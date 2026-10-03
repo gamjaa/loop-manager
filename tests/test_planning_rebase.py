@@ -188,6 +188,40 @@ class PlanningRebaseTest(unittest.TestCase):
 
 
 class PlanningDocumentRelevanceTest(unittest.TestCase):
+    def test_general_target_rechecks_new_active_requirement_outside_its_sources(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docs/plans").mkdir(parents=True)
+            plan = write_execplan(root, "G-118", "Current")
+            plan_path = plan.relative_to(root).as_posix()
+            requirement = "docs/requirements/[R-053] New Goal.md"
+
+            def git(_repo, *args, check=True):
+                if args[:2] == ("diff", "--name-only"):
+                    return SimpleNamespace(stdout=requirement + "\0", returncode=0)
+                if args[:2] == ("ls-tree", "-r"):
+                    return SimpleNamespace(stdout=plan_path + "\0", returncode=0)
+                if args[0] == "show":
+                    return SimpleNamespace(stdout=plan.read_text(), returncode=0)
+                revision, path = args[2].split(":", 1)
+                value = "same-plan" if path == plan_path else (
+                    "new-requirement" if revision == "new" and path == requirement else None
+                )
+                return SimpleNamespace(stdout=value or "", returncode=0 if value else 1)
+
+            arguments = (git, root, root, "old", "new", [], (), ("G-118",))
+            self.assertEqual(relevant_document_changes(*arguments), ())
+            self.assertEqual(relevant_document_changes(
+                *arguments, include_active_requirements=True,
+            ), (requirement,))
+            self.assertEqual(relevant_document_changes(
+                git, root, root, "old", "new", [], (), (),
+            ), ())
+            self.assertEqual(relevant_document_changes(
+                git, root, root, "old", "new", [], (), (),
+                include_active_requirements=True,
+            ), (requirement,))
+
     def test_only_current_plan_sources_and_dependencies_require_recheck(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -202,10 +236,18 @@ class PlanningDocumentRelevanceTest(unittest.TestCase):
                        "docs/plans/[G-101] Other.md")
             objects = {("old", path): path + "-old" for path in changes}
             objects.update({("new", path): path + "-new" for path in changes})
+            current_path = str(current.relative_to(root))
+            for revision in ("old", "new"):
+                objects[(revision, current_path)] = "same-current"
 
             def git(_repo, *args, check=True):
                 if args[:2] == ("diff", "--name-only"):
-                    return SimpleNamespace(stdout="\n".join(changes), returncode=0)
+                    return SimpleNamespace(stdout="\0".join(changes) + "\0", returncode=0)
+                if args[:2] == ("ls-tree", "-r"):
+                    return SimpleNamespace(stdout=current_path + "\0" + dependency + "\0",
+                                           returncode=0)
+                if args[0] == "show":
+                    return SimpleNamespace(stdout=current.read_text(), returncode=0)
                 assert args[:2] == ("rev-parse", "--verify")
                 revision, path = args[2].split(":", 1)
                 value = objects.get((revision, path))
@@ -227,7 +269,11 @@ class PlanningDocumentRelevanceTest(unittest.TestCase):
 
             def git(_repo, *args, check=True):
                 if args[:2] == ("diff", "--name-only"):
-                    return SimpleNamespace(stdout=source + "\n" + archive, returncode=0)
+                    return SimpleNamespace(stdout=source + "\0" + archive + "\0", returncode=0)
+                if args[:2] == ("ls-tree", "-r"):
+                    return SimpleNamespace(stdout=str(current.relative_to(root)) + "\0", returncode=0)
+                if args[0] == "show":
+                    return SimpleNamespace(stdout=current.read_text(), returncode=0)
                 revision, path = args[2].split(":", 1)
                 value = "same-blob" if (revision, path) in {
                     ("old", source), ("new", archive),
@@ -238,6 +284,115 @@ class PlanningDocumentRelevanceTest(unittest.TestCase):
                 git, root, root, "old", "new", [str(current.relative_to(root))], (),
             )
             self.assertEqual(result, ())
+            self.assertEqual(relevant_document_changes(
+                git, root, root, "old", "new", [str(current.relative_to(root))], (),
+                include_active_requirements=True,
+            ), ())
+
+    def test_content_preserving_dependency_archive_needs_no_recheck(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docs/plans").mkdir(parents=True)
+            target = write_execplan(root, "G-118", "Current", depends_on=("G-100",))
+            target_path = str(target.relative_to(root))
+            dependency = "docs/plans/[G-100] Dependency.md"
+            archived = "docs/plans/archive/[G-100] Dependency.md"
+
+            def git(_repo, *args, check=True):
+                if args[:2] == ("diff", "--name-only"):
+                    return SimpleNamespace(stdout=dependency + "\0" + archived + "\0",
+                                           returncode=0)
+                if args[:2] == ("ls-tree", "-r"):
+                    other = dependency if args[4] == "old" else archived
+                    return SimpleNamespace(stdout=target_path + "\0" + other + "\0",
+                                           returncode=0)
+                if args[0] == "show":
+                    return SimpleNamespace(stdout=target.read_text(), returncode=0)
+                revision, path = args[2].split(":", 1)
+                value = ("target" if path == target_path else "same" if
+                         (revision, path) in (("old", dependency), ("new", archived))
+                         else None)
+                return SimpleNamespace(stdout=value or "", returncode=0 if value else 1)
+
+            self.assertEqual(relevant_document_changes(
+                git, root, root, "old", "new", [], (), ("G-118",),
+            ), ())
+
+    def test_unchanged_checkout_rechecks_remote_target_and_both_relation_sets(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            old_path = "docs/plans/[G-118] Current.md"
+            new_path = "docs/plans/[G-118] Renamed.md"
+            old_source = "docs/requirements/[R-051] Old.md"
+            new_source = "docs/requirements/[R-052] New.md"
+            old_dependency = "docs/plans/[G-100] Old dependency.md"
+            new_dependency = "docs/plans/[G-101] New dependency.md"
+            (root / "docs/plans").mkdir(parents=True)
+            old_text = write_execplan(root, "G-118", "Current",
+                                      sources=(old_source,),
+                                      depends_on=("G-100",)).read_text()
+            new_text = write_execplan(root, "G-118", "Renamed",
+                                      sources=(new_source,),
+                                      depends_on=("G-101",)).read_text()
+            trees = {
+                "old": {old_path: old_text, old_source: "old source",
+                        old_dependency: "old dependency"},
+                "new": {new_path: new_text, new_source: "new source",
+                        new_dependency: "new dependency"},
+            }
+            changed = (old_path, new_path, old_source, new_source,
+                       old_dependency, new_dependency)
+
+            def git(_repo, *args, check=True):
+                if args[:2] == ("diff", "--name-only"):
+                    return SimpleNamespace(stdout="\0".join(changed) + "\0", returncode=0)
+                if args[:2] == ("ls-tree", "-r"):
+                    return SimpleNamespace(stdout="\0".join(trees[args[4]]) + "\0", returncode=0)
+                if args[0] == "show":
+                    revision, path = args[1].split(":", 1)
+                    return SimpleNamespace(stdout=trees[revision][path], returncode=0)
+                revision, path = args[2].split(":", 1)
+                value = trees[revision].get(path)
+                return SimpleNamespace(stdout=value or "", returncode=0 if value else 1)
+
+            result = relevant_document_changes(
+                git, root, root, "old", "new", [], (), ("G-118",),
+            )
+            self.assertEqual(result, tuple(sorted((new_path, old_source,
+                                                   new_source, old_dependency,
+                                                   new_dependency))))
+
+    def test_explicit_target_tracks_unicode_source_and_policy_without_local_edit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "docs/plans").mkdir(parents=True)
+            source = "docs/requirements/[R-051] 관련.md"
+            unrelated = "docs/requirements/[R-052] 무관.md"
+            plan = write_execplan(root, "G-118", "Current", sources=(source,))
+            path = str(plan.relative_to(root))
+            content = plan.read_text()
+            changes = (source, unrelated, "AGENTS.md")
+
+            def git(_repo, *args, check=True):
+                if args[:2] == ("diff", "--name-only"):
+                    return SimpleNamespace(stdout="\0".join(changes) + "\0", returncode=0)
+                if args[:2] == ("ls-tree", "-r"):
+                    return SimpleNamespace(stdout=path + "\0", returncode=0)
+                if args[0] == "show":
+                    return SimpleNamespace(stdout=content, returncode=0)
+                revision, candidate = args[2].split(":", 1)
+                value = "same" if candidate == path else (
+                    "old" if revision == "old" else "new"
+                )
+                return SimpleNamespace(stdout=value, returncode=0)
+
+            self.assertEqual(relevant_document_changes(
+                git, root, root, "old", "new", [], (), ("G-118",),
+            ), ("AGENTS.md", source))
+            changes = (unrelated,)
+            self.assertEqual(relevant_document_changes(
+                git, root, root, "old", "new", [], (), ("G-118",),
+            ), ())
 
 
 class PlanningRebaseGitBoundaryTest(unittest.TestCase):

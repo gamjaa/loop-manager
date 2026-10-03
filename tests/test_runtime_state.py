@@ -163,6 +163,80 @@ class CurrentRebaseRuntimeTests(unittest.TestCase):
 
 
 class RuntimeStateRepositoryTest(unittest.TestCase):
+    def test_planning_correction_releases_only_bound_incident_atomically(self):
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        notifications.configure_session(connection, enabled=True)
+        repository = runtime_state.RuntimeStateRepository(connection)
+        repository.update_project("repo", {
+            "planning_error": "old unsafe", "planning_error_fingerprint": "old-input",
+            "planning_error_origin": "unsafe",
+            "active_sha": "new-base", "planning_result_completed": 1,
+        })
+        incident_identity = connection.execute(
+            "SELECT planning_error_incident_id FROM projects WHERE repo = 'repo'",
+        ).fetchone()[0]
+        repository.update_project("repo", {
+            "planning_correction_error": "old unsafe",
+            "planning_correction_incident_id": incident_identity,
+            "planning_correction_sha": "new-base",
+            "planning_correction_context": "post_refactor_revalidation:2",
+        })
+        incident = connection.execute(
+            "SELECT id FROM notified_block_incidents WHERE repo = 'repo' "
+            "AND subject = 'planning'",
+        ).fetchone()[0]
+        arguments = dict(error="old unsafe", active_sha="new-base",
+                         context="post_refactor_revalidation:2")
+        self.assertFalse(repository.release_planning_correction(
+            "repo", **{**arguments, "active_sha": "stale"},
+        ))
+        self.assertIsNone(connection.execute(
+            "SELECT released_at FROM notified_block_incidents WHERE id = ?",
+            (incident,),
+        ).fetchone()[0])
+        repository.update_project("repo", {"planning_error": "old unsafe"})
+        self.assertFalse(repository.release_planning_correction("repo", **arguments))
+        repository.update_project("repo", {
+            "planning_correction_error": "old unsafe",
+            "planning_correction_incident_id": incident_identity,
+            "planning_correction_sha": "new-base",
+            "planning_correction_context": "post_refactor_revalidation:2",
+        })
+        connection.execute(
+            "UPDATE projects SET planning_error_incident_id = 'other-incident' "
+            "WHERE repo = 'repo'",
+        )
+        self.assertFalse(repository.release_planning_correction("repo", **arguments))
+        connection.execute(
+            "UPDATE projects SET planning_error_incident_id = ? WHERE repo = 'repo'",
+            (incident_identity,),
+        )
+
+        def interrupt(stage):
+            if stage == "after_planning_block_release":
+                raise RuntimeError("interrupted")
+
+        with self.assertRaisesRegex(RuntimeError, "interrupted"):
+            runtime_state.RuntimeStateRepository(
+                connection, fault_hook=interrupt,
+            ).release_planning_correction("repo", **arguments)
+        self.assertEqual(connection.execute(
+            "SELECT planning_error FROM projects WHERE repo = 'repo'",
+        ).fetchone()[0], "old unsafe")
+        self.assertIsNone(connection.execute(
+            "SELECT released_at FROM notified_block_incidents WHERE id = ?",
+            (incident,),
+        ).fetchone()[0])
+        self.assertTrue(repository.release_planning_correction("repo", **arguments))
+        self.assertIsNone(connection.execute(
+            "SELECT planning_error FROM projects WHERE repo = 'repo'",
+        ).fetchone()[0])
+        self.assertIsNone(connection.execute(
+            "SELECT planning_error_origin FROM projects WHERE repo = 'repo'",
+        ).fetchone()[0])
+        self.assertFalse(repository.release_planning_correction("repo", **arguments))
+
     def test_planning_error_release_rolls_back_with_incident_on_interruption(self):
         connection = runtime_connection()
         self.addCleanup(connection.close)

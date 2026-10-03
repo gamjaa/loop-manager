@@ -7,7 +7,7 @@ from unittest import mock
 import loop_manager
 from tests.support.catalog import write_execplan
 from tests.support.git import git_command, make_remote_repository, commit_and_push
-from tests.support.worker import dummy_worker_sessions
+from tests.support.worker import dummy_worker_context, dummy_worker_sessions, legacy_planning_ports
 
 
 class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
@@ -44,7 +44,6 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
         self.assertTrue(decision.has_ready)
         self.assertIsNone(decision.runnable_ready)
 
-    @dummy_worker_sessions
     def test_dependency_blocked_ready_is_not_an_empty_catalog(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -197,6 +196,8 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                 ), mock.patch(
                     "loop_manager.run_codex",
                     side_effect=agent,
+                ), legacy_planning_ports(), dummy_worker_context(
+                    roles=("worker", "planner", "maintenance_planner")
                 ):
                     outcomes = loop_manager.schedule_registered_projects(
                         connection,
@@ -417,6 +418,10 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                 def agent(worktree, _state, _config, role_name, _prompt, **_kwargs):
                     roles.append(role_name)
                     if role_name == "planner":
+                        if not publishes_plan and roles.count("planner") == 2:
+                            self.assertEqual(_kwargs.get("session_id"), "planner-session")
+                            self.assertEqual((worktree / "src/app.py").read_text(encoding="utf-8"),
+                                             "VALUE = 2\n")
                         if publishes_plan and roles.count("planner") == 1:
                             write_execplan(
                                 worktree,
@@ -489,7 +494,7 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                 self.assertEqual(
                     roles,
                     ["planner", "planner", "worker"] if publishes_plan
-                    else ["planner"],
+                    else ["planner", "planner"],
                 )
                 self.assertEqual(
                     project["phase"], "WORKING" if publishes_plan else None

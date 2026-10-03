@@ -52,6 +52,12 @@ def planning_snapshot(**overrides):
         "planning_result": None,
         "planning_error": None,
         "planning_error_fingerprint": None,
+        "planning_error_incident_id": None,
+        "planning_error_origin": None,
+        "planning_correction_error": None,
+        "planning_correction_incident_id": None,
+        "planning_correction_sha": None,
+        "planning_correction_context": None,
         "active_sha": None,
         "worktree": None,
         "last_error": None,
@@ -97,6 +103,7 @@ class FakeStatePort:
         self.snapshot = snapshot
         self.cycle = cycle or maintenance_cycle()
         self.updates = []
+        self.diagnostics = []
         self.clear_calls = []
         self.activate_result = None
         self.recovered_cycle = self.cycle
@@ -137,6 +144,22 @@ class FakeStatePort:
         }
         if snapshot_values:
             self.snapshot = replace(self.snapshot, **snapshot_values)
+
+    def release_planning_correction(self, _repo, *, error, active_sha, context):
+        row = self.snapshot
+        if not (row.planning_error == row.planning_correction_error == error
+                and row.planning_error_incident_id is not None
+                and row.planning_error_incident_id == row.planning_correction_incident_id
+                and row.active_sha == row.planning_correction_sha == active_sha
+                and row.planning_correction_context == context
+                and row.planning_result_completed):
+            return False
+        self.update(_repo, planning_error=None, planning_error_fingerprint=None,
+                    planning_error_incident_id=None,
+                    planning_correction_error=None, planning_correction_incident_id=None,
+                    planning_correction_sha=None,
+                    planning_correction_context=None)
+        return True
 
     def transaction(self):
         @contextmanager
@@ -187,7 +210,7 @@ class FakeStatePort:
         return self.activate_result
 
     def preserve_diagnostics(self, _repo, _snapshot):
-        pass
+        self.diagnostics.append(_snapshot)
 
     def clear_active(
         self,
@@ -361,7 +384,7 @@ class FakeGitPort:
     def accept_resolved_stash_conflict(self, *_args):
         pass
 
-    def relevant_document_changes(self, *_args):
+    def relevant_document_changes(self, *_args, **_kwargs):
         return ()
 
     def validate_managed_worktree(self, _worktree):

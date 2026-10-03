@@ -165,6 +165,10 @@ class PlanningStatePort(Protocol):
 
     def update(self, repo: str, **values: object) -> None: ...
 
+    def release_planning_correction(
+        self, repo: str, *, error: str, active_sha: str, context: str,
+    ) -> bool: ...
+
     def transaction(self) -> AbstractContextManager[object]: ...
 
     def advance_maintenance_cycle(
@@ -410,6 +414,7 @@ class PlanningGitPort(Protocol):
     def relevant_document_changes(
         self, worktree: Path, old: str, target: str,
         edited_paths: list[str], catalog_rows: Sequence[Any],
+        target_plan_ids: Sequence[str], *, include_active_requirements: bool,
     ) -> tuple[str, ...]: ...
 
     def validate_managed_worktree(self, worktree: Path) -> None: ...

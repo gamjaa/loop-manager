@@ -20,7 +20,7 @@ from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.planning import planning_runtime
 from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventoryError
 from tests.support.git import commit_and_push, git_command, make_remote_repository
-from tests.support.worker import dummy_worker_context
+from tests.support.worker import dummy_worker_context, legacy_planning_ports
 from tests.support.catalog import plan_text
 
 
@@ -191,7 +191,9 @@ class MaintenanceCycleCase(unittest.TestCase):
             "loop_manager.ensure_safe_base_worktree"
         ), mock.patch(
             "loop_manager.run_codex", side_effect=agent
-        ), dummy_worker_context():
+        ), legacy_planning_ports(), dummy_worker_context(
+            roles=("worker", "planner", "maintenance_planner")
+        ):
             return loop_manager.run_project_result(
                 connection,
                 state_dir,
@@ -293,4 +295,3 @@ class MaintenanceCycleCase(unittest.TestCase):
             ),
             cycle_base_sha=base_sha,
         )
-

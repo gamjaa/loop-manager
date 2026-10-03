@@ -1,8 +1,15 @@
 import hashlib
 import subprocess
+from types import SimpleNamespace
 from loop_manager_internal.maintenance import maintenance_file_inventory
 from loop_manager_internal.maintenance import maintenance_file_review as review
 from loop_manager_internal.maintenance import compact_file_review as compact
+
+
+def inventory(contents, revision="revision"):
+    return SimpleNamespace(revision=revision, sources=tuple(SimpleNamespace(
+        path=path, content_hash=hashlib.sha256(content).hexdigest(), mode="100644"
+    ) for path, content in sorted(contents.items())))
 
 
 def compact_result(source, content):

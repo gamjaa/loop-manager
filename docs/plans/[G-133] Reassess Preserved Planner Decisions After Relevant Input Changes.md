@@ -58,10 +58,36 @@ Worker는 아래 경계에서 수정한 로직과 새 회귀를 직접 검증하
 
 - [x] 사용자 제공 사건과 현재 관련 입력 판별·workspace·validation·publication 코드 경계 확인
 - [x] PRODUCT 및 G-118에 근거한 결함 수정 범위와 회귀·검증 책임 정의
-- [ ] 평가 대상 관련 입력 추적과 재판단 예약·감사 영속화
-- [ ] 검증된 오류 사건 연결과 조건부 해제·완료 복구
-- [ ] 관련 targeted unit test 작성·실행 및 검증 목록 유지
+- [x] 평가 대상 관련 입력 추적과 재판단 예약·감사 영속화
+- [x] 검증된 오류 사건 연결과 조건부 해제·완료 복구
+- [x] 관련 targeted unit test 작성·실행 및 검증 목록 유지
 - [ ] Manager 전체 verify, 독립 Review 및 사용자 Merge
+
+Worker targeted 실행(모두 최종 통과):
+
+- `python3 -m unittest tests.test_planning_rebase.PlanningDocumentRelevanceTest` — 5 cases. 첫 실행에서 제거된 dependency의 새 원격 경로를 요구해 실패했고 수정 후 동일 명령이 통과했다.
+- `python3 -m unittest tests.test_planning_recovery.PlanningRecoveryTest.test_saved_unsafe_rechecks_changed_target_and_releases_only_linked_error` — 현재·legacy `unsafe`, 독립 오류, 재시작·stale 검증 통과.
+- `python3 -m unittest tests.test_planning_recovery.PlanningRecoveryTest.test_unrelated_advance_does_not_schedule_completed_unsafe_again` — 무관한 원격 전진에서 재호출 대기와 사건 연결을 만들지 않는 1 case 통과.
+- `python3 -m unittest tests.test_planning_recovery.PlanningRecoveryTest.test_additional_related_advance_rebinds_one_pending_correction` — 추가 관련 전진의 경로 문맥·최신 base 재결합과 단일 pending 1 case 통과.
+- `python3 -m unittest tests.test_planning_recovery.PlanningRecoveryTest.test_exhausted_validation_error_retries_once_after_relevant_change` 및 `python3 -m unittest tests.test_planning_recovery.PlanningRecoveryTest.test_related_document_change_requests_saved_planner_recheck` — 각 1 case 통과.
+- `python3 -m unittest tests.test_planning_recovery.PlanningRecoveryTest.test_fresh_unsafe_records_error_origin_for_later_correction` 및 `python3 -m unittest tests.test_planning_recovery.PlanningDiagnosticsTest.test_successive_bases_keep_original_result_and_error_audit` — 각 1 case 통과.
+- `python3 -m unittest tests.test_runtime_state.RuntimeStateRepositoryTest.test_planning_correction_releases_only_bound_incident_atomically` 및 `python3 -m unittest tests.test_runtime_state.RuntimeStateRepositoryTest.test_planning_error_release_rolls_back_with_incident_on_interruption` — 각 1 case 통과.
+- `python3 -m unittest tests.test_manager_schema.ManagerSchemaTest.test_existing_database_adds_planning_fingerprint_without_losing_state` — 1 case 통과.
+- `python3 -m unittest tests.test_planning_recovery.PlanningRecoveryTest.test_completed_no_change_turn_resumes_validation_without_agent_replay`, `python3 -m unittest tests.test_planning_recovery.PlanningConflictCorrectionUnitTests.test_workspace_wiring_preserves_error_and_commits_base_before_cleanup`, `python3 -m unittest tests.test_planning_publication.PlanningPublicationTest.test_no_change_cleanup_failure_keeps_saved_planning_result` — 기존 완료 결과 재사용·workspace 복구·publication guard의 각 1 case 통과.
+- Manager verify 피드백에서 legacy 유지보수 fixture가 새 tiered 포트와 실제 Codex 모델 조회를 사용해 기존 경로 검증을 중단했다. fixture의 해당 경로만 명시적으로 유지하고 `unused.ini` Planner 역할에 가짜 프로필을 제공했다. 보고된 개별 case 4건과 fixture unit case 1건을 직접 재실행해 통과했다.
+- Review 피드백: 일반 Planner는 READY 대상의 `sources` 밖에 새로 생긴 활성 Requirement도 재평가하며, 일반 planning이 결합되지 않은 유지보수 판단은 무관한 Requirement와 전체 지문 변경만으로 소진된 오류를 재시도하지 않는다. 새 fake-port unit case 3건과 내용 보존 archive 회귀 case 1건을 개별 실행해 통과했다.
+- Manager verify 피드백: 관련 source 변경을 가정하던 기존 fake-port case에 READY 평가 대상과 변경 문서 응답이 빠져 있었다. 둘을 명시하고 `python3 -m unittest tests.test_planning_selection.PlanningSelectionTest.test_failed_maintenance_input_restarts_after_related_source_change`를 개별 실행해 통과했다.
+
+- Review 후속: 일반 planning을 포함하는 유지보수 cycle에서 문서 변경 없이 전체 입력 지문만 변경돼도 소진된 validation 오류의 교정을 예약하도록 조건을 보완했다. 내용 보존 archive와 일반 planning이 없는 유지보수의 무관 입력은 계속 오류를 보존한다.
+- `python3 -m unittest tests.test_planning_recovery.PlanningRecoveryTest.test_combined_maintenance_code_change_resets_exhausted_error_once tests.test_planning_recovery.PlanningRecoveryTest.test_unrelated_maintenance_requirement_does_not_reset_exhausted_error` — 최초 실행은 새 fake-port fixture의 maintenance context 응답 누락으로 실패했다. 응답을 명시한 뒤 동일 명령 재실행에서 2 cases 모두 통과했다.
+- `tests/test_maintenance_cycle.py::MaintenanceCycleTest.test_remote_target_edit_recovers_unsafe_in_same_session_and_completes_cycle`를 추가했다. 기존 격리 remote·실제 Git/SQLite/catalog/validation fixture에서 무수정 unsafe 보존, 동일 입력 무호출, 별도 clone의 대상 commit/push, 같은 session/worktree의 revalidated, idle·오류 해제·catalog 반영·원래 오류 감사와 불필요한 push 부재를 확인한다. Worker의 integration 실행 금지에 따라 실행하지 않았으며 기존 verify의 unittest discover로 Manager가 실행한다. 새 루트 파일이나 검증 스크립트 변경은 없다.
+
+
+- Review 2차 후속: 완료된 결과의 재판단도 문서 변경과 실제 전체 입력 지문 변경을 함께 사용한다. 일반 planning 및 일반 planning을 포함한 유지보수는 코드만 바뀌어도 이전 결과를 감사에 보존하고 base 채택과 pending·오류 사건 연결을 함께 저장한다. 실패 gate 지문 불일치 자체를 입력 변경으로 간주하지 않으며, 동일 내용·내용 보존 archive와 유지보수 전용의 무관 코드 변경은 재호출하지 않는다.
+- `python3 -m unittest tests.test_planning_recovery.PlanningRecoveryTest.test_completed_results_recheck_code_input_before_recording_success tests.test_planning_recovery.PlanningRecoveryTest.test_combined_maintenance_code_change_resets_exhausted_error_once tests.test_planning_recovery.PlanningRecoveryTest.test_unrelated_maintenance_requirement_does_not_reset_exhausted_error tests.test_planning_recovery.PlanningRecoveryTest.test_saved_unsafe_rechecks_changed_target_and_releases_only_linked_error` — 4 cases 모두 첫 실행 통과. 새 case는 3개 mode × 3개 변경 유형에서 완료 결과 재판단, base 채택 후 재시작, 동일 세션 1회 호출, 검증 후 연결 오류 해제와 publication 전 성공 기준 보존을 확인한다. 전체 verify·integration은 실행하지 않았다.
+
+- Manager verify 후속(2개 실패): 기존 no-change 테스트가 전체 입력 지문 또는 실제 `src/app.py`를 바꾸면서도 재호출하지 않는 이전 기대를 사용했다. fake-port case를 `test_remote_input_identity_controls_completed_result_reuse_after_pause`로 개정해 동일 입력의 결과 재사용과 변경 입력의 같은 세션 재호출을 함께 검증한다. 실제 Git case는 코드 변경 후 두 번째 Planner 호출과 최신 코드·동일 세션을 확인하도록 수정했다. 제품 코드는 변경하지 않았다.
+- `python3 -m unittest tests.test_planning_selection.PlanningSelectionTest.test_remote_input_identity_controls_completed_result_reuse_after_pause` — 1 case(2 subtests) 첫 실행 통과. 수정한 `test_catalog_scheduling.CatalogSchedulingTest.test_remote_input_change_after_planner_defers_published_ready_worker`는 실제 Git integration이므로 Worker에서 실행하지 않았으며 Manager 전체 verify의 재검증이 필요하다. 기존 verify 수집 범위는 유지했다.
 
 ## Decision Log
 
@@ -69,3 +95,5 @@ Worker는 아래 경계에서 수정한 로직과 새 회귀를 직접 검증하
 - 2026-10-03: 코드 수정 없이 문서만 작성했다. 사건 SHA·session·수동 복구 결과는 사용자 제공 증거와 코드 경로 확인을 구분하며 운영 DB, 사건 감사 파일이나 기존 계획을 수정하지 않는다. 기존 G-130·G-131·G-132와의 ID 충돌을 피하도록 사용자 판단에 따라 이 계획의 번호를 G-133으로 변경했다. 기존 입력 분류 G-130과 G-131·G-132의 참조는 유지한다.
 - 2026-10-03: priority는 안전한 무인 재개를 막고 반복 수동 복구를 요구하는 결함이므로 `critical`, 복잡도와 위험은 입력·사건·중단 복구·게시 transaction을 함께 다루므로 `high`로 둔다. 실제 보호 실패를 해제하거나 publication guard를 제거하는 우회는 구현하지 않는다.
 - 2026-10-03: 기본 worktree 동기화, Worker/Reviewer의 문서 재확인 범위, Planner 권한, maintenance mode·장벽, 재시도 한도와 사용자 Merge 규칙은 변경하지 않는다. PRODUCT·Requirement·ARCHITECTURE·AGENTS·PLANS는 이 문서 작성에서 수정하지 않는다. 비호환 schema·상태 모델 변경, 데이터 삭제·비가역 migration이나 Git/PR 경계 변경이 필요해지면 기존 Architecture Change Policy에 따라 구현 전에 사용자 결정을 받는다.
+- 2026-10-03 Worker: 원격 전후 Git 선언과 stable ID를 비교해 eligible READY 또는 revalidation 대상의 본문·source·dependency·정책 변경을 판별한다. 무수정 완료 결과의 재판단은 기존 session과 worktree에 pending으로 저장하며 이전 결과·오류·재시도는 base별 진단에 보존한다. 새 SQLite 열은 nullable인 호환 추가이며 기존 데이터 삭제나 비호환 상태 전이는 없다.
+- 2026-10-03 Worker: 오류 원인 종류와 사건 ID, 재판단 base SHA 및 maintenance phase/revision을 연결하고 fresh 결과가 실제 검증을 통과한 뒤 원격 SHA와 현재 사건을 다시 확인해 기존 transaction에서 오류와 알림 차단을 해제한다. Legacy 상태는 보존 결과·재시도·진단에서 연결을 확인할 때만 보완한다. 독립 오류와 재차 `unsafe`는 유지한다. `scripts/verify.sh`의 기존 unittest discover·compile 목록이 변경 파일을 이미 포함하므로 검증 스크립트는 수정하지 않았다. 전체 verify·Review·Merge는 Loop Manager의 후속 경계에 남긴다.

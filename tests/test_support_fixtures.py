@@ -15,7 +15,7 @@ import loop_manager
 from loop_manager_internal.execution.worker_session import SessionBinding
 from loop_manager_internal.git import manager_git_journal
 from tests.support.execution import ExecutionFixture, execution_fixture
-from tests.support.worker import dummy_worker_context, dummy_worker_sessions
+from tests.support.worker import dummy_worker_context, dummy_worker_sessions, legacy_planning_ports
 from tests.support.origin import OriginScopeFixture
 
 
@@ -97,6 +97,28 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
             self.assertEqual(loop_manager._agent_profile(
                 Path('unused.ini'), 'codex', 'worker', 1, Path('/managed')), 'real profile')
             self.assertEqual(original.call_count, 3)
+
+    def test_dummy_profile_can_cover_legacy_planner_roles_without_changing_default(self):
+        original = mock.Mock(return_value='real profile')
+        with mock.patch.object(loop_manager, '_agent_profile', original):
+            with dummy_worker_context(roles=('worker', 'planner', 'maintenance_planner')):
+                for role in ('worker', 'planner', 'maintenance_planner'):
+                    with self.subTest(role=role):
+                        self.assertEqual(loop_manager._agent_profile(
+                            Path('unused.ini'), 'codex', role, 1, Path('/managed')),
+                            loop_manager.AgentProfile('fixture-worker-model', 'medium'))
+                self.assertEqual(loop_manager._agent_profile(
+                    Path('unused.ini'), 'codex', 'reviewer', 1, Path('/managed')), 'real profile')
+            self.assertIs(loop_manager._agent_profile, original)
+            original.assert_called_once()
+
+    def test_legacy_planning_ports_hide_tiered_only_inside_fixture(self):
+        original = mock.Mock(side_effect=lambda: SimpleNamespace(tiered=object()))
+        with mock.patch.object(loop_manager, '_PlanningLifecyclePorts', original):
+            with legacy_planning_ports():
+                self.assertFalse(hasattr(loop_manager._PlanningLifecyclePorts(), 'tiered'))
+            self.assertIs(loop_manager._PlanningLifecyclePorts, original)
+            self.assertTrue(hasattr(loop_manager._PlanningLifecyclePorts(), 'tiered'))
 
     def test_dummy_session_binding_only_updates_opted_in_legacy_session(self):
         repository = mock.Mock()

@@ -28,13 +28,13 @@ def isolated_scope_resources(_connection, _repo, worktree, before, role_name, **
 
 
 @contextlib.contextmanager
-def dummy_worker_context():
-    """Opt a legacy unused.ini scenario into fake profile/session preflight."""
+def dummy_worker_context(*, roles=("worker",)):
+    """Opt legacy unused.ini roles into fake profile/session preflight."""
     real_profile = loop_manager._agent_profile
     real_ports = loop_manager._ExecutionLifecyclePorts
 
     def profile(config_path, provider, role_name, level, worktree):
-        if (role_name == 'worker' and Path(config_path).name == 'unused.ini'
+        if (role_name in roles and Path(config_path).name == 'unused.ini'
                 and not Path(config_path).exists()):
             return loop_manager.AgentProfile('fixture-worker-model', 'medium')
         return real_profile(config_path, provider, role_name, level, worktree)
@@ -64,6 +64,22 @@ def dummy_worker_sessions(test):
         with dummy_worker_context():
             return test(*args, **kwargs)
     return run
+
+
+@contextlib.contextmanager
+def legacy_planning_ports():
+    """Exercise preserved planning flows without the newer tiered review port."""
+    real_ports = loop_manager._PlanningLifecyclePorts
+
+    def ports_without_tiered(*args, **kwargs):
+        ports = real_ports(*args, **kwargs)
+        del ports.tiered
+        return ports
+
+    with mock.patch.object(
+        loop_manager, '_PlanningLifecyclePorts', side_effect=ports_without_tiered
+    ):
+        yield
 
 
 def decision(**changes):

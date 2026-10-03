@@ -176,11 +176,13 @@ class _PlanningGitPorts:
 
     def relevant_document_changes(
         self, worktree: Path, old: str, target: str,
-        edited_paths: list[str], catalog_rows,
+        edited_paths: list[str], catalog_rows, target_plan_ids=(),
+        *, include_active_requirements: bool = False,
     ) -> tuple[str, ...]:
         return planning_document_relevance.relevant_document_changes(
             self._effects.git, self._repo_path, worktree, old, target,
-            edited_paths, catalog_rows,
+            edited_paths, catalog_rows, target_plan_ids,
+            include_active_requirements=include_active_requirements,
         )
 
     def validate_managed_worktree(self, worktree: Path) -> None:

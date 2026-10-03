@@ -1,18 +1,12 @@
-import hashlib
 import json
 from pathlib import Path
 import sqlite3
 import subprocess
 import tempfile
 import unittest
-from types import SimpleNamespace
 
 from loop_manager_internal.maintenance import code_index
-
-
-def inventory(contents, revision="revision"):
-    return SimpleNamespace(revision=revision, sources=tuple(SimpleNamespace(path=path,
-        content_hash=hashlib.sha256(content).hexdigest(), mode="100644") for path, content in sorted(contents.items())))
+from tests.support.maintenance import inventory
 
 
 class CodeIndexTest(unittest.TestCase):

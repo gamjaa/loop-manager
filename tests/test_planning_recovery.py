@@ -32,6 +32,10 @@ from loop_manager_internal.planning.planning_runtime import (
     choose_planning_decision,
 )
 from loop_manager_internal.storage.runtime_state import PlanningSnapshot
+from loop_manager_internal.planning.diagnostics import (
+    PreservePlanningDiagnosticsEffects, planning_diagnostics_path,
+    preserve_planning_diagnostics,
+)
 
 
 from tests.support.planning_case import (
@@ -39,7 +43,374 @@ from tests.support.planning_case import (
     FakeValidationPort, FakeEventPort, planning_snapshot, maintenance_cycle,
 )
 
+class PlanningDiagnosticsTest(unittest.TestCase):
+    def test_successive_bases_keep_original_result_and_error_audit(self):
+        effects = PreservePlanningDiagnosticsEffects(
+            _nul_git_paths=lambda *_args: (),
+            git=lambda *_args, **_kwargs: None,
+            planning_diagnostics_path=planning_diagnostics_path,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            row = {
+                "planning_attempt_fingerprint": "same-input",
+                "planning_error_fingerprint": "failed-input",
+                "worktree": None,
+                "planning_error": "old unsafe",
+                "planning_error_incident_id": "incident-1",
+                "planning_error_origin": "unsafe",
+                "planning_validation_error": None,
+                "last_error": "old unsafe",
+                "planner_session_id": "saved-session",
+                "planning_retry_count": 2,
+                "planning_result_completed": 1,
+                "planning_result": 'MAINTENANCE_RESULT: {"outcome":"unsafe"}',
+                "active_sha": "base-1",
+            }
+            first = preserve_planning_diagnostics(effects, Path(directory), "/repo", row)
+            second = preserve_planning_diagnostics(
+                effects, Path(directory), "/repo", {**row, "active_sha": "base-2"},
+            )
+            self.assertNotEqual(first, second)
+            self.assertIn("old unsafe", first.read_text())
+            self.assertIn('"outcome":"unsafe"', first.read_text())
+            self.assertIn("base-2", second.read_text())
+
 class PlanningRecoveryTest(PlanningCase):
+    def test_completed_results_recheck_code_input_before_recording_success(self):
+        for mode in ("general", "combined", "maintenance"):
+            for change in ("code", "same-content", "archive"):
+                with self.subTest(mode=mode, change=change):
+                    maintenance = mode != "general"
+                    cycle = maintenance_cycle(
+                        phase=(maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION
+                               if maintenance else maintenance_state.MaintenancePhase.IDLE),
+                        cycle_base_sha="base", revalidation_plan_ids=("G-066",),
+                        include_general_planning=mode == "combined",
+                    )
+                    original = ('MAINTENANCE_RESULT: {"outcome":"unsafe","reason":"old evidence"}'
+                                if maintenance else "no further plans")
+                    error = "old unsafe evidence" if maintenance else None
+                    ports = FakePorts(planning_snapshot(
+                        phase="PLANNING", active_sha="base", worktree="/planning",
+                        planning_attempt_fingerprint="original-input", planning_workspace_owned=1,
+                        planner_session_id="saved-session", planning_result=original,
+                        planning_result_completed=True, planning_error=error,
+                        planning_error_origin="unsafe" if maintenance else None,
+                        last_error=error,
+                        planning_fingerprint="previous-success",
+                    ), cycle)
+                    ports.git.remote = "new-base"
+                    ports.git.fingerprints = {
+                        "base": "old-input",
+                        "new-base": "old-input" if change == "same-content" else "new-input",
+                    }
+                    ports.git.relevant_document_changes = mock.Mock(return_value=())
+                    ports.git.requirement_archive_only = mock.Mock(return_value=change == "archive")
+                    ports.validation.prepare_maintenance_context = mock.Mock(
+                        return_value=SimpleNamespace(active_sha="new-base"),
+                    )
+                    ports.validation.maintenance_change_context = mock.Mock(return_value="")
+                    ports.validation.maintenance_prompt = mock.Mock(return_value="recheck inputs")
+                    ports.validation.validate_maintenance_result = mock.Mock(return_value=None)
+                    ports.agent.result = replace(ports.agent.result, message=(
+                        'MAINTENANCE_RESULT: {"outcome":"revalidated"}' if maintenance
+                        else "fresh no further plans"
+                    ))
+                    coordinator = PlanningLifecycleCoordinator(ports)
+                    run = coordinator._new_run(self.context)
+                    self.assertIsNone(coordinator._workspace._prepare_workspace(run))
+                    recheck = mode != "maintenance" and change == "code"
+                    saved = ports.state.snapshot
+                    self.assertEqual(bool(saved.planning_result_pending_validation), recheck)
+                    self.assertEqual(bool(saved.planning_result_completed), not recheck)
+                    self.assertEqual(saved.planning_fingerprint, "previous-success")
+                    self.assertEqual(saved.planning_error, error)
+                    self.assertEqual(saved.planning_result, None if recheck else original)
+                    if recheck:
+                        self.assertEqual(ports.state.diagnostics[-1].planning_result, original)
+                        self.assertIn("전체 계획 입력", saved.planning_validation_error)
+                        self.assertEqual(saved.planning_correction_error, error)
+                    # Restart after adopting the base must not lose or duplicate pending work.
+                    diagnostic_count = len(ports.state.diagnostics)
+                    run = coordinator._new_run(self.context)
+                    self.assertIsNone(coordinator._workspace._prepare_workspace(run))
+                    self.assertEqual(len(ports.state.diagnostics), diagnostic_count)
+                    ports.git.relevant_document_changes.assert_called_once()
+                    self.assertIsNone(coordinator._assessment._run_planner_turn(run))
+                    self.assertEqual(ports.agent.run_count, int(recheck))
+                    if recheck:
+                        self.assertEqual(ports.agent.resumed_session, "saved-session")
+                        self.assertIsNone(coordinator._assessment._run_planner_turn(run))
+                        self.assertEqual(ports.agent.run_count, 1)
+                        self.assertIsNone(coordinator._assessment._validate_planner_result(run))
+                        self.assertIsNone(ports.state.snapshot.planning_error)
+                        # Validation alone must not advance the publication success baseline.
+                        self.assertEqual(ports.state.snapshot.planning_fingerprint, "previous-success")
+
+    def test_general_ready_result_rechecks_new_active_requirement(self):
+        requirement = "docs/requirements/[R-053] New Goal.md"
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/planning",
+            planning_attempt_fingerprint="original-input",
+            planning_workspace_owned=1, planner_session_id="saved-session",
+            planning_result="saved result", planning_result_completed=True,
+        ))
+        ports.state.execplan_rows = lambda _repo: [{"plan_id": "G-118", "status": "READY"}]
+        ports.git.remote = "new-base"
+        ports.git.relevant_document_changes = mock.Mock(return_value=(requirement,))
+
+        coordinator = PlanningLifecycleCoordinator(ports)
+        self.assertIsNone(coordinator._workspace._prepare_workspace(
+            coordinator._new_run(self.context),
+        ))
+
+        self.assertEqual(ports.git.relevant_document_changes.call_args.args[-1], ("G-118",))
+        self.assertTrue(ports.git.relevant_document_changes.call_args.kwargs[
+            "include_active_requirements"
+        ])
+        self.assertTrue(ports.state.snapshot.planning_result_pending_validation)
+        self.assertFalse(ports.state.snapshot.planning_result_completed)
+        self.assertIsNone(ports.state.snapshot.planning_result)
+        self.assertEqual(ports.state.diagnostics[-1].planning_result, "saved result")
+        self.assertEqual(ports.state.snapshot.planner_session_id, "saved-session")
+
+    def test_unrelated_maintenance_requirement_does_not_reset_exhausted_error(self):
+        cycle = maintenance_cycle(
+            phase=maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+            cycle_base_sha="base", revalidation_plan_ids=("G-066",), revision=1,
+        )
+        original_input = "old-input"
+        error = "saved validation failure"
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/planning",
+            planning_attempt_fingerprint="original-input", planning_workspace_owned=1,
+            planner_session_id="saved-session", planning_retry_count=3,
+            planning_error=error, planning_error_origin="validation",
+            planning_validation_error=error,
+            planning_error_fingerprint=maintenance_planning_fingerprint(cycle, original_input),
+        ), cycle)
+        ports.git.fingerprints = {"base": original_input, "new-base": "unrelated-input"}
+        ports.git.remote = "new-base"
+        ports.git.relevant_document_changes = mock.Mock(return_value=())
+
+        coordinator = PlanningLifecycleCoordinator(ports)
+        outcome = coordinator._workspace._prepare_workspace(coordinator._new_run(self.context))
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+        self.assertEqual(ports.state.snapshot.active_sha, "new-base")
+        self.assertEqual(ports.state.snapshot.planning_retry_count, 3)
+        self.assertFalse(ports.state.snapshot.planning_result_pending_validation)
+        self.assertEqual(ports.state.snapshot.planning_error, error)
+        self.assertIsNone(ports.state.snapshot.planning_correction_error)
+        self.assertEqual(ports.agent.run_count, 0)
+        self.assertFalse(ports.git.relevant_document_changes.call_args.kwargs[
+            "include_active_requirements"
+        ])
+
+    def test_combined_maintenance_code_change_resets_exhausted_error_once(self):
+        for archive_only in (False, True):
+            with self.subTest(archive_only=archive_only):
+                cycle = maintenance_cycle(
+                    phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                    cycle_base_sha="base", include_general_planning=True, revision=1,
+                )
+                error = "saved validation failure"
+                ports = FakePorts(planning_snapshot(
+                    phase="PLANNING", active_sha="base", worktree="/planning",
+                    planning_attempt_fingerprint="original-input", planning_workspace_owned=1,
+                    planner_session_id="saved-session", planning_retry_count=3,
+                    planning_error=error, planning_error_origin="validation",
+                    planning_validation_error=error,
+                    planning_error_fingerprint=maintenance_planning_fingerprint(cycle, "old-input"),
+                ), cycle)
+                ports.git.fingerprints = {"base": "old-input", "new-base": "code-input"}
+                ports.git.remote = "new-base"
+                ports.git.relevant_document_changes = mock.Mock(return_value=())
+                ports.git.requirement_archive_only = mock.Mock(return_value=archive_only)
+                ports.validation.prepare_maintenance_context = mock.Mock(return_value=SimpleNamespace())
+                ports.validation.maintenance_change_context = mock.Mock(return_value="")
+                coordinator = PlanningLifecycleCoordinator(ports)
+
+                coordinator._workspace._prepare_workspace(coordinator._new_run(self.context))
+
+                saved = ports.state.snapshot
+                self.assertEqual(saved.active_sha, "new-base")
+                self.assertEqual(saved.planning_retry_count, 3 if archive_only else 0)
+                self.assertEqual(bool(saved.planning_result_pending_validation), not archive_only)
+                self.assertEqual(saved.planning_error, error)
+                self.assertEqual(saved.planner_session_id, "saved-session")
+                self.assertEqual(ports.state.diagnostics[-1].planning_retry_count, 3)
+                if not archive_only:
+                    self.assertEqual(saved.planning_correction_error, error)
+                    self.assertEqual(saved.planning_correction_sha, "new-base")
+                    coordinator._workspace._prepare_workspace(coordinator._new_run(self.context))
+                    self.assertEqual(ports.state.snapshot.planning_correction_incident_id,
+                                     saved.planning_correction_incident_id)
+                    self.assertEqual(len(ports.state.diagnostics), 1)
+                self.assertEqual(ports.agent.run_count, 0)
+
+    def test_fresh_unsafe_records_error_origin_for_later_correction(self):
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/planning",
+            planning_result='MAINTENANCE_RESULT: {"outcome":"unsafe","reason":"needs review"}',
+            planning_result_completed=True,
+        ), maintenance_cycle(
+            phase=maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+            cycle_base_sha="base", revalidation_plan_ids=("G-066",),
+        ))
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(self.context)
+        run.planning_worktree = Path("/planning")
+        run.maintenance_context = SimpleNamespace(active_sha="base")
+        run.dirty_files = []
+
+        outcome = coordinator._assessment._validate_planner_result(run)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.UNSAFE_REVALIDATION)
+        self.assertEqual(ports.state.snapshot.planning_error_origin, "unsafe")
+        self.assertIsNone(ports.state.snapshot.planning_correction_error)
+
+    def test_exhausted_validation_error_retries_once_after_relevant_change(self):
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/planning",
+            planning_attempt_fingerprint="original-input",
+            planning_workspace_owned=1, planner_session_id="saved-session",
+            planning_retry_count=3, planning_error="old validation failure",
+            planning_validation_error="old validation failure",
+            planning_error_fingerprint="fingerprint",
+        ))
+        ports.git.remote = "new-base"
+        ports.git.relevant_document_changes = mock.Mock(return_value=("docs/PRODUCT.md",))
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(self.context)
+
+        self.assertIsNone(coordinator._workspace._prepare_workspace(run))
+        self.assertEqual(ports.state.snapshot.planning_retry_count, 0)
+        self.assertTrue(ports.state.snapshot.planning_result_pending_validation)
+        self.assertIsNone(coordinator._assessment._run_planner_turn(run))
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertIsNone(coordinator._assessment._validate_planner_result(run))
+        self.assertIsNone(ports.state.snapshot.planning_error)
+
+    def test_saved_unsafe_rechecks_changed_target_and_releases_only_linked_error(self):
+        original_result = 'MAINTENANCE_RESULT: {"outcome":"unsafe","reason":"old evidence"}'
+        revised_result = 'MAINTENANCE_RESULT: {"outcome":"revalidated"}'
+        old_error = "post-refactor revalidation이 제품 목표 보존을 확정하지 못했습니다: old evidence"
+        for scenario in ("current", "legacy", "independent"):
+            with self.subTest(scenario=scenario):
+                linked = scenario != "independent"
+                ports = FakePorts(planning_snapshot(
+                    phase="PLANNING", active_sha="base", worktree="/planning",
+                    planning_attempt_fingerprint="original-input",
+                    planning_workspace_owned=1, planner_session_id="saved-session",
+                    planning_result=original_result, planning_result_completed=True,
+                    planning_error=old_error if linked else "independent error",
+                    planning_error_origin="unsafe" if scenario == "current" else None,
+                    last_error=old_error,
+                ), maintenance_cycle(
+                    phase=maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+                    cycle_base_sha="base", revalidation_plan_ids=("G-066",),
+                ))
+                ports.git.remote = "new-base"
+                ports.git.relevant_document_changes = mock.Mock(
+                    return_value=("docs/plans/[G-066] Changed.md",),
+                )
+                ports.validation.prepare_maintenance_context = mock.Mock(
+                    return_value=SimpleNamespace(active_sha="new-base"),
+                )
+                ports.validation.maintenance_change_context = mock.Mock(return_value="changes")
+                ports.validation.maintenance_prompt = mock.Mock(return_value="correct the plan")
+                ports.validation.validate_maintenance_result = mock.Mock(return_value=None)
+                ports.agent.result = replace(ports.agent.result, message=revised_result)
+                coordinator = PlanningLifecycleCoordinator(ports)
+                run = coordinator._new_run(self.context)
+
+                self.assertIsNone(coordinator._workspace._prepare_workspace(run))
+                self.assertEqual(
+                    ports.git.relevant_document_changes.call_args.args[-1], ("G-066",),
+                )
+                self.assertTrue(ports.state.snapshot.planning_result_pending_validation)
+                self.assertEqual(ports.state.snapshot.planning_correction_error,
+                                 old_error if linked else None)
+                run = coordinator._new_run(self.context)  # restart after base adoption
+                self.assertIsNone(coordinator._workspace._prepare_workspace(run))
+                ports.git.relevant_document_changes.assert_called_once()
+                self.assertIsNone(coordinator._assessment._run_planner_turn(run))
+                self.assertEqual(ports.agent.resumed_session, "saved-session")
+                if linked:
+                    ports.git.remote = "later-base"
+                    stale = coordinator._assessment._validate_planner_result(run)
+                    self.assertEqual(stale.kind,
+                                     PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED)
+                    self.assertEqual(ports.state.snapshot.planning_error, old_error)
+                    ports.git.remote = "new-base"
+                self.assertIsNone(coordinator._assessment._validate_planner_result(run))
+                self.assertEqual(ports.state.snapshot.planning_error,
+                                 None if linked else "independent error")
+
+    def test_unrelated_advance_does_not_schedule_completed_unsafe_again(self):
+        result = 'MAINTENANCE_RESULT: {"outcome":"unsafe","reason":"old evidence"}'
+        error = "post-refactor revalidation이 제품 목표 보존을 확정하지 못했습니다: old evidence"
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/planning",
+            planning_attempt_fingerprint="original-input",
+            planning_workspace_owned=1, planner_session_id="saved-session",
+            planning_result=result, planning_result_completed=True,
+            planning_error=error, planning_error_origin="unsafe", last_error=error,
+        ), maintenance_cycle(
+            phase=maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+            cycle_base_sha="base", revalidation_plan_ids=("G-066",),
+        ))
+        ports.git.remote = "new-base"
+        ports.validation.prepare_maintenance_context = mock.Mock(return_value=object())
+        ports.validation.maintenance_change_context = mock.Mock(return_value="")
+        coordinator = PlanningLifecycleCoordinator(ports)
+
+        self.assertIsNone(coordinator._workspace._prepare_workspace(
+            coordinator._new_run(self.context),
+        ))
+        self.assertTrue(ports.state.snapshot.planning_result_completed)
+        self.assertFalse(ports.state.snapshot.planning_result_pending_validation)
+        self.assertIsNone(ports.state.snapshot.planning_correction_error)
+
+    def test_additional_related_advance_rebinds_one_pending_correction(self):
+        result = 'MAINTENANCE_RESULT: {"outcome":"unsafe","reason":"old evidence"}'
+        error = "post-refactor revalidation이 제품 목표 보존을 확정하지 못했습니다: old evidence"
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/planning",
+            planning_attempt_fingerprint="original-input",
+            planning_workspace_owned=1, planner_session_id="saved-session",
+            planning_result=result, planning_result_completed=True,
+            planning_error=error, planning_error_origin="unsafe", last_error=error,
+        ), maintenance_cycle(
+            phase=maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+            cycle_base_sha="base", revalidation_plan_ids=("G-066",),
+        ))
+        ports.git.remote = "new-base"
+        ports.git.relevant_document_changes = mock.Mock(side_effect=(
+            ("docs/plans/[G-066] Target.md",),
+            ("docs/PRODUCT.md",),
+        ))
+        ports.validation.prepare_maintenance_context = mock.Mock(return_value=object())
+        ports.validation.maintenance_change_context = mock.Mock(return_value="")
+        coordinator = PlanningLifecycleCoordinator(ports)
+
+        self.assertIsNone(coordinator._workspace._prepare_workspace(
+            coordinator._new_run(self.context),
+        ))
+        ports.git.remote = "latest-base"
+        self.assertIsNone(coordinator._workspace._prepare_workspace(
+            coordinator._new_run(self.context),
+        ))
+        row = ports.state.snapshot
+        self.assertEqual(row.planning_correction_sha, "latest-base")
+        self.assertIn("[G-066] Target.md", row.planning_validation_error)
+        self.assertIn("docs/PRODUCT.md", row.planning_validation_error)
+        self.assertEqual(row.planner_session_id, "saved-session")
+        self.assertTrue(row.planning_result_pending_validation)
+        self.assertIsNone(row.planning_result)
+        self.assertEqual(ports.git.relevant_document_changes.call_count, 2)
+
     def test_recorded_workspace_fetch_preserves_saved_planner_scope_during_remote_race(self):
         from tests.support.origin import remote_fixture, advance_remote, git
         from loop_manager_internal.storage import database
@@ -291,6 +662,7 @@ class PlanningRecoveryTest(PlanningCase):
             planning_result="saved result", planning_result_completed=True,
             planning_error="old validation failure",
             planning_validation_error="old validation failure",
+            planning_error_origin="validation", planning_retry_count=3,
         ))
         ports.git.remote = "new-base"
         ports.git.relevant_document_changes = mock.Mock(return_value=(
@@ -304,10 +676,12 @@ class PlanningRecoveryTest(PlanningCase):
         self.assertFalse(ports.state.snapshot.planning_result_completed)
         self.assertIn("[R-051] Relevant.md",
                       ports.state.snapshot.planning_validation_error)
-        self.assertEqual(ports.state.snapshot.planning_error,
-                         ports.state.snapshot.planning_validation_error)
+        self.assertEqual(ports.state.snapshot.planning_error, "old validation failure")
+        self.assertEqual(ports.state.snapshot.planning_correction_error,
+                         "old validation failure")
+        self.assertEqual(ports.state.snapshot.planning_correction_sha, "new-base")
         self.assertEqual(ports.state.snapshot.planner_session_id, "saved-session")
-        self.assertEqual(ports.state.snapshot.planning_result, "saved result")
+        self.assertIsNone(ports.state.snapshot.planning_result)
 
     def test_planner_resolves_owned_plan_file_rebase_conflict_in_saved_session(self):
         with tempfile.TemporaryDirectory() as directory:

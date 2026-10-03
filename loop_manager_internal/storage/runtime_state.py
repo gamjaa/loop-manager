@@ -83,6 +83,12 @@ PROJECT_ONLY_FIELDS = frozenset(
         "planning_result",
         "planning_error",
         "planning_error_fingerprint",
+        "planning_error_incident_id",
+        "planning_error_origin",
+        "planning_correction_error",
+        "planning_correction_incident_id",
+        "planning_correction_sha",
+        "planning_correction_context",
     }
 )
 
@@ -120,6 +126,12 @@ PLANNING_CLEAR_VALUES: Mapping[str, object] = {
     "planning_result": None,
     "planning_error": None,
     "planning_error_fingerprint": None,
+    "planning_error_incident_id": None,
+    "planning_error_origin": None,
+    "planning_correction_error": None,
+    "planning_correction_incident_id": None,
+    "planning_correction_sha": None,
+    "planning_correction_context": None,
 }
 
 EXECUTION_CLEAR_VALUES: Mapping[str, object] = {
@@ -223,6 +235,12 @@ class PlanningSnapshot:
     planning_result: str | None
     planning_error: str | None
     planning_error_fingerprint: str | None
+    planning_error_incident_id: str | None
+    planning_error_origin: str | None
+    planning_correction_error: str | None
+    planning_correction_incident_id: str | None
+    planning_correction_sha: str | None
+    planning_correction_context: str | None
     active_sha: str | None
     worktree: str | None
     last_error: str | None
@@ -263,6 +281,12 @@ class PlanningSnapshot:
             planning_error_fingerprint=_text(
                 row, "planning_error_fingerprint"
             ),
+            planning_error_incident_id=_text(row, "planning_error_incident_id"),
+            planning_error_origin=_text(row, "planning_error_origin"),
+            planning_correction_error=_text(row, "planning_correction_error"),
+            planning_correction_incident_id=_text(row, "planning_correction_incident_id"),
+            planning_correction_sha=_text(row, "planning_correction_sha"),
+            planning_correction_context=_text(row, "planning_correction_context"),
             active_sha=_text(row, "active_sha"),
             worktree=_text(row, "worktree"),
             last_error=_text(row, "last_error"),
@@ -568,11 +592,28 @@ class RuntimeStateRepository:
 
     def _update_project_row(self, repo: str, values: Mapping[str, object]) -> None:
         self._validate_fields(values, PROJECT_UPDATE_FIELDS)
-        if "planning_error" in values and values["planning_error"] is None:
+        values = dict(values)
+        if "planning_error" in values:
+            if "planning_correction_error" not in values:
+                values.update(
+                    planning_correction_error=None,
+                    planning_correction_incident_id=None,
+                    planning_correction_sha=None,
+                    planning_correction_context=None,
+                )
             previous = self.connection.execute(
-                "SELECT planning_error FROM projects WHERE repo = ?", (repo,),
+                "SELECT planning_error, planning_error_incident_id "
+                "FROM projects WHERE repo = ?", (repo,),
             ).fetchone()
-            if previous is not None and previous[0]:
+            if values["planning_error"] is None:
+                values["planning_error_incident_id"] = None
+                values["planning_error_origin"] = None
+            elif (previous is None or previous["planning_error"] != values["planning_error"]
+                  or not previous["planning_error_incident_id"]):
+                values.setdefault("planning_error_incident_id", uuid4().hex)
+                if previous is None or previous["planning_error"] != values["planning_error"]:
+                    values.setdefault("planning_error_origin", None)
+            if values["planning_error"] is None and previous is not None and previous[0]:
                 notifications.release_block(self.connection, repo, "planning")
                 self._fault("after_planning_block_release")
         assignments = ", ".join(f"{field} = ?" for field in values)
@@ -655,6 +696,39 @@ class RuntimeStateRepository:
             self._fault("after_project_update")
             if enqueue:
                 self._enqueue(repo)
+
+    def release_planning_correction(
+        self, repo: str, *, error: str, active_sha: str, context: str,
+    ) -> bool:
+        """Release only the incident linked to this freshly validated result."""
+        with _transaction(self.connection):
+            row = self.connection.execute(
+                "SELECT planning_error, planning_correction_error, "
+                "planning_error_incident_id, planning_correction_incident_id, "
+                "planning_correction_sha, planning_correction_context, "
+                "active_sha, planning_result_completed FROM projects WHERE repo = ?",
+                (repo,),
+            ).fetchone()
+            if row is None or not (
+                row["planning_error"] == error
+                and row["planning_correction_error"] == error
+                and bool(row["planning_error_incident_id"])
+                and row["planning_error_incident_id"] == row["planning_correction_incident_id"]
+                and row["planning_correction_sha"] == active_sha
+                and row["planning_correction_context"] == context
+                and row["active_sha"] == active_sha
+                and row["planning_result_completed"]
+            ):
+                return False
+            self.update_project(repo, {
+                "planning_error": None,
+                "planning_error_fingerprint": None,
+                "planning_correction_error": None,
+                "planning_correction_incident_id": None,
+                "planning_correction_sha": None,
+                "planning_correction_context": None,
+            })
+            return True
 
     def complete_rebase(
         self, expected, checkpoint_repository, *,

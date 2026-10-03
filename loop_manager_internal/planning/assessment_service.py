@@ -554,6 +554,11 @@ class PlanningAssessmentService(PlanningService):
                 values.update(
                     planning_error=message,
                     planning_error_fingerprint=run.current_fingerprint,
+                    planning_error_origin="validation",
+                    planning_correction_error=None,
+                    planning_correction_incident_id=None,
+                    planning_correction_sha=None,
+                    planning_correction_context=None,
                 )
             self._ports.state.update(context.repo, **values)
             self._ports.events.error(message)
@@ -612,7 +617,12 @@ class PlanningAssessmentService(PlanningService):
                 context.repo,
                 planning_error=message,
                 planning_error_fingerprint=run.current_fingerprint,
+                planning_error_origin="unsafe",
                 last_error=message,
+                planning_correction_error=None,
+                planning_correction_incident_id=None,
+                planning_correction_sha=None,
+                planning_correction_context=None,
             )
             self._ports.events.error(message)
             return PlanningOutcome(
@@ -625,9 +635,21 @@ class PlanningAssessmentService(PlanningService):
         )
         run.maintenance_decision = decision
         run.validated_result = validated_result
-        if row.planning_error and row.planning_error == row.planning_validation_error:
-            self._ports.state.update(
-                context.repo, planning_error=None, planning_error_fingerprint=None,
+        if row.planning_error and row.planning_correction_error:
+            if self._ports.git.fetch_base(context.repo_path, context.base_branch) != row.active_sha:
+                return PlanningOutcome(
+                    PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED,
+                    detail="검증 중 원격 입력이 전진해 최신 기준에서 다시 확인합니다.",
+                    error=True,
+                )
+            cycle = run.maintenance_cycle
+            correction_context = (
+                f"{cycle.phase.value}:{cycle.revision}"
+                if run.maintenance_planning else "general"
             )
-            run.row = self._ports.state.planning(context.repo)
+            if self._ports.state.release_planning_correction(
+                context.repo, error=row.planning_error,
+                active_sha=str(row.active_sha or ""), context=correction_context,
+            ):
+                run.row = self._ports.state.planning(context.repo)
         return None
