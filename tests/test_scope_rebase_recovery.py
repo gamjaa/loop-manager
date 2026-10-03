@@ -44,6 +44,7 @@ class ScopeRebaseRecoveryTest(AgentScopeFixture, unittest.TestCase):
                 plan_sha,
                 loop_manager.planning_input_fingerprint(repo, "main"),
             )
+            self._confirm_general_plan_input(connection, repo, plan_sha)
             plan = connection.execute(
                 "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
                 (str(repo),),
@@ -294,6 +295,7 @@ class ScopeRebaseRecoveryTest(AgentScopeFixture, unittest.TestCase):
                 plan_sha,
                 loop_manager.planning_input_fingerprint(repo, "main"),
             )
+            self._confirm_general_plan_input(connection, repo, plan_sha)
             plan = connection.execute(
                 "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
                 (str(repo),),

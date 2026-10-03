@@ -13,6 +13,12 @@ from loop_manager_internal.planning.planning_contracts import (
 )
 
 class PlanningSelectionService(PlanningService):
+    def _plan_declarations_match(
+        self, context: PlanningContext, base_sha: str,
+    ) -> bool:
+        current = self._ports.git.plan_declarations(context.repo_path, base_sha)
+        return self._ports.state.plan_declarations_match(context.repo, current)
+
     def _gate_preserved_error(self, run: _PlanningRun) -> PlanningOutcome | None:
         """Check the failed input before scheduling or stale-workspace cleanup."""
 
@@ -359,16 +365,20 @@ class PlanningSelectionService(PlanningService):
         base_sha: str,
         current_fingerprint: str,
     ) -> bool:
+        if not self._plan_declarations_match(context, base_sha):
+            return True
         if row.planning_fingerprint == current_fingerprint:
             return False
         if row.planning_fingerprint and row.processed_sha:
-            processed = self._ports.git.input_fingerprint(
+            processed = self._ports.git.nonplan_fingerprint(
                 context.repo_path, row.processed_sha
             )
-            if processed == current_fingerprint:
+            current = self._ports.git.nonplan_fingerprint(context.repo_path, base_sha)
+            if processed == current:
                 return False
             if self._ports.git.requirement_archive_only(
-                context.repo_path, row.processed_sha, base_sha
+                context.repo_path, row.processed_sha, base_sha,
+                verified_plan_declarations=True,
             ):
                 return False
         return True
@@ -400,7 +410,8 @@ class PlanningSelectionService(PlanningService):
             if processed == current_fingerprint:
                 return False
             if self._ports.git.requirement_archive_only(
-                context.repo_path, row.processed_sha, base_sha
+                context.repo_path, row.processed_sha, base_sha,
+                verified_plan_declarations=self._plan_declarations_match(context, base_sha),
             ):
                 return False
         return True
@@ -543,6 +554,7 @@ class PlanningSelectionService(PlanningService):
             not run.maintenance_planning
             and not row.phase
             and row.planning_fingerprint == run.current_fingerprint
+            and self._plan_declarations_match(context, run.base_sha)
             and not forced_general_planning
         ):
             self._ports.state.update(
@@ -563,10 +575,14 @@ class PlanningSelectionService(PlanningService):
             and row.processed_sha
             and not forced_general_planning
         ):
-            processed = self._ports.git.input_fingerprint(
-                context.repo_path, row.processed_sha
+            declarations_match = self._plan_declarations_match(context, run.base_sha)
+            processed = self._ports.git.nonplan_fingerprint(
+                context.repo_path, row.processed_sha,
             )
-            if processed == run.current_fingerprint:
+            current = self._ports.git.nonplan_fingerprint(
+                context.repo_path, run.base_sha,
+            )
+            if declarations_match and processed == current:
                 self._ports.state.update(
                     context.repo,
                     processed_sha=run.base_sha,
@@ -577,8 +593,9 @@ class PlanningSelectionService(PlanningService):
                 )
                 planning_required = False
                 run.fingerprint_skipped = True
-            elif self._ports.git.requirement_archive_only(
-                context.repo_path, row.processed_sha, run.base_sha
+            elif declarations_match and self._ports.git.requirement_archive_only(
+                context.repo_path, row.processed_sha, run.base_sha,
+                verified_plan_declarations=True,
             ):
                 self._ports.state.update(
                     context.repo,

@@ -118,6 +118,7 @@ class FakeStatePort:
         self.maintenance_due_reason = "interval_reached"
         self.maintenance_begin_count = 0
         self.document_approval_pending = False
+        self.plan_declarations_match_result = True
         self.schedule_result = SimpleNamespace(
             active=None,
             has_ready=False,
@@ -131,6 +132,12 @@ class FakeStatePort:
 
     def planning(self, _repo):
         return self.snapshot
+
+    def plan_declarations_match(self, _repo, _entries):
+        return self.plan_declarations_match_result
+
+    def record_general_plan_declarations(self, _repo, _revision, _entries):
+        self.plan_declarations_match_result = True
 
     def maintenance_cycle(self, _repo):
         return self.cycle
@@ -311,6 +318,7 @@ class FakeGitPort:
         self.remote = "base"
         self.fingerprint = "fingerprint"
         self.fingerprints = {}
+        self.nonplan_fingerprints = {}
         self.specification_fingerprints = {}
         self.dirty_files = []
         self.ancestor = True
@@ -352,10 +360,16 @@ class FakeGitPort:
     def input_fingerprint(self, _repo_path, _sha):
         return self.fingerprints.get(_sha, self.fingerprint)
 
+    def nonplan_fingerprint(self, _repo_path, sha):
+        return self.nonplan_fingerprints.get(sha, self.fingerprints.get(sha, self.fingerprint))
+
+    def plan_declarations(self, _repo_path, _sha):
+        return {}
+
     def specification_fingerprint(self, _repo_path, sha):
         return self.specification_fingerprints.get(sha, "specification")
 
-    def requirement_archive_only(self, *_args):
+    def requirement_archive_only(self, *_args, **_kwargs):
         return False
 
     def validate_workspace_identity(self, *_args):

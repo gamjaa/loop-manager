@@ -17,6 +17,7 @@ from loop_manager_internal.maintenance.maintenance_orchestration import (
 )
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanMode, MaintenancePlanningContext
 from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.storage import planning_input_state
 from loop_manager_internal.planning import planning_runtime
 from loop_manager_internal.catalog.execplan_catalog import plan_content_hash
 from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventoryError
@@ -137,6 +138,7 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
         del ports.tiered
         ports.state.advance_maintenance_cycle.return_value = cycle
         ports.state.schedule.return_value = decision
+        ports.state.execplan_rows.return_value = []
         ports.state.maintenance_due.return_value = maintenance_state.ReviewDue(
             True, "stabilization_due", 10, maintenance_state.MaintenancePhase.IDLE,
         )
@@ -1052,6 +1054,9 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
                     "transition",
                     autospec=True,
                     side_effect=fail_refactoring_transition,
+                ), mock.patch(
+                    "loop_manager_internal.planning.tiered_assessment.enabled",
+                    return_value=False,
                 ):
                     first = self._run_registered(
                         connection, state_dir, repo_path, agent
@@ -1095,6 +1100,9 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
 
                 with mock.patch(
                     "loop_manager.git", side_effect=record_recovery_git
+                ), mock.patch(
+                    "loop_manager_internal.planning.tiered_assessment.enabled",
+                    return_value=False,
                 ):
                     second = self._run_registered(
                         connection, state_dir, repo_path, agent
@@ -1134,8 +1142,10 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
         connection = self._connection()
         connection.execute(
             "UPDATE projects SET planning_fingerprint = 'cycle-one', "
-            "specification_fingerprint = 'spec-one' WHERE repo = '/one'"
+            "specification_fingerprint = 'spec-one', processed_sha = ? WHERE repo = '/one'",
+            ("a" * 40,),
         )
+        planning_input_state.record_general(connection, "/one", "a" * 40, {})
         repository = maintenance_state.MaintenanceRepository(connection)
         cycle, _ = self._legacy_cycle(connection, "/one", "a" * 40)
         with mock.patch.object(loop_manager, "_run_project_step", return_value=0), mock.patch.object(

@@ -10,6 +10,7 @@ from pathlib import PurePosixPath
 import re
 import sqlite3
 from typing import Callable, Iterator, Sequence
+from . import planning_input_state
 
 
 ARCHIVE_ITEMS_SCHEMA = """
@@ -411,6 +412,16 @@ class ExecPlanArchiveRepository:
                 if (commit_oid is not None and self.apply_catalog is not None
                         and not self.apply_catalog(base_sha, commit_oid, candidates)):
                     raise _ArchiveCatalogSuperseded
+                if commit_oid is not None and self.apply_catalog is not None:
+                    planning_input_state.advance_verified_delta(
+                        self.connection, repo, commit_oid,
+                        {
+                            candidate.active_path: (
+                                ("blob", candidate.content_hash), None,
+                            )
+                            for candidate in candidates
+                        },
+                    )
         except _ArchiveCatalogSuperseded:
             return ArchiveWriteResult.SUPERSEDED
         return ArchiveWriteResult.APPLIED

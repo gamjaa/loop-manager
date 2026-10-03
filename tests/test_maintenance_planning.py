@@ -290,6 +290,7 @@ class ApprovedDocumentPlanTest(unittest.TestCase):
                 mock.patch.object(loop_manager, "_assert_mutable_ready_snapshot_current"),
                 mock.patch.object(loop_manager, "_register_execplan_rows"),
                 mock.patch.object(loop_manager, "_clear_active_in_current_transaction"),
+                mock.patch.object(loop_manager, "plan_declarations", return_value={path: ("blob", "f" * 40)}),
             ):
                 for _ in range(2):
                     loop_manager._apply_general_planning_batch(

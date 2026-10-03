@@ -13,7 +13,7 @@ from loop_manager_internal.notifications import notifications
 from loop_manager_internal.recovery import scoped_blocking, blocked_remote_observation
 from . import (execplan_catalog_state, execplan_archive_state, requirement_archive_state,
                agent_invocation_state, validation_feedback_state, recovery_state,
-               blocked_checkpoint_state, maintenance_state)
+               blocked_checkpoint_state, maintenance_state, planning_input_state)
 
 
 SCHEMA = """
@@ -459,6 +459,7 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
     connection.execute(GUIDANCE_APPROVALS_SCHEMA)
     connection.execute(EXECPLAN_CANCELLATIONS_SCHEMA)
     connection.execute(GENERAL_PLANNING_PUBLICATIONS_SCHEMA)
+    planning_input_state.ensure_schema(connection)
     agent_invocation_state.ensure_schema(connection)
     validation_feedback_state.ensure_schema(connection)
     validation_feedback_state.ValidationFeedbackRepository(connection).migrate_legacy()

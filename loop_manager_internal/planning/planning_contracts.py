@@ -370,7 +370,8 @@ class PlanningGitPort(Protocol):
     def specification_fingerprint(self, repo_path: Path, sha: str) -> str: ...
 
     def requirement_archive_only(
-        self, repo_path: Path, old_sha: str, new_sha: str
+        self, repo_path: Path, old_sha: str, new_sha: str,
+        *, verified_plan_declarations: bool = False,
     ) -> bool: ...
 
     def validate_workspace_identity(

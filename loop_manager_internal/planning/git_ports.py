@@ -21,6 +21,8 @@ class PlanningGitPortsEffects:
     _is_requirement_archive_only_change: Callable[..., object]
     _recorded_base_fetch: Callable[..., object]
     _planning_input_fingerprint: Callable[..., object]
+    _nonplan_input_fingerprint: Callable[..., object]
+    plan_declarations: Callable[..., object]
     _specification_input_fingerprint: Callable[..., object]
     changed_files: Callable[..., object]
     git: Callable[..., object]
@@ -88,13 +90,23 @@ class _PlanningGitPorts:
     def input_fingerprint(self, repo_path: Path, sha: str) -> str:
         return self._effects._planning_input_fingerprint(repo_path, sha)
 
+    def nonplan_fingerprint(self, repo_path: Path, sha: str) -> str:
+        return self._effects._nonplan_input_fingerprint(repo_path, sha)
+
+    def plan_declarations(self, repo_path: Path, sha: str) -> dict[str, tuple[str, str]]:
+        return self._effects.plan_declarations(repo_path, sha)
+
     def specification_fingerprint(self, repo_path: Path, sha: str) -> str:
         return self._effects._specification_input_fingerprint(repo_path, sha)
 
     def requirement_archive_only(
-        self, repo_path: Path, old_sha: str, new_sha: str
+        self, repo_path: Path, old_sha: str, new_sha: str,
+        *, verified_plan_declarations: bool = False,
     ) -> bool:
-        return self._effects._is_requirement_archive_only_change(repo_path, old_sha, new_sha)
+        return self._effects._is_requirement_archive_only_change(
+            repo_path, old_sha, new_sha,
+            verified_plan_declarations=verified_plan_declarations,
+        )
 
     def validate_workspace_identity(
         self, repo: str, fingerprint: str, worktree: Path

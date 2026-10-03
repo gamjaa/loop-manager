@@ -40,9 +40,9 @@ priority: high
 
 ## Progress
 
-- [ ] 원격 입력 분류와 사용자 active-plan 변경 trigger 연결
-- [ ] 일반·유지보수 게시 및 archive의 검증된 비교 기준 보존
-- [ ] 호환 저장·중단 복구와 관련 targeted 회귀 검증
+- [x] 원격 입력 분류와 사용자 active-plan 변경 trigger 연결
+- [x] 일반·유지보수 게시 및 archive의 검증된 비교 기준 보존
+- [x] 호환 저장·중단 복구와 관련 targeted 회귀 검증
 - [ ] Manager 전체 verify, 독립 Review 및 사용자 Merge
 
 ## Decision Log
@@ -51,3 +51,7 @@ priority: high
 - 현재 catalog의 G-066과 G-112~G-114는 Worker prompt·runtime·Planner 투영·Codex 경계를 담당하며 이 입력 분류 변경을 포함하지 않는다. 해당 작업과 과거 완료 계획을 재계획하지 않는다.
 - 일반 게시의 원격 확인·mutable READY CAS·원자 적용과 유지보수 게시 intent를 재사용한다. 검증된 자동 delta를 소비하는 일과 전체 작업을 확인한 성공을 구분해 G-132가 제한된 점검 기준을 안전하게 사용할 수 있게 한다.
 - priority는 `high`다. 사용자가 바꾼 예정 작업을 자동 실행 전에 반영하는 핵심 계획 경계를 다룬다. R-049의 실행 선택 변경을 근거로 하며 새로운 제품 목표나 게시 권한을 추가하지 않는다.
+- 2026-10-03: 전체 입력 지문을 active ExecPlan을 포함하는 v3으로 올리고, 기존 코드·문서 비교 범위는 v2의 별도 비교 함수로 유지했다. 일반 계획의 성공 revision과 계획 선언 경로·내용 해시 기준을 `general` scope 및 형식과 함께 저장한다. 유지보수 게시와 검증된 ExecPlan archive는 원자 적용된 계획 delta만 이 기준에 반영한다. 후속 원격 사용자 계획 변경은 게시 배치 경로를 보존하는 한 별도 입력으로 남긴다. 기존 성공 revision의 저장 지문이 v2와 재대조될 때만 비교를 재사용하며, 그렇지 않으면 일반 Planner를 선택한다.
+- 2026-10-03: Reviewer 지적에 따라 legacy `processed_sha`는 Planner 실행 없이 전진할 수 있음을 확인했다. 따라서 v2 지문과 해당 revision의 선언이 일치해도 과거 사용자 계획 변경의 검토를 증명하지 못한다. 저장된 검증 기준이 없는 기존 DB는 일반 Planner로 기준을 확정하며, 같은 기준을 요구하는 완료 판정도 보류한다.
+
+- 2026-10-03: Reviewer의 동시 archive 회귀를 수정했다. 저장된 검증 선언과 현재 active ExecPlan이 일치하는 선택·완료 판정에서만 Requirement archive와 내용 보존 ExecPlan archive를 함께 분류한다. 진행 중 Planner 결과의 복구는 엄격한 기본 판정을 유지한다. READY 유무·반복 관측, 미검증 이동, 사용자 계획·코드·archive 내용 변경 및 완료 판정의 targeted 회귀를 확인했다.

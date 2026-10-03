@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
+from loop_manager_internal.storage import planning_input_state
 from tests.support.git import git_command
 from tests.support.worker import dummy_worker_sessions
 
@@ -33,6 +34,7 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
             "(repo, last_success_merged_count, file_assessment_start_merged_count) "
             "VALUES (?, 0, 0)", (repo,),
         )
+        planning_input_state.record_general(connection, repo, "base-sha", {})
         connection.commit()
         return connection, repo
 
@@ -62,6 +64,69 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
             connection.execute(
                 "UPDATE projects SET planning_fingerprint = 'older' WHERE repo = ?", (repo,),
             )
+            self.assertIsNone(loop_manager._stable_work_reason(
+                connection, repo, refactoring_review_interval=5,
+            ))
+        connection.close()
+
+    def test_dual_archive_completion_requires_verified_plan_baseline(self):
+        connection, repo = self._connection()
+        self.addCleanup(connection.close)
+        plan = "docs/plans/[G-018] Work.md"
+        previous = {
+            b"docs/requirements/R.md": (b"blob", b"requirement"),
+            plan.encode(): (b"blob", b"plan"),
+        }
+        current = {
+            b"docs/requirements/archive/R.md": (b"blob", b"requirement"),
+            b"docs/plans/archive/[G-018] Work.md": (b"blob", b"plan"),
+        }
+        connection.execute("UPDATE projects SET processed_sha = 'old-base' WHERE repo = ?", (repo,))
+        connection.execute("UPDATE exec_plans SET status = 'MERGED' WHERE repo = ?", (repo,))
+        planning_input_state.record_general(connection, repo, "old-base", {plan: ("blob", "plan")})
+        with mock.patch("loop_manager.git") as command, mock.patch(
+            "loop_manager._planning_input_fingerprint", return_value="archived-full"
+        ), mock.patch(
+            "loop_manager._specification_input_fingerprint", return_value="archived-spec"
+        ), mock.patch(
+            "loop_manager._git_tree_entries",
+            side_effect=lambda _repo, sha: previous if sha == "old-base" else current,
+        ):
+            command.return_value.stdout = "archived-base\n"
+            self.assertIsNone(loop_manager._stable_work_reason(
+                connection, repo, refactoring_review_interval=5,
+            ))
+            planning_input_state.advance_verified_delta(
+                connection, repo, "archived-base", {plan: (("blob", "plan"), None)},
+            )
+            for _ in range(2):
+                result = loop_manager._stable_work_reason(
+                    connection, repo, refactoring_review_interval=5,
+                )
+                self.assertIsNotNone(result)
+                self.assertTrue(result.completed)
+
+    def test_legacy_processed_sha_cannot_confirm_unreviewed_plan(self):
+        connection, repo = self._connection()
+        connection.execute(
+            "DELETE FROM planning_input_baselines WHERE repo = ?", (repo,),
+        )
+        connection.execute(
+            "UPDATE projects SET processed_sha = 'base-sha', "
+            "planning_fingerprint = 'legacy-v2' WHERE repo = ?", (repo,),
+        )
+        with mock.patch("loop_manager.git") as git_command, mock.patch(
+            "loop_manager._planning_input_fingerprint", return_value="current-v3"
+        ), mock.patch(
+            "loop_manager._nonplan_input_fingerprint", return_value="legacy-v2"
+        ), mock.patch(
+            "loop_manager._specification_input_fingerprint", return_value="spec-one"
+        ), mock.patch(
+            "loop_manager.plan_declarations", return_value={}
+        ), mock.patch(
+            "loop_manager._git_tree_entries", return_value={}
+        ):
+            git_command.return_value.stdout = "base-sha\n"
             self.assertIsNone(loop_manager._stable_work_reason(
                 connection, repo, refactoring_review_interval=5,
             ))

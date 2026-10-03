@@ -17,6 +17,7 @@ from loop_manager_internal.maintenance.maintenance_orchestration import (
 )
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanMode, MaintenancePlanningContext
 from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.storage import planning_input_state
 from loop_manager_internal.planning import planning_runtime
 from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventoryError
 from tests.support.git import commit_and_push, git_command, make_remote_repository
@@ -163,6 +164,16 @@ class MaintenanceCycleCase(unittest.TestCase):
                 "WHERE repo = ? AND plan_id = ?",
                 (status, repo, plan_id),
             )
+        planning_input_state.record_general(
+            connection, repo, plan_sha,
+            loop_manager.plan_declarations(repo_path, plan_sha),
+        )
+        connection.execute(
+            "UPDATE projects SET processed_sha = ?, planning_fingerprint = ?, "
+            "specification_fingerprint = ? WHERE repo = ?",
+            (plan_sha, loop_manager._planning_input_fingerprint(repo_path, plan_sha),
+             loop_manager._specification_input_fingerprint(repo_path, plan_sha), repo),
+        )
         # These cases exercise recovery and ordering of a legacy cycle that
         # was already active when the file-assessment schedule was introduced.
         cycle, started = self._legacy_cycle(

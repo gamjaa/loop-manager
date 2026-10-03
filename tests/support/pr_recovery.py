@@ -1,6 +1,7 @@
 import sqlite3
 from pathlib import Path
 import loop_manager
+from loop_manager_internal.storage import planning_input_state
 from tests.support.catalog import write_execplan
 from tests.support.git import (
     git_command,
@@ -50,6 +51,11 @@ class PrRecoveryFixture:
             plan_sha,
             loop_manager.planning_input_fingerprint(repo, "main"),
         )
+        with connection:
+            planning_input_state.record_general(
+                connection, str(repo), plan_sha,
+                loop_manager.plan_declarations(repo, plan_sha),
+            )
         branch, worktree = loop_manager.expected_execplan_workspace(
             state_dir, str(repo), "G-026"
         )

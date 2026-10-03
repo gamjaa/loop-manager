@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
+from loop_manager_internal.storage import planning_input_state
 from tests.support.catalog import write_execplan
 from tests.support.git import git_command, make_remote_repository, commit_and_push
 from tests.support.worker import dummy_worker_context, dummy_worker_sessions, legacy_planning_ports
@@ -59,9 +60,6 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
             historical = write_execplan(
                 blocked_repo, "G-009", "Unverified Historical"
             )
-            archive = blocked_repo / "docs/plans/archive"
-            archive.mkdir()
-            historical.rename(archive / historical.name)
 
             blocked_plan = write_execplan(
                 blocked_repo,
@@ -119,7 +117,25 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                     ),
                 ),
             )
-            for repo, plan_id, plan_path, title, dependencies, priority, plan_sha in (
+            planning_input_state.record_general(
+                connection, str(blocked_repo), blocked_plan_sha,
+                loop_manager.plan_declarations(blocked_repo, blocked_plan_sha),
+            )
+            planning_input_state.record_general(
+                connection, str(runnable_repo), runnable_plan_sha,
+                loop_manager.plan_declarations(runnable_repo, runnable_plan_sha),
+            )
+            for repo, plan_id, plan_path, title, dependencies, priority, plan_sha, status in (
+                (
+                    blocked_repo,
+                    "G-009",
+                    historical,
+                    "Unverified Historical",
+                    (),
+                    "normal",
+                    blocked_plan_sha,
+                    "PLAN_BLOCKED",
+                ),
                 (
                     blocked_repo,
                     "G-010",
@@ -128,6 +144,7 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                     ("G-009",),
                     "critical",
                     blocked_plan_sha,
+                    "READY",
                 ),
                 (
                     runnable_repo,
@@ -137,6 +154,7 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                     (),
                     "high",
                     runnable_plan_sha,
+                    "READY",
                 ),
             ):
                 connection.execute(
@@ -145,7 +163,7 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                         repo, plan_id, path, title, sources, depends_on, priority,
                         content_hash, status, plan_sha
                     ) VALUES (?, ?, ?, ?, '["docs/PRODUCT.md"]', ?, ?,
-                              ?, 'READY', ?)
+                              ?, ?, ?)
                     """,
                     (
                         str(repo),
@@ -155,6 +173,7 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                         json.dumps(dependencies),
                         priority,
                         loop_manager.file_hash(plan_path),
+                        status,
                         plan_sha,
                     ),
                 )
@@ -237,7 +256,7 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
         )
         self.assertEqual(
             [tuple(row) for row in blocked_catalog],
-            [("G-010", "READY")],
+            [("G-009", "PLAN_BLOCKED"), ("G-010", "READY")],
         )
         self.assertEqual(runnable_status, "IMPLEMENTING")
 
@@ -553,6 +572,10 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                         str(repo),
                     ),
                 )
+                planning_input_state.record_general(
+                    connection, str(repo), baseline_sha,
+                    loop_manager.plan_declarations(repo, baseline_sha),
+                )
                 connection.commit()
                 roles = []
 
@@ -619,6 +642,10 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                 WHERE repo = ?
                 """,
                 (selected_fingerprint, selected_sha, str(repo)),
+            )
+            planning_input_state.record_general(
+                connection, str(repo), selected_sha,
+                loop_manager.plan_declarations(repo, selected_sha),
             )
             connection.commit()
 
