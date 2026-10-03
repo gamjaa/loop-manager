@@ -18,8 +18,9 @@ from loop_manager_internal.maintenance.maintenance_orchestration import (
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanMode, MaintenancePlanningContext
 from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.planning import planning_runtime
+from loop_manager_internal.catalog.execplan_catalog import plan_content_hash
 from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventoryError
-from tests.support.git import commit_and_push, git_command, make_remote_repository
+from tests.support.git import advance_remote_file, commit_and_push, git_command, make_remote_repository
 from tests.support.worker import dummy_worker_context
 from tests.support.catalog import plan_text
 
@@ -663,6 +664,79 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
         self.assertEqual(project["phase"], "PLANNING")
         self.assertIn("goal preservation is uncertain", project["planning_error"])
         self.assertEqual(plan["status"], "READY")
+
+    def test_remote_target_edit_recovers_unsafe_in_same_session_and_completes_cycle(self):
+        # Real Git, catalog, validation and SQLite; only the external Agent is scripted.
+        with tempfile.TemporaryDirectory() as directory:
+            repo_path, state_dir, connection, repo = self._integration_project(
+                directory,
+                (("G-000", "Merged Foundation", "MERGED", (), "normal"),
+                 ("G-001", "Ready Feature", "READY", ("G-000",), "critical")),
+            )
+            base = git_command(repo_path, "rev-parse", "origin/main")
+            self._enter_revalidation(connection, repo, base)
+            calls = []
+            original = 'MAINTENANCE_RESULT: {"outcome":"unsafe","reason":"old target evidence"}'
+
+            def agent(worktree, _state, _config, role, prompt, **kwargs):
+                if role != "planner":
+                    return loop_manager.CodexResult(1, "stop worker", "worker-session")
+                calls.append((worktree, kwargs.get("session_id"), prompt))
+                self.assertLessEqual(len(calls), 2)
+                return loop_manager.CodexResult(
+                    0, original if len(calls) == 1 else
+                    'MAINTENANCE_RESULT: {"outcome":"revalidated"}', "unsafe-session",
+                )
+
+            try:
+                first = self._run_registered(connection, state_dir, repo_path, agent)
+                self.assertEqual(first.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+                saved = connection.execute(
+                    "SELECT * FROM projects WHERE repo = ?", (repo,),
+                ).fetchone()
+                self.assertEqual(saved["planning_result"], original)
+                self.assertTrue(saved["planning_result_completed"])
+                self.assertIn("old target evidence", saved["planning_error"])
+                self.assertEqual(git_command(Path(saved["worktree"]), "status", "--porcelain"), "")
+                # An unchanged retry must retain the completed unsafe result.
+                self._run_registered(connection, state_dir, repo_path, agent)
+                self.assertEqual(len(calls), 1)
+                target = "docs/plans/[G-001] Ready Feature.md"
+                updated = (repo_path / target).read_text(encoding="utf-8") + "\nUpdated target evidence.\n"
+                latest = advance_remote_file(directory, repo_path, target, updated, "Revise target evidence")
+                real_git = loop_manager.git
+                pushes = []
+
+                def record_git(path, *arguments, **kwargs):
+                    if arguments and arguments[0] == "push":
+                        pushes.append(arguments)
+                    return real_git(path, *arguments, **kwargs)
+
+                with mock.patch("loop_manager.git", side_effect=record_git):
+                    self._run_registered(connection, state_dir, repo_path, agent)
+                completed = maintenance_state.MaintenanceRepository(connection).get(repo)
+                project = connection.execute(
+                    "SELECT planning_error FROM projects WHERE repo = ?", (repo,),
+                ).fetchone()
+                plan = connection.execute(
+                    "SELECT content_hash FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+                    (repo,),
+                ).fetchone()
+                self.assertEqual(len(calls), 2)
+                self.assertEqual(calls[1][0], calls[0][0])
+                self.assertEqual(calls[1][1], "unsafe-session")
+                self.assertIn(target, calls[1][2])
+                self.assertEqual(completed.phase, maintenance_state.MaintenancePhase.IDLE)
+                self.assertEqual(completed.last_success_commit, latest)
+                self.assertIsNone(project["planning_error"])
+                self.assertEqual(plan["content_hash"], plan_content_hash(updated))
+                self.assertEqual(pushes, [])
+                diagnostics = [p.read_text(encoding="utf-8") for p in
+                               (state_dir / "logs").rglob("*.txt")]
+                self.assertTrue(any(original in text and saved["planning_error"] in text
+                                    and "unsafe-session" in text for text in diagnostics))
+            finally:
+                connection.close()
 
     def test_stale_revalidation_snapshot_rejects_result_before_ready_worker(self):
         with tempfile.TemporaryDirectory() as directory:

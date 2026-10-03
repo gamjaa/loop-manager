@@ -136,6 +136,48 @@ class PlanningRecoveryTest(PlanningCase):
             "include_active_requirements"
         ])
 
+    def test_combined_maintenance_code_change_resets_exhausted_error_once(self):
+        for archive_only in (False, True):
+            with self.subTest(archive_only=archive_only):
+                cycle = maintenance_cycle(
+                    phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                    cycle_base_sha="base", include_general_planning=True, revision=1,
+                )
+                error = "saved validation failure"
+                ports = FakePorts(planning_snapshot(
+                    phase="PLANNING", active_sha="base", worktree="/planning",
+                    planning_attempt_fingerprint="original-input", planning_workspace_owned=1,
+                    planner_session_id="saved-session", planning_retry_count=3,
+                    planning_error=error, planning_error_origin="validation",
+                    planning_validation_error=error,
+                    planning_error_fingerprint=maintenance_planning_fingerprint(cycle, "old-input"),
+                ), cycle)
+                ports.git.fingerprints = {"base": "old-input", "new-base": "code-input"}
+                ports.git.remote = "new-base"
+                ports.git.relevant_document_changes = mock.Mock(return_value=())
+                ports.git.requirement_archive_only = mock.Mock(return_value=archive_only)
+                ports.validation.prepare_maintenance_context = mock.Mock(return_value=SimpleNamespace())
+                ports.validation.maintenance_change_context = mock.Mock(return_value="")
+                coordinator = PlanningLifecycleCoordinator(ports)
+
+                coordinator._workspace._prepare_workspace(coordinator._new_run(self.context))
+
+                saved = ports.state.snapshot
+                self.assertEqual(saved.active_sha, "new-base")
+                self.assertEqual(saved.planning_retry_count, 3 if archive_only else 0)
+                self.assertEqual(bool(saved.planning_result_pending_validation), not archive_only)
+                self.assertEqual(saved.planning_error, error)
+                self.assertEqual(saved.planner_session_id, "saved-session")
+                self.assertEqual(ports.state.diagnostics[-1].planning_retry_count, 3)
+                if not archive_only:
+                    self.assertEqual(saved.planning_correction_error, error)
+                    self.assertEqual(saved.planning_correction_sha, "new-base")
+                    coordinator._workspace._prepare_workspace(coordinator._new_run(self.context))
+                    self.assertEqual(ports.state.snapshot.planning_correction_incident_id,
+                                     saved.planning_correction_incident_id)
+                    self.assertEqual(len(ports.state.diagnostics), 1)
+                self.assertEqual(ports.agent.run_count, 0)
+
     def test_fresh_unsafe_records_error_origin_for_later_correction(self):
         ports = FakePorts(planning_snapshot(
             phase="PLANNING", active_sha="base", worktree="/planning",

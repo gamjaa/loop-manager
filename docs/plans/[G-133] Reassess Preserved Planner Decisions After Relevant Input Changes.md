@@ -78,6 +78,10 @@ Worker targeted 실행(모두 최종 통과):
 - Review 피드백: 일반 Planner는 READY 대상의 `sources` 밖에 새로 생긴 활성 Requirement도 재평가하며, 일반 planning이 결합되지 않은 유지보수 판단은 무관한 Requirement와 전체 지문 변경만으로 소진된 오류를 재시도하지 않는다. 새 fake-port unit case 3건과 내용 보존 archive 회귀 case 1건을 개별 실행해 통과했다.
 - Manager verify 피드백: 관련 source 변경을 가정하던 기존 fake-port case에 READY 평가 대상과 변경 문서 응답이 빠져 있었다. 둘을 명시하고 `python3 -m unittest tests.test_planning_selection.PlanningSelectionTest.test_failed_maintenance_input_restarts_after_related_source_change`를 개별 실행해 통과했다.
 
+- Review 후속: 일반 planning을 포함하는 유지보수 cycle에서 문서 변경 없이 전체 입력 지문만 변경돼도 소진된 validation 오류의 교정을 예약하도록 조건을 보완했다. 내용 보존 archive와 일반 planning이 없는 유지보수의 무관 입력은 계속 오류를 보존한다.
+- `python3 -m unittest tests.test_planning_recovery.PlanningRecoveryTest.test_combined_maintenance_code_change_resets_exhausted_error_once tests.test_planning_recovery.PlanningRecoveryTest.test_unrelated_maintenance_requirement_does_not_reset_exhausted_error` — 최초 실행은 새 fake-port fixture의 maintenance context 응답 누락으로 실패했다. 응답을 명시한 뒤 동일 명령 재실행에서 2 cases 모두 통과했다.
+- `tests/test_maintenance_cycle.py::MaintenanceCycleTest.test_remote_target_edit_recovers_unsafe_in_same_session_and_completes_cycle`를 추가했다. 기존 격리 remote·실제 Git/SQLite/catalog/validation fixture에서 무수정 unsafe 보존, 동일 입력 무호출, 별도 clone의 대상 commit/push, 같은 session/worktree의 revalidated, idle·오류 해제·catalog 반영·원래 오류 감사와 불필요한 push 부재를 확인한다. Worker의 integration 실행 금지에 따라 실행하지 않았으며 기존 verify의 unittest discover로 Manager가 실행한다. 새 루트 파일이나 검증 스크립트 변경은 없다.
+
 ## Decision Log
 
 - 2026-10-03: 사용자는 “관련 원격 입력 변경 후 보존된 Planner 판단 재평가와 오류 해제” 범위의 새 ExecPlan 작성을 요청했다. 기존 PRODUCT와 MERGED된 G-118의 누락된 복구 동작을 수정하므로 새 Requirement나 제품 정책을 추가하지 않는다. `sources`는 현재 PRODUCT로 두고 G-118은 복구 계약·감사 참조로 사용한다. 이미 구현된 경계의 보완이므로 새 미완료 선행 계획은 없으며 `depends_on`은 비워 둔다.

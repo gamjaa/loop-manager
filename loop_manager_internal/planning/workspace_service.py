@@ -188,7 +188,9 @@ class PlanningWorkspaceService(PlanningService):
                 )
                 relevant_failed_input_change = bool(
                     changed_documents or
-                    (not run.maintenance_planning and not unchanged_failed_input)
+                    ((not run.maintenance_planning
+                      or run.maintenance_cycle.include_general_planning)
+                     and not unchanged_failed_input)
                 )
                 linked_error = self._linked_failed_result(run)
                 if row.agent_snapshot:
