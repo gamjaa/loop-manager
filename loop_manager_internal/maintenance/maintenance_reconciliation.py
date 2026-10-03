@@ -614,25 +614,37 @@ def synthesis_pages(progress: ReconciliationProgress) -> tuple[str, ...]:
         *(('relation', result) for result in progress.completed),
         *(('excluded_candidate', candidate) for candidate in progress.excluded_candidates),
     )
-    pages = []
+    fragments = []
     for record_index, (kind, record) in enumerate(records):
         text = json.dumps({"kind": kind, "value": record}, ensure_ascii=False, sort_keys=True)
-        # Preserve record boundaries for independent sessions. Neighbouring
-        # fragments remain retrievable from the durable evidence bundle.
+        # Split oversized records losslessly, then pack small records together.
+        # Neighbouring fragments remain retrievable from the evidence bundle.
         fragment_limit = SYNTHESIS_PAGE_CHARS - 256  # Reserve space for record/part metadata.
         count = (len(text) + fragment_limit - 1) // fragment_limit
         width = (len(text) + count - 1) // count
-        pages.extend(f"record={record_index} kind={kind} part={part + 1}/{count}\n" + text[offset:offset + width]
-                     for part, offset in enumerate(range(0, len(text), width)))
+        fragments.extend((record_index, text[offset:offset + width])
+                         for offset in range(0, len(text), width))
+    pages, body, first, last = [], "", 0, 0
+    for record_index, fragment in fragments:
+        if body and len(body) + len(fragment) > SYNTHESIS_PAGE_CHARS - 256:
+            pages.append(f"records={first}-{last}\n" + body)
+            body = ""
+        if not body:
+            first = record_index
+        last = record_index
+        body += fragment
+    if body:
+        pages.append(f"records={first}-{last}\n" + body)
     return tuple(pages)
 
 
 def synthesis_prompt(page: SynthesisPage, manifest: Path) -> str:
     return (
-        "유지보수 종합의 증거 페이지를 순서대로 검토하라. 파일을 수정하지 마라. "
+        "유지보수 종합의 증거 페이지를 검토하라. 파일을 수정하지 마라. "
+        "한 페이지에는 연속된 여러 JSON 기록 또는 큰 기록의 조각이 포함될 수 있다. "
         "이것은 이미 검증된 파일 검토·관계 결과이며 원본 전체를 다시 읽지 마라. "
         "큰 JSON 기록은 여러 페이지에 걸칠 수 있다. 단일 파일의 구조 문제도 포함해 "
-        "독립된 세션에서 판단하라. 다른 조각의 문맥이 필요하면 아래 증거 manifest와 "
+        "관련 기록을 함께 판단하라. 다른 조각의 문맥이 필요하면 아래 증거 manifest와 "
         "같은 record의 인접 페이지 또는 관련 관계만 제한된 크기로 조회하라. "
         "이전 세션의 기억에 의존하지 마라. "
         "최종 계획 및 FINDINGS_RESULT는 모든 페이지를 처리한 다음 요청한다.\n"
@@ -719,7 +731,7 @@ class SynthesisRepository:
                 progress: ReconciliationProgress) -> SynthesisPage:
         pages = synthesis_pages(progress)
         digest = hashlib.sha256(json.dumps(
-            ["independent-pages-v2", cycle, revision, pages], ensure_ascii=False,
+            ["packed-pages-v3", cycle, revision, pages], ensure_ascii=False,
         ).encode()).hexdigest()
         with self.connection:
             row = self.connection.execute(
@@ -861,6 +873,39 @@ class SynthesisRepository:
 
     def resolution_session(self, repo: str, unit: ResolutionUnit, session_id: str) -> None:
         self._update_resolution(repo, unit, "session_id = ?", (session_id,))
+
+    def resolution_batch(self, repo: str, unit: ResolutionUnit, count: int) -> tuple[ResolutionUnit, ...]:
+        row = self.connection.execute(
+            "SELECT results_json FROM provisional_synthesis WHERE repo = ? AND digest = ?",
+            (repo, unit.digest),
+        ).fetchone()
+        if row is None:
+            raise ReconciliationError("최종 판단의 종합 근거가 바뀌었습니다.")
+        assessments = json.loads(row[0])
+        saved = {item[0]: item[1:] for item in self.connection.execute(
+            "SELECT page_index, result_json, session_id, validation_error "
+            "FROM provisional_synthesis_resolutions WHERE repo = ? AND digest = ? AND decision_digest = ?",
+            (repo, unit.digest, unit.decision_digest),
+        )}
+        units = []
+        for index in range(unit.index, len(assessments)):
+            previous = saved.get(index)
+            if previous and previous[0] is not None:
+                continue
+            session, error = previous[1:] if previous else (None, None)
+            if units and (len(units) >= count or session or error):
+                break
+            if previous is None:
+                with self.connection:
+                    self.connection.execute(
+                        "INSERT OR REPLACE INTO provisional_synthesis_resolutions VALUES (?, ?, ?, ?, NULL, NULL, NULL)",
+                        (repo, index, unit.digest, unit.decision_digest),
+                    )
+            units.append(ResolutionUnit(unit.digest, unit.decision_digest, index, assessments[index],
+                                        unit.finding_keys, unit.manifest, session, error))
+            if session or error:
+                break
+        return tuple(units)
 
     def resolution_fail(self, repo: str, unit: ResolutionUnit, error: str) -> None:
         self._update_resolution(repo, unit, "validation_error = ?", (error[:2000],))

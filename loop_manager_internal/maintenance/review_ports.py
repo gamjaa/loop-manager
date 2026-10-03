@@ -56,6 +56,9 @@ class _PlanningFileReviewPorts:
     def complete(self, repo: str, cycle_revision: int, source: maintenance_file_inventory.TrackedSource, result: dict) -> None:
         self._repository.complete(repo, cycle_revision, source, result)
 
+    def pending_units(self, repo: str, progress):
+        return self._repository.pending_units(repo, progress)
+
     def fail(self, repo: str, cycle_revision: int, source: maintenance_file_inventory.TrackedSource, error: str) -> None:
         self._repository.fail(repo, cycle_revision, source, error)
 
@@ -101,6 +104,14 @@ class _PlanningReconciliationPorts:
     def synthesis_complete(self, repo: str, page, output: str) -> None:
         self._synthesis.complete(repo, page, output)
 
+    def synthesis_batch(self, page, progress, count: int):
+        texts = maintenance_reconciliation.synthesis_pages(progress)
+        end = min(page.total, page.index + (1 if page.session_id else count))
+        return tuple(maintenance_reconciliation.SynthesisPage(
+            page.digest, index, page.total, texts[index],
+            page.session_id if index == page.index else None,
+        ) for index in range(page.index, end))
+
     def content(self, repository: Path, base: str, source: maintenance_file_inventory.TrackedSource) -> bytes:
         return maintenance_file_review.source_bytes(repository, base, source)
 
@@ -125,6 +136,9 @@ class _PlanningReconciliationPorts:
 
     def resolution_session(self, repo, unit, session_id):
         self._synthesis.resolution_session(repo, unit, session_id)
+
+    def resolution_batch(self, repo, unit, count):
+        return self._synthesis.resolution_batch(repo, unit, count)
 
     def resolution_complete(self, repo, unit, output):
         self._synthesis.resolution_complete(repo, unit, output)

@@ -1,5 +1,6 @@
 """Planning lifecycle coordinator: dispatch durable state through phase services."""
 from __future__ import annotations
+import time
 from loop_manager_internal.planning.planning_contracts import (
     MAX_PLANNER_VALIDATION_RETRIES, PlanningAgentResult, PlanningAgentResultKind,
     PlanningAgentPort, PlanningContext, PlanningDecision, PlanningDecisionKind,
@@ -47,10 +48,31 @@ class PlanningLifecycleCoordinator:
                             base_sha=context.base_sha, maintenance_planning=maintenance_planning)
 
     def run(self, context: PlanningContext) -> PlanningOutcome:
-        snapshot = snapshot_run(self._new_run(context))
-        for service, phase in self._handlers:
-            step = service.step(phase, snapshot)
-            snapshot = step.snapshot
-            if step.outcome is not None:
-                return step.outcome
-        raise RuntimeError("planning lifecycle ended without a typed outcome")
+        started, completed = time.monotonic(), 0
+        while True:
+            # Reload state and pass the normal input/workspace gates between batches.
+            snapshot = snapshot_run(self._new_run(context))
+            for service, phase in self._handlers:
+                step = service.step(phase, snapshot)
+                snapshot = step.snapshot
+                outcome = step.outcome
+                if outcome is None:
+                    continue
+                if outcome.kind is not PlanningOutcomeKind.ASSESSMENT_PROGRESS:
+                    return outcome
+                completed += 1
+                if (completed >= MAX_ASSESSMENT_BATCHES
+                    or time.monotonic() - started >= ASSESSMENT_RUN_SECONDS):
+                    self._ports.events.log(
+                        f"유지보수 실행 한도 도달: {completed}개 묶음 저장, 다음 실행에서 이어갑니다.")
+                    return PlanningOutcome(PlanningOutcomeKind.WAITING)
+                latest = self._ports.git.fetch_base(context.repo_path, context.base_branch)
+                if latest != context.base_sha:
+                    return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART, base_sha=latest)
+                break
+            else:
+                raise RuntimeError("planning lifecycle ended without a typed outcome")
+
+
+ASSESSMENT_RUN_SECONDS = 1800
+MAX_ASSESSMENT_BATCHES = 128

@@ -284,6 +284,22 @@ class ReconciliationUnitTest(unittest.TestCase):
 
 
 class SynthesisPagingTest(unittest.TestCase):
+    def test_small_records_share_pages_without_losing_any_source_or_review(self):
+        sources = tuple(source(f"src/{index}.py", b"def calculate(): return 1\n") for index in range(100))
+        reviews = tuple({"path": item.path, "evidence": "A small grounded review."} for item in sources)
+        progress = reconciliation.ReconciliationProgress(sources, (), (), None, file_reviews=reviews)
+        pages = reconciliation.synthesis_pages(progress)
+        self.assertLess(len(pages), 10)
+        body = "".join(page.partition("\n")[2] for page in pages)
+        decoder, records = json.JSONDecoder(), []
+        while body:
+            value, end = decoder.raw_decode(body)
+            records.append(value)
+            body = body[end:]
+        self.assertEqual([record["value"]["path"] for record in records],
+                         [item.path for item in sources] * 2)
+        self.assertEqual([record["kind"] for record in records], ["selected"] * 100 + ["file_review"] * 100)
+
     def setUp(self):
         self.connection = sqlite3.connect(":memory:")
         self.addCleanup(self.connection.close)

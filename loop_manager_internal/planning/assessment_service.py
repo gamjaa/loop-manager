@@ -15,6 +15,7 @@ from loop_manager_internal.maintenance import (
 from loop_manager_internal.storage import maintenance_state, maintenance_file_ledger
 from loop_manager_internal.planning.assessment_port import AssessmentError, AssessmentPort
 from loop_manager_internal.planning.planning_service import PlanningService
+from loop_manager_internal.planning.assessment_batches import MaintenanceAssessmentBatches
 from loop_manager_internal.planning.planning_contracts import (
     _PlanningRun, PlanningOutcome, PlanningOutcomeKind, PlanningAgentResultKind,
     MAX_PLANNER_VALIDATION_RETRIES,
@@ -293,64 +294,11 @@ class PlanningAssessmentService(PlanningService):
         return PlanningOutcome(PlanningOutcomeKind.NO_CHANGE)
 
     def _review_one_file(self, run: _PlanningRun, worktree: Path) -> PlanningOutcome | None:
-        """Persist at most one source-bound review unit per scheduler turn."""
-        context = run.context
-        review = self._ports.file_review
-        try:
-            progress = review.progress(
-                context.repo, context.repo_path, context.base_branch,
-                run.maintenance_cycle.revision, str(run.row.active_sha),
-            )
-            unit = progress.next_unit
-            if unit is None:
-                return None
-            content = review.content(context.repo_path, context.base_branch, unit.source)
-            prompt = maintenance_file_review.review_prompt(
-                unit.source, content, root_placements=progress.root_placements,
-            )
-            if unit.error:
-                prompt += "\n이전 검토 결과 오류를 수정하라: " + unit.error
-            review.start(context.repo, run.maintenance_cycle.revision, unit.source)
-        except (maintenance_file_review.FileReviewError, SourceInventoryError) as error:
-            self._ports.events.error(str(error))
-            return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART,
-                                   detail=str(error))
-        result, scope = run_scoped_planner_turn(
-            self._ports.agent, context.repo, "maintenance_planner", worktree, prompt, unit.session_id,
-            lambda session_id: review.session(
-                context.repo, run.maintenance_cycle.revision, unit.source, session_id,
-            ),
-        )
-        if scope.error:
-            self._ports.events.error(scope.error)
-            return self._operational_error()
-        if result.code:
-            self._ports.events.error(result.message)
-            if result.kind is PlanningAgentResultKind.TRANSIENT_FAILURE:
-                kind = PlanningOutcomeKind.TRANSIENT_PAUSE
-            elif result.kind is PlanningAgentResultKind.USAGE_LIMIT:
-                kind = PlanningOutcomeKind.USAGE_LIMIT_PAUSE
-            else:
-                kind = PlanningOutcomeKind.OPERATIONAL_ERROR
-            return PlanningOutcome(kind, error=True)
-        try:
-            # Re-read the current ref before accepting any Agent-supplied claim.
-            content = review.content(context.repo_path, context.base_branch, unit.source)
-            parsed = maintenance_file_review.parse_review(
-                result.message, unit.source, content,
-            )
-            review.complete(context.repo, run.maintenance_cycle.revision,
-                            unit.source, parsed)
-        except (maintenance_file_review.FileReviewError, SourceInventoryError) as error:
-            review.fail(context.repo, run.maintenance_cycle.revision,
-                        unit.source, str(error))
-            self._ports.events.error(str(error))
-            return PlanningOutcome(PlanningOutcomeKind.VALIDATION_RETRY,
-                                   detail=str(error))
-        return PlanningOutcome(PlanningOutcomeKind.WAITING)
+        """Review a bounded batch while preserving each source-bound receipt."""
+        return MaintenanceAssessmentBatches(self._ports).review_files(run, worktree)
 
     def _reconcile_one_relation(self, run: _PlanningRun, worktree: Path) -> PlanningOutcome | None:
-        """Verify one cross-file candidate per turn, retaining session progress."""
+        """Batch related candidates, then advance durable synthesis evidence."""
         context = run.context
         port = self._ports.reconciliation
         try:
@@ -359,98 +307,24 @@ class PlanningAssessmentService(PlanningService):
                 run.maintenance_cycle.revision, str(run.row.active_sha),
             )
             if progress.pending_scan:
-                return PlanningOutcome(PlanningOutcomeKind.WAITING)
+                return PlanningOutcome(PlanningOutcomeKind.ASSESSMENT_PROGRESS)
             relation = progress.next_relation
             if relation is None:
                 return self._synthesize_one_page(run, worktree, progress)
-            left = port.content(context.repo_path, context.base_branch, relation.left)
-            right = port.content(context.repo_path, context.base_branch, relation.right)
-            prompt = maintenance_reconciliation.relation_prompt(relation, left, right)
-            port.start(context.repo, run.maintenance_cycle.revision,
-                       str(run.row.active_sha), relation)
-            session_id, previous_error = port.unit(context.repo, relation)
-            if previous_error:
-                prompt += "\n이전 관계 확인 결과 오류를 수정하라: " + previous_error
+            return MaintenanceAssessmentBatches(self._ports).review_relations(run, worktree, progress)
         except (maintenance_reconciliation.ReconciliationError, maintenance_file_review.FileReviewError,
                 SourceInventoryError) as error:
             self._ports.events.error(str(error))
             return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART, detail=str(error))
-        result, scope = run_scoped_planner_turn(
-            self._ports.agent, context.repo, "maintenance_planner", worktree, prompt, session_id,
-            lambda value: port.session(context.repo, run.maintenance_cycle.revision,
-                                       relation, value),
-        )
-        if scope.error:
-            self._ports.events.error(scope.error)
-            return self._operational_error()
-        if result.code:
-            self._ports.events.error(result.message)
-            if result.kind is PlanningAgentResultKind.TRANSIENT_FAILURE:
-                kind = PlanningOutcomeKind.TRANSIENT_PAUSE
-            elif result.kind is PlanningAgentResultKind.USAGE_LIMIT:
-                kind = PlanningOutcomeKind.USAGE_LIMIT_PAUSE
-            else:
-                kind = PlanningOutcomeKind.OPERATIONAL_ERROR
-            return PlanningOutcome(kind, error=True)
-        try:
-            left = port.content(context.repo_path, context.base_branch, relation.left)
-            right = port.content(context.repo_path, context.base_branch, relation.right)
-            parsed = maintenance_reconciliation.parse_relation(result.message, relation, left, right)
-            port.complete(context.repo, run.maintenance_cycle.revision, relation, parsed)
-        except (maintenance_reconciliation.ReconciliationError, maintenance_file_review.FileReviewError,
-                SourceInventoryError) as error:
-            port.fail(context.repo, run.maintenance_cycle.revision, relation, str(error))
-            self._ports.events.error(str(error))
-            return PlanningOutcome(PlanningOutcomeKind.VALIDATION_RETRY, detail=str(error))
-        return PlanningOutcome(PlanningOutcomeKind.WAITING)
-
     def _synthesize_one_page(self, run: _PlanningRun, worktree: Path,
                              progress) -> PlanningOutcome | None:
-        """Assess one page independently; only its durable result crosses sessions."""
+        """Batch synthesis receipts, then collect the final findings."""
         context, port = run.context, self._ports.reconciliation
         page = port.synthesis(context.repo, run.maintenance_cycle.revision,
                               str(run.row.active_sha), progress)
         if page.index == page.total:
             return self._collect_findings_unit(run, worktree)
-        manifest = port.synthesis_export(context.repo, page, progress,
-                                         context.state_dir / "maintenance-evidence")
-        session_errors = []
-
-        def save_session(session_id):
-            try:
-                port.synthesis_session(context.repo, page, session_id)
-            except maintenance_reconciliation.ReconciliationError as error:
-                session_errors.append(str(error))
-
-        result, scope = run_scoped_planner_turn(
-            self._ports.agent, context.repo, "maintenance_planner", worktree,
-            maintenance_reconciliation.synthesis_prompt(page, manifest),
-            page.session_id, save_session,
-        )
-        if scope.error:
-            self._ports.events.error(scope.error)
-            return self._operational_error()
-        if result.code:
-            self._ports.events.error(result.message)
-            kind = {PlanningAgentResultKind.TRANSIENT_FAILURE: PlanningOutcomeKind.TRANSIENT_PAUSE,
-                    PlanningAgentResultKind.USAGE_LIMIT: PlanningOutcomeKind.USAGE_LIMIT_PAUSE}.get(
-                        result.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
-            return PlanningOutcome(kind, error=True)
-        try:
-            if session_errors:
-                raise maintenance_reconciliation.ReconciliationError(session_errors[0])
-            current = port.progress(context.repo, context.repo_path, context.base_branch,
-                                    run.maintenance_cycle.revision, str(run.row.active_sha))
-            fresh = port.synthesis(context.repo, run.maintenance_cycle.revision,
-                                   str(run.row.active_sha), current)
-            if fresh.key != page.key:
-                raise maintenance_reconciliation.ReconciliationError("종합 중 source가 바뀌었습니다.")
-            port.synthesis_complete(context.repo, page, result.message)
-        except (maintenance_reconciliation.ReconciliationError, maintenance_file_review.FileReviewError,
-                SourceInventoryError) as error:
-            self._ports.events.error(str(error))
-            return PlanningOutcome(PlanningOutcomeKind.VALIDATION_RETRY, detail=str(error))
-        return PlanningOutcome(PlanningOutcomeKind.WAITING)
+        return MaintenanceAssessmentBatches(self._ports).synthesize(run, worktree, progress, page)
 
     def _active_plan_statuses(self, repo: str) -> dict[str, str]:
         return {str(item["plan_id"]): str(item["status"])
@@ -488,33 +362,12 @@ class PlanningAssessmentService(PlanningService):
                 pass  # A new snapshot already invalidated the old unit.
             self._ports.events.error(str(error))
             return PlanningOutcome(PlanningOutcomeKind.VALIDATION_RETRY, detail=str(error))
-        return PlanningOutcome(PlanningOutcomeKind.WAITING)
+        return PlanningOutcome(PlanningOutcomeKind.ASSESSMENT_PROGRESS)
 
     def _resolve_one_page(self, run: _PlanningRun, worktree: Path,
                           unit: maintenance_reconciliation.ResolutionUnit) -> PlanningOutcome:
-        """Keep the final Planner result pending while one coverage receipt is validated."""
-        repo, port = run.context.repo, self._ports.reconciliation
-        result, scope = run_scoped_planner_turn(
-            self._ports.agent, repo, "maintenance_planner", worktree,
-            maintenance_reconciliation.resolution_prompt(unit), unit.session_id,
-            lambda session_id: port.resolution_session(repo, unit, session_id),
-        )
-        if scope.error:
-            self._ports.events.error(scope.error)
-            return self._operational_error()
-        if result.code:
-            self._ports.events.error(result.message)
-            kind = {PlanningAgentResultKind.TRANSIENT_FAILURE: PlanningOutcomeKind.TRANSIENT_PAUSE,
-                    PlanningAgentResultKind.USAGE_LIMIT: PlanningOutcomeKind.USAGE_LIMIT_PAUSE}.get(
-                        result.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
-            return PlanningOutcome(kind, error=True)
-        try:
-            port.resolution_complete(repo, unit, result.message)
-        except maintenance_reconciliation.ReconciliationError as error:
-            port.resolution_fail(repo, unit, str(error))
-            self._ports.events.error(str(error))
-            return PlanningOutcome(PlanningOutcomeKind.VALIDATION_RETRY, detail=str(error))
-        return PlanningOutcome(PlanningOutcomeKind.WAITING)
+        """Keep the final Planner result pending while batch coverage is validated."""
+        return MaintenanceAssessmentBatches(self._ports).resolve(run, worktree, unit)
 
     def _validate_planner_result(
         self, run: _PlanningRun

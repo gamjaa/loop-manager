@@ -476,6 +476,19 @@ class ProvisionalReviewRepository:
             selected, completed, unit, root_placement_inventory(inventory), roots,
         )
 
+    def pending_units(self, repo: str, progress: FileReviewProgress) -> tuple[ReviewUnit, ...]:
+        """Return individually resumable units after progress reconciled identities."""
+        completed = {item["path"] for item in progress.completed}
+        saved = {path: (session, error) for path, session, error in self.connection.execute(
+            "SELECT path, session_id, validation_error FROM provisional_file_reviews WHERE repo = ?",
+            (repo,),
+        )}
+        units = tuple(ReviewUnit(source, *saved.get(source.path, (None, None)))
+                      for source in progress.selected if source.path not in completed)
+        if not units and progress.next_unit is not None:
+            return (progress.next_unit,)
+        return units
+
     def start(self, repo: str, cycle_revision: int, source: TrackedSource) -> None:
         with self.connection:
             self.connection.execute(

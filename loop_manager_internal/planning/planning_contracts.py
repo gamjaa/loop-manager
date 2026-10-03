@@ -44,6 +44,7 @@ class PlanningOutcomeKind(str, Enum):
     NO_CHANGE = "no_change"
     REFACTORING = "refactoring"
     WAITING = "waiting"
+    ASSESSMENT_PROGRESS = "assessment_progress"
     UNSAFE_REVALIDATION = "unsafe_revalidation"
     VALIDATION_RETRY = "validation_retry"
     REMOTE_BASE_RESTART = "remote_base_restart"
