@@ -298,6 +298,16 @@ class FakeGitPort:
         self.remove_error = None
         self.advance_remote_on_push = False
 
+    def fetch_base(self, repo_path, base):
+        self.calls.append((str(repo_path), ("recorded_base_fetch", base), True))
+        return self.remote
+
+    def save_planning_correction(self, *_args):
+        pass
+
+    def planning_correction(self, *_args):
+        return None
+
     def run(self, repo, *arguments, check=True):
         self.calls.append((str(repo), arguments, check))
         if arguments[:2] == ("worktree", "remove") and self.remove_error:

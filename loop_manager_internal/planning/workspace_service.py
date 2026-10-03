@@ -20,6 +20,10 @@ class PlanningWorkspaceService(PlanningService):
         self, run: _PlanningRun, worktree: Path, target: str, detail: str,
         collision_paths: tuple[str, ...] = (), stash_sha: str = "",
     ) -> bool:
+        saved = self._ports.git.planning_correction(run.context.repo, worktree, target)
+        if saved is not None:
+            paths, was_rebase = saved
+            return self._finish_rebase_correction(run, worktree, target, paths, was_rebase)
         unmerged = tuple(sorted(filter(None, set(self._ports.git.run(
             worktree, "diff", "--name-only", "--diff-filter=U", "-z",
         ).stdout.split("\0")))))
@@ -124,8 +128,17 @@ class PlanningWorkspaceService(PlanningService):
             ).returncode != 1:
                 self._ports.events.error("FUTURE_IDEAS 충돌 내용을 병합해야 합니다.")
                 return False
-        if unmerged:
-            self._ports.git.run(worktree, "add", "--", *unmerged)
+        self._ports.git.save_planning_correction(
+            run.context.repo, worktree, target, unmerged, was_rebase,
+        )
+        return self._finish_rebase_correction(run, worktree, target, unmerged, was_rebase)
+
+    def _finish_rebase_correction(
+        self, run: _PlanningRun, worktree: Path, target: str,
+        paths: tuple[str, ...], was_rebase: bool,
+    ) -> bool:
+        if paths:
+            self._ports.git.run(worktree, "add", "--", *paths)
         in_rebase = rebase_in_progress(self._ports.git.run, worktree)
         if in_rebase:
             continued = self._ports.git.run(
@@ -197,11 +210,7 @@ class PlanningWorkspaceService(PlanningService):
         # This is a safe boundary: no Planner or verifier is using the
         # worktree. Recheck origin even when the project step began earlier.
         try:
-            self._ports.git.run(context.repo_path, "fetch", "origin")
-            latest = self._ports.git.run(
-                context.repo_path, "rev-parse", "--verify",
-                f"refs/remotes/origin/{context.base_branch}^{{commit}}",
-            ).stdout.strip()
+            latest = self._ports.git.fetch_base(context.repo_path, context.base_branch)
             if latest == row.active_sha:
                 # The SQLite base update may have committed immediately before
                 # a crash that left the preservation stash and journal behind.

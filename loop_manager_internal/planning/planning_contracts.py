@@ -336,6 +336,17 @@ class PlanningStatePort(Protocol):
 class PlanningGitPort(Protocol):
     """Git and managed planning-worktree boundary."""
 
+    def fetch_base(self, repo_path: Path, base: str) -> str: ...
+
+    def save_planning_correction(
+        self, repo: str, worktree: Path, target: str,
+        paths: tuple[str, ...], was_rebase: bool,
+    ) -> None: ...
+
+    def planning_correction(
+        self, repo: str, worktree: Path, target: str,
+    ) -> tuple[tuple[str, ...], bool] | None: ...
+
     def run(
         self, repo: Path, *arguments: str, check: bool = True
     ) -> Any: ...

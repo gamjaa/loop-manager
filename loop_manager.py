@@ -3555,6 +3555,7 @@ _PlanningGitPorts = _bind_effects(
         _git_operation_entries=lambda *args, **kwargs: _git_operation_entries(*args, **kwargs),
         _ignored_worktree_paths=lambda *args, **kwargs: _ignored_worktree_paths(*args, **kwargs),
         _is_requirement_archive_only_change=lambda *args, **kwargs: _is_requirement_archive_only_change(*args, **kwargs),
+        _recorded_base_fetch=lambda *args, **kwargs: _recorded_base_fetch(*args, **kwargs),
         _planning_input_fingerprint=lambda *args, **kwargs: _planning_input_fingerprint(*args, **kwargs),
         _specification_input_fingerprint=lambda *args, **kwargs: _specification_input_fingerprint(*args, **kwargs),
         changed_files=lambda *args, **kwargs: changed_files(*args, **kwargs),

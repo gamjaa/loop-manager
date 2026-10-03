@@ -241,6 +241,96 @@ class PlanningDocumentRelevanceTest(unittest.TestCase):
 
 
 class PlanningRebaseGitBoundaryTest(unittest.TestCase):
+    def test_correction_resumes_after_stage_without_repeating_planner(self):
+        from loop_manager_internal.planning import planning_rebase
+        from loop_manager_internal.planning.workspace_service import PlanningWorkspaceService
+        from tests.support.planning_case import FakePorts, planning_snapshot
+        for committed in (False, True):
+            for drift in (False, True):
+                with self.subTest(committed=committed, drift=drift), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    repo = root / "repo"
+                    repo.mkdir()
+                    armed = False
+
+                    def git(cwd, *args, check=True):
+                        nonlocal armed
+                        result = subprocess.run(
+                            ["git", *args], cwd=cwd, text=True,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        )
+                        if check and result.returncode:
+                            raise RuntimeError(result.stdout)
+                        if armed and args[:2] == ("add", "--"):
+                            armed = False
+                            raise RuntimeError("interrupted after stage")
+                        return result
+
+                    git(repo, "init", "-b", "main")
+                    git(repo, "config", "user.name", "Test")
+                    git(repo, "config", "user.email", "test@example.com")
+                    name = "docs/plans/Plan.md"
+                    (repo / name).parent.mkdir(parents=True)
+                    (repo / name).write_text("base\n")
+                    git(repo, "add", ".")
+                    git(repo, "commit", "-m", "base")
+                    old = git(repo, "rev-parse", "HEAD").stdout.strip()
+                    tree = root / "planning"
+                    git(repo, "worktree", "add", "--detach", str(tree), old)
+                    (tree / name).write_text("local\n")
+                    git(tree, "add", name)
+                    if committed:
+                        git(tree, "commit", "-m", "candidate")
+                    (repo / name).write_text("remote\n")
+                    git(repo, "add", name)
+                    git(repo, "commit", "-m", "remote")
+                    target = git(repo, "rev-parse", "HEAD").stdout.strip()
+                    args = (git, repo, root / "state", str(repo), tree, old, target)
+                    first = rebase_planning_worktree(*args)
+                    self.assertTrue(first.conflict)
+                    ports = FakePorts(planning_snapshot(planner_session_id="saved-session"))
+                    ports.git.run = git
+                    ports.git.save_planning_correction = lambda *a: planning_rebase.save_planning_correction(
+                        git, root / "state", *a,
+                    )
+                    ports.git.planning_correction = lambda *a: planning_rebase.planning_correction(
+                        git, root / "state", *a,
+                    )
+                    ports.git.accept_resolved_stash_conflict = lambda *a: accept_resolved_stash_conflict(
+                        git, root / "state", *a,
+                    )
+                    invoke = ports.agent.run_planner
+
+                    def resolve(tree, prompt, session, callback):
+                        (tree / name).write_text("remote\nlocal\n")
+                        return invoke(tree, prompt, session, callback)
+
+                    ports.agent.run_planner = resolve
+                    run = SimpleNamespace(
+                        maintenance_planning=False, row=ports.state.snapshot,
+                        context=SimpleNamespace(repo=str(repo)),
+                    )
+                    armed = True
+                    service = PlanningWorkspaceService(ports)
+                    with self.assertRaisesRegex(RuntimeError, "interrupted after stage"):
+                        service._resolve_rebase_conflict(
+                            run, tree, target, first.detail, first.conflict_paths, first.stash_sha,
+                        )
+                    self.assertEqual(git(tree, "ls-files", "-u").stdout, "")
+                    resumed = rebase_planning_worktree(*args)
+                    self.assertTrue(resumed.conflict)
+                    if drift:
+                        (tree / name).write_text("unapproved change\n")
+                        with self.assertRaisesRegex(PlanningRebaseError, "작업물이 달라"):
+                            service._resolve_rebase_conflict(run, tree, target, resumed.detail)
+                        self.assertEqual((tree / name).read_text(), "unapproved change\n")
+                    else:
+                        self.assertTrue(service._resolve_rebase_conflict(run, tree, target, resumed.detail))
+                        self.assertFalse(rebase_planning_worktree(*args).conflict)
+                        self.assertEqual((tree / name).read_text(), "remote\nlocal\n")
+                        complete_planning_rebase(git, root / "state", str(repo), tree, target)
+                    self.assertEqual(ports.agent.run_count, 1)
+
     def test_staged_overlap_becomes_resumable_conflict(self):
         for interrupted in (False, True, "legacy"):
             with self.subTest(interrupted=interrupted), tempfile.TemporaryDirectory() as directory:

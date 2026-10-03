@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import tempfile
 from uuid import uuid4
@@ -237,6 +238,7 @@ def rebase_planning_worktree(
         # Restore the stash on the rebased commit first: its index is relative
         # to the prepared commit, not the remote base. Keep that identity for
         # recovery after apply or reset completes immediately before a crash.
+        record.pop("correction", None)
         record["restored_head"] = head
         record["phase"] = phase = "applying"
         _write(path, record)
@@ -301,6 +303,77 @@ def rebase_planning_worktree(
     if record.get("restored_digest") != _restored_digest(git, worktree):
         raise PlanningRebaseError("보존 stash 복원 후 planning 작업물이 달라졌습니다.")
     return PlanningRebaseResult(target, True)
+
+
+def _correction_digest(git, worktree: Path, paths: tuple[str, ...]) -> str:
+    # Index stages change during "add"; bind the approved worktree bytes and
+    # all other index changes instead. Include deletions and untracked output.
+    names = set(paths)
+    for args in (("diff", "--name-only", "HEAD", "-z"),
+                 ("ls-files", "--others", "--exclude-standard", "-z")):
+        names.update(filter(None, _git_ok(git, worktree, *args).split("\0")))
+    files = []
+    for name in sorted(names):
+        file = worktree / name
+        if file.is_symlink():
+            value = ("link", os.readlink(file))
+        elif file.is_file():
+            value = ("file", file.read_bytes(), file.stat().st_mode & 0o111)
+        elif not file.exists():
+            value = ("deleted",)
+        else:
+            raise PlanningRebaseError(f"planning 교정 파일 형식이 유효하지 않습니다: {name}")
+        files.append((name, value))
+    other_index = _git_ok(
+        git, worktree, "diff", "--cached", "--binary", "HEAD", "--", ".",
+        *(f":(literal,exclude){name}" for name in paths),
+    )
+    return hashlib.sha256(repr((files, other_index)).encode()).hexdigest()
+
+
+def save_planning_correction(
+    git, state_dir: Path, repo: str, worktree: Path, target: str,
+    paths: tuple[str, ...], was_rebase: bool,
+) -> None:
+    """Persist a scope-checked correction before Manager stages its paths."""
+    path = _journal_path(state_dir, repo, worktree)
+    record = _read(path, repo, worktree)
+    if record is None or record["target"] != target or record["phase"] not in {"rebasing", "conflict"}:
+        raise PlanningRebaseError("planning 교정을 저장할 rebase 단계가 다릅니다.")
+    record["correction"] = {
+        "paths": list(paths), "was_rebase": was_rebase,
+        "head": _git_ok(git, worktree, "rev-parse", "HEAD"),
+        "digest": _correction_digest(git, worktree, paths),
+    }
+    _write(path, record)
+
+
+def planning_correction(
+    git, state_dir: Path, repo: str, worktree: Path, target: str,
+) -> tuple[tuple[str, ...], bool] | None:
+    """Resume only the unchanged correction whose Agent scope already passed."""
+    record = _read(_journal_path(state_dir, repo, worktree), repo, worktree)
+    if record is None or "correction" not in record:
+        return None
+    saved = record["correction"]
+    if (record["target"] != target or not isinstance(saved, dict)
+            or not isinstance(saved.get("paths"), list)
+            or not isinstance(saved.get("was_rebase"), bool)
+            or any(not isinstance(name, str) or (
+                name != "docs/FUTURE_IDEAS.md"
+                and re.fullmatch(r"docs/plans/[^/]+\.md", name) is None
+            ) for name in saved["paths"])):
+        raise PlanningRebaseError("planning 교정 기록의 대상·경로가 유효하지 않습니다.")
+    if saved.get("head") != _git_ok(git, worktree, "rev-parse", "HEAD"):
+        # A continued rebase can reach another commit's conflict. Its correction
+        # must come from the Planner, not the preceding commit's record.
+        if saved["was_rebase"] and record["phase"] == "rebasing":
+            return None
+        raise PlanningRebaseError("planning 교정 HEAD가 바뀌었습니다.")
+    paths = tuple(saved["paths"])
+    if saved.get("digest") != _correction_digest(git, worktree, paths):
+        raise PlanningRebaseError("검증된 planning 교정 후 작업물이 달라졌습니다.")
+    return paths, saved["was_rebase"]
 
 
 def complete_planning_rebase(git, state_dir: Path, repo: str, worktree: Path, target: str) -> None:

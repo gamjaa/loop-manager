@@ -40,6 +40,50 @@ from tests.support.planning_case import (
 )
 
 class PlanningRecoveryTest(PlanningCase):
+    def test_recorded_workspace_fetch_preserves_saved_planner_scope_during_remote_race(self):
+        from tests.support.origin import remote_fixture, advance_remote, git
+        from loop_manager_internal.storage import database
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, writer = remote_fixture(directory)
+            state_dir = Path(directory) / "state"
+            state_dir.mkdir()
+            connection = database.connect_database(state_dir, create=True)
+            self.addCleanup(connection.close)
+            tree = Path(directory) / "planning"
+            old = git(source, "rev-parse", "HEAD")
+            git(source, "worktree", "add", "--detach", str(tree), old)
+            repo = str(source)
+            connection.execute("INSERT INTO projects (repo, base_branch) VALUES (?, 'main')", (repo,))
+            connection.commit()
+            context = replace(self.context, repo=repo, repo_path=source, state_dir=state_dir)
+            before = loop_manager.capture_git_snapshot(tree)
+            snapshot = before.serialize()
+            connection.execute(
+                "UPDATE projects SET agent_snapshot=?, agent_role='planner', worktree=? WHERE repo=?",
+                (snapshot, str(tree), repo),
+            )
+            connection.commit()
+            loop_manager._recorded_base_fetch(source, state_dir, "main", owner="project")
+            # Origin advances after the outer fetch, while a saved scope exists.
+            latest = advance_remote(writer)
+            ports = FakePorts(planning_snapshot(
+                repo=repo, phase="PLANNING", active_sha=old, worktree=str(tree),
+                planning_workspace_owned=1, planner_session_id="saved-session",
+                agent_snapshot=snapshot, agent_role="planner",
+            ))
+            real_git = loop_manager._PlanningGitPorts(connection, source, state_dir)
+            ports.git.fetch_base = real_git.fetch_base
+            ports.git.remote = latest
+            real_agent = loop_manager._PlanningAgentPorts(connection, context, None)
+            ports.agent.validate_saved_scope = mock.Mock(wraps=real_agent.validate_saved_scope)
+            coordinator = PlanningLifecycleCoordinator(ports)
+            self.assertIsNone(coordinator._workspace._prepare_workspace(coordinator._new_run(context)))
+            self.assertIsNone(real_agent.validate_saved_scope("planner", tree, snapshot).error)
+            self.assertEqual(ports.agent.validate_saved_scope.call_count, 1)
+            self.assertEqual(git(source, "rev-parse", "origin/main"), latest)
+            self.assertEqual(ports.state.snapshot.planner_session_id, "saved-session")
+            self.assertEqual(git(source, "rev-parse", "HEAD"), old)
+
     def test_rebased_workspace_refreshes_sqlite_catalog_before_ready_snapshot(self):
         from tests.support.catalog import make_catalog_root, write_execplan
         from tests.support.maintenance_planning_case import git
