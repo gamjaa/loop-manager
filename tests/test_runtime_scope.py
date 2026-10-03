@@ -49,13 +49,25 @@ class RuntimeRecreationEvidenceTests(unittest.TestCase):
         self.assertTrue(self.proven())
         self.validate_lock.assert_called_once_with('loop-manager-runtime:old')
 
-    def test_missing_receipt_or_result_does_not_prove_recreation(self):
-        for path in (self.receipt_path, self.result_path):
+    def test_missing_receipt_or_journal_does_not_prove_recreation(self):
+        for path in (self.receipt_path, self.intent_path, self.result_path):
             with self.subTest(path=path):
                 saved = path.read_text()
                 path.unlink()
                 self.assertFalse(self.proven())
                 path.write_text(saved)
+
+    def test_malformed_receipt_or_journal_is_rejected_without_writing_evidence(self):
+        paths = (self.receipt_path, self.intent_path, self.result_path)
+        for path in paths:
+            original = path.read_bytes()
+            for malformed in ('{', '[]', 'null'):
+                with self.subTest(path=path, malformed=malformed):
+                    path.write_text(malformed)
+                    saved = {p: p.read_bytes() for p in paths}
+                    self.assertFalse(self.proven())
+                    self.assertEqual({p: p.read_bytes() for p in paths}, saved)
+            path.write_bytes(original)
 
     def test_unproven_previous_creation_is_rejected(self):
         self.validate_lock.side_effect = RuntimeError('unknown creation')
@@ -73,11 +85,22 @@ class RuntimeRecreationEvidenceTests(unittest.TestCase):
         for path, original, key, value in (
             (self.intent_path, self.intent, 'version', 2),
             (self.intent_path, self.intent, 'owner', 'worker'),
+            (self.intent_path, self.intent, 'id', 'other'),
+            (self.intent_path, self.intent, 'repo', '/other'),
             (self.intent_path, self.intent, 'target', '/other'),
+            (self.intent_path, self.intent, 'kind', 'runtime_create'),
+            (self.intent_path, self.intent, 'before', {'exists': False, 'registration': None}),
+            (self.intent_path, self.intent, 'expected', {'exists': True, 'registration': None}),
+            (self.result_path, self.result, 'id', 'other'),
             (self.result_path, self.result, 'status', 'aborted'),
             (self.result_path, self.result, 'candidates', {}),
             (self.result_path, self.result, 'observed', {'exists': True, 'registration': None}),
             (self.receipt_path, self.receipt, 'repo', '/other'),
+            (self.receipt_path, self.receipt, 'id', 'other'),
+            (self.receipt_path, self.receipt, 'target', '/other'),
+            (self.receipt_path, self.receipt, 'before', {
+                'exists': True, 'registration': {
+                    'head': self.sha, 'detached': True, 'locked': 'loop-manager-runtime:foreign'}}),
         ):
             with self.subTest(path=path, key=key):
                 path.write_text(json.dumps({**original, key: value}))
