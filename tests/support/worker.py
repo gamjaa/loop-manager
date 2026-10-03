@@ -66,6 +66,22 @@ def dummy_worker_sessions(test):
     return run
 
 
+@contextlib.contextmanager
+def legacy_planning_ports():
+    """Exercise preserved planning flows without the newer tiered review port."""
+    real_ports = loop_manager._PlanningLifecyclePorts
+
+    def ports_without_tiered(*args, **kwargs):
+        ports = real_ports(*args, **kwargs)
+        del ports.tiered
+        return ports
+
+    with mock.patch.object(
+        loop_manager, '_PlanningLifecyclePorts', side_effect=ports_without_tiered
+    ):
+        yield
+
+
 def decision(**changes):
     value = {
         "kind": "needs_user_decision",

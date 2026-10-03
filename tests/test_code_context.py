@@ -7,7 +7,7 @@ import unittest
 from unittest import mock
 
 from loop_manager_internal.maintenance import code_context, code_index
-from tests.test_code_index import inventory
+from tests.support.maintenance import inventory
 
 
 class CodeContextTest(unittest.TestCase):

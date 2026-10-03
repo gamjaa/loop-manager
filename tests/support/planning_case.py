@@ -103,6 +103,7 @@ class FakeStatePort:
         self.snapshot = snapshot
         self.cycle = cycle or maintenance_cycle()
         self.updates = []
+        self.diagnostics = []
         self.clear_calls = []
         self.activate_result = None
         self.recovered_cycle = self.cycle
@@ -209,7 +210,7 @@ class FakeStatePort:
         return self.activate_result
 
     def preserve_diagnostics(self, _repo, _snapshot):
-        pass
+        self.diagnostics.append(_snapshot)
 
     def clear_active(
         self,

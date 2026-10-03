@@ -7,7 +7,7 @@ from unittest import mock
 
 from loop_manager_internal.maintenance import code_index, tiered_review
 from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventory, ClassifiedPath, TrackedSource
-from tests.test_code_index import inventory
+from tests.support.maintenance import inventory
 
 
 class TieredReviewTest(unittest.TestCase):

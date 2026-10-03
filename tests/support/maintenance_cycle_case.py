@@ -20,7 +20,7 @@ from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.planning import planning_runtime
 from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventoryError
 from tests.support.git import commit_and_push, git_command, make_remote_repository
-from tests.support.worker import dummy_worker_context
+from tests.support.worker import dummy_worker_context, legacy_planning_ports
 from tests.support.catalog import plan_text
 
 
@@ -183,15 +183,6 @@ class MaintenanceCycleCase(unittest.TestCase):
         repo_path: Path,
         agent,
     ) -> loop_manager.ProjectRunResult:
-        # These scenarios resume cycles created before tiered module reviews.
-        # Keep their original planning path while exercising the real lifecycle.
-        real_ports = loop_manager._PlanningLifecyclePorts
-
-        def legacy_ports(*args, **kwargs):
-            ports = real_ports(*args, **kwargs)
-            del ports.tiered
-            return ports
-
         with mock.patch(
             "loop_manager.validate_repository", return_value=repo_path
         ), mock.patch(
@@ -200,9 +191,9 @@ class MaintenanceCycleCase(unittest.TestCase):
             "loop_manager.ensure_safe_base_worktree"
         ), mock.patch(
             "loop_manager.run_codex", side_effect=agent
-        ), mock.patch.object(
-            loop_manager, "_PlanningLifecyclePorts", side_effect=legacy_ports
-        ), dummy_worker_context(roles=("worker", "planner", "maintenance_planner")):
+        ), legacy_planning_ports(), dummy_worker_context(
+            roles=("worker", "planner", "maintenance_planner")
+        ):
             return loop_manager.run_project_result(
                 connection,
                 state_dir,

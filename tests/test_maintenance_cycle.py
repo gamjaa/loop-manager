@@ -353,6 +353,8 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
                 "현재 목표에 필요하지 않은 추상화·설정·파일 추가",
                 "오류 처리·보안·접근성·회귀 검증",
                 "결정·예외·실패 흐름과 Acceptance Criteria의 의미",
+                "원본을 실제로 읽는 파일별 단위",
+                "성공 ledger가 아니다",
             ):
                 with self.subTest(mode=mode, signal=signal):
                     self.assertIn(signal, prompt)

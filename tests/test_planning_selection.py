@@ -540,8 +540,10 @@ class PlanningSelectionTest(PlanningCase):
 
         self.assertEqual(ports.agent.run_count, 0)
         self.assertEqual(preserved.active_sha, "new-base")
-        self.assertEqual(preserved.planning_result, "saved result")
-        self.assertEqual(preserved.planning_error, preserved.planning_validation_error)
+        self.assertIsNone(preserved.planning_result)
+        self.assertEqual(ports.state.diagnostics[-1].planning_result, "saved result")
+        self.assertEqual(ports.state.diagnostics[-1].planning_error, "saved failure")
+        self.assertEqual(ports.state.diagnostics[-1].planning_validation_error, "saved failure")
         self.assertIn("docs/PRODUCT.md", preserved.planning_validation_error)
         self.assertTrue(preserved.planning_result_pending_validation)
         self.assertFalse(preserved.planning_result_completed)

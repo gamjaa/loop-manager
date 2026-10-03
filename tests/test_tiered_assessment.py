@@ -13,7 +13,7 @@ from loop_manager_internal.planning.planning_runtime import PlanningAgentResult,
 from loop_manager_internal.storage.maintenance_state import MaintenancePhase
 from loop_manager_internal.storage import maintenance_file_ledger
 from tests.support.planning_case import PlanningCase, FakePorts, planning_snapshot, maintenance_cycle
-from tests.test_code_index import inventory
+from tests.support.maintenance import inventory
 
 
 class TieredAssessmentTest(PlanningCase):
