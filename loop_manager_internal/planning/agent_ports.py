@@ -10,15 +10,40 @@ from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.application.contracts import TRANSIENT_AGENT_ERROR_PREFIX
 from loop_manager_internal.application.contracts import USAGE_LIMIT_ERROR_PREFIX
 from loop_manager_internal.notifications import notifications
-from loop_manager_internal.planning.planning_runtime import PlanningAgentResult
-from loop_manager_internal.planning.planning_runtime import PlanningAgentResultKind
-from loop_manager_internal.planning.planning_runtime import PlanningContext
-from loop_manager_internal.planning.planning_runtime import PlanningScopeResult
+from loop_manager_internal.planning.planning_contracts import PlanningAgentPort
+from loop_manager_internal.planning.planning_contracts import PlanningAgentResult
+from loop_manager_internal.planning.planning_contracts import PlanningAgentResultKind
+from loop_manager_internal.planning.planning_contracts import PlanningContext
+from loop_manager_internal.planning.planning_contracts import PlanningScopeResult
 from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
 from pathlib import Path
 import contextlib
 import sqlite3
 import threading
+
+
+def run_scoped_planner_turn(
+    agent: PlanningAgentPort,
+    repo: str,
+    role: str,
+    worktree: Path,
+    prompt: str,
+    session_id: str | None,
+    save_session: Callable[[str], None],
+) -> tuple[PlanningAgentResult, PlanningScopeResult]:
+    """Run one turn, preserving session writes and failed scope evidence.
+
+    Callback exceptions propagate; consumers retain their own error priorities
+    and result validation. Scope cleanup follows only a successful scope check.
+    """
+    before = agent.begin_scope(role, worktree)
+    result = agent.run_planner(worktree, prompt, session_id, save_session)
+    if result.session_id:
+        save_session(result.session_id)
+    scope = agent.finish_scope(role, worktree, before)
+    if not scope.error:
+        agent.clear_scope(repo)
+    return result, scope
 
 
 @dataclass(frozen=True)

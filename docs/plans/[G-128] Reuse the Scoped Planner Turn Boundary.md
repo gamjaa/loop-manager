@@ -71,11 +71,28 @@ source revision `f9c10ed921ed8fe39757a36c3ca27b77a0539ee8`에서 `planning/asses
 - 각 여섯 소비 경로에서 session owner, 일반 turn과 unit turn의 오류 우선순위, transient/usage/configuration 결과, source drift 재조회와 pending marker를 비교한다. 기존 `PlanningAssessmentTest.test_assessment_review_unit_precedes_planner_and_preserves_session`, `test_assessment_reconciles_one_relation_before_final_planner`, `test_final_decision_waits_for_one_resolution_without_rerunning_planner` 중 수정 경계에 해당하는 case를 선택한다.
 - Manager 전체 verify는 일반·유지보수 planning, legacy/pending 평가 재개, source 변조 거부, publication 전 성공 기준 보존, session fallback·격리와 standalone package import를 확인한다. 기존 실제 Git·CLI fake 회귀와 두 OS의 검증 범위는 줄이지 않는다. Reviewer는 callback/저장 순서와 scope 증거 보존을 읽기 전용으로 검토한다.
 
+### 구현 대응표와 검증 기록
+
+`agent_ports.run_scoped_planner_turn`은 begin → run(callback 저장) → 반환 session 저장 → finish → 성공 scope만 clear 순서를 소유하고 Agent/scope 결과를 그대로 반환한다. 예외를 잡거나 receipt·성공 기준을 기록하지 않는다. 타입 import는 `planning_contracts`를 직접 사용한다.
+
+| 소비자 | session 저장 owner | helper 밖에 보존한 정책 |
+| --- | --- | --- |
+| 일반/final turn | 최종 synthesis page가 있으면 해당 page, 이어 project Planner session | scope snapshot 저장, Agent 종료 오류 우선, pending 결과 저장·후속 검증 |
+| file review | cycle revision과 source unit | scope 오류 우선, 원본 재조회·hash 검증 후 receipt |
+| relation | cycle revision과 relation | scope 오류 우선, 양쪽 원본 재조회 후 receipt |
+| synthesis | 독립 page | session 오류 수집 closure, scope 오류 우선, 최신 page key 재조회 후 receipt |
+| findings | 독립 collection unit | scope 오류 우선, 현재 active plan/source snapshot 검증 후 receipt |
+| resolution | 독립 resolution unit | scope 오류 우선, 최종 Planner 결과를 pending으로 유지하며 receipt 검증 |
+
+- `tests.test_planning_assessment.ScopedPlannerTurnTests`: 9 tests 통과. 신규/재개 session과 중복 저장 순서, 각 실패 경계, 여섯 소비자의 helper 사용, 오류 우선순위·result kind, snapshot/pending 보존, callback 전파/수집, source 재조회 및 standalone import의 자원 생성 부재를 확인했다.
+- 기존 `PlanningAssessmentTest`의 review unit, relation, resolution, independent pages/durable evidence case 4개가 통과했다. fake ports와 in-memory evidence repository만 사용했다.
+- 기존 Linux verify는 unittest discover와 변경된 두 runtime 파일의 compile 검사를 이미 포함한다. 스크립트 수정은 필요하지 않으며 Worker는 전체 verify를 실행하지 않았다. root 항목 이동·추가와 workspace 충돌 교정 변경은 없다.
+
 ## Progress
 
 - [x] 지정 revision의 중복 절차·기존 helper·소비자와 테스트 확인
-- [ ] 공통 scoped-turn helper와 여섯 평가 소비자 연결
-- [ ] 관련 targeted unit test
+- [x] 공통 scoped-turn helper와 여섯 평가 소비자 연결
+- [x] 관련 targeted unit test
 - [ ] Manager 전체 verify, 독립 Review 및 사용자 Merge
 
 ## Decision Log
