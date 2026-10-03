@@ -51,11 +51,27 @@ G-118 이후 추가된 이 책임 혼합을 별도 planning 충돌 교정 경계
 - Manager 전체 verify는 `tests/test_planning_rebase.py`의 실제 Git 회귀 전체를 포함한다. stage·apply·soft-reset·base 저장·stash drop 사이 중단에서 작업물과 index를 보존하고 같은 Planner 교정을 반복하지 않아야 한다. 일반·barrier·revalidation planning, 원격 재작성·source drift, 성공 기준/lease 및 최종 Worker verify/Review gate를 보존한다.
 - Reviewer는 교정과 workspace의 책임 분리, 소유권 검증 누락 부재, journal/transaction 보존과 테스트·verify 범위가 약화되지 않았는지 읽기 전용 검토한다. Worker는 실제 Git integration test와 전체 verify를 실행하지 않는다.
 
+### 구현 대응표와 검증 기록
+
+| 경계 | 구현 및 보존한 책임 |
+| --- | --- |
+| `planning/conflict_correction.py` | `PlanningConflictCorrection.resolve`가 repo·worktree·target·detail·role·session·저장 callback과 기존 Git/Agent/event port만 받는다. prompt, unmerged/collision 검증, 교정 저장과 stage/continue·stash 수용을 담당한다. state port·coordinator·가변 run을 받지 않는다. |
+| `planning/workspace_service.py` | 기존 실제 Git 테스트가 소비하는 `_resolve_rebase_conflict`만 얇게 위임한다. 소유권·fetch·재관측·cycle/intent·오류 지문 보존·SQLite base 채택·catalog 권한 재구성 및 base 저장 뒤 journal 정리 순서는 유지한다. 소비가 없는 `_finish_rebase_correction`은 별도 교정 경계의 `finish`로 이동했다. |
+| `planning/agent_ports.py`, `planning/planning_rebase.py` | 기존 scoped-turn helper와 journal identity/digest 검증·저장을 그대로 재사용한다. prompt·오류 우선순위·session callback 전파·JSON 및 stash 형식을 변경하지 않는다. |
+| `tests/test_planning_recovery.py` | 독립 교정 unit class 14 cases와 기존 workspace 연결 3 cases를 fake ports로 검증했다. 실제 Git 회귀는 기존 얇은 위임에서 같은 구현을 소비하며 assertion·수집을 변경하지 않았다. |
+| `scripts/verify.sh`, `scripts/verify.ps1` | 기존 compile 목록에 내부 교정 모듈만 추가했다. unittest discover와 전체 검증 범위는 유지한다. |
+
+- targeted 명령: `python3 -m unittest tests.test_planning_recovery.PlanningConflictCorrectionUnitTests tests.test_planning_recovery.PlanningRecoveryTest.test_planner_resolves_owned_plan_file_rebase_conflict_in_saved_session tests.test_planning_recovery.PlanningRecoveryTest.test_untracked_plan_id_collision_uses_saved_planner_session tests.test_planning_recovery.PlanningRecoveryTest.test_saved_scope_violation_blocks_rebase_without_discarding_result`
+- 첫 실행에서 유지보수 wiring fixture가 일반 입력 지문을 사용해 실패했다. 기존 `maintenance_planning_fingerprint`로 fixture를 수정한 뒤 같은 명령으로 17 tests가 모두 통과했다.
+- 저장된 실제 journal을 fake Git port와 연결해 같은 교정의 Agent 무호출, HEAD/file/index/target drift 거부와 새 rebase 충돌의 별도 turn을 확인했다. scope·session 저장 실패 후 Git 쓰기 없음, 잘못된 파일·marker·역할 밖 경로 거부, ID 충돌 원격 보존 및 별도 로컬 파일 요구, FUTURE_IDEAS 병합과 maintenance scope 거부, continue 실패와 stash 수용을 검증했다.
+- workspace wiring은 일반/유지보수 역할, 오류·session·publication intent 보존과 교정 → 재관측 → cycle/intent → 진단 보존 → base 저장 → 정리 순서를 확인했다. 충돌 없는 준비는 교정 경계를 생성하지 않는다.
+- Worker는 실제 Git integration, 전체 suite·lint·build·type check와 전체 verify를 실행하지 않았다. Manager 전체 verify·Review·Merge는 별도 검증이다. 루트 이동·추가 없이 G-128의 루트 배치 확인을 유지하며 PRODUCT·Requirement·ARCHITECTURE·AGENTS·PLANS는 수정하지 않았다.
+
 ## Progress
 
 - [x] 지정 revision의 교정·workspace·journal 및 관련 테스트 경계 확인
-- [ ] G-128 Merge 후 충돌 교정 경계 분리·연결
-- [ ] 관련 targeted unit test
+- [x] G-128 공통 scope helper를 사용한 충돌 교정 경계 분리·연결
+- [x] 관련 targeted unit test
 - [ ] Manager 전체 verify, 독립 Review 및 사용자 Merge
 
 ## Decision Log
