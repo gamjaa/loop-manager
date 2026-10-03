@@ -21,7 +21,11 @@ from loop_manager_internal.maintenance.file_review_protocol import (
     FILE_RESULT_FIELDS, ROOT_RESULT_FIELDS, REFERENCE_FIELDS, SIMILAR_FIELDS,
     FileReviewError, MAX_FIELD_CHARS, MAX_LIST_ITEMS, MIN_CHUNK_REVIEW_CHARS,
     MIN_DESCRIPTION_CHARS, MIN_EXCERPT_CHARS, RESULT_PREFIX,
+    MIN_REVIEW_CITATION_CHARS,
     decode_result, require_fields, result_instructions, review_string as _string,
+)
+from loop_manager_internal.maintenance.file_review_evidence import (
+    review_cites_source, unverified_symbols,
 )
 from loop_manager_internal.maintenance.maintenance_file_inventory import (
     RootPlacement, SourceInventory, SourceInventoryError, TrackedSource, _git, cached_source_inventory,
@@ -204,8 +208,12 @@ def _validate_chunk_reviews(value: object, content: bytes) -> list[dict]:
             raise FileReviewError("검토 구간의 지문 또는 시작·중간·끝 인용이 원본과 다릅니다.")
         note = _string(item["review"], f"evidence.chunk_reviews[{index}].review",
                        minimum=MIN_CHUNK_REVIEW_CHARS)
-        if not any(anchor in note for anchor in (opening, middle, closing)):
-            raise FileReviewError("구간별 검토 근거가 원본 인용과 연결되지 않았습니다.")
+        if not review_cites_source(note, (opening, middle, closing)):
+            raise FileReviewError(
+                f"evidence.chunk_reviews[{index}].review의 검토 근거가 원본 인용과 연결되지 않았습니다. "
+                f"세 excerpt 중 하나에 포함된 {MIN_REVIEW_CITATION_CHARS}자 이상의 연속 원본문자열을 "
+                "review에 그대로 인용하세요 (더 짧은 인용은 전체 사용).",
+            )
         normalized.append({
             "index": index, "start": start, "end": end,
             "chunk_hash": item["chunk_hash"], "opening_excerpt": opening,
@@ -251,8 +259,13 @@ def parse_review(output: str, source: TrackedSource, content: bytes) -> dict:
     _string(code_map["responsibility"], "code_map.responsibility", minimum=MIN_DESCRIPTION_CHARS)
     for key in ("entry_points", "public_symbols"):
         symbols = _strings(code_map[key], key)
-        if any(symbol not in text for symbol in symbols):
-            raise FileReviewError(f"{key}에 원본에 없는 심벌이 있습니다.")
+        missing = unverified_symbols(symbols, source.path, content, text)
+        if missing:
+            raise FileReviewError(
+                f"code_map.{key}에 원본에서 확인되지 않은 심벌이 있습니다: "
+                + json.dumps(missing, ensure_ascii=False)
+                + ". 실제 원본의 심벌 또는 AST로 확인되는 Class.method를 사용하세요.",
+            )
     code_map["related_tests"] = [
         _path(path, "관련 테스트 경로")
         for path in _strings(code_map["related_tests"], "related_tests")

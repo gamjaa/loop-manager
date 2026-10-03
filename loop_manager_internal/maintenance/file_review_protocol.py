@@ -18,6 +18,7 @@ MAX_LIST_ITEMS = 32
 MIN_DESCRIPTION_CHARS = 12
 MIN_CHUNK_REVIEW_CHARS = 20
 MIN_EXCERPT_CHARS = 8
+MIN_REVIEW_CITATION_CHARS = 12
 EXAMPLE_CONTENT = b"def calculate(): return 1\n"
 EXAMPLE_TREE = ("100644 blob " + "b" * 40 + "\texample.py\n").encode()
 EVIDENCE_TEXT_FIELDS = (
@@ -187,11 +188,19 @@ def result_instructions(*, root: bool = False) -> str:
         f"evidence의 {', '.join(EVIDENCE_TEXT_FIELDS)}와 code_map.responsibility는 "
         f"각각 앞뒤 공백 제거 후 최소 {MIN_DESCRIPTION_CHARS}자, 전체 최대 {MAX_FIELD_CHARS}자다. "
         f"chunk_reviews의 review는 최소 {MIN_CHUNK_REVIEW_CHARS}자, 최대 {MAX_FIELD_CHARS}자다. "
+        "review에는 검증된 opening_excerpt, middle_excerpt, closing_excerpt 중 하나에 포함된 "
+        f"최소 {MIN_REVIEW_CITATION_CHARS}자 연속 원본문자열을 그대로 인용하라. "
+        "원본 인용이 더 짧으면 그 인용 전체를 사용하라. 줄바꿈·공백 차이는 무시한다. 예: 인용 안에 "
+        "'codex_model_efforts: Callable'가 있으면 review에 이 문자열을 그대로 넣고 판단 근거를 이어 써라. "
         f"그 외 문자열은 비어 있지 않고 최대 {MAX_FIELD_CHARS}자다. "
         f"배열은 최대 {MAX_LIST_ITEMS}개다. 예외로 chunk_reviews는 제한 없이 "
         "원본의 모든 byte 구간을 순서대로 포함한다. 인용은 실제 원본에 있어야 하며 "
         f"excerpts 중 하나는 최소 {MIN_EXCERPT_CHARS}자다 (그보다 짧은 원본은 가능한 실제 인용). "
         "확인된 것이 없는 배열은 []로 남겨라.\n"
+        "entry_points와 public_symbols에는 원본에 실제 있는 심벌을 넣어라. "
+        "Python은 AST에서 실제 정의가 확인되는 Class.method 표현도 허용한다. "
+        "예: 원본의 Runner 클래스에 run 메서드가 정의되어 있으면 [\"Runner.run\"]을 사용할 수 있다. "
+        "다른 클래스의 메서드를 조합하거나 현재 원본에 없는 module prefix를 붙이지 마라.\n"
         "direct_references와 pending_references 각 항목의 JSON 형식: "
         + json.dumps(reference, ensure_ascii=False)
         + ". target_path는 상대 경로 또는 null, symbol은 심벌 또는 null이며 "
