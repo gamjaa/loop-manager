@@ -331,12 +331,6 @@ class PlanningSelectionService(PlanningService):
                     "PROJECT_BLOCKED 해제 전에는 새 Planner나 Worker를 시작하지 않습니다."
                 )
                 return PlanningOutcome(PlanningOutcomeKind.WAITING)
-            if any(
-                str(item["status"]) == "PR_OPEN"
-                for item in self._ports.state.execplan_rows(context.repo)
-            ):
-                self._ports.events.info("열린 PR이 종료되기 전에는 새 Planner나 Worker를 시작하지 않습니다.")
-                return PlanningOutcome(PlanningOutcomeKind.WAITING)
             run.general_fingerprint = self._ports.git.input_fingerprint(
                 context.repo_path, run.base_sha
             )

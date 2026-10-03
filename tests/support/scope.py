@@ -1,12 +1,29 @@
 import sqlite3
 from pathlib import Path
 import loop_manager
+from loop_manager_internal.storage import planning_input_state
 from tests.support.catalog import write_execplan
 from tests.support.git import git_command, make_remote_repository, commit_and_push
 
 
 class AgentScopeFixture:
     """Shared scenario setup; inheriting this fixture collects no tests."""
+
+    @staticmethod
+    def _confirm_general_plan_input(connection, repo: Path, revision: str) -> None:
+        with connection:
+            planning_input_state.record_general(
+                connection, str(repo), revision,
+                loop_manager.plan_declarations(repo, revision),
+            )
+            connection.execute(
+                "UPDATE projects SET processed_sha = ?, planning_fingerprint = ?, "
+                "specification_fingerprint = ? WHERE repo = ?",
+                (revision,
+                 loop_manager._planning_input_fingerprint(repo, revision),
+                 loop_manager._specification_input_fingerprint(repo, revision),
+                 str(repo)),
+            )
 
     def _repository_with_plan(self, directory: str) -> tuple[Path, str]:
         repo = make_remote_repository(directory)

@@ -53,6 +53,7 @@ class ScopeValidationMutationsTest(AgentScopeFixture, unittest.TestCase):
                 ),
             )
             connection.commit()
+            self._confirm_general_plan_input(connection, repo, plan_sha)
             with connection:
                 connection.execute(
                     """
