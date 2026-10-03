@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest import mock
 import loop_manager
 from loop_manager_internal.recovery import scoped_blocking
+from loop_manager_internal.storage import planning_input_state
 from tests.support.worker import dummy_worker_sessions
 
 
@@ -56,6 +57,7 @@ class PersistedMergeProjectQueryTest(unittest.TestCase):
             if real_lifecycle:
                 stack.enter_context(mock.patch.object(loop_manager, "_planning_input_fingerprint", return_value="stable"))
                 stack.enter_context(mock.patch.object(loop_manager, "_specification_input_fingerprint", return_value="spec"))
+                stack.enter_context(mock.patch.object(loop_manager, "plan_declarations", return_value={}))
                 stack.enter_context(mock.patch.object(loop_manager, "is_loop_manager_repository", return_value=False))
             else:
                 planning = stack.enter_context(mock.patch.object(
@@ -129,6 +131,7 @@ class PersistedMergeProjectQueryTest(unittest.TestCase):
             "UPDATE projects SET planning_fingerprint = 'stable', "
             "specification_fingerprint = 'spec', processed_sha = ?", ("a" * 40,),
         )
+        planning_input_state.record_general(self.connection, "/repo", "a" * 40, {})
         self.connection.commit()
 
     @dummy_worker_sessions

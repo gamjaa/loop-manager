@@ -190,12 +190,11 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
              mock.patch.object(loop_manager, '_run_registered_project', side_effect=run_project):
             results = run_scheduler()
             self.assertEqual([(repo, value) for repo, value, _thread in results], [
-                ('blocked', configured),
+                ('blocked', loop_manager.AgentProfile('fixture-worker-model', 'medium')),
                 ('runnable', loop_manager.AgentProfile('fixture-worker-model', 'medium')),
             ])
             self.assertTrue(all(thread != threading.get_ident() for _repo, _value, thread in results))
-            profile.assert_called_once_with(
-                config.path, 'codex', 'planner', 1, Path('blocked'))
+            profile.assert_not_called()
             self.assertIs(loop_manager._agent_profile, profile)
             with self.assertRaisesRegex(loop_manager.ManagedConfigError, 'missing worker config'):
                 loop_manager._agent_profile(config.path, 'codex', 'worker', 1, Path('runnable'))

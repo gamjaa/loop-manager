@@ -17,6 +17,7 @@ from loop_manager_internal.maintenance.maintenance_orchestration import (
 )
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanMode, MaintenancePlanningContext
 from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.storage import planning_input_state
 from loop_manager_internal.planning import planning_runtime
 from loop_manager_internal.catalog.execplan_catalog import plan_content_hash
 from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventoryError
@@ -137,6 +138,7 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
         del ports.tiered
         ports.state.advance_maintenance_cycle.return_value = cycle
         ports.state.schedule.return_value = decision
+        ports.state.execplan_rows.return_value = []
         ports.state.maintenance_due.return_value = maintenance_state.ReviewDue(
             True, "stabilization_due", 10, maintenance_state.MaintenancePhase.IDLE,
         )
@@ -526,8 +528,10 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
 
         self.assertEqual(first.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
         self.assertEqual(second.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+        # The merged worker changes source code, so full planning checks that
+        # input after the maintenance cycle before selecting the next READY.
         self.assertEqual(
-            roles, ["planner", "worker", "planner", "worker"]
+            roles, ["planner", "worker", "planner", "planner", "worker"]
         )
         self.assertEqual(selected, ["G-001", "G-002"])
         self.assertEqual(completed.phase, maintenance_state.MaintenancePhase.IDLE)
@@ -600,8 +604,9 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
 
         self.assertEqual(first.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
         self.assertEqual(second.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+        # The remote implementation commit is still a general planning input.
         self.assertEqual(
-            roles, ["planner", "worker", "planner", "worker"]
+            roles, ["planner", "worker", "planner", "planner", "worker"]
         )
         self.assertIn("post-refactor revalidation", prompts[2])
         self.assertEqual(selected, ["G-002", "G-001"])
@@ -1140,8 +1145,10 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
         connection = self._connection()
         connection.execute(
             "UPDATE projects SET planning_fingerprint = 'cycle-one', "
-            "specification_fingerprint = 'spec-one' WHERE repo = '/one'"
+            "specification_fingerprint = 'spec-one', processed_sha = ? WHERE repo = '/one'",
+            ("a" * 40,),
         )
+        planning_input_state.record_general(connection, "/one", "a" * 40, {})
         repository = maintenance_state.MaintenanceRepository(connection)
         cycle, _ = self._legacy_cycle(connection, "/one", "a" * 40)
         with mock.patch.object(loop_manager, "_run_project_step", return_value=0), mock.patch.object(
