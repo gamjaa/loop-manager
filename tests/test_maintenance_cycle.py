@@ -528,10 +528,8 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
 
         self.assertEqual(first.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
         self.assertEqual(second.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
-        # The merged worker changes source code, so full planning checks that
-        # input after the maintenance cycle before selecting the next READY.
         self.assertEqual(
-            roles, ["planner", "worker", "planner", "planner", "worker"]
+            roles, ["planner", "worker", "planner", "worker"]
         )
         self.assertEqual(selected, ["G-001", "G-002"])
         self.assertEqual(completed.phase, maintenance_state.MaintenancePhase.IDLE)
@@ -604,9 +602,8 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
 
         self.assertEqual(first.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
         self.assertEqual(second.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
-        # The remote implementation commit is still a general planning input.
         self.assertEqual(
-            roles, ["planner", "worker", "planner", "planner", "worker"]
+            roles, ["planner", "worker", "planner", "worker"]
         )
         self.assertIn("post-refactor revalidation", prompts[2])
         self.assertEqual(selected, ["G-002", "G-001"])

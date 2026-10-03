@@ -320,7 +320,7 @@ class MaintenanceAuthorityTest(MaintenancePlanningCase):
         self.assertIn("docs/FUTURE_IDEAS.md", prompt)
         self.assertIn("사용자 편집을 대행", prompt)
         self.assertIn("Manager가 제공한 파일 또는 모듈 단위", prompt)
-        self.assertIn("정적 코드맵은 의미 검토 성공을 뜻하지 않는다", prompt)
+        self.assertIn("정적 코드맵은 의미 검토 성공을 뜻하지 않으며", prompt)
         self.assertEqual(
             [plan["id"] for _path, plan in result.plans],
             ["G-002", "G-003"],
