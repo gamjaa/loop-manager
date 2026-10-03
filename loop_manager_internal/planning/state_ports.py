@@ -118,6 +118,7 @@ class _PlanningStatePorts:
         include_general_planning: bool,
         self_repository: bool = False,
         completion_candidate: bool = False,
+        due_override: maintenance_state.ReviewDue | None = None,
     ) -> tuple[maintenance_state.MaintenanceCycle, bool]:
         return self._maintenance_repository.begin_assessment_if_due(
             repo,
@@ -126,6 +127,7 @@ class _PlanningStatePorts:
             include_general_planning=include_general_planning,
             self_repository=self_repository,
             completion_candidate=completion_candidate,
+            due_override=due_override,
         )
 
     def settle_empty_stabilization_assessment(
@@ -289,6 +291,8 @@ class _PlanningStatePorts:
                 self._connection, repo, repository, base_branch, source_sha,
                 evidence,
             )
+            if evidence.tiered is not None:
+                return
             self._maintenance_repository.advance_file_assessment_success_baseline(
                 repo, expected_revision=cycle_revision, source_sha=source_sha,
                 expected_merged_count=evidence.merged_count,

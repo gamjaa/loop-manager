@@ -1,7 +1,7 @@
 """Planner invocation, source-bound file assessment, and result validation."""
 from __future__ import annotations
 from pathlib import Path
-from loop_manager_internal.planning.agent_ports import run_scoped_planner_turn
+from loop_manager_internal.planning.agent_ports import run_scoped_planner_turn, planner_progress
 from loop_manager_internal.planning.planning_catalog import PlanningResultInvalid
 from loop_manager_internal.maintenance.maintenance_orchestration import (
     MaintenanceOrchestrationError, MaintenanceOutcome, MaintenancePlannerDecision,
@@ -69,8 +69,24 @@ class PlanningAssessmentService(PlanningService):
             self._file_assessment_active(run)
             and hasattr(self._ports, "file_review")
         )
+        from loop_manager_internal.planning import tiered_assessment
+        from loop_manager_internal.maintenance.tiered_review import TieredReviewError
+        module_enabled = tiered_assessment.enabled(self._ports, run)
+        if module_enabled:
+            file_review_enabled = False
         if should_run:
             final_page = None
+            module_context = None
+            if module_enabled:
+                try:
+                    module_outcome, module_context = tiered_assessment.prepare_turn(self._ports, run, worktree)
+                except (TieredReviewError, SourceInventoryError, OSError) as error:
+                    self._ports.events.error(str(error))
+                    return PlanningOutcome(PlanningOutcomeKind.OPERATIONAL_ERROR, detail=str(error), error=True)
+                if module_outcome is not None:
+                    return module_outcome
+                if module_context == "no_model_needed":
+                    return None
             if file_review_enabled:
                 progress = self._ports.file_review.progress(
                     context.repo, context.repo_path, context.base_branch,
@@ -113,6 +129,8 @@ class PlanningAssessmentService(PlanningService):
                         run.maintenance_cycle.include_general_planning
                     ),
                 )
+                if module_context:
+                    prompt += module_context
                 if file_review_enabled:
                     if hasattr(self._ports, "reconciliation"):
                         progress = self._ports.reconciliation.progress(
@@ -145,7 +163,7 @@ class PlanningAssessmentService(PlanningService):
                             "최종 응답에 아래 식별자·digest·개수·요약만 그대로 포함하라:\n"
                             + maintenance_findings.RESULT_PREFIX + maintenance_findings.encode(collection.receipt)
                         )
-                if (context.self_repository and run.maintenance_cycle.phase
+                if (not module_enabled and context.self_repository and run.maintenance_cycle.phase
                     is maintenance_state.MaintenancePhase.ASSESSMENT
                     and not run.maintenance_cycle.full_assessment_completed):
                     try:
@@ -181,16 +199,21 @@ class PlanningAssessmentService(PlanningService):
                     self._ports.state.compact_catalog(context.repo),
                     run.mutable_ready_snapshot,
                 )
+                from loop_manager_internal.maintenance.tiered_ports import query_instruction
+                if not row.planner_session_id:
+                    prompt += (self._ports.tiered.query_context(context.repo_path, context.base_branch,
+                        str(row.active_sha), context.state_dir) if hasattr(self._ports, "tiered") else query_instruction())
             def save_final_session(session_id):
                 if final_page is not None:
                     self._ports.reconciliation.synthesis_session(context.repo, final_page, session_id)
                 self._ports.state.update(context.repo, planner_session_id=session_id)
 
-            result, scope_result = run_scoped_planner_turn(
-                self._ports.agent, context.repo, role, worktree, prompt,
-                final_page.session_id if final_page is not None else row.planner_session_id,
-                save_final_session,
-            )
+            with planner_progress(self._ports.events, f"{role} 계획 작성 ({context.repo})"):
+                result, scope_result = run_scoped_planner_turn(
+                    self._ports.agent, context.repo, role, worktree, prompt,
+                    final_page.session_id if final_page is not None else row.planner_session_id,
+                    save_final_session,
+                )
             if scope_result.error:
                 scope_error = scope_result.error
                 if scope_result.result_snapshot is not None:
@@ -392,7 +415,15 @@ class PlanningAssessmentService(PlanningService):
                     )
                 except MaintenanceOrchestrationError as error:
                     raise PlanningResultInvalid(str(error)) from error
-                if (run.maintenance_cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT
+                from loop_manager_internal.planning import tiered_assessment
+                from loop_manager_internal.maintenance.tiered_review import TieredReviewError
+                module_enabled = tiered_assessment.enabled(self._ports, run)
+                if module_enabled:
+                    try:
+                        self._ports.tiered.validate_final(run, decision)
+                    except TieredReviewError as error:
+                        raise PlanningResultInvalid(str(error)) from error
+                if (not module_enabled and run.maintenance_cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT
                     and run.maintenance_cycle.file_assessment_start_merged_count is not None
                     and (not context.self_repository or run.maintenance_cycle.full_assessment_completed)
                     and hasattr(self._ports, "reconciliation")):
@@ -478,6 +509,7 @@ class PlanningAssessmentService(PlanningService):
                 )
             if (
                 decision is not None
+                and not tiered_assessment.enabled(self._ports, run)
                 and context.self_repository
                 and run.maintenance_cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT
                 and not run.maintenance_cycle.full_assessment_completed

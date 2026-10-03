@@ -4063,6 +4063,9 @@ def build_parser() -> argparse.ArgumentParser:
                               help="의미 보존이 불확실하면 승인 대신 새 검토 요구")
     draft_commands.add_parser("approved", help="현재 원본에 유효한 승인 조회")
 
+    maintenance = subcommands.add_parser("maintenance-review", help="등록 프로젝트의 전체 정밀 점검을 다음 안전한 경계에 요청")
+    maintenance.add_argument("repository", help="등록된 Git 저장소 루트")
+
     run = subcommands.add_parser("run", help="등록 프로젝트의 다음 작업을 처리")
     run.add_argument(
         "--skip-if-running",

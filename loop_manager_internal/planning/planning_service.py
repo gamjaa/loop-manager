@@ -15,9 +15,11 @@ class PlanningService:
     def _operational_error() -> PlanningOutcome:
         return PlanningOutcome(PlanningOutcomeKind.OPERATIONAL_ERROR, error=True)
 
-    @staticmethod
-    def _file_assessment_active(run: _PlanningRun) -> bool:
+    def _file_assessment_active(self, run: _PlanningRun) -> bool:
         cycle = run.maintenance_cycle
+        from loop_manager_internal.planning import tiered_assessment
+        if tiered_assessment.enabled(self._ports, run):
+            return True
         return bool(
             run.maintenance_planning
             and cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT

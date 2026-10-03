@@ -480,6 +480,24 @@ class MaintenanceRepository:
         self_repository: bool = False,
     ) -> ReviewDue:
         state = self.get(repo)
+        from loop_manager_internal.maintenance import tiered_review
+        if self.connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tiered_maintenance_success'").fetchone():
+            repository = tiered_review.TieredReviewRepository(self.connection)
+            success = repository.success(repo)
+            request = self.connection.execute("SELECT 1 FROM tiered_maintenance_requests WHERE repo = ?", (repo,)).fetchone()
+            if success is not None or request is not None:
+                if interval <= 0:
+                    raise ValueError("refactoring review interval must be positive")
+                if state.phase is not MaintenancePhase.IDLE:
+                    return ReviewDue(False, "active_cycle", 0, state.phase)
+                baseline = success["full_merged_count"] if success else None
+                if baseline is None:
+                    return ReviewDue(True, "initial_full", 0, state.phase)
+                delta = self._merged_count(repo) - baseline
+                if delta < 0:
+                    raise MaintenanceStateError("전체 정밀 Merge 기준이 현재 이력보다 큽니다.")
+                return ReviewDue(bool(request) or delta >= interval,
+                    "requested_full" if request else "periodic_full" if delta >= interval else "interval_not_reached", delta, state.phase)
         if (
             self_repository
             and state.phase is MaintenancePhase.IDLE
@@ -674,6 +692,7 @@ class MaintenanceRepository:
         include_general_planning: bool = False,
         self_repository: bool = False,
         completion_candidate: bool = False,
+        due_override: ReviewDue | None = None,
     ) -> tuple[MaintenanceCycle, bool]:
         """Create one assessment cycle, or return the already-active cycle."""
 
@@ -682,7 +701,7 @@ class MaintenanceRepository:
             if state.phase is not MaintenancePhase.IDLE:
                 return state, False
             merged_count = self._merged_count(repo)
-            decision = self.file_assessment_due(
+            decision = due_override or self.file_assessment_due(
                 repo, interval, self_repository=self_repository,
                 completion_candidate=completion_candidate,
             )

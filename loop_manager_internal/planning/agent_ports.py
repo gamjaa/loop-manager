@@ -20,6 +20,24 @@ from pathlib import Path
 import contextlib
 import sqlite3
 import threading
+import time
+
+
+@contextlib.contextmanager
+def planner_progress(events, label: str, *, interval: float = 30):
+    """Log elapsed time during a long call without touching SQLite on the thread."""
+    stopped = threading.Event()
+    started = time.monotonic()
+    def report():
+        while not stopped.wait(interval):
+            events.log(f"{label}: 모델 호출 진행 중, {time.monotonic() - started:.0f}초 경과")
+    reporter = threading.Thread(target=report, daemon=True)
+    reporter.start()
+    try:
+        yield
+    finally:
+        stopped.set()
+        reporter.join(timeout=1)
 
 
 def run_scoped_planner_turn(
@@ -30,6 +48,7 @@ def run_scoped_planner_turn(
     prompt: str,
     session_id: str | None,
     save_session: Callable[[str], None],
+    *, read_only: bool = False,
 ) -> tuple[PlanningAgentResult, PlanningScopeResult]:
     """Run one turn, preserving session writes and failed scope evidence.
 
@@ -38,6 +57,8 @@ def run_scoped_planner_turn(
     """
     before = agent.begin_scope(role, worktree)
     profile = {"profile_role": "maintenance_planner"} if role == "maintenance_planner" else {}
+    if read_only:
+        profile["read_only"] = True
     result = agent.run_planner(worktree, prompt, session_id, save_session, **profile)
     if result.session_id:
         save_session(result.session_id)
@@ -89,7 +110,7 @@ class _PlanningAgentPorts:
         prompt: str,
         session_id: str | None,
         on_session_started: Callable[[str], None],
-        *, profile_role: str | None = None,
+        *, profile_role: str | None = None, read_only: bool = False,
     ) -> PlanningAgentResult:
         context = self._context
         guard = self._planner_mutex or contextlib.nullcontext()
@@ -116,7 +137,7 @@ class _PlanningAgentPorts:
                     context.config_path,
                     "planner",
                     prompt,
-                    read_only=False,
+                    read_only=read_only,
                     persist_session=True,
                     session_id=current_session_id,
                     on_session_started=on_session_started,

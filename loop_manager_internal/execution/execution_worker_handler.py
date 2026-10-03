@@ -250,6 +250,18 @@ class WorkerHandler:
             row = self.ports._row()
         active_session_id = decision.session_id
         observed_session_id = None
+        from loop_manager_internal.maintenance.tiered_ports import prepare_query_context, query_instruction
+        from loop_manager_internal.maintenance import code_index
+        import sqlite3
+        query_context = query_instruction()
+        try:
+            base = self.ports.identity.base
+            revision = code_index.git(self.ports.identity.repo_path, "rev-parse", "--verify",
+                                      f"refs/remotes/origin/{base}^{{commit}}").decode().strip()
+            query_context = prepare_query_context(self.ports.state.connection, self.ports.identity.repo_path,
+                base, revision, self.ports.identity.state_dir)
+        except (ValueError, OSError, sqlite3.Error):
+            pass  # Source facts are optional context; never block implementation.
         worker_scope_before = self.ports.begin_agent_scope(
             self.ports.identity.repo,
             context.worktree,
@@ -316,6 +328,8 @@ class WorkerHandler:
                 archive_candidates=self.ports.snapshot().archive_candidates, session_recovery=recovering,
                 guidance_common_allowed=self.ports.is_loop_manager_repository(self.ports.identity.repo_path),
                 guidance_context=guidance_context, allow_common_plans=allow_common_plans)
+            if not current_session_id or recovering:
+                prompt = (prompt or '') + query_context
             checkpoint = self.ports.checkpoint
             accepted = (checkpoint.get(self.ports.identity.repo, str(plan['id'])).snapshot or {}).get('current_rebase_acceptance') if checkpoint else None
             if accepted and not context.resolving_rebase:

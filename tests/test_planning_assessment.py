@@ -248,6 +248,7 @@ class PlanningAssessmentTest(PlanningCase):
             {"key": "page-7", "assessment": "This page has one cohesive responsibility.", "has_issue": False},
             frozenset(), Path("/evidence/decision.json"), "saved-unit-session")
         ports.reconciliation = SimpleNamespace(validate=mock.Mock(return_value=unit),
+            resolution_batch=lambda *_: (unit,),
             resolution_session=mock.Mock(), resolution_complete=mock.Mock(), resolution_fail=mock.Mock())
         ports.agent.result = PlanningAgentResult(0,
             maintenance_reconciliation.RESOLUTION_PREFIX + json.dumps({"key": "page-7",
@@ -258,7 +259,7 @@ class PlanningAssessmentTest(PlanningCase):
         run = coordinator._new_run(self.context)
         run.planning_worktree = Path("/worktree")
         run.maintenance_context = object()
-        self.assertEqual(coordinator._assessment._validate_planner_result(run).kind, PlanningOutcomeKind.WAITING)
+        self.assertEqual(coordinator._assessment._validate_planner_result(run).kind, PlanningOutcomeKind.ASSESSMENT_PROGRESS)
         self.assertEqual(ports.agent.run_count, 1)
         self.assertEqual(ports.agent.resumed_session, "saved-unit-session")
         ports.reconciliation.resolution_complete.assert_called_once()
@@ -277,7 +278,7 @@ class PlanningAssessmentTest(PlanningCase):
         coordinator = PlanningLifecycleCoordinator(ports)
         run = coordinator._new_run(self.context)
         outcome = coordinator._assessment._reconcile_one_relation(run, Path("/worktree"))
-        self.assertEqual(outcome.kind, PlanningOutcomeKind.WAITING)
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.ASSESSMENT_PROGRESS)
         self.assertEqual(ports.agent.run_count, 0)
         ports.reconciliation.synthesis.assert_not_called()
 
@@ -317,12 +318,14 @@ class PlanningAssessmentTest(PlanningCase):
             findings_unit=findings_unit, findings_session=findings.session,
             findings_complete=findings_complete, findings_fail=findings.fail,
             progress=mock.Mock(return_value=progress), synthesis=repository.prepare,
+            synthesis_batch=lambda page, _progress, _count: (page,),
             synthesis_session=repository.session, synthesis_complete=repository.complete,
             synthesis_export=repository.export)
         ports.validation.maintenance_prompt = mock.Mock(return_value="assessment prompt")
         prompts, sessions = [], []
 
-        def consume(_worktree, prompt, session_id, callback):
+        def consume(_worktree, prompt, session_id, callback, **profile):
+            self.assertEqual(profile.get("profile_role"), "maintenance_planner")
             prompts.append(prompt)
             sessions.append(session_id)
             callback("session-one")
@@ -357,8 +360,8 @@ class PlanningAssessmentTest(PlanningCase):
         with mock.patch.object(coordinator._assessment, "_review_one_file", return_value=None):
             for _ in maintenance_reconciliation.synthesis_pages(progress):
                 result = coordinator._assessment._run_planner_turn(run)
-                self.assertEqual(result.kind, PlanningOutcomeKind.WAITING)
-            self.assertEqual(coordinator._assessment._run_planner_turn(run).kind, PlanningOutcomeKind.WAITING)
+                self.assertEqual(result.kind, PlanningOutcomeKind.ASSESSMENT_PROGRESS)
+            self.assertEqual(coordinator._assessment._run_planner_turn(run).kind, PlanningOutcomeKind.ASSESSMENT_PROGRESS)
             self.assertIsNone(coordinator._assessment._run_planner_turn(run))
         self.assertIsNone(sessions[0])
         self.assertTrue(all(session is None for session in sessions))

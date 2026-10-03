@@ -44,5 +44,7 @@ class _PlanningLifecyclePorts:
         self.validation = self._effects._PlanningValidationPorts(connection)
         self.file_review = self._effects._PlanningFileReviewPorts(connection)
         self.reconciliation = self._effects._PlanningReconciliationPorts(connection)
+        from loop_manager_internal.maintenance.tiered_ports import TieredMaintenancePort
+        self.tiered = TieredMaintenancePort(connection)
         self.assessment = MaintenanceAssessmentPort()
         self.events = self._effects._PlanningEventPorts()

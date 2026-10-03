@@ -1,5 +1,7 @@
 import hashlib
+from contextlib import closing
 from pathlib import Path
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -111,6 +113,26 @@ class TrackedSourceInventoryTest(unittest.TestCase):
         self.assertEqual(classified["requirements.txt"].disposition, "excluded")
         self.assertEqual(classified["requirements-dev.txt"].reason, "root dependency manifest")
         self.assertEqual(classified["build/generated.go"].disposition, "excluded")
+
+    def test_tiered_inventory_includes_regular_unknown_files_without_weakening_legacy(self):
+        self.write("mystery.dat", b"unknown source purpose\n")
+        revision = self.publish()
+        with closing(sqlite3.connect(":memory:")) as connection:
+            inventory = source_inventory.cached_source_inventory(connection, self.repo, "main", revision, include_uncertain=True)
+            self.assertEqual([item.path for item in inventory.sources], ["mystery.dat"])
+            self.assertEqual(inventory.classifications[0].disposition, "uncertain")
+            with mock.patch.object(source_inventory, "tracked_source_inventory", side_effect=AssertionError("cached tree")):
+                self.assertEqual(source_inventory.cached_source_inventory(connection, self.repo, "main", revision, include_uncertain=True), inventory)
+            with self.assertRaises(source_inventory.SourceInventoryError):
+                source_inventory.cached_source_inventory(connection, self.repo, "main", revision)
+
+    def test_tiered_inventory_still_rejects_unsafe_git_modes(self):
+        self.write("link-target", b"missing")
+        target_blob = self.git("hash-object", "-w", "--", "link-target")
+        self.git("update-index", "--add", "--cacheinfo", "120000", target_blob, "src/link")
+        revision = self.publish(staged=True)
+        with self.assertRaisesRegex(source_inventory.SourceInventoryError, "src/link"):
+            source_inventory.tracked_source_inventory(self.repo, "main", revision, include_uncertain=True)
 
     def test_root_placement_inventory_keeps_fixed_paths_and_marks_root_source_for_review(self):
         files = {

@@ -186,7 +186,7 @@ def _classify(path: str, mode: str, sample: bytes, has_nul: bool) -> tuple[str, 
     return "uncertain", "tracked file has no conclusive source, document, asset, or configuration role"
 
 
-def tracked_source_inventory(repo: Path, base_branch: str, revision: str) -> SourceInventory:
+def tracked_source_inventory(repo: Path, base_branch: str, revision: str, *, include_uncertain: bool = False) -> SourceInventory:
     """Classify every tracked path and bind targets to exact remote blob bytes."""
     verify_remote_revision(repo, base_branch, revision)
     tree = _git(repo, "ls-tree", "-r", "-z", "--full-tree", revision)
@@ -218,12 +218,13 @@ def tracked_source_inventory(repo: Path, base_branch: str, revision: str) -> Sou
             if disposition != "excluded":
                 content_hash, sample, has_nul = _blob_fingerprint(repo, oid)
                 disposition, reason = _classify(path, git_mode, sample, has_nul)
-                if disposition == "source":
+                if disposition == "source" or (include_uncertain and disposition == "uncertain" and git_mode in {"100644", "100755"}):
                     sources.append(TrackedSource(path, content_hash, git_mode, revision, reason))
         classifications.append(ClassifiedPath(path, disposition, reason))
     verify_remote_revision(repo, base_branch, revision)
     classifications.sort(key=lambda item: item.path)
-    uncertain = [item for item in classifications if item.disposition == "uncertain"]
+    covered = {source.path for source in sources}
+    uncertain = [item for item in classifications if item.disposition == "uncertain" and (not include_uncertain or item.path not in covered)]
     if uncertain:
         details = "; ".join(f"{item.path}: {item.reason}" for item in uncertain[:10])
         raise SourceInventoryError("추적 파일 분류를 확정할 수 없습니다: " + details)
@@ -258,13 +259,13 @@ def root_placement_inventory(inventory: SourceInventory) -> tuple[RootPlacement,
 
 
 def cached_source_inventory(connection: sqlite3.Connection, repository: Path,
-                            base: str, revision: str) -> SourceInventory:
+                            base: str, revision: str, *, include_uncertain: bool = False) -> SourceInventory:
     """Reuse classification of an immutable tree, checking the live ref every time."""
     verify_remote_revision(repository, base, revision)
     connection.execute("""CREATE TABLE IF NOT EXISTS maintenance_inventory_cache (
         repository TEXT NOT NULL, base TEXT NOT NULL, revision TEXT NOT NULL,
         inventory_json TEXT NOT NULL, PRIMARY KEY (repository, base))""")
-    key = (str(repository.resolve()), base)
+    key = (str(repository.resolve()), base + (":uncertain" if include_uncertain else ""))
     row = connection.execute(
         "SELECT revision, inventory_json FROM maintenance_inventory_cache WHERE repository = ? AND base = ?", key,
     ).fetchone()
@@ -272,7 +273,7 @@ def cached_source_inventory(connection: sqlite3.Connection, repository: Path,
         value = json.loads(row[1])
         return SourceInventory(revision, tuple(TrackedSource(**item) for item in value["sources"]),
                                tuple(ClassifiedPath(**item) for item in value["classifications"]))
-    inventory = tracked_source_inventory(repository, base, revision)
+    inventory = tracked_source_inventory(repository, base, revision, **({"include_uncertain": True} if include_uncertain else {}))
     with connection:
         connection.execute("INSERT OR REPLACE INTO maintenance_inventory_cache VALUES (?, ?, ?, ?)",
                            (*key, revision, json.dumps(asdict(inventory), ensure_ascii=False)))

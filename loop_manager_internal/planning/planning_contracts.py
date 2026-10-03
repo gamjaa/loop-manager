@@ -45,6 +45,7 @@ class PlanningOutcomeKind(str, Enum):
     REFACTORING = "refactoring"
     WAITING = "waiting"
     ASSESSMENT_PROGRESS = "assessment_progress"
+    MAINTENANCE_COMPLETE = "maintenance_complete"
     UNSAFE_REVALIDATION = "unsafe_revalidation"
     VALIDATION_RETRY = "validation_retry"
     REMOTE_BASE_RESTART = "remote_base_restart"
@@ -425,7 +426,7 @@ class PlanningAgentPort(Protocol):
         prompt: str,
         session_id: str | None,
         on_session_started: Callable[[str], None],
-        *, profile_role: str | None = None,
+        *, profile_role: str | None = None, read_only: bool = False,
     ) -> PlanningAgentResult: ...
 
     def finish_scope(

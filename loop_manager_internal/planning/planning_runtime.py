@@ -58,6 +58,14 @@ class PlanningLifecycleCoordinator:
                 outcome = step.outcome
                 if outcome is None:
                     continue
+                if outcome.kind is PlanningOutcomeKind.MAINTENANCE_COMPLETE:
+                    from dataclasses import replace
+                    latest = self._ports.git.fetch_base(context.repo_path, context.base_branch)
+                    self._ports.state.reconcile_catalog(context.repo, context.repo_path, context.base_branch, latest)
+                    context = replace(context, base_sha=latest)
+                    if time.monotonic() - started >= ASSESSMENT_RUN_SECONDS:
+                        return PlanningOutcome(PlanningOutcomeKind.NO_CHANGE)
+                    break
                 if outcome.kind is not PlanningOutcomeKind.ASSESSMENT_PROGRESS:
                     return outcome
                 completed += 1

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from loop_manager_internal.application.contracts import ValidatedPlanningResult
 from loop_manager_internal.maintenance import maintenance_file_publication
 from loop_manager_internal.maintenance.code_map_artifact import ARTIFACT_PATH
+from loop_manager_internal.maintenance import tiered_review
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanMode
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningContext
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningError
@@ -315,9 +316,9 @@ def record_maintenance_publication_intent(
     cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
     evidence = None
     if (expected_phase is maintenance_state.MaintenancePhase.ASSESSMENT
-        and cycle.file_assessment_start_merged_count is not None
-        and (not effects.is_loop_manager_repository(Path(repo))
-             or cycle.full_assessment_completed)):
+        and ((cycle.file_assessment_start_merged_count is not None
+              and (not effects.is_loop_manager_repository(Path(repo)) or cycle.full_assessment_completed))
+             or tiered_review.has_assessment(connection, repo, context.cycle_revision, context.active_sha))):
         evidence = maintenance_file_publication.collect(
             connection, repo, worktree, base_branch,
             context.cycle_revision, context.active_sha,
@@ -472,17 +473,22 @@ def _maintenance_publication_already_applied(
             and cycle.last_success_commit == plan_commit
         )
     if (cycle_matches and context.mode is MaintenancePlanMode.BARRIER
-        and cycle.file_assessment_start_merged_count is not None
-        and (not effects.is_loop_manager_repository(Path(repo))
-             or cycle.full_assessment_completed)):
+        and ((cycle.file_assessment_start_merged_count is not None
+              and (not effects.is_loop_manager_repository(Path(repo)) or cycle.full_assessment_completed))
+             or tiered_review.has_assessment(connection, repo, context.cycle_revision, context.active_sha))):
         evidence = maintenance_file_publication.saved_intent(
             connection, repo, context.cycle_revision, context.active_sha,
             plan_commit,
         )
-        success = maintenance_file_ledger.FileReviewRepository(connection).last_success(repo)
-        if (success is None or success.source_revision != evidence.inventory.revision
-            or cycle.last_success_file_assessment_merged_count is None):
-            return False
+        if evidence.tiered is not None:
+            success = tiered_review.TieredReviewRepository(connection).success(repo)
+            if success is None or success["digest"] != evidence.tiered["digest"]:
+                return False
+        else:
+            success = maintenance_file_ledger.FileReviewRepository(connection).last_success(repo)
+            if (success is None or success.source_revision != evidence.inventory.revision
+                or cycle.last_success_file_assessment_merged_count is None):
+                return False
     return cycle_matches and effects._maintenance_rows_match_published_batch(
         connection, repo, worktree, result, plan_commit
     )
@@ -626,9 +632,9 @@ def _apply_maintenance_planning_batch(
 
         cycle = repository.get(repo)
         if (context.mode is MaintenancePlanMode.BARRIER
-            and cycle.file_assessment_start_merged_count is not None
-            and (not effects.is_loop_manager_repository(Path(repo))
-                 or cycle.full_assessment_completed)):
+            and ((cycle.file_assessment_start_merged_count is not None
+                  and (not effects.is_loop_manager_repository(Path(repo)) or cycle.full_assessment_completed))
+                 or tiered_review.has_assessment(connection, repo, context.cycle_revision, context.active_sha))):
             evidence = maintenance_file_publication.saved_intent(
                 connection, repo, context.cycle_revision, context.active_sha,
                 plan_commit,
@@ -637,12 +643,13 @@ def _apply_maintenance_planning_batch(
                 connection, repo, Path(repo), base_branch,
                 current_remote or plan_commit, evidence,
             )
-            repository.advance_file_assessment_success_baseline(
-                repo, expected_revision=context.cycle_revision,
-                source_sha=context.active_sha,
-                expected_merged_count=evidence.merged_count,
-                bump_revision=False,
-            )
+            if evidence.tiered is None:
+                repository.advance_file_assessment_success_baseline(
+                    repo, expected_revision=context.cycle_revision,
+                    source_sha=context.active_sha,
+                    expected_merged_count=evidence.merged_count,
+                    bump_revision=False,
+                )
 
         if (
             context.mode is MaintenancePlanMode.BARRIER
@@ -837,9 +844,9 @@ def recover_maintenance_planning_batch(
     if (
         remote_advanced_after_publication
         and cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT
-        and cycle.file_assessment_start_merged_count is not None
-        and (not effects.is_loop_manager_repository(Path(repo))
-             or cycle.full_assessment_completed)
+        and ((cycle.file_assessment_start_merged_count is not None
+              and (not effects.is_loop_manager_repository(Path(repo)) or cycle.full_assessment_completed))
+             or tiered_review.has_assessment(connection, repo, cycle.revision, base_sha))
     ):
         evidence = maintenance_file_publication.saved_intent(
             connection, repo, cycle.revision, base_sha, plan_commit,

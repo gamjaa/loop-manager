@@ -80,6 +80,7 @@ class PlanningSelectionService(PlanningService):
         if (
             row.phase == "PLANNING"
             and assessment_can_yield(cycle)
+            and not hasattr(self._ports, "tiered")
             and not row.planning_error
             and not row.planning_validation_error
             and self._ports.state.general_publication(context.repo) is None
@@ -132,6 +133,12 @@ class PlanningSelectionService(PlanningService):
             run.maintenance_cycle = cycle
             return None
         decision = self._ports.state.schedule(context.repo)
+        if getattr(decision, "project_blocked", False):
+            self._ports.events.info("PROJECT_BLOCKED 해제 전에는 새 점검이나 작업을 시작하지 않습니다.")
+            return PlanningOutcome(PlanningOutcomeKind.WAITING)
+        waiting_for_pr = decision.has_waiting
+        if hasattr(self._ports, "tiered"):
+            waiting_for_pr = any(str(item["status"]) == "PR_OPEN" for item in self._ports.state.execplan_rows(context.repo))
         approval_pending = (
             context.self_repository
             and cycle.phase is maintenance_state.MaintenancePhase.IDLE
@@ -142,7 +149,7 @@ class PlanningSelectionService(PlanningService):
         if (
             context.registered_only
             and cycle.phase is maintenance_state.MaintenancePhase.IDLE
-            and not decision.has_waiting
+            and not waiting_for_pr
             and not approval_pending
         ):
             completion_candidate = bool(
@@ -166,11 +173,23 @@ class PlanningSelectionService(PlanningService):
                         run.specification_fingerprint, run.general_fingerprint,
                     )
                 )
-            due = self._ports.state.maintenance_due(
+            tiered_selection = None
+            if hasattr(self._ports, "tiered"):
+                try:
+                    tiered_selection = self._ports.tiered.select(context, run.base_sha)
+                    self._ports.events.log(
+                        f"유지보수 정적 분석: {len(tiered_selection.index.records)}파일, "
+                        f"갱신 {tiered_selection.index.parsed}, 재사용 {tiered_selection.index.reused}, "
+                        f"선택 {tiered_selection.mode}, 이유={','.join(tiered_selection.reasons)}")
+                except (SourceInventoryError, ValueError, OSError) as error:
+                    self._ports.events.error(str(error))
+                    return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART, detail=str(error), error=True)
+            due = (maintenance_state.ReviewDue(tiered_selection.required,
+                tiered_selection.mode, 0, cycle.phase) if tiered_selection is not None else self._ports.state.maintenance_due(
                 context.repo, context.refactoring_review_interval,
                 self_repository=context.self_repository,
                 completion_candidate=completion_candidate,
-            )
+            ))
             if due.reason == "stabilization_due" and hasattr(
                 self._ports, "file_review"
             ):
@@ -216,7 +235,7 @@ class PlanningSelectionService(PlanningService):
                     )
             if due.required:
                 include_general = False
-                if not decision.has_ready:
+                if not decision.has_ready and tiered_selection is None:
                     run.general_fingerprint = self._ports.git.input_fingerprint(
                         context.repo_path, run.base_sha
                     )
@@ -230,8 +249,9 @@ class PlanningSelectionService(PlanningService):
                     include_general_planning=include_general,
                     self_repository=context.self_repository,
                     completion_candidate=completion_candidate,
+                    **({"due_override": due} if tiered_selection is not None else {}),
                 )
-        if assessment_can_yield(cycle):
+        if assessment_can_yield(cycle) and not hasattr(self._ports, "tiered"):
             decision = self._ports.state.schedule(context.repo)
             if (
                 decision.runnable_ready is not None
@@ -247,7 +267,7 @@ class PlanningSelectionService(PlanningService):
                 self._ports.events.info("기존 READY 실행을 재개하고 미게시 유지보수 평가를 보류합니다.")
                 return PlanningOutcome(PlanningOutcomeKind.EXECUTION_READY)
         if (
-            decision.has_waiting
+            waiting_for_pr
             and cycle.phase
             in {
                 maintenance_state.MaintenancePhase.ASSESSMENT,
@@ -255,7 +275,8 @@ class PlanningSelectionService(PlanningService):
             }
         ):
             self._ports.events.info(
-                "PLAN_BLOCKED 또는 PR_OPEN 종료 전 유지보수 평가를 보류합니다."
+                "Merge 대기 PR 종료 전 유지보수 평가를 보류합니다."
+                if hasattr(self._ports, "tiered") else "PLAN_BLOCKED 또는 PR_OPEN 종료 전 유지보수 평가를 보류합니다."
             )
             return PlanningOutcome(PlanningOutcomeKind.WAITING)
         if cycle.phase in {
@@ -696,6 +717,10 @@ class PlanningSelectionService(PlanningService):
         context = run.context
         row = run.row
         newly_activated = run.ready_activated_before_planning
+        if (hasattr(self._ports, "tiered") and run.maintenance_planning and not row.phase
+                and self._ports.state.maintenance_cycle(context.repo).phase is maintenance_state.MaintenancePhase.IDLE):
+            self._ports.events.log("유지보수 cycle 완료: 일반 작업 선택으로 복귀합니다.")
+            return PlanningOutcome(PlanningOutcomeKind.MAINTENANCE_COMPLETE)
         if not row.phase:
             latest_sha = self._fetch_remote_head(context)
             if self._remote_base_changed_before_activation(run, latest_sha):

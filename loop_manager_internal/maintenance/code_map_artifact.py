@@ -198,9 +198,13 @@ def prepare(connection: sqlite3.Connection, repo: str, context, worktree: Path, 
         or context.cycle_phase != "assessment"):
         raise CodeMapArtifactError("코드맵 출력과 활성 평가의 원본 identity가 다릅니다.")
     target = _safe_target(worktree)
-    maps = ReconciliationRepository(connection).valid_maps(repo, evidence.inventory)
-    maps.update((path, json.loads(raw)) for path, raw in evidence.code_maps)
-    contents = serialize(evidence.inventory, maps)
+    if evidence.tiered is not None:
+        from loop_manager_internal.maintenance.code_index import CodeIndex
+        contents = CodeIndex(evidence.inventory.revision, evidence.tiered["records"], 0, 0).serialize()
+    else:
+        maps = ReconciliationRepository(connection).valid_maps(repo, evidence.inventory)
+        maps.update((path, json.loads(raw)) for path, raw in evidence.code_maps)
+        contents = serialize(evidence.inventory, maps)
     if len(contents) > MAX_ARTIFACT_BYTES:
         raise CodeMapArtifactError("코드맵 출력이 허용 크기를 초과했습니다.")
     existing = target.read_bytes() if target.exists() else None

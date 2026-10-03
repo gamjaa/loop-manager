@@ -215,6 +215,19 @@ def execute_runtime_command(
         return effects.configure_registry(args, state_dir, config_path)
     if args.command == "document-drafts":
         return effects._document_drafts_command(args, state_dir, config_path)
+    if args.command == "maintenance-review":
+        from uuid import uuid4
+        from loop_manager_internal.maintenance import tiered_review
+        repo = str(Path(args.repository).expanduser().resolve())
+        with effects.connect_database(state_dir) as connection:
+            if not connection.execute("SELECT 1 FROM projects WHERE repo = ? AND registered = 1", (repo,)).fetchone():
+                raise ValueError("전체 정밀 점검은 등록된 프로젝트만 요청할 수 있습니다.")
+            tiered_review.ensure_schema(connection)
+            connection.execute("INSERT INTO tiered_maintenance_requests VALUES (?, ?) "
+                "ON CONFLICT(repo) DO UPDATE SET request_id = excluded.request_id", (repo, uuid4().hex))
+            connection.commit()
+        effects.operation_print(f"전체 정밀 점검 요청 저장: {repo}; 다음 안전한 작업 선택 경계에서 실행합니다.")
+        return 0
     with effects.connect_database(state_dir) as connection:
         agent_invocation_state.InvocationRepository(connection).reconcile_interrupted()
         return effects.run_registered_projects(

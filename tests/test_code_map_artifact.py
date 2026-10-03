@@ -43,7 +43,7 @@ class CodeMapArtifactTest(unittest.TestCase):
         self.maps = {source.path: result_for(source, self.contents[source.path].decode().strip(),
                                             self.contents[source.path])["code_map"] for source in self.sources}
         self.context = MaintenancePlanningContext("repo", MaintenancePlanMode.BARRIER, "a" * 40, 4, "assessment", ())
-        self.evidence = SimpleNamespace(inventory=self.inventory, code_maps=tuple(
+        self.evidence = SimpleNamespace(inventory=self.inventory, tiered=None, code_maps=tuple(
             (path, json.dumps(value)) for path, value in self.maps.items()))
 
     def git_reader(self, data, mode=b"100644"):
@@ -131,6 +131,7 @@ class CodeMapArtifactTest(unittest.TestCase):
 
     def test_prepare_merges_retained_maps_and_records_receipt_before_write(self):
         evidence = SimpleNamespace(inventory=self.inventory,
+                                   tiered=None,
                                    code_maps=(("src/b.py", json.dumps(self.maps["src/b.py"])),))
         with mock.patch.object(reconciliation.ReconciliationRepository, "valid_maps", return_value={"src/a.py": self.maps["src/a.py"]}), \
                 mock.patch.object(artifact, "_git", return_value=b""):
@@ -181,6 +182,7 @@ class CodeMapArtifactTest(unittest.TestCase):
             effects, self.connection, context, self.root, [artifact.ARTIFACT_PATH]))
         maps = {"src/a.py": self.maps["src/a.py"]}
         evidence = SimpleNamespace(inventory=replace(self.inventory, revision=context.active_sha),
+                                   tiered=None,
                                    code_maps=(("src/a.py", json.dumps(maps["src/a.py"])),))
         # The current remote already contains the freshly computed context.
         raw = artifact.serialize(evidence.inventory, maps)
