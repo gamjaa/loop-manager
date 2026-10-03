@@ -7,7 +7,7 @@ from unittest import mock
 import loop_manager
 from tests.support.catalog import write_execplan
 from tests.support.git import git_command, make_remote_repository, commit_and_push
-from tests.support.worker import dummy_worker_context, legacy_planning_ports
+from tests.support.worker import dummy_worker_context, dummy_worker_sessions, legacy_planning_ports
 
 
 class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
