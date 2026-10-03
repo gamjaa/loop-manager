@@ -30,7 +30,7 @@ class FileReviewPromptTest(unittest.TestCase):
                     "파일이나 문서를 수정하지 마라",
                     "길이만으로 개선을 강제하지 말고",
                     "FILE_REVIEW_RESULT:",
-                    "chunk_reviews:",
+                    '"chunk_reviews":',
                     "revision-bound root placement inventory:",
                     "실제 참조·사용자 경로·소유권·안전한 목적지",
                 ):
