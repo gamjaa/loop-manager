@@ -630,3 +630,347 @@ class PlanningRecoveryTest(PlanningCase):
         self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
         self.assertNotEqual(ports.state.snapshot.phase, "WORKING")
         self.assertEqual(ports.state.snapshot.planning_fingerprint, "old-full")
+
+
+class PlanningConflictCorrectionUnitTests(PlanningCase):
+    """Exercise the correction boundary with fake ports, without real Git."""
+
+    plan_path = "docs/plans/[G-001] Plan.md"
+
+    def setUp(self):
+        super().setUp()
+        from loop_manager_internal.planning.conflict_correction import PlanningConflictCorrection
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.worktree = Path(self.directory.name) / "planning"
+        self.plan = self.worktree / self.plan_path
+        self.plan.parent.mkdir(parents=True)
+        self.plan.write_text("resolved plan\n")
+        self.git = FakeGitPort()
+        self.agent = FakeAgentPort()
+        self.events = FakeEventPort()
+        self.effects = []
+        self.unmerged = self.plan_path + "\0"
+        self.candidates = ""
+        self.remote_diff = 0
+        self.continue_code = 0
+        self.index_diff = ""
+        self.role = "planner"
+        self.rebase_dir = self.worktree / ".git/rebase-merge"
+        self.rebase_dir.mkdir(parents=True)
+        original_run = self.git.run
+
+        def run(tree, *args, check=True):
+            self.effects.append(args)
+            result = original_run(tree, *args, check=check)
+            if args == ("diff", "--name-only", "--diff-filter=U", "-z"):
+                result.stdout = self.unmerged
+            elif args[:2] == ("rev-parse", "--git-path"):
+                result.stdout = str(self.worktree / ".git" / args[2])
+            elif args == ("-c", "core.editor=true", "rebase", "--continue"):
+                result.returncode = self.continue_code
+                result.stdout = "continue failed"
+            elif args[:3] == ("ls-tree", "-r", "--name-only"):
+                result.stdout = self.plan_path + "\n"
+            elif args == ("ls-files", "--others", "--exclude-standard"):
+                result.stdout = self.candidates
+            elif args[:3] == ("diff", "--quiet", "HEAD"):
+                result.returncode = self.remote_diff
+            elif args[:4] == ("diff", "--cached", "--binary", "HEAD"):
+                result.stdout = self.index_diff
+            return result
+
+        self.git.run = run
+        self.git.save_planning_correction = mock.Mock(
+            side_effect=lambda *args: self.effects.append(("save", *args)),
+        )
+        self.git.accept_resolved_stash_conflict = mock.Mock(
+            side_effect=lambda *args: self.effects.append(("accept", *args)),
+        )
+        self.agent.begin_scope = mock.Mock(side_effect=lambda role, tree: self.effects.append(("begin", role)))
+        self.agent.finish_scope = mock.Mock(return_value=PlanningScopeResult())
+        self.agent.clear_scope = mock.Mock()
+        self.sessions = []
+        self.correction = PlanningConflictCorrection(self.git, self.agent, self.events)
+
+    def resolve(self, **kwargs):
+        return self.correction.resolve(
+            "/repo", self.worktree, "target", "conflict detail", self.role,
+            "saved-session", self.sessions.append, **kwargs,
+        )
+
+    def assert_no_git_writes(self):
+        self.git.save_planning_correction.assert_not_called()
+        self.git.accept_resolved_stash_conflict.assert_not_called()
+        self.assertFalse(any(args[0] in {"add", "-c"} for args in self.effects))
+
+    def test_scoped_turn_saves_session_before_correction_and_stages_only_unmerged_paths(self):
+        invoke = self.agent.run_planner
+
+        def planner(tree, prompt, session, callback):
+            self.assertIn("conflict detail", prompt)
+            self.assertIn("git show stash^2:", prompt)
+            self.assertIn("git show stash:", prompt)
+            callback("started-session")
+            return invoke(tree, prompt, session, callback)
+
+        self.agent.run_planner = planner
+        self.assertTrue(self.resolve(stash_sha="stash"))
+        self.assertEqual(self.sessions, ["started-session", "session-1"])
+        self.assertEqual(self.agent.resumed_session, "saved-session")
+        self.agent.begin_scope.assert_called_once_with("planner", self.worktree)
+        self.agent.clear_scope.assert_called_once_with("/repo")
+        save_index = next(i for i, args in enumerate(self.effects) if args[0] == "save")
+        add_index = self.effects.index(("add", "--", self.plan_path))
+        continue_index = self.effects.index(("-c", "core.editor=true", "rebase", "--continue"))
+        self.assertLess(save_index, add_index)
+        self.assertLess(add_index, continue_index)
+        self.git.accept_resolved_stash_conflict.assert_not_called()
+
+    def test_scope_error_takes_priority_and_keeps_scope_evidence(self):
+        self.agent.result = replace(self.agent.result, code=1, message="agent failed")
+        self.agent.finish_scope.return_value = PlanningScopeResult(error="scope rejected")
+        self.assertFalse(self.resolve())
+        self.assertEqual(self.sessions, ["session-1"])
+        self.assertEqual(self.events.messages, [("error", "scope rejected")])
+        self.agent.clear_scope.assert_not_called()
+        self.assert_no_git_writes()
+
+    def test_agent_error_after_valid_scope_does_not_save_correction(self):
+        self.agent.result = replace(self.agent.result, code=1, message="agent failed")
+        self.assertFalse(self.resolve())
+        self.agent.clear_scope.assert_called_once()
+        self.assertEqual(self.events.messages, [("error", "agent failed")])
+        self.assert_no_git_writes()
+
+    def test_session_callback_failure_propagates_without_scope_cleanup_or_git_writes(self):
+        for started in (True, False):
+            with self.subTest(started=started):
+                def fail(_session):
+                    raise RuntimeError("session persistence failed")
+
+                self.sessions = SimpleNamespace(append=fail)
+                if started:
+                    self.agent.run_planner = lambda tree, prompt, session, callback: callback("started")
+                else:
+                    self.agent.run_planner = lambda *args: self.agent.result
+                with self.assertRaisesRegex(RuntimeError, "session persistence failed"):
+                    self.resolve()
+                self.agent.finish_scope.assert_not_called()
+                self.agent.clear_scope.assert_not_called()
+                self.assert_no_git_writes()
+
+    def test_invalid_files_are_rejected_before_correction_save(self):
+        for kind in ("symlink", "directory", "marker"):
+            with self.subTest(kind=kind):
+                self.plan.unlink(missing_ok=True)
+                if kind == "symlink":
+                    self.plan.symlink_to("missing-target")
+                elif kind == "directory":
+                    self.plan.mkdir()
+                else:
+                    self.plan.write_text("<<<<<<< ours\n=======\n>>>>>>> theirs\n")
+                self.assertFalse(self.resolve())
+                self.assertIn("잘못된 파일 형식", self.events.messages[-1][1])
+                self.assert_no_git_writes()
+                if kind == "directory":
+                    self.plan.rmdir()
+
+    def test_no_conflict_or_role_outside_path_never_invokes_agent(self):
+        for paths in ("", "src/code.py\0", "docs/plans/nested/Plan.md\0"):
+            with self.subTest(paths=paths):
+                self.unmerged = paths
+                self.assertFalse(self.resolve())
+                self.assertEqual(self.agent.run_count, 0)
+                self.assert_no_git_writes()
+
+    def test_continue_failure_retains_saved_correction_and_session(self):
+        self.continue_code = 1
+        self.assertFalse(self.resolve())
+        self.git.save_planning_correction.assert_called_once()
+        self.assertEqual(self.sessions, ["session-1"])
+        self.assertEqual(self.events.messages, [("error", "continue failed")])
+        self.git.accept_resolved_stash_conflict.assert_not_called()
+
+    def test_completed_rebase_is_not_mistaken_for_stash_acceptance(self):
+        self.rebase_dir.rmdir()
+        self.git.planning_correction = mock.Mock(return_value=((self.plan_path,), True))
+        self.assertTrue(self.resolve())
+        self.assertEqual(self.agent.run_count, 0)
+        self.git.accept_resolved_stash_conflict.assert_not_called()
+        self.assertNotIn(("-c", "core.editor=true", "rebase", "--continue"), self.effects)
+
+    def test_collision_requires_separate_local_file_and_preserves_remote(self):
+        self.unmerged = ""
+        self.rebase_dir.rmdir()
+        corrected = "docs/plans/[G-002] Local.md"
+        (self.worktree / corrected).write_text("local result\n")
+        for candidates, diff, accepted in (("", 0, False), (corrected, 1, False), (corrected, 0, True)):
+            with self.subTest(candidates=candidates, diff=diff):
+                self.candidates = candidates
+                self.remote_diff = diff
+                self.assertEqual(self.resolve(collision_paths=(self.plan_path,), stash_sha="stash"), accepted)
+                if not accepted:
+                    self.assert_no_git_writes()
+        self.git.save_planning_correction.assert_called_once_with("/repo", self.worktree, "target", (), False)
+        self.git.accept_resolved_stash_conflict.assert_called_once_with("/repo", self.worktree, "target")
+        self.assertFalse(any(args[0] == "add" for args in self.effects))
+        self.assertEqual(self.plan.read_text(), "resolved plan\n")
+
+    def test_future_ideas_collision_requires_merge_and_scope_can_reject_maintenance_changes(self):
+        self.unmerged = ""
+        self.rebase_dir.rmdir()
+        future = "docs/FUTURE_IDEAS.md"
+        (self.worktree / future).write_text("merged ideas\n")
+        self.assertFalse(self.resolve(collision_paths=(future,), stash_sha="stash"))
+        self.assert_no_git_writes()
+        self.role = "maintenance_planner"
+        self.remote_diff = 1
+        self.agent.finish_scope.return_value = PlanningScopeResult(error="barrier forbids FUTURE_IDEAS")
+        self.assertFalse(self.resolve(collision_paths=(future,), stash_sha="stash"))
+        self.agent.begin_scope.assert_called_with("maintenance_planner", self.worktree)
+        self.assert_no_git_writes()
+        self.role = "planner"
+        self.agent.finish_scope.return_value = PlanningScopeResult()
+        self.assertTrue(self.resolve(collision_paths=(future,), stash_sha="stash"))
+        self.git.accept_resolved_stash_conflict.assert_called_once()
+
+    def test_durable_correction_reuses_agent_only_for_new_conflict_and_rejects_drift(self):
+        from loop_manager_internal.planning import planning_rebase
+        state_dir = Path(self.directory.name) / "state"
+        path = planning_rebase._journal_path(state_dir, "/repo", self.worktree)
+        record = dict(repo="/repo", worktree=str(self.worktree.resolve()), old="old",
+                      target="target", head="base", nonce="nonce", dirty=True, phase="conflict")
+        planning_rebase._write(path, record)
+        self.git.save_planning_correction.side_effect = lambda *args: planning_rebase.save_planning_correction(
+            self.git.run, state_dir, *args,
+        )
+        self.git.planning_correction = lambda *args: planning_rebase.planning_correction(self.git.run, state_dir, *args)
+        self.assertTrue(self.resolve())
+        self.assertTrue(self.resolve())
+        self.assertEqual(self.agent.run_count, 1)
+        self.assertEqual(self.sessions, ["session-1"])
+        for drift in ("head", "file", "index", "target"):
+            with self.subTest(drift=drift):
+                self.git.head = "other" if drift == "head" else "base"
+                self.plan.write_text("different\n" if drift == "file" else "resolved plan\n")
+                self.index_diff = "different index" if drift == "index" else ""
+                self.effects.clear()
+                with self.assertRaises(planning_rebase.PlanningRebaseError):
+                    if drift == "target":
+                        self.correction.resolve("/repo", self.worktree, "other", "", self.role,
+                                                "saved-session", self.sessions.append)
+                    else:
+                        self.resolve()
+                self.assertEqual(self.agent.run_count, 1)
+                self.assertFalse(any(args[0] in {"add", "-c"} for args in self.effects))
+        self.index_diff = ""
+        self.git.head = "new-conflict-head"
+        saved_record = planning_rebase._read(path, "/repo", self.worktree)
+        saved_record["phase"] = "rebasing"
+        planning_rebase._write(path, saved_record)
+        self.assertTrue(self.resolve())
+        self.assertEqual(self.agent.run_count, 2)
+
+    def test_workspace_wiring_preserves_error_and_commits_base_before_cleanup(self):
+        for maintenance in (False, True):
+            with self.subTest(maintenance=maintenance):
+                ports = FakePorts(planning_snapshot(
+                    phase="PLANNING", active_sha="base", worktree=str(self.worktree),
+                    planning_attempt_fingerprint="original-input", planning_workspace_owned=1,
+                    planner_session_id="saved-session", planning_error="original error",
+                    planning_error_fingerprint="fingerprint", planning_result="saved result",
+                ))
+                ports.git.remote = "target"
+                order = []
+                if maintenance:
+                    ports.state.cycle = maintenance_cycle(
+                        phase=maintenance_state.MaintenancePhase.ASSESSMENT, cycle_base_sha="base",
+                    )
+                    ports.state.snapshot = replace(
+                        ports.state.snapshot,
+                        planning_error_fingerprint=maintenance_planning_fingerprint(ports.state.cycle, "fingerprint"),
+                    )
+                    ports.state.restart_stale_maintenance = lambda repo, cycle, target: (
+                        order.append("cycle") or replace(cycle, cycle_base_sha=target)
+                    )
+                    ports.validation.prepare_maintenance_context = lambda *args: "context"
+                    ports.validation.maintenance_change_context = lambda *args: "changes"
+                else:
+                    ports.state.supersede_unpublished_general_intent = lambda *args: order.append("intent")
+                coordinator = PlanningLifecycleCoordinator(ports)
+                run = coordinator._new_run(self.context)
+                conflict = SimpleNamespace(target="target", conflict=True, detail="conflict",
+                                           conflict_paths=(), stash_sha="stash")
+                completed = SimpleNamespace(target="target", conflict=False)
+                results = iter((conflict, completed))
+                ports.git.rebase_planning_workspace = lambda *args: order.append("observe") or next(results)
+                ports.state.preserve_diagnostics = mock.Mock(side_effect=lambda *args: order.append("diagnostics"))
+                ports.state.reconcile_catalog = lambda *args: order.append("catalog")
+                update = ports.state.update
+
+                def save(repo, **values):
+                    if "active_sha" in values:
+                        order.append("base")
+                    update(repo, **values)
+
+                ports.state.update = save
+
+                def cleanup(*args):
+                    self.assertEqual(ports.state.snapshot.active_sha, "target")
+                    self.assertEqual(ports.state.snapshot.planning_error, "original error")
+                    self.assertEqual(ports.state.snapshot.planner_session_id, "saved-session")
+                    order.append("cleanup")
+
+                ports.git.complete_planning_rebase = cleanup
+                with mock.patch("loop_manager_internal.planning.workspace_service.PlanningConflictCorrection") as boundary:
+                    boundary.return_value.resolve.side_effect = lambda *args: order.append("correct") or True
+                    outcome = coordinator._workspace._prepare_workspace(run)
+                    args = boundary.return_value.resolve.call_args.args
+                    self.assertEqual(args[:6], ("/repo", self.worktree, "target", "conflict",
+                                               "maintenance_planner" if maintenance else "planner", "saved-session"))
+                    self.assertTrue(callable(args[6]))
+                    self.assertEqual(args[7:], ((), "stash"))
+                # The unchanged failed input remains gated after base adoption.
+                self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+                self.assertEqual(order, ["observe", "correct", "observe", "cycle" if maintenance else "intent",
+                                         "diagnostics", "base", "cleanup"])
+                self.assertEqual(ports.state.snapshot.planning_result, "saved result")
+                self.assertEqual(ports.state.clear_calls, [])
+
+    def test_workspace_without_conflict_never_constructs_correction_boundary(self):
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree=str(self.worktree),
+            planning_workspace_owned=1, planner_session_id="saved-session",
+        ))
+        ports.git.remote = "target"
+        coordinator = PlanningLifecycleCoordinator(ports)
+        with mock.patch("loop_manager_internal.planning.workspace_service.PlanningConflictCorrection") as boundary:
+            self.assertIsNone(coordinator._workspace._prepare_workspace(coordinator._new_run(self.context)))
+            boundary.assert_not_called()
+        self.assertEqual(ports.agent.run_count, 0)
+
+    def test_workspace_correction_failure_keeps_base_and_publication_intent(self):
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree=str(self.worktree),
+            planning_workspace_owned=1, planner_session_id="saved-session",
+            planning_error="original error", planning_error_fingerprint="failed-input",
+        ))
+        ports.git.remote = "target"
+        intent = object()
+        ports.state.general_intent = intent
+        ports.git.rebase_planning_workspace = mock.Mock(return_value=SimpleNamespace(
+            target="target", conflict=True, detail="conflict remains",
+        ))
+        ports.git.complete_planning_rebase = mock.Mock()
+        coordinator = PlanningLifecycleCoordinator(ports)
+        with mock.patch("loop_manager_internal.planning.workspace_service.PlanningConflictCorrection") as boundary:
+            boundary.return_value.resolve.side_effect = RuntimeError("session persistence failed")
+            outcome = coordinator._workspace._prepare_workspace(coordinator._new_run(self.context))
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.TRANSIENT_PAUSE)
+        self.assertEqual(ports.state.snapshot.active_sha, "base")
+        self.assertEqual(ports.state.snapshot.planning_error_fingerprint, "failed-input")
+        self.assertEqual(ports.state.snapshot.planning_error, "original error")
+        self.assertIs(ports.state.general_intent, intent)
+        ports.git.complete_planning_rebase.assert_not_called()
+        self.assertEqual(ports.state.clear_calls, [])

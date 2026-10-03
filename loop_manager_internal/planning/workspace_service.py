@@ -1,14 +1,13 @@
 """Planning workspace creation and ownership checks."""
 from __future__ import annotations
 from pathlib import Path
-import re
-import stat
 from loop_manager_internal.planning.planning_catalog import PlanningResultInvalid
-from loop_manager_internal.planning.planning_rebase import PlanningRebaseError, rebase_in_progress
+from loop_manager_internal.planning.planning_rebase import PlanningRebaseError
 from loop_manager_internal.maintenance.maintenance_orchestration import maintenance_planning_fingerprint
 from loop_manager_internal.maintenance.maintenance_orchestration import MaintenanceOrchestrationError
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningError
 from loop_manager_internal.planning.planning_service import PlanningService
+from loop_manager_internal.planning.conflict_correction import PlanningConflictCorrection
 from loop_manager_internal.planning.planning_contracts import (
     _PlanningRun, PlanningOutcome, PlanningOutcomeKind,
     PlanningWorkspaceOwnershipError,
@@ -20,139 +19,17 @@ class PlanningWorkspaceService(PlanningService):
         self, run: _PlanningRun, worktree: Path, target: str, detail: str,
         collision_paths: tuple[str, ...] = (), stash_sha: str = "",
     ) -> bool:
-        saved = self._ports.git.planning_correction(run.context.repo, worktree, target)
-        if saved is not None:
-            paths, was_rebase = saved
-            return self._finish_rebase_correction(run, worktree, target, paths, was_rebase)
-        unmerged = tuple(sorted(filter(None, set(self._ports.git.run(
-            worktree, "diff", "--name-only", "--diff-filter=U", "-z",
-        ).stdout.split("\0")))))
-        paths = tuple(sorted(set(unmerged) | set(collision_paths)))
-        if not paths:
-            return False
-        if any(
-            path != "docs/FUTURE_IDEAS.md"
-            and re.fullmatch(r"docs/plans/[^/]+\.md", path) is None
-            for path in paths
-        ):
-            self._ports.events.error(
-                "planning 역할 밖의 rebase 충돌 파일을 보존합니다: "
-                + ", ".join(paths)
-            )
-            return False
-        was_rebase = rebase_in_progress(self._ports.git.run, worktree)
-        role = "maintenance_planner" if run.maintenance_planning else "planner"
-        prompt = (
-            "관리 planning rebase 충돌을 같은 권한 안에서 해결하라. "
-            "아래 파일의 충돌 내용을 편집하되 Git stage·continue·abort는 실행하지 마라. "
-            "기존 계획 목표와 현재 원격 선언을 모두 확인하라.\n"
-            + "\n".join(paths) + "\n" + detail
-        )
-        if stash_sha:
-            prompt += (
-                "\n보존된 staged 원본은 "
-                f"`git show {stash_sha}^2:<경로>`, 최종 작업 원본은 "
-                f"`git show {stash_sha}:<경로>`로 확인하고 모두 보존해 해결하라."
-            )
-        if collision_paths:
-            prompt += (
-                "\n보존 stash의 untracked 파일이 원격의 같은 경로와 충돌했다. "
-                "원격 파일을 덮어쓰지 말고 각 새 ExecPlan을 별도 ID·파일로 보존해 교정하라. "
-                "FUTURE_IDEAS는 두 내용을 현재 파일에 병합하라. 보존된 원본은 "
-                f"`git show {stash_sha}^3:<경로>`로 확인할 수 있다."
-            )
-        before = self._ports.agent.begin_scope(role, worktree)
-        result = self._ports.agent.run_planner(
-            worktree, prompt, run.row.planner_session_id,
+        return PlanningConflictCorrection(
+            self._ports.git, self._ports.agent, self._ports.events,
+        ).resolve(
+            run.context.repo, worktree, target, detail,
+            "maintenance_planner" if run.maintenance_planning else "planner",
+            run.row.planner_session_id,
             lambda session_id: self._ports.state.update(
                 run.context.repo, planner_session_id=session_id,
             ),
+            collision_paths, stash_sha,
         )
-        if result.session_id:
-            self._ports.state.update(
-                run.context.repo, planner_session_id=result.session_id,
-            )
-        scope = self._ports.agent.finish_scope(role, worktree, before)
-        if scope.error:
-            self._ports.events.error(scope.error)
-            return False
-        self._ports.agent.clear_scope(run.context.repo)
-        if result.code:
-            self._ports.events.error(result.message)
-            return False
-        for path in paths:
-            file = worktree / path
-            try:
-                if file.is_symlink() or file.exists() and (
-                    not stat.S_ISREG(file.lstat().st_mode)
-                    or any(marker in file.read_bytes() for marker in (
-                        b"<<<<<<< ", b"\n=======\n", b">>>>>>> ",
-                    ))
-                ):
-                    self._ports.events.error(f"planning 충돌 표식 또는 잘못된 파일 형식: {path}")
-                    return False
-            except OSError as error:
-                self._ports.events.error(f"planning 충돌 파일을 확인할 수 없습니다: {path}: {error}")
-                return False
-        if collision_paths:
-            saved_paths = set(self._ports.git.run(
-                worktree, "ls-tree", "-r", "--name-only", f"{stash_sha}^3",
-            ).stdout.splitlines())
-            candidate_paths = set(self._ports.git.run(
-                worktree, "ls-files", "--others", "--exclude-standard",
-            ).stdout.splitlines()) | set(self._ports.git.run(
-                worktree, "diff", "--cached", "--name-only",
-            ).stdout.splitlines())
-            corrected_plans = {
-                path for path in candidate_paths - saved_paths
-                if re.fullmatch(r"docs/plans/[^/]+\.md", path)
-                and path not in collision_paths
-            }
-            plan_collisions = [
-                path for path in collision_paths if path.startswith("docs/plans/")
-            ]
-            if any(self._ports.git.run(
-                worktree, "diff", "--quiet", "HEAD", "--", path,
-                check=False,
-            ).returncode != 0 for path in plan_collisions):
-                self._ports.events.error("새 ID 충돌 교정은 원격 ExecPlan을 보존해야 합니다.")
-                return False
-            if len(corrected_plans) < len(plan_collisions):
-                self._ports.events.error(
-                    "원격 ID와 충돌한 새 ExecPlan을 별도 파일로 보존해야 합니다."
-                )
-                return False
-            if "docs/FUTURE_IDEAS.md" in collision_paths and self._ports.git.run(
-                worktree, "diff", "--quiet", "HEAD", "--", "docs/FUTURE_IDEAS.md",
-                check=False,
-            ).returncode != 1:
-                self._ports.events.error("FUTURE_IDEAS 충돌 내용을 병합해야 합니다.")
-                return False
-        self._ports.git.save_planning_correction(
-            run.context.repo, worktree, target, unmerged, was_rebase,
-        )
-        return self._finish_rebase_correction(run, worktree, target, unmerged, was_rebase)
-
-    def _finish_rebase_correction(
-        self, run: _PlanningRun, worktree: Path, target: str,
-        paths: tuple[str, ...], was_rebase: bool,
-    ) -> bool:
-        if paths:
-            self._ports.git.run(worktree, "add", "--", *paths)
-        in_rebase = rebase_in_progress(self._ports.git.run, worktree)
-        if in_rebase:
-            continued = self._ports.git.run(
-                worktree, "-c", "core.editor=true", "rebase", "--continue",
-                check=False,
-            )
-            if continued.returncode:
-                self._ports.events.error(continued.stdout[-2000:])
-                return False
-        elif not was_rebase:
-            self._ports.git.accept_resolved_stash_conflict(
-                run.context.repo, worktree, target,
-            )
-        return True
 
     def _prepare_workspace(
         self, run: _PlanningRun
