@@ -163,30 +163,51 @@ class WriteIsolationTests(TestCase):
                             isolation._assert_no_codex_extensions(root)
 
     def test_selected_codex_home_does_not_inherit_config_above_git_root(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            personal = root / '.codex'
-            personal.mkdir()
-            (personal / 'config.toml').write_text('[plugins.personal]\nenabled = true\n')
-            selected = root / 'automation-codex'
-            selected.mkdir()
-            (selected / 'config.toml').write_text('model = "test"\n')
-            repository = root / 'repo'
-            repository.mkdir()
-            (repository / '.git').write_text('gitdir: /registered/gitdir\n')
-            nested = repository / 'nested'
-            nested.mkdir()
-            with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(selected)}):
-                paths = isolation._codex_config_files(nested)
-                self.assertIn(selected / 'config.toml', paths)
-                self.assertIn(repository / '.codex/config.toml', paths)
-                self.assertNotIn(personal / 'config.toml', paths)
-                isolation._assert_no_codex_extensions(nested)
-                project = repository / '.codex'
-                project.mkdir()
-                (project / 'config.toml').write_text('[mcp_servers.external]\ncommand = "tool"\n')
-                with self.assertRaisesRegex(isolation.IsolationError, 'MCP'):
+        for linked in (False, True):
+            with self.subTest(linked=linked), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                personal = root / '.codex'
+                personal.mkdir()
+                personal_config = personal / 'config.toml'
+                # A leaked MCP config must reject, unlike disabled plugin registrations.
+                personal_config.write_text('[mcp_servers.personal]\ncommand = "tool"\n')
+                selected = root / 'automation-codex'
+                selected.mkdir()
+                selected_config = selected / 'config.toml'
+                selected_config.write_text('model = "test"\n')
+                repository = root / 'repo'
+                repository.mkdir()
+                if linked:
+                    (repository / '.git').write_text('gitdir: /registered/gitdir\n')
+                else:
+                    (repository / '.git').mkdir()
+                nested = repository / 'nested'
+                nested.mkdir()
+                project_configs = (nested / '.codex/config.toml',
+                                   repository / '.codex/config.toml')
+                for config in project_configs:
+                    config.parent.mkdir()
+                    config.write_text('model = "test"\n')
+                with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(selected)}), \
+                     mock.patch.object(isolation.Path, 'home', return_value=root):
+                    paths = isolation._codex_config_files(nested)
+                    self.assertEqual(paths[:3], (selected_config, *project_configs))
+                    self.assertNotIn(personal_config, paths)
                     isolation._assert_no_codex_extensions(nested)
+                    digest = isolation._configuration_digest('codex', nested, None)
+                    personal_config.write_text('invalid TOML [')
+                    isolation._assert_no_codex_extensions(nested)
+                    self.assertEqual(isolation._configuration_digest('codex', nested, None),
+                                     digest)
+                    for config in (selected_config, *project_configs):
+                        with self.subTest(config=config):
+                            config.write_text('[mcp_servers.external]\ncommand = "tool"\n')
+                            with self.assertRaisesRegex(isolation.IsolationError, 'MCP'):
+                                isolation._assert_no_codex_extensions(nested)
+                            self.assertNotEqual(
+                                isolation._configuration_digest('codex', nested, None), digest)
+                            config.write_text('model = "test"\n')
+                    self.assertEqual(personal_config.read_text(), 'invalid TOML [')
 
     def test_configuration_revision_changes_attempt_fingerprint(self):
         with tempfile.TemporaryDirectory() as directory:
