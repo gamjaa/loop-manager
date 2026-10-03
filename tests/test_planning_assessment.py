@@ -496,3 +496,262 @@ class PlanningAssessmentTest(PlanningCase):
         self.assertEqual((request.repo, request.plan_id, request.transition,
                           request.attempt), ("/repo", None, "start", 1))
         self.assertIs(run_agent.call_args.kwargs["connection"], connection)
+
+
+class ScopedPlannerTurnTests(PlanningCase):
+    def _observed_agent(self, result=None, scope=None):
+        agent = FakeAgentPort()
+        if result is not None:
+            agent.result = result
+        events = []
+        before = object()
+        agent.begin_scope = mock.Mock(side_effect=lambda *args: events.append(("begin", args)) or before)
+        original = agent.run_planner
+
+        def invoke(worktree, prompt, session, callback):
+            events.append(("run", session))
+            callback("started")
+            return original(worktree, prompt, session, callback)
+
+        agent.run_planner = mock.Mock(side_effect=invoke)
+        agent.finish_scope = mock.Mock(side_effect=lambda *args: events.append(("finish", args)) or (scope or PlanningScopeResult()))
+        agent.clear_scope = mock.Mock(side_effect=lambda repo: events.append(("clear", repo)))
+        return agent, events, before
+
+    def test_new_and_resumed_sessions_preserve_write_order_and_results(self):
+        from loop_manager_internal.planning.agent_ports import run_scoped_planner_turn
+        for session in (None, "resumed"):
+            for returned in (None, "started", "returned"):
+                with self.subTest(session=session, returned=returned):
+                    result = PlanningAgentResult(0, "output", returned, PlanningAgentResultKind.SUCCESS)
+                    scope = PlanningScopeResult(result_snapshot="snapshot")
+                    agent, events, before = self._observed_agent(result, scope)
+                    actual = run_scoped_planner_turn(agent, "/repo", "planner", Path("/tree"),
+                        "prompt", session, lambda value: events.append(("save", value)))
+                    expected = [("begin", ("planner", Path("/tree"))), ("run", session), ("save", "started")]
+                    if returned:
+                        expected.append(("save", returned))
+                    expected.extend([("finish", ("planner", Path("/tree"), before)), ("clear", "/repo")])
+                    self.assertEqual(events, expected)
+                    self.assertIs(actual[0], result)
+                    self.assertIs(actual[1], scope)
+                    self.assertEqual(agent.run_planner.call_args.args[:3], (Path("/tree"), "prompt", session))
+
+    def test_scope_rejection_preserves_snapshot_without_cleanup(self):
+        from loop_manager_internal.planning.agent_ports import run_scoped_planner_turn
+        scope = PlanningScopeResult("denied", "snapshot")
+        agent, events, _ = self._observed_agent(scope=scope)
+        result, actual = run_scoped_planner_turn(agent, "/repo", "maintenance_planner", Path("/tree"),
+            "prompt", None, lambda value: events.append(("save", value)))
+        self.assertIs(result, agent.result)
+        self.assertIs(actual, scope)
+        self.assertEqual([event[0] for event in events], ["begin", "run", "save", "save", "finish"])
+        agent.clear_scope.assert_not_called()
+
+    def test_exceptions_stop_at_failing_boundary_without_cleanup(self):
+        from loop_manager_internal.planning.agent_ports import run_scoped_planner_turn
+        for boundary in ("begin", "call", "callback", "returned_session", "finish", "clear"):
+            with self.subTest(boundary=boundary):
+                agent, events, _ = self._observed_agent()
+                error = RuntimeError(boundary)
+                if boundary in ("begin", "call", "finish", "clear"):
+                    method = {"begin": "begin_scope", "call": "run_planner", "finish": "finish_scope", "clear": "clear_scope"}[boundary]
+                    getattr(agent, method).side_effect = error
+                def save(value):
+                    events.append(("save", value))
+                    if boundary == "callback" or (boundary == "returned_session" and value == agent.result.session_id):
+                        raise error
+                with self.assertRaises(RuntimeError) as caught:
+                    run_scoped_planner_turn(agent, "/repo", "planner", Path("/tree"), "prompt", None, save)
+                self.assertIs(caught.exception, error)
+                if boundary in ("begin", "call", "callback", "returned_session"):
+                    agent.finish_scope.assert_not_called()
+                if boundary != "clear":
+                    agent.clear_scope.assert_not_called()
+
+    def _unit_case(self, name):
+        ports = FakePorts(planning_snapshot(phase="PLANNING", active_sha="base", planner_session_id="owner"),
+            maintenance_cycle(phase=maintenance_state.MaintenancePhase.ASSESSMENT, cycle_base_sha="base", revision=4))
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(self.context)
+        run.planning_worktree = Path("/tree")
+        run.maintenance_context = object()
+        source = TrackedSource("src/calc.py", "b" * 64, "100644", "base", "source code")
+        unit = SimpleNamespace(source=source, session_id="owner", error=None, receipt=None)
+        relation = SimpleNamespace(left=source, right=source)
+        page = SimpleNamespace(index=0, total=1, session_id="owner", key="key")
+        port = mock.Mock()
+        ports.reconciliation = port
+        port.progress.return_value = SimpleNamespace(pending_scan=False, next_relation=relation)
+        port.content.return_value = b"content"
+        port.unit.return_value = ("owner", None)
+        port.synthesis.return_value = page
+        port.synthesis_export.return_value = Path("/manifest")
+        port.findings_unit.return_value = (unit, Path("/manifest"))
+        service = coordinator._assessment
+        if name == "review":
+            ports.file_review = port
+            port.progress.return_value = SimpleNamespace(next_unit=unit, root_placements=())
+            invoke = lambda: service._review_one_file(run, run.planning_worktree)
+            save, complete = port.session, port.complete
+            prompt = "maintenance_file_review.review_prompt"
+        elif name == "relation":
+            invoke = lambda: service._reconcile_one_relation(run, run.planning_worktree)
+            save, complete = port.session, port.complete
+            prompt = "maintenance_reconciliation.relation_prompt"
+        elif name == "synthesis":
+            invoke = lambda: service._synthesize_one_page(run, run.planning_worktree, object())
+            save, complete = port.synthesis_session, port.synthesis_complete
+            prompt = "maintenance_reconciliation.synthesis_prompt"
+        elif name == "findings":
+            invoke = lambda: service._collect_findings_unit(run, run.planning_worktree)
+            save, complete = port.findings_session, port.findings_complete
+            prompt = "maintenance_findings.unit_prompt"
+        else:
+            invoke = lambda: service._resolve_one_page(run, run.planning_worktree, unit)
+            save, complete = port.resolution_session, port.resolution_complete
+            prompt = "maintenance_reconciliation.resolution_prompt"
+        return ports, run, invoke, save, complete, prompt
+
+    def test_five_units_share_boundary_preserve_owner_and_scope_error_priority(self):
+        from loop_manager_internal.planning.agent_ports import run_scoped_planner_turn
+        for name in ("review", "relation", "synthesis", "findings", "resolution"):
+            for kind, expected in ((PlanningAgentResultKind.SUCCESS, PlanningOutcomeKind.OPERATIONAL_ERROR),
+                (PlanningAgentResultKind.TRANSIENT_FAILURE, PlanningOutcomeKind.TRANSIENT_PAUSE),
+                (PlanningAgentResultKind.USAGE_LIMIT, PlanningOutcomeKind.USAGE_LIMIT_PAUSE),
+                (PlanningAgentResultKind.PERMANENT_CONFIGURATION, PlanningOutcomeKind.OPERATIONAL_ERROR)):
+                for denied in (False, True):
+                    with self.subTest(unit=name, kind=kind, denied=denied):
+                        ports, run, invoke, save, complete, prompt = self._unit_case(name)
+                        # Even a successful Agent must not complete a rejected unit.
+                        result = PlanningAgentResult(0 if kind is PlanningAgentResultKind.SUCCESS else 1,
+                            "agent error", "returned", kind)
+                        scope = PlanningScopeResult("scope error", "snapshot") if denied else PlanningScopeResult()
+                        ports.agent, events, _ = self._observed_agent(result, scope)
+                        # For success use scope rejection; successful receipts are covered
+                        # by the real protocol tests below.
+                        if not denied and kind is PlanningAgentResultKind.SUCCESS:
+                            continue
+                        with mock.patch("loop_manager_internal.planning.assessment_service." + prompt, return_value="prompt"), mock.patch(
+                            "loop_manager_internal.planning.assessment_service.run_scoped_planner_turn", wraps=run_scoped_planner_turn) as helper:
+                            outcome = invoke()
+                        helper.assert_called_once()
+                        self.assertEqual(ports.agent.resumed_session, "owner")
+                        self.assertEqual([call.args[-1] for call in save.call_args_list], ["started", "returned"])
+                        complete.assert_not_called()
+                        self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR if denied else expected)
+                        self.assertEqual(ports.events.messages[-1][1], "scope error" if denied else "agent error")
+                        self.assertEqual(ports.agent.clear_scope.call_count, 0 if denied else 1)
+                        self.assertEqual(ports.state.cycle.last_success_merged_count, run.maintenance_cycle.last_success_merged_count)
+
+    def test_general_turn_keeps_exit_priority_snapshot_and_pending_marker(self):
+        from loop_manager_internal.planning.agent_ports import run_scoped_planner_turn
+        for kind, expected in ((PlanningAgentResultKind.SUCCESS, None),
+            (PlanningAgentResultKind.TRANSIENT_FAILURE, PlanningOutcomeKind.TRANSIENT_PAUSE),
+            (PlanningAgentResultKind.USAGE_LIMIT, PlanningOutcomeKind.USAGE_LIMIT_PAUSE),
+            (PlanningAgentResultKind.PERMANENT_CONFIGURATION, PlanningOutcomeKind.OPERATIONAL_ERROR)):
+            with self.subTest(kind=kind):
+                ports = FakePorts(planning_snapshot(phase="PLANNING", active_sha="base", planner_session_id="owner"))
+                result = PlanningAgentResult(0 if expected is None else 1, "agent message", "returned", kind)
+                ports.agent, events, _ = self._observed_agent(result, PlanningScopeResult("scope error", "snapshot"))
+                coordinator = PlanningLifecycleCoordinator(ports)
+                run = coordinator._new_run(self.context)
+                run.planning_worktree = Path("/tree")
+                run.mutable_ready_snapshot = ports.validation.snapshot
+                with mock.patch("loop_manager_internal.planning.assessment_service.run_scoped_planner_turn", wraps=run_scoped_planner_turn) as helper:
+                    outcome = coordinator._assessment._run_planner_turn(run)
+                helper.assert_called_once()
+                self.assertEqual(ports.agent.resumed_session, "owner")
+                self.assertEqual([update["planner_session_id"] for update in ports.state.updates if "planner_session_id" in update], ["started", "returned"])
+                self.assertEqual(ports.state.snapshot.agent_result_snapshot, "snapshot")
+                ports.agent.clear_scope.assert_not_called()
+                if expected is None:
+                    self.assertIsNone(outcome)
+                    self.assertEqual(run.planner_scope_error, "scope error")
+                    self.assertTrue(run.row.planning_result_pending_validation)
+                    self.assertTrue(run.row.planning_result_completed)
+                    self.assertEqual(coordinator._assessment._validate_planner_result(run).kind, PlanningOutcomeKind.VALIDATION_RETRY)
+                else:
+                    self.assertEqual(outcome.kind, expected)
+                    self.assertEqual(ports.state.snapshot.last_error, "agent message")
+                    self.assertFalse(ports.state.snapshot.planning_result_pending_validation)
+                    self.assertFalse(ports.state.snapshot.planning_result_completed)
+
+    def test_synthesis_collects_session_errors_and_rechecks_page_identity(self):
+        for failure in ("session", "source"):
+            with self.subTest(failure=failure):
+                ports, run, invoke, save, complete, prompt = self._unit_case("synthesis")
+                ports.agent, events, _ = self._observed_agent()
+                if failure == "session":
+                    save.side_effect = maintenance_reconciliation.ReconciliationError("session failed")
+                else:
+                    page = ports.reconciliation.synthesis.return_value
+                    ports.reconciliation.synthesis.side_effect = [page, SimpleNamespace(key="changed")]
+                with mock.patch("loop_manager_internal.planning.assessment_service." + prompt, return_value="prompt"):
+                    outcome = invoke()
+                self.assertEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
+                self.assertEqual(save.call_count, 2)
+                ports.agent.finish_scope.assert_called_once()
+                ports.agent.clear_scope.assert_called_once()
+                complete.assert_not_called()
+                if failure == "source":
+                    ports.reconciliation.progress.assert_called_once()
+                    self.assertEqual(ports.reconciliation.synthesis.call_count, 2)
+
+    def test_standalone_imports_do_not_load_coordinator_or_create_resources(self):
+        import subprocess
+        import sys
+        script = '''
+import importlib, pathlib, sqlite3, subprocess, sys, tempfile
+from unittest import mock
+with (mock.patch.object(sqlite3, "connect", side_effect=AssertionError("DB at import")),
+      mock.patch.object(subprocess, "Popen", side_effect=AssertionError("process at import")),
+      mock.patch.object(tempfile, "TemporaryDirectory", side_effect=AssertionError("temp at import")),
+      mock.patch.object(pathlib.Path, "mkdir", side_effect=AssertionError("mkdir at import")),
+      mock.patch.object(pathlib.Path, "write_text", side_effect=AssertionError("write at import")),
+      mock.patch.object(pathlib.Path, "write_bytes", side_effect=AssertionError("write at import"))):
+    importlib.import_module("loop_manager_internal.planning.agent_ports")
+    importlib.import_module("loop_manager_internal.planning.assessment_service")
+    assert "loop_manager_internal.planning.planning_runtime" not in sys.modules
+    assert "loop_manager" not in sys.modules
+'''
+        result = subprocess.run([sys.executable, "-B", "-c", script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_unit_session_errors_propagate_except_synthesis_collection(self):
+        for name in ("review", "relation", "findings", "resolution"):
+            for failing_session in ("started", "session-1"):
+                with self.subTest(unit=name, failing_session=failing_session):
+                    ports, run, invoke, save, complete, prompt = self._unit_case(name)
+                    ports.agent, events, _ = self._observed_agent()
+                    error = maintenance_reconciliation.ReconciliationError("session failed")
+                    def store(*args):
+                        if args[-1] == failing_session:
+                            raise error
+                    save.side_effect = store
+                    with mock.patch("loop_manager_internal.planning.assessment_service." + prompt, return_value="prompt"):
+                        with self.assertRaises(maintenance_reconciliation.ReconciliationError) as caught:
+                            invoke()
+                    self.assertIs(caught.exception, error)
+                    ports.agent.finish_scope.assert_not_called()
+                    ports.agent.clear_scope.assert_not_called()
+                    complete.assert_not_called()
+
+    def test_review_and_relation_recheck_source_before_receipt(self):
+        for name, parser, error_type in (
+            ("review", "maintenance_file_review.parse_review", maintenance_file_review.FileReviewError),
+            ("relation", "maintenance_reconciliation.parse_relation", maintenance_reconciliation.ReconciliationError),
+        ):
+            with self.subTest(unit=name):
+                ports, run, invoke, save, complete, prompt = self._unit_case(name)
+                ports.agent, events, _ = self._observed_agent()
+                port = ports.file_review if name == "review" else ports.reconciliation
+                port.content.side_effect = [b"old", b"new"] if name == "review" else [b"old-left", b"old-right", b"new-left", b"new-right"]
+                with mock.patch("loop_manager_internal.planning.assessment_service." + prompt, return_value="prompt"), mock.patch(
+                    "loop_manager_internal.planning.assessment_service." + parser, side_effect=error_type("source changed")) as parse:
+                    outcome = invoke()
+                self.assertEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
+                self.assertEqual(port.content.call_count, 2 if name == "review" else 4)
+                self.assertEqual(parse.call_args.args[-1], b"new" if name == "review" else b"new-right")
+                port.fail.assert_called_once()
+                complete.assert_not_called()

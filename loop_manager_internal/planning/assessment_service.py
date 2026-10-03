@@ -1,6 +1,7 @@
 """Planner invocation, source-bound file assessment, and result validation."""
 from __future__ import annotations
 from pathlib import Path
+from loop_manager_internal.planning.agent_ports import run_scoped_planner_turn
 from loop_manager_internal.planning.planning_catalog import PlanningResultInvalid
 from loop_manager_internal.maintenance.maintenance_orchestration import (
     MaintenanceOrchestrationError, MaintenanceOutcome, MaintenancePlannerDecision,
@@ -184,14 +185,11 @@ class PlanningAssessmentService(PlanningService):
                     self._ports.reconciliation.synthesis_session(context.repo, final_page, session_id)
                 self._ports.state.update(context.repo, planner_session_id=session_id)
 
-            before = self._ports.agent.begin_scope(role, worktree)
-            result = self._ports.agent.run_planner(
-                worktree, prompt, final_page.session_id if final_page is not None else row.planner_session_id,
+            result, scope_result = run_scoped_planner_turn(
+                self._ports.agent, context.repo, role, worktree, prompt,
+                final_page.session_id if final_page is not None else row.planner_session_id,
                 save_final_session,
             )
-            if result.session_id:
-                save_final_session(result.session_id)
-            scope_result = self._ports.agent.finish_scope(role, worktree, before)
             if scope_result.error:
                 scope_error = scope_result.error
                 if scope_result.result_snapshot is not None:
@@ -199,8 +197,6 @@ class PlanningAssessmentService(PlanningService):
                         context.repo,
                         agent_result_snapshot=scope_result.result_snapshot,
                     )
-            else:
-                self._ports.agent.clear_scope(context.repo)
 
             if result.code:
                 message = result.message or f"Planner 종료 코드 {result.code}"
@@ -319,21 +315,15 @@ class PlanningAssessmentService(PlanningService):
             self._ports.events.error(str(error))
             return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART,
                                    detail=str(error))
-        before = self._ports.agent.begin_scope("maintenance_planner", worktree)
-        result = self._ports.agent.run_planner(
-            worktree, prompt, unit.session_id,
+        result, scope = run_scoped_planner_turn(
+            self._ports.agent, context.repo, "maintenance_planner", worktree, prompt, unit.session_id,
             lambda session_id: review.session(
                 context.repo, run.maintenance_cycle.revision, unit.source, session_id,
             ),
         )
-        if result.session_id:
-            review.session(context.repo, run.maintenance_cycle.revision,
-                           unit.source, result.session_id)
-        scope = self._ports.agent.finish_scope("maintenance_planner", worktree, before)
         if scope.error:
             self._ports.events.error(scope.error)
             return self._operational_error()
-        self._ports.agent.clear_scope(context.repo)
         if result.code:
             self._ports.events.error(result.message)
             if result.kind is PlanningAgentResultKind.TRANSIENT_FAILURE:
@@ -385,19 +375,14 @@ class PlanningAssessmentService(PlanningService):
                 SourceInventoryError) as error:
             self._ports.events.error(str(error))
             return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART, detail=str(error))
-        before = self._ports.agent.begin_scope("maintenance_planner", worktree)
-        result = self._ports.agent.run_planner(
-            worktree, prompt, session_id,
+        result, scope = run_scoped_planner_turn(
+            self._ports.agent, context.repo, "maintenance_planner", worktree, prompt, session_id,
             lambda value: port.session(context.repo, run.maintenance_cycle.revision,
                                        relation, value),
         )
-        if result.session_id:
-            port.session(context.repo, run.maintenance_cycle.revision, relation, result.session_id)
-        scope = self._ports.agent.finish_scope("maintenance_planner", worktree, before)
         if scope.error:
             self._ports.events.error(scope.error)
             return self._operational_error()
-        self._ports.agent.clear_scope(context.repo)
         if result.code:
             self._ports.events.error(result.message)
             if result.kind is PlanningAgentResultKind.TRANSIENT_FAILURE:
@@ -429,7 +414,6 @@ class PlanningAssessmentService(PlanningService):
             return self._collect_findings_unit(run, worktree)
         manifest = port.synthesis_export(context.repo, page, progress,
                                          context.state_dir / "maintenance-evidence")
-        before = self._ports.agent.begin_scope("maintenance_planner", worktree)
         session_errors = []
 
         def save_session(session_id):
@@ -438,17 +422,14 @@ class PlanningAssessmentService(PlanningService):
             except maintenance_reconciliation.ReconciliationError as error:
                 session_errors.append(str(error))
 
-        result = self._ports.agent.run_planner(
-            worktree, maintenance_reconciliation.synthesis_prompt(page, manifest),
+        result, scope = run_scoped_planner_turn(
+            self._ports.agent, context.repo, "maintenance_planner", worktree,
+            maintenance_reconciliation.synthesis_prompt(page, manifest),
             page.session_id, save_session,
         )
-        if result.session_id:
-            save_session(result.session_id)
-        scope = self._ports.agent.finish_scope("maintenance_planner", worktree, before)
         if scope.error:
             self._ports.events.error(scope.error)
             return self._operational_error()
-        self._ports.agent.clear_scope(context.repo)
         if result.code:
             self._ports.events.error(result.message)
             kind = {PlanningAgentResultKind.TRANSIENT_FAILURE: PlanningOutcomeKind.TRANSIENT_PAUSE,
@@ -482,16 +463,13 @@ class PlanningAssessmentService(PlanningService):
             run.maintenance_cycle.revision, str(run.row.active_sha), plans, context.state_dir / "maintenance-evidence")
         if unit.receipt is not None:
             return None
-        before = self._ports.agent.begin_scope("maintenance_planner", worktree)
-        result = self._ports.agent.run_planner(worktree, maintenance_findings.unit_prompt(unit, manifest),
+        result, scope = run_scoped_planner_turn(
+            self._ports.agent, context.repo, "maintenance_planner", worktree,
+            maintenance_findings.unit_prompt(unit, manifest),
             unit.session_id, lambda session_id: port.findings_session(context.repo, unit, session_id))
-        if result.session_id:
-            port.findings_session(context.repo, unit, result.session_id)
-        scope = self._ports.agent.finish_scope("maintenance_planner", worktree, before)
         if scope.error:
             self._ports.events.error(scope.error)
             return self._operational_error()
-        self._ports.agent.clear_scope(context.repo)
         if result.code:
             self._ports.events.error(result.message)
             kind = {PlanningAgentResultKind.TRANSIENT_FAILURE: PlanningOutcomeKind.TRANSIENT_PAUSE,
@@ -516,18 +494,14 @@ class PlanningAssessmentService(PlanningService):
                           unit: maintenance_reconciliation.ResolutionUnit) -> PlanningOutcome:
         """Keep the final Planner result pending while one coverage receipt is validated."""
         repo, port = run.context.repo, self._ports.reconciliation
-        before = self._ports.agent.begin_scope("maintenance_planner", worktree)
-        result = self._ports.agent.run_planner(
-            worktree, maintenance_reconciliation.resolution_prompt(unit), unit.session_id,
+        result, scope = run_scoped_planner_turn(
+            self._ports.agent, repo, "maintenance_planner", worktree,
+            maintenance_reconciliation.resolution_prompt(unit), unit.session_id,
             lambda session_id: port.resolution_session(repo, unit, session_id),
         )
-        if result.session_id:
-            port.resolution_session(repo, unit, result.session_id)
-        scope = self._ports.agent.finish_scope("maintenance_planner", worktree, before)
         if scope.error:
             self._ports.events.error(scope.error)
             return self._operational_error()
-        self._ports.agent.clear_scope(repo)
         if result.code:
             self._ports.events.error(result.message)
             kind = {PlanningAgentResultKind.TRANSIENT_FAILURE: PlanningOutcomeKind.TRANSIENT_PAUSE,
