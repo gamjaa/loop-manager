@@ -13,6 +13,11 @@ import sqlite3
 from typing import Iterator, Sequence
 from uuid import uuid4
 
+from loop_manager_internal.maintenance.file_review_protocol import (
+    MAX_FIELD_CHARS, MAX_LIST_ITEMS, MIN_DESCRIPTION_CHARS, MIN_EXCERPT_CHARS,
+    ROOT_CATEGORIES, ROOT_ITEM_FIELDS, ROOT_REFERENCE_FIELDS,
+    require_fields, review_string,
+)
 from loop_manager_internal.maintenance.maintenance_file_inventory import (
     RootPlacement, SourceInventory, TrackedSource, root_placement_inventory,
     _git, tracked_source_inventory, verify_remote_revision,
@@ -89,21 +94,18 @@ def validate_root_reviews(repository: Path, inventory: SourceInventory, results:
     paths = {item.path for item in inventory.classifications}
     contents = {}
     for result in results:
-        if not isinstance(result, dict) or set(result) != {
-            "path", "category", "references", "user_path", "ownership", "destination", "reason",
-        }:
-            raise FileReviewLedgerError("루트 조사 결과 필드가 계약과 다릅니다.")
+        require_fields(result, ROOT_ITEM_FIELDS, "root_reviews 항목",
+                       error_type=FileReviewLedgerError)
         path = result["path"]
         if not isinstance(path, str) or path not in roots or path in seen:
             raise FileReviewLedgerError("루트 조사 경로가 누락되거나 중복됐습니다.")
         seen.add(path)
-        if not isinstance(result["category"], str) or result["category"] not in {
-            "tool_required", "user_entry", "execution_build_deploy", "internal_implementation", "uncertain",
-        }:
+        if not isinstance(result["category"], str) or result["category"] not in ROOT_CATEGORIES:
             raise FileReviewLedgerError("루트 조사 분류가 유효하지 않습니다.")
         for key in ("user_path", "ownership", "reason"):
-            if not isinstance(result[key], str) or not 12 <= len(result[key].strip()) <= 1200:
-                raise FileReviewLedgerError("루트 참조·사용자 경로·소유권·판단 근거가 필요합니다.")
+            value = result[key].strip() if isinstance(result[key], str) else result[key]
+            review_string(value, f"root_reviews[{path}].{key}", minimum=MIN_DESCRIPTION_CHARS,
+                          error_type=FileReviewLedgerError)
         destination = result["destination"]
         if destination is not None and (
             not isinstance(destination, str) or not destination or destination.startswith("/")
@@ -117,12 +119,12 @@ def validate_root_reviews(repository: Path, inventory: SourceInventory, results:
         ):
             raise FileReviewLedgerError("필수 루트 경로는 유지해야 합니다.")
         references = result["references"]
-        if not isinstance(references, list) or not 1 <= len(references) <= 32:
+        if not isinstance(references, list) or not 1 <= len(references) <= MAX_LIST_ITEMS:
             raise FileReviewLedgerError("루트 조사에는 원본 참조가 필요합니다.")
         linked = False
         for ref in references:
-            if not isinstance(ref, dict) or set(ref) != {"path", "excerpt"}:
-                raise FileReviewLedgerError("루트 원본 참조 형식이 유효하지 않습니다.")
+            require_fields(ref, ROOT_REFERENCE_FIELDS, f"root_reviews[{path}].references 항목",
+                           error_type=FileReviewLedgerError)
             reference_path, excerpt = ref["path"], ref["excerpt"]
             if reference_path == ".":
                 text = tree
@@ -134,7 +136,8 @@ def validate_root_reviews(repository: Path, inventory: SourceInventory, results:
                 text = contents[reference_path]
             else:
                 raise FileReviewLedgerError("루트 참조 경로가 현재 원본에 없습니다.")
-            if not isinstance(excerpt, str) or not 8 <= len(excerpt) <= 1200 or excerpt not in text:
+            if (not isinstance(excerpt, str)
+                or not MIN_EXCERPT_CHARS <= len(excerpt) <= MAX_FIELD_CHARS or excerpt not in text):
                 raise FileReviewLedgerError("루트 참조 인용이 현재 원본과 다릅니다.")
             linked = linked or (isinstance(reference_path, str) and reference_path.split("/", 1)[0] == path) or path in excerpt
         if not linked:

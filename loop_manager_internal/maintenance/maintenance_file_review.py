@@ -16,6 +16,13 @@ import shlex
 import sqlite3
 from typing import Sequence
 
+from loop_manager_internal.maintenance.file_review_protocol import (
+    CHUNK_FIELDS, CODE_MAP_FIELDS, EVIDENCE_FIELDS, EVIDENCE_TEXT_FIELDS,
+    FILE_RESULT_FIELDS, ROOT_RESULT_FIELDS, REFERENCE_FIELDS, SIMILAR_FIELDS,
+    FileReviewError, MAX_FIELD_CHARS, MAX_LIST_ITEMS, MIN_CHUNK_REVIEW_CHARS,
+    MIN_DESCRIPTION_CHARS, MIN_EXCERPT_CHARS, RESULT_PREFIX,
+    decode_result, require_fields, result_instructions, review_string as _string,
+)
 from loop_manager_internal.maintenance.maintenance_file_inventory import (
     RootPlacement, SourceInventory, SourceInventoryError, TrackedSource, _git, cached_source_inventory,
     root_placement_inventory,
@@ -28,14 +35,7 @@ from loop_manager_internal.storage.maintenance_file_ledger import (
 from loop_manager_internal.quality.quality_guidance import AGENT_QUALITY_GUIDANCE
 
 
-class FileReviewError(ValueError):
-    """A provisional review or its source identity cannot be trusted."""
-
-
-RESULT_PREFIX = "FILE_REVIEW_RESULT: "
 MAX_EMBEDDED_SOURCE_BYTES = 48_000
-MAX_FIELD_CHARS = 1_200
-MAX_LIST_ITEMS = 32
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS provisional_file_reviews (
     repo TEXT NOT NULL,
@@ -73,17 +73,14 @@ class FileReviewProgress:
     root_reviews: tuple[dict, ...] = ()
 
 
-def _string(value: object, label: str, *, minimum: int = 1) -> str:
-    if (not isinstance(value, str) or len(value.strip()) < minimum
-        or len(value) > MAX_FIELD_CHARS):
-        raise FileReviewError(f"{label}에는 구체적인 비어 있지 않은 문자열이 필요합니다.")
-    return value.strip()
-
-
 def _strings(value: object, label: str, *, required: bool = False) -> tuple[str, ...]:
-    if (not isinstance(value, list) or len(value) > MAX_LIST_ITEMS
-        or (required and not value)):
+    if not isinstance(value, list):
         raise FileReviewError(f"{label}에는 문자열 배열이 필요합니다.")
+    if len(value) > MAX_LIST_ITEMS or (required and not value):
+        raise FileReviewError(
+            f"{label} 배열 길이가 유효하지 않습니다: {len(value)}개, "
+            f"허용 {int(required)}~{MAX_LIST_ITEMS}개.",
+        )
     strings = tuple(_string(item, label) for item in value)
     if len(strings) != len(set(strings)):
         raise FileReviewError(f"{label}에 중복 값이 있습니다.")
@@ -104,8 +101,7 @@ def _references(value: object, label: str, text: str) -> list[dict]:
     normalized = []
     keys = set()
     for item in value:
-        if not isinstance(item, dict) or set(item) != {"target_path", "symbol", "evidence"}:
-            raise FileReviewError(f"{label} 참조 필드가 유효하지 않습니다.")
+        require_fields(item, REFERENCE_FIELDS, label)
         path = _path(item["target_path"], label) if item["target_path"] is not None else None
         symbol = _string(item["symbol"], label) if item["symbol"] is not None else None
         excerpt = _string(item["evidence"], label)
@@ -127,11 +123,10 @@ def _similar_candidates(value: object) -> list[dict]:
     normalized = []
     seen = set()
     for item in value:
-        if not isinstance(item, dict) or set(item) != {"target_path", "responsibility", "reason"}:
-            raise FileReviewError("유사 책임 후보 필드가 유효하지 않습니다.")
+        require_fields(item, SIMILAR_FIELDS, "similar_responsibilities 항목")
         path = _path(item["target_path"], "유사 책임 경로")
         responsibility = _string(item["responsibility"], "유사 책임")
-        reason = _string(item["reason"], "유사 책임 후보 근거", minimum=12)
+        reason = _string(item["reason"], "유사 책임 후보 근거", minimum=MIN_DESCRIPTION_CHARS)
         key = (path, responsibility)
         if key in seen:
             raise FileReviewError("유사 책임 후보가 중복됐습니다.")
@@ -188,11 +183,7 @@ def _validate_chunk_reviews(value: object, content: bytes) -> list[dict]:
         raise FileReviewError("원본의 모든 검토 구간에 대한 근거가 필요합니다.")
     normalized = []
     for index, ((start, end), item) in enumerate(zip(spans, value)):
-        if not isinstance(item, dict) or set(item) != {
-            "index", "start", "end", "chunk_hash", "opening_excerpt",
-            "middle_excerpt", "closing_excerpt", "review",
-        }:
-            raise FileReviewError("검토 구간의 결과 형식이 유효하지 않습니다.")
+        require_fields(item, CHUNK_FIELDS, f"evidence.chunk_reviews[{index}]")
         if (type(item["index"]) is not int or item["index"] != index
             or type(item["start"]) is not int or item["start"] != start
             or type(item["end"]) is not int or item["end"] != end):
@@ -211,7 +202,8 @@ def _validate_chunk_reviews(value: object, content: bytes) -> list[dict]:
             or middle not in rendered[middle_start:middle_end]
             or closing not in rendered[-256:]):
             raise FileReviewError("검토 구간의 지문 또는 시작·중간·끝 인용이 원본과 다릅니다.")
-        note = _string(item["review"], "구간별 검토 근거", minimum=20)
+        note = _string(item["review"], f"evidence.chunk_reviews[{index}].review",
+                       minimum=MIN_CHUNK_REVIEW_CHARS)
         if not any(anchor in note for anchor in (opening, middle, closing)):
             raise FileReviewError("구간별 검토 근거가 원본 인용과 연결되지 않았습니다.")
         normalized.append({
@@ -224,60 +216,39 @@ def _validate_chunk_reviews(value: object, content: bytes) -> list[dict]:
 
 def parse_review(output: str, source: TrackedSource, content: bytes) -> dict:
     """Validate a single Agent result against content actually read from Git."""
-    lines = [line[len(RESULT_PREFIX):] for line in output.splitlines()
-             if line.startswith(RESULT_PREFIX)]
-    if len(lines) != 1:
-        raise FileReviewError("FILE_REVIEW_RESULT JSON 줄이 정확히 하나 필요합니다.")
     # Bound individual fields and lists below, not the serialized document:
     # mandatory chunk evidence grows with the source and JSON escaping varies.
-    try:
-        result = json.loads(lines[0])
-    except json.JSONDecodeError as error:
-        raise FileReviewError("FILE_REVIEW_RESULT JSON이 유효하지 않습니다.") from error
+    result = decode_result(output)
+    require_fields(result, ROOT_RESULT_FIELDS if source.reason == ROOT_REVIEW_REASON
+                   else FILE_RESULT_FIELDS, "FILE_REVIEW_RESULT")
     if source.reason == ROOT_REVIEW_REASON:
-        if not isinstance(result, dict) or set(result) != {
-            "path", "content_hash", "mode", "source_revision", "root_reviews",
-        } or any(result[key] != getattr(source, key if key != "source_revision" else "revision")
+        if any(result[key] != getattr(source, key if key != "source_revision" else "revision")
                  for key in ("path", "content_hash", "mode", "source_revision")):
             raise FileReviewError("루트 조사 결과 identity 또는 계약이 다릅니다.")
         if hashlib.sha256(content).hexdigest() != source.content_hash or not isinstance(result["root_reviews"], list):
             raise FileReviewError("루트 조사 원본 또는 결과가 유효하지 않습니다.")
         return result
-    expected = {
-        "path", "content_hash", "mode", "source_revision", "evidence",
-        "code_map", "pending_references", "similar_responsibilities",
-    }
-    if not isinstance(result, dict) or set(result) != expected:
-        raise FileReviewError("FILE_REVIEW_RESULT 필드가 계약과 다릅니다.")
     if tuple(result[key] for key in ("path", "content_hash", "mode", "source_revision")) != (
         source.path, source.content_hash, source.mode, source.revision,
     ):
         raise FileReviewError("검토 결과의 source identity가 선정 파일과 다릅니다.")
     text = _source_text(content)
     evidence = result["evidence"]
-    if not isinstance(evidence, dict) or set(evidence) != {
-        "excerpts", "readability", "responsibility_and_integration",
-        "error_recovery", "test_boundary", "duplication", "change_context",
-        "chunk_reviews",
-    }:
-        raise FileReviewError("파일별 검토 근거가 누락됐습니다.")
+    require_fields(evidence, EVIDENCE_FIELDS, "evidence")
     excerpts = _strings(evidence["excerpts"], "코드 인용", required=bool(text.strip()))
     if (not text.strip() and excerpts) or any(excerpt not in text for excerpt in excerpts):
         raise FileReviewError("빈 원본 또는 원본에 없는 코드 인용은 검토로 인정할 수 없습니다.")
-    if len(text.strip()) >= 8 and all(len(excerpt) < 8 for excerpt in excerpts):
+    if (len(text.strip()) >= MIN_EXCERPT_CHARS
+        and all(len(excerpt) < MIN_EXCERPT_CHARS for excerpt in excerpts)):
         raise FileReviewError("코드 인용이 실제 검토 근거로 사용하기에 너무 짧습니다.")
     evidence["chunk_reviews"] = _validate_chunk_reviews(
         evidence["chunk_reviews"], content,
     )
-    for key in set(evidence) - {"excerpts", "chunk_reviews"}:
-        _string(evidence[key], key, minimum=12)
+    for key in EVIDENCE_TEXT_FIELDS:
+        _string(evidence[key], f"evidence.{key}", minimum=MIN_DESCRIPTION_CHARS)
     code_map = result["code_map"]
-    if not isinstance(code_map, dict) or set(code_map) != {
-        "responsibility", "entry_points", "public_symbols", "direct_references",
-        "related_tests",
-    }:
-        raise FileReviewError("코드맵 필드가 누락됐습니다.")
-    _string(code_map["responsibility"], "책임", minimum=12)
+    require_fields(code_map, CODE_MAP_FIELDS, "code_map")
+    _string(code_map["responsibility"], "code_map.responsibility", minimum=MIN_DESCRIPTION_CHARS)
     for key in ("entry_points", "public_symbols"):
         symbols = _strings(code_map[key], key)
         if any(symbol not in text for symbol in symbols):
@@ -317,15 +288,9 @@ def review_prompt(
             "revision-bound root placement inventory: " + json.dumps(
                 [item.__dict__ for item in root_placements], ensure_ascii=False) + "\n"
             "Git tree:\n" + _source_text(content) + "\n"
-            "FILE_REVIEW_RESULT: 한 줄 JSON을 정확히 하나 기록하라. 필수 필드: "
-            "path, content_hash, mode, source_revision, root_reviews:[모든 루트마다 "
-            "{path, category:tool_required|user_entry|execution_build_deploy|internal_implementation|uncertain, "
-            "references:[{path:실제 추적 파일 경로, excerpt:8자 이상의 정확한 원본 인용}], "
-            "user_path:실제 사용자 이용 경로 또는 확인 불가 이유, ownership:소유권 또는 확인 불가 이유, "
-            "destination:안전한 상대 목적지 또는 null, reason:참조 조사와 유지·이동 판단 근거}]. "
-            "user_path, ownership, reason은 각각 12자 이상의 구체적인 설명이 필요하다. "
             "binary 등 참조를 증명하지 못한 항목은 uncertain으로 남기고 references에 "
-            "path=., excerpt=Git tree의 정확한 행을 사용할 수 있다. 필수 도구 경로도 tree 참조를 허용한다."
+            "path=., excerpt=Git tree의 정확한 행을 사용할 수 있다. 필수 도구 경로도 tree 참조를 허용한다.\n"
+            + result_instructions(root=True)
         )
     text = _source_text(content)
     source_location = json.dumps({
@@ -370,25 +335,16 @@ def review_prompt(
         f"{AGENT_QUALITY_GUIDANCE}\n"
         f"source identity: {source_location}\n"
         "revision-bound root placement inventory: " + root_inventory + "\n"
-        "각 root 항목의 분류와 근거를 보존하고, 현재 source와 직접 연결되는 "
-        "항목은 실제 참조·사용자 경로·소유권·안전한 목적지를 확인하라. "
+        "루트 항목의 실제 참조·사용자 경로·소유권·안전한 목적지 조사는 별도 root 조사 단위에서 기록한다. "
+        "이 일반 파일 검토에서 root inventory는 문맥이며 root 전용 결과 필드를 추가하지 마라. "
+        "현재 source와 직접 연결되는 근거는 기존 evidence, code_map과 후보 배열에 기록하라. "
         "근거가 불명확하면 이동·삭제 후보로 만들지 마라.\n"
         + source_instruction +
-        "최종 응답에는 FILE_REVIEW_RESULT: 다음에 한 줄 JSON object를 정확히 하나 기록하라. "
-        "필수 필드: path, content_hash, mode, source_revision, "
-        "evidence={excerpts:[원본의 정확한 인용], readability, "
-        "responsibility_and_integration, error_recovery, test_boundary, "
-        "duplication, change_context, chunk_reviews:[각 구간마다 순서대로 "
-        "{index, start, end, chunk_hash:해당 byte 구간 SHA256, "
-        "opening_excerpt, middle_excerpt, closing_excerpt, review}]}, "
-        "각 구간의 byte 범위는 index*chunk_bytes부터 다음 경계까지이며 "
-        "시작·중간·끝 인용과 그중 하나를 직접 언급하는 구체적인 review가 모두 필요하다. "
-        "code_map={responsibility, entry_points:[], "
-        "public_symbols:[], direct_references:[{target_path:null|상대경로, "
-        "symbol:null|심벌, evidence:원본의 정확한 인용}], related_tests:[]}, "
-        "pending_references:[같은 참조 객체], "
-        "similar_responsibilities:[{target_path:상대경로, responsibility:책임, "
-        "reason:구체적 이유}]. 확인된 것이 없는 배열은 비워라."
+        "각 구간의 byte 범위는 index*chunk_bytes부터 다음 경계 또는 원본 끝까지이며 "
+        "chunk_hash는 해당 byte 구간 SHA256이다. opening_excerpt는 구간의 처음 256자, "
+        "middle_excerpt는 구간의 중간을 중심으로 앞뒤 128자, closing_excerpt는 마지막 256자에서 "
+        "각각 인용하라. review에는 이 인용 중 하나를 직접 언급하는 구체적인 근거가 필요하다.\n"
+        + result_instructions()
     )
 
 

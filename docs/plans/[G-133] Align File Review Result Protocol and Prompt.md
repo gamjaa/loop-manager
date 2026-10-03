@@ -37,11 +37,12 @@ priority: critical
 
 ## Progress
 
-- [ ] protocol 경계와 출력 예시 구현
-- [ ] 관련 targeted unit test 통과
+- [x] protocol 경계와 출력 예시 구현
+- [x] 관련 targeted unit test 통과: `python3 -m unittest tests.test_file_review_protocol tests.test_maintenance_file_review.FileReviewPromptTest` (18 tests, 2026-10-03)
 - [ ] Manager 전체 verify 및 읽기 전용 Review 통과
 - [ ] 사용자 구현 PR Merge
 
 ## Decision Log
 
 - 2026-10-03: 사용자가 반복된 `FILE_REVIEW_RESULT` 오류의 핫픽스를 요청했고 간단한 JSON 예시를 프롬프트에 제공하도록 지시했다. 현재 제품 동작의 코드 결함 수정으로 한정하며 PRODUCT·Requirement·ARCHITECTURE와 AGENTS를 변경하지 않는다.
+- 2026-10-03: 저장된 실제 실패 응답 4개와 정상 응답 1개를 새 parser로 읽기 전용 재검증했다. 분리된 marker/JSON은 형식 오류를 통과하고 실제 추가 필드 이름을 표시했으며, 1,985자 change_context는 1,200자 상한 초과로 진단했다. 정상 응답은 계속 통과했다. 의미 있는 추가 필드를 버려 과거 실패 응답을 성공 처리하지 않는다.
