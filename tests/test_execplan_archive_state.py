@@ -1,7 +1,7 @@
 import sqlite3
 import unittest
 
-from loop_manager_internal.storage import execplan_archive_state
+from loop_manager_internal.storage import execplan_archive_state, planning_input_state
 
 
 class ExecPlanArchiveStateTest(unittest.TestCase):
@@ -111,6 +111,29 @@ class ExecPlanArchiveStateTest(unittest.TestCase):
         self.assertEqual(archived["pending_reason"], None)
         self.assertEqual(archived["archived"], 1)
         self.assertEqual(archived["final_hash"], "hash-G-001")
+
+    def test_verified_archive_consumes_only_matching_active_declaration(self):
+        self._insert("G-001", "Merged")
+        item = self.repository.merged_candidates("/repo")[0]
+        baseline = {item.active_path: ("blob", item.content_hash),
+                    "docs/plans/[G-002] User.md": ("blob", "old")}
+        planning_input_state.record_general(self.connection, "/repo", "base", baseline)
+        repository = execplan_archive_state.ExecPlanArchiveRepository(
+            self.connection, apply_catalog=lambda *_args: True,
+        )
+
+        result = repository.record_success(
+            "/repo", (item,), base_sha="base", operation_id=None,
+            commit_oid="archive-commit", push_result="pushed:archive-commit",
+        )
+
+        self.assertEqual(result, execplan_archive_state.ArchiveWriteResult.APPLIED)
+        self.assertTrue(planning_input_state.matches(
+            self.connection, "/repo", {"docs/plans/[G-002] User.md": ("blob", "old")},
+        ))
+        self.assertFalse(planning_input_state.matches(
+            self.connection, "/repo", {"docs/plans/[G-002] User.md": ("blob", "changed")},
+        ))
 
     def test_revision_change_supersedes_old_candidate_and_preserves_audit(self):
         self._insert("G-001", "Original")

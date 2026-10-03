@@ -9,12 +9,13 @@ from loop_manager_internal.planning.planning_runtime import PlanningOutcome
 from loop_manager_internal.planning.planning_runtime import PlanningOutcomeKind
 from loop_manager_internal.recovery import recovery_runtime
 from loop_manager_internal.runtime.contracts import PROJECT_STEP_RETRY
-from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.storage import maintenance_state, planning_input_state
 from loop_manager_internal.storage import recovery_state
 from loop_manager_internal.storage import runtime_state
 from pathlib import Path
 import hashlib
 import sqlite3
+import subprocess
 
 
 def _planning_outcome_step_result(outcome: PlanningOutcome) -> int | None:
@@ -147,12 +148,13 @@ def _blocked_recovery_subjects(
 @dataclass(frozen=True)
 class StableWorkReasonEffects:
     """Named effects for _stable_work_reason; no entry-point/module access."""
-    _general_planning_required: Callable[..., object]
+    _nonplan_input_fingerprint: Callable[..., object]
     _git_tree_entries: Callable[..., object]
     _is_active_requirement: Callable[..., object]
     _is_requirement_archive_only_change: Callable[..., object]
     _planning_input_fingerprint: Callable[..., object]
     _specification_input_fingerprint: Callable[..., object]
+    plan_declarations: Callable[..., object]
     catalog_schedule_decision: Callable[..., object]
     git: Callable[..., object]
     is_loop_manager_repository: Callable[..., object]
@@ -206,7 +208,28 @@ def _stable_work_reason(
         archive_only = effects._is_requirement_archive_only_change(
             repo_path, str(row["processed_sha"]), base_sha,
         )
-    if effects._general_planning_required(row, repo_path, base_sha, current_input):
+    current_plans = effects.plan_declarations(repo_path, base_sha)
+    if not planning_input_state.matches(connection, repo, current_plans):
+        if planning_input_state.has_baseline(connection, repo) or not row["processed_sha"]:
+            return None
+        try:
+            old_sha = str(row["processed_sha"])
+            if not (
+                row["planning_fingerprint"] == effects._nonplan_input_fingerprint(
+                    repo_path, old_sha,
+                )
+                and effects.plan_declarations(repo_path, old_sha) == current_plans
+            ):
+                return None
+        except (RuntimeError, subprocess.CalledProcessError, OSError, ValueError):
+            return None
+    if current_input != row["planning_fingerprint"] and not (
+        row["processed_sha"] and (
+            archive_only or effects._nonplan_input_fingerprint(
+                repo_path, str(row["processed_sha"])
+            ) == effects._nonplan_input_fingerprint(repo_path, base_sha)
+        )
+    ):
         return None
     if row["specification_fingerprint"] is not None:
         if (

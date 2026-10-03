@@ -1277,6 +1277,7 @@ _is_specification_input = _bind_effects(
 )
 
 _planning_input_digest = input_fingerprints._planning_input_digest
+_nonplan_input_digest = input_fingerprints._nonplan_input_digest
 
 _specification_input_digest = input_fingerprints._specification_input_digest
 
@@ -1285,6 +1286,15 @@ _planning_input_fingerprint = _bind_effects(
         _git_tree_entries=lambda *args, **kwargs: _git_tree_entries(*args, **kwargs),
         _is_planning_input=lambda *args, **kwargs: _is_planning_input(*args, **kwargs),
         _planning_input_digest=lambda *args, **kwargs: _planning_input_digest(*args, **kwargs),
+        git_bytes=lambda *args, **kwargs: git_bytes(*args, **kwargs),
+    ),
+)
+
+_nonplan_input_fingerprint = _bind_effects(
+    input_fingerprints._nonplan_input_fingerprint, lambda: input_fingerprints.InternalPlanningInputFingerprintEffects(
+        _git_tree_entries=lambda *args, **kwargs: _git_tree_entries(*args, **kwargs),
+        _is_planning_input=lambda *args, **kwargs: _is_planning_input(*args, **kwargs),
+        _planning_input_digest=lambda *args, **kwargs: _nonplan_input_digest(*args, **kwargs),
         git_bytes=lambda *args, **kwargs: git_bytes(*args, **kwargs),
     ),
 )
@@ -1300,6 +1310,13 @@ _specification_input_fingerprint = _bind_effects(
         _git_tree_entries=lambda *args, **kwargs: _git_tree_entries(*args, **kwargs),
         _is_specification_input=lambda *args, **kwargs: _is_specification_input(*args, **kwargs),
         _specification_input_digest=lambda *args, **kwargs: _specification_input_digest(*args, **kwargs),
+        git_bytes=lambda *args, **kwargs: git_bytes(*args, **kwargs),
+    ),
+)
+
+plan_declarations = _bind_effects(
+    input_fingerprints.plan_declarations, lambda: input_fingerprints.PlanDeclarationsEffects(
+        _git_tree_entries=lambda *args, **kwargs: _git_tree_entries(*args, **kwargs),
         git_bytes=lambda *args, **kwargs: git_bytes(*args, **kwargs),
     ),
 )
@@ -1551,6 +1568,7 @@ _general_planning_batch_already_applied = _bind_effects(
     planner_publication._general_planning_batch_already_applied, lambda: planner_publication.GeneralPlanningBatchAlreadyAppliedEffects(
         _execplan_metadata=lambda *args, **kwargs: _execplan_metadata(*args, **kwargs),
         file_hash=lambda *args, **kwargs: file_hash(*args, **kwargs),
+        plan_declarations=lambda *args, **kwargs: plan_declarations(*args, **kwargs),
     ),
 )
 
@@ -1563,6 +1581,7 @@ _apply_general_planning_batch = _bind_effects(
         file_hash=lambda *args, **kwargs: file_hash(*args, **kwargs),
         general_planning_publication=lambda *args, **kwargs: general_planning_publication(*args, **kwargs),
         is_loop_manager_repository=lambda *args, **kwargs: is_loop_manager_repository(*args, **kwargs),
+        plan_declarations=lambda *args, **kwargs: plan_declarations(*args, **kwargs),
     ),
 )
 
@@ -1663,6 +1682,7 @@ _apply_maintenance_planning_batch = _bind_effects(
         _execplan_metadata=lambda *args, **kwargs: _execplan_metadata(*args, **kwargs),
         _maintenance_publication_already_applied=lambda *args, **kwargs: _maintenance_publication_already_applied(*args, **kwargs),
         _planning_input_fingerprint=lambda *args, **kwargs: _planning_input_fingerprint(*args, **kwargs),
+        plan_declarations=lambda *args, **kwargs: plan_declarations(*args, **kwargs),
         _register_execplan_rows=lambda *args, **kwargs: _register_execplan_rows(*args, **kwargs),
         _specification_input_fingerprint=lambda *args, **kwargs: _specification_input_fingerprint(*args, **kwargs),
         file_hash=lambda *args, **kwargs: file_hash(*args, **kwargs),
@@ -1786,13 +1806,6 @@ catalog_schedule_decision = _bind_effects(
 select_ready_execplan = _bind_effects(
     project_selection.select_ready_execplan, lambda: project_selection.SelectReadyExecplanEffects(
         catalog_schedule_decision=lambda *args, **kwargs: catalog_schedule_decision(*args, **kwargs),
-    ),
-)
-
-_general_planning_required = _bind_effects(
-    input_fingerprints._general_planning_required, lambda: input_fingerprints.GeneralPlanningRequiredEffects(
-        _is_requirement_archive_only_change=lambda *args, **kwargs: _is_requirement_archive_only_change(*args, **kwargs),
-        _planning_input_fingerprint=lambda *args, **kwargs: _planning_input_fingerprint(*args, **kwargs),
     ),
 )
 
@@ -3558,7 +3571,9 @@ _PlanningGitPorts = _bind_effects(
         _is_requirement_archive_only_change=lambda *args, **kwargs: _is_requirement_archive_only_change(*args, **kwargs),
         _recorded_base_fetch=lambda *args, **kwargs: _recorded_base_fetch(*args, **kwargs),
         _planning_input_fingerprint=lambda *args, **kwargs: _planning_input_fingerprint(*args, **kwargs),
+        _nonplan_input_fingerprint=lambda *args, **kwargs: _nonplan_input_fingerprint(*args, **kwargs),
         _specification_input_fingerprint=lambda *args, **kwargs: _specification_input_fingerprint(*args, **kwargs),
+        plan_declarations=lambda *args, **kwargs: plan_declarations(*args, **kwargs),
         changed_files=lambda *args, **kwargs: changed_files(*args, **kwargs),
         git=lambda *args, **kwargs: git(*args, **kwargs),
         make_planning_worktree=lambda *args, **kwargs: make_planning_worktree(*args, **kwargs),
@@ -3744,12 +3759,13 @@ run_project_result = _bind_effects(
 
 _stable_work_reason = _bind_effects(
     project_outcomes._stable_work_reason, lambda: project_outcomes.StableWorkReasonEffects(
-        _general_planning_required=lambda *args, **kwargs: _general_planning_required(*args, **kwargs),
+        _nonplan_input_fingerprint=lambda *args, **kwargs: _nonplan_input_fingerprint(*args, **kwargs),
         _git_tree_entries=lambda *args, **kwargs: _git_tree_entries(*args, **kwargs),
         _is_active_requirement=lambda *args, **kwargs: _is_active_requirement(*args, **kwargs),
         _is_requirement_archive_only_change=lambda *args, **kwargs: _is_requirement_archive_only_change(*args, **kwargs),
         _planning_input_fingerprint=lambda *args, **kwargs: _planning_input_fingerprint(*args, **kwargs),
         _specification_input_fingerprint=lambda *args, **kwargs: _specification_input_fingerprint(*args, **kwargs),
+        plan_declarations=lambda *args, **kwargs: plan_declarations(*args, **kwargs),
         catalog_schedule_decision=lambda *args, **kwargs: catalog_schedule_decision(*args, **kwargs),
         git=lambda *args, **kwargs: git(*args, **kwargs),
         is_loop_manager_repository=lambda *args, **kwargs: is_loop_manager_repository(*args, **kwargs),

@@ -224,8 +224,6 @@ def _assert_remote_preserves_maintenance_batch(
     base_sha: str,
     plan_commit: str,
     remote_sha: str,
-    *,
-    reject_catalog_drift: bool = False,
 ) -> None:
     """Confirm a published batch remains byte-identical at a newer remote tip."""
 
@@ -254,28 +252,6 @@ def _assert_remote_preserves_maintenance_batch(
             "게시된 maintenance batch 경로가 후속 원격 commit에서 변경됐습니다: "
             f"{rendered}"
         )
-
-    if not reject_catalog_drift:
-        return
-
-    plans_prefix = b"docs/plans/"
-    catalog_changes = sorted(
-        path
-        for path in plan_tree.keys() | remote_tree.keys()
-        if path.startswith(plans_prefix)
-        and path.endswith(b".md")
-        and b"/" not in path[len(plans_prefix) :]
-        and plan_tree.get(path) != remote_tree.get(path)
-    )
-    if catalog_changes:
-        rendered = ", ".join(
-            path.decode("utf-8", errors="replace") for path in catalog_changes
-        )
-        raise MaintenancePlanningError(
-            "게시 뒤 원격 ExecPlan catalog가 후속 commit에서 변경됐습니다: "
-            f"{rendered}"
-        )
-
 
 @dataclass(frozen=True)
 class RecordMaintenancePublicationIntentEffects:
@@ -537,6 +513,7 @@ class ApplyMaintenancePlanningBatchEffects:
     _execplan_metadata: Callable[..., object]
     _maintenance_publication_already_applied: Callable[..., object]
     _planning_input_fingerprint: Callable[..., object]
+    plan_declarations: Callable[..., object]
     _register_execplan_rows: Callable[..., object]
     _specification_input_fingerprint: Callable[..., object]
     file_hash: Callable[..., object]
@@ -694,6 +671,18 @@ def _apply_maintenance_planning_batch(
                 else None
             ),
         )
+        from loop_manager_internal.storage import planning_input_state
+        after = effects.plan_declarations(worktree, plan_commit)
+        if include_general_planning:
+            planning_input_state.record_general(
+                connection, repo, plan_commit, after,
+            )
+        else:
+            before = effects.plan_declarations(worktree, context.active_sha)
+            planning_input_state.advance_verified_delta(
+                connection, repo, plan_commit,
+                planning_input_state.delta(before, after),
+            )
         return next_cycle
 
 
@@ -834,7 +823,6 @@ def recover_maintenance_planning_batch(
         if effects._git_commit_is_ancestor(worktree, plan_commit, current_remote):
             effects._assert_remote_preserves_maintenance_batch(
                 worktree, base_sha, plan_commit, current_remote,
-                reject_catalog_drift=True,
             )
             remote_advanced_after_publication = True
         else:

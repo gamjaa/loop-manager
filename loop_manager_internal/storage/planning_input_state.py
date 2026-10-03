@@ -1,0 +1,126 @@
+"""Durable, scoped comparison baseline for active ExecPlan declarations."""
+from __future__ import annotations
+
+import json
+import sqlite3
+from typing import Mapping
+
+
+FORMAT = "active-plan-content-sha256-v1"
+FULL_FORMAT = "planning-input-v3"
+SCOPE = "general"
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS planning_input_baselines (
+    repo TEXT NOT NULL,
+    scope TEXT NOT NULL,
+    reference_revision TEXT NOT NULL,
+    last_verified_revision TEXT NOT NULL,
+    fingerprint_format TEXT NOT NULL,
+    full_input_format TEXT NOT NULL,
+    entries TEXT NOT NULL,
+    PRIMARY KEY (repo, scope)
+)
+"""
+
+PlanEntries = Mapping[str, tuple[str, str]]
+
+
+def ensure_schema(connection: sqlite3.Connection) -> None:
+    connection.execute(SCHEMA)
+
+
+def _encoded(entries: PlanEntries) -> str:
+    return json.dumps(entries, sort_keys=True, separators=(",", ":"))
+
+
+def _saved(connection: sqlite3.Connection, repo: str) -> dict[str, tuple[str, str]] | None:
+    ensure_schema(connection)
+    row = connection.execute(
+        "SELECT fingerprint_format, full_input_format, entries FROM planning_input_baselines "
+        "WHERE repo = ? AND scope = ?", (repo, SCOPE),
+    ).fetchone()
+    if (row is None or row["fingerprint_format"] != FORMAT
+            or row["full_input_format"] != FULL_FORMAT):
+        return None
+    try:
+        raw = json.loads(row["entries"])
+        if not isinstance(raw, dict) or any(
+            not isinstance(path, str) or not isinstance(value, list)
+            or len(value) != 2 or not all(isinstance(part, str) for part in value)
+            for path, value in raw.items()
+        ):
+            return None
+        return {path: (value[0], value[1]) for path, value in raw.items()}
+    except (TypeError, ValueError):
+        return None
+
+
+def matches(connection: sqlite3.Connection, repo: str, current: PlanEntries) -> bool:
+    saved = _saved(connection, repo)
+    return saved is not None and saved == current
+
+
+def has_baseline(connection: sqlite3.Connection, repo: str) -> bool:
+    ensure_schema(connection)
+    return connection.execute(
+        "SELECT 1 FROM planning_input_baselines WHERE repo = ? AND scope = ?",
+        (repo, SCOPE),
+    ).fetchone() is not None
+
+
+def record_general(
+    connection: sqlite3.Connection, repo: str, revision: str, entries: PlanEntries,
+) -> None:
+    """Call in the same transaction as a successful full planning result."""
+    ensure_schema(connection)
+    connection.execute(
+        "INSERT INTO planning_input_baselines "
+        "(repo, scope, reference_revision, last_verified_revision, fingerprint_format, full_input_format, entries) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(repo, scope) DO UPDATE SET "
+        "reference_revision = excluded.reference_revision, "
+        "last_verified_revision = excluded.last_verified_revision, "
+        "fingerprint_format = excluded.fingerprint_format, "
+        "full_input_format = excluded.full_input_format, entries = excluded.entries",
+        (repo, SCOPE, revision, revision, FORMAT, FULL_FORMAT, _encoded(entries)),
+    )
+
+
+def advance_verified_delta(
+    connection: sqlite3.Connection, repo: str, revision: str,
+    changes: Mapping[str, tuple[tuple[str, str] | None, tuple[str, str] | None]],
+) -> bool:
+    """Consume only a verified Manager plan delta, preserving unrelated input."""
+    if not changes:
+        return False
+    saved = _saved(connection, repo)
+    if saved is None:
+        return False
+    applied = False
+    for path, (before, after) in changes.items():
+        if saved.get(path) != before:
+            # An unobserved user change at this path remains a Planner input.
+            continue
+        if after is None:
+            saved.pop(path, None)
+        else:
+            saved[path] = after
+        applied = True
+    if applied:
+        connection.execute(
+            "UPDATE planning_input_baselines SET entries = ?, last_verified_revision = ? "
+            "WHERE repo = ? AND scope = ? AND fingerprint_format = ? "
+            "AND full_input_format = ?",
+            (_encoded(saved), revision, repo, SCOPE, FORMAT, FULL_FORMAT),
+        )
+    return applied
+
+
+def delta(before: PlanEntries, after: PlanEntries) -> dict[
+    str, tuple[tuple[str, str] | None, tuple[str, str] | None]
+]:
+    return {
+        path: (before.get(path), after.get(path))
+        for path in before.keys() | after.keys()
+        if before.get(path) != after.get(path)
+    }

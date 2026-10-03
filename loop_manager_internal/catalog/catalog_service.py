@@ -2,6 +2,7 @@
 from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
+from enum import Enum
 from loop_manager_internal.application.contracts import PLAN_SHA_BACKFILL_ERROR
 from loop_manager_internal.catalog import execplan_catalog
 from loop_manager_internal.catalog import project_catalog_refresh
@@ -491,12 +492,30 @@ class IsPlanningInputEffects:
     _is_active_requirement: Callable[..., object]
 
 
+class PlanningInputKind(str, Enum):
+    DOCUMENT = "document"
+    GUIDANCE = "guidance"
+    ACTIVE_PLAN = "active_plan"
+    OTHER = "other"
+    EXCLUDED = "excluded"
+
+
+def classify_planning_input(
+    path: bytes, is_active_requirement: Callable[[bytes], bool],
+) -> PlanningInputKind:
+    if path in {b"docs/PRODUCT.md", b"docs/ARCHITECTURE.md"} or is_active_requirement(path):
+        return PlanningInputKind.DOCUMENT
+    if path == b"AGENTS.md":
+        return PlanningInputKind.GUIDANCE
+    if execplan_catalog.is_active_execplan_path(path):
+        return PlanningInputKind.ACTIVE_PLAN
+    if not path.startswith(b"docs/"):
+        return PlanningInputKind.OTHER
+    return PlanningInputKind.EXCLUDED
+
+
 def _is_planning_input(effects: IsPlanningInputEffects, path: bytes) -> bool:
-    if path in {b"AGENTS.md", b"docs/PRODUCT.md", b"docs/ARCHITECTURE.md"}:
-        return True
-    if effects._is_active_requirement(path):
-        return True
-    return not path.startswith(b"docs/")
+    return classify_planning_input(path, effects._is_active_requirement) is not PlanningInputKind.EXCLUDED
 
 
 @dataclass(frozen=True)
@@ -506,9 +525,7 @@ class IsSpecificationInputEffects:
 
 
 def _is_specification_input(effects: IsSpecificationInputEffects, path: bytes) -> bool:
-    return path in {b"docs/PRODUCT.md", b"docs/ARCHITECTURE.md"} or (
-        effects._is_active_requirement(path)
-    )
+    return classify_planning_input(path, effects._is_active_requirement) is PlanningInputKind.DOCUMENT
 
 
 def _parse_execplan(

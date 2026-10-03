@@ -26,6 +26,12 @@ _ARCHIVED_PATH = re.compile(
 _ACTIVE_REQUIREMENT_PATH = re.compile(r"docs/requirements/[^/]+\.md")
 
 
+def is_active_execplan_path(path: str | bytes) -> bool:
+    if isinstance(path, bytes):
+        path = path.decode("utf-8", "surrogateescape")
+    return _ACTIVE_PATH.fullmatch(path) is not None
+
+
 def plan_content_hash(content: bytes | str) -> str:
     """Hash the exact UTF-8 bytes of a validated ExecPlan document."""
     if isinstance(content, str):

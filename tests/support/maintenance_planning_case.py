@@ -22,6 +22,7 @@ from loop_manager_internal.storage import maintenance_file_ledger
 from loop_manager_internal.maintenance import maintenance_file_publication
 from loop_manager_internal.maintenance import maintenance_reconciliation
 from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.storage import planning_input_state
 from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventory, TrackedSource
 from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot, mutable_snapshot_token
 
@@ -350,9 +351,13 @@ class MaintenancePlanningCase(unittest.TestCase):
         git(self.repo, "push", "origin", "HEAD:main")
         return plan_commit, intent, inventory
 
-    def _assert_published_batch_recovery_rejects_catalog_drift(
+    def _assert_published_batch_recovery_preserves_catalog_drift(
         self, drift: str
     ) -> None:
+        planning_input_state.record_general(
+            self.connection, str(self.repo), self.base_sha,
+            loop_manager.plan_declarations(self.repo, self.base_sha),
+        )
         context = self._begin_barrier()
         self._write_barrier_batch()
         result = self._validate_barrier(context)
@@ -388,21 +393,22 @@ class MaintenancePlanningCase(unittest.TestCase):
         git(other, "push", "origin", "HEAD:main")
         git(self.repo, "fetch", "origin")
 
-        with self.assertRaisesRegex(
-            loop_manager.MaintenancePlanningError, "ExecPlan catalog"
-        ):
-            loop_manager.recover_maintenance_planning_batch(
-                self.connection, str(self.repo), self.repo, "main"
-            )
-        self.assertEqual(
-            maintenance_state.MaintenanceRepository(self.connection).get(str(self.repo)),
-            intent,
+        recovered = loop_manager.recover_maintenance_planning_batch(
+            self.connection, str(self.repo), self.repo, "main"
         )
-        self.assertIsNone(
-            self.connection.execute(
-                "SELECT 1 FROM exec_plans "
-                "WHERE repo = ? AND plan_id = 'G-002'",
-                (str(self.repo),),
-            ).fetchone()
-        )
-
+        self.assertEqual(recovered.publication_commit_sha, plan_commit)
+        self.assertNotEqual(recovered, intent)
+        project = self.connection.execute(
+            "SELECT processed_sha, planning_fingerprint FROM projects WHERE repo = ?",
+            (str(self.repo),),
+        ).fetchone()
+        self.assertEqual(tuple(project), (None, None))
+        self.assertTrue(planning_input_state.matches(
+            self.connection, str(self.repo),
+            loop_manager.plan_declarations(self.repo, plan_commit),
+        ))
+        remote = git(self.repo, "rev-parse", "origin/main")
+        self.assertFalse(planning_input_state.matches(
+            self.connection, str(self.repo),
+            loop_manager.plan_declarations(self.repo, remote),
+        ))

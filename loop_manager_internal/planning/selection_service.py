@@ -1,6 +1,7 @@
 """Planning input selection, safety gates, and READY activation."""
 from __future__ import annotations
 import hashlib
+import subprocess
 from pathlib import Path
 from loop_manager_internal.maintenance.maintenance_orchestration import assessment_can_yield, maintenance_planning_fingerprint
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningError
@@ -13,6 +14,31 @@ from loop_manager_internal.planning.planning_contracts import (
 )
 
 class PlanningSelectionService(PlanningService):
+    def _plan_declarations_match(
+        self, row: runtime_state.PlanningSnapshot,
+        context: PlanningContext, base_sha: str,
+    ) -> bool:
+        current = self._ports.git.plan_declarations(context.repo_path, base_sha)
+        if self._ports.state.plan_declarations_match(context.repo, current):
+            return True
+        if self._ports.state.has_plan_declaration_baseline(context.repo):
+            return False
+        if not row.processed_sha or not row.planning_fingerprint:
+            return False
+        # A legacy full-planning result can be reused only when its saved
+        # fingerprint still proves the immutable successful revision.
+        try:
+            old_sha = str(row.processed_sha)
+            stored = str(row.planning_fingerprint)
+            comparable = stored == self._ports.git.nonplan_fingerprint(
+                context.repo_path, old_sha,
+            )
+            return comparable and current == self._ports.git.plan_declarations(
+                context.repo_path, old_sha,
+            )
+        except (RuntimeError, subprocess.CalledProcessError, OSError, ValueError):
+            return False
+
     def _gate_preserved_error(self, run: _PlanningRun) -> PlanningOutcome | None:
         """Check the failed input before scheduling or stale-workspace cleanup."""
 
@@ -359,13 +385,16 @@ class PlanningSelectionService(PlanningService):
         base_sha: str,
         current_fingerprint: str,
     ) -> bool:
+        if not self._plan_declarations_match(row, context, base_sha):
+            return True
         if row.planning_fingerprint == current_fingerprint:
             return False
         if row.planning_fingerprint and row.processed_sha:
-            processed = self._ports.git.input_fingerprint(
+            processed = self._ports.git.nonplan_fingerprint(
                 context.repo_path, row.processed_sha
             )
-            if processed == current_fingerprint:
+            current = self._ports.git.nonplan_fingerprint(context.repo_path, base_sha)
+            if processed == current:
                 return False
             if self._ports.git.requirement_archive_only(
                 context.repo_path, row.processed_sha, base_sha
@@ -543,6 +572,7 @@ class PlanningSelectionService(PlanningService):
             not run.maintenance_planning
             and not row.phase
             and row.planning_fingerprint == run.current_fingerprint
+            and self._plan_declarations_match(row, context, run.base_sha)
             and not forced_general_planning
         ):
             self._ports.state.update(
@@ -563,10 +593,14 @@ class PlanningSelectionService(PlanningService):
             and row.processed_sha
             and not forced_general_planning
         ):
-            processed = self._ports.git.input_fingerprint(
-                context.repo_path, row.processed_sha
+            declarations_match = self._plan_declarations_match(row, context, run.base_sha)
+            processed = self._ports.git.nonplan_fingerprint(
+                context.repo_path, row.processed_sha,
             )
-            if processed == run.current_fingerprint:
+            current = self._ports.git.nonplan_fingerprint(
+                context.repo_path, run.base_sha,
+            )
+            if declarations_match and processed == current:
                 self._ports.state.update(
                     context.repo,
                     processed_sha=run.base_sha,
@@ -577,7 +611,7 @@ class PlanningSelectionService(PlanningService):
                 )
                 planning_required = False
                 run.fingerprint_skipped = True
-            elif self._ports.git.requirement_archive_only(
+            elif declarations_match and self._ports.git.requirement_archive_only(
                 context.repo_path, row.processed_sha, run.base_sha
             ):
                 self._ports.state.update(

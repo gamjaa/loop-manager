@@ -89,6 +89,9 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
                         Path('unused.ini'), 'codex', 'worker', 1, Path('/managed')),
                         loop_manager.AgentProfile('fixture-worker-model', 'medium'))
                     self.assertEqual(loop_manager._agent_profile(
+                        Path('unused.ini'), 'codex', 'maintenance_planner', None, Path('/managed')),
+                        loop_manager.AgentProfile('fixture-worker-model', 'medium'))
+                    self.assertEqual(loop_manager._agent_profile(
                         Path('configured.ini'), 'codex', 'worker', 1, Path('/managed')), 'real profile')
                     self.assertEqual(loop_manager._agent_profile(
                         Path('unused.ini'), 'codex', 'reviewer', None, Path('/managed')), 'real profile')

@@ -1052,6 +1052,9 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
                     "transition",
                     autospec=True,
                     side_effect=fail_refactoring_transition,
+                ), mock.patch(
+                    "loop_manager_internal.planning.tiered_assessment.enabled",
+                    return_value=False,
                 ):
                     first = self._run_registered(
                         connection, state_dir, repo_path, agent
@@ -1095,6 +1098,9 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
 
                 with mock.patch(
                     "loop_manager.git", side_effect=record_recovery_git
+                ), mock.patch(
+                    "loop_manager_internal.planning.tiered_assessment.enabled",
+                    return_value=False,
                 ):
                     second = self._run_registered(
                         connection, state_dir, repo_path, agent

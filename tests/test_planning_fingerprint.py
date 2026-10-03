@@ -4,12 +4,23 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
+from loop_manager_internal.catalog import catalog_service
 from tests.support.catalog import write_execplan
 from tests.support.git import git_command, make_remote_repository, commit_and_push
 from tests.support.worker import dummy_worker_sessions
 
 
 class PlanningFingerprintTest(unittest.TestCase):
+    def test_input_kind_distinguishes_documents_plans_and_code(self):
+        classify = lambda path: catalog_service.classify_planning_input(
+            path, loop_manager._is_active_requirement,
+        )
+        self.assertEqual(classify(b"docs/PRODUCT.md"), catalog_service.PlanningInputKind.DOCUMENT)
+        self.assertEqual(classify(b"AGENTS.md"), catalog_service.PlanningInputKind.GUIDANCE)
+        self.assertEqual(classify(b"docs/plans/[G-130] Plan.md"), catalog_service.PlanningInputKind.ACTIVE_PLAN)
+        self.assertEqual(classify(b"src/app.py"), catalog_service.PlanningInputKind.OTHER)
+        self.assertEqual(classify(b"docs/FUTURE_IDEAS.md"), catalog_service.PlanningInputKind.EXCLUDED)
+
     def test_planning_input_path_boundary(self):
         cases = {
             b"AGENTS.md": True,
@@ -21,8 +32,11 @@ class PlanningFingerprintTest(unittest.TestCase):
             b".github/workflows/test.yml": True,
             b"src/app.py": True,
             b"docs/PLANS.md": False,
+            b"docs/REQUIREMENT.template.md": False,
             b"docs/FUTURE_IDEAS.md": False,
-            b"docs/plans/[G-999] Ignored.md": False,
+            b"docs/plans/[G-999] Active.md": True,
+            b"docs/plans/archive/[G-999] Archived.md": False,
+            b"docs/plans/nested/[G-999] Nested.md": False,
             b"docs/requirements/archive/Old.md": False,
             b"docs/requirements/nested/Requirement.md": False,
             b"docs/requirements/NotMarkdown.txt": False,
@@ -91,6 +105,35 @@ class PlanningFingerprintTest(unittest.TestCase):
             (repo / "src/app.py").rename(repo / "src/renamed.py")
             commit_and_push(repo, "Rename source")
             self.assertNotEqual(loop_manager.planning_input_fingerprint(repo, "main"), changed)
+
+    def test_active_plan_changes_are_remote_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            initial = loop_manager.planning_input_fingerprint(repo, "main")
+            other = loop_manager._nonplan_input_fingerprint(repo, "origin/main")
+            plan = repo / "docs/plans/[G-999] New.md"
+            plan.parent.mkdir(parents=True, exist_ok=True)
+            plan.write_text("new\n", encoding="utf-8")
+            self.assertEqual(loop_manager.planning_input_fingerprint(repo, "main"), initial)
+            commit_and_push(repo, "Add plan")
+            added = loop_manager.planning_input_fingerprint(repo, "main")
+            self.assertNotEqual(added, initial)
+            self.assertEqual(loop_manager._nonplan_input_fingerprint(repo, "origin/main"), other)
+
+            plan.write_text("revised\n", encoding="utf-8")
+            commit_and_push(repo, "Revise plan")
+            revised = loop_manager.planning_input_fingerprint(repo, "main")
+            self.assertNotEqual(revised, added)
+
+            renamed = plan.with_name("[G-999] Renamed.md")
+            plan.rename(renamed)
+            commit_and_push(repo, "Rename plan")
+            renamed_fingerprint = loop_manager.planning_input_fingerprint(repo, "main")
+            self.assertNotEqual(renamed_fingerprint, revised)
+
+            renamed.unlink()
+            commit_and_push(repo, "Delete plan")
+            self.assertEqual(loop_manager.planning_input_fingerprint(repo, "main"), initial)
 
     def test_planning_input_fingerprint_includes_gitlink_commit(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -485,11 +485,11 @@ class MaintenancePublicationTest(MaintenancePlanningCase):
             ).fetchone()
         )
 
-    def test_published_batch_recovery_rejects_added_catalog_plan(self):
-        self._assert_published_batch_recovery_rejects_catalog_drift("addition")
+    def test_published_batch_recovery_keeps_added_user_plan_unobserved(self):
+        self._assert_published_batch_recovery_preserves_catalog_drift("addition")
 
-    def test_published_batch_recovery_rejects_modified_catalog_plan(self):
-        self._assert_published_batch_recovery_rejects_catalog_drift("modification")
+    def test_published_batch_recovery_keeps_modified_user_plan_unobserved(self):
+        self._assert_published_batch_recovery_preserves_catalog_drift("modification")
 
     def test_publication_preflight_restarts_when_origin_base_moves(self):
         context = self._begin_barrier()

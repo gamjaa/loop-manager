@@ -8,7 +8,7 @@ import unittest
 from unittest import mock
 
 import loop_manager
-from loop_manager_internal.storage import maintenance_state, planning_publication_state
+from loop_manager_internal.storage import maintenance_state, planning_publication_state, planning_input_state
 from loop_manager_internal.maintenance.maintenance_planning import PlanRevision, ReadyPlanSnapshot
 from loop_manager_internal.planning.planning_catalog import PlanDeletion, MutableReadySnapshot, mutable_snapshot_token
 
@@ -238,6 +238,9 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         self.assertEqual(
             tuple(project), (None, commit, specification, planning)
         )
+        self.assertTrue(planning_input_state.matches(
+            self.connection, str(self.repo), loop_manager.plan_declarations(self.repo, commit),
+        ))
         self.assertIsNone(
             loop_manager.general_planning_publication(
                 self.connection, str(self.repo)
@@ -301,6 +304,9 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
             (str(self.repo),),
         ).fetchone()
         self.assertEqual(tuple(project), ("PLANNING", None))
+        self.assertFalse(planning_input_state.has_baseline(
+            self.connection, str(self.repo),
+        ))
         self.assertIsNotNone(
             loop_manager.general_planning_publication(
                 self.connection, str(self.repo)
@@ -424,6 +430,28 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
                 self.connection, str(self.repo)
             )
         )
+
+    def test_recovery_consumes_published_batch_but_keeps_later_user_plan(self):
+        _result, commit, _specification, _planning = self.prepare_batch()
+        with tempfile.TemporaryDirectory() as directory:
+            other = Path(directory) / "later"
+            git(self.repo, "worktree", "add", "--detach", str(other), commit)
+            user_plan = other / "docs/plans/[G-004] User.md"
+            user_plan.write_text(plan_text("G-004", "User"), encoding="utf-8")
+            git(other, "add", "docs/plans/[G-004] User.md")
+            git(other, "commit", "-m", "User plan after publication")
+            later = git(other, "rev-parse", "HEAD")
+            git(self.repo, "update-ref", "refs/remotes/origin/main", later)
+
+            self.assertEqual(loop_manager.recover_general_planning_batch(
+                self.connection, str(self.repo), self.repo, "main",
+            ), "applied")
+            self.assertTrue(planning_input_state.matches(
+                self.connection, str(self.repo), loop_manager.plan_declarations(self.repo, commit),
+            ))
+            self.assertFalse(planning_input_state.matches(
+                self.connection, str(self.repo), loop_manager.plan_declarations(self.repo, later),
+            ))
 
     def test_cancelled_plan_id_is_reserved_from_future_allocation(self):
         result, commit, specification, planning = self.prepare_batch()
@@ -555,8 +583,9 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
             loop_manager._planning_input_fingerprint(self.repo, changed),
         )
 
-    def test_plan_edits_and_archive_do_not_change_full_input_but_agents_does(self):
+    def test_plan_edits_and_archive_change_full_input_but_not_other_input(self):
         baseline = loop_manager._planning_input_fingerprint(self.repo, self.base)
+        other = loop_manager._nonplan_input_fingerprint(self.repo, self.base)
         plan = self.repo / self.paths["G-001"]
         plan.write_text(plan_text("G-001", "Edited First"), encoding="utf-8")
         git(self.repo, "add", self.paths["G-001"])
@@ -570,10 +599,11 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         git(self.repo, "commit", "-m", "archive plan")
         archived = git(self.repo, "rev-parse", "HEAD")
 
+        self.assertNotEqual(loop_manager._planning_input_fingerprint(self.repo, edited), baseline)
+        self.assertNotEqual(loop_manager._planning_input_fingerprint(self.repo, archived), baseline)
         self.assertEqual(
-            [loop_manager._planning_input_fingerprint(self.repo, revision)
-             for revision in (edited, archived)],
-            [baseline, baseline],
+            [loop_manager._nonplan_input_fingerprint(self.repo, revision)
+             for revision in (edited, archived)], [other, other],
         )
 
         (self.repo / "AGENTS.md").write_text("# New guidance\n", encoding="utf-8")
@@ -585,6 +615,36 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
             ),
             baseline,
         )
+
+    def test_verified_plan_delta_preserves_unrelated_user_plan_change(self):
+        baseline = loop_manager.plan_declarations(self.repo, self.base)
+        planning_input_state.record_general(
+            self.connection, str(self.repo), self.base, baseline,
+        )
+        first = self.paths["G-001"]
+        second = self.paths["G-002"]
+        own = ("blob", "verified-new")
+        planning_input_state.advance_verified_delta(
+            self.connection, str(self.repo), "maintenance-commit",
+            {first: (baseline[first], own)},
+        )
+        self.assertTrue(planning_input_state.matches(
+            self.connection, str(self.repo), {**baseline, first: own},
+        ))
+        self.assertFalse(planning_input_state.matches(
+            self.connection, str(self.repo), {first: own, second: ("blob", "user-edit")},
+        ))
+        self.assertFalse(planning_input_state.advance_verified_delta(
+            self.connection, str(self.repo), "unverified-drift",
+            {second: (("blob", "user-edit"), None)},
+        ))
+        row = self.connection.execute(
+            "SELECT scope, reference_revision, last_verified_revision, fingerprint_format "
+            "FROM planning_input_baselines WHERE repo = ?", (str(self.repo),),
+        ).fetchone()
+        self.assertEqual(tuple(row), (
+            "general", self.base, "maintenance-commit", planning_input_state.FORMAT,
+        ))
 
 
 class MutableReadyMetadataCasTest(unittest.TestCase):

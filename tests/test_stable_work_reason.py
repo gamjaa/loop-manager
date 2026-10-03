@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
+from loop_manager_internal.storage import planning_input_state
 from tests.support.git import git_command
 from tests.support.worker import dummy_worker_sessions
 
@@ -33,6 +34,7 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
             "(repo, last_success_merged_count, file_assessment_start_merged_count) "
             "VALUES (?, 0, 0)", (repo,),
         )
+        planning_input_state.record_general(connection, repo, "base-sha", {})
         connection.commit()
         return connection, repo
 

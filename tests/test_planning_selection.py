@@ -41,6 +41,46 @@ from tests.support.planning_case import (
 )
 
 class PlanningSelectionTest(PlanningCase):
+    def test_changed_plan_declaration_preempts_runnable_ready(self):
+        ports = FakePorts(planning_snapshot(
+            processed_sha="base", planning_fingerprint="fingerprint",
+            specification_fingerprint="specification",
+        ))
+        ports.state.plan_declarations_match_result = False
+        ports.git.requirement_archive_only = mock.Mock(return_value=True)
+        ports.state.schedule_result.has_ready = True
+        ports.state.schedule_result.runnable_ready = object()
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(self.context)
+
+        self.assertIsNone(coordinator._selection._select_planning_work(run))
+        self.assertEqual(run.selection.kind, PlanningDecisionKind.RUN_FALLBACK_PLANNING)
+        self.assertFalse(run.ready_activated_before_planning)
+        ports.git.requirement_archive_only.assert_not_called()
+
+    def test_legacy_success_requires_matching_revision_to_skip_plan_recheck(self):
+        for stored, legacy, expected in (
+            ("fingerprint", "fingerprint", PlanningDecisionKind.ACTIVATE_READY),
+            ("unverified", "fingerprint", PlanningDecisionKind.RUN_FALLBACK_PLANNING),
+            ("v3-without-baseline", "v2", PlanningDecisionKind.RUN_FALLBACK_PLANNING),
+        ):
+            with self.subTest(stored=stored):
+                ports = FakePorts(planning_snapshot(
+                    processed_sha="base", planning_fingerprint=stored,
+                    specification_fingerprint="specification",
+                ))
+                ports.state.plan_declarations_match_result = False
+                ports.state.has_plan_declaration_baseline_result = False
+                ports.git.nonplan_fingerprints["base"] = legacy
+                ports.git.fingerprints["base"] = stored
+                ports.state.schedule_result.has_ready = True
+                ports.state.schedule_result.runnable_ready = object()
+                coordinator = PlanningLifecycleCoordinator(ports)
+                run = coordinator._new_run(self.context)
+
+                self.assertIsNone(coordinator._selection._select_planning_work(run))
+                self.assertEqual(run.selection.kind, expected)
+
     def test_selection_step_returns_a_new_immutable_snapshot(self):
         ports = FakePorts(planning_snapshot())
         coordinator = PlanningLifecycleCoordinator(ports)

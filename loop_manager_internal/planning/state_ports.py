@@ -7,7 +7,7 @@ from loop_manager_internal.application.contracts import ValidatedPlanningResult
 from loop_manager_internal.maintenance import maintenance_file_inventory
 from loop_manager_internal.maintenance import maintenance_file_publication
 from loop_manager_internal.storage import maintenance_state
-from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.storage import runtime_state, planning_input_state
 from loop_manager_internal.storage.planning_publication_state import GeneralPlanningPublication
 from pathlib import Path
 import sqlite3
@@ -235,6 +235,19 @@ class _PlanningStatePorts:
             specification_fingerprint=specification_fingerprint,
             planning_fingerprint=planning_fingerprint,
         )
+
+    def plan_declarations_match(
+        self, repo: str, entries: dict[str, tuple[str, str]],
+    ) -> bool:
+        return planning_input_state.matches(self._connection, repo, entries)
+
+    def has_plan_declaration_baseline(self, repo: str) -> bool:
+        return planning_input_state.has_baseline(self._connection, repo)
+
+    def record_general_plan_declarations(
+        self, repo: str, revision: str, entries: dict[str, tuple[str, str]],
+    ) -> None:
+        planning_input_state.record_general(self._connection, repo, revision, entries)
 
     def clear_validation(self, repo: str) -> None:
         self._effects.clear_planning_validation_state(self._connection, repo)

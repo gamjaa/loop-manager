@@ -9,7 +9,7 @@ from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot
 from loop_manager_internal.planning.planning_catalog import PlanDeletion
 from loop_manager_internal.planning.planning_catalog import PlannerValidationError
 from loop_manager_internal.storage import execplan_catalog_state
-from loop_manager_internal.storage import planning_publication_state
+from loop_manager_internal.storage import planning_publication_state, planning_input_state
 from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.storage.planning_publication_state import GeneralPlanningPublication
 from pathlib import Path
@@ -316,6 +316,7 @@ class GeneralPlanningBatchAlreadyAppliedEffects:
     """Named effects for _general_planning_batch_already_applied; no entry-point/module access."""
     _execplan_metadata: Callable[..., object]
     file_hash: Callable[..., object]
+    plan_declarations: Callable[..., object]
 
 
 def _general_planning_batch_already_applied(
@@ -336,6 +337,10 @@ def _general_planning_batch_already_applied(
         plan_commit,
         specification_fingerprint,
         planning_fingerprint,
+    ):
+        return False
+    if not planning_input_state.matches(
+        connection, repo, effects.plan_declarations(worktree, plan_commit),
     ):
         return False
     for path, plan in result.plans:
@@ -428,6 +433,7 @@ class ApplyGeneralPlanningBatchEffects:
     file_hash: Callable[..., object]
     general_planning_publication: Callable[..., object]
     is_loop_manager_repository: Callable[..., object]
+    plan_declarations: Callable[..., object]
 
 
 def _apply_general_planning_batch(
@@ -504,6 +510,10 @@ def _apply_general_planning_batch(
             processed_sha=plan_commit,
             specification_fingerprint=specification_fingerprint,
             planning_fingerprint=planning_fingerprint,
+        )
+        planning_input_state.record_general(
+            connection, repo, plan_commit,
+            effects.plan_declarations(worktree, plan_commit),
         )
         planning_publication_state.delete_general_planning_publication(connection, repo)
 
@@ -597,7 +607,6 @@ def recover_general_planning_batch(
                 intent.base_sha,
                 intent.commit_sha,
                 remote,
-                reject_catalog_drift=True,
             )
         effects._apply_general_planning_batch(
             connection,
