@@ -76,6 +76,7 @@ Worker targeted 실행(모두 최종 통과):
 - `python3 -m unittest tests.test_planning_recovery.PlanningRecoveryTest.test_completed_no_change_turn_resumes_validation_without_agent_replay`, `python3 -m unittest tests.test_planning_recovery.PlanningConflictCorrectionUnitTests.test_workspace_wiring_preserves_error_and_commits_base_before_cleanup`, `python3 -m unittest tests.test_planning_publication.PlanningPublicationTest.test_no_change_cleanup_failure_keeps_saved_planning_result` — 기존 완료 결과 재사용·workspace 복구·publication guard의 각 1 case 통과.
 - Manager verify 피드백에서 legacy 유지보수 fixture가 새 tiered 포트와 실제 Codex 모델 조회를 사용해 기존 경로 검증을 중단했다. fixture의 해당 경로만 명시적으로 유지하고 `unused.ini` Planner 역할에 가짜 프로필을 제공했다. 보고된 개별 case 4건과 fixture unit case 1건을 직접 재실행해 통과했다.
 - Review 피드백: 일반 Planner는 READY 대상의 `sources` 밖에 새로 생긴 활성 Requirement도 재평가하며, 일반 planning이 결합되지 않은 유지보수 판단은 무관한 Requirement와 전체 지문 변경만으로 소진된 오류를 재시도하지 않는다. 새 fake-port unit case 3건과 내용 보존 archive 회귀 case 1건을 개별 실행해 통과했다.
+- Manager verify 피드백: 관련 source 변경을 가정하던 기존 fake-port case에 READY 평가 대상과 변경 문서 응답이 빠져 있었다. 둘을 명시하고 `python3 -m unittest tests.test_planning_selection.PlanningSelectionTest.test_failed_maintenance_input_restarts_after_related_source_change`를 개별 실행해 통과했다.
 
 ## Decision Log
 

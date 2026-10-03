@@ -230,6 +230,9 @@ class PlanningSelectionTest(PlanningCase):
         ), cycle)
         ports.git.fingerprints = {"base": "old-input", "advanced-base": "new-input"}
         ports.git.remote = "advanced-base"
+        source = "docs/requirements/[R-052] Relevant.md"
+        ports.state.execplan_rows = lambda _repo: [{"plan_id": "G-066", "status": "READY"}]
+        ports.git.relevant_document_changes = mock.Mock(return_value=(source,))
         ports.validation.prepare_maintenance_context = mock.Mock(return_value=object())
         ports.validation.maintenance_change_context = mock.Mock(return_value="source changed")
         ports.validation.maintenance_prompt = mock.Mock(return_value="correct the saved failure")
@@ -242,6 +245,10 @@ class PlanningSelectionTest(PlanningCase):
         )
 
         self.assertEqual(outcome.kind, PlanningOutcomeKind.TRANSIENT_PAUSE)
+        self.assertEqual(ports.git.relevant_document_changes.call_args.args[-1], ("G-066",))
+        self.assertFalse(ports.git.relevant_document_changes.call_args.kwargs[
+            "include_active_requirements"
+        ])
         self.assertEqual(ports.git.ownership_checks,
                          [("/repo", fingerprint, Path("/planning"))])
         self.assertEqual(ports.state.snapshot.planning_error, "saved maintenance failure")
