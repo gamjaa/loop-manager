@@ -15,7 +15,6 @@ from loop_manager_internal.storage import runtime_state
 from pathlib import Path
 import hashlib
 import sqlite3
-import subprocess
 
 
 def _planning_outcome_step_result(outcome: PlanningOutcome) -> int | None:
@@ -210,19 +209,7 @@ def _stable_work_reason(
         )
     current_plans = effects.plan_declarations(repo_path, base_sha)
     if not planning_input_state.matches(connection, repo, current_plans):
-        if planning_input_state.has_baseline(connection, repo) or not row["processed_sha"]:
-            return None
-        try:
-            old_sha = str(row["processed_sha"])
-            if not (
-                row["planning_fingerprint"] == effects._nonplan_input_fingerprint(
-                    repo_path, old_sha,
-                )
-                and effects.plan_declarations(repo_path, old_sha) == current_plans
-            ):
-                return None
-        except (RuntimeError, subprocess.CalledProcessError, OSError, ValueError):
-            return None
+        return None
     if current_input != row["planning_fingerprint"] and not (
         row["processed_sha"] and (
             archive_only or effects._nonplan_input_fingerprint(

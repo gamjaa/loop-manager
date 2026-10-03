@@ -69,6 +69,32 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
             ))
         connection.close()
 
+    def test_legacy_processed_sha_cannot_confirm_unreviewed_plan(self):
+        connection, repo = self._connection()
+        connection.execute(
+            "DELETE FROM planning_input_baselines WHERE repo = ?", (repo,),
+        )
+        connection.execute(
+            "UPDATE projects SET processed_sha = 'base-sha', "
+            "planning_fingerprint = 'legacy-v2' WHERE repo = ?", (repo,),
+        )
+        with mock.patch("loop_manager.git") as git_command, mock.patch(
+            "loop_manager._planning_input_fingerprint", return_value="current-v3"
+        ), mock.patch(
+            "loop_manager._nonplan_input_fingerprint", return_value="legacy-v2"
+        ), mock.patch(
+            "loop_manager._specification_input_fingerprint", return_value="spec-one"
+        ), mock.patch(
+            "loop_manager.plan_declarations", return_value={}
+        ), mock.patch(
+            "loop_manager._git_tree_entries", return_value={}
+        ):
+            git_command.return_value.stdout = "base-sha\n"
+            self.assertIsNone(loop_manager._stable_work_reason(
+                connection, repo, refactoring_review_interval=5,
+            ))
+        connection.close()
+
     def test_runnable_and_due_maintenance_do_not_emit_exhaustion(self):
         connection, repo = self._connection()
         connection.execute(

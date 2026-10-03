@@ -119,7 +119,6 @@ class FakeStatePort:
         self.maintenance_begin_count = 0
         self.document_approval_pending = False
         self.plan_declarations_match_result = True
-        self.has_plan_declaration_baseline_result = True
         self.schedule_result = SimpleNamespace(
             active=None,
             has_ready=False,
@@ -136,9 +135,6 @@ class FakeStatePort:
 
     def plan_declarations_match(self, _repo, _entries):
         return self.plan_declarations_match_result
-
-    def has_plan_declaration_baseline(self, _repo):
-        return self.has_plan_declaration_baseline_result
 
     def record_general_plan_declarations(self, _repo, _revision, _entries):
         self.plan_declarations_match_result = True

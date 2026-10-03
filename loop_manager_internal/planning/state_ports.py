@@ -241,9 +241,6 @@ class _PlanningStatePorts:
     ) -> bool:
         return planning_input_state.matches(self._connection, repo, entries)
 
-    def has_plan_declaration_baseline(self, repo: str) -> bool:
-        return planning_input_state.has_baseline(self._connection, repo)
-
     def record_general_plan_declarations(
         self, repo: str, revision: str, entries: dict[str, tuple[str, str]],
     ) -> None:
