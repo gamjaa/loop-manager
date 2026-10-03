@@ -202,14 +202,15 @@ def _stable_work_reason(
     ).stdout.strip()
     current_input = effects._planning_input_fingerprint(repo_path, base_sha)
     current_specification = effects._specification_input_fingerprint(repo_path, base_sha)
+    current_plans = effects.plan_declarations(repo_path, base_sha)
+    if not planning_input_state.matches(connection, repo, current_plans):
+        return None
     archive_only = False
     if current_input != row["planning_fingerprint"] and row["processed_sha"]:
         archive_only = effects._is_requirement_archive_only_change(
             repo_path, str(row["processed_sha"]), base_sha,
+            verified_plan_declarations=True,
         )
-    current_plans = effects.plan_declarations(repo_path, base_sha)
-    if not planning_input_state.matches(connection, repo, current_plans):
-        return None
     if current_input != row["planning_fingerprint"] and not (
         row["processed_sha"] and (
             archive_only or effects._nonplan_input_fingerprint(

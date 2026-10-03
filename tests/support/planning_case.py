@@ -369,7 +369,7 @@ class FakeGitPort:
     def specification_fingerprint(self, _repo_path, sha):
         return self.specification_fingerprints.get(sha, "specification")
 
-    def requirement_archive_only(self, *_args):
+    def requirement_archive_only(self, *_args, **_kwargs):
         return False
 
     def validate_workspace_identity(self, *_args):

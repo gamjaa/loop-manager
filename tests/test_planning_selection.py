@@ -11,7 +11,10 @@ from unittest import mock
 
 import loop_manager
 from loop_manager_internal.notifications import notifications
-from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.storage import maintenance_state, planning_input_state
+from loop_manager_internal.planning.input_fingerprints import (
+    IsRequirementArchiveOnlyChangeEffects, _is_requirement_archive_only_change,
+)
 from loop_manager_internal.maintenance import maintenance_file_review
 from loop_manager_internal.maintenance import maintenance_findings
 from loop_manager_internal.maintenance import maintenance_reconciliation
@@ -41,6 +44,81 @@ from tests.support.planning_case import (
 )
 
 class PlanningSelectionTest(PlanningCase):
+    def test_dual_archive_skips_only_with_verified_unchanged_declarations(self):
+        requirement = b"docs/requirements/R.md"
+        plan = b"docs/plans/[G-001] Done.md"
+        ready = b"docs/plans/[G-002] Ready.md"
+        previous = {
+            requirement: (b"blob", b"requirement"),
+            plan: (b"blob", b"done"),
+            ready: (b"blob", b"ready"),
+        }
+        for change in ("verified", "unverified", "plan-edit", "code", "archive-edit"):
+            for has_ready in (False, True):
+                with self.subTest(change=change, has_ready=has_ready):
+                    current = {
+                        b"docs/requirements/archive/R.md": previous[requirement],
+                        b"docs/plans/archive/[G-001] Done.md": previous[plan],
+                        ready: previous[ready],
+                    }
+                    if change == "plan-edit":
+                        current[ready] = (b"blob", b"edited")
+                    elif change == "code":
+                        current[b"source.py"] = (b"blob", b"new-code")
+                    elif change == "archive-edit":
+                        current[b"docs/plans/archive/[G-001] Done.md"] = (b"blob", b"edited")
+                    effects = IsRequirementArchiveOnlyChangeEffects(
+                        _git_tree_entries=lambda _repo, sha: previous if sha == "old-base" else current,
+                        _is_planning_input=loop_manager._is_planning_input,
+                    )
+                    ports = FakePorts(planning_snapshot(
+                        processed_sha="old-base", planning_fingerprint="old-full",
+                        specification_fingerprint="old-specification",
+                    ))
+                    ports.git.fingerprints = {"old-base": "old-full", "base": "archive-full"}
+                    ports.git.specification_fingerprints["old-base"] = "old-specification"
+                    ports.git.requirement_archive_only = lambda repo, old, new, **kwargs: (
+                        _is_requirement_archive_only_change(effects, repo, old, new, **kwargs)
+                    )
+                    declarations = lambda tree: {
+                        path.decode(): tuple(part.decode() for part in value)
+                        for path, value in tree.items()
+                        if loop_manager.execplan_catalog.is_active_execplan_path(path)
+                    }
+                    connection = sqlite3.connect(":memory:")
+                    self.addCleanup(connection.close)
+                    connection.row_factory = sqlite3.Row
+                    planning_input_state.record_general(connection, "/repo", "old-base", declarations(previous))
+                    if change != "unverified":
+                        planning_input_state.advance_verified_delta(
+                            connection, "/repo", "base", {plan.decode(): (("blob", "done"), None)},
+                        )
+                    ports.git.plan_declarations = lambda *_args: declarations(current)
+                    ports.state.plan_declarations_match = lambda repo, entries: (
+                        planning_input_state.matches(connection, repo, entries)
+                    )
+                    ports.state.schedule_result = SimpleNamespace(
+                        active=None, has_ready=has_ready, has_waiting=False,
+                        runnable_ready=object() if has_ready else None, project_blocked=False,
+                    )
+                    ports.state.activate_result = object() if has_ready else None
+                    coordinator = PlanningLifecycleCoordinator(ports)
+                    if change == "verified":
+                        for _ in range(2):
+                            outcome = coordinator.run(self.context)
+                            self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY
+                                             if has_ready else PlanningOutcomeKind.FINGERPRINT_SKIPPED)
+                            ports.state.snapshot = replace(ports.state.snapshot, phase=None)
+                        self.assertEqual(ports.agent.run_count, 0)
+                        self.assertEqual(ports.state.snapshot.planning_fingerprint, "old-full")
+                    else:
+                        run = coordinator._new_run(self.context)
+                        self.assertIsNone(coordinator._selection._select_planning_work(run))
+                        self.assertIn(run.selection.kind, {
+                            PlanningDecisionKind.RUN_SPECIFICATION_PLANNING,
+                            PlanningDecisionKind.RUN_FALLBACK_PLANNING,
+                        })
+
     def test_changed_plan_declaration_preempts_runnable_ready(self):
         ports = FakePorts(planning_snapshot(
             processed_sha="base", planning_fingerprint="fingerprint",

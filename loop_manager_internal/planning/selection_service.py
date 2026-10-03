@@ -377,7 +377,8 @@ class PlanningSelectionService(PlanningService):
             if processed == current:
                 return False
             if self._ports.git.requirement_archive_only(
-                context.repo_path, row.processed_sha, base_sha
+                context.repo_path, row.processed_sha, base_sha,
+                verified_plan_declarations=True,
             ):
                 return False
         return True
@@ -409,7 +410,8 @@ class PlanningSelectionService(PlanningService):
             if processed == current_fingerprint:
                 return False
             if self._ports.git.requirement_archive_only(
-                context.repo_path, row.processed_sha, base_sha
+                context.repo_path, row.processed_sha, base_sha,
+                verified_plan_declarations=self._plan_declarations_match(context, base_sha),
             ):
                 return False
         return True
@@ -592,7 +594,8 @@ class PlanningSelectionService(PlanningService):
                 planning_required = False
                 run.fingerprint_skipped = True
             elif declarations_match and self._ports.git.requirement_archive_only(
-                context.repo_path, row.processed_sha, run.base_sha
+                context.repo_path, row.processed_sha, run.base_sha,
+                verified_plan_declarations=True,
             ):
                 self._ports.state.update(
                     context.repo,

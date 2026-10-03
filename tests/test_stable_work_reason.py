@@ -69,6 +69,43 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
             ))
         connection.close()
 
+    def test_dual_archive_completion_requires_verified_plan_baseline(self):
+        connection, repo = self._connection()
+        self.addCleanup(connection.close)
+        plan = "docs/plans/[G-018] Work.md"
+        previous = {
+            b"docs/requirements/R.md": (b"blob", b"requirement"),
+            plan.encode(): (b"blob", b"plan"),
+        }
+        current = {
+            b"docs/requirements/archive/R.md": (b"blob", b"requirement"),
+            b"docs/plans/archive/[G-018] Work.md": (b"blob", b"plan"),
+        }
+        connection.execute("UPDATE projects SET processed_sha = 'old-base' WHERE repo = ?", (repo,))
+        connection.execute("UPDATE exec_plans SET status = 'MERGED' WHERE repo = ?", (repo,))
+        planning_input_state.record_general(connection, repo, "old-base", {plan: ("blob", "plan")})
+        with mock.patch("loop_manager.git") as command, mock.patch(
+            "loop_manager._planning_input_fingerprint", return_value="archived-full"
+        ), mock.patch(
+            "loop_manager._specification_input_fingerprint", return_value="archived-spec"
+        ), mock.patch(
+            "loop_manager._git_tree_entries",
+            side_effect=lambda _repo, sha: previous if sha == "old-base" else current,
+        ):
+            command.return_value.stdout = "archived-base\n"
+            self.assertIsNone(loop_manager._stable_work_reason(
+                connection, repo, refactoring_review_interval=5,
+            ))
+            planning_input_state.advance_verified_delta(
+                connection, repo, "archived-base", {plan: (("blob", "plan"), None)},
+            )
+            for _ in range(2):
+                result = loop_manager._stable_work_reason(
+                    connection, repo, refactoring_review_interval=5,
+                )
+                self.assertIsNotNone(result)
+                self.assertTrue(result.completed)
+
     def test_legacy_processed_sha_cannot_confirm_unreviewed_plan(self):
         connection, repo = self._connection()
         connection.execute(

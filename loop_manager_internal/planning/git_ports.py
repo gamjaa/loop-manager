@@ -100,9 +100,13 @@ class _PlanningGitPorts:
         return self._effects._specification_input_fingerprint(repo_path, sha)
 
     def requirement_archive_only(
-        self, repo_path: Path, old_sha: str, new_sha: str
+        self, repo_path: Path, old_sha: str, new_sha: str,
+        *, verified_plan_declarations: bool = False,
     ) -> bool:
-        return self._effects._is_requirement_archive_only_change(repo_path, old_sha, new_sha)
+        return self._effects._is_requirement_archive_only_change(
+            repo_path, old_sha, new_sha,
+            verified_plan_declarations=verified_plan_declarations,
+        )
 
     def validate_workspace_identity(
         self, repo: str, fingerprint: str, worktree: Path
