@@ -64,6 +64,7 @@
 | Merge 대기 PR이 없는 due 리팩터링의 우선 처리 | [R-054](requirements/%5BR-054%5D%20Due%20Refactoring%20Priority.md) |
 | 이벤트 시점의 진행·사용자 조치 알림과 무음 구분 | [R-053](requirements/%5BR-053%5D%20Timely%20Progress%20Notifications.md) |
 | 테스트별 시간·실제 Agent 없는 테스트·안전한 Python 캐시 | [R-058](requirements/%5BR-058%5D%20Test%20Timing%20and%20Agent-Free%20Test%20Execution.md), [R-059](requirements/%5BR-059%5D%20Safe%20Python%20Bytecode%20Cache%20Use.md) |
+| 규칙 기반 작업의 Manager 처리·모델 호출과 입출력 감소·동일 입력 성공 결과 재사용 | [R-063](requirements/%5BR-063%5D%20Manager-Owned%20Deterministic%20Work%20and%20Minimal%20Model%20Use.md) |
 
 R-023의 원격 실행·self handoff 목표는 유지하며 로컬 갱신 gate는 R-056, 역할별 파일 권한은 R-061을 따른다. R-055의 planning 오류와 R-061의 유효한 draft 사용자 판단 대기는 구분한다. draft는 planning 오류가 아니며 독립 작업을 막지 않지만 프로젝트 완료와 관련 Requirement archive를 허용하는 완료 상태도 아니다.
 
@@ -274,7 +275,7 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 ### 작업 선택과 동시 실행
 
 - 실행 중인 변경을 먼저 재개한다. 없으면 dependency를 충족한 확정 PR 충돌 복구를 일반 Planner·유지보수 평가·READY 선택보다 먼저 수행한다.
-- PLAN_BLOCKED 또는 안정된 PR_OPEN이 있으면 유지보수 평가는 보류하고, 아래 입력 변경·독립 READY 정책을 따른다.
+- Merge 대기 PR이 있으면 새 유지보수 평가는 보류한다. 독립 계획의 PLAN_BLOCKED 자체는 단계별 유지보수 평가를 막지 않으며, PROJECT_BLOCKED와 현재 변경 실행·공유 안전 gate는 유지한다.
 - 같은 프로젝트에 여러 READY ExecPlan이 대기할 수 있다
 - 같은 프로젝트에서는 IMPLEMENTING, VERIFYING, REVIEWING, PUBLISHING 또는 PR 충돌 복구 중인 ExecPlan 하나만 현재 변경 실행으로 둔다. `PLAN_BLOCKED`와 충돌 복구 중이 아닌 `PR_OPEN`은 이 자리를 점유하지 않는다
 - 새 계획 입력은 실행 중인 작업을 선점하지 않는다. 명세 또는 전체 계획 입력 지문 변경은 다음 안전한 선택 경계에서 READY보다 먼저 한 번 반영한다
@@ -296,11 +297,12 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 
 ### 유지보수 평가
 
-- 첫 평가 전에는 안전한 시점의 MERGED ExecPlan 수를 시작 기준으로 보존한다. 기존 활성 cycle을 먼저 복구·완료하며 과거 성공 이력은 유지한다.
-- 첫 평가는 시작 기준, 정기 평가는 마지막 성공한 파일별 평가 이후 새 MERGED 수가 `refactoring_review_interval`에 도달하면 시작한다. 설정은 양의 정수이며 기본값은 20이다.
-- 성공한 파일별 평가 이력이 있는 완료 후보는 마지막 평가 이후 Merge가 10개 이상이고 새 대상이 있으면 주기 전 안정화 평가를 한 번 수행한다.
-- 최신 원격의 새 파일 또는 경로·내용·실행 모드가 바뀐 파일만 다시 평가한다. 미확인 관계·검토 누락·불확실한 분류를 성공으로 처리하지 않으며, 대상이 없으면 형식적 Agent 호출·계획 없이 완료할 수 있다.
+- 기존 활성 cycle을 먼저 복구·완료하고 과거 성공 이력은 유지한다. 새 평가는 최신 원격 입력을 정적으로 확인해 모델 없는 `fast`, 영향받은 모듈의 `targeted`, 전체 모듈의 `full` 점검 중 필요한 범위를 선택한다.
+- 첫 전체 정밀 점검은 초기 입력에서 수행하며, 이후 마지막 성공한 전체 정밀 점검 이후 새 MERGED 수가 `refactoring_review_interval`에 도달하거나 사용자가 전체 점검을 요청하면 다시 수행한다. 설정은 양의 정수이며 기본값은 20이다. 정적·부분 점검은 이 전체 정밀 기준을 전진시키지 않는다.
+- 주기 사이에는 같은 입력에서 평가 모델을 반복 호출하지 않는다. 변경은 정적으로 확인하고 공개 계약·상태·저장·복구·권한·관계 불확실성·순환·중복·루트 배치 등 확인이 필요한 영향에는 관련 모듈과 테스트를 포함한 정밀 점검을 수행한다. 미확인 사실을 성공한 의미 검토로 만들지 않는다.
+- 원본에 결합된 성공 모듈 검토는 해당 묶음의 입력이 같을 때 재사용한다. 검토에서 발견이 없고 일반 계획을 함께 수행할 필요도 없으면 별도 종합·계획 호출을 하지 않는다. 발견이 있으면 새 계획·기존 비종료 계획·근거 있는 제외에 연결해 처리한다.
 - 리팩터링은 동작·공개 계약·저장 형식을 보존한다. 평가 성공·게시·사후 재검증이 실제로 완료되기 전에는 성공 기준을 전진시키지 않는다.
+- 종전 파일별 평가·게시 결과를 보존한 cycle은 해당 검증·복구 경로로 마친다. 그 이력과 완료 후보의 종전 안정화 판정을 새 단계별 평가의 기본 반복 조건으로 사용하지 않는다.
 
 ### 복구 판단과 최종 차단
 

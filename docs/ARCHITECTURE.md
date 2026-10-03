@@ -20,6 +20,8 @@ Loop Manager는 Windows와 Linux에서 동작하는 Python 3 프로그램이다.
 
 현행 구조와 활성 변경 요청의 적용 범위는 [PRODUCT의 변경 요구사항 절](PRODUCT.md#활성-변경-요구사항과-현재-동작)에서 연결한다. 아래의 로컬 fast-forward 제한, PR 없는 checkpoint, Planner의 FUTURE_IDEAS 작성과 Worker 문서 제한은 현행 설명이며, 각각 R-056·R-060·R-061의 구현 목표를 거부하는 제약으로 사용하지 않는다. 구현 전 Agent의 실제 권한과 실행 gate를 문서만으로 변경하지 않는다.
 
+[R-063](requirements/%5BR-063%5D%20Manager-Owned%20Deterministic%20Work%20and%20Minimal%20Model%20Use.md)은 규칙 기반 편집·결과 형식 처리의 Manager 이관과 모델 호출 축소를 요청한다. 아래의 후보 revision 변경 후 Worker·verify·Review 재수행은 현행 설명이며, R-063 구현에서는 역할별 입력 동일성이 증명된 성공 결과의 재사용 범위에 한해 변경한다. 실제 변경과 비교 근거가 없는 경우의 재검증·최신 원격 게시 gate는 유지한다.
+
 ## 실행 환경과 시작
 
 - Codex 또는 Claude Code CLI 중 최소 하나가 설치되고 인증돼있어야 한다
@@ -216,15 +218,19 @@ dependency·priority·명세 변경·유지보수 DAG의 선택 순서는 PRODUC
 
 [R-055 구현 예정](requirements/%5BR-055%5D%20Blocking%20Path%20Audit%20and%20Minimal%20Interruption.md): 보존된 planning 오류 자체는 변경 실행 자리의 점유 근거가 아니다. planning worktree·session·미게시 결과·오류는 별도로 보존하고, 진행 중 operation·미확정 게시·실제 공유 안전 문제가 없으면 실행 자리를 비워 기존 독립 계획을 계속한다. 새 Planner 주기와 프로젝트 완료 선언은 오류가 해소될 때까지 보류한다.
 
-### 파일별 유지보수 기록
+### 유지보수 분석과 성공 근거
 
-프로젝트별 첫 파일별 평가 전에는 등록 또는 기존 정책 적용의 안전한 시점에 확인한 MERGED ExecPlan 수를 시작 기준으로 보존한다. 기존 활성 유지보수 cycle은 먼저 복구·완료하고 과거 성공 이력은 감사 자료로 보존한다. 첫 평가와 이후 정기 평가는 각각 시작 기준 또는 마지막 성공한 파일별 평가 이후 새로 MERGED된 ExecPlan 수가 공통 `refactoring_review_interval`에 도달할 때 시작한다. 이 설정은 양의 정수이며 기본값은 20이다. 성공한 파일별 평가 이력이 있는 완료 후보는 정기 주기 전에도 이후 Merge 수가 10개 이상이고 새 검토 대상이 있을 때 한 번 안정화 평가를 한다
+Manager는 최신 원격 추적 파일의 경로·내용 hash·mode와 분석 버전에 결합된 정적 사실을 저장한다. 변경된 파일만 다시 파싱하되 현재 파일 집합에서 관계를 다시 계산한다. 정적 코드맵·읽기 전용 조회는 심벌·import·직접 참조·관련 테스트·분석 불확실성을 제공하며 의미 검토 성공 증거는 아니다. 정적 사실은 `docs/maintenance/code-map.jsonl`과 Agent 조회용 별도 snapshot에 제공하고, Manager의 운영 SQLite·session·상태를 Agent 입력으로 내보내지 않는다.
 
-유지보수 Planner만 활성 cycle mode와 무소유 READY snapshot에 한정해 barrier dependency 또는 사후 구조 참조를 개정할 수 있다. READY가 없고 일반 계획 입력도 변경된 due 경계에서만 일반 계획과 유지보수 평가를 한 호출로 결합한다
+PRODUCT의 `fast`·`targeted`·`full` 선택은 정적 비교와 마지막 성공한 전체 정밀 점검의 Merge 기준을 사용한다. `fast`에는 모델 검토 묶음이나 의미 검토 receipt를 만들지 않는다. 정밀 점검은 관련 파일을 모듈 단위의 제한된 묶음으로 구성하고, 원본·mode·정적 사실·분석 버전·평가 조건에 결합된 묶음 identity의 성공 결과를 재사용한다. 전체 점검의 성공 Merge 기준과 최신 정적·부분 평가 기준은 따로 보존한다.
 
-파일별 유지보수 평가는 최신 원격 한 revision의 추적 코드·테스트·실행·검증 스크립트를 분류하고, 기존 성공 기록에 없거나 경로·내용·실행 모드가 달라진 파일만 원본과 관계를 검토한다. 변경 없는 파일은 다시 검토하지 않고, 분류 불확실성·검토 누락·미확인 관계는 성공으로 처리하지 않는다. 선정 파일이 없으면 평가 Agent나 형식적 계획 없이 목록을 검증하고 완료할 수 있다. 검토 중 작성한 코드맵은 성공한 파일에만 원본 identity와 함께 보존하며 변경된 코드맵은 현재 관계 근거로 사용하지 않는다
+모듈 의미 검토는 읽기 전용 Planner 호출로 필요한 원본과 보존 조건을 확인한다. Manager는 묶음 범위·판단·발견과 실제 원본 인용을 검증해 잠정 결과로 보존한다. 발견이 없고 일반 계획도 필요하지 않으면 추가 종합·계획 호출 없이 no-change 결과를 준비한다. 발견이 있으면 저장된 검토를 입력으로 계획 또는 근거 있는 제외에 연결하며, 파일별 검토·관계 확인·종합 페이지를 다시 기본 단계로 실행하지 않는다.
 
-유지보수 planning batch는 원격 fast-forward와 catalog 적용이 확인된 뒤 실제 검토한 파일의 ledger·코드맵과 마지막 성공 파일별 평가의 MERGED 수를 한 SQLite transaction으로 확정한다. 새 리팩터링 계획은 동작·공개 계약·저장 형식을 보존하며 기존 DAG·장벽·사후 재검증 경로를 따른다. 사후 재검증은 cycle 완료를 담당하고 파일별 성공 시점을 다시 쓰지 않는다. 미게시·검증 실패·원격 source 변경은 성공 기준값을 전진시키지 않으며 같은 source의 검증된 잠정 증거와 publication intent를 복구한다
+유지보수 Planner의 barrier dependency·사후 구조 참조 개정은 계속 활성 mode와 무소유 READY snapshot에 한정한다. 새 단계별 평가의 일반 계획은 별도 필요한 계획 주기에서 수행한다. 일반 계획 결합 여부와 종전 결과를 이미 보존한 cycle은 해당 mode·게시 검증을 유지해 복구한다.
+
+planning batch의 원격 게시·catalog 반영과 현재 원격 입력 일치를 확인한 뒤 정적·모듈 평가 근거와 해당 성공 기준을 SQLite transaction에서 확정한다. 미게시·검증 실패·원격 source 변경은 성공 기준을 전진시키지 않으며 잠정 근거·publication intent를 보존해 복구한다. 새 리팩터링 계획은 기존 DAG·장벽·사후 재검증 경로를 따르고, 사후 재검증은 cycle 완료를 담당한다.
+
+종전 파일별 평가 경로는 이미 보존된 결과·게시의 복구를 위해 유지한다. 실제 검토 파일의 ledger·의미 코드맵·파일별 성공 기준은 그 경로에서만 원본·관계·게시 검증을 거쳐 확정하며, 정적 코드맵이나 새 모듈 평가를 파일별 의미 검토 완료로 기록하지 않는다.
 
 ## AI Agent 실행
 
