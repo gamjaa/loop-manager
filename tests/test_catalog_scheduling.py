@@ -418,6 +418,10 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                 def agent(worktree, _state, _config, role_name, _prompt, **_kwargs):
                     roles.append(role_name)
                     if role_name == "planner":
+                        if not publishes_plan and roles.count("planner") == 2:
+                            self.assertEqual(_kwargs.get("session_id"), "planner-session")
+                            self.assertEqual((worktree / "src/app.py").read_text(encoding="utf-8"),
+                                             "VALUE = 2\n")
                         if publishes_plan and roles.count("planner") == 1:
                             write_execplan(
                                 worktree,
@@ -490,7 +494,7 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                 self.assertEqual(
                     roles,
                     ["planner", "planner", "worker"] if publishes_plan
-                    else ["planner"],
+                    else ["planner", "planner"],
                 )
                 self.assertEqual(
                     project["phase"], "WORKING" if publishes_plan else None

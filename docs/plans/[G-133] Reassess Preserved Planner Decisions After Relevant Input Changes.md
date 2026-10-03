@@ -86,6 +86,9 @@ Worker targeted 실행(모두 최종 통과):
 - Review 2차 후속: 완료된 결과의 재판단도 문서 변경과 실제 전체 입력 지문 변경을 함께 사용한다. 일반 planning 및 일반 planning을 포함한 유지보수는 코드만 바뀌어도 이전 결과를 감사에 보존하고 base 채택과 pending·오류 사건 연결을 함께 저장한다. 실패 gate 지문 불일치 자체를 입력 변경으로 간주하지 않으며, 동일 내용·내용 보존 archive와 유지보수 전용의 무관 코드 변경은 재호출하지 않는다.
 - `python3 -m unittest tests.test_planning_recovery.PlanningRecoveryTest.test_completed_results_recheck_code_input_before_recording_success tests.test_planning_recovery.PlanningRecoveryTest.test_combined_maintenance_code_change_resets_exhausted_error_once tests.test_planning_recovery.PlanningRecoveryTest.test_unrelated_maintenance_requirement_does_not_reset_exhausted_error tests.test_planning_recovery.PlanningRecoveryTest.test_saved_unsafe_rechecks_changed_target_and_releases_only_linked_error` — 4 cases 모두 첫 실행 통과. 새 case는 3개 mode × 3개 변경 유형에서 완료 결과 재판단, base 채택 후 재시작, 동일 세션 1회 호출, 검증 후 연결 오류 해제와 publication 전 성공 기준 보존을 확인한다. 전체 verify·integration은 실행하지 않았다.
 
+- Manager verify 후속(2개 실패): 기존 no-change 테스트가 전체 입력 지문 또는 실제 `src/app.py`를 바꾸면서도 재호출하지 않는 이전 기대를 사용했다. fake-port case를 `test_remote_input_identity_controls_completed_result_reuse_after_pause`로 개정해 동일 입력의 결과 재사용과 변경 입력의 같은 세션 재호출을 함께 검증한다. 실제 Git case는 코드 변경 후 두 번째 Planner 호출과 최신 코드·동일 세션을 확인하도록 수정했다. 제품 코드는 변경하지 않았다.
+- `python3 -m unittest tests.test_planning_selection.PlanningSelectionTest.test_remote_input_identity_controls_completed_result_reuse_after_pause` — 1 case(2 subtests) 첫 실행 통과. 수정한 `test_catalog_scheduling.CatalogSchedulingTest.test_remote_input_change_after_planner_defers_published_ready_worker`는 실제 Git integration이므로 Worker에서 실행하지 않았으며 Manager 전체 verify의 재검증이 필요하다. 기존 verify 수집 범위는 유지했다.
+
 ## Decision Log
 
 - 2026-10-03: 사용자는 “관련 원격 입력 변경 후 보존된 Planner 판단 재평가와 오류 해제” 범위의 새 ExecPlan 작성을 요청했다. 기존 PRODUCT와 MERGED된 G-118의 누락된 복구 동작을 수정하므로 새 Requirement나 제품 정책을 추가하지 않는다. `sources`는 현재 PRODUCT로 두고 G-118은 복구 계약·감사 참조로 사용한다. 이미 구현된 경계의 보완이므로 새 미완료 선행 계획은 없으며 `depends_on`은 비워 둔다.

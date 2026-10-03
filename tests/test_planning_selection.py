@@ -466,32 +466,41 @@ class PlanningSelectionTest(PlanningCase):
             "new-specification",
         )
 
-    def test_unrelated_remote_change_reuses_completed_no_change_result_after_pause(self):
-        ports = FakePorts(planning_snapshot(planning_fingerprint="old-input"))
-        ports.validation.result = None
-        ports.git.fingerprints["new-base"] = "new-input"
-        original_planner = ports.agent.run_planner
+    def test_remote_input_identity_controls_completed_result_reuse_after_pause(self):
+        for input_changed in (False, True):
+            with self.subTest(input_changed=input_changed):
+                ports = FakePorts(planning_snapshot(planning_fingerprint="old-input"))
+                ports.validation.result = None
+                ports.git.fingerprints["new-base"] = (
+                    "new-input" if input_changed else ports.git.fingerprint
+                )
+                original_planner = ports.agent.run_planner
 
-        def advance_after_planner(*args):
-            result = original_planner(*args)
-            ports.git.remote = "new-base"
-            return result
+                def advance_after_planner(*args):
+                    result = original_planner(*args)
+                    ports.git.remote = "new-base"
+                    return result
 
-        ports.agent.run_planner = advance_after_planner
-        coordinator = PlanningLifecycleCoordinator(ports)
-        first = coordinator.run(self.context)
-        preserved = ports.state.snapshot
+                ports.agent.run_planner = advance_after_planner
+                coordinator = PlanningLifecycleCoordinator(ports)
+                first = coordinator.run(self.context)
+                preserved = ports.state.snapshot
 
-        self.assertEqual(first.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED)
-        self.assertEqual(preserved.phase, "PLANNING")
-        self.assertTrue(preserved.planning_result_completed)
-        self.assertEqual(ports.state.clear_calls, [])
-        second = coordinator.run(replace(self.context, base_sha="new-base"))
+                self.assertEqual(first.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED)
+                self.assertEqual(preserved.phase, "PLANNING")
+                self.assertTrue(preserved.planning_result_completed)
+                self.assertEqual(ports.state.clear_calls, [])
+                self.assertEqual(preserved.planning_fingerprint, "old-input")
+                self.assertEqual(ports.agent.run_count, 1)
+                second = coordinator.run(replace(self.context, base_sha="new-base"))
 
-        self.assertEqual(second.kind, PlanningOutcomeKind.NO_CHANGE)
-        self.assertEqual(ports.agent.run_count, 1)
-        self.assertEqual(ports.state.snapshot.processed_sha, "new-base")
-        self.assertEqual(ports.state.snapshot.planning_fingerprint, "new-input")
+                self.assertEqual(second.kind, PlanningOutcomeKind.NO_CHANGE)
+                self.assertEqual(ports.agent.run_count, 2 if input_changed else 1)
+                if input_changed:
+                    self.assertEqual(ports.agent.resumed_session, "session-1")
+                self.assertEqual(ports.state.snapshot.processed_sha, "new-base")
+                self.assertEqual(ports.state.snapshot.planning_fingerprint,
+                                 ports.git.fingerprints["new-base"])
 
     def test_failed_input_correction_resumes_after_base_adoption_before_agent(self):
         ports = FakePorts(planning_snapshot(
