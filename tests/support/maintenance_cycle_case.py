@@ -183,6 +183,15 @@ class MaintenanceCycleCase(unittest.TestCase):
         repo_path: Path,
         agent,
     ) -> loop_manager.ProjectRunResult:
+        # These scenarios resume cycles created before tiered module reviews.
+        # Keep their original planning path while exercising the real lifecycle.
+        real_ports = loop_manager._PlanningLifecyclePorts
+
+        def legacy_ports(*args, **kwargs):
+            ports = real_ports(*args, **kwargs)
+            del ports.tiered
+            return ports
+
         with mock.patch(
             "loop_manager.validate_repository", return_value=repo_path
         ), mock.patch(
@@ -191,7 +200,9 @@ class MaintenanceCycleCase(unittest.TestCase):
             "loop_manager.ensure_safe_base_worktree"
         ), mock.patch(
             "loop_manager.run_codex", side_effect=agent
-        ), dummy_worker_context():
+        ), mock.patch.object(
+            loop_manager, "_PlanningLifecyclePorts", side_effect=legacy_ports
+        ), dummy_worker_context(roles=("worker", "planner", "maintenance_planner")):
             return loop_manager.run_project_result(
                 connection,
                 state_dir,
@@ -293,4 +304,3 @@ class MaintenanceCycleCase(unittest.TestCase):
             ),
             cycle_base_sha=base_sha,
         )
-

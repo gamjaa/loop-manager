@@ -74,6 +74,7 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
         )
         run.planning_worktree = Path("/worktree")
         ports = mock.Mock()
+        del ports.tiered
         ports.git.run.return_value.stdout = source
         ports.git.changed_files.return_value = []
         ports.file_review.progress.return_value.selected = ()
@@ -132,6 +133,7 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
             runnable_ready=None, project_blocked=False,
         )
         ports = mock.Mock()
+        del ports.tiered
         ports.state.advance_maintenance_cycle.return_value = cycle
         ports.state.schedule.return_value = decision
         ports.state.maintenance_due.return_value = maintenance_state.ReviewDue(
@@ -391,25 +393,11 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
                 )
 
             try:
-                with mock.patch(
-                    "loop_manager.validate_repository", return_value=repo_path
-                ), mock.patch(
-                    "loop_manager.validate_provider_runtime"
-                ), mock.patch(
-                    "loop_manager.ensure_safe_base_worktree"
-                ), mock.patch(
-                    "loop_manager.run_codex", side_effect=agent
-                ), mock.patch.object(
+                with mock.patch.object(
                     loop_manager.notifications, "enqueue_completion_if_ready"
                 ) as enqueue:
-                    result = loop_manager.run_project_result(
-                        connection,
-                        state_dir,
-                        repo,
-                        Path("unused.ini"),
-                        "main",
-                        False,
-                        registered_only=True,
+                    result = self._run_registered(
+                        connection, state_dir, repo_path, agent
                     )
                 cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
                 project = connection.execute(
@@ -1111,4 +1099,3 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
             )
             self.assertEqual(result.kind, loop_manager.ProjectRunKind.COMPLETED)
             enqueue.assert_called_once_with(connection, "/one", mock.ANY)
-

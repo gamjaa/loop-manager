@@ -74,6 +74,7 @@ Worker targeted 실행(모두 최종 통과):
 - `python3 -m unittest tests.test_runtime_state.RuntimeStateRepositoryTest.test_planning_correction_releases_only_bound_incident_atomically` 및 `python3 -m unittest tests.test_runtime_state.RuntimeStateRepositoryTest.test_planning_error_release_rolls_back_with_incident_on_interruption` — 각 1 case 통과.
 - `python3 -m unittest tests.test_manager_schema.ManagerSchemaTest.test_existing_database_adds_planning_fingerprint_without_losing_state` — 1 case 통과.
 - `python3 -m unittest tests.test_planning_recovery.PlanningRecoveryTest.test_completed_no_change_turn_resumes_validation_without_agent_replay`, `python3 -m unittest tests.test_planning_recovery.PlanningConflictCorrectionUnitTests.test_workspace_wiring_preserves_error_and_commits_base_before_cleanup`, `python3 -m unittest tests.test_planning_publication.PlanningPublicationTest.test_no_change_cleanup_failure_keeps_saved_planning_result` — 기존 완료 결과 재사용·workspace 복구·publication guard의 각 1 case 통과.
+- Manager verify 피드백에서 legacy 유지보수 fixture가 새 tiered 포트와 실제 Codex 모델 조회를 사용해 기존 경로 검증을 중단했다. fixture의 해당 경로만 명시적으로 유지하고 `unused.ini` Planner 역할에 가짜 프로필을 제공했다. 보고된 개별 case 4건과 fixture unit case 1건을 직접 재실행해 통과했다.
 
 ## Decision Log
 
