@@ -76,6 +76,77 @@ class PlanningDiagnosticsTest(unittest.TestCase):
             self.assertIn("base-2", second.read_text())
 
 class PlanningRecoveryTest(PlanningCase):
+    def test_completed_results_recheck_code_input_before_recording_success(self):
+        for mode in ("general", "combined", "maintenance"):
+            for change in ("code", "same-content", "archive"):
+                with self.subTest(mode=mode, change=change):
+                    maintenance = mode != "general"
+                    cycle = maintenance_cycle(
+                        phase=(maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION
+                               if maintenance else maintenance_state.MaintenancePhase.IDLE),
+                        cycle_base_sha="base", revalidation_plan_ids=("G-066",),
+                        include_general_planning=mode == "combined",
+                    )
+                    original = ('MAINTENANCE_RESULT: {"outcome":"unsafe","reason":"old evidence"}'
+                                if maintenance else "no further plans")
+                    error = "old unsafe evidence" if maintenance else None
+                    ports = FakePorts(planning_snapshot(
+                        phase="PLANNING", active_sha="base", worktree="/planning",
+                        planning_attempt_fingerprint="original-input", planning_workspace_owned=1,
+                        planner_session_id="saved-session", planning_result=original,
+                        planning_result_completed=True, planning_error=error,
+                        planning_error_origin="unsafe" if maintenance else None,
+                        last_error=error,
+                        planning_fingerprint="previous-success",
+                    ), cycle)
+                    ports.git.remote = "new-base"
+                    ports.git.fingerprints = {
+                        "base": "old-input",
+                        "new-base": "old-input" if change == "same-content" else "new-input",
+                    }
+                    ports.git.relevant_document_changes = mock.Mock(return_value=())
+                    ports.git.requirement_archive_only = mock.Mock(return_value=change == "archive")
+                    ports.validation.prepare_maintenance_context = mock.Mock(
+                        return_value=SimpleNamespace(active_sha="new-base"),
+                    )
+                    ports.validation.maintenance_change_context = mock.Mock(return_value="")
+                    ports.validation.maintenance_prompt = mock.Mock(return_value="recheck inputs")
+                    ports.validation.validate_maintenance_result = mock.Mock(return_value=None)
+                    ports.agent.result = replace(ports.agent.result, message=(
+                        'MAINTENANCE_RESULT: {"outcome":"revalidated"}' if maintenance
+                        else "fresh no further plans"
+                    ))
+                    coordinator = PlanningLifecycleCoordinator(ports)
+                    run = coordinator._new_run(self.context)
+                    self.assertIsNone(coordinator._workspace._prepare_workspace(run))
+                    recheck = mode != "maintenance" and change == "code"
+                    saved = ports.state.snapshot
+                    self.assertEqual(bool(saved.planning_result_pending_validation), recheck)
+                    self.assertEqual(bool(saved.planning_result_completed), not recheck)
+                    self.assertEqual(saved.planning_fingerprint, "previous-success")
+                    self.assertEqual(saved.planning_error, error)
+                    self.assertEqual(saved.planning_result, None if recheck else original)
+                    if recheck:
+                        self.assertEqual(ports.state.diagnostics[-1].planning_result, original)
+                        self.assertIn("전체 계획 입력", saved.planning_validation_error)
+                        self.assertEqual(saved.planning_correction_error, error)
+                    # Restart after adopting the base must not lose or duplicate pending work.
+                    diagnostic_count = len(ports.state.diagnostics)
+                    run = coordinator._new_run(self.context)
+                    self.assertIsNone(coordinator._workspace._prepare_workspace(run))
+                    self.assertEqual(len(ports.state.diagnostics), diagnostic_count)
+                    ports.git.relevant_document_changes.assert_called_once()
+                    self.assertIsNone(coordinator._assessment._run_planner_turn(run))
+                    self.assertEqual(ports.agent.run_count, int(recheck))
+                    if recheck:
+                        self.assertEqual(ports.agent.resumed_session, "saved-session")
+                        self.assertIsNone(coordinator._assessment._run_planner_turn(run))
+                        self.assertEqual(ports.agent.run_count, 1)
+                        self.assertIsNone(coordinator._assessment._validate_planner_result(run))
+                        self.assertIsNone(ports.state.snapshot.planning_error)
+                        # Validation alone must not advance the publication success baseline.
+                        self.assertEqual(ports.state.snapshot.planning_fingerprint, "previous-success")
+
     def test_general_ready_result_rechecks_new_active_requirement(self):
         requirement = "docs/requirements/[R-053] New Goal.md"
         ports = FakePorts(planning_snapshot(

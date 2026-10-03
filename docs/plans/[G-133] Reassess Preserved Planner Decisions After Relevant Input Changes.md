@@ -82,6 +82,10 @@ Worker targeted 실행(모두 최종 통과):
 - `python3 -m unittest tests.test_planning_recovery.PlanningRecoveryTest.test_combined_maintenance_code_change_resets_exhausted_error_once tests.test_planning_recovery.PlanningRecoveryTest.test_unrelated_maintenance_requirement_does_not_reset_exhausted_error` — 최초 실행은 새 fake-port fixture의 maintenance context 응답 누락으로 실패했다. 응답을 명시한 뒤 동일 명령 재실행에서 2 cases 모두 통과했다.
 - `tests/test_maintenance_cycle.py::MaintenanceCycleTest.test_remote_target_edit_recovers_unsafe_in_same_session_and_completes_cycle`를 추가했다. 기존 격리 remote·실제 Git/SQLite/catalog/validation fixture에서 무수정 unsafe 보존, 동일 입력 무호출, 별도 clone의 대상 commit/push, 같은 session/worktree의 revalidated, idle·오류 해제·catalog 반영·원래 오류 감사와 불필요한 push 부재를 확인한다. Worker의 integration 실행 금지에 따라 실행하지 않았으며 기존 verify의 unittest discover로 Manager가 실행한다. 새 루트 파일이나 검증 스크립트 변경은 없다.
 
+
+- Review 2차 후속: 완료된 결과의 재판단도 문서 변경과 실제 전체 입력 지문 변경을 함께 사용한다. 일반 planning 및 일반 planning을 포함한 유지보수는 코드만 바뀌어도 이전 결과를 감사에 보존하고 base 채택과 pending·오류 사건 연결을 함께 저장한다. 실패 gate 지문 불일치 자체를 입력 변경으로 간주하지 않으며, 동일 내용·내용 보존 archive와 유지보수 전용의 무관 코드 변경은 재호출하지 않는다.
+- `python3 -m unittest tests.test_planning_recovery.PlanningRecoveryTest.test_completed_results_recheck_code_input_before_recording_success tests.test_planning_recovery.PlanningRecoveryTest.test_combined_maintenance_code_change_resets_exhausted_error_once tests.test_planning_recovery.PlanningRecoveryTest.test_unrelated_maintenance_requirement_does_not_reset_exhausted_error tests.test_planning_recovery.PlanningRecoveryTest.test_saved_unsafe_rechecks_changed_target_and_releases_only_linked_error` — 4 cases 모두 첫 실행 통과. 새 case는 3개 mode × 3개 변경 유형에서 완료 결과 재판단, base 채택 후 재시작, 동일 세션 1회 호출, 검증 후 연결 오류 해제와 publication 전 성공 기준 보존을 확인한다. 전체 verify·integration은 실행하지 않았다.
+
 ## Decision Log
 
 - 2026-10-03: 사용자는 “관련 원격 입력 변경 후 보존된 Planner 판단 재평가와 오류 해제” 범위의 새 ExecPlan 작성을 요청했다. 기존 PRODUCT와 MERGED된 G-118의 누락된 복구 동작을 수정하므로 새 Requirement나 제품 정책을 추가하지 않는다. `sources`는 현재 PRODUCT로 두고 G-118은 복구 계약·감사 참조로 사용한다. 이미 구현된 경계의 보완이므로 새 미완료 선행 계획은 없으며 `depends_on`은 비워 둔다.

@@ -152,28 +152,23 @@ class PlanningWorkspaceService(PlanningService):
                     context.repo, worktree, latest,
                 )
             if latest != row.active_sha:
-                unchanged_failed_input = False
+                includes_general = (
+                    not run.maintenance_planning
+                    or run.maintenance_cycle.include_general_planning
+                )
                 mode_failure = str(row.planning_error_fingerprint or "").startswith("maintenance-cycle:")
-                if row.planning_error:
+                general_input_changed = False
+                if includes_general:
                     previous_input = self._ports.git.input_fingerprint(
                         context.repo_path, str(row.active_sha or ""),
                     )
                     latest_input = self._ports.git.input_fingerprint(context.repo_path, latest)
-                    previous_failed_fingerprint = (
-                        maintenance_planning_fingerprint(run.maintenance_cycle, previous_input)
-                        if run.maintenance_planning else previous_input
-                    )
-                    unchanged_failed_input = bool(
-                        row.planning_error_fingerprint == previous_failed_fingerprint
-                        and (previous_input == latest_input or self._ports.git.requirement_archive_only(
+                    general_input_changed = (
+                        previous_input != latest_input
+                        and not self._ports.git.requirement_archive_only(
                             context.repo_path, str(row.active_sha or ""), latest,
-                        ))
-                    )
-                    if mode_failure:
-                        unchanged_failed_input = row.planning_error_fingerprint == (
-                            f"maintenance-cycle:{run.maintenance_cycle.phase.value}:"
-                            f"{run.maintenance_cycle.revision}"
                         )
+                    )
                 catalog_rows = self._ports.state.execplan_rows(context.repo)
                 changed_documents = self._ports.git.relevant_document_changes(
                     worktree, str(row.active_sha or ""), latest,
@@ -181,17 +176,10 @@ class PlanningWorkspaceService(PlanningService):
                         worktree, str(row.active_sha or ""),
                     )) | set(self._ports.git.changed_files(worktree))),
                     catalog_rows, self._assessment_targets(run, catalog_rows),
-                    include_active_requirements=(
-                        not run.maintenance_planning
-                        or run.maintenance_cycle.include_general_planning
-                    ),
+                    include_active_requirements=includes_general,
                 )
-                relevant_failed_input_change = bool(
-                    changed_documents or
-                    ((not run.maintenance_planning
-                      or run.maintenance_cycle.include_general_planning)
-                     and not unchanged_failed_input)
-                )
+                relevant_input_changed = bool(changed_documents or general_input_changed)
+                recheck_completed = row.planning_result_completed and relevant_input_changed
                 linked_error = self._linked_failed_result(run)
                 if row.agent_snapshot:
                     role = "maintenance_planner" if run.maintenance_planning else "planner"
@@ -253,21 +241,23 @@ class PlanningWorkspaceService(PlanningService):
                         if mode_failure else maintenance_planning_fingerprint(run.maintenance_cycle, adopted_input)
                         if run.maintenance_planning else adopted_input
                     )
-                    if (relevant_failed_input_change
+                    if (relevant_input_changed
                             and not row.planning_result_completed
                             and not mode_failure):
                         # Keep the authorized correction durable across the
                         # crash window before the next Planner invocation.
                         values["planning_result_pending_validation"] = 1
-                    if (relevant_failed_input_change and not mode_failure
+                    if (relevant_input_changed and not mode_failure
                             and linked_error):
                         values["planning_retry_count"] = 0
-                if changed_documents and row.planning_result_completed:
+                if recheck_completed:
                     if not row.planning_error:
                         self._ports.state.preserve_diagnostics(context.repo, row)
                     recheck_message = (
                         "현재 planning 결과의 관련 문서가 변경됐습니다: "
                         + ", ".join(changed_documents)
+                        if changed_documents else
+                        "현재 planning 결과의 전체 계획 입력이 변경됐습니다. 최신 코드와 테스트를 다시 평가하세요."
                     )
                     values.update(
                         planning_result_pending_validation=1,
@@ -284,9 +274,9 @@ class PlanningWorkspaceService(PlanningService):
                             + "\n관련 원격 입력 변경: " + ", ".join(additional)
                         ).lstrip()
                 correction_pending = bool(
-                    (changed_documents and row.planning_result_completed)
+                    recheck_completed
                     or (not row.planning_result_completed
-                        and relevant_failed_input_change and not mode_failure)
+                        and relevant_input_changed and not mode_failure)
                     or (row.planning_correction_error == row.planning_error
                         and row.planning_result_pending_validation)
                 )
@@ -308,7 +298,7 @@ class PlanningWorkspaceService(PlanningService):
                 self._ports.events.info(
                     f"planning base 반영: {row.active_sha} -> {result.target}; "
                     f"후보={self._ports.git.run(worktree, 'rev-parse', 'HEAD').stdout.strip()}; "
-                    f"재개={'validation' if row.planning_result_completed and not changed_documents else 'planner'}; "
+                    f"재개={'validation' if row.planning_result_completed and not recheck_completed else 'planner'}; "
                     f"남은 원인={row.planning_error or row.planning_validation_error or '없음'}"
                 )
                 row = self._ports.state.planning(context.repo)
@@ -318,7 +308,7 @@ class PlanningWorkspaceService(PlanningService):
                         detail="원격 base가 다시 전진해 다음 안전 경계에서 반영합니다.",
                         error=True,
                     )
-                if (row.planning_error and (not relevant_failed_input_change or mode_failure)
+                if (row.planning_error and (not relevant_input_changed or mode_failure)
                         and not row.planning_result_completed
                         and not row.planning_result_pending_validation):
                     self._ports.events.error(
