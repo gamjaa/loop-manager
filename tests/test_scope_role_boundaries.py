@@ -96,3 +96,13 @@ class ScopeRoleBoundariesTest(AgentScopeFixture, unittest.TestCase):
             after = loop_manager.capture_git_snapshot(repo)
 
             loop_manager.validate_agent_scope("planner", repo, before, after)
+
+    def test_planner_check_rejects_plan_and_code_changes(self):
+        for path in ("docs/plans/[G-001] Scope Safety.md", "src/app.py"):
+            with self.subTest(path=path), tempfile.TemporaryDirectory() as directory:
+                repo, _ = self._repository_with_plan(directory)
+                before = loop_manager.capture_git_snapshot(repo)
+                (repo / path).write_text("changed\n", encoding="utf-8")
+                after = loop_manager.capture_git_snapshot(repo)
+                with self.assertRaisesRegex(loop_manager.AgentScopeError, "planner_check Git 범위 위반"):
+                    loop_manager.validate_agent_scope("planner_check", repo, before, after)

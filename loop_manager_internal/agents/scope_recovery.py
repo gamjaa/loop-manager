@@ -187,7 +187,7 @@ def validate_persisted_agent_scope(
             reason_code=BlockReasonCode.SHARED_GIT_CONFIG_MUTATION,
         )
     role_name = str(project["agent_role"] or "")
-    if role_name not in {"planner", "maintenance_planner", "worker", "reviewer"}:
+    if role_name not in {"planner", "planner_check", "maintenance_planner", "worker", "reviewer"}:
         raise AgentScopeError(
             f"저장된 Agent 역할이 유효하지 않습니다: {role_name or '없음'}"
         )

@@ -42,9 +42,9 @@ priority: high
 
 ## Progress
 
-- [ ] 독립 점검 profile과 기존 설정 fallback 지원
-- [ ] 좁은 prompt·세 결과 parser와 읽기 전용 호출 연결
-- [ ] 역할·session·scope·usage 및 정책 거부 회귀 검증
+- [x] 독립 점검 profile과 기존 설정 fallback 지원
+- [x] 좁은 prompt·세 결과 parser와 읽기 전용 호출 연결
+- [x] 역할·session·scope·usage 및 정책 거부 회귀 검증
 - [ ] Manager 전체 verify, 독립 Review 및 사용자 Merge
 
 ## Decision Log

@@ -56,6 +56,36 @@ docs/FUTURE_IDEAS.md는 planning batch와 함께 생성·수정할 수 있지만
 """.strip()
 
 
+def planner_check_prompt(
+    change_context: str,
+    compact_catalog: str,
+    mutable_snapshot: MutableReadySnapshot,
+    error: str | None = None,
+) -> str:
+    """Give a read-only check only its changed-code and scheduled-work inputs."""
+    failure = f"\n이전 결과 검증 오류: {error[-3000:]}\n" if error else ""
+    return f"""
+당신은 Loop Manager의 읽기 전용 점검 Planner다.
+마지막 확인 기준 이후의 관련 코드·테스트·설정 변경이 아래 예정 작업에 영향을 주는지만 판단하라.
+전체 미충족 작업이나 저장소 전체 개선점을 탐색하지 마라. 계획 본문·근거·코드·테스트는 영향 판단에 필요한 부분만 읽어라.
+
+변경 문맥:
+{change_context}
+
+비종료 compact catalog:
+{compact_catalog}
+
+수정 가능한 미착수 READY identity snapshot (수정 권한이 아님):
+{mutable_snapshot.prompt_payload()}
+
+결과는 정확히 한 줄의 PLANNER_CHECK_RESULT: JSON 객체로 반환하라.
+필드는 outcome(no_change|needs_revision|uncertain), evidence(확인한 근거), reason(판단 또는 일반 Planner 인계 사유), plan_ids(영향받은 snapshot ID 배열)다.
+needs_revision은 하나 이상의 대상 ID를 적고 no_change는 빈 배열을 적어라. 불확실하면 uncertain을 사용하고 실패 또는 no_change로 바꾸지 마라.
+읽기 전용 검색과 diff는 허용한다. 구현·테스트·verify 실행, commit·push·PR 생성, ExecPlan·FUTURE_IDEAS·코드·문서·Git metadata를 포함한 모든 파일 변경은 금지한다.
+{failure}
+""".strip()
+
+
 def maintenance_planner_prompt(
     context: MaintenancePlanningContext,
     compact_catalog: str,
