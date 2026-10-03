@@ -17,6 +17,18 @@ class PlanningSelectionService(PlanningService):
         """Check the failed input before scheduling or stale-workspace cleanup."""
 
         row = run.row
+        if (row.phase == "PLANNING" and row.planning_workspace_owned == 1
+                and row.planning_result_pending_validation
+                and not row.planning_result_completed):
+            # Resume an already-authorized correction after an interruption;
+            # the failed-input gate still stops completed/exhausted attempts.
+            return None
+        if (row.phase == "PLANNING" and row.planning_workspace_owned == 1
+                and row.active_sha != run.base_sha):
+            # A remote advance is handled in the owned workspace. Keep any
+            # independent planning error until the preserved result is checked.
+            run.error_input_changed = True
+            return None
         if not row.planning_error or run.publication_recovery_verified:
             return None
         cycle = run.maintenance_cycle
@@ -397,6 +409,7 @@ class PlanningSelectionService(PlanningService):
             and cycle.publication_stage is None
             and row.phase == "PLANNING"
             and not row.planning_error
+            and row.planning_workspace_owned != 1
         ):
             stale_worktree = Path(str(row.worktree or ""))
             stored_fingerprint = str(row.planning_attempt_fingerprint or "")
@@ -454,6 +467,8 @@ class PlanningSelectionService(PlanningService):
             and row.planning_error_fingerprint == run.current_fingerprint
             and not recoverable_publication
             and not run.error_input_changed
+            and not (row.planning_result_pending_validation
+                     and not row.planning_result_completed)
         ):
             self._ports.events.error(
                 f"계획 오류가 해결되지 않았습니다: {row.planning_error}\n"
@@ -461,7 +476,8 @@ class PlanningSelectionService(PlanningService):
             )
             return self._operational_error()
 
-        if row.planning_error and not recoverable_publication:
+        if (row.planning_error and not recoverable_publication
+                and row.planning_workspace_owned != 1):
             outcome = self._discard_stale_planning(run, row)
             if outcome is not None:
                 return outcome
@@ -481,7 +497,8 @@ class PlanningSelectionService(PlanningService):
             started_fingerprint = (
                 row.planning_attempt_fingerprint or run.current_fingerprint
             )
-            if started_fingerprint != run.current_fingerprint:
+            if (started_fingerprint != run.current_fingerprint
+                    and row.planning_workspace_owned != 1):
                 outcome = self._discard_stale_planning(
                     run,
                     row,
@@ -665,7 +682,7 @@ class PlanningSelectionService(PlanningService):
         return None
 
     def _fetch_remote_head(self, context: PlanningContext) -> str:
-        self._ports.git.run(context.repo_path, "fetch", "origin")
+        self._ports.git.fetch_base(context.repo_path, context.base_branch)
         return self._ports.git.run(
             context.repo_path,
             "rev-parse",

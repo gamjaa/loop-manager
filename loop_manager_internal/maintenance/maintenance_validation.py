@@ -92,6 +92,7 @@ class PrepareMaintenancePlanningContextEffects:
     _maintenance_context: Callable[..., object]
     _maintenance_mode_and_rows: Callable[..., object]
     _ready_plan_snapshot: Callable[..., object]
+    _ready_plan_snapshot_at_revision: Callable[..., object]
 
 
 def prepare_maintenance_planning_context(
@@ -106,9 +107,21 @@ def prepare_maintenance_planning_context(
     mode, rows = effects._maintenance_mode_and_rows(
         connection, repo, cycle, active_sha
     )
-    snapshots = tuple(
-        effects._ready_plan_snapshot(worktree, active_sha, row) for row in rows
+    planning = connection.execute(
+        "SELECT planner_session_id, agent_snapshot, "
+        "planning_result_pending_validation, planning_result_completed, "
+        "planning_validation_error, planning_retry_count "
+        "FROM projects WHERE repo = ?", (repo,),
+    ).fetchone()
+    resumed = planning is not None and any(planning)
+    # A resumed Planner may already have edited an eligible READY file. Its
+    # authority is still the original Git blob and SQLite row; the changed
+    # checkout is validated separately as the Planner result.
+    snapshot_at = (
+        effects._ready_plan_snapshot_at_revision if resumed
+        else effects._ready_plan_snapshot
     )
+    snapshots = tuple(snapshot_at(worktree, active_sha, row) for row in rows)
     return effects._maintenance_context(repo, active_sha, cycle, mode, snapshots)
 
 

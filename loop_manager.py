@@ -1465,6 +1465,7 @@ prepare_maintenance_planning_context = _bind_effects(
         _maintenance_context=lambda *args, **kwargs: _maintenance_context(*args, **kwargs),
         _maintenance_mode_and_rows=lambda *args, **kwargs: _maintenance_mode_and_rows(*args, **kwargs),
         _ready_plan_snapshot=lambda *args, **kwargs: _ready_plan_snapshot(*args, **kwargs),
+        _ready_plan_snapshot_at_revision=lambda *args, **kwargs: _ready_plan_snapshot_at_revision(*args, **kwargs),
     ),
 )
 
@@ -3542,6 +3543,7 @@ _PlanningStatePorts = _bind_effects(
         record_maintenance_publication_intent=lambda *args, **kwargs: record_maintenance_publication_intent(*args, **kwargs),
         recover_general_planning_batch=lambda *args, **kwargs: recover_general_planning_batch(*args, **kwargs),
         recover_maintenance_planning_batch=lambda *args, **kwargs: recover_maintenance_planning_batch(*args, **kwargs),
+        reconcile_execplan_catalog=lambda *args, **kwargs: reconcile_execplan_catalog(*args, **kwargs),
         register_execplans=lambda *args, **kwargs: register_execplans(*args, **kwargs),
         update_project=lambda *args, **kwargs: update_project(*args, **kwargs),
     ),
@@ -3553,6 +3555,7 @@ _PlanningGitPorts = _bind_effects(
         _git_operation_entries=lambda *args, **kwargs: _git_operation_entries(*args, **kwargs),
         _ignored_worktree_paths=lambda *args, **kwargs: _ignored_worktree_paths(*args, **kwargs),
         _is_requirement_archive_only_change=lambda *args, **kwargs: _is_requirement_archive_only_change(*args, **kwargs),
+        _recorded_base_fetch=lambda *args, **kwargs: _recorded_base_fetch(*args, **kwargs),
         _planning_input_fingerprint=lambda *args, **kwargs: _planning_input_fingerprint(*args, **kwargs),
         _specification_input_fingerprint=lambda *args, **kwargs: _specification_input_fingerprint(*args, **kwargs),
         changed_files=lambda *args, **kwargs: changed_files(*args, **kwargs),

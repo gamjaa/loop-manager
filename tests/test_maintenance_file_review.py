@@ -45,6 +45,20 @@ class FileReviewPromptTest(unittest.TestCase):
 
 
 class ProvisionalFileReviewTest(unittest.TestCase):
+    def test_unchanged_source_review_survives_remote_revision_advance(self):
+        first = self.publish({"src/a.py": "def calculate(): return 1\n"})
+        source = first.sources[0]
+        self.finish(source)
+        advanced = self.publish({"docs/OTHER.md": "Unrelated change.\n"})
+
+        resumed = self.state(advanced, cycle=2)
+
+        self.assertEqual(len(resumed.completed), 1)
+        self.assertEqual(resumed.completed[0]["path"], "src/a.py")
+        self.assertEqual(resumed.completed[0]["source_revision"], advanced.revision)
+        changed = self.publish({"src/a.py": "def calculate(): return 2\n"})
+        self.assertEqual(self.state(changed, cycle=3).completed, ())
+
     def test_structured_reference_candidates_are_normalized_and_source_checked(self):
         content = b"def calculate(): return helper()\n"
         source = maintenance_file_inventory.TrackedSource(
@@ -424,13 +438,15 @@ class ProvisionalFileReviewTest(unittest.TestCase):
         with self.assertRaisesRegex(review.FileReviewError, "identity"):
             review.parse_review(review.RESULT_PREFIX + json.dumps(payload), source, content)
 
-    def test_source_drift_and_cycle_revision_invalidate_only_stale_units(self):
+    def test_source_drift_invalidates_units_but_cycle_revision_reuses_unchanged_source(self):
         inventory = self.publish({"src/a.py": "def calculate(): return 1\n"})
         source = inventory.sources[0]
         self.finish(source)
         self.assertEqual(len(self.state(inventory).completed), 1)
-        self.assertIsNotNone(self.state(inventory, cycle=2).next_unit)
-        self.finish(source)
+        resumed = self.state(inventory, cycle=2)
+        self.assertEqual(len(resumed.completed), 1)
+        self.assertEqual(resumed.next_unit.source.reason,
+                         maintenance_file_ledger.ROOT_REVIEW_REASON)
         changed = self.publish({"src/a.py": "def calculate(): return 2\n"})
         with self.assertRaises(maintenance_file_inventory.SourceInventoryError):
             self.state(inventory)

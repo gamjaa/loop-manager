@@ -57,6 +57,7 @@ class PlanningAssessmentService(PlanningService):
                 or row.last_error
             )
             and not row.planning_result_pending_validation
+            and not row.planning_result_completed
             and not (
                 row.planning_validation_error
                 and row.planning_retry_count >= MAX_PLANNER_VALIDATION_RETRIES
@@ -262,17 +263,18 @@ class PlanningAssessmentService(PlanningService):
         row = run.row
         assert run.maintenance_context is not None
         self._ports.git.validate_worktree_ownership(
-            context.repo, str(run.current_fingerprint or ""), worktree,
+            context.repo, str(row.planning_attempt_fingerprint or run.current_fingerprint or ""), worktree,
         )
-        self._ports.git.run(context.repo_path, "fetch", "origin")
+        self._ports.git.fetch_base(context.repo_path, context.base_branch)
         try:
             self._ports.validation.validate_publication_base(
                 context.repo, context.repo_path, context.base_branch,
                 run.maintenance_context,
             )
         except MaintenancePlanningRestart:
-            self._ports.git.run(context.repo_path, "worktree", "remove", "--force", str(worktree))
-            return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART, error=True)
+            return PlanningOutcome(
+                PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED, error=True,
+            )
         evidence = self._ports.state.file_assessment_evidence(
             context.repo, context.repo_path, context.base_branch,
             run.maintenance_cycle.revision, str(row.active_sha),
@@ -707,7 +709,7 @@ class PlanningAssessmentService(PlanningService):
             try:
                 self._ports.git.validate_worktree_ownership(
                     context.repo,
-                    str(run.current_fingerprint or ""),
+                    str(row.planning_attempt_fingerprint or run.current_fingerprint or ""),
                     worktree,
                 )
                 with self._ports.state.transaction():
@@ -764,4 +766,9 @@ class PlanningAssessmentService(PlanningService):
         )
         run.maintenance_decision = decision
         run.validated_result = validated_result
+        if row.planning_error and row.planning_error == row.planning_validation_error:
+            self._ports.state.update(
+                context.repo, planning_error=None, planning_error_fingerprint=None,
+            )
+            run.row = self._ports.state.planning(context.repo)
         return None

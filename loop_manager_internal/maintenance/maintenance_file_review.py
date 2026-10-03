@@ -17,7 +17,7 @@ import sqlite3
 from typing import Sequence
 
 from loop_manager_internal.maintenance.maintenance_file_inventory import (
-    RootPlacement, SourceInventory, TrackedSource, _git, cached_source_inventory,
+    RootPlacement, SourceInventory, SourceInventoryError, TrackedSource, _git, cached_source_inventory,
     root_placement_inventory,
     verify_remote_revision,
 )
@@ -424,6 +424,38 @@ class ProvisionalReviewRepository:
             valid: dict[str, tuple[str | None, str | None, dict | None]] = {}
             for path, cycle, revision, digest, mode, session_id, error, raw in rows:
                 source = expected.get(str(path))
+                if source is not None and (cycle != cycle_revision or revision != source.revision):
+                    try:
+                        same_source = (
+                            digest == source.content_hash and mode == source.mode
+                            and _git(repository, "merge-base", str(revision), source.revision).strip()
+                            == str(revision).encode("ascii")
+                        )
+                        if same_source and raw is not None:
+                            preserved = json.loads(raw)
+                            if (not isinstance(preserved, dict)
+                                    or preserved.get("source_revision") != revision):
+                                same_source = False
+                            else:
+                                preserved["source_revision"] = source.revision
+                                raw = json.dumps(preserved, ensure_ascii=False, sort_keys=True)
+                                parsed = parse_review(
+                                    RESULT_PREFIX + raw, source,
+                                    source_bytes(repository, base, source),
+                                )
+                                if source.reason == ROOT_REVIEW_REASON:
+                                    validate_root_reviews(repository, inventory, parsed["root_reviews"])
+                        if same_source:
+                            self.connection.execute(
+                                "UPDATE provisional_file_reviews SET cycle_revision = ?, "
+                                "source_revision = ?, result_json = ? "
+                                "WHERE repo = ? AND path = ?",
+                                (cycle_revision, source.revision, raw, repo, path),
+                            )
+                            cycle, revision = cycle_revision, source.revision
+                    except (SourceInventoryError, FileReviewError, FileReviewLedgerError,
+                            ValueError, UnicodeError):
+                        pass
                 if (source is None or cycle != cycle_revision or revision != source.revision
                     or digest != source.content_hash or mode != source.mode):
                     self.connection.execute(

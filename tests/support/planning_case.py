@@ -119,6 +119,9 @@ class FakeStatePort:
             project_blocked=False,
         )
 
+    def reconcile_catalog(self, *_args):
+        pass
+
     def planning(self, _repo):
         return self.snapshot
 
@@ -248,6 +251,12 @@ class FakeStatePort:
             self.clear_active("/repo")
         return self.general_recovery_result
 
+    def supersede_unpublished_general_intent(self, _repo):
+        self.general_intent = None
+
+    def supersede_unpublished_maintenance_intent(self, _repo, cycle, _base):
+        return cycle
+
     def record_general_intent(self, *_args):
         self.general_intent_record_count += 1
         if self.general_intent_record_count == self.general_intent_error_call:
@@ -288,6 +297,16 @@ class FakeGitPort:
         self.workspace_error = None
         self.remove_error = None
         self.advance_remote_on_push = False
+
+    def fetch_base(self, repo_path, base):
+        self.calls.append((str(repo_path), ("recorded_base_fetch", base), True))
+        return self.remote
+
+    def save_planning_correction(self, *_args):
+        pass
+
+    def planning_correction(self, *_args):
+        return None
 
     def run(self, repo, *arguments, check=True):
         self.calls.append((str(repo), arguments, check))
@@ -330,6 +349,20 @@ class FakeGitPort:
 
     def changed_files(self, _worktree, _since=None):
         return list(self.dirty_files)
+
+    def rebase_planning_workspace(self, _repo, _fingerprint, _worktree, _old, target):
+        self.validate_worktree_ownership(_repo, _fingerprint, _worktree)
+        self.head = target
+        return SimpleNamespace(target=target, changed=True, conflict=False)
+
+    def complete_planning_rebase(self, *_args):
+        self.calls.append((None, ("complete_planning_rebase", *_args), True))
+
+    def accept_resolved_stash_conflict(self, *_args):
+        pass
+
+    def relevant_document_changes(self, *_args):
+        return ()
 
     def validate_managed_worktree(self, _worktree):
         pass

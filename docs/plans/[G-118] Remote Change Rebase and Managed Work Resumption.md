@@ -46,11 +46,40 @@ priority: critical
 
 ## Progress
 
-- [ ] 기존 planning·execution 원격 반영 및 재개 경계 조사
-- [ ] 원본 snapshot과 Planner 결과 분리 및 보존 rebase 연결
-- [ ] 단계별 관련 문서 확인·검증 무효화·게시 복구 구현
-- [ ] targeted unit test 및 Manager 전체 검증 경로 유지
+- [x] 기존 planning·execution 원격 반영 및 재개 경계 조사
+- [x] 원본 snapshot과 Planner 결과 분리 및 보존 rebase 연결
+- [x] 단계별 관련 문서 확인·검증 무효화·게시 복구 구현
+- [x] targeted unit test 및 Manager 전체 검증 경로 유지
 - [ ] Manager 전체 verify, 독립 Review 및 사용자 Merge
+
+### 구현 경계 대응
+
+| 계획의 조사 대상 | 현재 책임 소유 경계와 재사용 근거 |
+| --- | --- |
+| `planning_runtime.py`의 선택·원격 반영 | coordinator의 기존 순서를 유지하고 `selection_service.py`, `workspace_service.py`에서 소유 workspace를 보존한다. detached planning의 index·untracked 복원 journal은 `planning_rebase.py`에 둔다. |
+| READY 원본·최신 권한 | 기존 `planner_validation.py`의 revision blob snapshot과 SQLite CAS 검사를 재사용하고 `maintenance_validation.py`에서 신규 checkout 검사와 재개 원본 복원을 구분한다. |
+| Planner 호출·검증·게시 | `assessment_service.py`에서 완료 호출을 재사용하고 `publication_service.py`에서 미게시 후보를 보존한다. 기존 publication intent 복구가 이미 게시된 결과를 먼저 확정한다. |
+| 관련 문서·유지보수 근거 | `planning_document_relevance.py`가 source·dependency의 blob을 비교한다. `maintenance_file_review.py`는 원본 identity가 같은 잠정 파일 검토만 새 revision에 재검증해 재사용하며 관계 검증은 기존 source-bound 경계를 따른다. |
+| Worker·Reviewer 재확인 | `execution_revision.py`, `execution_revision_handler.py`에서 source 내용과 경로 이동을 Worker 재확인 입력에서 제외한다. 기존 후보 HEAD 토큰과 managed rebase acceptance가 targeted test·verify·Review를 무효화한다. |
+
+루트 항목 추가·이동은 없으며 새 모듈과 테스트는 기존 패키지·테스트 경로에 둔다. Linux verify의 명시적 compile 대상에 새 모듈을 추가하고 전체 검증 실행은 Manager에 맡긴다. R-051은 사용자 지정 경로로 원문을 보존해 archive 이동한다.
+
+첫 Worker 후보의 관련 unit test 101개가 통과했다. 잠정 검토 재사용과 충돌하는 기존 cycle 변경 테스트를 갱신한 뒤 같은 명령을 재실행했다. `test_planning_error_recovery.py`의 프로젝트 복구 시나리오는 폐기·새 세션 기대값을 보존·재개로 갱신했으며 통합 테스트 실행은 Manager 전체 verify에 남긴다. Worker는 전체 verify·Review·게시를 실행하지 않았다.
+
+Manager verify 피드백 6건에 따라 Windows verify에도 새 모듈을 등록하고 source-only 변경·planning 폐기·추가 호출의 기존 테스트 기대값을 재개 규칙에 맞췄다. 원격 base와 cycle revision만 전진하면 오류 입력을 현재 기준에 결합하되 Agent를 재호출하지 않는다. 관련 입력 교정은 기존 세션과 감사 자료를 유지하며, base 채택 뒤 호출 전 중단돼도 pending correction에서 이어간다. 유지보수 mode 오류는 실제 조건이 해소되기 전까지 보존한다.
+
+현재 후보의 planning 선택·execution 실패 정책·verify 목록 unit test는 실패 원인 수정 후 동일 명령으로 38개 통과했다. snapshot·staged/unstaged 중단 복구·잠정 검토 재사용·source-only gate의 개별 회귀 6개도 새로 실행해 통과했다. `test_catalog_scheduling.py`의 통합 시나리오는 no-change 결과와 세션을 보존하는 일시 중단·다음 실행 기대값으로 갱신했으며 Manager 전체 verify에서 실행한다.
+
+
+재개 Worker는 현재 base 대비 최종 diff와 미해결 Review 3건을 다시 확인했다. journal 디렉터리 동기화는 기존 Windows 대응 helper를 재사용한다. staged index 복원이 변경 없이 실패하면 보존 stash에서 three-way 충돌을 만들고 같은 Planner 세션으로 해결하며, 이전 빈 conflict journal과 복원 직후 중단도 복구한다. 충돌 경로 조회는 Git이 지원하는 NUL 구분 diff로 교체했다. 미게시 intent를 대체한 뒤 최신 원격 catalog를 SQLite에 반영하고 READY snapshot을 생성하며, 같은 base의 유효한 prepared intent는 기존 catalog를 유지한다. catalog 경쟁은 planning 오류 지문을 오염시키지 않고 일시 중단한다.
+
+현재 후보에서 rebase·workspace 복구 unit test 36개, planning 선택·게시·execution 실패 정책·verify 목록·maintenance snapshot 52개, 후보·source-only gate·유지보수 근거 재사용 6개가 통과했다. 첫 명령에서 확인한 충돌 경로 Git 옵션 결함과 테스트 fixture 오류를 수정한 뒤 동일 명령을 재실행했다. Windows 분기는 플랫폼 모의 검증이며 실제 Windows 실행과 전체 verify·Review는 Manager에 남긴다.
+
+Manager의 source 동기화 verify 피드백 2건은 planning 준비에서 이미 검증된 catalog를 직접 재조회한 것이 원인이었다. 프로젝트의 기존 `ProjectCatalogRefresh`를 일반 planning과 미게시 intent 복구에 전달해 같은 revision·선언 및 검증된 archive 이동의 증거를 재사용한다. 원격 revision 또는 SQLite 선언이 달라지면 기존 CAS 경계에서 다시 검증하며, 독립 coordinator의 직접 reconciliation 경로도 유지한다. 현재 후보의 `ProjectCatalogRefreshTest`, `test_planning_recovery`, `test_planning_rebase` unit test 75개가 모두 통과했다. 전달된 source 동기화 통합 테스트의 기대값은 변경하지 않았고 실행은 Manager에 남겼다.
+
+추가 Review 2건에 따라 workspace의 원격 관측은 기존 `_recorded_base_fetch`를 사용한다. 저장된 Planner scope와 바깥 fetch 이후의 원격 경쟁을 실제 fetch journal·scope 검증으로 확인했다. 범위 검사와 충돌 내용 검사를 통과한 교정은 stage 전에 기존 rebase journal에 HEAD·경로·작업물 지문으로 저장한다. stash 충돌과 commit rebase 충돌 모두 stage 직후 중단에서 Agent 호출 없이 남은 Git 단계를 재개하며, 교정 후 내용 변경은 보존·거부한다. 완료한 commit 교정 근거는 stash 복원 전에 제거해 다른 충돌에 재사용하지 않는다. 현재 후보의 `test_planning_rebase`, `test_planning_recovery`, `test_planning_selection` targeted unit test 58개가 모두 통과했다. 전체 verify와 Review는 Manager에 남긴다.
+
+후속 Review에서 발견한 게시 복구의 누락 fetch를 수정하고, 평가·선택·게시의 나머지 planning fetch도 기존 기록 경계로 통일했다. prepared intent·저장 scope·원격 재전진을 함께 검증했다. stash 교정 확정은 soft reset 전에 `accepting` 단계와 이전 commit 기준 index·작업물 지문을 저장해 reset 직후 중단도 복구한다. 복구 중 내용이 바뀌면 보존·거부하며 Planner 호출은 반복하지 않는다. 현재 후보의 planning rebase·recovery·publication·selection·assessment unit test 84개가 모두 통과했다. 전체 verify·Review는 Manager에 남긴다.
 
 ## Decision Log
 
@@ -60,3 +89,5 @@ priority: critical
 - 새로운 운영상 장애의 안전한 복구를 우선해 priority를 critical로 둔다. 다른 계획과 충돌하는 코드·테스트 추출은 본 작업에 필요한 책임 경계로 제한한다.
 
 - 2026-10-02: 사용자가 G-118의 ARCHITECTURE diff를 확인하고 반영을 승인했다. 이 정확한 문서 변경은 별도 사용자 결정 commit으로 게시하며 Worker는 해당 문서를 다시 수정하지 않는다. 기존 작업물·session과 범위 검사, Manager 전체 verify·Review 및 사용자 Merge 조건을 유지한다.
+- 2026-10-02: 재개 세션에서 현재 HEAD 대비 후보 전체를 재검토했다. prepared commit 위의 미커밋 변경은 rebased commit에 먼저 복원하고 soft reset으로 검증 후보를 구성해 staged·unstaged 구분을 보존한다. stash apply·reset 직후 중단, 완료된 no-change 호출 재사용과 내용 보존 ExecPlan 이동을 targeted unit test로 검증한다. 보존 stash는 SQLite의 새 base 확정과 작업물 identity 확인 뒤에만 제거한다.
+- 2026-10-02: verify 피드백 대응에서 실패의 내용 identity와 maintenance cycle/base identity를 분리했다. 동일 입력의 오류는 새 base 채택 후에도 재시도 gate에 남기고 원래 fingerprint는 진단으로 보존한다. 관련 입력 변경으로 허용된 교정은 pending validation에 기록해 호출 전 중단을 복구하며, 원격 반영만으로 mode 오류나 독립 차단을 해제하지 않는다.

@@ -50,6 +50,71 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
         return self.connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
                                        (self.repo, plan)).fetchone()
 
+    def prepare_planning_workspace(self):
+        from tests.support.planning_case import FakePorts, planning_snapshot
+        from loop_manager_internal.planning.planning_runtime import (
+            PlanningContext, PlanningLifecycleCoordinator,
+        )
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha=self.sha, worktree="/planning",
+            planning_workspace_owned=1, planner_session_id="saved-session",
+            planning_result_completed=True,
+        ))
+        ports.git.remote = self.sha
+        ports.state.reconcile_catalog = mock.Mock(
+            side_effect=AssertionError("must reuse the project catalog boundary"),
+        )
+        context = PlanningContext(
+            repo=self.repo, repo_path=Path(self.repo), state_dir=Path("/state"),
+            base_branch="main", base_sha=self.sha, provider="codex",
+            config_path=Path("/config.ini"), registered_only=False,
+            refactoring_review_interval=5, refresh_catalog=self.boundary.refresh,
+        )
+        coordinator = PlanningLifecycleCoordinator(ports)
+        outcome = coordinator._workspace._prepare_workspace(coordinator._new_run(context))
+        ports.state.reconcile_catalog.assert_not_called()
+        return outcome, ports
+
+    def test_planning_reuses_validated_project_catalog(self):
+        self.boundary.refresh()
+        outcome, ports = self.prepare_planning_workspace()
+        self.assertIsNone(outcome)
+        self.assertEqual(self.loads, [self.sha])
+        self.assertEqual(ports.state.snapshot.planner_session_id, "saved-session")
+
+    def test_planning_reuses_proven_archive_catalog_without_reread(self):
+        self.assertEqual(self.archive(), archive_state.ArchiveWriteResult.APPLIED)
+        outcome, _ports = self.prepare_planning_workspace()
+        self.assertIsNone(outcome)
+        self.assertEqual(self.loads, [self.base_sha])
+        self.assertEqual(self.row("G-002")["current_revision_sha"], self.sha)
+        self.assertEqual(self.row("G-002")["path"], "docs/plans/archive/[G-002] Dependency.md")
+
+    def test_planning_refreshes_catalog_after_base_adoption_before_snapshot(self):
+        old = self.boundary.refresh()
+        self.sha = "c" * 40
+        outcome, _ports = self.prepare_planning_workspace()
+        self.assertIsNone(outcome)
+        self.assertEqual(self.loads, [old, self.sha])
+        self.assertEqual(self.row()["current_revision_sha"], self.sha)
+
+    def test_planning_revalidates_changed_sqlite_declarations(self):
+        self.boundary.refresh()
+        self.connection.execute("UPDATE exec_plans SET priority='low' WHERE plan_id='G-001'")
+        self.connection.commit()
+        outcome, _ports = self.prepare_planning_workspace()
+        self.assertIsNone(outcome)
+        self.assertEqual(self.loads, [self.sha, self.sha])
+        self.assertEqual(self.row()["priority"], "critical")
+
+    def test_planning_catalog_failure_preserves_result_without_error_gate(self):
+        from loop_manager_internal.planning.planning_runtime import PlanningOutcomeKind
+        self.documents.pop("docs/plans/[G-002] Dependency.md")
+        outcome, ports = self.prepare_planning_workspace()
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.TRANSIENT_PAUSE)
+        self.assertTrue(ports.state.snapshot.planning_result_completed)
+        self.assertIsNone(ports.state.snapshot.planning_error)
+
     def test_all_declarations_refresh_preserving_execution_audit_and_planning_error(self):
         self.connection.execute("UPDATE projects SET planning_error='retained'")
         original = self.row()
@@ -195,6 +260,7 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
             self.assertEqual(self.row()['sources'], '["docs/requirements/change.md"]')
             return False
         def planning(*args):
+            self.assertTrue(callable(args[-1].refresh_catalog))
             self.events.append('planning')
             self.assertEqual(self.row()['depends_on'], '["G-002"]')
             return SimpleNamespace(kind=manager.PlanningOutcomeKind.WAITING)

@@ -52,12 +52,14 @@
 - 원격 ExecPlan catalog가 누락 파일, 잘못된 형식·source·ID 또는 dependency graph 때문에 유효하지 않으면 다른 ExecPlan 상태를 바꾸지 않고 실제 원인 파일을 포함한 프로젝트 범위 진단으로 격리한다
 - ExecPlan 생성 전 Planner 실패는 프로젝트의 `planning_error`로 SQLite에 저장하며 ExecPlan BLOCKED 상태를 만들지 않는다
 - 일반·유지보수 planning의 미해결 오류와 입력 지문은 다른 ExecPlan의 차단 해제·PR 상태 변경·project 실행 상태 정리와 독립적으로 보존한다. worktree 경로 부재나 관련 입력이 같은 원격 base 전진만으로 해제하지 않으며, 같은 입력의 반복 실행·재시작에서는 Planner를 다시 호출하지 않는다
-- 관련 planning 입력이 바뀌거나 검증된 게시 복구가 가능할 때만 저장된 소유권·workspace identity를 확인하고 정리 또는 게시 결과가 확정된 뒤 오류를 해제한다. 소유 증거 없는 기존 planning 경로와 정리 실패는 Git 등록·HEAD·index·파일 및 진단·session·작업물을 보존한다
+- 관련 planning 입력이 바뀌면 저장된 소유권·workspace identity를 확인하고 관리 worktree에 최신 원격 base를 반영한다. 오류는 입력 전진만으로 해제하지 않고 보존된 결과의 교정·재검증 또는 게시 복구로 원인이 실제 해소된 뒤에만 해제한다. 소유 증거 없는 경로와 복구 실패는 Git 등록·HEAD·index·파일 및 진단·session·작업물을 보존한다
 - 미충족 PRODUCT 또는 Requirement에 근거해서만 ExecPlan을 작성한다
 - 실행 중인 변경 작업은 새 계획 입력이 선점하지 않는다. 안전한 선택 경계에서 마지막 성공 Planner 이후 명세 또는 전체 계획 입력이 바뀌었으면 대기 중인 READY보다 일반 Planner를 정확히 한 번 먼저 실행한다. 입력이 같으면 실행 가능한 READY를 우선순위대로 시작하며, 없으면 대기 또는 완료 조건을 평가한다. due 유지보수 평가는 기존 순서를 유지한다
 - 프로젝트별 첫 파일별 평가 전에는 등록 또는 기존 정책 적용의 안전한 시점에 확인한 MERGED ExecPlan 수를 시작 기준으로 보존한다. 기존 활성 유지보수 cycle은 먼저 복구·완료하고 과거 성공 이력은 감사 자료로 보존한다. 첫 평가와 이후 정기 평가는 각각 시작 기준 또는 마지막 성공한 파일별 평가 이후 새로 MERGED된 ExecPlan 수가 공통 `refactoring_review_interval`에 도달할 때 시작한다. 이 설정은 양의 정수이며 기본값은 20이다. 성공한 파일별 평가 이력이 있는 완료 후보는 정기 주기 전에도 이후 Merge 수가 10개 이상이고 새 검토 대상이 있을 때 한 번 안정화 평가를 한다
 - 실행 가능한 READY ExecPlan은 명세 또는 전체 계획 입력 변경에 따른 우선 계획이 없을 때 안전한 무인 자동화를 막는 작업부터 결정적 순서로 선택한다. dependency 미충족 READY, `PLAN_BLOCKED`·안정된 `PR_OPEN`만 남은 경우에도 명세 또는 전체 계획 입력 trigger를 평가하되, 활성 유지보수 주기의 prerequisite 집합과 리팩터링 DAG 순서는 유지한다
 - Planner는 최신 `origin/<base-branch>` 기준의 detached planning worktree에서 새 ExecPlan을 작성하고, SQLite와 Git snapshot으로 증명된 미착수 READY만 같은 ID로 수정·rename·삭제할 수 있다. 그 밖의 기존 계획과 파일은 변경하지 않으며 범위 밖 아이디어만 `docs/FUTURE_IDEAS.md`에 기록한다
+- 진행 중인 일반·유지보수 planning은 원격 base 전진 시 staged·unstaged·untracked 변경과 세션을 관리 worktree에 보존해 반영하고 최신 catalog·SQLite 권한에서 재검증한다. 시작 revision의 READY 원본과 Planner가 작성한 결과를 구분하며, 관련 근거·의존 문서의 실제 내용이 바뀐 경우에만 해당 계획을 다시 확인한다. 무관한 문서 변경과 내용 보존 이동은 재확인을 만들지 않는다
+- Worker·Reviewer의 문서 재확인은 현재 ExecPlan 내용 변경에 한정한다. 후보 HEAD가 바뀌면 문서 재확인 여부와 관계없이 Worker의 필요한 targeted test, Manager 전체 verify와 읽기 전용 Review를 최종 후보에서 다시 통과한다
 - 유지보수 Planner만 활성 cycle mode와 무소유 READY snapshot에 한정해 barrier dependency 또는 사후 구조 참조를 개정할 수 있다. READY가 없고 일반 계획 입력도 변경된 due 경계에서만 일반 계획과 유지보수 평가를 한 호출로 결합한다
 - 파일별 유지보수 평가는 최신 원격 한 revision의 추적 코드·테스트·실행·검증 스크립트를 분류하고, 기존 성공 기록에 없거나 경로·내용·실행 모드가 달라진 파일만 원본과 관계를 검토한다. 변경 없는 파일은 다시 검토하지 않고, 분류 불확실성·검토 누락·미확인 관계는 성공으로 처리하지 않는다. 선정 파일이 없으면 평가 Agent나 형식적 계획 없이 목록을 검증하고 완료할 수 있다. 검토 중 작성한 코드맵은 성공한 파일에만 원본 identity와 함께 보존하며 변경된 코드맵은 현재 관계 근거로 사용하지 않는다
 - 유지보수 planning batch는 원격 fast-forward와 catalog 적용이 확인된 뒤 실제 검토한 파일의 ledger·코드맵과 마지막 성공 파일별 평가의 MERGED 수를 한 SQLite transaction으로 확정한다. 새 리팩터링 계획은 동작·공개 계약·저장 형식을 보존하며 기존 DAG·장벽·사후 재검증 경로를 따른다. 사후 재검증은 cycle 완료를 담당하고 파일별 성공 시점을 다시 쓰지 않는다. 미게시·검증 실패·원격 source 변경은 성공 기준값을 전진시키지 않으며 같은 source의 검증된 잠정 증거와 publication intent를 복구한다
@@ -153,7 +155,7 @@
 11. 검증 실패 내용을 같은 Planner 세션에 전달하고 최대 3회까지 수정을 요청한다
 12. 3회 후에도 유효하지 않으면 프로젝트의 `planning_error`에 원인과 계획 입력 지문을 저장하고 처리를 중단한다
 13. 유효한 생성·개정·rename·삭제와 `docs/FUTURE_IDEAS.md` 변경을 planning worktree에서 하나의 planning commit으로 만든다
-14. 계획 commit이 아직 원격에 없는데 `origin/<base-branch>`가 계획 기준 이후 바뀌었으면 planning worktree를 정리하고 최신 기준으로 다시 계획한다
+14. 계획 commit이 아직 원격에 없는데 `origin/<base-branch>`가 전진했으면 관리 worktree의 변경·세션을 보존해 반영하고 새 catalog·대상 권한 및 관련 문서 변경을 재검증한다. 충돌과 원격 재작성·소유권 불명확은 작업을 보존한 채 기존 복구 경계로 보낸다
 15. 기준과 mutable READY snapshot이 그대로면 복구 가능한 publication intent를 저장한 뒤 계획 commit을 `origin/<base-branch>`에 fast-forward push한다
 16. push된 commit을 확인한 뒤에만 생성 row 등록, 개정 row 갱신, 삭제 row 제거와 취소 감사, 두 성공 지문 및 planning 상태 정리를 하나의 SQLite transaction으로 적용한다. FUTURE_IDEAS 변경만으로는 ExecPlan 실행 상태를 만들지 않는다
 17. 모든 `depends_on`이 MERGED인 READY ExecPlan 중 제품 우선순위가 가장 높은 계획 하나를 결정적으로 선택한다
@@ -177,13 +179,13 @@ Planner 결과 검증 실패:
 2. 최대 3회까지 수정과 재검증을 수행한다
 3. 계속 실패하면 계획 입력 지문과 원인을 `planning_error`에 저장하고 planning worktree를 보존한다
 4. 같은 계획 입력 지문에서는 Planner를 다시 실행하지 않는다
-5. 계획 입력 지문이 바뀌면 이전 planning worktree의 검증 기록을 보존하고 해당 worktree를 정리한 뒤 `planning_error`를 지우고 새로운 planning worktree에서 다시 시작한다
+5. 원격 입력이 전진하면 이전 planning worktree·검증 기록·세션을 보존해 반영한다. 오류 원인이 실제로 해소됐는지 재검증하기 전에는 `planning_error`를 지우지 않는다
 
 ExecPlan 게시 실패:
-1. 계획 commit을 push하기 전에 `origin/<base-branch>`가 바뀌면 기존 계획 commit을 rebase하지 않고 폐기한 뒤 최신 기준으로 다시 계획한다
+1. 계획 commit을 push하기 전에 `origin/<base-branch>`가 전진하면 미게시 후보를 보존해 관리 worktree에서 rebase하고 최신 catalog·SQLite 권한과 결과를 재검증한다
 2. fast-forward push가 거부되면 계획 commit과 오류를 보존하고 다음 실행에서 다시 시도한다
 3. push 성공을 원격에서 확인하기 전에는 ExecPlan을 READY로 등록하거나 Worker를 시작하지 않는다
-4. 일반·유지보수 batch의 prepared intent와 planning worktree는 push·SQLite 적용 실패 뒤에도 보존한다. 원격에 batch가 있으면 원자 적용을 재개하고, 없으면 최신 base와 snapshot에서 다시 계획한다
+4. 일반·유지보수 batch의 prepared intent와 planning worktree는 push·SQLite 적용 실패 뒤에도 보존한다. 원격에 batch가 있으면 원자 적용을 재개하고, 없으면 보존 후보를 최신 base로 옮겨 재검증한다
 
 전체 검증 또는 Review 실패:
 1. 프로그램이 전체 검증 실패 내용 또는 Reviewer의 blocking issue를 같은 Worker 세션에 전달하고 Reviewer도 저장된 세션을 재사용한다

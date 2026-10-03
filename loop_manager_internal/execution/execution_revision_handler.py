@@ -439,16 +439,10 @@ class RevisionHandler:
 
         row = self.ports._row()
         active_sha = str(row['active_sha'] or '')
-        legacy_input_paths = {
-            str(catalog_plan['path']),
-            *(str(item) for item in json.loads(str(catalog_plan['sources']))),
-        }
-        legacy_definition_changed = any(
-            path in legacy_input_paths
-            or path.startswith('docs/plans/')
-            or (bool(archive_sources) and path.startswith('docs/requirements/'))
-            for path in changed_paths
-        )
+        # Only the active ExecPlan calls for another specification check.
+        # Source and unrelated document changes still participate in Git,
+        # archive eligibility, and candidate validation below.
+        legacy_definition_changed = str(catalog_plan['path']) in changed_paths
         legacy_baseline = bool(
             previous is None
             and active_sha
@@ -761,4 +755,3 @@ class RevisionHandler:
             verify_result=verify_result,
             final_block_reason=BlockReasonCode.PLAN_INPUT_INVALID,
         )
-

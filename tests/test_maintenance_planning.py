@@ -30,6 +30,62 @@ from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot
 
 from tests.support.maintenance_planning_case import git
 
+
+class MaintenanceSnapshotResumeTest(unittest.TestCase):
+    def test_resumed_planner_reads_original_ready_blob(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(
+            "CREATE TABLE projects (repo TEXT, planner_session_id TEXT, "
+            "agent_snapshot TEXT, planning_result_pending_validation INTEGER, "
+            "planning_result_completed INTEGER, planning_validation_error TEXT, "
+            "planning_retry_count INTEGER)"
+        )
+        connection.execute(
+            "INSERT INTO projects VALUES ('/repo', 'saved-session', NULL, 1, 0, NULL, 0)"
+        )
+        strict = mock.Mock(side_effect=AssertionError("checkout is Planner output"))
+        original = mock.Mock(return_value="original-ready-blob")
+        effects = maintenance_validation.PrepareMaintenancePlanningContextEffects(
+            _maintenance_context=lambda _repo, _sha, _cycle, _mode, plans: plans,
+            _maintenance_mode_and_rows=lambda *_args: ("barrier", ("ready-row",)),
+            _ready_plan_snapshot=strict,
+            _ready_plan_snapshot_at_revision=original,
+        )
+        with mock.patch.object(maintenance_state.MaintenanceRepository, "get", return_value=object()):
+            result = maintenance_validation.prepare_maintenance_planning_context(
+                effects, connection, "/repo", Path("/planning"), "start-revision"
+            )
+        self.assertEqual(result, ("original-ready-blob",))
+        original.assert_called_once_with(Path("/planning"), "start-revision", "ready-row")
+        strict.assert_not_called()
+
+    def test_new_planner_checks_checkout_before_granting_ready_authority(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(
+            "CREATE TABLE projects (repo TEXT, planner_session_id TEXT, "
+            "agent_snapshot TEXT, planning_result_pending_validation INTEGER, "
+            "planning_result_completed INTEGER, planning_validation_error TEXT, "
+            "planning_retry_count INTEGER)"
+        )
+        connection.execute("INSERT INTO projects VALUES ('/repo', NULL, NULL, 0, 0, NULL, 0)")
+        strict = mock.Mock(return_value="strict-snapshot")
+        original = mock.Mock(side_effect=AssertionError("new checkout must be checked"))
+        effects = maintenance_validation.PrepareMaintenancePlanningContextEffects(
+            _maintenance_context=lambda _repo, _sha, _cycle, _mode, plans: plans,
+            _maintenance_mode_and_rows=lambda *_args: ("barrier", ("ready-row",)),
+            _ready_plan_snapshot=strict,
+            _ready_plan_snapshot_at_revision=original,
+        )
+        with mock.patch.object(maintenance_state.MaintenanceRepository, "get", return_value=object()):
+            result = maintenance_validation.prepare_maintenance_planning_context(
+                effects, connection, "/repo", Path("/planning"), "start-revision"
+            )
+        self.assertEqual(result, ("strict-snapshot",))
+        strict.assert_called_once()
+        original.assert_not_called()
+
 class MaintenancePublicationTransactionTest(unittest.TestCase):
     def test_stale_publication_restart_rolls_back_if_workspace_cleanup_fails(self):
         connection = sqlite3.connect(":memory:")

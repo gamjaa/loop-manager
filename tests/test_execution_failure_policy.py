@@ -13,6 +13,7 @@ from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 from loop_manager_internal.execution.execution_runtime import ExecutionPhase, ExecutionOutcome, ExecutionOutcomeKind
+from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
 from loop_manager_internal.execution.worker_session import SessionBinding, SessionTransition
 from tests.support.worker import decision as worker_decision
 from tests.support.execution import VALID_WORKER_RESULT
@@ -354,13 +355,16 @@ class ExecutionFailurePolicyTests(ExecutionRecoveryScenarios, ExecutionPhaseScen
         self.assertEqual(row['worker_session_id'], 'worker-session')
 
 
-    def test_working_source_change_clears_retry_artifacts_before_worker(self):
+    def test_working_source_change_preserves_retry_artifacts_without_execplan_change(self):
         self.handler.guard(self.context())
+        worker_token = DefinitionSnapshot.deserialize(
+            self.state.row()['definition_snapshot'],
+        ).worker_token
         self.state.update_project(
             'repo',
             worker_result='previous worker result',
             verify_result='failed verify result',
-            worker_input_token='stale-worker-token',
+            worker_input_token=worker_token,
         )
         self.effects.revision.source_fingerprint.return_value = 'revised-source'
 
@@ -368,9 +372,9 @@ class ExecutionFailurePolicyTests(ExecutionRecoveryScenarios, ExecutionPhaseScen
 
         self.assertNotIsInstance(guarded, ExecutionOutcome)
         row = self.state.row()
-        self.assertIsNone(row['worker_result'])
-        self.assertIsNone(row['verify_result'])
-        self.assertIsNone(row['worker_input_token'])
+        self.assertEqual(row['worker_result'], 'previous worker result')
+        self.assertEqual(row['verify_result'], 'failed verify result')
+        self.assertEqual(row['worker_input_token'], worker_token)
 
 
     def test_dependency_gate_reports_unmerged_direct_and_indirect_plans(self):

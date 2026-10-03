@@ -403,6 +403,7 @@ class ProjectService:
                 config_path=self.identity.config_path, registered_only=self.identity.registered_only,
                 refactoring_review_interval=self.identity.refactoring_review_interval,
                 self_repository=self.identity.registered_only and self.effects.is_loop_manager_repository(self.state.repo_path),
+                refresh_catalog=self._refresh_catalog,
             )
             self.state.recovered_planning_outcome = PlanningLifecycleCoordinator(self.effects._PlanningLifecyclePorts(
                 self.identity.connection, runtime_state.RuntimeStateRepository(self.identity.connection),
@@ -650,6 +651,7 @@ class ProjectService:
             registered_only=self.identity.registered_only,
             refactoring_review_interval=self.identity.refactoring_review_interval,
             self_repository=self.identity.registered_only and self.effects.is_loop_manager_repository(self.state.repo_path),
+            refresh_catalog=self._refresh_catalog,
         )
         self.effects._check_runtime_handoff()
         if self.state.recovered_planning_outcome is not None:
@@ -721,8 +723,8 @@ class ProjectService:
                 continue
             return self.effects._execution_outcome_step_result(execution_outcome)
 
-    def _refresh_catalog(self) -> str:
-        revision = self.state.catalog_refresh.refresh()
+    def _refresh_catalog(self, revision: str | None = None) -> str:
+        revision = self.state.catalog_refresh.refresh(revision)
         if self.state.history_revision != revision:
             self.effects.migrate_legacy_execplans(
                 self.identity.connection, reconcile_history=True, target_repo=self.state.repo, ensure_schema=False,

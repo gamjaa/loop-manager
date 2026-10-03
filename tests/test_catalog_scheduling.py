@@ -461,6 +461,21 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                         False,
                     )
 
+                    if not publishes_plan:
+                        preserved = connection.execute(
+                            "SELECT phase, worktree, planner_session_id, planning_result_completed "
+                            "FROM projects WHERE repo = ?", (str(repo),),
+                        ).fetchone()
+                        self.assertEqual(result, 0)
+                        self.assertEqual(roles, ["planner"])
+                        self.assertEqual(preserved["phase"], "PLANNING")
+                        self.assertEqual(preserved["planner_session_id"], "planner-session")
+                        self.assertTrue(preserved["planning_result_completed"])
+                        self.assertTrue(Path(preserved["worktree"]).is_dir())
+                        result = loop_manager.run_project(
+                            connection, state_dir, str(repo), Path("unused.ini"), "main", False,
+                        )
+
                 project = connection.execute(
                     "SELECT phase, planning_fingerprint FROM projects WHERE repo = ?",
                     (str(repo),),
@@ -474,7 +489,7 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                 self.assertEqual(
                     roles,
                     ["planner", "planner", "worker"] if publishes_plan
-                    else ["planner", "planner"],
+                    else ["planner"],
                 )
                 self.assertEqual(
                     project["phase"], "WORKING" if publishes_plan else None

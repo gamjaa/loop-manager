@@ -122,6 +122,7 @@ class PlanningContext:
     registered_only: bool
     refactoring_review_interval: int
     self_repository: bool = False
+    refresh_catalog: Callable[[str], str] | None = None
 
 
 @dataclass(frozen=True)
@@ -151,6 +152,10 @@ class PlanningScopeResult:
 
 class PlanningStatePort(Protocol):
     """Durable planning and maintenance repository boundary."""
+
+    def reconcile_catalog(
+        self, repo: str, repository: Path, base_branch: str, revision: str,
+    ) -> None: ...
 
     def planning(self, repo: str) -> runtime_state.PlanningSnapshot: ...
 
@@ -199,6 +204,13 @@ class PlanningStatePort(Protocol):
         self,
         repo: str,
         expected: maintenance_state.MaintenanceCycle,
+        base_sha: str,
+    ) -> maintenance_state.MaintenanceCycle: ...
+
+    def supersede_unpublished_general_intent(self, repo: str) -> None: ...
+
+    def supersede_unpublished_maintenance_intent(
+        self, repo: str, cycle: maintenance_state.MaintenanceCycle,
         base_sha: str,
     ) -> maintenance_state.MaintenanceCycle: ...
 
@@ -324,6 +336,17 @@ class PlanningStatePort(Protocol):
 class PlanningGitPort(Protocol):
     """Git and managed planning-worktree boundary."""
 
+    def fetch_base(self, repo_path: Path, base: str) -> str: ...
+
+    def save_planning_correction(
+        self, repo: str, worktree: Path, target: str,
+        paths: tuple[str, ...], was_rebase: bool,
+    ) -> None: ...
+
+    def planning_correction(
+        self, repo: str, worktree: Path, target: str,
+    ) -> tuple[tuple[str, ...], bool] | None: ...
+
     def run(
         self, repo: Path, *arguments: str, check: bool = True
     ) -> Any: ...
@@ -360,6 +383,24 @@ class PlanningGitPort(Protocol):
     def changed_files(
         self, worktree: Path, since: str | None = None
     ) -> list[str]: ...
+
+    def rebase_planning_workspace(
+        self, repo: str, fingerprint: str, worktree: Path,
+        old_base: str, target: str,
+    ) -> Any: ...
+
+    def complete_planning_rebase(
+        self, repo: str, worktree: Path, target: str,
+    ) -> None: ...
+
+    def accept_resolved_stash_conflict(
+        self, repo: str, worktree: Path, target: str,
+    ) -> None: ...
+
+    def relevant_document_changes(
+        self, worktree: Path, old: str, target: str,
+        edited_paths: list[str], catalog_rows: Sequence[Any],
+    ) -> tuple[str, ...]: ...
 
     def validate_managed_worktree(self, worktree: Path) -> None: ...
 

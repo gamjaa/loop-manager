@@ -20,7 +20,7 @@ from tests.support.worker import dummy_worker_sessions
 
 class PlanningErrorRecoveryTest(unittest.TestCase):
     @dummy_worker_sessions
-    def test_planning_error_blocks_same_input_and_changed_input_starts_fresh(self):
+    def test_planning_scope_error_preserves_unauthorized_result_after_input_advance(self):
         isolation = mock.patch.object(loop_manager, '_agent_git_resources', side_effect=isolated_scope_resources)
         isolation.start()
         self.addCleanup(isolation.stop)
@@ -104,25 +104,18 @@ class PlanningErrorRecoveryTest(unittest.TestCase):
             restarted = connection.execute(
                 "SELECT * FROM projects WHERE repo = ?", (str(repo),)
             ).fetchone()
-            diagnostic = loop_manager.planning_diagnostics_path(
-                state_dir, str(repo), old_fingerprint
-            )
-            self.assertEqual(planner.call_count, 5)
-            self.assertEqual(planner_sessions[-1], None)
-            self.assertFalse(old_worktree.exists())
-            self.assertNotEqual(Path(restarted["worktree"]), old_worktree)
-            self.assertNotEqual(
+            self.assertEqual(planner.call_count, 4)
+            self.assertEqual(planner_sessions[-1], "planner-session")
+            self.assertTrue(old_worktree.exists())
+            self.assertEqual(Path(restarted["worktree"]), old_worktree)
+            self.assertEqual(
                 restarted["planning_attempt_fingerprint"],
                 old_fingerprint,
             )
-            self.assertEqual(restarted["planning_retry_count"], 0)
-            self.assertIsNone(restarted["planning_error"])
-            self.assertIsNone(restarted["planning_error_fingerprint"])
-            self.assertTrue(diagnostic.is_file())
-            diagnostic_text = diagnostic.read_text(encoding="utf-8")
-            self.assertIn(blocked["planning_error"], diagnostic_text)
-            self.assertIn("unexpected.txt", diagnostic_text)
-            self.assertIn("+invalid 4", diagnostic_text)
+            self.assertEqual(restarted["planning_retry_count"], 3)
+            self.assertEqual(restarted["planning_error"], blocked["planning_error"])
+            self.assertEqual(restarted["planning_error_fingerprint"], old_fingerprint)
+            self.assertEqual((old_worktree / "unexpected.txt").read_text(), "invalid 4\n")
 
     @dummy_worker_sessions
     def test_planning_error_gate_precedes_dirty_base_worktree_check(self):
@@ -270,7 +263,7 @@ class PlanningErrorRecoveryTest(unittest.TestCase):
         connection.close()
 
     @dummy_worker_sessions
-    def test_changed_remote_input_restarts_failed_planning_from_latest_origin(self):
+    def test_changed_remote_input_rebases_failed_planning_in_preserved_workspace(self):
         seen_source_contents = []
 
         def fail_planner(worktree, *_args, **_kwargs):
@@ -321,8 +314,8 @@ class PlanningErrorRecoveryTest(unittest.TestCase):
             ).fetchone()
             self.assertEqual(seen_source_contents, ["VALUE = 1\n", "VALUE = 2\n"])
             self.assertNotEqual(second["active_sha"], first["active_sha"])
-            self.assertNotEqual(second["worktree"], first["worktree"])
-            self.assertFalse(Path(first["worktree"]).exists())
+            self.assertEqual(second["worktree"], first["worktree"])
+            self.assertTrue(Path(first["worktree"]).exists())
             self.assertEqual(second["active_sha"], git_command(repo, "rev-parse", "origin/main"))
             self.assertEqual(second["phase"], "PLANNING")
             self.assertIsNone(second["planning_fingerprint"])
