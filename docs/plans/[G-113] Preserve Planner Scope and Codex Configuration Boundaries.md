@@ -4,6 +4,7 @@ title: Preserve Planner Scope and Codex Configuration Boundaries
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-023] Self-Hosted Runtime Refresh Handoff.md
+  - docs/requirements/[R-050] Direct Codex Exec with Native Sandbox.md
 depends_on:
   - G-127
   - G-129
@@ -21,25 +22,26 @@ priority: critical
 - Planner가 실행 슬롯을 소유하는 동안 자동 active-plan hydration은 Planner 상태를 변경하지 않는다.
 - Planner가 없으면 기존 활성 계획의 투영과 재개가 유지된다. READY priority와 dependency 선택 규칙은 바꾸지 않는다.
 - Codex 사용자 설정은 선택된 CODEX_HOME에서 읽고 project config는 선택 worktree에서 repository root까지 읽는다. repository 밖 다른 사용자 설정은 project config로 읽지 않는다.
-- 실제 활성 설정의 확장·exec-policy 충돌과 격리 실패는 계속 거부한다.
-- 운영 복구는 DB 백업과 process lock 아래 현재 소유 workspace 및 사용자 reject 결정을 보존한다. G-058은 critical 계획 완료 전 사용자 요청에 따른 대기 상태로 보존한다.
+- 현재 호출에 실제 적용되는 확장·exec-policy·관리 설정의 충돌과 내장 sandbox 확인 실패는 계속 거부한다. 비활성화된 개인 plugin 등록 자체는 충돌로 판정하지 않으며 사용자 설정을 삭제하거나 수정하지 않는다.
+- Codex 호출은 현재 PRODUCT/R-050의 직접 `codex exec`, 역할별 내장 쓰기 정책 및 granular 자동 검토 계약을 유지한다. 바깥 wrapper, 전체 mount 증명, 중첩 sandbox 성공 및 시스템 AppArmor 설정 변경을 이 계획의 시작·완료 조건으로 요구하지 않는다.
+- 현재 소유 workspace, Agent session·snapshot과 사용자 guidance 결정을 보존한다. 과거 G-058 보류 지시를 현재 상태에 재적용하거나 운영 SQLite 상태를 수동 수정하지 않는다.
 
 ## Implementation
 
-- hydrate_active_project에서 기존 planning ownership 판정을 적용한다.
-- Codex config 경로 수집을 .git repository 경계로 제한한다.
-- 별도 운영 Codex home을 사용해 개인 plugin 설정을 유지하면서 자동 실행의 설정 충돌을 해결한다.
-- 현재 Codex CLI의 `sandbox --permission-profile` 인자에 기존 최소 쓰기 경계를 명시한다. outer profile과 기존 mount gate를 함께 검증하며 inner model 명령의 network 제한과 자동 승인 검토는 유지한다.
+- `loop_manager_internal/storage/project_state_adapter.py`의 `hydrate_active_project`와 `loop_manager_internal/storage/runtime_state.py`의 `recovery_slot_available`을 기준으로 Planner 또는 중단된 planning attempt가 소유한 슬롯을 active-plan 투영이 덮어쓰지 않는지 확인한다. 현재 구현을 재작성하지 않고 확인된 잔여 결함만 수정한다.
+- `loop_manager_internal/agents/agent_write_isolation.py`의 `_codex_config_files`가 선택된 CODEX_HOME과 선택 worktree의 repository 경계만 사용하는지 확인한다. 현재 코드에 이미 있는 경계 제한을 재사용하고 사용자 인증·설정 파일을 변경하거나 복제하지 않는다.
+- 직접 호출·정책 확인은 `loop_manager_internal/agents/agent_codex_sandbox.py`와 기존 isolation 경계가 소유한다. 필요한 수정도 이 책임 경계 안에서 수행하며 outer permission profile이나 mount gate를 되살리지 않는다. G-114는 선언된 경로 probe의 오탐·거부 조건 회귀를 담당하므로 해당 검증을 여기서 중복 구현하지 않는다.
 
 ## Validation
 
-- Planner ownership과 기존 active-plan hydration 및 실제 config 충돌에 대한 targeted unit test만 실행한다.
-- 전체 verify는 Manager가 수행한다. 운영 로그에서 scope 비교 오류 없이 Planner 또는 critical Worker가 실제 시작하는지 확인한다.
+- Worker는 `tests/test_runtime_state.py`의 `test_active_hydration_preserves_planner_scope_and_interrupted_attempt`와 `test_active_hydration_resumes_worker_when_planner_does_not_own_slot`, `tests/test_agent_write_isolation.py`의 `test_selected_codex_home_does_not_inherit_config_above_git_root` 및 실제 설정 충돌 사례 중 변경한 경계의 최소 targeted unit test만 실행한다.
+- 정책 연결을 수정할 때만 `tests/test_codex_native_invocation.py`의 직접 호출·재개·fallback 사례를 포함한다. 코드·테스트 변경이 없으면 현재 구현·테스트의 충족 근거와 targeted test 미실행 사유를 기록한다.
+- 전체 verify는 Manager가 수행하고, Reviewer는 전달된 결과를 읽기 전용으로 검토한다. 실제 모델 실행, 운영 DB 수정 또는 개인 설정 변경을 Worker 검증 조건으로 요구하지 않는다.
 
 ## Progress
 
-- [x] 코드 수정 및 targeted unit test 5개 통과
-- [ ] 운영 기준선 복구 및 critical 계획 선택 확인
+- [x] 과거 작업 기록: 코드 수정 및 targeted unit test 5개 통과 (현재 revision의 검증 결과가 아님)
+- [ ] 현재 Planner 소유권·설정 경계 구현과 회귀 사례 재확인 및 확인된 잔여 결함만 수정
 - [ ] Manager 전체 verify, Review 및 사용자 Merge
 
 ## Decision Log
@@ -49,3 +51,5 @@ priority: critical
 
 - 2026-10-01: 실제 자동 실행에서 CLI 0.159.3의 outer sandbox는 named permission profile을 요구함을 확인했다. 기존 mount proof와 쓰기 경계를 유지하는 형식으로 갱신한다. Ubuntu AppArmor가 vendor bwrap의 namespace 초기화를 거부하는 운영 환경 조건은 개별 binary profile로 해결하며 시스템 전체 userns 정책은 변경하지 않는다.
 - 2026-10-02 사용자 결정: 리팩터링 우선 요청에 따라 미착수·무소유 READY인 이 계획은 G-127 Merge 이후 진행한다. 원래 Planner 소유권·설정 경계·거부 조건과 목표는 유지하고 실행 시 최신 application·Agent 경로와 현재 PRODUCT/R-050의 직접 Codex 실행 계약을 확인한다. 과거 운영·targeted test 기록은 보존하되 새 revision의 검증 성공으로 사용하지 않는다.
+
+- 2026-10-03 사용자 요청에 따른 정책 정합성 수정: 현재 PRODUCT/R-050을 우선해 과거 outer sandbox·mount proof·AppArmor 운영 조정 지시를 현재 Implementation에서 제거했다. 원래 Planner 소유권과 repository 설정 경계 목표는 유지한다. G-058은 운영 SQLite에서 이미 MERGED이므로 과거 보류 지시를 현재 Acceptance Criteria에서 제거했다. 위 2026-10-01 기록은 당시의 진단이며 현재 실행 지시가 아니다. 현재 hydration·config 경계는 구현돼 있으므로 잔여 결함만 다루고, 과거 결과로 완료를 선언하지 않는다. SQLite와 실행 상태는 수정하지 않는다.
