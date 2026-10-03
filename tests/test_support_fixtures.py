@@ -90,7 +90,7 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
                         loop_manager.AgentProfile('fixture-worker-model', 'medium'))
                     self.assertEqual(loop_manager._agent_profile(
                         Path('unused.ini'), 'codex', 'maintenance_planner', None, Path('/managed')),
-                        loop_manager.AgentProfile('fixture-worker-model', 'medium'))
+                        'real profile')
                     self.assertEqual(loop_manager._agent_profile(
                         Path('configured.ini'), 'codex', 'worker', 1, Path('/managed')), 'real profile')
                     self.assertEqual(loop_manager._agent_profile(
@@ -99,7 +99,7 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
             self.assertIs(loop_manager._agent_profile, original)
             self.assertEqual(loop_manager._agent_profile(
                 Path('unused.ini'), 'codex', 'worker', 1, Path('/managed')), 'real profile')
-            self.assertEqual(original.call_count, 3)
+            self.assertEqual(original.call_count, 4)
 
     def test_dummy_profile_can_cover_legacy_planner_roles_without_changing_default(self):
         original = mock.Mock(return_value='real profile')
