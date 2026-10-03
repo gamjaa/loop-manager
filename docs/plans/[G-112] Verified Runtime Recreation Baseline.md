@@ -39,7 +39,7 @@ priority: critical
 
 - [x] 과거 작업 기록: 삭제 증거 검증 및 좁은 scope 연결
 - [x] 과거 작업 기록: targeted unit test 총 8개 통과 (현재 revision의 검증 결과가 아님)
-- [ ] 현재 구현과 테스트를 기준으로 Acceptance Criteria 재확인 및 확인된 잔여 결함만 수정
+- [x] 현재 구현과 테스트를 기준으로 Acceptance Criteria 재확인: 기존 구현 유지, 삭제 증거 거부·snapshot/checkpoint 보존 회귀 테스트 보강
 - [ ] Manager 전체 verify, 독립 Review 및 사용자 Merge
 
 ## Decision Log
@@ -49,3 +49,6 @@ priority: critical
 - 2026-10-02 사용자 결정: 리팩터링 우선 요청에 따라 미착수·무소유 READY인 이 계획은 G-127 Merge 이후 진행한다. 원래 runtime 증거·거부 조건·검증 결과와 목표는 유지하고, 실행 시 리팩터링된 runtime·scope 경로를 확인한다. 과거 targeted test 기록을 새로운 revision의 검증 성공으로 사용하지 않는다.
 
 - 2026-10-03 사용자 요청에 따른 대기 계획 전체 점검: 현재 runtime 증거 검사와 scope decision이 이미 구현돼 있음을 코드·테스트로 확인했다. 현재 PRODUCT/R-023/R-050과 충돌하는 목표는 없으며 원래 증거·거부 조건을 유지한다. 구현 경로를 최신 책임 경계로 갱신하고 중복 구현을 금지했다. 과거 테스트 결과로 현재 verify·Review·사용자 Merge를 대체하지 않는다. SQLite와 실행 상태는 수정하지 않는다.
+- 2026-10-03 Worker 재확인: `scope_recovery.py`는 부모 process lock identity, clean detached exact SHA 및 현재 durable 생성 표식을 먼저 검증한다. `runtime_scope.py`는 이전 생성 표식과 일치하는 삭제 receipt·bootstrap intent·완료 result를 요구하며 잠금 외 등록 필드가 달라지면 거부한다. `agent_scope_decision.py`는 선택 runtime의 일치하는 원본 등록만 재조정하고 저장된 결과·checkpoint의 별도 변조와 무관한 metadata를 보존하므로 구현을 재작성하지 않았다.
+- 회귀 누락 보강: 삭제 intent 누락, receipt·intent·result의 JSON 손상과 identity·소유자·전후 상태 변조 거부, 증거 파일의 읽기 전용 보존, 정상 재생성 시 원본 snapshot·checkpoint·scope identity·Agent 파일 변경 보존, 저장된 결과·checkpoint의 runtime 등록 위반 보존을 기존 두 테스트 파일에 추가했다. 새 파일·루트 항목이나 별도 증거 경로는 만들지 않았다.
+- 현재 변경의 targeted 검증: `python3 -m unittest tests.test_runtime_scope.RuntimeRecreationEvidenceTests tests.test_agent_scope_decision.PersistedScopeDecisionTests.test_runtime_lock_replacement_requires_proof_and_preserves_other_changes tests.test_agent_scope_decision.PersistedScopeDecisionTests.test_runtime_recreation_preserves_checkpoint_and_original_agent_metadata tests.test_agent_scope_decision.PersistedScopeDecisionTests.test_runtime_recreation_keeps_agent_result_and_checkpoint_registration_violations -v` — 9개 통과. 기존 `scripts/verify.sh`의 unittest discovery가 두 파일을 포함하므로 변경하지 않았다. 전체 verify·Review·Merge는 별도 확인 대상이다.

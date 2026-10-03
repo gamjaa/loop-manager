@@ -93,6 +93,55 @@ class PersistedScopeDecisionTests(unittest.TestCase):
         self.assertEqual(check.before.worktrees, current.worktrees)
         self.assertEqual(check.before.refs, current.refs)
 
+    def test_runtime_recreation_preserves_checkpoint_and_original_agent_metadata(self):
+        runtime = '/state/runtime'
+        old = ('HEAD=b', 'detached=True', 'locked=old')
+        new = ('HEAD=b', 'detached=True', 'locked=new')
+        before = snapshot(
+            worktrees={**snapshot().worktrees, runtime: old},
+            refs={**snapshot().refs, 'refs/remotes/origin/main': ('b', '')},
+            scope_id='original-scope', scope_start_digest='original-digest')
+        saved = replace(before, dirty={'app.py': (('unstaged',), 'agent-work')})
+        checkpoint = ManagerGitCheckpoint(saved, frozenset({'/cleanup'}))
+        current = replace(saved, worktrees={**saved.worktrees, runtime: new})
+        original_before = before.serialize()
+        original_checkpoint = checkpoint.serialize()
+        outcome = decide(before, current, checkpoint=checkpoint,
+                         manager_runtime=(runtime, 'b'), runtime_recreation_proven=True)
+        first, second = outcome.checks
+        expected_before = replace(before, worktrees={**before.worktrees, runtime: new})
+        self.assertEqual(outcome.reconciled_before, expected_before)
+        self.assertEqual(first.before, expected_before)
+        self.assertEqual(first.after, current)
+        self.assertEqual(second.before, current)
+        self.assertEqual(second.allowed_worktrees, checkpoint.cleanup_worktrees)
+        self.assertEqual(before.serialize(), original_before)
+        self.assertEqual(checkpoint.serialize(), original_checkpoint)
+
+    def test_runtime_recreation_keeps_agent_result_and_checkpoint_registration_violations(self):
+        runtime = '/state/runtime'
+        old = ('HEAD=b', 'detached=True', 'locked=old')
+        new = ('HEAD=b', 'detached=True', 'locked=new')
+        before = snapshot(worktrees={**snapshot().worktrees, runtime: old},
+                          refs={**snapshot().refs, 'refs/remotes/origin/main': ('b', '')})
+        current = replace(before, worktrees={**before.worktrees, runtime: new})
+        for registration in (('HEAD=foreign', 'detached=True', 'locked=old'),
+                             ('HEAD=b', 'detached=True', 'locked=agent')):
+            with self.subTest(registration=registration):
+                saved = replace(before, worktrees={**before.worktrees, runtime: registration},
+                                refs={**before.refs, 'refs/heads/other': ('foreign', '')})
+                # The same helper carries runtime evidence into stored Agent results.
+                reconciled = decision.reconcile_runtime_snapshot(saved, before, current, runtime)
+                self.assertEqual(reconciled, saved)
+                outcome = decide(before, current, checkpoint=ManagerGitCheckpoint(saved, frozenset()),
+                                 manager_runtime=(runtime, 'b'), runtime_recreation_proven=True)
+                first, second = outcome.checks
+                self.assertEqual(first.after, saved)
+                self.assertEqual(second.before, saved)
+                with self.assertRaises(AgentScopeError):
+                    validate_agent_scope(first.role, Path(WORKTREE), first.before, first.after,
+                                         selected_plan_path=PLAN)
+
     def test_worker_and_reviewer_preserve_unallowed_shared_changes(self):
         before = snapshot()
         current = replace(before, refs={**before.refs, "refs/heads/unowned": ("b", "commit")})
