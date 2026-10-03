@@ -78,12 +78,18 @@ class ManagerSchemaTest(unittest.TestCase):
         self.assertIn("planning_result_pending_validation", columns)
         self.assertIn("planning_result_completed", columns)
         self.assertIn("planning_error_fingerprint", columns)
+        self.assertTrue({
+            "planning_error_incident_id", "planning_error_origin",
+            "planning_correction_error", "planning_correction_incident_id",
+            "planning_correction_sha", "planning_correction_context",
+        } <= columns)
         self.assertEqual((row["base_branch"], row["phase"]), ("main", "WORKING"))
         self.assertIsNone(row["specification_fingerprint"])
         self.assertIsNone(row["planning_fingerprint"])
         self.assertEqual(row["planning_retry_count"], 0)
         self.assertEqual(row["planning_result_pending_validation"], 0)
         self.assertIsNone(row["planning_error"])
+        self.assertIsNone(row["planning_correction_incident_id"])
 
     def test_existing_database_adds_worker_session_and_result_fields(self):
         with tempfile.TemporaryDirectory() as directory:

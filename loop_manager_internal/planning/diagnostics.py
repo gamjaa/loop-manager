@@ -66,7 +66,12 @@ def preserve_planning_diagnostics(
                 diff += untracked.stdout
         except RuntimeError as diff_error:
             diff = f"diff 보존 실패: {diff_error}"
-    diagnostic = effects.planning_diagnostics_path(state_dir, repo, fingerprint)
+    # Preserve each adopted base separately; repeated corrections must not
+    # overwrite the original failed result or its retry evidence.
+    identity = hashlib.sha256(
+        f"{fingerprint}\0{row['active_sha'] or 'unknown'}".encode("utf-8")
+    ).hexdigest()
+    diagnostic = effects.planning_diagnostics_path(state_dir, repo, identity)
     diagnostic.parent.mkdir(parents=True, exist_ok=True)
     diagnostic.write_text(
         "\n".join(
@@ -75,6 +80,13 @@ def preserve_planning_diagnostics(
                 f"planning_worktree: {worktree or ''}",
                 f"planner_session_id: {row['planner_session_id'] or ''}",
                 f"validation_retries: {row['planning_retry_count']}",
+                f"active_sha: {row['active_sha'] or ''}",
+                f"planning_error: {row['planning_error'] or ''}",
+                f"planning_error_incident_id: {row['planning_error_incident_id'] or ''}",
+                f"planning_error_origin: {row['planning_error_origin'] or ''}",
+                f"planning_validation_error: {row['planning_validation_error'] or ''}",
+                f"planning_result_completed: {int(bool(row['planning_result_completed']))}",
+                f"planning_result: {row['planning_result'] or ''}",
                 "",
                 "last_error:",
                 str(error),

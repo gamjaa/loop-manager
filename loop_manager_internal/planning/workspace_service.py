@@ -1,20 +1,77 @@
 """Planning workspace creation and ownership checks."""
 from __future__ import annotations
 from pathlib import Path
+from uuid import uuid4
 from loop_manager_internal.planning.planning_catalog import PlanningResultInvalid
 from loop_manager_internal.planning.planning_rebase import PlanningRebaseError
-from loop_manager_internal.maintenance.maintenance_orchestration import maintenance_planning_fingerprint
-from loop_manager_internal.maintenance.maintenance_orchestration import MaintenanceOrchestrationError
+from loop_manager_internal.maintenance.maintenance_orchestration import (
+    maintenance_planning_fingerprint, MaintenanceOrchestrationError,
+    MaintenanceOutcome, parse_maintenance_planner_decision,
+)
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningError
+from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.planning.planning_service import PlanningService
 from loop_manager_internal.planning.conflict_correction import PlanningConflictCorrection
 from loop_manager_internal.planning.planning_contracts import (
     _PlanningRun, PlanningOutcome, PlanningOutcomeKind,
-    PlanningWorkspaceOwnershipError,
+    PlanningWorkspaceOwnershipError, MAX_PLANNER_VALIDATION_RETRIES,
     WORKSPACE_OWNED, WORKSPACE_RESERVED,
 )
 
 class PlanningWorkspaceService(PlanningService):
+    @staticmethod
+    def _correction_context(run: _PlanningRun) -> str:
+        if not run.maintenance_planning:
+            return "general"
+        cycle = run.maintenance_cycle
+        return f"{cycle.phase.value}:{cycle.revision}"
+
+    @staticmethod
+    def _linked_failed_result(run: _PlanningRun) -> bool:
+        row = run.row
+        if not row.planning_error:
+            return False
+        if (row.planning_error_origin == "validation"
+                and row.planning_retry_count >= MAX_PLANNER_VALIDATION_RETRIES):
+            return True
+        if (row.planning_error_origin is None
+                and row.planning_retry_count >= MAX_PLANNER_VALIDATION_RETRIES
+                and row.planning_error == row.planning_validation_error):
+            # Legacy rows have no cause marker; exhausted retries and the
+            # original diagnostic together establish this older connection.
+            return True
+        if not row.planning_result_completed:
+            return False
+        if not run.maintenance_planning or row.planning_error_origin not in (None, "unsafe"):
+            return False
+        try:
+            decision = parse_maintenance_planner_decision(
+                str(row.planning_result or ""), run.maintenance_cycle.phase,
+            )
+        except MaintenanceOrchestrationError:
+            return False
+        return (decision.outcome is MaintenanceOutcome.UNSAFE
+                and (row.planning_error_origin == "unsafe"
+                     or row.last_error == row.planning_error))
+
+    @staticmethod
+    def _assessment_targets(run: _PlanningRun, rows) -> tuple[str, ...]:
+        ids = set(run.maintenance_cycle.revalidation_plan_ids if run.maintenance_planning else ())
+        if (run.maintenance_planning and
+                run.maintenance_cycle.phase is maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION):
+            return tuple(sorted(ids))
+        for plan in rows:
+            keys = plan.keys()
+            if plan["status"] != "READY":
+                continue
+            if any(plan[key] for key in (
+                "branch", "worktree", "workspace_owned", "ever_started",
+                "worker_session_id", "reviewer_session_id", "agent_snapshot", "pr_url",
+            ) if key in keys):
+                continue
+            ids.add(str(plan["plan_id"]))
+        return tuple(sorted(ids))
+
     def _resolve_rebase_conflict(
         self, run: _PlanningRun, worktree: Path, target: str, detail: str,
         collision_paths: tuple[str, ...] = (), stash_sha: str = "",
@@ -117,13 +174,15 @@ class PlanningWorkspaceService(PlanningService):
                             f"maintenance-cycle:{run.maintenance_cycle.phase.value}:"
                             f"{run.maintenance_cycle.revision}"
                         )
+                catalog_rows = self._ports.state.execplan_rows(context.repo)
                 changed_documents = self._ports.git.relevant_document_changes(
                     worktree, str(row.active_sha or ""), latest,
                     sorted(set(self._ports.git.changed_files(
                         worktree, str(row.active_sha or ""),
                     )) | set(self._ports.git.changed_files(worktree))),
-                    self._ports.state.execplan_rows(context.repo),
+                    catalog_rows, self._assessment_targets(run, catalog_rows),
                 )
+                linked_error = self._linked_failed_result(run)
                 if row.agent_snapshot:
                     role = "maintenance_planner" if run.maintenance_planning else "planner"
                     if row.agent_role != role:
@@ -184,16 +243,18 @@ class PlanningWorkspaceService(PlanningService):
                         if mode_failure else maintenance_planning_fingerprint(run.maintenance_cycle, adopted_input)
                         if run.maintenance_planning else adopted_input
                     )
-                    if (not unchanged_failed_input and not row.planning_result_completed
+                    if ((changed_documents or not unchanged_failed_input)
+                            and not row.planning_result_completed
                             and not mode_failure):
                         # Keep the authorized correction durable across the
                         # crash window before the next Planner invocation.
                         values["planning_result_pending_validation"] = 1
-                    if (not unchanged_failed_input and not mode_failure
-                            and row.planning_error == row.planning_validation_error):
+                    if ((changed_documents or not unchanged_failed_input) and not mode_failure
+                            and linked_error):
                         values["planning_retry_count"] = 0
                 if changed_documents and row.planning_result_completed:
-                    self._ports.state.preserve_diagnostics(context.repo, row)
+                    if not row.planning_error:
+                        self._ports.state.preserve_diagnostics(context.repo, row)
                     recheck_message = (
                         "현재 planning 결과의 관련 문서가 변경됐습니다: "
                         + ", ".join(changed_documents)
@@ -202,10 +263,36 @@ class PlanningWorkspaceService(PlanningService):
                         planning_result_pending_validation=1,
                         planning_result_completed=0,
                         planning_validation_error=recheck_message,
+                        planning_result=None,
                     )
-                    if row.planning_error and row.planning_error == row.planning_validation_error:
-                        values["planning_error"] = recheck_message
-                self._ports.state.update(context.repo, **values)
+                elif changed_documents and not row.planning_result_completed:
+                    additional = [path for path in changed_documents
+                                  if path not in str(row.planning_validation_error or "")]
+                    if additional:
+                        values["planning_validation_error"] = (
+                            str(row.planning_validation_error or "").rstrip()
+                            + "\n관련 원격 입력 변경: " + ", ".join(additional)
+                        ).lstrip()
+                correction_pending = bool(
+                    (changed_documents and row.planning_result_completed)
+                    or (not row.planning_result_completed
+                        and (changed_documents or not unchanged_failed_input)
+                        and not mode_failure)
+                    or (row.planning_correction_error == row.planning_error
+                        and row.planning_result_pending_validation)
+                )
+                if (row.planning_error and correction_pending
+                        and (linked_error or row.planning_correction_error == row.planning_error)):
+                    incident_id = row.planning_error_incident_id or uuid4().hex
+                    values.update(
+                        planning_error_incident_id=incident_id,
+                        planning_correction_error=row.planning_error,
+                        planning_correction_incident_id=incident_id,
+                        planning_correction_sha=result.target,
+                        planning_correction_context=self._correction_context(run),
+                    )
+                with self._ports.state.transaction():
+                    self._ports.state.update(context.repo, **values)
                 self._ports.git.complete_planning_rebase(
                     context.repo, worktree, result.target,
                 )

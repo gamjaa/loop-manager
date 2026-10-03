@@ -77,6 +77,13 @@ class _PlanningStatePorts:
     def update(self, repo: str, **values: object) -> None:
         self._effects.update_project(self._connection, repo, **values)
 
+    def release_planning_correction(
+        self, repo: str, *, error: str, active_sha: str, context: str,
+    ) -> bool:
+        return self._runtime_repository.release_planning_correction(
+            repo, error=error, active_sha=active_sha, context=context,
+        )
+
     def transaction(self):
         return runtime_state._transaction(self._connection)
 
