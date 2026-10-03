@@ -79,6 +79,8 @@ Manager의 source 동기화 verify 피드백 2건은 planning 준비에서 이�
 
 추가 Review 2건에 따라 workspace의 원격 관측은 기존 `_recorded_base_fetch`를 사용한다. 저장된 Planner scope와 바깥 fetch 이후의 원격 경쟁을 실제 fetch journal·scope 검증으로 확인했다. 범위 검사와 충돌 내용 검사를 통과한 교정은 stage 전에 기존 rebase journal에 HEAD·경로·작업물 지문으로 저장한다. stash 충돌과 commit rebase 충돌 모두 stage 직후 중단에서 Agent 호출 없이 남은 Git 단계를 재개하며, 교정 후 내용 변경은 보존·거부한다. 완료한 commit 교정 근거는 stash 복원 전에 제거해 다른 충돌에 재사용하지 않는다. 현재 후보의 `test_planning_rebase`, `test_planning_recovery`, `test_planning_selection` targeted unit test 58개가 모두 통과했다. 전체 verify와 Review는 Manager에 남긴다.
 
+후속 Review에서 발견한 게시 복구의 누락 fetch를 수정하고, 평가·선택·게시의 나머지 planning fetch도 기존 기록 경계로 통일했다. prepared intent·저장 scope·원격 재전진을 함께 검증했다. stash 교정 확정은 soft reset 전에 `accepting` 단계와 이전 commit 기준 index·작업물 지문을 저장해 reset 직후 중단도 복구한다. 복구 중 내용이 바뀌면 보존·거부하며 Planner 호출은 반복하지 않는다. 현재 후보의 planning rebase·recovery·publication·selection·assessment unit test 84개가 모두 통과했다. 전체 verify·Review는 Manager에 남긴다.
+
 ## Decision Log
 
 - 2026-10-02: 사용자는 원격 전진을 어느 단계에서 관측하든 관리 작업을 rebase 후 이어가고, 단계별 관련 문서가 변경됐을 때만 재확인하도록 요청했다. Worker·Reviewer의 추가 문서 확인 대상은 현재 진행 중인 ExecPlan이다.

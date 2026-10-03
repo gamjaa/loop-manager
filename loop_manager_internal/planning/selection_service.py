@@ -682,7 +682,7 @@ class PlanningSelectionService(PlanningService):
         return None
 
     def _fetch_remote_head(self, context: PlanningContext) -> str:
-        self._ports.git.run(context.repo_path, "fetch", "origin")
+        self._ports.git.fetch_base(context.repo_path, context.base_branch)
         return self._ports.git.run(
             context.repo_path,
             "rev-parse",

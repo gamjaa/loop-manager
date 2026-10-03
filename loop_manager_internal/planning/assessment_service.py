@@ -265,7 +265,7 @@ class PlanningAssessmentService(PlanningService):
         self._ports.git.validate_worktree_ownership(
             context.repo, str(row.planning_attempt_fingerprint or run.current_fingerprint or ""), worktree,
         )
-        self._ports.git.run(context.repo_path, "fetch", "origin")
+        self._ports.git.fetch_base(context.repo_path, context.base_branch)
         try:
             self._ports.validation.validate_publication_base(
                 context.repo, context.repo_path, context.base_branch,

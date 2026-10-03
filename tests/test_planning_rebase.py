@@ -241,11 +241,11 @@ class PlanningDocumentRelevanceTest(unittest.TestCase):
 
 
 class PlanningRebaseGitBoundaryTest(unittest.TestCase):
-    def test_correction_resumes_after_stage_without_repeating_planner(self):
+    def test_correction_resumes_after_stage_or_reset_without_repeating_planner(self):
         from loop_manager_internal.planning import planning_rebase
         from loop_manager_internal.planning.workspace_service import PlanningWorkspaceService
         from tests.support.planning_case import FakePorts, planning_snapshot
-        for committed in (False, True):
+        for committed in (False, True, "prepared"):
             for drift in (False, True):
                 with self.subTest(committed=committed, drift=drift), tempfile.TemporaryDirectory() as directory:
                     root = Path(directory)
@@ -261,9 +261,9 @@ class PlanningRebaseGitBoundaryTest(unittest.TestCase):
                         )
                         if check and result.returncode:
                             raise RuntimeError(result.stdout)
-                        if armed and args[:2] == ("add", "--"):
+                        if armed and args[:2] == (("reset", "--soft") if committed == "prepared" else ("add", "--")):
                             armed = False
-                            raise RuntimeError("interrupted after stage")
+                            raise RuntimeError("interrupted after correction")
                         return result
 
                     git(repo, "init", "-b", "main")
@@ -277,9 +277,13 @@ class PlanningRebaseGitBoundaryTest(unittest.TestCase):
                     old = git(repo, "rev-parse", "HEAD").stdout.strip()
                     tree = root / "planning"
                     git(repo, "worktree", "add", "--detach", str(tree), old)
+                    if committed == "prepared":
+                        (tree / "prepared.txt").write_text("prepared\n")
+                        git(tree, "add", "prepared.txt")
+                        git(tree, "commit", "-m", "prepared")
                     (tree / name).write_text("local\n")
                     git(tree, "add", name)
-                    if committed:
+                    if committed is True:
                         git(tree, "commit", "-m", "candidate")
                     (repo / name).write_text("remote\n")
                     git(repo, "add", name)
@@ -312,11 +316,24 @@ class PlanningRebaseGitBoundaryTest(unittest.TestCase):
                     )
                     armed = True
                     service = PlanningWorkspaceService(ports)
-                    with self.assertRaisesRegex(RuntimeError, "interrupted after stage"):
+                    with self.assertRaisesRegex(RuntimeError, "interrupted after correction"):
                         service._resolve_rebase_conflict(
                             run, tree, target, first.detail, first.conflict_paths, first.stash_sha,
                         )
                     self.assertEqual(git(tree, "ls-files", "-u").stdout, "")
+                    if committed == "prepared":
+                        self.assertEqual(git(tree, "rev-parse", "HEAD").stdout.strip(), target)
+                        if drift:
+                            (tree / name).write_text("unapproved change\n")
+                            with self.assertRaisesRegex(PlanningRebaseError, "작업물이 달라"):
+                                rebase_planning_worktree(*args)
+                        else:
+                            self.assertFalse(rebase_planning_worktree(*args).conflict)
+                            self.assertEqual((tree / name).read_text(), "remote\nlocal\n")
+                            self.assertEqual((tree / "prepared.txt").read_text(), "prepared\n")
+                            complete_planning_rebase(git, root / "state", str(repo), tree, target)
+                        self.assertEqual(ports.agent.run_count, 1)
+                        continue
                     resumed = rebase_planning_worktree(*args)
                     self.assertTrue(resumed.conflict)
                     if drift:

@@ -65,7 +65,7 @@ def _read(path: Path, repo: str, worktree: Path) -> dict[str, object] | None:
             for field in ("old", "target", "head", "nonce"))
             or not isinstance(record.get("dirty"), bool)):
         raise PlanningRebaseError("planning rebase journal의 원본·대상 정보가 유효하지 않습니다.")
-    if record.get("phase") not in {"before_stash", "stashed", "rebasing", "applying", "restored", "conflict"}:
+    if record.get("phase") not in {"before_stash", "stashed", "rebasing", "applying", "restored", "conflict", "accepting"}:
         raise PlanningRebaseError("planning rebase journal 단계가 유효하지 않습니다.")
     return record
 
@@ -98,9 +98,9 @@ def rebase_in_progress(git, worktree: Path) -> bool:
     return False
 
 
-def _restored_fingerprint(git, worktree: Path) -> tuple[object, ...]:
+def _restored_fingerprint(git, worktree: Path, revision: str = "HEAD") -> tuple[object, ...]:
     """Capture the index, tracked worktree and untracked bytes separately."""
-    staged = _git_ok(git, worktree, "diff", "--binary", "--cached", "HEAD")
+    staged = _git_ok(git, worktree, "diff", "--binary", "--cached", revision)
     unstaged = _git_ok(git, worktree, "diff", "--binary")
     untracked = _git_ok(git, worktree, "ls-files", "--others", "--exclude-standard", "-z")
     files = []
@@ -117,8 +117,8 @@ def _restored_fingerprint(git, worktree: Path) -> tuple[object, ...]:
     return staged, unstaged, tuple(files)
 
 
-def _restored_digest(git, worktree: Path) -> str:
-    return hashlib.sha256(repr(_restored_fingerprint(git, worktree)).encode()).hexdigest()
+def _restored_digest(git, worktree: Path, revision: str = "HEAD") -> str:
+    return hashlib.sha256(repr(_restored_fingerprint(git, worktree, revision)).encode()).hexdigest()
 
 
 def _apply_stash(git, worktree: Path, stash_sha: str):
@@ -217,6 +217,10 @@ def rebase_planning_worktree(
         _write(path, record)
     if record["dirty"] and stash is None and phase != "restored":
         raise PlanningRebaseError("planning 변경물의 보존 stash가 없습니다.")
+
+    if phase == "accepting":
+        accept_resolved_stash_conflict(git, state_dir, repo, worktree, target)
+        return PlanningRebaseResult(target, True)
 
     just_started_apply = False
     if phase in {"stashed", "rebasing"}:
@@ -399,15 +403,25 @@ def accept_resolved_stash_conflict(
     """Adopt an explicitly corrected stash conflict after Git reports no unmerged paths."""
     path = _journal_path(state_dir, repo, worktree)
     record = _read(path, repo, worktree)
-    if record is None or record["phase"] != "conflict" or record["target"] != target:
+    if record is None or record["phase"] not in {"conflict", "accepting"} or record["target"] != target:
         raise PlanningRebaseError("해결할 planning stash 충돌 단계가 없습니다.")
     if git(worktree, "ls-files", "-u", "-z").stdout:
         raise PlanningRebaseError("planning stash 충돌이 아직 index에 남아 있습니다.")
     head = _git_ok(git, worktree, "rev-parse", "HEAD")
-    if head != str(record.get("restored_head", target)):
-        raise PlanningRebaseError("planning stash 충돌의 base HEAD가 바뀌었습니다.")
-    if not _git_ok(git, worktree, "status", "--porcelain", "--untracked-files=all"):
-        raise PlanningRebaseError("해결된 planning 후보 변경물이 없습니다.")
+    restored_head = str(record.get("restored_head", target))
+    if record["phase"] == "conflict":
+        if head != restored_head:
+            raise PlanningRebaseError("planning stash 충돌의 base HEAD가 바뀌었습니다.")
+        if not _git_ok(git, worktree, "status", "--porcelain", "--untracked-files=all"):
+            raise PlanningRebaseError("해결된 planning 후보 변경물이 없습니다.")
+        # Bind index/worktree bytes to the pre-reset commit, so the identity
+        # remains valid on either side of the soft-reset crash window.
+        record["accepting_digest"] = _restored_digest(git, worktree, restored_head)
+        record["phase"] = "accepting"
+        _write(path, record)
+    elif (head not in {restored_head, target}
+          or record.get("accepting_digest") != _restored_digest(git, worktree, restored_head)):
+        raise PlanningRebaseError("planning stash 교정 확정 중 작업물이 달라졌습니다.")
     if head != target:
         _git_ok(git, worktree, "reset", "--soft", target)
     record["restored_digest"] = _restored_digest(git, worktree)

@@ -12,7 +12,7 @@ class PlanningPublicationService(PlanningService):
         self._ports.git.validate_worktree_ownership(
             run.context.repo, str(run.row.planning_attempt_fingerprint or ""), worktree,
         )
-        self._ports.git.run(run.context.repo_path, "fetch", "origin")
+        self._ports.git.fetch_base(run.context.repo_path, run.context.base_branch)
 
     def _preserve_recovery_error(
         self, run: _PlanningRun, fingerprint: str, error: RuntimeError,
@@ -139,7 +139,7 @@ class PlanningPublicationService(PlanningService):
             )
             return self._operational_error()
         if validated_result is None:
-            self._ports.git.run(context.repo_path, "fetch", "origin")
+            self._ports.git.fetch_base(context.repo_path, context.base_branch)
             latest_sha = self._ports.git.run(
                 context.repo_path, "rev-parse", "--verify",
                 f"refs/remotes/origin/{context.base_branch}^{{commit}}",
@@ -168,7 +168,7 @@ class PlanningPublicationService(PlanningService):
             if run.maintenance_planning:
                 assert run.maintenance_context is not None
                 try:
-                    self._ports.git.run(context.repo_path, "fetch", "origin")
+                    self._ports.git.fetch_base(context.repo_path, context.base_branch)
                     self._ports.validation.validate_publication_base(
                         context.repo,
                         context.repo_path,
@@ -370,7 +370,7 @@ class PlanningPublicationService(PlanningService):
                 self._ports.events.error(message)
                 return self._operational_error()
 
-        self._ports.git.run(context.repo_path, "fetch", "origin")
+        self._ports.git.fetch_base(context.repo_path, context.base_branch)
         latest_sha = self._ports.git.run(
             context.repo_path,
             "rev-parse",
@@ -459,7 +459,7 @@ class PlanningPublicationService(PlanningService):
                 self._ports.state.update(context.repo, last_error=message)
                 self._ports.events.error(pushed.stdout)
                 return self._operational_error()
-            self._ports.git.run(context.repo_path, "fetch", "origin")
+            self._ports.git.fetch_base(context.repo_path, context.base_branch)
             latest_sha = self._ports.git.run(
                 context.repo_path,
                 "rev-parse",
