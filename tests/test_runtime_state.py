@@ -453,27 +453,82 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
 
 
     def test_active_hydration_preserves_planner_scope_and_interrupted_attempt(self):
-        for phase, attempt in (("PLANNING", None), (None, "saved-attempt")):
-            with self.subTest(phase=phase, attempt=attempt):
+        owners = (
+            {"phase": "PLANNING"},
+            {"planning_attempt_fingerprint": "saved-attempt"},
+            {"planning_error": "planner failed"},
+            {"planning_error_fingerprint": "failed-input"},
+            {"planning_workspace_owned": 1},
+            {"planning_retry_count": 2},
+            {"planner_session_id": "planner-session"},
+            {"planning_validation_error": "invalid-result"},
+            {"planning_result_pending_validation": 1},
+            {"planning_result_completed": 1},
+            {"planning_result": "saved-result"},
+        )
+        for owner in owners:
+            with self.subTest(owner=owner):
                 connection = runtime_connection()
                 self.addCleanup(connection.close)
-                connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', branch='loop-manager/G-047', worktree='/worker' WHERE repo='repo'")
-                connection.execute("UPDATE projects SET phase=?, planning_attempt_fingerprint=?, worktree='/planner', agent_role='planner', agent_snapshot='planner-scope' WHERE repo='repo'", (phase, attempt))
+                connection.execute(
+                    "UPDATE exec_plans SET status='IMPLEMENTING', "
+                    "branch='loop-manager/G-047', worktree='/worker', "
+                    "worker_session_id='worker-session', agent_snapshot='worker-scope', "
+                    "guidance_plan_hash='user-decision' WHERE repo='repo'"
+                )
+                connection.execute(
+                    "UPDATE projects SET phase=NULL, planning_attempt_fingerprint=NULL, "
+                    "worktree='/planner', agent_role='planner', "
+                    "agent_snapshot='planner-scope' WHERE repo='repo'"
+                )
+                runtime_state.RuntimeStateRepository(connection).update_project(
+                    'repo', owner, enqueue=False,
+                )
                 connection.commit()
-                before = dict(connection.execute("SELECT * FROM projects WHERE repo='repo'").fetchone())
+                before_project = dict(connection.execute(
+                    "SELECT * FROM projects WHERE repo='repo'"
+                ).fetchone())
+                before_plan = dict(connection.execute(
+                    "SELECT * FROM exec_plans WHERE repo='repo'"
+                ).fetchone())
                 loop_manager.hydrate_active_project(connection, 'repo')
-                self.assertEqual(dict(connection.execute("SELECT * FROM projects WHERE repo='repo'").fetchone()), before)
-                self.assertEqual(connection.execute("SELECT status FROM exec_plans WHERE repo='repo'").fetchone()[0], 'IMPLEMENTING')
+                self.assertEqual(dict(connection.execute(
+                    "SELECT * FROM projects WHERE repo='repo'"
+                ).fetchone()), before_project)
+                self.assertEqual(dict(connection.execute(
+                    "SELECT * FROM exec_plans WHERE repo='repo'"
+                ).fetchone()), before_plan)
 
     def test_active_hydration_resumes_worker_when_planner_does_not_own_slot(self):
         connection = runtime_connection()
         self.addCleanup(connection.close)
         connection.execute("UPDATE projects SET planning_attempt_fingerprint=NULL WHERE repo='repo'")
-        connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', branch='loop-manager/G-047', worktree='/worker' WHERE repo='repo'")
+        connection.execute(
+            "UPDATE exec_plans SET status='IMPLEMENTING', branch='loop-manager/G-047', "
+            "worktree='/worker', worker_session_id='worker-session', "
+            "agent_role='worker', agent_snapshot='worker-scope', "
+            "guidance_plan_hash='user-decision' WHERE repo='repo'"
+        )
         connection.commit()
+        preserved_fields = ("status", "branch", "worktree", "workspace_owned",
+                            "worker_session_id", "agent_role", "agent_snapshot",
+                            "guidance_plan_hash")
+        before_plan = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo='repo'"
+        ).fetchone()
         loop_manager.hydrate_active_project(connection, 'repo')
-        row = connection.execute("SELECT phase,branch,worktree FROM projects WHERE repo='repo'").fetchone()
-        self.assertEqual(tuple(row), ('WORKING', 'loop-manager/G-047', '/worker'))
+        row = connection.execute(
+            "SELECT phase,branch,worktree,worker_session_id,agent_role,agent_snapshot, "
+            "planning_fingerprint FROM projects WHERE repo='repo'"
+        ).fetchone()
+        self.assertEqual(tuple(row), ('WORKING', 'loop-manager/G-047', '/worker',
+                                     'worker-session', 'worker', 'worker-scope',
+                                     'planning-kept'))
+        after_plan = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo='repo'"
+        ).fetchone()
+        self.assertEqual({field: after_plan[field] for field in preserved_fields},
+                         {field: before_plan[field] for field in preserved_fields})
 
     def test_phase_mapping_and_field_ownership_are_declared_once(self):
         self.assertEqual(

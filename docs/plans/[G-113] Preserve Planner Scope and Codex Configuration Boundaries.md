@@ -41,7 +41,7 @@ priority: critical
 ## Progress
 
 - [x] 과거 작업 기록: 코드 수정 및 targeted unit test 5개 통과 (현재 revision의 검증 결과가 아님)
-- [ ] 현재 Planner 소유권·설정 경계 구현과 회귀 사례 재확인 및 확인된 잔여 결함만 수정
+- [x] 현재 Planner 소유권·설정 경계 구현 재확인; 잔여 구현 결함 없이 기존 회귀 테스트 강화
 - [ ] Manager 전체 verify, Review 및 사용자 Merge
 
 ## Decision Log
@@ -53,3 +53,7 @@ priority: critical
 - 2026-10-02 사용자 결정: 리팩터링 우선 요청에 따라 미착수·무소유 READY인 이 계획은 G-127 Merge 이후 진행한다. 원래 Planner 소유권·설정 경계·거부 조건과 목표는 유지하고 실행 시 최신 application·Agent 경로와 현재 PRODUCT/R-050의 직접 Codex 실행 계약을 확인한다. 과거 운영·targeted test 기록은 보존하되 새 revision의 검증 성공으로 사용하지 않는다.
 
 - 2026-10-03 사용자 요청에 따른 정책 정합성 수정: 현재 PRODUCT/R-050을 우선해 과거 outer sandbox·mount proof·AppArmor 운영 조정 지시를 현재 Implementation에서 제거했다. 원래 Planner 소유권과 repository 설정 경계 목표는 유지한다. G-058은 운영 SQLite에서 이미 MERGED이므로 과거 보류 지시를 현재 Acceptance Criteria에서 제거했다. 위 2026-10-01 기록은 당시의 진단이며 현재 실행 지시가 아니다. 현재 hydration·config 경계는 구현돼 있으므로 잔여 결함만 다루고, 과거 결과로 완료를 선언하지 않는다. SQLite와 실행 상태는 수정하지 않는다.
+
+- 2026-10-03 Worker 구현 확인: `hydrate_active_project`는 `recovery_slot_available`로 live·보존 planning 소유권을 검사한 뒤에만 활성 계획을 조회·투영한다. `_codex_config_files`는 선택 CODEX_HOME과 `.git` 파일·디렉터리로 식별한 repository 내부 설정 및 기존 시스템 설정만 열거한다. 개인 plugin 등록은 호출의 `features.plugins=false`·`features.apps=false`로 비활성화하며, MCP·exec-policy·관리 확장 강제 활성화의 기존 거부 조건과 내장 sandbox probe는 유지된다. 잔여 구현 결함이 없어 production 코드·호출 정책·verify 스크립트는 변경하지 않았다. 기존 Linux verify는 두 테스트 모듈을 전체 discovery에 포함한다.
+- 회귀 보강: hydration 테스트는 11개 독립 planning 소유권 표식 각각에서 project·ExecPlan 전체 row 보존을 확인하고, 슬롯이 비면 Worker session·snapshot·workspace 소유권·guidance hash와 성공 planning 지문을 보존하며 재개하는지 확인한다. 설정 테스트는 일반·linked repository에서 루트 위 MCP·잘못된 TOML이 검사와 지문에 포함되지 않고, 선택 home·repository 루트·하위 설정의 MCP는 거부되며 지문에 반영되는지 확인한다. 모든 설정 조작은 임시 fixture에 한정했다.
+- 현재 revision targeted 검증: Validation에 명시된 hydration 2개, 설정 경계 1개와 개인 plugin·관리 확장·exec-policy·상속 MCP 4개를 한 명령으로 실행했다. 최초 실행은 Worker 재개 테스트의 전체 row 불변 기대 때문에 실패했다. 기존 활성 계획 조회의 catalog cache 초기화를 확인하고 비교를 보존해야 할 실행 필드로 한정한 뒤 동일 명령을 재실행해 7개 모두 통과했다. 전체 verify·Review·Merge는 이 결과에 포함되지 않으며 운영 SQLite·사용자 설정·기존 guidance 결정은 변경하지 않았다.
