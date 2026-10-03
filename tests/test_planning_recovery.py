@@ -18,6 +18,9 @@ from loop_manager_internal.maintenance import maintenance_reconciliation
 from loop_manager_internal.maintenance.maintenance_file_inventory import RootPlacement, TrackedSource
 from tests.support.maintenance import result_for
 from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot, mutable_snapshot_token
+from loop_manager_internal.planning.input_fingerprints import (
+    IsRequirementArchiveOnlyChangeEffects, _is_requirement_archive_only_change,
+)
 from loop_manager_internal.maintenance.maintenance_orchestration import maintenance_planning_fingerprint
 from loop_manager_internal.planning.planning_runtime import (
     PlanningAgentResult,
@@ -76,6 +79,55 @@ class PlanningDiagnosticsTest(unittest.TestCase):
             self.assertIn("base-2", second.read_text())
 
 class PlanningRecoveryTest(PlanningCase):
+    def test_completed_general_result_rechecks_archive_mixed_with_plan_edit(self):
+        requirement = b"docs/requirements/R.md"
+        archived = b"docs/requirements/archive/R.md"
+        plan = b"docs/plans/[G-001] Plan.md"
+        previous = {
+            requirement: (b"blob", b"requirement"),
+            plan: (b"blob", b"original-plan"),
+        }
+        for plan_changed in (False, True):
+            with self.subTest(plan_changed=plan_changed):
+                current = {
+                    archived: previous[requirement],
+                    plan: (b"blob", b"edited-plan" if plan_changed else b"original-plan"),
+                }
+                effects = IsRequirementArchiveOnlyChangeEffects(
+                    _git_tree_entries=lambda _repo, revision: (
+                        previous if revision == "base" else current
+                    ),
+                    _is_planning_input=loop_manager._is_planning_input,
+                )
+                ports = FakePorts(planning_snapshot(
+                    phase="PLANNING", active_sha="base", worktree="/planning",
+                    planning_attempt_fingerprint="original-input",
+                    planning_workspace_owned=1, planner_session_id="saved-session",
+                    planning_result="saved result", planning_result_completed=True,
+                    planning_fingerprint="previous-success",
+                ))
+                ports.git.remote = "new-base"
+                ports.git.fingerprints = {"base": "old-input", "new-base": "new-input"}
+                ports.git.relevant_document_changes = mock.Mock(return_value=())
+                ports.git.requirement_archive_only = lambda _repo, old, new: (
+                    _is_requirement_archive_only_change(effects, Path("/repo"), old, new)
+                )
+
+                coordinator = PlanningLifecycleCoordinator(ports)
+                self.assertIsNone(coordinator._workspace._prepare_workspace(
+                    coordinator._new_run(self.context),
+                ))
+
+                saved = ports.state.snapshot
+                self.assertEqual(bool(saved.planning_result_pending_validation), plan_changed)
+                self.assertEqual(bool(saved.planning_result_completed), not plan_changed)
+                self.assertEqual(saved.planning_fingerprint, "previous-success")
+                if plan_changed:
+                    self.assertEqual(ports.state.diagnostics[-1].planning_result, "saved result")
+                    self.assertIsNone(saved.planning_result)
+                else:
+                    self.assertEqual(saved.planning_result, "saved result")
+
     def test_completed_results_recheck_code_input_before_recording_success(self):
         for mode in ("general", "combined", "maintenance"):
             for change in ("code", "same-content", "archive"):

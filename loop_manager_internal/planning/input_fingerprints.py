@@ -162,11 +162,7 @@ def _is_requirement_archive_only_change(
     archive_prefix = b"docs/requirements/archive/"
 
     def relevant(path: bytes) -> bool:
-        return (
-            (effects._is_planning_input(path)
-             and not execplan_catalog.is_active_execplan_path(path))
-            or path.startswith(archive_prefix)
-        )
+        return effects._is_planning_input(path) or path.startswith(archive_prefix)
 
     previous = {
         path.decode("utf-8"): value
