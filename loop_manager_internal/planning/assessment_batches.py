@@ -118,7 +118,10 @@ class MaintenanceAssessmentBatches:
                 if units and (len(units) >= MAX_BATCH_UNITS or unit.session_id or unit.error):
                     break
                 content = port.content(context.repo_path, context.base_branch, unit.source)
-                prompt = files.review_prompt(unit.source, content, root_placements=progress.root_placements)
+                prompt = files.review_prompt(
+                    unit.source, content, root_placements=progress.root_placements,
+                    compact=True, source_paths=progress.source_paths, include_contract=not units,
+                )
                 if unit.error:
                     prompt += "\n이전 결과 오류를 수정하라: " + unit.error
                 weight = max(len(content), len(prompt.encode()))
@@ -158,7 +161,8 @@ class MaintenanceAssessmentBatches:
                 if unit.source.path not in receipts:
                     raise BatchResultError(f"일괄 검토 결과 누락: {unit.source.path}")
                 content = port.content(context.repo_path, context.base_branch, unit.source)
-                parsed = files.parse_review(receipts[unit.source.path], unit.source, content)
+                parsed = files.parse_review(receipts[unit.source.path], unit.source, content,
+                                            source_paths=progress.source_paths)
                 port.complete(context.repo, run.maintenance_cycle.revision, unit.source, parsed)
                 accepted += 1
             except SourceInventoryError as error:
@@ -249,10 +253,20 @@ class MaintenanceAssessmentBatches:
             prompts = [relations.synthesis_prompt(item, manifest) for item in pages]
         except (relations.ReconciliationError, SourceInventoryError) as error:
             return self._failure(error)
-        result = self._invoke(run, worktree, prompts, relations.SYNTHESIS_PREFIX, page.session_id,
-                              lambda session: port.synthesis_session(context.repo, page, session))
+        session_errors = []
+
+        def save_session(session):
+            try:
+                port.synthesis_session(context.repo, page, session)
+            except (relations.ReconciliationError, files.FileReviewError) as error:
+                session_errors.append(str(error))
+
+        result = self._invoke(run, worktree, prompts, relations.SYNTHESIS_PREFIX,
+                              page.session_id, save_session)
         if isinstance(result, PlanningOutcome):
             return result
+        if session_errors:
+            return self._failure(relations.ReconciliationError("\n".join(session_errors)))
         try:
             receipts = batch_outputs(result.message, relations.SYNTHESIS_PREFIX, "key",
                                      {item.key for item in pages})

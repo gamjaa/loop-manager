@@ -3592,6 +3592,7 @@ _execplan_archive_housekeeping_safe = _bind_effects(
 
 _PlanningAgentPorts = _bind_effects(
     agent_ports._PlanningAgentPorts, lambda: agent_ports.PlanningAgentPortsEffects(
+        _agent_profile=lambda *args, **kwargs: _agent_profile(*args, **kwargs),
         _agent_git_resources=lambda *args, **kwargs: _agent_git_resources(*args, **kwargs),
         _reconciled_manager_scope_metadata=lambda *args, **kwargs: _reconciled_manager_scope_metadata(*args, **kwargs),
         begin_agent_scope=lambda *args, **kwargs: begin_agent_scope(*args, **kwargs),

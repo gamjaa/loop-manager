@@ -39,6 +39,10 @@ def provider_profile(
         raise RuntimeError(f"설정 파일이 없습니다: {config_path}")
     if section not in parser:
         raise RuntimeError(f"{label} 설정 section [{section}]이 없습니다.")
+    # Older configurations share the Planner profile. An explicitly supplied
+    # maintenance profile, including an empty/invalid one, must be validated.
+    if section == f"{provider}.roles" and name == "maintenance_planner" and name not in parser[section]:
+        name = "planner"
     if name not in parser[section]:
         raise RuntimeError(f"{label} 설정이 없습니다: [{section}] {name}")
 
@@ -136,7 +140,7 @@ def validate_provider_profiles(
 ) -> None:
     """Validate every configured role before an Agent state transition."""
 
-    for role_name in ("planner", "reviewer"):
+    for role_name in ("planner", "maintenance_planner", "reviewer"):
         provider_profile(
             config_path,
             provider,

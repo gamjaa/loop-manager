@@ -2,6 +2,19 @@ import hashlib
 import subprocess
 from loop_manager_internal.maintenance import maintenance_file_inventory
 from loop_manager_internal.maintenance import maintenance_file_review as review
+from loop_manager_internal.maintenance import compact_file_review as compact
+
+
+def compact_result(source, content):
+    facts = compact.source_facts(source, content, chunk_bytes=review.MAX_EMBEDDED_SOURCE_BYTES)
+    return {
+        "version": compact.VERSION, "path": source.path, "content_hash": source.content_hash,
+        "mode": source.mode, "source_revision": source.revision,
+        "summary": "The module provides a small calculation boundary without mutable global state.",
+        "chunks": ["The source fragment " + item["opening_excerpt"]
+                   + " establishes this segment's implementation and review boundary."
+                   for item in facts["chunk_reviews"]],
+    }
 
 
 def root_results_for(repository, inventory):

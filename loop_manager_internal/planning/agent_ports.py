@@ -37,7 +37,8 @@ def run_scoped_planner_turn(
     and result validation. Scope cleanup follows only a successful scope check.
     """
     before = agent.begin_scope(role, worktree)
-    result = agent.run_planner(worktree, prompt, session_id, save_session)
+    profile = {"profile_role": "maintenance_planner"} if role == "maintenance_planner" else {}
+    result = agent.run_planner(worktree, prompt, session_id, save_session, **profile)
     if result.session_id:
         save_session(result.session_id)
     scope = agent.finish_scope(role, worktree, before)
@@ -50,6 +51,7 @@ def run_scoped_planner_turn(
 class PlanningAgentPortsEffects:
     """Named effects for _PlanningAgentPorts; no entry-point/module access."""
     _agent_git_resources: Callable[..., object]
+    _agent_profile: Callable[..., object]
     _reconciled_manager_scope_metadata: Callable[..., object]
     begin_agent_scope: Callable[..., object]
     capture_git_snapshot: Callable[..., object]
@@ -87,10 +89,19 @@ class _PlanningAgentPorts:
         prompt: str,
         session_id: str | None,
         on_session_started: Callable[[str], None],
+        *, profile_role: str | None = None,
     ) -> PlanningAgentResult:
         context = self._context
         guard = self._planner_mutex or contextlib.nullcontext()
         with guard:
+            profile_arguments = {}
+            if profile_role is not None:
+                profile = self._effects._agent_profile(
+                    context.config_path, context.provider, profile_role, None, worktree,
+                )
+                profile_arguments["resolved_profile"] = profile
+                self._effects.operation_log(
+                    f"{profile_role} 설정: {context.provider}, {profile.model}, {profile.effort}")
             with self._connection:
                 resumed = notifications.record_work_start(
                     self._connection, context.repo, "Planner",
@@ -111,6 +122,7 @@ class _PlanningAgentPorts:
                     on_session_started=on_session_started,
                     connection=self._connection,
                     invocation=invocation,
+                    **profile_arguments,
                 ), AttemptSequence(context.repo, None)),
                 session_id=session_id,
             )

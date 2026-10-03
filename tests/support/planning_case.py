@@ -388,6 +388,7 @@ class FakeAgentPort:
         _prompt,
         session_id,
         _on_session_started,
+        *, profile_role=None,
     ):
         self.run_count += 1
         self.resumed_session = session_id

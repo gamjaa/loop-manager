@@ -27,6 +27,7 @@ from loop_manager_internal.maintenance.file_review_protocol import (
 from loop_manager_internal.maintenance.file_review_evidence import (
     review_cites_source, unverified_symbols,
 )
+from loop_manager_internal.maintenance import compact_file_review
 from loop_manager_internal.maintenance.maintenance_file_inventory import (
     RootPlacement, SourceInventory, SourceInventoryError, TrackedSource, _git, cached_source_inventory,
     root_placement_inventory,
@@ -75,6 +76,7 @@ class FileReviewProgress:
     next_unit: ReviewUnit | None
     root_placements: tuple[RootPlacement, ...] = ()
     root_reviews: tuple[dict, ...] = ()
+    source_paths: tuple[str, ...] = ()
 
 
 def _strings(value: object, label: str, *, required: bool = False) -> tuple[str, ...]:
@@ -222,11 +224,16 @@ def _validate_chunk_reviews(value: object, content: bytes) -> list[dict]:
     return normalized
 
 
-def parse_review(output: str, source: TrackedSource, content: bytes) -> dict:
+def parse_review(output: str, source: TrackedSource, content: bytes, *,
+                 source_paths: tuple[str, ...] = ()) -> dict:
     """Validate a single Agent result against content actually read from Git."""
     # Bound individual fields and lists below, not the serialized document:
     # mandatory chunk evidence grows with the source and JSON escaping varies.
     result = decode_result(output)
+    if source.reason != ROOT_REVIEW_REASON and "version" in result:
+        result = compact_file_review.expand_result(
+            result, source, content, source_paths, chunk_bytes=MAX_EMBEDDED_SOURCE_BYTES,
+        )
     require_fields(result, ROOT_RESULT_FIELDS if source.reason == ROOT_REVIEW_REASON
                    else FILE_RESULT_FIELDS, "FILE_REVIEW_RESULT")
     if source.reason == ROOT_REVIEW_REASON:
@@ -285,6 +292,8 @@ def parse_review(output: str, source: TrackedSource, content: bytes) -> dict:
 def review_prompt(
     source: TrackedSource, content: bytes, *,
     root_placements: tuple[RootPlacement, ...] = (),
+    compact: bool = False, source_paths: tuple[str, ...] = (),
+    include_contract: bool = True,
 ) -> str:
     """Give the Agent the exact blob for a bounded, single-file review unit."""
     if source.reason == ROOT_REVIEW_REASON:
@@ -328,6 +337,33 @@ def review_prompt(
             "print(b[i*n:(i+1)*n].decode(\"utf-8\",\"backslashreplace\"),end=\"\")' "
             f"{spec} INDEX\n"
         )
+    if compact:
+        if not text.strip():
+            source_instruction += (
+                "검증된 원본은 0 byte이거나 공백만 포함한다. summary에는 실행 코드가 없는 "
+                "사실과 경로에서 확인할 수 있는 역할을 설명하라. 심벌·직접 참조를 만들어내지 마라. "
+                "0 byte이면 chunks는 []이며 공백 byte가 있으면 모든 구간의 공백 인용과 검토 근거가 필요하다.\n"
+            )
+        facts = compact_file_review.source_facts(
+            source, content, source_paths, chunk_bytes=MAX_EMBEDDED_SOURCE_BYTES,
+        )
+        common = (
+            "당신은 유지보수 Planner다. 각 Git blob 전체를 실제로 읽고 파일이나 문서를 수정하지 마라. "
+            "길이만으로 개선을 강제하지 말고 읽기 쉬움, 책임과 외부 연동, 오류 복구, 테스트 경계, "
+            "중복 및 후속 작업의 관련 없는 문맥 감소를 모두 평가하라. 직접 참조·유사 책임 중 "
+            "나중에 확인할 후보만 pending·similar에 남기고 문맥 파일은 완료 대상으로 세지 마라.\n"
+            f"{AGENT_QUALITY_GUIDANCE}\n"
+            "루트 항목의 실제 참조·사용자 경로·소유권·안전한 목적지 조사는 별도 root 조사 단위에서 기록한다. "
+            "이 일반 파일 검토에서 root inventory는 문맥이며 root 전용 결과 필드를 추가하지 마라. "
+            "근거가 불명확하면 이동·삭제 후보로 만들지 마라.\n"
+            "revision-bound root placement inventory: " + json.dumps(
+                [item.__dict__ for item in root_placements], ensure_ascii=False) + "\n"
+            + compact_file_review.result_instructions()
+        ) if include_contract else "이 단위에도 앞의 compact 검토 계약을 적용하라.\n"
+        return (common + f"source identity: {source_location}\n"
+                + "Manager source facts (배열 후보의 index는 0부터): "
+                + json.dumps(facts, ensure_ascii=False, separators=(",", ":")) + "\n"
+                + source_instruction)
     if not text.strip():
         source_instruction += (
             "검증된 원본은 0 byte이거나 공백만 포함한다. excerpts는 []로 기록하고 "
@@ -474,6 +510,7 @@ class ProvisionalReviewRepository:
                     if next_source else None)
         return FileReviewProgress(
             selected, completed, unit, root_placement_inventory(inventory), roots,
+            tuple(source.path for source in inventory.sources),
         )
 
     def pending_units(self, repo: str, progress: FileReviewProgress) -> tuple[ReviewUnit, ...]:

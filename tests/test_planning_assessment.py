@@ -147,7 +147,7 @@ class PlanningAssessmentTest(PlanningCase):
                               cycle_base_sha="a" * 40, revision=4,
                               file_assessment_start_merged_count=0),
         )
-        ports.file_review = SimpleNamespace(progress=mock.Mock(return_value=
+        ports.file_review = SimpleNamespace(pending_units=mock.Mock(return_value=()), progress=mock.Mock(return_value=
             maintenance_file_review.FileReviewProgress((left,), ({"path": left.path},), None)))
         ports.reconciliation = SimpleNamespace(
             progress=mock.Mock(return_value=maintenance_reconciliation.ReconciliationProgress(
@@ -171,7 +171,7 @@ class PlanningAssessmentTest(PlanningCase):
 
         outcome = coordinator._assessment._run_planner_turn(run)
 
-        self.assertEqual(outcome.kind, PlanningOutcomeKind.WAITING)
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.ASSESSMENT_PROGRESS)
         self.assertEqual(ports.agent.resumed_session, "saved-relation-session")
         self.assertEqual(ports.reconciliation.complete.call_count, 1)
         self.assertEqual(ports.reconciliation.fail.call_count, 0)
@@ -193,6 +193,7 @@ class PlanningAssessmentTest(PlanningCase):
             "engine.py", "internal_implementation", "root source candidate",
         )
         ports.file_review = SimpleNamespace(
+            pending_units=mock.Mock(return_value=(unit,)),
             progress=mock.Mock(return_value=maintenance_file_review.FileReviewProgress(
                 (source,), (), unit, (root_placement,),
             )),
@@ -215,7 +216,7 @@ class PlanningAssessmentTest(PlanningCase):
 
         outcome = coordinator._assessment._run_planner_turn(run)
 
-        self.assertEqual(outcome.kind, PlanningOutcomeKind.WAITING)
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.ASSESSMENT_PROGRESS)
         self.assertEqual(ports.agent.resumed_session, "saved-session")
         self.assertEqual(ports.agent.run_count, 1)
         prompt = ports.agent.run_planner.call_args.args[1]
@@ -508,10 +509,10 @@ class ScopedPlannerTurnTests(PlanningCase):
         agent.begin_scope = mock.Mock(side_effect=lambda *args: events.append(("begin", args)) or before)
         original = agent.run_planner
 
-        def invoke(worktree, prompt, session, callback):
+        def invoke(worktree, prompt, session, callback, **kwargs):
             events.append(("run", session))
             callback("started")
-            return original(worktree, prompt, session, callback)
+            return original(worktree, prompt, session, callback, **kwargs)
 
         agent.run_planner = mock.Mock(side_effect=invoke)
         agent.finish_scope = mock.Mock(side_effect=lambda *args: events.append(("finish", args)) or (scope or PlanningScopeResult()))
@@ -577,21 +578,26 @@ class ScopedPlannerTurnTests(PlanningCase):
         run.planning_worktree = Path("/tree")
         run.maintenance_context = object()
         source = TrackedSource("src/calc.py", "b" * 64, "100644", "base", "source code")
-        unit = SimpleNamespace(source=source, session_id="owner", error=None, receipt=None)
-        relation = SimpleNamespace(left=source, right=source)
-        page = SimpleNamespace(index=0, total=1, session_id="owner", key="key")
+        unit = SimpleNamespace(source=source, session_id="owner", error=None, receipt=None, index=0)
+        other = TrackedSource("src/other.py", "c" * 64, "100644", "base", "source code")
+        relation = SimpleNamespace(left=source, right=other, key="relation-key")
+        page = SimpleNamespace(index=0, total=1, session_id="owner", key="key", text="evidence")
         port = mock.Mock()
         ports.reconciliation = port
-        port.progress.return_value = SimpleNamespace(pending_scan=False, next_relation=relation)
+        port.progress.return_value = SimpleNamespace(pending_scan=False, next_relation=relation,
+                                                     completed=(), relations=(relation,))
         port.content.return_value = b"content"
         port.unit.return_value = ("owner", None)
         port.synthesis.return_value = page
+        port.synthesis_batch.return_value = (page,)
+        port.resolution_batch.return_value = (unit,)
         port.synthesis_export.return_value = Path("/manifest")
         port.findings_unit.return_value = (unit, Path("/manifest"))
         service = coordinator._assessment
         if name == "review":
             ports.file_review = port
-            port.progress.return_value = SimpleNamespace(next_unit=unit, root_placements=())
+            port.progress.return_value = maintenance_file_review.FileReviewProgress((source,), (), unit)
+            port.pending_units.return_value = (unit,)
             invoke = lambda: service._review_one_file(run, run.planning_worktree)
             save, complete = port.session, port.complete
             prompt = "maintenance_file_review.review_prompt"
@@ -632,8 +638,9 @@ class ScopedPlannerTurnTests(PlanningCase):
                         # by the real protocol tests below.
                         if not denied and kind is PlanningAgentResultKind.SUCCESS:
                             continue
+                        module = "assessment_service" if name == "findings" else "assessment_batches"
                         with mock.patch("loop_manager_internal.planning.assessment_service." + prompt, return_value="prompt"), mock.patch(
-                            "loop_manager_internal.planning.assessment_service.run_scoped_planner_turn", wraps=run_scoped_planner_turn) as helper:
+                            "loop_manager_internal.planning." + module + ".run_scoped_planner_turn", wraps=run_scoped_planner_turn) as helper:
                             outcome = invoke()
                         helper.assert_called_once()
                         self.assertEqual(ports.agent.resumed_session, "owner")
@@ -682,6 +689,8 @@ class ScopedPlannerTurnTests(PlanningCase):
             with self.subTest(failure=failure):
                 ports, run, invoke, save, complete, prompt = self._unit_case("synthesis")
                 ports.agent, events, _ = self._observed_agent()
+                ports.agent.result = PlanningAgentResult(0, 'SYNTHESIS_PAGE_RESULT: {"key":"key"}',
+                    "session-1", PlanningAgentResultKind.SUCCESS)
                 if failure == "session":
                     save.side_effect = maintenance_reconciliation.ReconciliationError("session failed")
                 else:
@@ -730,9 +739,14 @@ with (mock.patch.object(sqlite3, "connect", side_effect=AssertionError("DB at im
                             raise error
                     save.side_effect = store
                     with mock.patch("loop_manager_internal.planning.assessment_service." + prompt, return_value="prompt"):
-                        with self.assertRaises(maintenance_reconciliation.ReconciliationError) as caught:
-                            invoke()
-                    self.assertIs(caught.exception, error)
+                        if name == "relation":
+                            outcome = invoke()
+                            self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+                            self.assertEqual(outcome.detail, str(error))
+                        else:
+                            with self.assertRaises(maintenance_reconciliation.ReconciliationError) as caught:
+                                invoke()
+                            self.assertIs(caught.exception, error)
                     ports.agent.finish_scope.assert_not_called()
                     ports.agent.clear_scope.assert_not_called()
                     complete.assert_not_called()
@@ -746,6 +760,9 @@ with (mock.patch.object(sqlite3, "connect", side_effect=AssertionError("DB at im
                 ports, run, invoke, save, complete, prompt = self._unit_case(name)
                 ports.agent, events, _ = self._observed_agent()
                 port = ports.file_review if name == "review" else ports.reconciliation
+                output = ('FILE_REVIEW_RESULT: {"path":"src/calc.py"}' if name == "review"
+                          else 'RELATION_RESULT: {"key":"relation-key"}')
+                ports.agent.result = PlanningAgentResult(0, output, "session-1", PlanningAgentResultKind.SUCCESS)
                 port.content.side_effect = [b"old", b"new"] if name == "review" else [b"old-left", b"old-right", b"new-left", b"new-right"]
                 with mock.patch("loop_manager_internal.planning.assessment_service." + prompt, return_value="prompt"), mock.patch(
                     "loop_manager_internal.planning.assessment_service." + parser, side_effect=error_type("source changed")) as parse:

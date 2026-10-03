@@ -16,7 +16,7 @@ from loop_manager_internal.planning.planning_contracts import (
     PlanningAgentResult, PlanningAgentResultKind, PlanningOutcome, PlanningOutcomeKind,
     PlanningScopeResult, PlanningStepResult,
 )
-from tests.support.maintenance import result_for
+from tests.support.maintenance import result_for, compact_result
 
 
 REVISION = "a" * 40
@@ -50,7 +50,7 @@ class AssessmentBatchTest(unittest.TestCase):
         self.worktree = Path("/worktree")
 
     def answer(self, output, kind=PlanningAgentResultKind.SUCCESS):
-        def invoke(worktree, prompt, session, callback):
+        def invoke(worktree, prompt, session, callback, **kwargs):
             callback("batch-session")
             return PlanningAgentResult(0 if kind is PlanningAgentResultKind.SUCCESS else 1,
                                        output, "batch-session", kind)
@@ -85,6 +85,24 @@ class AssessmentBatchTest(unittest.TestCase):
         self.assertEqual(self.runner.review_files(self.run, self.worktree).kind,
                          PlanningOutcomeKind.ASSESSMENT_PROGRESS)
         self.assertEqual(len(self.saved()), 3)
+
+    def test_compact_batch_uses_one_contract_and_saves_legacy_compatible_receipts(self):
+        outputs = []
+        for source in self.sources:
+            payload = compact_result(source, self.contents[source.path])
+            payload["symbols"] = [0]
+            outputs.append(files.RESULT_PREFIX + json.dumps(payload))
+        self.answer("\n".join(outputs))
+        self.assertEqual(self.runner.review_files(self.run, self.worktree).kind,
+                         PlanningOutcomeKind.ASSESSMENT_PROGRESS)
+        self.assertEqual(len(self.saved()), 3)
+        prompt = self.agent.run_planner.call_args.args[1]
+        self.assertEqual(prompt.count("summary는 책임과 종합 판단"), 1)
+        self.assertEqual(self.agent.run_planner.call_args.kwargs["profile_role"], "maintenance_planner")
+        for parsed, source in zip(self.saved(), self.sources):
+            self.assertNotIn("version", parsed)
+            self.assertEqual(files.parse_review(files.RESULT_PREFIX + json.dumps(parsed), source,
+                                                self.contents[source.path]), parsed)
 
     def test_missing_receipt_saves_valid_files_and_resumes_only_unfinished_unit(self):
         self.answer(self.file_output(self.sources[:2]))
@@ -130,7 +148,7 @@ class AssessmentBatchTest(unittest.TestCase):
         self.assertEqual(self.saved(), [])
 
     def test_remote_change_after_call_rejects_unverified_receipts(self):
-        def invoke(*args):
+        def invoke(*args, **kwargs):
             args[3]("batch-session")
             self.port.content.side_effect = SourceInventoryError("remote advanced")
             return PlanningAgentResult(0, self.file_output(), "batch-session", PlanningAgentResultKind.SUCCESS)
