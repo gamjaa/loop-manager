@@ -886,6 +886,7 @@ _scope_observation_effects = _bind_effects(
 _scope_validation_effects = _bind_effects(
     agent_adapter._scope_validation_effects, lambda: agent_adapter.ScopeValidationEffectsEffects(
         _agent_git_resources=lambda *args, **kwargs: _agent_git_resources(*args, **kwargs),
+        capture_git_snapshot=lambda *args, **kwargs: capture_git_snapshot(*args, **kwargs),
         _current_rebase_service=lambda *args, **kwargs: _current_rebase_service(*args, **kwargs),
         _git_common_directory=lambda *args, **kwargs: _git_common_directory(*args, **kwargs),
         _owned_rebase_state_dir=lambda *args, **kwargs: _owned_rebase_state_dir(*args, **kwargs),

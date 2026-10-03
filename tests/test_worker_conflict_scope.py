@@ -33,11 +33,14 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
             status=loop_manager.managed_rebase_validation.RebaseStatus.WAITING))
         for patcher in (
             mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=lambda *_: self.after),
+            mock.patch.object(loop_manager, '_scope_snapshot_with_start_ignore_rules',
+                              side_effect=lambda _worktree, _before, after: after),
             mock.patch.object(loop_manager, '_owned_rebase_state_dir', return_value=Path('/state')),
             mock.patch.object(loop_manager, '_current_rebase_service', return_value=self.service),
             mock.patch.object(loop_manager, 'validate_active_execplan_metadata', return_value={'id': 'G-092'}),
             mock.patch.object(loop_manager, 'validate_managed_worktree'),
             mock.patch.object(loop_manager, 'git', side_effect=AssertionError('unit test has no Git writes')),
+            mock.patch.object(loop_manager, 'git_bytes', return_value=b''),
         ):
             patcher.start()
             self.addCleanup(patcher.stop)
@@ -62,3 +65,165 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
             self.after = replace(self.after, index={'app.py': (f'{tag} 100644 resolved 0',)})
             with self.subTest(tag=tag), self.assertRaisesRegex(loop_manager.AgentScopeError, 'index flags'):
                 self.validate()
+
+    def completed_rebase(self):
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        ExecutionCheckpointRepository(self.connection).record(
+            '/repo', 'G-092', expected_generation=0, operation='rebase',
+            expected_head='before', target_base_oid='base', observed_remote_oid='remote', snapshot={})
+        self.after = replace(self.after, head='completed', branch='loop-manager/G-092',
+            dirty={}, operations={}, refs={'refs/heads/loop-manager/G-092': ('completed', '')},
+            worktrees={'/managed': ('HEAD=completed', 'branch=refs/heads/loop-manager/G-092')})
+        self.completion_observation = SimpleNamespace(head='completed',
+            repository_state_fingerprint=loop_manager.managed_rebase_validation.fingerprint({
+                'refs': self.after.refs, 'worktrees': self.after.worktrees, 'config': self.after.config}))
+        self.service.require_owned.return_value = (self.completion_observation, SimpleNamespace(
+            status=loop_manager.managed_rebase_validation.RebaseStatus.COMPLETE))
+
+    def test_worker_completed_owned_rebase_accepts_head_ref_index_and_operation_transition(self):
+        self.completed_rebase()
+        self.assertEqual(self.validate(), {'id': 'G-092'})
+        self.service.require_owned.assert_called_once()
+
+    def test_worker_completed_rebase_requires_current_ownership_and_remote_lease(self):
+        self.completed_rebase()
+        self.service.require_owned.side_effect = RuntimeError('remote or ownership differs')
+        with self.assertRaisesRegex(loop_manager.AgentScopeError, 'HEAD 변경'):
+            self.validate()
+
+    def test_owned_completion_with_all_commits_skipped_accepts_unchanged_head(self):
+        self.completed_rebase()
+        self.before = replace(self.before, head='completed')
+        self.assertEqual(self.validate(), {'id': 'G-092'})
+
+    def test_completed_rebase_uses_real_current_result_policy(self):
+        from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseService
+        from loop_manager_internal.git.managed_rebase_validation import FileChange
+        from tests.support.rebase_observations import expectation, observation, scope_for
+        self.completed_rebase()
+        expected = expectation(plan_id='G-092', plan_path=self.plan['path'],
+            worktree='/managed', branch='loop-manager/G-092')
+        expected = replace(expected, remote=replace(expected.remote, branch=expected.branch))
+        observed = observation(expected, head=self.after.head,
+            branch_ref=self.after.refs[f'refs/heads/{expected.branch}'],
+            registration=self.after.worktrees['/managed'],
+            repository_state_fingerprint=self.completion_observation.repository_state_fingerprint)
+        service = ManagedRebaseService(expected, mock.Mock())
+        with mock.patch.object(loop_manager, '_current_rebase_service', return_value=service), \
+             mock.patch('loop_manager_internal.git.managed_rebase_adoption.observe_current_rebase',
+                        return_value=(observed, scope_for(expected, observed))) as read:
+            self.assertEqual(self.validate(), {'id': 'G-092'})
+            for invalid in (
+                replace(observed, base_is_ancestor=False),
+                replace(observed, identity_verified=False),
+                replace(observed, remote=replace(observed.remote, oid='foreign')),
+                replace(observed, input_fingerprint='changed-input'),
+                replace(observed, committed=(FileChange('AGENTS.md', '100644', '100644', 'old', 'new', 'M'),)),
+                replace(observed, index_clean=False),
+            ):
+                with self.subTest(observed=invalid):
+                    read.return_value = (invalid, scope_for(expected, invalid))
+                    with self.assertRaises(loop_manager.AgentScopeError):
+                        self.validate()
+
+    def test_saved_completion_is_accepted_after_rebase_adoption(self):
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        from tests.support.rebase_observations import expectation, observation, decision_for
+        self.completed_rebase()
+        expected = expectation(plan_id='G-092', plan_path=self.plan['path'],
+            worktree='/managed', branch='loop-manager/G-092')
+        expected = replace(expected, remote=replace(expected.remote, branch=expected.branch))
+        observed = observation(expected, head=self.after.head, branch_ref=('completed', ''),
+            registration=self.after.worktrees['/managed'])
+        acceptance = decision_for(expected, observed).acceptance
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        current = checkpoints.get('/repo', 'G-092')
+        checkpoints.record('/repo', 'G-092', expected_generation=current.generation,
+            operation=None, expected_head='completed', target_base_oid='base',
+            observed_remote_oid='remote', snapshot={'current_rebase_acceptance': acceptance})
+        before_serialized, after_serialized = self.before.serialize(), self.after.serialize()
+        loop_manager.validate_agent_scope('worker', self.worktree,
+            loop_manager.GitSnapshot.deserialize(before_serialized),
+            loop_manager.GitSnapshot.deserialize(after_serialized),
+            selected_plan_path=self.plan['path'], external_worktree=self.repo, connection=self.connection,
+            owned_rebase=True)
+        self.assertEqual(self.before.serialize(), before_serialized)
+        self.assertEqual(self.after.serialize(), after_serialized)
+
+    def test_blocked_scope_accepts_saved_worker_completion_without_erasing_snapshots(self):
+        self.completed_rebase()
+        before_serialized, after_serialized = self.before.serialize(), self.after.serialize()
+        self.connection.execute("UPDATE exec_plans SET agent_role='worker', agent_snapshot=?, "
+            "agent_result_snapshot=? WHERE plan_id='G-092'", (before_serialized, after_serialized))
+        plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        with mock.patch.object(loop_manager, '_guidance_worker_targets', return_value=()), \
+             mock.patch.object(loop_manager, '_published_plan_allows_common_plans', return_value=False), \
+             mock.patch.object(loop_manager, 'requirement_archive_candidates', return_value=()), \
+             mock.patch.object(loop_manager, '_proven_manager_base_refs', return_value=frozenset()), \
+             mock.patch.object(loop_manager, '_proven_merged_cleanup_paths', return_value=frozenset()), \
+             mock.patch.object(loop_manager, '_reconciled_manager_scope_metadata',
+                               side_effect=lambda _c, _p, _s, _r, _id, value, *_args: value):
+            loop_manager.validate_blocked_agent_scope(self.connection, self.repo, str(self.repo),
+                'main', self.worktree, plan['path'], accepted_rebase=True, saved_plan=plan)
+        saved = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual(saved['agent_snapshot'], before_serialized)
+        self.assertEqual(saved['agent_result_snapshot'], after_serialized)
+
+    def test_worker_completed_rebase_cannot_accept_stale_saved_result_or_observation(self):
+        self.completed_rebase()
+        with mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=replace(self.after, head='later')):
+            with self.assertRaises(loop_manager.AgentScopeError):
+                loop_manager.validate_agent_scope('worker', self.worktree, self.before, self.after,
+                    selected_plan_path=self.plan['path'], external_worktree=self.repo,
+                    connection=self.connection)
+        self.completion_observation.repository_state_fingerprint = 'older-state'
+        with self.assertRaises(loop_manager.AgentScopeError):
+            self.validate()
+
+    def test_completed_rebase_preserves_unrelated_metadata_checks(self):
+        self.completed_rebase()
+        completed = self.after
+        for after in (
+            replace(completed, refs={**completed.refs, 'refs/heads/foreign': ('foreign', '')}),
+            replace(completed, worktrees={**completed.worktrees, '/other': ('HEAD=foreign',)}),
+            replace(completed, config={'local:core.hooksPath': ('foreign',)}),
+        ):
+            with self.subTest(after=after):
+                self.after = after
+                self.completion_observation.repository_state_fingerprint = (
+                    loop_manager.managed_rebase_validation.fingerprint({
+                        'refs': after.refs, 'worktrees': after.worktrees, 'config': after.config}))
+                with self.assertRaises(loop_manager.AgentScopeError):
+                    self.validate()
+
+    def test_completion_observation_race_preserves_head_violation(self):
+        self.completed_rebase()
+        with mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=(
+                self.after, replace(self.after, index={'app.py': ('H 100644 raced 0',)}))):
+            with self.assertRaisesRegex(loop_manager.AgentScopeError, 'HEAD 변경'):
+                loop_manager.validate_agent_scope('worker', self.worktree, self.before, self.after,
+                    selected_plan_path=self.plan['path'], external_worktree=self.repo,
+                    connection=self.connection)
+
+    def test_completed_rebase_preserves_index_security_flag_changes(self):
+        self.completed_rebase()
+        original_before, original_after = self.before, self.after
+        for before, after in (
+            (original_before, replace(original_after, index={'app.py': ('S 100644 resolved 0',)})),
+            (replace(original_before, index={'app.py': ('s 100644 old 0',)}), original_after),
+        ):
+            with self.subTest(before=before, after=after):
+                self.before, self.after = before, after
+                with self.assertRaisesRegex(loop_manager.AgentScopeError, 'index flags'):
+                    self.validate()
+
+    def test_general_worker_and_reviewer_cannot_borrow_completed_rebase(self):
+        self.completed_rebase()
+        self.before = replace(self.before, branch='loop-manager/G-092', operations={})
+        with self.assertRaisesRegex(loop_manager.AgentScopeError, 'HEAD 변경'):
+            self.validate()
+        self.before = replace(self.before, branch=None, operations={'rebase-merge': 'owned'})
+        with self.assertRaisesRegex(loop_manager.AgentScopeError, 'HEAD 변경'):
+            loop_manager.validate_agent_scope('reviewer', self.worktree, self.before, self.after,
+                selected_plan_path=self.plan['path'], external_worktree=self.repo,
+                connection=self.connection)

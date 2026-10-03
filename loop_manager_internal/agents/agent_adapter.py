@@ -84,6 +84,7 @@ class ScopeValidationEffectsEffects:
     _rebase_in_progress_for_branch: Callable[..., object]
     _scope_snapshot_with_start_ignore_rules: Callable[..., object]
     agent_snapshot_changes: Callable[..., object]
+    capture_git_snapshot: Callable[..., object]
     git: Callable[..., object]
     operation_log: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
@@ -100,6 +101,7 @@ def _scope_validation_effects(effects: ScopeValidationEffectsEffects, ) -> scope
         _rebase_in_progress_for_branch=effects._rebase_in_progress_for_branch,
         _scope_snapshot_with_start_ignore_rules=effects._scope_snapshot_with_start_ignore_rules,
         agent_snapshot_changes=effects.agent_snapshot_changes,
+        capture_git_snapshot=effects.capture_git_snapshot,
         git=effects.git,
         operation_log=effects.operation_log,
         validate_managed_worktree=effects.validate_managed_worktree,

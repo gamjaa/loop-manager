@@ -18,7 +18,7 @@ from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode, BlockScope
 from loop_manager_internal.git import managed_rebase_validation
-from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseService
+from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseService, selected_baseline
 
 
 @dataclass(frozen=True)
@@ -35,6 +35,7 @@ class ScopeValidationEffects:
     _rebase_in_progress_for_branch: Callable[..., bool]
     _scope_snapshot_with_start_ignore_rules: Callable[..., GitSnapshot]
     agent_snapshot_changes: Callable[..., list[AgentChange]]
+    capture_git_snapshot: Callable[..., GitSnapshot]
     git: Callable[..., subprocess.CompletedProcess[str]]
     operation_log: Callable[..., None]
     validate_managed_worktree: Callable[..., None]
@@ -109,6 +110,58 @@ def _agent_git_resources(
     return resources
 
 
+def _completed_worker_rebase_baseline(
+    role: str, worktree: Path, before: GitSnapshot, after: GitSnapshot,
+    selected_plan_path: str | None, repo_path: Path | None,
+    connection: sqlite3.Connection | None, effects: ScopeValidationEffects,
+) -> GitSnapshot:
+    """Accept only a live, owned completion of a scope begun during rebase.
+
+    The current-result service checks files, index, inputs, reservation and
+    remote/PR leases. Other refs, worktrees and config retain their old baseline.
+    A saved result from a different Git state cannot borrow this acceptance.
+    """
+    if (role != 'worker' or connection is None or repo_path is None
+            or not selected_plan_path or before.branch is not None
+            or not {'rebase-merge', 'rebase-apply'}.intersection(before.operations)
+            or after.branch is None):
+        return before
+    plan_id = effects._plan_id_from_path(selected_plan_path)
+    if not plan_id:
+        return before
+    repo = str(repo_path)
+    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id)
+    if (checkpoint.operation != 'rebase' and not managed_rebase_validation.valid_acceptance(
+            (checkpoint.snapshot or {}).get('current_rebase_acceptance'))):
+        return before
+    plan = effects.repository(connection).scope_owner(repo, plan_id)
+    state_dir = effects._owned_rebase_state_dir(repo, plan_id, worktree)
+    if plan is None or state_dir is None:
+        return before
+    try:
+        live = effects.capture_git_snapshot(worktree)
+        if not agent_scope_decision._same_local_snapshot(live, after):
+            return before
+        observed, verdict = effects._current_rebase_service(
+            connection, repo_path, state_dir, repo, plan_id, worktree,
+            plan['branch']).require_owned(checkpoint=checkpoint)
+        if verdict.status is not managed_rebase_validation.RebaseStatus.COMPLETE:
+            return before
+        if effects.capture_git_snapshot(worktree) != live:
+            return before
+        key, ref = str(_canonical_path(worktree)), f"refs/heads/{plan['branch']}"
+        if (observed.head != after.head
+                or not agent_scope_decision._same_local_snapshot(live, after)
+                or live.refs.get(ref) != after.refs.get(ref)
+                or live.worktrees.get(key) != after.worktrees.get(key)
+                or observed.repository_state_fingerprint != managed_rebase_validation.fingerprint({
+                    'refs': live.refs, 'worktrees': live.worktrees, 'config': live.config})):
+            return before
+        return selected_baseline(before, after, plan['branch'], key)
+    except (RuntimeError, OSError, ValueError):
+        return before
+
+
 def validate_agent_scope(
     role_name: str,
     worktree: Path,
@@ -136,7 +189,19 @@ def validate_agent_scope(
             connection, external_worktree, worktree, before, role_name,
             selected_plan_path=selected_plan_path,
         )
+    original = before
+    before = _completed_worker_rebase_baseline(
+        role_name, worktree, before, after, selected_plan_path,
+        external_worktree, connection, effects)
     changes = effects.agent_snapshot_changes(worktree, before, after)
+    if before is not original:
+        # Completion changes stage/OID normally, but never excuses security
+        # flag changes, including flags removed before the final observation.
+        changes.extend(AgentChange(path, ('index flags',))
+                       for path in original.index.keys() | after.index.keys()
+                       if agent_scope_decision.index_security_flags(original.index.get(path, ()))
+                       != agent_scope_decision.index_security_flags(after.index.get(path, ())))
+        owned_rebase = True
     violations: list[str] = []
     violation_reason = BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION
     external_key = (

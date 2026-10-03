@@ -188,6 +188,25 @@ class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
         self.fixture.effects.validation.verify.assert_not_called()
         self.fixture.effects.agent.run_agent.assert_not_called()
 
+    def test_worker_completed_rebase_is_adopted_without_repeating_git_and_requires_revalidation(self):
+        context = replace(self.fixture.context(), resolving_rebase=True)
+        with mock.patch.object(self.handler, '_stage_rebase_correction',
+                               side_effect=AssertionError('completed rebase must not be staged')), \
+             mock.patch.object(self.handler, '_execute_rebase_step',
+                               side_effect=AssertionError('completed rebase must not continue')):
+            result = self.handler._finish_worker(context, self.state.row(), VALID_WORKER_RESULT)
+        self.assertEqual(result.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
+        saved = self.checkpoint.get('repo', 'G-047')
+        self.assertIsNone(saved.operation)
+        self.assertEqual(saved.expected_head, 'owned-head')
+        row = self.state.row()
+        self.assertEqual(row['phase'], 'WORKING')
+        self.assertEqual(row['worker_session_id'], 'saved-worker')
+        for field in ('worker_result', 'worker_input_token', 'verify_result', 'review_result',
+                      'verify_token', 'review_token', 'publication_token'):
+            self.assertIsNone(row[field], field)
+        self.fixture.effects.validation.verify.assert_not_called()
+
     def test_stale_or_out_of_scope_current_result_preserves_checkpoint_and_audit(self):
         from loop_manager_internal.git.managed_rebase_validation import FileChange
         original = self.checkpoint.get('repo', 'G-047')
