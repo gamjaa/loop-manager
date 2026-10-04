@@ -146,6 +146,27 @@ class RunnerTests(TestCase):
         self.assertEqual(result.code, 0)
         self.assertEqual(result.collection_status, "error")
 
+    def test_auxiliary_collection_error_keeps_success_and_usage_in_ledger(self):
+        class Provider:
+            def run(self, request):
+                return manager.AgentResult(
+                    0, "done", "session", usage=invocation.Usage(10, 4, None, 2),
+                    collection_status="error",
+                )
+
+        with mock.patch.object(manager, "agent_provider", return_value=Provider()):
+            result = manager.run_agent(
+                "codex", Path("/worktree"), Path("/state"), Path("/config"),
+                "planner", "secret", read_only=False, connection=self.connection,
+                invocation=invocation.InvocationContext("repo", None),
+                resolved_profile=manager.AgentProfile("model", "low"),
+            )
+        row = self.connection.execute("""SELECT result_kind, result_code, session_id,
+            collection_status, input_tokens, cached_input_tokens, output_tokens
+            FROM agent_invocations""").fetchone()
+        self.assertEqual(result.code, 0)
+        self.assertEqual(tuple(row), ("success", 0, "session", "error", 10, 4, 2))
+
     def test_profile_observation_failure_does_not_replace_provider_result(self):
         class Provider:
             def run(self, request):
@@ -186,6 +207,49 @@ class RunnerTests(TestCase):
         rows = self.connection.execute("SELECT result_kind, transition_cause FROM agent_invocations ORDER BY attempt").fetchall()
         self.assertEqual([tuple(row) for row in rows],
                          [("timeout", None), ("success", "timeout")])
+
+    def test_timeout_spellings_share_timeout_ledger_kind(self):
+        class Provider:
+            def run(self, request):
+                return manager.AgentResult(1, self.message)
+
+        for message in ("Agent CLI timeout", "Agent CLI timed out"):
+            with self.subTest(message=message), \
+                 mock.patch.object(manager, "_agent_profile",
+                                   return_value=manager.AgentProfile("model", "low")), \
+                 mock.patch.object(manager, "agent_provider", return_value=Provider()):
+                Provider.message = message
+                result = manager.run_agent(
+                    "codex", Path("/worktree"), Path("/state"), Path("/config"),
+                    "planner", "secret", read_only=False, connection=self.connection,
+                    invocation=invocation.InvocationContext("repo", None),
+                    resolved_profile=manager.AgentProfile("model", "low"),
+                )
+            self.assertEqual(result.ledger_kind, "timeout")
+        rows = self.connection.execute(
+            "SELECT result_kind FROM agent_invocations ORDER BY rowid"
+        ).fetchall()
+        self.assertEqual([row["result_kind"] for row in rows], ["timeout", "timeout"])
+
+    def test_latest_attempt_without_final_session_clears_saved_session(self):
+        class Provider:
+            def run(self, request):
+                self_outer.assertEqual(request.session_id, "saved-session")
+                return manager.AgentResult(1, "configuration error")
+
+        self_outer = self
+        with mock.patch.object(manager, "agent_provider", return_value=Provider()):
+            manager.run_agent(
+                "codex", Path("/worktree"), Path("/state"), Path("/config"),
+                "planner", "secret", read_only=False, session_id="saved-session",
+                connection=self.connection,
+                invocation=invocation.InvocationContext("repo", None),
+                resolved_profile=manager.AgentProfile("model", "low"),
+            )
+        row = self.connection.execute(
+            "SELECT session_id, result_kind FROM agent_invocations"
+        ).fetchone()
+        self.assertEqual(tuple(row), (None, "permanent_configuration"))
 
     def test_replacement_context_marks_first_process_and_retry_cause(self):
         attempts = invocation.AttemptSequence(

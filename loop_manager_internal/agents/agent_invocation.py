@@ -68,6 +68,11 @@ def classify_agent_result(code: int, message: str) -> AgentResultKind:
     return AgentResultKind.PERMANENT_CONFIGURATION
 
 
+def timeout_message(message: str) -> bool:
+    """Recognize the timeout spellings used by providers and process wrappers."""
+    return bool(re.search(r"\btimeout\b|\btimed out\b", message, re.I))
+
+
 @dataclass(frozen=True)
 class Usage:
     input_tokens: int | None = None
@@ -106,7 +111,7 @@ class AgentResult:
     @property
     def ledger_kind(self) -> str:
         if (self.result_kind is AgentResultKind.TRANSIENT_FAILURE
-                and "timeout" in self.message.casefold()):
+                and timeout_message(self.message)):
             return "timeout"
         return self.result_kind.value
 
