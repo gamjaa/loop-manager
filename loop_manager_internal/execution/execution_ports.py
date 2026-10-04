@@ -97,6 +97,7 @@ class ExecutionLifecyclePortsEffects:
     _current_rebase_service: Callable[..., object]
     _git_operation_entries: Callable[..., object]
     _guidance_worker_targets: Callable[..., object]
+    prepare_guidance_preapprovals: Callable[..., object]
     _path_signature: Callable[..., object]
     _plan_id_from_path: Callable[..., object]
     _published_plan_allows_common_plans: Callable[..., object]
@@ -204,6 +205,7 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
             _worktree_execplan_input_fingerprint=state.bind(dependencies._worktree_execplan_input_fingerprint, name="_worktree_execplan_input_fingerprint", connected=False, mutates=False),
             _revision_execplan_input_fingerprint=state.bind(dependencies._revision_execplan_input_fingerprint, name="_revision_execplan_input_fingerprint", connected=False, mutates=False),
             _guidance_worker_targets=state.bind(dependencies._guidance_worker_targets, name="_guidance_worker_targets", connected=True, mutates=False),
+            prepare_guidance_preapprovals=state.bind(dependencies.prepare_guidance_preapprovals, name="prepare_guidance_preapprovals", connected=True, mutates=True),
             guidance_resume_context=state.bind(dependencies.guidance_resume_context, name="guidance_resume_context", connected=True, mutates=False),
             _published_plan_allows_common_plans=state.bind(dependencies._published_plan_allows_common_plans, name="_published_plan_allows_common_plans", connected=False, mutates=False),
             is_loop_manager_repository=state.bind(dependencies.is_loop_manager_repository, name="is_loop_manager_repository", connected=False, mutates=False),

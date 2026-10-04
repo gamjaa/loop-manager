@@ -267,6 +267,7 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - 공통 내용이 없는 `AGENTS.md`는 사용자 확인 후 강제 등록할 수 있다
 - `AGENTS.md` 포함 검사와 `docs/PLANS.md` 해시 검사는 프로젝트 등록 시 선택한 원격 commit blob에만 수행하며 자동 Loop에서는 반복하지 않는다
 - 자동 작업의 기준은 `origin/<base-branch>`다
+- 사용자는 원격 기준에 게시하는 ExecPlan의 정확한 AGENTS.md Proposal과 User Decision으로 사전 승인할 수 있다. Worker 시작 전에 결정과 당시 기준 파일을 대조하고 유효한 patch만 허용한다. 기준이 바뀌면 재승인을 기다리며 로컬 본문·포괄적 허락·Agent가 작성한 승인은 인정하지 않는다. 실제 결과와 최신 base 검증, Review와 사용자 Merge는 유지한다.
 - 기본 worktree의 로컬 변경, checkout branch와 ahead·diverged 이력은 자동 작업을 막지 않으며 local-only 내용은 자동 입력에 포함하지 않는다
 
 - 기본 worktree의 안전한 동기화가 불가능하면 이유를 기록하고 로컬 상태를 보존하며 원격 SHA 기반 작업을 계속한다. 검증된 safe fast-forward 외의 기본 worktree 변경은 수행하지 않는다.

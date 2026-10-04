@@ -315,6 +315,7 @@ from loop_manager_internal.catalog import legacy_migration
 from loop_manager_internal.catalog import project_selection
 from loop_manager_internal.catalog import requirement_archive_service
 from loop_manager_internal.documents import guidance_service
+from loop_manager_internal.documents import guidance_preapproval
 from loop_manager_internal.documents import pr_description
 from loop_manager_internal.execution import execution_ports
 from loop_manager_internal.execution import plan_validation
@@ -2763,6 +2764,18 @@ _guidance_rows = _bind_effects(
 
 _guidance_worker_targets = guidance_service._guidance_worker_targets
 
+prepare_guidance_preapprovals = _bind_effects(
+    guidance_preapproval.prepare_guidance_preapprovals,
+    lambda: guidance_preapproval.PrepareGuidancePreapprovalsEffects(
+        _guidance_document=lambda *args, **kwargs: _guidance_document(*args, **kwargs),
+        _guidance_rows=lambda *args, **kwargs: _guidance_rows(*args, **kwargs),
+        _invalidate_guidance_approval=lambda *args, **kwargs: _invalidate_guidance_approval(*args, **kwargs),
+        _validate_guidance_proposal_scope=lambda *args, **kwargs: _validate_guidance_proposal_scope(*args, **kwargs),
+        git=lambda *args, **kwargs: git(*args, **kwargs),
+        is_loop_manager_repository=lambda *args, **kwargs: is_loop_manager_repository(*args, **kwargs),
+    ),
+)
+
 _published_plan_allows_common_plans = _bind_effects(
     guidance_service._published_plan_allows_common_plans, lambda: guidance_service.PublishedPlanAllowsCommonPlansEffects(
         git=lambda *args, **kwargs: git(*args, **kwargs),
@@ -3951,6 +3964,7 @@ _ExecutionLifecyclePorts = _bind_effects(
         _current_rebase_service=lambda *args, **kwargs: _current_rebase_service(*args, **kwargs),
         _git_operation_entries=lambda *args, **kwargs: _git_operation_entries(*args, **kwargs),
         _guidance_worker_targets=lambda *args, **kwargs: _guidance_worker_targets(*args, **kwargs),
+        prepare_guidance_preapprovals=lambda *args, **kwargs: prepare_guidance_preapprovals(*args, **kwargs),
         _path_signature=lambda *args, **kwargs: _path_signature(*args, **kwargs),
         _plan_id_from_path=lambda *args, **kwargs: _plan_id_from_path(*args, **kwargs),
         _published_plan_allows_common_plans=lambda *args, **kwargs: _published_plan_allows_common_plans(*args, **kwargs),

@@ -79,6 +79,7 @@ class AgentEffects:
     _worktree_execplan_input_fingerprint: Callable[..., Any]
     _revision_execplan_input_fingerprint: Callable[..., Any]
     _guidance_worker_targets: Callable[..., Any]
+    prepare_guidance_preapprovals: Callable[..., Any]
     guidance_resume_context: Callable[..., Any]
     _published_plan_allows_common_plans: Callable[..., Any]
     is_loop_manager_repository: Callable[..., Any]

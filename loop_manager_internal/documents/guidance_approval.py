@@ -27,9 +27,15 @@ class GuidanceDecision:
     revision: str
     patch: str
     line: int
+    baseline: str = ""
 
     @property
     def identity(self) -> str:
+        if self.baseline:
+            return _identity(
+                "loop-manager-guidance-decision-v2", self.proposal_id,
+                self.decision, self.revision, self.patch, self.baseline,
+            )
         return _identity(
             "loop-manager-guidance-decision-v1",
             self.proposal_id,
@@ -90,6 +96,7 @@ _PROPOSAL_BODY_RE = re.compile(
 _DECISION_BODY_RE = re.compile(
     r"\A[ \t]*Decision:[ \t]*`(?P<decision>pending|approve|reject|replace)`[ \t]*\n"
     r"[ \t]*Revision:[ \t]*`(?P<revision>[^`\r\n]*)`[ \t]*\n"
+    r"(?:[ \t]*Baseline:[ \t]*`(?P<baseline>[0-9a-f]{40}|[0-9a-f]{64})`[ \t]*\n)?"
     r"[ \t]*Patch:[ \t]*\n```diff[ \t]*\n(?P<patch>.*?)```(?:[ \t]*\n)*\Z",
     re.DOTALL,
 )
@@ -281,10 +288,11 @@ def parse_guidance_document(text: str) -> GuidanceDocument | None:
         decision_kind = decision_match.group("decision")
         revision = decision_match.group("revision").strip()
         decision_patch = _normalize_patch(decision_match.group("patch"))
+        baseline = decision_match.group("baseline") or ""
         if decision_kind == "pending":
-            if revision or decision_patch:
+            if revision or decision_patch or baseline:
                 raise GuidanceFormatError(
-                    f"pending User Decision의 Revision과 Patch는 비어 있어야 합니다: {proposal_id}"
+                    f"pending User Decision의 Revision·Patch·Baseline은 비어 있어야 합니다: {proposal_id}"
                 )
         else:
             if not revision:
@@ -307,6 +315,7 @@ def parse_guidance_document(text: str) -> GuidanceDocument | None:
             revision=revision,
             patch=decision_patch,
             line=_line_number(normalized, log_start + decision_heading.start()),
+            baseline=baseline,
         )
         proposals.append(
             GuidanceProposal(
@@ -385,9 +394,10 @@ def apply_patch_to_content(original: bytes, target: str, patch: str) -> bytes:
         root = Path(directory)
         destination = root / normalized_target
         destination.parent.mkdir(parents=True, exist_ok=True)
-        destination.write_bytes(original)
+        crlf = b"\r\n" in original and b"\n" not in original.replace(b"\r\n", b"")
+        destination.write_bytes(original.replace(b"\r\n", b"\n") if crlf else original)
         result = subprocess.run(
-            ["git", "apply", "--whitespace=nowarn", "-"],
+            ["git", "-c", "core.autocrlf=false", "apply", "--whitespace=nowarn", "-"],
             input=normalized_patch.encode("utf-8"),
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
@@ -400,4 +410,5 @@ def apply_patch_to_content(original: bytes, target: str, patch: str) -> bytes:
                 "guidance patch를 대상 기준 내용에 정확히 적용할 수 없습니다"
                 + (f": {detail}" if detail else ".")
             )
-        return destination.read_bytes()
+        contents = destination.read_bytes()
+        return contents.replace(b"\n", b"\r\n") if crlf else contents
