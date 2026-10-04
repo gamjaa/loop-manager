@@ -41,6 +41,7 @@ class WorkspaceFixture:
         commit_and_push(repo, "Add recovery safety plan")
         plan_sha = git_command(repo, "rev-parse", "origin/main")
         connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
         connection.row_factory = sqlite3.Row
         connection.execute(loop_manager.SCHEMA)
         connection.execute(
@@ -83,6 +84,7 @@ class CleanupFixture:
 
     def _memory_connection(self, repo: Path):
         connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
         connection.row_factory = sqlite3.Row
         connection.execute(loop_manager.SCHEMA)
         connection.execute(loop_manager.CLEANUP_PENDING_SCHEMA)

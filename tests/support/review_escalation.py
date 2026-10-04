@@ -23,6 +23,7 @@ class WorkerEscalationFixture:
         state_dir = Path(directory) / "state"
         state_dir.mkdir()
         connection = loop_manager.connect_database(state_dir, create=True)
+        self.addCleanup(connection.close)
         connection.execute(
             """
             INSERT INTO projects (repo, base_branch, phase, plan_path, worktree)
@@ -67,6 +68,7 @@ class WorkerEscalationFixture:
         )
         loop_manager.make_worktree(repo, worktree, branch, "main")
         connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
         connection.row_factory = sqlite3.Row
         connection.execute(loop_manager.SCHEMA)
         connection.execute(

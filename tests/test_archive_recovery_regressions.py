@@ -203,8 +203,10 @@ class ArchiveRecoveryRegressionTest(unittest.TestCase):
         directory = self.enterContext(tempfile.TemporaryDirectory())
         database = str(Path(directory) / "history.db")
         disk = sqlite3.connect(database)
-        self.connection.backup(disk)
-        disk.close()
+        try:
+            self.connection.backup(disk)
+        finally:
+            disk.close()
         self.connection.close()
         self.connection = sqlite3.connect(database)
         self.connection.row_factory = sqlite3.Row

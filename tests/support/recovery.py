@@ -21,7 +21,10 @@ class BoundedRecoveryFixture:
     ) -> tuple[Path, sqlite3.Connection]:
         root = make_catalog_root(directory)
         plan = write_execplan(root, "G-013", "Bounded Recovery")
+        owns_connection = connection is None
         connection = connection or sqlite3.connect(":memory:")
+        if owns_connection:
+            self.addCleanup(connection.close)
         connection.row_factory = sqlite3.Row
         connection.execute(loop_manager.SCHEMA)
         loop_manager._ensure_execplans_schema(connection)
@@ -68,6 +71,7 @@ class BoundedRecoveryFixture:
         )
         loop_manager.make_worktree(repo, worktree, branch, "main")
         connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
         connection.row_factory = sqlite3.Row
         connection.execute(loop_manager.SCHEMA)
         connection.execute(

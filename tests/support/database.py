@@ -7,34 +7,38 @@ from loop_manager_internal.notifications import notifications
 
 def runtime_connection() -> sqlite3.Connection:
     connection = sqlite3.connect(":memory:")
-    connection.row_factory = sqlite3.Row
-    connection.execute(database.SCHEMA)
-    database._ensure_execplans_schema(connection)
-    notifications.ensure_schema(connection)
-    connection.execute(
-        """
-        INSERT INTO projects (
-            repo, base_branch, provider, planning_fingerprint,
-            planning_attempt_fingerprint, phase
-        ) VALUES ('repo', 'main', 'codex', 'planning-kept',
-                  'planning-cleared', NULL)
-        """
-    )
-    connection.execute(
-        """
-        INSERT INTO exec_plans (
-            repo, plan_id, path, title, sources, depends_on, priority,
-            content_hash, status, plan_sha, active_sha, branch, worktree,
-            workspace_owned
-        ) VALUES (
-            'repo', 'G-047', 'docs/plans/[G-047] Runtime.md', 'Runtime',
-            '["docs/PRODUCT.md"]', '[]', 'normal', 'hash', 'READY',
-            'plan-sha', NULL, NULL, NULL, 1
+    try:
+        connection.row_factory = sqlite3.Row
+        connection.execute(database.SCHEMA)
+        database._ensure_execplans_schema(connection)
+        notifications.ensure_schema(connection)
+        connection.execute(
+            """
+            INSERT INTO projects (
+                repo, base_branch, provider, planning_fingerprint,
+                planning_attempt_fingerprint, phase
+            ) VALUES ('repo', 'main', 'codex', 'planning-kept',
+                      'planning-cleared', NULL)
+            """
         )
-        """
-    )
-    connection.commit()
-    return connection
+        connection.execute(
+            """
+            INSERT INTO exec_plans (
+                repo, plan_id, path, title, sources, depends_on, priority,
+                content_hash, status, plan_sha, active_sha, branch, worktree,
+                workspace_owned
+            ) VALUES (
+                'repo', 'G-047', 'docs/plans/[G-047] Runtime.md', 'Runtime',
+                '["docs/PRODUCT.md"]', '[]', 'normal', 'hash', 'READY',
+                'plan-sha', NULL, NULL, NULL, 1
+            )
+            """
+        )
+        connection.commit()
+        return connection
+    except BaseException:
+        connection.close()
+        raise
 
 
 class AutomationCatalogFixture:
@@ -42,15 +46,20 @@ class AutomationCatalogFixture:
 
     def _connection(self, repo: str = "repo") -> sqlite3.Connection:
         connection = sqlite3.connect(":memory:")
-        connection.row_factory = sqlite3.Row
-        connection.execute(database.SCHEMA)
-        database._ensure_execplans_schema(connection)
-        connection.execute(
-            "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
-            (repo,),
-        )
-        connection.commit()
-        return connection
+        self.addCleanup(connection.close)
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute(database.SCHEMA)
+            database._ensure_execplans_schema(connection)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (repo,),
+            )
+            connection.commit()
+            return connection
+        except BaseException:
+            connection.close()
+            raise
 
     def _insert_plan(
         self,

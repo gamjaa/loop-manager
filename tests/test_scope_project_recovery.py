@@ -32,6 +32,7 @@ class ScopeProjectRecoveryTest(AgentScopeFixture, unittest.TestCase):
             plan_sha = git_command(repo, "rev-parse", "origin/main")
 
             connection = sqlite3.connect(":memory:")
+            self.addCleanup(connection.close)
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
             connection.execute(
@@ -170,6 +171,7 @@ class ScopeProjectRecoveryTest(AgentScopeFixture, unittest.TestCase):
                     commit_and_push(repo, "Add dependency plan")
                     plan_sha = git_command(repo, "rev-parse", "origin/main")
                     connection = sqlite3.connect(":memory:")
+                    self.addCleanup(connection.close)
                     connection.row_factory = sqlite3.Row
                     connection.execute(loop_manager.SCHEMA)
                     connection.execute(

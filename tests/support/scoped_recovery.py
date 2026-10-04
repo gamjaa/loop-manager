@@ -14,6 +14,7 @@ from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 class ScopedGateFixture:
     def setUp(self):
         self.connection = sqlite3.connect(":memory:")
+        self.addCleanup(self.connection.close)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute(loop_manager.SCHEMA)
         loop_manager._ensure_execplans_schema(self.connection)
