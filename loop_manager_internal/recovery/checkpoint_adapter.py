@@ -56,9 +56,10 @@ class CheckpointSafetyEffects:
 
 
 def _frozen_push_target(url: str) -> tuple[tuple[str, str], str]:
-    """Map a fresh operand to one validated URL within the push command."""
-    operand = f'loop-manager-verified-{secrets.token_hex(16)}://target'
-    return ('-c', f'url.{url}.insteadOf={operand}'), operand
+    """Make this push command's longest URL rewrites resolve to the checked URL."""
+    operand = f'x{secrets.token_hex(16)}://target'
+    return ('-c', f'url.{url}.insteadOf={operand}',
+            '-c', f'url.{url}.pushInsteadOf={operand}'), operand
 
 
 class CheckpointSafetyAdapter:

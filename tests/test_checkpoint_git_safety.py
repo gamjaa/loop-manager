@@ -274,6 +274,22 @@ class GuidanceCheckpointGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.
 
 
 class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
+    def test_existing_push_instead_of_cannot_redirect_frozen_target(self):
+        other = Path(self.temporary.name) / 'other-remote.git'
+        self.run_git(self.repo, 'init', '--bare', str(other))
+        self.run_git(self.repo, 'config', '--add', f'url.{other}.pushInsteadOf',
+                     'loop-manager-verified-')
+        self.run_git(self.repo, 'config', '--add', f'url.{other}.pushInsteadOf', 'x')
+        request = self.block()
+        adapter = loop_manager._BlockedCheckpointAdapter(
+            self.connection, self.repo, self.state_dir, str(self.repo.resolve()),
+        )
+        adapter.push(request, self.base_oid, blocked_checkpoint.PushDecision(
+            blocked_checkpoint.PushMode.CREATE))
+        ref = 'refs/heads/loop-manager/G-034'
+        self.assertEqual(self.run_git(self.remote, 'rev-parse', ref), self.base_oid)
+        self.assertNotEqual(loop_manager.git(other, 'rev-parse', '--verify', ref, check=False).returncode, 0)
+
     def test_chained_url_rewrite_pushes_to_the_once_validated_target(self):
         other = Path(self.temporary.name) / 'other-remote.git'
         self.run_git(self.repo, 'init', '--bare', str(other))
@@ -326,6 +342,8 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
             if 'push' in arguments:
                 self.run_git(self.repo, 'config', '--unset-all', f'url.{self.remote}.insteadOf')
                 self.run_git(self.repo, 'config', '--add', f'url.{other}.insteadOf', 'alias://project')
+                self.run_git(self.repo, 'config', '--add', f'url.{other}.pushInsteadOf', 'x')
+                self.run_git(self.repo, 'config', '--add', f'url.{other}.pushInsteadOf', str(self.remote))
             return original_git(path, *arguments, **kwargs)
 
         with mock.patch.object(loop_manager, 'git', side_effect=change_rewrite_before_push):

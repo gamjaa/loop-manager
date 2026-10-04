@@ -153,23 +153,49 @@ class RemoveCleanupWorktreeEffects:
 def restore_cleanup_unlock(
     intent: Mapping[str, object], current: Mapping[str, object], repo: Path,
     worktree: Path, *, git: Callable[..., object], observe: Callable[[], object],
-) -> None:
-    """Restore the owned lock after an interrupted, unsuccessful removal."""
+) -> dict[str, object]:
+    """Restore the prior lock state and return the verified workspace state."""
     before = intent.get("before")
     registration = before.get("registration") if isinstance(before, dict) else None
     reason = registration.get("locked") if isinstance(registration, dict) else None
-    unlocked = ({**before, "registration": {**registration, "locked": None}}
-                if isinstance(before, dict) and isinstance(registration, dict) else None)
+    current_registration = current.get("registration") if isinstance(current, dict) else None
+    oid = r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})"
+    branch = registration.get("branch") if isinstance(registration, dict) else None
+    plan = (re.fullmatch(r"refs/heads/loop-manager/(G-\d+)", branch)
+            if isinstance(branch, str) else None)
     if (intent.get("kind") != "managed_worktree_remove"
             or intent.get("expected") != {"exists": False, "registration": None, "index": None}
-            or not isinstance(reason, str) or not reason.startswith("loop-manager-worktree:")
-            or current != unlocked):
+            or plan is None or intent.get("owner") != f"plan:{plan.group(1)}"
+            or Path(str(intent.get("target", ""))).name != plan.group(1)
+            or worktree.name != plan.group(1)
+            or set(before) != {"exists", "registration", "index"}
+            or before["exists"] is not True
+            or set(registration) != {"head", "branch", "locked"}
+            or not isinstance(registration["head"], str)
+            or re.fullmatch(oid, registration["head"]) is None
+            or not isinstance(before["index"], str)
+            or re.fullmatch(oid, before["index"]) is None
+            or (reason is not None and (not isinstance(reason, str)
+                                         or not reason.startswith("loop-manager-worktree:")))
+            or not isinstance(current_registration, dict)
+            or set(current) != {"exists", "registration", "index"}
+            or current["exists"] is not True
+            or set(current_registration) != set(registration)
+            or current_registration.get("branch") != registration.get("branch")
+            or current_registration.get("locked") not in (None, reason)
+            or not isinstance(current_registration.get("head"), str)
+            or re.fullmatch(oid, current_registration["head"]) is None
+            or not isinstance(current.get("index"), str)
+            or re.fullmatch(oid, current["index"]) is None):
         raise manager_git_journal.MutationEvidenceError(
             "관리 worktree 정리 중간 잠금 상태를 확인할 수 없습니다.")
-    git(repo, "worktree", "lock", f"--reason={reason}", str(worktree))
-    if observe() != before:
+    relocked = {**current, "registration": {**current_registration, "locked": reason}}
+    if reason is not None and current_registration["locked"] is None:
+        git(repo, "worktree", "lock", f"--reason={reason}", str(worktree))
+    if observe() != relocked:
         raise manager_git_journal.MutationEvidenceError(
             "관리 worktree 정리 잠금 복원이 확인되지 않았습니다.")
+    return relocked
 
 
 def remove_cleanup_worktree(
@@ -226,7 +252,8 @@ def remove_cleanup_worktree(
                     if before["registration"]["locked"]:
                         restore_cleanup_unlock(
                             {"kind": "managed_worktree_remove", "before": before,
-                             "expected": expected},
+                             "expected": expected, "owner": owner,
+                             "target": str(effects._canonical_path(worktree))},
                             effects._managed_worktree_transition_state(repo, worktree),
                             repo, worktree, git=effects.git,
                             observe=lambda: effects._managed_worktree_transition_state(repo, worktree),

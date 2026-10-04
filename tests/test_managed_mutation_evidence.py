@@ -16,7 +16,7 @@ from unittest import mock
 from loop_manager_internal.execution.execution_checkpoint import owned_detached_rebase, rebase_preserves_worktree_files
 from loop_manager_internal.execution.execution_handlers import ExecutionHandlers
 from loop_manager_internal.git.rebase_correction import CorrectionAction
-from loop_manager_internal.git import manager_git_journal as journal
+from loop_manager_internal.git import cleanup_service, manager_git_journal as journal
 import loop_manager
 from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
@@ -29,6 +29,42 @@ BRANCH = 'loop-manager/G-091'
 
 
 class ManagedTransitionTests(unittest.TestCase):
+    def test_unlocked_cleanup_recovery_accepts_changed_head_without_git_write(self):
+        before = {'exists': True, 'registration': {
+            'head': OLD, 'branch': f'refs/heads/{BRANCH}', 'locked': None,
+        }, 'index': TREE}
+        current = {'exists': True, 'registration': {
+            'head': NEW, 'branch': f'refs/heads/{BRANCH}', 'locked': None,
+        }, 'index': TREE}
+        intent = {'kind': 'managed_worktree_remove', 'owner': 'plan:G-091',
+                  'target': '/state/G-091', 'before': before,
+                  'expected': {'exists': False, 'registration': None, 'index': None}}
+        git = mock.Mock()
+        self.assertEqual(cleanup_service.restore_cleanup_unlock(
+            intent, current, Path('/repo'), Path('/state/G-091'),
+            git=git, observe=lambda: current), current)
+        git.assert_not_called()
+
+    def test_cleanup_unlock_recovery_rejects_changed_ownership(self):
+        before = {'exists': True, 'registration': {
+            'head': OLD, 'branch': f'refs/heads/{BRANCH}',
+            'locked': 'loop-manager-worktree:owned',
+        }, 'index': TREE}
+        intent = {'kind': 'managed_worktree_remove', 'owner': 'plan:G-091',
+                  'target': '/state/G-091', 'before': before,
+                  'expected': {'exists': False, 'registration': None, 'index': None}}
+        for registration in ({'head': NEW, 'branch': 'refs/heads/other', 'locked': None},
+                             {'head': NEW, 'branch': f'refs/heads/{BRANCH}',
+                              'locked': 'foreign-owner'}):
+            with self.subTest(registration=registration):
+                current = {**before, 'registration': registration}
+                git = mock.Mock()
+                with self.assertRaises(journal.MutationEvidenceError):
+                    cleanup_service.restore_cleanup_unlock(
+                        intent, current, Path('/repo'), Path('/state/G-091'),
+                        git=git, observe=lambda: current)
+                git.assert_not_called()
+
     def test_v2_rebase_retry_keeps_intent_after_checkpoint_observation(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)

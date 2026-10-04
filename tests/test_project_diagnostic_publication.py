@@ -106,10 +106,11 @@ class ProjectDiagnosticPublicationUnitTests(unittest.TestCase):
         adapter._validated_push_url.assert_called_once_with(request)
         args = git.call_args.args
         operand = args[-2]
-        self.assertRegex(operand, r'^loop-manager-verified-[0-9a-f]{32}://target$')
+        self.assertRegex(operand, r'^x[0-9a-f]{32}://target$')
         self.assertEqual(args, (
             Path('/state/G-107'), '-c', f'core.hooksPath={os.devnull}',
-            '-c', f'url.https://github.com/example/repo.git.insteadOf={operand}', 'push',
+            '-c', f'url.https://github.com/example/repo.git.insteadOf={operand}',
+            '-c', f'url.https://github.com/example/repo.git.pushInsteadOf={operand}', 'push',
             '--force-with-lease=refs/heads/loop-manager/diagnostics/G-107/artifact:',
             operand, 'a' * 40 + ':refs/heads/loop-manager/diagnostics/G-107/artifact'))
         self.assertNotIn('origin', git.call_args.args)
