@@ -1,5 +1,5 @@
 ---
-id: G-153
+id: G-148
 title: 프로젝트 공통 verify 실행 규약과 runner
 sources:
   - docs/PRODUCT.md
@@ -55,7 +55,7 @@ priority: normal
 
 ### 4. 서버 인계: 후속 adapter·실제 검증·프로젝트 연결
 
-- 로컬 기반 PR은 R-067과 G-153을 활성 위치에 유지한다. PR 본문에 구현한 계약·확인된 지원 범위·targeted 결과와 남은 OS·성능·언어 간 검증을 기록한다. 완료 판정과 Requirement eligibility·Merge 후 ExecPlan archive는 Loop Manager의 기존 절차를 따르며, 로컬에서 서버 SQLite에 완료·dependency 상태를 만들어 넣지 않는다.
+- 로컬 기반 PR은 R-067과 G-148을 활성 위치에 유지한다. PR 본문에 구현한 계약·확인된 지원 범위·targeted 결과와 남은 OS·성능·언어 간 검증을 기록한다. 완료 판정과 Requirement eligibility·Merge 후 ExecPlan archive는 Loop Manager의 기존 절차를 따르며, 로컬에서 서버 SQLite에 완료·dependency 상태를 만들어 넣지 않는다.
 - 기반 PR이 Merge된 뒤 서버의 Loop Manager Planner가 현재 코드와 R-067의 미충족 부분을 대조해 후속 계획을 만든다. 기존 사용 환경의 비Python 테스트 도구 하나를 공식 수집·reporter·지원 버전·내부 병렬 제어 가능성으로 선정하고 작은 adapter와 독립 예제를 구현한다. 모든 도구 adapter를 한꺼번에 만들지 않는다.
 - Manager가 Agent 밖에서 전체 verify와 예제의 실제 프로세스·동시 실행·timeout·취소 검증을 수행한다. Windows·Linux에서 한 verify만 정리되고 다른 실행이 보존되는지 확인한다. 실패는 동일 Worker 세션의 해당 구현 경계에 전달한다.
 - 같은 환경·revision·Python/Git 또는 테스트 도구 버전·검증 범위에서 직렬/auto, 단일/동시 verify의 결과·시간·메모리·부하·배정·예약을 비교한다. 병렬화가 이득 없는 작은 작업도 포함하며 개선율을 미리 확정하지 않는다.
@@ -77,10 +77,12 @@ priority: normal
 - 2026-10-04: 사용자 요청에 따라 G-153을 `docs/plans/manual/`에서 `docs/plans/`로 이동하고 활성 ExecPlan으로 정리했다. 구현 범위·ID·sources·dependency는 유지하며 실행 상태를 파일에 추가하지 않았다.
 - 2026-10-04: 사용자가 로컬 작업 전체를 기존 PR에 반영하도록 요청해 R-067과 G-153을 PR #138 브랜치로 옮겨 게시한다. 이 반영은 공통 규약·runner의 요구사항과 계획 문서이며 G-153 코드 구현·전체 verify·Review·Merge의 완료를 뜻하지 않는다.
 
+- 2026-10-04: catalog 차단 복구를 위해 미등록 활성 계획의 ID와 파일명을 G-153에서 G-148로 정정했다. SQLite의 마지막 등록 ID는 G-147이며 manual 기록은 실행 catalog의 번호 예약에 포함되지 않는다. 과거 작성 기록은 보존하고 목적·범위·Acceptance Criteria·dependency는 유지한다. 구현 완료를 뜻하지 않는다.
+
 ## Decision Log
 
 - 사용자는 프로젝트마다 자원 조율을 구현하는 대신 Loop Manager 기능으로 공통 규약을 제공하고 그 규약에 맞춰 다른 프로젝트도 사용하는 계획을 요청했다.
 - R-065의 기존 Non-Goal을 변경하지 않고 R-067에서 선택적 연결을 정의한다. R-058·R-065의 안전·검증 원칙은 이어받지만 기존 수동 기록을 관리 대상 완료 증거로 승격하지 않는다.
-- R-067 전체 범위는 공통 core + unittest·비Python 도구의 최소 두 adapter + 적합성 예제다. G-153의 로컬 단계는 core와 자체 unittest를 먼저 제공한다. 언어 독립성은 서버 후속의 실제 다른 도구 연결로 확인한다. 도구별 adapter는 결과 의미가 달라 필요한 경계이며 범용 plugin framework·자동 도구 판별·일괄 마이그레이션은 도입하지 않는다.
+- R-067 전체 범위는 공통 core + unittest·비Python 도구의 최소 두 adapter + 적합성 예제다. G-148의 로컬 단계는 core와 자체 unittest를 먼저 제공한다. 언어 독립성은 서버 후속의 실제 다른 도구 연결로 확인한다. 도구별 adapter는 결과 의미가 달라 필요한 경계이며 범용 plugin framework·자동 도구 판별·일괄 마이그레이션은 도입하지 않는다.
 - 프로젝트 연결 선언은 명시적 opt-in이고, 연결된 규약의 오류는 실패다. 미지원 도구의 미연결 프로젝트는 기존 verify를 유지한다. 실제 Agent 차단은 지원 adapter의 실행 경계에서 검증하며 임의 언어의 모든 subprocess를 기존 Python guard 하나로 차단할 수 있다고 간주하지 않는다.
-- 현재 합의는 기능·규약 계획이며 전체 코드 구현이나 외부 저장소 변경의 완료를 뜻하지 않는다. G-153은 활성 ExecPlan으로 관리하며 서버 자동 입력은 원격 기준 branch에 게시된 활성 Requirement와 ExecPlan catalog다.
+- 현재 합의는 기능·규약 계획이며 전체 코드 구현이나 외부 저장소 변경의 완료를 뜻하지 않는다. G-148은 활성 ExecPlan으로 관리하며 서버 자동 입력은 원격 기준 branch에 게시된 활성 Requirement와 ExecPlan catalog다.
