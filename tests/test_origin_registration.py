@@ -23,6 +23,24 @@ from loop_manager_internal.runtime import bootstrap
 
 
 class OriginRegistrationTests(unittest.TestCase):
+    def test_registry_schema_does_not_commit_caller_transaction(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.execute(
+            "CREATE TABLE projects (repo TEXT PRIMARY KEY, base_branch TEXT, provider TEXT)"
+        )
+        connection.execute("INSERT INTO projects VALUES ('repo', 'main', 'codex')")
+        loop_manager.project_registry.ensure_registry_schema(connection)
+        self.assertTrue(connection.in_transaction)
+        self.assertIn("origin", {
+            row[1] for row in connection.execute("PRAGMA table_info(projects)")
+        })
+        connection.rollback()
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM projects").fetchone()[0], 0)
+        self.assertNotIn("origin", {
+            row[1] for row in connection.execute("PRAGMA table_info(projects)")
+        })
+
     def test_self_runtime_identity_rejects_alias_and_other_clone(self):
         with tempfile.TemporaryDirectory() as directory:
             _remote, source, other_clone = remote_fixture(directory)

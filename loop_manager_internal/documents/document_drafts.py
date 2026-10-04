@@ -488,7 +488,7 @@ class DocumentDraftRepository:
         elif uncertain_reason:
             raise DocumentDraftError("의미 보존 불확실 사유는 승인 요청에만 사용합니다.")
         token = uuid4().hex
-        self.connection.execute(
+        changed = self.connection.execute(
             "UPDATE document_drafts SET state = ?, requested_decision = ?, decision_revision = ?, "
             "decision_reason = ?, decided_at = CURRENT_TIMESTAMP "
             "WHERE draft_id = ? AND state = 'pending'",
@@ -496,7 +496,15 @@ class DocumentDraftRepository:
              "approve" if decision in {"approve", "stale"} else "reject",
              token, reason, draft_id),
         )
-        return self.get(draft_id)
+        stored = self.get(draft_id)
+        if changed.rowcount != 1:
+            if stored.state == "pending":
+                raise DocumentDraftError("문서 수정본 결정이 저장되지 않았습니다.")
+            raise DocumentDraftError(
+                f"문서 수정본이 이미 {stored.state} 상태로 결정됐습니다 "
+                f"(decision revision: {stored.decision_revision})."
+            )
+        return stored
 
     def approved(self, repo: str, repository: Path, base_branch: str) -> tuple[DocumentDraft, ...]:
         """Expose only approvals whose source identity still matches the remote."""

@@ -332,18 +332,24 @@ class ValidationFeedbackRepository:
                 (repo, plan_id),
             ).fetchone():
                 continue
-            with _transaction(self.connection):
-                if self.connection.execute(
-                    "SELECT 1 FROM validation_results WHERE repo=? AND plan_id=? LIMIT 1",
-                    (repo, plan_id),
-                ).fetchone():
-                    self._mark_migrated(repo, plan_id)
-                    continue
-                for stage in ("verify", "review"):
-                    raw = row[f"{stage}_result"]
-                    try:
+            try:
+                with _transaction(self.connection):
+                    if self.connection.execute(
+                        "SELECT 1 FROM validation_results WHERE repo=? AND plan_id=? LIMIT 1",
+                        (repo, plan_id),
+                    ).fetchone():
+                        self._mark_migrated(repo, plan_id)
+                        continue
+                    for stage in ("verify", "review"):
+                        raw = row[f"{stage}_result"]
                         history = json.loads(row[f"{stage}_failure_history"] or "{}")
-                        if not raw or not isinstance(history, dict) or not history:
+                        if not isinstance(history, dict):
+                            raise ValueError("invalid legacy failure history")
+                        for record in history.values():
+                            if (not isinstance(record, dict)
+                                    or int(record.get("occurrences", 1)) < 1):
+                                raise ValueError("invalid legacy failure occurrence")
+                        if not raw or not history:
                             continue
                         if stage == "verify":
                             if len(history) != 1:
@@ -377,6 +383,8 @@ class ValidationFeedbackRepository:
                                 self._event(result_id, repo, plan_id, stage,
                                             item.identity, occurrence, 1,
                                             item.diagnostic, True)
-                    except (TypeError, ValueError, KeyError):
-                        continue
-                self._mark_migrated(repo, plan_id)
+                    self._mark_migrated(repo, plan_id)
+            except (TypeError, ValueError, KeyError):
+                # A malformed later stage must not leave earlier audit rows or
+                # mark this plan complete; a corrected legacy row can retry.
+                continue

@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from contextlib import nullcontext
 import sqlite3
 
+from loop_manager_internal.storage.runtime_state import _transaction
+
 
 BLOCKING_STATUSES = (
     "READY",
@@ -43,15 +45,18 @@ def ensure_registry_schema(connection: sqlite3.Connection) -> None:
         "agents_approved": "INTEGER NOT NULL DEFAULT 0",
         "origin": "TEXT",
     }
-    changed = False
-    for column, definition in migrations.items():
-        if column not in columns:
-            connection.execute(
-                f"ALTER TABLE projects ADD COLUMN {column} {definition}"
-            )
-            changed = True
-    if changed:
-        connection.commit()
+    missing = [(column, definition) for column, definition in migrations.items()
+               if column not in columns]
+    if missing:
+        with _transaction(connection):
+            # Another process may have migrated the table before we acquired
+            # the write lock. Recheck before applying additive DDL.
+            current = {row[1] for row in connection.execute("PRAGMA table_info(projects)")}
+            for column, definition in missing:
+                if column not in current:
+                    connection.execute(
+                        f"ALTER TABLE projects ADD COLUMN {column} {definition}"
+                    )
 
 
 def list_projects(connection: sqlite3.Connection) -> tuple[RegisteredProject, ...]:

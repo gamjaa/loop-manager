@@ -33,10 +33,14 @@ Make transaction ownership and conditional updates explicit across stored decisi
 
 ## Progress
 
-- [ ] Align conditional writes and transaction ownership at each storage boundary.
-- [ ] Add rollback, race and historical-row regressions.
+- [x] Align conditional writes and transaction ownership at each storage boundary.
+- [x] Add rollback, race and historical-row regressions.
 
 ## Decision Log
 
 - Manifest findings 4, 5, 35, 41 and 42 share durable-versus-observed state divergence. High priority follows the concrete rollback and already-started Worker-level corruption paths; the plan preserves schema and state semantics.
 - Observed transaction paths: `loop_manager_internal/documents/document_drafts.py`, `loop_manager_internal/execution/execution_state.py`, `loop_manager_internal/runtime/project_registry.py`, `loop_manager_internal/storage/validation_feedback_state.py`, `loop_manager_internal/storage/execplan_catalog_state.py`.
+- Draft decisions now check the pending-row CAS count and report the stored decision on a race; the decision remains scoped to that draft and another user's recorded choice is never replaced.
+- Rebase completion now updates the expected memory snapshot after the SQLite transaction succeeds, so a failed commit retains the prior snapshot and can retry. Registry schema preparation uses the existing transaction helper and rechecks missing columns under the write lock; it cannot commit the caller's unrelated work.
+- A malformed legacy feedback row rolls back all stage audit writes and stays eligible for a corrected retry. Catalog reconciliation treats durable `ever_started` as execution history, preserving an effective Worker level even when other transient evidence has been reset. These paths need no new user action or storage format change; malformed legacy data requires correction before import.
+- Added focused regressions for draft CAS races, rebase commit rollback, registry caller rollback, malformed feedback retry, and `ever_started`-only rows. The existing Linux verify entrypoint already delegates to the full verification runner and propagates its exit status.

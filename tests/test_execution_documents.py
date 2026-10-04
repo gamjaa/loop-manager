@@ -16,6 +16,25 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 
 class ExecutionDocumentsTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+    def test_draft_decision_race_reports_stored_decision(self):
+        drafts = object.__new__(handlers.document_drafts.DocumentDraftRepository)
+        drafts.connection = mock.Mock()
+        drafts.connection.execute.return_value.rowcount = 0
+        pending = SimpleNamespace(proposed_hash="hash", state="pending", repo="repo")
+        decided = SimpleNamespace(state="rejected", decision_revision="other-revision")
+        with (
+            mock.patch.object(drafts, "get", side_effect=(pending, decided)),
+            mock.patch.object(handlers.document_drafts, "ownership_clear"),
+        ):
+            with self.assertRaisesRegex(
+                handlers.document_drafts.DocumentDraftError,
+                "already rejected|이미 rejected",
+            ) as raised:
+                drafts.decide("draft", "hash", "reject", Path("."), "main")
+        self.assertIn("other-revision", str(raised.exception))
+        self.assertEqual(drafts.connection.execute.call_count, 1)
+        self.assertIn("AND state = 'pending'", drafts.connection.execute.call_args.args[0])
+
     def test_document_execution_guard_preserves_crlf_approved_diff(self):
         original, proposed = b"# Product\r\nOld.\r\n", b"# Product\r\nNew.\r\n"
         draft = SimpleNamespace(

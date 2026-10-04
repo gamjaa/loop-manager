@@ -62,6 +62,59 @@ class ValidationFeedbackStateTests(unittest.TestCase):
         self.observe("review", raw, normalize_feedback("review", raw))
         self.assertEqual(self.pending().rows[0]["occurrence"], 5)
 
+    def test_malformed_later_legacy_stage_rolls_back_audit_and_can_retry(self):
+        self.connection.execute(
+            "CREATE TABLE exec_plans (repo TEXT,plan_id TEXT,current_revision_sha TEXT,"
+            "verify_result TEXT,review_result TEXT,verify_failure_history TEXT,"
+            "review_failure_history TEXT)"
+        )
+        self.connection.execute(
+            "INSERT INTO exec_plans VALUES (?,?,?,?,?,?,?)",
+            ("repo", "G-040", "revision", "verify failure", "review failure",
+             '{"fingerprint":{"occurrences":2}}', "{malformed"),
+        )
+        self.repo.migrate_legacy()
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM validation_results"
+        ).fetchone()[0], 0)
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM validation_feedback_migrations"
+        ).fetchone()[0], 0)
+        self.connection.execute(
+            "UPDATE exec_plans SET review_failure_history = '{}'"
+        )
+        self.repo.migrate_legacy()
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM validation_results"
+        ).fetchone()[0], 1)
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM validation_feedback_migrations"
+        ).fetchone()[0], 1)
+
+        self.connection.execute(
+            "INSERT INTO exec_plans VALUES (?,?,?,?,?,?,?)",
+            ("repo", "G-041", "revision", "verify failure", "review failure",
+             '{"fingerprint":{"occurrences":2}}',
+             '{"historical":{"occurrences":"invalid"}}'),
+        )
+        self.repo.migrate_legacy()
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM validation_results WHERE plan_id = 'G-041'"
+        ).fetchone()[0], 0)
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM validation_feedback_migrations WHERE plan_id = 'G-041'"
+        ).fetchone()[0], 0)
+        self.connection.execute(
+            "UPDATE exec_plans SET review_failure_history = '{}' WHERE plan_id = 'G-041'"
+        )
+        self.repo.migrate_legacy()
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM validation_results WHERE plan_id = 'G-041'"
+        ).fetchone()[0], 1)
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM validation_feedback_migrations WHERE plan_id = 'G-041'"
+        ).fetchone()[0], 1)
+
     def test_repetition_changed_diagnostic_resolution_and_recurrence(self):
         first = Feedback("verify", "verify:A", "failure A")
         changed = Feedback("verify", "verify:A", "failure A at new line")

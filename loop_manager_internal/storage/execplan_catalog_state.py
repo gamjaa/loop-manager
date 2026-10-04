@@ -635,6 +635,7 @@ class DefinitionStateRepository:
     def _has_execution_history(row: sqlite3.Row) -> bool:
         return bool(
             str(row["status"]) != "READY"
+            or int(row["ever_started"] or 0)
             or int(row["retry_count"] or 0)
             or row["worker_session_id"]
             or row["reviewer_session_id"]

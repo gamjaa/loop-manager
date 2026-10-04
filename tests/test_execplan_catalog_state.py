@@ -1,5 +1,5 @@
 from loop_manager_internal.storage import database
-from tests.support.catalog import CatalogReconciliationFixture
+from tests.support.catalog import CatalogReconciliationFixture, catalog_reconciliation_fixture
 from tests.support.catalog import archived_entry, FakeDefinitionPort, active_snapshot
 import hashlib
 import json
@@ -36,6 +36,30 @@ class FakeMergeProof:
 
 
 class ExecPlanCatalogStateTest(unittest.TestCase):
+    def test_ever_started_alone_preserves_effective_worker_level(self):
+        fixture = catalog_reconciliation_fixture(self)
+        fixture.connection.execute(
+            "UPDATE exec_plans SET status = 'READY', ever_started = 1, "
+            "initial_worker_level = 7, effective_worker_level = 7 "
+            "WHERE plan_id = 'G-002'"
+        )
+        fixture.connection.commit()
+        pinned = active_snapshot(
+            "c" * 40,
+            {
+                "docs/plans/[G-001] Old.md": fixture._text("G-001", "Old"),
+                "docs/plans/[G-002] Dependency.md": fixture._text(
+                    "G-002", "Dependency", complexity="low", risk="low"
+                ),
+            },
+        )
+        fixture._service(pinned).reconcile("/repo")
+        level = fixture.connection.execute(
+            "SELECT initial_worker_level, effective_worker_level "
+            "FROM exec_plans WHERE plan_id = 'G-002'"
+        ).fetchone()
+        self.assertEqual(tuple(level), (1, 7))
+
     def setUp(self):
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row
