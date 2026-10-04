@@ -38,7 +38,25 @@ Worker는 현재 작업에 제공된 문서 수정 권한 안에서 코드·설�
 
 ## Agent guidance 변경 제안과 사용자 결정
 
+사용자는 구현 전에 아래 Proposal과 User Decision을 ExecPlan에 함께 작성해 원격 기준 branch에 게시할 수 있다. 사전 승인 배치의 모든 Decision은 `approve`, `replace` 또는 `reject`여야 하며 각각 비어 있지 않은 Revision이 필요하다. 사전 결정에는 Revision 다음에 Baseline 필드를 추가한다. 값은 기준 commit의 전체 SHA로, 40자리 또는 64자리 소문자 16진수이며 배치 전체가 같은 commit을 사용한다. 채팅의 허락이나 일반 본문은 승인 입력이 아니다. 적용 조건과 순서는 ExecPlan의 Acceptance Criteria와 dependency로 명시한다.
+
+Loop Manager는 Worker 시작 전에 채택한 계획 revision의 제안·결정을 작업 파일과 대조하고, 원격 기준의 선행 commit인 Baseline의 `AGENTS.md`를 승인 기준으로 사용한다. 현재 파일의 내용·mode가 같으면 SQLite에 등록한 결정과 정확한 patch만 Worker에게 전달한다. checkout의 LF/CRLF 변환은 동일 내용으로 처리하며 실제 적용에서는 현재 줄바꿈을 보존한다. 기준이 달라졌으면 파일을 수정하지 않고 같은 ExecPlan의 User Decision 재승인 대기로 전환한다. 사용자는 최신 기준에 맞는 새 Revision 또는 대체 patch를 기록해야 한다. 등록된 승인은 재시작 때 원격 결정으로 덮어쓰지 않는다.
+
+사전 승인 User Decision 예시(실제 기준 commit SHA로 바꾼다):
+
+````markdown
+### Agent Guidance User Decision: guidance-example
+Decision: `approve`
+Revision: `user-2026-10-04-1`
+Baseline: `0123456789abcdef0123456789abcdef01234567`
+Patch:
+```diff
+```
+````
+
 Worker가 현재 ExecPlan 달성에 꼭 필요한 `AGENTS.md` 규칙 변경을 발견하면 파일을 직접 수정하지 않고 해당 ExecPlan의 `Decision Log` 끝에 아래 제안과 빈 사용자 결정을 한 쌍으로 추가한 뒤 작업을 중단한다. proposal ID는 ExecPlan 안에서 고유한 소문자·숫자·하이픈 값이어야 한다. `Target`은 저장소 루트의 `AGENTS.md`만 허용하며, `Scope`는 기본적으로 `project`다. 프로그램이 현재 작업을 공통 규칙 원본의 작업으로 명시한 경우에만 `common`을 사용한다. 대상과 범위는 제공된 작업 문맥을 따른다. Planner와 Reviewer는 제안하거나 적용하지 않는다.
+
+Worker가 만드는 새 pending 결정에는 Baseline을 추가하지 않는다. Baseline 없는 기존 사용자 결정 대기·승인 형식과 승인 기록은 그대로 유지한다.
 
 ````markdown
 ### Agent Guidance Proposal: guidance-example

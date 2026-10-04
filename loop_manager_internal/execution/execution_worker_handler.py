@@ -26,6 +26,7 @@ from loop_manager_internal.execution.worker_outcome import WorkerOutcome, Worker
 from loop_manager_internal.execution.execution_effects import ExecutionContract, FeedbackEffects
 from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot
 from loop_manager_internal.execution.execution_state import ExecutionStatePort
+from loop_manager_internal.documents.guidance_approval import GuidanceFormatError
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 
 @dataclass(frozen=True)
@@ -40,6 +41,7 @@ class WorkerHandlerPorts:
     rebase_corrections: RebaseCorrectionRepository
     state: ExecutionStatePort
     _guidance_worker_targets: Callable[..., Any]
+    prepare_guidance_preapprovals: Callable[..., Any]
     _published_plan_allows_common_plans: Callable[..., Any]
     _rebase_in_progress_for_branch: Callable[..., Any]
     _revision_execplan_input_fingerprint: Callable[..., Any]
@@ -262,6 +264,23 @@ class WorkerHandler:
                 base, revision, self.ports.identity.state_dir)
         except (ValueError, OSError, sqlite3.Error):
             pass  # Source facts are optional context; never block implementation.
+        try:
+            guidance_blocked = self.ports.prepare_guidance_preapprovals(
+                self.ports.identity.repo_path, self.ports.identity.repo,
+                context.worktree, catalog_plan,
+            )
+        except (self.ports.contract.AgentScopeError, GuidanceFormatError) as error:
+            return self.ports._block_final(
+                self.ports.identity.repo, context.worktree, str(error), '',
+                reason=BlockReasonCode.PLAN_INPUT_INVALID,
+            )
+        except (RuntimeError, OSError, subprocess.CalledProcessError) as error:
+            return self.ports._recover(
+                classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
+                str(error), context=context,
+            )
+        if guidance_blocked:
+            return self.ports._final(str(self.ports.state.blocked()['last_error']))
         worker_scope_before = self.ports.begin_agent_scope(
             self.ports.identity.repo,
             context.worktree,
