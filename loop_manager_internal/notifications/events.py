@@ -2,15 +2,61 @@
 from __future__ import annotations
 import hashlib
 import json
+from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
 from loop_manager_internal.documents import reviewer_specification
 from .work_exhaustion import WorkReasonSnapshot
-from .repository import ensure_schema, _enabled, _insert
+from .repository import (adopt_legacy_block_notices, ensure_schema, _enabled,
+                         _insert)
 from .incidents import (_key, _remote_inspection_suffix, _queue_block,
                         _plan_block_key, _project_block_key,
                         _project_checkpoint, _project_checkpoint_suffix)
 from .rendering import _checkpoint_link
+
+
+@dataclass(frozen=True)
+class _BlockedPlanProjection:
+    """Named inputs for one blocked-plan notification payload."""
+
+    plan_id: str
+    title: str
+    path: str
+    sources: str
+    reason_code: str
+    evidence: str
+    checkpoint_result: str | None
+    checkpoint_remote_oid: str | None
+    checkpoint_unpublished_reason: str | None
+    checkpoint_branch: str | None
+    origin: str | None
+    checkpoint_inspected_remote_oid: str | None
+    checkpoint_inspection_reason: str | None
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> _BlockedPlanProjection:
+        def optional(name: str) -> str | None:
+            value = row[name]
+            return str(value) if value is not None else None
+
+        return cls(
+            plan_id=str(row["plan_id"]),
+            title=str(row["plan_title"]),
+            path=str(row["plan_path"]),
+            sources=str(row["plan_sources"]),
+            reason_code=str(row["reason_code"]),
+            evidence=str(row["evidence"]),
+            checkpoint_result=optional("checkpoint_result"),
+            checkpoint_remote_oid=optional("checkpoint_remote_oid"),
+            checkpoint_unpublished_reason=optional("checkpoint_unpublished_reason"),
+            checkpoint_branch=optional("checkpoint_branch"),
+            origin=optional("origin"),
+            checkpoint_inspected_remote_oid=optional(
+                "checkpoint_inspected_remote_oid"
+            ),
+            checkpoint_inspection_reason=optional("checkpoint_inspection_reason"),
+        )
+
 
 def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) -> None:
     """Enqueue all plan/project events after their owning update and before commit."""
@@ -18,6 +64,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
     if not _enabled(connection):
         return
     ensure_schema(connection)
+    adopt_legacy_block_notices(connection)
     project = connection.execute(
         "SELECT phase, plan_path, pr_url, last_error, planning_error "
         "FROM projects WHERE repo = ?",
@@ -60,9 +107,14 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         )
 
     plan_blocks = connection.execute(
-        "SELECT p.plan_id, p.title, p.path, p.sources, b.reason_code, b.evidence, "
-        "c.result, c.remote_oid, c.unpublished_reason, c.branch, r.origin, "
-        "c.inspected_remote_oid, c.inspection_reason "
+        "SELECT p.plan_id AS plan_id, p.title AS plan_title, p.path AS plan_path, "
+        "p.sources AS plan_sources, b.reason_code AS reason_code, "
+        "b.evidence AS evidence, c.result AS checkpoint_result, "
+        "c.remote_oid AS checkpoint_remote_oid, "
+        "c.unpublished_reason AS checkpoint_unpublished_reason, "
+        "c.branch AS checkpoint_branch, r.origin AS origin, "
+        "c.inspected_remote_oid AS checkpoint_inspected_remote_oid, "
+        "c.inspection_reason AS checkpoint_inspection_reason "
         "FROM execplan_blocks AS b JOIN exec_plans AS p USING (repo, plan_id) "
         "JOIN projects AS r ON r.repo = b.repo "
         "LEFT JOIN blocked_checkpoints AS c USING (repo, plan_id) "
@@ -70,43 +122,49 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         "('published', 'unpublished')) ORDER BY p.plan_id",
         (repo,),
     ).fetchall()
-    for plan in plan_blocks:
+    for row in plan_blocks:
+        plan = _BlockedPlanProjection.from_row(row)
         try:
-            sources = json.loads(str(plan[3]))
+            sources = json.loads(plan.sources)
         except (TypeError, ValueError):
             sources = []
         stage = "ExecPlan"
-        plan_id = str(plan[0])
-        plan_title = str(plan[1])
+        plan_id = plan.plan_id
+        plan_title = plan.title
         recovery_identity, recovery_evidence = final_recovery(plan_id)
         paths = (
             list(recovery_evidence["user_targets"])
             if recovery_evidence is not None
-            else [str(plan[2]), *(str(item) for item in sources)]
+            else [plan.path, *(str(item) for item in sources)]
         )
         deadlock = None
-        if plan[4] == "review_specification_deadlock":
+        if plan.reason_code == "review_specification_deadlock":
             try:
-                deadlock = reviewer_specification.parse_evidence(str(plan[5]))
+                deadlock = reviewer_specification.parse_evidence(plan.evidence)
             except ValueError:
                 pass
             if deadlock is not None:
                 paths = list(deadlock.paths)
         checkpoint = None
-        if plan[6] == "published":
+        if plan.checkpoint_result == "published":
             checkpoint = {
                 "result": "published",
-                "branch": plan[9],
-                "branch_url": _checkpoint_link(plan[10], plan[7]),
-                "commit_oid": plan[7],
+                "branch": plan.checkpoint_branch,
+                "branch_url": _checkpoint_link(
+                    plan.origin, plan.checkpoint_remote_oid,
+                ),
+                "commit_oid": plan.checkpoint_remote_oid,
             }
-        elif plan[6] == "local_only":
+        elif plan.checkpoint_result == "local_only":
             checkpoint = {
                 "result": "local_only",
-                "reason": str(plan[8] or "checkpoint를 게시하지 않았습니다."),
+                "reason": (
+                    plan.checkpoint_unpublished_reason
+                    or "checkpoint를 게시하지 않았습니다."
+                ),
             }
         guidance_locations = []
-        if plan[4] == "guidance_approval_required":
+        if plan.reason_code == "guidance_approval_required":
             rows = connection.execute(
                 "SELECT proposal_id, proposal_line, decision_line "
                 "FROM guidance_approvals WHERE repo = ? AND plan_id = ? "
@@ -116,8 +174,8 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
             guidance_locations = [
                 {
                     "proposal_id": str(row[0]),
-                    "proposal": f"{plan[2]}:{row[1]}",
-                    "user_decision": f"{plan[2]}:{row[2]}",
+                    "proposal": f"{plan.path}:{row[1]}",
+                    "user_decision": f"{plan.path}:{row[2]}",
                 }
                 for row in rows
             ]
@@ -128,16 +186,18 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
                 if location not in paths
             )
         remote_inspection = _remote_inspection_suffix(
-            plan[6], plan[11], plan[12]
+            plan.checkpoint_result,
+            plan.checkpoint_inspected_remote_oid,
+            plan.checkpoint_inspection_reason,
         )
         payload = {
             "project": name,
             "stage": stage,
             "scope": "plan",
-            "reason_code": str(plan[4]),
+            "reason_code": plan.reason_code,
             "execplan_id": plan_id,
             "execplan_title": plan_title,
-            "cause": str(plan[5]),
+            "cause": plan.evidence,
             "paths": paths,
             "guidance_locations": guidance_locations,
             "checkpoint": checkpoint,
@@ -163,8 +223,8 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
             connection,
             repo,
             f"plan:{plan_id}",
-            _plan_block_key(repo, plan[4], plan_id, recovery_identity,
-                            remote_inspection),
+            _plan_block_key(repo, plan.reason_code, plan_id,
+                            recovery_identity, remote_inspection),
             payload,
         )
 
@@ -520,4 +580,3 @@ def enqueue_waiting_reason(
             return False
         _insert(connection, event_key, repo, "work_waiting", payload)
     return True
-

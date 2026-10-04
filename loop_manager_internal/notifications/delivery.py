@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 import json
 import sqlite3
-from .repository import ensure_schema
+from .repository import adopt_legacy_block_notices, ensure_schema
 from .incidents import _current_block_key, _materialize_resumption
 from .rendering import _message, _pieces
 from .transport import send_telegram
@@ -84,6 +84,7 @@ def dispatch_pending(
     if not token or not chat_id:
         return 0
     ensure_schema(connection)
+    adopt_legacy_block_notices(connection)
     rows = connection.execute(
         "SELECT event_key, event_type, payload FROM notification_outbox "
         "WHERE sent_at IS NULL AND canceled_at IS NULL "

@@ -109,11 +109,15 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             "ALTER TABLE notified_block_incidents ADD COLUMN version "
             "INTEGER NOT NULL DEFAULT 0"
         )
-    _adopt_legacy_block_notices(connection)
 
 
-def _adopt_legacy_block_notices(connection: sqlite3.Connection) -> None:
-    """Attach notices from each still-active pre-incident block."""
+def adopt_legacy_block_notices(connection: sqlite3.Connection) -> None:
+    """Attach pre-incident notices to the blocks they still represent.
+
+    This is a current-state incident migration, rather than schema setup.  The
+    event projection owns when it runs so preparing an SQLite connection cannot
+    alter recovery or delivery state by itself.
+    """
 
     required = {
         "projects", "project_blocks", "execplan_blocks", "blocked_checkpoints",
@@ -296,4 +300,3 @@ def _insert(
 def _encode_payload(payload: dict[str, object]) -> str:
     """Use the same JSON representation for incidents and outbox rows."""
     return json.dumps(payload, ensure_ascii=False)
-

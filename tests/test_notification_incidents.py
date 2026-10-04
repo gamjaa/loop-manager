@@ -445,6 +445,11 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                 (key, repo, json.dumps(payload)),
             )
         with connection:
+            notifications.ensure_schema(connection)
+            self.assertIsNone(connection.execute(
+                "SELECT 1 FROM notified_block_incidents WHERE repo = ?", (repo,),
+            ).fetchone())
+            notifications.adopt_legacy_block_notices(connection)
             notifications.enqueue_current_project_events(connection, repo)
         self.assertEqual(connection.execute(
             "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'blocked'"
