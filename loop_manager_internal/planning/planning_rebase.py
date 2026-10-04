@@ -38,7 +38,7 @@ def _journal_path(state_dir: Path, repo: str, worktree: Path) -> Path:
 
 
 def _correction_path_allowed(name: object) -> bool:
-    return isinstance(name, str) and (
+    return isinstance(name, str) and "\0" not in name and (
         name == "docs/FUTURE_IDEAS.md"
         or (re.fullmatch(r"docs/plans/[^/]+\.md", name) is not None
             and (os.name != "nt" or "\\" not in name))

@@ -116,6 +116,12 @@ class PlanningRebaseTest(unittest.TestCase):
             with self.assertRaises(PlanningRebaseError):
                 rebase_planning_worktree(git, root, root, '/repo', worktree, 'old', 'new')
             git.assert_not_called()
+            record['correction']['paths'] = ['docs/plans/a\0.md']
+            planning_rebase._write(path, record)
+            with self.assertRaises(PlanningRebaseError):
+                rebase_planning_worktree(git, root, root, '/repo', worktree, 'old', 'new')
+            git.assert_not_called()
+            self.assertEqual(planning_rebase.json.loads(path.read_text()), record)
             record.pop('correction')
             planning_rebase._write(path, record)
             with self.assertRaises(PlanningRebaseError):
