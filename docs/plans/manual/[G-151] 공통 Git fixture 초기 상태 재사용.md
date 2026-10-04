@@ -37,11 +37,12 @@ priority: normal
 
 - [x] 초기 seed 재사용과 독립 복사 구현
 - [x] targeted unit test 6개 통과와 scoped diff 확인
-- [ ] branch push
+- [x] `codex/verify-fixture-fast-path` branch push
 - [ ] Agent 밖의 전체 verify, 읽기 전용 Review와 사용자 Merge
 
 ## Decision Log
 
+- 구현 commit `65934d1`을 `origin/codex/verify-fixture-fast-path`에 push했다. 직접 작업 계획은 활성 catalog에서 제외되며 서버의 G-135 실행 상태를 변경하지 않았다.
 - `py -3 -B -m unittest tests.test_git_fixture_seed tests.test_support_fixtures.SupportFixtureTests.test_git_factory_uses_explicit_repository_and_preserves_seed_files tests.test_support_fixtures.SupportFixtureTests.test_imports_create_no_resources_or_discoverable_cases`: 6개 통과. Windows sandbox 임시 디렉터리 권한 오류 후 같은 command를 정상 권한으로 다시 실행했다.
 - 기존 초기화는 Git subprocess 8회이며, seed 준비 후 각 독립 복사는 2회다. 파일 복사 비용과 전체 verify의 실제 시간 변화는 측정하지 않았다. 전체 verify의 discovery 범위와 스크립트는 유지한다.
 - 사용자는 서버가 G-135를 실행 중인 동안 후속 계획에서 필요한 작은 부분을 로컬에서 선행 구현·push하도록 요청했다.
