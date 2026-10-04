@@ -502,7 +502,11 @@ class ImmediateRebasePublicationTests(TestCase):
 
     def test_existing_remote_without_durable_publication_identity_is_preserved(self):
         self.state.update_project('repo', publication_remote_oid=None)
-        self.fixture.connection.execute("DELETE FROM blocked_checkpoints WHERE repo = 'repo'")
+        # Seed the durable missing-identity state before rebase adoption owns
+        # its transaction, rather than leaving a fixture transaction open.
+        with self.fixture.connection:
+            self.fixture.connection.execute("DELETE FROM blocked_checkpoints WHERE repo = 'repo'")
+        self.assertFalse(self.fixture.connection.in_transaction)
         with self.assertRaises(handlers.RecoveryFailure):
             self.complete()
         saved = self.checkpoints.get('repo', 'G-047')

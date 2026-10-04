@@ -105,6 +105,10 @@ class ExecutionCheckpointRecoveryPhaseTests(ExecutionRecoveryScenarios, Executio
             handlers.RecoveryObservation(handlers.RecoveryReason.STATUS_FAILED, 'repo', 'G-047',
                 'WORKING', 'plan-revision', base, 'old-failure', f'{base}|saved-worker|',
                 rebase_block_reconciliation.LEGACY_COMPLETION_DIAGNOSTIC))
+        # Production commits the run marker and recovery observation before
+        # adopting a rebase; this fixture owns those setup writes.
+        case.fixture.connection.commit()
+        self.assertFalse(case.fixture.connection.in_transaction)
         with mock.patch.object(handlers.manager_git_journal, 'verified_rebase_completion',
                                side_effect=AssertionError('history is not a current gate')):
             case.handler._complete_rebase_intent(case.fixture.context())
