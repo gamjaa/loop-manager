@@ -46,17 +46,34 @@ class OwnedRebaseMetadataEffects:
     git: Callable[..., object]
 
 
-def _owned_rebase_metadata(effects: OwnedRebaseMetadataEffects, worktree: Path) -> dict[str, str] | None:
+def _owned_rebase_metadata(effects: OwnedRebaseMetadataEffects, worktree: Path,
+                           *, git_paths: dict | None = None) -> dict[str, str] | None:
+    directories = ("rebase-merge", "rebase-apply")
+    if git_paths is None:
+        result = effects.git(worktree, "rev-parse", "--git-path", directories[0],
+                             "--git-path", directories[1], check=False)
+        if result.returncode:
+            raise RuntimeError("rebase metadata 경로를 확인할 수 없습니다.")
+        paths = result.stdout.splitlines()
+        if len(paths) != 2 or not all(paths):
+            # 줄바꿈이 있는 경로는 단일 조회의 전체 출력으로 해석한다.
+            paths = []
+            for directory in directories:
+                result = effects.git(worktree, "rev-parse", "--git-path", directory, check=False)
+                if result.returncode:
+                    raise RuntimeError("rebase metadata 경로를 확인할 수 없습니다.")
+                path = result.stdout.rstrip("\n")
+                if not path:
+                    raise RuntimeError("rebase metadata 경로가 비어 있습니다.")
+                paths.append(path)
+        git_paths = dict(zip(directories, map(Path, paths)))
     for directory in ("rebase-merge", "rebase-apply"):
         values = {}
+        root = git_paths[directory]
+        if not root.is_absolute():
+            root = worktree / root
         for name in ("orig-head", "head-name", "onto"):
-            result = effects.git(worktree, "rev-parse", "--git-path", f"{directory}/{name}",
-                         check=False)
-            if result.returncode:
-                break
-            path = Path(result.stdout.strip())
-            if not path.is_absolute():
-                path = worktree / path
+            path = root / name
             if not path.is_file():
                 break
             values[name] = path.read_text(encoding="utf-8").strip()

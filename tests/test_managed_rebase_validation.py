@@ -292,6 +292,35 @@ class CurrentRebaseObservationTests(unittest.TestCase):
         forbidden_queries = {'reflog', 'rev-list', 'range-diff', 'rebase', 'add', 'commit'}
         self.assertFalse(any(call.args[1] in forbidden_queries for call in adapters.git.call_args_list))
 
+    def test_snapshot_details_remove_duplicate_queries_but_recapture_both_observations(self):
+        adapters = self.adapters()
+        legacy, scope = observe_current_rebase(self.expected, adapters)
+        debug = adapters.git(Path(self.expected.worktree), 'ls-files', '--debug', '-z').stdout
+        buffers = []
+        def capture(worktree, *, details):
+            buffers.append(details)
+            details.update(index_debug=debug, staged_raw='', ignored_paths=('ignored.pyc',))
+            return adapters.capture_snapshot.return_value
+        optimized = replace(adapters, capture_snapshot=capture)
+        adapters.git.reset_mock()
+        actual, actual_scope = observe_current_rebase(self.expected, optimized)
+        self.assertEqual((actual, actual_scope), (legacy, scope))
+        self.assertEqual(len(buffers), 2)
+        self.assertIsNot(buffers[0], buffers[1])
+        self.assertFalse(any(call.args[1] == 'ls-files' or '--cached' in call.args
+                             for call in adapters.git.call_args_list))
+        buffers.clear()
+        def changing_capture(worktree, *, details):
+            snapshot = capture(worktree, details=details)
+            if len(buffers) == 2:
+                details['staged_raw'] = ':100644 100644 old blob M\0app.py\0'
+            return snapshot
+        failed, scope = observe_current_rebase(self.expected,
+            replace(adapters, capture_snapshot=changing_capture))
+        self.assertIsInstance(failed, ObservationFailure)
+        self.assertEqual(failed.area, 'state_changed')
+        self.assertIsNone(scope)
+
     def test_new_base_observation_uses_common_ancestor_with_retained_auxiliary_files(self):
         expected, adapters = self.expected, self.adapters()
         snapshot = adapters.capture_snapshot.return_value

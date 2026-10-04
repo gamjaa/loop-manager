@@ -5,7 +5,6 @@ from contextlib import ExitStack
 from types import SimpleNamespace
 import os
 import subprocess
-import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -285,17 +284,3 @@ class PublicationObservationBoundaryTests(unittest.TestCase):
                 self.assertEqual(callback(Path('/repo'), 'rev-parse', 'HEAD', check=False), 'observed')
             self.assertEqual(git.call_args_list, [mock.call(Path('/repo'), 'rev-parse', 'HEAD', check=False)] * 3)
         self.assertFalse(hasattr(archive.effects, 'resume_project_block_if_safe'))
-
-    def test_extracted_boundaries_import_without_the_root_module(self):
-        modules = ('git.command_adapter', 'git.github_observation', 'git.workspace', 'git.source_sync',
-                   'git.managed_rebase_runtime', 'recovery.checkpoint_adapter', 'catalog.archive_git',
-                   'recovery.pull_request_recovery', 'recovery.scope_reconciliation', 'recovery.checkpoint_recovery')
-        for module in modules:
-            with self.subTest(module=module):
-                result = subprocess.run([
-                    sys.executable, '-I', '-B', '-c',
-                    "import importlib, sys; sys.path.insert(0, sys.argv[1]); "
-                    "importlib.import_module('loop_manager_internal.' + sys.argv[2]); "
-                    "assert 'loop_manager' not in sys.modules",
-                    str(loop_manager.ROOT), module], capture_output=True, text=True, timeout=30)
-                self.assertEqual(result.returncode, 0, result.stderr)

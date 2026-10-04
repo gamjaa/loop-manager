@@ -19,58 +19,47 @@ PACKAGE = ROOT / "loop_manager_internal"
 
 
 class InternalPackageMigrationTests(unittest.TestCase):
-    def test_agent_services_import_without_loading_the_entry_point(self):
-        modules = (
-            'agent_profiles', 'agent_prompts', 'invocation_service', 'provider_adapters',
-            'scope_contracts', 'scope_observation', 'scope_validation',
-            'scope_lifecycle', 'scope_baseline', 'scope_recovery',
-        )
-        for module in modules:
-            with self.subTest(module=module):
-                result = subprocess.run(
-                    [sys.executable, '-I', '-B', '-c',
-                     "import importlib, sys; sys.path.insert(0, sys.argv[1]); "
-                     "importlib.import_module('loop_manager_internal.agents.' + sys.argv[2]); "
-                     "assert 'loop_manager' not in sys.modules",
-                     str(ROOT), module],
-                    capture_output=True, text=True, check=False, timeout=30,
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_foundation_modules_import_without_loading_the_entry_point(self):
-        modules = (
-            "runtime.contracts", "runtime.process_lock", "runtime.runtime_identity",
-            "runtime.bootstrap", "storage.database", "storage.catalog_migration",
-            "storage.planning_publication_state",
-        )
-        for module in modules:
-            with self.subTest(module=module):
-                result = subprocess.run(
-                    [sys.executable, "-I", "-B", "-c",
-                     "import importlib, sys; sys.path.insert(0, sys.argv[1]); "
-                     "importlib.import_module('loop_manager_internal.' + sys.argv[2]); "
-                     "assert 'loop_manager' not in sys.modules",
-                     str(ROOT), module],
-                    capture_output=True, text=True, check=False, timeout=30,
-                )
-                self.assertEqual(result.returncode, 0, result.stderr)
-
     def test_each_module_imports_first_without_loading_the_entry_point(self):
-        # Fresh interpreters expose import-order cycles hidden by the manager's imports.
-        for path in sorted(PACKAGE.rglob("*.py")):
-            if path.name == "__init__.py":
-                continue
-            module = ".".join(path.relative_to(ROOT).with_suffix("").parts)
+        # 모듈마다 새 interpreter에서 순환 import와 resource effect를 함께 검사한다.
+        code = """
+import importlib, sqlite3, subprocess, sys
+sys.path.insert(0, sys.argv[1])
+def forbidden(*args, **kwargs):
+    raise AssertionError('resource effect during import')
+sqlite3.connect = forbidden
+subprocess.run = forbidden
+# Windows asyncio는 import 시 Popen을 상속하므로 생성만 금지한다.
+class ForbiddenPopen(subprocess.Popen):
+    __init__ = forbidden
+subprocess.Popen = ForbiddenPopen
+importlib.import_module(sys.argv[2])
+if sys.argv[2] != 'loop_manager':
+    assert 'loop_manager' not in sys.modules
+"""
+        modules = ['loop_manager', *(".".join(path.relative_to(ROOT).with_suffix("").parts)
+                   for path in sorted(PACKAGE.rglob("*.py")) if path.name != "__init__.py")]
+        for module in modules:
             with self.subTest(module=module):
                 result = subprocess.run(
-                    [sys.executable, "-I", "-B", "-c",
-                     "import importlib, sys; sys.path.insert(0, sys.argv[1]); "
-                     "importlib.import_module(sys.argv[2]); "
-                     "assert 'loop_manager' not in sys.modules",
-                     str(ROOT), module],
-                    capture_output=True, text=True, check=False, timeout=30,
-                )
+                    [sys.executable, "-I", "-B", "-c", code, str(ROOT), module],
+                    capture_output=True, text=True, check=False, timeout=30)
                 self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_fresh_import_guard_rejects_sqlite_and_process_creation(self):
+        real_run = subprocess.run
+        with mock.patch.object(subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, '', '')) as run:
+            self.test_each_module_imports_first_without_loading_the_entry_point()
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertEqual(len({command[-1] for command in commands}), len(commands))
+        self.assertTrue(all(command[1:3] == ['-I', '-B'] for command in commands))
+        code = commands[0][4]
+        for effect in ("sqlite3.connect(':memory:')", "subprocess.run(['git', '--version'])",
+                       "subprocess.Popen(['git', '--version'])"):
+            with self.subTest(effect=effect):
+                result = real_run([sys.executable, '-I', '-B', '-c', code + '\n' + effect,
+                                   str(ROOT), 'sqlite3'], capture_output=True, text=True, timeout=30)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn('resource effect during import', result.stderr)
 
     def test_public_module_bindings_and_helper_identity_are_preserved(self):
         for name, value in vars(loop_manager).items():

@@ -6,6 +6,7 @@ from dataclasses import dataclass, replace
 import hashlib
 import json
 import os
+import re
 from pathlib import Path
 import subprocess
 
@@ -31,6 +32,13 @@ _GIT_OPERATION_PATHS = (
     "BISECT_TERMS",
 )
 
+RAW_DIFF_OPTIONS = ("--raw", "--no-abbrev", "--no-renames", "--no-ext-diff",
+                    "--no-textconv", "--ignore-submodules=none", "-z")
+_INDEX_DEBUG = re.compile(
+    rb"  ctime: [^\n]*\n  mtime: [^\n]*\n  dev: [^\n]*\n"
+    rb"  uid: [^\n]*\n  size: [^\n]*\tflags: [0-9a-fA-F]+\n"
+)
+
 @dataclass(frozen=True)
 class ObservationEffects:
     """Explicit effects supplied by the composition boundary."""
@@ -43,26 +51,43 @@ class ObservationEffects:
 
 
 def _nul_git_paths(repo: Path, *arguments: str, effects: ObservationEffects) -> list[str]:
+    raw = effects.git_bytes(repo, *arguments)
+    if raw and not raw.endswith(b"\0"):
+        raise RuntimeError("Git 경로 목록이 잘렸습니다.")
     return [
         os.fsdecode(record)
-        for record in effects.git_bytes(repo, *arguments).split(b"\0")
+        for record in raw.split(b"\0")
         if record
     ]
 
 
-def _index_entries(worktree: Path, *, effects: ObservationEffects) -> dict[str, tuple[str, ...]]:
+def _index_entries(worktree: Path, *, effects: ObservationEffects,
+                   details: dict | None = None) -> dict[str, tuple[str, ...]]:
     entries: dict[str, list[str]] = {}
-    for record in effects.git_bytes(
-        worktree, "ls-files", "--stage", "-v", "-z"
-    ).split(b"\0"):
-        if not record:
-            continue
+    raw = effects.git_bytes(worktree, "ls-files", "--stage", "-v",
+                            *(("--debug",) if details is not None else ()), "-z")
+    debug_records = []
+    position = 0
+    while position < len(raw):
+        end = raw.find(b"\0", position)
+        if end < 0:
+            raise RuntimeError("Git index snapshot이 잘렸습니다.")
+        record = raw[position:end]
+        position = end + 1
         metadata, separator, raw_path = record.partition(b"\t")
-        if not separator:
+        if not separator or not raw_path:
             raise RuntimeError("Git index snapshot을 해석할 수 없습니다.")
         entries.setdefault(os.fsdecode(raw_path), []).append(
             metadata.decode("ascii", errors="replace")
         )
+        if details is not None:
+            debug = _INDEX_DEBUG.match(raw, position)
+            if debug is None:
+                raise RuntimeError("Git index debug snapshot을 해석할 수 없습니다.")
+            debug_records.append(raw_path + b"\0" + debug.group())
+            position = debug.end()
+    if details is not None:
+        details["index_debug"] = os.fsdecode(b"".join(debug_records))
     return {
         path: tuple(sorted(metadata))
         for path, metadata in entries.items()
@@ -241,7 +266,8 @@ def _git_operation_path_signature(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _git_operation_entries(worktree: Path, *, effects: ObservationEffects) -> dict[str, str]:
+def _git_operation_entries(worktree: Path, *, effects: ObservationEffects,
+                           paths: dict | None = None) -> dict[str, str]:
     entries: dict[str, str] = {}
     arguments = tuple(value for name in _GIT_OPERATION_PATHS for value in ("--git-path", name))
     resolved_paths = effects.git(worktree, "rev-parse", *arguments).stdout.splitlines()
@@ -249,10 +275,14 @@ def _git_operation_entries(worktree: Path, *, effects: ObservationEffects) -> di
     if len(resolved_paths) != len(_GIT_OPERATION_PATHS) or any(not path for path in resolved_paths):
         resolved_paths = [effects.git(worktree, "rev-parse", "--git-path", name).stdout.strip()
                           for name in _GIT_OPERATION_PATHS]
+    if not all(resolved_paths):
+        raise RuntimeError("Git operation 경로를 확인할 수 없습니다.")
     for name, resolved in zip(_GIT_OPERATION_PATHS, resolved_paths):
         path = Path(resolved)
         if not path.is_absolute():
             path = worktree / path
+        if paths is not None:
+            paths[name] = path
         if path.exists() or path.is_symlink():
             entries[name] = _git_operation_path_signature(path)
     return entries
@@ -293,7 +323,8 @@ def _path_signature(worktree: Path, relative_path: str, *, effects: ObservationE
     return digest.hexdigest()
 
 
-def _capture_local_worktree_state(worktree: Path, *, effects: ObservationEffects) -> tuple[
+def _capture_local_worktree_state(worktree: Path, *, effects: ObservationEffects,
+                                  details: dict | None = None) -> tuple[
     str,
     str | None,
     dict[str, tuple[str, ...]],
@@ -311,7 +342,19 @@ def _capture_local_worktree_state(worktree: Path, *, effects: ObservationEffects
         check=False,
     )
     branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
-    index = _index_entries(worktree, effects=effects)
+    index = _index_entries(worktree, effects=effects, details=details)
+    if details is not None:
+        raw = effects.git_bytes(worktree, "diff", "--cached", *RAW_DIFF_OPTIONS, "--")
+        records = raw.split(b"\0")
+        if records.pop() or len(records) % 2 or any(
+                not records[n].startswith(b":") or not records[n + 1]
+                for n in range(0, len(records), 2)):
+            raise RuntimeError("Git staged diff snapshot을 해석할 수 없습니다.")
+        staged_paths = [os.fsdecode(path) for path in records[1::2]]
+        details["staged_raw"] = os.fsdecode(raw)
+    else:
+        staged_paths = _nul_git_paths(worktree, "diff", "--cached", "--name-only",
+                                      "-z", "--ignore-submodules=none", effects=effects)
     path_kinds: dict[str, set[str]] = {}
     path_groups = (
         (
@@ -327,15 +370,7 @@ def _capture_local_worktree_state(worktree: Path, *, effects: ObservationEffects
         ),
         (
             "staged",
-            _nul_git_paths(
-                worktree,
-                "diff",
-                "--cached",
-                "--name-only",
-                "-z",
-                "--ignore-submodules=none",
-                effects=effects,
-            ),
+            staged_paths,
         ),
         (
             "untracked",
@@ -355,10 +390,14 @@ def _capture_local_worktree_state(worktree: Path, *, effects: ObservationEffects
     # A changed ignore rule cannot make a new file disappear from the scope
     # snapshot. Git's current exclude result is trustworthy only when the
     # matching tracked rule is still the version at HEAD.
-    for relative_path in _nul_git_paths(
+    ignored = _nul_git_paths(
         worktree, "ls-files", "--others", "--ignored", "--exclude-standard", "-z"
-    , effects=effects):
-        source = _ignore_rule_source(worktree, relative_path, effects=effects)
+    , effects=effects)
+    if details is not None:
+        details["ignored_paths"] = tuple(ignored)
+    sources = _ignore_rule_sources(worktree, ignored, effects=effects)
+    for relative_path in ignored:
+        source = sources.get(relative_path)
         if source is None:
             raise RuntimeError(f"ignored 경로의 Git 규칙을 확인할 수 없습니다: {relative_path}")
         if source == ".gitignore" or source.endswith("/.gitignore"):
@@ -392,27 +431,36 @@ def _worktree_state_signature(worktree: Path, *, effects: ObservationEffects) ->
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _ignore_rule_source(worktree: Path, path: str, *, effects: ObservationEffects) -> str | None:
+def _ignore_rule_sources(worktree: Path, paths: list[str], *, effects: ObservationEffects) -> dict[str, str]:
+    if not paths:
+        return {}
     result = effects._handoff_run(
         [
             "git", "-C", str(worktree), "check-ignore",
             "--no-index", "-v", "-z", "--stdin",
         ],
-        input=os.fsencode(path) + b"\0",
+        input=b"".join(os.fsencode(path) + b"\0" for path in paths),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
     )
-    if result.returncode == 1:
-        return None
     fields = result.stdout.split(b"\0")
-    if (
-        result.returncode != 0
-        or len(fields) != 5
-        or fields[-1]
-        or fields[3] != os.fsencode(path)
-    ):
-        raise RuntimeError(f"ignored 경로의 Git 규칙을 확인할 수 없습니다: {path}")
-    return os.fsdecode(fields[0])
+    if result.returncode not in {0, 1} or fields.pop() or len(fields) % 4:
+        raise RuntimeError("ignored 경로의 Git 규칙 묶음을 확인할 수 없습니다.")
+    sources = {}
+    expected = set(paths)
+    for offset in range(0, len(fields), 4):
+        source, line, pattern, raw_path = fields[offset:offset + 4]
+        path = os.fsdecode(raw_path)
+        if path not in expected or path in sources or not source or not line or not pattern:
+            raise RuntimeError("ignored 경로의 Git 규칙 묶음이 불완전합니다.")
+        sources[path] = os.fsdecode(source)
+    if bool(sources) != (result.returncode == 0):
+        raise RuntimeError("ignored 경로의 Git 규칙 결과가 종료 코드와 다릅니다.")
+    return sources
+
+
+def _ignore_rule_source(worktree: Path, path: str, *, effects: ObservationEffects) -> str | None:
+    return _ignore_rule_sources(worktree, [path], effects=effects).get(path)
 
 
 def _normalize_legacy_ignored_snapshot(
@@ -447,11 +495,20 @@ def _normalize_legacy_ignored_snapshot(
     return replace(saved, dirty=dirty) if dirty != saved.dirty else saved
 
 
-def capture_git_snapshot(worktree: Path, *, effects: ObservationEffects) -> GitSnapshot:
+def capture_git_snapshot(worktree: Path, *, effects: ObservationEffects,
+                         details: dict | None = None) -> GitSnapshot:
     """Capture local and repository-wide Git state without staging content."""
 
     with snapshot_timing(effects) as observed:
-        head, branch, index, dirty = _capture_local_worktree_state(worktree, effects=observed)
+        # 상세 결과는 이 호출의 관측 안에서만 전달하고 저장 snapshot에는 넣지 않는다.
+        if details is not None:
+            details.clear()
+        head, branch, index, dirty = _capture_local_worktree_state(
+            worktree, effects=observed, **({"details": details} if details is not None else {}))
+        paths = {} if details is not None else None
+        operations = _git_operation_entries(worktree, effects=observed, paths=paths)
+        if details is not None:
+            details["git_paths"] = paths
         return GitSnapshot(
             head=head,
             branch=branch,
@@ -460,7 +517,7 @@ def capture_git_snapshot(worktree: Path, *, effects: ObservationEffects) -> GitS
             refs=_shared_ref_entries(worktree, effects=observed),
             worktrees=_registered_worktree_entries(worktree, effects=observed),
             config=_config_entries(worktree, effects=observed),
-            operations=_git_operation_entries(worktree, effects=observed),
+            operations=operations,
         )
 
 

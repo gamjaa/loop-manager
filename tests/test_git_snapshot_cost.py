@@ -8,13 +8,147 @@ from unittest import mock
 
 import loop_manager as manager
 from loop_manager_internal.agents import scope_observation
+from loop_manager_internal.git.managed_rebase_observation import (
+    ObservationAdapters, observe_current_rebase, parse_index, parse_raw_changes,
+)
+from loop_manager_internal.git.managed_rebase_validation import RebaseObservation
 from loop_manager_internal.verification import git_timing
 from loop_manager_internal.verification.git_timing import snapshot_timing
 from loop_manager_internal.verification.timing import EventWriter, summarize
 from tests.support.git import git_command, make_remote_repository
+from tests.support.rebase_observations import expectation
 
 
 class GitSnapshotCostTests(unittest.TestCase):
+    def test_real_rebase_observation_shares_reads_and_still_queries_twice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            head = git_command(repo, 'rev-parse', 'HEAD')
+            expected = expectation(repo=str(repo.resolve()), worktree=str(repo.resolve()),
+                repository_identity=str((repo / '.git').resolve()), branch='main',
+                target_base_oid=head, before_head=head)
+            git = mock.Mock(wraps=manager.git)
+            adapters = ObservationAdapters(git=git, capture_snapshot=manager.capture_git_snapshot,
+                validate_identity=mock.Mock(), read_rebase_metadata=manager._owned_rebase_metadata,
+                read_remote=mock.Mock(return_value=expected.remote),
+                read_inputs=lambda _: ('inputs', 'worker-contract'),
+                read_file=lambda root, path: ('100644', manager._path_signature(root, path)),
+                path_allowed=lambda _: True, contracts_allowed=lambda _: True)
+            legacy = observe_current_rebase(expected, replace(adapters,
+                capture_snapshot=lambda root, **_: manager.capture_git_snapshot(root)))
+            legacy_calls = git.call_count
+            git.reset_mock()
+            actual = observe_current_rebase(expected, adapters)
+            self.assertIsInstance(actual[0], RebaseObservation)
+            self.assertIsNotNone(actual[1])
+            self.assertEqual(actual, legacy)
+            self.assertEqual(legacy_calls - git.call_count, 6)
+            self.assertEqual(adapters.read_remote.call_count, 4)
+            self.assertFalse(any(call.args[1] == 'ls-files' or '--cached' in call.args
+                                 for call in git.call_args_list))
+
+    def test_details_share_index_diff_ignored_and_paths_without_changing_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            (repo / '.gitignore').write_text('*.cache\n', encoding='utf-8')
+            git_command(repo, 'add', '.gitignore')
+            git_command(repo, 'commit', '-m', 'Ignore artifacts')
+            for name in ('one.cache', 'two space.cache'):
+                (repo / name).write_text('ignored', encoding='utf-8')
+            (repo / 'src/app.py').write_text('changed', encoding='utf-8')
+            git_command(repo, 'add', 'src/app.py')
+            git_command(repo, 'update-index', '--skip-worktree', 'README.md')
+            expected = manager.capture_git_snapshot(repo)
+            effects = manager._scope_observation_effects()
+            git = mock.Mock(wraps=effects.git)
+            git_bytes = mock.Mock(wraps=effects.git_bytes)
+            process = mock.Mock(wraps=effects._handoff_run)
+            details = {'stale': 'must disappear'}
+            actual = scope_observation.capture_git_snapshot(repo, details=details,
+                effects=replace(effects, git=git, git_bytes=git_bytes, _handoff_run=process))
+            self.assertEqual(actual.serialize(), expected.serialize())
+            self.assertNotIn('stale', details)
+            entries = parse_index(actual.index, details['index_debug'])
+            self.assertTrue(next(entry for entry in entries if entry.path == 'README.md').flags)
+            self.assertEqual([change.path for change in parse_raw_changes(details['staged_raw'])], ['src/app.py'])
+            self.assertEqual(set(details['ignored_paths']), {'one.cache', 'two space.cache'})
+            self.assertEqual(process.call_count, 1, 'ignored 파일 수와 subprocess 수를 분리한다')
+            self.assertEqual(sum(call.args[1] == 'diff' for call in git_bytes.call_args_list), 2)
+            self.assertEqual(sum(call.args[1] == 'ls-files' and '--stage' in call.args
+                                 for call in git_bytes.call_args_list), 1)
+            metadata_dir = details['git_paths']['rebase-merge']
+            metadata_dir.mkdir()
+            for name, value in (('orig-head', 'before'), ('head-name', 'refs/heads/main'), ('onto', 'target')):
+                (metadata_dir / name).write_text(value, encoding='utf-8')
+            with mock.patch.object(manager, 'git', wraps=manager.git) as read:
+                self.assertEqual(manager._owned_rebase_metadata(repo, git_paths=details['git_paths'])['onto'], 'target')
+                read.assert_not_called()
+                self.assertEqual(manager._owned_rebase_metadata(repo)['onto'], 'target')
+                self.assertEqual(read.call_count, 1)
+            (metadata_dir / 'onto').write_text('advanced', encoding='utf-8')
+            self.assertEqual(manager._owned_rebase_metadata(repo, git_paths=details['git_paths'])['onto'], 'advanced')
+            (repo / '.gitignore').write_text('*.cache\nchanged-ignore\n', encoding='utf-8')
+            changed = manager.capture_git_snapshot(repo, details=details)
+            self.assertIn('one.cache', changed.dirty)
+            self.assertIn('two space.cache', changed.dirty)
+
+    def test_batched_ignore_sources_reject_malformed_results_and_missing_rules(self):
+        effects = manager._scope_observation_effects()
+        with self.assertRaisesRegex(RuntimeError, '목록이 잘렸습니다'):
+            scope_observation._nul_git_paths(Path('/repo'), 'ls-files', '--others',
+                effects=replace(effects, git_bytes=mock.Mock(return_value=b'ignored.cache')))
+        valid = b'.gitignore\0' + b'1\0*.cache\0one.cache\0'
+        for output, code in ((valid + valid, 0), (valid[:-1], 0),
+                             (valid.replace(b'one.cache', b'other.cache'), 0),
+                             (valid, 1), (b'', 128)):
+            with self.subTest(output=output, code=code):
+                process = mock.Mock(return_value=subprocess.CompletedProcess([], code, output))
+                with self.assertRaises(RuntimeError):
+                    scope_observation._ignore_rule_sources(Path('/repo'), ['one.cache'],
+                        effects=replace(effects, _handoff_run=process))
+        process = mock.Mock(return_value=subprocess.CompletedProcess([], 0, valid))
+        sources = scope_observation._ignore_rule_sources(Path('/repo'), ['one.cache', 'missing'],
+            effects=replace(effects, _handoff_run=process))
+        self.assertEqual(sources, {'one.cache': '.gitignore'})
+        self.assertEqual(process.call_args.kwargs['input'], b'one.cache\0missing\0')
+        with self.assertRaisesRegex(RuntimeError, '규칙을 확인할 수 없습니다: missing'):
+            scope_observation._capture_local_worktree_state(Path('/repo'), effects=replace(
+                effects, git=mock.Mock(return_value=subprocess.CompletedProcess([], 0, 'head\n')),
+                git_bytes=mock.Mock(side_effect=[b'', b'', b'', b'', b'one.cache\0missing\0']),
+                _handoff_run=process))
+        process.return_value = subprocess.CompletedProcess([], 1, b'')
+        self.assertIsNone(scope_observation._ignore_rule_source(Path('/repo'), 'missing',
+            effects=replace(effects, _handoff_run=process)))
+
+    def test_combined_index_debug_preserves_stages_and_unusual_path_and_fails_closed(self):
+        effects = manager._scope_observation_effects()
+        path = 'tab\tline\nname'
+        raw = b''.join(
+            f'M 100644 blob-{stage} {stage}\t{path}\0'.encode() +
+            f'  ctime: 1:1\n  mtime: 1:1\n  dev: 1\tino: 1\n  uid: 1\tgid: 1\n  size: 1\tflags: {stage << 12:x}\n'.encode()
+            for stage in (1, 2, 3))
+        details = {}
+        fake = replace(effects, git_bytes=mock.Mock(return_value=raw))
+        index = scope_observation._index_entries(Path('/repo'), effects=fake, details=details)
+        self.assertEqual([entry.stage for entry in parse_index(index, details['index_debug'])], [1, 2, 3])
+        self.assertEqual(set(index), {path})
+        for malformed in (raw[:-1], raw.replace(b'flags: 1000', b'flags: invalid'), raw + b'truncated'):
+            with self.subTest(malformed=malformed), self.assertRaises(RuntimeError):
+                scope_observation._index_entries(Path('/repo'), details={},
+                    effects=replace(effects, git_bytes=mock.Mock(return_value=malformed)))
+
+    def test_metadata_query_failure_and_empty_operation_paths_are_not_absence(self):
+        with mock.patch.object(manager, 'git', return_value=subprocess.CompletedProcess([], 128, '')):
+            with self.assertRaisesRegex(RuntimeError, 'metadata 경로'):
+                manager._owned_rebase_metadata(Path('/repo'))
+        with mock.patch.object(manager, 'git', return_value=subprocess.CompletedProcess([], 0, '')):
+            with self.assertRaisesRegex(RuntimeError, '경로가 비어 있습니다'):
+                manager._owned_rebase_metadata(Path('/repo'))
+        effects = replace(manager._scope_observation_effects(),
+            git=mock.Mock(return_value=subprocess.CompletedProcess([], 0, '')))
+        with self.assertRaisesRegex(RuntimeError, 'operation 경로'):
+            scope_observation._git_operation_entries(Path('/repo'), effects=effects)
+
     def test_operation_batch_matches_single_queries_and_recaptures_each_worktree(self):
         with tempfile.TemporaryDirectory(prefix="snapshot cost ") as directory:
             repo = make_remote_repository(directory)
