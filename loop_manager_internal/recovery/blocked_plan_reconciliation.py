@@ -23,6 +23,7 @@ from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 from loop_manager_internal.execution.verify_process import VerifyTerminationUncertain
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 
@@ -149,8 +150,11 @@ def validated_scope_refs(
                 and owned_remote_oid(
                     connection, repo_path, repo, plan_id, plan['branch'], Path(plan['worktree']),
                     tracked[0], git, before_head=current.head,
-                    recorded_oid=plan['publication_remote_oid'], require_live=False) == tracked[0]):
+                    recorded_oid=plan['publication_remote_oid'], require_live=False,
+                    strict_observation=True) == tracked[0]):
             allowed.add(branch_ref)
+    except RecoveryFailure:
+        raise
     except (OSError, RuntimeError, ValueError):
         return frozenset()
     return frozenset(allowed)
@@ -294,7 +298,8 @@ class BlockedPlanReconciler:
             if self.ports.owned_remote_oid(
                     self.connection, self.repo_path, self.repo, plan['plan_id'], plan['branch'],
                     Path(plan['worktree']), context['branch_oid'], self.ports.git,
-                    before_head=head, recorded_oid=current['publication_remote_oid']) is None:
+                    before_head=head, recorded_oid=current['publication_remote_oid'],
+                    strict_observation=True) is None:
                 raise RuntimeError('마지막 채택 원격 OID와 게시 checkpoint 소유권을 증명할 수 없습니다.')
             checkpoints = ExecutionCheckpointRepository(self.connection)
             checkpoint = checkpoints.get(self.repo, plan['plan_id'])
@@ -587,6 +592,8 @@ class BlockedPlanReconciler:
                 'SELECT phase FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?',
                 (self.repo, plan_id)).fetchone()
             retry = (checkpoint.operation is not None or isinstance(error, AssessmentPending)
+                     or isinstance(error, RecoveryFailure)
+                     and error.reason is RecoveryReason.PUBLICATION_RETRY
                      or request is not None and request['phase'] == 'retry_pending')
             self.ports._update_blocked_error(self.connection, self.repo, plan_id, str(error), preserve_cause=True)
             if not retry:

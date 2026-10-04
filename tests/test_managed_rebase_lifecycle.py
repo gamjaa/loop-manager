@@ -9,6 +9,7 @@ from contextlib import nullcontext
 from dataclasses import replace
 import os
 from pathlib import Path
+from types import SimpleNamespace
 import sqlite3
 import subprocess
 from tempfile import TemporaryDirectory
@@ -22,6 +23,9 @@ from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, 
 from loop_manager_internal.execution.execution_state import ExecutionStatePort
 import loop_manager as lm
 from loop_manager_internal.git import manager_git_journal as journal
+from loop_manager_internal.git import direct_rebase_service, managed_rebase_publication
+from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.execution.worker_session import SessionBinding
 from tests.support import execution as policy_fixture
@@ -29,6 +33,124 @@ from tests.support import execution as policy_fixture
 
 class SimulatedProcessExit(BaseException):
     pass
+
+
+class RebaseObservationFailureTests(unittest.TestCase):
+    def test_preflight_database_failure_preserves_publication_intent(self):
+        intent = {'remote_before': 'old', 'head': 'new'}
+        current = SimpleNamespace(
+            operation='rebase_publish', snapshot={'rebase_publication_intent': intent},
+            rebase_publication_intent=lambda: intent,
+        )
+        for edge in ('checkpoint', 'state', 'owner'):
+            with self.subTest(edge=edge):
+                checkpoints = mock.Mock()
+                checkpoints.get.return_value = current
+                state = mock.Mock()
+                state.row.return_value = {}
+                git = mock.Mock()
+                lookup_pr = mock.Mock()
+                service = mock.Mock()
+                if edge == 'checkpoint':
+                    checkpoints.get.side_effect = sqlite3.OperationalError('database is locked')
+                elif edge == 'state':
+                    state.row.side_effect = sqlite3.OperationalError('database is locked')
+                else:
+                    checkpoints.connection.execute.side_effect = sqlite3.OperationalError('database is locked')
+
+                with self.assertRaises(managed_rebase_publication.RebaseObservationRetry) as caught:
+                    managed_rebase_publication.publish_checkpoint(
+                        state=state, checkpoints=checkpoints, repo='/repo',
+                        plan_id='G-001', repo_path=Path('/repo'), worktree=Path('/worktree'),
+                        branch='loop-manager/G-001', service=service,
+                        owns_remote=mock.Mock(), git=git, lookup_pr=lookup_pr)
+
+                self.assertIs(caught.exception.reason, RecoveryReason.PUBLICATION_RETRY)
+                self.assertEqual(current.snapshot['rebase_publication_intent'], intent)
+                checkpoints.begin_rebase_publication.assert_not_called()
+                state.complete_rebase_publication.assert_not_called()
+                git.assert_not_called()
+                lookup_pr.assert_not_called()
+                service.assert_not_called()
+
+    def test_pr_lookup_failure_retries_saved_rebase_intent(self):
+        intent = {'remote_before': 'old', 'head': 'new'}
+        current = SimpleNamespace(
+            operation='rebase_publish', snapshot={'rebase_publication_intent': intent},
+            rebase_publication_intent=lambda: intent,
+        )
+        checkpoints = mock.Mock()
+        checkpoints.get.return_value = current
+        checkpoints.connection.execute.return_value.fetchone.return_value = None
+        state = mock.Mock()
+        state.row.return_value = {'pr_url': None, 'pr_conflict_recovery': None}
+        git = mock.Mock()
+        with mock.patch.object(managed_rebase_publication.manager_git_journal,
+                               'live_remote_branch_oid', return_value='old'):
+            with self.assertRaises(managed_rebase_publication.RebaseObservationRetry):
+                managed_rebase_publication.publish_checkpoint(
+                    state=state, checkpoints=checkpoints, repo='/repo',
+                    plan_id='G-001', repo_path=Path('/repo'), worktree=Path('/worktree'),
+                    branch='loop-manager/G-001', service=mock.Mock(),
+                    owns_remote=mock.Mock(), git=git,
+                    lookup_pr=mock.Mock(side_effect=RuntimeError('changed diagnostic')))
+        git.assert_not_called()
+
+    def test_direct_rebase_observation_failure_retries_but_rejection_remains_false(self):
+        service = mock.Mock()
+        effects = direct_rebase_service.DirectRebaseHistoryProvenEffects(
+            _current_rebase_service=lambda *args, **kwargs: service,
+            _owned_rebase_state_dir=lambda *args: Path('/state'),
+        )
+        args = (None, Path('/repo'), '/repo', 'G-001', Path('/worktree'),
+                'loop-manager/G-001', 'before', 'after', 'base', None)
+        service.observe.side_effect = RuntimeError('different diagnostic')
+        with self.assertRaises(RecoveryFailure) as caught:
+            direct_rebase_service._direct_rebase_history_proven(effects, *args)
+        self.assertIs(caught.exception.reason, RecoveryReason.PUBLICATION_RETRY)
+        service.observe.side_effect = None
+        service.observe.return_value = (
+            SimpleNamespace(head='after'), SimpleNamespace(status=RebaseStatus.REJECTED))
+        self.assertFalse(direct_rebase_service._direct_rebase_history_proven(effects, *args))
+        service.observe.return_value = (
+            SimpleNamespace(detail='unavailable'), SimpleNamespace(status=RebaseStatus.UNAVAILABLE))
+        with self.assertRaises(RecoveryFailure) as caught:
+            direct_rebase_service._direct_rebase_history_proven(effects, *args)
+        self.assertIs(caught.exception.reason, RecoveryReason.PUBLICATION_RETRY)
+
+    def test_remote_query_failure_retries_without_rebase_publication(self):
+        current = SimpleNamespace(
+            operation='rebase_publish',
+            snapshot={'rebase_publication_intent': {'remote_before': 'old', 'head': 'new'}},
+            rebase_publication_intent=lambda: {'remote_before': 'old', 'head': 'new'},
+        )
+        checkpoints = mock.Mock()
+        checkpoints.get.return_value = current
+        checkpoints.connection.execute.return_value.fetchone.return_value = None
+        state = mock.Mock()
+        state.row.return_value = {}
+        git = mock.Mock()
+        with mock.patch.object(managed_rebase_publication.manager_git_journal,
+                               'live_remote_branch_oid',
+                               side_effect=journal.MutationEvidenceError('changed text')):
+            with self.assertRaises(RecoveryFailure) as caught:
+                managed_rebase_publication.publish_checkpoint(
+                    state=state, checkpoints=checkpoints, repo='/repo',
+                    plan_id='G-001', repo_path=Path('/repo'), worktree=Path('/worktree'),
+                    branch='loop-manager/G-001', service=mock.Mock(),
+                    owns_remote=mock.Mock(), git=git, lookup_pr=mock.Mock())
+        self.assertIs(caught.exception.reason, RecoveryReason.PUBLICATION_RETRY)
+        self.assertIsInstance(caught.exception, managed_rebase_publication.RebaseObservationRetry)
+        git.assert_not_called()
+        with mock.patch.object(managed_rebase_publication.manager_git_journal,
+                               'live_remote_branch_oid', return_value='unexpected'):
+            with self.assertRaises(RecoveryFailure) as caught:
+                managed_rebase_publication.publish_checkpoint(
+                    state=state, checkpoints=checkpoints, repo='/repo',
+                    plan_id='G-001', repo_path=Path('/repo'), worktree=Path('/worktree'),
+                    branch='loop-manager/G-001', service=mock.Mock(),
+                    owns_remote=mock.Mock(), git=git, lookup_pr=mock.Mock())
+        self.assertIs(caught.exception.reason, RecoveryReason.REMOTE_OID_UNCERTAIN)
 
 
 @unittest.skipIf(os.name == "nt", "Linux mode-bit and bash verification fixture")

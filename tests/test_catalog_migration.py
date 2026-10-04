@@ -5,10 +5,41 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 import loop_manager
+from loop_manager_internal.catalog.catalog_service import BackfillPlanShasEffects, backfill_plan_shas
+from loop_manager_internal.runtime.contracts import GitLockError
 from tests.support.catalog import make_catalog_root, write_execplan
 from tests.support.git import git_command, make_remote_repository, commit_and_push
+
+
+class BackfillObservationTests(unittest.TestCase):
+    def test_failed_git_history_does_not_block_or_backfill_project(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        connection.execute(
+            "CREATE TABLE projects (repo TEXT, plan_path TEXT, plan_sha TEXT, phase TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO projects VALUES ('/repo', 'docs/plans/plan.md', NULL, 'WORKING')"
+        )
+        effects = BackfillPlanShasEffects(
+            _plan_id_from_path=lambda path: "G-001",
+            git=lambda *args, **kwargs: SimpleNamespace(returncode=128, stdout=""),
+        )
+        with self.assertRaisesRegex(RuntimeError, "backfill"):
+            backfill_plan_shas(effects, connection)
+        self.assertIsNone(connection.execute("SELECT plan_sha FROM projects").fetchone()[0])
+        self.assertEqual(connection.execute("SELECT phase FROM projects").fetchone()[0], "WORKING")
+        def locked_git(*args, **kwargs):
+            raise GitLockError('different lock diagnostic')
+        locked = BackfillPlanShasEffects(
+            _plan_id_from_path=lambda path: "G-001", git=locked_git,
+        )
+        with self.assertRaises(GitLockError):
+            backfill_plan_shas(locked, connection)
+        connection.close()
 
 
 class CatalogMigrationTest(AutomationCatalogFixture, unittest.TestCase):

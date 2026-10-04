@@ -29,6 +29,7 @@ class GitChangeContext:
     commits: tuple[ChangedCommit, ...]
     truncated: bool
     error: str | None = None
+    observation_failed: bool = False
 
     @property
     def ok(self) -> bool:
@@ -36,15 +37,15 @@ class GitChangeContext:
 
 
 def _git(repo: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["git", "-C", str(repo), *arguments],
-        check=False,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
+    command = ["git", "-C", str(repo), *arguments]
+    try:
+        return subprocess.run(
+            command, check=False, text=True, encoding="utf-8",
+            errors="replace", stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except OSError:
+        return subprocess.CompletedProcess(command, 127, "")
 
 
 def _bounded_git_output(
@@ -118,9 +119,9 @@ def _bounded_git_output(
 
 
 def _context_error(
-    baseline: str, current: str, detail: str
+    baseline: str, current: str, detail: str, *, observation_failed: bool = False,
 ) -> GitChangeContext:
-    return GitChangeContext(baseline, current, (), False, detail)
+    return GitChangeContext(baseline, current, (), False, detail, observation_failed)
 
 
 def _normalized_path(raw: str) -> str | None:
@@ -148,10 +149,16 @@ def bounded_remote_change_context(
         repo, "rev-parse", "--verify", f"{remote_ref}^{{commit}}"
     )
     if remote.returncode or remote.stdout.strip() != current_commit:
+        missing_remote = False
+        if remote.returncode:
+            missing_remote = _git(
+                repo, "show-ref", "--verify", "--quiet", remote_ref
+            ).returncode == 1
         return _context_error(
             baseline_commit,
             current_commit,
             f"현재 원격 기준 commit을 확인할 수 없습니다: origin/{base_branch}",
+            observation_failed=bool(remote.returncode) and not missing_remote,
         )
     baseline = _git(
         repo, "cat-file", "-e", f"{baseline_commit}^{{commit}}"
@@ -161,6 +168,7 @@ def bounded_remote_change_context(
             baseline_commit,
             current_commit,
             "직전 성공 평가 commit이 원격 이력에 없습니다.",
+            observation_failed=baseline.returncode != 1,
         )
     ancestor = _git(
         repo, "merge-base", "--is-ancestor", baseline_commit, current_commit
@@ -170,6 +178,7 @@ def bounded_remote_change_context(
             baseline_commit,
             current_commit,
             "직전 성공 평가 commit이 현재 원격 이력의 조상이 아닙니다.",
+            observation_failed=ancestor.returncode != 1,
         )
     listed = _git(
         repo,
@@ -183,6 +192,7 @@ def bounded_remote_change_context(
             baseline_commit,
             current_commit,
             "원격 변경 commit 범위를 안전하게 읽을 수 없습니다.",
+            observation_failed=True,
         )
     newest_first = [line for line in listed.stdout.splitlines() if line]
     truncated = len(newest_first) > MAX_CHANGE_COMMITS
@@ -221,6 +231,7 @@ def bounded_remote_change_context(
                 baseline_commit,
                 current_commit,
                 "원격 변경 commit 내용을 안전하게 읽을 수 없습니다.",
+                observation_failed=True,
             )
         subject = subject_result.stdout.rstrip("\n")
         truncated = truncated or subject_overflow or paths_overflow

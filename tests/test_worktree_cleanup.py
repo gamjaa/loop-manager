@@ -320,8 +320,9 @@ class WorktreeCleanupTest(CleanupFixture, unittest.TestCase):
     def test_pr_queries_request_immutable_head_oid(self):
         response = subprocess.CompletedProcess(
             ["gh"], 0, stdout=(
-                '{"url":"u","state":"MERGED","mergedAt":"t",'
-                '"headRefOid":"abc","baseRefName":"main"}'
+                '{"url":"https://example.test/pr/7","state":"MERGED","mergedAt":"t",'
+                '"headRefOid":"abc","headRefName":"loop-manager/G-007",'
+                '"baseRefName":"main","mergeable":"UNKNOWN"}'
             ),
         )
         with mock.patch("loop_manager.command", return_value=response) as command:

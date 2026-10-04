@@ -6,6 +6,9 @@ from loop_manager_internal.git import manager_git_journal
 from loop_manager_internal.git import managed_rebase_adoption
 from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
 from loop_manager_internal.recovery import checkpoint_ownership
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
+import sqlite3
 
 from loop_manager_internal.execution.execution_session import ExecutionIdentity
 from loop_manager_internal.execution.execution_state import ExecutionStatePort
@@ -37,12 +40,16 @@ class OwnershipHandler:
         self, context, row, remote_oid, current, pull_request=None,
     ):
         """Require the published checkpoint's durable owner on an active resume."""
-        checkpoint = self.ports.state.connection.execute(
-            'SELECT phase, accepted_remote_oid, request_identity, branch, worktree '
-            'FROM blocked_checkpoints '
-            'WHERE repo = ? AND plan_id = ?',
-            (self.ports.identity.repo, context.plan.plan_id),
-        ).fetchone()
+        try:
+            checkpoint = self.ports.state.connection.execute(
+                'SELECT phase, accepted_remote_oid, request_identity, branch, worktree '
+                'FROM blocked_checkpoints '
+                'WHERE repo = ? AND plan_id = ?',
+                (self.ports.identity.repo, context.plan.plan_id),
+            ).fetchone()
+        except sqlite3.OperationalError as error:
+            raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
+                                  'checkpoint database observation failed') from error
         if checkpoint is None or checkpoint['phase'] != 'published':
             return True
         if current is not None and current.operation == 'rebase':
@@ -82,8 +89,11 @@ class OwnershipHandler:
                 local_oid = self.ports.git(
                     context.worktree, 'rev-parse', 'HEAD',
                 ).stdout.strip()
-            except (RuntimeError, OSError):
+            except WorkspaceOwnershipError:
                 return False
+            except (RuntimeError, OSError) as error:
+                raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
+                                      'checkpoint worktree observation failed') from error
             if local_oid != remote_oid:
                 return False
             return checkpoint_ownership.owned_remote_oid(
@@ -91,6 +101,7 @@ class OwnershipHandler:
                 context.plan.plan_id, context.branch, context.worktree,
                 remote_oid, self.ports.git,
                 before_head=local_oid, recorded_oid=remote_oid,
+                strict_observation=True,
             ) == remote_oid
         return False
 
@@ -135,6 +146,7 @@ class OwnershipHandler:
                     and not checkpoint_ownership.committed_tree_matches_intent(
                         self.ports.identity.repo_path, current.expected_head, local,
                         current.snapshot or {}, self.ports.git,
+                        strict_observation=True,
                     )):
                 return False
             if checkpoint_ownership.owned_remote_oid(
@@ -142,6 +154,7 @@ class OwnershipHandler:
                 context.plan.plan_id, context.branch, context.worktree,
                 original, self.ports.git,
                 before_head=local, require_live=False,
+                strict_observation=True,
             ) != original:
                 return False
             pending_push = (
@@ -164,11 +177,23 @@ class OwnershipHandler:
                 self.ports.identity.repo_path, 'ls-remote', '--heads', 'origin',
                 f'refs/heads/{context.branch}', check=False,
             )
-        except (RuntimeError, OSError):
+        except RecoveryFailure:
+            raise
+        except WorkspaceOwnershipError:
             return False
-        return (observed.returncode == 0 and
-                [line.split() for line in observed.stdout.splitlines() if line.strip()]
-                == [[expected_live, f'refs/heads/{context.branch}']])
+        except (RuntimeError, OSError) as error:
+            raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
+                                  'checkpoint review ownership observation failed') from error
+        if observed.returncode:
+            raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
+                                  'checkpoint review remote observation failed')
+        ref = f'refs/heads/{context.branch}'
+        rows = [line.split() for line in observed.stdout.splitlines() if line.strip()]
+        if rows and (len(rows) != 1 or len(rows[0]) != 2 or rows[0][1] != ref):
+            raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
+                                  'checkpoint review remote response malformed')
+        live_oid = rows[0][0] if rows else None
+        return live_oid == expected_live
 
     def _current_rebase_service(self, context, **options):
         factory = self.ports.current_rebase_service
@@ -218,6 +243,7 @@ class OwnershipHandler:
                 context.plan.plan_id, context.branch, context.worktree,
                 original, self.ports.git, recorded_oid=original,
                 require_live=remote_oid == original,
+                strict_observation=True,
             ) != original:
                 return False
             service = self.ports._current_rebase_service(context, remote_oid=remote_oid)
@@ -229,14 +255,27 @@ class OwnershipHandler:
                     service.expected, remote=replace(service.expected.remote,
                         pull_request=PullRequest(str(pull_request['url']), self.ports.identity.repo,
                             context.branch, remote_oid, 'OPEN'))))
-            observed, decision = service.require_owned(checkpoint=current)
+            observed, decision = service.observe(checkpoint=current)
+            if decision.status is RebaseStatus.UNAVAILABLE:
+                raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
+                                      'checkpoint rebase observation unavailable')
+            if decision.status not in {RebaseStatus.START, RebaseStatus.WAITING, RebaseStatus.COMPLETE}:
+                return False
             if current.operation == 'commit' and observed.head != current.expected_head:
                 return checkpoint_ownership.committed_tree_matches_intent(
                     self.ports.identity.repo_path, current.expected_head, observed.head,
-                    current.snapshot or {}, self.ports.git)
-            return decision.status in {RebaseStatus.START, RebaseStatus.WAITING, RebaseStatus.COMPLETE}
-        except (RuntimeError, OSError, KeyError, TypeError):
+                    current.snapshot or {}, self.ports.git,
+                    strict_observation=True)
+            return True
+        except RecoveryFailure:
+            raise
+        except manager_git_journal.MutationEvidenceError:
             return False
+        except (WorkspaceOwnershipError, KeyError, TypeError):
+            return False
+        except (RuntimeError, OSError) as error:
+            raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
+                                  'checkpoint rebase ownership observation failed') from error
 
     def _owned_detached_rebase(self, context, row, remote_oid, current, checkpoint, pull_request):
         return self._owned_current_checkpoint_rebase(
@@ -365,4 +404,3 @@ class OwnershipHandler:
         if ancestry.returncode not in (0, 1):
             raise manager_git_journal.MutationEvidenceError('legacy rebase target ancestry unavailable')
         return ancestry.returncode == 1
-

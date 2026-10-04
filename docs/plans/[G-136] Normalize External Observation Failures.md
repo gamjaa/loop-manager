@@ -33,10 +33,16 @@ Keep absent evidence separate from failed Git, GitHub and filesystem observation
 
 ## Progress
 
-- [ ] Define failure disposition at existing external observation boundaries.
-- [ ] Add fault injection for absence, transient error and unsafe uncertainty.
+- [x] Define failure disposition at existing external observation boundaries.
+- [x] Add fault injection for absence, transient error and unsafe uncertainty.
 
 ## Decision Log
 
 - Manifest findings 3, 6, 7, 11, 13, 15, 19, 23 and 24 share an evidence-classification responsibility. The plan leaves policy decisions in their current services and does not reinterpret a failed lookup as permission to proceed.
 - Observed caller paths: `loop_manager_internal/catalog/catalog_service.py`, `loop_manager_internal/execution/plan_validation.py`, `loop_manager_internal/execution/execution_ownership_handler.py`, `loop_manager_internal/git/direct_rebase_service.py`, `loop_manager_internal/git/managed_rebase_publication.py`, `loop_manager_internal/git/github_observation.py`, `loop_manager_internal/maintenance/maintenance_git.py`, `loop_manager_internal/planning/planner_validation.py`.
+- Catalog SHA backfill now stops on failed Git history before changing SQLite or recording a safety block. Revision documents and Planner base paths use successful tree evidence to confirm absence; file stat/read and READY revision I/O failures remain operational, while confirmed missing READY declarations retain the validation refusal.
+- GitHub observation validates command success and the requested PR JSON shape before returning a PR or confirmed empty list. The services retain PR identity and publication decisions. Managed rebase publication, direct rebase proof, checkpoint ownership and both plan/project blocked recovery use typed retry results for failed Git/SQLite observations; valid remote mismatch, ancestry failure and rejected rebase state remain safety refusals. Recovery disposition uses result and exception types, not diagnostic wording.
+- Bounded maintenance Git context marks command/stream failure separately from confirmed missing baseline or nonancestor evidence; preparation pauses without saving a Planner error for failed observation. Targeted fault injection covers these distinctions.
+- Rebase publication marks failed remote, PR, current-state and ownership reads with a distinct retry type; a rejected push keeps its saved intent and existing blocked-release result. Published review and project-block ownership compare one exact remote ref/OID record, while empty output remains confirmed absence and malformed records remain retryable.
+- Revision gate document and worktree I/O failures now use transient status recovery while preserving the Worker session; invalid declarations retain their final input decision. Rebase publication also classifies checkpoint, state and owner SQLite preflight read failures before any remote effect, preserving the saved intent for retry.
+- Review follow-up: ExecPlan body hashes and Review issue fingerprints now reuse the revision document adapter. Failed `git show` with an existing or unreadable tree remains operational; only confirmed absence retains the input-error or missing-document fingerprint. Fault injection reaches the real body reader through the revision gate and the real Review reader through blocked release, verifying session and block preservation. Current-candidate targeted observation tests pass; the existing Linux verify entry point remains applicable.

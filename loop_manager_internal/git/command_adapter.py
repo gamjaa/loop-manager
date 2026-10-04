@@ -79,3 +79,42 @@ def git_bytes(effects: GitBytesEffects, repo: Path, *arguments: str) -> bytes:
             raise GitLockError(message)
         raise RuntimeError(message)
     return result.stdout
+
+
+class ExternalObservationError(RuntimeError):
+    """A read failed before absence or an ownership decision could be made."""
+
+
+def revision_path_exists(git: Callable[..., object], repo: Path,
+                         revision: str, path: str) -> bool:
+    """Require a successful exact tree query before classifying a path."""
+    try:
+        tree = git(repo, "ls-tree", "-z", "--full-tree", revision, "--", path)
+    except GitLockError:
+        raise
+    except (RuntimeError, OSError) as error:
+        raise ExternalObservationError(f"Git revision tree 조회에 실패했습니다: {path}") from error
+    if tree.returncode:
+        raise ExternalObservationError(f"Git revision tree 조회에 실패했습니다: {path}")
+    records = [record for record in tree.stdout.split("\0") if record]
+    if any(record.partition("\t")[2] != path for record in records):
+        raise ExternalObservationError(f"Git tree 경로 관측이 유효하지 않습니다: {path}")
+    return bool(records)
+
+
+def revision_document_or_none(git: Callable[..., object], repo: Path,
+                              revision: str, path: str) -> str | None:
+    """Read a revision path; only a successful tree query can prove absence."""
+    try:
+        shown = git(repo, "show", f"{revision}:{path}")
+    except GitLockError:
+        raise
+    except (RuntimeError, OSError) as error:
+        if not revision_path_exists(git, repo, revision, path):
+            return None
+        raise ExternalObservationError(f"Git revision 문서 조회에 실패했습니다: {path}") from error
+    if shown.returncode == 0:
+        return shown.stdout
+    if not revision_path_exists(git, repo, revision, path):
+        return None
+    raise ExternalObservationError(f"Git revision 문서 조회에 실패했습니다: {path}")

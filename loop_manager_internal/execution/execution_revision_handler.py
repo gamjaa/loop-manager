@@ -11,6 +11,7 @@ from loop_manager_internal.execution.execution_runtime import ExecutionContext, 
 from loop_manager_internal.storage.requirement_archive_state import ArchiveTargetRepository, ArchiveTargetConflict
 from loop_manager_internal.catalog.requirement_archive_recovery import ArchiveRecoveryPorts, ArchiveRecoveryService
 from loop_manager_internal.execution.worker_outcome import WorkerOutcomeError
+from loop_manager_internal.git.command_adapter import ExternalObservationError
 
 from loop_manager_internal.execution.execution_effects import ExecutionContract
 from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot
@@ -432,6 +433,8 @@ class RevisionHandler:
             return self._revision_error(
                 context, f"ExecPlan revision gate 확인 실패: {error}"
             )
+        except (ExternalObservationError, OSError) as error:
+            return self.ports._recover(RecoveryReason.STATUS_FAILED, str(error), context=context)
         except (RuntimeError, ValueError) as error:
             return self._revision_error(
                 context, f"ExecPlan revision gate 확인 실패: {error}"
@@ -646,6 +649,8 @@ class RevisionHandler:
                 ))
         except RecoveryFailure:
             raise
+        except (ExternalObservationError, OSError) as error:
+            return self.ports._recover(RecoveryReason.STATUS_FAILED, str(error), context=context)
         except RuntimeError as error:
             return self._revision_error(context, str(error))
         if self.ports.snapshot()._archive_snapshot is not None:

@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from typing import Callable
 from loop_manager_internal.recovery import blocked_checkpoint
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 
 
 def owned_remote_oid(
@@ -15,14 +16,21 @@ def owned_remote_oid(
     git: Callable[..., object], *, before_head: str | None = None,
     recorded_oid: str | None = None,
     require_live: bool = True,
+    strict_observation: bool = False,
 ) -> str | None:
     """Return an OID only when durable identity and live origin both prove it."""
     if not remote_oid:
         return None
-    row = connection.execute(
-        "SELECT * FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?",
-        (repo, plan_id),
-    ).fetchone()
+    try:
+        row = connection.execute(
+            "SELECT * FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?",
+            (repo, plan_id),
+        ).fetchone()
+    except sqlite3.OperationalError as error:
+        if strict_observation:
+            raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
+                                  'checkpoint ownership database observation failed') from error
+        raise
     if row is None or any((
         row['phase'] != 'published', row['result'] != 'published',
         row['branch'] != branch, row['worktree'] != str(worktree),
@@ -65,27 +73,51 @@ def owned_remote_oid(
                 )
             ):
                 return None
-        if git(repo_path, 'merge-base', '--is-ancestor', published,
-               remote_oid, check=False).returncode != 0:
+        ancestry = git(repo_path, 'merge-base', '--is-ancestor', published,
+                       remote_oid, check=False)
+        if ancestry.returncode not in (0, 1):
+            raise RuntimeError('checkpoint ancestry observation failed')
+        if ancestry.returncode == 1:
             return None
-        if before_head and git(repo_path, 'merge-base', '--is-ancestor',
-                               remote_oid, before_head, check=False).returncode != 0:
-            return None
+        if before_head:
+            ancestry = git(repo_path, 'merge-base', '--is-ancestor',
+                           remote_oid, before_head, check=False)
+            if ancestry.returncode not in (0, 1):
+                raise RuntimeError('checkpoint head ancestry observation failed')
+            if ancestry.returncode == 1:
+                return None
         if not require_live:
             return remote_oid
         observed = git(repo_path, 'ls-remote', '--heads', 'origin',
                        f'refs/heads/{branch}', check=False)
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError) as error:
+        if strict_observation:
+            raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
+                                  'checkpoint ownership Git observation failed') from error
+        return None
+    if observed.returncode:
+        if strict_observation:
+            raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
+                                  'checkpoint live remote observation failed')
         return None
     lines = [line.split() for line in observed.stdout.splitlines() if line.strip()]
-    if observed.returncode or lines != [[remote_oid, f'refs/heads/{branch}']]:
+    if not lines:
+        return None
+    if (len(lines) != 1 or len(lines[0]) != 2
+            or lines[0][1] != f'refs/heads/{branch}'
+            or re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', lines[0][0]) is None):
+        if strict_observation:
+            raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
+                                  'checkpoint live remote response malformed')
+        return None
+    if lines[0][0] != remote_oid:
         return None
     return remote_oid
 
 
 def committed_tree_matches_intent(
     repo_path: Path, before_head: str | None, head: str,
-    snapshot: dict, git: Callable[..., object],
+    snapshot: dict, git: Callable[..., object], *, strict_observation: bool = False,
 ) -> bool:
     """Match an interrupted Manager commit to its approved staged tree."""
     tree = snapshot.get('commit_tree_oid')
@@ -104,7 +136,10 @@ def committed_tree_matches_intent(
             and git(repo_path, 'rev-parse', f'{head}^{{tree}}').stdout.strip()
             == tree
         )
-    except (OSError, RuntimeError):
+    except (OSError, RuntimeError) as error:
+        if strict_observation:
+            raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
+                                  'checkpoint commit observation failed') from error
         return False
 
 

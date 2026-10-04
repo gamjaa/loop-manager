@@ -436,7 +436,7 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
         pinned = self.pinned(self.sha)
         port = SimpleNamespace(load=lambda: pinned, loaded=pinned, current_revision=lambda: self.sha)
         with mock.patch.object(manager, '_GitCatalogDefinitionPort', return_value=port), \
-             mock.patch.object(manager, 'git', return_value=SimpleNamespace(stdout=self.sha)):
+             mock.patch.object(manager, 'git', return_value=SimpleNamespace(returncode=0, stdout=self.sha)):
             result = manager.reconcile_execplan_catalog(self.connection, Path(self.repo), self.repo, 'main')
         self.assertEqual(result.kind, state.ReconciliationKind.RECONCILED)
         self.assertEqual(self.row()['status'], 'IMPLEMENTING')
