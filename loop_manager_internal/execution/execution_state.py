@@ -116,6 +116,10 @@ class ExecutionStatePort:
 
     def complete_rebase(self, checkpoint_repository, *, completion=None, project_values,
                         published_proof=None, acceptance=None, reobserve=None):
+        # This port publishes an in-memory snapshot and must own the commit.
+        if self.connection.in_transaction:
+            raise runtime_state.RuntimeStateError(
+                "rebase completion requires transaction ownership")
         with runtime_state._transaction(self.connection):
             expected = self.check()
             if expected is None:

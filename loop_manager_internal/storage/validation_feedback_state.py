@@ -327,15 +327,13 @@ class ValidationFeedbackRepository:
         ).fetchall()
         for row in rows:
             repo, plan_id = row["repo"], row["plan_id"]
-            if self.connection.execute(
-                "SELECT 1 FROM validation_feedback_migrations WHERE repo=? AND plan_id=?",
-                (repo, plan_id),
-            ).fetchone():
-                continue
             try:
                 with _transaction(self.connection):
+                    # Native observations supersede legacy columns. Legacy-only
+                    # audits may be a partial import from an older implementation.
                     if self.connection.execute(
-                        "SELECT 1 FROM validation_results WHERE repo=? AND plan_id=? LIMIT 1",
+                        "SELECT 1 FROM validation_results WHERE repo=? AND plan_id=? "
+                        "AND classification != 'legacy_failure' LIMIT 1",
                         (repo, plan_id),
                     ).fetchone():
                         self._mark_migrated(repo, plan_id)
@@ -346,8 +344,9 @@ class ValidationFeedbackRepository:
                         if not isinstance(history, dict):
                             raise ValueError("invalid legacy failure history")
                         for record in history.values():
-                            if (not isinstance(record, dict)
-                                    or int(record.get("occurrences", 1)) < 1):
+                            occurrence = record.get("occurrences", 1) if isinstance(record, dict) else None
+                            if (type(occurrence) is not int
+                                    or not 1 <= occurrence <= 9223372036854775807):
                                 raise ValueError("invalid legacy failure occurrence")
                         if not raw or not history:
                             continue
@@ -364,6 +363,12 @@ class ValidationFeedbackRepository:
                                 continue
                             feedback = normalize_feedback(stage, str(raw))
                         if feedback:
+                            if self.connection.execute(
+                                "SELECT 1 FROM validation_results WHERE repo=? AND plan_id=? "
+                                "AND stage=? AND classification='legacy_failure' LIMIT 1",
+                                (repo, plan_id, stage),
+                            ).fetchone():
+                                continue
                             result_id = self._result(
                                 repo, plan_id, row["current_revision_sha"],
                                 stage, "legacy_failure", str(raw), feedback,
@@ -385,6 +390,11 @@ class ValidationFeedbackRepository:
                                             item.diagnostic, True)
                     self._mark_migrated(repo, plan_id)
             except (TypeError, ValueError, KeyError):
-                # A malformed later stage must not leave earlier audit rows or
-                # mark this plan complete; a corrected legacy row can retry.
+                # Roll back new audit rows, preserve immutable older audits, and
+                # revoke an old false completion so corrected input can retry.
+                with _transaction(self.connection):
+                    self.connection.execute(
+                        "DELETE FROM validation_feedback_migrations WHERE repo=? AND plan_id=?",
+                        (repo, plan_id),
+                    )
                 continue

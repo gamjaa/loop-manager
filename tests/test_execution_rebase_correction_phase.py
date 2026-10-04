@@ -13,6 +13,7 @@ from loop_manager_internal.storage.execution_checkpoint_state import CheckpointR
 from loop_manager_internal.execution.execution_runtime import ExecutionPhase, ExecutionOutcomeKind
 from loop_manager_internal.storage import blocked_checkpoint_state
 from loop_manager_internal.execution.execution_state import ExecutionStatePort
+from loop_manager_internal.storage.runtime_state import RuntimeStateError
 from tests.support.worker import decision as worker_decision
 
 
@@ -21,6 +22,27 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 
 class ExecutionRebaseCorrectionPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+    def test_rebase_rejects_outer_transaction_without_mutation(self):
+        connection, runtime, checkpoint, original, _expected, decision = runtime_rebase_fixture(self)
+        state = ExecutionStatePort(connection, runtime, "repo")
+        before = checkpoint.get("repo", original.plan_id)
+        connection.execute("BEGIN")
+        with self.assertRaisesRegex(RuntimeStateError, "transaction ownership"):
+            state.complete_rebase(
+                checkpoint, project_values={"phase": "WORKING"},
+                acceptance=decision.acceptance, reobserve=lambda: decision,
+            )
+        self.assertTrue(connection.in_transaction)
+        self.assertEqual(runtime.projected("repo"), original)
+        self.assertEqual(checkpoint.get("repo", original.plan_id), before)
+        connection.rollback()
+        self.assertEqual(state.expected, runtime.projected("repo"))
+        state.complete_rebase(
+            checkpoint, project_values={"phase": "WORKING"},
+            acceptance=decision.acceptance, reobserve=lambda: decision,
+        )
+        self.assertEqual(state.expected, runtime.projected("repo"))
+
     def test_rebase_commit_failure_keeps_expected_snapshot_for_retry(self):
         connection, runtime, checkpoint, original, _expected, decision = (
             runtime_rebase_fixture(self)

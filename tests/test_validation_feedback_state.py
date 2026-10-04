@@ -115,6 +115,74 @@ class ValidationFeedbackStateTests(unittest.TestCase):
             "SELECT COUNT(*) FROM validation_feedback_migrations WHERE plan_id = 'G-041'"
         ).fetchone()[0], 1)
 
+    def test_invalid_legacy_occurrences_remain_retryable(self):
+        self.connection.execute(
+            "CREATE TABLE exec_plans (repo TEXT,plan_id TEXT,current_revision_sha TEXT,"
+            "verify_result TEXT,review_result TEXT,verify_failure_history TEXT,"
+            "review_failure_history TEXT)"
+        )
+        for index, value in enumerate((1.5, float("inf"), float("nan"), True,
+                                       0, -1, 2**63, "2", None)):
+            with self.subTest(value=value):
+                plan = f"G-{index}"
+                self.connection.execute(
+                    "INSERT INTO exec_plans VALUES (?,?,?,?,?,?,?)",
+                    ("repo", plan, "revision", "failure", None,
+                     json.dumps({"fingerprint": {"occurrences": value}}), "{}"),
+                )
+                self.repo.migrate_legacy()
+                for table in ("validation_results", "validation_feedback_events",
+                              "validation_feedback_current", "validation_feedback_migrations"):
+                    self.assertEqual(self.connection.execute(
+                        f"SELECT COUNT(*) FROM {table} WHERE plan_id=?", (plan,)
+                    ).fetchone()[0], 0)
+                self.connection.execute(
+                    "UPDATE exec_plans SET verify_failure_history=? WHERE plan_id=?",
+                    ('{"fingerprint":{"occurrences":2}}', plan),
+                )
+                self.repo.migrate_legacy()
+                self.assertEqual(self.connection.execute(
+                    "SELECT occurrence FROM validation_feedback_current WHERE plan_id=?", (plan,)
+                ).fetchone()[0], 2)
+
+    def test_prior_partial_legacy_migration_recovers_without_duplicate_audit(self):
+        self.connection.execute(
+            "CREATE TABLE exec_plans (repo TEXT,plan_id TEXT,current_revision_sha TEXT,"
+            "verify_result TEXT,review_result TEXT,verify_failure_history TEXT,"
+            "review_failure_history TEXT)"
+        )
+        raw = "ISSUE_ID: file::function::bug\nFix it\nVERDICT: FAIL"
+        self.connection.execute(
+            "INSERT INTO exec_plans VALUES (?,?,?,?,?,?,?)",
+            ("repo", "G-040", "revision", "verify failure", raw,
+             '{"fingerprint":{"occurrences":2}}', "{malformed"),
+        )
+        feedback = (Feedback("verify", "verify:fingerprint", "verify failure"),)
+        result_id = self.repo._result("repo", "G-040", "revision", "verify",
+                                      "legacy_failure", "verify failure", feedback)
+        self.repo._event(result_id, "repo", "G-040", "verify", feedback[0].identity,
+                         2, 1, feedback[0].diagnostic, True)
+        self.repo._mark_migrated("repo", "G-040")
+        audit = tuple(self.connection.execute("SELECT * FROM validation_results").fetchone())
+        self.repo.migrate_legacy()
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM validation_feedback_migrations").fetchone()[0], 0)
+        self.assertEqual(tuple(self.connection.execute(
+            "SELECT * FROM validation_results").fetchone()), audit)
+        self.connection.execute(
+            "UPDATE exec_plans SET review_failure_history=?", ('{"review":{"occurrences":1}}',))
+        self.repo.migrate_legacy()
+        self.repo.migrate_legacy()
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM validation_results").fetchone()[0], 2)
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM validation_feedback_events").fetchone()[0], 2)
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM validation_feedback_migrations").fetchone()[0], 1)
+        self.assertEqual(tuple(self.connection.execute(
+            "SELECT * FROM validation_results WHERE id=?", (result_id,)).fetchone()), audit)
+        self.assertEqual({row["stage"] for row in self.pending().rows}, {"verify", "review"})
+
     def test_repetition_changed_diagnostic_resolution_and_recurrence(self):
         first = Feedback("verify", "verify:A", "failure A")
         changed = Feedback("verify", "verify:A", "failure A at new line")
