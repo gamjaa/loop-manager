@@ -128,12 +128,15 @@ def run_agent(
                 pass
         raise
     result = _coerce_agent_result(raw, session_id)
+    if result.collection_status == "error":
+        collection_status = "error"
     if ledger is not None and identity is not None:
         try:
             ledger.finish(identity, result.ledger_kind, result.code,
                           max(0, int((time.monotonic() - started) * 1000)),
                           result.session_id, result.usage,
-                          "error" if collection_status == "error" else None)
+                          "error" if collection_status == "error" else None,
+                          replace_session=True)
             if collection_status != "error":
                 collection_status = result.usage.status
         except sqlite3.Error:

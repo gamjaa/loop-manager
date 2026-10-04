@@ -196,15 +196,13 @@ class InvocationRepository:
 
     def finish(self, identity: str, kind: str, code: int | None,
                duration_ms: int, session_id: str | None, usage: Usage,
-               collection_status: str | None = None) -> None:
+               collection_status: str | None = None, *,
+               replace_session: bool = False) -> None:
         with self.connection:
-            if kind != "success":
-                self.connection.execute("""UPDATE agent_isolation_evidence
-                    SET status = 'invalidated', reason = 'agent_attempt_not_successful'
-                    WHERE invocation_id = ? AND status IN ('verified', 'prepared')""", (identity,))
-            self.connection.execute("""UPDATE agent_invocations SET
+            session_update = "session_id = ?" if replace_session else "session_id = COALESCE(?, session_id)"
+            cursor = self.connection.execute(f"""UPDATE agent_invocations SET
                 finished_at = ?, duration_ms = ?, result_kind = ?, result_code = ?,
-                session_id = COALESCE(?, session_id), collection_status = ?,
+                {session_update}, collection_status = ?,
                 input_tokens = ?, cached_input_tokens = ?, cache_write_input_tokens = ?,
                 output_tokens = ?, reasoning_output_tokens = ?
                 WHERE invocation_id = ? AND finished_at IS NULL""",
@@ -213,6 +211,10 @@ class InvocationRepository:
                  usage.input_tokens, usage.cached_input_tokens,
                  usage.cache_write_input_tokens, usage.output_tokens,
                  usage.reasoning_output_tokens, identity))
+            if cursor.rowcount and kind != "success":
+                self.connection.execute("""UPDATE agent_isolation_evidence
+                    SET status = 'invalidated', reason = 'agent_attempt_not_successful'
+                    WHERE invocation_id = ? AND status IN ('verified', 'prepared')""", (identity,))
 
     def reconcile_interrupted(self) -> int:
         with self.connection:

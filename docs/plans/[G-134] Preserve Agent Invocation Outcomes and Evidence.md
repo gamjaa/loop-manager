@@ -33,10 +33,11 @@ Separate a completed physical Agent invocation from best-effort log persistence 
 
 ## Progress
 
-- [ ] Separate physical result from auxiliary evidence failure and align durable classification.
-- [ ] Add focused replay and failure regression tests.
+- [x] Separate physical result from auxiliary evidence failure and align durable classification.
+- [x] Add focused replay and failure regression tests.
 
 ## Decision Log
 
 - Source revision `79dd511a962fa0d2ba2530554fa0d945d64b8f17`, manifest findings 0, 1 and 37 show one invocation-result boundary; finding 46 identifies a direct missing regression case. No storage-format or retry-policy change is intended.
 - Observed responsibility paths: `loop_manager_internal/agents/provider_adapters.py`, `loop_manager_internal/agents/agent_invocation.py`, `loop_manager_internal/storage/agent_invocation_state.py`.
+- Implementation record: post-exit Codex auxiliary-copy failures now preserve the completed result and observed usage while marking collection as an error; timeout spelling, final-session replacement and conditional finish finalization share the persisted result boundary. Focused regressions cover each failure and replay path.

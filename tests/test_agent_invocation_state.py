@@ -4,6 +4,7 @@ import sqlite3
 from unittest import TestCase
 
 from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, Usage
+from loop_manager_internal.agents.agent_write_isolation import IsolationEvidence
 from loop_manager_internal.storage.agent_invocation_state import InvocationRepository, ensure_schema
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 
@@ -67,6 +68,28 @@ class InvocationRepositoryTests(TestCase):
                          ("observed-session", "interrupted", "unknown"))
         self.assertEqual(self.connection.execute("SELECT phase FROM projects").fetchone()[0],
                          "VERIFYING")
+
+    def test_conflicting_finish_cannot_invalidate_successful_evidence(self):
+        identity = self.repository.start(
+            InvocationContext("repo", "G-134"), "worker", "codex",
+            ResolvedProfile("model", "high"), "session",
+        )
+        evidence = IsolationEvidence(
+            "codex", "version", "Linux:test", "worker", "/worktree", "repo",
+            "a" * 64, "verified", snapshot_digest="b" * 64,
+            configuration_digest="c" * 64,
+        )
+        self.repository.record_isolation(identity, evidence)
+        self.repository.finish(identity, "success", 0, 1, "session", Usage())
+        self.repository.finish(identity, "transient_failure", 1, 2, None, Usage())
+
+        row = self.connection.execute("""SELECT call.result_kind, proof.status
+            FROM agent_invocations AS call JOIN agent_isolation_evidence AS proof
+            USING (invocation_id) WHERE call.invocation_id = ?""", (identity,)).fetchone()
+        self.assertEqual(tuple(row), ("success", "verified"))
+        self.assertTrue(self.repository.verified_invocation(
+            identity, session_id="session", expected=evidence,
+        ))
 
     def test_summary_uses_nullable_counters_and_provider_input_semantics(self):
         context = InvocationContext("repo", "G-039", attempt=2, transition="resume")

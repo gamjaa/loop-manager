@@ -172,6 +172,7 @@ def run_codex(
         ]
     resolved_session_id = session_id
     timeout_triggered = threading.Event()
+    collection_status = "unknown"
     if persist_session and not session_id:
         with log.open("w", encoding="utf-8") as output:
             process = effects._handoff_popen(
@@ -234,10 +235,19 @@ def run_codex(
                 **({"launch_process": effects._handoff_popen} if codex_launch is not None else {}),
             )
         returncode = result.returncode
-    message = (provider_last_message.read_text(encoding="utf-8")
-               if provider_last_message.is_file() else "")
+    try:
+        message = (provider_last_message.read_text(encoding="utf-8")
+                   if provider_last_message.is_file() else "")
+    except (OSError, UnicodeError):
+        # The process has already completed; unavailable auxiliary output must
+        # not turn that completed physical call into a retry.
+        message = ""
+        collection_status = "error"
     if codex_launch is not None and provider_last_message.is_file():
-        last_message.write_text(message, encoding="utf-8")
+        try:
+            last_message.write_text(message, encoding="utf-8")
+        except (OSError, UnicodeError):
+            collection_status = "error"
     if timeout_triggered.is_set():
         message = f"Codex {role_name} 실행 timeout ({AGENT_CLI_TIMEOUT_SECONDS}초)"
     if returncode and not message:
@@ -248,7 +258,12 @@ def run_codex(
         # Usage is observational; a failed log read cannot retry a completed CLI call.
         usage = Usage(status="invalid")
     if codex_launch is not None and returncode != 125:
-        saved_log.write_text(log.read_text(encoding="utf-8"), encoding="utf-8")
+        try:
+            saved_log.write_text(log.read_text(encoding="utf-8"), encoding="utf-8")
+        except (OSError, UnicodeError):
+            # Keep the process result and parsed usage; only the auxiliary
+            # durable copy failed and the ledger records that separately.
+            collection_status = "error"
     if persist_session and not resolved_session_id:
         if returncode == 0:
             return CodexResult(
@@ -267,6 +282,7 @@ def run_codex(
                 else None
             ),
             usage,
+            collection_status,
         )
     return returncode, message.strip()
 

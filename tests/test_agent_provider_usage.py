@@ -177,3 +177,54 @@ class UsageTests(TestCase):
         self.assertEqual((result.code, result.session_id, result.usage.status),
                          (0, "session", "invalid"))
         self.assertEqual(launch.call_count, 1)
+
+    def test_codex_auxiliary_log_copy_failure_preserves_completed_result(self):
+        original_write_text = Path.write_text
+
+        def write_text(path, data, *args, **kwargs):
+            if path.name == "planner.log":
+                raise OSError("auxiliary log unavailable")
+            return original_write_text(path, data, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            attempt = root / "attempt"
+            attempt.mkdir()
+            launch = provider_adapters.agent_write_isolation.CodexLaunch(
+                (), (), {}, root, attempt, "{}",
+            )
+            effects = provider_adapters.ProviderEffects(
+                mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock(),
+            )
+            evidence = mock.Mock(status="verified")
+            def run(_launch, _arguments, **kwargs):
+                kwargs["stdout"].write(
+                    '{"type":"turn.completed","usage":{"input_tokens":10,'
+                    '"cached_input_tokens":4,"output_tokens":2}}\n'
+                )
+                return mock.Mock(returncode=0)
+
+            def prepare(_provider, _role, _worktree, _state_dir, _read_only, observe,
+                        *_args, **_kwargs):
+                observe(evidence)
+                return launch
+
+            with mock.patch.object(provider_adapters.agent_write_isolation.CodexLaunch,
+                                   "run", autospec=True, side_effect=run) as run_call, \
+                 mock.patch.object(provider_adapters.agent_write_isolation,
+                                   "prepare_isolation", side_effect=prepare), \
+                 mock.patch.object(provider_adapters.agent_write_isolation,
+                                   "assert_current"), \
+                 mock.patch.object(Path, "write_text", autospec=True,
+                                   side_effect=write_text):
+                result = provider_adapters.run_codex(
+                    root, root, root / "config", "planner", "prompt",
+                    read_only=False, persist_session=True, session_id="saved-session",
+                    resolved_profile=invocation.ResolvedProfile("model", "high"),
+                    isolation_snapshot_digest=lambda: "snapshot",
+                    on_isolation_checked=mock.Mock(), effects=effects,
+                )
+        self.assertEqual((result.code, result.session_id, result.usage.input_tokens,
+                          result.collection_status),
+                         (0, "saved-session", 10, "error"))
+        self.assertEqual(run_call.call_count, 1)
