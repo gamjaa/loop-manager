@@ -36,6 +36,43 @@ class SimulatedProcessExit(BaseException):
 
 
 class RebaseObservationFailureTests(unittest.TestCase):
+    def test_preflight_database_failure_preserves_publication_intent(self):
+        intent = {'remote_before': 'old', 'head': 'new'}
+        current = SimpleNamespace(
+            operation='rebase_publish', snapshot={'rebase_publication_intent': intent},
+            rebase_publication_intent=lambda: intent,
+        )
+        for edge in ('checkpoint', 'state', 'owner'):
+            with self.subTest(edge=edge):
+                checkpoints = mock.Mock()
+                checkpoints.get.return_value = current
+                state = mock.Mock()
+                state.row.return_value = {}
+                git = mock.Mock()
+                lookup_pr = mock.Mock()
+                service = mock.Mock()
+                if edge == 'checkpoint':
+                    checkpoints.get.side_effect = sqlite3.OperationalError('database is locked')
+                elif edge == 'state':
+                    state.row.side_effect = sqlite3.OperationalError('database is locked')
+                else:
+                    checkpoints.connection.execute.side_effect = sqlite3.OperationalError('database is locked')
+
+                with self.assertRaises(managed_rebase_publication.RebaseObservationRetry) as caught:
+                    managed_rebase_publication.publish_checkpoint(
+                        state=state, checkpoints=checkpoints, repo='/repo',
+                        plan_id='G-001', repo_path=Path('/repo'), worktree=Path('/worktree'),
+                        branch='loop-manager/G-001', service=service,
+                        owns_remote=mock.Mock(), git=git, lookup_pr=lookup_pr)
+
+                self.assertIs(caught.exception.reason, RecoveryReason.PUBLICATION_RETRY)
+                self.assertEqual(current.snapshot['rebase_publication_intent'], intent)
+                checkpoints.begin_rebase_publication.assert_not_called()
+                state.complete_rebase_publication.assert_not_called()
+                git.assert_not_called()
+                lookup_pr.assert_not_called()
+                service.assert_not_called()
+
     def test_pr_lookup_failure_retries_saved_rebase_intent(self):
         intent = {'remote_before': 'old', 'head': 'new'}
         current = SimpleNamespace(

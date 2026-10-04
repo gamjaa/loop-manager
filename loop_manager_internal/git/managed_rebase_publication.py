@@ -23,26 +23,29 @@ class RebaseObservationRetry(RecoveryFailure):
 
 def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree,
                        branch, service, owns_remote, git, lookup_pr):
-    current = checkpoints.get(repo, plan_id)
-    saved = current.snapshot or {}
-    intent = saved.get('rebase_publication_intent')
-    pending = current.operation == 'rebase_publish'
-    if pending and current.rebase_publication_intent() is None:
-        raise RebasePublicationRejected('intermediate checkpoint intent identity differs')
-    acceptance = saved.get('current_rebase_acceptance')
-    if not pending and (current.operation is not None or not valid_acceptance(acceptance)):
-        return
-    row = state.row()
-    if not pending and (row['pr_url'] or row['pr_conflict_recovery']
-                        or acceptance['remote']['pull_request'] is not None
-                        or not acceptance['remote']['oid']):
-        return
-    if not pending and saved.get('rebase_publication_result', {}).get('acceptance_id') == acceptance['id']:
-        return
-    owner = checkpoints.connection.execute(
-        "SELECT accepted_remote_oid FROM blocked_checkpoints WHERE repo = ? AND plan_id = ? "
-        "AND phase = 'published' AND branch = ? AND worktree = ?",
-        (repo, plan_id, branch, str(worktree))).fetchone()
+    try:
+        current = checkpoints.get(repo, plan_id)
+        saved = current.snapshot or {}
+        intent = saved.get('rebase_publication_intent')
+        pending = current.operation == 'rebase_publish'
+        if pending and current.rebase_publication_intent() is None:
+            raise RebasePublicationRejected('intermediate checkpoint intent identity differs')
+        acceptance = saved.get('current_rebase_acceptance')
+        if not pending and (current.operation is not None or not valid_acceptance(acceptance)):
+            return
+        row = state.row()
+        if not pending and (row['pr_url'] or row['pr_conflict_recovery']
+                            or acceptance['remote']['pull_request'] is not None
+                            or not acceptance['remote']['oid']):
+            return
+        if not pending and saved.get('rebase_publication_result', {}).get('acceptance_id') == acceptance['id']:
+            return
+        owner = checkpoints.connection.execute(
+            "SELECT accepted_remote_oid FROM blocked_checkpoints WHERE repo = ? AND plan_id = ? "
+            "AND phase = 'published' AND branch = ? AND worktree = ?",
+            (repo, plan_id, branch, str(worktree))).fetchone()
+    except sqlite3.OperationalError as error:
+        raise RebaseObservationRetry('intermediate checkpoint database observation failed') from error
     expected_oid = (intent['remote_before'] if pending else
                     row['publication_remote_oid'] or (owner[0] if owner else None))
     if not pending and expected_oid is None:
@@ -51,8 +54,8 @@ def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree
         raise RebasePublicationRejected('intermediate checkpoint has no adopted remote OID')
 
     def inspect():
-        state.check()
         try:
+            state.check()
             selected = checkpoints.get(repo, plan_id)
         except sqlite3.OperationalError as error:
             raise RebaseObservationRetry('intermediate checkpoint database observation failed') from error

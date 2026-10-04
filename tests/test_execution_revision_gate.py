@@ -7,6 +7,7 @@ from unittest import TestCase, mock
 
 from loop_manager_internal.execution import execution_handlers as handlers
 from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
+from loop_manager_internal.git.command_adapter import ExternalObservationError
 import loop_manager as lm
 from loop_manager_internal.catalog.requirement_archive import ArchiveSnapshot
 from loop_manager_internal.execution.execution_runtime import ExecutionPhase, ExecutionPhaseCoordinator, ExecutionOutcome, ExecutionOutcomeKind
@@ -19,6 +20,31 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 
 class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+    def test_revision_document_observation_failure_preserves_worker_session(self):
+        self.state.update_project('repo', worker_session_id='saved-session')
+        self.effects.revision.body_hash.side_effect = ExternalObservationError('Git read failed')
+
+        result = self.handler.guard(self.context())
+
+        self.assertEqual(result.recovery.observation.reason, handlers.RecoveryReason.STATUS_FAILED)
+        self.assertIn(result.kind, (ExecutionOutcomeKind.RETRY, ExecutionOutcomeKind.TRANSIENT_PAUSE))
+        self.assertEqual(self.state.row()['worker_session_id'], 'saved-session')
+        self.effects.blocking.block_active_execplan.assert_not_called()
+        self.effects.validation.validate_active_execplan_metadata.assert_not_called()
+
+    def test_worktree_document_observation_failure_preserves_worker_session(self):
+        self.state.update_project('repo', worker_session_id='saved-session')
+        self.effects.validation.validate_active_execplan_metadata.side_effect = (
+            ExternalObservationError('Git read failed')
+        )
+
+        result = self.handler.guard(self.context())
+
+        self.assertEqual(result.recovery.observation.reason, handlers.RecoveryReason.STATUS_FAILED)
+        self.assertIn(result.kind, (ExecutionOutcomeKind.RETRY, ExecutionOutcomeKind.TRANSIENT_PAUSE))
+        self.assertEqual(self.state.row()['worker_session_id'], 'saved-session')
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
     def test_saved_decision_blocks_revision_refresh_before_checkpoint_commit(self):
         self._decision_workspace()
         message = worker_decision()
