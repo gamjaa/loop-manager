@@ -78,15 +78,15 @@ class TimestampedExecutionProgressLogsTest(unittest.TestCase):
                 fake_msvcrt = types.SimpleNamespace(
                     LK_NBLCK=1, LK_UNLCK=2, locking=lock,
                 )
+                fake_fcntl = types.SimpleNamespace(
+                    LOCK_EX=1, LOCK_NB=2, LOCK_UN=3, flock=lock,
+                )
                 patches = [
                     mock.patch.object(process_lock_module.os, "name", platform),
                     mock.patch.object(process_lock_module.os, "open", return_value=10),
                     mock.patch.object(process_lock_module.os, "fdopen", return_value=handle),
+                    mock.patch.dict(sys.modules, {lock_module: fake_fcntl if lock_module == "fcntl" else fake_msvcrt}),
                 ]
-                if lock_module == "fcntl":
-                    patches.append(mock.patch("fcntl.flock", lock))
-                else:
-                    patches.append(mock.patch.dict(sys.modules, {"msvcrt": fake_msvcrt}))
                 with patches[0], patches[1], patches[2], patches[3]:
                     with self.assertRaisesRegex(OSError, "unlock failed"):
                         with process_lock_module.process_lock(state_dir):

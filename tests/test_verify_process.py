@@ -107,15 +107,22 @@ class VerifyProcessTests(unittest.TestCase):
                 "print('progress',flush=True); "
                 "child.wait()"
             )
-            passed, timed_out, output = run_verify_process(
-                [sys.executable, "-c", parent], root, 1,
-            )
-            self.assertEqual((passed, timed_out), (False, True))
-            self.assertIn("progress", output)
-            pid = int(child_pid.read_text())
-            status = Path(f"/proc/{pid}/stat")
-            if status.exists():
-                self.assertEqual(status.read_text().split()[2], "Z")
+            try:
+                passed, timed_out, output = run_verify_process(
+                    [sys.executable, "-c", parent], root, 1,
+                )
+                self.assertEqual((passed, timed_out), (False, True))
+                self.assertIn("progress", output)
+                pid = int(child_pid.read_text())
+                status = Path(f"/proc/{pid}/stat")
+                if status.exists():
+                    self.assertEqual(status.read_text().split()[2], "Z")
+            finally:
+                if child_pid.exists():
+                    try:
+                        os.kill(int(child_pid.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux /proc assertion")
     def test_timeout_kills_child_in_new_session(self):
