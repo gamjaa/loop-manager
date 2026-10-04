@@ -29,7 +29,7 @@ class ResourceDecisionTests(unittest.TestCase):
         self.assertTrue(decide(self.snapshot(available=80 * MIB), now=10, running=0, cap=1, existing=True).granted)
 
     def test_unknown_or_stale_observation_serializes_and_recovers(self):
-        for snapshot in (self.snapshot(busy=None), self.snapshot(at=0), self.snapshot(available=None)):
+        for snapshot in (self.snapshot(busy=None), self.snapshot(at=0), self.snapshot(at=11), self.snapshot(available=None)):
             decision = decide(snapshot, now=10, running=0, cap="auto")
             self.assertTrue(decision.granted)
             self.assertEqual(decision.limit, 1)
@@ -93,6 +93,42 @@ class ReservationTests(unittest.TestCase):
 
     def request(self, operation, **values):
         return self.coordinator.request(self.a, self.sa, operation, **values)
+
+    def test_fresh_sample_after_request_clock_allows_parallel_reservations(self):
+        def sample():
+            self.now += 0.25
+            return Snapshot(self.now, self.capacity, 0, 4096 * MIB, "fake")
+
+        self.coordinator.sampler = SimpleNamespace(sample=sample)
+        first = self.request("acquire")
+        self.assertTrue(first["granted"])
+        self.assertFalse(first["fallback"])
+        reservation = self.coordinator.reservations[first["token"]]
+        self.assertEqual((reservation["at"], reservation["born_at"]), (self.now, self.now))
+        second = self.request("acquire")
+        self.assertTrue(second["granted"])
+        self.assertFalse(second["fallback"])
+        self.assertEqual(len(self.coordinator.reservations), 2)
+
+    def test_sample_that_ages_during_observation_serializes_then_recovers(self):
+        def sample():
+            snapshot = Snapshot(self.now, self.capacity, 0, 4096 * MIB, "fake")
+            self.now += resources.SNAPSHOT_MAX_AGE + 0.25
+            return snapshot
+
+        self.coordinator.sampler = SimpleNamespace(sample=sample)
+        first = self.request("acquire")
+        self.assertTrue(first["granted"])
+        self.assertTrue(first["fallback"])
+        self.assertEqual(first["limit"], 1)
+        self.assertFalse(self.request("acquire")["granted"])
+        self.assertFalse(self.coordinator.request(self.b, self.sb, "acquire")["granted"])
+        self.request("not_started", token=first["token"])
+        self.coordinator.sampler = SimpleNamespace(
+            sample=lambda: Snapshot(self.now, self.capacity, 0, 4096 * MIB, "fake"))
+        recovered = self.coordinator.request(self.b, self.sb, "acquire")
+        self.assertTrue(recovered["granted"])
+        self.assertFalse(recovered["fallback"])
 
     def test_simultaneous_start_does_not_double_reserve_one_cpu(self):
         self.capacity = 1

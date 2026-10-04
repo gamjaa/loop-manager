@@ -98,7 +98,6 @@ class VerifyCoordinator:
             owner = self.sessions.get(session)
             if owner is None or not secrets.compare_digest(owner["secret"], secret):
                 raise RuntimeError("verify 통신 인증 실패")
-            now = self.clock()
             if operation == "acquire":
                 if owner["require_guard"] and owner["guard"] is None:
                     return {"granted": False, "reason": "verify 모체 소유권 확인 대기"}
@@ -106,11 +105,12 @@ class VerifyCoordinator:
                 existing = self.reservations.get(token) if token else None
                 if token and (existing is None or existing["session"] != session or existing["active"]):
                     raise RuntimeError("재사용할 idle 예약이 없습니다.")
+                snapshot = self.sampler.sample()
+                now = self.clock()
                 self.last_request[session] = now
                 self.waiters = deque(item for item in self.waiters if now - self.last_request.get(item, now) < 1)
                 if session not in self.waiters:
                     self.waiters.append(session)
-                snapshot = self.sampler.sample()
                 running = sum(value["active"] for value in self.reservations.values() if value["session"] == session)
                 pending = [value for value in self.reservations.values()
                            if value["uncertain"] or value["pid"] is None or
