@@ -48,14 +48,18 @@ Patch:
 """
 
 
-def git(repo: Path, *arguments: str) -> str:
-    result = subprocess.run(
+def git_result(repo: Path, *arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
         ["git", "-C", str(repo), *arguments],
-        check=True,
+        check=check,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
+
+
+def git(repo: Path, *arguments: str) -> str:
+    return git_result(repo, *arguments).stdout.strip()
     return result.stdout.strip()
 
 

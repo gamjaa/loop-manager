@@ -14,7 +14,7 @@ from loop_manager_internal.catalog import project_catalog_refresh as refresh
 from tests.support import catalog as fixtures
 
 
-class ProjectCatalogRefreshTest(unittest.TestCase):
+class _CatalogRefreshCase(unittest.TestCase):
     def setUp(self):
         self.fixture = fixtures.catalog_reconciliation_fixture(self)
         self.connection = self.fixture.connection
@@ -78,6 +78,67 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
         ports.state.reconcile_catalog.assert_not_called()
         return outcome, ports
 
+    def archive(self, *, remote=True):
+        self.boundary.refresh()
+        self.archive_repo = archive_state.ExecPlanArchiveRepository(
+            self.connection, apply_catalog=self.boundary.apply_archive)
+        self.candidates = self.archive_repo.merged_candidates(self.repo)
+        self.base_sha = self.sha
+        self.sha = 'c' * 40 if remote else self.sha
+        return self.archive_repo.record_success(
+            self.repo, self.candidates, base_sha=self.base_sha, operation_id=None,
+            commit_oid='c'*40, push_result='pushed:'+'c'*40)
+
+    def run_step(self, *, pr=None, phase=None, invalid=False, scope_error=False):
+        self.connection.execute("UPDATE projects SET phase=?, agent_snapshot=NULL, branch=NULL, worktree=NULL, plan_path=NULL WHERE repo=?", (phase, self.repo))
+        self.connection.execute("UPDATE exec_plans SET status='READY', branch=NULL, worktree=NULL, pr_url=NULL WHERE repo=?", (self.repo,))
+        if scope_error:
+            self.connection.execute("UPDATE projects SET agent_snapshot='saved' WHERE repo=?", (self.repo,))
+        self.connection.commit()
+        self.events = []
+        def reconcile(revision, remember):
+            self.events.append('catalog')
+            if invalid:
+                return state.CatalogReconciliationService(
+                    state.DefinitionStateRepository(self.connection), fixtures.FakeDefinitionPort(
+                        replace(self.pinned(revision), snapshot=catalog.ExecPlanCatalogSnapshot({}, {})))
+                ).reconcile(self.repo)
+            return self.reconcile(revision, remember)
+        self.boundary.reconcile = reconcile
+        def pull_requests(*args, **kwargs):
+            self.events.append('pr')
+            self.assertEqual(self.row()['priority'], 'critical')
+            if pr:
+                pr()
+            kwargs['after_reconciliation']()
+            return SimpleNamespace(step_result=0)
+        def safe(*args, **kwargs):
+            self.events.append('archive-eligibility')
+            self.assertEqual(self.row()['sources'], '["docs/requirements/change.md"]')
+            return False
+        def planning(*args):
+            self.assertTrue(callable(args[-1].refresh_catalog))
+            self.events.append('planning')
+            self.assertEqual(self.row()['depends_on'], '["G-002"]')
+            return SimpleNamespace(kind=manager.PlanningOutcomeKind.WAITING)
+        with contextlib.ExitStack() as stack:
+            for name in ('observe_blocked_plan_remotes', 'migrate_legacy_execplans', 'backfill_plan_shas', 'resume_plan_blocks',
+                         '_recorded_base_fetch', 'ensure_safe_base_worktree'):
+                stack.enter_context(mock.patch.object(manager, name))
+            stack.enter_context(mock.patch.object(manager, 'validate_repository', return_value=Path(self.repo)))
+            stack.enter_context(mock.patch.object(manager, 'remote_base', side_effect=lambda *a, **k: self.events.append('fetch') or 'main'))
+            stack.enter_context(mock.patch.object(manager, 'git', side_effect=lambda *a, **k: SimpleNamespace(stdout=self.sha)))
+            stack.enter_context(mock.patch.object(manager, 'recheck_cleanup_pending', return_value=[]))
+            stack.enter_context(mock.patch.object(manager, '_execplan_archive_housekeeping_safe', side_effect=safe))
+            stack.enter_context(mock.patch.object(manager, 'synchronize_waiting_pull_requests', side_effect=pull_requests))
+            stack.enter_context(mock.patch.object(manager.project_catalog_refresh, 'ProjectCatalogRefresh', return_value=self.boundary))
+            stack.enter_context(mock.patch.object(manager.PlanningLifecycleCoordinator, 'run', side_effect=planning))
+            stack.enter_context(mock.patch.object(manager, 'validate_persisted_agent_scope', side_effect=RuntimeError('unsafe')))
+            return manager._run_project_step(self.connection, Path('/state'), self.repo, Path('unused.ini'), 'main', False)
+
+
+class CatalogPlanningConsumerTests(_CatalogRefreshCase):
+
     def test_planning_reuses_validated_project_catalog(self):
         self.boundary.refresh()
         outcome, ports = self.prepare_planning_workspace()
@@ -117,6 +178,31 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
         self.assertEqual(outcome.kind, PlanningOutcomeKind.TRANSIENT_PAUSE)
         self.assertTrue(ports.state.snapshot.planning_result_completed)
         self.assertIsNone(ports.state.snapshot.planning_error)
+
+class CatalogCacheAndCasTests(_CatalogRefreshCase):
+    def test_refresh_does_not_update_another_repositorys_plan(self):
+        project = dict(self.connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (self.repo,)
+        ).fetchone())
+        project['repo'] = '/other-repo'
+        plan = dict(self.row())
+        plan['repo'] = project['repo']
+        for values, table in ((project, 'projects'), (plan, 'exec_plans')):
+            columns = ', '.join(values)
+            placeholders = ', '.join('?' for _ in values)
+            self.connection.execute(
+                f"INSERT INTO {table} ({columns}) VALUES ({placeholders})",
+                tuple(values.values()),
+            )
+        self.connection.commit()
+
+        self.boundary.refresh()
+
+        other = self.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+            (project['repo'],),
+        ).fetchone()
+        self.assertEqual(dict(other), plan)
 
     def test_all_declarations_refresh_preserving_execution_audit_and_planning_error(self):
         self.connection.execute("UPDATE projects SET planning_error='retained'")
@@ -195,17 +281,7 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
         self.assertEqual(self.row()['title'], 'Old')
         self.assertEqual(self.row()['worker_session_id'], 'concurrent')
 
-    def archive(self, *, remote=True):
-        self.boundary.refresh()
-        self.archive_repo = archive_state.ExecPlanArchiveRepository(
-            self.connection, apply_catalog=self.boundary.apply_archive)
-        self.candidates = self.archive_repo.merged_candidates(self.repo)
-        self.base_sha = self.sha
-        self.sha = 'c' * 40 if remote else self.sha
-        return self.archive_repo.record_success(
-            self.repo, self.candidates, base_sha=self.base_sha, operation_id=None,
-            commit_oid='c'*40, push_result='pushed:'+'c'*40)
-
+class CatalogArchiveConsumerTests(_CatalogRefreshCase):
     def test_verified_archive_delta_and_audit_are_atomic_without_reread(self):
         self.assertEqual(self.archive(), archive_state.ArchiveWriteResult.APPLIED)
         item = self.archive_repo.item(self.repo, 'G-002')
@@ -235,53 +311,7 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
         self.assertIsNone(repo.item(self.repo, 'G-002'))
         self.assertEqual(self.row('G-002')['path'], 'docs/plans/[G-002] Dependency.md')
 
-    def run_step(self, *, pr=None, phase=None, invalid=False, scope_error=False):
-        self.connection.execute("UPDATE projects SET phase=?, agent_snapshot=NULL, branch=NULL, worktree=NULL, plan_path=NULL", (phase,))
-        self.connection.execute("UPDATE exec_plans SET status='READY', branch=NULL, worktree=NULL, pr_url=NULL")
-        if scope_error:
-            self.connection.execute("UPDATE projects SET agent_snapshot='saved'")
-        self.connection.commit()
-        self.events = []
-        def reconcile(revision, remember):
-            self.events.append('catalog')
-            if invalid:
-                return state.CatalogReconciliationService(
-                    state.DefinitionStateRepository(self.connection), fixtures.FakeDefinitionPort(
-                        replace(self.pinned(revision), snapshot=catalog.ExecPlanCatalogSnapshot({}, {})))
-                ).reconcile(self.repo)
-            return self.reconcile(revision, remember)
-        self.boundary.reconcile = reconcile
-        def pull_requests(*args, **kwargs):
-            self.events.append('pr')
-            self.assertEqual(self.row()['priority'], 'critical')
-            if pr:
-                pr()
-            kwargs['after_reconciliation']()
-            return SimpleNamespace(step_result=0)
-        def safe(*args, **kwargs):
-            self.events.append('archive-eligibility')
-            self.assertEqual(self.row()['sources'], '["docs/requirements/change.md"]')
-            return False
-        def planning(*args):
-            self.assertTrue(callable(args[-1].refresh_catalog))
-            self.events.append('planning')
-            self.assertEqual(self.row()['depends_on'], '["G-002"]')
-            return SimpleNamespace(kind=manager.PlanningOutcomeKind.WAITING)
-        with contextlib.ExitStack() as stack:
-            for name in ('observe_blocked_plan_remotes', 'migrate_legacy_execplans', 'backfill_plan_shas', 'resume_plan_blocks',
-                         '_recorded_base_fetch', 'ensure_safe_base_worktree'):
-                stack.enter_context(mock.patch.object(manager, name))
-            stack.enter_context(mock.patch.object(manager, 'validate_repository', return_value=Path(self.repo)))
-            stack.enter_context(mock.patch.object(manager, 'remote_base', side_effect=lambda *a, **k: self.events.append('fetch') or 'main'))
-            stack.enter_context(mock.patch.object(manager, 'git', side_effect=lambda *a, **k: SimpleNamespace(stdout=self.sha)))
-            stack.enter_context(mock.patch.object(manager, 'recheck_cleanup_pending', return_value=[]))
-            stack.enter_context(mock.patch.object(manager, '_execplan_archive_housekeeping_safe', side_effect=safe))
-            stack.enter_context(mock.patch.object(manager, 'synchronize_waiting_pull_requests', side_effect=pull_requests))
-            stack.enter_context(mock.patch.object(manager.project_catalog_refresh, 'ProjectCatalogRefresh', return_value=self.boundary))
-            stack.enter_context(mock.patch.object(manager.PlanningLifecycleCoordinator, 'run', side_effect=planning))
-            stack.enter_context(mock.patch.object(manager, 'validate_persisted_agent_scope', side_effect=RuntimeError('unsafe')))
-            return manager._run_project_step(self.connection, Path('/state'), self.repo, Path('unused.ini'), 'main', False)
-
+class ProjectCatalogConsumerTests(_CatalogRefreshCase):
     def test_step_fetch_catalog_pr_archive_and_selection_order(self):
         self.assertEqual(self.run_step(), 0)
         self.assertEqual(self.events, ['fetch', 'catalog', 'pr', 'archive-eligibility', 'planning'])

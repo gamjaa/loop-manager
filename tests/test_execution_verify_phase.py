@@ -15,11 +15,10 @@ from tests.support.worker import decision as worker_decision
 from tests.support.execution import READY_WORKER_RESULT, VALID_WORKER_RESULT
 
 
-from tests.support.execution_recovery_scenarios import ExecutionRecoveryScenarios
 from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 
-class ExecutionVerifyPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestCase):
     def test_timeout_verify_uses_stable_fingerprint_and_returns_to_worker(self):
         feedback = ValidationFeedbackRepository(self.connection)
         self._with_feedback(feedback)

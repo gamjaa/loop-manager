@@ -32,8 +32,8 @@ Reduce coupling among test scenario owners. Current catalog refresh tests combin
 
 ## Progress
 
-- [ ] Separate catalog consumers and recovery fixture responsibilities.
-- [ ] Preserve scenario assertions and scope fixture writes.
+- [x] Separate catalog consumers and recovery fixture responsibilities.
+- [x] Preserve scenario assertions and scope fixture writes.
 
 ## Decision Log
 
