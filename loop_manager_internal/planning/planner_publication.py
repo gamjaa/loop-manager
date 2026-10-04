@@ -169,7 +169,7 @@ def _planning_result_from_manifest(effects: PlanningResultFromManifestEffects, m
             deletions=deletions,
             mutable_snapshot=snapshot,
         )
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError) as error:
         raise PlannerValidationError(
             "보존된 general planning publication manifest가 유효하지 않습니다."
         ) from error

@@ -54,17 +54,28 @@ class PlanningPublicationTest(PlanningCase):
         connection.row_factory = sqlite3.Row
         connection.execute(loop_manager.SCHEMA)
         connection.execute(GENERAL_PLANNING_PUBLICATIONS_SCHEMA)
-        connection.execute("INSERT INTO projects (repo, base_branch) VALUES ('/repo', 'main')")
-        manifest = '{"session":"planner-session","plans":[]}'
+        connection.execute(
+            "INSERT INTO projects (repo, base_branch, planner_session_id) "
+            "VALUES ('/repo', 'main', 'planner-session')"
+        )
+        connection.commit()
+        snapshot = MutableReadySnapshot(
+            "/repo", "base", (), mutable_snapshot_token("/repo", "base", ())
+        )
+        manifest = loop_manager._planning_result_manifest(
+            loop_manager.ValidatedPlanningResult(
+                plans=(), publication_paths=(), mutable_snapshot=snapshot,
+            )
+        )
         valid = GeneralPlanningPublication(
-            "/repo", "prepared", "base", "commit", "token", "spec", "input",
+            "/repo", "prepared", "base", "commit", snapshot.token, "spec", "input",
             manifest, hashlib.sha256(manifest.encode()).hexdigest(),
         )
         with self.assertRaises(PlanningResultInvalid):
             record_general_planning_publication(
                 connection, replace(valid, manifest_hash="invalid")
             )
-        for invalid_manifest in ("", "[]", "invalid"):
+        for invalid_manifest in ("", "[]", "invalid", "{}"):
             with self.subTest(manifest=invalid_manifest):
                 with self.assertRaises(PlanningResultInvalid):
                     record_general_planning_publication(
@@ -72,6 +83,12 @@ class PlanningPublicationTest(PlanningCase):
                             valid, manifest=invalid_manifest,
                             manifest_hash=hashlib.sha256(invalid_manifest.encode()).hexdigest(),
                         ),
+                    )
+        for field, value in (("base_sha", "wrong-base"), ("snapshot_token", "wrong-token")):
+            with self.subTest(field=field):
+                with self.assertRaises(PlanningResultInvalid):
+                    record_general_planning_publication(
+                        connection, replace(valid, **{field: value})
                     )
         self.assertIsNone(general_planning_publication(connection, "/repo"))
         self.assertEqual(record_general_planning_publication(connection, valid), valid)
@@ -81,7 +98,18 @@ class PlanningPublicationTest(PlanningCase):
         resumed = sqlite3.connect(database)
         self.addCleanup(resumed.close)
         resumed.row_factory = sqlite3.Row
-        self.assertEqual(general_planning_publication(resumed, "/repo"), valid)
+        restored = general_planning_publication(resumed, "/repo")
+        self.assertEqual(restored, valid)
+        self.assertEqual(
+            loop_manager._planning_result_from_manifest(restored.manifest).mutable_snapshot,
+            snapshot,
+        )
+        self.assertEqual(
+            resumed.execute(
+                "SELECT planner_session_id FROM projects WHERE repo = '/repo'"
+            ).fetchone()["planner_session_id"],
+            "planner-session",
+        )
 
     def test_unpublished_planning_slot_yields_only_clean_owned_base_worktree(self):
         for guard in ("clean", "dirty", "committed", "ownership", "publication", "project_blocked", "active"):

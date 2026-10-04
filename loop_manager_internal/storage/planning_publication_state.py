@@ -7,7 +7,10 @@ import json
 import hashlib
 import sqlite3
 
-from loop_manager_internal.planning.planning_catalog import PlanDeletion, PlannerValidationError
+from loop_manager_internal.planning.planning_catalog import (
+    PlanDeletion, PlannerValidationError, mutable_snapshot_token,
+    snapshot_from_dict,
+)
 from loop_manager_internal.maintenance.maintenance_planning import PlanRevision
 from .execplan_catalog_state import serialize_plan_metadata, worker_level
 
@@ -68,21 +71,34 @@ def record_general_planning_publication(
         publication.manifest,
     )
     with connection:
-        try:
-            manifest_valid = isinstance(json.loads(publication.manifest), dict)
-        except (TypeError, ValueError):
-            manifest_valid = False
-        if not manifest_valid:
-            raise PlannerValidationError(
-                "general planning publication manifest가 유효하지 않습니다."
-            )
         if (
-            not isinstance(publication.manifest_hash, str)
+            not isinstance(publication.manifest, str)
+            or not isinstance(publication.manifest_hash, str)
             or hashlib.sha256(publication.manifest.encode("utf-8")).hexdigest()
             != publication.manifest_hash
         ):
             raise PlannerValidationError(
                 "general planning publication manifest hash가 다릅니다."
+            )
+        # Import here because the publication transition also uses this state module.
+        from loop_manager_internal.planning.planner_publication import (
+            PlanningResultFromManifestEffects, _planning_result_from_manifest,
+        )
+        result = _planning_result_from_manifest(
+            PlanningResultFromManifestEffects(
+                mutable_snapshot_token=mutable_snapshot_token,
+                snapshot_from_dict=snapshot_from_dict,
+            ),
+            publication.manifest,
+        )
+        snapshot = result.mutable_snapshot
+        if snapshot is None or (
+            snapshot.repo != repo
+            or snapshot.active_sha != publication.base_sha
+            or snapshot.token != publication.snapshot_token
+        ):
+            raise PlannerValidationError(
+                "general planning publication과 mutable READY snapshot이 다릅니다."
             )
         current = general_planning_publication(connection, repo)
         if current is not None:
