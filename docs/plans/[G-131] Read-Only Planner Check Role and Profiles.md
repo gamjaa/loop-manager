@@ -40,6 +40,8 @@ priority: high
 - prompt와 parser의 세 결과·근거·유효한 대상 ID, 누락·모호한 응답·알 수 없는 결과, 전체 작업 탐색 지시 부재와 모든 파일 쓰기 거부를 검증한다. 실제 모델 호출이나 운영 설정 변경을 targeted 검증 조건으로 요구하지 않는다.
 - Manager 전체 verify는 기존 일반·유지보수 Planner, Worker·Reviewer profile/권한과 session 복구를 보존하면서 새로운 읽기 전용 역할을 지원하는지 확인한다. Reviewer의 기존 테스트 재실행 금지와 Worker/Manager 검증 책임은 유지한다.
 
+- 사용자 결정에 따라 Manager 전체 verify에서 보고된 유지보수 cycle 테스트 실패도 G-131에서 함께 해결한다. 변경하지 않은 파일이라는 이유만으로 기존 오류로 분류하지 않고, 공통 profile·Agent 호출 경로의 변경 영향과 실패 원인을 확인한다. 필요한 fixture·mock과 관련 평가 경로의 최소 수정 및 targeted 회귀 검증을 포함하며, 기존 제품 동작과 평가 정책을 보존한다. 전체 verify는 Manager가 실행하고 검증 범위를 축소하거나 실패 테스트를 제외하지 않는다.
+
 ## Progress
 
 - [x] 독립 점검 profile과 기존 설정 fallback 지원
@@ -53,3 +55,5 @@ priority: high
 - G-130의 입력 분류와 독립적으로 기존 snapshot·Agent 호출 API를 사용하는 역할을 작성한다. G-132가 두 경계를 조합한다. 점검을 위해 별도 CLI transport, 외부 서비스, root 파일이나 provider 구현을 추가하지 않는다.
 - R-050의 직접 실행과 기존 정책 확인을 그대로 사용한다. G-113의 설정 경계와 G-114의 보호 경로 probe 작업을 여기서 재구현하지 않는다.
 - priority는 `high`다. R-049의 자동 역할 선택에 필요한 읽기 전용 실행과 독립 설정을 제공한다. 더 가벼운 모델의 사용은 사용자 설정에 맡긴다.
+- 2026-10-03 사용자 결정: 전체 verify에서 보고된 유지보수 cycle 테스트 17건의 실패를 별도 ExecPlan으로 분리하지 않고 G-131 Worker가 함께 조사·수정하도록 승인한다. G-131의 공통 호출 경로 변경에 따른 회귀 가능성을 확인하고, 검증 통과에 필요한 fixture·mock 및 관련 평가 경로의 최소 수정을 현재 작업 범위에 포함한다. 변경되지 않은 파일이라는 사실만으로 G-131과 무관하다고 결론 내리지 않는다. 제품 동작·평가 정책 변경이나 검증 약화는 이 승인에 포함하지 않는다.
+- 2026-10-04: 최신 base G-130은 보고된 유지보수 cycle 오류의 재현 원인이던 legacy fixture의 실제 Model 조회와 tiered 평가 진입을 `dummy_worker_context(roles=...)`, `legacy_planning_ports()` 및 명시적 `tiered` 제거로 보정했다. 같은 base는 계획 입력 기록을 fixture에 추가했다. G-131 변경은 유지보수 역할의 profile 선택과 `read_only` 경로를 보존하며, 재적용 후 해당 직접 호출 회귀와 점검 역할 targeted unit test 10개가 통과했다. 17건 전체의 최종 확인은 Manager verify에 맡긴다.
