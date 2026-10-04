@@ -186,6 +186,20 @@ def _fallback_verify_diagnostic(raw: str, exit_code: int | None) -> str:
 
 def format_verify_failure(raw: str, *, exit_code: int | None = None,
                           timed_out: bool = False) -> str:
+    diagnostic = _format_verify_failure(raw, exit_code=exit_code, timed_out=timed_out)
+    anchors = [redact_secrets(line) for line in raw.splitlines() if line.startswith("[VERIFY_DIAGNOSTIC] ")]
+    if anchors:
+        anchor = anchors[-1][:MAX_DIAGNOSTIC // 3]
+        available = MAX_DIAGNOSTIC - len(anchor) - 2
+        if len(diagnostic) > available:
+            prefix = diagnostic[:max(0, available - len(_TRUNCATED) - 1)]
+            diagnostic = prefix.rsplit("\n", 1)[0].rstrip() + "\n" + _TRUNCATED
+        return diagnostic + "\n\n" + anchor
+    return diagnostic
+
+
+def _format_verify_failure(raw: str, *, exit_code: int | None = None,
+                          timed_out: bool = False) -> str:
     """Conservatively render recognizable verify failures for Worker feedback.
 
     This deliberately does not alter the raw output used for audit or retry

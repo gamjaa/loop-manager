@@ -19,6 +19,7 @@ class ManagedConfig:
     telegram_chat_id: str
     refactoring_review_interval: int = 20
     verify_timeout_seconds: int = 600
+    verify_parallelism: str | int = "auto"
 
     @property
     def telegram_enabled(self) -> bool:
@@ -102,6 +103,12 @@ def load_managed_config(path: Path) -> ManagedConfig:
             "[loop] verify_timeout_seconds는 양의 정수여야 합니다."
         )
 
+    from loop_manager_internal.verification.resources import parse_parallelism
+    try:
+        verify_parallelism = parse_parallelism(_setting(parser, "loop", "verify_parallelism", fallback="auto"))
+    except ValueError as error:
+        raise ManagedConfigError("[loop] verify_parallelism은 auto 또는 양의 정수여야 합니다.") from error
+
     telegram_token = _setting(
         parser,
         "telegram",
@@ -126,4 +133,5 @@ def load_managed_config(path: Path) -> ManagedConfig:
         telegram_chat_id=telegram_chat_id,
         refactoring_review_interval=refactoring_review_interval,
         verify_timeout_seconds=verify_timeout_seconds,
+        verify_parallelism=verify_parallelism,
     )

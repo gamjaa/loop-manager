@@ -187,10 +187,17 @@ def verify(effects: VerifyEffects, worktree: Path, timeout_seconds: int = 600) -
     if not script.is_file():
         return False, f"전체 검증 스크립트가 없습니다: {script.relative_to(worktree)}"
     gate = _runtime_handoff_signal.get()
-    passed, timed_out, output = effects.run_verify_process(
-        arguments, worktree, timeout_seconds,
-        **({"launch_process": effects._handoff_popen} if gate is not None else {}),
-    )
+    if (worktree / "loop_manager_internal/verification/runner.py").is_file():
+        from loop_manager_internal.verification import manager_adapter
+        passed, timed_out, output = manager_adapter.run(
+            effects, arguments, worktree, timeout_seconds,
+            launch=effects._handoff_popen if gate is not None else None,
+        )
+    else:
+        passed, timed_out, output = effects.run_verify_process(
+            arguments, worktree, timeout_seconds,
+            **({"launch_process": effects._handoff_popen} if gate is not None else {}),
+        )
     exit_code = getattr(output, "exit_code", 0 if passed else None)
     if timed_out:
         output += (

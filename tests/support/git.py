@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 import loop_manager
+from loop_manager_internal.verification.timing import phase
 
 
 def git_command(repo: Path, *arguments: str) -> str:
@@ -61,7 +62,8 @@ def _remote_repository_seed():
     """프로세스 안에서 재사용할 초기 저장소를 필요할 때 준비한다."""
     directory = tempfile.TemporaryDirectory(prefix="loop-manager-test-seed-")
     try:
-        _initialize_remote_repository(directory.name)
+        with phase("git_fixture:seed_initialization"):
+            _initialize_remote_repository(directory.name)
     except BaseException:
         directory.cleanup()
         raise
@@ -75,10 +77,11 @@ def make_remote_repository(directory: str) -> Path:
     parent = Path(directory)
     remote = parent / "remote.git"
     repo = parent / "repo"
-    shutil.copytree(seed / "remote.git", remote)
-    shutil.copytree(seed / "repo", repo)
-    git_command(repo, "init", "--initial-branch=main")
-    git_command(repo, "remote", "set-url", "origin", str(remote))
+    with phase("git_fixture:independent_copy"):
+        shutil.copytree(seed / "remote.git", remote)
+        shutil.copytree(seed / "repo", repo)
+        git_command(repo, "init", "--initial-branch=main")
+        git_command(repo, "remote", "set-url", "origin", str(remote))
     return repo
 
 

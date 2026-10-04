@@ -329,6 +329,9 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 ### PR 생성과 Merge 후 정리
 
 - Worker는 현재 환경의 전체 검증 스크립트를 생성·유지하고, 프로그램이 Agent 밖에서 실행한다.
+- Loop Manager 자체 verify는 동일한 unittest manifest와 fixture 계약을 직렬·프로세스 병렬 모드에서 유지하고 전체 compile을 포함한다. 실제 Agent 실행을 테스트 경계에서 차단하며 테스트·fixture·대기·정리의 시간과 중단 진단을 성공 stdout과 분리해 보존한다.
+- 자체 verify의 `verify_parallelism`은 생략 시 `auto`, 양의 정수는 상한, `1`은 직렬이다. 실행량은 코드가 CPU 제한·실제 부하·메모리 여유와 미반영 예약으로 결정하며 등록 프로젝트 수로 고정 분할하지 않는다. 관측 실패는 직렬로 축소하고 자원 대기도 전체 timeout에 포함한다.
+- Manager 실행 인스턴스가 동시 verify의 확인·예약을 조율한다. 예약은 해당 자식 종료 또는 미시작을 확인한 뒤 해제하며 종료 불명은 보존한다. 기존 프로젝트 선택과 같은 프로젝트의 ExecPlan 동시 실행 정책은 유지한다. 과거 시간 자료는 현재 후보 검증을 대신하지 않는다.
 - 최종 후보에서 관련 targeted test와 전체 verify가 통과하고 Reviewer blocking issue가 없어야 한다.
 - 최신 base 반영이나 후보·관련 입력 변경으로 기존 성공 근거가 무효화되면 Worker 후보 확인·targeted test·전체 verify·Review를 다시 수행한다.
 - 게시 직전 archive eligibility가 이동 집합과 다르면 같은 Worker 세션에서 교정하고 검증·Review를 반복한다.

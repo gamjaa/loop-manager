@@ -51,6 +51,10 @@ setup은 기존 `.venv`를 재사용하고 `requirements.txt`의 패키지를 �
 
 `config/config.ini`에 모델·Effort, Telegram과 동시 실행 수를 설정한다. `[codex.roles]`와 `[claude.roles]`의 `planner_check = Model alias,Effort`는 읽기 전용 점검 Planner에 독립 적용되며 생략하면 같은 provider의 `planner` 값을 사용한다. `max_workers` 기본값은 3, 전체 verify의 `verify_timeout_seconds`는 600초다. 검증이 정상 진행 중인데 상한이 부족한 경우 `[loop]`에서 조정한다.
 
+Loop Manager 자체 verify는 `[loop] verify_parallelism = auto`가 기본이다. 코드는 허용 CPU·실제 부하·메모리 여유와 아직 관측에 반영되지 않은 예약을 확인해 새 테스트 모듈을 배정한다. 양의 정수는 verify별 상한이며 `1`은 직렬이다. 상한 안에서도 자원 부족 시 배정을 기다리고, 관측 실패 시 직렬로 축소한다. `max_workers`의 프로젝트 실행 수와 별개이며 다른 등록 프로젝트의 verify 스크립트에는 적용하지 않는다.
+
+Manager 실행의 시간 이벤트·worker 원문·manifest·집계는 상태 디렉터리 `logs/verify/<실행 ID>/`에 남는다. 단독 스크립트는 `.cache/verify/<실행 ID>/`를 사용한다. 기존 두 OS 스크립트가 같은 runner로 전체 unittest와 compile을 수행하며 실제 Agent CLI·외부 API 연결은 테스트 프로세스에서 차단된다. 시간 집계만 읽으려면 `python -m loop_manager_internal.verification.runner --report <직렬 기록 디렉터리> <auto 기록 디렉터리>`를 사용한다. 이 명령은 테스트를 실행하지 않는다. 비교 결과의 범위·관측 환경 일치와 원본의 부하·메모리 제한을 확인한 뒤 시간을 해석한다.
+
 실제 config에는 비밀값이 들어갈 수 있으므로 Git에 commit하지 않는다. 상태·PR·session은 source checkout 밖 사용자 상태 디렉터리의 SQLite에 저장한다. 상태 디렉터리는 백업해 둔다.
 
 ### 4. 상태 초기화와 프로젝트 등록

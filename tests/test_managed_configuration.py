@@ -161,7 +161,7 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
 
     def test_scheduler_passes_configured_verify_timeout_to_project_worker(self):
         config = ManagedConfig(
-            Path('/config.ini'), 1, '', '', verify_timeout_seconds=42,
+            Path('/config.ini'), 1, '', '', verify_timeout_seconds=42, verify_parallelism=2,
         )
         result = loop_manager.ScheduledProjectResult(
             '/repo', loop_manager.ProjectRunResult(loop_manager.ProjectRunKind.WAITING, 0),
@@ -176,6 +176,8 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
                 (result,),
             )
         self.assertEqual(worker.call_args.args[-1], 42)
+        self.assertEqual(worker.call_args.kwargs['verify_parallelism'], 2)
+        self.assertIsNotNone(worker.call_args.kwargs['verify_coordinator'])
 
     def test_invalid_refactoring_interval_stops_before_database_creation(self):
         with tempfile.TemporaryDirectory() as directory:

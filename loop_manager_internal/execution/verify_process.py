@@ -239,10 +239,21 @@ def _stop_linux_tree(root_pid: int) -> dict[int, int]:
                 raise VerifyTerminationUncertain(
                     f"verify 자식 추적 상한 초과 (PGID {root_pid})"
                 )
-    except Exception:
-        os.killpg(root_pid, signal.SIGKILL)
+    except Exception as primary:
+        cleanup_errors = []
+        try:
+            os.killpg(root_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except Exception as error:
+            cleanup_errors.append(str(error))
         for pid, started in descendants.items():
-            _signal_linux_process(pid, started, signal.SIGKILL)
+            try:
+                _signal_linux_process(pid, started, signal.SIGKILL)
+            except Exception as error:
+                cleanup_errors.append(str(error))
+        if cleanup_errors:
+            raise VerifyTerminationUncertain(f"{primary}; 자식 정리 오류: " + "; ".join(cleanup_errors)) from primary
         raise
 
 
@@ -263,13 +274,72 @@ def _confirm_linux_descendants_stopped(descendants: dict[int, int]) -> None:
         time.sleep(0.05)
 
 
+def terminate_verify_process(process) -> None:
+    """확인된 모든 정리 경계를 시도하고 종료 불명을 보존한다."""
+    errors, descendants = [], {}
+    if os.name == "nt":
+        try:
+            killed = subprocess.run(
+                ["taskkill", "/PID", str(process.pid), "/T", "/F"],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=10, check=False,
+            )
+            if killed.returncode:
+                errors.append(f"taskkill {killed.returncode}")
+        except (OSError, subprocess.TimeoutExpired) as error:
+            errors.append(str(error))
+    else:
+        if sys.platform.startswith("linux"):
+            try:
+                descendants = _stop_linux_tree(process.pid)
+            except Exception as error:
+                errors.append(str(error))
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except OSError as error:
+            errors.append(str(error))
+        for pid, started in descendants.items():
+            try:
+                _signal_linux_process(pid, started, signal.SIGKILL)
+            except Exception as error:
+                errors.append(str(error))
+    try:
+        process.wait(timeout=10)
+    except (OSError, subprocess.TimeoutExpired) as error:
+        errors.append(str(error))
+    if os.name != "nt":
+        for confirm in (lambda: _confirm_posix_group_stopped(process.pid),
+                        lambda: _confirm_linux_descendants_stopped(descendants)):
+            try:
+                confirm()
+            except Exception as error:
+                errors.append(str(error))
+    if errors:
+        raise VerifyTerminationUncertain(f"verify 자식 종료 불명 (PID {process.pid}): " + "; ".join(errors))
+
+
+_WINDOWS_VERIFY_BOOTSTRAP = """\\
+import subprocess, sys
+if sys.stdin.readline().strip() != 'start':
+    raise SystemExit(2)
+sys.exit(subprocess.call(sys.argv[1:], stdin=subprocess.DEVNULL))
+"""
+
+
 def run_verify_process(
     arguments: list[str], worktree: Path, timeout_seconds: int,
     *,
     launch_process: Callable[..., subprocess.Popen] | None = None,
+    environment: dict[str, str] | None = None,
+    job_scope: bool = False,
+    on_started: Callable[..., None] | None = None,
 ) -> tuple[bool, bool, str]:
-    """Return (passed, timed_out, bounded output), or fail closed on live descendants."""
-
+    """Return (passed, timed_out, output), only after owned descendants stop."""
+    job = None
+    assigned = False
+    process = None
+    started = time.monotonic()
     with tempfile.TemporaryFile() as output:
         command = (
             [sys.executable, "-c", _LINUX_SUBREAPER, *arguments]
@@ -280,56 +350,61 @@ def run_verify_process(
             {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
             if os.name == "nt" else {"start_new_session": True}
         )
-        process = (launch_process or subprocess.Popen)(
-            command, cwd=worktree, stdin=subprocess.DEVNULL,
-            stdout=output, stderr=subprocess.STDOUT, **options,
-        )
+        if os.name == "nt" and job_scope:
+            from loop_manager_internal.execution.windows_job import WindowsJob
+            job = WindowsJob()
+            command = [sys.executable, "-c", _WINDOWS_VERIFY_BOOTSTRAP, *arguments]
+        if environment is not None:
+            options["env"] = environment
         try:
-            code = process.wait(timeout=timeout_seconds)
+            process = (launch_process or subprocess.Popen)(
+                command, cwd=worktree,
+                stdin=subprocess.PIPE if job else subprocess.DEVNULL,
+                stdout=output, stderr=subprocess.STDOUT, **options,
+            )
+            if job:
+                job.assign(process)
+                assigned = True
+            if on_started:
+                on_started(process, job)
+            if job:
+                process.stdin.write(b"start\n")
+                process.stdin.close()
+            remaining = max(0.001, timeout_seconds - (time.monotonic() - started))
+            code = process.wait(timeout=remaining)
+            if job:
+                job.wait(max(0.001, timeout_seconds - (time.monotonic() - started)))
             output.seek(0)
             return code == 0, False, VerifyProcessOutput(
                 output.read().decode("utf-8", errors="replace"), exit_code=code,
             )
-        except subprocess.TimeoutExpired:
-            descendants = {}
-            if os.name == "nt":
-                try:
-                    killed = subprocess.run(
-                        ["taskkill", "/PID", str(process.pid), "/T", "/F"],
-                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        timeout=10, check=False,
-                    )
-                except (OSError, subprocess.TimeoutExpired) as error:
-                    raise VerifyTerminationUncertain(
-                        f"verify process tree 종료 확인 실패 (PID {process.pid}): {error}"
-                    ) from error
-                if killed.returncode:
-                    raise VerifyTerminationUncertain(
-                        f"verify process tree 종료 실패 (PID {process.pid}, taskkill {killed.returncode})"
-                    )
+        except (subprocess.TimeoutExpired, TimeoutError):
+            if job and assigned:
+                errors = []
+                for cleanup in (job.terminate, lambda: process.wait(timeout=10), lambda: job.wait(10)):
+                    try:
+                        cleanup()
+                    except Exception as error:
+                        errors.append(str(error))
+                if errors:
+                    raise VerifyTerminationUncertain("Windows verify 자식 종료 불명: " + "; ".join(errors))
             else:
-                if sys.platform.startswith("linux"):
-                    descendants = _stop_linux_tree(process.pid)
-                try:
-                    os.killpg(process.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                except OSError as error:
-                    raise VerifyTerminationUncertain(
-                        f"verify process group 종료 실패 (PGID {process.pid}): {error}"
-                    ) from error
-                for pid, started in descendants.items():
-                    _signal_linux_process(pid, started, signal.SIGKILL)
-            try:
-                process.wait(timeout=10)
-            except (OSError, subprocess.TimeoutExpired) as error:
-                raise VerifyTerminationUncertain(
-                    f"verify process 종료 확인 실패 (PID {process.pid})"
-                ) from error
-            if os.name != "nt":
-                _confirm_posix_group_stopped(process.pid)
-                if descendants:
-                    _confirm_linux_descendants_stopped(descendants)
-            return False, True, VerifyProcessOutput(
-                _tail(output), exit_code=process.returncode,
-            )
+                terminate_verify_process(process)
+            return False, True, VerifyProcessOutput(_tail(output), exit_code=process.returncode)
+        except BaseException:
+            if process is not None and process.poll() is None:
+                if job and assigned:
+                    errors = []
+                    for cleanup in (job.terminate, lambda: process.wait(timeout=10), lambda: job.wait(10)):
+                        try:
+                            cleanup()
+                        except Exception as error:
+                            errors.append(str(error))
+                    if errors:
+                        raise VerifyTerminationUncertain("Windows verify 취소 뒤 종료 불명: " + "; ".join(errors))
+                else:
+                    terminate_verify_process(process)
+            raise
+        finally:
+            if job:
+                job.close()

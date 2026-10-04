@@ -1,5 +1,5 @@
 ---
-id: G-151
+id: G-152
 title: 공통 Git fixture 초기 상태 재사용
 sources:
   - docs/PRODUCT.md
@@ -42,6 +42,7 @@ priority: normal
 
 ## Decision Log
 
+- 2026-10-04: 최신 main의 별도 AGENTS 작업이 G-151을 사용해 이 Git fixture 수동 기록을 G-152로 옮겼다. 기존 구현·검증·commit 이력과 목적은 유지하고 G-149의 참조만 함께 정정한다.
 - 구현 commit `65934d1`을 `origin/codex/verify-fixture-fast-path`에 push했다. 직접 작업 계획은 활성 catalog에서 제외되며 서버의 G-135 실행 상태를 변경하지 않았다.
 - `py -3 -B -m unittest tests.test_git_fixture_seed tests.test_support_fixtures.SupportFixtureTests.test_git_factory_uses_explicit_repository_and_preserves_seed_files tests.test_support_fixtures.SupportFixtureTests.test_imports_create_no_resources_or_discoverable_cases`: 6개 통과. Windows sandbox 임시 디렉터리 권한 오류 후 같은 command를 정상 권한으로 다시 실행했다.
 - 기존 초기화는 Git subprocess 8회이며, seed 준비 후 각 독립 복사는 2회다. 파일 복사 비용과 전체 verify의 실제 시간 변화는 측정하지 않았다. 전체 verify의 discovery 범위와 스크립트는 유지한다.
