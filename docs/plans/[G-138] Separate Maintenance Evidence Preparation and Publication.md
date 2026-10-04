@@ -3,6 +3,7 @@ id: G-138
 title: Separate Maintenance Evidence Preparation and Publication
 sources:
   - docs/PRODUCT.md
+  - docs/requirements/[R-054] Due Refactoring Priority.md
 depends_on: []
 complexity: high
 risk: high
@@ -13,7 +14,7 @@ priority: normal
 
 Give maintenance assessment evidence a verified publication boundary. Current export writes catalog and plan files sequentially, then treats catalog existence as completion after interruption. The file ledger also mixes root/Git evidence validation with SQLite application and remote publication, which makes partial success and retry hard to reason about.
 
-R-054's due refactoring priority remains unimplemented and is outside this plan's scope. Keep `docs/requirements/[R-054] Due Refactoring Priority.md` active and cancel its archive move in this candidate. This plan does not establish completion of R-054; its unrelated source association is removed so that G-138 cannot authorize that archive move.
+R-054's due refactoring priority remains unimplemented and is outside this plan's scope. Keep `docs/requirements/[R-054] Due Refactoring Priority.md` active and cancel its archive move in this candidate. The source citation provides context and does not establish completion of R-054. The user's decision rejects archiving this unimplemented requirement in this candidate.
 
 ## Acceptance Criteria
 
