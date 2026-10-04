@@ -80,6 +80,19 @@ def active_connection(
 
 
 class GuidanceFormatTest(unittest.TestCase):
+    def test_preapproval_baseline_is_bound_without_changing_legacy_decisions(self):
+        approved = guidance_plan(decision='approve', revision='published')
+        with_baseline = approved.replace('Revision: `published`\n', 'Revision: `published`\nBaseline: `' + 'a' * 40 + '`\n')
+        first = guidance_approval.parse_guidance_document(approved)
+        second = guidance_approval.parse_guidance_document(with_baseline)
+        changed = guidance_approval.parse_guidance_document(with_baseline.replace('a' * 40, 'b' * 40))
+        self.assertEqual(first.structure_hash, second.structure_hash)
+        self.assertEqual(second.proposals[0].decision.baseline, 'a' * 40)
+        self.assertNotEqual(first.proposals[0].decision.identity, second.proposals[0].decision.identity)
+        self.assertNotEqual(second.proposals[0].decision.identity, changed.proposals[0].decision.identity)
+        with self.assertRaises(guidance_approval.GuidanceFormatError):
+            guidance_approval.parse_guidance_document(with_baseline.replace('a' * 40, 'HEAD'))
+
     def test_parser_binds_target_patch_and_decision_deterministically(self):
         pending = guidance_approval.parse_guidance_document(guidance_plan())
         approved = guidance_approval.parse_guidance_document(
@@ -643,6 +656,7 @@ Patch:
             )
             resumed = loop_manager.active_execplan(connection, str(repo))
             self.assertEqual(resumed["worker_session_id"], "worker-session")
+            connection.close()
 
     def test_planner_guidance_proposal_is_rejected_before_catalog_publication(self):
         with tempfile.TemporaryDirectory() as directory:

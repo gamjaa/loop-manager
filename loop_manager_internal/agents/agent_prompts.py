@@ -228,6 +228,7 @@ def worker_prompt(
             "\nSQLite에 사용자 결정과 결합되어 승인된 guidance가 있다. "
             "아래 approve/replace patch만 해당 Target에 적용하고 reject 대상은 원래 baseline으로 유지하라. "
             "이전 불일치가 남아 있으면 expected_content_hash가 되도록 복원하라. "
+            "원격 기준에 게시된 사전 승인도 Manager가 이 문맥으로 전달한 경우에만 적용하라. "
             "User Decision은 수정하지 말며, 최종 대상 내용은 expected_content_hash와 일치해야 한다:\n"
             f"{guidance_context}\n"
         )

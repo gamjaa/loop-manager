@@ -8,6 +8,7 @@ import loop_manager as lm
 from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKind
 from tests.support.execution import READY_WORKER_RESULT
+from pathlib import Path
 
 
 from tests.support.execution_recovery_scenarios import ExecutionRecoveryScenarios
@@ -15,6 +16,44 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 
 class ExecutionGuidanceTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+    def setUp(self):
+        super().setUp()
+        self.state.update_project('repo', active_sha='base', worktree=str(Path('/state/G-047')))
+
+    def test_preapproval_is_prepared_before_worker_scope_and_model_call(self):
+        order = []
+        self.effects.agent.prepare_guidance_preapprovals.side_effect = lambda *args: order.append('prepare') or False
+        self.effects.agent.begin_agent_scope.side_effect = lambda *args, **kwargs: order.append('scope')
+        agent = self.effects.agent.run_agent.side_effect
+        self.effects.agent.run_agent.side_effect = lambda *args, **kwargs: order.append('agent') or agent(*args, **kwargs)
+        self.handler.run(self.context())
+        self.assertEqual(order[:3], ['prepare', 'scope', 'agent'])
+
+    def test_stale_preapproval_stops_before_worker_scope_model_and_verify(self):
+        self.effects.agent.prepare_guidance_preapprovals.return_value = True
+        result = self.handler.run(self.context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.effects.agent.begin_agent_scope.assert_not_called()
+        self.effects.agent.run_agent.assert_not_called()
+        self.effects.validation.verify.assert_not_called()
+
+    def test_invalid_preapproval_blocks_only_its_plan_before_agent_scope(self):
+        self.effects.agent.prepare_guidance_preapprovals.side_effect = lm.AgentScopeError('사전 승인 불일치')
+        result = self.handler.run(self.context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        blocked = self.effects.blocking.block_active_execplan.call_args.kwargs['recovery_decision']
+        self.assertEqual(blocked.block_reason.value, 'plan_input_invalid')
+        self.assertEqual(blocked.scope.value, 'plan')
+        self.effects.agent.begin_agent_scope.assert_not_called()
+        self.effects.agent.run_agent.assert_not_called()
+
+    def test_preapproval_read_failure_uses_recovery_without_running_worker(self):
+        self.effects.agent.prepare_guidance_preapprovals.side_effect = OSError('읽기 실패')
+        result = self.handler.run(self.context())
+        self.assertIn(result.kind, (ExecutionOutcomeKind.RETRY, ExecutionOutcomeKind.TRANSIENT_PAUSE))
+        self.effects.agent.begin_agent_scope.assert_not_called()
+        self.effects.agent.run_agent.assert_not_called()
+
     def test_guidance_result_keeps_worker_scope_until_block_is_recorded(self):
         worktree, before, after = self._prepare_pending_guidance(
             implementation_changes=True,
