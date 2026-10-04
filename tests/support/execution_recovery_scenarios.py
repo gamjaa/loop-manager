@@ -277,7 +277,7 @@ class ExecutionRecoveryScenarios:
                                 git(fixture.worktree, 'push', 'origin', f'{original}:refs/heads/{branch}')
                                 git(fixture.repo, 'update-ref', '-d', f'refs/remotes/origin/{branch}')
                         return require_owned(**options)
-                    return SimpleNamespace(require_owned=observe)
+                    return SimpleNamespace(observe=observe, require_owned=observe)
                 with mock.patch.object(lm, '_current_rebase_service', side_effect=service_with_race):
                     for _ in range(2):
                         self.assertFalse(resume())

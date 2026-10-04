@@ -36,6 +36,29 @@ class SimulatedProcessExit(BaseException):
 
 
 class RebaseObservationFailureTests(unittest.TestCase):
+    def test_pr_lookup_failure_retries_saved_rebase_intent(self):
+        intent = {'remote_before': 'old', 'head': 'new'}
+        current = SimpleNamespace(
+            operation='rebase_publish', snapshot={'rebase_publication_intent': intent},
+            rebase_publication_intent=lambda: intent,
+        )
+        checkpoints = mock.Mock()
+        checkpoints.get.return_value = current
+        checkpoints.connection.execute.return_value.fetchone.return_value = None
+        state = mock.Mock()
+        state.row.return_value = {'pr_url': None, 'pr_conflict_recovery': None}
+        git = mock.Mock()
+        with mock.patch.object(managed_rebase_publication.manager_git_journal,
+                               'live_remote_branch_oid', return_value='old'):
+            with self.assertRaises(managed_rebase_publication.RebaseObservationRetry):
+                managed_rebase_publication.publish_checkpoint(
+                    state=state, checkpoints=checkpoints, repo='/repo',
+                    plan_id='G-001', repo_path=Path('/repo'), worktree=Path('/worktree'),
+                    branch='loop-manager/G-001', service=mock.Mock(),
+                    owns_remote=mock.Mock(), git=git,
+                    lookup_pr=mock.Mock(side_effect=RuntimeError('changed diagnostic')))
+        git.assert_not_called()
+
     def test_direct_rebase_observation_failure_retries_but_rejection_remains_false(self):
         service = mock.Mock()
         effects = direct_rebase_service.DirectRebaseHistoryProvenEffects(
@@ -80,6 +103,7 @@ class RebaseObservationFailureTests(unittest.TestCase):
                     branch='loop-manager/G-001', service=mock.Mock(),
                     owns_remote=mock.Mock(), git=git, lookup_pr=mock.Mock())
         self.assertIs(caught.exception.reason, RecoveryReason.PUBLICATION_RETRY)
+        self.assertIsInstance(caught.exception, managed_rebase_publication.RebaseObservationRetry)
         git.assert_not_called()
         with mock.patch.object(managed_rebase_publication.manager_git_journal,
                                'live_remote_branch_oid', return_value='unexpected'):

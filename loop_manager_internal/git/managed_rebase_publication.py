@@ -6,6 +6,7 @@ Git acceptance; this boundary owns the exact remote lease and resumable push.
 from loop_manager_internal.git.managed_rebase_validation import RebaseStatus, valid_acceptance
 from loop_manager_internal.git import manager_git_journal
 from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+import sqlite3
 
 
 class RebasePublicationRejected(RecoveryFailure):
@@ -13,8 +14,11 @@ class RebasePublicationRejected(RecoveryFailure):
         super().__init__(RecoveryReason.REMOTE_OID_UNCERTAIN, detail)
 
 
-class RebaseRemoteObservationFailed(manager_git_journal.MutationEvidenceError):
-    """The live remote ref could not be read; its state remains unknown."""
+class RebaseObservationRetry(RecoveryFailure):
+    """An external read failed; a saved publication intent can be retried."""
+
+    def __init__(self, detail):
+        super().__init__(RecoveryReason.PUBLICATION_RETRY, detail)
 
 
 def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree,
@@ -48,32 +52,51 @@ def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree
 
     def inspect():
         state.check()
-        selected = checkpoints.get(repo, plan_id)
+        try:
+            selected = checkpoints.get(repo, plan_id)
+        except sqlite3.OperationalError as error:
+            raise RebaseObservationRetry('intermediate checkpoint database observation failed') from error
         # Use the actual remote only for observing a completed intent. Never
         # replace its expected lease with an unexpected remote observation.
         try:
             oid = manager_git_journal.live_remote_branch_oid(git, repo_path, branch)
         except manager_git_journal.MutationEvidenceError as error:
-            raise RebaseRemoteObservationFailed(str(error)) from error
+            raise RebaseObservationRetry(str(error)) from error
         head = intent['head'] if pending else acceptance['head']
         if oid not in ({expected_oid, head} if pending else {expected_oid}):
             raise RebasePublicationRejected('intermediate checkpoint remote lease changed or disappeared')
-        if (row['pr_url'] or row['pr_conflict_recovery']
-                or lookup_pr(repo_path, branch, None) is not None):
+        if row['pr_url'] or row['pr_conflict_recovery']:
             raise RebasePublicationRejected('intermediate checkpoint branch now has a PR')
-        live = service(remote_oid=oid)
-        observed, decision = live.observe(checkpoint=selected)
+        try:
+            pr_exists = lookup_pr(repo_path, branch, None) is not None
+        except (RuntimeError, OSError) as error:
+            raise RebaseObservationRetry('intermediate checkpoint PR observation failed') from error
+        if pr_exists:
+            raise RebasePublicationRejected('intermediate checkpoint branch now has a PR')
+        try:
+            live = service(remote_oid=oid)
+            observed, decision = live.observe(checkpoint=selected)
+        except (RecoveryFailure, manager_git_journal.MutationEvidenceError):
+            raise
+        except (RuntimeError, OSError) as error:
+            raise RebaseObservationRetry('intermediate checkpoint rebase observation failed') from error
         if decision.status is RebaseStatus.UNAVAILABLE:
-            raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
-                                  'intermediate checkpoint observation unavailable: ' + decision.reason)
+            raise RebaseObservationRetry('intermediate checkpoint observation unavailable: ' + decision.reason)
         accepted = decision.acceptance
         if (decision.status is not RebaseStatus.COMPLETE or not valid_acceptance(accepted)
                 or accepted['head'] != head
                 or any(accepted[key] != (intent if pending else acceptance)[key]
                        for key in ('repo', 'plan_id', 'repository_identity', 'worktree',
                                    'branch', 'target_base_oid'))
-                or accepted['remote']['pull_request'] is not None
-                or not owns_remote(oid, selected)):
+                or accepted['remote']['pull_request'] is not None):
+            raise RebasePublicationRejected('intermediate checkpoint current ownership or scope differs')
+        try:
+            owned = owns_remote(oid, selected)
+        except RecoveryFailure as error:
+            if error.reason is RecoveryReason.PUBLICATION_RETRY:
+                raise RebaseObservationRetry('intermediate checkpoint ownership observation failed') from error
+            raise
+        if not owned:
             raise RebasePublicationRejected('intermediate checkpoint current ownership or scope differs')
         return oid, accepted
 
@@ -108,6 +131,5 @@ def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree
         # same intent. No failure clears intent, adopts a new lease or work.
         reason = (RecoveryReason.REMOTE_OID_UNCERTAIN
                   if isinstance(error, manager_git_journal.MutationEvidenceError)
-                  and not isinstance(error, RebaseRemoteObservationFailed)
                   else RecoveryReason.PUBLICATION_RETRY)
         raise RecoveryFailure(reason, str(error)) from error

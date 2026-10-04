@@ -6,7 +6,6 @@ from dataclasses import dataclass
 from loop_manager_internal.agents.scope_contracts import AgentScopeError
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.git import rebase_block_reconciliation
-from loop_manager_internal.git import manager_git_journal
 from loop_manager_internal.recovery import blocked_plan_reconciliation
 from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 from loop_manager_internal.recovery import scoped_blocking
@@ -670,11 +669,11 @@ def _resume_owned_checkpoint_project_block(effects: ResumeOwnedCheckpointProject
                 raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
                                       'checkpoint remote observation failed')
             ref = f'refs/heads/{branch}'
-            try:
-                live_oid = manager_git_journal.parse_remote_branch_oid(live.stdout, ref)
-            except manager_git_journal.MutationEvidenceError as error:
+            rows = [line.split() for line in live.stdout.splitlines() if line.strip()]
+            if rows and (len(rows) != 1 or len(rows[0]) != 2 or rows[0][1] != ref):
                 raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
-                                      'checkpoint remote response malformed') from error
+                                      'checkpoint remote response malformed')
+            live_oid = rows[0][0] if rows else None
             if (original_oid != before_head
                     or live_oid != remote_oid):
                 return False

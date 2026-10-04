@@ -34,6 +34,41 @@ from loop_manager_internal.runtime.contracts import GitLockError
 
 
 class ExternalOwnershipObservationTests(TestCase):
+    def test_review_remote_absence_and_malformed_response_are_distinct(self):
+        ref = 'refs/heads/branch'
+        response = {'stdout': f'old\t{ref}\n'}
+        def git(_repo, operation, *args, **kwargs):
+            if operation == 'ls-remote':
+                return SimpleNamespace(returncode=0, stdout=response['stdout'])
+            return SimpleNamespace(returncode=0, stdout='old\n')
+        ports = SimpleNamespace(
+            identity=SimpleNamespace(repo='/repo', repo_path=Path('/repo'), state_dir=Path('/state')),
+            state=SimpleNamespace(connection=mock.Mock()), git=git,
+            validate_execplan_workspace_identity=mock.Mock(),
+            validate_managed_worktree=mock.Mock(),
+        )
+        context = SimpleNamespace(plan=SimpleNamespace(plan_id='G-001'),
+                                  branch='branch', worktree=Path('/worktree'))
+        checkpoint = {'accepted_remote_oid': 'old', 'request_identity': 'request',
+                      'branch': 'branch', 'worktree': '/worktree'}
+        marker = {'request_identity': 'request', 'owner_oid': 'old', 'head': 'old'}
+        current = SimpleNamespace(operation='review', snapshot={}, expected_head='old')
+        handler = OwnershipHandler(ports)
+        with mock.patch.object(checkpoint_ownership, 'owned_remote_oid', return_value='old'):
+            self.assertTrue(handler._owned_published_review_resume(
+                context, {'publication_remote_oid': 'old', 'pr_url': None},
+                'old', current, checkpoint, marker, None))
+            response['stdout'] = ''
+            self.assertFalse(handler._owned_published_review_resume(
+                context, {'publication_remote_oid': 'old', 'pr_url': None},
+                'old', current, checkpoint, marker, None))
+            response['stdout'] = 'malformed ref response\n'
+            with self.assertRaises(RecoveryFailure) as caught:
+                handler._owned_published_review_resume(
+                    context, {'publication_remote_oid': 'old', 'pr_url': None},
+                    'old', current, checkpoint, marker, None)
+        self.assertIs(caught.exception.reason, RecoveryReason.PUBLICATION_RETRY)
+
     def test_blocked_checkpoint_adoption_retries_failed_owner_observation(self):
         checkpoint = SimpleNamespace(operation=None)
         connection = mock.Mock()

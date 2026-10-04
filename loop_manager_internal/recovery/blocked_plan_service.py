@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from loop_manager_internal.agents.scope_contracts import AgentScopeError
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.git import rebase_block_reconciliation
+from loop_manager_internal.git.managed_rebase_publication import RebaseObservationRetry
 from loop_manager_internal.recovery import checkpoint_ownership
 from loop_manager_internal.recovery import recovery_runtime
 from loop_manager_internal.recovery import scope_reconciliation
@@ -580,7 +581,7 @@ def resume_blocked_execplan_if_inputs_changed(
                     preserved_observation=preserved_observation,
                 )
             except recovery_runtime.RecoveryFailure as error:
-                if error.reason is recovery_runtime.RecoveryReason.PUBLICATION_RETRY:
+                if isinstance(error, RebaseObservationRetry):
                     raise
                 effects._update_blocked_error(connection, repo, str(plan['plan_id']),
                                       f'차단 해제 rebase 게시를 완료할 수 없습니다: {error}')

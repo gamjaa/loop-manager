@@ -197,6 +197,7 @@ class ExecutionFixture:
                 index=(SimpleNamespace(stage=1),) if stages else ())
             decision = RebaseDecision(RebaseStatus.WAITING if in_progress or stages else RebaseStatus.COMPLETE)
             return SimpleNamespace(expected=SimpleNamespace(remote=remote),
+                observe=lambda **_options: (observed, decision),
                 require_owned=lambda **_options: (observed, decision),
                 adopt=lambda *_args: fake_complete_rebase(context, project_values={'active_sha': current.target_base_oid}))
         self.handler._current_rebase_service = fake_current_service

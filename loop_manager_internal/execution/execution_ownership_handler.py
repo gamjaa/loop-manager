@@ -188,11 +188,11 @@ class OwnershipHandler:
             raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
                                   'checkpoint review remote observation failed')
         ref = f'refs/heads/{context.branch}'
-        try:
-            live_oid = manager_git_journal.parse_remote_branch_oid(observed.stdout, ref)
-        except manager_git_journal.MutationEvidenceError as error:
+        rows = [line.split() for line in observed.stdout.splitlines() if line.strip()]
+        if rows and (len(rows) != 1 or len(rows[0]) != 2 or rows[0][1] != ref):
             raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
-                                  'checkpoint review remote response malformed') from error
+                                  'checkpoint review remote response malformed')
+        live_oid = rows[0][0] if rows else None
         return live_oid == expected_live
 
     def _current_rebase_service(self, context, **options):
