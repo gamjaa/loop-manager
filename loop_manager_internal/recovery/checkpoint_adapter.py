@@ -21,6 +21,7 @@ from loop_manager_internal.storage import execution_checkpoint_state
 from pathlib import Path
 import json
 import os
+import secrets
 import sqlite3
 import tempfile
 
@@ -376,12 +377,13 @@ class CheckpointSafetyAdapter:
 
 
     def _validated_push_url(self, request) -> str:
-        """Resolve one registered destination for an immediate, explicit push."""
+        """Validate the destination and return its raw, once-rewritten URL."""
         project = self.connection.execute('SELECT origin FROM projects WHERE repo = ?',
                                           (request.repo,)).fetchone()
         if project is None or not project['origin']:
             raise RuntimeError('등록 origin이 없어 checkpoint를 local-only로 보존합니다.')
         try:
+            push_url = None
             for context in (self.repo_path, Path(request.worktree)):
                 for arguments in (('remote', 'get-url', '--all', 'origin'),
                                   ('remote', 'get-url', '--push', '--all', 'origin')):
@@ -391,9 +393,29 @@ class CheckpointSafetyAdapter:
                     if (context == Path(request.worktree)
                             and arguments == ('remote', 'get-url', '--push', '--all', 'origin')):
                         push_url = urls[0]
+            worktree = Path(request.worktree)
+            raw = self.safety_effects.git(
+                worktree, 'config', '--get-all', 'remote.origin.pushurl', check=False)
+            if raw.returncode == 1:
+                raw = self.safety_effects.git(
+                    worktree, 'config', '--get-all', 'remote.origin.url', check=False)
+            if raw.returncode or len(raw.stdout.splitlines()) != 1 or not raw.stdout.strip():
+                raise RuntimeError('origin push URL 원본이 하나로 확인되지 않습니다.')
+            raw_url = raw.stdout.strip()
+            probe = f'loop-manager-push-probe-{secrets.token_hex(8)}'
+            direct = self.safety_effects.git(
+                worktree, '-c', f'remote.{probe}.url={raw_url}',
+                'remote', '-v')
+            remote_names = {line.split('\t', 1)[0] for line in direct.stdout.splitlines()
+                            if '\t' in line}
+            destinations = [line[len(probe) + 1:-len(' (push)')]
+                            for line in direct.stdout.splitlines()
+                            if line.startswith(probe + '\t') and line.endswith(' (push)')]
+            if raw_url in remote_names or destinations != [push_url]:
+                raise RuntimeError('명시적 push URL이 검증한 origin 대상과 다릅니다.')
         except (OSError, RuntimeError) as error:
             raise RuntimeError(f'checkpoint 원격 저장소 검증 실패: {error}') from error
-        return push_url
+        return raw_url
 
 
     def _shared_safety_error(

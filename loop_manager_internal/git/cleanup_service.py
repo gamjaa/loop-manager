@@ -196,11 +196,9 @@ def remove_cleanup_worktree(
                     raise WorkspaceOwnershipError("관리 worktree 정리 직전 상태가 변경됐습니다.")
                 if still_safe().status != "safe":
                     raise WorkspaceOwnershipError("관리 worktree 정리 직전 안전 판정이 변경됐습니다.")
-                if before["registration"]["locked"]:
-                    effects.git(repo, "worktree", "unlock", str(worktree))
-                if still_safe().status != "safe":
-                    raise WorkspaceOwnershipError("관리 worktree 정리 직전 안전 판정이 변경됐습니다.")
-                effects.git(repo, "worktree", "remove", *arguments, str(worktree))
+                remove_arguments = (("--force", "--force")
+                                    if before["registration"]["locked"] else arguments)
+                effects.git(repo, "worktree", "remove", *remove_arguments, str(worktree))
                 effects._write_managed_worktree_receipt(
                     state_dir, token, repo, worktree, before, expected, "remove",
                 )
