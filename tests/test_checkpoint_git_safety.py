@@ -363,7 +363,8 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
         )
         self.assertEqual(adapter.observe_remote(request), local_oid)
         unrecorded = adapter.assess(request)
-        self.assertTrue(unrecorded.safe, unrecorded.detail)
+        self.assertFalse(unrecorded.safe)
+        self.assertEqual(unrecorded.reason_code, "shared_ref_mutation")
         blocked_checkpoint_state.BlockedCheckpointRepository(
             self.connection
         ).finish_published(request, local_oid)

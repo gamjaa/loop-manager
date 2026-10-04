@@ -716,6 +716,11 @@ class CheckpointPublicationAdapter:
                 1,
                 manager_git_journal.exact_branch_lease(request.branch, request.expected_remote_oid),
             )
+        tracking_ref = f"refs/remotes/origin/{request.branch}"
+        tracked = self.publication_effects.git(
+            Path(request.worktree), "rev-parse", "--verify", tracking_ref, check=False,
+        )
+        tracked_oid = tracked.stdout.strip() if tracked.returncode == 0 else "0" * len(local_oid)
         scoped_options = (("-c", f"core.hooksPath={os.devnull}")
                           if self.project_recovery_scope else ())
         pushed = self.publication_effects.git(Path(request.worktree), *scoped_options, *arguments, check=False)
@@ -723,6 +728,17 @@ class CheckpointPublicationAdapter:
             raise blocked_checkpoint.CheckpointPushError(
                 "checkpoint push 실패:\n" + pushed.stdout[-8000:],
                 retryable=blocked_checkpoint.push_failure_retryable(pushed.stdout),
+            )
+        # A URL push does not refresh origin's tracking ref as a named-remote
+        # push does. Preserve that local result without overwriting a concurrent
+        # ref change; the durable checkpoint can recover after a failed CAS.
+        updated = self.publication_effects.git(
+            Path(request.worktree), "update-ref", tracking_ref, local_oid, tracked_oid,
+            check=False,
+        )
+        if updated.returncode:
+            raise RuntimeError(
+                "checkpoint push 뒤 origin 추적 ref 갱신 실패:\n" + updated.stdout[-8000:]
             )
 
 
