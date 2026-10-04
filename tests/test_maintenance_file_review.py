@@ -6,6 +6,7 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 from loop_manager_internal.maintenance import maintenance_file_inventory
 from loop_manager_internal.maintenance import maintenance_file_review as review
@@ -498,6 +499,36 @@ class ProvisionalFileReviewTest(unittest.TestCase):
                          b"def calculate(): return 2\n")
         self.assertEqual(self.progress.completed_summary(str(self.repo)),
                          {"preview": [], "more_than_preview": False})
+
+    def test_ledger_rechecks_project_identity_before_applying_prepared_evidence(self):
+        inventory = self.publish({"src/a.py": "def calculate(): return 1\n"})
+        source = inventory.sources[0]
+        reviewed = (maintenance_file_ledger.ReviewedSource(
+            source.path, source.content_hash, source.mode, source.revision,
+            "Reviewed implementation and related test responsibilities.",
+        ),)
+        roots = root_results_for(self.repo, inventory)
+        prepare = self.ledger._prepare_evidence
+        changed = False
+
+        def change_project_after_preparation(*args, **kwargs):
+            nonlocal changed
+            result = prepare(*args, **kwargs)
+            if not changed:
+                self.connection.execute(
+                    "UPDATE projects SET base_branch = 'other' WHERE repo = ?", (str(self.repo),)
+                )
+                changed = True
+            return result
+        with mock.patch.object(self.ledger, "_prepare_evidence", side_effect=change_project_after_preparation):
+            with self.assertRaisesRegex(maintenance_file_ledger.FileReviewLedgerError, "base branch"):
+                self.ledger.record_success(str(self.repo), str(self.repo), "main", inventory, reviewed,
+                                           root_reviews=roots)
+        self.assertIsNone(self.ledger.last_success(str(self.repo)))
+        self.assertEqual(self.ledger.reviews(str(self.repo)), ())
+        self.connection.execute("UPDATE projects SET base_branch = 'main' WHERE repo = ?", (str(self.repo),))
+        self.ledger.record_success(str(self.repo), str(self.repo), "main", inventory, reviewed, root_reviews=roots)
+        self.assertEqual(self.ledger.last_success(str(self.repo)).source_revision, inventory.revision)
 
 
 class ReviewReceiptUnitTest(unittest.TestCase):

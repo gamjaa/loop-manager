@@ -285,6 +285,25 @@ class ReconciliationUnitTest(unittest.TestCase):
             reconciliation.parse_findings(output, progress, self.inventory,
                                           self.contents, {}, ())
 
+    def test_empty_result_and_non_string_evidence_path_request_correction(self):
+        selected = self.sources["src/a.py"]
+        progress = reconciliation.ReconciliationProgress((selected,), (), (), None)
+        for empty in ({}, None, reconciliation.FINDINGS_PREFIX + "{}"):
+            with self.subTest(empty=empty), self.assertRaises(reconciliation.ReconciliationError):
+                reconciliation.parse_findings(empty, progress, self.inventory, self.contents, {}, ())
+        finding = {
+            "issue_key": "issue-a", "targets": [selected.path],
+            "evidence": [{"path": [selected.path], "content_hash": selected.content_hash,
+                          "mode": selected.mode, "excerpt": "def calculate()"}],
+            "relation_keys": [], "boundary": "Extract the shared calculation into a focused module.",
+            "context_reduction": "The interface will no longer contain unrelated calculation logic.",
+            "integration_cost": "One import and focused tests preserve the existing behavior.",
+            "status": "new_plan", "plan_id": "G-999", "plan_comparisons": [],
+        }
+        value = {"source_revision": REVISION, "findings": [finding], "no_issue_reason": None}
+        with self.assertRaisesRegex(reconciliation.ReconciliationError, "코드 근거"):
+            reconciliation.parse_findings(value, progress, self.inventory, self.contents, {}, ("G-999",))
+
 
 class SynthesisPagingTest(unittest.TestCase):
     def test_small_records_share_pages_without_losing_any_source_or_review(self):

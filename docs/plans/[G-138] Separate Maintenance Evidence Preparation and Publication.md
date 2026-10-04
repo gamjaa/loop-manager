@@ -33,8 +33,8 @@ Give maintenance assessment evidence a verified publication boundary. Current ex
 
 ## Progress
 
-- [ ] Establish complete-generation export and ledger responsibility boundaries.
-- [ ] Add interruption, malformed-result and retry regressions.
+- [x] Establish complete-generation export and ledger responsibility boundaries.
+- [x] Add interruption, malformed-result and retry regressions.
 
 ## Decision Log
 
@@ -42,3 +42,4 @@ Give maintenance assessment evidence a verified publication boundary. Current ex
 - Observed evidence paths: `loop_manager_internal/maintenance/maintenance_findings.py`, `loop_manager_internal/maintenance/maintenance_reconciliation.py`, `loop_manager_internal/storage/maintenance_file_ledger.py`.
 
 - 2026-10-05 복구 실행 결정: 보존된 작업의 정상 자동 실행 복구 요청에 따라, R-070 병합 이후 전체 verify가 드러낸 복구 fixture·Git 관측 회귀는 G-160의 별도 수정으로 처리한다. G-138의 제품 목표와 구현 범위를 확대하지 않는다. 해당 회귀 수정이 원격 main에 반영되면 기존 Worker 세션으로 최신 후보를 확인하고 targeted test·Manager 전체 verify·Reviewer를 다시 수행한다. 이전 archive 이동은 완료 조건으로 요구하지 않으며 R-054 활성 경로를 유지한다.
+- The existing findings manifest is the completion marker: export verifies every expected catalog, plan and unit byte before reuse, repairs incomplete files with atomic replacements, then publishes the manifest last. Ledger evidence preparation runs before writes and is rechecked inside the SQLite transaction; the source and root representations remain unchanged.

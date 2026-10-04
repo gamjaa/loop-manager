@@ -4,6 +4,7 @@ from pathlib import Path
 import sqlite3
 import tempfile
 import unittest
+from unittest import mock
 
 from loop_manager_internal.maintenance import maintenance_findings as stream
 from loop_manager_internal.maintenance import maintenance_reconciliation as review
@@ -105,6 +106,51 @@ class FindingsStreamTest(unittest.TestCase):
         self.assertLess(len(output.encode()), 600)
         self.assertNotIn('"findings":', output)
         self.assertEqual(self.repository.resolve("repo", unit, output, plans)["findings"], findings)
+
+    def test_export_repairs_interrupted_catalog_and_plan_generation(self):
+        plans, texts, findings = self.data()
+        unit, _ = self.collect(plans, texts, findings)
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "evidence.json"
+            manifest = self.repository.export("repo", unit, plans, texts, evidence)
+            original_catalog = (manifest.parent / "plans.jsonl").read_bytes()
+            original_plan = (manifest.parent / "plan-00000000.txt").read_bytes()
+            (manifest.parent / "plan-00000000.txt").write_bytes(original_plan[:8])
+            (manifest.parent / "plans.jsonl").write_bytes(original_catalog[:10])
+            publish = stream._publish_file
+
+            def interrupt(path, content):
+                if path.name == "plans.jsonl":
+                    raise OSError("interrupted before catalog publication")
+                publish(path, content)
+            with mock.patch.object(stream, "_publish_file", side_effect=interrupt):
+                with self.assertRaisesRegex(OSError, "interrupted"):
+                    self.repository.export("repo", unit, plans, texts, evidence)
+            self.assertFalse(manifest.exists())
+            self.assertEqual((manifest.parent / "plan-00000000.txt").read_bytes(), original_plan)
+            self.assertEqual(self.repository.export("repo", unit, plans, texts, evidence), manifest)
+            self.assertEqual((manifest.parent / "plans.jsonl").read_bytes(), original_catalog)
+            with mock.patch.object(stream, "_publish_file") as write:
+                self.repository.export("repo", unit, plans, texts, evidence)
+                write.assert_not_called()
+            missing = manifest.parent / "plan-00000001.txt"
+            missing.unlink()
+            self.repository.export("repo", unit, plans, texts, evidence)
+            self.assertEqual(missing.read_text(), texts["G-0001"])
+            outside = Path(directory) / "outside.txt"
+            outside.write_text("outside remains untouched")
+            linked = manifest.parent / "plan-00000002.txt"
+            linked.unlink()
+            linked.symlink_to(outside)
+            self.repository.export("repo", unit, plans, texts, evidence)
+            self.assertFalse(linked.is_symlink())
+            self.assertEqual(linked.read_text(), texts["G-0002"])
+            self.assertEqual(outside.read_text(), "outside remains untouched")
+            saved_unit = manifest.parent / "unit-00000000.json"
+            original_unit = saved_unit.read_bytes()
+            saved_unit.write_bytes(original_unit[:12])
+            self.repository.export("repo", unit, plans, texts, evidence)
+            self.assertEqual(saved_unit.read_bytes(), original_unit)
 
     def test_many_findings_and_plans_preserve_every_record_with_resume(self):
         plans, texts, findings = self.data(30, 120)

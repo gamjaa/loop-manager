@@ -502,7 +502,8 @@ def parse_findings(output: str | dict, progress: ReconciliationProgress,
     if progress.pending_scan or progress.next_relation is not None or len(progress.completed) != len(progress.relations):
         raise ReconciliationError("미확인 파일 간 관계가 남았습니다.")
     value = _single_json(output, FINDINGS_PREFIX) if isinstance(output, str) else output
-    if set(value) != {"source_revision", "findings", "no_issue_reason"} or value["source_revision"] != inventory.revision:
+    if (not isinstance(value, dict) or set(value) != {"source_revision", "findings", "no_issue_reason"}
+        or value["source_revision"] != inventory.revision):
         raise ReconciliationError("발견 결과의 source 또는 필드가 다릅니다.")
     roots = root_move_candidates(progress.root_reviews)
     findings = value["findings"]
@@ -545,7 +546,9 @@ def parse_findings(output: str | dict, progress: ReconciliationProgress,
             or not set(targets) & (selected | roots.keys())):
             raise ReconciliationError("발견 대상은 선정된 현재 원본을 포함해야 합니다.")
         evidence = finding["evidence"]
-        if not isinstance(evidence, list) or set(targets) != {item.get("path") for item in evidence if isinstance(item, dict)}:
+        if (not isinstance(evidence, list)
+            or any(not isinstance(item, dict) or not isinstance(item.get("path"), str) for item in evidence)
+            or set(targets) != {item["path"] for item in evidence}):
             raise ReconciliationError("모든 발견 대상의 코드 근거가 필요합니다.")
         for item in evidence:
             if isinstance(item, dict) and set(item) == {"path", "root_review_hash", "excerpt"}:
