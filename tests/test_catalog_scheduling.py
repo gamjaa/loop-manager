@@ -419,6 +419,7 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                 started_fingerprint = loop_manager.planning_input_fingerprint(repo, "main")
                 roles = []
                 remote_advanced = False
+                published_fingerprint = None
 
                 def advance_remote():
                     nonlocal remote_advanced
@@ -465,8 +466,13 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                 original_publish = loop_manager.publish_general_planning_batch
 
                 def publish(*args, **kwargs):
+                    nonlocal published_fingerprint
                     original_publish(*args, **kwargs)
                     if publishes_plan and not remote_advanced:
+                        published_fingerprint = connection.execute(
+                            "SELECT planning_fingerprint FROM projects WHERE repo = ?",
+                            (str(repo),),
+                        ).fetchone()["planning_fingerprint"]
                         git_command(repo, "merge", "--ff-only", "origin/main")
                         advance_remote()
 
@@ -527,11 +533,14 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                 self.assertEqual(
                     project["phase"], "WORKING" if publishes_plan else None
                 )
-                self.assertEqual(
-                    project["planning_fingerprint"],
-                    loop_manager.planning_input_fingerprint(repo, "main"),
-                )
-                self.assertNotEqual(project["planning_fingerprint"], started_fingerprint)
+                current_fingerprint = loop_manager.planning_input_fingerprint(repo, "main")
+                if publishes_plan:
+                    self.assertIsNotNone(published_fingerprint)
+                    self.assertEqual(project["planning_fingerprint"], published_fingerprint)
+                    self.assertNotEqual(project["planning_fingerprint"], current_fingerprint)
+                else:
+                    self.assertEqual(project["planning_fingerprint"], current_fingerprint)
+                    self.assertNotEqual(project["planning_fingerprint"], started_fingerprint)
                 self.assertEqual(
                     [tuple(plan) for plan in plans],
                     [("G-001", "MERGED")]
