@@ -7,7 +7,7 @@ from loop_manager_internal.application.contracts import ValidatedPlanningResult
 from loop_manager_internal.maintenance import maintenance_file_inventory
 from loop_manager_internal.maintenance import maintenance_file_publication
 from loop_manager_internal.storage import maintenance_state
-from loop_manager_internal.storage import runtime_state, planning_input_state
+from loop_manager_internal.storage import runtime_state, planning_input_state, planner_check_state
 from loop_manager_internal.storage.planning_publication_state import GeneralPlanningPublication
 from pathlib import Path
 import sqlite3
@@ -68,6 +68,28 @@ class _PlanningStatePorts:
 
     def planning(self, repo: str) -> runtime_state.PlanningSnapshot:
         return self._runtime_repository.planning(repo)
+
+    def general_baseline(self, repo: str) -> bool:
+        return planning_input_state.has_baseline(self._connection, repo)
+
+    def planner_check(self, repo: str) -> sqlite3.Row | None:
+        return planner_check_state.get(self._connection, repo)
+
+    def begin_planner_check(self, repo: str, **values: str) -> None:
+        with self.transaction():
+            planner_check_state.begin(self._connection, repo, **values)
+
+    def advance_planner_check(
+        self, repo: str, expected_stage: str, next_stage: str,
+        *, expected_input: str | None = None,
+        expected_target: str | None = None, **values: object,
+    ) -> bool:
+        with self.transaction():
+            return planner_check_state.advance(
+                self._connection, repo, expected_stage, next_stage,
+                expected_input=expected_input, expected_target=expected_target,
+                **values,
+            )
 
     def maintenance_cycle(
         self, repo: str

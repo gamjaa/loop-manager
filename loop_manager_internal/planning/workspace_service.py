@@ -182,7 +182,10 @@ class PlanningWorkspaceService(PlanningService):
                 recheck_completed = row.planning_result_completed and relevant_input_changed
                 linked_error = self._linked_failed_result(run)
                 if row.agent_snapshot:
-                    role = "maintenance_planner" if run.maintenance_planning else "planner"
+                    check = getattr(self._ports.state, "planner_check", lambda _repo: None)(context.repo)
+                    role = ("maintenance_planner" if run.maintenance_planning else
+                            "planner_check" if check is not None and check["stage"] in {"pending", "result"}
+                            else "planner")
                     if row.agent_role != role:
                         self._ports.events.error("보존된 Agent 역할이 현재 Planner와 다릅니다.")
                         return self._operational_error()

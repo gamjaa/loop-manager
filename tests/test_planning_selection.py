@@ -21,6 +21,7 @@ from loop_manager_internal.maintenance import maintenance_reconciliation
 from loop_manager_internal.maintenance.maintenance_file_inventory import RootPlacement, TrackedSource
 from tests.support.maintenance import result_for
 from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot, mutable_snapshot_token
+from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
 from loop_manager_internal.maintenance.maintenance_orchestration import maintenance_planning_fingerprint
 from loop_manager_internal.planning.planning_runtime import (
     PlanningAgentResult,
@@ -411,14 +412,32 @@ class PlanningSelectionTest(PlanningCase):
         self.assertEqual(second.kind, PlanningOutcomeKind.EXECUTION_READY)
         self.assertEqual(ports.agent.run_count, 1)
 
-    def test_source_change_with_ready_runs_planner_once_before_activation(self):
+    def _code_check_ports(self):
         ports = FakePorts(
             planning_snapshot(
+                processed_sha="old-base",
                 specification_fingerprint="specification",
                 planning_fingerprint="old-full",
             )
         )
         ports.git.fingerprint = "new-full"
+        ports.git.fingerprints["old-base"] = "old-full"
+        ports.state.has_general_baseline = True
+        plan = ReadyPlanSnapshot(
+            plan_id="G-001", path="docs/plans/[G-001] Ready.md", title="Ready",
+            sources=("docs/PRODUCT.md",), depends_on=(), complexity="low",
+            risk="low", priority="normal", content_hash="plan-hash",
+            plan_sha="base", text="plan", current_complexity="low",
+            current_risk="low", current_metadata_recorded=True,
+        )
+        ports.validation.snapshot = MutableReadySnapshot(
+            repo="/repo", active_sha="base", plans=(plan,),
+            token=mutable_snapshot_token("/repo", "base", (plan,)),
+        )
+        ports.agent.result = PlanningAgentResult(
+            0, 'PLANNER_CHECK_RESULT: {"outcome":"no_change","evidence":"code paths reviewed","reason":"plans remain valid","plan_ids":[]}',
+            "check-session", PlanningAgentResultKind.SUCCESS,
+        )
         ports.state.schedule_result = SimpleNamespace(
             active=None,
             has_ready=True,
@@ -427,16 +446,438 @@ class PlanningSelectionTest(PlanningCase):
             project_blocked=False,
         )
         ports.state.activate_result = object()
+        return ports
+
+    def test_source_change_with_ready_runs_planner_once_before_activation(self):
+        ports = self._code_check_ports()
+        ports.git.diff_name_status = "M\tsrc/app.py\nM\tdocs/plans/[G-002] Auto.md\n"
 
         outcome = PlanningLifecycleCoordinator(ports).run(self.context)
 
         self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
         self.assertEqual(ports.agent.run_count, 1)
-        self.assertEqual(ports.state.snapshot.planning_fingerprint, "new-full")
+        self.assertEqual(ports.agent.roles, [("planner_check", True)])
+        self.assertIn("src/app.py", ports.agent.prompts[0])
+        self.assertNotIn("docs/plans/[G-002] Auto.md", ports.agent.prompts[0])
+        self.assertEqual(ports.state.snapshot.planning_fingerprint, "old-full")
+        self.assertEqual(ports.state.check_record["stage"], "accepted")
 
         ports.state.snapshot = replace(ports.state.snapshot, phase=None)
         PlanningLifecycleCoordinator(ports).run(self.context)
         self.assertEqual(ports.agent.run_count, 1)
+
+    def test_accepted_check_survives_content_identical_revision_advance(self):
+        ports = self._code_check_ports()
+        PlanningLifecycleCoordinator(ports).run(self.context)
+        ports.state.snapshot = replace(ports.state.snapshot, phase=None)
+        ports.git.remote = "same-content-base"
+        ports.git.head = "same-content-base"
+        ports.git.fingerprints["same-content-base"] = "new-full"
+
+        outcome = PlanningLifecycleCoordinator(ports).run(
+            replace(self.context, base_sha="same-content-base"),
+        )
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertEqual(ports.state.check_record["stage"], "accepted")
+
+    def test_remote_code_change_during_check_reselects_new_input(self):
+        ports = self._code_check_ports()
+        original_run = ports.agent.run_planner
+
+        def advance_remote(*args, **kwargs):
+            result = original_run(*args, **kwargs)
+            ports.git.remote = "new-base"
+            ports.git.fingerprints["new-base"] = "newer-full"
+            return result
+
+        ports.agent.run_planner = advance_remote
+        first = PlanningLifecycleCoordinator(ports).run(self.context)
+        self.assertEqual(first.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        self.assertEqual(ports.state.check_record["stage"], "result")
+        ports.agent.run_planner = original_run
+
+        second = PlanningLifecycleCoordinator(ports).run(
+            replace(self.context, base_sha="new-base"),
+        )
+
+        self.assertEqual(second.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(ports.agent.roles, [("planner_check", True)] * 2)
+        self.assertEqual(ports.state.check_record["input_fingerprint"], "newer-full")
+
+    def test_remote_document_change_during_check_hands_off_latest_input(self):
+        ports = self._code_check_ports()
+        original_run = ports.agent.run_planner
+
+        def advance_remote(*args, **kwargs):
+            result = original_run(*args, **kwargs)
+            ports.git.remote = "document-base"
+            ports.git.fingerprints["document-base"] = "document-full"
+            ports.git.specification_fingerprints["document-base"] = "changed-specification"
+            return result
+
+        ports.agent.run_planner = advance_remote
+        first = PlanningLifecycleCoordinator(ports).run(self.context)
+        self.assertEqual(first.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        ports.agent.run_planner = original_run
+        ports.agent.result = PlanningAgentResult(
+            0, "general planner result", "general-session",
+            PlanningAgentResultKind.SUCCESS,
+        )
+
+        second = PlanningLifecycleCoordinator(ports).run(
+            replace(self.context, base_sha="document-base"),
+        )
+
+        self.assertEqual(second.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(ports.agent.roles, [("planner_check", True), (None, False)])
+        self.assertEqual(ports.state.check_record["stage"], "handoff")
+
+    def test_code_change_with_dependency_waiting_ready_checks_then_waits(self):
+        ports = self._code_check_ports()
+        ports.state.schedule_result.runnable_ready = None
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.WAITING)
+        self.assertEqual(ports.agent.roles, [("planner_check", True)])
+        self.assertEqual(ports.state.check_record["stage"], "accepted")
+        self.assertEqual(ports.state.snapshot.planning_fingerprint, "old-full")
+
+    def test_active_execution_is_not_preempted_by_check_snapshot(self):
+        ports = self._code_check_ports()
+        ports.state.schedule_result.active = object()
+        ports.validation.prepare_general_context = mock.Mock(
+            side_effect=AssertionError("active work must be resumed first"),
+        )
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(self.context)
+
+        self.assertIsNone(coordinator._selection._select_planning_work(run))
+        self.assertEqual(run.selection.kind, PlanningDecisionKind.RESUME_ACTIVE)
+        ports.validation.prepare_general_context.assert_not_called()
+
+    def test_code_change_without_mutable_ready_uses_general_planner(self):
+        ports = self._code_check_ports()
+        ports.validation.snapshot = MutableReadySnapshot(
+            "/repo", "base", (), mutable_snapshot_token("/repo", "base", ()),
+        )
+        ports.agent.result = PlanningAgentResult(
+            0, "general planner result", "general-session",
+            PlanningAgentResultKind.SUCCESS,
+        )
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(ports.agent.roles, [(None, False)])
+        self.assertIsNone(ports.state.check_record)
+
+    def test_guidance_and_code_change_uses_general_planner(self):
+        ports = self._code_check_ports()
+        ports.git.guidance_changed = True
+        ports.agent.result = PlanningAgentResult(
+            0, "general planner result", "general-session",
+            PlanningAgentResultKind.SUCCESS,
+        )
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(ports.agent.roles, [(None, False)])
+        self.assertIsNone(ports.state.check_record)
+
+    def test_accepted_check_does_not_claim_later_general_planning(self):
+        ports = self._code_check_ports()
+        first = PlanningLifecycleCoordinator(ports).run(self.context)
+        self.assertEqual(first.kind, PlanningOutcomeKind.EXECUTION_READY)
+        ports.state.snapshot = replace(ports.state.snapshot, phase=None)
+        ports.validation.snapshot = MutableReadySnapshot(
+            "/repo", "base", (), mutable_snapshot_token("/repo", "base", ()),
+        )
+        ports.agent.result = PlanningAgentResult(
+            0, "general planner result", "general-session",
+            PlanningAgentResultKind.SUCCESS,
+        )
+
+        second = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(second.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(ports.agent.roles, [("planner_check", True), (None, False)])
+        self.assertEqual(ports.state.check_record["stage"], "superseded")
+
+    def test_mutable_ready_owner_change_during_check_blocks_acceptance(self):
+        ports = self._code_check_ports()
+        original = ports.validation.snapshot
+        empty = MutableReadySnapshot(
+            "/repo", "base", (), mutable_snapshot_token("/repo", "base", ()),
+        )
+        ports.validation.prepare_general_context = mock.Mock(
+            side_effect=[original, original, empty],
+        )
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        self.assertEqual(ports.agent.roles, [("planner_check", True)])
+        self.assertEqual(ports.state.check_record["stage"], "result")
+        self.assertEqual(ports.state.snapshot.planning_fingerprint, "old-full")
+
+        ports.validation.prepare_general_context = mock.Mock(return_value=original)
+        resumed = PlanningLifecycleCoordinator(ports).run(self.context)
+        self.assertEqual(resumed.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertEqual(ports.state.check_record["stage"], "accepted")
+
+    def test_mutable_ready_owner_change_blocks_stale_handoff(self):
+        ports = self._code_check_ports()
+        ports.agent.result = PlanningAgentResult(
+            0, 'PLANNER_CHECK_RESULT: {"outcome":"needs_revision","evidence":"changed API","reason":"update plan","plan_ids":["G-001"]}',
+            "check-session", PlanningAgentResultKind.SUCCESS,
+        )
+        original = ports.validation.snapshot
+        empty = MutableReadySnapshot(
+            "/repo", "base", (), mutable_snapshot_token("/repo", "base", ()),
+        )
+        ports.validation.prepare_general_context = mock.Mock(
+            side_effect=[original, original, empty],
+        )
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        self.assertEqual(ports.agent.roles, [("planner_check", True)])
+        self.assertEqual(ports.state.check_record["stage"], "result")
+
+    def test_mutable_ready_owner_change_after_acceptance_blocks_activation(self):
+        ports = self._code_check_ports()
+        original = ports.validation.snapshot
+        empty = MutableReadySnapshot(
+            "/repo", "base", (), mutable_snapshot_token("/repo", "base", ()),
+        )
+        ports.validation.prepare_general_context = mock.Mock(
+            side_effect=[original, original, original, empty],
+        )
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        self.assertEqual(ports.state.check_record["stage"], "accepted")
+        self.assertIsNone(ports.state.snapshot.phase)
+        self.assertEqual(ports.agent.run_count, 1)
+
+    def test_invalid_check_result_keeps_pending_session(self):
+        ports = self._code_check_ports()
+        ports.agent.result = PlanningAgentResult(
+            0, "PLANNER_CHECK_RESULT: invalid", "check-session",
+            PlanningAgentResultKind.SUCCESS,
+        )
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
+        self.assertEqual(ports.state.check_record["stage"], "pending")
+        self.assertEqual(ports.state.check_record["session_id"], "check-session")
+        self.assertEqual(ports.state.check_record["retry_count"], 1)
+        self.assertEqual(ports.state.snapshot.planning_fingerprint, "old-full")
+
+    def test_check_result_with_secret_is_rejected_without_storing_value(self):
+        ports = self._code_check_ports()
+        ports.agent.result = PlanningAgentResult(
+            0, 'PLANNER_CHECK_RESULT: {"outcome":"no_change","evidence":"Bearer exampletoken","reason":"plans remain valid","plan_ids":[]}',
+            "check-session", PlanningAgentResultKind.SUCCESS,
+        )
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
+        self.assertEqual(ports.state.check_record["stage"], "pending")
+        self.assertNotIn("exampletoken", str(ports.state.check_record))
+
+    def test_check_scope_failure_cannot_advance_baseline(self):
+        ports = self._code_check_ports()
+        ports.agent.finish_scope = mock.Mock(return_value=PlanningScopeResult(
+            error="read-only scope changed", result_snapshot="scope-evidence",
+        ))
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+        self.assertEqual(ports.state.check_record["stage"], "pending")
+        self.assertEqual(ports.state.snapshot.planning_fingerprint, "old-full")
+        self.assertEqual(ports.state.snapshot.planning_error, "read-only scope changed")
+        self.assertEqual(ports.state.snapshot.agent_result_snapshot, "scope-evidence")
+
+    def test_check_usage_limit_preserves_pending_session_and_baseline(self):
+        ports = self._code_check_ports()
+        ports.agent.result = PlanningAgentResult(
+            1, "usage limit reached", "check-session",
+            PlanningAgentResultKind.USAGE_LIMIT,
+        )
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.USAGE_LIMIT_PAUSE)
+        self.assertEqual(ports.state.check_record["stage"], "pending")
+        self.assertEqual(ports.state.check_record["session_id"], "check-session")
+        self.assertEqual(ports.state.snapshot.planning_fingerprint, "old-full")
+
+    def test_check_revision_hands_off_once_to_general_planner(self):
+        for decision, plan_ids in (("needs_revision", ["G-001"]), ("uncertain", [])):
+            with self.subTest(decision=decision):
+                ports = self._code_check_ports()
+                ports.agent.results = [
+                    PlanningAgentResult(
+                        0, "PLANNER_CHECK_RESULT: " + json.dumps({
+                            "outcome": decision, "evidence": "changed API",
+                            "reason": "G-001 validation needs review", "plan_ids": plan_ids,
+                        }),
+                        "check-session", PlanningAgentResultKind.SUCCESS,
+                    ),
+                    PlanningAgentResult(
+                        0, "general planner result", "general-session",
+                        PlanningAgentResultKind.SUCCESS,
+                    ),
+                ]
+
+                outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+                self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
+                self.assertEqual(ports.agent.roles, [("planner_check", True), (None, False)])
+                self.assertEqual(ports.state.check_record["stage"], "handoff")
+                self.assertEqual(ports.state.snapshot.planning_fingerprint, "new-full")
+
+    def test_interrupted_handoff_resumes_general_without_second_check(self):
+        ports = self._code_check_ports()
+        ports.state.check_record = {
+            "stage": "handoff", "error": "needs_revision: validation changed",
+            "base_sha": "base", "session_id": "check-session",
+        }
+        ports.state.snapshot = replace(
+            ports.state.snapshot, phase="PLANNING", active_sha="base",
+            planning_attempt_fingerprint="new-full", planning_workspace_owned=1,
+            worktree="/state/worktrees/planning",
+        )
+        ports.agent.result = PlanningAgentResult(
+            0, "general planner result", "general-session",
+            PlanningAgentResultKind.SUCCESS,
+        )
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(ports.agent.roles, [(None, False)])
+        self.assertEqual(ports.state.check_record["stage"], "handoff")
+
+    def test_interrupted_general_result_after_handoff_is_not_recalled(self):
+        ports = self._code_check_ports()
+        ports.state.check_record = {
+            "stage": "handoff", "error": "needs_revision: validation changed",
+            "base_sha": "base", "session_id": "check-session",
+        }
+        ports.state.snapshot = replace(
+            ports.state.snapshot, phase="PLANNING", active_sha="base",
+            planning_attempt_fingerprint="new-full", planning_workspace_owned=1,
+            worktree="/state/worktrees/planning", planning_result_completed=True,
+            planning_result="general result", planner_session_id="general-session",
+        )
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(ports.agent.run_count, 0)
+        self.assertEqual(ports.state.snapshot.planning_fingerprint, "new-full")
+
+    def test_interrupted_accepted_cleanup_resumes_without_second_check(self):
+        ports = self._interrupted_accepted_ports()
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(ports.agent.run_count, 0)
+        self.assertEqual(ports.state.snapshot.planning_fingerprint, "old-full")
+
+    def _interrupted_accepted_ports(self):
+        ports = self._code_check_ports()
+        from loop_manager_internal.storage.planner_check_state import target_fingerprint
+        ports.state.check_record = {
+            "stage": "accepted", "input_fingerprint": "new-full",
+            "target_fingerprint": target_fingerprint(ports.validation.snapshot),
+            "specification_fingerprint": "specification", "base_sha": "base",
+            "comparison_sha": "old-base",
+        }
+        ports.state.snapshot = replace(
+            ports.state.snapshot, phase="PLANNING", active_sha="base",
+            planning_attempt_fingerprint="new-full", planning_workspace_owned=1,
+            worktree="/state/worktrees/planning",
+        )
+        return ports
+
+    def test_interrupted_accepted_reselects_changed_remote_input_or_target(self):
+        for change in ("code", "document", "plan", "guidance", "owner"):
+            with self.subTest(change=change):
+                ports = self._interrupted_accepted_ports()
+                ports.git.remote = "new-base"
+                ports.git.fingerprints["new-base"] = "new-full"
+                if change == "code":
+                    ports.git.fingerprints["new-base"] = "newer-full"
+                elif change == "document":
+                    ports.git.specification_fingerprints["new-base"] = "changed-specification"
+                elif change == "plan":
+                    ports.state.plan_declarations_match_result = False
+                elif change == "guidance":
+                    ports.git.guidance_changed = True
+                else:
+                    ports.validation.snapshot = MutableReadySnapshot(
+                        "/repo", "new-base", (),
+                        mutable_snapshot_token("/repo", "new-base", ()),
+                    )
+
+                outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+                self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+                self.assertIsNone(ports.state.snapshot.phase)
+                self.assertEqual(ports.agent.run_count, 0)
+                self.assertEqual(ports.state.check_record["stage"], "accepted")
+                if change == "code":
+                    resumed = PlanningLifecycleCoordinator(ports).run(
+                        replace(self.context, base_sha="new-base"),
+                    )
+                    self.assertEqual(resumed.kind, PlanningOutcomeKind.EXECUTION_READY)
+                    self.assertEqual(ports.agent.roles, [("planner_check", True)])
+                    self.assertEqual(
+                        ports.state.check_record["input_fingerprint"], "newer-full",
+                    )
+
+    def test_interrupted_accepted_reuses_identical_remote_revision(self):
+        ports = self._interrupted_accepted_ports()
+        ports.git.remote = "same-content-base"
+        ports.git.fingerprints["same-content-base"] = "new-full"
+
+        first = PlanningLifecycleCoordinator(ports).run(self.context)
+        second = PlanningLifecycleCoordinator(ports).run(
+            replace(self.context, base_sha="same-content-base"),
+        )
+
+        self.assertEqual(first.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        self.assertEqual(second.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(ports.agent.run_count, 0)
+        self.assertEqual(ports.state.snapshot.planning_fingerprint, "old-full")
+
+    def test_accepted_input_mismatch_at_activation_restarts_before_worker(self):
+        ports = self._interrupted_accepted_ports()
+        ports.state.snapshot = replace(ports.state.snapshot, phase=None)
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(self.context)
+        run.current_fingerprint = "newer-full"
+        run.specification_fingerprint = "specification"
+        run.fingerprint_skipped = True
+
+        outcome = coordinator._selection._activate_next_execplan(run)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        self.assertIsNone(ports.state.snapshot.phase)
 
     def test_no_change_planner_result_advances_full_baseline_before_ready(self):
         ports = FakePorts(planning_snapshot(

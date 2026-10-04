@@ -16,6 +16,7 @@ from loop_manager_internal.planning.selection_service import PlanningSelectionSe
 from loop_manager_internal.planning.workspace_service import PlanningWorkspaceService
 from loop_manager_internal.planning.assessment_service import PlanningAssessmentService
 from loop_manager_internal.planning.publication_service import PlanningPublicationService
+from loop_manager_internal.planning.check_service import PlanningCheckService
 
 class PlanningLifecycleCoordinator:
     """Read the durable phase and advance the selected lifecycle step."""
@@ -24,13 +25,17 @@ class PlanningLifecycleCoordinator:
         self._selection = PlanningSelectionService(ports)
         self._workspace = PlanningWorkspaceService(ports)
         self._assessment = PlanningAssessmentService(ports, ports.assessment)
+        self._check = PlanningCheckService(ports)
         self._publication = PlanningPublicationService(ports)
         self._handlers = (
             (self._publication, "_recover_publication"),
             (self._selection, "_gate_preserved_error"),
             (self._selection, "_select_planning_work"),
             (self._selection, "_reconcile_inputs"),
+            (self._check, "_resume_accepted"),
+            (self._check, "_resume_handoff"),
             (self._workspace, "_prepare_workspace"),
+            (self._check, "_run_check"),
             (self._assessment, "_run_planner_turn"),
             (self._assessment, "_validate_planner_result"),
             (self._publication, "_publish_planner_result"),

@@ -388,7 +388,6 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                 self.assertEqual(result.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
                 step.assert_called_once()
 
-    @dummy_worker_sessions
     def test_remote_input_change_after_planner_defers_published_ready_worker(self):
         for publishes_plan in (False, True):
             with self.subTest(publishes_plan=publishes_plan), tempfile.TemporaryDirectory() as directory:
@@ -420,6 +419,7 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                 started_fingerprint = loop_manager.planning_input_fingerprint(repo, "main")
                 roles = []
                 remote_advanced = False
+                published_fingerprint = None
 
                 def advance_remote():
                     nonlocal remote_advanced
@@ -436,6 +436,16 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
 
                 def agent(worktree, _state, _config, role_name, _prompt, **_kwargs):
                     roles.append(role_name)
+                    if role_name == "planner_check":
+                        self.assertTrue(_kwargs["read_only"])
+                        return loop_manager.CodexResult(
+                            0,
+                            "PLANNER_CHECK_RESULT: " + json.dumps({
+                                "outcome": "no_change", "evidence": "source diff reviewed",
+                                "reason": "queued plan remains valid", "plan_ids": [],
+                            }),
+                            "check-session",
+                        )
                     if role_name == "planner":
                         if not publishes_plan and roles.count("planner") == 2:
                             self.assertEqual(_kwargs.get("session_id"), "planner-session")
@@ -456,8 +466,13 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                 original_publish = loop_manager.publish_general_planning_batch
 
                 def publish(*args, **kwargs):
+                    nonlocal published_fingerprint
                     original_publish(*args, **kwargs)
                     if publishes_plan and not remote_advanced:
+                        published_fingerprint = connection.execute(
+                            "SELECT planning_fingerprint FROM projects WHERE repo = ?",
+                            (str(repo),),
+                        ).fetchone()["planning_fingerprint"]
                         git_command(repo, "merge", "--ff-only", "origin/main")
                         advance_remote()
 
@@ -475,7 +490,7 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                 ), mock.patch(
                     "loop_manager.publish_general_planning_batch",
                     side_effect=publish,
-                ):
+                ), dummy_worker_context(roles=("worker", "planner_check")):
                     result = loop_manager.run_project(
                         connection,
                         state_dir,
@@ -512,24 +527,26 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                 self.assertEqual(result, 1 if publishes_plan else 0)
                 self.assertEqual(
                     roles,
-                    ["planner", "planner", "worker"] if publishes_plan
+                    ["planner", "planner_check", "worker"] if publishes_plan
                     else ["planner", "planner"],
                 )
                 self.assertEqual(
                     project["phase"], "WORKING" if publishes_plan else None
                 )
-                self.assertEqual(
-                    project["planning_fingerprint"],
-                    loop_manager.planning_input_fingerprint(repo, "main"),
-                )
-                self.assertNotEqual(project["planning_fingerprint"], started_fingerprint)
+                current_fingerprint = loop_manager.planning_input_fingerprint(repo, "main")
+                if publishes_plan:
+                    self.assertIsNotNone(published_fingerprint)
+                    self.assertEqual(project["planning_fingerprint"], published_fingerprint)
+                    self.assertNotEqual(project["planning_fingerprint"], current_fingerprint)
+                else:
+                    self.assertEqual(project["planning_fingerprint"], current_fingerprint)
+                    self.assertNotEqual(project["planning_fingerprint"], started_fingerprint)
                 self.assertEqual(
                     [tuple(plan) for plan in plans],
                     [("G-001", "MERGED")]
                     + ([('G-002', 'IMPLEMENTING')] if publishes_plan else []),
                 )
 
-    @dummy_worker_sessions
     def test_changed_input_plans_before_ready_and_unchanged_input_runs_worker(self):
         for changed in (True, False):
             with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
@@ -581,6 +598,16 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
 
                 def agent(_worktree, _state, _config, role_name, _prompt, **_kwargs):
                     roles.append(role_name)
+                    if role_name == "planner_check":
+                        self.assertTrue(_kwargs["read_only"])
+                        return loop_manager.CodexResult(
+                            0,
+                            "PLANNER_CHECK_RESULT: " + json.dumps({
+                                "outcome": "no_change", "evidence": "source diff reviewed",
+                                "reason": "queued plan remains valid", "plan_ids": [],
+                            }),
+                            "check-session",
+                        )
                     if role_name == "planner":
                         return loop_manager.CodexResult(0, "", "planner-session")
                     return loop_manager.CodexResult(1, "stop", f"{role_name}-session")
@@ -596,7 +623,7 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                 ), mock.patch(
                     "loop_manager.run_codex",
                     side_effect=agent,
-                ):
+                ), dummy_worker_context(roles=("worker", "planner_check")):
                     result = loop_manager.run_project(
                         connection,
                         state_dir,
@@ -608,7 +635,7 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
 
                 self.assertEqual(result, 1)
                 self.assertEqual(
-                    roles, ["planner", "worker"] if changed else ["worker"]
+                    roles, ["planner_check", "worker"] if changed else ["worker"]
                 )
 
     @dummy_worker_sessions

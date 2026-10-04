@@ -49,9 +49,9 @@ priority: high
 ## Progress
 
 - [ ] 선행 G-130·G-131 Merge 확인
-- [ ] 입력·mutable READY에 따른 역할 선택과 집중된 점검 service 연결
-- [ ] durable 결과 적용·인계·재시작 및 최신 입력 gate 구현
-- [ ] 오류·실행 자리·완료 기준 분리와 관련 targeted 회귀 검증
+- [x] 입력·mutable READY에 따른 역할 선택과 집중된 점검 service 연결
+- [x] durable 결과 적용·인계·재시작 및 최신 입력 gate 구현
+- [x] 오류·실행 자리·완료 기준 분리와 관련 targeted 회귀 검증
 - [ ] Manager 전체 verify, 독립 Review 및 사용자 Merge
 
 ## Decision Log
@@ -60,3 +60,4 @@ priority: high
 - G-130은 입력·게시 provenance를, G-131은 읽기 전용 호출·profile·결과 계약을 담당한다. 두 계획이 MERGED인 뒤 실행 선택·저장·복구를 연결한다. 기존 G-113의 Planner 슬롯 보호와 현재 구현된 session·publication 복구 경계를 재사용하며 해당 결함을 별도 재구현하지 않는다.
 - 제한된 점검의 성공으로 일반 계획 전체 성공을 덮지 않는다. 이후 코드 변경의 비교에는 마지막 유효한 점검 기준을 사용할 수 있지만, 예정 대상이 없어졌거나 전체 미충족 작업을 판단할 때에는 일반 Planner 확인이 필요하다.
 - priority는 `high`다. 입력 변경에 맞는 자동 역할 선택과 오래된 결과의 Worker activation 방지를 구현한다. R-049가 요청한 선택 정책 안에서 현재 Git·게시·검증 책임과 SQLite 실행 상태 모델을 유지한다.
+- 2026-10-04: 점검은 기존 PLANNING 슬롯과 관리 worktree를 사용하고 입력·대상에 결합된 별도 SQLite 단계(`pending`/`result`/`accepted`/`handoff`/`superseded`)에 session·결과·오류를 보존한다. 입력 또는 대상이 달라진 이전 판단은 감사 이력에 남기고 새 snapshot에서 다시 선택한다. `accepted`는 일반 계획 성공 지문을 바꾸지 않으며 인계는 점검 session을 일반 Planner에 전달하지 않는다. R-049는 요청대로 본문 변경 없이 archive로 이동했고 장기 역할 규칙은 PRODUCT에 기록했다.

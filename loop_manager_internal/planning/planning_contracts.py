@@ -70,6 +70,7 @@ class PlanningDecisionKind(str, Enum):
     RUN_SPECIFICATION_PLANNING = "run_specification_planning"
     ACTIVATE_READY = "activate_ready"
     RUN_FALLBACK_PLANNING = "run_fallback_planning"
+    RUN_PLANNER_CHECK = "run_planner_check"
     STABLE_WAIT = "stable_wait"
     COMPLETE = "complete"
 
@@ -86,6 +87,7 @@ def choose_planning_decision(
     runnable_ready: bool,
     planning_input_changed: bool,
     has_waiting_catalog: bool,
+    check_ready: bool = False,
 ) -> PlanningDecision:
     """Choose active work, changed planning input, or READY at a safe boundary."""
 
@@ -93,6 +95,8 @@ def choose_planning_decision(
         kind = PlanningDecisionKind.RESUME_ACTIVE
     elif specification_changed:
         kind = PlanningDecisionKind.RUN_SPECIFICATION_PLANNING
+    elif planning_input_changed and check_ready:
+        kind = PlanningDecisionKind.RUN_PLANNER_CHECK
     elif planning_input_changed:
         kind = PlanningDecisionKind.RUN_FALLBACK_PLANNING
     elif runnable_ready:
@@ -160,6 +164,18 @@ class PlanningStatePort(Protocol):
     ) -> None: ...
 
     def planning(self, repo: str) -> runtime_state.PlanningSnapshot: ...
+
+    def general_baseline(self, repo: str) -> bool: ...
+
+    def planner_check(self, repo: str) -> Any | None: ...
+
+    def begin_planner_check(self, repo: str, **values: str) -> None: ...
+
+    def advance_planner_check(
+        self, repo: str, expected_stage: str, next_stage: str,
+        *, expected_input: str | None = None,
+        expected_target: str | None = None, **values: object,
+    ) -> bool: ...
 
     def maintenance_cycle(self, repo: str) -> maintenance_state.MaintenanceCycle: ...
 
@@ -554,6 +570,7 @@ class _PlanningRun:
     planning_worktree: Path | None = None
     maintenance_context: MaintenancePlanningContext | None = None
     mutable_ready_snapshot: MutableReadySnapshot | None = None
+    check_comparison_sha: str | None = None
     maintenance_change_context: str = ""
     dirty_files: list[str] | None = None
     planner_scope_error: str | None = None
@@ -582,6 +599,7 @@ class PlanningRunSnapshot:
     planning_worktree: Path | None = None
     maintenance_context: MaintenancePlanningContext | None = None
     mutable_ready_snapshot: MutableReadySnapshot | None = None
+    check_comparison_sha: str | None = None
     maintenance_change_context: str = ""
     dirty_files: tuple[str, ...] | None = None
     planner_scope_error: str | None = None
