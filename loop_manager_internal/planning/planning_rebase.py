@@ -15,6 +15,7 @@ import tempfile
 from uuid import uuid4
 
 from loop_manager_internal.git.manager_git_journal import _sync_directory
+from loop_manager_internal.runtime.contracts import GitLockError
 
 
 class PlanningRebaseError(RuntimeError):
@@ -104,6 +105,15 @@ def _stash(git, worktree: Path, message: str) -> tuple[str, str] | None:
 
 
 def _git_ok(git, worktree: Path, *args: str) -> str:
+    if "-z" in args and callable(getattr(git, "nul_paths", None)):
+        try:
+            paths = git.nul_paths(worktree, *args)
+        except GitLockError:
+            raise
+        except RuntimeError as error:
+            raise PlanningRebaseError(
+                f"planning Git 단계 실패 ({' '.join(args[:2])})") from error
+        return "\0".join(paths) + ("\0" if paths else "")
     result = git(worktree, *args, check=False)
     if result.returncode:
         raise PlanningRebaseError(f"planning Git 단계 실패 ({' '.join(args[:2])}): {result.stdout[-2000:]}")
@@ -174,11 +184,21 @@ def _matches_completed_stash_apply(
 
 
 def _stash_untracked_collisions(git, worktree: Path, stash_sha: str) -> tuple[str, ...]:
-    saved = git(worktree, "ls-tree", "-r", "--name-only", "-z", f"{stash_sha}^3", check=False)
-    if saved.returncode:
-        return ()
+    arguments = ("ls-tree", "-r", "--name-only", "-z", f"{stash_sha}^3")
+    if callable(getattr(git, "nul_paths", None)):
+        try:
+            paths = git.nul_paths(worktree, *arguments)
+        except GitLockError:
+            raise
+        except RuntimeError:
+            return ()  # The stash may have no untracked parent.
+    else:
+        saved = git(worktree, *arguments, check=False)
+        if saved.returncode:
+            return ()
+        paths = saved.stdout.split("\0")
     return tuple(sorted(
-        path for path in saved.stdout.split("\0") if path
+        path for path in paths if path
         and git(worktree, "ls-files", "--error-unmatch", "--", path,
                 check=False).returncode == 0
     ))

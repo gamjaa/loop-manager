@@ -1,6 +1,8 @@
 """Small stateful Git double for the detached planning rebase boundary."""
 from pathlib import Path
 from types import SimpleNamespace
+import hashlib
+import os
 import subprocess
 import tempfile
 import unittest
@@ -99,6 +101,49 @@ class PlanningRebaseTest(unittest.TestCase):
         git = mock.Mock(return_value=SimpleNamespace(stdout=name + '\0', returncode=0))
         self.assertEqual(planning_rebase._git_ok(
             git, Path('/repo'), 'ls-files', '--others', '-z'), name + '\0')
+
+    @unittest.skipIf(os.name == 'nt', 'raw non-UTF-8 filename fixture requires POSIX')
+    def test_rebase_fingerprints_read_raw_nul_paths_without_text_git(self):
+        from loop_manager_internal.agents import scope_observation
+        from loop_manager_internal.planning import planning_rebase
+        from loop_manager_internal.planning.git_ports import _PlanningGitPorts
+        raw_name = b' leading\r\xff\tback\\slash'
+        name = os.fsdecode(raw_name)
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            (worktree / name).write_bytes(b'content')
+            text_git = mock.Mock(return_value=SimpleNamespace(stdout='', returncode=0))
+            raw_effects = SimpleNamespace(git_bytes=mock.Mock(return_value=raw_name + b'\0'))
+            paths = lambda repo, *args: scope_observation._nul_git_paths(
+                repo, *args, effects=raw_effects)
+            port = _PlanningGitPorts(
+                SimpleNamespace(git=text_git, _nul_git_paths=paths),
+                None, worktree, worktree)
+            git = port._rebase_git
+            fingerprint = planning_rebase._restored_fingerprint(git, worktree)
+            self.assertEqual(fingerprint[2], ((name, 'file', b'content', 0),))
+            digest = planning_rebase._correction_digest(git, worktree, ())
+            expected = hashlib.sha256(repr(([(name, ('file', b'content', 0))], '')).encode()).hexdigest()
+            self.assertEqual(digest, expected)
+            self.assertTrue(all('-z' not in call.args for call in text_git.call_args_list))
+            self.assertTrue(all('-z' in call.args for call in raw_effects.git_bytes.call_args_list))
+            raw_effects.git_bytes.side_effect = RuntimeError('Git read failed')
+            with self.assertRaises(PlanningRebaseError):
+                planning_rebase._git_ok(git, worktree, 'ls-files', '--others', '-z')
+
+    def test_missing_stash_untracked_parent_is_empty_but_git_lock_is_preserved(self):
+        from loop_manager_internal.planning import planning_rebase
+        from loop_manager_internal.planning.git_ports import _RebaseGit
+        from loop_manager_internal.runtime.contracts import GitLockError
+        text_git = mock.Mock(side_effect=AssertionError('NUL output reached text Git'))
+        paths = mock.Mock(side_effect=RuntimeError('no untracked parent'))
+        git = _RebaseGit(text_git, paths)
+        self.assertEqual(planning_rebase._stash_untracked_collisions(
+            git, Path('/repo'), 'stash'), ())
+        paths.side_effect = GitLockError('locked')
+        with self.assertRaises(GitLockError):
+            planning_rebase._stash_untracked_collisions(git, Path('/repo'), 'stash')
+        text_git.assert_not_called()
 
     def test_windows_journal_skips_directory_open(self):
         from loop_manager_internal.planning import planning_rebase

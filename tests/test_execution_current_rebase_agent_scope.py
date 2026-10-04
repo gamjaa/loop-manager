@@ -40,6 +40,36 @@ class CurrentRebaseAgentScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
         self.assertEqual(restored.head, self.original.head)
         self.assertFalse(restored.shared_metadata_complete)
 
+    def test_version_five_comparison_requires_scope_identity(self):
+        from loop_manager_internal.git.managed_rebase_adoption import agent_comparison_baseline
+        from loop_manager_internal.git.manager_git_journal import MutationEvidenceError
+        import hashlib
+        import json
+        original = replace(self.original, scope_id='a' * 32,
+                           scope_start_digest='b' * 64)
+        valid = json.loads(original.serialize())
+        saved = {'current_rebase_agent_baseline': {
+            'kind': 'current_rebase_comparison_baseline', 'role': 'worker',
+            'original': hashlib.sha256(original.serialize().encode()).hexdigest(),
+            'snapshot': original.serialize(),
+        }}
+        self.assertEqual(agent_comparison_baseline(original, saved, 'worker'), original)
+        for field, invalid in (('scope_id', None), ('scope_id', 'not-a-token'),
+                               ('scope_id', 'c' * 32),
+                               ('scope_start_digest', None), ('scope_start_digest', 'bad'),
+                               ('scope_start_digest', 'd' * 64)):
+            with self.subTest(field=field, invalid=invalid):
+                damaged = {**valid, field: invalid}
+                saved['current_rebase_agent_baseline']['snapshot'] = json.dumps(damaged)
+                with self.assertRaises(MutationEvidenceError):
+                    agent_comparison_baseline(original, saved, 'worker')
+        saved['current_rebase_agent_baseline']['snapshot'] = json.dumps({
+            key: value for key, value in valid.items()
+            if key not in ('scope_id', 'scope_start_digest')
+        } | {'version': 4})
+        with self.assertRaises(MutationEvidenceError):
+            agent_comparison_baseline(original, saved, 'worker')
+
 
     def test_resumed_scope_keeps_original_and_records_observed_comparison_start(self):
         from loop_manager_internal.git.managed_rebase_adoption import agent_comparison_baseline

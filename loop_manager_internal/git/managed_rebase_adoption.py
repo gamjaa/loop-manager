@@ -7,6 +7,7 @@ separate boundaries.
 from dataclasses import dataclass, replace
 import hashlib
 import json
+import re
 
 from loop_manager_internal.git.managed_rebase_observation import ObservationAdapters, observe_current_rebase
 from loop_manager_internal.git.managed_rebase_validation import (
@@ -152,6 +153,14 @@ def agent_comparison_baseline(original, saved, role):
     try:
         parsed = json.loads(raw) if isinstance(raw, str) else None
         if (not isinstance(parsed, dict)
+                or (bool(original.scope_id) != (parsed.get('version') == 5))
+                or (parsed.get('version') == 5 and (
+                    not isinstance(parsed.get('scope_id'), str)
+                    or re.fullmatch(r'[0-9a-f]{32}', parsed['scope_id']) is None
+                    or not isinstance(parsed.get('scope_start_digest'), str)
+                    or re.fullmatch(r'[0-9a-f]{64}', parsed['scope_start_digest']) is None
+                    or parsed['scope_id'] != original.scope_id
+                    or parsed['scope_start_digest'] != original.scope_start_digest))
                 or not isinstance(parsed.get('head'), str)
                 or not parsed['head']
                 or parsed.get('branch') is not None and not isinstance(parsed['branch'], str)
