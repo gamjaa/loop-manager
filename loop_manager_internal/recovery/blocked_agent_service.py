@@ -82,6 +82,12 @@ def _require_blocked_agent_recovery_owner(
         (repo, plan_id),
     ).fetchone()
     checkpoint = ExecutionCheckpointRepository(connection).get(repo, str(plan_id))
+    generation = recovery["checkpoint_generation"]
+    generation_valid = (
+        checkpoint.generation >= generation
+        if recovery["state"] == "isolated"
+        else checkpoint.generation == generation
+    )
     if (plan is None or plan["status"] != "PLAN_BLOCKED"
             or plan["branch"] != recovery["branch"]
             or plan["worktree"] != str(worktree)
@@ -90,7 +96,7 @@ def _require_blocked_agent_recovery_owner(
                 block[field] != recovery["owner_block"].get(field)
                 for field in ("reason_code", "release_fingerprint", "created_at"))
             or request is None or request["request_identity"] != recovery["owner_request_identity"]
-            or checkpoint.generation != recovery["checkpoint_generation"]):
+            or not generation_valid):
         raise AgentScopeError("BLOCKED Agent 복구의 계획·원인·checkpoint generation이 변경됐습니다.")
 
 
@@ -501,19 +507,26 @@ def _complete_blocked_agent_recovery(
             except (KeyError, TypeError, ValueError, RuntimeError, OSError) as error:
                 raise AgentScopeError("BLOCKED Agent 복원 중간 tree를 확인할 수 없습니다.") from error
             if current.dirty:
-                # read-tree(index_tree) can have restored the staged entries
-                # before their saved flags. Its content and dirty signatures
-                # must still match the original baseline exactly.
                 contents = lambda entries: {
                     path: tuple(entry.partition(' ')[2] for entry in values)
                     for path, values in entries.items()}
-                safe = (index_tree == baseline["index_tree"]
-                        and current.dirty == before.dirty
-                        and all(' ' in entry for values in current.index.values()
-                                for entry in values)
-                        and contents(current.index) == contents(before.index)
-                        and all(entry.startswith('H ') or entry in before.index.get(path, ())
-                                for path, values in current.index.items() for entry in values))
+                if index_tree == baseline["worktree_tree"]:
+                    # The first read-tree populates both index and worktree
+                    # from the saved worktree tree. Former unstaged/untracked
+                    # paths now appear staged against HEAD.
+                    safe = (all(kinds == ("staged",) for kinds, _ in current.dirty.values())
+                            and all(entry.startswith('H ') for values in current.index.values()
+                                    for entry in values))
+                else:
+                    # The second read-tree restores staged entries before
+                    # their saved flags; compare their content and dirty state.
+                    safe = (index_tree == baseline["index_tree"]
+                            and current.dirty == before.dirty
+                            and all(' ' in entry for values in current.index.values()
+                                    for entry in values)
+                            and contents(current.index) == contents(before.index)
+                            and all(entry.startswith('H ') or entry in before.index.get(path, ())
+                                    for path, values in current.index.items() for entry in values))
             else:
                 safe = (index_tree in clean_trees
                         and all(entry.startswith('H ') for values in current.index.values()
