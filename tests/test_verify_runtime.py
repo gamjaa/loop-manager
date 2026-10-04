@@ -73,7 +73,10 @@ class TimingAndManifestTests(unittest.TestCase):
             def tearDown(self):
                 advance(3)
         with tempfile.TemporaryDirectory() as directory:
-            result, summary = self.run_suite(unittest.TestSuite([Case("test_case")]), Path(directory), lambda: clock[0])
+            with fixture_timing():
+                result, summary = self.run_suite(
+                    unittest.TestSuite([Case("test_case")]), Path(directory), lambda: clock[0],
+                )
         self.assertTrue(result.wasSuccessful())
         self.assertEqual(summary["tests"][0]["duration"], 10)
         class_phases = [event for event in summary["phases"] if "Class" in event["name"]]
