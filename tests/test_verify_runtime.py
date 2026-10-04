@@ -203,6 +203,12 @@ class GuardAndConfigurationTests(unittest.TestCase):
         self.assertEqual(environment[guard.MARKER], "1")
         self.assertIn("child_guard", environment["PYTHONPATH"])
         self.assertNotIn("LOOP_MANAGER_VERIFY_SECRET", guard.worker_environment(environment))
+        with self.assertRaises(RuntimeError):
+            audit("subprocess.Popen", (None, 'cmd /c "codex exec"', None, {}))
+        windows_environment = {}
+        audit("subprocess.Popen", (None, 'git rev-parse HEAD', None, windows_environment))
+        self.assertEqual(windows_environment[guard.MARKER], "1")
+        self.assertIn("child_guard", windows_environment["PYTHONPATH"])
 
     def test_managed_parallelism_defaults_caps_and_invalid_values(self):
         with tempfile.TemporaryDirectory() as directory:

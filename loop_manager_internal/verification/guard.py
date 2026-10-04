@@ -44,7 +44,8 @@ def _local(host):
 def install_guard():
     def audit(event, arguments):
         if event == "subprocess.Popen":
-            check_command([arguments[0]], enabled=True)
+            if arguments[0] is not None:
+                check_command([arguments[0]], enabled=True)
             check_command(arguments[1], enabled=True)
             environment = arguments[3]
             # env를 명시하거나 테스트가 부모 env를 비워도 Python 자식의 차단을 유지한다.

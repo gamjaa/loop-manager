@@ -26,6 +26,7 @@ priority: high
 1. `VerifyCoordinator.request()`의 acquire에서 sampler 호출 뒤 판단 시각을 읽고 대기열·예약 계산 및 생성에 일관되게 사용한다. `resources.decide()`의 보호 조건은 유지한다.
 2. `tests/test_verify_resources.py`에 시간 전진·stale·복구 회귀를 추가하고 기존 예약·자원 unit test로 보호 정책을 확인한다.
 3. 기존 verify runner와 스크립트의 동일 manifest·compile·timeout·Agent 차단 경로로 직렬/auto를 비교한다. 제품·Requirement·G-135 문서는 변경하지 않는다.
+4. Windows 실측 시작에서 확인된 subprocess audit의 `executable=None` 입력만 수용한다. 명시된 executable과 실제 command의 Agent 차단 및 자식 차단 환경 상속은 보존한다.
 
 ## Validation
 
@@ -45,3 +46,4 @@ priority: high
 
 - 2026-10-04: 관측을 미래로 허용하거나 snapshot 시각을 보정하지 않고 관측 이후에 clock을 읽는다. 실제 낡은 관측과 시간 역행의 안전한 축소는 유지한다.
 - 2026-10-04: G-135 실행 시간은 운영 발견 근거이며 이번 로컬 실측의 baseline 또는 결함 단독 효과로 취급하지 않는다.
+- 2026-10-04: 첫 직렬 실측은 테스트 수집 전에 Windows Python 3.13 subprocess audit의 `executable=None`을 `os.fsdecode()`에 전달해 실패했다. 실제 command 검사는 유지하면서 생략된 executable 검사만 건너뛰는 최소 호환 수정을 실측 선행 조건으로 추가한다.
