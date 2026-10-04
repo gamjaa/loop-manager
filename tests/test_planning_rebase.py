@@ -1,6 +1,8 @@
 """Small stateful Git double for the detached planning rebase boundary."""
 from pathlib import Path
 from types import SimpleNamespace
+import hashlib
+import os
 import subprocess
 import tempfile
 import unittest
@@ -67,6 +69,170 @@ class PlanningGitDouble:
 
 
 class PlanningRebaseTest(unittest.TestCase):
+    def test_null_correction_journal_refuses_before_git_mutation(self):
+        from loop_manager_internal.planning import planning_rebase
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / 'planning'
+            worktree.mkdir()
+            path = planning_rebase._journal_path(root, '/repo', worktree)
+            record = {
+                'repo': '/repo', 'worktree': str(worktree.resolve()),
+                'old': 'old', 'target': 'new', 'head': 'old', 'nonce': 'nonce',
+                'dirty': True, 'phase': 'rebasing', 'correction': None,
+            }
+            planning_rebase._write(path, record)
+            git = mock.Mock()
+            with self.assertRaises(PlanningRebaseError):
+                rebase_planning_worktree(git, root, root, '/repo', worktree, 'old', 'new')
+            git.assert_not_called()
+            self.assertEqual(planning_rebase.json.loads(path.read_text()), record)
+
+    def test_damaged_correction_journal_refuses_before_git_mutation(self):
+        from loop_manager_internal.planning import planning_rebase
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / 'planning'
+            worktree.mkdir()
+            path = planning_rebase._journal_path(root, '/repo', worktree)
+            planning_rebase._write(path, {
+                'repo': '/repo', 'worktree': str(worktree.resolve()),
+                'old': 'old', 'target': 'new', 'head': 'old', 'nonce': 'nonce',
+                'dirty': True, 'phase': 'rebasing',
+                'correction': {'paths': 'docs/plans/a.md', 'was_rebase': True,
+                               'head': 'old', 'digest': 'hash'},
+            })
+            git = mock.Mock()
+            with self.assertRaises(PlanningRebaseError):
+                rebase_planning_worktree(git, root, root, '/repo', worktree, 'old', 'new')
+            git.assert_not_called()
+            record = planning_rebase.json.loads(path.read_text())
+            record['phase'] = 'rebasing'
+            record['correction'] = {
+                'paths': ['docs/plans/../../AGENTS.md'],
+                'was_rebase': True, 'head': 'old', 'digest': 'hash',
+            }
+            planning_rebase._write(path, record)
+            with self.assertRaises(PlanningRebaseError):
+                rebase_planning_worktree(git, root, root, '/repo', worktree, 'old', 'new')
+            git.assert_not_called()
+            record['correction']['paths'] = ['docs/plans/a\0.md']
+            planning_rebase._write(path, record)
+            with self.assertRaises(PlanningRebaseError):
+                rebase_planning_worktree(git, root, root, '/repo', worktree, 'old', 'new')
+            git.assert_not_called()
+            self.assertEqual(planning_rebase.json.loads(path.read_text()), record)
+            record.pop('correction')
+            planning_rebase._write(path, record)
+            with self.assertRaises(PlanningRebaseError):
+                planning_rebase.save_planning_correction(
+                    git, root, '/repo', worktree, 'new',
+                    ('docs/plans/../../AGENTS.md',), True)
+            git.assert_not_called()
+            self.assertTrue(path.exists())
+            record['phase'] = ['rebasing']
+            planning_rebase._write(path, record)
+            with self.assertRaises(PlanningRebaseError):
+                rebase_planning_worktree(git, root, root, '/repo', worktree, 'old', 'new')
+            git.assert_not_called()
+
+    @unittest.skipIf(os.name == 'nt', 'literal backslash filename requires POSIX')
+    def test_posix_backslash_correction_is_saved_and_resumed(self):
+        from loop_manager_internal.planning import planning_rebase
+        name = 'docs/plans/a\\b.md'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / 'planning'
+            file = worktree / name
+            file.parent.mkdir(parents=True)
+            file.write_bytes(b'approved')
+            path = planning_rebase._journal_path(root, '/repo', worktree)
+            planning_rebase._write(path, {
+                'repo': '/repo', 'worktree': str(worktree.resolve()),
+                'old': 'old', 'target': 'new', 'head': 'old', 'nonce': 'nonce',
+                'dirty': True, 'phase': 'rebasing',
+            })
+
+            def git(_worktree, *args, check=False):
+                self.assertEqual(_worktree, worktree)
+                if args == ('rev-parse', 'HEAD'):
+                    return SimpleNamespace(stdout='old\n', returncode=0)
+                if args in (('diff', '--name-only', 'HEAD', '-z'),
+                            ('ls-files', '--others', '--exclude-standard', '-z'),
+                            ('diff', '--cached', '--binary', 'HEAD', '--', '.',
+                             f':(literal,exclude){name}')):
+                    return SimpleNamespace(stdout='', returncode=0)
+                raise AssertionError(f'unexpected Git command: {args}')
+
+            planning_rebase.save_planning_correction(
+                git, root, '/repo', worktree, 'new', (name,), True)
+            self.assertEqual(
+                planning_rebase.planning_correction(git, root, '/repo', worktree, 'new'),
+                ((name,), True),
+            )
+            file.write_bytes(b'changed')
+            with self.assertRaises(PlanningRebaseError):
+                planning_rebase.planning_correction(git, root, '/repo', worktree, 'new')
+
+    def test_windows_correction_path_rejects_backslash(self):
+        from loop_manager_internal.planning import planning_rebase
+        with mock.patch.object(planning_rebase, 'os') as windows_os:
+            windows_os.name = 'nt'
+            self.assertFalse(planning_rebase._correction_path_allowed(
+                'docs/plans/..\\..\\AGENTS.md'))
+
+    def test_nul_git_path_output_keeps_leading_whitespace(self):
+        from loop_manager_internal.planning import planning_rebase
+        name = ' leading\tline\nback\\slash'
+        git = mock.Mock(return_value=SimpleNamespace(stdout=name + '\0', returncode=0))
+        self.assertEqual(planning_rebase._git_ok(
+            git, Path('/repo'), 'ls-files', '--others', '-z'), name + '\0')
+        git.assert_called_once_with(
+            Path('/repo'), 'ls-files', '--others', '-z', check=False)
+
+    @unittest.skipIf(os.name == 'nt', 'raw non-UTF-8 filename fixture requires POSIX')
+    def test_rebase_fingerprints_read_raw_nul_paths_without_text_git(self):
+        from loop_manager_internal.agents import scope_observation
+        from loop_manager_internal.planning import planning_rebase
+        from loop_manager_internal.planning.git_ports import _PlanningGitPorts
+        raw_name = b' leading\r\xff\tback\\slash'
+        name = os.fsdecode(raw_name)
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            (worktree / name).write_bytes(b'content')
+            text_git = mock.Mock(return_value=SimpleNamespace(stdout='', returncode=0))
+            raw_effects = SimpleNamespace(git_bytes=mock.Mock(return_value=raw_name + b'\0'))
+            paths = lambda repo, *args: scope_observation._nul_git_paths(
+                repo, *args, effects=raw_effects)
+            port = _PlanningGitPorts(
+                SimpleNamespace(git=text_git, _nul_git_paths=paths),
+                None, worktree, worktree)
+            git = port._rebase_git
+            fingerprint = planning_rebase._restored_fingerprint(git, worktree)
+            self.assertEqual(fingerprint[2], ((name, 'file', b'content', 0),))
+            digest = planning_rebase._correction_digest(git, worktree, ())
+            expected = hashlib.sha256(repr(([(name, ('file', b'content', 0))], '')).encode()).hexdigest()
+            self.assertEqual(digest, expected)
+            self.assertTrue(all('-z' not in call.args for call in text_git.call_args_list))
+            self.assertTrue(all('-z' in call.args for call in raw_effects.git_bytes.call_args_list))
+            raw_effects.git_bytes.side_effect = RuntimeError('Git read failed')
+            with self.assertRaises(PlanningRebaseError):
+                planning_rebase._git_ok(git, worktree, 'ls-files', '--others', '-z')
+
+    def test_missing_stash_untracked_parent_is_empty_but_git_lock_is_preserved(self):
+        from loop_manager_internal.planning import planning_rebase
+        from loop_manager_internal.planning.git_ports import _RebaseGit
+        from loop_manager_internal.runtime.contracts import GitLockError
+        text_git = mock.Mock(side_effect=AssertionError('NUL output reached text Git'))
+        paths = mock.Mock(side_effect=RuntimeError('no untracked parent'))
+        git = _RebaseGit(text_git, paths)
+        self.assertEqual(planning_rebase._stash_untracked_collisions(
+            git, Path('/repo'), 'stash'), ())
+        paths.side_effect = GitLockError('locked')
+        with self.assertRaises(GitLockError):
+            planning_rebase._stash_untracked_collisions(git, Path('/repo'), 'stash')
+        text_git.assert_not_called()
+
     def test_windows_journal_skips_directory_open(self):
         from loop_manager_internal.planning import planning_rebase
         from loop_manager_internal.git import manager_git_journal

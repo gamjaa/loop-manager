@@ -603,13 +603,71 @@ def _write_new(path: Path, value: Mapping[str, Any]) -> None:
     _sync_directory(path.parent)
 
 
-def _read(path: Path) -> dict[str, Any]:
+def _read(path: Path, *, require_rebase_branch: bool = False) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
         raise MutationEvidenceError(f"Manager Git journal을 읽을 수 없습니다: {path}") from error
     if not isinstance(value, dict):
         raise MutationEvidenceError("Manager Git journal 형식이 유효하지 않습니다.")
+    if path.name == 'active.json' or path.name.endswith('.intent.json'):
+        legacy_rebase = (path.name.endswith('.intent.json')
+                         and value.get('kind') is None
+                         and isinstance(value.get('expected'), dict)
+                         and isinstance(value['expected'].get('branch'), str))
+        if (not isinstance(value.get('id'), str)
+                or not isinstance(value.get('owner'), str)
+                or not (isinstance(value.get('kind'), str) or legacy_rebase)
+                or not isinstance(value.get('repo'), str)
+                or not isinstance(value.get('target'), str)
+                or not isinstance(value.get('before'), dict)
+                or not isinstance(value.get('expected'), dict)):
+            raise MutationEvidenceError("Manager Git intent 형식이 유효하지 않습니다.")
+        before, expected = value['before'], value['expected']
+        if value.get('kind') in {'bootstrap_fetch', 'project_fetch'}:
+            valid = (isinstance(before.get('oid'), (str, type(None)))
+                     and isinstance(expected.get('oid'), str))
+        elif value.get('kind') == 'source_fast_forward':
+            valid = all(isinstance(item.get('index'), dict)
+                        and isinstance(item.get('changes'), list)
+                        and isinstance(item.get('operations'), list)
+                        for item in (before, expected))
+        elif value.get('kind') == 'managed_rebase' or legacy_rebase:
+            valid = (isinstance(before.get('head'), str)
+                     and ('branch' not in expected
+                          or isinstance(expected['branch'], str))
+                     and all(isinstance(item[key], dict)
+                             for item in (before, expected)
+                             for key in ('index', 'dirty', 'accepted_files', 'staged_index')
+                             if key in item))
+        else:
+            valid = all(isinstance(item.get('exists'), bool)
+                        and isinstance(item.get('registration'), (dict, type(None)))
+                        for item in (before, expected))
+        if not valid:
+            raise MutationEvidenceError("Manager Git intent의 중첩 근거가 유효하지 않습니다.")
+        # Partial rebase audits remain readable; a sealed transition needs
+        # the branch before it can provide mutation evidence.
+        if (require_rebase_branch and value.get('kind') == 'managed_rebase'
+                and not expected.get('branch')):
+            raise MutationEvidenceError("Manager rebase 저장 intent에 branch가 없습니다.")
+    elif path.name.endswith('.result.json'):
+        if (not isinstance(value.get('id'), str)
+                or not isinstance(value.get('status'), str)
+                or not isinstance(value.get('observed'), dict)
+                or not isinstance(value.get('candidates'), dict)):
+            raise MutationEvidenceError("Manager Git 결과 형식이 유효하지 않습니다.")
+        candidates = value['candidates']
+        observed = value['observed']
+        if (any(not isinstance(candidates[key], dict)
+                for key in ('refs', 'worktrees', 'selected') if key in candidates)
+                or ('index' in observed and not (
+                    isinstance(observed['index'], (str, type(None)))
+                    if 'exists' in observed else isinstance(observed['index'], dict)))
+                or ('dirty' in observed and not isinstance(observed['dirty'], dict))
+                or ('metadata' in observed and observed['metadata'] is not None
+                    and not isinstance(observed['metadata'], dict))):
+            raise MutationEvidenceError("Manager Git 결과의 중첩 근거가 유효하지 않습니다.")
     return value
 
 
@@ -1168,7 +1226,8 @@ def verified_managed_transitions(
             # own result remains unavailable until active-intent cleanup ends.
             if result.get("id") == active_id or result.get("status") != "complete":
                 continue
-            intent = _read(slot / f"{result.get('id')}.intent.json")
+            intent = _read(slot / f"{result.get('id')}.intent.json",
+                           require_rebase_branch=True)
             if kind is not None and (intent.get('kind') != kind or intent.get('target') != target):
                 raise MutationEvidenceError('Manager Git resource identity differs')
             if intent.get("repo") != repo or intent.get("owner") != owner:

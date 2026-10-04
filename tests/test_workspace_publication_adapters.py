@@ -3,6 +3,7 @@ from dataclasses import fields, replace
 from pathlib import Path
 from contextlib import ExitStack
 from types import SimpleNamespace
+import os
 import subprocess
 import sys
 import tempfile
@@ -138,6 +139,22 @@ class CheckpointRecoveryBoundaryRegressionTests(unittest.TestCase):
 
 
 class WorkspaceEffectBoundaryTests(unittest.TestCase):
+    def test_changed_files_preserves_nul_paths_in_all_git_modes(self):
+        from loop_manager_internal.git import workspace_service
+        from loop_manager_internal.agents import scope_observation
+        raw_names = [b' leading.txt', b'tab\tname', b'line\nname',
+                     b'carriage\rname', b'back\\slash', b'raw-\xff']
+        names = {os.fsdecode(name) for name in raw_names}
+        effects = fake_effects(workspace_service.ChangedFilesEffects)
+        raw_effects = fake_effects(scope_observation.ObservationEffects)
+        raw_effects.git_bytes.return_value = b'\0'.join(raw_names) + b'\0'
+        effects._nul_git_paths.side_effect = lambda repo, *args: (
+            scope_observation._nul_git_paths(repo, *args, effects=raw_effects))
+        self.assertEqual(workspace_service.changed_files(effects, Path('/repo')), sorted(names))
+        self.assertEqual(workspace_service.changed_files(effects, Path('/repo'), 'base'), sorted(names))
+        self.assertTrue(all(call.args[-1] == '-z' for call in raw_effects.git_bytes.call_args_list))
+        self.assertTrue(any('--cached' in call.args for call in raw_effects.git_bytes.call_args_list))
+
     def test_rebase_ignored_overlap_refuses_before_subprocess(self):
         effects = fake_effects(command_adapter.GitEffects)
         effects._ignored_paths_overlapping_git_update.return_value = ['cache/file']

@@ -15,6 +15,7 @@ import tempfile
 from uuid import uuid4
 
 from loop_manager_internal.git.manager_git_journal import _sync_directory
+from loop_manager_internal.runtime.contracts import GitLockError
 
 
 class PlanningRebaseError(RuntimeError):
@@ -34,6 +35,14 @@ class PlanningRebaseResult:
 def _journal_path(state_dir: Path, repo: str, worktree: Path) -> Path:
     identity = hashlib.sha256((repo + "\0" + str(worktree.resolve())).encode()).hexdigest()
     return state_dir / "planning-rebase" / f"{identity}.json"
+
+
+def _correction_path_allowed(name: object) -> bool:
+    return isinstance(name, str) and "\0" not in name and (
+        name == "docs/FUTURE_IDEAS.md"
+        or (re.fullmatch(r"docs/plans/[^/]+\.md", name) is not None
+            and (os.name != "nt" or "\\" not in name))
+    )
 
 
 def _write(path: Path, record: dict[str, object]) -> None:
@@ -65,8 +74,26 @@ def _read(path: Path, repo: str, worktree: Path) -> dict[str, object] | None:
             for field in ("old", "target", "head", "nonce"))
             or not isinstance(record.get("dirty"), bool)):
         raise PlanningRebaseError("planning rebase journal의 원본·대상 정보가 유효하지 않습니다.")
-    if record.get("phase") not in {"before_stash", "stashed", "rebasing", "applying", "restored", "conflict", "accepting"}:
+    if (not isinstance(record.get("phase"), str) or record["phase"] not in
+            {"before_stash", "stashed", "rebasing", "applying", "restored", "conflict", "accepting"}):
         raise PlanningRebaseError("planning rebase journal 단계가 유효하지 않습니다.")
+    for field in ("restored_head", "restored_digest", "accepting_digest"):
+        if field in record and (not isinstance(record[field], str) or not record[field]):
+            raise PlanningRebaseError("planning rebase journal의 복원 근거가 유효하지 않습니다.")
+    correction = record.get("correction")
+    if "correction" in record and (
+        not isinstance(correction, dict)
+        or not isinstance(correction.get("paths"), list)
+        or any(not _correction_path_allowed(name) for name in correction["paths"])
+        or type(correction.get("was_rebase")) is not bool
+        or not isinstance(correction.get("head"), str) or not correction["head"]
+        or not isinstance(correction.get("digest"), str) or not correction["digest"]
+    ):
+        raise PlanningRebaseError("planning rebase journal의 교정 근거가 유효하지 않습니다.")
+    if record["phase"] == "accepting" and "accepting_digest" not in record:
+        raise PlanningRebaseError("planning rebase journal의 복원 근거가 없습니다.")
+    if record["phase"] == "restored" and "restored_digest" not in record:
+        raise PlanningRebaseError("planning rebase journal의 복원 근거가 없습니다.")
     return record
 
 
@@ -82,11 +109,26 @@ def _stash(git, worktree: Path, message: str) -> tuple[str, str] | None:
     return matches[0] if matches else None
 
 
+def _nul_reader(git):
+    # Mock and other dynamic callables may synthesize missing attributes.
+    return getattr(git, "__dict__", {}).get("nul_paths")
+
+
 def _git_ok(git, worktree: Path, *args: str) -> str:
+    nul_paths = _nul_reader(git)
+    if "-z" in args and callable(nul_paths):
+        try:
+            paths = nul_paths(worktree, *args)
+        except GitLockError:
+            raise
+        except RuntimeError as error:
+            raise PlanningRebaseError(
+                f"planning Git 단계 실패 ({' '.join(args[:2])})") from error
+        return "\0".join(paths) + ("\0" if paths else "")
     result = git(worktree, *args, check=False)
     if result.returncode:
         raise PlanningRebaseError(f"planning Git 단계 실패 ({' '.join(args[:2])}): {result.stdout[-2000:]}")
-    return result.stdout.strip()
+    return result.stdout if "-z" in args else result.stdout.strip()
 
 
 def rebase_in_progress(git, worktree: Path) -> bool:
@@ -153,11 +195,22 @@ def _matches_completed_stash_apply(
 
 
 def _stash_untracked_collisions(git, worktree: Path, stash_sha: str) -> tuple[str, ...]:
-    saved = git(worktree, "ls-tree", "-r", "--name-only", "-z", f"{stash_sha}^3", check=False)
-    if saved.returncode:
-        return ()
+    arguments = ("ls-tree", "-r", "--name-only", "-z", f"{stash_sha}^3")
+    nul_paths = _nul_reader(git)
+    if callable(nul_paths):
+        try:
+            paths = nul_paths(worktree, *arguments)
+        except GitLockError:
+            raise
+        except RuntimeError:
+            return ()  # The stash may have no untracked parent.
+    else:
+        saved = git(worktree, *arguments, check=False)
+        if saved.returncode:
+            return ()
+        paths = saved.stdout.split("\0")
     return tuple(sorted(
-        path for path in saved.stdout.split("\0") if path
+        path for path in paths if path
         and git(worktree, "ls-files", "--error-unmatch", "--", path,
                 check=False).returncode == 0
     ))
@@ -344,6 +397,8 @@ def save_planning_correction(
     record = _read(path, repo, worktree)
     if record is None or record["target"] != target or record["phase"] not in {"rebasing", "conflict"}:
         raise PlanningRebaseError("planning 교정을 저장할 rebase 단계가 다릅니다.")
+    if any(not _correction_path_allowed(name) for name in paths):
+        raise PlanningRebaseError("planning 교정 경로가 유효하지 않습니다.")
     record["correction"] = {
         "paths": list(paths), "was_rebase": was_rebase,
         "head": _git_ok(git, worktree, "rev-parse", "HEAD"),
@@ -363,10 +418,7 @@ def planning_correction(
     if (record["target"] != target or not isinstance(saved, dict)
             or not isinstance(saved.get("paths"), list)
             or not isinstance(saved.get("was_rebase"), bool)
-            or any(not isinstance(name, str) or (
-                name != "docs/FUTURE_IDEAS.md"
-                and re.fullmatch(r"docs/plans/[^/]+\.md", name) is None
-            ) for name in saved["paths"])):
+            or any(not _correction_path_allowed(name) for name in saved["paths"])):
         raise PlanningRebaseError("planning 교정 기록의 대상·경로가 유효하지 않습니다.")
     if saved.get("head") != _git_ok(git, worktree, "rev-parse", "HEAD"):
         # A continued rebase can reach another commit's conflict. Its correction

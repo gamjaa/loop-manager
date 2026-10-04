@@ -6,6 +6,8 @@ separate boundaries.
 """
 from dataclasses import dataclass, replace
 import hashlib
+import json
+import re
 
 from loop_manager_internal.git.managed_rebase_observation import ObservationAdapters, observe_current_rebase
 from loop_manager_internal.git.managed_rebase_validation import (
@@ -147,4 +149,43 @@ def agent_comparison_baseline(original, saved, role):
         # A later Agent scope has its own original start. Retain old comparison
         # records as audit instead of making them a historical gate.
         return original
-    return type(original).deserialize(baseline['snapshot'])
+    raw = baseline.get('snapshot')
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else None
+        if (not isinstance(parsed, dict)
+                or (bool(original.scope_id) != (parsed.get('version') == 5))
+                or (parsed.get('version') == 5 and (
+                    not isinstance(parsed.get('scope_id'), str)
+                    or re.fullmatch(r'[0-9a-f]{32}', parsed['scope_id']) is None
+                    or not isinstance(parsed.get('scope_start_digest'), str)
+                    or re.fullmatch(r'[0-9a-f]{64}', parsed['scope_start_digest']) is None
+                    or parsed['scope_id'] != original.scope_id
+                    or parsed['scope_start_digest'] != original.scope_start_digest))
+                or not isinstance(parsed.get('head'), str)
+                or not parsed['head']
+                or parsed.get('branch') is not None and not isinstance(parsed['branch'], str)
+                or any(not isinstance(parsed.get(key), dict) for key in ('index', 'dirty'))
+                or any(not isinstance(parsed.get(key, {} if parsed.get('version') in
+                                      (1, 2, 3) else None), dict)
+                       for key in ('refs', 'worktrees', 'config', 'operations'))
+                or any(not isinstance(entries, list)
+                       or any(not isinstance(entry, str) for entry in entries)
+                       for entries in parsed['index'].values())
+                or any(not isinstance(state, list) or len(state) != 2
+                       or not isinstance(state[0], list)
+                       or any(not isinstance(kind, str) for kind in state[0])
+                       or not isinstance(state[1], str)
+                       for state in parsed['dirty'].values())
+                or any(not isinstance(state, list) or len(state) != 2
+                       or any(not isinstance(entry, str) for entry in state)
+                       for state in parsed.get('refs', {}).values())
+                or any(not isinstance(entries, list)
+                       or any(not isinstance(entry, str) for entry in entries)
+                       for key in ('worktrees', 'config')
+                       for entries in parsed.get(key, {}).values())
+                or any(not isinstance(value, str) for value in
+                       parsed.get('operations', {}).values())):
+            raise ValueError('invalid snapshot fields')
+        return type(original).deserialize(raw)
+    except (TypeError, ValueError, KeyError, RuntimeError) as error:
+        raise MutationEvidenceError('current rebase Agent comparison is malformed') from error

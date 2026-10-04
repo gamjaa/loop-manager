@@ -2568,7 +2568,7 @@ validate_planning_worktree_ownership = _bind_effects(
 
 changed_files = _bind_effects(
     workspace_service.changed_files, lambda: workspace_service.ChangedFilesEffects(
-        git=lambda *args, **kwargs: git(*args, **kwargs),
+        _nul_git_paths=lambda *args, **kwargs: _nul_git_paths(*args, **kwargs),
     ),
 )
 
@@ -3586,6 +3586,7 @@ _PlanningGitPorts = _bind_effects(
         _recorded_base_fetch=lambda *args, **kwargs: _recorded_base_fetch(*args, **kwargs),
         _planning_input_fingerprint=lambda *args, **kwargs: _planning_input_fingerprint(*args, **kwargs),
         _nonplan_input_fingerprint=lambda *args, **kwargs: _nonplan_input_fingerprint(*args, **kwargs),
+        _nul_git_paths=lambda *args, **kwargs: _nul_git_paths(*args, **kwargs),
         _specification_input_fingerprint=lambda *args, **kwargs: _specification_input_fingerprint(*args, **kwargs),
         plan_declarations=lambda *args, **kwargs: plan_declarations(*args, **kwargs),
         changed_files=lambda *args, **kwargs: changed_files(*args, **kwargs),

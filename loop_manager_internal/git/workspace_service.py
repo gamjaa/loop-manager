@@ -96,17 +96,18 @@ def _rebase_in_progress_for_branch(effects: RebaseInProgressForBranchEffects, wo
 @dataclass(frozen=True)
 class ChangedFilesEffects:
     """Named effects for changed_files; no entry-point/module access."""
-    git: Callable[..., object]
+    _nul_git_paths: Callable[..., object]
 
 
 def changed_files(effects: ChangedFilesEffects, worktree: Path, since: str | None = None) -> list[str]:
+    def paths(*args: str) -> set[str]:
+        return set(effects._nul_git_paths(worktree, *args, "-z"))
+
     if since:
-        output = effects.git(worktree, "diff", "--name-only", f"{since}..HEAD").stdout
-        return sorted(line for line in output.splitlines() if line)
-    unstaged = effects.git(worktree, "diff", "--name-only").stdout.splitlines()
-    staged = effects.git(worktree, "diff", "--cached", "--name-only").stdout.splitlines()
-    untracked = effects.git(worktree, "ls-files", "--others", "--exclude-standard").stdout.splitlines()
-    return sorted(set(unstaged + staged + untracked))
+        return sorted(paths("diff", "--name-only", f"{since}..HEAD"))
+    return sorted(paths("diff", "--name-only")
+                  | paths("diff", "--cached", "--name-only")
+                  | paths("ls-files", "--others", "--exclude-standard"))
 
 
 @dataclass(frozen=True)

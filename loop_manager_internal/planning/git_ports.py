@@ -22,6 +22,7 @@ class PlanningGitPortsEffects:
     _recorded_base_fetch: Callable[..., object]
     _planning_input_fingerprint: Callable[..., object]
     _nonplan_input_fingerprint: Callable[..., object]
+    _nul_git_paths: Callable[..., object]
     plan_declarations: Callable[..., object]
     _specification_input_fingerprint: Callable[..., object]
     changed_files: Callable[..., object]
@@ -30,6 +31,16 @@ class PlanningGitPortsEffects:
     validate_managed_worktree: Callable[..., object]
     validate_planning_workspace_identity: Callable[..., object]
     validate_planning_worktree_ownership: Callable[..., object]
+
+
+@dataclass(frozen=True)
+class _RebaseGit:
+    """Keep planning rebase's ordinary Git calls and NUL paths on their own ports."""
+    git: Callable[..., object]
+    nul_paths: Callable[..., object]
+
+    def __call__(self, *args, **kwargs):
+        return self.git(*args, **kwargs)
 
 
 class _PlanningGitPorts:
@@ -45,6 +56,7 @@ class _PlanningGitPorts:
         self._connection = connection
         self._repo_path = repo_path
         self._state_dir = state_dir
+        self._rebase_git = _RebaseGit(effects.git, effects._nul_git_paths)
 
     def run(
         self, repo: Path, *arguments: str, check: bool = True
@@ -71,14 +83,14 @@ class _PlanningGitPorts:
         paths: tuple[str, ...], was_rebase: bool,
     ) -> None:
         planning_rebase.save_planning_correction(
-            self._effects.git, self._state_dir, repo, worktree, target, paths, was_rebase,
+            self._rebase_git, self._state_dir, repo, worktree, target, paths, was_rebase,
         )
 
     def planning_correction(
         self, repo: str, worktree: Path, target: str,
     ) -> tuple[tuple[str, ...], bool] | None:
         return planning_rebase.planning_correction(
-            self._effects.git, self._state_dir, repo, worktree, target,
+            self._rebase_git, self._state_dir, repo, worktree, target,
         )
 
     def restore_code_map_conflict(
@@ -170,20 +182,20 @@ class _PlanningGitPorts:
     ) -> planning_rebase.PlanningRebaseResult:
         self.validate_worktree_ownership(repo, fingerprint, worktree)
         return planning_rebase.rebase_planning_worktree(
-            self._effects.git, self._repo_path, self._state_dir, repo,
+            self._rebase_git, self._repo_path, self._state_dir, repo,
             worktree, old_base, target,
         )
 
     def complete_planning_rebase(self, repo: str, worktree: Path, target: str) -> None:
         planning_rebase.complete_planning_rebase(
-            self._effects.git, self._state_dir, repo, worktree, target,
+            self._rebase_git, self._state_dir, repo, worktree, target,
         )
 
     def accept_resolved_stash_conflict(
         self, repo: str, worktree: Path, target: str,
     ) -> None:
         planning_rebase.accept_resolved_stash_conflict(
-            self._effects.git, self._state_dir, repo, worktree, target,
+            self._rebase_git, self._state_dir, repo, worktree, target,
         )
 
     def relevant_document_changes(
