@@ -553,10 +553,11 @@ class DiagnosticPublicationRepository:
                          'head_oid', 'tree_oid', 'cause'))
                         or intent['repo'] != repo or intent['plan_id'] != plan_id
                         or intent['original_branch'] != plan['branch']
-                        or intent['cause'] != block['evidence']
                         or payload.get('commit_oid') != intent['head_oid']
                         or payload.get('branch') != intent['ref']):
                     raise RuntimeError('진단 ref·확인 OID가 저장된 intent와 다릅니다.')
+                # The intent retains its original cause across identical-content
+                # reuse. The current block is guarded by cause_identity above.
                 changed = self.connection.execute(
                     'UPDATE blocked_diagnostic_publications SET confirmed_oid = head_oid '
                     'WHERE repo = ? AND plan_id = ? AND ref = ? '
