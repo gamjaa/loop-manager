@@ -42,6 +42,7 @@ priority: normal
 
 ## Decision Log
 
+- 사용자 문서 정리 요청 뒤에도 이 직접 작업은 `plans/manual/`에 유지한다. 일반 PR 전환은 검토 준비 상태이며 마지막 Progress의 전체 verify·Review·Merge를 완료로 바꾸지 않는다. `plans/archive/`와 자동 catalog의 이력·dependency에 이 기록을 추가하지 않는다.
 - 2026-10-04: 최신 main의 별도 AGENTS 작업이 G-151을 사용해 이 Git fixture 수동 기록을 G-152로 옮겼다. 기존 구현·검증·commit 이력과 목적은 유지하고 G-149의 참조만 함께 정정한다.
 - 구현 commit `65934d1`을 `origin/codex/verify-fixture-fast-path`에 push했다. 직접 작업 계획은 활성 catalog에서 제외되며 서버의 G-135 실행 상태를 변경하지 않았다.
 - `py -3 -B -m unittest tests.test_git_fixture_seed tests.test_support_fixtures.SupportFixtureTests.test_git_factory_uses_explicit_repository_and_preserves_seed_files tests.test_support_fixtures.SupportFixtureTests.test_imports_create_no_resources_or_discoverable_cases`: 6개 통과. Windows sandbox 임시 디렉터리 권한 오류 후 같은 command를 정상 권한으로 다시 실행했다.
