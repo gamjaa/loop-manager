@@ -119,6 +119,8 @@ class FakeStatePort:
         self.maintenance_begin_count = 0
         self.document_approval_pending = False
         self.plan_declarations_match_result = True
+        self.check_record = None
+        self.has_general_baseline = False
         self.schedule_result = SimpleNamespace(
             active=None,
             has_ready=False,
@@ -135,6 +137,30 @@ class FakeStatePort:
 
     def plan_declarations_match(self, _repo, _entries):
         return self.plan_declarations_match_result
+
+    def general_baseline(self, _repo):
+        return self.has_general_baseline
+
+    def planner_check(self, _repo):
+        return self.check_record
+
+    def begin_planner_check(self, _repo, **values):
+        self.check_record = {**values, "stage": "pending", "session_id": None,
+                             "result": None, "error": None, "retry_count": 0}
+
+    def advance_planner_check(self, _repo, expected_stage, next_stage, *,
+                              expected_input=None, expected_target=None, **values):
+        if self.check_record is None or self.check_record["stage"] != expected_stage:
+            return False
+        if (expected_input is not None
+                and self.check_record["input_fingerprint"] != expected_input):
+            return False
+        if (expected_target is not None
+                and self.check_record["target_fingerprint"] != expected_target):
+            return False
+        self.check_record.update(values)
+        self.check_record["stage"] = next_stage
+        return True
 
     def record_general_plan_declarations(self, _repo, _revision, _entries):
         self.plan_declarations_match_result = True
@@ -328,6 +354,8 @@ class FakeGitPort:
         self.workspace_error = None
         self.remove_error = None
         self.advance_remote_on_push = False
+        self.guidance_changed = False
+        self.diff_name_status = ""
 
     def fetch_base(self, repo_path, base):
         self.calls.append((str(repo_path), ("recorded_base_fetch", base), True))
@@ -355,6 +383,12 @@ class FakeGitPort:
             return SimpleNamespace(
                 stdout="", returncode=0 if self.ancestor else 1
             )
+        if arguments[:2] == ("diff", "--name-only") and arguments[-1:] == ("AGENTS.md",):
+            return SimpleNamespace(
+                stdout="AGENTS.md\n" if self.guidance_changed else "", returncode=0,
+            )
+        if arguments[:2] == ("diff", "--name-status"):
+            return SimpleNamespace(stdout=self.diff_name_status, returncode=0)
         return SimpleNamespace(stdout="", returncode=0)
 
     def input_fingerprint(self, _repo_path, _sha):
@@ -409,6 +443,9 @@ class FakeAgentPort:
     def __init__(self):
         self.run_count = 0
         self.resumed_session = None
+        self.roles = []
+        self.prompts = []
+        self.results = []
         self.result = PlanningAgentResult(
             0,
             "planner result",
@@ -425,11 +462,13 @@ class FakeAgentPort:
         _prompt,
         session_id,
         _on_session_started,
-        *, profile_role=None,
+        *, profile_role=None, read_only=False,
     ):
         self.run_count += 1
+        self.roles.append((profile_role, read_only))
+        self.prompts.append(_prompt)
         self.resumed_session = session_id
-        return self.result
+        return self.results.pop(0) if self.results else self.result
 
     def finish_scope(self, _role, _worktree, _before):
         return PlanningScopeResult()

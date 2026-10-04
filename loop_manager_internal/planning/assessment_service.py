@@ -199,6 +199,14 @@ class PlanningAssessmentService(PlanningService):
                     self._ports.state.compact_catalog(context.repo),
                     run.mutable_ready_snapshot,
                 )
+                check = getattr(self._ports.state, "planner_check", lambda _repo: None)(context.repo)
+                if check is not None and check["stage"] == "handoff":
+                    prompt += (
+                        "\n\n읽기 전용 점검 Planner 인계 근거: "
+                        + str(check["error"] or "수정 필요")
+                        + "\n점검 기준 revision: " + str(check["base_sha"])
+                        + "\n이 근거를 최신 입력과 대조하고 일반 Planner 권한 안에서 판단하라."
+                    )
                 from loop_manager_internal.maintenance.tiered_ports import query_instruction
                 if not row.planner_session_id:
                     prompt += (self._ports.tiered.query_context(context.repo_path, context.base_branch,

@@ -80,6 +80,7 @@ def planner_check_prompt(
 
 결과는 정확히 한 줄의 PLANNER_CHECK_RESULT: JSON 객체로 반환하라.
 필드는 outcome(no_change|needs_revision|uncertain), evidence(확인한 근거), reason(판단 또는 일반 Planner 인계 사유), plan_ids(영향받은 snapshot ID 배열)다.
+evidence와 reason은 변경 경로·관계·판단만 간결하게 요약하고 비밀값이나 source checkout의 로컬 파일 내용은 포함하지 마라.
 needs_revision은 하나 이상의 대상 ID를 적고 no_change는 빈 배열을 적어라. 불확실하면 uncertain을 사용하고 실패 또는 no_change로 바꾸지 마라.
 읽기 전용 검색과 diff는 허용한다. 구현·테스트·verify 실행, commit·push·PR 생성, ExecPlan·FUTURE_IDEAS·코드·문서·Git metadata를 포함한 모든 파일 변경은 금지한다.
 {failure}

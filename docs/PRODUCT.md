@@ -58,7 +58,7 @@
 
 | 변경 범위 | 적용할 Requirement |
 |---|---|
-| Planner 역할 선택·변경 중심 검토·최종 확인·draft와 Agent 문서 권한 | [R-049](requirements/%5BR-049%5D%20Input-Specific%20Planner%20Roles.md), [R-057](requirements/%5BR-057%5D%20Change-Focused%20Planning%20and%20Final%20Full%20Verification.md), [R-061](requirements/%5BR-061%5D%20Agent%20Roles%20and%20Draft%20ExecPlan%20Decisions.md) |
+| Planner 역할 선택·변경 중심 검토·최종 확인·draft와 Agent 문서 권한 | [R-049](requirements/archive/%5BR-049%5D%20Input-Specific%20Planner%20Roles.md), [R-057](requirements/%5BR-057%5D%20Change-Focused%20Planning%20and%20Final%20Full%20Verification.md), [R-061](requirements/%5BR-061%5D%20Agent%20Roles%20and%20Draft%20ExecPlan%20Decisions.md) |
 | Worker 최초 level·Review 승격·Planner와 Worker의 명시적 모델 설정 | [R-052](requirements/%5BR-052%5D%20Worker%20Classification%20and%20Initial%20Level%20Calibration.md) |
 | 차단 범위·비차단 로컬 base 동기화·Git 통합과 원격 보존·로컬 환경 재검사 | [R-055](requirements/%5BR-055%5D%20Blocking%20Path%20Audit%20and%20Minimal%20Interruption.md), [R-056](requirements/%5BR-056%5D%20Non-Blocking%20Local%20Base%20Synchronization.md), [R-060](requirements/%5BR-060%5D%20Collaborative%20Git%20Recovery%20and%20Remote%20Blocked%20Snapshots.md), [R-062](requirements/%5BR-062%5D%20Local%20Environment%20Recovery%20Command.md) |
 | Merge 대기 PR이 없는 due 리팩터링의 우선 처리 | [R-054](requirements/%5BR-054%5D%20Due%20Refactoring%20Priority.md) |
@@ -247,7 +247,9 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 
 - source와 dependency 변경은 같은 reconciliation 결과를 다음 archive 후보·입력 지문·READY 선택에 사용하고 priority 변경은 다음 선택부터 반영한다. complexity·risk 변경은 최초 Worker level을 다시 계산하되 실행 이력이 있는 계획의 effective level과 Review 승격 이력을 낮추지 않는다
 - 현재 path와 title은 compact catalog, 로그·알림과 이후 파일 조회에 사용하지만 기존 PR의 ExecPlan 링크는 최초 게시 SHA와 최초 active path를 계속 사용한다
-- 일반 Planner는 안전한 선택 경계에서 명세 또는 전체 계획 입력 지문이 마지막 성공 기준과 달라졌을 때 READY 선택보다 먼저 한 번 실행한다. 비종료 compact catalog와 미착수 READY snapshot을 사용해 현재 식별 가능한 미충족 작업을 한 번에 모두 계획한다
+- 최초 또는 비교 가능한 전체 계획 성공 기준이 없거나, PRODUCT·활성 Requirement·ARCHITECTURE·AGENTS·사용자 active ExecPlan이 바뀌면 일반 Planner를 READY 선택보다 먼저 실행한다. 일반 Planner는 비종료 compact catalog와 미착수 READY snapshot으로 현재 식별 가능한 미충족 작업을 한 번에 계획한다
+- 문서·지침·active ExecPlan은 그대로이고 코드·테스트·설정만 바뀌면 수정 가능한 미착수 READY를 읽기 전용 점검 Planner가 먼저 확인한다. dependency 대기 READY도 포함하며 실행 이력·소유 증거가 있는 계획은 대상에서 제외한다. 대상이 없으면 일반 Planner가 전체 미충족 작업을 확인한다
+- 점검의 수정 불필요 결과는 같은 입력과 대상에서 재사용하고 일반 Planner 없이 기존 READY 선택을 이어간다. 수정 필요·판단 불확실은 근거와 대상을 일반 Planner에 인계한다. 점검 성공은 예정 작업의 유지 가능성만 확인하며 전체 계획·유지보수 성공 기준이나 프로젝트 완료를 확정하지 않는다
 - `docs/FUTURE_IDEAS.md`는 계획 입력 지문, 활성 Requirement와 프로젝트 완료 판정에서 제외하며 그 항목을 자동으로 Requirement 또는 ExecPlan으로 승격하지 않는다
 - MERGED ExecPlan은 Planner 입력에서 제외하며 프로그램만 ID 고유성, 의존성 충족과 감사 이력을 위해 관리한다
 - Planner와 Worker의 실행 후보는 `docs/plans/` 바로 아래의 active ExecPlan으로 제한하고, `docs/plans/archive/`는 ID 고유성, 다음 번호, dependency, 복구와 감사 검증에만 포함한다
@@ -278,9 +280,9 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - Merge 대기 PR이 있으면 새 유지보수 평가는 보류한다. 독립 계획의 PLAN_BLOCKED 자체는 단계별 유지보수 평가를 막지 않으며, PROJECT_BLOCKED와 현재 변경 실행·공유 안전 gate는 유지한다.
 - 같은 프로젝트에 여러 READY ExecPlan이 대기할 수 있다
 - 같은 프로젝트에서는 IMPLEMENTING, VERIFYING, REVIEWING, PUBLISHING 또는 PR 충돌 복구 중인 ExecPlan 하나만 현재 변경 실행으로 둔다. `PLAN_BLOCKED`와 충돌 복구 중이 아닌 `PR_OPEN`은 이 자리를 점유하지 않는다
-- 새 계획 입력은 실행 중인 작업을 선점하지 않는다. 명세 또는 전체 계획 입력 지문 변경은 다음 안전한 선택 경계에서 READY보다 먼저 한 번 반영한다
+- 새 계획 입력은 실행 중인 작업을 선점하지 않는다. 문서·지침·사용자 active ExecPlan 변경은 다음 안전한 선택 경계에서 일반 Planner로, 코드 전용 변경은 수정 가능한 READY가 있으면 점검 Planner로 READY 시작 전에 반영한다
 - READY ExecPlan은 모든 `depends_on`이 MERGED이고 다른 현재 작업이 없을 때만 시작한다
-- dependency를 충족하지 못한 READY만 남은 프로젝트도 명세·전체 계획 입력 변경 trigger가 있으면 Planner를 한 번 실행하고, 성공 기준과 입력이 같으면 대기한다
+- dependency를 충족하지 못한 READY만 남아도 변경 입력에 해당하는 Planner 역할을 한 번 실행하고, 확인 기준과 입력·대상이 같으면 대기한다
 - 제품 우선순위는 안전한 무인 실행을 막거나 반복적인 사용자 복구를 요구하는 작업, 정상 경로의 사용자 개입을 제거하는 핵심 자동화, 그 밖의 Current Goal, 선택적 편의와 최적화 순이다
 - 실행 가능한 READY ExecPlan이 여럿이면 제품 우선순위가 높은 계획을 먼저 선택하고 같은 우선순위에서는 숫자 ExecPlan ID가 가장 작은 계획을 선택한다
 - 활성 유지보수 prerequisite 집합은 dependency gate 뒤 priority와 숫자 ID 순으로, 리팩터링 DAG는 dependency gate 뒤 숫자 ID 순으로 선택하며 집합 밖 READY는 cycle이 끝날 때까지 시작하지 않는다. 이때도 `PROJECT_BLOCKED`는 일반 실행을 막고, 다른 `PLAN_BLOCKED`·`PR_OPEN`과 dependency로 연결된 계획은 건너뛴다

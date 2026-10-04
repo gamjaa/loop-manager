@@ -9,6 +9,7 @@ from unittest import mock
 import loop_manager
 from loop_manager_internal.agents import agent_profiles
 from loop_manager_internal.agents.agent_prompts import planner_check_prompt
+from loop_manager_internal.storage import planner_check_state
 from loop_manager_internal.planning.agent_ports import run_scoped_planner_turn
 from loop_manager_internal.planning.planner_check import parse_planner_check_result
 from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot, PlanningResultInvalid
@@ -16,6 +17,60 @@ from tests.support.planning_case import PlanningCase
 
 
 class PlannerCheckContractTest(unittest.TestCase):
+    def test_database_schema_registers_check_ledger(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+
+        loop_manager._ensure_execplans_schema(connection)
+
+        tables = {
+            row[0] for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'",
+            )
+        }
+        self.assertIn("planner_checks", tables)
+        self.assertIn("planner_check_history", tables)
+
+    def test_durable_check_stage_and_revision_independent_target(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        target = planner_check_state.target_fingerprint(
+            MutableReadySnapshot("repo", "first-sha", (), "first-token")
+        )
+        self.assertEqual(target, planner_check_state.target_fingerprint(
+            MutableReadySnapshot("repo", "second-sha", (), "second-token")
+        ))
+        planner_check_state.begin(
+            connection, "repo", input_fingerprint="input-a",
+            specification_fingerprint="spec", target_fingerprint=target,
+            base_sha="first-sha", comparison_sha="baseline",
+        )
+        self.assertTrue(planner_check_state.advance(
+            connection, "repo", "pending", "result", result="decision",
+            session_id="check-session",
+        ))
+        self.assertFalse(planner_check_state.advance(
+            connection, "repo", "pending", "accepted",
+        ))
+        self.assertFalse(planner_check_state.advance(
+            connection, "repo", "result", "accepted", expected_input="other-input",
+        ))
+        self.assertEqual(planner_check_state.get(connection, "repo")["stage"], "result")
+        planner_check_state.begin(
+            connection, "repo", input_fingerprint="input-b",
+            specification_fingerprint="spec", target_fingerprint=target,
+            base_sha="second-sha", comparison_sha="first-sha",
+        )
+        old = connection.execute(
+            "SELECT stage, result, session_id FROM planner_check_history WHERE repo = ?",
+            ("repo",),
+        ).fetchone()
+        self.assertEqual(tuple(old), ("result", "decision", "check-session"))
+        self.assertEqual(planner_check_state.get(connection, "repo")["stage"], "pending")
+
     def test_profiles_are_independent_and_only_absent_values_inherit(self):
         catalog = {"model-a": frozenset({"high"}), "model-b": frozenset({"low"})}
         with tempfile.TemporaryDirectory() as directory:
