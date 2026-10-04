@@ -37,6 +37,13 @@ def _journal_path(state_dir: Path, repo: str, worktree: Path) -> Path:
     return state_dir / "planning-rebase" / f"{identity}.json"
 
 
+def _correction_path_allowed(name: object) -> bool:
+    return isinstance(name, str) and (
+        name == "docs/FUTURE_IDEAS.md"
+        or re.fullmatch(r"docs/plans/[^/\\]+\.md", name) is not None
+    )
+
+
 def _write(path: Path, record: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     data = json.dumps(record, sort_keys=True).encode("utf-8")
@@ -76,10 +83,7 @@ def _read(path: Path, repo: str, worktree: Path) -> dict[str, object] | None:
     if correction is not None and (
         not isinstance(correction, dict)
         or not isinstance(correction.get("paths"), list)
-        or any(not isinstance(name, str) or (
-            name != "docs/FUTURE_IDEAS.md"
-            and re.fullmatch(r"docs/plans/[^/]+\.md", name) is None
-        ) for name in correction["paths"])
+        or any(not _correction_path_allowed(name) for name in correction["paths"])
         or type(correction.get("was_rebase")) is not bool
         or not isinstance(correction.get("head"), str) or not correction["head"]
         or not isinstance(correction.get("digest"), str) or not correction["digest"]
@@ -392,6 +396,8 @@ def save_planning_correction(
     record = _read(path, repo, worktree)
     if record is None or record["target"] != target or record["phase"] not in {"rebasing", "conflict"}:
         raise PlanningRebaseError("planning 교정을 저장할 rebase 단계가 다릅니다.")
+    if any(not _correction_path_allowed(name) for name in paths):
+        raise PlanningRebaseError("planning 교정 경로가 유효하지 않습니다.")
     record["correction"] = {
         "paths": list(paths), "was_rebase": was_rebase,
         "head": _git_ok(git, worktree, "rev-parse", "HEAD"),
@@ -411,10 +417,7 @@ def planning_correction(
     if (record["target"] != target or not isinstance(saved, dict)
             or not isinstance(saved.get("paths"), list)
             or not isinstance(saved.get("was_rebase"), bool)
-            or any(not isinstance(name, str) or (
-                name != "docs/FUTURE_IDEAS.md"
-                and re.fullmatch(r"docs/plans/[^/]+\.md", name) is None
-            ) for name in saved["paths"])):
+            or any(not _correction_path_allowed(name) for name in saved["paths"])):
         raise PlanningRebaseError("planning 교정 기록의 대상·경로가 유효하지 않습니다.")
     if saved.get("head") != _git_ok(git, worktree, "rev-parse", "HEAD"):
         # A continued rebase can reach another commit's conflict. Its correction

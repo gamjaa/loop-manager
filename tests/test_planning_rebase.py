@@ -87,8 +87,24 @@ class PlanningRebaseTest(unittest.TestCase):
             with self.assertRaises(PlanningRebaseError):
                 rebase_planning_worktree(git, root, root, '/repo', worktree, 'old', 'new')
             git.assert_not_called()
-            self.assertTrue(path.exists())
             record = planning_rebase.json.loads(path.read_text())
+            record['phase'] = 'rebasing'
+            record['correction'] = {
+                'paths': ['docs/plans/..\\..\\AGENTS.md'],
+                'was_rebase': True, 'head': 'old', 'digest': 'hash',
+            }
+            planning_rebase._write(path, record)
+            with self.assertRaises(PlanningRebaseError):
+                rebase_planning_worktree(git, root, root, '/repo', worktree, 'old', 'new')
+            git.assert_not_called()
+            record.pop('correction')
+            planning_rebase._write(path, record)
+            with self.assertRaises(PlanningRebaseError):
+                planning_rebase.save_planning_correction(
+                    git, root, '/repo', worktree, 'new',
+                    ('docs/plans/..\\..\\AGENTS.md',), True)
+            git.assert_not_called()
+            self.assertTrue(path.exists())
             record['phase'] = ['rebasing']
             planning_rebase._write(path, record)
             with self.assertRaises(PlanningRebaseError):
