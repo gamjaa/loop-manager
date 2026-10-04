@@ -1,6 +1,5 @@
 """Planning input selection, safety gates, and READY activation."""
 from __future__ import annotations
-import hashlib
 from pathlib import Path
 from loop_manager_internal.maintenance.maintenance_orchestration import assessment_can_yield, maintenance_planning_fingerprint
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningError
@@ -8,6 +7,7 @@ from loop_manager_internal.maintenance.maintenance_file_inventory import SourceI
 from loop_manager_internal.storage import maintenance_state, maintenance_file_ledger, runtime_state
 from loop_manager_internal.storage.planner_check_state import target_fingerprint
 from loop_manager_internal.planning.planning_catalog import PlanningResultInvalid
+from loop_manager_internal.planning.planning_workspace import planning_workspace_path
 from loop_manager_internal.planning.planning_service import PlanningService
 from loop_manager_internal.planning.planning_contracts import (
     _PlanningRun, PlanningContext, PlanningDecisionKind, PlanningOutcome,
@@ -668,13 +668,8 @@ class PlanningSelectionService(PlanningService):
                     if not superseded:
                         self._ports.events.error("일반 Planner 시작 전 점검 상태가 변경됐습니다.")
                         return self._operational_error()
-            project_id = hashlib.sha256(context.repo.encode()).hexdigest()[:16]
-            worktree = (
-                context.state_dir
-                / "worktrees"
-                / project_id
-                / "planning"
-                / run.current_fingerprint
+            worktree = planning_workspace_path(
+                context.state_dir, context.repo, run.current_fingerprint
             )
             if run.selection and run.selection.kind is PlanningDecisionKind.RUN_PLANNER_CHECK:
                 assert run.mutable_ready_snapshot is not None

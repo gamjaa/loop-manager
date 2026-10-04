@@ -35,7 +35,7 @@ class PinnedPublishedPlanRegistrationTest(unittest.TestCase):
             lambda: frozenset(), pinned_revision=sha,
         )
         with (
-            mock.patch.object(loop_manager, "revision_execplan_snapshot", return_value=snapshot),
+            mock.patch.object(loop_manager, "revision_execplan_snapshot", return_value=snapshot) as pinned_snapshot,
             mock.patch.object(loop_manager, "git_bytes", return_value=tree),
             mock.patch.object(loop_manager, "git", return_value=mock.Mock(stdout=sha)),
         ):
@@ -43,6 +43,7 @@ class PinnedPublishedPlanRegistrationTest(unittest.TestCase):
                 loop_manager.execplan_catalog_state.DefinitionStateRepository(connection),
                 port,
             ).reconcile("/missing-checkout")
+        self.assertEqual(pinned_snapshot.call_args.args[1], sha)
         self.assertEqual(
             result.kind, loop_manager.execplan_catalog_state.ReconciliationKind.RECONCILED
         )

@@ -107,9 +107,8 @@ class PlannerInterruptionRecoveryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = make_remote_repository(directory)
             state_dir = Path(directory) / "state"
-            connection = sqlite3.connect(":memory:")
-            connection.row_factory = sqlite3.Row
-            connection.execute(loop_manager.SCHEMA)
+            state_dir.mkdir()
+            connection = loop_manager.connect_database(state_dir, create=True)
 
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
@@ -140,6 +139,15 @@ class PlannerInterruptionRecoveryTest(unittest.TestCase):
                 self.assertEqual(interrupted["planner_session_id"], "planner-session")
                 self.assertEqual(interrupted["planning_result_pending_validation"], 1)
                 self.assertIsNone(interrupted["planning_validation_error"])
+                saved_result = interrupted["planning_result"]
+                connection.close()
+                connection = loop_manager.connect_database(state_dir)
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT planning_result FROM projects WHERE repo = ?", (str(repo),)
+                    ).fetchone()["planning_result"],
+                    saved_result,
+                )
 
                 self.assertEqual(
                     loop_manager.run_project(

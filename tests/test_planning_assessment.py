@@ -17,7 +17,7 @@ from loop_manager_internal.maintenance import maintenance_findings
 from loop_manager_internal.maintenance import maintenance_reconciliation
 from loop_manager_internal.maintenance.maintenance_file_inventory import RootPlacement, TrackedSource
 from tests.support.maintenance import result_for
-from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot, mutable_snapshot_token
+from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot, mutable_snapshot_token, snapshot_from_dict
 from loop_manager_internal.maintenance.maintenance_orchestration import maintenance_planning_fingerprint
 from loop_manager_internal.planning.planning_runtime import (
     PlanningAgentResult,
@@ -41,6 +41,25 @@ from tests.support.planning_case import (
 )
 
 class PlanningAssessmentTest(PlanningCase):
+    def test_saved_snapshot_rejects_malformed_collections(self):
+        original = {
+            "plan_id": "G-001", "path": "docs/plans/[G-001] Plan.md",
+            "title": "Plan", "sources": ["docs/PRODUCT.md"],
+            "depends_on": [], "complexity": "low", "risk": "low",
+            "priority": "normal", "content_hash": "hash", "plan_sha": "sha",
+            "text": "plan",
+        }
+        for field, invalid in (
+            ("sources", "docs/PRODUCT.md"), ("sources", {"a": "b"}),
+            ("sources", []), ("sources", [42]),
+            ("depends_on", "G-002"), ("depends_on", {"G-002": True}),
+            ("depends_on", [None]),
+        ):
+            with self.subTest(field=field, invalid=invalid):
+                with self.assertRaisesRegex(ValueError, "snapshot manifest"):
+                    snapshot_from_dict({**original, field: invalid})
+        self.assertEqual(snapshot_from_dict(original).sources, ("docs/PRODUCT.md",))
+
     def test_corrupt_saved_assessment_stops_before_agent_invocation(self):
         revision = "a" * 40
         ports = FakePorts(

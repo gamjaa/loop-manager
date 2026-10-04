@@ -21,16 +21,18 @@ def validate_planning_workspace_identity(
     fingerprint: str,
     worktree: Path,
 ) -> None:
-    project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
-    expected = (
-        state_dir / "worktrees" / project_id / "planning" / fingerprint
-    )
+    expected = planning_workspace_path(state_dir, repo, fingerprint)
     effects._validate_managed_path_boundary(
         state_dir,
         worktree,
         expected,
         "planning worktree",
     )
+
+
+def planning_workspace_path(state_dir: Path, repo: str, fingerprint: str) -> Path:
+    project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
+    return state_dir / "worktrees" / project_id / "planning" / fingerprint
 
 
 @dataclass(frozen=True)

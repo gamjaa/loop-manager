@@ -21,6 +21,10 @@ from loop_manager_internal.maintenance import maintenance_reconciliation
 from loop_manager_internal.maintenance.maintenance_file_inventory import RootPlacement, TrackedSource
 from tests.support.maintenance import result_for
 from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot, mutable_snapshot_token
+from loop_manager_internal.planning.planning_workspace import (
+    planning_workspace_path, validate_planning_workspace_identity,
+    ValidatePlanningWorkspaceIdentityEffects,
+)
 from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
 from loop_manager_internal.maintenance.maintenance_orchestration import maintenance_planning_fingerprint
 from loop_manager_internal.planning.planning_runtime import (
@@ -45,6 +49,18 @@ from tests.support.planning_case import (
 )
 
 class PlanningSelectionTest(PlanningCase):
+    def test_planning_workspace_identity_uses_selected_path(self):
+        state_dir = Path("/state")
+        selected = planning_workspace_path(state_dir, "/repo", "fingerprint")
+        validate = mock.Mock()
+        validate_planning_workspace_identity(
+            ValidatePlanningWorkspaceIdentityEffects(validate),
+            state_dir, "/repo", "fingerprint", selected,
+        )
+        validate.assert_called_once_with(
+            state_dir, selected, selected, "planning worktree"
+        )
+
     def test_dual_archive_skips_only_with_verified_unchanged_declarations(self):
         requirement = b"docs/requirements/R.md"
         plan = b"docs/plans/[G-001] Done.md"

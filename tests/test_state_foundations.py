@@ -13,7 +13,9 @@ from loop_manager_internal.storage import (
     planning_publication_state as publication,
 )
 from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot, PlanRevision
-from loop_manager_internal.planning.planning_catalog import PlanDeletion, PlannerValidationError
+from loop_manager_internal.planning.planning_catalog import (
+    PlanDeletion, PlannerValidationError, mutable_snapshot_token,
+)
 from tests.support.database import AutomationCatalogFixture
 from tests.support.catalog import active_snapshot, plan_text
 
@@ -129,13 +131,21 @@ class StateFoundationTests(AutomationCatalogFixture, unittest.TestCase):
         effects.revision_execplan_snapshot.assert_not_called()
 
     def test_publication_intent_json_round_trip_conflict_and_hash_tampering(self):
-        manifest = json.dumps({'version': 1, 'paths': ['한글.md']}, ensure_ascii=True, separators=(',', ':'))
-        intent = publication.GeneralPlanningPublication('repo', 'prepared', 'base', 'commit', 'token',
+        manifest = json.dumps({
+            'version': 1, 'publication_paths': ['한글.md'],
+            'publication_hashes': {}, 'plans': [], 'revisions': [], 'deletions': [],
+            'mutable_snapshot': {
+                'repo': 'repo', 'active_sha': 'base',
+                'token': mutable_snapshot_token('repo', 'base', ()), 'plans': [],
+            },
+        }, ensure_ascii=True, separators=(',', ':'))
+        intent = publication.GeneralPlanningPublication('repo', 'prepared', 'base', 'commit',
+            mutable_snapshot_token('repo', 'base', ()),
             'specification', 'planning', manifest, hashlib.sha256(manifest.encode()).hexdigest())
         self.assertEqual(publication.record_general_planning_publication(self.connection, intent), intent)
         self.assertEqual(publication.record_general_planning_publication(self.connection, intent), intent)
-        self.assertEqual(json.loads(publication.general_planning_publication(self.connection, 'repo').manifest),
-                         {'version': 1, 'paths': ['한글.md']})
+        self.assertEqual(publication.general_planning_publication(self.connection, 'repo').manifest,
+                         manifest)
         with self.assertRaisesRegex(PlannerValidationError, '다른 general'):
             publication.record_general_planning_publication(self.connection, replace(intent, commit_sha='other'))
         self.assertEqual(publication.general_planning_publication(self.connection, 'repo'), intent)
