@@ -305,6 +305,17 @@ class ProjectCauseRevalidationTests(ProjectRemoteRecoveryFixture, unittest.TestC
 
 
 class ProjectCheckpointPublicationTests(ProjectRemoteRecoveryFixture, unittest.TestCase):
+    def record_diagnostic_publication(self, context):
+        _, request = self.coordinator._request(self.plan(), context)
+        repository = blocked_checkpoint_state.DiagnosticPublicationRepository(self.connection)
+        intent = repository.intent(request, base_oid=self.base, head_oid=self.head,
+                                   tree_oid='c' * 40, cause=context['project_block']['evidence'])
+        repository.result(
+            self.repo, 'G-106', context['cause_identity'],
+            dict(result='published', diagnostic=True, branch=intent['ref'],
+                 commit_oid=self.head, original_branch=request.branch, base_oid=self.base),
+            intent=intent)
+
     def test_transient_diagnostic_push_retries_saved_intent_without_new_rebase(self):
         with (mock.patch.object(self.coordinator, '_lineage_known', return_value=False),
               mock.patch.object(self.coordinator, '_incorporate', side_effect=lambda plan, context: context.update(candidate=self.signature)) as incorporate,
@@ -398,8 +409,8 @@ class ProjectCheckpointPublicationTests(ProjectRemoteRecoveryFixture, unittest.T
     def test_confirmed_original_publication_releases_only_its_project_cause(self):
         context = self.complete_context()
         context['diagnostic'] = False
-        self.connection.execute("UPDATE exec_plans SET publication_remote_oid = ? WHERE plan_id = 'G-106'", (self.head,))
-        self.connection.commit()
+        store, request = self.coordinator._request(self.plan(), context)
+        store.finish_published(request, self.head)
         loop_manager.blocked_checkpoint_state.DiagnosticPublicationRepository(self.connection).result(
             self.repo, 'G-106', context['cause_identity'],
             dict(result='published', branch=self.plan()['branch'], commit_oid=self.head))
@@ -415,9 +426,7 @@ class ProjectCheckpointPublicationTests(ProjectRemoteRecoveryFixture, unittest.T
 
     def test_diagnostic_success_never_releases_publication_ownership_cause(self):
         context = self.complete_context()
-        loop_manager.blocked_checkpoint_state.DiagnosticPublicationRepository(self.connection).result(
-            self.repo, 'G-106', context['cause_identity'], dict(result='published', diagnostic=True,
-            branch='loop-manager/diagnostics/G-106/content', commit_oid=self.head))
+        self.record_diagnostic_publication(context)
         with mock.patch.object(self.coordinator, '_candidate_unchanged'):
             self.coordinator._revalidate_project_cause(self.plan(), context)
         self.assertEqual(scoped_blocking.project_block(self.connection, self.repo)['evidence'], 'original project cause')
@@ -425,9 +434,7 @@ class ProjectCheckpointPublicationTests(ProjectRemoteRecoveryFixture, unittest.T
 
     def test_later_cause_revalidation_error_keeps_the_confirmed_publication(self):
         def published(plan, context):
-            loop_manager.blocked_checkpoint_state.DiagnosticPublicationRepository(self.connection).result(
-                self.repo, 'G-106', context['cause_identity'], dict(result='published', diagnostic=True,
-                branch='loop-manager/diagnostics/G-106/content', commit_oid=self.head))
+            self.record_diagnostic_publication(context)
         with (mock.patch.object(self.coordinator, '_lineage_known', return_value=False),
               mock.patch.object(self.coordinator, '_incorporate', side_effect=lambda plan, context: context.update(candidate=self.signature)),
               mock.patch.object(self.coordinator, '_publish', side_effect=published),
