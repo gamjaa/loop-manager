@@ -81,7 +81,7 @@ def _read(path: Path, repo: str, worktree: Path) -> dict[str, object] | None:
         if field in record and (not isinstance(record[field], str) or not record[field]):
             raise PlanningRebaseError("planning rebase journal의 복원 근거가 유효하지 않습니다.")
     correction = record.get("correction")
-    if correction is not None and (
+    if "correction" in record and (
         not isinstance(correction, dict)
         or not isinstance(correction.get("paths"), list)
         or any(not _correction_path_allowed(name) for name in correction["paths"])

@@ -69,6 +69,25 @@ class PlanningGitDouble:
 
 
 class PlanningRebaseTest(unittest.TestCase):
+    def test_null_correction_journal_refuses_before_git_mutation(self):
+        from loop_manager_internal.planning import planning_rebase
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / 'planning'
+            worktree.mkdir()
+            path = planning_rebase._journal_path(root, '/repo', worktree)
+            record = {
+                'repo': '/repo', 'worktree': str(worktree.resolve()),
+                'old': 'old', 'target': 'new', 'head': 'old', 'nonce': 'nonce',
+                'dirty': True, 'phase': 'rebasing', 'correction': None,
+            }
+            planning_rebase._write(path, record)
+            git = mock.Mock()
+            with self.assertRaises(PlanningRebaseError):
+                rebase_planning_worktree(git, root, root, '/repo', worktree, 'old', 'new')
+            git.assert_not_called()
+            self.assertEqual(planning_rebase.json.loads(path.read_text()), record)
+
     def test_damaged_correction_journal_refuses_before_git_mutation(self):
         from loop_manager_internal.planning import planning_rebase
         with tempfile.TemporaryDirectory() as directory:
