@@ -327,23 +327,28 @@ class ValidationFeedbackRepository:
         ).fetchall()
         for row in rows:
             repo, plan_id = row["repo"], row["plan_id"]
-            if self.connection.execute(
-                "SELECT 1 FROM validation_feedback_migrations WHERE repo=? AND plan_id=?",
-                (repo, plan_id),
-            ).fetchone():
-                continue
-            with _transaction(self.connection):
-                if self.connection.execute(
-                    "SELECT 1 FROM validation_results WHERE repo=? AND plan_id=? LIMIT 1",
-                    (repo, plan_id),
-                ).fetchone():
-                    self._mark_migrated(repo, plan_id)
-                    continue
-                for stage in ("verify", "review"):
-                    raw = row[f"{stage}_result"]
-                    try:
+            try:
+                with _transaction(self.connection):
+                    # Native observations supersede legacy columns. Legacy-only
+                    # audits may be a partial import from an older implementation.
+                    if self.connection.execute(
+                        "SELECT 1 FROM validation_results WHERE repo=? AND plan_id=? "
+                        "AND classification != 'legacy_failure' LIMIT 1",
+                        (repo, plan_id),
+                    ).fetchone():
+                        self._mark_migrated(repo, plan_id)
+                        continue
+                    for stage in ("verify", "review"):
+                        raw = row[f"{stage}_result"]
                         history = json.loads(row[f"{stage}_failure_history"] or "{}")
-                        if not raw or not isinstance(history, dict) or not history:
+                        if not isinstance(history, dict):
+                            raise ValueError("invalid legacy failure history")
+                        for record in history.values():
+                            occurrence = record.get("occurrences", 1) if isinstance(record, dict) else None
+                            if (type(occurrence) is not int
+                                    or not 1 <= occurrence <= 9223372036854775807):
+                                raise ValueError("invalid legacy failure occurrence")
+                        if not raw or not history:
                             continue
                         if stage == "verify":
                             if len(history) != 1:
@@ -358,11 +363,32 @@ class ValidationFeedbackRepository:
                                 continue
                             feedback = normalize_feedback(stage, str(raw))
                         if feedback:
-                            result_id = self._result(
-                                repo, plan_id, row["current_revision_sha"],
-                                stage, "legacy_failure", str(raw), feedback,
-                            )
+                            existing = self.connection.execute(
+                                "SELECT id,raw_output,identities FROM validation_results "
+                                "WHERE repo=? AND plan_id=? AND stage=? "
+                                "AND classification='legacy_failure' ORDER BY id DESC LIMIT 1",
+                                (repo, plan_id, stage),
+                            ).fetchone()
+                            if existing is not None:
+                                if (existing["raw_output"] != str(raw)
+                                        or json.loads(existing["identities"]) !=
+                                        [item.identity for item in feedback]):
+                                    raise ValueError("legacy audit differs from source")
+                                result_id = existing["id"]
+                            else:
+                                result_id = self._result(
+                                    repo, plan_id, row["current_revision_sha"],
+                                    stage, "legacy_failure", str(raw), feedback,
+                                )
                             for item in feedback:
+                                # Older imports could stop after the result or
+                                # any event. Preserve that audit and fill gaps.
+                                if self.connection.execute(
+                                    "SELECT 1 FROM validation_feedback_events "
+                                    "WHERE result_id=? AND identity=? LIMIT 1",
+                                    (result_id, item.identity),
+                                ).fetchone():
+                                    continue
                                 if stage == "verify":
                                     fingerprint = item.identity.split(":", 1)[1]
                                 else:
@@ -377,6 +403,13 @@ class ValidationFeedbackRepository:
                                 self._event(result_id, repo, plan_id, stage,
                                             item.identity, occurrence, 1,
                                             item.diagnostic, True)
-                    except (TypeError, ValueError, KeyError):
-                        continue
-                self._mark_migrated(repo, plan_id)
+                    self._mark_migrated(repo, plan_id)
+            except (TypeError, ValueError, KeyError):
+                # Roll back new audit rows, preserve immutable older audits, and
+                # revoke an old false completion so corrected input can retry.
+                with _transaction(self.connection):
+                    self.connection.execute(
+                        "DELETE FROM validation_feedback_migrations WHERE repo=? AND plan_id=?",
+                        (repo, plan_id),
+                    )
+                continue

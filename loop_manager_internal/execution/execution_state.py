@@ -116,11 +116,15 @@ class ExecutionStatePort:
 
     def complete_rebase(self, checkpoint_repository, *, completion=None, project_values,
                         published_proof=None, acceptance=None, reobserve=None):
+        # This port publishes an in-memory snapshot and must own the commit.
+        if self.connection.in_transaction:
+            raise runtime_state.RuntimeStateError(
+                "rebase completion requires transaction ownership")
         with runtime_state._transaction(self.connection):
             expected = self.check()
             if expected is None:
                 raise runtime_state.RuntimeStateError("execution projection이 없습니다.")
-            self.expected = self.repository.complete_rebase(
+            updated = self.repository.complete_rebase(
                 expected, checkpoint_repository, completion=completion,
                 project_values=project_values, published_proof=published_proof,
                 acceptance=acceptance, reobserve=reobserve,
@@ -132,6 +136,7 @@ class ExecutionStatePort:
                 self.repo, self.plan_id, base_revision=expected.active_sha,
                 worker_session=expected.worker_session_id,
             )
+        self.expected = updated
 
     def complete_rebase_publication(self, checkpoints, *, intent, acceptance, reobserve):
         """Atomically advance the lease without approving or unblocking a candidate."""
