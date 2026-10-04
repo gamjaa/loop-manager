@@ -41,7 +41,7 @@ def assess_cleanup(effects: AssessCleanupEffects, worktree: Path, pr_head_oid: s
     if dirty_kinds:
         return CleanupAssessment("dirty", ", ".join(dirty_kinds))
     try:
-        _head, _branch, _index, dirty = effects._capture_local_worktree_state(worktree)
+        head, branch, index, dirty = effects._capture_local_worktree_state(worktree)
         operations = effects._git_operation_entries(worktree)
     except RuntimeError as error:
         return CleanupAssessment("unverifiable", f"worktree 상태 확인 실패: {error}")
@@ -75,7 +75,12 @@ def assess_cleanup(effects: AssessCleanupEffects, worktree: Path, pr_head_oid: s
     except RuntimeError as error:
         return CleanupAssessment("unverifiable", f"commit 관계 확인 실패: {error}")
     if relation.returncode == 0:
-        return CleanupAssessment("safe")
+        if head != local_head:
+            return CleanupAssessment("unverifiable", "worktree HEAD가 판정 중 변경됐습니다.")
+        return CleanupAssessment(
+            "safe", pr_head_oid=pr_head_oid,
+            observation=(head, branch, tuple(sorted(index.items()))),
+        )
     if relation.returncode == 1:
         return CleanupAssessment(
             "local-only commits", "로컬 HEAD에 PR head에 포함되지 않은 commit이 있습니다."
@@ -142,6 +147,7 @@ class RemoveCleanupWorktreeEffects:
     _managed_worktree_marker: Callable[..., object]
     _managed_worktree_transition_state: Callable[..., object]
     _write_managed_worktree_receipt: Callable[..., object]
+    assess_cleanup: Callable[..., CleanupAssessment]
     git: Callable[..., object]
 
 
@@ -152,11 +158,25 @@ def remove_cleanup_worktree(
     if assessment.status != "safe":
         return assessment
     try:
+        def still_safe() -> CleanupAssessment:
+            if not assessment.pr_head_oid or assessment.observation is None:
+                return CleanupAssessment("unverifiable", "worktree 정리 판정 근거가 없습니다.")
+            current = effects.assess_cleanup(worktree, assessment.pr_head_oid)
+            if current.status == "safe" and current.observation != assessment.observation:
+                return CleanupAssessment("unverifiable", "worktree 정리 판정 이후 HEAD, branch 또는 index가 변경됐습니다.")
+            return current
+
+        current = still_safe()
+        if current.status != "safe":
+            return current
         _head, _branch, _index, dirty = effects._capture_local_worktree_state(worktree)
         if dirty or effects._git_operation_entries(worktree):
             return CleanupAssessment("dirty", "worktree 제거 직전 권위 있는 변경이 있습니다.")
         arguments = ("--force",) if effects._ignored_worktree_paths(worktree) else ()
         if state_dir is None:
+            current = still_safe()
+            if current.status != "safe":
+                return current
             effects.git(repo, "worktree", "remove", *arguments, str(worktree))
         else:
             if not owner:
@@ -174,8 +194,12 @@ def remove_cleanup_worktree(
             def apply(token: str) -> None:
                 if effects._managed_worktree_transition_state(repo, worktree) != before:
                     raise WorkspaceOwnershipError("관리 worktree 정리 직전 상태가 변경됐습니다.")
+                if still_safe().status != "safe":
+                    raise WorkspaceOwnershipError("관리 worktree 정리 직전 안전 판정이 변경됐습니다.")
                 if before["registration"]["locked"]:
                     effects.git(repo, "worktree", "unlock", str(worktree))
+                if still_safe().status != "safe":
+                    raise WorkspaceOwnershipError("관리 worktree 정리 직전 안전 판정이 변경됐습니다.")
                 effects.git(repo, "worktree", "remove", *arguments, str(worktree))
                 effects._write_managed_worktree_receipt(
                     state_dir, token, repo, worktree, before, expected, "remove",

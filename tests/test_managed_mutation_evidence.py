@@ -709,10 +709,15 @@ class ManagedTransitionTests(unittest.TestCase):
                                     return_value={}),
                   mock.patch.object(loop_manager, '_ignored_worktree_paths',
                                     return_value=[]),
+                  mock.patch.object(loop_manager, 'assess_cleanup',
+                                    return_value=loop_manager.CleanupAssessment(
+                                        'safe', pr_head_oid=OLD,
+                                        observation=(OLD, BRANCH, ()))),
                   mock.patch.object(loop_manager, '_write_managed_worktree_receipt',
                                     side_effect=RuntimeError('crash after Git'))):
                 result = loop_manager.remove_cleanup_worktree(
-                    repo, worktree, loop_manager.CleanupAssessment('safe'),
+                    repo, worktree, loop_manager.CleanupAssessment(
+                        'safe', pr_head_oid=OLD, observation=(OLD, BRANCH, ())),
                     state_dir=state, owner='plan:G-091',
                 )
                 self.assertEqual(result.status, 'unverifiable')

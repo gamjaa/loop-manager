@@ -88,6 +88,8 @@ class WorkerLevelDecision:
 class CleanupAssessment:
     status: str
     reason: str | None = None
+    pr_head_oid: str | None = None
+    observation: tuple[object, ...] | None = None
 
 
 @dataclass(frozen=True)

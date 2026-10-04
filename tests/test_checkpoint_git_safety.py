@@ -274,6 +274,26 @@ class GuidanceCheckpointGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.
 
 
 class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
+    def test_push_rechecks_registered_origin_after_safe_assessment(self):
+        request = self.block()
+        adapter = loop_manager._BlockedCheckpointAdapter(
+            self.connection, self.repo, self.state_dir, str(self.repo.resolve()),
+        )
+        verdict = adapter.assess(request)
+        self.assertTrue(verdict.safe, verdict.detail)
+        local_oid = adapter.ensure_local_commit(request, adapter.prepare(request, verdict))
+        other = Path(self.temporary.name) / "other-remote.git"
+        self.run_git(self.repo, "init", "--bare", str(other))
+        self.run_git(self.repo, "remote", "set-url", "origin", str(other))
+        with self.assertRaises(blocked_checkpoint.CheckpointPushError):
+            adapter.push(request, local_oid, blocked_checkpoint.PushDecision(
+                blocked_checkpoint.PushMode.CREATE))
+        self.assertTrue(self.worktree.exists())
+        self.run_git(self.repo, "remote", "set-url", "origin", str(self.remote))
+        adapter.push(request, local_oid, blocked_checkpoint.PushDecision(
+            blocked_checkpoint.PushMode.CREATE))
+        self.assertEqual(adapter.observe_remote(request), local_oid)
+
     def test_clean_checkpoint_identity_survives_reclassification(self):
         from loop_manager_internal.recovery import checkpoint_ownership
         repo = str(self.repo.resolve())
@@ -343,8 +363,7 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
         )
         self.assertEqual(adapter.observe_remote(request), local_oid)
         unrecorded = adapter.assess(request)
-        self.assertFalse(unrecorded.safe)
-        self.assertEqual(unrecorded.reason_code, "shared_ref_mutation")
+        self.assertTrue(unrecorded.safe, unrecorded.detail)
         blocked_checkpoint_state.BlockedCheckpointRepository(
             self.connection
         ).finish_published(request, local_oid)

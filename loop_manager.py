@@ -2602,6 +2602,7 @@ remove_cleanup_worktree = _bind_effects(
         _managed_worktree_marker=lambda *args, **kwargs: _managed_worktree_marker(*args, **kwargs),
         _managed_worktree_transition_state=lambda *args, **kwargs: _managed_worktree_transition_state(*args, **kwargs),
         _write_managed_worktree_receipt=lambda *args, **kwargs: _write_managed_worktree_receipt(*args, **kwargs),
+        assess_cleanup=lambda *args, **kwargs: assess_cleanup(*args, **kwargs),
         git=lambda *args, **kwargs: git(*args, **kwargs),
     ),
 )

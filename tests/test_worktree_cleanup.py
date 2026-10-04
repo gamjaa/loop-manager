@@ -11,6 +11,40 @@ from tests.support.git import git_command, make_remote_repository
 
 class WorktreeCleanupTest(CleanupFixture, unittest.TestCase):
 
+    def test_commit_added_after_assessment_preserves_worktree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, worktree, _branch, pr_head = self._managed_worktree(Path(directory))
+            assessment = loop_manager.assess_cleanup(worktree, pr_head)
+            self.assertEqual(assessment.status, "safe")
+            (worktree / "README.md").write_text("# New local work\n", encoding="utf-8")
+            git_command(worktree, "add", "README.md")
+            git_command(worktree, "commit", "-m", "local after assessment")
+
+            result = loop_manager.remove_cleanup_worktree(repo, worktree, assessment)
+
+            self.assertEqual(result.status, "local-only commits")
+            self.assertTrue(worktree.exists())
+
+    def test_unverifiable_pr_head_after_assessment_preserves_worktree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, worktree, _branch, pr_head = self._managed_worktree(Path(directory))
+            assessment = loop_manager.assess_cleanup(worktree, pr_head)
+            with mock.patch.object(loop_manager, "assess_cleanup", return_value=
+                                   loop_manager.CleanupAssessment("unverifiable", "PR head unavailable")):
+                result = loop_manager.remove_cleanup_worktree(repo, worktree, assessment)
+            self.assertEqual(result.status, "unverifiable")
+            self.assertTrue(worktree.exists())
+
+    def test_changed_clean_head_after_assessment_preserves_worktree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, worktree, _branch, pr_head = self._managed_worktree(Path(directory))
+            assessment = loop_manager.assess_cleanup(worktree, pr_head)
+            parent = git_command(worktree, "rev-parse", "HEAD^")
+            git_command(worktree, "reset", "--hard", parent)
+            result = loop_manager.remove_cleanup_worktree(repo, worktree, assessment)
+            self.assertEqual(result.status, "unverifiable")
+            self.assertTrue(worktree.exists())
+
     def test_ignored_only_worktree_is_removed_after_safe_assessment(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, worktree, _branch, head = self._managed_worktree(Path(directory))

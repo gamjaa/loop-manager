@@ -367,17 +367,33 @@ class CheckpointSafetyAdapter:
                 False, blocked_checkpoint.SafetyScope.PLAN, 'registered_origin_missing',
                 '등록 origin이 없어 checkpoint를 local-only로 보존합니다.', current.head, ())
         try:
+            self._validated_push_url(request)
+        except RuntimeError as error:
+            return blocked_checkpoint.SafetyVerdict(
+                False, blocked_checkpoint.SafetyScope.PROJECT, 'shared_git_config_mutation',
+                str(error), current.head, ())
+        return None
+
+
+    def _validated_push_url(self, request) -> str:
+        """Resolve one registered destination for an immediate, explicit push."""
+        project = self.connection.execute('SELECT origin FROM projects WHERE repo = ?',
+                                          (request.repo,)).fetchone()
+        if project is None or not project['origin']:
+            raise RuntimeError('등록 origin이 없어 checkpoint를 local-only로 보존합니다.')
+        try:
             for context in (self.repo_path, Path(request.worktree)):
                 for arguments in (('remote', 'get-url', '--all', 'origin'),
                                   ('remote', 'get-url', '--push', '--all', 'origin')):
                     urls = self.safety_effects.git(context, *arguments).stdout.splitlines()
                     if len(urls) != 1 or self.safety_effects.github_repository(urls[0]) != project['origin']:
                         raise RuntimeError('등록 origin과 fetch/push 대상이 다릅니다.')
+                    if (context == Path(request.worktree)
+                            and arguments == ('remote', 'get-url', '--push', '--all', 'origin')):
+                        push_url = urls[0]
         except (OSError, RuntimeError) as error:
-            return blocked_checkpoint.SafetyVerdict(
-                False, blocked_checkpoint.SafetyScope.PROJECT, 'shared_git_config_mutation',
-                str(error), current.head, ())
-        return None
+            raise RuntimeError(f'checkpoint 원격 저장소 검증 실패: {error}') from error
+        return push_url
 
 
     def _shared_safety_error(
@@ -679,9 +695,13 @@ class CheckpointPublicationAdapter:
                 "checkpoint branch/worktree가 저장되지 않았습니다.",
                 retryable=False,
             )
+        try:
+            push_url = self._validated_push_url(request)
+        except RuntimeError as error:
+            raise blocked_checkpoint.CheckpointPushError(str(error), retryable=False) from error
         arguments = [
             "push",
-            "origin",
+            push_url,
             f"{local_oid}:refs/heads/{request.branch}",
         ]
         if decision.mode in {blocked_checkpoint.PushMode.CREATE, blocked_checkpoint.PushMode.FAST_FORWARD}:
@@ -739,12 +759,8 @@ def push_diagnostic_checkpoint(effects: PushDiagnosticCheckpointEffects, adapter
     """Create an exact absent ref; never update original or tracking refs."""
     if not request.branch or not request.branch.startswith('loop-manager/diagnostics/'):
         raise RuntimeError('진단 ref 이름이 유효하지 않습니다.')
-    snapshot = effects.capture_git_snapshot(Path(request.worktree))
-    verdict = adapter._origin_safety_error(request, snapshot)
-    if verdict is not None:
-        raise RuntimeError(verdict.detail)
+    origin = adapter._validated_push_url(request)
     # An explicit verified URL avoids Git's automatic remote-tracking update.
-    origin = effects.git(Path(request.worktree), 'remote', 'get-url', '--push', 'origin').stdout.strip()
     pushed = effects.git(Path(request.worktree), '-c', f'core.hooksPath={os.devnull}', 'push',
                  manager_git_journal.exact_branch_lease(request.branch, None), origin,
                  f'{head}:refs/heads/{request.branch}', check=False)
