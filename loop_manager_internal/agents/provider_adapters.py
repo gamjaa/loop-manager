@@ -251,7 +251,10 @@ def run_codex(
     if timeout_triggered.is_set():
         message = f"Codex {role_name} 실행 timeout ({AGENT_CLI_TIMEOUT_SECONDS}초)"
     if returncode and not message:
-        message = log.read_text(encoding="utf-8")[-6000:]
+        try:
+            message = log.read_text(encoding="utf-8")[-6000:]
+        except (OSError, UnicodeError):
+            collection_status = "error"
     try:
         usage = codex_log_usage(log.read_text(encoding="utf-8"))
     except (OSError, UnicodeError):
@@ -270,8 +273,9 @@ def run_codex(
                 1,
                 f"Codex {role_name} 실행 결과에서 세션 ID를 확인할 수 없습니다.",
                 usage=usage,
+                collection_status=collection_status,
             )
-    if persist_session or session_id:
+    if persist_session or session_id or collection_status == "error":
         return CodexResult(
             returncode,
             message.strip(),

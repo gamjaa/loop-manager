@@ -179,6 +179,49 @@ class UsageTests(TestCase):
         self.assertEqual(launch.call_count, 1)
 
     def test_codex_auxiliary_log_copy_failure_preserves_completed_result(self):
+        result, runs = self._codex_auxiliary_copy_failure(
+            persist_session=True, session_id="saved-session",
+        )
+        self.assertEqual((result.code, result.session_id, result.usage.input_tokens,
+                          result.collection_status),
+                         (0, "saved-session", 10, "error"))
+        self.assertEqual(runs, 1)
+
+    def test_codex_ephemeral_copy_failure_returns_collection_error(self):
+        result, runs = self._codex_auxiliary_copy_failure(
+            persist_session=False, session_id=None,
+        )
+        self.assertEqual((result.code, result.session_id, result.usage.input_tokens,
+                          result.collection_status),
+                         (0, None, 10, "error"))
+        self.assertEqual(runs, 1)
+
+    def test_codex_failed_log_read_does_not_retry_completed_call(self):
+        original_read_text = Path.read_text
+
+        def read_text(path, *args, **kwargs):
+            if path.name == "planner.log":
+                raise OSError("failure log unavailable")
+            return original_read_text(path, *args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with mock.patch.object(manager.subprocess, "run",
+                                   return_value=mock.Mock(returncode=1)) as launch, \
+                 mock.patch.object(Path, "read_text", autospec=True,
+                                   side_effect=read_text):
+                result = manager.run_agent_with_retries(
+                    lambda _session, _fallback: manager.run_codex(
+                        root, root, root / "config", "planner", "prompt",
+                        read_only=False,
+                        resolved_profile=invocation.ResolvedProfile("model", "high")),
+                    session_id=None,
+                )
+        self.assertEqual((result.code, result.message, result.collection_status,
+                          result.usage.status), (1, "", "error", "invalid"))
+        self.assertEqual(launch.call_count, 1)
+
+    def _codex_auxiliary_copy_failure(self, *, persist_session, session_id):
         original_write_text = Path.write_text
 
         def write_text(path, data, *args, **kwargs):
@@ -219,12 +262,9 @@ class UsageTests(TestCase):
                                    side_effect=write_text):
                 result = provider_adapters.run_codex(
                     root, root, root / "config", "planner", "prompt",
-                    read_only=False, persist_session=True, session_id="saved-session",
+                    read_only=False, persist_session=persist_session, session_id=session_id,
                     resolved_profile=invocation.ResolvedProfile("model", "high"),
                     isolation_snapshot_digest=lambda: "snapshot",
                     on_isolation_checked=mock.Mock(), effects=effects,
                 )
-        self.assertEqual((result.code, result.session_id, result.usage.input_tokens,
-                          result.collection_status),
-                         (0, "saved-session", 10, "error"))
-        self.assertEqual(run_call.call_count, 1)
+        return result, run_call.call_count
