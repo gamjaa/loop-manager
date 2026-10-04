@@ -104,10 +104,16 @@ def _stash(git, worktree: Path, message: str) -> tuple[str, str] | None:
     return matches[0] if matches else None
 
 
+def _nul_reader(git):
+    # Mock and other dynamic callables may synthesize missing attributes.
+    return getattr(git, "__dict__", {}).get("nul_paths")
+
+
 def _git_ok(git, worktree: Path, *args: str) -> str:
-    if "-z" in args and callable(getattr(git, "nul_paths", None)):
+    nul_paths = _nul_reader(git)
+    if "-z" in args and callable(nul_paths):
         try:
-            paths = git.nul_paths(worktree, *args)
+            paths = nul_paths(worktree, *args)
         except GitLockError:
             raise
         except RuntimeError as error:
@@ -185,9 +191,10 @@ def _matches_completed_stash_apply(
 
 def _stash_untracked_collisions(git, worktree: Path, stash_sha: str) -> tuple[str, ...]:
     arguments = ("ls-tree", "-r", "--name-only", "-z", f"{stash_sha}^3")
-    if callable(getattr(git, "nul_paths", None)):
+    nul_paths = _nul_reader(git)
+    if callable(nul_paths):
         try:
-            paths = git.nul_paths(worktree, *arguments)
+            paths = nul_paths(worktree, *arguments)
         except GitLockError:
             raise
         except RuntimeError:

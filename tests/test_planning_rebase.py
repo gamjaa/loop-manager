@@ -101,6 +101,8 @@ class PlanningRebaseTest(unittest.TestCase):
         git = mock.Mock(return_value=SimpleNamespace(stdout=name + '\0', returncode=0))
         self.assertEqual(planning_rebase._git_ok(
             git, Path('/repo'), 'ls-files', '--others', '-z'), name + '\0')
+        git.assert_called_once_with(
+            Path('/repo'), 'ls-files', '--others', '-z', check=False)
 
     @unittest.skipIf(os.name == 'nt', 'raw non-UTF-8 filename fixture requires POSIX')
     def test_rebase_fingerprints_read_raw_nul_paths_without_text_git(self):
