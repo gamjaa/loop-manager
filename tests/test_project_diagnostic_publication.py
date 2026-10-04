@@ -100,17 +100,19 @@ class ProjectDiagnosticPublicationUnitTests(unittest.TestCase):
     def test_diagnostic_create_uses_absence_lease_and_verified_url(self):
         request = SimpleNamespace(branch='loop-manager/diagnostics/G-107/artifact', worktree='/state/G-107')
         adapter = mock.Mock()
-        adapter._origin_safety_error.return_value = None
-        with (mock.patch.object(loop_manager, 'capture_git_snapshot'),
-              mock.patch.object(loop_manager, 'git', side_effect=[
-                  SimpleNamespace(stdout='https://github.com/example/repo.git\n'),
-                  SimpleNamespace(returncode=0, stdout='')]) as git):
+        adapter._validated_push_url.return_value = 'https://github.com/example/repo.git'
+        with mock.patch.object(loop_manager, 'git', return_value=SimpleNamespace(returncode=0, stdout='')) as git:
             loop_manager.push_diagnostic_checkpoint(adapter, request, 'a' * 40)
-        self.assertEqual(git.call_args.args, (
-            Path('/state/G-107'), '-c', f'core.hooksPath={os.devnull}', 'push',
+        adapter._validated_push_url.assert_called_once_with(request)
+        args = git.call_args.args
+        operand = args[-2]
+        self.assertRegex(operand, r'^x[0-9a-f]{32}://target$')
+        self.assertEqual(args, (
+            Path('/state/G-107'), '-c', f'core.hooksPath={os.devnull}',
+            '-c', f'url.https://github.com/example/repo.git.insteadOf={operand}',
+            '-c', f'url.https://github.com/example/repo.git.pushInsteadOf={operand}', 'push',
             '--force-with-lease=refs/heads/loop-manager/diagnostics/G-107/artifact:',
-            'https://github.com/example/repo.git',
-            'a' * 40 + ':refs/heads/loop-manager/diagnostics/G-107/artifact'))
+            operand, 'a' * 40 + ':refs/heads/loop-manager/diagnostics/G-107/artifact'))
         self.assertNotIn('origin', git.call_args.args)
 
     def test_diagnostic_never_pushes_an_original_branch_or_unverified_origin(self):
@@ -118,11 +120,10 @@ class ProjectDiagnosticPublicationUnitTests(unittest.TestCase):
         with mock.patch.object(loop_manager, 'git') as git:
             with self.assertRaises(RuntimeError):
                 loop_manager.push_diagnostic_checkpoint(adapter, SimpleNamespace(branch='loop-manager/G-107'), 'a' * 40)
-            adapter._origin_safety_error.return_value = SimpleNamespace(detail='origin changed')
-            with mock.patch.object(loop_manager, 'capture_git_snapshot'):
-                with self.assertRaisesRegex(RuntimeError, 'origin changed'):
-                    loop_manager.push_diagnostic_checkpoint(adapter, SimpleNamespace(
-                        branch='loop-manager/diagnostics/G-107/artifact', worktree='/state/G-107'), 'a' * 40)
+            adapter._validated_push_url.side_effect = RuntimeError('origin changed')
+            with self.assertRaisesRegex(RuntimeError, 'origin changed'):
+                loop_manager.push_diagnostic_checkpoint(adapter, SimpleNamespace(
+                    branch='loop-manager/diagnostics/G-107/artifact', worktree='/state/G-107'), 'a' * 40)
         git.assert_not_called()
 
     def test_original_checkpoint_fast_forward_and_create_use_exact_leases(self):
@@ -132,18 +133,47 @@ class ProjectDiagnosticPublicationUnitTests(unittest.TestCase):
             request = loop_manager.blocked_checkpoint.CheckpointRequest(
                 'repo', 'G-107', 'request', loop_manager.blocked_checkpoint.CheckpointPhase.LOCAL_COMMITTED,
                 'verify_retry_exhausted', 'failure', 'loop-manager/G-107', '/state/G-107', expected)
-            with mock.patch.object(loop_manager, 'git', return_value=SimpleNamespace(returncode=0, stdout='')) as git:
+            with (mock.patch.object(adapter, '_validated_push_url',
+                                    return_value='https://github.com/example/repo.git'),
+                  mock.patch.object(loop_manager, 'git', side_effect=[
+                      SimpleNamespace(returncode=1, stdout=''),
+                      SimpleNamespace(returncode=0, stdout=''),
+                      SimpleNamespace(returncode=0, stdout=''),
+                  ]) as git):
                 adapter.push(request, 'a' * 40, loop_manager.blocked_checkpoint.PushDecision(mode))
-            self.assertIn('--force-with-lease=refs/heads/loop-manager/G-107:' + (expected or ''), git.call_args.args)
+            self.assertIn('--force-with-lease=refs/heads/loop-manager/G-107:' + (expected or ''),
+                          git.call_args_list[1].args)
+            self.assertEqual(git.call_args_list[2].args[1:3],
+                             ('update-ref', 'refs/remotes/origin/loop-manager/G-107'))
+            self.assertEqual(git.call_args_list[2].args[-1], '0' * 40)
+
+    def test_tracking_ref_race_after_push_keeps_checkpoint_recoverable(self):
+        adapter = loop_manager._BlockedCheckpointAdapter(mock.Mock(), Path('/repo'), Path('/state'), 'repo')
+        request = SimpleNamespace(branch='loop-manager/G-107', worktree='/state/G-107',
+                                  expected_remote_oid=None)
+        with (mock.patch.object(adapter, '_validated_push_url',
+                                return_value='https://github.com/example/repo.git'),
+              mock.patch.object(loop_manager, 'git', side_effect=[
+                  SimpleNamespace(returncode=1, stdout=''),
+                  SimpleNamespace(returncode=0, stdout=''),
+                  SimpleNamespace(returncode=1, stdout='tracking ref changed'),
+              ]) as git):
+            with self.assertRaises(RuntimeError) as raised:
+                adapter.push(request, 'a' * 40, loop_manager.blocked_checkpoint.PushDecision(
+                    loop_manager.blocked_checkpoint.PushMode.CREATE))
+        self.assertIn('tracking ref changed', str(raised.exception))
+        self.assertEqual(git.call_args_list[2].args[-1], '0' * 40)
 
     def test_project_original_branch_push_disables_hooks(self):
         adapter = loop_manager._BlockedCheckpointAdapter(mock.Mock(), Path('/repo'), Path('/state'), 'repo',
                                                          project_recovery_scope=True)
         request = SimpleNamespace(branch='loop-manager/G-107', worktree='/state/G-107', expected_remote_oid='b' * 40)
-        with mock.patch.object(loop_manager, 'git', return_value=SimpleNamespace(returncode=0, stdout='')) as git:
+        with (mock.patch.object(adapter, '_validated_push_url',
+                                return_value='https://github.com/example/repo.git'),
+              mock.patch.object(loop_manager, 'git', return_value=SimpleNamespace(returncode=0, stdout='')) as git):
             adapter.push(request, 'a' * 40, loop_manager.blocked_checkpoint.PushDecision(
                 loop_manager.blocked_checkpoint.PushMode.FAST_FORWARD))
-        self.assertEqual(git.call_args.args[1:3], ('-c', f'core.hooksPath={os.devnull}'))
+        self.assertEqual(git.call_args_list[1].args[1:3], ('-c', f'core.hooksPath={os.devnull}'))
 
     def test_project_rebase_disables_hooks_and_other_branch_updates(self):
         connection = sqlite3.connect(':memory:')

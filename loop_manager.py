@@ -1084,6 +1084,7 @@ _recover_managed_worktree_removal = _bind_effects(
         _canonical_path=lambda *args, **kwargs: _canonical_path(*args, **kwargs),
         _managed_worktree_marker=lambda *args, **kwargs: _managed_worktree_marker(*args, **kwargs),
         _managed_worktree_transition_state=lambda *args, **kwargs: _managed_worktree_transition_state(*args, **kwargs),
+        git=lambda *args, **kwargs: git(*args, **kwargs),
     ),
 )
 
@@ -2598,10 +2599,10 @@ remove_cleanup_worktree = _bind_effects(
         _canonical_path=lambda *args, **kwargs: _canonical_path(*args, **kwargs),
         _capture_local_worktree_state=lambda *args, **kwargs: _capture_local_worktree_state(*args, **kwargs),
         _git_operation_entries=lambda *args, **kwargs: _git_operation_entries(*args, **kwargs),
-        _ignored_worktree_paths=lambda *args, **kwargs: _ignored_worktree_paths(*args, **kwargs),
         _managed_worktree_marker=lambda *args, **kwargs: _managed_worktree_marker(*args, **kwargs),
         _managed_worktree_transition_state=lambda *args, **kwargs: _managed_worktree_transition_state(*args, **kwargs),
         _write_managed_worktree_receipt=lambda *args, **kwargs: _write_managed_worktree_receipt(*args, **kwargs),
+        assess_cleanup=lambda *args, **kwargs: assess_cleanup(*args, **kwargs),
         git=lambda *args, **kwargs: git(*args, **kwargs),
     ),
 )

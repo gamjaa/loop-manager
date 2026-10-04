@@ -274,6 +274,105 @@ class GuidanceCheckpointGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.
 
 
 class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
+    def test_existing_push_instead_of_cannot_redirect_frozen_target(self):
+        other = Path(self.temporary.name) / 'other-remote.git'
+        self.run_git(self.repo, 'init', '--bare', str(other))
+        self.run_git(self.repo, 'config', '--add', f'url.{other}.pushInsteadOf',
+                     'loop-manager-verified-')
+        self.run_git(self.repo, 'config', '--add', f'url.{other}.pushInsteadOf', 'x')
+        request = self.block()
+        adapter = loop_manager._BlockedCheckpointAdapter(
+            self.connection, self.repo, self.state_dir, str(self.repo.resolve()),
+        )
+        adapter.push(request, self.base_oid, blocked_checkpoint.PushDecision(
+            blocked_checkpoint.PushMode.CREATE))
+        ref = 'refs/heads/loop-manager/G-034'
+        self.assertEqual(self.run_git(self.remote, 'rev-parse', ref), self.base_oid)
+        self.assertNotEqual(loop_manager.git(other, 'rev-parse', '--verify', ref, check=False).returncode, 0)
+
+    def test_chained_url_rewrite_pushes_to_the_once_validated_target(self):
+        other = Path(self.temporary.name) / 'other-remote.git'
+        self.run_git(self.repo, 'init', '--bare', str(other))
+        self.run_git(self.repo, 'remote', 'set-url', 'origin', 'alias://project')
+        self.run_git(self.repo, 'config', '--add', f'url.{self.remote}.insteadOf', 'alias://project')
+        self.run_git(self.repo, 'config', '--add', f'url.{other}.insteadOf', str(self.remote))
+        request = self.block()
+        adapter = loop_manager._BlockedCheckpointAdapter(
+            self.connection, self.repo, self.state_dir, str(self.repo.resolve()),
+        )
+        verdict = adapter.assess(request)
+        self.assertTrue(verdict.safe, verdict.detail)
+        self.assertEqual(adapter._validated_push_url(request), str(self.remote))
+        local_oid = adapter.ensure_local_commit(request, adapter.prepare(request, verdict))
+        adapter.push(request, local_oid, blocked_checkpoint.PushDecision(
+            blocked_checkpoint.PushMode.CREATE))
+        ref = 'refs/heads/loop-manager/G-034'
+        self.assertEqual(self.run_git(self.remote, 'rev-parse', ref), local_oid)
+        self.assertNotEqual(loop_manager.git(other, 'rev-parse', '--verify', ref, check=False).returncode, 0)
+
+    def test_rewritten_push_target_cannot_resolve_as_another_remote_name(self):
+        other = Path(self.temporary.name) / 'other-remote.git'
+        self.run_git(self.repo, 'init', '--bare', str(other))
+        self.run_git(self.repo, 'remote', 'add', 'other', str(other))
+        self.run_git(self.repo, 'remote', 'set-url', 'origin', 'other')
+        self.run_git(self.repo, 'config', '--add', f'url.{self.remote}.insteadOf', 'other')
+        request = self.block()
+        adapter = loop_manager._BlockedCheckpointAdapter(
+            self.connection, self.repo, self.state_dir, str(self.repo.resolve()),
+        )
+        self.assertEqual(adapter._validated_push_url(request), str(self.remote))
+        adapter.push(request, self.base_oid, blocked_checkpoint.PushDecision(
+            blocked_checkpoint.PushMode.CREATE))
+        ref = 'refs/heads/loop-manager/G-034'
+        self.assertEqual(self.run_git(self.remote, 'rev-parse', ref), self.base_oid)
+        self.assertNotEqual(loop_manager.git(other, 'rev-parse', '--verify', ref, check=False).returncode, 0)
+
+    def test_config_change_between_validation_and_push_keeps_validated_target(self):
+        other = Path(self.temporary.name) / 'other-remote.git'
+        self.run_git(self.repo, 'init', '--bare', str(other))
+        self.run_git(self.repo, 'remote', 'set-url', 'origin', 'alias://project')
+        self.run_git(self.repo, 'config', '--add', f'url.{self.remote}.insteadOf', 'alias://project')
+        request = self.block()
+        adapter = loop_manager._BlockedCheckpointAdapter(
+            self.connection, self.repo, self.state_dir, str(self.repo.resolve()),
+        )
+        original_git = loop_manager.git
+
+        def change_rewrite_before_push(path, *arguments, **kwargs):
+            if 'push' in arguments:
+                self.run_git(self.repo, 'config', '--unset-all', f'url.{self.remote}.insteadOf')
+                self.run_git(self.repo, 'config', '--add', f'url.{other}.insteadOf', 'alias://project')
+                self.run_git(self.repo, 'config', '--add', f'url.{other}.pushInsteadOf', 'x')
+                self.run_git(self.repo, 'config', '--add', f'url.{other}.pushInsteadOf', str(self.remote))
+            return original_git(path, *arguments, **kwargs)
+
+        with mock.patch.object(loop_manager, 'git', side_effect=change_rewrite_before_push):
+            adapter.push(request, self.base_oid, blocked_checkpoint.PushDecision(
+                blocked_checkpoint.PushMode.CREATE))
+        ref = 'refs/heads/loop-manager/G-034'
+        self.assertEqual(self.run_git(self.remote, 'rev-parse', ref), self.base_oid)
+        self.assertNotEqual(original_git(other, 'rev-parse', '--verify', ref, check=False).returncode, 0)
+
+    def test_push_rechecks_registered_origin_after_safe_assessment(self):
+        request = self.block()
+        adapter = loop_manager._BlockedCheckpointAdapter(
+            self.connection, self.repo, self.state_dir, str(self.repo.resolve()),
+        )
+        verdict = adapter.assess(request)
+        self.assertTrue(verdict.safe, verdict.detail)
+        local_oid = adapter.ensure_local_commit(request, adapter.prepare(request, verdict))
+        other = Path(self.temporary.name) / "other-remote.git"
+        self.run_git(self.repo, "init", "--bare", str(other))
+        self.run_git(self.repo, "remote", "set-url", "origin", str(other))
+        with self.assertRaises(blocked_checkpoint.CheckpointPushError):
+            adapter.push(request, local_oid, blocked_checkpoint.PushDecision(
+                blocked_checkpoint.PushMode.CREATE))
+        self.assertTrue(self.worktree.exists())
+        self.run_git(self.repo, "remote", "set-url", "origin", str(self.remote))
+        adapter.push(request, local_oid, blocked_checkpoint.PushDecision(
+            blocked_checkpoint.PushMode.CREATE))
+        self.assertEqual(adapter.observe_remote(request), local_oid)
+
     def test_clean_checkpoint_identity_survives_reclassification(self):
         from loop_manager_internal.recovery import checkpoint_ownership
         repo = str(self.repo.resolve())

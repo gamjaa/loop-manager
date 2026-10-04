@@ -34,10 +34,13 @@ Close the gap between a safe Git assessment and its destructive effect. The curr
 
 ## Progress
 
-- [ ] Recheck cleanup and push proofs at their mutation boundaries.
-- [ ] Add race and restart regression cases.
+- [x] Recheck cleanup and push proofs at their mutation boundaries.
+- [x] Add race and restart regression cases.
 
 ## Decision Log
 
 - Manifest findings 10 and 30 identify distinct Git mutations with the same assessment-to-use hazard; finding 90 shows the cleanup test only checks assessment. High priority follows the concrete local-commit loss and wrong-remote publication paths, not file size.
 - Observed mutation paths: `loop_manager_internal/git/cleanup_service.py`, `loop_manager_internal/recovery/checkpoint_adapter.py`.
+- Cleanup assessment now carries an immutable HEAD, branch and index observation with the PR head OID. Removal repeats the full assessment before Git removes the worktree, including inside the managed journal application. A stale or unverifiable assessment leaves the worktree for `cleanup_pending` recheck.
+- Checkpoint publication resolves and validates the registered fetch and push identity immediately before push, then uses the validated effective URL under the existing exact branch lease. After success it conditionally advances the local `origin` tracking ref to preserve named-remote push behavior; a competing ref change leaves the durable checkpoint for recovery.
+- Review correction: locked cleanup unlocks only within the journal application and removes without force. A failed removal restores its original lock state. If HEAD or index changes during journaled removal, recovery records the prior intent as aborted without adopting the changed state as Manager work, then rechecks the current worktree. Publication maps a fresh random push operand to the validated URL with exact `insteadOf` and `pushInsteadOf` rules in the same Git command, so an existing or changed shorter rewrite rule cannot redirect it.

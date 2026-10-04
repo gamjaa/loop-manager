@@ -21,6 +21,7 @@ from loop_manager_internal.storage import execution_checkpoint_state
 from pathlib import Path
 import json
 import os
+import secrets
 import sqlite3
 import tempfile
 
@@ -52,6 +53,13 @@ class CheckpointSafetyEffects:
     validate_blocked_agent_scope: Callable[..., object]
     validate_execplan_workspace_identity: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
+
+
+def _frozen_push_target(url: str) -> tuple[tuple[str, str], str]:
+    """Make this push command's longest URL rewrites resolve to the checked URL."""
+    operand = f'x{secrets.token_hex(16)}://target'
+    return ('-c', f'url.{url}.insteadOf={operand}',
+            '-c', f'url.{url}.pushInsteadOf={operand}'), operand
 
 
 class CheckpointSafetyAdapter:
@@ -367,17 +375,33 @@ class CheckpointSafetyAdapter:
                 False, blocked_checkpoint.SafetyScope.PLAN, 'registered_origin_missing',
                 '등록 origin이 없어 checkpoint를 local-only로 보존합니다.', current.head, ())
         try:
+            self._validated_push_url(request)
+        except RuntimeError as error:
+            return blocked_checkpoint.SafetyVerdict(
+                False, blocked_checkpoint.SafetyScope.PROJECT, 'shared_git_config_mutation',
+                str(error), current.head, ())
+        return None
+
+
+    def _validated_push_url(self, request) -> str:
+        """Resolve the registered destination before freezing it for push."""
+        project = self.connection.execute('SELECT origin FROM projects WHERE repo = ?',
+                                          (request.repo,)).fetchone()
+        if project is None or not project['origin']:
+            raise RuntimeError('등록 origin이 없어 checkpoint를 local-only로 보존합니다.')
+        try:
             for context in (self.repo_path, Path(request.worktree)):
                 for arguments in (('remote', 'get-url', '--all', 'origin'),
                                   ('remote', 'get-url', '--push', '--all', 'origin')):
                     urls = self.safety_effects.git(context, *arguments).stdout.splitlines()
                     if len(urls) != 1 or self.safety_effects.github_repository(urls[0]) != project['origin']:
                         raise RuntimeError('등록 origin과 fetch/push 대상이 다릅니다.')
+                    if (context == Path(request.worktree)
+                            and arguments == ('remote', 'get-url', '--push', '--all', 'origin')):
+                        push_url = urls[0]
         except (OSError, RuntimeError) as error:
-            return blocked_checkpoint.SafetyVerdict(
-                False, blocked_checkpoint.SafetyScope.PROJECT, 'shared_git_config_mutation',
-                str(error), current.head, ())
-        return None
+            raise RuntimeError(f'checkpoint 원격 저장소 검증 실패: {error}') from error
+        return push_url
 
 
     def _shared_safety_error(
@@ -679,9 +703,14 @@ class CheckpointPublicationAdapter:
                 "checkpoint branch/worktree가 저장되지 않았습니다.",
                 retryable=False,
             )
+        try:
+            push_url = self._validated_push_url(request)
+        except RuntimeError as error:
+            raise blocked_checkpoint.CheckpointPushError(str(error), retryable=False) from error
+        rewrite_options, operand = _frozen_push_target(push_url)
         arguments = [
             "push",
-            "origin",
+            operand,
             f"{local_oid}:refs/heads/{request.branch}",
         ]
         if decision.mode in {blocked_checkpoint.PushMode.CREATE, blocked_checkpoint.PushMode.FAST_FORWARD}:
@@ -696,13 +725,30 @@ class CheckpointPublicationAdapter:
                 1,
                 manager_git_journal.exact_branch_lease(request.branch, request.expected_remote_oid),
             )
+        tracking_ref = f"refs/remotes/origin/{request.branch}"
+        tracked = self.publication_effects.git(
+            Path(request.worktree), "rev-parse", "--verify", tracking_ref, check=False,
+        )
+        tracked_oid = tracked.stdout.strip() if tracked.returncode == 0 else "0" * len(local_oid)
         scoped_options = (("-c", f"core.hooksPath={os.devnull}")
                           if self.project_recovery_scope else ())
-        pushed = self.publication_effects.git(Path(request.worktree), *scoped_options, *arguments, check=False)
+        pushed = self.publication_effects.git(
+            Path(request.worktree), *scoped_options, *rewrite_options, *arguments, check=False)
         if pushed.returncode:
             raise blocked_checkpoint.CheckpointPushError(
                 "checkpoint push 실패:\n" + pushed.stdout[-8000:],
                 retryable=blocked_checkpoint.push_failure_retryable(pushed.stdout),
+            )
+        # A URL push does not refresh origin's tracking ref as a named-remote
+        # push does. Preserve that local result without overwriting a concurrent
+        # ref change; the durable checkpoint can recover after a failed CAS.
+        updated = self.publication_effects.git(
+            Path(request.worktree), "update-ref", tracking_ref, local_oid, tracked_oid,
+            check=False,
+        )
+        if updated.returncode:
+            raise RuntimeError(
+                "checkpoint push 뒤 origin 추적 ref 갱신 실패:\n" + updated.stdout[-8000:]
             )
 
 
@@ -739,14 +785,12 @@ def push_diagnostic_checkpoint(effects: PushDiagnosticCheckpointEffects, adapter
     """Create an exact absent ref; never update original or tracking refs."""
     if not request.branch or not request.branch.startswith('loop-manager/diagnostics/'):
         raise RuntimeError('진단 ref 이름이 유효하지 않습니다.')
-    snapshot = effects.capture_git_snapshot(Path(request.worktree))
-    verdict = adapter._origin_safety_error(request, snapshot)
-    if verdict is not None:
-        raise RuntimeError(verdict.detail)
-    # An explicit verified URL avoids Git's automatic remote-tracking update.
-    origin = effects.git(Path(request.worktree), 'remote', 'get-url', '--push', 'origin').stdout.strip()
-    pushed = effects.git(Path(request.worktree), '-c', f'core.hooksPath={os.devnull}', 'push',
-                 manager_git_journal.exact_branch_lease(request.branch, None), origin,
+    origin = adapter._validated_push_url(request)
+    rewrite_options, operand = _frozen_push_target(origin)
+    # A frozen URL operand avoids Git's automatic remote-tracking update.
+    pushed = effects.git(Path(request.worktree), '-c', f'core.hooksPath={os.devnull}',
+                 *rewrite_options, 'push',
+                 manager_git_journal.exact_branch_lease(request.branch, None), operand,
                  f'{head}:refs/heads/{request.branch}', check=False)
     if pushed.returncode:
         raise blocked_checkpoint.CheckpointPushError(

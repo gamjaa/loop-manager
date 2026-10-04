@@ -11,6 +11,40 @@ from tests.support.git import git_command, make_remote_repository
 
 class WorktreeCleanupTest(CleanupFixture, unittest.TestCase):
 
+    def test_commit_added_after_assessment_preserves_worktree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, worktree, _branch, pr_head = self._managed_worktree(Path(directory))
+            assessment = loop_manager.assess_cleanup(worktree, pr_head)
+            self.assertEqual(assessment.status, "safe")
+            (worktree / "README.md").write_text("# New local work\n", encoding="utf-8")
+            git_command(worktree, "add", "README.md")
+            git_command(worktree, "commit", "-m", "local after assessment")
+
+            result = loop_manager.remove_cleanup_worktree(repo, worktree, assessment)
+
+            self.assertEqual(result.status, "local-only commits")
+            self.assertTrue(worktree.exists())
+
+    def test_unverifiable_pr_head_after_assessment_preserves_worktree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, worktree, _branch, pr_head = self._managed_worktree(Path(directory))
+            assessment = loop_manager.assess_cleanup(worktree, pr_head)
+            with mock.patch.object(loop_manager, "assess_cleanup", return_value=
+                                   loop_manager.CleanupAssessment("unverifiable", "PR head unavailable")):
+                result = loop_manager.remove_cleanup_worktree(repo, worktree, assessment)
+            self.assertEqual(result.status, "unverifiable")
+            self.assertTrue(worktree.exists())
+
+    def test_changed_clean_head_after_assessment_preserves_worktree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, worktree, _branch, pr_head = self._managed_worktree(Path(directory))
+            assessment = loop_manager.assess_cleanup(worktree, pr_head)
+            parent = git_command(worktree, "rev-parse", "HEAD^")
+            git_command(worktree, "reset", "--hard", parent)
+            result = loop_manager.remove_cleanup_worktree(repo, worktree, assessment)
+            self.assertEqual(result.status, "unverifiable")
+            self.assertTrue(worktree.exists())
+
     def test_ignored_only_worktree_is_removed_after_safe_assessment(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, worktree, _branch, head = self._managed_worktree(Path(directory))
@@ -29,6 +63,155 @@ class WorktreeCleanupTest(CleanupFixture, unittest.TestCase):
                 "safe",
             )
             self.assertFalse(worktree.exists())
+
+    def test_file_created_at_removal_is_preserved(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, worktree, _branch, head = self._managed_worktree(Path(directory))
+            assessment = loop_manager.assess_cleanup(worktree, head)
+            self.assertEqual(assessment.status, "safe")
+            original_git = loop_manager.git
+
+            def create_file_before_remove(path, *arguments, **kwargs):
+                if arguments[:2] == ("worktree", "remove"):
+                    (worktree / "late.txt").write_text("user change\n", encoding="utf-8")
+                return original_git(path, *arguments, **kwargs)
+
+            with mock.patch.object(loop_manager, "git", side_effect=create_file_before_remove):
+                result = loop_manager.remove_cleanup_worktree(repo, worktree, assessment)
+            self.assertEqual(result.status, "unverifiable")
+            self.assertEqual((worktree / "late.txt").read_text(encoding="utf-8"), "user change\n")
+
+    def test_file_created_after_managed_unlock_is_preserved_and_relocked(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, worktree, _branch, head = self._managed_worktree(root, "G-135")
+            git_command(repo, "worktree", "lock", "--reason=loop-manager-worktree:owned", str(worktree))
+            assessment = loop_manager.assess_cleanup(worktree, head)
+            self.assertEqual(assessment.status, "safe")
+            original_git = loop_manager.git
+
+            def create_file_before_remove(path, *arguments, **kwargs):
+                if arguments[:2] == ("worktree", "remove"):
+                    (worktree / "late.txt").write_text("user change\n", encoding="utf-8")
+                return original_git(path, *arguments, **kwargs)
+
+            state_dir = root / "state"
+            with mock.patch.object(loop_manager, "git", side_effect=create_file_before_remove):
+                result = loop_manager.remove_cleanup_worktree(
+                    repo, worktree, assessment, state_dir=state_dir, owner="plan:G-135")
+            self.assertEqual(result.status, "unverifiable")
+            self.assertEqual((worktree / "late.txt").read_text(encoding="utf-8"), "user change\n")
+            self.assertFalse(loop_manager._recover_managed_worktree_removal(state_dir, repo, worktree))
+            record = next(item for item in loop_manager._worktree_catalog(repo)
+                          if item.get("worktree") == str(worktree))
+            self.assertEqual(record.get("locked"), "loop-manager-worktree:owned")
+
+    def test_head_or_index_change_after_unlock_aborts_stale_journal(self):
+        for mutation in ("head", "index"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                repo, worktree, _branch, head = self._managed_worktree(root, "G-135")
+                git_command(repo, "worktree", "lock", "--reason=loop-manager-worktree:owned", str(worktree))
+                assessment = loop_manager.assess_cleanup(worktree, head)
+                self.assertEqual(assessment.status, "safe")
+                original_git = loop_manager.git
+
+                def mutate_after_unlock(path, *arguments, **kwargs):
+                    result = original_git(path, *arguments, **kwargs)
+                    if arguments[:2] == ("worktree", "unlock"):
+                        if mutation == "head":
+                            git_command(worktree, "reset", "--hard", "HEAD^")
+                        else:
+                            (worktree / "src/app.py").write_text("VALUE = 3\n", encoding="utf-8")
+                            git_command(worktree, "add", "src/app.py")
+                    return result
+
+                state_dir = root / "state"
+                with mock.patch.object(loop_manager, "git", side_effect=mutate_after_unlock):
+                    result = loop_manager.remove_cleanup_worktree(
+                        repo, worktree, assessment, state_dir=state_dir, owner="plan:G-135")
+                self.assertEqual(result.status, "unverifiable")
+                self.assertTrue(worktree.exists())
+                record = next(item for item in loop_manager._worktree_catalog(repo)
+                              if item.get("worktree") == str(worktree))
+                self.assertEqual(record.get("locked"), "loop-manager-worktree:owned")
+                fresh = loop_manager.assess_cleanup(worktree, head)
+                if mutation == "head":
+                    self.assertEqual(fresh.status, "safe")
+                    self.assertEqual(loop_manager.remove_cleanup_worktree(
+                        repo, worktree, fresh, state_dir=state_dir,
+                        owner="plan:G-135").status, "safe")
+                else:
+                    self.assertFalse(loop_manager._recover_managed_worktree_removal(
+                        state_dir, repo, worktree))
+                    self.assertEqual(fresh.status, "dirty")
+                    self.assertEqual((worktree / "src/app.py").read_text(encoding="utf-8"), "VALUE = 3\n")
+                self.assertEqual(list((state_dir / "manager-git-journal").glob("*/active.json")), [])
+
+    def test_interrupted_cleanup_with_changed_head_recovers_for_recheck(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, worktree, _branch, head = self._managed_worktree(root, "G-135")
+            git_command(repo, "worktree", "lock", "--reason=loop-manager-worktree:owned", str(worktree))
+            assessment = loop_manager.assess_cleanup(worktree, head)
+            original_git = loop_manager.git
+            original_assess = loop_manager.assess_cleanup
+            unlocked = False
+
+            def mutate_after_unlock(path, *arguments, **kwargs):
+                nonlocal unlocked
+                result = original_git(path, *arguments, **kwargs)
+                if arguments[:2] == ("worktree", "unlock"):
+                    git_command(worktree, "reset", "--hard", "HEAD^")
+                    unlocked = True
+                return result
+
+            def interrupt_after_unlock(*arguments):
+                if unlocked:
+                    raise KeyboardInterrupt()
+                return original_assess(*arguments)
+
+            state_dir = root / "state"
+            with (mock.patch.object(loop_manager, "git", side_effect=mutate_after_unlock),
+                  mock.patch.object(loop_manager, "assess_cleanup", side_effect=interrupt_after_unlock),
+                  self.assertRaises(KeyboardInterrupt)):
+                loop_manager.remove_cleanup_worktree(
+                    repo, worktree, assessment, state_dir=state_dir, owner="plan:G-135")
+            self.assertFalse(loop_manager._recover_managed_worktree_removal(state_dir, repo, worktree))
+            self.assertEqual(list((state_dir / "manager-git-journal").glob("*/active.json")), [])
+            fresh = loop_manager.assess_cleanup(worktree, head)
+            self.assertEqual(fresh.status, "safe")
+            self.assertEqual(loop_manager.remove_cleanup_worktree(
+                repo, worktree, fresh, state_dir=state_dir, owner="plan:G-135").status, "safe")
+
+    def test_unlocked_cleanup_head_change_aborts_stale_journal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo, worktree, _branch, head = self._managed_worktree(root, "G-135")
+            assessment = loop_manager.assess_cleanup(worktree, head)
+            original_assess = loop_manager.assess_cleanup
+            calls = 0
+
+            def change_head_on_journal_recheck(*arguments):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    git_command(worktree, "reset", "--hard", "HEAD^")
+                return original_assess(*arguments)
+
+            state_dir = root / "state"
+            with mock.patch.object(loop_manager, "assess_cleanup",
+                                   side_effect=change_head_on_journal_recheck):
+                result = loop_manager.remove_cleanup_worktree(
+                    repo, worktree, assessment, state_dir=state_dir, owner="plan:G-135")
+            self.assertEqual(result.status, "unverifiable")
+            self.assertTrue(worktree.exists())
+            self.assertFalse(loop_manager._recover_managed_worktree_removal(state_dir, repo, worktree))
+            self.assertEqual(list((state_dir / "manager-git-journal").glob("*/active.json")), [])
+            fresh = loop_manager.assess_cleanup(worktree, head)
+            self.assertEqual(fresh.status, "safe")
+            self.assertEqual(loop_manager.remove_cleanup_worktree(
+                repo, worktree, fresh, state_dir=state_dir, owner="plan:G-135").status, "safe")
 
     def test_planning_cleanup_accepts_ignored_artifact_but_preserves_dirty_workspace(self):
         with tempfile.TemporaryDirectory() as directory:

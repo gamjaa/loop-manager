@@ -9,8 +9,7 @@ from unittest import mock
 
 import loop_manager as lm
 from loop_manager_internal.documents import guidance_approval as ga
-from tests.support.guidance import PATCH, guidance_plan
-from tests.test_guidance_approval import active_connection, git, repository
+from tests.support.guidance import PATCH, active_connection, git, guidance_plan, repository
 
 
 class GuidancePreapprovalTests(unittest.TestCase):

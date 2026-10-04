@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 _current_writer: ContextVar[EventWriter | None] = ContextVar("verify_events", default=None)
+_fixture_timing_active: ContextVar[bool] = ContextVar("fixture_timing_active", default=False)
 
 
 class EventWriter:
@@ -120,33 +121,40 @@ class TimedResult(unittest.TextTestResult):
 @contextmanager
 def fixture_timing():
     """load_tests의 suite 구조를 유지하며 표준 fixture hook을 기록한다."""
-    names = ("_handleClassSetUp", "_tearDownPreviousClass", "_handleModuleFixture", "_handleModuleTearDown")
-    with ExitStack() as patches:
-        for name in names:
-            original = getattr(unittest.TestSuite, name)
-
-            def measured(suite, *args, _name=name, _original=original):
-                test = args[0] if len(args) == 2 else None
-                result = args[-1]
-                previous = getattr(result, "_previousTestClass", None)
-                current = test.__class__ if test is not None else None
-                if _name == "_handleClassSetUp":
-                    changed, owner = current != previous, current
-                elif _name == "_tearDownPreviousClass":
-                    changed, owner = previous is not None and current != previous, previous
-                elif _name == "_handleModuleFixture":
-                    changed = previous is None or previous.__module__ != current.__module__
-                    owner = current.__module__
-                else:
-                    changed, owner = previous is not None, previous.__module__ if previous else None
-                if changed:
-                    label = owner if isinstance(owner, str) else f"{owner.__module__}.{owner.__qualname__}"
-                    with phase(f"fixture:{_name}:{label}"):
-                        return _original(suite, *args)
-                return _original(suite, *args)
-
-            patches.enter_context(mock.patch.object(unittest.TestSuite, name, measured))
+    if _fixture_timing_active.get():
         yield
+        return
+    token = _fixture_timing_active.set(True)
+    names = ("_handleClassSetUp", "_tearDownPreviousClass", "_handleModuleFixture", "_handleModuleTearDown")
+    try:
+        with ExitStack() as patches:
+            for name in names:
+                original = getattr(unittest.TestSuite, name)
+
+                def measured(suite, *args, _name=name, _original=original):
+                    test = args[0] if len(args) == 2 else None
+                    result = args[-1]
+                    previous = getattr(result, "_previousTestClass", None)
+                    current = test.__class__ if test is not None else None
+                    if _name == "_handleClassSetUp":
+                        changed, owner = current != previous, current
+                    elif _name == "_tearDownPreviousClass":
+                        changed, owner = previous is not None and current != previous, previous
+                    elif _name == "_handleModuleFixture":
+                        changed = previous is None or previous.__module__ != current.__module__
+                        owner = current.__module__
+                    else:
+                        changed, owner = previous is not None, previous.__module__ if previous else None
+                    if changed:
+                        label = owner if isinstance(owner, str) else f"{owner.__module__}.{owner.__qualname__}"
+                        with phase(f"fixture:{_name}:{label}"):
+                            return _original(suite, *args)
+                    return _original(suite, *args)
+
+                patches.enter_context(mock.patch.object(unittest.TestSuite, name, measured))
+            yield
+    finally:
+        _fixture_timing_active.reset(token)
 
 
 def atomic_json(path: Path, value):
