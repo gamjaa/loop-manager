@@ -22,6 +22,8 @@ fast = gpt-5.6-luna
 
 [codex.roles]
 planner = strong,xhigh
+; 읽기 전용 점검 Planner. 생략하면 planner 값을 사용한다.
+planner_check = strong,xhigh
 ; 유지보수 평가·관계 검토·계획에 사용할 Model alias,Effort. 기존 설정에서 생략하면 planner를 사용한다.
 maintenance_planner = strong,xhigh
 reviewer = strong,high
@@ -43,6 +45,8 @@ fast = claude-haiku-4-5-20251001
 
 [claude.roles]
 planner = strong,high
+; 생략하면 planner 값을 사용한다.
+planner_check = strong,high
 maintenance_planner = strong,high
 reviewer = strong,high
 

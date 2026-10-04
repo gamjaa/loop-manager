@@ -105,6 +105,31 @@ class RunnerTests(TestCase):
             ("reviewer", "G-039", "revision", "reviewer-session"),
         ])
 
+    def test_planner_check_ledger_keeps_role_profile_session_and_usage(self):
+        class Provider:
+            def run(self, request):
+                self_outer.assertEqual(request.role_name, "planner_check")
+                self_outer.assertTrue(request.read_only)
+                self_outer.assertEqual((request.profile.model, request.profile.effort), ("check-model", "low"))
+                request.on_session_started("check-session")
+                return manager.AgentResult(0, "checked", "check-session",
+                                           usage=invocation.Usage(input_tokens=12, output_tokens=3))
+
+        self_outer = self
+        with mock.patch.object(manager, "_agent_profile", return_value=manager.AgentProfile("check-model", "low")), \
+             mock.patch.object(manager, "agent_provider", return_value=Provider()):
+            result = manager.run_agent(
+                "codex", Path("/worktree"), Path("/state"), Path("/config"),
+                "planner_check", "secret prompt", read_only=True,
+                connection=self.connection,
+                invocation=invocation.InvocationContext("repo", None),
+            )
+        self.assertEqual(result.code, 0)
+        row = self.connection.execute(
+            "SELECT role, model, effort, session_id, input_tokens, output_tokens FROM agent_invocations"
+        ).fetchone()
+        self.assertEqual(tuple(row), ("planner_check", "check-model", "low", "check-session", 12, 3))
+
     def test_ledger_failure_does_not_change_agent_success(self):
         self.connection.execute("DROP TABLE agent_invocations")
 

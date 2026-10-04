@@ -53,17 +53,20 @@ def run_scoped_planner_turn(
     """Run one turn, preserving session writes and failed scope evidence.
 
     Callback exceptions propagate; consumers retain their own error priorities
-    and result validation. Scope cleanup follows only a successful scope check.
+    and result validation. Read-only check scope stays available until its
+    caller validates the result; other roles retain their existing cleanup.
     """
     before = agent.begin_scope(role, worktree)
-    profile = {"profile_role": "maintenance_planner"} if role == "maintenance_planner" else {}
+    profile = {"profile_role": role} if role in {"maintenance_planner", "planner_check"} else {}
+    if role == "planner_check":
+        read_only = True
     if read_only:
         profile["read_only"] = True
     result = agent.run_planner(worktree, prompt, session_id, save_session, **profile)
     if result.session_id:
         save_session(result.session_id)
     scope = agent.finish_scope(role, worktree, before)
-    if not scope.error:
+    if not scope.error and role != "planner_check":
         agent.clear_scope(repo)
     return result, scope
 
@@ -113,6 +116,22 @@ class _PlanningAgentPorts:
         *, profile_role: str | None = None, read_only: bool = False,
     ) -> PlanningAgentResult:
         context = self._context
+        role_name = "planner_check" if profile_role == "planner_check" else "planner"
+        if role_name == "planner_check":
+            read_only = True
+        if session_id is not None:
+            try:
+                prior = self._connection.execute(
+                    "SELECT role FROM agent_invocations WHERE repo = ? AND session_id = ? "
+                    "ORDER BY rowid DESC LIMIT 1", (context.repo, session_id),
+                ).fetchone()
+            except sqlite3.OperationalError as error:
+                if role_name == "planner_check" or "no such table: agent_invocations" not in str(error):
+                    raise RuntimeError("점검 Planner session 기록을 확인할 수 없습니다.")
+                prior = None  # Legacy Planner fixtures may have no invocation ledger.
+            if (role_name == "planner_check" and (prior is None or prior[0] != role_name)
+                    or role_name == "planner" and prior is not None and prior[0] == "planner_check"):
+                raise RuntimeError("점검 Planner session 역할이 일치하지 않습니다.")
         guard = self._planner_mutex or contextlib.nullcontext()
         with guard:
             profile_arguments = {}
@@ -135,7 +154,7 @@ class _PlanningAgentPorts:
                     worktree,
                     context.state_dir,
                     context.config_path,
-                    "planner",
+                    role_name,
                     prompt,
                     read_only=read_only,
                     persist_session=True,

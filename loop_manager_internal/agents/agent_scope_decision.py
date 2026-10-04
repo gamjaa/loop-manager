@@ -136,6 +136,7 @@ def used_git_resources(*, role: str, phase: str, base_branch: str,
     """Unknown roles/stages retain repository-wide comparison."""
     stages = {
         "planner": {"PLANNING", "PLAN_BLOCKED"},
+        "planner_check": {"PLANNING", "PLAN_BLOCKED"},
         "maintenance_planner": {"PLANNING", "PLAN_BLOCKED"},
         "worker": {"WORKING", "IMPLEMENTING", "VERIFYING", "REVIEWING", "PUBLISHING", "PLAN_BLOCKED"},
         "reviewer": {"REVIEWING", "PUBLISHING", "PLAN_BLOCKED"},
@@ -311,7 +312,7 @@ def decide_persisted_scope(
     manager_refs: frozenset[str] = frozenset(),
 ) -> ScopeDecision:
     """Describe ordered scope checks without reading Git or persisted state."""
-    if role not in {"planner", "maintenance_planner", "worker", "reviewer"}:
+    if role not in {"planner", "planner_check", "maintenance_planner", "worker", "reviewer"}:
         raise ScopeDecisionError(f"저장된 Agent 역할이 유효하지 않습니다: {role or '없음'}")
     if role == "worker" and not selected_plan_path:
         raise ScopeDecisionError("저장된 Worker ExecPlan 경로가 없습니다.")

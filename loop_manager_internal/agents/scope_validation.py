@@ -71,10 +71,11 @@ def _agent_git_resources(
                 or saved.scope_start_digest != before.scope_start_digest
                 or owner['agent_role'] != role or owner['worktree'] != str(worktree)):
             return None
-        if role in {'planner', 'maintenance_planner'}:
+        if role in {'planner', 'planner_check', 'maintenance_planner'}:
             plan_id = None
         session_key = 'planner_session_id' if role in {'planner', 'maintenance_planner'} else f'{role}_session_id'
-        session_id = owner[session_key]
+        session_id = (agent_invocation_state.InvocationRepository(connection).latest_scope_session(before.scope_id)
+                      if role == 'planner_check' else owner[session_key])
         invocation_role = role
         if role == 'maintenance_planner':
             # Maintenance units own their sessions in their own state tables;
@@ -375,7 +376,7 @@ def validate_agent_scope(
                 allowed_guidance_targets,
                 allow_common_plans,
             )
-        elif role_name == "reviewer":
+        elif role_name in {"reviewer", "planner_check"}:
             allowed = False
         else:
             raise ValueError(f"알 수 없는 Agent 역할입니다: {role_name}")
