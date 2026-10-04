@@ -603,7 +603,7 @@ def _write_new(path: Path, value: Mapping[str, Any]) -> None:
     _sync_directory(path.parent)
 
 
-def _read(path: Path) -> dict[str, Any]:
+def _read(path: Path, *, require_rebase_branch: bool = False) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as error:
@@ -646,6 +646,11 @@ def _read(path: Path) -> dict[str, Any]:
                         for item in (before, expected))
         if not valid:
             raise MutationEvidenceError("Manager Git intent의 중첩 근거가 유효하지 않습니다.")
+        # Partial rebase audits remain readable; a sealed transition needs
+        # the branch before it can provide mutation evidence.
+        if (require_rebase_branch and value.get('kind') == 'managed_rebase'
+                and not expected.get('branch')):
+            raise MutationEvidenceError("Manager rebase 저장 intent에 branch가 없습니다.")
     elif path.name.endswith('.result.json'):
         if (not isinstance(value.get('id'), str)
                 or not isinstance(value.get('status'), str)
@@ -1221,7 +1226,8 @@ def verified_managed_transitions(
             # own result remains unavailable until active-intent cleanup ends.
             if result.get("id") == active_id or result.get("status") != "complete":
                 continue
-            intent = _read(slot / f"{result.get('id')}.intent.json")
+            intent = _read(slot / f"{result.get('id')}.intent.json",
+                           require_rebase_branch=True)
             if kind is not None and (intent.get('kind') != kind or intent.get('target') != target):
                 raise MutationEvidenceError('Manager Git resource identity differs')
             if intent.get("repo") != repo or intent.get("owner") != owner:

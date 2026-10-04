@@ -12,6 +12,26 @@ REF = "refs/remotes/origin/main"
 
 
 class ManagerGitTransitionTests(unittest.TestCase):
+    def test_sealed_rebase_without_branch_is_refused_as_mutation_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            token = journal.begin_rebase(
+                state, owner='plan:G-099', repo='/repo', target='/worktree',
+                before={'head': OLD}, expected={'run_id': 'saved-run'},
+            )
+            journal.complete_rebase(
+                state, repo='/repo', target='/worktree',
+                observe=lambda: {'head': NEW}, validate=lambda *_: {},
+            )
+            slot = journal._slot(state, '/repo', 'managed_rebase', '/worktree')
+            intent_path = slot / f'{token}.intent.json'
+            result_path = slot / f'{token}.result.json'
+            original_intent, original_result = intent_path.read_bytes(), result_path.read_bytes()
+            with self.assertRaises(journal.MutationEvidenceError):
+                journal.verified_managed_transitions(state, '/repo', 'plan:G-099')
+            self.assertEqual(intent_path.read_bytes(), original_intent)
+            self.assertEqual(result_path.read_bytes(), original_result)
+
     def test_damaged_nested_intent_refuses_replay_without_git_write(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
