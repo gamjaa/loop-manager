@@ -5,7 +5,10 @@ import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from types import SimpleNamespace
 import loop_manager
+from loop_manager_internal.recovery import blocked_agent_service
+from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 from tests.support.git import git_command, advance_remote_file
 from tests.support.worker import isolated_scope_resources
 from tests.support.worker import dummy_worker_sessions
@@ -539,3 +542,117 @@ class ScopeRebaseRecoveryTest(AgentScopeFixture, unittest.TestCase):
             self.assertIn("Reviewer mutation.", stashed_plan)
             resumed_agent.assert_called_once()
             self.assertEqual(resumed_agent.call_args.args[3], "worker")
+
+
+class BlockedAgentBaselineResumeUnitTests(unittest.TestCase):
+    def test_interrupted_dirty_baseline_restore_reuses_verified_tree(self):
+        connection = sqlite3.connect(':memory:')
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        connection.execute(loop_manager.SCHEMA)
+        loop_manager._ensure_execplans_schema(connection)
+        loop_manager.scoped_blocking.ensure_schema(connection)
+        loop_manager.blocked_checkpoint_state.ensure_schema(connection)
+        before = loop_manager.GitSnapshot(
+            'a' * 40, 'loop-manager/G-001', {},
+            {'notes.txt': (('unstaged',), 'saved-content')}, {}, {}, {}, {})
+        clean = loop_manager.GitSnapshot(
+            before.head, before.branch, {}, {}, {}, {}, {}, {})
+        baseline = json.dumps({'worktree_tree': 'b' * 40, 'index_tree': 'c' * 40})
+        recovery = dict(version=1, state='stashed', source_snapshot=before.serialize(),
+                        original_head=before.head, violation_head=before.head,
+                        branch=before.branch, stash_marker='owned-stash', stash_oid='stash',
+                        violation_ref='refs/loop-manager/diagnostic/test')
+        connection.execute(
+            'INSERT INTO projects (repo, base_branch, phase, agent_snapshot, agent_baseline, agent_recovery) '
+            'VALUES (?, ?, ?, ?, ?, ?)',
+            ('repo', 'main', 'PLAN_BLOCKED', before.serialize(), baseline, json.dumps(recovery)))
+        connection.execute(
+            "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, priority, "
+            "content_hash, status, branch, worktree, workspace_owned) "
+            "VALUES ('repo', 'G-001', 'docs/plans/[G-001] Work.md', 'Work', '[]', '[]', "
+            "'high', 'hash', 'PLAN_BLOCKED', 'loop-manager/G-001', '/state/G-001', 1)"
+        )
+        connection.execute(
+            "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+            "VALUES ('repo', 'G-001', 'plan', 'default_worktree_mutation', 'saved cause')"
+        )
+        connection.execute(
+            "INSERT INTO blocked_checkpoints (repo, plan_id, request_identity, phase, reason_code, evidence) "
+            "VALUES ('repo', 'G-001', 'owned-request', 'requested', 'default_worktree_mutation', 'saved cause')"
+        )
+        block = dict(connection.execute(
+            "SELECT * FROM execplan_blocks WHERE plan_id = 'G-001'").fetchone())
+        recovery.update(owner_plan_id='G-001', owner_block=block,
+                        owner_request_identity='owned-request', checkpoint_generation=0)
+        connection.execute(
+            "UPDATE projects SET agent_recovery = ? WHERE repo = 'repo'",
+            (json.dumps(recovery),))
+        connection.commit()
+
+        def update_project(db, repo, **values):
+            db.execute('UPDATE projects SET agent_recovery = ? WHERE repo = ?',
+                       (values['agent_recovery'], repo))
+            db.commit()
+
+        def effects(*, interrupted, observed=clean):
+            port = mock.Mock()
+            port._deserialize_blocked_agent_recovery.side_effect = blocked_agent_service._deserialize_blocked_agent_recovery
+            port._serialize_blocked_agent_recovery.side_effect = blocked_agent_service._serialize_blocked_agent_recovery
+            port._blocked_recovery_stash_oid.return_value = 'stash'
+            port._config_entries.return_value = before.config
+            port.capture_git_snapshot.side_effect = [observed, before]
+            port._same_local_snapshot.return_value = False
+            port._recovered_agent_local_state_matches.side_effect = [False, True]
+            port.update_project.side_effect = update_project
+            port.git.side_effect = lambda _worktree, command, *args: SimpleNamespace(
+                stdout=('b' * 40 if command == 'write-tree' else 'd' * 40))
+            if interrupted:
+                port._restore_agent_baseline.side_effect = KeyboardInterrupt()
+            return port
+
+        first = effects(interrupted=True)
+        with self.assertRaises(KeyboardInterrupt):
+            blocked_agent_service._complete_blocked_agent_recovery(
+                first, connection, 'repo', Path('/state/G-001'))
+        saved = json.loads(connection.execute(
+            "SELECT agent_recovery FROM projects WHERE repo = 'repo'").fetchone()[0])
+        self.assertEqual(saved['state'], 'restoring_baseline')
+
+        changed = loop_manager.GitSnapshot(
+            before.head, before.branch, {},
+            {'notes.txt': (('unstaged',), 'later-user-edit')}, {}, {}, {}, {})
+        unsafe = effects(interrupted=False, observed=changed)
+        with self.assertRaises(loop_manager.AgentScopeError):
+            blocked_agent_service._complete_blocked_agent_recovery(
+                unsafe, connection, 'repo', Path('/state/G-001'))
+        unsafe._restore_agent_baseline.assert_not_called()
+
+        connection.execute('SAVEPOINT changed_cause')
+        connection.execute(
+            "UPDATE blocked_checkpoints SET request_identity = 'new-cause' WHERE plan_id = 'G-001'")
+        stale_cause = effects(interrupted=False)
+        with self.assertRaises(loop_manager.AgentScopeError):
+            blocked_agent_service._complete_blocked_agent_recovery(
+                stale_cause, connection, 'repo', Path('/state/G-001'))
+        stale_cause._restore_agent_baseline.assert_not_called()
+        connection.execute('ROLLBACK TO changed_cause')
+        connection.execute('RELEASE changed_cause')
+
+        connection.execute('SAVEPOINT stale_generation')
+        ExecutionCheckpointRepository(connection).record(
+            'repo', 'G-001', expected_generation=0, operation=None,
+            expected_head=None, target_base_oid=None, observed_remote_oid=None, snapshot=None)
+        stale = effects(interrupted=False)
+        with self.assertRaises(loop_manager.AgentScopeError):
+            blocked_agent_service._complete_blocked_agent_recovery(
+                stale, connection, 'repo', Path('/state/G-001'))
+        stale._restore_agent_baseline.assert_not_called()
+        connection.execute('ROLLBACK TO stale_generation')
+        connection.execute('RELEASE stale_generation')
+
+        restarted = effects(interrupted=False)
+        blocked_agent_service._complete_blocked_agent_recovery(
+            restarted, connection, 'repo', Path('/state/G-001'))
+        restarted._restore_agent_baseline.assert_called_once()
+        restarted._mark_blocked_agent_isolated.assert_called_once()

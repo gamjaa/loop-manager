@@ -568,28 +568,22 @@ def dispatch_blocked_checkpoints(
         results,
         max_push_attempts=MAX_TRANSIENT_AGENT_RETRIES,
     )
-    try:
-        return dispatcher.dispatch(repo, skip_identities=skip_identities)
-    except blocked_checkpoint.CheckpointPushError as error:
-        for request in repository.pending(repo):
-            if request.request_identity in skip_identities:
-                continue
+    completed = 0
+    for request in repository.pending(repo):
+        if request.request_identity in skip_identities:
+            continue
+        try:
+            completed += int(dispatcher._dispatch_one(request))
+        except blocked_checkpoint.CheckpointPushError as error:
+            repository.finish_unpublished(request, str(error), retryable=error.retryable)
+            # A failed observation says nothing about requests not yet tried.
+            break
+        except (OSError, RuntimeError) as error:
             repository.finish_unpublished(
-                request, str(error), retryable=error.retryable
+                request, f"checkpoint 처리 실패: {error}", retryable=True,
             )
-            results.finalized(request)
-        return 0
-    except (OSError, RuntimeError) as error:
-        for request in repository.pending(repo):
-            if request.request_identity in skip_identities:
-                continue
-            repository.finish_unpublished(
-                request,
-                f"checkpoint 처리 실패: {error}",
-                retryable=True,
-            )
-            results.finalized(request)
-        return 0
+            break
+    return completed
 
 
 def _execution_outcome_step_result(outcome: ExecutionOutcome) -> int:

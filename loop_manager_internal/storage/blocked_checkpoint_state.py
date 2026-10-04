@@ -520,14 +520,65 @@ class DiagnosticPublicationRepository:
         return row
 
     def result(self, repo, plan_id, cause_identity, payload, *, intent=None):
+        from loop_manager_internal.recovery import scoped_blocking
+
         with self.connection:
+            block = scoped_blocking.project_block(self.connection, repo)
+            plan = self.connection.execute(
+                'SELECT branch, worktree FROM exec_plans WHERE repo = ? AND plan_id = ?',
+                (repo, plan_id),
+            ).fetchone()
+            if (block is None or block['plan_id'] != plan_id or plan is None
+                    or scoped_blocking.project_cause_identity(block) != cause_identity):
+                raise RuntimeError('진단 결과의 project 원인 또는 계획 소유권이 변경됐습니다.')
             if intent is not None:
-                if payload.get('commit_oid') != intent['head_oid'] or payload.get('branch') != intent['ref']:
-                    raise RuntimeError('진단 ref·확인 OID가 저장된 intent와 다릅니다.')
-                self.connection.execute(
-                    'UPDATE blocked_diagnostic_publications SET confirmed_oid = head_oid '
+                request = self.connection.execute(
+                    'SELECT branch, worktree FROM blocked_checkpoints '
+                    'WHERE repo = ? AND plan_id = ?', (repo, plan_id),
+                ).fetchone()
+                current_intent = self.connection.execute(
+                    'SELECT * FROM blocked_diagnostic_publications '
                     'WHERE repo = ? AND plan_id = ? AND ref = ?',
+                    (repo, plan_id, intent['ref']),
+                ).fetchone()
+                if (request is None or request['branch'] != plan['branch']
+                        or request['worktree'] != plan['worktree']
+                        or payload.get('result') != 'published'
+                        or payload.get('diagnostic') is not True
+                        or payload.get('original_branch') != plan['branch']
+                        or payload.get('base_oid') != intent['base_oid']
+                        or current_intent is None or any(
+                        current_intent[field] != intent[field] for field in
+                        ('repo', 'plan_id', 'ref', 'original_branch', 'base_oid',
+                         'head_oid', 'tree_oid', 'cause'))
+                        or intent['repo'] != repo or intent['plan_id'] != plan_id
+                        or intent['original_branch'] != plan['branch']
+                        or intent['cause'] != block['evidence']
+                        or payload.get('commit_oid') != intent['head_oid']
+                        or payload.get('branch') != intent['ref']):
+                    raise RuntimeError('진단 ref·확인 OID가 저장된 intent와 다릅니다.')
+                changed = self.connection.execute(
+                    'UPDATE blocked_diagnostic_publications SET confirmed_oid = head_oid '
+                    'WHERE repo = ? AND plan_id = ? AND ref = ? '
+                    'AND (confirmed_oid IS NULL OR confirmed_oid = head_oid)',
                     (repo, plan_id, intent['ref']))
+                if changed.rowcount != 1:
+                    raise RuntimeError('진단 게시 intent 결과가 변경됐습니다.')
+            elif payload.get('result') == 'published':
+                request = self.connection.execute(
+                    'SELECT branch, worktree, phase, remote_oid FROM blocked_checkpoints '
+                    'WHERE repo = ? AND plan_id = ?', (repo, plan_id),
+                ).fetchone()
+                if (request is None or request['phase'] != 'published'
+                        or request['branch'] != plan['branch']
+                        or request['worktree'] != plan['worktree']
+                        or payload.get('branch') != request['branch']
+                        or payload.get('commit_oid') != request['remote_oid']):
+                    raise RuntimeError('원래 branch 게시 결과의 소유권이 변경됐습니다.')
+            elif (payload.get('result') != 'local_only'
+                  or payload.get('original_branch') != plan['branch']
+                  or payload.get('worktree') != plan['worktree']):
+                raise RuntimeError('local-only 진단 결과의 계획 identity가 변경됐습니다.')
             self.connection.execute(
                 'INSERT INTO project_checkpoint_results VALUES (?, ?, ?, ?) '
                 'ON CONFLICT(repo, plan_id) DO UPDATE SET cause_identity = excluded.cause_identity, '

@@ -254,6 +254,19 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
             return False
         effects._clear_project_block_without_losing_planning_error(connection, repo, project)
         if scoped_blocking.is_scope_baseline_block(block):
+            current_checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+                repo, plan_id)
+            if current_checkpoint != checkpoint:
+                raise RuntimeError('project scope 차단 해제 중 checkpoint generation이 변경됐습니다.')
+            execution_checkpoint_state.ExecutionCheckpointRepository(connection).record(
+                repo, plan_id, expected_generation=checkpoint.generation,
+                operation=checkpoint.operation, expected_head=checkpoint.expected_head,
+                target_base_oid=checkpoint.target_base_oid,
+                observed_remote_oid=checkpoint.observed_remote_oid,
+                snapshot={**(checkpoint.snapshot or {}), 'scope_block_release_audit': [
+                    *(checkpoint.snapshot or {}).get('scope_block_release_audit', ()),
+                    {'block': dict(block), 'candidate': checked.serialize() if checked else None}]},
+            )
             recovery_state.RecoveryRepository(connection).resolve_rebase_block(repo, plan_id, block)
         if str(plan["status"]) in ACTIVE_EXECPLAN_STATUSES:
             effects.hydrate_execplan_project(connection, repo, plan)

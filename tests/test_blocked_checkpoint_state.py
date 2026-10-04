@@ -1,9 +1,12 @@
 import sqlite3
 import unittest
+from pathlib import Path
 from unittest import mock
 from loop_manager_internal.notifications import notifications
 
 from loop_manager_internal.recovery import blocked_checkpoint
+from loop_manager_internal.recovery import checkpoint_service
+from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.storage import blocked_checkpoint_state
 import loop_manager
 from loop_manager_internal.storage import runtime_state
@@ -12,6 +15,7 @@ from loop_manager_internal.storage import runtime_state
 class BlockedCheckpointRepositoryTest(unittest.TestCase):
     def test_diagnostic_intent_reuse_does_not_promote_original_ownership(self):
         request = self.request()
+        cause = self.diagnostic_cause('original failure')
         repository = blocked_checkpoint_state.DiagnosticPublicationRepository(self.connection)
         original = dict(self.connection.execute('SELECT * FROM exec_plans').fetchone())
         intent = repository.intent(request, base_oid='a' * 40, head_oid='b' * 40,
@@ -19,26 +23,69 @@ class BlockedCheckpointRepositoryTest(unittest.TestCase):
         reused = repository.intent(request, base_oid='a' * 40, head_oid='b' * 40,
                                    tree_oid='c' * 40, cause='later observation')
         self.assertEqual(dict(intent), dict(reused))
-        payload = dict(result='published', diagnostic=True, branch=intent['ref'], commit_oid='b' * 40)
-        repository.result('repo', 'G-034', 'cause', payload, intent=intent)
-        repository.result('repo', 'G-034', 'cause', payload, intent=intent)
+        payload = dict(result='published', diagnostic=True, branch=intent['ref'], commit_oid='b' * 40,
+                       original_branch=request.branch, base_oid='a' * 40)
+        repository.result('repo', 'G-034', cause, payload, intent=intent)
+        repository.result('repo', 'G-034', cause, payload, intent=intent)
         self.assertEqual(dict(self.connection.execute('SELECT * FROM exec_plans').fetchone()), original)
         self.assertIsNone(self.connection.execute('SELECT accepted_remote_oid FROM blocked_checkpoints').fetchone()[0])
         self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM blocked_diagnostic_publications').fetchone()[0], 1)
         self.assertEqual(self.connection.execute('SELECT confirmed_oid FROM blocked_diagnostic_publications').fetchone()[0], 'b' * 40)
         with self.assertRaises(RuntimeError):
-            repository.result('repo', 'G-034', 'cause', {**payload, 'commit_oid': 'd' * 40}, intent=intent)
+            repository.result('repo', 'G-034', cause, {**payload, 'commit_oid': 'd' * 40}, intent=intent)
 
     def test_diagnostic_result_and_notification_rollback_together(self):
         request = self.request()
+        cause = self.diagnostic_cause()
         repository = blocked_checkpoint_state.DiagnosticPublicationRepository(self.connection)
         intent = repository.intent(request, base_oid='a' * 40, head_oid='b' * 40, tree_oid='c' * 40, cause='failure')
         with mock.patch.object(notifications, 'enqueue_current_project_events', side_effect=KeyboardInterrupt):
             with self.assertRaises(KeyboardInterrupt):
-                repository.result('repo', 'G-034', 'cause',
-                                  dict(result='published', branch=intent['ref'], commit_oid='b' * 40), intent=intent)
+                repository.result('repo', 'G-034', cause,
+                                  dict(result='published', diagnostic=True, branch=intent['ref'],
+                                       commit_oid='b' * 40, original_branch=request.branch,
+                                       base_oid='a' * 40), intent=intent)
         self.assertIsNone(self.connection.execute('SELECT confirmed_oid FROM blocked_diagnostic_publications').fetchone()[0])
         self.assertIsNone(self.connection.execute('SELECT * FROM project_checkpoint_results').fetchone())
+
+    def test_diagnostic_result_rejects_stale_cause_and_missing_intent_row(self):
+        request = self.request()
+        cause = self.diagnostic_cause()
+        repository = blocked_checkpoint_state.DiagnosticPublicationRepository(self.connection)
+        intent = repository.intent(request, base_oid='a' * 40, head_oid='b' * 40,
+                                   tree_oid='c' * 40, cause='failure')
+        payload = dict(result='published', diagnostic=True, branch=intent['ref'], commit_oid='b' * 40,
+                       original_branch=request.branch, base_oid='a' * 40)
+        with self.assertRaises(RuntimeError):
+            repository.result('repo', 'G-034', 'stale-cause', payload, intent=intent)
+        self.connection.execute('DELETE FROM blocked_diagnostic_publications')
+        with self.assertRaises(RuntimeError):
+            repository.result('repo', 'G-034', cause, payload, intent=intent)
+        self.assertIsNone(self.connection.execute('SELECT * FROM project_checkpoint_results').fetchone())
+
+    def test_transient_checkpoint_observation_keeps_unattempted_request_pending(self):
+        first = self.request()
+        self.connection.execute(
+            "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, priority, "
+            "content_hash, status, branch, worktree, workspace_owned) "
+            "VALUES ('repo', 'G-035', 'docs/plans/[G-035] Other.md', 'Other', '[]', '[]', "
+            "'critical', 'hash', 'PLAN_BLOCKED', 'loop-manager/G-035', '/state/G-035', 1)"
+        )
+        second = self.repository.request(
+            repo='repo', plan_id='G-035', reason_code='verify_retry_exhausted',
+            evidence='other failure', branch='loop-manager/G-035', worktree='/state/G-035',
+            expected_remote_oid=None, rebase_recovery=False,
+        )
+        effects = checkpoint_service.DispatchBlockedCheckpointsEffects(
+            _BlockedCheckpointAdapter=lambda *_args: mock.Mock())
+        with mock.patch.object(
+                blocked_checkpoint.BlockedCheckpointDispatcher, '_dispatch_one',
+                side_effect=RuntimeError('PR observation unavailable')) as attempted:
+            self.assertEqual(checkpoint_service.dispatch_blocked_checkpoints(
+                effects, self.connection, Path('/repo'), Path('/state'), 'repo'), 0)
+        attempted.assert_called_once_with(first)
+        self.assertEqual(self.repository.get('repo', first.plan_id).phase.value, 'retry_pending')
+        self.assertEqual(self.repository.get('repo', second.plan_id).phase.value, 'requested')
 
     def setUp(self):
         self.connection = sqlite3.connect(":memory:")
@@ -112,6 +159,15 @@ class BlockedCheckpointRepositoryTest(unittest.TestCase):
             rebase_recovery=False,
             release_fingerprint=release_fingerprint,
         )
+
+    def diagnostic_cause(self, evidence='failure'):
+        self.connection.execute(
+            "INSERT INTO project_blocks (repo, scope, reason_code, plan_id, evidence) "
+            "VALUES ('repo', 'project', 'repository_state_unsafe', 'G-034', ?)",
+            (evidence,),
+        )
+        return scoped_blocking.project_cause_identity(
+            scoped_blocking.project_block(self.connection, 'repo'))
 
     def test_request_and_phase_progress_are_durable_and_idempotent(self):
         request = self.request()
