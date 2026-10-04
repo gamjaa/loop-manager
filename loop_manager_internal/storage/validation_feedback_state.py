@@ -363,17 +363,32 @@ class ValidationFeedbackRepository:
                                 continue
                             feedback = normalize_feedback(stage, str(raw))
                         if feedback:
-                            if self.connection.execute(
-                                "SELECT 1 FROM validation_results WHERE repo=? AND plan_id=? "
-                                "AND stage=? AND classification='legacy_failure' LIMIT 1",
+                            existing = self.connection.execute(
+                                "SELECT id,raw_output,identities FROM validation_results "
+                                "WHERE repo=? AND plan_id=? AND stage=? "
+                                "AND classification='legacy_failure' ORDER BY id DESC LIMIT 1",
                                 (repo, plan_id, stage),
-                            ).fetchone():
-                                continue
-                            result_id = self._result(
-                                repo, plan_id, row["current_revision_sha"],
-                                stage, "legacy_failure", str(raw), feedback,
-                            )
+                            ).fetchone()
+                            if existing is not None:
+                                if (existing["raw_output"] != str(raw)
+                                        or json.loads(existing["identities"]) !=
+                                        [item.identity for item in feedback]):
+                                    raise ValueError("legacy audit differs from source")
+                                result_id = existing["id"]
+                            else:
+                                result_id = self._result(
+                                    repo, plan_id, row["current_revision_sha"],
+                                    stage, "legacy_failure", str(raw), feedback,
+                                )
                             for item in feedback:
+                                # Older imports could stop after the result or
+                                # any event. Preserve that audit and fill gaps.
+                                if self.connection.execute(
+                                    "SELECT 1 FROM validation_feedback_events "
+                                    "WHERE result_id=? AND identity=? LIMIT 1",
+                                    (result_id, item.identity),
+                                ).fetchone():
+                                    continue
                                 if stage == "verify":
                                     fingerprint = item.identity.split(":", 1)[1]
                                 else:

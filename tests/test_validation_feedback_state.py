@@ -183,6 +183,64 @@ class ValidationFeedbackStateTests(unittest.TestCase):
             "SELECT * FROM validation_results WHERE id=?", (result_id,)).fetchone()), audit)
         self.assertEqual({row["stage"] for row in self.pending().rows}, {"verify", "review"})
 
+    def test_prior_legacy_result_with_missing_events_recovers_on_retry(self):
+        from loop_manager import validation_failure_fingerprints
+
+        self.connection.execute(
+            "CREATE TABLE exec_plans (repo TEXT,plan_id TEXT,current_revision_sha TEXT,"
+            "verify_result TEXT,review_result TEXT,verify_failure_history TEXT,"
+            "review_failure_history TEXT)"
+        )
+        raw = "ISSUE_ID: file::one::bug\nFix one\nISSUE_ID: file::two::bug\nFix two\nVERDICT: FAIL"
+        feedback = normalize_feedback("review", raw)
+        fingerprints = validation_failure_fingerprints("review", raw)
+        for saved_events in (0, 1):
+            with self.subTest(saved_events=saved_events):
+                plan = f"G-{saved_events}"
+                history = {key: {"occurrences": 3} for key, _ in fingerprints}
+                history[fingerprints[-1][0]]["occurrences"] = "invalid"
+                self.connection.execute(
+                    "INSERT INTO exec_plans VALUES (?,?,?,?,?,?,?)",
+                    ("repo", plan, "revision", None, raw, "{}", json.dumps(history)),
+                )
+                result_id = self.repo._result("repo", plan, "revision", "review",
+                                              "legacy_failure", raw, feedback)
+                for item in feedback[:saved_events]:
+                    self.repo._event(result_id, "repo", plan, "review", item.identity,
+                                     3, 1, item.diagnostic, True)
+                self.repo._mark_migrated("repo", plan)
+                audit = tuple(self.connection.execute(
+                    "SELECT * FROM validation_results WHERE id=?", (result_id,)).fetchone())
+                old_events = [tuple(row) for row in self.connection.execute(
+                    "SELECT * FROM validation_feedback_events WHERE result_id=?", (result_id,))]
+                self.repo.migrate_legacy()
+                self.assertIsNone(self.connection.execute(
+                    "SELECT 1 FROM validation_feedback_migrations WHERE plan_id=?", (plan,)).fetchone())
+                self.assertEqual(self.connection.execute(
+                    "SELECT COUNT(*) FROM validation_feedback_events WHERE result_id=?",
+                    (result_id,)).fetchone()[0], saved_events)
+                history[fingerprints[-1][0]]["occurrences"] = 3
+                self.connection.execute(
+                    "UPDATE exec_plans SET review_failure_history=? WHERE plan_id=?",
+                    (json.dumps(history), plan))
+                self.repo.migrate_legacy()
+                self.repo.migrate_legacy()
+                self.assertEqual(tuple(self.connection.execute(
+                    "SELECT * FROM validation_results WHERE id=?", (result_id,)).fetchone()), audit)
+                self.assertEqual(self.connection.execute(
+                    "SELECT COUNT(*) FROM validation_results WHERE plan_id=?", (plan,)).fetchone()[0], 1)
+                events = [tuple(row) for row in self.connection.execute(
+                    "SELECT * FROM validation_feedback_events WHERE result_id=? ORDER BY sequence",
+                    (result_id,))]
+                self.assertEqual(len(events), 2)
+                self.assertEqual(events[:saved_events], old_events)
+                self.assertIsNotNone(self.connection.execute(
+                    "SELECT 1 FROM validation_feedback_migrations WHERE plan_id=?", (plan,)).fetchone())
+                delivery = self.repo.prepare("repo", plan, "session")
+                self.assertEqual({row["identity"] for row in delivery.rows},
+                                 {item.identity for item in feedback})
+                self.assertEqual([row["occurrence"] for row in delivery.rows], [3, 3])
+
     def test_repetition_changed_diagnostic_resolution_and_recurrence(self):
         first = Feedback("verify", "verify:A", "failure A")
         changed = Feedback("verify", "verify:A", "failure A at new line")
