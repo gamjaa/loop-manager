@@ -109,10 +109,10 @@ def _revision_execplan_body_hash(
     revision: str,
     path: str,
 ) -> str:
-    shown = effects.git(repo_path, "show", f"{revision}:{path}", check=False)
-    if shown.returncode:
+    contents = revision_document_or_none(effects.git, repo_path, revision, path)
+    if contents is None:
         raise RuntimeError(f"최신 ExecPlan 본문을 읽을 수 없습니다: {path}")
-    return execution_revision.execplan_body_hash(shown.stdout)
+    return execution_revision.execplan_body_hash(contents)
 
 
 @dataclass(frozen=True)
@@ -208,10 +208,8 @@ def _revision_review_issue_fingerprint(
         return None
     entries = []
     for relative_path in paths:
-        shown = effects.git(repo_path, "show", f"{revision}:{relative_path}", check=False)
-        entries.append(
-            (relative_path, shown.stdout if shown.returncode == 0 else None)
-        )
+        contents = revision_document_or_none(effects.git, repo_path, revision, relative_path)
+        entries.append((relative_path, contents))
     return effects._execplan_input_fingerprint(entries)
 
 

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest import TestCase, mock
 
 from loop_manager_internal.execution import execution_handlers as handlers
+from loop_manager_internal.execution import plan_validation
 from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
 from loop_manager_internal.git.command_adapter import ExternalObservationError
 import loop_manager as lm
@@ -22,7 +23,16 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
     def test_revision_document_observation_failure_preserves_worker_session(self):
         self.state.update_project('repo', worker_session_id='saved-session')
-        self.effects.revision.body_hash.side_effect = ExternalObservationError('Git read failed')
+        def git(_repo, operation, *args, **kwargs):
+            if operation == 'show':
+                raise RuntimeError('arbitrary Git failure')
+            return SimpleNamespace(returncode=0, stdout=f'100644 blob abc\t{args[-1]}\0')
+
+        self.effects.revision.body_hash.side_effect = lambda *args: (
+            plan_validation._revision_execplan_body_hash(
+                plan_validation.RevisionExecplanBodyHashEffects(git=git), *args
+            )
+        )
 
         result = self.handler.guard(self.context())
 

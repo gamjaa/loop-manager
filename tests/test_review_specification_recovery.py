@@ -91,6 +91,32 @@ class ReviewSpecificationRecoveryTest(BoundedRecoveryFixture, unittest.TestCase)
                 connection, Path('/repo'), 'repo', 'main', Path('/state'),
             ))
             requeue.assert_not_called()
+            from loop_manager_internal.execution import plan_validation
+            from loop_manager_internal.git.command_adapter import ExternalObservationError
+
+            path = 'docs/ARCHITECTURE.md'
+            observation = plan_validation.RevisionReviewIssueFingerprintEffects(
+                _execplan_input_fingerprint=plan_validation._execplan_input_fingerprint,
+                _review_issue_paths=lambda result: [path],
+                git=mock.Mock(side_effect=[
+                    RuntimeError('temporary read failure'),
+                    SimpleNamespace(returncode=0, stdout=f'100644 blob abc\t{path}\0'),
+                ]),
+            )
+            document_input.side_effect = lambda *args: (
+                plan_validation._revision_review_issue_fingerprint(observation, *args)
+            )
+            with self.assertRaises(ExternalObservationError):
+                loop_manager.resume_blocked_execplan_if_inputs_changed(
+                    connection, Path('/repo'), 'repo', 'main', Path('/state'),
+                )
+            requeue.assert_not_called()
+            row = connection.execute(
+                "SELECT status, blocked_review_fingerprint FROM exec_plans "
+                "WHERE repo = 'repo' AND plan_id = 'G-047'"
+            ).fetchone()
+            self.assertEqual(tuple(row), ('PLAN_BLOCKED', 'old-document'))
+            document_input.side_effect = None
             document_input.return_value = 'changed-architecture'
             self.assertTrue(loop_manager.resume_blocked_execplan_if_inputs_changed(
                 connection, Path('/repo'), 'repo', 'main', Path('/state'),

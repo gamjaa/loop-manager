@@ -5,6 +5,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
 import loop_manager
+from loop_manager_internal.execution import plan_validation
 from loop_manager_internal.git.command_adapter import ExternalObservationError, revision_document_or_none
 from loop_manager_internal.planning.planner_validation import (
     FutureIdeaItemsEffects, _future_idea_items, validate_planner_result,
@@ -18,6 +19,50 @@ from tests.support.worker import dummy_worker_sessions
 
 
 class RevisionDocumentObservationTests(unittest.TestCase):
+    def test_body_hash_confirmed_absence_retains_input_error(self):
+        git = mock.Mock(side_effect=[RuntimeError('missing'), SimpleNamespace(returncode=0, stdout='')])
+        with self.assertRaises(RuntimeError) as raised:
+            plan_validation._revision_execplan_body_hash(
+                plan_validation.RevisionExecplanBodyHashEffects(git=git),
+                Path('/repo'), 'base', 'docs/plans/plan.md',
+            )
+        self.assertNotIsInstance(raised.exception, ExternalObservationError)
+
+    def test_review_fingerprint_requires_confirmed_observation(self):
+        path = 'docs/PRODUCT.md'
+        for tree, expected in (
+            (SimpleNamespace(returncode=0, stdout=''), 'absent'),
+            (SimpleNamespace(returncode=0, stdout=f'100644 blob abc\t{path}\0'), 'error'),
+            (SimpleNamespace(returncode=128, stdout='unavailable'), 'error'),
+        ):
+            for failure in (RuntimeError('different diagnostic'), SimpleNamespace(returncode=128, stdout='failed')):
+                with self.subTest(tree=tree, failure=failure):
+                    fingerprint = mock.Mock(return_value='absent')
+                    effects = plan_validation.RevisionReviewIssueFingerprintEffects(
+                        _execplan_input_fingerprint=fingerprint,
+                        _review_issue_paths=lambda result: [path],
+                        git=mock.Mock(side_effect=[failure, tree]),
+                    )
+                    if expected == 'error':
+                        with self.assertRaises(ExternalObservationError):
+                            plan_validation._revision_review_issue_fingerprint(effects, Path('/repo'), 'base', {})
+                        fingerprint.assert_not_called()
+                    else:
+                        self.assertEqual(plan_validation._revision_review_issue_fingerprint(effects, Path('/repo'), 'base', {}), 'absent')
+                        fingerprint.assert_called_once_with([(path, None)])
+
+    def test_review_fingerprint_success_preserves_contents(self):
+        effects = plan_validation.RevisionReviewIssueFingerprintEffects(
+            _execplan_input_fingerprint=plan_validation._execplan_input_fingerprint,
+            _review_issue_paths=lambda result: ['docs/PRODUCT.md'],
+            git=mock.Mock(return_value=SimpleNamespace(returncode=0, stdout='unchanged')),
+        )
+        self.assertEqual(
+            plan_validation._revision_review_issue_fingerprint(effects, Path('/repo'), 'base', {}),
+            plan_validation._execplan_input_fingerprint([('docs/PRODUCT.md', 'unchanged')]),
+        )
+        effects.git.assert_called_once()
+
     def test_git_lock_keeps_its_retry_category(self):
         git = mock.Mock(side_effect=GitLockError('different lock text'))
         with self.assertRaises(GitLockError):
