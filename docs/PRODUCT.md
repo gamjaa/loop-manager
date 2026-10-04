@@ -60,7 +60,7 @@
 |---|---|
 | Planner 역할 선택·변경 중심 검토·최종 확인·draft와 Agent 문서 권한 | [R-049](requirements/archive/%5BR-049%5D%20Input-Specific%20Planner%20Roles.md), [R-057](requirements/%5BR-057%5D%20Change-Focused%20Planning%20and%20Final%20Full%20Verification.md), [R-061](requirements/%5BR-061%5D%20Agent%20Roles%20and%20Draft%20ExecPlan%20Decisions.md) |
 | Worker 최초 level·Review 승격·Planner와 Worker의 명시적 모델 설정 | [R-052](requirements/%5BR-052%5D%20Worker%20Classification%20and%20Initial%20Level%20Calibration.md) |
-| 차단 범위·비차단 로컬 base 동기화·Git 통합과 원격 보존·로컬 환경 재검사 | [R-055](requirements/%5BR-055%5D%20Blocking%20Path%20Audit%20and%20Minimal%20Interruption.md), [R-056](requirements/%5BR-056%5D%20Non-Blocking%20Local%20Base%20Synchronization.md), [R-060](requirements/%5BR-060%5D%20Collaborative%20Git%20Recovery%20and%20Remote%20Blocked%20Snapshots.md), [R-062](requirements/%5BR-062%5D%20Local%20Environment%20Recovery%20Command.md) |
+| 차단 범위·비차단 로컬 base 동기화·Git 통합과 원격 보존·로컬 환경 재검사 | [R-055](requirements/%5BR-055%5D%20Blocking%20Path%20Audit%20and%20Minimal%20Interruption.md), [R-056](requirements/%5BR-056%5D%20Non-Blocking%20Local%20Base%20Synchronization.md), [R-060](requirements/archive/%5BR-060%5D%20Collaborative%20Git%20Recovery%20and%20Remote%20Blocked%20Snapshots.md), [R-062](requirements/%5BR-062%5D%20Local%20Environment%20Recovery%20Command.md) |
 | Merge 대기 PR이 없는 due 리팩터링의 우선 처리 | [R-054](requirements/%5BR-054%5D%20Due%20Refactoring%20Priority.md) |
 | 이벤트 시점의 진행·사용자 조치 알림과 무음 구분 | [R-053](requirements/%5BR-053%5D%20Timely%20Progress%20Notifications.md) |
 | 테스트별 시간·실제 Agent 없는 테스트·안전한 Python 캐시 | [R-058](requirements/%5BR-058%5D%20Test%20Timing%20and%20Agent-Free%20Test%20Execution.md), [R-059](requirements/%5BR-059%5D%20Safe%20Python%20Bytecode%20Cache%20Use.md) |

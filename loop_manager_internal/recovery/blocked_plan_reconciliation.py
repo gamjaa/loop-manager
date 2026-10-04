@@ -255,7 +255,11 @@ class BlockedPlanReconciler:
             raise RuntimeError('원격 작업 branch가 관측 이후 변경·삭제됐습니다.')
         if not allow_published and base.oid != context['base_oid']:
             raise RuntimeError('원격 base가 관측 이후 변경됐습니다.')
-        if self.ports.pr_for_branch(self.repo_path, context['identity']['branch']) is not None:
+        try:
+            pull_request = self.ports.pr_for_branch(self.repo_path, context['identity']['branch'])
+        except (OSError, RuntimeError) as error:
+            raise AssessmentPending('차단 계획 PR 조회를 재시도합니다.') from error
+        if pull_request is not None:
             raise RuntimeError('기존 PR이 있는 작업 branch의 차단 checkpoint 복구를 거부합니다.')
         return branch.oid
 
@@ -467,7 +471,10 @@ class BlockedPlanReconciler:
         adapter = self.ports._BlockedCheckpointAdapter(self.connection, self.repo_path, self.state_dir, self.repo,
                                                      reconciliation_scope=True)
         expected = self._remote(context, allow_published=True)
-        remote = adapter.observe_remote(request)
+        try:
+            remote = adapter.observe_remote(request)
+        except (OSError, RuntimeError) as error:
+            raise AssessmentPending('차단 checkpoint 원격 조회를 재시도합니다.') from error
         if remote != expected:
             raise RuntimeError('checkpoint 게시 직전 원격 작업 branch가 변경됐습니다.')
         head = self.ports.git(Path(plan['worktree']), 'rev-parse', 'HEAD^{commit}').stdout.strip()
@@ -476,8 +483,11 @@ class BlockedPlanReconciler:
             return
         repository.refresh(request, expected_remote_oid=remote)
         results = self.ports._BlockedCheckpointResults(self.connection)
-        blocked_checkpoint.BlockedCheckpointDispatcher(repository, adapter, adapter, results)._dispatch_one(
-            repository.get(self.repo, plan['plan_id']))
+        try:
+            blocked_checkpoint.BlockedCheckpointDispatcher(repository, adapter, adapter, results)._dispatch_one(
+                repository.get(self.repo, plan['plan_id']))
+        except (OSError, RuntimeError) as error:
+            raise AssessmentPending('차단 checkpoint 게시 관측을 재시도합니다.') from error
         if repository.get(self.repo, plan['plan_id']).phase.value == 'retry_pending':
             raise RuntimeError('차단 checkpoint의 일시적 게시 실패를 같은 요청으로 재개합니다.')
 
@@ -496,7 +506,8 @@ class BlockedPlanReconciler:
                 self.repo, plan['plan_id'], plan_values=values,
                 project_values={'phase': 'WORKING', 'last_error': values['last_error']},
                 expected_status='PLAN_BLOCKED', enqueue=False)
-            scoped_blocking.clear_plan_block(self.connection, self.repo, plan['plan_id'])
+            scoped_blocking.clear_revalidated_rebase_block(
+                self.connection, context['block'], is_plan_block=True)
             runtime.hydrate_snapshot(self.repo, resumed)
             self._save(plan['plan_id'], context['input_identity'], 'complete', context)
 

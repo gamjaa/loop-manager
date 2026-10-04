@@ -349,14 +349,21 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
             intent = repository.intent(request, base_oid=context['base_oid'], head_oid=head,
                                        tree_oid=tree, cause=context['project_block']['evidence'])
             target = replace(request, branch=intent['ref'])
-            oid = adapter.observe_remote(target)
+            try:
+                oid = adapter.observe_remote(target)
+            except (OSError, RuntimeError) as error:
+                raise AssessmentPending('진단 ref 원격 조회를 재시도합니다.') from error
             decision = decide_diagnostic_push(head, oid)
             if decision.mode is PushMode.REJECT:
                 raise RuntimeError(decision.reason)
             self._candidate_unchanged(plan, context)
             if decision.mode is PushMode.CREATE:
                 self.ports.push_diagnostic_checkpoint(adapter, target, head)
-            if adapter.observe_remote(target) != head:
+            try:
+                confirmed = adapter.observe_remote(target)
+            except (OSError, RuntimeError) as error:
+                raise AssessmentPending('진단 ref push 결과 조회를 재시도합니다.') from error
+            if confirmed != head:
                 raise AssessmentPending('진단 ref push 결과의 OID를 확인할 수 없습니다.')
             payload = dict(result='published', diagnostic=True, branch=intent['ref'], commit_oid=head,
                            original_branch=request.branch, base_oid=context['base_oid'])
@@ -364,8 +371,11 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
         else:
             store.refresh(request, expected_remote_oid=expected)
             request = store.get(self.repo, plan['plan_id'])
-            blocked_checkpoint.BlockedCheckpointDispatcher(
-                store, adapter, adapter, self.ports._BlockedCheckpointResults(self.connection))._dispatch_one(request)
+            try:
+                blocked_checkpoint.BlockedCheckpointDispatcher(
+                    store, adapter, adapter, self.ports._BlockedCheckpointResults(self.connection))._dispatch_one(request)
+            except (OSError, RuntimeError) as error:
+                raise AssessmentPending('원래 branch checkpoint 게시 관측을 재시도합니다.') from error
             request = store.get(self.repo, plan['plan_id'])
             if request.phase.value != 'published':
                 row = self.connection.execute('SELECT unpublished_reason FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?',
@@ -388,37 +398,44 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
             raise RuntimeError('project 복구 후보의 현재 rebase 상태가 완료되지 않았습니다.')
 
     def _revalidate_project_cause(self, plan, context):
-        self._candidate_unchanged(plan, context)
-        reason = context['project_block']['reason_code']
-        proven_publication = False
-        if reason == scoped_blocking.BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value and not context['diagnostic']:
-            row = self.connection.execute(
-                'SELECT cause_identity, payload FROM project_checkpoint_results WHERE repo = ? AND plan_id = ?',
-                (self.repo, plan['plan_id'])).fetchone()
-            result = json.loads(row['payload']) if row else {}
-            proven_publication = bool(row and row['cause_identity'] == context['cause_identity']
-                                      and result.get('result') == 'published' and not result.get('diagnostic')
-                                      and result.get('commit_oid') == self._plan(plan['plan_id'])['publication_remote_oid']
-                                      and self._lineage_known(self._plan(plan['plan_id']), context))
-        if proven_publication or reason == scoped_blocking.BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value:
-            with runtime_state._transaction(self.connection):
-                self._check_owner(plan['plan_id'], context)
-                self._candidate_unchanged(plan, context)
+        with runtime_state._transaction(self.connection):
+            self._check_owner(plan['plan_id'], context)
+            self._candidate_unchanged(plan, context)
+            reason = context['project_block']['reason_code']
+            proven_publication = False
+            if reason == scoped_blocking.BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value and not context['diagnostic']:
+                row = self.connection.execute(
+                    'SELECT cause_identity, payload FROM project_checkpoint_results WHERE repo = ? AND plan_id = ?',
+                    (self.repo, plan['plan_id'])).fetchone()
+                result = json.loads(row['payload']) if row else {}
+                proven_publication = bool(row and row['cause_identity'] == context['cause_identity']
+                                          and result.get('result') == 'published' and not result.get('diagnostic')
+                                          and result.get('commit_oid') == self._plan(plan['plan_id'])['publication_remote_oid']
+                                          and self._lineage_known(self._plan(plan['plan_id']), context))
+            if proven_publication or reason == scoped_blocking.BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value:
                 scoped_blocking.clear_revalidated_rebase_block(
                     self.connection, context['project_block'], is_plan_block=False)
-        elif plan['agent_snapshot']:
-            self.ports.resume_project_block_if_safe(self.connection, self.repo_path, self.state_dir, self.repo)
-        if (scoped_blocking.project_block(self.connection, self.repo) is None
-                and scoped_blocking.plan_block(self.connection, self.repo, plan['plan_id']) is None):
-            # Clearing a project gate cannot send a changed candidate directly
-            # into its former verify/review/publication phase.
-            with runtime_state._transaction(self.connection):
+            elif plan['agent_snapshot']:
+                self.ports.resume_project_block_if_safe(self.connection, self.repo_path, self.state_dir, self.repo)
+            released = scoped_blocking.project_block(self.connection, self.repo) is None
+            if released and scoped_blocking.plan_block(self.connection, self.repo, plan['plan_id']) is None:
+                # Gate release and candidate invalidation must commit together.
                 values = revalidation_values(context['base_oid'])
                 values.pop('phase')
                 values.update(status='IMPLEMENTING')
                 runtime = runtime_state.RuntimeStateRepository(self.connection)
                 updated = runtime.update_plan(self.repo, plan['plan_id'], plan_values=values, enqueue=False)
                 runtime.hydrate_snapshot(self.repo, updated)
+            if released:
+                current = self.connection.execute(
+                    'SELECT * FROM blocked_remote_observations WHERE repo = ? AND plan_id = ?',
+                    (self.repo, plan['plan_id']),
+                ).fetchone()
+                if current is not None and observations.input_identity(current) == context['input_identity']:
+                    observations.mark_processed(
+                        self.connection, self.repo, plan['plan_id'], context['input_identity'])
+                self._save(plan['plan_id'], context['input_identity'], 'complete', context)
+            return released
 
     def refresh_catalog(self, plan_id):
         """Prove the linked scope before fetching declarations for recovery."""
@@ -515,7 +532,8 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
                 self._save(plan_id, key, stage, context)
             if stage == 'published':
                 self._check_owner(plan_id, context)
-                self._revalidate_project_cause(plan, context)
+                if self._revalidate_project_cause(plan, context):
+                    return 'recovered'
                 project = self.connection.execute('SELECT * FROM projects WHERE repo = ?', (self.repo,)).fetchone()
                 self.ports.observe_blocked_plan_remotes(self.connection, self.repo_path, self.repo, project, plan_id=plan_id)
                 current = self.connection.execute('SELECT * FROM blocked_remote_observations WHERE repo = ? AND plan_id = ?',
@@ -530,11 +548,6 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
         except (OSError, RuntimeError, ValueError) as error:
             # A local-only diagnostic is a result, never a replacement cause.
             self.ports._update_blocked_error(self.connection, self.repo, plan_id, str(error), preserve_cause=True)
-            if stage != 'published':
-                DiagnosticPublicationRepository(self.connection).result(
-                    self.repo, plan_id, context['cause_identity'],
-                    dict(result='local_only', reason=str(error), original_branch=context['identity']['branch'],
-                         base_oid=context['base_oid'], worktree=context['identity']['worktree']))
             checkpoint = ExecutionCheckpointRepository(self.connection).get(self.repo, plan_id)
             if isinstance(error, LocalWorkPending):
                 waiting = dict(row)
@@ -545,6 +558,15 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
                          or isinstance(error, RecoveryFailure)
                          and error.reason is RecoveryReason.PUBLICATION_RETRY
                          or isinstance(error, CheckpointPushError) and error.retryable)
+            if stage != 'published' and not retryable and not isinstance(error, InputChanged):
+                try:
+                    DiagnosticPublicationRepository(self.connection).result(
+                        self.repo, plan_id, context['cause_identity'],
+                        dict(result='local_only', reason=str(error), original_branch=context['identity']['branch'],
+                             base_oid=context['base_oid'], worktree=context['identity']['worktree']))
+                except RuntimeError:
+                    # A newer owner/cause has replaced this recovery attempt.
+                    return 'blocked'
             if checkpoint.operation is None and not retryable and not isinstance(error, LocalWorkPending):
                 with runtime_state._transaction(self.connection):
                     self._save(plan_id, key, 'refused', context)

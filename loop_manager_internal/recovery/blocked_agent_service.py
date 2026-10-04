@@ -4,6 +4,8 @@ from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
 from loop_manager_internal.agents import scope_baseline
+from loop_manager_internal.recovery import scoped_blocking
+from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 from loop_manager_internal.agents.scope_contracts import AgentScopeError
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
@@ -26,7 +28,7 @@ def _deserialize_blocked_agent_recovery(value: str) -> dict[str, object]:
     if (
         not isinstance(parsed, dict)
         or parsed.get("version") != 1
-        or parsed.get("state") not in {"prepared", "stashed", "isolated"}
+        or parsed.get("state") not in {"prepared", "stashed", "restoring_baseline", "isolated"}
         or not isinstance(parsed.get("source_snapshot"), str)
         or not isinstance(parsed.get("original_head"), str)
         or not isinstance(parsed.get("violation_head"), str)
@@ -53,9 +55,49 @@ def _deserialize_blocked_agent_recovery(value: str) -> dict[str, object]:
             parsed.get("plan_contents") is not None
             and not isinstance(parsed.get("plan_contents"), str)
         )
+        or (any(key in parsed for key in ("owner_plan_id", "owner_block", "owner_request_identity", "checkpoint_generation"))
+            and (not isinstance(parsed.get("owner_plan_id"), str)
+                 or not isinstance(parsed.get("owner_block"), dict)
+                 or not isinstance(parsed.get("owner_request_identity"), str)
+                 or not isinstance(parsed.get("checkpoint_generation"), int)))
     ):
         raise AgentScopeError("저장된 BLOCKED Agent 복구 상태 형식을 지원하지 않습니다.")
     return parsed
+
+
+def _require_blocked_agent_recovery_owner(
+    connection: sqlite3.Connection, repo: str, worktree: Path,
+    recovery: Mapping[str, object],
+) -> None:
+    plan_id = recovery.get("owner_plan_id")
+    if plan_id is None:  # Existing persisted recovery records have no owner fields.
+        return
+    plan = connection.execute(
+        "SELECT status, branch, worktree, workspace_owned FROM exec_plans "
+        "WHERE repo = ? AND plan_id = ?", (repo, plan_id),
+    ).fetchone()
+    block = scoped_blocking.plan_block(connection, repo, str(plan_id))
+    request = connection.execute(
+        "SELECT request_identity FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?",
+        (repo, plan_id),
+    ).fetchone()
+    checkpoint = ExecutionCheckpointRepository(connection).get(repo, str(plan_id))
+    generation = recovery["checkpoint_generation"]
+    generation_valid = (
+        checkpoint.generation >= generation
+        if recovery["state"] == "isolated"
+        else checkpoint.generation == generation
+    )
+    if (plan is None or plan["status"] != "PLAN_BLOCKED"
+            or plan["branch"] != recovery["branch"]
+            or plan["worktree"] != str(worktree)
+            or int(plan["workspace_owned"] or 0) != WORKSPACE_OWNED
+            or block is None or any(
+                block[field] != recovery["owner_block"].get(field)
+                for field in ("reason_code", "release_fingerprint", "created_at"))
+            or request is None or request["request_identity"] != recovery["owner_request_identity"]
+            or not generation_valid):
+        raise AgentScopeError("BLOCKED Agent 복구의 계획·원인·checkpoint generation이 변경됐습니다.")
 
 
 @dataclass(frozen=True)
@@ -337,6 +379,7 @@ def _complete_blocked_agent_recovery(
     recovery = effects._deserialize_blocked_agent_recovery(
         str(project["agent_recovery"])
     )
+    _require_blocked_agent_recovery_owner(connection, repo, worktree, recovery)
     try:
         before = GitSnapshot.deserialize(str(project["agent_snapshot"]))
         source = GitSnapshot.deserialize(str(recovery["source_snapshot"]))
@@ -379,6 +422,8 @@ def _complete_blocked_agent_recovery(
             repo,
             agent_recovery=effects._serialize_blocked_agent_recovery(recovery),
         )
+    elif stash_oid is None or stash_oid != recovery.get("stash_oid"):
+        raise AgentScopeError("BLOCKED Agent 복구 stash 소유권이 변경됐습니다.")
 
     branch = str(recovery["branch"])
     original_head = str(recovery["original_head"])
@@ -409,6 +454,8 @@ def _complete_blocked_agent_recovery(
         raise AgentScopeError(
             "Agent 실행 전 Git operation이 있는 worktree는 자동 복구할 수 없습니다."
         )
+    if recovery["state"] == "restoring_baseline" and current.head != original_head:
+        raise AgentScopeError("BLOCKED Agent baseline 복구 HEAD가 저장된 시작 commit과 다릅니다.")
 
     if effects._recovered_agent_local_state_matches(
         worktree,
@@ -449,9 +496,52 @@ def _complete_blocked_agent_recovery(
         )
 
     if not effects._same_local_snapshot(before, current):
-        if current.dirty:
+        if recovery["state"] == "restoring_baseline":
+            try:
+                baseline = json.loads(str(project["agent_baseline"]))
+                clean_trees = {
+                    str(baseline["worktree_tree"]),
+                    effects.git(worktree, "rev-parse", original_head + "^{tree}").stdout.strip(),
+                }
+                index_tree = effects.git(worktree, "write-tree").stdout.strip()
+            except (KeyError, TypeError, ValueError, RuntimeError, OSError) as error:
+                raise AgentScopeError("BLOCKED Agent 복원 중간 tree를 확인할 수 없습니다.") from error
+            if current.dirty:
+                contents = lambda entries: {
+                    path: tuple(entry.partition(' ')[2] for entry in values)
+                    for path, values in entries.items()}
+                if index_tree == baseline["worktree_tree"]:
+                    # The first read-tree populates both index and worktree
+                    # from the saved worktree tree. Former unstaged/untracked
+                    # paths now appear staged against HEAD.
+                    safe = (all(kinds == ("staged",) for kinds, _ in current.dirty.values())
+                            and all(entry.startswith('H ') for values in current.index.values()
+                                    for entry in values))
+                else:
+                    # The second read-tree restores staged entries before
+                    # their saved flags; compare their content and dirty state.
+                    safe = (index_tree == baseline["index_tree"]
+                            and current.dirty == before.dirty
+                            and all(' ' in entry for values in current.index.values()
+                                    for entry in values)
+                            and contents(current.index) == contents(before.index)
+                            and all(entry.startswith('H ') or entry in before.index.get(path, ())
+                                    for path, values in current.index.items() for entry in values))
+            else:
+                safe = (index_tree in clean_trees
+                        and all(entry.startswith('H ') for values in current.index.values()
+                                for entry in values))
+            if not safe:
+                raise AgentScopeError("BLOCKED Agent 복원 중 사용자 변경 또는 index 차이가 발견됐습니다.")
+        elif current.dirty:
             raise AgentScopeError(
                 "BLOCKED Agent 복구 중 예상하지 못한 새 worktree 변경이 생겼습니다."
+            )
+        if recovery["state"] != "restoring_baseline":
+            recovery["state"] = "restoring_baseline"
+            effects.update_project(
+                connection, repo,
+                agent_recovery=effects._serialize_blocked_agent_recovery(recovery),
             )
         effects._restore_agent_baseline(
             worktree,
@@ -660,6 +750,18 @@ def preserve_blocked_agent_changes(
         "plan_mode": plan_mode,
         "stash_oid": None,
     }
+    block = scoped_blocking.plan_block(connection, repo, plan_id)
+    request = connection.execute(
+        "SELECT request_identity FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?",
+        (repo, plan_id),
+    ).fetchone()
+    if block is None or request is None:
+        raise AgentScopeError("BLOCKED Agent 복구의 저장된 계획 원인이 없습니다.")
+    recovery.update(
+        owner_plan_id=plan_id, owner_block=dict(block),
+        owner_request_identity=request["request_identity"],
+        checkpoint_generation=ExecutionCheckpointRepository(connection).get(repo, plan_id).generation,
+    )
     effects.update_project(
         connection,
         repo,
@@ -731,6 +833,7 @@ def resume_interrupted_blocked_agent_recovery(
         raise AgentScopeError(
             "BLOCKED Agent 복구 workspace의 Loop Manager 소유권을 증명할 수 없습니다."
         )
+    _require_blocked_agent_recovery_owner(connection, repo, worktree, recovery)
     try:
         effects.validate_execplan_workspace_identity(
             state_dir,

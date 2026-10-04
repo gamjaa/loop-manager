@@ -1,9 +1,16 @@
 from tests.support.scope import AgentScopeFixture
+from tests.support.blocked_remote import ProjectBlockedRemoteFixture
+from loop_manager_internal.recovery import scoped_blocking
+from loop_manager_internal.recovery import scope_reconciliation
+from loop_manager_internal.recovery import project_block_service
+from loop_manager_internal.storage import execution_checkpoint_state
 import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
+from types import SimpleNamespace
+import json
 import loop_manager
 from tests.support.catalog import write_execplan
 from tests.support.git import git_command, commit_and_push
@@ -241,3 +248,78 @@ class ScopeProjectRecoveryTest(AgentScopeFixture, unittest.TestCase):
                         stored,
                     )
                     self.assertEqual(current["id"], "G-001")
+
+
+class ProjectRecoveryTransitionUnitTests(ProjectBlockedRemoteFixture, unittest.TestCase):
+    def test_rebase_scope_project_release_advances_checkpoint_generation(self):
+        self.connection.execute(
+            "UPDATE project_blocks SET reason_code = 'shared_ref_mutation' WHERE repo = 'repo'")
+        self.connection.execute(
+            "UPDATE exec_plans SET agent_snapshot = 'saved-snapshot' WHERE plan_id = 'G-106'")
+        self.connection.commit()
+        checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        before = checkpoints.get(self.repo, 'G-106')
+        effects = mock.Mock()
+        effects._reconcile_guidance_double_block.return_value = False
+        effects.capture_git_snapshot.return_value = SimpleNamespace(serialize=lambda: 'candidate')
+        effects._clear_project_block_without_losing_planning_error.side_effect = (
+            project_block_service._clear_project_block_without_losing_planning_error)
+        self.assertTrue(scope_reconciliation.resume_project_block_if_safe(
+            effects, self.connection, Path('/repo'), Path('/state'), self.repo))
+        after = checkpoints.get(self.repo, 'G-106')
+        self.assertEqual(after.generation, before.generation + 1)
+        self.assertEqual(after.snapshot['scope_block_release_audit'][-1]['candidate'], 'candidate')
+        self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
+
+    def test_transient_pr_lookup_keeps_project_diagnostic_pending(self):
+        self.ports.pr_for_branch.side_effect = RuntimeError('temporary API failure')
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertEqual(self.connection.execute(
+            "SELECT stage FROM project_blocked_reconciliations WHERE plan_id = 'G-106'").fetchone()[0], 'observed')
+        self.assertIsNone(self.connection.execute(
+            "SELECT * FROM project_checkpoint_results WHERE plan_id = 'G-106'").fetchone())
+        self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+
+    def test_gate_release_and_candidate_revalidation_roll_back_together(self):
+        self.connection.execute("DELETE FROM execplan_blocks WHERE plan_id = 'G-106'")
+        self.connection.execute(
+            "UPDATE exec_plans SET status = 'IMPLEMENTING', publication_remote_oid = ?, "
+            "worker_result = 'old candidate' "
+            "WHERE plan_id = 'G-106'", (self.head,))
+        self.connection.execute(
+            "UPDATE project_blocks SET previous_phase = 'WORKING' WHERE repo = 'repo'")
+        block = scoped_blocking.project_block(self.connection, self.repo)
+        cause = scoped_blocking.project_cause_identity(block)
+        self.connection.execute(
+            "INSERT INTO project_checkpoint_results VALUES (?, ?, ?, ?)",
+            (self.repo, 'G-106', cause,
+             json.dumps({'result': 'published', 'commit_oid': self.head})))
+        self.connection.commit()
+        plan = self.plan()
+        context = {
+            'plan_id': 'G-106', 'project_block': dict(block),
+            'cause_identity': cause, 'diagnostic': False,
+            'base_oid': self.base, 'input_identity': 'candidate',
+        }
+        with (mock.patch.object(self.coordinator, '_check_owner', return_value=plan),
+              mock.patch.object(self.coordinator, '_candidate_unchanged'),
+              mock.patch.object(self.coordinator, '_lineage_known', return_value=True),
+              mock.patch.object(self.coordinator, '_save', side_effect=KeyboardInterrupt)):
+            with self.assertRaises(KeyboardInterrupt):
+                self.coordinator._revalidate_project_cause(plan, context)
+        self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+        self.assertEqual(self.plan()['status'], 'IMPLEMENTING')
+        self.assertEqual(self.plan()['worker_result'], 'old candidate')
+        self.assertIsNone(self.connection.execute(
+            "SELECT * FROM project_blocked_reconciliations WHERE plan_id = 'G-106'").fetchone())
+
+        restarted = self.recovery.ProjectBlockedReconciler(
+            self.ports, self.connection, Path('/repo'), Path('/state'), self.repo, 'main')
+        with (mock.patch.object(restarted, '_check_owner', return_value=plan),
+              mock.patch.object(restarted, '_candidate_unchanged'),
+              mock.patch.object(restarted, '_lineage_known', return_value=True)):
+            self.assertTrue(restarted._revalidate_project_cause(plan, context))
+        self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
+        self.assertIsNone(self.plan()['worker_result'])
+        self.assertEqual(self.connection.execute(
+            "SELECT stage FROM project_blocked_reconciliations WHERE plan_id = 'G-106'").fetchone()[0], 'complete')

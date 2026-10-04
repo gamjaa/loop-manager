@@ -107,6 +107,33 @@ class PlanRecoveryGateTests(PlanRemoteRecoveryFixture, unittest.TestCase):
 
 
 class PlanCheckpointPublicationRaceTests(PlanRemoteRecoveryFixture, unittest.TestCase):
+    def test_transient_pr_lookup_keeps_blocked_input_pending(self):
+        self.ports.pr_for_branch.side_effect = RuntimeError('temporary API failure')
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertEqual(self.connection.execute(
+            "SELECT stage FROM blocked_plan_reconciliations WHERE plan_id = 'G-106'").fetchone()[0], 'observed')
+        self.assertTrue(blocked_remote_observation.pending_input(self.row()))
+        self.assertEqual(scoped_blocking.plan_block(
+            self.connection, self.repo, 'G-106')['evidence'], 'original verify failure')
+
+    def test_final_plan_release_rejects_changed_cause_identity(self):
+        plan = self.plan()
+        block = dict(scoped_blocking.plan_block(self.connection, self.repo, 'G-106'))
+        context = {
+            'plan_id': 'G-106', 'identity': {
+                field: plan[field] for field in blocked_plan_reconciliation.IDENTITY_FIELDS},
+            'block': block, 'base_oid': self.base, 'candidate': self.signature,
+            'evaluation': {'detail': 'cause resolved'}, 'input_identity': 'candidate',
+        }
+        self.connection.execute(
+            "UPDATE execplan_blocks SET created_at = 'later' WHERE plan_id = 'G-106'")
+        self.connection.commit()
+        with mock.patch.object(self.coordinator, '_candidate_unchanged'):
+            with self.assertRaises(RuntimeError):
+                self.coordinator._resume(plan, context)
+        self.assertEqual(self.plan()['status'], 'PLAN_BLOCKED')
+        self.assertIsNotNone(scoped_blocking.plan_block(self.connection, self.repo, 'G-106'))
+
     def test_registered_origin_lookup_failure_does_not_take_legacy_release_path(self):
         failure = blocked_remote_observation.RefObservation('error', error='network')
         with mock.patch.object(blocked_remote_observation, 'observe_refs', return_value=(failure, failure)):

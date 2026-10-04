@@ -39,5 +39,7 @@ Consolidate blocked recovery decisions and their final state transition. The rev
 
 ## Decision Log
 
+- Diagnostic publication reuse retains the intent's historical cause while validating the current project cause identity transactionally. Identical ref/OID reuse must not require historical evidence to equal the current block evidence. The repository regression changes the block evidence, rejects the stale cause and mismatched OID, and verifies idempotent publication under the current cause without ownership promotion or block release.
+
 - Manifest findings 27–29, 31–33, 38 and 40 identify related recovery transition defects. Findings 48, 53, 64, 80 and 81 show missing tests for adoption, notification rollback and resumed recovery. High priority follows the documented repeated manual recovery risk after gate release interruption.
 - Observed recovery paths: `loop_manager_internal/recovery/blocked_agent_service.py`, `loop_manager_internal/recovery/checkpoint_service.py`, `loop_manager_internal/recovery/blocked_plan_reconciliation.py`, `loop_manager_internal/recovery/project_block_service.py`, `loop_manager_internal/recovery/project_blocked_recovery.py`, `loop_manager_internal/recovery/block_service.py`, `loop_manager_internal/storage/blocked_checkpoint_state.py`, `loop_manager_internal/storage/recovery_state.py`, `tests/test_scope_ignored_artifacts.py`.
