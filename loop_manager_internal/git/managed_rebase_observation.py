@@ -11,6 +11,7 @@ from pathlib import Path
 import re
 from typing import Callable
 
+from loop_manager_internal.agents.scope_observation import RAW_DIFF_OPTIONS
 from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
 from loop_manager_internal.git.managed_rebase_validation import (
     FileChange, IndexEntry, ObservationFailure, RebaseExpectation,
@@ -80,7 +81,7 @@ class ObservationAdapters:
     # Reuse validate_execplan_workspace_identity and validate_managed_worktree,
     # with owned detached rebases permitted. Raise on any identity uncertainty.
     validate_identity: Callable[[RebaseExpectation], None]
-    read_rebase_metadata: Callable[[Path], dict | None]
+    read_rebase_metadata: Callable
     # Must query the live origin ref and PR identity/head, including absence.
     read_remote: Callable[[RebaseExpectation], Remote]
     # Recompute from current plan/source/approval inputs, not saved Worker turns.
@@ -117,24 +118,24 @@ def _once(expected: RebaseExpectation, adapters: ObservationAdapters) -> RebaseO
                      f'{expected.target_base_oid}^{{commit}}').strip()
     if target != expected.target_base_oid:
         raise ValueError('target base is not an immutable commit identity')
-    snapshot = adapters.capture_snapshot(worktree)
+    details = {}
+    snapshot = adapters.capture_snapshot(worktree, details=details)
     if not snapshot.shared_metadata_complete:
         raise ValueError('incomplete repository observation')
-    metadata = adapters.read_rebase_metadata(worktree)
+    metadata = adapters.read_rebase_metadata(
+        worktree, **({'git_paths': details['git_paths']} if 'git_paths' in details else {}))
     inputs, scope_policy = adapters.read_inputs(expected)
     remote = adapters.read_remote(expected)
     if not isinstance(remote, Remote):
         raise ValueError('remote observation missing')
     ancestor = adapters.git(worktree, 'merge-base', '--is-ancestor',
                             expected.target_base_oid, snapshot.head, check=False)
-    index_clean = adapters.git(worktree, 'diff', '--cached', '--quiet',
-                               '--no-ext-diff', '--ignore-submodules=none', check=False)
-    if ancestor.returncode not in {0, 1} or index_clean.returncode not in {0, 1}:
-        raise RuntimeError('ancestry or index query failed')
-    index = parse_index(snapshot.index, _stdout(adapters, worktree,
-                                              'ls-files', '--debug', '-z'))
-    diff_options = ('--raw', '--no-abbrev', '--no-renames', '--no-ext-diff',
-                    '--no-textconv', '--ignore-submodules=none', '-z')
+    if ancestor.returncode not in {0, 1}:
+        raise RuntimeError('조상 commit 관측에 실패했습니다.')
+    debug = details['index_debug'] if 'index_debug' in details else _stdout(
+        adapters, worktree, 'ls-files', '--debug', '-z')
+    index = parse_index(snapshot.index, debug)
+    diff_options = RAW_DIFF_OPTIONS
     diff_base = expected.target_base_oid
     if (ancestor.returncode == 1 and snapshot.head == expected.before_head
             and metadata is None and not controlling_git_operation(snapshot.operations)):
@@ -146,15 +147,18 @@ def _once(expected: RebaseExpectation, adapters: ObservationAdapters) -> RebaseO
         adapters, worktree, 'diff', *diff_options,
         diff_base, snapshot.head, '--',
     ))
-    staged = parse_raw_changes(_stdout(
-        adapters, worktree, 'diff', '--cached', *diff_options, '--',
-    ))
+    staged = parse_raw_changes(details['staged_raw'] if 'staged_raw' in details else _stdout(
+        adapters, worktree, 'diff', '--cached', *diff_options, '--'))
     kinds = {path: set(value[0]) for path, value in snapshot.dirty.items()}
-    ignored = _stdout(adapters, worktree, 'ls-files', '--others', '--ignored',
-                      '--exclude-standard', '-z')
-    if ignored and not ignored.endswith('\0'):
-        raise ValueError('incomplete ignored file list')
-    for path in filter(None, ignored.split('\0')):
+    if 'ignored_paths' in details:
+        ignored_paths = details['ignored_paths']
+    else:
+        ignored = _stdout(adapters, worktree, 'ls-files', '--others', '--ignored',
+                          '--exclude-standard', '-z')
+        if ignored and not ignored.endswith('\0'):
+            raise ValueError('incomplete ignored file list')
+        ignored_paths = tuple(filter(None, ignored.split('\0')))
+    for path in ignored_paths:
         kinds.setdefault(path, set()).add('ignored')
     # core.filemode=false can hide a tracked mode change from Git diff. Inspect
     # actual modes as well; the file reader handles platform Git mode semantics.
@@ -185,7 +189,7 @@ def _once(expected: RebaseExpectation, adapters: ObservationAdapters) -> RebaseO
         operations=tuple(sorted(snapshot.operations.items())),
         metadata=tuple(sorted(metadata.items())) if metadata is not None else None,
         base_is_ancestor=ancestor.returncode == 0,
-        index_clean=index_clean.returncode == 0, index=index,
+        index_clean=not staged, index=index,
         committed=committed, staged=staged, files=tuple(files), remote=remote,
         input_fingerprint=inputs, scope_fingerprint=scope_policy,
         repository_state_fingerprint=fingerprint({

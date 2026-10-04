@@ -270,15 +270,16 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 git(worktree, 'commit', '-m', title)
 
             commit('notes.txt', 'independent\n', 'Independent first commit')
-            changed = lines.copy()
-            changed[0] = 'value=worker\n'
-            commit('app.txt', ''.join(changed), 'Middle conflicting commit')
-            if not legacy:
-                commit('skip.txt', 'worker\n', 'Second conflict to resolve as empty')
-            changed[20] = 'later-content\n'
-            commit('app.txt', ''.join(changed), 'Later content and mode', executable=True)
-            changed[12] = 'another-later-change\n'
-            commit('app.txt', ''.join(changed), 'Another later same-file change')
+            if not publication_interruption:
+                changed = lines.copy()
+                changed[0] = 'value=worker\n'
+                commit('app.txt', ''.join(changed), 'Middle conflicting commit')
+                if not legacy:
+                    commit('skip.txt', 'worker\n', 'Second conflict to resolve as empty')
+                changed[20] = 'later-content\n'
+                commit('app.txt', ''.join(changed), 'Later content and mode', executable=True)
+                changed[12] = 'another-later-change\n'
+                commit('app.txt', ''.join(changed), 'Another later same-file change')
             original = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
             git(worktree, 'push', 'origin', branch)
             upstream = lines.copy()
@@ -443,12 +444,34 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 journal.begin_rebase = begin_legacy
 
             handler = new_handler()
-            handler._rebase_latest(handler._context(), handler._row(), target, publishing=with_pr)
-            self.assertTrue(lm._rebase_in_progress_for_branch(worktree, branch))
+            if publication_interruption:
+                # 게시 경계만 검사할 때는 실제 Git으로 후보와 pending SQLite를
+                # 준비한다. Manager의 충돌 교정·journal 경계는 다른 12개 흐름이 검사한다.
+                current = effects.checkpoint.get(repo_key, 'G-047')
+                effects.checkpoint.record(repo_key, 'G-047',
+                    expected_generation=current.generation, operation='rebase',
+                    expected_head=original, target_base_oid=target,
+                    observed_remote_oid=original, snapshot={'rebase_remote_oid': original})
+                # 독립된 임시 worktree를 target에 놓고 최종 허용 tree를 만든다.
+                # 원격 branch는 original을 유지하므로 실제 lease 경쟁도 검사한다.
+                git(worktree, 'reset', '--hard', target)
+                resolved = upstream.copy()
+                resolved[0] = 'value=resolved\n'
+                resolved[20] = 'later-content\n'
+                resolved[12] = 'another-later-change\n'
+                (worktree / 'app.txt').write_text(''.join(resolved))
+                (worktree / 'app.txt').chmod(0o755)
+                (worktree / 'notes.txt').write_text('independent\n')
+                git(worktree, 'add', '--', 'app.txt', 'notes.txt')
+                git(worktree, 'commit', '-m', 'Publication boundary candidate')
+            else:
+                handler._rebase_latest(handler._context(), handler._row(), target, publishing=with_pr)
+                self.assertTrue(lm._rebase_in_progress_for_branch(worktree, branch))
             handler = restart()
-            conflict_context = handler.recover(handler._context())
-            self.assertNotIsInstance(conflict_context, ExecutionOutcome)
-            self.assertTrue(conflict_context.resolving_rebase)
+            if not publication_interruption:
+                conflict_context = handler.recover(handler._context())
+                self.assertNotIsInstance(conflict_context, ExecutionOutcome)
+                self.assertTrue(conflict_context.resolving_rebase)
             self.assertEqual(events, [])
             if manual:
                 while lm._rebase_in_progress_for_branch(worktree, branch):
@@ -471,7 +494,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                     handler._finish_rebase_journal(handler._context())
                 if missing_journal:
                     (state_dir / 'manager-git-journal').rename(state_dir / 'preserved-old-audit')
-            else:
+            elif not publication_interruption:
                 if not legacy:
                     handler.run(conflict_context)
                     self.assertEqual(len(resolutions), 1)
@@ -489,7 +512,8 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 with crash:
                     with self.assertRaises(SimulatedProcessExit):
                         handler.run(handler._context())
-            self.assertEqual(len(resolutions), 1 if legacy else 2)
+            resolution_count = 0 if publication_interruption else (1 if legacy else 2)
+            self.assertEqual(len(resolutions), resolution_count)
             final_head = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
             if cumulative:
                 # Recover the final currently owned result, without replaying
@@ -515,7 +539,9 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 fixture.remote = git(repo, 'rev-parse', 'HEAD').stdout.strip()
                 connection.execute('UPDATE exec_plans SET current_revision_sha = ?', (fixture.remote,))
             slot = journal._slot(state_dir, str(repo.resolve()), 'managed_rebase', str(worktree.resolve()))
-            self.assertEqual((slot / 'active.json').exists(), not sealed_restart and not missing_journal and not manual)
+            self.assertEqual((slot / 'active.json').exists(),
+                             not sealed_restart and not missing_journal and not manual
+                             and not publication_interruption)
             sealed_before = {path.name: path.read_bytes()
                              for path in slot.glob('*.result.json')}
             intents_before = {path.name: path.read_bytes()
@@ -541,8 +567,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
 
             effects.workspace.git.side_effect = no_repeated_rebase
             if publication_interruption:
-                # Conflict correction already used Worker turns. Publication
-                # must precede any additional candidate work on this restart.
+                # 준비한 후보의 게시는 추가 후보 작업보다 먼저 확정해야 한다.
                 publication_start = len(events)
                 attempted = []
                 def interrupted_push(path, *args, **kwargs):
@@ -626,7 +651,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             self.assertEqual(effects.state.row()['worker_session_id'], 'worker-session')
             audit_row = handler.rebase_corrections.get(repo_key, 'G-047')
             self.assertEqual(audit_row.audit if audit_row else (), audit_before)
-            self.assertEqual(len(resolutions), 1 if legacy else 2)
+            self.assertEqual(len(resolutions), resolution_count)
             transitions = journal.verified_managed_transitions(
                 state_dir, str(repo.resolve()), 'plan:G-047',
                 agent_session_id='worker-session', git=git)
@@ -642,6 +667,15 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             self.assertIsNone(effects.state.row()['worker_result'])
             self.assertIsNone(effects.state.row()['verify_result'])
             self.assertIsNone(effects.state.row()['review_result'])
+            if publication_interruption:
+                # 7개 게시 실패/중단 case 모두 위의 실제 원격 lease·intent·CAS·
+                # restart·멱등성·session·검증 무효화 assertion을 유지한다.
+                # 후속 Worker→verify→Review는 정상/수동/legacy 12개 case가 검사한다.
+                self.assertNotIn('worker', events)
+                self.assertNotIn('verify', events)
+                self.assertNotIn('reviewer', events)
+                effects.publication.push_managed_publication_branch.assert_not_called()
+                return
             context = handler.guard(recovered)
             if latest_base_advanced:
                 self.assertIsInstance(context, ExecutionOutcome)

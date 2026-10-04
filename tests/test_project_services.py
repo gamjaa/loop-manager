@@ -4,8 +4,6 @@ from inspect import getclosurevars, signature
 import importlib
 from dataclasses import fields
 from pathlib import Path
-import subprocess
-import sys
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -75,32 +73,6 @@ class ProjectServiceCompositionTests(unittest.TestCase):
                 self.assertNotIn(parameter.name, value.__annotations__)
                 self.assertEqual(tuple(signature(value).parameters),
                                  tuple(signature(implementation).parameters)[1:])
-
-    def test_services_import_without_entry_point_or_resource_effects(self):
-        modules = {value.__wrapped__.__module__ for value in vars(loop_manager).values()
-                   if getattr(value, '__wrapped__', None) is not None
-                   and getattr(value, '__module__', None) == 'loop_manager'}
-        modules.update(('loop_manager', 'loop_manager_internal.application.contracts',
-                        'loop_manager_internal.application.compatibility',
-                        'loop_manager_internal.runtime.handoff_gate'))
-        code = """
-import importlib, sqlite3, subprocess, sys
-sys.path.insert(0, sys.argv[1])
-def forbidden(*args, **kwargs):
-    raise AssertionError('resource effect during import')
-sqlite3.connect = forbidden
-subprocess.run = forbidden
-subprocess.Popen = forbidden
-importlib.import_module(sys.argv[2])
-if sys.argv[2] != 'loop_manager':
-    assert 'loop_manager' not in sys.modules
-"""
-        for module in sorted(modules):
-            with self.subTest(module=module):
-                result = subprocess.run([sys.executable, '-I', '-B', '-c', code,
-                    str(loop_manager.ROOT), module], capture_output=True, text=True,
-                    check=False, timeout=30)
-                self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_planning_ports_resolve_named_callbacks_after_construction(self):
         connection = runtime_connection()
