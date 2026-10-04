@@ -23,6 +23,23 @@ class CurrentRebaseAgentScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
         with self.assertRaises(MutationEvidenceError):
             agent_comparison_baseline(self.original, saved, 'worker')
 
+    def test_legacy_saved_comparison_snapshot_remains_readable(self):
+        from loop_manager_internal.git.managed_rebase_adoption import agent_comparison_baseline
+        import hashlib
+        import json
+        parsed = json.loads(self.original.serialize())
+        parsed['version'] = 3
+        for key in ('refs', 'worktrees', 'config', 'operations'):
+            parsed.pop(key)
+        saved = {'current_rebase_agent_baseline': {
+            'kind': 'current_rebase_comparison_baseline', 'role': 'worker',
+            'original': hashlib.sha256(self.original.serialize().encode()).hexdigest(),
+            'snapshot': json.dumps(parsed),
+        }}
+        restored = agent_comparison_baseline(self.original, saved, 'worker')
+        self.assertEqual(restored.head, self.original.head)
+        self.assertFalse(restored.shared_metadata_complete)
+
 
     def test_resumed_scope_keeps_original_and_records_observed_comparison_start(self):
         from loop_manager_internal.git.managed_rebase_adoption import agent_comparison_baseline

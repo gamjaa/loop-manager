@@ -155,8 +155,10 @@ def agent_comparison_baseline(original, saved, role):
                 or not isinstance(parsed.get('head'), str)
                 or not parsed['head']
                 or parsed.get('branch') is not None and not isinstance(parsed['branch'], str)
-                or any(not isinstance(parsed.get(key), dict) for key in
-                       ('index', 'dirty', 'refs', 'worktrees', 'config', 'operations'))
+                or any(not isinstance(parsed.get(key), dict) for key in ('index', 'dirty'))
+                or any(not isinstance(parsed.get(key, {} if parsed.get('version') in
+                                      (1, 2, 3) else None), dict)
+                       for key in ('refs', 'worktrees', 'config', 'operations'))
                 or any(not isinstance(entries, list)
                        or any(not isinstance(entry, str) for entry in entries)
                        for entries in parsed['index'].values())
@@ -167,12 +169,13 @@ def agent_comparison_baseline(original, saved, role):
                        for state in parsed['dirty'].values())
                 or any(not isinstance(state, list) or len(state) != 2
                        or any(not isinstance(entry, str) for entry in state)
-                       for state in parsed['refs'].values())
+                       for state in parsed.get('refs', {}).values())
                 or any(not isinstance(entries, list)
                        or any(not isinstance(entry, str) for entry in entries)
                        for key in ('worktrees', 'config')
-                       for entries in parsed[key].values())
-                or any(not isinstance(value, str) for value in parsed['operations'].values())):
+                       for entries in parsed.get(key, {}).values())
+                or any(not isinstance(value, str) for value in
+                       parsed.get('operations', {}).values())):
             raise ValueError('invalid snapshot fields')
         return type(original).deserialize(raw)
     except (TypeError, ValueError, KeyError, RuntimeError) as error:

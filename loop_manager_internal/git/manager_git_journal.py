@@ -634,7 +634,8 @@ def _read(path: Path) -> dict[str, Any]:
                         for item in (before, expected))
         elif value.get('kind') == 'managed_rebase' or legacy_rebase:
             valid = (isinstance(before.get('head'), str)
-                     and isinstance(expected.get('branch'), str)
+                     and ('branch' not in expected
+                          or isinstance(expected['branch'], str))
                      and all(isinstance(item[key], dict)
                              for item in (before, expected)
                              for key in ('index', 'dirty', 'accepted_files', 'staged_index')
@@ -655,8 +656,10 @@ def _read(path: Path) -> dict[str, Any]:
         observed = value['observed']
         if (any(not isinstance(candidates[key], dict)
                 for key in ('refs', 'worktrees', 'selected') if key in candidates)
-                or any(not isinstance(observed[key], dict)
-                       for key in ('index', 'dirty') if key in observed)
+                or ('index' in observed and not (
+                    isinstance(observed['index'], (str, type(None)))
+                    if 'exists' in observed else isinstance(observed['index'], dict)))
+                or ('dirty' in observed and not isinstance(observed['dirty'], dict))
                 or ('metadata' in observed and observed['metadata'] is not None
                     and not isinstance(observed['metadata'], dict))):
             raise MutationEvidenceError("Manager Git 결과의 중첩 근거가 유효하지 않습니다.")
