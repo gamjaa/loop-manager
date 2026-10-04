@@ -53,7 +53,8 @@ def run_scoped_planner_turn(
     """Run one turn, preserving session writes and failed scope evidence.
 
     Callback exceptions propagate; consumers retain their own error priorities
-    and result validation. Scope cleanup follows only a successful scope check.
+    and result validation. Read-only check scope stays available until its
+    caller validates the result; other roles retain their existing cleanup.
     """
     before = agent.begin_scope(role, worktree)
     profile = {"profile_role": role} if role in {"maintenance_planner", "planner_check"} else {}
@@ -65,7 +66,7 @@ def run_scoped_planner_turn(
     if result.session_id:
         save_session(result.session_id)
     scope = agent.finish_scope(role, worktree, before)
-    if not scope.error:
+    if not scope.error and role != "planner_check":
         agent.clear_scope(repo)
     return result, scope
 

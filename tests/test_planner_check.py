@@ -61,7 +61,7 @@ class PlannerCheckRoutingTest(PlanningCase):
         port = loop_manager._PlanningAgentPorts(connection, self.context, None)
         result = loop_manager.AgentResult(0, "checked", "check-session")
         with mock.patch.object(port, "begin_scope") as begin, mock.patch.object(port, "finish_scope") as finish, \
-                mock.patch.object(port, "clear_scope"), \
+                mock.patch.object(port, "clear_scope") as clear, \
                 mock.patch.object(loop_manager, "_agent_profile", return_value=loop_manager.AgentProfile("check-model", "low")) as profile, \
                 mock.patch.object(loop_manager, "run_agent", return_value=result) as invoke:
             finish.return_value.error = None
@@ -71,6 +71,28 @@ class PlannerCheckRoutingTest(PlanningCase):
         self.assertEqual(invoke.call_args.args[4], "planner_check")
         self.assertTrue(invoke.call_args.kwargs["read_only"])
         self.assertEqual(invoke.call_args.kwargs["resolved_profile"].model, "check-model")
+        clear.assert_not_called()
+
+    def test_scoped_check_failure_preserves_session_and_scope(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        port = loop_manager._PlanningAgentPorts(connection, self.context, None)
+        result = loop_manager.AgentResult(1, "sandbox policy failed", "check-session")
+        saved = []
+        with mock.patch.object(port, "begin_scope") as begin, mock.patch.object(port, "finish_scope") as finish, \
+                mock.patch.object(port, "clear_scope") as clear, \
+                mock.patch.object(loop_manager, "_agent_profile", return_value=loop_manager.AgentProfile("check-model", "low")), \
+                mock.patch.object(loop_manager, "run_agent", return_value=result):
+            finish.return_value.error = None
+            outcome, scope = run_scoped_planner_turn(
+                port, self.context.repo, "planner_check", Path("/tree"),
+                "check", None, saved.append,
+            )
+        self.assertEqual(outcome.code, 1)
+        self.assertIs(scope, finish.return_value)
+        self.assertEqual(saved, ["check-session"])
+        finish.assert_called_once_with("planner_check", Path("/tree"), begin.return_value)
+        clear.assert_not_called()
 
     def test_planner_session_cannot_resume_as_check(self):
         connection = sqlite3.connect(":memory:")
