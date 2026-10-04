@@ -308,6 +308,35 @@ class VerifyProcessBoundaryTests(unittest.TestCase):
 
 
 class RunnerPoolTests(unittest.TestCase):
+    def test_unchanged_rejections_keep_periodic_snapshot_and_reservation_diagnostics(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+            root = Path(directory)
+            clock = [0.0]
+            writer = EventWriter(root / "events.jsonl", clock=lambda: clock[0])
+            cleanup.callback(writer.close)
+            attempts = iter(enumerate((0.0, 0.4, 1.1, 1.2)))
+            class Client:
+                def request(self, operation, **values):
+                    if operation != "acquire":
+                        return {}
+                    index, clock[0] = next(attempts)
+                    return {"granted": index == 3, "token": "owned", "reason": "same pressure",
+                            "snapshot_age": 0, "pending_cpu": index, "running": 0,
+                            "snapshot": {"busy": 1.5 + index / 10}}
+            worker = SimpleNamespace(process=mock.Mock(pid=100), token="owned", number=0,
+                                     module=None, report=None, job=None)
+            worker.process.poll.return_value = None
+            def assign(module, path, _directory):
+                worker.module, worker.report = module, path
+                path.write_text(json.dumps({"module": module.name, "passed": True, "completed": list(module.ids)}))
+            worker.assign = assign
+            with mock.patch.object(runner, "stop_worker"):
+                self.assertTrue(runner.execute_manifest([manifest.Module("first", ("a",))], root, writer,
+                    Client(), spawn=lambda *_args: worker, sleep=lambda _seconds: None))
+            allocations = summarize(root)["allocations"]
+            self.assertEqual([event["at"] for event in allocations], [0.0, 1.1, 1.2])
+            self.assertEqual([event["decision"]["pending_cpu"] for event in allocations], [0, 2, 3])
+
     def test_compile_error_is_not_converted_to_success_or_resource_fallback(self):
         with mock.patch.object(runner.py_compile, "compile", side_effect=runner.py_compile.PyCompileError(
             SyntaxError, SyntaxError("fake syntax failure"), "loop_manager.py")):

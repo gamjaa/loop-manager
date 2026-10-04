@@ -190,11 +190,22 @@ def summarize(directory: Path, *, now=None):
                 result = event
             elif kind == "fixture_result":
                 fixtures.append(event)
+    snapshots = {}
+    for event in phases:
+        if event.get("snapshot") != "full":
+            continue
+        cost = snapshots.setdefault(event["name"], {"count": 0, "seconds": 0.0, "commands": {}})
+        cost["count"] += 1
+        cost["seconds"] += event["duration"]
+        for command, values in event["commands"].items():
+            total = cost["commands"].setdefault(command, {"count": 0, "seconds": 0.0})
+            total["count"] += values["count"]
+            total["seconds"] += values["seconds"]
     summary = {"metadata": metadata, "counts": dict(Counter(item["result"] for item in completed)),
                "tests": sorted(completed, key=lambda item: item["duration"], reverse=True),
                "phases": sorted(phases, key=lambda item: item["duration"], reverse=True),
                "active": [{**event, "elapsed": max(0, (finished_at if finished_at is not None else now) - event["at"])} for event in active.values()],
-               "allocations": decisions, "fixture_results": fixtures, "result": result}
+               "allocations": decisions, "git_snapshots": snapshots, "fixture_results": fixtures, "result": result}
     atomic_json(directory / "summary.json", summary)
     return summary
 
@@ -218,6 +229,9 @@ def comparison(directories, summaries):
                      "seconds": duration("verify_process") if duration("verify_process") is not None else duration("verify"),
                      "git_fixture_seconds": sum(event["duration"] for event in summary["phases"]
                                                 if event["name"].startswith("git_fixture:")),
+                     "git_snapshot_count": sum(cost["count"] for cost in summary.get("git_snapshots", {}).values()),
+                     "git_snapshot_commands": sum(command["count"] for cost in summary.get("git_snapshots", {}).values()
+                                                  for command in cost["commands"].values()),
                      "passed": (summary.get("result") or {}).get("passed"), "counts": summary["counts"]})
     scope_matches = bool(scopes and scopes[0]) and all(scope == scopes[0] for scope in scopes)
     environment_matches = bool(contexts and all(value is not None for value in contexts[0][:6])) and all(
