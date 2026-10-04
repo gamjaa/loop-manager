@@ -18,6 +18,7 @@ from pathlib import Path
 import secrets
 import sqlite3
 import threading
+from loop_manager_internal.verification.coordination import ExecutionSettings, VerifyCoordinator, settings as verify_settings
 
 
 @dataclass(frozen=True)
@@ -41,10 +42,14 @@ def _run_registered_project(
     runtime_mutation: RuntimeMutation | None = None,
     external_run_id: str | None = None,
     handoff_gate: RuntimeHandoffGate | None = None,
+    verify_coordinator: VerifyCoordinator | None = None,
+    verify_parallelism: str | int = "auto",
 ) -> ScheduledProjectResult:
     """Run one registry row with state isolated to this worker connection."""
 
     handoff_token = _runtime_handoff_signal.set(handoff_gate)
+    verify_token = (verify_settings.set(ExecutionSettings(verify_coordinator, verify_parallelism, state_dir))
+                    if verify_coordinator is not None else None)
     try:
         effects._check_runtime_handoff()
         # The scheduler connection completed migrations before starting any
@@ -113,6 +118,8 @@ def _run_registered_project(
             error=True,
         )
     finally:
+        if verify_token is not None:
+            verify_settings.reset(verify_token)
         _runtime_handoff_signal.reset(handoff_token)
     return ScheduledProjectResult(project.repo, result)
 
@@ -147,7 +154,7 @@ def schedule_registered_projects(
     handoff_gate = RuntimeHandoffGate(threading.Event(), threading.Lock())
     external_run_id = secrets.token_hex(16)
     worker_count = min(config.max_workers, len(projects))
-    with ThreadPoolExecutor(
+    with VerifyCoordinator() as verify_coordinator, ThreadPoolExecutor(
         max_workers=worker_count,
         thread_name_prefix="loop-project",
     ) as pool:
@@ -164,6 +171,8 @@ def schedule_registered_projects(
                 config.verify_timeout_seconds,
                 external_run_id=external_run_id,
                 handoff_gate=handoff_gate,
+                verify_coordinator=verify_coordinator,
+                verify_parallelism=config.verify_parallelism,
                 **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
             )
             for project in projects

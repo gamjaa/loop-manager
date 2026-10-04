@@ -1,7 +1,11 @@
+import atexit
+from functools import lru_cache
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 import loop_manager
+from loop_manager_internal.verification.timing import phase
 
 
 def git_command(repo: Path, *arguments: str) -> str:
@@ -15,7 +19,7 @@ def git_command(repo: Path, *arguments: str) -> str:
     )
     return result.stdout.strip()
 
-def make_remote_repository(directory: str) -> Path:
+def _initialize_remote_repository(directory: str) -> Path:
     parent = Path(directory)
     remote = parent / "remote.git"
     repo = parent / "repo"
@@ -52,6 +56,34 @@ def make_remote_repository(directory: str) -> Path:
     git_command(repo, "commit", "-m", "Initial")
     git_command(repo, "push", "-u", "origin", "main")
     return repo
+
+@lru_cache(maxsize=1)
+def _remote_repository_seed():
+    """프로세스 안에서 재사용할 초기 저장소를 필요할 때 준비한다."""
+    directory = tempfile.TemporaryDirectory(prefix="loop-manager-test-seed-")
+    try:
+        with phase("git_fixture:seed_initialization"):
+            _initialize_remote_repository(directory.name)
+    except BaseException:
+        directory.cleanup()
+        raise
+    atexit.register(directory.cleanup)
+    return directory
+
+
+def make_remote_repository(directory: str) -> Path:
+    """초기 상태를 복사하고 각 테스트의 실제 저장소를 독립시킨다."""
+    seed = Path(_remote_repository_seed().name)
+    parent = Path(directory)
+    remote = parent / "remote.git"
+    repo = parent / "repo"
+    with phase("git_fixture:independent_copy"):
+        shutil.copytree(seed / "remote.git", remote)
+        shutil.copytree(seed / "repo", repo)
+        git_command(repo, "init", "--initial-branch=main")
+        git_command(repo, "remote", "set-url", "origin", str(remote))
+    return repo
+
 
 def commit_and_push(repo: Path, message: str) -> None:
     git_command(repo, "add", "-A")

@@ -2,6 +2,8 @@
 
 from pathlib import Path
 import unittest
+from unittest import mock
+from loop_manager_internal.verification import runner
 
 from loop_manager_internal.recovery import blocked_checkpoint
 from loop_manager_internal.storage import blocked_checkpoint_state
@@ -29,11 +31,13 @@ class CatalogCheckpointWiringTest(unittest.TestCase):
             "loop_manager_internal/recovery/recovery_dispatcher.py", "loop_manager_internal/recovery/recovery_runtime.py",
             "loop_manager_internal/storage/recovery_state.py",
         }
+        with mock.patch.object(runner.py_compile, "compile") as compile_source:
+            runner.compile_project(root)
+        compiled = {Path(call.args[0]).relative_to(root).as_posix() for call in compile_source.call_args_list}
+        self.assertTrue(required.issubset(compiled))
+        self.assertIn('loop_manager_internal/recovery/blocked_plan_reconciliation.py', compiled)
         for name in ("verify.sh", "verify.ps1"):
             with self.subTest(script=name):
                 lines = (root / "scripts" / name).read_text().splitlines()
-                commands = [line for line in lines if "-m py_compile " in line]
+                commands = [line for line in lines if "-m loop_manager_internal.verification.runner" in line]
                 self.assertEqual(len(commands), 1)
-                self.assertTrue(required.issubset(set(commands[0].split())))
-                if name == 'verify.sh':
-                    self.assertIn('loop_manager_internal/recovery/blocked_plan_reconciliation.py', commands[0].split())

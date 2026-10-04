@@ -245,8 +245,9 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
         with tempfile.TemporaryDirectory() as directory:
             with mock.patch.object(fixture_git.subprocess, 'run') as process, \
                  mock.patch.object(fixture_git, 'git_command') as git:
-                repo = fixture_git.make_remote_repository(directory)
+                repo = fixture_git._initialize_remote_repository(directory)
             process.assert_called_once()
+            self.assertEqual(git.call_count, 7)
             self.assertEqual(process.call_args.args[0], [
                 'git', 'init', '--bare', '--initial-branch=main',
                 str(Path(directory) / 'remote.git'),

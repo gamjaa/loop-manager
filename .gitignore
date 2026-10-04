@@ -31,6 +31,7 @@ htmlcov/
 .coverage
 .coverage.*
 .pytest_cache/
+.cache/verify/
 
 # Type checkers
 .mypy_cache/

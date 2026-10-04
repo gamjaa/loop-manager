@@ -9,6 +9,7 @@ import sys
 import tempfile
 from types import FunctionType, ModuleType
 import unittest
+from unittest import mock
 
 import loop_manager
 
@@ -144,12 +145,15 @@ class InternalPackageMigrationTests(unittest.TestCase):
             self.assertFalse(list(runtime.rglob("*.pyc")))
 
     def test_both_verify_scripts_compile_every_relocated_module(self):
+        from loop_manager_internal.verification import runner
         required = {"loop_manager.py", *(p.relative_to(ROOT).as_posix()
                                          for p in PACKAGE.rglob("*.py"))}
+        with mock.patch.object(runner.py_compile, "compile") as compile_source:
+            runner.compile_project(ROOT)
+        self.assertEqual({Path(call.args[0]).relative_to(ROOT).as_posix() for call in compile_source.call_args_list}, required)
+        self.assertTrue(all(call.kwargs['doraise'] for call in compile_source.call_args_list))
         for name in ("verify.sh", "verify.ps1"):
             with self.subTest(script=name):
                 lines = (ROOT / "scripts" / name).read_text(encoding="utf-8").splitlines()
-                commands = [line for line in lines if "-m py_compile " in line]
+                commands = [line for line in lines if "-m loop_manager_internal.verification.runner" in line]
                 self.assertEqual(len(commands), 1)
-                self.assertEqual(set(commands[0].split("-m py_compile ", 1)[1].split()), required)
-                self.assertTrue(any("-m unittest discover -s tests" in line for line in lines))
