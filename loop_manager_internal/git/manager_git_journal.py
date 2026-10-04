@@ -610,6 +610,56 @@ def _read(path: Path) -> dict[str, Any]:
         raise MutationEvidenceError(f"Manager Git journal을 읽을 수 없습니다: {path}") from error
     if not isinstance(value, dict):
         raise MutationEvidenceError("Manager Git journal 형식이 유효하지 않습니다.")
+    if path.name == 'active.json' or path.name.endswith('.intent.json'):
+        legacy_rebase = (path.name.endswith('.intent.json')
+                         and value.get('kind') is None
+                         and isinstance(value.get('expected'), dict)
+                         and isinstance(value['expected'].get('branch'), str))
+        if (not isinstance(value.get('id'), str)
+                or not isinstance(value.get('owner'), str)
+                or not (isinstance(value.get('kind'), str) or legacy_rebase)
+                or not isinstance(value.get('repo'), str)
+                or not isinstance(value.get('target'), str)
+                or not isinstance(value.get('before'), dict)
+                or not isinstance(value.get('expected'), dict)):
+            raise MutationEvidenceError("Manager Git intent 형식이 유효하지 않습니다.")
+        before, expected = value['before'], value['expected']
+        if value.get('kind') in {'bootstrap_fetch', 'project_fetch'}:
+            valid = (isinstance(before.get('oid'), (str, type(None)))
+                     and isinstance(expected.get('oid'), str))
+        elif value.get('kind') == 'source_fast_forward':
+            valid = all(isinstance(item.get('index'), dict)
+                        and isinstance(item.get('changes'), list)
+                        and isinstance(item.get('operations'), list)
+                        for item in (before, expected))
+        elif value.get('kind') == 'managed_rebase' or legacy_rebase:
+            valid = (isinstance(before.get('head'), str)
+                     and isinstance(expected.get('branch'), str)
+                     and all(isinstance(item[key], dict)
+                             for item in (before, expected)
+                             for key in ('index', 'dirty', 'accepted_files', 'staged_index')
+                             if key in item))
+        else:
+            valid = all(isinstance(item.get('exists'), bool)
+                        and isinstance(item.get('registration'), (dict, type(None)))
+                        for item in (before, expected))
+        if not valid:
+            raise MutationEvidenceError("Manager Git intent의 중첩 근거가 유효하지 않습니다.")
+    elif path.name.endswith('.result.json'):
+        if (not isinstance(value.get('id'), str)
+                or not isinstance(value.get('status'), str)
+                or not isinstance(value.get('observed'), dict)
+                or not isinstance(value.get('candidates'), dict)):
+            raise MutationEvidenceError("Manager Git 결과 형식이 유효하지 않습니다.")
+        candidates = value['candidates']
+        observed = value['observed']
+        if (any(not isinstance(candidates[key], dict)
+                for key in ('refs', 'worktrees', 'selected') if key in candidates)
+                or any(not isinstance(observed[key], dict)
+                       for key in ('index', 'dirty') if key in observed)
+                or ('metadata' in observed and observed['metadata'] is not None
+                    and not isinstance(observed['metadata'], dict))):
+            raise MutationEvidenceError("Manager Git 결과의 중첩 근거가 유효하지 않습니다.")
     return value
 
 

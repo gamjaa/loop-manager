@@ -6,6 +6,7 @@ separate boundaries.
 """
 from dataclasses import dataclass, replace
 import hashlib
+import json
 
 from loop_manager_internal.git.managed_rebase_observation import ObservationAdapters, observe_current_rebase
 from loop_manager_internal.git.managed_rebase_validation import (
@@ -147,4 +148,32 @@ def agent_comparison_baseline(original, saved, role):
         # A later Agent scope has its own original start. Retain old comparison
         # records as audit instead of making them a historical gate.
         return original
-    return type(original).deserialize(baseline['snapshot'])
+    raw = baseline.get('snapshot')
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else None
+        if (not isinstance(parsed, dict)
+                or not isinstance(parsed.get('head'), str)
+                or not parsed['head']
+                or parsed.get('branch') is not None and not isinstance(parsed['branch'], str)
+                or any(not isinstance(parsed.get(key), dict) for key in
+                       ('index', 'dirty', 'refs', 'worktrees', 'config', 'operations'))
+                or any(not isinstance(entries, list)
+                       or any(not isinstance(entry, str) for entry in entries)
+                       for entries in parsed['index'].values())
+                or any(not isinstance(state, list) or len(state) != 2
+                       or not isinstance(state[0], list)
+                       or any(not isinstance(kind, str) for kind in state[0])
+                       or not isinstance(state[1], str)
+                       for state in parsed['dirty'].values())
+                or any(not isinstance(state, list) or len(state) != 2
+                       or any(not isinstance(entry, str) for entry in state)
+                       for state in parsed['refs'].values())
+                or any(not isinstance(entries, list)
+                       or any(not isinstance(entry, str) for entry in entries)
+                       for key in ('worktrees', 'config')
+                       for entries in parsed[key].values())
+                or any(not isinstance(value, str) for value in parsed['operations'].values())):
+            raise ValueError('invalid snapshot fields')
+        return type(original).deserialize(raw)
+    except (TypeError, ValueError, KeyError, RuntimeError) as error:
+        raise MutationEvidenceError('current rebase Agent comparison is malformed') from error

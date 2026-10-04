@@ -11,6 +11,18 @@ import loop_manager as lm
 
 
 class CurrentRebaseAgentScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
+    def test_damaged_saved_comparison_snapshot_uses_evidence_error(self):
+        from loop_manager_internal.git.managed_rebase_adoption import agent_comparison_baseline
+        from loop_manager_internal.git.manager_git_journal import MutationEvidenceError
+        import hashlib
+        saved = {'current_rebase_agent_baseline': {
+            'kind': 'current_rebase_comparison_baseline', 'role': 'worker',
+            'original': hashlib.sha256(self.original.serialize().encode()).hexdigest(),
+            'snapshot': '{"version":4,"head":"valid","index":[]}',
+        }}
+        with self.assertRaises(MutationEvidenceError):
+            agent_comparison_baseline(self.original, saved, 'worker')
+
 
     def test_resumed_scope_keeps_original_and_records_observed_comparison_start(self):
         from loop_manager_internal.git.managed_rebase_adoption import agent_comparison_baseline

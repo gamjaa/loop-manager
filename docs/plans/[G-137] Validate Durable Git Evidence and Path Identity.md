@@ -33,8 +33,8 @@ Centralize strict decoding of Git paths and stored mutation evidence where recov
 
 ## Progress
 
-- [ ] Consolidate lossless path decoding and evidence validation.
-- [ ] Add malformed, replay and special-name regression tests.
+- [x] Consolidate lossless path decoding and evidence validation.
+- [x] Add malformed, replay and special-name regression tests.
 
 ## Decision Log
 

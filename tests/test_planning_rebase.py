@@ -67,6 +67,39 @@ class PlanningGitDouble:
 
 
 class PlanningRebaseTest(unittest.TestCase):
+    def test_damaged_correction_journal_refuses_before_git_mutation(self):
+        from loop_manager_internal.planning import planning_rebase
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / 'planning'
+            worktree.mkdir()
+            path = planning_rebase._journal_path(root, '/repo', worktree)
+            planning_rebase._write(path, {
+                'repo': '/repo', 'worktree': str(worktree.resolve()),
+                'old': 'old', 'target': 'new', 'head': 'old', 'nonce': 'nonce',
+                'dirty': True, 'phase': 'rebasing',
+                'correction': {'paths': 'docs/plans/a.md', 'was_rebase': True,
+                               'head': 'old', 'digest': 'hash'},
+            })
+            git = mock.Mock()
+            with self.assertRaises(PlanningRebaseError):
+                rebase_planning_worktree(git, root, root, '/repo', worktree, 'old', 'new')
+            git.assert_not_called()
+            self.assertTrue(path.exists())
+            record = planning_rebase.json.loads(path.read_text())
+            record['phase'] = ['rebasing']
+            planning_rebase._write(path, record)
+            with self.assertRaises(PlanningRebaseError):
+                rebase_planning_worktree(git, root, root, '/repo', worktree, 'old', 'new')
+            git.assert_not_called()
+
+    def test_nul_git_path_output_keeps_leading_whitespace(self):
+        from loop_manager_internal.planning import planning_rebase
+        name = ' leading\tline\nback\\slash'
+        git = mock.Mock(return_value=SimpleNamespace(stdout=name + '\0', returncode=0))
+        self.assertEqual(planning_rebase._git_ok(
+            git, Path('/repo'), 'ls-files', '--others', '-z'), name + '\0')
+
     def test_windows_journal_skips_directory_open(self):
         from loop_manager_internal.planning import planning_rebase
         from loop_manager_internal.git import manager_git_journal

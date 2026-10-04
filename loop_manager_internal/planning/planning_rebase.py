@@ -65,8 +65,29 @@ def _read(path: Path, repo: str, worktree: Path) -> dict[str, object] | None:
             for field in ("old", "target", "head", "nonce"))
             or not isinstance(record.get("dirty"), bool)):
         raise PlanningRebaseError("planning rebase journal의 원본·대상 정보가 유효하지 않습니다.")
-    if record.get("phase") not in {"before_stash", "stashed", "rebasing", "applying", "restored", "conflict", "accepting"}:
+    if (not isinstance(record.get("phase"), str) or record["phase"] not in
+            {"before_stash", "stashed", "rebasing", "applying", "restored", "conflict", "accepting"}):
         raise PlanningRebaseError("planning rebase journal 단계가 유효하지 않습니다.")
+    for field in ("restored_head", "restored_digest", "accepting_digest"):
+        if field in record and (not isinstance(record[field], str) or not record[field]):
+            raise PlanningRebaseError("planning rebase journal의 복원 근거가 유효하지 않습니다.")
+    correction = record.get("correction")
+    if correction is not None and (
+        not isinstance(correction, dict)
+        or not isinstance(correction.get("paths"), list)
+        or any(not isinstance(name, str) or (
+            name != "docs/FUTURE_IDEAS.md"
+            and re.fullmatch(r"docs/plans/[^/]+\.md", name) is None
+        ) for name in correction["paths"])
+        or type(correction.get("was_rebase")) is not bool
+        or not isinstance(correction.get("head"), str) or not correction["head"]
+        or not isinstance(correction.get("digest"), str) or not correction["digest"]
+    ):
+        raise PlanningRebaseError("planning rebase journal의 교정 근거가 유효하지 않습니다.")
+    if record["phase"] == "accepting" and "accepting_digest" not in record:
+        raise PlanningRebaseError("planning rebase journal의 복원 근거가 없습니다.")
+    if record["phase"] == "restored" and "restored_digest" not in record:
+        raise PlanningRebaseError("planning rebase journal의 복원 근거가 없습니다.")
     return record
 
 
@@ -86,7 +107,7 @@ def _git_ok(git, worktree: Path, *args: str) -> str:
     result = git(worktree, *args, check=False)
     if result.returncode:
         raise PlanningRebaseError(f"planning Git 단계 실패 ({' '.join(args[:2])}): {result.stdout[-2000:]}")
-    return result.stdout.strip()
+    return result.stdout if "-z" in args else result.stdout.strip()
 
 
 def rebase_in_progress(git, worktree: Path) -> bool:

@@ -12,6 +12,41 @@ REF = "refs/remotes/origin/main"
 
 
 class ManagerGitTransitionTests(unittest.TestCase):
+    def test_damaged_nested_intent_refuses_replay_without_git_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            observed = {'oid': OLD}
+            slot = journal._slot(state, '/repo', 'project_fetch', REF)
+            slot.mkdir(parents=True)
+            damaged = {'version': 1, 'id': 'a' * 32, 'owner': 'project',
+                       'kind': 'project_fetch', 'repo': '/repo', 'target': REF,
+                       'before': {'oid': OLD}, 'expected': {'oid': {'forged': NEW}}}
+            journal._write_new(slot / 'active.json', damaged)
+            apply = mock.Mock()
+            with self.assertRaises(journal.MutationEvidenceError):
+                journal.execute(state, owner='project', kind='project_fetch', repo='/repo',
+                                target=REF, before=observed, expected={'oid': NEW},
+                                observe=lambda: observed.copy(), apply=apply,
+                                marker=lambda _: True)
+            apply.assert_not_called()
+            self.assertEqual(observed, {'oid': OLD})
+            self.assertTrue((slot / 'active.json').exists())
+
+    def test_damaged_nested_result_never_offers_transition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            slot = journal._slot(state, '/repo', 'project_fetch', REF)
+            slot.mkdir(parents=True)
+            journal._write_new(slot / ('a' * 32 + '.result.json'), {
+                'id': 'a' * 32, 'status': 'complete',
+                'observed': {'oid': NEW}, 'candidates': {'refs': []},
+            })
+            with self.assertRaises(journal.MutationEvidenceError):
+                journal.verified_candidates(
+                    state, '/repo', baseline_refs={REF: OLD},
+                    baseline_worktrees={}, live_refs={REF: NEW}, live_worktrees={},
+                    marker=lambda _: True)
+
     def test_legacy_resolution_uses_approved_commit_before_later_same_file_change(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
