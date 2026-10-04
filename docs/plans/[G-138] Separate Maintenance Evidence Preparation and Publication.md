@@ -3,6 +3,7 @@ id: G-138
 title: Separate Maintenance Evidence Preparation and Publication
 sources:
   - docs/PRODUCT.md
+  - docs/requirements/[R-054] Due Refactoring Priority.md
 depends_on: []
 complexity: high
 risk: high
@@ -12,8 +13,6 @@ priority: normal
 ## Purpose
 
 Give maintenance assessment evidence a verified publication boundary. Current export writes catalog and plan files sequentially, then treats catalog existence as completion after interruption. The file ledger also mixes root/Git evidence validation with SQLite application and remote publication, which makes partial success and retry hard to reason about.
-
-R-054's due refactoring priority remains unimplemented and is outside this plan's scope. Keep `docs/requirements/[R-054] Due Refactoring Priority.md` active and cancel its archive move in this candidate. This plan does not establish completion of R-054; its unrelated source association is removed so that G-138 cannot authorize that archive move.
 
 ## Acceptance Criteria
 
@@ -41,4 +40,3 @@ R-054's due refactoring priority remains unimplemented and is outside this plan'
 
 - Manifest findings 17, 18 and 43 identify the publication and validation boundaries; finding 60 calls out incomplete restart coverage. No root movement, schema migration or new assessment call is authorized by this plan.
 - Observed evidence paths: `loop_manager_internal/maintenance/maintenance_findings.py`, `loop_manager_internal/maintenance/maintenance_reconciliation.py`, `loop_manager_internal/storage/maintenance_file_ledger.py`.
-- User Decision (2026-10-04): “이동하지 않고 유지해줘.” Cancel R-054's archive move and retain the requirement at its active path without changing its contents. Preserve the PRODUCT and ARCHITECTURE links to that active path. Resume G-138's existing implementation and validation after reconciling the candidate with this decision; R-054 must remain available to Planner until its own acceptance criteria are implemented.
