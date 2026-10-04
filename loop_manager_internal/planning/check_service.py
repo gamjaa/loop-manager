@@ -62,7 +62,9 @@ class PlanningCheckService(PlanningService):
         self._ports.events.log(f"점검 Planner → 일반 Planner 인계: {reason}")
         return None
 
-    def _finish_accepted(self, run: _PlanningRun) -> PlanningOutcome | None:
+    def _finish_accepted(
+        self, run: _PlanningRun, *, stale: bool = False,
+    ) -> PlanningOutcome | None:
         repo = run.context.repo
         row = self._ports.state.planning(repo)
         worktree = Path(str(row.worktree or ""))
@@ -85,6 +87,9 @@ class PlanningCheckService(PlanningService):
         except RuntimeError as error:
             return self._fail(run, f"점검 workspace 정리 실패: {error}")
         run.row = self._ports.state.planning(repo)
+        if stale:
+            self._ports.events.log("점검 Planner: 확정 뒤 입력이나 대상이 변경되어 다시 선택합니다.")
+            return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART)
         run.fingerprint_skipped = True
         self._ports.events.log("점검 Planner: 수정 불필요; 예정 READY를 유지합니다.")
         return None
@@ -93,6 +98,31 @@ class PlanningCheckService(PlanningService):
         if run.row.phase == "PLANNING" and not run.maintenance_planning:
             check = getattr(self._ports.state, "planner_check", lambda _repo: None)(run.context.repo)
             if check is not None and check["stage"] == "accepted":
+                repo = run.context.repo
+                latest = self._ports.git.fetch_base(
+                    run.context.repo_path, run.context.base_branch,
+                )
+                guidance_changed = bool(self._ports.git.run(
+                    run.context.repo_path, "diff", "--name-only",
+                    str(check["comparison_sha"]), latest, "--", "AGENTS.md",
+                ).stdout.strip())
+                if (guidance_changed
+                        or self._ports.git.input_fingerprint(run.context.repo_path, latest)
+                        != check["input_fingerprint"]
+                        or self._ports.git.specification_fingerprint(run.context.repo_path, latest)
+                        != check["specification_fingerprint"]
+                        or not self._ports.state.plan_declarations_match(
+                            repo, self._ports.git.plan_declarations(run.context.repo_path, latest),
+                        )):
+                    return self._finish_accepted(run, stale=True)
+                try:
+                    current = self._ports.validation.prepare_general_context(
+                        repo, run.context.repo_path, latest,
+                    )
+                except PlanningResultInvalid:
+                    return self._finish_accepted(run, stale=True)
+                if target_fingerprint(current) != check["target_fingerprint"]:
+                    return self._finish_accepted(run, stale=True)
                 return self._finish_accepted(run)
         return None
 
@@ -112,7 +142,7 @@ class PlanningCheckService(PlanningService):
         if check is None or check["stage"] in {"handoff", "superseded"}:
             return None
         if check["stage"] == "accepted":
-            return self._finish_accepted(run)
+            return self._resume_accepted(run)
         worktree = run.planning_worktree
         assert worktree is not None
 

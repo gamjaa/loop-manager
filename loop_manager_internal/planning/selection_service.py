@@ -814,8 +814,10 @@ class PlanningSelectionService(PlanningService):
             if run.fingerprint_skipped:
                 check = getattr(self._ports.state, "planner_check", lambda _repo: None)(context.repo)
                 if (check is not None and check["stage"] == "accepted"
-                        and check["input_fingerprint"] == run.current_fingerprint
                         and row.planning_fingerprint != run.current_fingerprint):
+                    if (check["input_fingerprint"] != run.current_fingerprint
+                            or check["specification_fingerprint"] != run.specification_fingerprint):
+                        return self._restart_for_new_input()
                     try:
                         current = self._ports.validation.prepare_general_context(
                             context.repo, context.repo_path, latest_sha,

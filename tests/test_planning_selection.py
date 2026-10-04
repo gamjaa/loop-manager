@@ -790,24 +790,94 @@ class PlanningSelectionTest(PlanningCase):
         self.assertEqual(ports.state.snapshot.planning_fingerprint, "new-full")
 
     def test_interrupted_accepted_cleanup_resumes_without_second_check(self):
-        ports = self._code_check_ports()
-        from loop_manager_internal.storage.planner_check_state import target_fingerprint
-        ports.state.check_record = {
-            "stage": "accepted", "input_fingerprint": "new-full",
-            "target_fingerprint": target_fingerprint(ports.validation.snapshot),
-            "specification_fingerprint": "specification", "base_sha": "base",
-        }
-        ports.state.snapshot = replace(
-            ports.state.snapshot, phase="PLANNING", active_sha="base",
-            planning_attempt_fingerprint="new-full", planning_workspace_owned=1,
-            worktree="/state/worktrees/planning",
-        )
+        ports = self._interrupted_accepted_ports()
 
         outcome = PlanningLifecycleCoordinator(ports).run(self.context)
 
         self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
         self.assertEqual(ports.agent.run_count, 0)
         self.assertEqual(ports.state.snapshot.planning_fingerprint, "old-full")
+
+    def _interrupted_accepted_ports(self):
+        ports = self._code_check_ports()
+        from loop_manager_internal.storage.planner_check_state import target_fingerprint
+        ports.state.check_record = {
+            "stage": "accepted", "input_fingerprint": "new-full",
+            "target_fingerprint": target_fingerprint(ports.validation.snapshot),
+            "specification_fingerprint": "specification", "base_sha": "base",
+            "comparison_sha": "old-base",
+        }
+        ports.state.snapshot = replace(
+            ports.state.snapshot, phase="PLANNING", active_sha="base",
+            planning_attempt_fingerprint="new-full", planning_workspace_owned=1,
+            worktree="/state/worktrees/planning",
+        )
+        return ports
+
+    def test_interrupted_accepted_reselects_changed_remote_input_or_target(self):
+        for change in ("code", "document", "plan", "guidance", "owner"):
+            with self.subTest(change=change):
+                ports = self._interrupted_accepted_ports()
+                ports.git.remote = "new-base"
+                ports.git.fingerprints["new-base"] = "new-full"
+                if change == "code":
+                    ports.git.fingerprints["new-base"] = "newer-full"
+                elif change == "document":
+                    ports.git.specification_fingerprints["new-base"] = "changed-specification"
+                elif change == "plan":
+                    ports.state.plan_declarations_match_result = False
+                elif change == "guidance":
+                    ports.git.guidance_changed = True
+                else:
+                    ports.validation.snapshot = MutableReadySnapshot(
+                        "/repo", "new-base", (),
+                        mutable_snapshot_token("/repo", "new-base", ()),
+                    )
+
+                outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+                self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+                self.assertIsNone(ports.state.snapshot.phase)
+                self.assertEqual(ports.agent.run_count, 0)
+                self.assertEqual(ports.state.check_record["stage"], "accepted")
+                if change == "code":
+                    resumed = PlanningLifecycleCoordinator(ports).run(
+                        replace(self.context, base_sha="new-base"),
+                    )
+                    self.assertEqual(resumed.kind, PlanningOutcomeKind.EXECUTION_READY)
+                    self.assertEqual(ports.agent.roles, [("planner_check", True)])
+                    self.assertEqual(
+                        ports.state.check_record["input_fingerprint"], "newer-full",
+                    )
+
+    def test_interrupted_accepted_reuses_identical_remote_revision(self):
+        ports = self._interrupted_accepted_ports()
+        ports.git.remote = "same-content-base"
+        ports.git.fingerprints["same-content-base"] = "new-full"
+
+        first = PlanningLifecycleCoordinator(ports).run(self.context)
+        second = PlanningLifecycleCoordinator(ports).run(
+            replace(self.context, base_sha="same-content-base"),
+        )
+
+        self.assertEqual(first.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        self.assertEqual(second.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(ports.agent.run_count, 0)
+        self.assertEqual(ports.state.snapshot.planning_fingerprint, "old-full")
+
+    def test_accepted_input_mismatch_at_activation_restarts_before_worker(self):
+        ports = self._interrupted_accepted_ports()
+        ports.state.snapshot = replace(ports.state.snapshot, phase=None)
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(self.context)
+        run.current_fingerprint = "newer-full"
+        run.specification_fingerprint = "specification"
+        run.fingerprint_skipped = True
+
+        outcome = coordinator._selection._activate_next_execplan(run)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        self.assertIsNone(ports.state.snapshot.phase)
 
     def test_no_change_planner_result_advances_full_baseline_before_ready(self):
         ports = FakePorts(planning_snapshot(
