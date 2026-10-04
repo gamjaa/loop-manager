@@ -143,12 +143,33 @@ class RemoveCleanupWorktreeEffects:
     _canonical_path: Callable[..., object]
     _capture_local_worktree_state: Callable[..., object]
     _git_operation_entries: Callable[..., object]
-    _ignored_worktree_paths: Callable[..., object]
     _managed_worktree_marker: Callable[..., object]
     _managed_worktree_transition_state: Callable[..., object]
     _write_managed_worktree_receipt: Callable[..., object]
     assess_cleanup: Callable[..., CleanupAssessment]
     git: Callable[..., object]
+
+
+def restore_cleanup_unlock(
+    intent: Mapping[str, object], current: Mapping[str, object], repo: Path,
+    worktree: Path, *, git: Callable[..., object], observe: Callable[[], object],
+) -> None:
+    """Restore the owned lock after an interrupted, unsuccessful removal."""
+    before = intent.get("before")
+    registration = before.get("registration") if isinstance(before, dict) else None
+    reason = registration.get("locked") if isinstance(registration, dict) else None
+    unlocked = ({**before, "registration": {**registration, "locked": None}}
+                if isinstance(before, dict) and isinstance(registration, dict) else None)
+    if (intent.get("kind") != "managed_worktree_remove"
+            or intent.get("expected") != {"exists": False, "registration": None, "index": None}
+            or not isinstance(reason, str) or not reason.startswith("loop-manager-worktree:")
+            or current != unlocked):
+        raise manager_git_journal.MutationEvidenceError(
+            "관리 worktree 정리 중간 잠금 상태를 확인할 수 없습니다.")
+    git(repo, "worktree", "lock", f"--reason={reason}", str(worktree))
+    if observe() != before:
+        raise manager_git_journal.MutationEvidenceError(
+            "관리 worktree 정리 잠금 복원이 확인되지 않았습니다.")
 
 
 def remove_cleanup_worktree(
@@ -172,12 +193,11 @@ def remove_cleanup_worktree(
         _head, _branch, _index, dirty = effects._capture_local_worktree_state(worktree)
         if dirty or effects._git_operation_entries(worktree):
             return CleanupAssessment("dirty", "worktree 제거 직전 권위 있는 변경이 있습니다.")
-        arguments = ("--force",) if effects._ignored_worktree_paths(worktree) else ()
         if state_dir is None:
             current = still_safe()
             if current.status != "safe":
                 return current
-            effects.git(repo, "worktree", "remove", *arguments, str(worktree))
+            effects.git(repo, "worktree", "remove", str(worktree))
         else:
             if not owner:
                 raise WorkspaceOwnershipError("관리 worktree 정리 journal의 계획 identity가 없습니다.")
@@ -196,9 +216,22 @@ def remove_cleanup_worktree(
                     raise WorkspaceOwnershipError("관리 worktree 정리 직전 상태가 변경됐습니다.")
                 if still_safe().status != "safe":
                     raise WorkspaceOwnershipError("관리 worktree 정리 직전 안전 판정이 변경됐습니다.")
-                remove_arguments = (("--force", "--force")
-                                    if before["registration"]["locked"] else arguments)
-                effects.git(repo, "worktree", "remove", *remove_arguments, str(worktree))
+                if before["registration"]["locked"]:
+                    effects.git(repo, "worktree", "unlock", str(worktree))
+                try:
+                    if still_safe().status != "safe":
+                        raise WorkspaceOwnershipError("관리 worktree 정리 직전 안전 판정이 변경됐습니다.")
+                    effects.git(repo, "worktree", "remove", str(worktree))
+                except RuntimeError:
+                    if before["registration"]["locked"]:
+                        restore_cleanup_unlock(
+                            {"kind": "managed_worktree_remove", "before": before,
+                             "expected": expected},
+                            effects._managed_worktree_transition_state(repo, worktree),
+                            repo, worktree, git=effects.git,
+                            observe=lambda: effects._managed_worktree_transition_state(repo, worktree),
+                        )
+                    raise
                 effects._write_managed_worktree_receipt(
                     state_dir, token, repo, worktree, before, expected, "remove",
                 )
@@ -210,6 +243,10 @@ def remove_cleanup_worktree(
                 expected=expected,
                 observe=lambda: effects._managed_worktree_transition_state(repo, worktree),
                 apply=apply, marker=marker,
+                restore_intermediate=lambda intent, observed: restore_cleanup_unlock(
+                    intent, observed, repo, worktree, git=effects.git,
+                    observe=lambda: effects._managed_worktree_transition_state(repo, worktree),
+                ),
             )
     except RuntimeError as error:
         return CleanupAssessment("unverifiable", f"worktree 제거 실패: {error}")

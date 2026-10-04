@@ -4,6 +4,7 @@ from tests.support.execution import complete_execution_effects, execution_handle
 from pathlib import Path
 from contextlib import ExitStack
 from dataclasses import replace
+import copy
 from loop_manager_internal.git.managed_rebase_validation import FileChange, IndexEntry
 from tests.support.current_rebase import current_rebase_case
 import sqlite3
@@ -695,6 +696,10 @@ class ManagedTransitionTests(unittest.TestCase):
             def git(_repo, *args, **_kwargs):
                 if args[0] == 'rev-parse':
                     return SimpleNamespace(returncode=0, stdout=TREE + '\n')
+                if args[:2] == ('worktree', 'unlock'):
+                    observed['registration']['locked'] = None
+                if args[:2] == ('worktree', 'lock'):
+                    observed['registration']['locked'] = args[2].removeprefix('--reason=')
                 if args[:2] == ('worktree', 'remove'):
                     observed.update(exists=False, registration=None, index=None)
                     worktree.rmdir()
@@ -702,7 +707,7 @@ class ManagedTransitionTests(unittest.TestCase):
 
             with (mock.patch.object(loop_manager, 'git', side_effect=git),
                   mock.patch.object(loop_manager, '_managed_worktree_transition_state',
-                                    side_effect=lambda *_: observed.copy()),
+                                    side_effect=lambda *_: copy.deepcopy(observed)),
                   mock.patch.object(loop_manager, '_capture_local_worktree_state',
                                     return_value=(OLD, BRANCH, {}, {})),
                   mock.patch.object(loop_manager, '_git_operation_entries',
@@ -729,7 +734,7 @@ class ManagedTransitionTests(unittest.TestCase):
                 '*/active.json',
             ))), 1)
 
-    def test_locked_cleanup_rechecks_without_stranding_journal_after_stale_proof(self):
+    def test_locked_cleanup_restores_journal_after_stale_proof_and_interrupted_unlock(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo = root / 'repo'
@@ -749,6 +754,10 @@ class ManagedTransitionTests(unittest.TestCase):
             def git(_repo, *args, **_kwargs):
                 if args[0] == 'rev-parse':
                     return SimpleNamespace(returncode=0, stdout=TREE + '\n')
+                if args[:2] == ('worktree', 'unlock'):
+                    observed['registration']['locked'] = None
+                if args[:2] == ('worktree', 'lock'):
+                    observed['registration']['locked'] = args[2].removeprefix('--reason=')
                 if args[:2] == ('worktree', 'remove'):
                     removed.append(args)
                     observed.update(exists=False, registration=None, index=None)
@@ -757,13 +766,14 @@ class ManagedTransitionTests(unittest.TestCase):
 
             with (mock.patch.object(loop_manager, 'git', side_effect=git),
                   mock.patch.object(loop_manager, '_managed_worktree_transition_state',
-                                    side_effect=lambda *_: observed.copy()),
+                                    side_effect=lambda *_: copy.deepcopy(observed)),
                   mock.patch.object(loop_manager, '_capture_local_worktree_state',
                                     return_value=(OLD, BRANCH, {}, {})),
                   mock.patch.object(loop_manager, '_git_operation_entries', return_value={}),
                   mock.patch.object(loop_manager, '_ignored_worktree_paths', return_value=[]),
                   mock.patch.object(loop_manager, 'assess_cleanup', side_effect=[
-                      safe, loop_manager.CleanupAssessment('unverifiable', 'stale'), safe, safe,
+                      safe, loop_manager.CleanupAssessment('unverifiable', 'stale'),
+                      safe, safe, KeyboardInterrupt(), safe, safe, safe,
                   ])):
                 first = loop_manager.remove_cleanup_worktree(
                     repo, worktree, safe, state_dir=state, owner='plan:G-091')
@@ -775,11 +785,18 @@ class ManagedTransitionTests(unittest.TestCase):
                 self.assertFalse(loop_manager._recover_managed_worktree_removal(
                     state, repo, worktree))
 
+                with self.assertRaises(KeyboardInterrupt):
+                    loop_manager.remove_cleanup_worktree(
+                        repo, worktree, safe, state_dir=state, owner='plan:G-091')
+                self.assertIsNone(observed['registration']['locked'])
+                self.assertFalse(loop_manager._recover_managed_worktree_removal(
+                    state, repo, worktree))
+                self.assertEqual(observed['registration']['locked'], 'loop-manager-worktree:owned')
                 second = loop_manager.remove_cleanup_worktree(
                     repo, worktree, safe, state_dir=state, owner='plan:G-091')
-                self.assertEqual(second.status, 'safe')
+                self.assertEqual(second.status, 'safe', second.reason)
                 self.assertFalse(worktree.exists())
-                self.assertEqual(removed[0][:4], ('worktree', 'remove', '--force', '--force'))
+                self.assertEqual(removed[0], ('worktree', 'remove', str(worktree)))
                 self.assertEqual(list((state / 'manager-git-journal').glob('*/active.json')), [])
 
     def test_direct_rebase_result_recovers_after_git_before_journal_result(self):

@@ -104,11 +104,14 @@ class ProjectDiagnosticPublicationUnitTests(unittest.TestCase):
         with mock.patch.object(loop_manager, 'git', return_value=SimpleNamespace(returncode=0, stdout='')) as git:
             loop_manager.push_diagnostic_checkpoint(adapter, request, 'a' * 40)
         adapter._validated_push_url.assert_called_once_with(request)
-        self.assertEqual(git.call_args.args, (
-            Path('/state/G-107'), '-c', f'core.hooksPath={os.devnull}', 'push',
+        args = git.call_args.args
+        operand = args[-2]
+        self.assertRegex(operand, r'^loop-manager-verified-[0-9a-f]{32}://target$')
+        self.assertEqual(args, (
+            Path('/state/G-107'), '-c', f'core.hooksPath={os.devnull}',
+            '-c', f'url.https://github.com/example/repo.git.insteadOf={operand}', 'push',
             '--force-with-lease=refs/heads/loop-manager/diagnostics/G-107/artifact:',
-            'https://github.com/example/repo.git',
-            'a' * 40 + ':refs/heads/loop-manager/diagnostics/G-107/artifact'))
+            operand, 'a' * 40 + ':refs/heads/loop-manager/diagnostics/G-107/artifact'))
         self.assertNotIn('origin', git.call_args.args)
 
     def test_diagnostic_never_pushes_an_original_branch_or_unverified_origin(self):

@@ -4,7 +4,7 @@ from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
 from loop_manager_internal.application.contracts import CleanupAssessment
-from loop_manager_internal.git import manager_git_journal
+from loop_manager_internal.git import cleanup_service, manager_git_journal
 from loop_manager_internal.runtime import bootstrap
 from loop_manager_internal.runtime.contracts import RuntimeMutation
 from loop_manager_internal.runtime.contracts import RuntimeWorktree
@@ -174,6 +174,7 @@ class RecoverManagedWorktreeRemovalEffects:
     _canonical_path: Callable[..., object]
     _managed_worktree_marker: Callable[..., object]
     _managed_worktree_transition_state: Callable[..., object]
+    git: Callable[..., object]
 
 
 def _recover_managed_worktree_removal(
@@ -185,6 +186,10 @@ def _recover_managed_worktree_removal(
         observe=lambda: effects._managed_worktree_transition_state(repo, worktree),
         marker=lambda intent: effects._managed_worktree_marker(
             state_dir, intent, "remove",
+        ),
+        restore_intermediate=lambda intent, observed: cleanup_service.restore_cleanup_unlock(
+            intent, observed, repo, worktree, git=effects.git,
+            observe=lambda: effects._managed_worktree_transition_state(repo, worktree),
         ),
     )
 

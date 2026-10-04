@@ -625,6 +625,7 @@ def execute(
     observe: Callable[[], dict[str, Any]],
     apply: Callable[[str], None],
     marker: Callable[[Mapping[str, Any]], bool],
+    restore_intermediate: Callable[[Mapping[str, Any], Mapping[str, Any]], None] | None = None,
 ) -> str:
     """Execute or recover one transition. Return applied, recovered, or equal.
 
@@ -651,6 +652,10 @@ def execute(
             or _read(slot / f"{previous['id']}.intent.json") != previous
         ):
             raise MutationEvidenceError("Manager Git 활성 intent가 불완전합니다.")
+        if (current != previous["before"] and current != previous["expected"]
+                and restore_intermediate is not None):
+            restore_intermediate(previous, current)
+            current = observe()
         if current == previous["expected"]:
             candidates = verified_transition(previous, current, marker(previous))
             _finish(slot, active, previous, current, candidates, "complete")
@@ -695,6 +700,7 @@ def recover_active(
     state_dir: Path, *, repo: str, kind: str, target: str,
     observe: Callable[[], dict[str, Any]],
     marker: Callable[[Mapping[str, Any]], bool],
+    restore_intermediate: Callable[[Mapping[str, Any], Mapping[str, Any]], None] | None = None,
 ) -> bool:
     """Finalize an interrupted write before a caller's early equal return."""
     slot = _slot(state_dir, repo, kind, target)
@@ -707,6 +713,10 @@ def recover_active(
     ) or _read(slot / f"{intent.get('id')}.intent.json") != intent:
         raise MutationEvidenceError("Manager Git 활성 intent가 불완전합니다.")
     current = observe()
+    if (current != intent["before"] and current != intent["expected"]
+            and restore_intermediate is not None):
+        restore_intermediate(intent, current)
+        current = observe()
     if current == intent["before"]:
         return False
     candidates = verified_transition(intent, current, marker(intent))
