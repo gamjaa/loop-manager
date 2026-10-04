@@ -9,7 +9,9 @@ import json
 import sqlite3
 from uuid import uuid4
 
-from loop_manager_internal.execution.validation_feedback import Feedback, bounded_diagnostic, normalize_feedback
+from loop_manager_internal.execution.validation_feedback import (
+    Feedback, bounded_diagnostic, normalize_feedback, redact_secrets,
+)
 from loop_manager_internal.storage.runtime_state import _transaction
 
 
@@ -132,7 +134,7 @@ class ValidationFeedbackRepository:
             "INSERT INTO validation_results "
             "(repo,plan_id,definition_revision,stage,classification,raw_output,identities,created_at) "
             "VALUES (?,?,?,?,?,?,?,?)",
-            (repo, plan_id, revision, stage, classification, raw,
+            (repo, plan_id, revision, stage, classification, redact_secrets(raw),
              json.dumps([item.identity for item in feedback]), now),
         )
         result_id = cursor.lastrowid

@@ -32,10 +32,11 @@ Keep credential-bearing verify and Review feedback out of durable diagnostics an
 
 ## Progress
 
-- [ ] Cover JSON-formatted credentials at the shared feedback boundary.
-- [ ] Strengthen secret-bearing bootstrap and feedback tests.
+- [x] Cover JSON-formatted credentials at the shared feedback boundary.
+- [x] Strengthen secret-bearing bootstrap and feedback tests.
 
 ## Decision Log
 
 - Manifest findings 8 and 47 identify a concrete disclosure path and a false-positive secrecy assertion. High priority follows the possibility of credentials entering a durable log or Worker prompt.
 - Observed feedback path: `loop_manager_internal/execution/validation_feedback.py`.
+- Reused `redact_secrets` for both normalized diagnostics and durable validation-result output, so quoted credential values are removed before either feedback persistence or Worker prompt delivery.

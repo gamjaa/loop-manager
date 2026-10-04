@@ -75,15 +75,19 @@ class BootstrapEntryTests(unittest.TestCase):
             self.assertEqual(loop_manager.main(), 7)
         self.assertEqual(events, ["lock", "prepare", "child", "unlock"])
 
-        arguments = loop_manager.runtime_child_arguments(
-            ["--config", "custom/config.ini", "run"],
-            source=source,
-            state_dir=state_dir,
-            config_path=source / "custom/config.ini",
-            runtime=runtime,
-        )
-        self.assertIn(str(source / "custom/config.ini"), arguments)
-        self.assertNotIn("secret-value", " ".join(arguments))
+        with tempfile.TemporaryDirectory() as directory:
+            config_path = Path(directory) / "config.ini"
+            sentinel = "bootstrap-config-secret-sentinel"
+            config_path.write_text(f"[telegram]\\ntoken = {sentinel}\\n")
+            arguments = loop_manager.runtime_child_arguments(
+                ["--config", "custom/config.ini", "run"],
+                source=source,
+                state_dir=state_dir,
+                config_path=config_path,
+                runtime=runtime,
+            )
+            self.assertIn(str(config_path), arguments)
+            self.assertNotIn(sentinel, " ".join(arguments))
         secured = loop_manager.runtime_child_arguments(
             ["--runtime-mutation-id", "spoofed", "run"],
             source=source, state_dir=state_dir,

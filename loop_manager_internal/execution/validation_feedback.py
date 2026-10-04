@@ -11,8 +11,8 @@ _ISSUE = re.compile(r"(?mi)^[ \t]*ISSUE_ID:[ \t]*(?P<id>[^\r\n]+?)[ \t]*$")
 _VERDICT = re.compile(r"(?mi)^[ \t]*VERDICT:[ \t]*(?:PASS|FAIL)[ \t]*$")
 _ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _CREDENTIAL = re.compile(
-    r"(?i)(\b(?:api[_-]?key|access[_-]?token|telegram[_-]?token|secret|password)"
-    r"\b\s*[:=]\s*)([^\s,;]+)"
+    r"(?ix)(\b(?:api[_-]?key|access[_-]?token|telegram[_-]?token|secret|password)"
+    r"\b[\"']?\s*[:=]\s*)(?:\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'|[^\s,;]+)"
 )
 _BEARER = re.compile(r"(?i)(\bBearer\s+)([^\s,;]+)")
 _TOKEN = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{20,}|\d{8,10}:[A-Za-z0-9_-]{35})\b")
