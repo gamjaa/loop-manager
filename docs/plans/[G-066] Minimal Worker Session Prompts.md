@@ -8,6 +8,19 @@ depends_on:
   - G-065
   - G-127
   - G-129
+  - G-134
+  - G-135
+  - G-136
+  - G-137
+  - G-138
+  - G-139
+  - G-140
+  - G-141
+  - G-142
+  - G-143
+  - G-144
+  - G-145
+  - G-146
 complexity: high
 risk: medium
 priority: low
