@@ -138,7 +138,8 @@ from loop_manager_internal.storage import execution_checkpoint_state
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.git import managed_rebase_validation
 
-class PlanRemoteRecoveryFixture(BlockedRemoteFixture):
+class PublishedSuccessorPreparation:
+    """Shared setup for scenarios that start from a published checkpoint."""
     def published_successor(self):
         branch, worktree = self.plan()['branch'], self.plan()['worktree']
         remote = 'c' * 40
@@ -202,6 +203,7 @@ class PlanRemoteRecoveryFixture(BlockedRemoteFixture):
         return original
 
 
+class PlanRemoteRecoveryFixture(PublishedSuccessorPreparation, BlockedRemoteFixture):
     def guidance_tracking_updates(self):
         original = self.published_successor()
         branch = self.plan()['branch']
@@ -321,9 +323,9 @@ class PlanRemoteRecoveryFixture(BlockedRemoteFixture):
             self.persisted_adoption_scope()
 
 
-class ProjectRemoteRecoveryFixture(ProjectBlockedRemoteFixture):
+class ProjectRemoteRecoveryFixture(PublishedSuccessorPreparation, ProjectBlockedRemoteFixture):
     def published_project_successor(self, *, plan_block=False):
-        original = PlanRemoteRecoveryFixture.published_successor(self)
+        original = self.published_successor()
         if not plan_block:
             scoped_blocking.clear_plan_block(self.connection, self.repo, 'G-106')
             self.connection.execute(
