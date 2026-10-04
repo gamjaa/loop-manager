@@ -51,8 +51,9 @@ def backfill_plan_shas(
             "--format=%H",
             "--",
             row["plan_path"],
-            check=False,
         )
+        if result.returncode:
+            raise RuntimeError("ExecPlan plan SHA backfill Git 이력을 읽을 수 없습니다.")
         commits = [
             value
             for value in result.stdout.splitlines()

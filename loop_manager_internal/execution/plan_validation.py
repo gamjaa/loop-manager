@@ -6,10 +6,13 @@ from dataclasses import dataclass
 from loop_manager_internal.application.contracts import ExecPlanMetadataError
 from loop_manager_internal.catalog import execplan_catalog
 from loop_manager_internal.execution import execution_revision
+from loop_manager_internal.git.command_adapter import ExternalObservationError, revision_document_or_none
+from loop_manager_internal.runtime.contracts import GitLockError
 from pathlib import Path
 import hashlib
 import json
 import sqlite3
+import stat
 
 
 def _execplan_input_fingerprint(entries: list[tuple[str, str | None]]) -> str:
@@ -40,7 +43,11 @@ def _worktree_execplan_input_fingerprint(effects: WorktreeExecplanInputFingerpri
     entries = []
     for relative_path in effects._execplan_input_paths(plan):
         path = worktree / relative_path
-        contents = path.read_text(encoding="utf-8") if path.is_file() else None
+        try:
+            regular = stat.S_ISREG(path.stat().st_mode)
+        except FileNotFoundError:
+            regular = False
+        contents = path.read_text(encoding="utf-8") if regular else None
         entries.append((relative_path, contents))
     return effects._execplan_input_fingerprint(entries)
 
@@ -60,8 +67,8 @@ def _revision_execplan_input_fingerprint(
 ) -> str:
     entries = []
     for relative_path in effects._execplan_input_paths(plan):
-        shown = effects.git(repo_path, "show", f"{revision}:{relative_path}", check=False)
-        entries.append((relative_path, shown.stdout if shown.returncode == 0 else None))
+        contents = revision_document_or_none(effects.git, repo_path, revision, relative_path)
+        entries.append((relative_path, contents))
     return effects._execplan_input_fingerprint(entries)
 
 
@@ -81,25 +88,13 @@ def _revision_execplan_source_fingerprint(
 
     entries = []
     for relative_path in json.loads(str(plan["sources"])):
-        shown = effects.git(
-            repo_path,
-            "show",
-            f"{revision}:{relative_path}",
-            check=False,
-        )
-        if shown.returncode and relative_path != "docs/PRODUCT.md":
+        contents = revision_document_or_none(effects.git, repo_path, revision, relative_path)
+        if contents is None and relative_path != "docs/PRODUCT.md":
             archive_path = execplan_catalog.requirement_archive_path(
                 str(relative_path)
             )
-            shown = effects.git(
-                repo_path,
-                "show",
-                f"{revision}:{archive_path}",
-                check=False,
-            )
-        entries.append(
-            (str(relative_path), shown.stdout if shown.returncode == 0 else None)
-        )
+            contents = revision_document_or_none(effects.git, repo_path, revision, archive_path)
+        entries.append((str(relative_path), contents))
     return effects._execplan_input_fingerprint(entries)
 
 
@@ -360,6 +355,10 @@ def validate_active_execplan_metadata(
 ) -> dict[str, object]:
     try:
         current = effects.validate_execplan(worktree, relative_path)
+    except (ExternalObservationError, GitLockError):
+        raise
+    except OSError:
+        raise
     except RuntimeError as error:
         raise ExecPlanMetadataError(str(error)) from error
     comparison_plan = plan

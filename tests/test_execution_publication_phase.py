@@ -4,6 +4,8 @@ from tests.support.execution import ExecutionFixture
 from dataclasses import replace
 import json
 from types import SimpleNamespace
+import sqlite3
+from pathlib import Path
 from unittest import TestCase, mock
 
 from loop_manager_internal.execution import execution_handlers as handlers
@@ -18,6 +20,200 @@ from tests.support.execution import READY_WORKER_RESULT
 from tests.support.execution_recovery_scenarios import ExecutionRecoveryScenarios
 from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 from tests.support.execution_assertions import _assert_post_push_pr_attachment
+from loop_manager_internal.git.github_observation import PrForBranchEffects, pr_for_branch
+from loop_manager_internal.execution.execution_ownership_handler import OwnershipHandler
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+from loop_manager_internal.recovery import checkpoint_ownership
+from loop_manager_internal.recovery import blocked_plan_reconciliation, project_blocked_recovery
+from loop_manager_internal.execution.plan_validation import (
+    RevisionExecplanSourceFingerprintEffects, _revision_execplan_source_fingerprint,
+    validate_active_execplan_metadata,
+)
+from loop_manager_internal.git.command_adapter import ExternalObservationError
+from loop_manager_internal.runtime.contracts import GitLockError
+
+
+class ExternalOwnershipObservationTests(TestCase):
+    def test_blocked_checkpoint_adoption_retries_failed_owner_observation(self):
+        checkpoint = SimpleNamespace(operation=None)
+        connection = mock.Mock()
+        connection.execute.return_value.fetchone.return_value = {'phase': 'published'}
+        owner = mock.Mock(side_effect=RecoveryFailure(
+            RecoveryReason.PUBLICATION_RETRY, 'different diagnostic'))
+        reconciler = SimpleNamespace(
+            connection=connection, repo='/repo', repo_path=Path('/repo'),
+            state_dir=Path('/state'),
+            ports=SimpleNamespace(
+                _reconcile_published_blocked_checkpoint=lambda *args, **kwargs: 'unchanged',
+                git=lambda *args, **kwargs: SimpleNamespace(stdout='head\n'),
+                owned_remote_oid=owner,
+            ),
+            _plan=lambda plan_id: {'publication_remote_oid': 'head'},
+        )
+        plan = {'plan_id': 'G-001', 'branch': 'branch', 'worktree': '/worktree'}
+        context = {'branch_oid': 'head'}
+        with mock.patch.object(blocked_plan_reconciliation, 'ExecutionCheckpointRepository') as checkpoints, \
+             mock.patch.object(blocked_plan_reconciliation, 'BlockedCheckpointRepository'):
+            checkpoints.return_value.get.return_value = checkpoint
+            with self.assertRaises(RecoveryFailure) as caught:
+                blocked_plan_reconciliation.BlockedPlanReconciler._adopt(
+                    reconciler, plan, context)
+        self.assertIs(caught.exception.reason, RecoveryReason.PUBLICATION_RETRY)
+        self.assertTrue(owner.call_args.kwargs['strict_observation'])
+
+    def test_project_checkpoint_lineage_retries_failed_owner_observation(self):
+        connection = mock.Mock()
+        connection.execute.return_value.fetchone.return_value = {
+            'accepted_remote_oid': 'head', 'published_oid': None,
+        }
+        owner = mock.Mock(side_effect=RecoveryFailure(
+            RecoveryReason.PUBLICATION_RETRY, 'different diagnostic'))
+        reconciler = SimpleNamespace(
+            connection=connection, repo='/repo', repo_path=Path('/repo'),
+            ports=SimpleNamespace(owned_remote_oid=owner, git=mock.Mock()),
+        )
+        plan = {'plan_id': 'G-001', 'branch': 'branch', 'worktree': '/worktree',
+                'publication_remote_oid': 'head'}
+        with self.assertRaises(RecoveryFailure) as caught:
+            project_blocked_recovery.ProjectBlockedReconciler._lineage_known(
+                reconciler, plan, {})
+        self.assertIs(caught.exception.reason, RecoveryReason.PUBLICATION_RETRY)
+        self.assertTrue(owner.call_args.kwargs['strict_observation'])
+
+    def test_blocked_scope_ref_observation_failure_remains_retryable(self):
+        branch = 'loop-manager/G-001'
+        branch_ref = f'refs/remotes/origin/{branch}'
+        before = SimpleNamespace(refs={branch_ref: ('old', '')})
+        current = SimpleNamespace(
+            refs={branch_ref: ('head', ''), f'refs/heads/{branch}': ('head', '')},
+            branch=branch, head='head',
+        )
+        connection = mock.Mock()
+        connection.execute.side_effect = [
+            SimpleNamespace(fetchone=lambda: {'present': 1}),
+            SimpleNamespace(fetchone=lambda: {
+                'registered_origin': 'example/repo', 'base_ref': 'refs/heads/main',
+                'branch_ref': f'refs/heads/{branch}', 'base_result': 'present',
+                'base_oid': 'base', 'origin_url': 'https://github.com/example/repo',
+            }),
+            SimpleNamespace(fetchone=lambda: {
+                'status': 'PLAN_BLOCKED', 'workspace_owned': 1,
+                'branch': branch, 'worktree': '/worktree',
+                'publication_remote_oid': 'head',
+            }),
+            SimpleNamespace(fetchone=lambda: {
+                'origin': 'example/repo', 'base_branch': 'main',
+            }),
+        ]
+        owner = mock.Mock(side_effect=RecoveryFailure(
+            RecoveryReason.PUBLICATION_RETRY, 'different diagnostic'))
+        observed = SimpleNamespace(result='present', oid='head')
+        with mock.patch.object(blocked_plan_reconciliation.observations, 'observe_refs',
+                               return_value=(observed, observed)):
+            with self.assertRaises(RecoveryFailure) as caught:
+                blocked_plan_reconciliation.validated_scope_refs(
+                    connection, Path('/repo'), '/repo', 'main', 'G-001',
+                    before, None, current,
+                    git=lambda *args, **kwargs: SimpleNamespace(stdout='https://github.com/example/repo\n'),
+                    github_repository=lambda origin: 'example/repo',
+                    owned_remote_oid=owner,
+                )
+        self.assertIs(caught.exception.reason, RecoveryReason.PUBLICATION_RETRY)
+        self.assertTrue(owner.call_args.kwargs['strict_observation'])
+
+    def test_workspace_metadata_git_lock_does_not_become_agent_correction(self):
+        effects = SimpleNamespace(validate_execplan=mock.Mock(
+            side_effect=GitLockError('changed lock text')))
+        with self.assertRaises(GitLockError):
+            validate_active_execplan_metadata(
+                effects, Path('/repo'), Path('/worktree'),
+                'docs/plans/plan.md', {},
+            )
+
+    def test_failed_source_read_does_not_fall_back_to_archive(self):
+        source = 'docs/requirements/[R-001] Source.md'
+        calls = []
+        def git(_repo, operation, *args, **kwargs):
+            calls.append((operation, args))
+            if operation == 'show':
+                return SimpleNamespace(returncode=128, stdout='different diagnostic')
+            return SimpleNamespace(
+                returncode=0, stdout=f'100644 blob deadbeef\t{source}\0')
+        effects = RevisionExecplanSourceFingerprintEffects(
+            _execplan_input_fingerprint=mock.Mock(), git=git,
+        )
+        with self.assertRaises(ExternalObservationError):
+            _revision_execplan_source_fingerprint(
+                effects, Path('/repo'), 'base', {'sources': json.dumps([source])}
+            )
+        self.assertEqual([operation for operation, _args in calls], ['show', 'ls-tree'])
+        effects._execplan_input_fingerprint.assert_not_called()
+
+    def test_pr_response_must_be_valid_before_absence_or_identity_is_accepted(self):
+        malformed_fields = json.dumps([{
+            'url': 'https://example.test/pr/1', 'state': [], 'mergedAt': None,
+            'headRefOid': 'head', 'headRefName': 'loop-manager/G-001',
+            'baseRefName': 'main', 'mergeable': 'UNKNOWN',
+        }])
+        for response in ('not JSON', '{}', '[null]', '[{}, {}]', malformed_fields):
+            with self.subTest(response=response):
+                effects = PrForBranchEffects(command=lambda *args, **kwargs:
+                    SimpleNamespace(returncode=0, stdout=response))
+                with self.assertRaises(RuntimeError):
+                    pr_for_branch(effects, Path('/repo'), 'loop-manager/G-001')
+        effects = PrForBranchEffects(command=lambda *args, **kwargs:
+            SimpleNamespace(returncode=0, stdout='[]'))
+        self.assertIsNone(pr_for_branch(effects, Path('/repo'), 'loop-manager/G-001'))
+        failed = PrForBranchEffects(command=lambda *args, **kwargs:
+            SimpleNamespace(returncode=1, stdout='[]'))
+        with self.assertRaises(RuntimeError):
+            pr_for_branch(failed, Path('/repo'), 'loop-manager/G-001')
+
+    def test_checkpoint_sqlite_failure_is_retryable_and_does_not_check_git(self):
+        connection = mock.Mock()
+        connection.execute.side_effect = sqlite3.OperationalError('database is locked')
+        git = mock.Mock()
+        handler = OwnershipHandler(SimpleNamespace(
+            state=SimpleNamespace(connection=connection),
+            identity=SimpleNamespace(repo='/repo'), git=git,
+        ))
+        context = SimpleNamespace(plan=SimpleNamespace(plan_id='G-001'))
+        with self.assertRaises(RecoveryFailure) as caught:
+            handler._owned_checkpoint_remote(context, {}, None, None)
+        self.assertIs(caught.exception.reason, RecoveryReason.PUBLICATION_RETRY)
+        git.assert_not_called()
+
+    def test_failed_live_ref_query_does_not_become_ownership_refusal(self):
+        row = {
+            'phase': 'published', 'result': 'published', 'branch': 'branch',
+            'worktree': '/worktree', 'accepted_remote_oid': 'old',
+            'pending_remote_oid': None, 'published_oid': 'published',
+            'commit_identity': 'identity', 'tree_oid': 'tree',
+        }
+        connection = mock.Mock()
+        connection.execute.return_value.fetchone.return_value = row
+        def git(_repo, operation, *args, **kwargs):
+            if operation == 'show':
+                return SimpleNamespace(stdout='[G-001] BLOCKED checkpoint\nScope: plan\nCheckpoint-Identity: identity\n')
+            if operation == 'rev-parse':
+                return SimpleNamespace(stdout='tree\n')
+            return SimpleNamespace(returncode=1 if operation == 'ls-remote' else 0, stdout='')
+        with self.assertRaises(RecoveryFailure) as caught:
+            checkpoint_ownership.owned_remote_oid(
+                connection, Path('/repo'), '/repo', 'G-001', 'branch',
+                Path('/worktree'), 'old', git, strict_observation=True,
+            )
+        self.assertIs(caught.exception.reason, RecoveryReason.PUBLICATION_RETRY)
+        def malformed_git(repo, operation, *args, **kwargs):
+            if operation == 'ls-remote':
+                return SimpleNamespace(returncode=0, stdout='malformed ref response')
+            return git(repo, operation, *args, **kwargs)
+        with self.assertRaises(RecoveryFailure) as caught:
+            checkpoint_ownership.owned_remote_oid(
+                connection, Path('/repo'), '/repo', 'G-001', 'branch',
+                Path('/worktree'), 'old', malformed_git, strict_observation=True,
+            )
+        self.assertIs(caught.exception.reason, RecoveryReason.PUBLICATION_RETRY)
 
 
 class ExecutionPublicationPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):

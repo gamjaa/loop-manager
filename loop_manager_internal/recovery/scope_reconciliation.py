@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from loop_manager_internal.agents.scope_contracts import AgentScopeError
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.git import rebase_block_reconciliation
+from loop_manager_internal.git import manager_git_journal
 from loop_manager_internal.recovery import blocked_plan_reconciliation
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.scoped_blocking import GUIDANCE_BLOCK_REASON
@@ -660,12 +662,21 @@ def _resume_owned_checkpoint_project_block(effects: ResumeOwnedCheckpointProject
                 connection, repo_path, repo, plan_id, branch, worktree,
                 before_head, effects.git, before_head=current.head,
                 recorded_oid=before_head, require_live=False,
+                strict_observation=True,
             )
             live = effects.git(repo_path, 'ls-remote', '--heads', 'origin',
                        f'refs/heads/{branch}', check=False)
-            rows = [line.split() for line in live.stdout.splitlines() if line.strip()]
-            if (original_oid != before_head or live.returncode
-                    or rows != [[remote_oid, f'refs/heads/{branch}']]):
+            if live.returncode:
+                raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
+                                      'checkpoint remote observation failed')
+            ref = f'refs/heads/{branch}'
+            try:
+                live_oid = manager_git_journal.parse_remote_branch_oid(live.stdout, ref)
+            except manager_git_journal.MutationEvidenceError as error:
+                raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
+                                      'checkpoint remote response malformed') from error
+            if (original_oid != before_head
+                    or live_oid != remote_oid):
                 return False
             owned_oid = remote_oid
         else:
@@ -674,9 +685,12 @@ def _resume_owned_checkpoint_project_block(effects: ResumeOwnedCheckpointProject
                 remote_oid, effects.git,
                 before_head=current.head if direct_review else before_head,
                 recorded_oid=str(plan['publication_remote_oid'] or '') or None,
+                strict_observation=True,
             )
         if owned_oid is None:
             return False
+    except RecoveryFailure:
+        raise
     except (OSError, RuntimeError, WorkspaceOwnershipError, ValueError):
         return False
     with runtime_state._transaction(connection):
@@ -844,6 +858,7 @@ def _resume_legacy_review_count_block(effects: ResumeLegacyReviewCountBlockEffec
                         connection, repo_path, repo, plan_id, branch,
                         worktree, remote_oid, effects.git, before_head=snapshot.head,
                         recorded_oid=str(plan["publication_remote_oid"] or "") or None,
+                        strict_observation=True,
                     ) != remote_oid):
                 return False
             published_resume = {
@@ -853,11 +868,18 @@ def _resume_legacy_review_count_block(effects: ResumeLegacyReviewCountBlockEffec
             }
         elif remote_oid is not None and remote_oid != plan["publication_remote_oid"]:
             return False
-        if remote_oid is not None and effects.git(
-            repo_path, "merge-base", "--is-ancestor", remote_oid,
-            snapshot.head, check=False,
-        ).returncode != 0:
-            return False
+        if remote_oid is not None:
+            ancestry = effects.git(
+                repo_path, "merge-base", "--is-ancestor", remote_oid,
+                snapshot.head, check=False,
+            )
+            if ancestry.returncode not in (0, 1):
+                raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
+                                      'checkpoint ancestry observation failed')
+            if ancestry.returncode == 1:
+                return False
+    except RecoveryFailure:
+        raise
     except (AgentScopeError, OSError, RuntimeError, WorkspaceOwnershipError,
             KeyError, TypeError, ValueError):
         return False
@@ -932,6 +954,8 @@ def _resume_interrupted_blocked_rebase(effects: ResumeInterruptedBlockedRebaseEf
                 connection, repo, str(plan['plan_id']), worktree,
                 checkpoint.target_base_oid, repo_path=repo_path, branch=branch,
                 agent_session_id=plan['worker_session_id'])
+        except RecoveryFailure:
+            raise
         except (RuntimeError, OSError, ValueError) as error:
             effects._update_blocked_error(connection, repo, str(plan['plan_id']),
                                   f'중단된 차단 해제 rebase 게시를 완료할 수 없습니다: {error}')
@@ -963,6 +987,7 @@ def _resume_interrupted_blocked_rebase(effects: ResumeInterruptedBlockedRebaseEf
             before_head=None if confirmed else before_head,
             recorded_oid=original_oid if confirmed else str(plan['publication_remote_oid'] or '') or None,
             require_live=not confirmed,
+            strict_observation=True,
         ) if not plan['pr_url'] else None
         safe = (
             owned_oid is not None
@@ -1012,6 +1037,8 @@ def _resume_interrupted_blocked_rebase(effects: ResumeInterruptedBlockedRebaseEf
                     )
                 safe = safe and effects._blocked_resume_worktree_matches(
                     worktree, marker, snapshot, restore_staged=False)
+    except RecoveryFailure:
+        raise
     except (OSError, RuntimeError, ValueError, KeyError, TypeError):
         safe = False
     if not safe:

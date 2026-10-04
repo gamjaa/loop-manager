@@ -7,16 +7,63 @@ import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 from loop_manager_internal.documents import document_drafts
 from loop_manager_internal.documents import document_publication
 import loop_manager
 from loop_manager_internal.maintenance import maintenance_git
+from loop_manager_internal.maintenance import cycle_service
+from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningError
 from loop_manager_internal.maintenance import maintenance_file_inventory
 from loop_manager_internal.storage import maintenance_file_ledger
 from loop_manager_internal.maintenance import maintenance_file_publication
 from loop_manager_internal.storage import maintenance_state
+
+
+class MaintenanceObservationFailureTests(unittest.TestCase):
+    def test_git_failure_and_confirmed_nonancestor_have_distinct_dispositions(self):
+        failed = subprocess.CompletedProcess(['git'], 128, '')
+        with mock.patch.object(maintenance_git, '_git', return_value=failed):
+            context = maintenance_git.bounded_remote_change_context(
+                Path('/repo'), 'main', 'before', 'after')
+        self.assertTrue(context.observation_failed)
+        self.assertFalse(context.ok)
+
+        def missing_remote(_repo, operation, *args):
+            return subprocess.CompletedProcess(
+                ['git'], 1 if operation == 'show-ref' else 128, ''
+            )
+        with mock.patch.object(maintenance_git, '_git', side_effect=missing_remote):
+            context = maintenance_git.bounded_remote_change_context(
+                Path('/repo'), 'main', 'before', 'after')
+        self.assertFalse(context.observation_failed)
+        self.assertFalse(context.ok)
+
+        def git(_repo, operation, *args):
+            if operation == 'merge-base':
+                return subprocess.CompletedProcess(['git'], 1, '')
+            return subprocess.CompletedProcess(['git'], 0, 'after\n')
+        with mock.patch.object(maintenance_git, '_git', side_effect=git):
+            context = maintenance_git.bounded_remote_change_context(
+                Path('/repo'), 'main', 'before', 'after')
+        self.assertFalse(context.observation_failed)
+        self.assertFalse(context.ok)
+
+    def test_context_caller_preserves_operational_and_unsafe_categories(self):
+        cycle = SimpleNamespace(cycle_base_sha='after', last_success_commit='before')
+        context = maintenance_git.GitChangeContext('before', 'after', (), False,
+                                                   'diagnostic', True)
+        with mock.patch.object(maintenance_git, 'bounded_remote_change_context', return_value=context):
+            with self.assertRaises(RuntimeError) as caught:
+                cycle_service._maintenance_change_context_text(Path('/repo'), 'main', cycle)
+        self.assertNotIsInstance(caught.exception, MaintenancePlanningError)
+        context = maintenance_git.GitChangeContext('before', 'after', (), False,
+                                                   'unsafe', False)
+        with mock.patch.object(maintenance_git, 'bounded_remote_change_context', return_value=context):
+            with self.assertRaises(MaintenancePlanningError):
+                cycle_service._maintenance_change_context_text(Path('/repo'), 'main', cycle)
 
 
 class DocumentDraftTest(unittest.TestCase):

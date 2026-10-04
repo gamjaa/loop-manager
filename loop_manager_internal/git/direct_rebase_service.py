@@ -13,6 +13,7 @@ from loop_manager_internal.git import rebase_file_evidence
 from loop_manager_internal.recovery import checkpoint_ownership
 from loop_manager_internal.recovery import project_blocked_recovery
 from loop_manager_internal.recovery import scoped_blocking
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 from loop_manager_internal.storage import execution_checkpoint_state
 from loop_manager_internal.storage import runtime_state
 from pathlib import Path
@@ -263,10 +264,18 @@ def _direct_rebase_history_proven(
         observed, decision = effects._current_rebase_service(
             connection, repo_path, state_dir, repo, plan_id, worktree, branch,
             target=target_base,
-        ).require_owned()
+        ).observe()
+        if decision.status is managed_rebase_validation.RebaseStatus.UNAVAILABLE:
+            raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
+                                  'direct rebase observation unavailable')
         return decision.status.value == 'complete' and observed.head == after_head
-    except (RuntimeError, OSError):
+    except RecoveryFailure:
+        raise
+    except manager_git_journal.MutationEvidenceError:
         return False
+    except (RuntimeError, OSError) as error:
+        raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
+                              'direct rebase observation failed') from error
 
 
 def _direct_rebase_result_matches_observation(
@@ -444,7 +453,8 @@ def _publish_direct_rebase_checkpoint(effects: PublishDirectRebaseCheckpointEffe
             return False
         return checkpoint_ownership.owned_remote_oid(
             connection, repo_path, repo, plan_id, branch, worktree, original, effects.git,
-            recorded_oid=original, require_live=oid == original) == original
+            recorded_oid=original, require_live=oid == original,
+            strict_observation=True) == original
 
     managed_rebase_publication.publish_checkpoint(
         state=state, checkpoints=checkpoints, repo=repo, plan_id=plan_id,

@@ -2,11 +2,90 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 import loop_manager
+from loop_manager_internal.git.command_adapter import ExternalObservationError, revision_document_or_none
+from loop_manager_internal.planning.planner_validation import (
+    FutureIdeaItemsEffects, _future_idea_items, validate_planner_result,
+    _ready_plan_snapshot_at_revision,
+)
+from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningError
+from loop_manager_internal.runtime.contracts import GitLockError
 from tests.support.catalog import write_execplan
 from tests.support.git import git_command, make_remote_repository
 from tests.support.worker import dummy_worker_sessions
+
+
+class RevisionDocumentObservationTests(unittest.TestCase):
+    def test_git_lock_keeps_its_retry_category(self):
+        git = mock.Mock(side_effect=GitLockError('different lock text'))
+        with self.assertRaises(GitLockError):
+            revision_document_or_none(git, Path('/repo'), 'base', 'docs/PRODUCT.md')
+        self.assertEqual(git.call_count, 1)
+
+    def test_failed_show_requires_confirmed_tree_absence(self):
+        calls = []
+        def git(_repo, operation, *args, **kwargs):
+            calls.append(operation)
+            if operation == "show":
+                return SimpleNamespace(returncode=128, stdout="changed diagnostic")
+            return SimpleNamespace(returncode=0, stdout="100644 blob deadbeef\tdocs/FUTURE_IDEAS.md\0")
+
+        with self.assertRaises(ExternalObservationError):
+            revision_document_or_none(git, Path("/repo"), "base", "docs/FUTURE_IDEAS.md")
+        self.assertEqual(calls, ["show", "ls-tree"])
+
+    def test_confirmed_absence_does_not_invent_previous_future_ideas(self):
+        def git(_repo, operation, *args, **kwargs):
+            return SimpleNamespace(returncode=128 if operation == "show" else 0, stdout="")
+        effects = FutureIdeaItemsEffects(
+            _future_idea_items_from_text=lambda value: ((value,),) if value else (),
+            git=git,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            self.assertEqual(_future_idea_items(effects, Path(directory), "base"), ())
+
+    def test_future_idea_file_read_error_remains_operational(self):
+        effects = FutureIdeaItemsEffects(
+            _future_idea_items_from_text=lambda value: (), git=mock.Mock(),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'docs/FUTURE_IDEAS.md'
+            path.parent.mkdir()
+            path.write_text('idea', encoding='utf-8')
+            with mock.patch.object(Path, 'read_text', side_effect=OSError('unreadable')):
+                with self.assertRaises(ExternalObservationError):
+                    _future_idea_items(effects, Path(directory), 'base')
+        effects.git.assert_not_called()
+
+    def test_planner_tree_failure_does_not_become_agent_correction(self):
+        effects = SimpleNamespace(
+            changed_files=lambda *args: [],
+            mutable_snapshot_token=lambda *args: 'snapshot',
+            git=mock.Mock(side_effect=RuntimeError('different failure text')),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ExternalObservationError):
+                validate_planner_result(
+                    effects, Path(directory), 'base',
+                    ['docs/plans/[G-001] Proposed.md'],
+                )
+
+    def test_ready_revision_read_failure_remains_operational(self):
+        effects = SimpleNamespace(git_bytes=mock.Mock(side_effect=RuntimeError('Git lock')))
+        with self.assertRaises(ExternalObservationError):
+            _ready_plan_snapshot_at_revision(
+                effects, Path('/repo'), 'base', {'path': 'docs/plans/plan.md'}
+            )
+
+    def test_confirmed_missing_ready_revision_keeps_safety_decision(self):
+        git_bytes = mock.Mock(side_effect=[RuntimeError('missing'), b''])
+        effects = SimpleNamespace(git_bytes=git_bytes)
+        with self.assertRaises(MaintenancePlanningError):
+            _ready_plan_snapshot_at_revision(
+                effects, Path('/repo'), 'base', {'path': 'docs/plans/plan.md'}
+            )
 
 
 class PlannerValidationRecoveryTest(unittest.TestCase):

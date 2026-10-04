@@ -19,6 +19,7 @@ from loop_manager_internal.git.managed_rebase_validation import ObservationFailu
 from loop_manager_internal.recovery import blocked_remote_observation as observations
 from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.recovery import scoped_blocking
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 from loop_manager_internal.storage.execplan_catalog_state import ReconciliationKind
 
 
@@ -194,7 +195,8 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
             return self.ports.owned_remote_oid(
                 self.connection, self.repo_path, self.repo, plan['plan_id'], plan['branch'],
                 Path(plan['worktree']), original, self.ports.git,
-                before_head=original, recorded_oid=original, require_live=False) == original
+                before_head=original, recorded_oid=original, require_live=False,
+                strict_observation=True) == original
         # Creating an absent original ref is safe only without any earlier
         # publication. A deleted known ref must never be recreated here.
         return bool(context['branch_oid'] is None and row is not None
@@ -539,7 +541,10 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
                 waiting['worktree_fingerprint'] = self.ports._worktree_state_signature(Path(context['identity']['worktree']))
                 context['waiting_input'] = observations.input_identity(waiting)
                 self._save(plan_id, key, stage, context)
-            retryable = isinstance(error, AssessmentPending) or isinstance(error, CheckpointPushError) and error.retryable
+            retryable = (isinstance(error, AssessmentPending)
+                         or isinstance(error, RecoveryFailure)
+                         and error.reason is RecoveryReason.PUBLICATION_RETRY
+                         or isinstance(error, CheckpointPushError) and error.retryable)
             if checkpoint.operation is None and not retryable and not isinstance(error, LocalWorkPending):
                 with runtime_state._transaction(self.connection):
                     self._save(plan_id, key, 'refused', context)

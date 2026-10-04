@@ -391,6 +391,11 @@ class PlanningWorkspaceService(PlanningService):
                 )
                 self._ports.events.error(message)
                 return self._operational_error()
+            except (RuntimeError, OSError) as error:
+                self._ports.events.error(f"maintenance 관측 재시도: {error}")
+                return PlanningOutcome(
+                    PlanningOutcomeKind.TRANSIENT_PAUSE, detail=str(error), error=True,
+                )
             run.maintenance_cycle = cycle
             run.maintenance_context = maintenance_context
             run.maintenance_change_context = change_context
@@ -413,5 +418,10 @@ class PlanningWorkspaceService(PlanningService):
                 )
                 self._ports.events.error(message)
                 return self._operational_error()
+            except (RuntimeError, OSError) as error:
+                self._ports.events.error(f"Planner 기준 관측 재시도: {error}")
+                return PlanningOutcome(
+                    PlanningOutcomeKind.TRANSIENT_PAUSE, detail=str(error), error=True,
+                )
         run.planning_worktree = worktree
         return None

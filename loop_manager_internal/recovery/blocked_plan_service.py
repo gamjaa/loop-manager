@@ -473,6 +473,7 @@ def resume_blocked_execplan_if_inputs_changed(
             worktree, remote_oid, effects.git,
             before_head=effects.git(worktree, 'rev-parse', 'HEAD').stdout.strip(),
             recorded_oid=str(plan['publication_remote_oid'] or '') or None,
+            strict_observation=True,
         ) if not plan['pr_url'] else None
         if owned_oid is None:
             effects._update_blocked_error(
@@ -495,8 +496,14 @@ def resume_blocked_execplan_if_inputs_changed(
     target_base_oid = effects.git(repo_path, 'rev-parse', revision).stdout.strip()
     if owned_oid is not None:
         before_head = effects.git(worktree, 'rev-parse', 'HEAD').stdout.strip()
-        if effects.git(repo_path, 'merge-base', '--is-ancestor', owned_oid,
-               before_head, check=False).returncode != 0:
+        ancestry = effects.git(repo_path, 'merge-base', '--is-ancestor', owned_oid,
+                               before_head, check=False)
+        if ancestry.returncode not in (0, 1):
+            raise recovery_runtime.RecoveryFailure(
+                recovery_runtime.RecoveryReason.PUBLICATION_RETRY,
+                'checkpoint ancestry observation failed',
+            )
+        if ancestry.returncode == 1:
             effects._update_blocked_error(connection, repo, str(plan['plan_id']),
                                   '게시 checkpoint 이후 로컬 HEAD 계보가 다릅니다.')
             return False
@@ -514,12 +521,10 @@ def resume_blocked_execplan_if_inputs_changed(
         check=False,
     )
     if base_ancestry.returncode not in (0, 1):
-        error = (
-            "BLOCKED 해제 전 원격 base ancestry 확인 실패:\n"
-            f"{base_ancestry.stdout[-8000:]}"
+        raise recovery_runtime.RecoveryFailure(
+            recovery_runtime.RecoveryReason.PUBLICATION_RETRY,
+            "BLOCKED 해제 전 원격 base ancestry 확인 실패",
         )
-        effects._update_blocked_error(connection, repo, str(plan["plan_id"]), error)
-        return False
     if base_ancestry.returncode == 1:
         rebased = effects._journaled_direct_rebase(
             connection, repo_path, repo, str(plan['plan_id']), worktree,
@@ -575,6 +580,8 @@ def resume_blocked_execplan_if_inputs_changed(
                     preserved_observation=preserved_observation,
                 )
             except recovery_runtime.RecoveryFailure as error:
+                if error.reason is recovery_runtime.RecoveryReason.PUBLICATION_RETRY:
+                    raise
                 effects._update_blocked_error(connection, repo, str(plan['plan_id']),
                                       f'차단 해제 rebase 게시를 완료할 수 없습니다: {error}')
                 return False

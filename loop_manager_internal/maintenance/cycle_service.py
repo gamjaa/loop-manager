@@ -21,6 +21,10 @@ def _maintenance_change_context_text(
         repo_path, base_branch, baseline, current
     )
     if not context.ok:
+        if context.observation_failed:
+            raise RuntimeError(
+                context.error or "bounded 유지보수 변경 문맥 관측에 실패했습니다."
+            )
         raise MaintenancePlanningError(
             context.error or "bounded 유지보수 변경 문맥을 만들 수 없습니다."
         )

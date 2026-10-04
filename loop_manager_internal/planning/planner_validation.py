@@ -4,12 +4,16 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.application.contracts import ValidatedPlanningResult
 from loop_manager_internal.application.contracts import _FUTURE_IDEA_ITEM
+from loop_manager_internal.git.command_adapter import (
+    ExternalObservationError, revision_document_or_none, revision_path_exists,
+)
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningError
 from loop_manager_internal.maintenance.maintenance_planning import PlanRevision
 from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
 from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot
 from loop_manager_internal.planning.planning_catalog import PlanDeletion
 from loop_manager_internal.planning.planning_catalog import PlannerValidationError
+from loop_manager_internal.runtime.contracts import GitLockError
 from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.storage.planning_publication_state import _MUTABLE_READY_EVIDENCE_FIELDS
 from pathlib import Path
@@ -18,6 +22,45 @@ import json
 import os
 import re
 import sqlite3
+import stat
+
+
+def _regular_file_or_absent(path: Path) -> bool:
+    try:
+        return stat.S_ISREG(path.stat().st_mode)
+    except FileNotFoundError:
+        return False
+
+
+def _ready_revision_contents(git_bytes: Callable[..., bytes], repository: Path,
+                             revision: str, path: str) -> bytes:
+    """Keep a missing READY declaration distinct from a failed Git read."""
+    try:
+        return git_bytes(repository, "show", f"{revision}:{path}")
+    except GitLockError:
+        raise
+    except (RuntimeError, OSError) as error:
+        try:
+            tree = git_bytes(repository, "ls-tree", "-z", "--full-tree",
+                             revision, "--", path)
+        except GitLockError:
+            raise
+        except (RuntimeError, OSError) as tree_error:
+            raise ExternalObservationError(
+                f"READY ExecPlan revision tree를 읽을 수 없습니다: {path}"
+            ) from tree_error
+        records = [record for record in tree.split(b"\0") if record]
+        if not records:
+            raise MaintenancePlanningError(
+                f"READY ExecPlan이 revision에 없습니다: {path}"
+            ) from error
+        if any(record.partition(b"\t")[2] != os.fsencode(path) for record in records):
+            raise ExternalObservationError(
+                f"READY ExecPlan revision tree 항목이 유효하지 않습니다: {path}"
+            ) from error
+        raise ExternalObservationError(
+            f"READY ExecPlan revision 문서를 읽을 수 없습니다: {path}"
+        ) from error
 
 
 @dataclass(frozen=True)
@@ -52,19 +95,17 @@ def _future_idea_items(
 ) -> tuple[tuple[str, ...], ...]:
     path = worktree / "docs/FUTURE_IDEAS.md"
     current_text = ""
-    if path.is_file():
+    if _regular_file_or_absent(path):
         try:
             current_text = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as error:
+        except OSError as error:
+            raise ExternalObservationError("Planner FUTURE_IDEAS를 읽을 수 없습니다.") from error
+        except UnicodeError as error:
             raise RuntimeError("Planner FUTURE_IDEAS를 읽을 수 없습니다.") from error
 
-    previous = effects.git(
-        worktree,
-        "show",
-        f"{active_sha}:docs/FUTURE_IDEAS.md",
-        check=False,
-    )
-    previous_text = previous.stdout if previous.returncode == 0 else ""
+    previous_text = revision_document_or_none(
+        effects.git, worktree, active_sha, "docs/FUTURE_IDEAS.md"
+    ) or ""
     return tuple(
         dict.fromkeys(
             effects._future_idea_items_from_text(previous_text)
@@ -103,7 +144,11 @@ def _validate_future_idea_separation(
     for plan_path in plan_paths:
         try:
             plan_text = (worktree / plan_path).read_text(encoding="utf-8")
-        except (OSError, UnicodeError) as error:
+        except OSError as error:
+            raise ExternalObservationError(
+                f"Planner ExecPlan을 읽을 수 없습니다: {plan_path}"
+            ) from error
+        except UnicodeError as error:
             raise RuntimeError(f"Planner ExecPlan을 읽을 수 없습니다: {plan_path}") from error
         plan_tokens = effects._idea_tokens(plan_text)
         if any(
@@ -162,7 +207,7 @@ def validate_planner_result(
     current_plans: dict[str, dict[str, object]] = {}
     for changed_path in planned_files:
         if changed_path == "docs/FUTURE_IDEAS.md":
-            if not (worktree / changed_path).is_file():
+            if not _regular_file_or_absent(worktree / changed_path):
                 raise PlannerValidationError(
                     "Planner는 docs/FUTURE_IDEAS.md를 삭제할 수 없습니다."
                 )
@@ -172,13 +217,7 @@ def validate_planner_result(
                 "Planner는 docs/plans의 새 계획, mutable READY와 "
                 "docs/FUTURE_IDEAS.md만 변경할 수 있습니다."
             )
-        existed = effects.git(
-            worktree,
-            "cat-file",
-            "-e",
-            f"{active_sha}:{changed_path}",
-            check=False,
-        ).returncode == 0
+        existed = revision_path_exists(effects.git, worktree, active_sha, changed_path)
         if existed:
             if changed_path not in snapshot.by_path:
                 if mutable_snapshot is None:
@@ -191,7 +230,7 @@ def validate_planner_result(
                     f"{changed_path}"
                 )
             base_paths.add(changed_path)
-        if not (worktree / changed_path).is_file():
+        if not _regular_file_or_absent(worktree / changed_path):
             plan_paths.append(changed_path)
             continue
         try:
@@ -202,7 +241,9 @@ def validate_planner_result(
                 require_priority=not existed,
                 allow_archive_fallback=False,
             )
-        except (OSError, UnicodeError, RuntimeError) as error:
+        except (UnicodeError, RuntimeError) as error:
+            if isinstance(error, (ExternalObservationError, GitLockError)):
+                raise
             raise PlannerValidationError(
                 f"Planner ExecPlan을 읽을 수 없습니다: {changed_path} ({error})"
             ) from error
@@ -309,7 +350,7 @@ def validate_planner_result(
             publication_hashes=tuple(
                 (path, effects.file_hash(worktree / path))
                 for path in planned_files
-                if (worktree / path).is_file()
+                if _regular_file_or_absent(worktree / path)
             ),
             revisions=tuple(
                 sorted(revisions, key=lambda item: int(item.snapshot.plan_id[2:]))
@@ -319,6 +360,8 @@ def validate_planner_result(
             ),
             mutable_snapshot=snapshot,
         )
+    except (ExternalObservationError, GitLockError):
+        raise
     except RuntimeError as error:
         raise PlannerValidationError(str(error)) from error
 
@@ -436,18 +479,12 @@ def _assert_ready_plan_revision(
 ) -> None:
     """Bind a READY row to the Git revision that published its exact body."""
 
-    try:
-        is_ancestor = effects._git_commit_is_ancestor(
-            repository, snapshot.plan_sha, active_revision
-        )
-        revision_contents = effects.git_bytes(
-            repository, "show", f"{snapshot.plan_sha}:{snapshot.path}"
-        )
-    except RuntimeError as error:
-        raise MaintenancePlanningError(
-            "READY ExecPlan plan revision SHA를 확인할 수 없습니다: "
-            f"{snapshot.plan_id}"
-        ) from error
+    is_ancestor = effects._git_commit_is_ancestor(
+        repository, snapshot.plan_sha, active_revision
+    )
+    revision_contents = _ready_revision_contents(
+        effects.git_bytes, repository, snapshot.plan_sha, snapshot.path,
+    )
     if not is_ancestor or revision_contents != contents:
         raise MaintenancePlanningError(
             "READY ExecPlan plan revision SHA가 현재 catalog 본문과 "
@@ -515,34 +552,24 @@ def _ready_plan_snapshot(
 ) -> ReadyPlanSnapshot:
     path = str(row["path"])
     target = worktree / path
-    if not target.is_file():
+    if not _regular_file_or_absent(target):
         raise MaintenancePlanningError(
             f"READY ExecPlan 파일을 확인할 수 없습니다: {path}"
         )
-    try:
-        base_contents = effects.git_bytes(worktree, "show", f"{active_sha}:{path}")
-        standard_index_flags = effects._git_path_has_standard_index_flags(worktree, path)
-        checkout_matches = effects._git_path_matches_revision(
-            worktree, active_sha, path, cached=False
-        )
-    except RuntimeError as error:
-        raise MaintenancePlanningError(
-            f"평가 기준 revision에서 READY ExecPlan을 확인할 수 없습니다: {path}"
-        ) from error
+    base_contents = _ready_revision_contents(effects.git_bytes, worktree, active_sha, path)
+    standard_index_flags = effects._git_path_has_standard_index_flags(worktree, path)
+    checkout_matches = effects._git_path_matches_revision(
+        worktree, active_sha, path, cached=False
+    )
     if not standard_index_flags or not checkout_matches:
         raise MaintenancePlanningError(
             f"READY ExecPlan 파일이 평가 기준 revision과 다릅니다: {path}"
         )
     snapshot = effects._ready_plan_snapshot_from_contents(row, base_contents)
     effects._assert_ready_plan_revision(worktree, active_sha, snapshot, base_contents)
-    try:
-        index_matches = effects._git_path_matches_revision(
-            worktree, active_sha, path, cached=True
-        )
-    except RuntimeError as error:
-        raise MaintenancePlanningError(
-            f"평가 기준 revision에서 READY ExecPlan을 확인할 수 없습니다: {path}"
-        ) from error
+    index_matches = effects._git_path_matches_revision(
+        worktree, active_sha, path, cached=True
+    )
     if not index_matches:
         raise MaintenancePlanningError(
             f"READY ExecPlan 파일이 평가 기준 revision과 다릅니다: {path}"
@@ -564,12 +591,7 @@ def _ready_plan_snapshot_at_revision(
     row: sqlite3.Row,
 ) -> ReadyPlanSnapshot:
     path = str(row["path"])
-    try:
-        contents = effects.git_bytes(repository, "show", f"{revision}:{path}")
-    except RuntimeError as error:
-        raise MaintenancePlanningError(
-            f"보존된 publication 기준에서 READY ExecPlan을 확인할 수 없습니다: {path}"
-        ) from error
+    contents = _ready_revision_contents(effects.git_bytes, repository, revision, path)
     snapshot = effects._ready_plan_snapshot_from_contents(row, contents)
     effects._assert_ready_plan_revision(repository, revision, snapshot, contents)
     return snapshot

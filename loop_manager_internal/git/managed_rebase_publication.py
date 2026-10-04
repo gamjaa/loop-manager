@@ -13,6 +13,10 @@ class RebasePublicationRejected(RecoveryFailure):
         super().__init__(RecoveryReason.REMOTE_OID_UNCERTAIN, detail)
 
 
+class RebaseRemoteObservationFailed(manager_git_journal.MutationEvidenceError):
+    """The live remote ref could not be read; its state remains unknown."""
+
+
 def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree,
                        branch, service, owns_remote, git, lookup_pr):
     current = checkpoints.get(repo, plan_id)
@@ -47,7 +51,10 @@ def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree
         selected = checkpoints.get(repo, plan_id)
         # Use the actual remote only for observing a completed intent. Never
         # replace its expected lease with an unexpected remote observation.
-        oid = manager_git_journal.live_remote_branch_oid(git, repo_path, branch)
+        try:
+            oid = manager_git_journal.live_remote_branch_oid(git, repo_path, branch)
+        except manager_git_journal.MutationEvidenceError as error:
+            raise RebaseRemoteObservationFailed(str(error)) from error
         head = intent['head'] if pending else acceptance['head']
         if oid not in ({expected_oid, head} if pending else {expected_oid}):
             raise RebasePublicationRejected('intermediate checkpoint remote lease changed or disappeared')
@@ -99,7 +106,8 @@ def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree
     except (RuntimeError, OSError) as error:
         # A current-state mismatch is a refusal; transport errors can retry the
         # same intent. No failure clears intent, adopts a new lease or work.
-        reason = (RecoveryReason.REMOTE_OID_UNCERTAIN if isinstance(error, manager_git_journal.MutationEvidenceError)
-                  and str(error) != 'rebase remote: live branch query failed'
+        reason = (RecoveryReason.REMOTE_OID_UNCERTAIN
+                  if isinstance(error, manager_git_journal.MutationEvidenceError)
+                  and not isinstance(error, RebaseRemoteObservationFailed)
                   else RecoveryReason.PUBLICATION_RETRY)
         raise RecoveryFailure(reason, str(error)) from error
