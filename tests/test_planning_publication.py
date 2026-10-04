@@ -18,6 +18,11 @@ from loop_manager_internal.maintenance import maintenance_reconciliation
 from loop_manager_internal.maintenance.maintenance_file_inventory import RootPlacement, TrackedSource
 from tests.support.maintenance import result_for
 from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot, mutable_snapshot_token
+from loop_manager_internal.storage.planning_publication_state import (
+    GeneralPlanningPublication, general_planning_publication,
+    record_general_planning_publication,
+)
+from loop_manager_internal.storage.database import GENERAL_PLANNING_PUBLICATIONS_SCHEMA
 from loop_manager_internal.maintenance.maintenance_orchestration import maintenance_planning_fingerprint
 from loop_manager_internal.planning.planning_runtime import (
     PlanningAgentResult,
@@ -40,6 +45,44 @@ from tests.support.planning_case import (
 )
 
 class PlanningPublicationTest(PlanningCase):
+    def test_publication_intent_rejects_bad_hash_before_insert_and_recovers(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        database = Path(directory.name) / "state.db"
+        connection = sqlite3.connect(database)
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        connection.execute(GENERAL_PLANNING_PUBLICATIONS_SCHEMA)
+        connection.execute("INSERT INTO projects (repo, base_branch) VALUES ('/repo', 'main')")
+        manifest = '{"session":"planner-session","plans":[]}'
+        valid = GeneralPlanningPublication(
+            "/repo", "prepared", "base", "commit", "token", "spec", "input",
+            manifest, hashlib.sha256(manifest.encode()).hexdigest(),
+        )
+        with self.assertRaises(PlanningResultInvalid):
+            record_general_planning_publication(
+                connection, replace(valid, manifest_hash="invalid")
+            )
+        for invalid_manifest in ("", "[]", "invalid"):
+            with self.subTest(manifest=invalid_manifest):
+                with self.assertRaises(PlanningResultInvalid):
+                    record_general_planning_publication(
+                        connection, replace(
+                            valid, manifest=invalid_manifest,
+                            manifest_hash=hashlib.sha256(invalid_manifest.encode()).hexdigest(),
+                        ),
+                    )
+        self.assertIsNone(general_planning_publication(connection, "/repo"))
+        self.assertEqual(record_general_planning_publication(connection, valid), valid)
+        self.assertEqual(record_general_planning_publication(connection, valid), valid)
+        self.assertEqual(general_planning_publication(connection, "/repo"), valid)
+        connection.close()
+        resumed = sqlite3.connect(database)
+        self.addCleanup(resumed.close)
+        resumed.row_factory = sqlite3.Row
+        self.assertEqual(general_planning_publication(resumed, "/repo"), valid)
+
     def test_unpublished_planning_slot_yields_only_clean_owned_base_worktree(self):
         for guard in ("clean", "dirty", "committed", "ownership", "publication", "project_blocked", "active"):
             with self.subTest(guard=guard), tempfile.TemporaryDirectory() as directory:

@@ -65,8 +65,25 @@ def record_general_planning_publication(
         publication.specification_fingerprint,
         publication.planning_fingerprint,
         publication.manifest_hash,
+        publication.manifest,
     )
     with connection:
+        try:
+            manifest_valid = isinstance(json.loads(publication.manifest), dict)
+        except (TypeError, ValueError):
+            manifest_valid = False
+        if not manifest_valid:
+            raise PlannerValidationError(
+                "general planning publication manifest가 유효하지 않습니다."
+            )
+        if (
+            not isinstance(publication.manifest_hash, str)
+            or hashlib.sha256(publication.manifest.encode("utf-8")).hexdigest()
+            != publication.manifest_hash
+        ):
+            raise PlannerValidationError(
+                "general planning publication manifest hash가 다릅니다."
+            )
         current = general_planning_publication(connection, repo)
         if current is not None:
             actual = (
@@ -77,6 +94,7 @@ def record_general_planning_publication(
                 current.specification_fingerprint,
                 current.planning_fingerprint,
                 current.manifest_hash,
+                current.manifest,
             )
             if actual != expected:
                 raise PlannerValidationError(

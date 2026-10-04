@@ -125,10 +125,18 @@ def snapshot_from_dict(value: Mapping[str, object]) -> ReadyPlanSnapshot:
             raise ValueError("incomplete current metadata")
         current_complexity = value.get("current_complexity")
         current_risk = value.get("current_risk")
-        sources = tuple(str(item) for item in value["sources"])  # type: ignore[arg-type]
-        depends_on = tuple(
-            str(item) for item in value["depends_on"]  # type: ignore[arg-type]
-        )
+        raw_sources = value["sources"]
+        raw_dependencies = value["depends_on"]
+        if (
+            not isinstance(raw_sources, list)
+            or not raw_sources
+            or any(not isinstance(item, str) for item in raw_sources)
+            or not isinstance(raw_dependencies, list)
+            or any(not isinstance(item, str) for item in raw_dependencies)
+        ):
+            raise ValueError("invalid snapshot collections")
+        sources = tuple(raw_sources)
+        depends_on = tuple(raw_dependencies)
         return ReadyPlanSnapshot(
             plan_id=str(value["plan_id"]),
             path=str(value["path"]),
