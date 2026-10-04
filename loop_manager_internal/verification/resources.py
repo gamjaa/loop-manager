@@ -11,6 +11,7 @@ MIB = 1024 * 1024
 DEFAULT_WORKER_BYTES = 128 * MIB  # 실측 전 초기 보호값이며 실측 RSS로 상향한다.
 SNAPSHOT_MAX_AGE = 2.0
 RESERVATION_GRACE = 0.75
+CPU_AVERAGE_SECONDS = 1.0
 
 
 def parse_parallelism(value: str) -> str | int:
@@ -32,6 +33,9 @@ class Snapshot:
     reason: str = ""
     affinity_cpus: int | None = None
     applied_quota: float | None = None
+    system_busy: float | None = None
+    cgroup_busy: float | None = None
+    busy_average: float | None = None
 
 
 @dataclass(frozen=True)
@@ -40,6 +44,8 @@ class Decision:
     reason: str
     limit: int
     fallback: bool = False
+    free_cpu: float | None = None
+    required_cpu: float | None = None
 
 
 def decide(snapshot: Snapshot, *, now: float, running: int, cap: str | int,
@@ -61,11 +67,14 @@ def decide(snapshot: Snapshot, *, now: float, running: int, cap: str | int,
     if stale or snapshot.busy is None or snapshot.available is None:
         allowed = running == 0 and global_running == 0 and pending_cpu == 0
         return Decision(allowed, "관측 실패/낡은 관측: 직렬 축소", 1, True)
-    free = snapshot.cpus - snapshot.busy - pending_cpu
-    # 확대에는 CPU 한 개의 여유를 요구하고 단일 CPU의 진행은 더 낮은 문턱을 쓴다.
-    threshold = min(1.0, snapshot.cpus * 0.8) if running == 0 else 1.0
+    load = max(snapshot.busy, snapshot.busy_average) if snapshot.busy_average is not None else snapshot.busy
+    free = snapshot.cpus - load - pending_cpu
+    # CPU 상한 안에서만 확대한다. 2코어에서는 0.5코어의 보호 여유를 두며,
+    # 낮은 순간 부하는 평균보다 먼저 확대하지 않고 순간 과부하는 즉시 제한한다.
+    threshold = min(1.0, snapshot.cpus * (0.8 if running == 0 else 0.25))
     allowed = free >= threshold and snapshot.busy < snapshot.cpus * 0.95
-    return Decision(allowed, "CPU 여유 활용" if allowed else "CPU 부하/미반영 예약 대기", limit)
+    return Decision(allowed, "CPU 여유 활용" if allowed else "CPU 부하/미반영 예약 대기", limit,
+                    free_cpu=free, required_cpu=threshold)
 
 
 def cgroup_paths(proc: Path = Path("/proc")):
@@ -181,6 +190,7 @@ class ResourceSampler:
         self.read = read or (windows_sample if os.name == "nt" else linux_sample)
         self.previous = None
         self.snapshot = None
+        self.busy_average = None
 
     def sample(self):
         now = self.clock()
@@ -191,23 +201,35 @@ class ResourceSampler:
             if not math.isfinite(cpus) or cpus <= 0:
                 raise ValueError("허용 CPU 관측 실패")
             used = None
+            system_busy = cgroup_busy = None
             if self.previous is not None:
                 then, old_total, old_busy, old_usage = self.previous
                 if total > old_total and busy >= old_busy and now > then and not (usage is not None and old_usage is not None and usage < old_usage):
-                    host_free = host_cpus * (1 - (busy - old_busy) / (total - old_total))
+                    system_busy = host_cpus * (busy - old_busy) / (total - old_total)
+                    host_free = host_cpus - system_busy
                     used = min(cpus, host_cpus - host_free) if os.name == "nt" else max(0, cpus - host_free)
                     if usage is not None and old_usage is not None:
-                        used = max(used, (usage - old_usage) / (now - then))
+                        cgroup_busy = (usage - old_usage) / (now - then)
+                        used = max(used, cgroup_busy)
                     elif cpus < host_cpus:
                         used = None
+            if used is None:
+                self.busy_average = None
+            elif self.busy_average is None:
+                self.busy_average = used
+            else:
+                weight = 1 - math.exp(-(now - self.previous[0]) / CPU_AVERAGE_SECONDS)
+                self.busy_average += weight * (used - self.busy_average)
             self.previous = now, total, busy, usage
             self.snapshot = Snapshot(now, cpus, used, available,
                                      "Windows system/affinity" if os.name == "nt" else "Linux affinity/proc/cgroup",
                                      "CPU 범위/차이 관측 불가" if used is None else "",
                                      int(cpus) if os.name == "nt" else host_cpus,
-                                     cpus if os.name != "nt" and cpus < host_cpus else None)
+                                     cpus if os.name != "nt" and cpus < host_cpus else None,
+                                     system_busy, cgroup_busy, self.busy_average)
         except (OSError, ValueError, KeyError, ZeroDivisionError, AttributeError) as error:
             self.previous = None
+            self.busy_average = None
             previous = self.snapshot
             self.snapshot = Snapshot(now, previous.cpus if previous else float(os.cpu_count() or 1),
                                      None, previous.available if previous else None,

@@ -12,6 +12,7 @@ import subprocess
 from loop_manager_internal.runtime.runtime_identity import _canonical_path
 from loop_manager_internal.agents.scope_contracts import GitSnapshot, AgentChange, AgentScopeError
 from loop_manager_internal.agents.agent_scope_decision import index_security_flags as _non_default_index_flags
+from loop_manager_internal.verification.git_timing import snapshot_timing
 
 
 _GIT_OPERATION_PATHS = (
@@ -242,13 +243,13 @@ def _git_operation_path_signature(path: Path) -> str:
 
 def _git_operation_entries(worktree: Path, *, effects: ObservationEffects) -> dict[str, str]:
     entries: dict[str, str] = {}
-    for name in _GIT_OPERATION_PATHS:
-        resolved = effects.git(
-            worktree,
-            "rev-parse",
-            "--git-path",
-            name,
-        ).stdout.strip()
+    arguments = tuple(value for name in _GIT_OPERATION_PATHS for value in ("--git-path", name))
+    resolved_paths = effects.git(worktree, "rev-parse", *arguments).stdout.splitlines()
+    # 줄바꿈을 포함하는 Git 경로는 기존 단일 조회로 해석한다.
+    if len(resolved_paths) != len(_GIT_OPERATION_PATHS) or any(not path for path in resolved_paths):
+        resolved_paths = [effects.git(worktree, "rev-parse", "--git-path", name).stdout.strip()
+                          for name in _GIT_OPERATION_PATHS]
+    for name, resolved in zip(_GIT_OPERATION_PATHS, resolved_paths):
         path = Path(resolved)
         if not path.is_absolute():
             path = worktree / path
@@ -449,17 +450,18 @@ def _normalize_legacy_ignored_snapshot(
 def capture_git_snapshot(worktree: Path, *, effects: ObservationEffects) -> GitSnapshot:
     """Capture local and repository-wide Git state without staging content."""
 
-    head, branch, index, dirty = _capture_local_worktree_state(worktree, effects=effects)
-    return GitSnapshot(
-        head=head,
-        branch=branch,
-        index=index,
-        dirty=dirty,
-        refs=_shared_ref_entries(worktree, effects=effects),
-        worktrees=_registered_worktree_entries(worktree, effects=effects),
-        config=_config_entries(worktree, effects=effects),
-        operations=_git_operation_entries(worktree, effects=effects),
-    )
+    with snapshot_timing(effects) as observed:
+        head, branch, index, dirty = _capture_local_worktree_state(worktree, effects=observed)
+        return GitSnapshot(
+            head=head,
+            branch=branch,
+            index=index,
+            dirty=dirty,
+            refs=_shared_ref_entries(worktree, effects=observed),
+            worktrees=_registered_worktree_entries(worktree, effects=observed),
+            config=_config_entries(worktree, effects=observed),
+            operations=_git_operation_entries(worktree, effects=observed),
+        )
 
 
 def agent_snapshot_changes(

@@ -162,6 +162,7 @@ def execute_manifest(modules, directory, writer, client, *, spawn=start_worker, 
     pending, workers, completed, passed = list(modules), [], set(), True
     budget = DEFAULT_WORKER_BYTES
     last_reason = None
+    last_allocation_at = None
     waiting = None
     try:
         while pending or any(worker.module is not None for worker in workers):
@@ -191,9 +192,11 @@ def execute_manifest(modules, directory, writer, client, *, spawn=start_worker, 
                 idle = next((worker for worker in workers if worker.module is None), None)
                 reply = client.request("acquire", **({"token": idle.token} if idle else {}), worker_bytes=budget)
                 reason = reply["reason"]
-                if reply["granted"] or reason != last_reason:
+                now = writer.clock()
+                if reply["granted"] or reason != last_reason or last_allocation_at is None or now - last_allocation_at >= 1:
                     writer.emit("allocation", decision=reply, estimated_worker_bytes=budget)
                     last_reason = reason
+                    last_allocation_at = now
                 if reply["granted"]:
                     if waiting is not None:
                         writer.emit("phase_end", name="resource_wait", start=waiting["at"],

@@ -45,6 +45,36 @@ class ResourceDecisionTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 parse_parallelism(value)
 
+    def test_two_cpu_expansion_uses_half_core_margin_but_preserves_pressure_guards(self):
+        expanded = decide(self.snapshot(cpus=2, busy=1.4, busy_average=1.3), now=10, running=1, cap="auto")
+        self.assertTrue(expanded.granted)
+        self.assertEqual(expanded.required_cpu, 0.5)
+        self.assertAlmostEqual(expanded.free_cpu, 0.6)
+        for values in ({"busy": 1.9}, {"busy": 0.5, "busy_average": 1.8}):
+            self.assertFalse(decide(self.snapshot(cpus=2, **values), now=10, running=1, cap="auto").granted)
+        self.assertFalse(decide(self.snapshot(cpus=2, busy=1.4), now=10, running=1, cap="auto", pending_cpu=1).granted)
+        self.assertFalse(decide(self.snapshot(cpus=2, busy=0), now=10, running=2, cap="auto").granted)
+        self.assertTrue(decide(self.snapshot(cpus=2, busy=1.3, busy_average=1.4), now=10, running=1, cap="auto").granted)
+
+    def test_sampler_distinguishes_system_cgroup_and_smooths_recovery(self):
+        clock = [0.0]
+        samples = iter([(2, 100, 20, 1024 * MIB, 0, 4),
+                        (2, 200, 40, 1024 * MIB, 1.6, 4),
+                        (2, 300, 60, 1024 * MIB, 1.6, 4)])
+        sampler = ResourceSampler(clock=lambda: clock[0], read=lambda: next(samples))
+        with mock.patch.object(resources.os, "name", "posix"):
+            self.assertIsNone(sampler.sample().busy)
+            clock[0] = 1
+            busy = sampler.sample()
+            self.assertAlmostEqual(busy.system_busy, 0.8)
+            self.assertAlmostEqual(busy.cgroup_busy, 1.6)
+            self.assertEqual(busy.busy_average, busy.busy)
+            clock[0] = 1.25
+            recovered = sampler.sample()
+        self.assertEqual(recovered.busy, 0)
+        self.assertGreater(recovered.busy_average, 1)
+        self.assertLess(recovered.busy_average, busy.busy_average)
+
     def test_sampler_measures_deltas_and_does_not_treat_first_sample_as_idle(self):
         clock = [0.0]
         samples = iter([(4, 100, 20, 1024 * MIB, 1.0, 4), (4, 200, 70, 1024 * MIB, 1.5, 4)])
@@ -109,6 +139,24 @@ class ReservationTests(unittest.TestCase):
         self.assertTrue(second["granted"])
         self.assertFalse(second["fallback"])
         self.assertEqual(len(self.coordinator.reservations), 2)
+
+    def test_allocation_reports_snapshot_age_running_and_protected_reservations(self):
+        first = self.request("acquire")
+        second = self.request("acquire")
+        self.assertEqual(first["snapshot_age"], 0)
+        self.assertEqual(second["running"], 1)
+        self.assertEqual(second["global_running"], 1)
+        self.assertEqual(second["pending_cpu"], 1)
+        self.assertEqual(second["pending_memory"], resources.DEFAULT_WORKER_BYTES)
+        self.request("bind", token=first["token"], pid=100)
+        self.request("not_started", token=second["token"])
+        self.now += resources.RESERVATION_GRACE + 1
+        third = self.request("acquire")
+        self.assertEqual(third["pending_cpu"], 0)
+        self.assertEqual(third["pending_memory"], 0)
+        self.coordinator.finish(self.a, stopped=False)
+        blocked = self.coordinator.request(self.b, self.sb, "acquire")
+        self.assertEqual(blocked["pending_cpu"], 2)
 
     def test_sample_that_ages_during_observation_serializes_then_recovers(self):
         def sample():

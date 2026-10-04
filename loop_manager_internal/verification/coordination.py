@@ -118,20 +118,26 @@ class VerifyCoordinator:
                 pending_memory = [value for value in self.reservations.values()
                                   if value["uncertain"] or value["pid"] is None or now - value["born_at"] < RESERVATION_GRACE]
                 memory = max(DEFAULT_WORKER_BYTES, int(data.get("worker_bytes", DEFAULT_WORKER_BYTES)))
+                global_running = sum(value["active"] for value in self.reservations.values())
+                diagnostics = {"snapshot": asdict(snapshot), "snapshot_age": now - snapshot.at,
+                               "running": running, "global_running": global_running,
+                               "pending_cpu": len(pending),
+                               "pending_memory": sum(value["bytes"] for value in pending_memory)}
                 decision = decide(snapshot, now=now, running=running, cap=owner["cap"],
-                                  pending_cpu=len(pending), pending_memory=sum(value["bytes"] for value in pending_memory),
+                                  pending_cpu=diagnostics["pending_cpu"], pending_memory=diagnostics["pending_memory"],
                                   worker_bytes=memory, existing=existing is not None,
-                                  global_running=sum(value["active"] for value in self.reservations.values()))
+                                  global_running=global_running)
                 if running >= decision.limit:
                     self.waiters.remove(session)
-                    return {**asdict(decision), "snapshot": asdict(snapshot)}
+                    return {**asdict(decision), **diagnostics}
                 if self.waiters[0] != session:
-                    return {"granted": False, "reason": "다른 verify의 배정 순서", "snapshot": asdict(snapshot)}
+                    return {**asdict(decision), **diagnostics,
+                            "granted": False, "reason": "다른 verify의 배정 순서"}
                 if decision.granted:
                     self.waiters.popleft()
                 else:
                     self.waiters.rotate(-1)
-                reply = {**asdict(decision), "snapshot": asdict(snapshot)}
+                reply = {**asdict(decision), **diagnostics}
                 if decision.granted:
                     token = token or secrets.token_hex(16)
                     if existing:
