@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
+from tests.support.profiles import profile_config
 from tests.support.catalog import write_execplan
 from tests.support.git import make_remote_repository
 from tests.support.worker import dummy_worker_sessions
@@ -223,7 +224,7 @@ class PlannerInterruptionRecoveryTest(unittest.TestCase):
             repo = make_remote_repository(directory)
             state_dir = Path(directory) / "state"
             state_dir.mkdir()
-            config = loop_manager.ROOT / "config/config.ini.example"
+            config = profile_config(self)
             connection = loop_manager.connect_database(state_dir, create=True)
 
             with mock.patch(
@@ -234,7 +235,7 @@ class PlannerInterruptionRecoveryTest(unittest.TestCase):
                 "loop_manager.ensure_safe_base_worktree"
             ), mock.patch(
                 "loop_manager.codex_model_efforts",
-                return_value={"gpt-6.1-sol": frozenset({"xhigh"})},
+                return_value={"test-strong": frozenset({"xhigh"})},
             ), mock.patch(
                 "loop_manager.subprocess.Popen", side_effect=start_process
             ), mock.patch(

@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
+from tests.support.profiles import profile_config
 from tests.support.catalog import write_execplan
 from tests.support.git import git_command, make_remote_repository, commit_and_push
 from tests.support.worker import dummy_worker_sessions
@@ -222,7 +223,7 @@ class ScopeInterruptedAgentsTest(AgentScopeFixture, unittest.TestCase):
                         "--state-dir",
                         str(state_dir),
                         "--config",
-                        str(loop_manager.ROOT / "config/config.ini.example"),
+                        str(profile_config(self)),
                         "run",
                     ],
                 ), mock.patch(
@@ -297,7 +298,7 @@ class ScopeInterruptedAgentsTest(AgentScopeFixture, unittest.TestCase):
                     "--state-dir",
                     str(state_dir),
                     "--config",
-                    str(loop_manager.ROOT / "config/config.ini.example"),
+                    str(profile_config(self)),
                     "run",
                 ],
             ), mock.patch(
