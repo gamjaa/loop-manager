@@ -278,6 +278,10 @@ def validate_planner_result(
             pending = connection.execute(
                 "SELECT plan_id, evidence FROM execplan_catalog_holds WHERE repo = ?", (repo,),
             ).fetchall()
+            if not pending:
+                # A new Planner error has no existing hold to reuse. Preserve
+                # the original catalog diagnostic for the correction retry.
+                raise
             causes = [dict(plan_id=item.plan_id, path=item.path, code=item.code,
                            message=item.message, source=item.source) for item in local.issues]
             held = {str(row[0]): json.loads(str(row[1])) for row in pending}

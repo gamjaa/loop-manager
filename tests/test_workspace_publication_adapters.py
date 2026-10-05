@@ -148,16 +148,39 @@ class WorkspaceEffectBoundaryTests(unittest.TestCase):
         names = {os.fsdecode(name) for name in raw_names}
         effects = fake_effects(workspace_service.ChangedFilesEffects)
         raw_effects = fake_effects(scope_observation.ObservationEffects)
-        raw_effects.git_bytes.return_value = b'\0'.join(raw_names) + b'\0'
+        raw_effects.git_bytes.side_effect = lambda repo, *args: (
+            b''.join(b'1\t0\t' + name + b'\0' for name in raw_names)
+            if '--numstat' in args else b'\0'.join(raw_names) + b'\0')
         effects._nul_git_paths.side_effect = lambda repo, *args: (
             scope_observation._nul_git_paths(repo, *args, effects=raw_effects))
+        effects._unstaged_git_paths.side_effect = lambda repo: (
+            scope_observation._unstaged_git_paths(repo, effects=raw_effects))
         self.assertEqual(workspace_service.changed_files(effects, Path('/repo')), sorted(names))
         self.assertEqual(workspace_service.changed_files(effects, Path('/repo'), 'base'), sorted(names))
-        self.assertTrue(all(call.args[-1] == '-z' for call in raw_effects.git_bytes.call_args_list))
+        self.assertTrue(all('-z' in call.args for call in raw_effects.git_bytes.call_args_list))
         self.assertTrue(any('--cached' in call.args for call in raw_effects.git_bytes.call_args_list))
         self.assertTrue(all('--no-renames' in call.args
                             for call in raw_effects.git_bytes.call_args_list
                             if 'diff' in call.args))
+
+    def test_changed_files_uses_content_observation_in_planner_composition(self):
+        calls = []
+
+        def git_bytes(repo, *args):
+            calls.append(args)
+            if '--numstat' in args:
+                return b'1\t0\treal edit\0-\t-\tbinary.bin\0'  # No stat-only paths.
+            if '--cached' in args:
+                return b'staged.txt\0'
+            if args[0] == 'ls-files':
+                return b'new.txt\0'
+            return b'unchanged copied file\0'  # Stale name-only index stat.
+
+        with mock.patch.object(loop_manager, 'git_bytes', side_effect=git_bytes):
+            self.assertEqual(loop_manager.changed_files(Path('/repo')),
+                             ['binary.bin', 'new.txt', 'real edit', 'staged.txt'])
+        self.assertFalse(any('--name-only' in args and '--cached' not in args
+                             for args in calls))
 
     def test_rebase_ignored_overlap_refuses_before_subprocess(self):
         effects = fake_effects(command_adapter.GitEffects)

@@ -39,7 +39,7 @@ class PersistedMergeProjectQueryTest(unittest.TestCase):
         self.connection.commit()
 
     def run_step(self, *, synchronize=None, real_lifecycle=False):
-        reconciled = SimpleNamespace(
+        reconciled = loop_manager.execplan_catalog_state.CatalogReconciliationResult(
             kind=loop_manager.execplan_catalog_state.ReconciliationKind.RECONCILED,
             revision_sha="a" * 40,
         )

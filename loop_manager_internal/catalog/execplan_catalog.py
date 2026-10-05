@@ -549,10 +549,11 @@ def snapshot_from_documents(
         try:
             header = parse_frontmatter(text)
             plan_id, title = header.get("id"), header.get("title")
-            if (not isinstance(plan_id, str) or _PLAN_ID.fullmatch(plan_id) is None
-                    or not isinstance(title, str)
+            if not isinstance(plan_id, str) or _PLAN_ID.fullmatch(plan_id) is None:
+                raise RuntimeError("ExecPlan id는 G-000 형식이어야 합니다.")
+            if (not isinstance(title, str)
                     or PurePosixPath(path).name != f"[{plan_id}] {title}.md"):
-                raise RuntimeError("ExecPlan ID와 파일명의 identity가 일치하지 않습니다.")
+                raise RuntimeError("ExecPlan 파일명은 `[id] title.md`와 일치해야 합니다.")
         except RuntimeError as error:
             raise ExecPlanCatalogError(
                 f"ExecPlan 파일이 유효하지 않습니다: {path} ({error})",

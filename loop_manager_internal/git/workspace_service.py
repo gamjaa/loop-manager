@@ -97,6 +97,7 @@ def _rebase_in_progress_for_branch(effects: RebaseInProgressForBranchEffects, wo
 class ChangedFilesEffects:
     """Named effects for changed_files; no entry-point/module access."""
     _nul_git_paths: Callable[..., object]
+    _unstaged_git_paths: Callable[..., object]
 
 
 def changed_files(effects: ChangedFilesEffects, worktree: Path, since: str | None = None) -> list[str]:
@@ -105,7 +106,7 @@ def changed_files(effects: ChangedFilesEffects, worktree: Path, since: str | Non
 
     if since:
         return sorted(paths("diff", "--no-renames", "--name-only", f"{since}..HEAD"))
-    return sorted(paths("diff", "--no-renames", "--name-only")
+    return sorted(set(effects._unstaged_git_paths(worktree))
                   | paths("diff", "--cached", "--no-renames", "--name-only")
                   | paths("ls-files", "--others", "--exclude-standard"))
 

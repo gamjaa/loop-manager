@@ -683,7 +683,7 @@ class ProjectCatalogConsumerTests(_CatalogRefreshCase):
                                            base_sha=self.sha, newly_activated=True)
         def observe_pr(*args, **kwargs):
             self.assertEqual(self.row()['current_revision_sha'], self.sha)
-            self.assertEqual(self.row()['priority'], expected_priority)
+            self.assertEqual(self.row()['priority'], 'critical')
             events.append('pr-after-catalog')
             kwargs['after_reconciliation']()
             return SimpleNamespace(step_result=0)
@@ -1149,5 +1149,31 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
                 contains_guidance_sections=lambda text: False,
                 load_execplan_catalog=manager.load_execplan_catalog)
             with self.assertRaisesRegex(planner_validation.PlannerValidationError, '보류 계획에 의존'):
+                planner_validation.validate_planner_result(effects, root, self.sha, [],
+                    connection=self.connection, repo=self.repo)
+
+    def test_new_planner_error_preserves_catalog_diagnostic_without_existing_holds(self):
+        import tempfile
+        from loop_manager_internal.planning import planner_validation
+        self.documents['docs/plans/[G-002] Dependency.md'] = self.fixture._text('G-002', 'Dependency')
+        self.boundary.refresh()
+        self.assertFalse(self.held())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = 'docs/plans/[G-006] New invalid.md'
+            documents = {**self.documents, 'docs/PRODUCT.md': 'Product.',
+                         path: self.fixture._text('G-006', 'New invalid', depends_on=('G-999',))}
+            for relative, text in documents.items():
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding='utf-8')
+            effects = SimpleNamespace(changed_files=lambda *args: [path],
+                mutable_snapshot_token=lambda *args: 'token',
+                git=lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=''),
+                _parse_execplan=catalog.parse_execplan_file,
+                contains_guidance_sections=lambda text: False,
+                load_execplan_catalog=manager.load_execplan_catalog)
+            with self.assertRaisesRegex(planner_validation.PlannerValidationError,
+                                        '존재하지 않는 depends_on ID.*G-999'):
                 planner_validation.validate_planner_result(effects, root, self.sha, [],
                     connection=self.connection, repo=self.repo)

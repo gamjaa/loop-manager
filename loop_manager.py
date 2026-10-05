@@ -2571,6 +2571,8 @@ validate_planning_worktree_ownership = _bind_effects(
 changed_files = _bind_effects(
     workspace_service.changed_files, lambda: workspace_service.ChangedFilesEffects(
         _nul_git_paths=lambda *args, **kwargs: _nul_git_paths(*args, **kwargs),
+        _unstaged_git_paths=lambda worktree: scope_observation._unstaged_git_paths(
+            worktree, effects=_scope_observation_effects()),
     ),
 )
 
