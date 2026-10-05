@@ -9,6 +9,8 @@ from unittest import mock
 from loop_manager_internal.catalog import execplan_catalog
 from loop_manager_internal.storage import execplan_catalog_state
 import loop_manager
+from tests.support import catalog as catalog_fixtures
+from tests.support.catalog import execplan_header
 
 
 def plan_text(
@@ -17,26 +19,104 @@ def plan_text(
     *,
     depends_on: tuple[str, ...] = (),
 ) -> str:
-    dependencies = "depends_on: []"
-    if depends_on:
-        dependencies = "depends_on:\n" + "\n".join(
-            f"  - {dependency}" for dependency in depends_on
-        )
-    return f"""---
-id: {plan_id}
-title: {title}
-sources:
-  - docs/PRODUCT.md
-{dependencies}
-complexity: low
-risk: low
-priority: normal
----
+    return f"""{execplan_header(plan_id, title, depends_on=depends_on)}
 
 ## Purpose
 
 Catalog fixture.
 """
+
+
+class ExecPlanHeaderRenderingTest(unittest.TestCase):
+    def test_default_header_and_empty_source_variants_are_preserved(self):
+        self.assertEqual(
+            execplan_header("G-001", "Default"),
+            "---\n"
+            "id: G-001\n"
+            "title: Default\n"
+            "sources:\n"
+            "  - docs/PRODUCT.md\n"
+            "depends_on: []\n"
+            "complexity: low\n"
+            "risk: low\n"
+            "priority: normal\n"
+            "---",
+        )
+        self.assertEqual(
+            execplan_header(
+                "G-002", "Variant", sources=(), depends_on=("G-001",),
+                complexity="medium", risk="high", priority=None,
+                include_priority=False,
+            ),
+            "---\n"
+            "id: G-002\n"
+            "title: Variant\n"
+            "sources: []\n"
+            "depends_on:\n"
+            "  - G-001\n"
+            "complexity: medium\n"
+            "risk: high\n"
+            "---",
+        )
+        self.assertEqual(
+            execplan_header(
+                "G-003", "Empty block", sources=(), empty_sources_as_list=False,
+            ),
+            "---\n"
+            "id: G-003\n"
+            "title: Empty block\n"
+            "sources:\n"
+            "\n"
+            "depends_on: []\n"
+            "complexity: low\n"
+            "risk: low\n"
+            "priority: normal\n"
+            "---",
+        )
+
+    def test_catalog_fixtures_share_header_and_keep_their_body_forms(self):
+        expected = execplan_header("G-001", "Shared")
+        self.assertTrue(
+            catalog_fixtures.plan_text("G-001", "Shared").startswith(
+                expected + "\n\n## Purpose\n"
+            )
+        )
+        self.assertIn(
+            "priority: None\n",
+            catalog_fixtures.plan_text("G-001", "Shared", priority=None),
+        )
+        self.assertTrue(
+            catalog_fixtures.archived_entry("G-001", "Shared").text.startswith(
+                expected + "\n\n## Purpose\n"
+            )
+        )
+
+        empty_source_header = execplan_header(
+            "G-002", "Empty", sources=(), empty_sources_as_list=False,
+        )
+        self.assertTrue(
+            catalog_fixtures.CatalogReconciliationFixture._text(
+                "G-002", "Empty", sources=(),
+            ).startswith(empty_source_header + "\n\n## Purpose\n")
+        )
+        self.assertIn(
+            "priority: None\n",
+            catalog_fixtures.CatalogReconciliationFixture._text(
+                "G-002", "Empty", priority=None,
+            ),
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = catalog_fixtures.make_catalog_root(directory)
+            path = catalog_fixtures.write_execplan(root, "G-001", "Shared")
+            self.assertTrue(
+                path.read_text(encoding="utf-8").startswith(
+                    expected + "\n\n## Purpose\n"
+                )
+            )
+            no_priority = catalog_fixtures.write_execplan(
+                root, "G-002", "No Priority", priority=None,
+            ).read_text(encoding="utf-8")
+            self.assertNotIn("priority:", no_priority.split("---", 2)[1])
 
 
 class ExecPlanCatalogSnapshotTest(unittest.TestCase):

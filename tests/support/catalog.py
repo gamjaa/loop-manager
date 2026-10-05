@@ -13,6 +13,48 @@ def make_catalog_root(directory: str) -> Path:
     (root / "docs/PRODUCT.md").write_text("# Product\n", encoding="utf-8")
     return root
 
+
+def execplan_header(
+    plan_id: str,
+    title: str,
+    *,
+    sources: tuple[str, ...] = ("docs/PRODUCT.md",),
+    depends_on: tuple[str, ...] = (),
+    complexity: str = "low",
+    risk: str = "low",
+    priority: str | None = "normal",
+    include_priority: bool = True,
+    empty_sources_as_list: bool = True,
+) -> str:
+    if sources:
+        source_lines = "sources:\n" + "".join(
+            f"  - {source}\n" for source in sources
+        ).rstrip("\n")
+    elif empty_sources_as_list:
+        source_lines = "sources: []"
+    else:
+        source_lines = "sources:\n"
+    if depends_on:
+        dependency_lines = "depends_on:\n" + "\n".join(
+            f"  - {dependency}" for dependency in depends_on
+        )
+    else:
+        dependency_lines = "depends_on: []"
+    fields = [
+        "---",
+        f"id: {plan_id}",
+        f"title: {title}",
+        source_lines,
+        dependency_lines,
+        f"complexity: {complexity}",
+        f"risk: {risk}",
+    ]
+    if include_priority:
+        fields.append(f"priority: {priority}")
+    fields.append("---")
+    return "\n".join(fields)
+
+
 def write_execplan(
     root: Path,
     plan_id: str,
@@ -24,23 +66,13 @@ def write_execplan(
     risk: str = "low",
     priority: str | None = "normal",
 ) -> Path:
-    source_lines = "sources: []" if not sources else "sources:\n" + "".join(
-        f"  - {source}\n" for source in sources
-    ).rstrip("\n")
-    dependency_lines = "depends_on: []" if not depends_on else "depends_on:\n" + "".join(
-        f"  - {dependency}\n" for dependency in depends_on
-    ).rstrip("\n")
-    priority_line = f"priority: {priority}\n" if priority is not None else ""
     plan = root / "docs/plans" / f"[{plan_id}] {title}.md"
     plan.write_text(
-        f"""---
-id: {plan_id}
-title: {title}
-{source_lines}
-{dependency_lines}
-complexity: {complexity}
-risk: {risk}
-{priority_line}---
+        f"""{execplan_header(
+            plan_id, title, sources=sources, depends_on=depends_on,
+            complexity=complexity, risk=risk, priority=priority,
+            include_priority=priority is not None,
+        )}
 
 ## Purpose
 
@@ -67,21 +99,7 @@ def plan_text(
     ),
     implementation: str = "Separate the responsibility into a testable module boundary.",
 ) -> str:
-    dependencies = "depends_on: []"
-    if depends_on:
-        dependencies = "depends_on:\n" + "\n".join(
-            f"  - {dependency}" for dependency in depends_on
-        )
-    return f"""---
-id: {plan_id}
-title: {title}
-sources:
-  - docs/PRODUCT.md
-{dependencies}
-complexity: low
-risk: low
-priority: {priority}
----
+    return f"""{execplan_header(plan_id, title, depends_on=depends_on, priority=priority)}
 
 ## Purpose
 
@@ -116,16 +134,7 @@ def archived_entry(
     *,
     text_suffix: str = "",
 ) -> execplan_catalog.ExecPlanCatalogEntry:
-    text = f"""---
-id: {plan_id}
-title: {title}
-sources:
-  - docs/PRODUCT.md
-depends_on: []
-complexity: low
-risk: low
-priority: normal
----
+    text = f"""{execplan_header(plan_id, title)}
 
 ## Purpose
 
@@ -251,22 +260,11 @@ class CatalogReconciliationFixture:
         priority="normal",
         body="Body.",
     ):
-        source_lines = "\n".join(f"  - {source}" for source in sources)
-        dependencies = "depends_on: []"
-        if depends_on:
-            dependencies = "depends_on:\n" + "\n".join(
-                f"  - {dependency}" for dependency in depends_on
-            )
-        return f"""---
-id: {plan_id}
-title: {title}
-sources:
-{source_lines}
-{dependencies}
-complexity: {complexity}
-risk: {risk}
-priority: {priority}
----
+        return f"""{execplan_header(
+            plan_id, title, sources=sources, depends_on=depends_on,
+            complexity=complexity, risk=risk, priority=priority,
+            empty_sources_as_list=False,
+        )}
 
 ## Purpose
 
