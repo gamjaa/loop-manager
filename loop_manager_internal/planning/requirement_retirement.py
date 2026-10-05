@@ -48,6 +48,7 @@ class FinalInput:
     source_oid: str
     criteria: tuple[str, ...]
     related_ids: tuple[str, ...]
+    reuse_from: Judgment | None = None
 
 
 @dataclass(frozen=True)
@@ -87,12 +88,21 @@ def assessment_prompt(inputs: tuple[FinalInput, ...]) -> str:
         return ""
     payload = [
         {"path": item.path, "input_token": item.token,
-         "related_plan_ids": item.related_ids, "criteria": item.criteria}
+         "related_plan_ids": item.related_ids, "criteria": item.criteria,
+         "reuse_from": ({"assessed_sha": item.reuse_from.assessed_sha,
+                          "criteria_evidence": item.reuse_from.criteria_evidence,
+                          "relevant_paths": item.reuse_from.relevant_paths}
+                         if item.reuse_from else None)}
         for item in inputs
     ]
     return (
         "\n\n아래 Requirement는 관련 ExecPlan이 모두 실제 MERGED다. 최신 원격 구현과 "
-        "검증 근거를 읽고 각 Acceptance Criterion의 전체 충족 여부를 판단하라. "
+        "reuse_from이 없으면 검증 근거를 읽고 각 Acceptance Criterion의 전체 충족 여부를 판단하라. "
+        "reuse_from이 있으면 구현·검증 입력은 같고 명세만 변경됐다. 먼저 assessed_sha부터 "
+        "최신 revision까지 두 명세 전문의 diff(인용하지 않은 절·새 절 포함)를 검토하라. "
+        "변경이 이 Requirement에 무관함을 확인하면 전체 충족 검사를 반복하지 말고 "
+        "outcome=reuse와 이전 criteria_evidence·relevant_paths를 그대로 반환하라. "
+        "새 관련 규칙 또는 불확실성이 있으면 전체 기준을 재평가하고 일반 결과를 반환하라. "
         "계획 작성 완료만으로 충족을 추정하지 마라. 추가 작업은 일반 Planner 권한으로 "
         "ExecPlan에 연결하라. Requirement 파일은 수정하지 마라. "
         "마지막 응답에 REQUIREMENT_JUDGMENTS: JSON 배열을 정확히 한 줄로 적어라. "
@@ -267,13 +277,16 @@ class RequirementRetirementPort:
         return result
 
     def _token(self, repo: str, repository: Path, revision: str, path: str,
-               oid: str, related, tree, relevant_paths: tuple[str, ...]) -> str:
+               oid: str, related, tree, relevant_paths: tuple[str, ...],
+               *, specification_revision: str | None = None) -> str:
         if any(not _valid_evidence_path(item) for item in relevant_paths):
             raise RetirementError(f"판단 관련 경로가 유효하지 않습니다: {path}")
-        relevant = self._evidence(repository, revision, relevant_paths)
-        unspecified = tuple((name, tree.get(name)) for name in SPECIFICATIONS
-                            if not any(item == name or item.startswith(name + "#")
-                                       for item in relevant_paths))
+        spec_revision = specification_revision or revision
+        spec_paths = tuple(item for item in relevant_paths if item.split("#", 1)[0] in SPECIFICATIONS)
+        implementation_paths = tuple(item for item in relevant_paths if item not in spec_paths)
+        relevant = self._evidence(repository, revision, implementation_paths)
+        relevant.update(self._evidence(repository, spec_revision, spec_paths))
+        specifications = _tree(self.git, repository, spec_revision, *SPECIFICATIONS)
         plan_evidence = tuple(
             (
                 str(row["plan_id"]), str(row["path"]), str(row["sources"]),
@@ -283,7 +296,7 @@ class RequirementRetirementPort:
                 _digest((str(row["verify_result"] or ""), str(row["review_result"] or ""))),
             ) for row in related
         )
-        return _digest(("explicit-specification-evidence-v3", path, oid, unspecified, plan_evidence,
+        return _digest(("complete-specification-context-v4", path, oid, tuple(sorted(specifications.items())), plan_evidence,
                         tuple(sorted((item, relevant.get(item)) for item in relevant_paths))))
 
     def pending(self, repo: str, repository: Path, revision: str) -> tuple[FinalInput, ...]:
@@ -304,8 +317,15 @@ class RequirementRetirementPort:
                     path, token, "uncertain", (str(error),), relevant_paths, revision,
                 ))
                 continue
+            reuse_from = None
+            if prior is not None and prior.outcome == "fulfilled" and prior.input_token != token:
+                if prior.input_token == self._token(
+                    repo, repository, revision, path, oid, related, tree, relevant_paths,
+                    specification_revision=prior.assessed_sha,
+                ):
+                    reuse_from = prior
             result.append(FinalInput(path, token, oid, criteria,
-                                     tuple(str(row["plan_id"]) for row in related)))
+                                     tuple(str(row["plan_id"]) for row in related), reuse_from))
         return tuple(result)
 
     def validate_result(self, repo: str, repository: Path, revision: str,
@@ -361,9 +381,17 @@ class RequirementRetirementPort:
                 raise RetirementError("Requirement 판단 path가 입력과 다릅니다.")
             item = expected[path]
             if value["input_token"] != item.token or value["outcome"] not in {
-                "fulfilled", "unfulfilled", "uncertain",
+                "fulfilled", "unfulfilled", "uncertain", "reuse",
             }:
                 raise RetirementError(f"Requirement 판단 입력 또는 결과가 유효하지 않습니다: {path}")
+            if value["outcome"] == "reuse":
+                prior = item.reuse_from
+                if (prior is None or value["criteria_evidence"] != list(prior.criteria_evidence)
+                    or value["relevant_paths"] != list(prior.relevant_paths)):
+                    raise RetirementError(f"명세 변경 영향 점검으로 재사용할 수 없는 판단입니다: {path}")
+                judgments.append(Judgment(path, item.token, prior.outcome,
+                                          prior.criteria_evidence, prior.relevant_paths, revision))
+                continue
             evidence = value["criteria_evidence"]
             paths = value["relevant_paths"]
             if (not isinstance(evidence, list) or len(evidence) != len(item.criteria)

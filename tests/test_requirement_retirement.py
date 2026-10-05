@@ -41,6 +41,7 @@ class FakeGit:
             "docs/ARCHITECTURE.md": b"# Architecture\n",
             "feature.py": b"implemented = True\n",
         }
+        self.revisions = {}
         self.blob_reads = 0
         self.index_resets = []
 
@@ -53,13 +54,14 @@ class FakeGit:
         if command == "cat-file":
             self.blob_reads += 1
             oid = args[-1]
-            return next(value for value in self.files.values()
+            return next(value for files in [self.files, *self.revisions.values()] for value in files.values()
                         if hashlib.sha1(b"blob " + str(len(value)).encode() + b"\0" + value).hexdigest() == oid)
         if command != "ls-tree":
             raise AssertionError(command)
         paths = args[args.index("--") + 1:]
         entries = []
-        for path, value in self.files.items():
+        files = self.revisions.get(args[args.index("--") - 1], self.files)
+        for path, value in files.items():
             if not any(path == item or path.startswith(item + "/") for item in paths):
                 continue
             oid = hashlib.sha1(b"blob " + str(len(value)).encode() + b"\0" + value).hexdigest()
@@ -155,25 +157,58 @@ class RequirementRetirementTest(unittest.TestCase):
                 self.git.files[changed_path] = contents
                 self.assertEqual(len(self.port.pending("repo", self.root, "base")), 1)
 
-    def test_specification_sections_reuse_unrelated_edits_and_invalidate_related_edits(self):
+    def test_specification_change_uses_general_impact_check_before_reusing_fulfillment(self):
+        from loop_manager_internal.planning.requirement_retirement import assessment_prompt
         self.add_plan()
-        for name in ("docs/PRODUCT.md", "docs/ARCHITECTURE.md"):
-            self.git.files[name] = b"# Document\n## Feature\nRequired rule\n## Other\nOther rule\n"
+        self.git.files["docs/PRODUCT.md"] = b"## Feature\nRule\n## Other\nOther rule\n"
+        self.git.revisions["base"] = dict(self.git.files)
         (item,) = self.port.pending("repo", self.root, "base")
-        payload = json.loads(self.judgment_line(item).split(": ", 1)[1])
-        payload[0]["relevant_paths"] = [
-            "feature.py", "docs/PRODUCT.md### Feature", "docs/ARCHITECTURE.md### Feature",
-        ]
-        self.port.record("repo", self.port.validate_result(
-            "repo", self.root, "base", "REQUIREMENT_JUDGMENTS: " + json.dumps(payload),
-        ))
-        for name in ("docs/PRODUCT.md", "docs/ARCHITECTURE.md"):
-            original = self.git.files[name]
-            self.git.files[name] = original.replace(b"Other rule", b"Unrelated revision")
-            self.assertEqual(self.port.pending("repo", self.root, "advanced"), ())
-            self.git.files[name] = original.replace(b"Required rule", b"Changed requirement")
+        self.port.record("repo", self.port.validate_result("repo", self.root, "base", self.judgment_line(
+            item, paths=["feature.py", "docs/PRODUCT.md### Feature", "docs/ARCHITECTURE.md"],
+        )))
+        self.git.files["docs/PRODUCT.md"] += b"\n## Unrelated feature\nIndependent rule\n"
+        self.git.revisions["advanced"] = dict(self.git.files)
+        (check,) = self.port.pending("repo", self.root, "advanced")
+        self.assertIsNotNone(check.reuse_from)
+        self.assertIn("outcome=reuse", assessment_prompt((check,)))
+        self.assertEqual(self.port.fulfilled_moves("repo", self.root, "advanced"), ())
+        prior = check.reuse_from
+        result = "REQUIREMENT_JUDGMENTS: " + json.dumps([{
+            "path": SOURCE, "input_token": check.token, "outcome": "reuse",
+            "criteria_evidence": list(prior.criteria_evidence), "relevant_paths": list(prior.relevant_paths),
+        }])
+        self.port.record("repo", self.port.validate_result("repo", self.root, "advanced", result))
+        restarted = RequirementRetirementPort(self.connection, self.git)
+        self.assertEqual(restarted.pending("repo", self.root, "advanced"), ())
+        self.assertEqual(restarted.fulfilled_moves("repo", self.root, "advanced"), (SOURCE,))
+        self.git.files["feature.py"] = b"changed implementation"
+        (changed,) = restarted.pending("repo", self.root, "later")
+        self.assertIsNone(changed.reuse_from)
+        with self.assertRaises(RetirementError):
+            restarted.validate_result("repo", self.root, "later", result.replace(check.token, changed.token))
+
+    def test_new_applicable_sibling_rule_blocks_section_bound_retirement(self):
+        self.add_plan()
+        self.git.files["docs/PRODUCT.md"] = b"## Feature\nRule\n## Other\nOther rule\n"
+        self.git.revisions["base"] = dict(self.git.files)
+        (item,) = self.port.pending("repo", self.root, "base")
+        line = self.judgment_line(item, paths=["feature.py", "docs/PRODUCT.md### Feature", "docs/ARCHITECTURE.md"])
+        self.port.record("repo", self.port.validate_result("repo", self.root, "base", line))
+        for contents in (
+            b"## Feature\nRule\n## Other\nOther rule\n## Completion\nFeature requires durable evidence.\n",
+            b"## Feature\nRule\n## Other\nFeature requires durable evidence.\n",
+        ):
+            self.git.files["docs/PRODUCT.md"] = contents
             self.assertEqual(self.port.fulfilled_moves("repo", self.root, "advanced"), ())
-            self.git.files[name] = original
+            self.assertEqual(self.port.stage_moves("repo", self.root, "advanced", self.root), ())
+            with self.assertRaises(RetirementError):
+                self.port.validate_result("repo", self.root, "advanced", line)
+            (check,) = self.port.pending("repo", self.root, "advanced")
+            self.assertIsNotNone(check.reuse_from)
+        self.port.record("repo", self.port.validate_result(
+            "repo", self.root, "advanced", self.judgment_line(check, "unfulfilled"),
+        ))
+        self.assertEqual(self.port.fulfilled_moves("repo", self.root, "advanced"), ())
         self.assertEqual(self.port.pending("repo", self.root, "advanced"), ())
 
     def test_unrelated_declaration_is_pinned_and_new_applicable_rule_invalidates(self):
