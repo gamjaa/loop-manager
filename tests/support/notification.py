@@ -12,7 +12,6 @@ class NotificationFixture:
         database: str | Path = ":memory:",
     ) -> sqlite3.Connection:
         connection = sqlite3.connect(database)
-        self.addCleanup(connection.close)
         try:
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
@@ -41,10 +40,11 @@ class NotificationFixture:
                 ("docs/plans/[G-018] Reliable notices.md", "/projects/alpha"),
             )
             connection.commit()
-            return connection
         except BaseException:
             connection.close()
             raise
+        self.addCleanup(connection.close)
+        return connection
 
     @staticmethod
     def events(connection: sqlite3.Connection) -> list[sqlite3.Row]:

@@ -2,6 +2,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
@@ -206,9 +207,10 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
         delivered.assert_called_once()
 
     def test_registered_project_wires_immediate_delivery_after_commit(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             state_dir = Path(directory)
             connection = self.connection(database=state_dir / "loop-manager.db")
+            cleanup.callback(connection.close)
             repo = "/projects/alpha"
             project = project_registry.RegisteredProject(
                 repo, "main", "codex", None, False
@@ -276,9 +278,10 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
             connection.close()
 
     def test_ambiguous_interruption_stays_pending_and_retries_after_restart(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             database = Path(directory) / "state.db"
             connection = self.connection(database=database)
+            cleanup.callback(connection.close)
             loop_manager.update_project(
                 connection,
                 "/projects/alpha",
@@ -302,6 +305,7 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
             connection.close()
 
             restarted = sqlite3.connect(database)
+            cleanup.callback(restarted.close)
             restarted.row_factory = sqlite3.Row
             notifications.ensure_schema(restarted)
             claimed = self.events(restarted)[0]
@@ -400,9 +404,10 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
                 connection.close()
 
     def test_later_failure_resumes_frozen_text_after_restart(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             database = Path(directory) / "state.db"
             connection = self.connection(database=database)
+            cleanup.callback(connection.close)
             original = self.add_event(connection, body="가🙂\n" * 3000)
             delivered = []
 
@@ -429,6 +434,7 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
             connection.close()
 
             restarted = sqlite3.connect(database)
+            cleanup.callback(restarted.close)
             restarted.row_factory = sqlite3.Row
             notifications.ensure_schema(restarted)
             remaining = []
@@ -593,4 +599,3 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(calls, [original])
         self.assertEqual(self.events(connection)[0]["confirmed_pieces"], 1)
         self.assertIsNotNone(self.events(connection)[0]["delivery_started_at"])
-

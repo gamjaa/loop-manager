@@ -3,6 +3,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 import loop_manager
@@ -12,6 +13,17 @@ from tests.support.worker import dummy_worker_sessions
 
 
 class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.TestCase):
+    def test_level_fixture_closes_database_when_setup_fails(self):
+        connection = mock.Mock()
+        connection.execute.side_effect = RuntimeError("database setup failed")
+
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            loop_manager, "connect_database", return_value=connection
+        ):
+            with self.assertRaisesRegex(RuntimeError, "database setup failed"):
+                self._level_state(directory, initial_level=1)
+        connection.close.assert_called_once_with()
+
     @dummy_worker_sessions
     def test_new_execplan_stores_capped_initial_and_effective_level(self):
         cases = (
@@ -105,10 +117,11 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
 
     @dummy_worker_sessions
     def test_review_level_persists_with_global_history_and_blocked_reset(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             root, state_dir, connection = self._level_state(
                 directory, initial_level=7
             )
+            cleanup.callback(connection.close)
             output = (
                 "ISSUE_ID: app.py::same-issue::blocking\n"
                 "Actionable issue\nVERDICT: FAIL"
@@ -119,6 +132,7 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
             connection.close()
 
             reopened = loop_manager.connect_database(state_dir)
+            cleanup.callback(reopened.close)
             before = reopened.execute(
                 """
                 SELECT effective_worker_level, review_level_history
@@ -185,10 +199,11 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
 
     @dummy_worker_sessions
     def test_verify_and_invalid_review_do_not_change_escalation_history(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             root, _state_dir, connection = self._level_state(
                 directory, initial_level=4
             )
+            cleanup.callback(connection.close)
             review = (
                 "ISSUE_ID: app.py::review-only::blocking\n"
                 "Actionable issue\nVERDICT: FAIL"

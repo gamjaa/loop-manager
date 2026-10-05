@@ -6,6 +6,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import tempfile
 import threading
 from types import SimpleNamespace
 import unittest
@@ -16,6 +17,9 @@ from loop_manager_internal.execution.worker_session import SessionBinding
 from loop_manager_internal.git import manager_git_journal
 from tests.support.execution import ExecutionFixture, execution_fixture
 from tests.support import database as database_fixture
+from tests.support import notification as notification_fixture
+from tests.support import recovery as recovery_fixture
+from tests.support import workspace as workspace_fixture
 from tests.support.worker import dummy_worker_context, dummy_worker_sessions, legacy_planning_ports
 from tests.support.origin import OriginScopeFixture
 
@@ -248,6 +252,34 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
                 database_fixture.runtime_connection()
         connection.close.assert_called_once_with()
 
+    def test_notification_fixture_closes_owned_connection_after_initialization_failure(self):
+        connection = mock.Mock()
+        connection.execute.side_effect = RuntimeError('schema setup failed')
+        owner = SimpleNamespace(addCleanup=self.addCleanup)
+        with mock.patch.object(notification_fixture.sqlite3, 'connect', return_value=connection):
+            with self.assertRaisesRegex(RuntimeError, 'schema setup failed'):
+                notification_fixture.NotificationFixture.connection(owner)
+        connection.close.assert_called_once_with()
+
+    def test_recovery_fixture_closes_its_owned_connection_after_initialization_failure(self):
+        connection = mock.Mock()
+        connection.execute.side_effect = RuntimeError('schema setup failed')
+        owner = SimpleNamespace(addCleanup=self.addCleanup)
+        with tempfile.TemporaryDirectory() as directory:
+            with mock.patch.object(recovery_fixture.sqlite3, 'connect', return_value=connection):
+                with self.assertRaisesRegex(RuntimeError, 'schema setup failed'):
+                    recovery_fixture.BoundedRecoveryFixture._failure_state(owner, directory)
+        connection.close.assert_called_once_with()
+
+    def test_workspace_fixture_closes_owned_connection_after_initialization_failure(self):
+        connection = mock.Mock()
+        connection.execute.side_effect = RuntimeError('schema setup failed')
+        owner = SimpleNamespace(addCleanup=self.addCleanup)
+        with mock.patch.object(workspace_fixture.sqlite3, 'connect', return_value=connection):
+            with self.assertRaisesRegex(RuntimeError, 'schema setup failed'):
+                workspace_fixture.CleanupFixture._memory_connection(owner, Path('/repo'))
+        connection.close.assert_called_once_with()
+
     def test_catalog_fixture_registers_cleanup_before_initialization(self):
         connection = mock.Mock()
         connection.execute.side_effect = RuntimeError('schema setup failed')
@@ -259,7 +291,6 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
         self.assertGreaterEqual(connection.close.call_count, 1)
 
     def test_git_factory_uses_explicit_repository_and_preserves_seed_files(self):
-        import tempfile
         from tests.support import git as fixture_git
         with tempfile.TemporaryDirectory() as directory:
             with mock.patch.object(fixture_git.subprocess, 'run') as process, \

@@ -46,7 +46,6 @@ class AutomationCatalogFixture:
 
     def _connection(self, repo: str = "repo") -> sqlite3.Connection:
         connection = sqlite3.connect(":memory:")
-        self.addCleanup(connection.close)
         try:
             connection.row_factory = sqlite3.Row
             connection.execute(database.SCHEMA)
@@ -56,10 +55,11 @@ class AutomationCatalogFixture:
                 (repo,),
             )
             connection.commit()
-            return connection
         except BaseException:
             connection.close()
             raise
+        self.addCleanup(connection.close)
+        return connection
 
     def _insert_plan(
         self,

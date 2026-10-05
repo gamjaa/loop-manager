@@ -23,37 +23,42 @@ class BoundedRecoveryFixture:
         plan = write_execplan(root, "G-013", "Bounded Recovery")
         owns_connection = connection is None
         connection = connection or sqlite3.connect(":memory:")
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            loop_manager._ensure_execplans_schema(connection)
+            connection.execute(
+                """
+                INSERT INTO projects (
+                    repo, base_branch, phase, plan_path, worktree,
+                    worker_session_id, reviewer_session_id
+                ) VALUES (?, 'main', 'VERIFYING', ?, ?, 'worker-session', 'reviewer-session')
+                """,
+                (str(root), plan.relative_to(root).as_posix(), str(root)),
+            )
+            connection.execute(
+                """
+                INSERT INTO exec_plans (
+                    repo, plan_id, path, title, sources, depends_on, priority,
+                    content_hash, status, worktree, worker_session_id,
+                    reviewer_session_id
+                ) VALUES (?, 'G-013', ?, 'Bounded Recovery', ?, '[]', 'critical',
+                          'hash', 'VERIFYING', ?, 'worker-session', 'reviewer-session')
+                """,
+                (
+                    str(root),
+                    plan.relative_to(root).as_posix(),
+                    json.dumps(["docs/PRODUCT.md"]),
+                    str(root),
+                ),
+            )
+            connection.commit()
+        except BaseException:
+            if owns_connection:
+                connection.close()
+            raise
         if owns_connection:
             self.addCleanup(connection.close)
-        connection.row_factory = sqlite3.Row
-        connection.execute(loop_manager.SCHEMA)
-        loop_manager._ensure_execplans_schema(connection)
-        connection.execute(
-            """
-            INSERT INTO projects (
-                repo, base_branch, phase, plan_path, worktree,
-                worker_session_id, reviewer_session_id
-            ) VALUES (?, 'main', 'VERIFYING', ?, ?, 'worker-session', 'reviewer-session')
-            """,
-            (str(root), plan.relative_to(root).as_posix(), str(root)),
-        )
-        connection.execute(
-            """
-            INSERT INTO exec_plans (
-                repo, plan_id, path, title, sources, depends_on, priority,
-                content_hash, status, worktree, worker_session_id,
-                reviewer_session_id
-            ) VALUES (?, 'G-013', ?, 'Bounded Recovery', ?, '[]', 'critical',
-                      'hash', 'VERIFYING', ?, 'worker-session', 'reviewer-session')
-            """,
-            (
-                str(root),
-                plan.relative_to(root).as_posix(),
-                json.dumps(["docs/PRODUCT.md"]),
-                str(root),
-            ),
-        )
-        connection.commit()
         return root, connection
 
     def _active_worker_project(
@@ -71,26 +76,30 @@ class BoundedRecoveryFixture:
         )
         loop_manager.make_worktree(repo, worktree, branch, "main")
         connection = sqlite3.connect(":memory:")
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                """
+                INSERT INTO projects (
+                    repo, base_branch, active_sha, plan_sha, phase, branch,
+                    worktree, plan_path
+                ) VALUES (?, 'main', ?, ?, 'WORKING', ?, ?, ?)
+                """,
+                (
+                    str(repo),
+                    plan_sha,
+                    plan_sha,
+                    branch,
+                    str(worktree),
+                    plan.relative_to(repo).as_posix(),
+                ),
+            )
+            connection.commit()
+        except BaseException:
+            connection.close()
+            raise
         self.addCleanup(connection.close)
-        connection.row_factory = sqlite3.Row
-        connection.execute(loop_manager.SCHEMA)
-        connection.execute(
-            """
-            INSERT INTO projects (
-                repo, base_branch, active_sha, plan_sha, phase, branch,
-                worktree, plan_path
-            ) VALUES (?, 'main', ?, ?, 'WORKING', ?, ?, ?)
-            """,
-            (
-                str(repo),
-                plan_sha,
-                plan_sha,
-                branch,
-                str(worktree),
-                plan.relative_to(repo).as_posix(),
-            ),
-        )
-        connection.commit()
         return repo, state_dir, connection
 
     def _run_review_sequence(

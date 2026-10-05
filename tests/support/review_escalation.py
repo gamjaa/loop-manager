@@ -23,33 +23,37 @@ class WorkerEscalationFixture:
         state_dir = Path(directory) / "state"
         state_dir.mkdir()
         connection = loop_manager.connect_database(state_dir, create=True)
+        try:
+            connection.execute(
+                """
+                INSERT INTO projects (repo, base_branch, phase, plan_path, worktree)
+                VALUES (?, 'main', 'REVIEWING', ?, ?)
+                """,
+                (str(root), plan.relative_to(root).as_posix(), str(root)),
+            )
+            connection.execute(
+                """
+                INSERT INTO exec_plans (
+                    repo, plan_id, path, title, sources, depends_on, priority,
+                    content_hash, status, worktree, initial_worker_level,
+                    effective_worker_level
+                ) VALUES (?, 'G-019', ?, 'Review Escalation', ?, '[]', 'critical',
+                          'hash', 'REVIEWING', ?, ?, ?)
+                """,
+                (
+                    str(root),
+                    plan.relative_to(root).as_posix(),
+                    json.dumps(["docs/PRODUCT.md"]),
+                    str(root),
+                    initial_level,
+                    initial_level,
+                ),
+            )
+            connection.commit()
+        except BaseException:
+            connection.close()
+            raise
         self.addCleanup(connection.close)
-        connection.execute(
-            """
-            INSERT INTO projects (repo, base_branch, phase, plan_path, worktree)
-            VALUES (?, 'main', 'REVIEWING', ?, ?)
-            """,
-            (str(root), plan.relative_to(root).as_posix(), str(root)),
-        )
-        connection.execute(
-            """
-            INSERT INTO exec_plans (
-                repo, plan_id, path, title, sources, depends_on, priority,
-                content_hash, status, worktree, initial_worker_level,
-                effective_worker_level
-            ) VALUES (?, 'G-019', ?, 'Review Escalation', ?, '[]', 'critical',
-                      'hash', 'REVIEWING', ?, ?, ?)
-            """,
-            (
-                str(root),
-                plan.relative_to(root).as_posix(),
-                json.dumps(["docs/PRODUCT.md"]),
-                str(root),
-                initial_level,
-                initial_level,
-            ),
-        )
-        connection.commit()
         return root, state_dir, connection
 
     def _active_worker_project(
@@ -68,26 +72,30 @@ class WorkerEscalationFixture:
         )
         loop_manager.make_worktree(repo, worktree, branch, "main")
         connection = sqlite3.connect(":memory:")
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                """
+                INSERT INTO projects (
+                    repo, base_branch, active_sha, plan_sha, phase, branch,
+                    worktree, plan_path
+                ) VALUES (?, 'main', ?, ?, 'WORKING', ?, ?, ?)
+                """,
+                (
+                    str(repo),
+                    plan_sha,
+                    plan_sha,
+                    branch,
+                    str(worktree),
+                    plan.relative_to(repo).as_posix(),
+                ),
+            )
+            connection.commit()
+        except BaseException:
+            connection.close()
+            raise
         self.addCleanup(connection.close)
-        connection.row_factory = sqlite3.Row
-        connection.execute(loop_manager.SCHEMA)
-        connection.execute(
-            """
-            INSERT INTO projects (
-                repo, base_branch, active_sha, plan_sha, phase, branch,
-                worktree, plan_path
-            ) VALUES (?, 'main', ?, ?, 'WORKING', ?, ?, ?)
-            """,
-            (
-                str(repo),
-                plan_sha,
-                plan_sha,
-                branch,
-                str(worktree),
-                plan.relative_to(repo).as_posix(),
-            ),
-        )
-        connection.commit()
         return repo, state_dir, connection
 
     def _run_reviews(

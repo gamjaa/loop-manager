@@ -41,28 +41,32 @@ class WorkspaceFixture:
         commit_and_push(repo, "Add recovery safety plan")
         plan_sha = git_command(repo, "rev-parse", "origin/main")
         connection = sqlite3.connect(":memory:")
-        self.addCleanup(connection.close)
-        connection.row_factory = sqlite3.Row
-        connection.execute(loop_manager.SCHEMA)
-        connection.execute(
-            "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
-            (str(repo),),
-        )
-        connection.commit()
-        relative_plan = plan.relative_to(repo).as_posix()
-        loop_manager.register_execplans(
-            connection,
-            str(repo),
-            repo,
-            [(relative_plan, loop_manager._parse_execplan(repo, plan))],
-            plan_sha,
-            loop_manager.planning_input_fingerprint(repo, "main"),
-        )
-        with connection:
-            planning_input_state.record_general(
-                connection, str(repo), plan_sha,
-                loop_manager.plan_declarations(repo, plan_sha),
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (str(repo),),
             )
+            connection.commit()
+            relative_plan = plan.relative_to(repo).as_posix()
+            loop_manager.register_execplans(
+                connection,
+                str(repo),
+                repo,
+                [(relative_plan, loop_manager._parse_execplan(repo, plan))],
+                plan_sha,
+                loop_manager.planning_input_fingerprint(repo, "main"),
+            )
+            with connection:
+                planning_input_state.record_general(
+                    connection, str(repo), plan_sha,
+                    loop_manager.plan_declarations(repo, plan_sha),
+                )
+        except BaseException:
+            connection.close()
+            raise
+        self.addCleanup(connection.close)
         branch, worktree = loop_manager.expected_execplan_workspace(
             state_dir, str(repo), "G-012"
         )
@@ -84,15 +88,19 @@ class CleanupFixture:
 
     def _memory_connection(self, repo: Path):
         connection = sqlite3.connect(":memory:")
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
+            connection.execute(loop_manager.CLEANUP_PENDING_SCHEMA)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (str(repo),),
+            )
+            connection.commit()
+        except BaseException:
+            connection.close()
+            raise
         self.addCleanup(connection.close)
-        connection.row_factory = sqlite3.Row
-        connection.execute(loop_manager.SCHEMA)
-        connection.execute(loop_manager.CLEANUP_PENDING_SCHEMA)
-        connection.execute(
-            "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
-            (str(repo),),
-        )
-        connection.commit()
         return connection
 
 

@@ -17,8 +17,20 @@ from tests.support.catalog import archived_entry
 
 
 class ArchiveRecoveryRegressionTest(unittest.TestCase):
+    def test_setup_registers_connection_cleanup_before_schema_initialization(self):
+        fixture = type(self)("test_audit_proof_survives_repeated_tampering_and_database_reconnect")
+        connection = mock.Mock()
+        connection.execute.side_effect = RuntimeError("schema setup failed")
+
+        with mock.patch.object(sqlite3, "connect", return_value=connection):
+            with self.assertRaisesRegex(RuntimeError, "schema setup failed"):
+                fixture.setUp()
+        fixture.doCleanups()
+        connection.close.assert_called_once_with()
+
     def setUp(self):
         self.connection = sqlite3.connect(":memory:")
+        self.addCleanup(self.connection.close)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute(loop_manager.SCHEMA)
         loop_manager._ensure_execplans_schema(self.connection)
@@ -27,7 +39,6 @@ class ArchiveRecoveryRegressionTest(unittest.TestCase):
         )
         self.entry = archived_entry()
         self.active = replace(self.entry, path=self.entry.active_path)
-        self.addCleanup(self.connection.close)
 
     def migrate(self, *, archived):
         snapshot = execplan_catalog.ExecPlanCatalogSnapshot(
