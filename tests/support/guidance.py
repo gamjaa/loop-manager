@@ -60,7 +60,6 @@ def git_result(repo: Path, *arguments: str, check: bool = True) -> subprocess.Co
 
 def git(repo: Path, *arguments: str) -> str:
     return git_result(repo, *arguments).stdout.strip()
-    return result.stdout.strip()
 
 
 def repository(root: Path) -> tuple[Path, str]:
