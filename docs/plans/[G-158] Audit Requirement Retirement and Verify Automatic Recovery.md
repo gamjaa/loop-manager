@@ -47,7 +47,7 @@ Use the deployed Planner-judgment and Manager-retirement policy to perform the r
 
 - [x] Record the actual Manager full verify for candidate `5830a071c83779ad3d6d84a63ced210ab4b3f28d` (2,447 success / 2 skip).
 - [ ] Accept criterion-specific reassessment of the 49 rejected archive judgments and resolve the automatic Review FAIL.
-- [ ] Register the user-authorized manual G-158 PR and connect its identity in Manager SQLite.
+- [x] Register the user-authorized manual G-158 PR #155 and connect its identity in Manager SQLite as PR_OPEN; automatic Review FAIL is preserved.
 - [ ] Confirm actual user Merge; PR_OPEN does not represent automatic Review PASS.
 
 ## Decision Log
@@ -73,3 +73,5 @@ Use the deployed Planner-judgment and Manager-retirement policy to perform the r
 - 2026-10-05 Review 교정: `review:docs/audits/g-158/requirement-audit.json::results.criteria::insufficient-audit-evidence`는 R-063을 제외한 49개 문서의 652개 기준에 문서 단위 사유와 동일한 경로 목록이 반복된다고 지적했다. 예를 들어 R-001의 READY 선택과 priority parser 검증은 서로 다른 기준인데 같은 대체 근거가 기록돼 있다. 운영 DB의 50개 행과 pending 0건은 형식 검증·저장 사실일 뿐 기준별 의미 판단의 유효성을 증명하지 않는다. 이 결과를 잠정 분류로 표시하고 위의 감사·복구 완료 체크를 되돌렸다. 원본 감사 파일과 등록 영수증·실패 피드백은 보존했으며 운영 SQLite의 결과를 Worker가 수정·삭제·초기화하지 않았다. 일반 Planner가 각 기준의 현재 충족·명시적 대체·잔여 미구현을 근거별로 재평가하고, Manager가 기존 audit 경계에서 검증·교체한 뒤에만 완료 결과를 수용해야 한다.
 
 - 2026-10-05 사용자 수동 게시 결정: 사용자는 `insufficient-audit-evidence` Review FAIL 로그를 확인한 뒤 “복잡하게 할 필요없이 직접 PR 등록하고 그걸로 PR_OPEN 상태로 바꾸면 안 돼?”라고 요청했다. 이 명시적 결정에 따라 현재 문서 후보를 수동 PR로 게시하고 실제 GitHub identity를 G-158의 PR_OPEN에 연결한다. Reviewer 실패·49건 재평가 pending·최초 후보의 Manager verify 기록과 기존 session·실패 감사를 유지한다. 자동 Review 통과, 감사 전체 완료 또는 사용자 Merge를 만들어내지 않는다. G-142/G-144/G-145의 독립 차단과 유지보수 상태도 보존한다.
+
+- 2026-10-05 수동 PR 연결 확인: `https://github.com/gamjaa/loop-manager/pull/155`의 OPEN 상태·main base·loop-manager/G-158 head와 로컬 HEAD 일치를 확인하고, 전역 Manager 잠금·DB backup 아래 기존 RuntimeStateRepository로 G-158만 PR_OPEN에 연결했다. 자동 Review FAIL·49개 감사 재평가 pending·Worker/Reviewer session·실패 이력과 다른 계획·유지보수 상태는 보존했다. 실제 사용자 Merge는 아직 확인하지 않았으며 Manager가 등록된 같은 PR을 관측한다.
