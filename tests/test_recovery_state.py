@@ -12,6 +12,7 @@ from loop_manager_internal.storage.recovery_state import (
     RecoveryRepository, RecoveryStateConflict, begin_external_run,
     pending_review_correction, reserve_review_correction, start_review_correction,
 )
+from loop_manager_internal.execution.validation_feedback import redact_secrets
 from loop_manager_internal.recovery.recovery_dispatcher import RecoveryDispatcher
 from tests.support.database import runtime_connection
 
@@ -86,6 +87,21 @@ class RecoveryRepositoryTests(unittest.TestCase):
         self.assertEqual(
             reserve_review_correction(self.connection, 'repo', 'G-042', 4),
             (True, 1, next_run),
+        )
+
+    def test_review_correction_matches_the_redacted_audit_result(self):
+        self.connection.execute(
+            "CREATE TABLE validation_results (id INTEGER PRIMARY KEY, repo TEXT, "
+            "plan_id TEXT, stage TEXT, classification TEXT, raw_output TEXT)"
+        )
+        raw = 'ISSUE_ID: app.py::secret::blocking\npassword: review-secret\nVERDICT: FAIL'
+        self.connection.execute(
+            "INSERT INTO validation_results VALUES (1, 'repo', 'G-042', "
+            "'review', 'failure', ?)", (redact_secrets(raw),),
+        )
+
+        self.assertEqual(
+            pending_review_correction(self.connection, 'repo', 'G-042', raw), 1,
         )
 
     def setUp(self):

@@ -231,6 +231,28 @@ class ValidationFeedbackTests(unittest.TestCase):
         self.assertNotIn("json-secret-second", persisted)
         self.assertNotIn("repeat-secret", persisted)
 
+    def test_unterminated_quoted_credential_does_not_leave_a_multiline_tail(self):
+        secret = "json-secret-first\njson-secret-second"
+        raw = f'FAILED tests/test_config.py::test_loads\n{{"password": "{secret}'
+        redacted = redact_secrets(raw)
+
+        self.assertIn('"password": <REDACTED>', redacted)
+        self.assertNotIn("json-secret-first", redacted)
+        self.assertNotIn("json-secret-second", redacted)
+        output = lm.VerifyOutput(raw)
+        self.assertEqual(str(output), redacted)
+        self.assertEqual(output.fingerprint_source, redacted)
+
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        ensure_schema(connection)
+        repository = ValidationFeedbackRepository(connection)
+        repository.observe("repo", "G-146", None, "verify", False, raw)
+        persisted = connection.execute(
+            "SELECT raw_output FROM validation_results"
+        ).fetchone()[0]
+        self.assertEqual(persisted, redacted)
+
     def test_worker_recovery_prompt_redacts_previous_result_and_error(self):
         prompt = lm.worker_prompt(
             'docs/plans/[G-040] Plan.md', 'API_KEY=private-error',

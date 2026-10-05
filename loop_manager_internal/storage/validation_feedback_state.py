@@ -190,6 +190,7 @@ class ValidationFeedbackRepository:
     def _event(self, result_id: int, repo: str, plan_id: str, stage: str,
                identity: str, occurrence: int, revision: int,
                diagnostic: str, active: bool) -> None:
+        diagnostic = redact_secrets(diagnostic)
         cursor = self.connection.execute(
             "INSERT INTO validation_feedback_events "
             "(result_id,repo,plan_id,stage,identity,occurrence,revision,diagnostic,active) "

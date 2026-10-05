@@ -44,50 +44,40 @@ class BootstrapEntryTests(unittest.TestCase):
             self.assertEqual(actual_source, source)
             self.assertEqual(actual_state, state_dir)
             events.append("prepare")
-            return loop_manager.RuntimeWorktree(runtime.path, runtime.commit_sha, mutation_id)
+            return loop_manager.RuntimeWorktree(runtime.path, runtime.commit_sha, None)
 
-        def child(actual_source, actual_state, config_path, selected, arguments):
-            self.assertEqual(actual_source, source)
-            self.assertEqual(actual_state, state_dir)
-            self.assertEqual(config_path, source / "custom/config.ini")
-            self.assertEqual(selected.path, runtime.path)
-            self.assertEqual(selected.commit_sha, runtime.commit_sha)
-            self.assertRegex(selected.mutation_id, r"^[0-9a-f]{32}$")
+        def child(arguments, **kwargs):
+            self.assertEqual(kwargs, {"cwd": runtime.path, "check": False})
+            self.assertEqual(
+                config_path.read_text(), f"[telegram]\ntoken = {sentinel}\n",
+            )
+            self.assertIn(str(config_path), arguments)
             self.assertEqual(arguments[-2:], ["run", "--skip-if-running"])
+            self.assertNotIn(sentinel, " ".join(arguments))
             events.append("child")
-            return 7
-
-        with mock.patch.object(
-            loop_manager.sys,
-            "argv",
-            [
-                "loop_manager.py",
-                "--state-dir",
-                str(state_dir),
-                "--config",
-                "custom/config.ini",
-                "run",
-                "--skip-if-running",
-            ],
-        ), mock.patch("loop_manager.process_lock", side_effect=locked), mock.patch(
-            "loop_manager.prepare_bootstrap_runtime", side_effect=prepare
-        ), mock.patch("loop_manager.run_runtime_child", side_effect=child):
-            self.assertEqual(loop_manager.main(), 7)
-        self.assertEqual(events, ["lock", "prepare", "child", "unlock"])
+            return subprocess.CompletedProcess(arguments, 7)
 
         with tempfile.TemporaryDirectory() as directory:
             config_path = Path(directory) / "config.ini"
             sentinel = "bootstrap-config-secret-sentinel"
-            config_path.write_text(f"[telegram]\\ntoken = {sentinel}\\n")
-            arguments = loop_manager.runtime_child_arguments(
-                ["--config", "custom/config.ini", "run"],
-                source=source,
-                state_dir=state_dir,
-                config_path=config_path,
-                runtime=runtime,
-            )
-            self.assertIn(str(config_path), arguments)
-            self.assertNotIn(sentinel, " ".join(arguments))
+            config_path.write_text(f"[telegram]\ntoken = {sentinel}\n")
+            with mock.patch.object(
+                loop_manager.sys,
+                "argv",
+                [
+                    "loop_manager.py",
+                    "--state-dir",
+                    str(state_dir),
+                    "--config",
+                    str(config_path),
+                    "run",
+                    "--skip-if-running",
+                ],
+            ), mock.patch("loop_manager.process_lock", side_effect=locked), mock.patch(
+                "loop_manager.prepare_bootstrap_runtime", side_effect=prepare
+            ), mock.patch("loop_manager.subprocess.run", side_effect=child):
+                self.assertEqual(loop_manager.main(), 7)
+        self.assertEqual(events, ["lock", "prepare", "child", "unlock"])
         secured = loop_manager.runtime_child_arguments(
             ["--runtime-mutation-id", "spoofed", "run"],
             source=source, state_dir=state_dir,

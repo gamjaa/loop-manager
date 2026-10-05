@@ -156,9 +156,9 @@ class VerifyOutput(str):
 
     def __new__(cls, output: str, *, timed_out: bool = False,
                 exit_code: int | None = None) -> VerifyOutput:
-        shown = redact_secrets(output) if timed_out else output
+        shown = redact_secrets(output)
         instance = super().__new__(cls, shown.strip()[-8000:])
-        instance.fingerprint_source = output
+        instance.fingerprint_source = shown
         instance.timed_out = timed_out
         instance.exit_code = exit_code
         return instance

@@ -302,6 +302,7 @@ class TransitionValidationFailureEffects:
     active_execplan: Callable[..., object]
     capture_git_snapshot: Callable[..., object]
     evaluate_review_worker_level: Callable[..., object]
+    redact_secrets: Callable[..., object]
     validation_failure_fingerprints: Callable[..., object]
 
 
@@ -313,6 +314,17 @@ def transition_validation_failure(
     output: str,
 ) -> ValidationFailureDecision:
     """Persist stage-local failures and own their retry/BLOCKED transition."""
+
+    redacted = effects.redact_secrets(str(output))
+    if redacted != str(output):
+        if hasattr(output, "timed_out"):
+            output = type(output)(
+                redacted,
+                timed_out=bool(output.timed_out),
+                exit_code=output.exit_code,
+            )
+        else:
+            output = redacted
 
     columns = {
         "verify": "verify_failure_history",

@@ -9,7 +9,7 @@ from loop_manager_internal.agents.agent_invocation import AttemptSequence, Track
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, classify_exception
 from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind
-from loop_manager_internal.execution.validation_feedback import normalize_feedback
+from loop_manager_internal.execution.validation_feedback import normalize_feedback, redact_secrets
 from loop_manager_internal.documents.reviewer_specification import SpecificationDeadlock, validate_locations
 
 from loop_manager_internal.execution.execution_effects import ExecutionContract, FeedbackEffects
@@ -188,6 +188,7 @@ class ReviewHandler:
                 session_id=row['reviewer_session_id'],
             )
             code, review = review_result
+            review = redact_secrets(str(review))
             # Nonzero returned attempts are already audited before retries;
             # post-call rejection records classify only unaudited zero exits.
             feedback_repo = self.ports.feedback.repository if self.ports.feedback else None
@@ -378,4 +379,3 @@ class ReviewHandler:
             publication_token=None,
         )
         return self.ports._advanced()
-

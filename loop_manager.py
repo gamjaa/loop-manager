@@ -2934,6 +2934,7 @@ transition_validation_failure = _bind_effects(
         active_execplan=lambda *args, **kwargs: active_execplan(*args, **kwargs),
         capture_git_snapshot=lambda *args, **kwargs: capture_git_snapshot(*args, **kwargs),
         evaluate_review_worker_level=lambda *args, **kwargs: evaluate_review_worker_level(*args, **kwargs),
+        redact_secrets=lambda *args, **kwargs: redact_secrets(*args, **kwargs),
         validation_failure_fingerprints=lambda *args, **kwargs: validation_failure_fingerprints(*args, **kwargs),
     ),
 )
