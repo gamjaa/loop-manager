@@ -533,15 +533,16 @@ class PlanningAssessmentService(PlanningService):
                 assert run.mutable_ready_snapshot is not None
                 manager_paths = ()
                 if hasattr(self._ports, "retirement"):
-                    from loop_manager_internal.planning.requirement_retirement import RetirementError
+                    from loop_manager_internal.planning.requirement_retirement import (
+                        RetirementError, RetirementReassessment,
+                    )
                     try:
                         manager_paths = self._ports.retirement.receipted_paths(
                             context.repo, context.repo_path, str(row.active_sha), worktree,
                         )
+                    except RetirementReassessment as error:
+                        raise PlanningResultInvalid(str(error)) from error
                     except RetirementError as error:
-                        from loop_manager_internal.planning.requirement_retirement import RetirementReassessment
-                        if isinstance(error, RetirementReassessment):
-                            raise PlanningResultInvalid(str(error)) from error
                         self._ports.state.update(
                             context.repo, planning_error=str(error),
                             planning_error_fingerprint=run.current_fingerprint,
@@ -560,7 +561,6 @@ class PlanningAssessmentService(PlanningService):
                 if hasattr(self._ports, "retirement"):
                     from dataclasses import replace
                     from loop_manager_internal.application.contracts import ValidatedPlanningResult
-                    from loop_manager_internal.planning.requirement_retirement import RetirementError
                     try:
                         judgments = (() if run.audit_restorations else
                             self._ports.retirement.validate_result(
@@ -597,10 +597,19 @@ class PlanningAssessmentService(PlanningService):
                         restored = self._ports.retirement.stage_restorations(
                             context.repo, context.repo_path, str(row.active_sha), worktree,
                         )
-                        moved = (() if restored else self._ports.retirement.stage_moves(
+                        if not restored:
+                            self._ports.retirement.stage_moves(
+                                context.repo, context.repo_path, str(row.active_sha), worktree,
+                                excluded_sources=tuple(sorted(planned_sources)),
+                            )
+                        # A restoration can defer new retirements while older
+                        # retirements are already staged. Keep every currently
+                        # proven receipt, not just paths staged in this turn.
+                        manager_paths = self._ports.retirement.receipted_paths(
                             context.repo, context.repo_path, str(row.active_sha), worktree,
-                            excluded_sources=tuple(sorted(planned_sources)),
-                        ))
+                        )
+                    except RetirementReassessment as error:
+                        raise PlanningResultInvalid(str(error)) from error
                     except RetirementError as error:
                         self._ports.state.update(
                             context.repo, planning_error=str(error),
@@ -609,12 +618,11 @@ class PlanningAssessmentService(PlanningService):
                         )
                         self._ports.events.error(str(error))
                         return self._operational_error()
-                    if moved or restored:
+                    if manager_paths:
                         if validated_result is None:
                             validated_result = ValidatedPlanningResult(
                                 (), (), mutable_snapshot=run.mutable_ready_snapshot,
                             )
-                        manager_paths = tuple(moved) + tuple(restored)
                         paths = tuple(sorted(set(validated_result.publication_paths) | set(manager_paths)))
                         hashes = dict(validated_result.publication_hashes)
                         import hashlib
@@ -625,8 +633,14 @@ class PlanningAssessmentService(PlanningService):
                         validated_result = replace(
                             validated_result, publication_paths=paths,
                             publication_hashes=tuple(sorted(hashes.items())),
-                            retirement_moves=tuple(moved[::2]),
-                            restoration_moves=tuple(restored[::2]),
+                            retirement_moves=tuple(
+                                source for source in manager_paths[::2]
+                                if not source.startswith("docs/requirements/archive/")
+                            ),
+                            restoration_moves=tuple(
+                                source for source in manager_paths[::2]
+                                if source.startswith("docs/requirements/archive/")
+                            ),
                         )
                         run.dirty_files = sorted(set(dirty_files) | set(manager_paths))
             if (

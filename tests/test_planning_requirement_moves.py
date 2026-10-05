@@ -19,12 +19,15 @@ from loop_manager_internal.planning.planning_catalog import (
 from loop_manager_internal.planning.requirement_retirement import (
     RequirementRetirementPort, RetirementError,
 )
+from loop_manager_internal.planning.assessment_service import PlanningAssessmentService
 
 
 SOURCE = "docs/requirements/[R-001] 기능 이름.md"
 ARCHIVE = "docs/requirements/archive/[R-001] 기능 이름.md"
 CONTENTS = b"# Feature\n\n## Acceptance Criteria\n\n- Works end to end\n"
 PLAN = "docs/plans/[G-001] New plan.md"
+LEGACY = "docs/requirements/[R-002] Legacy.md"
+LEGACY_ARCHIVE = "docs/requirements/archive/[R-002] Legacy.md"
 PLAN_TEXT = """---
 id: G-001
 title: New plan
@@ -69,7 +72,7 @@ class PlanningRequirementMoveTest(unittest.TestCase):
             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         ).stdout.decode("utf-8").strip()
 
-    def case(self, *, restore=False, renames="true"):
+    def case(self, *, restore=False, renames="true", include_restoration=False):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         root = Path(temporary.name)
@@ -79,12 +82,15 @@ class PlanningRequirementMoveTest(unittest.TestCase):
         self.git(root, "config", "core.autocrlf", "false")
         self.git(root, "config", "diff.renames", renames)
         origin, destination = (ARCHIVE, SOURCE) if restore else (SOURCE, ARCHIVE)
-        for path, content in {
+        files = {
             origin: CONTENTS,
             "docs/PRODUCT.md": b"# Product\n",
             "docs/ARCHITECTURE.md": b"# Architecture\n",
             "feature.py": b"implemented = True\n",
-        }.items():
+        }
+        if include_restoration:
+            files[LEGACY_ARCHIVE] = CONTENTS
+        for path, content in files.items():
             target = root / path
             target.parent.mkdir(parents=True, exist_ok=True)
             target.write_bytes(content)
@@ -111,6 +117,12 @@ class PlanningRequirementMoveTest(unittest.TestCase):
              "content", "PR_OPEN" if restore else "MERGED", "head", "remote",
              "verify", "review", "passed", "passed"),
         )
+        if include_restoration:
+            connection.execute(
+                "INSERT INTO exec_plans VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                ("repo", "G-098", "docs/plans/G-098.md", json.dumps([LEGACY]),
+                 "content", "PR_OPEN", "head", "remote", "verify", "review", "passed", "passed"),
+            )
         adapter = SimpleNamespace(run=loop_manager.git, run_bytes=loop_manager.git_bytes)
         port = RequirementRetirementPort(connection, adapter)
         if restore:
@@ -253,6 +265,74 @@ class PlanningRequirementMoveTest(unittest.TestCase):
                     loop_manager._validate_general_planning_commit(
                         case.root, result, self.git(case.root, "rev-parse", "HEAD"),
                     )
+
+    def assessment(self, case):
+        row = SimpleNamespace(phase="PLANNING", active_sha=case.base,
+                              planning_result="", planning_error=None)
+        ports = SimpleNamespace(
+            retirement=case.port,
+            validation=SimpleNamespace(validate_general_result=lambda *args, **kwargs:
+                loop_manager.validate_planner_result(
+                    args[1], args[2], args[3], repo="repo",
+                    mutable_snapshot=args[4], **kwargs,
+                )),
+            events=SimpleNamespace(error=mock.Mock()),
+            state=SimpleNamespace(update=mock.Mock()),
+        )
+        run = SimpleNamespace(
+            row=row, context=SimpleNamespace(repo="repo", repo_path=case.root),
+            planning_worktree=case.root, mutable_ready_snapshot=case.snapshot,
+            dirty_files=[], maintenance_planning=False, planner_scope_error=None,
+            audit_restorations=(LEGACY,), current_fingerprint="input",
+        )
+        return PlanningAssessmentService(ports, None), ports, run
+
+    def test_assessment_manifest_preserves_existing_retirements_during_restoration(self):
+        for mixed in (False, True):
+            with self.subTest(mixed=mixed):
+                case = self.case(include_restoration=True)
+                self.git(case.root, "add", "-A")
+                if mixed:
+                    (case.root / PLAN).write_text(PLAN_TEXT, encoding="utf-8")
+                service, ports, run = self.assessment(case)
+                for resumed in (False, True):
+                    with self.subTest(resumed=resumed):
+                        self.assertIsNone(service._validate_planner_result(run))
+                        result = run.validated_result
+                        self.assertEqual(result.retirement_moves, (SOURCE,))
+                        self.assertEqual(result.restoration_moves, (LEGACY_ARCHIVE,))
+                        self.assertEqual(set(result.publication_paths),
+                                         {SOURCE, ARCHIVE, LEGACY, LEGACY_ARCHIVE} | ({PLAN} if mixed else set()))
+                        self.assertEqual(set(dict(result.publication_hashes)),
+                                         {ARCHIVE, LEGACY} | ({PLAN} if mixed else set()))
+                        if not resumed:
+                            self.git(case.root, "add", "-A")
+                            self.git(case.root, "commit", "-m", "combined planning batch")
+                        manifest = loop_manager._planning_result_manifest(result)
+                        restored = loop_manager._planning_result_from_manifest(manifest)
+                        loop_manager._validate_general_planning_commit(
+                            case.root, restored, self.git(case.root, "rev-parse", "HEAD"),
+                        )
+                        run.dirty_files = []
+                ports.events.error.assert_not_called()
+
+    def test_assessment_rechecks_old_receipts_after_staging_new_moves(self):
+        case = self.case(include_restoration=True)
+        service, ports, run = self.assessment(case)
+        stage = case.port.stage_restorations
+
+        def corrupt_old_move_after_restoration(*args, **kwargs):
+            paths = stage(*args, **kwargs)
+            (case.root / ARCHIVE).write_bytes(b"tampered after initial check")
+            return paths
+
+        with mock.patch.object(case.port, "stage_restorations", side_effect=corrupt_old_move_after_restoration):
+            outcome = service._validate_planner_result(run)
+        self.assertTrue(outcome.error)
+        self.assertEqual(outcome.kind.value, "operational_error")
+        self.assertIn("영수증과 worktree", ports.state.update.call_args.kwargs["planning_error"])
+        self.assertFalse(hasattr(run, "validated_result"))
+        self.assertEqual((case.root / ARCHIVE).read_bytes(), b"tampered after initial check")
 
 
 if __name__ == "__main__":
