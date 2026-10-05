@@ -473,6 +473,7 @@ class PlanCauseRevalidationTests(PlanRemoteRecoveryFixture, unittest.TestCase):
             self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
         self.ports._journaled_direct_rebase.assert_called_once()
         self.ports._complete_direct_rebase_checkpoint.assert_called_once()
+        self.assertEqual(self.ports._journaled_direct_rebase.call_args.kwargs['observed_remote'], (None,))
         self.ports._recorded_base_fetch.assert_called_once_with(
             Path('/repo'), Path('/state'), 'main', owner='plan:G-106')
         self.assertEqual(self.plan()['blocked_fingerprint'], 'input')

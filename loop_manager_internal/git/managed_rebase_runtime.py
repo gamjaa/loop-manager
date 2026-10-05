@@ -14,6 +14,7 @@ from loop_manager_internal.git.managed_rebase_observation import ObservationAdap
 from loop_manager_internal.git.managed_rebase_validation import RebaseExpectation, Remote, PullRequest, fingerprint
 from loop_manager_internal.git.manager_git_journal import MutationEvidenceError
 from loop_manager_internal.recovery.work_branch_integration import user_changes, matching_user_paths
+from loop_manager_internal.agents.agent_scope_decision import _worker_path_allowed
 from dataclasses import replace
 
 
@@ -261,7 +262,8 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
         approved = matching_user_paths(observed, user_blobs)
         paths = {change.path for change in (*observed.committed, *observed.staged)}
         paths.update(file.path for file in observed.files)
-        return all(worker_allowed(path) or path in approved for path in paths) and checked_contracts(observed)
+        return all(_worker_path_allowed(path, expected.plan_path, archives, guidance, common)
+                   or path in approved for path in paths) and checked_contracts(observed)
 
     return ManagedRebaseService(expected, ObservationAdapters(
         git=ports.git, capture_snapshot=ports.capture_git_snapshot,

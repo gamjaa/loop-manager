@@ -328,6 +328,20 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
     )
     if metadata_error:
         return refuse(metadata_error)
+    if project_recovery_context is not None:
+        scope_base = blocked['active_sha'] or blocked['plan_sha']
+        if not scope_base:
+            return refuse('현재 계획의 기존 실행 base를 확정할 수 없어 원격 checkpoint 채택을 중단합니다.')
+        try:
+            # Inspect the complete artifact against its existing execution
+            # base, which retains archive sources. The latest base may not be
+            # fetched yet; incorporation subsequently fetches and checks it.
+            project_blocked_recovery.independent_scope(
+                project_blocked_recovery.CurrentScopeEffects(effects._current_rebase_service), connection, repo_path, state_dir, repo, blocked,
+                target=scope_base, remote_oid=observed,
+            )
+        except (OSError, RuntimeError, ValueError) as error:
+            return refuse(str(error))
     if not integrating:
         try:
             effects.validate_blocked_agent_scope(
@@ -401,20 +415,6 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
     if not combined and adopted_head != observed:
         return refuse("fast-forward 뒤 관리 worktree HEAD가 원격 후보와 다릅니다.")
     adopted_snapshot = effects.capture_git_snapshot(worktree)
-    if project_recovery_context is not None:
-        scope_base = blocked['active_sha'] or blocked['plan_sha']
-        if not scope_base:
-            return refuse('현재 계획의 기존 실행 base를 확정할 수 없어 원격 checkpoint 채택을 중단합니다.')
-        try:
-            # Inspect the complete artifact against its existing execution
-            # base, which retains archive sources. The latest base may not be
-            # fetched yet; incorporation subsequently fetches and checks it.
-            project_blocked_recovery.independent_scope(
-                project_blocked_recovery.CurrentScopeEffects(effects._current_rebase_service), connection, repo_path, state_dir, repo, blocked,
-                target=scope_base, remote_oid=observed,
-            )
-        except (OSError, RuntimeError, ValueError) as error:
-            return refuse(str(error))
     input_identity = effects._remote_checkpoint_input_identity(
         blocked, adopted_snapshot, ignored_paths,
     )

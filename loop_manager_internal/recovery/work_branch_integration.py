@@ -135,6 +135,10 @@ def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, sna
             if now.index != before.index:
                 raise RuntimeError('보존 commit의 index가 사용자에 의해 변경됐습니다.')
             effects.git(worktree, 'read-tree', intent['local_tree'])
+            # Refresh only stat evidence for the newly pinned index. In
+            # particular, binary entries may otherwise look unstaged until
+            # Git refreshes them; changed working bytes still cause refusal.
+            effects.git(worktree, 'update-index', '--refresh')
         clean = effects.capture_git_snapshot(worktree)
         if (clean.dirty or clean.head != intent['local_commit'] or clean.branch != branch
                 or clean.config != before.config):

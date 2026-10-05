@@ -16,7 +16,7 @@ from loop_manager_internal.storage import execution_checkpoint_state, blocked_ch
 from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
 from loop_manager_internal.recovery import blocked_plan_reconciliation
 from loop_manager_internal.recovery import checkpoint_ownership
-from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
+from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode, SCOPE_BASELINE_REASONS
 from loop_manager_internal.git import managed_rebase_validation, managed_rebase_adoption, manager_git_journal
 from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseService
 from loop_manager_internal.runtime.process_lock import _held_process_lock_identity
@@ -841,7 +841,10 @@ def validate_blocked_agent_scope(
         resources = effects._agent_git_resources(
             connection, repo_path, worktree, before, role_name,
             selected_plan_path=selected_plan_path)
-        if (role_name in {'worker', 'reviewer'} and current.branch is not None
+        owner = saved_plan if saved_plan is not None else guidance_plan
+        correcting_scope = (owner is not None and owner['blocked_reason'] in SCOPE_BASELINE_REASONS)
+        if (role_name in {'worker', 'reviewer'} and before.scope_id and before.scope_start_digest
+                and not correcting_scope and current.branch is not None
                 and resources is not None and not current.operations
                 and not project['agent_recovery'] and before.branch == current.branch
                 and current.branch == blocked_result.branch):
@@ -853,9 +856,10 @@ def validate_blocked_agent_scope(
                 allowed_requirement_archives=archive_sources,
                 external_worktree=repo_path, base_branch=base, resources=resources,
                 connection=connection)
-            relation = effects.git(worktree, 'merge-base', '--is-ancestor',
-                                   blocked_result.head, current.head, check=False)
-            if relation.returncode == 0:
+            relation = (0 if blocked_result.head == current.head else
+                        effects.git(worktree, 'merge-base', '--is-ancestor',
+                                    blocked_result.head, current.head, check=False).returncode)
+            if relation == 0:
                 if any(_non_default_index_flags(entries) for entries in current.index.values()):
                     raise AgentScopeError('사용자 입력의 index flags가 안전하지 않습니다.')
                 normalized = managed_rebase_adoption.selected_baseline(
@@ -867,11 +871,9 @@ def validate_blocked_agent_scope(
                     external_worktree=repo_path, base_branch=base,
                     resources=resources, connection=connection)
                 return
-            if relation.returncode not in {0, 1}:
+            if relation not in {0, 1}:
                 raise AgentScopeError('사용자 입력의 commit 관계를 확인할 수 없습니다.')
-        if (require_safe_result or role_name in {'worker', 'reviewer'}
-                and before.shared_metadata_complete and blocked_result.shared_metadata_complete
-                or (guidance_plan is not None
+        if (require_safe_result or (guidance_plan is not None
                     and guidance_plan['blocked_reason'] == GUIDANCE_BLOCK_REASON)):
             original = GitSnapshot.deserialize(str(serialized))
             comparison = agent_scope_decision.manager_comparison_baseline(

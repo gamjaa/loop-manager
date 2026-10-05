@@ -95,6 +95,33 @@ class WorkBranchIntegrationUnitTests(unittest.TestCase):
         self.assertFalse(any(call.args[1] in {'reset', 'clean', 'push'}
                              for call in self.effects.git.call_args_list))
 
+    def test_pinned_index_stat_refresh_precedes_clean_capture_and_rebase(self):
+        git = self.git
+        def stat_stale_index(root, *args, **kwargs):
+            result = git(root, *args, **kwargs)
+            if args[0] == 'read-tree':
+                self.now = replace(self.now, dirty={'new.bin': (('unstaged',), 'binary-bytes')})
+            elif args == ('update-index', '--refresh'):
+                self.now = replace(self.now, dirty={})
+            return result
+        self.effects.git.side_effect = stat_stale_index
+        self.assertFalse(self.run_integration().dirty)
+        self.effects._journaled_direct_rebase.assert_called_once()
+
+    def test_working_change_during_index_refresh_keeps_preservation_and_stops_rebase(self):
+        git = self.git
+        def changed_file(root, *args, **kwargs):
+            if args == ('update-index', '--refresh'):
+                raise RuntimeError('needs update')
+            return git(root, *args, **kwargs)
+        self.effects.git.side_effect = changed_file
+        with self.assertRaisesRegex(RuntimeError, 'needs update'):
+            self.run_integration()
+        saved = self.store.get('repo', 'G-166').snapshot['work_branch_integration']
+        self.assertEqual(saved['baseline'], self.baseline)
+        self.assertEqual(saved['phase'], 'preserving')
+        self.effects._journaled_direct_rebase.assert_not_called()
+
     def test_complete_restart_does_not_repeat_preservation_or_rebase(self):
         self.run_integration()
         self.run_integration()
@@ -237,7 +264,8 @@ class BlockedUserInputScopeUnitTests(unittest.TestCase):
         self.addCleanup(self.connection.close)
         self.before = GitSnapshot('agent-start', 'loop-manager/G-166', {}, {},
             {'refs/heads/loop-manager/G-166': ('agent-start', '')},
-            {'/state/G-166': ('HEAD=agent-start', 'branch=refs/heads/loop-manager/G-166')}, {}, {})
+            {'/state/G-166': ('HEAD=agent-start', 'branch=refs/heads/loop-manager/G-166')}, {}, {},
+            scope_id='finished-scope', scope_start_digest='start-digest')
         self.result = replace(self.before, dirty={'code.py': (('untracked',), 'agent-bytes')})
         self.current = replace(self.result, head='user-head',
             dirty={'AGENTS.md': (('staged', 'unstaged'), 'user-bytes')},
@@ -267,10 +295,10 @@ class BlockedUserInputScopeUnitTests(unittest.TestCase):
             git=mock.Mock(return_value=subprocess.CompletedProcess([], 0, '')),
             github_repository=mock.Mock())
 
-    def validate(self):
+    def validate(self, **options):
         scope_recovery.validate_blocked_agent_scope(
             self.connection, Path('/source'), 'repo', 'main', Path('/state/G-166'),
-            'docs/plans/[G-166] Work.md', saved_plan=self.plan, effects=self.effects)
+            'docs/plans/[G-166] Work.md', saved_plan=self.plan, effects=self.effects, **options)
 
     def test_completed_isolated_agent_result_is_checked_before_local_user_changes(self):
         self.validate()
@@ -282,6 +310,19 @@ class BlockedUserInputScopeUnitTests(unittest.TestCase):
         self.assertEqual(checks[-1].kwargs['resources'].refs,
             frozenset({'refs/heads/loop-manager/G-166', 'refs/remotes/origin/main',
                        'refs/remotes/origin/loop-manager/G-166'}))
+
+    def test_same_head_input_needs_no_ancestry_command(self):
+        self.effects.capture_git_snapshot.return_value = replace(self.current, head=self.result.head)
+        self.validate()
+        self.effects.git.assert_not_called()
+
+    def test_scope_correction_keeps_saved_result_and_checks_current_state(self):
+        self.plan['blocked_reason'] = 'managed_worktree_scope_violation'
+        self.effects.capture_git_snapshot.return_value = self.result
+        self.validate()
+        self.effects.git.assert_not_called()
+        self.assertEqual(self.effects.validate_agent_scope.call_args.args[3], self.result)
+        self.assertEqual(self.plan['agent_result_snapshot'], self.result.serialize())
 
     def test_actual_agent_violation_is_not_absorbed_as_user_input(self):
         self.effects.validate_agent_scope.side_effect = AgentScopeError('actual Agent violation')
@@ -312,7 +353,7 @@ class BlockedUserInputScopeUnitTests(unittest.TestCase):
                   'refs/heads/loop-manager/user': ('user-ref', '')},
             worktrees={**self.result.worktrees, '/source': ('HEAD=user-base',)})
         self.effects.capture_git_snapshot.return_value = self.current
-        self.validate()
+        self.validate(require_safe_result=True)
         checked = self.effects.validate_agent_scope.call_args_list
         self.assertEqual(checked[0].args[3], self.result)
         self.assertIn('refs/remotes/origin/main', checked[-1].kwargs['resources'].refs)

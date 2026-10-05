@@ -70,7 +70,7 @@ class ExternalOwnershipObservationTests(TestCase):
         self.assertIs(caught.exception.reason, RecoveryReason.PUBLICATION_RETRY)
 
     def test_blocked_checkpoint_adoption_retries_failed_owner_observation(self):
-        checkpoint = SimpleNamespace(operation=None)
+        checkpoint = SimpleNamespace(operation=None, snapshot={})
         connection = mock.Mock()
         connection.execute.return_value.fetchone.return_value = {'phase': 'published'}
         owner = mock.Mock(side_effect=RecoveryFailure(

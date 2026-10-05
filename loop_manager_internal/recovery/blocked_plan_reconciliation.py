@@ -394,7 +394,8 @@ class BlockedPlanReconciler:
                 self._check_owner(plan_id, context)
                 rebased = self.ports._journaled_direct_rebase(
                     self.connection, self.repo_path, self.repo, plan_id, worktree, branch,
-                    context['base_oid'], agent_session_id=plan['worker_session_id'])
+                    context['base_oid'], agent_session_id=plan['worker_session_id'],
+                    observed_remote=(context['branch_oid'],))
                 if rebased.returncode:
                     raise RuntimeError('차단 계획 관리 rebase가 충돌 해결을 기다립니다: ' + rebased.stdout[-2000:])
         checkpoint = checkpoints.get(self.repo, plan_id)
@@ -405,7 +406,8 @@ class BlockedPlanReconciler:
             if decision.status.value == 'ready_to_start':
                 rebased = self.ports._journaled_direct_rebase(
                     self.connection, self.repo_path, self.repo, plan_id, worktree, branch,
-                    checkpoint.target_base_oid, agent_session_id=plan['worker_session_id'])
+                    checkpoint.target_base_oid, agent_session_id=plan['worker_session_id'],
+                    observed_remote=(checkpoint.observed_remote_oid,))
                 if rebased.returncode:
                     raise RuntimeError('차단 계획 관리 rebase가 충돌 해결을 기다립니다: ' + rebased.stdout[-2000:])
                 checkpoint = checkpoints.get(self.repo, plan_id)
