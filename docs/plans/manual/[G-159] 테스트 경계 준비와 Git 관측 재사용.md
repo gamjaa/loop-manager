@@ -38,7 +38,7 @@ R-070의 반복 준비와 동일 검사 구간의 중복 관측을 줄인다. �
 
 - [x] R-070, 제품·설계·ExecPlan 규칙 및 기존 fixture와 관측 경로 확인
 - [x] 구현과 targeted unit test 29개 통과
-- [ ] 일반 PR 게시
+- [x] 일반 PR 게시: https://github.com/gamjaa/loop-manager/pull/150
 - [ ] Manager 전체 비교 verify, Review 및 사용자 Merge
 
 ## Decision Log
@@ -66,6 +66,7 @@ R-070의 반복 준비와 동일 검사 구간의 중복 관측을 줄인다. �
 - 환경: Windows, Python 3.13.14, Git 2.54.0.windows.1. 코드 기준은 `53f7322`에 이 PR의 미커밋 후보를 적용한 상태다. targeted unit은 직렬 실행이며 별도 부하를 주입하지 않았다. 다른 호스트 프로세스의 동시 부하는 통제하지 않았다.
 - 대표 준비 unit 비교는 두 경우 모두 기존 초기 repository seed가 준비된 상태다. 독립 준비 2회와 준비 1회+저장+복원+identity 검증을 비교한다. 현재 후보에서 구 경로와 새 경로를 같은 assertion으로 실행한다. 최초 seed 생성의 효과를 이번 절감으로 합산하지 않는다.
 - 실제 Git 명령: **40 → 26회**, snapshot: **3 → 2회**. 한 실행의 전체 준비 구간은 **2.0595 → 2.0204초**였다. 복사·저장·digest 검사·복원·정리를 포함한다. 절대 시간 차이는 작고 단일 실행이므로 절감률을 보장하지 않는다. 이 값은 unit 준비 사례의 경과 시간이며 모듈 누적 또는 전체 verify 경과 시간이 아니다.
+- 원격 main으로 기준을 정리한 `1ee9a90`에서 같은 준비 unit을 재실행해 통과했다. 명령·snapshot 수는 같고 **1.9657 → 1.8163초**였다. 재사용의 저장 0.2583초·identity 확인 0.0461초·복원 0.2158초·정리 0.0808초를 포함한다. 이 재실행도 전체 verify 비교는 아니다.
 - HEAD/branch 묶음 조회는 attached 기본 checkout+detached 추가 worktree의 구 조회와 동일 snapshot을 반환하며 Git 명령 2회를 줄인다. 두 index의 bytes도 관측 전후 동일하다.
 - 동일 inspect의 소유권 소비자는 전체 expectation·checkpoint generation이 같은 결과만 사용한다. repository·worktree·branch·target·remote·입력·범위·generation이 다르면 새 관측으로 돌아가는 unit case를 남겼다. 독립 원격 소유권 거절도 유지한다. 전체 결과를 실행 단계나 재시작 사이에 보존하지 않는다.
 - journal 없음/owner 불일치/이미 완료에는 기록 관측 0회, 유효 활성 journal에는 지연 수집한다. 관측 오류가 나면 intent를 보존한다.
