@@ -263,12 +263,14 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
 
     def test_notification_fixture_leaves_file_connection_cleanup_to_its_caller(self):
         owner = mock.Mock()
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             returned = notification_fixture.NotificationFixture.connection(
                 owner, database=Path(directory) / 'loop-manager.db'
             )
+            cleanup.callback(returned.close)
             owner.addCleanup.assert_not_called()
-            returned.close()
+        with self.assertRaises(sqlite3.ProgrammingError):
+            returned.execute('SELECT 1')
 
     def test_recovery_fixture_closes_its_owned_connection_after_initialization_failure(self):
         connection = mock.Mock()
