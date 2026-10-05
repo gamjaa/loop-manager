@@ -8,13 +8,16 @@ try {
     [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
     $env:PYTHONIOENCODING = 'utf-8'
     $venvPython = Join-Path $root '.venv/Scripts/python.exe'
+    $pythonArguments = @()
     if (Test-Path -LiteralPath $venvPython) {
-        & $venvPython -u -m loop_manager_internal.verification.runner
+        $pythonCommand = $venvPython
     } elseif (Get-Command py -ErrorAction SilentlyContinue) {
-        py -3 -u -m loop_manager_internal.verification.runner
+        $pythonCommand = 'py'
+        $pythonArguments = @('-3')
     } else {
-        python -u -m loop_manager_internal.verification.runner
+        $pythonCommand = 'python'
     }
+    & $pythonCommand @pythonArguments -u -m loop_manager_internal.verification.runner
     $verifyExitCode = $LASTEXITCODE
 } finally {
     [Console]::OutputEncoding = $previousEncoding
