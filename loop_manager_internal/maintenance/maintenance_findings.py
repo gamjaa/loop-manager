@@ -9,9 +9,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 from typing import Callable, Mapping
+from uuid import uuid4
 
 from loop_manager_internal.maintenance.maintenance_reconciliation import ReconciliationError, _note, _single_json
 
@@ -27,6 +29,20 @@ def encode(value: object) -> str:
 
 def digest(value: object) -> str:
     return hashlib.sha256(encode(value).encode()).hexdigest()
+
+
+def _publish_file(path: Path, content: bytes) -> None:
+    """Replace one export file without exposing a truncated write."""
+    temporary = path.with_name(f".{path.name}-{uuid4().hex}")
+    try:
+        temporary.write_bytes(content)
+        os.replace(temporary, path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _matches_file(path: Path, content: bytes) -> bool:
+    return path.is_file() and not path.is_symlink() and path.read_bytes() == content
 
 
 @dataclass(frozen=True)
@@ -235,21 +251,39 @@ class FindingsRepository:
     def export(self, repo: str, unit: FindingsUnit, plans: Mapping[str, str], plan_texts: Mapping[str, str],
                evidence_manifest: Path) -> Path:
         directory = evidence_manifest.parent / "findings" / unit.manifest_id
+        if directory.parent.is_symlink() or directory.is_symlink():
+            raise ReconciliationError("발견 export 경로가 일반 디렉터리가 아닙니다.")
         directory.mkdir(parents=True, exist_ok=True)
         catalog = directory / "plans.jsonl"
-        if not catalog.exists():
-            with catalog.open("w", encoding="utf-8") as stream:
-                for index, (plan, status) in enumerate(sorted(plans.items())):
-                    name = f"plan-{index:08d}.txt"
-                    (directory / name).write_text(plan_texts[plan], encoding="utf-8")
-                    stream.write(encode({"plan_id": plan, "status": status, "path": name}) + "\n")
-        for index, raw in self.connection.execute("SELECT unit_index,payload_json FROM provisional_findings_units WHERE repo=? AND manifest_id=?",
-                                                  (repo, unit.manifest_id)):
-            path = directory / f"unit-{index:08d}.json"
-            if not path.exists():
-                path.write_text(raw, encoding="utf-8")
+        files = {}
+        catalog_lines = []
+        for index, (plan, status) in enumerate(sorted(plans.items())):
+            name = f"plan-{index:08d}.txt"
+            files[name] = plan_texts[plan].encode("utf-8")
+            catalog_lines.append(encode({"plan_id": plan, "status": status, "path": name}) + "\n")
+        files[catalog.name] = "".join(catalog_lines).encode("utf-8")
+        rows = self.connection.execute(
+            "SELECT unit_index,payload_json FROM provisional_findings_units "
+            "WHERE repo=? AND manifest_id=? ORDER BY unit_index", (repo, unit.manifest_id),
+        ).fetchall()
+        if [index for index, _ in rows] != list(range(unit.index)):
+            raise ReconciliationError("저장된 발견 단위가 누락됐습니다.")
+        for index, raw in rows:
+            files[f"unit-{index:08d}.json"] = raw.encode("utf-8")
         manifest = directory / "manifest.json"
-        manifest.write_text(encode({"manifest_id": unit.manifest_id, "source_revision": unit.revision,
+        manifest_content = encode({"manifest_id": unit.manifest_id, "source_revision": unit.revision,
             "evidence_manifest": str(evidence_manifest), "plan_catalog": str(catalog), "plan_count": len(plans),
-            "next_unit": unit.index, "unit_pattern": "unit-{index:08d}.json", "receipt": unit.receipt}), encoding="utf-8")
+            "next_unit": unit.index, "unit_pattern": "unit-{index:08d}.json", "receipt": unit.receipt}).encode("utf-8")
+        if _matches_file(manifest, manifest_content) and all(
+            _matches_file(directory / name, content) for name, content in files.items()
+        ):
+            return manifest
+        # The manifest is the completion marker. Remove it before repairing any
+        # generation, then publish it only after every referenced file is whole.
+        manifest.unlink(missing_ok=True)
+        for name, content in files.items():
+            path = directory / name
+            if not _matches_file(path, content):
+                _publish_file(path, content)
+        _publish_file(manifest, manifest_content)
         return manifest

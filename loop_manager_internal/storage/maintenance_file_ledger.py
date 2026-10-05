@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -53,6 +54,14 @@ class ReviewedSource:
     mode: str
     source_revision: str
     evidence: str
+
+
+@dataclass(frozen=True)
+class PreparedAssessment:
+    selected: tuple[TrackedSource, ...]
+    placements: tuple[dict, ...]
+    remote_revision: str
+    legacy: bool
 
 
 ROOT_REVIEW_PATH = "."
@@ -284,17 +293,13 @@ class FileReviewRepository:
             )
         )
 
-    def record_success(
+    def _prepare_evidence(
         self, repo: str, repository_path: str, base_branch: str,
         inventory: SourceInventory, reviewed: Sequence[ReviewedSource],
         *, published_revision: str | None = None, root_reviews: Sequence[dict] | None = None,
         legacy_publication_commit: str | None = None,
-    ) -> AssessmentSuccess:
-        """Commit only complete, source-bound review evidence in one transaction.
-
-        Empty evidence is valid only when no source file needs review. Retired
-        paths remain in the ledger as audit rows and are ignored for selection.
-        """
+    ) -> PreparedAssessment:
+        """Validate source, root, and review evidence before any ledger write."""
         source_repo = Path(repository_path)
         if Path(repo).resolve() != source_repo.resolve():
             raise FileReviewLedgerError("프로젝트와 원격 Git 저장소 경로가 다릅니다.")
@@ -344,26 +349,44 @@ class FileReviewRepository:
             or (not legacy and {item.path for item in root_placement_inventory(current)}
                 != {item["path"] for item in placements})):
             raise FileReviewLedgerError("루트 조사 후 참조 또는 소유 대상이 변경됐습니다.")
+        selected = self.selected_sources(repo, inventory)
+        if len(reviewed) != len(selected):
+            raise FileReviewLedgerError("선정된 모든 파일의 검토 근거가 필요합니다.")
+        expected = {source.path: source for source in selected}
+        seen: set[str] = set()
+        for result in reviewed:
+            if not isinstance(result, ReviewedSource) or not isinstance(result.path, str):
+                raise FileReviewLedgerError("검토 결과 형식이 유효하지 않습니다.")
+            source = expected.get(result.path)
+            if (source is None or result.path in seen
+                or (result.content_hash, result.mode, result.source_revision)
+                != (source.content_hash, source.mode, source.revision)
+                or not re.fullmatch(r"[0-9a-f]{64}", result.content_hash)
+                or not isinstance(result.evidence, str)
+                or len(result.evidence.strip()) < 20):
+                raise FileReviewLedgerError("검토 근거 또는 파일 원본 identity가 유효하지 않습니다.")
+            seen.add(result.path)
+        if seen != set(expected):
+            raise FileReviewLedgerError("선정된 파일의 검토가 누락됐습니다.")
+        # Keep the first validated decision independent of caller-owned root
+        # dictionaries, including their nested reference evidence.
+        return PreparedAssessment(selected, deepcopy(placements), remote_revision, legacy)
+
+    def record_success(
+        self, repo: str, repository_path: str, base_branch: str,
+        inventory: SourceInventory, reviewed: Sequence[ReviewedSource],
+        *, published_revision: str | None = None, root_reviews: Sequence[dict] | None = None,
+        legacy_publication_commit: str | None = None,
+    ) -> AssessmentSuccess:
+        """Commit prepared evidence and recheck publication inside the transaction."""
+        options = dict(published_revision=published_revision, root_reviews=root_reviews,
+                       legacy_publication_commit=legacy_publication_commit)
+        prepared = self._prepare_evidence(repo, repository_path, base_branch, inventory, reviewed, **options)
+        source_repo = Path(repository_path)
         with _transaction(self.connection):
-            selected = self.selected_sources(repo, inventory)
-            if len(reviewed) != len(selected):
-                raise FileReviewLedgerError("선정된 모든 파일의 검토 근거가 필요합니다.")
-            expected = {source.path: source for source in selected}
-            seen: set[str] = set()
-            for result in reviewed:
-                if not isinstance(result, ReviewedSource) or not isinstance(result.path, str):
-                    raise FileReviewLedgerError("검토 결과 형식이 유효하지 않습니다.")
-                source = expected.get(result.path)
-                if (source is None or result.path in seen
-                    or (result.content_hash, result.mode, result.source_revision)
-                    != (source.content_hash, source.mode, source.revision)
-                    or not re.fullmatch(r"[0-9a-f]{64}", result.content_hash)
-                    or not isinstance(result.evidence, str)
-                    or len(result.evidence.strip()) < 20):
-                    raise FileReviewLedgerError("검토 근거 또는 파일 원본 identity가 유효하지 않습니다.")
-                seen.add(result.path)
-            if seen != set(expected):
-                raise FileReviewLedgerError("선정된 파일의 검토가 누락됐습니다.")
+            if self._prepare_evidence(repo, repository_path, base_branch, inventory, reviewed, **options) != prepared:
+                raise FileReviewLedgerError("게시 직전 평가 근거 또는 선정 파일이 변경됐습니다.")
+            selected, placements, legacy = prepared.selected, prepared.placements, prepared.legacy
             reviewed_at = datetime.now(timezone.utc).isoformat()
             current_paths = {source.path for source in inventory.sources}
             for review in self.reviews(repo):
@@ -410,5 +433,10 @@ class FileReviewRepository:
                 "source_revision = excluded.source_revision, reviewed_at = excluded.reviewed_at",
                 (repo, inventory.revision, reviewed_at),
             )
-            verify_remote_revision(source_repo, base_branch, remote_revision)
+            project = self.connection.execute(
+                "SELECT base_branch FROM projects WHERE repo = ?", (repo,),
+            ).fetchone()
+            if project is None or str(project[0]) != base_branch:
+                raise FileReviewLedgerError("등록된 프로젝트의 base branch가 다릅니다.")
+            verify_remote_revision(source_repo, base_branch, prepared.remote_revision)
         return AssessmentSuccess(inventory.revision, reviewed_at)
