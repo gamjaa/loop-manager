@@ -17,6 +17,24 @@ import loop_manager as manager
 
 
 class UsageTests(TestCase):
+    def test_reviewer_escaped_literals_keep_nonsecret_failure_context(self):
+        diagnostic = r'FAILED parser at \u003d and \" token'
+        malformed = r'{"type":"error","message":"Unexpected \u003d and \" token'
+        self.assertEqual(provider_adapters._redact_reviewer_log(diagnostic), diagnostic)
+        self.assertEqual(provider_adapters._redact_reviewer_log(malformed), malformed)
+
+        event = json.dumps({'type': 'item.completed', 'item': {
+            'type': 'agent_message', 'text': diagnostic,
+        }})
+        clean = json.loads(provider_adapters._redact_reviewer_log(event))
+        self.assertEqual(clean['item']['text'], diagnostic)
+
+        mixed = r'FAILED parser at \u003d; password: hidden-secret; tail \"'
+        clean = provider_adapters._redact_reviewer_log(mixed)
+        self.assertNotIn('hidden-secret', clean)
+        self.assertIn(r'FAILED parser at \u003d', clean)
+        self.assertIn(r'tail \"', clean)
+
     def test_reviewer_pipe_yields_session_line_before_eof(self):
         read_fd, write_fd = os.pipe()
         received = []
@@ -53,9 +71,15 @@ class UsageTests(TestCase):
         self.assertIn('malformed reviewer JSON omitted', clean)
 
     def test_truncated_reviewer_json_omits_unicode_escaped_key(self):
-        raw = '{"item":{"text":"pass\\u0077ord: unicode-secret and context'
+        raw = '{"item":{"text":"password: first-secret; pass\\u0077ord: unicode-secret and context'
         clean = provider_adapters._redact_reviewer_log(raw)
+        self.assertNotIn('first-secret', clean)
         self.assertNotIn('unicode-secret', clean)
+        self.assertIn('malformed reviewer JSON omitted', clean)
+
+        doubly_escaped = r'{"item":{"text":"pass\\u0077ord: double-secret and context'
+        clean = provider_adapters._redact_reviewer_log(doubly_escaped)
+        self.assertNotIn('double-secret', clean)
         self.assertIn('malformed reviewer JSON omitted', clean)
 
     def test_nested_reviewer_json_redacts_unicode_escaped_key(self):
@@ -66,7 +90,10 @@ class UsageTests(TestCase):
 
     def test_reviewer_provider_artifacts_redact_json_credentials(self):
         secret = 'review-json-secret'
-        review = f'{{"password": "{secret}", "result": "VERDICT: FAIL"}}'
+        context = r'FAILED parser at \u003d and \" token'
+        review = json.dumps({
+            'password': secret, 'result': 'VERDICT: FAIL', 'detail': context,
+        })
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
 
@@ -91,6 +118,7 @@ class UsageTests(TestCase):
             )
             self.assertNotIn(secret, str(codex_result))
             self.assertIn('VERDICT: FAIL', codex_result[1])
+            self.assertEqual(json.loads(codex_result[1])['detail'], context)
             log_dir, = (root / 'logs').iterdir()
             for artifact in ('reviewer.log', 'reviewer-last.txt'):
                 self.assertNotIn(secret, (log_dir / artifact).read_text())
@@ -111,6 +139,7 @@ class UsageTests(TestCase):
                 resolved_profile=invocation.ResolvedProfile('model', 'high'), effects=effects,
             )
             self.assertNotIn(secret, str(claude_result))
+            self.assertEqual(json.loads(claude_result[1])['detail'], context)
             for artifact in ('claude-reviewer.log', 'claude-reviewer-last.txt'):
                 self.assertNotIn(secret, (log_dir / artifact).read_text())
 

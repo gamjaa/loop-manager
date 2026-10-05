@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 from pathlib import Path
+import re
 import subprocess
 import threading
 from typing import Protocol
@@ -48,6 +49,23 @@ def _json_object(line: str) -> tuple[dict[str, object] | None, bool]:
 
 def _redact_reviewer_log(raw: str) -> str:
     """Decode JSON events so escaped credential keys receive the same scrubber."""
+    def decoded_escapes(value: str) -> str:
+        while True:
+            decoded = re.sub(r"(?<!\\)\\u([0-9a-fA-F]{4})",
+                             lambda match: chr(int(match.group(1), 16)), value)
+            decoded = decoded.replace("\\\\", "\\").replace('\\"', '"')
+            if decoded == value:
+                return value
+            value = decoded
+
+    def scrub_text(value: str, omitted: str) -> str:
+        clean = redact_secrets(value)
+        if "\\" not in value:
+            return clean
+        if redact_secrets(decoded_escapes(value)) != decoded_escapes(clean):
+            return omitted
+        return clean
+
     def scrub(value: object) -> object:
         if isinstance(value, dict):
             return {
@@ -63,10 +81,8 @@ def _redact_reviewer_log(raw: str) -> str:
                 try:
                     return json.dumps(scrub(json.loads(value)), ensure_ascii=False)
                 except (ValueError, RecursionError):
-                    return "[malformed reviewer JSON omitted]"
-            if "\\u" in value or "\\\"" in value:
-                return "[escaped reviewer text omitted]"
-            return redact_secrets(value)
+                    pass
+            return scrub_text(value, "[escaped reviewer text omitted]")
         return value
 
     lines = []
@@ -74,11 +90,7 @@ def _redact_reviewer_log(raw: str) -> str:
         try:
             decoded = json.loads(line)
         except (ValueError, RecursionError):
-            if line.lstrip().startswith(("{", "[")) or "\\u" in line or "\\\"" in line:
-                lines.append("[malformed reviewer JSON omitted]" +
-                             ("\n" if line.endswith("\n") else ""))
-            else:
-                lines.append(redact_secrets(line))
+            lines.append(scrub_text(line, "[malformed reviewer JSON omitted]"))
         else:
             lines.append(json.dumps(scrub(decoded), ensure_ascii=False) +
                          ("\n" if line.endswith("\n") else ""))

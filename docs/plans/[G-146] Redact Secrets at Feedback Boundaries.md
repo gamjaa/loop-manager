@@ -45,3 +45,4 @@ Keep credential-bearing verify and Review feedback out of durable diagnostics an
 - Native Reviewer keeps the previous last-message file when preflight blocks process creation; it replaces that file only after collecting a sanitized message.
 - Codex and Claude Reviewer calls, including resumed calls, drain JSONL in bounded chunks and sanitize before a capped log write. Oversized or undecodable JSON lines are omitted, including unicode-escaped credential keys, while later result and session events remain available.
 - Bounded Reviewer reads now stop at each newline so a short session-start event is observed before the provider closes stdout; a real pipe test covers delivery before EOF.
+- Malformed Reviewer text retains benign escaped literals after scrubbing; an escape-normalized comparison omits text only when an encoded credential would remain.
