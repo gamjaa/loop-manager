@@ -1,11 +1,13 @@
 """Physical Agent invocation observations and tolerant provider usage parsing."""
 
 from pathlib import Path
+import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
-import io
+import threading
 from unittest import TestCase, mock
 
 from loop_manager_internal.agents import agent_invocation as invocation
@@ -15,6 +17,33 @@ import loop_manager as manager
 
 
 class UsageTests(TestCase):
+    def test_reviewer_pipe_yields_session_line_before_eof(self):
+        read_fd, write_fd = os.pipe()
+        received = []
+        done = threading.Event()
+        with os.fdopen(read_fd, 'r', encoding='utf-8') as reader:
+            writer = os.fdopen(write_fd, 'w', encoding='utf-8')
+
+            def receive():
+                try:
+                    received.append(next(provider_adapters._bounded_reviewer_lines(reader)))
+                except Exception as error:
+                    received.append(error)
+                finally:
+                    done.set()
+
+            thread = threading.Thread(target=receive, daemon=True)
+            thread.start()
+            try:
+                session_line = '{"type":"thread.started","thread_id":"session"}\n'
+                writer.write(session_line)
+                writer.flush()
+                self.assertTrue(done.wait(1), 'session line waited for pipe EOF')
+                self.assertEqual(received, [session_line])
+            finally:
+                writer.close()
+                thread.join(1)
+
     def test_truncated_reviewer_json_redacts_escaped_credential_key(self):
         raw = ('{"item":{"text":"\\"password\\": \\"escaped-secret\\" and context\n'
                '\\"api_key\\": \\"another-secret\\" more context')
@@ -110,11 +139,13 @@ class UsageTests(TestCase):
             effects = provider_adapters.ProviderEffects(
                 mock.Mock(), mock.Mock(), mock.Mock(), codex_start, mock.Mock(),
             )
+            codex_sessions = []
             provider_adapters.run_codex(
                 root, root, root / 'config', 'reviewer', 'prompt', read_only=True,
-                persist_session=True,
+                persist_session=True, on_session_started=codex_sessions.append,
                 resolved_profile=invocation.ResolvedProfile('model', 'high'), effects=effects,
             )
+            self.assertEqual(codex_sessions, ['session'])
             log_dir, = (root / 'logs').iterdir()
             for artifact in ('reviewer.log', 'reviewer-last.txt'):
                 self.assertNotIn(secret, (log_dir / artifact).read_text())
@@ -126,11 +157,13 @@ class UsageTests(TestCase):
                 mock.Mock(), mock.Mock(), mock.Mock(),
                 mock.Mock(return_value=Process(claude_stream)), mock.Mock(),
             )
+            claude_sessions = []
             provider_adapters.run_claude(
                 root, root, root / 'config', 'reviewer', 'prompt', read_only=True,
-                persist_session=True,
+                persist_session=True, on_session_started=claude_sessions.append,
                 resolved_profile=invocation.ResolvedProfile('model', 'high'), effects=effects,
             )
+            self.assertEqual(claude_sessions, ['session'])
             for artifact in ('claude-reviewer.log', 'claude-reviewer-last.txt'):
                 self.assertNotIn(secret, (log_dir / artifact).read_text())
 
@@ -139,8 +172,11 @@ class UsageTests(TestCase):
 
         class Stream(io.StringIO):
             def read(self, size=-1):
-                self_test.assertEqual(size, 8192)
-                return super().read(size)
+                self_test.fail('reviewer output must be read one bounded line at a time')
+
+            def readline(self, size=-1):
+                self_test.assertEqual(size, provider_adapters.MAX_REVIEWER_LINE + 1)
+                return super().readline(size)
 
         class Process:
             def __init__(self, stream):

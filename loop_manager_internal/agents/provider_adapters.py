@@ -86,27 +86,20 @@ def _redact_reviewer_log(raw: str) -> str:
 
 
 def _bounded_reviewer_lines(stream):
-    """Drain untrusted JSONL with a fixed maximum retained line size."""
+    """Yield JSONL as each newline arrives without retaining oversized lines."""
     pending = ""
     oversized = False
-    while chunk := stream.read(8192):
-        start = 0
-        while start < len(chunk):
-            end = chunk.find("\n", start)
-            part = chunk[start:end + 1] if end >= 0 else chunk[start:]
-            if not oversized:
-                if len(pending) + len(part) <= MAX_REVIEWER_LINE:
-                    pending += part
-                else:
-                    pending = ""
-                    oversized = True
-            if end >= 0:
-                yield None if oversized else pending
-                pending = ""
-                oversized = False
-                start = end + 1
+    while part := stream.readline(MAX_REVIEWER_LINE + 1):
+        if not oversized:
+            if len(pending) + len(part) <= MAX_REVIEWER_LINE:
+                pending += part
             else:
-                break
+                pending = ""
+                oversized = True
+        if part.endswith("\n"):
+            yield None if oversized else pending
+            pending = ""
+            oversized = False
     if pending or oversized:
         yield None if oversized else pending
 
