@@ -67,6 +67,7 @@ class WorkerPublicationValidationTest(unittest.TestCase):
             base_index = git_command(repo, "diff", "--cached")
             base_head = git_command(repo, "rev-parse", "HEAD")
             connection = sqlite3.connect(":memory:")
+            self.addCleanup(connection.close)
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
             connection.execute(
@@ -185,6 +186,7 @@ class WorkerPublicationValidationTest(unittest.TestCase):
             loop_manager.make_worktree(repo, worktree, branch, "main")
             plan_sha = git_command(repo, "rev-parse", "origin/main")
             connection = sqlite3.connect(":memory:")
+            self.addCleanup(connection.close)
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
             connection.execute(

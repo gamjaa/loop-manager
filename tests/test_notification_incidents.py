@@ -2,6 +2,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
@@ -316,9 +317,10 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
 
     def test_planning_incident_survives_database_reopen_and_repeated_observation(self):
         repo = "/projects/alpha"
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             database = Path(directory) / "state.db"
             connection = self.connection(database=database)
+            cleanup.callback(connection.close)
             with connection:
                 connection.execute(
                     "UPDATE projects SET planning_error = 'owner mismatch' "
@@ -332,6 +334,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
             connection.close()
 
             connection = sqlite3.connect(database)
+            cleanup.callback(connection.close)
             connection.row_factory = sqlite3.Row
             for _ in range(3):
                 with connection:
@@ -940,6 +943,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         directory = self.enterContext(tempfile.TemporaryDirectory())
         database = Path(directory) / "notices.db"
         connection = self.connection(database=database)
+        self.addCleanup(connection.close)
         repo = "/projects/alpha"
         with connection:
             connection.execute(

@@ -42,6 +42,7 @@ def git(repo: Path, *arguments: str) -> str:
 class MaintenancePlanningCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
         root = Path(self.temporary.name)
         self.remote = root / "remote.git"
         self.repo = root / "repo"
@@ -72,6 +73,7 @@ class MaintenancePlanningCase(unittest.TestCase):
         self.base_sha = git(self.repo, "rev-parse", "HEAD")
 
         self.connection = sqlite3.connect(":memory:")
+        self.addCleanup(self.connection.close)
         self.connection.row_factory = sqlite3.Row
         self.connection.execute(loop_manager.SCHEMA)
         loop_manager._ensure_execplans_schema(self.connection)
@@ -82,10 +84,6 @@ class MaintenancePlanningCase(unittest.TestCase):
         self._insert_plan("G-000", "Merged Foundation", "MERGED")
         self._insert_plan("G-001", "Ready Feature", "READY")
         self.connection.commit()
-
-    def tearDown(self) -> None:
-        self.connection.close()
-        self.temporary.cleanup()
 
     def _path(self, plan_id: str, title: str) -> Path:
         return self.repo / "docs/plans" / f"[{plan_id}] {title}.md"

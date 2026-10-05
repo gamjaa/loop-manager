@@ -35,8 +35,8 @@ Make SQLite fixture lifetime explicit so assertions, setup failures and Windows 
 
 ## Progress
 
-- [ ] Assign connection ownership and immediate cleanup in shared and direct fixtures.
-- [ ] Add failure-path lifetime checks where existing tests cannot observe closure.
+- [x] Assign connection ownership and immediate cleanup in shared and direct fixtures.
+- [x] Add failure-path lifetime checks where existing tests cannot observe closure.
 
 ## Decision Log
 

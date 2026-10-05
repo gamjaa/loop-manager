@@ -1,4 +1,4 @@
-from contextlib import closing
+from contextlib import ExitStack, closing
 from tests.support.recovery_boundary import RecoveryBoundary
 from tests.support.recovery import BoundedRecoveryFixture
 import json
@@ -91,10 +91,11 @@ class RecoveryHistoryTest(BoundedRecoveryFixture, unittest.TestCase):
 
     @dummy_worker_sessions
     def test_history_persists_and_stage_success_or_blocked_requeue_clears_it(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             state_dir = Path(directory) / "state"
             state_dir.mkdir()
             database = sqlite3.connect(state_dir / "loop-manager.db")
+            cleanup.callback(database.close)
             database.row_factory = sqlite3.Row
             root, connection = self._failure_state(
                 str(Path(directory) / "catalog"), connection=database
@@ -108,6 +109,7 @@ class RecoveryHistoryTest(BoundedRecoveryFixture, unittest.TestCase):
             connection.close()
 
             reopened = sqlite3.connect(state_dir / "loop-manager.db")
+            cleanup.callback(reopened.close)
             reopened.row_factory = sqlite3.Row
             persisted = reopened.execute(
                 "SELECT verify_failure_history, review_failure_history "

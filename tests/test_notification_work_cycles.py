@@ -2,6 +2,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
@@ -69,10 +70,10 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
 
     def test_completion_while_disabled_cancels_wait_before_reenabled_dispatch(self):
         for fail_delivery in (False, True):
-            with self.subTest(fail_delivery=fail_delivery):
-                directory = self.enterContext(tempfile.TemporaryDirectory())
+            with self.subTest(fail_delivery=fail_delivery), tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
                 database = Path(directory) / "state.db"
                 connection = self.connection(database=database)
+                cleanup.callback(connection.close)
                 repo = "/projects/alpha"
                 waiting = work_exhaustion.WorkReasonSnapshot(
                     "cycle-one", (),
@@ -99,7 +100,7 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
                 connection.close()
 
                 restarted = sqlite3.connect(database)
-                self.addCleanup(restarted.close)
+                cleanup.callback(restarted.close)
                 restarted.row_factory = sqlite3.Row
                 notifications.configure_session(restarted, enabled=True)
                 delivered = mock.Mock()
@@ -182,9 +183,10 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
 
 class WorkReasonOutboxTest(NotificationFixture, unittest.TestCase):
     def test_waiting_snapshot_lists_confirmed_causes_and_deduplicates_restart(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             database = Path(directory) / "state.db"
             connection = self.connection(database=database)
+            cleanup.callback(connection.close)
             repo = "/projects/alpha"
             connection.execute(
                 "UPDATE exec_plans SET depends_on = '[\"G-017\"]' "
@@ -225,6 +227,7 @@ class WorkReasonOutboxTest(NotificationFixture, unittest.TestCase):
             connection.close()
 
             restarted = sqlite3.connect(database)
+            cleanup.callback(restarted.close)
             restarted.row_factory = sqlite3.Row
             notifications.configure_session(restarted, enabled=True)
             notifications.enqueue_waiting_reason(restarted, repo, snapshot)
@@ -245,10 +248,10 @@ class WorkReasonOutboxTest(NotificationFixture, unittest.TestCase):
     def test_disabled_wait_transition_cancels_stale_notice_before_restart(self):
         for remaining_requirement in (False, True):
             for failed_delivery in (False, True):
-                with self.subTest(requirement=remaining_requirement, failed=failed_delivery):
-                    directory = self.enterContext(tempfile.TemporaryDirectory())
+                with self.subTest(requirement=remaining_requirement, failed=failed_delivery), tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
                     database = Path(directory) / "state.db"
                     connection = self.connection(database=database)
+                    cleanup.callback(connection.close)
                     repo = "/projects/alpha"
                     connection.execute(
                         "UPDATE exec_plans SET status = 'PR_OPEN' WHERE repo = ?", (repo,),
@@ -292,7 +295,7 @@ class WorkReasonOutboxTest(NotificationFixture, unittest.TestCase):
                     connection.close()
 
                     restarted = sqlite3.connect(database)
-                    self.addCleanup(restarted.close)
+                    cleanup.callback(restarted.close)
                     restarted.row_factory = sqlite3.Row
                     notifications.configure_session(restarted, enabled=True)
                     delivered = mock.Mock()
@@ -368,5 +371,3 @@ class WorkReasonOutboxTest(NotificationFixture, unittest.TestCase):
             connection, "token", "chat", adapter=delivered,
         ), 1)
         self.assertIsNotNone(self.events(connection)[0]["sent_at"])
-
-
