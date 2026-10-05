@@ -191,7 +191,7 @@ def collect(
             judgment = None
             if _table_exists(connection, "requirement_judgments"):
                 judgment = connection.execute(
-                    "SELECT outcome, invalidation_reason FROM requirement_judgments "
+                    "SELECT outcome, invalidation_reason, criteria_evidence FROM requirement_judgments "
                     "WHERE repo = ? AND source_path = ?", (repo, path),
                 ).fetchone()
             if judgment is None or judgment[1]:
@@ -201,7 +201,13 @@ def collect(
             elif judgment[0] == "unfulfilled":
                 reason = "전체 기준 미충족 판단에 따른 후속 계획을 기다립니다"
             else:
-                reason = "전체 충족 판단이 불확실하여 사용자 결정을 기다립니다"
+                evidence = json.loads(str(judgment[2]))
+                reason = (
+                    "전체 충족 판단이 불확실하여 사용자 결정을 기다립니다: "
+                    + "; ".join(str(item) for item in evidence)
+                    + f". 사용자 확인 대상: {path}. 해당 문서에 결정·근거를 명시해 수정하면 "
+                    "일반 Planner가 변경 입력을 재평가합니다."
+                )
         elif not related:
             reason = "Planner는 추가 계획이 없다고 확인했지만 활성 Requirement가 남아 있습니다"
         elif all(status in {"MERGED", "PLAN_BLOCKED"} for status in related):

@@ -149,6 +149,100 @@ class RequirementRetirementTest(unittest.TestCase):
                 self.git.files[changed_path] = contents
                 self.assertEqual(len(self.port.pending("repo", self.root, "base")), 1)
 
+    def test_specification_sections_reuse_unrelated_edits_and_invalidate_related_edits(self):
+        self.add_plan()
+        for name in ("docs/PRODUCT.md", "docs/ARCHITECTURE.md"):
+            self.git.files[name] = b"# Document\n## Feature\nRequired rule\n## Other\nOther rule\n"
+        (item,) = self.port.pending("repo", self.root, "base")
+        payload = json.loads(self.judgment_line(item).split(": ", 1)[1])
+        payload[0]["relevant_paths"] += [
+            "docs/PRODUCT.md### Feature", "docs/ARCHITECTURE.md### Feature",
+        ]
+        self.port.record("repo", self.port.validate_result(
+            "repo", self.root, "base", "REQUIREMENT_JUDGMENTS: " + json.dumps(payload),
+        ))
+        for name in ("docs/PRODUCT.md", "docs/ARCHITECTURE.md"):
+            original = self.git.files[name]
+            self.git.files[name] = original.replace(b"Other rule", b"Unrelated revision")
+            self.assertEqual(self.port.pending("repo", self.root, "advanced"), ())
+            self.git.files[name] = original.replace(b"Required rule", b"Changed requirement")
+            self.assertEqual(self.port.fulfilled_moves("repo", self.root, "advanced"), ())
+            self.git.files[name] = original
+        self.assertEqual(self.port.pending("repo", self.root, "advanced"), ())
+
+    def test_missing_or_ambiguous_specification_section_cannot_prove_fulfillment(self):
+        self.add_plan()
+        (item,) = self.port.pending("repo", self.root, "base")
+        payload = json.loads(self.judgment_line(item).split(": ", 1)[1])
+        payload[0]["relevant_paths"].append("docs/PRODUCT.md### Feature")
+        for contents in (b"# Product\n", b"## Feature\nOne\n## Feature\nTwo\n"):
+            self.git.files["docs/PRODUCT.md"] = contents
+            (current,) = self.port.pending("repo", self.root, "base")
+            payload[0]["input_token"] = current.token
+            with self.assertRaises(RetirementError):
+                self.port.validate_result(
+                    "repo", self.root, "base", "REQUIREMENT_JUDGMENTS: " + json.dumps(payload),
+                )
+
+    def test_staged_retirement_rebinds_receipt_after_unrelated_base_advance(self):
+        self.add_plan()
+        (item,) = self.port.pending("repo", self.root, "base")
+        line = self.judgment_line(item)
+        self.port.record("repo", self.port.validate_result("repo", self.root, "base", line))
+        origin = self.root / SOURCE
+        origin.parent.mkdir(parents=True)
+        origin.write_bytes(CONTENTS)
+        self.port.stage_moves("repo", self.root, "base", self.root)
+        self.git.files["unrelated.py"] = b"new"
+        self.assertEqual(self.port.receipted_paths("repo", self.root, "advanced", self.root),
+                         (SOURCE, ARCHIVE))
+        self.port.validate_result("repo", self.root, "advanced", line)
+        self.port.stage_moves("repo", self.root, "advanced", self.root)
+        row = self.connection.execute("SELECT base_sha FROM requirement_move_receipts").fetchone()
+        self.assertEqual(row[0], "advanced")
+        self.assertEqual((self.root / ARCHIVE).read_bytes(), CONTENTS)
+        self.git.files["feature.py"] = b"changed"
+        with self.assertRaises(RetirementError):
+            self.port.receipted_paths("repo", self.root, "later", self.root)
+
+    def test_staged_restoration_rebinds_receipt_after_unrelated_base_advance(self):
+        self.git.files.pop(SOURCE)
+        self.git.files[ARCHIVE] = CONTENTS
+        self.add_plan(status="PR_OPEN")
+        archived = self.root / ARCHIVE
+        archived.parent.mkdir(parents=True)
+        archived.write_bytes(CONTENTS)
+        self.port.stage_restorations("repo", self.root, "base", self.root)
+        self.git.files["unrelated.py"] = b"new"
+        self.assertEqual(self.port.receipted_paths("repo", self.root, "advanced", self.root),
+                         (ARCHIVE, SOURCE))
+        self.port.stage_restorations("repo", self.root, "advanced", self.root)
+        row = self.connection.execute("SELECT observed_sha FROM requirement_audit").fetchone()
+        self.assertEqual(row[0], "advanced")
+        self.assertEqual((self.root / SOURCE).read_bytes(), CONTENTS)
+
+    def test_uncertain_judgment_exposes_decision_and_resumes_on_requirement_edit(self):
+        self.add_plan()
+        self.connection.execute("ALTER TABLE projects ADD COLUMN planning_error TEXT")
+        for column in ("title", "depends_on", "pr_url"):
+            self.connection.execute(f"ALTER TABLE exec_plans ADD COLUMN {column} TEXT")
+        (item,) = self.port.pending("repo", self.root, "base")
+        self.port.record("repo", self.port.validate_result(
+            "repo", self.root, "base", self.judgment_line(item, "uncertain"),
+        ))
+        self.assertEqual(self.port.pending("repo", self.root, "base"), ())
+        snapshot = work_exhaustion.collect(
+            self.connection, "repo", cycle="cycle", active_requirements=(SOURCE,),
+        )
+        self.assertFalse(snapshot.completed)
+        reason = snapshot.requirements[0]["reason"]
+        self.assertIn(SOURCE, reason)
+        self.assertIn("feature.py and merged validation receipt", reason)
+        self.assertIn("수정하면", reason)
+        self.git.files[SOURCE] += b"\nUser decision clarifies the criterion.\n"
+        self.assertEqual(len(self.port.pending("repo", self.root, "advanced")), 1)
+        self.assertEqual(self.port.fulfilled_moves("repo", self.root, "advanced"), ())
+
     def test_staged_move_refuses_changed_catalog_relationship_on_resume(self):
         self.add_plan()
         (item,) = self.port.pending("repo", self.root, "base")
