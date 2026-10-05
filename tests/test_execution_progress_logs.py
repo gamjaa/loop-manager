@@ -3,7 +3,9 @@ import errno
 import os
 import datetime
 import subprocess
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -54,18 +56,67 @@ class TimestampedExecutionProgressLogsTest(unittest.TestCase):
         self.assertTrue(output.called)
 
     def test_process_lock_only_classifies_contention_errnos_as_busy(self):
-        target = "msvcrt.locking" if os.name == "nt" else "fcntl.flock"
-        with tempfile.TemporaryDirectory() as directory:
-            with mock.patch(target, side_effect=OSError(errno.EAGAIN, "busy")):
-                with self.assertRaises(loop_manager.ProcessLockBusyError):
-                    with process_lock_module.process_lock(Path(directory)):
-                        pass
-            with mock.patch(target, side_effect=OSError(errno.ENOLCK, "lock system failure")):
-                with self.assertRaises(OSError) as raised:
-                    with process_lock_module.process_lock(Path(directory)):
-                        pass
+        for platform, lock_module in (("posix", "fcntl"), ("nt", "msvcrt")):
+            for error_number, expected in (
+                (errno.EAGAIN, loop_manager.ProcessLockBusyError),
+                (errno.ENOLCK, OSError),
+            ):
+                with self.subTest(platform=platform, errno=error_number):
+                    error = OSError(error_number, "lock failed")
+                    error.winerror = 0
+                    lock = mock.Mock(side_effect=error)
+                    handle = mock.Mock()
+                    fake_module = (
+                        types.SimpleNamespace(LOCK_EX=1, LOCK_NB=2, flock=lock)
+                        if lock_module == "fcntl"
+                        else types.SimpleNamespace(LK_NBLCK=1, locking=lock)
+                    )
+                    with mock.patch.object(process_lock_module.os, "name", platform), mock.patch.object(
+                        process_lock_module.os, "open", return_value=10
+                    ), mock.patch.object(
+                        process_lock_module.os, "fdopen", return_value=handle
+                    ), mock.patch.dict(sys.modules, {lock_module: fake_module}):
+                        with self.assertRaises(expected) as raised:
+                            with process_lock_module.process_lock(mock.MagicMock()):
+                                pass
+                    if expected is OSError:
+                        self.assertEqual(raised.exception.errno, errno.ENOLCK)
+                    handle.close.assert_called_once()
 
-        self.assertEqual(raised.exception.errno, errno.ENOLCK)
+    def test_process_lock_closes_handle_when_unlock_fails_on_each_platform(self):
+        for platform, lock_module in (("posix", "fcntl"), ("nt", "msvcrt")):
+            with self.subTest(platform=platform):
+                state_dir = mock.MagicMock()
+                handle = mock.Mock()
+                handle.fileno.return_value = 10
+                entered = mock.Mock()
+                lock = mock.Mock(side_effect=[None, OSError("unlock failed")])
+                fake_msvcrt = types.SimpleNamespace(
+                    LK_NBLCK=1, LK_UNLCK=2, locking=lock,
+                )
+                fake_fcntl = types.SimpleNamespace(
+                    LOCK_EX=1, LOCK_NB=2, LOCK_UN=4, flock=lock,
+                )
+                patches = [
+                    mock.patch.object(process_lock_module.os, "name", platform),
+                    mock.patch.object(process_lock_module.os, "open", return_value=10),
+                    mock.patch.object(process_lock_module.os, "fdopen", return_value=handle),
+                    mock.patch.dict(sys.modules, {lock_module: fake_fcntl if lock_module == "fcntl" else fake_msvcrt}),
+                ]
+                with patches[0], patches[1], patches[2], patches[3], mock.patch.object(
+                    process_lock_module.os, "fsync"
+                ) as fsync:
+                    with self.assertRaisesRegex(OSError, "unlock failed"):
+                        with process_lock_module.process_lock(state_dir) as acquired:
+                            entered(acquired)
+                entered.assert_called_once_with(handle)
+                fsync.assert_called_once_with(10)
+                handle.close.assert_called_once()
+                self.assertEqual(lock.call_args_list, [
+                    mock.call(10, 1, 1), mock.call(10, 2, 1),
+                ] if platform == "nt" else [
+                    mock.call(10, 3), mock.call(10, 4),
+                ])
 
     @unittest.skipIf(os.name == "nt", "POSIX 셸 실행 fixture")
     def test_bash_launcher_skips_git_and_preserves_run_arguments(self):

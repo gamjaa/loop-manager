@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 from loop_manager_internal.execution import verify_process
+from loop_manager_internal.execution import windows_job
 from loop_manager_internal.execution.verify_process import (
     _confirm_posix_group_stopped, _linux_group_has_live_members,
     _stop_linux_tree, _wait_linux_process_stopped,
@@ -106,15 +107,22 @@ class VerifyProcessTests(unittest.TestCase):
                 "print('progress',flush=True); "
                 "child.wait()"
             )
-            passed, timed_out, output = run_verify_process(
-                [sys.executable, "-c", parent], root, 1,
-            )
-            self.assertEqual((passed, timed_out), (False, True))
-            self.assertIn("progress", output)
-            pid = int(child_pid.read_text())
-            status = Path(f"/proc/{pid}/stat")
-            if status.exists():
-                self.assertEqual(status.read_text().split()[2], "Z")
+            try:
+                passed, timed_out, output = run_verify_process(
+                    [sys.executable, "-c", parent], root, 1,
+                )
+                self.assertEqual((passed, timed_out), (False, True))
+                self.assertIn("progress", output)
+                pid = int(child_pid.read_text())
+                status = Path(f"/proc/{pid}/stat")
+                if status.exists():
+                    self.assertEqual(status.read_text().split()[2], "Z")
+            finally:
+                if child_pid.exists():
+                    try:
+                        os.kill(int(child_pid.read_text()), signal.SIGKILL)
+                    except ProcessLookupError:
+                        pass
 
     @unittest.skipUnless(sys.platform.startswith("linux"), "Linux /proc assertion")
     def test_timeout_kills_child_in_new_session(self):
@@ -257,6 +265,75 @@ class VerifyProcessTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self._assert_windows_tree_kill_failure(root)
+
+    def test_windows_timeout_cleanup_preserves_timeout_and_attempts_every_boundary(self):
+        root = Path.cwd()
+        process, job = mock.Mock(pid=123), mock.Mock()
+        timeout = subprocess.TimeoutExpired(["verify"], 1)
+        process.poll.return_value = None
+        process.wait.side_effect = [timeout, OSError("wait failed")]
+        job.terminate.side_effect = OSError("terminate failed")
+        job.wait.side_effect = TimeoutError("child active")
+        with mock.patch.object(verify_process.os, "name", "nt"), mock.patch.object(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, create=True
+        ), mock.patch.object(windows_job, "WindowsJob", return_value=job):
+            with self.assertRaisesRegex(VerifyTerminationUncertain, "verify 시간 초과") as raised:
+                run_verify_process(
+                    ["verify"], root, 1,
+                    launch_process=mock.Mock(return_value=process), job_scope=True,
+                )
+        self.assertIs(raised.exception.__cause__, timeout)
+        self.assertIn("terminate failed", str(raised.exception))
+        self.assertIn("wait failed", str(raised.exception))
+        self.assertIn("child active", str(raised.exception))
+        job.terminate.assert_called_once()
+        self.assertEqual(process.wait.call_count, 2)
+        job.wait.assert_called_once_with(10)
+        job.close.assert_called_once()
+
+    def test_windows_failure_cleans_job_even_after_parent_exit(self):
+        root = Path.cwd()
+        process, job = mock.Mock(pid=123), mock.Mock()
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        primary = OSError("job accounting failed")
+        job.wait.side_effect = [primary, TimeoutError("child active")]
+        job.terminate.side_effect = OSError("terminate failed")
+        with mock.patch.object(verify_process.os, "name", "nt"), mock.patch.object(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, create=True
+        ), mock.patch.object(windows_job, "WindowsJob", return_value=job):
+            with self.assertRaisesRegex(VerifyTerminationUncertain, "job accounting failed") as raised:
+                run_verify_process(
+                    ["verify"], root, 1,
+                    launch_process=mock.Mock(return_value=process), job_scope=True,
+                )
+        self.assertIs(raised.exception.__cause__, primary)
+        self.assertIn("terminate failed", str(raised.exception))
+        self.assertIn("child active", str(raised.exception))
+        job.terminate.assert_called_once()
+        self.assertEqual(process.wait.call_count, 2)
+        self.assertEqual(job.wait.call_count, 2)
+        job.close.assert_called_once()
+
+    def test_cleanup_uncertainty_keeps_the_primary_failure(self):
+        root = Path.cwd()
+        process = mock.Mock(pid=123)
+        process.poll.return_value = None
+        primary = RuntimeError("started callback failed")
+        cleanup = VerifyTerminationUncertain("child cleanup uncertain")
+
+        def fail_start(*_args):
+            raise primary
+
+        with mock.patch(
+            "loop_manager_internal.execution.verify_process.subprocess.Popen", return_value=process,
+        ), mock.patch(
+            "loop_manager_internal.execution.verify_process.terminate_verify_process", side_effect=cleanup,
+        ):
+            with self.assertRaisesRegex(VerifyTerminationUncertain, "started callback failed") as raised:
+                run_verify_process(["verify"], root, 1, on_started=fail_start)
+        self.assertIs(raised.exception.__cause__, primary)
+        self.assertIn("child cleanup uncertain", str(raised.exception))
 
     def _assert_windows_tree_kill_failure(self, root: Path):
         with mock.patch.object(

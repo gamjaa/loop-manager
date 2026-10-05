@@ -55,12 +55,14 @@ def process_lock(state_dir: Path, *, identity: str = "0"):
         _write_process_lock_identity(handle, identity)
         yield handle
     finally:
-        handle.seek(0)
-        if os.name == "nt":
-            msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
-        else:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
-        handle.close()
+        try:
+            handle.seek(0)
+            if os.name == "nt":
+                msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            handle.close()
 
 
 def _write_process_lock_identity(handle, identity: str) -> None:

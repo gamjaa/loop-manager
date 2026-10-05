@@ -319,6 +319,18 @@ def terminate_verify_process(process) -> None:
         raise VerifyTerminationUncertain(f"verify 자식 종료 불명 (PID {process.pid}): " + "; ".join(errors))
 
 
+def _terminate_windows_job(job, process) -> list[str]:
+    """Try every owned Windows cleanup boundary before reporting uncertainty."""
+
+    errors = []
+    for cleanup in (job.terminate, lambda: process.wait(timeout=10), lambda: job.wait(10)):
+        try:
+            cleanup()
+        except Exception as error:
+            errors.append(str(error))
+    return errors
+
+
 _WINDOWS_VERIFY_BOOTSTRAP = """\\
 import subprocess, sys
 if sys.stdin.readline().strip() != 'start':
@@ -378,32 +390,38 @@ def run_verify_process(
             return code == 0, False, VerifyProcessOutput(
                 output.read().decode("utf-8", errors="replace"), exit_code=code,
             )
-        except (subprocess.TimeoutExpired, TimeoutError):
+        except (subprocess.TimeoutExpired, TimeoutError) as primary:
             if job and assigned:
-                errors = []
-                for cleanup in (job.terminate, lambda: process.wait(timeout=10), lambda: job.wait(10)):
-                    try:
-                        cleanup()
-                    except Exception as error:
-                        errors.append(str(error))
+                errors = _terminate_windows_job(job, process)
                 if errors:
-                    raise VerifyTerminationUncertain("Windows verify 자식 종료 불명: " + "; ".join(errors))
+                    raise VerifyTerminationUncertain(
+                        f"verify 시간 초과 ({primary}); Windows verify 자식 종료 불명: "
+                        + "; ".join(errors)
+                    ) from primary
             else:
-                terminate_verify_process(process)
-            return False, True, VerifyProcessOutput(_tail(output), exit_code=process.returncode)
-        except BaseException:
-            if process is not None and process.poll() is None:
-                if job and assigned:
-                    errors = []
-                    for cleanup in (job.terminate, lambda: process.wait(timeout=10), lambda: job.wait(10)):
-                        try:
-                            cleanup()
-                        except Exception as error:
-                            errors.append(str(error))
-                    if errors:
-                        raise VerifyTerminationUncertain("Windows verify 취소 뒤 종료 불명: " + "; ".join(errors))
-                else:
+                try:
                     terminate_verify_process(process)
+                except VerifyTerminationUncertain as cleanup_error:
+                    raise VerifyTerminationUncertain(
+                        f"verify 시간 초과 ({primary}); {cleanup_error}"
+                    ) from primary
+            return False, True, VerifyProcessOutput(_tail(output), exit_code=process.returncode)
+        except BaseException as primary:
+            if process is not None and (assigned or process.poll() is None):
+                if job and assigned:
+                    errors = _terminate_windows_job(job, process)
+                    if errors:
+                        raise VerifyTerminationUncertain(
+                            f"verify 실패 ({primary}); Windows verify 취소 뒤 종료 불명: "
+                            + "; ".join(errors)
+                        ) from primary
+                else:
+                    try:
+                        terminate_verify_process(process)
+                    except VerifyTerminationUncertain as cleanup_error:
+                        raise VerifyTerminationUncertain(
+                            f"verify 실패 ({primary}); {cleanup_error}"
+                        ) from primary
             raise
         finally:
             if job:
