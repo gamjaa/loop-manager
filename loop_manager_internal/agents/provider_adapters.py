@@ -4,9 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import hashlib
-import io
 import json
-import re
 from pathlib import Path
 import subprocess
 import threading
@@ -19,6 +17,8 @@ from loop_manager_internal.agents import agent_write_isolation
 from loop_manager_internal.execution.validation_feedback import redact_secrets
 
 AGENT_CLI_TIMEOUT_SECONDS = 3600
+MAX_REVIEWER_LINE = 256 * 1024
+MAX_REVIEWER_LOG = 2 * 1024 * 1024
 CodexResult = AgentResult
 
 @dataclass(frozen=True)
@@ -48,8 +48,6 @@ def _json_object(line: str) -> tuple[dict[str, object] | None, bool]:
 
 def _redact_reviewer_log(raw: str) -> str:
     """Decode JSON events so escaped credential keys receive the same scrubber."""
-    raw = redact_secrets(raw)
-
     def scrub(value: object) -> object:
         if isinstance(value, dict):
             return {
@@ -60,19 +58,57 @@ def _redact_reviewer_log(raw: str) -> str:
             }
         if isinstance(value, list):
             return [scrub(item) for item in value]
-        return redact_secrets(value) if isinstance(value, str) else value
+        if isinstance(value, str):
+            if value.lstrip().startswith(("{", "[")):
+                try:
+                    return json.dumps(scrub(json.loads(value)), ensure_ascii=False)
+                except (ValueError, RecursionError):
+                    return "[malformed reviewer JSON omitted]"
+            if "\\u" in value or "\\\"" in value:
+                return "[escaped reviewer text omitted]"
+            return redact_secrets(value)
+        return value
 
     lines = []
     for line in raw.splitlines(keepends=True):
         try:
             decoded = json.loads(line)
         except (ValueError, RecursionError):
-            # Invalid JSON may still contain escaped credential keys.
-            lines.append(redact_secrets(re.sub(r'\\+(?=["\'])', '', line)))
+            if line.lstrip().startswith(("{", "[")) or "\\u" in line or "\\\"" in line:
+                lines.append("[malformed reviewer JSON omitted]" +
+                             ("\n" if line.endswith("\n") else ""))
+            else:
+                lines.append(redact_secrets(line))
         else:
             lines.append(json.dumps(scrub(decoded), ensure_ascii=False) +
                          ("\n" if line.endswith("\n") else ""))
     return "".join(lines)
+
+
+def _bounded_reviewer_lines(stream):
+    """Drain untrusted JSONL with a fixed maximum retained line size."""
+    pending = ""
+    oversized = False
+    while chunk := stream.read(8192):
+        start = 0
+        while start < len(chunk):
+            end = chunk.find("\n", start)
+            part = chunk[start:end + 1] if end >= 0 else chunk[start:]
+            if not oversized:
+                if len(pending) + len(part) <= MAX_REVIEWER_LINE:
+                    pending += part
+                else:
+                    pending = ""
+                    oversized = True
+            if end >= 0:
+                yield None if oversized else pending
+                pending = ""
+                oversized = False
+                start = end + 1
+            else:
+                break
+    if pending or oversized:
+        yield None if oversized else pending
 
 
 def _codex_reviewer_message(raw: str) -> str:
@@ -217,9 +253,11 @@ def run_codex(
     resolved_session_id = session_id
     timeout_triggered = threading.Event()
     collection_status = "unknown"
-    captured = ""
-    if persist_session and not session_id:
-        with (io.StringIO() if role_name == "reviewer" else log.open("w", encoding="utf-8")) as output:
+    reviewer_message = ""
+    reviewer_tail = ""
+    reviewer_usage = ""
+    if (persist_session and not session_id) or role_name == "reviewer":
+        with log.open("w", encoding="utf-8") as output:
             start = codex_launch.start if codex_launch else effects._handoff_popen
             process = start(
                 arguments,
@@ -239,12 +277,32 @@ def run_codex(
             try:
                 process.stdin.write(prompt)
                 process.stdin.close()
-                for line in process.stdout:
-                    output.write(line)
-                    output.flush()
+                lines = (_bounded_reviewer_lines(process.stdout) if role_name == "reviewer"
+                         else process.stdout)
+                remaining = MAX_REVIEWER_LOG
+                for line in lines:
+                    if role_name == "reviewer":
+                        safe = ("[reviewer output line omitted]\n" if line is None
+                                else _redact_reviewer_log(line))
+                        reviewer_tail = (reviewer_tail + safe)[-6000:]
+                        if remaining:
+                            fragment = safe[:remaining]
+                            output.write(fragment)
+                            output.flush()
+                            remaining -= len(fragment)
+                        if line is None:
+                            continue
+                        reviewer_message = _codex_reviewer_message(line) or reviewer_message
+                        event, _decoded = _json_object(line)
+                        if event is not None and event.get("type") == "turn.completed":
+                            reviewer_usage = safe
+                    else:
+                        output.write(line)
+                        output.flush()
                     if resolved_session_id:
                         continue
-                    event, _decoded = _json_object(line)
+                    if role_name != "reviewer":
+                        event, _decoded = _json_object(line)
                     if event is None:
                         continue
                     if event.get("type") == "thread.started" and isinstance(
@@ -263,9 +321,6 @@ def run_codex(
                 process.stdout.close()
                 if codex_launch is not None:
                     codex_launch.stop(process)
-            if role_name == "reviewer":
-                captured = output.getvalue()
-                log.write_text(_redact_reviewer_log(captured), encoding="utf-8")
     else:
         with log.open("w", encoding="utf-8") as output:
             runner = codex_launch.run if codex_launch is not None else effects._handoff_run
@@ -275,19 +330,16 @@ def run_codex(
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                stdout=subprocess.PIPE if role_name == "reviewer" else output,
+                stdout=output,
                 stderr=subprocess.STDOUT,
                 env=launch_environment,
                 cwd=worktree,
                 timeout=AGENT_CLI_TIMEOUT_SECONDS,
                 **({"launch_process": effects._handoff_popen} if codex_launch is not None else {}),
             )
-            if role_name == "reviewer":
-                captured = result.stdout or ""
-                output.write(_redact_reviewer_log(captured))
         returncode = result.returncode
     try:
-        message = (_codex_reviewer_message(captured) if role_name == "reviewer" else
+        message = (reviewer_message if role_name == "reviewer" else
                    provider_last_message.read_text(encoding="utf-8")
                    if provider_last_message.is_file() else "")
     except (OSError, UnicodeError):
@@ -309,13 +361,15 @@ def run_codex(
         message = f"Codex {role_name} 실행 timeout ({AGENT_CLI_TIMEOUT_SECONDS}초)"
     if returncode and not message:
         try:
-            message = log.read_text(encoding="utf-8")[-6000:]
+            message = (reviewer_tail if role_name == "reviewer" else
+                       log.read_text(encoding="utf-8")[-6000:])
         except (OSError, UnicodeError):
             collection_status = "error"
     if role_name == "reviewer":
         message = _redact_reviewer_log(message)
     try:
-        usage = codex_log_usage(log.read_text(encoding="utf-8"))
+        usage = codex_log_usage(reviewer_usage if role_name == "reviewer" else
+                                log.read_text(encoding="utf-8"))
     except (OSError, UnicodeError):
         # Usage is observational; a failed log read cannot retry a completed CLI call.
         usage = Usage(status="invalid")
@@ -384,7 +438,7 @@ def run_claude(
     last_message = project_dir / f"claude-{role_name}-last.txt"
     last_message.unlink(missing_ok=True)
 
-    streaming = persist_session and session_id is None
+    streaming = role_name == "reviewer" or (persist_session and session_id is None)
     arguments = [
         "claude",
         "--print",
@@ -409,7 +463,7 @@ def run_claude(
         stream_error_seen = False
         stream_error_message = ""
         diagnostic_tail = ""
-        with (io.StringIO() if role_name == "reviewer" else log.open("w", encoding="utf-8")) as output:
+        with log.open("w", encoding="utf-8") as output:
             process = effects._handoff_popen(
                 arguments,
                 stdin=subprocess.PIPE,
@@ -428,25 +482,42 @@ def run_claude(
             try:
                 process.stdin.write(prompt)
                 process.stdin.close()
-                for line in process.stdout:
-                    output.write(line)
-                    output.flush()
+                lines = (_bounded_reviewer_lines(process.stdout) if role_name == "reviewer"
+                         else process.stdout)
+                remaining = MAX_REVIEWER_LOG
+                for line in lines:
+                    if role_name == "reviewer":
+                        safe = ("[reviewer output line omitted]\n" if line is None
+                                else _redact_reviewer_log(line))
+                        diagnostic_tail = (diagnostic_tail + safe)[-6000:]
+                        if remaining:
+                            fragment = safe[:remaining]
+                            output.write(fragment)
+                            output.flush()
+                            remaining -= len(fragment)
+                        if line is None:
+                            usage = Usage(status="invalid")
+                            continue
+                    else:
+                        output.write(line)
+                        output.flush()
                     event, decoded = _json_object(line)
                     if event is None:
                         if not decoded:
-                            diagnostic_tail = (diagnostic_tail + line)[-6000:]
+                            diagnostic_tail = (diagnostic_tail + (safe if role_name == "reviewer" else line))[-6000:]
                         if usage.status == "unknown":
                             usage = Usage(status="invalid")
                         continue
                     if event.get("is_error") or event.get("type") == "error":
                         stream_error_seen = True
                         candidate = _claude_result_message(event)
-                        stream_error_message = candidate or line.strip()[-6000:]
+                        stream_error_message = candidate or (
+                            safe if role_name == "reviewer" else line).strip()[-6000:]
                     if event.get("is_error") or event.get("type") in {
                         "error",
                         "result",
                     }:
-                        diagnostic_tail = (diagnostic_tail + line)[-6000:]
+                        diagnostic_tail = (diagnostic_tail + (safe if role_name == "reviewer" else line))[-6000:]
                     event_session = event.get("session_id")
                     if (
                         resolved_session_id is None
@@ -469,8 +540,6 @@ def run_claude(
             finally:
                 timeout.cancel()
                 process.stdout.close()
-            if role_name == "reviewer":
-                log.write_text(_redact_reviewer_log(output.getvalue()), encoding="utf-8")
         message = stream_error_message or _claude_result_message(final_event)
         if stream_error_seen and returncode == 0:
             returncode = 1

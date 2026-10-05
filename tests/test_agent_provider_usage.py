@@ -21,7 +21,19 @@ class UsageTests(TestCase):
         clean = provider_adapters._redact_reviewer_log(raw)
         self.assertNotIn('escaped-secret', clean)
         self.assertNotIn('another-secret', clean)
-        self.assertIn('context', clean)
+        self.assertIn('malformed reviewer JSON omitted', clean)
+
+    def test_truncated_reviewer_json_omits_unicode_escaped_key(self):
+        raw = '{"item":{"text":"pass\\u0077ord: unicode-secret and context'
+        clean = provider_adapters._redact_reviewer_log(raw)
+        self.assertNotIn('unicode-secret', clean)
+        self.assertIn('malformed reviewer JSON omitted', clean)
+
+    def test_nested_reviewer_json_redacts_unicode_escaped_key(self):
+        raw = json.dumps({'item': {'text': '{"pass\\u0077ord": "nested-secret"}'}})
+        clean = provider_adapters._redact_reviewer_log(raw)
+        self.assertNotIn('nested-secret', clean)
+        self.assertIn('<REDACTED>', clean)
 
     def test_reviewer_provider_artifacts_redact_json_credentials(self):
         secret = 'review-json-secret'
@@ -35,14 +47,14 @@ class UsageTests(TestCase):
                 event = json.dumps({'type': 'item.completed', 'item': {
                     'type': 'agent_message', 'text': review,
                 }}) + '\n' + '{"item":{"text":"\\"password\\": \\"truncated-secret'
-                return subprocess.run(
-                    [sys.executable, '-c', 'import sys; sys.stdout.write(sys.argv[1])', event],
-                    **{key: value for key, value in kwargs.items() if key != 'input'},
-                    input=kwargs['input'],
+                return subprocess.Popen(
+                    [sys.executable, '-c',
+                     'import sys; sys.stdin.read(); sys.stdout.write(sys.argv[1])', event],
+                    **kwargs,
                 )
 
             effects = provider_adapters.ProviderEffects(
-                mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock(), codex_run,
+                mock.Mock(), mock.Mock(), mock.Mock(), codex_run, mock.Mock(),
             )
             codex_result = provider_adapters.run_codex(
                 root, root, root / 'config', 'reviewer', 'prompt', read_only=True,
@@ -55,12 +67,15 @@ class UsageTests(TestCase):
                 self.assertNotIn(secret, (log_dir / artifact).read_text())
                 self.assertNotIn('truncated-secret', (log_dir / artifact).read_text())
 
+            claude_process = mock.Mock()
+            claude_process.stdin = io.StringIO()
+            claude_process.stdout = io.StringIO(
+                json.dumps({'type': 'result', 'result': review}) + '\n'
+            )
+            claude_process.wait.return_value = 0
             effects = provider_adapters.ProviderEffects(
-                mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock(),
-                mock.Mock(return_value=mock.Mock(
-                    returncode=0, stdout=('{"result": ' +
-                    json.dumps(review) + '}'),
-                )),
+                mock.Mock(), mock.Mock(), mock.Mock(),
+                mock.Mock(return_value=claude_process), mock.Mock(),
             )
             claude_result = provider_adapters.run_claude(
                 root, root, root / 'config', 'reviewer', 'prompt', read_only=True,
@@ -119,15 +134,75 @@ class UsageTests(TestCase):
             for artifact in ('claude-reviewer.log', 'claude-reviewer-last.txt'):
                 self.assertNotIn(secret, (log_dir / artifact).read_text())
 
+    def test_reviewer_streams_oversized_lines_without_retaining_raw_output(self):
+        secret = 'oversized-review-secret'
+
+        class Stream(io.StringIO):
+            def read(self, size=-1):
+                self_test.assertEqual(size, 8192)
+                return super().read(size)
+
+        class Process:
+            def __init__(self, stream):
+                self.stdin = io.StringIO()
+                self.stdout = Stream(stream)
+
+            def wait(self):
+                return 0
+
+        self_test = self
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            large = json.dumps({'password': secret, 'detail': 'x' * 4096}) + '\n'
+            codex_final = json.dumps({'type': 'item.completed', 'item': {
+                'type': 'agent_message', 'text': 'VERDICT: PASS',
+            }}) + '\n'
+            claude_final = json.dumps({
+                'type': 'result', 'session_id': 'session', 'result': 'VERDICT: PASS',
+            }) + '\n'
+            effects = provider_adapters.ProviderEffects(
+                mock.Mock(), mock.Mock(), mock.Mock(),
+                mock.Mock(return_value=Process(
+                    '{"type":"thread.started","thread_id":"session"}\n' + large + codex_final,
+                )), mock.Mock(),
+            )
+            with mock.patch.object(provider_adapters, 'MAX_REVIEWER_LINE', 256), \
+                 mock.patch.object(provider_adapters, 'MAX_REVIEWER_LOG', 256):
+                codex = provider_adapters.run_codex(
+                    root, root, root / 'config', 'reviewer', 'prompt', read_only=True,
+                    persist_session=True,
+                    resolved_profile=invocation.ResolvedProfile('model', 'high'), effects=effects,
+                )
+                effects = provider_adapters.ProviderEffects(
+                    mock.Mock(), mock.Mock(), mock.Mock(),
+                    mock.Mock(return_value=Process(large + claude_final)), mock.Mock(),
+                )
+                claude = provider_adapters.run_claude(
+                    root, root, root / 'config', 'reviewer', 'prompt', read_only=True,
+                    persist_session=True,
+                    resolved_profile=invocation.ResolvedProfile('model', 'high'), effects=effects,
+                )
+            self.assertEqual((codex.message, claude.message), ('VERDICT: PASS', 'VERDICT: PASS'))
+            log_dir, = (root / 'logs').iterdir()
+            for artifact in ('reviewer.log', 'claude-reviewer.log'):
+                content = (log_dir / artifact).read_text()
+                self.assertLessEqual(len(content), 256)
+                self.assertNotIn(secret, content)
+                self.assertIn('reviewer output line omitted', content)
+
     def test_reviewer_auxiliary_copy_failure_preserves_completed_session(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             event = json.dumps({'type': 'item.completed', 'item': {
                 'type': 'agent_message', 'text': 'VERDICT: PASS',
             }})
-            calls = mock.Mock(return_value=subprocess.CompletedProcess([], 0, event))
+            process = mock.Mock()
+            process.stdin = io.StringIO()
+            process.stdout = io.StringIO(event)
+            process.wait.return_value = 0
+            calls = mock.Mock(return_value=process)
             effects = provider_adapters.ProviderEffects(
-                mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock(), calls,
+                mock.Mock(), mock.Mock(), mock.Mock(), calls, mock.Mock(),
             )
             original_write = Path.write_text
 
@@ -247,8 +322,11 @@ class UsageTests(TestCase):
     def test_claude_malformed_json_keeps_agent_failure_and_invalid_usage(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with mock.patch.object(manager.subprocess, "run", return_value=mock.Mock(
-                returncode=1, stdout="{not-json")):
+            process = mock.Mock()
+            process.stdin = io.StringIO()
+            process.stdout = io.StringIO("{not-json")
+            process.wait.return_value = 1
+            with mock.patch.object(manager.subprocess, "Popen", return_value=process):
                 result = manager.run_claude(
                     root, root, root / "config", "reviewer", "prompt",
                     read_only=True, persist_session=True, session_id="session",

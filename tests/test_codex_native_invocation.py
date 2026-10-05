@@ -20,6 +20,14 @@ from tests.support.workspace import native_agent_boundary
 
 @skipUnless(isolation.platform.system() == "Linux", "native tool policy probe requires Linux")
 class NativeWriteIsolationTests(TestCase):
+    @staticmethod
+    def reviewer_process(output, code=0):
+        process = mock.Mock(pid=4321, returncode=code)
+        process.stdin = io.StringIO()
+        process.stdout = io.StringIO(output)
+        process.wait.return_value = code
+        return process
+
     def boundary(self, root):
         return native_agent_boundary(root)
 
@@ -229,13 +237,19 @@ class NativeWriteIsolationTests(TestCase):
                     kwargs['stdout'].write('provider log\n')
                     return manager.subprocess.CompletedProcess(command, 0)
 
+                def start(command, **kwargs):
+                    result = run(command, **kwargs)
+                    return self.reviewer_process(result.stdout or '', result.returncode)
+
                 with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
                      mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
                      mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
                      mock.patch.object(manager, 'capture_git_snapshot', return_value=
                                        mock.Mock(serialize=lambda: 'snapshot')), \
                      mock.patch.object(isolation.subprocess, 'run', side_effect=run), \
-                     mock.patch.object(envelope.CodexLaunch, 'run', side_effect=run):
+                     mock.patch.object(envelope.CodexLaunch, 'run', side_effect=run), \
+                     mock.patch.object(envelope.CodexLaunch, 'start', side_effect=start), \
+                     mock.patch.object(envelope.CodexLaunch, 'stop'):
                     result = manager.run_agent(
                         'codex', boundary.worktree, state_root, state_root / 'config', role, 'prompt',
                         read_only=read_only, session_id=session, connection=connection,
@@ -302,13 +316,19 @@ class NativeWriteIsolationTests(TestCase):
                         read_only=role == 'reviewer', session_id=session, connection=connection,
                         resolved_profile=invocation.ResolvedProfile('model', 'high'), invocation=context),
                     attempts)
+                def start(command, **kwargs):
+                    result = run(command, **kwargs)
+                    return self.reviewer_process(result.stdout or '', result.returncode)
+
                 with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
                      mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
                      mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
                      mock.patch.object(manager, 'capture_git_snapshot', return_value=
                                        mock.Mock(serialize=lambda: 'snapshot')), \
                      mock.patch.object(isolation.subprocess, 'run', side_effect=run), \
-                     mock.patch.object(envelope.CodexLaunch, 'run', side_effect=run):
+                     mock.patch.object(envelope.CodexLaunch, 'run', side_effect=run), \
+                     mock.patch.object(envelope.CodexLaunch, 'start', side_effect=start), \
+                     mock.patch.object(envelope.CodexLaunch, 'stop'):
                     result = manager.run_agent_with_retries(invoke, session_id='saved-session')
                 self.assertEqual(result.code, 0)
                 self.assertEqual(len(calls), 2)
@@ -377,6 +397,21 @@ class NativeWriteIsolationTests(TestCase):
                 state.ensure_schema(connection)
                 handoff = manager.RuntimeHandoffGate(threading.Event(), threading.Lock())
                 process = mock.Mock(pid=4321, returncode=0)
+                if role == 'reviewer':
+                    class ReviewerOutput(io.StringIO):
+                        def read(self, size=-1):
+                            self_test.assertTrue(handoff.launch_lock.acquire(blocking=False))
+                            handoff.launch_lock.release()
+                            handoff.stop()
+                            return super().read(size)
+
+                    self_test = self
+                    process.stdin = io.StringIO()
+                    process.stdout = ReviewerOutput(
+                        '{"type":"item.completed","item":{"type":"agent_message",'
+                        '"text":"completed"}}\n'
+                    )
+                    process.wait.return_value = 0
 
                 def start(command, **kwargs):
                     self.assertTrue(handoff.launch_lock.locked())
@@ -385,6 +420,9 @@ class NativeWriteIsolationTests(TestCase):
                     if session:
                         self.assertIn('resume', command)
                         self.assertIn(session, command)
+                    if role == 'reviewer':
+                        self.assertNotIn('-o', command)
+                        return process
 
                     def communicate(prompt, *, timeout):
                         self.assertEqual(prompt, 'prompt')
@@ -392,10 +430,6 @@ class NativeWriteIsolationTests(TestCase):
                         self.assertTrue(handoff.launch_lock.acquire(blocking=False))
                         handoff.launch_lock.release()
                         handoff.stop()
-                        if role == 'reviewer':
-                            self.assertNotIn('-o', command)
-                            return ('{"type":"item.completed","item":{"type":"agent_message",'
-                                    '"text":"completed"}}\n', None)
                         Path(command[command.index('-o') + 1]).write_text('completed')
                         kwargs['stdout'].write('provider log\n')
                         return (None, None)
@@ -425,7 +459,10 @@ class NativeWriteIsolationTests(TestCase):
                         terminate.assert_called_once_with(4321, envelope.signal.SIGKILL)
                 finally:
                     manager._runtime_handoff_signal.reset(token)
-                process.communicate.assert_called_once()
+                if role == 'reviewer':
+                    process.communicate.assert_not_called()
+                else:
+                    process.communicate.assert_called_once()
                 process.wait.assert_called_once()
                 self.assertEqual((result.code, result.message, result.session_id), (0, 'completed', session))
                 proof = connection.execute('''SELECT proof.status, call.result_kind, call.session_id

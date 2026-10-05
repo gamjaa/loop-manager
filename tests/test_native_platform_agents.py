@@ -154,11 +154,6 @@ class NativePlatformAgentTests(unittest.TestCase):
             self.assertEqual(result.returncode, 7)
             output.seek(0)
             self.assertEqual(output.read().strip(), b'ok')
-        piped = launch.run([sys.executable, '-c', "print('review output')"],
-            launch_process=subprocess.Popen, input='prompt', timeout=10,
-            text=True, encoding='utf-8', env=dict(os.environ, PYTHONIOENCODING='utf-8'),
-            stdout=subprocess.PIPE)
-        self.assertEqual((piped.returncode, piped.stdout.strip()), (0, 'review output'))
 
     def test_streamed_provider_uses_owned_launch_and_preserves_session(self):
         from loop_manager_internal.agents import windows_runtime

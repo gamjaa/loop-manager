@@ -50,8 +50,8 @@ class CodexLaunch:
         # The caller owns the atomic runtime handoff check at process creation.
         process = self.start(arguments, launch_process=launch_process, **kwargs)
         try:
-            stdout, stderr = process.communicate(prompt, timeout=timeout)
-            return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
+            process.communicate(prompt, timeout=timeout)
+            return subprocess.CompletedProcess(arguments, process.returncode)
         finally:
             # Direct exec can still spawn tools. Reap the whole process group.
             self.stop(process)
