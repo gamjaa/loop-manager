@@ -7,7 +7,10 @@ from unittest import mock
 
 import loop_manager
 from loop_manager_internal.storage import execution_checkpoint_state
+from loop_manager_internal.storage import blocked_checkpoint_state
 from loop_manager_internal.recovery import scoped_blocking
+from loop_manager_internal.recovery import blocked_checkpoint
+from loop_manager_internal.recovery import checkpoint_ownership
 from loop_manager_internal.recovery import blocked_plan_reconciliation
 from loop_manager_internal.recovery import blocked_remote_observation
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
@@ -772,6 +775,25 @@ class PlanRecoveryAdoptionTests(PlanRemoteRecoveryFixture, unittest.TestCase):
 
     def test_interruption_after_release_preserves_audit_and_uses_adopted_baseline(self):
         original = self.published_successor()
+        repository = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection)
+        request = repository.get(self.repo, 'G-106')
+        tree = 'd' * 40
+        message = '[G-106] BLOCKED checkpoint\nScope: plan\nCheckpoint-Identity: checkpoint\n'
+        repository.record_prepared(request, blocked_checkpoint.PreparedCheckpoint(
+            original.head, tree, 'checkpoint', message, ()))
+        repository.finish_published(request, original.head)
+        git = self.ports.git.side_effect
+        def ownership_git(path, *args, **kwargs):
+            if args == ('show', '-s', '--format=%B', original.head):
+                return SimpleNamespace(returncode=0, stdout=message)
+            if args == ('rev-parse', f'{original.head}^{{tree}}'):
+                return SimpleNamespace(returncode=0, stdout=tree)
+            if args[:1] == ('ls-remote',):
+                return SimpleNamespace(returncode=0, stdout=(
+                    f"{self.row()['branch_oid']}\trefs/heads/{original.branch}\n"))
+            return git(path, *args, **kwargs)
+        self.ports.git.side_effect = ownership_git
+        self.ports.owned_remote_oid.side_effect = checkpoint_ownership.owned_remote_oid
         manager = loop_manager.ManagerGitCheckpoint(original, frozenset()).serialize()
         self.connection.execute(
             "UPDATE exec_plans SET agent_manager_snapshot = ?, agent_baseline = 'old' "
@@ -808,6 +830,17 @@ class PlanRecoveryAdoptionTests(PlanRemoteRecoveryFixture, unittest.TestCase):
         self.assertEqual(before.head, self.head)
         self.assertNotEqual(before.head, original.head)
         self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
+
+    def test_successor_without_checkpoint_identity_keeps_block_and_audit(self):
+        original = self.published_successor()
+        self.ports.owned_remote_oid.side_effect = checkpoint_ownership.owned_remote_oid
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertIn('게시 checkpoint 소유권', self.plan()['last_error'])
+        self.assertEqual(self.plan()['status'], 'PLAN_BLOCKED')
+        self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
+        self.assertEqual(self.plan()['agent_result_snapshot'], original.serialize())
+        self.assertIsNotNone(scoped_blocking.plan_block(self.connection, self.repo, 'G-106'))
+        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
 
     def test_agent_scope_violation_before_adoption_is_not_absorbed(self):
         original = self.published_successor()

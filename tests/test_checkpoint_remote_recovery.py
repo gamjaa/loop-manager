@@ -901,7 +901,9 @@ class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest
 
 
     def test_interruption_after_release_does_not_restore_old_agent_snapshot(self):
-        self.publish_block()
+        # Preserve the real dispatcher's tree and commit identity for the
+        # ownership gate exercised by remote refresh.
+        self._remote_refresh_fixture()
         stale = loop_manager.capture_git_snapshot(self.worktree).serialize()
         self.connection.execute(
             "UPDATE exec_plans SET agent_role = 'worker', agent_snapshot = ?, "
