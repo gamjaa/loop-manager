@@ -171,7 +171,9 @@ def unmet_execplan_dependencies(
     }
     if plan_id not in graph:
         raise RuntimeError(f"dependency를 확인할 ExecPlan이 없습니다: {plan_id}")
-    unmet: set[str] = set()
+    from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
+    held = catalog_held_plan_ids(connection, repo)
+    unmet: set[str] = {plan_id} if plan_id in held else set()
     visited: set[str] = set()
 
     def visit(current: str) -> None:
@@ -181,7 +183,7 @@ def unmet_execplan_dependencies(
         dependencies, _status = graph[current]
         for dependency in dependencies:
             stored = graph.get(dependency)
-            if stored is None or stored[1] != "MERGED":
+            if dependency in held or stored is None or stored[1] != "MERGED":
                 unmet.add(dependency)
             if stored is not None:
                 visit(dependency)

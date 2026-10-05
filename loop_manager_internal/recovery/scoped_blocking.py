@@ -140,6 +140,17 @@ def _reason(value: object) -> BlockReasonCode:
         raise RuntimeError(f"알 수 없는 구조화된 차단 원인입니다: {value}") from error
 
 
+def catalog_held_plan_ids(connection: sqlite3.Connection, repo: str) -> frozenset[str]:
+    """Additional catalog causes never replace approval or execution blocks."""
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_catalog_holds'"
+    ).fetchone() is None:
+        return frozenset()
+    return frozenset(str(row[0]) for row in connection.execute(
+        "SELECT plan_id FROM execplan_catalog_holds WHERE repo = ?", (repo,),
+    ))
+
+
 def plan_blocks(connection: sqlite3.Connection, repo: str) -> tuple[sqlite3.Row, ...]:
     return tuple(
         connection.execute(

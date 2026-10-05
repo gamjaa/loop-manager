@@ -12,12 +12,15 @@ from dataclasses import dataclass, replace
 from enum import Enum
 import hashlib
 import json
+from pathlib import Path
 import re
 import sqlite3
 from typing import Callable, Iterator, Mapping, Protocol
 from uuid import uuid4
 
 from loop_manager_internal.catalog.execplan_catalog import (
+    CatalogIssue,
+    withhold_catalog_issues,
     ExecPlanCatalogEntry,
     ExecPlanCatalogSnapshot,
     final_content_matches,
@@ -134,6 +137,18 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(HISTORICAL_CATALOG_SCHEMA)
     connection.execute(CATALOG_DIAGNOSTICS_SCHEMA)
     connection.execute(CATALOG_REVISIONS_SCHEMA)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS execplan_catalog_views (
+            repo TEXT PRIMARY KEY, revision_sha TEXT NOT NULL,
+            fingerprint TEXT NOT NULL, validation_kind TEXT NOT NULL
+        )
+    """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS execplan_catalog_holds (
+            repo TEXT NOT NULL, plan_id TEXT NOT NULL, revision_sha TEXT NOT NULL,
+            evidence TEXT NOT NULL, resume_status TEXT, PRIMARY KEY (repo, plan_id)
+        )
+    """)
     columns = {
         str(row[1])
         for row in connection.execute(
@@ -154,6 +169,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
 
 class ReconciliationKind(str, Enum):
     RECONCILED = "reconciled"
+    EXECUTION_VIEW = "execution-view"
     STALE = "stale"
     INVALID_CATALOG = "invalid-catalog"
 
@@ -204,6 +220,7 @@ class CatalogStateSnapshot:
     rows: tuple[CatalogRowVersion, ...]
     project_values: tuple[object, ...] | None
     reserved: tuple[tuple[str, str], ...] = ()
+    holds: tuple[tuple[str, str, str, str | None], ...] = ()
 
     @property
     def plan_ids(self) -> frozenset[str]:
@@ -215,6 +232,25 @@ class PinnedCatalog:
     revision_sha: str
     snapshot: ExecPlanCatalogSnapshot
     regular_paths: frozenset[str] | None = None
+
+
+def new_declaration_issues(pinned: PinnedCatalog, known_ids: frozenset[str]) -> tuple[CatalogIssue, ...]:
+    """Validate stricter publication inputs before legacy recovery can create rows."""
+    issues = []
+    for key, entry in pinned.snapshot.active.items():
+        if key in known_ids:
+            continue
+        try:
+            parse_execplan_text(entry.path, entry.text, require_priority=True, validate_sources=False)
+        except RuntimeError as error:
+            issues.append(CatalogIssue(key, entry.path, "invalid-plan",
+                                      f"신규 ExecPlan 형식이 유효하지 않습니다: {error}"))
+        if pinned.regular_paths is not None:
+            for source in entry.sources:
+                if source not in pinned.regular_paths:
+                    issues.append(CatalogIssue(key, entry.path, "missing-source",
+                        f"신규 ExecPlan의 활성 source가 없습니다: {source}", source))
+    return tuple(issues)
 
 
 @dataclass(frozen=True)
@@ -234,6 +270,12 @@ class CatalogReconciliationResult:
     revision_sha: str | None = None
     changed_plan_ids: tuple[str, ...] = ()
     diagnostic: ReconciliationDiagnostic | None = None
+    withheld_plan_ids: tuple[str, ...] = ()
+    catalog: PinnedCatalog | None = None
+
+    @property
+    def usable(self) -> bool:
+        return self.kind in {ReconciliationKind.RECONCILED, ReconciliationKind.EXECUTION_VIEW}
 
 
 class InvalidPinnedCatalog(RuntimeError):
@@ -417,6 +459,11 @@ def _catalog_fingerprint(snapshot: ExecPlanCatalogSnapshot) -> str:
             encoded = value.encode("utf-8")
             digest.update(len(encoded).to_bytes(8, "big"))
             digest.update(encoded)
+    for plan_id, path, content_hash in snapshot.withheld:
+        digest.update(json.dumps((plan_id, path, content_hash)).encode("utf-8"))
+    for issue in snapshot.issues:
+        digest.update(json.dumps((issue.plan_id, issue.code, issue.message, issue.source),
+                                 ensure_ascii=False).encode("utf-8"))
     return digest.hexdigest()
 
 
@@ -553,6 +600,10 @@ class DefinitionStateRepository:
                 else None
             ),
             reserved=tuple(sorted(reserved_values)),
+            holds=tuple(tuple(row) for row in self.connection.execute(
+                "SELECT plan_id, revision_sha, evidence, resume_status FROM execplan_catalog_holds "
+                "WHERE repo = ? ORDER BY plan_id", (repo,),
+            )),
         )
 
     def has_publication_intent(self, repo: str) -> bool:
@@ -750,28 +801,81 @@ class DefinitionStateRepository:
                         projected_path = entry.path
                     changed.append(plan_id)
                     self._fault(f"after-plan:{plan_id}")
+                self._apply_execution_holds(repo, pinned, expected, projected_path)
+                fingerprint = _catalog_fingerprint(pinned.snapshot)
+                kind = "execution-view" if pinned.snapshot.issues else "full-catalog"
                 self.connection.execute(
-                    """
-                    INSERT INTO execplan_catalog_revisions (
-                        repo, revision_sha, catalog_fingerprint
-                    ) VALUES (?, ?, ?)
-                    ON CONFLICT(repo) DO UPDATE SET
-                        revision_sha = excluded.revision_sha,
-                        catalog_fingerprint = excluded.catalog_fingerprint,
-                        updated_at = CURRENT_TIMESTAMP
-                    """,
-                    (
-                        repo,
-                        pinned.revision_sha,
-                        _catalog_fingerprint(pinned.snapshot),
-                    ),
+                    "INSERT INTO execplan_catalog_views VALUES (?, ?, ?, ?) "
+                    "ON CONFLICT(repo) DO UPDATE SET revision_sha=excluded.revision_sha, "
+                    "fingerprint=excluded.fingerprint, validation_kind=excluded.validation_kind",
+                    (repo, pinned.revision_sha, fingerprint, kind),
                 )
+                if not pinned.snapshot.issues:
+                    self.connection.execute(
+                        "INSERT INTO execplan_catalog_revisions (repo, revision_sha, catalog_fingerprint) "
+                        "VALUES (?, ?, ?) ON CONFLICT(repo) DO UPDATE SET "
+                        "revision_sha=excluded.revision_sha, catalog_fingerprint=excluded.catalog_fingerprint, "
+                        "updated_at=CURRENT_TIMESTAMP", (repo, pinned.revision_sha, fingerprint),
+                    )
                 self._fault("before-revision-recheck")
                 if not revision_is_current():
                     raise _StaleCatalogSnapshot
         except _StaleCatalogSnapshot:
             return None
         return tuple(changed)
+
+    def _apply_execution_holds(
+        self, repo: str, pinned: PinnedCatalog, expected: CatalogStateSnapshot, projected_path: str,
+    ) -> None:
+        """Pause the mutation slot without replacing any independent block."""
+        from . import runtime_state
+        from loop_manager_internal.recovery import scoped_blocking
+
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        issues = [dict(plan_id=item.plan_id, path=item.path, code=item.code,
+                       message=item.message, source=item.source)
+                  for item in pinned.snapshot.issues]
+        held = {key: json.dumps({"revision": pinned.revision_sha,
+                    "plan_id": key, "path": path, "content_hash": content_hash,
+                    "causes": issues}, ensure_ascii=False, sort_keys=True)
+                for key, path, content_hash in pinned.snapshot.withheld}
+        previous = {item[0]: item[3] for item in expected.holds}
+        resume = {key: previous.get(key) for key in held}
+        for row in expected.rows:
+            status = row.values[_ROW_VERSION_FIELDS.index("status")]
+            if row.plan_id in held and status in runtime_state.ACTIVE_STATUSES:
+                resume[row.plan_id] = str(status)
+                runtime.update_plan(repo, row.plan_id, plan_values={"status": "PLAN_BLOCKED"},
+                                    expected_status=str(status), enqueue=False)
+        # A corrected execution resumes its exact saved phase only when the
+        # independent execution has relinquished the repository mutation slot.
+        for key, phase in previous.items():
+            if key in held or phase is None:
+                continue
+            row = self.connection.execute(
+                "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = ?", (repo, key),
+            ).fetchone()
+            if (row is None or row[0] != "PLAN_BLOCKED"
+                    or scoped_blocking.plan_block(self.connection, repo, key) is not None):
+                continue
+            if runtime.active_row(repo) is not None:
+                held[key] = json.dumps({"revision": pinned.revision_sha,
+                    "plan_id": key, "code": "execution-slot-busy"})
+                resume[key] = phase
+            else:
+                runtime.update_plan(repo, key, plan_values={"status": phase},
+                                    expected_status="PLAN_BLOCKED", enqueue=False)
+        self.connection.execute("DELETE FROM execplan_catalog_holds WHERE repo = ?", (repo,))
+        self.connection.executemany(
+            "INSERT INTO execplan_catalog_holds VALUES (?, ?, ?, ?, ?)",
+            ((repo, key, pinned.revision_sha, evidence, resume.get(key))
+             for key, evidence in held.items()),
+        )
+        project = self.connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
+        if (project is not None and not runtime_state.planning_owns_execution_slot(project)
+                and projected_path and any(row.plan_id in held
+                    and str(row.values[1]) == projected_path for row in expected.rows)):
+            runtime.clear(repo)
 
 
 class CatalogReconciliationService:
@@ -817,6 +921,43 @@ class CatalogReconciliationService:
             diagnostic=diagnostic,
         )
 
+    def _shared_ownership_failure(
+        self, pinned: PinnedCatalog, expected: CatalogStateSnapshot,
+    ) -> CatalogReconciliationResult | None:
+        """Refuse execution views whose paused owners overlap shared resources."""
+        project = dict(zip(_PROJECT_VERSION_FIELDS, expected.project_values or ()))
+        owners = []
+        for row in expected.rows:
+            values = dict(zip(_ROW_VERSION_FIELDS, row.values))
+            if (row.plan_id in pinned.snapshot.withheld_ids
+                    and project.get("plan_path") == values["path"]
+                    and project.get("agent_snapshot")
+                    and project["agent_snapshot"] != values["agent_snapshot"]):
+                return self._invalid(pinned.revision_sha, "shared-ownership",
+                    f"보류할 실행의 Agent scope 소유권을 보존할 수 없습니다: {row.plan_id}")
+            for field in ("branch", "worktree"):
+                value = values[field]
+                if not value:
+                    continue
+                value = Path(str(value)).resolve() if field == "worktree" else str(value)
+                for other_id, other_field, other_value in owners:
+                    if field != other_field:
+                        continue
+                    overlap = (value == other_value if field == "branch" else
+                               value.is_relative_to(other_value) or other_value.is_relative_to(value))
+                    if (overlap and
+                            ({other_id, row.plan_id} & pinned.snapshot.withheld_ids)):
+                        return self._invalid(pinned.revision_sha, "shared-ownership",
+                            f"오류 계획과 독립 계획의 {field} 소유권이 겹칩니다: {other_id}, {row.plan_id}")
+                if field == "worktree" and project.get("worktree") and row.plan_id in pinned.snapshot.withheld_ids:
+                    project_path = Path(str(project["worktree"])).resolve()
+                    if (project.get("plan_path") != values["path"] and
+                            (value.is_relative_to(project_path) or project_path.is_relative_to(value))):
+                        return self._invalid(pinned.revision_sha, "shared-ownership",
+                            f"오류 계획과 프로젝트 작업 공간이 겹칩니다: {row.plan_id}")
+                owners.append((row.plan_id, field, value))
+        return None
+
     def reconcile(self, repo: str) -> CatalogReconciliationResult:
         # The owning Planner must recover its manifest before unrelated IDs
         # can be classified as user publications.
@@ -832,8 +973,13 @@ class CatalogReconciliationService:
             )
         expected = self.repository.capture(repo)
         stored_ids = expected.plan_ids
-        catalog_ids = frozenset(pinned.snapshot.all)
+        catalog_ids = pinned.snapshot.observed_ids
+        pending_ids = {item[0] for item in expected.holds}
         missing_files = sorted(stored_ids - catalog_ids)
+        missing_pending = sorted(pending_ids - catalog_ids)
+        if missing_pending:
+            return self._invalid(pinned.revision_sha, "missing-plan",
+                "보류한 원격 ExecPlan 파일이 없습니다: " + ", ".join(missing_pending))
         historical_ids = self.repository.historical_ids(repo)
         missing_history = sorted(
             historical_ids - stored_ids - catalog_ids
@@ -893,55 +1039,44 @@ class CatalogReconciliationService:
                 f"신규 archive ExecPlan은 자동 등록할 수 없습니다: {plan_id}",
                 path=entry.path,
             )
-        if unknown_active:
+        new_observations = {
+            key: path for key, path, _hash in pinned.snapshot.withheld
+            if key not in stored_ids and key not in historical_ids
+        }
+        new_observations.update({key: pinned.snapshot.active[key].path for key in unknown_active})
+        if new_observations:
             if pinned.regular_paths is None:
-                entry = pinned.snapshot.active[unknown_active[0]]
-                return self._invalid(
-                    pinned.revision_sha, "unknown-plan-id",
-                    "신규 ExecPlan source를 검증할 원격 tree가 없습니다: "
-                    f"{entry.plan_id}", path=entry.path,
-                )
-            all_reserved = (
-                {(row.plan_id, str(row.values[1])) for row in expected.rows}
-                | set(expected.reserved)
-            )
-            max_number = max(
-                (
-                    int(plan_id[2:]) for plan_id, _ in all_reserved
-                    if plan_id.startswith("G-") and plan_id[2:].isdigit()
-                ), default=0
-            )
-            reserved_paths = {path for _, path in all_reserved}
-            for offset, plan_id in enumerate(
-                sorted(unknown_active, key=lambda value: int(value[2:]))
-            ):
-                entry = pinned.snapshot.active[plan_id]
-                number = int(plan_id[2:])
-                if number != max_number + offset + 1 or entry.path in reserved_paths:
-                    return self._invalid(
-                        pinned.revision_sha, "unknown-plan-id",
+                return self._invalid(pinned.revision_sha, "unknown-plan-id",
+                    "신규 ExecPlan source를 검증할 원격 tree가 없습니다.")
+            all_reserved = ({(row.plan_id, str(row.values[1])) for row in expected.rows}
+                            | set(expected.reserved))
+            max_number = max((int(key[2:]) for key, _path in all_reserved
+                              if key.startswith("G-") and key[2:].isdigit()), default=0)
+            reserved_paths = {path for _key, path in all_reserved}
+            reserved_ids = {item[0] for item in all_reserved}
+            for key, path in new_observations.items():
+                if key in reserved_ids or path in reserved_paths:
+                    return self._invalid(pinned.revision_sha, "unknown-plan-id",
+                        f"신규 ExecPlan identity가 예약 이력과 충돌합니다: {key}", path=path)
+            max_number = max(max_number, max((int(key[2:]) for key in pending_ids), default=0))
+            fresh_ids = sorted(set(new_observations) - pending_ids, key=lambda key: int(key[2:]))
+            for offset, key in enumerate(fresh_ids):
+                if int(key[2:]) != max_number + offset + 1 or new_observations[key] in reserved_paths:
+                    return self._invalid(pinned.revision_sha, "unknown-plan-id",
                         "신규 ExecPlan ID가 저장된 최대 번호 다음부터 연속되지 "
-                        f"않거나 경로가 예약 이력과 충돌합니다: {plan_id}",
-                        path=entry.path,
-                    )
-                try:
-                    parse_execplan_text(
-                        entry.path, entry.text, require_priority=True,
-                        validate_sources=False,
-                    )
-                except RuntimeError as error:
-                    return self._invalid(
-                        pinned.revision_sha, "invalid-plan",
-                        f"신규 ExecPlan 형식이 유효하지 않습니다: {error}",
-                        path=entry.path,
-                    )
-                for source in entry.sources:
-                    if source not in pinned.regular_paths:
-                        return self._invalid(
-                            pinned.revision_sha, "missing-source",
-                            f"신규 ExecPlan의 활성 source가 없습니다: {source}",
-                            path=entry.path, source=source,
-                        )
+                        f"않거나 경로가 예약 이력과 충돌합니다: {key}", path=new_observations[key])
+            issues = new_declaration_issues(pinned, stored_ids)
+            if issues:
+                if not pinned.snapshot.isolation_enabled:
+                    issue = issues[0]
+                    return self._invalid(pinned.revision_sha, issue.code, issue.message,
+                                         path=issue.path, source=issue.source)
+                pinned = replace(pinned, snapshot=withhold_catalog_issues(pinned.snapshot, tuple(issues)))
+                unknown_active = sorted(set(pinned.snapshot.active) - stored_ids)
+        if pinned.snapshot.issues:
+            unsafe = self._shared_ownership_failure(pinned, expected)
+            if unsafe is not None:
+                return unsafe
         if self.catalog.current_revision() != pinned.revision_sha:
             return CatalogReconciliationResult(
                 ReconciliationKind.STALE, revision_sha=pinned.revision_sha
@@ -960,9 +1095,11 @@ class CatalogReconciliationService:
                 ReconciliationKind.STALE, revision_sha=pinned.revision_sha
             )
         return CatalogReconciliationResult(
-            ReconciliationKind.RECONCILED,
+            ReconciliationKind.EXECUTION_VIEW if pinned.snapshot.issues else ReconciliationKind.RECONCILED,
             revision_sha=pinned.revision_sha,
             changed_plan_ids=changed,
+            withheld_plan_ids=tuple(sorted(pinned.snapshot.withheld_ids)),
+            catalog=pinned,
         )
 
 

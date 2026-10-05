@@ -1,7 +1,7 @@
 """catalog catalog service boundaries and named composition effects."""
 from __future__ import annotations
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 from loop_manager_internal.application.contracts import PLAN_SHA_BACKFILL_ERROR
 from loop_manager_internal.catalog import execplan_catalog
@@ -127,6 +127,7 @@ def revision_execplan_snapshot(
     revision: str,
     *,
     archive_conflict_plan_ids: frozenset[str] = frozenset(),
+    isolate_errors: bool = False,
 ) -> execplan_catalog.ExecPlanCatalogSnapshot:
     """Read and fully validate active/archive plans from one immutable tree."""
 
@@ -180,6 +181,7 @@ def revision_execplan_snapshot(
         invalid_plan_entries=invalid_plan_entries,
         revision_sha=revision_sha,
         archive_conflict_plan_ids=archive_conflict_plan_ids,
+        isolate_errors=isolate_errors,
     )
 
 
@@ -278,6 +280,7 @@ class _GitCatalogDefinitionPort:
                 self.repo,
                 revision_sha,
                 archive_conflict_plan_ids=self.archive_conflict_plan_ids(),
+                isolate_errors=True,
             )
         except execplan_catalog.ExecPlanCatalogError as error:
             tree = self._effects._git_tree_entries(self.repo, revision_sha)
@@ -374,7 +377,8 @@ def reconcile_execplan_catalog(
     repository = execplan_catalog_state.DefinitionStateRepository(connection)
     service = execplan_catalog_state.CatalogReconciliationService(repository, port)
     legacy = connection.execute(
-        "SELECT 1 FROM execplan_catalog_revisions WHERE repo = ?", (repo,),
+        "SELECT 1 FROM execplan_catalog_revisions WHERE repo = ? "
+        "UNION SELECT 1 FROM execplan_catalog_views WHERE repo = ?", (repo, repo),
     ).fetchone() is None
     if legacy and not repository.has_publication_intent(repo):
         # Initial migration and declaration reconciliation share a rollback
@@ -382,7 +386,12 @@ def reconcile_execplan_catalog(
         try:
             with execplan_catalog_state._transaction(connection):
                 pinned = port.load()
-                if repository.capture(repo).plan_ids - frozenset(pinned.snapshot.all):
+                if pinned.snapshot.isolation_enabled:
+                    issues = execplan_catalog_state.new_declaration_issues(pinned, repository.capture(repo).plan_ids)
+                    if issues:
+                        pinned = replace(pinned, snapshot=execplan_catalog.withhold_catalog_issues(pinned.snapshot, issues))
+                        port.loaded = pinned
+                if repository.capture(repo).plan_ids - pinned.snapshot.observed_ids:
                     raise project_catalog_refresh.CatalogRefreshStopped(service.reconcile(repo))
                 effects.backfill_plan_shas(connection, target_repo=repo, manage_transaction=False)
                 effects.migrate_legacy_execplans(
@@ -391,7 +400,7 @@ def reconcile_execplan_catalog(
                     pinned_catalog=pinned,
                 )
                 result = service.reconcile(repo)
-                if result.kind is not execplan_catalog_state.ReconciliationKind.RECONCILED:
+                if not result.usable:
                     raise project_catalog_refresh.CatalogRefreshStopped(result)
         except execplan_catalog_state.InvalidPinnedCatalog as error:
             result = execplan_catalog_state.CatalogReconciliationResult(
@@ -414,10 +423,14 @@ def reconcile_execplan_catalog(
             )
     else:
         result = service.reconcile(repo)
-    if (result.kind is execplan_catalog_state.ReconciliationKind.RECONCILED
-            and on_reconciled is not None):
+    if (result.kind is execplan_catalog_state.ReconciliationKind.INVALID_CATALOG
+            and remote_sha is not None and port.current_revision() != remote_sha):
+        return execplan_catalog_state.CatalogReconciliationResult(
+            execplan_catalog_state.ReconciliationKind.STALE, revision_sha=remote_sha,
+        )
+    if (result.usable and on_reconciled is not None):
         assert port.loaded is not None
-        on_reconciled(port.loaded)
+        on_reconciled(result.catalog or port.loaded)
     catalog_reason = BlockReasonCode.EXECPLAN_CATALOG_INVALID.value
     existing_block = scoped_blocking.project_block(connection, repo)
     if result.kind is execplan_catalog_state.ReconciliationKind.INVALID_CATALOG:
@@ -455,7 +468,7 @@ def reconcile_execplan_catalog(
         return result
     if (
         record_invalid
-        and result.kind is execplan_catalog_state.ReconciliationKind.RECONCILED
+        and result.usable
         and existing_block is not None
         and existing_block["reason_code"] == catalog_reason
     ):

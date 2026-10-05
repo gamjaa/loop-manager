@@ -294,7 +294,10 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
         return False
     if runtime_state.RuntimeStateRepository(connection).active_row(repo) is not None:
         return False
+    held = scoped_blocking.catalog_held_plan_ids(connection, repo)
     for blocked in effects.plan_blocked_execplans(connection, repo):
+        if str(blocked["plan_id"]) in held:
+            continue
         current_block = scoped_blocking.plan_block(
             connection, repo, str(blocked["plan_id"]),
         )

@@ -105,8 +105,14 @@ def collect(
         "SELECT plan_id, title, status, depends_on, pr_url, sources "
         "FROM exec_plans WHERE repo = ? ORDER BY plan_id", (repo,),
     ).fetchall()
+    holds = {}
+    if _table_exists(connection, "execplan_catalog_holds"):
+        holds = {str(row[0]): str(row[1]) for row in connection.execute(
+            "SELECT plan_id, evidence FROM execplan_catalog_holds WHERE repo = ?", (repo,),
+        )}
     statuses = {
         str(row["plan_id"]): (
+            "CATALOG_HELD" if str(row["plan_id"]) in holds else
             "MERGED" if history.get(str(row["plan_id"])) else
             "HISTORICAL_UNVERIFIED" if str(row["plan_id"]) in history else
             str(row["status"])
@@ -125,13 +131,16 @@ def collect(
     plans = []
     for row in rows:
         plan_id = str(row["plan_id"])
-        if plan_id in history or row["status"] == "MERGED":
+        if plan_id not in holds and (plan_id in history or row["status"] == "MERGED"):
             continue
-        status = str(row["status"])
+        status = statuses[plan_id]
         item: dict[str, object] = {
             "id": plan_id, "title": str(row["title"]), "status": status,
         }
-        if status == "READY":
+        if status == "CATALOG_HELD":
+            item.update(reason="ExecPlan catalog 오류의 교정 대기",
+                        reason_code="execplan_catalog_invalid", evidence=holds[plan_id])
+        elif status == "READY":
             dependencies = json.loads(str(row["depends_on"]))
             missing = [
                 {"id": str(dependency), "status": statuses.get(str(dependency), "UNKNOWN")}
@@ -163,6 +172,11 @@ def collect(
             return None
         plans.append(item)
 
+    known_ids = {str(row["plan_id"]) for row in rows}
+    plans.extend({"id": key, "title": key, "status": "CATALOG_HELD",
+                  "reason": "ExecPlan catalog 오류의 교정 대기",
+                  "reason_code": "execplan_catalog_invalid", "evidence": holds[key]}
+                 for key in sorted(holds.keys() - known_ids))
     project = connection.execute(
         "SELECT planning_error FROM projects WHERE repo = ?", (repo,),
     ).fetchone()

@@ -430,6 +430,9 @@ def enqueue_completion_if_ready(
 ) -> bool:
     """Record completion only for an already verified stable selection."""
 
+    from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
+    if catalog_held_plan_ids(connection, repo):
+        return False
     if snapshot is None or not snapshot.completed:
         return False
     ensure_schema(connection)

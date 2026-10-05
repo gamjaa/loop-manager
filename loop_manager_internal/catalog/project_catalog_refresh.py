@@ -40,6 +40,9 @@ class ProjectCatalogRefresh:
             tuple(row.values[:state._ROW_VERSION_FIELDS.index("status")]
                   for row in snapshot.rows),
             tuple(item for item in snapshot.reserved if item[0] not in snapshot.plan_ids),
+            snapshot.holds,
+            tuple((row.plan_id, row.values[state._ROW_VERSION_FIELDS.index("status")])
+                  for row in snapshot.rows) if snapshot.holds else (),
         )
 
     def refresh(self, revision: str | None = None) -> str:
@@ -49,7 +52,7 @@ class ProjectCatalogRefresh:
                 and self.current_revision() == revision):
             return revision
         result = self.reconcile(revision, self._remember)
-        if result.kind is not state.ReconciliationKind.RECONCILED:
+        if not result.usable:
             raise CatalogRefreshStopped(result)
         assert result.revision_sha is not None
         self.revision = result.revision_sha
@@ -75,7 +78,7 @@ class ProjectCatalogRefresh:
         reread is necessary. Repository CAS and remote checks still apply.
         """
         pinned = self.pinned
-        if (pinned is None or pinned.revision_sha != base_sha
+        if (pinned is None or pinned.snapshot.issues or pinned.revision_sha != base_sha
                 or self.current_revision() != commit_oid
                 or pinned.regular_paths is None):
             return False

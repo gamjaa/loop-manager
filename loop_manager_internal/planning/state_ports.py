@@ -57,12 +57,11 @@ class _PlanningStatePorts:
     def reconcile_catalog(
         self, repo: str, repository: Path, base_branch: str, revision: str,
     ) -> None:
-        from loop_manager_internal.storage.execplan_catalog_state import ReconciliationKind
         result = self._effects.reconcile_execplan_catalog(
             self._connection, repository, repo, base_branch,
             remote_sha=revision,
         )
-        if result.kind is not ReconciliationKind.RECONCILED:
+        if not result.usable:
             detail = result.diagnostic.message if result.diagnostic else result.kind.value
             raise RuntimeError(f"planning catalog 갱신 대기: {detail}")
 
