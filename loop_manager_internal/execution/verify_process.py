@@ -407,7 +407,7 @@ def run_verify_process(
                     ) from primary
             return False, True, VerifyProcessOutput(_tail(output), exit_code=process.returncode)
         except BaseException as primary:
-            if process is not None and process.poll() is None:
+            if process is not None and (assigned or process.poll() is None):
                 if job and assigned:
                     errors = _terminate_windows_job(job, process)
                     if errors:

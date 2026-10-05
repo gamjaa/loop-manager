@@ -291,6 +291,30 @@ class VerifyProcessTests(unittest.TestCase):
         job.wait.assert_called_once_with(10)
         job.close.assert_called_once()
 
+    def test_windows_failure_cleans_job_even_after_parent_exit(self):
+        root = Path.cwd()
+        process, job = mock.Mock(pid=123), mock.Mock()
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        primary = OSError("job accounting failed")
+        job.wait.side_effect = [primary, TimeoutError("child active")]
+        job.terminate.side_effect = OSError("terminate failed")
+        with mock.patch.object(verify_process.os, "name", "nt"), mock.patch.object(
+            subprocess, "CREATE_NEW_PROCESS_GROUP", 0x200, create=True
+        ), mock.patch.object(windows_job, "WindowsJob", return_value=job):
+            with self.assertRaisesRegex(VerifyTerminationUncertain, "job accounting failed") as raised:
+                run_verify_process(
+                    ["verify"], root, 1,
+                    launch_process=mock.Mock(return_value=process), job_scope=True,
+                )
+        self.assertIs(raised.exception.__cause__, primary)
+        self.assertIn("terminate failed", str(raised.exception))
+        self.assertIn("child active", str(raised.exception))
+        job.terminate.assert_called_once()
+        self.assertEqual(process.wait.call_count, 2)
+        self.assertEqual(job.wait.call_count, 2)
+        job.close.assert_called_once()
+
     def test_cleanup_uncertainty_keeps_the_primary_failure(self):
         root = Path.cwd()
         process = mock.Mock(pid=123)
