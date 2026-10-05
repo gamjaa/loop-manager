@@ -37,6 +37,10 @@ class RetirementError(RuntimeError):
     """A final assessment or move lacks authoritative evidence."""
 
 
+class RetirementReassessment(RetirementError):
+    """A receipted move was withdrawn; resume ordinary Planner assessment."""
+
+
 @dataclass(frozen=True)
 class FinalInput:
     path: str
@@ -97,7 +101,7 @@ def assessment_prompt(inputs: tuple[FinalInput, ...]) -> str:
         "relevant_paths(판단에 사용한 구현·테스트 상대 경로 배열)다. "
         "PRODUCT·ARCHITECTURE 근거는 relevant_paths에 파일#정확한 Markdown 제목 줄로 "
         "관련 절을 모두 지정하라(예: docs/PRODUCT.md### 제품 규칙). "
-        "절 지정은 해당 절과 하위 절을 포함한다. 문서 전체가 관련되면 파일 경로를 사용하라. "
+        "절 지정은 해당 절과 하위 절을 포함한다. 문서 전체가 관련되면 파일 경로를 사용하고 관련 근거가 없는 문서는 생략하라. "
         "근거가 부족하면 uncertain을 사용하고 criteria_evidence에 사용자가 결정해야 할 "
         "구체적인 문제와 해당 Requirement에 명시해야 할 결정을 적어라.\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -262,12 +266,6 @@ class RequirementRetirementPort:
         if any(not _valid_evidence_path(item) for item in relevant_paths):
             raise RetirementError(f"판단 관련 경로가 유효하지 않습니다: {path}")
         relevant = self._evidence(repository, revision, relevant_paths)
-        # Legacy judgments retain conservative whole-document dependencies until
-        # Planner supplies explicit section evidence on their next assessment.
-        specifications = tuple(
-            (name, tree.get(name)) for name in SPECIFICATIONS
-            if not any(item.startswith(name + "#") for item in relevant_paths)
-        )
         plan_evidence = tuple(
             (
                 str(row["plan_id"]), str(row["path"]), str(row["sources"]),
@@ -277,7 +275,7 @@ class RequirementRetirementPort:
                 _digest((str(row["verify_result"] or ""), str(row["review_result"] or ""))),
             ) for row in related
         )
-        return _digest((path, oid, specifications, plan_evidence,
+        return _digest(("explicit-specification-evidence-v2", path, oid, plan_evidence,
                         tuple(sorted((item, relevant.get(item)) for item in relevant_paths))))
 
     def pending(self, repo: str, repository: Path, revision: str) -> tuple[FinalInput, ...]:
@@ -711,6 +709,39 @@ class RequirementRetirementPort:
             paths.extend((source, destination))
         return tuple(paths)
 
+    def _withdraw_move(self, repo: str, repository: Path, revision: str,
+                       worktree: Path, row) -> None:
+        source = str(row["source_path"])
+        destination = "docs/requirements/archive/" + source.removeprefix("docs/requirements/")
+        _safe_parent(worktree, source)
+        _safe_parent(worktree, destination)
+        remote = _tree(self.git, repository, revision, source, destination)
+        if (destination in remote or source not in remote
+                or remote[source][0] not in {"100644", "100755"}):
+            raise RetirementError(f"Requirement 이동 철회 원격 경로가 안전하지 않습니다: {source}")
+        original = self.git.run_bytes(repository, "cat-file", "blob", str(row["source_oid"]))
+        current = self.git.run_bytes(repository, "cat-file", "blob", remote[source][1])
+        origin, target = worktree / source, worktree / destination
+        if origin.is_symlink() or target.is_symlink():
+            raise RetirementError(f"Requirement 이동 철회 경로가 symlink입니다: {source}")
+        if origin.exists():
+            if not origin.is_file() or origin.read_bytes() != current or target.exists():
+                raise RetirementError(f"Requirement 이동 철회 원본에 보존할 변경이 있습니다: {source}")
+        else:
+            if not target.is_file() or target.read_bytes() != original or original != current:
+                raise RetirementError(f"Requirement 이동 철회 영수증과 내용이 다릅니다: {source}")
+            os.rename(target, origin)
+        # Reset only the proven Manager move's index entries; a publication
+        # interruption may have staged them even when HEAD still equals base.
+        self.git.run(worktree, "reset", revision, "--", source, destination)
+        # An interrupted inverse rename is recognized above before retiring its
+        # pending receipt. Unrelated worktree files and judgment history survive.
+        self.judgments.invalidate(repo, source, "staged retirement withdrawn after related input change")
+        self.connection.execute(
+            "DELETE FROM requirement_move_receipts WHERE repo = ? AND source_path = ? AND stage = 'pending'",
+            (repo, source),
+        )
+
     def receipted_paths(self, repo: str, repository: Path, revision: str,
                         worktree: Path) -> tuple[str, ...]:
         paths = []
@@ -724,7 +755,10 @@ class RequirementRetirementPort:
             judgment = self.judgments.get(repo, source)
             if (source not in currently_fulfilled or judgment is None
                 or judgment.input_token != str(row["judgment_token"])):
-                raise RetirementError(f"Requirement 이동 자격이 변경됐습니다: {source}")
+                self._withdraw_move(repo, repository, revision, worktree, row)
+                raise RetirementReassessment(
+                    f"Requirement 이동을 철회했습니다. 최신 관련 계획·근거로 일반 Planner 판단을 갱신하세요: {source}"
+                )
             destination = "docs/requirements/archive/" + source.removeprefix("docs/requirements/")
             origin, target = worktree / source, worktree / destination
             _safe_parent(worktree, source)

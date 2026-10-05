@@ -11,7 +11,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 from loop_manager_internal.planning.requirement_retirement import (
-    RequirementRetirementPort, RetirementError,
+    RequirementRetirementPort, RetirementError, RetirementReassessment,
 )
 from loop_manager_internal.storage.requirement_judgment_state import Judgment
 from loop_manager_internal.application.contracts import ValidatedPlanningResult
@@ -42,6 +42,12 @@ class FakeGit:
             "feature.py": b"implemented = True\n",
         }
         self.blob_reads = 0
+        self.index_resets = []
+
+    def run(self, _repo, *args):
+        if args[:1] != ("reset",) or args[2:] != ("--", SOURCE, ARCHIVE):
+            raise AssertionError(args)
+        self.index_resets.append(args)
 
     def run_bytes(self, _repo, command, *args):
         if command == "cat-file":
@@ -144,7 +150,9 @@ class RequirementRetirementTest(unittest.TestCase):
                 self.add_plan()
                 (item,) = self.port.pending("repo", self.root, "base")
                 self.port.record("repo", self.port.validate_result(
-                    "repo", self.root, "base", self.judgment_line(item, "unfulfilled"),
+                    "repo", self.root, "base", self.judgment_line(item, "unfulfilled").replace(
+                        '["feature.py"]', '["feature.py", "docs/PRODUCT.md"]',
+                    ),
                 ))
                 self.git.files[changed_path] = contents
                 self.assertEqual(len(self.port.pending("repo", self.root, "base")), 1)
@@ -169,6 +177,67 @@ class RequirementRetirementTest(unittest.TestCase):
             self.assertEqual(self.port.fulfilled_moves("repo", self.root, "advanced"), ())
             self.git.files[name] = original
         self.assertEqual(self.port.pending("repo", self.root, "advanced"), ())
+
+    def test_product_only_evidence_does_not_track_unrelated_architecture(self):
+        self.add_plan()
+        self.git.files["docs/PRODUCT.md"] = b"## Feature\nRule\n"
+        (item,) = self.port.pending("repo", self.root, "base")
+        line = self.judgment_line(item).replace(
+            '["feature.py"]', '["feature.py", "docs/PRODUCT.md### Feature"]',
+        )
+        self.port.record("repo", self.port.validate_result("repo", self.root, "base", line))
+        self.git.files["docs/ARCHITECTURE.md"] = b"Unrelated architectural change\n"
+        restarted = RequirementRetirementPort(self.connection, self.git)
+        self.assertEqual(restarted.pending("repo", self.root, "advanced"), ())
+        self.assertEqual(restarted.fulfilled_moves("repo", self.root, "advanced"), (SOURCE,))
+        self.git.files["docs/PRODUCT.md"] = b"## Feature\nChanged rule\n"
+        self.assertEqual(len(restarted.pending("repo", self.root, "later")), 1)
+
+    def test_invalidated_move_withdrawal_preserves_unrelated_files_and_reassesses(self):
+        self.add_plan()
+        (item,) = self.port.pending("repo", self.root, "base")
+        self.port.record("repo", self.port.validate_result(
+            "repo", self.root, "base", self.judgment_line(item),
+        ))
+        origin = self.root / SOURCE
+        origin.parent.mkdir(parents=True)
+        origin.write_bytes(CONTENTS)
+        other = self.root / "other.txt"
+        other.write_bytes(b"keep local work")
+        self.port.stage_moves("repo", self.root, "base", self.root)
+        self.git.files["feature.py"] = b"Changed implementation"
+        with self.assertRaises(RetirementReassessment):
+            self.port.receipted_paths("repo", self.root, "advanced", self.root)
+        restarted = RequirementRetirementPort(self.connection, self.git)
+        self.assertEqual(restarted.receipted_paths("repo", self.root, "advanced", self.root), ())
+        self.assertEqual(origin.read_bytes(), CONTENTS)
+        self.assertEqual(self.git.index_resets, [("reset", "advanced", "--", SOURCE, ARCHIVE)])
+        self.assertEqual(other.read_bytes(), b"keep local work")
+        (fresh,) = restarted.pending("repo", self.root, "advanced")
+        restarted.record("repo", restarted.validate_result(
+            "repo", self.root, "advanced", self.judgment_line(fresh),
+        ))
+        self.assertEqual(restarted.stage_moves("repo", self.root, "advanced", self.root),
+                         (SOURCE, ARCHIVE))
+
+    def test_invalidated_move_does_not_overwrite_modified_archive(self):
+        self.add_plan()
+        (item,) = self.port.pending("repo", self.root, "base")
+        self.port.record("repo", self.port.validate_result(
+            "repo", self.root, "base", self.judgment_line(item),
+        ))
+        origin = self.root / SOURCE
+        origin.parent.mkdir(parents=True)
+        origin.write_bytes(CONTENTS)
+        self.port.stage_moves("repo", self.root, "base", self.root)
+        (self.root / ARCHIVE).write_bytes(b"local edit")
+        self.git.files["feature.py"] = b"changed"
+        with self.assertRaises(RetirementError):
+            self.port.receipted_paths("repo", self.root, "advanced", self.root)
+        self.assertEqual((self.root / ARCHIVE).read_bytes(), b"local edit")
+        self.assertEqual(self.connection.execute(
+            "SELECT count(*) FROM requirement_move_receipts",
+        ).fetchone()[0], 1)
 
     def test_missing_or_ambiguous_specification_section_cannot_prove_fulfillment(self):
         self.add_plan()
@@ -257,7 +326,12 @@ class RequirementRetirementTest(unittest.TestCase):
 
         with self.assertRaises(RetirementError):
             self.port.receipted_paths("repo", self.root, "base", self.root)
-        self.assertEqual((self.root / ARCHIVE).read_bytes(), CONTENTS)
+        self.assertEqual((self.root / SOURCE).read_bytes(), CONTENTS)
+        self.assertFalse((self.root / ARCHIVE).exists())
+        self.assertEqual(self.port.receipted_paths("repo", self.root, "base", self.root), ())
+        self.assertEqual(self.port.pending("repo", self.root, "base"), ())
+        self.connection.execute("UPDATE exec_plans SET status = 'MERGED'")
+        self.assertEqual(len(self.port.pending("repo", self.root, "base")), 1)
 
     def test_manager_retirement_is_not_reaudited_as_historical_archive(self):
         self.add_plan()
@@ -455,6 +529,26 @@ class RequirementRetirementTest(unittest.TestCase):
 
 
 class RetirementPublicationManifestTest(unittest.TestCase):
+    def test_withdrawn_move_uses_existing_planner_validation_retry(self):
+        from loop_manager_internal.planning.assessment_service import PlanningAssessmentService
+        from loop_manager_internal.planning.planning_contracts import PlanningOutcomeKind
+        ports = SimpleNamespace(
+            retirement=SimpleNamespace(receipted_paths=mock.Mock(
+                side_effect=RetirementReassessment("reassess current evidence"))),
+            state=SimpleNamespace(update=mock.Mock()), events=SimpleNamespace(error=mock.Mock()),
+        )
+        service = PlanningAssessmentService(ports, mock.Mock())
+        row = SimpleNamespace(phase="PLANNING", active_sha="advanced", planning_retry_count=0,
+                              planning_result_pending_validation=0, planning_validation_error=None)
+        run = SimpleNamespace(row=row, context=SimpleNamespace(repo="repo", repo_path=Path("/repo")),
+                              planning_worktree=Path("/worktree"), dirty_files=[], planner_scope_error=None,
+                              maintenance_planning=False, mutable_ready_snapshot=object())
+        outcome = service._validate_planner_result(run)
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
+        self.assertEqual(ports.state.update.call_args.kwargs["planning_result_completed"], 0)
+        self.assertEqual(ports.state.update.call_args.kwargs["planning_result_pending_validation"], 0)
+
+
     def test_remote_confirmed_move_marks_receipt_and_audit_together(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)

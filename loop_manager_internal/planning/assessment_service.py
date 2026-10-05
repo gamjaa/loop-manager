@@ -539,6 +539,9 @@ class PlanningAssessmentService(PlanningService):
                             context.repo, context.repo_path, str(row.active_sha), worktree,
                         )
                     except RetirementError as error:
+                        from loop_manager_internal.planning.requirement_retirement import RetirementReassessment
+                        if isinstance(error, RetirementReassessment):
+                            raise PlanningResultInvalid(str(error)) from error
                         self._ports.state.update(
                             context.repo, planning_error=str(error),
                             planning_error_fingerprint=run.current_fingerprint,
