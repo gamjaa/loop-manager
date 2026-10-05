@@ -234,7 +234,7 @@ class PlannerInterruptionRecoveryTest(unittest.TestCase):
                 "loop_manager.ensure_safe_base_worktree"
             ), mock.patch(
                 "loop_manager.codex_model_efforts",
-                return_value={"gpt-5.6-sol": frozenset({"xhigh"})},
+                return_value={"gpt-6.1-sol": frozenset({"xhigh"})},
             ), mock.patch(
                 "loop_manager.subprocess.Popen", side_effect=start_process
             ), mock.patch(
