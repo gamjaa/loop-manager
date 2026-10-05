@@ -61,6 +61,25 @@ def _nul_git_paths(repo: Path, *arguments: str, effects: ObservationEffects) -> 
     ]
 
 
+def _unstaged_git_paths(worktree: Path, *, effects: ObservationEffects) -> list[str]:
+    # name-only can report every stat-stale entry when read-only diff cannot
+    # refresh the index. Numstat checks content without writing the index.
+    raw = effects.git_bytes(worktree, 'diff', '--numstat', '--no-renames',
+                            '--no-ext-diff', '--no-textconv', '-z',
+                            '--ignore-submodules=none', '--')
+    if raw and not raw.endswith(b'\0'):
+        raise RuntimeError('Git unstaged numstat 목록이 잘렸습니다.')
+    paths = []
+    for record in raw.split(b'\0')[:-1]:
+        fields = record.split(b'\t', 2)
+        if (len(fields) != 3 or not fields[2]
+                or not ((fields[0].isdigit() and fields[1].isdigit())
+                        or fields[:2] == [b'-', b'-'])):
+            raise RuntimeError('Git unstaged numstat 목록을 해석할 수 없습니다.')
+        paths.append(os.fsdecode(fields[2]))
+    return paths
+
+
 def _index_entries(worktree: Path, *, effects: ObservationEffects,
                    details: dict | None = None) -> dict[str, tuple[str, ...]]:
     entries: dict[str, list[str]] = {}
@@ -356,14 +375,7 @@ def _capture_local_worktree_state(worktree: Path, *, effects: ObservationEffects
     path_groups = (
         (
             "unstaged",
-            _nul_git_paths(
-                worktree,
-                "diff",
-                "--name-only",
-                "-z",
-                "--ignore-submodules=none",
-                effects=effects,
-            ),
+            _unstaged_git_paths(worktree, effects=effects),
         ),
         (
             "staged",

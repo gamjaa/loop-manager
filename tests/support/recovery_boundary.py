@@ -27,6 +27,33 @@ def _tree_digest(root):
     return digest.hexdigest()
 
 
+def _temporary_tables(connection):
+    tables = []
+    for kind, name, sql in connection.execute(
+            "SELECT type, name, sql FROM sqlite_temp_master ORDER BY name"):
+        if sql is None and kind == 'index':
+            continue  # Recreated by the owning table's constraint.
+        if kind != 'table' or not sql.startswith('CREATE TABLE '):
+            raise RuntimeError('지원하지 않는 복구 경계 TEMP schema')
+        quoted = '"' + name.replace('"', '""') + '"'
+        rows = tuple(tuple(row) for row in connection.execute('SELECT * FROM temp.' + quoted))
+        tables.append((name, sql, rows))
+    return tuple(tables)
+
+
+def _restore_temporary_tables(connection, saved):
+    for name, _sql, _rows in _temporary_tables(connection):
+        quoted = '"' + name.replace('"', '""') + '"'
+        connection.execute('DROP TABLE temp.' + quoted)
+    for name, sql, rows in saved:
+        connection.execute(sql.replace('CREATE TABLE ', 'CREATE TEMP TABLE ', 1))
+        if rows:
+            quoted = '"' + name.replace('"', '""') + '"'
+            placeholders = ','.join('?' for _ in rows[0])
+            connection.executemany('INSERT INTO temp.' + quoted + ' VALUES (' + placeholders + ')', rows)
+    connection.commit()
+
+
 class RecoveryBoundary:
     """소유한 임시 경로만 복원한다. 경로·receipt 치환 및 전역 cache는 없다.
 
@@ -48,12 +75,13 @@ class RecoveryBoundary:
             raise RuntimeError('이미 저장한 복구 경계')
         databases = list(connection.execute('PRAGMA database_list'))
         self.database_path = databases[0][2]
-        if (len(databases) != 1 or self.database_path and (
+        if (any(row[1] not in {'main', 'temp'} for row in databases) or self.database_path and (
                 not Path(self.database_path).resolve().is_relative_to(Path(self.directory).resolve())
                 or connection.execute('PRAGMA journal_mode').fetchone()[0] != 'delete')):
             raise RuntimeError('복구 경계 밖의 DB 또는 지원하지 않는 journal mode')
         with phase('git_fixture:boundary_save'):
             connection.commit()
+            self.temporary_tables = _temporary_tables(connection)
             connection.backup(self.database)
             self.sql = tuple(self.database.iterdump())
             self.digest = _tree_digest(Path(self.directory))
@@ -88,7 +116,8 @@ class RecoveryBoundary:
             else:
                 connection.rollback()
                 self.database.backup(connection)
-            if tuple(connection.iterdump()) != self.sql:
+            _restore_temporary_tables(connection, self.temporary_tables)
+            if tuple(connection.iterdump()) != self.sql or _temporary_tables(connection) != self.temporary_tables:
                 raise RuntimeError('복구 시작 상태 재현 불일치')
             return connection
 

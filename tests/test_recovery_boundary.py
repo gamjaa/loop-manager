@@ -125,6 +125,39 @@ class RecoveryBoundaryTests(unittest.TestCase):
         self.assertNotEqual(*paths)
         self.assertTrue(all(not Path(path).exists() for path in paths))
 
+    def test_restore_preserves_external_run_temp_state_and_discards_variant_state(self):
+        for disk in (False, True):
+            with self.subTest(disk=disk), RecoveryBoundary() as boundary:
+                database = str(Path(boundary.directory) / 'state.db') if disk else ':memory:'
+                connection = sqlite3.connect(database)
+                connection.execute('CREATE TABLE checkpoint (generation INTEGER)')
+                connection.execute('INSERT INTO checkpoint VALUES (7)')
+                connection.execute('CREATE TEMP TABLE recovery_external_run (run_id TEXT, payload BLOB)')
+                connection.execute('INSERT INTO recovery_external_run VALUES (?, ?)', ('original', b'bytes'))
+                boundary.save(connection)
+                for variant in ('failed', 'retried'):
+                    connection.execute('UPDATE checkpoint SET generation=99')
+                    connection.execute('UPDATE recovery_external_run SET run_id=?', (variant,))
+                    connection.execute('CREATE TEMP TABLE extra_variant_state (value TEXT)')
+                    connection.commit()
+                    connection = boundary.restore(connection)
+                    self.assertEqual(tuple(connection.execute('SELECT * FROM checkpoint').fetchone()), (7,))
+                    self.assertEqual(tuple(connection.execute('SELECT * FROM recovery_external_run').fetchone()), ('original', b'bytes'))
+                    self.assertIsNone(connection.execute("SELECT name FROM sqlite_temp_master WHERE name='extra_variant_state'").fetchone())
+
+    def test_attached_database_remains_rejected_when_temp_state_is_present(self):
+        with RecoveryBoundary() as boundary:
+            connection = sqlite3.connect(':memory:')
+            self.addCleanup(connection.close)
+            connection.execute('CREATE TEMP TABLE recovery_external_run (run_id TEXT)')
+            connection.execute("ATTACH DATABASE ':memory:' AS foreign_state")
+            marker = Path(boundary.directory) / 'preserved'
+            marker.write_text('original')
+            with self.assertRaisesRegex(RuntimeError, 'DB'):
+                boundary.save(connection)
+            self.assertFalse(boundary.saved)
+            self.assertEqual(marker.read_text(), 'original')
+
     def test_missing_boundary_and_changed_database_are_not_success(self):
         with RecoveryBoundary() as boundary:
             connection = sqlite3.connect(':memory:')

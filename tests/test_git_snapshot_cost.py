@@ -48,6 +48,31 @@ class GitSnapshotCostTests(unittest.TestCase):
                     scope_observation._capture_local_worktree_state(repo, effects=replace(effects,
                         git=mock.Mock(return_value=subprocess.CompletedProcess([], 0, output))))
 
+    def test_stale_index_stat_is_checked_without_writing_or_false_dirty_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            git_command(repo, 'read-tree', 'HEAD')
+            index = repo / '.git/index'
+            original_index = index.read_bytes()
+            self.assertEqual(manager.capture_git_snapshot(repo).dirty, {})
+            self.assertEqual(index.read_bytes(), original_index)
+            (repo / 'src/app.py').write_text('real edit\n')
+            observed = manager.capture_git_snapshot(repo)
+            self.assertEqual(set(observed.dirty), {'src/app.py'})
+            self.assertEqual(observed.dirty['src/app.py'][0], ('unstaged',))
+            self.assertEqual(index.read_bytes(), original_index)
+
+    def test_unstaged_numstat_keeps_binary_and_special_paths_and_rejects_truncation(self):
+        effects = manager._scope_observation_effects()
+        raw = b'0\t0\tmode-only\0-\t-\ttab\tnewline\n.bin\0'
+        observed = scope_observation._unstaged_git_paths(Path('/repo'), effects=replace(
+            effects, git_bytes=mock.Mock(return_value=raw)))
+        self.assertEqual(observed, ['mode-only', 'tab\tnewline\n.bin'])
+        for malformed in (raw[:-1], b'one\t0\tpath\0', b'-\t0\tpath\0', b'0\t0\t\0', b'path\0'):
+            with self.subTest(raw=malformed), self.assertRaises(RuntimeError):
+                scope_observation._unstaged_git_paths(Path('/repo'), effects=replace(
+                    effects, git_bytes=mock.Mock(return_value=malformed)))
+
     def test_total_git_cost_includes_preparation_and_snapshot_with_parent_reason(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
