@@ -1553,6 +1553,7 @@ _planning_result_from_manifest = _bind_effects(
 
 _validate_general_planning_commit = _bind_effects(
     planner_publication._validate_general_planning_commit, lambda: planner_publication.ValidateGeneralPlanningCommitEffects(
+        _nul_git_paths=lambda *args, **kwargs: _nul_git_paths(*args, **kwargs),
         git=lambda *args, **kwargs: git(*args, **kwargs),
         git_bytes=lambda *args, **kwargs: git_bytes(*args, **kwargs),
     ),

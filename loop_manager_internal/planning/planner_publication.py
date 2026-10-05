@@ -182,6 +182,7 @@ def _planning_result_from_manifest(effects: PlanningResultFromManifestEffects, m
 @dataclass(frozen=True)
 class ValidateGeneralPlanningCommitEffects:
     """Named effects for _validate_general_planning_commit; no entry-point/module access."""
+    _nul_git_paths: Callable[..., object]
     git: Callable[..., object]
     git_bytes: Callable[..., object]
 
@@ -209,15 +210,15 @@ def _validate_general_planning_commit(
     committed_paths = tuple(
         sorted(
             path
-            for path in effects.git(
+            for path in effects._nul_git_paths(
                 worktree,
                 "diff",
                 "--no-renames",
                 "--name-only",
                 snapshot.active_sha,
                 plan_commit,
-            ).stdout.splitlines()
-            if path
+                "-z",
+            )
         )
     )
     if committed_paths != tuple(sorted(result.publication_paths)):
