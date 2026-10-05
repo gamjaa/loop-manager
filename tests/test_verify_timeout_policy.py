@@ -70,6 +70,56 @@ class VerifyTimeoutPolicyTests(unittest.TestCase):
         self.assertEqual([item.blocked for item in decisions], [False, False, False, True])
         self.assertEqual(len({item.fingerprint for item in decisions}), 1)
 
+    def test_validation_transition_redacts_persisted_failure_state(self):
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        runtime_state.RuntimeStateRepository(connection).activate(
+            'repo', 'G-047', activation_sha='base',
+            branch='loop-manager/G-047', worktree='/state/G-047',
+        )
+        secret = 'verify-transition-secret'
+        loop_manager.transition_validation_failure(
+            connection, 'repo', Path('/state/G-047'), 'verify',
+            f'FAILED tests/test_config.py::test_loads\npassword: {secret}',
+        )
+
+        rows = connection.execute(
+            "SELECT last_error,verify_result,verify_failure_history FROM exec_plans "
+            "WHERE repo='repo' AND plan_id='G-047'"
+        ).fetchone()
+        project = connection.execute(
+            "SELECT last_error,verify_result FROM projects WHERE repo='repo'"
+        ).fetchone()
+        for value in (*rows, *project):
+            self.assertNotIn(secret, str(value))
+
+    def test_verify_fingerprint_keeps_previous_raw_identity(self):
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        runtime_state.RuntimeStateRepository(connection).activate(
+            'repo', 'G-047', activation_sha='base',
+            branch='loop-manager/G-047', worktree='/state/G-047',
+        )
+        raw = 'FAILED tests/test_config.py::test_loads\npassword: same-secret'
+        expected, _ = loop_manager.validation_failure_fingerprint(
+            'verify', raw, Path('/state/G-047'),
+        )
+        first = loop_manager.transition_validation_failure(
+            connection, 'repo', Path('/state/G-047'), 'verify', raw,
+        )
+        output = loop_manager.VerifyOutput(raw)
+        decision = loop_manager.transition_validation_failure(
+            connection, 'repo', Path('/state/G-047'), 'verify', output,
+        )
+        self.assertEqual(decision.fingerprint, expected)
+        self.assertEqual(first.fingerprint, expected)
+        self.assertEqual(decision.occurrences, 2)
+        row = connection.execute(
+            "SELECT verify_failure_history,verify_result FROM exec_plans "
+            "WHERE repo='repo' AND plan_id='G-047'"
+        ).fetchone()
+        self.assertNotIn('same-secret', str(tuple(row)))
+
     def test_higher_config_limit_resumes_same_workspace_at_verify(self):
         connection = runtime_connection()
         self.addCleanup(connection.close)

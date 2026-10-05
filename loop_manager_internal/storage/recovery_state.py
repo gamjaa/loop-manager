@@ -7,6 +7,8 @@ import json
 import sqlite3
 import uuid
 
+from loop_manager_internal.execution.validation_feedback import redact_secrets
+
 from loop_manager_internal.recovery.recovery_runtime import (
     RecoveryAction, RecoveryDecision, RecoveryObservation, RecoveryReason, decide,
 )
@@ -179,7 +181,7 @@ def pending_review_correction(
     ).fetchone()
     if (row is None or row["stage"] != "review"
             or row["classification"] not in {"failure", "legacy_failure"}
-            or row["raw_output"] != review_result):
+            or row["raw_output"] != redact_secrets(review_result)):
         return None
     return int(row["id"])
 

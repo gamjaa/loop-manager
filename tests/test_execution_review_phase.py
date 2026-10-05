@@ -493,6 +493,31 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
             "SELECT classification FROM validation_results ORDER BY id"
         ).fetchall()[0][0], 'failure')
 
+    def test_review_failure_redacts_transition_and_operation_output(self):
+        secret = 'review-handler-secret'
+        review = (
+            'ISSUE_ID: app.py::config::secret\n'
+            f'password: {secret}\nVERDICT: FAIL'
+        )
+        self.effects.validation.parse_reviewer_result.side_effect = lm.parse_reviewer_result
+        self.effects.validation.transition_validation_failure.return_value = SimpleNamespace(
+            blocked=False, fingerprint='failure',
+        )
+        self.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: lm.AgentResult(
+            0, review, session_id='review-session',
+        )
+
+        self.handler.review(self.review_context())
+
+        self.assertNotIn(
+            secret,
+            self.effects.validation.transition_validation_failure.call_args.args[3],
+        )
+        self.assertTrue(all(
+            secret not in str(call.args)
+            for call in self.effects.events.operation_print.call_args_list
+        ))
+
 
     def test_review_retry_audits_each_returned_attempt(self):
         self._with_feedback(ValidationFeedbackRepository(self.connection))

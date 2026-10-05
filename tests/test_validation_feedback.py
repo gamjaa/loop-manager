@@ -1,10 +1,14 @@
 import re
+import sqlite3
 import unittest
 
 import loop_manager as lm
 from loop_manager_internal.execution.validation_feedback import (MAX_DIAGNOSTIC, format_verify_failure,
                                  is_validation_error, normalize_feedback,
                                  redact_secrets, render_delta)
+from loop_manager_internal.storage.validation_feedback_state import (
+    ValidationFeedbackRepository, ensure_schema,
+)
 
 
 class ValidationFeedbackTests(unittest.TestCase):
@@ -201,6 +205,58 @@ class ValidationFeedbackTests(unittest.TestCase):
         self.assertNotIn("secret-bearer", item.diagnostic)
         self.assertIn("Fix assertion", item.diagnostic)
         self.assertNotIn("private-value", redact_secrets(raw))
+
+    def test_json_credentials_are_redacted_before_feedback_persistence(self):
+        secret = "json-secret-first\njson-secret-second"
+        raw = (
+            'FAILED tests/test_config.py::test_loads\\n'
+            f'{{"password": "{secret}", "api_key": "repeat-secret"}}\\n'
+            'AssertionError: configuration rejected'
+        )
+        feedback, = normalize_feedback("verify", raw, (("digest", "normalized"),))
+        self.assertNotIn("json-secret-first", feedback.diagnostic)
+        self.assertNotIn("json-secret-second", feedback.diagnostic)
+        self.assertNotIn("repeat-secret", feedback.diagnostic)
+        self.assertIn("configuration rejected", feedback.diagnostic)
+
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        ensure_schema(connection)
+        repository = ValidationFeedbackRepository(connection)
+        repository.observe("repo", "G-146", None, "verify", False, raw, (feedback,))
+        persisted = connection.execute(
+            "SELECT raw_output FROM validation_results"
+        ).fetchone()[0]
+        self.assertNotIn("json-secret-first", persisted)
+        self.assertNotIn("json-secret-second", persisted)
+        self.assertNotIn("repeat-secret", persisted)
+
+    def test_unterminated_quoted_credential_does_not_leave_a_multiline_tail(self):
+        secret = "json-secret-first\njson-secret-second"
+        raw = f'FAILED tests/test_config.py::test_loads\n{{"password": "{secret}'
+        redacted = redact_secrets(raw)
+
+        self.assertIn('"password": <REDACTED>', redacted)
+        self.assertNotIn("json-secret-first", redacted)
+        self.assertNotIn("json-secret-second", redacted)
+        output = lm.VerifyOutput(raw)
+        self.assertEqual(str(output), redacted)
+        self.assertEqual(output.fingerprint_source, raw)
+
+    def test_escaped_newline_in_unterminated_credential_masks_remaining_value(self):
+        raw = 'password: "first-secret\\\nsecond-secret trailing context'
+        redacted = redact_secrets(raw)
+        self.assertEqual(redacted, 'password: <REDACTED>')
+
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        ensure_schema(connection)
+        repository = ValidationFeedbackRepository(connection)
+        repository.observe("repo", "G-146", None, "verify", False, raw)
+        persisted = connection.execute(
+            "SELECT raw_output FROM validation_results"
+        ).fetchone()[0]
+        self.assertEqual(persisted, redacted)
 
     def test_worker_recovery_prompt_redacts_previous_result_and_error(self):
         prompt = lm.worker_prompt(

@@ -8,7 +8,7 @@ import sys
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, RecoveryFailure, classify_exception
 from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind, LatestBaseCheckpoint
-from loop_manager_internal.execution.validation_feedback import normalize_feedback
+from loop_manager_internal.execution.validation_feedback import normalize_feedback, redact_secrets
 from loop_manager_internal.execution.worker_outcome import WorkerOutcomeError
 
 from loop_manager_internal.execution.execution_effects import ExecutionContract, FeedbackEffects
@@ -80,12 +80,14 @@ class VerifyHandler:
             )
             self.ports.operation_print(detail, file=sys.stderr)
             return (self.ports._final(detail), detail)
+        raw_output = redact_secrets(str(getattr(output, 'fingerprint_source', output)))
+        if not hasattr(output, 'fingerprint_source'):
+            output = raw_output
         feedback_repo = self.ports.feedback.repository if self.ports.feedback else None
         if feedback_repo is not None:
             fingerprints = () if passed else self.ports.feedback.fingerprints(
                 'verify', output, context.worktree,
             )
-            raw_output = getattr(output, 'fingerprint_source', str(output))
             feedback_items = () if passed else normalize_feedback(
                 'verify', raw_output, fingerprints,
                 exit_code=getattr(output, 'exit_code', None),
@@ -318,4 +320,3 @@ class VerifyHandler:
             return self.ports._final(no_change_error)
         self.ports.state.update_project(self.ports.identity.repo, phase='REVIEWING', last_error=None)
         return self.ports._advanced()
-

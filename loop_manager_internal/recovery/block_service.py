@@ -302,6 +302,7 @@ class TransitionValidationFailureEffects:
     active_execplan: Callable[..., object]
     capture_git_snapshot: Callable[..., object]
     evaluate_review_worker_level: Callable[..., object]
+    redact_secrets: Callable[..., object]
     validation_failure_fingerprints: Callable[..., object]
 
 
@@ -326,6 +327,7 @@ def transition_validation_failure(
     if plan is None:
         raise RuntimeError("검증 실패를 기록할 활성 ExecPlan을 찾을 수 없습니다.")
     failures = effects.validation_failure_fingerprints(stage, output, worktree)
+    redacted = effects.redact_secrets(str(output))
     history = effects._deserialize_failure_history(plan[history_column])
     recorded_failures = []
     for fingerprint, normalized in failures:
@@ -333,7 +335,7 @@ def transition_validation_failure(
         occurrences = int(previous["occurrences"]) + 1
         history[fingerprint] = {
             "occurrences": occurrences,
-            "sample": normalized[-2000:],
+            "sample": effects.redact_secrets(normalized)[-2000:],
         }
         recorded_failures.append((fingerprint, normalized, occurrences))
     blocking_failure = next(
@@ -373,7 +375,7 @@ def transition_validation_failure(
         error = (
             f"{labels[stage]} 동일 실패가 Worker 수정 후 "
             f"{MAX_VALIDATION_FINGERPRINT_REPEATS}회 다시 발생했습니다.\n"
-            f"실패 지문: {fingerprint}\n{output[-8000:]}"
+            f"실패 지문: {fingerprint}\n{redacted[-8000:]}"
         )
         blocked_input, blocked_worktree_input = (
             effects._blocked_validation_input_fingerprints(
@@ -391,11 +393,11 @@ def transition_validation_failure(
             )
             if blocked_revision:
                 blocked_review_input = effects._revision_review_issue_fingerprint(
-                    Path(repo), blocked_revision, output
+                Path(repo), blocked_revision, redacted
                 )
     else:
         prefix = "전체 검증 실패" if stage == "verify" else "Review 실패"
-        error = f"{prefix}:\n{output[-8000:]}"
+        error = f"{prefix}:\n{redacted[-8000:]}"
         blocked_input = None
         blocked_worktree_input = None
         blocked_review_input = None
@@ -412,11 +414,11 @@ def transition_validation_failure(
         "last_error": error,
     }
     if stage == "verify":
-        plan_values["verify_result"] = output
-        project_values["verify_result"] = output
+        plan_values["verify_result"] = redacted
+        project_values["verify_result"] = redacted
     else:
-        plan_values["review_result"] = output
-        project_values["review_result"] = output
+        plan_values["review_result"] = redacted
+        project_values["review_result"] = redacted
         if level_decision is not None:
             plan_values["effective_worker_level"] = level_decision.effective_level
             plan_values["review_level_history"] = serialized_level_history

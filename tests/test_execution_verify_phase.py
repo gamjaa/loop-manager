@@ -43,6 +43,28 @@ class ExecutionVerifyPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         self.assertEqual(first, second)
         self.effects.validation.transition_validation_failure.assert_called_once()
 
+    def test_verify_failure_redacts_transition_and_operation_output(self):
+        secret = 'verify-handler-secret'
+        self.effects.validation.verify.side_effect = None
+        self.effects.validation.verify.return_value = (
+            False, f'FAILED tests/test_config.py::test_loads\npassword: {secret}',
+        )
+        self.effects.validation.transition_validation_failure.return_value = SimpleNamespace(
+            blocked=False, fingerprint='failure',
+        )
+
+        _outcome, output = self.handler._verify_once(self.context('VERIFYING'))
+
+        self.assertNotIn(secret, output)
+        self.assertNotIn(
+            secret,
+            self.effects.validation.transition_validation_failure.call_args.args[3],
+        )
+        self.assertTrue(all(
+            secret not in str(call.args)
+            for call in self.effects.events.operation_print.call_args_list
+        ))
+
 
     def test_unconfirmed_verify_termination_blocks_project(self):
         self.effects.validation.verify.side_effect = lm.VerifyTerminationUncertain(
