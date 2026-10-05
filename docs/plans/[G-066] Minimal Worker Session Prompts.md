@@ -21,6 +21,7 @@ depends_on:
   - G-144
   - G-145
   - G-146
+  - G-147
 complexity: high
 risk: medium
 priority: low
@@ -40,18 +41,21 @@ priority: low
 
 ## Implementation
 
-- `loop_manager_internal/agents/agent_prompts.py`의 `worker_prompt`를 새 세션 초기 문맥과 기존 세션 delta로 분리하고, G-058의 공통 품질 지침은 초기 문맥에만 포함한다. CLI별 프로젝트 지침 자동 로딩 가능 여부를 기존 Agent 호출 경계에서 결정한다.
-- `loop_manager_internal/execution/execution_worker_handler.py`와 `loop_manager_internal/execution/worker_session.py`의 실제 session decision을 기준으로 archive 후보·guidance 결정·비검증 오류의 변경을 비교한다. 필요한 최소 per-session 전달 cursor를 SQLite에 보존하고 Agent가 새 문맥을 수용한 뒤 전진시켜 중단 시 재전송 가능하게 한다. verify·Review 피드백은 기존 `loop_manager_internal/storage/validation_feedback_state.py` cursor를 재사용한다.
-- 세션 교체 시 저장된 상태에서 미완료 요점만 구성하고 이전 `worker_result`·검증 원문은 prompt에서 제거한다. G-065의 집중된 verify 진단만 미해결 피드백으로 연결한다.
+- `loop_manager_internal/agents/agent_prompts.py`의 `worker_prompt`는 세션 초기·복구 문맥과 기존 세션 delta의 표현을 맡는다. G-147이 공통 호출 경계에 보존한 지침 버전을 재사용하고 G-058의 품질 지침을 사용자 메시지에 중복하지 않는다. 프로젝트 지침 자동 로딩 여부는 기존 provider 호출 경계에서 확인하며, 불가능한 환경에서만 새 세션에 한 번 확인을 요청한다.
+- `loop_manager_internal/execution/execution_worker_handler.py`의 호출별 prompt 구성은 `worker_session.py`의 `SessionDecision`·`SessionTransition`과 실제 retry·fallback의 session identity를 사용한다. 같은 resolved provider·Model의 effort 변경은 재개이고 provider·Model 교체, legacy 미결합 세션과 session-unavailable fallback은 최소 문맥 복구다. `agents/agent_invocation.py`의 retry와 `agents/invocation_service.py`의 실제 호출 기록·격리 책임을 중복 구현하지 않는다.
+- archive 후보·승인 guidance·비검증 오류는 현재 준비 snapshot과 승인·오류 상태에서 필요한 내용의 변경만 비교한다. 기존 `storage/validation_feedback_state.py`의 `prepare`·`bind_session`·`delivered`와 `execution/validation_feedback.py`의 `render_delta`·`is_validation_error`를 재사용하고, 나머지 전달 상태만 기존 storage·transaction 경계에 최소한으로 추가한다. 호출 전 전달할 revision을 고정하고 실제 session에 결합하며, 기존 범위·guidance·Worker 결과 검증을 통과한 전달만 확인한다. session 시작 관측만으로 cursor를 전진시키지 않고 중단·실패·저장 실패에는 미확인 내용을 보존해 재전송한다. 호출 이후 새로 생긴 정보까지 확인 처리하지 않는다.
+- 교체 세션에는 저장 상태의 미완료 요점과 G-065의 미해결 진단만 구성하고 이전 `worker_result`·검증 원문은 넣지 않는다. 정적 코드 조회 안내의 초기 전달과 현재 rebase 후보·ExecPlan 변경에 필요한 재확인 지시는 기존 경계에 연결한다. 축약을 후보 검증 성공 재사용으로 취급하지 않으며 Requirement 완료 판단·이동은 현재 Planner·Manager 경계를 유지한다. archive 후보 변경 전달을 이유로 Worker의 Requirement 이동을 다시 요구하지 않는다.
 
 ## Validation
 
-- Worker는 `tests/test_execution_worker_phase.py`의 prompt·fallback 사례, `tests/test_worker_session.py`의 session decision 사례와 `tests/test_validation_feedback.py`의 feedback·비밀값 가림 사례 중 수정한 경계의 최소 targeted unit test만 실행한다. 결과 protocol 변경이 필요한 경우 `tests/test_worker_result_contract.py`의 직접 관련 사례만 추가한다.
-- 최초 turn, 동일 세션 일반 수정·effort 변경·verify·Review 교정, archive·guidance·비검증 오류 변경과 중복 없음, provider·Model 변경·session-unavailable fallback, 전송 중단·재시작 및 자동 지침 로딩 유무를 검증한다.
-- 전체 verify는 Agent 범위·guidance 승인, Worker 결과 검증, feedback cursor와 CLI session 복구가 유지되는지 확인한다.
+- Worker는 `tests/test_execution_worker_phase.py`의 prompt·fallback, `tests/test_worker_session.py`의 전이 및 `tests/test_validation_feedback_state.py`의 전달 확인·재개 중 변경한 경계의 최소 targeted unit case만 실행한다. `tests/support/execution.py`의 기존 fixture·Agent double을 재사용한다. 기존 재개 prompt의 역할 반복과 복구 prompt의 이전 결과 포함을 요구하는 assertion은 이 계획의 초기 전달·delta·최소 복구 계약에 맞춰 갱신한다.
+- 최초 turn, 같은 세션의 일반 수정·effort 변경·verify·Review 교정, archive·guidance·비검증 오류 변경 및 두 채널 중복 방지, resolved provider·Model 교체·legacy 복구·session-unavailable fallback을 검증한다. 자동 지침 로딩 유무와 G-147의 고정 공통 버전 재사용도 확인하며 실제 Agent를 호출하지 않는다.
+- session 시작 직후 timeout, 잘못된 Worker 결과, fallback 시작 실패, 전달 확인 전후 중단·재시작·저장 실패와 호출 뒤 새 revision 발생에서 미확인 내용이 누락되지 않고 확인된 동일 내용을 반복하지 않는지 검증한다. 비밀값 가림과 승인 문맥은 `tests/test_validation_feedback.py`·`tests/test_execution_guidance.py`, 결과 형식은 `tests/test_worker_result_contract.py`의 직접 관련 case를 변경 시 연결한다.
+- 전체 verify는 Agent 범위·guidance 사전 승인, Worker 결과·사용자 결정 protocol, 피드백 audit·cursor, 실제 호출·session 복구와 rebase 후보 재확인 회귀를 유지한다. 기존 unittest manifest 수집·Agent 호출 차단을 사용하며 전체 verify와 Reviewer의 책임은 `docs/PLANS.md`를 따른다.
 
 ## Progress
 
+- [x] 2026-10-05 지정 READY snapshot의 목표·범위와 최신 prompt·session·feedback 관련 회귀 경계를 문서·원본으로 재검증함 (구현·테스트 실행 아님)
 - [ ] 초기·재개·교체 Worker prompt 경계 분리
 - [ ] 새 archive·guidance·오류 전달 cursor 연결
 - [ ] 관련 targeted 회귀 사례 추가
@@ -62,3 +66,6 @@ priority: low
 - 2026-10-02 사용자 결정: 리팩터링을 먼저 진행하므로 G-127 Merge 이후 시작한다. SQLite에서 미착수·무소유 READY임을 확인했으며 원래 목표·Acceptance Criteria와 기존 dependency는 유지한다. 실행 시 G-119~G-125에서 정리된 prompt·session·handler와 테스트의 최신 경로를 확인한다.
 
 - 2026-10-03 사용자 요청에 따른 대기 계획 전체 점검: R-033과 현재 PRODUCT/R-050에 목표 충돌이 없음을 확인했다. G-119~G-129 이후의 실제 prompt·Worker handler·session·feedback 및 테스트 경로로 갱신했다. 직접 Codex 실행과 신규·재개·fallback의 역할별 내장 sandbox 정책은 prompt 축약과 독립적으로 유지한다. SQLite와 실행 상태는 수정하지 않는다.
+
+- 2026-10-05 post-refactor revalidation: source revision `c203b1437537b868862a104e668586d392c5ad0a`의 `agents/agent_prompts.py:165`, `execution/execution_worker_handler.py:239`·`:334`·`:545`, `execution/worker_session.py:65`, `storage/validation_feedback_state.py:211`를 `loop_manager_internal/` 아래 원본과 관련 테스트로 대조했다. 세션 전이·검증 피드백 cursor는 이미 분리돼 있으므로 재사용하고 나머지 전달 상태만 확장한다. ID·경로·title·sources·complexity·risk·priority·Purpose·Acceptance Criteria와 기존 dependency는 보존한다.
+- G-147의 공통 지침 주입·버전 보존을 먼저 Merge하도록 dependency를 추가했다. 공통 규칙의 별도 주입과 사용자 turn의 축약을 연결하기 위한 순서이며 G-147의 구현·등록·배포 범위를 가져오지 않는다. 이전 초기 메시지 품질 지침 포함 방향은 해당 공통 버전 재사용으로 연결하고, R-033의 반복 방지·최소 복구·승인·권한·검증 목표는 유지한다. Requirement retirement, 공통 verify 규약과 후보 성공 재사용은 별도 책임으로 남기며 이번 재검증은 실행 상태나 성공 증거를 만들지 않는다.
