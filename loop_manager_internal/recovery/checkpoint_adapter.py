@@ -2,7 +2,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from loop_manager_internal.agents import agent_scope_decision
 from loop_manager_internal.agents.agent_scope_decision import _non_default_index_flags
 from loop_manager_internal.agents.agent_scope_decision import _same_local_snapshot
 from loop_manager_internal.agents.agent_scope_decision import _worker_path_allowed
@@ -36,6 +37,7 @@ class PushDiagnosticCheckpointEffects:
 @dataclass(frozen=True)
 class CheckpointSafetyEffects:
     """Read-only ownership, path scope and current evidence gates."""
+    _agent_git_resources: Callable[..., object]
     _guidance_document: Callable[..., object]
     _guidance_document_matches_rows: Callable[..., object]
     _guidance_rows: Callable[..., object]
@@ -345,11 +347,15 @@ class CheckpointSafetyAdapter:
             self.safety_effects._guidance_document_matches_rows(document, rows, require_decisions=False)
             before = GitSnapshot.deserialize(str(plan["agent_snapshot"]))
             result = GitSnapshot.deserialize(str(plan["agent_result_snapshot"]))
+            project = self.connection.execute(
+                'SELECT base_branch FROM projects WHERE repo = ?', (request.repo,)).fetchone()
             self.safety_effects.validate_agent_scope(
                 "worker", worktree, before, result,
                 selected_plan_path=str(plan["path"]),
                 allowed_guidance_targets=self._approved_guidance_targets(request),
                 allow_common_plans=self.safety_effects._published_plan_allows_common_plans(self.repo_path, plan),
+                external_worktree=self.repo_path, base_branch=project['base_branch'],
+                connection=self.connection,
             )
             if _same_local_snapshot(result, current):
                 return True
@@ -428,6 +434,10 @@ class CheckpointSafetyAdapter:
             before = GitSnapshot.deserialize(str(serialized))
             if not before.shared_metadata_complete:
                 raise ValueError("persisted shared metadata가 없습니다.")
+            resources = self.safety_effects._agent_git_resources(
+                self.connection, self.repo_path, Path(request.worktree), before,
+                str(plan['agent_role'] or ''), selected_plan_path=str(plan['path']))
+            before, current = agent_scope_decision.scoped_metadata(before, current, resources)
         except (ValueError, TypeError, KeyError, RuntimeError) as error:
             return reject("workspace_ownership_uncertain", str(error))
         if before.config != current.config:
@@ -497,7 +507,14 @@ class CheckpointPublicationAdapter:
     ) -> None:
         if request.reason_code != GUIDANCE_BLOCK_REASON:
             return
-        snapshot = self.publication_effects.capture_git_snapshot(Path(str(request.worktree))).serialize()
+        previous = self.connection.execute(
+            'SELECT agent_snapshot FROM exec_plans WHERE repo = ? AND plan_id = ?',
+            (request.repo, request.plan_id)).fetchone()
+        before = GitSnapshot.deserialize(previous['agent_snapshot']) if previous and previous['agent_snapshot'] else None
+        current = self.publication_effects.capture_git_snapshot(Path(str(request.worktree)))
+        # Manager commit은 같은 호출의 기준선만 전진시킨다. 격리 증거를 새로 만들지 않는다.
+        snapshot = replace(current, scope_id=before.scope_id if before else None,
+                           scope_start_digest=before.scope_start_digest if before else None).serialize()
         with self.connection:
             self.connection.execute(
                 "UPDATE exec_plans SET agent_snapshot = ?, agent_result_snapshot = ? "

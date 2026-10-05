@@ -675,6 +675,7 @@ _archive_git_effects = _bind_effects(
 
 _checkpoint_safety_effects = _bind_effects(
     git_adapter._checkpoint_safety_effects, lambda: git_adapter.CheckpointSafetyEffectsEffects(
+        _agent_git_resources=lambda *args, **kwargs: _agent_git_resources(*args, **kwargs),
         _current_rebase_service=lambda *args, **kwargs: _current_rebase_service(*args, **kwargs),
         _guidance_document=lambda *args, **kwargs: _guidance_document(*args, **kwargs),
         _guidance_document_matches_rows=lambda *args, **kwargs: _guidance_document_matches_rows(*args, **kwargs),
@@ -3295,6 +3296,7 @@ synchronize_waiting_pull_requests = _bind_effects(
 
 _reconcile_guidance_double_block = _bind_effects(
     project_block_service._reconcile_guidance_double_block, lambda: project_block_service.ReconcileGuidanceDoubleBlockEffects(
+        _agent_git_resources=lambda *args, **kwargs: _agent_git_resources(*args, **kwargs),
         _canonical_path=lambda *args, **kwargs: _canonical_path(*args, **kwargs),
         _guidance_checkpoint_commit_evidence=lambda *args, **kwargs: _guidance_checkpoint_commit_evidence(*args, **kwargs),
         _guidance_document=lambda *args, **kwargs: _guidance_document(*args, **kwargs),
