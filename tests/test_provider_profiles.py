@@ -8,14 +8,28 @@ import loop_manager
 
 
 class ProviderProfilesTest(unittest.TestCase):
+    def profile_config(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        config = Path(directory.name) / "config.ini"
+        config.write_text(
+            "[codex.models]\n"
+            "fast = test-fast\nbalanced = test-balanced\nstrong = test-strong\n"
+            "[codex.roles]\nplanner = strong,xhigh\n"
+            "[codex.worker]\n"
+            "level1 = fast,medium\nlevel4 = balanced,high\nlevel7 = strong,xhigh\n",
+            encoding="utf-8",
+        )
+        return config
+
     def test_role_resolves_model_alias(self):
-        config = loop_manager.ROOT / "config/config.ini.example"
+        config = self.profile_config()
 
         with mock.patch(
             "loop_manager.codex_model_efforts",
-            return_value={"gpt-5.6-sol": frozenset({"xhigh"})},
+            return_value={"test-strong": frozenset({"xhigh"})},
         ):
-            self.assertEqual(loop_manager.role(config, "planner"), ("gpt-5.6-sol", "xhigh"))
+            self.assertEqual(loop_manager.role(config, "planner"), ("test-strong", "xhigh"))
 
     def test_worker_level_boundaries_and_cap(self):
         cases = [
@@ -39,20 +53,20 @@ class ProviderProfilesTest(unittest.TestCase):
                 self.assertEqual(loop_manager.worker_level(plan), expected)
 
     def test_worker_profile_resolves_level_alias(self):
-        config = loop_manager.ROOT / "config/config.ini.example"
+        config = self.profile_config()
 
         model_efforts = {
-            "gpt-5.6-luna": frozenset({"medium"}),
-            "gpt-5.6-terra": frozenset({"high"}),
-            "gpt-5.6-sol": frozenset({"xhigh"}),
+            "test-fast": frozenset({"medium"}),
+            "test-balanced": frozenset({"high"}),
+            "test-strong": frozenset({"xhigh"}),
         }
         with mock.patch("loop_manager.codex_model_efforts", return_value=model_efforts):
-            self.assertEqual(loop_manager.worker_profile(config, 1), ("gpt-5.6-luna", "medium"))
-            self.assertEqual(loop_manager.worker_profile(config, 4), ("gpt-5.6-terra", "high"))
-            self.assertEqual(loop_manager.worker_profile(config, 7), ("gpt-5.6-sol", "xhigh"))
+            self.assertEqual(loop_manager.worker_profile(config, 1), ("test-fast", "medium"))
+            self.assertEqual(loop_manager.worker_profile(config, 4), ("test-balanced", "high"))
+            self.assertEqual(loop_manager.worker_profile(config, 7), ("test-strong", "xhigh"))
 
     def test_worker_profile_rejects_invalid_level(self):
-        config = loop_manager.ROOT / "config/config.ini.example"
+        config = self.profile_config()
 
         for level in (0, 9, True):
             with self.subTest(level=level):
@@ -160,7 +174,7 @@ class ProviderProfilesTest(unittest.TestCase):
         self.assertEqual(command.call_args.kwargs["cwd"], worktree)
 
     def test_run_codex_validates_profile_in_worker_catalog(self):
-        config = loop_manager.ROOT / "config/config.ini.example"
+        config = self.profile_config()
         with tempfile.TemporaryDirectory() as directory:
             worktree = Path(directory) / "worktree"
             worktree.mkdir()
@@ -168,7 +182,7 @@ class ProviderProfilesTest(unittest.TestCase):
             completed = subprocess.CompletedProcess([], 0)
             with mock.patch(
                 "loop_manager.codex_model_efforts",
-                return_value={"gpt-5.6-terra": frozenset({"high"})},
+                return_value={"test-balanced": frozenset({"high"})},
             ) as model_efforts, mock.patch(
                 "loop_manager.subprocess.run", return_value=completed
             ):
@@ -218,7 +232,7 @@ class ProviderProfilesTest(unittest.TestCase):
                             loop_manager.worker_profile(config, level)
 
     def test_worker_codex_uses_level_model_and_effort(self):
-        config = loop_manager.ROOT / "config/config.ini.example"
+        config = self.profile_config()
         with tempfile.TemporaryDirectory() as directory:
             worktree = Path(directory) / "worktree"
             worktree.mkdir()
@@ -226,7 +240,7 @@ class ProviderProfilesTest(unittest.TestCase):
             completed = subprocess.CompletedProcess([], 0)
             with mock.patch(
                 "loop_manager.codex_model_efforts",
-                return_value={"gpt-5.6-terra": frozenset({"high"})},
+                return_value={"test-balanced": frozenset({"high"})},
             ), mock.patch("loop_manager.subprocess.run", return_value=completed) as run:
                 code, message = loop_manager.run_codex(
                     worktree,
@@ -240,7 +254,7 @@ class ProviderProfilesTest(unittest.TestCase):
 
         self.assertEqual((code, message), (0, ""))
         arguments = run.call_args.args[0]
-        self.assertEqual(arguments[arguments.index("-m") + 1], "gpt-5.6-terra")
+        self.assertEqual(arguments[arguments.index("-m") + 1], "test-balanced")
         self.assertIn('model_reasoning_effort="high"', arguments)
 
     def test_unsupported_worker_effort_fails_before_codex_starts(self):

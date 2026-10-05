@@ -1,4 +1,5 @@
 from contextlib import closing
+import configparser
 import json
 import io
 import os
@@ -81,16 +82,26 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
         self.assertEqual(row["provider"], "codex")
 
     def test_codex_and_claude_profiles_validate_every_role_and_level(self):
-        config = loop_manager.ROOT / "config/config.ini.example"
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        config = Path(directory.name) / "config.ini"
+        config.write_text(
+            "[codex.models]\nstrong = test-strong\n"
+            "[codex.roles]\nplanner = strong,xhigh\nreviewer = strong,high\n"
+            "[codex.worker]\n"
+            + "".join(f"level{level} = strong,xhigh\n" for level in range(1, 9))
+            + "[claude.models]\nstrong = claude-opus-5\n"
+            "fast = claude-haiku-4-5-20251001\n"
+            "[claude.roles]\nplanner = strong,high\nreviewer = strong,high\n"
+            "[claude.worker]\nlevel1 = fast,medium\n"
+            + "".join(f"level{level} = strong,high\n" for level in range(2, 8))
+            + "level8 = strong,max\n",
+            encoding="utf-8",
+        )
         all_efforts = frozenset(
             {"low", "medium", "high", "xhigh", "max", "ultra"}
         )
-        codex_models = {
-            "gpt-6-astra": all_efforts,
-            "gpt-5.6-sol": all_efforts,
-            "gpt-5.6-terra": all_efforts,
-            "gpt-5.6-luna": all_efforts,
-        }
+        codex_models = {"test-strong": all_efforts}
 
         loop_manager.validate_provider_profiles(config, "codex", codex_models)
         supported = subprocess.CompletedProcess(
@@ -112,7 +123,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             loop_manager.provider_worker_profile(
                 config, "codex", 7, codex_models
             ),
-            ("gpt-5.6-sol", "xhigh"),
+            ("test-strong", "xhigh"),
         )
         self.assertEqual(
             loop_manager.provider_worker_profile(
@@ -131,6 +142,22 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             ),
             ("claude-opus-5", "high"),
         )
+
+    def test_example_profiles_validate_every_role_and_level(self):
+        config = loop_manager.ROOT / "config/config.ini.example"
+        parser = configparser.ConfigParser()
+        self.assertEqual(parser.read(config, encoding="utf-8"), [str(config)])
+        # 이 테스트는 예제 설정의 내부 일관성을 검사하며 실제 CLI 지원 여부는 검사하지 않는다.
+        for provider, efforts in (
+            ("codex", frozenset({"low", "medium", "high", "xhigh", "max", "ultra"})),
+            ("claude", loop_manager.CLAUDE_EFFORTS),
+        ):
+            with self.subTest(provider=provider):
+                catalog = {
+                    model.strip(): efforts
+                    for model in parser[f"{provider}.models"].values()
+                }
+                loop_manager.validate_provider_profiles(config, provider, catalog)
 
     def test_invalid_claude_profile_stops_before_cli_process(self):
         with tempfile.TemporaryDirectory() as directory:
