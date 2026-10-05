@@ -1057,6 +1057,8 @@ def record_current_rebase_result(state_dir, *, repo, target, owner, decision, ob
     if (intent.get('repo') != repo or intent.get('target') != target
             or intent.get('owner') != owner or not intent.get('id')):
         return False
+    # 기록 대상이 확인된 뒤에만 비용이 큰 현재 Git 상태를 수집한다.
+    observed = observed() if callable(observed) else observed
     # A result sealed by an older policy is audit data. Do not rewrite it.
     result_path = slot / f"{intent['id']}.result.json"
     if result_path.exists():

@@ -67,8 +67,10 @@ def git(effects: GitEffects,
 
 
 def git_bytes(effects: GitBytesEffects, repo: Path, *arguments: str) -> bytes:
+    # 관측용 diff의 stat 갱신은 복원한 index를 변경하므로 명시적으로 끈다.
+    options = ('-c', 'diff.autoRefreshIndex=false') if arguments[:1] == ('diff',) else ()
     result = effects._handoff_run(
-        ["git", "-C", str(repo), *arguments],
+        ["git", "-C", str(repo), *options, *arguments],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )

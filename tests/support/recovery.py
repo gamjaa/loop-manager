@@ -1,4 +1,5 @@
 import json
+from contextlib import nullcontext
 import sqlite3
 from pathlib import Path
 from unittest import mock
@@ -94,8 +95,21 @@ class BoundedRecoveryFixture:
         review_messages: tuple[str, ...],
         *,
         publish: bool,
+        boundary=None,
     ) -> dict[str, object]:
-        repo, state_dir, connection = self._active_worker_project(directory)
+        if boundary is not None and boundary.saved:
+            repo, state_dir, connection = boundary.review_state
+            boundary.restore(connection)
+        else:
+            repo, state_dir, connection = self._active_worker_project(directory)
+        from loop_manager_internal.execution.execution_handlers import ExecutionHandlers
+        review_entry = ExecutionHandlers.review
+
+        def save_review_entry(handler, context):
+            if not boundary.saved:
+                boundary.review_state = repo, state_dir, connection
+                boundary.save(connection)
+            return review_entry(handler, context)
         roles = []
         reviewer_sessions = []
         reviewer_prompts = []
@@ -144,7 +158,8 @@ class BoundedRecoveryFixture:
                 return {"url": "https://example.test/pr/13"}
             return None
 
-        with mock.patch(
+        with (mock.patch.object(ExecutionHandlers, 'review', save_review_entry)
+              if boundary is not None else nullcontext()), mock.patch(
             "loop_manager.validate_repository", return_value=repo
         ), mock.patch(
             "loop_manager.remote_base", return_value="main"

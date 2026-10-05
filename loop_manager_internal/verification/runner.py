@@ -16,6 +16,7 @@ import uuid
 
 from loop_manager_internal.verification.coordination import CoordinatorClient, VerifyCoordinator
 from loop_manager_internal.verification.guard import MARKER, install_guard, worker_environment
+from loop_manager_internal.verification.git_timing import git_command_timing
 from loop_manager_internal.verification.manifest import Module, discover, load_module, test_cases, validate_report
 from loop_manager_internal.verification.resources import DEFAULT_WORKER_BYTES, ResourceSampler, parse_parallelism, process_memory
 from loop_manager_internal.verification.timing import EventWriter, TimedResult, atomic_json, comparison, diagnostic, fixture_timing, phase, summarize
@@ -42,7 +43,7 @@ def worker_main():
                     suite = load_module(module)
                     owners = {test.id(): (test.__class__.__module__,
                               f"{test.__class__.__module__}.{test.__class__.__qualname__}") for test in test_cases(suite)}
-                with writer.activate(), phase(f"module:{module.name}"), fixture_timing():
+                with writer.activate(), phase(f"module:{module.name}"), fixture_timing(), git_command_timing():
                     result = unittest.TextTestRunner(
                         resultclass=lambda *args, **kwargs: TimedResult(*args, writer=writer, **kwargs),
                         stream=sys.stderr,

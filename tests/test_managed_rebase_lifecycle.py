@@ -4,6 +4,7 @@ Git, journal, stage validation, correction turns, checkpoint recovery and phase
 handlers are real. Agent CLI and catalog services use deterministic fixtures.
 """
 from tests.support.execution import execution_fixture
+from tests.support.recovery_boundary import RecoveryBoundary
 
 from contextlib import nullcontext
 from dataclasses import replace
@@ -156,28 +157,16 @@ class RebaseObservationFailureTests(unittest.TestCase):
 @unittest.skipIf(os.name == "nt", "Linux mode-bit and bash verification fixture")
 class ManagedRebaseLifecycleTests(unittest.TestCase):
     def test_checkpoint_multiconflict_skip_restart_verify_review(self):
-        self._lifecycle(with_pr=False)
+        self._lifecycle(with_pr=False, sealed_restart=(False, True))
 
     def test_pr_multiconflict_skip_restart_verify_review(self):
-        self._lifecycle(with_pr=True)
-
-    def test_checkpoint_restart_after_journal_seal_before_sqlite(self):
-        self._lifecycle(with_pr=False, sealed_restart=True)
-
-    def test_pr_restart_after_journal_seal_before_sqlite(self):
-        self._lifecycle(with_pr=True, sealed_restart=True)
+        self._lifecycle(with_pr=True, sealed_restart=(False, True))
 
     def test_legacy_same_file_replay_restart_before_journal_seal(self):
-        self._lifecycle(with_pr=True, legacy=True)
-
-    def test_legacy_same_file_replay_restart_after_journal_seal(self):
-        self._lifecycle(with_pr=True, legacy=True, sealed_restart=True)
+        self._lifecycle(with_pr=True, legacy=True, sealed_restart=(False, True))
 
     def test_legacy_checkpoint_restart_before_journal_seal(self):
-        self._lifecycle(with_pr=False, legacy=True)
-
-    def test_legacy_checkpoint_restart_after_journal_seal(self):
-        self._lifecycle(with_pr=False, legacy=True, sealed_restart=True)
+        self._lifecycle(with_pr=False, legacy=True, sealed_restart=(False, True))
 
     def test_manual_checkpoint_completion_without_journal_reconfirms_candidate(self):
         self._lifecycle(with_pr=False, manual=True, missing_journal=True)
@@ -219,8 +208,8 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
         # substituted Manager rebase methods or its substituted journal writer.
         real_begin = journal.begin_rebase
         fixture = execution_fixture(self)
-        with TemporaryDirectory() as directory, mock.patch.object(journal, 'begin_rebase', real_begin):
-            root = Path(directory)
+        with RecoveryBoundary() as boundary, mock.patch.object(journal, 'begin_rebase', real_begin):
+            root = Path(boundary.directory)
             repo, remote, state_dir = root / 'repo', root / 'remote.git', root / 'state'
             state_dir.mkdir()
             repo_key = str(repo.resolve())
@@ -473,231 +462,245 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 self.assertNotIsInstance(conflict_context, ExecutionOutcome)
                 self.assertTrue(conflict_context.resolving_rebase)
             self.assertEqual(events, [])
-            if manual:
-                while lm._rebase_in_progress_for_branch(worktree, branch):
-                    source = git(worktree, 'rev-parse', 'REBASE_HEAD').stdout.strip()
-                    resolutions.append(source)
-                    conflicts = git(worktree, 'diff', '--name-only', '--diff-filter=U').stdout.splitlines()
-                    if 'app.txt' in conflicts:
-                        resolved = upstream.copy()
-                        resolved[0] = 'value=resolved\n'
-                        (worktree / 'app.txt').write_text(''.join(resolved))
-                        git(worktree, 'add', '--', 'app.txt')
-                        git(worktree, '-c', 'core.editor=true', 'rebase', '--continue', check=False)
-                    elif 'skip.txt' in conflicts:
-                        (worktree / 'skip.txt').write_text('base\n')
-                        git(worktree, 'add', '--', 'skip.txt')
-                        git(worktree, 'rebase', '--skip', check=False)
-                    else:
-                        self.fail('unexpected manual conflict')
-                if sealed_restart:
-                    handler._finish_rebase_journal(handler._context())
-                if missing_journal:
-                    (state_dir / 'manager-git-journal').rename(state_dir / 'preserved-old-audit')
-            elif not publication_interruption:
-                if not legacy:
-                    handler.run(conflict_context)
-                    self.assertEqual(len(resolutions), 1)
-                    self.assertEqual(git(worktree, 'diff', '--name-only', '--diff-filter=U').stdout.strip(), 'skip.txt')
-                real_post = handler._post_rebase_observation
+            if not manual and not publication_interruption and not legacy:
+                handler.run(conflict_context)
+                self.assertEqual(len(resolutions), 1)
+                self.assertEqual(git(worktree, 'diff', '--name-only', '--diff-filter=U').stdout.strip(), 'skip.txt')
+            variants = sealed_restart if isinstance(sealed_restart, tuple) else (sealed_restart,)
+            if len(variants) > 1:
+                boundary.save(connection)
+            prepared_events, prepared_resolutions = events.copy(), resolutions.copy()
+            for variant, sealed_restart in enumerate(variants):
+                with self.subTest(sealed_restart=sealed_restart):
+                    if variant:
+                        connection = boundary.restore(connection)
+                        effects = replace(effects, state=ExecutionStatePort(
+                            connection, runtime_state.RuntimeStateRepository(connection), repo_key),
+                            checkpoint=ExecutionCheckpointRepository(connection))
+                        effects.workspace.git.side_effect = git
+                        events[:], resolutions[:] = prepared_events, prepared_resolutions
+                        handler = new_handler()
+                    if manual:
+                        while lm._rebase_in_progress_for_branch(worktree, branch):
+                            source = git(worktree, 'rev-parse', 'REBASE_HEAD').stdout.strip()
+                            resolutions.append(source)
+                            conflicts = git(worktree, 'diff', '--name-only', '--diff-filter=U').stdout.splitlines()
+                            if 'app.txt' in conflicts:
+                                resolved = upstream.copy()
+                                resolved[0] = 'value=resolved\n'
+                                (worktree / 'app.txt').write_text(''.join(resolved))
+                                git(worktree, 'add', '--', 'app.txt')
+                                git(worktree, '-c', 'core.editor=true', 'rebase', '--continue', check=False)
+                            elif 'skip.txt' in conflicts:
+                                (worktree / 'skip.txt').write_text('base\n')
+                                git(worktree, 'add', '--', 'skip.txt')
+                                git(worktree, 'rebase', '--skip', check=False)
+                            else:
+                                self.fail('unexpected manual conflict')
+                        if sealed_restart:
+                            handler._finish_rebase_journal(handler._context())
+                        if missing_journal:
+                            (state_dir / 'manager-git-journal').rename(state_dir / 'preserved-old-audit')
+                    elif not publication_interruption:
+                        real_post = handler._post_rebase_observation
 
-                def crash_after_git(context, target_oid, output, **kwargs):
-                    if not lm._rebase_in_progress_for_branch(worktree, branch):
-                        raise SimulatedProcessExit()
-                    return real_post(context, target_oid, output, **kwargs)
+                        def crash_after_git(context, target_oid, output, **kwargs):
+                            if not lm._rebase_in_progress_for_branch(worktree, branch):
+                                raise SimulatedProcessExit()
+                            return real_post(context, target_oid, output, **kwargs)
 
-                crash = (mock.patch.object(effects.state, 'complete_rebase', side_effect=SimulatedProcessExit)
-                         if sealed_restart else mock.patch.object(handler, '_post_rebase_observation',
-                                                                   side_effect=crash_after_git))
-                with crash:
-                    with self.assertRaises(SimulatedProcessExit):
-                        handler.run(handler._context())
-            resolution_count = 0 if publication_interruption else (1 if legacy else 2)
-            self.assertEqual(len(resolutions), resolution_count)
-            final_head = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
-            if cumulative:
-                # Recover the final currently owned result, without replaying
-                # two historical rebases or reconstructing absent receipts.
-                (repo / 'base-only.txt').write_text('second target base\n')
-                git(repo, 'add', '--', 'base-only.txt')
-                git(repo, 'commit', '-m', 'Second target before legacy recovery')
-                fixture.remote = git(repo, 'rev-parse', 'HEAD').stdout.strip()
-                git(repo, 'push', 'origin', 'main')
-                git(repo, 'fetch', 'origin')
-                git(worktree, 'rebase', fixture.remote)
-                final_head = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
-                pending = effects.checkpoint.get(repo_key, 'G-047')
-                effects.checkpoint.record(repo_key, 'G-047', expected_generation=pending.generation,
-                    operation='rebase', expected_head=original, target_base_oid=fixture.remote,
-                    observed_remote_oid=original, snapshot={'rebase_remote_oid': original})
-                connection.execute('UPDATE exec_plans SET current_revision_sha = ?', (fixture.remote,))
-            if latest_base_advanced:
-                (repo / 'docs/PRODUCT.md').write_text('# Product\n\nUpdated current input.\n')
-                git(repo, 'add', '--', 'docs/PRODUCT.md')
-                git(repo, 'commit', '-m', 'Advance inputs after completed Git rebase')
-                git(repo, 'push', 'origin', 'main')
-                fixture.remote = git(repo, 'rev-parse', 'HEAD').stdout.strip()
-                connection.execute('UPDATE exec_plans SET current_revision_sha = ?', (fixture.remote,))
-            slot = journal._slot(state_dir, str(repo.resolve()), 'managed_rebase', str(worktree.resolve()))
-            self.assertEqual((slot / 'active.json').exists(),
-                             not sealed_restart and not missing_journal and not manual
-                             and not publication_interruption)
-            sealed_before = {path.name: path.read_bytes()
-                             for path in slot.glob('*.result.json')}
-            intents_before = {path.name: path.read_bytes()
-                              for path in slot.glob('*.intent.json')}
-            if sealed_restart:
-                final_results = [journal._read(path) for path in slot.glob('*.result.json')
-                                 if journal._read(path)['observed']['metadata'] is None]
-                self.assertEqual(len(final_results), 0 if manual else 1)
-                self.assertIsNone(effects.checkpoint.get(repo_key, 'G-047').completed_rebase())
-            self.assertEqual(effects.checkpoint.get(repo_key, 'G-047').operation, 'rebase')
-            audit_row = handler.rebase_corrections.get(repo_key, 'G-047')
-            audit_before = audit_row.audit if audit_row else ()
-            handler = restart()
+                        crash = (mock.patch.object(effects.state, 'complete_rebase', side_effect=SimulatedProcessExit)
+                                 if sealed_restart else mock.patch.object(handler, '_post_rebase_observation',
+                                                                           side_effect=crash_after_git))
+                        with crash:
+                            with self.assertRaises(SimulatedProcessExit):
+                                handler.run(handler._context())
+                    resolution_count = 0 if publication_interruption else (1 if legacy else 2)
+                    self.assertEqual(len(resolutions), resolution_count)
+                    final_head = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
+                    if cumulative:
+                        # Recover the final currently owned result, without replaying
+                        # two historical rebases or reconstructing absent receipts.
+                        (repo / 'base-only.txt').write_text('second target base\n')
+                        git(repo, 'add', '--', 'base-only.txt')
+                        git(repo, 'commit', '-m', 'Second target before legacy recovery')
+                        fixture.remote = git(repo, 'rev-parse', 'HEAD').stdout.strip()
+                        git(repo, 'push', 'origin', 'main')
+                        git(repo, 'fetch', 'origin')
+                        git(worktree, 'rebase', fixture.remote)
+                        final_head = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
+                        pending = effects.checkpoint.get(repo_key, 'G-047')
+                        effects.checkpoint.record(repo_key, 'G-047', expected_generation=pending.generation,
+                            operation='rebase', expected_head=original, target_base_oid=fixture.remote,
+                            observed_remote_oid=original, snapshot={'rebase_remote_oid': original})
+                        connection.execute('UPDATE exec_plans SET current_revision_sha = ?', (fixture.remote,))
+                    if latest_base_advanced:
+                        (repo / 'docs/PRODUCT.md').write_text('# Product\n\nUpdated current input.\n')
+                        git(repo, 'add', '--', 'docs/PRODUCT.md')
+                        git(repo, 'commit', '-m', 'Advance inputs after completed Git rebase')
+                        git(repo, 'push', 'origin', 'main')
+                        fixture.remote = git(repo, 'rev-parse', 'HEAD').stdout.strip()
+                        connection.execute('UPDATE exec_plans SET current_revision_sha = ?', (fixture.remote,))
+                    slot = journal._slot(state_dir, str(repo.resolve()), 'managed_rebase', str(worktree.resolve()))
+                    self.assertEqual((slot / 'active.json').exists(),
+                                     not sealed_restart and not missing_journal and not manual
+                                     and not publication_interruption)
+                    sealed_before = {path.name: path.read_bytes()
+                                     for path in slot.glob('*.result.json')}
+                    intents_before = {path.name: path.read_bytes()
+                                      for path in slot.glob('*.intent.json')}
+                    if sealed_restart:
+                        final_results = [journal._read(path) for path in slot.glob('*.result.json')
+                                         if journal._read(path)['observed']['metadata'] is None]
+                        self.assertEqual(len(final_results), 0 if manual else 1)
+                        self.assertIsNone(effects.checkpoint.get(repo_key, 'G-047').completed_rebase())
+                    self.assertEqual(effects.checkpoint.get(repo_key, 'G-047').operation, 'rebase')
+                    audit_row = handler.rebase_corrections.get(repo_key, 'G-047')
+                    audit_before = audit_row.audit if audit_row else ()
+                    handler = restart()
 
-            def no_repeated_rebase(path, *args, **kwargs):
-                if 'rebase' in args and (not latest_base_advanced or args[-1] != fixture.remote):
-                    self.fail('restart repeated completed Git rebase')
-                if args[0] == 'push':
-                    events.append('checkpoint-push')
-                elif 'rebase' in args:
-                    events.append('next-base-rebase')
-                return git(path, *args, **kwargs)
+                    def no_repeated_rebase(path, *args, **kwargs):
+                        if 'rebase' in args and (not latest_base_advanced or args[-1] != fixture.remote):
+                            self.fail('restart repeated completed Git rebase')
+                        if args[0] == 'push':
+                            events.append('checkpoint-push')
+                        elif 'rebase' in args:
+                            events.append('next-base-rebase')
+                        return git(path, *args, **kwargs)
 
-            effects.workspace.git.side_effect = no_repeated_rebase
-            if publication_interruption:
-                # 준비한 후보의 게시는 추가 후보 작업보다 먼저 확정해야 한다.
-                publication_start = len(events)
-                attempted = []
-                def interrupted_push(path, *args, **kwargs):
-                    if args[0] == 'push':
-                        attempted.append(args)
+                    effects.workspace.git.side_effect = no_repeated_rebase
+                    if publication_interruption:
+                        # 준비한 후보의 게시는 추가 후보 작업보다 먼저 확정해야 한다.
+                        publication_start = len(events)
+                        attempted = []
+                        def interrupted_push(path, *args, **kwargs):
+                            if args[0] == 'push':
+                                attempted.append(args)
+                                if publication_interruption == 'permission':
+                                    # A real receive hook models server policy rejection.
+                                    hook = remote / 'hooks/pre-receive'
+                                    hook.write_text('#!/bin/sh\necho permission-denied >&2\nexit 1\n')
+                                    hook.chmod(0o755)
+                                elif publication_interruption == 'remote-race':
+                                    git(remote, 'update-ref', f'refs/heads/{branch}', target)
+                                elif publication_interruption in ('before-push', 'remote-deleted', 'new-pr'):
+                                    raise SimulatedProcessExit()
+                                result = no_repeated_rebase(path, *args, **kwargs)
+                                if publication_interruption == 'after-push':
+                                    raise SimulatedProcessExit()
+                                return result
+                            return no_repeated_rebase(path, *args, **kwargs)
+                        effects.workspace.git.side_effect = interrupted_push
+                        completion = (mock.patch.object(effects.state, 'complete_rebase_publication',
+                                                        side_effect=SimulatedProcessExit())
+                                      if publication_interruption == 'sqlite' else nullcontext())
+                        with completion:
+                            try:
+                                first = handler.recover(handler._context())
+                            except SimulatedProcessExit:
+                                first = None
+                            else:
+                                self.assertIsInstance(first, ExecutionOutcome)
+                        pending = effects.checkpoint.get(repo_key, 'G-047')
+                        self.assertEqual(pending.operation, 'rebase_publish')
+                        intent = pending.snapshot['rebase_publication_intent']
+                        self.assertEqual(intent['remote_before'], original)
+                        self.assertEqual(attempted, [('push',
+                            f'--force-with-lease=refs/heads/{branch}:{original}', 'origin',
+                            f'{final_head}:refs/heads/{branch}')])
+                        self.assertEqual(effects.state.row()['publication_remote_oid'], original)
+                        publication_events = events[publication_start:]
+                        self.assertNotIn('verify', publication_events)
+                        self.assertNotIn('reviewer', publication_events)
+                        self.assertNotIn('worker', publication_events)
+                        effects.workspace.git.side_effect = no_repeated_rebase
                         if publication_interruption == 'permission':
-                            # A real receive hook models server policy rejection.
-                            hook = remote / 'hooks/pre-receive'
-                            hook.write_text('#!/bin/sh\necho permission-denied >&2\nexit 1\n')
-                            hook.chmod(0o755)
-                        elif publication_interruption == 'remote-race':
-                            git(remote, 'update-ref', f'refs/heads/{branch}', target)
-                        elif publication_interruption in ('before-push', 'remote-deleted', 'new-pr'):
-                            raise SimulatedProcessExit()
-                        result = no_repeated_rebase(path, *args, **kwargs)
-                        if publication_interruption == 'after-push':
-                            raise SimulatedProcessExit()
-                        return result
-                    return no_repeated_rebase(path, *args, **kwargs)
-                effects.workspace.git.side_effect = interrupted_push
-                completion = (mock.patch.object(effects.state, 'complete_rebase_publication',
-                                                side_effect=SimulatedProcessExit())
-                              if publication_interruption == 'sqlite' else nullcontext())
-                with completion:
-                    try:
-                        first = handler.recover(handler._context())
-                    except SimulatedProcessExit:
-                        first = None
-                    else:
-                        self.assertIsInstance(first, ExecutionOutcome)
-                pending = effects.checkpoint.get(repo_key, 'G-047')
-                self.assertEqual(pending.operation, 'rebase_publish')
-                intent = pending.snapshot['rebase_publication_intent']
-                self.assertEqual(intent['remote_before'], original)
-                self.assertEqual(attempted, [('push',
-                    f'--force-with-lease=refs/heads/{branch}:{original}', 'origin',
-                    f'{final_head}:refs/heads/{branch}')])
-                self.assertEqual(effects.state.row()['publication_remote_oid'], original)
-                publication_events = events[publication_start:]
-                self.assertNotIn('verify', publication_events)
-                self.assertNotIn('reviewer', publication_events)
-                self.assertNotIn('worker', publication_events)
-                effects.workspace.git.side_effect = no_repeated_rebase
-                if publication_interruption == 'permission':
-                    (remote / 'hooks/pre-receive').unlink()
-                elif publication_interruption == 'remote-deleted':
-                    git(remote, 'update-ref', '-d', f'refs/heads/{branch}')
-                elif publication_interruption == 'new-pr':
-                    effects.publication.pr_for_branch.return_value = {
-                        'url': 'https://example.test/pr/new', 'state': 'OPEN',
-                        'headRefName': branch, 'headRefOid': original, 'baseRefName': 'main'}
-                handler = restart()
-                if publication_interruption in ('remote-race', 'remote-deleted', 'new-pr'):
-                    with self.assertRaises(handlers.RecoveryFailure):
+                            (remote / 'hooks/pre-receive').unlink()
+                        elif publication_interruption == 'remote-deleted':
+                            git(remote, 'update-ref', '-d', f'refs/heads/{branch}')
+                        elif publication_interruption == 'new-pr':
+                            effects.publication.pr_for_branch.return_value = {
+                                'url': 'https://example.test/pr/new', 'state': 'OPEN',
+                                'headRefName': branch, 'headRefOid': original, 'baseRefName': 'main'}
+                        handler = restart()
+                        if publication_interruption in ('remote-race', 'remote-deleted', 'new-pr'):
+                            with self.assertRaises(handlers.RecoveryFailure):
+                                handler._publish_rebased_checkpoint(handler._context())
+                            self.assertEqual(effects.checkpoint.get(repo_key, 'G-047'), pending)
+                            expected_remote = None if publication_interruption == 'remote-deleted' else (
+                                target if publication_interruption == 'remote-race' else original)
+                            self.assertEqual(journal.live_remote_branch_oid(git, repo, branch), expected_remote)
+                            self.assertEqual(git(worktree, 'rev-parse', 'HEAD').stdout.strip(), final_head)
+                            return
                         handler._publish_rebased_checkpoint(handler._context())
-                    self.assertEqual(effects.checkpoint.get(repo_key, 'G-047'), pending)
-                    expected_remote = None if publication_interruption == 'remote-deleted' else (
-                        target if publication_interruption == 'remote-race' else original)
-                    self.assertEqual(journal.live_remote_branch_oid(git, repo, branch), expected_remote)
+                        self.assertEqual(effects.checkpoint.get(repo_key, 'G-047').snapshot['rebase_publication_intent'], intent)
+                        if publication_interruption in ('after-push', 'sqlite'):
+                            self.assertEqual(events.count('checkpoint-push'), 1)
+                    recovered = handler.recover(handler._context())
+                    self.assertNotIsInstance(recovered, ExecutionOutcome)
+                    completed_checkpoint = effects.checkpoint.get(repo_key, 'G-047')
+                    self.assertIsNone(completed_checkpoint.operation)
+                    for name, content in {**sealed_before, **intents_before}.items():
+                        self.assertEqual((slot / name).read_bytes(), content)
+                    if sealed_restart:
+                        self.assertEqual(completed_checkpoint.snapshot['current_rebase_acceptance']['head'], final_head)
+                    handler._complete_rebase_intent(handler._context())
+                    self.assertEqual(effects.checkpoint.get(repo_key, 'G-047'), completed_checkpoint)
+                    if not with_pr:
+                        self.assertTrue(handler._owned_checkpoint_remote(
+                            handler._context(), handler._row(), final_head,
+                            effects.checkpoint.get(repo_key, 'G-047'),
+                        ))
+                    self.assertEqual(effects.state.row()['worker_session_id'], 'worker-session')
+                    audit_row = handler.rebase_corrections.get(repo_key, 'G-047')
+                    self.assertEqual(audit_row.audit if audit_row else (), audit_before)
+                    self.assertEqual(len(resolutions), resolution_count)
+                    transitions = journal.verified_managed_transitions(
+                        state_dir, str(repo.resolve()), 'plan:G-047',
+                        agent_session_id='worker-session', git=git)
+                    self.assertEqual(transitions, [], 'manual/current acceptance is not Manager replay evidence')
+                    if not with_pr:
+                        self.assertEqual(journal.live_remote_branch_oid(git, repo, branch), final_head)
+                        self.assertEqual(effects.state.row()['publication_remote_oid'], final_head)
+                        self.assertIn('checkpoint-push', events)
+                    else:
+                        self.assertEqual(journal.live_remote_branch_oid(git, repo, branch), original)
+                        self.assertNotIn('checkpoint-push', events)
+                    self.assertEqual(recovered.phase, ExecutionPhase.IMPLEMENTING)
+                    self.assertIsNone(effects.state.row()['worker_result'])
+                    self.assertIsNone(effects.state.row()['verify_result'])
+                    self.assertIsNone(effects.state.row()['review_result'])
+                    if publication_interruption:
+                        # 7개 게시 실패/중단 case 모두 위의 실제 원격 lease·intent·CAS·
+                        # restart·멱등성·session·검증 무효화 assertion을 유지한다.
+                        # 후속 Worker→verify→Review는 정상/수동/legacy 12개 case가 검사한다.
+                        self.assertNotIn('worker', events)
+                        self.assertNotIn('verify', events)
+                        self.assertNotIn('reviewer', events)
+                        effects.publication.push_managed_publication_branch.assert_not_called()
+                        return
+                    context = handler.guard(recovered)
+                    if latest_base_advanced:
+                        self.assertIsInstance(context, ExecutionOutcome)
+                        context = handler.guard(handler._context())
+                        final_head = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
+                        self.assertEqual(effects.state.row()['active_sha'], fixture.remote)
+                        self.assertLess(events.index('checkpoint-push'), events.index('next-base-rebase'))
+                        self.assertEqual(journal.live_remote_branch_oid(git, repo, branch), final_head)
+                        self.assertEqual(events.count('checkpoint-push'), 2)
+                    self.assertNotIsInstance(context, ExecutionOutcome)
+                    self.assertEqual(context.phase, ExecutionPhase.IMPLEMENTING)
+                    before_worker_count = events.count('worker')
+                    context = handler.run(context).context
+                    self.assertEqual(events.count('worker'), before_worker_count + 1)
+                    self.assertEqual(context.phase, ExecutionPhase.VERIFYING)
+                    verified = handler.verify(context, handler)
+                    self.assertEqual(verified.context.phase, ExecutionPhase.REVIEWING, verified.detail)
+                    reviewed = handler.review(verified.context)
+                    self.assertEqual(reviewed.context.phase, ExecutionPhase.PUBLISHING, reviewed.detail)
+                    self.assertEqual(events.count('verify'), 1)
+                    self.assertEqual(events[-2:], ['verify', 'reviewer'])
+                    self.assertEqual(len(resolutions), 1 if legacy else 2)
                     self.assertEqual(git(worktree, 'rev-parse', 'HEAD').stdout.strip(), final_head)
-                    return
-                handler._publish_rebased_checkpoint(handler._context())
-                self.assertEqual(effects.checkpoint.get(repo_key, 'G-047').snapshot['rebase_publication_intent'], intent)
-                if publication_interruption in ('after-push', 'sqlite'):
-                    self.assertEqual(events.count('checkpoint-push'), 1)
-            recovered = handler.recover(handler._context())
-            self.assertNotIsInstance(recovered, ExecutionOutcome)
-            completed_checkpoint = effects.checkpoint.get(repo_key, 'G-047')
-            self.assertIsNone(completed_checkpoint.operation)
-            for name, content in {**sealed_before, **intents_before}.items():
-                self.assertEqual((slot / name).read_bytes(), content)
-            if sealed_restart:
-                self.assertEqual(completed_checkpoint.snapshot['current_rebase_acceptance']['head'], final_head)
-            handler._complete_rebase_intent(handler._context())
-            self.assertEqual(effects.checkpoint.get(repo_key, 'G-047'), completed_checkpoint)
-            if not with_pr:
-                self.assertTrue(handler._owned_checkpoint_remote(
-                    handler._context(), handler._row(), final_head,
-                    effects.checkpoint.get(repo_key, 'G-047'),
-                ))
-            self.assertEqual(effects.state.row()['worker_session_id'], 'worker-session')
-            audit_row = handler.rebase_corrections.get(repo_key, 'G-047')
-            self.assertEqual(audit_row.audit if audit_row else (), audit_before)
-            self.assertEqual(len(resolutions), resolution_count)
-            transitions = journal.verified_managed_transitions(
-                state_dir, str(repo.resolve()), 'plan:G-047',
-                agent_session_id='worker-session', git=git)
-            self.assertEqual(transitions, [], 'manual/current acceptance is not Manager replay evidence')
-            if not with_pr:
-                self.assertEqual(journal.live_remote_branch_oid(git, repo, branch), final_head)
-                self.assertEqual(effects.state.row()['publication_remote_oid'], final_head)
-                self.assertIn('checkpoint-push', events)
-            else:
-                self.assertEqual(journal.live_remote_branch_oid(git, repo, branch), original)
-                self.assertNotIn('checkpoint-push', events)
-            self.assertEqual(recovered.phase, ExecutionPhase.IMPLEMENTING)
-            self.assertIsNone(effects.state.row()['worker_result'])
-            self.assertIsNone(effects.state.row()['verify_result'])
-            self.assertIsNone(effects.state.row()['review_result'])
-            if publication_interruption:
-                # 7개 게시 실패/중단 case 모두 위의 실제 원격 lease·intent·CAS·
-                # restart·멱등성·session·검증 무효화 assertion을 유지한다.
-                # 후속 Worker→verify→Review는 정상/수동/legacy 12개 case가 검사한다.
-                self.assertNotIn('worker', events)
-                self.assertNotIn('verify', events)
-                self.assertNotIn('reviewer', events)
-                effects.publication.push_managed_publication_branch.assert_not_called()
-                return
-            context = handler.guard(recovered)
-            if latest_base_advanced:
-                self.assertIsInstance(context, ExecutionOutcome)
-                context = handler.guard(handler._context())
-                final_head = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
-                self.assertEqual(effects.state.row()['active_sha'], fixture.remote)
-                self.assertLess(events.index('checkpoint-push'), events.index('next-base-rebase'))
-                self.assertEqual(journal.live_remote_branch_oid(git, repo, branch), final_head)
-                self.assertEqual(events.count('checkpoint-push'), 2)
-            self.assertNotIsInstance(context, ExecutionOutcome)
-            self.assertEqual(context.phase, ExecutionPhase.IMPLEMENTING)
-            before_worker_count = events.count('worker')
-            context = handler.run(context).context
-            self.assertEqual(events.count('worker'), before_worker_count + 1)
-            self.assertEqual(context.phase, ExecutionPhase.VERIFYING)
-            verified = handler.verify(context, handler)
-            self.assertEqual(verified.context.phase, ExecutionPhase.REVIEWING, verified.detail)
-            reviewed = handler.review(verified.context)
-            self.assertEqual(reviewed.context.phase, ExecutionPhase.PUBLISHING, reviewed.detail)
-            self.assertEqual(events.count('verify'), 1)
-            self.assertEqual(events[-2:], ['verify', 'reviewer'])
-            self.assertEqual(len(resolutions), 1 if legacy else 2)
-            self.assertEqual(git(worktree, 'rev-parse', 'HEAD').stdout.strip(), final_head)
-            self.assertIn('phase-bound candidate verified', effects.state.row()['verify_result'])
-            effects.publication.push_managed_publication_branch.assert_not_called()
+                    self.assertIn('phase-bound candidate verified', effects.state.row()['verify_result'])
+                    effects.publication.push_managed_publication_branch.assert_not_called()

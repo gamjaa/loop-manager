@@ -312,6 +312,7 @@ def _path_signature(worktree: Path, relative_path: str, *, effects: ObservationE
                 "--porcelain=v1",
                 "--untracked-files=all",
                 check=False,
+                env={**os.environ, 'GIT_OPTIONAL_LOCKS': '0'},
             )
             digest.update(head.stdout.encode("utf-8", errors="replace"))
             digest.update(b"\0")
@@ -332,16 +333,12 @@ def _capture_local_worktree_state(worktree: Path, *, effects: ObservationEffects
 ]:
     """Capture one worktree's HEAD, branch, index and file state."""
 
-    head = effects.git(worktree, "rev-parse", "--verify", "HEAD").stdout.strip()
-    branch_result = effects.git(
-        worktree,
-        "symbolic-ref",
-        "--quiet",
-        "--short",
-        "HEAD",
-        check=False,
-    )
-    branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
+    identity = effects.git(worktree, "rev-parse", "HEAD", "--abbrev-ref", "HEAD").stdout.splitlines()
+    if (len(identity) != 2 or re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", identity[0]) is None
+            or not identity[1]):
+        raise RuntimeError("Git HEAD·branch snapshot을 해석할 수 없습니다.")
+    head, branch = identity
+    branch = None if branch == "HEAD" else branch
     index = _index_entries(worktree, effects=effects, details=details)
     if details is not None:
         raw = effects.git_bytes(worktree, "diff", "--cached", *RAW_DIFF_OPTIONS, "--")

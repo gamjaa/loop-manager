@@ -13,13 +13,71 @@ from loop_manager_internal.git.managed_rebase_observation import (
 )
 from loop_manager_internal.git.managed_rebase_validation import RebaseObservation
 from loop_manager_internal.verification import git_timing
-from loop_manager_internal.verification.git_timing import snapshot_timing
-from loop_manager_internal.verification.timing import EventWriter, summarize
+from loop_manager_internal.verification.git_timing import snapshot_timing, git_command_timing
+from loop_manager_internal.verification.timing import EventWriter, summarize, phase
 from tests.support.git import git_command, make_remote_repository
 from tests.support.rebase_observations import expectation
 
 
 class GitSnapshotCostTests(unittest.TestCase):
+    def test_head_branch_batch_matches_legacy_and_saves_one_command_per_worktree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            other = Path(directory) / 'other'
+            git_command(repo, 'worktree', 'add', '--detach', str(other))
+            effects = manager._scope_observation_effects()
+            indexes = [repo / '.git/index', repo / '.git/worktrees/other/index']
+            original_indexes = [path.read_bytes() for path in indexes]
+            count = []
+            def legacy(path, *args, **kwargs):
+                if args == ('rev-parse', 'HEAD', '--abbrev-ref', 'HEAD'):
+                    head = effects.git(path, 'rev-parse', '--verify', 'HEAD').stdout.strip()
+                    branch = effects.git(path, 'symbolic-ref', '--quiet', '--short', 'HEAD', check=False)
+                    count.extend(('rev-parse', 'symbolic-ref'))
+                    return subprocess.CompletedProcess([], 0, head + '\n' + (branch.stdout.strip() if branch.returncode == 0 else 'HEAD') + '\n')
+                count.append(args[0])
+                return effects.git(path, *args, **kwargs)
+            expected = scope_observation.capture_git_snapshot(repo, effects=replace(effects, git=legacy))
+            calls = mock.Mock(wraps=effects.git)
+            actual = scope_observation.capture_git_snapshot(repo, effects=replace(effects, git=calls))
+            self.assertEqual(actual, expected)
+            self.assertEqual([path.read_bytes() for path in indexes], original_indexes)
+            self.assertEqual(len(count) - calls.call_count, 2)
+            for output in ('', 'bad\nmain\n', 'a' * 40 + '\n', 'a' * 40 + '\nmain\nextra\n'):
+                with self.subTest(output=output), self.assertRaises(RuntimeError):
+                    scope_observation._capture_local_worktree_state(repo, effects=replace(effects,
+                        git=mock.Mock(return_value=subprocess.CompletedProcess([], 0, output))))
+
+    def test_total_git_cost_includes_preparation_and_snapshot_with_parent_reason(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            writer = EventWriter(root / 'worker.jsonl')
+            try:
+                with writer.activate(), git_command_timing():
+                    writer.current_test = self.id()
+                    with phase('fixture:prepare'):
+                        repo = make_remote_repository(str(root / 'case'))
+                    def shared():
+                        return manager.capture_git_snapshot(repo)
+                    def first_decision():
+                        return shared()
+                    def ownership():
+                        return shared()
+                    with phase('inspect'):
+                        self.assertEqual(first_decision(), ownership())
+            finally:
+                writer.close()
+            summary = summarize(root)
+            snapshots = summary['git_snapshots']
+            self.assertEqual(len(snapshots), 2)
+            self.assertTrue(any('first_decision' in name for name in snapshots))
+            self.assertTrue(any('ownership' in name for name in snapshots))
+            snapshot_commands = sum(command['count'] for cost in snapshots.values() for command in cost['commands'].values())
+            self.assertGreater(sum(cost['count'] for cost in summary['git_commands']), snapshot_commands)
+            self.assertTrue(any('fixture:prepare' in cost['phases'] for cost in summary['git_commands']))
+            self.assertTrue(all(cost['test'] == self.id() for cost in summary['git_commands']))
+            self.assertFalse(summary['git_commands_incomplete'])
+
     def test_real_rebase_observation_shares_reads_and_still_queries_twice(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = make_remote_repository(directory)
@@ -113,7 +171,7 @@ class GitSnapshotCostTests(unittest.TestCase):
         self.assertEqual(process.call_args.kwargs['input'], b'one.cache\0missing\0')
         with self.assertRaisesRegex(RuntimeError, '규칙을 확인할 수 없습니다: missing'):
             scope_observation._capture_local_worktree_state(Path('/repo'), effects=replace(
-                effects, git=mock.Mock(return_value=subprocess.CompletedProcess([], 0, 'head\n')),
+                effects, git=mock.Mock(return_value=subprocess.CompletedProcess([], 0, 'a' * 40 + '\nmain\n')),
                 git_bytes=mock.Mock(side_effect=[b'', b'', b'', b'', b'one.cache\0missing\0']),
                 _handoff_run=process))
         process.return_value = subprocess.CompletedProcess([], 1, b'')
@@ -214,13 +272,12 @@ class GitSnapshotCostTests(unittest.TestCase):
                 writer.close()
             summary = summarize(logs)
             self.assertNotEqual(before.dirty, after.dirty)
-            self.assertEqual(len(summary["git_snapshots"]), 1)
-            name, cost = next(iter(summary["git_snapshots"].items()))
-            self.assertIn(":capture:", name)
-            self.assertEqual(cost["count"], 2)
-            self.assertEqual(cost["commands"]["rev-parse"]["count"], 6)
-            self.assertEqual(cost["commands"]["diff"]["count"], 4)
-            self.assertGreater(cost["seconds"], 0)
+            costs = summary['git_snapshots']
+            self.assertTrue(all(':capture:' in name for name in costs))
+            self.assertEqual(sum(cost['count'] for cost in costs.values()), 2)
+            self.assertEqual(sum(cost['commands']['rev-parse']['count'] for cost in costs.values()), 6)
+            self.assertEqual(sum(cost['commands']['diff']['count'] for cost in costs.values()), 4)
+            self.assertGreater(sum(cost['seconds'] for cost in costs.values()), 0)
             text = (logs / "worker.jsonl").read_text(encoding="utf-8")
             self.assertNotIn("do-not-log-this", text)
             self.assertNotIn(str(repo), text)

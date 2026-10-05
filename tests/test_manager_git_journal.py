@@ -323,6 +323,30 @@ class ManagerGitTransitionTests(unittest.TestCase):
 
 
 class CurrentRebaseAuditTests(unittest.TestCase):
+    def test_unused_journal_does_not_observe_and_active_failure_preserves_intent(self):
+        from tests.support.rebase_observations import decision_for
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            observe = mock.Mock(return_value={'head': 'after'})
+            arguments = dict(repo='/repo', target='/owned', owner='plan:G-108',
+                             decision=decision_for(), observed=observe)
+            self.assertFalse(journal.record_current_rebase_result(state, **arguments))
+            observe.assert_not_called()
+            journal.begin_rebase(state, owner='plan:G-108', repo='/repo', target='/owned',
+                before={'head': 'before'}, expected={'branch': 'loop-manager/G-108'})
+            self.assertFalse(journal.record_current_rebase_result(state, **{**arguments, 'owner': 'other'}))
+            observe.assert_not_called()
+            observe.side_effect = RuntimeError('observation failed')
+            with self.assertRaisesRegex(RuntimeError, 'observation failed'):
+                journal.record_current_rebase_result(state, **arguments)
+            self.assertTrue((journal._slot(state, '/repo', 'managed_rebase', '/owned') / 'active.json').exists())
+            observe.side_effect = None
+            self.assertTrue(journal.record_current_rebase_result(state, **arguments))
+            self.assertEqual(observe.call_count, 2)
+            self.assertFalse(journal.record_current_rebase_result(state, **arguments))
+            self.assertEqual(observe.call_count, 2)
+
     def test_current_observation_preserves_old_result_without_fabricating_receipts(self):
         from tests.support.rebase_observations import decision_for
         with tempfile.TemporaryDirectory() as directory:

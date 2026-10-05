@@ -355,7 +355,7 @@ class RebaseHandler:
         return manager_git_journal.record_current_rebase_result(
             self.ports.identity.state_dir, repo=str(self.ports.identity.repo_path.resolve()),
             target=str(context.worktree.resolve()), owner=f'plan:{context.plan.plan_id}',
-            decision=decision, observed=self.ports._rebase_journal_state(context))
+            decision=decision, observed=lambda: self.ports._rebase_journal_state(context))
 
     def _run_managed_rebase(self, context, target_oid, *, autostash=False):
         if self.ports.current_rebase_service is not None:
@@ -665,8 +665,8 @@ class RebaseHandler:
             repo=self.ports.identity.repo, plan_id=context.plan.plan_id, repo_path=self.ports.identity.repo_path,
             worktree=context.worktree, branch=context.branch,
             service=lambda **options: self.ports._current_rebase_service(context, **options),
-            owns_remote=lambda oid, selected: self.ports._owned_checkpoint_remote(
-                context, self.ports._row(), oid, selected),
+            owns_remote=lambda oid, selected, **evidence: self.ports._owned_checkpoint_remote(
+                context, self.ports._row(), oid, selected, **evidence),
             git=self.ports.git,
             lookup_pr=self.ports.pr_for_branch)
 

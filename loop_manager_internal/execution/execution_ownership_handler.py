@@ -38,6 +38,7 @@ class OwnershipHandler:
 
     def _owned_checkpoint_remote(
         self, context, row, remote_oid, current, pull_request=None,
+        *, rebase_observation=None,
     ):
         """Require the published checkpoint's durable owner on an active resume."""
         try:
@@ -54,13 +55,15 @@ class OwnershipHandler:
             return True
         if current is not None and current.operation == 'rebase':
             return self._owned_current_checkpoint_rebase(
-                context, row, remote_oid, current, checkpoint, pull_request)
+                context, row, remote_oid, current, checkpoint, pull_request,
+                rebase_observation=rebase_observation)
         if current is not None and ((current.snapshot or {}).get('current_rebase_acceptance')
                 or (current.snapshot or {}).get('completed_rebase')
                 or (current.snapshot or {}).get('rebase_completion')
                 or self._legacy_current_rebase(context, current)):
-            return self._owned_persisted_rebase(
+            return self._owned_current_checkpoint_rebase(
                 context, row, remote_oid, current, checkpoint, pull_request,
+                rebase_observation=rebase_observation,
             )
         review_resume = (current.snapshot or {}).get('published_review_resume') if current else None
         if review_resume is not None and current.operation != 'rebase':
@@ -210,7 +213,7 @@ class OwnershipHandler:
             read_fetched=self.ports.remote_branch_oid)
 
     def _owned_current_checkpoint_rebase(self, context, row, remote_oid, current,
-                                         checkpoint, pull_request):
+                                         checkpoint, pull_request, *, rebase_observation=None):
         original = str(checkpoint['accepted_remote_oid'] or '')
         recorded = str(row['publication_remote_oid'] or original)
         if not original or row['pr_url']:
@@ -255,7 +258,14 @@ class OwnershipHandler:
                     service.expected, remote=replace(service.expected.remote,
                         pull_request=PullRequest(str(pull_request['url']), self.ports.identity.repo,
                             context.branch, remote_oid, 'OPEN'))))
-            observed, decision = service.observe(checkpoint=current)
+            # 이 호출 구간에서 전달된 증거만 사용한다. 새 service의 전체 입력과
+            # generation이 다르면 다시 관측하며 실행 단계 사이에 저장하지 않는다.
+            if (rebase_observation is not None
+                    and rebase_observation[0] == service.expected
+                    and service.expected.generation == current.generation):
+                _, observed, decision = rebase_observation
+            else:
+                observed, decision = service.observe(checkpoint=current)
             if decision.status is RebaseStatus.UNAVAILABLE:
                 raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
                                       'checkpoint rebase observation unavailable')
