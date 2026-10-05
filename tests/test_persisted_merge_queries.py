@@ -55,6 +55,7 @@ class PersistedMergeProjectQueryTest(unittest.TestCase):
             stack.enter_context(mock.patch.object(loop_manager, "reconcile_execplan_catalog", return_value=reconciled))
             planning = None
             if real_lifecycle:
+                stack.enter_context(mock.patch.object(loop_manager, "git_bytes", return_value=b""))
                 stack.enter_context(mock.patch.object(loop_manager, "_planning_input_fingerprint", return_value="stable"))
                 stack.enter_context(mock.patch.object(loop_manager, "_specification_input_fingerprint", return_value="spec"))
                 stack.enter_context(mock.patch.object(loop_manager, "plan_declarations", return_value={}))

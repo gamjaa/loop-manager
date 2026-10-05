@@ -35,7 +35,7 @@ class PlanningAssessmentService(PlanningService):
         context = run.context
         worktree = run.planning_worktree
         assert worktree is not None
-        if hasattr(self._ports, "retirement"):
+        if not run.maintenance_planning and hasattr(self._ports, "retirement"):
             run.audit_restorations = self._ports.retirement.audit_restorations(
                 context.repo, context.repo_path, str(row.active_sha),
             )

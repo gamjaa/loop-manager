@@ -142,8 +142,5 @@ class CurrentRebaseAgentScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
         connection.execute("UPDATE projects SET agent_result_snapshot = ? WHERE repo = 'repo'",
                            (self.current.serialize(),))
         with mock.patch.object(lm, 'requirement_archive_candidates', return_value=(source,)):
-            self.assertEqual(lm.validate_persisted_agent_scope(
-                connection, Path('/repo'), Path('/state'), 'repo'), self.current)
-        with mock.patch.object(lm, 'requirement_archive_candidates', return_value=()):
             with self.assertRaises(lm.AgentScopeError):
                 lm.validate_persisted_agent_scope(connection, Path('/repo'), Path('/state'), 'repo')

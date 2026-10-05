@@ -372,6 +372,9 @@ class RevisionHandler:
         self.ports.update_snapshot(catalog_plan=catalog_plan)
         self.ports.update_snapshot(plan=self.ports._cached_plan(catalog_plan))
         try:
+            # Document approval identity remains mandatory independently of
+            # the retired execution-time Requirement archive calculation.
+            self.ports._document_draft(context)
             # Requirement retirement is assessed after the related plans MERGE.
             # An old execution archive target is never an implementation input.
             archive_sources = ()
