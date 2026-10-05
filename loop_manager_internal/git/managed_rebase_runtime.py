@@ -259,9 +259,26 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
         path, expected.plan_path, archives, guidance, common)
     checked_contracts = contracts
     def scoped_contracts(observed):
+        # Conflict bytes are preservation input, never a final approval. Only
+        # recorded user paths in this exact owned operation may bypass Worker
+        # document contracts while their nonzero index stages remain. The
+        # outer policy still checks identity, lease, modes, stages and ownership.
+        metadata = dict(observed.metadata or ())
+        if (checkpoint.operation == 'rebase' and expected.before_head
+                and metadata.get('head-name') == f'refs/heads/{branch}'
+                and metadata.get('orig-head') == expected.before_head
+                and metadata.get('onto') == expected.target_base_oid):
+            conflicts = {entry.path for entry in observed.index
+                         if entry.stage and entry.path in user_blobs}
+            observed = replace(observed,
+                committed=tuple(change for change in observed.committed if change.path not in conflicts),
+                staged=tuple(change for change in observed.staged if change.path not in conflicts),
+                files=tuple(file for file in observed.files if file.path not in conflicts),
+                index=tuple(entry for entry in observed.index if entry.path not in conflicts))
         approved = matching_user_paths(observed, user_blobs)
         paths = {change.path for change in (*observed.committed, *observed.staged)}
         paths.update(file.path for file in observed.files)
+        paths.update(entry.path for entry in observed.index if entry.stage)
         return all(_worker_path_allowed(path, expected.plan_path, archives, guidance, common)
                    or path in approved for path in paths) and checked_contracts(observed)
 

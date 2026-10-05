@@ -251,9 +251,14 @@ class BlockedPlanReconciler:
             allowed.add(intent['head'])
         if allow_published and self._plan(context['plan_id'])['publication_remote_oid']:
             allowed.add(self._plan(context['plan_id'])['publication_remote_oid'])
+        integration = (checkpoint.snapshot or {}).get('work_branch_integration') or {}
+        refresh_pending = bool(integration
+            and (checkpoint.operation == 'rebase' or checkpoint.operation is None
+                 and integration.get('phase') in {'preserving', 'rebasing'})
+            and integration.get('branch') == context['identity']['branch']
+            and integration.get('worktree') == context['identity']['worktree'])
         if branch.oid not in allowed:
-            integration = (checkpoint.snapshot or {}).get('work_branch_integration') or {}
-            if integration and checkpoint.operation == 'rebase' and branch.oid:
+            if refresh_pending and context['branch_oid'] and branch.oid:
                 fetched = self.ports.git(
                     self.repo_path, 'fetch', '--no-tags', '--refmap=', 'origin',
                     context['branch_ref'], check=False)
@@ -270,7 +275,7 @@ class BlockedPlanReconciler:
             else:
                 raise RuntimeError('원격 작업 branch가 관측 이후 변경·삭제됐습니다.')
         if not allow_published and base.oid != context['base_oid']:
-            if checkpoint.operation == 'rebase' and (checkpoint.snapshot or {}).get('work_branch_integration'):
+            if refresh_pending:
                 context['base_oid'] = base.oid
             else:
                 raise InputChanged('원격 base가 관측 이후 변경됐습니다.')

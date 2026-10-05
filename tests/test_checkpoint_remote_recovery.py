@@ -182,6 +182,99 @@ class CheckpointRebaseGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.Te
     def test_remote_refresh_base_only_with_same_specification(self):
         self._assert_remote_refresh(base_changed=True, branch_changed=False, resolved=False)
 
+    def _user_document_conflict_then_successor(self, path):
+        repo, _ = self._remote_refresh_fixture()
+        self.user_commit(path, 'remote user document\n')
+        target = self.worktree / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text('local user document\n')
+        self.run_git(self.worktree, 'add', '--', path)
+        self.run_git(self.worktree, 'commit', '-m', 'Local user document input')
+        self.assertFalse(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir, repo, 'main'))
+        self.assertIn(path, self.run_git(self.worktree, 'ls-files', '-u'))
+        checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        pending = checkpoints.get(repo, 'G-034')
+        self.assertEqual(pending.snapshot['work_branch_integration']['phase'], 'rebasing')
+        self.assertEqual(pending.operation, 'rebase')
+        self.user_commit(path, 'local user document\n')
+        loop_manager.observe_blocked_plan_remotes(self.connection, self.repo, repo,
+            self.connection.execute('SELECT * FROM projects').fetchone())
+        with mock.patch.object(loop_manager, '_evaluate_remote_checkpoint_cause',
+                               return_value=(False, 'original cause still present', None)):
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, self.repo, self.state_dir, repo, 'main'))
+        self.assertFalse(self.run_git(self.worktree, 'ls-files', '-u'))
+        self.assertEqual(target.read_text(), 'local user document\n')
+        current = checkpoints.get(repo, 'G-034')
+        self.assertIsNone(current.operation)
+        restart = current.snapshot['work_branch_integration_history'][0]['restart']
+        raw = json.loads(restart['baseline'])
+        self.assertEqual(raw['version'], 2)
+        self.assertEqual(set(raw['stage_trees']), {'0', '1', '2', '3'})
+        self.assertIn('<<<<<<<', self.run_git(self.worktree, 'show', raw['worktree_tree'] + ':' + path))
+        with mock.patch.object(loop_manager, '_journaled_direct_rebase',
+                               side_effect=AssertionError('completed integration repeated')):
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, self.repo, self.state_dir, repo, 'main'))
+
+    def test_user_guidance_document_conflict_accepts_resolution_push_after_restart(self):
+        self._user_document_conflict_then_successor('AGENTS.md')
+
+    def test_user_architecture_document_conflict_accepts_resolution_push_after_restart(self):
+        self._user_document_conflict_then_successor('docs/ARCHITECTURE.md')
+
+    def _pending_integration_successor(self, *, after_ref):
+        repo, _ = self._remote_refresh_fixture(branch_changed=True)
+        (self.worktree / 'staged.txt').write_text('original index\n')
+        self.run_git(self.worktree, 'add', 'staged.txt')
+        (self.worktree / 'staged.txt').write_text('original working bytes\n')
+        session = self.connection.execute('SELECT worker_session_id FROM exec_plans').fetchone()[0]
+        git = loop_manager.git
+        def interrupted_git(root, *args, **kwargs):
+            result = git(root, *args, **kwargs)
+            if 'update-ref' in args and 'refs/heads/loop-manager/G-034' in args:
+                raise KeyboardInterrupt
+            return result
+        patch = (mock.patch.object(loop_manager, 'git', side_effect=interrupted_git) if after_ref else
+                 mock.patch.object(loop_manager, '_journaled_direct_rebase', side_effect=KeyboardInterrupt))
+        with patch:
+            with self.assertRaises(KeyboardInterrupt):
+                loop_manager.resume_plan_blocks(self.connection, self.repo, self.state_dir, repo, 'main')
+        checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        pending = checkpoints.get(repo, 'G-034')
+        original = pending.snapshot['work_branch_integration']
+        self.assertIsNone(pending.operation)
+        self.assertEqual(original['phase'], 'preserving' if after_ref else 'rebasing')
+        successor = self.user_commit('dependency.py', 'user successor dependency\n')
+        loop_manager.observe_blocked_plan_remotes(self.connection, self.repo, repo,
+            self.connection.execute('SELECT * FROM projects').fetchone())
+        with mock.patch.object(loop_manager, '_evaluate_remote_checkpoint_cause',
+                               return_value=(False, 'original cause still present', None)):
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, self.repo, self.state_dir, repo, 'main'))
+        current = checkpoints.get(repo, 'G-034')
+        completed = current.snapshot['work_branch_integration']
+        self.assertEqual(completed['phase'], 'complete')
+        self.assertEqual(completed['remote'], successor)
+        for key in ('baseline', 'before', 'local_commit', 'local_tree'):
+            self.assertEqual(completed[key], original[key])
+        raw = json.loads(original['baseline'])
+        self.assertEqual(self.run_git(self.worktree, 'show', raw['index_tree'] + ':staged.txt'), 'original index')
+        self.assertEqual((self.worktree / 'staged.txt').read_text(), 'original working bytes\n')
+        self.assertEqual(self.connection.execute('SELECT worker_session_id FROM exec_plans').fetchone()[0], session)
+        self.assertFalse(self.run_git(self.worktree, 'ls-files', '-u'))
+        with mock.patch.object(loop_manager, '_journaled_direct_rebase',
+                               side_effect=AssertionError('completed integration repeated')):
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, self.repo, self.state_dir, repo, 'main'))
+
+    def test_successor_after_preservation_ref_interruption_resumes_original_input(self):
+        self._pending_integration_successor(after_ref=True)
+
+    def test_successor_before_work_rebase_start_resumes_original_input(self):
+        self._pending_integration_successor(after_ref=False)
+
 
     def test_remote_refresh_successor_only_keeps_unresolved_cause(self):
         self._assert_remote_refresh(base_changed=False, branch_changed=True, resolved=False)
@@ -814,18 +907,19 @@ class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest
             "UPDATE exec_plans SET agent_role = 'worker', agent_snapshot = ?, "
             "agent_result_snapshot = ?, agent_manager_snapshot = ?, "
             "agent_baseline = 'old' WHERE plan_id = 'G-034'",
-            (stale, stale, stale),
+            (stale, stale, loop_manager.ManagerGitCheckpoint(
+                loop_manager.GitSnapshot.deserialize(stale), frozenset()).serialize()),
         )
         self.connection.commit()
         corrected = self.user_commit()
-        original = loop_manager._resume_remote_corrected_execplan
+        original = blocked_plan_reconciliation.BlockedPlanReconciler._resume
 
         def interrupted(*arguments, **keywords):
             original(*arguments, **keywords)
             raise KeyboardInterrupt
 
-        with mock.patch.object(loop_manager, "_resume_remote_corrected_execplan",
-                               side_effect=interrupted):
+        with mock.patch.object(blocked_plan_reconciliation.BlockedPlanReconciler, "_resume",
+                               new=interrupted):
             with self.assertRaises(KeyboardInterrupt):
                 loop_manager.resume_plan_blocks(
                     self.connection, self.repo, self.state_dir,
@@ -838,7 +932,12 @@ class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest
             "WHERE plan_id = 'G-034'"
         ).fetchone()
         self.assertEqual(stored["status"], "IMPLEMENTING")
-        self.assertTrue(all(value is None for value in tuple(stored)[1:]))
+        self.assertEqual(stored['agent_snapshot'], stale)
+        self.assertEqual(stored['agent_result_snapshot'], stale)
+        saved = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(
+            str(self.repo.resolve()), 'G-034')
+        self.assertEqual(loop_manager.GitSnapshot.deserialize(
+            saved.snapshot['remote_adoption_scope']['snapshot']).head, corrected)
         loop_manager.hydrate_active_project(
             self.connection, str(self.repo.resolve()),
         )
@@ -846,7 +945,8 @@ class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest
             "SELECT agent_role, agent_snapshot, agent_result_snapshot, "
             "agent_manager_snapshot FROM projects"
         ).fetchone()
-        self.assertTrue(all(value is None for value in project))
+        self.assertEqual(project['agent_snapshot'], stale)
+        self.assertEqual(project['agent_result_snapshot'], stale)
         resumed_scope = loop_manager.begin_agent_scope(
             self.connection, str(self.repo.resolve()), self.worktree, "worker",
         )

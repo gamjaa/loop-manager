@@ -182,6 +182,27 @@ class WorkspaceEffectBoundaryTests(unittest.TestCase):
         self.assertFalse(any('--name-only' in args and '--cached' not in args
                              for args in calls))
 
+    def test_changed_files_uses_content_evidence_without_refreshing_selected_index(self):
+        from loop_manager_internal.git import workspace_service
+        effects = fake_effects(workspace_service.ChangedFilesEffects)
+        effects._unstaged_git_paths.return_value = ['binary.bin', 'deleted.py', 'mode.sh']
+        effects._nul_git_paths.side_effect = lambda root, *args: (
+            ['staged.py'] if '--cached' in args else ['untracked.py'])
+        self.assertEqual(workspace_service.changed_files(effects, Path('/repo')),
+                         ['binary.bin', 'deleted.py', 'mode.sh', 'staged.py', 'untracked.py'])
+        effects._unstaged_git_paths.assert_called_once_with(Path('/repo'))
+        self.assertFalse(any('diff' in call.args and '--cached' not in call.args
+                             for call in effects._nul_git_paths.call_args_list))
+
+    def test_changed_files_composition_ignores_stat_only_diff_names(self):
+        def git_bytes(root, *args):
+            return b'unchanged.py\0' if '--name-only' in args and '--cached' not in args else b''
+        with mock.patch.object(loop_manager, 'git_bytes', side_effect=git_bytes) as read:
+            self.assertEqual(loop_manager.changed_files(Path('/repo')), [])
+        self.assertTrue(any('--numstat' in call.args for call in read.call_args_list))
+        self.assertFalse(any('--name-only' in call.args and '--cached' not in call.args
+                             for call in read.call_args_list))
+
     def test_rebase_ignored_overlap_refuses_before_subprocess(self):
         effects = fake_effects(command_adapter.GitEffects)
         effects._ignored_paths_overlapping_git_update.return_value = ['cache/file']

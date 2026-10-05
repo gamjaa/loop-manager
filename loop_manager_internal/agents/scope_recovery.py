@@ -842,37 +842,49 @@ def validate_blocked_agent_scope(
             connection, repo_path, worktree, before, role_name,
             selected_plan_path=selected_plan_path)
         owner = saved_plan if saved_plan is not None else guidance_plan
-        correcting_scope = (owner is not None and owner['blocked_reason'] in SCOPE_BASELINE_REASONS)
+        user_input_cause = (owner is not None and bool(owner['blocked_reason'])
+                            and owner['blocked_reason'] not in SCOPE_BASELINE_REASONS
+                            and owner['blocked_reason'] != BlockReasonCode.LEGACY_UNSCOPED_BLOCK.value)
         if (role_name in {'worker', 'reviewer'} and before.scope_id and before.scope_start_digest
-                and not correcting_scope and current.branch is not None
+                and user_input_cause and current.branch is not None
                 and resources is not None and not current.operations
                 and not project['agent_recovery'] and before.branch == current.branch
                 and current.branch == blocked_result.branch):
-            effects.validate_agent_scope(
-                role_name, worktree, before, blocked_result,
-                selected_plan_path=selected_plan_path if role_name == 'worker' else None,
-                allowed_guidance_targets=effects._guidance_worker_targets(connection, repo, plan_id),
-                allow_common_plans=effects._published_plan_allows_common_plans(repo_path, guidance_plan),
-                allowed_requirement_archives=archive_sources,
-                external_worktree=repo_path, base_branch=base, resources=resources,
-                connection=connection)
-            relation = (0 if blocked_result.head == current.head else
-                        effects.git(worktree, 'merge-base', '--is-ancestor',
-                                    blocked_result.head, current.head, check=False).returncode)
-            if relation == 0:
-                if any(_non_default_index_flags(entries) for entries in current.index.values()):
-                    raise AgentScopeError('사용자 입력의 index flags가 안전하지 않습니다.')
-                normalized = managed_rebase_adoption.selected_baseline(
-                    blocked_result, current, current.branch, str(worktree.resolve()))
+            result_safe = True
+            try:
                 effects.validate_agent_scope(
-                    'reviewer', worktree, normalized, current,
-                    allowed_ref_changes=allowed_ref_changes,
-                    allowed_worktree_changes=allowed_worktree_changes,
-                    external_worktree=repo_path, base_branch=base,
-                    resources=resources, connection=connection)
-                return
-            if relation not in {0, 1}:
-                raise AgentScopeError('사용자 입력의 commit 관계를 확인할 수 없습니다.')
+                    role_name, worktree, before, blocked_result,
+                    selected_plan_path=selected_plan_path if role_name == 'worker' else None,
+                    allowed_guidance_targets=effects._guidance_worker_targets(connection, repo, plan_id),
+                    allow_common_plans=effects._published_plan_allows_common_plans(repo_path, guidance_plan),
+                    allowed_requirement_archives=archive_sources,
+                    external_worktree=repo_path, base_branch=base, resources=resources,
+                    connection=connection)
+            except AgentScopeError:
+                if require_safe_result:
+                    raise
+                # Existing scope correction may still isolate a diagnosed
+                # Agent commit. Never normalize that result as user input;
+                # adoption separately requires the actual result to be safe.
+                result_safe = False
+            if result_safe:
+                relation = (0 if blocked_result.head == current.head else
+                            effects.git(worktree, 'merge-base', '--is-ancestor',
+                                        blocked_result.head, current.head, check=False).returncode)
+                if relation == 0:
+                    if any(_non_default_index_flags(entries) for entries in current.index.values()):
+                        raise AgentScopeError('사용자 입력의 index flags가 안전하지 않습니다.')
+                    normalized = managed_rebase_adoption.selected_baseline(
+                        blocked_result, current, current.branch, str(worktree.resolve()))
+                    effects.validate_agent_scope(
+                        'reviewer', worktree, normalized, current,
+                        allowed_ref_changes=allowed_ref_changes,
+                        allowed_worktree_changes=allowed_worktree_changes,
+                        external_worktree=repo_path, base_branch=base,
+                        resources=resources, connection=connection)
+                    return
+                if relation not in {0, 1}:
+                    raise AgentScopeError('사용자 입력의 commit 관계를 확인할 수 없습니다.')
         if (require_safe_result or (guidance_plan is not None
                     and guidance_plan['blocked_reason'] == GUIDANCE_BLOCK_REASON)):
             original = GitSnapshot.deserialize(str(serialized))

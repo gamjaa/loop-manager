@@ -1211,6 +1211,107 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
 
 class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
     """The production factory's identity/input adapters, with no Git process."""
+    def _user_document_service(self):
+        from tests.support.runtime import runtime_rebase_fixture
+        from loop_manager_internal.git.managed_rebase_runtime import build_service
+        connection, _, checkpoints, *_ = runtime_rebase_fixture(self)
+        current = checkpoints.get('repo', 'G-047')
+        checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+            operation='rebase', expected_head='before', target_base_oid='base',
+            observed_remote_oid='remote', snapshot={**current.snapshot,
+                'work_branch_integration': {'remote': 'remote', 'local_commit': 'local-user'}})
+        ports = mock.Mock()
+        def git(_root, *args, **kwargs):
+            output = ''
+            if args == ('rev-parse', '--git-common-dir'):
+                output = '/repo/.git'
+            elif args[0] == 'diff':
+                output = ''.join(':100644 100644 old user M\0' + path + '\0'
+                    for path in ('AGENTS.md', 'docs/ARCHITECTURE.md'))
+            return SimpleNamespace(stdout=output, returncode=0)
+        ports.git.side_effect = git
+        ports.requirement_archive_candidates.return_value = ()
+        ports._published_plan_allows_common_plans.return_value = False
+        ports._revision_execplan_input_fingerprint.return_value = 'published-input'
+        ports._worktree_execplan_input_fingerprint.return_value = 'current-input'
+        ports._owned_rebase_metadata.return_value = {'head-name': 'refs/heads/loop-manager/G-047',
+                                                    'orig-head': 'before', 'onto': 'base'}
+        ports._worker_path_allowed.side_effect = loop_manager._worker_path_allowed
+        service = build_service(ports, connection, Path(REPO), Path('/state'),
+                                'repo', 'G-047', Path('/owned'), 'loop-manager/G-047')
+        return ports, service
+
+    def test_owned_user_document_conflicts_allow_preservation_without_final_acceptance(self):
+        from tests.support.rebase_observations import observation
+        from loop_manager_internal.git.managed_rebase_validation import (
+            WorktreeFile, RebaseStatus, assess_scope, assess_current_rebase)
+        ports, service = self._user_document_service()
+        expected = service.expected
+        for path in ('AGENTS.md', 'docs/ARCHITECTURE.md'):
+            with self.subTest(path=path):
+                pending = observation(expected, head='partial', branch=None,
+                    branch_ref=('before', ''), registration=('HEAD=partial', 'detached=True'),
+                    branch_worktrees=(), operations=(('rebase-merge', 'owned'),),
+                    metadata=(('head-name', f'refs/heads/{expected.branch}'),
+                              ('orig-head', 'before'), ('onto', 'base')),
+                    index_clean=False,
+                    index=tuple(IndexEntry(path, '100644', f'blob-{stage}', stage, 'M', stage << 12)
+                                for stage in (1, 2, 3)),
+                    committed=(FileChange(path, '100644', '100644', 'old', 'partial-user', 'M'),),
+                    staged=(FileChange(path, '100644', '000000', 'old', '0', 'U'),),
+                    files=(WorktreeFile(path, ('staged', 'unstaged'), '100644', 'conflict bytes'),),
+                    input_fingerprint=expected.input_fingerprint, scope_fingerprint=expected.scope_fingerprint)
+                scope = assess_scope(expected, pending, path_allowed=service.adapters.path_allowed,
+                                     contracts_allowed=service.adapters.contracts_allowed)
+                with mock.patch('loop_manager_internal.git.managed_rebase_adoption.observe_current_rebase',
+                                return_value=(pending, scope)):
+                    _, decision = service.require_owned()
+                self.assertEqual(decision.status, RebaseStatus.WAITING)
+                self.assertIsNone(decision.acceptance)
+                self.assertEqual(len(pending.index), 3)  # The observation and stages remain intact.
+                final = observation(expected,
+                    committed=(FileChange(path, '100644', '100644', 'old', 'user', 'M'),),
+                    index=(IndexEntry(path, '100644', 'user', 0, 'H', 0),),
+                    input_fingerprint=expected.input_fingerprint, scope_fingerprint=expected.scope_fingerprint)
+                def decision_for(actual):
+                    scope = assess_scope(expected, actual, path_allowed=service.adapters.path_allowed,
+                                         contracts_allowed=service.adapters.contracts_allowed)
+                    return assess_current_rebase(expected, actual, scope)
+                self.assertEqual(decision_for(final).status, RebaseStatus.COMPLETE)
+                unapproved = replace(final, committed=(replace(final.committed[0], new_oid='agent'),))
+                self.assertEqual(decision_for(unapproved).status, RebaseStatus.REJECTED)
+                invalid_stage = replace(pending, index=(replace(pending.index[0], flags=0x8000),))
+                self.assertEqual(decision_for(invalid_stage).status, RebaseStatus.REJECTED)
+                foreign_operation = replace(pending, operations=(*pending.operations, ('MERGE_HEAD', 'foreign')))
+                self.assertEqual(decision_for(foreign_operation).status, RebaseStatus.REJECTED)
+                ports.reset_mock()
+                self.assertTrue(service.adapters.contracts_allowed(pending))
+                self.assertEqual(ports.mock_calls, [])  # Preservation policy stays pure.
+
+    def test_user_document_conflict_permission_requires_recorded_input_and_exact_operation(self):
+        from tests.support.rebase_observations import observation
+        from loop_manager_internal.git.managed_rebase_validation import WorktreeFile
+        _, service = self._user_document_service()
+        expected = service.expected
+        pending = observation(expected,
+            metadata=(('head-name', f'refs/heads/{expected.branch}'),
+                      ('orig-head', 'before'), ('onto', 'base')),
+            committed=(), staged=(FileChange('AGENTS.md', '100644', '000000', 'old', '0', 'U'),),
+            files=(WorktreeFile('AGENTS.md', ('unstaged',), '100644', 'manual bytes'),),
+            index=(IndexEntry('AGENTS.md', '100644', 'ours', 2, 'M', 0x2000),))
+        for metadata in (None, (('head-name', 'refs/heads/other'), ('orig-head', 'before'), ('onto', 'base')),
+                         (('head-name', f'refs/heads/{expected.branch}'), ('orig-head', 'other'), ('onto', 'base')),
+                         (('head-name', f'refs/heads/{expected.branch}'), ('orig-head', 'before'), ('onto', 'other'))):
+            with self.subTest(metadata=metadata):
+                self.assertFalse(service.adapters.contracts_allowed(replace(pending, metadata=metadata)))
+        unknown = 'docs/requirements/unconfirmed.md'
+        self.assertFalse(service.adapters.contracts_allowed(replace(pending,
+            staged=(replace(pending.staged[0], path=unknown),),
+            files=(replace(pending.files[0], path=unknown),),
+            index=(replace(pending.index[0], path=unknown),))))
+        # Once stages disappear, remaining manual bytes are subject to the final contract.
+        self.assertFalse(service.adapters.contracts_allowed(replace(pending, index=())))
+
     def test_archive_contract_uses_original_base_only_before_rebase(self):
         from loop_manager_internal.catalog import requirement_archive
         from loop_manager_internal.git.managed_rebase_runtime import build_service

@@ -21,6 +21,8 @@ def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, sna
     checkpoints = ExecutionCheckpointRepository(connection)
     current = checkpoints.get(repo, plan_id)
     intent = (current.snapshot or {}).get('work_branch_integration')
+    if intent and (intent['branch'], intent['worktree']) != (branch, str(worktree)):
+        raise RuntimeError('진행 중인 작업 branch 통합의 소유권이 다릅니다.')
     if intent and intent['phase'] == 'complete' and intent['remote'] != remote and current.operation is None:
         current = checkpoints.record(
             repo, plan_id, expected_generation=current.generation,
@@ -31,7 +33,7 @@ def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, sna
                           *(current.snapshot or {}).get('work_branch_integration_history', ()), intent]})
         intent = None
 
-    def save(value, *, head=None, operation=None):
+    def save(value, *, head=None, operation=None, history=None):
         nonlocal current, intent
         current = checkpoints.get(repo, plan_id)
         current = checkpoints.record(
@@ -39,8 +41,22 @@ def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, sna
             operation=operation, expected_head=head or current.expected_head,
             target_base_oid=current.target_base_oid if operation == 'rebase' else remote,
             observed_remote_oid=remote,
-            snapshot={**(current.snapshot or {}), 'integration_repo': repo, 'work_branch_integration': value})
+            snapshot={**(current.snapshot or {}), 'integration_repo': repo,
+                      'work_branch_integration': value,
+                      **({'work_branch_integration_history': history} if history is not None else {})})
         intent = value
+
+    if (intent and intent['remote'] != remote and current.operation is None
+            and intent['phase'] in {'preserving', 'rebasing'}):
+        # The caller fetched and verified a successor. No rebase has started:
+        # keep the original raw baseline/index and pinned commit, and retry the
+        # idempotent preservation checks before starting against the new input.
+        before = GitSnapshot.deserialize(intent['before'])
+        if (snapshot.branch != branch or snapshot.config != before.config
+                or controlling_git_operation(snapshot.operations)):
+            raise RuntimeError('중단된 작업 branch 통합의 로컬 소유권이 변경됐습니다.')
+        save({**intent, 'remote': remote, 'phase': 'preserving'},
+             history=[*(current.snapshot or {}).get('work_branch_integration_history', ()), intent])
 
     if intent and intent['remote'] != remote and current.operation == 'rebase':
         # A user pushed a newer successor while our owned rebase was paused.

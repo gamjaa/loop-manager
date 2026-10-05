@@ -70,8 +70,8 @@ class WorkBranchIntegrationUnitTests(unittest.TestCase):
     def rebase(self, *args, **kwargs):
         current = self.store.get('repo', 'G-166')
         self.store.record('repo', 'G-166', expected_generation=current.generation,
-            operation='rebase', expected_head=self.now.head, target_base_oid='remote',
-            observed_remote_oid='remote', snapshot=current.snapshot)
+            operation='rebase', expected_head=self.now.head, target_base_oid=args[-1],
+            observed_remote_oid=kwargs['observed_remote'][0], snapshot=current.snapshot)
         self.now = replace(self.now, head='combined')
         return subprocess.CompletedProcess([], 0, 'OK')
 
@@ -167,6 +167,63 @@ class WorkBranchIntegrationUnitTests(unittest.TestCase):
         self.run_integration()
         self.assertEqual(self.now.head, 'combined')
         self.effects._capture_agent_baseline.assert_called_once()
+
+    def test_new_successor_after_ref_update_interruption_reuses_original_preservation(self):
+        git = self.git
+        def interrupted(root, *args, **kwargs):
+            result = git(root, *args, **kwargs)
+            if 'update-ref' in args:
+                raise KeyboardInterrupt
+            return result
+        self.effects.git.side_effect = interrupted
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_integration()
+        original = self.store.get('repo', 'G-166').snapshot['work_branch_integration']
+        self.assertEqual(original['phase'], 'preserving')
+        self.effects.git.side_effect = git
+        self.run_integration('successor')
+        current = self.store.get('repo', 'G-166')
+        saved = current.snapshot['work_branch_integration']
+        self.assertEqual(saved['phase'], 'complete')
+        self.assertEqual(current.observed_remote_oid, 'successor')
+        self.assertEqual(current.snapshot['work_branch_integration_history'], [original])
+        for field in ('before', 'baseline', 'local_commit', 'local_tree'):
+            self.assertEqual(saved[field], original[field])
+        self.effects._capture_agent_baseline.assert_called_once()
+        self.effects._journaled_direct_rebase.assert_called_once()
+        self.assertEqual(self.effects._journaled_direct_rebase.call_args.args[-1], 'successor')
+
+    def test_new_successor_before_rebase_start_rechecks_pinned_work_and_does_not_repeat_commit(self):
+        self.effects._journaled_direct_rebase.side_effect = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_integration()
+        original = self.store.get('repo', 'G-166').snapshot['work_branch_integration']
+        self.assertEqual(original['phase'], 'rebasing')
+        self.assertIsNone(self.store.get('repo', 'G-166').operation)
+        self.effects._journaled_direct_rebase.side_effect = self.rebase
+        self.run_integration('successor')
+        self.assertEqual(self.now.head, 'combined')
+        saved = self.store.get('repo', 'G-166').snapshot['work_branch_integration']
+        self.assertEqual(saved['baseline'], original['baseline'])
+        self.assertEqual(saved['before'], original['before'])
+        self.effects._capture_agent_baseline.assert_called_once()
+        self.assertEqual(self.effects._journaled_direct_rebase.call_args.kwargs['observed_remote'],
+                         ('successor',))
+        self.assertEqual(sum('update-ref' in call.args for call in self.effects.git.call_args_list), 1)
+
+    def test_pending_successor_rejects_changed_local_work_without_mutating_git(self):
+        self.effects._journaled_direct_rebase.side_effect = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_integration()
+        self.now = replace(self.now, dirty={'file': (('unstaged',), 'later user bytes')})
+        self.effects.git.reset_mock()
+        with self.assertRaisesRegex(RuntimeError, '새 로컬 작업물'):
+            self.run_integration('successor')
+        self.assertFalse(any('read-tree' in call.args or 'update-ref' in call.args
+                             for call in self.effects.git.call_args_list))
+        self.assertEqual(self.now.dirty['file'][1], 'later user bytes')
+        saved = self.store.get('repo', 'G-166').snapshot['work_branch_integration']
+        self.assertEqual(saved['baseline'], self.baseline)
 
     def test_new_user_push_preserves_conflict_before_restarting_owned_operation(self):
         self.accepted.status.value = 'waiting_for_resolution'
@@ -324,10 +381,33 @@ class BlockedUserInputScopeUnitTests(unittest.TestCase):
         self.assertEqual(self.effects.validate_agent_scope.call_args.args[3], self.result)
         self.assertEqual(self.plan['agent_result_snapshot'], self.result.serialize())
 
+    def test_legacy_or_missing_cause_keeps_commit_isolation_route(self):
+        self.effects.capture_git_snapshot.return_value = self.result
+        for reason in (None, 'legacy_unscoped_block'):
+            with self.subTest(reason=reason):
+                self.plan['blocked_reason'] = reason
+                self.effects.validate_agent_scope.reset_mock()
+                self.validate()
+                self.assertEqual(self.effects.validate_agent_scope.call_count, 1)
+                self.assertEqual(self.effects.validate_agent_scope.call_args.args[0], 'worker')
+                self.assertEqual(self.effects.validate_agent_scope.call_args.args[2].dirty, self.result.dirty)
+        self.effects.git.assert_not_called()
+
+    def test_diagnosed_result_keeps_scope_correction_without_user_normalization(self):
+        self.effects.capture_git_snapshot.return_value = self.result
+        self.plan['blocked_reason'] = 'plan_input_invalid'
+        self.effects.validate_agent_scope.side_effect = [AgentScopeError('diagnosed commit'), None]
+        self.validate()
+        checks = self.effects.validate_agent_scope.call_args_list
+        self.assertEqual(len(checks), 2)
+        self.assertTrue(all(check.args[0] == 'worker' for check in checks))
+        self.assertEqual(checks[-1].args[2].dirty, self.result.dirty)
+        self.effects.git.assert_not_called()
+
     def test_actual_agent_violation_is_not_absorbed_as_user_input(self):
         self.effects.validate_agent_scope.side_effect = AgentScopeError('actual Agent violation')
         with self.assertRaisesRegex(AgentScopeError, 'actual Agent'):
-            self.validate()
+            self.validate(require_safe_result=True)
         self.effects.validate_agent_scope.assert_called_once()
 
     def test_unfinished_or_unproven_scope_does_not_absorb_new_user_bytes(self):
