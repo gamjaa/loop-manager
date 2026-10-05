@@ -943,6 +943,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         directory = self.enterContext(tempfile.TemporaryDirectory())
         database = Path(directory) / "notices.db"
         connection = self.connection(database=database)
+        self.addCleanup(connection.close)
         repo = "/projects/alpha"
         with connection:
             connection.execute(

@@ -2,6 +2,7 @@ import json
 import sqlite3
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 
@@ -208,9 +209,10 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
         )
 
     def test_merged_completion_outbox_replays_once_after_restart(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             database = Path(directory) / "state.db"
             connection = self.connection(database=database)
+            cleanup.callback(connection.close)
             repo = "/projects/alpha"
             snapshot = work_exhaustion.WorkReasonSnapshot("merge-cycle", (), (), None, None)
             with connection:
@@ -231,8 +233,8 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
             connection.close()
 
             restarted = sqlite3.connect(database)
+            cleanup.callback(restarted.close)
             restarted.row_factory = sqlite3.Row
-            self.addCleanup(restarted.close)
             notifications.configure_session(restarted, enabled=True)
             self.assertTrue(notifications.enqueue_completion_if_ready(
                 restarted, repo, snapshot,

@@ -53,7 +53,6 @@ class WorkerEscalationFixture:
         except BaseException:
             connection.close()
             raise
-        self.addCleanup(connection.close)
         return root, state_dir, connection
 
     def _active_worker_project(

@@ -24,6 +24,16 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
                 self._level_state(directory, initial_level=1)
         connection.close.assert_called_once_with()
 
+    def test_level_fixture_leaves_returned_file_connection_to_caller(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+            with mock.patch.object(self, "addCleanup") as register_cleanup:
+                _root, _state_dir, connection = self._level_state(
+                    directory, initial_level=1
+                )
+            cleanup.callback(connection.close)
+            register_cleanup.assert_not_called()
+            self.assertEqual(connection.execute("SELECT 1").fetchone()[0], 1)
+
     @dummy_worker_sessions
     def test_new_execplan_stores_capped_initial_and_effective_level(self):
         cases = (
@@ -55,6 +65,7 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
                 root, plan_path.relative_to(root).as_posix()
             )
             connection = sqlite3.connect(":memory:")
+            self.addCleanup(connection.close)
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
             loop_manager._ensure_execplans_schema(connection)
