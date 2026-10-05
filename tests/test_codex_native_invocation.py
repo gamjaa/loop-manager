@@ -1,6 +1,7 @@
 """Direct Codex invocation, native policy and runtime handoff contracts."""
 
 import sqlite3
+import errno
 from pathlib import Path
 import tempfile
 import io
@@ -179,6 +180,49 @@ class NativeWriteIsolationTests(TestCase):
             write_open.assert_not_called()
             scratch.assert_not_called()
 
+    def test_probe_checks_only_declared_paths_without_mount_or_tree_inspection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            boundary, state_root, home = self.boundary(Path(directory))
+            launch = envelope.prepare_launch(boundary, state_root, 'reviewer', True, (),
+                                             {'CODEX_HOME': str(home)})
+            specification = json.loads(launch.specification)
+            with mock.patch.object(gate.os, 'statvfs',
+                                   return_value=mock.Mock(f_flag=gate.os.ST_RDONLY)) as checked, \
+                 mock.patch.object(gate.os, 'open', side_effect=OSError(errno.EROFS, 'denied')), \
+                 mock.patch.object(gate.Path, 'open', side_effect=PermissionError('mount table unavailable')) as opened, \
+                 mock.patch.object(gate.Path, 'iterdir', side_effect=PermissionError('hidden subtree')) as listed, \
+                 mock.patch.object(gate.os, 'walk', side_effect=PermissionError('hidden subtree')) as walked:
+                gate.check_boundary(specification)
+            self.assertEqual([call.args[0] for call in checked.call_args_list],
+                             [Path(value) for value in specification['protected']])
+            opened.assert_not_called()
+            listed.assert_not_called()
+            walked.assert_not_called()
+
+    def test_missing_protected_path_and_lookup_errors_emit_no_success_marker(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            specification = {'protected': [str(root / 'missing')], 'files': [],
+                             'writable': [str(root)]}
+            failures = (None, *(OSError(code, 'lookup failed')
+                               for code in (errno.ENOENT, errno.EACCES, errno.EIO)))
+            for failure in failures:
+                specification['protected'] = [str(root if failure else root / 'missing')]
+                stdout, stderr = io.StringIO(), io.StringIO()
+                with self.subTest(failure=failure), \
+                     mock.patch.object(gate.sys, 'argv', ['probe', json.dumps(specification)]), \
+                     mock.patch.object(gate.sys, 'stdout', stdout), \
+                     mock.patch.object(gate.sys, 'stderr', stderr), \
+                     mock.patch.object(gate.os, 'statvfs', side_effect=failure) as checked, \
+                     mock.patch.object(gate.os, 'open') as opened, \
+                     mock.patch.object(gate.tempfile, 'TemporaryDirectory') as scratch:
+                    self.assertEqual(gate.main(), 125)
+                self.assertEqual(stdout.getvalue(), '')
+                self.assertIn('boundary verification failed', stderr.getvalue())
+                self.assertEqual(checked.call_count, int(failure is not None))
+                opened.assert_not_called()
+                scratch.assert_not_called()
+
     def test_writable_probe_creates_updates_renames_and_removes_only_scratch(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -188,12 +232,15 @@ class NativeWriteIsolationTests(TestCase):
             selected.mkdir()
             preserved = source / 'local-only'
             preserved.write_bytes(b'unchanged')
+            product = selected / 'existing-product'
+            product.write_bytes(b'saved work')
             specification = {'writable': [str(selected)], 'protected': [str(source)], 'files': []}
             with mock.patch.object(gate.os, 'statvfs', return_value=mock.Mock(f_flag=gate.os.ST_RDONLY)), \
                  mock.patch.object(gate.os, 'walk', side_effect=PermissionError('tree inspection unavailable')) as walk:
                 gate.check_boundary(specification)
             walk.assert_not_called()
-            self.assertEqual(list(selected.iterdir()), [])
+            self.assertEqual(list(selected.iterdir()), [product])
+            self.assertEqual(product.read_bytes(), b'saved work')
             self.assertEqual(preserved.read_bytes(), b'unchanged')
             self.assertEqual(list(source.iterdir()), [preserved])
 

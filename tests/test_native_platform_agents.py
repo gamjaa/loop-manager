@@ -1,7 +1,10 @@
 """실제 모델 호출 없이 OS별 Codex 격리·실행 경계를 검사한다."""
 import ctypes
+import errno
+import io
 import json
 import os
+import sqlite3
 from pathlib import Path
 import subprocess
 import sys
@@ -11,10 +14,13 @@ from types import SimpleNamespace
 import unittest
 from unittest import mock
 
+import loop_manager as manager
+from loop_manager_internal.agents import agent_invocation as invocation
 from loop_manager_internal.agents import agent_codex_sandbox as envelope
 from loop_manager_internal.agents import agent_sandbox_exec as probe
 from loop_manager_internal.agents import agent_write_isolation as isolation
 from loop_manager_internal.agents import provider_adapters
+from loop_manager_internal.storage import agent_invocation_state as state
 from tests.support.workspace import native_agent_boundary
 
 
@@ -107,6 +113,7 @@ class NativePlatformAgentTests(unittest.TestCase):
                 function = '_windows_readonly_directory' if platform == 'win32' else '_darwin_readonly_path'
                 with self.subTest(platform=platform), mock.patch.object(probe.sys, 'platform', platform), \
                      mock.patch.object(probe, function) as check, \
+                     mock.patch.object(probe.os, 'statvfs', create=True) as statvfs, \
                      mock.patch.object(probe.tempfile, 'mkstemp', side_effect=AssertionError('mutation')):
                     probe.check_boundary(spec)
                     check.assert_called_once_with(root)
@@ -114,6 +121,104 @@ class NativePlatformAgentTests(unittest.TestCase):
                     with self.assertRaises(probe.BoundaryError):
                         probe.check_boundary(spec)
                     self.assertEqual(list(root.iterdir()), [])
+                    statvfs.assert_not_called()
+
+    def test_non_linux_protected_file_probe_preserves_content_and_fails_closed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pointer = Path(directory) / '.git'
+            content = b'gitdir: /protected/worktrees/selected\n'
+            pointer.write_bytes(content)
+            spec = json.dumps({'protected': [str(pointer)], 'files': [], 'writable': []})
+            for platform in ('win32', 'darwin'):
+                # None uses the real writable open: it must fail without changing content.
+                for code in (None, errno.EACCES, errno.EPERM, errno.EROFS,
+                             errno.ENOENT, errno.EIO, errno.EINVAL):
+                    denied = code in (errno.EACCES, errno.EPERM, errno.EROFS)
+                    stdout, stderr = io.StringIO(), io.StringIO()
+                    real_open = probe.os.open
+                    with self.subTest(platform=platform, code=code), \
+                         mock.patch.object(probe.sys, 'platform', platform), \
+                         mock.patch.object(probe.sys, 'argv', ['probe', spec]), \
+                         mock.patch.object(probe.sys, 'stdout', stdout), \
+                         mock.patch.object(probe.sys, 'stderr', stderr), \
+                         mock.patch.object(probe, '_darwin_readonly_path'), \
+                         mock.patch.object(probe.os, 'statvfs', create=True) as statvfs, \
+                         mock.patch.object(probe.os, 'open', side_effect=
+                                           real_open if code is None else OSError(code, 'probe result')) as opened:
+                        self.assertEqual(probe.main(), 0 if denied else 125)
+                    opened.assert_called_once_with(str(pointer),
+                        probe.os.O_WRONLY | getattr(probe.os, 'O_CLOEXEC', 0))
+                    statvfs.assert_not_called()
+                    self.assertEqual(stdout.getvalue(), 'agent-tool-boundary-v2\n' if denied else '')
+                    self.assertEqual(bool(stderr.getvalue()), not denied)
+                    self.assertEqual(pointer.read_bytes(), content)
+
+    def test_probe_failure_blocks_provider_and_preserves_prior_invocation_and_files(self):
+        for system in ('Linux', 'Darwin', 'Windows'):
+            for role in ('worker', 'reviewer'):
+                for session in (None, 'saved-session'):
+                    for code, output in ((125, 'agent-tool-boundary-v2'),
+                                         (0, 'agent-write-boundary-v1'),
+                                         (0, 'agent-tool-boundary-v2 extra')):
+                        with self.subTest(system=system, role=role, session=session, code=code, output=output), \
+                             tempfile.TemporaryDirectory() as directory:
+                            boundary, state_root, home = native_agent_boundary(Path(directory))
+                            connection = sqlite3.connect(':memory:')
+                            self.addCleanup(connection.close)
+                            state.ensure_schema(connection)
+                            ledger = state.InvocationRepository(connection)
+                            profile = invocation.ResolvedProfile('model', 'high')
+                            context = invocation.InvocationContext(str(boundary.source), 'G-114', attempt=2)
+                            prior = ledger.start(invocation.InvocationContext(str(boundary.source), 'G-114'),
+                                                 role, 'codex', profile, 'saved-session')
+                            ledger.record_isolation(prior, isolation.IsolationEvidence(
+                                'codex', 'codex-cli 0.159.3', system, role, str(boundary.worktree),
+                                boundary.repository_identity, 'prior-policy', 'verified', '', 'snapshot', 'config'))
+                            ledger.finish(prior, 'success', 0, 1, 'saved-session', invocation.Usage())
+                            old_calls = connection.execute('SELECT * FROM agent_invocations').fetchall()
+                            old_proofs = connection.execute('SELECT * FROM agent_isolation_evidence').fetchall()
+                            logs = state_root / 'logs' / manager.hashlib.sha256(
+                                str(boundary.worktree).encode()).hexdigest()[:16]
+                            logs.mkdir(parents=True)
+                            preserved = (logs / f'{role}.log', logs / f'{role}-last.txt',
+                                         boundary.worktree / 'work-product.txt')
+                            for path in preserved:
+                                path.write_text('saved content')
+
+                            def run(command, **kwargs):
+                                if command == ['codex', '--version']:
+                                    return subprocess.CompletedProcess(command, 0, 'codex-cli 0.159.3', '')
+                                if tuple(command[-2:]) == ('features', 'list'):
+                                    return subprocess.CompletedProcess(command, 0,
+                                        'plugins stable false\napps stable false\n', '')
+                                self.assertEqual(tuple(command[:2]), ('codex', 'sandbox'))
+                                return subprocess.CompletedProcess(command, code, output, '')
+
+                            with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
+                                 mock.patch.object(isolation.platform, 'system', return_value=system), \
+                                 mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
+                                 mock.patch.object(manager, 'capture_git_snapshot', return_value=
+                                                   mock.Mock(serialize=lambda: 'snapshot')), \
+                                 mock.patch.object(isolation.subprocess, 'run', side_effect=run), \
+                                 mock.patch.object(manager.subprocess, 'Popen') as spawn:
+                                with self.assertRaisesRegex(isolation.IsolationError, '쓰기 경계'):
+                                    manager.run_agent('codex', boundary.worktree, state_root,
+                                        state_root / 'config', role, 'prompt', read_only=role == 'reviewer',
+                                        persist_session=True, session_id=session, connection=connection,
+                                        resolved_profile=profile, invocation=context)
+                            spawn.assert_not_called()
+                            self.assertEqual(connection.execute('SELECT * FROM agent_invocations WHERE invocation_id = ?',
+                                             (prior,)).fetchall(), old_calls)
+                            self.assertEqual(connection.execute('SELECT * FROM agent_isolation_evidence WHERE invocation_id = ?',
+                                             (prior,)).fetchall(), old_proofs)
+                            row = connection.execute('''SELECT proof.status, call.session_id, call.attempt,
+                                call.result_kind, call.finished_at FROM agent_invocations call
+                                JOIN agent_isolation_evidence proof USING(invocation_id)
+                                WHERE call.invocation_id != ?''', (prior,)).fetchone()
+                            self.assertEqual(row[:4], ('rejected', session, 2, 'exception'))
+                            self.assertIsNotNone(row[4])
+                            for path in preserved:
+                                self.assertEqual(path.read_text(), 'saved content')
 
     def test_windows_directory_probe_checks_each_right_without_writes(self):
         kernel = mock.Mock()
