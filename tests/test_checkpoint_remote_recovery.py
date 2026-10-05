@@ -272,12 +272,18 @@ class CheckpointRebaseGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.Te
 
     def _user_document_conflict_then_successor(self, path):
         repo, _ = self._remote_refresh_fixture()
-        self.user_commit(path, 'remote user document\n')
+        remote = self.user_commit(path, 'remote user document\n')
         target = self.worktree / path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text('local user document\n')
         self.run_git(self.worktree, 'add', '--', path)
         self.run_git(self.worktree, 'commit', '-m', 'Local user document input')
+        loop_manager.observe_blocked_plan_remotes(self.connection, self.repo, repo,
+            self.connection.execute('SELECT * FROM projects').fetchone())
+        observed = self.connection.execute(
+            'SELECT branch_oid FROM blocked_remote_observations WHERE repo = ? AND plan_id = ?',
+            (repo, 'G-034')).fetchone()
+        self.assertEqual(observed['branch_oid'], remote)
         self.assertFalse(loop_manager.resume_plan_blocks(
             self.connection, self.repo, self.state_dir, repo, 'main'))
         self.assertIn(path, self.run_git(self.worktree, 'ls-files', '-u'))

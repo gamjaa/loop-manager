@@ -20,6 +20,39 @@ from tests.support.blocked_remote import PlanRemoteRecoveryFixture
 
 
 class PlanRecoveryGateTests(PlanRemoteRecoveryFixture, unittest.TestCase):
+    def test_push_after_observation_is_preserved_until_refresh_pins_new_lease(self):
+        original = self.published_successor()
+        successor = self.row()['branch_oid']
+        self.connection.execute(
+            'UPDATE blocked_remote_observations SET branch_oid = ?, confirmed_branch_oid = ? '
+            'WHERE repo = ? AND plan_id = ?',
+            (original.head, original.head, self.repo, 'G-106'))
+        self.connection.commit()
+        with (mock.patch.object(loop_manager, '_worktree_state_signature', return_value=self.signature),
+              mock.patch.object(self.coordinator, '_incorporate', side_effect=KeyboardInterrupt) as incorporate):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+            self.ports._reconcile_published_blocked_checkpoint.assert_not_called()
+            incorporate.assert_not_called()
+            self.assertEqual(self.current_snapshot, original)
+            self.assertEqual(blocked_checkpoint_state.BlockedCheckpointRepository(
+                self.connection).get(self.repo, 'G-106').remote_oid, original.head)
+            loop_manager.observe_blocked_plan_remotes(
+                self.connection, Path('/repo'), self.repo,
+                self.connection.execute('SELECT * FROM projects').fetchone(), plan_id='G-106')
+            self.assertEqual(self.row()['branch_oid'], successor)
+            with self.assertRaises(KeyboardInterrupt):
+                self.coordinator.reconcile('G-106')
+        self.assertEqual(self.current_snapshot.head, successor)
+        self.assertEqual(self.ports._reconcile_published_blocked_checkpoint.call_args.kwargs[
+            'expected_remote_oid'], successor)
+        self.assertEqual(execution_checkpoint_state.ExecutionCheckpointRepository(
+            self.connection).get(self.repo, 'G-106').observed_remote_oid, successor)
+        self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
+        self.assertEqual(self.plan()['agent_result_snapshot'], original.serialize())
+        self.assertEqual(scoped_blocking.plan_block(self.connection, self.repo, 'G-106')['evidence'],
+                         'original verify failure')
+        self.assertTrue(blocked_remote_observation.pending_input(self.row()))
+
     def test_published_successor_does_not_update_another_repositorys_plan(self):
         other = dict(self.plan())
         other['repo'] = 'other-repo'
