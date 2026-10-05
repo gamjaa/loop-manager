@@ -83,19 +83,6 @@ def provider_profile(
             f"{label} Model 설정이 비어 있습니다: [{models_section}] {alias}"
         )
 
-    if provider == "claude" and section == "claude.worker" and name == "level8":
-        expected_alias, expected_effort = "strong", "max"
-        if (alias, effort) != (expected_alias, expected_effort):
-            raise RuntimeError(
-                f"{label}은 {expected_alias},{expected_effort} 설정이어야 합니다."
-            )
-        if not re.fullmatch(
-            r"claude-opus-5(?:[-.].*)?", model
-        ):
-            raise RuntimeError(
-                f"{label} Model은 claude-opus-5 계열이어야 합니다: {model}"
-            )
-
     supported = model_efforts.get(model)
     if supported is None:
         raise RuntimeError(

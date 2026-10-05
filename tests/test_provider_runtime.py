@@ -11,6 +11,7 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 import loop_manager
+from tests.support.profiles import profile_config
 from tests.support.worker import worker_result
 
 
@@ -82,26 +83,13 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
         self.assertEqual(row["provider"], "codex")
 
     def test_codex_and_claude_profiles_validate_every_role_and_level(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        config = Path(directory.name) / "config.ini"
-        config.write_text(
-            "[codex.models]\nstrong = test-strong\n"
-            "[codex.roles]\nplanner = strong,xhigh\nreviewer = strong,high\n"
-            "[codex.worker]\n"
-            + "".join(f"level{level} = strong,xhigh\n" for level in range(1, 9))
-            + "[claude.models]\nstrong = claude-opus-5\n"
-            "fast = claude-haiku-4-5-20251001\n"
-            "[claude.roles]\nplanner = strong,high\nreviewer = strong,high\n"
-            "[claude.worker]\nlevel1 = fast,medium\n"
-            + "".join(f"level{level} = strong,high\n" for level in range(2, 8))
-            + "level8 = strong,max\n",
-            encoding="utf-8",
-        )
+        config = profile_config(self)
         all_efforts = frozenset(
             {"low", "medium", "high", "xhigh", "max", "ultra"}
         )
-        codex_models = {"test-strong": all_efforts}
+        codex_models = {
+            model: all_efforts for model in ("test-fast", "test-balanced", "test-strong")
+        }
 
         loop_manager.validate_provider_profiles(config, "codex", codex_models)
         supported = subprocess.CompletedProcess(
@@ -129,7 +117,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             loop_manager.provider_worker_profile(
                 config, "claude", 1, claude_models
             ),
-            ("claude-haiku-4-5-20251001", "medium"),
+            ("claude-haiku-test", "medium"),
         )
         self.assertEqual(
             loop_manager.provider_profile(
@@ -140,7 +128,18 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
                 "Claude reviewer",
                 claude_models,
             ),
-            ("claude-opus-5", "high"),
+            ("claude-opus-test", "high"),
+        )
+
+        parser = configparser.ConfigParser()
+        parser.read(config, encoding="utf-8")
+        parser["claude.worker"]["level8"] = "fast,medium"
+        with config.open("w", encoding="utf-8") as output:
+            parser.write(output)
+        loop_manager.validate_provider_profiles(config, "claude", claude_models)
+        self.assertEqual(
+            loop_manager.provider_worker_profile(config, "claude", 8, claude_models),
+            ("claude-haiku-test", "medium"),
         )
 
     def test_example_profiles_validate_every_role_and_level(self):
@@ -164,7 +163,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             root = Path(directory)
             config = root / "config.ini"
             config.write_text(
-                "[claude.models]\nfast = claude-haiku-4-5-20251001\n"
+                "[claude.models]\nfast = claude-haiku-test\n"
                 "[claude.worker]\nlevel1 = fast,minimal\n",
                 encoding="utf-8",
             )
@@ -187,7 +186,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             root = Path(directory)
             config = root / "config.ini"
             config.write_text(
-                "[claude.models]\nstrong = claude-opus-999\n"
+                "[claude.models]\nstrong = claude-opus-unsupported\n"
                 "[claude.roles]\nplanner = strong,high\n",
                 encoding="utf-8",
             )
@@ -195,7 +194,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             def reject_model(arguments, **_kwargs):
                 return subprocess.CompletedProcess(
                     arguments,
-                    1 if "claude-opus-999" in arguments else 0,
+                    1 if "claude-opus-unsupported" in arguments else 0,
                     stdout="Unknown model",
                 )
 
@@ -203,12 +202,12 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
                 "loop_manager.command", side_effect=reject_model
             ):
                 with self.assertRaisesRegex(
-                    RuntimeError, "Model.*claude-opus-999"
+                    RuntimeError, "Model.*claude-opus-unsupported"
                 ):
                     loop_manager.claude_model_efforts(config, root)
 
             config.write_text(
-                "[claude.models]\nstrong = claude-opus-5\n"
+                "[claude.models]\nstrong = claude-opus-test\n"
                 "[claude.roles]\nplanner = strong,max\n",
                 encoding="utf-8",
             )
@@ -224,12 +223,12 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
                 "loop_manager.command", side_effect=reject_effort
             ):
                 with self.assertRaisesRegex(
-                    RuntimeError, "Model/Effort.*claude-opus-5,max"
+                    RuntimeError, "Model/Effort.*claude-opus-test,max"
                 ):
                     loop_manager.claude_model_efforts(config, root)
 
     def test_runtime_validation_rejects_missing_and_unauthenticated_cli(self):
-        config = loop_manager.ROOT / "config/config.ini.example"
+        config = profile_config(self)
         with mock.patch("loop_manager.shutil.which", return_value=None), mock.patch(
             "loop_manager.command"
         ) as command:
@@ -271,7 +270,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
         )
 
     def test_claude_starts_resumes_and_applies_role_permissions(self):
-        config = loop_manager.ROOT / "config/config.ini.example"
+        config = profile_config(self)
         session_id = "claude-session"
         calls: list[tuple[list[str], dict[str, object]]] = []
         stream = (
@@ -319,10 +318,10 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             started_sessions: list[str] = []
             with mock.patch(
                 "loop_manager.claude_worker_profile",
-                return_value=("claude-sonnet-5", "high"),
+                return_value=("claude-sonnet-test", "high"),
             ), mock.patch(
                 "loop_manager.claude_role",
-                return_value=("claude-opus-5", "high"),
+                return_value=("claude-opus-test", "high"),
             ), mock.patch(
                 "loop_manager.subprocess.Popen", side_effect=StartedProcess
             ):
@@ -385,7 +384,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             })
 
     def test_claude_planner_processes_do_not_force_bytecode_isolation(self):
-        config = loop_manager.ROOT / "config/config.ini.example"
+        config = profile_config(self)
         session_id = "claude-planner-session"
         stream = (
             json.dumps({"type": "system", "session_id": session_id}) + "\n"
@@ -414,7 +413,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             with mock.patch.dict(
                 os.environ, {"PYTHONDONTWRITEBYTECODE": "0"}, clear=False
             ), mock.patch(
-                "loop_manager.claude_role", return_value=("claude-opus-5", "high")
+                "loop_manager.claude_role", return_value=("claude-opus-test", "high")
             ), mock.patch(
                 "loop_manager.subprocess.Popen", side_effect=started_process
             ) as popen, mock.patch(
@@ -482,7 +481,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
         )
 
     def test_claude_stream_errors_preserve_output_for_classification_and_retry(self):
-        config = loop_manager.ROOT / "config/config.ini.example"
+        config = profile_config(self)
 
         class StreamOutput:
             def __init__(self, raw_output):
@@ -537,7 +536,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             state_dir = root / "state"
             with mock.patch(
                 "loop_manager.claude_worker_profile",
-                return_value=("claude-sonnet-5", "high"),
+                return_value=("claude-sonnet-test", "high"),
             ), mock.patch(
                 "loop_manager.subprocess.Popen", side_effect=start_process
             ) as popen:
@@ -585,7 +584,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
         )
 
     def test_claude_zero_exit_stream_error_remains_failure(self):
-        config = loop_manager.ROOT / "config/config.ini.example"
+        config = profile_config(self)
         cases = (
             ({"type": "error", "error": {"message": "usage limit reached"}},
              "usage limit reached", loop_manager.AgentResultKind.USAGE_LIMIT, 1),
@@ -622,7 +621,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
 
                             with mock.patch(
                                 "loop_manager.claude_worker_profile",
-                                return_value=("claude-sonnet-5", "high"),
+                                return_value=("claude-sonnet-test", "high"),
                             ), mock.patch(
                                 "loop_manager.subprocess.Popen", side_effect=start
                             ):

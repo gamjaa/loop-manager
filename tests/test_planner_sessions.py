@@ -7,11 +7,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
+from tests.support.profiles import profile_config
 
 
 class PlannerSessionsTest(unittest.TestCase):
     def test_planner_codex_persists_thread_id_and_resumes_exact_session(self):
-        config = loop_manager.ROOT / "config/config.ini.example"
+        config = profile_config(self)
         calls = []
         call_options = []
 
@@ -56,7 +57,7 @@ class PlannerSessionsTest(unittest.TestCase):
             state_dir = Path(directory) / "state"
             with mock.patch(
                 "loop_manager.codex_model_efforts",
-                return_value={"gpt-6.1-sol": frozenset({"xhigh"})},
+                return_value={"test-strong": frozenset({"xhigh"})},
             ), mock.patch(
                 "loop_manager.subprocess.Popen", side_effect=StartedProcess
             ), mock.patch("loop_manager.subprocess.run", side_effect=codex_run):
@@ -145,7 +146,7 @@ class PlannerSessionsTest(unittest.TestCase):
             worktree.mkdir()
             state_dir = root / "state"
             with mock.patch(
-                "loop_manager.role", return_value=("gpt-5.6-sol", "high")
+                "loop_manager.role", return_value=("test-strong", "high")
             ), mock.patch("loop_manager.subprocess.Popen", side_effect=resumed):
                 result = loop_manager.run_codex(
                     worktree,

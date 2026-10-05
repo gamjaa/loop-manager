@@ -5,25 +5,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
+from tests.support.profiles import profile_config
 
 
 class ProviderProfilesTest(unittest.TestCase):
-    def profile_config(self):
-        directory = tempfile.TemporaryDirectory()
-        self.addCleanup(directory.cleanup)
-        config = Path(directory.name) / "config.ini"
-        config.write_text(
-            "[codex.models]\n"
-            "fast = test-fast\nbalanced = test-balanced\nstrong = test-strong\n"
-            "[codex.roles]\nplanner = strong,xhigh\n"
-            "[codex.worker]\n"
-            "level1 = fast,medium\nlevel4 = balanced,high\nlevel7 = strong,xhigh\n",
-            encoding="utf-8",
-        )
-        return config
-
     def test_role_resolves_model_alias(self):
-        config = self.profile_config()
+        config = profile_config(self)
 
         with mock.patch(
             "loop_manager.codex_model_efforts",
@@ -53,7 +40,7 @@ class ProviderProfilesTest(unittest.TestCase):
                 self.assertEqual(loop_manager.worker_level(plan), expected)
 
     def test_worker_profile_resolves_level_alias(self):
-        config = self.profile_config()
+        config = profile_config(self)
 
         model_efforts = {
             "test-fast": frozenset({"medium"}),
@@ -66,7 +53,7 @@ class ProviderProfilesTest(unittest.TestCase):
             self.assertEqual(loop_manager.worker_profile(config, 7), ("test-strong", "xhigh"))
 
     def test_worker_profile_rejects_invalid_level(self):
-        config = self.profile_config()
+        config = profile_config(self)
 
         for level in (0, 9, True):
             with self.subTest(level=level):
@@ -102,8 +89,8 @@ class ProviderProfilesTest(unittest.TestCase):
             ),
             (
                 "unsupported-effort",
-                "[codex.models]\nfast = gpt-5.6-sol\n[codex.worker]\nlevel1 = fast,minimal\n",
-                "Model/Effort 조합을 Codex CLI가 지원하지 않습니다: gpt-5.6-sol,minimal",
+                "[codex.models]\nfast = test-strong\n[codex.worker]\nlevel1 = fast,minimal\n",
+                "Model/Effort 조합을 Codex CLI가 지원하지 않습니다: test-strong,minimal",
             ),
             (
                 "unsupported-model",
@@ -145,7 +132,7 @@ class ProviderProfilesTest(unittest.TestCase):
                     with mock.patch(
                         "loop_manager.codex_model_efforts",
                         return_value={
-                            "gpt-5.6-sol": frozenset(
+                            "test-strong": frozenset(
                                 {"low", "medium", "high", "xhigh", "max", "ultra"}
                             )
                         },
@@ -157,7 +144,7 @@ class ProviderProfilesTest(unittest.TestCase):
         catalog = {
             "models": [
                 {
-                    "slug": "gpt-reserve",
+                    "slug": "test-reserve",
                     "supported_reasoning_levels": [
                         {"effort": "max"}, {"effort": "ultra"}
                     ],
@@ -169,12 +156,12 @@ class ProviderProfilesTest(unittest.TestCase):
         with mock.patch("loop_manager.command", return_value=completed) as command:
             efforts = loop_manager.codex_model_efforts(worktree)
 
-        self.assertEqual(efforts, {"gpt-reserve": frozenset({"max", "ultra"})})
+        self.assertEqual(efforts, {"test-reserve": frozenset({"max", "ultra"})})
         self.assertEqual(command.call_args.args[0], ["codex", "debug", "models"])
         self.assertEqual(command.call_args.kwargs["cwd"], worktree)
 
     def test_run_codex_validates_profile_in_worker_catalog(self):
-        config = self.profile_config()
+        config = profile_config(self)
         with tempfile.TemporaryDirectory() as directory:
             worktree = Path(directory) / "worktree"
             worktree.mkdir()
@@ -200,13 +187,13 @@ class ProviderProfilesTest(unittest.TestCase):
 
     def test_profiles_validate_model_specific_efforts(self):
         model_efforts = {
-            "gpt-5.6-sol": frozenset({"low", "medium", "high", "xhigh", "max", "ultra"}),
-            "gpt-5.6-luna": frozenset({"low", "medium", "high", "xhigh", "max"}),
+            "test-strong": frozenset({"low", "medium", "high", "xhigh", "max", "ultra"}),
+            "test-fast": frozenset({"low", "medium", "high", "xhigh", "max"}),
         }
         contents = (
             "[codex.models]\n"
-            "strong = gpt-5.6-sol\n"
-            "fast = gpt-5.6-luna\n"
+            "strong = test-strong\n"
+            "fast = test-fast\n"
             "[codex.roles]\n"
             "planner = strong,max\n"
             "reviewer = strong,ultra\n"
@@ -223,16 +210,16 @@ class ProviderProfilesTest(unittest.TestCase):
                 "loop_manager.codex_model_efforts",
                 return_value=model_efforts,
             ):
-                self.assertEqual(loop_manager.role(config, "planner"), ("gpt-5.6-sol", "max"))
-                self.assertEqual(loop_manager.role(config, "reviewer"), ("gpt-5.6-sol", "ultra"))
-                self.assertEqual(loop_manager.worker_profile(config, 1), ("gpt-5.6-luna", "max"))
+                self.assertEqual(loop_manager.role(config, "planner"), ("test-strong", "max"))
+                self.assertEqual(loop_manager.role(config, "reviewer"), ("test-strong", "ultra"))
+                self.assertEqual(loop_manager.worker_profile(config, 1), ("test-fast", "max"))
                 for level in (2, 3):
                     with self.subTest(level=level):
                         with self.assertRaisesRegex(RuntimeError, "Model/Effort 조합"):
                             loop_manager.worker_profile(config, level)
 
     def test_worker_codex_uses_level_model_and_effort(self):
-        config = self.profile_config()
+        config = profile_config(self)
         with tempfile.TemporaryDirectory() as directory:
             worktree = Path(directory) / "worktree"
             worktree.mkdir()
@@ -262,13 +249,13 @@ class ProviderProfilesTest(unittest.TestCase):
             root = Path(directory)
             config = root / "config.ini"
             config.write_text(
-                "[codex.models]\nstrong = gpt-5.6-sol\n[codex.worker]\nlevel1 = strong,minimal\n",
+                "[codex.models]\nstrong = test-strong\n[codex.worker]\nlevel1 = strong,minimal\n",
                 encoding="utf-8",
             )
             with mock.patch(
                 "loop_manager.codex_model_efforts",
                 return_value={
-                    "gpt-5.6-sol": frozenset({"low", "medium", "high", "xhigh", "max", "ultra"})
+                    "test-strong": frozenset({"low", "medium", "high", "xhigh", "max", "ultra"})
                 },
             ), mock.patch("loop_manager.subprocess.run") as run:
                 with self.assertRaisesRegex(RuntimeError, "Model/Effort 조합"):

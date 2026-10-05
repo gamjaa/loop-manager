@@ -326,7 +326,7 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - 정확한 Model 이름과 Effort는 `config/config.ini`에서 관리한다
 - 최초 Worker level 계산은 level 8을 반환하지 않는다
 - 유효한 Review FAIL의 저장된 반복 진행만 effective level을 한 단계씩 올릴 수 있으며 한 ExecPlan 안에서는 level을 낮추지 않는다
-- Codex level 8은 `gpt-6-astra,low`, Claude level 8은 Opus strong alias의 `max`를 사용하고 level 8보다 높은 자동 profile은 없다
+- Codex와 Claude의 level 8도 `config/config.ini`에서 지정한 Model alias와 Effort를 사용하며 CLI가 지원하는 조합인지 검증한다. level 8보다 높은 자동 profile은 없다
 - effective level과 level별 Review 승격 이력은 SQLite에 저장하고 새 ExecPlan 또는 정상적인 BLOCKED 해제에서 최초 level로 초기화한다
 
 ### PR 생성과 Merge 후 정리

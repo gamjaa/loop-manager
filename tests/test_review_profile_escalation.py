@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
+from tests.support.profiles import profile_config
 from tests.support.catalog import make_catalog_root, write_execplan
 from tests.support.worker import dummy_worker_sessions
 
@@ -274,91 +275,70 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
 
     @dummy_worker_sessions
     def test_codex_and_claude_level_eight_profiles_share_validation_boundary(self):
-        config = loop_manager.ROOT / "config/config.ini.example"
-        with mock.patch(
-            "loop_manager.codex_model_efforts",
-            return_value={"gpt-6.1-sol": frozenset({"xhigh"})},
+        config = profile_config(self)
+        for provider, model, effort in (
+            ("codex", "test-strong", "xhigh"),
+            ("claude", "claude-opus-test", "max"),
         ):
-            self.assertEqual(
-                loop_manager.worker_profile(config, 8),
-                ("gpt-6.1-sol", "xhigh"),
-            )
-        self.assertEqual(
-            loop_manager.provider_worker_profile(
-                config,
-                "claude",
-                8,
-                {"claude-opus-5": frozenset({"max"})},
-            ),
-            ("claude-opus-5", "max"),
-        )
+            with self.subTest(provider=provider):
+                catalog = {model: frozenset({effort})}
+                self.assertEqual(
+                    loop_manager.provider_worker_profile(config, provider, 8, catalog),
+                    (model, effort),
+                )
+                with mock.patch(
+                    f"loop_manager.{provider}_model_efforts", return_value=catalog
+                ):
+                    resolve = (loop_manager.worker_profile if provider == "codex"
+                               else loop_manager.claude_worker_profile)
+                    self.assertEqual(resolve(config, 8), (model, effort))
+
+                with tempfile.TemporaryDirectory() as directory:
+                    with mock.patch(
+                        f"loop_manager.{provider}_model_efforts",
+                        return_value={model: frozenset({"medium"})},
+                    ), mock.patch("loop_manager.subprocess.run") as run, mock.patch(
+                        "loop_manager.subprocess.Popen"
+                    ) as popen:
+                        with self.assertRaisesRegex(RuntimeError, "지원하지 않습니다"):
+                            getattr(loop_manager, f"run_{provider}")(
+                                Path(directory) / "worktree",
+                                Path(directory) / "state",
+                                config,
+                                "worker",
+                                "prompt",
+                                read_only=False,
+                                level=8,
+                            )
+                    run.assert_not_called()
+                    popen.assert_not_called()
 
         with tempfile.TemporaryDirectory() as directory:
-            with mock.patch(
-                "loop_manager.codex_model_efforts",
-                return_value={"gpt-6.1-sol": frozenset({"medium"})},
-            ), mock.patch("loop_manager.subprocess.run") as subprocess_run:
-                with self.assertRaisesRegex(RuntimeError, "지원하지 않습니다"):
-                    loop_manager.run_codex(
-                        Path(directory) / "worktree",
-                        Path(directory) / "state",
-                        config,
-                        "worker",
-                        "prompt",
-                        read_only=False,
-                        level=8,
+            for provider, model in (
+                ("codex", "supported-model"),
+                ("claude", "claude-haiku-custom"),
+            ):
+                with self.subTest(provider=provider, profile="custom,high"):
+                    custom_config = Path(directory) / f"{provider}.ini"
+                    custom_config.write_text(
+                        f"[{provider}.models]\ncustom = {model}\n"
+                        f"[{provider}.worker]\nlevel8 = custom,high\n",
+                        encoding="utf-8",
                     )
-            subprocess_run.assert_not_called()
-
-        with tempfile.TemporaryDirectory() as directory:
-            custom_config = Path(directory) / "custom.ini"
-            custom_config.write_text(
-                "[codex.models]\ncustom = supported-model\n"
-                "[codex.worker]\nlevel8 = custom,high\n",
-                encoding="utf-8",
-            )
-            self.assertEqual(
-                loop_manager.provider_worker_profile(
-                    custom_config, "codex", 8,
-                    {"supported-model": frozenset({"high"})},
-                ),
-                ("supported-model", "high"),
-            )
-            with self.assertRaisesRegex(RuntimeError, "지원하지 않습니다"):
-                loop_manager.provider_worker_profile(custom_config, "codex", 8, {})
-
-        invalid_profiles = (
-            (
-                "claude-alias",
-                "[claude.models]\nstrong = claude-opus-5\nfast = claude-haiku\n"
-                "[claude.worker]\nlevel8 = fast,max\n",
-                "claude",
-                {"claude-haiku": frozenset({"max"})},
-                "strong,max",
-            ),
-            (
-                "claude-family",
-                "[claude.models]\nstrong = claude-fable-5\n"
-                "[claude.worker]\nlevel8 = strong,max\n",
-                "claude",
-                {"claude-fable-5": frozenset({"max"})},
-                "claude-opus-5",
-            ),
-            (
-                "unsupported-effort",
-                "[codex.models]\nfrontier = gpt-6-astra\n"
-                "[codex.worker]\nlevel8 = frontier,low\n",
-                "codex",
-                {"gpt-6-astra": frozenset({"medium"})},
-                "지원하지 않습니다",
-            ),
-        )
-        with tempfile.TemporaryDirectory() as directory:
-            for name, contents, provider, catalog, message in invalid_profiles:
-                with self.subTest(name=name):
-                    profile_config = Path(directory) / f"{name}.ini"
-                    profile_config.write_text(contents, encoding="utf-8")
-                    with self.assertRaisesRegex(RuntimeError, message):
+                    self.assertEqual(
                         loop_manager.provider_worker_profile(
-                            profile_config, provider, 8, catalog
+                            custom_config, provider, 8, {model: frozenset({"high"})},
+                        ),
+                        (model, "high"),
+                    )
+                    with self.assertRaisesRegex(RuntimeError, "지원하지 않습니다"):
+                        loop_manager.provider_worker_profile(custom_config, provider, 8, {})
+                    custom_config.write_text(
+                        f"[{provider}.models]\ncustom = {model}\n"
+                        f"[{provider}.worker]\nlevel7 = custom,high\n",
+                        encoding="utf-8",
+                    )
+                    with self.assertRaisesRegex(RuntimeError, "level8 설정이 없습니다"):
+                        loop_manager.provider_worker_profile(
+                            custom_config, provider, 8, {model: frozenset({"high"})},
                         )
