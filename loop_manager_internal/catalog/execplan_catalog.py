@@ -7,7 +7,7 @@ plans while validating identity and dependencies across both collections.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import hashlib
 from pathlib import Path, PurePosixPath
@@ -235,11 +235,19 @@ def _is_regular_file(path: Path) -> bool:
 
 
 def _source_exists(
-    root: Path,
+    root: Path | None,
     source: str,
     *,
     allow_archive_fallback: bool,
+    available_regular_paths: AbstractSet[str] | None = None,
 ) -> bool:
+    if available_regular_paths is not None:
+        return source in available_regular_paths or bool(
+            allow_archive_fallback and source != "docs/PRODUCT.md"
+            and requirement_archive_path(source) in available_regular_paths
+        )
+    if root is None:
+        return True
     if _is_regular_file(root / source):
         return True
     return bool(
@@ -372,12 +380,34 @@ class ExecPlanDefinition:
 
 
 @dataclass(frozen=True)
+class CatalogIssue:
+    """A declaration failure with identity proven by strict frontmatter parsing."""
+
+    plan_id: str
+    path: str
+    code: str
+    message: str
+    source: str | None = None
+
+
+@dataclass(frozen=True)
 class ExecPlanCatalogSnapshot:
-    """A full identity graph with separate executable and historical views."""
+    """Validated declarations and, when isolated, revision-bound withheld identities."""
 
     active: Mapping[str, ExecPlanCatalogEntry]
     archived: Mapping[str, ExecPlanCatalogEntry]
     revision_sha: str | None = None
+    isolation_enabled: bool = False
+    issues: tuple[CatalogIssue, ...] = ()
+    withheld: tuple[tuple[str, str, str], ...] = ()
+
+    @property
+    def observed_ids(self) -> frozenset[str]:
+        return frozenset(self.all) | frozenset(item[0] for item in self.withheld)
+
+    @property
+    def withheld_ids(self) -> frozenset[str]:
+        return frozenset(item[0] for item in self.withheld)
 
     @property
     def historical(self) -> Mapping[str, ExecPlanCatalogEntry]:
@@ -392,7 +422,7 @@ class ExecPlanCatalogSnapshot:
 
     @property
     def next_plan_number(self) -> int:
-        return max((int(plan_id[2:]) for plan_id in self.all), default=0) + 1
+        return max((int(plan_id[2:]) for plan_id in self.observed_ids), default=0) + 1
 
     @property
     def next_plan_id(self) -> str:
@@ -434,38 +464,41 @@ def _entry(relative_path: str, text: str, values: Mapping[str, object]) -> ExecP
     )
 
 
-def _validate_full_graph(entries: Mapping[str, ExecPlanCatalogEntry]) -> None:
+def _graph_issues(entries: Mapping[str, ExecPlanCatalogEntry],
+                  observed_ids: AbstractSet[str]) -> tuple[CatalogIssue, ...]:
+    issues = []
     for plan_id, entry in entries.items():
-        missing = sorted(
-            dependency for dependency in entry.depends_on if dependency not in entries
-        )
+        missing = sorted(set(entry.depends_on) - observed_ids)
         if missing:
-            raise RuntimeError(
-                f"ExecPlan {plan_id}의 존재하지 않는 depends_on ID입니다: "
-                + ", ".join(missing)
-            )
-
-    states: dict[str, str] = {}
+            issues.append(CatalogIssue(plan_id, entry.path, "missing-dependency",
+                f"ExecPlan {plan_id}의 존재하지 않는 depends_on ID입니다: " + ", ".join(missing)))
+    visited: set[str] = set()
     stack: list[str] = []
 
     def visit(plan_id: str) -> None:
-        states[plan_id] = "visiting"
+        if plan_id in stack:
+            cycle = stack[stack.index(plan_id):]
+            message = "순환 ExecPlan 의존성입니다: " + " -> ".join([*cycle, plan_id])
+            issues.extend(CatalogIssue(member, entries[member].path, "dependency-cycle", message)
+                          for member in cycle)
+            return
+        if plan_id in visited or plan_id not in entries:
+            return
         stack.append(plan_id)
         for dependency in sorted(entries[plan_id].depends_on):
-            if states.get(dependency) == "visiting":
-                start = stack.index(dependency)
-                raise RuntimeError(
-                    "순환 ExecPlan 의존성입니다: "
-                    + " -> ".join([*stack[start:], dependency])
-                )
-            if states.get(dependency) is None:
-                visit(dependency)
+            visit(dependency)
         stack.pop()
-        states[plan_id] = "visited"
+        visited.add(plan_id)
 
     for plan_id in entries:
-        if states.get(plan_id) is None:
-            visit(plan_id)
+        visit(plan_id)
+    return tuple(issues)
+
+
+def _validate_full_graph(entries: Mapping[str, ExecPlanCatalogEntry]) -> None:
+    issues = _graph_issues(entries, frozenset(entries))
+    if issues:
+        raise RuntimeError(issues[0].message)
 
 
 def snapshot_from_documents(
@@ -478,138 +511,133 @@ def snapshot_from_documents(
     invalid_plan_entries: Mapping[str, str] | None = None,
     revision_sha: str | None = None,
     archive_conflict_plan_ids: AbstractSet[str] = frozenset(),
+    isolate_errors: bool = False,
 ) -> ExecPlanCatalogSnapshot:
-    """Build a snapshot from already-read regular-file documents.
+    """Validate the full catalog, or explicitly derive an independent execution view.
 
-    Callers that read Git trees can use this API without making the parser
-    aware of Git.  Nested paths are ignored by the exact path expressions.
+    Broken frontmatter, encoding and non-regular files cannot prove identity.
+    They always fail closed. Isolated errors never become executable entries.
     """
-
     if invalid_plan_entries:
-        relative_path = sorted(invalid_plan_entries)[0]
-        kind = invalid_plan_entries[relative_path]
+        path = sorted(invalid_plan_entries)[0]
         raise ExecPlanCatalogError(
             f"ExecPlan은 원격 revision의 일반 파일이어야 합니다: "
-            f"{relative_path} ({kind})",
-            code="non-regular-plan",
-            path=relative_path,
+            f"{path} ({invalid_plan_entries[path]})",
+            code="non-regular-plan", path=path,
         )
+    entries: dict[str, ExecPlanCatalogEntry] = {}
+    identities: dict[str, tuple[str, str]] = {}
+    issues: list[CatalogIssue] = []
 
-    active: dict[str, ExecPlanCatalogEntry] = {}
-    archived: dict[str, ExecPlanCatalogEntry] = {}
-    filenames: dict[str, str] = {}
-    for relative_path in sorted(documents):
-        active_candidate = re.fullmatch(
-            r"docs/plans/[^/]+\.md", relative_path
-        )
-        archived_candidate = re.fullmatch(
-            r"docs/plans/archive/[^/]+\.md", relative_path
-        )
-        if active_candidate is None and archived_candidate is None:
+    def reject(plan_id, path, code, message, source=None):
+        if not isolate_errors:
+            raise ExecPlanCatalogError(message, code=code, path=path, source=source)
+        issues.append(CatalogIssue(plan_id, path, code, message, source))
+
+    for path in sorted(documents):
+        if not re.fullmatch(r"docs/plans/(?:archive/)?[^/]+\.md", path):
             continue
-        raw = documents[relative_path]
+        raw = documents[path]
         try:
             text = raw.decode("utf-8") if isinstance(raw, bytes) else raw
         except UnicodeDecodeError as error:
             raise ExecPlanCatalogError(
-                f"ExecPlan 파일이 UTF-8이 아닙니다: {relative_path}",
-                code="invalid-encoding",
-                path=relative_path,
+                f"ExecPlan 파일이 UTF-8이 아닙니다: {path}",
+                code="invalid-encoding", path=path,
             ) from error
+        # Identity is never guessed from a filename or a fragment of broken YAML.
         try:
-            values = parse_execplan_text(
-                relative_path,
-                text,
-                root=root,
-                validate_sources=(
-                    validate_sources and available_regular_paths is None
-                ),
-                allow_archive_fallback=allow_archive_fallback,
-            )
+            header = parse_frontmatter(text)
+            plan_id, title = header.get("id"), header.get("title")
+            if not isinstance(plan_id, str) or _PLAN_ID.fullmatch(plan_id) is None:
+                raise RuntimeError("ExecPlan id는 G-000 형식이어야 합니다.")
+            if (not isinstance(title, str)
+                    or PurePosixPath(path).name != f"[{plan_id}] {title}.md"):
+                raise RuntimeError("ExecPlan 파일명은 `[id] title.md`와 일치해야 합니다.")
         except RuntimeError as error:
             raise ExecPlanCatalogError(
-                f"ExecPlan 파일이 유효하지 않습니다: {relative_path} ({error})",
-                code="invalid-plan",
-                path=relative_path,
+                f"ExecPlan 파일이 유효하지 않습니다: {path} ({error})",
+                code="invalid-plan", path=path,
             ) from error
-        entry = _entry(relative_path, text, values)
-        if validate_sources and available_regular_paths is not None:
-            for source in entry.sources:
-                exists = source in available_regular_paths
-                archived_source = None
-                if source != "docs/PRODUCT.md":
-                    archived_source = requirement_archive_path(source)
-                    exists = exists or bool(
-                        allow_archive_fallback
-                        and archived_source in available_regular_paths
-                    )
-                if not exists:
+        if plan_id in identities:
+            other_path = identities[plan_id][0]
+            # Preserve the existing, merge-proven archive conflict exception.
+            if (path.startswith("docs/plans/archive/")
+                    and not other_path.startswith("docs/plans/archive/")
+                    and plan_id in archive_conflict_plan_ids
+                    and plan_id in entries):
+                try:
+                    values = parse_execplan_text(path, text, validate_sources=False)
+                except RuntimeError as error:
                     raise ExecPlanCatalogError(
-                        "존재하지 않는 ExecPlan source입니다: "
-                        f"{source} ({relative_path})",
-                        code="missing-source",
-                        path=relative_path,
-                        source=source,
-                        related_paths=(
-                            (archived_source,) if archived_source else ()
-                        ),
-                    )
-        all_entries = {**active, **archived}
-        if entry.plan_id in all_entries:
-            other = all_entries[entry.plan_id]
-            if (
-                entry.archived
-                and not other.archived
-                and entry.plan_id in archive_conflict_plan_ids
-            ):
-                # Only a validated copy of a SQLite-confirmed MERGED plan
-                # may be handled as an archive candidate path conflict.
+                        f"ExecPlan 파일이 유효하지 않습니다: {path} ({error})",
+                        code="invalid-plan", path=path,
+                    ) from error
+                if validate_sources:
+                    for source in values["sources"]:
+                        if not _source_exists(root, source, allow_archive_fallback=allow_archive_fallback,
+                                              available_regular_paths=available_regular_paths):
+                            raise ExecPlanCatalogError(
+                                f"존재하지 않는 ExecPlan source입니다: {source} ({path})",
+                                code="missing-source", path=path, source=source,
+                            )
                 continue
             raise ExecPlanCatalogError(
-                f"중복 ExecPlan id입니다: {entry.plan_id} "
-                f"({other.path}, {relative_path})",
-                code="duplicate-id",
-                path=relative_path,
-                related_paths=(other.path,),
+                f"중복 ExecPlan id입니다: {plan_id} ({other_path}, {path})",
+                code="duplicate-id", path=path, related_paths=(other_path,),
             )
-        filename = PurePosixPath(relative_path).name
-        if filename in filenames:
-            raise ExecPlanCatalogError(
-                "중복 ExecPlan 파일명입니다: "
-                f"{filename} ({filenames[filename]}, {relative_path})",
-                code="duplicate-path",
-                path=relative_path,
-                related_paths=(filenames[filename],),
-            )
-        filenames[filename] = relative_path
-        (archived if entry.archived else active)[entry.plan_id] = entry
+        identities[plan_id] = (path, plan_content_hash(text))
+        try:
+            values = parse_execplan_text(path, text, validate_sources=False)
+        except RuntimeError as error:
+            reject(plan_id, path, "invalid-plan",
+                   f"ExecPlan 파일이 유효하지 않습니다: {path} ({error})")
+            continue
+        entry = _entry(path, text, values)
+        entries[plan_id] = entry
+        if validate_sources:
+            for source in entry.sources:
+                exists = _source_exists(root, source, allow_archive_fallback=allow_archive_fallback,
+                                        available_regular_paths=available_regular_paths)
+                if not exists:
+                    reject(plan_id, path, "missing-source",
+                           f"존재하지 않는 ExecPlan source입니다: {source} ({path})", source)
 
-    combined = {**active, **archived}
-    combined = dict(sorted(combined.items(), key=lambda item: int(item[0][2:])))
-    try:
-        _validate_full_graph(combined)
-    except RuntimeError as error:
-        message = str(error)
-        mentioned = tuple(
-            entry.path
-            for plan_id, entry in combined.items()
-            if plan_id in message
-        )
-        raise ExecPlanCatalogError(
-            message,
-            code=(
-                "dependency-cycle"
-                if "순환" in message
-                else "missing-dependency"
-            ),
-            path=(mentioned[0] if mentioned else None),
-            related_paths=mentioned[1:],
-        ) from error
-    sort_key = lambda item: int(item[0][2:])
-    return ExecPlanCatalogSnapshot(
-        active=MappingProxyType(dict(sorted(active.items(), key=sort_key))),
-        archived=MappingProxyType(dict(sorted(archived.items(), key=sort_key))),
-        revision_sha=revision_sha,
+    for issue in _graph_issues(entries, frozenset(identities)):
+        reject(issue.plan_id, issue.path, issue.code, issue.message)
+    ordered = dict(sorted(entries.items(), key=lambda item: int(item[0][2:])))
+    snapshot = ExecPlanCatalogSnapshot(
+        active=MappingProxyType({key: entry for key, entry in ordered.items() if not entry.archived}),
+        archived=MappingProxyType({key: entry for key, entry in ordered.items() if entry.archived}),
+        revision_sha=revision_sha, isolation_enabled=isolate_errors,
+        withheld=tuple((key, *identities[key]) for key in sorted(identities.keys() - entries.keys())),
+    )
+    return withhold_catalog_issues(snapshot, tuple(issues))
+
+
+def withhold_catalog_issues(snapshot: ExecPlanCatalogSnapshot,
+                            issues: tuple[CatalogIssue, ...]) -> ExecPlanCatalogSnapshot:
+    """Add identity/state validation failures to the same dependency closure."""
+    entries = snapshot.all
+    affected = set(snapshot.withheld_ids) | {issue.plan_id for issue in issues}
+    dependents: dict[str, set[str]] = {}
+    for key, entry in entries.items():
+        for dependency in entry.depends_on:
+            dependents.setdefault(dependency, set()).add(key)
+    pending = list(affected)
+    while pending:
+        for key in dependents.get(pending.pop(), ()):
+            if key not in affected:
+                affected.add(key)
+                pending.append(key)
+    withheld = {key: (path, content_hash) for key, path, content_hash in snapshot.withheld}
+    withheld.update({key: (entry.path, entry.content_hash) for key, entry in entries.items()
+                     if key in affected})
+    return replace(snapshot,
+        active=MappingProxyType({key: entry for key, entry in snapshot.active.items() if key not in affected}),
+        archived=MappingProxyType({key: entry for key, entry in snapshot.archived.items() if key not in affected}),
+        issues=(*snapshot.issues, *issues),
+        withheld=tuple((key, *withheld[key]) for key in sorted(withheld)),
     )
 
 
@@ -631,6 +659,7 @@ def load_execplan_snapshot(
     *,
     validate_sources: bool = True,
     allow_archive_fallback: bool = True,
+    isolate_errors: bool = False,
 ) -> ExecPlanCatalogSnapshot:
     """Read only direct regular files from active and archive directories."""
 
@@ -640,11 +669,21 @@ def load_execplan_snapshot(
             root / "docs/plans/archive", "docs/plans/archive"
         )
     )
+    invalid = {}
+    if isolate_errors:
+        for directory in (root / "docs/plans", root / "docs/plans/archive"):
+            if not directory.is_dir():
+                continue
+            for path in directory.iterdir():
+                if path.suffix == ".md" and not _is_regular_file(path):
+                    invalid[path.relative_to(root).as_posix()] = "non-regular"
     return snapshot_from_documents(
         documents,
+        invalid_plan_entries=invalid,
         root=root,
         validate_sources=validate_sources,
         allow_archive_fallback=allow_archive_fallback,
+        isolate_errors=isolate_errors,
     )
 
 

@@ -2,6 +2,7 @@
 from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
+from loop_manager_internal.catalog import execplan_catalog, project_catalog_refresh
 from loop_manager_internal.application.contracts import ValidatedPlanningResult
 from loop_manager_internal.application.contracts import _FUTURE_IDEA_ITEM
 from loop_manager_internal.git.command_adapter import (
@@ -260,7 +261,22 @@ def validate_planner_result(
         plan_paths.append(changed_path)
 
     try:
-        catalog = effects.load_execplan_catalog(worktree)
+        from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
+        held_ids = (catalog_held_plan_ids(connection, repo)
+                    if connection is not None and repo is not None else frozenset())
+        withheld_ids = frozenset()
+        if held_ids:
+            project_catalog_refresh.assert_planning_dependencies_unheld(
+                {}, current_plans.items(), held_ids)
+            local = project_catalog_refresh.validated_held_planning_snapshot(
+                connection, repo, worktree, active_sha, git=effects.git,
+                load_snapshot=execplan_catalog.load_execplan_snapshot)
+            catalog = local.active_metadata()
+            withheld_ids = local.withheld_ids
+        else:
+            catalog = effects.load_execplan_catalog(worktree)
+        project_catalog_refresh.assert_planning_dependencies_unheld(
+            catalog, current_plans.items(), held_ids)
         plans: list[tuple[str, dict[str, object]]] = []
         revisions: list[PlanRevision] = []
         deletions: list[PlanDeletion] = []
@@ -321,7 +337,7 @@ def validate_planner_result(
         new_plan_paths = [path for path, _plan in plans]
         effects._validate_future_idea_separation(worktree, active_sha, new_plan_paths)
         new_ids = {str(plan["id"]) for _, plan in plans}
-        reserved_ids = set(catalog) - new_ids
+        reserved_ids = (set(catalog) | withheld_ids) - new_ids
         reserved_ids.update(plan.plan_id for plan in snapshot.plans)
         if connection is not None and repo is not None:
             reserved_ids.update(
@@ -665,8 +681,10 @@ def mutable_ready_snapshot(
         (repo,),
     ).fetchall()
     plans: list[ReadyPlanSnapshot] = []
+    from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
+    held = catalog_held_plan_ids(connection, repo)
     for row in rows:
-        if not effects._row_is_mutable_ready(row):
+        if str(row["plan_id"]) in held or not effects._row_is_mutable_ready(row):
             continue
         try:
             plans.append(

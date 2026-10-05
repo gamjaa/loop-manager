@@ -89,7 +89,9 @@ class _CatalogRefreshCase(unittest.TestCase):
             self.repo, self.candidates, base_sha=self.base_sha, operation_id=None,
             commit_oid='c'*40, push_result='pushed:'+'c'*40)
 
-    def run_step(self, *, pr=None, phase=None, invalid=False, scope_error=False):
+    def run_step(self, *, pr=None, phase=None, invalid=False, scope_error=False,
+                 expected_priority="critical", expected_sources='["docs/requirements/change.md"]',
+                 expected_dependencies='["G-002"]'):
         self.connection.execute("UPDATE projects SET phase=?, agent_snapshot=NULL, branch=NULL, worktree=NULL, plan_path=NULL WHERE repo=?", (phase, self.repo))
         self.connection.execute("UPDATE exec_plans SET status='READY', branch=NULL, worktree=NULL, pr_url=NULL WHERE repo=?", (self.repo,))
         if scope_error:
@@ -107,19 +109,19 @@ class _CatalogRefreshCase(unittest.TestCase):
         self.boundary.reconcile = reconcile
         def pull_requests(*args, **kwargs):
             self.events.append('pr')
-            self.assertEqual(self.row()['priority'], 'critical')
+            self.assertEqual(self.row()['priority'], expected_priority)
             if pr:
                 pr()
             kwargs['after_reconciliation']()
             return SimpleNamespace(step_result=0)
         def safe(*args, **kwargs):
             self.events.append('archive-eligibility')
-            self.assertEqual(self.row()['sources'], '["docs/requirements/change.md"]')
+            self.assertEqual(self.row()['sources'], expected_sources)
             return False
         def planning(*args):
             self.assertTrue(callable(args[-1].refresh_catalog))
             self.events.append('planning')
-            self.assertEqual(self.row()['depends_on'], '["G-002"]')
+            self.assertEqual(self.row()['depends_on'], expected_dependencies)
             return SimpleNamespace(kind=manager.PlanningOutcomeKind.WAITING)
         with contextlib.ExitStack() as stack:
             for name in ('observe_blocked_plan_remotes', 'migrate_legacy_execplans', 'backfill_plan_shas', 'resume_plan_blocks',
@@ -325,6 +327,17 @@ class CatalogCacheAndCasTests(_CatalogRefreshCase):
         self.assertEqual(state.DefinitionStateRepository(self.connection).capture(self.repo), before)
         self.assertEqual(manager.scoped_blocking.project_block(self.connection, self.repo)['evidence'], 'separate safety cause')
 
+    def test_real_pr_close_audit_does_not_invalidate_catalog_cache(self):
+        self.boundary.refresh()
+        self.connection.execute("UPDATE exec_plans SET status='PR_OPEN' WHERE plan_id='G-001'")
+        self.connection.commit()
+        manager._block_closed_pull_request(self.connection, self.repo, self.row(),
+                                          'https://example/pr/1', 'c'*40)
+        self.boundary.refresh()
+        self.assertEqual(self.row()['status'], 'PLAN_BLOCKED')
+        self.assertEqual(len(self.loads), 1)
+        self.assertIsNotNone(manager.scoped_blocking.plan_block(self.connection, self.repo, 'G-001'))
+
 
 class CatalogArchiveConsumerTests(_CatalogRefreshCase):
     def test_verified_archive_delta_and_audit_are_atomic_without_reread(self):
@@ -454,17 +467,6 @@ class CatalogPullRequestConsumerTests(_CatalogRefreshCase):
                 cleanup.assert_not_called()
                 fetch.assert_not_called()
                 self.assertEqual(dict(self.row()), before)
-
-    def test_real_pr_close_audit_does_not_invalidate_catalog_cache(self):
-        self.boundary.refresh()
-        self.connection.execute("UPDATE exec_plans SET status='PR_OPEN' WHERE plan_id='G-001'")
-        self.connection.commit()
-        manager._block_closed_pull_request(self.connection, self.repo, self.row(),
-                                          'https://example/pr/1', 'c'*40)
-        self.boundary.refresh()
-        self.assertEqual(self.row()['status'], 'PLAN_BLOCKED')
-        self.assertEqual(len(self.loads), 1)
-        self.assertIsNotNone(manager.scoped_blocking.plan_block(self.connection, self.repo, 'G-001'))
 
     def test_new_merge_proof_allows_archive_conflict_without_pr_state_transition(self):
         active = 'docs/plans/[G-001] Old.md'
@@ -743,3 +745,741 @@ class ProjectCatalogConsumerTests(_CatalogRefreshCase):
                 timeout=30,
             )
         self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class ScopedCatalogRefreshTests(_CatalogRefreshCase):
+    def setUp(self):
+        super().setUp()
+        self.connection.execute(
+            "UPDATE exec_plans SET status='READY', branch=NULL, worktree=NULL, pr_url=NULL")
+        for plan_id, title, status in (('G-003', 'Direct', 'READY'),
+                                     ('G-004', 'Indirect', 'READY'),
+                                     ('G-005', 'Waiting', 'PR_OPEN')):
+            self.fixture._insert(plan_id, title, status=status,
+                                 branch='waiting' if status == 'PR_OPEN' else None,
+                                 pr_url='https://example/pr/5' if status == 'PR_OPEN' else None)
+        self.connection.commit()
+        self.documents = {
+            'docs/plans/[G-001] Updated.md': self.fixture._text('G-001', 'Updated'),
+            'docs/plans/[G-002] Dependency.md': self.fixture._text('G-002', 'Dependency', risk='invalid'),
+            'docs/plans/[G-003] Direct.md': self.fixture._text('G-003', 'Direct', depends_on=('G-002',)),
+            'docs/plans/[G-004] Indirect.md': self.fixture._text('G-004', 'Indirect', depends_on=('G-003',)),
+            'docs/plans/[G-005] Waiting.md': self.fixture._text('G-005', 'Waiting'),
+        }
+        self.paths = frozenset((*self.documents, 'docs/PRODUCT.md'))
+
+    def pinned(self, revision):
+        return state.PinnedCatalog(revision, catalog.snapshot_from_documents(
+            self.documents, validate_sources=True, available_regular_paths=self.paths,
+            revision_sha=revision, isolate_errors=True), self.paths)
+
+    def reconcile(self, revision, remember):
+        self.loads.append(revision)
+        pinned = self.pinned(revision)
+        result = state.CatalogReconciliationService(
+            state.DefinitionStateRepository(self.connection), fixtures.FakeDefinitionPort(pinned)
+        ).reconcile(self.repo)
+        if result.usable:
+            remember(result.catalog or pinned)
+        return result
+
+    def held(self):
+        return manager.scoped_blocking.catalog_held_plan_ids(self.connection, self.repo)
+
+    def test_independent_selection_and_pr_observation_continue_without_partial_catalog_success(self):
+        original = dict(self.row('G-002'))
+        self.boundary.refresh()
+        self.assertEqual(self.held(), {'G-002', 'G-003', 'G-004'})
+        self.assertEqual(dict(self.row('G-002')), original)
+        self.assertEqual(manager.select_ready_execplan(self.connection, self.repo)['plan_id'], 'G-001')
+        self.assertEqual(manager.unmet_execplan_dependencies(self.connection, self.repo, 'G-004'), ('G-004',))
+        self.assertIsNone(self.connection.execute(
+            'SELECT * FROM execplan_catalog_revisions WHERE repo=?', (self.repo,)).fetchone())
+        view = self.connection.execute(
+            'SELECT * FROM execplan_catalog_views WHERE repo=?', (self.repo,)).fetchone()
+        self.assertEqual((view['revision_sha'], view['validation_kind']), (self.sha, 'execution-view'))
+        with mock.patch.object(manager, 'pr_for_branch', return_value={
+                'state': 'OPEN', 'headRefName': 'waiting', 'baseRefName': 'main',
+                'url': 'https://example/pr/5', 'mergeStateStatus': 'CLEAN'}) as observe:
+            manager.observe_waiting_pull_requests(self.connection, Path(self.repo), Path('/state'), self.repo)
+        observe.assert_called_once()
+        self.assertEqual(self.row('G-005')['status'], 'PR_OPEN')
+        restarted = refresh.ProjectCatalogRefresh(self.connection, self.repo, lambda: self.sha, self.reconcile)
+        restarted.refresh()
+        self.assertEqual(self.held(), {'G-002', 'G-003', 'G-004'})
+        self.assertEqual(restarted.pinned.snapshot.withheld_ids, self.held())
+
+    def test_remote_correction_releases_only_catalog_causes_and_preserves_history(self):
+        with self.connection:
+            manager.scoped_blocking.record_plan_block(
+                self.connection, self.repo, 'G-003', manager.BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED,
+                'pending approval', 'approval-fingerprint')
+        approval = dict(manager.scoped_blocking.plan_block(self.connection, self.repo, 'G-003'))
+        original = dict(self.row('G-003'))
+        self.boundary.refresh()
+        self.documents['docs/plans/[G-002] Dependency.md'] = self.fixture._text('G-002', 'Dependency')
+        self.sha = 'c' * 40
+        self.boundary.refresh()
+        self.assertEqual(self.held(), set())
+        self.assertEqual(dict(manager.scoped_blocking.plan_block(self.connection, self.repo, 'G-003')), approval)
+        for field in ('status', 'blocked_reason', 'worker_session_id', 'retry_count',
+                      'verify_failure_history', 'publication_sha'):
+            self.assertEqual(self.row('G-003')[field], original[field])
+        self.assertEqual(self.row('G-002')['current_revision_sha'], self.sha)
+
+    def test_remote_and_sqlite_races_do_not_split_view_and_pending_causes(self):
+        before = self.fixture.repository.capture(self.repo)
+        for fault in ('before-revision-recheck', 'after-plan:G-001'):
+            with self.subTest(fault=fault):
+                def interrupt(stage):
+                    if stage == fault:
+                        raise RuntimeError('interrupted')
+                with self.assertRaisesRegex(RuntimeError, 'interrupted'):
+                    self.fixture._service(self.pinned(self.sha), fault_hook=interrupt).reconcile(self.repo)
+                self.assertEqual(self.fixture.repository.capture(self.repo), before)
+                self.assertIsNone(self.connection.execute('SELECT * FROM execplan_catalog_views').fetchone())
+        result = self.fixture._service(self.pinned(self.sha), revisions=[self.sha, self.sha, 'c' * 40]).reconcile(self.repo)
+        self.assertEqual(result.kind, state.ReconciliationKind.STALE)
+        self.assertEqual(self.fixture.repository.capture(self.repo), before)
+        self.assertEqual(self.held(), set())
+
+    def test_shared_worktree_or_branch_rejects_execution_view(self):
+        for field in ('worktree', 'branch'):
+            with self.subTest(field=field):
+                self.connection.execute(f'UPDATE exec_plans SET {field}=? WHERE plan_id IN (?, ?)',
+                                        ('shared', 'G-001', 'G-002'))
+                self.connection.commit()
+                result = self.fixture._service(self.pinned(self.sha)).reconcile(self.repo)
+                self.assertEqual(result.kind, state.ReconciliationKind.INVALID_CATALOG)
+                self.assertEqual(result.diagnostic.code, 'shared-ownership')
+                self.assertEqual(self.held(), set())
+                self.connection.execute(f'UPDATE exec_plans SET {field}=NULL')
+                self.connection.commit()
+
+    def test_active_hold_preserves_session_and_waits_for_independent_execution_on_correction(self):
+        self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', ever_started=1 WHERE plan_id='G-002'")
+        self.connection.execute("UPDATE projects SET plan_path=?", ('docs/plans/[G-002] Dependency.md',))
+        self.connection.commit()
+        original = dict(self.row('G-002'))
+        self.boundary.refresh()
+        self.assertIsNone(manager.active_execplan(self.connection, self.repo))
+        paused = dict(self.row('G-002'))
+        self.assertEqual(paused.pop('status'), 'PLAN_BLOCKED')
+        self.assertEqual(paused, {key: value for key, value in original.items() if key != 'status'})
+        self.assertIsNone(self.connection.execute('SELECT plan_path FROM projects').fetchone()[0])
+        self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING' WHERE plan_id='G-001'")
+        self.connection.commit()
+        self.documents['docs/plans/[G-002] Dependency.md'] = self.fixture._text('G-002', 'Dependency')
+        self.sha = 'c' * 40
+        self.boundary.refresh()
+        self.assertEqual(self.held(), {'G-002'})
+        self.assertEqual(manager.active_execplan(self.connection, self.repo)['plan_id'], 'G-001')
+        self.connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id='G-001'")
+        self.connection.commit()
+        self.boundary.refresh()
+        self.assertEqual(self.held(), set())
+        self.assertEqual(manager.active_execplan(self.connection, self.repo)['plan_id'], 'G-002')
+
+    def test_planning_reuses_execution_view(self):
+        self.boundary.refresh()
+        outcome, _ports = self.prepare_planning_workspace()
+        self.assertIsNone(outcome)
+        self.assertEqual(self.loads, [self.sha])
+
+    def test_archive_adoption_does_not_discard_pending_errors(self):
+        self.boundary.refresh()
+        self.assertFalse(self.boundary.apply_archive(self.sha, 'c' * 40, ()))
+        self.assertEqual(self.held(), {'G-002', 'G-003', 'G-004'})
+
+    def test_project_step_reaches_pr_archive_gate_and_planning_with_scoped_errors(self):
+        result = self.run_step(expected_priority='normal', expected_sources='["docs/PRODUCT.md"]',
+                               expected_dependencies='[]')
+        self.assertEqual(result, 0)
+        self.assertEqual(self.events, ['fetch', 'catalog', 'pr', 'archive-eligibility', 'planning'])
+        self.assertEqual(self.held(), {'G-002', 'G-003', 'G-004'})
+
+    def test_scoped_adoption_does_not_touch_another_registered_project(self):
+        project = dict(self.connection.execute('SELECT * FROM projects').fetchone())
+        project['repo'] = '/other-repo'
+        plan = dict(self.row('G-001'))
+        plan['repo'] = project['repo']
+        for table, values in (('projects', project), ('exec_plans', plan)):
+            self.connection.execute(f"INSERT INTO {table} ({', '.join(values)}) "
+                                    f"VALUES ({', '.join('?' for _ in values)})", tuple(values.values()))
+        self.connection.commit()
+        self.boundary.refresh()
+        self.assertEqual(dict(self.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo='/other-repo'").fetchone()), plan)
+        self.assertEqual(manager.scoped_blocking.catalog_held_plan_ids(self.connection, '/other-repo'), set())
+        self.assertEqual(manager.select_ready_execplan(self.connection, '/other-repo')['plan_id'], 'G-001')
+
+    def test_public_reconciliation_returns_execution_view_and_releases_only_old_catalog_project_block(self):
+        port = fixtures.FakeDefinitionPort(self.pinned(self.sha))
+        port.loaded = port.pinned
+        with self.connection:
+            manager.scoped_blocking.record_project_block(
+                self.connection, self.repo, manager.BlockReasonCode.EXECPLAN_CATALOG_INVALID,
+                'old global catalog failure', 'old', plan_id='G-002', previous_phase=None)
+        with mock.patch.object(manager, '_GitCatalogDefinitionPort', return_value=port), \
+             mock.patch.object(manager, 'backfill_plan_shas'), \
+             mock.patch.object(manager, 'migrate_legacy_execplans'):
+            result = manager.reconcile_execplan_catalog(self.connection, Path(self.repo), self.repo, 'main')
+        self.assertEqual(result.kind, state.ReconciliationKind.EXECUTION_VIEW)
+        self.assertIsNone(manager.scoped_blocking.project_block(self.connection, self.repo))
+        self.assertEqual(self.held(), {'G-002', 'G-003', 'G-004'})
+
+    def test_related_sqlite_ownership_change_is_not_overwritten(self):
+        pinned = self.pinned(self.sha)
+        repository = state.DefinitionStateRepository(self.connection)
+        original_apply = repository.apply
+        def competing_owner(*args, **kwargs):
+            self.connection.execute("UPDATE exec_plans SET worker_session_id='competing' WHERE plan_id='G-002'")
+            self.connection.commit()
+            return original_apply(*args, **kwargs)
+        with mock.patch.object(repository, 'apply', side_effect=competing_owner):
+            result = state.CatalogReconciliationService(repository, fixtures.FakeDefinitionPort(pinned)).reconcile(self.repo)
+        self.assertEqual(result.kind, state.ReconciliationKind.STALE)
+        self.assertEqual(self.held(), set())
+        self.assertEqual(self.row('G-002')['worker_session_id'], 'competing')
+
+    def test_pr_conflict_selection_skips_held_plan_even_if_cached_dependency_is_merged(self):
+        from loop_manager_internal.recovery import waiting_pr_service
+        from loop_manager_internal.application.contracts import WaitingPullRequestObservation
+        self.connection.execute("UPDATE exec_plans SET status='PR_OPEN', branch='broken', pr_url='https://example/pr/2' WHERE plan_id='G-002'")
+        self.connection.commit()
+        self.boundary.refresh()
+        effects = SimpleNamespace(active_execplan=manager.active_execplan,
+            hydrate_execplan_project=mock.Mock(), reconcile_existing_pull_request=mock.Mock(return_value=None))
+        observation = WaitingPullRequestObservation(
+            merged=False, conflicts=((self.row('G-002'), {}), (self.row('G-005'), {})))
+        waiting_pr_service.select_waiting_pull_request_conflict(
+            effects, self.connection, Path(self.repo), Path('/state'), self.repo, observation)
+        self.assertEqual(effects.hydrate_execplan_project.call_args.args[2]['plan_id'], 'G-005')
+
+    def test_independent_planner_batch_retains_only_unchanged_proven_errors(self):
+        import tempfile
+        from loop_manager_internal.planning import planner_validation
+        self.boundary.refresh()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for path, contents in {**self.documents, 'docs/PRODUCT.md': 'Product.',
+                                   'docs/FUTURE_IDEAS.md': 'Deferred.'}.items():
+                target = root / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(contents, encoding='utf-8')
+            def git(_root, command, *arguments, **kwargs):
+                path = arguments[-1]
+                return SimpleNamespace(returncode=0, stdout=f'100644 blob abc\t{path}\0' if command == 'ls-tree' else '')
+            effects = SimpleNamespace(changed_files=lambda *args: ['docs/FUTURE_IDEAS.md'],
+                mutable_snapshot_token=lambda *args: 'token', git=git,
+                load_execplan_catalog=manager.load_execplan_catalog,
+                _validate_future_idea_separation=mock.Mock(),
+                file_hash=lambda path: catalog.plan_content_hash(path.read_bytes()))
+            result = planner_validation.validate_planner_result(effects, root, self.sha, [],
+                connection=self.connection, repo=self.repo)
+            self.assertEqual(result.publication_paths, ('docs/FUTURE_IDEAS.md',))
+            for mutation in ('cause', 'bytes', 'symlink'):
+                with self.subTest(mutation=mutation):
+                    target = root / 'docs/plans/[G-002] Dependency.md'
+                    if mutation == 'cause':
+                        target.write_text(self.fixture._text('G-002', 'Dependency', risk='other-invalid'))
+                    elif mutation == 'bytes':
+                        target.write_text(self.documents['docs/plans/[G-002] Dependency.md'])
+                        effects.git = lambda root, command, *args, **kwargs: (SimpleNamespace(returncode=1, stdout="")
+                            if command == "diff" else git(root, command, *args, **kwargs))
+                    else:
+                        effects.git = git
+                        target.unlink()
+                        target.symlink_to(root / 'docs/PRODUCT.md')
+                    with self.assertRaises(planner_validation.PlannerValidationError):
+                        planner_validation.validate_planner_result(effects, root, self.sha, [],
+                            connection=self.connection, repo=self.repo)
+
+    def test_invalid_new_declaration_is_reserved_and_can_be_corrected_after_independent_registration(self):
+        broken_path = 'docs/plans/[G-006] New invalid.md'
+        valid_path = 'docs/plans/[G-007] New independent.md'
+        self.documents[broken_path] = self.fixture._text('G-006', 'New invalid', risk='invalid')
+        self.documents[valid_path] = self.fixture._text('G-007', 'New independent')
+        self.paths |= {broken_path, valid_path}
+        self.boundary.refresh()
+        self.assertIn('G-006', self.held())
+        self.assertIsNone(self.row('G-006'))
+        self.assertEqual(self.row('G-007')['status'], 'READY')
+        self.documents[broken_path] = self.fixture._text('G-006', 'New invalid')
+        self.sha = 'c' * 40
+        self.boundary.refresh()
+        self.assertNotIn('G-006', self.held())
+        self.assertEqual(self.row('G-006')['status'], 'READY')
+
+    def test_missing_priority_of_new_plan_is_withheld_with_its_dependents(self):
+        new_path = 'docs/plans/[G-006] Legacy metadata.md'
+        self.documents[new_path] = self.fixture._text('G-006', 'Legacy metadata').replace('priority: normal\n', '')
+        dependent_path = 'docs/plans/[G-007] New dependent.md'
+        self.documents[dependent_path] = self.fixture._text('G-007', 'New dependent', depends_on=('G-006',))
+        self.paths |= {new_path, dependent_path}
+        self.boundary.refresh()
+        self.assertEqual(self.held(), {'G-002', 'G-003', 'G-004', 'G-006', 'G-007'})
+        self.assertEqual(self.boundary.pinned.snapshot.withheld_ids, self.held())
+        self.assertIsNone(self.row('G-006'))
+        self.assertIsNone(self.row('G-007'))
+        self.assertEqual(manager.select_ready_execplan(self.connection, self.repo)['plan_id'], 'G-001')
+
+    def test_active_correction_preserves_a_separate_approval_added_while_held(self):
+        self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', ever_started=1 WHERE plan_id='G-002'")
+        self.connection.commit()
+        self.boundary.refresh()
+        with self.connection:
+            manager.scoped_blocking.record_plan_block(self.connection, self.repo, 'G-002',
+                manager.BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED, 'approval while held', 'approval')
+        approval = dict(manager.scoped_blocking.plan_block(self.connection, self.repo, 'G-002'))
+        self.documents['docs/plans/[G-002] Dependency.md'] = self.fixture._text('G-002', 'Dependency')
+        self.sha = 'c' * 40
+        self.boundary.refresh()
+        self.assertEqual(self.row('G-002')['status'], 'PLAN_BLOCKED')
+        self.assertEqual(dict(manager.scoped_blocking.plan_block(self.connection, self.repo, 'G-002')), approval)
+        self.assertEqual(self.held(), set())
+
+    def test_runtime_activation_and_projection_cannot_bypass_catalog_hold(self):
+        from loop_manager_internal.storage import runtime_state
+        self.boundary.refresh()
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        with self.assertRaisesRegex(runtime_state.RuntimeStateError, 'catalog'):
+            runtime.activate(self.repo, 'G-002', activation_sha=self.sha, branch='broken', worktree='/broken')
+        with self.assertRaisesRegex(runtime_state.RuntimeStateError, 'catalog'):
+            runtime.hydrate_snapshot(self.repo, runtime.get(self.repo, 'G-002'))
+
+    def test_all_execution_phases_resume_without_losing_validation_or_sessions(self):
+        for index, phase in enumerate(('IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING'), start=1):
+            with self.subTest(phase=phase):
+                self.documents['docs/plans/[G-002] Dependency.md'] = self.fixture._text('G-002', 'Dependency', risk='invalid')
+                self.connection.execute(
+                    "UPDATE exec_plans SET status=?, ever_started=1, worker_session_id='saved-worker', "
+                    "reviewer_session_id='saved-reviewer', verify_result='saved-verify', review_result='saved-review' "
+                    "WHERE plan_id='G-002'", (phase,))
+                self.connection.commit()
+                self.sha = f'{index:x}' * 40
+                self.boundary.refresh()
+                self.assertEqual(self.row('G-002')['status'], 'PLAN_BLOCKED')
+                self.documents['docs/plans/[G-002] Dependency.md'] = self.fixture._text('G-002', 'Dependency')
+                self.sha = f'{index + 4:x}' * 40
+                self.boundary.refresh()
+                row = self.row('G-002')
+                self.assertEqual(row['status'], phase)
+                self.assertEqual((row['worker_session_id'], row['reviewer_session_id'],
+                                  row['verify_result'], row['review_result']),
+                                 ('saved-worker', 'saved-reviewer', 'saved-verify', 'saved-review'))
+
+    def test_legacy_backfill_receives_withheld_new_metadata_before_it_can_create_rows(self):
+        self.documents['docs/plans/[G-002] Dependency.md'] = self.fixture._text('G-002', 'Dependency')
+        path = 'docs/plans/[G-006] Missing priority.md'
+        self.documents[path] = self.fixture._text('G-006', 'Missing priority').replace('priority: normal\n', '')
+        self.paths |= {path}
+        port = fixtures.FakeDefinitionPort(self.pinned(self.sha))
+        port.loaded = port.pinned
+        port.load = lambda: port.loaded
+        def backfill(*args, **kwargs):
+            pinned = kwargs['pinned_catalog']
+            self.assertEqual(pinned.snapshot.withheld_ids, {'G-006'})
+            self.assertNotIn('G-006', pinned.snapshot.active)
+        with mock.patch.object(manager, '_GitCatalogDefinitionPort', return_value=port), \
+             mock.patch.object(manager, 'backfill_plan_shas'), \
+             mock.patch.object(manager, 'migrate_legacy_execplans', side_effect=backfill):
+            result = manager.reconcile_execplan_catalog(self.connection, Path(self.repo), self.repo, 'main')
+        self.assertEqual(result.kind, state.ReconciliationKind.EXECUTION_VIEW)
+        self.assertEqual(self.held(), {'G-006'})
+        self.assertIsNone(self.row('G-006'))
+
+    def test_ambiguous_error_from_an_outdated_revision_does_not_create_a_project_block(self):
+        diagnostic = state.ReconciliationDiagnostic(self.sha, 'duplicate-id', 'ambiguous IDs',
+            'docs/plans/[G-002] Dependency.md', None, 'fingerprint')
+        port = SimpleNamespace(loaded=None, load=mock.Mock(side_effect=state.InvalidPinnedCatalog(diagnostic)),
+                               current_revision=lambda: 'c' * 40)
+        with mock.patch.object(manager, '_GitCatalogDefinitionPort', return_value=port), \
+             mock.patch.object(manager, 'git', return_value=SimpleNamespace(stdout=self.sha)):
+            result = manager.reconcile_execplan_catalog(self.connection, Path(self.repo), self.repo, 'main',
+                                                        remote_sha=self.sha)
+        self.assertEqual(result.kind, state.ReconciliationKind.STALE)
+        self.assertIsNone(manager.scoped_blocking.project_block(self.connection, self.repo))
+        self.assertEqual(self.held(), set())
+
+    def test_pending_catalog_errors_prevent_false_completion_after_all_prs_merge(self):
+        from loop_manager_internal.notifications import work_exhaustion
+        self.boundary.refresh()
+        self.connection.execute("UPDATE exec_plans SET status='MERGED'")
+        self.connection.commit()
+        snapshot = work_exhaustion.collect(self.connection, self.repo, cycle=self.sha, active_requirements=())
+        self.assertFalse(snapshot.completed)
+        self.assertTrue(snapshot.has_distinct_wait)
+        self.assertEqual({item['id'] for item in snapshot.plans}, self.held())
+        self.assertTrue(all(item['evidence'] for item in snapshot.plans))
+        previously_complete = work_exhaustion.WorkReasonSnapshot(self.sha, (), (), None, None)
+        self.assertFalse(manager.notifications.enqueue_completion_if_ready(self.connection, self.repo,
+                                                                         previously_complete))
+
+    def test_activation_rechecks_new_catalog_hold_inside_its_transaction(self):
+        from loop_manager_internal.storage import runtime_state
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        with mock.patch.object(manager.scoped_blocking, 'catalog_held_plan_ids',
+                               side_effect=(frozenset(), frozenset({'G-002'}))), \
+             self.assertRaisesRegex(runtime_state.RuntimeStateError, 'catalog'):
+            runtime.activate(self.repo, 'G-002', activation_sha=self.sha, branch='broken', worktree='/broken')
+        self.assertEqual(self.row('G-002')['status'], 'READY')
+
+    def test_planner_cannot_add_dependency_on_pending_new_plan_with_missing_priority(self):
+        import tempfile
+        from loop_manager_internal.planning import planner_validation
+        self.documents['docs/plans/[G-002] Dependency.md'] = self.fixture._text('G-002', 'Dependency')
+        broken = 'docs/plans/[G-006] Missing priority.md'
+        self.documents[broken] = self.fixture._text('G-006', 'Missing priority').replace('priority: normal\n', '')
+        self.paths |= {broken}
+        self.boundary.refresh()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = 'docs/plans/[G-007] Dependent.md'
+            documents = {**self.documents, 'docs/PRODUCT.md': 'Product.',
+                         path: self.fixture._text('G-007', 'Dependent', depends_on=('G-006',))}
+            for relative, text in documents.items():
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding='utf-8')
+            effects = SimpleNamespace(changed_files=lambda *args: [path],
+                mutable_snapshot_token=lambda *args: 'token',
+                git=lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=''),
+                _parse_execplan=catalog.parse_execplan_file,
+                contains_guidance_sections=lambda text: False,
+                load_execplan_catalog=manager.load_execplan_catalog)
+            with self.assertRaisesRegex(planner_validation.PlannerValidationError, '보류 계획에 의존'):
+                planner_validation.validate_planner_result(effects, root, self.sha, [],
+                    connection=self.connection, repo=self.repo)
+
+    def test_new_planner_error_preserves_catalog_diagnostic_without_existing_holds(self):
+        import tempfile
+        from loop_manager_internal.planning import planner_validation
+        self.documents['docs/plans/[G-002] Dependency.md'] = self.fixture._text('G-002', 'Dependency')
+        self.boundary.refresh()
+        self.assertFalse(self.held())
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = 'docs/plans/[G-006] New invalid.md'
+            documents = {**self.documents, 'docs/PRODUCT.md': 'Product.',
+                         path: self.fixture._text('G-006', 'New invalid', depends_on=('G-999',))}
+            for relative, text in documents.items():
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding='utf-8')
+            effects = SimpleNamespace(changed_files=lambda *args: [path],
+                mutable_snapshot_token=lambda *args: 'token',
+                git=lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=''),
+                _parse_execplan=catalog.parse_execplan_file,
+                contains_guidance_sections=lambda text: False,
+                load_execplan_catalog=manager.load_execplan_catalog)
+            with self.assertRaisesRegex(planner_validation.PlannerValidationError,
+                                        '존재하지 않는 depends_on ID.*G-999'):
+                planner_validation.validate_planner_result(effects, root, self.sha, [],
+                    connection=self.connection, repo=self.repo)
+
+    def test_independent_planner_accepts_combined_risk_and_new_declaration_errors(self):
+        import tempfile
+        from loop_manager_internal.planning import planner_validation
+        for reason in ('priority', 'active-source'):
+            with self.subTest(reason=reason), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                broken = 'docs/plans/[G-006] New invalid.md'
+                text = self.fixture._text('G-006', 'New invalid')
+                if reason == 'priority':
+                    text = text.replace('priority: normal\n', '')
+                else:
+                    text = text.replace('docs/PRODUCT.md', 'docs/requirements/Moved.md')
+                    self.paths |= {'docs/requirements/archive/Moved.md'}
+                self.documents[broken] = text
+                self.paths |= {broken}
+                self.sha = ('c' if reason == 'priority' else 'd') * 40
+                self.boundary.refresh()
+                path = 'docs/plans/[G-007] Independent.md'
+                documents = {**self.documents, 'docs/PRODUCT.md': 'Product.',
+                    'docs/requirements/archive/Moved.md': 'Moved.',
+                    path: self.fixture._text('G-007', 'Independent')}
+                for relative, contents in documents.items():
+                    target = root / relative
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_text(contents, encoding='utf-8')
+                def git(_root, command, *args, **kwargs):
+                    item = args[-1]
+                    tree = f'100644 blob abc\t{item}\0' if item in self.documents else ''
+                    return SimpleNamespace(returncode=0, stdout=tree if command == 'ls-tree' else '')
+                effects = SimpleNamespace(changed_files=lambda *args: [path],
+                    mutable_snapshot_token=lambda *args: 'token', git=git,
+                    _parse_execplan=catalog.parse_execplan_file,
+                    contains_guidance_sections=lambda text: False,
+                    load_execplan_catalog=manager.load_execplan_catalog,
+                    _validate_future_idea_separation=mock.Mock(),
+                    file_hash=lambda target: catalog.plan_content_hash(target.read_bytes()))
+                result = planner_validation.validate_planner_result(effects, root, self.sha, [],
+                    connection=self.connection, repo=self.repo)
+                self.assertEqual([plan['id'] for _, plan in result.plans], ['G-007'])
+                self.assertEqual(self.held(), {'G-002', 'G-003', 'G-004', 'G-006'})
+                (root / broken).write_text(text + '\nChanged withheld body.\n')
+                with self.assertRaisesRegex(planner_validation.PlannerValidationError, '원인이나 범위'):
+                    planner_validation.validate_planner_result(effects, root, self.sha, [],
+                        connection=self.connection, repo=self.repo)
+                (root / broken).write_text(text, encoding='utf-8')
+                if reason == 'priority':
+                    (root / broken).write_text(text.replace('risk: low\n', 'risk: low\npriority: normal\n'))
+                else:
+                    (root / 'docs/requirements/Moved.md').write_text('Moved.', encoding='utf-8')
+                with self.assertRaisesRegex(planner_validation.PlannerValidationError, '원인이나 범위'):
+                    planner_validation.validate_planner_result(effects, root, self.sha, [],
+                        connection=self.connection, repo=self.repo)
+
+    def test_corrected_execution_waits_for_planner_slot_and_resumes_after_release(self):
+        self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', ever_started=1 WHERE plan_id='G-002'")
+        self.connection.execute("UPDATE projects SET plan_path=?", ('docs/plans/[G-002] Dependency.md',))
+        self.connection.commit()
+        original = dict(self.row('G-002'))
+        self.boundary.refresh()
+        self.connection.execute("UPDATE projects SET phase='PLANNING', planner_session_id='independent-planner', "
+                                "planning_workspace_owned=1, branch='planning', worktree='/planning', agent_snapshot='saved'")
+        self.connection.commit()
+        planning = dict(self.connection.execute('SELECT * FROM projects').fetchone())
+        self.documents['docs/plans/[G-002] Dependency.md'] = self.fixture._text('G-002', 'Dependency')
+        self.sha = 'c' * 40
+        self.boundary.refresh()
+        self.assertEqual(self.row('G-002')['status'], 'PLAN_BLOCKED')
+        self.assertEqual(self.row('G-002')['worker_session_id'], original['worker_session_id'])
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM projects').fetchone()), planning)
+        self.assertEqual(self.held(), {'G-002'})
+        hold = self.connection.execute('SELECT resume_status, evidence FROM execplan_catalog_holds').fetchone()
+        self.assertEqual(hold['resume_status'], 'IMPLEMENTING')
+        self.assertIn('execution-slot-busy', hold['evidence'])
+        # Preserved Planner evidence also owns the slot outside the live phase.
+        self.connection.execute("UPDATE projects SET phase='IDLE', planning_workspace_owned=0")
+        self.connection.commit()
+        self.boundary.refresh()
+        self.assertEqual(self.row('G-002')['status'], 'PLAN_BLOCKED')
+        self.connection.execute("UPDATE projects SET planner_session_id=NULL, agent_snapshot=NULL, branch=NULL, worktree=NULL")
+        self.connection.commit()
+        self.boundary.refresh()
+        self.assertEqual(self.row('G-002')['status'], 'IMPLEMENTING')
+        self.assertEqual(self.row('G-002')['worker_session_id'], original['worker_session_id'])
+        self.assertFalse(self.held())
+        self.assertEqual(self.loads, ['b' * 40, 'c' * 40, 'c' * 40])
+
+    def test_planner_slot_ownership_change_invalidates_catalog_cas(self):
+        repository = state.DefinitionStateRepository(self.connection)
+        expected = repository.capture(self.repo)
+        self.connection.execute("UPDATE projects SET planning_attempt_fingerprint='concurrent-planner'")
+        self.connection.commit()
+        self.assertIsNone(repository.apply(self.repo, self.pinned(self.sha), expected,
+            revision_is_current=lambda: True))
+        self.assertFalse(self.held())
+
+    def test_maintenance_barrier_excludes_holds_and_validates_independent_batch(self):
+        import tempfile
+        from loop_manager_internal.storage import maintenance_state
+        self.connection.execute("UPDATE exec_plans SET workspace_owned=0, worker_session_id=NULL, "
+                                "reviewer_session_id=NULL, retry_count=0, ever_started=0 WHERE plan_id='G-001'")
+        self.documents['docs/plans/[G-001] Updated.md'] = fixtures.plan_text('G-001', 'Updated')
+        broken = 'docs/plans/[G-006] New invalid.md'
+        self.documents[broken] = self.fixture._text('G-006', 'New invalid').replace('priority: normal\n', '')
+        self.paths |= {broken}
+        self.connection.commit()
+        self.boundary.refresh()
+        maintenance_state.ensure_schema(self.connection)
+        self.connection.execute("INSERT INTO maintenance_cycles (repo, phase, cycle_base_sha) VALUES (?, 'assessment', ?)",
+                                (self.repo, self.sha))
+        self.connection.commit()
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for relative, contents in {**self.documents, 'docs/PRODUCT.md': 'Product.'}.items():
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(contents, encoding='utf-8')
+            def snapshot_at(worktree, sha, row):
+                return manager._ready_plan_snapshot_from_contents(row, (worktree / row['path']).read_bytes())
+            with mock.patch.object(manager, '_ready_plan_snapshot', side_effect=snapshot_at) as snapshots:
+                context = manager.prepare_maintenance_planning_context(self.connection, self.repo, root, self.sha)
+            self.assertEqual([plan.plan_id for plan in context.eligible_plans], ['G-001'])
+            snapshots.assert_called_once()
+            cycle = maintenance_state.MaintenanceRepository(self.connection).get(self.repo)
+            with mock.patch.object(manager, '_ready_plan_snapshot_at_revision', side_effect=snapshot_at) as snapshots:
+                restored_context = manager._maintenance_context_at_revision(
+                    self.connection, self.repo, root, self.sha, cycle)
+            self.assertEqual(restored_context, context)
+            snapshots.assert_called_once()
+            self.assertNotEqual(self.row('G-002')['content_hash'], catalog.plan_content_hash(
+                (root / self.row('G-002')['path']).read_bytes()))
+            path = 'docs/plans/[G-007] Refactor.md'
+            (root / path).write_text(fixtures.plan_text('G-007', 'Refactor'), encoding='utf-8')
+            ready = context.eligible_plans[0]
+            (root / ready.path).write_text(ready.text.replace('depends_on: []', 'depends_on:\n  - G-007'), encoding='utf-8')
+            def git(_root, command, *args, **kwargs):
+                item = args[-1]
+                tree = f'100644 blob abc\t{item}\0' if item in self.documents else ''
+                return SimpleNamespace(returncode=0, stdout=tree if command == 'ls-tree' else '')
+            with mock.patch.object(manager, 'git', side_effect=git), \
+                 mock.patch.object(manager, '_git_tree_entries', return_value={
+                     relative.encode(): (b'blob', b'abc') for relative in self.documents}), \
+                 mock.patch.object(manager, 'changed_files', return_value=[]):
+                result = manager.validate_maintenance_planner_result(
+                    self.connection, context, root, [ready.path, path])
+                self.assertEqual([plan['id'] for _, plan in result.plans], ['G-007'])
+                self.assertEqual([revision.snapshot.plan_id for revision in result.revisions], ['G-001'])
+                for mutation in ('held-body', 'held-dependency', 'new-priority'):
+                    with self.subTest(mutation=mutation):
+                        (root / broken).write_text(self.documents[broken], encoding='utf-8')
+                        text = fixtures.plan_text('G-007', 'Refactor')
+                        if mutation == 'held-body':
+                            (root / broken).write_text(self.documents[broken] + '\nChanged.\n', encoding='utf-8')
+                        elif mutation == 'held-dependency':
+                            text = text.replace('depends_on: []', 'depends_on:\n  - G-002')
+                        else:
+                            text = text.replace('priority: normal\n', '')
+                        (root / path).write_text(text, encoding='utf-8')
+                        with self.assertRaises(manager.PlannerValidationError):
+                            manager.validate_maintenance_planner_result(
+                                self.connection, context, root, [ready.path, path])
+                (root / path).write_text(fixtures.plan_text('G-007', 'Refactor'), encoding='utf-8')
+                (root / broken).write_text(self.documents[broken], encoding='utf-8')
+                self.connection.execute("INSERT INTO execplan_catalog_holds "
+                    "SELECT repo, 'G-001', revision_sha, evidence, NULL FROM execplan_catalog_holds LIMIT 1")
+                with self.assertRaisesRegex(manager.PlannerValidationError, 'eligible READY snapshot'):
+                    manager.validate_maintenance_planner_result(
+                        self.connection, context, root, [ready.path, path])
+
+    def test_maintenance_context_refuses_held_required_revalidation(self):
+        from loop_manager_internal.maintenance import maintenance_validation
+        from loop_manager_internal.storage import maintenance_state
+        self.boundary.refresh()
+        cycle = SimpleNamespace(phase=maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+                                revalidation_plan_ids=('G-002',))
+        effects = maintenance_validation.MaintenanceModeAndRowsEffects(is_unowned_ready=manager.is_unowned_ready)
+        with self.assertRaisesRegex(manager.MaintenancePlanningError, 'catalog 보류'):
+            maintenance_validation._maintenance_mode_and_rows(effects, self.connection, self.repo, cycle, self.sha)
+
+    @contextlib.contextmanager
+    def _scoped_maintenance_publication(self):
+        import hashlib
+        import tempfile
+        from loop_manager_internal.storage import maintenance_state
+        self.connection.execute("UPDATE exec_plans SET workspace_owned=0, worker_session_id=NULL, "
+                                "reviewer_session_id=NULL, retry_count=0, ever_started=0 WHERE plan_id='G-001'")
+        self.documents['docs/plans/[G-001] Updated.md'] = fixtures.plan_text('G-001', 'Updated')
+        broken = 'docs/plans/[G-006] New invalid.md'
+        self.documents[broken] = self.fixture._text('G-006', 'New invalid').replace('priority: normal\n', '')
+        self.paths |= {broken}
+        self.connection.commit()
+        self.boundary.refresh()
+        maintenance_state.ensure_schema(self.connection)
+        self.connection.execute("INSERT INTO maintenance_cycles (repo, phase, cycle_base_sha) VALUES (?, 'assessment', ?)",
+                                (self.repo, self.sha))
+        self.connection.commit()
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as ports:
+            root = Path(directory)
+            baseline = {**self.documents, 'docs/PRODUCT.md': 'Product.'}
+            for relative, text in baseline.items():
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding='utf-8')
+            def snapshot_at(worktree, sha, row):
+                return manager._ready_plan_snapshot_from_contents(row, baseline[row['path']].encode())
+            ports.enter_context(mock.patch.object(manager, '_ready_plan_snapshot', side_effect=snapshot_at))
+            ports.enter_context(mock.patch.object(manager, '_ready_plan_snapshot_at_revision', side_effect=snapshot_at))
+            context = manager.prepare_maintenance_planning_context(self.connection, self.repo, root, self.sha)
+            path = 'docs/plans/[G-007] Refactor.md'
+            (root / path).write_text(fixtures.plan_text('G-007', 'Refactor'), encoding='utf-8')
+            ready = context.eligible_plans[0]
+            (root / ready.path).write_text(ready.text.replace('depends_on: []', 'depends_on:\n  - G-007'), encoding='utf-8')
+            batch = SimpleNamespace(root=root, context=context, commit='e' * 40, remote=self.sha,
+                                    publication_paths=(ready.path, path), broken=broken)
+            committed = {relative: (root / relative).read_bytes() for relative in batch.publication_paths}
+            base_tree = {relative.encode(): (b'blob', hashlib.sha1(text.encode()).hexdigest().encode())
+                         for relative, text in baseline.items()}
+            plan_tree = {**base_tree, **{relative.encode(): (b'blob', hashlib.sha1(data).hexdigest().encode())
+                                      for relative, data in committed.items()}}
+            remote_tree = {**plan_tree, b'docs/notes.md': (b'blob', b'f' * 40)}
+            def git(_root, command, *args, **kwargs):
+                stdout, returncode = '', 0
+                if command == 'rev-parse':
+                    stdout = batch.commit if args == ('HEAD',) else batch.remote
+                elif command == 'rev-list':
+                    stdout = f'{batch.commit} {self.sha}'
+                elif command == 'ls-tree':
+                    stdout = f'100644 blob abc\t{args[-1]}\0' if args[-1] in baseline else ''
+                elif command == 'diff' and '--name-only' in args:
+                    stdout = '\n'.join(batch.publication_paths)
+                elif command == 'diff' and '--quiet' in args:
+                    returncode = int((root / args[-1]).read_bytes() != baseline[args[-1]].encode())
+                return SimpleNamespace(stdout=stdout, returncode=returncode)
+            ports.enter_context(mock.patch.object(manager, 'git', side_effect=git))
+            ports.enter_context(mock.patch.object(manager, 'git_bytes', side_effect=lambda root, cmd, spec: committed[spec.split(':', 1)[1]]))
+            ports.enter_context(mock.patch.object(manager, '_git_tree_entries', side_effect=lambda root, sha:
+                base_tree if sha == self.sha else plan_tree if sha == batch.commit else remote_tree))
+            ports.enter_context(mock.patch.object(manager, 'changed_files', return_value=list(batch.publication_paths)))
+            ports.enter_context(mock.patch.object(manager, 'is_loop_manager_repository', return_value=False))
+            ports.enter_context(mock.patch.object(manager, 'plan_declarations', return_value={}))
+            batch.result = manager.validate_maintenance_planner_result(
+                self.connection, context, root, list(batch.publication_paths))
+            yield batch
+
+    def _assert_scoped_maintenance_recovery(self, *, remote_advances):
+        import sqlite3
+        from loop_manager_internal.storage import maintenance_state
+        with self._scoped_maintenance_publication() as batch:
+            before = {key: dict(self.row(key)) for key in self.held() if self.row(key) is not None}
+            holds = [tuple(row) for row in self.connection.execute('SELECT * FROM execplan_catalog_holds ORDER BY plan_id')]
+            intent = manager.record_maintenance_publication_intent(
+                self.connection, self.repo, batch.root, 'main', batch.result, batch.commit)
+            self.assertEqual(intent.publication_stage, 'prepared')
+            self.assertEqual(intent.publication_refactoring_plan_ids, ('G-007',))
+            self.assertIsNone(self.row('G-007'))
+            # Only durable SQLite state and committed blobs survive this restart.
+            restarted = sqlite3.connect(':memory:')
+            restarted.row_factory = sqlite3.Row
+            self.addCleanup(restarted.close)
+            self.connection.backup(restarted)
+            batch.remote = 'f' * 40 if remote_advances else batch.commit
+            cycle = manager.recover_maintenance_planning_batch(restarted, self.repo, batch.root, 'main')
+            self.assertEqual(cycle.phase, maintenance_state.MaintenancePhase.REFACTORING)
+            self.assertEqual(cycle.publication_remote_oid, batch.commit)
+            self.assertEqual(cycle.refactoring_plan_ids, ('G-007',))
+            self.assertEqual(restarted.execute("SELECT status FROM exec_plans WHERE plan_id='G-007'").fetchone()[0], 'READY')
+            self.assertEqual(restarted.execute("SELECT depends_on FROM exec_plans WHERE plan_id='G-001'").fetchone()[0], '["G-007"]')
+            for key, row in before.items():
+                self.assertEqual(dict(restarted.execute('SELECT * FROM exec_plans WHERE plan_id=?', (key,)).fetchone()), row)
+            self.assertEqual([tuple(row) for row in restarted.execute('SELECT * FROM execplan_catalog_holds ORDER BY plan_id')], holds)
+            again = manager.recover_maintenance_planning_batch(restarted, self.repo, batch.root, 'main')
+            self.assertEqual(again, cycle)
+            self.assertEqual(restarted.execute("SELECT COUNT(*) FROM exec_plans WHERE plan_id='G-007'").fetchone()[0], 1)
+
+    def test_maintenance_intent_recovers_scoped_batch_after_restart(self):
+        self._assert_scoped_maintenance_recovery(remote_advances=False)
+
+    def test_maintenance_intent_recovers_scoped_batch_after_remote_advances(self):
+        self._assert_scoped_maintenance_recovery(remote_advances=True)
+
+    def test_maintenance_publication_rejects_changed_hold_and_preserves_intent(self):
+        from loop_manager_internal.storage import maintenance_state
+        with self._scoped_maintenance_publication() as batch:
+            target = batch.root / batch.broken
+            baseline = target.read_bytes()
+            holds = [tuple(row) for row in self.connection.execute('SELECT * FROM execplan_catalog_holds ORDER BY plan_id')]
+            target.write_bytes(baseline + b'\nChanged withheld file.\n')
+            with self.assertRaisesRegex(manager.MaintenancePlanningError, '원인이나 범위'):
+                manager.record_maintenance_publication_intent(
+                    self.connection, self.repo, batch.root, 'main', batch.result, batch.commit)
+            self.assertIsNone(maintenance_state.MaintenanceRepository(self.connection).get(self.repo).publication_stage)
+            target.write_bytes(baseline)
+            intent = manager.record_maintenance_publication_intent(
+                self.connection, self.repo, batch.root, 'main', batch.result, batch.commit)
+            batch.remote = batch.commit
+            for mutation in ('held-file', 'batch-file'):
+                with self.subTest(mutation=mutation):
+                    target = batch.root / (batch.broken if mutation == 'held-file' else batch.publication_paths[-1])
+                    data = target.read_bytes()
+                    target.write_bytes(data + b'\nChanged after intent.\n')
+                    with self.assertRaises(manager.MaintenancePlanningError):
+                        manager.recover_maintenance_planning_batch(self.connection, self.repo, batch.root, 'main')
+                    self.assertEqual(maintenance_state.MaintenanceRepository(self.connection).get(self.repo), intent)
+                    self.assertIsNone(self.row('G-007'))
+                    self.assertEqual([tuple(row) for row in self.connection.execute('SELECT * FROM execplan_catalog_holds ORDER BY plan_id')], holds)
+                    target.write_bytes(data)

@@ -219,10 +219,11 @@ def _migrate_execplan_catalog(
                 )
             }
             catalog_initialized = connection.execute(
-                "SELECT 1 FROM execplan_catalog_revisions WHERE repo = ?",
-                (project["repo"],),
+                "SELECT 1 FROM execplan_catalog_revisions WHERE repo = ? "
+                "UNION SELECT 1 FROM execplan_catalog_views WHERE repo = ?",
+                (project["repo"], project["repo"]),
             ).fetchone() is not None
-            missing_stored_ids = set(stored) - set(snapshot.all)
+            missing_stored_ids = set(stored) - snapshot.observed_ids
             legacy_backfill_allowed = (
                 not catalog_initialized and not missing_stored_ids
             )

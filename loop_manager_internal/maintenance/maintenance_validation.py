@@ -3,6 +3,10 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.application.contracts import ValidatedPlanningResult
+from loop_manager_internal.catalog import project_catalog_refresh
+from loop_manager_internal.git.command_adapter import ExternalObservationError
+from loop_manager_internal.runtime.contracts import GitLockError
+from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
 from loop_manager_internal.maintenance.maintenance_file_inventory import AssessmentError
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanMode
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningContext
@@ -30,6 +34,7 @@ def _maintenance_mode_and_rows(
     cycle: maintenance_state.MaintenanceCycle,
     active_sha: str,
 ) -> tuple[MaintenancePlanMode, list[sqlite3.Row]]:
+    held_ids = catalog_held_plan_ids(connection, repo)
     if cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT:
         if cycle.cycle_base_sha != active_sha:
             raise MaintenancePlanningError(
@@ -45,10 +50,13 @@ def _maintenance_mode_and_rows(
             "ORDER BY plan_id",
             (repo,),
         ).fetchall()
-        return MaintenancePlanMode.BARRIER, [row for row in rows if effects.is_unowned_ready(row)]
+        return MaintenancePlanMode.BARRIER, [row for row in rows
+            if row["plan_id"] not in held_ids and effects.is_unowned_ready(row)]
     if cycle.phase is maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION:
         rows = []
         for plan_id in cycle.revalidation_plan_ids:
+            if plan_id in held_ids:
+                raise MaintenancePlanningError(f"재검증 대상 계획이 catalog 보류 중입니다: {plan_id}")
             row = connection.execute(
                 "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ? "
                 "AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
@@ -186,7 +194,10 @@ def _assert_maintenance_context_current(
             "maintenance mode 또는 eligible READY snapshot이 SQLite 단계와 "
             "일치하지 않습니다."
         )
+    held_ids = catalog_held_plan_ids(connection, context.repo)
     for snapshot in context.eligible_plans:
+        if snapshot.plan_id in held_ids:
+            raise MaintenancePlanningError(f"READY snapshot 계획이 catalog 보류 중입니다: {snapshot.plan_id}")
         row = connection.execute(
             "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
             (context.repo, snapshot.plan_id),
@@ -249,6 +260,7 @@ class ValidateMaintenancePlannerResultEffects:
     _validate_future_idea_separation: Callable[..., object]
     changed_files: Callable[..., object]
     contains_guidance_sections: Callable[..., object]
+    git: Callable[..., object]
     load_execplan_snapshot: Callable[..., object]
     published_execplan: Callable[..., object]
     terminal_new_plan_ids: Callable[..., object]
@@ -352,9 +364,15 @@ def validate_maintenance_planner_result(
                 new_paths.append(path)
 
         try:
-            catalog_snapshot = effects.load_execplan_snapshot(
-                worktree, validate_sources=False
-            )
+            held_ids = catalog_held_plan_ids(connection, context.repo)
+            if held_ids:
+                catalog_snapshot = project_catalog_refresh.validated_held_planning_snapshot(
+                    connection, context.repo, worktree, context.active_sha,
+                    git=effects.git, load_snapshot=effects.load_execplan_snapshot)
+            else:
+                catalog_snapshot = effects.load_execplan_snapshot(worktree, validate_sources=False)
+        except (ExternalObservationError, GitLockError):
+            raise
         except RuntimeError as error:
             raise MaintenancePlanningError(str(error)) from error
         catalog = catalog_snapshot.active_metadata()
@@ -378,6 +396,12 @@ def validate_maintenance_planner_result(
                     f"검증 중 maintenance ExecPlan이 변경됐습니다: {path}"
                 )
             new_plans.append((path, validated_plan))
+        try:
+            project_catalog_refresh.assert_planning_dependencies_unheld(
+                catalog, new_plans + [(path, catalog[eligible[path].plan_id]) for path in revised_paths],
+                held_ids)
+        except RuntimeError as error:
+            raise MaintenancePlanningError(str(error)) from error
         new_ids = {str(plan["id"]) for _, plan in new_plans}
         declared_refactoring = (
             new_ids
@@ -404,7 +428,7 @@ def validate_maintenance_planner_result(
 
         existing_ids = [
             int(plan_id[2:])
-            for plan_id in catalog_snapshot.all
+            for plan_id in catalog_snapshot.observed_ids
             if plan_id not in new_ids
         ]
         first_id = max(existing_ids, default=0) + 1

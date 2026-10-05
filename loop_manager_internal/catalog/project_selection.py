@@ -120,14 +120,18 @@ def compact_execplan_catalog(effects: CompactExecplanCatalogEffects, connection:
         (repo,),
     ).fetchall()
     rows = sorted(rows, key=lambda row: int(str(row["plan_id"])[2:]))
+    held = {str(row[0]): json.loads(str(row[1])) for row in connection.execute(
+        "SELECT plan_id, evidence FROM execplan_catalog_holds WHERE repo = ?", (repo,),
+    )}
     catalog = [
         {
             "id": row["plan_id"],
             "title": row["title"],
-            "status": row["status"],
+            "status": "CATALOG_HELD" if str(row["plan_id"]) in held else row["status"],
             "sources": json.loads(row["sources"]),
             "depends_on": json.loads(row["depends_on"]),
             "priority": row["priority"],
+            **({"catalog_error": held[str(row["plan_id"])]} if str(row["plan_id"]) in held else {}),
         }
         for row in rows
     ]
@@ -153,6 +157,8 @@ def prerequisite_validation_rows(
         "AND h.currently_archived = 1)",
         (repo,),
     ).fetchall()
+    held = scoped_blocking.catalog_held_plan_ids(connection, repo)
+    active = [row for row in active if str(row["plan_id"]) not in held]
     included = {str(row["plan_id"]): row for row in active}
     pending = list(active)
     while pending:
@@ -277,23 +283,24 @@ def catalog_schedule_decision(
         )
         for row in rows
     }
+    held = scoped_blocking.catalog_held_plan_ids(connection, repo)
     ready = [
         row
         for row in rows
-        if row["status"] == "READY" and str(row["plan_id"]) not in historical_ids
+        if row["status"] == "READY" and str(row["plan_id"]) not in historical_ids | held
     ]
     execution_rows = [
         row for row in rows
-        if str(row["plan_id"]) not in historical_ids
+        if str(row["plan_id"]) not in held and (str(row["plan_id"]) not in historical_ids
         or (
             historical_confirmation[str(row["plan_id"])]
             and row["status"] == "MERGED"
-        )
+        ))
     ]
     candidates = []
     for row in ready:
         dependencies = json.loads(row["depends_on"])
-        if all(statuses.get(dependency) == "MERGED" for dependency in dependencies):
+        if all(dependency not in held and statuses.get(dependency) == "MERGED" for dependency in dependencies):
             candidates.append(row)
     selected = None
     cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
@@ -325,7 +332,7 @@ def catalog_schedule_decision(
         active=active,
         has_ready=bool(ready),
         runnable_ready=selected,
-        has_plan_blocked=any(
+        has_plan_blocked=bool(held) or any(
             row["status"] == "PLAN_BLOCKED"
             and str(row["plan_id"]) not in historical_ids for row in rows
         ),

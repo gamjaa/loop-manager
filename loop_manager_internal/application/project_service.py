@@ -724,7 +724,12 @@ class ProjectService:
             return self.effects._execution_outcome_step_result(execution_outcome)
 
     def _refresh_catalog(self, revision: str | None = None) -> str:
+        projected = runtime_state.RuntimeStateRepository(self.identity.connection).projected_row(self.state.repo)
         revision = self.state.catalog_refresh.refresh(revision)
+        if (projected is not None and str(projected["plan_id"]) in
+                scoped_blocking.catalog_held_plan_ids(self.identity.connection, self.state.repo)):
+            # The verified scope remains with its paused plan's runtime row.
+            self.state.validated_agent_scope = None
         if self.state.history_revision != revision:
             self.effects.migrate_legacy_execplans(
                 self.identity.connection, reconcile_history=True, target_repo=self.state.repo, ensure_schema=False,

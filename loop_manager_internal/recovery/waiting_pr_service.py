@@ -275,13 +275,14 @@ def select_waiting_pull_request_conflict(
     statuses = {
         plan_id: str(row["status"]) for plan_id, row in current_rows.items()
     }
+    held = scoped_blocking.catalog_held_plan_ids(connection, repo)
     eligible: list[tuple[sqlite3.Row, Mapping[str, object]]] = []
     for stored, pull_request in observation.conflicts:
         current = current_rows.get(str(stored["plan_id"]))
-        if current is None or current["status"] != "PR_OPEN":
+        if current is None or current["status"] != "PR_OPEN" or str(current["plan_id"]) in held:
             continue
         if all(
-            statuses.get(str(dependency)) == "MERGED"
+            str(dependency) not in held and statuses.get(str(dependency)) == "MERGED"
             for dependency in json.loads(str(current["depends_on"]))
         ):
             eligible.append((current, pull_request))

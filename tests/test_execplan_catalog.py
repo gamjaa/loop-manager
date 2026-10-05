@@ -432,3 +432,85 @@ class ExecPlanCatalogSnapshotTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ScopedCatalogParsingTest(unittest.TestCase):
+    def snapshot(self, documents):
+        return execplan_catalog.snapshot_from_documents(
+            documents, validate_sources=True,
+            available_regular_paths={'docs/PRODUCT.md'}, revision_sha='a' * 40,
+            isolate_errors=True,
+        )
+
+    def test_missing_source_withholds_transitive_dependents_only(self):
+        documents = {
+            'docs/plans/[G-001] Invalid.md': execplan_header(
+                'G-001', 'Invalid', sources=('docs/requirements/missing.md',)),
+            'docs/plans/[G-002] Direct.md': plan_text('G-002', 'Direct', depends_on=('G-001',)),
+            'docs/plans/[G-003] Indirect.md': plan_text('G-003', 'Indirect', depends_on=('G-002',)),
+            'docs/plans/[G-004] Independent.md': plan_text('G-004', 'Independent'),
+        }
+        view = self.snapshot(documents)
+        self.assertEqual(set(view.active), {'G-004'})
+        self.assertEqual(view.withheld_ids, {'G-001', 'G-002', 'G-003'})
+        self.assertEqual(view.observed_ids, {'G-001', 'G-002', 'G-003', 'G-004'})
+        self.assertEqual(view.issues[0].code, 'missing-source')
+        with self.assertRaises(execplan_catalog.ExecPlanCatalogError):
+            execplan_catalog.snapshot_from_documents(
+                documents, validate_sources=True, available_regular_paths={'docs/PRODUCT.md'})
+
+    def test_unique_invalid_metadata_and_dependency_cycles_remain_non_executable(self):
+        for broken in (
+            execplan_header('G-001', 'Invalid', risk='unsupported'),
+            execplan_header('G-001', 'Invalid', depends_on=('G-099',)),
+            execplan_header('G-001', 'Invalid', depends_on=('G-002',)),
+        ):
+            with self.subTest(broken=broken):
+                view = self.snapshot({
+                    'docs/plans/[G-001] Invalid.md': broken,
+                    'docs/plans/[G-002] Direct.md': plan_text('G-002', 'Direct', depends_on=('G-001',)),
+                    'docs/plans/[G-003] Independent.md': plan_text('G-003', 'Independent'),
+                })
+                self.assertEqual(set(view.active), {'G-003'})
+                self.assertEqual(view.withheld_ids, {'G-001', 'G-002'})
+
+    def test_ambiguous_identity_encoding_and_shared_file_safety_fail_closed(self):
+        for documents in (
+            {'docs/plans/[G-001] Invalid.md': '---\nid: G-001\nrisk: bad'},
+            {'docs/plans/[G-001] Invalid.md': execplan_header('G-002', 'Invalid')},
+            {'docs/plans/[G-001] Invalid.md': b'\xff'},
+            {'docs/plans/[G-001] Invalid.md': execplan_header('G-001', 'Invalid', risk='bad'),
+             'docs/plans/[G-001] Other.md': execplan_header('G-001', 'Other')},
+        ):
+            with self.subTest(documents=documents), self.assertRaises(execplan_catalog.ExecPlanCatalogError):
+                self.snapshot(documents)
+        with self.assertRaises(execplan_catalog.ExecPlanCatalogError):
+            execplan_catalog.snapshot_from_documents({}, isolate_errors=True,
+                invalid_plan_entries={'docs/plans/[G-001] Invalid.md': 'symlink'})
+
+    def test_git_port_pins_isolated_errors_and_execution_view_to_one_tree(self):
+        from loop_manager_internal.catalog import catalog_service
+        revision = 'a' * 40
+        product = 'docs/PRODUCT.md'
+        broken = 'docs/plans/[G-001] Broken.md'
+        independent = 'docs/plans/[G-002] Independent.md'
+        contents = {
+            'broken-oid': execplan_header('G-001', 'Broken', risk='invalid').encode(),
+            'valid-oid': plan_text('G-002', 'Independent').encode(),
+        }
+        tree = (f'100644 blob product-oid\t{product}\0'
+                f'100644 blob broken-oid\t{broken}\0'
+                f'100644 blob valid-oid\t{independent}\0').encode()
+        def git_bytes(_repo, command, *arguments):
+            return tree if command == 'ls-tree' else contents[arguments[-1]]
+        effects = SimpleNamespace(git=lambda *args: SimpleNamespace(stdout=revision), git_bytes=git_bytes)
+        port = catalog_service._GitCatalogDefinitionPort(
+            SimpleNamespace(git=effects.git, git_bytes=effects.git_bytes,
+                revision_execplan_snapshot=lambda repo, sha, **kwargs:
+                    catalog_service.revision_execplan_snapshot(effects, repo, sha, **kwargs)),
+            Path('/repo'), 'origin/main', lambda: frozenset())
+        pinned = port.load()
+        self.assertEqual((pinned.revision_sha, pinned.snapshot.revision_sha), (revision, revision))
+        self.assertEqual(set(pinned.snapshot.active), {'G-002'})
+        self.assertEqual(pinned.snapshot.withheld_ids, {'G-001'})
+        self.assertEqual(pinned.regular_paths, {product, broken, independent})

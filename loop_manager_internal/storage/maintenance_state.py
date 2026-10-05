@@ -519,10 +519,17 @@ class MaintenanceRepository:
         if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", source_sha):
             raise MaintenanceStateError("검증된 catalog source revision이 없습니다.")
         try:
-            revision = self.connection.execute(
-                "SELECT revision_sha FROM execplan_catalog_revisions WHERE repo = ?",
-                (repo,),
-            ).fetchone()
+            revision = None
+            if self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_catalog_views'"
+            ).fetchone() is not None:
+                revision = self.connection.execute(
+                    "SELECT revision_sha FROM execplan_catalog_views WHERE repo = ?", (repo,),
+                ).fetchone()
+            if revision is None:
+                revision = self.connection.execute(
+                    "SELECT revision_sha FROM execplan_catalog_revisions WHERE repo = ?", (repo,),
+                ).fetchone()
         except sqlite3.OperationalError as error:
             raise MaintenanceStateError(
                 "검증된 catalog source revision이 없습니다."

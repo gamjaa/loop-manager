@@ -1076,6 +1076,10 @@ class RuntimeStateRepository:
         """Apply a decided source/projection transition in one savepoint."""
 
         with _transaction(self.connection):
+            if plan_values.get("status") in ACTIVE_STATUSES:
+                from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
+                if plan_id in catalog_held_plan_ids(self.connection, repo):
+                    raise RuntimeStateError("catalog 오류로 보류된 ExecPlan을 실행할 수 없습니다.")
             self._update_plan_row(
                 repo, plan_id, plan_values, expected_status=expected_status
             )
@@ -1170,6 +1174,9 @@ class RuntimeStateRepository:
         worktree: str,
         preserve_worker_session: bool = False,
     ) -> ExecutionSnapshot:
+        from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
+        if plan_id in catalog_held_plan_ids(self.connection, repo):
+            raise RuntimeStateError("catalog 오류로 보류된 ExecPlan을 activate할 수 없습니다.")
         selected = self.get(repo, plan_id)
         # Maintenance deferral resumes an owned execution; ordinary activation
         # still discards stale session state from a newly queued declaration.
@@ -1239,7 +1246,10 @@ class RuntimeStateRepository:
     ) -> ExecutionSnapshot:
         if snapshot.repo != repo:
             raise RuntimeStateError("hydrate 대상 프로젝트와 snapshot이 다릅니다.")
+        from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
         with _transaction(self.connection):
+            if snapshot.plan_id in catalog_held_plan_ids(self.connection, repo):
+                raise RuntimeStateError("catalog 오류로 보류된 ExecPlan을 hydrate할 수 없습니다.")
             self._update_project_row(repo, snapshot.project_values())
             self._fault("after_project_update")
         return snapshot
