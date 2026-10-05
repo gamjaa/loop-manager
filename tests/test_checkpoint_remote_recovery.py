@@ -912,6 +912,12 @@ class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest
         )
         self.connection.commit()
         corrected = self.user_commit()
+        # Project entry observes remote inputs before resume_plan_blocks;
+        # exercise that route rather than the unobserved legacy fallback.
+        repo = str(self.repo.resolve())
+        loop_manager.observe_blocked_plan_remotes(
+            self.connection, self.repo, repo,
+            self.connection.execute('SELECT * FROM projects WHERE repo = ?', (repo,)).fetchone())
         original = blocked_plan_reconciliation.BlockedPlanReconciler._resume
 
         def interrupted(*arguments, **keywords):

@@ -772,18 +772,37 @@ class PlanRecoveryAdoptionTests(PlanRemoteRecoveryFixture, unittest.TestCase):
 
     def test_interruption_after_release_preserves_audit_and_uses_adopted_baseline(self):
         original = self.published_successor()
+        manager = loop_manager.ManagerGitCheckpoint(original, frozenset()).serialize()
+        self.connection.execute(
+            "UPDATE exec_plans SET agent_manager_snapshot = ?, agent_baseline = 'old' "
+            "WHERE repo = ? AND plan_id = 'G-106'", (manager, self.repo))
+        self.connection.commit()
         self.ports._evaluate_remote_checkpoint_cause.return_value = (True, 'resolved', 'verify')
+        effects = replace(loop_manager._scope_reconciliation_effects_resume_plan_blocks(),
+                          plan_recovery_effects=lambda: self.ports)
         resume = blocked_plan_reconciliation.BlockedPlanReconciler._resume
         def interrupt(instance, *args, **kwargs):
             resume(instance, *args, **kwargs)
             raise KeyboardInterrupt()
-        with mock.patch.object(blocked_plan_reconciliation.BlockedPlanReconciler, '_resume', new=interrupt):
+        with (mock.patch.object(loop_manager, '_scope_reconciliation_effects_resume_plan_blocks',
+                                return_value=effects),
+              mock.patch.object(blocked_plan_reconciliation.BlockedPlanReconciler, '_resume', new=interrupt),
+              mock.patch.object(loop_manager, '_resume_remote_corrected_execplan',
+                                side_effect=AssertionError('unobserved legacy recovery'))):
             with self.assertRaises(KeyboardInterrupt):
-                self.coordinator.reconcile('G-106')
+                loop_manager.resume_plan_blocks(
+                    self.connection, Path('/repo'), Path('/state'), self.repo, 'main')
         self.assertEqual(self.plan()['status'], 'IMPLEMENTING')
         self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
+        self.assertEqual(self.plan()['agent_result_snapshot'], original.serialize())
+        self.assertEqual(self.plan()['agent_manager_snapshot'], manager)
+        self.assertEqual(self.plan()['agent_baseline'], 'old')
         self.assertIsNone(scoped_blocking.plan_block(self.connection, self.repo, 'G-106'))
         self.assertEqual(self.coordinator.reconcile('G-106'), 'unhandled')
+        loop_manager.hydrate_active_project(self.connection, self.repo)
+        projected = self.connection.execute('SELECT * FROM projects WHERE repo = ?', (self.repo,)).fetchone()
+        self.assertEqual(projected['agent_snapshot'], original.serialize())
+        self.assertEqual(projected['agent_manager_snapshot'], manager)
         before = loop_manager.begin_agent_scope(
             self.connection, self.repo, Path(self.plan()['worktree']), 'worker')
         self.assertEqual(before.head, self.head)
