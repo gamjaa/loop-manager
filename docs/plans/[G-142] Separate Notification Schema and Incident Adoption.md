@@ -4,7 +4,8 @@ title: Separate Notification Schema and Incident Adoption
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-053] Timely Progress Notifications.md
-depends_on: []
+depends_on:
+  - G-158
 complexity: medium
 risk: medium
 priority: normal
@@ -40,3 +41,5 @@ Make notification event projection and legacy incident adoption explicit. The no
 
 - Manifest findings 20 and 21 identify the mixed notification responsibilities; finding 82 identifies an outbox assertion gap relevant to the same durable event boundary.
 - Observed notification paths: `loop_manager_internal/notifications/events.py`, `loop_manager_internal/notifications/repository.py`.
+
+- 2026-10-05 사용자 실행 순서 결정: G-158의 archive Requirement 감사·복구 준비 PR이 실제 Merge된 뒤 기존 세션과 후보를 보존하여 재개한다. 미충족 Requirement는 활성 입력으로 유지하고 조기 archive 강제를 완료 조건으로 적용하지 않는다. 재개 후 targeted test, Manager 전체 verify, Reviewer와 PR 게시를 통해 실제 복구를 확인하며 다른 안전 차단은 별도로 판단한다.
