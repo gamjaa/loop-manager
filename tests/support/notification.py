@@ -43,7 +43,8 @@ class NotificationFixture:
         except BaseException:
             connection.close()
             raise
-        self.addCleanup(connection.close)
+        if database == ":memory:":
+            self.addCleanup(connection.close)
         return connection
 
     @staticmethod

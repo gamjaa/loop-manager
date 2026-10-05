@@ -261,6 +261,15 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
                 notification_fixture.NotificationFixture.connection(owner)
         connection.close.assert_called_once_with()
 
+    def test_notification_fixture_leaves_file_connection_cleanup_to_its_caller(self):
+        owner = mock.Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            returned = notification_fixture.NotificationFixture.connection(
+                owner, database=Path(directory) / 'loop-manager.db'
+            )
+            owner.addCleanup.assert_not_called()
+            returned.close()
+
     def test_recovery_fixture_closes_its_owned_connection_after_initialization_failure(self):
         connection = mock.Mock()
         connection.execute.side_effect = RuntimeError('schema setup failed')

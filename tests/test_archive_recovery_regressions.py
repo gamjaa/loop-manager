@@ -211,44 +211,55 @@ class ArchiveRecoveryRegressionTest(unittest.TestCase):
         revised = archived_entry(text_suffix=" synchronized revision")
         tampered = archived_entry(text_suffix=" tampered")
         self.seed_history(original, revised)
-        directory = self.enterContext(tempfile.TemporaryDirectory())
-        database = str(Path(directory) / "history.db")
-        disk = sqlite3.connect(database)
-        try:
-            self.connection.backup(disk)
-        finally:
-            disk.close()
-        self.connection.close()
-        self.connection = sqlite3.connect(database)
-        self.connection.row_factory = sqlite3.Row
-        self.addCleanup(self.connection.close)
-        with (
-            mock.patch("loop_manager.pr_for_branch", side_effect=AssertionError("PR query")) as pr,
-            mock.patch("loop_manager.git", return_value=subprocess.CompletedProcess(
-                [], 0, "c" * 40, "",
-            )),
-            mock.patch("loop_manager.git_bytes", return_value=original.text.encode()),
-            mock.patch("loop_manager._git_commit_is_ancestor", return_value=True),
-        ):
-            for observed in (tampered, original, tampered):
-                result = self.recover_stored_history(observed)
-                self.assertEqual(result.merged, ())
-                self.assertEqual(result.diagnostics[0].code, "archived-content-hash-mismatch")
-                self.connection.commit()
+        with tempfile.TemporaryDirectory() as directory:
+            database = str(Path(directory) / "history.db")
+
+            def reconnect():
+                connection = sqlite3.connect(database)
+                try:
+                    connection.row_factory = sqlite3.Row
+                except BaseException:
+                    connection.close()
+                    raise
+                return connection
+
+            disk = sqlite3.connect(database)
+            try:
+                self.connection.backup(disk)
+            finally:
+                disk.close()
+            self.connection.close()
+            self.connection = reconnect()
+            self.addCleanup(self.connection.close)
+            try:
+                with (
+                    mock.patch("loop_manager.pr_for_branch", side_effect=AssertionError("PR query")) as pr,
+                    mock.patch("loop_manager.git", return_value=subprocess.CompletedProcess(
+                        [], 0, "c" * 40, "",
+                    )),
+                    mock.patch("loop_manager.git_bytes", return_value=original.text.encode()),
+                    mock.patch("loop_manager._git_commit_is_ancestor", return_value=True),
+                ):
+                    for observed in (tampered, original, tampered):
+                        result = self.recover_stored_history(observed)
+                        self.assertEqual(result.merged, ())
+                        self.assertEqual(result.diagnostics[0].code, "archived-content-hash-mismatch")
+                        self.connection.commit()
+                        self.connection.close()
+                        self.connection = reconnect()
+                        self.addCleanup(self.connection.close)
+                        audit = execplan_catalog_state.CatalogStateRepository(self.connection).historical_row(
+                            "/repo", "G-001",
+                        )
+                        self.assertEqual(audit["merge_confirmed"], 1)
+                        self.assertEqual(audit["final_content_hash"], revised.content_hash)
+                        self.assertEqual(audit["proof_revision"], "b" * 40)
+                    repaired = self.recover_stored_history(revised)
+                    self.assertEqual(repaired.diagnostics, ())
+                    self.assertEqual(len(repaired.merged), 1)
+                    pr.assert_not_called()
+            finally:
                 self.connection.close()
-                self.connection = sqlite3.connect(database)
-                self.connection.row_factory = sqlite3.Row
-                self.addCleanup(self.connection.close)
-                audit = execplan_catalog_state.CatalogStateRepository(self.connection).historical_row(
-                    "/repo", "G-001",
-                )
-                self.assertEqual(audit["merge_confirmed"], 1)
-                self.assertEqual(audit["final_content_hash"], revised.content_hash)
-                self.assertEqual(audit["proof_revision"], "b" * 40)
-            repaired = self.recover_stored_history(revised)
-            self.assertEqual(repaired.diagnostics, ())
-            self.assertEqual(len(repaired.merged), 1)
-            pr.assert_not_called()
 
     def test_renamed_plan_repeated_recovery_keeps_publication_identity(self):
         original = self.entry
