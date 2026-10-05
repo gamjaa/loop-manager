@@ -668,7 +668,7 @@ def _remote_adoption_agent_baseline(
             and adopted['branch'] == adoption_plan['branch']
             and adopted['worktree'] == str(worktree)
             and adopted['head'] == checkpoint.expected_head
-            and adopted['head'] == checkpoint.observed_remote_oid
+            and adopted.get('remote', adopted['head']) == checkpoint.observed_remote_oid
             and not project['agent_recovery']):
         # R-039 validated the preserved Agent output before the Manager's
         # fast-forward. Compare later changes to that exact durable result;
@@ -825,6 +825,7 @@ def validate_blocked_agent_scope(
         # A planned cleanup is not proof it ran. The exact completed removal
         # has already been checked by _proven_merged_cleanup_paths.
     result_serialized = project["agent_result_snapshot"]
+    post_agent_resources = None
     if result_serialized:
         try:
             blocked_result = GitSnapshot.deserialize(str(result_serialized))
@@ -834,8 +835,44 @@ def validate_blocked_agent_scope(
             ) from error
 
         blocked_result = reconcile_metadata(blocked_result)
-        if require_safe_result or (guidance_plan is not None
-                                   and guidance_plan['blocked_reason'] == GUIDANCE_BLOCK_REASON):
+        # A finished, isolated invocation gives us a separate Agent result.
+        # Validate that result first, then classify later selected-worktree
+        # edits as user input. Legacy/in-flight scopes retain strict comparison.
+        resources = effects._agent_git_resources(
+            connection, repo_path, worktree, before, role_name,
+            selected_plan_path=selected_plan_path)
+        if (role_name in {'worker', 'reviewer'} and current.branch is not None
+                and resources is not None and not current.operations
+                and not project['agent_recovery'] and before.branch == current.branch
+                and current.branch == blocked_result.branch):
+            effects.validate_agent_scope(
+                role_name, worktree, before, blocked_result,
+                selected_plan_path=selected_plan_path if role_name == 'worker' else None,
+                allowed_guidance_targets=effects._guidance_worker_targets(connection, repo, plan_id),
+                allow_common_plans=effects._published_plan_allows_common_plans(repo_path, guidance_plan),
+                allowed_requirement_archives=archive_sources,
+                external_worktree=repo_path, base_branch=base, resources=resources,
+                connection=connection)
+            relation = effects.git(worktree, 'merge-base', '--is-ancestor',
+                                   blocked_result.head, current.head, check=False)
+            if relation.returncode == 0:
+                if any(_non_default_index_flags(entries) for entries in current.index.values()):
+                    raise AgentScopeError('사용자 입력의 index flags가 안전하지 않습니다.')
+                normalized = managed_rebase_adoption.selected_baseline(
+                    blocked_result, current, current.branch, str(worktree.resolve()))
+                effects.validate_agent_scope(
+                    'reviewer', worktree, normalized, current,
+                    allowed_ref_changes=allowed_ref_changes,
+                    allowed_worktree_changes=allowed_worktree_changes,
+                    external_worktree=repo_path, base_branch=base,
+                    resources=resources, connection=connection)
+                return
+            if relation.returncode not in {0, 1}:
+                raise AgentScopeError('사용자 입력의 commit 관계를 확인할 수 없습니다.')
+        if (require_safe_result or role_name in {'worker', 'reviewer'}
+                and before.shared_metadata_complete and blocked_result.shared_metadata_complete
+                or (guidance_plan is not None
+                    and guidance_plan['blocked_reason'] == GUIDANCE_BLOCK_REASON)):
             original = GitSnapshot.deserialize(str(serialized))
             comparison = agent_scope_decision.manager_comparison_baseline(
                 original, original, checkpoint.snapshot or {}, role_name)
@@ -846,6 +883,17 @@ def validate_blocked_agent_scope(
                 allow_common_plans=effects._published_plan_allows_common_plans(repo_path, guidance_plan),
                 allowed_requirement_archives=archive_sources,
                 external_worktree=repo_path, base_branch=base, connection=connection)
+
+            # A validated historical Agent result still protects actual Agent
+            # writes. Later unrelated branches/default-checkout changes are
+            # outside this selected Manager recovery even for legacy ledgers.
+            owner = saved_plan if saved_plan is not None else guidance_plan
+            if (role_name in {'worker', 'reviewer'} and owner is not None
+                    and 'workspace_owned' in owner.keys() and int(owner['workspace_owned']) == 1
+                    and owner['branch'] == current.branch and owner['worktree'] == str(worktree)):
+                post_agent_resources = agent_scope_decision.used_git_resources(
+                    role=role_name, phase='PLAN_BLOCKED', base_branch=base,
+                    branch=current.branch, worktree_key=str(worktree.resolve()))
 
         if (
             before.shared_metadata_complete
@@ -885,4 +933,5 @@ def validate_blocked_agent_scope(
         external_worktree=repo_path,
         base_branch=base,
         connection=connection,
+        resources=post_agent_resources,
     )

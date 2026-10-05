@@ -2,6 +2,7 @@ import json
 import sqlite3
 import subprocess
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -11,6 +12,8 @@ from loop_manager_internal.storage import execution_checkpoint_state
 import loop_manager
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.recovery import checkpoint_ownership
+from loop_manager_internal.recovery import work_branch_integration
+from loop_manager_internal.git import managed_rebase_validation as rebase_policy
 
 
 class CheckpointRefreshFixture:
@@ -37,7 +40,9 @@ class CheckpointRefreshFixture:
         return self.connection.execute('SELECT * FROM blocked_checkpoints').fetchone()
 
 
-    def _adoption(self, *, fetched_oid=None, observed_oid=None):
+    def _adoption(self, *, fetched_oid=None, observed_oid=None, diverged=False,
+                  dirty=False, changed_paths=('code.py',), rewritten=False, candidate_race=False,
+                  managed_rebased=False, local_rewritten=False, manager_waiting=False):
         branch, worktree = 'loop-manager/G-106', str(Path('/state/G-106'))
         original, successor = 'a' * 40, 'b' * 40
         self.connection.execute("UPDATE projects SET origin = 'example/repo'")
@@ -49,36 +54,69 @@ class CheckpointRefreshFixture:
             "VALUES ('repo', 'G-106', 'plan', 'verify_retry_exhausted', 'original failure')")
         self.connection.commit()
         plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
-        snapshot = loop_manager.GitSnapshot(original, branch, {}, {},
-                                            {f'refs/heads/{branch}': (original, '')},
+        local = 'c' * 40 if diverged or managed_rebased or local_rewritten else original
+        snapshot = loop_manager.GitSnapshot(local, branch, {}, {},
+                                            {f'refs/heads/{branch}': (local, '')},
                                             {str(Path(worktree).resolve()): (f'branch=refs/heads/{branch}',)}, {}, {})
+        if managed_rebased:
+            acceptance = dict(kind=rebase_policy.ACCEPTANCE_KIND, policy_version=rebase_policy.POLICY_VERSION,
+                repo='repo', repository_identity='identity', plan_id='G-106', plan_path=plan['path'],
+                worktree=worktree, branch=branch, target_base_oid='e' * 40,
+                remote=dict(repository='repo', branch=branch, oid=original, pull_request=None),
+                head=local, generation=0, input_fingerprint='input', scope_fingerprint='scope',
+                state_fingerprint='state', role='worker')
+            acceptance['id'] = rebase_policy.fingerprint(acceptance)
+            execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).record(
+                'repo', 'G-106', expected_generation=0, operation=None, expected_head=local,
+                target_base_oid='e' * 40, observed_remote_oid=original,
+                snapshot={'current_rebase_acceptance': acceptance})
+        if dirty:
+            snapshot = replace(snapshot, dirty={'local.txt': (('untracked',), 'bytes')})
+        combined = 'd' * 40 if diverged or dirty or managed_rebased else successor
+        adopted = replace(snapshot, head=combined, dirty={},
+                          refs={f'refs/heads/{branch}': (combined, '')})
+        confirmed = replace(adopted, dirty={'new.txt': (('untracked',), 'raced')}) if candidate_race else adopted
         def git(_, *args, **kwargs):
             output = ''
+            code = 0
             if args[:2] == ('remote', 'get-url'):
                 output = 'https://github.com/example/repo'
             elif args == ('rev-parse', 'FETCH_HEAD^{commit}'):
                 output = fetched_oid or successor
             elif args == ('rev-parse', 'HEAD^{commit}'):
-                output = successor
+                output = combined
+            elif args == ('merge-base', '--is-ancestor', original, successor):
+                code = int(rewritten)
+            elif args == ('merge-base', '--is-ancestor', original, local):
+                code = int(managed_rebased or local_rewritten)
+            elif args == ('merge-base', '--is-ancestor', local, successor):
+                code = int(diverged or managed_rebased)
             elif args[:1] == ('ls-tree',):
                 output = '100644 blob ' + successor + '\tcode.py'
-            return subprocess.CompletedProcess([], 0, output)
+            return subprocess.CompletedProcess([], code, output)
         with (mock.patch.object(loop_manager, '_BlockedCheckpointAdapter') as adapter,
               mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
               mock.patch.object(loop_manager, 'validate_managed_worktree'),
-              mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=snapshot),
+              mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=[snapshot, adopted, confirmed]),
               mock.patch.object(loop_manager, '_nul_git_paths', side_effect=lambda _, *args:
-                                ('code.py',) if args[0] == 'diff' else ()),
+                                changed_paths if args[0] == 'diff' else ()),
               mock.patch.object(loop_manager, '_published_plan_allows_common_plans', return_value=False),
               mock.patch.object(loop_manager, '_blocked_execplan_revision_metadata_error', return_value=None),
               mock.patch.object(loop_manager, 'git', side_effect=git) as commands,
+              mock.patch.object(loop_manager, 'validate_blocked_agent_scope'),
+              mock.patch.object(loop_manager, '_current_rebase_service') as service,
+              mock.patch.object(work_branch_integration, 'integrate', return_value=adopted) as integrate,
               mock.patch.object(loop_manager, '_evaluate_remote_checkpoint_cause') as evaluate):
             adapter.return_value.observe_remote.return_value = observed_oid or successor
             adapter.return_value._approved_guidance_targets.return_value = ()
+            service.return_value.require_owned.return_value = (None, mock.Mock(status=mock.Mock(
+                value='waiting_for_resolution' if manager_waiting else 'complete')))
             result = loop_manager._reconcile_published_blocked_checkpoint(
                 self.connection, Path('/repo'), Path('/state'), 'repo', plan, self.row(),
                 self.store.get('repo', 'G-106'), self.store, adopt_only=True, expected_remote_oid=successor)
         evaluate.assert_not_called()
+        if (diverged or dirty or managed_rebased) and not rewritten and not manager_waiting:
+            integrate.assert_called_once()
         self.assertEqual(scoped_blocking.plan_block(self.connection, 'repo', 'G-106')['evidence'], 'original failure')
         return result, commands
 
@@ -145,6 +183,8 @@ class BlockedCheckpointRefreshUnitTests(CheckpointRefreshFixture, unittest.TestC
 
 
     def test_adoption_defers_cause_check_and_records_exact_successor_lease(self):
+        self.connection.execute("UPDATE exec_plans SET verify_token = 'old', review_token = 'old', "
+                                "publication_token = 'old', worker_result = 'preserved audit'")
         result, _ = self._adoption()
         self.assertEqual(result, 'adopted')
         self.assertEqual(self.row()['accepted_remote_oid'], 'b' * 40)
@@ -152,6 +192,11 @@ class BlockedCheckpointRefreshUnitTests(CheckpointRefreshFixture, unittest.TestC
         checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get('repo', 'G-106')
         self.assertEqual(checkpoint.observed_remote_oid, 'b' * 40)
         self.assertIsNone(checkpoint.operation)
+        plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertIsNone(plan['verify_token'])
+        self.assertIsNone(plan['review_token'])
+        self.assertIsNone(plan['publication_token'])
+        self.assertEqual(plan['worker_result'], 'preserved audit')
 
 
     def test_adoption_fetch_race_does_not_fast_forward_or_change_accepted_oid(self):
@@ -165,3 +210,49 @@ class BlockedCheckpointRefreshUnitTests(CheckpointRefreshFixture, unittest.TestC
         result, commands = self._adoption(observed_oid='c' * 40)
         self.assertEqual(result, 'blocked')
         commands.assert_not_called()
+
+    def test_diverged_branch_preserves_local_candidate_and_pins_remote_lease(self):
+        result, commands = self._adoption(diverged=True)
+        self.assertEqual(result, 'adopted')
+        saved = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get('repo', 'G-106')
+        self.assertEqual(saved.expected_head, 'd' * 40)
+        self.assertEqual(saved.observed_remote_oid, 'b' * 40)
+        self.assertEqual(saved.snapshot['remote_adoption_scope']['remote'], 'b' * 40)
+        self.assertTrue(loop_manager.blocked_plan_reconciliation.remote_adoption_is_current(saved))
+        self.assertFalse(any('merge' in call.args for call in commands.call_args_list))
+
+    def test_dirty_branch_uses_preserving_integration(self):
+        result, _ = self._adoption(dirty=True)
+        self.assertEqual(result, 'adopted')
+
+    def test_user_guidance_successor_is_input_instead_of_worker_scope_violation(self):
+        result, _ = self._adoption(changed_paths=('AGENTS.md', 'docs/ARCHITECTURE.md'))
+        self.assertEqual(result, 'adopted')
+
+    def test_remote_rewrite_remains_refused_without_integration(self):
+        result, _ = self._adoption(rewritten=True)
+        self.assertEqual(result, 'blocked')
+        self.assertEqual(self.row()['accepted_remote_oid'], 'a' * 40)
+
+    def test_candidate_race_before_sqlite_confirmation_retains_pending_input(self):
+        result, _ = self._adoption(candidate_race=True)
+        self.assertEqual(result, 'blocked')
+        self.assertEqual(self.row()['accepted_remote_oid'], 'a' * 40)
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get('repo', 'G-106')
+        self.assertEqual(checkpoint.snapshot['remote_adoption_intent']['head'], 'b' * 40)
+        self.assertTrue(self.row()['inspection_retryable'])
+
+    def test_current_owned_manager_rebase_can_replace_local_ancestry_receipt(self):
+        result, _ = self._adoption(managed_rebased=True)
+        self.assertEqual(result, 'adopted')
+
+    def test_unproven_local_rewrite_remains_refused(self):
+        result, _ = self._adoption(local_rewritten=True)
+        self.assertEqual(result, 'blocked')
+        self.assertEqual(self.row()['accepted_remote_oid'], 'a' * 40)
+
+    def test_incomplete_manager_rebase_is_not_adopted_as_success(self):
+        result, _ = self._adoption(managed_rebased=True, manager_waiting=True)
+        self.assertEqual(result, 'blocked')
+        self.assertEqual(self.row()['accepted_remote_oid'], 'a' * 40)
+        self.assertTrue(self.row()['inspection_retryable'])

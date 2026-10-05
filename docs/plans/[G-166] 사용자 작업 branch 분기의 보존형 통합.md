@@ -36,9 +36,13 @@ priority: critical
 ## Progress
 
 - [x] 2026-10-05 planning 기준 a049a76의 명세·원본·관련 테스트와 비종료 catalog에서 미충족 범위를 확인함. 구현·테스트 실행은 하지 않음.
-- [ ] 구현 및 관련 targeted unit 검증
+- [x] 구현 및 관련 targeted unit 검증
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
 
 - 통합·출처·재시작 판단의 결합 때문에 complexity high, 사용자 작업 손실 가능성 때문에 risk critical다. PR에 대한 checkpoint 게시와 충돌 진단은 G-167·G-168로 분리한다.
+- 원격 작업 branch의 검증된 사용자 후속 입력과 로컬 전용 작업은 `recovery/work_branch_integration.py`에서 기존 baseline tree·managed rebase·SQLite checkpoint를 사용해 통합한다. staged·unstaged·untracked 원형은 baseline ref와 intent에 남기고, 작업 파일을 reset·clean하지 않고 보존 commit으로 고정한 뒤 작업 branch와 최신 base를 순서대로 반영한다. 새 루트 항목·설정·스키마는 추가하지 않는다.
+- 실제 저장된 Agent 결과는 먼저 검증한다. 이후 사용자 입력의 정확한 blob과 선택 자원의 전이만 비교 기준에 반영하며, legacy 결과에서도 무관한 기본 checkout·비소유 branch의 사후 변화는 범위 밖으로 둔다. Agent 출처가 불확실한 로컬 파일·index 변경과 실제 origin·공유 자원·Agent 위반은 계속 거부한다. 변경 후보의 검증·게시 token을 무효화하고 독립 차단·session·기존 결과 감사는 보존한다.
+- 새 사용자 push로 소유 rebase를 재시작할 때 충돌 파일의 tree와 모든 index stage를 ref에 보존한 뒤 해당 operation만 abort한다. 충돌 자료를 정상 구현에 무조건 적용하지 않으며, 수동 완료·중단된 확정은 현재 상태와 원격 lease를 재관측해 중복 반영을 피한다. 원격 진단 게시와 PR 확장은 이 계획에 포함하지 않는다.
+- targeted 검증: `python3 -m unittest tests.test_work_branch_integration tests.test_checkpoint_adoption.BlockedCheckpointRefreshUnitTests` 32개 통과. 테스트 입력·대기 intent 기대값·Remote fixture 형식의 세 실패를 수정하고 동일 명령으로 재검증했다. `scripts/verify.sh`는 기존 전체 검증 runner의 모듈 탐색으로 새 테스트를 포함하므로 변경하지 않았다. 실제 Git 양쪽 원격 전진·rename/delete/binary·사용자 push 회귀는 추가·갱신했으며 Worker는 실행하지 않았다.

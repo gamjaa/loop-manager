@@ -118,6 +118,67 @@ class ProjectCheckpointGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.T
 
 
 class CheckpointRebaseGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.TestCase):
+    def test_both_remotes_and_local_commits_index_worktree_binary_input_survive(self):
+        repo, _ = self._remote_refresh_fixture(base_changed=True, branch_changed=True)
+        (self.worktree / 'rename.txt').write_text('rename bytes\n')
+        (self.worktree / 'remove.txt').write_text('remove bytes\n')
+        self.run_git(self.worktree, 'add', 'rename.txt', 'remove.txt')
+        self.run_git(self.worktree, 'commit', '-m', 'Local files before rename and delete')
+        self.run_git(self.worktree, 'mv', 'rename.txt', 'renamed.txt')
+        self.run_git(self.worktree, 'rm', 'remove.txt')
+        self.run_git(self.worktree, 'commit', '-m', 'Local rename and delete')
+        (self.worktree / 'staged.txt').write_text('staged version\n')
+        self.run_git(self.worktree, 'add', 'staged.txt')
+        (self.worktree / 'staged.txt').write_text('working version\n')
+        (self.worktree / 'untracked.bin').write_bytes(b'\0\xff\x01local binary')
+        (self.repo / 'source-only.txt').write_text('default checkout input\n')
+        self.run_git(self.repo, 'add', 'source-only.txt')
+        self.run_git(self.repo, 'branch', 'loop-manager/user-similar-name')
+        source_head = self.run_git(self.repo, 'rev-parse', 'HEAD')
+        with mock.patch.object(loop_manager, '_evaluate_remote_checkpoint_cause',
+                               return_value=(False, 'same cause', None)):
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, self.repo, self.state_dir, repo, 'main'))
+        self.assertEqual((self.worktree / 'code.py').read_text(), 'corrected\n')
+        self.assertEqual((self.worktree / 'dependency.py').read_text(), 'dependency = True\n')
+        self.assertEqual((self.worktree / 'renamed.txt').read_text(), 'rename bytes\n')
+        self.assertFalse((self.worktree / 'rename.txt').exists())
+        self.assertFalse((self.worktree / 'remove.txt').exists())
+        self.assertEqual((self.worktree / 'staged.txt').read_text(), 'working version\n')
+        self.assertEqual((self.worktree / 'untracked.bin').read_bytes(), b'\0\xff\x01local binary')
+        saved = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(repo, 'G-034')
+        baseline = json.loads(saved.snapshot['work_branch_integration']['baseline'])
+        self.assertEqual(self.run_git(self.worktree, 'show', baseline['index_tree'] + ':staged.txt'), 'staged version')
+        self.assertEqual(self.run_git(self.repo, 'rev-parse', 'HEAD'), source_head)
+        self.assertEqual(self.run_git(self.repo, 'rev-parse', 'refs/heads/loop-manager/user-similar-name'), source_head)
+        self.assertEqual((self.repo / 'source-only.txt').read_text(), 'default checkout input\n')
+        self.assertFalse((self.worktree / 'source-only.txt').exists())
+        with mock.patch.object(loop_manager, '_journaled_direct_rebase', side_effect=AssertionError('duplicate rebase')):
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, self.repo, self.state_dir, repo, 'main'))
+
+    def test_user_push_during_work_branch_conflict_restarts_from_preserved_local_input(self):
+        repo, _ = self._remote_refresh_fixture(branch_changed=True)
+        (self.worktree / 'code.py').write_text('local resolution\n')
+        self.run_git(self.worktree, 'add', 'code.py')
+        self.run_git(self.worktree, 'commit', '-m', 'Local conflicting input')
+        self.assertFalse(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir, repo, 'main'))
+        self.assertTrue(self.run_git(self.worktree, 'ls-files', '-u'))
+        self.user_commit('code.py', 'local resolution\n')
+        loop_manager.observe_blocked_plan_remotes(self.connection, self.repo, repo,
+            self.connection.execute('SELECT * FROM projects').fetchone())
+        with mock.patch.object(loop_manager, '_evaluate_remote_checkpoint_cause',
+                               return_value=(False, 'same cause', None)):
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, self.repo, self.state_dir, repo, 'main'))
+        self.assertFalse(self.run_git(self.worktree, 'ls-files', '-u'))
+        self.assertEqual((self.worktree / 'code.py').read_text(), 'local resolution\n')
+        saved = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(repo, 'G-034')
+        restart = saved.snapshot['work_branch_integration_history'][0]['restart']
+        self.assertEqual(json.loads(restart['baseline'])['version'], 2)
+        self.assertIsNone(saved.operation)
+
     def test_remote_refresh_base_only_with_same_specification(self):
         self._assert_remote_refresh(base_changed=True, branch_changed=False, resolved=False)
 
@@ -380,7 +441,7 @@ class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest
         ).fetchone()[0], after_events)
 
 
-    def test_dirty_local_worktree_keeps_remote_successor_unadopted(self):
+    def test_conflicting_dirty_local_input_is_preserved_before_remote_integration(self):
         published = self.publish_block()
         self.user_commit()
         (self.worktree / "code.py").write_text("local work\n", encoding="utf-8")
@@ -391,11 +452,14 @@ class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest
         )
 
         self.assertFalse(resumed)
-        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"), published)
-        self.assertEqual((self.worktree / "code.py").read_text(), "local work\n")
-        self.assertIn("로컬", self.connection.execute(
-            "SELECT last_error FROM exec_plans WHERE plan_id = 'G-034'"
-        ).fetchone()[0])
+        saved = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(
+            str(self.repo.resolve()), 'G-034')
+        intent = saved.snapshot['work_branch_integration']
+        baseline = json.loads(intent['baseline'])
+        self.assertEqual(self.run_git(self.worktree, 'show', baseline['ref'] + ':code.py'), 'local work')
+        self.assertEqual(json.loads(intent['before'])['head'], published)
+        self.assertEqual(saved.operation, 'rebase')
+        self.assertTrue(self.run_git(self.worktree, 'ls-files', '-u'))
 
 
     def test_local_unpublished_commit_is_not_overwritten_by_remote_divergence(self):
@@ -410,7 +474,11 @@ class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest
             self.connection, self.repo, self.state_dir,
             str(self.repo.resolve()), "main",
         ))
-        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"), local)
+        saved = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(
+            str(self.repo.resolve()), 'G-034')
+        self.assertEqual(saved.snapshot['work_branch_integration']['local_commit'], local)
+        self.assertEqual(self.run_git(self.worktree, 'show', local + ':code.py'), 'local commit')
+        self.assertTrue(self.run_git(self.worktree, 'ls-files', '-u'))
         self.assertEqual(self.run_git(self.repo, "ls-remote", "origin",
                                       "refs/heads/loop-manager/G-034").split()[0],
                          corrected)
@@ -453,18 +521,19 @@ class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest
         ).fetchone()[0])
 
 
-    def test_remote_agents_file_change_is_outside_worker_scope(self):
+    def test_remote_user_guidance_is_adopted_without_releasing_original_cause(self):
         published = self.publish_block()
-        self.user_commit("AGENTS.md", "foreign guidance\n")
+        successor = self.user_commit("AGENTS.md", "user guidance\n")
 
         self.assertFalse(loop_manager.resume_plan_blocks(
             self.connection, self.repo, self.state_dir,
             str(self.repo.resolve()), "main",
         ))
-        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"), published)
-        self.assertIn("AGENTS.md", self.connection.execute(
-            "SELECT last_error FROM exec_plans WHERE plan_id = 'G-034'"
-        ).fetchone()[0])
+        self.assertNotEqual(successor, published)
+        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"), successor)
+        self.assertEqual((self.worktree / 'AGENTS.md').read_text(), 'user guidance\n')
+        self.assertEqual(scoped_blocking.plan_block(self.connection, str(self.repo.resolve()), 'G-034')['reason_code'],
+                         'verify_retry_exhausted')
 
 
     def test_remote_noncode_change_remains_blocked_and_records_inspection(self):

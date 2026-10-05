@@ -163,24 +163,46 @@ def _capture_agent_baseline(
     snapshot: GitSnapshot,
     *,
     effects: ScopeBaselineEffects,
+    preserve_conflicts: bool = False,
 ) -> str | None:
     if not snapshot.dirty:
         return None
-    if snapshot.operations:
+    if snapshot.operations and not preserve_conflicts:
         # Rebase-conflict resolution intentionally starts inside a Git
         # operation. Its scope is still validated, but it cannot use the
         # ordinary HEAD/index tree recovery representation.
         return None
-    if effects.git(worktree, "ls-files", "-u", "-z").stdout:
+    unmerged = effects.git(worktree, "ls-files", "-u", "-z").stdout
+    if unmerged and not preserve_conflicts:
         # Autostash can leave an unmerged index after rebase metadata vanishes.
         # Its stage OIDs are captured by the execution checkpoint, while this
         # ordinary baseline cannot represent them with write-tree.
         return None
-    index_tree = effects.git(worktree, "write-tree").stdout.strip()
+    stage_trees = {}
+    if unmerged:
+        # Represent every stage as a tree so even manually staged blobs remain
+        # reachable after an owned rebase is restarted. The original stage
+        # entries and operation signatures stay in the caller's snapshot.
+        with tempfile.TemporaryDirectory(prefix='loop-manager-conflict-index-') as directory:
+            for stage in range(4):
+                index_path = Path(directory) / str(stage)
+                _git_with_index(worktree, index_path, 'read-tree', '--empty', effects=effects)
+                for path, entries in sorted(snapshot.index.items()):
+                    for entry in entries:
+                        _tag, mode, oid, entry_stage = entry.split()
+                        if entry_stage == str(stage):
+                            _git_with_index(worktree, index_path, 'update-index', '--add',
+                                            '--cacheinfo', mode, oid, path, effects=effects)
+                stage_trees[str(stage)] = _git_with_index(
+                    worktree, index_path, 'write-tree', effects=effects).stdout.strip()
+        index_tree = effects.git(worktree, 'rev-parse', 'HEAD^{tree}').stdout.strip()
+    else:
+        index_tree = effects.git(worktree, "write-tree").stdout.strip()
     worktree_tree = _agent_worktree_tree(worktree, snapshot, index_tree, effects=effects)
-    baseline_id = hashlib.sha256(
-        f"{snapshot.head}\0{index_tree}\0{worktree_tree}".encode("ascii")
-    ).hexdigest()
+    identity = f"{snapshot.head}\0{index_tree}\0{worktree_tree}"
+    if stage_trees:
+        identity += '\0' + json.dumps(stage_trees, sort_keys=True)
+    baseline_id = hashlib.sha256(identity.encode('ascii')).hexdigest()
     project_id = hashlib.sha256(repo.encode()).hexdigest()[:16]
     refname = f"refs/loop-manager/baselines/{project_id}/{baseline_id}"
     index_commit = _commit_tree(
@@ -190,6 +212,9 @@ def _capture_agent_baseline(
         f"Loop Manager baseline index {baseline_id}",
         effects=effects,
     )
+    for stage, tree in sorted(stage_trees.items()):
+        index_commit = _commit_tree(worktree, tree, index_commit,
+                                   f'Loop Manager conflict stage {stage} {baseline_id}', effects=effects)
     worktree_commit = _commit_tree(
         worktree,
         worktree_tree,
@@ -211,11 +236,12 @@ def _capture_agent_baseline(
         effects.git(worktree, "update-ref", refname, worktree_commit)
     return json.dumps(
         {
-            "version": 1,
+            "version": 2 if stage_trees else 1,
             "ref": refname,
             "ref_target": worktree_commit,
             "index_tree": index_tree,
             "worktree_tree": worktree_tree,
+            **({'stage_trees': stage_trees} if stage_trees else {}),
         },
         ensure_ascii=True,
         separators=(",", ":"),

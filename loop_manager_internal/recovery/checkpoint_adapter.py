@@ -437,6 +437,12 @@ class CheckpointSafetyAdapter:
             resources = self.safety_effects._agent_git_resources(
                 self.connection, self.repo_path, Path(request.worktree), before,
                 str(plan['agent_role'] or ''), selected_plan_path=str(plan['path']))
+            if resources is None and self.reconciliation_scope and self._validated_reconciliation_scope(request, plan):
+                base = self.connection.execute(
+                    'SELECT base_branch FROM projects WHERE repo = ?', (request.repo,)).fetchone()[0]
+                resources = agent_scope_decision.used_git_resources(
+                    role='worker', phase='PLAN_BLOCKED', base_branch=base,
+                    branch=request.branch, worktree_key=str(_canonical_path(Path(request.worktree))))
             before, current = agent_scope_decision.scoped_metadata(before, current, resources)
         except (ValueError, TypeError, KeyError, RuntimeError) as error:
             return reject("workspace_ownership_uncertain", str(error))
@@ -444,6 +450,10 @@ class CheckpointSafetyAdapter:
             return reject("shared_git_config_mutation", "checkpoint Git config가 저장된 snapshot과 다릅니다.")
         own_ref = f"refs/heads/{request.branch}"
         remote_ref = f"refs/remotes/origin/{request.branch}"
+        from loop_manager_internal.recovery.work_branch_integration import preserved_refs
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(
+            request.repo, request.plan_id)
+        baselines = preserved_refs(request.repo, checkpoint.snapshot or {}, current.refs)
         owned_remote_oid = (
             self.safety_effects._owned_checkpoint_remote_oid(
                 self.connection, self.repo_path, request, plan, current,
@@ -456,7 +466,7 @@ class CheckpointSafetyAdapter:
             before, current,
         )
         for name in before.refs.keys() | current.refs.keys():
-            if name == own_ref or name in fetched_refs or name.startswith("refs/codex/turn-diffs/"):
+            if name == own_ref or name in fetched_refs or name in baselines or name.startswith("refs/codex/turn-diffs/"):
                 continue
             if before.refs.get(name) == current.refs.get(name):
                 continue

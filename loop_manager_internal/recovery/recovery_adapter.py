@@ -375,11 +375,17 @@ class CheckpointRecoveryEffectsReconcilePublishedBlockedCheckpointEffects:
     github_repository: Callable[..., object]
     validate_execplan_workspace_identity: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
+    _capture_agent_baseline: Callable[..., object]
+    _journaled_direct_rebase: Callable[..., object]
+    validate_blocked_agent_scope: Callable[..., object]
 
 
 def _checkpoint_recovery_effects_reconcile_published_blocked_checkpoint(effects: CheckpointRecoveryEffectsReconcilePublishedBlockedCheckpointEffects, ) -> checkpoint_recovery.ReconcilePublishedBlockedCheckpointEffects:
     return checkpoint_recovery.ReconcilePublishedBlockedCheckpointEffects(
         _BlockedCheckpointAdapter=effects._BlockedCheckpointAdapter,
+        _capture_agent_baseline=effects._capture_agent_baseline,
+        _journaled_direct_rebase=effects._journaled_direct_rebase,
+        validate_blocked_agent_scope=effects.validate_blocked_agent_scope,
         _blocked_execplan_revision_metadata_error=effects._blocked_execplan_revision_metadata_error,
         _current_rebase_service=effects._current_rebase_service,
         _evaluate_remote_checkpoint_cause=effects._evaluate_remote_checkpoint_cause,
