@@ -2,6 +2,8 @@
 
 기준 원격 revision: `4be5702ee7bf133667bd3c58745659b527018237`. 사용자가 승인한 수동 감사이며 cron 감사 실행이나 구현 완료로 꾸미지 않는다.
 
+**검토 보류:** Reviewer는 R-063을 제외한 49개 문서의 652개 기준에 문서 단위 사유와 동일한 근거 경로 목록이 반복되어 기준별 충족·대체를 확인할 수 없다고 판단했다. 아래 `fulfilled`·`superseded`는 등록 당시의 잠정 분류이며 확정된 감사 결과가 아니다. 최초 등록의 pending 0건은 이 반복 근거를 저장한 결과였다. Reviewer 반려 후 원래 등록 이력을 별도 backup에 보존하고 49건을 재평가 pending으로 전환했다. 기존 입력·원문·등록 이력은 보존하고, 일반 Planner의 기준별 재평가와 Manager 소유 결과 교체 전에는 이 분류를 Requirement 완료나 복구 근거로 사용하지 않는다.
+
 archive Requirement **50개**, Acceptance Criteria **668개**를 고정 입력에 포함했다. 모든 과거 관련 계획의 Merge 여부와 현재 코드·테스트·후속 명세를 대조했다. 상세 기준 원문·판단·파일 blob/hash·심벌은 [requirement-audit.json](requirement-audit.json)에 있다.
 
 ## 복구 판단
@@ -77,7 +79,7 @@ R-049 설정 생략 거부는 후속 G-131 AC3의 optional fallback으로 바뀌
 
 ## Manager 경계 확인
 
-운영 DB의 일관된 backup에서 기존 Manager `RequirementRetirementPort`로 50개 입력을 pin하고 8개씩 결과를 검증·저장했다. 동일 입력 재조회에 pending 0개·blob 재읽기 0회를 확인했다. 생산 DB의 사건을 임의로 재생성하거나 요구사항 판정을 모델 없는 키워드 분류로 만들지 않았다. 같은 판단을 기존 Manager API로 생산 DB에도 등록했다. 전역 process lock과 등록 전 DB backup을 사용했고, 50개 결과 및 재시작 뒤 동일 입력 pending 0개·blob 재읽기 0회를 확인했다. 계획·프로젝트·유지보수 상태는 바뀌지 않았으며 별도 운영 receipt에 등록 시각·전후 상태를 보존한다.
+운영 DB의 일관된 backup에서 기존 Manager `RequirementRetirementPort`로 50개 입력을 pin하고 8개씩 결과를 형식 검증·저장했다. 동일 입력 재조회에 pending 0개·blob 재읽기 0회를 확인했다. 같은 판단을 기존 Manager API로 생산 DB에도 등록했다. 전역 process lock과 등록 전 DB backup을 사용했으며 계획·프로젝트·유지보수 상태는 바뀌지 않았다. 별도 운영 receipt에 등록 시각·전후 상태를 보존한다. 이 형식 검증은 반복된 기준별 근거의 의미적 충분성을 확인하지 못했다. Reviewer 지적에 따라 저장된 49개 결과의 완료 판정은 보류한다.
 
 현재 G-142/G-144/G-145는 G-158에 의존하며 기존 plan·session·branch·worktree·feedback·차단을 유지한다. 조기 archive 강제는 R-068/G-157에 비춰 재평가할 대상이다. G-145의 독립 Windows fcntl/cleanup 피드백과 그 밖의 scope/ownership 차단을 이 감사로 일괄 해제하지 않는다.
 
@@ -88,3 +90,7 @@ R-049 설정 생략 거부는 후속 G-131 AC3의 optional fallback으로 바뀌
 ## 사용자 문서 범위 결정
 
 미충족 잔여 목표는 활성 R-071·R-072·R-073에 보존한다. 새 ExecPlan은 작성하지 않으며 이후 Planner가 활성 Requirement를 기준으로 계획한다. G-158에는 감사 결과·복구 준비·실제 확인한 Progress만 기록한다. 감사 JSON은 원문·입력·기준별 근거를 고정한 증거이며 활성 Requirement나 새 계획 입력을 대신하지 않는다.
+
+## 사용자 수동 PR 게시 결정
+
+사용자는 Review FAIL 로그와 근거 보강 대기를 확인한 뒤 직접 PR을 등록하고 G-158을 PR_OPEN으로 연결하도록 요청했다. 이 게시 결정은 자동 Review PASS나 49개 문서의 기준별 완료 판정이 아니다. 최초 후보 `5830a071c83779ad3d6d84a63ced210ab4b3f28d`의 Manager 전체 verify는 2,447 success·2 skip으로 통과했으며, 이후 변경은 이 검토 보류와 수동 게시 결정의 문서 기록이다. PR과 Manager에는 실패·기존 성공·재평가 대기를 함께 보존하고 실제 사용자 Merge를 기다린다.

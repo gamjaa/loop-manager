@@ -40,13 +40,15 @@ Use the deployed Planner-judgment and Manager-retirement policy to perform the r
 
 ## Progress
 
-- [x] Confirm G-157 runtime adoption and pinned audit results; authorized manual results are registered through the Manager audit port, with no claim that cron ran the semantic audit.
-- [x] Verify Requirement retention/restoration and follow-up handling; preserve superseded originals and recover surviving R-063 goals as active R-071/R-072/R-073 without new ExecPlans.
+- [x] Confirm G-157 runtime adoption and pin the archive inventory (50 Requirements / 668 criteria); criterion-specific acceptance of 49 results remains pending after Review rejection.
+- [x] Preserve original archived sources and write active R-071/R-072/R-073 for the separately evidenced surviving R-063 goals; create no new ExecPlans.
 - [x] Record recovery readiness for G-142/G-144/G-145 and hand execution validation to each plan after G-158 Merge; retained state is inventoried, dependent execution remains unverified.
 - [x] Record remaining real blockers without clearing unrelated safety causes; independent blocks, sessions and maintenance state are preserved.
 
-- [ ] Confirm Manager full verify and independent Review for the published candidate.
-- [ ] Register the G-158 PR and connect its verified identity in Manager SQLite; wait for actual user Merge.
+- [x] Record the actual Manager full verify for candidate `5830a071c83779ad3d6d84a63ced210ab4b3f28d` (2,447 success / 2 skip).
+- [ ] Accept criterion-specific reassessment of the 49 rejected archive judgments and resolve the automatic Review FAIL.
+- [ ] Register the user-authorized manual G-158 PR and connect its identity in Manager SQLite.
+- [ ] Confirm actual user Merge; PR_OPEN does not represent automatic Review PASS.
 
 ## Decision Log
 
@@ -67,3 +69,7 @@ Use the deployed Planner-judgment and Manager-retirement policy to perform the r
 - 2026-10-05 후속 복구 경계: G-142/G-144/G-145는 기존 G-158 dependency와 작업물·session·verify·Review 실패·checkpoint를 유지한다. 이전 archive 강제 지적은 R-068/G-157에 비춰 재평가할 대상이며, G-145의 Windows fcntl/cleanup 피드백과 다른 ownership·scope·사용자 결정 차단은 일괄 해제하지 않는다. G-158 실제 Merge 뒤 각 계획의 현재 입력·독립 원인·안전 gate를 확인하고 Worker·targeted test·전체 verify·Review·PR을 각각 진행해야 한다. 이번 체크는 복구 준비 기록 완료이며 자동 실행 성공 기록이 아니다.
 
 - 2026-10-05 운영 감사 등록 확인: 전역 Manager process lock과 일관된 DB backup을 확보한 뒤 기존 audit port로 고정 입력 50개 결과를 생산 DB에 등록했다. DB 재연결 후 같은 입력에서 pending 0개·blob 재읽기 0회를 확인했다. ExecPlan·project·maintenance 행은 등록 전후 동일하며 과거 실행·실패·세션을 변경하지 않았다. 운영 receipt: `/home/ubuntu/.local/state/loop-manager/manual-audits/G-158-20261005T080802Z/registration.json`. G-158 검증·Review·PR 상태는 이 감사 저장만으로 성공 처리하지 않는다.
+
+- 2026-10-05 Review 교정: `review:docs/audits/g-158/requirement-audit.json::results.criteria::insufficient-audit-evidence`는 R-063을 제외한 49개 문서의 652개 기준에 문서 단위 사유와 동일한 경로 목록이 반복된다고 지적했다. 예를 들어 R-001의 READY 선택과 priority parser 검증은 서로 다른 기준인데 같은 대체 근거가 기록돼 있다. 운영 DB의 50개 행과 pending 0건은 형식 검증·저장 사실일 뿐 기준별 의미 판단의 유효성을 증명하지 않는다. 이 결과를 잠정 분류로 표시하고 위의 감사·복구 완료 체크를 되돌렸다. 원본 감사 파일과 등록 영수증·실패 피드백은 보존했으며 운영 SQLite의 결과를 Worker가 수정·삭제·초기화하지 않았다. 일반 Planner가 각 기준의 현재 충족·명시적 대체·잔여 미구현을 근거별로 재평가하고, Manager가 기존 audit 경계에서 검증·교체한 뒤에만 완료 결과를 수용해야 한다.
+
+- 2026-10-05 사용자 수동 게시 결정: 사용자는 `insufficient-audit-evidence` Review FAIL 로그를 확인한 뒤 “복잡하게 할 필요없이 직접 PR 등록하고 그걸로 PR_OPEN 상태로 바꾸면 안 돼?”라고 요청했다. 이 명시적 결정에 따라 현재 문서 후보를 수동 PR로 게시하고 실제 GitHub identity를 G-158의 PR_OPEN에 연결한다. Reviewer 실패·49건 재평가 pending·최초 후보의 Manager verify 기록과 기존 session·실패 감사를 유지한다. 자동 Review 통과, 감사 전체 완료 또는 사용자 Merge를 만들어내지 않는다. G-142/G-144/G-145의 독립 차단과 유지보수 상태도 보존한다.

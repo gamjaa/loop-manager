@@ -2,6 +2,13 @@
   "format": "g158-manual-requirement-audit-v1",
   "observed_at_utc": "2026-10-05T07:58:29.077756+00:00",
   "authority": "User-authorized manual G-158 audit, not a cron/Worker operational audit run",
+  "review_status": {
+    "identity": "review:docs/audits/g-158/requirement-audit.json::results.criteria::insufficient-audit-evidence",
+    "disposition": "provisional_review_rejected",
+    "affected_documents": 49,
+    "affected_criteria": 652,
+    "reason": "Reviewer rejected repeated criterion evidence for 49 documents / 652 criteria. The initial registration reported pending 0; those 49 results have since been invalidated to pending with the prior records preserved. R-063 retains its criterion-specific uncertain result."
+  },
   "base_sha": "4be5702ee7bf133667bd3c58745659b527018237",
   "runtime_adoption_evidence": "G-157 MERGED / PR #149; prior G-158 runtime 90466148355c1d79786522b71d961d9b9b2a1943 descends from G-157; this manual candidate uses latest origin/main",
   "coverage": {
@@ -25946,7 +25953,8 @@
     "production_validated_rows": 50,
     "execplan_state_changes": 0,
     "project_state_changes": 0,
-    "maintenance_state_changes": 0
+    "maintenance_state_changes": 0,
+    "current_pending_after_review_invalidation": 49
   },
   "test_limits": "Documentation-only candidate. No unit/full/integration tests run by this Agent. Static parser/DAG/evidence checks are not runtime acceptance or Manager full verify/Review.",
   "followup_documents": {
@@ -25960,5 +25968,16 @@
       "sha256": "747de9b2058cc42210a5dd924dfe91228b7f7c625b0d9307126df5191856bdec"
     }
   },
-  "scope_decision": "User requested Requirements only for recovered goals, no new ExecPlans; G-158 may record audit evidence and completed Progress items."
+  "scope_decision": "User requested Requirements only for recovered goals, no new ExecPlans; G-158 may record audit evidence and completed Progress items.",
+  "manual_publication": {
+    "authority": "User explicitly requested direct PR creation and G-158 PR_OPEN linkage after seeing the Review FAIL log",
+    "automatic_review": "FAIL retained; not converted to PASS",
+    "criterion_reassessment_pending": 49,
+    "prior_full_verify": {
+      "candidate_head": "5830a071c83779ad3d6d84a63ced210ab4b3f28d",
+      "success": 2447,
+      "skip": 2
+    },
+    "final_document_updates": "Review rejection and pending reassessment disclosure; not a new full-verify receipt"
+  }
 }
