@@ -176,7 +176,7 @@ class RequirementRetirementTest(unittest.TestCase):
             self.git.files[name] = original
         self.assertEqual(self.port.pending("repo", self.root, "advanced"), ())
 
-    def test_product_only_evidence_does_not_track_unrelated_architecture(self):
+    def test_unrelated_declaration_is_pinned_and_new_applicable_rule_invalidates(self):
         self.add_plan()
         self.git.files["docs/PRODUCT.md"] = b"## Feature\nRule\n"
         (item,) = self.port.pending("repo", self.root, "base")
@@ -185,12 +185,29 @@ class RequirementRetirementTest(unittest.TestCase):
             "docs/ARCHITECTURE.md#unrelated: no architecture constraint applies to this criterion",
         ])
         self.port.record("repo", self.port.validate_result("repo", self.root, "base", line))
-        self.git.files["docs/ARCHITECTURE.md"] = b"Unrelated architectural change\n"
         restarted = RequirementRetirementPort(self.connection, self.git)
         self.assertEqual(restarted.pending("repo", self.root, "advanced"), ())
         self.assertEqual(restarted.fulfilled_moves("repo", self.root, "advanced"), (SOURCE,))
-        self.git.files["docs/PRODUCT.md"] = b"## Feature\nChanged rule\n"
+        self.git.files["docs/ARCHITECTURE.md"] += b"\n## Feature\nFeature must persist validation receipts.\n"
+        self.assertEqual(restarted.fulfilled_moves("repo", self.root, "later"), ())
+        self.assertEqual(restarted.stage_moves("repo", self.root, "later", self.root), ())
         self.assertEqual(len(restarted.pending("repo", self.root, "later")), 1)
+        with self.assertRaises(RetirementError):
+            restarted.validate_result("repo", self.root, "later", line)
+        self.assertIsNotNone(restarted.judgments.get("repo", SOURCE).invalidation_reason)
+
+    def test_unrelated_declaration_cannot_prove_missing_specification(self):
+        self.add_plan()
+        (item,) = self.port.pending("repo", self.root, "base")
+        line = self.judgment_line(item, paths=[
+            "feature.py", "docs/PRODUCT.md",
+            "docs/ARCHITECTURE.md#unrelated: no architecture constraints",
+        ])
+        del self.git.files["docs/ARCHITECTURE.md"]
+        (current,) = self.port.pending("repo", self.root, "base")
+        line = line.replace(item.token, current.token)
+        with self.assertRaises(RetirementError):
+            self.port.validate_result("repo", self.root, "base", line)
 
     def test_fulfilled_result_rejects_omitted_specification_evidence(self):
         self.add_plan()

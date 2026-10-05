@@ -240,7 +240,9 @@ class RequirementRetirementPort:
                 result[path] = entry
                 continue
             if filename in SPECIFICATIONS and heading.startswith("unrelated: ") and heading[11:].strip():
-                result[path] = ("100644", heading)
+                # Absence of applicable rules was judged against this exact
+                # document. A changed document may introduce applicable rules.
+                result[path] = (entry[0], _digest((entry[1], heading))) if entry else None
                 continue
             if filename not in SPECIFICATIONS or not re.fullmatch(r"#{1,6} .+", heading):
                 raise RetirementError(f"명세 근거 절이 유효하지 않습니다: {path}")
