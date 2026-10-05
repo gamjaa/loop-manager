@@ -146,6 +146,20 @@ class PlanningRequirementMoveTest(unittest.TestCase):
             restore=restore,
         )
 
+    def test_receipt_revalidation_refreshes_base_without_new_retirements(self):
+        case = self.case(include_restoration=True)
+        old_base = case.base
+        self.git(case.root, "commit", "--allow-empty", "-m", "unrelated base advance")
+        new_base = self.git(case.root, "rev-parse", "HEAD")
+        self.assertNotEqual(old_base, new_base)
+        case.port.stage_restorations("repo", case.root, new_base, case.root)
+        paths = case.port.receipted_paths("repo", case.root, new_base, case.root)
+        self.assertIn(SOURCE, paths)
+        receipt = case.connection.execute(
+            "SELECT base_sha, stage FROM requirement_move_receipts WHERE source_path=?", (SOURCE,),
+        ).fetchone()
+        self.assertEqual(tuple(receipt), (new_base, "pending"))
+
     def validate(self, case, paths=None, dirty_files=None):
         return loop_manager.validate_planner_result(
             case.root, case.base, dirty_files or [], repo="repo",

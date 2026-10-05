@@ -821,6 +821,13 @@ class RequirementRetirementPort:
             if (origin.exists() or target.is_symlink() or not target.is_file()
                     or target.read_bytes() != original):
                 raise RetirementError(f"Requirement 이동 영수증과 worktree가 다릅니다: {source}")
+            # Revalidation proves this pending move against the current base.
+            # Restorations may defer stage_moves, which normally refreshes it.
+            self.connection.execute(
+                "UPDATE requirement_move_receipts SET base_sha = ?, updated_at=CURRENT_TIMESTAMP "
+                "WHERE repo = ? AND source_path = ? AND stage = 'pending'",
+                (revision, repo, source),
+            )
             paths.extend((source, destination))
         valid_restorations = set(self.audit_restorations(repo, repository, revision))
         for row in self.connection.execute(
