@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.application.contracts import ValidatedPlanningResult
+from loop_manager_internal.catalog import execplan_catalog, project_catalog_refresh
+from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
 from loop_manager_internal.maintenance import maintenance_file_publication
 from loop_manager_internal.maintenance.code_map_artifact import ARTIFACT_PATH
 from loop_manager_internal.maintenance import tiered_review
@@ -71,12 +73,14 @@ class ValidateMaintenancePlanningCommitEffects:
     git: Callable[..., object]
     git_bytes: Callable[..., object]
     load_execplan_catalog: Callable[..., object]
+    load_execplan_snapshot: Callable[..., object]
 
 
 def _validate_maintenance_planning_commit(
     effects: ValidateMaintenancePlanningCommitEffects, repository: Path,
     result: ValidatedPlanningResult,
     plan_commit: str,
+    *, connection: sqlite3.Connection | None = None,
 ) -> None:
     context = result.maintenance_context
     if context is None:
@@ -129,7 +133,21 @@ def _validate_maintenance_planning_commit(
         path: plan for path, plan in result.plans
     }
     expected.update({revision.path: revision.plan for revision in result.revisions})
-    effects.load_execplan_catalog(repository, validate_sources=False)
+    held_ids = (
+        catalog_held_plan_ids(connection, context.repo)
+        if connection is not None else frozenset()
+    )
+    if held_ids:
+        try:
+            snapshot = project_catalog_refresh.validated_held_planning_snapshot(
+                connection, context.repo, repository, context.active_sha,
+                git=effects.git, load_snapshot=effects.load_execplan_snapshot)
+            project_catalog_refresh.assert_planning_dependencies_unheld(
+                snapshot.active_metadata(), expected.items(), held_ids)
+        except execplan_catalog.ExecPlanCatalogError as error:
+            raise MaintenancePlanningError(str(error)) from error
+    else:
+        effects.load_execplan_catalog(repository, validate_sources=False)
     for path in result.publication_paths:
         local_contents = (repository / path).read_bytes()
         remote_contents = effects.git_bytes(repository, "show", f"{plan_commit}:{path}")
@@ -169,6 +187,7 @@ def _validate_maintenance_publication_commit(
     plan_commit: str,
     *,
     require_remote_confirmation: bool = True,
+    connection: sqlite3.Connection | None = None,
 ) -> None:
     context = result.maintenance_context
     if context is None:
@@ -190,7 +209,9 @@ def _validate_maintenance_publication_commit(
             f"maintenance planning commit의 {detail}을 origin/base에서 "
             "확인할 수 없습니다."
         )
-    effects._validate_maintenance_planning_commit(repository, result, plan_commit)
+    effects._validate_maintenance_planning_commit(
+        repository, result, plan_commit, connection=connection,
+    )
 
 
 @dataclass(frozen=True)
@@ -283,6 +304,7 @@ def record_maintenance_publication_intent(
         result,
         plan_commit,
         require_remote_confirmation=False,
+        connection=connection,
     )
     expected_phase = (
         maintenance_state.MaintenancePhase.ASSESSMENT
@@ -497,7 +519,7 @@ def publish_maintenance_planning_batch(
             "SQLite-bound maintenance context가 publication 대상과 일치하지 않습니다."
         )
     effects._validate_maintenance_publication_commit(
-        worktree, base_branch, result, plan_commit
+        worktree, base_branch, result, plan_commit, connection=connection
     )
     return effects._apply_maintenance_planning_batch(
         connection, repo, worktree, base_branch, result, plan_commit
@@ -873,7 +895,9 @@ def recover_maintenance_planning_batch(
             "보존된 maintenance publication commit에 검증할 batch가 없습니다."
         )
     if remote_advanced_after_publication:
-        effects._validate_maintenance_planning_commit(worktree, result, plan_commit)
+        effects._validate_maintenance_planning_commit(
+            worktree, result, plan_commit, connection=connection,
+        )
         return effects._apply_maintenance_planning_batch(
             connection, repo, worktree, base_branch, result, plan_commit,
             current_remote=current_remote,

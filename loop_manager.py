@@ -1625,6 +1625,7 @@ _validate_maintenance_planning_commit = _bind_effects(
         git=lambda *args, **kwargs: git(*args, **kwargs),
         git_bytes=lambda *args, **kwargs: git_bytes(*args, **kwargs),
         load_execplan_catalog=lambda *args, **kwargs: load_execplan_catalog(*args, **kwargs),
+        load_execplan_snapshot=lambda *args, **kwargs: load_execplan_snapshot(*args, **kwargs),
     ),
 )
 

@@ -1355,3 +1355,131 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
         effects = maintenance_validation.MaintenanceModeAndRowsEffects(is_unowned_ready=manager.is_unowned_ready)
         with self.assertRaisesRegex(manager.MaintenancePlanningError, 'catalog 보류'):
             maintenance_validation._maintenance_mode_and_rows(effects, self.connection, self.repo, cycle, self.sha)
+
+    @contextlib.contextmanager
+    def _scoped_maintenance_publication(self):
+        import hashlib
+        import tempfile
+        from loop_manager_internal.storage import maintenance_state
+        self.connection.execute("UPDATE exec_plans SET workspace_owned=0, worker_session_id=NULL, "
+                                "reviewer_session_id=NULL, retry_count=0, ever_started=0 WHERE plan_id='G-001'")
+        self.documents['docs/plans/[G-001] Updated.md'] = fixtures.plan_text('G-001', 'Updated')
+        broken = 'docs/plans/[G-006] New invalid.md'
+        self.documents[broken] = self.fixture._text('G-006', 'New invalid').replace('priority: normal\n', '')
+        self.paths |= {broken}
+        self.connection.commit()
+        self.boundary.refresh()
+        maintenance_state.ensure_schema(self.connection)
+        self.connection.execute("INSERT INTO maintenance_cycles (repo, phase, cycle_base_sha) VALUES (?, 'assessment', ?)",
+                                (self.repo, self.sha))
+        self.connection.commit()
+        with tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as ports:
+            root = Path(directory)
+            baseline = {**self.documents, 'docs/PRODUCT.md': 'Product.'}
+            for relative, text in baseline.items():
+                target = root / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding='utf-8')
+            def snapshot_at(worktree, sha, row):
+                return manager._ready_plan_snapshot_from_contents(row, baseline[row['path']].encode())
+            ports.enter_context(mock.patch.object(manager, '_ready_plan_snapshot', side_effect=snapshot_at))
+            ports.enter_context(mock.patch.object(manager, '_ready_plan_snapshot_at_revision', side_effect=snapshot_at))
+            context = manager.prepare_maintenance_planning_context(self.connection, self.repo, root, self.sha)
+            path = 'docs/plans/[G-007] Refactor.md'
+            (root / path).write_text(fixtures.plan_text('G-007', 'Refactor'), encoding='utf-8')
+            ready = context.eligible_plans[0]
+            (root / ready.path).write_text(ready.text.replace('depends_on: []', 'depends_on:\n  - G-007'), encoding='utf-8')
+            batch = SimpleNamespace(root=root, context=context, commit='e' * 40, remote=self.sha,
+                                    publication_paths=(ready.path, path), broken=broken)
+            committed = {relative: (root / relative).read_bytes() for relative in batch.publication_paths}
+            base_tree = {relative.encode(): (b'blob', hashlib.sha1(text.encode()).hexdigest().encode())
+                         for relative, text in baseline.items()}
+            plan_tree = {**base_tree, **{relative.encode(): (b'blob', hashlib.sha1(data).hexdigest().encode())
+                                      for relative, data in committed.items()}}
+            remote_tree = {**plan_tree, b'docs/notes.md': (b'blob', b'f' * 40)}
+            def git(_root, command, *args, **kwargs):
+                stdout, returncode = '', 0
+                if command == 'rev-parse':
+                    stdout = batch.commit if args == ('HEAD',) else batch.remote
+                elif command == 'rev-list':
+                    stdout = f'{batch.commit} {self.sha}'
+                elif command == 'ls-tree':
+                    stdout = f'100644 blob abc\t{args[-1]}\0' if args[-1] in baseline else ''
+                elif command == 'diff' and '--name-only' in args:
+                    stdout = '\n'.join(batch.publication_paths)
+                elif command == 'diff' and '--quiet' in args:
+                    returncode = int((root / args[-1]).read_bytes() != baseline[args[-1]].encode())
+                return SimpleNamespace(stdout=stdout, returncode=returncode)
+            ports.enter_context(mock.patch.object(manager, 'git', side_effect=git))
+            ports.enter_context(mock.patch.object(manager, 'git_bytes', side_effect=lambda root, cmd, spec: committed[spec.split(':', 1)[1]]))
+            ports.enter_context(mock.patch.object(manager, '_git_tree_entries', side_effect=lambda root, sha:
+                base_tree if sha == self.sha else plan_tree if sha == batch.commit else remote_tree))
+            ports.enter_context(mock.patch.object(manager, 'changed_files', return_value=list(batch.publication_paths)))
+            ports.enter_context(mock.patch.object(manager, 'is_loop_manager_repository', return_value=False))
+            ports.enter_context(mock.patch.object(manager, 'plan_declarations', return_value={}))
+            batch.result = manager.validate_maintenance_planner_result(
+                self.connection, context, root, list(batch.publication_paths))
+            yield batch
+
+    def _assert_scoped_maintenance_recovery(self, *, remote_advances):
+        import sqlite3
+        from loop_manager_internal.storage import maintenance_state
+        with self._scoped_maintenance_publication() as batch:
+            before = {key: dict(self.row(key)) for key in self.held() if self.row(key) is not None}
+            holds = [tuple(row) for row in self.connection.execute('SELECT * FROM execplan_catalog_holds ORDER BY plan_id')]
+            intent = manager.record_maintenance_publication_intent(
+                self.connection, self.repo, batch.root, 'main', batch.result, batch.commit)
+            self.assertEqual(intent.publication_stage, 'prepared')
+            self.assertEqual(intent.publication_refactoring_plan_ids, ('G-007',))
+            self.assertIsNone(self.row('G-007'))
+            # Only durable SQLite state and committed blobs survive this restart.
+            restarted = sqlite3.connect(':memory:')
+            restarted.row_factory = sqlite3.Row
+            self.addCleanup(restarted.close)
+            self.connection.backup(restarted)
+            batch.remote = 'f' * 40 if remote_advances else batch.commit
+            cycle = manager.recover_maintenance_planning_batch(restarted, self.repo, batch.root, 'main')
+            self.assertEqual(cycle.phase, maintenance_state.MaintenancePhase.REFACTORING)
+            self.assertEqual(cycle.publication_remote_oid, batch.commit)
+            self.assertEqual(cycle.refactoring_plan_ids, ('G-007',))
+            self.assertEqual(restarted.execute("SELECT status FROM exec_plans WHERE plan_id='G-007'").fetchone()[0], 'READY')
+            self.assertEqual(restarted.execute("SELECT depends_on FROM exec_plans WHERE plan_id='G-001'").fetchone()[0], '["G-007"]')
+            for key, row in before.items():
+                self.assertEqual(dict(restarted.execute('SELECT * FROM exec_plans WHERE plan_id=?', (key,)).fetchone()), row)
+            self.assertEqual([tuple(row) for row in restarted.execute('SELECT * FROM execplan_catalog_holds ORDER BY plan_id')], holds)
+            again = manager.recover_maintenance_planning_batch(restarted, self.repo, batch.root, 'main')
+            self.assertEqual(again, cycle)
+            self.assertEqual(restarted.execute("SELECT COUNT(*) FROM exec_plans WHERE plan_id='G-007'").fetchone()[0], 1)
+
+    def test_maintenance_intent_recovers_scoped_batch_after_restart(self):
+        self._assert_scoped_maintenance_recovery(remote_advances=False)
+
+    def test_maintenance_intent_recovers_scoped_batch_after_remote_advances(self):
+        self._assert_scoped_maintenance_recovery(remote_advances=True)
+
+    def test_maintenance_publication_rejects_changed_hold_and_preserves_intent(self):
+        from loop_manager_internal.storage import maintenance_state
+        with self._scoped_maintenance_publication() as batch:
+            target = batch.root / batch.broken
+            baseline = target.read_bytes()
+            holds = [tuple(row) for row in self.connection.execute('SELECT * FROM execplan_catalog_holds ORDER BY plan_id')]
+            target.write_bytes(baseline + b'\nChanged withheld file.\n')
+            with self.assertRaisesRegex(manager.MaintenancePlanningError, '원인이나 범위'):
+                manager.record_maintenance_publication_intent(
+                    self.connection, self.repo, batch.root, 'main', batch.result, batch.commit)
+            self.assertIsNone(maintenance_state.MaintenanceRepository(self.connection).get(self.repo).publication_stage)
+            target.write_bytes(baseline)
+            intent = manager.record_maintenance_publication_intent(
+                self.connection, self.repo, batch.root, 'main', batch.result, batch.commit)
+            batch.remote = batch.commit
+            for mutation in ('held-file', 'batch-file'):
+                with self.subTest(mutation=mutation):
+                    target = batch.root / (batch.broken if mutation == 'held-file' else batch.publication_paths[-1])
+                    data = target.read_bytes()
+                    target.write_bytes(data + b'\nChanged after intent.\n')
+                    with self.assertRaises(manager.MaintenancePlanningError):
+                        manager.recover_maintenance_planning_batch(self.connection, self.repo, batch.root, 'main')
+                    self.assertEqual(maintenance_state.MaintenanceRepository(self.connection).get(self.repo), intent)
+                    self.assertIsNone(self.row('G-007'))
+                    self.assertEqual([tuple(row) for row in self.connection.execute('SELECT * FROM execplan_catalog_holds ORDER BY plan_id')], holds)
+                    target.write_bytes(data)
