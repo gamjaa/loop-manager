@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 import loop_manager
+from loop_manager_internal.planning.requirement_retirement import FinalInput
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.storage import maintenance_state, planning_input_state
 from loop_manager_internal.planning.input_fingerprints import (
@@ -71,8 +72,8 @@ class PlanningSelectionTest(PlanningCase):
             processed_sha="base", planning_fingerprint="fingerprint",
             specification_fingerprint="specification",
         ))
-        item = SimpleNamespace(
-            path="docs/requirements/R.md", token="pinned", criteria=("Works",),
+        item = FinalInput(
+            path="docs/requirements/R.md", token="pinned", source_oid="source-blob", criteria=("Works",),
             related_ids=("G-001",),
         )
         ports.retirement = SimpleNamespace(
@@ -125,8 +126,8 @@ class PlanningSelectionTest(PlanningCase):
             specification_fingerprint="specification",
         ))
         source = "docs/requirements/R.md"
-        item = SimpleNamespace(
-            path=source, token="pinned", criteria=("Works",),
+        item = FinalInput(
+            path=source, token="pinned", source_oid="source-blob", criteria=("Works",),
             related_ids=("G-001",),
         )
         ports.retirement = SimpleNamespace(

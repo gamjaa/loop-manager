@@ -76,6 +76,8 @@ Remove the premature Requirement archive gate that repeatedly blocks valid imple
 
 - Complete specification context: tokens now bind both entire specification trees as well as cited evidence. New sibling rules and newly relevant edits in existing uncited sections block stale retirement. If only specification inputs changed, ordinary general Planner receives the prior assessment revision/evidence and checks the complete specification diff; it may explicitly reuse unchanged fulfillment without repeating the whole-Requirement check. Changed implementation, validation or plan inputs cannot use this shortcut. The refreshed judgment is pinned to the new revision; absent impact results remain ineligible. Tests cover new sibling/existing-section rules, unchanged-input restart, explicit unrelated-diff reuse, and rejection of reuse after implementation changes.
 
+- Verify fixture alignment: the final-assessment selection and missing-follow-up tests now construct the production FinalInput type, including its default reuse context, rather than an incomplete namespace. Assertions still require one general (not quick) turn and reject unfulfilled results without a source-linked follow-up plan.
+
 ### Agent Guidance Proposal: retirement-after-merged-judgment
 Target: `AGENTS.md`
 Scope: `common`
