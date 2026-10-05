@@ -241,7 +241,12 @@ class ValidationFeedbackTests(unittest.TestCase):
         self.assertNotIn("json-secret-second", redacted)
         output = lm.VerifyOutput(raw)
         self.assertEqual(str(output), redacted)
-        self.assertEqual(output.fingerprint_source, redacted)
+        self.assertEqual(output.fingerprint_source, raw)
+
+    def test_escaped_newline_in_unterminated_credential_masks_remaining_value(self):
+        raw = 'password: "first-secret\\\nsecond-secret trailing context'
+        redacted = redact_secrets(raw)
+        self.assertEqual(redacted, 'password: <REDACTED>')
 
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)

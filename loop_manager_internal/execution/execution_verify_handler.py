@@ -81,15 +81,8 @@ class VerifyHandler:
             self.ports.operation_print(detail, file=sys.stderr)
             return (self.ports._final(detail), detail)
         raw_output = redact_secrets(str(getattr(output, 'fingerprint_source', output)))
-        if raw_output != str(output):
-            if hasattr(output, 'timed_out'):
-                output = type(output)(
-                    raw_output,
-                    timed_out=bool(output.timed_out),
-                    exit_code=output.exit_code,
-                )
-            else:
-                output = raw_output
+        if not hasattr(output, 'fingerprint_source'):
+            output = raw_output
         feedback_repo = self.ports.feedback.repository if self.ports.feedback else None
         if feedback_repo is not None:
             fingerprints = () if passed else self.ports.feedback.fingerprints(

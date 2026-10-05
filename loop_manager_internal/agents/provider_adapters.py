@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import hashlib
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -14,6 +15,7 @@ from loop_manager_internal.agents.agent_invocation import AgentRequest, AgentRes
 from loop_manager_internal.agents.agent_profiles import agent_environment
 from loop_manager_internal.agents.agent_provider_usage import claude_usage, codex_log_usage
 from loop_manager_internal.agents import agent_write_isolation
+from loop_manager_internal.execution.validation_feedback import redact_secrets
 
 AGENT_CLI_TIMEOUT_SECONDS = 3600
 CodexResult = AgentResult
@@ -41,6 +43,34 @@ def _json_object(line: str) -> tuple[dict[str, object] | None, bool]:
     except (ValueError, RecursionError):
         return None, False
     return (event if isinstance(event, dict) else None), True
+
+
+def _redact_reviewer_log(raw: str) -> str:
+    """Decode JSON events so escaped credential keys receive the same scrubber."""
+    raw = redact_secrets(raw)
+
+    def scrub(value: object) -> object:
+        if isinstance(value, dict):
+            return {
+                key: ("<REDACTED>" if isinstance(key, str) and
+                      redact_secrets(f"{key}: sentinel") != f"{key}: sentinel"
+                      else scrub(value_item))
+                for key, value_item in value.items()
+            }
+        if isinstance(value, list):
+            return [scrub(item) for item in value]
+        return redact_secrets(value) if isinstance(value, str) else value
+
+    lines = []
+    for line in raw.splitlines(keepends=True):
+        try:
+            decoded = json.loads(line)
+        except (ValueError, RecursionError):
+            lines.append(redact_secrets(line))
+        else:
+            lines.append(json.dumps(scrub(decoded), ensure_ascii=False) +
+                         ("\n" if line.endswith("\n") else ""))
+    return "".join(lines)
 
 
 def _start_timeout(process: subprocess.Popen[str], triggered: threading.Event,
@@ -174,7 +204,7 @@ def run_codex(
     timeout_triggered = threading.Event()
     collection_status = "unknown"
     if persist_session and not session_id:
-        with log.open("w", encoding="utf-8") as output:
+        with (io.StringIO() if role_name == "reviewer" else log.open("w", encoding="utf-8")) as output:
             start = codex_launch.start if codex_launch else effects._handoff_popen
             process = start(
                 arguments,
@@ -218,8 +248,10 @@ def run_codex(
                 process.stdout.close()
                 if codex_launch is not None:
                     codex_launch.stop(process)
+            if role_name == "reviewer":
+                log.write_text(_redact_reviewer_log(output.getvalue()), encoding="utf-8")
     else:
-        with log.open("w", encoding="utf-8") as output:
+        with (io.StringIO() if role_name == "reviewer" else log.open("w", encoding="utf-8")) as output:
             runner = codex_launch.run if codex_launch is not None else effects._handoff_run
             result = runner(
                 arguments,
@@ -234,6 +266,8 @@ def run_codex(
                 timeout=AGENT_CLI_TIMEOUT_SECONDS,
                 **({"launch_process": effects._handoff_popen} if codex_launch is not None else {}),
             )
+            if role_name == "reviewer":
+                log.write_text(_redact_reviewer_log(output.getvalue()), encoding="utf-8")
         returncode = result.returncode
     try:
         message = (provider_last_message.read_text(encoding="utf-8")
@@ -243,6 +277,14 @@ def run_codex(
         # not turn that completed physical call into a retry.
         message = ""
         collection_status = "error"
+    if role_name == "reviewer":
+        message = _redact_reviewer_log(message)
+        if provider_last_message.is_file():
+            try:
+                provider_last_message.write_text(message, encoding="utf-8")
+            except (OSError, UnicodeError):
+                provider_last_message.unlink(missing_ok=True)
+                collection_status = "error"
     if codex_launch is not None and provider_last_message.is_file():
         try:
             last_message.write_text(message, encoding="utf-8")
@@ -255,6 +297,8 @@ def run_codex(
             message = log.read_text(encoding="utf-8")[-6000:]
         except (OSError, UnicodeError):
             collection_status = "error"
+    if role_name == "reviewer":
+        message = _redact_reviewer_log(message)
     try:
         usage = codex_log_usage(log.read_text(encoding="utf-8"))
     except (OSError, UnicodeError):
@@ -350,7 +394,7 @@ def run_claude(
         stream_error_seen = False
         stream_error_message = ""
         diagnostic_tail = ""
-        with log.open("w", encoding="utf-8") as output:
+        with (io.StringIO() if role_name == "reviewer" else log.open("w", encoding="utf-8")) as output:
             process = effects._handoff_popen(
                 arguments,
                 stdin=subprocess.PIPE,
@@ -410,6 +454,8 @@ def run_claude(
             finally:
                 timeout.cancel()
                 process.stdout.close()
+            if role_name == "reviewer":
+                log.write_text(_redact_reviewer_log(output.getvalue()), encoding="utf-8")
         message = stream_error_message or _claude_result_message(final_event)
         if stream_error_seen and returncode == 0:
             returncode = 1
@@ -430,7 +476,8 @@ def run_claude(
         )
         returncode = result.returncode
         raw_output = result.stdout or ""
-        log.write_text(raw_output, encoding="utf-8")
+        log.write_text(_redact_reviewer_log(raw_output) if role_name == "reviewer" else raw_output,
+                       encoding="utf-8")
         try:
             event = json.loads(raw_output)
         except (ValueError, RecursionError):
@@ -451,6 +498,8 @@ def run_claude(
 
     if timeout_triggered.is_set():
         message = f"Claude {role_name} 실행 timeout ({AGENT_CLI_TIMEOUT_SECONDS}초)"
+    if role_name == "reviewer":
+        message = _redact_reviewer_log(message)
     if message:
         last_message.write_text(message, encoding="utf-8")
     if persist_session and not resolved_session_id and returncode == 0:

@@ -12,8 +12,8 @@ _VERDICT = re.compile(r"(?mi)^[ \t]*VERDICT:[ \t]*(?:PASS|FAIL)[ \t]*$")
 _ANSI = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _CREDENTIAL = re.compile(
     r"(?ix)(\b(?:api[_-]?key|access[_-]?token|telegram[_-]?token|secret|password)"
-    r"\b[\"']?\s*[:=]\s*)(?:\"(?:\\.|[^\"\\])*(?:\"|$)|'"
-    r"(?:\\.|[^'\\])*(?:'|$)|[^\s,;]+)"
+    r"\b[\"']?\s*[:=]\s*)(?:\"(?:\\[\s\S]|[^\"\\])*(?:\"|$)|'"
+    r"(?:\\[\s\S]|[^'\\])*(?:'|$)|[^\s,;]+)"
 )
 _BEARER = re.compile(r"(?i)(\bBearer\s+)([^\s,;]+)")
 _TOKEN = re.compile(r"\b(?:sk-[A-Za-z0-9_-]{20,}|\d{8,10}:[A-Za-z0-9_-]{35})\b")
@@ -203,8 +203,8 @@ def _format_verify_failure(raw: str, *, exit_code: int | None = None,
                           timed_out: bool = False) -> str:
     """Conservatively render recognizable verify failures for Worker feedback.
 
-    This deliberately does not alter the raw output used for audit or retry
-    fingerprints.  If no explicit, broadly recognizable failure marker is
+    This deliberately does not alter the original output used for retry
+    fingerprints. If no explicit, broadly recognizable failure marker is
     present, the bounded tail remains more honest than a guessed diagnosis.
     """
     clean = redact_secrets(_ANSI.sub("", raw).replace("\r\n", "\n").replace("\r", "\n")).strip()

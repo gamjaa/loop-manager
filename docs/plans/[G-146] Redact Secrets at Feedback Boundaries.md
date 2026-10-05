@@ -40,3 +40,4 @@ Keep credential-bearing verify and Review feedback out of durable diagnostics an
 - Manifest findings 8 and 47 identify a concrete disclosure path and a false-positive secrecy assertion. High priority follows the possibility of credentials entering a durable log or Worker prompt.
 - Observed feedback path: `loop_manager_internal/execution/validation_feedback.py`.
 - Reused `redact_secrets` for both normalized diagnostics and durable validation-result output, so quoted credential values are removed before either feedback persistence or Worker prompt delivery.
+- Preserved the existing verify fingerprint source and cursor identity while redacting stored samples, state, provider Review logs and last-message files. Reviewer log JSON is decoded before applying the shared scrubber to nested result strings.

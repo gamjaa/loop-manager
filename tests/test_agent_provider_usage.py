@@ -1,6 +1,7 @@
 """Physical Agent invocation observations and tolerant provider usage parsing."""
 
 from pathlib import Path
+import json
 import tempfile
 import io
 from unittest import TestCase, mock
@@ -12,6 +13,90 @@ import loop_manager as manager
 
 
 class UsageTests(TestCase):
+    def test_reviewer_provider_artifacts_redact_json_credentials(self):
+        secret = 'review-json-secret'
+        review = f'{{"password": "{secret}", "result": "VERDICT: FAIL"}}'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def codex_run(arguments, **kwargs):
+                kwargs['stdout'].write(review + '\n')
+                Path(arguments[arguments.index('-o') + 1]).write_text(review)
+                return mock.Mock(returncode=0)
+
+            effects = provider_adapters.ProviderEffects(
+                mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock(), codex_run,
+            )
+            codex_result = provider_adapters.run_codex(
+                root, root, root / 'config', 'reviewer', 'prompt', read_only=True,
+                resolved_profile=invocation.ResolvedProfile('model', 'high'), effects=effects,
+            )
+            self.assertNotIn(secret, str(codex_result))
+            log_dir, = (root / 'logs').iterdir()
+            for artifact in ('reviewer.log', 'reviewer-last.txt'):
+                self.assertNotIn(secret, (log_dir / artifact).read_text())
+
+            effects = provider_adapters.ProviderEffects(
+                mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock(),
+                mock.Mock(return_value=mock.Mock(
+                    returncode=0, stdout=('{"result": ' +
+                    json.dumps(review) + '}'),
+                )),
+            )
+            claude_result = provider_adapters.run_claude(
+                root, root, root / 'config', 'reviewer', 'prompt', read_only=True,
+                resolved_profile=invocation.ResolvedProfile('model', 'high'), effects=effects,
+            )
+            self.assertNotIn(secret, str(claude_result))
+            for artifact in ('claude-reviewer.log', 'claude-reviewer-last.txt'):
+                self.assertNotIn(secret, (log_dir / artifact).read_text())
+
+    def test_streaming_reviewer_logs_redact_before_storage(self):
+        secret = 'streaming-review-secret'
+        review = f'{{"password": "{secret}", "result": "VERDICT: FAIL"}}'
+
+        class Process:
+            def __init__(self, stream):
+                self.stdin = io.StringIO()
+                self.stdout = io.StringIO(stream)
+
+            def wait(self):
+                return 0
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+
+            def codex_start(arguments, **_kwargs):
+                Path(arguments[arguments.index('-o') + 1]).write_text(review)
+                return Process('{"type":"thread.started","thread_id":"session"}\n' + review)
+
+            effects = provider_adapters.ProviderEffects(
+                mock.Mock(), mock.Mock(), mock.Mock(), codex_start, mock.Mock(),
+            )
+            provider_adapters.run_codex(
+                root, root, root / 'config', 'reviewer', 'prompt', read_only=True,
+                persist_session=True,
+                resolved_profile=invocation.ResolvedProfile('model', 'high'), effects=effects,
+            )
+            log_dir, = (root / 'logs').iterdir()
+            for artifact in ('reviewer.log', 'reviewer-last.txt'):
+                self.assertNotIn(secret, (log_dir / artifact).read_text())
+
+            claude_stream = json.dumps({
+                'type': 'result', 'session_id': 'session', 'result': review,
+            }) + '\n'
+            effects = provider_adapters.ProviderEffects(
+                mock.Mock(), mock.Mock(), mock.Mock(),
+                mock.Mock(return_value=Process(claude_stream)), mock.Mock(),
+            )
+            provider_adapters.run_claude(
+                root, root, root / 'config', 'reviewer', 'prompt', read_only=True,
+                persist_session=True,
+                resolved_profile=invocation.ResolvedProfile('model', 'high'), effects=effects,
+            )
+            for artifact in ('claude-reviewer.log', 'claude-reviewer-last.txt'):
+                self.assertNotIn(secret, (log_dir / artifact).read_text())
+
     def test_stream_timeout_preserves_observed_session_and_failure_kind(self):
         class Process:
             def __init__(self, stream):

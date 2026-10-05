@@ -158,7 +158,7 @@ class VerifyOutput(str):
                 exit_code: int | None = None) -> VerifyOutput:
         shown = redact_secrets(output)
         instance = super().__new__(cls, shown.strip()[-8000:])
-        instance.fingerprint_source = shown
+        instance.fingerprint_source = output
         instance.timed_out = timed_out
         instance.exit_code = exit_code
         return instance
