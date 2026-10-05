@@ -588,7 +588,7 @@ def parse_findings(output: str | dict, progress: ReconciliationProgress,
             if roots[path]["destination"] not in finding["boundary"]:
                 raise ReconciliationError("루트 이동 계획은 조사한 안전한 목적지를 유지해야 합니다.")
         status, plan_id = finding["status"], finding["plan_id"]
-        if (not isinstance(plan_id, str)
+        if (not isinstance(status, str) or not isinstance(plan_id, str)
             or (status == "existing_plan" and (plan_id not in existing_plans or existing_plans[plan_id] == "MERGED"))
             or (status == "new_plan" and plan_id not in new_plan_ids)
             or status not in {"existing_plan", "new_plan"}):

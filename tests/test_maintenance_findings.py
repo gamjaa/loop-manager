@@ -9,6 +9,7 @@ from unittest import mock
 from loop_manager_internal.maintenance import maintenance_findings as stream
 from loop_manager_internal.maintenance import maintenance_reconciliation as review
 from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventory, TrackedSource
+from tests.support.workspace import symlink_or_skip
 
 
 class FindingsStreamTest(unittest.TestCase):
@@ -137,20 +138,27 @@ class FindingsStreamTest(unittest.TestCase):
             missing.unlink()
             self.repository.export("repo", unit, plans, texts, evidence)
             self.assertEqual(missing.read_text(), texts["G-0001"])
-            outside = Path(directory) / "outside.txt"
-            outside.write_text("outside remains untouched")
-            linked = manifest.parent / "plan-00000002.txt"
-            linked.unlink()
-            linked.symlink_to(outside)
-            self.repository.export("repo", unit, plans, texts, evidence)
-            self.assertFalse(linked.is_symlink())
-            self.assertEqual(linked.read_text(), texts["G-0002"])
-            self.assertEqual(outside.read_text(), "outside remains untouched")
             saved_unit = manifest.parent / "unit-00000000.json"
             original_unit = saved_unit.read_bytes()
             saved_unit.write_bytes(original_unit[:12])
             self.repository.export("repo", unit, plans, texts, evidence)
             self.assertEqual(saved_unit.read_bytes(), original_unit)
+
+    def test_export_replaces_symlink_without_writing_its_target(self):
+        plans, texts, findings = self.data()
+        unit, _ = self.collect(plans, texts, findings)
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "evidence.json"
+            manifest = self.repository.export("repo", unit, plans, texts, evidence)
+            outside = Path(directory) / "outside.txt"
+            outside.write_text("outside remains untouched")
+            linked = manifest.parent / "plan-00000002.txt"
+            linked.unlink()
+            symlink_or_skip(linked, outside)
+            self.repository.export("repo", unit, plans, texts, evidence)
+            self.assertFalse(linked.is_symlink())
+            self.assertEqual(linked.read_text(), texts["G-0002"])
+            self.assertEqual(outside.read_text(), "outside remains untouched")
 
     def test_many_findings_and_plans_preserve_every_record_with_resume(self):
         plans, texts, findings = self.data(30, 120)

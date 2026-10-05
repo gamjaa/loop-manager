@@ -285,7 +285,7 @@ class ReconciliationUnitTest(unittest.TestCase):
             reconciliation.parse_findings(output, progress, self.inventory,
                                           self.contents, {}, ())
 
-    def test_empty_result_and_non_string_evidence_path_request_correction(self):
+    def test_malformed_result_path_and_status_request_correction(self):
         selected = self.sources["src/a.py"]
         progress = reconciliation.ReconciliationProgress((selected,), (), (), None)
         for empty in ({}, None, reconciliation.FINDINGS_PREFIX + "{}"):
@@ -303,6 +303,16 @@ class ReconciliationUnitTest(unittest.TestCase):
         value = {"source_revision": REVISION, "findings": [finding], "no_issue_reason": None}
         with self.assertRaisesRegex(reconciliation.ReconciliationError, "코드 근거"):
             reconciliation.parse_findings(value, progress, self.inventory, self.contents, {}, ("G-999",))
+        finding["evidence"][0]["path"] = selected.path
+        self.assertEqual(reconciliation.parse_findings(
+            value, progress, self.inventory, self.contents, {}, ("G-999",)), value)
+        for status in ([], {}, None, True, 1, "unknown"):
+            with self.subTest(status=status):
+                finding["status"] = status
+                output = reconciliation.FINDINGS_PREFIX + json.dumps(value)
+                with self.assertRaisesRegex(reconciliation.ReconciliationError, "계획 연결"):
+                    reconciliation.parse_findings(
+                        output, progress, self.inventory, self.contents, {}, ("G-999",))
 
 
 class SynthesisPagingTest(unittest.TestCase):
