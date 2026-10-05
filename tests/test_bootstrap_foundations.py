@@ -34,7 +34,7 @@ class BootstrapFoundationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'process lock'):
                 process_lock._held_process_lock_identity(state)
             with process_lock.process_lock(state, identity='new'):
-                self.assertEqual((state / 'loop-manager.lock').read_text(), 'new')
+                self.assertEqual(process_lock._held_process_lock_identity(state), 'new')
 
     def test_bootstrap_checks_revision_before_and_after_runtime_selection(self):
         service = runtime_service(Path('/runtime'))
@@ -77,7 +77,7 @@ class BootstrapFoundationTests(unittest.TestCase):
             events.append('cleanup') or (_ for _ in ()).throw(RuntimeError('keep runtime'))))
         def child(command, **options):
             events.append('child-exit')
-            self.assertEqual(command[:4], ['/chosen/python', '-B', '-u', '/runtime/loop_manager.py'])
+            self.assertEqual(command[:4], ['/chosen/python', '-B', '-u', str(Path('/runtime/loop_manager.py'))])
             self.assertEqual(command[command.index('--config') + 1], str(config))
             self.assertEqual(command[command.index('--runtime-mutation-id') + 1], 'b' * 32)
             self.assertEqual(options, {'cwd': Path('/runtime'), 'check': False})

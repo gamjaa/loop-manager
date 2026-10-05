@@ -1,3 +1,4 @@
+from contextlib import closing
 import io
 import sqlite3
 import subprocess
@@ -1094,7 +1095,7 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
             database.commit()
             database.close()
 
-            with loop_manager.connect_database(state_dir) as migrated:
+            with closing(loop_manager.connect_database(state_dir)) as migrated, migrated:
                 tables = {
                     row[0]
                     for row in migrated.execute(

@@ -1,4 +1,5 @@
 """Narrow tests for the Worker disposition contract."""
+from contextlib import closing
 from tests.support.worker import decision
 
 import sqlite3
@@ -102,11 +103,11 @@ class WorkerOutcomeTests(unittest.TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         database = Path(directory.name) / 'state.sqlite'
-        with sqlite3.connect(database) as saved:
+        with closing(sqlite3.connect(database)) as saved, saved:
             source.backup(saved)
 
         for _ in range(3):
-            with sqlite3.connect(database) as connection:
+            with closing(sqlite3.connect(database)) as connection, connection:
                 connection.row_factory = sqlite3.Row
                 with (
                     mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint',
@@ -127,7 +128,7 @@ class WorkerOutcomeTests(unittest.TestCase):
                 self.assertEqual(tuple(row),
                                  ('PLAN_BLOCKED', 'saved-session', '{"issue":3}'))
 
-        with sqlite3.connect(database) as connection:
+        with closing(sqlite3.connect(database)) as connection, connection:
             connection.row_factory = sqlite3.Row
             with (
                 mock.patch.object(loop_manager, '_revision_execplan_input_fingerprint',

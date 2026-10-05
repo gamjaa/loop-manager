@@ -1,3 +1,4 @@
+from contextlib import closing
 from tests.support.database import AutomationCatalogFixture
 import hashlib
 import json
@@ -85,7 +86,7 @@ class CatalogMigrationTest(AutomationCatalogFixture, unittest.TestCase):
             database.commit()
             database.close()
 
-            with loop_manager.connect_database(state_dir) as connection:
+            with closing(loop_manager.connect_database(state_dir)) as connection, connection:
                 loop_manager.migrate_legacy_execplans(connection, target_repo=str(root))
                 before_reconciliation = connection.execute(
                     "SELECT plan_id, status FROM exec_plans WHERE repo = ? ORDER BY plan_id",

@@ -1,3 +1,4 @@
+from contextlib import closing
 import json
 import sqlite3
 import subprocess
@@ -251,7 +252,7 @@ class PlannerInterruptionRecoveryTest(unittest.TestCase):
                     )
             connection.close()
 
-            with loop_manager.connect_database(state_dir) as connection:
+            with closing(loop_manager.connect_database(state_dir)) as connection, connection:
                 interrupted = connection.execute(
                     "SELECT * FROM projects WHERE repo = ?", (str(repo),)
                 ).fetchone()

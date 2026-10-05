@@ -8,6 +8,7 @@ import tempfile
 from types import SimpleNamespace
 import unittest
 from unittest import mock
+from tests.support.workspace import symlink_or_skip
 
 from loop_manager_internal.maintenance import code_map_artifact as artifact
 from loop_manager_internal.maintenance import maintenance_reconciliation as reconciliation
@@ -219,7 +220,7 @@ class CodeMapArtifactTest(unittest.TestCase):
 
     def test_symlink_parent_or_target_is_never_followed(self):
         (self.root / "outside").mkdir()
-        (self.root / "docs").symlink_to(self.root / "outside", target_is_directory=True)
+        symlink_or_skip(self.root / "docs", self.root / "outside", target_is_directory=True)
         with self.assertRaises(artifact.CodeMapArtifactError):
             artifact.prepare(self.connection, "repo", self.context, self.root, self.evidence, None)
         self.assertEqual(list((self.root / "outside").iterdir()), [])

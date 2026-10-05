@@ -42,6 +42,7 @@ def _local(host):
 
 @lru_cache(maxsize=1)
 def install_guard():
+    os.environ[MARKER] = "1"
     def audit(event, arguments):
         if event == "subprocess.Popen":
             if arguments[0] is not None:

@@ -27,18 +27,28 @@ class CodexLaunch:
 
     @staticmethod
     def stop(process) -> None:
+        if os.name == 'nt':
+            from .windows_runtime import stop
+            stop(process)
+            return
         try:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+
+    @staticmethod
+    def start(arguments, *, launch_process, **kwargs):
+        if os.name == 'nt':
+            from .windows_runtime import start
+            return start(arguments, launch_process, **kwargs)
+        return launch_process(arguments, stdin=subprocess.PIPE, start_new_session=True, **kwargs)
 
     def run(self, arguments: list[str], *,
             launch_process: Callable[..., subprocess.Popen], **kwargs):
         prompt = kwargs.pop('input')
         timeout = kwargs.pop('timeout')
         # The caller owns the atomic runtime handoff check at process creation.
-        process = launch_process(arguments, stdin=subprocess.PIPE,
-                                 start_new_session=True, **kwargs)
+        process = self.start(arguments, launch_process=launch_process, **kwargs)
         try:
             process.communicate(prompt, timeout=timeout)
             return subprocess.CompletedProcess(arguments, process.returncode)
@@ -51,7 +61,7 @@ class CodexLaunch:
         feature_result = subprocess.run(
             ('codex', *CODEX_EXTENSION_ARGUMENTS, 'features', 'list'),
             cwd=json.loads(self.specification)['worktree'], env=self.environment,
-            capture_output=True, text=True, timeout=30, check=False)
+            capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30, check=False)
         feature_states = {}
         for line in feature_result.stdout.splitlines():
             fields = line.split()
@@ -63,16 +73,23 @@ class CodexLaunch:
             raise RuntimeError('Codex 확장 도구 비활성화 결과를 확인할 수 없습니다.')
         result = subprocess.run(self.probe_arguments, cwd=json.loads(self.specification)['worktree'],
                                 env=self.environment,
-                                capture_output=True, text=True, timeout=30, check=False)
+                                capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=30, check=False)
         if result.returncode or result.stdout.strip() != 'agent-tool-boundary-v2':
             raise RuntimeError('Codex 내장 도구 sandbox의 파일 쓰기 경계를 확인할 수 없습니다.')
 
 
 def _owned_directory(path: Path) -> None:
+    if os.name == 'nt' and sys.version_info < (3, 13):
+        raise RuntimeError('Windows의 비공개 runtime 디렉터리 생성에는 Python 3.13 이상이 필요합니다.')
     path.mkdir(mode=0o700, exist_ok=True)
     status = path.lstat()
     if (not stat.S_ISDIR(status.st_mode) or path.resolve() != path.absolute()
-            or status.st_uid != os.getuid() or status.st_mode & 0o077):
+            or path.is_symlink() or getattr(path, 'is_junction', lambda: False)()):
+        raise RuntimeError('Codex runtime 경로의 소유권·권한을 확인할 수 없습니다.')
+    if os.name == 'nt':
+        from .windows_runtime import assert_private_directory
+        assert_private_directory(path)
+    elif status.st_uid != os.getuid() or status.st_mode & 0o077:
         raise RuntimeError('Codex runtime 경로의 소유권·권한을 확인할 수 없습니다.')
 
 
@@ -108,14 +125,18 @@ def prepare_launch(boundary, state_dir: Path, role: str, read_only: bool,
     _owned_directory(base)
     runtime = base / identity
     _owned_directory(runtime)
-    home = runtime / 'codex'
-    _owned_directory(home)
-    for name in ('auth.json', 'config.toml'):
-        _read_only_link(source_home / name, home / name)
+    # Windows는 인증 파일 복사나 symlink 권한 없이 기존 Codex 저장소를 사용한다.
+    home = source_home if os.name == 'nt' else runtime / 'codex'
+    if os.name != 'nt':
+        _owned_directory(home)
+        for name in ('auth.json', 'config.toml'):
+            _read_only_link(source_home / name, home / name)
     attempt = Path(tempfile.mkdtemp(prefix='call-', dir=runtime))
     child_environment = dict(environment)
     child_environment['CODEX_HOME'] = str(home)
     child_environment['TMPDIR'] = str(attempt)
+    if os.name == 'nt':
+        child_environment['TEMP'] = child_environment['TMP'] = str(attempt)
     writable = [] if read_only else [attempt]
     if not read_only:
         writable.append(boundary.worktree)
@@ -162,4 +183,7 @@ def prepare_launch(boundary, state_dir: Path, role: str, read_only: bool,
     if not read_only:
         arguments = (*arguments, '-c',
                      'sandbox_workspace_write.writable_roots=' + json.dumps([str(attempt)]))
+    if os.name == 'nt':
+        arguments = (*arguments, '-c', 'windows.sandbox="elevated"')
+        probe_arguments = (*probe_arguments[:1], '-c', 'windows.sandbox="elevated"', *probe_arguments[1:])
     return CodexLaunch(arguments, probe_arguments, child_environment, runtime, attempt, specification)

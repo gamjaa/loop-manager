@@ -1,0 +1,33 @@
+name: OS compatibility
+on: [push, pull_request, workflow_dispatch]
+permissions:
+  contents: read
+jobs:
+  verify:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    env:
+      PYTHONIOENCODING: utf-8
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+      - name: Windows verify
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/verify.ps1
+      - name: POSIX verify
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bash scripts/verify.sh
+      - name: Verification diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: verify-${{ matrix.os }}
+          path: .cache/verify/

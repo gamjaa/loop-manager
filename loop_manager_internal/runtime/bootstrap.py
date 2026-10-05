@@ -4,6 +4,7 @@ Git mutation and journal policy remain in the existing Git adapters. This
 service owns runtime selection, ownership validation and child handoff only.
 """
 from __future__ import annotations
+from contextlib import closing
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -355,7 +356,7 @@ class BootstrapService:
         database = state_dir / "loop-manager.db"
         if not database.is_file():
             return "main"
-        with sqlite3.connect(database.as_uri() + "?mode=ro", uri=True) as connection:
+        with closing(sqlite3.connect(database.as_uri() + "?mode=ro", uri=True)) as connection, connection:
             columns = {row[1] for row in connection.execute("PRAGMA table_info(projects)")}
             if not {"repo", "base_branch"} <= columns:
                 raise RuntimeError("상태 DB의 프로젝트 등록 정보를 읽을 수 없습니다.")

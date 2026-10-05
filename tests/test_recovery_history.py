@@ -1,3 +1,4 @@
+from contextlib import closing
 from tests.support.recovery_boundary import RecoveryBoundary
 from tests.support.recovery import BoundedRecoveryFixture
 import json
@@ -365,7 +366,7 @@ class RecoveryHistoryTest(BoundedRecoveryFixture, unittest.TestCase):
             database.commit()
             database.close()
 
-            with loop_manager.connect_database(state_dir) as migrated:
+            with closing(loop_manager.connect_database(state_dir)) as migrated, migrated:
                 project_columns = {
                     row[1] for row in migrated.execute("PRAGMA table_info(projects)")
                 }

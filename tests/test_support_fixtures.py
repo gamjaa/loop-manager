@@ -31,7 +31,7 @@ class SupportFixtureTests(unittest.TestCase):
         capture.assert_called_once_with(source)
         self.assertEqual(saved, before)
         row = connection.execute('SELECT * FROM projects').fetchone()
-        self.assertEqual((row['repo'], row['phase'], row['agent_role']), ('/source', 'PLANNING', 'planner'))
+        self.assertEqual((row['repo'], row['phase'], row['agent_role']), (str(source), 'PLANNING', 'planner'))
         self.assertEqual(loop_manager.GitSnapshot.deserialize(row['agent_snapshot']), before)
         self.assertFalse(connection.in_transaction)
 

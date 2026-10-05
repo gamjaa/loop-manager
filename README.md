@@ -8,6 +8,10 @@ Loop Manager는 여러 로컬 GitHub 프로젝트의 계획·구현·검증·Pul
 
 Python 3, Git, GitHub CLI와 프로젝트에서 선택한 인증된 Codex 또는 Claude Code CLI가 필요하다. 아래 명령은 Loop Manager 저장소 루트에서 실행한다.
 
+Windows·macOS·Linux의 검증 진입점은 각각 PowerShell과 Bash를 사용한다. verify는 저장소의 `.venv`를 우선 사용하며 다른 디렉터리에서 호출해도 저장소 루트에서 실행한다. macOS에서 CPU·메모리 관측이 불가능하면 기존 안전 규칙에 따라 직렬 검증으로 축소한다. CI의 OS matrix가 각 플랫폼에서 전체 검증을 수행한다.
+
+Codex 자동 실행은 세 OS의 내장 sandbox 사전 검사를 통과해야 시작하며 CLI 0.159.3 이상이 필요하다. Windows에서는 Python 3.13 이상과 초기 설정을 마친 elevated sandbox가 필요하고 기존 `CODEX_HOME`의 인증·session 저장소를 사용한다. Linux/macOS는 역할별 runtime에서 원본 인증·설정에 연결한다. Windows는 ACL·Job Object, macOS는 Seatbelt 정책, Linux는 읽기 전용 mount와 프로세스 그룹을 사용하며 경계를 확인할 수 없으면 권한을 완화하지 않고 중단한다. Claude의 검증되지 않은 격리 호출은 계속 거부한다. [Codex 권한 정책](https://developers.openai.com/codex/permissions)
+
 ### 1. 관리할 프로젝트 준비
 
 ```powershell

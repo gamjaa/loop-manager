@@ -5,6 +5,7 @@ from dataclasses import dataclass
 import math
 import os
 from pathlib import Path
+import sys
 import time
 
 MIB = 1024 * 1024
@@ -187,7 +188,8 @@ def windows_sample():
 class ResourceSampler:
     def __init__(self, *, clock=time.monotonic, read=None):
         self.clock = clock
-        self.read = read or (windows_sample if os.name == "nt" else linux_sample)
+        self.read = read or (windows_sample if os.name == "nt" else
+                            linux_sample if sys.platform.startswith("linux") else None)
         self.previous = None
         self.snapshot = None
         self.busy_average = None
@@ -197,6 +199,8 @@ class ResourceSampler:
         if self.snapshot is not None and now - self.snapshot.at < 0.2:
             return self.snapshot
         try:
+            if self.read is None:
+                raise OSError("이 OS의 자원 관측은 지원하지 않아 직렬 검증으로 축소합니다.")
             cpus, total, busy, available, usage, host_cpus = self.read()
             if not math.isfinite(cpus) or cpus <= 0:
                 raise ValueError("허용 CPU 관측 실패")
@@ -239,6 +243,9 @@ class ResourceSampler:
 
 def process_memory():
     """관측 가능한 현재 프로세스 RSS와 peak를 bytes로 반환한다."""
+    if sys.platform == "darwin":
+        import resource
+        return {"peak": resource.getrusage(resource.RUSAGE_SELF).ru_maxrss}
     if os.name != "nt":
         try:
             values = {line.split(":")[0]: int(line.split()[1]) * 1024

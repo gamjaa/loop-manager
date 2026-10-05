@@ -1,10 +1,21 @@
 import sqlite3
+import unittest
 from pathlib import Path
 import loop_manager
 from loop_manager_internal.storage import planning_input_state
 from loop_manager_internal.agents import agent_write_isolation as isolation
 from tests.support.catalog import write_execplan
 from tests.support.git import git_command, make_remote_repository, commit_and_push
+
+
+def symlink_or_skip(link: Path, target, *, target_is_directory=False):
+    """Windows의 symlink 권한 부재만 건너뛰고 다른 오류는 실패시킨다."""
+    try:
+        link.symlink_to(target, target_is_directory=target_is_directory)
+    except OSError as error:
+        if getattr(error, 'winerror', None) == 1314:
+            raise unittest.SkipTest('Windows symlink 생성 권한이 없습니다.') from error
+        raise
 
 
 class WorkspaceFixture:
@@ -85,6 +96,7 @@ class CleanupFixture:
 
 def native_agent_boundary(root: Path):
     """Build synthetic linked-worktree/config files for native provider unit tests."""
+    root = root.resolve()
     state_root = root / 'state'
     selected = state_root / 'worktrees' / 'project' / 'G-088'
     source = root / 'source'

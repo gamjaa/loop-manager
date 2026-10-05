@@ -1,3 +1,4 @@
+from contextlib import closing
 import json
 import io
 import os
@@ -68,7 +69,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             legacy.commit()
             legacy.close()
 
-            with loop_manager.connect_database(state_dir) as migrated:
+            with closing(loop_manager.connect_database(state_dir)) as migrated, migrated:
                 columns = {
                     row[1] for row in migrated.execute("PRAGMA table_info(projects)")
                 }

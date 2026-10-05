@@ -1,3 +1,4 @@
+from contextlib import closing
 import sqlite3
 import tempfile
 import unittest
@@ -32,7 +33,7 @@ class WorkerPublicationMigrationTest(unittest.TestCase):
             database.commit()
             database.close()
 
-            with loop_manager.connect_database(state_dir) as connection:
+            with closing(loop_manager.connect_database(state_dir)) as connection, connection:
                 loop_manager.backfill_plan_shas(connection, target_repo=str(repo))
                 row = connection.execute(
                     "SELECT plan_sha, phase FROM projects WHERE repo = ?", (str(repo),)
@@ -64,7 +65,7 @@ class WorkerPublicationMigrationTest(unittest.TestCase):
             database.commit()
             database.close()
 
-            with loop_manager.connect_database(state_dir) as connection:
+            with closing(loop_manager.connect_database(state_dir)) as connection, connection:
                 loop_manager.backfill_plan_shas(connection, target_repo=str(repo))
                 blocked = connection.execute(
                     "SELECT phase, last_error FROM projects WHERE repo = ?", (str(repo),)
@@ -97,7 +98,7 @@ class WorkerPublicationMigrationTest(unittest.TestCase):
             database.commit()
             database.close()
 
-            with loop_manager.connect_database(state_dir) as connection:
+            with closing(loop_manager.connect_database(state_dir)) as connection, connection:
                 columns = {row[1] for row in connection.execute("PRAGMA table_info(projects)")}
                 loop_manager.update_project(connection, "repo", active_sha="current", plan_sha="planned")
                 loop_manager.update_project(connection, "repo", active_sha="rebased")

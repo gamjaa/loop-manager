@@ -54,18 +54,20 @@ class TimestampedExecutionProgressLogsTest(unittest.TestCase):
         self.assertTrue(output.called)
 
     def test_process_lock_only_classifies_contention_errnos_as_busy(self):
+        target = "msvcrt.locking" if os.name == "nt" else "fcntl.flock"
         with tempfile.TemporaryDirectory() as directory:
-            with mock.patch("fcntl.flock", side_effect=OSError(errno.EAGAIN, "busy")):
+            with mock.patch(target, side_effect=OSError(errno.EAGAIN, "busy")):
                 with self.assertRaises(loop_manager.ProcessLockBusyError):
                     with process_lock_module.process_lock(Path(directory)):
                         pass
-            with mock.patch("fcntl.flock", side_effect=OSError(errno.ENOLCK, "lock system failure")):
+            with mock.patch(target, side_effect=OSError(errno.ENOLCK, "lock system failure")):
                 with self.assertRaises(OSError) as raised:
                     with process_lock_module.process_lock(Path(directory)):
                         pass
 
         self.assertEqual(raised.exception.errno, errno.ENOLCK)
 
+    @unittest.skipIf(os.name == "nt", "POSIX 셸 실행 fixture")
     def test_bash_launcher_skips_git_and_preserves_run_arguments(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

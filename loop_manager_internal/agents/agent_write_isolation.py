@@ -52,7 +52,7 @@ class WorktreeBoundary:
 def _git(worktree: Path, *args: str) -> str:
     result = subprocess.run(
         ["git", "-C", str(worktree), *args], capture_output=True, text=True,
-        check=False, timeout=15,
+        encoding="utf-8", check=False, timeout=15,
     )
     if result.returncode:
         raise IsolationError(f"Git worktree identity 확인 실패: {' '.join(args)}")
@@ -235,14 +235,14 @@ def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
         snapshot = snapshot_digest()
         if not snapshot:
             raise IsolationError("Agent 시작 Git snapshot 지문이 비었습니다.")
-        if platform.system() != "Linux":
+        if platform.system() not in {"Linux", "Darwin", "Windows"}:
             raise IsolationError(f"{provider} {platform.system()}에서 쓰기 격리를 검증할 수 없습니다.")
         if provider != "codex":
             raise IsolationError(f"{provider} 파일 도구와 sandbox 효력을 사전에 증명할 수 없습니다.")
         _assert_no_codex_execpolicy(boundary.worktree)
         _assert_no_codex_extensions(boundary.worktree)
         result = subprocess.run(["codex", "--version"], capture_output=True,
-                                text=True, timeout=15, check=False)
+                                text=True, encoding="utf-8", errors="replace", timeout=15, check=False)
         if result.returncode or not result.stdout.strip():
             raise IsolationError("Codex CLI 버전을 확인할 수 없습니다.")
         version = result.stdout.strip()
@@ -308,7 +308,7 @@ def assert_current(evidence: IsolationEvidence, worktree: Path, state_dir: Path,
         raise IsolationError("Agent 사전 검사 뒤 worktree·설정·Git 상태가 변경됐습니다.")
     try:
         result = subprocess.run([evidence.provider, "--version"], capture_output=True,
-                                text=True, timeout=15, check=False)
+                                text=True, encoding="utf-8", errors="replace", timeout=15, check=False)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise IsolationError("Agent CLI 버전 재확인 실패") from error
     if result.returncode or result.stdout.strip() != evidence.cli_version:
