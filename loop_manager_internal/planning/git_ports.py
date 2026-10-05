@@ -27,6 +27,7 @@ class PlanningGitPortsEffects:
     _specification_input_fingerprint: Callable[..., object]
     changed_files: Callable[..., object]
     git: Callable[..., object]
+    git_bytes: Callable[..., bytes]
     make_planning_worktree: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
     validate_planning_workspace_identity: Callable[..., object]
@@ -72,6 +73,9 @@ class _PlanningGitPorts:
             if self._effects._ignored_worktree_paths(workspace):
                 arguments = ("worktree", "remove", "--force", str(workspace))
         return self._effects.git(repo, *arguments, check=check)
+
+    def run_bytes(self, repo: Path, *arguments: str) -> bytes:
+        return self._effects.git_bytes(repo, *arguments)
 
     def fetch_base(self, repo_path: Path, base: str) -> str:
         return self._effects._recorded_base_fetch(

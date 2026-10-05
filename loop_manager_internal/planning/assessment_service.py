@@ -35,6 +35,19 @@ class PlanningAssessmentService(PlanningService):
         context = run.context
         worktree = run.planning_worktree
         assert worktree is not None
+        if hasattr(self._ports, "retirement"):
+            run.audit_restorations = self._ports.retirement.audit_restorations(
+                context.repo, context.repo_path, str(row.active_sha),
+            )
+            if (run.audit_restorations and not row.planning_result_completed
+                    and not row.planning_result_pending_validation
+                    and not row.planner_session_id and not row.agent_snapshot):
+                self._ports.state.update(
+                    context.repo, planning_result_completed=1, planning_result="",
+                )
+                run.row = self._ports.state.planning(context.repo)
+                run.dirty_files = self._ports.git.changed_files(worktree)
+                return None
         head = self._ports.git.run(worktree, "rev-parse", "HEAD").stdout.strip()
         dirty_files = self._ports.git.changed_files(worktree)
         if row.planning_validation_error and head != row.active_sha:
@@ -199,6 +212,16 @@ class PlanningAssessmentService(PlanningService):
                     self._ports.state.compact_catalog(context.repo),
                     run.mutable_ready_snapshot,
                 )
+                if hasattr(self._ports, "retirement"):
+                    from loop_manager_internal.planning.requirement_retirement import assessment_prompt, audit_prompt
+                    run.retirement_pending = self._ports.retirement.pending(
+                        context.repo, context.repo_path, str(row.active_sha),
+                    )
+                    prompt += assessment_prompt(run.retirement_pending)
+                    run.audit_pending = self._ports.retirement.audit_pending(
+                        context.repo, context.repo_path, str(row.active_sha),
+                    )
+                    prompt += audit_prompt(run.audit_pending)
                 check = getattr(self._ports.state, "planner_check", lambda _repo: None)(context.repo)
                 if check is not None and check["stage"] == "handoff":
                     prompt += (
@@ -508,13 +531,101 @@ class PlanningAssessmentService(PlanningService):
                         )
             else:
                 assert run.mutable_ready_snapshot is not None
+                manager_paths = ()
+                if hasattr(self._ports, "retirement"):
+                    from loop_manager_internal.planning.requirement_retirement import RetirementError
+                    try:
+                        manager_paths = self._ports.retirement.receipted_paths(
+                            context.repo, context.repo_path, str(row.active_sha), worktree,
+                        )
+                    except RetirementError as error:
+                        self._ports.state.update(
+                            context.repo, planning_error=str(error),
+                            planning_error_fingerprint=run.current_fingerprint,
+                            last_error=str(error),
+                        )
+                        self._ports.events.error(str(error))
+                        return self._operational_error()
                 validated_result = self._ports.validation.validate_general_result(
                     context.repo,
                     worktree,
                     str(row.active_sha or ""),
                     dirty_files,
                     run.mutable_ready_snapshot,
+                    **({"manager_paths": manager_paths} if manager_paths else {}),
                 )
+                if hasattr(self._ports, "retirement"):
+                    from dataclasses import replace
+                    from loop_manager_internal.application.contracts import ValidatedPlanningResult
+                    from loop_manager_internal.planning.requirement_retirement import RetirementError
+                    try:
+                        judgments = (() if run.audit_restorations else
+                            self._ports.retirement.validate_result(
+                                context.repo, context.repo_path, str(row.active_sha),
+                                str(row.planning_result or ""),
+                            ))
+                        planned_sources = {
+                            source
+                            for _path, plan in (validated_result.plans if validated_result else ())
+                            for source in plan.get("sources", ())
+                        } | {
+                            source
+                            for revision in (validated_result.revisions if validated_result else ())
+                            for source in revision.plan.get("sources", ())
+                        }
+                        for judgment in judgments:
+                            if judgment.outcome == "fulfilled" and judgment.source_path in planned_sources:
+                                raise RetirementError(
+                                    f"충족 판단과 새 ExecPlan source가 충돌합니다: {judgment.source_path}"
+                                )
+                            if judgment.outcome == "unfulfilled" and judgment.source_path not in planned_sources:
+                                raise RetirementError(
+                                    f"미충족 Requirement의 후속 ExecPlan이 없습니다: {judgment.source_path}"
+                                )
+                        self._ports.retirement.record(context.repo, judgments)
+                        if not run.audit_restorations:
+                            self._ports.retirement.record_audit_result(
+                                context.repo, context.repo_path, str(row.active_sha),
+                                str(row.planning_result or ""),
+                            )
+                    except RetirementError as error:
+                        raise PlanningResultInvalid(str(error)) from error
+                    try:
+                        restored = self._ports.retirement.stage_restorations(
+                            context.repo, context.repo_path, str(row.active_sha), worktree,
+                        )
+                        moved = (() if restored else self._ports.retirement.stage_moves(
+                            context.repo, context.repo_path, str(row.active_sha), worktree,
+                            excluded_sources=tuple(sorted(planned_sources)),
+                        ))
+                    except RetirementError as error:
+                        self._ports.state.update(
+                            context.repo, planning_error=str(error),
+                            planning_error_fingerprint=run.current_fingerprint,
+                            last_error=str(error),
+                        )
+                        self._ports.events.error(str(error))
+                        return self._operational_error()
+                    if moved or restored:
+                        if validated_result is None:
+                            validated_result = ValidatedPlanningResult(
+                                (), (), mutable_snapshot=run.mutable_ready_snapshot,
+                            )
+                        manager_paths = tuple(moved) + tuple(restored)
+                        paths = tuple(sorted(set(validated_result.publication_paths) | set(manager_paths)))
+                        hashes = dict(validated_result.publication_hashes)
+                        import hashlib
+                        for path in manager_paths:
+                            target = worktree / path
+                            if target.is_file():
+                                hashes[path] = hashlib.sha256(target.read_bytes()).hexdigest()
+                        validated_result = replace(
+                            validated_result, publication_paths=paths,
+                            publication_hashes=tuple(sorted(hashes.items())),
+                            retirement_moves=tuple(moved[::2]),
+                            restoration_moves=tuple(restored[::2]),
+                        )
+                        run.dirty_files = sorted(set(dirty_files) | set(manager_paths))
             if (
                 decision is not None
                 and not tiered_assessment.enabled(self._ports, run)

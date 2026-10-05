@@ -49,6 +49,102 @@ from tests.support.planning_case import (
 )
 
 class PlanningSelectionTest(PlanningCase):
+    def test_outstanding_requirement_work_adds_no_retirement_model_call(self):
+        ports = FakePorts(planning_snapshot(
+            processed_sha="base", planning_fingerprint="fingerprint",
+            specification_fingerprint="specification",
+        ))
+        ports.retirement = SimpleNamespace(
+            pending=lambda *_args: (), audit_restorations=lambda *_args: (),
+            audit_pending=lambda *_args: (),
+        )
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(ports.agent.run_count, 0)
+        self.assertIn(outcome.kind, {
+            PlanningOutcomeKind.FINGERPRINT_SKIPPED, PlanningOutcomeKind.NO_CHANGE,
+        })
+
+    def test_final_requirement_check_uses_one_general_turn_not_quick_check(self):
+        ports = FakePorts(planning_snapshot(
+            processed_sha="base", planning_fingerprint="fingerprint",
+            specification_fingerprint="specification",
+        ))
+        item = SimpleNamespace(
+            path="docs/requirements/R.md", token="pinned", criteria=("Works",),
+            related_ids=("G-001",),
+        )
+        ports.retirement = SimpleNamespace(
+            pending=lambda *_args: (item,),
+            audit_restorations=lambda *_args: (),
+            audit_pending=lambda *_args: (),
+            validate_result=lambda *_args: (),
+            record=lambda *_args: None,
+            record_audit_result=lambda *_args: None,
+            stage_restorations=lambda *_args: (),
+            stage_moves=lambda *_args, **_kwargs: (),
+            receipted_paths=lambda *_args: (),
+        )
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertFalse(ports.agent.roles[0][1])
+        self.assertIn("REQUIREMENT_JUDGMENTS", ports.agent.prompts[0])
+        self.assertNotEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
+
+    def test_historical_audit_uses_general_planner_once(self):
+        ports = FakePorts(planning_snapshot(
+            processed_sha="base", planning_fingerprint="fingerprint",
+            specification_fingerprint="specification",
+        ))
+        item = SimpleNamespace(
+            path="docs/requirements/R.md", token="audit-pinned",
+            criteria=("Works",), related_ids=("G-001",),
+        )
+        ports.retirement = SimpleNamespace(
+            pending=lambda *_args: (), audit_restorations=lambda *_args: (),
+            audit_pending=lambda *_args: (item,),
+            validate_result=lambda *_args: (), record=lambda *_args: None,
+            record_audit_result=lambda *_args: None,
+            stage_restorations=lambda *_args: (), stage_moves=lambda *_args, **_kwargs: (),
+            receipted_paths=lambda *_args: (),
+        )
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertFalse(ports.agent.roles[0][1])
+        self.assertIn("REQUIREMENT_AUDIT", ports.agent.prompts[0])
+        self.assertNotEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
+
+    def test_unfulfilled_final_judgment_requires_source_linked_followup_plan(self):
+        ports = FakePorts(planning_snapshot(
+            processed_sha="base", planning_fingerprint="fingerprint",
+            specification_fingerprint="specification",
+        ))
+        source = "docs/requirements/R.md"
+        item = SimpleNamespace(
+            path=source, token="pinned", criteria=("Works",),
+            related_ids=("G-001",),
+        )
+        ports.retirement = SimpleNamespace(
+            pending=lambda *_args: (item,), audit_restorations=lambda *_args: (),
+            audit_pending=lambda *_args: (),
+            validate_result=lambda *_args: (SimpleNamespace(
+                source_path=source, outcome="unfulfilled",
+            ),),
+            record=lambda *_args: None, record_audit_result=lambda *_args: None,
+            stage_restorations=lambda *_args: (), stage_moves=lambda *_args, **_kwargs: (),
+            receipted_paths=lambda *_args: (),
+        )
+
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
+        self.assertEqual(ports.agent.run_count, 1)
+
     def test_planning_workspace_identity_uses_selected_path(self):
         state_dir = Path("/state")
         selected = planning_workspace_path(state_dir, "/repo", "fingerprint")

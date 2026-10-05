@@ -70,7 +70,7 @@ AGENTS.md는 공통 작업 원칙, 이 Skill은 사람이 읽는 문서의 작�
 
 Requirement는 frontmatter나 별도 상태 없이 제품에 원하는 변화와 Acceptance Criteria를 기록하는 순수 문서다. `docs/requirements/` 바로 아래의 모든 Requirement가 Planner 입력이 되므로, 사용자 결정이 필요한 항목을 해소하고 Ready Check를 통과한 뒤 해당 위치에 저장한다. 파일 경로는 안정적인 식별자로 유지한다.
 
-완료된 Requirement는 사용자가 직접 archive하지 않는다. 마지막 관련 ExecPlan의 구현 PR에서 Loop Manager가 eligibility를 다시 확인한 뒤 내용 변경 없이 `docs/requirements/archive/`로 자동 이동한다. archive PR이 Merge되기 전에는 활성 Requirement로서 Planner 입력에 남는다. 관련 비종료 ExecPlan이 남아 있거나 archive 충돌 또는 source 관계의 불확실성이 있으면 자동 이동하지 않고 활성 위치에 보존한다. 대화형 문서 작성 과정에서도 이 eligibility를 우회해 Requirement를 이동하지 않는다.
+완료된 Requirement는 사용자가 직접 archive하지 않는다. 관련 ExecPlan이 모두 실제 Merge되고 일반 Planner가 최신 원격 구현·검증 근거로 전체 Acceptance Criteria 충족을 확인하면 Loop Manager가 일반 planning 게시에서 내용 변경 없이 `docs/requirements/archive/`로 이동한다. 원격 게시 확인 전에는 활성 Planner 입력에 남으며, 비종료 계획·draft, 이동 충돌 또는 source 관계·충족 판단의 불확실성이 있으면 이동하지 않는다. 대화형 문서 작성 과정에서도 이 판단과 게시 경계를 우회해 Requirement를 이동하지 않는다.
 
 ## Ready Check
 

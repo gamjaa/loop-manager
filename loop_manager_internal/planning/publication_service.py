@@ -318,6 +318,14 @@ class PlanningPublicationService(PlanningService):
             )
             if run.maintenance_planning:
                 message = "Update periodic maintenance planning batch"
+            elif validated_result.restoration_moves and not (
+                plans or validated_result.revisions or validated_result.deletions
+            ):
+                message = "Restore unfinished Requirements from historical archive audit"
+            elif validated_result.retirement_moves and not (
+                plans or validated_result.revisions or validated_result.deletions
+            ):
+                message = "Retire fulfilled Requirements after merged implementation assessment"
             elif not plans and not (
                 validated_result.revisions or validated_result.deletions
             ):

@@ -576,6 +576,9 @@ class _PlanningRun:
     planner_scope_error: str | None = None
     maintenance_decision: MaintenancePlannerDecision | None = None
     validated_result: Any = None
+    retirement_pending: tuple[Any, ...] = ()
+    audit_restorations: tuple[str, ...] = ()
+    audit_pending: tuple[Any, ...] = ()
     error_input_changed: bool = False
     publication_recovery_verified: bool = False
 
@@ -605,6 +608,9 @@ class PlanningRunSnapshot:
     planner_scope_error: str | None = None
     maintenance_decision: MaintenancePlannerDecision | None = None
     validated_result: Any = None
+    retirement_pending: tuple[Any, ...] = ()
+    audit_restorations: tuple[str, ...] = ()
+    audit_pending: tuple[Any, ...] = ()
     error_input_changed: bool = False
     publication_recovery_verified: bool = False
 

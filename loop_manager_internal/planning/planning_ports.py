@@ -40,6 +40,8 @@ class _PlanningLifecyclePorts:
         self.git = self._effects._PlanningGitPorts(
             connection, context.repo_path, context.state_dir
         )
+        from loop_manager_internal.planning.requirement_retirement import RequirementRetirementPort
+        self.retirement = RequirementRetirementPort(connection, self.git)
         self.agent = self._effects._PlanningAgentPorts(connection, context, planner_mutex)
         self.validation = self._effects._PlanningValidationPorts(connection)
         self.file_review = self._effects._PlanningFileReviewPorts(connection)

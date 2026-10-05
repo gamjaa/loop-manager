@@ -410,32 +410,33 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
         self.assertNotIn('push', self.calls)
 
 
-    def test_guard_pins_archive_target_without_resetting_worker_session(self):
+    def test_guard_ignores_stale_archive_target_without_resetting_worker_session(self):
         source = 'docs/requirements/source.md'
         self.effects.archive.requirement_archive_sources.return_value = (source,)
-        self.effects.archive.requirement_archive_touched_sources.return_value = ()
-        snapshot = ArchiveSnapshot('base', 'catalog', 'states', 'G-047', (), ())
-        self.effects.archive.requirement_archive_snapshot.return_value = snapshot
-        original_git = self.git
-
-        def git(path, *args, **kwargs):
-            if args[0] == 'merge-base':
-                return SimpleNamespace(stdout='base', returncode=0)
-            return original_git(path, *args, **kwargs)
-
-        self.effects.workspace.git.side_effect = git
+        from loop_manager_internal.storage.requirement_archive_state import ensure_schema
+        ensure_schema(self.connection)
+        self.connection.execute(
+            'INSERT INTO requirement_archive_targets '
+            '(repo, plan_id, generation, base_oid, catalog_token, state_token, '
+            'snapshot_token, candidates, move_set, stage, attempts) '
+            'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+            ('repo', 'G-047', 4, 'base', 'stale', 'stale', 'stale',
+             '["docs/requirements/source.md"]', None, 'VALIDATED', 0),
+        )
         self.state.update_project('repo', worker_session_id='saved-session')
 
         result = self.handler.guard(self.context())
 
-        self.assertEqual(result.archive_snapshot_token, snapshot.token)
+        self.assertNotIsInstance(result, ExecutionOutcome)
+        self.assertEqual(result.archive_sources, ())
+        self.assertIsNone(result.archive_snapshot_token)
         target = self.connection.execute(
             'SELECT snapshot_token, stage FROM requirement_archive_targets '
             "WHERE repo = 'repo' AND plan_id = 'G-047'"
         ).fetchone()
-        self.assertEqual(target['snapshot_token'], snapshot.token)
-        self.assertEqual(target['stage'], 'WORKTREE_UPDATED')
+        self.assertEqual((target['snapshot_token'], target['stage']), ('stale', 'VALIDATED'))
         self.assertEqual(self.state.row()['worker_session_id'], 'saved-session')
+        self.effects.archive.requirement_archive_snapshot.assert_not_called()
         self.effects.blocking.block_active_execplan.assert_not_called()
 
 
@@ -464,14 +465,14 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
 
         result = self.handler.guard(self.context())
 
-        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
-        self.assertEqual(result.recovery.observation.reason,
-                         handlers.RecoveryReason.BASE_BEHIND)
+        self.assertNotIsInstance(result, ExecutionOutcome)
+        self.assertLess(fetches, 2)
+        self.effects.archive.requirement_archive_snapshot.assert_not_called()
         self.assertEqual(self.state.row()['worker_session_id'], 'saved-session')
         self.effects.blocking.block_active_execplan.assert_not_called()
 
 
-    def test_guard_persists_archive_target_before_latest_base_refresh(self):
+    def test_guard_refreshes_base_without_archive_target(self):
         source = 'docs/requirements/source.md'
         self.remote = 'base-2'
         self.effects.archive.requirement_archive_sources.return_value = (source,)
@@ -489,7 +490,8 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
             'SELECT base_oid, snapshot_token, stage '
             "FROM requirement_archive_targets WHERE repo = 'repo'"
         ).fetchone()
-        self.assertEqual(tuple(target), ('base-2', snapshot.token, 'OBSERVED'))
+        self.assertIsNone(target)
+        self.effects.archive.requirement_archive_snapshot.assert_not_called()
         self.effects.blocking.block_active_execplan.assert_not_called()
 
 
@@ -535,10 +537,8 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
 
         result = self.handler.guard(self.context())
 
-        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
-        self.assertEqual(result.recovery.observation.reason,
-                         handlers.RecoveryReason.OWNERSHIP_UNCERTAIN)
-        self.assertNotIn('rebase', self.calls)
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.effects.archive.requirement_archive_snapshot.assert_not_called()
         self.assertIsNone(self.connection.execute(
             "SELECT snapshot_token FROM requirement_archive_targets WHERE repo = 'repo'"
         ).fetchone())
@@ -574,10 +574,9 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
             call.args[0] for call in self.effects.workspace.git.call_args_list
             if call.args[1:3] == ('merge-base', '--is-ancestor')
         ]
-        self.assertEqual(ancestry_paths, [Path('/state/G-047')])
-        self.effects.workspace.validate_managed_worktree.assert_called_with(
-            Path('/repo'), Path('/state/G-047'), 'loop-manager/G-047'
-        )
+        self.assertEqual(ancestry_paths, [])
+        self.effects.archive.requirement_archive_snapshot.assert_not_called()
+        self.effects.workspace.validate_managed_worktree.assert_not_called()
 
 
     def test_guard_archive_snapshot_ignores_base_checkout_head(self):
@@ -608,7 +607,8 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
             call.args[0] for call in self.effects.workspace.git.call_args_list
             if call.args[1:3] == ('merge-base', '--is-ancestor')
         ]
-        self.assertEqual(ancestry_paths, [Path('/state/G-047')])
+        self.assertEqual(ancestry_paths, [])
+        self.effects.archive.requirement_archive_snapshot.assert_not_called()
         self.effects.blocking.block_active_execplan.assert_not_called()
 
 

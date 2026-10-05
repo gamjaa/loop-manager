@@ -115,6 +115,7 @@ class _PlanningValidationPorts:
         active_sha: str,
         dirty_files: list[str],
         mutable_snapshot: MutableReadySnapshot,
+        *, manager_paths: tuple[str, ...] = (),
     ) -> ValidatedPlanningResult | None:
         result = self._effects.validate_planner_result(
             worktree,
@@ -123,6 +124,7 @@ class _PlanningValidationPorts:
             connection=self._connection,
             repo=repo,
             mutable_snapshot=mutable_snapshot,
+            manager_paths=manager_paths,
         )
         from loop_manager_internal.documents import document_drafts
         repository = Path(repo)

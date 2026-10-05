@@ -188,7 +188,20 @@ def collect(
             if path in sources:
                 related.append(statuses[str(row["plan_id"])])
         if related and all(status == "MERGED" for status in related):
-            reason = "관련 계획은 Merge됐고 archive 게시 확인을 기다립니다"
+            judgment = None
+            if _table_exists(connection, "requirement_judgments"):
+                judgment = connection.execute(
+                    "SELECT outcome, invalidation_reason FROM requirement_judgments "
+                    "WHERE repo = ? AND source_path = ?", (repo, path),
+                ).fetchone()
+            if judgment is None or judgment[1]:
+                reason = "관련 계획 Merge 후 일반 Planner의 전체 충족 판단을 기다립니다"
+            elif judgment[0] == "fulfilled":
+                reason = "전체 충족 판단 후 Manager의 내용 보존 이동 게시를 기다립니다"
+            elif judgment[0] == "unfulfilled":
+                reason = "전체 기준 미충족 판단에 따른 후속 계획을 기다립니다"
+            else:
+                reason = "전체 충족 판단이 불확실하여 사용자 결정을 기다립니다"
         elif not related:
             reason = "Planner는 추가 계획이 없다고 확인했지만 활성 Requirement가 남아 있습니다"
         elif all(status in {"MERGED", "PLAN_BLOCKED"} for status in related):
@@ -202,6 +215,21 @@ def collect(
             "id": identifier, "path": path, "reason": reason,
             "independent_wait": independent_wait,
         })
+
+    if _table_exists(connection, "requirement_audit"):
+        for row in connection.execute(
+            "SELECT source_path, reason FROM requirement_audit "
+            "WHERE repo = ? AND outcome = 'uncertain' AND stage = 'observed' "
+            "ORDER BY source_path", (repo,),
+        ):
+            path = str(row["source_path"])
+            match = re.match(r"docs/requirements/(\[R-\d+\])", path)
+            requirement_reasons.append({
+                "id": match.group(1) if match else path, "path": path,
+                "reason": "과거 archive 근거가 불확실하여 사용자 결정을 기다립니다: "
+                          + str(row["reason"]),
+                "independent_wait": True,
+            })
 
     return WorkReasonSnapshot(
         cycle, tuple(plans), tuple(requirement_reasons), project_block, planning_error,

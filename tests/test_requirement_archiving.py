@@ -590,7 +590,7 @@ Test fallback.
                 allow_archive_fallback=False,
             )
 
-    def test_worker_scope_and_prompt_are_limited_to_calculated_candidates(self):
+    def test_worker_prompt_defers_requirement_retirement(self):
         source = "docs/requirements/[R-001] Done.md"
         archived = loop_manager.requirement_archive_path(source)
 
@@ -620,8 +620,8 @@ Test fallback.
             None,
             archive_candidates=(source,),
         )
-        self.assertIn(source, prompt)
-        self.assertIn("내용 변경 없이", prompt)
+        self.assertNotIn("이동하라", prompt)
+        self.assertIn("관련 계획이 Merge된 뒤", prompt)
         self.assertIn(
             "수정하거나 이동하지 마라",
             loop_manager.worker_prompt("docs/plans/[G-001] Plan.md", None),
@@ -665,22 +665,24 @@ Test fallback.
         third = loop_manager._worktree_execplan_input_fingerprint(worker, row)
         self.assertNotEqual(second, third)
 
-    def test_shared_guidance_describes_automatic_archive_contract(self):
+    def test_shared_guidance_keeps_retirement_policy_in_product(self):
         skill = (
             loop_manager.ROOT
             / ".agents/skills/specification-docs/SKILL.md"
         ).read_text(encoding="utf-8")
         agents = (loop_manager.ROOT / "AGENTS.md").read_text(encoding="utf-8")
+        common = (loop_manager.ROOT / "docs/AGENTS.common.md").read_text(encoding="utf-8")
 
-        for guidance in (skill, agents):
-            with self.subTest(guidance=guidance):
-                self.assertIn("마지막 관련 ExecPlan의 구현 PR", guidance)
-                self.assertIn("Loop Manager가 eligibility를 다시 확인", guidance)
-                self.assertIn("내용 변경 없이 `docs/requirements/archive/`로 자동 이동", guidance)
-                self.assertIn("archive PR이 Merge되기 전에는 활성", guidance)
-                self.assertIn("archive 충돌 또는 source 관계", guidance)
-
-        self.assertIn("eligibility를 우회해 Requirement를 이동하지 않는다", skill)
+        self.assertIn("일반 Planner가 최신 원격 구현", skill)
+        self.assertIn("Loop Manager가 일반 planning 게시", skill)
+        self.assertNotIn("마지막 관련 ExecPlan의 구현 PR", agents)
+        self.assertNotIn("마지막 관련 ExecPlan의 구현 PR", common)
+        product = (loop_manager.ROOT / "docs/PRODUCT.md").read_text(encoding="utf-8")
+        template = (loop_manager.ROOT / "docs/REQUIREMENT.template.md").read_text(encoding="utf-8")
+        self.assertIn("각 Acceptance Criterion", product)
+        self.assertIn("일반 planning 게시", product)
+        self.assertIn("일반 planning 게시", template)
+        self.assertNotIn("마지막 관련 ExecPlan의 구현 PR", template)
         self.assertNotIn("archive 이동은 사용자가 수행", skill)
         self.assertNotIn("완료된 Requirement는 사용자가 `docs/requirements/archive/`로 옮긴다", agents)
 

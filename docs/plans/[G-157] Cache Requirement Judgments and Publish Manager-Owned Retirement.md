@@ -64,3 +64,42 @@ Remove the premature Requirement archive gate that repeatedly blocks valid imple
 - Bootstrap publication prerequisite: until G-157 is user-Merged and automatic runtime handoff completes, the running Manager still enforces the old archive contract, including against this new implementation candidate. Worker code changes cannot change that running gate. Before activation, establish a supported, explicitly authorized one-time recovery path for this candidate's validation/publication that preserves active incomplete Requirements and all ownership, targeted-test, Manager verify, Review and PR checks. Do not claim that priority or READY activation alone resolves this second constraint, archive unfinished documents merely to pass the gate, patch the runtime without its ownership contract, or bypass a rejected publication. If no supported path is available, record that specific rollout blocker and obtain the necessary concrete approval before implementation execution.
 - The previous G-155/G-156 local drafts concern remaining feature implementation and have not been published. This policy plan does not rely on their registration or publish them indirectly.
 - Publication refinement: the already-approved one-time audit and operational recovery are a real follow-up G-158, dependent on G-157 and grounded in R-068 and R-055. Its pending source relationships keep R-068/R-055 out of the legacy archive candidate set while G-157 is implemented. R-053 is already protected by the unfinished G-142 source relationship. Recompute the complete legacy archive set after actual catalog adoption before activation; these relationships are not evidence that either older Requirement is fulfilled.
+
+### Agent Guidance Proposal: retirement-after-merged-judgment
+Target: `AGENTS.md`
+Scope: `common`
+Reason: G-157은 관련 ExecPlan의 실제 Merge 후 일반 Planner가 Requirement 전체 충족을 판단하고 Manager가 일반 planning 게시에서 이동하도록 변경한다. 현재 공통 규칙은 마지막 구현 PR 안에서 이동을 요구한다.
+Impact: 변경하지 않으면 Worker와 Reviewer가 계속 구현 PR의 archive 이동을 필수로 해석하여 부분 구현 계획의 정상 검증과 게시를 막는다.
+Patch:
+```diff
+diff --git a/AGENTS.md b/AGENTS.md
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -15,7 +15,7 @@
+ - Requirement 구현 결과가 앞으로도 지켜야 할 제품 규칙이면 예외적으로 코드와 같은 PR에서 `PRODUCT.md`를 갱신할 수 있다.
+ - Requirement는 frontmatter나 상태가 없는 순수 문서다.
+ - `docs/requirements/` 바로 아래의 모든 Requirement는 Planner 입력으로 사용한다.
+-- 완료된 Requirement는 마지막 관련 ExecPlan의 구현 PR에서 Loop Manager가 eligibility를 다시 확인한 뒤 내용 변경 없이 `docs/requirements/archive/`로 자동 이동한다. archive PR이 Merge되기 전에는 활성 Planner 입력으로 남으며, 관련 비종료 ExecPlan, archive 충돌 또는 source 관계 불확실성이 있으면 이동하지 않는다.
++- 완료된 Requirement는 관련 ExecPlan이 모두 실제 MERGED이고 일반 Planner가 최신 Merge된 구현·검증 근거로 전체 Acceptance Criteria 충족을 확인한 뒤에만 Loop Manager가 일반 planning 게시에서 원문 그대로 `docs/requirements/archive/`로 이동한다. 원격 게시가 확인되기 전에는 활성 Planner 입력으로 남으며, 관련 비종료 ExecPlan·draft, 이동 충돌 또는 source 관계·충족 판단 불확실성이 있으면 이동하지 않는다.
+ - `docs/REQUIREMENT.template.md`와 `docs/requirements/archive/`는 작업 입력으로 읽지 않는다.
+ 
+ 시스템 설계:
+```
+
+### Agent Guidance User Decision: retirement-after-merged-judgment
+Decision: `replace`
+Revision: `user-2026-10-05-remove-retirement-policy-from-guidance`
+Patch:
+```diff
+diff --git a/AGENTS.md b/AGENTS.md
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -15,7 +15,6 @@
+ - Requirement 구현 결과가 앞으로도 지켜야 할 제품 규칙이면 예외적으로 코드와 같은 PR에서 `PRODUCT.md`를 갱신할 수 있다.
+ - Requirement는 frontmatter나 상태가 없는 순수 문서다.
+ - `docs/requirements/` 바로 아래의 모든 Requirement는 Planner 입력으로 사용한다.
+-- 완료된 Requirement는 마지막 관련 ExecPlan의 구현 PR에서 Loop Manager가 eligibility를 다시 확인한 뒤 내용 변경 없이 `docs/requirements/archive/`로 자동 이동한다. archive PR이 Merge되기 전에는 활성 Planner 입력으로 남으며, 관련 비종료 ExecPlan, archive 충돌 또는 source 관계 불확실성이 있으면 이동하지 않는다.
+ - `docs/REQUIREMENT.template.md`와 `docs/requirements/archive/`는 작업 입력으로 읽지 않는다.
+ 
+ 시스템 설계:
+```
