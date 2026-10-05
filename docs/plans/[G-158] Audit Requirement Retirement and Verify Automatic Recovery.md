@@ -40,10 +40,13 @@ Use the deployed Planner-judgment and Manager-retirement policy to perform the r
 
 ## Progress
 
-- [ ] Confirm G-157 runtime adoption and pinned audit results.
-- [ ] Verify Requirement retention/restoration and follow-up handling.
-- [ ] Record recovery readiness for G-142/G-144/G-145 and hand execution validation to each plan after G-158 Merge.
-- [ ] Record remaining real blockers without clearing unrelated safety causes.
+- [x] Confirm G-157 runtime adoption and pinned audit results; authorized manual results are registered through the Manager audit port, with no claim that cron ran the semantic audit.
+- [x] Verify Requirement retention/restoration and follow-up handling; preserve superseded originals and recover surviving R-063 goals as active R-071/R-072/R-073 without new ExecPlans.
+- [x] Record recovery readiness for G-142/G-144/G-145 and hand execution validation to each plan after G-158 Merge; retained state is inventoried, dependent execution remains unverified.
+- [x] Record remaining real blockers without clearing unrelated safety causes; independent blocks, sessions and maintenance state are preserved.
+
+- [ ] Confirm Manager full verify and independent Review for the published candidate.
+- [ ] Register the G-158 PR and connect its verified identity in Manager SQLite; wait for actual user Merge.
 
 ## Decision Log
 
@@ -53,3 +56,14 @@ Use the deployed Planner-judgment and Manager-retirement policy to perform the r
 - The current maintenance cycle also excludes ordinary newly published follow-ups. Register and select this plan through an explicitly authorized single-plan recovery admission after its dependency is MERGED; preserve the existing maintenance cycle and normal single-project execution boundary.
 
 - 2026-10-05 사용자 실행 순서 결정: G-158을 먼저 수행하고 G-142·G-144·G-145의 Merge 선행 dependency로 등록한다. 감사·복구 준비와 실제 후속 실행 검증을 분리해 상호 대기를 피한다. G-138의 R-070 복구 fixture·Git 관측 회귀는 G-160 별도 수정이며 이 계획으로 성공 처리하지 않는다. 사용자는 기존 유지보수 주기와 작업물·세션을 보존하는 G-158 단일 계획 복구 admission을 승인했다. 원격 개정 채택과 당시 실행 슬롯·소유권·dependency·안전 조건을 확인한 Manager 절차로만 실행하며 SQLite 사건을 임의 초기화하지 않는다.
+
+- 2026-10-05 읽기 전용 운영 관측: SQLite에서 G-157은 `MERGED`이고 PR #149가 연결돼 있다. 실행 runtime `90466148355c1d79786522b71d961d9b9b2a1943`은 G-157 게시 SHA `ced4db4041db6f5f4b188785129b6561ecbb31cf`의 후속이며, 07:22 UTC의 G-158 Worker 호출과 catalog 관측이 이 runtime에서 기록됐다. 감사 inventory에 사용한 관측 SHA는 `90466148355c1d79786522b71d961d9b9b2a1943`이다. 해당 tree의 `docs/requirements/archive/`에는 Markdown 50개가 있고, 경로·mode·blob OID를 정렬한 `git ls-tree -r` 행의 SHA-256은 `c1bf72310c6b8971b77d59ac23803965c4d48411c30a4b602ab1d8ef494a6b0f`이다. 활성 Requirement는 14개이며 R-053/R-055/R-068은 각각 blob `14413ff21d3798517d8a8a7d03575f1afe993d40`/`6edebc4edfd45fc942e9af77dafdd3eb1be74541`/`7190d71bf847ace8770e47632ae104d450e9d6c8`로 남아 있다. 50개 archive 모두 catalog상 관련 계획이 적어도 하나 있고 모두 `MERGED`여서 이 사실만으로 완료를 판정할 수 없다. 이 목록은 Worker의 읽기 전용 예비 inventory이며 Manager의 pinned audit 결과나 Planner의 의미 판단을 대신하지 않는다.
+- 같은 관측에서 운영 `requirement_audit`와 `requirement_move_receipts`는 모두 0건이다. 유지보수 주기는 `refactoring` 단계다. `PlanningSelectionService`는 이 단계에서 READY 작업을 활성화하고 일반 planning의 `audit_pending` 경로를 지나지 않는다. 따라서 배포된 runtime에서 감사가 아직 실행되지 않았고, archive 50개의 fulfilled/premature/superseded/uncertain 결과·재시작 재사용·내용 보존 복원은 확인할 수 없다. Worker는 Manager를 직접 실행하거나 운영 SQLite를 수정하지 않았다. 감사가 가능한 Manager-owned 진입 시점 또는 유지보수 중 감사 경계의 결정이 필요하며, 결과가 생기기 전에는 이 계획의 감사 Acceptance Criteria를 충족했다고 기록하지 않는다.
+- G-142/G-144/G-145는 각각 `PLAN_BLOCKED`이고 `depends_on=[G-158]`, 기존 Worker·Reviewer session, branch, worktree, verify 결과, Review 실패와 `user_decision_required` block/checkpoint가 남아 있으며 PR은 없다. 세 worktree의 미게시 변경도 남아 있다. 이전 archive 강제 지적은 배포된 G-157 정책에 비춰 재평가할 대상이지만, G-145에는 별도의 Windows `fcntl` 테스트 지적과 범위 격리 전 미게시 checkpoint도 있어 일괄 해제할 수 없다. G-158이 실제 Merge된 뒤 Manager가 현재 입력·소유권·각 독립 원인을 확인하고 세 계획의 Worker 확인, targeted test, 전체 verify, Review, PR 게시를 각각 진행해야 한다. 현재 기록은 복구 준비 inventory이며 실행 완료 증거가 아니다.
+
+- 2026-10-05 사용자 수동 감사 승인과 문서 범위 결정: G-158 branch에서 archive Requirement 전수를 현재 PRODUCT·활성 Requirement·후속 계획·구현·테스트와 대조한다. 이후 명세로 변경·대체·충돌한 과거 조건을 제외하고 미완료 잔여 목표만 활성 Requirement로 작성한다. 사용자는 새 G 문서를 작성하지 말고 G-158에 이번 작업 내용과 완료한 항목을 기록하도록 결정했다. 따라서 새 ExecPlan은 작성하지 않으며 R-071/R-072/R-073만 후속 Planner 입력으로 추가한다. 감사 증거는 `docs/audits/G-158/README.md`와 `requirement-audit.json`에 고정한다. 기존 source·목표·dependency·session·branch·작업물·차단과 유지보수 주기를 보존한다.
+- 2026-10-05 수동 감사 결과: 고정 base `4be5702ee7bf133667bd3c58745659b527018237`의 archive 50개와 Acceptance Criteria 668개를 대조했다. 정적 구현·테스트 계약에 부합하는 문서 25개, 후속 정책을 적용해야 하는 문서 24개, 전체 원문 복원이 부적절한 혼합 문서 R-063 1개로 구분했다. 이 분류는 이번 Agent가 전체 테스트를 실행했다는 의미가 아니다. R-063의 남은 규칙 기반 편집·결과 형식·사실 설명 호출 축소는 R-071, 역할별 동일 입력 성공 재사용은 R-072, 호출 목적·실행 여부·usage 범위·조회는 R-073으로 보존한다. R-068이 대체한 구현 PR archive 규칙은 제외하며 R-049 strict 설정은 후속 G-131의 optional fallback에 따라 복원하지 않는다. 활성 R-033/G-066 등이 이미 보존하는 미완료 범위는 중복 추가하지 않는다. 과거 MERGED ID를 재실행하거나 archive 원문을 변경·일괄 이동하지 않았다.
+- 2026-10-05 감사 저장 검증: 운영 DB의 일관된 backup에서 기존 Manager `RequirementRetirementPort`가 원문·source 관계·관련 제품·계획·구현 근거를 pin하고 50개 결과의 기준별 근거를 검증·저장했다. DB를 닫고 다시 연 동일 입력에서 pending 0개·blob 재읽기 0회를 확인했다. 생산 DB 등록과 PR 연결은 별도 Manager API 절차로 확인하며, 이 수동 절차를 cron의 일반 Planner 감사 실행으로 보고하지 않는다. 문서와 감사 증거만 바뀌어 새 executable unit test가 필요하지 않으며 targeted test·전체 verify를 직접 실행하지 않았다. Manager의 전체 verify와 독립 Review, 실제 PR·사용자 Merge는 각 실제 결과가 확인될 때만 체크한다.
+- 2026-10-05 후속 복구 경계: G-142/G-144/G-145는 기존 G-158 dependency와 작업물·session·verify·Review 실패·checkpoint를 유지한다. 이전 archive 강제 지적은 R-068/G-157에 비춰 재평가할 대상이며, G-145의 Windows fcntl/cleanup 피드백과 다른 ownership·scope·사용자 결정 차단은 일괄 해제하지 않는다. G-158 실제 Merge 뒤 각 계획의 현재 입력·독립 원인·안전 gate를 확인하고 Worker·targeted test·전체 verify·Review·PR을 각각 진행해야 한다. 이번 체크는 복구 준비 기록 완료이며 자동 실행 성공 기록이 아니다.
+
+- 2026-10-05 운영 감사 등록 확인: 전역 Manager process lock과 일관된 DB backup을 확보한 뒤 기존 audit port로 고정 입력 50개 결과를 생산 DB에 등록했다. DB 재연결 후 같은 입력에서 pending 0개·blob 재읽기 0회를 확인했다. ExecPlan·project·maintenance 행은 등록 전후 동일하며 과거 실행·실패·세션을 변경하지 않았다. 운영 receipt: `/home/ubuntu/.local/state/loop-manager/manual-audits/G-158-20261005T080802Z/registration.json`. G-158 검증·Review·PR 상태는 이 감사 저장만으로 성공 처리하지 않는다.
