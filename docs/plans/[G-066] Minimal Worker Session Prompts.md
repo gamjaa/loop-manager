@@ -22,6 +22,11 @@ depends_on:
   - G-145
   - G-146
   - G-147
+  - G-160
+  - G-171
+  - G-173
+  - G-180
+  - G-181
 complexity: high
 risk: medium
 priority: low
@@ -61,6 +66,8 @@ priority: low
 - [ ] 관련 targeted 회귀 사례 추가
 
 ## Decision Log
+
+- 2026-10-05 일반 mutable READY snapshot `202cd7f3a965a13572b02c54e2fefa108d58d6d661ef94298e7d4a2ed22ef059`에 따라 ID와 기존 목표를 보존했다. 새 Review 교정·문서 권한·User Decision·결과 정규화·verify 입력 확인의 전달 계약이 먼저 확정되도록 G-160·G-171·G-173·G-180·G-181을 dependency에 추가했다. 이 계획이 해당 기능을 중복 구현하지 않으며 session delta는 확정된 계약을 따른다.
 
 - CLI가 보존하는 대화를 Loop Manager가 별도로 압축하거나 재구성하지 않는다. G-058의 공통 지침과 G-065의 verify 피드백을 전제로 한다.
 - 2026-10-02 사용자 결정: 리팩터링을 먼저 진행하므로 G-127 Merge 이후 시작한다. SQLite에서 미착수·무소유 READY임을 확인했으며 원래 목표·Acceptance Criteria와 기존 dependency는 유지한다. 실행 시 G-119~G-125에서 정리된 prompt·session·handler와 테스트의 최신 경로를 확인한다.

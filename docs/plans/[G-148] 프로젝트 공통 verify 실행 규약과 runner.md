@@ -4,7 +4,8 @@ title: 프로젝트 공통 verify 실행 규약과 runner
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-067] 프로젝트 공통 verify 실행 규약.md
-depends_on: []
+depends_on:
+  - G-147
 complexity: high
 risk: high
 priority: normal
@@ -27,7 +28,7 @@ priority: normal
 
 ### 1. 기준선 확인과 규약 확정
 
-- PR [#138](https://github.com/gamjaa/loop-manager/pull/138)의 실제 Merge·검증 상태와 R-065의 남은 작업을 확인한다. Merge 전 코드를 현재 제품 보장이나 이미 통과한 기반으로 취급하지 않는다. Merge 후 `verification/coordination.py`, `resources.py`, `timing.py`, `manager_adapter.py`, `runner.py`, `manifest.py`와 `execution/result_validation.py`의 경계를 다시 확인한다.
+- planning 기준 `a049a76`의 `verification/coordination.py`, `resources.py`, `timing.py`, `manager_adapter.py`, `runner.py`, `manifest.py`와 `execution/result_validation.py`에 구현된 자원 배정·예약·시간·종료 경계를 재사용한다. 실행 시 최신 원격과 실제 Merge·검증 근거를 다시 확인하고 이미 구현된 R-065 기능을 중복 구현하지 않는다.
 - G-135 및 비종료 계획의 목표·실행 이력·dependency를 변경하지 않는다. 실제로 겹치는 종료·fixture·지침 변경은 최신 catalog의 소유권과 Merge 상태를 확인해 실행 계획별로 필요한 선행 조건만 설정한다. 전체 계획을 무조건 기존 리팩터링 완료 뒤로 미루지 않는다.
 - 첫 연결 선언은 `scripts/verify.json`의 schema version·adapter 식별자·프로젝트 테스트 환경·수집 옵션·순서 있는 검증 단계로 한정한다. 실제 테스트 ID와 실행 단위는 현재 revision에서 수집하며 정적 선언을 수집 결과로 대체하지 않는다.
 - 단위는 고유 ID·argv 배열·worktree 안의 cwd·직렬 또는 독립 실행 조건을 제공한다. core가 명령 문자열을 shell로 해석하지 않는다. 단계 순서는 고정하고 범용 dependency DAG·resource lock 설정은 만들지 않는다.
@@ -80,6 +81,8 @@ priority: normal
 - 2026-10-04: catalog 차단 복구를 위해 미등록 활성 계획의 ID와 파일명을 G-153에서 G-148로 정정했다. SQLite의 마지막 등록 ID는 G-147이며 manual 기록은 실행 catalog의 번호 예약에 포함되지 않는다. 과거 작성 기록은 보존하고 목적·범위·Acceptance Criteria·dependency는 유지한다. 구현 완료를 뜻하지 않는다.
 
 ## Decision Log
+
+- 2026-10-05 일반 mutable READY snapshot `202cd7f3a965a13572b02c54e2fefa108d58d6d661ef94298e7d4a2ed22ef059`에서 ID·로컬 공통 core/unittest 목표를 보존했다. 역할별 공통 지침은 G-147의 주입·고정 버전을 먼저 사용하도록 dependency를 추가했다. 비Python adapter·두 언어 예제와 실제 OS/부하 비교는 G-186·G-187이 맡으며 이 계획의 구현 완료로 R-067 전체 충족을 주장하지 않는다.
 
 - 사용자는 프로젝트마다 자원 조율을 구현하는 대신 Loop Manager 기능으로 공통 규약을 제공하고 그 규약에 맞춰 다른 프로젝트도 사용하는 계획을 요청했다.
 - R-065의 기존 Non-Goal을 변경하지 않고 R-067에서 선택적 연결을 정의한다. R-058·R-065의 안전·검증 원칙은 이어받지만 기존 수동 기록을 관리 대상 완료 증거로 승격하지 않는다.
