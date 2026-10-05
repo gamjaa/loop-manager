@@ -1,6 +1,7 @@
 from tests.support.scope import AgentScopeFixture
 from tests.support.git import prepare_manager_import_fixture
 import sqlite3
+import os
 import subprocess
 import sys
 import tempfile
@@ -74,6 +75,9 @@ class ScopeIgnoredArtifactsTest(AgentScopeFixture, unittest.TestCase):
     def test_persisted_worker_snapshot_resumes_with_legacy_ignored_artifact(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, plan_path = self._repository_with_plan(directory)
+            exclude = repo / '.git/legacy-empty-exclude'
+            exclude.write_bytes(b'')
+            git_command(repo, 'config', 'core.excludesFile', str(exclude))
             (repo / ".gitignore").write_text("cache.bin\n", encoding="utf-8")
             commit_and_push(repo, "Ignore cache fixture")
             (repo / "cache.bin").write_bytes(b"old")
@@ -168,6 +172,7 @@ class ScopeIgnoredArtifactsTest(AgentScopeFixture, unittest.TestCase):
             with self.assertRaisesRegex(loop_manager.AgentScopeError, "hidden.txt"):
                 loop_manager.validate_agent_scope("reviewer", repo, before, after)
 
+    @unittest.skipIf(os.name == 'nt', 'Windows 파일명에는 콜론을 사용할 수 없습니다.')
     def test_colon_in_ignore_rule_path_cannot_hide_untracked_file(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, _plan_path = self._repository_with_plan(directory)

@@ -1,5 +1,7 @@
 from contextlib import closing
 import io
+import hashlib
+import os
 import sqlite3
 import subprocess
 import tempfile
@@ -291,7 +293,7 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
                 root, "HEAD", approve_agents_mismatch=True
             )
             self.assertTrue(approved)
-            self.assertEqual(agents_hash, loop_manager.file_hash(root / "AGENTS.md"))
+            self.assertEqual(agents_hash, hashlib.sha256(loop_manager.git_bytes(root, "show", "HEAD:AGENTS.md")).hexdigest())
 
             (root / "docs/PLANS.md").write_text("different\n", encoding="utf-8")
             self._commit(root, "Change plans")
@@ -304,16 +306,14 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             target = Path(directory) / "project"
             target.mkdir()
+            command = (["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                        str(loop_manager.ROOT / "scripts/copy-project-files.ps1"), "-TargetPath", str(target)]
+                       if os.name == "nt" else ["bash", str(loop_manager.ROOT / "scripts/copy-project-files.sh"), str(target)])
             subprocess.run(
-                [
-                    "bash",
-                    str(loop_manager.ROOT / "scripts/copy-project-files.sh"),
-                    str(target),
-                ],
+                command,
                 check=True,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                text=True,
             )
 
             skill = (target / ".agents/skills/specification-docs/SKILL.md").read_text(
@@ -385,7 +385,7 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             """
         )
         connection.commit()
-        project_registry.remove_project(connection, "/repo")
+        project_registry.remove_project(connection, added.repo)
 
         self.assertEqual(project_registry.list_projects(connection), ())
         self.assertEqual(

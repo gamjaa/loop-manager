@@ -92,7 +92,7 @@ class VerifyProcessTests(unittest.TestCase):
                         [sys.executable, "-c", f"print('result'); raise SystemExit({code})"],
                         root, 2,
                     )
-                    self.assertEqual(result, (code == 0, False, "result\n"))
+                    self.assertEqual(result, (code == 0, False, "result" + os.linesep))
 
     @unittest.skipIf(os.name == "nt", "POSIX process-group assertion")
     def test_timeout_kills_child_process(self):

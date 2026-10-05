@@ -885,8 +885,8 @@ class OwnedScopePublicationRecoveryTests(ScopedGateFixture, unittest.TestCase):
                   pr_url='https://example.test/pr/3')
         with self.connection:
             self.connection.execute(
-                "UPDATE exec_plans SET worktree = '/managed/G-003' "
-                "WHERE repo = ? AND plan_id = 'G-003'", (self.repo,),
+                "UPDATE exec_plans SET worktree = ? "
+                "WHERE repo = ? AND plan_id = 'G-003'", (str(Path('/managed/G-003').resolve()), self.repo),
             )
             self.connection.execute(
                 "UPDATE projects SET phase = 'PLANNING', worktree = '/planning', "
@@ -915,8 +915,8 @@ class OwnedScopePublicationRecoveryTests(ScopedGateFixture, unittest.TestCase):
             (self.repo,),
         ).fetchone()[0], 'MERGED')
         self.assertIsNotNone(self.connection.execute(
-            "SELECT 1 FROM cleanup_pending WHERE repo = ? AND worktree = '/managed/G-003'",
-            (self.repo,),
+            "SELECT 1 FROM cleanup_pending WHERE repo = ? AND worktree = ?",
+            (self.repo, str(Path('/managed/G-003').resolve())),
         ).fetchone())
 
 
@@ -1034,13 +1034,13 @@ class OwnedScopePublicationRecoveryTests(ScopedGateFixture, unittest.TestCase):
         )
         with self.connection:
             self.connection.execute(
-                "UPDATE exec_plans SET worktree = '/managed', worker_session_id = 'session' "
-                "WHERE repo = ? AND plan_id = 'G-081'", (self.repo,),
+                "UPDATE exec_plans SET worktree = ?, worker_session_id = 'session' "
+                "WHERE repo = ? AND plan_id = 'G-081'", (str(Path('/managed').resolve()), self.repo),
             )
             self.connection.execute(
                 "UPDATE projects SET phase = 'PROJECT_BLOCKED', plan_path = ?, "
-                "branch = 'loop/G-081', worktree = '/managed' WHERE repo = ?",
-                (plan['path'], self.repo),
+                "branch = 'loop/G-081', worktree = ? WHERE repo = ?",
+                (plan['path'], str(Path('/managed').resolve()), self.repo),
             )
             self.connection.execute(
                 "INSERT INTO project_blocks (repo, scope, reason_code, plan_id, evidence, previous_phase) "

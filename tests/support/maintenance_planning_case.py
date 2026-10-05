@@ -61,7 +61,7 @@ class MaintenancePlanningCase(unittest.TestCase):
         for name in ("legacy/module.py", "refactored/adapter.py"):
             source = self.repo / name
             source.parent.mkdir(parents=True, exist_ok=True)
-            source.write_text("# tracked module\n", encoding="utf-8")
+            source.write_text("# tracked module\n", encoding="utf-8", newline="\n")
         self._write_plan("G-000", "Merged Foundation")
         self.ready_path = self._write_plan(
             "G-001", "Ready Feature", depends_on=("G-000",)
@@ -118,7 +118,7 @@ class MaintenancePlanningCase(unittest.TestCase):
                 acceptance_criteria=acceptance_criteria,
                 implementation=implementation,
             ),
-            encoding="utf-8",
+            encoding="utf-8", newline="\n",
         )
         return path
 

@@ -280,7 +280,7 @@ class ProjectCauseRevalidationTests(ProjectRemoteRecoveryFixture, unittest.TestC
         remote = object()
         observed = SimpleNamespace(
             remote=remote, operations=(), metadata=None, branch=self.plan()['branch'],
-            branch_ref=(self.head, ''), head=self.head, branch_worktrees=('/state/G-106',),
+            branch_ref=(self.head, ''), head=self.head, branch_worktrees=(str(Path('/state/G-106').resolve()),),
             registration=(f'HEAD={self.head}', 'branch=refs/heads/loop-manager/G-106'), index=())
         observed.remote = SimpleNamespace(pull_request=None)
         self.ports._current_rebase_service.return_value.expected.remote = observed.remote

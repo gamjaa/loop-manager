@@ -4,6 +4,7 @@ import sqlite3
 import subprocess
 import tempfile
 import unittest
+from tests.support.workspace import symlink_or_skip
 import hashlib
 import json
 from dataclasses import replace
@@ -90,6 +91,8 @@ class DocumentDraftTest(unittest.TestCase):
             document_publication.validate_exact_worktree(approved, worktree, self.source_sha)
         (worktree / "AGENTS.md").unlink()
         (worktree / approved.target_path).chmod(0o755)
+        subprocess.run(["git", "-C", str(worktree), "update-index", "--chmod=+x", "--",
+                        approved.target_path], check=True, capture_output=True)
         with self.assertRaises(document_drafts.DocumentDraftError):
             document_publication.validate_exact_worktree(approved, worktree, self.source_sha)
 
@@ -200,7 +203,7 @@ class DocumentDraftTest(unittest.TestCase):
         )
         worktree = self.root / 'managed'
         worktree.mkdir()
-        (worktree / 'docs').symlink_to(self.repo / 'docs', target_is_directory=True)
+        symlink_or_skip(worktree / 'docs', self.repo / 'docs', target_is_directory=True)
         with self.assertRaises(document_drafts.DocumentDraftError):
             document_publication.apply_approved_bytes(
                 approved, worktree, self.source_sha,
@@ -249,6 +252,7 @@ class DocumentDraftTest(unittest.TestCase):
         self._git("init", "-b", "main")
         self._git("config", "user.email", "test@example.com")
         self._git("config", "user.name", "Test")
+        self._git("config", "core.autocrlf", "false")
         self.documents = {
             "docs/PRODUCT.md": b"# Product\n\nRepeated rule.\n",
             "docs/ARCHITECTURE.md": b"# Architecture\n\nRepeated explanation.\n",
@@ -423,6 +427,12 @@ class DocumentDraftTest(unittest.TestCase):
         with self.assertRaises(document_drafts.DocumentDraftError):
             self._create()
 
+    def _command_database(self, _state_dir):
+        self.database.commit()
+        connection = sqlite3.connect(self.root / "state.db")
+        connection.row_factory = sqlite3.Row
+        return connection
+
     def test_cli_has_explicit_identity_and_hash_boundary(self):
         parser = loop_manager.build_parser()
         proposal = b"# Product\r\n\r\nRule.\r\n"
@@ -431,7 +441,7 @@ class DocumentDraftTest(unittest.TestCase):
                                   draft.draft_id])
         output = io.BytesIO()
         with mock.patch.object(loop_manager, "is_loop_manager_repository", return_value=True), \
-             mock.patch.object(loop_manager, "connect_database", return_value=self.database), \
+             mock.patch.object(loop_manager, "connect_database", side_effect=self._command_database), \
              mock.patch.object(loop_manager.sys, "stdout", mock.Mock(buffer=output)):
             self.assertEqual(loop_manager._document_drafts_command(show, self.root, self.root / "config.ini"), 0)
         review = output.getvalue()
@@ -446,7 +456,7 @@ class DocumentDraftTest(unittest.TestCase):
         self.assertEqual((args.draft_id, args.proposed_hash, args.decision),
                          (draft.draft_id, draft.proposed_hash, "approve"))
         with mock.patch.object(loop_manager, "is_loop_manager_repository", return_value=True), \
-             mock.patch.object(loop_manager, "connect_database", return_value=self.database), \
+             mock.patch.object(loop_manager, "connect_database", side_effect=self._command_database), \
              mock.patch.object(loop_manager, "_recorded_base_fetch", return_value="base") as fetched, \
              mock.patch.object(loop_manager, "operation_print"):
             self.assertEqual(loop_manager._document_drafts_command(args, self.root, self.root / "config.ini"), 0)
@@ -475,7 +485,7 @@ class DocumentDraftTest(unittest.TestCase):
         ])
         output = io.BytesIO()
         with mock.patch.object(loop_manager, "is_loop_manager_repository", return_value=True), \
-             mock.patch.object(loop_manager, "connect_database", return_value=self.database), \
+             mock.patch.object(loop_manager, "connect_database", side_effect=self._command_database), \
              mock.patch.object(loop_manager, "_recorded_base_fetch", return_value="base") as fetched, \
              mock.patch.object(loop_manager, "run_agent", return_value=(0, response)) as agent, \
              mock.patch.object(loop_manager.sys, "stdout", mock.Mock(buffer=output)):

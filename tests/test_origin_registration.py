@@ -25,6 +25,32 @@ from loop_manager_internal.runtime import bootstrap
 
 
 class OriginRegistrationTests(unittest.TestCase):
+    def test_registration_normalizes_document_line_endings_but_hashes_agent_bytes(self):
+        for newline in (b'\n', b'\r\n'):
+            with self.subTest(newline=newline):
+                def common(path):
+                    return loop_manager.normalized_text(loop_manager.ROOT / path).encode('utf-8').replace(b'\n', newline)
+
+                documents = {
+                    'AGENTS.md': common('AGENTS.md'),
+                    'docs/PLANS.md': common('docs/PLANS.md'),
+                    'docs/ARCHITECTURE.md': b'# Custom architecture\n',
+                    'docs/PRODUCT.md': b'# Custom product\n',
+                }
+                with mock.patch.object(loop_manager, '_git_tree_entries', return_value={}), mock.patch.object(
+                    loop_manager, '_revision_blob', side_effect=lambda _root, _entries, path: documents[path]
+                ):
+                    self.assertEqual(
+                        loop_manager.inspect_registration_files(Path('/repo'), 'revision', approve_agents_mismatch=False),
+                        (hashlib.sha256(documents['AGENTS.md']).hexdigest(), False),
+                    )
+                    for path in ('docs/ARCHITECTURE.md', 'docs/PRODUCT.md'):
+                        original = documents[path]
+                        documents[path] = common(path.replace('.md', '.template.md'))
+                        with self.assertRaisesRegex(RuntimeError, '템플릿'):
+                            loop_manager.inspect_registration_files(Path('/repo'), 'revision', approve_agents_mismatch=False)
+                        documents[path] = original
+
     def test_registry_schema_does_not_commit_caller_transaction(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
@@ -119,7 +145,7 @@ class OriginRegistrationTests(unittest.TestCase):
             self.assertFalse(approved)
             self.assertEqual(
                 agents_hash,
-                loop_manager.file_hash(loop_manager.ROOT / "AGENTS.md"),
+                hashlib.sha256(loop_manager.git_bytes(repo, "show", f"{committed_agents}:AGENTS.md")).hexdigest(),
             )
 
             def validate(_path, **kwargs):

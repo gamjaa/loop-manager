@@ -100,6 +100,8 @@ class TimingAndManifestTests(unittest.TestCase):
             def test_unexpected(self):
                 pass
             def test_subtest(self):
+                with self.subTest(value=0):
+                    self.skipTest("fake subtest skip before failure")
                 with self.subTest(value=1):
                     self.fail("fake subtest")
         with tempfile.TemporaryDirectory() as directory:
@@ -107,6 +109,24 @@ class TimingAndManifestTests(unittest.TestCase):
         self.assertFalse(result.wasSuccessful())
         self.assertEqual(summary["counts"], {"success": 1, "failure": 2, "error": 1, "skip": 1,
                                            "expected_failure": 1, "unexpected_success": 1})
+
+    def test_skipped_subtest_completes_parent_without_fixture_skip(self):
+        class Case(unittest.TestCase):
+            def test_case(self):
+                with self.subTest(kind="unsupported"):
+                    self.skipTest("platform feature unavailable")
+                with self.subTest(kind="supported"):
+                    self.assertTrue(True)
+        case = Case("test_case")
+        with tempfile.TemporaryDirectory() as directory:
+            result, summary = self.run_suite(unittest.TestSuite([case]), Path(directory))
+        self.assertTrue(result.wasSuccessful())
+        self.assertEqual(result.completed, [case.id()])
+        self.assertEqual(summary["counts"], {"skip": 1})
+        self.assertEqual(summary["fixture_results"], [])
+        self.assertTrue(manifest.validate_report(
+            manifest.Module(__name__, (case.id(),)),
+            {"module": __name__, "passed": True, "completed": result.completed}))
 
     def test_truncated_event_preserves_active_test_without_false_completion(self):
         with tempfile.TemporaryDirectory() as directory:

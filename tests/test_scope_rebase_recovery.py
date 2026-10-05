@@ -228,7 +228,7 @@ class ScopeRebaseRecoveryTest(AgentScopeFixture, unittest.TestCase):
                 "--format=%(objectname)",
                 "refs/loop-manager/violations/",
             ).splitlines()
-            self.assertEqual(result, 1)
+            self.assertEqual(result, 1, dict(project))
             self.assertEqual(project["phase"], "WORKING")
             self.assertEqual(
                 project["last_error"],
@@ -520,7 +520,7 @@ class ScopeRebaseRecoveryTest(AgentScopeFixture, unittest.TestCase):
                 "FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
                 (str(repo),),
             ).fetchone()
-            self.assertEqual(result, 1)
+            self.assertEqual(result, 1, dict(project))
             self.assertEqual(project["phase"], "WORKING")
             self.assertEqual(
                 project["last_error"],
@@ -571,7 +571,7 @@ class BlockedAgentBaselineResumeUnitTests(unittest.TestCase):
             "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, priority, "
             "content_hash, status, branch, worktree, workspace_owned) "
             "VALUES ('repo', 'G-001', 'docs/plans/[G-001] Work.md', 'Work', '[]', '[]', "
-            "'high', 'hash', 'PLAN_BLOCKED', 'loop-manager/G-001', '/state/G-001', 1)"
+            "'high', 'hash', 'PLAN_BLOCKED', 'loop-manager/G-001', ?, 1)", (str(Path('/state/G-001')),)
         )
         connection.execute(
             "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
@@ -688,12 +688,12 @@ class BlockedAgentBaselineResumeUnitTests(unittest.TestCase):
             'a' * 40, 'loop-manager/G-001', {}, {}, {}, {}, {}, {})
         connection.execute(
             'INSERT INTO projects (repo, base_branch, phase, branch, worktree) '
-            "VALUES ('repo', 'main', 'PLAN_BLOCKED', 'loop-manager/G-001', '/state/G-001')")
+            "VALUES ('repo', 'main', 'PLAN_BLOCKED', 'loop-manager/G-001', ?)", (str(Path('/state/G-001')),))
         connection.execute(
             "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, priority, "
             "content_hash, status, branch, worktree, workspace_owned) "
             "VALUES ('repo', 'G-001', 'docs/plans/[G-001] Work.md', 'Work', '[]', '[]', "
-            "'high', 'hash', 'PLAN_BLOCKED', 'loop-manager/G-001', '/state/G-001', 1)")
+            "'high', 'hash', 'PLAN_BLOCKED', 'loop-manager/G-001', ?, 1)", (str(Path('/state/G-001')),))
         connection.execute(
             "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
             "VALUES ('repo', 'G-001', 'plan', 'default_worktree_mutation', 'saved cause')")

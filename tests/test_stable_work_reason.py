@@ -16,7 +16,7 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
         loop_manager._ensure_execplans_schema(connection)
         loop_manager.notifications.ensure_schema(connection)
         loop_manager.notifications.configure_session(connection, enabled=True)
-        repo = "/projects/alpha"
+        repo = str(Path("/projects/alpha").resolve())
         connection.execute(
             "INSERT INTO projects (repo, base_branch, planning_fingerprint, "
             "specification_fingerprint) VALUES (?, 'main', 'cycle-one', 'spec-one')",

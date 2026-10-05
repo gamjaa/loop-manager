@@ -402,7 +402,7 @@ class PlanningDocumentRelevanceTest(unittest.TestCase):
                        "docs/plans/[G-101] Other.md")
             objects = {("old", path): path + "-old" for path in changes}
             objects.update({("new", path): path + "-new" for path in changes})
-            current_path = str(current.relative_to(root))
+            current_path = current.relative_to(root).as_posix()
             for revision in ("old", "new"):
                 objects[(revision, current_path)] = "same-current"
 
@@ -421,7 +421,7 @@ class PlanningDocumentRelevanceTest(unittest.TestCase):
 
             rows = [{"plan_id": "G-100", "path": dependency}]
             result = relevant_document_changes(
-                git, root, root, "old", "new", [str(current.relative_to(root))], rows,
+                git, root, root, "old", "new", [current.relative_to(root).as_posix()], rows,
             )
             self.assertEqual(result, (product, dependency, source))
 
@@ -437,7 +437,7 @@ class PlanningDocumentRelevanceTest(unittest.TestCase):
                 if args[:2] == ("diff", "--name-only"):
                     return SimpleNamespace(stdout=source + "\0" + archive + "\0", returncode=0)
                 if args[:2] == ("ls-tree", "-r"):
-                    return SimpleNamespace(stdout=str(current.relative_to(root)) + "\0", returncode=0)
+                    return SimpleNamespace(stdout=current.relative_to(root).as_posix() + "\0", returncode=0)
                 if args[0] == "show":
                     return SimpleNamespace(stdout=current.read_text(), returncode=0)
                 revision, path = args[2].split(":", 1)
@@ -447,11 +447,11 @@ class PlanningDocumentRelevanceTest(unittest.TestCase):
                 return SimpleNamespace(stdout=value or "", returncode=0 if value else 1)
 
             result = relevant_document_changes(
-                git, root, root, "old", "new", [str(current.relative_to(root))], (),
+                git, root, root, "old", "new", [current.relative_to(root).as_posix()], (),
             )
             self.assertEqual(result, ())
             self.assertEqual(relevant_document_changes(
-                git, root, root, "old", "new", [str(current.relative_to(root))], (),
+                git, root, root, "old", "new", [current.relative_to(root).as_posix()], (),
                 include_active_requirements=True,
             ), ())
 
@@ -460,7 +460,7 @@ class PlanningDocumentRelevanceTest(unittest.TestCase):
             root = Path(directory)
             (root / "docs/plans").mkdir(parents=True)
             target = write_execplan(root, "G-118", "Current", depends_on=("G-100",))
-            target_path = str(target.relative_to(root))
+            target_path = target.relative_to(root).as_posix()
             dependency = "docs/plans/[G-100] Dependency.md"
             archived = "docs/plans/archive/[G-100] Dependency.md"
 
@@ -535,7 +535,7 @@ class PlanningDocumentRelevanceTest(unittest.TestCase):
             source = "docs/requirements/[R-051] 관련.md"
             unrelated = "docs/requirements/[R-052] 무관.md"
             plan = write_execplan(root, "G-118", "Current", sources=(source,))
-            path = str(plan.relative_to(root))
+            path = plan.relative_to(root).as_posix()
             content = plan.read_text()
             changes = (source, unrelated, "AGENTS.md")
 

@@ -92,7 +92,8 @@ class RuntimeReadOnlyIsolationTests(TestCase):
         with tempfile.TemporaryDirectory() as directory:
             boundary, state_root, home, observed, git = self.fixture(Path(directory))
             runtime = observed['selected']
-            connection = sqlite3.connect(':memory:')
+            database = state_root / 'command.db'
+            connection = sqlite3.connect(database)
             connection.row_factory = sqlite3.Row
             self.addCleanup(connection.close)
             state.ensure_schema(connection)
@@ -141,6 +142,11 @@ class RuntimeReadOnlyIsolationTests(TestCase):
             drafts.generation_prompt.assert_called_once_with(str(boundary.source), boundary.source,
                                                              'main', 'docs/PRODUCT.md')
             parse.assert_called_once_with('draft response')
+            with self.assertRaises(sqlite3.ProgrammingError):
+                connection.execute('SELECT 1')
+            connection = sqlite3.connect(database)
+            self.addCleanup(connection.close)
             row = connection.execute('''SELECT proof.status, proof.canonical_worktree, call.result_kind
                 FROM agent_isolation_evidence proof JOIN agent_invocations call USING(invocation_id)''').fetchone()
+            connection.close()
             self.assertEqual(tuple(row), ('verified', str(runtime), 'success'))

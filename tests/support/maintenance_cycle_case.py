@@ -135,7 +135,7 @@ class MaintenanceCycleCase(unittest.TestCase):
                     depends_on=dependencies,
                     priority=priority,
                 ),
-                encoding="utf-8",
+                encoding="utf-8", newline="\n",
             )
             paths.append(path)
         commit_and_push(repo_path, "Add maintenance integration catalog")
@@ -268,7 +268,7 @@ class MaintenanceCycleCase(unittest.TestCase):
         plans_dir = worktree / "docs/plans"
         (plans_dir / "[G-002] Extract Boundary.md").write_text(
             plan_text("G-002", "Extract Boundary"),
-            encoding="utf-8",
+            encoding="utf-8", newline="\n",
         )
         (plans_dir / "[G-001] Ready Feature.md").write_text(
             plan_text(
@@ -277,7 +277,7 @@ class MaintenanceCycleCase(unittest.TestCase):
                 depends_on=("G-002",),
                 priority=ready_priority,
             ),
-            encoding="utf-8",
+            encoding="utf-8", newline="\n",
         )
 
     def _enter_revalidation(

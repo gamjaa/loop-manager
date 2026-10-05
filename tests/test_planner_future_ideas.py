@@ -193,7 +193,7 @@ class PlannerFutureIdeasTest(unittest.TestCase):
                     if role_name == "planner":
                         (worktree / "docs/FUTURE_IDEAS.md").write_text(
                             "# Future Ideas\n\n- Deferred idea\n",
-                            encoding="utf-8",
+                            encoding="utf-8", newline="\n",
                         )
                         if with_plan:
                             (worktree / "docs/plans").mkdir(parents=True, exist_ok=True)

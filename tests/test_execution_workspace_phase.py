@@ -2,6 +2,7 @@
 
 from tests.support.execution import ExecutionFixture
 from dataclasses import replace
+from pathlib import Path
 from unittest import TestCase
 
 import loop_manager as lm
@@ -45,7 +46,7 @@ class ExecutionWorkspacePhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseSce
         row = self.state.row()
         self.assertEqual(row['worker_session_id'], 'worker-session')
         self.assertEqual(row['worker_result'], 'saved result')
-        self.assertEqual(row['worktree'], '/state/G-047')
+        self.assertEqual(row['worktree'], str(Path('/state/G-047')))
         self.effects.blocking.block_active_execplan_from_revision.assert_not_called()
         self.assertEqual(self.connection.execute(
             "SELECT COUNT(*) FROM blocked_checkpoints WHERE repo = 'repo'"

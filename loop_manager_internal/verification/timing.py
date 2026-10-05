@@ -91,7 +91,7 @@ class TimedResult(unittest.TextTestResult):
 
     def addSkip(self, test, reason):
         super().addSkip(test, reason)
-        self._outcome(test, "skip")
+        self._outcome(getattr(test, "test_case", test), "skip")
 
     def addExpectedFailure(self, test, err):
         super().addExpectedFailure(test, err)

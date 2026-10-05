@@ -133,7 +133,7 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
         self.assertEqual(row['worker_session_id'], 'worker-session')
         self.assertEqual(row['reviewer_session_id'], 'reviewer-session')
         self.assertEqual(row['branch'], 'loop-manager/G-047')
-        self.assertEqual(row['worktree'], '/state/G-047')
+        self.assertEqual(row['worktree'], str(Path('/state/G-047')))
 
 
     def test_conflict_revision_dependency_merge_resumes_worker(self):
@@ -193,7 +193,7 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
         self.assertEqual(self.state.row()['phase'], 'WORKING')
         self.assertIsNone(self.state.row()['worker_result'])
         self.assertEqual(self.state.row()['branch'], 'loop-manager/G-047')
-        self.assertEqual(self.state.row()['worktree'], '/state/G-047')
+        self.assertEqual(self.state.row()['worktree'], str(Path('/state/G-047')))
         self.effects.validation.verify.assert_not_called()
         latest_plan = self.handler._cached_plan(self.handler.catalog_plan)
         rerun = self._dispatch_conflict_revision(latest_plan)

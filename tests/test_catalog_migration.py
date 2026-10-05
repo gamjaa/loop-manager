@@ -346,6 +346,7 @@ class CatalogMigrationTest(AutomationCatalogFixture, unittest.TestCase):
     def test_fresh_recovery_rejects_archive_tampered_before_first_observation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = make_remote_repository(directory)
+            git_command(root, "config", "core.autocrlf", "false")
             (root / "docs/plans").mkdir()
             active = write_execplan(root, "G-001", "Tampered Archive")
             original_hash = hashlib.sha256(active.read_bytes()).hexdigest()
@@ -415,6 +416,7 @@ class CatalogMigrationTest(AutomationCatalogFixture, unittest.TestCase):
     def test_archived_merged_row_recovers_from_stored_state_and_git_ancestry(self):
         with tempfile.TemporaryDirectory() as directory:
             root = make_remote_repository(directory)
+            git_command(root, "config", "core.autocrlf", "false")
             (root / "docs/plans").mkdir()
             active = write_execplan(root, "G-001", "Stored Merge")
             commit_and_push(root, "Add stored merge plan")

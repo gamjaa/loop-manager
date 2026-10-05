@@ -84,7 +84,7 @@ class EvidenceFreeBlockedScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
         self.case.state.update_project('repo', agent_snapshot=self.original.serialize(), publication_remote_oid='owned-head')
         lm.blocked_checkpoint_state.BlockedCheckpointRepository(self.case.fixture.connection).request(
             repo='repo', plan_id='G-047', reason_code='verify_retry_exhausted', evidence='original cause',
-            branch='loop-manager/G-047', worktree='/state/G-047', expected_remote_oid='remote', rebase_recovery=False)
+            branch='loop-manager/G-047', worktree=str(Path('/state/G-047').resolve()), expected_remote_oid='remote', rebase_recovery=False)
 
     def test_owned_checkpoint_tracking_update_does_not_rewrite_original_agent_snapshot(self):
         self._published_tracking_ref()

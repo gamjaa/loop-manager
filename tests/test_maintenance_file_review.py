@@ -466,6 +466,7 @@ class ProvisionalFileReviewTest(unittest.TestCase):
         self.assertEqual(self.state(inventory).completed, ())
         self.finish(source)
         (self.repo / source.path).chmod(0o755)
+        self.git("update-index", "--chmod=+x", "--", source.path)
         changed = self.publish({})
         current = self.state(changed)
         self.assertEqual(current.completed, ())

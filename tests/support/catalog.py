@@ -46,7 +46,7 @@ risk: {risk}
 
 Test plan.
 """,
-        encoding="utf-8",
+        encoding="utf-8", newline="\n",
     )
     return plan
 

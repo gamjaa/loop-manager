@@ -187,11 +187,12 @@ def _atomic_restore_file(
             os.fsync(handle.fileno())
         os.chmod(temporary, mode)
         os.replace(temporary, target)
-        directory_fd = os.open(target.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
+        if os.name != "nt":
+            directory_fd = os.open(target.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
     except OSError as error:
         raise AgentScopeError(
             f"BLOCKED ExecPlan 사용자 변경 원자적 복원 실패: {error}"

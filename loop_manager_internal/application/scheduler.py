@@ -2,6 +2,7 @@
 from __future__ import annotations
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from dataclasses import dataclass
 from loop_manager_internal.application.contracts import ProjectRunKind
 from loop_manager_internal.application.contracts import ProjectRunResult
@@ -55,7 +56,7 @@ def _run_registered_project(
         # The scheduler connection completed migrations before starting any
         # project threads. Repeating DDL here races with another project's
         # state transaction and can fail with SQLITE_BUSY.
-        with effects.connect_database(state_dir, run_migrations=False) as connection:
+        with closing(effects.connect_database(state_dir, run_migrations=False)) as connection, connection:
             notifications.configure_session(
                 connection, enabled=bool(telegram_token and telegram_chat_id)
             )

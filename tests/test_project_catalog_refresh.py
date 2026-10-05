@@ -18,7 +18,10 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
     def setUp(self):
         self.fixture = fixtures.catalog_reconciliation_fixture(self)
         self.connection = self.fixture.connection
-        self.repo = '/repo'
+        self.repo = str(Path('/repo').resolve())
+        self.connection.execute('UPDATE projects SET repo = ?', (self.repo,))
+        self.connection.execute('UPDATE exec_plans SET repo = ?', (self.repo,))
+        self.connection.commit()
         self.sha = 'b' * 40
         self.loads = []
         self.documents = {

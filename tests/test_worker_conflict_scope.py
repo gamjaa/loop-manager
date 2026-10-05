@@ -10,22 +10,22 @@ import loop_manager
 class WorkerConflictScopeUnitTests(unittest.TestCase):
     def setUp(self):
         from types import SimpleNamespace
-        self.repo, self.worktree = Path('/repo'), Path('/managed')
+        self.repo, self.worktree = Path('/repo').resolve(), Path('/managed').resolve()
         self.connection = sqlite3.connect(':memory:')
         self.connection.row_factory = sqlite3.Row
         self.addCleanup(self.connection.close)
         self.connection.execute(loop_manager.SCHEMA)
         loop_manager._ensure_execplans_schema(self.connection)
-        self.connection.execute("INSERT INTO projects (repo, base_branch) VALUES ('/repo', 'main')")
+        self.connection.execute("INSERT INTO projects (repo, base_branch) VALUES (?, 'main')", (str(self.repo),))
         self.connection.execute("INSERT INTO exec_plans (repo, plan_id, path, title, sources, "
             "depends_on, priority, content_hash, status, branch, worktree, workspace_owned) VALUES "
-            "('/repo', 'G-092', 'docs/plans/[G-092] Work.md', 'Work', '[]', '[]', 'normal', 'hash', "
-            "'IMPLEMENTING', 'loop-manager/G-092', '/managed', 1)")
+            "(?, 'G-092', 'docs/plans/[G-092] Work.md', 'Work', '[]', '[]', 'normal', 'hash', "
+            "'IMPLEMENTING', 'loop-manager/G-092', ?, 1)", (str(self.repo), str(self.worktree)))
         self.plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
         self.before = loop_manager.GitSnapshot('partial', None,
             {'app.py': tuple(f'M 100644 old-{stage} {stage}' for stage in (1, 2, 3))}, {},
             {'refs/heads/loop-manager/G-092': ('before', '')},
-            {'/managed': ('HEAD=partial', 'detached=True')}, {}, {'rebase-merge': 'owned'})
+            {str(self.worktree): ('HEAD=partial', 'detached=True')}, {}, {'rebase-merge': 'owned'})
         self.after = replace(self.before, index={'app.py': ('H 100644 resolved 0',)},
                              dirty={'app.py': (('staged',), 'resolved-file')})
         self.service = mock.Mock()
@@ -69,11 +69,11 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
     def completed_rebase(self):
         from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
         ExecutionCheckpointRepository(self.connection).record(
-            '/repo', 'G-092', expected_generation=0, operation='rebase',
+            str(self.repo), 'G-092', expected_generation=0, operation='rebase',
             expected_head='before', target_base_oid='base', observed_remote_oid='remote', snapshot={})
         self.after = replace(self.after, head='completed', branch='loop-manager/G-092',
             dirty={}, operations={}, refs={'refs/heads/loop-manager/G-092': ('completed', '')},
-            worktrees={'/managed': ('HEAD=completed', 'branch=refs/heads/loop-manager/G-092')})
+            worktrees={str(self.worktree): ('HEAD=completed', 'branch=refs/heads/loop-manager/G-092')})
         self.completion_observation = SimpleNamespace(head='completed',
             repository_state_fingerprint=loop_manager.managed_rebase_validation.fingerprint({
                 'refs': self.after.refs, 'worktrees': self.after.worktrees, 'config': self.after.config}))
@@ -102,11 +102,11 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
         from tests.support.rebase_observations import expectation, observation, scope_for
         self.completed_rebase()
         expected = expectation(plan_id='G-092', plan_path=self.plan['path'],
-            worktree='/managed', branch='loop-manager/G-092')
+            worktree=str(self.worktree), branch='loop-manager/G-092')
         expected = replace(expected, remote=replace(expected.remote, branch=expected.branch))
         observed = observation(expected, head=self.after.head,
             branch_ref=self.after.refs[f'refs/heads/{expected.branch}'],
-            registration=self.after.worktrees['/managed'],
+            registration=self.after.worktrees[str(self.worktree)],
             repository_state_fingerprint=self.completion_observation.repository_state_fingerprint)
         service = ManagedRebaseService(expected, mock.Mock())
         with mock.patch.object(loop_manager, '_current_rebase_service', return_value=service), \
@@ -131,14 +131,14 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
         from tests.support.rebase_observations import expectation, observation, decision_for
         self.completed_rebase()
         expected = expectation(plan_id='G-092', plan_path=self.plan['path'],
-            worktree='/managed', branch='loop-manager/G-092')
+            worktree=str(self.worktree), branch='loop-manager/G-092')
         expected = replace(expected, remote=replace(expected.remote, branch=expected.branch))
         observed = observation(expected, head=self.after.head, branch_ref=('completed', ''),
-            registration=self.after.worktrees['/managed'])
+            registration=self.after.worktrees[str(self.worktree)])
         acceptance = decision_for(expected, observed).acceptance
         checkpoints = ExecutionCheckpointRepository(self.connection)
-        current = checkpoints.get('/repo', 'G-092')
-        checkpoints.record('/repo', 'G-092', expected_generation=current.generation,
+        current = checkpoints.get(str(self.repo), 'G-092')
+        checkpoints.record(str(self.repo), 'G-092', expected_generation=current.generation,
             operation=None, expected_head='completed', target_base_oid='base',
             observed_remote_oid='remote', snapshot={'current_rebase_acceptance': acceptance})
         before_serialized, after_serialized = self.before.serialize(), self.after.serialize()

@@ -81,7 +81,7 @@ class ExecutionFixture:
         self.addCleanup(self.connection.close)
         self.repository = runtime_state.RuntimeStateRepository(self.connection)
         self.repository.activate('repo', 'G-047', activation_sha='base',
-                                 branch='loop-manager/G-047', worktree='/state/G-047')
+                                 branch='loop-manager/G-047', worktree=str(Path('/state/G-047')))
         self.state = ExecutionStatePort(self.connection, self.repository, 'repo')
         # Existing saved-session fixtures represent sessions started by this
         # configured provider; explicit None still exercises legacy recovery.

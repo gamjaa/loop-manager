@@ -29,7 +29,7 @@ class CheckpointRecoveryBoundaryRegressionTests(unittest.TestCase):
         self.snapshot = loop_manager.GitSnapshot('published', 'loop-manager/G-047', {}, {}, {}, {}, {}, {})
         self.connection.execute(
             "UPDATE exec_plans SET status = 'PLAN_BLOCKED', branch = 'loop-manager/G-047', "
-            "worktree = '/state/G-047', blocked_reason = 'verify_retry_exhausted'")
+            "worktree = ?, blocked_reason = 'verify_retry_exhausted'", (str(Path('/state/G-047')),))
         self.connection.execute('UPDATE projects SET planning_attempt_fingerprint = NULL')
         self.connection.commit()
 
@@ -85,7 +85,7 @@ class CheckpointRecoveryBoundaryRegressionTests(unittest.TestCase):
 
     def test_guidance_double_block_restores_reason_and_request_identity(self):
         reason, evidence = 'managed_worktree_scope_violation', 'guidance wait'
-        branch, worktree = self.snapshot.branch, '/state/G-047'
+        branch, worktree = self.snapshot.branch, str(Path('/state/G-047'))
         self.connection.execute(
             "UPDATE exec_plans SET blocked_reason = ?, guidance_plan_hash = 'guidance-hash', "
             "publication_remote_oid = 'published', worker_session_id = 'session', "
@@ -142,7 +142,9 @@ class WorkspaceEffectBoundaryTests(unittest.TestCase):
         from loop_manager_internal.git import workspace_service
         from loop_manager_internal.agents import scope_observation
         raw_names = [b' leading.txt', b'tab\tname', b'line\nname',
-                     b'carriage\rname', b'back\\slash', b'raw-\xff']
+                     b'carriage\rname', b'back\\slash', '한글.txt'.encode('utf-8')]
+        if os.name != 'nt':
+            raw_names.append(b'raw-\xff')  # POSIX에서만 유효한 비 UTF-8 파일명도 보존한다.
         names = {os.fsdecode(name) for name in raw_names}
         effects = fake_effects(workspace_service.ChangedFilesEffects)
         raw_effects = fake_effects(scope_observation.ObservationEffects)

@@ -256,6 +256,8 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 if executable:
                     target.chmod(0o755)
                 git(worktree, 'add', '--', path)
+                if executable:
+                    git(worktree, 'update-index', '--chmod=+x', '--', path)
                 git(worktree, 'commit', '-m', title)
 
             commit('notes.txt', 'independent\n', 'Independent first commit')
@@ -452,6 +454,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 (worktree / 'app.txt').chmod(0o755)
                 (worktree / 'notes.txt').write_text('independent\n')
                 git(worktree, 'add', '--', 'app.txt', 'notes.txt')
+                git(worktree, 'update-index', '--chmod=+x', '--', 'app.txt')
                 git(worktree, 'commit', '-m', 'Publication boundary candidate')
             else:
                 handler._rebase_latest(handler._context(), handler._row(), target, publishing=with_pr)

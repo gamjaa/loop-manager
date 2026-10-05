@@ -43,7 +43,7 @@ class WorkerPublicationValidationTest(unittest.TestCase):
         with mock.patch("loop_manager.operation_log") as operation_log:
             loop_manager.log_base_worktree_sync(Path("/source"), result)
         operation_log.assert_called_once_with(
-            "기본 worktree 동기화 equal (/source): 이미 원격 base와 같음",
+            f"기본 worktree 동기화 equal ({Path('/source')}): 이미 원격 base와 같음",
             error=False,
         )
 

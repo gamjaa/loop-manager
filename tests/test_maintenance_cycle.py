@@ -152,7 +152,7 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
 
         self.assertIsNone(coordinator._selection._select_planning_work(run))
         ports.state.settle_empty_stabilization_assessment.assert_called_once_with(
-            "/repo", 20, source_sha=source, repository_path="/repo",
+            "/repo", 20, source_sha=source, repository_path=str(Path("/repo")),
             base_branch="main", inventory=empty_inventory,
         )
         ports.state.begin_maintenance_assessment.assert_not_called()
@@ -1001,7 +1001,7 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
                             "Extract Boundary",
                             depends_on=("G-000",),
                         ),
-                        encoding="utf-8",
+                        encoding="utf-8", newline="\n",
                     )
                     (plans_dir / "[G-002] Pending Capability.md").write_text(
                         plan_text(
@@ -1021,7 +1021,7 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
                                 "module boundary."
                             ),
                         ),
-                        encoding="utf-8",
+                        encoding="utf-8", newline="\n",
                     )
                     return loop_manager.CodexResult(
                         0,
@@ -1140,14 +1140,16 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
 
     def test_active_or_due_cycle_blocks_project_completion_notification(self):
         connection = self._connection()
+        repo = str(Path("/one").resolve())
+        connection.execute("UPDATE projects SET repo = ? WHERE repo = '/one'", (repo,))
         connection.execute(
             "UPDATE projects SET planning_fingerprint = 'cycle-one', "
-            "specification_fingerprint = 'spec-one', processed_sha = ? WHERE repo = '/one'",
-            ("a" * 40,),
+            "specification_fingerprint = 'spec-one', processed_sha = ? WHERE repo = ?",
+            ("a" * 40, repo),
         )
-        planning_input_state.record_general(connection, "/one", "a" * 40, {})
+        planning_input_state.record_general(connection, repo, "a" * 40, {})
         repository = maintenance_state.MaintenanceRepository(connection)
-        cycle, _ = self._legacy_cycle(connection, "/one", "a" * 40)
+        cycle, _ = self._legacy_cycle(connection, repo, "a" * 40)
         with mock.patch.object(loop_manager, "_run_project_step", return_value=0), mock.patch.object(
             loop_manager.notifications, "enqueue_completion_if_ready"
         ) as enqueue, mock.patch.object(
@@ -1161,7 +1163,7 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
             result = loop_manager.run_project_result(
                 connection,
                 Path("/state"),
-                "/one",
+                repo,
                 Path("/config.ini"),
                 None,
                 False,
@@ -1170,7 +1172,7 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
             enqueue.assert_not_called()
 
             repository.advance_success_baseline(
-                "/one",
+                repo,
                 expected_phase=cycle.phase,
                 expected_revision=cycle.revision,
                 remote_commit="a" * 40,
@@ -1178,10 +1180,10 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
             result = loop_manager.run_project_result(
                 connection,
                 Path("/state"),
-                "/one",
+                repo,
                 Path("/config.ini"),
                 None,
                 False,
             )
             self.assertEqual(result.kind, loop_manager.ProjectRunKind.COMPLETED)
-            enqueue.assert_called_once_with(connection, "/one", mock.ANY)
+            enqueue.assert_called_once_with(connection, repo, mock.ANY)

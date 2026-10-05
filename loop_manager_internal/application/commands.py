@@ -2,6 +2,7 @@
 from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
+from contextlib import closing
 from loop_manager_internal.agents.agent_invocation import InvocationContext
 from loop_manager_internal.runtime import project_registry
 from loop_manager_internal.runtime.contracts import RuntimeMutation
@@ -27,12 +28,12 @@ def configure_registry(
 ) -> int:
     if args.config_command == "init":
         effects.load_managed_config(config_path)
-        with effects.connect_database(state_dir, create=True):
+        with closing(effects.connect_database(state_dir, create=True)) as connection, connection:
             pass
         effects.operation_print(f"상태 DB 초기화 완료: {state_dir / 'loop-manager.db'}")
         return 0
 
-    with effects.connect_database(state_dir) as connection:
+    with closing(effects.connect_database(state_dir)) as connection, connection:
         if args.config_command == "list":
             projects = project_registry.list_projects(connection)
             if not projects:
@@ -90,7 +91,7 @@ def _document_drafts_command(
             "일회성 문서 수정본은 Loop Manager 저장소 자체에서만 사용할 수 있습니다."
         )
     repo = str(repository)
-    with effects.connect_database(state_dir) as connection:
+    with closing(effects.connect_database(state_dir)) as connection, connection:
         project = connection.execute(
             "SELECT base_branch, provider FROM projects WHERE repo = ? AND registered = 1",
             (repo,),
@@ -207,7 +208,7 @@ def execute_runtime_command(
 ) -> int:
     config = effects.load_managed_config(config_path)
     if args.command == "init":
-        with effects.connect_database(state_dir, create=True):
+        with closing(effects.connect_database(state_dir, create=True)) as connection, connection:
             pass
         effects.operation_print(f"상태 DB 초기화 완료: {state_dir / 'loop-manager.db'}")
         return 0
@@ -219,7 +220,7 @@ def execute_runtime_command(
         from uuid import uuid4
         from loop_manager_internal.maintenance import tiered_review
         repo = str(Path(args.repository).expanduser().resolve())
-        with effects.connect_database(state_dir) as connection:
+        with closing(effects.connect_database(state_dir)) as connection, connection:
             if not connection.execute("SELECT 1 FROM projects WHERE repo = ? AND registered = 1", (repo,)).fetchone():
                 raise ValueError("전체 정밀 점검은 등록된 프로젝트만 요청할 수 있습니다.")
             tiered_review.ensure_schema(connection)
@@ -228,7 +229,7 @@ def execute_runtime_command(
             connection.commit()
         effects.operation_print(f"전체 정밀 점검 요청 저장: {repo}; 다음 안전한 작업 선택 경계에서 실행합니다.")
         return 0
-    with effects.connect_database(state_dir) as connection:
+    with closing(effects.connect_database(state_dir)) as connection, connection:
         agent_invocation_state.InvocationRepository(connection).reconcile_interrupted()
         return effects.run_registered_projects(
             connection, state_dir, config,

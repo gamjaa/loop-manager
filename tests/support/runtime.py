@@ -1,3 +1,4 @@
+from pathlib import Path
 from tests.support.database import runtime_connection
 import dataclasses
 from loop_manager_internal.storage import runtime_state
@@ -10,7 +11,7 @@ def runtime_rebase_fixture(test, *, legacy=False):
     test.addCleanup(connection.close)
     runtime = runtime_state.RuntimeStateRepository(connection)
     runtime.activate('repo', 'G-047', activation_sha='old-base',
-                     branch='loop-manager/G-047', worktree='/owned')
+                     branch='loop-manager/G-047', worktree=str(Path('/owned')))
     runtime.reserve_workspace('repo', 'G-047', reserved_value=1, allowed_values=(1,))
     current = runtime.projected('repo')
     checkpoint = ExecutionCheckpointRepository(connection)

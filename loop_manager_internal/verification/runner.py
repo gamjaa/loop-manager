@@ -57,7 +57,7 @@ def worker_main():
                                 break
                 report = {"module": module.name, "passed": result.wasSuccessful(),
                           "completed": result.completed, "memory": process_memory()}
-                fixture_skips = {test.id() for test, _reason in result.skipped if test.id() not in result.completed}
+                fixture_skips = {test.id() for test, _reason in result.skipped if getattr(test, "test_case", test).id() not in result.completed}
                 report["fixture_skip_sources"] = sorted(fixture_skips)
                 report["fixture_skipped"] = [identity for identity, (owner, klass) in owners.items()
                     if identity not in result.completed and
