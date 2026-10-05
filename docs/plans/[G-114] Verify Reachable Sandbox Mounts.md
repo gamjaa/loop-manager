@@ -56,8 +56,8 @@ Codex 내장 도구 sandbox의 경계 확인에서 무관하거나 접근 불가
 
 - [x] 과거 작업 기록: 이전 mount gate 수정·targeted unit test 9개 및 agent-write-boundary-v1 envelope 확인 (현재 정책·revision의 검증 결과가 아님)
 - [x] 2026-10-05 지정 READY snapshot의 선언 경로 목표와 최신 운영체제별 probe·호출 gate·테스트 참조를 원본으로 재검증함 (구현·테스트 실행 아님)
-- [ ] 현재 선언된 경로 probe와 Acceptance Criteria 대조 및 빠진 오탐·거부 회귀만 보완
-- [ ] 변경한 경계의 targeted 검증 또는 변경 없음 근거 기록
+- [x] 현재 선언된 경로 probe와 Acceptance Criteria 대조 및 빠진 오탐·거부 회귀만 보완
+- [x] 변경한 경계의 targeted 검증 또는 변경 없음 근거 기록
 - [ ] Manager 전체 verify, 독립 Review 및 사용자 Merge
 
 ## Decision Log
@@ -70,3 +70,6 @@ Codex 내장 도구 sandbox의 경계 확인에서 무관하거나 접근 불가
 - 2026-10-03 사용자 요청에 따른 정책 정합성 수정: 대기 중인 모든 계획을 현재 정책에 맞춰 수정하라는 지시에 따라, PRODUCT/R-050이 제외한 전체 mount·privilege·namespace 증명 조건을 현재 Acceptance Criteria·Implementation·Validation에서 제거하고 원래 오탐 방지 문제를 선언된 경로 검사로 한정했다. 이는 유지보수 Planner가 독자적으로 목표를 축소한 결과가 아니라 사용자 요청에 따른 기존 계획 편집이다. ID·경로·title·dependency는 유지하며 sources에 R-050을 추가했다. 위 2026-10-01 mount gate 기록과 2026-10-02 목표 보존 결정 중 현재 정책과 충돌하는 부분은 이 결정으로 대체하며 과거 기록은 보존한다. SQLite와 실행 상태는 수정하지 않는다.
 
 - 2026-10-05 post-refactor revalidation: source revision `c203b1437537b868862a104e668586d392c5ad0a`의 `loop_manager_internal/agents/agent_sandbox_exec.py:50`, `agent_codex_sandbox.py:60`, `agent_write_isolation.py:209`와 `tests/test_codex_native_invocation.py:21`·`tests/test_native_platform_agents.py:102`를 원본으로 대조했다. 선언 경로 검사·provider 없는 독립 probe는 유지되고 Windows·macOS의 native 거부 확인 및 별도 플랫폼 테스트가 추가돼 있으므로 구현·검증 참조만 연결했다. ID·경로·title·sources·complexity·risk·priority·Purpose·Acceptance Criteria·dependency와 과거 기록은 보존한다. 전체 mount 증명, 새로운 정책·인증·process infrastructure 및 Worker의 전체 verify 실행을 추가하지 않으며 과거 결과를 현재 검증 성공으로 채택하지 않는다.
+
+- 2026-10-05 구현 대조: `agent_sandbox_exec.check_boundary`는 선언된 보호 경로에만 OS별 거부 검사를 적용하고 보호 파일은 비truncate open, 허용 쓰기는 소유 scratch로 확인한다. `main`은 누락·조회 오류에 성공 표식을 내지 않으며 `CodexLaunch.probe`는 종료 코드와 정확한 v2 표식을 함께 요구한다. `prepare_isolation`의 호출별 rejected 증거와 provider 시작 전 검사, `assert_current`의 변경 거부 및 `invocation_service`의 실패 기록은 기존 책임에서 요구사항을 충족하므로 운영 코드는 변경하지 않았다. mount parser·하위 트리 탐색·정책 확대를 추가하지 않았다.
+- 2026-10-05 회귀 보완·검증: 기존 두 테스트 모듈과 `native_agent_boundary`를 재사용했다. 선언 경로만 조회하고 mount 표·하위 트리를 읽지 않는 사례, 보호 경로 누락·ENOENT/EACCES/EIO 조회 실패, 기존 작업 파일과 보호 `.git` 내용 보존, Windows·macOS에서 Linux filesystem 조회를 하지 않는 사례를 보완했다. 파일 open은 EACCES/EPERM/EROFS만 성공 증거로 인정하며 쓰기 허용·ENOENT/EIO/EINVAL은 거부함을 확인했다. Linux/Darwin/Windows 환경 double의 Worker·Reviewer 신규·재개 호출에서 실패 코드·v1·불명확한 v2 출력은 provider 시작 전에 rejected로 기록되고 이전 호출·증거·session·attempt·로그·작업물이 보존됨을 확인했다. 변경한 `NativeWriteIsolationTests` 3개 case와 `NativePlatformAgentTests` 3개 case만 Agent 차단 guard와 `python3 -B -m unittest -v`로 실행해 6개 모두 통과했다. Windows·macOS의 실제 native sandbox는 Linux 실행 환경에서 실행하지 않았고 정책 조회는 기존 double을 사용했다. 기존 `scripts/verify.sh`와 runner의 unittest discovery·Agent 차단은 두 모듈을 포함하므로 수정하지 않았으며 전체 verify는 실행하지 않았다.
