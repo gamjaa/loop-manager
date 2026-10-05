@@ -261,18 +261,13 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             + "\n"
         )
 
-        class StartedOutput:
-            def __iter__(self):
-                return iter(stream.splitlines(keepends=True))
-
-            def close(self):
-                pass
-
         class StartedProcess:
             def __init__(self, arguments, **kwargs):
                 calls.append((arguments, kwargs))
                 self.stdin = mock.Mock()
-                self.stdout = StartedOutput()
+                self.stdout = io.StringIO(
+                    resumed_payload + "\n" if "--resume" in arguments else stream
+                )
 
             def wait(self):
                 return 0
@@ -289,10 +284,6 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             }
         )
 
-        def resumed(arguments, **kwargs):
-            calls.append((arguments, kwargs))
-            return subprocess.CompletedProcess(arguments, 0, stdout=resumed_payload)
-
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             worktree = root / "worktree"
@@ -307,8 +298,6 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
                 return_value=("claude-opus-5", "high"),
             ), mock.patch(
                 "loop_manager.subprocess.Popen", side_effect=StartedProcess
-            ), mock.patch(
-                "loop_manager.subprocess.run", side_effect=resumed
             ):
                 started = loop_manager.run_claude(
                     worktree,
@@ -348,7 +337,9 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
         self.assertNotIn("worker prompt", start_arguments)
         self.assertEqual(start_options["cwd"], worktree)
         self.assertIn("--resume", resume_arguments)
+        self.assertIn("stream-json", resume_arguments)
         self.assertIn(session_id, resume_arguments)
+        self.assertEqual(resume_options["stdout"], subprocess.PIPE)
         self.assertEqual(
             resume_arguments[
                 resume_arguments.index("--permission-mode") + 1

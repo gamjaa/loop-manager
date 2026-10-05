@@ -1,4 +1,5 @@
 import json
+import io
 import os
 import subprocess
 import tempfile
@@ -123,8 +124,18 @@ class PlannerSessionsTest(unittest.TestCase):
         def resumed(arguments, **kwargs):
             observed["arguments"] = arguments
             observed["cwd"] = kwargs["cwd"]
+            self.assertEqual(kwargs["stdout"], subprocess.PIPE)
+            self.assertNotIn("-o", arguments)
             (kwargs["cwd"] / "resume-output.txt").write_text("managed\n", encoding="utf-8")
-            return subprocess.CompletedProcess(arguments, 0)
+            process = mock.Mock()
+            process.stdin = io.StringIO()
+            process.stdout = io.StringIO(
+                json.dumps({"type": "item.completed", "item": {
+                    "type": "agent_message", "text": "VERDICT: PASS",
+                }}) + "\n"
+            )
+            process.wait.return_value = 0
+            return process
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -135,7 +146,7 @@ class PlannerSessionsTest(unittest.TestCase):
             state_dir = root / "state"
             with mock.patch(
                 "loop_manager.role", return_value=("gpt-5.6-sol", "high")
-            ), mock.patch("loop_manager.subprocess.run", side_effect=resumed):
+            ), mock.patch("loop_manager.subprocess.Popen", side_effect=resumed):
                 result = loop_manager.run_codex(
                     worktree,
                     state_dir,
@@ -147,6 +158,7 @@ class PlannerSessionsTest(unittest.TestCase):
                 )
 
             self.assertEqual(result.code, 0)
+            self.assertEqual(result.message, "VERDICT: PASS")
             self.assertEqual(observed["cwd"], worktree)
             self.assertTrue((worktree / "resume-output.txt").is_file())
             self.assertFalse((base / "resume-output.txt").exists())
