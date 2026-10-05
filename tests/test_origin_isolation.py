@@ -282,7 +282,7 @@ class OriginIsolationScopeTest(OriginScopeFixture, unittest.TestCase):
                             runtime_mutation=identity,
                         )
                 self.assertEqual(
-                    git(source, "worktree", "list", "--porcelain").count(str(runtime.path)), 1,
+                    git(source, "worktree", "list", "--porcelain").count(runtime.path.as_posix()), 1,
                 )
             connection.close()
 
@@ -432,7 +432,7 @@ class OriginIsolationScopeTest(OriginScopeFixture, unittest.TestCase):
             result = loop_manager.run_project_result(
                 connection,
                 Path("/state"),
-                "/repo",
+                str(Path("/repo").resolve()),
                 Path("/config.ini"),
                 None,
                 False,
@@ -443,7 +443,7 @@ class OriginIsolationScopeTest(OriginScopeFixture, unittest.TestCase):
             connection.execute(
                 "SELECT reason_code, pending_action FROM recovery_records "
                 "WHERE repo = ? AND subject = '__project__'",
-                ("/repo",),
+                (str(Path("/repo").resolve()),),
             ).fetchone(),
             ("git_lock", "pause"),
         )
