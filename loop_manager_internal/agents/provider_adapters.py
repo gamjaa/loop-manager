@@ -177,7 +177,7 @@ def run_codex(
     # Preserve the previous result until native policy preflight accepts the call.
     provider_last_message = (codex_launch.attempt / "last-message.txt"
                              if codex_launch else last_message)
-    if codex_launch is None or role_name == "reviewer":
+    if codex_launch is None:
         last_message.unlink(missing_ok=True)
     permissions = (list(isolation_arguments) if isolation_arguments is not None
                    else codex_sandbox_arguments(read_only))
