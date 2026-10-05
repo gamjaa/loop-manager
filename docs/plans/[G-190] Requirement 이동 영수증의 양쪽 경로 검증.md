@@ -36,10 +36,12 @@ priority: critical
 ## Progress
 
 - [x] 2026-10-05 기준 a049a76의 planner_validation·workspace_service·retirement·publication 원본과 기존 unit 근거를 대조했다. 과거 내용 보존 이동 b6a0387의 읽기 전용 Git diff는 기본 name-only에서 목적지만, no-renames에서 두 경로를 반환한다. 구현·테스트 실행은 하지 않았다.
-- [ ] 구현 및 관련 targeted unit 검증
+- [x] `changed_files`는 `--no-renames`로 양쪽 경로를 반환한다. planning 검증은 현재 index·worktree 변경도 관측하고, 저장된 dirty 목록만으로 영수증 경로를 인정하지 않는다. commit 검증도 기존 NUL 경로 helper로 공백·한글 경로를 보존한다.
+- [x] 2026-10-05 targeted unit test 51개 통과. `test_planning_requirement_moves`의 archive·복원/unstaged·staged·committed/rename 설정/단독·혼합 24가지 조합과 재시작·manifest·원문 검증, 위반 거부 및 기존 retirement·workspace·Planner 권한 회귀를 확인했다.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
 
 - 알려진 관측 계약과 기존 helper를 연결하므로 complexity medium이다. Requirement 복원·이동 게시가 막히거나 범위 검사를 잘못 완화할 영향으로 risk high, 현재 자동 planning 게시를 막는 오류이므로 priority critical이다.
 - 현재 R-002 복원은 Manager 소유의 미게시 작업이다. Planner는 원문·index·영수증을 변경하지 않으며, 원격 복원 확인 전 R-002의 후속 구현 계획을 만들지 않는다. 이 계획은 활성 R-068·R-055의 이동·재개 계약만 다룬다.
+- 사용자는 이 세션에서 targeted test 성공 후 PR 등록과 G-190의 실제 `PR_OPEN` DB 연결을 직접 요청했다. 전체 verify·Reviewer 성공은 미실행으로 남기며, 기존 planning 오류·Requirement 영수증·다른 계획의 상태는 보존한다. 기존 verify 스크립트는 unittest discovery로 새 회귀 모듈을 자동 포함하므로 변경하지 않는다.

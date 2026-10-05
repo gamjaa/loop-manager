@@ -191,10 +191,13 @@ def validate_planner_result(
     dedicated exception. Operational Git failures must retain their normal
     recovery boundary and never consume the Planner validation retry budget.
     """
-    observed = set(dirty_files) | set(effects.changed_files(worktree, active_sha))
+    # A resumed batch can still have Manager moves in the index/worktree.
+    # Saved dirty paths are hints, not proof that a receipted move exists.
+    observed = (set(effects.changed_files(worktree, active_sha))
+                | set(effects.changed_files(worktree)))
     if not set(manager_paths) <= observed:
         raise PlannerValidationError("Manager Requirement 이동 영수증이 실제 변경과 다릅니다.")
-    planned_files = sorted(observed - set(manager_paths))
+    planned_files = sorted((observed | set(dirty_files)) - set(manager_paths))
     if not planned_files:
         return None
     snapshot = mutable_snapshot or MutableReadySnapshot(

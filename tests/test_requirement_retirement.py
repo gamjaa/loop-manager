@@ -768,7 +768,10 @@ class RetirementPublicationManifestTest(unittest.TestCase):
             self.assertEqual(operation, "show")
             return blobs[spec]
 
-        effects = ValidateGeneralPlanningCommitEffects(git=git, git_bytes=git_bytes)
+        effects = ValidateGeneralPlanningCommitEffects(
+            _nul_git_paths=lambda *_args: [SOURCE, ARCHIVE],
+            git=git, git_bytes=git_bytes,
+        )
         _validate_general_planning_commit(effects, Path("/unused"), result, "commit")
         blobs["commit:" + ARCHIVE] = b"changed"
         with self.assertRaises(PlannerValidationError):

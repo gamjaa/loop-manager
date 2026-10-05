@@ -104,9 +104,9 @@ def changed_files(effects: ChangedFilesEffects, worktree: Path, since: str | Non
         return set(effects._nul_git_paths(worktree, *args, "-z"))
 
     if since:
-        return sorted(paths("diff", "--name-only", f"{since}..HEAD"))
-    return sorted(paths("diff", "--name-only")
-                  | paths("diff", "--cached", "--name-only")
+        return sorted(paths("diff", "--no-renames", "--name-only", f"{since}..HEAD"))
+    return sorted(paths("diff", "--no-renames", "--name-only")
+                  | paths("diff", "--cached", "--no-renames", "--name-only")
                   | paths("ls-files", "--others", "--exclude-standard"))
 
 

@@ -155,6 +155,9 @@ class WorkspaceEffectBoundaryTests(unittest.TestCase):
         self.assertEqual(workspace_service.changed_files(effects, Path('/repo'), 'base'), sorted(names))
         self.assertTrue(all(call.args[-1] == '-z' for call in raw_effects.git_bytes.call_args_list))
         self.assertTrue(any('--cached' in call.args for call in raw_effects.git_bytes.call_args_list))
+        self.assertTrue(all('--no-renames' in call.args
+                            for call in raw_effects.git_bytes.call_args_list
+                            if 'diff' in call.args))
 
     def test_rebase_ignored_overlap_refuses_before_subprocess(self):
         effects = fake_effects(command_adapter.GitEffects)
