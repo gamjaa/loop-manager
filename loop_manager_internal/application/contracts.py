@@ -143,6 +143,8 @@ class ValidatedPlanningResult:
     refactoring_plan_ids: tuple[str, ...] = ()
     revalidation_plan_ids: tuple[str, ...] = ()
     maintenance_code_map_hash: str | None = None
+    retirement_moves: tuple[str, ...] = ()
+    restoration_moves: tuple[str, ...] = ()
 
 
 class VerifyOutput(str):

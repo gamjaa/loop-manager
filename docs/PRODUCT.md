@@ -23,7 +23,7 @@
 - 계획별 상태·재시도·Agent session·작업 공간을 SQLite에 보존해 중단 후 재개한다.
 - Worker가 구현·관련 테스트·전체 검증 스크립트를 작성하고, 프로그램이 전체 검증과 독립 Review를 실행한다. 실패는 기존 작업에서 교정한다.
 - 검증된 작업으로 PR을 생성하고 사용자 Merge를 기다린다.
-- 완료된 Requirement는 마지막 관련 구현 PR에서, MERGED ExecPlan은 별도 정리 commit에서 자동 archive한다.
+- 전체 충족이 확인된 Requirement는 일반 planning 게시에서, MERGED ExecPlan은 별도 정리 commit에서 자동 archive한다.
 - 같은 프로젝트의 변경은 직렬로, 다른 프로젝트는 설정한 동시 실행 수 안에서 병렬로 처리한다.
 - 변경되지 않은 입력에서는 Planner를 반복 호출하지 않는다.
 - PR 생성·차단·프로젝트 완료를 Telegram으로 알린다.
@@ -115,9 +115,9 @@ R-023의 원격 실행·self handoff 목표는 유지하며 로컬 갱신 gate�
 2. 기존 변경 작업과 확정 PR 충돌 복구를 우선한다. 유지보수·일반 Planner·READY 선택은 아래 작업 선택 정책을 따른다.
 3. Planner가 현재 명세·코드·compact catalog와 허용된 미착수 READY snapshot을 확인한다. 새 작업을 계획하고 허용된 기존 계획만 조정한다.
 4. 프로그램이 범위·형식·source·의존성을 검증하고 계획을 원격 base에 게시한다. 원격 게시를 확인한 결과만 실행 대상으로 반영한다.
-5. dependency를 충족한 READY 하나를 선택해 전용 branch·worktree에서 Worker를 실행한다. Worker는 구현·관련 테스트·verify 스크립트와 해당 Requirement archive를 준비한다.
-6. 프로그램이 Worker 결과와 archive 이동을 검증하고 최신 base를 반영한다. 최종 후보의 전체 검증과 읽기 전용 Review를 수행하며 실패는 같은 작업에서 교정한다.
-7. 게시 직전 base와 archive eligibility가 바뀌었으면 필요한 교정·후보 확인·검증·Review를 다시 수행한 뒤 기존 PR을 복구하거나 새 PR을 생성한다.
+5. dependency를 충족한 READY 하나를 선택해 전용 branch·worktree에서 Worker를 실행한다. Worker는 구현·관련 테스트와 verify 스크립트를 준비하며 Requirement를 이동하지 않는다.
+6. 프로그램이 Worker 결과를 검증하고 최신 base를 반영한다. 최종 후보의 전체 검증과 읽기 전용 Review를 수행하며 실패는 같은 작업에서 교정한다.
+7. 게시 직전 base나 후보 근거가 바뀌었으면 필요한 교정·후보 확인·검증·Review를 다시 수행한 뒤 기존 PR을 복구하거나 새 PR을 생성한다.
 8. 안정된 PR_OPEN은 실행 자리를 비운다. 해당 계획에 직접·간접 의존하지 않는 READY는 순차적으로 시작할 수 있고, 연결 PR의 Merge 확인 뒤 의존 작업이 시작된다.
 
 계획 게시의 원자 적용, 작업 공간 복구와 단계별 Git 처리는 [ARCHITECTURE.md](ARCHITECTURE.md#계획-게시와-작업-공간)를 따른다.
@@ -180,7 +180,7 @@ PR 없는 게시 checkpoint의 과거 Review 횟수 차단은 현재 게시 소�
 2. 프로그램이 실제 Merge를 확인해 MERGED와 알림을 기록한다. 관리 worktree는 아래 정리 조건을 만족할 때만 제거한다.
 3. 최신 원격 base에서 안전한 MERGED ExecPlan을 내용 보존 archive로 게시한다. 정리 실패는 작업 완료를 되돌리거나 다음 작업을 막지 않는다.
 4. 다음 의존 작업을 시작하거나 Planner의 추가 작업 없음과 프로젝트 완료 gate를 확인한다.
-5. 모든 완료 조건이 충족되면 프로젝트 완료 이벤트를 전송한다. Merge된 PR의 Requirement archive는 활성 입력에서 제외된다.
+5. 모든 완료 조건이 충족되면 프로젝트 완료 이벤트를 전송한다. 일반 planning 게시로 원격 확인된 Requirement 이동만 활성 입력에서 제외된다.
 
 ### 실행 종료 및 재개
 
@@ -236,8 +236,10 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - Requirement는 원하는 변화·이유·Acceptance Criteria만 기록하며 frontmatter·상태·complexity·risk를 두지 않는다
 - 기존 ExecPlan의 활성 Requirement source가 없으면 동일 파일명의 `docs/requirements/archive/` 문서를 조회하되 원래 source 경로는 바꾸지 않는다
 - 새 ExecPlan의 source와 Planner 입력은 활성 PRODUCT 또는 `docs/requirements/` 바로 아래 문서로 제한한다
-- 현재 ExecPlan을 제외한 모든 관련 ExecPlan이 MERGED인 Requirement만 archive 후보이며, 이미 모든 관련 계획이 MERGED인 과거 Requirement도 후보에 포함한다
-- archive 이동 집합의 결정적인 차이는 같은 Worker 문맥에서 한도 내 교정하고, 최신 base·catalog 시차는 신뢰할 수 있는 원본으로 재평가한다. 이동 목적지 충돌이나 source 관계·상태를 끝내 하나로 확정할 수 없을 때만 덮어쓰기 없이 현재 ExecPlan을 `PLAN_BLOCKED`로 만든다
+- 관련 ExecPlan·draft가 미완료이면 Requirement 전체 충족 확인을 미룬다. 마지막 관련 계획이 실제 MERGED가 된 뒤 일반 Planner가 최신 원격 구현·검증 근거로 각 Acceptance Criterion을 충족·미충족·불확실로 판단한다. 계획 작성 완료나 관련 계획의 Merge만으로 충족을 추정하지 않는다
+- Manager는 Requirement 원문, 관련 명세·계획 관계, 구현·검증 근거에 결합된 판단을 보존한다. 동일한 유효 입력의 충족·미충족 판단은 재사용하고 관련 입력이 바뀌면 미완료 작업이 없는 시점에 일반 Planner가 다시 확인한다. 빠른 Planner는 이 판단·이동에 참여하지 않으며 기존 계획 변경 영향 점검만 수행한다
+- 유효한 최종 충족 판단과 source 관계·Merge 상태가 확인되면 Manager가 원문 그대로 일반 planning 게시에서 Requirement를 이동한다. 새 계획과 이동을 함께 게시하거나 이동만 게시할 수 있으며 원격 확인 전에는 활성 입력으로 유지한다. 충돌·불확실성은 덮어쓰기나 임의 완료 없이 보존한다
+- 일회성 과거 archive 감사는 비종료 source 관계와 완료 근거를 revision에 묶어 보존한다. 확인된 조기 이동만 planning 게시로 복원하며 과거 archive를 평소 활성 Planner 입력으로 사용하지 않는다
 - `PLAN_BLOCKED` 해제 지문은 원래 활성 Requirement 경로만 사용하고 archive 변경에는 반응하지 않는다
 - Requirement는 PRODUCT의 변경 요청이며 ExecPlan의 구현 상세나 실행 상태를 포함하지 않는다
 - Requirement 파일 경로를 안정적인 식별자로 사용한다
@@ -245,7 +247,7 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - `docs/REQUIREMENT.template.md`와 `docs/requirements/archive/`는 Planner 입력에서 제외한다
 - ExecPlan의 `sources`에는 근거가 된 PRODUCT 또는 Requirement 경로가 있어야 한다
 
-- source와 dependency 변경은 같은 reconciliation 결과를 다음 archive 후보·입력 지문·READY 선택에 사용하고 priority 변경은 다음 선택부터 반영한다. complexity·risk 변경은 최초 Worker level을 다시 계산하되 실행 이력이 있는 계획의 effective level과 Review 승격 이력을 낮추지 않는다
+- source와 dependency 변경은 같은 reconciliation 결과를 Requirement 판단 자격·입력 지문·READY 선택에 사용하고 priority 변경은 다음 선택부터 반영한다. complexity·risk 변경은 최초 Worker level을 다시 계산하되 실행 이력이 있는 계획의 effective level과 Review 승격 이력을 낮추지 않는다
 - 현재 path와 title은 compact catalog, 로그·알림과 이후 파일 조회에 사용하지만 기존 PR의 ExecPlan 링크는 최초 게시 SHA와 최초 active path를 계속 사용한다
 - 최초 또는 비교 가능한 전체 계획 성공 기준이 없거나, PRODUCT·활성 Requirement·ARCHITECTURE·AGENTS·사용자 active ExecPlan이 바뀌면 일반 Planner를 READY 선택보다 먼저 실행한다. 일반 Planner는 비종료 compact catalog와 미착수 READY snapshot으로 현재 식별 가능한 미충족 작업을 한 번에 계획한다
 - 문서·지침·active ExecPlan은 그대로이고 코드·테스트·설정만 바뀌면 수정 가능한 미착수 READY를 읽기 전용 점검 Planner가 먼저 확인한다. dependency 대기 READY도 포함하며 실행 이력·소유 증거가 있는 계획은 대상에서 제외한다. 대상이 없으면 일반 Planner가 전체 미충족 작업을 확인한다
@@ -310,7 +312,7 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 ### 복구 판단과 최종 차단
 
 - 차단 후보는 disposition, 안정적인 원인 code, plan ID, phase, plan/base revision, 진단 지문과 진전 marker로 기록한다. 복구 disposition과 `PLAN_BLOCKED`/`PROJECT_BLOCKED` scope는 별도 기준이며 최종 사용자 조치가 확정된 뒤에만 원인 code로 scope를 정한다
-- 일시적 Git·서비스 실패는 현재 실행을 보존해 다음 실행에서 재시도하고, 유효한 최신 base·catalog 및 실제 소유 Git 상태로 하나의 다음 단계를 확정할 수 있으면 상태를 재구성한다. archive 이동 집합과 rebase 충돌은 진전과 반복 한도를 기록하며 교정한다. Manager가 처음 rebase 충돌을 관측하거나 Worker 결과 형식 오류를 받으면 현재 실행을 끝내고 다음 실행에서 보존된 Worker 세션으로 재개한다. 진행 중인 Worker·검증·Review 교정은 같은 실행에서 이어갈 수 있다
+- 일시적 Git·서비스 실패는 현재 실행을 보존해 다음 실행에서 재시도하고, 유효한 최신 base·catalog 및 실제 소유 Git 상태로 하나의 다음 단계를 확정할 수 있으면 상태를 재구성한다. Requirement 이동 실패는 planning 작업에 보존하고 rebase 충돌은 진전과 반복 한도를 기록하며 교정한다. Manager가 처음 rebase 충돌을 관측하거나 Worker 결과 형식 오류를 받으면 현재 실행을 끝내고 다음 실행에서 보존된 Worker 세션으로 재개한다. 진행 중인 Worker·검증·Review 교정은 같은 실행에서 이어갈 수 있다
 - 일시 재시도, 상태 재구성, 한도 내 Agent 교정은 현재 phase, branch, worktree, 소유권, Agent session, 승인, 변경, 검증 원문과 실패 이력을 보존하며 차단, 원격 checkpoint, BLOCKED 알림을 만들지 않는다. 한 실행에서 최신 원격 snapshot이 안정되지 않으면 같은 상태로 일시 중단하고 다음 실행에서 다시 판정한다
 - 승인·PR reopen·소유권·Agent 범위·원격 OID 불확실성, 안전한 원본으로 확정할 수 없는 손상, verify·rebase·Worker 결과 형식·Reviewer 프로토콜의 최종 반복 한도 소진과 의미를 확정할 수 없는 무변경 결과만 최종 사용자 조치로 차단한다. Review 유발 Worker 교정의 실행별 한도는 작업을 보존하는 일시 중단으로 처리한다. 최종 기록에는 복구 횟수, 마지막 안정 revision, 남은 불확실성과 실제 조치 대상을 포함한다
 - 최종 `PLAN_BLOCKED`와 계획에 연결된 `PROJECT_BLOCKED`의 검증 가능한 대상 작업만 안전한 원격 checkpoint 또는 진단 게시 대상이다. BLOCKED 알림은 최종 차단 transaction과 checkpoint 결과 뒤에 생성하고 동일 plan/scope/reason/fingerprint/revision은 한 번만 알린다. 사용자 수정 경로는 원인이 실제 대상을 제공할 때만 표시한다
@@ -335,7 +337,7 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - Manager 실행 인스턴스가 동시 verify의 확인·예약을 조율한다. 예약은 해당 자식 종료 또는 미시작을 확인한 뒤 해제하며 종료 불명은 보존한다. 기존 프로젝트 선택과 같은 프로젝트의 ExecPlan 동시 실행 정책은 유지한다. 과거 시간 자료는 현재 후보 검증을 대신하지 않는다.
 - 최종 후보에서 관련 targeted test와 전체 verify가 통과하고 Reviewer blocking issue가 없어야 한다.
 - 최신 base 반영이나 후보·관련 입력 변경으로 기존 성공 근거가 무효화되면 Worker 후보 확인·targeted test·전체 verify·Review를 다시 수행한다.
-- 게시 직전 archive eligibility가 이동 집합과 다르면 같은 Worker 세션에서 교정하고 검증·Review를 반복한다.
+- 구현 PR 게시에는 Requirement 전체 완료나 archive 이동을 강제하지 않는다. Requirement 이동은 별도 planning 게시에서 최신 판단·원문·목적지와 원격 base를 다시 확인한다.
 - 관리 rebase는 자동 Worker 해결과 사용자 수동 해결을 같은 현재 상태 기준으로 수용한다. 현재 소유권·범위·Git 상태·원격 기대값을 검증하며, 과거 turn·stage·receipt·journal 완전성을 완료 조건으로 요구하지 않는다.
 - PR 없는 동일 계획의 기존 원격 작업 branch를 rebase한 결과는 다음 Worker·verify·Review·추가 rebase보다 먼저 중간 checkpoint 게시 또는 안전한 거부를 확정한다. 이 게시는 차단 해제·검증 성공·PR 승인을 대신하지 않는다.
 - 같은 branch의 기존 PR을 복구해 사용하며 중복 PR을 만들지 않는다. PR은 사용자가 Merge한다.

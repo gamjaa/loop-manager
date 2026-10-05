@@ -194,17 +194,11 @@ def worker_prompt(
             "VERIFY_TIMEOUT_LIMIT_INSUFFICIENT: <진행 근거와 필요한 설정 조정> "
             "한 줄을 적어라.\n"
         )
-    if archive_candidates:
-        archive_instruction = (
-            "\n다음 Requirement만 내용 변경 없이 같은 파일명으로 "
-            "docs/requirements/archive/에 이동하라:\n"
-            f"{json.dumps(archive_candidates, ensure_ascii=False)}\n"
-        )
-    else:
-        archive_instruction = (
-            "\n계산된 Requirement archive 후보가 없다. "
-            "docs/requirements/ 아래 파일을 수정하거나 이동하지 마라.\n"
-        )
+    archive_instruction = (
+        "\nRequirement 완료 판단과 내용 보존 이동은 관련 계획이 Merge된 뒤 "
+        "일반 Planner와 Manager가 처리한다. 이 구현 작업에서는 "
+        "docs/requirements/ 아래 파일을 수정하거나 이동하지 마라.\n"
+    )
     recovery = ""
     if session_recovery:
         recovery = (

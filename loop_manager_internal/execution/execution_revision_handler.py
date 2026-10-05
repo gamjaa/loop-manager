@@ -372,23 +372,14 @@ class RevisionHandler:
         self.ports.update_snapshot(catalog_plan=catalog_plan)
         self.ports.update_snapshot(plan=self.ports._cached_plan(catalog_plan))
         try:
-            archive_sources = (
-                () if self.ports._document_draft(context) is not None
-                else self.ports.requirement_archive_sources(self.ports.identity.repo)
-            )
-            archive_snapshot = (
-                self.ports.requirement_archive_snapshot(
-                    self.ports.identity.repo_path,
-                    self.ports.identity.repo,
-                    latest_sha,
-                    str(catalog_plan['plan_id']),
-                )
-                if archive_sources else None
-            )
-            archive_candidates = (
-                archive_snapshot.candidates
-                if archive_snapshot is not None else ()
-            )
+            # Document approval identity remains mandatory independently of
+            # the retired execution-time Requirement archive calculation.
+            self.ports._document_draft(context)
+            # Requirement retirement is assessed after the related plans MERGE.
+            # An old execution archive target is never an implementation input.
+            archive_sources = ()
+            archive_snapshot = None
+            archive_candidates = ()
             snapshot = DefinitionSnapshot(
                 revision_sha=latest_sha,
                 path=str(catalog_plan['path']),

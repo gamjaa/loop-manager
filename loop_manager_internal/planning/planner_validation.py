@@ -183,6 +183,7 @@ def validate_planner_result(
     connection: sqlite3.Connection | None = None,
     repo: str | None = None,
     mutable_snapshot: MutableReadySnapshot | None = None,
+    manager_paths: tuple[str, ...] = (),
 ) -> ValidatedPlanningResult | None:
     """Validate one create/revise/rename/delete planning batch.
 
@@ -190,7 +191,10 @@ def validate_planner_result(
     dedicated exception. Operational Git failures must retain their normal
     recovery boundary and never consume the Planner validation retry budget.
     """
-    planned_files = sorted(set(dirty_files) | set(effects.changed_files(worktree, active_sha)))
+    observed = set(dirty_files) | set(effects.changed_files(worktree, active_sha))
+    if not set(manager_paths) <= observed:
+        raise PlannerValidationError("Manager Requirement 이동 영수증이 실제 변경과 다릅니다.")
+    planned_files = sorted(observed - set(manager_paths))
     if not planned_files:
         return None
     snapshot = mutable_snapshot or MutableReadySnapshot(

@@ -25,7 +25,6 @@
 - Requirement 구현 결과가 앞으로도 지켜야 할 제품 규칙이면 예외적으로 코드와 같은 PR에서 `PRODUCT.md`를 갱신할 수 있다.
 - Requirement는 frontmatter나 상태가 없는 순수 문서다.
 - `docs/requirements/` 바로 아래의 모든 Requirement는 Planner 입력으로 사용한다.
-- 완료된 Requirement는 마지막 관련 ExecPlan의 구현 PR에서 Loop Manager가 eligibility를 다시 확인한 뒤 내용 변경 없이 `docs/requirements/archive/`로 자동 이동한다. archive PR이 Merge되기 전에는 활성 Planner 입력으로 남으며, 관련 비종료 ExecPlan, archive 충돌 또는 source 관계 불확실성이 있으면 이동하지 않는다.
 - `docs/REQUIREMENT.template.md`와 `docs/requirements/archive/`는 작업 입력으로 읽지 않는다.
 
 시스템 설계:

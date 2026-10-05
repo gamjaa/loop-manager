@@ -12,6 +12,7 @@ from loop_manager_internal.runtime import project_registry
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.recovery import scoped_blocking, blocked_remote_observation
 from . import (execplan_catalog_state, execplan_archive_state, requirement_archive_state,
+               requirement_judgment_state,
                agent_invocation_state, validation_feedback_state, recovery_state,
                blocked_checkpoint_state, maintenance_state, planning_input_state,
                planner_check_state)
@@ -291,6 +292,7 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
     execplan_catalog_state.ensure_schema(connection)
     execplan_archive_state.ensure_schema(connection)
     requirement_archive_state.ensure_schema(connection)
+    requirement_judgment_state.RequirementJudgmentRepository(connection)
     columns = {row[1] for row in connection.execute("PRAGMA table_info(exec_plans)")}
     if "blocked_fingerprint" not in columns:
         connection.execute("ALTER TABLE exec_plans ADD COLUMN blocked_fingerprint TEXT")

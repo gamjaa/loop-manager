@@ -6,8 +6,8 @@
 Requirement는 제품에 원하는 변화와 완료 조건을 기록하는 순수 문서다.
 docs/requirements/ 바로 아래에 저장한 모든 Requirement는 Planner 입력으로 사용된다.
 미결정 사항을 해소한 뒤 이 위치에 저장한다.
-완료된 Requirement는 마지막 관련 ExecPlan의 구현 PR에서 Loop Manager가 eligibility를 다시 확인한 뒤 내용 변경 없이 archive/로 자동 이동한다.
-archive PR이 Merge되기 전에는 활성 Planner 입력으로 남으며, 관련 비종료 ExecPlan·archive 충돌·source 관계 불확실성이 있으면 이동하지 않는다.
+관련 ExecPlan이 모두 실제 Merge되고 일반 Planner가 전체 Acceptance Criteria 충족을 확인한 뒤 Loop Manager가 일반 planning 게시에서 원문 그대로 archive/로 이동한다.
+원격 게시가 확인되기 전에는 활성 Planner 입력으로 남으며, 비종료 계획·draft·archive 충돌·source 관계나 충족 판단의 불확실성이 있으면 이동하지 않는다.
 -->
 
 ## Context

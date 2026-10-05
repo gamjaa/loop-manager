@@ -83,6 +83,8 @@ def _planning_result_manifest(effects: PlanningResultManifestEffects, result: Va
         "version": 1,
         "publication_paths": list(result.publication_paths),
         "publication_hashes": dict(result.publication_hashes),
+        "retirement_moves": list(result.retirement_moves),
+        "restoration_moves": list(result.restoration_moves),
         "plans": [[path, plan] for path, plan in result.plans],
         "revisions": [
             {
@@ -165,6 +167,8 @@ def _planning_result_from_manifest(effects: PlanningResultFromManifestEffects, m
                 str(path) for path in payload["publication_paths"]
             ),
             publication_hashes=publication_hashes,
+            retirement_moves=tuple(str(path) for path in payload.get("retirement_moves", ())),
+            restoration_moves=tuple(str(path) for path in payload.get("restoration_moves", ())),
             revisions=revisions,
             deletions=deletions,
             mutable_snapshot=snapshot,
@@ -252,6 +256,34 @@ def _validate_general_planning_commit(
             raise PlannerValidationError(
                 f"삭제 manifest 경로가 planning commit에 남아 있습니다: {path}"
             )
+    for source in result.retirement_moves:
+        if not source.startswith("docs/requirements/") or source.count("/") != 2:
+            raise PlannerValidationError(f"Requirement 이동 원본이 유효하지 않습니다: {source}")
+        destination = "docs/requirements/archive/" + source.removeprefix("docs/requirements/")
+        if source not in result.publication_paths or destination not in result.publication_paths:
+            raise PlannerValidationError(f"Requirement 이동 manifest가 불완전합니다: {source}")
+        if effects.git(worktree, "cat-file", "-e", f"{plan_commit}:{source}", check=False).returncode == 0:
+            raise PlannerValidationError(f"Requirement 원본이 planning commit에 남아 있습니다: {source}")
+        if effects.git(worktree, "cat-file", "-e", f"{snapshot.active_sha}:{destination}", check=False).returncode == 0:
+            raise PlannerValidationError(f"Requirement 이동 목적지가 이미 있었습니다: {destination}")
+        original = effects.git_bytes(worktree, "show", f"{snapshot.active_sha}:{source}")
+        moved = effects.git_bytes(worktree, "show", f"{plan_commit}:{destination}")
+        if moved != original:
+            raise PlannerValidationError(f"Requirement 이동 중 원문이 변경됐습니다: {source}")
+    for archived in result.restoration_moves:
+        if not archived.startswith("docs/requirements/archive/") or archived.count("/") != 3:
+            raise PlannerValidationError(f"Requirement 복원 원본이 유효하지 않습니다: {archived}")
+        destination = "docs/requirements/" + archived.removeprefix("docs/requirements/archive/")
+        if archived not in result.publication_paths or destination not in result.publication_paths:
+            raise PlannerValidationError(f"Requirement 복원 manifest가 불완전합니다: {archived}")
+        if effects.git(worktree, "cat-file", "-e", f"{plan_commit}:{archived}", check=False).returncode == 0:
+            raise PlannerValidationError(f"Requirement archive 원본이 planning commit에 남아 있습니다: {archived}")
+        if effects.git(worktree, "cat-file", "-e", f"{snapshot.active_sha}:{destination}", check=False).returncode == 0:
+            raise PlannerValidationError(f"Requirement 복원 목적지가 이미 있었습니다: {destination}")
+        original = effects.git_bytes(worktree, "show", f"{snapshot.active_sha}:{archived}")
+        restored = effects.git_bytes(worktree, "show", f"{plan_commit}:{destination}")
+        if restored != original:
+            raise PlannerValidationError(f"Requirement 복원 중 원문이 변경됐습니다: {archived}")
 
 
 @dataclass(frozen=True)
@@ -515,6 +547,34 @@ def _apply_general_planning_batch(
             connection, repo, plan_commit,
             effects.plan_declarations(worktree, plan_commit),
         )
+        for source in result.retirement_moves:
+            changed = connection.execute(
+                "UPDATE requirement_move_receipts SET stage = 'published', "
+                "updated_at = CURRENT_TIMESTAMP WHERE repo = ? AND source_path = ? "
+                "AND base_sha = ? AND stage = 'pending'",
+                (repo, source, snapshot.active_sha),
+            )
+            if changed.rowcount != 1:
+                raise PlannerValidationError(
+                    f"Requirement 이동 영수증을 확인할 수 없습니다: {source}"
+                )
+            connection.execute(
+                "UPDATE requirement_audit SET stage = 'published', "
+                "updated_at = CURRENT_TIMESTAMP WHERE repo = ? AND source_path = ?",
+                (repo, source),
+            )
+        for archived in result.restoration_moves:
+            source = "docs/requirements/" + archived.removeprefix("docs/requirements/archive/")
+            changed = connection.execute(
+                "UPDATE requirement_audit SET stage = 'published', updated_at = CURRENT_TIMESTAMP "
+                "WHERE repo = ? AND source_path = ? AND observed_sha = ? "
+                "AND outcome = 'restore' AND stage = 'staged'",
+                (repo, source, snapshot.active_sha),
+            )
+            if changed.rowcount != 1:
+                raise PlannerValidationError(
+                    f"Requirement 복원 영수증을 확인할 수 없습니다: {source}"
+                )
         planning_publication_state.delete_general_planning_publication(connection, repo)
 
 

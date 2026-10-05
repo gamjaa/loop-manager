@@ -334,6 +334,16 @@ class PlanningSelectionService(PlanningService):
                 run.base_sha,
                 run.general_fingerprint,
             )
+            if hasattr(self._ports, "retirement"):
+                run.audit_restorations = self._ports.retirement.audit_restorations(
+                    context.repo, context.repo_path, run.base_sha,
+                )
+                run.audit_pending = self._ports.retirement.audit_pending(
+                    context.repo, context.repo_path, run.base_sha,
+                )
+                run.retirement_pending = self._ports.retirement.pending(
+                    context.repo, context.repo_path, run.base_sha,
+                )
             check_ready = False
             check_accepted = False
             if (planning_input_changed and not specification_changed
@@ -377,7 +387,10 @@ class PlanningSelectionService(PlanningService):
                 run.fingerprint_skipped = True
             run.selection = choose_planning_decision(
                 has_active=getattr(decision, "active", None) is not None,
-                specification_changed=specification_changed or approval_pending,
+                specification_changed=(specification_changed or approval_pending
+                                       or bool(run.retirement_pending)
+                                       or bool(run.audit_restorations)
+                                       or bool(run.audit_pending)),
                 runnable_ready=decision.runnable_ready is not None,
                 planning_input_changed=planning_input_changed,
                 check_ready=check_ready,

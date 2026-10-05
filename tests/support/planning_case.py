@@ -496,6 +496,8 @@ class FakeValidationPort:
             revisions=(),
             deletions=(),
             mutable_snapshot=snapshot,
+            retirement_moves=(),
+            restoration_moves=(),
         )
 
     def maintenance_context_at_revision(self, *_args):
