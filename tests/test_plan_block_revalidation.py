@@ -144,7 +144,8 @@ class PendingIntegrationRemoteRefreshTests(PlanRemoteRecoveryFixture, unittest.T
             operation=operation, expected_head=self.head, target_base_oid='previous-user-input',
             observed_remote_oid='previous-user-input', snapshot={'work_branch_integration': {
                 'phase': phase, 'remote': 'previous-user-input',
-                'branch': plan['branch'] if owned else 'other', 'worktree': plan['worktree']}})
+                'branch': plan['branch'] if owned else 'other', 'worktree': plan['worktree']}}
+                if phase is not None else {})
         return context
 
     def _new_remote(self, *, ancestry=0, fetch=0):
@@ -183,6 +184,19 @@ class PendingIntegrationRemoteRefreshTests(PlanRemoteRecoveryFixture, unittest.T
                 with self.assertRaises(RuntimeError):
                     self.coordinator._remote(context)
                 self.assertEqual(context['branch_oid'], 'previous-user-input')
+
+    def test_base_conflict_without_integration_reobserves_successor_and_retains_unchanged_lease_target(self):
+        context = self._context(None, operation='rebase')
+        self._new_remote()
+        self.coordinator._remote(context)
+        self.assertEqual((context['branch_oid'], context['base_oid']), ('successor', 'new-base'))
+        context = self._context(None, operation='rebase')
+        with mock.patch.object(blocked_remote_observation, 'observe_refs', return_value=(
+                blocked_remote_observation.RefObservation('present', 'new-base'),
+                blocked_remote_observation.RefObservation('present', 'previous-user-input'))):
+            with self.assertRaises(blocked_plan_reconciliation.InputChanged):
+                self.coordinator._remote(context)
+        self.assertEqual(context['base_oid'], self.base)
 
 
 class PlanCheckpointPublicationRaceTests(PlanRemoteRecoveryFixture, unittest.TestCase):
@@ -445,6 +459,47 @@ class PlanCheckpointPublicationRaceTests(PlanRemoteRecoveryFixture, unittest.Tes
 
 
 class PlanCauseRevalidationTests(PlanRemoteRecoveryFixture, unittest.TestCase):
+    def test_adopted_base_conflict_reobserves_successor_before_incorporation_after_restart(self):
+        self.published_successor()
+        store = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        def conflict(plan, context):
+            prior = store.get(self.repo, 'G-106')
+            store.record(self.repo, 'G-106', expected_generation=prior.generation, operation='rebase',
+                expected_head=self.head, target_base_oid=self.base,
+                observed_remote_oid=context['branch_oid'], snapshot=prior.snapshot)
+            raise RuntimeError('base conflict')
+        with mock.patch.object(self.coordinator, '_incorporate', side_effect=conflict):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertEqual(self.connection.execute(
+            'SELECT stage FROM blocked_plan_reconciliations WHERE plan_id = ?', ('G-106',)).fetchone()[0], 'adopted')
+        successor = 'e' * 40
+        self.connection.execute("UPDATE blocked_remote_observations SET branch_oid = ? WHERE plan_id = 'G-106'",
+                                (successor,))
+        self.connection.commit()
+        git = self.ports.git.side_effect
+        def successor_git(root, *args, **kwargs):
+            if args == ('rev-parse', 'FETCH_HEAD^{commit}'):
+                return SimpleNamespace(returncode=0, stdout=successor)
+            return git(root, *args, **kwargs)
+        self.ports.git.side_effect = successor_git
+        restarted = blocked_plan_reconciliation.BlockedPlanReconciler(
+            self.ports, self.connection, Path('/repo'), Path('/state'), self.repo, 'main')
+        steps = []
+        def adopt(plan, context):
+            steps.append(('adopt', context['branch_oid']))
+        def incorporate(plan, context):
+            steps.append(('incorporate', context['branch_oid']))
+            raise RuntimeError('base conflict remains')
+        with (mock.patch.object(blocked_remote_observation, 'observe_refs', return_value=(
+                  blocked_remote_observation.RefObservation('present', self.base),
+                  blocked_remote_observation.RefObservation('present', successor))),
+              mock.patch.object(restarted, '_adopt', side_effect=adopt),
+              mock.patch.object(restarted, '_incorporate', side_effect=incorporate)):
+            self.assertEqual(restarted.reconcile('G-106'), 'blocked')
+        self.assertEqual(steps, [('adopt', successor), ('incorporate', successor)])
+        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+        self.assertEqual(self.plan()['status'], 'PLAN_BLOCKED')
+
     def test_refusal_keeps_original_cause_and_is_memoized(self):
         self.ports.pr_for_branch.return_value = {'state': 'OPEN'}
         self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')

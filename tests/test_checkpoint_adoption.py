@@ -42,7 +42,7 @@ class CheckpointRefreshFixture:
 
     def _adoption(self, *, fetched_oid=None, observed_oid=None, diverged=False,
                   dirty=False, changed_paths=('code.py',), rewritten=False, candidate_race=False,
-                  managed_rebased=False, local_rewritten=False, manager_waiting=False):
+                  managed_rebased=False, local_rewritten=False, manager_waiting=False, base_conflict=False):
         branch, worktree = 'loop-manager/G-106', str(Path('/state/G-106'))
         original, successor = 'a' * 40, 'b' * 40
         self.connection.execute("UPDATE projects SET origin = 'example/repo'")
@@ -72,8 +72,15 @@ class CheckpointRefreshFixture:
                 snapshot={'current_rebase_acceptance': acceptance})
         if dirty:
             snapshot = replace(snapshot, dirty={'local.txt': (('untracked',), 'bytes')})
+        restored = snapshot
+        if base_conflict:
+            execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).record(
+                'repo', 'G-106', expected_generation=0, operation='rebase', expected_head=original,
+                target_base_oid='e' * 40, observed_remote_oid=original, snapshot={})
+            snapshot = replace(snapshot, head='detached', branch=None, operations={'rebase-merge': 'owned'},
+                               dirty={'code.py': (('unstaged',), 'manual conflict bytes')})
         combined = 'd' * 40 if diverged or dirty or managed_rebased else successor
-        adopted = replace(snapshot, head=combined, dirty={},
+        adopted = replace(restored, head=combined, dirty={},
                           refs={f'refs/heads/{branch}': (combined, '')})
         confirmed = replace(adopted, dirty={'new.txt': (('untracked',), 'raced')}) if candidate_race else adopted
         def git(_, *args, **kwargs):
@@ -97,7 +104,8 @@ class CheckpointRefreshFixture:
         with (mock.patch.object(loop_manager, '_BlockedCheckpointAdapter') as adapter,
               mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'),
               mock.patch.object(loop_manager, 'validate_managed_worktree'),
-              mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=[snapshot, adopted, confirmed]),
+              mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=(
+                  [snapshot, restored, adopted, confirmed] if base_conflict else [snapshot, adopted, confirmed])),
               mock.patch.object(loop_manager, '_nul_git_paths', side_effect=lambda _, *args:
                                 changed_paths if args[0] == 'diff' else ()),
               mock.patch.object(loop_manager, '_published_plan_allows_common_plans', return_value=False),
@@ -106,15 +114,26 @@ class CheckpointRefreshFixture:
               mock.patch.object(loop_manager, 'validate_blocked_agent_scope'),
               mock.patch.object(loop_manager, '_current_rebase_service') as service,
               mock.patch.object(work_branch_integration, 'integrate', return_value=adopted) as integrate,
+              mock.patch.object(work_branch_integration, 'restart_base_rebase') as restart,
               mock.patch.object(loop_manager, '_evaluate_remote_checkpoint_cause') as evaluate):
             adapter.return_value.observe_remote.return_value = observed_oid or successor
             adapter.return_value._approved_guidance_targets.return_value = ()
             service.return_value.require_owned.return_value = (None, mock.Mock(status=mock.Mock(
                 value='waiting_for_resolution' if manager_waiting else 'complete')))
+            def finish_restart(*args):
+                checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+                current = checkpoints.get('repo', 'G-106')
+                return checkpoints.record('repo', 'G-106', expected_generation=current.generation,
+                    operation=None, expected_head=original, target_base_oid=successor,
+                    observed_remote_oid=original, snapshot=current.snapshot)
+            restart.side_effect = finish_restart
             result = loop_manager._reconcile_published_blocked_checkpoint(
                 self.connection, Path('/repo'), Path('/state'), 'repo', plan, self.row(),
                 self.store.get('repo', 'G-106'), self.store, adopt_only=True, expected_remote_oid=successor)
         evaluate.assert_not_called()
+        if base_conflict:
+            restart.assert_called_once()
+            self.assertEqual(restart.call_args.args[-1], snapshot)
         if (diverged or dirty or managed_rebased) and not rewritten and not manager_waiting:
             integrate.assert_called_once()
         self.assertEqual(scoped_blocking.plan_block(self.connection, 'repo', 'G-106')['evidence'], 'original failure')
@@ -122,6 +141,12 @@ class CheckpointRefreshFixture:
 
 
 class BlockedCheckpointRefreshUnitTests(CheckpointRefreshFixture, unittest.TestCase):
+    def test_new_successor_restarts_owned_base_conflict_before_normal_adoption(self):
+        result, commands = self._adoption(base_conflict=True)
+        self.assertEqual(result, 'adopted')
+        self.assertEqual(self.row()['accepted_remote_oid'], 'b' * 40)
+        self.assertTrue(any('merge' in call.args for call in commands.call_args_list))
+
     def test_refresh_keeps_published_ownership_and_same_request(self):
         request = self.store.get('repo', 'G-106')
         self.store.refresh(request, expected_remote_oid='a' * 40)

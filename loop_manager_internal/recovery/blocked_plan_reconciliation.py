@@ -258,7 +258,7 @@ class BlockedPlanReconciler:
             and integration.get('branch') == context['identity']['branch']
             and integration.get('worktree') == context['identity']['worktree'])
         if branch.oid not in allowed:
-            if refresh_pending and context['branch_oid'] and branch.oid:
+            if (refresh_pending or checkpoint.operation == 'rebase') and context['branch_oid'] and branch.oid:
                 fetched = self.ports.git(
                     self.repo_path, 'fetch', '--no-tags', '--refmap=', 'origin',
                     context['branch_ref'], check=False)
@@ -275,7 +275,8 @@ class BlockedPlanReconciler:
             else:
                 raise RuntimeError('원격 작업 branch가 관측 이후 변경·삭제됐습니다.')
         if not allow_published and base.oid != context['base_oid']:
-            if refresh_pending:
+            if refresh_pending or checkpoint.operation == 'rebase' and (
+                    integration or context['branch_oid'] != checkpoint.observed_remote_oid):
                 context['base_oid'] = base.oid
             else:
                 raise InputChanged('원격 base가 관측 이후 변경됐습니다.')
@@ -300,6 +301,7 @@ class BlockedPlanReconciler:
         checkpoint = ExecutionCheckpointRepository(self.connection).get(self.repo, plan['plan_id'])
         integration = (checkpoint.snapshot or {}).get('work_branch_integration') or {}
         if (checkpoint.operation in {'rebase', 'rebase_publish'}
+                and checkpoint.observed_remote_oid == context['branch_oid']
                 and (not integration or integration.get('phase') == 'complete'
                      and integration.get('remote') == context['branch_oid'])):
             self.ports._current_rebase_service(
@@ -590,11 +592,23 @@ class BlockedPlanReconciler:
             key, stage, context = saved['input_identity'], saved['stage'], json.loads(saved['context'])
         try:
             plan = self._check_owner(plan_id, context)
+            if stage == 'adopted' and ExecutionCheckpointRepository(self.connection).get(
+                    self.repo, plan_id).operation == 'rebase':
+                remote_before = context['branch_oid']
+                self._remote(context, allow_published=True)
+                if context['branch_oid'] != remote_before:
+                    # Base incorporation may have paused after work-branch
+                    # adoption. Route a proven successor back through adoption
+                    # so it can preserve and restart that owned conflict.
+                    stage = 'observed'
+                    self._save(plan_id, key, stage, context)
             if stage == 'observed':
                 self._remote(context)
                 checkpoint = ExecutionCheckpointRepository(self.connection).get(self.repo, plan_id)
                 integration = (checkpoint.snapshot or {}).get('work_branch_integration') or {}
-                if (integration.get('phase') in {'preserving', 'rebasing'}
+                if (checkpoint.operation == 'rebase'
+                        and checkpoint.observed_remote_oid != context['branch_oid']
+                        or integration.get('phase') in {'preserving', 'rebasing'}
                         or integration and (checkpoint.snapshot or {}).get('remote_adoption_intent')
                         or integration and checkpoint.operation == 'rebase'
                         and integration.get('remote') != context['branch_oid']):

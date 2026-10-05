@@ -7,12 +7,88 @@ from __future__ import annotations
 
 import json
 import hashlib
+import tempfile
 from pathlib import Path
 
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
+
+
+def normalized_tree(effects, worktree, snapshot, index_tree):
+    """Build an application tree with Git attributes, retaining raw baselines."""
+    with tempfile.TemporaryDirectory(prefix='loop-manager-integration-index-') as directory:
+        index = Path(directory) / 'index'
+        effects._git_with_index(worktree, index, 'read-tree', index_tree)
+        effects._git_with_index(worktree, index, '--literal-pathspecs', 'add', '--all',
+                                '--', *sorted(snapshot.dirty))
+        return effects._git_with_index(worktree, index, 'write-tree').stdout.strip()
+
+
+def _preserve_conflict(effects, repo, worktree, snapshot):
+    baseline = effects._capture_agent_baseline(repo, worktree, snapshot, preserve_conflicts=True)
+    captured = effects.capture_git_snapshot(worktree)
+    if (captured.head, captured.branch, captured.index, captured.dirty, captured.operations, captured.config) != (
+            snapshot.head, snapshot.branch, snapshot.index, snapshot.dirty, snapshot.operations, snapshot.config):
+        raise RuntimeError('충돌 원형 보존 중 사용자 입력이 변경됐습니다.')
+    if snapshot.dirty and not baseline:
+        raise RuntimeError('현재 충돌 원형을 보존할 수 없습니다.')
+    return baseline
+
+
+def _abort_preserved_rebase(effects, connection, repo_path, state_dir, repo, plan, current, restart):
+    worktree, branch = Path(plan['worktree']), plan['branch']
+    now = effects.capture_git_snapshot(worktree)
+    if controlling_git_operation(now.operations):
+        effects._current_rebase_service(
+            connection, repo_path, state_dir, repo, plan['plan_id'], worktree, branch,
+            remote_oid=restart['remote']).require_owned(checkpoint=current)
+        original = GitSnapshot.deserialize(restart['snapshot'])
+        if (now.head, now.index, now.dirty, now.operations) != (
+                original.head, original.index, original.dirty, original.operations):
+            raise RuntimeError('보존된 충돌 원형과 현재 작업물이 다릅니다.')
+        result = effects.git(worktree, '-c', 'core.hooksPath=/dev/null', 'rebase', '--abort', check=False)
+        if result.returncode:
+            raise RuntimeError('소유 rebase 재시작을 재시도합니다: ' + result.stdout[-2000:])
+        now = effects.capture_git_snapshot(worktree)
+    if now.head != restart['original_head'] or now.branch != branch or now.operations:
+        raise RuntimeError('소유 rebase 복원 결과가 원래 로컬 HEAD와 다릅니다.')
+    return now
+
+
+def restart_base_rebase(effects, connection, repo_path, state_dir, repo, plan, remote, snapshot):
+    """Pin interrupted base-conflict input before restarting for a successor."""
+    plan_id, branch, worktree = plan['plan_id'], plan['branch'], Path(plan['worktree'])
+    checkpoints = ExecutionCheckpointRepository(connection)
+    current = checkpoints.get(repo, plan_id)
+    restart = (current.snapshot or {}).get('base_rebase_restart')
+    if restart is None or restart.get('phase') == 'complete':
+        effects._current_rebase_service(
+            connection, repo_path, state_dir, repo, plan_id, worktree, branch,
+            remote_oid=remote).require_owned(checkpoint=current)
+        baseline = _preserve_conflict(effects, repo, worktree, snapshot)
+        restart = dict(remote=remote, original_head=current.expected_head,
+                       snapshot=snapshot.serialize(), baseline=baseline, phase='preserving')
+        history = (current.snapshot or {}).get('base_rebase_restart_history', ())
+        previous = (current.snapshot or {}).get('base_rebase_restart')
+        current = checkpoints.record(
+            repo, plan_id, expected_generation=current.generation, operation=current.operation,
+            expected_head=current.expected_head, target_base_oid=current.target_base_oid,
+            observed_remote_oid=current.observed_remote_oid,
+            snapshot={**(current.snapshot or {}), 'integration_repo': repo, 'base_rebase_restart': restart,
+                      'base_rebase_restart_history': [*history, *([previous] if previous else [])]})
+    if restart['remote'] != remote:
+        raise RuntimeError('보존 중인 base 충돌 재시작의 원격 입력이 변경됐습니다.')
+    now = _abort_preserved_rebase(effects, connection, repo_path, state_dir, repo, plan, current, restart)
+    if now.dirty:
+        raise RuntimeError('base rebase 복원 뒤 미확인 로컬 작업물이 남았습니다.')
+    current = checkpoints.get(repo, plan_id)
+    return checkpoints.record(
+        repo, plan_id, expected_generation=current.generation, operation=None,
+        expected_head=now.head, target_base_oid=remote,
+        observed_remote_oid=current.observed_remote_oid,
+        snapshot={**(current.snapshot or {}), 'base_rebase_restart': {**restart, 'phase': 'complete'}})
 
 
 def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, snapshot):
@@ -67,37 +143,13 @@ def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, sna
                 connection, repo_path, state_dir, repo, plan_id, worktree, branch,
                 remote_oid=remote)
             service.require_owned(checkpoint=current)
-            preserved = effects._capture_agent_baseline(
-                repo, worktree, snapshot, preserve_conflicts=True)
-            after_capture = effects.capture_git_snapshot(worktree)
-            if (after_capture.head != snapshot.head or after_capture.index != snapshot.index
-                    or after_capture.dirty != snapshot.dirty or after_capture.operations != snapshot.operations
-                    or after_capture.config != snapshot.config):
-                raise RuntimeError('충돌 원형 보존 중 사용자 입력이 변경됐습니다.')
-            if snapshot.dirty and not preserved:
-                raise RuntimeError('현재 충돌 원형을 보존할 수 없습니다.')
+            preserved = _preserve_conflict(effects, repo, worktree, snapshot)
             restart = dict(remote=remote, original_head=current.expected_head,
                            snapshot=snapshot.serialize(), baseline=preserved)
             save({**intent, 'restart': restart}, head=current.expected_head, operation='rebase')
         elif restart['remote'] != remote:
             raise RuntimeError('보존 중인 충돌 재시작의 원격 입력이 다시 변경됐습니다.')
-        now = effects.capture_git_snapshot(worktree)
-        if controlling_git_operation(now.operations):
-            service = effects._current_rebase_service(
-                connection, repo_path, state_dir, repo, plan_id, worktree, branch,
-                remote_oid=remote)
-            service.require_owned(checkpoint=current)
-            original = GitSnapshot.deserialize(restart['snapshot'])
-            if (now.head != original.head or now.index != original.index
-                    or now.dirty != original.dirty or now.operations != original.operations):
-                raise RuntimeError('보존된 충돌 원형과 현재 작업물이 다릅니다.')
-            aborted = effects.git(worktree, '-c', 'core.hooksPath=/dev/null',
-                                  'rebase', '--abort', check=False)
-            if aborted.returncode:
-                raise RuntimeError('소유 rebase 재시작을 다음 실행에서 재시도합니다: ' + aborted.stdout[-2000:])
-            now = effects.capture_git_snapshot(worktree)
-        if now.head != restart['original_head'] or now.branch != branch:
-            raise RuntimeError('소유 rebase 복원 결과가 원래 로컬 HEAD와 다릅니다.')
+        now = _abort_preserved_rebase(effects, connection, repo_path, state_dir, repo, plan, current, restart)
         current = checkpoints.get(repo, plan_id)
         current = checkpoints.record(
             repo, plan_id, expected_generation=current.generation, operation=None,
@@ -117,13 +169,12 @@ def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, sna
                 or captured.index != snapshot.index or captured.dirty != snapshot.dirty
                 or captured.config != snapshot.config or captured.operations != snapshot.operations):
             raise RuntimeError('보존 tree 수집 중 사용자 작업물이 변경됐습니다.')
-        local_tree = (preserved['worktree_tree'] if preserved else
+        local_tree = (normalized_tree(effects, worktree, snapshot, preserved['index_tree']) if preserved else
                       effects.git(worktree, 'rev-parse', 'HEAD^{tree}').stdout.strip())
         local_commit = snapshot.head
         if preserved:
-            local_commit = effects.git(
-                worktree, 'commit-tree', local_tree, '-p', snapshot.head,
-                '-m', f'Preserve local input for {plan_id}').stdout.strip()
+            local_commit = effects._commit_tree(
+                worktree, local_tree, snapshot.head, f'Preserve local input for {plan_id}')
         intent = dict(remote=remote, branch=branch, worktree=str(worktree),
                       before=snapshot.serialize(), baseline=baseline,
                       local_tree=local_tree, local_commit=local_commit,
@@ -225,7 +276,9 @@ def preserved_refs(repo, saved, refs):
     prefix = 'refs/loop-manager/baselines/' + hashlib.sha256(repo.encode()).hexdigest()[:16] + '/'
     allowed = set()
     for intent in [*saved.get('work_branch_integration_history', ()),
-                   saved.get('work_branch_integration') or {}]:
+                   saved.get('work_branch_integration') or {},
+                   *saved.get('base_rebase_restart_history', ()),
+                   saved.get('base_rebase_restart') or {}]:
         for encoded in (intent.get('baseline'), (intent.get('restart') or {}).get('baseline')):
             if not encoded:
                 continue

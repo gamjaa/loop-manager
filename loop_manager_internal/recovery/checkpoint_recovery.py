@@ -54,6 +54,8 @@ class ReconcilePublishedBlockedCheckpointEffects:
     validate_execplan_workspace_identity: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
     _capture_agent_baseline: Callable[..., object]
+    _git_with_index: Callable[..., object]
+    _commit_tree: Callable[..., object]
     _journaled_direct_rebase: Callable[..., object]
     validate_blocked_agent_scope: Callable[..., object]
 
@@ -112,6 +114,10 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
         observation_error = f"원격 checkpoint를 재검증할 수 없습니다: {error}"
     else:
         observation_error = None
+    base_restarting = (adopt_only and current.operation == 'rebase'
+                       and current.observed_remote_oid != observed
+                       and (not integration or integration.get('phase') == 'complete'))
+    integrating = integrating or base_restarting
     accepted = str(row["accepted_remote_oid"] or row["published_oid"] or row["remote_oid"])
     unchanged = observed == accepted and not row["pending_remote_oid"]
     try:
@@ -257,7 +263,7 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
     fetched_oid = fetched_result.stdout.strip()
     if fetched_oid != observed:
         return retry("원격 checkpoint branch가 조회와 fetch 사이에 변경됐습니다.")
-    original_head = (current.expected_head if integrating and integration['phase'] == 'complete' else
+    original_head = (current.expected_head if base_restarting or integrating and integration['phase'] == 'complete' else
                      GitSnapshot.deserialize(integration['before']).head
                      if integrating else snapshot.head)
     local_history = effects.git(
@@ -285,7 +291,7 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
         except (OSError, RuntimeError, ValueError) as error:
             return refuse(str(error))
     ancestors = [(accepted, '마지막 확인 head'), (str(row['published_oid']), '게시 checkpoint')]
-    if integrating:
+    if integration and integrating:
         ancestors.append((str(integration['remote']), '진행 중인 원격 입력'))
     for ancestor, label in ancestors:
         relation = effects.git(
@@ -342,6 +348,21 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
             )
         except (OSError, RuntimeError, ValueError) as error:
             return refuse(str(error))
+    if base_restarting:
+        try:
+            work_branch_integration.restart_base_rebase(
+                effects, connection, repo_path, state_dir, repo, blocked, observed, snapshot)
+        except (OSError, RuntimeError, ValueError) as error:
+            return retry(str(error))
+        # Reobserve ownership and the exact successor after abort; the saved
+        # original HEAD and raw conflict trees remain restart evidence.
+        return _reconcile_published_blocked_checkpoint(
+            effects, connection, repo_path, state_dir, repo, blocked,
+            connection.execute('SELECT * FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?',
+                               (repo, blocked['plan_id'])).fetchone(),
+            request, repository, config_path, verify_timeout_seconds,
+            adopt_only=adopt_only, expected_remote_oid=expected_remote_oid,
+            project_recovery_context=project_recovery_context)
     if not integrating:
         try:
             effects.validate_blocked_agent_scope(

@@ -118,6 +118,94 @@ class ProjectCheckpointGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.T
 
 
 class CheckpointRebaseGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.TestCase):
+    def test_dirty_attributes_preserve_raw_bytes_and_integrate_normalized_blobs(self):
+        repo, _ = self._remote_refresh_fixture(branch_changed=True)
+        raw = {'crlf.txt': b'working\r\n', 'encoded.txt': 'working\n'.encode('utf-16')}
+        (self.worktree / '.gitattributes').write_text(
+            'crlf.txt text eol=crlf\nencoded.txt text working-tree-encoding=UTF-16\n')
+        for path, data in raw.items():
+            (self.worktree / path).write_bytes(data)
+        with mock.patch.object(loop_manager, '_evaluate_remote_checkpoint_cause',
+                               return_value=(False, 'same cause', None)):
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, self.repo, self.state_dir, repo, 'main'))
+        saved = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(repo, 'G-034')
+        intent = saved.snapshot['work_branch_integration']
+        baseline = json.loads(intent['baseline'])
+        self.assertEqual(intent['phase'], 'complete')
+        for path, data in raw.items():
+            self.assertEqual((self.worktree / path).read_bytes(), data)
+            preserved = subprocess.run(
+                ['git', '-C', str(self.worktree), 'show', f"{baseline['worktree_tree']}:{path}"],
+                check=True, stdout=subprocess.PIPE).stdout
+            self.assertEqual(preserved, data)
+            normalized = subprocess.run(
+                ['git', '-C', str(self.worktree), 'show', f'HEAD:{path}'],
+                check=True, stdout=subprocess.PIPE).stdout
+            self.assertEqual(normalized, b'working\n')
+        self.assertIsNone(saved.operation)
+        self.assertFalse(loop_manager.capture_git_snapshot(self.worktree).dirty)
+
+    def test_dirty_preservation_commit_does_not_require_user_identity(self):
+        repo, _ = self._remote_refresh_fixture(branch_changed=True)
+        (self.worktree / 'local.txt').write_text('local bytes\n')
+        self.run_git(self.worktree, 'config', '--unset', 'user.name')
+        self.run_git(self.worktree, 'config', '--unset', 'user.email')
+        self.run_git(self.worktree, 'config', 'user.useConfigOnly', 'true')
+        # Stop after preserving local input; rebase identity policy is a
+        # separate existing boundary from this commit-tree regression.
+        with mock.patch.object(loop_manager, '_journaled_direct_rebase', side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                loop_manager.resume_plan_blocks(self.connection, self.repo, self.state_dir, repo, 'main')
+        saved = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(repo, 'G-034')
+        intent = saved.snapshot['work_branch_integration']
+        self.assertEqual(intent['phase'], 'rebasing')
+        self.assertEqual(self.run_git(self.worktree, 'rev-parse', 'HEAD'), intent['local_commit'])
+        self.assertEqual(self.run_git(self.worktree, 'show', '-s', '--format=%an <%ae>;%cn <%ce>', 'HEAD'),
+                         'Loop Manager <loop-manager@localhost>;Loop Manager <loop-manager@localhost>')
+        self.assertEqual((self.worktree / 'local.txt').read_text(), 'local bytes\n')
+
+    def test_user_push_after_base_conflict_preserves_conflict_and_resumes_after_restart(self):
+        repo, _ = self._remote_refresh_fixture(branch_changed=True)
+        (self.repo / 'code.py').write_text('base correction\n')
+        self.run_git(self.repo, 'add', 'code.py')
+        self.run_git(self.repo, 'commit', '-m', 'Conflicting latest base')
+        self.run_git(self.repo, 'push', 'origin', 'main')
+        project = self.connection.execute('SELECT * FROM projects').fetchone()
+        loop_manager.observe_blocked_plan_remotes(self.connection, self.repo, repo, project)
+        self.assertFalse(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir, repo, 'main'))
+        self.assertTrue(self.run_git(self.worktree, 'ls-files', '-u'))
+        self.assertEqual(self.connection.execute(
+            'SELECT stage FROM blocked_plan_reconciliations WHERE plan_id = ?', ('G-034',)).fetchone()[0], 'adopted')
+        (self.worktree / 'code.py').write_text('manual local conflict bytes\n')
+        user = Path(self.temporary.name) / 'user'
+        self.run_git(user, 'fetch', 'origin', 'main')
+        merge = subprocess.run(['git', '-C', str(user), 'merge', '--no-edit', 'FETCH_HEAD'],
+                               stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        self.assertEqual(merge.returncode, 1, merge.stdout)
+        (user / 'code.py').write_text('resolved remote input\n')
+        self.run_git(user, 'add', 'code.py')
+        self.run_git(user, 'commit', '-m', 'Resolve base conflict remotely')
+        self.run_git(user, 'push', 'origin', 'HEAD:refs/heads/loop-manager/G-034')
+        loop_manager.observe_blocked_plan_remotes(self.connection, self.repo, repo, project)
+        with mock.patch.object(loop_manager, '_evaluate_remote_checkpoint_cause',
+                               return_value=(False, 'same cause', None)) as probe:
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, self.repo, self.state_dir, repo, 'main'))
+        probe.assert_called_once()
+        saved = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(repo, 'G-034')
+        restart = saved.snapshot['base_rebase_restart']
+        self.assertEqual(json.loads(restart['baseline'])['version'], 2)
+        self.assertEqual(restart['phase'], 'complete')
+        self.assertIsNone(saved.operation)
+        self.assertFalse(self.run_git(self.worktree, 'ls-files', '-u'))
+        self.assertEqual((self.worktree / 'code.py').read_text(), 'resolved remote input\n')
+        with mock.patch.object(loop_manager, '_evaluate_remote_checkpoint_cause') as duplicate_probe:
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, self.repo, self.state_dir, repo, 'main'))
+        duplicate_probe.assert_not_called()
+
     def test_both_remotes_and_local_commits_index_worktree_binary_input_survive(self):
         repo, _ = self._remote_refresh_fixture(base_changed=True, branch_changed=True)
         (self.worktree / 'rename.txt').write_text('rename bytes\n')

@@ -44,6 +44,8 @@ class WorkBranchIntegrationUnitTests(unittest.TestCase):
         self.service.observe.side_effect = lambda: (None, self.accepted)
         self.effects = SimpleNamespace(
             _capture_agent_baseline=mock.Mock(return_value=self.baseline),
+            _git_with_index=mock.Mock(return_value=subprocess.CompletedProcess([], 0, 'working-tree')),
+            _commit_tree=mock.Mock(return_value='preservation'),
             capture_git_snapshot=mock.Mock(side_effect=lambda _: self.now),
             git=mock.Mock(side_effect=self.git),
             _journaled_direct_rebase=mock.Mock(side_effect=self.rebase),
@@ -94,6 +96,85 @@ class WorkBranchIntegrationUnitTests(unittest.TestCase):
                          dict(observed_remote=('remote',), agent_session_id='same-session'))
         self.assertFalse(any(call.args[1] in {'reset', 'clean', 'push'}
                              for call in self.effects.git.call_args_list))
+
+    def test_application_tree_is_normalized_while_raw_baseline_is_retained(self):
+        self.effects._git_with_index.return_value.stdout = 'normalized-tree'
+        self.run_integration()
+        saved = self.store.get('repo', 'G-166').snapshot['work_branch_integration']
+        self.assertEqual(json.loads(saved['baseline'])['worktree_tree'], 'working-tree')
+        self.assertEqual(saved['local_tree'], 'normalized-tree')
+        self.effects._commit_tree.assert_called_once_with(
+            Path(self.plan['worktree']), 'normalized-tree', 'local', 'Preserve local input for G-166')
+        calls = self.effects._git_with_index.call_args_list
+        self.assertEqual(calls[1].args[2:], ('--literal-pathspecs', 'add', '--all', '--', 'file', 'new.bin'))
+        self.assertEqual(calls[0].args[1], calls[1].args[1])
+        self.assertEqual(calls[1].args[1], calls[2].args[1])
+        self.assertNotEqual(calls[1].args[1], Path(self.plan['worktree']) / '.git/index')
+
+    def test_filter_failure_stops_before_selected_head_or_index_moves(self):
+        self.effects._git_with_index.side_effect = RuntimeError('working-tree-encoding conversion failed')
+        with self.assertRaisesRegex(RuntimeError, 'conversion failed'):
+            self.run_integration()
+        self.effects._commit_tree.assert_not_called()
+        self.effects.git.assert_not_called()
+        self.effects._journaled_direct_rebase.assert_not_called()
+
+    def test_preservation_commit_uses_manager_identity_without_user_config(self):
+        def command(arguments, *, env):
+            self.assertEqual(env['GIT_AUTHOR_NAME'], 'Loop Manager')
+            self.assertEqual(env['GIT_COMMITTER_NAME'], 'Loop Manager')
+            self.assertEqual(env['GIT_AUTHOR_EMAIL'], 'loop-manager@localhost')
+            self.assertEqual(env['GIT_COMMITTER_EMAIL'], 'loop-manager@localhost')
+            return subprocess.CompletedProcess(arguments, 0, 'preservation\n')
+        effects = SimpleNamespace(command=mock.Mock(side_effect=command))
+        self.effects._commit_tree.side_effect = lambda root, tree, parent, message: scope_baseline._commit_tree(
+            root, tree, parent, message, effects=effects)
+        self.assertEqual(self.run_integration().head, 'combined')
+        self.assertIn('commit-tree', effects.command.call_args.args[0])
+
+    def test_base_conflict_restart_preserves_stages_and_resumes_after_abort_interruption(self):
+        conflict = replace(self.before, head='detached', branch=None,
+            index={'file': ('M 100644 base 1', 'M 100644 ours 2', 'M 100644 theirs 3')},
+            dirty={'file': (('staged', 'unstaged'), 'manual')}, operations={'rebase-merge': 'owned'})
+        self.now = conflict
+        self.store.record('repo', 'G-166', expected_generation=0, operation='rebase',
+            expected_head='local', target_base_oid='base', observed_remote_oid='old-remote', snapshot={})
+        git = self.git
+        def abort(root, *args, **kwargs):
+            if args[-2:] == ('rebase', '--abort'):
+                self.now = replace(self.before, dirty={}, operations={})
+                raise KeyboardInterrupt
+            return git(root, *args, **kwargs)
+        self.effects.git.side_effect = abort
+        arguments = (self.effects, self.connection, Path('/repo'), Path('/state'),
+                     'repo', self.plan, 'new-remote')
+        with self.assertRaises(KeyboardInterrupt):
+            integration.restart_base_rebase(*arguments, conflict)
+        saved = self.store.get('repo', 'G-166')
+        self.assertEqual(saved.operation, 'rebase')
+        restart = saved.snapshot['base_rebase_restart']
+        self.assertEqual(GitSnapshot.deserialize(restart['snapshot']).index, conflict.index)
+        self.effects.git.reset_mock()
+        completed = integration.restart_base_rebase(*arguments, self.now)
+        self.assertIsNone(completed.operation)
+        self.assertEqual(completed.expected_head, 'local')
+        self.assertEqual(completed.target_base_oid, 'new-remote')
+        self.assertEqual(completed.snapshot['base_rebase_restart']['phase'], 'complete')
+        self.assertEqual(completed.snapshot['base_rebase_restart']['baseline'], self.baseline)
+        self.effects.git.assert_not_called()
+        self.effects._capture_agent_baseline.assert_called_once_with(
+            'repo', Path(self.plan['worktree']), conflict, preserve_conflicts=True)
+
+    def test_base_conflict_ownership_refusal_does_not_capture_or_abort(self):
+        self.store.record('repo', 'G-166', expected_generation=0, operation='rebase',
+            expected_head='local', target_base_oid='base', observed_remote_oid='old-remote', snapshot={})
+        self.service.require_owned.side_effect = RuntimeError('origin or shared ownership changed')
+        with self.assertRaisesRegex(RuntimeError, 'ownership changed'):
+            integration.restart_base_rebase(self.effects, self.connection, Path('/repo'), Path('/state'),
+                                           'repo', self.plan, 'new-remote', self.now)
+        self.effects._capture_agent_baseline.assert_not_called()
+        self.effects.git.assert_not_called()
+        self.assertEqual(self.store.get('repo', 'G-166').operation, 'rebase')
 
     def test_pinned_index_stat_refresh_precedes_clean_capture_and_rebase(self):
         git = self.git
@@ -278,6 +359,13 @@ class ConflictBaselineUnitTests(unittest.TestCase):
 
 
 class UserBlobProvenanceUnitTests(unittest.TestCase):
+    def test_base_restart_refs_require_exact_project_and_pinned_oid(self):
+        ref = 'refs/loop-manager/baselines/' + hashlib.sha256(b'repo').hexdigest()[:16] + '/' + 'a' * 64
+        saved = {'base_rebase_restart': {'baseline': json.dumps({'ref': ref, 'ref_target': 'pinned'})}}
+        self.assertEqual(integration.preserved_refs('repo', saved, {ref: ('pinned', '')}), frozenset({ref}))
+        self.assertFalse(integration.preserved_refs('repo', saved, {ref: ('changed', '')}))
+        self.assertFalse(integration.preserved_refs('other', saved, {ref: ('pinned', '')}))
+
     def test_only_exact_owned_preservation_ref_can_advance_comparison(self):
         prefix = 'refs/loop-manager/baselines/' + hashlib.sha256(b'repo').hexdigest()[:16] + '/'
         owned = prefix + 'a' * 64
