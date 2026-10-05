@@ -277,11 +277,11 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
         config = loop_manager.ROOT / "config/config.ini.example"
         with mock.patch(
             "loop_manager.codex_model_efforts",
-            return_value={"gpt-6-astra": frozenset({"low"})},
+            return_value={"gpt-6.1-sol": frozenset({"xhigh"})},
         ):
             self.assertEqual(
                 loop_manager.worker_profile(config, 8),
-                ("gpt-6-astra", "low"),
+                ("gpt-6.1-sol", "xhigh"),
             )
         self.assertEqual(
             loop_manager.provider_worker_profile(
@@ -296,7 +296,7 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
         with tempfile.TemporaryDirectory() as directory:
             with mock.patch(
                 "loop_manager.codex_model_efforts",
-                return_value={"gpt-6-astra": frozenset({"medium"})},
+                return_value={"gpt-6.1-sol": frozenset({"medium"})},
             ), mock.patch("loop_manager.subprocess.run") as subprocess_run:
                 with self.assertRaisesRegex(RuntimeError, "지원하지 않습니다"):
                     loop_manager.run_codex(
@@ -310,15 +310,24 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
                     )
             subprocess_run.assert_not_called()
 
+        with tempfile.TemporaryDirectory() as directory:
+            custom_config = Path(directory) / "custom.ini"
+            custom_config.write_text(
+                "[codex.models]\ncustom = supported-model\n"
+                "[codex.worker]\nlevel8 = custom,high\n",
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                loop_manager.provider_worker_profile(
+                    custom_config, "codex", 8,
+                    {"supported-model": frozenset({"high"})},
+                ),
+                ("supported-model", "high"),
+            )
+            with self.assertRaisesRegex(RuntimeError, "지원하지 않습니다"):
+                loop_manager.provider_worker_profile(custom_config, "codex", 8, {})
+
         invalid_profiles = (
-            (
-                "codex-alias",
-                "[codex.models]\nfrontier = gpt-6-astra\nstrong = gpt-5.6-sol\n"
-                "[codex.worker]\nlevel8 = strong,low\n",
-                "codex",
-                {"gpt-5.6-sol": frozenset({"low"})},
-                "frontier,low",
-            ),
             (
                 "claude-alias",
                 "[claude.models]\nstrong = claude-opus-5\nfast = claude-haiku\n"

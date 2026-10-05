@@ -83,18 +83,13 @@ def provider_profile(
             f"{label} Model 설정이 비어 있습니다: [{models_section}] {alias}"
         )
 
-    if section == f"{provider}.worker" and name == "level8":
-        expected_alias, expected_effort = {
-            "codex": ("frontier", "low"),
-            "claude": ("strong", "max"),
-        }[provider]
+    if provider == "claude" and section == "claude.worker" and name == "level8":
+        expected_alias, expected_effort = "strong", "max"
         if (alias, effort) != (expected_alias, expected_effort):
             raise RuntimeError(
                 f"{label}은 {expected_alias},{expected_effort} 설정이어야 합니다."
             )
-        if provider == "codex" and model != "gpt-6-astra":
-            raise RuntimeError(f"{label} Model은 gpt-6-astra여야 합니다: {model}")
-        if provider == "claude" and not re.fullmatch(
+        if not re.fullmatch(
             r"claude-opus-5(?:[-.].*)?", model
         ):
             raise RuntimeError(
