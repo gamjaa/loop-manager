@@ -20,7 +20,6 @@
 시스템 설계:
 - `docs/ARCHITECTURE.md`
 
-Loop Manager가 수행하는 모든 구현 작업은 크기와 관계없이 `docs/plans` 하위에 ExecPlan을 작성한 뒤 진행한다.
 ExecPlan 작성 규칙:
 - `docs/PLANS.md`
 
