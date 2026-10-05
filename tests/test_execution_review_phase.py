@@ -163,7 +163,7 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
             "branch, worktree, accepted_remote_oid) "
             "VALUES ('repo', 'G-047', 'request', 'published', "
             "'review_retry_exhausted', 'review', 'loop-manager/G-047', "
-            "'/state/G-047', 'old-head')"
+            "?, 'old-head')", (str(Path('/state/G-047')),)
         )
         self.state.update_project('repo', phase='VERIFYING',
                                   publication_remote_oid='old-head')
@@ -227,7 +227,7 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
             "branch, worktree, accepted_remote_oid) "
             "VALUES ('repo', 'G-047', 'request', 'published', "
             "'review_retry_exhausted', 'review', 'loop-manager/G-047', "
-            "'/state/G-047', 'old-head')"
+            "?, 'old-head')", (str(Path('/state/G-047')),)
         )
         self.state.update_project('repo', publication_remote_oid='corrected-head')
         checkpoint.record(
@@ -282,7 +282,7 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
             "branch, worktree, accepted_remote_oid) "
             "VALUES ('repo', 'G-047', 'request', 'published', "
             "'review_retry_exhausted', 'review', 'loop-manager/G-047', "
-            "'/state/G-047', 'owned-head')"
+            "?, 'owned-head')", (str(Path('/state/G-047')),)
         )
         checkpoint.record(
             'repo', 'G-047', expected_generation=0, operation='push',
@@ -330,7 +330,7 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
             "branch, worktree, accepted_remote_oid) "
             "VALUES ('repo', 'G-047', 'request', 'published', "
             "'review_retry_exhausted', 'review', 'loop-manager/G-047', "
-            "'/state/G-047', 'owned-head')"
+            "?, 'owned-head')", (str(Path('/state/G-047')),)
         )
         context = self.context()
         marker = {'request_identity': 'request', 'owner_oid': 'owned-head',

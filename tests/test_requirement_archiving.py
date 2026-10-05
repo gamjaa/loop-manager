@@ -30,6 +30,7 @@ class RequirementArchiveEligibilityTest(unittest.TestCase):
         git(self.repo, "init", "--initial-branch=main")
         git(self.repo, "config", "user.email", "loop-manager@example.com")
         git(self.repo, "config", "user.name", "Loop Manager Test")
+        git(self.repo, "config", "core.autocrlf", "false")
         (self.repo / "docs/plans").mkdir(parents=True)
         (self.repo / "docs/requirements/archive").mkdir(parents=True)
         (self.repo / "docs/PRODUCT.md").write_text("# Product\n", encoding="utf-8")

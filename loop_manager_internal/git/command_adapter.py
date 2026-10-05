@@ -53,8 +53,12 @@ def git(effects: GitEffects,
             return subprocess.CompletedProcess(
                 ["git", "-C", str(repo), *arguments], 1, overlap_error
             )
+    # Manager fetch가 origin/HEAD를 자동 생성해 Agent scope에 섞지 않도록 한다.
+    options = ("-c", "remote.origin.followRemoteHEAD=never") if (
+        arguments[command_index:command_index + 1] == ("fetch",)
+    ) else ()
     result = effects.command(
-        ["git", "-C", str(repo), *arguments], check=False,
+        ["git", "-C", str(repo), *options, *arguments], check=False,
         **({"env": env} if env is not None else {}),
     )
     if check and result.returncode:
@@ -73,10 +77,10 @@ def git_bytes(effects: GitBytesEffects, repo: Path, *arguments: str) -> bytes:
     result = effects._handoff_run(
         ["git", "-C", str(repo), *options, *arguments],
         stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        stderr=subprocess.PIPE,
     )
     if result.returncode:
-        output = result.stdout[-6000:].decode("utf-8", errors="replace").strip()
+        output = (result.stdout + (result.stderr or b""))[-6000:].decode("utf-8", errors="replace").strip()
         message = f"명령 실패 (git -C {repo}):\n{output}"
         if effects.is_git_lock_failure(output):
             raise GitLockError(message)

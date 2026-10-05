@@ -921,44 +921,44 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
                              for row in self.events(connection)))
 
     def test_restart_preserves_confirmed_incident_and_unconfirmed_block_stays_silent(self):
-        with tempfile.TemporaryDirectory() as directory:
-            database = Path(directory) / "notices.db"
-            connection = self.connection(database=database)
-            repo = "/projects/alpha"
-            with connection:
-                connection.execute(
-                    "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
-                    "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'original cause')",
-                    (repo,),
-                )
-                notifications.enqueue_current_project_events(connection, repo)
-            notifications.dispatch_pending(
-                connection, "token", "chat", adapter=mock.Mock(),
+        directory = self.enterContext(tempfile.TemporaryDirectory())
+        database = Path(directory) / "notices.db"
+        connection = self.connection(database=database)
+        repo = "/projects/alpha"
+        with connection:
+            connection.execute(
+                "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'original cause')",
+                (repo,),
             )
-            with connection:
-                scoped_blocking.clear_plan_block(connection, repo, "G-018")
-            connection.close()
+            notifications.enqueue_current_project_events(connection, repo)
+        notifications.dispatch_pending(
+            connection, "token", "chat", adapter=mock.Mock(),
+        )
+        with connection:
+            scoped_blocking.clear_plan_block(connection, repo, "G-018")
+        connection.close()
 
-            restarted = sqlite3.connect(database)
-            self.addCleanup(restarted.close)
-            restarted.row_factory = sqlite3.Row
-            notifications.configure_session(restarted, enabled=True)
-            with restarted:
-                self.assertEqual(notifications.record_work_start(
-                    restarted, repo, "Worker", plan_id="G-018",
-                ), 1)
-                restarted.execute(
-                    "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
-                    "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'new cause')",
-                    (repo,),
-                )
-                notifications.enqueue_current_project_events(restarted, repo)
-                scoped_blocking.clear_plan_block(restarted, repo, "G-018")
-                self.assertEqual(notifications.record_work_start(
-                    restarted, repo, "Worker", plan_id="G-018",
-                ), 0)
-            self.assertEqual(len([row for row in self.events(restarted)
-                                  if row["event_type"] == "resumed"]), 1)
+        restarted = sqlite3.connect(database)
+        self.addCleanup(restarted.close)
+        restarted.row_factory = sqlite3.Row
+        notifications.configure_session(restarted, enabled=True)
+        with restarted:
+            self.assertEqual(notifications.record_work_start(
+                restarted, repo, "Worker", plan_id="G-018",
+            ), 1)
+            restarted.execute(
+                "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'new cause')",
+                (repo,),
+            )
+            notifications.enqueue_current_project_events(restarted, repo)
+            scoped_blocking.clear_plan_block(restarted, repo, "G-018")
+            self.assertEqual(notifications.record_work_start(
+                restarted, repo, "Worker", plan_id="G-018",
+            ), 0)
+        self.assertEqual(len([row for row in self.events(restarted)
+                              if row["event_type"] == "resumed"]), 1)
 
     def test_reopened_pr_records_resumption_in_transition(self):
         connection = self.connection()

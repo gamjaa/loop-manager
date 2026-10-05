@@ -27,7 +27,7 @@ class BlockedRemoteFixture:
                 'content_hash, status, branch, worktree, workspace_owned, worker_session_id, '
                 'verify_failure_history, effective_worker_level, priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
                 (self.repo, plan_id, f'docs/plans/[{plan_id}] Work.md', 'Work', '[]', '[]', 'hash',
-                 'IMPLEMENTING', f'loop-manager/{plan_id}', f'/state/{plan_id}', 1, 'session', '{"failure":3}', 6, 'critical'))
+                 'IMPLEMENTING', f'loop-manager/{plan_id}', str(Path(f'/state/{plan_id}').resolve()), 1, 'session', '{"failure":3}', 6, 'critical'))
             runtime_state = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
             runtime_state.block_plan(self.repo, plan_id, reason_code='verify_retry_exhausted',
                                      evidence='original verify failure', release_fingerprint='input',

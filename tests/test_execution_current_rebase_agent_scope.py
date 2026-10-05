@@ -97,7 +97,7 @@ class CurrentRebaseAgentScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
             self.original, accepted_start))
         self.current = replace(self.current, head='later-head',
             refs={**self.current.refs, 'refs/heads/loop-manager/G-047': ('later-head', '')},
-            worktrees={'/state/G-047': ('HEAD=later-head', 'branch=refs/heads/loop-manager/G-047')})
+            worktrees={str(Path('/state/G-047').resolve()): ('HEAD=later-head', 'branch=refs/heads/loop-manager/G-047')})
         connection.execute("UPDATE projects SET agent_result_snapshot = ? WHERE repo='repo'",
                            (accepted_start.serialize(),))
         with self.assertRaises(lm.AgentScopeError):

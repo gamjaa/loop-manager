@@ -268,7 +268,7 @@ class ApprovedDocumentPlanTest(unittest.TestCase):
             target.parent.mkdir(parents=True)
             target.write_text(
                 "## Approved Document Draft\n" + document_publication.planning_instruction(draft),
-                encoding="utf-8",
+                encoding="utf-8", newline="",
             )
             plan = {"id": "G-300", "sources": [document_publication.R027_SOURCE]}
             snapshot = MutableReadySnapshot(

@@ -50,7 +50,7 @@ class ExternalOwnershipObservationTests(TestCase):
         context = SimpleNamespace(plan=SimpleNamespace(plan_id='G-001'),
                                   branch='branch', worktree=Path('/worktree'))
         checkpoint = {'accepted_remote_oid': 'old', 'request_identity': 'request',
-                      'branch': 'branch', 'worktree': '/worktree'}
+                      'branch': 'branch', 'worktree': str(Path('/worktree'))}
         marker = {'request_identity': 'request', 'owner_oid': 'old', 'head': 'old'}
         current = SimpleNamespace(operation='review', snapshot={}, expected_head='old')
         handler = OwnershipHandler(ports)
@@ -85,7 +85,7 @@ class ExternalOwnershipObservationTests(TestCase):
             ),
             _plan=lambda plan_id: {'publication_remote_oid': 'head'},
         )
-        plan = {'plan_id': 'G-001', 'branch': 'branch', 'worktree': '/worktree'}
+        plan = {'plan_id': 'G-001', 'branch': 'branch', 'worktree': str(Path('/worktree'))}
         context = {'branch_oid': 'head'}
         with mock.patch.object(blocked_plan_reconciliation, 'ExecutionCheckpointRepository') as checkpoints, \
              mock.patch.object(blocked_plan_reconciliation, 'BlockedCheckpointRepository'):
@@ -107,7 +107,7 @@ class ExternalOwnershipObservationTests(TestCase):
             connection=connection, repo='/repo', repo_path=Path('/repo'),
             ports=SimpleNamespace(owned_remote_oid=owner, git=mock.Mock()),
         )
-        plan = {'plan_id': 'G-001', 'branch': 'branch', 'worktree': '/worktree',
+        plan = {'plan_id': 'G-001', 'branch': 'branch', 'worktree': str(Path('/worktree')),
                 'publication_remote_oid': 'head'}
         with self.assertRaises(RecoveryFailure) as caught:
             project_blocked_recovery.ProjectBlockedReconciler._lineage_known(
@@ -133,7 +133,7 @@ class ExternalOwnershipObservationTests(TestCase):
             }),
             SimpleNamespace(fetchone=lambda: {
                 'status': 'PLAN_BLOCKED', 'workspace_owned': 1,
-                'branch': branch, 'worktree': '/worktree',
+                'branch': branch, 'worktree': str(Path('/worktree')),
                 'publication_remote_oid': 'head',
             }),
             SimpleNamespace(fetchone=lambda: {
@@ -221,7 +221,7 @@ class ExternalOwnershipObservationTests(TestCase):
     def test_failed_live_ref_query_does_not_become_ownership_refusal(self):
         row = {
             'phase': 'published', 'result': 'published', 'branch': 'branch',
-            'worktree': '/worktree', 'accepted_remote_oid': 'old',
+            'worktree': str(Path('/worktree')), 'accepted_remote_oid': 'old',
             'pending_remote_oid': None, 'published_oid': 'published',
             'commit_identity': 'identity', 'tree_oid': 'tree',
         }

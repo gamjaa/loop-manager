@@ -198,17 +198,17 @@ def inspect_registration_files(
     architecture = blobs["docs/ARCHITECTURE.md"]
     agents = blobs["AGENTS.md"]
     assert plans is not None and architecture is not None and agents is not None
-    if hashlib.sha256(plans).hexdigest() != effects.file_hash(effects.ROOT / "docs/PLANS.md"):
+    if plans.replace(b"\r\n", b"\n") != effects.normalized_text(effects.ROOT / "docs/PLANS.md").encode("utf-8"):
         raise RuntimeError("docs/PLANS.md가 Loop Manager 기준 파일과 다릅니다.")
-    if hashlib.sha256(architecture).hexdigest() == effects.file_hash(
+    if architecture.replace(b"\r\n", b"\n") == effects.normalized_text(
         effects.ROOT / "docs/ARCHITECTURE.template.md"
-    ):
+    ).encode("utf-8"):
         raise RuntimeError(
             "docs/ARCHITECTURE.md가 변경되지 않은 템플릿이라 등록할 수 없습니다."
         )
-    if product is not None and hashlib.sha256(product).hexdigest() == effects.file_hash(
+    if product is not None and product.replace(b"\r\n", b"\n") == effects.normalized_text(
         effects.ROOT / "docs/PRODUCT.template.md"
-    ):
+    ).encode("utf-8"):
         raise RuntimeError(
             "docs/PRODUCT.md가 변경되지 않은 템플릿이라 등록할 수 없습니다."
         )

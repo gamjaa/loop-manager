@@ -346,12 +346,12 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
         self.block(reason='managed_worktree_scope_violation')
         self.scope_stage_result()
         self.case.observed = replace(self.case.observed, head='owned-head', branch='loop-manager/G-047',
-            branch_ref=('owned-head', ''), branch_worktrees=('/state/G-047',),
+            branch_ref=('owned-head', ''), branch_worktrees=(str(Path('/state/G-047').resolve()),),
             registration=('HEAD=owned-head', 'branch=refs/heads/loop-manager/G-047'),
             operations=(), metadata=None, index_clean=True, staged=())
         self.current_scope = replace(self.current_scope, head='owned-head', branch='loop-manager/G-047',
             refs={'refs/heads/loop-manager/G-047': ('owned-head', '')},
-            worktrees={'/state/G-047': self.case.observed.registration}, operations={}, dirty={})
+            worktrees={str(Path('/state/G-047').resolve()): self.case.observed.registration}, operations={}, dirty={})
         self.connection.execute("INSERT INTO exec_plans (repo, plan_id, path, title, sources, "
             "depends_on, priority, content_hash, status, blocked_reason) VALUES ('repo', 'G-048', "
             "'docs/plans/[G-048] Other.md', 'Other', '[]', '[]', 'normal', 'hash', 'PLAN_BLOCKED', 'user_decision_required')")

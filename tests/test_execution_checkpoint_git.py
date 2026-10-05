@@ -66,24 +66,26 @@ class AutostashCheckpointGitTests(unittest.TestCase):
             self.assertFalse((repo / '.git' / 'rebase-apply').exists())
 
             reopened = sqlite3.connect(Path(directory) / 'checkpoints.db')
-            reopened.row_factory = sqlite3.Row
-            self.addCleanup(reopened.close)
-            intent = ExecutionCheckpointRepository(reopened).get('repo', 'G-044')
-            actual = observe(
-                plan_id='G-044',
-                row=dict(phase='WORKING', active_sha=before_head,
-                         validated_base_sha=None, verify_token=None,
-                         review_token=None, archive_token=None,
-                         publication_token=None, publication_remote_oid=None,
-                         pr_head_oid=None),
-                definition_revision='definition', base_oid=target_base,
-                branch='feature', worktree=repo, owned=True, git=git,
-                rebase_in_progress=lambda *_: False,
-                remote_oid=None, pull_request=None,
-                rebase_intent=intent.operation == 'rebase',
-                rebase_before_head=intent.expected_head,
-                rebase_target_oid=intent.target_base_oid, stash_oid=None,
-            )
-            self.assertTrue(actual.unmerged_stages)
-            self.assertEqual(assess(actual).action, CheckpointAction.USER_ACTION)
-            self.assertEqual(assess(actual).reason, 'autostash_identity_unavailable')
+            try:
+                reopened.row_factory = sqlite3.Row
+                intent = ExecutionCheckpointRepository(reopened).get('repo', 'G-044')
+                actual = observe(
+                    plan_id='G-044',
+                    row=dict(phase='WORKING', active_sha=before_head,
+                             validated_base_sha=None, verify_token=None,
+                             review_token=None, archive_token=None,
+                             publication_token=None, publication_remote_oid=None,
+                             pr_head_oid=None),
+                    definition_revision='definition', base_oid=target_base,
+                    branch='feature', worktree=repo, owned=True, git=git,
+                    rebase_in_progress=lambda *_: False,
+                    remote_oid=None, pull_request=None,
+                    rebase_intent=intent.operation == 'rebase',
+                    rebase_before_head=intent.expected_head,
+                    rebase_target_oid=intent.target_base_oid, stash_oid=None,
+                )
+                self.assertTrue(actual.unmerged_stages)
+                self.assertEqual(assess(actual).action, CheckpointAction.USER_ACTION)
+                self.assertEqual(assess(actual).reason, 'autostash_identity_unavailable')
+            finally:
+                reopened.close()

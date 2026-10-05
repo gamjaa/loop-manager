@@ -27,7 +27,7 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
         workspace = recovered_rebase_workspace(self.handler.effects.workspace,
             connection=self.fixture.connection, repo_path=self.handler.repo_path,
             state_dir=self.handler.state_dir, repo='repo', plan_id='G-047',
-            worktree=Path('/state/G-047'))
+            worktree=Path('/state/G-047').resolve())
         # Substitute external Git effects after constructing the same bindings
         # as the real lifecycle fixture; no Git process runs in these cases.
         self.effects = replace(self.handler.effects, workspace=replace(workspace,
@@ -311,7 +311,7 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
         result = self.coordinator.dispatch(self.handler._context())
         self.assertEqual(result.kind, ExecutionOutcomeKind.SUCCESS)
         expected_record = mock.call(Path('/repo'), Path('/state'), 'repo',
-                                    'loop-manager/G-047', Path('/state/G-047'), self.final_head)
+                                    'loop-manager/G-047', Path('/state/G-047').resolve(), self.final_head)
         self.assertEqual(self.effects.publication.record_remote_publication_branch.call_args_list,
                          [expected_record, expected_record])
         self.effects.publication.push_managed_publication_branch.assert_not_called()

@@ -589,8 +589,9 @@ class RealGitJournalReplayTests(unittest.TestCase):
             git('commit', '-m', 'Change value on worker branch')
             changed[20] = 'line-20-after-resolution\n'
             app.write_text(''.join(changed), encoding='utf-8')
-            app.chmod(0o755)
             git('add', 'app.txt')
+            app.chmod(0o755)
+            git('update-index', '--chmod=+x', '--', 'app.txt')
             git('commit', '-m', 'Change later content and mode')
             changed[12] = 'line-12-after-resolution\n'
             app.write_text(''.join(changed), encoding='utf-8')
@@ -695,6 +696,7 @@ class RealGitJournalReplayTests(unittest.TestCase):
             staged = loop_manager._owned_rebase_journal_state(repo, branch)
             # Reproduce the mode-only attack that Git diff can conceal when
             # core.fileMode is false. The file and its approval stay unchanged.
+            file_mode = git('config', '--get', 'core.fileMode').stdout.strip()
             git('config', 'core.fileMode', 'false')
             git('update-index', '--chmod=+x', '--', 'app.txt')
             self.assertEqual(git('diff', '--quiet', '--', 'app.txt',
@@ -707,7 +709,7 @@ class RealGitJournalReplayTests(unittest.TestCase):
                 accepted_files={'app.txt': staged['dirty']['app.txt'][1]},
                 accepted_modes={'app.txt': '100644'}, staged_dirty=tampered['dirty']))
             git('update-index', '--chmod=-x', '--', 'app.txt')
-            git('config', 'core.fileMode', 'true')
+            git('config', 'core.fileMode', file_mode)
             staged_tree = git('write-tree').stdout.strip()
             continuation = journal.begin_rebase(
                 state, owner='plan:G-099', repo=repo_key, target=repo_key,

@@ -10,6 +10,9 @@ from loop_manager_internal.storage import planning_input_state
 from tests.support.worker import dummy_worker_sessions
 
 
+REPO = str(Path("/repo").resolve())
+
+
 class PersistedMergeProjectQueryTest(unittest.TestCase):
     def setUp(self):
         self.connection = sqlite3.connect(":memory:")
@@ -19,12 +22,12 @@ class PersistedMergeProjectQueryTest(unittest.TestCase):
         self.addCleanup(self.connection.close)
         self.connection.execute(
             "INSERT INTO projects (repo, base_branch, phase, plan_path, branch, pr_url) "
-            "VALUES ('/repo', 'main', 'PUBLISHING', 'docs/plans/[G-001] Original.md', "
-            "'loop-manager/G-001', 'https://example.test/pr/1')"
+            "VALUES (?, 'main', 'PUBLISHING', 'docs/plans/[G-001] Original.md', "
+            "'loop-manager/G-001', 'https://example.test/pr/1')", (REPO,)
         )
         self.insert_plan("G-001", "MERGED")
 
-    def insert_plan(self, plan_id, status, *, repo="/repo"):
+    def insert_plan(self, plan_id, status, *, repo=REPO):
         self.connection.execute(
             "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, "
             "priority, content_hash, status, branch, pr_url) "
@@ -46,7 +49,7 @@ class PersistedMergeProjectQueryTest(unittest.TestCase):
                 "migrate_legacy_execplans", "resume_plan_blocks", "_recorded_base_fetch",
             ):
                 stack.enter_context(mock.patch.object(loop_manager, name))
-            stack.enter_context(mock.patch.object(loop_manager, "validate_repository", return_value=Path("/repo")))
+            stack.enter_context(mock.patch.object(loop_manager, "validate_repository", return_value=Path(REPO)))
             stack.enter_context(mock.patch.object(loop_manager, "remote_base", return_value="main"))
             stack.enter_context(mock.patch.object(loop_manager, "git", return_value=SimpleNamespace(stdout="a" * 40)))
             stack.enter_context(mock.patch.object(loop_manager, "recheck_cleanup_pending", return_value=[]))
@@ -66,7 +69,7 @@ class PersistedMergeProjectQueryTest(unittest.TestCase):
                     return_value=SimpleNamespace(kind=loop_manager.PlanningOutcomeKind.WAITING),
                 ))
             result = loop_manager._run_project_step(
-                self.connection, Path("/state"), "/repo", Path("unused.ini"), "main", False,
+                self.connection, Path("/state"), REPO, Path("unused.ini"), "main", False,
             )
         self.assertEqual(result, 0)
         if planning is not None:
@@ -76,7 +79,7 @@ class PersistedMergeProjectQueryTest(unittest.TestCase):
     def test_stale_merged_projection_skips_pr_query_after_plan_rename(self):
         self.connection.execute(
             "UPDATE exec_plans SET path = 'docs/plans/archive/[G-001] Renamed.md' "
-            "WHERE repo = '/repo' AND plan_id = 'G-001'"
+            "WHERE repo = ? AND plan_id = 'G-001'", (REPO,)
         )
         with mock.patch.object(loop_manager, "pr_for_branch", side_effect=AssertionError("PR query")) as pr:
             for phase in ("PUBLISHING", "WORKING", "VERIFYING", "REVIEWING"):
@@ -89,7 +92,7 @@ class PersistedMergeProjectQueryTest(unittest.TestCase):
                     projection = self.connection.execute("SELECT phase, plan_path, branch FROM projects").fetchone()
                     self.assertEqual(tuple(projection), (None, None, None))
                     self.assertEqual(self.connection.execute(
-                        "SELECT status FROM exec_plans WHERE repo = '/repo' AND plan_id = 'G-001'"
+                        "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'", (REPO,)
                     ).fetchone()[0], "MERGED")
             pr.assert_not_called()
 
@@ -110,29 +113,29 @@ class PersistedMergeProjectQueryTest(unittest.TestCase):
 
         with mock.patch.object(loop_manager, "pr_for_branch", return_value={"state": "OPEN"}) as pr:
             self.run_step(synchronize=synchronize)
-            pr.assert_called_once_with(Path("/repo"), "loop-manager/G-002")
+            pr.assert_called_once_with(Path(REPO), "loop-manager/G-002")
         self.assertEqual(self.connection.execute(
             "SELECT status FROM exec_plans WHERE plan_id = 'G-002'"
         ).fetchone()[0], "PR_OPEN")
 
     @dummy_worker_sessions
     def test_unconfirmed_project_keeps_query_despite_other_repository_merge(self):
-        self.connection.execute("UPDATE exec_plans SET status = 'PR_OPEN' WHERE repo = '/repo'")
+        self.connection.execute("UPDATE exec_plans SET status = 'PR_OPEN' WHERE repo = ?", (REPO,))
         self.insert_plan("G-001", "MERGED", repo="/other")
         with mock.patch.object(loop_manager, "pr_for_branch", return_value=None) as pr:
             self.run_step()
-            pr.assert_called_once_with(Path("/repo"), "loop-manager/G-001", "https://example.test/pr/1")
+            pr.assert_called_once_with(Path(REPO), "loop-manager/G-001", "https://example.test/pr/1")
 
     def stable_planning_input(self):
         self.connection.execute(
             "INSERT INTO execplan_catalog_revisions (repo, revision_sha, catalog_fingerprint) "
-            "VALUES ('/repo', ?, 'catalog')", ("a" * 40,),
+            "VALUES (?, ?, 'catalog')", (REPO, "a" * 40),
         )
         self.connection.execute(
             "UPDATE projects SET planning_fingerprint = 'stable', "
             "specification_fingerprint = 'spec', processed_sha = ?", ("a" * 40,),
         )
-        planning_input_state.record_general(self.connection, "/repo", "a" * 40, {})
+        planning_input_state.record_general(self.connection, REPO, "a" * 40, {})
         self.connection.commit()
 
     @dummy_worker_sessions
@@ -156,7 +159,7 @@ class PersistedMergeProjectQueryTest(unittest.TestCase):
         self.assertEqual(tuple(self.connection.execute("SELECT * FROM exec_plans").fetchone()), before)
         project = self.connection.execute("SELECT phase, branch, plan_path, last_error FROM projects").fetchone()
         self.assertEqual(tuple(project), (None, None, None, None))
-        self.assertIsNone(scoped_blocking.project_block(self.connection, "/repo"))
+        self.assertIsNone(scoped_blocking.project_block(self.connection, REPO))
 
     @dummy_worker_sessions
     def test_merged_projection_allows_ready_activation_and_actual_execution_prepare(self):
@@ -181,7 +184,7 @@ class PersistedMergeProjectQueryTest(unittest.TestCase):
         project = self.connection.execute("SELECT phase, plan_path, last_error FROM projects").fetchone()
         self.assertEqual(tuple(project), ("WORKING", "docs/plans/[G-002] Original.md", None))
         self.assertEqual(self.connection.execute("SELECT status FROM exec_plans WHERE plan_id = 'G-001'").fetchone()[0], "MERGED")
-        self.assertIsNone(scoped_blocking.project_block(self.connection, "/repo"))
+        self.assertIsNone(scoped_blocking.project_block(self.connection, REPO))
 
     @dummy_worker_sessions
     def test_preserved_planning_attempt_keeps_merged_projection_and_sessions(self):

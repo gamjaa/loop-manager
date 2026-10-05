@@ -129,7 +129,7 @@ class WorkspaceMissingRecoveryTest(WorkspaceFixture, unittest.TestCase):
             self.assertEqual(sessions, ["worker-session"])
             self.assertTrue(worktree.is_dir())
             loop_manager.validate_managed_worktree(repo, worktree, branch)
-            self.assertEqual(project["phase"], "WORKING")
+            self.assertEqual(project["phase"], "WORKING", dict(project))
             self.assertEqual(project["last_error"], "stop after recovery")
             self.assertIsNone(project["agent_snapshot"])
             self.assertEqual(plan_status, "IMPLEMENTING")

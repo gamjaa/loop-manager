@@ -65,6 +65,7 @@ def repository(root: Path) -> tuple[Path, str]:
     git(repo, "init", "--initial-branch=main")
     git(repo, "config", "user.email", "loop@example.com")
     git(repo, "config", "user.name", "Loop Test")
+    git(repo, "config", "core.autocrlf", "false")
     files = {
         "AGENTS.md": "# Agents\n",
         "docs/PRODUCT.md": "# Product\n",

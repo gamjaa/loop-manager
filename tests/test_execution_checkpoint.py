@@ -42,7 +42,7 @@ class CheckpointAssessmentTests(unittest.TestCase):
     def test_published_owner_requires_commit_tree_and_exact_live_ref(self):
         row = {
             'phase': 'published', 'result': 'published',
-            'branch': 'loop/G-044', 'worktree': '/owned',
+            'branch': 'loop/G-044', 'worktree': str(Path('/owned')),
             'accepted_remote_oid': 'a' * 40, 'published_oid': 'a' * 40,
             'pending_remote_oid': None, 'commit_identity': 'identity',
             'tree_oid': 'tree',
@@ -127,7 +127,7 @@ class CheckpointAssessmentTests(unittest.TestCase):
         )
         row = {
             'phase': 'published', 'result': 'published',
-            'branch': 'loop/G-044', 'worktree': '/owned',
+            'branch': 'loop/G-044', 'worktree': str(Path('/owned')),
             'accepted_remote_oid': oid, 'published_oid': oid,
             'pending_remote_oid': None, 'commit_identity': identity,
             'tree_oid': 'tree', 'local_oid': oid,

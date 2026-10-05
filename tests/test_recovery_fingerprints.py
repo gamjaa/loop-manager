@@ -290,6 +290,7 @@ class RecoveryFingerprintsTest(BoundedRecoveryFixture, unittest.TestCase):
             scripts = worktree / "scripts"
             scripts.mkdir()
             (scripts / "verify.sh").write_text("#!/usr/bin/env bash\n", encoding="utf-8")
+            (scripts / "verify.ps1").write_text("exit 0\n", encoding="utf-8")
             lines = [
                 f"FAIL tests/test_{index:04}.py::test_case assertion {index}"
                 for index in range(400)

@@ -96,14 +96,14 @@ class ImmediateRebasePublicationTests(TestCase):
                     with self.assertRaises(Exit):
                         self.complete()
                 pending = self.checkpoints.get('repo', 'G-047')
-                branch, worktree = 'loop-manager/G-047', '/state/G-047'
+                branch, worktree = 'loop-manager/G-047', str(Path('/state/G-047').resolve())
                 ref, remote_ref = f'refs/heads/{branch}', f'refs/remotes/origin/{branch}'
                 original = lm.GitSnapshot('before', branch, {}, {},
                     {ref: ('before', ''), remote_ref: ('remote', ''), 'refs/heads/other': ('other', '')},
-                    {worktree: ('HEAD=before', f'branch=refs/heads/{branch}')}, {}, {})
+                    {str(Path(worktree).resolve()): ('HEAD=before', f'branch=refs/heads/{branch}')}, {}, {})
                 current = replace(original, head='owned-head', refs={**original.refs,
                     ref: ('owned-head', ''), remote_ref: (self.remote, '')},
-                    worktrees={worktree: ('HEAD=owned-head', f'branch=refs/heads/{branch}')})
+                    worktrees={str(Path(worktree).resolve()): ('HEAD=owned-head', f'branch=refs/heads/{branch}')})
                 self.state.update_project('repo', agent_role='worker',
                     agent_snapshot=original.serialize(), agent_result_snapshot=original.serialize())
                 with self.direct_ports(), ExitStack() as ports:
@@ -157,13 +157,13 @@ class ImmediateRebasePublicationTests(TestCase):
             for oid in ('remote', 'owned-head'):
                 self.remote = oid
                 service = lm._current_rebase_service(self.fixture.connection, Path('/repo'),
-                    Path('/state'), 'repo', 'G-047', Path('/state/G-047'), 'loop-manager/G-047')
+                    Path('/state'), 'repo', 'G-047', Path('/state/G-047').resolve(), 'loop-manager/G-047')
                 self.assertEqual(service.expected.remote.oid, oid)
             for oid in (None, 'external'):
                 self.remote = oid
                 with self.assertRaises(handlers.manager_git_journal.MutationEvidenceError):
                     lm._current_rebase_service(self.fixture.connection, Path('/repo'),
-                        Path('/state'), 'repo', 'G-047', Path('/state/G-047'), 'loop-manager/G-047')
+                        Path('/state'), 'repo', 'G-047', Path('/state/G-047').resolve(), 'loop-manager/G-047')
 
     def test_blocked_release_publishes_clean_head_before_restoring_staged_work(self):
         self.assert_blocked_release()
@@ -190,18 +190,18 @@ class ImmediateRebasePublicationTests(TestCase):
         runtime.transition_and_clear('repo', 'G-047', plan_values={
             'status': 'PLAN_BLOCKED', 'blocked_fingerprint': 'stored'}, enqueue=False)
         plan = connection.execute("SELECT * FROM exec_plans WHERE repo='repo' AND plan_id='G-047'").fetchone()
-        branch, worktree = 'loop-manager/G-047', '/state/G-047'
+        branch, worktree = 'loop-manager/G-047', str(Path('/state/G-047').resolve())
         before = lm.GitSnapshot('before', branch,
             {'app.py': ('H 100644 staged-blob 0',)}, {'app.py': (('staged',), 'saved-content')},
             {f'refs/heads/{branch}': ('before', '')},
-            {worktree: ('HEAD=before', f'branch=refs/heads/{branch}')}, {}, {})
+            {str(Path(worktree).resolve()): ('HEAD=before', f'branch=refs/heads/{branch}')}, {}, {})
         local = {'head': 'before', 'staged': True, 'base': 'base'}
         def capture(_):
             return replace(before, head=local['head'],
                 index=before.index if local['staged'] else {'app.py': ('H 100644 rebased-blob 0',)},
                 dirty={'app.py': (('staged',) if local['staged'] else ('unstaged',), 'saved-content')},
                 refs={f'refs/heads/{branch}': (local['head'], '')},
-                worktrees={worktree: ('HEAD=' + local['head'], f'branch=refs/heads/{branch}')})
+                worktrees={str(Path(worktree).resolve()): ('HEAD=' + local['head'], f'branch=refs/heads/{branch}')})
         original_git = self.git
         def git(path, *args, **kwargs):
             if args == ('rev-parse', 'HEAD'):
@@ -483,22 +483,22 @@ class ImmediateRebasePublicationTests(TestCase):
     def test_publication_comparison_updates_only_selected_remote_tracking_ref(self):
         from loop_manager_internal.git.managed_rebase_adoption import selected_baseline
         self.complete()
-        branch, worktree = 'loop-manager/G-047', '/state/G-047'
+        branch, worktree = 'loop-manager/G-047', str(Path('/state/G-047').resolve())
         ref, remote_ref = f'refs/heads/{branch}', f'refs/remotes/origin/{branch}'
         before = lm.GitSnapshot('before', branch, {}, {},
             {ref: ('before', ''), remote_ref: ('remote', ''), 'refs/heads/other': ('original', '')},
-            {worktree: ('HEAD=before',)}, {}, {})
+            {str(Path(worktree).resolve()): ('HEAD=before',)}, {}, {})
         current = replace(before, head='owned-head', refs={ref: ('owned-head', ''),
             remote_ref: ('owned-head', ''), 'refs/heads/other': ('unauthorized', '')},
-            worktrees={worktree: ('HEAD=owned-head',)})
+            worktrees={str(Path(worktree).resolve()): ('HEAD=owned-head',)})
         published = self.checkpoints.get('repo', 'G-047')
-        accepted = selected_baseline(before, current, branch, worktree, publication=published)
+        accepted = selected_baseline(before, current, branch, str(Path(worktree).resolve()), publication=published)
         self.assertEqual(accepted.refs[remote_ref], ('owned-head', ''))
         self.assertEqual(accepted.refs['refs/heads/other'], ('original', ''))
         self.assertEqual(before.refs[remote_ref], ('remote', ''))
         tampered = replace(current, refs={**current.refs, remote_ref: ('foreign', '')})
         with self.assertRaises(handlers.manager_git_journal.MutationEvidenceError):
-            selected_baseline(before, tampered, branch, worktree, publication=published)
+            selected_baseline(before, tampered, branch, str(Path(worktree).resolve()), publication=published)
 
     def test_existing_remote_without_durable_publication_identity_is_preserved(self):
         self.state.update_project('repo', publication_remote_oid=None)

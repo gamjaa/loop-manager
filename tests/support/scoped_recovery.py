@@ -19,7 +19,7 @@ class ScopedGateFixture:
         loop_manager._ensure_execplans_schema(self.connection)
         maintenance_state.ensure_schema(self.connection)
         notifications.ensure_schema(self.connection)
-        self.repo = "/projects/scoped"
+        self.repo = str(Path("/projects/scoped").resolve())
         self.connection.execute(
             "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
             (self.repo,),
@@ -71,14 +71,14 @@ class ScopeBaselineFixture:
         self.case = current_rebase_case(self)
         self.connection = self.case.fixture.connection
         self.checkpoints = self.case.checkpoint
-        self.worktree = Path('/state/G-047')
-        self.repo_path = Path('/repo')
+        self.worktree = Path('/state/G-047').resolve()
+        self.repo_path = Path('/repo').resolve()
         self.before = loop_manager.GitSnapshot('owned-head', 'loop-manager/G-047', {}, {},
             {'refs/heads/loop-manager/G-047': ('owned-head', '')},
-            {'/state/G-047': ('HEAD=owned-head', 'branch=refs/heads/loop-manager/G-047'),
-             '/repo': ('HEAD=source', 'state=clean')}, {}, {})
+            {str(self.worktree): ('HEAD=owned-head', 'branch=refs/heads/loop-manager/G-047'),
+             str(self.repo_path): ('HEAD=source', 'state=clean')}, {}, {})
         self.current = replace(self.before, dirty={'app.py': (('unstaged',), 'saved-work')},
-            worktrees={**self.before.worktrees, '/repo': ('HEAD=source', 'state=user-dirty')})
+            worktrees={**self.before.worktrees, str(self.repo_path): ('HEAD=source', 'state=user-dirty')})
         self.resources = used_git_resources(role='worker', phase='WORKING', base_branch='main',
             branch='loop-manager/G-047', worktree_key=str(self.worktree))
         self.isolated = True
@@ -121,7 +121,7 @@ class ScopeBaselineFixture:
 class CurrentRebaseBlockFixture(RebaseBlockFixture):
     def scope_stage_result(self):
         self.pending(staged=True)
-        path, branch = '/state/G-047', 'loop-manager/G-047'
+        path, branch = str(Path('/state/G-047').resolve()), 'loop-manager/G-047'
         before = loop_manager.GitSnapshot('partial', None,
             {'app.py': tuple(f'M 100644 old-{stage} {stage}' for stage in (1, 2, 3))}, {},
             {f'refs/heads/{branch}': ('before', '')},
@@ -160,7 +160,7 @@ class CurrentRebaseBlockFixture(RebaseBlockFixture):
             {'app.py': ('M 100644 manual 2',)},
             {'app.py': (('unstaged',), 'unresolved-content')},
             {'refs/heads/loop-manager/G-047': ('before', '')},
-            {'/state/G-047': ('HEAD=partial', 'detached=True')}, {}, {'rebase-merge': 'operation'})
+            {str(Path('/state/G-047').resolve()): ('HEAD=partial', 'detached=True')}, {}, {'rebase-merge': 'operation'})
         with self.connection:
             self.connection.execute("UPDATE exec_plans SET blocked_fingerprint = 'same-input', "
                 "blocked_worktree_fingerprint = 'same-input', agent_result_snapshot = ?",

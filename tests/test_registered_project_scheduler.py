@@ -100,6 +100,7 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
                 worktree = Path(directory)
                 (worktree / "scripts").mkdir()
                 (worktree / "scripts/verify.sh").write_text("#!/bin/sh\nexit 0\n")
+                (worktree / "scripts/verify.ps1").write_text("exit 0\n")
                 gate = loop_manager.RuntimeHandoffGate(
                     threading.Event(), threading.Lock(),
                 )
@@ -192,10 +193,16 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
             )
             gate = loop_manager.RuntimeHandoffGate(threading.Event(), threading.Lock())
             project = loop_manager.project_registry.list_projects(connection)[0]
+            worker_connections = []
+
+            def handoff(worker_connection, *args, **kwargs):
+                worker_connections.append(worker_connection)
+                raise loop_manager.SelfMergeRuntimeHandoff
+
             try:
                 with mock.patch(
                     "loop_manager.run_project_result",
-                    side_effect=loop_manager.SelfMergeRuntimeHandoff,
+                    side_effect=handoff,
                 ):
                     result = loop_manager._run_registered_project(
                         project, state_dir, config.path, "", "", threading.Lock(),
@@ -206,6 +213,8 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
                     result.result.kind, loop_manager.ProjectRunKind.RUNTIME_HANDOFF,
                 )
                 self.assertTrue(gate.event.is_set())
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    worker_connections[0].execute("SELECT 1")
                 token = loop_manager._runtime_handoff_signal.set(gate)
                 try:
                     with mock.patch("loop_manager.agent_provider") as agent:

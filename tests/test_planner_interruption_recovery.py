@@ -1,4 +1,4 @@
-from contextlib import closing
+from contextlib import closing, ExitStack
 import json
 import sqlite3
 import subprocess
@@ -105,11 +105,12 @@ class PlannerInterruptionRecoveryTest(unittest.TestCase):
                 raise RuntimeError("process interrupted after Planner result")
             return original_changed_files(*args, **kwargs)
 
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             repo = make_remote_repository(directory)
             state_dir = Path(directory) / "state"
             state_dir.mkdir()
             connection = loop_manager.connect_database(state_dir, create=True)
+            cleanup.callback(connection.close)
 
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
@@ -143,6 +144,7 @@ class PlannerInterruptionRecoveryTest(unittest.TestCase):
                 saved_result = interrupted["planning_result"]
                 connection.close()
                 connection = loop_manager.connect_database(state_dir)
+                cleanup.callback(connection.close)
                 self.assertEqual(
                     connection.execute(
                         "SELECT planning_result FROM projects WHERE repo = ?", (str(repo),)

@@ -1,6 +1,7 @@
 """Durable no-progress and turn CAS tests."""
 
 import sqlite3
+from contextlib import ExitStack
 import tempfile
 from pathlib import Path
 from unittest import TestCase
@@ -94,7 +95,7 @@ class RebaseCorrectionStateTests(TestCase):
                                  result='duplicate', scope_marker='accepted')
 
     def test_legacy_schema_upgrade_preserves_result_and_new_contract_after_reopen(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             path = Path(directory) / 'state.db'
             connection = sqlite3.connect(path)
             connection.row_factory = sqlite3.Row
@@ -128,7 +129,7 @@ class RebaseCorrectionStateTests(TestCase):
             connection.commit()
             connection.close()
             connection = sqlite3.connect(path)
-            self.addCleanup(connection.close)
+            cleanup.callback(connection.close)
             connection.row_factory = sqlite3.Row
             saved = RebaseCorrectionRepository(connection).get('repo', 'G-045')
             self.assertEqual(saved.worker_result, 'new result')

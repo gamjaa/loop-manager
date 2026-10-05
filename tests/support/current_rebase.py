@@ -21,7 +21,8 @@ class CurrentRebaseFixture:
         self.handler, self.state = self.fixture.handler, self.fixture.state
         self.handler._current_rebase_service = handlers.ExecutionHandlers._current_rebase_service.__get__(self.handler)
         self.checkpoint = ExecutionCheckpointRepository(self.fixture.connection)
-        self.state.update_project('repo', worker_result=VALID_WORKER_RESULT,
+        self.state.update_project('repo', worktree=str(Path('/state/G-047').resolve()),
+                                  worker_result=VALID_WORKER_RESULT,
                                   worker_session_id='saved-worker', verify_result='old verify',
                                   review_result='old review', worker_input_token='old-input')
         self.checkpoint.record(
@@ -31,7 +32,7 @@ class CurrentRebaseFixture:
                       'failure': 'old failure'})
         self.expected = expectation(repo='repo', plan_id='G-047',
                                     plan_path='docs/plans/[G-047] Runtime.md',
-                                    worktree='/state/G-047', branch='loop-manager/G-047')
+                                    worktree=str(Path('/state/G-047').resolve()), branch='loop-manager/G-047')
         self.expected = replace(self.expected, remote=replace(
             self.expected.remote, branch='loop-manager/G-047'))
         self.observed = observation(self.expected, head='owned-head',
@@ -72,7 +73,7 @@ class CurrentRebaseFixture:
             "(repo, plan_id, request_identity, phase, reason_code, evidence, "
             "branch, worktree, accepted_remote_oid) "
             "VALUES ('repo', 'G-047', 'request', 'published', 'review', 'evidence', "
-            "'loop-manager/G-047', '/state/G-047', 'remote')")
+            "'loop-manager/G-047', ?, 'remote')", (str(Path('/state/G-047').resolve()),))
         self.state.update_project('repo', publication_remote_oid='remote')
         self.fixture.effects.workspace._rebase_in_progress_for_branch.return_value = False
         self.fixture.effects.workspace.git_operation_entries.return_value = {}
@@ -103,7 +104,7 @@ class CurrentRebaseAgentScopeFixture:
     def setUp(self):
         self.case = current_rebase_case(self)
         self.case.handler._complete_rebase_intent(self.case.fixture.context())
-        branch, worktree = 'loop-manager/G-047', '/state/G-047'
+        branch, worktree = 'loop-manager/G-047', str(Path('/state/G-047').resolve())
         self.original = lm.GitSnapshot('before', branch, {}, {},
             {f'refs/heads/{branch}': ('before', ''), 'refs/heads/other': ('other', '')},
             {worktree: ('HEAD=before', f'branch=refs/heads/{branch}')}, {}, {})

@@ -3,6 +3,7 @@ from dataclasses import replace
 import sqlite3
 import tempfile
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import ExitStack
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -26,7 +27,7 @@ class LegacyBlockedScopeUnitTests(unittest.TestCase):
         connection.execute(loop_manager.SCHEMA)
         before = loop_manager.GitSnapshot('head', 'loop-manager/G-001', {}, {},
             {'refs/heads/loop-manager/G-099': ('original', '')},
-            {'/managed': ('HEAD=head', 'branch=refs/heads/loop-manager/G-001')}, {}, {})
+            {str(Path('/managed').resolve()): ('HEAD=head', 'branch=refs/heads/loop-manager/G-001')}, {}, {})
         connection.execute(
             "INSERT INTO projects (repo, base_branch, agent_role, agent_snapshot, agent_result_snapshot) "
             "VALUES ('repo', 'main', 'reviewer', ?, ?)",
@@ -49,10 +50,10 @@ class LegacyBlockedScopeUnitTests(unittest.TestCase):
 
 class ScopedBlockingGateTests(ScopedGateFixture, unittest.TestCase):
     def test_initialized_worker_queries_do_not_reenter_schema_ddl(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             state = Path(directory)
             parent = loop_manager.connect_database(state, create=True)
-            self.addCleanup(parent.close)
+            cleanup.callback(parent.close)
             parent.execute("BEGIN IMMEDIATE")
 
             def query_worker(repo):

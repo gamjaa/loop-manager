@@ -103,7 +103,7 @@ class WorktreeCleanupTest(CleanupFixture, unittest.TestCase):
             self.assertEqual((worktree / "late.txt").read_text(encoding="utf-8"), "user change\n")
             self.assertFalse(loop_manager._recover_managed_worktree_removal(state_dir, repo, worktree))
             record = next(item for item in loop_manager._worktree_catalog(repo)
-                          if item.get("worktree") == str(worktree))
+                          if Path(item["worktree"]) == worktree)
             self.assertEqual(record.get("locked"), "loop-manager-worktree:owned")
 
     def test_head_or_index_change_after_unlock_aborts_stale_journal(self):
@@ -133,7 +133,7 @@ class WorktreeCleanupTest(CleanupFixture, unittest.TestCase):
                 self.assertEqual(result.status, "unverifiable")
                 self.assertTrue(worktree.exists())
                 record = next(item for item in loop_manager._worktree_catalog(repo)
-                              if item.get("worktree") == str(worktree))
+                              if Path(item["worktree"]) == worktree)
                 self.assertEqual(record.get("locked"), "loop-manager-worktree:owned")
                 fresh = loop_manager.assess_cleanup(worktree, head)
                 if mutation == "head":

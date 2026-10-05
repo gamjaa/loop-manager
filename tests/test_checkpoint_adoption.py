@@ -26,7 +26,7 @@ class CheckpointRefreshFixture:
             "VALUES ('repo', 'G-106', 'docs/plans/[G-106] Work.md', 'Work', '[]', '[]', 'critical', 'hash', 'PLAN_BLOCKED')")
         self.store = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection)
         self.request = self.store.request(repo='repo', plan_id='G-106', reason_code='verify_retry_exhausted',
-                                          evidence='original failure', branch='loop-manager/G-106', worktree='/state/G-106',
+                                          evidence='original failure', branch='loop-manager/G-106', worktree=str(Path('/state/G-106')),
                                           expected_remote_oid='a' * 40, rebase_recovery=False)
         self.store.record_prepared(self.request, blocked_checkpoint.PreparedCheckpoint(
             'a' * 40, 'c' * 40, 'identity', 'message', ()))
@@ -38,7 +38,7 @@ class CheckpointRefreshFixture:
 
 
     def _adoption(self, *, fetched_oid=None, observed_oid=None):
-        branch, worktree = 'loop-manager/G-106', '/state/G-106'
+        branch, worktree = 'loop-manager/G-106', str(Path('/state/G-106'))
         original, successor = 'a' * 40, 'b' * 40
         self.connection.execute("UPDATE projects SET origin = 'example/repo'")
         self.connection.execute(
@@ -51,7 +51,7 @@ class CheckpointRefreshFixture:
         plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
         snapshot = loop_manager.GitSnapshot(original, branch, {}, {},
                                             {f'refs/heads/{branch}': (original, '')},
-                                            {worktree: (f'branch=refs/heads/{branch}',)}, {}, {})
+                                            {str(Path(worktree).resolve()): (f'branch=refs/heads/{branch}',)}, {}, {})
         def git(_, *args, **kwargs):
             output = ''
             if args[:2] == ('remote', 'get-url'):

@@ -22,6 +22,7 @@ from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 
 
+REPO = str(Path('/repo').resolve())
 OLD = 'a' * 40
 NEW = 'b' * 40
 TREE = 'c' * 40
@@ -41,7 +42,7 @@ class ManagedTransitionTests(unittest.TestCase):
                   'expected': {'exists': False, 'registration': None, 'index': None}}
         git = mock.Mock()
         self.assertEqual(cleanup_service.restore_cleanup_unlock(
-            intent, current, Path('/repo'), Path('/state/G-091'),
+            intent, current, Path(REPO), Path('/state/G-091'),
             git=git, observe=lambda: current), current)
         git.assert_not_called()
 
@@ -61,7 +62,7 @@ class ManagedTransitionTests(unittest.TestCase):
                 git = mock.Mock()
                 with self.assertRaises(journal.MutationEvidenceError):
                     cleanup_service.restore_cleanup_unlock(
-                        intent, current, Path('/repo'), Path('/state/G-091'),
+                        intent, current, Path(REPO), Path('/state/G-091'),
                         git=git, observe=lambda: current)
                 git.assert_not_called()
 
@@ -76,7 +77,7 @@ class ManagedTransitionTests(unittest.TestCase):
                 'agent_session_id': 'same-worker',
             }
             arguments = dict(state_dir=state, owner='plan:G-091',
-                             repo='/repo', target='/worktree', before={'head': OLD})
+                             repo=REPO, target=str(Path('/worktree').resolve()), before={'head': OLD})
             identity = journal.begin_rebase(**arguments, expected=expected)
 
             self.assertEqual(journal.begin_rebase(
@@ -99,7 +100,7 @@ class ManagedTransitionTests(unittest.TestCase):
             'metadata': None,
         }
         intent = {
-            'target': '/worktree', 'before': before,
+            'target': str(Path('/worktree').resolve()), 'before': before,
             'expected': {
                 'branch': BRANCH, 'before_head': OLD,
                 'target_base_oid': NEW, 'remote_oid': OLD,
@@ -135,13 +136,13 @@ class ManagedTransitionTests(unittest.TestCase):
         lock = 'loop-manager-worktree:owned-token'
         before = loop_manager.GitSnapshot(
             head=OLD, branch=BRANCH, index={}, dirty={}, refs={},
-            worktrees={'/worktree': old_registration}, config={}, operations={},
+            worktrees={str(Path('/worktree').resolve()): old_registration}, config={}, operations={},
         )
         current = loop_manager.replace(
-            before, worktrees={'/worktree': (*old_registration, f'locked={lock}')},
+            before, worktrees={str(Path('/worktree').resolve()): (*old_registration, f'locked={lock}')},
         )
         transition = {'intent': {
-            'kind': 'managed_worktree_create', 'target': '/worktree',
+            'kind': 'managed_worktree_create', 'target': str(Path('/worktree').resolve()),
             'before': {'exists': False, 'registration': None, 'index': None},
             'expected': {'registration': {'head': OLD,
                                           'branch': f'refs/heads/{BRANCH}',
@@ -157,7 +158,7 @@ class ManagedTransitionTests(unittest.TestCase):
         with mock.patch.object(journal, 'verified_managed_transitions',
                                side_effect=journal_transitions) as transitions:
             corrected = loop_manager._proven_recovered_worktree_baseline(
-                before, current, Path('/state'), Path('/repo'),
+                before, current, Path('/state'), Path(REPO),
                 'G-091', Path('/worktree'),
             )
             self.assertEqual(corrected.worktrees, current.worktrees)
@@ -165,22 +166,22 @@ class ManagedTransitionTests(unittest.TestCase):
                 loop_manager._proven_recovered_worktree_baseline(
                     before, loop_manager.replace(current, dirty={'app.py':
                         (('unstaged',), 'external')}), Path('/state'),
-                    Path('/repo'), 'G-091', Path('/worktree'),
+                    Path(REPO), 'G-091', Path('/worktree'),
                 )
             transition['intent']['expected']['registration']['locked'] = 'other'
             with self.assertRaises(loop_manager.AgentScopeError):
                 loop_manager._proven_recovered_worktree_baseline(
-                    before, current, Path('/state'), Path('/repo'),
+                    before, current, Path('/state'), Path(REPO),
                     'G-091', Path('/worktree'),
                 )
             transitions.assert_called_with(
-                Path('/state'), str(Path('/repo').resolve()), 'plan:G-091',
-                git=mock.ANY, kind='managed_worktree_create', target='/worktree',
+                Path('/state'), str(Path(REPO).resolve()), 'plan:G-091',
+                git=mock.ANY, kind='managed_worktree_create', target=str(Path('/worktree').resolve()),
             )
             observed_git = transitions.call_args.kwargs['git']
             with mock.patch.object(loop_manager, 'git', return_value='observed') as git:
-                self.assertEqual(observed_git(Path('/repo'), 'rev-parse', 'HEAD', check=False), 'observed')
-                git.assert_called_once_with(Path('/repo'), 'rev-parse', 'HEAD', check=False)
+                self.assertEqual(observed_git(Path(REPO), 'rev-parse', 'HEAD', check=False), 'observed')
+                git.assert_called_once_with(Path(REPO), 'rev-parse', 'HEAD', check=False)
 
     def test_rebase_continuation_accepts_only_proven_worker_correction(self):
         before = {
@@ -198,7 +199,7 @@ class ManagedTransitionTests(unittest.TestCase):
             'unmerged': False,
         }
         intent = {
-            'target': '/worktree', 'before': before,
+            'target': str(Path('/worktree').resolve()), 'before': before,
             'expected': {'branch': BRANCH, 'before_head': OLD,
                          'target_base_oid': NEW, 'remote_oid': OLD,
                          'action': 'continue',
@@ -255,7 +256,7 @@ class ManagedTransitionTests(unittest.TestCase):
             'operations': {}, 'metadata': None, 'index_clean': True,
         }
         intent = {
-            'id': 'owned', 'target': '/worktree', 'before': before,
+            'id': 'owned', 'target': str(Path('/worktree').resolve()), 'before': before,
             'expected': {'branch': BRANCH, 'before_head': OLD,
                          'target_base_oid': NEW, 'remote_oid': OLD,
                          'affected_paths': ['app.py']},
@@ -318,24 +319,24 @@ class ManagedTransitionTests(unittest.TestCase):
                 'unmerged': True, 'index_clean': False,
             }
             sealed_id = journal.begin_rebase(
-                state, owner='plan:G-091', repo='/repo', target=target,
+                state, owner='plan:G-091', repo=REPO, target=target,
                 before=before, expected=expected,
             )
             # Intent exists, but an external rebase can produce the same
             # metadata without executing this Manager operation.
             with self.assertRaises(journal.MutationEvidenceError):
                 journal.complete_rebase(
-                    state, repo='/repo', target=target, observe=lambda: conflict,
+                    state, repo=REPO, target=target, observe=lambda: conflict,
                     validate=lambda intent, observed: journal.verified_rebase_result(
                         intent, observed, current_remote_oid=OLD,
                         target_ancestor=True, patches_preserved=False, reflog_marker=False,
                     ),
                 )
-            slot = journal._slot(state, '/repo', 'managed_rebase', target)
+            slot = journal._slot(state, REPO, 'managed_rebase', target)
             self.assertTrue((slot / 'active.json').exists())
             self.assertFalse((slot / f'{sealed_id}.result.json').exists())
             journal.complete_rebase(
-                state, repo='/repo', target=target, observe=lambda: conflict,
+                state, repo=REPO, target=target, observe=lambda: conflict,
                 validate=lambda intent, observed: journal.verified_rebase_result(
                     intent, observed, current_remote_oid=OLD,
                     target_ancestor=True, patches_preserved=False, reflog_marker=True,
@@ -346,7 +347,7 @@ class ManagedTransitionTests(unittest.TestCase):
                 'dirty': {'app.py': [['staged'], 'resolved']}, 'unmerged': False,
             }
             pending_id = journal.begin_rebase(
-                state, owner='plan:G-091', repo='/repo', target=target,
+                state, owner='plan:G-091', repo=REPO, target=target,
                 before=corrected, expected={**expected, 'action': 'continue',
                                            'accepted_files': {'app.py': 'resolved'},
                                            'staged_tree_oid': TREE},
@@ -355,22 +356,22 @@ class ManagedTransitionTests(unittest.TestCase):
             # can be sealed, and the same intent must remain available to retry.
             validate = mock.Mock()
             self.assertFalse(journal.complete_rebase(
-                state, repo='/repo', target=target,
+                state, repo=REPO, target=target,
                 observe=lambda: corrected, validate=validate,
             ))
             validate.assert_not_called()
-            slot = journal._slot(state, '/repo', 'managed_rebase', target)
+            slot = journal._slot(state, REPO, 'managed_rebase', target)
             self.assertEqual(journal._read(slot / 'active.json')['id'], pending_id)
             self.assertFalse((slot / f'{pending_id}.result.json').exists())
             transitions = journal.verified_managed_transitions(
-                state, '/repo', 'plan:G-091', agent_session_id='worker-original',
+                state, REPO, 'plan:G-091', agent_session_id='worker-original',
             )
             self.assertEqual([item['intent']['id'] for item in transitions], [sealed_id])
             self.assertEqual(journal.verified_managed_transitions(
-                state, '/repo', 'plan:G-091', agent_session_id='other-worker',
+                state, REPO, 'plan:G-091', agent_session_id='other-worker',
             ), [])
             handler = execution_handler_stub()
-            handler.state_dir, handler.repo_path = state, Path('/repo')
+            handler.state_dir, handler.repo_path = state, Path(REPO)
             handler.effects = complete_execution_effects(SimpleNamespace(workspace=SimpleNamespace(git=mock.Mock())))
             context = SimpleNamespace(
                 plan=SimpleNamespace(plan_id='G-091'), worktree=Path(target),
@@ -390,7 +391,7 @@ class ManagedTransitionTests(unittest.TestCase):
                 (slot / f'{sealed_id}.intent.json').read_text(),
             )
             self.assertEqual(journal.verified_managed_transitions(
-                state, '/repo', 'plan:G-091', agent_session_id='worker-original',
+                state, REPO, 'plan:G-091', agent_session_id='worker-original',
             ), [])
 
     def test_conflict_rejects_unrelated_file_and_index_changes(self):
@@ -402,7 +403,7 @@ class ManagedTransitionTests(unittest.TestCase):
             'metadata': None,
         }
         intent = {
-            'target': '/worktree', 'before': before,
+            'target': str(Path('/worktree').resolve()), 'before': before,
             'expected': {'branch': BRANCH, 'before_head': OLD,
                          'target_base_oid': NEW, 'remote_oid': OLD,
                          'affected_paths': ['app.py']},
@@ -426,18 +427,18 @@ class ManagedTransitionTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
             journal.begin_rebase(
-                state, owner='plan:G-091', repo='/repo', target='/worktree',
+                state, owner='plan:G-091', repo=REPO, target=str(Path('/worktree').resolve()),
                 before=before, expected=intent['expected'],
             )
             self.assertTrue(journal.complete_rebase(
-                state, repo='/repo', target='/worktree',
+                state, repo=REPO, target=str(Path('/worktree').resolve()),
                 observe=lambda: observed,
                 validate=lambda saved, actual: journal.verified_rebase_result(
                     saved, actual, **checks,
                 ),
             ))
             selected = journal.verified_managed_transitions(
-                state, '/repo', 'plan:G-091',
+                state, REPO, 'plan:G-091',
             )[0]['result']['candidates']['selected']
             self.assertIsNone(selected['index'])
             self.assertIsNone(selected['dirty'])
@@ -478,7 +479,7 @@ class ManagedTransitionTests(unittest.TestCase):
             raise AssertionError(args)
 
         self.assertEqual(journal.rebase_affected_paths(
-            git, Path('/repo'), OLD, NEW,
+            git, Path(REPO), OLD, NEW,
         ), ['base.py', 'reverted.py'])
 
     def test_autostash_conflict_requires_saved_stash_identity(self):
@@ -490,7 +491,7 @@ class ManagedTransitionTests(unittest.TestCase):
             'index_clean': True,
         }
         intent = {
-            'id': 'owned', 'target': '/worktree', 'before': before,
+            'id': 'owned', 'target': str(Path('/worktree').resolve()), 'before': before,
             'expected': {'branch': BRANCH, 'before_head': OLD,
                          'target_base_oid': NEW, 'remote_oid': OLD},
         }
@@ -520,7 +521,7 @@ class ManagedTransitionTests(unittest.TestCase):
             'metadata': None, 'index_clean': True,
         }
         intent = {
-            'id': 'owned', 'target': '/worktree', 'before': before,
+            'id': 'owned', 'target': str(Path('/worktree').resolve()), 'before': before,
             'expected': {'branch': BRANCH, 'before_head': OLD,
                          'target_base_oid': NEW, 'remote_oid': OLD},
         }
@@ -583,21 +584,21 @@ class ManagedTransitionTests(unittest.TestCase):
                         'target_base_oid': NEW, 'remote_oid': OLD,
                         'agent_session_id': 'worker-original'}
             identity = journal.begin_rebase(
-                state, owner='plan:G-091', repo='/repo', target='/worktree',
+                state, owner='plan:G-091', repo=REPO, target=str(Path('/worktree').resolve()),
                 before=before, expected=expected,
             )
             self.assertEqual(identity, journal.begin_rebase(
-                state, owner='plan:G-091', repo='/repo', target='/worktree',
+                state, owner='plan:G-091', repo=REPO, target=str(Path('/worktree').resolve()),
                 before=before, expected=expected,
             ))
             with self.assertRaises(journal.MutationEvidenceError):
                 journal.begin_rebase(
-                    state, owner='plan:G-092', repo='/repo', target='/worktree',
+                    state, owner='plan:G-092', repo=REPO, target=str(Path('/worktree').resolve()),
                     before=before, expected=expected,
                 )
             with self.assertRaises(journal.MutationEvidenceError):
                 journal.complete_rebase(
-                    state, repo='/repo', target='/worktree',
+                    state, repo=REPO, target=str(Path('/worktree').resolve()),
                     observe=lambda: {'head': 'unexpected'},
                     validate=lambda *_: (_ for _ in ()).throw(
                         journal.MutationEvidenceError('external mutation')),
@@ -610,7 +611,7 @@ class ManagedTransitionTests(unittest.TestCase):
                 'unmerged': False, 'index_clean': True,
             }
             self.assertTrue(journal.complete_rebase(
-                state, repo='/repo', target='/worktree',
+                state, repo=REPO, target=str(Path('/worktree').resolve()),
                 observe=lambda: observed,
                 validate=lambda _intent, actual: {
                     'refs': {f'refs/heads/{BRANCH}': actual['ref']},
@@ -623,11 +624,11 @@ class ManagedTransitionTests(unittest.TestCase):
             # alone cannot establish current ownership on a later read.
             with self.assertRaises(journal.MutationEvidenceError):
                 journal.verified_managed_transitions(
-                    state, '/repo', 'plan:G-091',
+                    state, REPO, 'plan:G-091',
                     agent_session_id='worker-original',
                 )
             self.assertEqual(journal.verified_managed_transitions(
-                state, '/repo', 'plan:G-091',
+                state, REPO, 'plan:G-091',
                 agent_session_id='worker-new',
             ), [])
 
@@ -840,7 +841,7 @@ class ManagedTransitionTests(unittest.TestCase):
         case.fixture.journal_start.stop()
         with tempfile.TemporaryDirectory() as directory:
             state_dir = Path(directory)
-            journal.begin_current_rebase(state_dir, owner='plan:G-047', repo='/repo', target='/state/G-047',
+            journal.begin_current_rebase(state_dir, owner='plan:G-047', repo=REPO, target=str(Path('/state/G-047').resolve()),
                 before={'head': 'before'}, expected={'branch': 'loop-manager/G-047', 'before_head': 'before',
                 'target_base_oid': 'base', 'remote_oid': 'remote'})
             with (
@@ -854,13 +855,13 @@ class ManagedTransitionTests(unittest.TestCase):
                 with mock.patch.object(journal, '_finish', side_effect=RuntimeError('crash')):
                     with self.assertRaisesRegex(RuntimeError, 'crash'):
                         loop_manager._finish_owned_direct_rebase(state_dir, case.fixture.connection,
-                            Path('/repo'), 'repo', 'G-047', Path('/state/G-047'), 'loop-manager/G-047')
+                            Path(REPO), 'repo', 'G-047', Path('/state/G-047').resolve(), 'loop-manager/G-047')
                 loop_manager._complete_direct_rebase_checkpoint(case.fixture.connection, 'repo', 'G-047',
-                    Path('/state/G-047'), 'base', repo_path=Path('/repo'), branch='loop-manager/G-047',
+                    Path('/state/G-047').resolve(), 'base', repo_path=Path(REPO), branch='loop-manager/G-047',
                     agent_session_id='replacement')
                 saved = case.checkpoint.get('repo', 'G-047')
                 loop_manager._complete_direct_rebase_checkpoint(case.fixture.connection, 'repo', 'G-047',
-                    Path('/state/G-047'), 'base', repo_path=Path('/repo'), branch='loop-manager/G-047',
+                    Path('/state/G-047').resolve(), 'base', repo_path=Path(REPO), branch='loop-manager/G-047',
                     agent_session_id=None)
             self.assertIsNone(saved.operation)
             self.assertEqual(case.checkpoint.get('repo', 'G-047'), saved)
@@ -868,7 +869,7 @@ class ManagedTransitionTests(unittest.TestCase):
             refreshed = case.fixture.repository.projected('repo')
             self.assertIsNone(refreshed.worker_result)
             self.assertEqual(refreshed.status, 'IMPLEMENTING')
-            self.assertTrue((journal._slot(state_dir, '/repo', 'managed_rebase', '/state/G-047') / 'active.json').exists())
+            self.assertTrue((journal._slot(state_dir, REPO, 'managed_rebase', str(Path('/state/G-047').resolve())) / 'active.json').exists())
 
     def test_direct_rebase_without_sealed_result_keeps_checkpoint_operation(self):
         connection = sqlite3.connect(':memory:')
@@ -883,7 +884,7 @@ class ManagedTransitionTests(unittest.TestCase):
         with self.assertRaises(journal.MutationEvidenceError):
             loop_manager._complete_direct_rebase_checkpoint(
                 connection, 'repo', 'G-091', Path('/owned'), NEW,
-                repo_path=Path('/repo'), branch=BRANCH,
+                repo_path=Path(REPO), branch=BRANCH,
                 agent_session_id=None,
             )
         current = repository.get('repo', 'G-091')
@@ -905,11 +906,11 @@ class ManagedTransitionTests(unittest.TestCase):
             for field, value in (('head', 'before'), ('dirty', {'app.py': 'older'}), ('index', {'app.py': 'older'})):
                 with self.subTest(field=field), self.assertRaisesRegex(journal.MutationEvidenceError, 'observation drift'):
                     loop_manager._complete_direct_rebase_checkpoint(case.fixture.connection, 'repo', 'G-047',
-                        Path('/state/G-047'), 'base', repo_path=Path('/repo'), branch='loop-manager/G-047',
+                        Path('/state/G-047').resolve(), 'base', repo_path=Path(REPO), branch='loop-manager/G-047',
                         agent_session_id=None, preserved_observation={**observed, field: value})
                 self.assertEqual(case.checkpoint.get('repo', 'G-047'), original)
             loop_manager._complete_direct_rebase_checkpoint(case.fixture.connection, 'repo', 'G-047',
-                Path('/state/G-047'), 'base', repo_path=Path('/repo'), branch='loop-manager/G-047',
+                Path('/state/G-047').resolve(), 'base', repo_path=Path(REPO), branch='loop-manager/G-047',
                 agent_session_id=None, preserved_observation=observed)
         self.assertIsNone(case.checkpoint.get('repo', 'G-047').operation)
 
@@ -965,11 +966,11 @@ class ManagedTransitionTests(unittest.TestCase):
                 with self.subTest(pending=pending), self.assertRaises(journal.MutationEvidenceError):
                     case.observed = pending
                     loop_manager._complete_direct_rebase_checkpoint(case.fixture.connection, 'repo', 'G-047',
-                        Path('/state/G-047'), 'base', repo_path=Path('/repo'), branch='loop-manager/G-047', agent_session_id=None)
+                        Path('/state/G-047').resolve(), 'base', repo_path=Path(REPO), branch='loop-manager/G-047', agent_session_id=None)
                 self.assertEqual(case.checkpoint.get('repo', 'G-047'), original)
             case.observed = replace(clean, committed=(FileChange('app.py', '100644', '100755', 'old', 'manual-new-content', 'M'),))
             loop_manager._complete_direct_rebase_checkpoint(case.fixture.connection, 'repo', 'G-047',
-                Path('/state/G-047'), 'base', repo_path=Path('/repo'), branch='loop-manager/G-047', agent_session_id=None)
+                Path('/state/G-047').resolve(), 'base', repo_path=Path(REPO), branch='loop-manager/G-047', agent_session_id=None)
         self.assertIsNone(case.checkpoint.get('repo', 'G-047').operation)
 
 
@@ -1261,12 +1262,12 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                             ignore_status=lambda _path: (1, ''))
                     ports.requirement_archive_move_set.side_effect = moves
                     def build():
-                        return build_service(ports, connection, Path('/repo'), Path('/state'),
+                        return build_service(ports, connection, Path(REPO), Path('/state'),
                                              'repo', 'G-047', Path('/owned'), 'loop-manager/G-047')
                     if allowed:
                         service = build()
                         ports.requirement_archive_move_set.assert_called_once_with(
-                            Path('/repo'), 'common', Path('/owned'))
+                            Path(REPO), 'common', Path('/owned'))
                         from tests.support.rebase_observations import observation
                         from loop_manager_internal.git.managed_rebase_validation import FileChange
                         def archived_change(oid):
@@ -1282,7 +1283,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                         with self.assertRaises(requirement_archive.ArchiveMoveError):
                             build()
                         ports.requirement_archive_move_set.assert_called_once_with(
-                            Path('/repo'), 'base', Path('/owned'))
+                            Path(REPO), 'base', Path('/owned'))
 
     def test_factory_uses_current_inputs_exact_lease_and_final_scope(self):
         from tests.support.runtime import runtime_rebase_fixture
@@ -1301,7 +1302,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         ports.live_remote_branch_oid.return_value = 'remote'
         ports.pr_for_branch.return_value = None
         ports._worker_path_allowed.side_effect = loop_manager._worker_path_allowed
-        service = build_service(ports, connection, Path('/repo'), Path('/state'),
+        service = build_service(ports, connection, Path(REPO), Path('/state'),
                                 'repo', 'G-047', Path('/owned'), 'loop-manager/G-047')
         self.assertEqual(service.expected.remote.oid, 'remote')
         self.assertEqual(service.expected.before_head, 'before')
@@ -1327,7 +1328,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         from tests.support.runtime import runtime_rebase_fixture
         connection, runtime, *_ = runtime_rebase_fixture(self)
         handler = loop_manager._ExecutionLifecyclePorts(
-            connection, runtime, repo='repo', repo_path=Path('/repo'),
+            connection, runtime, repo='repo', repo_path=Path(REPO),
             state_dir=Path('/state'), base='main', base_sha='base',
             provider='codex', config_path=Path('/config'), newly_activated=False,
         )
@@ -1337,7 +1338,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         with mock.patch.object(loop_manager, '_current_rebase_service', return_value=service) as build:
             self.assertIs(handler.effects.workspace.current_rebase_service(
                 context, target='latest', remote_oid=None), service)
-        build.assert_called_once_with(connection, Path('/repo'), Path('/state'), 'repo',
+        build.assert_called_once_with(connection, Path(REPO), Path('/state'), 'repo',
                                       'G-047', Path('/owned'), 'loop-manager/G-047',
                                       target='latest', remote_oid=None)
 
@@ -1360,7 +1361,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                     mock.patch.object(loop_manager, '_publish_direct_rebase_checkpoint'),
                 ):
                     loop_manager._complete_direct_rebase_checkpoint(connection, 'repo', 'G-047',
-                        Path('/state/G-047'), 'base', repo_path=Path('/repo'),
+                        Path('/state/G-047').resolve(), 'base', repo_path=Path(REPO),
                         branch='loop-manager/G-047', agent_session_id=None)
                 result = runtime.get('repo', 'G-047')
                 self.assertEqual(result.status, 'PLAN_BLOCKED')
@@ -1385,7 +1386,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         connection.execute("INSERT INTO blocked_checkpoints "
             "(repo, plan_id, request_identity, phase, reason_code, evidence, branch, worktree, accepted_remote_oid) "
             "VALUES ('repo', 'G-047', 'request', 'published', 'verify', 'failure', "
-            "'loop-manager/G-047', '/state/G-047', 'remote')")
+            "'loop-manager/G-047', ?, 'remote')", (str(Path('/state/G-047').resolve()),))
         before = loop_manager.GitSnapshot('before', 'loop-manager/G-047',
             {'app.py': ('H 100644 staged-blob 0',)}, {'app.py': (('staged',), 'preserved')}, {}, {}, {}, {})
         snapshots, events = [before], []
@@ -1444,7 +1445,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
             for patch in patches:
                 stack.enter_context(patch)
             self.assertTrue(loop_manager.resume_blocked_execplan_if_inputs_changed(
-                connection, Path('/repo'), 'repo', 'main', Path('/state')))
+                connection, Path(REPO), 'repo', 'main', Path('/state')))
         self.assertEqual(events, ['rebase', 'adopt', 'publish', 'restore', 'record-head', 'requeue'])
         self.assertEqual(snapshots[0].index, before.index)
 
@@ -1461,7 +1462,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         connection.execute("INSERT INTO blocked_checkpoints "
             "(repo, plan_id, request_identity, phase, reason_code, evidence, branch, worktree, accepted_remote_oid) "
             "VALUES ('repo', 'G-047', 'request', 'published', 'verify', 'failure', "
-            "'loop-manager/G-047', '/state/G-047', 'remote')")
+            "'loop-manager/G-047', ?, 'remote')", (str(Path('/state/G-047').resolve()),))
         before = loop_manager.GitSnapshot('before', 'loop-manager/G-047',
             {'app.py': ('H 100644 staged-blob 0',)}, {'app.py': (('staged',), 'preserved')},
             {}, {}, {}, {})
@@ -1503,7 +1504,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
             mock.patch.object(loop_manager, '_requeue_blocked_execplan', side_effect=lambda *_a, **_k: events.append('requeue')) as requeue,
         ):
             self.assertTrue(loop_manager._resume_interrupted_blocked_rebase(
-                connection, Path('/repo'), 'repo', 'main', plan, Path('/state/G-047'), 'loop-manager/G-047'))
+                connection, Path(REPO), 'repo', 'main', plan, Path('/state/G-047').resolve(), 'loop-manager/G-047'))
             self.assertEqual(events, ['adopt', 'publish', 'restore', 'requeue'])
             saved = case.checkpoint.get('repo', 'G-047')
             events.clear()
@@ -1511,7 +1512,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                 staged=(FileChange('app.py', '100644', '100644', 'rebased-blob', 'staged-blob', 'M'),))
             with mock.patch.object(loop_manager, '_complete_direct_rebase_checkpoint') as completed:
                 self.assertTrue(loop_manager._resume_interrupted_blocked_rebase(
-                    connection, Path('/repo'), 'repo', 'main', plan, Path('/state/G-047'), 'loop-manager/G-047'))
+                    connection, Path(REPO), 'repo', 'main', plan, Path('/state/G-047').resolve(), 'loop-manager/G-047'))
                 completed.assert_called_once()
             self.assertEqual(case.checkpoint.get('repo', 'G-047'), saved)
             staged = case.observed
@@ -1524,7 +1525,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                     case.observed = unsafe
                     requeue.reset_mock()
                     self.assertFalse(loop_manager._resume_interrupted_blocked_rebase(
-                        connection, Path('/repo'), 'repo', 'main', plan, Path('/state/G-047'), 'loop-manager/G-047'))
+                        connection, Path(REPO), 'repo', 'main', plan, Path('/state/G-047').resolve(), 'loop-manager/G-047'))
                     requeue.assert_not_called()
                     self.assertEqual(case.checkpoint.get('repo', 'G-047'), saved)
         self.assertEqual(events, ['requeue'])
@@ -1546,7 +1547,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
     def test_continuation_needs_current_owned_state_not_worker_turn(self):
         from loop_manager_internal.git.managed_rebase_validation import RebaseDecision, RebaseStatus, Remote
         handler = execution_handler_stub()
-        handler.repo, handler.repo_path, handler.state_dir = 'repo', Path('/repo'), Path('/state')
+        handler.repo, handler.repo_path, handler.state_dir = 'repo', Path(REPO), Path('/state')
         checkpoint = SimpleNamespace(operation='rebase', expected_head=OLD, target_base_oid=NEW,
                                      snapshot={})
         service = mock.Mock()

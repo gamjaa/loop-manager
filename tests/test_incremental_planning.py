@@ -74,6 +74,7 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         git(self.repo, "init", "-b", "main")
         git(self.repo, "config", "user.email", "test@example.com")
         git(self.repo, "config", "user.name", "Test")
+        git(self.repo, "config", "core.autocrlf", "false")
         (self.repo / "docs/plans").mkdir(parents=True)
         (self.repo / "docs/requirements").mkdir(parents=True)
         (self.repo / "docs/PRODUCT.md").write_text("# Product\n", encoding="utf-8")
@@ -90,7 +91,7 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         for plan_id, relative in self.paths.items():
             title = "First" if plan_id == "G-001" else "Second"
             (self.repo / relative).write_text(
-                plan_text(plan_id, title), encoding="utf-8"
+                plan_text(plan_id, title), encoding="utf-8", newline="\n"
             )
         git(self.repo, "add", ".")
         git(self.repo, "commit", "-m", "base")

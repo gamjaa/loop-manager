@@ -1,4 +1,5 @@
-from contextlib import contextmanager
+from tests.support.workspace import symlink_or_skip
+from contextlib import contextmanager, ExitStack
 from dataclasses import replace
 import hashlib
 import json
@@ -467,12 +468,12 @@ class PlanningRecoveryTest(PlanningCase):
         from tests.support.origin import remote_fixture, advance_remote, git
         from loop_manager_internal.storage import database
         for recovery in (False, True):
-            with tempfile.TemporaryDirectory() as directory:
+            with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
                 _remote, source, writer = remote_fixture(directory)
                 state_dir = Path(directory) / "state"
                 state_dir.mkdir()
                 connection = database.connect_database(state_dir, create=True)
-                self.addCleanup(connection.close)
+                cleanup.callback(connection.close)
                 tree = Path(directory) / "planning"
                 old = git(source, "rev-parse", "HEAD")
                 git(source, "worktree", "add", "--detach", str(tree), old)
@@ -526,7 +527,7 @@ class PlanningRecoveryTest(PlanningCase):
         from tests.support.maintenance_planning_case import git
         from loop_manager_internal.storage import database, runtime_state
 
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             root = Path(directory)
             repository = make_catalog_root(str(root / "repo"))
             git(repository, "init", "-b", "main")
@@ -538,7 +539,7 @@ class PlanningRecoveryTest(PlanningCase):
             old = git(repository, "rev-parse", "HEAD").strip()
             git(repository, "update-ref", "refs/remotes/origin/main", old)
             connection = database.connect_database(root, create=True)
-            self.addCleanup(connection.close)
+            cleanup.callback(connection.close)
             repo = str(repository)
             connection.execute("INSERT INTO projects (repo, base_branch) VALUES (?, 'main')", (repo,))
             connection.commit()
@@ -549,7 +550,7 @@ class PlanningRecoveryTest(PlanningCase):
                 maintenance_state.MaintenanceRepository(connection), root,
             )
             original = plan.read_text()
-            plan.write_text(original.replace("Test plan.", "Remote acceptance change."))
+            plan.write_text(original.replace("Test plan.", "Remote acceptance change."), newline="\n")
             git(repository, "add", ".")
             git(repository, "commit", "-m", "remote")
             latest = git(repository, "rev-parse", "HEAD").strip()
@@ -1191,7 +1192,7 @@ class PlanningConflictCorrectionUnitTests(PlanningCase):
             with self.subTest(kind=kind):
                 self.plan.unlink(missing_ok=True)
                 if kind == "symlink":
-                    self.plan.symlink_to("missing-target")
+                    symlink_or_skip(self.plan, "missing-target")
                 elif kind == "directory":
                     self.plan.mkdir()
                 else:

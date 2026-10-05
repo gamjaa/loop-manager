@@ -69,7 +69,8 @@ class CompletionCycleTest(NotificationFixture, unittest.TestCase):
 
     def test_completion_while_disabled_cancels_wait_before_reenabled_dispatch(self):
         for fail_delivery in (False, True):
-            with self.subTest(fail_delivery=fail_delivery), tempfile.TemporaryDirectory() as directory:
+            with self.subTest(fail_delivery=fail_delivery):
+                directory = self.enterContext(tempfile.TemporaryDirectory())
                 database = Path(directory) / "state.db"
                 connection = self.connection(database=database)
                 repo = "/projects/alpha"
@@ -244,7 +245,8 @@ class WorkReasonOutboxTest(NotificationFixture, unittest.TestCase):
     def test_disabled_wait_transition_cancels_stale_notice_before_restart(self):
         for remaining_requirement in (False, True):
             for failed_delivery in (False, True):
-                with self.subTest(requirement=remaining_requirement, failed=failed_delivery), tempfile.TemporaryDirectory() as directory:
+                with self.subTest(requirement=remaining_requirement, failed=failed_delivery):
+                    directory = self.enterContext(tempfile.TemporaryDirectory())
                     database = Path(directory) / "state.db"
                     connection = self.connection(database=database)
                     repo = "/projects/alpha"

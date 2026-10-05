@@ -20,6 +20,23 @@ from tests.support.rebase_observations import expectation
 
 
 class GitSnapshotCostTests(unittest.TestCase):
+    def test_git_bytes_separates_warnings_and_preserves_failure_diagnostics(self):
+        from loop_manager_internal.git.command_adapter import GitBytesEffects, git_bytes
+        from loop_manager_internal.runtime.contracts import GitLockError
+
+        run = mock.Mock(return_value=subprocess.CompletedProcess(
+            [], 0, b'1\t0\tAGENTS.md\0', b'warning: LF will be replaced by CRLF\n'))
+        effects = GitBytesEffects(run, lambda output: 'index.lock' in output)
+        self.assertEqual(git_bytes(effects, Path('/repo'), 'diff', '--numstat', '-z'),
+                         b'1\t0\tAGENTS.md\0')
+        self.assertEqual(run.call_args.kwargs['stderr'], subprocess.PIPE)
+        for diagnostic, error in ((b'fatal: index.lock exists', GitLockError),
+                                  (b'fatal: invalid revision', RuntimeError)):
+            with self.subTest(diagnostic=diagnostic):
+                run.return_value = subprocess.CompletedProcess([], 1, b'', diagnostic)
+                with self.assertRaisesRegex(error, diagnostic.decode()):
+                    git_bytes(effects, Path('/repo'), 'show', 'HEAD')
+
     def test_head_branch_batch_matches_legacy_and_saves_one_command_per_worktree(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = make_remote_repository(directory)
