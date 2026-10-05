@@ -537,33 +537,38 @@ class ProvisionalFileReviewTest(unittest.TestCase):
             source.path, source.content_hash, source.mode, source.revision,
             "Reviewed implementation and related test responsibilities.",
         ),)
-        roots = root_results_for(self.repo, inventory)
-        original_reason = roots[0]["reason"]
-        original_excerpt = roots[0]["references"][0]["excerpt"]
         prepare = self.ledger._prepare_evidence
-        changed = False
+        for field in ("category", "reason", "reference"):
+            with self.subTest(field=field):
+                roots = root_results_for(self.repo, inventory)
+                original = json.loads(json.dumps(roots))
+                changed = False
 
-        def change_roots_after_preparation(*args, **kwargs):
-            nonlocal changed
-            result = prepare(*args, **kwargs)
-            if not changed:
-                roots[0]["reason"] = "The tracked tree remains present, but ownership is still uncertain."
-                roots[0]["references"][0]["excerpt"] = original_excerpt[2:]
-                self.assertEqual(result.placements[0]["reason"], original_reason)
-                self.assertEqual(result.placements[0]["references"][0]["excerpt"], original_excerpt)
-                changed = True
-            return result
+                def change_roots_after_preparation(*args, **kwargs):
+                    nonlocal changed
+                    result = prepare(*args, **kwargs)
+                    if not changed:
+                        if field == "reference":
+                            roots[0]["references"][0]["excerpt"] = original[0]["references"][0]["excerpt"][2:]
+                        else:
+                            roots[0][field] = ("tool_required" if field == "category" else
+                                "The tracked tree remains present, but ownership is still uncertain.")
+                        # Each mutation is valid on its own, so only the snapshot
+                        # comparison can reject it at the publication boundary.
+                        maintenance_file_ledger.validate_root_reviews(self.repo, inventory, roots)
+                        self.assertEqual(result.placements, tuple(original))
+                        changed = True
+                    return result
 
-        with mock.patch.object(self.ledger, "_prepare_evidence", side_effect=change_roots_after_preparation):
-            with self.assertRaisesRegex(maintenance_file_ledger.FileReviewLedgerError, "게시 직전"):
-                self.ledger.record_success(str(self.repo), str(self.repo), "main", inventory, reviewed,
-                                           root_reviews=roots)
-        self.assertIsNone(self.ledger.last_success(str(self.repo)))
-        self.assertEqual(self.ledger.reviews(str(self.repo)), ())
-        self.assertEqual(self.ledger.root_placements(str(self.repo)), ())
+                with mock.patch.object(self.ledger, "_prepare_evidence", side_effect=change_roots_after_preparation):
+                    with self.assertRaisesRegex(maintenance_file_ledger.FileReviewLedgerError, "게시 직전"):
+                        self.ledger.record_success(str(self.repo), str(self.repo), "main", inventory, reviewed,
+                                                   root_reviews=roots)
+                self.assertIsNone(self.ledger.last_success(str(self.repo)))
+                self.assertEqual(self.ledger.reviews(str(self.repo)), ())
+                self.assertEqual(self.ledger.root_placements(str(self.repo)), ())
 
-        roots[0]["reason"] = original_reason
-        roots[0]["references"][0]["excerpt"] = original_excerpt
+        roots = root_results_for(self.repo, inventory)
         self.ledger.record_success(str(self.repo), str(self.repo), "main", inventory, reviewed, root_reviews=roots)
         self.assertEqual(self.ledger.last_success(str(self.repo)).source_revision, inventory.revision)
 
