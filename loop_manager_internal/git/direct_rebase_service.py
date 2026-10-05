@@ -151,7 +151,7 @@ def _finish_owned_direct_rebase(
     return manager_git_journal.record_current_rebase_result(
         state_dir, repo=str(effects._canonical_path(repo_path)),
         target=str(effects._canonical_path(worktree)), owner=f'plan:{plan_id}',
-        decision=decision, observed=effects._owned_rebase_journal_state(worktree, branch),
+        decision=decision, observed=lambda: effects._owned_rebase_journal_state(worktree, branch),
     )
 
 
@@ -462,7 +462,7 @@ def _publish_direct_rebase_checkpoint(effects: PublishDirectRebaseCheckpointEffe
         "SELECT accepted_remote_oid FROM blocked_checkpoints WHERE repo = ? AND plan_id = ? "
         "AND phase = 'published'", (repo, plan_id)).fetchone()
 
-    def owns_remote(oid, selected):
+    def owns_remote(oid, selected, *, rebase_observation=None):
         if owner is None:
             return True
         original = owner['accepted_remote_oid']

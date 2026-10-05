@@ -1,3 +1,4 @@
+from tests.support.recovery_boundary import RecoveryBoundary
 from tests.support.recovery import BoundedRecoveryFixture
 import json
 import sqlite3
@@ -173,43 +174,44 @@ class RecoveryHistoryTest(BoundedRecoveryFixture, unittest.TestCase):
             "ISSUE_ID: app.py::unknown-verdict::blocking\nVERDICT: MAYBE",
             "VERDICT: PASS\ntrailing explanation",
         )
-        for review in invalid_reviews:
-            with self.subTest(review=review), tempfile.TemporaryDirectory() as directory:
-                data = self._run_review_sequence(
-                    directory,
-                    (review,) * loop_manager.MAX_REVIEWER_PROTOCOL_ATTEMPTS,
-                    publish=False,
-                )
+        with RecoveryBoundary() as boundary:
+            for variant, review in enumerate(invalid_reviews):
+                with self.subTest(review=review):
+                    data = self._run_review_sequence(
+                        boundary.directory,
+                        (review,) * loop_manager.MAX_REVIEWER_PROTOCOL_ATTEMPTS,
+                        publish=False, boundary=boundary,
+                    )
 
-            result = data["result"]
-            project = data["project"]
-            plan = data["plan"]
-            self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
-            self.assertEqual(result.exit_code, 0)
-            self.assertEqual(
-                data["roles"],
-                ["worker"]
-                + ["reviewer"] * loop_manager.MAX_REVIEWER_PROTOCOL_ATTEMPTS,
-            )
-            self.assertEqual(
-                data["reviewer_sessions"],
-                [None]
-                + ["reviewer-session"]
-                * (loop_manager.MAX_REVIEWER_PROTOCOL_ATTEMPTS - 1),
-            )
-            self.assertEqual(data["verify_calls"], 1)
-            self.assertEqual(data["transitions"], [])
-            self.assertIsNone(project["phase"])
-            self.assertIn("Reviewer 결과 프로토콜 오류", plan["last_error"])
-            self.assertIn("프로토콜 교정 3회 실패", plan["last_error"])
-            self.assertEqual(plan["review_result"], review)
-            self.assertEqual(plan["status"], "PLAN_BLOCKED")
-            self.assertEqual(json.loads(plan["review_failure_history"]), {})
-            self.assertEqual(json.loads(plan["review_level_history"]), {})
-            self.assertEqual(plan["effective_worker_level"], 1)
-            for prompt in data["reviewer_prompts"][1:]:
-                self.assertIn("직전 Reviewer 결과가 아래 프로토콜 검증에 실패", prompt)
-                self.assertIn(review, prompt)
+                result = data["result"]
+                project = data["project"]
+                plan = data["plan"]
+                self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+                self.assertEqual(result.exit_code, 0)
+                self.assertEqual(
+                    data["roles"],
+                    (["worker"] if variant == 0 else [])
+                    + ["reviewer"] * loop_manager.MAX_REVIEWER_PROTOCOL_ATTEMPTS,
+                )
+                self.assertEqual(
+                    data["reviewer_sessions"],
+                    [None]
+                    + ["reviewer-session"]
+                    * (loop_manager.MAX_REVIEWER_PROTOCOL_ATTEMPTS - 1),
+                )
+                self.assertEqual(data["verify_calls"], 1 if variant == 0 else 0)
+                self.assertEqual(data["transitions"], [])
+                self.assertIsNone(project["phase"])
+                self.assertIn("Reviewer 결과 프로토콜 오류", plan["last_error"])
+                self.assertIn("프로토콜 교정 3회 실패", plan["last_error"])
+                self.assertEqual(plan["review_result"], review)
+                self.assertEqual(plan["status"], "PLAN_BLOCKED")
+                self.assertEqual(json.loads(plan["review_failure_history"]), {})
+                self.assertEqual(json.loads(plan["review_level_history"]), {})
+                self.assertEqual(plan["effective_worker_level"], 1)
+                for prompt in data["reviewer_prompts"][1:]:
+                    self.assertIn("직전 Reviewer 결과가 아래 프로토콜 검증에 실패", prompt)
+                    self.assertIn(review, prompt)
 
     @dummy_worker_sessions
     def test_review_failure_then_verify_failure_keeps_stage_counts_independent(self):

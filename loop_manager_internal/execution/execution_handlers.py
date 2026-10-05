@@ -276,8 +276,8 @@ class ExecutionHandlers:
             },
         )
 
-    def _owned_checkpoint_remote(self, context, row, remote_oid, current, pull_request=None):
-        return self._ownership_handler()._owned_checkpoint_remote(context, row, remote_oid, current, pull_request)
+    def _owned_checkpoint_remote(self, context, row, remote_oid, current, pull_request=None, **evidence):
+        return self._ownership_handler()._owned_checkpoint_remote(context, row, remote_oid, current, pull_request, **evidence)
 
     def _owned_published_review_resume(self, context, row, remote_oid, current, checkpoint, marker, pull_request):
         return self._ownership_handler()._owned_published_review_resume(context, row, remote_oid, current, checkpoint, marker, pull_request)

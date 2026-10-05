@@ -18,6 +18,32 @@ from tests.support.execution_assertions import _assert_manual_autostash_recovery
 class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
     """Real handler/CAS policies with immutable fake Git observations only."""
 
+    def test_ownership_reuses_only_matching_inspect_evidence(self):
+        from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseService
+        self._prepare_current_checkpoint_recovery()
+        context = self.fixture.context()
+        current = self.checkpoint.get('repo', 'G-047')
+        service = self.factory(context)
+        observed, decision = service.observe(checkpoint=current)
+        def owned(expected):
+            return self.handler._owned_checkpoint_remote(context, self.state.row(), 'remote', current,
+                rebase_observation=(expected, observed, decision))
+        with mock.patch.object(ManagedRebaseService, 'observe', return_value=(observed, decision)) as read:
+            self.assertTrue(owned(service.expected))
+            read.assert_not_called()
+            for field, value in (('repo', 'other'), ('repository_identity', 'other'),
+                    ('worktree', '/other'), ('branch', 'other'), ('target_base_oid', 'other'),
+                    ('input_fingerprint', 'other'), ('scope_fingerprint', 'other'),
+                    ('generation', current.generation + 1),
+                    ('remote', replace(service.expected.remote, oid='other'))):
+                with self.subTest(field=field):
+                    read.reset_mock()
+                    self.assertTrue(owned(replace(service.expected, **{field: value})))
+                    read.assert_called_once_with(checkpoint=current)
+            # 동일 관측도 소비자의 독립 게시 소유권 거절을 덮지 않는다.
+            with mock.patch.object(handlers.checkpoint_ownership, 'owned_remote_oid', return_value=None):
+                self.assertFalse(owned(service.expected))
+
     def test_ordinary_checkpoint_remote_observation_keeps_fetched_reader(self):
         from loop_manager_internal.git.managed_rebase_adoption import checkpoint_remote_oid
         current = self.checkpoint.get('repo', 'G-047')

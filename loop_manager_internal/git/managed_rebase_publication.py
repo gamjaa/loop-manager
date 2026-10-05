@@ -94,7 +94,8 @@ def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree
                 or accepted['remote']['pull_request'] is not None):
             raise RebasePublicationRejected('intermediate checkpoint current ownership or scope differs')
         try:
-            owned = owns_remote(oid, selected)
+            owned = owns_remote(oid, selected,
+                                rebase_observation=(live.expected, observed, decision))
         except RecoveryFailure as error:
             if error.reason is RecoveryReason.PUBLICATION_RETRY:
                 raise RebaseObservationRetry('intermediate checkpoint ownership observation failed') from error

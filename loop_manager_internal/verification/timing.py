@@ -13,6 +13,7 @@ from unittest import mock
 
 _current_writer: ContextVar[EventWriter | None] = ContextVar("verify_events", default=None)
 _fixture_timing_active: ContextVar[bool] = ContextVar("fixture_timing_active", default=False)
+_phase_names: ContextVar[tuple[str, ...]] = ContextVar("verify_phase_names", default=())
 
 
 class EventWriter:
@@ -46,6 +47,7 @@ def phase(name: str, *, writer=None):
         yield
         return
     start = writer.emit("phase_start", name=name)
+    token = _phase_names.set((*_phase_names.get(), name))
     try:
         yield
     except BaseException:
@@ -55,6 +57,8 @@ def phase(name: str, *, writer=None):
     else:
         writer.emit("phase_end", name=name, start=start["at"],
                     duration=writer.clock() - start["at"], result="complete")
+    finally:
+        _phase_names.reset(token)
 
 
 class TimedResult(unittest.TextTestResult):
@@ -64,6 +68,7 @@ class TimedResult(unittest.TextTestResult):
 
     def startTest(self, test):
         super().startTest(test)
+        self.writer.current_test = test.id()
         self.started[test.id()] = self.writer.emit("test_start", id=test.id())["at"]
 
     def _outcome(self, test, outcome):
@@ -105,6 +110,7 @@ class TimedResult(unittest.TextTestResult):
         self.writer.emit("subtest_result", id=test.id(), result=outcome)
 
     def stopTest(self, test):
+        self.writer.current_test = None
         identity = test.id()
         started = self.started.pop(identity)
         if identity not in self.outcomes:
@@ -128,6 +134,14 @@ def fixture_timing():
     names = ("_handleClassSetUp", "_tearDownPreviousClass", "_handleModuleFixture", "_handleModuleTearDown")
     try:
         with ExitStack() as patches:
+            subtest = unittest.TestCase.subTest
+            variants = Counter()
+            @contextmanager
+            def timed_subtest(test, *args, **kwargs):
+                variants[test.id()] += 1
+                with phase(f'subtest:{test.id()}:{variants[test.id()]}'), subtest(test, *args, **kwargs):
+                    yield
+            patches.enter_context(mock.patch.object(unittest.TestCase, 'subTest', timed_subtest))
             for name in names:
                 original = getattr(unittest.TestSuite, name)
 
@@ -167,6 +181,7 @@ def summarize(directory: Path, *, now=None):
     now = time.monotonic() if now is None else now
     finished_at = None
     completed, active, phases, decisions, metadata, fixtures, result = [], {}, [], [], {}, [], None
+    git_costs, git_incomplete = [], []
     for path in sorted(directory.glob("*.jsonl")):
         for line in path.read_text(encoding="utf-8").splitlines(keepends=True):
             if not line.endswith("\n"):
@@ -190,6 +205,10 @@ def summarize(directory: Path, *, now=None):
                 result = event
             elif kind == "fixture_result":
                 fixtures.append(event)
+            elif kind == 'git_cost':
+                git_costs.append(event)
+            elif kind == 'git_cost_incomplete':
+                git_incomplete.append(event)
     snapshots = {}
     for event in phases:
         if event.get("snapshot") != "full":
@@ -205,7 +224,8 @@ def summarize(directory: Path, *, now=None):
                "tests": sorted(completed, key=lambda item: item["duration"], reverse=True),
                "phases": sorted(phases, key=lambda item: item["duration"], reverse=True),
                "active": [{**event, "elapsed": max(0, (finished_at if finished_at is not None else now) - event["at"])} for event in active.values()],
-               "allocations": decisions, "git_snapshots": snapshots, "fixture_results": fixtures, "result": result}
+               "allocations": decisions, "git_snapshots": snapshots, "git_commands": git_costs,
+               "git_commands_incomplete": git_incomplete, "fixture_results": fixtures, "result": result}
     atomic_json(directory / "summary.json", summary)
     return summary
 
@@ -232,6 +252,8 @@ def comparison(directories, summaries):
                      "git_snapshot_count": sum(cost["count"] for cost in summary.get("git_snapshots", {}).values()),
                      "git_snapshot_commands": sum(command["count"] for cost in summary.get("git_snapshots", {}).values()
                                                   for command in cost["commands"].values()),
+                     "git_commands": sum(cost['count'] for cost in summary.get('git_commands', [])),
+                     "git_command_seconds": sum(cost['seconds'] for cost in summary.get('git_commands', [])),
                      "passed": (summary.get("result") or {}).get("passed"), "counts": summary["counts"]})
     scope_matches = bool(scopes and scopes[0]) and all(scope == scopes[0] for scope in scopes)
     environment_matches = bool(contexts and all(value is not None for value in contexts[0][:6])) and all(
