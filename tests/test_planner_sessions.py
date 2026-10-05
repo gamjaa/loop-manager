@@ -56,7 +56,7 @@ class PlannerSessionsTest(unittest.TestCase):
             state_dir = Path(directory) / "state"
             with mock.patch(
                 "loop_manager.codex_model_efforts",
-                return_value={"gpt-5.6-sol": frozenset({"xhigh"})},
+                return_value={"gpt-6.1-sol": frozenset({"xhigh"})},
             ), mock.patch(
                 "loop_manager.subprocess.Popen", side_effect=StartedProcess
             ), mock.patch("loop_manager.subprocess.run", side_effect=codex_run):

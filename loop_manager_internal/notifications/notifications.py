@@ -1,5 +1,6 @@
 """Compatibility entry point for notification services."""
-from .repository import (ensure_schema, configure_session, _enabled, _insert)
+from .repository import (adopt_legacy_block_notices, ensure_schema,
+                         configure_session, _enabled, _insert)
 from .incidents import (_key, _remote_inspection_suffix, _queue_block,
                         release_block, record_work_start, _materialize_resumption,
                         _checkpoint_link, _project_checkpoint,

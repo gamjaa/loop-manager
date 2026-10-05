@@ -9,6 +9,7 @@ import loop_manager
 from loop_manager_internal.storage import blocked_checkpoint_state
 from loop_manager_internal.config.managed_config import ManagedConfigError, load_managed_config
 from loop_manager_internal.notifications import notifications
+from loop_manager_internal.notifications.events import _BlockedPlanProjection
 from loop_manager_internal.notifications import rendering
 from loop_manager_internal.notifications import work_exhaustion
 from loop_manager_internal.runtime import project_registry
@@ -33,6 +34,34 @@ class NotificationRenderingTest(unittest.TestCase):
 
 
 class NotificationEventTest(NotificationFixture, unittest.TestCase):
+    def test_blocked_projection_reads_aliases_in_any_column_order(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        fields = {
+            "plan_id": "G-018", "plan_title": "Named projection",
+            "plan_path": "docs/plans/plan.md", "plan_sources": "[]",
+            "reason_code": "user_decision_required", "evidence": "cause",
+            "checkpoint_result": "local_only", "checkpoint_remote_oid": None,
+            "checkpoint_unpublished_reason": "unpublished",
+            "checkpoint_branch": "branch", "origin": "owner/repo",
+            "checkpoint_inspected_remote_oid": "inspected",
+            "checkpoint_inspection_reason": "inspection reason",
+        }
+        expected = None
+        for names in (list(fields), list(reversed(fields))):
+            row = connection.execute(
+                "SELECT " + ", ".join(f"? AS {name}" for name in names),
+                [fields[name] for name in names],
+            ).fetchone()
+            projection = _BlockedPlanProjection.from_row(row)
+            if expected is None:
+                expected = projection
+            self.assertEqual(projection, expected)
+        self.assertEqual(expected.checkpoint_unpublished_reason, "unpublished")
+        self.assertEqual(expected.checkpoint_inspected_remote_oid, "inspected")
+        self.assertIsNone(expected.checkpoint_remote_oid)
+
     def test_specification_deadlock_notification_names_documents_and_question(self):
         connection = self.connection()
         repo = "/projects/alpha"
@@ -106,6 +135,120 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
         self.assertIn("Recovery attempts: git_lock: 1", rendered)
         self.assertEqual(rendered.count(expected[0]), 1)
         self.assertEqual(rendered.count(expected[1]), 1)
+
+    def test_blocked_plan_projection_keeps_guidance_and_checkpoint_fields_named(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        path = "docs/plans/[G-018] Named projection.md"
+        with connection:
+            connection.execute(
+                "UPDATE exec_plans SET path = ?, title = ?, sources = ? "
+                "WHERE repo = ? AND plan_id = 'G-018'",
+                (path, "Named projection", '["docs/PRODUCT.md"]', repo),
+            )
+            connection.execute(
+                "UPDATE projects SET origin = ? WHERE repo = ?",
+                ("example/alpha", repo),
+            )
+            connection.execute(
+                "INSERT INTO guidance_approvals (repo, plan_id, proposal_id, "
+                "proposal_hash, target_path, scope, proposal_patch, "
+                "proposal_patch_hash, proposal_line, decision_line, batch_id, "
+                "sequence, baseline_content, baseline_mode) "
+                "VALUES (?, 'G-018', 'guidance-a', 'hash', 'AGENTS.md', "
+                "'common', 'patch', 'patch-hash', 15, 22, 'batch', 0, ?, 420)",
+                (repo, b""),
+            )
+            scoped_blocking.record_plan_block(
+                connection,
+                repo,
+                "G-018",
+                scoped_blocking.BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED,
+                "User Decision pending",
+                "guidance-fingerprint",
+            )
+            checkpoints = blocked_checkpoint_state.BlockedCheckpointRepository(
+                connection
+            )
+            request = checkpoints.request(
+                repo=repo,
+                plan_id="G-018",
+                reason_code="guidance_approval_required",
+                evidence="User Decision pending",
+                branch="loop-manager/G-018",
+                worktree="/state/G-018",
+                expected_remote_oid=None,
+                rebase_recovery=False,
+            )
+            checkpoints.finish_published(request, "a" * 40)
+
+        event = next(
+            row for row in self.events(connection) if row["event_type"] == "blocked"
+        )
+        payload = json.loads(event["payload"])
+        self.assertEqual(payload["execplan_id"], "G-018")
+        self.assertEqual(payload["execplan_title"], "Named projection")
+        self.assertEqual(payload["cause"], "User Decision pending")
+        self.assertEqual(
+            payload["guidance_locations"],
+            [{
+                "proposal_id": "guidance-a",
+                "proposal": f"{path}:15",
+                "user_decision": f"{path}:22",
+            }],
+        )
+        self.assertEqual(
+            payload["checkpoint"],
+            {
+                "result": "published",
+                "branch": "loop-manager/G-018",
+                "branch_url": f"https://github.com/example/alpha/tree/{'a' * 40}",
+                "commit_oid": "a" * 40,
+            },
+        )
+
+    def test_merged_completion_outbox_replays_once_after_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "state.db"
+            connection = self.connection(database=database)
+            repo = "/projects/alpha"
+            snapshot = work_exhaustion.WorkReasonSnapshot("merge-cycle", (), (), None, None)
+            with connection:
+                connection.execute(
+                    "UPDATE exec_plans SET status = 'MERGED' WHERE repo = ?", (repo,),
+                )
+                connection.execute(
+                    "UPDATE projects SET phase = NULL, planning_error = NULL, "
+                    "planning_fingerprint = ? WHERE repo = ?",
+                    ("merge-cycle", repo),
+                )
+                notifications.record_merged_plan(
+                    connection, repo, "G-018", "Reliable notices",
+                )
+                self.assertTrue(notifications.enqueue_completion_if_ready(
+                    connection, repo, snapshot,
+                ))
+            connection.close()
+
+            restarted = sqlite3.connect(database)
+            restarted.row_factory = sqlite3.Row
+            self.addCleanup(restarted.close)
+            notifications.configure_session(restarted, enabled=True)
+            self.assertTrue(notifications.enqueue_completion_if_ready(
+                restarted, repo, snapshot,
+            ))
+            delivered = mock.Mock()
+            self.assertEqual(notifications.dispatch_pending(
+                restarted, "token", "chat", adapter=delivered,
+            ), 1)
+            delivered.assert_called_once()
+            self.assertEqual(restarted.execute(
+                "SELECT COUNT(*) FROM notification_outbox "
+                "WHERE repo = ? AND event_type = 'project_completed'", (repo,),
+            ).fetchone()[0], 1)
+            self.assertEqual(notifications.dispatch_pending(
+                restarted, "token", "chat", adapter=delivered,
+            ), 0)
 
     def test_disabled_and_partial_configuration_do_not_create_events(self):
         connection = self.connection(enabled=False)

@@ -143,6 +143,8 @@ class SelfMergeHandoffTest(PrRecoveryFixture, unittest.TestCase):
                 ), mock.patch(
                     "loop_manager.pr_for_branch", return_value=merged
                 ), mock.patch(
+                    "loop_manager_internal.application.scheduler.VerifyCoordinator"
+                ), mock.patch(
                     "loop_manager._run_registered_project",
                     return_value=loop_manager.ScheduledProjectResult(
                         str(repo), loop_manager.ProjectRunResult(

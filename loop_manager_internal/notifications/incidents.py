@@ -3,8 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from .repository import (ensure_schema, _enabled, _insert, _encode_payload,
-                         _planner_started_after_notice)
+from .repository import (adopt_legacy_block_notices, ensure_schema, _enabled,
+                         _insert, _encode_payload, _planner_started_after_notice)
 from .rendering import _checkpoint_link
 
 def _key(kind: str, repo: str, identity: str) -> str:
@@ -216,6 +216,7 @@ def release_block(connection: sqlite3.Connection, repo: str, subject: str) -> No
     """Release an incident and discard undelivered BLOCKED pieces atomically."""
 
     ensure_schema(connection)
+    adopt_legacy_block_notices(connection)
     if subject == "planning":
         current = connection.execute(
             "SELECT id, block_key, payload FROM notified_block_incidents "
@@ -279,6 +280,7 @@ def record_work_start(
     }:
         return 0
     ensure_schema(connection)
+    adopt_legacy_block_notices(connection)
     if connection.execute(
         "SELECT 1 FROM project_blocks WHERE repo = ?", (repo,),
     ).fetchone() is not None:

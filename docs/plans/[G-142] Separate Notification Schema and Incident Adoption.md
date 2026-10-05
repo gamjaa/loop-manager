@@ -34,8 +34,8 @@ Make notification event projection and legacy incident adoption explicit. The no
 
 ## Progress
 
-- [ ] Separate schema, adoption and named event projection.
-- [ ] Add field-order and persisted-outbox regression tests.
+- [x] Separate schema, adoption and named event projection.
+- [x] Add field-order and persisted-outbox regression tests.
 
 ## Decision Log
 
@@ -43,3 +43,10 @@ Make notification event projection and legacy incident adoption explicit. The no
 - Observed notification paths: `loop_manager_internal/notifications/events.py`, `loop_manager_internal/notifications/repository.py`.
 
 - 2026-10-05 사용자 실행 순서 결정: G-158의 archive Requirement 감사·복구 준비 PR이 실제 Merge된 뒤 기존 세션과 후보를 보존하여 재개한다. 미충족 Requirement는 활성 입력으로 유지하고 조기 archive 강제를 완료 조건으로 적용하지 않는다. 재개 후 targeted test, Manager 전체 verify, Reviewer와 PR 게시를 통해 실제 복구를 확인하며 다른 안전 차단은 별도로 판단한다.
+
+- Recovery: G-157/G-158 are merged. Requirement retirement belongs to Planner/Manager; this candidate retains active R-053/R-055 and requires fresh Worker confirmation, full verify and Review. Existing implementation is preserved.
+- Rebased candidate audit: the base-relative diff does not move Requirements; active R-053/R-055 remain at the PRODUCT-linked paths. This refactor does not implement R-053's remaining planning/start/failure events or silent delivery and does not retire either Requirement. Regression coverage now reverses query aliases and rolls back interrupted legacy adoption before retrying; schema preparation alone leaves incidents untouched. Existing Linux verification entry point remains applicable.
+- Supplied verify diagnostics identify six stale test catalogs/expectations after the base's example profile update. The affected provider-profile and Planner-session tests now match the existing example's GPT-6.1 Sol/GPT-6 Luna profiles, retaining model/effort validation and session interruption assertions. No production profile or verification command is changed.
+- The subsequent diagnostic exposes the same stale catalog in the provider-neutral all-role/all-level test. Its Codex catalog and level-7 expectation now match the existing example; Claude validation and all-role/all-level coverage are preserved.
+
+- Rebase reconciliation preserves the base's independent provider-profile/runtime fixtures and their test-model expectations; example-specific overrides are superseded. Planner session mocks remain aligned with the current example. All-role/all-level and Claude coverage are retained.
