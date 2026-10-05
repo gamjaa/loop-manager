@@ -40,9 +40,10 @@ priority: high
 - 관련 fixture는 native/canonical 경로, LF 또는 명시적 Git 변환 정책, DB 종료 후 임시 디렉터리 정리, Git index 실행 비트 및 기존 symlink 권한 skip 경계를 사용하도록 수정했다.
 - Windows 경로 복구·문서 등록·Git replay·유지보수 publication의 targeted 회귀 검증이 통과했다. 문서 줄바꿈과 Git stderr 분리, scheduler 연결 종료를 직접 확인하는 검증을 보강했다.
 - Windows BLOCKED 복구의 원자적 파일 교체는 파일 fsync를 유지하고 POSIX에서만 디렉터리 fsync를 실행한다. Manager fetch는 최신 Git의 origin/HEAD 자동 변경을 끈다. 두 문제는 실제 복구 테스트로 확인한다.
-- 수정본 Linux 전체 검증은 자동 병렬 실행에서 2,431개(성공 2,429개, 플랫폼 skip 2개)와 compile을 통과했다. 이후 fetch의 origin/HEAD 억제를 모든 Manager fetch 경로에 확장했으며 최종 snapshot을 다시 검증한다.
-- Windows 30분 전체 실행은 복구 모듈을 완료하기 전에 timeout됐다. 후속 실행에서 origin 격리 fixture의 경로 비교 두 건과 하위 테스트 skip을 완료 누락으로 잘못 처리한 검증기 결함을 수정했다. skip은 부모 테스트에 기록하고 기존 실패 우선순위 및 fixture skip 구분을 유지한다. 관련 targeted 검증을 통과했으며 전체 결과를 다시 확인한다.
-- 일반 PR #153을 게시했다. Windows에서 동일 테스트의 Git 2,277회 호출에 215초, Linux에서는 6.5초가 걸렸다. Defender의 실시간 검사가 켜져 있고 테스트 중 프로세스 CPU 카운터 253~291%를 관측했다. 인과 비중은 별도 비교가 없으므로 확정하지 않으며 백신 설정은 변경하지 않는다.
+- 최종 실행 코드 `13480dc`의 Windows Python 3.13.14 전체 검증은 2,432개(성공 2,373개, 플랫폼·symlink 권한 조건 skip 59개), compile과 종료 코드 0을 확인했다. 자동 병렬 실행에 1,827.04초가 걸렸고 timeout은 발생하지 않았다.
+- 동일 코드의 Git archive로 만든 독립 Linux snapshot에서 Ubuntu Python 3.12.3 전체 검증은 2,432개(성공 2,430개, 플랫폼 skip 2개), compile과 종료 코드 0을 확인했다. 자동 병렬 실행에 232.18초가 걸렸다.
+- Windows 30분 전체 실행은 복구 모듈을 완료하기 전에 timeout됐다. 후속 실행에서 origin 격리 fixture의 경로 비교 두 건과 하위 테스트 skip을 완료 누락으로 잘못 처리한 검증기 결함을 수정했다. skip은 부모 테스트에 기록하고 기존 실패 우선순위 및 fixture skip 구분을 유지한다. 관련 targeted 검증과 최종 전체 검증을 통과했다.
+- 일반 PR #153(https://github.com/gamjaa/loop-manager/pull/153)에 변경을 반영했다. 검증은 끝났으며 사용자 review·Merge는 대기 중이다. Windows에서 동일 테스트의 Git 2,277회 호출에 215초, Linux에서는 6.5초가 걸렸다. Defender의 실시간 검사가 켜져 있고 테스트 중 프로세스 CPU 카운터 253~291%를 관측했다. 인과 비중은 별도 비교가 없으므로 확정하지 않으며 백신 설정은 변경하지 않는다.
 
 ## Decision Log
 
