@@ -10,11 +10,7 @@ from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCh
 from loop_manager_internal.execution.execution_runtime import ExecutionOutcomeKind
 
 
-from tests.support.execution_recovery_scenarios import ExecutionRecoveryScenarios
-from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
-
-
-class ExecutionWorkspacePhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+class ExecutionWorkspacePhaseTests(ExecutionFixture, TestCase):
     def test_worktree_recovery_failure_keeps_durable_pending_boundary(self):
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)

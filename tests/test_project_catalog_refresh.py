@@ -14,7 +14,7 @@ from loop_manager_internal.catalog import project_catalog_refresh as refresh
 from tests.support import catalog as fixtures
 
 
-class ProjectCatalogRefreshTest(unittest.TestCase):
+class _CatalogRefreshCase(unittest.TestCase):
     def setUp(self):
         self.fixture = fixtures.catalog_reconciliation_fixture(self)
         self.connection = self.fixture.connection
@@ -78,6 +78,66 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
         ports.state.reconcile_catalog.assert_not_called()
         return outcome, ports
 
+    def archive(self, *, remote=True):
+        self.boundary.refresh()
+        self.archive_repo = archive_state.ExecPlanArchiveRepository(
+            self.connection, apply_catalog=self.boundary.apply_archive)
+        self.candidates = self.archive_repo.merged_candidates(self.repo)
+        self.base_sha = self.sha
+        self.sha = 'c' * 40 if remote else self.sha
+        return self.archive_repo.record_success(
+            self.repo, self.candidates, base_sha=self.base_sha, operation_id=None,
+            commit_oid='c'*40, push_result='pushed:'+'c'*40)
+
+    def run_step(self, *, pr=None, phase=None, invalid=False, scope_error=False):
+        self.connection.execute("UPDATE projects SET phase=?, agent_snapshot=NULL, branch=NULL, worktree=NULL, plan_path=NULL WHERE repo=?", (phase, self.repo))
+        self.connection.execute("UPDATE exec_plans SET status='READY', branch=NULL, worktree=NULL, pr_url=NULL WHERE repo=?", (self.repo,))
+        if scope_error:
+            self.connection.execute("UPDATE projects SET agent_snapshot='saved' WHERE repo=?", (self.repo,))
+        self.connection.commit()
+        self.events = []
+        def reconcile(revision, remember):
+            self.events.append('catalog')
+            if invalid:
+                return state.CatalogReconciliationService(
+                    state.DefinitionStateRepository(self.connection), fixtures.FakeDefinitionPort(
+                        replace(self.pinned(revision), snapshot=catalog.ExecPlanCatalogSnapshot({}, {})))
+                ).reconcile(self.repo)
+            return self.reconcile(revision, remember)
+        self.boundary.reconcile = reconcile
+        def pull_requests(*args, **kwargs):
+            self.events.append('pr')
+            self.assertEqual(self.row()['priority'], 'critical')
+            if pr:
+                pr()
+            kwargs['after_reconciliation']()
+            return SimpleNamespace(step_result=0)
+        def safe(*args, **kwargs):
+            self.events.append('archive-eligibility')
+            self.assertEqual(self.row()['sources'], '["docs/requirements/change.md"]')
+            return False
+        def planning(*args):
+            self.assertTrue(callable(args[-1].refresh_catalog))
+            self.events.append('planning')
+            self.assertEqual(self.row()['depends_on'], '["G-002"]')
+            return SimpleNamespace(kind=manager.PlanningOutcomeKind.WAITING)
+        with contextlib.ExitStack() as stack:
+            for name in ('observe_blocked_plan_remotes', 'migrate_legacy_execplans', 'backfill_plan_shas', 'resume_plan_blocks',
+                         '_recorded_base_fetch', 'ensure_safe_base_worktree'):
+                stack.enter_context(mock.patch.object(manager, name))
+            stack.enter_context(mock.patch.object(manager, 'validate_repository', return_value=Path(self.repo)))
+            stack.enter_context(mock.patch.object(manager, 'remote_base', side_effect=lambda *a, **k: self.events.append('fetch') or 'main'))
+            stack.enter_context(mock.patch.object(manager, 'git', side_effect=lambda *a, **k: SimpleNamespace(stdout=self.sha)))
+            stack.enter_context(mock.patch.object(manager, 'recheck_cleanup_pending', return_value=[]))
+            stack.enter_context(mock.patch.object(manager, '_execplan_archive_housekeeping_safe', side_effect=safe))
+            stack.enter_context(mock.patch.object(manager, 'synchronize_waiting_pull_requests', side_effect=pull_requests))
+            stack.enter_context(mock.patch.object(manager.project_catalog_refresh, 'ProjectCatalogRefresh', return_value=self.boundary))
+            stack.enter_context(mock.patch.object(manager.PlanningLifecycleCoordinator, 'run', side_effect=planning))
+            stack.enter_context(mock.patch.object(manager, 'validate_persisted_agent_scope', side_effect=RuntimeError('unsafe')))
+            return manager._run_project_step(self.connection, Path('/state'), self.repo, Path('unused.ini'), 'main', False)
+
+
+class CatalogPlanningConsumerTests(_CatalogRefreshCase):
     def test_planning_reuses_validated_project_catalog(self):
         self.boundary.refresh()
         outcome, ports = self.prepare_planning_workspace()
@@ -117,6 +177,36 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
         self.assertEqual(outcome.kind, PlanningOutcomeKind.TRANSIENT_PAUSE)
         self.assertTrue(ports.state.snapshot.planning_result_completed)
         self.assertIsNone(ports.state.snapshot.planning_error)
+
+    def test_planning_resume_refreshes_before_pr_consumers(self):
+        self.assertEqual(self.run_step(phase='PLANNING'), 0)
+        self.assertLess(self.events.index('catalog'), self.events.index('pr'))
+
+
+class CatalogCacheAndCasTests(_CatalogRefreshCase):
+    def test_refresh_does_not_update_another_repositorys_plan(self):
+        project = dict(self.connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (self.repo,)
+        ).fetchone())
+        project['repo'] = '/other-repo'
+        plan = dict(self.row())
+        plan['repo'] = project['repo']
+        for values, table in ((project, 'projects'), (plan, 'exec_plans')):
+            columns = ', '.join(values)
+            placeholders = ', '.join('?' for _ in values)
+            self.connection.execute(
+                f"INSERT INTO {table} ({columns}) VALUES ({placeholders})",
+                tuple(values.values()),
+            )
+        self.connection.commit()
+
+        self.boundary.refresh()
+
+        other = self.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
+            (project['repo'],),
+        ).fetchone()
+        self.assertEqual(dict(other), plan)
 
     def test_all_declarations_refresh_preserving_execution_audit_and_planning_error(self):
         self.connection.execute("UPDATE projects SET planning_error='retained'")
@@ -195,17 +285,48 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
         self.assertEqual(self.row()['title'], 'Old')
         self.assertEqual(self.row()['worker_session_id'], 'concurrent')
 
-    def archive(self, *, remote=True):
+    def test_catalog_transaction_interruption_restarts_without_partial_delta(self):
+        pinned = self.pinned(self.sha)
+        repo = state.DefinitionStateRepository(self.connection)
+        def interrupt(stage):
+            if stage == 'after-plan:G-001':
+                raise RuntimeError('interrupted')
+        repo._fault_hook = interrupt
+        with self.assertRaisesRegex(RuntimeError, 'interrupted'):
+            state.CatalogReconciliationService(repo, fixtures.FakeDefinitionPort(pinned)).reconcile(self.repo)
+        self.assertEqual(self.row()['title'], 'Old')
         self.boundary.refresh()
-        self.archive_repo = archive_state.ExecPlanArchiveRepository(
-            self.connection, apply_catalog=self.boundary.apply_archive)
-        self.candidates = self.archive_repo.merged_candidates(self.repo)
-        self.base_sha = self.sha
-        self.sha = 'c' * 40 if remote else self.sha
-        return self.archive_repo.record_success(
-            self.repo, self.candidates, base_sha=self.base_sha, operation_id=None,
-            commit_oid='c'*40, push_result='pushed:'+'c'*40)
+        self.assertEqual(self.row()['title'], 'Updated')
+        self.assertEqual(self.row()['worker_session_id'], 'worker')
 
+    def test_adapter_initial_migration_preserves_existing_execution(self):
+        pinned = self.pinned(self.sha)
+        port = SimpleNamespace(load=lambda: pinned, loaded=pinned, current_revision=lambda: self.sha)
+        with mock.patch.object(manager, '_GitCatalogDefinitionPort', return_value=port), \
+             mock.patch.object(manager, 'git', return_value=SimpleNamespace(returncode=0, stdout=self.sha)):
+            result = manager.reconcile_execplan_catalog(self.connection, Path(self.repo), self.repo, 'main')
+        self.assertEqual(result.kind, state.ReconciliationKind.RECONCILED)
+        self.assertEqual(self.row()['status'], 'IMPLEMENTING')
+        self.assertEqual(self.row()['worker_session_id'], 'worker')
+        self.assertEqual(self.row()['publication_content_hash'], 'old-hash-G-001')
+
+    def test_adapter_initial_invalid_catalog_preserves_cache_and_other_safety_cause(self):
+        manager.scoped_blocking.record_project_block(
+            self.connection, self.repo, manager.BlockReasonCode.REPOSITORY_STATE_UNSAFE,
+            'separate safety cause', 'fingerprint', plan_id='G-001', previous_phase='WORKING')
+        self.connection.commit()
+        before = state.DefinitionStateRepository(self.connection).capture(self.repo)
+        snapshot = catalog.snapshot_from_documents({'docs/plans/[G-001] Updated.md': self.fixture._text('G-001', 'Updated')})
+        pinned = state.PinnedCatalog(self.sha, snapshot, self.paths)
+        port = SimpleNamespace(load=lambda: pinned, loaded=pinned, current_revision=lambda: self.sha)
+        with mock.patch.object(manager, '_GitCatalogDefinitionPort', return_value=port):
+            result = manager.reconcile_execplan_catalog(self.connection, Path(self.repo), self.repo, 'main')
+        self.assertEqual(result.kind, state.ReconciliationKind.INVALID_CATALOG)
+        self.assertEqual(state.DefinitionStateRepository(self.connection).capture(self.repo), before)
+        self.assertEqual(manager.scoped_blocking.project_block(self.connection, self.repo)['evidence'], 'separate safety cause')
+
+
+class CatalogArchiveConsumerTests(_CatalogRefreshCase):
     def test_verified_archive_delta_and_audit_are_atomic_without_reread(self):
         self.assertEqual(self.archive(), archive_state.ArchiveWriteResult.APPLIED)
         item = self.archive_repo.item(self.repo, 'G-002')
@@ -235,99 +356,6 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
         self.assertIsNone(repo.item(self.repo, 'G-002'))
         self.assertEqual(self.row('G-002')['path'], 'docs/plans/[G-002] Dependency.md')
 
-    def run_step(self, *, pr=None, phase=None, invalid=False, scope_error=False):
-        self.connection.execute("UPDATE projects SET phase=?, agent_snapshot=NULL, branch=NULL, worktree=NULL, plan_path=NULL", (phase,))
-        self.connection.execute("UPDATE exec_plans SET status='READY', branch=NULL, worktree=NULL, pr_url=NULL")
-        if scope_error:
-            self.connection.execute("UPDATE projects SET agent_snapshot='saved'")
-        self.connection.commit()
-        self.events = []
-        def reconcile(revision, remember):
-            self.events.append('catalog')
-            if invalid:
-                return state.CatalogReconciliationService(
-                    state.DefinitionStateRepository(self.connection), fixtures.FakeDefinitionPort(
-                        replace(self.pinned(revision), snapshot=catalog.ExecPlanCatalogSnapshot({}, {})))
-                ).reconcile(self.repo)
-            return self.reconcile(revision, remember)
-        self.boundary.reconcile = reconcile
-        def pull_requests(*args, **kwargs):
-            self.events.append('pr')
-            self.assertEqual(self.row()['priority'], 'critical')
-            if pr:
-                pr()
-            kwargs['after_reconciliation']()
-            return SimpleNamespace(step_result=0)
-        def safe(*args, **kwargs):
-            self.events.append('archive-eligibility')
-            self.assertEqual(self.row()['sources'], '["docs/requirements/change.md"]')
-            return False
-        def planning(*args):
-            self.assertTrue(callable(args[-1].refresh_catalog))
-            self.events.append('planning')
-            self.assertEqual(self.row()['depends_on'], '["G-002"]')
-            return SimpleNamespace(kind=manager.PlanningOutcomeKind.WAITING)
-        with contextlib.ExitStack() as stack:
-            for name in ('observe_blocked_plan_remotes', 'migrate_legacy_execplans', 'backfill_plan_shas', 'resume_plan_blocks',
-                         '_recorded_base_fetch', 'ensure_safe_base_worktree'):
-                stack.enter_context(mock.patch.object(manager, name))
-            stack.enter_context(mock.patch.object(manager, 'validate_repository', return_value=Path(self.repo)))
-            stack.enter_context(mock.patch.object(manager, 'remote_base', side_effect=lambda *a, **k: self.events.append('fetch') or 'main'))
-            stack.enter_context(mock.patch.object(manager, 'git', side_effect=lambda *a, **k: SimpleNamespace(stdout=self.sha)))
-            stack.enter_context(mock.patch.object(manager, 'recheck_cleanup_pending', return_value=[]))
-            stack.enter_context(mock.patch.object(manager, '_execplan_archive_housekeeping_safe', side_effect=safe))
-            stack.enter_context(mock.patch.object(manager, 'synchronize_waiting_pull_requests', side_effect=pull_requests))
-            stack.enter_context(mock.patch.object(manager.project_catalog_refresh, 'ProjectCatalogRefresh', return_value=self.boundary))
-            stack.enter_context(mock.patch.object(manager.PlanningLifecycleCoordinator, 'run', side_effect=planning))
-            stack.enter_context(mock.patch.object(manager, 'validate_persisted_agent_scope', side_effect=RuntimeError('unsafe')))
-            return manager._run_project_step(self.connection, Path('/state'), self.repo, Path('unused.ini'), 'main', False)
-
-    def test_step_fetch_catalog_pr_archive_and_selection_order(self):
-        self.assertEqual(self.run_step(), 0)
-        self.assertEqual(self.events, ['fetch', 'catalog', 'pr', 'archive-eligibility', 'planning'])
-
-    def test_planning_resume_refreshes_before_pr_consumers(self):
-        self.assertEqual(self.run_step(phase='PLANNING'), 0)
-        self.assertLess(self.events.index('catalog'), self.events.index('pr'))
-
-    def test_invalid_input_stops_all_consumers(self):
-        self.assertEqual(self.run_step(invalid=True), 1)
-        self.assertEqual(self.events, ['fetch', 'catalog'])
-        self.assertEqual(self.row()['title'], 'Old')
-
-    def test_merge_push_refreshes_before_archive_eligibility(self):
-        self.assertEqual(self.run_step(pr=lambda: setattr(self, 'sha', 'c'*40)), 0)
-        self.assertEqual(self.events[:5], ['fetch', 'catalog', 'pr', 'catalog', 'archive-eligibility'])
-        self.assertEqual(self.row()['current_revision_sha'], self.sha)
-
-    def test_unsafe_agent_scope_prevents_fetch_and_consumers(self):
-        self.assertEqual(self.run_step(scope_error=True), 1)
-        self.assertEqual(self.events, [])
-
-    def test_restart_after_committed_pr_result_keeps_merge_and_session(self):
-        self.boundary.refresh()
-        self.connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id='G-001'")
-        self.connection.commit()
-        restarted = refresh.ProjectCatalogRefresh(self.connection, self.repo, lambda: self.sha, self.reconcile)
-        restarted.refresh()
-        self.assertEqual(self.row()['status'], 'MERGED')
-        self.assertEqual(self.row()['worker_session_id'], 'worker')
-        self.assertEqual(self.row()['publication_content_hash'], 'old-hash-G-001')
-
-    def test_catalog_transaction_interruption_restarts_without_partial_delta(self):
-        pinned = self.pinned(self.sha)
-        repo = state.DefinitionStateRepository(self.connection)
-        def interrupt(stage):
-            if stage == 'after-plan:G-001':
-                raise RuntimeError('interrupted')
-        repo._fault_hook = interrupt
-        with self.assertRaisesRegex(RuntimeError, 'interrupted'):
-            state.CatalogReconciliationService(repo, fixtures.FakeDefinitionPort(pinned)).reconcile(self.repo)
-        self.assertEqual(self.row()['title'], 'Old')
-        self.boundary.refresh()
-        self.assertEqual(self.row()['title'], 'Updated')
-        self.assertEqual(self.row()['worker_session_id'], 'worker')
-
     def test_archive_sqlite_definition_race_rolls_back_success(self):
         self.boundary.refresh()
         repo = archive_state.ExecPlanArchiveRepository(self.connection, apply_catalog=self.boundary.apply_archive)
@@ -340,61 +368,6 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
         self.assertEqual(result, archive_state.ArchiveWriteResult.SUPERSEDED)
         self.assertIsNone(repo.item(self.repo, 'G-002'))
         self.assertEqual(self.row('G-002')['path'], 'docs/plans/[G-002] Dependency.md')
-
-    def test_blocked_pr_query_cannot_close_reopen_or_cleanup_before_catalog(self):
-        self.connection.execute("UPDATE exec_plans SET status='PR_OPEN' WHERE plan_id='G-001'")
-        self.connection.commit()
-        before = dict(self.row())
-        for pr_state in ('MERGED', 'CLOSED', 'OPEN'):
-            with mock.patch.object(manager, 'pr_for_branch', return_value={
-                    'state': pr_state, 'url': before['pr_url'], 'headRefName': before['branch'],
-                    'baseRefName': 'main', 'headRefOid': 'd'*40}), \
-                 mock.patch.object(manager, 'complete_merged_execplan_worktree') as cleanup, \
-                 mock.patch.object(manager, '_recorded_base_fetch') as fetch:
-                manager.observe_waiting_pull_requests(self.connection, Path(self.repo), Path('/state'),
-                                                      self.repo, read_only=True)
-                cleanup.assert_not_called()
-                fetch.assert_not_called()
-                self.assertEqual(dict(self.row()), before)
-
-    def test_pending_publication_recovers_before_any_catalog_consumers(self):
-        self.connection.execute("UPDATE projects SET phase='PLANNING', agent_snapshot=NULL")
-        self.connection.commit()
-        calls = []
-        with contextlib.ExitStack() as stack:
-            for name in ('observe_blocked_plan_remotes', 'validate_repository', 'remote_base'):
-                stack.enter_context(mock.patch.object(manager, name, return_value='main' if name == 'remote_base' else Path(self.repo)))
-            stack.enter_context(mock.patch.object(manager, 'git', return_value=SimpleNamespace(stdout=self.sha)))
-            stack.enter_context(mock.patch.object(state.DefinitionStateRepository, 'has_publication_intent', return_value=True))
-            pr = stack.enter_context(mock.patch.object(manager, 'synchronize_waiting_pull_requests'))
-            archive = stack.enter_context(mock.patch.object(manager, '_execplan_archive_housekeeping_safe'))
-            catalog_call = stack.enter_context(mock.patch.object(manager, 'reconcile_execplan_catalog'))
-            stack.enter_context(mock.patch.object(manager.PlanningLifecycleCoordinator, 'run',
-                side_effect=lambda context: calls.append(context.base_sha) or SimpleNamespace(kind=manager.PlanningOutcomeKind.PUBLICATION_RECOVERY)))
-            result = manager._run_project_step(self.connection, Path('/state'), self.repo, Path('unused.ini'), 'main', False)
-        self.assertEqual(calls, [self.sha])
-        self.assertEqual(result, manager.PROJECT_STEP_RETRY)
-        pr.assert_not_called()
-        archive.assert_not_called()
-        catalog_call.assert_not_called()
-
-    def test_blocked_recovery_validates_scope_before_fetch_and_catalog(self):
-        from tests.support.blocked_remote import project_blocked_remote_fixture
-        fixture = project_blocked_remote_fixture(self)
-        coordinator = fixture.coordinator
-        events = []
-        fixture.ports._recorded_base_fetch.side_effect = lambda *a, **k: events.append('fetch')
-        fixture.ports.reconcile_execplan_catalog.side_effect = lambda *a, **k: events.append('catalog') or SimpleNamespace(kind=state.ReconciliationKind.RECONCILED)
-        with mock.patch.object(coordinator, '_validate', side_effect=lambda *a, **k: events.append('validate')), \
-             mock.patch.object(fixture.recovery, 'independent_scope', side_effect=lambda *a, **k: events.append('scope')):
-            self.assertTrue(coordinator.refresh_catalog('G-106'))
-        self.assertEqual(events, ['validate', 'scope', 'fetch', 'catalog'])
-        self.assertEqual(fixture.ports.reconcile_execplan_catalog.call_args.kwargs, {'record_invalid': False})
-        self.assertEqual(manager.scoped_blocking.project_block(fixture.connection, fixture.repo)['evidence'], 'original project cause')
-        events.clear()
-        with mock.patch.object(coordinator, '_validate', side_effect=RuntimeError('unsafe')):
-            self.assertFalse(coordinator.refresh_catalog('G-106'))
-        self.assertEqual(events, [])
 
     def test_archive_adapter_validates_publication_then_adopts_delta_and_audit(self):
         from loop_manager_internal.catalog import execplan_archive as archive
@@ -435,31 +408,52 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
         self.assertEqual(self.row('G-002')['path'], 'docs/plans/[G-002] Dependency.md')
         self.assertEqual(self.row()['worker_session_id'], 'raced')
 
-    def test_adapter_initial_migration_preserves_existing_execution(self):
-        pinned = self.pinned(self.sha)
-        port = SimpleNamespace(load=lambda: pinned, loaded=pinned, current_revision=lambda: self.sha)
-        with mock.patch.object(manager, '_GitCatalogDefinitionPort', return_value=port), \
-             mock.patch.object(manager, 'git', return_value=SimpleNamespace(returncode=0, stdout=self.sha)):
-            result = manager.reconcile_execplan_catalog(self.connection, Path(self.repo), self.repo, 'main')
-        self.assertEqual(result.kind, state.ReconciliationKind.RECONCILED)
-        self.assertEqual(self.row()['status'], 'IMPLEMENTING')
+    def test_archive_refresh_rechecks_safety_before_preparing_or_publishing(self):
+        self.boundary.refresh()
+        port = mock.Mock()
+        port.fetch_remote_base.side_effect = lambda base: self.sha
+        seen = []
+        def safety():
+            seen.append(self.row()['current_revision_sha'])
+            return False
+        with mock.patch.object(manager, '_ExecPlanArchiveGitPort', return_value=port):
+            result = manager.dispatch_execplan_archive_housekeeping(
+                self.connection, Path(self.repo), Path('/state'), self.repo, 'main',
+                catalog_refresh=self.boundary, archive_safety=safety)
+        self.assertTrue(seen)
+        self.assertEqual(set(seen), {self.sha})
+        port.prepare_commit.assert_not_called()
+        port.push_fast_forward.assert_not_called()
+        self.assertIsNone(result.commit_oid)
+        self.assertEqual(self.row('G-002')['status'], 'MERGED')
+
+
+class CatalogPullRequestConsumerTests(_CatalogRefreshCase):
+    def test_restart_after_committed_pr_result_keeps_merge_and_session(self):
+        self.boundary.refresh()
+        self.connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id='G-001'")
+        self.connection.commit()
+        restarted = refresh.ProjectCatalogRefresh(self.connection, self.repo, lambda: self.sha, self.reconcile)
+        restarted.refresh()
+        self.assertEqual(self.row()['status'], 'MERGED')
         self.assertEqual(self.row()['worker_session_id'], 'worker')
         self.assertEqual(self.row()['publication_content_hash'], 'old-hash-G-001')
 
-    def test_adapter_initial_invalid_catalog_preserves_cache_and_other_safety_cause(self):
-        manager.scoped_blocking.record_project_block(
-            self.connection, self.repo, manager.BlockReasonCode.REPOSITORY_STATE_UNSAFE,
-            'separate safety cause', 'fingerprint', plan_id='G-001', previous_phase='WORKING')
+    def test_blocked_pr_query_cannot_close_reopen_or_cleanup_before_catalog(self):
+        self.connection.execute("UPDATE exec_plans SET status='PR_OPEN' WHERE plan_id='G-001'")
         self.connection.commit()
-        before = state.DefinitionStateRepository(self.connection).capture(self.repo)
-        snapshot = catalog.snapshot_from_documents({'docs/plans/[G-001] Updated.md': self.fixture._text('G-001', 'Updated')})
-        pinned = state.PinnedCatalog(self.sha, snapshot, self.paths)
-        port = SimpleNamespace(load=lambda: pinned, loaded=pinned, current_revision=lambda: self.sha)
-        with mock.patch.object(manager, '_GitCatalogDefinitionPort', return_value=port):
-            result = manager.reconcile_execplan_catalog(self.connection, Path(self.repo), self.repo, 'main')
-        self.assertEqual(result.kind, state.ReconciliationKind.INVALID_CATALOG)
-        self.assertEqual(state.DefinitionStateRepository(self.connection).capture(self.repo), before)
-        self.assertEqual(manager.scoped_blocking.project_block(self.connection, self.repo)['evidence'], 'separate safety cause')
+        before = dict(self.row())
+        for pr_state in ('MERGED', 'CLOSED', 'OPEN'):
+            with mock.patch.object(manager, 'pr_for_branch', return_value={
+                    'state': pr_state, 'url': before['pr_url'], 'headRefName': before['branch'],
+                    'baseRefName': 'main', 'headRefOid': 'd'*40}), \
+                 mock.patch.object(manager, 'complete_merged_execplan_worktree') as cleanup, \
+                 mock.patch.object(manager, '_recorded_base_fetch') as fetch:
+                manager.observe_waiting_pull_requests(self.connection, Path(self.repo), Path('/state'),
+                                                      self.repo, read_only=True)
+                cleanup.assert_not_called()
+                fetch.assert_not_called()
+                self.assertEqual(dict(self.row()), before)
 
     def test_real_pr_close_audit_does_not_invalidate_catalog_cache(self):
         self.boundary.refresh()
@@ -573,24 +567,97 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
         block = manager.scoped_blocking.project_block(self.connection, self.repo)
         self.assertEqual(block['evidence'], self.block_evidence)
 
-    def test_archive_refresh_rechecks_safety_before_preparing_or_publishing(self):
-        self.boundary.refresh()
-        port = mock.Mock()
-        port.fetch_remote_base.side_effect = lambda base: self.sha
-        seen = []
-        def safety():
-            seen.append(self.row()['current_revision_sha'])
-            return False
-        with mock.patch.object(manager, '_ExecPlanArchiveGitPort', return_value=port):
-            result = manager.dispatch_execplan_archive_housekeeping(
-                self.connection, Path(self.repo), Path('/state'), self.repo, 'main',
-                catalog_refresh=self.boundary, archive_safety=safety)
-        self.assertTrue(seen)
-        self.assertEqual(set(seen), {self.sha})
-        port.prepare_commit.assert_not_called()
-        port.push_fast_forward.assert_not_called()
-        self.assertIsNone(result.commit_oid)
-        self.assertEqual(self.row('G-002')['status'], 'MERGED')
+    def test_project_safety_block_keeps_closed_pr_block_when_head_is_restored(self):
+        self.connection.execute(
+            "UPDATE exec_plans SET status='PLAN_BLOCKED', ever_started=1, blocked_reason=?, pr_head_oid=? WHERE plan_id='G-001'",
+            (manager.PR_CLOSED_BLOCK_REASON, 'd'*40))
+        manager.scoped_blocking.record_project_block(
+            self.connection, self.repo, manager.BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
+            'independent head safety cause', 'head-safety', plan_id='G-001', previous_phase='PLAN_BLOCKED')
+        self.connection.commit()
+        original = dict(self.row())
+        for head, pr_state in (('c'*40, 'OPEN'), ('d'*40, 'CLOSED'), ('d'*40, 'OPEN'), ('d'*40, 'OPEN')):
+            with contextlib.ExitStack() as stack:
+                stack.enter_context(mock.patch.object(manager, 'observe_blocked_plan_remotes'))
+                stack.enter_context(mock.patch.object(manager, 'resume_project_block_if_safe', return_value=False))
+                stack.enter_context(mock.patch.object(manager, 'pr_for_branch', return_value={
+                    'state': pr_state, 'headRefOid': head, 'headRefName': 'branch',
+                    'baseRefName': 'main', 'url': 'https://example/pr/1'}))
+                reconciler = stack.enter_context(mock.patch.object(manager.project_blocked_recovery, 'ProjectBlockedReconciler'))
+                reconciler.return_value.refresh_catalog.return_value = False
+                fetch = stack.enter_context(mock.patch.object(manager, 'remote_base'))
+                mutation = stack.enter_context(mock.patch.object(manager, '_recorded_base_fetch'))
+                cleanup = stack.enter_context(mock.patch.object(manager, 'complete_merged_execplan_worktree'))
+                agent = stack.enter_context(mock.patch.object(manager, 'run_agent'))
+                result = manager._run_project_step(self.connection, Path('/state'), self.repo, Path('unused.ini'), 'main', False)
+            self.assertEqual(result, 1)
+            self.assertEqual(dict(self.row()), original)
+            self.assertEqual(manager.scoped_blocking.project_block(self.connection, self.repo)['evidence'],
+                             'independent head safety cause')
+            reconciler.return_value.reconcile.assert_not_called()
+            fetch.assert_not_called()
+            mutation.assert_not_called()
+            cleanup.assert_not_called()
+            agent.assert_not_called()
+
+
+class ProjectCatalogConsumerTests(_CatalogRefreshCase):
+    def test_step_fetch_catalog_pr_archive_and_selection_order(self):
+        self.assertEqual(self.run_step(), 0)
+        self.assertEqual(self.events, ['fetch', 'catalog', 'pr', 'archive-eligibility', 'planning'])
+
+    def test_invalid_input_stops_all_consumers(self):
+        self.assertEqual(self.run_step(invalid=True), 1)
+        self.assertEqual(self.events, ['fetch', 'catalog'])
+        self.assertEqual(self.row()['title'], 'Old')
+
+    def test_merge_push_refreshes_before_archive_eligibility(self):
+        self.assertEqual(self.run_step(pr=lambda: setattr(self, 'sha', 'c'*40)), 0)
+        self.assertEqual(self.events[:5], ['fetch', 'catalog', 'pr', 'catalog', 'archive-eligibility'])
+        self.assertEqual(self.row()['current_revision_sha'], self.sha)
+
+    def test_unsafe_agent_scope_prevents_fetch_and_consumers(self):
+        self.assertEqual(self.run_step(scope_error=True), 1)
+        self.assertEqual(self.events, [])
+
+    def test_pending_publication_recovers_before_any_catalog_consumers(self):
+        self.connection.execute("UPDATE projects SET phase='PLANNING', agent_snapshot=NULL")
+        self.connection.commit()
+        calls = []
+        with contextlib.ExitStack() as stack:
+            for name in ('observe_blocked_plan_remotes', 'validate_repository', 'remote_base'):
+                stack.enter_context(mock.patch.object(manager, name, return_value='main' if name == 'remote_base' else Path(self.repo)))
+            stack.enter_context(mock.patch.object(manager, 'git', return_value=SimpleNamespace(stdout=self.sha)))
+            stack.enter_context(mock.patch.object(state.DefinitionStateRepository, 'has_publication_intent', return_value=True))
+            pr = stack.enter_context(mock.patch.object(manager, 'synchronize_waiting_pull_requests'))
+            archive = stack.enter_context(mock.patch.object(manager, '_execplan_archive_housekeeping_safe'))
+            catalog_call = stack.enter_context(mock.patch.object(manager, 'reconcile_execplan_catalog'))
+            stack.enter_context(mock.patch.object(manager.PlanningLifecycleCoordinator, 'run',
+                side_effect=lambda context: calls.append(context.base_sha) or SimpleNamespace(kind=manager.PlanningOutcomeKind.PUBLICATION_RECOVERY)))
+            result = manager._run_project_step(self.connection, Path('/state'), self.repo, Path('unused.ini'), 'main', False)
+        self.assertEqual(calls, [self.sha])
+        self.assertEqual(result, manager.PROJECT_STEP_RETRY)
+        pr.assert_not_called()
+        archive.assert_not_called()
+        catalog_call.assert_not_called()
+
+    def test_blocked_recovery_validates_scope_before_fetch_and_catalog(self):
+        from tests.support.blocked_remote import project_blocked_remote_fixture
+        fixture = project_blocked_remote_fixture(self)
+        coordinator = fixture.coordinator
+        events = []
+        fixture.ports._recorded_base_fetch.side_effect = lambda *a, **k: events.append('fetch')
+        fixture.ports.reconcile_execplan_catalog.side_effect = lambda *a, **k: events.append('catalog') or SimpleNamespace(kind=state.ReconciliationKind.RECONCILED)
+        with mock.patch.object(coordinator, '_validate', side_effect=lambda *a, **k: events.append('validate')), \
+             mock.patch.object(fixture.recovery, 'independent_scope', side_effect=lambda *a, **k: events.append('scope')):
+            self.assertTrue(coordinator.refresh_catalog('G-106'))
+        self.assertEqual(events, ['validate', 'scope', 'fetch', 'catalog'])
+        self.assertEqual(fixture.ports.reconcile_execplan_catalog.call_args.kwargs, {'record_invalid': False})
+        self.assertEqual(manager.scoped_blocking.project_block(fixture.connection, fixture.repo)['evidence'], 'original project cause')
+        events.clear()
+        with mock.patch.object(coordinator, '_validate', side_effect=RuntimeError('unsafe')):
+            self.assertFalse(coordinator.refresh_catalog('G-106'))
+        self.assertEqual(events, [])
 
     def test_publication_recovery_runs_selected_worker_in_same_step_after_catalog(self):
         self.connection.execute(
@@ -654,39 +721,6 @@ class ProjectCatalogRefreshTest(unittest.TestCase):
         planner.assert_called_once()
         pr.assert_not_called()
         refresh_scope.assert_not_called()
-
-    def test_project_safety_block_keeps_closed_pr_block_when_head_is_restored(self):
-        self.connection.execute(
-            "UPDATE exec_plans SET status='PLAN_BLOCKED', ever_started=1, blocked_reason=?, pr_head_oid=? WHERE plan_id='G-001'",
-            (manager.PR_CLOSED_BLOCK_REASON, 'd'*40))
-        manager.scoped_blocking.record_project_block(
-            self.connection, self.repo, manager.BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
-            'independent head safety cause', 'head-safety', plan_id='G-001', previous_phase='PLAN_BLOCKED')
-        self.connection.commit()
-        original = dict(self.row())
-        for head, pr_state in (('c'*40, 'OPEN'), ('d'*40, 'CLOSED'), ('d'*40, 'OPEN'), ('d'*40, 'OPEN')):
-            with contextlib.ExitStack() as stack:
-                stack.enter_context(mock.patch.object(manager, 'observe_blocked_plan_remotes'))
-                stack.enter_context(mock.patch.object(manager, 'resume_project_block_if_safe', return_value=False))
-                stack.enter_context(mock.patch.object(manager, 'pr_for_branch', return_value={
-                    'state': pr_state, 'headRefOid': head, 'headRefName': 'branch',
-                    'baseRefName': 'main', 'url': 'https://example/pr/1'}))
-                reconciler = stack.enter_context(mock.patch.object(manager.project_blocked_recovery, 'ProjectBlockedReconciler'))
-                reconciler.return_value.refresh_catalog.return_value = False
-                fetch = stack.enter_context(mock.patch.object(manager, 'remote_base'))
-                mutation = stack.enter_context(mock.patch.object(manager, '_recorded_base_fetch'))
-                cleanup = stack.enter_context(mock.patch.object(manager, 'complete_merged_execplan_worktree'))
-                agent = stack.enter_context(mock.patch.object(manager, 'run_agent'))
-                result = manager._run_project_step(self.connection, Path('/state'), self.repo, Path('unused.ini'), 'main', False)
-            self.assertEqual(result, 1)
-            self.assertEqual(dict(self.row()), original)
-            self.assertEqual(manager.scoped_blocking.project_block(self.connection, self.repo)['evidence'],
-                             'independent head safety cause')
-            reconciler.return_value.reconcile.assert_not_called()
-            fetch.assert_not_called()
-            mutation.assert_not_called()
-            cleanup.assert_not_called()
-            agent.assert_not_called()
 
     def test_planner_import_fixture_loads_catalog_adapter_without_git_or_provider(self):
         import subprocess

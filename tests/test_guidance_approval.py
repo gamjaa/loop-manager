@@ -1,5 +1,4 @@
 import sqlite3
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -7,7 +6,7 @@ from unittest import mock
 
 from loop_manager_internal.documents import guidance_approval
 import loop_manager
-from tests.support.guidance import PATCH, active_connection, git, guidance_plan, repository
+from tests.support.guidance import PATCH, active_connection, git, git_result, guidance_plan, repository
 
 
 class GuidanceFormatTest(unittest.TestCase):
@@ -864,10 +863,7 @@ Patch:
             git(repo, "commit", "-m", "Remote guidance")
             new_base = git(repo, "rev-parse", "HEAD")
             git(repo, "checkout", "main")
-            result = subprocess.run(
-                ["git", "-C", str(repo), "rebase", "upstream"],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            )
+            result = git_result(repo, "rebase", "upstream", check=False)
             self.assertNotEqual(result.returncode, 0)
             self.assertTrue(loop_manager._rebase_in_progress_for_branch(repo, "main"))
             loop_manager.clear_agent_scope(connection, str(repo))

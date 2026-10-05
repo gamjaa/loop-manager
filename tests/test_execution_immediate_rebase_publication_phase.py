@@ -19,6 +19,9 @@ from loop_manager_internal.execution.execution_runtime import ExecutionPhase
 class ImmediateRebasePublicationTests(TestCase):
     """Only fake external effects; test real acceptance, intents and runtime CAS."""
     def setUp(self):
+        self._reset_publication_case()
+
+    def _reset_publication_case(self):
         self.seed = current_rebase_case(self)
         self.seed._prepare_current_checkpoint_recovery()
         self.handler = self.seed.handler
@@ -90,7 +93,7 @@ class ImmediateRebasePublicationTests(TestCase):
             pass
         for stop in ('before-push', 'after-push'):
             with self.subTest(stop=stop):
-                self.setUp()
+                self._reset_publication_case()
                 self.before_push = (lambda: (_ for _ in ()).throw(Exit())) if stop == 'before-push' else None
                 with mock.patch.object(self.state, 'complete_rebase_publication', side_effect=Exit()):
                     with self.assertRaises(Exit):
@@ -386,7 +389,7 @@ class ImmediateRebasePublicationTests(TestCase):
     def test_remote_race_deletion_or_new_pr_never_replaces_intent_lease(self):
         for raced in ('external-commit', None, 'pr'):
             with self.subTest(raced=raced):
-                self.setUp()
+                self._reset_publication_case()
                 self.push_failure = True
                 with self.assertRaises(handlers.RecoveryFailure):
                     self.complete()
@@ -405,7 +408,7 @@ class ImmediateRebasePublicationTests(TestCase):
     def test_new_branch_existing_pr_or_different_owner_never_gets_early_push(self):
         for excluded in ('new-branch', 'existing-pr', 'other-owner'):
             with self.subTest(excluded=excluded):
-                self.setUp()
+                self._reset_publication_case()
                 if excluded == 'new-branch':
                     self.seed.expected = replace(self.seed.expected,
                         remote=replace(self.seed.expected.remote, oid=None))

@@ -13,6 +13,9 @@ class BlockedRemoteFixture:
     """Reusable setup and adapters; no discoverable test methods."""
 
     def setUp(self):
+        self._prepare_blocked_remote()
+
+    def _prepare_blocked_remote(self):
         self.connection = sqlite3.connect(':memory:')
         self.connection.row_factory = sqlite3.Row
         self.addCleanup(self.connection.close)
@@ -32,8 +35,8 @@ class BlockedRemoteFixture:
             runtime_state.block_plan(self.repo, plan_id, reason_code='verify_retry_exhausted',
                                      evidence='original verify failure', release_fingerprint='input',
                                      clear_projection=True)
-            self.connection.execute('UPDATE exec_plans SET blocked_fingerprint = ? WHERE plan_id = ?',
-                                    ('input', plan_id))
+            self.connection.execute('UPDATE exec_plans SET blocked_fingerprint = ? WHERE repo = ? AND plan_id = ?',
+                                    ('input', self.repo, plan_id))
             self.record_observation(plan_id)
         self.signature = 'before'
         self.ports = mock.Mock(spec=list(blocked_plan_reconciliation.PlanRecoveryEffects.__dataclass_fields__))
@@ -95,10 +98,13 @@ class BlockedRemoteFixture:
         self.record_observation(plan_id)
 
     def plan(self, plan_id='G-106'):
-        return self.connection.execute('SELECT * FROM exec_plans WHERE plan_id = ?', (plan_id,)).fetchone()
+        return self.connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?', (self.repo, plan_id)).fetchone()
 
     def row(self):
-        return self.connection.execute("SELECT * FROM blocked_remote_observations WHERE plan_id = 'G-106'").fetchone()
+        return self.connection.execute(
+            "SELECT * FROM blocked_remote_observations WHERE repo = ? AND plan_id = 'G-106'",
+            (self.repo,),
+        ).fetchone()
 
 
 class ProjectBlockedRemoteFixture(BlockedRemoteFixture):
@@ -107,11 +113,11 @@ class ProjectBlockedRemoteFixture(BlockedRemoteFixture):
     def setUp(self):
         from loop_manager_internal.recovery import project_blocked_recovery
         self.recovery = project_blocked_recovery
-        BlockedRemoteFixture.setUp(self)
+        self._prepare_blocked_remote()
         self.connection.execute(
             "INSERT INTO project_blocks (repo, scope, reason_code, plan_id, evidence, previous_phase) "
             "VALUES ('repo', 'project', 'publication_ownership_uncertain', 'G-106', 'original project cause', 'PLAN_BLOCKED')")
-        self.connection.execute("UPDATE projects SET phase = 'PROJECT_BLOCKED', last_error = 'original project cause'")
+        self.connection.execute("UPDATE projects SET phase = 'PROJECT_BLOCKED', last_error = 'original project cause' WHERE repo = ?", (self.repo,))
         self.connection.commit()
         self.ports.mock_add_spec(list(set(blocked_plan_reconciliation.PlanRecoveryEffects.__dataclass_fields__) | set(project_blocked_recovery.ProjectRecoveryEffects.__dataclass_fields__)))
         self.ports._BlockedCheckpointAdapter.return_value._origin_safety_error.return_value = None
@@ -132,7 +138,8 @@ from loop_manager_internal.storage import execution_checkpoint_state
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.git import managed_rebase_validation
 
-class PlanRemoteRecoveryFixture(BlockedRemoteFixture):
+class PublishedSuccessorPreparation:
+    """Shared setup for scenarios that start from a published checkpoint."""
     def published_successor(self):
         branch, worktree = self.plan()['branch'], self.plan()['worktree']
         remote = 'c' * 40
@@ -142,10 +149,10 @@ class PlanRemoteRecoveryFixture(BlockedRemoteFixture):
         self.current_snapshot = original
         self.connection.execute(
             "UPDATE exec_plans SET agent_role = 'worker', agent_snapshot = ?, agent_result_snapshot = ? "
-            "WHERE plan_id = 'G-106'", (original.serialize(), original.serialize()))
+            "WHERE repo = ? AND plan_id = 'G-106'", (original.serialize(), original.serialize(), self.repo))
         repository = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection)
         repository.finish_published(repository.get(self.repo, 'G-106'), self.head)
-        self.connection.execute("UPDATE blocked_remote_observations SET branch_result = 'present', branch_oid = ? WHERE plan_id = 'G-106'", (remote,))
+        self.connection.execute("UPDATE blocked_remote_observations SET branch_result = 'present', branch_oid = ? WHERE repo = ? AND plan_id = 'G-106'", (remote, self.repo))
         self.connection.commit()
         fetched = [self.base]
         self.fail_branch_fetch = False
@@ -196,6 +203,7 @@ class PlanRemoteRecoveryFixture(BlockedRemoteFixture):
         return original
 
 
+class PlanRemoteRecoveryFixture(PublishedSuccessorPreparation, BlockedRemoteFixture):
     def guidance_tracking_updates(self):
         original = self.published_successor()
         branch = self.plan()['branch']
@@ -205,8 +213,8 @@ class PlanRemoteRecoveryFixture(BlockedRemoteFixture):
             f'refs/remotes/origin/{branch}': (original.head, '')})
         self.connection.execute(
             "UPDATE exec_plans SET agent_snapshot = ?, agent_result_snapshot = ?, "
-            "blocked_reason = ?, publication_remote_oid = ? WHERE plan_id = 'G-106'",
-            (original.serialize(), original.serialize(), loop_manager.GUIDANCE_BLOCK_REASON, original.head))
+            "blocked_reason = ?, publication_remote_oid = ? WHERE repo = ? AND plan_id = 'G-106'",
+            (original.serialize(), original.serialize(), loop_manager.GUIDANCE_BLOCK_REASON, original.head, self.repo))
         self.connection.commit()
         patch = mock.patch.object(loop_manager.checkpoint_ownership, 'owned_remote_oid',
                                   return_value=original.head)
@@ -232,7 +240,8 @@ class PlanRemoteRecoveryFixture(BlockedRemoteFixture):
         self.assertNotIn('remote_adoption_scope', checkpoint.snapshot)
         self.assertEqual(checkpoint.snapshot['remote_adoption_intent']['head'], self.head)
         self.assertEqual(self.connection.execute(
-            "SELECT pending_remote_oid FROM blocked_checkpoints WHERE plan_id = 'G-106'").fetchone()[0], self.head)
+            "SELECT pending_remote_oid FROM blocked_checkpoints WHERE repo = ? AND plan_id = 'G-106'",
+            (self.repo,)).fetchone()[0], self.head)
         return original
 
 
@@ -314,18 +323,18 @@ class PlanRemoteRecoveryFixture(BlockedRemoteFixture):
             self.persisted_adoption_scope()
 
 
-class ProjectRemoteRecoveryFixture(ProjectBlockedRemoteFixture):
+class ProjectRemoteRecoveryFixture(PublishedSuccessorPreparation, ProjectBlockedRemoteFixture):
     def published_project_successor(self, *, plan_block=False):
-        original = PlanRemoteRecoveryFixture.published_successor(self)
+        original = self.published_successor()
         if not plan_block:
             scoped_blocking.clear_plan_block(self.connection, self.repo, 'G-106')
             self.connection.execute(
                 "UPDATE exec_plans SET status = 'IMPLEMENTING', blocked_reason = NULL, "
-                "blocked_fingerprint = NULL WHERE plan_id = 'G-106'")
-        self.connection.execute("UPDATE project_blocks SET reason_code = 'repository_state_unsafe'")
+                "blocked_fingerprint = NULL WHERE repo = ? AND plan_id = 'G-106'", (self.repo,))
+        self.connection.execute("UPDATE project_blocks SET reason_code = 'repository_state_unsafe' WHERE repo = ?", (self.repo,))
         self.previous_base = 'd' * 40
-        self.connection.execute("UPDATE exec_plans SET active_sha = ? WHERE plan_id = 'G-106'",
-                                (self.previous_base,))
+        self.connection.execute("UPDATE exec_plans SET active_sha = ? WHERE repo = ? AND plan_id = 'G-106'",
+                                (self.previous_base, self.repo))
         self.connection.commit()
         self.ports.owned_remote_oid.side_effect = lambda *args, **kwargs: args[6]
         self.ports._current_rebase_service.side_effect = self.current_service
@@ -410,7 +419,7 @@ class ProjectRemoteRecoveryFixture(ProjectBlockedRemoteFixture):
             {key: value for key, value in published.items() if key != 'id'})
         checkpoints.finish_rebase_publication(
             self.repo, 'G-106', intent=current.rebase_publication_intent(), acceptance=published)
-        self.connection.execute("UPDATE exec_plans SET publication_remote_oid = ? WHERE plan_id = 'G-106'", (self.head,))
-        self.connection.execute("UPDATE blocked_remote_observations SET branch_oid = ?, branch_result = 'present' WHERE plan_id = 'G-106'", (original,))
+        self.connection.execute("UPDATE exec_plans SET publication_remote_oid = ? WHERE repo = ? AND plan_id = 'G-106'", (self.head, self.repo))
+        self.connection.execute("UPDATE blocked_remote_observations SET branch_oid = ?, branch_result = 'present' WHERE repo = ? AND plan_id = 'G-106'", (original, self.repo))
         self.connection.commit()
         return checkpoints, original

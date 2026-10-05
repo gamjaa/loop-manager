@@ -16,8 +16,8 @@ class RebaseBlockFixture:
         self.checkpoints = self.case.checkpoint
         self.repo, self.plan_id = 'repo', 'G-047'
         loop_manager._ensure_execplans_schema(self.connection)
-        self.connection.execute("UPDATE projects SET planning_attempt_fingerprint = NULL")
-        self.connection.execute("UPDATE exec_plans SET workspace_owned = 1")
+        self.connection.execute("UPDATE projects SET planning_attempt_fingerprint = NULL WHERE repo = ?", (self.repo,))
+        self.connection.execute("UPDATE exec_plans SET workspace_owned = 1 WHERE repo = ? AND plan_id = ?", (self.repo, self.plan_id))
         self.connection.commit()
         self.is_plan_block = True
         def patch(*args, **kwargs):
@@ -38,7 +38,7 @@ class RebaseBlockFixture:
                     if project else 'G-088 repeated conflict with changed plan inputs')
         with self.connection:
             if project:
-                self.connection.execute("UPDATE projects SET phase = 'PROJECT_BLOCKED'")
+                self.connection.execute("UPDATE projects SET phase = 'PROJECT_BLOCKED' WHERE repo = ?", (self.repo,))
                 self.connection.execute("INSERT INTO project_blocks "
                     "(repo, scope, reason_code, plan_id, evidence, previous_phase) "
                     "VALUES ('repo', 'project', ?, 'G-047', ?, 'WORKING')", (reason, evidence))
@@ -46,13 +46,13 @@ class RebaseBlockFixture:
                 cause = separate or reason
                 self.connection.execute("UPDATE exec_plans SET status = 'PLAN_BLOCKED', "
                     "blocked_reason = ?, last_error = 'original block text', "
-                    "blocked_fingerprint = 'old-input'", (cause,))
+                    "blocked_fingerprint = 'old-input' WHERE repo = ? AND plan_id = ?", (cause, self.repo, self.plan_id))
                 self.connection.execute("INSERT INTO execplan_blocks "
                     "(repo, plan_id, scope, reason_code, evidence) "
                     "VALUES ('repo', 'G-047', 'plan', ?, ?)",
                     (cause, 'independent original cause' if separate else evidence))
                 if not project:
-                    self.connection.execute("UPDATE projects SET phase = 'PLAN_BLOCKED'")
+                    self.connection.execute("UPDATE projects SET phase = 'PLAN_BLOCKED' WHERE repo = ?", (self.repo,))
             subject = 'project' if project else 'plan:G-047'
             self.connection.execute("INSERT INTO notified_block_incidents "
                 "(repo, subject, block_key, event_key, payload) VALUES ('repo', ?, 'block', 'event', '{}')",

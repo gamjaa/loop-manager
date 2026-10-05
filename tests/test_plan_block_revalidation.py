@@ -17,6 +17,29 @@ from tests.support.blocked_remote import PlanRemoteRecoveryFixture
 
 
 class PlanRecoveryGateTests(PlanRemoteRecoveryFixture, unittest.TestCase):
+    def test_published_successor_does_not_update_another_repositorys_plan(self):
+        other = dict(self.plan())
+        other['repo'] = 'other-repo'
+        columns = ', '.join(other)
+        placeholders = ', '.join('?' for _ in other)
+        self.connection.execute(
+            "INSERT INTO projects (repo, base_branch, origin) VALUES (?, 'main', 'other/repo')",
+            (other['repo'],),
+        )
+        self.connection.execute(
+            f"INSERT INTO exec_plans ({columns}) VALUES ({placeholders})",
+            tuple(other.values()),
+        )
+        self.connection.commit()
+
+        self.published_successor()
+
+        persisted = self.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-106'",
+            (other['repo'],),
+        ).fetchone()
+        self.assertEqual(dict(persisted), other)
+
     def test_other_worker_defers_without_losing_observation_or_projection(self):
         self.connection.execute("UPDATE exec_plans SET status = 'IMPLEMENTING' WHERE plan_id = 'G-107'")
         self.connection.commit()
