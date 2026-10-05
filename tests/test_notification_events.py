@@ -9,6 +9,7 @@ import loop_manager
 from loop_manager_internal.storage import blocked_checkpoint_state
 from loop_manager_internal.config.managed_config import ManagedConfigError, load_managed_config
 from loop_manager_internal.notifications import notifications
+from loop_manager_internal.notifications.events import _BlockedPlanProjection
 from loop_manager_internal.notifications import rendering
 from loop_manager_internal.notifications import work_exhaustion
 from loop_manager_internal.runtime import project_registry
@@ -33,6 +34,34 @@ class NotificationRenderingTest(unittest.TestCase):
 
 
 class NotificationEventTest(NotificationFixture, unittest.TestCase):
+    def test_blocked_projection_reads_aliases_in_any_column_order(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        fields = {
+            "plan_id": "G-018", "plan_title": "Named projection",
+            "plan_path": "docs/plans/plan.md", "plan_sources": "[]",
+            "reason_code": "user_decision_required", "evidence": "cause",
+            "checkpoint_result": "local_only", "checkpoint_remote_oid": None,
+            "checkpoint_unpublished_reason": "unpublished",
+            "checkpoint_branch": "branch", "origin": "owner/repo",
+            "checkpoint_inspected_remote_oid": "inspected",
+            "checkpoint_inspection_reason": "inspection reason",
+        }
+        expected = None
+        for names in (list(fields), list(reversed(fields))):
+            row = connection.execute(
+                "SELECT " + ", ".join(f"? AS {name}" for name in names),
+                [fields[name] for name in names],
+            ).fetchone()
+            projection = _BlockedPlanProjection.from_row(row)
+            if expected is None:
+                expected = projection
+            self.assertEqual(projection, expected)
+        self.assertEqual(expected.checkpoint_unpublished_reason, "unpublished")
+        self.assertEqual(expected.checkpoint_inspected_remote_oid, "inspected")
+        self.assertIsNone(expected.checkpoint_remote_oid)
+
     def test_specification_deadlock_notification_names_documents_and_question(self):
         connection = self.connection()
         repo = "/projects/alpha"
