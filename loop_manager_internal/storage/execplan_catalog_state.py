@@ -25,6 +25,7 @@ from loop_manager_internal.catalog.execplan_catalog import (
     ExecPlanCatalogSnapshot,
     final_content_matches,
     parse_execplan_text,
+    _source_exists,
 )
 
 
@@ -234,8 +235,10 @@ class PinnedCatalog:
     regular_paths: frozenset[str] | None = None
 
 
-def new_declaration_issues(pinned: PinnedCatalog, known_ids: frozenset[str]) -> tuple[CatalogIssue, ...]:
-    """Validate stricter publication inputs before legacy recovery can create rows."""
+def new_declaration_issues(
+    pinned: PinnedCatalog, known_ids: frozenset[str], *, root: Path | None = None,
+) -> tuple[CatalogIssue, ...]:
+    """Apply publication rules against a pinned tree or a planning checkout."""
     issues = []
     for key, entry in pinned.snapshot.active.items():
         if key in known_ids:
@@ -245,9 +248,10 @@ def new_declaration_issues(pinned: PinnedCatalog, known_ids: frozenset[str]) -> 
         except RuntimeError as error:
             issues.append(CatalogIssue(key, entry.path, "invalid-plan",
                                       f"신규 ExecPlan 형식이 유효하지 않습니다: {error}"))
-        if pinned.regular_paths is not None:
+        if pinned.regular_paths is not None or root is not None:
             for source in entry.sources:
-                if source not in pinned.regular_paths:
+                if not _source_exists(root, source, allow_archive_fallback=False,
+                                      available_regular_paths=pinned.regular_paths):
                     issues.append(CatalogIssue(key, entry.path, "missing-source",
                         f"신규 ExecPlan의 활성 source가 없습니다: {source}", source))
     return tuple(issues)
@@ -393,6 +397,16 @@ _PROJECT_VERSION_FIELDS = (
     "agent_manager_snapshot",
     "active_sha",
     "validated_base_sha",
+    "planning_error",
+    "planning_error_fingerprint",
+    "planning_attempt_fingerprint",
+    "planning_workspace_owned",
+    "planning_retry_count",
+    "planner_session_id",
+    "planning_validation_error",
+    "planning_result_pending_validation",
+    "planning_result_completed",
+    "planning_result",
 )
 
 
@@ -858,7 +872,7 @@ class DefinitionStateRepository:
             if (row is None or row[0] != "PLAN_BLOCKED"
                     or scoped_blocking.plan_block(self.connection, repo, key) is not None):
                 continue
-            if runtime.active_row(repo) is not None:
+            if runtime.active_row(repo) is not None or not runtime.recovery_slot_available(repo):
                 held[key] = json.dumps({"revision": pinned.revision_sha,
                     "plan_id": key, "code": "execution-slot-busy"})
                 resume[key] = phase

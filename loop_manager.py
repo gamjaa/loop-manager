@@ -1514,6 +1514,7 @@ validate_maintenance_planner_result = _bind_effects(
         _validate_future_idea_separation=lambda *args, **kwargs: _validate_future_idea_separation(*args, **kwargs),
         changed_files=lambda *args, **kwargs: changed_files(*args, **kwargs),
         contains_guidance_sections=lambda *args, **kwargs: contains_guidance_sections(*args, **kwargs),
+        git=lambda *args, **kwargs: git(*args, **kwargs),
         load_execplan_snapshot=lambda *args, **kwargs: load_execplan_snapshot(*args, **kwargs),
         published_execplan=lambda *args, **kwargs: published_execplan(*args, **kwargs),
         terminal_new_plan_ids=lambda *args, **kwargs: terminal_new_plan_ids(*args, **kwargs),

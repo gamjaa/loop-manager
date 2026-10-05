@@ -568,11 +568,13 @@ def load_execplan_snapshot(
     *,
     validate_sources: bool = True,
     allow_archive_fallback: bool = True,
+    isolate_errors: bool = False,
 ) -> execplan_catalog.ExecPlanCatalogSnapshot:
     return execplan_catalog.load_execplan_snapshot(
         worktree,
         validate_sources=validate_sources,
         allow_archive_fallback=allow_archive_fallback,
+        isolate_errors=isolate_errors,
     )
 
 

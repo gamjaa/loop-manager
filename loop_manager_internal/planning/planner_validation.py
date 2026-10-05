@@ -2,7 +2,7 @@
 from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
-from loop_manager_internal.catalog import execplan_catalog
+from loop_manager_internal.catalog import execplan_catalog, project_catalog_refresh
 from loop_manager_internal.application.contracts import ValidatedPlanningResult
 from loop_manager_internal.application.contracts import _FUTURE_IDEA_ITEM
 from loop_manager_internal.git.command_adapter import (
@@ -261,56 +261,22 @@ def validate_planner_result(
         plan_paths.append(changed_path)
 
     try:
+        from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
+        held_ids = (catalog_held_plan_ids(connection, repo)
+                    if connection is not None and repo is not None else frozenset())
         withheld_ids = frozenset()
-        try:
-            catalog = effects.load_execplan_catalog(worktree)
-        except execplan_catalog.ExecPlanCatalogError:
-            # An unrelated batch may retain the same proven, withheld errors.
-            # It cannot introduce/change an error or publish a dependent plan.
-            if connection is None or repo is None:
-                raise
-            view = connection.execute(
-                "SELECT revision_sha FROM execplan_catalog_views WHERE repo = ?", (repo,),
-            ).fetchone()
-            if view is None or view[0] != active_sha:
-                raise
-            local = execplan_catalog.load_execplan_snapshot(worktree, isolate_errors=True)
-            pending = connection.execute(
-                "SELECT plan_id, evidence FROM execplan_catalog_holds WHERE repo = ?", (repo,),
-            ).fetchall()
-            if not pending:
-                # A new Planner error has no existing hold to reuse. Preserve
-                # the original catalog diagnostic for the correction retry.
-                raise
-            causes = [dict(plan_id=item.plan_id, path=item.path, code=item.code,
-                           message=item.message, source=item.source) for item in local.issues]
-            held = {str(row[0]): json.loads(str(row[1])) for row in pending}
-            if (not local.issues or not local.withheld_ids <= held.keys()
-                    or any(held[key].get("causes") != causes for key in local.withheld_ids)
-                    or any(held[key].get("content_hash") != content_hash
-                           for key, _path, content_hash in local.withheld)):
-                raise PlannerValidationError("planning 결과가 보류 catalog 오류의 원인이나 범위를 변경했습니다.")
-            for _, path, _ in local.withheld:
-                if (not revision_path_exists(effects.git, worktree, active_sha, path)
-                        or effects.git(worktree, "diff", "--quiet", active_sha, "--", path,
-                                       check=False).returncode):
-                    raise PlannerValidationError(f"보류 catalog 파일이 변경됐습니다: {path}")
+        if held_ids:
+            project_catalog_refresh.assert_planning_dependencies_unheld(
+                {}, current_plans.items(), held_ids)
+            local = project_catalog_refresh.validated_held_planning_snapshot(
+                connection, repo, worktree, active_sha, git=effects.git,
+                load_snapshot=execplan_catalog.load_execplan_snapshot)
             catalog = local.active_metadata()
             withheld_ids = local.withheld_ids
-        if connection is not None and repo is not None:
-            from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
-            held_ids = catalog_held_plan_ids(connection, repo)
-            for path, parsed in current_plans.items():
-                pending_ids = list(parsed["depends_on"])
-                visited = set()
-                while pending_ids:
-                    dependency = pending_ids.pop()
-                    if dependency in visited:
-                        continue
-                    visited.add(dependency)
-                    if dependency in held_ids:
-                        raise PlannerValidationError(f"새 planning 결과가 보류 계획에 의존합니다: {path} -> {dependency}")
-                    pending_ids.extend(catalog.get(dependency, {}).get("depends_on", []))
+        else:
+            catalog = effects.load_execplan_catalog(worktree)
+        project_catalog_refresh.assert_planning_dependencies_unheld(
+            catalog, current_plans.items(), held_ids)
         plans: list[tuple[str, dict[str, object]]] = []
         revisions: list[PlanRevision] = []
         deletions: list[PlanDeletion] = []
