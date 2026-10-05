@@ -41,3 +41,4 @@ Keep credential-bearing verify and Review feedback out of durable diagnostics an
 - Observed feedback path: `loop_manager_internal/execution/validation_feedback.py`.
 - Reused `redact_secrets` for both normalized diagnostics and durable validation-result output, so quoted credential values are removed before either feedback persistence or Worker prompt delivery.
 - Preserved the existing verify fingerprint source and cursor identity while redacting stored samples, state, provider Review logs and last-message files. Reviewer log JSON is decoded before applying the shared scrubber to nested result strings.
+- Codex Reviewer now reads its final message from JSON stdout without requesting an `-o` file; resumed calls capture stdout through a real subprocess pipe. Invalid JSON lines normalize escaped quotes before applying the same credential scrubber.

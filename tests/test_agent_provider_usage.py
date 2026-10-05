@@ -2,6 +2,8 @@
 
 from pathlib import Path
 import json
+import subprocess
+import sys
 import tempfile
 import io
 from unittest import TestCase, mock
@@ -13,6 +15,14 @@ import loop_manager as manager
 
 
 class UsageTests(TestCase):
+    def test_truncated_reviewer_json_redacts_escaped_credential_key(self):
+        raw = ('{"item":{"text":"\\"password\\": \\"escaped-secret\\" and context\n'
+               '\\"api_key\\": \\"another-secret\\" more context')
+        clean = provider_adapters._redact_reviewer_log(raw)
+        self.assertNotIn('escaped-secret', clean)
+        self.assertNotIn('another-secret', clean)
+        self.assertIn('context', clean)
+
     def test_reviewer_provider_artifacts_redact_json_credentials(self):
         secret = 'review-json-secret'
         review = f'{{"password": "{secret}", "result": "VERDICT: FAIL"}}'
@@ -20,9 +30,16 @@ class UsageTests(TestCase):
             root = Path(directory)
 
             def codex_run(arguments, **kwargs):
-                kwargs['stdout'].write(review + '\n')
-                Path(arguments[arguments.index('-o') + 1]).write_text(review)
-                return mock.Mock(returncode=0)
+                self.assertNotIn('-o', arguments)
+                self.assertEqual(kwargs['stdout'], subprocess.PIPE)
+                event = json.dumps({'type': 'item.completed', 'item': {
+                    'type': 'agent_message', 'text': review,
+                }}) + '\n' + '{"item":{"text":"\\"password\\": \\"truncated-secret'
+                return subprocess.run(
+                    [sys.executable, '-c', 'import sys; sys.stdout.write(sys.argv[1])', event],
+                    **{key: value for key, value in kwargs.items() if key != 'input'},
+                    input=kwargs['input'],
+                )
 
             effects = provider_adapters.ProviderEffects(
                 mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock(), codex_run,
@@ -32,9 +49,11 @@ class UsageTests(TestCase):
                 resolved_profile=invocation.ResolvedProfile('model', 'high'), effects=effects,
             )
             self.assertNotIn(secret, str(codex_result))
+            self.assertIn('VERDICT: FAIL', codex_result[1])
             log_dir, = (root / 'logs').iterdir()
             for artifact in ('reviewer.log', 'reviewer-last.txt'):
                 self.assertNotIn(secret, (log_dir / artifact).read_text())
+                self.assertNotIn('truncated-secret', (log_dir / artifact).read_text())
 
             effects = provider_adapters.ProviderEffects(
                 mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock(),
@@ -67,8 +86,11 @@ class UsageTests(TestCase):
             root = Path(directory)
 
             def codex_start(arguments, **_kwargs):
-                Path(arguments[arguments.index('-o') + 1]).write_text(review)
-                return Process('{"type":"thread.started","thread_id":"session"}\n' + review)
+                self.assertNotIn('-o', arguments)
+                event = json.dumps({'type': 'item.completed', 'item': {
+                    'type': 'agent_message', 'text': review,
+                }})
+                return Process('{"type":"thread.started","thread_id":"session"}\n' + event)
 
             effects = provider_adapters.ProviderEffects(
                 mock.Mock(), mock.Mock(), mock.Mock(), codex_start, mock.Mock(),
@@ -96,6 +118,33 @@ class UsageTests(TestCase):
             )
             for artifact in ('claude-reviewer.log', 'claude-reviewer-last.txt'):
                 self.assertNotIn(secret, (log_dir / artifact).read_text())
+
+    def test_reviewer_auxiliary_copy_failure_preserves_completed_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            event = json.dumps({'type': 'item.completed', 'item': {
+                'type': 'agent_message', 'text': 'VERDICT: PASS',
+            }})
+            calls = mock.Mock(return_value=subprocess.CompletedProcess([], 0, event))
+            effects = provider_adapters.ProviderEffects(
+                mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock(), calls,
+            )
+            original_write = Path.write_text
+
+            def write(path, content, *args, **kwargs):
+                if path.name == 'reviewer-last.txt':
+                    raise OSError('auxiliary copy unavailable')
+                return original_write(path, content, *args, **kwargs)
+
+            with mock.patch.object(Path, 'write_text', autospec=True, side_effect=write):
+                result = provider_adapters.run_codex(
+                    root, root, root / 'config', 'reviewer', 'prompt', read_only=True,
+                    session_id='existing-session',
+                    resolved_profile=invocation.ResolvedProfile('model', 'high'), effects=effects,
+                )
+            self.assertEqual((result.code, result.session_id, result.collection_status),
+                             (0, 'existing-session', 'error'))
+            calls.assert_called_once()
 
     def test_stream_timeout_preserves_observed_session_and_failure_kind(self):
         class Process:

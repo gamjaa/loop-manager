@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import io
 import json
+import subprocess
 import threading
 from unittest import TestCase, mock, skipUnless
 
@@ -215,6 +216,14 @@ class NativeWriteIsolationTests(TestCase):
                     if session:
                         self.assertIn('resume', command)
                         self.assertIn(session, command)
+                    if role == 'reviewer':
+                        self.assertNotIn('-o', command)
+                        self.assertEqual(kwargs['stdout'], subprocess.PIPE)
+                        return manager.subprocess.CompletedProcess(
+                            command, 0,
+                            '{"type":"item.completed","item":{"type":"agent_message",'
+                            '"text":"completed"}}\n',
+                        )
                     target = Path(command[command.index('-o') + 1])
                     target.write_text('completed')
                     kwargs['stdout'].write('provider log\n')
@@ -270,8 +279,19 @@ class NativeWriteIsolationTests(TestCase):
                                      'read-only' if role == 'reviewer' else 'workspace-write')
                     self.assertNotIn('--approve-for-me', command)
                     if 'resume' in command:
+                        if role == 'reviewer':
+                            return manager.subprocess.CompletedProcess(
+                                command, 1, 'thread saved-session not found\n',
+                            )
                         kwargs['stdout'].write('thread saved-session not found\n')
                         return manager.subprocess.CompletedProcess(command, 1)
+                    if role == 'reviewer':
+                        self.assertNotIn('-o', command)
+                        return manager.subprocess.CompletedProcess(
+                            command, 0,
+                            '{"type":"item.completed","item":{"type":"agent_message",'
+                            '"text":"completed"}}\n',
+                        )
                     Path(command[command.index('-o') + 1]).write_text('completed')
                     return manager.subprocess.CompletedProcess(command, 0)
 
@@ -372,8 +392,13 @@ class NativeWriteIsolationTests(TestCase):
                         self.assertTrue(handoff.launch_lock.acquire(blocking=False))
                         handoff.launch_lock.release()
                         handoff.stop()
+                        if role == 'reviewer':
+                            self.assertNotIn('-o', command)
+                            return ('{"type":"item.completed","item":{"type":"agent_message",'
+                                    '"text":"completed"}}\n', None)
                         Path(command[command.index('-o') + 1]).write_text('completed')
                         kwargs['stdout'].write('provider log\n')
+                        return (None, None)
 
                     process.communicate.side_effect = communicate
                     return process

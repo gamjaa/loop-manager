@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import hashlib
 import io
 import json
+import re
 from pathlib import Path
 import subprocess
 import threading
@@ -66,11 +67,25 @@ def _redact_reviewer_log(raw: str) -> str:
         try:
             decoded = json.loads(line)
         except (ValueError, RecursionError):
-            lines.append(redact_secrets(line))
+            # Invalid JSON may still contain escaped credential keys.
+            lines.append(redact_secrets(re.sub(r'\\+(?=["\'])', '', line)))
         else:
             lines.append(json.dumps(scrub(decoded), ensure_ascii=False) +
                          ("\n" if line.endswith("\n") else ""))
     return "".join(lines)
+
+
+def _codex_reviewer_message(raw: str) -> str:
+    """Extract the final agent message from JSON stdout."""
+    message = ""
+    for line in raw.splitlines():
+        event, _ = _json_object(line)
+        if event is None or event.get("type") not in {"item.completed", "item.updated"}:
+            continue
+        item = event.get("item")
+        if isinstance(item, dict) and item.get("type") == "agent_message" and isinstance(item.get("text"), str):
+            message = item["text"]
+    return _redact_reviewer_log(message)
 
 
 def _start_timeout(process: subprocess.Popen[str], triggered: threading.Event,
@@ -162,7 +177,7 @@ def run_codex(
     # Preserve the previous result until native policy preflight accepts the call.
     provider_last_message = (codex_launch.attempt / "last-message.txt"
                              if codex_launch else last_message)
-    if codex_launch is None:
+    if codex_launch is None or role_name == "reviewer":
         last_message.unlink(missing_ok=True)
     permissions = (list(isolation_arguments) if isolation_arguments is not None
                    else codex_sandbox_arguments(read_only))
@@ -179,8 +194,7 @@ def run_codex(
             model,
             "-c",
             f'model_reasoning_effort="{effort}"',
-            "-o",
-            str(provider_last_message),
+            *([] if role_name == "reviewer" else ["-o", str(provider_last_message)]),
             session_id,
             "-",
         ]
@@ -188,7 +202,8 @@ def run_codex(
         arguments = [
             "codex",
             "exec",
-            *(["--json"] if persist_session else ["--ephemeral"]),
+            *(["--json"] if persist_session or role_name == "reviewer" else []),
+            *(["--ephemeral"] if not persist_session else []),
             *permissions,
             "-C",
             str(worktree),
@@ -196,13 +211,13 @@ def run_codex(
             model,
             "-c",
             f'model_reasoning_effort="{effort}"',
-            "-o",
-            str(provider_last_message),
+            *([] if role_name == "reviewer" else ["-o", str(provider_last_message)]),
             "-",
         ]
     resolved_session_id = session_id
     timeout_triggered = threading.Event()
     collection_status = "unknown"
+    captured = ""
     if persist_session and not session_id:
         with (io.StringIO() if role_name == "reviewer" else log.open("w", encoding="utf-8")) as output:
             start = codex_launch.start if codex_launch else effects._handoff_popen
@@ -249,9 +264,10 @@ def run_codex(
                 if codex_launch is not None:
                     codex_launch.stop(process)
             if role_name == "reviewer":
-                log.write_text(_redact_reviewer_log(output.getvalue()), encoding="utf-8")
+                captured = output.getvalue()
+                log.write_text(_redact_reviewer_log(captured), encoding="utf-8")
     else:
-        with (io.StringIO() if role_name == "reviewer" else log.open("w", encoding="utf-8")) as output:
+        with log.open("w", encoding="utf-8") as output:
             runner = codex_launch.run if codex_launch is not None else effects._handoff_run
             result = runner(
                 arguments,
@@ -259,7 +275,7 @@ def run_codex(
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                stdout=output,
+                stdout=subprocess.PIPE if role_name == "reviewer" else output,
                 stderr=subprocess.STDOUT,
                 env=launch_environment,
                 cwd=worktree,
@@ -267,25 +283,24 @@ def run_codex(
                 **({"launch_process": effects._handoff_popen} if codex_launch is not None else {}),
             )
             if role_name == "reviewer":
-                log.write_text(_redact_reviewer_log(output.getvalue()), encoding="utf-8")
+                captured = result.stdout or ""
+                output.write(_redact_reviewer_log(captured))
         returncode = result.returncode
     try:
-        message = (provider_last_message.read_text(encoding="utf-8")
+        message = (_codex_reviewer_message(captured) if role_name == "reviewer" else
+                   provider_last_message.read_text(encoding="utf-8")
                    if provider_last_message.is_file() else "")
     except (OSError, UnicodeError):
         # The process has already completed; unavailable auxiliary output must
         # not turn that completed physical call into a retry.
         message = ""
         collection_status = "error"
-    if role_name == "reviewer":
-        message = _redact_reviewer_log(message)
-        if provider_last_message.is_file():
-            try:
-                provider_last_message.write_text(message, encoding="utf-8")
-            except (OSError, UnicodeError):
-                provider_last_message.unlink(missing_ok=True)
-                collection_status = "error"
-    if codex_launch is not None and provider_last_message.is_file():
+    if role_name == "reviewer" and message:
+        try:
+            last_message.write_text(message, encoding="utf-8")
+        except (OSError, UnicodeError):
+            collection_status = "error"
+    if role_name != "reviewer" and codex_launch is not None and provider_last_message.is_file():
         try:
             last_message.write_text(message, encoding="utf-8")
         except (OSError, UnicodeError):
