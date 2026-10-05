@@ -1,3 +1,5 @@
+from contextlib import closing
+from tests.support.workspace import symlink_or_skip
 import sqlite3
 import unittest
 from dataclasses import replace
@@ -483,7 +485,7 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
         (self.worktree / "ignored.txt").write_text("secret\n", encoding="utf-8")
         (self.worktree / "AGENTS.md").write_text("outside\n", encoding="utf-8")
         self.run_git(self.worktree, "add", "-f", "AGENTS.md")
-        (self.worktree / "link.py").symlink_to("code.py")
+        symlink_or_skip(self.worktree / "link.py", "code.py")
         request = self.block()
         adapter = loop_manager._BlockedCheckpointAdapter(
             self.connection,
@@ -554,7 +556,7 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
 
     def test_deleted_tracked_symlink_is_rejected_staged_or_unstaged(self):
         link = self.worktree / "link.py"
-        link.symlink_to("code.py")
+        symlink_or_skip(link, "code.py")
         self.run_git(self.worktree, "add", "link.py")
         self.run_git(self.worktree, "commit", "-m", "symlink fixture")
         link.unlink()
@@ -699,7 +701,7 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
         loop_manager._finish_manager_base_fetch(self.connection, self.repo, second)
         current = loop_manager.capture_git_snapshot(self.worktree)
         saved_db = Path(self.temporary.name) / "fetch-chain.sqlite"
-        with sqlite3.connect(saved_db) as copy:
+        with closing(sqlite3.connect(saved_db)) as copy, copy:
             self.connection.backup(copy)
         copy.close()
         reopened = sqlite3.connect(saved_db)

@@ -175,9 +175,10 @@ def run_codex(
     collection_status = "unknown"
     if persist_session and not session_id:
         with log.open("w", encoding="utf-8") as output:
-            process = effects._handoff_popen(
+            start = codex_launch.start if codex_launch else effects._handoff_popen
+            process = start(
                 arguments,
-                stdin=subprocess.PIPE,
+                **({'launch_process': effects._handoff_popen} if codex_launch else {'stdin': subprocess.PIPE}),
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
@@ -185,7 +186,6 @@ def run_codex(
                 errors="replace",
                 env=launch_environment,
                 cwd=worktree,
-                start_new_session=codex_launch is not None,
             )
             assert process.stdin is not None
             assert process.stdout is not None

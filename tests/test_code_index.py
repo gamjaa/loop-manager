@@ -7,6 +7,7 @@ import unittest
 
 from loop_manager_internal.maintenance import code_index
 from tests.support.maintenance import inventory
+from tests.support.workspace import symlink_or_skip
 
 
 class CodeIndexTest(unittest.TestCase):
@@ -101,7 +102,7 @@ class CodeIndexTest(unittest.TestCase):
             self.assertIn("new.py", code_index.query_worktree(repo, ["new.py"])["records"])
             with self.assertRaises(ValueError):
                 code_index.query_worktree(repo, ["../outside.py"])
-            (repo / "link.py").symlink_to(repo / "a.py")
+            symlink_or_skip(repo / "link.py", repo / "a.py")
             with self.assertRaises(ValueError):
                 code_index.query_worktree(repo, ["link.py"])
 

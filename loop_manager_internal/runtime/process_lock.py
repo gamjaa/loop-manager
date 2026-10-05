@@ -26,7 +26,7 @@ def is_lock_contention(error: OSError) -> bool:
     """Return whether a non-blocking lock failure means another process holds it."""
 
     return error.errno in {errno.EACCES, errno.EAGAIN} or (
-        os.name == "nt" and error.winerror in {32, 33}
+        os.name == "nt" and getattr(error, "winerror", None) in {32, 33}
     )
 
 
@@ -65,6 +65,9 @@ def process_lock(state_dir: Path, *, identity: str = "0"):
 
 def _write_process_lock_identity(handle, identity: str) -> None:
     handle.seek(0)
+    # Windows의 byte-range lock은 다른 handle의 읽기도 금지한다.
+    if os.name == "nt":
+        handle.write(b"\0")
     handle.write(identity.encode("ascii"))
     handle.truncate()
     handle.flush()
@@ -73,7 +76,8 @@ def _write_process_lock_identity(handle, identity: str) -> None:
 
 def _held_process_lock_identity(state_dir: Path) -> str:
     """Read the parent lease only after proving another process still holds it."""
-    with (state_dir / "loop-manager.lock").open("r+b") as handle:
+    with (state_dir / "loop-manager.lock").open("r+b", buffering=0) as handle:
+        handle.seek(1 if os.name == "nt" else 0)
         identity = handle.read(128).decode("ascii", errors="replace")
         handle.seek(0)
         try:

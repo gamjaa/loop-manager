@@ -4,6 +4,7 @@ import sqlite3
 from pathlib import Path
 import tempfile
 from unittest import TestCase, mock
+from tests.support.workspace import symlink_or_skip
 
 from loop_manager_internal.agents import agent_invocation as invocation
 from loop_manager_internal.agents import agent_write_isolation as isolation
@@ -12,6 +13,19 @@ import loop_manager as manager
 
 
 class WriteIsolationTests(TestCase):
+    def setUp(self):
+        # 임시 worktree의 상위 사용자 설정이 테스트로 유입되지 않게 한다.
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        root = Path(directory.name)
+        (root / '.git').mkdir()
+        temporary_root = mock.patch.object(tempfile, 'tempdir', str(root))
+        temporary_root.start()
+        self.addCleanup(temporary_root.stop)
+        home = mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(root / 'codex-home')})
+        home.start()
+        self.addCleanup(home.stop)
+
     def test_worktree_inspection_rejects_alias_and_unregistered_path(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -44,7 +58,7 @@ class WriteIsolationTests(TestCase):
                 self.assertEqual((boundary.worktree, boundary.source,
                                   boundary.common_dir), (selected, source, common))
                 alias = selected.parent / 'alias'
-                alias.symlink_to(selected, target_is_directory=True)
+                symlink_or_skip(alias, selected, target_is_directory=True)
                 with self.assertRaises(isolation.IsolationError):
                     isolation.inspect_worktree(alias, state_root)
                 unrelated = root / 'unrelated'
@@ -368,18 +382,18 @@ class WriteIsolationTests(TestCase):
                             self.assertEqual(records[0].role, role)
                 run.assert_not_called()
 
-    def test_native_windows_records_rejection_before_provider_probe(self):
+    def test_unsupported_os_records_rejection_before_provider_probe(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             boundary = isolation.WorktreeBoundary(root, root / 'source', (),
                                                    root / 'git', root / 'common', 'repo')
             with mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
-                 mock.patch.object(isolation.platform, 'system', return_value='Windows'), \
+                 mock.patch.object(isolation.platform, 'system', return_value='UnsupportedOS'), \
                  mock.patch.object(isolation, 'prepare_launch') as probe:
                 for provider in ('codex', 'claude'):
                     with self.subTest(provider=provider):
                         records = []
-                        with self.assertRaisesRegex(isolation.IsolationError, 'Windows'):
+                        with self.assertRaisesRegex(isolation.IsolationError, 'UnsupportedOS'):
                             isolation.prepare_isolation(
                                 provider, 'worker', root, root, False, records.append,
                                 lambda: 'snapshot', expected_repository=str(root / 'source'))

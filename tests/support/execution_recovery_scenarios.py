@@ -1,4 +1,5 @@
 """Shared scenario setup retained from the phase policy tests."""
+from contextlib import closing
 
 from tests.support.current_rebase import current_rebase_case
 from tests.support.execution import recovered_rebase_workspace, recovered_rebase_publication
@@ -211,7 +212,7 @@ class ExecutionRecoveryScenarios:
         )
         database = fixture.state_dir / 'restart.db'
         connection.commit()
-        with sqlite3.connect(database) as persisted:
+        with closing(sqlite3.connect(database)) as persisted, persisted:
             connection.backup(persisted)
         connection.close()
         fixture.connection = sqlite3.connect(database)

@@ -1,4 +1,5 @@
 """Review Phase execution policy regression tests."""
+from contextlib import closing
 
 from tests.support.execution import ExecutionFixture
 from dataclasses import replace
@@ -84,7 +85,7 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         # handler, so ownership cannot depend on in-process state from release.
         database = fixture.state_dir / 'restart.db'
         connection.commit()
-        with sqlite3.connect(database) as persisted:
+        with closing(sqlite3.connect(database)) as persisted, persisted:
             connection.backup(persisted)
         connection.close()
         fixture.connection = sqlite3.connect(database)

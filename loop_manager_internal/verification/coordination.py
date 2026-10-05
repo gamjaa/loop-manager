@@ -10,6 +10,7 @@ from pathlib import Path
 import secrets
 import socket
 import socketserver
+import sys
 import threading
 import time
 
@@ -38,6 +39,10 @@ def execution_settings(coordinator, cap, state_dir):
 
 
 def process_identity(pid):
+    if sys.platform == "darwin":
+        from .darwin_process import process_info
+        info = process_info(pid)
+        return info[1] if info else None
     if os.name == "nt":
         from loop_manager_internal.execution.windows_job import process_identity as windows_identity
         return windows_identity(pid)
@@ -57,6 +62,13 @@ def descendant(pid, root):
         if pid == root:
             return True
         seen.add(pid)
+        if sys.platform == "darwin":
+            from .darwin_process import process_info
+            info = process_info(pid)
+            if info is None:
+                return False
+            pid = info[0]
+            continue
         stat = Path(f"/proc/{pid}/stat").read_text()
         pid = int(stat[stat.rfind(")") + 2:].split()[1])
     return False

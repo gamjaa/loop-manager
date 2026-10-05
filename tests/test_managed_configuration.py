@@ -1,3 +1,4 @@
+from contextlib import closing
 import io
 import sqlite3
 import subprocess
@@ -235,7 +236,7 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             invalid.write_text(
                 "[loop]\nrefactoring_review_interval = 0\n", encoding="utf-8"
             )
-            with loop_manager.connect_database(state_dir, create=True) as connection:
+            with closing(loop_manager.connect_database(state_dir, create=True)) as connection, connection:
                 project_registry.add_project(connection, self._record())
             args = loop_manager.build_parser().parse_args(
                 ["config", "remove", "/repo"]
@@ -246,7 +247,7 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
                     args, state_dir, invalid
                 )
 
-            with loop_manager.connect_database(state_dir) as connection:
+            with closing(loop_manager.connect_database(state_dir)) as connection, connection:
                 self.assertEqual(
                     tuple(project.repo for project in project_registry.list_projects(connection)),
                     ("/repo",),
@@ -714,7 +715,7 @@ Registration rollback fixture.
             database.commit()
             database.close()
 
-            with loop_manager.connect_database(state_dir) as connection:
+            with closing(loop_manager.connect_database(state_dir)) as connection, connection:
                 projects = project_registry.list_projects(connection)
 
         self.assertEqual(len(projects), 1)

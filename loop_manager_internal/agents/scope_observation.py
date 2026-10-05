@@ -55,7 +55,7 @@ def _nul_git_paths(repo: Path, *arguments: str, effects: ObservationEffects) -> 
     if raw and not raw.endswith(b"\0"):
         raise RuntimeError("Git 경로 목록이 잘렸습니다.")
     return [
-        os.fsdecode(record)
+        record.decode("utf-8", errors="surrogateescape")
         for record in raw.split(b"\0")
         if record
     ]
@@ -96,7 +96,7 @@ def _index_entries(worktree: Path, *, effects: ObservationEffects,
         metadata, separator, raw_path = record.partition(b"\t")
         if not separator or not raw_path:
             raise RuntimeError("Git index snapshot을 해석할 수 없습니다.")
-        entries.setdefault(os.fsdecode(raw_path), []).append(
+        entries.setdefault(raw_path.decode("utf-8", errors="surrogateescape"), []).append(
             metadata.decode("ascii", errors="replace")
         )
         if details is not None:
@@ -106,7 +106,7 @@ def _index_entries(worktree: Path, *, effects: ObservationEffects,
             debug_records.append(raw_path + b"\0" + debug.group())
             position = debug.end()
     if details is not None:
-        details["index_debug"] = os.fsdecode(b"".join(debug_records))
+        details["index_debug"] = b"".join(debug_records).decode("utf-8", errors="surrogateescape")
     return {
         path: tuple(sorted(metadata))
         for path, metadata in entries.items()
@@ -205,16 +205,22 @@ def _config_entries(worktree: Path, *, effects: ObservationEffects) -> dict[str,
     )
     if configured_global.returncode not in {0, 1}:
         raise RuntimeError("Git global exclude 경로를 확인할 수 없습니다.")
-    if configured_global.returncode == 0:
+    if configured_global.returncode == 0 and not configured_global.stdout.strip():
+        # 빈 core.excludesFile은 전역 ignore를 끈다. Path('')는 worktree가 된다.
+        global_exclude = None
+    elif configured_global.returncode == 0:
         global_exclude = Path(os.fsdecode(configured_global.stdout.strip()))
     else:
         global_exclude = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "git/ignore"
-    if not global_exclude.is_absolute():
+    if global_exclude is not None and not global_exclude.is_absolute():
         global_exclude = worktree / global_exclude
     for name, path in (
         ("repository-exclude", repository_exclude),
         ("global-exclude", global_exclude),
     ):
+        if path is None:
+            snapshot[f"ignore-source:{name}"] = ("", "disabled")
+            continue
         canonical = _canonical_path(path)
         signature = _git_operation_path_signature(canonical) if canonical.exists() else "missing"
         snapshot[f"ignore-source:{name}"] = (str(canonical), signature)

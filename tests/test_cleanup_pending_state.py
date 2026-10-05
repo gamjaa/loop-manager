@@ -1,3 +1,4 @@
+from contextlib import closing
 from tests.support.workspace import CleanupFixture
 import sqlite3
 import tempfile
@@ -25,7 +26,7 @@ class CleanupPendingStateTest(CleanupFixture, unittest.TestCase):
             database.commit()
             database.close()
 
-            with loop_manager.connect_database(state_dir) as connection:
+            with closing(loop_manager.connect_database(state_dir)) as connection, connection:
                 table = connection.execute(
                     "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'cleanup_pending'"
                 ).fetchone()
@@ -69,7 +70,7 @@ class CleanupPendingStateTest(CleanupFixture, unittest.TestCase):
             database.commit()
             database.close()
 
-            with loop_manager.connect_database(state_dir) as connection:
+            with closing(loop_manager.connect_database(state_dir)) as connection, connection:
                 pending = connection.execute(
                     "SELECT reason, workspace_owned FROM cleanup_pending WHERE repo = 'repo'"
                 ).fetchone()

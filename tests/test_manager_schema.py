@@ -1,3 +1,4 @@
+from contextlib import closing
 import sqlite3
 import tempfile
 import unittest
@@ -59,7 +60,7 @@ class ManagerSchemaTest(unittest.TestCase):
             database.commit()
             database.close()
 
-            with loop_manager.connect_database(state_dir) as connection:
+            with closing(loop_manager.connect_database(state_dir)) as connection, connection:
                 columns = {
                     row[1] for row in connection.execute("PRAGMA table_info(projects)")
                 }
@@ -110,7 +111,7 @@ class ManagerSchemaTest(unittest.TestCase):
             database.commit()
             database.close()
 
-            with loop_manager.connect_database(state_dir) as connection:
+            with closing(loop_manager.connect_database(state_dir)) as connection, connection:
                 columns = {row[1] for row in connection.execute("PRAGMA table_info(projects)")}
                 row = connection.execute("SELECT * FROM projects WHERE repo = 'repo'").fetchone()
 

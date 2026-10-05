@@ -1,3 +1,5 @@
+from contextlib import closing
+from tests.support.workspace import symlink_or_skip
 import contextlib
 from dataclasses import replace
 import hashlib
@@ -49,7 +51,7 @@ class OriginRegistrationTests(unittest.TestCase):
             runtime_path = state_dir / "runtime"
             selected = git(source, "rev-parse", "HEAD")
             git(source, "worktree", "add", "--detach", str(runtime_path), selected)
-            with sqlite3.connect(state_dir / "loop-manager.db") as connection:
+            with closing(sqlite3.connect(state_dir / "loop-manager.db")) as connection, connection:
                 connection.execute(loop_manager.SCHEMA)
                 connection.execute(
                     "INSERT INTO projects (repo, base_branch, origin) VALUES (?, ?, ?)",
@@ -59,7 +61,7 @@ class OriginRegistrationTests(unittest.TestCase):
                 source, runtime_path, selected, "a" * 32,
             )
             alias = Path(directory) / "source-alias"
-            alias.symlink_to(source, target_is_directory=True)
+            symlink_or_skip(alias, source, target_is_directory=True)
             project = lambda path, origin="owner/repo": loop_manager.project_registry.RegisteredProject(
                 str(path), "develop", "codex", None, False, origin,
             )
@@ -87,7 +89,7 @@ class OriginRegistrationTests(unittest.TestCase):
                     ),
                     "develop",
                 )
-                with sqlite3.connect(state_dir / "loop-manager.db") as connection:
+                with closing(sqlite3.connect(state_dir / "loop-manager.db")) as connection, connection:
                     connection.execute(
                         "UPDATE projects SET repo = ?", (str(alias),)
                     )

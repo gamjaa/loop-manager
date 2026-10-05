@@ -1,3 +1,4 @@
+from contextlib import closing
 import contextlib
 from dataclasses import replace
 import hashlib
@@ -98,7 +99,7 @@ class BootstrapEntryTests(unittest.TestCase):
             _remote, source, writer = remote_fixture(directory)
             state_dir = Path(directory) / "state"
             state_dir.mkdir()
-            with sqlite3.connect(state_dir / "loop-manager.db") as connection:
+            with closing(sqlite3.connect(state_dir / "loop-manager.db")) as connection, connection:
                 connection.execute(loop_manager.SCHEMA)
                 connection.execute(
                     "INSERT INTO projects (repo, base_branch, origin) VALUES (?, ?, ?)",
@@ -149,7 +150,7 @@ class BootstrapEntryTests(unittest.TestCase):
                 state_dir = Path(directory) / "state"
                 if command not in {("init",), ("config", "init")}:
                     state_dir.mkdir()
-                    with sqlite3.connect(state_dir / "loop-manager.db") as connection:
+                    with closing(sqlite3.connect(state_dir / "loop-manager.db")) as connection, connection:
                         connection.execute(loop_manager.SCHEMA)
                 remote_sha = advance_remote(writer)
                 arguments = ["--state-dir", str(state_dir), *command]
@@ -213,7 +214,7 @@ class BootstrapEntryTests(unittest.TestCase):
             (writer / "develop.txt").write_text("new\n")
             latest = commit_all(writer, "Advance develop")
             git(writer, "push", "origin", "develop")
-            with sqlite3.connect(state_dir / "loop-manager.db") as connection:
+            with closing(sqlite3.connect(state_dir / "loop-manager.db")) as connection, connection:
                 connection.execute(loop_manager.SCHEMA)
                 connection.execute(
                     "INSERT INTO projects (repo, base_branch, origin) VALUES (?, ?, ?)",
@@ -260,7 +261,7 @@ class BootstrapEntryTests(unittest.TestCase):
             source.mkdir()
             state_dir = Path(directory) / "state"
             state_dir.mkdir()
-            with sqlite3.connect(state_dir / "loop-manager.db") as connection:
+            with closing(sqlite3.connect(state_dir / "loop-manager.db")) as connection, connection:
                 connection.execute("CREATE TABLE projects (repo TEXT, base_branch TEXT)")
                 connection.execute(
                     "INSERT INTO projects VALUES (?, 'develop')", (str(source),)
@@ -269,7 +270,7 @@ class BootstrapEntryTests(unittest.TestCase):
                 loop_manager._bootstrap_service().bootstrap_base_branch(source, state_dir, "owner/repo"),
                 "develop",
             )
-            with sqlite3.connect(state_dir / "loop-manager.db") as connection:
+            with closing(sqlite3.connect(state_dir / "loop-manager.db")) as connection, connection:
                 self.assertEqual(
                     {row[1] for row in connection.execute("PRAGMA table_info(projects)")},
                     {"repo", "base_branch"},

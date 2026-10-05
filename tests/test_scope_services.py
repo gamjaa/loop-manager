@@ -129,6 +129,18 @@ class ScopeObservationTests(TestCase):
             with self.assertRaisesRegex(RuntimeError, '중복 경로'):
                 scope_observation._registered_worktree_entries(path, effects=self.effects)
 
+    def test_empty_global_excludes_does_not_hash_worktree(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            self.git_bytes.side_effect = lambda _path, *args: (
+                b'local\0file:config\0core.excludesfile\n\0' if args[0] == 'config' else b'exclude')
+            self.process.return_value = subprocess.CompletedProcess([], 0, b'\n')
+            before = scope_observation._config_entries(worktree, effects=self.effects)
+            (worktree / 'new.py').write_text('changed', encoding='utf-8')
+            after = scope_observation._config_entries(worktree, effects=self.effects)
+            self.assertEqual(before, after)
+            self.assertEqual(after['ignore-source:global-exclude'], ('', 'disabled'))
+
     def test_config_parser_keeps_origins_and_exclude_file_content_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             worktree = Path(directory)

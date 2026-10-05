@@ -1,4 +1,5 @@
 """Checkpoint Recovery Phase execution policy regression tests."""
+from contextlib import closing
 
 from tests.support.current_rebase import current_rebase_case
 from tests.support.execution import ExecutionFixture
@@ -156,7 +157,7 @@ class ExecutionCheckpointRecoveryPhaseTests(ExecutionRecoveryScenarios, Executio
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         database = Path(directory.name) / 'state.sqlite'
-        with sqlite3.connect(database) as saved:
+        with closing(sqlite3.connect(database)) as saved, saved:
             self.connection.backup(saved)
 
         self.effects.agent.run_agent.reset_mock()
@@ -167,7 +168,7 @@ class ExecutionCheckpointRecoveryPhaseTests(ExecutionRecoveryScenarios, Executio
             'git_operation_in_progress', 'unresolved rebase', None, (),
         )
         for iteration in range(3):
-            with sqlite3.connect(database) as connection:
+            with closing(sqlite3.connect(database)) as connection, connection:
                 connection.row_factory = sqlite3.Row
                 notifications.configure_session(connection, enabled=True)
                 with (
