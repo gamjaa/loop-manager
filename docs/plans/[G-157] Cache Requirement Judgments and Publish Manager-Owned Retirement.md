@@ -70,6 +70,8 @@ Remove the premature Requirement archive gate that repeatedly blocks valid imple
 
 - Follow-up review corrections: a PRODUCT-only evidence set no longer depends on unrelated ARCHITECTURE content. An invalidated pending retirement is withdrawn only after receipt, remote-path and original-byte checks; only its index paths are reset, unrelated work is preserved, and the existing Planner validation-retry path requests fresh evidence or defers while new related plans remain unfinished. Modified local content stays blocked instead of being overwritten. Targeted tests cover restart, re-assessment, subsequent movement and retry routing.
 
+- Evidence completeness and restoration recovery: fulfilled/unfulfilled final results must name both specification documents, using relevant sections/full paths or an explicit unrelated declaration with a reason. Missing declarations retain conservative dependencies and cannot authorize a new final result. Invalidated staged restoration evidence remains pinned until a receipt- and byte-checked inverse move succeeds; then the existing Planner retry re-evaluates the audit. Tests cover omitted specifications, declared unrelated evidence, related-rule invalidation, staged restoration invalidation, preserved local edits, and interruption after inverse rename.
+
 ### Agent Guidance Proposal: retirement-after-merged-judgment
 Target: `AGENTS.md`
 Scope: `common`

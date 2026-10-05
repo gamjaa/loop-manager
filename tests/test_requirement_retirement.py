@@ -45,7 +45,7 @@ class FakeGit:
         self.index_resets = []
 
     def run(self, _repo, *args):
-        if args[:1] != ("reset",) or args[2:] != ("--", SOURCE, ARCHIVE):
+        if args[:1] != ("reset",) or args[2:] not in (("--", SOURCE, ARCHIVE), ("--", ARCHIVE, SOURCE)):
             raise AssertionError(args)
         self.index_resets.append(args)
 
@@ -96,11 +96,11 @@ class RequirementRetirementTest(unittest.TestCase):
              "verify passed", "review passed"),
         )
 
-    def judgment_line(self, item, outcome="fulfilled"):
+    def judgment_line(self, item, outcome="fulfilled", paths=None):
         return "REQUIREMENT_JUDGMENTS: " + json.dumps([{
             "path": item.path, "input_token": item.token, "outcome": outcome,
             "criteria_evidence": ["feature.py and merged validation receipt"],
-            "relevant_paths": ["feature.py"],
+            "relevant_paths": paths if paths is not None else ["feature.py", "docs/PRODUCT.md", "docs/ARCHITECTURE.md"],
         }])
 
     def test_final_merge_defers_then_reuses_judgment_and_preserves_bytes(self):
@@ -150,9 +150,7 @@ class RequirementRetirementTest(unittest.TestCase):
                 self.add_plan()
                 (item,) = self.port.pending("repo", self.root, "base")
                 self.port.record("repo", self.port.validate_result(
-                    "repo", self.root, "base", self.judgment_line(item, "unfulfilled").replace(
-                        '["feature.py"]', '["feature.py", "docs/PRODUCT.md"]',
-                    ),
+                    "repo", self.root, "base", self.judgment_line(item, "unfulfilled"),
                 ))
                 self.git.files[changed_path] = contents
                 self.assertEqual(len(self.port.pending("repo", self.root, "base")), 1)
@@ -163,8 +161,8 @@ class RequirementRetirementTest(unittest.TestCase):
             self.git.files[name] = b"# Document\n## Feature\nRequired rule\n## Other\nOther rule\n"
         (item,) = self.port.pending("repo", self.root, "base")
         payload = json.loads(self.judgment_line(item).split(": ", 1)[1])
-        payload[0]["relevant_paths"] += [
-            "docs/PRODUCT.md### Feature", "docs/ARCHITECTURE.md### Feature",
+        payload[0]["relevant_paths"] = [
+            "feature.py", "docs/PRODUCT.md### Feature", "docs/ARCHITECTURE.md### Feature",
         ]
         self.port.record("repo", self.port.validate_result(
             "repo", self.root, "base", "REQUIREMENT_JUDGMENTS: " + json.dumps(payload),
@@ -182,9 +180,10 @@ class RequirementRetirementTest(unittest.TestCase):
         self.add_plan()
         self.git.files["docs/PRODUCT.md"] = b"## Feature\nRule\n"
         (item,) = self.port.pending("repo", self.root, "base")
-        line = self.judgment_line(item).replace(
-            '["feature.py"]', '["feature.py", "docs/PRODUCT.md### Feature"]',
-        )
+        line = self.judgment_line(item, paths=[
+            "feature.py", "docs/PRODUCT.md### Feature",
+            "docs/ARCHITECTURE.md#unrelated: no architecture constraint applies to this criterion",
+        ])
         self.port.record("repo", self.port.validate_result("repo", self.root, "base", line))
         self.git.files["docs/ARCHITECTURE.md"] = b"Unrelated architectural change\n"
         restarted = RequirementRetirementPort(self.connection, self.git)
@@ -192,6 +191,70 @@ class RequirementRetirementTest(unittest.TestCase):
         self.assertEqual(restarted.fulfilled_moves("repo", self.root, "advanced"), (SOURCE,))
         self.git.files["docs/PRODUCT.md"] = b"## Feature\nChanged rule\n"
         self.assertEqual(len(restarted.pending("repo", self.root, "later")), 1)
+
+    def test_fulfilled_result_rejects_omitted_specification_evidence(self):
+        self.add_plan()
+        (item,) = self.port.pending("repo", self.root, "base")
+        for paths in (["feature.py"], ["feature.py", "docs/PRODUCT.md"]):
+            with self.subTest(paths=paths), self.assertRaises(RetirementError):
+                self.port.validate_result("repo", self.root, "base", self.judgment_line(item, paths=paths))
+        self.assertIsNone(self.port.judgments.get("repo", SOURCE))
+        self.assertEqual(self.port.fulfilled_moves("repo", self.root, "base"), ())
+
+    def test_invalidated_staged_restoration_keeps_receipt_until_safe_withdrawal(self):
+        self.git.files.pop(SOURCE)
+        self.git.files[ARCHIVE] = CONTENTS
+        self.add_plan(status="PR_OPEN")
+        archived = self.root / ARCHIVE
+        archived.parent.mkdir(parents=True)
+        archived.write_bytes(CONTENTS)
+        self.port.stage_restorations("repo", self.root, "base", self.root)
+        self.connection.execute("UPDATE exec_plans SET status = 'MERGED'")
+        self.assertEqual(self.port.audit_restorations("repo", self.root, "advanced"), ())
+        self.assertEqual(self.connection.execute("SELECT stage FROM requirement_audit").fetchone()[0], "staged")
+        restarted = RequirementRetirementPort(self.connection, self.git)
+        with self.assertRaises(RetirementReassessment):
+            restarted.receipted_paths("repo", self.root, "advanced", self.root)
+        self.assertEqual(archived.read_bytes(), CONTENTS)
+        self.assertFalse((self.root / SOURCE).exists())
+        self.assertEqual(restarted.receipted_paths("repo", self.root, "advanced", self.root), ())
+        self.assertEqual(len(restarted.audit_pending("repo", self.root, "advanced")), 1)
+        self.assertEqual(self.git.index_resets, [("reset", "advanced", "--", ARCHIVE, SOURCE)])
+
+    def test_restoration_withdrawal_resumes_after_inverse_rename_interruption(self):
+        self.git.files.pop(SOURCE)
+        self.git.files[ARCHIVE] = CONTENTS
+        self.add_plan(status="PR_OPEN")
+        archived = self.root / ARCHIVE
+        archived.parent.mkdir(parents=True)
+        archived.write_bytes(CONTENTS)
+        self.port.stage_restorations("repo", self.root, "base", self.root)
+        self.connection.execute("UPDATE exec_plans SET status = 'MERGED'")
+        with mock.patch.object(self.git, "run", side_effect=RuntimeError("interrupted index reset")):
+            with self.assertRaises(RuntimeError):
+                self.port.receipted_paths("repo", self.root, "advanced", self.root)
+        self.assertEqual(archived.read_bytes(), CONTENTS)
+        self.assertEqual(self.connection.execute("SELECT stage FROM requirement_audit").fetchone()[0], "staged")
+        restarted = RequirementRetirementPort(self.connection, self.git)
+        with self.assertRaises(RetirementReassessment):
+            restarted.receipted_paths("repo", self.root, "advanced", self.root)
+        self.assertEqual(restarted.receipted_paths("repo", self.root, "advanced", self.root), ())
+        self.assertEqual(len(restarted.audit_pending("repo", self.root, "advanced")), 1)
+
+    def test_invalidated_restoration_preserves_local_edits_and_receipt(self):
+        self.git.files.pop(SOURCE)
+        self.git.files[ARCHIVE] = CONTENTS
+        self.add_plan(status="PR_OPEN")
+        archived = self.root / ARCHIVE
+        archived.parent.mkdir(parents=True)
+        archived.write_bytes(CONTENTS)
+        self.port.stage_restorations("repo", self.root, "base", self.root)
+        (self.root / SOURCE).write_bytes(b"user edit")
+        self.connection.execute("UPDATE exec_plans SET status = 'MERGED'")
+        with self.assertRaises(RetirementError):
+            self.port.receipted_paths("repo", self.root, "advanced", self.root)
+        self.assertEqual((self.root / SOURCE).read_bytes(), b"user edit")
+        self.assertEqual(self.connection.execute("SELECT stage FROM requirement_audit").fetchone()[0], "staged")
 
     def test_invalidated_move_withdrawal_preserves_unrelated_files_and_reassesses(self):
         self.add_plan()

@@ -101,7 +101,7 @@ def assessment_prompt(inputs: tuple[FinalInput, ...]) -> str:
         "relevant_paths(판단에 사용한 구현·테스트 상대 경로 배열)다. "
         "PRODUCT·ARCHITECTURE 근거는 relevant_paths에 파일#정확한 Markdown 제목 줄로 "
         "관련 절을 모두 지정하라(예: docs/PRODUCT.md### 제품 규칙). "
-        "절 지정은 해당 절과 하위 절을 포함한다. 문서 전체가 관련되면 파일 경로를 사용하고 관련 근거가 없는 문서는 생략하라. "
+        "절 지정은 해당 절과 하위 절을 포함한다. 두 명세 각각에 관련 절 또는 전체 파일 경로를 반드시 지정하라. 관련 근거가 없는 문서는 파일#unrelated: 구체적인 이유를 명시하라. 누락은 무관 판단이 아니다. "
         "근거가 부족하면 uncertain을 사용하고 criteria_evidence에 사용자가 결정해야 할 "
         "구체적인 문제와 해당 Requirement에 명시해야 할 결정을 적어라.\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
@@ -239,6 +239,9 @@ class RequirementRetirementPort:
             if not separator:
                 result[path] = entry
                 continue
+            if filename in SPECIFICATIONS and heading.startswith("unrelated: ") and heading[11:].strip():
+                result[path] = ("100644", heading)
+                continue
             if filename not in SPECIFICATIONS or not re.fullmatch(r"#{1,6} .+", heading):
                 raise RetirementError(f"명세 근거 절이 유효하지 않습니다: {path}")
             if entry is None or entry[0] == "120000":
@@ -266,6 +269,9 @@ class RequirementRetirementPort:
         if any(not _valid_evidence_path(item) for item in relevant_paths):
             raise RetirementError(f"판단 관련 경로가 유효하지 않습니다: {path}")
         relevant = self._evidence(repository, revision, relevant_paths)
+        unspecified = tuple((name, tree.get(name)) for name in SPECIFICATIONS
+                            if not any(item == name or item.startswith(name + "#")
+                                       for item in relevant_paths))
         plan_evidence = tuple(
             (
                 str(row["plan_id"]), str(row["path"]), str(row["sources"]),
@@ -275,7 +281,7 @@ class RequirementRetirementPort:
                 _digest((str(row["verify_result"] or ""), str(row["review_result"] or ""))),
             ) for row in related
         )
-        return _digest(("explicit-specification-evidence-v2", path, oid, plan_evidence,
+        return _digest(("explicit-specification-evidence-v3", path, oid, unspecified, plan_evidence,
                         tuple(sorted((item, relevant.get(item)) for item in relevant_paths))))
 
     def pending(self, repo: str, repository: Path, revision: str) -> tuple[FinalInput, ...]:
@@ -367,6 +373,11 @@ class RequirementRetirementPort:
                 or (value["outcome"] != "uncertain" and not paths)):
                 raise RetirementError(f"Requirement 기준별 근거가 불완전합니다: {path}")
             relevant_paths = tuple(sorted(set(paths)))
+            if value["outcome"] != "uncertain" and any(
+                not any(entry == name or entry.startswith(name + "#") for entry in relevant_paths)
+                for name in SPECIFICATIONS
+            ):
+                raise RetirementError(f"Requirement 판단에 명세별 근거 또는 명시적 무관 판단이 필요합니다: {path}")
             current = next(
                 (entry for entry in self._inputs(repo, repository, revision) if entry[0] == path),
                 None,
@@ -442,6 +453,10 @@ class RequirementRetirementPort:
             if previous is not None and previous["input_token"] == token:
                 if previous["outcome"] == "restore" and previous["stage"] != "published":
                     restorations.append(source)
+                continue
+            if previous is not None and previous["stage"] == "staged":
+                # Preserve the inverse-move receipt until the owned worktree is
+                # reconciled. A read-only eligibility refresh cannot erase it.
                 continue
             if mode not in {"100644", "100755"} or source in tree:
                 outcome, reason = "uncertain", "historical archive mode or active-path collision"
@@ -710,9 +725,10 @@ class RequirementRetirementPort:
         return tuple(paths)
 
     def _withdraw_move(self, repo: str, repository: Path, revision: str,
-                       worktree: Path, row) -> None:
-        source = str(row["source_path"])
-        destination = "docs/requirements/archive/" + source.removeprefix("docs/requirements/")
+                       worktree: Path, row, *, restoring: bool = False) -> None:
+        active = str(row["source_path"])
+        archived = "docs/requirements/archive/" + active.removeprefix("docs/requirements/")
+        source, destination = (archived, active) if restoring else (active, archived)
         _safe_parent(worktree, source)
         _safe_parent(worktree, destination)
         remote = _tree(self.git, repository, revision, source, destination)
@@ -736,7 +752,13 @@ class RequirementRetirementPort:
         self.git.run(worktree, "reset", revision, "--", source, destination)
         # An interrupted inverse rename is recognized above before retiring its
         # pending receipt. Unrelated worktree files and judgment history survive.
-        self.judgments.invalidate(repo, source, "staged retirement withdrawn after related input change")
+        self.judgments.invalidate(repo, active, "staged Requirement move withdrawn after related input change")
+        if restoring:
+            self.connection.execute(
+                "UPDATE requirement_audit SET stage = 'observed', updated_at=CURRENT_TIMESTAMP "
+                "WHERE repo = ? AND source_path = ? AND stage = 'staged'", (repo, active),
+            )
+            return
         self.connection.execute(
             "DELETE FROM requirement_move_receipts WHERE repo = ? AND source_path = ? AND stage = 'pending'",
             (repo, source),
@@ -778,7 +800,10 @@ class RequirementRetirementPort:
         ):
             source = str(row["source_path"])
             if source not in valid_restorations:
-                raise RetirementError(f"Requirement 복원 입력이 변경됐습니다: {source}")
+                self._withdraw_move(repo, repository, revision, worktree, row, restoring=True)
+                raise RetirementReassessment(
+                    f"Requirement 복원을 철회했습니다. 최신 계획·근거로 감사를 재평가하세요: {source}"
+                )
             archived = "docs/requirements/archive/" + source.removeprefix("docs/requirements/")
             origin, target = worktree / archived, worktree / source
             _safe_parent(worktree, archived)
