@@ -199,20 +199,21 @@ class ScopeValidationTests(TestCase):
     def test_independent_changes_require_full_invocation_proof(self):
         connection = runtime_connection()
         self.addCleanup(connection.close)
+        worktree = Path('/managed').resolve()
         bound = snapshot(scope_id='scope', scope_start_digest='a' * 64)
-        connection.execute("UPDATE projects SET phase='WORKING', worktree='/managed', branch=?, "
+        connection.execute("UPDATE projects SET phase='WORKING', worktree=?, branch=?, "
                            "agent_role='worker', agent_snapshot=?, worker_session_id='session'",
-                           (bound.branch, bound.serialize()))
+                           (str(worktree), bound.branch, bound.serialize()))
         effects = replace(self.effects, _git_common_directory=lambda _: Path('/common'),
             git=lambda *_: subprocess.CompletedProcess([], 0, 'origin'),
             validate_managed_worktree=mock.Mock(), _rebase_in_progress_for_branch=lambda *_: False)
         with mock.patch.object(agent_invocation_state.InvocationRepository, 'verified_scope', return_value=False):
             self.assertIsNone(scope_validation._agent_git_resources(
-                connection, Path('repo'), Path('/managed'), bound, 'worker', effects=effects))
+                connection, Path('repo'), worktree, bound, 'worker', effects=effects))
         with mock.patch.object(agent_invocation_state.InvocationRepository, 'verified_scope', return_value=True):
             resources = scope_validation._agent_git_resources(
-                connection, Path('repo'), Path('/managed'), bound, 'worker', effects=effects)
-        self.assertEqual(resources.worktrees, frozenset(('/managed',)))
+                connection, Path('repo'), worktree, bound, 'worker', effects=effects)
+        self.assertEqual(resources.worktrees, frozenset((str(worktree),)))
         changed = replace(bound, refs={'refs/heads/unrelated': ('new', '')})
         self.validate('worker', bound, changed, resources=resources)
         with self.assertRaises(AgentScopeError):
@@ -352,7 +353,7 @@ class PersistedScopeServiceTests(TestCase):
         recover.assert_not_called()
 
     def test_dirty_blocked_baseline_and_security_flags_are_not_absorbed(self):
-        before = snapshot(worktrees={'/managed': ('HEAD=head', 'branch=refs/heads/loop-manager/G-047')})
+        before = snapshot(worktrees={str(Path('/managed').resolve()): ('HEAD=head', 'branch=refs/heads/loop-manager/G-047')})
         result = replace(before, dirty={'src/app.py': (('unstaged',), 'agent')})
         accepted = scope_recovery._blocked_agent_local_baseline(before, result, result, Path('/managed'))
         self.assertEqual(accepted.dirty, result.dirty)

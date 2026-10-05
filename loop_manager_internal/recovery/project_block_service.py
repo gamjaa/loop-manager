@@ -30,6 +30,7 @@ import sqlite3
 @dataclass(frozen=True)
 class ReconcileGuidanceDoubleBlockEffects:
     """Named effects for _reconcile_guidance_double_block; no entry-point/module access."""
+    _agent_git_resources: Callable[..., object]
     _canonical_path: Callable[..., object]
     _guidance_checkpoint_commit_evidence: Callable[..., object]
     _guidance_document: Callable[..., object]
@@ -138,6 +139,9 @@ def _reconcile_guidance_double_block(
         )
         remote_ref = f"refs/remotes/origin/{branch}"
         own_ref = f"refs/heads/{branch}"
+        resources = effects._agent_git_resources(
+            connection, repo_path, worktree, before, 'worker', selected_plan_path=str(plan['path']))
+        before, current = agent_scope_decision.scoped_metadata(before, current, resources)
         if (
             not before.shared_metadata_complete or not current.shared_metadata_complete
             or before.head != oid or current.head != oid
