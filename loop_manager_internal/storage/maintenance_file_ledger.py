@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
@@ -367,7 +368,9 @@ class FileReviewRepository:
             seen.add(result.path)
         if seen != set(expected):
             raise FileReviewLedgerError("선정된 파일의 검토가 누락됐습니다.")
-        return PreparedAssessment(selected, placements, remote_revision, legacy)
+        # Keep the first validated decision independent of caller-owned root
+        # dictionaries, including their nested reference evidence.
+        return PreparedAssessment(selected, deepcopy(placements), remote_revision, legacy)
 
     def record_success(
         self, repo: str, repository_path: str, base_branch: str,

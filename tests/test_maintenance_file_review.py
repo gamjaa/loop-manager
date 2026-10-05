@@ -530,6 +530,43 @@ class ProvisionalFileReviewTest(unittest.TestCase):
         self.ledger.record_success(str(self.repo), str(self.repo), "main", inventory, reviewed, root_reviews=roots)
         self.assertEqual(self.ledger.last_success(str(self.repo)).source_revision, inventory.revision)
 
+    def test_ledger_rejects_changed_root_evidence_after_preparation(self):
+        inventory = self.publish({"src/a.py": "def calculate(): return 1\n"})
+        source = inventory.sources[0]
+        reviewed = (maintenance_file_ledger.ReviewedSource(
+            source.path, source.content_hash, source.mode, source.revision,
+            "Reviewed implementation and related test responsibilities.",
+        ),)
+        roots = root_results_for(self.repo, inventory)
+        original_reason = roots[0]["reason"]
+        original_excerpt = roots[0]["references"][0]["excerpt"]
+        prepare = self.ledger._prepare_evidence
+        changed = False
+
+        def change_roots_after_preparation(*args, **kwargs):
+            nonlocal changed
+            result = prepare(*args, **kwargs)
+            if not changed:
+                roots[0]["reason"] = "The tracked tree remains present, but ownership is still uncertain."
+                roots[0]["references"][0]["excerpt"] = original_excerpt[2:]
+                self.assertEqual(result.placements[0]["reason"], original_reason)
+                self.assertEqual(result.placements[0]["references"][0]["excerpt"], original_excerpt)
+                changed = True
+            return result
+
+        with mock.patch.object(self.ledger, "_prepare_evidence", side_effect=change_roots_after_preparation):
+            with self.assertRaisesRegex(maintenance_file_ledger.FileReviewLedgerError, "게시 직전"):
+                self.ledger.record_success(str(self.repo), str(self.repo), "main", inventory, reviewed,
+                                           root_reviews=roots)
+        self.assertIsNone(self.ledger.last_success(str(self.repo)))
+        self.assertEqual(self.ledger.reviews(str(self.repo)), ())
+        self.assertEqual(self.ledger.root_placements(str(self.repo)), ())
+
+        roots[0]["reason"] = original_reason
+        roots[0]["references"][0]["excerpt"] = original_excerpt
+        self.ledger.record_success(str(self.repo), str(self.repo), "main", inventory, reviewed, root_reviews=roots)
+        self.assertEqual(self.ledger.last_success(str(self.repo)).source_revision, inventory.revision)
+
 
 class ReviewReceiptUnitTest(unittest.TestCase):
     def test_validated_results_survive_restart_without_source_reread(self):
