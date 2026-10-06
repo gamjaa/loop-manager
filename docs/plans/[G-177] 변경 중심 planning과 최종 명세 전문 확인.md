@@ -10,7 +10,7 @@ depends_on:
   - G-176
 complexity: high
 risk: high
-priority: high
+priority: critical
 ---
 
 ## Purpose
