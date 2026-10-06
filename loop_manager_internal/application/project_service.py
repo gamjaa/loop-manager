@@ -152,6 +152,8 @@ class ProjectService:
         if self.identity.recovery_request_id is None:
             steps.append(self._synchronize_pull_requests)
             steps.append(self._resume_manual_work)
+        else:
+            steps.append(self._recheck_local_plan_blocks)
         steps.extend((self._resume_existing_execution, self._run_coordinators))
         for step in steps:
             result = step()
@@ -438,9 +440,9 @@ class ProjectService:
         if self.state.row is not None and execplan_catalog_state.DefinitionStateRepository(
             self.identity.connection
         ).has_publication_intent(self.state.repo):
-            if self.identity.recovery_request_id:
+            if self.identity.recovery_request_id and self.identity.recovery_plan_id is not None:
                 self.effects.operation_print(
-                    "진행 중인 planning 게시 복구가 있어 로컬 재검사를 중단했습니다.",
+                    "계획별 재검사에서는 planning 게시 복구를 실행하지 않습니다.",
                     file=sys.stderr,
                 )
                 return 1
@@ -453,6 +455,7 @@ class ProjectService:
                 refactoring_review_interval=self.identity.refactoring_review_interval,
                 self_repository=self.identity.registered_only and self.effects.is_loop_manager_repository(self.state.repo_path),
                 refresh_catalog=self._refresh_catalog,
+                local_environment_recheck=bool(self.identity.recovery_request_id),
             )
             self.state.recovered_planning_outcome = PlanningLifecycleCoordinator(self.effects._PlanningLifecyclePorts(
                 self.identity.connection, runtime_state.RuntimeStateRepository(self.identity.connection),
@@ -598,6 +601,10 @@ class ProjectService:
                 )
                 self.effects.operation_print(message, file=sys.stderr)
                 return 1
+        return self._recheck_local_plan_blocks()
+
+    def _recheck_local_plan_blocks(self) -> int | None:
+        """Use the same block policy without synchronizing unrelated PRs."""
         self.effects.resume_plan_blocks(
             self.identity.connection, self.state.repo_path, self.identity.state_dir, self.state.repo, self.state.base, self.identity.config_path,
             self.identity.verify_timeout_seconds,
@@ -782,12 +789,17 @@ class ProjectService:
                         f"선택한 계획에 실행할 로컬 복구 단계가 없습니다: {target['status']}",
                     )
                     return 0
-            elif active is None:
+            elif active is None and not (
+                self.state.row["planning_error"]
+                or runtime_state.planning_owns_execution_slot(self.state.row)
+                or self.state.recovered_planning_outcome is not None
+            ):
                 self.effects.operation_print(
                     "실행 중인 로컬 복구 단계가 없습니다. 프로젝트 환경과 저장된 차단 원인을 확인했습니다."
                 )
                 return 0
-            return self._dispatch_execution(runtime_repository, newly_activated=False)
+            if active is not None or self.identity.recovery_plan_id is not None:
+                return self._dispatch_execution(runtime_repository, newly_activated=False)
         planning_context = PlanningContext(
             repo=self.state.repo,
             repo_path=self.state.repo_path,
@@ -800,6 +812,7 @@ class ProjectService:
             refactoring_review_interval=self.identity.refactoring_review_interval,
             self_repository=self.identity.registered_only and self.effects.is_loop_manager_repository(self.state.repo_path),
             refresh_catalog=self._refresh_catalog,
+            local_environment_recheck=bool(self.identity.recovery_request_id),
         )
         self.effects._check_runtime_handoff()
         if self.state.recovered_planning_outcome is not None:
@@ -840,6 +853,8 @@ class ProjectService:
         if planning_step_result is not None:
             return planning_step_result
         self.state.base_sha = planning_outcome.base_sha or self.state.base_sha
+        if self.identity.recovery_request_id:
+            return 0
         newly_activated = planning_outcome.newly_activated
         return self._dispatch_execution(
             runtime_repository, newly_activated=newly_activated,

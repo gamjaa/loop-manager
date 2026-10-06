@@ -283,7 +283,8 @@ def _run_project_result(
                 )
             schedule = effects.catalog_schedule_decision(connection, repo)
             if (
-                step_result not in {
+                recovery_request_id is None
+                and step_result not in {
                     PROJECT_STEP_TRANSIENT_PAUSE,
                     PROJECT_STEP_USAGE_PAUSE,
                     PROJECT_STEP_PLANNING_PENDING,
@@ -298,6 +299,8 @@ def _run_project_result(
                 ).fetchone()
                 if project_after is not None and not runtime_state.planning_owns_execution_slot(project_after):
                     step_result = PROJECT_STEP_RETRY
+        if recovery_request_id is not None and step_result == PROJECT_STEP_RETRY:
+            step_result = PROJECT_STEP_TRANSIENT_PAUSE
         if step_result != PROJECT_STEP_RETRY:
             break
 

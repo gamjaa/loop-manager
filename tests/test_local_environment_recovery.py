@@ -6,6 +6,7 @@ import unittest
 from unittest import mock
 
 import loop_manager
+from loop_manager_internal.application.contracts import ProjectRunKind, ProjectRunResult
 from loop_manager_internal.application.commands import recover_local_environment
 from loop_manager_internal.application.project_runner import (
     InternalRunProjectResultEffects,
@@ -53,7 +54,7 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
                     repo_arg="repo", recovery_request_id=request_id))
                 calls = []
                 methods = ("_prepare_repository", "_reconcile_catalog_and_cleanup",
-                           "_synchronize_pull_requests", "_resume_manual_work",
+                           "_synchronize_pull_requests", "_resume_manual_work", "_recheck_local_plan_blocks",
                            "_resume_existing_execution", "_run_coordinators")
                 from contextlib import ExitStack
                 with ExitStack() as stack:
@@ -63,10 +64,121 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
                             return 0 if name == "_run_coordinators" else None
                         stack.enter_context(mock.patch.object(service, method, side_effect=step))
                     self.assertEqual(service.run().code, 0)
-                expected = list(methods) if request_id is None else [
+                expected = [method for method in methods if method != "_recheck_local_plan_blocks"] if request_id is None else [
                     method for method in methods
                     if method not in {"_synchronize_pull_requests", "_resume_manual_work"}]
                 self.assertEqual(calls, expected)
+
+    def test_paused_zero_exit_is_not_recorded_as_resolved(self):
+        self.config_path.write_text("[loop]\n", encoding="utf-8")
+        for kind in (ProjectRunKind.TRANSIENT_PAUSE, ProjectRunKind.USAGE_LIMIT_PAUSE):
+            with self.subTest(kind=kind):
+                effects = self.effects(mock.Mock(return_value=ProjectRunResult(kind, 0, "paused")))
+                self.assertEqual(recover_local_environment(
+                    effects, self.arguments, self.state_dir, self.config_path), 1)
+                with closing(loop_manager.connect_database(self.state_dir)) as connection:
+                    row = connection.execute(
+                        "SELECT result FROM local_environment_recovery_requests ORDER BY rowid DESC LIMIT 1"
+                    ).fetchone()
+                self.assertEqual(row[0], "unresolved")
+
+    def test_pending_recovery_record_prevents_success_without_a_block(self):
+        self.config_path.write_text("[loop]\n", encoding="utf-8")
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryReason
+        def run(connection, *_args, **_kwargs):
+            loop_manager._record_project_recovery(
+                connection, str(self.repository.resolve()), RecoveryReason.GIT_LOCK, "Git lock")
+            return ProjectRunResult(ProjectRunKind.COMPLETED, 0)
+        self.assertEqual(recover_local_environment(
+            self.effects(run), self.arguments, self.state_dir, self.config_path), 1)
+
+    def test_recovery_run_reaches_timeout_recheck_without_pr_sync(self):
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        identity = ProjectIdentity(
+            connection=connection, state_dir=Path("/state"), repo_arg="repo",
+            config_path=Path("/config.ini"), requested_base=None,
+            allow_agents_mismatch=False, requested_provider="codex",
+            registered_only=True, planner_mutex=None, refactoring_review_interval=20,
+            verify_timeout_seconds=600, runtime_mutation=None,
+            recovery_request_id="request", recovery_plan_id="G-047")
+        effects = SimpleNamespace(resume_plan_blocks=mock.Mock())
+        service = ProjectService(effects, identity)
+        service.state.repo = "repo"
+        service.state.repo_path = Path("/repo")
+        service.state.base = "main"
+        with mock.patch.object(service, "_prepare_repository", return_value=None), \
+             mock.patch.object(service, "_reconcile_catalog_and_cleanup", return_value=None), \
+             mock.patch.object(service, "_synchronize_pull_requests") as pr_sync, \
+             mock.patch.object(service, "_resume_existing_execution", return_value=None), \
+             mock.patch.object(service, "_run_coordinators", return_value=0):
+            self.assertEqual(service.run().code, 0)
+        pr_sync.assert_not_called()
+        self.assertEqual(effects.resume_plan_blocks.call_args.kwargs,
+                         {"plan_id": "G-047", "force_timeout_recheck": True})
+
+    def test_recovery_does_not_loop_for_independent_ready_work(self):
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        effects = InternalRunProjectResultEffects(
+            _checkpoint_dispatch_ready=mock.Mock(return_value=True),
+            _record_project_recovery=mock.Mock(),
+            _run_project_step=mock.Mock(side_effect=[0, AssertionError("repeated recovery")]),
+            _stable_work_reason=mock.Mock(return_value=None),
+            catalog_schedule_decision=mock.Mock(return_value=SimpleNamespace(
+                active=None, runnable_ready=object(), project_blocked=False)),
+            dispatch_blocked_checkpoints=mock.Mock(),
+            is_loop_manager_repository=mock.Mock(return_value=False),
+            operation_log=mock.Mock())
+        with mock.patch(
+            "loop_manager_internal.application.project_runner.blocked_checkpoint_state.BlockedCheckpointRepository"
+        ) as checkpoints:
+            checkpoints.return_value.pending.return_value = ()
+            _run_project_result(effects, connection, Path("/state"), "repo",
+                                Path("/config.ini"), None, False,
+                                recovery_request_id="request")
+        effects._run_project_step.assert_called_once()
+
+    def test_project_recovery_command_rechecks_saved_planning_without_selecting_ready(self):
+        self.config_path.write_text("[loop]\n", encoding="utf-8")
+        repo = str(self.repository.resolve())
+        with closing(loop_manager.connect_database(self.state_dir)) as connection, connection:
+            connection.execute("UPDATE projects SET planning_error = 'saved authentication failure' WHERE repo = ?", (repo,))
+        from loop_manager_internal.planning.planning_runtime import PlanningOutcome, PlanningOutcomeKind
+        def run(connection, state_dir, repository, config_path, *_args, **kwargs):
+            effects = SimpleNamespace(
+                _recorded_base_fetch=mock.Mock(), _check_runtime_handoff=mock.Mock(),
+                _PlanningLifecyclePorts=mock.Mock(),
+                is_loop_manager_repository=mock.Mock(return_value=False),
+                _planning_outcome_step_result=mock.Mock(return_value=None))
+            identity = ProjectIdentity(
+                connection=connection, state_dir=state_dir, repo_arg=repository,
+                config_path=config_path, requested_base=None, allow_agents_mismatch=False,
+                requested_provider="codex", registered_only=True, planner_mutex=None,
+                refactoring_review_interval=20, verify_timeout_seconds=600,
+                runtime_mutation=None, recovery_request_id=kwargs["recovery_request_id"])
+            service = ProjectService(effects, identity)
+            service.state.repo = repository
+            service.state.repo_path = Path(repository)
+            service.state.base = "main"
+            service.state.row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
+            def planning(context):
+                self.assertTrue(context.local_environment_recheck)
+                connection.execute("UPDATE projects SET planning_error = NULL WHERE repo = ?", (repo,))
+                return PlanningOutcome(PlanningOutcomeKind.NO_CHANGE)
+            with mock.patch.object(service, "_prepare_repository", return_value=None), \
+                 mock.patch.object(service, "_reconcile_catalog_and_cleanup", return_value=None), \
+                 mock.patch.object(service, "_recheck_local_plan_blocks", return_value=None), \
+                 mock.patch.object(service, "_resume_existing_execution", return_value=None), \
+                 mock.patch.object(service, "_refresh_catalog", return_value="base"), \
+                 mock.patch.object(service, "_dispatch_execution", side_effect=AssertionError("new work")), \
+                 mock.patch("loop_manager_internal.application.project_service.PlanningLifecycleCoordinator") as coordinator:
+                coordinator.return_value.run.side_effect = planning
+                result = service.run()
+                coordinator.return_value.run.assert_called_once()
+            return ProjectRunResult(ProjectRunKind.COMPLETED, result.code)
+        self.assertEqual(recover_local_environment(self.effects(run), self.arguments,
+                                                   self.state_dir, self.config_path), 0)
 
     def test_parser_accepts_plan_scoped_recovery(self):
         args = loop_manager.build_parser().parse_args([
@@ -77,7 +189,7 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
         self.assertEqual(args.plan, "G-169")
 
     def test_missing_config_keeps_one_pending_request_for_same_scope_resume(self):
-        run_result = mock.Mock(return_value=SimpleNamespace(exit_code=0, detail=None))
+        run_result = mock.Mock(return_value=ProjectRunResult(ProjectRunKind.COMPLETED, 0))
         effects = self.effects(run_result)
         with self.assertRaisesRegex(
             loop_manager.ManagedConfigError, "같은 `recover` 명령을 다시 실행",
@@ -159,7 +271,7 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
         args = loop_manager.build_parser().parse_args([
             "recover", str(self.repository), "--plan", "G-047",
         ])
-        run = mock.Mock(return_value=SimpleNamespace(exit_code=0, detail=None))
+        run = mock.Mock(return_value=ProjectRunResult(ProjectRunKind.COMPLETED, 0))
         effects = self.effects(run)
 
         self.assertEqual(

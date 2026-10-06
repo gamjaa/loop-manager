@@ -899,6 +899,93 @@ class PlanningRecoveryTest(PlanningCase):
             "planning workspace 소유권 검증 실패: workspace belongs to another task",
         )
 
+    def test_local_recheck_retries_same_failed_planning_input_once(self):
+        ports = FakePorts(planning_snapshot(
+            planning_error="saved tool failure",
+            planning_error_fingerprint="fingerprint",
+        ))
+        ports.state.activate_ready = mock.Mock(side_effect=AssertionError("new Worker"))
+        outcome = PlanningLifecycleCoordinator(ports).run(
+            replace(self.context, local_environment_recheck=True))
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.NO_CHANGE)
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertIsNone(ports.state.snapshot.planning_error)
+        ports.state.activate_ready.assert_not_called()
+
+    def test_local_recheck_validates_owned_result_before_releasing_error(self):
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/saved/planning",
+            planning_workspace_owned=1, planner_session_id="saved-session",
+            planning_attempt_fingerprint="fingerprint",
+            planning_error="saved validation failure", planning_error_origin="validation",
+            planning_error_fingerprint="fingerprint", planning_retry_count=3,
+            planning_validation_error="saved diagnostic",
+        ))
+        ports.state.activate_ready = mock.Mock(side_effect=AssertionError("new Worker"))
+        outcome = PlanningLifecycleCoordinator(ports).run(
+            replace(self.context, local_environment_recheck=True))
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.NO_CHANGE)
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertEqual(ports.agent.resumed_session, "saved-session")
+        self.assertIsNone(ports.state.snapshot.planning_error)
+        self.assertTrue(any(row.planning_retry_count == 3 for row in ports.state.diagnostics))
+        ports.state.activate_ready.assert_not_called()
+
+    def test_local_recheck_exhausted_planner_preserves_failure_history(self):
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/saved/planning",
+            planning_workspace_owned=1, planner_session_id="saved-session",
+            planning_attempt_fingerprint="fingerprint",
+            planning_error="saved tool failure", planning_error_fingerprint="fingerprint",
+            planning_validation_error="saved diagnostic", planning_retry_count=3,
+        ))
+        ports.agent.result = PlanningAgentResult(
+            1, "tool still unavailable", "saved-session", PlanningAgentResultKind.TRANSIENT_FAILURE)
+        outcome = PlanningLifecycleCoordinator(ports).run(
+            replace(self.context, local_environment_recheck=True))
+        self.assertTrue(outcome.error)
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertEqual(ports.agent.resumed_session, "saved-session")
+        self.assertEqual(ports.state.snapshot.planning_retry_count, 3)
+        self.assertEqual(ports.state.snapshot.planning_error, "saved tool failure")
+
+    def test_local_recheck_restores_preserved_planner_and_keeps_failed_validation(self):
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/saved/planning",
+            planning_workspace_owned=1, planner_session_id="saved-session",
+            planning_attempt_fingerprint="fingerprint",
+            planning_error="saved validation failure", planning_error_origin="validation",
+            planning_error_fingerprint="fingerprint", planning_retry_count=3,
+            planning_validation_error="saved diagnostic",
+        ))
+        ports.state.suspend_planning(ports.state.snapshot)
+        ports.validation.general_error = "validation still fails"
+        ports.state.activate_ready = mock.Mock(side_effect=AssertionError("new Worker"))
+        outcome = PlanningLifecycleCoordinator(ports).run(
+            replace(self.context, local_environment_recheck=True))
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertEqual(ports.agent.resumed_session, "saved-session")
+        self.assertIsNotNone(ports.state.snapshot.planning_error)
+        self.assertGreaterEqual(ports.state.snapshot.planning_retry_count, 3)
+        self.assertEqual(ports.state.snapshot.worktree, "/saved/planning")
+        ports.state.activate_ready.assert_not_called()
+
+    def test_local_recheck_recovers_saved_publication_without_new_planner(self):
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/saved/planning",
+            planning_workspace_owned=1, planner_session_id="saved-session",
+            planning_attempt_fingerprint="fingerprint", planning_error="publication failed",
+            planning_error_fingerprint="fingerprint"))
+        ports.state.general_intent = SimpleNamespace(base_sha="base", commit_sha="candidate")
+        ports.state.general_recovery_result = "applied"
+        ports.state.activate_ready = mock.Mock(side_effect=AssertionError("new Worker"))
+        outcome = PlanningLifecycleCoordinator(ports).run(
+            replace(self.context, local_environment_recheck=True))
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.PUBLICATION_RECOVERY)
+        self.assertEqual(ports.agent.run_count, 0)
+        ports.state.activate_ready.assert_not_called()
+
     def test_changed_failed_input_without_workspace_starts_new_planning(self):
         ports = FakePorts(planning_snapshot(
             planning_error="saved failure",

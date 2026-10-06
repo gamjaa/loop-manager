@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from contextlib import closing
+from loop_manager_internal.application.contracts import ProjectRunKind
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.agents.agent_invocation import InvocationContext
 from loop_manager_internal.config.managed_config import ManagedConfigError
@@ -216,6 +217,9 @@ def _local_recovery_causes_remain(after: dict, plan_id: str | None) -> bool:
         if item["scope"] == "project"
         or plan_id is None or item["plan_id"] == plan_id
     ]
+    if any(item["pending_action"] in {"retry", "pause", "correct", "final_block"}
+           for item in after["recoveries"]):
+        return True
     if relevant_blocks:
         return True
     return False
@@ -283,9 +287,10 @@ def recover_local_environment(
         after = local_recovery_state.snapshot(connection, repository, plan_id)
         unresolved = _local_recovery_causes_remain(after, plan_id)
         in_progress = _local_recovery_in_progress(after, plan_id)
-        result_code = 1 if outcome.exit_code or unresolved or in_progress else 0
+        paused = outcome.kind not in {ProjectRunKind.COMPLETED, ProjectRunKind.WAITING}
+        result_code = 1 if outcome.exit_code or paused or unresolved or in_progress else 0
         result = "resolved" if result_code == 0 else (
-            "in_progress" if in_progress and not unresolved and not outcome.exit_code
+            "in_progress" if in_progress and not unresolved and not outcome.exit_code and not paused
             else "unresolved"
         )
         if result == "in_progress":

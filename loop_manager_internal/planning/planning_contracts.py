@@ -129,6 +129,7 @@ class PlanningContext:
     refactoring_review_interval: int
     self_repository: bool = False
     refresh_catalog: Callable[[str], str] | None = None
+    local_environment_recheck: bool = False
 
 
 @dataclass(frozen=True)

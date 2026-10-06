@@ -77,6 +77,7 @@ class PlanningAssessmentService(PlanningService):
             and not (
                 row.planning_validation_error
                 and row.planning_retry_count >= MAX_PLANNER_VALIDATION_RETRIES
+                and not context.local_environment_recheck
             )
         )
         file_review_enabled = (
