@@ -91,22 +91,21 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
     head_value = pull_request.get("headRefOid")
     head_oid = str(head_value) if head_value else project["pr_head_oid"]
     state = str(pull_request.get("state") or "OPEN").upper()
-    unvalidated_checkpoint = False
+    unvalidated_candidate = False
     if (state == "OPEN" and project["pr_url"]
             and project["phase"] in {"WORKING", "VERIFYING", "REVIEWING", "PUBLISHING"}):
+        # Remote adoption invalidates final approval for ordinary checkpoints
+        # too, even when no rebase operation or publication intent exists.
+        unvalidated_candidate = not project["publication_token"]
         plan_id = effects._plan_id_from_path(str(project["plan_path"] or ""))
         if plan_id is not None:
             checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id)
-            intent = checkpoint.rebase_publication_intent()
-            result = (checkpoint.snapshot or {}).get("rebase_publication_result") or {}
-            unvalidated_checkpoint = bool(checkpoint.operation in {"rebase", "rebase_publish"}
-                or not project["publication_token"] and intent is not None and checkpoint.operation is None
-                and result.get("intent_id") == intent["id"]
-                and result.get("head") == intent["head"] == project["pr_head_oid"])
-        if unvalidated_checkpoint and not checkpoint_pr_matches(
+            unvalidated_candidate = (unvalidated_candidate
+                or checkpoint.operation in {"rebase", "rebase_publish"})
+        if unvalidated_candidate and not checkpoint_pr_matches(
                 pull_request, url=project["pr_url"], branch=branch, head=project["pr_head_oid"],
                 base=project["base_branch"]):
-            raise PublicationSafetyError("미검증 checkpoint의 기존 PR identity 또는 head가 변경됐습니다.")
+            raise PublicationSafetyError("미검증 후보의 기존 PR identity 또는 head가 변경됐습니다.")
     blocked_plan = effects.project_execplan(connection, repo)
     if blocked_plan is not None and blocked_plan["status"] != "PLAN_BLOCKED":
         blocked_plan = None
@@ -416,8 +415,8 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
             )
             effects.operation_print(detail, file=sys.stderr)
             return PROJECT_STEP_RETRY
-        if unvalidated_checkpoint:
-            # A confirmed intermediate push is still a candidate awaiting
+        if unvalidated_candidate:
+            # A checkpoint or adopted user push is still a candidate awaiting
             # Worker, verify and Review; only final publication can open it.
             return None
         if reopening_closed_pr:

@@ -225,6 +225,133 @@ class PlanRecoveryGateTests(PlanRemoteRecoveryFixture, unittest.TestCase):
 
 
 class ExistingPrPlanRecoveryTests(PlanRemoteRecoveryFixture, unittest.TestCase):
+    def _resume_general_pr_candidate(self):
+        original = self.published_successor()
+        successor = self.row()['branch_oid']
+        self.connection.execute(
+            "UPDATE exec_plans SET pr_url = 'saved-pr', pr_head_oid = ?, publication_remote_oid = ?, "
+            "worker_input_token = 'old-worker', verify_token = 'old-verify', review_token = 'old-review', "
+            "publication_token = 'old-publication' WHERE plan_id = 'G-106'",
+            (original.head, original.head))
+        self.connection.execute("UPDATE blocked_checkpoints SET pr_url = 'saved-pr' WHERE plan_id = 'G-106'")
+        self.connection.commit()
+        loop_manager._ensure_execplans_schema(self.connection)
+        self.pull_request = {'url': 'saved-pr', 'state': 'OPEN',
+            'headRefName': self.plan()['branch'], 'headRefOid': successor, 'baseRefName': 'main'}
+        self.ports.pr_for_branch.side_effect = lambda *_: dict(self.pull_request)
+        self.ports._evaluate_remote_checkpoint_cause.return_value = (True, 'user fix resolves cause', 'verify')
+        patch = mock.patch.object(loop_manager, 'pr_for_branch', side_effect=self.ports.pr_for_branch)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'resumed', self.plan()['last_error'])
+        self.ports._journaled_direct_rebase.assert_not_called()
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(self.repo, 'G-106')
+        self.assertIsNone(checkpoint.operation)
+        self.assertIsNone(checkpoint.rebase_publication_intent())
+        self.assertNotIn('current_rebase_acceptance', checkpoint.snapshot)
+        self.assertEqual(self.plan()['pr_head_oid'], successor)
+        self.assertEqual(self.plan()['publication_remote_oid'], successor)
+        self.assertEqual(self.plan()['pr_conflict_recovery'], 0)
+        receipt = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection).get(self.repo, 'G-106')
+        self.assertEqual(receipt.remote_oid, original.head)
+        self.assertEqual(self.connection.execute(
+            "SELECT accepted_remote_oid FROM blocked_checkpoints WHERE plan_id = 'G-106'"
+        ).fetchone()[0], successor)
+        return receipt
+
+    def _enter_general_pr_candidate(self):
+        from loop_manager_internal.application.project_service import ProjectService
+        from loop_manager_internal.execution.execution_runtime import (
+            ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind, ExecutionPhase, ExecutionPlanMetadata)
+        from loop_manager_internal.planning.planning_runtime import PlanningOutcome, PlanningOutcomeKind
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        execution = mock.Mock(spec=['prepare', 'recover', 'guard', 'run', 'verify', 'review', 'publish'])
+        def context():
+            plan = runtime.projected(self.repo)
+            return ExecutionContext(repo=self.repo, repo_path=Path('/repo'), state_dir=Path('/state'),
+                base_branch='main', base_sha=self.base, provider='codex', config_path=Path('/config'),
+                plan=ExecutionPlanMetadata(plan.plan_id, self.plan()['title'], plan.path, plan.plan_sha),
+                phase=ExecutionPhase(plan.status), branch=plan.branch, worktree=Path(plan.worktree),
+                active_sha=plan.active_sha, validated_base_sha=plan.validated_base_sha,
+                worker_session_id=plan.worker_session_id, pr_url=plan.pr_url,
+                worker_input_token=plan.worker_input_token, verify_token=plan.verify_token,
+                review_token=plan.review_token, publication_token=plan.publication_token)
+        execution.prepare.side_effect = context
+        execution.recover.side_effect = execution.guard.side_effect = lambda current: current
+        for stage in ('run', 'verify', 'review', 'publish'):
+            getattr(execution, stage).return_value = ExecutionOutcome(ExecutionOutcomeKind.SUCCESS)
+        def prepare(service):
+            self.connection.execute('UPDATE projects SET planning_attempt_fingerprint = NULL')
+            service.state.repo, service.state.repo_path, service.state.base = self.repo, Path('/repo'), 'main'
+            service.state.row = self.connection.execute('SELECT * FROM projects WHERE repo = ?', (self.repo,)).fetchone()
+            service.state.recovered_planning_outcome = PlanningOutcome(PlanningOutcomeKind.EXECUTION_READY)
+        # Repository/catalog effects and Agent processes are fake unit ports;
+        # project PR recovery and execution phase dispatch remain production code.
+        with (mock.patch.object(ProjectService, '_prepare_repository', prepare),
+              mock.patch.object(ProjectService, '_reconcile_catalog_and_cleanup', return_value=None),
+              mock.patch.object(ProjectService, '_synchronize_pull_requests', return_value=None),
+              mock.patch.object(ProjectService, '_refresh_catalog', return_value=self.base),
+              mock.patch.object(loop_manager, '_recorded_base_fetch', return_value=self.base),
+              mock.patch.object(loop_manager, '_check_runtime_handoff'),
+              mock.patch.object(loop_manager, '_ExecutionLifecyclePorts', return_value=execution),
+              mock.patch.object(loop_manager, 'make_worktree'),
+              mock.patch.object(loop_manager, 'operation_print')):
+            result = loop_manager._run_project_step(self.connection, Path('/state'), self.repo,
+                Path('/config'), None, False)
+        return result, execution
+
+    def test_user_push_without_base_rebase_reenters_worker_before_merge_wait(self):
+        receipt = self._resume_general_pr_candidate()
+        other = dict(self.plan('G-107'))
+        for _ in range(2):
+            result, execution = self._enter_general_pr_candidate()
+            self.assertEqual(result, 0)
+            execution.run.assert_called_once()
+            context = execution.run.call_args.args[0]
+            self.assertEqual(context.phase.value, 'IMPLEMENTING')
+            self.assertEqual(context.worker_session_id, 'session')
+            for token in ('worker_input_token', 'verify_token', 'review_token', 'publication_token'):
+                self.assertIsNone(getattr(context, token))
+            execution.verify.assert_not_called()
+            execution.review.assert_not_called()
+            execution.publish.assert_not_called()
+            self.assertEqual(self.plan()['status'], 'IMPLEMENTING')
+            self.assertEqual(self.plan()['pr_url'], 'saved-pr')
+            self.assertEqual(blocked_checkpoint_state.BlockedCheckpointRepository(self.connection).get(self.repo, 'G-106'), receipt)
+            self.assertEqual(dict(self.plan('G-107')), other)
+
+    def test_general_checkpoint_preserves_each_validation_stage_until_final_approval(self):
+        self._resume_general_pr_candidate()
+        for phase, stage in (('VERIFYING', 'verify'), ('REVIEWING', 'review'), ('PUBLISHING', 'publish')):
+            with self.subTest(phase=phase):
+                loop_manager.update_project(self.connection, self.repo, phase=phase)
+                result, execution = self._enter_general_pr_candidate()
+                self.assertEqual(result, 0)
+                getattr(execution, stage).assert_called_once()
+                self.assertEqual(self.plan()['status'], phase)
+                self.assertIsNone(self.plan()['publication_token'])
+
+    def test_general_checkpoint_pr_head_change_blocks_before_worker(self):
+        receipt = self._resume_general_pr_candidate()
+        self.pull_request['headRefOid'] = 'unexpected-head'
+        result, execution = self._enter_general_pr_candidate()
+        self.assertEqual(result, 1)
+        execution.prepare.assert_not_called()
+        self.assertEqual(scoped_blocking.project_block(self.connection, self.repo)['reason_code'],
+                         BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value)
+        self.assertEqual(self.plan()['pr_head_oid'], self.head)
+        self.assertEqual(blocked_checkpoint_state.BlockedCheckpointRepository(self.connection).get(self.repo, 'G-106'), receipt)
+
+    def test_general_checkpoint_with_final_publication_approval_enters_merge_wait(self):
+        self._resume_general_pr_candidate()
+        loop_manager.update_project(self.connection, self.repo,
+            phase='PUBLISHING', publication_token='current-final-approval')
+        result, execution = self._enter_general_pr_candidate()
+        self.assertEqual(result, 0)
+        execution.prepare.assert_not_called()
+        self.assertEqual(self.plan()['status'], 'PR_OPEN')
+        self.assertEqual(self.plan()['pr_url'], 'saved-pr')
+
     def test_user_push_rebase_publication_and_cause_recheck_resume_same_pr_recovery(self):
         from loop_manager_internal.git import managed_rebase_adoption, managed_rebase_validation
         from tests.support.rebase_observations import expectation, observation, scope_for
