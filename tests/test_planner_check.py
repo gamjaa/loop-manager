@@ -16,7 +16,7 @@ from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot
 from tests.support.planning_case import PlanningCase
 
 
-class PlannerCheckContractTest(unittest.TestCase):
+class PlannerCheckPolicyTest(unittest.TestCase):
     def test_database_schema_registers_check_ledger(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
@@ -71,21 +71,21 @@ class PlannerCheckContractTest(unittest.TestCase):
         self.assertEqual(tuple(old), ("result", "decision", "check-session"))
         self.assertEqual(planner_check_state.get(connection, "repo")["stage"], "pending")
 
-    def test_profiles_are_independent_and_only_absent_values_inherit(self):
+    def test_profiles_are_independent_and_missing_check_is_rejected(self):
         catalog = {"model-a": frozenset({"high"}), "model-b": frozenset({"low"})}
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.ini"
             for provider in ("codex", "claude"):
-                for value, expected in ((None, ("model-a", "high")), ("fast,low", ("model-b", "low"))):
+                for value, expected in (("strong,high", ("model-a", "high")), ("fast,low", ("model-b", "low"))):
                     path.write_text(f"[{provider}.models]\nstrong=model-a\nfast=model-b\n"
                                     f"[{provider}.roles]\nplanner=strong,high\nreviewer=strong,high\n"
                                     + (f"planner_check={value}\n" if value is not None else ""), encoding="utf-8")
                     self.assertEqual(agent_profiles.provider_profile(path, provider, f"{provider}.roles",
                                      "planner_check", "check", catalog), expected)
-                for value in ("", "missing,low", "fast,high", "fast,unsupported", "strong"):
+                for value in (None, "", "missing,low", "fast,high", "fast,unsupported", "strong"):
                     path.write_text(f"[{provider}.models]\nstrong=model-a\nfast=model-b\n"
                                     f"[{provider}.roles]\nplanner=strong,high\nreviewer=strong,high\n"
-                                    f"planner_check={value}\n", encoding="utf-8")
+                                    + (f"planner_check={value}\n" if value is not None else ""), encoding="utf-8")
                     with self.subTest(provider=provider, value=value), self.assertRaises(RuntimeError):
                         agent_profiles.validate_provider_profiles(path, provider, catalog)
 

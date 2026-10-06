@@ -86,7 +86,7 @@ class StateFoundationTests(AutomationCatalogFixture, unittest.TestCase):
                          'docs/plans/[G-001] Plan G-001.md')
 
     def test_worker_level_keeps_metadata_error_and_upper_bound(self):
-        self.assertEqual(catalog.worker_level({'complexity': 'high', 'risk': 'critical'}), 7)
+        self.assertEqual(catalog.worker_level({'complexity': 'high', 'risk': 'critical'}), 6)
         for metadata in ({}, {'complexity': [], 'risk': 'low'}, {'complexity': 'other', 'risk': 'low'}):
             with self.subTest(metadata=metadata), self.assertRaisesRegex(ValueError, '검증된 ExecPlan'):
                 catalog.worker_level(metadata)

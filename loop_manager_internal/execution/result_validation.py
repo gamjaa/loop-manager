@@ -142,7 +142,6 @@ def ensure_worker_level_state(
         raise RuntimeError("저장된 Worker level 상태가 완전하지 않습니다.")
     if (
         type(initial) is not int
-        or initial != calculated_initial
         or not 1 <= initial <= 7
         or type(effective) is not int
         or not initial <= effective <= 8
@@ -154,6 +153,15 @@ def ensure_worker_level_state(
     if any(not 1 <= int(level) <= effective for level in review_history):
         raise RuntimeError("저장된 Review 승격 이력이 Worker level과 일치하지 않습니다.")
 
+    if initial != calculated_initial:
+        # Recalibrate only the declaration cache; running profiles and audit
+        # records belong to the execution and survive policy changes.
+        with connection:
+            runtime_state.RuntimeStateRepository(connection).update_plan(
+                repo, str(catalog_plan["plan_id"]),
+                plan_values={"initial_worker_level": calculated_initial},
+                enqueue=False,
+            )
     return effective
 
 

@@ -438,10 +438,9 @@ def _decode_list(value: object, field: str, plan_id: str) -> tuple[str, ...]:
 
 
 def _worker_level(complexity: str, risk: str) -> int:
-    return min(
+    return (
         {"low": 1, "medium": 3, "high": 5}[complexity]
-        + {"low": 0, "medium": 1, "high": 2, "critical": 3}[risk],
-        7,
+        + {"low": 0, "medium": 0, "high": 0, "critical": 1}[risk]
     )
 
 
@@ -809,7 +808,7 @@ class DefinitionStateRepository:
                     initial_level = _worker_level(entry.complexity, entry.risk)
                     old_initial = row["initial_worker_level"]
                     old_effective = row["effective_worker_level"]
-                    if self._has_execution_history(row):
+                    if self._has_execution_history(row) or row["workspace_owned"]:
                         effective_level = max(
                             initial_level,
                             int(old_effective or old_initial or initial_level),

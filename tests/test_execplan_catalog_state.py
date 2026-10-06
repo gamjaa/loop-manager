@@ -658,7 +658,7 @@ class CatalogReconciliationTest(CatalogReconciliationFixture, unittest.TestCase)
         self.assertEqual(row["current_complexity"], "high")
         self.assertEqual(row["current_risk"], "critical")
         self.assertEqual(row["current_revision_sha"], "b" * 40)
-        self.assertEqual(row["initial_worker_level"], 7)
+        self.assertEqual(row["initial_worker_level"], 6)
         self.assertEqual(row["effective_worker_level"], 8)
         self.assertEqual(row["status"], "IMPLEMENTING")
         self.assertEqual(row["retry_count"], 4)
@@ -700,6 +700,61 @@ class CatalogReconciliationTest(CatalogReconciliationFixture, unittest.TestCase)
         )
         repeated = self._service(pinned).reconcile("/repo")
         self.assertEqual(repeated.changed_plan_ids, ())
+
+    def test_formula_transition_preserves_block_until_normal_requeue(self):
+        self.connection.execute(
+            "UPDATE exec_plans SET status = 'BLOCKED', initial_worker_level = 7, "
+            "effective_worker_level = 8, current_complexity = 'high', "
+            "current_risk = 'high', review_level_history = '{\"7\":{\"issue\":2}}', "
+            "verify_failure_history = '{\"verify\":1}', "
+            "review_failure_history = '{\"review\":1}' WHERE plan_id = 'G-001'"
+        )
+        self.connection.commit()
+        before = dict(self.connection.execute(
+            "SELECT * FROM exec_plans WHERE plan_id = 'G-001'"
+        ).fetchone())
+        pinned = active_snapshot("c" * 40, {
+            "docs/plans/[G-001] Old.md": self._text(
+                "G-001", "Old", complexity="high", risk="high"),
+            "docs/plans/[G-002] Dependency.md": self._text("G-002", "Dependency"),
+        })
+        self._service(pinned).reconcile("/repo")
+        after = dict(self.connection.execute(
+            "SELECT * FROM exec_plans WHERE plan_id = 'G-001'"
+        ).fetchone())
+        self.assertEqual(after["initial_worker_level"], 5)
+        for field in ("status", "effective_worker_level", "worker_session_id",
+                      "reviewer_session_id", "branch", "worktree", "pr_url",
+                      "retry_count", "review_level_history", "verify_failure_history",
+                      "review_failure_history"):
+            self.assertEqual(after[field], before[field], field)
+        self.assertEqual(self._service(pinned).reconcile("/repo").changed_plan_ids, ())
+        loop_manager._requeue_blocked_execplan(self.connection, "/repo", "G-001")
+        reset = self.connection.execute(
+            "SELECT * FROM exec_plans WHERE plan_id = 'G-001'"
+        ).fetchone()
+        self.assertEqual((reset["initial_worker_level"], reset["effective_worker_level"]), (5, 5))
+        for field in ("review_level_history", "verify_failure_history", "review_failure_history"):
+            self.assertEqual(reset[field], "{}")
+
+    def test_resume_recalibrates_legacy_initial_cache_without_runtime_loss(self):
+        self.connection.execute(
+            "UPDATE exec_plans SET ever_started = 1, initial_worker_level = 7, "
+            "effective_worker_level = 8, review_level_history = '{\"7\":{\"issue\":2}}' "
+            "WHERE plan_id = 'G-001'"
+        )
+        self.connection.commit()
+        before = dict(self.connection.execute(
+            "SELECT * FROM exec_plans WHERE plan_id = 'G-001'"
+        ).fetchone())
+        self.assertEqual(loop_manager.ensure_worker_level_state(
+            self.connection, "/repo", {"complexity": "high", "risk": "high"}), 8)
+        after = dict(self.connection.execute(
+            "SELECT * FROM exec_plans WHERE plan_id = 'G-001'"
+        ).fetchone())
+        self.assertEqual(after["initial_worker_level"], 5)
+        for field in before.keys() - {"initial_worker_level", "updated_at"}:
+            self.assertEqual(after[field], before[field], field)
 
     def test_ready_plan_uses_recomputed_level_but_started_plan_never_deescalates(self):
         self.connection.execute(
@@ -955,7 +1010,7 @@ class CatalogReconciliationTest(CatalogReconciliationFixture, unittest.TestCase)
         ).fetchall()
         self.assertEqual([tuple(row) for row in rows], [
             ("G-001", "IMPLEMENTING", 1), ("G-002", "MERGED", 1),
-            ("G-003", "READY", 1), ("G-004", "READY", 7),
+            ("G-003", "READY", 1), ("G-004", "READY", 6),
         ])
         self.assertEqual(self._service(pinned).reconcile("/repo").changed_plan_ids, ())
 
