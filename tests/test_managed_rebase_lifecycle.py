@@ -4,6 +4,7 @@ Git, journal, stage validation, correction turns, checkpoint recovery and phase
 handlers are real. Agent CLI and catalog services use deterministic fixtures.
 """
 from tests.support.execution import execution_fixture
+from tests.support.pr_recovery import observe_live_pull_request
 from tests.support.recovery_boundary import RecoveryBoundary
 
 from contextlib import nullcontext
@@ -75,7 +76,8 @@ class RebaseObservationFailureTests(unittest.TestCase):
                 service.assert_not_called()
 
     def test_pr_lookup_failure_retries_saved_rebase_intent(self):
-        intent = {'remote_before': 'old', 'head': 'new'}
+        intent = {'remote_before': 'old', 'head': 'new',
+                  'acceptance': {'remote': {'pull_request': None}}}
         current = SimpleNamespace(
             operation='rebase_publish', snapshot={'rebase_publication_intent': intent},
             rebase_publication_intent=lambda: intent,
@@ -330,7 +332,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 current_rebase_service=lambda context, **options: lm._current_rebase_service(
                     connection, repo, state_dir, repo_key, 'G-047', worktree, branch, **options)))
             pr_patch = mock.patch.object(lm, 'pr_for_branch', side_effect=lambda *_a, **_k:
-                                        effects.publication.pr_for_branch.return_value)
+                                        effects.publication.pr_for_branch(*_a, **_k))
             pr_patch.start()
             self.addCleanup(pr_patch.stop)
             effects.workspace.git.side_effect = git
@@ -350,6 +352,9 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 {'state': 'OPEN', 'headRefOid': original, 'url': 'https://example.test/pr/47',
                  'headRefName': branch, 'baseRefName': 'main'}
                 if with_pr else None)
+            if with_pr:
+                saved_pr = effects.publication.pr_for_branch.return_value
+                effects.publication.pr_for_branch.side_effect = lambda *_a, **_k: observe_live_pull_request(repo, saved_pr)
             events = []
             resolutions = []
 
@@ -662,13 +667,11 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                         state_dir, str(repo.resolve()), 'plan:G-047',
                         agent_session_id='worker-session', git=git)
                     self.assertEqual(transitions, [], 'manual/current acceptance is not Manager replay evidence')
-                    if not with_pr:
-                        self.assertEqual(journal.live_remote_branch_oid(git, repo, branch), final_head)
-                        self.assertEqual(effects.state.row()['publication_remote_oid'], final_head)
-                        self.assertIn('checkpoint-push', events)
-                    else:
-                        self.assertEqual(journal.live_remote_branch_oid(git, repo, branch), original)
-                        self.assertNotIn('checkpoint-push', events)
+                    self.assertEqual(journal.live_remote_branch_oid(git, repo, branch), final_head)
+                    self.assertEqual(effects.state.row()['publication_remote_oid'], final_head)
+                    self.assertIn('checkpoint-push', events)
+                    if with_pr:
+                        self.assertEqual(effects.state.row()['pr_head_oid'], final_head)
                     self.assertEqual(recovered.phase, ExecutionPhase.IMPLEMENTING)
                     self.assertIsNone(effects.state.row()['worker_result'])
                     self.assertIsNone(effects.state.row()['verify_result'])

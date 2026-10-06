@@ -130,6 +130,15 @@ class CheckpointSafetyAdapter:
                 None,
                 (),
             )
+        if request.reason_code == BlockReasonCode.PULL_REQUEST_CLOSED.value:
+            return blocked_checkpoint.SafetyVerdict(
+                False,
+                blocked_checkpoint.SafetyScope.PLAN,
+                "pull_request_closed",
+                "닫힌 PR은 다시 열릴 때까지 게시하지 않고 기존 PLAN_BLOCKED를 보존합니다.",
+                None,
+                (),
+            )
         if not request.branch or not request.worktree:
             return blocked_checkpoint.SafetyVerdict(
                 False,

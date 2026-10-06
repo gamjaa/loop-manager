@@ -12,6 +12,19 @@ from tests.support.git import (
 from tests.support.worker import worker_result
 
 
+def observe_live_pull_request(repo: Path, pull_request):
+    """Keep GitHub head observations aligned with successful local-remote pushes."""
+    if pull_request is None:
+        return None
+    ref = f"refs/heads/{pull_request['headRefName']}"
+    result = git_command(repo, 'ls-remote', 'origin', ref)
+    entries = [line.split() for line in result.splitlines()]
+    heads = [entry[0] for entry in entries if len(entry) == 2 and entry[1] == ref]
+    if len(heads) != 1:
+        raise AssertionError('PR fixture branch must have exactly one live remote head')
+    return {**pull_request, 'headRefOid': heads[0]}
+
+
 class PrRecoveryFixture:
     """Shared scenario setup; inheriting this fixture collects no tests."""
 

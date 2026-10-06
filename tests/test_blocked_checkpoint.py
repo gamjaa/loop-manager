@@ -387,6 +387,23 @@ class ExistingPrCheckpointPublicationTests(unittest.TestCase):
         self.assertEqual(self.dispatcher.dispatch('repo'), 0)
         self.assertEqual(len(self.pushes), 1)
 
+    def test_closed_pr_without_agent_scope_stays_plan_blocked_without_observations(self):
+        from loop_manager_internal.storage import runtime_state
+        runtime_state.RuntimeStateRepository(self.connection).block_plan(
+            'repo', 'G-047', reason_code='pull_request_closed',
+            evidence='PR closed', release_fingerprint='closed', clear_projection=True)
+        del self.adapter.assess
+        self.dispatcher.dispatch('repo')
+        plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual(plan['status'], 'PLAN_BLOCKED')
+        self.assertEqual(plan['blocked_reason'], 'pull_request_closed')
+        self.assertEqual(plan['pr_head_oid'], self.old)
+        self.assertIsNone(self.connection.execute('SELECT * FROM project_blocks').fetchone())
+        self.adapter.safety_effects.pr_for_branch.assert_not_called()
+        self.adapter.safety_effects.capture_git_snapshot.assert_not_called()
+        self.assertEqual(self.pushes, [])
+        self.assertEqual(self.store.get('repo', 'G-047').phase.value, 'unpublished')
+
     def test_push_success_tracking_ref_failure_retries_without_another_push(self):
         self.tracking_failure = True
         decision = blocked_checkpoint.PushDecision(blocked_checkpoint.PushMode.FAST_FORWARD)

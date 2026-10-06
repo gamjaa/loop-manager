@@ -198,7 +198,8 @@ class ExecutionStatePort:
 
         Pure parsers and log sinks need no state guard. Policy helpers which own
         persistence are checked before invocation and their resulting snapshot
-        becomes the next expected observation. Agent callbacks use update_project
+        becomes the next expected observation even if a later effect fails.
+        Agent callbacks use update_project
         above, so an intervening phase/projection change is rejected on return.
         """
         external = name in {
@@ -211,10 +212,14 @@ class ExecutionStatePort:
                 self.check()
             if connected:
                 args = (self.connection, *args)
-            result = function(*args, **kwargs)
-            if mutates:
-                self.expected = self.repository.projected(self.repo)
-            elif external:
+            try:
+                result = function(*args, **kwargs)
+            finally:
+                if mutates:
+                    # A helper may adopt the rebase before checkpoint publication
+                    # fails. Recovery must observe that durable state on retry.
+                    self.expected = self.repository.projected(self.repo)
+            if external and not mutates:
                 self.check()
             return result
 

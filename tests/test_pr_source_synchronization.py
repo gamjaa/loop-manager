@@ -1,4 +1,4 @@
-from tests.support.pr_recovery import PrRecoveryFixture
+from tests.support.pr_recovery import PrRecoveryFixture, observe_live_pull_request
 import sqlite3
 import subprocess
 import tempfile
@@ -447,7 +447,8 @@ class PrSourceSynchronizationTest(PrRecoveryFixture, unittest.TestCase):
             ), mock.patch(
                 "loop_manager.ensure_safe_base_worktree"
             ) as synchronize, mock.patch(
-                "loop_manager.pr_for_branch", return_value=pull_request
+                "loop_manager.pr_for_branch", side_effect=lambda *_a, **_k:
+                    observe_live_pull_request(repo, pull_request)
             ), mock.patch(
                 "loop_manager.verify", return_value=(True, "verify: PASS")
             ), mock.patch(

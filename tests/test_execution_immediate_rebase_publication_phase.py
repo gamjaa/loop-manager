@@ -90,6 +90,42 @@ class ImmediateRebasePublicationTests(TestCase):
             stack.enter_context(patch)
         return stack
 
+    def test_bound_direct_rebase_retry_keeps_adoption_and_same_publication_intent(self):
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+        self._existing_pr()
+        self.push_failure = True
+        complete = self.state.bind(lm._complete_direct_rebase_checkpoint, connected=True, mutates=True)
+        arguments = ('repo', 'G-047', Path('/state/G-047').resolve())
+        options = dict(target_base_oid=self.seed.expected.target_base_oid,
+                       repo_path=Path('/repo'), branch='loop-manager/G-047',
+                       agent_session_id=self.state.row()['worker_session_id'])
+        def service(*_args, **options):
+            current = self.seed.factory(None, **options)
+            return replace(current, expected=replace(current.expected,
+                remote=replace(current.expected.remote, pull_request=replace(
+                    self.seed.expected.remote.pull_request, head=current.expected.remote.oid))))
+        with self.direct_ports(), mock.patch.object(lm, '_current_rebase_service',
+                side_effect=service), \
+                mock.patch.object(lm, 'pr_for_branch',
+                    side_effect=self.handler.effects.publication.pr_for_branch):
+            with self.assertRaises(RecoveryFailure) as caught:
+                complete(*arguments, **options)
+            self.assertIs(caught.exception.reason, RecoveryReason.PUBLICATION_RETRY)
+            pending = self.checkpoints.get('repo', 'G-047')
+            self.assertEqual(pending.operation, 'rebase_publish')
+            self.assertEqual(self.state.check().status, 'IMPLEMENTING')
+            self.assertEqual(self.state.row()['publication_remote_oid'], 'remote')
+            self.assertIsNone(self.state.row()['verify_result'])
+            self.push_failure = False
+            complete(*arguments, **options)
+        self.assertEqual(self.state.row()['publication_remote_oid'], 'owned-head')
+        self.assertEqual(self.state.row()['pr_head_oid'], 'owned-head')
+        self.assertIsNone(self.state.row()['review_token'])
+        self.assertEqual(self.checkpoints.get('repo', 'G-047').snapshot['rebase_publication_intent'],
+                         pending.snapshot['rebase_publication_intent'])
+        self.assertEqual(len(self.pushes), 2)
+        self.assertEqual(self.pushes[0], self.pushes[1])
+
     def _existing_pr(self):
         from loop_manager_internal.git.managed_rebase_validation import PullRequest
         pr = PullRequest('https://example.test/pr/47', 'repo', 'loop-manager/G-047', 'remote', 'OPEN')

@@ -108,7 +108,7 @@ class ExternalOwnershipObservationTests(TestCase):
             ports=SimpleNamespace(owned_remote_oid=owner, git=mock.Mock()),
         )
         plan = {'plan_id': 'G-001', 'branch': 'branch', 'worktree': str(Path('/worktree')),
-                'publication_remote_oid': 'head'}
+                'publication_remote_oid': 'head', 'pr_url': None, 'pr_head_oid': None}
         with self.assertRaises(RecoveryFailure) as caught:
             project_blocked_recovery.ProjectBlockedReconciler._lineage_known(
                 reconciler, plan, {})

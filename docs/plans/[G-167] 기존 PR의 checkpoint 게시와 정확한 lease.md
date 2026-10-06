@@ -33,6 +33,8 @@ PR이 존재한다는 이유로 checkpoint를 거부하는 현재 경로를 실�
 - Manager 전체 verify는 실제 원격 lease 거부·중복 push 방지, PR identity 보존과 최종 후보 검증 무효화를 검증한다.
 
 - Worker targeted unit 검증: `python3 -m unittest tests.test_blocked_checkpoint.ExistingPrCheckpointPublicationTests tests.test_blocked_checkpoint_state.BlockedCheckpointRepositoryTest tests.test_execution_immediate_rebase_publication_phase.ImmediateRebasePublicationTests tests.test_execution_checkpoint_state.RebasePublicationRepositoryTests` — 50개 PASS. 외부 Git·PR 효과를 대체한 unit 경계에서 lease 경쟁, PR 종료·identity 변경, 후보 승인 무효화, 독립 차단 보존 및 저장 중단 후 재사용을 검증했다. `BlockedCheckpointPolicyTest`도 별도 targeted 실행에서 통과했다.
+- verify 피드백에 따른 targeted unit 검증: `python3 -m unittest tests.test_blocked_checkpoint.ExistingPrCheckpointPublicationTests tests.test_execution_immediate_rebase_publication_phase.ImmediateRebasePublicationTests tests.test_managed_rebase_lifecycle.RebaseObservationFailureTests tests.test_execution_publication_phase.ExternalOwnershipObservationTests.test_project_checkpoint_lineage_retries_failed_owner_observation tests.test_pr_conflict_corrections.LivePullRequestObservationTests` — 최종 41개 PASS. 새 재시도 fixture의 필수 인자 누락과 외부 상태 port 참조를 수정한 뒤 동일 명령으로 재검증했다. 닫힌 PR 차단 보존, rebase adoption 후 게시 실패·재시도와 live PR head 관측을 외부 효과를 대체한 unit 경계에서 검사했다. 실제 Git 복구 시나리오의 fixture도 live head·순차 lease에 맞췄으며 실행은 Manager 전체 verify에 맡긴다.
+- 결과 보고 검증: 위 41개 unit test를 동일 명령으로 재확인했다. 초기 fixture 실행의 ERROR·FAIL 결과를 `FAILED_COMMAND:` 뒤에 명시하고 동일 명령의 `RERUN:` 뒤에 최종 PASS를 둔 실제 보고 문구를 기존 `parse_worker_result`에 전달하는 단일 unit test도 통과했다. 결과 파서·공통 지침은 변경하지 않는다.
 
 ## Progress
 
@@ -47,3 +49,4 @@ PR이 존재한다는 이유로 checkpoint를 거부하는 현재 경로를 실�
 - R-060의 명시된 기존 PR checkpoint 확장을 적용했다. PR URL은 checkpoint 요청과 rebase intent에 보존하고, Open 상태·branch·live head를 게시 전후 및 SQLite 확정 경계에서 대조한다. 정상 후속 push와 검증된 rebase lease를 구분하며 기존 차단·session·작업 공간을 보존한다.
 - 기존 PR의 후보가 바뀌면 PR head와 lease를 함께 전진시키고 후보 승인 토큰을 무효화한다. commit/push 뒤 중단된 요청은 저장된 commit identity·tree·lease를 유지해 중복 commit·push를 피한다. 최종 verify·Review를 마친 후보가 이미 같은 PR checkpoint에 있으면 최신 PR·원격·후보 검증을 거쳐 push 없이 재사용한다.
 - 새 루트 항목·Requirement·ARCHITECTURE·AGENTS·PLANS 변경은 없다. `scripts/verify.sh`는 기존 verification runner로 전체 검증을 수행하고 실패 코드를 전달하므로 그대로 유지한다. 전체 검증·Review·Merge는 Manager와 사용자의 후속 경계다.
+- 닫힌 PR로 이미 차단된 요청은 historical agent scope 없이도 PLAN_BLOCKED를 보존하고 PR 재개 경계에 맡긴다. rebase adoption과 게시 효과를 연결한 mutating helper는 게시 실패 시에도 저장된 snapshot을 호출자에 반영하여 같은 intent·lease의 재시도를 가리지 않는다. 정상 복구 fixture는 저장된 최초 head를 수정하지 않고 실제 원격 head를 조회하므로, 두 checkpoint의 순차 lease와 최종 중복 push 생략을 검사한다.
