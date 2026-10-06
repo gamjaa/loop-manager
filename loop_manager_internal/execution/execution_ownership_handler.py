@@ -216,7 +216,7 @@ class OwnershipHandler:
                                          checkpoint, pull_request, *, rebase_observation=None):
         original = str(checkpoint['accepted_remote_oid'] or '')
         recorded = str(row['publication_remote_oid'] or original)
-        if not original or row['pr_url']:
+        if not original:
             return False
         intermediate = (current.snapshot or {}).get('rebase_publication_intent') or {}
         pending_intermediate = (current.operation == 'rebase_publish'
@@ -237,8 +237,10 @@ class OwnershipHandler:
                 or pending_intermediate
                 or (remote_oid == recorded and (current.snapshot or {}).get('last_adopted_remote_oid') == recorded)):
             return False
-        if pull_request is not None and (current.operation != 'pr_create'
-                                        or pull_request.get('headRefOid') != remote_oid):
+        if pull_request is not None and (
+                pull_request.get('headRefOid') != remote_oid
+                or (row['pr_url'] and pull_request.get('url') != row['pr_url'])
+                or (not row['pr_url'] and current.operation != 'pr_create')):
             return False
         try:
             if checkpoint_ownership.owned_remote_oid(

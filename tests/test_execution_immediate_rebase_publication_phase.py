@@ -56,8 +56,10 @@ class ImmediateRebasePublicationTests(TestCase):
             if self.push_failure:
                 return SimpleNamespace(returncode=1, stdout='permission denied')
             self.remote = 'owned-head'
+            pr = self.seed.expected.remote.pull_request
             self.seed.observed = replace(self.seed.observed,
-                                         remote=replace(self.seed.expected.remote, oid=self.remote))
+                remote=replace(self.seed.expected.remote, oid=self.remote,
+                               pull_request=replace(pr, head=self.remote) if pr else None))
             return SimpleNamespace(returncode=0, stdout='pushed')
         return self.fixture.observed_git(path, *args, **kwargs)
 
@@ -87,6 +89,84 @@ class ImmediateRebasePublicationTests(TestCase):
         ):
             stack.enter_context(patch)
         return stack
+
+    def _existing_pr(self):
+        from loop_manager_internal.git.managed_rebase_validation import PullRequest
+        pr = PullRequest('https://example.test/pr/47', 'repo', 'loop-manager/G-047', 'remote', 'OPEN')
+        self.seed.expected = replace(self.seed.expected,
+            remote=replace(self.seed.expected.remote, pull_request=pr))
+        self.seed.observed = replace(self.seed.observed, remote=self.seed.expected.remote)
+        self.state.update_project('repo', pr_url=pr.identity, pr_head_oid='remote',
+            verify_token='old-verify', review_token='old-review', publication_token='old-publication')
+        factory = self.handler.effects.workspace.current_rebase_service
+        def current_pr_service(context, **options):
+            service = factory(context, **options)
+            return replace(service, expected=replace(service.expected,
+                remote=replace(service.expected.remote,
+                    pull_request=replace(pr, head=service.expected.remote.oid))))
+        self.handler.effects = replace(self.handler.effects, workspace=replace(
+            self.handler.effects.workspace, current_rebase_service=current_pr_service))
+        self.pr_changes = {}
+        self.handler.effects.publication.pr_for_branch.side_effect = lambda *_: {
+            'url': pr.identity, 'state': 'OPEN', 'headRefName': pr.branch,
+            'headRefOid': self.remote, 'baseRefName': 'main', **self.pr_changes}
+
+    def test_existing_pr_checkpoint_uses_exact_lease_and_invalidates_approval(self):
+        self._existing_pr()
+        self.complete()
+        saved = self.checkpoints.get('repo', 'G-047')
+        self.assertEqual(saved.snapshot['rebase_publication_intent']['acceptance']['remote']['pull_request']['identity'],
+                         'https://example.test/pr/47')
+        self.assertEqual(self.state.row()['pr_head_oid'], 'owned-head')
+        project = self.fixture.connection.execute("SELECT * FROM projects WHERE repo='repo'").fetchone()
+        self.assertEqual(project['pr_head_oid'], 'owned-head')
+        self.assertIsNone(project['verify_token'])
+        self.assertIsNone(project['review_token'])
+        for field in ('verify_token', 'review_token', 'publication_token', 'validated_base_sha',
+                      'worker_result', 'verify_result', 'review_result'):
+            self.assertIsNone(self.state.row()[field])
+        self.assertEqual(self.pushes, [('push', '--force-with-lease=refs/heads/loop-manager/G-047:remote',
+                                       'origin', 'owned-head:refs/heads/loop-manager/G-047')])
+        self.handler._publish_rebased_checkpoint(self.handler._context())
+        self.assertEqual(len(self.pushes), 1)
+
+    def test_existing_pr_push_before_sqlite_confirmation_resumes_without_duplicate_push(self):
+        self._existing_pr()
+        class Exit(BaseException):
+            pass
+        with mock.patch.object(self.state, 'complete_rebase_publication', side_effect=Exit()):
+            with self.assertRaises(Exit):
+                self.complete()
+        pending = self.checkpoints.get('repo', 'G-047')
+        self.assertEqual(pending.operation, 'rebase_publish')
+        self.assertEqual(self.state.row()['pr_head_oid'], 'remote')
+        self.restart()
+        self.handler._publish_rebased_checkpoint(self.handler._context())
+        self.assertEqual(len(self.pushes), 1)
+        self.assertEqual(self.state.row()['pr_head_oid'], 'owned-head')
+        self.assertEqual(self.checkpoints.get('repo', 'G-047').snapshot['rebase_publication_intent'],
+                         pending.snapshot['rebase_publication_intent'])
+
+    def test_existing_pr_close_merge_identity_and_head_changes_preserve_the_lease(self):
+        for changes in ({'state': 'CLOSED'}, {'state': 'MERGED'}, {'url': 'other-pr'},
+                        {'headRefName': 'other-branch'}, {'headRefOid': 'user-head'}):
+            with self.subTest(changes=changes):
+                self._reset_publication_case()
+                self._existing_pr()
+                class Exit(BaseException):
+                    pass
+                self.before_push = lambda: (_ for _ in ()).throw(Exit())
+                with self.assertRaises(Exit):
+                    self.complete()
+                pending = self.checkpoints.get('repo', 'G-047')
+                attempts = len(self.pushes)
+                self.before_push = None
+                self.pr_changes = changes
+                with self.assertRaises(RuntimeError):
+                    self.handler._publish_rebased_checkpoint(self.handler._context())
+                self.assertEqual(len(self.pushes), attempts)
+                self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+                self.assertEqual(self.remote, 'remote')
 
     def test_pending_publication_passes_persisted_agent_scope_before_handler_recovery(self):
         class Exit(BaseException):
@@ -427,13 +507,13 @@ class ImmediateRebasePublicationTests(TestCase):
                         with self.assertRaises(RuntimeError):
                             self.complete()
                     elif excluded == 'existing-pr':
-                        # Existing PR rebase still uses the ordinary path; there
-                        # is no intermediate publication entry for its branch.
+                        # An unbound PR cannot inherit a no-PR acceptance.
                         saved = self.checkpoints.get('repo', 'G-047')
                         from tests.support.rebase_observations import decision_for
                         accepted = decision_for(self.seed.expected, self.seed.observed).acceptance
                         self.checkpoints.accept_current_rebase('repo', 'G-047', acceptance=accepted)
-                        self.handler._publish_rebased_checkpoint(self.handler._context())
+                        with self.assertRaises(RuntimeError):
+                            self.handler._publish_rebased_checkpoint(self.handler._context())
                     else:
                         self.complete()
                 self.assertEqual(self.pushes, [])

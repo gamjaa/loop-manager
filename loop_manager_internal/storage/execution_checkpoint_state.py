@@ -74,7 +74,7 @@ class CheckpointRecord:
         if (intent['kind'] != 'intermediate_rebase_publication' or intent['version'] != 1
                 or type(intent['generation']) is not int or intent['generation'] < 0
                 or not valid_acceptance(accepted)
-                or not intent['remote_before'] or accepted['remote']['pull_request'] is not None
+                or not intent['remote_before']
                 or accepted['remote']['oid'] != intent['remote_before']
                 or any(accepted[key] != intent[key] for key in (
                     'repo', 'plan_id', 'repository_identity', 'branch', 'worktree',
@@ -207,8 +207,7 @@ class ExecutionCheckpointRepository:
                 or acceptance['plan_id'] != plan_id
                 or current.expected_head != acceptance['head']
                 or current.target_base_oid != acceptance['target_base_oid']
-                or acceptance['remote']['oid'] != remote_before or not remote_before
-                or acceptance['remote']['pull_request'] is not None):
+                or acceptance['remote']['oid'] != remote_before or not remote_before):
             raise CheckpointRace('intermediate rebase publication acceptance changed')
         intent = {key: acceptance[key] for key in (
             'repo', 'plan_id', 'repository_identity', 'branch', 'worktree',
@@ -240,7 +239,8 @@ class ExecutionCheckpointRepository:
                     'target_base_oid', 'head'))
                 or intent['repo'] != repo or intent['plan_id'] != plan_id
                 or acceptance['remote']['oid'] != intent['head']
-                or acceptance['remote']['pull_request'] is not None):
+                or (acceptance['remote']['pull_request'] or {}).get('identity')
+                   != (intent['acceptance']['remote']['pull_request'] or {}).get('identity')):
             raise CheckpointRace('intermediate rebase publication result changed')
         if current.operation is None and saved.get('rebase_publication_result', {}).get('intent_id') == intent['id']:
             return current

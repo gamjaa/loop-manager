@@ -5,6 +5,7 @@ Git acceptance; this boundary owns the exact remote lease and resumable push.
 """
 from loop_manager_internal.git.managed_rebase_validation import RebaseStatus, valid_acceptance
 from loop_manager_internal.git import manager_git_journal
+from loop_manager_internal.recovery.blocked_checkpoint import checkpoint_pr_matches
 from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 import sqlite3
 
@@ -34,9 +35,7 @@ def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree
         if not pending and (current.operation is not None or not valid_acceptance(acceptance)):
             return
         row = state.row()
-        if not pending and (row['pr_url'] or row['pr_conflict_recovery']
-                            or acceptance['remote']['pull_request'] is not None
-                            or not acceptance['remote']['oid']):
+        if not pending and not acceptance['remote']['oid']:
             return
         if not pending and saved.get('rebase_publication_result', {}).get('acceptance_id') == acceptance['id']:
             return
@@ -47,7 +46,8 @@ def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree
     except sqlite3.OperationalError as error:
         raise RebaseObservationRetry('intermediate checkpoint database observation failed') from error
     expected_oid = (intent['remote_before'] if pending else
-                    row['publication_remote_oid'] or (owner[0] if owner else None))
+                    row['publication_remote_oid'] or (row['pr_head_oid'] if row['pr_url'] else None)
+                    or (owner[0] if owner else None))
     if not pending and expected_oid is None:
         raise RebasePublicationRejected('existing remote branch has no durable publication identity')
     if not expected_oid:
@@ -68,14 +68,16 @@ def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree
         head = intent['head'] if pending else acceptance['head']
         if oid not in ({expected_oid, head} if pending else {expected_oid}):
             raise RebasePublicationRejected('intermediate checkpoint remote lease changed or disappeared')
-        if row['pr_url'] or row['pr_conflict_recovery']:
-            raise RebasePublicationRejected('intermediate checkpoint branch now has a PR')
+        accepted_pr = (intent['acceptance'] if pending else acceptance)['remote']['pull_request']
+        pr_url = accepted_pr['identity'] if accepted_pr else None
+        if (row['pr_url'] or None) != pr_url:
+            raise RebasePublicationRejected('intermediate checkpoint saved PR identity changed')
         try:
-            pr_exists = lookup_pr(repo_path, branch, None) is not None
+            live_pr = lookup_pr(repo_path, branch, pr_url)
         except (RuntimeError, OSError) as error:
             raise RebaseObservationRetry('intermediate checkpoint PR observation failed') from error
-        if pr_exists:
-            raise RebasePublicationRejected('intermediate checkpoint branch now has a PR')
+        if not checkpoint_pr_matches(live_pr, url=pr_url, branch=branch, head=oid):
+            raise RebasePublicationRejected('intermediate checkpoint PR identity or head changed')
         try:
             live = service(remote_oid=oid)
             observed, decision = live.observe(checkpoint=selected)
@@ -91,7 +93,7 @@ def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree
                 or any(accepted[key] != (intent if pending else acceptance)[key]
                        for key in ('repo', 'plan_id', 'repository_identity', 'worktree',
                                    'branch', 'target_base_oid'))
-                or accepted['remote']['pull_request'] is not None):
+                or (accepted['remote']['pull_request'] or {}).get('identity') != pr_url):
             raise RebasePublicationRejected('intermediate checkpoint current ownership or scope differs')
         try:
             owned = owns_remote(oid, selected,
@@ -112,7 +114,7 @@ def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree
                 acceptance=checked, remote_before=expected_oid)
             intent = current.snapshot['rebase_publication_intent']
             pending = True
-        # Recheck exact live ref, PR absence and current ownership after the
+        # Recheck exact live ref, PR identity and current ownership after the
         # durable intent, immediately before the external effect.
         oid, checked = inspect()
         if oid != intent['head']:

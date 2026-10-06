@@ -167,7 +167,7 @@ PR 없는 게시 checkpoint의 과거 Review 횟수 차단은 현재 게시 소�
 | 안전한 원격 후속 commit 또는 base 전진 | 기존 branch·worktree·session과 로컬 작업을 보존해 반영하고 원래 차단 원인을 다시 검사한다. 새 OID나 checkpoint 게시만으로 해제하지 않는다. |
 | 삭제·재작성·경쟁·소유권 불명확 또는 미해결 충돌 | 원격 ref를 덮지 않고 차단·작업물과 실제 미게시 이유를 보존한다. |
 
-1. 최종 차단 상태와 원인을 먼저 보존한다. PR 없는 검증 가능한 대상 작업은 안전한 원격 checkpoint 또는 별도 진단 branch에 보존하고 결과를 알린다.
+1. 최종 차단 상태와 원인을 먼저 보존한다. 검증 가능한 대상 작업은 안전한 원격 checkpoint 또는 별도 진단 branch에 보존하고 결과를 알린다. 기존 PR은 저장된 URL·Open 상태·작업 branch·정확한 원격 head를 재확인해 같은 branch에 게시하며 새 PR·Draft PR을 만들지 않는다.
 2. 저장된 원인과 현재 입력·작업 상태를 대조한다. 같은 입력의 실패를 반복하지 않으며 다른 계획·planning·사용자 결정의 차단을 함께 해제하지 않는다.
 3. 일반적인 입력·승인·PR reopen 해제는 해당 계획의 재시도·실패 지문과 Worker level을 초기화해 READY 또는 PR_OPEN으로 되돌린다. 원격 복구는 기존 session·실패·승격 감사를 보존한다.
 4. 후보가 바뀐 작업은 Worker의 현재 입력·최종 diff 확인과 targeted test, 프로그램 전체 verify·Review를 다시 통과한다. 첫 PR도 최종 검증과 Review 성공 뒤에만 생성한다.
@@ -339,7 +339,7 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - 최신 base 반영이나 후보·관련 입력 변경으로 기존 성공 근거가 무효화되면 Worker 후보 확인·targeted test·전체 verify·Review를 다시 수행한다.
 - 구현 PR 게시에는 Requirement 전체 완료나 archive 이동을 강제하지 않는다. Requirement 이동은 별도 planning 게시에서 최신 판단·원문·목적지와 원격 base를 다시 확인한다.
 - 관리 rebase는 자동 Worker 해결과 사용자 수동 해결을 같은 현재 상태 기준으로 수용한다. 현재 소유권·범위·Git 상태·원격 기대값을 검증하며, 과거 turn·stage·receipt·journal 완전성을 완료 조건으로 요구하지 않는다.
-- PR 없는 동일 계획의 기존 원격 작업 branch를 rebase한 결과는 다음 Worker·verify·Review·추가 rebase보다 먼저 중간 checkpoint 게시 또는 안전한 거부를 확정한다. 이 게시는 차단 해제·검증 성공·PR 승인을 대신하지 않는다.
+- 동일 계획의 기존 원격 작업 branch를 rebase한 결과는 다음 Worker·verify·Review·추가 rebase보다 먼저 중간 checkpoint 게시 또는 안전한 거부를 확정한다. 기존 PR도 저장된 PR identity와 실제 원격 OID의 정확한 lease에 결합해 게시한다. intent·원격 결과·SQLite 확정 사이에 중단되면 같은 결과를 재사용하며 예상 밖 원격 commit을 덮지 않는다. 이 게시는 차단 해제·검증 성공·PR 승인을 대신하지 않고, 바뀐 PR 후보의 Worker·verify·Review·publication 승인은 무효화한다.
 - 같은 branch의 기존 PR을 복구해 사용하며 중복 PR을 만들지 않는다. PR은 사용자가 Merge한다.
 
 | Merge 후 작업 공간 | 처리 |

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum
 import hashlib
 import json
@@ -48,6 +48,7 @@ class CheckpointRequest:
     local_oid: str | None = None
     remote_oid: str | None = None
     rebase_recovery: bool = False
+    pr_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -266,6 +267,20 @@ def checkpoint_message(
     )
 
 
+def checkpoint_pr_matches(pull_request, *, url, branch, head, base=None) -> bool:
+    """Bind an existing open PR to the selected branch and exact live ref."""
+    if not url:
+        return pull_request is None
+    return bool(
+        isinstance(pull_request, dict) and head
+        and pull_request.get('url') == url
+        and pull_request.get('state') == 'OPEN' and not pull_request.get('mergedAt')
+        and pull_request.get('headRefName') == branch
+        and pull_request.get('headRefOid') == head
+        and (base is None or pull_request.get('baseRefName') == base)
+    )
+
+
 def decide_push(
     *,
     local_oid: str,
@@ -331,7 +346,7 @@ class CheckpointStatePort(Protocol):
     def record_prepared(self, request: CheckpointRequest, prepared: PreparedCheckpoint) -> None: ...
     def record_local(self, request: CheckpointRequest, local_oid: str) -> None: ...
     def record_remote_observation(self, request: CheckpointRequest, remote_oid: str | None) -> CheckpointRequest: ...
-    def finish_published(self, request: CheckpointRequest, remote_oid: str) -> None: ...
+    def finish_published(self, request: CheckpointRequest, remote_oid: str, *, reobserve=None) -> None: ...
     def finish_unpublished(self, request: CheckpointRequest, reason: str, *, retryable: bool) -> None: ...
 
 
@@ -341,6 +356,7 @@ class CheckpointSafetyPort(Protocol):
 
 class CheckpointPublicationPort(Protocol):
     def existing_pull_request(self, request: CheckpointRequest) -> object | None: ...
+    def confirm(self, request: CheckpointRequest, local_oid: str) -> str | None: ...
     def prepare(self, request: CheckpointRequest, verdict: SafetyVerdict) -> PreparedCheckpoint: ...
     def ensure_local_commit(self, request: CheckpointRequest, prepared: PreparedCheckpoint) -> str: ...
     def observe_remote(self, request: CheckpointRequest) -> str | None: ...
@@ -385,6 +401,13 @@ class BlockedCheckpointDispatcher:
                 completed += 1
         return completed
 
+    def _finish_published(self, request, local_oid):
+        if request.pr_url:
+            self._state.finish_published(
+                request, local_oid, reobserve=lambda: self._publication.confirm(request, local_oid))
+        else:
+            self._state.finish_published(request, local_oid)
+
     def _dispatch_one(self, request: CheckpointRequest) -> bool:
         verdict = self._safety.assess(request)
         if not verdict.safe:
@@ -401,10 +424,13 @@ class BlockedCheckpointDispatcher:
             self._results.finalized(request)
             return True
 
-        if self._publication.existing_pull_request(request) is not None:
+        pull_request = self._publication.existing_pull_request(request)
+        if not any(checkpoint_pr_matches(
+                pull_request, url=request.pr_url, branch=request.branch, head=head)
+                for head in (request.expected_remote_oid, request.local_oid, verdict.head_oid)):
             self._state.finish_unpublished(
                 request,
-                "동일 head branch에 기존 PR이 있어 checkpoint 게시 대상이 아닙니다.",
+                "기존 PR identity, 상태 또는 head가 checkpoint 대상과 다릅니다.",
                 retryable=False,
             )
             self._results.finalized(request)
@@ -414,6 +440,9 @@ class BlockedCheckpointDispatcher:
         self._state.record_prepared(request, prepared)
         local_oid = self._publication.ensure_local_commit(request, prepared)
         self._state.record_local(request, local_oid)
+        if request.pr_url:
+            request = replace(request, local_oid=local_oid, tree_oid=prepared.tree_oid,
+                              commit_identity=prepared.commit_identity)
         remote_oid = self._publication.observe_remote(request)
         request = self._state.record_remote_observation(request, remote_oid)
         decision = decide_push(
@@ -438,7 +467,7 @@ class BlockedCheckpointDispatcher:
             self._results.finalized(request)
             return True
         if decision.mode is PushMode.NONE:
-            self._state.finish_published(request, local_oid)
+            self._finish_published(request, local_oid)
             self._results.finalized(request)
             return True
 
@@ -452,7 +481,7 @@ class BlockedCheckpointDispatcher:
                         "checkpoint push 결과를 원격에서 확인할 수 없습니다.",
                         retryable=True,
                     )
-                self._state.finish_published(request, local_oid)
+                self._finish_published(request, local_oid)
                 self._results.finalized(request)
                 return True
             except CheckpointPushError as error:

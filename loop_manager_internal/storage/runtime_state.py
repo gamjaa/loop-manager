@@ -1494,12 +1494,10 @@ class RuntimeStateRepository:
                 evidence=evidence,
                 branch=_text(checkpoint_plan, "branch"),
                 worktree=_text(checkpoint_plan, "worktree"),
-                expected_remote_oid=_text(
-                    checkpoint_plan, "publication_remote_oid"
-                ),
+                expected_remote_oid=(_text(checkpoint_plan, "publication_remote_oid")
+                                     or _text(checkpoint_plan, "pr_head_oid")),
                 rebase_recovery=bool(
-                    checkpoint_plan["publication_remote_oid"]
-                    and not checkpoint_plan["pr_url"]
+                    checkpoint_plan["publication_remote_oid"] or checkpoint_plan["pr_head_oid"]
                 ),
                 release_fingerprint=release_fingerprint,
             )

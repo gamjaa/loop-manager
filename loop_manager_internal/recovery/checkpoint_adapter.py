@@ -130,15 +130,6 @@ class CheckpointSafetyAdapter:
                 None,
                 (),
             )
-        if plan["pr_url"]:
-            return blocked_checkpoint.SafetyVerdict(
-                False,
-                blocked_checkpoint.SafetyScope.PLAN,
-                "existing_pull_request",
-                "기존 PR에 연결된 계획은 checkpoint 대상이 아닙니다.",
-                None,
-                (),
-            )
         if not request.branch or not request.worktree:
             return blocked_checkpoint.SafetyVerdict(
                 False,
@@ -490,7 +481,13 @@ class CheckpointSafetyAdapter:
         if not request.branch:
             return None
         try:
-            return self.safety_effects.pr_for_branch(self.repo_path, request.branch)
+            plan = self._plan(request)
+            if (plan['pr_url'] or None) != request.pr_url:
+                raise blocked_checkpoint.CheckpointPushError(
+                    'checkpoint의 저장된 PR identity가 변경됐습니다.', retryable=False)
+            return self.safety_effects.pr_for_branch(self.repo_path, request.branch, request.pr_url)
+        except blocked_checkpoint.CheckpointPushError:
+            raise
         except RuntimeError as error:
             raise blocked_checkpoint.CheckpointPushError(
                 f"checkpoint PR 조회 실패: {error}", retryable=True
@@ -570,6 +567,16 @@ class CheckpointPublicationAdapter:
             raise RuntimeError("안전하지 않은 checkpoint를 준비할 수 없습니다.")
         worktree = Path(request.worktree)
         tree_oid = self._tree_for_paths(worktree, verdict.included_paths)
+        if (request.pr_url and not verdict.included_paths and request.commit_identity
+                and request.tree_oid == tree_oid):
+            message = self.publication_effects.git(
+                worktree, 'show', '-s', '--format=%B', 'HEAD').stdout
+            if (request.local_oid == verdict.head_oid
+                    or f'Checkpoint-Identity: {request.commit_identity}' in message.splitlines()):
+                # Keep the same durable candidate after commit/push interrupted
+                # before its SQLite receipt; no new identity or empty commit.
+                return blocked_checkpoint.PreparedCheckpoint(
+                    verdict.head_oid, tree_oid, request.commit_identity, message, ())
         identity = blocked_checkpoint.checkpoint_identity(
             plan_id=request.plan_id,
             reason_code=request.reason_code,
@@ -701,8 +708,17 @@ class CheckpointPublicationAdapter:
                 "checkpoint 원격 branch 조회 실패:\n" + result.stdout[-8000:],
                 retryable=True,
             )
-        return manager_git_journal.parse_remote_branch_oid(
+        oid = manager_git_journal.parse_remote_branch_oid(
             result.stdout, f'refs/heads/{request.branch}')
+        if request.pr_url:
+            project = self.connection.execute(
+                'SELECT base_branch FROM projects WHERE repo = ?', (request.repo,)).fetchone()
+            if not blocked_checkpoint.checkpoint_pr_matches(
+                    self.existing_pull_request(request), url=request.pr_url,
+                    branch=request.branch, head=oid, base=project['base_branch']):
+                raise blocked_checkpoint.CheckpointPushError(
+                    '기존 PR identity, 상태 또는 원격 head가 변경됐습니다.', retryable=False)
+        return oid
 
 
     def is_fast_forward(self, remote_oid: str, local_oid: str) -> bool:
@@ -719,6 +735,44 @@ class CheckpointPublicationAdapter:
         return result.returncode == 0
 
 
+    def confirm(self, request, local_oid):
+        self._validated_push_url(request)
+        self._check_publication(request, local_oid, blocked_checkpoint.PushDecision(blocked_checkpoint.PushMode.NONE))
+        return self.observe_remote(request)
+
+    def _check_publication(self, request, local_oid, decision):
+        verdict = self.assess(request)
+        if not verdict.safe or verdict.head_oid != local_oid or verdict.included_paths:
+            raise blocked_checkpoint.CheckpointPushError(
+                verdict.detail or 'checkpoint 후보 HEAD가 변경됐습니다.', retryable=False)
+        remote = self.observe_remote(request)
+        project = self.connection.execute(
+            'SELECT base_branch FROM projects WHERE repo = ?', (request.repo,)).fetchone()
+        if not blocked_checkpoint.checkpoint_pr_matches(
+                self.existing_pull_request(request), url=request.pr_url,
+                branch=request.branch, head=remote, base=project['base_branch']):
+            raise blocked_checkpoint.CheckpointPushError(
+                '기존 PR identity, 상태 또는 head가 변경됐습니다.', retryable=False)
+        if remote not in (request.expected_remote_oid, local_oid):
+            raise blocked_checkpoint.CheckpointPushError(
+                'checkpoint의 정확한 원격 lease가 변경됐습니다.', retryable=False)
+        if decision.mode is blocked_checkpoint.PushMode.REBASE_LEASE and request.pr_url:
+            from loop_manager_internal.git.managed_rebase_validation import valid_acceptance
+            current = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(
+                request.repo, request.plan_id)
+            accepted = current.current_rebase_acceptance()
+            if (not valid_acceptance(accepted) or accepted['repo'] != request.repo
+                    or accepted['plan_id'] != request.plan_id
+                    or accepted['branch'] != request.branch
+                    or accepted['worktree'] != str(_canonical_path(Path(request.worktree)))
+                    or accepted['remote']['oid'] != request.expected_remote_oid
+                    or not accepted['remote']['pull_request']
+                    or accepted['remote']['pull_request']['identity'] != request.pr_url
+                    or not self.is_fast_forward(accepted['head'], local_oid)):
+                raise blocked_checkpoint.CheckpointPushError(
+                    '기존 PR checkpoint의 현재 rebase 완료 근거가 없습니다.', retryable=False)
+        return remote
+
     def push(
         self,
         request: blocked_checkpoint.CheckpointRequest,
@@ -734,6 +788,8 @@ class CheckpointPublicationAdapter:
             push_url = self._validated_push_url(request)
         except RuntimeError as error:
             raise blocked_checkpoint.CheckpointPushError(str(error), retryable=False) from error
+        remote = (self._check_publication(request, local_oid, decision)
+                  if getattr(request, 'pr_url', None) else None)
         rewrite_options, operand = _frozen_push_target(push_url)
         arguments = [
             "push",
@@ -759,13 +815,14 @@ class CheckpointPublicationAdapter:
         tracked_oid = tracked.stdout.strip() if tracked.returncode == 0 else "0" * len(local_oid)
         scoped_options = (("-c", f"core.hooksPath={os.devnull}")
                           if self.project_recovery_scope else ())
-        pushed = self.publication_effects.git(
-            Path(request.worktree), *scoped_options, *rewrite_options, *arguments, check=False)
-        if pushed.returncode:
-            raise blocked_checkpoint.CheckpointPushError(
-                "checkpoint push 실패:\n" + pushed.stdout[-8000:],
-                retryable=blocked_checkpoint.push_failure_retryable(pushed.stdout),
-            )
+        if remote != local_oid:
+            pushed = self.publication_effects.git(
+                Path(request.worktree), *scoped_options, *rewrite_options, *arguments, check=False)
+            if pushed.returncode:
+                raise blocked_checkpoint.CheckpointPushError(
+                    "checkpoint push 실패:\n" + pushed.stdout[-8000:],
+                    retryable=blocked_checkpoint.push_failure_retryable(pushed.stdout),
+                )
         # A URL push does not refresh origin's tracking ref as a named-remote
         # push does. Preserve that local result without overwriting a concurrent
         # ref change; the durable checkpoint can recover after a failed CAS.

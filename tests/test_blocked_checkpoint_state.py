@@ -159,6 +159,25 @@ class BlockedCheckpointRepositoryTest(unittest.TestCase):
                 finish()
                 self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], 1)
 
+    def test_existing_pr_request_receipt_and_validation_invalidation_are_atomic(self):
+        self.connection.execute("UPDATE exec_plans SET pr_url='https://example.test/pr/34', "
+            "pr_head_oid='old', verify_token='verify', review_token='review', publication_token='publish'")
+        request = self.request()
+        self.assertEqual(request.pr_url, 'https://example.test/pr/34')
+        self.repository.record_local(request, 'candidate')
+        with self.assertRaises(RuntimeError):
+            self.repository.finish_published(request, 'candidate', reobserve=lambda: 'user-push')
+        self.assertEqual(self.repository.get('repo', 'G-034').phase.value, 'local_committed')
+        self.assertEqual(self.connection.execute('SELECT verify_token FROM exec_plans').fetchone()[0], 'verify')
+        self.repository.finish_published(request, 'candidate', reobserve=lambda: 'candidate')
+        plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual(plan['pr_url'], request.pr_url)
+        self.assertEqual(plan['pr_head_oid'], 'candidate')
+        self.assertEqual(plan['status'], 'PLAN_BLOCKED')
+        for field in ('verify_token', 'review_token', 'publication_token'):
+            self.assertIsNone(plan[field])
+        self.assertEqual(self.repository.get('repo', 'G-034').phase.value, 'published')
+
     def request(self, evidence="failure", release_fingerprint=None):
         return self.repository.request(
             repo="repo",
@@ -266,7 +285,7 @@ class BlockedCheckpointRepositoryTest(unittest.TestCase):
             self.assertTrue({
                 "published_oid", "accepted_remote_oid", "pending_remote_oid",
                 "inspected_remote_oid", "inspected_input", "inspection_reason",
-                "inspection_retryable",
+                "inspection_retryable", "pr_url",
             }.issubset(columns))
         finally:
             connection.close()

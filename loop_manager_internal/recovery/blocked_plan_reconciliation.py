@@ -291,11 +291,14 @@ class BlockedPlanReconciler:
             else:
                 raise InputChanged('원격 base가 관측 이후 변경됐습니다.')
         try:
-            pull_request = self.ports.pr_for_branch(self.repo_path, context['identity']['branch'])
+            plan = self._plan(context['plan_id'])
+            pull_request = self.ports.pr_for_branch(self.repo_path, context['identity']['branch'], plan['pr_url'])
         except (OSError, RuntimeError) as error:
             raise AssessmentPending('차단 계획 PR 조회를 재시도합니다.') from error
-        if pull_request is not None:
-            raise RuntimeError('기존 PR이 있는 작업 branch의 차단 checkpoint 복구를 거부합니다.')
+        if not blocked_checkpoint.checkpoint_pr_matches(
+                pull_request, url=plan['pr_url'], branch=plan['branch'], head=branch.oid,
+                base=project['base_branch']):
+            raise RuntimeError('기존 PR identity·상태·head가 차단 checkpoint와 다릅니다.')
         return branch.oid
 
     def _validate(self, plan, *, rebase=False):
@@ -588,7 +591,7 @@ class BlockedPlanReconciler:
             plan = self._plan(plan_id)
             block = scoped_blocking.plan_block(self.connection, self.repo, plan_id)
             if (plan is None or block is None or plan['status'] != 'PLAN_BLOCKED'
-                    or not plan['worktree'] or not plan['branch'] or plan['pr_url']
+                    or not plan['worktree'] or not plan['branch']
                     or plan['workspace_owned'] != 1):
                 return 'unhandled'
             context = {field: row[field] for field in ('registered_origin', 'origin_url', 'base_ref',

@@ -147,7 +147,8 @@ class ExecutionStatePort:
             if (expected is None or expected.repo != intent['repo']
                     or expected.plan_id != intent['plan_id']
                     or expected.branch != intent['branch'] or expected.worktree != intent['worktree']
-                    or expected.workspace_owned != 1 or expected.pr_url
+                    or expected.workspace_owned != 1
+                    or (expected.pr_url or None) != (intent['acceptance']['remote']['pull_request'] or {}).get('identity')
                     or expected.publication_remote_oid not in (None, intent['remote_before'], intent['head'])):
                 raise runtime_state.RuntimeStateError('intermediate publication owner changed')
             oid, checked = reobserve()
@@ -161,10 +162,21 @@ class ExecutionStatePort:
             updated = self._record_rebase_publication(expected, intent['head'])
         self.expected = updated
 
+    def _publication_values(self, expected, head):
+        values = {'publication_remote_oid': head}
+        if expected.pr_url:
+            values.update(pr_head_oid=head, worker_input_token=None, archive_token=None,
+                          verify_token=None, review_token=None, publication_token=None,
+                          validated_base_sha=None, worker_result=None, verify_result=None,
+                          review_result=None)
+        if expected.pr_conflict_recovery:
+            values['pr_conflict_head_oid'] = head
+        return values
+
     def _record_rebase_publication(self, expected, head):
+        values = self._publication_values(expected, head)
         return self.repository.transition_from_snapshot(
-            expected, plan_values={'publication_remote_oid': head},
-            project_values={'publication_remote_oid': head})
+            expected, plan_values=values, project_values=values)
 
     def open_pull_request(self, repo, **values):
         if repo != self.repo:
@@ -232,5 +244,5 @@ class DirectRebasePublicationStatePort(ExecutionStatePort):
         if self.projected:
             return super()._record_rebase_publication(expected, head)
         return self.repository.update_plan(
-            self.repo, self.plan_id, plan_values={'publication_remote_oid': head},
+            self.repo, self.plan_id, plan_values=self._publication_values(expected, head),
             expected_status=expected.status, enqueue=False)

@@ -210,8 +210,8 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
         return refuse("게시 OID가 증명되지 않은 legacy checkpoint의 원격 변경은 채택할 수 없습니다.")
     if row["pending_remote_oid"] and row["pending_remote_oid"] != observed and not integrating:
         return refuse("미완료 원격 checkpoint 채택 중 branch OID가 다시 변경됐습니다.")
-    if blocked["pr_url"] or int(blocked["workspace_owned"] or 0) != WORKSPACE_OWNED:
-        return refuse("PR 또는 관리 workspace 소유권 때문에 원격 checkpoint를 채택할 수 없습니다.")
+    if int(blocked["workspace_owned"] or 0) != WORKSPACE_OWNED:
+        return refuse("관리 workspace 소유권 때문에 원격 checkpoint를 채택할 수 없습니다.")
     if request.branch != branch or request.worktree != str(worktree):
         return refuse("저장된 checkpoint branch/worktree가 ExecPlan 소유권과 다릅니다.")
     if safety_error:

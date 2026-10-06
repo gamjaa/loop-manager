@@ -349,6 +349,10 @@ def push_owned_pr_conflict_recovery(
     if (effects.git(worktree, 'rev-parse', 'HEAD').stdout.strip() != local_oid
             or effects.git(worktree, 'rev-parse', '--verify', f'refs/heads/{branch}').stdout.strip() != local_oid):
         raise PublicationSafetyError('PR push 직전 소유 branch 또는 관리 HEAD가 변경됐습니다.')
+    if remote_oid == local_oid:
+        # A validated candidate can already be the confirmed PR checkpoint.
+        # Reuse its live identity after the same validation gates.
+        return local_oid
     lease = f"--force-with-lease=refs/heads/{branch}:{observed_head}"
     pushed = effects.git(
         worktree,
