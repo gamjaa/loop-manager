@@ -24,6 +24,49 @@ from loop_manager_internal.runtime import bootstrap
 
 
 class BootstrapEntryTests(unittest.TestCase):
+    def test_remote_child_handoff_preserves_source_config_interpreter_arguments_and_real_lock(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, writer = remote_fixture(directory)
+            state = Path(directory) / "state"
+            remote = advance_remote(writer, path="loop_manager.py", value="VALUE = 'latest-remote-bootstrap'\n")
+            (source / "loop_manager.py").write_text("VALUE = 'local-only'\n")
+            config = source / "config/config.ini"
+            config.parent.mkdir(); config.write_text("secret-sentinel\n")
+            before_head = git(source, "rev-parse", "HEAD")
+            real_run = subprocess.run
+            def child(command, **options):
+                if command[0] == "git":
+                    return real_run(command, **options)
+                path = Path(command[3])
+                self.assertEqual(command[:3], [loop_manager.sys.executable, "-B", "-u"])
+                self.assertEqual(path.read_text(), "VALUE = 'latest-remote-bootstrap'\n")
+                self.assertEqual(git(path.parent, "rev-parse", "HEAD"), remote)
+                self.assertEqual(options, {"cwd": path.parent, "check": False})
+                self.assertIn("--runtime-child", command)
+                self.assertEqual(command[-2:], ["run", "--skip-if-running"])
+                self.assertEqual(command[command.index("--config") + 1], str(config))
+                self.assertEqual(command[command.index("--runtime-source") + 1], str(source))
+                self.assertNotIn("secret-sentinel", " ".join(command))
+                self.assertFalse((path.parent / "config/config.ini").exists())
+                token = command[command.index("--runtime-mutation-id") + 1]
+                from loop_manager_internal.runtime.process_lock import _held_process_lock_identity
+                self.assertEqual(_held_process_lock_identity(state), "runtime:" + token)
+                with self.assertRaises(loop_manager.ProcessLockBusyError):
+                    with loop_manager.process_lock(state):
+                        self.fail("parent lock released before child exit")
+                return subprocess.CompletedProcess(command, 7)
+            with mock.patch.object(loop_manager, "ROOT", source), mock.patch.object(
+                loop_manager.sys, "argv", ["loop_manager.py", "--state-dir", str(state), "--config", "config/config.ini", "run", "--skip-if-running"]
+            ), mock.patch("loop_manager.github_repository", return_value="owner/repo"), mock.patch(
+                "loop_manager.subprocess.run", side_effect=child
+            ):
+                self.assertEqual(loop_manager.main(), 7)
+            self.assertEqual(git(source, "rev-parse", "HEAD"), before_head)
+            self.assertEqual((source / "loop_manager.py").read_text(), "VALUE = 'local-only'\n")
+            self.assertEqual(config.read_text(), "secret-sentinel\n")
+            with loop_manager.process_lock(state):
+                pass
+
     def test_bootstrap_holds_lock_around_runtime_and_normalizes_external_config(self):
         events: list[str] = []
         state_dir = Path("/state").resolve()
@@ -88,7 +131,7 @@ class BootstrapEntryTests(unittest.TestCase):
         self.assertNotIn("spoofed", secured)
 
 
-    def test_bootstrap_refreshes_dirty_source_then_starts_matching_runtime_next_run(self):
+    def test_bootstrap_refreshes_dirty_source_and_starts_remote_runtime_in_same_run(self):
         with tempfile.TemporaryDirectory() as directory:
             _remote, source, writer = remote_fixture(directory)
             state_dir = Path(directory) / "state"
@@ -115,22 +158,19 @@ class BootstrapEntryTests(unittest.TestCase):
                 "loop_manager.run_runtime_child", return_value=0
             ) as child:
                 self.assertEqual(loop_manager.main(), 0)
-                child.assert_not_called()
+                child.assert_called_once()
                 self.assertEqual(git(source, "rev-parse", "HEAD"), remote_sha)
-                self.assertFalse((state_dir / "runtimes").exists())
                 self.assertEqual(git(source, "ls-files", "--stage", "--", "tracked.txt"), before_index)
                 self.assertEqual((source / "tracked.txt").read_text(), "unstaged\n")
                 self.assertEqual((source / "local.txt").read_text(), "untracked\n")
                 self.assertEqual(ignored.read_text(), "ignored\n")
 
-                self.assertEqual(loop_manager.main(), 0)
-                child.assert_called_once()
                 selected = child.call_args.args[3]
                 self.assertEqual(selected.commit_sha, remote_sha)
                 self.assertEqual(git(selected.path, "rev-parse", "HEAD"), remote_sha)
 
 
-    def test_bootstrap_refresh_requires_retry_for_one_shot_commands(self):
+    def test_bootstrap_refresh_runs_one_shot_commands_without_retry(self):
         commands = (
             ("init",),
             ("config", "init"),
@@ -154,21 +194,14 @@ class BootstrapEntryTests(unittest.TestCase):
                 ), mock.patch("loop_manager.github_repository", return_value="owner/repo"), mock.patch(
                     "loop_manager.run_runtime_child", return_value=7
                 ) as child, mock.patch("loop_manager.operation_log") as log:
-                    self.assertEqual(loop_manager.main(), 1)
-                    child.assert_not_called()
-                    self.assertTrue(any(
-                        "같은 명령을 다시 실행하세요" in call.args[0]
-                        and call.kwargs.get("error") is True
-                        for call in log.call_args_list
-                    ))
+                    self.assertEqual(loop_manager.main(), 7)
+                    child.assert_called_once()
                     self.assertEqual(git(source, "rev-parse", "HEAD"), remote_sha)
-                    self.assertFalse((state_dir / "runtimes").exists())
                     if command in {("init",), ("config", "init")}:
                         self.assertFalse((state_dir / "loop-manager.db").exists())
 
-                    self.assertEqual(loop_manager.main(), 7)
-                    child.assert_called_once()
                     self.assertEqual(child.call_args.args[-1], arguments)
+                    self.assertEqual(child.call_args.args[3].commit_sha, remote_sha)
 
 
     def test_bootstrap_equal_sha_allows_dirty_source(self):
@@ -217,8 +250,8 @@ class BootstrapEntryTests(unittest.TestCase):
             with mock.patch("loop_manager.github_repository", return_value="owner/repo"):
                 with loop_manager.process_lock(state_dir, identity="bootstrap:" + "a" * 32):
                     self.assertEqual(
-                        loop_manager._bootstrap_service().prepare_bootstrap_runtime(source, state_dir, "a" * 32),
-                        loop_manager.BootstrapRefreshHandoff("develop", latest),
+                        loop_manager._bootstrap_service().prepare_bootstrap_runtime(source, state_dir, "a" * 32).commit_sha,
+                        latest,
                     )
                 self.assertEqual(git(source, "rev-parse", "HEAD"), latest)
                 with loop_manager.process_lock(state_dir, identity="bootstrap:" + "b" * 32) as handle:
@@ -242,9 +275,9 @@ class BootstrapEntryTests(unittest.TestCase):
                             "--runtime-mutation-id", "b" * 32,
                             "--state-dir", str(state_dir), "run",
                         ],
-                    ), mock.patch("loop_manager.execute_runtime_command") as execute:
-                        self.assertEqual(loop_manager.main(), 1)
-                        execute.assert_not_called()
+                    ), mock.patch("loop_manager.execute_runtime_command", return_value=0) as execute:
+                        self.assertEqual(loop_manager.main(), 0)
+                        execute.assert_called_once()
             self.assertEqual(runtime.commit_sha, latest)
             self.assertEqual(git(runtime.path, "rev-parse", "HEAD"), latest)
 
@@ -271,38 +304,49 @@ class BootstrapEntryTests(unittest.TestCase):
                 )
 
 
-    def test_bootstrap_rejects_unsafe_refresh_and_does_not_start_runtime(self):
-        for scenario in ("overlap", "ahead", "diverged", "other-branch", "operation"):
+    def test_bootstrap_preserves_source_and_selects_remote_for_all_local_states(self):
+        for scenario in ("overlap", "ahead", "diverged", "other-branch", "detached", "operation", "clean-diverged"):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
                 _remote, source, writer = remote_fixture(directory)
                 state_dir = Path(directory) / "state"
                 if scenario == "overlap":
                     (source / "tracked.txt").write_text("local\n")
-                elif scenario in {"ahead", "diverged"}:
+                elif scenario in {"ahead", "diverged", "clean-diverged"}:
                     (source / "local.txt").write_text("local\n")
                     commit_all(source, "Local only")
+                    if scenario == "diverged":
+                        (source / "tracked.txt").write_text("dirty\n")
                 elif scenario == "other-branch":
                     git(source, "checkout", "-b", "topic")
+                elif scenario == "detached":
+                    git(source, "checkout", "--detach")
                 elif scenario == "operation":
                     operation = Path(git(source, "rev-parse", "--git-path", "MERGE_HEAD"))
                     if not operation.is_absolute():
                         operation = source / operation
                     operation.write_text(git(source, "rev-parse", "HEAD") + "\n")
-                if scenario != "ahead":
-                    advance_remote(writer)
+                remote_sha = git(writer, "rev-parse", "HEAD") if scenario == "ahead" else advance_remote(writer)
                 before = git(source, "rev-parse", "HEAD")
+                before_state = loop_manager._source_transition_state(source)
                 with mock.patch.object(loop_manager, "ROOT", source), mock.patch.object(
                     loop_manager.sys, "argv", ["loop_manager.py", "--state-dir", str(state_dir), "run"]
                 ), mock.patch("loop_manager.github_repository", return_value="owner/repo"), mock.patch(
-                    "loop_manager.run_runtime_child"
+                    "loop_manager.run_runtime_child", return_value=0
                 ) as child:
-                    self.assertEqual(loop_manager.main(), 1)
-                    child.assert_not_called()
-                self.assertEqual(git(source, "rev-parse", "HEAD"), before)
-                self.assertFalse((state_dir / "runtimes").exists())
+                    self.assertEqual(loop_manager.main(), 0)
+                    child.assert_called_once()
+                    runtime = child.call_args.args[3]
+                self.assertEqual(runtime.commit_sha, remote_sha)
+                self.assertEqual(git(runtime.path, "rev-parse", "HEAD"), remote_sha)
+                self.assertFalse((runtime.path / "local.txt").exists())
+                if scenario != "clean-diverged":
+                    self.assertEqual(loop_manager._source_transition_state(source), before_state)
+                else:
+                    self.assertNotEqual(git(source, "rev-parse", "HEAD"), before)
+                    self.assertEqual((source / "local.txt").read_text(), "local\n")
 
 
-    def test_bootstrap_rejects_git_failures_and_source_race(self):
+    def test_bootstrap_continues_after_sync_failure_and_source_race_but_rejects_fetch_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             _remote, source, writer = remote_fixture(directory)
             state_dir = Path(directory) / "state"
@@ -318,9 +362,8 @@ class BootstrapEntryTests(unittest.TestCase):
                 "loop_manager.git", side_effect=failing_git
             ):
                 with loop_manager.process_lock(state_dir, identity="bootstrap:" + "a" * 32):
-                    with self.assertRaisesRegex(RuntimeError, "fast-forward 실패"):
-                        loop_manager._bootstrap_service().prepare_bootstrap_runtime(source, state_dir, "a" * 32)
-            self.assertFalse((state_dir / "runtimes").exists())
+                    selected = loop_manager._bootstrap_service().prepare_bootstrap_runtime(source, state_dir, "a" * 32)
+            self.assertEqual(selected.commit_sha, git(writer, "rev-parse", "HEAD"))
             advance_remote(writer, value="three\n")
 
             def failing_fetch(repo, *arguments, **kwargs):
@@ -334,7 +377,6 @@ class BootstrapEntryTests(unittest.TestCase):
                 with loop_manager.process_lock(state_dir, identity="bootstrap:" + "c" * 32):
                     with self.assertRaisesRegex(RuntimeError, "fetch refused"):
                         loop_manager._bootstrap_service().prepare_bootstrap_runtime(source, state_dir, "c" * 32)
-            self.assertFalse((state_dir / "runtimes").exists())
 
             def raced_sync(repo, base, *, remote_sha, state_dir, owner):
                 git(source, "checkout", "-b", "topic")
@@ -344,9 +386,8 @@ class BootstrapEntryTests(unittest.TestCase):
                 "loop_manager.synchronize_base_worktree", side_effect=raced_sync
             ):
                 with loop_manager.process_lock(state_dir, identity="bootstrap:" + "b" * 32):
-                    with self.assertRaisesRegex(RuntimeError, "bootstrap revision 변경"):
-                        loop_manager._bootstrap_service().prepare_bootstrap_runtime(source, state_dir, "b" * 32)
-            self.assertFalse((state_dir / "runtimes").exists())
+                    selected = loop_manager._bootstrap_service().prepare_bootstrap_runtime(source, state_dir, "b" * 32)
+            self.assertEqual(selected.commit_sha, git(writer, "rev-parse", "HEAD"))
 
 
     def test_launchers_only_start_the_python_bootstrap(self):

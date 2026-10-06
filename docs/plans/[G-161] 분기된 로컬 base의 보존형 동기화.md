@@ -46,10 +46,14 @@ clean diverged base의 확인된 로컬 전용 commit을 원격 base 위로 안�
 - [x] 2026-10-05 fef5741의 mutable READY snapshot과 원본 hash를 대조하고 R-023·R-056의 원격 bootstrap 실행 조건을 같은 계획에 명시함. 구현·테스트 실행은 하지 않음.
 - [x] 2026-10-05 최신 planning 기준 32e496c와 제공된 mutable READY snapshot에서 재평가함. G-114의 probe 실패·파일 보존 회귀 보강은 bootstrap gate·diverged 동기화의 미충족 범위를 바꾸지 않으며 기존 개정 목표를 유지함. 구현·테스트 실행은 하지 않음.
 - [x] 2026-10-06 a1db7e8의 최신 원격 코드·테스트로 R-010 전체 기준을 재평가함. source HEAD·branch 및 갱신 성공·재실행 gate의 미충족 목표를 기존 G-161에 연결함. 구현·테스트 실행은 하지 않음.
-- [ ] 구현 및 관련 targeted unit 검증
+- [x] 구현 및 관련 targeted unit 검증: source sync·bootstrap foundation/entry·journal의 45개 unit case와 self handoff의 1개 case 통과. source journal 손상의 프로젝트 간 비차단 보강 후 journal class 3개 case 추가 재검증 통과.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- 2026-10-06: `git/source_rebase.py`에 source 전용 intent·invocation·result와 복구 경계를 분리하고 기존 journal 저장·reflog 표식·commit 보존 helper를 재사용했다. clean 선형 commit만 rebase하며 dirty·merge commit·중간 replay 경로의 ignored 충돌은 보존한다. 실패 receipt와 실제 파일·index·operation이 일치하는 소유 conflict만 abort하고, receipt 없는 중단·후속 사용자 수정은 보존한다. 완료·abort 뒤 journal 확정 중단은 Git 쓰기를 반복하지 않고 확정한다. 같은 실패 입력의 rebase·fast-forward는 반복 보류하며 새 관련 입력에서 재검사한다.
+- 2026-10-06: bootstrap의 source HEAD·branch·operation 일치 및 갱신 후 외부 재실행 gate를 제거했다. lock 아래 확정한 원격 SHA의 detached runtime 자식이 그 revision의 `main` bootstrap에서 repository·runtime·부모 lock을 검증한 뒤 요청 명령을 실행한다. sync skip·실패·예외는 진단하고 원격 SHA·runtime 소유권 오류는 보존·중단한다. 기존 config·interpreter·인자 전달과 부모 lock 유지 helper를 그대로 사용하며 별도 clone·updater·ignored 복제를 추가하지 않았다. 선택된 source journal은 원격 planning release의 gate에서 제외하고 PRODUCT에 지속 규칙을 반영했다.
+- 2026-10-06: Linux 전체 검증 경로는 기존 `scripts/verify.sh`와 전체 unit manifest를 실행하는 verification runner를 재사용한다. Worker는 전체 verify·suite·lint·build·type check를 실행하지 않았으며 Manager 검증·Review·사용자 Merge는 남겨둔다.
 
 - 2026-10-06: R-010의 남은 원격 runtime 실행 목표는 기존 G-161과 같아 source와 G-012 선행 gate를 연결한다. pinned runtime 이전 임시 updater는 이미 제거됐다. 로컬 dirty 상태의 일괄 skip·diverged 금지는 최신 R-023·R-056의 disjoint fast-forward·보존형 rebase 정책으로 대체된 조건이므로 되살리지 않고 원격 격리·사용자 상태 보존을 검증한다. 기존 별도 관리 worktree·등록·Worker Git 쓰기 금지 구현은 중복 계획하지 않는다.
 

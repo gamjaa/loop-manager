@@ -1,11 +1,11 @@
-"""Preserving source checkout fast-forward effects."""
+"""Preserving source checkout synchronization effects."""
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
 from collections.abc import Mapping
 from loop_manager_internal.agents.scope_observation import _git_operation_path_signature
-from loop_manager_internal.git import manager_git_journal
+from loop_manager_internal.git import manager_git_journal, source_rebase
 from loop_manager_internal.runtime.contracts import BaseWorktreeSnapshot
 from loop_manager_internal.runtime.contracts import BaseWorktreeSyncResult
 from loop_manager_internal.runtime.contracts import GitLockError
@@ -196,11 +196,14 @@ def synchronize_base_worktree(effects: SynchronizeBaseWorktreeEffects,
     state_dir: Path | None = None,
     owner: str = "project",
 ) -> BaseWorktreeSyncResult:
-    """Best-effort fast-forward of an eligible primary checkout."""
+    """Best-effort synchronization; source results never gate remote work."""
 
     selected_remote = remote_sha or ""
     try:
         if state_dir is not None:
+            recovered = source_rebase.recover(effects, repo, state_dir, base)
+            if recovered is not None:
+                return recovered
             manager_git_journal.recover_active(
                 state_dir, repo=str(_canonical_path(repo)),
                 kind="source_fast_forward", target=str(_canonical_path(repo)),
@@ -293,8 +296,11 @@ def synchronize_base_worktree(effects: SynchronizeBaseWorktreeEffects,
                     + ahead.stdout[-2000:].strip(),
                     selected_remote,
                 )
-            reason = "ahead" if ahead.returncode == 0 else "diverged"
-            return BaseWorktreeSyncResult("skipped", reason, selected_remote)
+            if ahead.returncode == 0:
+                return BaseWorktreeSyncResult("skipped", "ahead", selected_remote)
+            return source_rebase.synchronize(
+                effects, repo, state_dir, base, selected_remote, before, owner,
+            )
 
         changed_paths = tuple(
             effects._nul_git_paths(
@@ -366,6 +372,16 @@ def synchronize_base_worktree(effects: SynchronizeBaseWorktreeEffects,
                     repo, selected_remote, before_state["index"], changed_paths,
                 ),
             }
+            slot = manager_git_journal._slot(
+                state_dir, str(_canonical_path(repo)), "source_fast_forward",
+                str(_canonical_path(repo)),
+            )
+            if (slot / "active.json").exists():
+                prior = manager_git_journal._read(slot / "active.json")
+                if prior["before"] == before_state and prior["expected"] == expected_state:
+                    return BaseWorktreeSyncResult(
+                        "failed", "동일 입력의 미확정 fast-forward 반복 보류; intent 보존", selected_remote,
+                    )
 
             def apply(token: str) -> None:
                 environment = {**os.environ,
@@ -412,6 +428,6 @@ def ensure_safe_base_worktree(effects: EnsureSafeBaseWorktreeEffects,
 
 def log_base_worktree_sync(effects: LogBaseWorktreeSyncEffects, repo: Path, result: BaseWorktreeSyncResult) -> None:
     effects.operation_log(
-        f"기본 worktree 동기화 {result.status} ({repo}): {result.reason}",
+        f"기본 worktree 동기화 {result.status} ({repo}, remote={result.remote_sha}): {result.reason}",
         error=result.status in {"skipped", "failed"},
     )

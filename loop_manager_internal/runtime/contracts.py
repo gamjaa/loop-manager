@@ -33,12 +33,6 @@ class RuntimeWorktree:
 
 
 @dataclass(frozen=True)
-class BootstrapRefreshHandoff:
-    base_branch: str
-    commit_sha: str
-
-
-@dataclass(frozen=True)
 class RuntimeMutation:
     source: Path
     path: Path

@@ -5,11 +5,36 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
+from loop_manager_internal.application import self_runtime
+from loop_manager_internal.application.contracts import WaitingPullRequestObservation
+from loop_manager_internal.runtime.project_registry import RegisteredProject
+from types import SimpleNamespace
 from tests.support.git import git_command
 from tests.support.worker import dummy_worker_sessions
 
 
 class SelfMergeHandoffTest(PrRecoveryFixture, unittest.TestCase):
+    def test_local_sync_status_never_gates_verified_self_merge_handoff(self):
+        project = RegisteredProject('/source', 'develop', 'codex', None, False)
+        old, remote = 'a' * 40, 'b' * 40
+        runtime = loop_manager.RuntimeMutation(Path('/source'), Path('/runtime'), old, 'c' * 32)
+        observation = WaitingPullRequestObservation((), True, ('https://example.test/pr/1',))
+        for status in ('updated', 'skipped', 'failed'):
+            with self.subTest(status=status):
+                sync = loop_manager.BaseWorktreeSyncResult(status, 'local checkout preserved', remote)
+                effects = self_runtime.FinishSelfMergeHandoffEffects(
+                    _registered_self_runtime_project=mock.Mock(return_value=True),
+                    ensure_safe_base_worktree=mock.Mock(return_value=sync),
+                    git=mock.Mock(side_effect=[SimpleNamespace(stdout=remote), SimpleNamespace(stdout=remote), SimpleNamespace(returncode=0)]),
+                    log_base_worktree_sync=mock.Mock(), operation_log=mock.Mock(),
+                )
+                with mock.patch.object(self_runtime.scoped_blocking, 'project_block', return_value=None):
+                    with self.assertRaises(loop_manager.SelfMergeRuntimeHandoff):
+                        self_runtime._finish_self_merge_handoff(effects, None, project, Path('/state'), runtime, observation)
+                effects.ensure_safe_base_worktree.assert_called_once_with(
+                    Path('/source'), 'develop', remote_sha=remote, state_dir=Path('/state'))
+                effects.git.assert_called_with(Path('/source'), 'merge-base', '--is-ancestor', old, remote, check=False)
+                self.assertIn('source_sync=' + status, effects.operation_log.call_args.args[0])
 
     def test_self_merge_handoff_persists_merge_before_parallel_submission(self):
         with tempfile.TemporaryDirectory() as directory:

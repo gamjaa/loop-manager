@@ -190,7 +190,7 @@ PR 없는 게시 checkpoint의 과거 Review 횟수 차단은 현재 게시 소�
 
 1. 같은 사용자 상태 디렉터리의 다른 Loop Manager가 실행 중이면 상태를 바꾸지 않고 종료한다
 2. 각 프로젝트의 PR, worktree와 저장된 실행 상태를 외부 상태와 대조한다
-3. 기본 worktree의 dirty, staged, untracked, ahead, diverged, detached 또는 다른 branch 상태는 원격 SHA 기반 작업을 막지 않는다. safe fast-forward 조건을 만족하지 않으면 기본 worktree 동기화만 건너뛴다
+3. 기본 worktree의 dirty, staged, untracked, ahead, diverged, detached 또는 다른 branch 상태는 원격 SHA 기반 작업을 막지 않는다. 안전한 fast-forward·로컬 commit 보존 rebase 조건을 만족하지 않으면 기본 worktree 동기화만 건너뛴다
 4. 프로젝트별로 하나의 작업만 선택하고 전체 동시 실행 수를 `max_workers`로 제한한다
 5. 처리 중인 상태, 세션과 작업 공간을 SQLite에 저장한다
 6. 중단된 작업은 다음 실행에서 저장된 상태부터 재개한다
@@ -277,10 +277,11 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 - 사용자는 원격 기준에 게시하는 ExecPlan의 정확한 AGENTS.md Proposal과 User Decision으로 사전 승인할 수 있다. Worker 시작 전에 결정과 당시 기준 파일을 대조하고 유효한 patch만 허용한다. 기준이 바뀌면 재승인을 기다리며 로컬 본문·포괄적 허락·Agent가 작성한 승인은 인정하지 않는다. 실제 결과와 최신 base 검증, Review와 사용자 Merge는 유지한다.
 - 기본 worktree의 로컬 변경, checkout branch와 ahead·diverged 이력은 자동 작업을 막지 않으며 local-only 내용은 자동 입력에 포함하지 않는다
 
-- 기본 worktree의 안전한 동기화가 불가능하면 이유를 기록하고 로컬 상태를 보존하며 원격 SHA 기반 작업을 계속한다. 검증된 safe fast-forward 외의 기본 worktree 변경은 수행하지 않는다.
+- 기본 worktree는 equal이면 무변경, ahead이면 보존·skip, behind이면 disjoint 로컬 변경과 index·ignored 파일을 보존하는 safe fast-forward로 처리한다. clean diverged의 확인된 선형 로컬 commit은 durable intent 아래 원격 base 위로 rebase하며 자동 push하지 않는다. dirty 작업·merge commit·겹치는 ignored 경로·사용자 operation·소유권 불확실은 보존·skip한다. 실패·중단에서 소유 작업과 실제 ref·index·파일이 일치할 때만 복구하고 동일 입력의 실패 Git 쓰기를 반복하지 않는다.
+- bootstrap은 process lock 아래 등록된 self base(미등록이면 `main`)의 원격 SHA를 확정하고 그 revision의 bootstrap·runtime을 같은 실행에서 시작한다. source HEAD·branch·동기화 성공은 실행 조건이 아니며 로컬 코드를 실행 입력으로 사용하지 않는다. source 기준 절대 config 경로·interpreter·인자를 전달하고 자식 종료까지 부모 lock을 유지한다. 원격 revision·runtime 소유권 검증 실패는 보존·진단하며 로컬 HEAD나 오래된 코드로 대체 실행하지 않는다.
 
 - Loop Manager가 만드는 계획과 구현 변경은 대상 프로젝트 밖의 Loop Manager 관리 경로에 만든 별도 worktree와 branch에만 기록한다
-- 자동 실행 중 기본 worktree에서는 검증된 `git merge --ff-only` 상당의 safe fast-forward 외에 checkout, pull, reset, stash, clean, commit과 파일 생성을 수행하지 않는다
+- 자동 실행 중 기본 worktree에서는 위의 safe fast-forward와 소유권·로컬 commit 보존이 검증된 rebase·abort 외에 checkout, pull, reset, stash, clean, commit과 파일 생성을 수행하지 않는다
 
 ### 작업 선택과 동시 실행
 

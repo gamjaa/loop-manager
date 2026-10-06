@@ -20,9 +20,220 @@ from tests.support.origin import (
     remote_fixture, advance_remote, OriginScopeFixture,
 )
 from loop_manager_internal.runtime import bootstrap
+from loop_manager_internal.git import source_rebase
 
 
 class SourceSynchronizationTests(unittest.TestCase):
+    def test_sync_log_distinguishes_remote_revision_and_local_failure(self):
+        result = loop_manager.BaseWorktreeSyncResult("failed", "diverged conflict preserved", "a" * 40)
+        with mock.patch("loop_manager.operation_log") as log:
+            loop_manager.log_base_worktree_sync(Path("/source"), result)
+        message = log.call_args.args[0]
+        self.assertIn("remote=" + "a" * 40, message)
+        self.assertIn("diverged conflict preserved", message)
+        self.assertTrue(log.call_args.kwargs["error"])
+
+    def _diverged(self, directory, *, conflict=False):
+        _remote, source, writer = remote_fixture(directory)
+        path = "tracked.txt" if conflict else "local.txt"
+        (source / path).write_text("local\n")
+        original = commit_all(source, "Local only")
+        state = Path(directory) / "state"
+        remote = advance_remote(writer)
+        loop_manager._recorded_base_fetch(source, state, "main", owner="project")
+        return source, writer, state, original, remote
+
+    def test_clean_diverged_replays_local_commits_without_publishing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, writer, state, original, remote = self._diverged(directory)
+            ignored = source / "ignored/config.ini"
+            ignored.parent.mkdir(); ignored.write_text("secret\n")
+            (source / "second.txt").write_text("second\n")
+            original = commit_all(source, "Second local commit")
+            git(source, "branch", "user-topic")
+            git(source, "config", "rebase.updateRefs", "true")
+            result = loop_manager.synchronize_base_worktree(source, "main", remote_sha=remote, state_dir=state)
+            self.assertEqual(result.status, "updated", result.reason)
+            self.assertEqual(result.remote_sha, remote)
+            self.assertEqual(git(source, "rev-list", "--count", f"{remote}..HEAD"), "2")
+            self.assertTrue(loop_manager.checkpoint_ownership.rebase_preserves_commits(
+                source, original, git(source, "rev-parse", "HEAD"), remote, loop_manager.git))
+            self.assertEqual(git(source, "rev-parse", "user-topic"), original)
+            self.assertEqual(git(writer, "ls-remote", "--heads", "origin", "main").split()[0], remote)
+            self.assertEqual(ignored.read_text(), "secret\n")
+            self.assertEqual((source / "local.txt").read_text(), "local\n")
+            self.assertEqual((source / "tracked.txt").read_text(), "two\n")
+            self.assertEqual(git(source, "stash", "list"), "")
+            self.assertFalse(list((state / "manager-git-journal").glob("*/active.json")))
+
+    def test_diverged_dirty_index_and_intermediate_ignored_overlap_are_preserved(self):
+        for scenario in ("staged", "unstaged", "untracked", "index-flag", "ignored-intermediate", "operation"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                source, _writer, state, _original, remote = self._diverged(directory)
+                if scenario in {"staged", "unstaged", "untracked"}:
+                    path = source / ("tracked.txt" if scenario != "untracked" else "user.txt")
+                    path.write_text("dirty\n")
+                    if scenario == "staged":
+                        git(source, "add", path.name)
+                elif scenario == "index-flag":
+                    git(source, "update-index", "--skip-worktree", "tracked.txt")
+                elif scenario == "ignored-intermediate":
+                    ignored = source / "ignored/temporary.txt"
+                    ignored.parent.mkdir(); ignored.write_text("committed\n")
+                    git(source, "add", "-f", "ignored/temporary.txt")
+                    git(source, "commit", "-m", "Intermediate file")
+                    git(source, "rm", "ignored/temporary.txt")
+                    git(source, "commit", "-m", "Remove intermediate file")
+                    ignored.parent.mkdir(exist_ok=True); ignored.write_text("preserve\n")
+                else:
+                    operation = Path(git(source, "rev-parse", "--git-path", "MERGE_HEAD"))
+                    if not operation.is_absolute(): operation = source / operation
+                    operation.write_text(remote + "\n")
+                before = source_rebase._observe(loop_manager._source_sync_effects_synchronize_base_worktree(), source, "main")
+                result = loop_manager.synchronize_base_worktree(source, "main", remote_sha=remote, state_dir=state)
+                self.assertEqual(result.status, "skipped", result.reason)
+                self.assertEqual(source_rebase._observe(loop_manager._source_sync_effects_synchronize_base_worktree(), source, "main"), before)
+
+    def test_owned_conflict_restores_start_and_does_not_repeat_until_inputs_change(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, writer, state, original, remote = self._diverged(directory, conflict=True)
+            before_index = git(source, "ls-files", "--stage", "-v")
+            result = loop_manager.synchronize_base_worktree(source, "main", remote_sha=remote, state_dir=state)
+            self.assertEqual(result.status, "failed", result.reason)
+            self.assertEqual(git(source, "rev-parse", "HEAD"), original)
+            self.assertEqual(git(source, "ls-files", "--stage", "-v"), before_index)
+            self.assertEqual((source / "tracked.txt").read_text(), "local\n")
+            self.assertFalse(loop_manager._git_operation_entries(source))
+            real_git = loop_manager.git
+            with mock.patch("loop_manager.git", wraps=real_git) as commands:
+                repeated = loop_manager.synchronize_base_worktree(source, "main", remote_sha=remote, state_dir=state)
+            self.assertEqual(repeated.status, "skipped", repeated.reason)
+            self.assertFalse(any("rebase" in call.args[1:] for call in commands.call_args_list))
+            remote = advance_remote(writer, path="another.txt")
+            loop_manager._recorded_base_fetch(source, state, "main", owner="project")
+            with mock.patch("loop_manager.git", wraps=real_git) as commands:
+                loop_manager.synchronize_base_worktree(source, "main", remote_sha=remote, state_dir=state)
+            self.assertTrue(any("rebase" in call.args[1:] for call in commands.call_args_list))
+
+    def test_interrupted_success_reuses_completion_and_rejects_later_user_changes(self):
+        for mutation in (None, "ref", "index", "file"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                source, _writer, state, original, remote = self._diverged(directory)
+                with mock.patch.object(manager_git_journal, "_finish", side_effect=RuntimeError("interrupted")):
+                    self.assertEqual(loop_manager.synchronize_base_worktree(source, "main", remote_sha=remote, state_dir=state).status, "failed")
+                head = git(source, "rev-parse", "HEAD")
+                self.assertNotEqual(head, original)
+                if mutation == "ref":
+                    git(source, "update-ref", "-m", "external away", "refs/heads/main", original)
+                    git(source, "update-ref", "-m", "external back", "refs/heads/main", head)
+                elif mutation == "index":
+                    git(source, "update-index", "--assume-unchanged", "local.txt")
+                elif mutation == "file":
+                    (source / "local.txt").write_text("later user edit\n")
+                effects = loop_manager._source_sync_effects_synchronize_base_worktree()
+                before = source_rebase._observe(effects, source, "main")
+                with mock.patch("loop_manager.git", wraps=loop_manager.git) as commands:
+                    result = loop_manager.synchronize_base_worktree(source, "main", remote_sha=remote, state_dir=state)
+                self.assertEqual(result.status, "updated" if mutation is None else "failed", result.reason)
+                self.assertEqual(source_rebase._observe(effects, source, "main"), before)
+                self.assertFalse(any("rebase" in call.args[1:] for call in commands.call_args_list))
+
+    def test_interrupted_conflict_only_aborts_unchanged_owned_receipt(self):
+        for mutation in (None, "file", "operation", "no-receipt"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                source, _writer, state, _original, remote = self._diverged(directory, conflict=True)
+                with mock.patch.object(source_rebase, "_restore_failure", side_effect=RuntimeError("interrupted")):
+                    self.assertEqual(loop_manager.synchronize_base_worktree(source, "main", remote_sha=remote, state_dir=state).status, "failed")
+                if mutation == "file":
+                    (source / "tracked.txt").write_text("user resolution\n")
+                elif mutation == "operation":
+                    path = Path(git(source, "rev-parse", "--git-path", "rebase-merge/onto"))
+                    if not path.is_absolute(): path = source / path
+                    path.write_text(_original + "\n")
+                elif mutation == "no-receipt":
+                    slot = manager_git_journal._slot(state, str(source), "source_rebase", str(source))
+                    next(slot.glob("*.invocation.json")).unlink()
+                effects = loop_manager._source_sync_effects_synchronize_base_worktree()
+                before = source_rebase._observe(effects, source, "main")
+                result = loop_manager.synchronize_base_worktree(source, "main", remote_sha=remote, state_dir=state)
+                self.assertEqual(result.status, "failed", result.reason)
+                self.assertFalse(manager_git_journal.has_pending_project_mutation(state, str(source)))
+                if mutation is None:
+                    self.assertFalse(loop_manager._git_operation_entries(source))
+                    self.assertEqual((source / "tracked.txt").read_text(), "local\n")
+                else:
+                    self.assertEqual(source_rebase._observe(effects, source, "main"), before)
+
+    def test_interrupted_abort_finalization_reuses_restored_start_without_another_git_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source, _writer, state, original, remote = self._diverged(directory, conflict=True)
+            with mock.patch.object(manager_git_journal, "_finish", side_effect=RuntimeError("interrupted after abort")):
+                result = loop_manager.synchronize_base_worktree(source, "main", remote_sha=remote, state_dir=state)
+            self.assertEqual(result.status, "failed")
+            self.assertEqual(git(source, "rev-parse", "HEAD"), original)
+            self.assertFalse(loop_manager._git_operation_entries(source))
+            with mock.patch("loop_manager.git", wraps=loop_manager.git) as commands:
+                recovered = loop_manager.synchronize_base_worktree(source, "main", remote_sha=remote, state_dir=state)
+            self.assertEqual(recovered.status, "failed", recovered.reason)
+            self.assertFalse(any("rebase" in call.args[1:] for call in commands.call_args_list))
+            self.assertEqual((source / "tracked.txt").read_text(), "local\n")
+            self.assertFalse(list((state / "manager-git-journal").glob("*/active.json")))
+
+    def test_failed_fast_forward_is_not_repeated_at_identical_inputs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _remote, source, writer = remote_fixture(directory)
+            state = Path(directory) / "state"
+            remote = advance_remote(writer)
+            loop_manager._recorded_base_fetch(source, state, "main", owner="project")
+            real_git = loop_manager.git
+            attempts = []
+            def locked(repo, *args, **kwargs):
+                if args[:2] == ("merge", "--ff-only"):
+                    attempts.append(args)
+                    return subprocess.CompletedProcess(args, 128, "index.lock exists")
+                return real_git(repo, *args, **kwargs)
+            with mock.patch("loop_manager.git", side_effect=locked):
+                for _ in range(2):
+                    result = loop_manager.synchronize_base_worktree(source, "main", remote_sha=remote, state_dir=state)
+                    self.assertEqual(result.status, "failed")
+                self.assertEqual(len(attempts), 1)
+                remote = advance_remote(writer, path="next.txt")
+                loop_manager._recorded_base_fetch(source, state, "main", owner="project")
+                self.assertEqual(loop_manager.synchronize_base_worktree(source, "main", remote_sha=remote, state_dir=state).status, "failed")
+                self.assertEqual(len(attempts), 2)
+            self.assertFalse(manager_git_journal.has_pending_project_mutation(state, str(source)))
+
+    def test_source_rebase_lock_and_concurrent_eligibility_changes_are_preserved(self):
+        for scenario in ("lock", "concurrent-file", "concurrent-remote"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                source, _writer, state, original, remote = self._diverged(directory)
+                if scenario == "lock":
+                    lock = Path(git(source, "rev-parse", "--git-path", "index.lock"))
+                    if not lock.is_absolute(): lock = source / lock
+                    lock.write_text("user-lock\n")
+                    result = loop_manager.synchronize_base_worktree(source, "main", remote_sha=remote, state_dir=state)
+                    self.assertEqual(result.status, "failed", result.reason)
+                    self.assertEqual(lock.read_text(), "user-lock\n")
+                else:
+                    real_snapshot = loop_manager._base_worktree_snapshot
+                    calls = 0
+                    def raced(repo):
+                        nonlocal calls
+                        calls += 1
+                        if calls == 2:
+                            if scenario == "concurrent-file":
+                                (repo / "local.txt").write_text("user edit\n")
+                            else:
+                                git(repo, "update-ref", "refs/remotes/origin/main", original)
+                        return real_snapshot(repo)
+                    with mock.patch("loop_manager._base_worktree_snapshot", side_effect=raced):
+                        result = loop_manager.synchronize_base_worktree(source, "main", remote_sha=remote, state_dir=state)
+                    self.assertEqual(result.status, "skipped", result.reason)
+                    if scenario == "concurrent-file":
+                        self.assertEqual((source / "local.txt").read_text(), "user edit\n")
+                self.assertEqual(git(source, "rev-parse", "HEAD"), original)
+                self.assertFalse(loop_manager._git_operation_entries(source))
+
     def test_source_fast_forward_recovers_without_touching_disjoint_local_delta(self):
         with tempfile.TemporaryDirectory() as directory:
             _remote, source, writer = remote_fixture(directory)
