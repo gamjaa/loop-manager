@@ -46,6 +46,8 @@ def run_project_result(
     on_step_completed: Callable[[], None] | None = None,
     runtime_mutation: RuntimeMutation | None = None,
     external_run_id: str | None = None,
+    recovery_request_id: str | None = None,
+    recovery_plan_id: str | None = None,
 ) -> ProjectRunResult:
     """Run one scheduler invocation and project its external failure outcome."""
 
@@ -66,6 +68,10 @@ def run_project_result(
             refactoring_review_interval=refactoring_review_interval,
             verify_timeout_seconds=verify_timeout_seconds,
             on_step_completed=on_step_completed, runtime_mutation=runtime_mutation,
+            **({
+                "recovery_request_id": recovery_request_id,
+                "recovery_plan_id": recovery_plan_id,
+            } if recovery_request_id is not None else {}),
         )
         return outcome
     except SelfMergeRuntimeHandoff:
@@ -125,6 +131,8 @@ def _run_project_result(
     verify_timeout_seconds: int = 600,
     on_step_completed: Callable[[], None] | None = None,
     runtime_mutation: RuntimeMutation | None = None,
+    recovery_request_id: str | None = None,
+    recovery_plan_id: str | None = None,
 ) -> ProjectRunResult:
     """Run retryable validation progress to a stable project-level outcome."""
 
@@ -134,8 +142,18 @@ def _run_project_result(
         recovery_state.ensure_schema(connection)
     recovery_attempts: dict[str, int] = {}
     pause_detail: str | None = None
+
+    def checkpoint_dispatch_scope() -> tuple[bool, str | None]:
+        if recovery_request_id is None or recovery_plan_id is None:
+            return True, None
+        active = runtime_state.RuntimeStateRepository(connection).active_row(repo)
+        if active is not None and str(active["plan_id"]) != recovery_plan_id:
+            return False, recovery_plan_id
+        return True, recovery_plan_id
+
     while True:
-        if effects._checkpoint_dispatch_ready(connection, repo):
+        dispatch_checkpoints, checkpoint_plan_id = checkpoint_dispatch_scope()
+        if dispatch_checkpoints and effects._checkpoint_dispatch_ready(connection, repo):
             project_before = connection.execute(
                 "SELECT phase, pr_conflict_recovery FROM projects WHERE repo = ?",
                 (repo,),
@@ -157,7 +175,7 @@ def _run_project_result(
             pending_before = (
                 blocked_checkpoint_state.BlockedCheckpointRepository(
                     connection
-                ).pending(repo)
+                ).pending(repo, plan_id=checkpoint_plan_id)
             )
             if any(
                 request.request_identity not in checkpoint_attempts
@@ -168,6 +186,7 @@ def _run_project_result(
                     Path(repo),
                     state_dir,
                     repo,
+                    plan_id=checkpoint_plan_id,
                     skip_identities=frozenset(checkpoint_attempts),
                 )
                 checkpoint_attempts.update(
@@ -197,6 +216,10 @@ def _run_project_result(
             step_result = effects._run_project_step(
                 *step_arguments,
                 **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
+                **({
+                    "recovery_request_id": recovery_request_id,
+                    "recovery_plan_id": recovery_plan_id,
+                } if recovery_request_id is not None else {}),
             )
         except GitLockError as error:
             effects._record_project_recovery(
@@ -236,11 +259,12 @@ def _run_project_result(
                     step_result = PROJECT_STEP_TRANSIENT_PAUSE
                     pause_detail = str(record["detail"])
                     break
-        if effects._checkpoint_dispatch_ready(connection, repo):
+        dispatch_checkpoints, checkpoint_plan_id = checkpoint_dispatch_scope()
+        if dispatch_checkpoints and effects._checkpoint_dispatch_ready(connection, repo):
             pending_after = (
                 blocked_checkpoint_state.BlockedCheckpointRepository(
                     connection
-                ).pending(repo)
+                ).pending(repo, plan_id=checkpoint_plan_id)
             )
             if any(
                 request.request_identity not in checkpoint_attempts
@@ -251,6 +275,7 @@ def _run_project_result(
                     Path(repo),
                     state_dir,
                     repo,
+                    plan_id=checkpoint_plan_id,
                     skip_identities=frozenset(checkpoint_attempts),
                 )
                 checkpoint_attempts.update(

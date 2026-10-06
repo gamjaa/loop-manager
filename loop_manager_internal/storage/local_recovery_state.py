@@ -1,0 +1,194 @@
+"""Audited, bounded requests to recheck a registered project's local state."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+import hashlib
+import json
+import sqlite3
+import uuid
+
+
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS local_environment_recovery_requests (
+    request_id TEXT PRIMARY KEY,
+    repo TEXT NOT NULL,
+    plan_id TEXT,
+    status TEXT NOT NULL CHECK (status IN ('pending', 'completed')),
+    before_state TEXT NOT NULL,
+    after_state TEXT,
+    result TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    completed_at TEXT
+);
+CREATE UNIQUE INDEX IF NOT EXISTS one_pending_local_recovery_per_repo
+ON local_environment_recovery_requests(repo) WHERE status = 'pending';
+"""
+
+
+class LocalRecoveryRequestError(RuntimeError):
+    """A recovery request conflicts with the current durable request scope."""
+
+
+@dataclass(frozen=True)
+class LocalRecoveryRequest:
+    request_id: str
+    repo: str
+    plan_id: str | None
+    status: str
+    resumed: bool
+
+
+def ensure_schema(connection: sqlite3.Connection) -> None:
+    connection.executescript(SCHEMA)
+
+
+def _digest(value: object) -> str:
+    raw = value if isinstance(value, bytes) else str(value or "").encode("utf-8")
+    return hashlib.sha256(raw).hexdigest()
+
+
+def snapshot(connection: sqlite3.Connection, repo: str, plan_id: str | None) -> dict:
+    """Capture cause identities and retry/promotion history without storing secrets."""
+    project = connection.execute(
+        "SELECT phase, planning_error, pr_conflict_recovery FROM projects WHERE repo = ?",
+        (repo,),
+    ).fetchone()
+    selected_plans = connection.execute(
+        "SELECT plan_id, status, blocked_reason, blocked_fingerprint, retry_count, "
+        "verify_failure_history, review_failure_history, initial_worker_level, "
+        "effective_worker_level, review_level_history, current_revision_sha, plan_sha "
+        "FROM exec_plans WHERE repo = ? AND (? IS NULL OR plan_id = ?) ORDER BY plan_id",
+        (repo, plan_id, plan_id),
+    ).fetchall()
+    blocks: list[dict] = []
+    for table, scope in (("execplan_blocks", "plan"), ("project_blocks", "project")):
+        exists = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", (table,),
+        ).fetchone()
+        if exists is None:
+            continue
+        sql = f"SELECT plan_id, reason_code, evidence, release_fingerprint FROM {table} WHERE repo = ?"
+        args: tuple[object, ...] = (repo,)
+        if scope == "plan" and plan_id is not None:
+            sql += " AND plan_id = ?"
+            args += (plan_id,)
+        blocks.extend({
+            "scope": scope,
+            "plan_id": str(row[0]) if row[0] is not None else None,
+            "reason_code": str(row[1]),
+            "evidence_sha256": _digest(row[2]),
+            "release_fingerprint_sha256": _digest(row[3]) if row[3] else None,
+        } for row in connection.execute(sql, args))
+    recoveries: list[dict] = []
+    exists = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='recovery_records'",
+    ).fetchone()
+    if exists is not None:
+        rows = connection.execute(
+            "SELECT subject, generation, reason_code, disposition, pending_action, phase, "
+            "fingerprint, progress_marker, occurrence, attempts, recovery_counts, "
+            "occurrence_index, detail FROM recovery_records WHERE repo = ? "
+            "AND (? IS NULL OR subject IN (?, '__project__')) ORDER BY subject",
+            (repo, plan_id, plan_id),
+        )
+        recoveries = [{
+            "subject": str(row[0]), "generation": int(row[1]),
+            "reason_code": str(row[2]), "disposition": str(row[3]),
+            "pending_action": str(row[4]), "phase": str(row[5]),
+            "fingerprint_sha256": _digest(row[6]),
+            "progress_marker_sha256": _digest(row[7]),
+            "occurrence": int(row[8]), "attempts": int(row[9]),
+            "recovery_counts_sha256": _digest(row[10]),
+            "occurrence_index_sha256": _digest(row[11]),
+            "detail_sha256": _digest(row[12]),
+        } for row in rows]
+    plans = [{
+        "plan_id": str(row[0]), "status": str(row[1]),
+        "blocked_reason": str(row[2]) if row[2] else None,
+        "blocked_fingerprint_sha256": _digest(row[3]) if row[3] else None,
+        "retry_count": int(row[4]),
+        "verify_failure_history_sha256": _digest(row[5]),
+        "review_failure_history_sha256": _digest(row[6]),
+        "initial_worker_level": int(row[7]) if row[7] is not None else None,
+        "effective_worker_level": int(row[8]) if row[8] is not None else None,
+        "review_level_history_sha256": _digest(row[9]),
+        "revision_sha256": _digest(row[10] or row[11]),
+    } for row in selected_plans]
+    return {
+        "phase": str(project[0] or "") if project else "",
+        "planning_error_sha256": _digest(project[1]) if project and project[1] else None,
+        "pr_conflict_recovery": bool(project[2]) if project else False,
+        "plans": plans,
+        "blocks": sorted(blocks, key=lambda item: (item["scope"], item["plan_id"] or "")),
+        "recoveries": recoveries,
+    }
+
+
+def begin_request(
+    connection: sqlite3.Connection, repo: str, plan_id: str | None,
+) -> LocalRecoveryRequest:
+    ensure_schema(connection)
+    pending = connection.execute(
+        "SELECT request_id, plan_id FROM local_environment_recovery_requests "
+        "WHERE repo = ? AND status = 'pending'",
+        (repo,),
+    ).fetchone()
+    if pending is not None:
+        current_plan = str(pending[1]) if pending[1] is not None else None
+        if current_plan != plan_id:
+            raise LocalRecoveryRequestError(
+                "다른 범위의 로컬 환경 재검사 요청이 중단된 채 남아 있습니다. "
+                f"같은 명령으로 먼저 재개하세요 (계획: {current_plan or 'project'})."
+            )
+        return LocalRecoveryRequest(str(pending[0]), repo, plan_id, "pending", True)
+    before = json.dumps(snapshot(connection, repo, plan_id), sort_keys=True, separators=(",", ":"))
+    request_id = uuid.uuid4().hex
+    try:
+        with connection:
+            connection.execute(
+                "INSERT INTO local_environment_recovery_requests "
+                "(request_id, repo, plan_id, status, before_state) VALUES (?, ?, ?, 'pending', ?)",
+                (request_id, repo, plan_id, before),
+            )
+    except sqlite3.IntegrityError as error:
+        raise LocalRecoveryRequestError(
+            "다른 로컬 환경 재검사 요청이 먼저 시작됐습니다. 같은 명령으로 재개하세요."
+        ) from error
+    return LocalRecoveryRequest(request_id, repo, plan_id, "pending", False)
+
+
+def complete_request(
+    connection: sqlite3.Connection, request: LocalRecoveryRequest,
+    result: str,
+) -> dict:
+    after = snapshot(connection, request.repo, request.plan_id)
+    serialized = json.dumps(after, sort_keys=True, separators=(",", ":"))
+    with connection:
+        changed = connection.execute(
+            "UPDATE local_environment_recovery_requests SET status = 'completed', "
+            "after_state = ?, result = ?, updated_at = CURRENT_TIMESTAMP, "
+            "completed_at = CURRENT_TIMESTAMP WHERE request_id = ? AND status = 'pending'",
+            (serialized, result, request.request_id),
+        )
+        if changed.rowcount != 1:
+            raise LocalRecoveryRequestError("로컬 재검사 요청 상태가 변경됐습니다.")
+    return after
+
+
+def record_progress(
+    connection: sqlite3.Connection, request: LocalRecoveryRequest,
+    after: dict,
+) -> None:
+    """Keep an unfinished bounded request resumable without issuing a new identity."""
+    serialized = json.dumps(after, sort_keys=True, separators=(",", ":"))
+    with connection:
+        changed = connection.execute(
+            "UPDATE local_environment_recovery_requests SET after_state = ?, "
+            "result = 'in_progress', updated_at = CURRENT_TIMESTAMP "
+            "WHERE request_id = ? AND status = 'pending'",
+            (serialized, request.request_id),
+        )
+        if changed.rowcount != 1:
+            raise LocalRecoveryRequestError("로컬 재검사 요청 상태가 변경됐습니다.")

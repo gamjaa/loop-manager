@@ -159,3 +159,48 @@ class VerifyTimeoutPolicyTests(unittest.TestCase):
         self.assertEqual(plan['worktree'], '/state/G-047')
         self.assertEqual(plan['worker_result'], 'saved Worker result')
         self.assertEqual(plan['verify_result'], 'whole verify timeout')
+
+    def test_manual_recheck_runs_timeout_verify_without_clearing_failure_history(self):
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        repository = runtime_state.RuntimeStateRepository(connection)
+        repository.activate(
+            'repo', 'G-047', activation_sha='base',
+            branch='loop-manager/G-047', worktree='/state/G-047',
+        )
+        history = '{"old-failure":{"occurrences":3,"sample":"timeout"}}'
+        repository.update_plan(
+            'repo', 'G-047', plan_values={
+                'retry_count': 3, 'verify_failure_history': history,
+                'effective_worker_level': 4, 'review_level_history': '{"4":2}',
+            },
+        )
+        repository.block_plan(
+            'repo', 'G-047',
+            reason_code=BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value,
+            evidence='9 of 10 tests completed', release_fingerprint='2',
+            plan_values={
+                'blocked_fingerprint': '2', 'worker_result': 'saved Worker result',
+                'verify_result': 'whole verify timeout',
+            },
+            clear_projection=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config.ini'
+            config.write_text('[loop]\nverify_timeout_seconds = 2\n', encoding='utf-8')
+            with mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'), mock.patch.object(
+                loop_manager, 'validate_blocked_agent_scope'
+            ):
+                self.assertTrue(loop_manager.resume_plan_blocks(
+                    connection, Path('repo'), Path('/state'), 'repo', 'main', config,
+                    plan_id='G-047', force_timeout_recheck=True,
+                ))
+        plan = connection.execute(
+            "SELECT status,retry_count,verify_failure_history,effective_worker_level,review_level_history "
+            "FROM exec_plans WHERE repo='repo' AND plan_id='G-047'"
+        ).fetchone()
+        self.assertEqual(plan['status'], 'VERIFYING')
+        self.assertEqual(plan['retry_count'], 3)
+        self.assertEqual(plan['verify_failure_history'], history)
+        self.assertEqual(plan['effective_worker_level'], 4)
+        self.assertEqual(plan['review_level_history'], '{"4":2}')

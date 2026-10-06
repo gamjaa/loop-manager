@@ -284,6 +284,8 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
     base: str,
     config_path: Path | None = None,
     verify_timeout_seconds: int | None = None,
+    plan_id: str | None = None,
+    force_timeout_recheck: bool = False,
 ) -> bool:
     """Reevaluate each plan block without letting one overwrite another."""
 
@@ -297,11 +299,22 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
         return False
     held = scoped_blocking.catalog_held_plan_ids(connection, repo)
     for blocked in effects.plan_blocked_execplans(connection, repo):
+        if plan_id is not None and str(blocked["plan_id"]) != plan_id:
+            continue
         if str(blocked["plan_id"]) in held:
             continue
         current_block = scoped_blocking.plan_block(
             connection, repo, str(blocked["plan_id"]),
         )
+        # An explicit local recheck may schedule the saved timeout validation
+        # again. Other block causes still require their own user/input gate.
+        current_reason = (
+            str(current_block["reason_code"])
+            if current_block is not None else str(blocked["blocked_reason"] or "")
+        )
+        if (force_timeout_recheck and current_reason
+                != BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value):
+            continue
         if scoped_blocking.is_scope_baseline_block(current_block):
             prior_projection = effects.project_execplan(connection, repo)
             if effects.resume_blocked_execplan_if_inputs_changed(
@@ -433,7 +446,7 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
                 if verify_timeout_seconds is not None
                 else effects.load_managed_config(config_path or effects.ROOT / "config/config.ini").verify_timeout_seconds
             )
-            if new_timeout <= old_timeout:
+            if new_timeout <= old_timeout and not force_timeout_recheck:
                 continue
             effects.hydrate_execplan_project(connection, repo, blocked)
             worktree = Path(str(blocked["worktree"]))
@@ -459,8 +472,6 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
                         "blocked_fingerprint": None,
                         "blocked_worktree_fingerprint": None,
                         "blocked_review_fingerprint": None,
-                        "verify_failure_history": "{}",
-                        "retry_count": 0,
                         "last_error": None,
                     },
                     project_values={"phase": "VERIFYING", "last_error": None},

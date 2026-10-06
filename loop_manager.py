@@ -3967,6 +3967,7 @@ execute_runtime_command = _bind_effects(
         operation_print=lambda *args, **kwargs: operation_print(*args, **kwargs),
         run_registered_projects=lambda *args, **kwargs: run_registered_projects(*args, **kwargs),
         manual_command=lambda *args, **kwargs: _manual_command(*args, **kwargs),
+        run_project_result=lambda *args, **kwargs: run_project_result(*args, **kwargs),
     ),
 )
 
@@ -4198,6 +4199,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     maintenance = subcommands.add_parser("maintenance-review", help="등록 프로젝트의 전체 정밀 점검을 다음 안전한 경계에 요청")
     maintenance.add_argument("repository", help="등록된 Git 저장소 루트")
+
+    recover = subcommands.add_parser(
+        "recover", help="등록 프로젝트의 로컬 환경 원인을 제한해 재검사",
+    )
+    recover.add_argument("repository", help="재검사할 등록 저장소 루트")
+    recover.add_argument("--plan", help="이 프로젝트 안의 특정 ExecPlan만 재검사")
 
     run = subcommands.add_parser("run", help="등록 프로젝트의 다음 작업을 처리")
     run.add_argument(
