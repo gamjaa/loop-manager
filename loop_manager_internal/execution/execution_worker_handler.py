@@ -888,7 +888,7 @@ class WorkerHandler:
                     context.plan.plan_id, self.ports.snapshot().level,
                 )
             self.ports.state.update_project(
-                self.ports.identity.repo,
+                self.ports.identity.repo, preserve_transaction=True,
                 phase='VERIFYING',
                 validated_base_sha=None,
                 worker_result=message,

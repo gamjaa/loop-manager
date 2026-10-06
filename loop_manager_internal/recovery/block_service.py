@@ -310,10 +310,14 @@ class TransitionValidationFailureEffects:
 def transition_validation_failure(
     effects: TransitionValidationFailureEffects, connection: sqlite3.Connection,
     repo: str, worktree: Path, stage: str, output: str,
+    *, review_level: int | None = None, candidate_head: str | None = None,
 ) -> ValidationFailureDecision:
     # Read, consume the correction identity, and advance the level in one write transaction.
     with runtime_state._transaction(connection):
-        return _transition_validation_failure(effects, connection, repo, worktree, stage, output)
+        return _transition_validation_failure(
+            effects, connection, repo, worktree, stage, output,
+            review_level=review_level, candidate_head=candidate_head,
+        )
 
 
 def _transition_validation_failure(
@@ -322,6 +326,7 @@ def _transition_validation_failure(
     worktree: Path,
     stage: str,
     output: str,
+    *, review_level: int | None = None, candidate_head: str | None = None,
 ) -> ValidationFailureDecision:
     """Persist stage-local failures and own their retry/BLOCKED transition."""
 
@@ -370,14 +375,13 @@ def _transition_validation_failure(
     serialized_level_history: str | None = None
     if stage == "review" and plan["effective_worker_level"] is not None:
         correction = review_correction_state.deserialize(plan["review_correction_state"])
-        observation = correction.pop('observation', {})
         level_decision = effects.evaluate_review_worker_level(
             plan["effective_worker_level"],
             effects._deserialize_review_level_history(plan["review_level_history"]),
             tuple(failure[0] for failure in recorded_failures),
             correction,
-            review_level=observation.get('level'),
-            candidate_head=observation.get('head'),
+            review_level=review_level,
+            candidate_head=candidate_head,
         )
         serialized_level_history = json.dumps(
             level_decision.review_history,

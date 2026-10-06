@@ -11,16 +11,7 @@ def deserialize(value: object) -> dict:
     state = json.loads(str(value or '{}'))
     if not isinstance(state, dict):
         raise RuntimeError('저장된 Review 교정 상태가 유효하지 않습니다.')
-    observation = state.get('observation')
-    if observation is not None and (
-        not isinstance(observation, dict)
-        or type(observation.get('level')) is not int or not 1 <= observation['level'] <= 8
-        or not isinstance(observation.get('head'), str) or not observation['head']
-    ):
-        raise RuntimeError('저장된 Review 관측 identity가 유효하지 않습니다.')
-    # An observation-only value is staged and consumed inside the same transaction
-    # for the first baseline, including an obsolete-level result.
-    if state and set(state) != {'observation'}:
+    if state:
         if (state.get('version') != 1
                 or type(state.get('level')) is not int
                 or not 1 <= state['level'] <= 8

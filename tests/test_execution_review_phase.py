@@ -483,7 +483,7 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
             with runtime_state._transaction(self.connection):
                 review_correction_state.verified(self.connection, 'repo', 'G-047', 'verified-head')
                 lm.clear_validation_failure_history(self.connection, 'repo', 'verify')
-                self.state.update_project('repo', phase='REVIEWING', verify_result='PASS')
+                self.state.update_project('repo', phase='REVIEWING', verify_result='PASS', preserve_transaction=True)
                 raise RuntimeError('interrupted')
         self.assertEqual(review_correction_state.load(self.connection, 'repo', 'G-047'), state)
         self.assertEqual(self.connection.execute(

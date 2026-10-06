@@ -5,7 +5,7 @@ from typing import Callable, Any, Mapping
 from loop_manager_internal.documents import document_drafts
 from loop_manager_internal.documents import document_publication
 import sys
-from loop_manager_internal.storage import review_correction_state, runtime_state
+from loop_manager_internal.storage import review_correction_state
 from loop_manager_internal.agents.agent_invocation import AttemptSequence, TrackedAgentCall
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, classify_exception
@@ -356,23 +356,10 @@ class ReviewHandler:
                 normalize_feedback('review', review) if verdict == 'FAIL' else (),
             )
         if verdict == 'FAIL':
-            with runtime_state._transaction(self.ports.state.connection):
-                correction = review_correction_state.load(
-                    self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id,
-                )
-                correction['observation'] = {
-                    'level': review_level,
-                    'head': candidate_head,
-                }
-                review_correction_state.save(
-                    self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id, correction,
-                )
-                decision = self.ports.transition_validation_failure(
-                    self.ports.identity.repo,
-                    context.worktree,
-                    'review',
-                    review,
-                )
+            decision = self.ports.transition_validation_failure(
+                self.ports.identity.repo, context.worktree, 'review', review,
+                review_level=review_level, candidate_head=candidate_head,
+            )
             self.ports.operation_log(
                 f"Worker 반환: {self.ports.snapshot().plan['id']} {self.ports.snapshot().plan['title']} (Review 실패)",
                 error=True,

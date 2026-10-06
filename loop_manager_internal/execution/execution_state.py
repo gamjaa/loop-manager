@@ -77,10 +77,13 @@ class ExecutionStatePort:
         row = self.repository.get(self.repo, self.plan_id)
         return {"last_error": row.last_error}
 
-    def update_project(self, repo, **values):
+    def update_project(self, repo, *, preserve_transaction=False, **values):
         if repo != self.repo:
             raise runtime_state.RuntimeStateError("execution repository identity 불일치")
-        with runtime_state._transaction(self.connection):
+        # Existing callers own the commit; paired correction writes explicitly
+        # retain their surrounding transaction until all evidence is stored.
+        with (runtime_state._transaction(self.connection)
+              if preserve_transaction else self.connection):
             expected = self.check()
             if expected is None:
                 raise runtime_state.RuntimeStateError("execution projection이 없습니다.")

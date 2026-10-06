@@ -51,3 +51,5 @@ priority: high
 - 구현은 기존 ISSUE_ID 지문, 검증 원문 감사, Review 교정 예약과 profile/session 전이를 재사용한다. 호환 가능한 `exec_plans.review_correction_state` JSON 열에 현재 level의 기준선·완료 교정 집계·미완료 turn·verify 후보 HEAD를 저장하며, 기존 level별 지문 이력에서 완료 횟수를 소급 추정하지 않는다. `storage/review_correction_state.py`는 이 저장 경계만 담당한다.
 - Worker의 정상 결과와 VERIFYING 전이, 성공한 후보 verify와 검증 토큰, 유효 FAIL의 교정 소비와 level 갱신을 기존 중첩 transaction helper로 묶는다. 낡은 level 후보의 Review, CLI/프로토콜 재시도와 교정 없는 재관측은 승격하지 않는다. 기준선·교정의 원본 Review ID·검증 HEAD·결과 지문·적용 level을 감사에 보존하며 PASS는 진행 중인 집계만 끝낸다. 정상 사용자 차단 해제만 새 교정 상태도 초기화한다.
 - PRODUCT의 최초 12개 level 조합과 명시 설정·교정 후 승격 규칙을 반영했다. 기존 `scripts/verify.sh`는 unittest manifest 자동 탐색으로 변경된 unit test를 포함하므로 수정할 필요가 없다. Worker는 전체 verify를 실행하지 않았으며 Manager 검증·읽기 전용 Review·사용자 Merge는 남아 있다.
+
+- Manager verify 진단에서 공통 `update_project`의 commit 동작을 바꾼 영향으로 rebase 완료가 열린 외부 transaction을 거절하는 회귀를 확인했다. 기존 호출의 commit 의미를 유지하고 새 Worker·verify의 결합 저장에서만 `preserve_transaction=True`로 기존 transaction helper를 사용한다. 유효 Review의 level·후보 HEAD는 전이 인자로 전달해 임시 관측 상태 저장을 제거했다. 재현한 unit case, 관련 복구 경계와 원자 rollback을 targeted 검증하며 전체 verify 재실행은 Manager에 맡긴다.

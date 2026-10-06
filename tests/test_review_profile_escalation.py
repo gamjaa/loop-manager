@@ -169,10 +169,10 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
         review_correction_state.begin_worker(connection, repo, 'G-019', level, source)
         review_correction_state.complete_worker(connection, repo, 'G-019', level)
         review_correction_state.verified(connection, repo, 'G-019', 'candidate')
-        state = review_correction_state.load(connection, repo, 'G-019')
-        state['observation'] = {'level': level, 'head': 'candidate'}
-        review_correction_state.save(connection, repo, 'G-019', state)
-        return loop_manager.transition_validation_failure(connection, repo, root, 'review', output)
+        return loop_manager.transition_validation_failure(
+            connection, repo, root, 'review', output,
+            review_level=level, candidate_head='candidate',
+        )
 
     @dummy_worker_sessions
     def test_review_level_persists_with_global_history_and_blocked_reset(self):
@@ -332,7 +332,10 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
                     "SELECT effective_worker_level FROM exec_plans WHERE plan_id = 'G-019'"
                 ).fetchone()[0], 4)
                 # Retry the same verified result; consume it once with the level update.
-                loop_manager.transition_validation_failure(connection, str(root), root, 'review', issue)
+                loop_manager.transition_validation_failure(
+                    connection, str(root), root, 'review', issue,
+                    review_level=4, candidate_head='candidate',
+                )
                 self.assertEqual(connection.execute(
                     "SELECT effective_worker_level FROM exec_plans WHERE plan_id = 'G-019'"
                 ).fetchone()[0], 5)

@@ -276,7 +276,7 @@ class VerifyHandler:
             )
             self.ports.clear_validation_failure_history(self.ports.identity.repo, 'verify')
             self.ports.state.update_project(
-                self.ports.identity.repo,
+                self.ports.identity.repo, preserve_transaction=True,
                 validated_base_sha=context.active_sha,
                 verify_result=output,
                 verify_token=(
