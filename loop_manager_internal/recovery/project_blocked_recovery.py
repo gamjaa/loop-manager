@@ -30,6 +30,7 @@ class ProjectRecoveryEffects(RecoveryWorkspaceEffects):
     push_diagnostic_checkpoint: Callable[..., object]
     reconcile_execplan_catalog: Callable[..., object]
     resume_project_block_if_safe: Callable[..., object]
+    preserve_blocked_diagnostics: Callable[..., object] | None = None
 
 
 @dataclass(frozen=True)
@@ -487,10 +488,18 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
             context = json.loads(saved['context'])
             key, stage = saved['input_identity'], saved['stage']
             if context.get('waiting_input') == observations.input_identity(row):
+                if self.ports.preserve_blocked_diagnostics is not None:
+                    request = BlockedCheckpointRepository(self.connection).get(self.repo, plan_id)
+                    if request:
+                        self.ports.preserve_blocked_diagnostics(self.connection, self.repo_path, self.state_dir, request, project_scope=True)
                 return 'blocked'
             context.pop('waiting_input', None)
         else:
             if not observations.pending_input(row):
+                if self.ports.preserve_blocked_diagnostics is not None:
+                    request = BlockedCheckpointRepository(self.connection).get(self.repo, plan_id)
+                    if request:
+                        self.ports.preserve_blocked_diagnostics(self.connection, self.repo_path, self.state_dir, request, project_scope=True)
                 return 'blocked'
             plan = self._plan(plan_id)
             block = scoped_blocking.project_block(self.connection, self.repo)
@@ -575,4 +584,8 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
                     self._save(plan_id, key, 'refused', context)
                     if not isinstance(error, InputChanged):
                         observations.mark_processed(self.connection, self.repo, plan_id, key)
+            if self.ports.preserve_blocked_diagnostics is not None:
+                request = BlockedCheckpointRepository(self.connection).get(self.repo, plan_id)
+                if request:
+                    self.ports.preserve_blocked_diagnostics(self.connection, self.repo_path, self.state_dir, request, project_scope=True)
             return 'blocked'

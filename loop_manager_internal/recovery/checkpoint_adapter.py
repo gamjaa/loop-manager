@@ -21,6 +21,7 @@ from loop_manager_internal.runtime.runtime_identity import _canonical_path
 from loop_manager_internal.storage import execution_checkpoint_state
 from pathlib import Path
 import json
+import hashlib
 import os
 import secrets
 import sqlite3
@@ -65,6 +66,85 @@ def _frozen_push_target(url: str) -> tuple[tuple[str, str], str]:
 
 
 class CheckpointSafetyAdapter:
+    def diagnostic_source(self, request):
+        """Prove the selected current scope even while its owned rebase waits."""
+        from loop_manager_internal.recovery.diagnostic_preservation import PreservationSource, artifact_observation, redact_detail
+        from loop_manager_internal.recovery.blocked_plan_reconciliation import slot_available
+        plan = self._plan(request)
+        project_block = scoped_blocking.project_block(self.connection, request.repo)
+        if project_block is not None and not self.project_recovery_scope:
+            raise RuntimeError('프로젝트 안전 차단의 연결 계획만 진단 보존할 수 있습니다.')
+        block = scoped_blocking.project_block(self.connection, request.repo) if self.project_recovery_scope else scoped_blocking.plan_block(
+            self.connection, request.repo, request.plan_id)
+        if block is None or not slot_available(self.connection, request.repo, request.plan_id):
+            raise RuntimeError('진단 보존의 원인 또는 변경 실행 자리를 확인할 수 없습니다.')
+        cause = dict(block)
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(request.repo, request.plan_id)
+        target = checkpoint.target_base_oid or plan['active_sha'] or plan['current_revision_sha'] or plan['plan_sha']
+        if not target or not request.worktree or not request.branch or plan['agent_recovery']:
+            raise RuntimeError('진단 보존의 target·작업 공간 또는 Agent 범위를 확인할 수 없습니다.')
+        observations = self.connection.execute(
+            'SELECT branch_oid FROM blocked_remote_observations WHERE repo = ? AND plan_id = ?',
+            (request.repo, request.plan_id)).fetchone()
+        remote = observations['branch_oid'] if observations else checkpoint.observed_remote_oid
+        service = self.safety_effects.current_scope_effects()._current_rebase_service(
+            self.connection, self.repo_path, self.state_dir, request.repo, request.plan_id,
+            Path(request.worktree), request.branch, target=target, remote_oid=remote)
+        def observe():
+            try:
+                return service.require_owned(checkpoint=execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(request.repo, request.plan_id))[0]
+            except manager_git_journal.MutationEvidenceError:
+                return artifact_observation(service)
+        observed = observe()
+        metadata = dict(observed.metadata or ())
+        worktree = Path(request.worktree)
+        snapshot = self.safety_effects.capture_git_snapshot(worktree)
+        revisions = dict(base=target, head=snapshot.head,
+                         start=metadata.get('orig-head', snapshot.head))
+        replay = self.safety_effects.git(worktree, 'rev-parse', '--verify', 'REBASE_HEAD^{commit}', check=False)
+        if metadata and replay.returncode == 0:
+            revisions['replay'] = replay.stdout.strip()
+        selection_base = target
+        if metadata:
+            selection_base = self.safety_effects.git(worktree, 'merge-base', target, revisions['start']).stdout.strip()
+        selection_revisions = [revisions['start']] if metadata else [snapshot.head]
+        remaining = self.safety_effects.git(worktree, 'rev-list', '--reverse',
+                                           target + '..' + revisions['start']).stdout.splitlines()
+        # Include original versions of commits still to replay, without making
+        # their entire trees/history reachable from the orphan diagnostic.
+        for index, oid in enumerate(remaining):
+            revisions['local-' + str(index)] = oid
+        selection_revisions.extend(oid for oid in remaining if oid not in selection_revisions)
+        def validate():
+            current = self._plan(request)
+            current_block = scoped_blocking.project_block(self.connection, request.repo) if self.project_recovery_scope else scoped_blocking.plan_block(
+                self.connection, request.repo, request.plan_id)
+            if (current_block is None or dict(current_block) != cause
+                    or (current['branch'], current['worktree']) != (request.branch, request.worktree)
+                    or not slot_available(self.connection, request.repo, request.plan_id)):
+                raise RuntimeError('진단 보존의 원인·소유권이 변경됐습니다.')
+            observe()
+            result = self.safety_effects.capture_git_snapshot(worktree)
+            origin_error = self._origin_safety_error(request, result)
+            if origin_error:
+                raise RuntimeError(origin_error.detail)
+            return result
+        approved = GitSnapshot.deserialize(plan['agent_result_snapshot']).dirty if plan['agent_result_snapshot'] else {}
+        def allowed(name):
+            if ('untracked' in snapshot.dirty.get(name, ((), ''))[0]
+                    and approved.get(name) != snapshot.dirty.get(name)):
+                return False
+            return bool(service.adapters.path_allowed(name))
+        scope = 'project' if self.project_recovery_scope else 'plan'
+        return PreservationSource(
+            request.repo, scope, request.plan_id,
+            hashlib.sha256(json.dumps(cause, sort_keys=True).encode()).hexdigest(),
+            request.branch, worktree, revisions,
+            dict(reason=request.reason_code, evidence=redact_detail(str(block['evidence'])),
+                 phase=plan['status'], operations=sorted(snapshot.operations),
+                 rebase=metadata, remaining_commits=remaining,
+                 selection_base=selection_base, selection_revisions=selection_revisions), allowed, validate)
+
     def _plan(self, request: blocked_checkpoint.CheckpointRequest) -> sqlite3.Row:
         if self.project_recovery_scope:
             row = self.connection.execute(

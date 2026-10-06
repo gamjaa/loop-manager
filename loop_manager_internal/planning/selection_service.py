@@ -84,6 +84,7 @@ class PlanningSelectionService(PlanningService):
                 f"보존된 planning worktree: {row.preserved_worktree}"
             )
             if row.planning_preserved_state:
+                self._ports.state.retry_diagnostic_preservation(run.context.repo, row)
                 return self._continue_published_work(run)
             return self._suspend_failed_planning(run)
         if row.planning_preserved_state:

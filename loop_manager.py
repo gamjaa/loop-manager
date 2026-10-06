@@ -346,6 +346,7 @@ from loop_manager_internal.recovery import block_service
 from loop_manager_internal.recovery import blocked_agent_service
 from loop_manager_internal.recovery import blocked_plan_service
 from loop_manager_internal.recovery import checkpoint_service
+from loop_manager_internal.recovery import diagnostic_preservation
 from loop_manager_internal.recovery import pr_ownership
 from loop_manager_internal.recovery import project_block_service
 from loop_manager_internal.recovery import recovery_adapter
@@ -782,6 +783,7 @@ _project_blocked_recovery_effects = _bind_effects(
         observe_blocked_plan_remotes=lambda *args, **kwargs: observe_blocked_plan_remotes(*args, **kwargs),
         pr_for_branch=lambda *args, **kwargs: pr_for_branch(*args, **kwargs),
         push_diagnostic_checkpoint=lambda *args, **kwargs: push_diagnostic_checkpoint(*args, **kwargs),
+        preserve_blocked_diagnostics=lambda *args, **kwargs: preserve_blocked_diagnostics(*args, **kwargs),
         reconcile_execplan_catalog=lambda *args, **kwargs: reconcile_execplan_catalog(*args, **kwargs),
         resume_project_block_if_safe=lambda *args, **kwargs: resume_project_block_if_safe(*args, **kwargs),
         unmet_execplan_dependencies=lambda *args, **kwargs: unmet_execplan_dependencies(*args, **kwargs),
@@ -3578,6 +3580,7 @@ _PlanningStatePorts = _bind_effects(
         is_loop_manager_repository=lambda *args, **kwargs: is_loop_manager_repository(*args, **kwargs),
         prerequisite_validation_rows=lambda *args, **kwargs: prerequisite_validation_rows(*args, **kwargs),
         preserve_planning_diagnostics=lambda *args, **kwargs: preserve_planning_diagnostics(*args, **kwargs),
+        preserve_remote_planning_diagnostics=lambda *args, **kwargs: preserve_remote_planning_diagnostics(*args, **kwargs),
         publish_general_planning_batch=lambda *args, **kwargs: publish_general_planning_batch(*args, **kwargs),
         publish_maintenance_planning_batch=lambda *args, **kwargs: publish_maintenance_planning_batch(*args, **kwargs),
         record_general_planning_publication_intent=lambda *args, **kwargs: record_general_planning_publication_intent(*args, **kwargs),
@@ -3957,8 +3960,33 @@ push_diagnostic_checkpoint = _bind_effects(
 dispatch_blocked_checkpoints = _bind_effects(
     checkpoint_service.dispatch_blocked_checkpoints, lambda: checkpoint_service.DispatchBlockedCheckpointsEffects(
         _BlockedCheckpointAdapter=lambda *args, **kwargs: _BlockedCheckpointAdapter(*args, **kwargs),
+        preserve_blocked_diagnostics=lambda *args, **kwargs: preserve_blocked_diagnostics(*args, **kwargs),
     ),
 )
+
+
+def _diagnostic_preservation_effects():
+    return diagnostic_preservation.PreservationEffects(
+        git=lambda *args, **kwargs: git(*args, **kwargs),
+        git_bytes=lambda *args, **kwargs: git_bytes(*args, **kwargs),
+        push_diagnostic_checkpoint=lambda *args, **kwargs: push_diagnostic_checkpoint(*args, **kwargs))
+
+
+def preserve_blocked_diagnostics(connection, repo_path, state_dir, request, *, project_scope=False):
+    return checkpoint_service.preserve_blocked_diagnostics(
+        _diagnostic_preservation_effects(), _BlockedCheckpointAdapter,
+        connection, repo_path, state_dir, request, project_scope=project_scope)
+
+
+def preserve_remote_planning_diagnostics(connection, state_dir, repo, snapshot):
+    effects = diagnostics.RemotePlanningDiagnosticsEffects(
+        preservation_effects=_diagnostic_preservation_effects,
+        adapter_factory=_BlockedCheckpointAdapter,
+        capture_git_snapshot=lambda *args, **kwargs: capture_git_snapshot(*args, **kwargs),
+        validate_planning_workspace_identity=lambda *args, **kwargs: validate_planning_workspace_identity(*args, **kwargs),
+        validate_managed_worktree=lambda *args, **kwargs: validate_managed_worktree(*args, **kwargs),
+        git=lambda *args, **kwargs: git(*args, **kwargs))
+    return diagnostics.preserve_remote_planning_diagnostics(effects, connection, state_dir, repo, snapshot)
 
 _execution_outcome_step_result = checkpoint_service._execution_outcome_step_result
 

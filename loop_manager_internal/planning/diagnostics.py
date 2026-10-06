@@ -98,3 +98,114 @@ def preserve_planning_diagnostics(
         encoding="utf-8",
     )
     return diagnostic
+
+
+@dataclass(frozen=True)
+class RemotePlanningDiagnosticsEffects:
+    preservation_effects: Callable
+    adapter_factory: Callable
+    capture_git_snapshot: Callable
+    validate_planning_workspace_identity: Callable
+    validate_managed_worktree: Callable
+    git: Callable
+
+
+def preserve_remote_planning_diagnostics(effects, connection, state_dir, repo, expected):
+    """Keep failed planning material separate from the current execution owner."""
+    from dataclasses import replace
+    from loop_manager_internal.agents.scope_contracts import GitSnapshot
+    from loop_manager_internal.planning import planning_rebase
+    from loop_manager_internal.recovery import blocked_checkpoint, diagnostic_preservation
+    from loop_manager_internal.storage import runtime_state
+    from loop_manager_internal.storage.blocked_checkpoint_state import DiagnosticPublicationRepository
+    from loop_manager_internal.notifications import notifications
+
+    raw = runtime_state._preserved_planning_values(expected.planning_preserved_state) if expected.planning_preserved_state else {}
+    row = replace(expected, **{name: value for name, value in raw.items() if name in expected.__dataclass_fields__},
+                  planning_preserved_state=None) if raw else expected
+    if not (row.planning_error or row.planning_validation_error):
+        return None
+    cause_identity = str(expected.planning_error_incident_id or expected.planning_error_fingerprint or row.planning_attempt_fingerprint or '')
+    store = DiagnosticPublicationRepository(connection)
+    payload = dict(result='local_only', diagnostic=True, complete=False, cause_identity=cause_identity,
+                   original_branch='', worktree=row.worktree,
+                   omitted={'all': 'planning ownership or collection unavailable'})
+    try:
+        project = connection.execute('SELECT base_branch FROM projects WHERE repo = ?', (repo,)).fetchone()
+        branch = project[0]
+        payload['original_branch'] = branch
+        if raw and (row.planning_error_incident_id != expected.planning_error_incident_id
+                    or row.planning_error != expected.planning_error):
+            raise RuntimeError('planning 보존 자료와 현재 오류 incident가 다릅니다.')
+        if not row.worktree or row.planning_workspace_owned != 1 or not row.active_sha:
+            raise RuntimeError('planning 진단 보존의 작업 공간·base 소유권을 확인할 수 없습니다.')
+        worktree = Path(row.worktree)
+        def validate():
+            if runtime_state.RuntimeStateRepository(connection).planning(repo) != expected:
+                raise RuntimeError('planning 진단 원인 또는 저장 문맥이 변경됐습니다.')
+            runtime = runtime_state.RuntimeStateRepository(connection)
+            if runtime.active_row(repo) is not None:
+                raise RuntimeError('다른 계획이 변경 실행 자리를 사용 중입니다.')
+            effects.validate_planning_workspace_identity(state_dir, repo, row.planning_attempt_fingerprint, worktree)
+            effects.validate_managed_worktree(Path(repo), worktree, None, allow_rebase=True)
+            current = effects.capture_git_snapshot(worktree)
+            if current.branch is not None or not current.shared_metadata_complete:
+                raise RuntimeError('planning 진단 worktree의 detached 소유권이 유효하지 않습니다.')
+            if row.agent_snapshot:
+                before = GitSnapshot.deserialize(row.agent_snapshot)
+                if (before.config != current.config or before.refs != current.refs
+                        or {key: value for key, value in before.worktrees.items() if key != str(worktree.resolve())}
+                        != {key: value for key, value in current.worktrees.items() if key != str(worktree.resolve())}):
+                    raise RuntimeError('planning 공유 Git 자료의 소유권을 확인할 수 없습니다.')
+            unmerged = any(entry.split()[-1] != '0' for entries in current.index.values() for entry in entries)
+            if current.operations or unmerged:
+                if set(current.operations) - {'rebase-merge', 'rebase-apply', 'REBASE_HEAD', 'MERGE_MSG', 'MERGE_MODE'}:
+                    raise RuntimeError('planning의 다른 Git operation이 진행 중입니다.')
+                journal = planning_rebase._read(planning_rebase._journal_path(state_dir, repo, worktree), repo, worktree)
+                if journal is None or journal['old'] != row.active_sha:
+                    raise RuntimeError('planning 충돌의 관리 rebase 소유권을 확인할 수 없습니다.')
+                if planning_rebase.rebase_in_progress(effects.git, worktree):
+                    for directory in ('rebase-merge', 'rebase-apply'):
+                        location = Path(effects.git(worktree, 'rev-parse', '--git-path', directory).stdout.strip())
+                        location = location if location.is_absolute() else worktree / location
+                        if location.exists() and ((location / 'orig-head').read_text().strip() != journal['head']
+                                                  or (location / 'onto').read_text().strip() != journal['target']):
+                            raise RuntimeError('planning 충돌의 원본·target이 다릅니다.')
+                elif (not unmerged or journal['phase'] not in {'applying', 'conflict'}
+                      or current.head != journal.get('restored_head', journal['target'])):
+                    raise RuntimeError('planning의 다른 Git operation이 진행 중입니다.')
+            return current
+        snapshot = validate()
+        revisions = dict(base=row.active_sha, head=snapshot.head)
+        journal = planning_rebase._read(planning_rebase._journal_path(state_dir, repo, worktree), repo, worktree)
+        if journal:
+            revisions.update(start=journal['head'], target=journal['target'])
+            stash = planning_rebase._stash(effects.git, worktree, 'loop-manager-planning-rebase:' + journal['nonce'])
+            if stash:
+                revisions['stash'] = stash[1]
+                revisions['staged-original'] = effects.git(worktree, 'rev-parse', stash[1] + '^2').stdout.strip()
+                untracked = effects.git(worktree, 'rev-parse', '--verify', stash[1] + '^3', check=False)
+                if untracked.returncode == 0:
+                    revisions['untracked-original'] = untracked.stdout.strip()
+        source = diagnostic_preservation.PreservationSource(
+            repo, 'planning', 'planning', cause_identity, branch, worktree, revisions,
+            dict(phase=row.phase, evidence=diagnostic_preservation.redact_detail(str(
+                row.planning_error or row.planning_validation_error)),
+                input_fingerprint=row.planning_attempt_fingerprint,
+                operations=sorted(snapshot.operations),
+                selection_revisions=[oid for label, oid in revisions.items()
+                                     if label not in {'base', 'target', 'untracked-original'}
+                                     and not (journal and label == 'head')],
+                untracked_revision=revisions.get('untracked-original')),
+            planning_rebase._correction_path_allowed, validate)
+        request = blocked_checkpoint.CheckpointRequest(repo, 'planning', cause_identity,
+            blocked_checkpoint.CheckpointPhase.REQUESTED, 'planning_error', '', branch, str(worktree))
+        adapter = effects.adapter_factory(connection, Path(repo), state_dir, repo)
+        payload = diagnostic_preservation.preserve(effects.preservation_effects(), connection,
+            state_dir, source, adapter, request, 'planning 실패 자료는 원격 base에 직접 게시하지 않습니다.')
+    except (OSError, RuntimeError, ValueError) as error:
+        payload['reason'] = diagnostic_preservation.redact_detail(str(error))
+        identity = hashlib.sha256((cause_identity + str(row.worktree) + str(row.active_sha)).encode()).hexdigest()
+        store.preserve(repo, 'planning', 'planning', identity, payload, retryable=True)
+    notifications.enqueue_current_project_events(connection, repo)
+    return payload

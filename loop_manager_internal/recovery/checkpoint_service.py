@@ -543,6 +543,7 @@ def push_diagnostic_checkpoint(effects: PushDiagnosticCheckpointEffects, adapter
 class DispatchBlockedCheckpointsEffects:
     """Named effects for dispatch_blocked_checkpoints; no entry-point/module access."""
     _BlockedCheckpointAdapter: Callable[..., object]
+    preserve_blocked_diagnostics: Callable[..., object] | None = None
 
 
 def dispatch_blocked_checkpoints(
@@ -583,7 +584,46 @@ def dispatch_blocked_checkpoints(
                 request, f"checkpoint 처리 실패: {error}", retryable=True,
             )
             break
+    if effects.preserve_blocked_diagnostics is not None:
+        for row in connection.execute(
+                "SELECT plan_id FROM blocked_checkpoints WHERE repo = ? AND phase IN ('unpublished', 'retry_pending')", (repo,)).fetchall():
+            request = repository.get(repo, row['plan_id'])
+            if request.request_identity not in skip_identities:
+                effects.preserve_blocked_diagnostics(connection, repo_path, state_dir, request)
     return completed
+
+
+def preserve_blocked_diagnostics(effects, adapter_factory, connection, repo_path,
+                                 state_dir, request, *, project_scope=False):
+    """Preservation failure is a receipt, never a new block or an approval."""
+    from loop_manager_internal.recovery import diagnostic_preservation
+    project_block = scoped_blocking.project_block(connection, request.repo)
+    if project_block is not None and project_block['plan_id'] == request.plan_id:
+        project_scope = True
+    adapter = adapter_factory(connection, repo_path, state_dir, request.repo,
+                              project_recovery_scope=project_scope)
+    row = connection.execute(
+        'SELECT unpublished_reason FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?',
+        (request.repo, request.plan_id)).fetchone()
+    original_reason = (row[0] if row else None) or '원래 branch 게시 조건을 충족하지 못했습니다.'
+    try:
+        source = adapter.diagnostic_source(request)
+        payload = diagnostic_preservation.preserve(
+            effects, connection, state_dir, source, adapter, request, original_reason)
+    except (OSError, RuntimeError, ValueError) as error:
+        scope = 'project' if project_scope else 'plan'
+        block = scoped_blocking.project_block(connection, request.repo) if project_scope else scoped_blocking.plan_block(
+            connection, request.repo, request.plan_id)
+        cause_identity = hashlib.sha256(json.dumps(dict(block), sort_keys=True).encode()).hexdigest() if block else ''
+        payload = dict(result='local_only', diagnostic=True, original_branch=request.branch,
+                       worktree=request.worktree, complete=False, omitted={'all': 'ownership or collection unavailable'},
+                       cause_identity=cause_identity,
+                       original_unpublished_reason=diagnostic_preservation.redact_detail(original_reason),
+                       reason=diagnostic_preservation.redact_detail(str(error)))
+        blocked_checkpoint_state.DiagnosticPublicationRepository(connection).preserve(
+            request.repo, scope, request.plan_id, request.request_identity, payload, retryable=True)
+    notifications.enqueue_current_project_events(connection, request.repo)
+    return payload
 
 
 def _execution_outcome_step_result(outcome: ExecutionOutcome) -> int:

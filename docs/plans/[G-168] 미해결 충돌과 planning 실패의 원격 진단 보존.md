@@ -45,3 +45,16 @@ priority: critical
 ## Decision Log
 
 - 자료 수집·격리 게시·재시작의 복합 경계로 complexity high, 원형 손실·민감 자료 게시 영향으로 risk critical다. 자료 게시의 실패가 독립 구현 작업을 새로 차단하지 않는다.
+- 원격 보존은 기존 checkpoint가 원래 branch를 먼저 시도하는 순서를 유지한다. 미게시·재시도 대기 checkpoint, 연결된 프로젝트 복구 실패와 planning 오류를 공통 `diagnostic_preservation` 경계로 연결한다. 보존된 planning 오류의 재시도는 실행 투영을 복원하지 않고 독립 작업 선택 전에 수행한다.
+- 진단 자료는 `<state-dir>/diagnostic-artifacts/<identity>/`의 내용 보존 bundle과 부모 없는 Git commit에 담는다. 원본 Git object 저장소를 재사용하되 관리 임시 index만 사용하며 원래 HEAD·index·ref·rebase를 바꾸지 않는다. 고정 author/date·tree와 원격 ref의 부재 lease로 동일 자료를 재사용하고, 게시 전 intent와 확인 후 receipt를 SQLite에 저장한다. object 정리 뒤에도 bundle과 현재 검증 자료로 같은 commit을 재구성할 수 있다.
+- 수집 대상은 현재 작업 범위를 통과한 변경 경로다. 승인 근거 없는 untracked, ignored, symlink·특수 파일, 읽을 수 없는 원형 및 비밀값을 포함한 경로는 diff까지 제외하고 manifest에 누락 이유를 남긴다. base·HEAD·시작/재생 commit·index stage·현재 수동 수정의 bytes·mode·부재를 별도로 보존하며 rename은 두 경로, binary는 원형 blob으로 표현한다. planning stash의 staged·untracked 원본도 선택된 문서 범위에서 보존한다.
+- 현재 상태 서비스의 정상 게시 판정은 그대로 유지한다. 닫힌 PR 또는 삭제된 원래 ref의 자료 보존은 동일 PR identity·원격 ref·worktree·rebase·파일 범위를 별도로 검증하며 rebase acceptance나 게시 승인으로 반환하지 않는다. 결과 알림은 현재 원인에 결합된 진단 ref·commit·원래 branch·누락 범위·미게시 사유만 사용한다.
+
+| 생성·재개 경로 | 보존·보호 경계 | 사용자 조치 |
+|---|---|---|
+| 계획 checkpoint의 Git operation·범위·PR·push 거부 | `checkpoint_service.dispatch_blocked_checkpoints` → 현재 소유권·scope 검사 → 격리 진단 intent; 원래 checkpoint 소유권과 차단은 유지 | 원래 branch 또는 안내된 근거 문서의 원인을 수정 |
+| 연결된 프로젝트 복구의 충돌·게시 불가·동일 입력 대기 | `project_blocked_recovery` → 연결 계획·단일 실행 자리 검사 → 공통 보존; 다른 계획·프로젝트 원인은 해제하지 않음 | 현재 연결 작업의 남은 원인 수정 |
+| planning 결과 오류·보존된 오류의 다음 실행 | `planning.state_ports` → 별도 planning 문맥·worktree·관리 rebase 검사 → 공통 보존; base에 실패 결과·catalog를 직접 적용하지 않음 | 원격 base의 계획·근거 수정 또는 로컬 환경 복구 |
+| 수집/commit/push/SQLite 확정 중단 | 원본 재관측·내용 hash·고정 commit·저장 intent·정확한 원격 OID 대조; ref 경쟁은 갱신 거부 | 실제 인증·권한·경쟁·누락 이유에 따른 수정 |
+
+- 관련 unit case는 `tests/test_diagnostic_preservation.py`에 있으며 실제 Git·원격·Agent effect를 mock한다. 기존 원형 evidence·diagnostic lease·planning 로그·차단 알림의 좁은 unit case를 함께 재사용한다. `tests/test_notification_incidents.py`의 helper import를 저장소 패키지 경로로 맞춰 직접 targeted 실행도 가능하게 한다. 기존 `scripts/verify.sh`는 새 test module을 자동 발견하는 전체 runner를 유지하며 Worker는 이를 실행하지 않는다.
