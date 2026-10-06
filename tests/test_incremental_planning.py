@@ -1119,6 +1119,9 @@ class MutableReadyMetadataCasTest(unittest.TestCase):
         self.assertTrue(snapshot.current_metadata_recorded)
 
     def test_snapshot_rejects_exact_complexity_and_risk_cache_changes(self):
+        self.assertIsNone(self.connection.execute(
+            "SELECT name FROM sqlite_master WHERE name='execplan_catalog_holds'"
+        ).fetchone())
         loop_manager._assert_mutable_ready_snapshot_current(
             self.connection, self.snapshot
         )
@@ -1141,6 +1144,30 @@ class MutableReadyMetadataCasTest(unittest.TestCase):
                 self.connection.execute(
                     f"UPDATE exec_plans SET {field} = NULL WHERE repo = 'repo'"
                 )
+        self.assertIsNone(self.connection.execute(
+            "SELECT name FROM sqlite_master WHERE name='execplan_catalog_holds'"
+        ).fetchone())
+
+    def test_recovery_goals_without_catalog_schema_preserve_registered_targets(self):
+        from loop_manager_internal.catalog import remote_deletions
+        evidence = json.dumps({"text": "deleted goal", "row": {}, "affected": ["G-001"], "resolved": {}})
+        self.connection.execute(
+            """INSERT INTO execplan_cancellations (
+                repo, plan_id, path, title, sources, depends_on, complexity,
+                risk, priority, content_hash, plan_sha, deletion_commit, recovery_evidence
+            ) VALUES ('repo', 'G-002', 'docs/plans/[G-002] Deleted.md', 'Deleted',
+                '["docs/PRODUCT.md"]', '[]', 'low', 'low', 'normal', 'hash',
+                'base', 'commit', ?)""", (evidence,))
+        schemas = tuple(self.connection.execute("SELECT name, sql FROM sqlite_master ORDER BY name"))
+        changes = self.connection.total_changes
+        goal = json.loads(remote_deletions.recovery_goals(self.connection, "repo")[0])
+        self.assertEqual(goal["id"], "G-002")
+        self.assertEqual(goal["affected_ids"], ["G-001"])
+        self.assertEqual(goal["evidence"], evidence)
+        self.assertEqual(tuple(self.connection.execute("SELECT name, sql FROM sqlite_master ORDER BY name")), schemas)
+        self.assertEqual(self.connection.total_changes, changes)
+        with self.assertRaisesRegex(loop_manager.PlannerValidationError, "삭제 목표 감사"):
+            loop_manager._assert_mutable_ready_snapshot_current(self.connection, self.snapshot)
 
     def test_publication_cas_rejects_cache_change_after_snapshot_guard(self):
         original = self.snapshot.plans[0]

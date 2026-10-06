@@ -135,10 +135,11 @@ def recovery_definitions(connection, repo, repository, pinned, *, git_bytes):
 
 def recovery_goals(connection, repo):
     """Keep cancellation evidence immutable; resolution is publication-bound."""
+    from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
     goals = []
     rows = connection.execute("SELECT * FROM exec_plans WHERE repo=?", (repo,)).fetchall()
     observed_ids = {str(row["plan_id"]) for row in rows}
-    observed_ids.update(str(row[0]) for row in connection.execute("SELECT plan_id FROM execplan_catalog_holds WHERE repo=?", (repo,)))
+    observed_ids.update(catalog_held_plan_ids(connection, repo))
     for cancelled in connection.execute(
         "SELECT * FROM execplan_cancellations WHERE repo=? AND recovery_evidence IS NOT NULL ORDER BY plan_id", (repo,),
     ):
