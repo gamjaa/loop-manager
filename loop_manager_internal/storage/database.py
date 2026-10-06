@@ -255,6 +255,7 @@ CREATE TABLE IF NOT EXISTS execplan_cancellations (
     content_hash TEXT NOT NULL,
     plan_sha TEXT NOT NULL,
     deletion_commit TEXT NOT NULL,
+    recovery_evidence TEXT,
     cancelled_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (repo, plan_id),
     FOREIGN KEY (repo) REFERENCES projects(repo)
@@ -461,6 +462,8 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
             connection.execute("RELEASE ever_started_backfill")
     connection.execute(GUIDANCE_APPROVALS_SCHEMA)
     connection.execute(EXECPLAN_CANCELLATIONS_SCHEMA)
+    if "recovery_evidence" not in {row[1] for row in connection.execute("PRAGMA table_info(execplan_cancellations)")}:
+        connection.execute("ALTER TABLE execplan_cancellations ADD COLUMN recovery_evidence TEXT")
     connection.execute(GENERAL_PLANNING_PUBLICATIONS_SCHEMA)
     planning_input_state.ensure_schema(connection)
     planner_check_state.ensure_schema(connection)

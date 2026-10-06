@@ -103,6 +103,7 @@ def _planning_result_manifest(effects: PlanningResultManifestEffects, result: Va
             "active_sha": snapshot.active_sha,
             "token": snapshot.token,
             "plans": [effects.snapshot_to_dict(plan) for plan in snapshot.plans],
+            "recovery_goals": list(snapshot.recovery_goals),
         },
     }
     return json.dumps(
@@ -134,9 +135,10 @@ def _planning_result_from_manifest(effects: PlanningResultFromManifestEffects, m
             active_sha=str(snapshot_value["active_sha"]),
             plans=snapshot_plans,
             token=str(snapshot_value["token"]),
+            recovery_goals=tuple(snapshot_value.get("recovery_goals", ())),
         )
         expected_token = effects.mutable_snapshot_token(
-            snapshot.repo, snapshot.active_sha, snapshot.plans
+            snapshot.repo, snapshot.active_sha, snapshot.plans, snapshot.recovery_goals
         )
         if snapshot.token != expected_token:
             raise ValueError("snapshot token mismatch")
@@ -524,6 +526,9 @@ def _apply_general_planning_batch(
         effects._register_execplan_rows(
             connection, repo, worktree, list(result.plans), plan_commit
         )
+        from loop_manager_internal.catalog.remote_deletions import resolve_recovery
+        resolve_recovery(connection, snapshot, plan_commit,
+                         {item.snapshot.plan_id for item in result.revisions})
         if effects.is_loop_manager_repository(Path(repo)):
             from loop_manager_internal.documents import document_drafts
             drafts = document_drafts.DocumentDraftRepository(connection)

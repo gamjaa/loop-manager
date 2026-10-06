@@ -264,19 +264,26 @@ def validate_planner_result(
         from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
         held_ids = (catalog_held_plan_ids(connection, repo)
                     if connection is not None and repo is not None else frozenset())
+        from loop_manager_internal.catalog import remote_deletions
+        changed_ids = {str(plan["id"]) for plan in current_plans.values()}
+        recovery_ids = {key for raw in snapshot.recovery_goals for key in json.loads(raw)["affected_ids"]} & snapshot.by_id.keys() & changed_ids
+        unresolved_holds = held_ids - recovery_ids
         withheld_ids = frozenset()
         if held_ids:
             project_catalog_refresh.assert_planning_dependencies_unheld(
-                {}, current_plans.items(), held_ids)
+                {}, current_plans.items(), unresolved_holds)
             local = project_catalog_refresh.validated_held_planning_snapshot(
                 connection, repo, worktree, active_sha, git=effects.git,
-                load_snapshot=execplan_catalog.load_execplan_snapshot)
+                load_snapshot=execplan_catalog.load_execplan_snapshot,
+                mutable_paths=frozenset(plan.path for plan in snapshot.plans if plan.plan_id in recovery_ids),
+                recovery_mode=bool(snapshot.recovery_goals))
             catalog = local.active_metadata()
             withheld_ids = local.withheld_ids
         else:
             catalog = effects.load_execplan_catalog(worktree)
         project_catalog_refresh.assert_planning_dependencies_unheld(
-            catalog, current_plans.items(), held_ids)
+            catalog, current_plans.items(), unresolved_holds)
+        remote_deletions.validate_recovery(worktree, snapshot, current_plans, catalog)
         plans: list[tuple[str, dict[str, object]]] = []
         revisions: list[PlanRevision] = []
         deletions: list[PlanDeletion] = []
@@ -683,8 +690,11 @@ def mutable_ready_snapshot(
     plans: list[ReadyPlanSnapshot] = []
     from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
     held = catalog_held_plan_ids(connection, repo)
+    from loop_manager_internal.catalog import remote_deletions
+    recovery = remote_deletions.recoverable_ids(connection, repo, held)
+    goals = remote_deletions.recovery_goals(connection, repo)
     for row in rows:
-        if str(row["plan_id"]) in held or not effects._row_is_mutable_ready(row):
+        if (str(row["plan_id"]) in held - recovery or not effects._row_is_mutable_ready(row)):
             continue
         try:
             plans.append(
@@ -699,7 +709,8 @@ def mutable_ready_snapshot(
         repo=repo,
         active_sha=active_sha,
         plans=ordered,
-        token=effects.mutable_snapshot_token(repo, active_sha, ordered),
+        token=effects.mutable_snapshot_token(repo, active_sha, ordered, goals),
+        recovery_goals=goals,
     )
 
 
@@ -715,6 +726,9 @@ def _assert_mutable_ready_snapshot_current(
     snapshot: MutableReadySnapshot,
 ) -> None:
     """Compare-and-snapshot guard used immediately before publication."""
+    from loop_manager_internal.catalog.remote_deletions import recovery_goals
+    if snapshot.recovery_goals != recovery_goals(connection, snapshot.repo):
+        raise PlannerValidationError("삭제 목표 감사가 mutable READY snapshot 이후 변경됐습니다.")
 
     if maintenance_state.MaintenanceRepository(connection).get(
         snapshot.repo

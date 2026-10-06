@@ -16,6 +16,8 @@ from loop_manager_internal.git.command_adapter import ExternalObservationError, 
 def validated_held_planning_snapshot(
     connection: sqlite3.Connection, repo: str, worktree: Path, active_sha: str,
     *, git: Callable, load_snapshot: Callable,
+    mutable_paths: frozenset[str] = frozenset(),
+    recovery_mode: bool = False,
 ) -> execplan_catalog.ExecPlanCatalogSnapshot:
     """Reuse only unchanged, revision-bound errors for either Planner consumer."""
     view = connection.execute(
@@ -34,6 +36,27 @@ def validated_held_planning_snapshot(
         "SELECT plan_id, evidence FROM execplan_catalog_holds WHERE repo = ?", (repo,),
     ).fetchall()
     held = {str(row[0]): json.loads(str(row[1])) for row in pending}
+    deletion_holds = any(cause["code"] in {"missing-plan", "deleted-goal"}
+                         for evidence in held.values() for cause in evidence.get("causes", ()))
+    if recovery_mode or deletion_holds:
+        # A deletion recovery may repair only its snapshot files. All other
+        # quarantined bytes stay pinned, including synthetic missing-file holds.
+        editable = {key for key, evidence in held.items() if evidence.get("path") in mutable_paths}
+        if local.withheld_ids - (held.keys() - editable):
+            raise execplan_catalog.ExecPlanCatalogError(
+                "삭제 복구 결과에 새 오류 또는 미해결 개정 대상이 있습니다.", code="held-planning-mismatch")
+        for key, evidence in held.items():
+            path = evidence.get("path")
+            if key in editable or not path:
+                continue
+            exists = revision_path_exists(git, worktree, active_sha, path)
+            result = git(worktree, "diff", "--quiet", active_sha, "--", path, check=False)
+            if result.returncode not in (0, 1):
+                raise ExternalObservationError(f"보류 catalog 파일의 Git 변경을 확인할 수 없습니다: {path}")
+            if result.returncode or (not exists and (worktree / path).exists()):
+                raise execplan_catalog.ExecPlanCatalogError(
+                    f"snapshot 밖 보류 파일이 변경됐습니다: {path}", code="held-planning-mismatch", path=path)
+        return local
     causes = [dict(plan_id=item.plan_id, path=item.path, code=item.code,
                    message=item.message, source=item.source) for item in local.issues]
     declaration_holds = {key for key, evidence in held.items() if "causes" in evidence}
@@ -106,6 +129,7 @@ class ProjectCatalogRefresh:
                   for row in snapshot.rows),
             tuple(item for item in snapshot.reserved if item[0] not in snapshot.plan_ids),
             snapshot.holds,
+            snapshot.cancellations,
             tuple((row.plan_id, row.values[state._ROW_VERSION_FIELDS.index("status")])
                   for row in snapshot.rows) if snapshot.holds else (),
             planning_owns_execution_slot(dict(zip(state._PROJECT_VERSION_FIELDS, snapshot.project_values)))

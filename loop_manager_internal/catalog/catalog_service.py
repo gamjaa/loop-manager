@@ -374,7 +374,22 @@ def reconcile_execplan_catalog(
         ),
         pinned_revision=remote_sha,
     )
+    # The Git adapter proves a real deletion against the last adopted bytes.
+    # Fake/alternate ports may already provide their own pinned evidence.
     repository = execplan_catalog_state.DefinitionStateRepository(connection)
+    if isinstance(port, _GitCatalogDefinitionPort) and not repository.has_publication_intent(repo):
+        from loop_manager_internal.catalog import remote_deletions
+        try:
+            pinned = port.load()
+            port.loaded = replace(pinned, deletions=remote_deletions.prove_deletions(
+                connection, repo, repo_path, pinned, git=effects.git,
+                git_bytes=port._effects.git_bytes,
+            ))
+            port.loaded = replace(port.loaded, recovery_definitions=remote_deletions.recovery_definitions(
+                connection, repo, repo_path, port.loaded, git_bytes=port._effects.git_bytes,
+            ))
+        except execplan_catalog_state.InvalidPinnedCatalog:
+            pass  # The service records the same pinned declaration diagnostic.
     service = execplan_catalog_state.CatalogReconciliationService(repository, port)
     legacy = connection.execute(
         "SELECT 1 FROM execplan_catalog_revisions WHERE repo = ? "
@@ -392,14 +407,15 @@ def reconcile_execplan_catalog(
                         pinned = replace(pinned, snapshot=execplan_catalog.withhold_catalog_issues(pinned.snapshot, issues))
                         port.loaded = pinned
                 if repository.capture(repo).plan_ids - pinned.snapshot.observed_ids:
-                    raise project_catalog_refresh.CatalogRefreshStopped(service.reconcile(repo))
-                effects.backfill_plan_shas(connection, target_repo=repo, manage_transaction=False)
-                effects.migrate_legacy_execplans(
-                    connection, reconcile_history=True, target_repo=repo,
-                    ensure_schema=False, manage_transaction=False,
-                    pinned_catalog=pinned,
-                )
-                result = service.reconcile(repo)
+                    result = service.reconcile(repo)
+                else:
+                    effects.backfill_plan_shas(connection, target_repo=repo, manage_transaction=False)
+                    effects.migrate_legacy_execplans(
+                        connection, reconcile_history=True, target_repo=repo,
+                        ensure_schema=False, manage_transaction=False,
+                        pinned_catalog=pinned,
+                    )
+                    result = service.reconcile(repo)
                 if not result.usable:
                     raise project_catalog_refresh.CatalogRefreshStopped(result)
         except execplan_catalog_state.InvalidPinnedCatalog as error:
