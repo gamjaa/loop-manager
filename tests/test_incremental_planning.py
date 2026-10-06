@@ -224,6 +224,83 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         repeated = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
         self.assertEqual(set(repeated.withheld_plan_ids), {"G-001", "G-002"})
 
+    def test_remote_deletion_started_implementation_reference_is_held(self):
+        body = plan_text("G-002", "Second").replace(
+            "- Keep the boundary explicit.", "- Build on the G-001 implementation.")
+        (self.repo / self.paths["G-002"]).write_text(body, encoding="utf-8")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "adopt implementation reference")
+        self._assert_started_deletion_reference(target_text=plan_text("G-002", "Second"))
+
+    def test_remote_deletion_started_simultaneous_validation_reference_is_held(self):
+        body = plan_text("G-002", "Second").replace(
+            "- Run the targeted unit test.", f"- Validate against `{self.paths['G-001']}`.")
+        self._assert_started_deletion_reference(target_text=body)
+
+    def _assert_started_deletion_reference(self, *, target_text):
+        result, _ = self._remote_deletion(dependent=False, started=True, new_plan=True, target_text=target_text)
+        self.assertEqual(set(result.withheld_plan_ids), {"G-001", "G-002"})
+        root = dict(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+        self.assertEqual(root["ever_started"], 1)
+        self.assertEqual(root["worker_session_id"], "saved")
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM execplan_cancellations").fetchone()[0], 0)
+        snapshot = loop_manager.mutable_ready_snapshot(self.connection, str(self.repo), self.repo, self.base)
+        self.assertEqual(set(snapshot.by_id), {"G-007"})
+        self.assertEqual(loop_manager.select_ready_execplan(self.connection, str(self.repo))["plan_id"], "G-007")
+        for _ in range(2):
+            result = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+            self.assertEqual(set(result.withheld_plan_ids), {"G-001", "G-002"})
+            current = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()
+            for field in ("plan_id", "path", "sources", "depends_on", "content_hash", "plan_sha",
+                          "ever_started", "worker_session_id", "status", "branch", "worktree", "pr_url", "workspace_owned"):
+                self.assertEqual(current[field], root[field])
+
+    def test_remote_deletion_started_reference_preserves_owned_pr(self):
+        body = plan_text("G-002", "Second") + "\nUse G-001 as the validation foundation.\n"
+        (self.repo / self.paths["G-002"]).write_text(body, encoding="utf-8")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "owned validation reference")
+        self.connection.execute("""UPDATE exec_plans SET status='PR_OPEN', ever_started=1,
+            branch='owned-second', worktree='/owned-second', workspace_owned=1,
+            worker_session_id='second-session', pr_url='https://example.test/pr/2' WHERE plan_id='G-002'""")
+        self.connection.commit()
+        self._assert_started_deletion_reference(target_text=plan_text("G-002", "Second"))
+        row = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-002'").fetchone()
+        self.assertEqual((row["status"], row["branch"], row["worktree"], row["workspace_owned"],
+                          row["worker_session_id"], row["pr_url"]),
+                         ("PR_OPEN", "owned-second", "/owned-second", 1, "second-session", "https://example.test/pr/2"))
+        self.assertEqual(row["content_hash"], hashlib.sha256(body.encode("utf-8")).hexdigest())
+
+    def test_remote_deletion_started_new_reference_hold_survives_removal_until_restored(self):
+        body = plan_text("G-007", "Independent") + "\nValidate against G-001.\n"
+        (self.repo / "docs/plans/[G-008] Downstream.md").write_text(
+            plan_text("G-008", "Downstream").replace("depends_on: []", "depends_on:\n  - G-007"), encoding="utf-8")
+        result, _ = self._remote_deletion(dependent=False, started=True, new_plan_text=body)
+        self.assertEqual(set(result.withheld_plan_ids), {"G-001", "G-007", "G-008"})
+        (self.repo / "docs/plans/[G-007] Independent.md").write_text(plan_text("G-007", "Independent"), encoding="utf-8")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "remove reference without recovering goal")
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", self.base)
+        for _ in range(2):
+            result = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+            self.assertEqual(set(result.withheld_plan_ids), {"G-001", "G-007", "G-008"})
+            self.assertIsNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-007'").fetchone())
+            self.assertIsNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-008'").fetchone())
+            self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM execplan_cancellations").fetchone()[0], 0)
+            self.assertEqual(loop_manager.select_ready_execplan(self.connection, str(self.repo))["plan_id"], "G-002")
+        root = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()
+        (self.repo / self.paths["G-001"]).write_bytes(loop_manager.git_bytes(
+            self.repo, "show", f"{root['current_revision_sha'] or root['plan_sha']}:{root['path']}"))
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "restore prerequisite declaration")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", git(self.repo, "rev-parse", "HEAD"))
+        result = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+        self.assertEqual(result.withheld_plan_ids, ())
+        self.assertEqual(self.connection.execute("SELECT worker_session_id FROM exec_plans WHERE plan_id='G-001'").fetchone()[0], "saved")
+        self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-007'").fetchone())
+        self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-008'").fetchone())
+
     def test_remote_deletion_started_hold_allows_independent_planner_result(self):
         self._remote_deletion(started=True, new_plan=True)
         snapshot = loop_manager.mutable_ready_snapshot(self.connection, str(self.repo), self.repo, self.base)

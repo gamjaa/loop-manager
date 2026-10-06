@@ -32,15 +32,66 @@ def mutable_row(connection, repo, plan_id):
     return row
 
 
-def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes):
+def reference_issues(connection, repo, repository, pinned, *, git_bytes):
+    """Observe deletion impacts independently of cancellation eligibility."""
+    rows = connection.execute("SELECT * FROM exec_plans WHERE repo=?", (repo,)).fetchall()
+    missing = {str(row["plan_id"]): str(row["path"]) for row in rows
+               if str(row["plan_id"]) not in pinned.snapshot.observed_ids}
+    if not missing:
+        return ()
+    latest_contents = {key: entry.text.encode("utf-8") for key, entry in pinned.snapshot.all.items()}
+    paths = {str(row["plan_id"]): str(row["path"]) for row in rows}
+    withheld_paths = {key: path for key, path, _hash in pinned.snapshot.withheld}
+    paths.update(withheld_paths)
+    paths.update({key: entry.path for key, entry in pinned.snapshot.all.items()})
+    previous_contents = {}
+    for row in rows:
+        revision = str(row["current_revision_sha"] or row["plan_sha"] or "")
+        if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", revision):
+            contents = git_bytes(repository, "show", f"{revision}:{row['path']}")
+            if catalog.plan_content_hash(contents) == row["content_hash"]:
+                previous_contents[str(row["plan_id"])] = contents
+    prior = [(str(row["plan_id"]), json.loads(row["evidence"])) for row in connection.execute(
+        "SELECT plan_id, evidence FROM execplan_catalog_holds WHERE repo=?", (repo,))]
+    issues = []
+    for key, path in missing.items():
+        reference = re.compile(rb"(?<![A-Za-z0-9-])" + key.encode("ascii") + rb"(?![A-Za-z0-9-])")
+        reference_path = path.encode("utf-8")
+        affected = {str(row["plan_id"]) for row in rows if key in json.loads(row["depends_on"])}
+        affected.update(other for other, contents in previous_contents.items()
+                        if reference_path in contents or reference.search(contents))
+        for other in pinned.snapshot.observed_ids:
+            latest = latest_contents.get(other)
+            latest_path = withheld_paths.get(other)
+            if (latest is None and latest_path is not None and pinned.regular_paths is not None
+                    and latest_path in pinned.regular_paths):
+                latest = git_bytes(repository, "show", f"{pinned.revision_sha}:{latest_path}")
+                latest_contents[other] = latest
+            if latest is not None and (reference_path in latest or reference.search(latest)):
+                affected.add(other)
+        # Keep unadopted references until their missing prerequisite returns;
+        # removing a reference cannot establish that its goal is unnecessary.
+        for other, evidence in prior:
+            for cause in evidence.get("causes", ()):
+                if (cause["plan_id"] == other and cause["code"] == "missing-plan-reference"
+                        and cause.get("source") == path):
+                    affected.add(other)
+                    paths.setdefault(other, evidence["path"])
+        issues.extend(catalog.CatalogIssue(other, paths[other], "missing-plan-reference",
+            f"삭제된 계획의 참조 근거를 보존합니다: {other} -> {key}", path)
+            for other in sorted(affected - {key}))
+    return tuple(issues)
+
+
+def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes, references=None):
     """Absence alone cannot cancel a row: prove its last adopted bytes/ancestry."""
     from loop_manager_internal.storage.execplan_catalog_state import DefinitionStateRepository
     state = DefinitionStateRepository(connection).capture(repo)
     reserved = {item[0] for item in state.reserved}
+    if references is None:
+        references = reference_issues(connection, repo, repository, pinned, git_bytes=git_bytes)
     deletions = []
     rows = connection.execute("SELECT * FROM exec_plans WHERE repo=?", (repo,)).fetchall()
-    latest_contents = {key: entry.text.encode("utf-8") for key, entry in pinned.snapshot.all.items()}
-    withheld_paths = {key: path for key, path, _hash in pinned.snapshot.withheld}
     for row in rows:
         key = str(row["plan_id"])
         if key in pinned.snapshot.observed_ids or key in reserved or mutable_row(connection, repo, key) is None:
@@ -77,33 +128,7 @@ def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes):
             current_complexity=row["current_complexity"], current_risk=row["current_risk"],
             current_metadata_recorded=True,
         )
-        affected = set()
-        reference = re.compile(rb"(?<![A-Za-z0-9-])" + key.encode("ascii") + rb"(?![A-Za-z0-9-])")
-        reference_path = path.encode("utf-8")
-        for other in rows:
-            other_id = str(other["plan_id"])
-            if other_id == key:
-                continue
-            if key in json.loads(other["depends_on"]):
-                affected.add(other_id)
-                continue
-            adopted = str(other["current_revision_sha"] or other["plan_sha"] or "")
-            if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", adopted):
-                previous = git_bytes(repository, "show", f"{adopted}:{other['path']}")
-                if (catalog.plan_content_hash(previous) == other["content_hash"]
-                        and (reference_path in previous or reference.search(previous))):
-                    affected.add(other_id)
-        # Newly observed declarations have no SQLite row yet.
-        for other_id in pinned.snapshot.observed_ids - {key}:
-            latest = latest_contents.get(other_id)
-            latest_path = withheld_paths.get(other_id)
-            if (latest is None and latest_path is not None and pinned.regular_paths is not None
-                    and latest_path in pinned.regular_paths):
-                # Isolated declarations can contain newly added references too.
-                latest = git_bytes(repository, "show", f"{pinned.revision_sha}:{latest_path}")
-                latest_contents[other_id] = latest
-            if latest is not None and (reference_path in latest or reference.search(latest)):
-                affected.add(other_id)
+        affected = {issue.plan_id for issue in references if issue.source == path}
         evidence = json.dumps({"text": text, "row": dict(row), "affected": sorted(affected),
                                "resolved": {}}, ensure_ascii=False, sort_keys=True)
         deletions.append(RemoteDeletion(original, evidence))

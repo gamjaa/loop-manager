@@ -381,10 +381,21 @@ def reconcile_execplan_catalog(
         from loop_manager_internal.catalog import remote_deletions
         try:
             pinned = port.load()
+            references = remote_deletions.reference_issues(
+                connection, repo, repo_path, pinned, git_bytes=port._effects.git_bytes,
+            )
             port.loaded = replace(pinned, deletions=remote_deletions.prove_deletions(
                 connection, repo, repo_path, pinned, git=effects.git,
-                git_bytes=port._effects.git_bytes,
+                git_bytes=port._effects.git_bytes, references=references,
             ))
+            cancelled = {item.snapshot.plan_id for item in port.loaded.deletions}
+            cancelled_paths = {item.snapshot.path for item in port.loaded.deletions}
+            held_references = tuple(issue for issue in references
+                if issue.plan_id not in cancelled and issue.source not in cancelled_paths)
+            if held_references:
+                port.loaded = replace(port.loaded, snapshot=execplan_catalog.withhold_catalog_issues(
+                    port.loaded.snapshot, held_references,
+                ))
             port.loaded = replace(port.loaded, recovery_definitions=remote_deletions.recovery_definitions(
                 connection, repo, repo_path, port.loaded, git_bytes=port._effects.git_bytes,
             ))
