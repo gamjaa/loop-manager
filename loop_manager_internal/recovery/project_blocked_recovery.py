@@ -79,8 +79,7 @@ def independent_scope(ports, connection, repo_path, state_dir, repo, plan,
             or f'HEAD={observed.head}' not in registration
             or f'branch=refs/heads/{branch}' not in registration
             or any(item.startswith(('prunable=', 'detached=')) for item in registration)
-            or any(entry.stage for entry in observed.index)
-            or observed.remote.pull_request is not None):
+            or any(entry.stage for entry in observed.index)):
         raise RuntimeError('project 복구 HEAD·branch·등록·index 또는 PR 상태가 안전하지 않습니다.')
     return service, observed
 
@@ -105,7 +104,7 @@ def _confirmed_original_publication(checkpoint, plan):
                 'target_base_oid', 'head'))
             or (plan['repo'], plan['plan_id'], plan['branch'], plan['worktree'])
             != (intent['repo'], intent['plan_id'], intent['branch'], intent['worktree'])
-            or accepted['remote']['pull_request'] is not None
+            or (accepted['remote']['pull_request'] or {}).get('identity') != (plan['pr_url'] or None)
             or accepted['remote']['oid'] != intent['head']
             or checkpoint.observed_remote_oid != intent['head']
             or plan['publication_remote_oid'] != intent['head']):
@@ -180,7 +179,7 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
             request = store.request(
                 repo=self.repo, plan_id=plan['plan_id'], reason_code=context['block']['reason_code'],
                 evidence=context['block']['evidence'], branch=plan['branch'], worktree=plan['worktree'],
-                expected_remote_oid=plan['publication_remote_oid'], rebase_recovery=False)
+                expected_remote_oid=plan['publication_remote_oid'] or plan['pr_head_oid'], rebase_recovery=False)
             self.connection.commit()
         return store, request
 
@@ -188,7 +187,11 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
         row = self.connection.execute('SELECT * FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?',
                                       (self.repo, plan['plan_id'])).fetchone()
         original = (row['accepted_remote_oid'] or row['published_oid']) if row else None
-        original = original or plan['publication_remote_oid']
+        original = original or plan['publication_remote_oid'] or plan['pr_head_oid']
+        if plan['pr_url'] and original == plan['pr_head_oid'] == context['branch_oid']:
+            # The persisted PR head and the live PR/ref are a publication owner
+            # even when the first blocked checkpoint has not yet been created.
+            return self._remote(context) == original
         if original:
             # Publication lineage is proved at its last accepted OID. A
             # currently valid rebased HEAD need not contain that old commit.
@@ -508,8 +511,8 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
             plan = self._check_owner(plan_id, context)
             if not context['registered_origin'] or not context['base_oid']:
                 raise RuntimeError('현재 repository·base·원격 기대값을 확정할 수 없어 local-only로 보존합니다.')
-            if not plan['branch'] or not plan['worktree'] or plan['workspace_owned'] != 1 or plan['pr_url']:
-                raise RuntimeError('현재 plan·branch·worktree 소유권 또는 PR 부재를 증명할 수 없습니다.')
+            if not plan['branch'] or not plan['worktree'] or plan['workspace_owned'] != 1:
+                raise RuntimeError('현재 plan·branch·worktree 소유권을 증명할 수 없습니다.')
             if stage == 'observed':
                 self._remote(context)
                 self._request(plan, context)

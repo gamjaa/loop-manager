@@ -3733,6 +3733,7 @@ _run_project_step = _bind_effects(
         _planning_outcome_step_result=lambda *args, **kwargs: _planning_outcome_step_result(*args, **kwargs),
         _project_blocked_recovery_effects=lambda *args, **kwargs: _project_blocked_recovery_effects(*args, **kwargs),
         _project_pr_merge_confirmed=lambda *args, **kwargs: _project_pr_merge_confirmed(*args, **kwargs),
+        _publish_direct_rebase_checkpoint=lambda *args, **kwargs: _publish_direct_rebase_checkpoint(*args, **kwargs),
         _record_manager_base_fetch_intent=lambda *args, **kwargs: _record_manager_base_fetch_intent(*args, **kwargs),
         _record_project_recovery=lambda *args, **kwargs: _record_project_recovery(*args, **kwargs),
         _recorded_base_fetch=lambda *args, **kwargs: _recorded_base_fetch(*args, **kwargs),

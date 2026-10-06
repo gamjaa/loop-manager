@@ -324,6 +324,10 @@ class PublicationPrObservationTests(PublicationBranchLeaseTestFixture, unittest.
                     worktree,
                 ) = self._publication_state(directory)
                 head = git_command(worktree, "rev-parse", "HEAD")
+                approval = seed_validated_candidate(connection, repo, worktree, 'G-014')
+                base = git_command(repo, 'rev-parse', 'origin/main')
+                loop_manager.update_project(connection, str(repo),
+                    publication_token=approval.publication_token(base, head))
                 pull_request = {
                     "url": "https://example.test/pr/14",
                     "state": initial_state,

@@ -2,6 +2,7 @@
 from contextlib import closing
 
 from tests.support.current_rebase import current_rebase_case
+from tests.support.pr_recovery import observe_live_pull_request
 from tests.support.execution import recovered_rebase_workspace, recovered_rebase_publication
 from dataclasses import replace
 import json
@@ -87,7 +88,8 @@ class ExecutionRecoveryScenarios:
             config_path=Path('/config'), newly_activated=False,
         )
         handler.plan = handler._cached_plan(handler.effects.state.active_execplan(repo))
-        with mock.patch.object(lm, 'pr_for_branch', return_value=pull_request):
+        with mock.patch.object(lm, 'pr_for_branch', side_effect=lambda *_a, **_k:
+                                    observe_live_pull_request(fixture.repo, pull_request)):
             context = handler._context()
         journal = handlers.manager_git_journal
         expected = dict(
@@ -115,7 +117,8 @@ class ExecutionRecoveryScenarios:
                 "UPDATE exec_plans SET agent_role = 'worker', agent_snapshot = ?, agent_baseline = ?",
                 (before_scope.serialize(), before_scope.head))
         if manual is None:
-            with mock.patch.object(lm, 'pr_for_branch', return_value=pull_request):
+            with mock.patch.object(lm, 'pr_for_branch', side_effect=lambda *_a, **_k:
+                                    observe_live_pull_request(fixture.repo, pull_request)):
                 handler._finish_rebase_journal(context)
         resolved = ['value=resolved\n'] + [f'line-{n}\n' for n in range(30)]
         continuation = None
@@ -144,7 +147,8 @@ class ExecutionRecoveryScenarios:
             resolved_scope = lm.capture_git_snapshot(fixture.worktree)
             self.assertTrue(all(entry.startswith('H ') and entry.endswith(' 0')
                                 for entry in resolved_scope.index['code.py']))
-            with mock.patch.object(lm, 'pr_for_branch', return_value=pull_request):
+            with mock.patch.object(lm, 'pr_for_branch', side_effect=lambda *_a, **_k:
+                                    observe_live_pull_request(fixture.repo, pull_request)):
                 lm.validate_worker_workspace_scope(
                     fixture.repo, fixture.worktree, branch, 'main', context.plan.path,
                     connection.execute('SELECT * FROM exec_plans').fetchone(), before_scope,
@@ -227,7 +231,8 @@ class ExecutionRecoveryScenarios:
                 connection, fixture.repo, fixture.state_dir, repo,
             )
 
-        with mock.patch.object(lm, 'pr_for_branch', return_value=pull_request):
+        with mock.patch.object(lm, 'pr_for_branch', side_effect=lambda *_a, **_k:
+                                    observe_live_pull_request(fixture.repo, pull_request)):
             # Planning still owns the slot; historical sessions are not gates.
             connection.execute("UPDATE projects SET planning_error = 'independent error'")
             self.assertFalse(resume())
@@ -374,7 +379,8 @@ class ExecutionRecoveryScenarios:
     def _continue_recovered_rebase(self, fixture, target, pull_request):
         """Run the phase policies; external Agent and verify services stay fake."""
         repo = str(fixture.repo.resolve())
-        pr_query = mock.patch.object(lm, 'pr_for_branch', return_value=pull_request)
+        pr_query = mock.patch.object(lm, 'pr_for_branch', side_effect=lambda *_a, **_k:
+                                    observe_live_pull_request(fixture.repo, pull_request))
         pr_query.start()
         self.addCleanup(pr_query.stop)
         state = ExecutionStatePort(
@@ -398,7 +404,8 @@ class ExecutionRecoveryScenarios:
         handler.plan = plan
         handler.catalog_plan = state.active_execplan(repo)
         effects.workspace.remote_branch_oid.side_effect = lm.remote_branch_oid
-        effects.publication.pr_for_branch.return_value = pull_request
+        effects.publication.pr_for_branch.side_effect = lambda *_a, **_k: observe_live_pull_request(
+            fixture.repo, pull_request)
         effects.agent.validate_worker_workspace_scope.return_value = plan
         effects.validation.validate_active_execplan_metadata.return_value = plan
         effects.validation.parse_worker_result.side_effect = lm.parse_worker_result
@@ -474,7 +481,7 @@ class ExecutionRecoveryScenarios:
         effects.publication.command.assert_not_called()
         if pull_request:
             state.update_project(repo, pr_conflict_recovery=1,
-                pr_conflict_head_oid=pull_request['headRefOid'], pr_conflict_base_oid=target)
+                pr_conflict_head_oid=state.row()['pr_head_oid'], pr_conflict_base_oid=target)
         # The real publication policy must reject a stale successful token.
         fresh_review = state.row()['review_token']
         state.update_project(repo, review_token='old candidate review')

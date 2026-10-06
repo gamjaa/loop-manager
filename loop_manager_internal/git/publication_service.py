@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
+from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
 from loop_manager_internal.git import managed_rebase_adoption
 from loop_manager_internal.runtime.contracts import PublicationSafetyError
 from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
@@ -270,7 +271,7 @@ def push_owned_pr_conflict_recovery(
     pull_request: Mapping[str, object],
     expected_oid: str,
 ) -> str:
-    """Push the expected reviewed candidate to the owned PR with its exact lease."""
+    """Publish a reviewed candidate to the saved PR; rewrites require rebase ownership."""
 
     plan = effects.active_execplan(connection, repo)
     project = connection.execute(
@@ -280,7 +281,6 @@ def push_owned_pr_conflict_recovery(
         project is None
         or plan is None
         or plan["status"] != "PUBLISHING"
-        or not int(plan["pr_conflict_recovery"])
         or int(plan["workspace_owned"]) != WORKSPACE_OWNED
         or str(plan["branch"] or "") != branch
         or Path(str(plan["worktree"] or "")) != worktree
@@ -289,13 +289,19 @@ def push_owned_pr_conflict_recovery(
             "기존 PR 충돌 복구 게시 소유권을 SQLite에서 확인할 수 없습니다."
         )
     url = str(plan["pr_url"] or "")
-    observed_head = str(plan["pr_conflict_head_oid"] or "")
-    target_base = str(plan["pr_conflict_base_oid"] or "")
+    recovery = bool(plan["pr_conflict_recovery"])
+    observed_head = str((plan["pr_conflict_head_oid"] if recovery
+                         else plan["publication_remote_oid"]) or "")
+    target_base = str((plan["pr_conflict_base_oid"] if recovery
+                      else plan["validated_base_sha"]) or "")
     if (
         str(pull_request.get("state") or "").upper() != "OPEN"
         or str(pull_request.get("url") or "") != url
         or str(pull_request.get("headRefName") or "") != branch
         or str(pull_request.get("headRefOid") or "") != observed_head
+        or (pull_request.get("baseRefName") is not None
+            and pull_request["baseRefName"] != project["base_branch"])
+        or (not recovery and str(plan["pr_head_oid"] or "") != observed_head)
     ):
         raise PublicationSafetyError(
             "게시 직전 PR URL, state, head branch 또는 head OID가 복구 "
@@ -329,6 +335,10 @@ def push_owned_pr_conflict_recovery(
         raise PublicationSafetyError(
             "검증된 base OID가 게시할 관리 HEAD의 조상이 아닙니다."
         )
+    if not recovery and effects.git(
+            worktree, 'merge-base', '--is-ancestor', observed_head, local_oid,
+            check=False).returncode != 0:
+        raise PublicationSafetyError('일반 PR 후보가 확인된 원격 checkpoint의 후속 commit이 아닙니다.')
 
     effects._fetch_pr_conflict_recovery_refs(
         repo_path,
@@ -343,17 +353,20 @@ def push_owned_pr_conflict_recovery(
         )
     current_pr = effects.pr_for_branch(repo_path, branch, url)
     if (current_pr is None or any(current_pr.get(key) != pull_request.get(key)
-                                 for key in ('url', 'state', 'headRefName', 'headRefOid'))):
+                                 for key in ('url', 'state', 'headRefName', 'headRefOid', 'baseRefName'))):
         raise PublicationSafetyError('push 직전 PR identity 또는 head가 변경됐습니다.')
     effects.validate_managed_worktree(repo_path, worktree, branch)
     if (effects.git(worktree, 'rev-parse', 'HEAD').stdout.strip() != local_oid
             or effects.git(worktree, 'rev-parse', '--verify', f'refs/heads/{branch}').stdout.strip() != local_oid):
         raise PublicationSafetyError('PR push 직전 소유 branch 또는 관리 HEAD가 변경됐습니다.')
-    lease = f"--force-with-lease=refs/heads/{branch}:{observed_head}"
+    if remote_oid == local_oid:
+        # A validated candidate can already be the confirmed PR checkpoint.
+        # Reuse its live identity after the same validation gates.
+        return local_oid
     pushed = effects.git(
         worktree,
         "push",
-        lease,
+        *([f"--force-with-lease=refs/heads/{branch}:{observed_head}"] if recovery else []),
         "origin",
         f"{local_oid}:refs/heads/{branch}",
         check=False,
@@ -401,31 +414,58 @@ def recover_confirmed_pr_conflict_push(
 ) -> bool:
     """Recover only a previously pushed local HEAD, never an arbitrary remote head."""
 
-    if (
-        project["phase"] != "PUBLISHING"
-        or not int(project["pr_conflict_recovery"])
-    ):
+    if project["phase"] != "PUBLISHING":
         return False
     plan = effects.active_execplan(connection, repo)
     branch = str(project["branch"] or "")
     worktree = Path(str(project["worktree"] or ""))
     remote_head = str(pull_request.get("headRefOid") or "")
-    observed_head = str(project["pr_conflict_head_oid"] or "")
-    target_base = str(project["pr_conflict_base_oid"] or "")
+    recovery = bool(project["pr_conflict_recovery"])
+    observed_head = str((project["pr_conflict_head_oid"] if recovery
+                         else project["publication_remote_oid"]) or "")
+    target_base = str((project["pr_conflict_base_oid"] if recovery
+                      else project["validated_base_sha"]) or "")
     if (
         plan is None
         or plan["status"] != "PUBLISHING"
-        or not int(plan["pr_conflict_recovery"])
+        or bool(plan["pr_conflict_recovery"]) != recovery
         or int(plan["workspace_owned"]) != WORKSPACE_OWNED
+        or str(plan["branch"] or "") != branch
+        or Path(str(plan["worktree"] or "")) != worktree
         or str(pull_request.get("state") or "").upper() != "OPEN"
         or str(pull_request.get("url") or "") != str(project["pr_url"] or "")
         or str(pull_request.get("headRefName") or "") != branch
+        or (pull_request.get("baseRefName") is not None
+            and pull_request["baseRefName"] != project["base_branch"])
         or not remote_head
+        or not observed_head
         or remote_head == observed_head
+        or (not recovery and (plan["pr_head_oid"] not in {observed_head, remote_head}
+                              or project["pr_head_oid"] != plan["pr_head_oid"]
+                              or plan["publication_remote_oid"] != observed_head))
         or not target_base
         or str(project["active_sha"] or "") != target_base
         or str(project["validated_base_sha"] or "") != target_base
+        or str(plan["active_sha"] or "") != target_base
+        or str(plan["validated_base_sha"] or "") != target_base
+        or not project["publication_token"]
+        or plan["publication_token"] != project["publication_token"]
     ):
+        return False
+    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+        repo, str(plan["plan_id"]))
+    if checkpoint.operation not in {None, "push"}:
+        return False
+    if (not recovery and plan['pr_head_oid'] != observed_head
+            and checkpoint.operation != 'push'):
+        return False
+    if checkpoint.operation == 'push' and (
+            checkpoint.expected_head != remote_head
+            or (checkpoint.snapshot or {}).get('remote_before') != observed_head):
+        return False
+    definition = DefinitionSnapshot.deserialize(plan["definition_snapshot"])
+    if (definition is None
+            or plan["publication_token"] != definition.publication_token(target_base, remote_head)):
         return False
     effects.validate_execplan_workspace_identity(
         state_dir, repo, str(plan["plan_id"]), branch, worktree
@@ -444,17 +484,41 @@ def recover_confirmed_pr_conflict_push(
     )
     if contains_base.returncode != 0:
         return False
+    if not recovery and effects.git(
+            worktree, 'merge-base', '--is-ancestor', observed_head, local_oid,
+            check=False).returncode != 0:
+        return False
     effects._fetch_pr_conflict_recovery_refs(
         repo_path, state_dir, str(project["base_branch"]), branch
     )
     if effects.remote_branch_oid(repo_path, branch) != local_oid:
         return False
-    runtime_state.RuntimeStateRepository(connection).open_pull_request(
-        repo,
-        publication_remote_oid=local_oid,
-        pr_head_oid=local_oid,
-        pr_conflict_recovery=0,
-        pr_conflict_head_oid=None,
-        pr_conflict_base_oid=None,
-    )
+    if effects.git(worktree, 'rev-parse', 'HEAD').stdout.strip() != local_oid:
+        return False
+    with runtime_state._transaction(connection):
+        current_plan = effects.active_execplan(connection, repo)
+        repository = runtime_state.RuntimeStateRepository(connection)
+        projected = repository.projected(repo)
+        ownership_fields = ('plan_id', 'status', 'branch', 'worktree', 'workspace_owned',
+            'pr_url', 'pr_head_oid', 'publication_remote_oid', 'active_sha', 'validated_base_sha',
+            'pr_conflict_recovery', 'pr_conflict_head_oid', 'pr_conflict_base_oid',
+            'definition_snapshot', 'publication_token')
+        if (current_plan is None or projected is None or projected.plan_id != plan['plan_id']
+                or projected.status != 'PUBLISHING'
+                or any(current_plan[key] != plan[key] for key in ownership_fields)):
+            raise PublicationSafetyError('최종 PR push 확인 중 실행 소유권이 변경됐습니다.')
+        if checkpoint.operation == 'push':
+            execution_checkpoint_state.ExecutionCheckpointRepository(connection).record(
+                repo, str(plan['plan_id']), expected_generation=checkpoint.generation,
+                operation=None, expected_head=local_oid,
+                target_base_oid=checkpoint.target_base_oid, observed_remote_oid=local_oid,
+                snapshot={**(checkpoint.snapshot or {}), 'pushed_checkpoint_head': local_oid})
+        repository.open_pull_request(
+            repo,
+            publication_remote_oid=local_oid,
+            pr_head_oid=local_oid,
+            pr_conflict_recovery=0,
+            pr_conflict_head_oid=None,
+            pr_conflict_base_oid=None,
+        )
     return True

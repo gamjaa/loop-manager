@@ -1,5 +1,5 @@
 from tests.support.recovery_boundary import RecoveryBoundary
-from tests.support.pr_recovery import PrRecoveryFixture
+from tests.support.pr_recovery import PrRecoveryFixture, observe_live_pull_request
 import json
 import subprocess
 import tempfile
@@ -10,6 +10,29 @@ import loop_manager
 from tests.support.git import git_command
 from tests.support.worker import worker_result
 from tests.support.worker import dummy_worker_sessions
+
+
+class LivePullRequestObservationTests(unittest.TestCase):
+    def test_live_observer_reads_remote_and_preserves_saved_pr_identity(self):
+        saved = {'url': 'saved-pr', 'state': 'OPEN', 'headRefName': 'branch',
+                 'headRefOid': 'old', 'baseRefName': 'main'}
+        with mock.patch('tests.support.pr_recovery.git_command',
+                        return_value='new\trefs/heads/branch\n') as git:
+            observed = observe_live_pull_request(Path('/repo'), saved)
+        git.assert_called_once_with(Path('/repo'), 'ls-remote', 'origin', 'refs/heads/branch')
+        self.assertEqual(observed, {**saved, 'headRefOid': 'new'})
+        self.assertEqual(saved['headRefOid'], 'old')
+
+    def test_live_observer_keeps_absent_pr_and_rejects_absent_or_ambiguous_ref(self):
+        with mock.patch('tests.support.pr_recovery.git_command') as git:
+            self.assertIsNone(observe_live_pull_request(Path('/repo'), None))
+            git.assert_not_called()
+            for output in ('', 'malformed', 'new\trefs/heads/other',
+                           'new\trefs/heads/branch\nold\trefs/heads/branch'):
+                with self.subTest(output=output):
+                    git.return_value = output
+                    with self.assertRaises(AssertionError):
+                        observe_live_pull_request(Path('/repo'), {'headRefName': 'branch'})
 
 
 class PrConflictCorrectionsTestFixture(PrRecoveryFixture):
@@ -162,7 +185,8 @@ class PrConflictLeaseTests(PrConflictCorrectionsTestFixture, unittest.TestCase):
             ), mock.patch(
                 "loop_manager.ensure_safe_base_worktree"
             ) as synchronize, mock.patch(
-                "loop_manager.pr_for_branch", return_value=pull_request
+                "loop_manager.pr_for_branch", side_effect=lambda *_a, **_k:
+                    observe_live_pull_request(repo, pull_request)
             ), mock.patch(
                 "loop_manager.verify", return_value=(True, "verify: PASS")
             ) as verify, mock.patch(
@@ -217,9 +241,12 @@ class PrConflictLeaseTests(PrConflictCorrectionsTestFixture, unittest.TestCase):
                  "worker-existing", "reviewer-existing"],
             )
             self.assertEqual(verify.call_count, 2)
-            self.assertEqual(len(pushes), 1)
+            self.assertEqual(len(pushes), 2)
             self.assertIn(lease, pushes[0])
-            self.assertNotIn("--force", pushes[0])
+            first_checkpoint = pushes[0][-1].split(":", 1)[0]
+            self.assertIn(f"--force-with-lease=refs/heads/{branch}:{first_checkpoint}", pushes[1])
+            for pushed in pushes:
+                self.assertNotIn("--force", pushed)
             self.assertEqual(created, [])
             self.assertEqual(source_after, source_before)
             synchronize.assert_not_called()
@@ -452,7 +479,8 @@ class PrConflictInterruptionTests(PrConflictCorrectionsTestFixture, unittest.Tes
                     with mock.patch(
                         "loop_manager.validate_repository", return_value=repo
                     ), mock.patch(
-                        "loop_manager.pr_for_branch", return_value=pull_request
+                        "loop_manager.pr_for_branch", side_effect=lambda *_a, **_k:
+                            observe_live_pull_request(repo, pull_request)
                     ), mock.patch(
                         "loop_manager.run_codex", return_value=paused_worker
                     ):
@@ -514,7 +542,8 @@ class PrConflictInterruptionTests(PrConflictCorrectionsTestFixture, unittest.Tes
                     with mock.patch(
                         "loop_manager.validate_repository", return_value=repo
                     ), mock.patch(
-                        "loop_manager.pr_for_branch", return_value=pull_request
+                        "loop_manager.pr_for_branch", side_effect=lambda *_a, **_k:
+                            observe_live_pull_request(repo, pull_request)
                     ), mock.patch(
                         "loop_manager.verify", return_value=(True, "verify: PASS")
                     ), mock.patch(
@@ -595,7 +624,7 @@ class PrConflictInterruptionTests(PrConflictCorrectionsTestFixture, unittest.Tes
                             return subprocess.CompletedProcess(arguments, 128, stdout=output)
                         if is_query:
                             return subprocess.CompletedProcess(
-                                arguments, 0, stdout=json.dumps(pull_request)
+                                arguments, 0, stdout=json.dumps(observe_live_pull_request(repo, pull_request))
                             )
                         result = original_command(arguments, **kwargs)
                         if operation == "rebase" and result.returncode == 0:

@@ -71,6 +71,9 @@ class OwnershipHandler:
                 context, row, remote_oid, current, checkpoint,
                 review_resume, pull_request,
             )
+        if current and (current.snapshot or {}).get('remote_adoption_scope'):
+            return self._owned_adopted_checkpoint(
+                context, row, remote_oid, current, checkpoint, pull_request)
         marker = (current.snapshot or {}).get('blocked_resume') if current else None
         if marker:
             return self._owned_current_checkpoint_rebase(
@@ -107,6 +110,73 @@ class OwnershipHandler:
                 strict_observation=True,
             ) == remote_oid
         return False
+
+    def _owned_adopted_checkpoint(self, context, row, remote_oid, current,
+                                  checkpoint, pull_request):
+        """Keep a checked fast-forward adoption owned through Worker and push."""
+        snapshot = current.snapshot or {}
+        scope = snapshot.get('remote_adoption_scope')
+        accepted = checkpoint['accepted_remote_oid']
+        recorded = row['publication_remote_oid']
+        if (not isinstance(scope, dict) or not accepted
+                or scope.get('head') != accepted or scope.get('remote') != accepted
+                or snapshot.get('last_adopted_remote_oid') != accepted
+                or scope.get('branch') != context.branch
+                or scope.get('worktree') != str(context.worktree)
+                or checkpoint['branch'] != context.branch
+                or checkpoint['worktree'] != str(context.worktree)
+                or snapshot.get('remote_adoption_intent')):
+            return False
+        try:
+            self.ports.validate_execplan_workspace_identity(
+                self.ports.identity.state_dir, self.ports.identity.repo, context.plan.plan_id,
+                context.branch, context.worktree)
+            self.ports.validate_managed_worktree(
+                self.ports.identity.repo_path, context.worktree, context.branch)
+            local = self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+            if self.ports.git(self.ports.identity.repo_path, 'rev-parse',
+                              f'refs/heads/{context.branch}').stdout.strip() != local:
+                return False
+            if (current.operation == 'commit' and local != current.expected_head
+                    and not checkpoint_ownership.committed_tree_matches_intent(
+                        self.ports.identity.repo_path, current.expected_head, local,
+                        snapshot, self.ports.git, strict_observation=True)):
+                return False
+            if checkpoint_ownership.owned_remote_oid(
+                    self.ports.state.connection, self.ports.identity.repo_path,
+                    self.ports.identity.repo, context.plan.plan_id, context.branch,
+                    context.worktree, accepted, self.ports.git, before_head=local,
+                    require_live=False, strict_observation=True) != accepted:
+                return False
+            before = snapshot.get('remote_before')
+            pending_push = (current.operation == 'push' and bool(before)
+                and before in (accepted, snapshot.get('pushed_checkpoint_head'))
+                and current.expected_head == local == remote_oid
+                and recorded in (before, remote_oid))
+            confirmed_push = (snapshot.get('pushed_checkpoint_head') == remote_oid == recorded)
+            if not ((remote_oid == recorded == accepted) or pending_push or confirmed_push):
+                return False
+            ancestor = before if pending_push else remote_oid
+            if ancestor != accepted and self.ports.git(
+                    context.worktree, 'merge-base', '--is-ancestor', ancestor, local,
+                    check=False).returncode != 0:
+                return False
+            if row['pr_url'] and (pull_request is None
+                    or pull_request.get('url') != row['pr_url']
+                    or pull_request.get('headRefName') != context.branch
+                    or pull_request.get('headRefOid') != remote_oid
+                    or (pending_push and row['pr_head_oid'] not in (before, remote_oid))
+                    or (not pending_push and row['pr_head_oid'] != remote_oid)):
+                return False
+            return manager_git_journal.live_remote_branch_oid(
+                self.ports.git, self.ports.identity.repo_path, context.branch) == remote_oid
+        except RecoveryFailure:
+            raise
+        except WorkspaceOwnershipError:
+            return False
+        except (RuntimeError, OSError) as error:
+            raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
+                                  'adopted checkpoint ownership observation failed') from error
 
     def _owned_published_review_resume(
         self, context, row, remote_oid, current, checkpoint, marker, pull_request,
@@ -216,7 +286,7 @@ class OwnershipHandler:
                                          checkpoint, pull_request, *, rebase_observation=None):
         original = str(checkpoint['accepted_remote_oid'] or '')
         recorded = str(row['publication_remote_oid'] or original)
-        if not original or row['pr_url']:
+        if not original:
             return False
         intermediate = (current.snapshot or {}).get('rebase_publication_intent') or {}
         pending_intermediate = (current.operation == 'rebase_publish'
@@ -237,8 +307,10 @@ class OwnershipHandler:
                 or pending_intermediate
                 or (remote_oid == recorded and (current.snapshot or {}).get('last_adopted_remote_oid') == recorded)):
             return False
-        if pull_request is not None and (current.operation != 'pr_create'
-                                        or pull_request.get('headRefOid') != remote_oid):
+        if pull_request is not None and (
+                pull_request.get('headRefOid') != remote_oid
+                or (row['pr_url'] and pull_request.get('url') != row['pr_url'])
+                or (not row['pr_url'] and current.operation != 'pr_create')):
             return False
         try:
             if checkpoint_ownership.owned_remote_oid(

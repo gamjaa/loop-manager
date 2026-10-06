@@ -240,6 +240,9 @@ class PrConflictPublicationTest(PrRecoveryFixture, unittest.TestCase):
                 pr_conflict_head_oid=observed_head,
                 pr_conflict_base_oid=base_oid,
             )
+            approval = seed_validated_candidate(connection, repo, worktree, 'G-026')
+            loop_manager.update_project(connection, str(repo),
+                publication_token=approval.publication_token(base_oid, local_head))
             project = connection.execute(
                 "SELECT * FROM projects WHERE repo = ?", (str(repo),)
             ).fetchone()
@@ -305,6 +308,9 @@ class PrConflictPublicationTest(PrRecoveryFixture, unittest.TestCase):
                     pr_conflict_recovery=1, pr_conflict_head_oid=observed_head,
                     pr_conflict_base_oid=base,
                 )
+                approval = seed_validated_candidate(connection, repo, worktree, 'G-026')
+                loop_manager.update_project(connection, str(repo),
+                    publication_token=approval.publication_token(base, local_head))
                 self._make_source_checkout_dirty_and_ahead(repo)
                 source_before = self._source_checkout_snapshot(repo)
                 if damage == "missing-worktree":

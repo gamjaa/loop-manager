@@ -210,8 +210,8 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
         return refuse("게시 OID가 증명되지 않은 legacy checkpoint의 원격 변경은 채택할 수 없습니다.")
     if row["pending_remote_oid"] and row["pending_remote_oid"] != observed and not integrating:
         return refuse("미완료 원격 checkpoint 채택 중 branch OID가 다시 변경됐습니다.")
-    if blocked["pr_url"] or int(blocked["workspace_owned"] or 0) != WORKSPACE_OWNED:
-        return refuse("PR 또는 관리 workspace 소유권 때문에 원격 checkpoint를 채택할 수 없습니다.")
+    if int(blocked["workspace_owned"] or 0) != WORKSPACE_OWNED:
+        return refuse("관리 workspace 소유권 때문에 원격 checkpoint를 채택할 수 없습니다.")
     if request.branch != branch or request.worktree != str(worktree):
         return refuse("저장된 checkpoint branch/worktree가 ExecPlan 소유권과 다릅니다.")
     if safety_error:
@@ -501,25 +501,31 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
                 'SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?', (repo, blocked['plan_id'])).fetchone()
             if selected is None or any(selected[field] != blocked[field] for field in (
                     *blocked_plan_reconciliation.IDENTITY_FIELDS, 'status', 'blocked_reason',
-                    'agent_snapshot', 'agent_result_snapshot')):
+                    'agent_snapshot', 'agent_result_snapshot', 'publication_remote_oid',
+                    'pr_head_oid', 'pr_conflict_recovery', 'pr_conflict_head_oid')):
                 return retry('원격 채택 확정 전 계획 소유권 또는 차단 원인이 변경됐습니다.')
             repository.record_remote_inspection(
                 request, observed, input_identity,
                 "원격 후속 commit 채택 완료; base 반영 뒤 원래 차단 원인을 검사합니다.",
                 commit=False,
             )
-            connection.execute(
-                "UPDATE exec_plans SET publication_remote_oid = ?, validated_base_sha = NULL, "
-                "worker_input_token = NULL, archive_token = NULL, verify_token = NULL, "
-                "review_token = NULL, publication_token = NULL WHERE repo = ? AND plan_id = ?",
-                (observed, repo, blocked['plan_id']),
-            )
-            projected = runtime_state.RuntimeStateRepository(connection).projected_row(repo)
+            values = dict(publication_remote_oid=observed, validated_base_sha=None,
+                          worker_input_token=None, archive_token=None, verify_token=None,
+                          review_token=None, publication_token=None)
+            if selected['pr_url']:
+                values['pr_head_oid'] = observed
+                if int(selected['pr_conflict_recovery']):
+                    values['pr_conflict_head_oid'] = observed
+            runtime = runtime_state.RuntimeStateRepository(connection)
+            projected = runtime.projected_row(repo)
             if projected is not None and projected['plan_id'] == blocked['plan_id']:
-                connection.execute(
-                    'UPDATE projects SET publication_remote_oid = ?, validated_base_sha = NULL, '
-                    'worker_input_token = NULL, archive_token = NULL, verify_token = NULL, '
-                    'review_token = NULL, publication_token = NULL WHERE repo = ?', (observed, repo))
+                runtime.transition(
+                    repo, str(blocked['plan_id']), plan_values=values, project_values=values,
+                    expected_status=selected['status'], enqueue=False)
+            else:
+                runtime.update_plan(
+                    repo, str(blocked['plan_id']), plan_values=values,
+                    expected_status=selected['status'], enqueue=False)
             checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
             current = checkpoints.get(repo, str(blocked['plan_id']))
             if current.operation is not None:

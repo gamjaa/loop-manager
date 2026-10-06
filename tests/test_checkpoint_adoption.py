@@ -10,6 +10,7 @@ from unittest import mock
 from loop_manager_internal.recovery import blocked_checkpoint
 from loop_manager_internal.storage import blocked_checkpoint_state
 from loop_manager_internal.storage import execution_checkpoint_state
+from loop_manager_internal.storage import runtime_state
 import loop_manager
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.recovery import checkpoint_ownership
@@ -45,7 +46,8 @@ class CheckpointRefreshFixture:
                   dirty=False, changed_paths=('code.py',), rewritten=False, candidate_race=False,
                   managed_rebased=False, local_rewritten=False, manager_waiting=False, base_conflict=False,
                   pending_restart=None, pending_input_rewritten=False, foreign_pending=False,
-                  completed_base_restart=False, base_completed=None):
+                  completed_base_restart=False, base_completed=None,
+                  existing_pr=False, projected=False, pr_conflict=False):
         branch, worktree = 'loop-manager/G-106', str(Path('/state/G-106'))
         original, successor = 'a' * 40, 'b' * 40
         self.connection.execute("UPDATE projects SET origin = 'example/repo'")
@@ -55,6 +57,20 @@ class CheckpointRefreshFixture:
         self.connection.execute(
             "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
             "VALUES ('repo', 'G-106', 'plan', 'verify_retry_exhausted', 'original failure')")
+        if existing_pr:
+            self.connection.execute(
+                'UPDATE exec_plans SET pr_url = ?, pr_head_oid = ?, publication_remote_oid = ?, '
+                'pr_conflict_recovery = ?, pr_conflict_head_oid = ?',
+                ('saved-pr', original, original, int(pr_conflict), original if pr_conflict else None))
+            self.request = self.store.request(
+                repo='repo', plan_id='G-106', reason_code='verify_retry_exhausted',
+                evidence='original failure', branch=branch, worktree=worktree,
+                expected_remote_oid=original, rebase_recovery=False)
+            self.store.record_prepared(self.request, blocked_checkpoint.PreparedCheckpoint(
+                original, 'c' * 40, 'identity', 'message', ()))
+            self.store.finish_published(self.request, original, reobserve=lambda: original)
+        if projected:
+            runtime_state.RuntimeStateRepository(self.connection).hydrate('repo', 'G-106')
         self.connection.commit()
         plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
         local = 'c' * 40 if diverged or managed_rebased or local_rewritten or pending_restart or base_completed else original
@@ -251,6 +267,83 @@ class CheckpointRefreshFixture:
 
 
 class BlockedCheckpointRefreshUnitTests(CheckpointRefreshFixture, unittest.TestCase):
+    def test_pr_successor_adoption_completes_base_rebase_and_resumes_unverified(self):
+        from tests.support.rebase_observations import expectation, observation, decision_for
+        from loop_manager_internal.git.managed_rebase_validation import PullRequest, Remote
+        self.connection.execute("UPDATE exec_plans SET worker_session_id = 'saved-worker'")
+        result, _ = self._adoption(existing_pr=True, projected=True, pr_conflict=True)
+        self.assertEqual(result, 'adopted')
+        runtime = runtime_state.RuntimeStateRepository(self.connection)
+        adopted = runtime.get('repo', 'G-106')
+        successor = 'b' * 40
+        self.assertEqual((adopted.publication_remote_oid, adopted.pr_head_oid,
+                          adopted.pr_conflict_head_oid), (successor,) * 3)
+        self.assertEqual(runtime.projected('repo'), adopted)
+        self.assertEqual(adopted.status, 'PLAN_BLOCKED')
+        checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        current = checkpoints.get('repo', 'G-106')
+        current = checkpoints.record(
+            'repo', 'G-106', expected_generation=current.generation, operation='rebase',
+            expected_head=successor, target_base_oid='latest-base', observed_remote_oid=successor,
+            snapshot=current.snapshot)
+        expected = expectation(
+            repo='repo', plan_id='G-106', plan_path=adopted.path, worktree=adopted.worktree,
+            branch=adopted.branch, generation=current.generation, target_base_oid='latest-base',
+            remote=Remote('repo', adopted.branch, successor,
+                          PullRequest('saved-pr', 'repo', adopted.branch, successor, 'OPEN')))
+        decision = decision_for(expected, observation(expected, head='rebased-head',
+            branch_ref=('rebased-head', ''), registration=('HEAD=rebased-head', f'branch=refs/heads/{adopted.branch}')))
+        completed = runtime.complete_rebase(
+            adopted, checkpoints, acceptance=decision.acceptance,
+            project_values={'phase': 'PLAN_BLOCKED'}, reobserve=lambda: decision)
+        self.assertEqual(completed.pr_head_oid, successor)
+        self.assertEqual(completed.active_sha, 'latest-base')
+        self.assertEqual(completed.status, 'PLAN_BLOCKED')
+        self.assertEqual(scoped_blocking.plan_block(self.connection, 'repo', 'G-106')['evidence'], 'original failure')
+        plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        loop_manager._resume_remote_corrected_execplan(
+            self.connection, 'repo', plan, self.store, self.store.get('repo', 'G-106'),
+            'rebased-head', 'current-input', 'cause resolved')
+        resumed = runtime.projected('repo')
+        self.assertEqual(resumed.status, 'IMPLEMENTING')
+        self.assertEqual(resumed.pr_head_oid, successor)
+        self.assertEqual(resumed.worker_session_id, 'saved-worker')
+        self.assertIsNone(resumed.verify_token)
+        self.assertIsNone(resumed.review_token)
+        self.assertIsNone(resumed.worker_result)
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, 'repo', 'G-106'))
+
+    def test_unprojected_pr_adoption_preserves_independent_project_heads(self):
+        self.connection.execute("UPDATE projects SET pr_head_oid = 'other-pr-head', "
+                                "publication_remote_oid = 'other-lease', verify_token = 'other-verify'")
+        result, _ = self._adoption(existing_pr=True)
+        self.assertEqual(result, 'adopted')
+        plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual(plan['pr_head_oid'], 'b' * 40)
+        project = self.connection.execute('SELECT * FROM projects').fetchone()
+        self.assertEqual(project['pr_head_oid'], 'other-pr-head')
+        self.assertEqual(project['publication_remote_oid'], 'other-lease')
+        self.assertEqual(project['verify_token'], 'other-verify')
+
+    def test_pr_head_and_receipt_adoption_roll_back_together(self):
+        transition = runtime_state.RuntimeStateRepository.transition
+        def interrupted(runtime, *args, **kwargs):
+            result = transition(runtime, *args, **kwargs)
+            if kwargs['plan_values'].get('pr_head_oid') == 'b' * 40:
+                raise RuntimeError('receipt interrupted')
+            return result
+        with mock.patch.object(runtime_state.RuntimeStateRepository, 'transition', autospec=True,
+                               side_effect=interrupted):
+            with self.assertRaisesRegex(RuntimeError, 'receipt interrupted'):
+                self._adoption(existing_pr=True, projected=True, pr_conflict=True)
+        plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        project = self.connection.execute('SELECT * FROM projects').fetchone()
+        for row in (plan, project):
+            self.assertEqual(row['publication_remote_oid'], 'a' * 40)
+            self.assertEqual(row['pr_head_oid'], 'a' * 40)
+            self.assertEqual(row['pr_conflict_head_oid'], 'a' * 40)
+        self.assertEqual(self.row()['accepted_remote_oid'], 'a' * 40)
+
     def test_manual_base_completion_then_successor_preserves_rewritten_result(self):
         result, commands = self._adoption(base_completed='manual')
         self.assertEqual(result, 'adopted')

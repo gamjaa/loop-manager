@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS blocked_checkpoints (
     reason_code TEXT NOT NULL,
     evidence TEXT NOT NULL,
     branch TEXT,
+    pr_url TEXT,
     worktree TEXT,
     expected_remote_oid TEXT,
     remote_observed INTEGER NOT NULL DEFAULT 0,
@@ -71,7 +72,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     for name in (
         "published_oid", "accepted_remote_oid", "pending_remote_oid",
         "inspected_remote_oid", "inspected_input", "inspection_reason",
-        "identity_reason_code", "identity_evidence",
+        "identity_reason_code", "identity_evidence", "pr_url",
     ):
         if name not in columns:
             connection.execute(f"ALTER TABLE blocked_checkpoints ADD COLUMN {name} TEXT")
@@ -92,6 +93,7 @@ def request_identity(
     branch: str | None,
     worktree: str | None,
     release_fingerprint: str | None = None,
+    pr_url: str | None = None,
 ) -> str:
     value = "\0".join(
         (
@@ -104,6 +106,8 @@ def request_identity(
             release_fingerprint or "",
         )
     )
+    if pr_url:
+        value += "\0" + pr_url
     return hashlib.sha256(value.encode()).hexdigest()
 
 
@@ -132,14 +136,13 @@ class BlockedCheckpointRepository:
         rebase_recovery: bool,
         release_fingerprint: str | None = None,
     ) -> CheckpointRequest:
+        plan = self.connection.execute(
+            "SELECT pr_url FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (repo, plan_id)).fetchone()
+        pr_url = plan['pr_url'] if plan else None
         identity = request_identity(
-            repo,
-            plan_id,
-            reason_code,
-            evidence,
-            branch,
-            worktree,
-            release_fingerprint,
+            repo, plan_id, reason_code, evidence, branch, worktree,
+            release_fingerprint, pr_url,
         )
         current = self.connection.execute(
             "SELECT request_identity FROM blocked_checkpoints "
@@ -152,8 +155,8 @@ class BlockedCheckpointRepository:
                 INSERT INTO blocked_checkpoints (
                     repo, plan_id, request_identity, phase, reason_code,
                     evidence, branch, worktree, expected_remote_oid,
-                    remote_observed, rebase_recovery
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    remote_observed, rebase_recovery, pr_url
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(repo, plan_id) DO UPDATE SET
                     request_identity = excluded.request_identity,
                     phase = excluded.phase,
@@ -177,6 +180,7 @@ class BlockedCheckpointRepository:
                     inspection_reason = NULL,
                     inspection_retryable = 0,
                     rebase_recovery = excluded.rebase_recovery,
+                    pr_url = excluded.pr_url,
                     result = NULL,
                     unpublished_reason = NULL,
                     retryable = 0,
@@ -194,6 +198,7 @@ class BlockedCheckpointRepository:
                     expected_remote_oid,
                     int(expected_remote_oid is not None),
                     int(rebase_recovery),
+                    pr_url,
                 ),
             )
         return self.get(repo, plan_id)
@@ -226,6 +231,7 @@ class BlockedCheckpointRepository:
                 str(row["remote_oid"]) if row["remote_oid"] is not None else None
             ),
             rebase_recovery=bool(row["rebase_recovery"]),
+            pr_url=row["pr_url"],
         )
 
     def get(self, repo: str, plan_id: str) -> CheckpointRequest:
@@ -361,9 +367,18 @@ class BlockedCheckpointRepository:
         )
 
     def finish_published(
-        self, request: CheckpointRequest, remote_oid: str
+        self, request: CheckpointRequest, remote_oid: str, *, reobserve=None
     ) -> None:
-        with self.connection:
+        from loop_manager_internal.storage.runtime_state import _transaction, RuntimeStateRepository
+
+        runtime = RuntimeStateRepository(self.connection)
+        with _transaction(self.connection):
+            plan = runtime.get(request.repo, request.plan_id)
+            if request.pr_url:
+                if ((plan.branch, plan.worktree, plan.pr_url) != (request.branch, request.worktree, request.pr_url)
+                        or reobserve is None or reobserve() != remote_oid
+                        or runtime.get(request.repo, request.plan_id) != plan):
+                    raise RuntimeError('checkpoint 확정 직전 PR·작업 공간·원격 결과가 변경됐습니다.')
             self._update(
                 request,
                 phase=CheckpointPhase.PUBLISHED.value,
@@ -380,11 +395,19 @@ class BlockedCheckpointRepository:
                 unpublished_reason=None,
                 retryable=0,
             )
-            self.connection.execute(
-                "UPDATE exec_plans SET publication_remote_oid = ? "
-                "WHERE repo = ? AND plan_id = ?",
-                (remote_oid, request.repo, request.plan_id),
-            )
+            values = {'publication_remote_oid': remote_oid}
+            if request.pr_url:
+                values.update(pr_head_oid=remote_oid, worker_input_token=None, archive_token=None,
+                              verify_token=None, review_token=None, publication_token=None,
+                              validated_base_sha=None, worker_result=None, verify_result=None,
+                              review_result=None)
+                if plan.pr_conflict_recovery:
+                    values['pr_conflict_head_oid'] = remote_oid
+            projected = runtime.projected(request.repo)
+            if request.pr_url and projected and projected.plan_id == request.plan_id:
+                runtime.update_project(request.repo, values, enqueue=False)
+            else:
+                runtime.update_plan(request.repo, request.plan_id, plan_values=values, enqueue=False)
             notifications.enqueue_current_project_events(self.connection, request.repo)
 
     def start_remote_adoption(self, request: CheckpointRequest, oid: str) -> None:
@@ -425,7 +448,7 @@ class BlockedCheckpointRepository:
             raise RuntimeError("게시되지 않은 checkpoint의 차단 원인을 바꿀 수 없습니다.")
         identity = request_identity(
             request.repo, request.plan_id, reason_code, evidence,
-            request.branch, request.worktree, release_fingerprint,
+            request.branch, request.worktree, release_fingerprint, request.pr_url,
         )
         # Legacy rows must retain the original identity inputs before reclassification.
         self.connection.execute(

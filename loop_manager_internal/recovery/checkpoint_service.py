@@ -434,7 +434,7 @@ def _owned_checkpoint_remote_oid(
     if tracked is None or tracked[1] or current.refs.get(local_ref) != (current.head, ""):
         return None
     candidate = tracked[0]
-    published = str(plan["publication_remote_oid"] or "")
+    published = str(plan["publication_remote_oid"] or (plan["pr_head_oid"] if request.pr_url else None) or "")
     durable = candidate == published and bool(published)
     if not durable and request.local_oid == candidate and request.tree_oid and request.commit_identity:
         try:

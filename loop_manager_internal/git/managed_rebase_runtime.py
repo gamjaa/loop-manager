@@ -75,7 +75,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
     if remote_oid is not _UNSET:
         expected_oid = remote_oid
     pr = (PullRequest(str(plan['pr_url']), repo, branch,
-                      str(plan['pr_head_oid'] or plan['pr_conflict_head_oid'] or ''), 'OPEN')
+                      str(expected_oid or ''), 'OPEN')
           if plan['pr_url'] else None)
     remote = Remote(repo, branch, expected_oid, pr)
     if (str(plan['branch'] or '') != branch

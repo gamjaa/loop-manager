@@ -3,17 +3,23 @@ from __future__ import annotations
 from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
+from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
 from loop_manager_internal.application.contracts import PRIORITY_ORDER
 from loop_manager_internal.application.contracts import PullRequestSyncResult
 from loop_manager_internal.application.contracts import WaitingPullRequestObservation
 from loop_manager_internal.notifications import notifications
+from loop_manager_internal.git.managed_rebase_adoption import revalidation_values
+from loop_manager_internal.recovery import blocked_plan_reconciliation
 from loop_manager_internal.recovery import pull_request_recovery
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.scoped_blocking import PR_CLOSED_BLOCK_REASON
+from loop_manager_internal.recovery.recovery_runtime import RecoveryReason
 from loop_manager_internal.runtime.contracts import PublicationSafetyError
 from loop_manager_internal.runtime.contracts import REBASE_IN_PROGRESS_ERROR
 from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.storage import recovery_state
+from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 from pathlib import Path
 import json
 import sqlite3
@@ -203,6 +209,10 @@ def observe_waiting_pull_requests(
                 "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
                 (repo, stored["plan_id"]),
             ).fetchone()
+            if stored["status"] != "PR_OPEN":
+                # An unvalidated candidate resumes execution when its slot is
+                # available; it never joins the Merge-wait conflict selection.
+                continue
         with connection:
             resumed = notifications.record_work_start(
                 connection, repo, "PR handling", plan_id=str(stored["plan_id"]),
@@ -363,8 +373,13 @@ def _block_closed_pull_request(
         and mirrored["plan_path"] == plan["path"]
     )
     with runtime_state._transaction(connection):
+        resume_phase = str(plan["status"])
+        if resume_phase == "PLAN_BLOCKED" and plan["blocked_reason"] == PR_CLOSED_BLOCK_REASON:
+            saved = recovery_state.RecoveryRepository(connection).row(repo, str(plan["plan_id"]))
+            if saved is not None and saved["reason_code"] == RecoveryReason.PULL_REQUEST_CLOSED.value:
+                resume_phase = str(saved["phase"])
         effects._final_block_recovery_decision(
-            connection, repo, plan, "PR_OPEN",
+            connection, repo, plan, resume_phase,
             BlockReasonCode.PULL_REQUEST_CLOSED, error,
             str(head_oid or ""), None,
         )
@@ -401,9 +416,28 @@ def _resume_reopened_pull_request(
 ) -> None:
     if conflict_oids is not None and not recovery:
         raise ValueError("PR 충돌 복구 OID는 복구 전이에만 기록할 수 있습니다.")
-    phase = "WORKING" if recovery else "PR_OPEN"
-    status = "IMPLEMENTING" if recovery else "PR_OPEN"
-    last_error = REBASE_IN_PROGRESS_ERROR if recovery else None
+    checkpoint = ExecutionCheckpointRepository(connection).get(repo, str(plan["plan_id"]))
+    saved_recovery = recovery_state.RecoveryRepository(connection).row(repo, str(plan["plan_id"]))
+    definition = DefinitionSnapshot.deserialize(plan["definition_snapshot"])
+    publication_approved = bool(definition is not None and plan["validated_base_sha"]
+        and plan["publication_token"] == definition.publication_token(
+            str(plan["validated_base_sha"]), str(head_oid or "")))
+    revalidate_candidate = bool(
+        plan["blocked_reason"] == PR_CLOSED_BLOCK_REASON
+        and (checkpoint.operation in {"rebase", "rebase_publish"}
+             or saved_recovery is not None
+             and saved_recovery["reason_code"] == RecoveryReason.PULL_REQUEST_CLOSED.value
+             and saved_recovery["phase"] in runtime_state.ACTIVE_STATUSES
+             and (saved_recovery["phase"] != "PUBLISHING" or not publication_approved)))
+    confirm_publication = bool(
+        not recovery and not revalidate_candidate
+        and plan['blocked_reason'] == PR_CLOSED_BLOCK_REASON and publication_approved
+        and checkpoint.operation == 'push' and checkpoint.expected_head == head_oid
+        and (checkpoint.snapshot or {}).get('remote_before') == plan['publication_remote_oid'])
+    recovery = recovery or revalidate_candidate
+    phase = "WORKING" if recovery else "PUBLISHING" if confirm_publication else "PR_OPEN"
+    status = "IMPLEMENTING" if recovery else phase
+    last_error = REBASE_IN_PROGRESS_ERROR if recovery and not revalidate_candidate else None
     execplan_values: dict[str, object] = {
         "status": status,
         "blocked_reason": None,
@@ -433,12 +467,23 @@ def _resume_reopened_pull_request(
                     pr_conflict_head_oid=conflict_oids[0],
                     pr_conflict_base_oid=conflict_oids[1],
                 )
+    if revalidate_candidate:
+        values = revalidation_values(checkpoint.target_base_oid or plan["active_sha"])
+        project_values.update(values)
+        execplan_values.update({key: value for key, value in values.items() if key != "phase"})
     with runtime_state._transaction(connection):
         mirrored = connection.execute(
             "SELECT * FROM projects WHERE repo = ?", (repo,)
         ).fetchone()
         repository = runtime_state.RuntimeStateRepository(connection)
-        if (mirrored and not runtime_state.planning_owns_execution_slot(mirrored)
+        if revalidate_candidate or confirm_publication:
+            if (scoped_blocking.project_block(connection, repo) is not None
+                    or not blocked_plan_reconciliation.slot_available(connection, repo, str(plan["plan_id"]))):
+                return
+            resumed_candidate = repository.update_plan(
+                repo, str(plan["plan_id"]), plan_values=execplan_values, enqueue=False)
+            repository.hydrate_snapshot(repo, resumed_candidate)
+        elif (mirrored and not runtime_state.planning_owns_execution_slot(mirrored)
                 and mirrored["plan_path"] == plan["path"]):
             projection = project_values if recovery else effects._clear_active_values()
             repository.transition(

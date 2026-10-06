@@ -56,8 +56,10 @@ class ImmediateRebasePublicationTests(TestCase):
             if self.push_failure:
                 return SimpleNamespace(returncode=1, stdout='permission denied')
             self.remote = 'owned-head'
+            pr = self.seed.expected.remote.pull_request
             self.seed.observed = replace(self.seed.observed,
-                                         remote=replace(self.seed.expected.remote, oid=self.remote))
+                remote=replace(self.seed.expected.remote, oid=self.remote,
+                               pull_request=replace(pr, head=self.remote) if pr else None))
             return SimpleNamespace(returncode=0, stdout='pushed')
         return self.fixture.observed_git(path, *args, **kwargs)
 
@@ -76,17 +78,577 @@ class ImmediateRebasePublicationTests(TestCase):
         self.handler = replacement
 
     def direct_ports(self):
+        def current_service(*_args, **options):
+            options.setdefault('remote_oid', self.remote)
+            service = self.seed.factory(None, **options)
+            pr = service.expected.remote.pull_request
+            if pr is not None:
+                service = replace(service, expected=replace(service.expected,
+                    remote=replace(service.expected.remote,
+                                   pull_request=replace(pr, head=service.expected.remote.oid))))
+            return service
         stack = ExitStack()
         for patch in (
             mock.patch.object(lm, '_owned_rebase_state_dir', return_value=Path('/state')),
-            mock.patch.object(lm, '_current_rebase_service', side_effect=lambda *_a, **options:
-                self.seed.factory(None, remote_oid=options.get('remote_oid', self.remote))),
+            mock.patch.object(lm, '_current_rebase_service', side_effect=current_service),
             mock.patch.object(lm, 'git', side_effect=self.git),
             mock.patch.object(lm, 'remote_branch_oid', side_effect=lambda *_: self.remote),
-            mock.patch.object(lm, 'pr_for_branch', return_value=None),
+            mock.patch.object(lm, 'pr_for_branch', side_effect=self.handler.effects.publication.pr_for_branch),
         ):
             stack.enter_context(patch)
         return stack
+
+    def test_bound_direct_rebase_retry_keeps_adoption_and_same_publication_intent(self):
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+        self._existing_pr()
+        self.push_failure = True
+        complete = self.state.bind(lm._complete_direct_rebase_checkpoint, connected=True, mutates=True)
+        arguments = ('repo', 'G-047', Path('/state/G-047').resolve())
+        options = dict(target_base_oid=self.seed.expected.target_base_oid,
+                       repo_path=Path('/repo'), branch='loop-manager/G-047',
+                       agent_session_id=self.state.row()['worker_session_id'])
+        with self.direct_ports():
+            with self.assertRaises(RecoveryFailure) as caught:
+                complete(*arguments, **options)
+            self.assertIs(caught.exception.reason, RecoveryReason.PUBLICATION_RETRY)
+            pending = self.checkpoints.get('repo', 'G-047')
+            self.assertEqual(pending.operation, 'rebase_publish')
+            self.assertEqual(self.state.check().status, 'IMPLEMENTING')
+            self.assertEqual(self.state.row()['publication_remote_oid'], 'remote')
+            self.assertIsNone(self.state.row()['verify_result'])
+            self.push_failure = False
+            complete(*arguments, **options)
+        self.assertEqual(self.state.row()['publication_remote_oid'], 'owned-head')
+        self.assertEqual(self.state.row()['pr_head_oid'], 'owned-head')
+        self.assertIsNone(self.state.row()['review_token'])
+        self.assertEqual(self.checkpoints.get('repo', 'G-047').snapshot['rebase_publication_intent'],
+                         pending.snapshot['rebase_publication_intent'])
+        self.assertEqual(len(self.pushes), 2)
+        self.assertEqual(self.pushes[0], self.pushes[1])
+
+    def _existing_pr(self):
+        from loop_manager_internal.git.managed_rebase_validation import PullRequest
+        pr = PullRequest('https://example.test/pr/47', 'repo', 'loop-manager/G-047', 'remote', 'OPEN')
+        self.seed.expected = replace(self.seed.expected,
+            remote=replace(self.seed.expected.remote, pull_request=pr))
+        self.seed.observed = replace(self.seed.observed, remote=self.seed.expected.remote)
+        self.state.update_project('repo', pr_url=pr.identity, pr_head_oid='remote',
+            verify_token='old-verify', review_token='old-review', publication_token='old-publication')
+        factory = self.handler.effects.workspace.current_rebase_service
+        def current_pr_service(context, **options):
+            service = factory(context, **options)
+            return replace(service, expected=replace(service.expected,
+                remote=replace(service.expected.remote,
+                    pull_request=replace(pr, head=service.expected.remote.oid))))
+        self.handler.effects = replace(self.handler.effects, workspace=replace(
+            self.handler.effects.workspace, current_rebase_service=current_pr_service))
+        self.pr_changes = {}
+        self.handler.effects.publication.pr_for_branch.side_effect = lambda *_: {
+            'url': pr.identity, 'state': 'OPEN', 'headRefName': pr.branch,
+            'headRefOid': self.remote, 'baseRefName': 'main', **self.pr_changes}
+
+    def test_existing_pr_checkpoint_uses_exact_lease_and_invalidates_approval(self):
+        self._existing_pr()
+        self.complete()
+        saved = self.checkpoints.get('repo', 'G-047')
+        self.assertEqual(saved.snapshot['rebase_publication_intent']['acceptance']['remote']['pull_request']['identity'],
+                         'https://example.test/pr/47')
+        self.assertEqual(self.state.row()['pr_head_oid'], 'owned-head')
+        project = self.fixture.connection.execute("SELECT * FROM projects WHERE repo='repo'").fetchone()
+        self.assertEqual(project['pr_head_oid'], 'owned-head')
+        self.assertIsNone(project['verify_token'])
+        self.assertIsNone(project['review_token'])
+        for field in ('verify_token', 'review_token', 'publication_token', 'validated_base_sha',
+                      'worker_result', 'verify_result', 'review_result'):
+            self.assertIsNone(self.state.row()[field])
+        self.assertEqual(self.pushes, [('push', '--force-with-lease=refs/heads/loop-manager/G-047:remote',
+                                       'origin', 'owned-head:refs/heads/loop-manager/G-047')])
+        self.handler._publish_rebased_checkpoint(self.handler._context())
+        self.assertEqual(len(self.pushes), 1)
+
+    def test_existing_pr_push_before_sqlite_confirmation_resumes_without_duplicate_push(self):
+        self._existing_pr()
+        class Exit(BaseException):
+            pass
+        with mock.patch.object(self.state, 'complete_rebase_publication', side_effect=Exit()):
+            with self.assertRaises(Exit):
+                self.complete()
+        pending = self.checkpoints.get('repo', 'G-047')
+        self.assertEqual(pending.operation, 'rebase_publish')
+        self.assertEqual(self.state.row()['pr_head_oid'], 'remote')
+        self.restart()
+        self.handler._publish_rebased_checkpoint(self.handler._context())
+        self.assertEqual(len(self.pushes), 1)
+        self.assertEqual(self.state.row()['pr_head_oid'], 'owned-head')
+        self.assertEqual(self.checkpoints.get('repo', 'G-047').snapshot['rebase_publication_intent'],
+                         pending.snapshot['rebase_publication_intent'])
+
+    def _restart_through_project_entry(self):
+        """Run the real project entry/PR recovery with unrelated preflight isolated."""
+        from loop_manager_internal.application.project_service import ProjectService
+        self.restart()
+        events = []
+        def prepare(service):
+            self.fixture.connection.execute("UPDATE projects SET planning_attempt_fingerprint = NULL")
+            service.state.repo, service.state.repo_path = 'repo', Path('/repo')
+            service.state.row = self.fixture.connection.execute("SELECT * FROM projects WHERE repo='repo'").fetchone()
+        def next_work(service):
+            events.append('candidate-work')
+            fresh = runtime_state.RuntimeStateRepository(self.fixture.connection).projected('repo')
+            self.assertEqual(fresh.status, 'IMPLEMENTING')
+            self.assertEqual(fresh.pr_head_oid, 'owned-head')
+            self.assertEqual(fresh.pr_conflict_head_oid, 'owned-head')
+            self.assertIsNone(fresh.verify_token)
+            self.assertIsNone(fresh.review_token)
+            return 0
+        actual_validate = lm._validate_active_pr_conflict_recovery
+        def validate(*args, **kwargs):
+            events.append('PR-ownership')
+            return actual_validate(*args, **kwargs)
+        with self.direct_ports(), ExitStack() as ports:
+            block = ports.enter_context(mock.patch.object(lm, 'block_active_execplan_from_revision'))
+            for patch in (
+                mock.patch.object(ProjectService, '_prepare_repository', autospec=True, side_effect=prepare),
+                mock.patch.object(ProjectService, '_reconcile_catalog_and_cleanup', return_value=None),
+                mock.patch.object(ProjectService, '_synchronize_pull_requests', return_value=None),
+                mock.patch.object(ProjectService, '_run_coordinators', autospec=True, side_effect=next_work),
+                mock.patch.object(lm, '_project_pr_merge_confirmed', return_value=False),
+                mock.patch.object(lm, '_fetch_pr_conflict_recovery_refs'),
+                mock.patch.object(lm, 'validate_execplan_workspace_identity'),
+                mock.patch.object(lm, 'make_worktree'),
+                mock.patch.object(lm, '_validate_active_pr_conflict_recovery', side_effect=validate),
+                mock.patch.object(lm, 'operation_print'),
+            ):
+                ports.enter_context(patch)
+            result = lm._run_project_step(self.fixture.connection, Path('/state'), 'repo',
+                                          Path('/config'), 'main', False)
+        return result, events, block
+
+    def test_project_entry_confirms_pushed_pr_checkpoint_before_old_head_validation(self):
+        self._existing_pr()
+        self.state.update_project('repo', pr_conflict_recovery=1,
+            pr_conflict_head_oid='remote', pr_conflict_base_oid='base')
+        class Exit(BaseException):
+            pass
+        with mock.patch.object(self.state, 'complete_rebase_publication', side_effect=Exit()):
+            with self.assertRaises(Exit):
+                self.complete()
+        pending = self.checkpoints.get('repo', 'G-047')
+        self.assertEqual(self.state.row()['pr_conflict_head_oid'], 'remote')
+        result, events, block = self._restart_through_project_entry()
+        self.assertEqual(result, 0)
+        self.assertEqual(events, ['PR-ownership', 'candidate-work'])
+        block.assert_not_called()
+        self.assertEqual(len(self.pushes), 1)
+        self.assertIsNone(self.checkpoints.get('repo', 'G-047').operation)
+        self.assertEqual(self.checkpoints.get('repo', 'G-047').snapshot['rebase_publication_intent'],
+                         pending.snapshot['rebase_publication_intent'])
+
+    def test_project_entry_refuses_changed_pr_after_checkpoint_push_before_next_work(self):
+        self._existing_pr()
+        self.state.update_project('repo', pr_conflict_recovery=1,
+            pr_conflict_head_oid='remote', pr_conflict_base_oid='base')
+        class Exit(BaseException):
+            pass
+        with mock.patch.object(self.state, 'complete_rebase_publication', side_effect=Exit()):
+            with self.assertRaises(Exit):
+                self.complete()
+        pending = self.checkpoints.get('repo', 'G-047')
+        for changes in ({'url': 'different-pr'}, {'headRefOid': 'user-head'},
+                        {'state': 'CLOSED', 'url': 'different-pr'},
+                        {'state': 'MERGED', 'headRefName': 'other-branch'},
+                        {'state': 'CLOSED', 'baseRefName': 'other-base'}):
+            with self.subTest(changes=changes):
+                self.pr_changes = changes
+                result, events, block = self._restart_through_project_entry()
+                self.assertEqual(result, 1)
+                self.assertEqual(events, [])
+                block.assert_called_once()
+                self.assertEqual(len(self.pushes), 1)
+                self.assertEqual(self.state.row()['pr_conflict_head_oid'], 'remote')
+                self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+
+    def _interrupt_pr_checkpoint(self, *, pushed):
+        self._existing_pr()
+        self.state.update_project('repo', pr_conflict_recovery=1,
+            pr_conflict_head_oid='remote', pr_conflict_base_oid='base')
+        if pushed:
+            with mock.patch.object(self.state, 'complete_rebase_publication', side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.complete()
+        else:
+            self.push_failure = True
+            from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure
+            with self.assertRaises(RecoveryFailure):
+                self.complete()
+            self.push_failure = False
+        return self.checkpoints.get('repo', 'G-047')
+
+    def _terminal_project_step(self, next_status):
+        """Keep project entry, waiting PRs, blocking and Merge transitions real."""
+        from loop_manager_internal.application.project_service import ProjectService
+        def prepare(service):
+            self.fixture.connection.execute('UPDATE projects SET planning_attempt_fingerprint = NULL')
+            service.state.repo, service.state.repo_path = 'repo', Path('/repo')
+            service.state.base = 'main'
+            service.state.row = self.fixture.connection.execute('SELECT * FROM projects').fetchone()
+        def synchronize(service):
+            result = lm.synchronize_waiting_pull_requests(
+                self.fixture.connection, Path('/repo'), Path('/state'), 'repo')
+            service.state.row = self.fixture.connection.execute('SELECT * FROM projects').fetchone()
+            return result.step_result or None
+        def next_work(_service):
+            plan = runtime_state.RuntimeStateRepository(self.fixture.connection).get('repo', 'G-047')
+            self.assertEqual(plan.status, next_status)
+            if next_status == 'IMPLEMENTING':
+                from loop_manager_internal.execution.execution_runtime import (
+                    ExecutionOutcome, ExecutionOutcomeKind, ExecutionPhaseCoordinator)
+                self.assertIsNone(self.checkpoints.get('repo', 'G-047').operation)
+                self.assertEqual(plan.pr_head_oid, 'owned-head')
+                self.assertIsNone(plan.worker_result)
+                self.assertIsNone(plan.worker_input_token)
+                self.assertIsNone(plan.verify_token)
+                self.assertIsNone(plan.review_token)
+                self.assertIsNone(plan.publication_token)
+                self.restart()
+                context = self.handler._context()
+                execution_ports = mock.Mock()
+                execution_ports.guard.side_effect = lambda context: context
+                execution_ports.run.return_value = ExecutionOutcome(ExecutionOutcomeKind.SUCCESS)
+                ExecutionPhaseCoordinator(execution_ports).dispatch(context)
+                execution_ports.run.assert_called_once_with(context)
+                execution_ports.verify.assert_not_called()
+                execution_ports.review.assert_not_called()
+                execution_ports.publish.assert_not_called()
+            return 0
+        with self.direct_ports(), ExitStack() as ports:
+            for patch in (
+                mock.patch.object(ProjectService, '_prepare_repository', autospec=True, side_effect=prepare),
+                mock.patch.object(ProjectService, '_reconcile_catalog_and_cleanup', return_value=None),
+                mock.patch.object(ProjectService, '_synchronize_pull_requests', autospec=True, side_effect=synchronize),
+                mock.patch.object(ProjectService, '_run_coordinators', autospec=True, side_effect=next_work),
+                mock.patch.object(lm, 'remote_base', return_value='base'),
+                mock.patch.object(lm, '_recorded_base_fetch', return_value='base'),
+                mock.patch.object(lm, '_fetch_pr_conflict_recovery_refs'),
+                mock.patch.object(lm, 'validate_execplan_workspace_identity'),
+                mock.patch.object(lm, 'make_worktree'),
+                mock.patch.object(lm, 'classify_pull_request_mergeability', return_value='mergeable'),
+                mock.patch.object(lm, '_revision_execplan_input_fingerprint', return_value='input'),
+                mock.patch.object(lm, '_assess_missing_managed_cleanup',
+                                  return_value=lm.CleanupAssessment('deferred', 'preserved workspace')),
+                mock.patch.object(lm, 'operation_print'),
+            ):
+                ports.enter_context(patch)
+            return lm._run_project_step(self.fixture.connection, Path('/state'), 'repo',
+                                        Path('/config'), 'main', False)
+
+    def test_pending_checkpoint_closed_pr_blocks_only_plan_and_same_pr_reopens(self):
+        from loop_manager_internal.recovery import scoped_blocking
+        for timing in ('before-push', 'after-push', 'during-push'):
+            with self.subTest(timing=timing):
+                self._reset_publication_case()
+                pending = self._interrupt_pr_checkpoint(pushed=timing == 'after-push')
+                if timing == 'during-push':
+                    self.before_push = lambda: self.pr_changes.update(state='CLOSED')
+                else:
+                    self.pr_changes = {'state': 'CLOSED'}
+                self.assertEqual(self._terminal_project_step('PLAN_BLOCKED'), 1)
+                runtime = runtime_state.RuntimeStateRepository(self.fixture.connection)
+                closed = runtime.get('repo', 'G-047')
+                self.assertEqual(closed.status, 'PLAN_BLOCKED')
+                self.assertEqual(scoped_blocking.plan_block(
+                    self.fixture.connection, 'repo', 'G-047')['reason_code'], lm.PR_CLOSED_BLOCK_REASON)
+                self.assertEqual(closed.pr_url, self.seed.expected.remote.pull_request.identity)
+                self.assertEqual(closed.pr_head_oid, self.remote)
+                self.assertIsNotNone(scoped_blocking.plan_block(self.fixture.connection, 'repo', 'G-047'))
+                self.assertIsNone(scoped_blocking.project_block(self.fixture.connection, 'repo'))
+                self.assertIsNone(runtime.projected('repo'))
+                self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+                self.assertEqual(len(self.pushes), 2 if timing == 'during-push' else 1)
+                self.assertEqual(self._terminal_project_step('PLAN_BLOCKED'), 0)
+                self.pr_changes = {}
+                self.assertEqual(self._terminal_project_step('IMPLEMENTING'), 0)
+                reopened = runtime.get('repo', 'G-047')
+                self.assertEqual(reopened.status, 'IMPLEMENTING')
+                self.assertEqual(reopened.pr_url, closed.pr_url)
+                self.assertEqual(reopened.pr_head_oid, 'owned-head')
+                self.assertEqual(reopened.worker_session_id, closed.worker_session_id)
+                self.assertIsNone(scoped_blocking.plan_block(self.fixture.connection, 'repo', 'G-047'))
+                self.assertIsNone(scoped_blocking.project_block(self.fixture.connection, 'repo'))
+                confirmed = self.checkpoints.get('repo', 'G-047')
+                self.assertIsNone(confirmed.operation)
+                self.assertEqual(confirmed.snapshot['rebase_publication_intent'],
+                                 pending.snapshot['rebase_publication_intent'])
+                self.assertEqual(confirmed.snapshot['rebase_publication_result']['head'], 'owned-head')
+                self.assertEqual(len(self.pushes), 1 if timing == 'after-push' else 2)
+
+    def test_confirmed_checkpoint_pr_close_preserves_active_candidate_revalidation(self):
+        self._existing_pr()
+        self.complete()
+        confirmed = self.checkpoints.get('repo', 'G-047')
+        self.pr_changes = {'state': 'CLOSED'}
+        self.assertEqual(self._terminal_project_step('PLAN_BLOCKED'), 1)
+        runtime_state.RuntimeStateRepository(self.fixture.connection).hydrate('repo', 'G-047')
+        self.assertEqual(self._terminal_project_step('PLAN_BLOCKED'), 1)
+        self.pr_changes = {}
+        self.assertEqual(self._terminal_project_step('IMPLEMENTING'), 0)
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), confirmed)
+        self.assertEqual(len(self.pushes), 1)
+
+    def _approve_current_pr_candidate(self):
+        from tests.support.publication import seed_validated_candidate
+        self._existing_pr()
+        self.complete()
+        with (mock.patch('tests.support.publication.git_command', side_effect=['base', 'owned-head']),
+              mock.patch.object(lm, '_revision_execplan_body_hash', return_value='body'),
+              mock.patch.object(lm, '_revision_execplan_source_fingerprint', return_value='sources')):
+            approval = seed_validated_candidate(self.fixture.connection, Path('repo'),
+                Path('/state/G-047'), 'G-047')
+        lm.update_project(self.fixture.connection, 'repo', phase='PUBLISHING',
+            active_sha='base', validated_base_sha='base', pr_conflict_recovery=0,
+            publication_token=approval.publication_token('base', 'owned-head'))
+        self.restart()
+        return approval
+
+    def test_approved_final_candidate_closed_pr_reopens_into_merge_wait(self):
+        from loop_manager_internal.recovery import scoped_blocking
+        approval = self._approve_current_pr_candidate()
+        runtime = runtime_state.RuntimeStateRepository(self.fixture.connection)
+        confirmed = self.checkpoints.get('repo', 'G-047')
+        self.pr_changes = {'state': 'CLOSED'}
+        self.assertEqual(self._terminal_project_step('PLAN_BLOCKED'), 1)
+        closed = runtime.get('repo', 'G-047')
+        self.assertEqual(closed.status, 'PLAN_BLOCKED')
+        self.assertEqual(closed.publication_token, approval.publication_token('base', 'owned-head'))
+        self.assertIsNone(scoped_blocking.project_block(self.fixture.connection, 'repo'))
+        self.pr_changes = {}
+        for _ in range(2):
+            self.assertEqual(self._terminal_project_step('PR_OPEN'), 0)
+            reopened = runtime.get('repo', 'G-047')
+            self.assertEqual(reopened.status, 'PR_OPEN')
+            self.assertEqual(reopened.pr_url, closed.pr_url)
+            self.assertEqual(reopened.pr_head_oid, closed.pr_head_oid)
+            self.assertEqual(reopened.publication_token, closed.publication_token)
+        self.assertIsNone(scoped_blocking.plan_block(self.fixture.connection, 'repo', 'G-047'))
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), confirmed)
+        self.assertEqual(len(self.pushes), 1)
+
+    def test_stale_final_approval_closed_pr_reopens_through_worker_revalidation(self):
+        approval = self._approve_current_pr_candidate()
+        self.state.update_project('repo', publication_token=approval.publication_token('base', 'previous-head'))
+        confirmed = self.checkpoints.get('repo', 'G-047')
+        self.pr_changes = {'state': 'CLOSED'}
+        self.assertEqual(self._terminal_project_step('PLAN_BLOCKED'), 1)
+        self.pr_changes = {}
+        self.assertEqual(self._terminal_project_step('IMPLEMENTING'), 0)
+        reopened = runtime_state.RuntimeStateRepository(self.fixture.connection).get('repo', 'G-047')
+        self.assertEqual(reopened.status, 'IMPLEMENTING')
+        self.assertIsNone(reopened.publication_token)
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), confirmed)
+        self.assertEqual(len(self.pushes), 1)
+
+    def test_confirmed_checkpoint_keeps_validation_stages_active_without_final_approval(self):
+        for phase in ('WORKING', 'VERIFYING', 'REVIEWING', 'PUBLISHING'):
+            with self.subTest(phase=phase):
+                self._reset_publication_case()
+                self._existing_pr()
+                self.complete()
+                self.state.update_project('repo', phase=phase)
+                expected = 'IMPLEMENTING' if phase == 'WORKING' else phase
+                self.assertEqual(self._terminal_project_step(expected), 0)
+                self.assertEqual(runtime_state.RuntimeStateRepository(
+                    self.fixture.connection).projected('repo').status, expected)
+                self.assertEqual(len(self.pushes), 1)
+
+    def test_changed_pr_after_confirmed_checkpoint_is_blocked_before_candidate_work(self):
+        from loop_manager_internal.recovery import scoped_blocking
+        for changes in ({'headRefOid': 'user-head'}, {'url': 'different-pr'},
+                        {'headRefName': 'other-branch'}, {'baseRefName': 'other-base'}):
+            with self.subTest(changes=changes):
+                self._reset_publication_case()
+                self._existing_pr()
+                self.complete()
+                confirmed = self.checkpoints.get('repo', 'G-047')
+                self.pr_changes = changes
+                self.assertEqual(self._terminal_project_step('unreachable'), 1)
+                project_block = scoped_blocking.project_block(self.fixture.connection, 'repo')
+                self.assertEqual(project_block['reason_code'], 'publication_ownership_uncertain')
+                self.assertEqual(runtime_state.RuntimeStateRepository(
+                    self.fixture.connection).get('repo', 'G-047').pr_head_oid, 'owned-head')
+                self.assertEqual(self.checkpoints.get('repo', 'G-047'), confirmed)
+                self.assertEqual(len(self.pushes), 1)
+
+    def test_pending_rebase_or_publication_cannot_recover_as_merge_wait(self):
+        for operation in ('rebase', 'rebase_publish'):
+            with self.subTest(operation=operation):
+                self._reset_publication_case()
+                if operation == 'rebase_publish':
+                    pending = self._interrupt_pr_checkpoint(pushed=False)
+                    self.state.update_project('repo', pr_conflict_recovery=0)
+                else:
+                    self._existing_pr()
+                    pending = self.checkpoints.get('repo', 'G-047')
+                project = self.fixture.connection.execute('SELECT * FROM projects').fetchone()
+                pull_request = self.handler.effects.publication.pr_for_branch(Path('/repo'), project['branch'], project['pr_url'])
+                with (self.direct_ports(),
+                      mock.patch.object(lm, 'validate_execplan_workspace_identity'),
+                      mock.patch.object(lm, 'make_worktree'),
+                      mock.patch.object(lm, 'operation_print')):
+                    self.assertIsNone(lm.reconcile_existing_pull_request(
+                        self.fixture.connection, Path('/repo'), Path('/state'), 'repo', project, pull_request))
+                self.assertEqual(runtime_state.RuntimeStateRepository(
+                    self.fixture.connection).projected('repo').status, 'IMPLEMENTING')
+                self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+
+    def test_legacy_closed_pr_with_pending_checkpoint_resumes_worker_revalidation(self):
+        pending = self._interrupt_pr_checkpoint(pushed=True)
+        self.pr_changes = {'state': 'CLOSED'}
+        self.assertEqual(self._terminal_project_step('PLAN_BLOCKED'), 1)
+        self.fixture.connection.execute("UPDATE recovery_records SET phase = 'PR_OPEN' WHERE subject = 'G-047'")
+        self.fixture.connection.commit()
+        self.pr_changes = {}
+        self.assertEqual(self._terminal_project_step('IMPLEMENTING'), 0)
+        self.assertEqual(self.checkpoints.get('repo', 'G-047').snapshot['rebase_publication_intent'],
+                         pending.snapshot['rebase_publication_intent'])
+        self.assertEqual(len(self.pushes), 1)
+
+    def test_reopened_pending_candidate_waits_for_other_execution_slot(self):
+        from loop_manager_internal.recovery import scoped_blocking
+        pending = self._interrupt_pr_checkpoint(pushed=True)
+        self.pr_changes = {'state': 'CLOSED'}
+        self.assertEqual(self._terminal_project_step('PLAN_BLOCKED'), 1)
+        self.fixture.connection.execute(
+            "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, "
+            "content_hash, priority, status, branch, worktree, workspace_owned, ever_started) "
+            "VALUES ('repo', 'G-048', 'docs/plans/[G-048] Other.md', 'Other', '[]', '[]', "
+            "'other', 'normal', 'IMPLEMENTING', 'loop-manager/G-048', '/state/G-048', 1, 1)")
+        runtime = runtime_state.RuntimeStateRepository(self.fixture.connection)
+        runtime.hydrate('repo', 'G-048')
+        self.fixture.connection.commit()
+        other = runtime.projected('repo')
+        project = dict(self.fixture.connection.execute('SELECT * FROM projects').fetchone())
+        self.pr_changes = {}
+        with self.direct_ports(), mock.patch.object(lm, 'classify_pull_request_mergeability', return_value='mergeable'):
+            lm.synchronize_waiting_pull_requests(self.fixture.connection, Path('/repo'), Path('/state'), 'repo')
+        self.assertEqual(runtime.projected('repo'), other)
+        self.assertEqual(dict(self.fixture.connection.execute('SELECT * FROM projects').fetchone()), project)
+        self.assertEqual(runtime.get('repo', 'G-047').status, 'PLAN_BLOCKED')
+        self.assertIsNotNone(scoped_blocking.plan_block(self.fixture.connection, 'repo', 'G-047'))
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+        self.assertEqual(len(self.pushes), 1)
+
+    def test_pending_checkpoint_merged_pr_records_merge_and_preserves_workspace(self):
+        from loop_manager_internal.recovery import scoped_blocking
+        for timing in ('before-push', 'after-push', 'during-push'):
+            with self.subTest(timing=timing):
+                self._reset_publication_case()
+                pending = self._interrupt_pr_checkpoint(pushed=timing == 'after-push')
+                if timing == 'during-push':
+                    self.before_push = lambda: self.pr_changes.update(state='MERGED')
+                else:
+                    self.pr_changes = {'state': 'MERGED'}
+                self.assertEqual(self._terminal_project_step('MERGED'), lm.PROJECT_STEP_PLANNING_PENDING)
+                runtime = runtime_state.RuntimeStateRepository(self.fixture.connection)
+                merged = runtime.get('repo', 'G-047')
+                self.assertEqual(merged.status, 'MERGED')
+                self.assertEqual(merged.pr_head_oid, self.remote)
+                self.assertEqual(merged.worker_session_id, 'saved-worker')
+                self.assertIsNone(runtime.projected('repo'))
+                self.assertIsNone(scoped_blocking.project_block(self.fixture.connection, 'repo'))
+                cleanup = self.fixture.connection.execute('SELECT * FROM cleanup_pending').fetchone()
+                self.assertEqual(cleanup['worktree'], merged.worktree)
+                self.assertEqual(cleanup['pr_url'], merged.pr_url)
+                self.assertEqual(cleanup['pr_head_oid'], merged.pr_head_oid)
+                self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+                self.assertEqual(self._terminal_project_step('MERGED'), 0)
+                self.assertEqual(len(self.pushes), 2 if timing == 'during-push' else 1)
+
+    def test_pending_checkpoint_pr_close_and_reopen_preserve_independent_plan_block(self):
+        from loop_manager_internal.recovery import scoped_blocking
+        pending = self._interrupt_pr_checkpoint(pushed=True)
+        runtime = runtime_state.RuntimeStateRepository(self.fixture.connection)
+        runtime.block_plan('repo', 'G-047', reason_code='verify_retry_exhausted',
+                           evidence='independent verify cause', release_fingerprint='input')
+        runtime.hydrate('repo', 'G-047')
+        original = dict(scoped_blocking.plan_block(self.fixture.connection, 'repo', 'G-047'))
+        self.pr_changes = {'state': 'CLOSED'}
+        self.assertEqual(self._terminal_project_step('PLAN_BLOCKED'), 1)
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+        self.assertEqual(dict(scoped_blocking.plan_block(self.fixture.connection, 'repo', 'G-047')), original)
+        self.assertIsNone(scoped_blocking.project_block(self.fixture.connection, 'repo'))
+        self.pr_changes = {}
+        self.assertEqual(self._terminal_project_step('PLAN_BLOCKED'), 1)
+        self.assertEqual(runtime.get('repo', 'G-047').status, 'PLAN_BLOCKED')
+        self.assertEqual(dict(scoped_blocking.plan_block(self.fixture.connection, 'repo', 'G-047')), original)
+        self.assertIsNone(scoped_blocking.project_block(self.fixture.connection, 'repo'))
+        self.assertIsNone(self.checkpoints.get('repo', 'G-047').operation)
+        self.assertEqual(len(self.pushes), 1)
+
+    def test_pending_checkpoint_terminal_observation_failure_retries_without_project_block(self):
+        from loop_manager_internal.recovery import scoped_blocking
+        pending = self._interrupt_pr_checkpoint(pushed=True)
+        observed = self.handler.effects.publication.pr_for_branch.side_effect
+        reads = 0
+        def lookup(*args):
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                raise OSError('GitHub temporarily unavailable')
+            return observed(*args)
+        self.pr_changes = {'state': 'CLOSED'}
+        self.handler.effects.publication.pr_for_branch.side_effect = lookup
+        self.assertEqual(self._terminal_project_step('IMPLEMENTING'), lm.PROJECT_STEP_RETRY)
+        self.assertEqual(runtime_state.RuntimeStateRepository(self.fixture.connection).get(
+            'repo', 'G-047').status, 'IMPLEMENTING')
+        self.assertIsNone(scoped_blocking.project_block(self.fixture.connection, 'repo'))
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+        self.assertEqual(self._terminal_project_step('PLAN_BLOCKED'), 1)
+
+    def test_project_entry_retries_same_pending_pr_publication_before_candidate_work(self):
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure
+        self._existing_pr()
+        self.state.update_project('repo', pr_conflict_recovery=1,
+            pr_conflict_head_oid='remote', pr_conflict_base_oid='base')
+        self.push_failure = True
+        with self.assertRaises(RecoveryFailure):
+            self.complete()
+        pending = self.checkpoints.get('repo', 'G-047')
+        result, events, block = self._restart_through_project_entry()
+        self.assertEqual(result, lm.PROJECT_STEP_RETRY)
+        self.assertEqual(events, [])
+        block.assert_not_called()
+        self.assertEqual(self.state.row()['pr_conflict_head_oid'], 'remote')
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+        self.push_failure = False
+        result, events, block = self._restart_through_project_entry()
+        self.assertEqual(result, 0)
+        self.assertEqual(events, ['PR-ownership', 'candidate-work'])
+        block.assert_not_called()
+        self.assertEqual(len(self.pushes), 3)
+        self.assertEqual(self.pushes, [self.pushes[0]] * 3)
+        self.assertEqual(self.checkpoints.get('repo', 'G-047').snapshot['rebase_publication_intent'],
+                         pending.snapshot['rebase_publication_intent'])
+
+    def test_existing_pr_close_merge_identity_and_head_changes_preserve_the_lease(self):
+        for changes in ({'state': 'CLOSED'}, {'state': 'MERGED'}, {'url': 'other-pr'},
+                        {'headRefName': 'other-branch'}, {'headRefOid': 'user-head'}):
+            with self.subTest(changes=changes):
+                self._reset_publication_case()
+                self._existing_pr()
+                class Exit(BaseException):
+                    pass
+                self.before_push = lambda: (_ for _ in ()).throw(Exit())
+                with self.assertRaises(Exit):
+                    self.complete()
+                pending = self.checkpoints.get('repo', 'G-047')
+                attempts = len(self.pushes)
+                self.before_push = None
+                self.pr_changes = changes
+                with self.assertRaises(RuntimeError):
+                    self.handler._publish_rebased_checkpoint(self.handler._context())
+                self.assertEqual(len(self.pushes), attempts)
+                self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+                self.assertEqual(self.remote, 'remote')
 
     def test_pending_publication_passes_persisted_agent_scope_before_handler_recovery(self):
         class Exit(BaseException):
@@ -427,13 +989,13 @@ class ImmediateRebasePublicationTests(TestCase):
                         with self.assertRaises(RuntimeError):
                             self.complete()
                     elif excluded == 'existing-pr':
-                        # Existing PR rebase still uses the ordinary path; there
-                        # is no intermediate publication entry for its branch.
+                        # An unbound PR cannot inherit a no-PR acceptance.
                         saved = self.checkpoints.get('repo', 'G-047')
                         from tests.support.rebase_observations import decision_for
                         accepted = decision_for(self.seed.expected, self.seed.observed).acceptance
                         self.checkpoints.accept_current_rebase('repo', 'G-047', acceptance=accepted)
-                        self.handler._publish_rebased_checkpoint(self.handler._context())
+                        with self.assertRaises(RuntimeError):
+                            self.handler._publish_rebased_checkpoint(self.handler._context())
                     else:
                         self.complete()
                 self.assertEqual(self.pushes, [])

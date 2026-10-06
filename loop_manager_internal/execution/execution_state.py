@@ -101,6 +101,27 @@ class ExecutionStatePort:
                 expected, transition_id, session_id, binding,
             )
 
+    def confirm_existing_pr_push(self, checkpoints, head):
+        """Advance the owned PR receipt and clear its push intent atomically."""
+        if checkpoints is None or checkpoints.connection is not self.connection:
+            raise runtime_state.RuntimeStateError('PR publication checkpoint database differs')
+        with runtime_state._transaction(self.connection):
+            expected = self.check()
+            current = checkpoints.get(self.repo, self.plan_id)
+            if (expected is None or expected.status != 'PUBLISHING' or not expected.pr_url
+                    or current.operation != 'push' or current.expected_head != head
+                    or (current.snapshot or {}).get('remote_before') != expected.publication_remote_oid
+                    or expected.pr_head_oid != expected.publication_remote_oid):
+                raise runtime_state.RuntimeStateError('PR publication intent ownership changed')
+            values = {'publication_remote_oid': head, 'pr_head_oid': head}
+            updated = self.repository.transition_from_snapshot(
+                expected, plan_values=values, project_values=values)
+            checkpoints.record(self.repo, self.plan_id, expected_generation=current.generation,
+                operation=None, expected_head=head, target_base_oid=current.target_base_oid,
+                observed_remote_oid=head,
+                snapshot={**(current.snapshot or {}), 'pushed_checkpoint_head': head})
+        self.expected = updated
+
     def correct_checkpoint(self, *, phase, active_sha, validated_base_sha,
                            invalidate_validation, expected_catalog=None):
         with self.connection:
@@ -147,7 +168,8 @@ class ExecutionStatePort:
             if (expected is None or expected.repo != intent['repo']
                     or expected.plan_id != intent['plan_id']
                     or expected.branch != intent['branch'] or expected.worktree != intent['worktree']
-                    or expected.workspace_owned != 1 or expected.pr_url
+                    or expected.workspace_owned != 1
+                    or (expected.pr_url or None) != (intent['acceptance']['remote']['pull_request'] or {}).get('identity')
                     or expected.publication_remote_oid not in (None, intent['remote_before'], intent['head'])):
                 raise runtime_state.RuntimeStateError('intermediate publication owner changed')
             oid, checked = reobserve()
@@ -161,10 +183,21 @@ class ExecutionStatePort:
             updated = self._record_rebase_publication(expected, intent['head'])
         self.expected = updated
 
+    def _publication_values(self, expected, head):
+        values = {'publication_remote_oid': head}
+        if expected.pr_url:
+            values.update(pr_head_oid=head, worker_input_token=None, archive_token=None,
+                          verify_token=None, review_token=None, publication_token=None,
+                          validated_base_sha=None, worker_result=None, verify_result=None,
+                          review_result=None)
+        if expected.pr_conflict_recovery:
+            values['pr_conflict_head_oid'] = head
+        return values
+
     def _record_rebase_publication(self, expected, head):
+        values = self._publication_values(expected, head)
         return self.repository.transition_from_snapshot(
-            expected, plan_values={'publication_remote_oid': head},
-            project_values={'publication_remote_oid': head})
+            expected, plan_values=values, project_values=values)
 
     def open_pull_request(self, repo, **values):
         if repo != self.repo:
@@ -186,7 +219,8 @@ class ExecutionStatePort:
 
         Pure parsers and log sinks need no state guard. Policy helpers which own
         persistence are checked before invocation and their resulting snapshot
-        becomes the next expected observation. Agent callbacks use update_project
+        becomes the next expected observation even if a later effect fails.
+        Agent callbacks use update_project
         above, so an intervening phase/projection change is rejected on return.
         """
         external = name in {
@@ -199,10 +233,14 @@ class ExecutionStatePort:
                 self.check()
             if connected:
                 args = (self.connection, *args)
-            result = function(*args, **kwargs)
-            if mutates:
-                self.expected = self.repository.projected(self.repo)
-            elif external:
+            try:
+                result = function(*args, **kwargs)
+            finally:
+                if mutates:
+                    # A helper may adopt the rebase before checkpoint publication
+                    # fails. Recovery must observe that durable state on retry.
+                    self.expected = self.repository.projected(self.repo)
+            if external and not mutates:
                 self.check()
             return result
 
@@ -232,5 +270,5 @@ class DirectRebasePublicationStatePort(ExecutionStatePort):
         if self.projected:
             return super()._record_rebase_publication(expected, head)
         return self.repository.update_plan(
-            self.repo, self.plan_id, plan_values={'publication_remote_oid': head},
+            self.repo, self.plan_id, plan_values=self._publication_values(expected, head),
             expected_status=expected.status, enqueue=False)
