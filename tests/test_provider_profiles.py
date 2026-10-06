@@ -1,3 +1,4 @@
+import configparser
 import json
 import subprocess
 import tempfile
@@ -6,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 import loop_manager
 from tests.support.profiles import profile_config
+from loop_manager_internal.agents import agent_profiles
 
 
 class ProviderProfilesTest(unittest.TestCase):
@@ -20,24 +22,103 @@ class ProviderProfilesTest(unittest.TestCase):
 
     def test_worker_level_boundaries_and_cap(self):
         cases = [
-            ("low", "low", 1),
-            ("low", "medium", 2),
-            ("low", "high", 3),
-            ("low", "critical", 4),
-            ("medium", "low", 3),
-            ("medium", "medium", 4),
-            ("medium", "high", 5),
-            ("medium", "critical", 6),
-            ("high", "low", 5),
-            ("high", "medium", 6),
-            ("high", "high", 7),
-            ("high", "critical", 7),
+            (complexity, risk, score + (risk == "critical"))
+            for complexity, score in (("low", 1), ("medium", 3), ("high", 5))
+            for risk in ("low", "medium", "high", "critical")
         ]
 
         for complexity, risk, expected in cases:
             with self.subTest(complexity=complexity, risk=risk):
                 plan = {"complexity": complexity, "risk": risk}
                 self.assertEqual(loop_manager.worker_level(plan), expected)
+
+    def test_selected_provider_requires_every_explicit_profile_and_alias(self):
+        for provider in ("codex", "claude"):
+            original = profile_config(self).read_text()
+            for role_section, name in (
+                (f"{provider}.roles", "planner"),
+                (f"{provider}.roles", "planner_check"),
+                *((f"{provider}.worker", f"level{i}") for i in range(1, 9)),
+            ):
+                for value in (None, "", "strong", ",high", "strong,", "strong,unsupported", "absent,high", "%"):
+                    with self.subTest(provider=provider, name=name, value=value):
+                        parser = configparser.ConfigParser(interpolation=None)
+                        parser.read_string(original)
+                        # No unselected provider settings are necessary.
+                        for section in list(parser.sections()):
+                            if not section.startswith(provider + "."):
+                                parser.remove_section(section)
+                        if value is None:
+                            inherited = parser[role_section].pop(name)
+                            parser["DEFAULT"][name] = inherited
+                        else:
+                            parser[role_section][name] = value
+                        config = profile_config(self)
+                        with config.open("w") as stream:
+                            parser.write(stream)
+                        catalog = {model: frozenset({"low", "medium", "high", "xhigh", "max"})
+                                   for model in parser[f"{provider}.models"].values()}
+                        with self.assertRaisesRegex(RuntimeError, name):
+                            agent_profiles.validate_provider_profiles(config, provider, catalog)
+
+    def test_explicit_alias_and_section_cannot_be_supplied_by_defaults(self):
+        for provider in ("codex", "claude"):
+            for change in ("missing-section", "missing-alias", "empty-model", "default-alias"):
+                with self.subTest(provider=provider, change=change):
+                    config = profile_config(self)
+                    parser = configparser.ConfigParser(interpolation=None)
+                    parser.read(config)
+                    models = f"{provider}.models"
+                    if change == "missing-section":
+                        parser.remove_section(models)
+                    elif change == "empty-model":
+                        parser[models]["strong"] = ""
+                    else:
+                        model = parser[models].pop("strong")
+                        if change == "default-alias":
+                            parser["DEFAULT"]["strong"] = model
+                    with config.open("w") as stream:
+                        parser.write(stream)
+                    with self.assertRaisesRegex(RuntimeError, models.replace(".", r"\.")):
+                        agent_profiles.provider_profile(
+                            config, provider, f"{provider}.roles", "planner", "Planner", {})
+
+    def test_all_levels_can_share_supported_profile(self):
+        for provider in ("codex", "claude"):
+            config = profile_config(self)
+            parser = configparser.ConfigParser()
+            parser.read(config)
+            for level in range(1, 9):
+                parser[f"{provider}.worker"][f"level{level}"] = "balanced,high"
+            with config.open("w") as stream:
+                parser.write(stream)
+            model = parser[f"{provider}.models"]["balanced"]
+            for level in range(1, 9):
+                self.assertEqual(agent_profiles.provider_worker_profile(
+                    config, provider, level, {model: frozenset({"high"})}), (model, "high"))
+
+    def test_example_profiles_are_complete_and_preserve_reviewer(self):
+        config = Path(__file__).resolve().parents[1] / "config/config.ini.example"
+        catalogs = {
+            "codex": {model: frozenset({"low", "medium", "high", "xhigh", "max"})
+                      for model in ("gpt-6-astra", "gpt-6.1-sol", "gpt-5.6-terra", "gpt-6-luna")},
+            "claude": {model: agent_profiles.CLAUDE_EFFORTS
+                       for model in ("claude-opus-5-5", "claude-sonnet-5-5", "claude-opus-5", "claude-haiku-4-5-20251001")},
+        }
+        for provider, catalog in catalogs.items():
+            agent_profiles.validate_provider_profiles(config, provider, catalog)
+            model, effort = agent_profiles.provider_profile(
+                config, provider, f"{provider}.roles", "reviewer", "reviewer", catalog)
+            self.assertEqual((model, effort),
+                             ("gpt-6.1-sol" if provider == "codex" else "claude-opus-5", "high"))
+        for level, (model, effort) in enumerate((
+            ("claude-sonnet-5-5", "low"), ("claude-sonnet-5-5", "medium"),
+            ("claude-sonnet-5-5", "medium"), ("claude-sonnet-5-5", "high"),
+            ("claude-opus-5-5", "medium"), ("claude-opus-5-5", "high"),
+            ("claude-opus-5-5", "xhigh"), ("claude-opus-5-5", "max")), 1):
+            self.assertEqual(agent_profiles.provider_worker_profile(
+                config, "claude", level, catalogs["claude"]), (model, effort))
+        self.assertIn("2.1.284", config.read_text())
 
     def test_worker_profile_resolves_level_alias(self):
         config = profile_config(self)

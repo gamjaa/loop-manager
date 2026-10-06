@@ -39,11 +39,14 @@ def provider_profile(
         raise RuntimeError(f"설정 파일이 없습니다: {config_path}")
     if section not in parser:
         raise RuntimeError(f"{label} 설정 section [{section}]이 없습니다.")
-    # Optional Planner roles inherit only when absent. Explicit values still
-    # pass through the same alias, model and effort validation below.
-    if section == f"{provider}.roles" and name in {"maintenance_planner", "planner_check"} and name not in parser[section]:
+    # Maintenance retains the existing connection to the general Planner.
+    if section == f"{provider}.roles" and name == "maintenance_planner" and name not in parser[section]:
         name = "planner"
-    if name not in parser[section]:
+    explicit = section == f"{provider}.worker" or name in {"planner", "planner_check"}
+    # SectionProxy includes DEFAULT entries; required profiles must be local.
+    profiles = parser._sections[section] if explicit else parser[section]
+    location = f"[{section}] {name}"
+    if name not in profiles:
         raise RuntimeError(f"{label} 설정이 없습니다: [{section}] {name}")
 
     try:
@@ -53,21 +56,21 @@ def provider_profile(
             f"{label} 설정 값 형식이 올바르지 않습니다: [{section}] {name}"
         ) from error
     if not value.strip():
-        raise RuntimeError(f"{label} Model alias/Effort 설정이 비어 있습니다.")
+        raise RuntimeError(f"{label} Model alias/Effort 설정이 비어 있습니다: {location}")
     parts = [part.strip() for part in value.split(",")]
     if len(parts) != 2:
-        raise RuntimeError(f"{label} 설정은 `Model alias,Effort` 형식이어야 합니다.")
+        raise RuntimeError(f"{label} 설정은 `Model alias,Effort` 형식이어야 합니다: {location}")
     alias, effort = parts
     if not alias:
-        raise RuntimeError(f"{label} Model alias 설정이 비어 있습니다.")
+        raise RuntimeError(f"{label} Model alias 설정이 비어 있습니다: {location}")
     if not effort:
-        raise RuntimeError(f"{label} Effort 설정이 비어 있습니다.")
+        raise RuntimeError(f"{label} Effort 설정이 비어 있습니다: {location}")
     models_section = f"{provider}.models"
     if models_section not in parser:
         raise RuntimeError(
             f"{label} Model alias section [{models_section}]가 없습니다."
         )
-    if alias not in parser[models_section]:
+    if alias not in (parser._sections[models_section] if explicit else parser[models_section]):
         raise RuntimeError(
             f"{label} Model alias가 [{models_section}]에 없습니다: {alias}"
         )
@@ -86,12 +89,12 @@ def provider_profile(
     supported = model_efforts.get(model)
     if supported is None:
         raise RuntimeError(
-            f"{label} Model을 {provider_label} CLI가 지원하지 않습니다: {model}"
+            f"{label} Model을 {provider_label} CLI가 지원하지 않습니다: {model} ({location})"
         )
     if effort not in supported:
         raise RuntimeError(
             f"{label} Model/Effort 조합을 {provider_label} CLI가 지원하지 않습니다: "
-            f"{model},{effort}"
+            f"{model},{effort} ({location})"
         )
     return model, effort
 

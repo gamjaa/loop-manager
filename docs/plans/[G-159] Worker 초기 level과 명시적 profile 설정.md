@@ -38,7 +38,7 @@ priority: high
 - [x] 2026-10-05 planning 기준 a049a76의 명세·원본·관련 테스트와 비종료 catalog에서 미충족 범위를 확인함. 구현·테스트 실행은 하지 않음.
 - [x] 2026-10-06 a1db7e8와 제공된 mutable READY snapshot의 원본 hash를 대조하고 최신 R-052의 명시 설정·Claude 예시·기존 실행 level 보존 조건을 보강함. 구현·테스트 실행은 하지 않음.
 - [x] 2026-10-06 최신 기준 49a7400과 새 mutable READY snapshot의 원본 hash를 대조함. G-193의 선택 변경은 이 목표를 대체하지 않으며 R-052의 산식 전환 보존과 정상 BLOCKED 해제 초기화를 구분한 완료·회귀 조건을 유지함. 구현·테스트 실행은 하지 않음.
-- [ ] 구현 및 관련 targeted unit 검증
+- [x] 초기 산식·cache 전환, 명시 profile 검증, Planner 분류 안내·예시를 구현하고 관련 targeted unit 검증을 통과함.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
@@ -50,3 +50,9 @@ priority: high
 
 - 계산·설정은 프로그램의 결정적 책임이다. Review 교정 결과에 따른 승격은 G-160에서 따로 다룬다. 난도는 제한된 정책 경계 변경, 위험은 잘못된 호출 선택의 영향으로 분류했다.
 - 이동 영수증의 rename 관측 오류는 별도 G-190으로 추가했다. 최종 신규 batch는 G-159~G-190의 32개이며 기존 ID를 재사용하지 않는다.
+
+- 구현 기록: 기존 catalog transaction에서 initial cache를 재계산하고 실행 이력 또는 workspace 소유권이 있는 계획의 effective level을 보존한다. 재개 경계의 유효한 과거 initial cache는 실행 상태·session·Review 기록을 유지한 채 보정하며, 정상 BLOCKED 해제에서 현재 metadata로 initial·effective level과 기존 집계를 초기화한다.
+- 설정 기록: 선택 provider의 Planner 두 역할·Worker 1~8 및 참조 alias는 해당 section에 직접 선언해야 한다. DEFAULT와 planner_check의 planner fallback은 허용하지 않으며 Reviewer와 maintenance의 기존 해석 경계는 보존한다. 오류에 section·항목 위치를 포함한다. 기존 level 8 지원 조합 검증을 재사용한다.
+- 문서 경계: 이번 Worker 입력에서 docs/PLANS.md 수정이 제외되므로 분류 기준은 기존 EXECPLAN_AUTHORING_GUIDANCE에 반영했다. Requirement·PRODUCT·ARCHITECTURE·AGENTS와 사용자 결정은 변경하지 않았다. 새 루트 파일·이동은 없다.
+- 지원 확인: 설치된 Codex의 `debug models`에서 예시의 네 모델과 effort를 확인했다. OpenAI Docs skill의 [Sol 공식 문서](https://developers.openai.com/api/docs/models/gpt-6.1-sol)와 [Claude effort 문서](https://code.claude.com/docs/en/model-config#adjust-effort-level), 공식 [v2.1.280](https://github.com/anthropics/claude-code/releases/tag/v2.1.280)·[v2.1.284](https://github.com/anthropics/claude-code/releases/tag/v2.1.284) release notes로 예시 지원·버전을 대조했다. Claude CLI는 설치되지 않아 실제 CLI 확인 대신 주입된 지원 catalog로 unit 검증했다. Reviewer는 Codex gpt-6.1-sol/high, Claude claude-opus-5/high를 유지한다.
+- 검증 기록: profile·cache·정상 해제·등록 경계의 targeted unit 실행은 19개 및 21개 모두 통과했다. 첫 실행의 테스트 클래스명과 실행 이력 fixture 오류를 수정하고 동일 명령 재실행을 통과했다. 기존 scripts/verify.sh는 전체 unittest manifest와 compile을 수행하는 runner를 실행하므로 유지한다. 전체 verify·integration·lint·build·type check와 commit·push·PR 생성은 실행하지 않았다.

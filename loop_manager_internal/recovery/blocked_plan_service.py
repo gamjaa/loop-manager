@@ -17,6 +17,7 @@ from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
 from loop_manager_internal.storage import execution_checkpoint_state
 from loop_manager_internal.storage import recovery_state
 from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.storage.execplan_catalog_state import worker_level
 from pathlib import Path
 import sqlite3
 
@@ -37,6 +38,11 @@ def _requeue_blocked_execplan(
         "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
         (repo, plan_id),
     ).fetchone()
+    initial_level = plan["initial_worker_level"] if plan is not None else None
+    if plan is not None and plan["current_complexity"] and plan["current_risk"]:
+        initial_level = worker_level({
+            "complexity": plan["current_complexity"], "risk": plan["current_risk"],
+        })
     if plan is not None and int(plan["pr_conflict_recovery"]):
         with connection:
             runtime_state.RuntimeStateRepository(connection).transition(
@@ -56,7 +62,8 @@ def _requeue_blocked_execplan(
                     "last_error": REBASE_IN_PROGRESS_ERROR,
                     "verify_failure_history": "{}",
                     "review_failure_history": "{}",
-                    "effective_worker_level": plan["initial_worker_level"],
+                    "initial_worker_level": initial_level,
+                    "effective_worker_level": initial_level,
                     "review_level_history": "{}",
                     "worker_session_transition": None,
                     "worker_session_binding": (
@@ -116,7 +123,8 @@ def _requeue_blocked_execplan(
                 "pr_head_oid": None,
                 "verify_failure_history": "{}",
                 "review_failure_history": "{}",
-                "effective_worker_level": plan["initial_worker_level"],
+                "initial_worker_level": initial_level,
+                "effective_worker_level": initial_level,
                 "review_level_history": "{}",
             },
             project_values=effects._clear_active_values(),

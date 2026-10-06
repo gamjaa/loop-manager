@@ -38,10 +38,10 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
     def test_new_execplan_stores_capped_initial_and_effective_level(self):
         cases = (
             ("low", "low", 1),
-            ("low", "critical", 4),
-            ("medium", "critical", 6),
-            ("high", "high", 7),
-            ("high", "critical", 7),
+            ("low", "critical", 2),
+            ("medium", "critical", 4),
+            ("high", "high", 5),
+            ("high", "critical", 6),
         )
         for complexity, risk, expected in cases:
             with self.subTest(complexity=complexity, risk=risk):
@@ -91,8 +91,8 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
             ).fetchone()
             connection.close()
 
-        self.assertEqual(stored["initial_worker_level"], 7)
-        self.assertEqual(stored["effective_worker_level"], 7)
+        self.assertEqual(stored["initial_worker_level"], 6)
+        self.assertEqual(stored["effective_worker_level"], 6)
         self.assertEqual(json.loads(stored["review_level_history"]), {})
 
     @dummy_worker_sessions

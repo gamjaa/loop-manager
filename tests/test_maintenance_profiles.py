@@ -23,7 +23,7 @@ class MaintenanceProfileTest(unittest.TestCase):
     def write(self, provider, maintenance=None):
         self.config.write_text(
             f"[{provider}.models]\nstrong=model-strong\nfast=model-fast\n"
-            f"[{provider}.roles]\nplanner=strong,xhigh\nreviewer=strong,high\n"
+            f"[{provider}.roles]\nplanner=strong,xhigh\nplanner_check=fast,medium\nreviewer=strong,high\n"
             + (f"maintenance_planner={maintenance}\n" if maintenance is not None else ""),
             encoding="utf-8",
         )

@@ -53,7 +53,7 @@ cp config/config.ini.example config/config.ini
 
 setup은 기존 `.venv`를 재사용하고 `requirements.txt`의 패키지를 설치한다. 현재 외부 Python 의존성은 없으며 나중에 추가되면 같은 스크립트를 다시 실행한다.
 
-`config/config.ini`에 모델·Effort, Telegram과 동시 실행 수를 설정한다. `[codex.roles]`와 `[claude.roles]`의 `planner_check = Model alias,Effort`는 읽기 전용 점검 Planner에 독립 적용되며 생략하면 같은 provider의 `planner` 값을 사용한다. `max_workers` 기본값은 3, 전체 verify의 `verify_timeout_seconds`는 600초다. 검증이 정상 진행 중인데 상한이 부족한 경우 `[loop]`에서 조정한다.
+`config/config.ini`에 모델·Effort, Telegram과 동시 실행 수를 설정한다. `[codex.roles]`와 `[claude.roles]`의 `planner_check = Model alias,Effort`는 읽기 전용 점검 Planner에 독립 적용된다. 선택 provider의 `planner`·`planner_check`와 Worker level 1~8 및 참조 alias를 모두 직접 지정해야 하며 누락·빈 값·미지원 조합은 실행 전에 거부한다. 유지보수 Planner는 기존 일반 Planner 연결을 유지한다. 예시는 운영 설정의 fallback으로 읽지 않으며 Claude 예시에는 Claude Code 2.1.284 이상이 필요하다. `max_workers` 기본값은 3, 전체 verify의 `verify_timeout_seconds`는 600초다. 검증이 정상 진행 중인데 상한이 부족한 경우 `[loop]`에서 조정한다.
 
 Loop Manager 자체 verify는 `[loop] verify_parallelism = auto`가 기본이다. 코드는 허용 CPU·실제 부하·메모리 여유와 아직 관측에 반영되지 않은 예약을 확인해 새 테스트 모듈을 배정한다. 양의 정수는 verify별 상한이며 `1`은 직렬이다. 상한 안에서도 자원 부족 시 배정을 기다리고, 관측 실패 시 직렬로 축소한다. `max_workers`의 프로젝트 실행 수와 별개이며 다른 등록 프로젝트의 verify 스크립트에는 적용하지 않는다.
 

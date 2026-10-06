@@ -53,5 +53,5 @@ class PinnedPublishedPlanRegistrationTest(unittest.TestCase):
         ).fetchone()
         self.assertEqual(row["content_hash"], execplan_catalog.plan_content_hash(text))
         self.assertEqual(row["publication_sha"], sha)
-        self.assertEqual(row["initial_worker_level"], 7)
+        self.assertEqual(row["initial_worker_level"], 6)
         self.assertEqual(row["status"], "READY")
