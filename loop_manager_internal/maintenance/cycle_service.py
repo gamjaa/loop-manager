@@ -6,6 +6,7 @@ from loop_manager_internal.maintenance import maintenance_git
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningError
 from loop_manager_internal.maintenance.maintenance_orchestration import cycle_scope_plan_ids
 from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
 from pathlib import Path
 import json
 import sqlite3
@@ -73,7 +74,10 @@ def _advance_maintenance_cycle_after_merges(
         maintenance_state.MaintenancePhase.REFACTORING,
         maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
     }) and cycle.publication_stage in (None, "remote_confirmed"):
-        if effects.all_cycle_plans_merged(rows, cycle_scope_plan_ids(rows, cycle)):
+        scope = cycle_scope_plan_ids(rows, cycle)
+        if catalog_held_plan_ids(connection, repo).intersection(scope):
+            return cycle
+        if effects.all_cycle_plans_merged(rows, scope):
             return repository.finish_cycle(repo, expected=cycle, source_sha=base_sha)
         if legacy_prerequisites:
             return repository.transition(repo, expected_phase=cycle.phase, expected_revision=cycle.revision,

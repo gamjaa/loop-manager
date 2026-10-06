@@ -9,6 +9,7 @@ from loop_manager_internal.maintenance import maintenance_file_publication
 from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.storage import runtime_state, planning_input_state, planner_check_state
 from loop_manager_internal.storage.planning_publication_state import GeneralPlanningPublication
+from loop_manager_internal.planning.planning_workspace import legacy_release_identity
 from pathlib import Path
 import sqlite3
 
@@ -85,6 +86,26 @@ class _PlanningStatePorts:
             "SELECT 1 FROM agent_invocations WHERE repo = ? AND finished_at IS NULL LIMIT 1",
             (repo,),
         ).fetchone() is not None
+
+    def prepare_legacy_release(self, expected: runtime_state.PlanningSnapshot,
+                               cycle: maintenance_state.MaintenanceCycle) -> maintenance_state.MaintenanceCycle:
+        with self.transaction():
+            if (self.planning(expected.repo) != expected or self.planning_release_pending(expected.repo)
+                    or expected.phase != "PLANNING" or expected.planning_workspace_owned != 1
+                    or not expected.worktree or not expected.planning_attempt_fingerprint
+                    or expected.planning_result_completed):
+                raise runtime_state.RuntimeStateError("workspace 해제 전 planning 입력 또는 실행이 변경됐습니다.")
+            return self._maintenance_repository.record_legacy_release(expected.repo, expected=cycle,
+                identity=legacy_release_identity(expected, cycle))
+
+    def complete_legacy_release(self, expected: runtime_state.PlanningSnapshot,
+                                cycle: maintenance_state.MaintenanceCycle) -> None:
+        with self.transaction():
+            if (self.planning(expected.repo) != expected or self.planning_release_pending(expected.repo)
+                    or cycle.legacy_release_identity != legacy_release_identity(expected, cycle)):
+                raise runtime_state.RuntimeStateError("workspace 해제 후 planning 입력 또는 실행이 변경됐습니다.")
+            self._maintenance_repository.clear_legacy_release(expected.repo, expected=cycle)
+            self.clear_active_in_transaction(expected.repo)
 
     def general_baseline(self, repo: str) -> bool:
         return planning_input_state.has_baseline(self._connection, repo)

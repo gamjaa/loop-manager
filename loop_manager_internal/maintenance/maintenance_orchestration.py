@@ -302,11 +302,13 @@ def validate_prerequisite_plan_ids(
 def select_cycle_ready_execplan(
     rows: Sequence[Mapping[str, object]],
     cycle: maintenance_state.MaintenanceCycle,
+    *, catalog_rows: Sequence[Mapping[str, object]] | None = None,
 ) -> Mapping[str, object] | None:
     """Select only the current cycle's runnable READY plan, if any."""
 
+    scope_rows = rows if catalog_rows is None else catalog_rows
     if cycle.phase is maintenance_state.MaintenancePhase.PREREQUISITE_WAIT:
-        allowed = cycle_scope_plan_ids(rows, cycle)
+        allowed = cycle_scope_plan_ids(scope_rows, cycle)
         priority_order = {"critical": 0, "high": 1, "normal": 2, "low": 3}
         order = lambda row: (
             priority_order[str(row["priority"])],
@@ -314,7 +316,7 @@ def select_cycle_ready_execplan(
         )
     elif cycle.phase in {maintenance_state.MaintenancePhase.REFACTORING,
                          maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION}:
-        allowed = cycle_scope_plan_ids(rows, cycle)
+        allowed = cycle_scope_plan_ids(scope_rows, cycle)
         order = lambda row: _plan_sort_key(str(row["plan_id"]))
     else:
         return None

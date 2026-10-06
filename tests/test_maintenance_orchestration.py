@@ -27,6 +27,34 @@ from tests.support.catalog import plan_text
 from tests.support.maintenance_cycle_case import MaintenanceCycleCase
 
 class MaintenanceOrchestrationTest(MaintenanceCycleCase):
+    def test_active_cycle_catalog_holds_wait_without_losing_dependency_scope(self):
+        connection = self._connection()
+        self.addCleanup(connection.close)
+        self._insert_plan(connection, "/one", "G-001", status="MERGED")
+        self._insert_plan(connection, "/one", "G-002", depends_on=("G-001",))
+        self._insert_plan(connection, "/one", "G-003")
+        self._insert_plan(connection, "/one", "G-099", priority="critical")
+        maintenance_state.ensure_schema(connection)
+        for phase in (maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
+                      maintenance_state.MaintenancePhase.REFACTORING,
+                      maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION):
+            for held in ("G-001", "G-002"):
+                with self.subTest(phase=phase, held=held):
+                    connection.execute("DELETE FROM maintenance_cycles")
+                    self._legacy_cycle(connection, "/one", "a" * 40)
+                    field = "prerequisite_plan_ids" if phase is maintenance_state.MaintenancePhase.PREREQUISITE_WAIT else "refactoring_plan_ids"
+                    connection.execute(f"UPDATE maintenance_cycles SET phase = ?, {field} = ?", (phase.value, '["G-002"]'))
+                    cycle = maintenance_state.MaintenanceRepository(connection).get("/one")
+                    connection.execute("INSERT INTO execplan_catalog_holds VALUES ('/one', ?, ?, '{}', NULL)", (held, "a" * 40))
+                    connection.commit()
+                    for _restart in range(2):
+                        self.assertIsNone(loop_manager.catalog_schedule_decision(connection, "/one").runnable_ready)
+                        self.assertEqual(maintenance_state.MaintenanceRepository(connection).get("/one"), cycle)
+                    connection.execute(f"UPDATE maintenance_cycles SET {field} = ?", ('["G-002", "G-003"]',))
+                    self.assertEqual(loop_manager.catalog_schedule_decision(connection, "/one").runnable_ready["plan_id"], "G-003")
+                    connection.execute("DELETE FROM execplan_catalog_holds")
+                    self.assertEqual(loop_manager.catalog_schedule_decision(connection, "/one").runnable_ready["plan_id"], "G-002")
+
     def test_assessment_activation_preserves_worker_session_in_plan_and_projection(self):
         from loop_manager_internal.execution.worker_session import SessionBinding, SessionTransition
 

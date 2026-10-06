@@ -9,7 +9,7 @@ from loop_manager_internal.storage import maintenance_state, runtime_state
 from loop_manager_internal.storage.planner_check_state import target_fingerprint
 from loop_manager_internal.planning.planning_catalog import PlanningResultInvalid
 from loop_manager_internal.planning.planner_check import parse_planner_check_result
-from loop_manager_internal.planning.planning_workspace import planning_workspace_path
+from loop_manager_internal.planning.planning_workspace import planning_workspace_path, legacy_release_identity
 from loop_manager_internal.planning.planning_service import PlanningService
 from loop_manager_internal.planning.planning_contracts import (
     _PlanningRun, PlanningContext, PlanningDecisionKind, PlanningOutcome,
@@ -216,17 +216,28 @@ class PlanningSelectionService(PlanningService):
                 and cycle.publication_stage != "prepared" and not row.planning_result_completed):
             worktree = Path(str(row.worktree or ""))
             try:
+                if (not row.worktree or row.planning_workspace_owned != 1
+                        or self._ports.state.planning_release_pending(context.repo)
+                        or cycle.legacy_release_identity not in (None, legacy_release_identity(row, cycle))):
+                    raise PlanningWorkspaceOwnershipError("기존 사후 단계의 workspace 해제 입력 또는 실행이 변경됐습니다.")
                 self._ports.git.validate_worktree_ownership(context.repo, str(row.planning_attempt_fingerprint or ""), worktree)
-                self._ports.git.validate_planning_release(context.repo, worktree)
-                if self._ports.git.changed_files(worktree) or self._ports.git.run(worktree, "rev-parse", "HEAD").stdout.strip() != row.active_sha:
-                    raise MaintenancePlanningError("기존 사후 재검증의 미확정 작성 결과를 보존해 게시 복구가 필요합니다.")
-                if row.agent_snapshot:
-                    scope = self._ports.agent.validate_saved_scope("maintenance_planner", worktree, row.agent_snapshot)
-                    if scope.error:
-                        raise MaintenancePlanningError(scope.error)
-                self._ports.state.preserve_diagnostics(context.repo, row)
-                self._ports.git.run(context.repo_path, "worktree", "remove", str(worktree))
-                self._ports.state.clear_active(context.repo)
+                if worktree.exists():
+                    self._ports.git.validate_planning_release(context.repo, worktree)
+                    if self._ports.git.changed_files(worktree) or self._ports.git.run(worktree, "rev-parse", "HEAD").stdout.strip() != row.active_sha:
+                        raise MaintenancePlanningError("기존 사후 재검증의 미확정 작성 결과를 보존해 게시 복구가 필요합니다.")
+                    if row.agent_snapshot:
+                        scope = self._ports.agent.validate_saved_scope("maintenance_planner", worktree, row.agent_snapshot)
+                        if scope.error:
+                            raise MaintenancePlanningError(scope.error)
+                    if cycle.legacy_release_identity is None:
+                        self._ports.state.preserve_diagnostics(context.repo, row)
+                        cycle = self._ports.state.prepare_legacy_release(row, cycle)
+                    self._ports.git.run(context.repo_path, "worktree", "remove", str(worktree))
+                elif cycle.legacy_release_identity is not None:
+                    self._ports.git.validate_planning_release(context.repo, worktree, allow_missing=True)
+                else:
+                    raise PlanningWorkspaceOwnershipError("workspace 해제 intent 없이 planning 경로가 사라졌습니다.")
+                self._ports.state.complete_legacy_release(row, cycle)
             except RuntimeError as error:
                 self._ports.events.error(str(error))
                 return self._operational_error()

@@ -363,7 +363,7 @@ def catalog_schedule_decision(
         maintenance_state.MaintenancePhase.REFACTORING,
         maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
     }:
-        selected = effects.select_cycle_ready_execplan(execution_rows, cycle)
+        selected = effects.select_cycle_ready_execplan(execution_rows, cycle, catalog_rows=rows)
     elif active is None and not project_is_blocked and effects.assessment_can_yield(cycle):
         resumable = [row for row in candidates if not effects.is_unowned_ready(row)]
         if resumable:

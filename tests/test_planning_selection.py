@@ -51,6 +51,92 @@ from tests.support.planning_case import (
 )
 
 class PlanningSelectionTest(PlanningCase):
+    def test_legacy_release_resumes_after_removal_and_state_clear_interruptions(self):
+        for interruption in ("after_remove", "during_clear"):
+            with self.subTest(interruption=interruption), tempfile.TemporaryDirectory() as directory:
+                worktree = Path(directory) / "planning"
+                worktree.mkdir()
+                original = planning_snapshot(phase="PLANNING", active_sha="base", worktree=str(worktree),
+                    planning_workspace_owned=1, planning_attempt_fingerprint="saved", planner_session_id="saved-session")
+                ports = FakePorts(original, maintenance_cycle(
+                    phase=maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+                    refactoring_plan_ids=("G-001",)))
+                ports.git.validate_planning_release = mock.Mock()
+                ordinary_git = ports.git.run
+                removals = []
+                def remove_once(repo, *arguments, **kwargs):
+                    if arguments[:2] == ("worktree", "remove"):
+                        removals.append(arguments)
+                        worktree.rmdir()
+                        if interruption == "after_remove":
+                            raise KeyboardInterrupt("after Git removal")
+                    return ordinary_git(repo, *arguments, **kwargs)
+                ports.git.run = remove_once
+                clear = ports.state.clear_active_in_transaction
+                if interruption == "during_clear":
+                    def interrupt_clear(*args, **kwargs):
+                        clear(*args, **kwargs)
+                        raise KeyboardInterrupt("before SQLite commit")
+                    ports.state.clear_active_in_transaction = interrupt_clear
+                coordinator = PlanningLifecycleCoordinator(ports)
+                with self.assertRaises(KeyboardInterrupt):
+                    coordinator._selection._select_planning_work(coordinator._new_run(self.context))
+                self.assertFalse(worktree.exists())
+                self.assertEqual(ports.state.snapshot, original)
+                self.assertIsNotNone(ports.state.cycle.legacy_release_identity)
+                self.assertEqual(len(ports.state.diagnostics), 1)
+                ports.state.clear_active_in_transaction = clear
+                restarted = PlanningLifecycleCoordinator(ports)
+                outcome = restarted._selection._select_planning_work(restarted._new_run(self.context))
+                self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+                self.assertIsNone(ports.state.snapshot.phase)
+                self.assertIsNone(ports.state.cycle.legacy_release_identity)
+                self.assertEqual(len(removals), 1)
+                self.assertEqual(len(ports.state.diagnostics), 1)
+                ports.git.validate_planning_release.assert_called_with(original.repo, worktree, allow_missing=True)
+                self.assertEqual(ports.agent.run_count, 0)
+
+    def test_legacy_missing_workspace_requires_matching_intent_and_no_live_agent(self):
+        from loop_manager_internal.planning.planning_workspace import legacy_release_identity
+        with tempfile.TemporaryDirectory() as directory:
+            row = planning_snapshot(phase="PLANNING", active_sha="base", worktree=str(Path(directory) / "missing"),
+                planning_workspace_owned=1, planning_attempt_fingerprint="saved")
+            cycle = maintenance_cycle(phase=maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+                refactoring_plan_ids=("G-001",))
+            identity = legacy_release_identity(row, cycle)
+            for scenario in ("no_intent", "bad_identity", "live_agent", "changed_cycle", "changed_input"):
+                with self.subTest(scenario=scenario):
+                    intent = None if scenario == "no_intent" else "bad-identity" if scenario == "bad_identity" else identity
+                    current_cycle = replace(cycle, legacy_release_identity=intent,
+                        revision=cycle.revision + (scenario == "changed_cycle"))
+                    current_row = replace(row, active_sha="different") if scenario == "changed_input" else row
+                    ports = FakePorts(current_row, current_cycle)
+                    ports.state.planning_release_pending = lambda _repo: scenario == "live_agent"
+                    ports.git.validate_planning_release = mock.Mock()
+                    coordinator = PlanningLifecycleCoordinator(ports)
+                    outcome = coordinator._selection._select_planning_work(coordinator._new_run(self.context))
+                    self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+                    self.assertEqual(ports.state.snapshot, current_row)
+                    self.assertEqual(ports.state.cycle.legacy_release_identity, intent)
+                    self.assertEqual(ports.agent.run_count, 0)
+
+    def test_released_workspace_validation_rejects_remaining_registration_and_mutations(self):
+        from loop_manager_internal.planning.git_ports import _PlanningGitPorts
+        with tempfile.TemporaryDirectory() as directory:
+            root, worktree = Path(directory), Path(directory) / "missing"
+            effects = SimpleNamespace(git=mock.Mock(return_value=SimpleNamespace(stdout="")), _nul_git_paths=mock.Mock())
+            port = _PlanningGitPorts(effects, None, root, root / "state")
+            with mock.patch("loop_manager_internal.git.manager_git_journal.has_pending_project_mutation", return_value=False):
+                with self.assertRaises(PlanningWorkspaceOwnershipError):
+                    port.validate_planning_release("/repo", worktree)
+                port.validate_planning_release("/repo", worktree, allow_missing=True)
+                effects.git.return_value.stdout = f"worktree {worktree}\0HEAD base\0detached\0\0"
+                with self.assertRaisesRegex(PlanningWorkspaceOwnershipError, "Git 등록"):
+                    port.validate_planning_release("/repo", worktree, allow_missing=True)
+            with mock.patch("loop_manager_internal.git.manager_git_journal.has_pending_project_mutation", return_value=True):
+                with self.assertRaisesRegex(PlanningWorkspaceOwnershipError, "미확정 Manager Git"):
+                    port.validate_planning_release("/repo", worktree, allow_missing=True)
+
     def test_uncertain_maintenance_boundaries_preserve_diagnostics_without_activation(self):
         for operation in ("advance_maintenance_cycle", "maintenance_due"):
             with self.subTest(operation=operation):

@@ -149,11 +149,17 @@ class _PlanningGitPorts:
         except WorkspaceOwnershipError as error:
             raise PlanningWorkspaceOwnershipError(str(error)) from error
 
-    def validate_planning_release(self, repo: str, worktree: Path | None) -> None:
+    def validate_planning_release(self, repo: str, worktree: Path | None, *, allow_missing: bool = False) -> None:
         from loop_manager_internal.git import manager_git_journal
         if manager_git_journal.has_pending_project_mutation(self._state_dir, repo):
             raise PlanningWorkspaceOwnershipError("미확정 Manager Git 쓰기가 남아 있습니다.")
         if worktree is not None:
+            if not worktree.exists() and allow_missing:
+                registrations = self._effects.git(self._repo_path, "worktree", "list", "--porcelain", "-z").stdout
+                if any(Path(item.removeprefix("worktree ")).resolve() == worktree.resolve()
+                       for item in registrations.split("\0") if item.startswith("worktree ")):
+                    raise PlanningWorkspaceOwnershipError("삭제된 planning 경로의 Git 등록이 남아 있습니다.")
+                return
             if not worktree.exists() or self._effects._git_operation_entries(worktree):
                 raise PlanningWorkspaceOwnershipError("planning worktree가 없거나 Git operation이 진행 중입니다.")
             self._effects.git(worktree, "rev-parse", "--verify", "HEAD^{commit}")

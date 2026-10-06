@@ -1,12 +1,20 @@
 """planning planning workspace boundaries and named composition effects."""
 from __future__ import annotations
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
 from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
 from pathlib import Path
 import hashlib
+import json
 import sqlite3
+
+
+def legacy_release_identity(snapshot, cycle) -> str:
+    """Tie deletion intent to the saved planning attempt and cycle, excluding itself."""
+    value = {"planning": asdict(snapshot),
+             "cycle": {key: value for key, value in asdict(cycle).items() if key != "legacy_release_identity"}}
+    return hashlib.sha256(json.dumps(value, sort_keys=True).encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)

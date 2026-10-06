@@ -957,6 +957,71 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
 
 
 class SinglePassMaintenanceCycleTest(MaintenanceCycleCase):
+    def test_catalog_hold_keeps_merged_scope_waiting_until_catalog_is_resolved(self):
+        self._insert_plan(self.connection, "/one", "G-001", status="MERGED")
+        cycle = self.start(maintenance_state.MaintenancePhase.REFACTORING, ("G-001",))
+        self.catalog()
+        self.connection.execute("INSERT INTO execplan_catalog_holds VALUES ('/one', 'G-001', ?, '{}', NULL)", (self.latest,))
+        self.connection.commit()
+        self.assertEqual(self.advance(), cycle)
+        with self.assertRaisesRegex(maintenance_state.MaintenanceStateError, "catalog 보류"):
+            self.repository.finish_cycle("/one", expected=cycle, source_sha=self.latest)
+        self.connection.execute("DELETE FROM execplan_catalog_holds")
+        self.connection.commit()
+        self.assertEqual(self.advance().phase, maintenance_state.MaintenancePhase.IDLE)
+
+    def test_legacy_release_intent_survives_restart_and_rolls_back_with_planning_clear(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.planning.state_ports import _PlanningStatePorts
+        from loop_manager_internal.storage.runtime_state import RuntimeStateRepository, RuntimeStateError
+        self._legacy_cycle(self.connection, "/one", self.source)
+        self.connection.execute("UPDATE maintenance_cycles SET phase = 'post_refactor_revalidation'")
+        self.connection.execute("UPDATE projects SET phase = 'PLANNING', active_sha = ?, worktree = '/managed/planning', "
+            "planning_workspace_owned = 1, planning_attempt_fingerprint = 'saved', planner_session_id = 'saved-session' WHERE repo = '/one'", (self.source,))
+        self.connection.commit()
+        runtime = RuntimeStateRepository(self.connection)
+        expected = runtime.planning("/one")
+        effects = SimpleNamespace(_clear_active_in_current_transaction=loop_manager._clear_active_in_current_transaction)
+        port = _PlanningStatePorts(effects, self.connection, runtime, self.repository, Path("/state"))
+        pending = port.prepare_legacy_release(expected, self.repository.get("/one"))
+        self.assertIsNotNone(pending.legacy_release_identity)
+        self.assertFalse(self.connection.in_transaction)
+        with self.assertRaisesRegex(maintenance_state.MaintenanceStateError, "workspace 해제"):
+            self.repository.finish_cycle("/one", expected=pending, source_sha=self.latest)
+        restarted = sqlite3.connect(":memory:")
+        restarted.row_factory = sqlite3.Row
+        self.addCleanup(restarted.close)
+        self.connection.backup(restarted)
+        repository = maintenance_state.MaintenanceRepository(restarted)
+        runtime = RuntimeStateRepository(restarted)
+        def interrupted_clear(*args, **kwargs):
+            loop_manager._clear_active_in_current_transaction(*args, **kwargs)
+            raise KeyboardInterrupt("before transaction commit")
+        effects._clear_active_in_current_transaction = interrupted_clear
+        port = _PlanningStatePorts(effects, restarted, runtime, repository, Path("/state"))
+        with self.assertRaises(KeyboardInterrupt):
+            port.complete_legacy_release(expected, pending)
+        self.assertEqual(repository.get("/one"), pending)
+        self.assertEqual(runtime.planning("/one"), expected)
+        restarted.execute("UPDATE projects SET active_sha = ? WHERE repo = '/one'", (self.latest,))
+        restarted.commit()
+        with self.assertRaises(RuntimeStateError):
+            port.complete_legacy_release(expected, pending)
+        self.assertIsNotNone(repository.get("/one").legacy_release_identity)
+        restarted.execute("UPDATE projects SET active_sha = ? WHERE repo = '/one'", (self.source,))
+        restarted.execute("UPDATE maintenance_cycles SET revision = revision + 1")
+        restarted.commit()
+        with self.assertRaises(maintenance_state.MaintenanceStateError):
+            port.complete_legacy_release(expected, pending)
+        self.assertEqual(runtime.planning("/one"), expected)
+        restarted.execute("UPDATE maintenance_cycles SET revision = ?", (pending.revision,))
+        restarted.commit()
+        effects._clear_active_in_current_transaction = loop_manager._clear_active_in_current_transaction
+        port.complete_legacy_release(expected, pending)
+        self.assertIsNone(runtime.planning("/one").phase)
+        self.assertIsNone(repository.get("/one").legacy_release_identity)
+        self.assertIsNone(repository.get("/one").last_cycle_merged_count)
+
     def setUp(self):
         self.connection = self._connection()
         self.addCleanup(self.connection.close)

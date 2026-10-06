@@ -118,6 +118,7 @@ class MaintenanceCycle:
     consumed_request_id: str | None = None
     assessment_plan_ids: tuple[str, ...] = ()
     cycle_id: str | None = None
+    legacy_release_identity: str | None = None
 
 
 @dataclass(frozen=True)
@@ -142,6 +143,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         for row in connection.execute("PRAGMA table_info(maintenance_cycles)")
     }
     migrations = {
+        "legacy_release_identity": "TEXT",
         "last_cycle_commit": "TEXT",
         "last_cycle_merged_count": "INTEGER",
         "cycle_request_id": "TEXT",
@@ -498,6 +500,7 @@ class MaintenanceRepository:
             consumed_request_id=row["consumed_request_id"],
             assessment_plan_ids=stored_plan_ids("assessment_plan_ids"),
             cycle_id=row["cycle_id"],
+            legacy_release_identity=row["legacy_release_identity"],
         )
 
     def due(self, repo: str, interval: int, *, self_repository: bool = False) -> ReviewDue:
@@ -551,6 +554,24 @@ class MaintenanceRepository:
             if cursor.rowcount != 1:
                 raise MaintenanceStateError("평가 범위를 기록할 cycle identity가 변경됐습니다.")
 
+    def record_legacy_release(self, repo: str, *, expected: MaintenanceCycle, identity: str) -> MaintenanceCycle:
+        """Bind a checked clean legacy workspace release before its Git removal."""
+        with _transaction(self.connection):
+            state = self.get(repo)
+            if (state != expected or state.phase is not MaintenancePhase.POST_REFACTOR_REVALIDATION
+                    or state.publication_stage == "prepared"
+                    or re.fullmatch(r"[0-9a-f]{64}", identity) is None
+                    or state.legacy_release_identity not in (None, identity)):
+                raise MaintenanceStateError("기존 사후 단계의 workspace 해제 identity가 변경됐습니다.")
+            self.connection.execute("UPDATE maintenance_cycles SET legacy_release_identity = ? WHERE repo = ?", (identity, repo))
+            return self.get(repo)
+
+    def clear_legacy_release(self, repo: str, *, expected: MaintenanceCycle) -> None:
+        """Caller also clears the matching planning slot in the same transaction."""
+        if self.get(repo) != expected or expected.legacy_release_identity is None:
+            raise MaintenanceStateError("기존 사후 단계의 workspace 해제 intent가 변경됐습니다.")
+        self.connection.execute("UPDATE maintenance_cycles SET legacy_release_identity = NULL WHERE repo = ?", (repo,))
+
     def finish_cycle(self, repo: str, *, expected: MaintenanceCycle, source_sha: str) -> MaintenanceCycle:
         """Close confirmed work atomically; never turn the merged source into a review receipt."""
         with _transaction(self.connection):
@@ -562,6 +583,8 @@ class MaintenanceRepository:
                 raise MaintenanceStateError("유지보수 종료 단계 또는 revision이 변경됐습니다.")
             if state.phase is MaintenancePhase.ASSESSMENT and (state.cycle_id is not None or not state.prerequisite_plan_ids):
                 raise MaintenanceStateError("미확정 평가를 Merge 종료로 처리할 수 없습니다.")
+            if state.legacy_release_identity is not None:
+                raise MaintenanceStateError("미완료 workspace 해제를 유지보수 종료로 처리할 수 없습니다.")
             if state.publication_stage not in (None, "remote_confirmed"):
                 raise MaintenanceStateError("미확정 유지보수 게시를 종료할 수 없습니다.")
             if state.publication_stage == "remote_confirmed" and (
@@ -572,6 +595,9 @@ class MaintenanceRepository:
             from loop_manager_internal.maintenance.maintenance_orchestration import cycle_scope_plan_ids
             rows = self.plan_rows(repo)
             scope = cycle_scope_plan_ids(rows, state)
+            from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
+            if catalog_held_plan_ids(self.connection, repo).intersection(scope):
+                raise MaintenanceStateError("유지보수 확정 범위의 catalog 보류가 남아 있습니다.")
             by_id = {row["plan_id"]: row["status"] for row in rows}
             if not scope or any(by_id[plan_id] != "MERGED" for plan_id in scope):
                 raise MaintenanceStateError("유지보수 확정 범위의 실제 Merge가 완료되지 않았습니다.")
