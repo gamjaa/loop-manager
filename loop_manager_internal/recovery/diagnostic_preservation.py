@@ -122,7 +122,9 @@ def collect(effects, source, snapshot):
         if not source.allowed(name) or _private_path(name):
             omitted[name] = 'outside verified scope or private path'
             continue
-        ignored = effects.git(source.worktree, '--literal-pathspecs', 'check-ignore',
+        # check-ignore consumes paths and rejects literal pathspec magic.
+        # Disable an inherited literal setting without weakening fail-closed checks.
+        ignored = effects.git(source.worktree, '--no-literal-pathspecs', 'check-ignore',
                               '--no-index', '--quiet', '--', name, check=False)
         if ignored.returncode != 1:
             omitted[name] = 'ignored path or ignore inspection unavailable'

@@ -26,6 +26,62 @@ def result(output='', code=0):
 
 
 class OriginalArtifactTests(unittest.TestCase):
+    def test_ignore_inspection_retains_conflict_stages_and_rejects_ignored_or_unavailable_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manual = b'<<<<<<< HEAD\nupstream\n=======\nmanual edit\n>>>>>>> local\n'
+            (root / 'code.py').write_bytes(manual)
+            content = {'base': b'before\n', 'ours': b'upstream\n', 'theirs': b'local\n'}
+            stages = b'100644 base 1\tcode.py\0' + b'100644 ours 2\tcode.py\0' + b'100644 theirs 3\tcode.py\0'
+            snapshot = GitSnapshot('head', None, {'code.py': tuple(stages.decode().strip('\0').split('\0'))},
+                {'code.py': (('unstaged',), 'conflict')}, {}, {}, {}, {'rebase-merge': 'owned'})
+            source = preservation.PreservationSource('repo', 'project', 'G-047', 'cause', 'branch',
+                root, {'base': 'base', 'head': 'head'}, {}, lambda _: True, lambda: snapshot)
+            def raw(_root, *args):
+                if 'ls-tree' in args:
+                    return b'100644 blob base\tcode.py\0'
+                if 'ls-files' in args:
+                    return stages
+                if 'cat-file' in args:
+                    return content[args[-1]]
+                if '--name-only' in args:
+                    return b'code.py\0'
+                if 'diff' in args:
+                    return b'conflict diff\n'
+                raise AssertionError(args)
+            for ignore_code in (1, 0, 128):
+                def check(_root, *args, **kwargs):
+                    # Git rejects the old option, including on tracked conflicts.
+                    if '--literal-pathspecs' in args:
+                        return result('pathspec magic not supported: literal', 128)
+                    self.assertEqual(args, ('--no-literal-pathspecs', 'check-ignore',
+                        '--no-index', '--quiet', '--', 'code.py'))
+                    self.assertEqual(kwargs, {'check': False})
+                    return result('', ignore_code)
+                with self.subTest(ignore_code=ignore_code):
+                    read = mock.Mock(side_effect=raw)
+                    before = snapshot.serialize()
+                    assets, manifest = preservation.collect(
+                        preservation.PreservationEffects(check, read, mock.Mock()), source, snapshot)
+                    self.assertEqual(snapshot.serialize(), before)
+                    self.assertEqual((root / 'code.py').read_bytes(), manual)
+                    if ignore_code == 1:
+                        self.assertTrue(manifest['complete'])
+                        self.assertEqual(manifest['omitted'], {})
+                        item = manifest['files']['code.py']
+                        self.assertEqual(set(item['index']), {'1', '2', '3'})
+                        for stage, oid in (('1', 'base'), ('2', 'ours'), ('3', 'theirs')):
+                            self.assertEqual(assets['blobs/' + item['index'][stage]['blob']], content[oid])
+                        self.assertEqual(assets['blobs/' + item['worktree']['blob']], manual)
+                        self.assertIn('diff/worktree.patch', assets)
+                    else:
+                        self.assertFalse(manifest['complete'])
+                        self.assertEqual(manifest['files'], {})
+                        self.assertEqual(manifest['omitted'],
+                            {'code.py': 'ignored path or ignore inspection unavailable'})
+                        self.assertEqual(set(assets), {'manifest.json'})
+                        self.assertFalse(any('cat-file' in call.args for call in read.call_args_list))
+
     def test_closed_pr_artifacts_have_ownership_proof_without_rebase_acceptance(self):
         from tests.support.rebase_observations import expectation, observation, scope_for
         from loop_manager_internal.git.managed_rebase_validation import PullRequest, RebaseStatus, assess_current_rebase
@@ -233,7 +289,7 @@ class PreservationTests(unittest.TestCase):
         self.assertNotEqual(calls[-1][1]['env']['GIT_INDEX_FILE'], str(self.root / '.git/index'))
 
 
-class CollectionSecurityTests(unittest.TestCase):
+class PreservationEngineTests(unittest.TestCase):
     def test_secret_originals_private_ignored_and_unrelated_files_never_enter_diff(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

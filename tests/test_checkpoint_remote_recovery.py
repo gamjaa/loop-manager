@@ -133,6 +133,7 @@ class ProjectCheckpointGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.T
         self.assertEqual(receipt['result'], 'published', receipt)
         self.assertEqual(self.run_git(self.remote, 'rev-parse', f"refs/heads/{receipt['branch']}"), receipt['commit_oid'])
         manifest = json.loads(self.run_git(self.worktree, 'show', f"{receipt['commit_oid']}:manifest.json"))
+        self.assertIn('code.py', manifest['files'], manifest)
         self.assertEqual(set(manifest['files']['code.py']['index']), {'1', '2', '3'})
         manual = manifest['files']['code.py']['worktree']['blob']
         preserved = subprocess.run(

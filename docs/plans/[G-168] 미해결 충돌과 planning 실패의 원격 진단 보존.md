@@ -59,3 +59,4 @@ priority: critical
 
 - 관련 unit case는 `tests/test_diagnostic_preservation.py`에 있으며 실제 Git·원격·Agent effect를 mock한다. 기존 원형 evidence·diagnostic lease·planning 로그·차단 알림의 좁은 unit case를 함께 재사용한다. `tests/test_notification_incidents.py`의 helper import를 저장소 패키지 경로로 맞춰 직접 targeted 실행도 가능하게 한다. 기존 `scripts/verify.sh`는 새 test module을 자동 발견하는 전체 runner를 유지하며 Worker는 이를 실행하지 않는다.
 - 루트의 진단 보존 연결도 기존 `_bind_effects`와 명시적인 effects 계약을 사용한다. 연결 프로젝트의 기존 게시가 완료되고 새 입력이 없으면 추가 진단을 생성하지 않으며, 미완료·충돌 대기 자료는 계속 재관측한다. 닫힌 PR의 동일 identity 조회는 차단 해제와 구분한다. 보존 실패 receipt가 초기 알림을 대체할 때 이전 미발송 알림은 취소하고, 동일 receipt의 재시작은 새 알림을 만들지 않는다. Manager용 Git 회귀 case는 원래 index·branch 불변, 진단 ref의 stage 원형·현재 bytes와 중복 push 방지를 확인한다.
+- `check-ignore`는 literal pathspec magic을 지원하지 않으므로 ignore 검사에서 `--no-literal-pathspecs`로 상속된 설정도 해제한다. 종료 코드 1인 경로만 원형 수집하고 ignored(0)·검사 실패는 계속 제외한다. unit case는 이 명령 경계와 충돌 stage·수동 수정 원형 보존, 제외 시 누락 표시를 함께 검증한다.
