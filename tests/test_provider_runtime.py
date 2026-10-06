@@ -743,11 +743,36 @@ class CommonGuidanceProviderTests(unittest.TestCase):
         self.assertEqual(tomllib.loads(args[1])['developer_instructions'], self.existing + '\n\n' + self.text)
         self.assertNotIn('model_instructions_file', repr(args))
         self.assertEqual(probe.call_count, 4)
+        self.assertEqual(probe.call_args_list[0].kwargs['env'], {'CODEX_HOME': 'runtime-home'})
         for call in probe.call_args_list[1:]:
             self.assertIn('selected-model', call.args[0])
             self.assertNotIn('--strict-config', call.args[0])
             self.assertEqual(call.kwargs['env'], {'CODEX_HOME': 'runtime-home'})
         self.assertEqual(self.guidance.snapshot_path.read_text(), self.text)
+
+    def test_capability_and_native_probes_filter_manager_secrets_and_keep_launch_environment(self):
+        def run(arguments, **context):
+            return subprocess.CompletedProcess(arguments, 0, self.native_probe(arguments, **context))
+        inherited = {'PATH': '/provider/bin', 'HOME': '/agent/home',
+                     'CODEX_HOME': '/codex/home', 'OPENAI_API_KEY': 'fake-openai',
+                     'CLAUDE_CONFIG_DIR': '/claude/config', 'ANTHROPIC_API_KEY': 'fake-anthropic',
+                     'TELEGRAM_BOT_TOKEN': 'fake-telegram', 'LOOP_MANAGER_SECRET': 'fake-manager'}
+        launch = {'PATH': '/isolated/bin', 'CODEX_HOME': '/isolated/codex'}
+        with mock.patch.dict(os.environ, inherited, clear=True), \
+             mock.patch.object(self.provider_guidance.subprocess, 'run', side_effect=run) as probe:
+            self.provider_guidance.codex_arguments(self.guidance, self.worktree)
+            self.provider_guidance.claude_arguments(self.guidance)
+            self.provider_guidance.codex_arguments(self.guidance, self.worktree, environment=launch)
+        self.assertEqual(len(probe.call_args_list), 9)
+        for call in probe.call_args_list[:5]:
+            provider = call.args[0][0]
+            allowed = ('CODEX_HOME', 'OPENAI_API_KEY') if provider == 'codex' else (
+                'CLAUDE_CONFIG_DIR', 'ANTHROPIC_API_KEY')
+            self.assertEqual(call.kwargs['env'], {key: inherited[key] for key in ('PATH', 'HOME', *allowed)})
+        self.assertEqual(probe.call_args_list[0].args[0], ['codex', '--version'])
+        self.assertEqual(probe.call_args_list[4].args[0], ['claude', '--help'])
+        for call in probe.call_args_list[5:]:
+            self.assertIs(call.kwargs['env'], launch)
 
     def test_untrusted_project_is_not_promoted_and_managed_override_is_rejected(self):
         import tomllib

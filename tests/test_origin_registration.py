@@ -25,6 +25,57 @@ from loop_manager_internal.runtime import bootstrap
 
 
 class OriginRegistrationTests(unittest.TestCase):
+    def test_reregistration_archives_legacy_approval_without_approving_current_hash(self):
+        from loop_manager_internal.runtime import project_registry
+        from loop_manager_internal.catalog.execplan_catalog import ExecPlanCatalogSnapshot
+        from types import SimpleNamespace
+        for old_hash, old_origin in (('legacy-hash', 'example/project'), (None, None)):
+            with self.subTest(old_hash=old_hash), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                revision = 'a' * 40
+                connection = sqlite3.connect(':memory:')
+                self.addCleanup(connection.close)
+                connection.row_factory = sqlite3.Row
+                connection.execute(loop_manager.SCHEMA)
+                loop_manager._ensure_execplans_schema(connection)
+                connection.execute('INSERT INTO projects (repo, base_branch, agents_hash, agents_approved, origin, registered) '
+                    'VALUES (?, ?, ?, 1, ?, ?)', (str(root), 'main', old_hash, old_origin, int(old_hash is None)))
+                connection.commit()
+                if old_hash is None:
+                    project_registry.remove_project(connection, str(root))
+                else:
+                    # A pre-migration unregister left only the original row.
+                    self.assertIsNone(connection.execute("SELECT name FROM sqlite_master WHERE name = "
+                        "'project_agents_approval_audit'").fetchone())
+                documents = {'AGENTS.md': b'project rules',
+                             'docs/PLANS.md': (loop_manager.ROOT / 'docs/PLANS.md').read_bytes(),
+                             'docs/ARCHITECTURE.md': b'# Custom architecture',
+                             'docs/PRODUCT.md': b'# Custom product'}
+                def validate(_path, **options):
+                    options['origin_result'].append('example/project')
+                    return root
+                with mock.patch.object(loop_manager, 'validate_repository', side_effect=validate), \
+                     mock.patch.object(loop_manager, 'remote_base', return_value='main'), \
+                     mock.patch.object(loop_manager, 'git', return_value=SimpleNamespace(stdout=revision)), \
+                     mock.patch.object(loop_manager, '_git_tree_entries', return_value={}), \
+                     mock.patch.object(loop_manager, '_revision_blob',
+                         side_effect=lambda _root, _entries, path: documents.get(path)), \
+                     mock.patch.object(loop_manager, 'migrate_legacy_execplans'), \
+                     mock.patch.object(loop_manager, 'revision_execplan_snapshot',
+                         return_value=ExecPlanCatalogSnapshot({}, {}, revision_sha=revision)):
+                    for approve in (False, True):
+                        added = loop_manager.add_registered_project(connection, root,
+                            config_path=Path('config.ini'), provider='codex', requested_base='main',
+                            approve_agents_mismatch=approve)
+                        self.assertFalse(added.agents_approved)
+                        self.assertEqual(added.agents_hash, hashlib.sha256(documents['AGENTS.md']).hexdigest())
+                        self.assertEqual(project_registry.list_projects(connection), (added,))
+                        audit = connection.execute('SELECT repo, agents_hash, agents_approved, origin '
+                            'FROM project_agents_approval_audit').fetchall()
+                        self.assertEqual([tuple(row) for row in audit], [(str(root), old_hash, 1, old_origin)])
+                        project_registry.remove_project(connection, str(root))
+                        documents['AGENTS.md'] = b'updated project rules'
+
     def test_project_only_agents_are_accepted_and_invalid_utf8_missing_inputs_are_rejected(self):
         from loop_manager_internal.runtime import project_registry
         documents = {'AGENTS.md': '프로젝트 규칙\r\n'.encode(),
@@ -98,6 +149,8 @@ class OriginRegistrationTests(unittest.TestCase):
         self.assertNotIn("origin", {
             row[1] for row in connection.execute("PRAGMA table_info(projects)")
         })
+        self.assertIsNone(connection.execute("SELECT name FROM sqlite_master WHERE name = "
+            "'project_agents_approval_audit'").fetchone())
 
     def test_self_runtime_identity_rejects_alias_and_other_clone(self):
         with tempfile.TemporaryDirectory() as directory:

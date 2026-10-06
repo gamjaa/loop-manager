@@ -10,9 +10,12 @@ import tomllib
 from uuid import uuid4
 
 from loop_manager_internal.agents.common_guidance import CommonGuidance, GuidanceError, _read
+from loop_manager_internal.agents.agent_profiles import agent_environment
 
 
 def _probe(arguments: list[str], **context) -> str:
+    if context.get('env') is None:
+        context['env'] = agent_environment(arguments[0])
     try:
         result = subprocess.run(arguments, capture_output=True, text=True,
                                 encoding="utf-8", timeout=15, check=False, **context)
@@ -66,7 +69,7 @@ def codex_arguments(guidance: CommonGuidance, worktree: Path, *,
                     context_arguments: tuple[str, ...] = (),
                     environment: dict[str, str] | None = None) -> list[str]:
     _validate(guidance)
-    version = _probe(["codex", "--version"]).strip()
+    version = _probe(["codex", "--version"], env=environment).strip()
     match = re.fullmatch(r"codex-cli (\d+)\.(\d+)\.(\d+)", version)
     if not match or tuple(map(int, match.groups())) < (0, 159, 3):
         raise GuidanceError("Codex CLI가 지원되는 developer_instructions 버전이 아닙니다.")

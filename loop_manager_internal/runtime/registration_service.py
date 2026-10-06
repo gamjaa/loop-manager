@@ -218,8 +218,8 @@ def inspect_registration_files(
     except UnicodeDecodeError as error:
         raise RuntimeError("origin의 AGENTS.md가 UTF-8이 아닙니다.") from error
     agents_hash = hashlib.sha256(agents).hexdigest()
-    # The old flag/registry column remain readable audit data. New registration
-    # does not compare project rules to the runtime's common instructions.
+    # Registry storage archives old approval/hash pairs before replacing these
+    # current-registration values. Project rules need no common-content approval.
     return agents_hash, False
 
 
