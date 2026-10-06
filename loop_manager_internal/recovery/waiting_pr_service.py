@@ -429,9 +429,14 @@ def _resume_reopened_pull_request(
              and saved_recovery["reason_code"] == RecoveryReason.PULL_REQUEST_CLOSED.value
              and saved_recovery["phase"] in runtime_state.ACTIVE_STATUSES
              and (saved_recovery["phase"] != "PUBLISHING" or not publication_approved)))
+    confirm_publication = bool(
+        not recovery and not revalidate_candidate
+        and plan['blocked_reason'] == PR_CLOSED_BLOCK_REASON and publication_approved
+        and checkpoint.operation == 'push' and checkpoint.expected_head == head_oid
+        and (checkpoint.snapshot or {}).get('remote_before') == plan['publication_remote_oid'])
     recovery = recovery or revalidate_candidate
-    phase = "WORKING" if recovery else "PR_OPEN"
-    status = "IMPLEMENTING" if recovery else "PR_OPEN"
+    phase = "WORKING" if recovery else "PUBLISHING" if confirm_publication else "PR_OPEN"
+    status = "IMPLEMENTING" if recovery else phase
     last_error = REBASE_IN_PROGRESS_ERROR if recovery and not revalidate_candidate else None
     execplan_values: dict[str, object] = {
         "status": status,
@@ -471,7 +476,7 @@ def _resume_reopened_pull_request(
             "SELECT * FROM projects WHERE repo = ?", (repo,)
         ).fetchone()
         repository = runtime_state.RuntimeStateRepository(connection)
-        if revalidate_candidate:
+        if revalidate_candidate or confirm_publication:
             if (scoped_blocking.project_block(connection, repo) is not None
                     or not blocked_plan_reconciliation.slot_available(connection, repo, str(plan["plan_id"]))):
                 return

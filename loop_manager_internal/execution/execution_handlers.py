@@ -714,8 +714,8 @@ class ExecutionHandlers:
     def publish(self, context, latest_base):
         return self._publication_handler().publish(context, latest_base)
 
-    def _publish_conflict_recovery(self, context, row, expected_oid):
-        return self._publication_handler()._publish_conflict_recovery(context, row, expected_oid)
+    def _publish_existing_pull_request(self, context, row, expected_oid):
+        return self._publication_handler()._publish_existing_pull_request(context, row, expected_oid)
 
     def _publish_new_pull_request(self, context, row):
         return self._publication_handler()._publish_new_pull_request(context, row)

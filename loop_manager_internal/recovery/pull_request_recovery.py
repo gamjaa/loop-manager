@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from collections.abc import Mapping
 from loop_manager_internal.git import manager_git_journal
+from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
 from loop_manager_internal.recovery import recovery_runtime
 from loop_manager_internal.recovery.blocked_checkpoint import checkpoint_pr_matches
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
@@ -91,6 +92,21 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
     head_value = pull_request.get("headRefOid")
     head_oid = str(head_value) if head_value else project["pr_head_oid"]
     state = str(pull_request.get("state") or "OPEN").upper()
+    if (state == 'OPEN' and project['phase'] == 'PUBLISHING'
+            and project['pr_url'] and not int(project['pr_conflict_recovery'])):
+        try:
+            if effects.recover_confirmed_pr_conflict_push(
+                    connection, repo_path, state_dir, repo, project, pull_request):
+                effects.operation_print(f"기존 PR 후보 push 확인 완료: {url}")
+                return 0
+        except (PublicationSafetyError, WorkspaceOwnershipError) as error:
+            detail = f"기존 PR 후보 push 소유권 검증 실패: {error}"
+            effects.block_active_execplan_from_revision(
+                connection, repo_path, repo, f"refs/remotes/origin/{project['base_branch']}",
+                detail, str(project['verify_result'] or ''),
+                reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN)
+            effects.operation_print(detail, file=sys.stderr)
+            return 1
     unvalidated_candidate = False
     if (state == "OPEN" and project["pr_url"]
             and project["phase"] in {"WORKING", "VERIFYING", "REVIEWING", "PUBLISHING"}):
@@ -102,6 +118,12 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
             checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id)
             unvalidated_candidate = (unvalidated_candidate
                 or checkpoint.operation in {"rebase", "rebase_publish"})
+            plan = effects.project_execplan(connection, repo)
+            definition = DefinitionSnapshot.deserialize(plan['definition_snapshot']) if plan else None
+            if definition is not None:
+                unvalidated_candidate = (unvalidated_candidate
+                    or project['publication_token'] != definition.publication_token(
+                        str(project['validated_base_sha'] or ''), str(head_oid or '')))
         if unvalidated_candidate and not checkpoint_pr_matches(
                 pull_request, url=project["pr_url"], branch=branch, head=project["pr_head_oid"],
                 base=project["base_branch"]):

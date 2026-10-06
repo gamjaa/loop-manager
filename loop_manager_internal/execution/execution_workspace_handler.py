@@ -312,6 +312,7 @@ class WorkspaceHandler:
                 completed_push = current.operation == 'push'
                 if completed_push and (marker or current.completed_rebase()
                                        or (current.snapshot or {}).get('current_rebase_acceptance')
+                                       or (current.snapshot or {}).get('remote_adoption_scope')
                                        or (current.snapshot or {}).get('published_review_resume')):
                     self.ports.state.update_project(
                         self.ports.identity.repo, publication_remote_oid=remote_oid,
@@ -327,6 +328,7 @@ class WorkspaceHandler:
                                  if completed_push and
                                  ((current.snapshot or {}).get('blocked_resume') or
                                   (current.snapshot or {}).get('published_review_resume') or
+                                  (current.snapshot or {}).get('remote_adoption_scope') or
                                   (current.snapshot or {}).get('current_rebase_acceptance') or
                                   current.completed_rebase())
                                  else {})},
@@ -472,6 +474,12 @@ class WorkspaceHandler:
                     ), **(
                         {'published_review_resume': current.snapshot['published_review_resume']}
                         if (current.snapshot or {}).get('published_review_resume')
+                        else {}
+                    ), **(
+                        {key: current.snapshot[key] for key in
+                         ('remote_adoption_scope', 'last_adopted_remote_oid', 'pushed_checkpoint_head')
+                         if key in current.snapshot}
+                        if (current.snapshot or {}).get('remote_adoption_scope')
                         else {}
                     )},
                 )

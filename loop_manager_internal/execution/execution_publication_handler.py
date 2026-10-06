@@ -172,6 +172,7 @@ class PublicationHandler:
                          if current.operation == 'push' and
                          ((current.snapshot or {}).get('blocked_resume') or
                           (current.snapshot or {}).get('published_review_resume') or
+                          (current.snapshot or {}).get('remote_adoption_scope') or
                           (current.snapshot or {}).get('current_rebase_acceptance') or
                           current.completed_rebase()) else {})},
         )
@@ -249,7 +250,7 @@ class PublicationHandler:
             publication = self._publication_resume().observe(
                 self.ports.identity.repo_path, context.worktree, context.branch,
                 str(row['publication_remote_oid'] or '') or None,
-                str(row['pr_url']) if int(row['pr_conflict_recovery']) else None,
+                str(row['pr_url'] or '') or None,
             )
         except (self.ports.contract.PublicationSafetyError, self.ports.contract.WorkspaceOwnershipError) as error:
             return self.ports._block_final(self.ports.identity.repo, context.worktree, str(error),
@@ -267,10 +268,15 @@ class PublicationHandler:
                 reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
             )
         existing_pr = publication.pull_request
-        # Owned PR conflict recovery deliberately starts from its saved PR
-        # head; its existing lease gate authorizes the later rebased push.
-        attachment = (replace(publication, local_oid=str(row['pr_conflict_head_oid'] or ''))
-                      if int(row['pr_conflict_recovery']) else publication)
+        # A saved PR remains at the last owned checkpoint while the Worker
+        # prepares its next candidate. The push gate checks that exact owner.
+        saved_head = (row['pr_conflict_head_oid'] if int(row['pr_conflict_recovery'])
+                      else row['pr_head_oid'])
+        owned_pr = bool(existing_pr and row['pr_url']
+            and existing_pr.get('url') == row['pr_url']
+            and saved_head == row['publication_remote_oid'])
+        attachment = (replace(publication, local_oid=str(saved_head or ''))
+                      if int(row['pr_conflict_recovery']) or owned_pr else publication)
         if assess_publication(attachment) is PublicationNext.USER_ACTION:
             return self.ports._block_final(
                 self.ports.identity.repo, context.worktree,
@@ -278,7 +284,8 @@ class PublicationHandler:
                 str(row['verify_result'] or ''),
                 reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
             )
-        if existing_pr:
+        if existing_pr and (not owned_pr
+                or str(existing_pr.get('state') or 'OPEN').upper() != 'OPEN'):
             try:
                 reconciliation = self.ports.reconcile_existing_pull_request(
                     self.ports.identity.repo_path,
@@ -440,11 +447,11 @@ class PublicationHandler:
                 ),
             )
             context = self.ports._context()
-        if int(row['pr_conflict_recovery']):
-            return self._publish_conflict_recovery(context, row, publication.local_oid)
+        if row['pr_url']:
+            return self._publish_existing_pull_request(context, row, publication.local_oid)
         return self._publish_new_pull_request(context, row)
 
-    def _publish_conflict_recovery(self, context, row, expected_oid):
+    def _publish_existing_pull_request(self, context, row, expected_oid):
         current_pr = self.ports.pr_for_branch(self.ports.identity.repo_path, context.branch, str(row['pr_url'] or ''))
         if current_pr is None:
             publication_error = '게시 직전 저장된 기존 PR을 다시 조회할 수 없습니다.'
@@ -457,17 +464,21 @@ class PublicationHandler:
             )
             self.ports.operation_print(publication_error, file=sys.stderr)
             return self.ports._final(publication_error)
-        reconciliation = self.ports.reconcile_existing_pull_request(
-            self.ports.identity.repo_path,
-            self.ports.identity.state_dir,
-            self.ports.identity.repo,
-            row,
-            current_pr,
-        )
-        if reconciliation is not None:
-            return self.ports._step_outcome(reconciliation)
+        if (int(row['pr_conflict_recovery'])
+                or str(current_pr.get('state') or '').upper() != 'OPEN'):
+            reconciliation = self.ports.reconcile_existing_pull_request(
+                self.ports.identity.repo_path,
+                self.ports.identity.state_dir,
+                self.ports.identity.repo,
+                row,
+                current_pr,
+            )
+            if reconciliation is not None:
+                return self.ports._step_outcome(reconciliation)
         row = self.ports._row()
         try:
+            if not int(row['pr_conflict_recovery']):
+                self._publication_intent(context, 'push', row['publication_remote_oid'])
             head_oid = self.ports.push_owned_pr_conflict_recovery(
                 self.ports.identity.repo_path,
                 self.ports.identity.state_dir,
@@ -496,6 +507,11 @@ class PublicationHandler:
                 classify_exception(error, operation=RecoveryReason.PUBLICATION_RETRY),
                 publication_error, context=context,
             )
+        if not int(row['pr_conflict_recovery']):
+            # Confirm the physical push before a newer definition/base can
+            # invalidate its approval and return the candidate to the Worker.
+            self.ports.state.confirm_existing_pr_push(self.ports.checkpoint, head_oid)
+            context = self.ports._context()
         guarded = self.ports._post_effect_guard(context)
         if isinstance(guarded, ExecutionOutcome):
             return guarded
@@ -508,7 +524,7 @@ class PublicationHandler:
             pr_conflict_head_oid=None,
             pr_conflict_base_oid=None,
         )
-        self.ports.operation_print(f"기존 PR 충돌 복구 게시 완료: {row['pr_url']}")
+        self.ports.operation_print(f"기존 PR 후보 게시 완료: {row['pr_url']}")
         return ExecutionOutcome(ExecutionOutcomeKind.SUCCESS)
 
     def _publish_new_pull_request(self, context, row):

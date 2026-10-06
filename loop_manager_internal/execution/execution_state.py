@@ -101,6 +101,27 @@ class ExecutionStatePort:
                 expected, transition_id, session_id, binding,
             )
 
+    def confirm_existing_pr_push(self, checkpoints, head):
+        """Advance the owned PR receipt and clear its push intent atomically."""
+        if checkpoints is None or checkpoints.connection is not self.connection:
+            raise runtime_state.RuntimeStateError('PR publication checkpoint database differs')
+        with runtime_state._transaction(self.connection):
+            expected = self.check()
+            current = checkpoints.get(self.repo, self.plan_id)
+            if (expected is None or expected.status != 'PUBLISHING' or not expected.pr_url
+                    or current.operation != 'push' or current.expected_head != head
+                    or (current.snapshot or {}).get('remote_before') != expected.publication_remote_oid
+                    or expected.pr_head_oid != expected.publication_remote_oid):
+                raise runtime_state.RuntimeStateError('PR publication intent ownership changed')
+            values = {'publication_remote_oid': head, 'pr_head_oid': head}
+            updated = self.repository.transition_from_snapshot(
+                expected, plan_values=values, project_values=values)
+            checkpoints.record(self.repo, self.plan_id, expected_generation=current.generation,
+                operation=None, expected_head=head, target_base_oid=current.target_base_oid,
+                observed_remote_oid=head,
+                snapshot={**(current.snapshot or {}), 'pushed_checkpoint_head': head})
+        self.expected = updated
+
     def correct_checkpoint(self, *, phase, active_sha, validated_base_sha,
                            invalidate_validation, expected_catalog=None):
         with self.connection:
