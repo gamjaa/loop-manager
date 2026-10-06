@@ -106,6 +106,7 @@ def changed_files(effects: ChangedFilesEffects, worktree: Path, since: str | Non
 
     if since:
         return sorted(paths("diff", "--no-renames", "--name-only", f"{since}..HEAD"))
+    # Content observation avoids stat-only names without rewriting the index.
     return sorted(set(effects._unstaged_git_paths(worktree))
                   | paths("diff", "--cached", "--no-renames", "--name-only")
                   | paths("ls-files", "--others", "--exclude-standard"))

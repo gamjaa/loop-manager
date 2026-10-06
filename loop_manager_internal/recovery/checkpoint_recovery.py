@@ -7,18 +7,20 @@ from dataclasses import replace
 from loop_manager_internal.agents.agent_invocation import InvocationContext
 from loop_manager_internal.agents.agent_prompts import reviewer_prompt
 from loop_manager_internal.agents.agent_scope_decision import _non_default_index_flags
-from loop_manager_internal.agents.agent_scope_decision import _worker_path_allowed
+from loop_manager_internal.agents.agent_scope_decision import scoped_metadata, used_git_resources
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.documents import reviewer_specification
 from loop_manager_internal.execution import execution_revision
 from loop_manager_internal.execution.validation_feedback import normalize_feedback
 from loop_manager_internal.execution.verify_process import VerifyTerminationUncertain
-from loop_manager_internal.git import managed_rebase_adoption
+from loop_manager_internal.git import managed_rebase_adoption, managed_rebase_validation
+from loop_manager_internal.git.managed_rebase_validation import _safe_path
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.recovery import blocked_checkpoint
 from loop_manager_internal.recovery import blocked_plan_reconciliation
 from loop_manager_internal.recovery import project_blocked_recovery
 from loop_manager_internal.recovery import scoped_blocking
+from loop_manager_internal.recovery import work_branch_integration
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
 from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
@@ -51,6 +53,11 @@ class ReconcilePublishedBlockedCheckpointEffects:
     github_repository: Callable[..., object]
     validate_execplan_workspace_identity: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
+    _capture_agent_baseline: Callable[..., object]
+    _git_with_index: Callable[..., object]
+    _commit_tree: Callable[..., object]
+    _journaled_direct_rebase: Callable[..., object]
+    validate_blocked_agent_scope: Callable[..., object]
 
 
 @dataclass(frozen=True)
@@ -94,6 +101,14 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
     snapshot = None
     worktree = Path(str(blocked["worktree"] or ""))
     branch = str(blocked["branch"] or "")
+    checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+    current = checkpoints.get(repo, str(blocked['plan_id']))
+    integration = (current.snapshot or {}).get('work_branch_integration')
+    base_completion = (current.snapshot or {}).get('base_rebase_restart') or {}
+    integrating = integration is not None and (
+        integration.get('phase') != 'complete' or current.operation == 'rebase'
+        or (current.snapshot or {}).get('remote_adoption_intent'))
+    integrating = integrating or blocked_plan_reconciliation.base_adoption_pending(current, branch, str(worktree))
     try:
         observed = adapter.observe_remote(request)
     except (OSError, RuntimeError) as error:
@@ -101,13 +116,21 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
         observation_error = f"원격 checkpoint를 재검증할 수 없습니다: {error}"
     else:
         observation_error = None
+    base_restarting = (adopt_only and current.operation == 'rebase'
+                       and current.observed_remote_oid != observed
+                       and (not integration or integration.get('phase') == 'complete'))
+    integrating = integrating or base_restarting
     accepted = str(row["accepted_remote_oid"] or row["published_oid"] or row["remote_oid"])
     unchanged = observed == accepted and not row["pending_remote_oid"]
     try:
         effects.validate_execplan_workspace_identity(
             state_dir, repo, str(blocked["plan_id"]), branch, worktree,
         )
-        effects.validate_managed_worktree(repo_path, worktree, branch)
+        effects.validate_managed_worktree(repo_path, worktree, branch, allow_rebase=integrating)
+        if integrating and current.operation == 'rebase':
+            effects._current_rebase_service(
+                connection, repo_path, state_dir, repo, str(blocked['plan_id']),
+                worktree, branch, remote_oid=observed).require_owned(checkpoint=current)
         snapshot = effects.capture_git_snapshot(worktree)
         ignored_paths = tuple(effects._nul_git_paths(
             worktree, "ls-files", "--others", "--ignored",
@@ -185,7 +208,7 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
         return refuse("게시된 원격 checkpoint branch가 삭제됐습니다.")
     if not row["published_oid"]:
         return refuse("게시 OID가 증명되지 않은 legacy checkpoint의 원격 변경은 채택할 수 없습니다.")
-    if row["pending_remote_oid"] and row["pending_remote_oid"] != observed:
+    if row["pending_remote_oid"] and row["pending_remote_oid"] != observed and not integrating:
         return refuse("미완료 원격 checkpoint 채택 중 branch OID가 다시 변경됐습니다.")
     if blocked["pr_url"] or int(blocked["workspace_owned"] or 0) != WORKSPACE_OWNED:
         return refuse("PR 또는 관리 workspace 소유권 때문에 원격 checkpoint를 채택할 수 없습니다.")
@@ -194,20 +217,18 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
     if safety_error:
         return refuse(safety_error)
     assert snapshot is not None
-    if snapshot.operations:
+    if snapshot.operations and not integrating:
         return refuse("미해결 Git operation: " + ", ".join(sorted(snapshot.operations)))
-    if snapshot.branch != branch or not snapshot.head:
+    if (snapshot.branch != branch and not integrating) or not snapshot.head:
         return refuse("관리 worktree의 branch 또는 HEAD가 저장된 ExecPlan과 다릅니다.")
     own_ref = f"refs/heads/{branch}"
     own_worktree = snapshot.worktrees.get(str(_canonical_path(worktree)), ())
     if (
         not snapshot.shared_metadata_complete
-        or snapshot.refs.get(own_ref, (None, None))[0] != snapshot.head
-        or f"branch={own_ref}" not in own_worktree
+        or not integrating and (snapshot.refs.get(own_ref, (None, None))[0] != snapshot.head
+                               or f"branch={own_ref}" not in own_worktree)
     ):
         return refuse("관리 branch ref와 worktree 등록 상태의 소유권을 증명할 수 없습니다.")
-    if snapshot.dirty:
-        return refuse("로컬 tracked/index/untracked 변경을 보존하기 위해 원격 fast-forward를 중단합니다.")
     if any(_non_default_index_flags(entries) for entries in snapshot.index.values()):
         return refuse("관리 worktree index flag가 안전하지 않습니다.")
     project = connection.execute(
@@ -227,7 +248,7 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
         return refuse(f"원격 저장소 소유권을 증명할 수 없습니다: {error}")
     try:
         # Project recovery may not trust configured mappings to shared refs.
-        refmap_options = ("--refmap=",) if project_recovery_context is not None else ()
+        refmap_options = ("--refmap=",)
         fetched = effects.git(
             repo_path, "fetch", "--no-tags", *refmap_options, "origin",
             f"refs/heads/{branch}", check=False,
@@ -244,17 +265,72 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
     fetched_oid = fetched_result.stdout.strip()
     if fetched_oid != observed:
         return retry("원격 checkpoint branch가 조회와 fetch 사이에 변경됐습니다.")
+    original_head = snapshot.head
+    if integrating:
+        original_head = (current.expected_head if base_restarting or not integration or integration['phase'] == 'complete'
+                         else GitSnapshot.deserialize(integration['before']).head)
+    history_head = original_head
+    acceptance = (current.snapshot or {}).get('current_rebase_acceptance') or {}
+    if (base_completion.get('acceptance_id') == acceptance.get('id')
+            and managed_rebase_validation.valid_acceptance(acceptance)
+            and base_completion.get('remote_before') == accepted
+            and base_completion.get('remote') == acceptance['remote']['oid']
+            and base_completion.get('head') == original_head
+            and all(acceptance[key] == value for key, value in (
+                ('repo', repo), ('plan_id', str(blocked['plan_id'])), ('plan_path', str(blocked['path'])),
+                ('branch', branch), ('worktree', str(_canonical_path(worktree))), ('head', original_head)))):
+        # This stable completed base result may rewrite accepted's OID. Its
+        # recorded original start still has to contain that accepted input.
+        # During a later work-branch rebase, the current operation was checked
+        # above; before it starts, recheck the completed base result itself.
+        if current.operation is None:
+            try:
+                observed_result, decision = effects._current_rebase_service(
+                    connection, repo_path, state_dir, repo, str(blocked['plan_id']), worktree, branch,
+                    target=acceptance['target_base_oid'], remote_oid=observed).require_owned(checkpoint=current)
+                if decision.status.value != 'complete' or observed_result.head != original_head:
+                    return retry('완료된 base rebase의 현재 결과가 변경됐습니다.')
+            except (OSError, RuntimeError, ValueError) as error:
+                return refuse(str(error))
+        history_head = base_completion['original_head']
     local_history = effects.git(
-        repo_path, "merge-base", "--is-ancestor", accepted, snapshot.head,
+        repo_path, "merge-base", "--is-ancestor", accepted, history_head,
         check=False,
     )
     if local_history.returncode not in {0, 1}:
         return retry("로컬 checkpoint ancestry를 확인할 수 없습니다.")
     if local_history.returncode == 1:
-        return refuse("로컬 branch HEAD가 마지막 확인 원격 head의 후속이 아닙니다.")
-    for ancestor, label in ((accepted, "마지막 확인 head"),
-                            (str(row["published_oid"]), "게시 checkpoint"),
-                            (snapshot.head, "로컬 HEAD")):
+        acceptance = (current.snapshot or {}).get('current_rebase_acceptance') or {}
+        if (current.operation is not None or current.expected_head != original_head
+                or not managed_rebase_validation.valid_acceptance(acceptance)
+                or any(acceptance[key] != value for key, value in (
+                    ('repo', repo), ('plan_id', str(blocked['plan_id'])),
+                    ('branch', branch), ('worktree', str(_canonical_path(worktree))),
+                    ('head', original_head)))
+                or acceptance['remote']['oid'] != accepted):
+            return refuse('로컬 branch 계보와 현재 Manager rebase 반영 근거를 증명할 수 없습니다.')
+        try:
+            _, decision = effects._current_rebase_service(
+                connection, repo_path, state_dir, repo, str(blocked['plan_id']),
+                worktree, branch, remote_oid=observed).require_owned(checkpoint=current)
+            if decision.status.value != 'complete':
+                return retry('이전 Manager rebase의 현재 완료를 먼저 확인해야 합니다.')
+        except (OSError, RuntimeError, ValueError) as error:
+            return refuse(str(error))
+    ancestors = [(accepted, '마지막 확인 head'), (str(row['published_oid']), '게시 checkpoint')]
+    if integration and integrating:
+        ancestors.append((str(integration['remote']), '진행 중인 원격 입력'))
+    if integrating:
+        saved = current.snapshot or {}
+        base_restart = saved.get('base_rebase_restart') or {}
+        for ancestor, label in (
+                ((saved.get('remote_adoption_intent') or {}).get('head'), '진행 중인 채택 입력'),
+                (((integration or {}).get('restart') or {}).get('remote'), '작업 branch 충돌 재시작 입력'),
+                (base_restart.get('remote') if base_restart.get('phase') != 'complete' else None,
+                 'base 충돌 재시작 입력')):
+            if ancestor:
+                ancestors.append((ancestor, label))
+    for ancestor, label in ancestors:
         relation = effects.git(
             repo_path, "merge-base", "--is-ancestor", ancestor, observed,
             check=False,
@@ -274,14 +350,11 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
         sources = tuple(str(source) for source in json.loads(str(blocked["sources"])))
     except (TypeError, ValueError):
         return refuse("ExecPlan source 목록을 검증할 수 없습니다.")
-    archives = tuple(source for source in sources if source.startswith("docs/requirements/")
-                     and "/archive/" not in source)
-    guidance = adapter._approved_guidance_targets(request)
-    common_plans = effects._published_plan_allows_common_plans(repo_path, blocked)
     for path in changed_paths:
-        if not _worker_path_allowed(path, str(blocked["path"]), archives,
-                                    guidance, common_plans):
-            return refuse(f"원격 checkpoint 변경 범위 위반: {path}")
+        # Remote successor commits are user input, not Worker output. File
+        # safety and current ExecPlan identity remain independent gates.
+        if not _safe_path(path):
+            return refuse(f'원격 checkpoint의 경로가 안전하지 않습니다: {path}')
         entry = effects.git(repo_path, "ls-tree", observed, "--", path).stdout
         if entry and not entry.startswith("100644 ") and not entry.startswith("100755 "):
             return refuse(f"원격 checkpoint에 symlink 또는 특수 파일이 있습니다: {path}")
@@ -312,17 +385,30 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
             )
         except (OSError, RuntimeError, ValueError) as error:
             return refuse(str(error))
+    if not integrating:
+        try:
+            effects.validate_blocked_agent_scope(
+                connection, repo_path, repo,
+                connection.execute('SELECT base_branch FROM projects WHERE repo = ?', (repo,)).fetchone()[0],
+                worktree, str(blocked['path']), saved_plan=blocked, require_safe_result=True)
+        except (OSError, RuntimeError, ValueError) as error:
+            return refuse(str(error))
     if adopt_only:
         checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
         current = checkpoints.get(repo, str(blocked['plan_id']))
         pending_scope = (current.snapshot or {}).get('remote_adoption_intent')
         if pending_scope is None:
+            saved_agent = (GitSnapshot.deserialize(str(blocked['agent_snapshot']))
+                           if blocked['agent_snapshot'] else None)
+            comparison_snapshot = replace(
+                snapshot, scope_id=saved_agent.scope_id if saved_agent else None,
+                scope_start_digest=saved_agent.scope_start_digest if saved_agent else None)
             pending_scope = {
                 'head': observed, 'branch': branch, 'worktree': str(worktree),
                 'request_identity': request.request_identity,
                 'agent_snapshot': blocked['agent_snapshot'],
                 'agent_result_snapshot': blocked['agent_result_snapshot'],
-                'snapshot': snapshot.serialize(),
+                'snapshot': comparison_snapshot.serialize(),
             }
             with runtime_state._transaction(connection):
                 checkpoints.record(
@@ -331,18 +417,62 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
                     target_base_oid=current.target_base_oid,
                     observed_remote_oid=current.observed_remote_oid,
                     snapshot={**(current.snapshot or {}), 'remote_adoption_intent': pending_scope})
+        elif (integrating
+              and (pending_scope['branch'], pending_scope['worktree'], pending_scope['request_identity'])
+              == (branch, str(worktree), request.request_identity)):
+            # Every saved input, including this pending head and a restart
+            # target, was verified above as an ancestor of the exact fetch.
+            pending_scope = {**pending_scope, 'head': observed}
+            checkpoints.record(
+                repo, str(blocked['plan_id']), expected_generation=current.generation,
+                operation=current.operation, expected_head=current.expected_head,
+                target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+                snapshot={**(current.snapshot or {}), 'remote_adoption_intent': pending_scope})
         elif (pending_scope['head'], pending_scope['branch'], pending_scope['worktree'],
               pending_scope['request_identity']) != (observed, branch, str(worktree), request.request_identity):
             return refuse('저장된 원격 채택 intent와 현재 요청이 다릅니다.')
+    if base_restarting:
+        try:
+            work_branch_integration.restart_base_rebase(
+                effects, connection, repo_path, state_dir, repo, blocked, observed, snapshot)
+        except (OSError, RuntimeError, ValueError) as error:
+            return retry(str(error))
+        # The pending adoption identity survives either abort or completion,
+        # including interruption before the successor is actually integrated.
+        return _reconcile_published_blocked_checkpoint(
+            effects, connection, repo_path, state_dir, repo, blocked,
+            connection.execute('SELECT * FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?',
+                               (repo, blocked['plan_id'])).fetchone(),
+            request, repository, config_path, verify_timeout_seconds,
+            adopt_only=adopt_only, expected_remote_oid=expected_remote_oid,
+            project_recovery_context=project_recovery_context)
+    current = checkpoints.get(repo, str(blocked['plan_id']))
+    checkpoints.record(
+        repo, str(blocked['plan_id']), expected_generation=current.generation,
+        operation=current.operation, expected_head=current.expected_head,
+        target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+        snapshot={**(current.snapshot or {}), 'remote_user_input': observed})
     repository.start_remote_adoption(request, observed)
-    if snapshot.head != observed:
+    relation = effects.git(repo_path, 'merge-base', '--is-ancestor',
+                           snapshot.head, observed, check=False).returncode
+    if relation not in {0, 1}:
+        return retry('작업 branch의 로컬·원격 관계를 확인할 수 없습니다.')
+    combined = integrating or bool(snapshot.dirty) or relation == 1
+    if combined:
+        try:
+            snapshot = work_branch_integration.integrate(
+                effects, connection, repo_path, state_dir, repo, blocked, observed, snapshot)
+        except (OSError, RuntimeError, ValueError) as error:
+            return retry(str(error))
+    elif snapshot.head != observed:
         advanced = effects.git(
             worktree, "-c", "core.hooksPath=/dev/null",
             "merge", "--ff-only", "--no-edit", observed, check=False,
         )
         if advanced.returncode:
             return retry("로컬 checkpoint fast-forward 실패: " + advanced.stdout[-2000:])
-    if effects.git(worktree, "rev-parse", "HEAD^{commit}").stdout.strip() != observed:
+    adopted_head = effects.git(worktree, "rev-parse", "HEAD^{commit}").stdout.strip()
+    if not combined and adopted_head != observed:
         return refuse("fast-forward 뒤 관리 worktree HEAD가 원격 후보와 다릅니다.")
     adopted_snapshot = effects.capture_git_snapshot(worktree)
     input_identity = effects._remote_checkpoint_input_identity(
@@ -351,33 +481,57 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
     if adopt_only:
         scope_snapshot = managed_rebase_adoption.selected_baseline(
             GitSnapshot.deserialize(pending_scope['snapshot']), adopted_snapshot,
-            branch, str(_canonical_path(worktree)))
+            branch, str(_canonical_path(worktree)),
+            publication=checkpoints.get(repo, str(blocked['plan_id'])))
         remote_ref = f'refs/remotes/origin/{branch}'
         if adopted_snapshot.refs.get(remote_ref) == (observed, ''):
             scope_snapshot = replace(scope_snapshot, refs={
                 **scope_snapshot.refs, remote_ref: (observed, '')})
         with runtime_state._transaction(connection):
+            resources = used_git_resources(
+                role='worker', phase='PLAN_BLOCKED',
+                base_branch=connection.execute('SELECT base_branch FROM projects WHERE repo = ?', (repo,)).fetchone()[0],
+                branch=branch, worktree_key=str(_canonical_path(worktree)))
+            current_snapshot = effects.capture_git_snapshot(worktree)
+            before_commit, at_commit = scoped_metadata(adopted_snapshot, current_snapshot, resources)
+            if (before_commit != at_commit
+                    or adapter.observe_remote(request) != observed):
+                return retry('원격 채택 확정 전 선택 후보·사용 자원 또는 원격 lease가 변경됐습니다.')
+            selected = connection.execute(
+                'SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?', (repo, blocked['plan_id'])).fetchone()
+            if selected is None or any(selected[field] != blocked[field] for field in (
+                    *blocked_plan_reconciliation.IDENTITY_FIELDS, 'status', 'blocked_reason',
+                    'agent_snapshot', 'agent_result_snapshot')):
+                return retry('원격 채택 확정 전 계획 소유권 또는 차단 원인이 변경됐습니다.')
             repository.record_remote_inspection(
                 request, observed, input_identity,
                 "원격 후속 commit 채택 완료; base 반영 뒤 원래 차단 원인을 검사합니다.",
                 commit=False,
             )
             connection.execute(
-                "UPDATE exec_plans SET publication_remote_oid = ? WHERE repo = ? AND plan_id = ?",
+                "UPDATE exec_plans SET publication_remote_oid = ?, validated_base_sha = NULL, "
+                "worker_input_token = NULL, archive_token = NULL, verify_token = NULL, "
+                "review_token = NULL, publication_token = NULL WHERE repo = ? AND plan_id = ?",
                 (observed, repo, blocked['plan_id']),
             )
+            projected = runtime_state.RuntimeStateRepository(connection).projected_row(repo)
+            if projected is not None and projected['plan_id'] == blocked['plan_id']:
+                connection.execute(
+                    'UPDATE projects SET publication_remote_oid = ?, validated_base_sha = NULL, '
+                    'worker_input_token = NULL, archive_token = NULL, verify_token = NULL, '
+                    'review_token = NULL, publication_token = NULL WHERE repo = ?', (observed, repo))
             checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
             current = checkpoints.get(repo, str(blocked['plan_id']))
             if current.operation is not None:
                 raise RuntimeError("원격 후속 commit 채택 중 다른 Git intent가 생겼습니다.")
             checkpoints.record(
                 repo, str(blocked['plan_id']), expected_generation=current.generation,
-                operation=None, expected_head=observed,
+                operation=None, expected_head=adopted_head,
                 target_base_oid=current.target_base_oid, observed_remote_oid=observed,
                 snapshot={**(current.snapshot or {}), 'last_adopted_remote_oid': observed,
                           'remote_adoption_intent': None,
                           'remote_adoption_scope': {
-                              'head': observed, 'branch': branch, 'worktree': str(worktree),
+                              'head': adopted_head, 'remote': observed, 'branch': branch, 'worktree': str(worktree),
                               'agent_snapshot': blocked['agent_snapshot'],
                               'agent_result_snapshot': blocked['agent_result_snapshot'],
                               'snapshot': scope_snapshot.serialize(),

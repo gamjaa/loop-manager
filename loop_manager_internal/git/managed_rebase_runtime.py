@@ -13,6 +13,9 @@ from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseServi
 from loop_manager_internal.git.managed_rebase_observation import ObservationAdapters
 from loop_manager_internal.git.managed_rebase_validation import RebaseExpectation, Remote, PullRequest, fingerprint
 from loop_manager_internal.git.manager_git_journal import MutationEvidenceError
+from loop_manager_internal.recovery.work_branch_integration import user_changes, matching_user_paths
+from loop_manager_internal.agents.agent_scope_decision import _worker_path_allowed
+from dataclasses import replace
 
 
 @dataclass(frozen=True)
@@ -211,7 +214,18 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
             guidance_signature = ports._path_signature(worktree, 'AGENTS.md')
             guidance_content = actual[0]
 
+    integration = saved.get('work_branch_integration') or {}
+    user_sources = [source for item in [*saved.get('work_branch_integration_history', ()), integration]
+                    for source in (item.get('remote'), item.get('local_commit'))]
+    adopted = saved.get('remote_adoption_scope') or {}
+    user_sources.extend((adopted.get('remote', adopted.get('head')), saved.get('remote_user_input')))
+    user_blobs = user_changes(ports.git, worktree, target, user_sources)
+
     def contracts(observed):
+        approved = matching_user_paths(observed, user_blobs)
+        observed = replace(observed,
+            committed=tuple(change for change in observed.committed if change.path not in approved),
+            staged=tuple(change for change in observed.staged if change.path not in approved))
         protected = {change.path for change in (*observed.committed, *observed.staged)}
         protected.update(file.path for file in observed.files)
         if any(path.startswith('docs/requirements/') for path in protected):
@@ -238,12 +252,41 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
                                       for file in observed.files if file.path == 'AGENTS.md')
         return True
 
+    # assess_scope's path callback has no blob argument. Check protected paths
+    # in contracts using the complete observation instead of granting a blanket
+    # path exemption to a later Agent invocation.
+    worker_allowed = lambda path: ports._worker_path_allowed(
+        path, expected.plan_path, archives, guidance, common)
+    checked_contracts = contracts
+    def scoped_contracts(observed):
+        # Conflict bytes are preservation input, never a final approval. Only
+        # recorded user paths in this exact owned operation may bypass Worker
+        # document contracts while their nonzero index stages remain. The
+        # outer policy still checks identity, lease, modes, stages and ownership.
+        metadata = dict(observed.metadata or ())
+        if (checkpoint.operation == 'rebase' and expected.before_head
+                and metadata.get('head-name') == f'refs/heads/{branch}'
+                and metadata.get('orig-head') == expected.before_head
+                and metadata.get('onto') == expected.target_base_oid):
+            conflicts = {entry.path for entry in observed.index
+                         if entry.stage and entry.path in user_blobs}
+            observed = replace(observed,
+                committed=tuple(change for change in observed.committed if change.path not in conflicts),
+                staged=tuple(change for change in observed.staged if change.path not in conflicts),
+                files=tuple(file for file in observed.files if file.path not in conflicts),
+                index=tuple(entry for entry in observed.index if entry.path not in conflicts))
+        approved = matching_user_paths(observed, user_blobs)
+        paths = {change.path for change in (*observed.committed, *observed.staged)}
+        paths.update(file.path for file in observed.files)
+        paths.update(entry.path for entry in observed.index if entry.stage)
+        return all(_worker_path_allowed(path, expected.plan_path, archives, guidance, common)
+                   or path in approved for path in paths) and checked_contracts(observed)
+
     return ManagedRebaseService(expected, ObservationAdapters(
         git=ports.git, capture_snapshot=ports.capture_git_snapshot,
         validate_identity=validate_identity, read_rebase_metadata=ports._owned_rebase_metadata,
         read_remote=read_remote, read_inputs=lambda _: current_contract()[-2:],
         read_file=read_file,
-        path_allowed=lambda path: ports._worker_path_allowed(
-            path, expected.plan_path, archives, guidance, common),
-        contracts_allowed=contracts,
+        path_allowed=lambda path: worker_allowed(path) or path in user_blobs,
+        contracts_allowed=scoped_contracts,
     ))

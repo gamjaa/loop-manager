@@ -303,8 +303,10 @@ class CaptureAgentBaselineEffects:
     _scope_baseline_effects: Callable[..., object]
 
 
-def _capture_agent_baseline(effects: CaptureAgentBaselineEffects, repo: str, worktree: Path, snapshot: GitSnapshot) -> str | None:
-    return scope_baseline._capture_agent_baseline(repo, worktree, snapshot, effects=effects._scope_baseline_effects())
+def _capture_agent_baseline(effects: CaptureAgentBaselineEffects, repo: str, worktree: Path, snapshot: GitSnapshot,
+                            *, preserve_conflicts: bool = False) -> str | None:
+    return scope_baseline._capture_agent_baseline(repo, worktree, snapshot, effects=effects._scope_baseline_effects(),
+                                                preserve_conflicts=preserve_conflicts)
 
 
 @dataclass(frozen=True)

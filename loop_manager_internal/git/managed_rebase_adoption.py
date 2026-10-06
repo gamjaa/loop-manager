@@ -95,6 +95,11 @@ def selected_baseline(snapshot, current, branch, worktree, *, publication=None):
     ref = f'refs/heads/{branch}'
     refs[ref] = current.refs[ref]
     if publication is not None:
+        from loop_manager_internal.recovery.work_branch_integration import preserved_refs
+        repo = (publication.snapshot or {}).get('integration_repo')
+        if repo:
+            for name in preserved_refs(repo, publication.snapshot or {}, current.refs):
+                refs[name] = current.refs[name]
         intent = publication.rebase_publication_intent()
         result = (publication.snapshot or {}).get('rebase_publication_result') or {}
         pending = publication.operation == 'rebase_publish'

@@ -792,6 +792,11 @@ _project_blocked_recovery_effects = _bind_effects(
 
 _checkpoint_recovery_effects_reconcile_published_blocked_checkpoint = _bind_effects(
     recovery_adapter._checkpoint_recovery_effects_reconcile_published_blocked_checkpoint, lambda: recovery_adapter.CheckpointRecoveryEffectsReconcilePublishedBlockedCheckpointEffects(
+        _capture_agent_baseline=lambda *args, **kwargs: _capture_agent_baseline(*args, **kwargs),
+        _git_with_index=lambda *args, **kwargs: _git_with_index(*args, **kwargs),
+        _commit_tree=lambda *args, **kwargs: _commit_tree(*args, **kwargs),
+        _journaled_direct_rebase=lambda *args, **kwargs: _journaled_direct_rebase(*args, **kwargs),
+        validate_blocked_agent_scope=lambda *args, **kwargs: validate_blocked_agent_scope(*args, **kwargs),
         _BlockedCheckpointAdapter=lambda *args, **kwargs: _BlockedCheckpointAdapter(*args, **kwargs),
         _blocked_execplan_revision_metadata_error=lambda *args, **kwargs: _blocked_execplan_revision_metadata_error(*args, **kwargs),
         _current_rebase_service=lambda *args, **kwargs: _current_rebase_service(*args, **kwargs),
