@@ -75,11 +75,11 @@ def _advance_maintenance_cycle_after_merges(
         maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
     }) and cycle.publication_stage in (None, "remote_confirmed"):
         scope = cycle_scope_plan_ids(rows, cycle)
-        if catalog_held_plan_ids(connection, repo).intersection(scope):
-            return cycle
-        if effects.all_cycle_plans_merged(rows, scope):
+        if (not catalog_held_plan_ids(connection, repo).intersection(scope)
+                and effects.all_cycle_plans_merged(rows, scope)):
             return repository.finish_cycle(repo, expected=cycle, source_sha=base_sha)
         if legacy_prerequisites:
+            # A hold delays confirmed work; it must not reopen its assessment.
             return repository.transition(repo, expected_phase=cycle.phase, expected_revision=cycle.revision,
                 next_phase=maintenance_state.MaintenancePhase.PREREQUISITE_WAIT, include_general_planning=False)
     return cycle

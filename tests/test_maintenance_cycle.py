@@ -957,6 +957,76 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
 
 
 class SinglePassMaintenanceCycleTest(MaintenanceCycleCase):
+    def test_legacy_prerequisite_hold_waits_without_reassessment_after_restart(self):
+        from tests.support.planning_case import FakePorts, planning_snapshot
+        for status in ("READY", "MERGED"):
+            for held_id in ("G-001", "G-002"):
+                with self.subTest(status=status, held_id=held_id):
+                    self.connection.execute("DELETE FROM maintenance_cycles")
+                    self.connection.execute("DELETE FROM exec_plans")
+                    self.connection.execute("DELETE FROM execplan_catalog_holds")
+                    dependency_status = "MERGED" if held_id == "G-002" else status
+                    self._insert_plan(self.connection, "/one", "G-001", status=dependency_status)
+                    self._insert_plan(self.connection, "/one", "G-002", status=status, depends_on=("G-001",))
+                    self._insert_plan(self.connection, "/one", "G-099", priority="critical")
+                    self._legacy_cycle(self.connection, "/one", self.source, include_general_planning=True)
+                    self.connection.execute("UPDATE maintenance_cycles SET prerequisite_plan_ids = '[\"G-002\"]', "
+                        "full_assessment_completed = 1, full_assessment_source_sha = ?, full_assessment_result = ?",
+                        (self.source, '{"evidence":"saved"}'))
+                    original = self.repository.get("/one")
+                    self.assertIsNone(original.cycle_id)
+                    self.connection.execute("INSERT INTO execplan_catalog_holds VALUES ('/one', ?, ?, '{}', NULL)",
+                        (held_id, self.latest))
+                    self.catalog()
+                    self.connection.commit()
+                    context = planning_runtime.PlanningContext(
+                        repo="/one", repo_path=Path("/one"), state_dir=Path("/state"),
+                        base_branch="main", base_sha=self.latest, provider="codex",
+                        config_path=Path("/config.ini"), registered_only=True,
+                        refactoring_review_interval=20)
+                    connection = self.connection
+                    for restart in (False, True):
+                        if restart:
+                            connection = sqlite3.connect(":memory:")
+                            connection.row_factory = sqlite3.Row
+                            self.addCleanup(connection.close)
+                            self.connection.backup(connection)
+                        repository = maintenance_state.MaintenanceRepository(connection)
+                        ports = FakePorts(planning_snapshot(repo="/one"), repository.get("/one"))
+                        ports.state.maintenance_cycle = repository.get
+                        ports.state.advance_maintenance_cycle = lambda repo, sha: loop_manager._advance_maintenance_cycle_after_merges(connection, repo, sha)
+                        ports.state.schedule = lambda repo: loop_manager.catalog_schedule_decision(connection, repo)
+                        ports.state.execplan_rows = repository.plan_rows
+                        ports.state.activate_ready = mock.Mock(side_effect=ports.state.activate_ready)
+                        outcome = planning_runtime.PlanningLifecycleCoordinator(ports).run(context)
+                        self.assertEqual(outcome.kind, planning_runtime.PlanningOutcomeKind.WAITING)
+                        self.assertEqual(ports.agent.run_count, 0)
+                        self.assertEqual(ports.state.maintenance_begin_count, 0)
+                        self.assertEqual(ports.state.updates, [])
+                        ports.state.activate_ready.assert_not_called()
+                        waiting = repository.get("/one")
+                        self.assertEqual(waiting.phase, maintenance_state.MaintenancePhase.PREREQUISITE_WAIT)
+                        self.assertEqual(waiting.revision, original.revision + 1)
+                        self.assertEqual(waiting.prerequisite_plan_ids, original.prerequisite_plan_ids)
+                        self.assertEqual(waiting.full_assessment_result, original.full_assessment_result)
+                        self.assertEqual(waiting.full_assessment_source_sha, original.full_assessment_source_sha)
+                        self.assertEqual(waiting.last_success_commit, original.last_success_commit)
+                        self.assertIsNone(waiting.last_cycle_commit)
+                        self.assertIsNone(waiting.last_cycle_merged_count)
+                        self.assertFalse(waiting.include_general_planning)
+                        self.assertTrue(any("dependency" in message for _level, message in ports.events.messages))
+                    connection.execute("DELETE FROM execplan_catalog_holds")
+                    connection.commit()
+                    resumed = loop_manager._advance_maintenance_cycle_after_merges(connection, "/one", self.latest)
+                    selected = loop_manager.catalog_schedule_decision(connection, "/one").runnable_ready
+                    if status == "READY":
+                        self.assertEqual(resumed, waiting)
+                        self.assertEqual(selected["plan_id"], "G-002" if dependency_status == "MERGED" else "G-001")
+                    else:
+                        self.assertEqual(resumed.phase, maintenance_state.MaintenancePhase.IDLE)
+                        self.assertEqual(resumed.last_cycle_merged_count, 2)
+                        self.assertEqual(selected["plan_id"], "G-099")
+
     def test_catalog_hold_keeps_merged_scope_waiting_until_catalog_is_resolved(self):
         self._insert_plan(self.connection, "/one", "G-001", status="MERGED")
         cycle = self.start(maintenance_state.MaintenancePhase.REFACTORING, ("G-001",))
