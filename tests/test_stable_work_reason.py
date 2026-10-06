@@ -31,8 +31,8 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
         loop_manager.maintenance_state.ensure_schema(connection)
         connection.execute(
             "INSERT INTO maintenance_cycles "
-            "(repo, last_success_merged_count, file_assessment_start_merged_count) "
-            "VALUES (?, 0, 0)", (repo,),
+            "(repo, last_cycle_commit, last_cycle_merged_count, file_assessment_start_merged_count) "
+            "VALUES (?, 'completed-cycle', 0, 0)", (repo,),
         )
         planning_input_state.record_general(connection, repo, "base-sha", {})
         connection.commit()

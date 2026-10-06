@@ -157,17 +157,22 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         "file_assessment_start_merged_count": "INTEGER",
         "last_success_file_assessment_merged_count": "INTEGER",
     }
-    for column, definition in migrations.items():
-        if column not in columns:
-            connection.execute(
-                f"ALTER TABLE maintenance_cycles ADD COLUMN {column} {definition}"
-            )
-    connection.execute(
-        "UPDATE maintenance_cycles SET last_cycle_commit = last_success_commit, "
-        "last_cycle_merged_count = last_success_merged_count WHERE phase = 'idle' "
-        "AND publication_stage IS NULL AND last_cycle_merged_count IS NULL "
-        "AND last_success_commit IS NOT NULL AND last_success_merged_count >= 0"
-    )
+    pending_columns = [(column, definition) for column, definition in migrations.items() if column not in columns]
+    if pending_columns:
+        with _transaction(connection):
+            for column, definition in pending_columns:
+                connection.execute(
+                    f"ALTER TABLE maintenance_cycles ADD COLUMN {column} {definition}"
+                )
+            if "last_cycle_merged_count" not in columns:
+                # Backfill once with its schema migration; initialized reads
+                # must not acquire a write lock or leave an implicit transaction.
+                connection.execute(
+                    "UPDATE maintenance_cycles SET last_cycle_commit = last_success_commit, "
+                    "last_cycle_merged_count = last_success_merged_count WHERE phase = 'idle' "
+                    "AND publication_stage IS NULL AND last_cycle_merged_count IS NULL "
+                    "AND last_success_commit IS NOT NULL AND last_success_merged_count >= 0"
+                )
     draft_columns = {
         str(row[1]) for row in connection.execute("PRAGMA table_info(document_drafts)")
     }

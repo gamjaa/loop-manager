@@ -1070,9 +1070,13 @@ class SinglePassMaintenanceCycleTest(MaintenanceCycleCase):
         self.assertEqual(self.repository.file_assessment_due("/one", 20).reason, "requested_full")
 
     def test_legacy_idle_boundary_migrates_without_rewriting_assessment_source(self):
+        self.connection.execute("ALTER TABLE maintenance_cycles DROP COLUMN last_cycle_merged_count")
+        self.connection.execute("ALTER TABLE maintenance_cycles DROP COLUMN last_cycle_commit")
         self._insert_plan(self.connection, "/one", "G-001", status="MERGED")
         self.connection.execute("INSERT INTO maintenance_cycles (repo, last_success_commit, last_success_merged_count) VALUES ('/one', ?, 1)", (self.source,))
+        self.connection.commit()
         restarted = maintenance_state.MaintenanceRepository(self.connection)
+        self.assertFalse(self.connection.in_transaction)
         self.assertEqual(restarted.get("/one").last_cycle_commit, self.source)
         self.assertFalse(restarted.file_assessment_due("/one", 20).required)
         self.assertEqual(restarted.get("/one").last_success_commit, self.source)

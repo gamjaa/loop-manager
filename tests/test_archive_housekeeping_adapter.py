@@ -88,7 +88,7 @@ class ExecPlanArchiveHousekeepingAdapterTest(unittest.TestCase):
                 refactoring_review_interval=5,
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             loop_manager._execplan_archive_housekeeping_safe(
                 connection,
                 "/repo",

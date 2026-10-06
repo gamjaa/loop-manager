@@ -574,6 +574,47 @@ class MaintenanceTransactionTest(unittest.TestCase):
 
 
 class MaintenanceStateRepositoryTest(unittest.TestCase):
+    def test_completion_boundary_migration_rolls_back_columns_and_can_resume(self):
+        connection = self._connection()
+        maintenance_state.ensure_schema(connection)
+        connection.execute("ALTER TABLE maintenance_cycles DROP COLUMN last_cycle_merged_count")
+        connection.execute("ALTER TABLE maintenance_cycles DROP COLUMN last_cycle_commit")
+        source = "a" * 40
+        connection.execute("INSERT INTO maintenance_cycles (repo, last_success_commit, last_success_merged_count) VALUES ('one', ?, 0)", (source,))
+        connection.execute("CREATE TRIGGER fail_migration BEFORE UPDATE ON maintenance_cycles BEGIN SELECT RAISE(ABORT, 'interrupted'); END")
+        connection.commit()
+        with self.assertRaises(sqlite3.IntegrityError):
+            maintenance_state.MaintenanceRepository(connection)
+        self.assertNotIn("last_cycle_merged_count", {row[1] for row in connection.execute("PRAGMA table_info(maintenance_cycles)")})
+        self.assertEqual(connection.execute("SELECT last_success_commit FROM maintenance_cycles").fetchone()[0], source)
+        self.assertFalse(connection.in_transaction)
+        connection.execute("DROP TRIGGER fail_migration")
+        restarted = maintenance_state.MaintenanceRepository(connection)
+        self.assertEqual(restarted.get("one").last_cycle_commit, source)
+        self.assertEqual(restarted.get("one").last_cycle_merged_count, 0)
+        self.assertFalse(connection.in_transaction)
+
+    def test_initialized_repository_reads_do_not_write_or_hold_a_backup_transaction(self):
+        connection = self._connection()
+        maintenance_state.ensure_schema(connection)
+        connection.execute("INSERT INTO maintenance_cycles (repo, last_success_merged_count) VALUES ('one', 0)")
+        connection.commit()
+        statements = []
+        connection.set_trace_callback(statements.append)
+        for _ in range(2):
+            repository = maintenance_state.MaintenanceRepository(connection)
+            self.assertIsNone(repository.get("one").last_cycle_merged_count)
+            self.assertEqual(repository.merged_count("one"), 0)
+            with self.assertRaises(maintenance_state.MaintenanceStateError):
+                repository.file_assessment_due("one", 20)
+            self.assertFalse(connection.in_transaction)
+        self.assertFalse(any(sql.lstrip().upper().startswith(("UPDATE", "INSERT", "DELETE"))
+                             for sql in statements), statements)
+        with closing(sqlite3.connect(":memory:")) as restarted:
+            connection.backup(restarted)
+            self.assertIsNone(restarted.execute(
+                "SELECT last_cycle_merged_count FROM maintenance_cycles WHERE repo = 'one'").fetchone()[0])
+
     @staticmethod
     def _start_legacy_assessment(connection, repo, source_sha):
         maintenance_state.ensure_schema(connection)
