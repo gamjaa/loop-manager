@@ -3965,28 +3965,30 @@ dispatch_blocked_checkpoints = _bind_effects(
 )
 
 
-def _diagnostic_preservation_effects():
-    return diagnostic_preservation.PreservationEffects(
+_diagnostic_preservation_effects = lambda: diagnostic_preservation.PreservationEffects(
         git=lambda *args, **kwargs: git(*args, **kwargs),
         git_bytes=lambda *args, **kwargs: git_bytes(*args, **kwargs),
         push_diagnostic_checkpoint=lambda *args, **kwargs: push_diagnostic_checkpoint(*args, **kwargs))
 
 
-def preserve_blocked_diagnostics(connection, repo_path, state_dir, request, *, project_scope=False):
-    return checkpoint_service.preserve_blocked_diagnostics(
-        _diagnostic_preservation_effects(), _BlockedCheckpointAdapter,
-        connection, repo_path, state_dir, request, project_scope=project_scope)
+preserve_blocked_diagnostics = _bind_effects(
+    checkpoint_service.preserve_blocked_diagnostics,
+    lambda: checkpoint_service.PreserveBlockedDiagnosticsEffects(
+        preservation_effects=lambda: _diagnostic_preservation_effects(),
+        adapter_factory=lambda *args, **kwargs: _BlockedCheckpointAdapter(*args, **kwargs)),
+)
 
 
-def preserve_remote_planning_diagnostics(connection, state_dir, repo, snapshot):
-    effects = diagnostics.RemotePlanningDiagnosticsEffects(
-        preservation_effects=_diagnostic_preservation_effects,
-        adapter_factory=_BlockedCheckpointAdapter,
+preserve_remote_planning_diagnostics = _bind_effects(
+    diagnostics.preserve_remote_planning_diagnostics,
+    lambda: diagnostics.RemotePlanningDiagnosticsEffects(
+        preservation_effects=lambda: _diagnostic_preservation_effects(),
+        adapter_factory=lambda *args, **kwargs: _BlockedCheckpointAdapter(*args, **kwargs),
         capture_git_snapshot=lambda *args, **kwargs: capture_git_snapshot(*args, **kwargs),
         validate_planning_workspace_identity=lambda *args, **kwargs: validate_planning_workspace_identity(*args, **kwargs),
         validate_managed_worktree=lambda *args, **kwargs: validate_managed_worktree(*args, **kwargs),
-        git=lambda *args, **kwargs: git(*args, **kwargs))
-    return diagnostics.preserve_remote_planning_diagnostics(effects, connection, state_dir, repo, snapshot)
+        git=lambda *args, **kwargs: git(*args, **kwargs)),
+)
 
 _execution_outcome_step_result = checkpoint_service._execution_outcome_step_result
 

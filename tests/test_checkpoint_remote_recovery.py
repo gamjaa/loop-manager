@@ -102,7 +102,7 @@ class ProjectCheckpointGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.T
         self.assertEqual(scoped_blocking.plan_block(self.connection, repo, 'G-034')['reason_code'], 'verify_retry_exhausted')
 
 
-    def test_project_rebase_conflict_preserves_worktree_without_checkpoint_push(self):
+    def test_project_rebase_conflict_preserves_original_index_and_publishes_artifacts(self):
         repo, original, coordinator = self._project_block_fixture(advance=False)
         # Advance the same path so the owned rebase conflicts after preserving
         # the local artifact in a checkpoint commit.
@@ -112,12 +112,36 @@ class ProjectCheckpointGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.T
         self.run_git(self.repo, 'push', 'origin', 'main')
         loop_manager.observe_blocked_plan_remotes(self.connection, self.repo, repo,
                                                 self.connection.execute('SELECT * FROM projects').fetchone())
-        with mock.patch.object(loop_manager, 'push_diagnostic_checkpoint', side_effect=AssertionError('conflict push')):
+        preserve = loop_manager.preserve_blocked_diagnostics
+        originals = []
+        def observe_preservation(*args, **kwargs):
+            before = loop_manager.capture_git_snapshot(self.worktree).serialize()
+            originals.append(before)
+            result = preserve(*args, **kwargs)
+            self.assertEqual(loop_manager.capture_git_snapshot(self.worktree).serialize(), before)
+            return result
+        with mock.patch.object(loop_manager, 'preserve_blocked_diagnostics', side_effect=observe_preservation):
             self.assertEqual(coordinator.reconcile('G-034'), 'blocked')
         result = json.loads(self.connection.execute('SELECT payload FROM project_checkpoint_results').fetchone()[0])
         self.assertEqual(result['result'], 'local_only')
         self.assertTrue(self.run_git(self.worktree, 'ls-files', '-u'))
         self.assertEqual(self.run_git(self.remote, 'rev-parse', 'refs/heads/loop-manager/G-034'), original)
+        self.assertEqual(len(originals), 1)
+        receipt = json.loads(self.connection.execute(
+            "SELECT payload FROM diagnostic_preservations WHERE scope = 'project' "
+            "ORDER BY observed_order DESC LIMIT 1").fetchone()[0])
+        self.assertEqual(receipt['result'], 'published', receipt)
+        self.assertEqual(self.run_git(self.remote, 'rev-parse', f"refs/heads/{receipt['branch']}"), receipt['commit_oid'])
+        manifest = json.loads(self.run_git(self.worktree, 'show', f"{receipt['commit_oid']}:manifest.json"))
+        self.assertEqual(set(manifest['files']['code.py']['index']), {'1', '2', '3'})
+        manual = manifest['files']['code.py']['worktree']['blob']
+        preserved = subprocess.run(
+            ['git', '-C', str(self.worktree), 'show', f"{receipt['commit_oid']}:blobs/{manual}"],
+            check=True, stdout=subprocess.PIPE).stdout
+        self.assertEqual(preserved, (self.worktree / 'code.py').read_bytes())
+        with mock.patch.object(loop_manager, 'push_diagnostic_checkpoint', side_effect=AssertionError('duplicate push')):
+            self.assertEqual(coordinator.reconcile('G-034'), 'blocked')
+        self.assertEqual(scoped_blocking.project_block(self.connection, repo)['evidence'], 'preserved project cause')
 
 
 class CheckpointRebaseGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.TestCase):

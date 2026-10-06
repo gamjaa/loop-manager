@@ -110,7 +110,7 @@ class RemotePlanningDiagnosticsEffects:
     git: Callable
 
 
-def preserve_remote_planning_diagnostics(effects, connection, state_dir, repo, expected):
+def preserve_remote_planning_diagnostics(effects: RemotePlanningDiagnosticsEffects, connection, state_dir, repo, expected):
     """Keep failed planning material separate from the current execution owner."""
     from dataclasses import replace
     from loop_manager_internal.agents.scope_contracts import GitSnapshot

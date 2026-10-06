@@ -593,14 +593,20 @@ def dispatch_blocked_checkpoints(
     return completed
 
 
-def preserve_blocked_diagnostics(effects, adapter_factory, connection, repo_path,
+@dataclass(frozen=True)
+class PreserveBlockedDiagnosticsEffects:
+    preservation_effects: Callable
+    adapter_factory: Callable
+
+
+def preserve_blocked_diagnostics(effects: PreserveBlockedDiagnosticsEffects, connection, repo_path,
                                  state_dir, request, *, project_scope=False):
     """Preservation failure is a receipt, never a new block or an approval."""
     from loop_manager_internal.recovery import diagnostic_preservation
     project_block = scoped_blocking.project_block(connection, request.repo)
     if project_block is not None and project_block['plan_id'] == request.plan_id:
         project_scope = True
-    adapter = adapter_factory(connection, repo_path, state_dir, request.repo,
+    adapter = effects.adapter_factory(connection, repo_path, state_dir, request.repo,
                               project_recovery_scope=project_scope)
     row = connection.execute(
         'SELECT unpublished_reason FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?',
@@ -609,7 +615,7 @@ def preserve_blocked_diagnostics(effects, adapter_factory, connection, repo_path
     try:
         source = adapter.diagnostic_source(request)
         payload = diagnostic_preservation.preserve(
-            effects, connection, state_dir, source, adapter, request, original_reason)
+            effects.preservation_effects(), connection, state_dir, source, adapter, request, original_reason)
     except (OSError, RuntimeError, ValueError) as error:
         scope = 'project' if project_scope else 'plan'
         block = scoped_blocking.project_block(connection, request.repo) if project_scope else scoped_blocking.plan_block(

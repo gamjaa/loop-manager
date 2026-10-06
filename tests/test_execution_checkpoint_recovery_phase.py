@@ -208,8 +208,15 @@ class ExecutionCheckpointRecoveryPhaseTests(ExecutionRecoveryScenarios, Executio
                                  ('unpublished', 'local_only', 'unresolved rebase'))
                 self.assertEqual(connection.execute(
                     "SELECT COUNT(*) FROM notification_outbox "
-                    "WHERE repo = 'repo' AND event_type = 'blocked'"
+                    "WHERE repo = 'repo' AND event_type = 'blocked' "
+                    "AND canceled_at IS NULL"
                 ).fetchone()[0], 1)
+                # The artifact receipt replaces the initial checkpoint notice;
+                # restarting the same wait does not create further notices.
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM notification_outbox "
+                    "WHERE repo = 'repo' AND event_type = 'blocked'"
+                ).fetchone()[0], 2)
         self.assertIn('Worker decision pending', plan_file.read_text(encoding='utf-8'))
         self.effects.agent.run_agent.assert_not_called()
         self.effects.validation.verify.assert_not_called()

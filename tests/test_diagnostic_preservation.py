@@ -313,6 +313,45 @@ class PreservationBoundaryTests(unittest.TestCase):
         self.assertEqual(preserve.call_args.args[-1].plan_id, request.plan_id)
         self.assertIsNone(self.connection.execute('SELECT * FROM project_blocks').fetchone())
 
+    def test_completed_project_publication_does_not_start_a_second_diagnostic(self):
+        from loop_manager_internal.recovery import project_blocked_recovery as project
+        coordinator = project.ProjectBlockedReconciler.__new__(project.ProjectBlockedReconciler)
+        coordinator.connection = mock.Mock()
+        coordinator.connection.execute.return_value.fetchone.side_effect = [{}, {'stage': 'complete'}]
+        coordinator.repo, coordinator.repo_path, coordinator.state_dir = 'repo', Path('/repo'), Path('/state')
+        coordinator.ports = mock.Mock()
+        coordinator.ports.unmet_execplan_dependencies.return_value = False
+        coordinator._plan = mock.Mock(return_value={'plan_id': 'G-047'})
+        with (mock.patch.object(project, 'project_slot_available', return_value=True),
+              mock.patch.object(project.observations, 'pending_input', return_value=False)):
+            self.assertEqual(coordinator.reconcile('G-047'), 'blocked')
+        coordinator.ports.preserve_blocked_diagnostics.assert_not_called()
+
+    def test_unavailable_artifact_receipt_replaces_notice_once_across_retries(self):
+        from loop_manager_internal.notifications import notifications
+        notifications.configure_session(self.connection, enabled=True)
+        self.connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                                "VALUES ('repo', 'G-047', 'plan', 'managed_worktree_conflict', 'conflict')")
+        repository = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection)
+        request = repository.request(repo='repo', plan_id='G-047', reason_code='managed_worktree_conflict',
+            evidence='conflict', branch='branch', worktree='/managed', expected_remote_oid=None, rebase_recovery=False)
+        repository.finish_unpublished(request, 'unresolved rebase', retryable=False)
+        adapter = mock.Mock()
+        adapter.diagnostic_source.side_effect = RuntimeError('ownership unavailable')
+        effects = checkpoint_service.PreserveBlockedDiagnosticsEffects(mock.Mock(), mock.Mock(return_value=adapter))
+        for _ in range(3):
+            payload = checkpoint_service.preserve_blocked_diagnostics(effects, self.connection,
+                Path('/repo'), Path('/state'), request)
+            self.assertEqual(payload['result'], 'local_only')
+            self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM notification_outbox "
+                "WHERE event_type='blocked' AND canceled_at IS NULL").fetchone()[0], 1)
+            self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM notification_outbox "
+                "WHERE event_type='blocked'").fetchone()[0], 2)
+        effects.preservation_effects.assert_not_called()
+        self.assertEqual(self.connection.execute(
+            "SELECT unpublished_reason FROM blocked_checkpoints WHERE repo='repo' AND plan_id='G-047'"
+        ).fetchone()[0], 'unresolved rebase')
+
     def test_unowned_planning_is_local_only_and_cannot_clear_error_or_other_plan(self):
         self.connection.execute("UPDATE projects SET planning_error='failure', planning_error_incident_id='incident', "
                                 "planning_workspace_owned=0, worktree='/unowned', active_sha='base'")

@@ -261,9 +261,13 @@ class GuidanceCheckpointGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.
         self.assertIsNone(plan["agent_snapshot"])
         self.assertIsNone(plan["agent_result_snapshot"])
         loop_manager._block_closed_pull_request(self.connection, repo, plan, plan["pr_url"], self.base_oid)
-        with mock.patch("loop_manager.pr_for_branch") as query:
+        closed = dict(url=plan['pr_url'], headRefName=plan['branch'],
+                      headRefOid=self.base_oid, state='CLOSED', baseRefName='main')
+        with mock.patch("loop_manager.pr_for_branch", return_value=closed) as query:
             loop_manager.dispatch_blocked_checkpoints(self.connection, self.repo, self.state_dir, repo)
-        query.assert_not_called()
+        self.assertTrue(query.called)
+        self.assertTrue(all(call.args == (self.repo, plan['branch'], plan['pr_url'])
+                            for call in query.call_args_list))
         self.assertIsNone(self.connection.execute("SELECT * FROM project_blocks").fetchone())
         blocked = self.connection.execute("SELECT * FROM exec_plans").fetchone()
         self.assertEqual(blocked["status"], "PLAN_BLOCKED")

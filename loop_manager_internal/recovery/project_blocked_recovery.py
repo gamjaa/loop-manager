@@ -496,7 +496,8 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
             context.pop('waiting_input', None)
         else:
             if not observations.pending_input(row):
-                if self.ports.preserve_blocked_diagnostics is not None:
+                if (self.ports.preserve_blocked_diagnostics is not None
+                        and (saved is None or saved['stage'] != 'complete')):
                     request = BlockedCheckpointRepository(self.connection).get(self.repo, plan_id)
                     if request:
                         self.ports.preserve_blocked_diagnostics(self.connection, self.repo_path, self.state_dir, request, project_scope=True)
