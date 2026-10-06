@@ -219,6 +219,7 @@ class PlannerValidationRecoveryTest(unittest.TestCase):
             if planner_calls == 1:
                 # The CLI starts a session and changes the worktree, then the
                 # process dies before it can report a completed result.
+                kwargs['on_session_started']('planner-session')
                 loop_manager.update_project(
                     connection,
                     str(repo),

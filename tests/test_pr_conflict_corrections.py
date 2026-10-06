@@ -292,7 +292,9 @@ class PrConflictCauseRevalidationTests(PrConflictCorrectionsTestFixture, unittes
                 **_kwargs,
             ):
                 roles.append(role_name)
-                return failed_worker
+                if role_name == 'worker':
+                    return failed_worker
+                return loop_manager.CodexResult(failed_worker.code, failed_worker.message, 'failed-planner')
 
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo

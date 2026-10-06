@@ -440,8 +440,11 @@ class MaintenancePublicationTest(MaintenancePlanningCase):
         progress = loop_manager.maintenance_file_review.ProvisionalReviewRepository(restarted_connection).progress(
             str(self.repo), self.repo, "main", recovered.revision, latest,
         )
-        self.assertEqual(progress.selected, ())
-        self.assertEqual(progress.next_unit.source.reason, maintenance_file_ledger.ROOT_REVIEW_REASON)
+        self.assertEqual({source.path for source in progress.selected},
+                         {source.path for source in latest.sources})
+        self.assertIsNotNone(progress.next_unit)
+        # Imported legacy judgments remain audit rows; no common version was recorded.
+        self.assertEqual(len(ledger.reviews(str(self.repo))), len(inventory.sources))
 
     def test_published_batch_recovery_rejects_changed_batch_path(self):
         context = self._begin_barrier()

@@ -376,6 +376,62 @@ class CommonGuidanceInvocationTests(TestCase):
             resolved_profile=invocation.ResolvedProfile('model', 'high'),
         )
 
+    def test_modern_session_fixture_binds_selected_plan_and_models_only_pr_body_reads(self):
+        from types import SimpleNamespace
+        from tests.support.worker import dummy_worker_context
+        from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
+        repository = mock.Mock()
+        repository.projected.return_value = SimpleNamespace(
+            plan_id='G-147', worktree=str(self.worktree), worker_session_id='saved-worker',
+            reviewer_session_id='saved-reviewer', worker_session_binding=None)
+        pr = {'body': '', 'state': 'OPEN', 'headRefOid': 'head'}
+        with mock.patch.object(manager, '_ExecutionLifecyclePorts', return_value='ports') as ports, \
+             mock.patch.object(manager, 'command', return_value='delegated') as command, \
+             mock.patch.object(manager, 'git', return_value=SimpleNamespace(stdout='branch')), \
+             mock.patch.object(manager, 'pr_for_branch', return_value=pr):
+            with dummy_worker_context():
+                for provider in ('codex', 'claude'):
+                    result = manager._ExecutionLifecyclePorts(self.connection, repository,
+                        repo='repo', state_dir=self.state_dir, config_path=Path('unused.ini'), provider=provider)
+                    self.assertEqual(result, 'ports')
+                observation = manager.command(['gh', 'pr', 'view', 'url', '--json',
+                    'body,headRefOid,state'], cwd=self.worktree)
+                import json
+                self.assertEqual(json.loads(observation.stdout), pr)
+                self.assertEqual(manager.command(['gh', 'pr', 'create']), 'delegated')
+        self.assertEqual(ports.call_count, 2)
+        command.assert_called_once_with(['gh', 'pr', 'create'])
+        saved = GuidanceRepository(self.connection)
+        context = invocation.InvocationContext('repo', 'G-147')
+        identity = self.guidance_module.task_identity(context, 'worker', self.worktree)
+        self.assertEqual(saved.session_task('repo', 'codex', 'saved-worker'), identity)
+        self.assertEqual(saved.session_task('repo', 'codex', 'saved-reviewer'), identity)
+        self.assertEqual(saved.session_task('repo', 'claude', 'saved-worker'), identity)
+        self.assertEqual(saved.session_task('repo', 'claude', 'saved-reviewer'), identity)
+        self.assertEqual(len(self.requests), 0)
+
+    def test_started_independent_session_keeps_guidance_after_interruption_and_runtime_change(self):
+        outer = self
+        class InterruptedProvider:
+            def run(self, request):
+                outer.requests.append(request)
+                request.on_session_started('interrupted-planner')
+                raise KeyboardInterrupt()
+        self.provider_mock.return_value = InterruptedProvider()
+        with self.assertRaises(KeyboardInterrupt):
+            self.invoke(role='planner', plan=None, task='planning-input')
+        original = self.requests[-1].common_guidance
+        self.source.write_text('new runtime instructions')
+        self.provider_mock.return_value = self.provider
+        result = self.invoke(role='planner', plan=None, task='planning-input', session='interrupted-planner')
+        self.assertEqual(result.code, 0)
+        self.assertEqual(self.requests[-1].common_guidance, original)
+        self.assertEqual(self.requests[-1].session_id, 'interrupted-planner')
+        audit = self.connection.execute(
+            "SELECT result_kind, session_id FROM agent_invocations WHERE result_kind = 'interrupted'").fetchall()
+        self.assertEqual([tuple(row) for row in audit], [('interrupted', 'interrupted-planner')])
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM agent_invocations').fetchone()[0], 2)
+
     def test_worker_reviewer_retry_and_new_tasks_preserve_runtime_version(self):
         self.assertEqual(self.invoke().code, 0)
         original = self.requests[-1].common_guidance

@@ -9,6 +9,7 @@ from tests.support.git import (
     commit_and_push,
     advance_remote_file,
 )
+from tests.support.publication import seed_validated_candidate
 from tests.support.worker import worker_result
 
 
@@ -146,6 +147,7 @@ class PrRecoveryFixture:
                     str(repo),
                 ),
             )
+        seed_validated_candidate(connection, repo, worktree, 'G-026')
         return (
             repo,
             state_dir,
@@ -171,6 +173,7 @@ class PrRecoveryFixture:
     ) -> dict[str, object]:
         return {
             "url": pr_url,
+            "body": "",
             "state": state,
             "mergedAt": None,
             "headRefOid": head_oid,

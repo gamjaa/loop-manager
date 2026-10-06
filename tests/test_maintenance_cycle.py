@@ -417,7 +417,8 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
                         f"maintenance-session-{planner_calls}",
                     )
                 selected.append(self._active_plan_id(connection, repo))
-                return loop_manager.CodexResult(1, "stop worker", "worker-session")
+                return loop_manager.CodexResult(1, "stop worker",
+                    "worker-session-" + str(self._active_plan_id(connection, repo)))
 
             try:
                 first = self._run_registered(
@@ -485,7 +486,8 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
                         "assessment-session",
                     )
                 selected.append(self._active_plan_id(connection, repo))
-                return loop_manager.CodexResult(1, "stop worker", "worker-session")
+                return loop_manager.CodexResult(1, "stop worker",
+                    "worker-session-" + str(self._active_plan_id(connection, repo)))
 
             try:
                 first = self._run_registered(

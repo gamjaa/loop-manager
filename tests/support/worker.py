@@ -33,6 +33,7 @@ def dummy_worker_context(*, roles=("worker",)):
     """Opt legacy unused.ini roles into fake profile/session preflight."""
     real_profile = loop_manager._agent_profile
     real_ports = loop_manager._ExecutionLifecyclePorts
+    real_command = loop_manager.command
 
     def profile(config_path, provider, role_name, level, worktree):
         if (role_name in roles and Path(config_path).name == 'unused.ini'
@@ -49,10 +50,31 @@ def dummy_worker_context(*, roles=("worker",)):
                         identity['provider'], 'fixture-worker-model', 'medium',
                     ).serialize(),
                 }, enqueue=False)
+            if saved and saved.worktree:
+                from tests.support.workspace import pin_common_guidance
+                from loop_manager_internal.agents.agent_invocation import InvocationContext
+                sessions = tuple(session for session in
+                                 (saved.worker_session_id, saved.reviewer_session_id) if session)
+                if sessions:
+                    pin_common_guidance(connection, InvocationContext(identity['repo'], saved.plan_id),
+                        Path(saved.worktree), identity['state_dir'], sessions=sessions, provider=identity['provider'])
         return real_ports(connection, repository, **identity)
 
+    def command(arguments, **kwargs):
+        # Legacy Git scenarios mock branch PR observations, not a second body
+        # query. Model that read while keeping every mutation at its old boundary.
+        if (arguments[:3] == ['gh', 'pr', 'view'] and '--json' in arguments
+                and arguments[arguments.index('--json') + 1] == 'body,headRefOid,state'):
+            import subprocess
+            worktree = kwargs['cwd']
+            branch = loop_manager.git(worktree, 'rev-parse', '--abbrev-ref', 'HEAD').stdout.strip()
+            pr = loop_manager.pr_for_branch(worktree, branch, arguments[3])
+            return subprocess.CompletedProcess(arguments, 0, stdout=json.dumps({'body': '', **pr}))
+        return real_command(arguments, **kwargs)
+
     with mock.patch.object(loop_manager, '_agent_profile', side_effect=profile), \
-         mock.patch.object(loop_manager, '_ExecutionLifecyclePorts', side_effect=ports):
+         mock.patch.object(loop_manager, '_ExecutionLifecyclePorts', side_effect=ports), \
+         mock.patch.object(loop_manager, 'command', side_effect=command):
         yield
 
 

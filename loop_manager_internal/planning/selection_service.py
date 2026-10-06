@@ -484,7 +484,7 @@ class PlanningSelectionService(PlanningService):
         base_sha: str,
         current_fingerprint: str,
     ) -> bool:
-        if getattr(self._ports.git, 'guidance_changed', lambda _repo: False)(context.repo_path):
+        if getattr(self._ports.git, 'runtime_guidance_changed', lambda _repo: False)(context.repo_path):
             return True
         if not self._plan_declarations_match(context, base_sha):
             return True
@@ -512,7 +512,7 @@ class PlanningSelectionService(PlanningService):
         current_fingerprint: str,
         current_general_fingerprint: str,
     ) -> bool:
-        if getattr(self._ports.git, 'guidance_changed', lambda _repo: False)(context.repo_path):
+        if getattr(self._ports.git, 'runtime_guidance_changed', lambda _repo: False)(context.repo_path):
             return True
         baseline = row.specification_fingerprint
         if baseline is None and row.planning_fingerprint == current_general_fingerprint:

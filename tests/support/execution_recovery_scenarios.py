@@ -406,6 +406,14 @@ class ExecutionRecoveryScenarios:
         effects.workspace.remote_branch_oid.side_effect = lm.remote_branch_oid
         effects.publication.pr_for_branch.side_effect = lambda *_a, **_k: observe_live_pull_request(
             fixture.repo, pull_request)
+        def publication_command(arguments, **_kwargs):
+            if arguments[:3] == ['gh', 'pr', 'view']:
+                return SimpleNamespace(returncode=0, stdout=json.dumps({
+                    'body': '', 'state': 'OPEN',
+                    'headRefOid': state.row()['publication_remote_oid'],
+                }))
+            return SimpleNamespace(returncode=0, stdout='https://example/pr/1')
+        effects.publication.command.side_effect = publication_command
         effects.agent.validate_worker_workspace_scope.return_value = plan
         effects.validation.validate_active_execplan_metadata.return_value = plan
         effects.validation.parse_worker_result.side_effect = lm.parse_worker_result
@@ -502,7 +510,8 @@ class ExecutionRecoveryScenarios:
         self.assertEqual(state.repository.get(repo, 'G-034').status, 'PR_OPEN')
         if pull_request:
             effects.publication.push_owned_pr_conflict_recovery.assert_called_once()
-            effects.publication.command.assert_not_called()
+            effects.publication.command.assert_called_once()
+            self.assertEqual(effects.publication.command.call_args.args[0][:3], ['gh', 'pr', 'view'])
         else:
             saved = effects.checkpoint.get(repo, 'G-034')
             if saved.snapshot.get('rebase_publication_result'):

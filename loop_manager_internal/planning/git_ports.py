@@ -121,7 +121,7 @@ class _PlanningGitPorts:
         saved = common_guidance.planning_content_hash(self._connection, str(repo_path))
         return {'guidance_hash': saved} if saved else {}
 
-    def guidance_changed(self, repo_path: Path) -> bool:
+    def runtime_guidance_changed(self, repo_path: Path) -> bool:
         return planning_input_state.guidance_changed(self._connection, str(repo_path))
 
     def requirement_archive_only(

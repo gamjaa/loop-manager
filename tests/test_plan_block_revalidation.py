@@ -1,4 +1,5 @@
 from dataclasses import replace
+import json
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -394,6 +395,8 @@ class ExistingPrPlanRecoveryTests(PlanRemoteRecoveryFixture, unittest.TestCase):
                 self.candidate_dirty = True
             return result
         fixture.effects.agent.run_agent.side_effect = agent
+        fixture.effects.publication.command.side_effect = lambda arguments, **_kwargs: SimpleNamespace(
+            returncode=0, stdout=json.dumps({'body': '', **self.pull_request}))
         effects = replace(fixture.effects, state=state, workspace=workspace, publication=publication,
             checkpoint=execution_checkpoint_state.ExecutionCheckpointRepository(self.connection))
         handler = ExecutionHandlers(effects, repo=self.repo, repo_path=Path('/repo'),
@@ -413,7 +416,8 @@ class ExistingPrPlanRecoveryTests(PlanRemoteRecoveryFixture, unittest.TestCase):
                          ['worker', 'reviewer'])
         self.assertEqual(fixture.effects.agent.run_agent.call_args_list[0].kwargs['session_id'], 'session')
         fixture.effects.validation.verify.assert_called_once()
-        fixture.effects.publication.command.assert_not_called()
+        fixture.effects.publication.command.assert_called_once()
+        self.assertEqual(fixture.effects.publication.command.call_args.args[0][:3], ['gh', 'pr', 'view'])
         self.assertEqual(self.pushes, [('push', 'origin', f"{self.head}:refs/heads/{self.plan()['branch']}")])
         self.assertNotEqual(self.head, adopted)
         self.assertEqual(self.plan()['pr_url'], 'saved-pr')
@@ -674,7 +678,8 @@ class ExistingPrPlanRecoveryTests(PlanRemoteRecoveryFixture, unittest.TestCase):
         self.assertEqual(result, 0, self.plan()['last_error'])
         self.assertEqual(self.plan()['status'], 'PR_OPEN')
         self.assertEqual(len(self.pushes), 1)
-        fixture.effects.publication.command.assert_not_called()
+        fixture.effects.publication.command.assert_called_once()
+        self.assertEqual(fixture.effects.publication.command.call_args.args[0][:3], ['gh', 'pr', 'view'])
 
     def test_general_pr_push_refuses_rewrites_and_changed_remote_or_pr(self):
         self._resume_general_pr_candidate()

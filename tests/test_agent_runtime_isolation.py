@@ -11,7 +11,8 @@ from loop_manager_internal.agents import agent_write_isolation as isolation
 from loop_manager_internal.agents import agent_codex_sandbox as envelope
 from loop_manager_internal.storage import agent_invocation_state as state
 import loop_manager as manager
-from tests.support.workspace import native_agent_boundary
+from tests.support.workspace import native_agent_boundary, pin_common_guidance, native_developer_texts
+from loop_manager_internal.agents import provider_guidance
 
 
 @skipUnless(isolation.platform.system() == 'Linux', 'native tool policy probe requires Linux')
@@ -104,6 +105,8 @@ class RuntimeReadOnlyIsolationTests(TestCase):
             drafts = mock.Mock()
             drafts.generation_prompt.return_value = ('draft prompt', 'document identity')
             launched = []
+            pin_common_guidance(connection, invocation.InvocationContext(
+                str(boundary.source), None, task_id='document-draft:document identity'), runtime, state_root)
 
             def run(command, **kwargs):
                 if command == ['codex', '--version']:
@@ -123,7 +126,8 @@ class RuntimeReadOnlyIsolationTests(TestCase):
 
             args = manager.argparse.Namespace(repository=str(boundary.source),
                                                draft_command='generate', target='docs/PRODUCT.md')
-            with mock.patch.object(manager, 'ROOT', runtime), \
+            with mock.patch.object(provider_guidance, '_developer_texts', side_effect=native_developer_texts), \
+                 mock.patch.object(manager, 'ROOT', runtime), \
                  mock.patch.object(manager, 'is_loop_manager_repository', return_value=True), \
                  mock.patch.object(manager, 'connect_database', return_value=connection), \
                  mock.patch.object(manager, '_recorded_base_fetch'), \

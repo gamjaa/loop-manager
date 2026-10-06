@@ -413,7 +413,7 @@ class CommonGuidanceFingerprintTest(unittest.TestCase):
         with mock.patch.object(common_guidance, 'runtime_content_hash', return_value='a' * 64):
             planning_input_state.record_general(connection, 'repo', 'revision', {})
             self.assertFalse(planning_input_state.guidance_changed(connection, 'repo'))
-        git = SimpleNamespace(guidance_changed=lambda _path: planning_input_state.guidance_changed(connection, 'repo'),
+        git = SimpleNamespace(runtime_guidance_changed=lambda _path: planning_input_state.guidance_changed(connection, 'repo'),
                               nonplan_fingerprint=mock.Mock(return_value='same'),
                               specification_fingerprint=mock.Mock(return_value='same'),
                               requirement_archive_only=mock.Mock(return_value=True))

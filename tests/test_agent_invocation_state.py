@@ -179,3 +179,30 @@ class CommonGuidanceStateTests(TestCase):
         for method in ('worker_candidate_token', 'verify_token', 'review_token', 'publication_token'):
             self.assertNotEqual(getattr(original, method)('head'), getattr(changed, method)('head'))
         self.assertEqual(DefinitionSnapshot.deserialize(original.serialize()), original)
+
+
+    def test_publication_fixture_tokens_use_saved_plan_guidance_without_git_execution(self):
+        from pathlib import Path
+        from unittest import mock
+        from tests.support.database import runtime_connection
+        from tests.support.publication import seed_validated_candidate
+        from loop_manager_internal.storage import runtime_state
+        from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
+        from loop_manager_internal.agents import common_guidance
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        runtime_state.RuntimeStateRepository(connection).activate(
+            'repo', 'G-047', activation_sha='base', branch='branch', worktree='/candidate')
+        identity = common_guidance.task_identity(InvocationContext('repo', 'G-047'), 'worker', Path('/candidate'))
+        GuidanceRepository(connection).save(identity, 'repo', 'a' * 64, 'a' * 40, '/snapshot')
+        def revision(_path, *_args):
+            return 'base' if _path == Path('repo') else 'candidate'
+        with mock.patch('tests.support.publication.git_command', side_effect=revision), \
+             mock.patch('loop_manager._revision_execplan_body_hash', return_value='body'), \
+             mock.patch('loop_manager._revision_execplan_source_fingerprint', return_value='source'), \
+             mock.patch.object(common_guidance, 'runtime_content_hash', return_value='b' * 64):
+            snapshot = seed_validated_candidate(connection, Path('repo'), Path('/candidate'), 'G-047')
+        self.assertEqual(snapshot.guidance_hash, 'a' * 64)
+        row = connection.execute('SELECT verify_token, review_token FROM exec_plans').fetchone()
+        self.assertEqual(row['verify_token'], snapshot.verify_token('base', 'candidate'))
+        self.assertEqual(row['review_token'], snapshot.review_token('base', 'candidate'))

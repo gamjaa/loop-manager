@@ -104,7 +104,7 @@ class CleanupFixture:
         return connection
 
 
-def pin_common_guidance(connection, context, worktree: Path, state_dir: Path, *, sessions=()):
+def pin_common_guidance(connection, context, worktree: Path, state_dir: Path, *, sessions=(), provider='codex'):
     """Seed known versions before native-policy unit doubles replace subprocess.
 
     Real instruction resolution/session fallback is covered by invocation tests;
@@ -119,7 +119,7 @@ def pin_common_guidance(connection, context, worktree: Path, state_dir: Path, *,
                            return_value=SimpleNamespace(returncode=0, stdout='a' * 40)):
         guidance = common_guidance.resolve(repository, context, 'worker', worktree, state_dir)
     for session in sessions:
-        repository.bind_session(context.repo, 'codex', session, guidance.task_id)
+        repository.bind_session(context.repo, provider, session, guidance.task_id)
     return guidance
 
 
