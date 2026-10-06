@@ -217,8 +217,7 @@ def _local_recovery_causes_remain(after: dict, plan_id: str | None) -> bool:
         if item["scope"] == "project"
         or plan_id is None or item["plan_id"] == plan_id
     ]
-    if any(item["pending_action"] in {"retry", "pause", "correct", "final_block"}
-           for item in after["recoveries"]):
+    if after["current_failures"]:
         return True
     if relevant_blocks:
         return True

@@ -412,11 +412,12 @@ def resume_plan_blocks(
     verify_timeout_seconds: int | None = None,
     plan_id: str | None = None,
     force_timeout_recheck: bool = False,
+    recovery_request_id: str | None = None,
 ) -> bool:
     return scope_reconciliation.resume_plan_blocks(
         effects._scope_reconciliation_effects_resume_plan_blocks(), connection,
         repo_path, state_dir, repo, base, config_path, verify_timeout_seconds,
-        plan_id, force_timeout_recheck,
+        plan_id, force_timeout_recheck, recovery_request_id,
     )
 
 

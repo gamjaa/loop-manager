@@ -86,8 +86,12 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
         self.config_path.write_text("[loop]\n", encoding="utf-8")
         from loop_manager_internal.recovery.recovery_runtime import RecoveryReason
         def run(connection, *_args, **_kwargs):
+            from loop_manager_internal.storage import recovery_state
+            repository = recovery_state.RecoveryRepository(connection)
+            before = repository.external_run_snapshot(str(self.repository.resolve()))
             loop_manager._record_project_recovery(
                 connection, str(self.repository.resolve()), RecoveryReason.GIT_LOCK, "Git lock")
+            repository.observe_external_run(str(self.repository.resolve()), before)
             return ProjectRunResult(ProjectRunKind.COMPLETED, 0)
         self.assertEqual(recover_local_environment(
             self.effects(run), self.arguments, self.state_dir, self.config_path), 1)
@@ -115,7 +119,7 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
             self.assertEqual(service.run().code, 0)
         pr_sync.assert_not_called()
         self.assertEqual(effects.resume_plan_blocks.call_args.kwargs,
-                         {"plan_id": "G-047", "force_timeout_recheck": True})
+                         {"plan_id": "G-047", "force_timeout_recheck": True, "recovery_request_id": "request"})
 
     def test_recovery_does_not_loop_for_independent_ready_work(self):
         connection = runtime_connection()
@@ -179,6 +183,47 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
             return ProjectRunResult(ProjectRunKind.COMPLETED, result.code)
         self.assertEqual(recover_local_environment(self.effects(run), self.arguments,
                                                    self.state_dir, self.config_path), 0)
+
+    def test_historical_recovery_does_not_prevent_successful_recheck(self):
+        self.config_path.write_text("[loop]\n", encoding="utf-8")
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryReason
+        from loop_manager_internal.storage import recovery_state
+        repo = str(self.repository.resolve())
+        with closing(loop_manager.connect_database(self.state_dir)) as connection, connection:
+            before = recovery_state.RecoveryRepository(connection).external_run_snapshot(repo)
+            loop_manager._record_project_recovery(connection, repo, RecoveryReason.GIT_LOCK, "old lock")
+            recovery_state.RecoveryRepository(connection).observe_external_run(repo, before)
+        from loop_manager_internal.application.project_runner import RunProjectResultEffects, run_project_result
+        runner_effects = RunProjectResultEffects(
+            _blocked_recovery_subjects=mock.Mock(return_value=frozenset()),
+            _run_project_result=mock.Mock(return_value=ProjectRunResult(ProjectRunKind.COMPLETED, 0)))
+        def successful_recheck(*args, **kwargs):
+            return run_project_result(runner_effects, *args, **kwargs)
+        result = recover_local_environment(self.effects(successful_recheck),
+                                           self.arguments, self.state_dir, self.config_path)
+        self.assertEqual(result, 0)
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            self.assertEqual(connection.execute("SELECT pending_action FROM recovery_records WHERE repo = ?", (repo,)).fetchone()[0], "retry")
+
+    def test_plan_recovery_finalization_keeps_independent_project_failure(self):
+        from loop_manager_internal.storage import recovery_state
+        from loop_manager_internal.application.project_runner import RunProjectResultEffects, run_project_result
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryReason
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        repo = str(Path("repo").resolve())
+        connection.execute("UPDATE projects SET repo = ?, planning_error = 'saved planning error'", (repo,))
+        snapshot = recovery_state.RecoveryRepository(connection).external_run_snapshot(repo)
+        loop_manager._record_project_recovery(connection, repo, RecoveryReason.GIT_LOCK, "planning tool failure")
+        recovery_state.RecoveryRepository(connection).observe_external_run(repo, snapshot)
+        before = dict(connection.execute("SELECT * FROM persistent_execution_failures WHERE repo = ?", (repo,)).fetchone())
+        effects = RunProjectResultEffects(
+            _blocked_recovery_subjects=mock.Mock(return_value=frozenset()),
+            _run_project_result=mock.Mock(return_value=ProjectRunResult(ProjectRunKind.WAITING, 0)))
+        run_project_result(effects, connection, Path("/state"), repo, Path("/config"), None, False,
+                           recovery_request_id="request", recovery_plan_id="G-047")
+        after = dict(connection.execute("SELECT * FROM persistent_execution_failures WHERE repo = ?", (repo,)).fetchone())
+        self.assertEqual(after, before)
 
     def test_parser_accepts_plan_scoped_recovery(self):
         args = loop_manager.build_parser().parse_args([

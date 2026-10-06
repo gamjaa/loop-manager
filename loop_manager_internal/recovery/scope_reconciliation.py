@@ -286,6 +286,7 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
     verify_timeout_seconds: int | None = None,
     plan_id: str | None = None,
     force_timeout_recheck: bool = False,
+    recovery_request_id: str | None = None,
 ) -> bool:
     """Reevaluate each plan block without letting one overwrite another."""
 
@@ -312,8 +313,11 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
             str(current_block["reason_code"])
             if current_block is not None else str(blocked["blocked_reason"] or "")
         )
-        if (force_timeout_recheck and current_reason
-                != BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value):
+        local_verify_recheck = force_timeout_recheck and current_reason in {
+            BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value,
+            BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value,
+        }
+        if force_timeout_recheck and not local_verify_recheck:
             continue
         if scoped_blocking.is_scope_baseline_block(current_block):
             prior_projection = effects.project_execplan(connection, repo)
@@ -439,8 +443,8 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
             with connection:
                 effects._clear_active_in_current_transaction(connection, repo)
             continue
-        if blocked["blocked_reason"] == BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value:
-            old_timeout = int(blocked["blocked_fingerprint"])
+        if local_verify_recheck or blocked["blocked_reason"] == BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value:
+            old_timeout = int(blocked["blocked_fingerprint"]) if not local_verify_recheck else 0
             new_timeout = (
                 verify_timeout_seconds
                 if verify_timeout_seconds is not None
@@ -465,6 +469,11 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
                     effects._clear_active_in_current_transaction(connection, repo)
                 continue
             with connection:
+                if recovery_request_id is not None:
+                    from loop_manager_internal.storage import local_recovery_state
+                    if not local_recovery_state.consume_recheck(connection, recovery_request_id, str(blocked["plan_id"]), "verify"):
+                        effects._clear_active_in_current_transaction(connection, repo)
+                        continue
                 runtime_state.RuntimeStateRepository(connection).transition(
                     repo, str(blocked["plan_id"]),
                     plan_values={

@@ -60,6 +60,7 @@ def run_project_result(
     # recovery observation durable on its own bounded state transition.
     connection.commit()
     outcome: ProjectRunResult | None = None
+    recovery_active = runtime_state.RuntimeStateRepository(connection).active_row(repo) if recovery_request_id else None
     try:
         outcome = effects._run_project_result(
             connection, state_dir, repo_arg, config_path, requested_base,
@@ -81,6 +82,25 @@ def run_project_result(
         # Failure observations are saved in their recovery transaction.  This
         # boundary only resolves an execution that reached a stable outcome.
         with connection:
+            resolved_subjects = None
+            if recovery_request_id is not None:
+                # Local recovery may resolve only inspected subjects. Planning
+                # errors are independent of the selected execution's outcome.
+                if recovery_plan_id is not None:
+                    subjects = {recovery_plan_id}
+                    project = connection.execute("SELECT planning_error FROM projects WHERE repo = ?", (repo,)).fetchone()
+                    if project is not None and not project[0]:
+                        subjects.add("__project__")
+                    resolved_subjects = frozenset(subjects)
+                else:
+                    project = connection.execute("SELECT planning_error FROM projects WHERE repo = ?", (repo,)).fetchone()
+                    subjects = {str(recovery_active["plan_id"])} if recovery_active is not None else set()
+                    current_active = runtime_state.RuntimeStateRepository(connection).active_row(repo)
+                    if current_active is not None:
+                        subjects.add(str(current_active["plan_id"]))
+                    if project is not None and not project[0]:
+                        subjects.add("__project__")
+                    resolved_subjects = frozenset(subjects)
             recovery_repository.finish_external_run(
                 repo, run_id,
                 resolved=(
@@ -93,6 +113,7 @@ def run_project_result(
                         ProjectRunKind.RUNTIME_HANDOFF,
                     }
                 ),
+                resolved_subjects=resolved_subjects,
                 blocked_subjects=(
                     frozenset() if outcome is not None
                     and outcome.kind is ProjectRunKind.RUNTIME_HANDOFF

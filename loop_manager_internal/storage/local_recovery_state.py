@@ -22,6 +22,12 @@ CREATE TABLE IF NOT EXISTS local_environment_recovery_requests (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     completed_at TEXT
 );
+CREATE TABLE IF NOT EXISTS local_environment_recheck_consumption (
+    request_id TEXT NOT NULL,
+    subject TEXT NOT NULL,
+    cause TEXT NOT NULL,
+    PRIMARY KEY (request_id, subject, cause)
+);
 CREATE UNIQUE INDEX IF NOT EXISTS one_pending_local_recovery_per_repo
 ON local_environment_recovery_requests(repo) WHERE status = 'pending';
 """
@@ -116,7 +122,13 @@ def snapshot(connection: sqlite3.Connection, repo: str, plan_id: str | None) -> 
         "review_level_history_sha256": _digest(row[9]),
         "revision_sha256": _digest(row[10] or row[11]),
     } for row in selected_plans]
+    failures = []
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE name = 'persistent_execution_failures'").fetchone():
+        failures = [str(row[0]) for row in connection.execute(
+            "SELECT subject FROM persistent_execution_failures WHERE repo = ? AND active = 1 "
+            "AND (? IS NULL OR subject IN (?, '__project__'))", (repo, plan_id, plan_id))]
     return {
+        "current_failures": failures,
         "phase": str(project[0] or "") if project else "",
         "planning_error_sha256": _digest(project[1]) if project and project[1] else None,
         "pr_conflict_recovery": bool(project[2]) if project else False,
@@ -157,6 +169,21 @@ def begin_request(
             "다른 로컬 환경 재검사 요청이 먼저 시작됐습니다. 같은 명령으로 재개하세요."
         ) from error
     return LocalRecoveryRequest(request_id, repo, plan_id, "pending", False)
+
+
+def consume_recheck(connection: sqlite3.Connection, request_id: str, subject: str, cause: str) -> bool:
+    """Claim once in the caller's transaction with the resumed phase transition."""
+    row = connection.execute(
+        "SELECT 1 FROM local_environment_recovery_requests WHERE request_id = ? AND status = 'pending'",
+        (request_id,),
+    ).fetchone()
+    if row is None:
+        raise LocalRecoveryRequestError("유효한 재검사 요청이 없습니다.")
+    changed = connection.execute(
+        "INSERT OR IGNORE INTO local_environment_recheck_consumption (request_id, subject, cause) VALUES (?, ?, ?)",
+        (request_id, subject, cause),
+    )
+    return changed.rowcount == 1
 
 
 def complete_request(

@@ -1,6 +1,7 @@
 """Focused state transition test for a verified insufficient timeout."""
 
 from pathlib import Path
+import sqlite3
 import tempfile
 import unittest
 from unittest import mock
@@ -69,6 +70,55 @@ class VerifyTimeoutPolicyTests(unittest.TestCase):
                 ))
         self.assertEqual([item.blocked for item in decisions], [False, False, False, True])
         self.assertEqual(len({item.fingerprint for item in decisions}), 1)
+
+    def test_consumed_exhausted_verify_recheck_is_not_repeated_after_restart(self):
+        from loop_manager_internal.storage import local_recovery_state
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        repository = runtime_state.RuntimeStateRepository(connection)
+        repository.activate('repo', 'G-047', activation_sha='base',
+                            branch='loop-manager/G-047', worktree='/state/G-047')
+        repository.update_plan('repo', 'G-047', plan_values={
+            'retry_count': 4, 'verify_failure_history': '{"timeout":4}',
+            'verify_result': '전체 verify 시간 초과:', 'worker_result': 'saved Worker'})
+        def block():
+            repository.block_plan('repo', 'G-047',
+                reason_code=BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value,
+                evidence='timeout retry exhausted', release_fingerprint='timeout', clear_projection=True)
+        block()
+        request = local_recovery_state.begin_request(connection, 'repo', 'G-047')
+        with mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'), \
+             mock.patch.object(loop_manager, 'validate_blocked_agent_scope'):
+            self.assertTrue(loop_manager.resume_plan_blocks(
+                connection, Path('repo'), Path('/state'), 'repo', 'main',
+                verify_timeout_seconds=600, plan_id='G-047', force_timeout_recheck=True,
+                recovery_request_id=request.request_id))
+            self.assertEqual(repository.active_row('repo')['status'], 'VERIFYING')
+            # The check failed and persisted its block, then the process died
+            # before the command completed its durable request.
+            block()
+            connection.commit()
+            temporary = tempfile.TemporaryDirectory()
+            self.addCleanup(temporary.cleanup)
+            database_path = Path(temporary.name) / 'recovery.db'
+            saved = sqlite3.connect(database_path)
+            connection.backup(saved)
+            saved.close()
+            connection.close()
+            connection = sqlite3.connect(database_path)
+            connection.row_factory = sqlite3.Row
+            self.addCleanup(connection.close)
+            resumed = local_recovery_state.begin_request(connection, 'repo', 'G-047')
+            self.assertEqual(resumed.request_id, request.request_id)
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                connection, Path('repo'), Path('/state'), 'repo', 'main',
+                verify_timeout_seconds=600, plan_id='G-047', force_timeout_recheck=True,
+                recovery_request_id=resumed.request_id))
+        plan = connection.execute("SELECT * FROM exec_plans WHERE repo='repo' AND plan_id='G-047'").fetchone()
+        self.assertEqual(plan['status'], 'PLAN_BLOCKED')
+        self.assertEqual(plan['retry_count'], 4)
+        self.assertEqual(plan['verify_failure_history'], '{"timeout":4}')
+        self.assertEqual(plan['worker_result'], 'saved Worker')
 
     def test_validation_transition_redacts_persisted_failure_state(self):
         connection = runtime_connection()

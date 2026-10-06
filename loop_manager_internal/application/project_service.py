@@ -611,6 +611,7 @@ class ProjectService:
             **({
                 "plan_id": self.identity.recovery_plan_id,
                 "force_timeout_recheck": True,
+                "recovery_request_id": self.identity.recovery_request_id,
             } if self.identity.recovery_request_id else {}),
         )
         if scoped_blocking.project_block(self.identity.connection, self.state.repo) is not None:
