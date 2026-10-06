@@ -2,6 +2,7 @@ from tests.support.runtime import runtime_rebase_fixture
 from tests.support.database import runtime_connection
 import dataclasses
 from pathlib import Path
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -1137,3 +1138,120 @@ class RuntimeStateRepositoryTest(unittest.TestCase):
                 "fingerprint",
             ),
         )
+
+
+class PreservedPlanningRuntimeTest(unittest.TestCase):
+    def failed_repository(self):
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        repository = runtime_state.RuntimeStateRepository(connection)
+        repository.update_project('repo', {
+            'phase': 'PLANNING', 'active_sha': 'failed-base', 'worktree': '/planning',
+            'planning_workspace_owned': 1, 'planning_error': 'validation failed',
+            'planning_error_fingerprint': 'failed-input', 'planner_session_id': 'planner-session',
+            'planning_result': 'unpublished-result', 'planning_validation_error': 'feedback',
+            'agent_role': 'planner', 'agent_snapshot': 'saved-scope',
+            'agent_result_snapshot': 'failed-result-scope',
+        }, enqueue=False)
+        return connection, repository
+
+    def test_worker_pr_and_merge_clear_preserve_attempt_and_error_incident(self):
+        connection, repository = self.failed_repository()
+        before = repository.planning('repo')
+        repository.suspend_planning(before, unconfirmed_plan_ids=('G-001',))
+        suspended = repository.planning('repo')
+        self.assertTrue(repository.recovery_slot_available('repo'))
+        worker = repository.activate('repo', 'G-047', activation_sha='base',
+                                     branch='loop-manager/G-047', worktree='/worker')
+        repository.transition('repo', worker.plan_id, plan_values={
+            'worker_session_id': 'worker-session', 'agent_role': 'worker',
+            'agent_snapshot': 'worker-scope'}, project_values={
+            'worker_session_id': 'worker-session', 'agent_role': 'worker',
+            'agent_snapshot': 'worker-scope'}, enqueue=False)
+        restarted = runtime_state.RuntimeStateRepository(connection)
+        restarted.hydrate('repo', worker.plan_id)
+        with self.assertRaises(runtime_state.RuntimeStateError):
+            restarted.resume_planning(restarted.planning('repo'))
+        restarted.open_pull_request('repo', pr_url='https://example.test/pull/1')
+        restarted.mark_merged('repo', worker.plan_id)
+        restarted.clear('repo')
+        after = restarted.planning('repo')
+        self.assertEqual(after.planning_preserved_state, suspended.planning_preserved_state)
+        self.assertEqual(after.preserved_unconfirmed_plan_ids, ('G-001',))
+        self.assertEqual(after.planning_error_incident_id, before.planning_error_incident_id)
+        self.assertEqual(after.planning_error, before.planning_error)
+        self.assertEqual(after.planning_fingerprint, before.planning_fingerprint)
+        restarted.resume_planning(after)
+        self.assertEqual(restarted.planning('repo'), before)
+        self.assertEqual(restarted.get('repo', worker.plan_id).worker_session_id, 'worker-session')
+        self.assertFalse(restarted.recovery_slot_available('repo'))
+
+    def test_invalid_preserved_targets_keep_slot_owned_and_do_not_restore(self):
+        for targets in (['G-001', 'G-001'], ['unsafe'], 'G-001'):
+            with self.subTest(targets=targets):
+                connection, repository = self.failed_repository()
+                repository.suspend_planning(repository.planning('repo'))
+                saved = json.loads(repository.planning('repo').planning_preserved_state)
+                saved['unconfirmed_plan_ids'] = targets
+                connection.execute('UPDATE projects SET planning_preserved_state = ? WHERE repo = ?',
+                                   (json.dumps(saved), 'repo'))
+                row = connection.execute('SELECT * FROM projects WHERE repo = ?', ('repo',)).fetchone()
+                self.assertTrue(runtime_state.planning_owns_execution_slot(row))
+                with self.assertRaises(runtime_state.RuntimeStateError):
+                    repository.planning('repo')
+
+    def test_suspension_and_resume_rollback_without_losing_projection(self):
+        for stage in ('after_planning_suspend', 'after_planning_resume'):
+            with self.subTest(stage=stage):
+                connection, repository = self.failed_repository()
+                if stage.endswith('resume'):
+                    repository.suspend_planning(repository.planning('repo'))
+                before = dict(connection.execute('SELECT * FROM projects').fetchone())
+                def fail(current):
+                    if current == stage:
+                        raise RuntimeError('interrupted')
+                failing = runtime_state.RuntimeStateRepository(connection, fault_hook=fail)
+                with self.assertRaisesRegex(RuntimeError, 'interrupted'):
+                    if stage.endswith('resume'):
+                        failing.resume_planning(repository.planning('repo'))
+                    else:
+                        failing.suspend_planning(repository.planning('repo'))
+                self.assertEqual(dict(connection.execute('SELECT * FROM projects').fetchone()), before)
+
+    def test_unverified_or_damaged_preservation_never_releases_slot(self):
+        connection, repository = self.failed_repository()
+        self.assertFalse(repository.recovery_slot_available('repo'))
+        repository.suspend_planning(repository.planning('repo'))
+        connection.execute("UPDATE projects SET planning_preserved_state = '{}' WHERE repo = 'repo'")
+        self.assertFalse(repository.recovery_slot_available('repo'))
+        with self.assertRaises(runtime_state.RuntimeStateError):
+            repository.planning('repo')
+
+    def test_stale_snapshot_cannot_suspend_or_resume(self):
+        _connection, repository = self.failed_repository()
+        original = repository.planning('repo')
+        repository.update_project('repo', {'planning_result': 'new-result'}, enqueue=False)
+        with self.assertRaises(runtime_state.RuntimeStateError):
+            repository.suspend_planning(original)
+        repository.suspend_planning(repository.planning('repo'))
+        suspended = repository.planning('repo')
+        repository.update_project('repo', {'phase': 'WORKING'}, enqueue=False)
+        with self.assertRaises(runtime_state.RuntimeStateError):
+            repository.resume_planning(suspended)
+
+    def test_pr_conflict_hydration_and_scope_failure_preserve_planner(self):
+        _connection, repository = self.failed_repository()
+        repository.suspend_planning(repository.planning('repo'))
+        saved = repository.planning('repo').planning_preserved_state
+        repository.update_plan('repo', 'G-047', plan_values={
+            'status': 'PR_OPEN', 'pr_url': 'https://example.test/pull/1',
+            'worker_session_id': 'worker-session'}, enqueue=False)
+        repository.transition('repo', 'G-047', expected_status='PR_OPEN',
+                              plan_values={'status': 'IMPLEMENTING', 'pr_conflict_recovery': 1},
+                              project_values={'phase': 'WORKING', 'plan_path': 'docs/plans/[G-047] Runtime.md'},
+                              enqueue=False)
+        repository.hydrate('repo', 'G-047')
+        repository.transition_and_clear('repo', 'G-047', plan_values={'status': 'PLAN_BLOCKED'},
+                                        enqueue=False)
+        self.assertEqual(repository.planning('repo').planning_preserved_state, saved)
+        self.assertEqual(repository.get('repo', 'G-047').worker_session_id, 'worker-session')

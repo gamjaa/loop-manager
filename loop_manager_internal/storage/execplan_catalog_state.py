@@ -402,6 +402,7 @@ _PROJECT_VERSION_FIELDS = (
     "agent_manager_snapshot",
     "active_sha",
     "validated_base_sha",
+    "planning_preserved_state",
     "planning_error",
     "planning_error_fingerprint",
     "planning_attempt_fingerprint",

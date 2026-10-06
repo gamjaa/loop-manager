@@ -1,17 +1,19 @@
 """Planning input selection, safety gates, and READY activation."""
 from __future__ import annotations
 from pathlib import Path
+import subprocess
 from loop_manager_internal.maintenance.maintenance_orchestration import assessment_can_yield, maintenance_planning_fingerprint
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningError
 from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventoryError
 from loop_manager_internal.storage import maintenance_state, maintenance_file_ledger, runtime_state
 from loop_manager_internal.storage.planner_check_state import target_fingerprint
 from loop_manager_internal.planning.planning_catalog import PlanningResultInvalid
+from loop_manager_internal.planning.planner_check import parse_planner_check_result
 from loop_manager_internal.planning.planning_workspace import planning_workspace_path
 from loop_manager_internal.planning.planning_service import PlanningService
 from loop_manager_internal.planning.planning_contracts import (
     _PlanningRun, PlanningContext, PlanningDecisionKind, PlanningOutcome,
-    PlanningOutcomeKind, choose_planning_decision,
+    PlanningOutcomeKind, PlanningWorkspaceOwnershipError, choose_planning_decision,
 )
 
 class PlanningSelectionService(PlanningService):
@@ -25,6 +27,12 @@ class PlanningSelectionService(PlanningService):
         """Check the failed input before scheduling or stale-workspace cleanup."""
 
         row = run.row
+        if row.planning_preserved_state:
+            decision = self._ports.state.schedule(run.context.repo)
+            if getattr(decision, "active", None) is not None:
+                return PlanningOutcome(PlanningOutcomeKind.EXECUTION_READY, base_sha=run.base_sha)
+            if getattr(decision, "project_blocked", False):
+                return PlanningOutcome(PlanningOutcomeKind.WAITING)
         if (row.phase == "PLANNING" and row.planning_workspace_owned == 1
                 and row.planning_result_pending_validation
                 and not row.planning_result_completed):
@@ -50,7 +58,7 @@ class PlanningSelectionService(PlanningService):
             maintenance_error = cycle.phase in {
                 maintenance_state.MaintenancePhase.ASSESSMENT,
                 maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
-            } and (run.maintenance_planning or row.phase is None)
+            } and (run.maintenance_planning or row.phase is None or row.planning_preserved_state)
             current = (
                 maintenance_planning_fingerprint(cycle, run.general_fingerprint)
                 if maintenance_error
@@ -73,11 +81,118 @@ class PlanningSelectionService(PlanningService):
         ):
             self._ports.events.error(
                 f"계획 오류가 해결되지 않았습니다: {row.planning_error}\n"
-                f"보존된 planning worktree: {row.worktree}"
+                f"보존된 planning worktree: {row.preserved_worktree}"
             )
-            return self._operational_error()
+            if row.planning_preserved_state:
+                return self._continue_published_work(run)
+            return self._suspend_failed_planning(run)
+        if row.planning_preserved_state:
+            if row.phase is not None:
+                return PlanningOutcome(PlanningOutcomeKind.WAITING)
+            self._ports.state.resume_planning(row)
+            return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART)
         run.error_input_changed = True
         return None
+
+    def _suspend_failed_planning(self, run: _PlanningRun) -> PlanningOutcome:
+        row, context = run.row, run.context
+        if (self._ports.state.general_publication(context.repo) is not None
+                or run.maintenance_cycle.publication_stage == "prepared"):
+            return self._operational_error()
+        # A snapshot/session without a confirmed workspace is not safe evidence.
+        if row.phase not in (None, "PLANNING"):
+            return self._operational_error()
+        worktree = Path(row.worktree) if row.worktree else None
+        try:
+            if self._ports.state.planning_release_pending(context.repo):
+                raise PlanningWorkspaceOwnershipError("미종료 Agent 실행이 남아 있습니다.")
+            if worktree is not None:
+                if row.planning_workspace_owned != 1:
+                    raise PlanningWorkspaceOwnershipError("planning worktree 소유권이 확인되지 않았습니다.")
+                self._ports.git.validate_worktree_ownership(
+                    context.repo, str(row.planning_attempt_fingerprint or ""), worktree,
+                )
+            elif (row.phase == "PLANNING" or row.active_sha or row.planning_workspace_owned
+                  or row.planner_session_id or row.agent_snapshot or row.planning_result
+                  or row.planning_attempt_fingerprint or row.planning_validation_error
+                  or row.planning_retry_count or row.planning_result_pending_validation
+                  or row.planning_result_completed):
+                raise PlanningWorkspaceOwnershipError("planning worktree 경로가 저장되지 않았습니다.")
+            self._ports.git.validate_planning_release(context.repo, worktree)
+            if row.agent_snapshot:
+                scope = self._ports.agent.validate_saved_scope(
+                    row.agent_role or "planner", worktree, row.agent_snapshot,
+                )
+                if scope.error:
+                    raise PlanningWorkspaceOwnershipError(scope.error)
+            self._ports.state.preserve_diagnostics(context.repo, row)
+            self._ports.state.suspend_planning(
+                row, unconfirmed_plan_ids=self._unconfirmed_failed_plans(run, worktree),
+            )
+        except RuntimeError as error:
+            self._ports.events.error(f"planning 실행 자리 보존 해제 대기: {error}")
+            return self._operational_error()
+        # Re-enter project synchronization so PR recovery sees the released slot.
+        return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART)
+
+    def _unconfirmed_failed_plans(self, run: _PlanningRun, worktree: Path | None) -> tuple[str, ...]:
+        """Retain the failed input's scope before exposing the execution slot."""
+        row, context, cycle = run.row, run.context, run.maintenance_cycle
+        if run.maintenance_planning and not cycle.include_general_planning:
+            return ()  # Maintenance targets retain their existing cycle gate.
+        rows = self._ports.state.execplan_rows(context.repo)
+        ids = tuple(sorted(str(plan['plan_id']) for plan in rows))
+        check = self._ports.state.planner_check(context.repo)
+        if (check is not None and check['stage'] in {'result', 'handoff', 'superseded'}
+                and check['base_sha'] == row.active_sha and check['result']):
+            try:
+                decision = parse_planner_check_result(check['result'], frozenset(ids))
+                if decision.outcome in {'needs_revision', 'uncertain'}:
+                    return decision.plan_ids or ids
+            except PlanningResultInvalid:
+                return ids
+        if not row.processed_sha or not row.active_sha or worktree is None:
+            return ids
+        try:
+            changed = self._ports.git.run(
+                context.repo_path, 'diff', '--name-only', '-z', row.processed_sha, row.active_sha,
+            ).stdout.split('\0')
+            # Source comparisons alone cannot establish the effect of a code
+            # or other unclassified change on existing goals and validation.
+            if any(path and not (path in {'AGENTS.md', 'docs/PRODUCT.md', 'docs/ARCHITECTURE.md', 'docs/PLANS.md'}
+                    or path.startswith(('docs/requirements/', 'docs/plans/'))) for path in changed):
+                return ids
+            affected = []
+            for plan_id in ids:
+                try:
+                    changes = self._ports.git.relevant_document_changes(
+                        worktree, row.processed_sha, row.active_sha, [], rows, (plan_id,),
+                        include_active_requirements=False,
+                    )
+                except (RuntimeError, subprocess.SubprocessError):
+                    affected.append(plan_id)  # An uncertain declaration is not independent.
+                else:
+                    if changes:
+                        affected.append(plan_id)
+            return tuple(affected)
+        except (RuntimeError, subprocess.SubprocessError):
+            return ids
+
+    def _continue_published_work(self, run: _PlanningRun) -> PlanningOutcome:
+        context = run.context
+        decision = self._ports.state.schedule(context.repo)
+        if (getattr(decision, "project_blocked", False)
+                or decision.runnable_ready is None):
+            return PlanningOutcome(PlanningOutcomeKind.WAITING)
+        # The normal remote/catalog and activation gates still validate the plan.
+        latest = self._fetch_remote_head(context)
+        if latest != run.base_sha:
+            return self._restart_for_new_input()
+        selected = self._ports.state.activate_ready(context.repo, latest)
+        if selected is None:
+            return PlanningOutcome(PlanningOutcomeKind.WAITING)
+        return PlanningOutcome(PlanningOutcomeKind.EXECUTION_READY,
+                               base_sha=latest, newly_activated=True)
 
     def _select_planning_work(
         self, run: _PlanningRun
@@ -561,7 +676,7 @@ class PlanningSelectionService(PlanningService):
         ):
             self._ports.events.error(
                 f"계획 오류가 해결되지 않았습니다: {row.planning_error}\n"
-                f"보존된 planning worktree: {row.worktree}"
+                f"보존된 planning worktree: {row.preserved_worktree}"
             )
             return self._operational_error()
 
