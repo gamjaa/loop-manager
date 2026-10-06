@@ -11,7 +11,9 @@ from unittest import mock
 import loop_manager
 from loop_manager_internal.catalog import execplan_catalog, execplan_drafts, catalog_service
 from loop_manager_internal.planning import planner_publication, planner_validation
-from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot, mutable_snapshot_token
+from loop_manager_internal.planning.planning_catalog import (
+    MutableReadySnapshot, mutable_snapshot_token, snapshot_from_dict, snapshot_to_dict,
+)
 from loop_manager_internal.planning.planning_contracts import choose_planning_decision, PlanningDecisionKind
 from loop_manager_internal.storage import execplan_catalog_state, execplan_draft_state, runtime_state
 from loop_manager_internal.notifications import work_exhaustion
@@ -90,6 +92,14 @@ class ExecPlanDraftDocumentTest(unittest.TestCase):
         self.assertIn("draft: true", prompt)
         self.assertIn("decision_wait.revision", prompt)
         self.assertIn("자기 승인", prompt)
+        for text, expected in ((text, True), (plan_text("G-001", "Decision"), False),
+                               (text.replace("draft: true", "draft: false"), False)):
+            with self.subTest(draft=expected, text=text[:160]):
+                original = replace(snapshot, text=text, content_hash=hashlib.sha256(text.encode()).hexdigest())
+                restored = snapshot_from_dict(snapshot_to_dict(original))
+                self.assertIs(restored.draft, expected)
+                restored_batch = replace(batch, plans=(restored,))
+                self.assertIs(json.loads(restored_batch.prompt_payload())["plans"][0]["draft"], expected)
 
     def test_mixed_batch_is_valid_but_agent_decision_is_a_validation_error(self):
         with tempfile.TemporaryDirectory() as directory:
