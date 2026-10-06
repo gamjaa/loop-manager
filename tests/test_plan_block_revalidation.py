@@ -20,6 +20,35 @@ from tests.support.blocked_remote import PlanRemoteRecoveryFixture
 
 
 class PlanRecoveryGateTests(PlanRemoteRecoveryFixture, unittest.TestCase):
+    def test_completed_base_pending_adoption_uses_current_result_boundary(self):
+        original = self.published_successor()
+        plan = self.plan()
+        store = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        current = store.get(self.repo, 'G-106')
+        request = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection).get(self.repo, 'G-106')
+        store.record(self.repo, 'G-106', expected_generation=current.generation, operation=None,
+            expected_head=self.head, target_base_oid=self.base, observed_remote_oid=original.head,
+            snapshot={'base_rebase_restart': {'phase': 'complete', 'remote': original.head},
+                      'remote_adoption_intent': {'head': original.head, 'branch': plan['branch'],
+                          'worktree': plan['worktree'], 'request_identity': request.request_identity,
+                          'snapshot': original.serialize(), 'agent_snapshot': plan['agent_snapshot'],
+                          'agent_result_snapshot': plan['agent_result_snapshot']}})
+        self.ports.validate_blocked_agent_scope.side_effect = AssertionError('stale Agent comparison')
+        def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, snapshot):
+            effects.git(Path(plan['worktree']), 'merge', '--ff-only', remote)
+            return effects.capture_git_snapshot(Path(plan['worktree']))
+        # The coordinator's Git-effect boundary is fake; the adoption handler
+        # still performs its current lease, identity and transactional checks.
+        with (mock.patch('loop_manager_internal.recovery.work_branch_integration.integrate',
+                         side_effect=integrate) as integration,
+              mock.patch.object(self.coordinator, '_incorporate', side_effect=KeyboardInterrupt)):
+            with self.assertRaises(KeyboardInterrupt):
+                self.coordinator.reconcile('G-106')
+        integration.assert_called_once()
+        self.ports._reconcile_published_blocked_checkpoint.assert_called_once()
+        self.ports.validate_execplan_workspace_identity.assert_called()
+        self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
+
     def test_push_after_observation_is_preserved_until_refresh_pins_new_lease(self):
         original = self.published_successor()
         successor = self.row()['branch_oid']
@@ -166,7 +195,7 @@ class PlanRecoveryGateTests(PlanRemoteRecoveryFixture, unittest.TestCase):
 
 
 class PendingIntegrationRemoteRefreshTests(PlanRemoteRecoveryFixture, unittest.TestCase):
-    def _context(self, phase, *, operation=None, owned=True):
+    def _context(self, phase, *, operation=None, owned=True, base_pending=False):
         plan = self.plan()
         context = dict(self.row())
         context.update(plan_id='G-106', branch_oid='previous-user-input',
@@ -175,7 +204,11 @@ class PendingIntegrationRemoteRefreshTests(PlanRemoteRecoveryFixture, unittest.T
         current = store.get(self.repo, 'G-106')
         store.record(self.repo, 'G-106', expected_generation=current.generation,
             operation=operation, expected_head=self.head, target_base_oid='previous-user-input',
-            observed_remote_oid='previous-user-input', snapshot={'work_branch_integration': {
+            observed_remote_oid='previous-user-input', snapshot={
+                'base_rebase_restart': {'phase': 'complete', 'remote': 'previous-user-input'},
+                'remote_adoption_intent': {'head': 'previous-user-input',
+                    'branch': plan['branch'] if owned else 'other', 'worktree': plan['worktree']}}
+                if base_pending else {'work_branch_integration': {
                 'phase': phase, 'remote': 'previous-user-input',
                 'branch': plan['branch'] if owned else 'other', 'worktree': plan['worktree']}}
                 if phase is not None else {})
@@ -207,6 +240,21 @@ class PendingIntegrationRemoteRefreshTests(PlanRemoteRecoveryFixture, unittest.T
                 self.assertEqual((context['branch_oid'], context['base_oid']), ('successor', 'new-base'))
                 self.ports.git.assert_any_call(Path('/repo'), 'merge-base', '--is-ancestor',
                                               'previous-user-input', 'successor', check=False)
+
+    def test_completed_base_pending_adoption_reobserves_successor_and_new_base(self):
+        context = self._context(None, base_pending=True)
+        self._new_remote()
+        self.coordinator._remote(context)
+        self.assertEqual((context['branch_oid'], context['base_oid']), ('successor', 'new-base'))
+
+    def test_completed_base_pending_adoption_rejects_rewrite_foreign_owner_and_other_operation(self):
+        for options, ancestry in (({}, 1), ({'owned': False}, 0), ({'operation': 'commit'}, 0)):
+            with self.subTest(options=options, ancestry=ancestry):
+                context = self._context(None, base_pending=True, **options)
+                self._new_remote(ancestry=ancestry)
+                with self.assertRaises(RuntimeError):
+                    self.coordinator._remote(context)
+                self.assertEqual(context['branch_oid'], 'previous-user-input')
 
     def test_pending_refresh_rejects_rewrite_foreign_intent_and_other_operations(self):
         for options, ancestry, fetch in (({}, 1, 0), ({'owned': False}, 0, 0),

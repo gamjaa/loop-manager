@@ -13,7 +13,8 @@ from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.agents import scope_recovery, agent_scope_decision
 from loop_manager_internal.agents import scope_baseline
 from loop_manager_internal.agents.scope_contracts import AgentScopeError
-from loop_manager_internal.git.managed_rebase_validation import FileChange
+from loop_manager_internal.git.managed_rebase_validation import FileChange, RebaseDecision, RebaseStatus
+from loop_manager_internal.git import managed_rebase_validation as rebase_policy
 from loop_manager_internal.recovery import work_branch_integration as integration
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 
@@ -183,6 +184,133 @@ class WorkBranchIntegrationUnitTests(unittest.TestCase):
         self.effects._capture_agent_baseline.assert_not_called()
         self.effects.git.assert_not_called()
         self.assertEqual(self.store.get('repo', 'G-166').operation, 'rebase')
+
+    def _base_completion_service(self):
+        self.now = replace(self.now, head='base-completed', branch=self.branch, dirty={}, index={}, operations={})
+        def service(*args, **kwargs):
+            current = self.store.get('repo', 'G-166')
+            acceptance = dict(kind=rebase_policy.ACCEPTANCE_KIND, policy_version=rebase_policy.POLICY_VERSION,
+                repo='repo', repository_identity='repository', plan_id='G-166',
+                plan_path='docs/plans/[G-166] Work.md', worktree=self.plan['worktree'], branch=self.branch,
+                target_base_oid=current.target_base_oid, head=self.now.head, generation=current.generation,
+                remote=dict(repository='repo', branch=self.branch, oid=kwargs['remote_oid'], pull_request=None),
+                input_fingerprint='input', scope_fingerprint='scope', state_fingerprint='state', role='worker')
+            acceptance['id'] = rebase_policy.fingerprint(acceptance)
+            self.accepted = RebaseDecision(RebaseStatus.COMPLETE, acceptance=acceptance)
+            return self.service
+        self.effects._current_rebase_service.side_effect = service
+
+    def _pending_base_completion(self):
+        current = self.store.record('repo', 'G-166', expected_generation=0, operation='rebase',
+            expected_head='local', target_base_oid='base', observed_remote_oid='old-remote',
+            snapshot={'agent-audit': self.before.serialize(), 'worker-session': 'same-session',
+                      'current_rebase_acceptance': {'old': 'audit'}})
+        self._base_completion_service()
+        return current
+
+    def complete_base(self, remote='successor'):
+        return integration.restart_base_rebase(self.effects, self.connection, Path('/repo'), Path('/state'),
+                                               'repo', self.plan, remote, self.now)
+
+    def test_manual_base_completion_is_accepted_before_successor_without_abort(self):
+        original = self._pending_base_completion()
+        completed = self.complete_base()
+        self.assertIsNone(completed.operation)
+        self.assertEqual(completed.expected_head, 'base-completed')
+        self.assertEqual(completed.target_base_oid, 'base')
+        self.assertEqual(completed.observed_remote_oid, 'successor')
+        self.assertEqual(completed.current_rebase_acceptance(), self.accepted.acceptance)
+        restart = completed.snapshot['base_rebase_restart']
+        self.assertEqual((restart['original_head'], restart['remote_before']), ('local', 'old-remote'))
+        self.assertEqual(restart['acceptance_id'], self.accepted.acceptance['id'])
+        self.assertEqual(completed.snapshot['current_rebase_acceptance_history'], [{'old': 'audit'}])
+        for key in ('agent-audit', 'worker-session'):
+            self.assertEqual(completed.snapshot[key], original.snapshot[key])
+        self.effects._capture_agent_baseline.assert_not_called()
+        self.effects.git.assert_not_called()
+        self.effects._journaled_direct_rebase.assert_not_called()
+        self.assertEqual(self.complete_base(), completed)
+
+    def test_manual_base_completion_keeps_saved_conflict_and_retargets_successor(self):
+        original = self._pause_base_restart(after_abort=False)
+        self._base_completion_service()
+        completed = self.complete_base('third-input')
+        self.assertEqual(completed.snapshot['base_rebase_restart_history'], [original])
+        for key in ('baseline', 'snapshot', 'original_head'):
+            self.assertEqual(completed.snapshot['base_rebase_restart'][key], original[key])
+        self.assertEqual(completed.snapshot['base_rebase_restart']['remote'], 'third-input')
+        self.assertEqual(completed.target_base_oid, 'base')
+        self.assertEqual(completed.expected_head, 'base-completed')
+        self.effects._capture_agent_baseline.assert_called_once()
+        self.assertFalse(any(call.args[-2:] == ('rebase', '--abort')
+                             for call in self.effects.git.call_args_list))
+
+    def test_manual_base_completion_recheck_interruption_retries_same_result(self):
+        original = self._pending_base_completion()
+        self.service.observe.side_effect = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.complete_base()
+        self.assertEqual(self.store.get('repo', 'G-166'), original)
+        self.service.observe.side_effect = lambda: (None, self.accepted)
+        self.assertEqual(self.complete_base().expected_head, 'base-completed')
+        self.effects.git.assert_not_called()
+
+    def test_manual_base_completion_save_interruption_does_not_repeat_completion(self):
+        self._pending_base_completion()
+        complete = integration._complete_owned_rebase
+        def interrupted(*args):
+            complete(*args)
+            raise KeyboardInterrupt
+        with mock.patch.object(integration, '_complete_owned_rebase', side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                self.complete_base()
+        saved = self.store.get('repo', 'G-166')
+        self.assertIsNone(saved.operation)
+        self.assertEqual(self.complete_base(), saved)
+        self.effects._capture_agent_baseline.assert_not_called()
+        self.effects.git.assert_not_called()
+
+    def test_changed_manual_base_completion_is_refused_before_abort(self):
+        original = self._pending_base_completion()
+        self.service.observe.side_effect = lambda: (None, RebaseDecision(RebaseStatus.WAITING))
+        with self.assertRaisesRegex(RuntimeError, '완료 관측'):
+            self.complete_base()
+        self.assertEqual(self.store.get('repo', 'G-166'), original)
+        self.effects._capture_agent_baseline.assert_not_called()
+        self.effects.git.assert_not_called()
+
+    def test_checkpoint_change_during_manual_base_completion_is_not_adopted(self):
+        original = self._pending_base_completion()
+        def changed():
+            current = self.store.get('repo', 'G-166')
+            self.store.record('repo', 'G-166', expected_generation=current.generation,
+                operation=current.operation, expected_head=current.expected_head,
+                target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+                snapshot={**current.snapshot, 'other-intent': True})
+            return None, self.accepted
+        self.service.observe.side_effect = changed
+        with self.assertRaisesRegex(RuntimeError, '완료 관측'):
+            self.complete_base()
+        self.assertEqual(self.store.get('repo', 'G-166'), original)
+        self.effects.git.assert_not_called()
+
+    def test_manual_base_completion_still_requires_current_ownership(self):
+        original = self._pending_base_completion()
+        self.service.require_owned.side_effect = RuntimeError('origin or Agent scope changed')
+        with self.assertRaisesRegex(RuntimeError, 'origin or Agent scope'):
+            self.complete_base()
+        self.assertEqual(self.store.get('repo', 'G-166'), original)
+        self.effects._capture_agent_baseline.assert_not_called()
+        self.effects.git.assert_not_called()
+
+    def test_manual_base_completion_rejects_rewritten_pending_successor(self):
+        self._pause_base_restart(after_abort=False)
+        original = self.store.get('repo', 'G-166')
+        self._base_completion_service()
+        self.effects.git.side_effect = lambda *args, **kwargs: subprocess.CompletedProcess([], 1, '')
+        with self.assertRaisesRegex(RuntimeError, '후속 commit'):
+            self.complete_base('third-input')
+        self.assertEqual(self.store.get('repo', 'G-166'), original)
 
     def test_pinned_index_stat_refresh_precedes_clean_capture_and_rebase(self):
         git = self.git

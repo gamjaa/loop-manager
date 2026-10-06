@@ -66,16 +66,53 @@ def _abort_preserved_rebase(effects, connection, repo_path, state_dir, repo, pla
     return now
 
 
+def _complete_owned_rebase(checkpoints, repo, plan_id, current, service, observed, decision, remote, saved):
+    """Accept a stable result at its original target under the fetched live lease."""
+    with runtime_state._transaction(checkpoints.connection):
+        if service.observe()[1] != decision or checkpoints.get(repo, plan_id) != current:
+            raise RuntimeError('관리 rebase 완료 관측이 변경됐습니다.')
+        return checkpoints.record(
+            repo, plan_id, expected_generation=current.generation, operation=None,
+            expected_head=observed.head, target_base_oid=current.target_base_oid,
+            observed_remote_oid=remote, snapshot=saved)
+
+
 def restart_base_rebase(effects, connection, repo_path, state_dir, repo, plan, remote, snapshot):
-    """Pin interrupted base-conflict input before restarting for a successor."""
+    """Accept a finished base rebase or preserve its conflict for a successor."""
     plan_id, branch, worktree = plan['plan_id'], plan['branch'], Path(plan['worktree'])
     checkpoints = ExecutionCheckpointRepository(connection)
     current = checkpoints.get(repo, plan_id)
     restart = (current.snapshot or {}).get('base_rebase_restart')
+    service = effects._current_rebase_service(
+        connection, repo_path, state_dir, repo, plan_id, worktree, branch, remote_oid=remote)
+    observed, decision = service.require_owned(checkpoint=current)
+    if current.operation == 'rebase' and decision.status.value == 'complete':
+        # A completed base rebase may have rewritten the accepted work-branch
+        # input. Keep its original start and acceptance together for subsequent
+        # adoption; a successor lease does not make this an aborted operation.
+        saved = current.snapshot or {}
+        history = list(saved.get('base_rebase_restart_history', ()))
+        if restart and (restart.get('phase') == 'complete' or restart['remote'] != remote):
+            history.append(restart)
+            restart = (None if restart.get('phase') == 'complete' else
+                       _successor_restart(effects, worktree, restart, remote))
+        acceptance = decision.acceptance
+        return _complete_owned_rebase(
+            checkpoints, repo, plan_id, current, service, observed, decision, remote,
+            {**saved, 'integration_repo': repo,
+             'current_rebase_acceptance': acceptance,
+             'current_rebase_acceptance_history': [
+                 *saved.get('current_rebase_acceptance_history', ()),
+                 *([saved['current_rebase_acceptance']] if saved.get('current_rebase_acceptance') else [])],
+             'base_rebase_restart_history': history,
+             'base_rebase_restart': {**(restart or {}), 'phase': 'complete', 'remote': remote,
+                 'remote_before': current.observed_remote_oid, 'original_head': current.expected_head,
+                 'head': observed.head, 'acceptance_id': acceptance['id']}})
+    if (current.operation is None and restart and restart.get('acceptance_id')
+            and (restart.get('head'), restart['remote']) == (observed.head, remote)
+            and decision.status.value == 'complete'):
+        return current
     if restart is None or restart.get('phase') == 'complete':
-        effects._current_rebase_service(
-            connection, repo_path, state_dir, repo, plan_id, worktree, branch,
-            remote_oid=remote).require_owned(checkpoint=current)
         baseline = _preserve_conflict(effects, repo, worktree, snapshot)
         restart = dict(remote=remote, original_head=current.expected_head,
                        snapshot=snapshot.serialize(), baseline=baseline, phase='preserving')
@@ -133,12 +170,14 @@ def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, sna
         intent = value
 
     def complete(service, observed, decision):
+        nonlocal current, intent
         # Bind completion to both the stable current result and this intent's
         # generation. A newer fetched lease does not change the completed target.
-        with runtime_state._transaction(connection):
-            if service.observe()[1] != decision or checkpoints.get(repo, plan_id) != current:
-                raise RuntimeError('작업 branch 통합 완료 관측이 변경됐습니다.')
-            save({**intent, 'phase': 'complete', 'head': observed.head}, head=observed.head)
+        completed = {**intent, 'phase': 'complete', 'head': observed.head}
+        current = _complete_owned_rebase(
+            checkpoints, repo, plan_id, current, service, observed, decision, remote,
+            {**(current.snapshot or {}), 'integration_repo': repo, 'work_branch_integration': completed})
+        intent = completed
 
     if intent and intent['remote'] != remote and current.operation == 'rebase':
         service = effects._current_rebase_service(

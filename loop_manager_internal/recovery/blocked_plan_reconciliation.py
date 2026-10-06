@@ -94,6 +94,14 @@ def remote_adoption_is_current(checkpoint) -> bool:
                 and accepted.get('head') != adopted.get('head'))
 
 
+def base_adoption_pending(checkpoint, branch, worktree) -> bool:
+    """Keep interrupted base recovery on its exact selected adoption boundary."""
+    saved = checkpoint.snapshot or {}
+    pending = saved.get('remote_adoption_intent') or {}
+    return bool(checkpoint.operation in {None, 'rebase'} and saved.get('base_rebase_restart') and pending
+                and (pending.get('branch'), pending.get('worktree')) == (branch, worktree))
+
+
 def validated_scope_refs(
     connection: sqlite3.Connection, repo_path: Path, repo: str, base: str,
     plan_id: str | None, before: GitSnapshot, result: GitSnapshot | None,
@@ -257,6 +265,8 @@ class BlockedPlanReconciler:
                  and integration.get('phase') in {'preserving', 'rebasing'})
             and integration.get('branch') == context['identity']['branch']
             and integration.get('worktree') == context['identity']['worktree'])
+        refresh_pending = refresh_pending or base_adoption_pending(
+            checkpoint, context['identity']['branch'], context['identity']['worktree'])
         if branch.oid not in allowed:
             if (refresh_pending or checkpoint.operation == 'rebase') and context['branch_oid'] and branch.oid:
                 fetched = self.ports.git(
@@ -611,7 +621,8 @@ class BlockedPlanReconciler:
                         or integration.get('phase') in {'preserving', 'rebasing'}
                         or integration and (checkpoint.snapshot or {}).get('remote_adoption_intent')
                         or integration and checkpoint.operation == 'rebase'
-                        and integration.get('remote') != context['branch_oid']):
+                        and integration.get('remote') != context['branch_oid']
+                        or base_adoption_pending(checkpoint, plan['branch'], plan['worktree'])):
                     self.ports.validate_execplan_workspace_identity(
                         self.state_dir, self.repo, plan_id, plan['branch'], Path(plan['worktree']))
                 else:
