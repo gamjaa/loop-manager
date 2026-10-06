@@ -39,6 +39,8 @@ def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes):
     reserved = {item[0] for item in state.reserved}
     deletions = []
     rows = connection.execute("SELECT * FROM exec_plans WHERE repo=?", (repo,)).fetchall()
+    latest_contents = {key: entry.text.encode("utf-8") for key, entry in pinned.snapshot.all.items()}
+    withheld_paths = {key: path for key, path, _hash in pinned.snapshot.withheld}
     for row in rows:
         key = str(row["plan_id"])
         if key in pinned.snapshot.observed_ids or key in reserved or mutable_row(connection, repo, key) is None:
@@ -76,6 +78,8 @@ def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes):
             current_metadata_recorded=True,
         )
         affected = []
+        reference = re.compile(rb"(?<![A-Za-z0-9-])" + key.encode("ascii") + rb"(?![A-Za-z0-9-])")
+        reference_path = path.encode("utf-8")
         for other in rows:
             other_id = str(other["plan_id"])
             if other_id == key:
@@ -83,12 +87,21 @@ def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes):
             if key in json.loads(other["depends_on"]):
                 affected.append(other_id)
                 continue
+            latest = latest_contents.get(other_id)
+            latest_path = withheld_paths.get(other_id)
+            if (latest is None and latest_path is not None and pinned.regular_paths is not None
+                    and latest_path in pinned.regular_paths):
+                # Isolated declarations can contain newly added references too.
+                latest = git_bytes(repository, "show", f"{pinned.revision_sha}:{latest_path}")
+                latest_contents[other_id] = latest
+            if latest is not None and (reference_path in latest or reference.search(latest)):
+                affected.append(other_id)
+                continue
             adopted = str(other["current_revision_sha"] or other["plan_sha"] or "")
             if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", adopted):
                 previous = git_bytes(repository, "show", f"{adopted}:{other['path']}")
                 if (catalog.plan_content_hash(previous) == other["content_hash"]
-                        and (path.encode("utf-8") in previous or re.search(
-                            rb"(?<![A-Za-z0-9-])" + key.encode("ascii") + rb"(?![A-Za-z0-9-])", previous))):
+                        and (reference_path in previous or reference.search(previous))):
                     affected.append(other_id)
         evidence = json.dumps({"text": text, "row": dict(row), "affected": sorted(affected),
                                "resolved": {}}, ensure_ascii=False, sort_keys=True)

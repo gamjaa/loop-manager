@@ -139,7 +139,7 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         self.connection.close()
         self.temporary.cleanup()
 
-    def _remote_deletion(self, *, dependent=True, started=False, new_plan=False, archive=False):
+    def _remote_deletion(self, *, dependent=True, started=False, new_plan=False, archive=False, target_text=None):
         from loop_manager_internal.catalog import remote_deletions
         if dependent:
             target = self.repo / self.paths["G-002"]
@@ -160,6 +160,8 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
             deleted.rename(archive_root / deleted.name)
         else:
             deleted.unlink()
+        if target_text is not None:
+            (self.repo / self.paths["G-002"]).write_text(target_text, encoding="utf-8")
         if new_plan:
             (self.repo / "docs/plans/[G-007] Independent.md").write_text(plan_text("G-007", "Independent"), encoding="utf-8")
         git(self.repo, "add", ".")
@@ -353,8 +355,35 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         target.write_text(plan_text("G-002", "Second") + "\nUse G-001 as the validation foundation.\n", encoding="utf-8")
         git(self.repo, "add", ".")
         git(self.repo, "commit", "-m", "implementation reference")
-        result, _ = self._remote_deletion(dependent=False)
+        result, _ = self._remote_deletion(dependent=False, target_text=plan_text("G-002", "Second"))
         self.assertEqual(set(result.withheld_plan_ids), {"G-002"})
+
+    def test_remote_deletion_simultaneous_implementation_reference_is_held(self):
+        body = plan_text("G-002", "Second").replace(
+            "- Keep the boundary explicit.", "- Build on the G-001 implementation.")
+        self._assert_simultaneous_deletion_reference(body)
+
+    def test_remote_deletion_simultaneous_validation_path_reference_is_held(self):
+        body = plan_text("G-002", "Second").replace(
+            "- Run the targeted unit test.", f"- Validate against `{self.paths['G-001']}`.")
+        self._assert_simultaneous_deletion_reference(body)
+
+    def test_remote_deletion_simultaneous_dependency_reference_is_held(self):
+        body = plan_text("G-002", "Second").replace("depends_on: []", "depends_on:\n  - G-001")
+        self._assert_simultaneous_deletion_reference(body)
+
+    def _assert_simultaneous_deletion_reference(self, body):
+        result, remote_deletions = self._remote_deletion(dependent=False, new_plan=True, target_text=body)
+        self.assertEqual(set(result.withheld_plan_ids), {"G-002"})
+        audit = self.connection.execute("SELECT recovery_evidence FROM execplan_cancellations").fetchone()
+        self.assertEqual(json.loads(audit[0])["affected"], ["G-002"])
+        snapshot = loop_manager.mutable_ready_snapshot(self.connection, str(self.repo), self.repo, self.base)
+        self.assertEqual(snapshot.by_id["G-002"].text, body)
+        self.assertEqual(json.loads(remote_deletions.recovery_goals(self.connection, str(self.repo))[0])["affected_ids"], ["G-002"])
+        self.assertEqual(loop_manager.select_ready_execplan(self.connection, str(self.repo))["plan_id"], "G-007")
+        again = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+        self.assertEqual(set(again.withheld_plan_ids), {"G-002"})
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM execplan_cancellations").fetchone()[0], 1)
 
     def test_remote_deletion_unknown_adopted_hash_is_preserved(self):
         loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
