@@ -157,7 +157,7 @@ class ValidationFeedbackRepository:
 
     def observe(self, repo: str, plan_id: str, revision: str | None,
                 stage: str, passed: bool, raw: str,
-                feedback: tuple[Feedback, ...] = ()) -> None:
+                feedback: tuple[Feedback, ...] = ()) -> int:
         """Append an execution and replace only the materialized active view."""
         if stage not in {"verify", "review"}:
             raise ValueError(stage)
@@ -186,6 +186,7 @@ class ValidationFeedbackRepository:
                             int(row["occurrence"]) + 1 if row else 1,
                             int(row["revision"]) + 1 if row else 1,
                             item.diagnostic, True)
+        return result_id
 
     def _event(self, result_id: int, repo: str, plan_id: str, stage: str,
                identity: str, occurrence: int, revision: int,

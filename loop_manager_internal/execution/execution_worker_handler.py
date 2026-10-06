@@ -216,6 +216,16 @@ class WorkerHandler:
                 self.ports.state.connection, self.ports.identity.repo, str(plan['id']),
                 str(row['review_result'] or ''),
             )
+            if review_result_id is None and not row['review_result']:
+                pending = review_correction_state.load(
+                    self.ports.state.connection, self.ports.identity.repo, str(plan['id']),
+                ).get('pending')
+                if (pending is not None and not pending['completed']
+                        and pending['level'] == self.ports.snapshot().level):
+                    review_result_id = recovery_state.pending_review_correction(
+                        self.ports.state.connection, self.ports.identity.repo, str(plan['id']),
+                        None, source_id=pending['source'],
+                    )
             if review_result_id is not None:
                 allowed, used, review_turn_run_id = recovery_state.reserve_review_correction(
                     self.ports.state.connection, self.ports.identity.repo, str(plan['id']),

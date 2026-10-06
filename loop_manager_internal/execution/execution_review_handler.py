@@ -351,8 +351,9 @@ class ReviewHandler:
                 reason=BlockReasonCode.REVIEW_SPECIFICATION_DEADLOCK,
                 user_targets=review_details.paths,
             )
+        review_source_id = None
         if feedback_repo is not None:
-            feedback_repo.observe(
+            review_source_id = feedback_repo.observe(
                 self.ports.identity.repo, str(self.ports.snapshot().plan['id']), context.plan.definition_revision_sha,
                 'review', verdict == 'PASS', review,
                 normalize_feedback('review', review) if verdict == 'FAIL' else (),
@@ -361,6 +362,7 @@ class ReviewHandler:
             decision = self.ports.transition_validation_failure(
                 self.ports.identity.repo, context.worktree, 'review', review,
                 review_level=review_level, candidate_head=candidate_head,
+                review_source_id=review_source_id,
             )
             self.ports.operation_log(
                 f"Worker 반환: {self.ports.snapshot().plan['id']} {self.ports.snapshot().plan['title']} (Review 실패)",

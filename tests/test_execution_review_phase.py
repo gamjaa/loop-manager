@@ -457,6 +457,9 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
                 'worker-format', 'worker-session', 'invalid Worker result',
             ),
         )
+        self.assertIsNone(handlers.recovery_state.pending_review_correction(
+            self.connection, 'repo', 'G-047', None, source_id=result_id,
+        ))
         self.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: lm.AgentResult(
             1, 'worker failed', session_id='worker-session',
         )
@@ -532,6 +535,64 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
             self.assertEqual(self.connection.execute(
                 "SELECT effective_worker_level FROM exec_plans WHERE plan_id = 'G-047'"
             ).fetchone()[0], 3 if correction == 2 else 2)
+
+    def test_same_level_corrections_after_rebase_retain_review_source(self):
+        from loop_manager_internal.storage import review_correction_state
+        issue = 'ISSUE_ID: app.py::persistent::blocking\nFix it\nVERDICT: FAIL'
+        self.repository.update_plan('repo', 'G-047', plan_values={
+            'initial_worker_level': 1, 'effective_worker_level': 1,
+        }, enqueue=False)
+        self.effects.validation.ensure_worker_level_state.side_effect = lambda *_args: self.connection.execute(
+            "SELECT effective_worker_level FROM exec_plans WHERE plan_id = 'G-047'"
+        ).fetchone()[0]
+        self._with_feedback(ValidationFeedbackRepository(self.connection))
+        self.effects.validation.parse_reviewer_result.side_effect = lm.parse_reviewer_result
+        self.effects.validation.transition_validation_failure.side_effect = self.state.bind(
+            lm.transition_validation_failure, connected=True, mutates=True,
+            name='transition_validation_failure',
+        )
+        handlers.recovery_state.begin_external_run(self.connection)
+        self.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: lm.AgentResult(
+            0, issue, session_id='review-session',
+        )
+        self.handler.review(self.review_context())
+        baseline = review_correction_state.load(self.connection, 'repo', 'G-047')
+        self.assertEqual(baseline['failures'], 0)
+        sources = []
+        for correction in range(1, 3):
+            pending = review_correction_state.load(self.connection, 'repo', 'G-047')['pending']
+            sources.append(pending['source'])
+            self.assertFalse(pending['completed'])
+            self.handler._complete_rebase_intent(self.context())
+            self.assertIsNone(self.state.row()['review_result'])
+            self.assertEqual(review_correction_state.load(
+                self.connection, 'repo', 'G-047')['pending'], pending)
+            self.assertEqual(handlers.recovery_state.pending_review_correction(
+                self.connection, 'repo', 'G-047', None, source_id=pending['source'],
+            ), pending['source'])
+            self.assertIsNone(handlers.recovery_state.pending_review_correction(
+                self.connection, 'repo', 'another-plan', None, source_id=pending['source'],
+            ))
+            self.effects.agent.run_agent.side_effect = self.agent
+            self.handler.run(self.context())
+            worker = review_correction_state.load(self.connection, 'repo', 'G-047')
+            self.assertEqual(worker['pending']['source'], sources[-1])
+            self.assertTrue(worker['pending']['completed'])
+            self.handler.verify(self.context(), self.handler)
+            self.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: lm.AgentResult(
+                0, issue, session_id='review-session',
+            )
+            self.handler.review(self.context())
+            saved = review_correction_state.load(self.connection, 'repo', 'G-047')
+            self.assertEqual(saved['failures'], correction)
+            self.assertEqual(self.connection.execute(
+                "SELECT effective_worker_level FROM exec_plans WHERE plan_id = 'G-047'"
+            ).fetchone()[0], 2 if correction == 2 else 1)
+        self.assertEqual([event['source_review_id'] for event in saved['audit']
+                          if event['kind'] == 'correction'], sources)
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM review_correction_turns WHERE repo = 'repo' AND plan_id = 'G-047'"
+        ).fetchone()[0], 2)
 
     def test_review_of_old_level_candidate_does_not_establish_new_baseline(self):
         from loop_manager_internal.storage import review_correction_state

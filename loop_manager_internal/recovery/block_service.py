@@ -311,12 +311,14 @@ def transition_validation_failure(
     effects: TransitionValidationFailureEffects, connection: sqlite3.Connection,
     repo: str, worktree: Path, stage: str, output: str,
     *, review_level: int | None = None, candidate_head: str | None = None,
+    review_source_id: int | None = None,
 ) -> ValidationFailureDecision:
     # Read, consume the correction identity, and advance the level in one write transaction.
     with runtime_state._transaction(connection):
         return _transition_validation_failure(
             effects, connection, repo, worktree, stage, output,
             review_level=review_level, candidate_head=candidate_head,
+            review_source_id=review_source_id,
         )
 
 
@@ -327,6 +329,7 @@ def _transition_validation_failure(
     stage: str,
     output: str,
     *, review_level: int | None = None, candidate_head: str | None = None,
+    review_source_id: int | None = None,
 ) -> ValidationFailureDecision:
     """Persist stage-local failures and own their retry/BLOCKED transition."""
 
@@ -383,6 +386,13 @@ def _transition_validation_failure(
             review_level=review_level,
             candidate_head=candidate_head,
         )
+        if review_source_id is not None and review_level == plan["effective_worker_level"]:
+            # Preserve the actual FAIL before rebase invalidates review_result.
+            # It is not a completed correction until Worker and verify finish.
+            level_decision.correction_state['pending'] = {
+                'source': review_source_id, 'level': level_decision.effective_level,
+                'completed': False, 'verified_head': None,
+            }
         serialized_level_history = json.dumps(
             level_decision.review_history,
             ensure_ascii=True,
