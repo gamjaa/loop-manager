@@ -380,6 +380,7 @@ class ArchivedDependencySelectionTest(unittest.TestCase):
                     if confirmed
                     else execplan_catalog_state.MergeProofKind.NONE
                 ),
+                revision="b" * 40 if confirmed else None,
             ),
             diagnostic=(
                 None
@@ -453,6 +454,10 @@ class ArchivedDependencySelectionTest(unittest.TestCase):
         )._merged_count("/repo")
 
         self.assertEqual(count, 2)
+        self.connection.execute("UPDATE execplan_catalog_history SET proof_revision = NULL WHERE plan_id = 'G-002'")
+        self.assertEqual(maintenance_state.MaintenanceRepository(self.connection)._merged_count("/repo"), 1)
+        self.connection.execute("UPDATE execplan_catalog_history SET proof_revision = ?, identity_verified = 0 WHERE plan_id = 'G-002'", ("b" * 40,))
+        self.assertEqual(maintenance_state.MaintenanceRepository(self.connection)._merged_count("/repo"), 1)
 
     def test_durable_merge_with_archive_diagnostic_does_not_satisfy_dependency(self):
         from loop_manager_internal.notifications import work_exhaustion
@@ -490,6 +495,7 @@ class ArchivedDependencySelectionTest(unittest.TestCase):
         cycle = mock.Mock(
             phase=maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
             prerequisite_plan_ids=("G-001",),
+            refactoring_plan_ids=(), assessment_plan_ids=(),
         )
         with (
             mock.patch.object(maintenance_state.MaintenanceRepository, "get", return_value=cycle),

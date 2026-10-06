@@ -217,12 +217,12 @@ PLAN_BLOCKED → PR_OPEN (같은 PR을 사용자가 다시 열음)
 유지보수 cycle은 ExecPlan 상태와 별도로 프로젝트별 SQLite에 보존한다.
 
 ```text
-IDLE → ASSESSMENT → IDLE (평가 없음)
-ASSESSMENT → PREREQUISITE_WAIT → ASSESSMENT
-ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
+IDLE → ASSESSMENT → IDLE (확정 계획 없음)
+ASSESSMENT → PREREQUISITE_WAIT → IDLE (확정 범위 Merge)
+ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 ```
 
-활성 작업은 cycle 시작보다 우선하며, 각 cycle 전이는 기록된 계획 집합의 Merge 또는 검증된 Planner 결과로만 진행한다.
+활성 작업은 cycle 시작보다 우선하며, 각 cycle 전이는 기록된 계획 집합의 Merge 또는 검증된 Planner 결과로만 진행한다. 기존 `POST_REFACTOR_REVALIDATION`은 저장된 결과·게시를 복구하고 확정 범위의 Merge를 확인한 뒤 새 평가 없이 종료한다.
 
 외부 CLI의 일시적 실패와 사용 한도 소진은 별도 ExecPlan 상태를 만들지 않고 현재 상태를 보존한다.
 
@@ -289,7 +289,7 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 - 제품 우선순위는 안전한 무인 실행을 막거나 반복적인 사용자 복구를 요구하는 작업, 정상 경로의 사용자 개입을 제거하는 핵심 자동화, 그 밖의 Current Goal, 선택적 편의와 최적화 순이다
 - 실행 가능한 READY ExecPlan이 여럿이면 제품 우선순위가 높은 계획을 먼저 선택하고 같은 우선순위에서는 숫자 ExecPlan ID가 가장 작은 계획을 선택한다
 - 활성 유지보수 prerequisite 집합은 dependency gate 뒤 priority와 숫자 ID 순으로, 리팩터링 DAG는 dependency gate 뒤 숫자 ID 순으로 선택하며 집합 밖 READY는 cycle이 끝날 때까지 시작하지 않는다. 이때도 `PROJECT_BLOCKED`는 일반 실행을 막고, 다른 `PLAN_BLOCKED`·`PR_OPEN`과 dependency로 연결된 계획은 건너뛴다
-- 마지막 리팩터링 계획 Merge 뒤에는 최신 원격 기준 사후 재검증을 성공하고 계획 개정의 원격 게시와 catalog 반영을 마칠 때까지 장벽 뒤 READY를 시작하지 않는다
+- 확정 범위의 마지막 계획 Merge와 필요한 원격 관측·게시·catalog 반영 뒤 cycle을 종료하고 장벽 뒤 READY의 일반 선택으로 돌아간다. 별도 사후 재검증이나 이를 대신하는 일반 Planner 호출을 종료 조건으로 추가하지 않는다
 - 각 ExecPlan은 고유하고 결정적인 이름의 branch와 별도 관리 worktree에서 작업한다
 - 서로 다른 프로젝트는 `max_workers` 범위에서 병렬로 처리한다
 
@@ -303,10 +303,11 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 ### 유지보수 평가
 
 - 기존 활성 cycle을 먼저 복구·완료하고 과거 성공 이력은 유지한다. 새 평가는 최신 원격 입력을 정적으로 확인해 모델 없는 `fast`, 영향받은 모듈의 `targeted`, 전체 모듈의 `full` 점검 중 필요한 범위를 선택한다.
-- 첫 전체 정밀 점검은 초기 입력에서 수행하며, 이후 마지막 성공한 전체 정밀 점검 이후 새 MERGED 수가 `refactoring_review_interval`에 도달하거나 사용자가 전체 점검을 요청하면 다시 수행한다. 설정은 양의 정수이며 기본값은 20이다. 정적·부분 점검은 이 전체 정밀 기준을 전진시키지 않는다.
-- 주기 사이에는 같은 입력에서 평가 모델을 반복 호출하지 않는다. 변경은 정적으로 확인하고 공개 계약·상태·저장·복구·권한·관계 불확실성·순환·중복·루트 배치 등 확인이 필요한 영향에는 관련 모듈과 테스트를 포함한 정밀 점검을 수행한다. 미확인 사실을 성공한 의미 검토로 만들지 않는다.
+- 첫 전체 정밀 점검은 초기 입력에서 수행한다. 이후에는 직전 cycle 정상 종료 시 마지막 유지보수 Merge까지 포함한 MERGED 수에서 `refactoring_review_interval`만큼 증가하거나 새 명시적 요청이 있을 때 시작한다. 설정은 양의 정수이며 기본값은 20이다. 활성 작업·실제 Open PR·프로젝트 안전 gate를 확인한 뒤 due 평가를 일반 Planner·빠른 점검·READY보다 먼저 수행한다.
+- 한 번의 평가에서 모듈 묶음 검토·필요한 종합을 수행하고 발견을 새 계획·기존 비종료 계획·근거 있는 제외에 연결해 prerequisite·리팩터링과 필요한 dependency closure를 확정한다. prerequisite Merge나 개선 결과로 새 평가를 시작해 범위를 늘리지 않는다. 주기 전 코드 영향·평가 receipt와 최신 원본의 차이·완료 후보는 자동 평가의 시작 조건이 아니다.
 - 원본에 결합된 성공 모듈 검토는 해당 묶음의 입력이 같을 때 재사용한다. 검토에서 발견이 없고 일반 계획을 함께 수행할 필요도 없으면 별도 종합·계획 호출을 하지 않는다. 발견이 있으면 새 계획·기존 비종료 계획·근거 있는 제외에 연결해 처리한다.
-- 리팩터링은 동작·공개 계약·저장 형식을 보존한다. 평가 성공·게시·사후 재검증이 실제로 완료되기 전에는 성공 기준을 전진시키지 않는다.
+- 리팩터링은 동작·공개 계약·저장 형식을 보존한다. 각 계획의 targeted test·전체 verify·Review·사용자 Merge를 유지하고 확정 범위가 모두 실제 MERGED인 뒤 종료한다. 계획 없음·기존 계획 연결·근거 있는 제외도 검증·필요한 게시 뒤 종료한다.
+- 평가 성공 원본과 cycle 종료 cadence는 별도로 보존한다. 수정 뒤 검토하지 않은 원본의 receipt를 합성하지 않는다. 명시 요청은 cycle 시작에 identity를 결합해 한 번 소비하며 활성 cycle 중 새 요청은 다음 안전한 경계까지 보존한다. 중단·원본 변경은 같은 cycle의 미완료 게시와 필요한 관련 근거만 재검증한다.
 - 종전 파일별 평가·게시 결과를 보존한 cycle은 해당 검증·복구 경로로 마친다. 그 이력과 완료 후보의 종전 안정화 판정을 새 단계별 평가의 기본 반복 조건으로 사용하지 않는다.
 
 ### 복구 판단과 최종 차단
@@ -353,7 +354,7 @@ ASSESSMENT → REFACTORING → POST_REFACTOR_REVALIDATION → IDLE
 
 - Planner가 현재 PRODUCT와 활성 Requirement에서 추가 ExecPlan이 필요 없다고 판단해야 한다
 - READY, IMPLEMENTING, VERIFYING, REVIEWING, PUBLISHING, PR_OPEN 또는 PLAN_BLOCKED 상태의 ExecPlan과 PROJECT_BLOCKED 레코드가 없어야 한다
-- due 또는 활성 유지보수 cycle과 해결되지 않은 유지보수 planning error가 없어야 하며, 성공 기준선이 최신 평가 또는 사후 재검증 결과까지 전진해야 한다
+- due 또는 활성 유지보수 cycle과 해결되지 않은 유지보수 planning error가 없어야 하며, 실제 Merge·게시·catalog 확인에 결합된 cycle 종료 기준이 있어야 한다. 최신 코드와 평가 receipt의 차이만으로 추가 유지보수를 요구하지 않는다
 - 해결되지 않은 `planning_error`가 없어야 한다
 - `cleanup_pending`은 프로젝트 완료를 막지 않는다
 - Requirement와 ExecPlan에는 별도의 초안 상태를 두지 않는다

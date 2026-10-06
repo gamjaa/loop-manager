@@ -446,10 +446,23 @@ def validate_maintenance_planner_result(
         terminals = effects.terminal_new_plan_ids(refactoring_plans)
         if context.mode is MaintenancePlanMode.BARRIER:
             if refactoring_plans:
-                if set(revised_paths) != set(eligible):
-                    missing = sorted(set(eligible) - set(revised_paths))
+                from loop_manager_internal.maintenance.maintenance_orchestration import (
+                    dependency_plan_ids, validate_prerequisite_plan_ids, MaintenanceOrchestrationError,
+                )
+                rows = maintenance_state.MaintenanceRepository(connection).plan_rows(context.repo)
+                statuses = {str(row["plan_id"]): str(row["status"]) for row in rows}
+                external = {dependency for _path, plan in refactoring_plans for dependency in plan["depends_on"]
+                            if dependency not in declared_refactoring and statuses.get(dependency) != "MERGED"}
+                try:
+                    required = {plan_id for plan_id in dependency_plan_ids(rows, external) if statuses[plan_id] != "MERGED"}
+                    validate_prerequisite_plan_ids(rows, tuple(required))
+                except MaintenanceOrchestrationError as error:
+                    raise MaintenancePlanningError(str(error)) from error
+                barrier_paths = {path for path, snapshot in eligible.items() if snapshot.plan_id not in required}
+                if set(revised_paths) != barrier_paths:
+                    missing = sorted(barrier_paths - set(revised_paths))
                     raise MaintenancePlanningError(
-                        "barrier mode는 모든 eligible READY 계획에 말단 dependency를 "
+                        "barrier mode는 필요한 선행을 제외한 모든 eligible READY 계획에 말단 dependency를 "
                         f"추가해야 합니다: {', '.join(missing)}"
                     )
                 for _path, plan in new_plans:
@@ -458,20 +471,6 @@ def validate_maintenance_planner_result(
                             "combined 일반 계획은 리팩터링 DAG 말단 뒤에 있어야 합니다: "
                             + str(plan["id"])
                         )
-                statuses = {
-                    str(row["plan_id"]): str(row["status"])
-                    for row in connection.execute(
-                        "SELECT plan_id, status FROM exec_plans WHERE repo = ?",
-                        (context.repo,),
-                    )
-                }
-                for _path, plan in refactoring_plans:
-                    for dependency in plan["depends_on"]:
-                        if dependency not in declared_refactoring and statuses.get(str(dependency)) != "MERGED":
-                            raise MaintenancePlanningError(
-                                "리팩터링 DAG의 외부 dependency는 이미 MERGED여야 합니다: "
-                                f"{plan['id']} -> {dependency}"
-                            )
             elif revised_paths:
                 raise MaintenancePlanningError(
                     "리팩터링 계획이 없는 assessment는 READY 장벽을 수정할 수 없습니다."

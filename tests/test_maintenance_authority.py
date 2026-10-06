@@ -29,6 +29,23 @@ from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot
 from tests.support.maintenance_planning_case import MaintenancePlanningCase, git
 
 class MaintenanceAuthorityTest(MaintenancePlanningCase):
+    def test_single_assessment_dag_accepts_required_ready_without_reverse_barrier(self):
+        context = self._begin_barrier()
+        self._write_plan("G-002", "Refactor Boundary", depends_on=("G-001",))
+        result = loop_manager.validate_maintenance_planner_result(
+            self.connection, context, self.repo, loop_manager.changed_files(self.repo),
+            refactoring_plan_ids=("G-002",),
+        )
+        self.assertEqual(result.refactoring_plan_ids, ("G-002",))
+        self.assertEqual(result.revisions, ())
+        self.assertEqual(result.plans[0][1]["depends_on"], ["G-001"])
+        self.connection.execute("UPDATE exec_plans SET branch = 'owned' WHERE plan_id = 'G-001'")
+        with self.assertRaises(loop_manager.PlannerValidationError):
+            loop_manager.validate_maintenance_planner_result(
+                self.connection, context, self.repo, loop_manager.changed_files(self.repo),
+                refactoring_plan_ids=("G-002",),
+            )
+
     def test_maintenance_snapshot_excludes_historical_ready_identity(self):
         text = self.ready_path.read_text(encoding="utf-8")
         entry = execplan_catalog.snapshot_from_documents(
@@ -606,7 +623,7 @@ class MaintenanceAuthorityTest(MaintenancePlanningCase):
             (str(self.repo),),
         ).fetchone()
         self.assertEqual(completed.phase, maintenance_state.MaintenancePhase.IDLE)
-        self.assertEqual(completed.last_success_commit, plan_commit)
+        self.assertEqual(completed.last_cycle_commit, plan_commit)
         self.assertEqual(repeated, completed)
         self.assertEqual(json.loads(row["depends_on"]), [])
         self.assertEqual(row["plan_sha"], plan_commit)

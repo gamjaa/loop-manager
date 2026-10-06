@@ -1,5 +1,6 @@
 """Planner invocation, source-bound file assessment, and result validation."""
 from __future__ import annotations
+import json
 from pathlib import Path
 from loop_manager_internal.planning.agent_ports import run_scoped_planner_turn, planner_progress
 from loop_manager_internal.planning.planning_catalog import PlanningResultInvalid
@@ -88,6 +89,9 @@ class PlanningAssessmentService(PlanningService):
         if module_enabled:
             file_review_enabled = False
         if should_run:
+            if run.maintenance_cycle.phase is maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION:
+                self._ports.events.error("기존 사후 재검증의 미확정 결과를 보존합니다. 추가 Planner 호출은 실행하지 않습니다.")
+                return self._operational_error()
             final_page = None
             module_context = None
             if module_enabled:
@@ -434,6 +438,7 @@ class PlanningAssessmentService(PlanningService):
         assert worktree is not None
         dirty_files = run.dirty_files or []
         decision: MaintenancePlannerDecision | None = None
+        existing_plan_ids = ()
         try:
             if run.planner_scope_error is not None:
                 raise PlanningResultInvalid(run.planner_scope_error)
@@ -451,7 +456,7 @@ class PlanningAssessmentService(PlanningService):
                 module_enabled = tiered_assessment.enabled(self._ports, run)
                 if module_enabled:
                     try:
-                        self._ports.tiered.validate_final(run, decision)
+                        existing_plan_ids = self._ports.tiered.validate_final(run, decision)
                     except TieredReviewError as error:
                         raise PlanningResultInvalid(str(error)) from error
                 if (not module_enabled and run.maintenance_cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT
@@ -471,6 +476,9 @@ class PlanningAssessmentService(PlanningService):
                         )
                         if isinstance(resolution, maintenance_reconciliation.ResolutionUnit):
                             return self._resolve_one_page(run, worktree, resolution)
+                        if isinstance(resolution, dict):
+                            existing_plan_ids = tuple(sorted({item["plan_id"] for item in resolution["findings"]
+                                if item["status"] == "existing_plan"}))
                     except (maintenance_reconciliation.ReconciliationError,
                             maintenance_file_review.FileReviewError, SourceInventoryError) as error:
                         raise PlanningResultInvalid(str(error)) from error
@@ -649,7 +657,6 @@ class PlanningAssessmentService(PlanningService):
                 and context.self_repository
                 and run.maintenance_cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT
                 and not run.maintenance_cycle.full_assessment_completed
-                and decision.outcome is not MaintenanceOutcome.PREREQUISITES
             ):
                 try:
                     inventory = self._assessment.inventory(
@@ -658,8 +665,7 @@ class PlanningAssessmentService(PlanningService):
                     report = self._assessment.validate(
                         str(row.planning_result or ""), inventory,
                         str(row.active_sha),
-                        decision.plan_ids
-                        if decision.outcome is MaintenanceOutcome.REFACTORING else (),
+                        decision.plan_ids if decision.outcome is MaintenanceOutcome.REFACTORING else (),
                         {str(item["plan_id"]) for item in
                          self._ports.state.execplan_rows(context.repo)},
                     )
@@ -668,6 +674,8 @@ class PlanningAssessmentService(PlanningService):
                         expected_revision=run.maintenance_cycle.revision,
                         source_sha=str(row.active_sha), result=report,
                     )
+                    existing_plan_ids = tuple(sorted({plan_id for item in json.loads(report)["findings"]
+                        if item["status"] == "existing_plan" for plan_id in item["plan_ids"]}))
                 except (AssessmentError,
                         maintenance_state.MaintenanceStateError) as error:
                     raise PlanningResultInvalid(str(error)) from error
@@ -702,48 +710,6 @@ class PlanningAssessmentService(PlanningService):
                 PlanningOutcomeKind.VALIDATION_RETRY, error=True
             )
 
-        if (
-            decision is not None
-            and decision.outcome is MaintenanceOutcome.PREREQUISITES
-        ):
-            try:
-                self._ports.git.validate_worktree_ownership(
-                    context.repo,
-                    str(row.planning_attempt_fingerprint or run.current_fingerprint or ""),
-                    worktree,
-                )
-                with self._ports.state.transaction():
-                    self._ports.state.transition_maintenance(
-                        context.repo,
-                        expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,
-                        expected_revision=run.maintenance_cycle.revision,
-                        next_phase=(
-                            maintenance_state.MaintenancePhase.PREREQUISITE_WAIT
-                        ),
-                        prerequisite_plan_ids=decision.plan_ids,
-                        include_general_planning=False,
-                    )
-                    self._ports.state.clear_active_in_transaction(context.repo)
-                    self._ports.git.run(
-                        context.repo_path,
-                        "worktree",
-                        "remove",
-                        str(worktree),
-                    )
-            except RuntimeError as error:
-                message = str(error)
-                self._ports.state.update(
-                    context.repo,
-                    planning_error=row.planning_error or message,
-                    planning_error_fingerprint=(
-                        row.planning_error_fingerprint or run.current_fingerprint
-                    ),
-                    last_error=message,
-                )
-                self._ports.events.error(message)
-                return self._operational_error()
-            return PlanningOutcome(PlanningOutcomeKind.PREREQUISITE_WAIT)
-
         if decision is not None and decision.outcome is MaintenanceOutcome.UNSAFE:
             message = (
                 "post-refactor revalidation이 제품 목표 보존을 확정하지 못했습니다: "
@@ -771,6 +737,10 @@ class PlanningAssessmentService(PlanningService):
         )
         run.maintenance_decision = decision
         run.validated_result = validated_result
+        if decision is not None and run.maintenance_cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT:
+            self._ports.state.record_maintenance_scope(context.repo, run.maintenance_cycle.revision, existing_plan_ids,
+                prerequisite_plan_ids=decision.plan_ids if decision.outcome is MaintenanceOutcome.PREREQUISITES else ())
+            self._ports.events.log(f"유지보수 평가 확정 범위: 결과={decision.outcome.value}, 계획={','.join((*decision.plan_ids, *existing_plan_ids)) or '없음'} (필요 dependency 포함)")
         if row.planning_error and row.planning_correction_error:
             if self._ports.git.fetch_base(context.repo_path, context.base_branch) != row.active_sha:
                 return PlanningOutcome(

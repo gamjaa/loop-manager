@@ -17,8 +17,19 @@ class TieredMaintenancePort:
         self.repository = tiered_review.TieredReviewRepository(connection)
 
     def select(self, context, revision):
-        return self.repository.select(context.repo, context.repo_path, context.base_branch, revision,
-            context.refactoring_review_interval, maintenance_state.MaintenanceRepository(self.connection).merged_count(context.repo))
+        maintenance = maintenance_state.MaintenanceRepository(self.connection)
+        cycle = maintenance.get(context.repo)
+        due = self.due(context)
+        selection = self.repository.select(context.repo, context.repo_path, context.base_branch, revision,
+            context.refactoring_review_interval, maintenance.merged_count(context.repo), force_full=due.required)
+        if cycle.phase is maintenance_state.MaintenancePhase.IDLE:
+            return replace(selection, required=due.required, paths=selection.paths if due.required else (),
+                           reasons=(due.reason,))
+        return selection
+
+    def due(self, context):
+        return maintenance_state.MaintenanceRepository(self.connection).file_assessment_due(
+            context.repo, context.refactoring_review_interval)
 
     def content(self, repository, revision, path):
         return code_index.git(repository, "show", f"{revision}:{path}")
@@ -36,7 +47,35 @@ class TieredMaintenancePort:
             selection = replace(selection, required=True)
         if cycle.cycle_start_merged_count is not None:
             selection = replace(selection, merged_count=cycle.cycle_start_merged_count)
-        return self.repository.prepare(context.repo, cycle.revision, selection)
+        prior = self.repository.latest(context.repo)
+        review_mode = None
+        if (prior is not None and prior.get("cycle_id") == cycle.cycle_id
+                and prior["source_revision"] != str(run.row.active_sha)):
+            paths = set(prior["paths"])
+            changed = {path for path in paths if prior["records"].get(path) != selection.index.records.get(path)}
+            for path in changed:
+                for records in (prior["records"], selection.index.records):
+                    if path in records:
+                        facts = records[path]["facts"]
+                        paths.update(facts["dependents"])
+                        paths.update(facts["related_tests"])
+                        paths.update(ref["path"] for ref in facts["references"])
+            if prior["roots"] != list(selection.roots):
+                paths.update(path for path in selection.index.records if "/" not in path)
+            groups = {code_index.module_group(path) for path in paths}
+            paths.update(path for path in selection.index.records if code_index.module_group(path) in groups)
+            paths &= selection.index.records.keys()
+            mode = prior["mode"]
+            if (mode == "full" and paths != selection.index.records.keys()) or (mode == "fast" and selection.mode != "fast"):
+                mode = "targeted"
+            # Full judgments can be reused for their unchanged original modules;
+            # a partial current scope must not claim a full current-source success.
+            review_mode = prior.get("review_mode", prior["mode"]) if prior["mode"] != "fast" else mode
+            selection = replace(selection, mode=mode, reasons=("resume_related_scope",),
+                paths=tuple(sorted(paths)), request_id=prior["request_id"])
+        else:
+            selection = replace(selection, request_id=cycle.cycle_request_id)
+        return self.repository.prepare(context.repo, cycle.revision, selection, cycle_id=cycle.cycle_id, review_mode=review_mode)
 
     def export(self, run, assessment, unit=None):
         directory = run.context.state_dir / "maintenance-evidence"
@@ -83,8 +122,6 @@ class TieredMaintenancePort:
         # may reject a candidate, link an existing plan, or link a newly validated plan.
         if findings:
             from loop_manager_internal.maintenance.maintenance_orchestration import MaintenanceOutcome
-            if decision.outcome is MaintenanceOutcome.PREREQUISITES:
-                return  # Existing dependency-closed prerequisite validation applies.
             lines = [line[len("MODULE_FINDINGS_RESULT: "):] for line in str(run.row.planning_result or "").splitlines()
                      if line.startswith("MODULE_FINDINGS_RESULT: ")]
             if len(lines) != 1:
@@ -122,10 +159,14 @@ class TieredMaintenancePort:
                     continue
                 raise tiered_review.TieredReviewError("모듈 발견이 유효한 처리나 계획에 연결되지 않았습니다.")
             new_ids = {item["plan_id"] for item in dispositions if item["status"] == "new_plan"}
-            if new_ids != set(decision.plan_ids):
+            if new_ids != (set(decision.plan_ids) if decision.outcome is MaintenanceOutcome.REFACTORING else set()):
                 raise tiered_review.TieredReviewError("새 리팩터링 계획과 모듈 발견 연결이 다릅니다.")
+            return tuple(sorted({item["plan_id"] for item in dispositions if item["status"] == "existing_plan"}))
         elif decision.plan_ids:
-            raise tiered_review.TieredReviewError("모듈 발견 없이 리팩터링 계획을 만들 수 없습니다.")
+            from loop_manager_internal.maintenance.maintenance_orchestration import MaintenanceOutcome
+            if decision.outcome is not MaintenanceOutcome.PREREQUISITES:
+                raise tiered_review.TieredReviewError("모듈 발견 없이 리팩터링 계획을 만들 수 없습니다.")
+        return ()
 
 
 def prepare_query_context(connection, repository, base, revision, directory):

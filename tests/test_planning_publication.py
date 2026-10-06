@@ -111,7 +111,7 @@ class PlanningPublicationTest(PlanningCase):
             "planner-session",
         )
 
-    def test_unpublished_planning_slot_yields_only_clean_owned_base_worktree(self):
+    def test_unpublished_assessment_keeps_owned_worktree_for_every_ready_guard(self):
         for guard in ("clean", "dirty", "committed", "ownership", "publication", "project_blocked", "active"):
             with self.subTest(guard=guard), tempfile.TemporaryDirectory() as directory:
                 snapshot = planning_snapshot(
@@ -145,19 +145,10 @@ class PlanningPublicationTest(PlanningCase):
                     ports.state.schedule_result.active = {"plan_id": "G-059"}
                 coordinator = PlanningLifecycleCoordinator(ports)
                 run = coordinator._new_run(self.context)
-                if guard == "ownership":
-                    with self.assertRaises(PlanningWorkspaceOwnershipError):
-                        coordinator._selection._select_planning_work(run)
-                else:
-                    outcome = coordinator._selection._select_planning_work(run)
-                    if guard == "clean":
-                        self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
-                        self.assertIsNone(ports.state.snapshot.phase)
-                        self.assertEqual(ports.state.snapshot.planning_fingerprint, "successful-input")
-                        self.assertEqual(ports.state.snapshot.processed_sha, "old")
-                    else:
-                        self.assertIsNone(outcome)
-                        self.assertEqual(ports.state.snapshot, snapshot)
+                outcome = coordinator._selection._select_planning_work(run)
+                self.assertIsNone(outcome)
+                self.assertEqual(ports.state.snapshot, snapshot)
+                self.assertEqual(ports.state.diagnostics, [])
                 self.assertEqual(ports.state.cycle, cycle)
 
     def test_remote_base_race_preserves_commit_before_push_or_registration(self):
@@ -533,7 +524,7 @@ class PlanningPublicationTest(PlanningCase):
             self.assertTrue(ports.state.snapshot.planning_result_completed)
             self.assertTrue(worktree.exists())
 
-    def test_prerequisite_cleanup_failure_preserves_planning_and_cycle(self):
+    def test_prerequisite_publication_cleanup_failure_preserves_planning_and_cycle(self):
         with tempfile.TemporaryDirectory() as directory:
             worktree = Path(directory) / "planning"
             worktree.mkdir()
@@ -548,8 +539,6 @@ class PlanningPublicationTest(PlanningCase):
                 worktree=str(worktree),
                 planning_attempt_fingerprint="fingerprint",
                 planning_workspace_owned=1,
-                planning_error="saved validation failure",
-                planning_error_fingerprint="fingerprint",
                 planner_session_id="saved-session",
                 planning_result=(
                     'MAINTENANCE_RESULT: '
@@ -576,13 +565,20 @@ class PlanningPublicationTest(PlanningCase):
                 "loop_manager_internal.planning.assessment_service.validate_prerequisite_plan_ids",
                 return_value=("G-001",),
             ):
-                outcome = coordinator._assessment._validate_planner_result(run)
+                self.assertIsNone(coordinator._assessment._validate_planner_result(run))
+
+            ports.state.transition_maintenance.assert_not_called()
+            cycle = ports.state.cycle
+            self.assertEqual(cycle.prerequisite_plan_ids, ("G-001",))
+            run.row = ports.state.snapshot
+            run.maintenance_cycle = cycle
+            outcome = coordinator._publication._publish_planner_result(run)
 
             self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
             self.assertEqual(ports.state.snapshot.phase, "PLANNING")
             self.assertEqual(ports.state.snapshot.worktree, str(worktree))
             self.assertEqual(ports.state.snapshot.planning_error,
-                             "saved validation failure")
+                             "cleanup failed")
             self.assertEqual(ports.state.snapshot.planning_error_fingerprint,
                              "fingerprint")
             self.assertEqual(ports.state.snapshot.planner_session_id,

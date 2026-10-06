@@ -12,6 +12,7 @@ from unittest import mock
 import loop_manager
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.planning.planning_workspace import legacy_release_identity
 from loop_manager_internal.maintenance import maintenance_file_review
 from loop_manager_internal.maintenance import maintenance_findings
 from loop_manager_internal.maintenance import maintenance_reconciliation
@@ -99,6 +100,19 @@ def maintenance_cycle(**overrides):
 
 
 class FakeStatePort:
+    def prepare_legacy_release(self, expected, cycle):
+        if self.snapshot != expected or self.cycle != cycle:
+            raise RuntimeError("release input changed")
+        self.cycle = replace(cycle, legacy_release_identity=legacy_release_identity(expected, cycle))
+        return self.cycle
+
+    def complete_legacy_release(self, expected, cycle):
+        with self.transaction():
+            if self.snapshot != expected or self.cycle != cycle:
+                raise RuntimeError("release input changed")
+            self.clear_active_in_transaction(expected.repo)
+            self.cycle = replace(cycle, legacy_release_identity=None)
+
     def __init__(self, snapshot, cycle=None):
         self.snapshot = snapshot
         self.cycle = cycle or maintenance_cycle()
@@ -307,6 +321,9 @@ class FakeStatePort:
 
     def transition_maintenance(self, *_args, **_kwargs):
         raise AssertionError("unexpected maintenance transition")
+
+    def record_maintenance_scope(self, _repo, _revision, plan_ids, prerequisite_plan_ids=()):
+        self.cycle = replace(self.cycle, assessment_plan_ids=plan_ids, prerequisite_plan_ids=prerequisite_plan_ids)
 
     def advance_success_baseline(self, *_args, **_kwargs):
         raise AssertionError("unexpected maintenance baseline")
