@@ -432,12 +432,27 @@ class PlanningSelectionService(PlanningService):
             if check_accepted:
                 planning_input_changed = False
                 run.fingerprint_skipped = True
+            if (hasattr(self._ports.state, "planning_review") and not approval_pending
+                    and not specification_changed and not planning_input_changed
+                    and not (run.audit_restorations or run.audit_pending or run.retirement_pending)
+                    and self._ports.state.final_review_candidate(context.repo,
+                        context.refactoring_review_interval, self_repository=context.self_repository)):
+                from loop_manager_internal.planning.specification_review import current_receipt
+                run.final_review_required = not current_receipt(
+                    self._ports.state.planning_review(context.repo, "final"),
+                    repo=context.repo_path, revision=run.base_sha,
+                    input_fingerprint=run.general_fingerprint,
+                    specification_fingerprint=run.specification_fingerprint,
+                    work_cycle=self._ports.state.review_work_cycle(context.repo),
+                    archive_only=self._ports.git.requirement_archive_only,
+                )
             run.selection = choose_planning_decision(
                 has_active=getattr(decision, "active", None) is not None,
                 specification_changed=(specification_changed or approval_pending
                                        or bool(run.retirement_pending)
                                        or bool(run.audit_restorations)
-                                       or bool(run.audit_pending)),
+                                       or bool(run.audit_pending)
+                                       or run.final_review_required),
                 runnable_ready=decision.runnable_ready is not None,
                 planning_input_changed=planning_input_changed,
                 check_ready=check_ready,

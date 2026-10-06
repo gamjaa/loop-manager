@@ -9,7 +9,7 @@ from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot
 from loop_manager_internal.planning.planning_catalog import PlanDeletion
 from loop_manager_internal.planning.planning_catalog import PlannerValidationError
 from loop_manager_internal.storage import execplan_catalog_state
-from loop_manager_internal.storage import planning_publication_state, planning_input_state
+from loop_manager_internal.storage import planning_publication_state, planning_input_state, planning_review_state
 from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.storage import execplan_draft_state
 from loop_manager_internal.catalog import execplan_drafts
@@ -556,6 +556,7 @@ def _apply_general_planning_batch(
                         drafts.bind_plan(repo, claim, str(plan["id"]))
             except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
                 raise PlannerValidationError(str(error)) from error
+        planning_review_state.confirm(connection, repo, snapshot.active_sha, plan_commit)
         effects._clear_active_in_current_transaction(
             connection,
             repo,

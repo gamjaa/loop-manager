@@ -676,6 +676,7 @@ class RetirementPublicationManifestTest(unittest.TestCase):
 
     def test_remote_confirmed_move_marks_receipt_and_audit_together(self):
         connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
         self.addCleanup(connection.close)
         connection.executescript("""
             CREATE TABLE requirement_move_receipts(
@@ -708,6 +709,11 @@ class RetirementPublicationManifestTest(unittest.TestCase):
             is_loop_manager_repository=lambda *_args: False,
             plan_declarations=lambda *_args: (),
         )
+        from loop_manager_internal.storage import planning_review_state
+        planning_review_state.begin(connection, "repo", purpose="final", revision="base",
+            input_fingerprint="planning", specification_fingerprint="spec",
+            work_cycle="cycle", comparison_revision=None)
+        planning_review_state.validate(connection, "repo", "base", "full review evidence", "fulfilled")
         module = "loop_manager_internal.planning.planner_publication"
         with (mock.patch(module + ".planning_publication_state.apply_mutable_catalog_changes"),
               mock.patch(module + ".planning_publication_state.delete_general_planning_publication"),
@@ -720,7 +726,25 @@ class RetirementPublicationManifestTest(unittest.TestCase):
             "SELECT (SELECT stage FROM requirement_move_receipts), "
             "(SELECT stage FROM requirement_audit)",
         ).fetchone()
-        self.assertEqual(stages, ("published", "published"))
+        self.assertEqual(tuple(stages), ("published", "published"))
+        receipt = planning_review_state.get(connection, "repo", "final")
+        self.assertEqual(receipt["confirmed_revision"], "commit")
+        self.assertEqual(receipt["revision"], "base")
+        self.assertIsNone(planning_review_state.get(connection, "repo", "attempt"))
+        # A later SQLite failure in the same remote batch cannot advance the receipt.
+        planning_review_state.begin(connection, "repo", purpose="final", revision="base",
+            input_fingerprint="changed", specification_fingerprint="spec",
+            work_cycle="next-cycle", comparison_revision=None)
+        planning_review_state.validate(connection, "repo", "base", "new full review", "fulfilled")
+        connection.execute("UPDATE requirement_move_receipts SET base_sha = 'wrong-base'")
+        with (mock.patch(module + ".planning_publication_state.apply_mutable_catalog_changes"),
+              mock.patch(module + ".planning_publication_state.delete_general_planning_publication"),
+              mock.patch(module + ".planning_input_state.record_general"),
+              self.assertRaises(PlannerValidationError)):
+            _apply_general_planning_batch(effects, connection, "repo", Path("/unused"), result,
+                                          "commit", "spec", "planning")
+        self.assertEqual(dict(planning_review_state.get(connection, "repo", "final")), dict(receipt))
+        self.assertEqual(planning_review_state.get(connection, "repo", "attempt")["work_cycle"], "next-cycle")
 
     def test_planner_scope_uses_only_proven_manager_move_paths(self):
         effects = SimpleNamespace(

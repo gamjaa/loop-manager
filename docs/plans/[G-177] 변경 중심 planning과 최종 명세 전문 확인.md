@@ -39,10 +39,15 @@ priority: critical
 
 - [x] 2026-10-05 planning 기준 a049a76의 명세·원본·관련 테스트와 비종료 catalog에서 미충족 범위를 확인함. 구현·테스트 실행은 하지 않음.
 - [x] 2026-10-06 b8ac37e의 G-176 Merge와 PRODUCT 변경을 확인하고 유지보수 종료와 프로젝트 최종 확인의 서로 다른 조건을 명확히 함.
-- [ ] 구현 및 관련 targeted unit 검증
+- [x] 2026-10-06 변경 비교·최종 전문 확인의 입력/결과 저장, 완료 gate와 게시 transaction 연결 및 관련 targeted unit 검증을 구현함.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
 
 - 성공 기준선·역할 선택·완료 gate가 연결되어 complexity high, 누락된 목표의 조기 완료 영향으로 risk high다.
 - G-176의 단일 평가·확정 범위 종료를 유지한다. R-057의 최종 전문 확인은 프로젝트 완료 판단에만 결합하며 유지보수 주기를 다시 열거나 사후 재검증을 복원하지 않는다.
+- 검토 문맥·결과 검증은 `planning/specification_review.py`, 원격 적용 전 attempt와 성공 기준선·최종 receipt는 `storage/planning_review_state.py`로 분리했다. 기존 입력 지문·역할 선택·mutable snapshot·Requirement judgment·게시 복구 helper를 재사용하며 루트 항목을 추가·이동하지 않는다.
+- 최초/비교 실패는 전문 검토, 비교 가능한 일반 호출은 delta 검토를 한다. 변경 검토·Requirement 판단 게시 후 입력과 catalog가 안정적인 완료 후보에서만 별도 최종 확인을 선택한다. 최종 확인에는 원격 입력 identity, 모든 활성 명세와 구현·검증 파일 근거 및 fulfilled/followup/needs_decision 결과를 요구한다. 후속 계획·draft의 source·기존 권한·사용자 결정 경계를 유지한다.
+- 성공 근거는 기존 원격 확인·SQLite 원자 적용 transaction에서만 확정한다. 최종 확인 도중 base 전진·불완전한 결과·게시/적용 실패는 성공을 전진시키지 않는다. 새 일반 검토 성공과 실제 Merge 수·유지보수 revision·저장된 후보/verify/review identity 변경은 오래된 최종 완료 근거를 무효화하며 이력은 보존한다. 최종 Planner에 검증 identity를 전달하고 누락·오래된 근거를 성공으로 합성하지 않도록 명시한다.
+- `docs/PRODUCT.md`의 일반 planning·프로젝트 완료 장기 규칙을 구현과 맞췄다. Requirement·ARCHITECTURE·PLANS·AGENTS와 사용자 결정은 수정하지 않았다. 기존 Linux `scripts/verify.sh`는 전체 검증 runner를 실행하고 실패 코드를 반환하므로 변경 없이 유지했다.
+- 검증: `SpecificationReviewSelectionTest` 9개와 완료 지문·archive·원격 게시 원자 적용 unit case 3개, 실제 state port 완료 후보 및 기존 DB의 additive schema 적용 unit case 각 1개를 통과했다. 첫 실행의 fixture 비교 지문·transaction 설정 오류를 교정한 뒤 같은 명령으로 재실행했다. 전체 verify·Review·사용자 Merge는 Manager의 후속 단계다.

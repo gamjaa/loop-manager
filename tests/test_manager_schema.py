@@ -61,6 +61,7 @@ class ManagerSchemaTest(unittest.TestCase):
             database.close()
 
             with closing(loop_manager.connect_database(state_dir)) as connection, connection:
+                self.assertEqual(connection.execute("SELECT COUNT(*) FROM planning_reviews").fetchone()[0], 0)
                 columns = {
                     row[1] for row in connection.execute("PRAGMA table_info(projects)")
                 }
