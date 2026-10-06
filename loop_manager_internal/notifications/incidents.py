@@ -396,6 +396,32 @@ def _project_checkpoint_suffix(checkpoint):
     ).encode()).hexdigest()) if checkpoint else ""
 
 
+def _preservation_checkpoint(connection, repo, scope, owner):
+    """Read current-cause artifacts without treating them as branch ownership."""
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='diagnostic_preservations'").fetchone() is None:
+        return None
+    if scope == 'planning':
+        row = connection.execute('SELECT planning_error_incident_id, planning_error_fingerprint, '
+                                 'planning_attempt_fingerprint FROM projects WHERE repo = ?', (repo,)).fetchone()
+        cause = str(row[0] or row[1] or row[2] or '') if row else ''
+    else:
+        table = 'project_blocks' if scope == 'project' else 'execplan_blocks'
+        row = connection.execute(f'SELECT * FROM {table} WHERE repo = ? AND plan_id = ?', (repo, owner)).fetchone()
+        if row is None:
+            return None
+        cause = hashlib.sha256(json.dumps(dict(row), sort_keys=True).encode()).hexdigest()
+    rows = connection.execute('SELECT payload FROM diagnostic_preservations WHERE repo = ? '
+                              'AND scope = ? AND owner = ? ORDER BY observed_order DESC', (repo, scope, owner)).fetchall()
+    for row in rows:
+        payload = json.loads(row[0])
+        if payload.get('cause_identity') == cause:
+            origin = connection.execute('SELECT origin FROM projects WHERE repo = ?', (repo,)).fetchone()
+            if payload.get('result') == 'published':
+                payload['branch_url'] = _checkpoint_link(origin[0] if origin else None, payload.get('commit_oid'))
+            return payload
+    return None
+
+
 def _current_block_key(
     connection: sqlite3.Connection, repo: str, payload: dict[str, object],
 ) -> str | None:
@@ -410,7 +436,8 @@ def _current_block_key(
         has_block = connection.execute(
             "SELECT 1 FROM project_blocks WHERE repo = ?", (repo,),
         ).fetchone()
-        return (_key("blocked", repo, "project\0planning_error\0")
+        return (_key("blocked", repo, "project\0planning_error\0" + _project_checkpoint_suffix(
+                    _preservation_checkpoint(connection, repo, 'planning', 'planning')))
                 if project and project[0] and not has_block else None)
     if payload.get("scope") == "plan":
         block = connection.execute(
@@ -423,6 +450,7 @@ def _current_block_key(
             return None
         recovery_subject = str(subject)
         remote = _remote_inspection_suffix(block[1], block[2], block[3])
+        remote += _project_checkpoint_suffix(_preservation_checkpoint(connection, repo, 'plan', str(subject)))
     elif payload.get("scope") == "project":
         block = connection.execute(
             "SELECT reason_code, plan_id FROM project_blocks WHERE repo = ?",
@@ -431,7 +459,8 @@ def _current_block_key(
         if block is None or block[0] != reason or block[1] != subject:
             return None
         recovery_subject = str(subject or "__project__")
-        remote = _project_checkpoint_suffix(_project_checkpoint(connection, repo, subject))
+        remote = _project_checkpoint_suffix(_preservation_checkpoint(connection, repo, 'project', subject)
+                                             or _project_checkpoint(connection, repo, subject))
     else:
         return None
     recovery_table = connection.execute(

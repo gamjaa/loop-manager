@@ -84,6 +84,7 @@ class PlanningSelectionService(PlanningService):
                 f"보존된 planning worktree: {row.preserved_worktree}"
             )
             if row.planning_preserved_state:
+                self._ports.state.retry_diagnostic_preservation(run.context.repo, row)
                 return self._continue_published_work(run)
             return self._suspend_failed_planning(run)
         if row.planning_preserved_state:
@@ -118,6 +119,9 @@ class PlanningSelectionService(PlanningService):
                   or row.planning_retry_count or row.planning_result_pending_validation
                   or row.planning_result_completed):
                 raise PlanningWorkspaceOwnershipError("planning worktree 경로가 저장되지 않았습니다.")
+            # Preservation proves its own ownership; an unresolved operation
+            # may be inspectable even though it cannot release the execution slot.
+            self._ports.state.preserve_diagnostics(context.repo, row)
             self._ports.git.validate_planning_release(context.repo, worktree)
             if row.agent_snapshot:
                 scope = self._ports.agent.validate_saved_scope(
@@ -125,7 +129,6 @@ class PlanningSelectionService(PlanningService):
                 )
                 if scope.error:
                     raise PlanningWorkspaceOwnershipError(scope.error)
-            self._ports.state.preserve_diagnostics(context.repo, row)
             self._ports.state.suspend_planning(
                 row, unconfirmed_plan_ids=self._unconfirmed_failed_plans(run, worktree),
             )

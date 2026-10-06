@@ -250,6 +250,8 @@ class PlanningStatePort(Protocol):
         self, repo: str, snapshot: runtime_state.PlanningSnapshot
     ) -> None: ...
 
+    def retry_diagnostic_preservation(self, repo: str, snapshot: runtime_state.PlanningSnapshot) -> None: ...
+
     def clear_active(
         self,
         repo: str,

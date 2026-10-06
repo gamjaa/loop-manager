@@ -12,6 +12,7 @@ from .repository import (adopt_legacy_block_notices, ensure_schema, _enabled,
 from .incidents import (_key, _remote_inspection_suffix, _queue_block,
                         _plan_block_key, _project_block_key,
                         _project_checkpoint, _project_checkpoint_suffix)
+from .incidents import _preservation_checkpoint
 from .rendering import _checkpoint_link
 
 
@@ -112,18 +113,21 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         "b.evidence AS evidence, c.result AS checkpoint_result, "
         "c.remote_oid AS checkpoint_remote_oid, "
         "c.unpublished_reason AS checkpoint_unpublished_reason, "
-        "c.branch AS checkpoint_branch, r.origin AS origin, "
+        "c.branch AS checkpoint_branch, c.phase AS checkpoint_phase, r.origin AS origin, "
         "c.inspected_remote_oid AS checkpoint_inspected_remote_oid, "
         "c.inspection_reason AS checkpoint_inspection_reason "
         "FROM execplan_blocks AS b JOIN exec_plans AS p USING (repo, plan_id) "
         "JOIN projects AS r ON r.repo = b.repo "
         "LEFT JOIN blocked_checkpoints AS c USING (repo, plan_id) "
         "WHERE b.repo = ? AND (c.repo IS NULL OR c.phase IN "
-        "('published', 'unpublished')) ORDER BY p.plan_id",
+        "('published', 'unpublished', 'retry_pending')) ORDER BY p.plan_id",
         (repo,),
     ).fetchall()
     for row in plan_blocks:
         plan = _BlockedPlanProjection.from_row(row)
+        preservation_checkpoint = _preservation_checkpoint(connection, repo, 'plan', plan.plan_id)
+        if row['checkpoint_phase'] == 'retry_pending' and preservation_checkpoint is None:
+            continue
         try:
             sources = json.loads(plan.sources)
         except (TypeError, ValueError):
@@ -163,6 +167,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
                     or "checkpoint를 게시하지 않았습니다."
                 ),
             }
+        checkpoint = preservation_checkpoint or checkpoint
         guidance_locations = []
         if plan.reason_code == "guidance_approval_required":
             rows = connection.execute(
@@ -190,6 +195,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
             plan.checkpoint_inspected_remote_oid,
             plan.checkpoint_inspection_reason,
         )
+        remote_inspection += _project_checkpoint_suffix(checkpoint) if checkpoint and checkpoint.get('diagnostic') else ''
         payload = {
             "project": name,
             "stage": stage,
@@ -235,7 +241,8 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         (repo,),
     ).fetchone()
     if project_block is not None:
-        checkpoint = _project_checkpoint(connection, repo, project_block[1])
+        checkpoint = (_preservation_checkpoint(connection, repo, 'project', project_block[1])
+                      or _project_checkpoint(connection, repo, project_block[1]))
         recovery_identity, recovery_evidence = final_recovery(
             str(project_block[1] or "__project__")
         )
@@ -280,11 +287,12 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         )
 
     if project[4] and project_block is None:
+        checkpoint = _preservation_checkpoint(connection, repo, 'planning', 'planning')
         _queue_block(
             connection,
             repo,
             "planning",
-            _key("blocked", repo, "project\0planning_error\0"),
+            _key("blocked", repo, "project\0planning_error\0" + _project_checkpoint_suffix(checkpoint)),
             {
                 "project": name,
                 "stage": "planning",
@@ -299,6 +307,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
                     "docs/ARCHITECTURE.md",
                 ],
                 "guidance_locations": [],
+                "checkpoint": checkpoint,
             },
         )
 

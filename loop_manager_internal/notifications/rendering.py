@@ -80,6 +80,13 @@ def _message(kind: str, payload: dict[str, object]) -> str:
                 ) + ")"
                 if checkpoint.get('worktree'):
                     checkpoint_text += '\nPreserved worktree: ' + str(checkpoint['worktree'])
+                if checkpoint.get('diagnostic'):
+                    checkpoint_text += '\nOriginal branch: ' + str(checkpoint.get('original_branch'))
+            if checkpoint.get('diagnostic'):
+                if checkpoint.get('complete') is False:
+                    checkpoint_text += '\nIncomplete artifacts: ' + str(checkpoint.get('omitted'))
+                if checkpoint.get('original_unpublished_reason'):
+                    checkpoint_text += '\nOriginal publication: ' + str(checkpoint['original_unpublished_reason'])
         return (
             f"[{payload['project']}] BLOCKED ({payload.get('scope')}: {subject})\n"
             f"Reason: {payload.get('reason_code')}\n{payload['cause']}"
@@ -122,5 +129,3 @@ MESSAGE_LIMIT = 4096
 def _pieces(text: str) -> list[str]:
     return [text[start:start + MESSAGE_LIMIT]
             for start in range(0, len(text), MESSAGE_LIMIT)]
-
-

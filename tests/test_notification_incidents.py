@@ -16,7 +16,7 @@ from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
 from loop_manager_internal.storage.recovery_state import RecoveryRepository
 
-from support.notification import NotificationFixture
+from tests.support.notification import NotificationFixture
 
 
 class IncidentPayloadEncodingTest(NotificationFixture, unittest.TestCase):

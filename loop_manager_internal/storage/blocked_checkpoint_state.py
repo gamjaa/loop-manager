@@ -58,6 +58,13 @@ CREATE TABLE IF NOT EXISTS blocked_checkpoints (
 
 def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(SCHEMA)
+    connection.execute("""CREATE TABLE IF NOT EXISTS diagnostic_preservations (
+        repo TEXT NOT NULL, scope TEXT NOT NULL, owner TEXT NOT NULL,
+        input_identity TEXT NOT NULL, ref TEXT, tree_oid TEXT, commit_oid TEXT,
+        payload TEXT NOT NULL, retryable INTEGER NOT NULL DEFAULT 0,
+        observed_order INTEGER NOT NULL DEFAULT 0,
+        PRIMARY KEY (repo, scope, owner, input_identity)
+    )""")
     connection.execute("""CREATE TABLE IF NOT EXISTS blocked_diagnostic_publications (
         repo TEXT NOT NULL, plan_id TEXT NOT NULL, ref TEXT NOT NULL,
         original_branch TEXT NOT NULL, base_oid TEXT NOT NULL,
@@ -523,6 +530,35 @@ class DiagnosticPublicationRepository:
     def __init__(self, connection):
         self.connection = connection
         ensure_schema(connection)
+
+    def preservation(self, repo, scope, owner, identity):
+        return self.connection.execute(
+            'SELECT * FROM diagnostic_preservations WHERE repo = ? AND scope = ? '
+            'AND owner = ? AND input_identity = ?', (repo, scope, owner, identity)).fetchone()
+
+    def preserve(self, repo, scope, owner, identity, payload, *, ref=None,
+                 tree=None, commit=None, retryable=False, revalidate=None):
+        with self.connection:
+            if revalidate is not None:
+                revalidate()
+            previous = self.preservation(repo, scope, owner, identity)
+            if previous and previous['commit_oid'] and (
+                    previous['ref'], previous['tree_oid'], previous['commit_oid']) != (ref, tree, commit):
+                raise RuntimeError('진단 보존 intent가 변경됐습니다.')
+            self.connection.execute(
+                'INSERT INTO diagnostic_preservations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '
+                '(SELECT COALESCE(MAX(observed_order), 0) + 1 FROM diagnostic_preservations)) '
+                'ON CONFLICT(repo, scope, owner, input_identity) DO UPDATE SET '
+                'ref = excluded.ref, tree_oid = excluded.tree_oid, commit_oid = excluded.commit_oid, '
+                'payload = excluded.payload, retryable = excluded.retryable, observed_order = excluded.observed_order',
+                (repo, scope, owner, identity, ref, tree, commit,
+                 json.dumps(payload, sort_keys=True), int(retryable)))
+
+    def latest_preservation(self, repo, scope, owner):
+        row = self.connection.execute(
+            'SELECT payload FROM diagnostic_preservations WHERE repo = ? AND scope = ? '
+            'AND owner = ? ORDER BY observed_order DESC LIMIT 1', (repo, scope, owner)).fetchone()
+        return json.loads(row[0]) if row else None
 
     def intent(self, request, *, base_oid, head_oid, tree_oid, cause):
         ref = diagnostic_branch(request.repo, request.plan_id, request.branch,

@@ -1,9 +1,96 @@
 """Content-free evidence for non-overlapping autostash file merges."""
 from difflib import SequenceMatcher
 import hashlib
+import os
 from pathlib import Path
 import stat
 import subprocess
+
+
+def stash_originals(worktree: Path, stash: str, git) -> dict[str, str]:
+    """Resolve a proven stash and its original index without applying it."""
+    def revision(expression):
+        result = git(worktree, 'rev-parse', '--verify', expression, check=False)
+        if result.returncode or not result.stdout.strip():
+            raise RuntimeError('diagnostic stash original revision unavailable')
+        return result.stdout.strip()
+    oid = revision(stash + '^{commit}')
+    revisions = {'stash': oid, 'stash-base': revision(oid + '^1'),
+                 'staged-original': revision(oid + '^2')}
+    untracked = git(worktree, 'rev-parse', '--verify', oid + '^3', check=False)
+    if untracked.returncode == 0:
+        if not untracked.stdout.strip():
+            raise RuntimeError('diagnostic stash untracked revision unavailable')
+        revisions['untracked-original'] = untracked.stdout.strip()
+    elif untracked.returncode not in (1, 128):
+        raise RuntimeError('diagnostic stash untracked revision unavailable')
+    return revisions
+
+
+def capture_originals(worktree: Path, paths: tuple[str, ...], revisions: dict,
+                      git_bytes) -> tuple[dict, dict[str, bytes]]:
+    """Read exact tree/index/worktree bytes without staging or resolving files.
+
+    The caller validates ownership, paths and secrets, then repeats collection
+    to reject concurrent edits. Absence is explicit; gitlinks are incomplete.
+    """
+    from pathlib import PurePosixPath
+    records, blobs = {}, {}
+
+    def store(mode, content, oid=None):
+        digest = hashlib.sha256(content).hexdigest()
+        blobs[digest] = content
+        return {'mode': mode, 'blob': digest, **({'oid': oid} if oid else {})}
+
+    for name in paths:
+        relative = PurePosixPath(name)
+        if (relative.is_absolute() or Path(name).is_absolute() or '..' in relative.parts or '\\' in name
+                or not name or '\0' in name or any(part.casefold() == '.git' for part in relative.parts)
+                or os.name == 'nt' and ':' in name):
+            raise RuntimeError('unsafe diagnostic path')
+        target = worktree / name
+        # A symlink parent must never turn a selected path into an external read.
+        if any(parent.is_symlink() for parent in [target, *target.parents]
+               if parent != worktree and worktree in parent.parents):
+            raise RuntimeError('diagnostic symlink path')
+        item = {}
+        for label, revision in revisions.items():
+            raw = git_bytes(worktree, '--literal-pathspecs', 'ls-tree', '-z',
+                            revision, '--', name)
+            entries = [entry for entry in raw.split(b'\0') if entry]
+            if not entries:
+                item[label] = {'absent': True}
+                continue
+            if len(entries) != 1:
+                raise RuntimeError('ambiguous diagnostic tree entry')
+            metadata, actual = entries[0].split(b'\t', 1)
+            mode, kind, oid = metadata.decode('ascii').split()
+            if actual != name.encode('utf-8', 'surrogateescape') or kind != 'blob':
+                raise RuntimeError('unsupported diagnostic tree entry')
+            item[label] = store(mode, git_bytes(worktree, 'cat-file', 'blob', oid), oid)
+        stages = {}
+        raw = git_bytes(worktree, '--literal-pathspecs', 'ls-files', '--stage', '-z', '--', name)
+        for entry in filter(None, raw.split(b'\0')):
+            metadata, actual = entry.split(b'\t', 1)
+            mode, oid, stage = metadata.decode('ascii').split()
+            if (actual != name.encode('utf-8', 'surrogateescape')
+                    or stage in stages or mode not in {'100644', '100755'}):
+                raise RuntimeError('unsupported diagnostic index entry')
+            stages[stage] = store(mode, git_bytes(worktree, 'cat-file', 'blob', oid), oid)
+        item['index'] = stages
+        try:
+            mode = target.lstat().st_mode
+        except FileNotFoundError:
+            item['worktree'] = {'absent': True}
+        else:
+            if not stat.S_ISREG(mode):
+                raise RuntimeError('unsupported diagnostic worktree entry')
+            file_mode = '100755' if mode & stat.S_IXUSR else '100644'
+            if os.name == 'nt':
+                file_mode = stages.get('0', {}).get('mode', '100644')
+            item['worktree'] = store(file_mode, target.read_bytes())
+        records[name] = item
+    return records, blobs
 
 
 def capture(worktree: Path, head: str, dirty: dict) -> dict:

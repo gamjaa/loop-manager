@@ -36,6 +36,7 @@ class PlanningStatePortsEffects:
     reconcile_execplan_catalog: Callable[..., object]
     register_execplans: Callable[..., object]
     update_project: Callable[..., object]
+    preserve_remote_planning_diagnostics: Callable[..., object] | None = None
 
 
 class _PlanningStatePorts:
@@ -241,6 +242,13 @@ class _PlanningStatePorts:
         self, repo: str, snapshot: runtime_state.PlanningSnapshot
     ) -> None:
         self._effects.preserve_planning_diagnostics(self._state_dir, repo, snapshot)
+        self.retry_diagnostic_preservation(repo, snapshot)
+
+    def retry_diagnostic_preservation(self, repo, snapshot):
+        """Retry a separate artifact intent while planning remains suspended."""
+        if self._effects.preserve_remote_planning_diagnostics is not None:
+            self._effects.preserve_remote_planning_diagnostics(
+                self._connection, self._state_dir, repo, snapshot)
 
     def clear_active(
         self,

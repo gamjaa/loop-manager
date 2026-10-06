@@ -88,6 +88,12 @@ class PlanningWorkspaceService(PlanningService):
             collision_paths, stash_sha,
         )
 
+    def _preserve_rebase_conflict(self, repo: str, detail: str) -> None:
+        current = self._ports.state.planning(repo)
+        if not (current.planning_error or current.planning_validation_error):
+            self._ports.state.update(repo, planning_validation_error='planning rebase 충돌: ' + detail)
+        self._ports.state.preserve_diagnostics(repo, self._ports.state.planning(repo))
+
     def _prepare_workspace(
         self, run: _PlanningRun
     ) -> PlanningOutcome | None:
@@ -143,6 +149,7 @@ class PlanningWorkspaceService(PlanningService):
 
         # This is a safe boundary: no Planner or verifier is using the
         # worktree. Recheck origin even when the project step began earlier.
+        conflict_detail = None
         try:
             latest = self._ports.git.fetch_base(context.repo_path, context.base_branch)
             if latest == row.active_sha:
@@ -201,6 +208,7 @@ class PlanningWorkspaceService(PlanningService):
                     worktree, str(row.active_sha or ""), latest,
                 )
                 if result.conflict:
+                    conflict_detail = result.detail
                     if self._resolve_rebase_conflict(
                         run, worktree, result.target, result.detail,
                         getattr(result, "conflict_paths", ()),
@@ -212,6 +220,7 @@ class PlanningWorkspaceService(PlanningService):
                             worktree, str(row.active_sha or ""), latest,
                         )
                 if result.conflict:
+                    self._preserve_rebase_conflict(context.repo, result.detail)
                     self._ports.events.error(
                         f"planning rebase 충돌; 작업 보존: {worktree}; {result.detail}"
                     )
@@ -219,6 +228,7 @@ class PlanningWorkspaceService(PlanningService):
                         PlanningOutcomeKind.TRANSIENT_PAUSE,
                         detail=result.detail, error=True,
                     )
+                conflict_detail = None
                 if run.maintenance_planning:
                     cycle = self._ports.state.maintenance_cycle(context.repo)
                     if cycle.publication_stage == "prepared":
@@ -347,6 +357,8 @@ class PlanningWorkspaceService(PlanningService):
                 ) if run.maintenance_planning else run.general_fingerprint
             )
         except (RuntimeError, PlanningRebaseError) as error:
+            if conflict_detail is not None:
+                self._preserve_rebase_conflict(context.repo, conflict_detail)
             self._ports.events.error(f"planning 원격 반영 대기: {error}")
             return PlanningOutcome(
                 PlanningOutcomeKind.TRANSIENT_PAUSE, detail=str(error), error=True,

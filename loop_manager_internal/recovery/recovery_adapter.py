@@ -325,10 +325,12 @@ class ProjectBlockedRecoveryEffectsEffects:
     unmet_execplan_dependencies: Callable[..., object]
     validate_execplan_workspace_identity: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
+    preserve_blocked_diagnostics: Callable[..., object] | None = None
 
 
 def _project_blocked_recovery_effects(effects: ProjectBlockedRecoveryEffectsEffects, ) -> project_blocked_recovery.ProjectRecoveryEffects:
     return project_blocked_recovery.ProjectRecoveryEffects(
+        preserve_blocked_diagnostics=effects.preserve_blocked_diagnostics,
         _BlockedCheckpointAdapter=effects._BlockedCheckpointAdapter,
         _BlockedCheckpointResults=_BlockedCheckpointResults,
         _current_rebase_service=effects._current_rebase_service,
