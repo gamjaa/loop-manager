@@ -201,6 +201,11 @@ def _preserved_planning_values(raw: object) -> dict[str, object]:
         values = json.loads(str(raw))
     except (TypeError, ValueError) as error:
         raise RuntimeStateError("보존된 planning 상태가 유효하지 않습니다.") from error
+    targets = values.pop("unconfirmed_plan_ids", None) if isinstance(values, dict) else None
+    if (targets is not None and (not isinstance(targets, list)
+            or any(not isinstance(value, str) or not re.fullmatch(r"G-\d{3,}", value) for value in targets)
+            or len(targets) != len(set(targets)))):
+        raise RuntimeStateError("보존된 planning 대상이 유효하지 않습니다.")
     if (not isinstance(values, dict)
             or set(values) != set(EXECUTION_CLEAR_VALUES) | set(PLANNING_CLEAR_VALUES)
             or not values["planning_error"] or values["phase"] not in (None, "PLANNING")):
@@ -270,6 +275,14 @@ class PlanningSnapshot:
         if self.planning_preserved_state:
             return _preserved_planning_values(self.planning_preserved_state)["worktree"]
         return self.worktree
+
+    @property
+    def preserved_unconfirmed_plan_ids(self) -> tuple[str, ...] | None:
+        if not self.planning_preserved_state:
+            return None
+        _preserved_planning_values(self.planning_preserved_state)
+        targets = json.loads(self.planning_preserved_state).get("unconfirmed_plan_ids")
+        return tuple(targets) if targets is not None else None
 
     def __getitem__(self, field: str) -> object:
         """Support the narrow compatibility helpers during coordinator extraction."""
@@ -578,7 +591,9 @@ class RuntimeStateRepository:
             raise RuntimeStateError("planning 상태를 읽을 프로젝트가 없습니다.")
         return PlanningSnapshot.from_row(row)
 
-    def suspend_planning(self, expected: PlanningSnapshot) -> None:
+    def suspend_planning(
+        self, expected: PlanningSnapshot, *, unconfirmed_plan_ids: tuple[str, ...] | None = None,
+    ) -> None:
         """Release only a checked failed attempt; retain its entire projection."""
         with _transaction(self.connection):
             if self.planning(expected.repo) != expected or not expected.planning_error:
@@ -591,6 +606,9 @@ class RuntimeStateRepository:
                 "SELECT * FROM projects WHERE repo = ?", (expected.repo,),
             ).fetchone()
             saved = {key: row[key] for key in (*EXECUTION_CLEAR_VALUES, *PLANNING_CLEAR_VALUES)}
+            if unconfirmed_plan_ids is not None:
+                saved["unconfirmed_plan_ids"] = list(unconfirmed_plan_ids)
+            _preserved_planning_values(json.dumps(saved))
             values = {**EXECUTION_CLEAR_VALUES, **PLANNING_CLEAR_VALUES}
             # Errors remain visible to completion, notifications and registration.
             for key in PLANNING_CLEAR_VALUES:

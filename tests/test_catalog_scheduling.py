@@ -828,6 +828,9 @@ class PreservedPlanningSchedulingTest(AutomationCatalogFixture, unittest.TestCas
                     'planning_error': 'later failure', 'planning_error_fingerprint': 'later-input',
                 }, enqueue=False)
                 runtime.suspend_planning(runtime.planning('repo'))
+                self.assertIsNone(loop_manager.catalog_schedule_decision(connection, 'repo').runnable_ready)
+                runtime.resume_planning(runtime.planning('repo'))
+                runtime.suspend_planning(runtime.planning('repo'), unconfirmed_plan_ids=())
                 self.assertEqual(loop_manager.catalog_schedule_decision(connection, 'repo').runnable_ready['plan_id'], 'G-001')
 
     def test_uncertain_or_invalid_general_check_does_not_release_unknown_targets(self):
@@ -933,7 +936,7 @@ class PreservedPlanningSchedulingTest(AutomationCatalogFixture, unittest.TestCas
                 self.assertEqual(maintenance_state.MaintenanceRepository(connection).get('repo').phase, phase)
                 runtime = runtime_state.RuntimeStateRepository(connection)
                 runtime.update_project('repo', {'planning_error': 'failed', 'planning_error_fingerprint': 'input'}, enqueue=False)
-                runtime.suspend_planning(runtime.planning('repo'))
+                runtime.suspend_planning(runtime.planning('repo'), unconfirmed_plan_ids=())
                 decision = loop_manager.catalog_schedule_decision(connection, 'repo')
                 self.assertEqual(decision.runnable_ready['plan_id'], 'G-004')
                 runtime.activate('repo', 'G-004', activation_sha='base', branch='branch', worktree='/worker')

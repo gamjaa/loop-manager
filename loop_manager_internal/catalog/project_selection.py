@@ -254,13 +254,21 @@ class CatalogScheduleDecisionEffects:
 
 def _unconfirmed_general_targets(
     effects: CatalogScheduleDecisionEffects, connection: sqlite3.Connection,
-    repo: str, rows: list[sqlite3.Row],
+    repo: str, rows: list[sqlite3.Row], project: sqlite3.Row, cycle: maintenance_state.MaintenanceCycle,
 ) -> set[str]:
     """A failed handoff does not certify the plans flagged by its check."""
+    preserved = runtime_state.PlanningSnapshot.from_row(project)
+    if preserved.preserved_unconfirmed_plan_ids is not None:
+        return set(preserved.preserved_unconfirmed_plan_ids)
     check = planner_check_state.get(connection, repo)
-    if check is None or check['stage'] == 'accepted':
+    if check is None and cycle.phase in {
+        maintenance_state.MaintenancePhase.ASSESSMENT,
+        maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+    } and not cycle.include_general_planning:
         return set()
     unknown = {str(row['plan_id']) for row in rows if effects.is_unowned_ready(row)}
+    if check is None or check['stage'] == 'accepted':
+        return {str(row['plan_id']) for row in rows}  # Legacy failures lack scope evidence.
     if check['stage'] in {'result', 'handoff', 'superseded'} and check['result']:
         try:
             decision = parse_planner_check_result(
@@ -334,7 +342,7 @@ def catalog_schedule_decision(
     suspended = bool(project is not None and project["planning_preserved_state"]
                      and not runtime_state.planning_owns_execution_slot(project))
     if suspended:
-        affected = _unconfirmed_general_targets(effects, connection, repo, rows)
+        affected = _unconfirmed_general_targets(effects, connection, repo, rows, project, cycle)
         if cycle.phase is maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION:
             # These goals still need validation after refactoring. An error
             # releases the mutation slot, not the target's execution gate.

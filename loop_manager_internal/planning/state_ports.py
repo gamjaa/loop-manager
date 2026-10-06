@@ -68,8 +68,10 @@ class _PlanningStatePorts:
     def planning(self, repo: str) -> runtime_state.PlanningSnapshot:
         return self._runtime_repository.planning(repo)
 
-    def suspend_planning(self, expected: runtime_state.PlanningSnapshot) -> None:
-        self._runtime_repository.suspend_planning(expected)
+    def suspend_planning(
+        self, expected: runtime_state.PlanningSnapshot, *, unconfirmed_plan_ids: tuple[str, ...] | None = None,
+    ) -> None:
+        self._runtime_repository.suspend_planning(expected, unconfirmed_plan_ids=unconfirmed_plan_ids)
 
     def resume_planning(self, expected: runtime_state.PlanningSnapshot) -> None:
         self._runtime_repository.resume_planning(expected)

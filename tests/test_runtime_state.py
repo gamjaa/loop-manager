@@ -2,6 +2,7 @@ from tests.support.runtime import runtime_rebase_fixture
 from tests.support.database import runtime_connection
 import dataclasses
 from pathlib import Path
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -1157,7 +1158,7 @@ class PreservedPlanningRuntimeTest(unittest.TestCase):
     def test_worker_pr_and_merge_clear_preserve_attempt_and_error_incident(self):
         connection, repository = self.failed_repository()
         before = repository.planning('repo')
-        repository.suspend_planning(before)
+        repository.suspend_planning(before, unconfirmed_plan_ids=('G-001',))
         suspended = repository.planning('repo')
         self.assertTrue(repository.recovery_slot_available('repo'))
         worker = repository.activate('repo', 'G-047', activation_sha='base',
@@ -1176,6 +1177,7 @@ class PreservedPlanningRuntimeTest(unittest.TestCase):
         restarted.clear('repo')
         after = restarted.planning('repo')
         self.assertEqual(after.planning_preserved_state, suspended.planning_preserved_state)
+        self.assertEqual(after.preserved_unconfirmed_plan_ids, ('G-001',))
         self.assertEqual(after.planning_error_incident_id, before.planning_error_incident_id)
         self.assertEqual(after.planning_error, before.planning_error)
         self.assertEqual(after.planning_fingerprint, before.planning_fingerprint)
@@ -1183,6 +1185,20 @@ class PreservedPlanningRuntimeTest(unittest.TestCase):
         self.assertEqual(restarted.planning('repo'), before)
         self.assertEqual(restarted.get('repo', worker.plan_id).worker_session_id, 'worker-session')
         self.assertFalse(restarted.recovery_slot_available('repo'))
+
+    def test_invalid_preserved_targets_keep_slot_owned_and_do_not_restore(self):
+        for targets in (['G-001', 'G-001'], ['unsafe'], 'G-001'):
+            with self.subTest(targets=targets):
+                connection, repository = self.failed_repository()
+                repository.suspend_planning(repository.planning('repo'))
+                saved = json.loads(repository.planning('repo').planning_preserved_state)
+                saved['unconfirmed_plan_ids'] = targets
+                connection.execute('UPDATE projects SET planning_preserved_state = ? WHERE repo = ?',
+                                   (json.dumps(saved), 'repo'))
+                row = connection.execute('SELECT * FROM projects WHERE repo = ?', ('repo',)).fetchone()
+                self.assertTrue(runtime_state.planning_owns_execution_slot(row))
+                with self.assertRaises(runtime_state.RuntimeStateError):
+                    repository.planning('repo')
 
     def test_suspension_and_resume_rollback_without_losing_projection(self):
         for stage in ('after_planning_suspend', 'after_planning_resume'):

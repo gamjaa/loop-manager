@@ -47,7 +47,7 @@ preserved planning_error가 실행 자리를 계속 점유하는 현재 gate를 
 
 | 경로 | 변경·유지 이유와 검증 |
 |---|---|
-| `planning/selection_service.py` preserved-error gate | 같은 입력은 신규 Planner를 호출하지 않는다. 확인된 실패 작업을 보존해 슬롯을 비운 뒤 독립 READY 선택 또는 대기를 반환한다. 활성 Worker·PR 교정은 선점하지 않는다. |
+| `planning/selection_service.py` preserved-error gate | 같은 입력은 신규 Planner를 호출하지 않는다. 점검 인계 또는 마지막 성공 기준과 실패 입력의 source·dependency 차이로 미확정 대상을 보존한 뒤 슬롯을 비운다. 독립 READY 선택 또는 대기를 반환하며 활성 Worker·PR 교정은 선점하지 않는다. |
 | `planning/git_ports.py`, `planning/state_ports.py`, `git/manager_git_journal.py` | 소유권·현재 Agent 범위·미종료 호출·planning worktree Git operation·미해결 index·미확정 공유 쓰기를 검사한다. 기본 checkout 전용 rebase·bisect는 실행 슬롯을 점유하지 않는다. prepared publication과 확인할 수 없는 workspace는 release하지 않으며 원인·결과를 보존한다. |
 | `storage/runtime_state.py`, `storage/database.py`, `storage/execplan_catalog_state.py` | 보존과 실행 투영을 transaction으로 분리하고 catalog CAS에 보존 상태를 포함한다. 재시작·중단 rollback·Worker/PR/Merge 정리 뒤 원래 planning을 복원한다. 손상된 보존 상태나 stale snapshot은 슬롯 해제 근거가 아니다. |
 | `catalog/project_selection.py`, `application/project_runner.py` | planning 오류에서도 catalog hold·dependency·PROJECT_BLOCKED·활성 실행 gate를 유지한 채 독립 READY를 순차 선택한다. post-refactor 재검증 대상과 일반 점검의 미확정 대상 및 전이 의존 계획은 목표 보존을 확정하기 전까지 선택하지 않는다. 보존된 planning 대기는 WAITING, 실제 Worker 오류는 실패로 반환하며 완료 판정은 보류한다. |
@@ -61,3 +61,6 @@ preserved planning_error가 실행 자리를 계속 점유하는 현재 gate를 
 - 기본 checkout의 operation metadata는 그 checkout의 상태로 취급한다. 관리 planning worktree의 operation·index·소유권, Agent의 공유 ref·설정 범위와 Manager Git journal 검사는 유지한다. 로컬 Git port unit case에서 사용자 rebase·bisect metadata·HEAD·index를 보존하면서 안전한 release를 허용하고 미확정 공유 쓰기는 거부함을 확인했다.
 - Review 대응 targeted unit 10개가 통과했다. 새 인계 테스트의 오류 반환·재시도 예상값을 실제 validation 소진 흐름에 맞게 수정한 뒤 동일 명령을 재실행했다. 성공 baseline과 대상 해제의 transaction rollback도 확인했다. 전체 verify와 integration 경로는 직접 실행하지 않았다.
 - Worker 결과의 추가 거부는 보고 형식에서 발생했다. `TARGETED_TESTS`의 실패 시나리오 설명이 미해결 테스트 실패로 해석됐고 실패·재실행 이력은 해당 절 밖에 있었다. 기존 parser를 수정하지 않고 이력을 같은 절에 배치해 수용됨을 확인했다. 동일 targeted 명령을 다시 실행해 10개 모두 OK·종료 코드 0을 확인했다.
+- 추가 Review에서 점검 없이 명세 변경으로 시작한 일반 planning의 대상 보류 누락을 확인했다. 기존 `relevant_document_changes`로 마지막 성공 revision과 실패한 입력의 원격 선언·source·dependency를 대조한다. 코드·분류 불명 변경, 비교 기준 부재 또는 읽기 실패에서는 독립성을 합성하지 않으며, 유지보수 전용 입력에는 기존 cycle 대상 gate를 유지한다.
+- `planning_preserved_state`의 선택적 `unconfirmed_plan_ids`는 실패 입력·작업물·session과 같은 transaction에서 저장한다. 새 DB column이나 루트 파일을 추가하지 않는다. scheduler는 점검 기록 유무와 관계없이 이 대상과 전이 의존 범위를 보류한다. 대상 정보가 없는 기존 일반 planning 보존 기록은 미확정 범위를 보수적으로 보류하고, 손상된 대상 정보는 슬롯 소유를 유지한다. 복원 때 대상 metadata를 실행 projection의 DB 필드로 적용하지 않는다.
+- 점검 기록 없음 → Requirement 변경 → 일반 Planner 교정 소진 → 영향받은 READY·MERGED 경유 의존 계획 보류·독립 READY 실행을 실제 source 비교 helper와 SQLite scheduler를 사용한 unit case로 확인했다. source 읽기 실패·코드 변경·기준 부재, Worker·PR·Merge 후 대상 보존과 손상 거부도 검증했다. 새 테스트의 `json` import 누락을 수정하고 동일 targeted 명령을 재실행해 21개 모두 OK·종료 코드 0을 확인했다. 전체 verify·integration은 실행하지 않았다.

@@ -1,12 +1,14 @@
 """Planning input selection, safety gates, and READY activation."""
 from __future__ import annotations
 from pathlib import Path
+import subprocess
 from loop_manager_internal.maintenance.maintenance_orchestration import assessment_can_yield, maintenance_planning_fingerprint
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningError
 from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventoryError
 from loop_manager_internal.storage import maintenance_state, maintenance_file_ledger, runtime_state
 from loop_manager_internal.storage.planner_check_state import target_fingerprint
 from loop_manager_internal.planning.planning_catalog import PlanningResultInvalid
+from loop_manager_internal.planning.planner_check import parse_planner_check_result
 from loop_manager_internal.planning.planning_workspace import planning_workspace_path
 from loop_manager_internal.planning.planning_service import PlanningService
 from loop_manager_internal.planning.planning_contracts import (
@@ -124,12 +126,57 @@ class PlanningSelectionService(PlanningService):
                 if scope.error:
                     raise PlanningWorkspaceOwnershipError(scope.error)
             self._ports.state.preserve_diagnostics(context.repo, row)
-            self._ports.state.suspend_planning(row)
+            self._ports.state.suspend_planning(
+                row, unconfirmed_plan_ids=self._unconfirmed_failed_plans(run, worktree),
+            )
         except RuntimeError as error:
             self._ports.events.error(f"planning 실행 자리 보존 해제 대기: {error}")
             return self._operational_error()
         # Re-enter project synchronization so PR recovery sees the released slot.
         return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART)
+
+    def _unconfirmed_failed_plans(self, run: _PlanningRun, worktree: Path | None) -> tuple[str, ...]:
+        """Retain the failed input's scope before exposing the execution slot."""
+        row, context, cycle = run.row, run.context, run.maintenance_cycle
+        if run.maintenance_planning and not cycle.include_general_planning:
+            return ()  # Maintenance targets retain their existing cycle gate.
+        rows = self._ports.state.execplan_rows(context.repo)
+        ids = tuple(sorted(str(plan['plan_id']) for plan in rows))
+        check = self._ports.state.planner_check(context.repo)
+        if (check is not None and check['stage'] in {'result', 'handoff', 'superseded'}
+                and check['base_sha'] == row.active_sha and check['result']):
+            try:
+                decision = parse_planner_check_result(check['result'], frozenset(ids))
+                if decision.outcome in {'needs_revision', 'uncertain'}:
+                    return decision.plan_ids or ids
+            except PlanningResultInvalid:
+                return ids
+        if not row.processed_sha or not row.active_sha or worktree is None:
+            return ids
+        try:
+            changed = self._ports.git.run(
+                context.repo_path, 'diff', '--name-only', '-z', row.processed_sha, row.active_sha,
+            ).stdout.split('\0')
+            # Source comparisons alone cannot establish the effect of a code
+            # or other unclassified change on existing goals and validation.
+            if any(path and not (path in {'AGENTS.md', 'docs/PRODUCT.md', 'docs/ARCHITECTURE.md', 'docs/PLANS.md'}
+                    or path.startswith(('docs/requirements/', 'docs/plans/'))) for path in changed):
+                return ids
+            affected = []
+            for plan_id in ids:
+                try:
+                    changes = self._ports.git.relevant_document_changes(
+                        worktree, row.processed_sha, row.active_sha, [], rows, (plan_id,),
+                        include_active_requirements=False,
+                    )
+                except (RuntimeError, subprocess.SubprocessError):
+                    affected.append(plan_id)  # An uncertain declaration is not independent.
+                else:
+                    if changes:
+                        affected.append(plan_id)
+            return tuple(affected)
+        except (RuntimeError, subprocess.SubprocessError):
+            return ids
 
     def _continue_published_work(self, run: _PlanningRun) -> PlanningOutcome:
         context = run.context

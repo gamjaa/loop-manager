@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 from types import SimpleNamespace
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from unittest import mock
@@ -1495,6 +1496,118 @@ class PreservedPlanningSelectionTest(PlanningCase):
         self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
         self.assertEqual(ports.state.snapshot, saved)
         self.assertEqual(ports.agent.run_count, 0)
+
+
+class FailedSpecificationPlanningTest(PlanningCase):
+    def test_no_check_specification_failure_holds_affected_ready_and_runs_independent(self):
+        from tests.support.database import AutomationCatalogFixture
+        from tests.support.catalog import execplan_header
+        from loop_manager_internal.storage import runtime_state, planner_check_state
+        from loop_manager_internal.planning.planning_document_relevance import relevant_document_changes
+        from loop_manager_internal.planning.planning_contracts import MAX_PLANNER_VALIDATION_RETRIES
+        connection = AutomationCatalogFixture._connection(self, '/repo')
+        for plan_id, status, dependency in (
+                ('G-001', 'READY', ()), ('G-002', 'READY', ()),
+                ('G-003', 'MERGED', ()), ('G-004', 'MERGED', ('G-003',)),
+                ('G-005', 'READY', ('G-004',))):
+            AutomationCatalogFixture._insert_plan(
+                self, connection, plan_id, status, repo='/repo', depends_on=dependency,
+                priority='low' if plan_id == 'G-002' else 'critical',
+            )
+        source = 'docs/requirements/A.md'
+        connection.execute("UPDATE exec_plans SET sources = ? WHERE plan_id IN ('G-001', 'G-003')",
+                           (json.dumps([source]),))
+        connection.execute("UPDATE exec_plans SET sources = ? WHERE plan_id = 'G-002'",
+                           (json.dumps(['docs/requirements/B.md']),))
+        ports = FakePorts(planning_snapshot(
+            processed_sha='old-base', specification_fingerprint='old-spec',
+            planning_fingerprint='old-input',
+        ))
+        ports.state.execplan_rows = lambda _repo: connection.execute('SELECT * FROM exec_plans').fetchall()
+        ports.git.fingerprint = 'new-input'
+        ports.git.fingerprints['old-base'] = 'old-input'
+        ports.git.specification_fingerprints['base'] = 'new-spec'
+        documents = {
+            plan['path']: execplan_header(
+                plan['plan_id'], plan['title'], sources=tuple(json.loads(plan['sources'])),
+                depends_on=tuple(json.loads(plan['depends_on'])),
+            ) for plan in ports.state.execplan_rows('/repo')
+        }
+        documents['docs/requirements/B.md'] = 'unchanged requirement'
+        documents['docs/PRODUCT.md'] = 'unchanged product'
+        original_run = ports.git.run
+        def remote_document_git(repo, *args, **kwargs):
+            if args[:3] == ('diff', '--name-only', '-z'):
+                return SimpleNamespace(stdout=source + '\0', returncode=0)
+            if args[:4] == ('ls-tree', '-r', '-z', '--name-only'):
+                return SimpleNamespace(stdout='\0'.join(path for path in documents if path.startswith('docs/plans/')), returncode=0)
+            if args[0] == 'show' or args[:2] == ('rev-parse', '--verify') and ':' in args[-1]:
+                revision, path = args[-1].split(':', 1)
+                content = ('old requirement' if revision == 'old-base' else 'changed requirement') if path == source else documents.get(path)
+                if content is None:
+                    return SimpleNamespace(stdout='', returncode=1)
+                return SimpleNamespace(stdout=content if args[0] == 'show' else hashlib.sha256(content.encode()).hexdigest(), returncode=0)
+            return original_run(repo, *args, **kwargs)
+        ports.git.run = remote_document_git
+        ports.git.relevant_document_changes = mock.Mock(side_effect=lambda *args, **kwargs:
+            relevant_document_changes(remote_document_git, self.context.repo_path, *args, **kwargs))
+        ports.validation.general_error = 'specification correction invalid'
+        for _ in range(MAX_PLANNER_VALIDATION_RETRIES + 1):
+            self.assertEqual(PlanningLifecycleCoordinator(ports).run(self.context).kind,
+                             PlanningOutcomeKind.VALIDATION_RETRY)
+        self.assertIsNone(ports.state.check_record)
+        self.assertEqual(PlanningLifecycleCoordinator(ports).run(self.context).kind,
+                         PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        preserved = ports.state.snapshot.planning_preserved_state
+        self.assertEqual(ports.state.snapshot.preserved_unconfirmed_plan_ids, ('G-001', 'G-003'))
+        for call in ports.git.relevant_document_changes.call_args_list:
+            self.assertEqual(call.args[1:3], ('old-base', 'base'))
+            self.assertFalse(call.kwargs['include_active_requirements'])
+        connection.execute('UPDATE projects SET planning_preserved_state = ?, planning_error = ? WHERE repo = ?',
+                           (preserved, ports.state.snapshot.planning_error, '/repo'))
+        self.assertIsNone(planner_check_state.get(connection, '/repo'))
+        ports.state.schedule = lambda repo: loop_manager.catalog_schedule_decision(connection, repo)
+        runtime = runtime_state.RuntimeStateRepository(connection)
+        def activate(repo, base):
+            selected = loop_manager.select_ready_execplan(connection, repo)
+            runtime.activate(repo, selected['plan_id'], activation_sha=base,
+                             branch='independent', worktree='/independent')
+            return selected
+        ports.state.activate_ready = activate
+        calls = ports.agent.run_count
+        self.assertEqual(PlanningLifecycleCoordinator(ports).run(self.context).kind,
+                         PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(runtime.active_row('/repo')['plan_id'], 'G-002')
+        connection.execute("UPDATE exec_plans SET status = 'PR_OPEN' WHERE plan_id = 'G-002'")
+        runtime.clear('/repo')
+        self.assertEqual(PlanningLifecycleCoordinator(ports).run(self.context).kind,
+                         PlanningOutcomeKind.WAITING)
+        self.assertEqual(ports.agent.run_count, calls)
+        self.assertEqual(runtime.planning('/repo').planning_preserved_state, preserved)
+        self.assertEqual(ports.state.snapshot.planning_preserved_state, preserved)
+
+    def test_unclassified_change_or_missing_baseline_does_not_certify_independence(self):
+        for reason in ('code', 'baseline', 'unreadable'):
+            with self.subTest(reason=reason):
+                ports = FakePorts(planning_snapshot(
+                    phase='PLANNING', active_sha='base', worktree='/planning',
+                    processed_sha=None if reason == 'baseline' else 'old-base',
+                    planning_workspace_owned=1, planning_error='invalid result',
+                    planning_attempt_fingerprint='fingerprint', planning_error_fingerprint='fingerprint',
+                ))
+                ports.state.execplan_rows = lambda _repo: [{'plan_id': 'G-001'}, {'plan_id': 'G-002'}]
+                original_run = ports.git.run
+                def run(repo, *args, **kwargs):
+                    if args[:3] == ('diff', '--name-only', '-z'):
+                        if reason == 'unreadable':
+                            raise subprocess.CalledProcessError(1, ['git', 'diff'])
+                        return SimpleNamespace(stdout='src/app.py\0', returncode=0)
+                    return original_run(repo, *args, **kwargs)
+                ports.git.run = run
+                self.assertEqual(PlanningLifecycleCoordinator(ports).run(self.context).kind,
+                                 PlanningOutcomeKind.REMOTE_BASE_RESTART)
+                self.assertEqual(ports.state.snapshot.preserved_unconfirmed_plan_ids, ('G-001', 'G-002'))
+                self.assertEqual(ports.agent.run_count, 0)
 
 
 class PlanningReleaseGitTest(unittest.TestCase):

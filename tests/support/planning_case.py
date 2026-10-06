@@ -141,10 +141,12 @@ class FakeStatePort:
     def planning_release_pending(self, _repo):
         return False
 
-    def suspend_planning(self, expected):
+    def suspend_planning(self, expected, *, unconfirmed_plan_ids=None):
         from loop_manager_internal.storage.runtime_state import PLANNING_CLEAR_VALUES, EXECUTION_CLEAR_VALUES
         saved = {key: getattr(expected, key, default)
                  for key, default in {**EXECUTION_CLEAR_VALUES, **PLANNING_CLEAR_VALUES}.items()}
+        if unconfirmed_plan_ids is not None:
+            saved['unconfirmed_plan_ids'] = list(unconfirmed_plan_ids)
         values = {key: value for key, value in PLANNING_CLEAR_VALUES.items()
                   if key in expected.__dataclass_fields__ and not key.startswith("planning_error")}
         self.snapshot = replace(expected, **values, phase=None, active_sha=None,
