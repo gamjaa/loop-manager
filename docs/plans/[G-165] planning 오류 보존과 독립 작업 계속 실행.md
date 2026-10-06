@@ -35,7 +35,7 @@ preserved planning_error가 실행 자리를 계속 점유하는 현재 gate를 
 ## Progress
 
 - [x] 2026-10-05 planning 기준 a049a76의 명세·원본·관련 테스트와 비종료 catalog에서 미충족 범위를 확인함. 구현·테스트 실행은 하지 않음.
-- [x] 구현 및 관련 targeted unit 검증 (선택한 23개 case와 보존 작업 재검증 1개 case 통과)
+- [x] 구현 및 관련 targeted unit 검증 (관리 rebase 후 현재 후보의 32개 case 통과)
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
@@ -64,3 +64,4 @@ preserved planning_error가 실행 자리를 계속 점유하는 현재 gate를 
 - 추가 Review에서 점검 없이 명세 변경으로 시작한 일반 planning의 대상 보류 누락을 확인했다. 기존 `relevant_document_changes`로 마지막 성공 revision과 실패한 입력의 원격 선언·source·dependency를 대조한다. 코드·분류 불명 변경, 비교 기준 부재 또는 읽기 실패에서는 독립성을 합성하지 않으며, 유지보수 전용 입력에는 기존 cycle 대상 gate를 유지한다.
 - `planning_preserved_state`의 선택적 `unconfirmed_plan_ids`는 실패 입력·작업물·session과 같은 transaction에서 저장한다. 새 DB column이나 루트 파일을 추가하지 않는다. scheduler는 점검 기록 유무와 관계없이 이 대상과 전이 의존 범위를 보류한다. 대상 정보가 없는 기존 일반 planning 보존 기록은 미확정 범위를 보수적으로 보류하고, 손상된 대상 정보는 슬롯 소유를 유지한다. 복원 때 대상 metadata를 실행 projection의 DB 필드로 적용하지 않는다.
 - 점검 기록 없음 → Requirement 변경 → 일반 Planner 교정 소진 → 영향받은 READY·MERGED 경유 의존 계획 보류·독립 READY 실행을 실제 source 비교 helper와 SQLite scheduler를 사용한 unit case로 확인했다. source 읽기 실패·코드 변경·기준 부재, Worker·PR·Merge 후 대상 보존과 손상 거부도 검증했다. 새 테스트의 `json` import 누락을 수정하고 동일 targeted 명령을 재실행해 21개 모두 OK·종료 코드 0을 확인했다. 전체 verify·integration은 실행하지 않았다.
+- 관리 rebase 결과인 HEAD `2a5b932`와 base `e8914da` 사이의 전체 18개 파일 diff 및 현재 수정분을 확인했다. 순차 실행 runner unit fixture에 planning 경계가 확인한 빈 미확정 대상 목록을 명시했으며, 대상 정보가 없는 일반 planning의 보수적 보류는 유지한다. 이전 후보의 검증 결과를 재사용하지 않고 관련 30개 case를 동일 명령으로 재실행해 OK·종료 코드 0을 확인했고, 변경된 기존 유지보수 오류 보존 2개 case도 개별 실행해 통과했다. 전체 verify와 Review는 Manager에 남긴다.

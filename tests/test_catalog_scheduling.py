@@ -988,7 +988,8 @@ class PreservedPlanningProjectResultTest(AutomationCatalogFixture, unittest.Test
         self._insert_plan(connection, 'G-002', 'READY', repo=repo)
         runtime = runtime_state.RuntimeStateRepository(connection)
         runtime.update_project(repo, {'planning_error': 'preserved failure'}, enqueue=False)
-        runtime.suspend_planning(runtime.planning(repo))
+        # The runner consumes the planning boundary's verified independent scope.
+        runtime.suspend_planning(runtime.planning(repo), unconfirmed_plan_ids=())
         saved = runtime.planning(repo).planning_preserved_state
         completed = []
         def step(*_args):
