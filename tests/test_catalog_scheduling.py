@@ -766,6 +766,42 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
 
 
 class PreservedPlanningSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
+    def test_unvalidated_targets_and_dependents_wait_while_independent_ready_runs(self):
+        from loop_manager_internal.storage import runtime_state, maintenance_state
+        connection = self._connection()
+        self._insert_plan(connection, 'G-001', 'READY', priority='critical')
+        self._insert_plan(connection, 'G-002', 'READY', depends_on=('G-001',))
+        self._insert_plan(connection, 'G-003', 'READY', title='Independent Refactoring', priority='low')
+        self._insert_plan(connection, 'G-004', 'MERGED')
+        self._insert_plan(connection, 'G-005', 'READY', depends_on=('G-004',), priority='critical')
+        self._insert_plan(connection, 'G-006', 'MERGED', depends_on=('G-004',))
+        self._insert_plan(connection, 'G-007', 'READY', depends_on=('G-006',), priority='critical')
+        maintenance_state.ensure_schema(connection)
+        connection.execute(
+            'INSERT INTO maintenance_cycles (repo, phase, revalidation_plan_ids) VALUES (?, ?, ?)',
+            ('repo', maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION.value,
+             json.dumps(['G-001', 'G-004'])),
+        )
+        runtime = runtime_state.RuntimeStateRepository(connection)
+        runtime.update_project('repo', {'planning_error': 'target goals remain uncertain',
+                                       'planning_error_origin': 'unsafe'}, enqueue=False)
+        runtime.suspend_planning(runtime.planning('repo'))
+        preserved = runtime.planning('repo')
+        decision = loop_manager.catalog_schedule_decision(connection, 'repo')
+        self.assertEqual(decision.runnable_ready['plan_id'], 'G-003')
+        connection.execute("UPDATE exec_plans SET status = 'PR_OPEN' WHERE plan_id = 'G-003'")
+        decision = loop_manager.catalog_schedule_decision(connection, 'repo')
+        self.assertTrue(decision.has_ready)
+        self.assertIsNone(decision.runnable_ready)
+        self.assertEqual(runtime.planning('repo'), preserved)
+        # The existing successful recovery boundary releases the target gate.
+        runtime.resume_planning(preserved)
+        runtime.clear('repo')
+        connection.execute('UPDATE maintenance_cycles SET phase = ? WHERE repo = ?',
+                           (maintenance_state.MaintenancePhase.IDLE.value, 'repo'))
+        decision = loop_manager.catalog_schedule_decision(connection, 'repo')
+        self.assertEqual(decision.runnable_ready['plan_id'], 'G-001')
+
     def test_failed_maintenance_allows_only_dependency_valid_independent_ready(self):
         from loop_manager_internal.storage import runtime_state, maintenance_state
         for phase in (maintenance_state.MaintenancePhase.IDLE,
@@ -777,8 +813,10 @@ class PreservedPlanningSchedulingTest(AutomationCatalogFixture, unittest.TestCas
                 self._insert_plan(connection, 'G-002', 'READY', depends_on=('G-001',), priority='critical')
                 self._insert_plan(connection, 'G-003', 'READY', priority='normal')
                 self._insert_plan(connection, 'G-004', 'READY', priority='high')
-                maintenance_state.MaintenanceRepository(connection).get('repo')
-                connection.execute('UPDATE maintenance_cycles SET phase = ? WHERE repo = ?', (phase.value, 'repo'))
+                maintenance_state.ensure_schema(connection)
+                connection.execute('INSERT INTO maintenance_cycles (repo, phase) VALUES (?, ?)',
+                                   ('repo', phase.value))
+                self.assertEqual(maintenance_state.MaintenanceRepository(connection).get('repo').phase, phase)
                 runtime = runtime_state.RuntimeStateRepository(connection)
                 runtime.update_project('repo', {'planning_error': 'failed', 'planning_error_fingerprint': 'input'}, enqueue=False)
                 runtime.suspend_planning(runtime.planning('repo'))

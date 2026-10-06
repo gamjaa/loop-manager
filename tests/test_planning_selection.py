@@ -494,11 +494,21 @@ class PlanningSelectionTest(PlanningCase):
         self.assertEqual(ports.state.cycle.cycle_base_sha, "advanced-base")
         self.assertEqual(ports.agent.run_count, 1)
         self.assertEqual(ports.agent.resumed_session, "saved-session")
+        failed = ports.state.snapshot
         repeated = PlanningLifecycleCoordinator(ports).run(
             replace(self.context, base_sha="advanced-base"),
         )
-        self.assertEqual(repeated.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+        self.assertEqual(repeated.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        preserved = json.loads(ports.state.snapshot.planning_preserved_state)
+        for field in ("active_sha", "worktree", "planner_session_id", "planning_result",
+                      "planning_error", "planning_error_fingerprint", "planning_validation_error"):
+            self.assertEqual(preserved[field], getattr(failed, field))
+        waiting = PlanningLifecycleCoordinator(ports).run(
+            replace(self.context, base_sha="advanced-base"),
+        )
+        self.assertEqual(waiting.kind, PlanningOutcomeKind.WAITING)
         self.assertEqual(ports.agent.run_count, 1)
+        self.assertEqual(ports.state.clear_calls, [])
 
     def test_specification_change_plans_once_before_runnable_ready(self):
         ports = FakePorts(
