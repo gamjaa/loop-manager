@@ -27,6 +27,7 @@ from loop_manager_internal.runtime.contracts import PublicationSafetyError
 from loop_manager_internal.runtime.contracts import RuntimeMutation
 from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
 from loop_manager_internal.storage import execplan_catalog_state
+from loop_manager_internal.storage import execution_checkpoint_state
 from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.storage import runtime_state
 from pathlib import Path
@@ -55,6 +56,7 @@ class RunProjectStepEffects:
     _planning_outcome_step_result: Callable[..., object]
     _project_blocked_recovery_effects: Callable[..., object]
     _project_pr_merge_confirmed: Callable[..., object]
+    _publish_direct_rebase_checkpoint: Callable[..., object]
     _record_manager_base_fetch_intent: Callable[..., object]
     _record_project_recovery: Callable[..., object]
     _recorded_base_fetch: Callable[..., object]
@@ -579,6 +581,9 @@ class ProjectService:
         if (self.state.row and self.state.row["branch"] and not runtime_state.planning_owns_execution_slot(self.state.row)
                 and not (self.state.recovered_planning_outcome is not None
                          and self.state.recovered_planning_outcome.newly_activated)):
+            pending_result = self._recover_pending_pr_checkpoint()
+            if pending_result is not None:
+                return pending_result
             existing_pr = self.effects.pr_for_branch(self.state.repo_path, self.state.row["branch"], self.state.row["pr_url"])
             if existing_pr:
                 try:
@@ -630,6 +635,35 @@ class ProjectService:
             self.state.row = self.identity.connection.execute(
                 "SELECT * FROM projects WHERE repo = ?", (self.state.repo,)
             ).fetchone()
+
+    def _recover_pending_pr_checkpoint(self) -> int | None:
+        """Confirm intermediate publication before checking the saved PR head."""
+        selected = runtime_state.RuntimeStateRepository(self.identity.connection).projected(self.state.repo)
+        if selected is None or not selected.pr_url:
+            return None
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(self.identity.connection).get(
+            self.state.repo, selected.plan_id)
+        if checkpoint.operation != 'rebase_publish':
+            return None
+        try:
+            self.effects._publish_direct_rebase_checkpoint(
+                self.identity.connection, self.state.repo_path, self.identity.state_dir,
+                self.state.repo, selected.plan_id, Path(selected.worktree), selected.branch)
+        except recovery_runtime.RecoveryFailure as error:
+            if error.reason is recovery_runtime.RecoveryReason.PUBLICATION_RETRY:
+                self.effects._record_project_recovery(
+                    self.identity.connection, self.state.repo, error.reason, str(error))
+                return PROJECT_STEP_RETRY
+            self.effects.block_active_execplan_from_revision(
+                self.identity.connection, self.state.repo_path, self.state.repo,
+                f"refs/remotes/origin/{self.state.row['base_branch']}", str(error),
+                str(self.state.row['verify_result'] or ''),
+                reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN)
+            self.effects.operation_print(str(error), file=sys.stderr)
+            return 1
+        self.state.row = self.identity.connection.execute(
+            'SELECT * FROM projects WHERE repo = ?', (self.state.repo,)).fetchone()
+        return None
 
     def _run_coordinators(self) -> int | None:
         assert self.state.row is not None
