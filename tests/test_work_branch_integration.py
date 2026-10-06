@@ -329,6 +329,142 @@ class WorkBranchIntegrationUnitTests(unittest.TestCase):
         self.assertEqual(saved['work_branch_integration']['remote'], 'new-user-remote')
         self.assertEqual(self.effects._journaled_direct_rebase.call_count, 2)
 
+    def _pause_work_restart(self, *, after_abort):
+        self.accepted.status.value = 'waiting_for_resolution'
+        with self.assertRaises(RuntimeError):
+            self.run_integration()
+        self.now = replace(self.now, branch=None,
+            index={'conflict.bin': ('M 100644 base 1', 'M 100644 ours 2', 'M 100644 theirs 3')},
+            dirty={'conflict.bin': (('staged', 'unstaged'), 'manual binary bytes')},
+            operations={'rebase-merge': 'owned'})
+        self.effects._capture_agent_baseline.side_effect = lambda repo, root, snapshot, **kw: (
+            self.baseline if snapshot.dirty else None)
+        self.accepted.status.value = 'complete'
+        def interrupted(root, *args, **kwargs):
+            if args[-2:] == ('rebase', '--abort'):
+                if after_abort:
+                    self.git(root, *args, **kwargs)
+                raise KeyboardInterrupt
+            return self.git(root, *args, **kwargs)
+        self.effects.git.side_effect = interrupted
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_integration('second-input')
+        original = self.store.get('repo', 'G-166').snapshot['work_branch_integration']
+        self.assertEqual(original['restart']['remote'], 'second-input')
+        self.effects.git.side_effect = self.git
+        self.effects.git.reset_mock()
+        return original
+
+    def _work_restart_successor(self, *, after_abort):
+        original = self._pause_work_restart(after_abort=after_abort)
+        self.run_integration('third-input')
+        current = self.store.get('repo', 'G-166')
+        history = current.snapshot['work_branch_integration_history']
+        self.assertEqual(history[0], original)
+        for field in ('baseline', 'snapshot', 'original_head'):
+            self.assertEqual(history[1]['restart'][field], original['restart'][field])
+        self.assertEqual(history[1]['restart']['remote'], 'third-input')
+        self.assertEqual(current.snapshot['work_branch_integration']['phase'], 'complete')
+        self.assertEqual(current.observed_remote_oid, 'third-input')
+        self.assertIsNone(current.operation)
+        self.assertEqual(sum(call.kwargs.get('preserve_conflicts', False)
+                             for call in self.effects._capture_agent_baseline.call_args_list), 1)
+        self.assertEqual(sum(call.args[-2:] == ('rebase', '--abort')
+                             for call in self.effects.git.call_args_list), int(not after_abort))
+        self.assertEqual(self.effects._commit_tree.call_count, 1)
+        self.assertEqual(self.effects._journaled_direct_rebase.call_count, 2)
+        self.effects.git.reset_mock()
+        self.run_integration('third-input')
+        self.assertFalse(any(call.args[-2:] == ('rebase', '--abort')
+                             for call in self.effects.git.call_args_list))
+        self.assertEqual(self.effects._journaled_direct_rebase.call_count, 2)
+
+    def test_push_after_restart_save_reuses_conflict_and_restarts_once(self):
+        self._work_restart_successor(after_abort=False)
+
+    def test_push_after_abort_reuses_conflict_without_second_abort(self):
+        self._work_restart_successor(after_abort=True)
+
+    def test_restart_successor_rewrite_is_refused_without_losing_preservation(self):
+        original = self._pause_work_restart(after_abort=False)
+        def rewritten(root, *args, **kwargs):
+            if args == ('merge-base', '--is-ancestor', 'second-input', 'third-input'):
+                return subprocess.CompletedProcess([], 1, '')
+            return self.git(root, *args, **kwargs)
+        self.effects.git.side_effect = rewritten
+        with self.assertRaisesRegex(RuntimeError, '후속 commit'):
+            self.run_integration('third-input')
+        self.assertEqual(self.store.get('repo', 'G-166').snapshot['work_branch_integration'], original)
+        self.assertFalse(any(call.args[-2:] == ('rebase', '--abort')
+                             for call in self.effects.git.call_args_list))
+        self.assertEqual(self.effects._journaled_direct_rebase.call_count, 1)
+
+    def test_restart_successor_still_requires_current_ownership(self):
+        original = self._pause_work_restart(after_abort=True)
+        self.service.require_owned.side_effect = RuntimeError('origin or ownership changed')
+        with self.assertRaisesRegex(RuntimeError, 'ownership changed'):
+            self.run_integration('third-input')
+        self.assertEqual(self.store.get('repo', 'G-166').snapshot['work_branch_integration'], original)
+        self.effects.git.assert_not_called()
+
+    def _pause_base_restart(self, *, after_abort):
+        self.now = replace(self.before, head='detached', branch=None,
+            index={'file': ('M 100644 base 1', 'M 100644 ours 2', 'M 100644 theirs 3')},
+            dirty={'file': (('staged', 'unstaged'), 'manual base conflict')},
+            operations={'rebase-merge': 'owned'})
+        self.store.record('repo', 'G-166', expected_generation=0, operation='rebase',
+            expected_head='local', target_base_oid='base', observed_remote_oid='remote', snapshot={})
+        def restored(root, *args, **kwargs):
+            if args[-2:] == ('rebase', '--abort'):
+                self.now = replace(self.before, dirty={}, operations={})
+                return subprocess.CompletedProcess([], 0, '')
+            return self.git(root, *args, **kwargs)
+        def interrupted(root, *args, **kwargs):
+            if args[-2:] == ('rebase', '--abort'):
+                if after_abort:
+                    restored(root, *args, **kwargs)
+                raise KeyboardInterrupt
+            return self.git(root, *args, **kwargs)
+        self.effects.git.side_effect = interrupted
+        with self.assertRaises(KeyboardInterrupt):
+            integration.restart_base_rebase(self.effects, self.connection, Path('/repo'), Path('/state'),
+                                           'repo', self.plan, 'second-input', self.now)
+        original = self.store.get('repo', 'G-166').snapshot['base_rebase_restart']
+        self.effects.git.side_effect = restored
+        self.effects.git.reset_mock()
+        return original
+
+    def _base_restart_successor(self, *, after_abort):
+        original = self._pause_base_restart(after_abort=after_abort)
+        current = integration.restart_base_rebase(self.effects, self.connection, Path('/repo'), Path('/state'),
+                                                 'repo', self.plan, 'third-input', self.now)
+        self.assertEqual(current.snapshot['base_rebase_restart_history'], [original])
+        for field in ('baseline', 'snapshot', 'original_head'):
+            self.assertEqual(current.snapshot['base_rebase_restart'][field], original[field])
+        self.assertEqual(current.snapshot['base_rebase_restart']['remote'], 'third-input')
+        self.assertEqual(current.snapshot['base_rebase_restart']['phase'], 'complete')
+        self.assertEqual(current.target_base_oid, 'third-input')
+        self.assertIsNone(current.operation)
+        self.effects._capture_agent_baseline.assert_called_once()
+        self.assertEqual(sum(call.args[-2:] == ('rebase', '--abort')
+                             for call in self.effects.git.call_args_list), int(not after_abort))
+
+    def test_base_successor_after_restart_save_retains_conflict_snapshot(self):
+        self._base_restart_successor(after_abort=False)
+
+    def test_base_successor_after_abort_does_not_repeat_abort(self):
+        self._base_restart_successor(after_abort=True)
+
+    def test_base_restart_rewrite_preserves_original_intent(self):
+        original = self._pause_base_restart(after_abort=False)
+        self.effects.git.side_effect = lambda *args, **kwargs: subprocess.CompletedProcess([], 1, '')
+        with self.assertRaisesRegex(RuntimeError, '후속 commit'):
+            integration.restart_base_rebase(self.effects, self.connection, Path('/repo'), Path('/state'),
+                                           'repo', self.plan, 'third-input', self.now)
+        self.assertEqual(self.store.get('repo', 'G-166').snapshot['base_rebase_restart'], original)
+        self.assertFalse(any(call.args[-2:] == ('rebase', '--abort')
+                             for call in self.effects.git.call_args_list))
+
 
 class ConflictBaselineUnitTests(unittest.TestCase):
     def test_all_conflict_stages_are_pinned_without_writing_selected_index(self):

@@ -37,6 +37,15 @@ def _preserve_conflict(effects, repo, worktree, snapshot):
     return baseline
 
 
+def _successor_restart(effects, worktree, restart, remote):
+    """Retarget preserved input only to a fetched descendant of its last input."""
+    relation = effects.git(worktree, 'merge-base', '--is-ancestor',
+                           restart['remote'], remote, check=False)
+    if relation.returncode != 0:
+        raise RuntimeError('보존된 충돌 재시작 입력의 후속 commit을 확인할 수 없습니다.')
+    return {**restart, 'remote': remote}
+
+
 def _abort_preserved_rebase(effects, connection, repo_path, state_dir, repo, plan, current, restart):
     worktree, branch = Path(plan['worktree']), plan['branch']
     now = effects.capture_git_snapshot(worktree)
@@ -79,7 +88,18 @@ def restart_base_rebase(effects, connection, repo_path, state_dir, repo, plan, r
             snapshot={**(current.snapshot or {}), 'integration_repo': repo, 'base_rebase_restart': restart,
                       'base_rebase_restart_history': [*history, *([previous] if previous else [])]})
     if restart['remote'] != remote:
-        raise RuntimeError('보존 중인 base 충돌 재시작의 원격 입력이 변경됐습니다.')
+        effects._current_rebase_service(
+            connection, repo_path, state_dir, repo, plan_id, worktree, branch,
+            remote_oid=remote).require_owned(checkpoint=current)
+        previous = restart
+        restart = _successor_restart(effects, worktree, restart, remote)
+        current = checkpoints.record(
+            repo, plan_id, expected_generation=current.generation, operation=current.operation,
+            expected_head=current.expected_head, target_base_oid=current.target_base_oid,
+            observed_remote_oid=current.observed_remote_oid,
+            snapshot={**(current.snapshot or {}), 'base_rebase_restart': restart,
+                      'base_rebase_restart_history': [
+                          *(current.snapshot or {}).get('base_rebase_restart_history', ()), previous]})
     now = _abort_preserved_rebase(effects, connection, repo_path, state_dir, repo, plan, current, restart)
     if now.dirty:
         raise RuntimeError('base rebase 복원 뒤 미확인 로컬 작업물이 남았습니다.')
@@ -148,7 +168,12 @@ def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, sna
                            snapshot=snapshot.serialize(), baseline=preserved)
             save({**intent, 'restart': restart}, head=current.expected_head, operation='rebase')
         elif restart['remote'] != remote:
-            raise RuntimeError('보존 중인 충돌 재시작의 원격 입력이 다시 변경됐습니다.')
+            effects._current_rebase_service(
+                connection, repo_path, state_dir, repo, plan_id, worktree, branch,
+                remote_oid=remote).require_owned(checkpoint=current)
+            restart = _successor_restart(effects, worktree, restart, remote)
+            save({**intent, 'restart': restart}, head=current.expected_head, operation='rebase',
+                 history=[*(current.snapshot or {}).get('work_branch_integration_history', ()), intent])
         now = _abort_preserved_rebase(effects, connection, repo_path, state_dir, repo, plan, current, restart)
         current = checkpoints.get(repo, plan_id)
         current = checkpoints.record(

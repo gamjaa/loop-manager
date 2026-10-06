@@ -42,7 +42,9 @@ class CheckpointRefreshFixture:
 
     def _adoption(self, *, fetched_oid=None, observed_oid=None, diverged=False,
                   dirty=False, changed_paths=('code.py',), rewritten=False, candidate_race=False,
-                  managed_rebased=False, local_rewritten=False, manager_waiting=False, base_conflict=False):
+                  managed_rebased=False, local_rewritten=False, manager_waiting=False, base_conflict=False,
+                  pending_restart=None, pending_input_rewritten=False, foreign_pending=False,
+                  completed_base_restart=False):
         branch, worktree = 'loop-manager/G-106', str(Path('/state/G-106'))
         original, successor = 'a' * 40, 'b' * 40
         self.connection.execute("UPDATE projects SET origin = 'example/repo'")
@@ -54,7 +56,7 @@ class CheckpointRefreshFixture:
             "VALUES ('repo', 'G-106', 'plan', 'verify_retry_exhausted', 'original failure')")
         self.connection.commit()
         plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
-        local = 'c' * 40 if diverged or managed_rebased or local_rewritten else original
+        local = 'c' * 40 if diverged or managed_rebased or local_rewritten or pending_restart else original
         snapshot = loop_manager.GitSnapshot(local, branch, {}, {},
                                             {f'refs/heads/{branch}': (local, '')},
                                             {str(Path(worktree).resolve()): (f'branch=refs/heads/{branch}',)}, {}, {})
@@ -73,13 +75,34 @@ class CheckpointRefreshFixture:
         if dirty:
             snapshot = replace(snapshot, dirty={'local.txt': (('untracked',), 'bytes')})
         restored = snapshot
+        if pending_restart:
+            pending_head, integration_remote = 'f' * 40, 'e' * 40
+            if pending_restart == 'before_abort':
+                snapshot = replace(snapshot, head='detached', branch=None,
+                    operations={'rebase-merge': 'owned'},
+                    index={'code.py': ('M 100644 ours 2', 'M 100644 theirs 3')},
+                    dirty={'code.py': (('staged', 'unstaged'), 'manual conflict bytes')})
+            execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).record(
+                'repo', 'G-106', expected_generation=0, operation='rebase', expected_head=local,
+                target_base_oid=integration_remote, observed_remote_oid=pending_head,
+                snapshot={'work_branch_integration': {
+                    'phase': 'rebasing', 'remote': integration_remote, 'before': restored.serialize(),
+                    'branch': branch, 'worktree': worktree,
+                    'restart': {'remote': pending_head, 'baseline': 'pinned-conflict'}},
+                    'remote_adoption_intent': {
+                        'head': pending_head, 'branch': 'foreign' if foreign_pending else branch,
+                        'worktree': worktree, 'request_identity': self.request.request_identity,
+                        'snapshot': restored.serialize(), 'agent_snapshot': None, 'agent_result_snapshot': None},
+                    **({'base_rebase_restart': {'phase': 'complete', 'remote': '1' * 40}}
+                       if completed_base_restart else {})})
+            self.store.start_remote_adoption(self.request, pending_head)
         if base_conflict:
             execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).record(
                 'repo', 'G-106', expected_generation=0, operation='rebase', expected_head=original,
                 target_base_oid='e' * 40, observed_remote_oid=original, snapshot={})
             snapshot = replace(snapshot, head='detached', branch=None, operations={'rebase-merge': 'owned'},
                                dirty={'code.py': (('unstaged',), 'manual conflict bytes')})
-        combined = 'd' * 40 if diverged or dirty or managed_rebased else successor
+        combined = 'd' * 40 if diverged or dirty or managed_rebased or pending_restart else successor
         adopted = replace(restored, head=combined, dirty={},
                           refs={f'refs/heads/{branch}': (combined, '')})
         confirmed = replace(adopted, dirty={'new.txt': (('untracked',), 'raced')}) if candidate_race else adopted
@@ -98,6 +121,10 @@ class CheckpointRefreshFixture:
                 code = int(managed_rebased or local_rewritten)
             elif args == ('merge-base', '--is-ancestor', local, successor):
                 code = int(diverged or managed_rebased)
+            elif pending_restart and args == ('merge-base', '--is-ancestor', pending_head, successor):
+                code = int(pending_input_rewritten)
+            elif completed_base_restart and args == ('merge-base', '--is-ancestor', '1' * 40, successor):
+                code = 1  # A completed historical input may predate a published Manager rebase.
             elif args[:1] == ('ls-tree',):
                 output = '100644 blob ' + successor + '\tcode.py'
             return subprocess.CompletedProcess([], code, output)
@@ -127,6 +154,15 @@ class CheckpointRefreshFixture:
                     operation=None, expected_head=original, target_base_oid=successor,
                     observed_remote_oid=original, snapshot=current.snapshot)
             restart.side_effect = finish_restart
+            if pending_restart:
+                def finish_integration(*args):
+                    checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+                    current = checkpoints.get('repo', 'G-106')
+                    checkpoints.record('repo', 'G-106', expected_generation=current.generation,
+                        operation=None, expected_head=combined, target_base_oid=successor,
+                        observed_remote_oid=successor, snapshot=current.snapshot)
+                    return adopted
+                integrate.side_effect = finish_integration
             result = loop_manager._reconcile_published_blocked_checkpoint(
                 self.connection, Path('/repo'), Path('/state'), 'repo', plan, self.row(),
                 self.store.get('repo', 'G-106'), self.store, adopt_only=True, expected_remote_oid=successor)
@@ -134,13 +170,48 @@ class CheckpointRefreshFixture:
         if base_conflict:
             restart.assert_called_once()
             self.assertEqual(restart.call_args.args[-1], snapshot)
-        if (diverged or dirty or managed_rebased) and not rewritten and not manager_waiting:
+        if ((diverged or dirty or managed_rebased or pending_restart)
+                and not rewritten and not manager_waiting and not pending_input_rewritten and not foreign_pending):
             integrate.assert_called_once()
+        if pending_restart and (pending_input_rewritten or foreign_pending):
+            integrate.assert_not_called()
         self.assertEqual(scoped_blocking.plan_block(self.connection, 'repo', 'G-106')['evidence'], 'original failure')
         return result, commands
 
 
 class BlockedCheckpointRefreshUnitTests(CheckpointRefreshFixture, unittest.TestCase):
+    def test_successor_after_restart_save_retargets_pending_adoption(self):
+        result, _ = self._adoption(pending_restart='before_abort')
+        self.assertEqual(result, 'adopted')
+        saved = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get('repo', 'G-106')
+        self.assertIsNone(saved.snapshot['remote_adoption_intent'])
+        self.assertEqual(saved.observed_remote_oid, 'b' * 40)
+        self.assertEqual(saved.snapshot['work_branch_integration']['restart']['baseline'], 'pinned-conflict')
+
+    def test_successor_after_abort_retargets_pending_adoption(self):
+        result, _ = self._adoption(pending_restart='after_abort')
+        self.assertEqual(result, 'adopted')
+        self.assertEqual(self.row()['accepted_remote_oid'], 'b' * 40)
+
+    def test_successor_must_include_pending_restart_input(self):
+        result, commands = self._adoption(pending_restart='before_abort', pending_input_rewritten=True)
+        self.assertEqual(result, 'blocked')
+        self.assertEqual(self.row()['accepted_remote_oid'], 'a' * 40)
+        saved = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get('repo', 'G-106')
+        self.assertEqual(saved.snapshot['remote_adoption_intent']['head'], 'f' * 40)
+        self.assertFalse(any('merge' in call.args or 'rebase' in call.args for call in commands.call_args_list))
+
+    def test_successor_does_not_retarget_foreign_pending_identity(self):
+        result, _ = self._adoption(pending_restart='after_abort', foreign_pending=True)
+        self.assertEqual(result, 'blocked')
+        self.assertEqual(self.row()['accepted_remote_oid'], 'a' * 40)
+
+    def test_completed_historical_base_restart_does_not_block_work_restart_successor(self):
+        result, commands = self._adoption(pending_restart='after_abort', completed_base_restart=True)
+        self.assertEqual(result, 'adopted')
+        self.assertFalse(any(call.args[1:] == ('merge-base', '--is-ancestor', '1' * 40, 'b' * 40)
+                             for call in commands.call_args_list))
+
     def test_new_successor_restarts_owned_base_conflict_before_normal_adoption(self):
         result, commands = self._adoption(base_conflict=True)
         self.assertEqual(result, 'adopted')

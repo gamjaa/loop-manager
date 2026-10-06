@@ -293,6 +293,16 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
     ancestors = [(accepted, '마지막 확인 head'), (str(row['published_oid']), '게시 checkpoint')]
     if integration and integrating:
         ancestors.append((str(integration['remote']), '진행 중인 원격 입력'))
+    if integrating:
+        saved = current.snapshot or {}
+        base_restart = saved.get('base_rebase_restart') or {}
+        for ancestor, label in (
+                ((saved.get('remote_adoption_intent') or {}).get('head'), '진행 중인 채택 입력'),
+                (((integration or {}).get('restart') or {}).get('remote'), '작업 branch 충돌 재시작 입력'),
+                (base_restart.get('remote') if base_restart.get('phase') != 'complete' else None,
+                 'base 충돌 재시작 입력')):
+            if ancestor:
+                ancestors.append((ancestor, label))
     for ancestor, label in ancestors:
         relation = effects.git(
             repo_path, "merge-base", "--is-ancestor", ancestor, observed,
@@ -395,9 +405,11 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
                     target_base_oid=current.target_base_oid,
                     observed_remote_oid=current.observed_remote_oid,
                     snapshot={**(current.snapshot or {}), 'remote_adoption_intent': pending_scope})
-        elif (integrating and pending_scope['head'] == integration['remote']
+        elif (integrating
               and (pending_scope['branch'], pending_scope['worktree'], pending_scope['request_identity'])
               == (branch, str(worktree), request.request_identity)):
+            # Every saved input, including this pending head and a restart
+            # target, was verified above as an ancestor of the exact fetch.
             pending_scope = {**pending_scope, 'head': observed}
             checkpoints.record(
                 repo, str(blocked['plan_id']), expected_generation=current.generation,

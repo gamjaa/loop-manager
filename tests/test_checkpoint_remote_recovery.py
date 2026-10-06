@@ -318,6 +318,68 @@ class CheckpointRebaseGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.Te
     def test_user_architecture_document_conflict_accepts_resolution_push_after_restart(self):
         self._user_document_conflict_then_successor('docs/ARCHITECTURE.md')
 
+    def _restart_successor_after_interruption(self, *, after_abort):
+        repo, _ = self._remote_refresh_fixture(branch_changed=True)
+        (self.worktree / 'code.py').write_text('local resolution\n')
+        self.run_git(self.worktree, 'add', 'code.py')
+        self.run_git(self.worktree, 'commit', '-m', 'Local conflicting input')
+        self.assertFalse(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir, repo, 'main'))
+        self.assertTrue(self.run_git(self.worktree, 'ls-files', '-u'))
+        second = self.user_commit('code.py', 'local resolution\n')
+        project = self.connection.execute('SELECT * FROM projects').fetchone()
+        loop_manager.observe_blocked_plan_remotes(self.connection, self.repo, repo, project)
+        git = loop_manager.git
+        def interrupted(root, *args, **kwargs):
+            if args[-2:] == ('rebase', '--abort'):
+                if after_abort:
+                    git(root, *args, **kwargs)
+                raise KeyboardInterrupt
+            return git(root, *args, **kwargs)
+        with mock.patch.object(loop_manager, 'git', side_effect=interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                loop_manager.resume_plan_blocks(self.connection, self.repo, self.state_dir, repo, 'main')
+        checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        pending = checkpoints.get(repo, 'G-034')
+        original = pending.snapshot['work_branch_integration']['restart']
+        self.assertEqual(original['remote'], second)
+        self.assertEqual(pending.snapshot['remote_adoption_intent']['head'], second)
+        third = self.user_commit('dependency.py', 'third user input\n')
+        loop_manager.observe_blocked_plan_remotes(self.connection, self.repo, repo, project)
+        with (mock.patch.object(loop_manager, 'git', side_effect=git) as calls,
+              mock.patch.object(loop_manager, '_evaluate_remote_checkpoint_cause',
+                                return_value=(False, 'original cause still present', None))):
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, self.repo, self.state_dir, repo, 'main'))
+        self.assertEqual(sum(call.args[-2:] == ('rebase', '--abort')
+                             for call in calls.call_args_list), int(not after_abort))
+        current = checkpoints.get(repo, 'G-034')
+        history = current.snapshot['work_branch_integration_history']
+        self.assertIn(original, [item.get('restart') for item in history])
+        retargeted = next(item['restart'] for item in history
+                          if (item.get('restart') or {}).get('remote') == third)
+        for field in ('baseline', 'snapshot', 'original_head'):
+            self.assertEqual(retargeted[field], original[field])
+        self.assertEqual(current.snapshot['work_branch_integration']['remote'], third)
+        self.assertEqual(current.snapshot['work_branch_integration']['phase'], 'complete')
+        self.assertIsNone(current.operation)
+        self.assertFalse(self.run_git(self.worktree, 'ls-files', '-u'))
+        self.assertEqual((self.worktree / 'code.py').read_text(), 'local resolution\n')
+        self.assertEqual((self.worktree / 'dependency.py').read_text(), 'third user input\n')
+        raw = json.loads(original['baseline'])
+        self.assertEqual(raw['version'], 2)
+        self.assertIn('<<<<<<<', self.run_git(self.worktree, 'show', raw['worktree_tree'] + ':code.py'))
+        with mock.patch.object(loop_manager, '_journaled_direct_rebase',
+                               side_effect=AssertionError('completed integration repeated')):
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, self.repo, self.state_dir, repo, 'main'))
+
+    def test_successor_after_conflict_restart_save_resumes_preserved_input(self):
+        self._restart_successor_after_interruption(after_abort=False)
+
+    def test_successor_after_conflict_abort_resumes_without_repeating_abort(self):
+        self._restart_successor_after_interruption(after_abort=True)
+
     def _pending_integration_successor(self, *, after_ref):
         repo, _ = self._remote_refresh_fixture(branch_changed=True)
         (self.worktree / 'staged.txt').write_text('original index\n')
