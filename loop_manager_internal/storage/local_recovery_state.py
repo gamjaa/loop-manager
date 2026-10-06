@@ -171,6 +171,13 @@ def begin_request(
     return LocalRecoveryRequest(request_id, repo, plan_id, "pending", False)
 
 
+def recheck_consumed(connection: sqlite3.Connection, request_id: str, subject: str, cause: str) -> bool:
+    return connection.execute(
+        "SELECT 1 FROM local_environment_recheck_consumption WHERE request_id = ? AND subject = ? AND cause = ?",
+        (request_id, subject, cause),
+    ).fetchone() is not None
+
+
 def consume_recheck(connection: sqlite3.Connection, request_id: str, subject: str, cause: str) -> bool:
     """Claim once in the caller's transaction with the resumed phase transition."""
     row = connection.execute(

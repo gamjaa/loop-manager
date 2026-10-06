@@ -456,6 +456,7 @@ class ProjectService:
                 self_repository=self.identity.registered_only and self.effects.is_loop_manager_repository(self.state.repo_path),
                 refresh_catalog=self._refresh_catalog,
                 local_environment_recheck=bool(self.identity.recovery_request_id),
+                recovery_request_id=self.identity.recovery_request_id,
             )
             self.state.recovered_planning_outcome = PlanningLifecycleCoordinator(self.effects._PlanningLifecyclePorts(
                 self.identity.connection, runtime_state.RuntimeStateRepository(self.identity.connection),
@@ -814,6 +815,7 @@ class ProjectService:
             self_repository=self.identity.registered_only and self.effects.is_loop_manager_repository(self.state.repo_path),
             refresh_catalog=self._refresh_catalog,
             local_environment_recheck=bool(self.identity.recovery_request_id),
+            recovery_request_id=self.identity.recovery_request_id,
         )
         self.effects._check_runtime_handoff()
         if self.state.recovered_planning_outcome is not None:

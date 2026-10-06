@@ -360,7 +360,7 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
         remote_result = blocked_plan_reconciliation.BlockedPlanReconciler(
             effects.plan_recovery_effects(), connection, repo_path, state_dir, repo, base,
             config_path, verify_timeout_seconds,
-        ).reconcile(str(blocked['plan_id']))
+        ).reconcile(str(blocked['plan_id']), **({'local_verify_recheck': True} if local_verify_recheck else {}))
         if scoped_blocking.project_block(connection, repo) is not None:
             return False
         if remote_result == 'resumed':

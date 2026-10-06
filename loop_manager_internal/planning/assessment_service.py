@@ -266,6 +266,10 @@ class PlanningAssessmentService(PlanningService):
                         agent_result_snapshot=scope_result.result_snapshot,
                     )
 
+            save_result = self._ports.state.update
+            if context.recovery_request_id:
+                save_result = lambda repo, **values: self._ports.state.update_local_recheck_result(
+                    repo, context.recovery_request_id, **values)
             if result.code:
                 message = result.message or f"Planner 종료 코드 {result.code}"
                 if result.kind is PlanningAgentResultKind.TRANSIENT_FAILURE:
@@ -274,7 +278,7 @@ class PlanningAssessmentService(PlanningService):
                     outcome = PlanningOutcomeKind.USAGE_LIMIT_PAUSE
                 else:
                     outcome = PlanningOutcomeKind.OPERATIONAL_ERROR
-                self._ports.state.update(
+                save_result(
                     context.repo,
                     last_error=message,
                     planning_result_pending_validation=0,
@@ -283,7 +287,7 @@ class PlanningAssessmentService(PlanningService):
                 )
                 self._ports.events.error(message)
                 return PlanningOutcome(outcome, error=True)
-            self._ports.state.update(
+            save_result(
                 context.repo,
                 last_error=None,
                 planning_result_completed=1,

@@ -225,6 +225,57 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
         after = dict(connection.execute("SELECT * FROM persistent_execution_failures WHERE repo = ?", (repo,)).fetchone())
         self.assertEqual(after, before)
 
+    def test_plan_command_preserves_slot_wait_with_independent_block(self):
+        self.config_path.write_text("[loop]\n", encoding="utf-8")
+        repo = str(self.repository.resolve())
+        with closing(loop_manager.connect_database(self.state_dir)) as connection, connection:
+            for plan_id in ("G-001", "G-002", "G-003"):
+                connection.execute(
+                    "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, priority, content_hash, status, plan_sha) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (repo, plan_id, f"docs/plans/{plan_id}.md", plan_id, '[]', '[]', 'normal', 'hash', 'READY', 'base'))
+            runtime_state.RuntimeStateRepository(connection).activate(
+                repo, "G-002", activation_sha="base", branch="branch", worktree="/worktree")
+            runtime_state.RuntimeStateRepository(connection).block_plan(
+                repo, "G-003", reason_code="user_decision_required", evidence="independent", release_fingerprint=None, clear_projection=False)
+        args = loop_manager.build_parser().parse_args(["recover", repo, "--plan", "G-001"])
+        def run(connection, state_dir, repository, config_path, *_args, **kwargs):
+            def step(*_args, **_kwargs):
+                identity = ProjectIdentity(
+                    connection=connection, state_dir=state_dir, repo_arg=repository,
+                    config_path=config_path, requested_base=None, allow_agents_mismatch=False,
+                    requested_provider="codex", registered_only=True, planner_mutex=None,
+                    refactoring_review_interval=20, verify_timeout_seconds=600, runtime_mutation=None,
+                    recovery_request_id=kwargs["recovery_request_id"], recovery_plan_id="G-001")
+                return ProjectService(SimpleNamespace(_check_runtime_handoff=mock.Mock(), operation_print=mock.Mock()), identity)._prepare_repository()
+            effects = InternalRunProjectResultEffects(
+                _checkpoint_dispatch_ready=mock.Mock(return_value=False), _record_project_recovery=mock.Mock(),
+                _run_project_step=step, _stable_work_reason=mock.Mock(return_value=SimpleNamespace(completed=False, describe=lambda: "waiting")),
+                catalog_schedule_decision=mock.Mock(), dispatch_blocked_checkpoints=mock.Mock(),
+                is_loop_manager_repository=mock.Mock(return_value=False), operation_log=mock.Mock())
+            return _run_project_result(effects, connection, state_dir, repository, config_path,
+                                       None, False, recovery_request_id=kwargs["recovery_request_id"], recovery_plan_id="G-001")
+        self.assertEqual(recover_local_environment(self.effects(run), args, self.state_dir, self.config_path), 1)
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            self.assertEqual(connection.execute("SELECT result FROM local_environment_recovery_requests").fetchone()[0], "unresolved")
+
+    def test_planning_result_and_consumption_survive_database_reopen(self):
+        from loop_manager_internal.storage import local_recovery_state, maintenance_state
+        from loop_manager_internal.planning.state_ports import _PlanningStatePorts
+        repo = str(self.repository.resolve())
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            request = local_recovery_state.begin_request(connection, repo, None)
+            state = _PlanningStatePorts(
+                SimpleNamespace(update_project=loop_manager.update_project), connection,
+                runtime_state.RuntimeStateRepository(connection),
+                maintenance_state.MaintenanceRepository(connection), self.state_dir)
+            state.update_local_recheck_result(repo, request.request_id,
+                last_error="tool unavailable", planning_result_completed=0,
+                planning_result_pending_validation=0)
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            self.assertTrue(local_recovery_state.recheck_consumed(connection, request.request_id, "planning", "planner"))
+            self.assertEqual(connection.execute("SELECT last_error FROM projects WHERE repo = ?", (repo,)).fetchone()[0], "tool unavailable")
+            self.assertEqual(local_recovery_state.begin_request(connection, repo, None).request_id, request.request_id)
+
     def test_parser_accepts_plan_scoped_recovery(self):
         args = loop_manager.build_parser().parse_args([
             "recover", str(self.repository), "--plan", "G-169",

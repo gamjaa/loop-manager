@@ -568,7 +568,7 @@ class BlockedPlanReconciler:
         if decision.status.value != 'complete':
             raise RuntimeError('차단 후보가 현재 소유 범위·target base·clean index 조건을 충족하지 않습니다.')
 
-    def reconcile(self, plan_id):
+    def reconcile(self, plan_id, *, local_verify_recheck=False):
         row = self.connection.execute('SELECT * FROM blocked_remote_observations WHERE repo = ? AND plan_id = ?',
                                       (self.repo, plan_id)).fetchone()
         if row is None:
@@ -587,7 +587,8 @@ class BlockedPlanReconciler:
                                         (self.repo, plan_id)).fetchone()
         if saved is None or saved['stage'] in TERMINAL:
             if not observations.pending_input(row):
-                if self._plan(plan_id)['blocked_reason'] == BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value:
+                if (self._plan(plan_id)['blocked_reason'] == BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value
+                        or local_verify_recheck and self._plan(plan_id)['blocked_reason'] == BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value):
                     return 'unhandled'
                 return 'blocked'
             plan = self._plan(plan_id)

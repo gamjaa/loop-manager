@@ -36,6 +36,10 @@ class PlanningSelectionService(PlanningService):
         """Check the failed input before scheduling or stale-workspace cleanup."""
 
         row = run.row
+        if (run.context.recovery_request_id
+                and self._ports.state.local_recheck_consumed(run.context.recovery_request_id)
+                and not row.planning_result_completed):
+            return self._operational_error()
         if run.context.local_environment_recheck and row.planning_error:
             if row.planning_preserved_state:
                 if self._ports.state.schedule(run.context.repo).active is not None:

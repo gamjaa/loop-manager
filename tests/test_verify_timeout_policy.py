@@ -86,6 +86,10 @@ class VerifyTimeoutPolicyTests(unittest.TestCase):
                 reason_code=BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value,
                 evidence='timeout retry exhausted', release_fingerprint='timeout', clear_projection=True)
         block()
+        from loop_manager_internal.recovery import blocked_remote_observation as observations
+        connection.execute("INSERT INTO blocked_remote_observations (repo, plan_id, registered_origin, base_result, branch_result, observed_at) VALUES ('repo', 'G-047', 'https://example.test/repo.git', 'present', 'present', 'now')")
+        observed = connection.execute("SELECT * FROM blocked_remote_observations WHERE repo='repo' AND plan_id='G-047'").fetchone()
+        observations.mark_processed(connection, 'repo', 'G-047', observations.input_identity(observed))
         request = local_recovery_state.begin_request(connection, 'repo', 'G-047')
         with mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'), \
              mock.patch.object(loop_manager, 'validate_blocked_agent_scope'):

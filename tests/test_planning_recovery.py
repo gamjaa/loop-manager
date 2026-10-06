@@ -971,6 +971,26 @@ class PlanningRecoveryTest(PlanningCase):
         self.assertEqual(ports.state.snapshot.worktree, "/saved/planning")
         ports.state.activate_ready.assert_not_called()
 
+    def test_failed_planning_recheck_is_consumed_before_command_completion(self):
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/saved/planning",
+            planning_workspace_owned=1, planner_session_id="saved-session",
+            planning_attempt_fingerprint="fingerprint", planning_error="tool failure",
+            planning_error_fingerprint="fingerprint", planning_retry_count=3,
+            planning_validation_error="saved diagnostic"))
+        ports.agent.result = PlanningAgentResult(
+            1, "tool unavailable", "saved-session", PlanningAgentResultKind.TRANSIENT_FAILURE)
+        context = replace(self.context, local_environment_recheck=True, recovery_request_id="request")
+        outcome = PlanningLifecycleCoordinator(ports).run(context)
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.TRANSIENT_PAUSE)
+        self.assertTrue(ports.state.local_recheck_consumed("request"))
+        # Reconstruct the coordinator after the failure was saved but before
+        # the recover command completed its request.
+        second = PlanningLifecycleCoordinator(ports).run(context)
+        self.assertEqual(second.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertEqual(ports.state.snapshot.planning_retry_count, 3)
+
     def test_local_recheck_recovers_saved_publication_without_new_planner(self):
         ports = FakePorts(planning_snapshot(
             phase="PLANNING", active_sha="base", worktree="/saved/planning",

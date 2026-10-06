@@ -352,6 +352,8 @@ def _run_project_result(
         if step_result == 0:
             effects.operation_log(reason)
             return ProjectRunResult(ProjectRunKind.WAITING, 0, reason)
+    if recovery_request_id is not None and step_result != 0:
+        return ProjectRunResult(ProjectRunKind.OPERATIONAL_ERROR, 1, detail)
     snapshot = None
     if step_result == 0 or (step_result == 1 and connection.execute(
         "SELECT 1 FROM exec_plans WHERE repo = ? AND status = 'PLAN_BLOCKED' "

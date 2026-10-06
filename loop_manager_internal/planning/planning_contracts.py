@@ -130,6 +130,7 @@ class PlanningContext:
     self_repository: bool = False
     refresh_catalog: Callable[[str], str] | None = None
     local_environment_recheck: bool = False
+    recovery_request_id: str | None = None
 
 
 @dataclass(frozen=True)
