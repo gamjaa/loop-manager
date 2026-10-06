@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.application.contracts import CatalogScheduleDecision
-from loop_manager_internal.application.contracts import PRIORITY_ORDER
+from loop_manager_internal.catalog.effective_priority import effective_priorities
 from loop_manager_internal.maintenance.maintenance_orchestration import MaintenanceOrchestrationError
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
@@ -331,8 +331,11 @@ def catalog_schedule_decision(
             and row["status"] == "MERGED"
         ))
     ]
+    priorities = effective_priorities(execution_rows)
     candidates = []
     for row in ready:
+        if str(row["plan_id"]) not in priorities:
+            continue
         dependencies = json.loads(row["depends_on"])
         if all(dependency not in held and statuses.get(dependency) == "MERGED" for dependency in dependencies):
             candidates.append(row)
@@ -353,11 +356,11 @@ def catalog_schedule_decision(
             if dependents.issubset(affected):
                 break
             affected.update(dependents)
-        candidates = [row for row in candidates if str(row["plan_id"]) not in affected]
+        priorities = effective_priorities([row for row in execution_rows
+                                           if str(row["plan_id"]) not in affected])
+        candidates = [row for row in candidates if str(row["plan_id"]) in priorities]
         if active is None and not project_is_blocked and candidates:
-            selected = min(candidates, key=lambda row: (
-                PRIORITY_ORDER[str(row["priority"])], int(str(row["plan_id"])[2:]),
-            ))
+            selected = min(candidates, key=lambda row: priorities[str(row["plan_id"])].sort_key(str(row["plan_id"])))
     elif active is None and not project_is_blocked and cycle.phase in {
         maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
         maintenance_state.MaintenancePhase.REFACTORING,
@@ -367,9 +370,7 @@ def catalog_schedule_decision(
     elif active is None and not project_is_blocked and effects.assessment_can_yield(cycle):
         resumable = [row for row in candidates if not effects.is_unowned_ready(row)]
         if resumable:
-            selected = min(resumable, key=lambda row: (
-                PRIORITY_ORDER[str(row["priority"])], int(str(row["plan_id"])[2:]),
-            ))
+            selected = min(resumable, key=lambda row: priorities[str(row["plan_id"])].sort_key(str(row["plan_id"])))
     elif (
         active is None
         and not project_is_blocked
@@ -378,12 +379,11 @@ def catalog_schedule_decision(
     ):
         selected = min(
             candidates,
-            key=lambda row: (
-                PRIORITY_ORDER[str(row["priority"])],
-                int(str(row["plan_id"])[2:]),
-            ),
+            key=lambda row: priorities[str(row["plan_id"])].sort_key(str(row["plan_id"])),
         )
     return CatalogScheduleDecision(
+        selection_reason=(priorities[str(selected["plan_id"])].reason(str(selected["plan_id"]))
+                          if selected is not None else None),
         active=active,
         has_ready=bool(ready),
         runnable_ready=selected,
@@ -403,9 +403,13 @@ def catalog_schedule_decision(
 class SelectReadyExecplanEffects:
     """Named effects for select_ready_execplan; no entry-point/module access."""
     catalog_schedule_decision: Callable[..., object]
+    operation_log: Callable[..., object]
 
 
 def select_ready_execplan(effects: SelectReadyExecplanEffects, connection: sqlite3.Connection, repo: str) -> sqlite3.Row | None:
     """Apply the dependency gate before deterministic priority/ID ordering."""
 
-    return effects.catalog_schedule_decision(connection, repo).runnable_ready
+    decision = effects.catalog_schedule_decision(connection, repo)
+    if decision.runnable_ready is not None:
+        effects.operation_log(f"READY 선택 ({repo}): {decision.selection_reason}")
+    return decision.runnable_ready

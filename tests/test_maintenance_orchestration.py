@@ -265,3 +265,21 @@ class MaintenanceOrchestrationTest(MaintenanceCycleCase):
                 MaintenanceOrchestrationError
             ):
                 parse_maintenance_planner_decision(output, phase)
+
+
+class EffectivePrerequisitePriorityTest(MaintenanceCycleCase):
+    def test_goal_outside_cycle_boosts_only_allowed_prerequisite_and_dag_keeps_id_order(self):
+        connection = self._connection()
+        self.addCleanup(connection.close)
+        self._insert_plan(connection, '/one', 'G-001', priority='high')
+        self._insert_plan(connection, '/one', 'G-002', priority='low')
+        self._insert_plan(connection, '/one', 'G-003', priority='critical', depends_on=('G-002',))
+        self._insert_plan(connection, '/one', 'G-000', priority='critical')
+        maintenance_state.ensure_schema(connection)
+        self._legacy_cycle(connection, '/one', 'a' * 40)
+        connection.execute("UPDATE maintenance_cycles SET phase='prerequisite_wait', prerequisite_plan_ids='[\"G-001\", \"G-002\"]'")
+        self.assertEqual(loop_manager.catalog_schedule_decision(connection, '/one').runnable_ready['plan_id'], 'G-002')
+        connection.execute("UPDATE maintenance_cycles SET phase='refactoring', refactoring_plan_ids='[\"G-001\", \"G-002\"]'")
+        self.assertEqual(loop_manager.catalog_schedule_decision(connection, '/one').runnable_ready['plan_id'], 'G-001')
+        connection.execute("UPDATE maintenance_cycles SET phase='prerequisite_wait', refactoring_plan_ids='[]', prerequisite_plan_ids='[\"G-001\"]'")
+        self.assertEqual(loop_manager.catalog_schedule_decision(connection, '/one').runnable_ready['plan_id'], 'G-001')

@@ -10,6 +10,7 @@ import re
 from typing import Mapping, Sequence
 
 from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.catalog.effective_priority import effective_priorities
 
 
 class MaintenanceOrchestrationError(RuntimeError):
@@ -306,14 +307,11 @@ def select_cycle_ready_execplan(
 ) -> Mapping[str, object] | None:
     """Select only the current cycle's runnable READY plan, if any."""
 
+    priorities = effective_priorities(rows)
     scope_rows = rows if catalog_rows is None else catalog_rows
     if cycle.phase is maintenance_state.MaintenancePhase.PREREQUISITE_WAIT:
         allowed = cycle_scope_plan_ids(scope_rows, cycle)
-        priority_order = {"critical": 0, "high": 1, "normal": 2, "low": 3}
-        order = lambda row: (
-            priority_order[str(row["priority"])],
-            _plan_sort_key(str(row["plan_id"])),
-        )
+        order = lambda row: priorities[str(row["plan_id"])].sort_key(str(row["plan_id"]))
     elif cycle.phase in {maintenance_state.MaintenancePhase.REFACTORING,
                          maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION}:
         allowed = cycle_scope_plan_ids(scope_rows, cycle)
@@ -324,7 +322,7 @@ def select_cycle_ready_execplan(
     candidates = []
     for plan_id in allowed:
         row = by_id.get(plan_id)
-        if row is None or str(row["status"]) != "READY":
+        if row is None or plan_id not in priorities or str(row["status"]) != "READY":
             continue
         dependencies = json.loads(str(row["depends_on"]))
         if all(

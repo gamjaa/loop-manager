@@ -40,7 +40,7 @@ priority: critical
 
 - [x] 2026-10-06 기준 a197132e3aaaf91967665c4ed5e6e4fd6e90409c의 활성 명세·catalog와 현재 선택 코드·테스트를 대조했다. 일반·재개 READY 및 유지보수 prerequisite가 선언값만 비교하는 미충족 범위를 확인했다. 구현·테스트 실행은 하지 않았다.
 - [x] 2026-10-06 최신 기준 2fca86c3194a89934072172bc4abd98d245eb840에서 Merge된 G-165의 관련 문서·코드·테스트 변경을 다시 대조했다. 새 독립 READY 정렬 소비자와 미확정 대상 보류를 반영했으며 추가 구현 목표나 테스트 실행은 없다.
-- [ ] 구현 및 관련 targeted unit 검증
+- [x] 구현 및 관련 targeted unit 검증: 공통 effective_priority 계산을 일반·재개·planning 오류 보존·유지보수 prerequisite 선택에 연결했다. 선언 cache와 실행 gate를 보존하고 선택 로그에 선언값·유효값·목표 경로를 추가했다. 관련 14개 unit test가 통과했다. 전체 verify는 Worker가 실행하지 않았다.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
@@ -49,3 +49,7 @@ priority: critical
 - complexity medium: dependency 그래프의 전파와 여러 기존 선택 소비자를 연결하지만 상태 전이나 게시 방식의 재설계는 필요하지 않다. risk medium: 오계산은 선택 지연·잘못된 처리 순서를 만들 수 있으나 선언·실행 자격을 보존하고 다음 선택에서 재계산해 복구할 수 있다. 안전 gate·후보 제한의 회귀는 별도로 검증한다.
 - G-176·G-179의 확정 범위·cycle 종료·barrier 목표와 R-075의 정렬 변경은 독립적이다. R-054·R-074의 상위 선택 정책을 바꾸지 않고, 해당 계획이나 snapshot 밖 실행 계획을 개정하지 않는다.
 - 이전 결과 검증 중 G-165가 Merge돼 관련 문서가 변경됐다. 최신 기준의 catalog/project_selection.py가 추가한 planning 오류 보존 중 priority 비교도 같은 R-075 목표에 포함한다. 슬롯 해제·미확정 범위 판단은 재사용하며 G-165 파일·완료 이력을 수정하거나 중복 계획하지 않는다.
+
+- 공통 계산은 `catalog/effective_priority.py`에 두고 매 선택의 검증·hold 제외 view에서 재계산한다. 불완전·순환 closure는 전파·실행 후보에서 제외하고 planning 미확정 대상과 전이 의존 계획의 보류를 유지한다. 유지보수 범위 계산과 리팩터링 DAG의 숫자 ID 정렬은 재사용한다.
+- 기존 루트 진입·composition 파일 `loop_manager.py`에는 선택 로그 effect 연결만 추가했다. 새 루트 항목·파일 이동은 없으며 기존 Linux verify는 unittest discovery와 전체 compile 경로를 이미 제공해 수정이 필요하지 않다.
+- targeted 검증의 초기 두 실패는 새 테스트 fixture의 enum 저장값과 cycle 범위 초기화 오류였다. fixture를 수정하고 동일 명령을 재실행해 14개 모두 통과했다.

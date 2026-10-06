@@ -1012,3 +1012,117 @@ class PreservedPlanningProjectResultTest(AutomationCatalogFixture, unittest.Test
         self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
         self.assertEqual(runtime.planning(repo).planning_preserved_state, saved)
         effects._stable_work_reason.assert_not_called()
+
+
+class EffectivePrioritySchedulingTest(AutomationCatalogFixture, unittest.TestCase):
+    def test_multilevel_merge_gate_and_selection_log_preserve_declarations(self):
+        connection = self._connection()
+        for plan_id, priority, deps in (
+            ('G-177', 'critical', ('G-170', 'G-176')),
+            ('G-170', 'high', ('G-169',)),
+            ('G-169', 'low', ()), ('G-176', 'normal', ()),
+            ('G-168', 'high', ()),
+        ):
+            self._insert_plan(connection, plan_id, 'READY', priority=priority, depends_on=deps)
+        with mock.patch.object(loop_manager, 'operation_log') as log:
+            self.assertEqual(loop_manager.select_ready_execplan(connection, 'repo')['plan_id'], 'G-169')
+        self.assertIn('declared_priority=low', log.call_args.args[0])
+        self.assertIn('effective_priority=critical', log.call_args.args[0])
+        self.assertIn('G-177 -> G-170 -> G-169', log.call_args.args[0])
+        connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id='G-169'")
+        self.assertEqual(loop_manager.catalog_schedule_decision(connection, 'repo').runnable_ready['plan_id'], 'G-170')
+        self.assertEqual(connection.execute("SELECT priority FROM exec_plans WHERE plan_id='G-170'").fetchone()[0], 'high')
+        connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id='G-170'")
+        self.assertEqual(loop_manager.catalog_schedule_decision(connection, 'repo').runnable_ready['plan_id'], 'G-176')
+        connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id='G-176'")
+        self.assertEqual(loop_manager.catalog_schedule_decision(connection, 'repo').runnable_ready['plan_id'], 'G-177')
+
+    def test_shared_goals_recompute_after_priority_dependency_and_catalog_changes(self):
+        from loop_manager_internal.catalog.effective_priority import effective_priorities
+        connection = self._connection()
+        self._insert_plan(connection, 'G-001', 'READY', priority='low')
+        self._insert_plan(connection, 'G-002', 'READY', priority='high')
+        self._insert_plan(connection, 'G-003', 'READY', priority='critical', depends_on=('G-001',))
+        self._insert_plan(connection, 'G-004', 'READY', priority='high', depends_on=('G-001',))
+        def values():
+            return effective_priorities(connection.execute('SELECT * FROM exec_plans').fetchall())
+        self.assertEqual(values()['G-001'].effective, 'critical')
+        connection.execute("UPDATE exec_plans SET priority='normal' WHERE plan_id='G-003'")
+        self.assertEqual(values()['G-001'].effective, 'high')
+        self.assertEqual(loop_manager.catalog_schedule_decision(connection, 'repo').runnable_ready['plan_id'], 'G-001')
+        connection.execute("UPDATE exec_plans SET depends_on='[]' WHERE plan_id='G-004'")
+        self.assertEqual(values()['G-001'].effective, 'normal')
+        connection.execute("DELETE FROM exec_plans WHERE plan_id='G-003'")
+        self.assertEqual(values()['G-001'].effective, 'low')
+        self._insert_plan(connection, 'G-005', 'READY', priority='critical', depends_on=('G-001',))
+        self.assertEqual(values()['G-001'].effective, 'critical')
+        connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id='G-005'")
+        self.assertEqual(values()['G-001'].effective, 'low')
+        self.assertEqual(values(), values())
+
+    def test_invalid_and_held_relations_do_not_raise_independent_priority(self):
+        connection = self._connection()
+        self._insert_plan(connection, 'G-001', 'READY', priority='low')
+        self._insert_plan(connection, 'G-002', 'READY', priority='high')
+        self._insert_plan(connection, 'G-003', 'READY', priority='critical', depends_on=('G-001', 'G-099'))
+        self._insert_plan(connection, 'G-004', 'READY', priority='critical', depends_on=('G-001', 'G-004'))
+        self._insert_plan(connection, 'G-005', 'READY', priority='critical', depends_on=('G-001', 'G-006'))
+        self._insert_plan(connection, 'G-006', 'READY', depends_on=('G-005',))
+        self._insert_plan(connection, 'G-007', 'READY', priority='critical', depends_on=('G-001',))
+        connection.execute("INSERT INTO execplan_catalog_holds VALUES ('repo', 'G-007', 'sha', '{}', NULL)")
+        self.assertEqual(loop_manager.catalog_schedule_decision(connection, 'repo').runnable_ready['plan_id'], 'G-002')
+
+    def test_waiting_paths_do_not_prevent_independent_selection(self):
+        for status in ('PLAN_BLOCKED', 'PR_OPEN'):
+            with self.subTest(status=status):
+                connection = self._connection()
+                self._insert_plan(connection, 'G-001', status, priority='low')
+                self._insert_plan(connection, 'G-002', 'READY', priority='critical', depends_on=('G-001',))
+                self._insert_plan(connection, 'G-003', 'READY', priority='high')
+                self.assertEqual(loop_manager.catalog_schedule_decision(connection, 'repo').runnable_ready['plan_id'], 'G-003')
+                self.assertEqual(connection.execute("SELECT status FROM exec_plans WHERE plan_id='G-001'").fetchone()[0], status)
+
+    def test_resumable_and_preserved_planning_use_inheritance_within_candidate_gate(self):
+        from loop_manager_internal.storage import runtime_state, maintenance_state
+        for preserved in (False, True):
+            with self.subTest(preserved=preserved):
+                connection = self._connection()
+                self._insert_plan(connection, 'G-001', 'READY', priority='low')
+                self._insert_plan(connection, 'G-002', 'READY', priority='high')
+                self._insert_plan(connection, 'G-003', 'READY', priority='critical', depends_on=('G-001',))
+                connection.execute("UPDATE exec_plans SET workspace_owned=1 WHERE plan_id IN ('G-001', 'G-002')")
+                if preserved:
+                    runtime = runtime_state.RuntimeStateRepository(connection)
+                    runtime.update_project('repo', {'planning_error': 'failed'}, enqueue=False)
+                    runtime.suspend_planning(runtime.planning('repo'), unconfirmed_plan_ids=())
+                else:
+                    maintenance_state.ensure_schema(connection)
+                    connection.execute("INSERT INTO maintenance_cycles (repo, phase) VALUES ('repo', 'assessment')")
+                decision = loop_manager.catalog_schedule_decision(connection, 'repo')
+                self.assertEqual(decision.runnable_ready['plan_id'], 'G-001')
+
+    def test_merged_boundary_default_priority_and_restart(self):
+        import sqlite3
+        from loop_manager_internal.catalog.effective_priority import effective_priorities
+        rows = [
+            {'plan_id': 'G-001', 'status': 'READY', 'depends_on': '[]'},
+            {'plan_id': 'G-002', 'status': 'MERGED', 'priority': 'low', 'depends_on': '["G-001"]'},
+            {'plan_id': 'G-003', 'status': 'READY', 'priority': 'critical', 'depends_on': '["G-002"]'},
+            {'plan_id': 'G-004', 'status': 'READY', 'priority': 'low', 'depends_on': '["G-003"]'},
+        ]
+        priorities = effective_priorities(rows)
+        self.assertEqual(priorities['G-001'].effective, 'normal')
+        self.assertEqual(priorities['G-003'].effective, 'critical')
+        self.assertEqual(priorities['G-003'].paths, ())
+        connection = self._connection()
+        self._insert_plan(connection, 'G-001', 'READY', priority='low')
+        self._insert_plan(connection, 'G-002', 'READY', priority='critical', depends_on=('G-001',))
+        connection.commit()
+        restarted = sqlite3.connect(':memory:')
+        self.addCleanup(restarted.close)
+        restarted.row_factory = sqlite3.Row
+        connection.backup(restarted)
+        before = loop_manager.catalog_schedule_decision(connection, 'repo')
+        after = loop_manager.catalog_schedule_decision(restarted, 'repo')
+        self.assertEqual(before.runnable_ready['plan_id'], after.runnable_ready['plan_id'])
+        self.assertEqual(before.selection_reason, after.selection_reason)

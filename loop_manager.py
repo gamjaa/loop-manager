@@ -1818,6 +1818,7 @@ catalog_schedule_decision = _bind_effects(
 
 select_ready_execplan = _bind_effects(
     project_selection.select_ready_execplan, lambda: project_selection.SelectReadyExecplanEffects(
+        operation_log=lambda *args, **kwargs: operation_log(*args, **kwargs),
         catalog_schedule_decision=lambda *args, **kwargs: catalog_schedule_decision(*args, **kwargs),
     ),
 )
