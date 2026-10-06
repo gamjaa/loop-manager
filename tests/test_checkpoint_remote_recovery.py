@@ -1,6 +1,7 @@
 import json
 import sqlite3
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -13,6 +14,7 @@ from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.recovery import blocked_plan_reconciliation
 from loop_manager_internal.recovery import work_branch_integration
 from loop_manager_internal.execution.worker_session import SessionBinding
+from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
 
 
 from tests.support.blocked_git import CheckpointGitRecoveryFixture
@@ -207,6 +209,24 @@ class CheckpointRebaseGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.Te
                 self.connection, self.repo, self.state_dir, repo, 'main'))
         duplicate_probe.assert_not_called()
 
+    def _complete_base_conflict(self, resolved):
+        # Message/current-commit markers can survive completion. Continue only
+        # a controlling rebase, preserving those markers as recovery evidence.
+        for _ in range(3):
+            operation = controlling_git_operation(loop_manager.capture_git_snapshot(self.worktree).operations)
+            if operation is None:
+                break
+            self.assertIn(operation, {'rebase-merge', 'rebase-apply'})
+            (self.worktree / 'code.py').write_text(resolved)
+            self.run_git(self.worktree, 'add', 'code.py')
+            result = subprocess.run(
+                ['git', '-C', str(self.worktree), '-c', 'core.editor=true', 'rebase', '--continue'],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.assertIn(result.returncode, (0, 1), result.stdout)
+            if result.returncode:
+                self.assertTrue(self.run_git(self.worktree, 'ls-files', '-u'), result.stdout)
+        self.assertIsNone(controlling_git_operation(loop_manager.capture_git_snapshot(self.worktree).operations))
+
     def _manual_base_completion_then_successor(self, *, after_save=False):
         repo, _ = self._remote_refresh_fixture(branch_changed=True)
         (self.repo / 'code.py').write_text('base correction\n')
@@ -227,18 +247,7 @@ class CheckpointRebaseGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.Te
         resolved = 'manually completed base input\n'
         # Both the checkpoint and the user's first commit may conflict when
         # replayed. Resolve each remaining step as a user would, with a bound.
-        for _ in range(3):
-            if not loop_manager.capture_git_snapshot(self.worktree).operations:
-                break
-            (self.worktree / 'code.py').write_text(resolved)
-            self.run_git(self.worktree, 'add', 'code.py')
-            result = subprocess.run(
-                ['git', '-C', str(self.worktree), '-c', 'core.editor=true', 'rebase', '--continue'],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
-            self.assertIn(result.returncode, (0, 1), result.stdout)
-            if result.returncode:
-                self.assertTrue(self.run_git(self.worktree, 'ls-files', '-u'), result.stdout)
-        self.assertFalse(loop_manager.capture_git_snapshot(self.worktree).operations)
+        self._complete_base_conflict(resolved)
         completed = self.run_git(self.worktree, 'rev-parse', 'HEAD')
         self.assertNotEqual(completed, before.expected_head)
         ancestry = subprocess.run(['git', '-C', str(self.worktree), 'merge-base', '--is-ancestor',
@@ -738,6 +747,65 @@ class CheckpointRebaseGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.Te
         ).get(repo, 'G-034').snapshot['blocked_resume']
         self.assertEqual(resumed['owner_oid'], new_oid)
         self.assertEqual(resumed['before_head'], new_oid)
+
+
+class ManualRebaseContinuationUnitTests(unittest.TestCase):
+    """Exercise the manual-completion fixture without any Git process."""
+    def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.worktree = Path(directory.name)
+        (self.worktree / 'code.py').write_text('completed input\n')
+        self.run_git = mock.Mock(return_value='unmerged code.py')
+        capture = mock.patch.object(loop_manager, 'capture_git_snapshot')
+        command = mock.patch.object(subprocess, 'run')
+        self.capture = capture.start()
+        self.command = command.start()
+        self.addCleanup(capture.stop)
+        self.addCleanup(command.stop)
+
+    def complete(self):
+        CheckpointRebaseGitRecoveryTests._complete_base_conflict(self, 'resolved input\n')
+
+    def test_completed_markers_do_not_repeat_continue_or_modify_files(self):
+        retained = {'MERGE_MSG': 'message', 'MERGE_MODE': 'mode', 'REBASE_HEAD': 'previous commit'}
+        self.capture.return_value = mock.Mock(operations=retained)
+        self.complete()
+        self.command.assert_not_called()
+        self.run_git.assert_not_called()
+        self.assertEqual((self.worktree / 'code.py').read_text(), 'completed input\n')
+        self.assertEqual(retained, {'MERGE_MSG': 'message', 'MERGE_MODE': 'mode',
+                                    'REBASE_HEAD': 'previous commit'})
+
+    def test_multiple_conflicts_finish_before_retained_markers(self):
+        retained = {'MERGE_MSG': 'message', 'REBASE_HEAD': 'previous commit'}
+        self.capture.side_effect = [mock.Mock(operations=markers) for markers in (
+            {'rebase-merge': 'first conflict'}, {'rebase-apply': 'next conflict'}, retained, retained)]
+        self.command.side_effect = [subprocess.CompletedProcess([], code, b'rebase step') for code in (1, 0)]
+        self.complete()
+        self.assertEqual(self.command.call_count, 2)
+        for call in self.command.call_args_list:
+            self.assertEqual(call.args[0][-2:], ['rebase', '--continue'])
+        self.assertEqual(self.run_git.call_args_list, [
+            mock.call(self.worktree, 'add', 'code.py'),
+            mock.call(self.worktree, 'ls-files', '-u'),
+            mock.call(self.worktree, 'add', 'code.py')])
+        self.assertEqual((self.worktree / 'code.py').read_text(), 'resolved input\n')
+
+    def test_foreign_operation_is_refused_before_mutation(self):
+        self.capture.return_value = mock.Mock(operations={'MERGE_HEAD': 'other operation'})
+        with self.assertRaises(AssertionError):
+            self.complete()
+        self.command.assert_not_called()
+        self.run_git.assert_not_called()
+        self.assertEqual((self.worktree / 'code.py').read_text(), 'completed input\n')
+
+    def test_unfinished_rebase_is_not_accepted_after_retry_bound(self):
+        self.capture.return_value = mock.Mock(operations={'rebase-merge': 'remaining conflict'})
+        self.command.return_value = subprocess.CompletedProcess([], 1, b'conflict')
+        with self.assertRaises(AssertionError):
+            self.complete()
+        self.assertEqual(self.command.call_count, 3)
 
 
 class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest.TestCase):
