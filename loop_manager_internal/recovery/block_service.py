@@ -10,6 +10,7 @@ from loop_manager_internal.recovery import recovery_runtime
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.scoped_blocking import BlockScope
+from loop_manager_internal.storage import review_correction_state
 from loop_manager_internal.storage import recovery_state
 from loop_manager_internal.storage import runtime_state
 from pathlib import Path
@@ -308,6 +309,15 @@ class TransitionValidationFailureEffects:
 
 def transition_validation_failure(
     effects: TransitionValidationFailureEffects, connection: sqlite3.Connection,
+    repo: str, worktree: Path, stage: str, output: str,
+) -> ValidationFailureDecision:
+    # Read, consume the correction identity, and advance the level in one write transaction.
+    with runtime_state._transaction(connection):
+        return _transition_validation_failure(effects, connection, repo, worktree, stage, output)
+
+
+def _transition_validation_failure(
+    effects: TransitionValidationFailureEffects, connection: sqlite3.Connection,
     repo: str,
     worktree: Path,
     stage: str,
@@ -359,10 +369,15 @@ def transition_validation_failure(
     level_decision: WorkerLevelDecision | None = None
     serialized_level_history: str | None = None
     if stage == "review" and plan["effective_worker_level"] is not None:
+        correction = review_correction_state.deserialize(plan["review_correction_state"])
+        observation = correction.pop('observation', {})
         level_decision = effects.evaluate_review_worker_level(
             plan["effective_worker_level"],
             effects._deserialize_review_level_history(plan["review_level_history"]),
             tuple(failure[0] for failure in recorded_failures),
+            correction,
+            review_level=observation.get('level'),
+            candidate_head=observation.get('head'),
         )
         serialized_level_history = json.dumps(
             level_decision.review_history,
@@ -422,6 +437,7 @@ def transition_validation_failure(
         if level_decision is not None:
             plan_values["effective_worker_level"] = level_decision.effective_level
             plan_values["review_level_history"] = serialized_level_history
+            plan_values["review_correction_state"] = json.dumps(level_decision.correction_state)
     if blocked:
         plan_values.update(
             blocked_fingerprint=blocked_input,

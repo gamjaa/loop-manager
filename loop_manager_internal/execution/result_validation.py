@@ -29,6 +29,7 @@ from loop_manager_internal.application.contracts import _TIMESTAMP_NOISE
 from loop_manager_internal.documents import reviewer_specification
 from loop_manager_internal.git import github_observation
 from loop_manager_internal.runtime.handoff_gate import _runtime_handoff_signal
+from loop_manager_internal.storage import review_correction_state
 from loop_manager_internal.storage import recovery_state
 from loop_manager_internal.storage import runtime_state
 from pathlib import Path
@@ -76,32 +77,54 @@ def evaluate_review_worker_level(
     effective_level: int,
     review_history: dict[str, dict[str, int]],
     fingerprints: tuple[str, ...],
+    correction_state: dict | None = None,
+    *,
+    review_level: int | None = None,
+    candidate_head: str | None = None,
 ) -> WorkerLevelDecision:
-    """Return the monotonic level transition for one valid Reviewer FAIL."""
-
+    """Count only completed, verified feedback turns after a per-level baseline."""
     if type(effective_level) is not int or not 1 <= effective_level <= 8:
         raise ValueError(f"effective Worker level이 유효하지 않습니다: {effective_level}")
     if not fingerprints or any(not fingerprint for fingerprint in fingerprints):
         raise ValueError("Review 승격 평가에는 실패 지문이 하나 이상 필요합니다.")
-
-    history = {
-        level: dict(records)
-        for level, records in review_history.items()
-    }
+    history = {level: dict(records) for level, records in review_history.items()}
+    # Copy nested pending/issues as well: callers may retain the pre-transition state.
+    state = json.loads(json.dumps(correction_state or {}))
+    if review_level is not None and review_level != effective_level:
+        return WorkerLevelDecision(effective_level, effective_level, history, state)
+    baseline = not state or state.get('closed', False) or state['level'] != effective_level
+    pending = state.get('pending')
+    completed = bool(pending and pending['level'] == effective_level
+                     and pending['completed'] and candidate_head
+                     and pending['verified_head'] == candidate_head)
+    if baseline:
+        state = {'version': 1, 'level': effective_level,
+                 'baseline': sorted(set(fingerprints)), 'failures': 0, 'issues': {},
+                 'pending': None,
+                 'audit': [*state.get('audit', []), {
+                     'kind': 'baseline', 'level': effective_level,
+                     'issues': sorted(set(fingerprints)),
+                 }]}
+    elif not completed:
+        return WorkerLevelDecision(effective_level, effective_level, history, state)
+    else:
+        state.setdefault('audit', []).append({
+            'kind': 'correction', 'level': effective_level,
+            'source_review_id': pending['source'], 'verified_head': candidate_head,
+            'issues': sorted(set(fingerprints)),
+        })
+        state['pending'] = None  # Consumed atomically with the level update.
+        state['failures'] += 1
+        for fingerprint in set(fingerprints):
+            state['issues'][fingerprint] = state['issues'].get(fingerprint, 0) + 1
     current = history.setdefault(str(effective_level), {})
-    for fingerprint in sorted(set(fingerprints)):
+    for fingerprint in set(fingerprints):
         current[fingerprint] = current.get(fingerprint, 0) + 1
-
-    should_escalate = (
-        any(occurrences >= 2 for occurrences in current.values())
-        or len(current) >= 3
-    )
-    next_level = (
-        effective_level + 1
-        if should_escalate and effective_level < 8
-        else effective_level
-    )
-    return WorkerLevelDecision(effective_level, next_level, history)
+    escalate = (state['failures'] >= 3
+                or any(state['issues'].get(issue, 0) >= 2 for issue in state['baseline']))
+    next_level = min(8, effective_level + 1) if escalate else effective_level
+    state['audit'][-1]['effective_level'] = next_level
+    return WorkerLevelDecision(effective_level, next_level, history, state)
 
 
 @dataclass(frozen=True)
@@ -147,6 +170,7 @@ def ensure_worker_level_state(
         or not initial <= effective <= 8
     ):
         raise RuntimeError("저장된 Worker level 상태가 ExecPlan과 일치하지 않습니다.")
+    review_correction_state.deserialize(catalog_plan["review_correction_state"])
     review_history = effects._deserialize_review_level_history(
         catalog_plan["review_level_history"]
     )
@@ -528,11 +552,17 @@ def clear_validation_failure_history(
     if plan is None:
         raise RuntimeError("지문 이력을 초기화할 활성 ExecPlan을 찾을 수 없습니다.")
     fingerprints = tuple(effects._deserialize_failure_history(plan[column]))
-    with connection:
+    plan_values = {column: "{}"}
+    if stage == "review":
+        state = review_correction_state.deserialize(plan["review_correction_state"])
+        plan_values["review_correction_state"] = json.dumps(
+            review_correction_state.end_episode(state, plan["effective_worker_level"]),
+        )
+    with runtime_state._transaction(connection):
         runtime_state.RuntimeStateRepository(connection).update_plan(
             repo,
             str(plan["plan_id"]),
-            plan_values={column: "{}"},
+            plan_values=plan_values,
             enqueue=False,
         )
         recovery_state.RecoveryRepository(connection).clear_correction_occurrences(

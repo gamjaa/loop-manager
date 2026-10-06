@@ -6,6 +6,7 @@ import hashlib
 import json
 from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
 from loop_manager_internal.notifications import notifications
+from loop_manager_internal.storage import review_correction_state, runtime_state
 from loop_manager_internal.storage import recovery_state
 import re
 import subprocess
@@ -236,6 +237,11 @@ class WorkerHandler:
                              + str(row['review_result'] or '')).encode()
                         ).hexdigest(),
                     )
+        if not context.resolving_rebase:
+            review_correction_state.begin_worker(
+                self.ports.state.connection, self.ports.identity.repo, str(plan['id']),
+                self.ports.snapshot().level, review_result_id,
+            )
         decision = decide_session(
             row['worker_session_id'],
             SessionBinding.deserialize(row['worker_session_binding']),
@@ -875,25 +881,31 @@ class WorkerHandler:
                     snapshot={**current.snapshot, 'worker_candidate_token':
                               self.ports.snapshot()._definition_snapshot.worker_candidate_token(head)},
                 )
-        self.ports.state.update_project(
-            self.ports.identity.repo,
-            phase='VERIFYING',
-            validated_base_sha=None,
-            worker_result=message,
-            verify_result=None,
-            review_result=None,
-            worker_input_token=(
-                self.ports.snapshot()._definition_snapshot.worker_token
-                if self.ports.snapshot()._definition_snapshot is not None else None
-            ),
-            archive_token=(
-                self.ports.snapshot()._definition_snapshot.archive_token
-                if self.ports.snapshot()._definition_snapshot is not None else None
-            ),
-            verify_token=None,
-            review_token=None,
-            publication_token=None,
-            last_error=None,
-        )
+        with runtime_state._transaction(self.ports.state.connection):
+            if not context.resolving_rebase:
+                review_correction_state.complete_worker(
+                    self.ports.state.connection, self.ports.identity.repo,
+                    context.plan.plan_id, self.ports.snapshot().level,
+                )
+            self.ports.state.update_project(
+                self.ports.identity.repo,
+                phase='VERIFYING',
+                validated_base_sha=None,
+                worker_result=message,
+                verify_result=None,
+                review_result=None,
+                worker_input_token=(
+                    self.ports.snapshot()._definition_snapshot.worker_token
+                    if self.ports.snapshot()._definition_snapshot is not None else None
+                ),
+                archive_token=(
+                    self.ports.snapshot()._definition_snapshot.archive_token
+                    if self.ports.snapshot()._definition_snapshot is not None else None
+                ),
+                verify_token=None,
+                review_token=None,
+                publication_token=None,
+                last_error=None,
+            )
         return self.ports._advanced()
 

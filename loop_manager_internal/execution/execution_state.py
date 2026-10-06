@@ -80,7 +80,7 @@ class ExecutionStatePort:
     def update_project(self, repo, **values):
         if repo != self.repo:
             raise runtime_state.RuntimeStateError("execution repository identity 불일치")
-        with self.connection:
+        with runtime_state._transaction(self.connection):
             expected = self.check()
             if expected is None:
                 raise runtime_state.RuntimeStateError("execution projection이 없습니다.")

@@ -111,6 +111,7 @@ EXECPLAN_RUNTIME_FIELDS = frozenset(MIRRORED_FIELDS) | {
     "initial_worker_level",
     "effective_worker_level",
     "review_level_history",
+    "review_correction_state",
     "blocked_reason",
     "guidance_plan_hash",
     "workspace_owned",

@@ -469,6 +469,52 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         ).fetchone()[0], 3)
 
 
+    def test_verified_correction_and_execution_projection_roll_back_together(self):
+        from loop_manager_internal.storage import review_correction_state
+        state = {'version': 1, 'level': 1, 'baseline': ['issue'],
+                 'failures': 0, 'issues': {}, 'pending': {
+                     'source': 1, 'level': 1, 'completed': True, 'verified_head': None,
+                 }}
+        review_correction_state.save(self.connection, 'repo', 'G-047', state)
+        old_phase = self.connection.execute(
+            "SELECT phase FROM projects WHERE repo = 'repo'"
+        ).fetchone()[0]
+        with self.assertRaisesRegex(RuntimeError, 'interrupted'):
+            with runtime_state._transaction(self.connection):
+                review_correction_state.verified(self.connection, 'repo', 'G-047', 'verified-head')
+                lm.clear_validation_failure_history(self.connection, 'repo', 'verify')
+                self.state.update_project('repo', phase='REVIEWING', verify_result='PASS')
+                raise RuntimeError('interrupted')
+        self.assertEqual(review_correction_state.load(self.connection, 'repo', 'G-047'), state)
+        self.assertEqual(self.connection.execute(
+            "SELECT phase FROM projects WHERE repo = 'repo'"
+        ).fetchone()[0], old_phase)
+
+    def test_review_of_old_level_candidate_does_not_establish_new_baseline(self):
+        from loop_manager_internal.storage import review_correction_state
+        state = {'version': 1, 'level': 1, 'baseline': ['issue'],
+                 'failures': 2, 'issues': {'issue': 2}, 'pending': None}
+        review_correction_state.save(self.connection, 'repo', 'G-047', state)
+        self.connection.execute(
+            "UPDATE exec_plans SET effective_worker_level = 2 WHERE plan_id = 'G-047'"
+        )
+        self.connection.commit()
+        self.effects.validation.parse_reviewer_result.side_effect = lm.parse_reviewer_result
+        self.effects.agent.run_agent.side_effect = [lm.AgentResult(
+            0, 'ISSUE_ID: app.py::persistent::blocking\nFix it\nVERDICT: FAIL',
+            session_id='review-session',
+        )]
+        self.effects.validation.transition_validation_failure.side_effect = self.state.bind(
+            lm.transition_validation_failure, connected=True, mutates=True,
+            name='transition_validation_failure',
+        )
+        self.handler.review(self.review_context())
+        stored = review_correction_state.load(self.connection, 'repo', 'G-047')
+        self.assertEqual(stored, state)
+        self.assertEqual(self.connection.execute(
+            "SELECT review_level_history FROM exec_plans WHERE plan_id = 'G-047'"
+        ).fetchone()[0], '{}')
+
     def test_review_observation_tracks_each_issue_and_pass_resolves_them(self):
         feedback = ValidationFeedbackRepository(self.connection)
         self._with_feedback(feedback)

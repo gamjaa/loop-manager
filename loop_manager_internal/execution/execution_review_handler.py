@@ -5,6 +5,7 @@ from typing import Callable, Any, Mapping
 from loop_manager_internal.documents import document_drafts
 from loop_manager_internal.documents import document_publication
 import sys
+from loop_manager_internal.storage import review_correction_state, runtime_state
 from loop_manager_internal.agents.agent_invocation import AttemptSequence, TrackedAgentCall
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, classify_exception
@@ -138,9 +139,21 @@ class ReviewHandler:
                 self.ports._document_guard(context, draft)
             except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
                 return self.ports._document_block(context, draft, error)
+        review_level = self.ports.snapshot().level
         entry_evidence = self._review_entry_evidence(context)
         if isinstance(entry_evidence, ExecutionOutcome):
             return entry_evidence
+        candidate_head = self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+        correction = review_correction_state.load(
+            self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id,
+        )
+        if correction:
+            pending = correction.get('pending')
+            # A repeated Review of the previous level's candidate must not establish
+            # the newly escalated level's baseline before its Worker has run.
+            review_level = (pending['level'] if pending and pending['completed']
+                            and pending['verified_head'] == candidate_head
+                            else correction['level'])
         targeted_test_reason = self.ports.contract.reviewer_targeted_test_reason(
             entry_evidence.test_evidence,
         )
@@ -343,12 +356,23 @@ class ReviewHandler:
                 normalize_feedback('review', review) if verdict == 'FAIL' else (),
             )
         if verdict == 'FAIL':
-            decision = self.ports.transition_validation_failure(
-                self.ports.identity.repo,
-                context.worktree,
-                'review',
-                review,
-            )
+            with runtime_state._transaction(self.ports.state.connection):
+                correction = review_correction_state.load(
+                    self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id,
+                )
+                correction['observation'] = {
+                    'level': review_level,
+                    'head': candidate_head,
+                }
+                review_correction_state.save(
+                    self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id, correction,
+                )
+                decision = self.ports.transition_validation_failure(
+                    self.ports.identity.repo,
+                    context.worktree,
+                    'review',
+                    review,
+                )
             self.ports.operation_log(
                 f"Worker 반환: {self.ports.snapshot().plan['id']} {self.ports.snapshot().plan['title']} (Review 실패)",
                 error=True,
