@@ -11,7 +11,17 @@ def deserialize(value: object) -> dict:
     state = json.loads(str(value or '{}'))
     if not isinstance(state, dict):
         raise RuntimeError('저장된 Review 교정 상태가 유효하지 않습니다.')
-    if state:
+    candidate = state.get('candidate')
+    if candidate is not None and (
+        not isinstance(candidate, dict)
+        or type(candidate.get('level')) is not int or not 1 <= candidate['level'] <= 8
+        or type(candidate.get('completed')) is not bool
+        or (candidate.get('verified_head') is not None and (
+            not isinstance(candidate['verified_head'], str) or not candidate['verified_head']))
+    ):
+        raise RuntimeError('저장된 Worker 검증 후보가 유효하지 않습니다.')
+    # A candidate can precede the first FAIL or survive lost Review feedback.
+    if state.keys() - {'candidate'}:
         if (state.get('version') != 1
                 or type(state.get('level')) is not int
                 or not 1 <= state['level'] <= 8
@@ -50,8 +60,8 @@ def deserialize(value: object) -> dict:
 
 def end_episode(state: dict, effective_level: int) -> dict:
     """PASS clears the live streak, preserving completed-turn linkage and baselines."""
-    if not state:
-        return {}
+    if 'level' not in state:
+        return state
     return {**state, 'level': effective_level, 'closed': True,
             'baseline': [], 'failures': 0, 'issues': {}, 'pending': None}
 
@@ -77,28 +87,35 @@ def begin_worker(connection: sqlite3.Connection, repo: str, plan_id: str,
                  level: int, source: int | None) -> None:
     """Retries and verify remediation retain the same feedback identity."""
     state = load(connection, repo, plan_id)
-    if not state:
-        return  # Legacy feedback has no trustworthy baseline linkage yet.
+    state['candidate'] = {'level': level, 'completed': False, 'verified_head': None}
     pending = state.get('pending')
-    if source is not None:
+    if source is not None and 'level' in state:
         pending = {'source': source, 'level': level, 'completed': False, 'verified_head': None}
     if pending is not None:
         pending.update(completed=False, verified_head=None)
         state['pending'] = pending
-        save(connection, repo, plan_id, state)
+    save(connection, repo, plan_id, state)
 
 
 def complete_worker(connection: sqlite3.Connection, repo: str, plan_id: str, level: int) -> None:
     state = load(connection, repo, plan_id)
+    candidate = state.get('candidate')
     pending = state.get('pending')
+    if candidate is not None and candidate['level'] == level:
+        candidate.update(completed=True, verified_head=None)
     if pending is not None and pending['level'] == level:
         pending.update(completed=True, verified_head=None)
+    if candidate is not None or pending is not None:
         save(connection, repo, plan_id, state)
 
 
 def verified(connection: sqlite3.Connection, repo: str, plan_id: str, head: str) -> None:
     state = load(connection, repo, plan_id)
+    candidate = state.get('candidate')
     pending = state.get('pending')
+    if candidate is not None and candidate['completed']:
+        candidate['verified_head'] = head
     if pending is not None and pending['completed']:
         pending['verified_head'] = head
+    if candidate is not None or pending is not None:
         save(connection, repo, plan_id, state)

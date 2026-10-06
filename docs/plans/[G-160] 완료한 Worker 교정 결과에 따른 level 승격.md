@@ -53,3 +53,5 @@ priority: high
 - PRODUCT의 최초 12개 level 조합과 명시 설정·교정 후 승격 규칙을 반영했다. 기존 `scripts/verify.sh`는 unittest manifest 자동 탐색으로 변경된 unit test를 포함하므로 수정할 필요가 없다. Worker는 전체 verify를 실행하지 않았으며 Manager 검증·읽기 전용 Review·사용자 Merge는 남아 있다.
 
 - Manager verify 진단에서 공통 `update_project`의 commit 동작을 바꾼 영향으로 rebase 완료가 열린 외부 transaction을 거절하는 회귀를 확인했다. 기존 호출의 commit 의미를 유지하고 새 Worker·verify의 결합 저장에서만 `preserve_transaction=True`로 기존 transaction helper를 사용한다. 유효 Review의 level·후보 HEAD는 전이 인자로 전달해 임시 관측 상태 저장을 제거했다. 재현한 unit case, 관련 복구 경계와 원자 rollback을 targeted 검증하며 전체 verify 재실행은 Manager에 맡긴다.
+
+- Reviewer 교정: `review_result`가 rebase로 사라져도 source ID와 별개인 Worker 후보의 실제 level·완료 여부·검증 HEAD를 저장한다. 이 후보를 새 기준선에도 보존해 승격 직후 첫 검증된 FAIL을 해당 level의 기준선으로 집계하고, 교정 없는 낡은 후보 재관측은 계속 제외한다. 원격 checkpoint의 정상 차단 해제와 Review 이력 초기화 경계는 새 교정 상태도 같은 transaction에서 초기화한다. 승격→rebase→Worker→verify→Review 뒤 두 교정의 승격, 기존 집계가 있는 checkpoint 재개 뒤 첫 FAIL, 낡은 후보와 rollback 회귀를 targeted 검증했다. phase fixture도 유효한 초기 Worker level을 명시한다.

@@ -147,10 +147,12 @@ class ReviewHandler:
         correction = review_correction_state.load(
             self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id,
         )
-        if correction:
+        candidate = correction.get('candidate')
+        if candidate and candidate['completed'] and candidate['verified_head'] == candidate_head:
+            review_level = candidate['level']
+        elif 'level' in correction:
             pending = correction.get('pending')
-            # A repeated Review of the previous level's candidate must not establish
-            # the newly escalated level's baseline before its Worker has run.
+            # Preserve the conservative interpretation of older stored candidates.
             review_level = (pending['level'] if pending and pending['completed']
                             and pending['verified_head'] == candidate_head
                             else correction['level'])

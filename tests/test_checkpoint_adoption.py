@@ -270,7 +270,17 @@ class BlockedCheckpointRefreshUnitTests(CheckpointRefreshFixture, unittest.TestC
     def test_pr_successor_adoption_completes_base_rebase_and_resumes_unverified(self):
         from tests.support.rebase_observations import expectation, observation, decision_for
         from loop_manager_internal.git.managed_rebase_validation import PullRequest, Remote
-        self.connection.execute("UPDATE exec_plans SET worker_session_id = 'saved-worker'")
+        correction = {'version': 1, 'level': 1, 'baseline': ['old-issue'],
+                      'failures': 2, 'issues': {'old-issue': 2}, 'pending': {
+                          'source': 1, 'level': 1, 'completed': True,
+                          'verified_head': 'rebased-head',
+                      }}
+        self.connection.execute(
+            "UPDATE exec_plans SET worker_session_id = 'saved-worker', "
+            "initial_worker_level = 1, effective_worker_level = 2, "
+            "review_level_history = ?, review_correction_state = ?",
+            (json.dumps({'1': {'old-issue': 3}}), json.dumps(correction)),
+        )
         result, _ = self._adoption(existing_pr=True, projected=True, pr_conflict=True)
         self.assertEqual(result, 'adopted')
         runtime = runtime_state.RuntimeStateRepository(self.connection)
@@ -312,6 +322,24 @@ class BlockedCheckpointRefreshUnitTests(CheckpointRefreshFixture, unittest.TestC
         self.assertIsNone(resumed.review_token)
         self.assertIsNone(resumed.worker_result)
         self.assertIsNone(scoped_blocking.plan_block(self.connection, 'repo', 'G-106'))
+        from loop_manager_internal.storage import review_correction_state
+        reset = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id = 'G-106'").fetchone()
+        self.assertEqual(reset['effective_worker_level'], 1)
+        self.assertEqual(json.loads(reset['review_level_history']), {})
+        self.assertEqual(review_correction_state.load(self.connection, 'repo', 'G-106'), {})
+        review_correction_state.begin_worker(self.connection, 'repo', 'G-106', 1, None)
+        review_correction_state.complete_worker(self.connection, 'repo', 'G-106', 1)
+        review_correction_state.verified(self.connection, 'repo', 'G-106', 'rebased-head')
+        loop_manager.transition_validation_failure(
+            self.connection, 'repo', Path('/state/G-106'), 'review',
+            'ISSUE_ID: app.py::persistent::blocking\nFix it\nVERDICT: FAIL',
+            review_level=1, candidate_head='rebased-head',
+        )
+        baseline = review_correction_state.load(self.connection, 'repo', 'G-106')
+        self.assertEqual(baseline['failures'], 0)
+        self.assertEqual(self.connection.execute(
+            "SELECT effective_worker_level FROM exec_plans WHERE plan_id = 'G-106'"
+        ).fetchone()[0], 1)
 
     def test_unprojected_pr_adoption_preserves_independent_project_heads(self):
         self.connection.execute("UPDATE projects SET pr_head_oid = 'other-pr-head', "

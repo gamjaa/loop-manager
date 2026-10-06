@@ -490,6 +490,49 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
             "SELECT phase FROM projects WHERE repo = 'repo'"
         ).fetchone()[0], old_phase)
 
+    def test_escalated_worker_after_rebase_establishes_candidate_level_baseline(self):
+        from loop_manager_internal.storage import review_correction_state
+        issue = 'ISSUE_ID: app.py::persistent::blocking\nFix it\nVERDICT: FAIL'
+        state = {'version': 1, 'level': 1, 'baseline': ['old-issue'],
+                 'failures': 2, 'issues': {'old-issue': 2}, 'pending': None}
+        review_correction_state.save(self.connection, 'repo', 'G-047', state)
+        self.repository.update_plan('repo', 'G-047', plan_values={
+            'initial_worker_level': 1, 'effective_worker_level': 2,
+        }, enqueue=False)
+        self.handler.level = 2
+        self.effects.validation.ensure_worker_level_state.side_effect = lambda *_args: self.connection.execute(
+            "SELECT effective_worker_level FROM exec_plans WHERE plan_id = 'G-047'"
+        ).fetchone()[0]
+        self.review_context()  # Install the existing definition/token fixture.
+        self._with_feedback(ValidationFeedbackRepository(self.connection))
+        self.effects.validation.parse_reviewer_result.side_effect = lm.parse_reviewer_result
+        self.effects.validation.transition_validation_failure.side_effect = self.state.bind(
+            lm.transition_validation_failure, connected=True, mutates=True,
+            name='transition_validation_failure',
+        )
+        self.handler._complete_rebase_intent(self.context())
+        self.assertIsNone(self.state.row()['review_result'])
+        self.assertIsNone(review_correction_state.load(self.connection, 'repo', 'G-047')['pending'])
+        for correction in range(3):
+            self.effects.agent.run_agent.side_effect = self.agent
+            outcome = self.handler.run(self.context())
+            self.assertEqual(self.state.row()['phase'], 'VERIFYING', outcome)
+            worker = review_correction_state.load(self.connection, 'repo', 'G-047')
+            self.assertEqual(worker.get('candidate', {}).get('level'), 2, worker)
+            self.assertTrue(worker['candidate']['completed'])
+            self.handler.verify(self.context(), self.handler)
+            self.assertEqual(self.state.row()['phase'], 'REVIEWING')
+            self.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: lm.AgentResult(
+                0, issue, session_id='review-session',
+            )
+            self.handler.review(self.context())
+            saved = review_correction_state.load(self.connection, 'repo', 'G-047')
+            self.assertEqual(saved['level'], 2)
+            self.assertEqual(saved['failures'], correction)
+            self.assertEqual(self.connection.execute(
+                "SELECT effective_worker_level FROM exec_plans WHERE plan_id = 'G-047'"
+            ).fetchone()[0], 3 if correction == 2 else 2)
+
     def test_review_of_old_level_candidate_does_not_establish_new_baseline(self):
         from loop_manager_internal.storage import review_correction_state
         state = {'version': 1, 'level': 1, 'baseline': ['issue'],

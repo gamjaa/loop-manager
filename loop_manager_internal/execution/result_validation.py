@@ -92,7 +92,7 @@ def evaluate_review_worker_level(
     state = json.loads(json.dumps(correction_state or {}))
     if review_level is not None and review_level != effective_level:
         return WorkerLevelDecision(effective_level, effective_level, history, state)
-    baseline = not state or state.get('closed', False) or state['level'] != effective_level
+    baseline = 'level' not in state or state.get('closed', False) or state['level'] != effective_level
     pending = state.get('pending')
     completed = bool(pending and pending['level'] == effective_level
                      and pending['completed'] and candidate_head
@@ -101,6 +101,7 @@ def evaluate_review_worker_level(
         state = {'version': 1, 'level': effective_level,
                  'baseline': sorted(set(fingerprints)), 'failures': 0, 'issues': {},
                  'pending': None,
+                 **({'candidate': state['candidate']} if 'candidate' in state else {}),
                  'audit': [*state.get('audit', []), {
                      'kind': 'baseline', 'level': effective_level,
                      'issues': sorted(set(fingerprints)),
