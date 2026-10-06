@@ -298,7 +298,7 @@ def _reconcile_rebase_evidence_block(
             not plan['agent_snapshot'] or plan['agent_recovery']):
         return False
     active = runtime_state.RuntimeStateRepository(connection).active_row(repo)
-    if (runtime_state.planning_owns_execution_slot(project) or project['planning_error']
+    if (runtime_state.planning_owns_execution_slot(project)
             or (active is not None and active['plan_id'] != plan_id)
             or int(plan['workspace_owned'] or 0) != WORKSPACE_OWNED
             or not plan['branch'] or not plan['worktree']
@@ -367,7 +367,7 @@ def _reconcile_scope_baseline_plan_block(effects: ReconcileScopeBaselinePlanBloc
             or not plan['agent_snapshot'] or plan['agent_recovery']
             or int(plan['workspace_owned'] or 0) != WORKSPACE_OWNED
             or scoped_blocking.project_block(connection, repo) is not None
-            or runtime_state.planning_owns_execution_slot(project) or project['planning_error']
+            or runtime_state.planning_owns_execution_slot(project)
             or not runtime.recovery_slot_available(repo) or runtime.active_row(repo) is not None
             or effects.unmet_execplan_dependencies(connection, repo, plan_id)):
         return False

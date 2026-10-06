@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import dataclass
+import json
 import re
 import sqlite3
 from typing import Callable, Iterator, Mapping
@@ -81,6 +82,7 @@ PROJECT_ONLY_FIELDS = frozenset(
         "planning_result_pending_validation",
         "planning_result_completed",
         "planning_result",
+        "planning_preserved_state",
         "planning_error",
         "planning_error_fingerprint",
         "planning_error_incident_id",
@@ -194,13 +196,27 @@ def execplan_status_for_phase(phase: object) -> str | None:
     return COMPATIBILITY_STATUS_BY_PHASE.get(normalized, normalized)
 
 
+def _preserved_planning_values(raw: object) -> dict[str, object]:
+    try:
+        values = json.loads(str(raw))
+    except (TypeError, ValueError) as error:
+        raise RuntimeStateError("보존된 planning 상태가 유효하지 않습니다.") from error
+    if (not isinstance(values, dict)
+            or set(values) != set(EXECUTION_CLEAR_VALUES) | set(PLANNING_CLEAR_VALUES)
+            or not values["planning_error"] or values["phase"] not in (None, "PLANNING")):
+        raise RuntimeStateError("보존된 planning 상태가 유효하지 않습니다.")
+    return values
+
+
 def planning_owns_execution_slot(project: sqlite3.Row) -> bool:
-    """Recognize a live or preserved planning attempt, including interrupted ones.
+    """Only a verified suspension separates preserved errors from slot ownership."""
 
-    Successful input fingerprints are durable baselines, not slot ownership.
-    Attempt-specific evidence must remain intact until planning itself clears it.
-    """
-
+    if "planning_preserved_state" in project.keys() and project["planning_preserved_state"]:
+        try:
+            _preserved_planning_values(project["planning_preserved_state"])
+        except RuntimeStateError:
+            return True
+        return project["phase"] == "PLANNING"
     return bool(
         project["phase"] == "PLANNING"
         or project["planning_error"]
@@ -247,6 +263,13 @@ class PlanningSnapshot:
     agent_role: str | None
     agent_snapshot: str | None
     agent_result_snapshot: str | None
+    planning_preserved_state: str | None = None
+
+    @property
+    def preserved_worktree(self) -> str | None:
+        if self.planning_preserved_state:
+            return _preserved_planning_values(self.planning_preserved_state)["worktree"]
+        return self.worktree
 
     def __getitem__(self, field: str) -> object:
         """Support the narrow compatibility helpers during coordinator extraction."""
@@ -257,7 +280,10 @@ class PlanningSnapshot:
 
     @classmethod
     def from_row(cls, row: sqlite3.Row) -> "PlanningSnapshot":
+        if row["planning_preserved_state"]:
+            _preserved_planning_values(row["planning_preserved_state"])
         return cls(
+            planning_preserved_state=_text(row, "planning_preserved_state"),
             repo=str(row["repo"]),
             phase=_text(row, "phase"),
             processed_sha=_text(row, "processed_sha"),
@@ -552,6 +578,42 @@ class RuntimeStateRepository:
             raise RuntimeStateError("planning 상태를 읽을 프로젝트가 없습니다.")
         return PlanningSnapshot.from_row(row)
 
+    def suspend_planning(self, expected: PlanningSnapshot) -> None:
+        """Release only a checked failed attempt; retain its entire projection."""
+        with _transaction(self.connection):
+            if self.planning(expected.repo) != expected or not expected.planning_error:
+                raise RuntimeStateError("planning 보존 입력이 변경됐습니다.")
+            if self.active_row(expected.repo) is not None or expected.phase not in (None, "PLANNING"):
+                raise RuntimeStateError("다른 실행이 planning 슬롯을 사용하고 있습니다.")
+            if expected.planning_preserved_state:
+                raise RuntimeStateError("이미 보존된 planning 상태입니다.")
+            row = self.connection.execute(
+                "SELECT * FROM projects WHERE repo = ?", (expected.repo,),
+            ).fetchone()
+            saved = {key: row[key] for key in (*EXECUTION_CLEAR_VALUES, *PLANNING_CLEAR_VALUES)}
+            values = {**EXECUTION_CLEAR_VALUES, **PLANNING_CLEAR_VALUES}
+            # Errors remain visible to completion, notifications and registration.
+            for key in PLANNING_CLEAR_VALUES:
+                if key.startswith("planning_error"):
+                    values.pop(key)
+            values["planning_preserved_state"] = json.dumps(saved, sort_keys=True)
+            self._update_project_row(expected.repo, values)
+            self._fault("after_planning_suspend")
+
+    def resume_planning(self, expected: PlanningSnapshot) -> None:
+        """Restore the same attempt after the execution slot has become free."""
+        with _transaction(self.connection):
+            if (self.planning(expected.repo) != expected or not expected.planning_preserved_state
+                    or self.active_row(expected.repo) is not None or expected.phase is not None):
+                raise RuntimeStateError("planning 복구 슬롯 또는 입력이 변경됐습니다.")
+            from loop_manager_internal.recovery.scoped_blocking import project_block
+            if project_block(self.connection, expected.repo) is not None:
+                raise RuntimeStateError("PROJECT_BLOCKED 중에는 planning을 복구할 수 없습니다.")
+            values = _preserved_planning_values(expected.planning_preserved_state)
+            values["planning_preserved_state"] = None
+            self._update_project_row(expected.repo, values)
+            self._fault("after_planning_resume")
+
     def recovery_slot_available(self, repo: str) -> bool:
         """Allow plan recovery to project or clear only after planning releases it."""
 
@@ -593,6 +655,15 @@ class RuntimeStateRepository:
     def _update_project_row(self, repo: str, values: Mapping[str, object]) -> None:
         self._validate_fields(values, PROJECT_UPDATE_FIELDS)
         values = dict(values)
+        preserved = self.connection.execute(
+            "SELECT planning_preserved_state FROM projects WHERE repo = ?", (repo,),
+        ).fetchone()
+        if (preserved is not None and preserved[0]
+                and "planning_preserved_state" not in values):
+            # Execution projection cleanup cannot dispose of a suspended attempt.
+            values = {key: value for key, value in values.items() if key not in PLANNING_CLEAR_VALUES}
+        if not values:
+            return
         if "planning_error" in values:
             if "planning_correction_error" not in values:
                 values.update(
@@ -922,7 +993,7 @@ class RuntimeStateRepository:
                         or dict(self._plan_row(repo, plan_id)) != dict(expected_plan)
                         or dict(project) != dict(expected_project)
                         or current_block is None or dict(current_block) != dict(block)
-                        or planning_owns_execution_slot(project) or project['planning_error']
+                        or planning_owns_execution_slot(project)
                         or (active is not None and active['plan_id'] != plan_id)
                         or (is_plan_block and scoped_blocking.project_block(self.connection, repo) is not None)
                         or not dependencies_ready()

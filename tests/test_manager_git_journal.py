@@ -382,3 +382,33 @@ class CurrentRebaseAuditTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class PendingProjectMutationTest(unittest.TestCase):
+    def test_unsealed_mutation_blocks_only_owning_project_without_writing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            self.assertFalse(journal.has_pending_project_mutation(state, '/repo'))
+            journal.begin_rebase(
+                state, owner='plan:G-165', repo='/repo', target='/planning',
+                before={'head': OLD}, expected={'run_id': 'saved-run', 'branch': 'planning'},
+            )
+            slot = journal._slot(state, '/repo', 'managed_rebase', '/planning')
+            original = (slot / 'active.json').read_bytes()
+            self.assertTrue(journal.has_pending_project_mutation(state, '/repo'))
+            self.assertFalse(journal.has_pending_project_mutation(state, '/other'))
+            self.assertEqual((slot / 'active.json').read_bytes(), original)
+            journal.complete_rebase(
+                state, repo='/repo', target='/planning',
+                observe=lambda: {'head': NEW}, validate=lambda *_: {},
+            )
+            self.assertFalse(journal.has_pending_project_mutation(state, '/repo'))
+
+    def test_damaged_active_intent_is_not_a_release_proof(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            slot = state / 'manager-git-journal' / 'damaged'
+            slot.mkdir(parents=True)
+            (slot / 'active.json').write_text('{}')
+            with self.assertRaises(journal.MutationEvidenceError):
+                journal.has_pending_project_mutation(state, '/repo')

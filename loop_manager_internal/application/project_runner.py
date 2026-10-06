@@ -17,6 +17,7 @@ from loop_manager_internal.runtime.handoff_gate import SelfMergeRuntimeHandoff
 from loop_manager_internal.storage import blocked_checkpoint_state
 from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.storage import recovery_state
+from loop_manager_internal.storage import runtime_state
 from pathlib import Path
 import sqlite3
 import threading
@@ -267,19 +268,16 @@ def _run_project_result(
                 and not schedule.project_blocked
             ):
                 project_after = connection.execute(
-                    "SELECT phase, planning_error FROM projects WHERE repo = ?",
+                    "SELECT * FROM projects WHERE repo = ?",
                     (repo,),
                 ).fetchone()
-                if project_after is not None and (
-                    project_after["phase"] != "PLANNING"
-                    and not project_after["planning_error"]
-                ):
+                if project_after is not None and not runtime_state.planning_owns_execution_slot(project_after):
                     step_result = PROJECT_STEP_RETRY
         if step_result != PROJECT_STEP_RETRY:
             break
 
     row = connection.execute(
-        "SELECT phase, last_error, planning_error FROM projects WHERE repo = ?",
+        "SELECT * FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
     detail = str(row["last_error"] or "") if row else None
@@ -299,8 +297,12 @@ def _run_project_result(
         return ProjectRunResult(ProjectRunKind.BLOCKED, 1, reason)
     if row is not None and row["planning_error"]:
         reason = f"planning_error: {row['planning_error']}"
-        effects.operation_log(reason, error=True)
-        return ProjectRunResult(ProjectRunKind.OPERATIONAL_ERROR, 1, reason)
+        if runtime_state.planning_owns_execution_slot(row):
+            effects.operation_log(reason, error=True)
+            return ProjectRunResult(ProjectRunKind.OPERATIONAL_ERROR, 1, reason)
+        if step_result == 0:
+            effects.operation_log(reason)
+            return ProjectRunResult(ProjectRunKind.WAITING, 0, reason)
     snapshot = None
     if step_result == 0 or (step_result == 1 and connection.execute(
         "SELECT 1 FROM exec_plans WHERE repo = ? AND status = 'PLAN_BLOCKED' "

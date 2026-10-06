@@ -677,6 +677,18 @@ def _slot(state_dir: Path, repo: str, kind: str, target: str) -> Path:
     return state_dir / "manager-git-journal" / digest
 
 
+def has_pending_project_mutation(state_dir: Path, repo: str) -> bool:
+    """Unsealed intents cannot be treated as a released mutation slot."""
+    root = state_dir / "manager-git-journal"
+    if not root.exists():
+        return False
+    for slot in root.iterdir():
+        active = slot / "active.json"
+        if active.is_file() and _read(active).get("repo") == repo:
+            return True
+    return False
+
+
 def execute(
     state_dir: Path, *, owner: str, kind: str, repo: str, target: str,
     before: Mapping[str, Any], expected: Mapping[str, Any],

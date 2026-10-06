@@ -304,7 +304,14 @@ def catalog_schedule_decision(
             candidates.append(row)
     selected = None
     cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
-    if active is None and not project_is_blocked and cycle.phase in {
+    project = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
+    suspended = bool(project is not None and project["planning_preserved_state"]
+                     and not runtime_state.planning_owns_execution_slot(project))
+    if suspended and active is None and not project_is_blocked and candidates:
+        selected = min(candidates, key=lambda row: (
+            PRIORITY_ORDER[str(row["priority"])], int(str(row["plan_id"])[2:]),
+        ))
+    elif active is None and not project_is_blocked and cycle.phase in {
         maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
         maintenance_state.MaintenancePhase.REFACTORING,
     }:

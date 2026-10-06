@@ -68,6 +68,21 @@ class _PlanningStatePorts:
     def planning(self, repo: str) -> runtime_state.PlanningSnapshot:
         return self._runtime_repository.planning(repo)
 
+    def suspend_planning(self, expected: runtime_state.PlanningSnapshot) -> None:
+        self._runtime_repository.suspend_planning(expected)
+
+    def resume_planning(self, expected: runtime_state.PlanningSnapshot) -> None:
+        self._runtime_repository.resume_planning(expected)
+
+    def planning_release_pending(self, repo: str) -> bool:
+        tables = {row[0] for row in self._connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'",
+        )}
+        return "agent_invocations" in tables and self._connection.execute(
+            "SELECT 1 FROM agent_invocations WHERE repo = ? AND finished_at IS NULL LIMIT 1",
+            (repo,),
+        ).fetchone() is not None
+
     def general_baseline(self, repo: str) -> bool:
         return planning_input_state.has_baseline(self._connection, repo)
 

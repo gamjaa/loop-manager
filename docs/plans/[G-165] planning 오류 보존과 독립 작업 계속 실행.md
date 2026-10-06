@@ -35,9 +35,23 @@ preserved planning_error가 실행 자리를 계속 점유하는 현재 gate를 
 ## Progress
 
 - [x] 2026-10-05 planning 기준 a049a76의 명세·원본·관련 테스트와 비종료 catalog에서 미충족 범위를 확인함. 구현·테스트 실행은 하지 않음.
-- [ ] 구현 및 관련 targeted unit 검증
+- [x] 구현 및 관련 targeted unit 검증 (선택한 23개 case와 보존 작업 재검증 1개 case 통과)
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
 
 - 여러 durable 상태와 실행 슬롯을 분리해야 해 complexity high, 오류 작업물과 실행 순서 손실의 영향으로 risk high다. 원격 진단 보존 자체는 G-168에서 구현한다.
+
+- 기존 runtime 전이·planning workspace 소유권·Agent scope·Manager Git journal을 재사용한다. `projects.planning_preserved_state`는 additive TEXT 필드이며 실패한 planning의 projection·session·미게시 결과·피드백을 보존한다. 작업 공간을 이동·삭제하거나 새 루트 파일을 만들지 않는다.
+- Worker projection 정리·PR 전이·Merge·차단 복구는 보존된 planning과 오류 incident를 변경하지 않는다. 입력 변경 때 빈 실행 자리에서 기존 projection을 복원하며, 이후 기존 workspace 재검증·교정·게시 경계가 해당 오류의 실제 해소를 판정한다.
+
+| 경로 | 변경·유지 이유와 검증 |
+|---|---|
+| `planning/selection_service.py` preserved-error gate | 같은 입력은 신규 Planner를 호출하지 않는다. 확인된 실패 작업을 보존해 슬롯을 비운 뒤 독립 READY 선택 또는 대기를 반환한다. 활성 Worker·PR 교정은 선점하지 않는다. |
+| `planning/git_ports.py`, `planning/state_ports.py`, `git/manager_git_journal.py` | 소유권·현재 Agent 범위·미종료 호출·공유 Git operation·미해결 index·미확정 쓰기를 검사한다. prepared publication과 확인할 수 없는 workspace는 release하지 않으며 원인·결과를 보존한다. |
+| `storage/runtime_state.py`, `storage/database.py`, `storage/execplan_catalog_state.py` | 보존과 실행 투영을 transaction으로 분리하고 catalog CAS에 보존 상태를 포함한다. 재시작·중단 rollback·Worker/PR/Merge 정리 뒤 원래 planning을 복원한다. 손상된 보존 상태나 stale snapshot은 슬롯 해제 근거가 아니다. |
+| `catalog/project_selection.py`, `application/project_runner.py` | 유지보수 오류에서도 catalog hold·dependency·PROJECT_BLOCKED·활성 실행 gate를 유지한 채 기존 READY를 순차 선택한다. 보존된 planning 대기는 WAITING, 실제 Worker 오류는 실패로 반환하며 완료 판정은 보류한다. |
+| `recovery/project_block_service.py`, `storage/runtime_state.py` rebase 복구 | 별도 planning 오류의 존재만으로 독립 복구를 막던 중복 gate를 슬롯 소유 판정으로 통일한다. 미해제 planning 슬롯과 대상 계획의 기존 소유권·dependency·scope·checkpoint 검사는 유지한다. |
+
+- 관련 unit 검증은 `tests/test_planning_selection.py`, `tests/test_runtime_state.py`, `tests/test_catalog_scheduling.py`, `tests/test_manager_git_journal.py`의 변경한 class·case에 한정했다. 실행 결과 경계에서 누락된 import를 발견해 수정하고 같은 23개 case 명령을 재실행해 모두 통과했으며, 기존 session 복원 후 오류 해제를 별도 1개 case로 확인했다.
+- 기존 `scripts/verify.sh`는 프로젝트 verification runner의 test discovery를 사용하므로 이번 테스트도 포함한다. 스크립트 변경이 필요하지 않으며 전체 verify는 Manager가 수행한다.

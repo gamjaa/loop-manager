@@ -138,6 +138,25 @@ class FakeStatePort:
     def plan_declarations_match(self, _repo, _entries):
         return self.plan_declarations_match_result
 
+    def planning_release_pending(self, _repo):
+        return False
+
+    def suspend_planning(self, expected):
+        from loop_manager_internal.storage.runtime_state import PLANNING_CLEAR_VALUES, EXECUTION_CLEAR_VALUES
+        saved = {key: getattr(expected, key, default)
+                 for key, default in {**EXECUTION_CLEAR_VALUES, **PLANNING_CLEAR_VALUES}.items()}
+        values = {key: value for key, value in PLANNING_CLEAR_VALUES.items()
+                  if key in expected.__dataclass_fields__ and not key.startswith("planning_error")}
+        self.snapshot = replace(expected, **values, phase=None, active_sha=None,
+                                worktree=None, agent_role=None, agent_snapshot=None,
+                                agent_result_snapshot=None, last_error=None,
+                                planning_preserved_state=json.dumps(saved))
+
+    def resume_planning(self, expected):
+        values = {key: value for key, value in json.loads(expected.planning_preserved_state).items()
+                  if key in expected.__dataclass_fields__}
+        self.snapshot = replace(expected, **values, planning_preserved_state=None)
+
     def general_baseline(self, _repo):
         return self.has_general_baseline
 
@@ -413,6 +432,9 @@ class FakeGitPort:
         self.ownership_checks.append((repo, fingerprint, worktree))
         if self.ownership_error is not None:
             raise self.ownership_error
+
+    def validate_planning_release(self, _repo, _worktree):
+        pass
 
     def make_planning_worktree(self, *_args, **_kwargs):
         if self.workspace_error is not None:

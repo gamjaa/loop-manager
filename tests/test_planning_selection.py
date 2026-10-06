@@ -396,21 +396,26 @@ class PlanningSelectionTest(PlanningCase):
         )
         ports = FakePorts(before, cycle)
         ports.git.remote = "advanced-base"
-        for _ in range(4):
+        for attempt in range(4):
             outcome = PlanningLifecycleCoordinator(ports).run(
                 replace(self.context, base_sha="advanced-base")
             )
-            self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
-            self.assertEqual(ports.state.snapshot.active_sha, "advanced-base")
-            self.assertEqual(ports.state.snapshot.worktree, before.worktree)
+            self.assertEqual(outcome.kind, (PlanningOutcomeKind.OPERATIONAL_ERROR
+                if attempt == 0 else PlanningOutcomeKind.REMOTE_BASE_RESTART
+                if attempt == 1 else PlanningOutcomeKind.WAITING))
+            saved = (planning_snapshot(**{key: value for key, value in json.loads(ports.state.snapshot.planning_preserved_state).items()
+                                          if key in PlanningSnapshot.__dataclass_fields__})
+                     if ports.state.snapshot.planning_preserved_state else ports.state.snapshot)
+            self.assertEqual(saved.active_sha, "advanced-base")
+            self.assertEqual(saved.worktree, before.worktree)
             self.assertEqual(ports.state.snapshot.planning_error, before.planning_error)
-            self.assertEqual(ports.state.snapshot.planner_session_id, "saved-session")
-            self.assertEqual(ports.state.snapshot.planning_attempt_fingerprint, fingerprint)
+            self.assertEqual(saved.planner_session_id, "saved-session")
+            self.assertEqual(saved.planning_attempt_fingerprint, fingerprint)
             self.assertEqual(ports.state.cycle.cycle_base_sha, "advanced-base")
             self.assertEqual(ports.state.clear_calls, [])
         self.assertEqual(ports.agent.run_count, 0)
         self.assertEqual(ports.git.ownership_checks,
-                         [("/repo", fingerprint, Path("/planning"))])
+                         [("/repo", fingerprint, Path("/planning"))] * 2)
 
     def test_maintenance_mode_error_survives_base_and_source_advance(self):
         cycle = maintenance_cycle(
@@ -427,12 +432,17 @@ class PlanningSelectionTest(PlanningCase):
         ports.git.remote = "advanced-base"
         ports.git.fingerprints = {"base": "old-input", "advanced-base": "new-input"}
 
-        for _ in range(2):
+        for attempt in range(3):
             outcome = PlanningLifecycleCoordinator(ports).run(
                 replace(self.context, base_sha="advanced-base"),
             )
-            self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
-            self.assertEqual(ports.state.snapshot.active_sha, "advanced-base")
+            self.assertEqual(outcome.kind, (PlanningOutcomeKind.OPERATIONAL_ERROR
+                if attempt == 0 else PlanningOutcomeKind.REMOTE_BASE_RESTART
+                if attempt == 1 else PlanningOutcomeKind.WAITING))
+            saved = (planning_snapshot(**{key: value for key, value in json.loads(ports.state.snapshot.planning_preserved_state).items()
+                                          if key in PlanningSnapshot.__dataclass_fields__})
+                     if ports.state.snapshot.planning_preserved_state else ports.state.snapshot)
+            self.assertEqual(saved.active_sha, "advanced-base")
             self.assertEqual(ports.state.snapshot.planning_error, "mode requires user action")
         self.assertEqual(ports.agent.run_count, 0)
         self.assertEqual(ports.state.clear_calls, [])
@@ -1323,3 +1333,165 @@ class PlanningSelectionTest(PlanningCase):
         self.assertEqual(second.kind, PlanningOutcomeKind.EXECUTION_READY)
         self.assertEqual(activated, ["G-002"])
         self.assertEqual(ports.agent.run_count, 0)
+
+
+class PreservedPlanningSelectionTest(PlanningCase):
+    def failed_ports(self, **values):
+        defaults = dict(
+            phase="PLANNING", active_sha="base", worktree="/planning",
+            planning_workspace_owned=1, planning_attempt_fingerprint="fingerprint",
+            planner_session_id="saved-session", planning_result="unpublished-result",
+            planning_validation_error="failed validation", planning_retry_count=3,
+            planning_error="saved failure", planning_error_fingerprint="fingerprint",
+        )
+        defaults.update(values)
+        return FakePorts(planning_snapshot(**defaults))
+
+    def test_same_input_releases_then_runs_independent_ready_without_planner(self):
+        ports = self.failed_ports()
+        original = ports.state.snapshot
+        ports.state.schedule_result.runnable_ready = object()
+        ports.state.schedule_result.has_ready = True
+        ports.state.activate_result = object()
+        self.assertEqual(PlanningLifecycleCoordinator(ports).run(self.context).kind,
+                         PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        saved = ports.state.snapshot.planning_preserved_state
+        self.assertEqual(json.loads(saved)["planner_session_id"], original.planner_session_id)
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertTrue(outcome.newly_activated)
+        self.assertEqual(ports.agent.run_count, 0)
+        self.assertEqual(ports.state.snapshot.planning_preserved_state, saved)
+        self.assertEqual(ports.state.snapshot.planning_error, original.planning_error)
+        self.assertFalse(any(args[:1] == ("push",) for _, args, _ in ports.git.calls))
+
+    def test_no_independent_work_waits_without_completion_or_retirement(self):
+        ports = self.failed_ports()
+        self.assertEqual(PlanningLifecycleCoordinator(ports).run(self.context).kind,
+                         PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        ports.retirement = SimpleNamespace(pending=mock.Mock())
+        for _ in range(3):
+            outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+            self.assertEqual(outcome.kind, PlanningOutcomeKind.WAITING)
+        ports.retirement.pending.assert_not_called()
+        self.assertEqual(ports.agent.run_count, 0)
+
+    def test_release_refuses_uncertain_ownership_operations_scope_and_publication(self):
+        for reason in ("ownership", "operation", "agent", "scope", "intent", "maintenance-intent"):
+            with self.subTest(reason=reason):
+                ports = self.failed_ports()
+                if reason == "ownership":
+                    ports.git.ownership_error = PlanningWorkspaceOwnershipError("unknown owner")
+                elif reason == "operation":
+                    ports.git.validate_planning_release = mock.Mock(
+                        side_effect=PlanningWorkspaceOwnershipError("unsealed Git operation"))
+                elif reason == "agent":
+                    ports.state.planning_release_pending = lambda _repo: True
+                elif reason == "scope":
+                    ports.state.snapshot = replace(ports.state.snapshot, agent_snapshot="scope")
+                    ports.agent.validate_saved_scope = lambda *_args: PlanningScopeResult("shared ref changed")
+                elif reason == "intent":
+                    ports.state.general_intent = object()
+                else:
+                    ports.state.cycle = replace(ports.state.cycle, publication_stage="prepared")
+                original = ports.state.snapshot
+                run = PlanningLifecycleCoordinator(ports)._new_run(self.context)
+                outcome = PlanningLifecycleCoordinator(ports)._selection._gate_preserved_error(run)
+                self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+                self.assertEqual(ports.state.snapshot, original)
+                self.assertEqual(ports.agent.run_count, 0)
+
+    def test_active_pr_correction_keeps_slot_even_when_failed_input_changes(self):
+        ports = self.failed_ports()
+        PlanningLifecycleCoordinator(ports).run(self.context)
+        saved = ports.state.snapshot.planning_preserved_state
+        ports.state.snapshot = replace(ports.state.snapshot, phase="WORKING")
+        ports.state.schedule_result.active = object()
+        ports.git.fingerprint = "changed-input"
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertFalse(outcome.newly_activated)
+        self.assertEqual(ports.state.snapshot.planning_preserved_state, saved)
+        self.assertEqual(ports.agent.run_count, 0)
+
+    def test_changed_input_restores_same_attempt_before_revalidation(self):
+        ports = self.failed_ports()
+        original = ports.state.snapshot
+        PlanningLifecycleCoordinator(ports).run(self.context)
+        ports.git.fingerprint = "changed-input"
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        self.assertEqual(ports.state.snapshot, original)
+        self.assertEqual(ports.agent.run_count, 0)
+
+    def test_restored_validation_error_clears_only_after_saved_session_revalidation(self):
+        ports = self.failed_ports(planning_error="failed validation", planning_error_origin="validation")
+        PlanningLifecycleCoordinator(ports).run(self.context)
+        ports.git.remote = "new-base"
+        ports.git.fingerprints["new-base"] = "changed-input"
+        ports.git.relevant_document_changes = mock.Mock(return_value=("docs/PRODUCT.md",))
+        ports.validation.result = None
+        updated = replace(self.context, base_sha="new-base")
+        self.assertEqual(PlanningLifecycleCoordinator(ports).run(updated).kind,
+                         PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        self.assertEqual(ports.state.snapshot.planning_error, "failed validation")
+        self.assertEqual(ports.agent.run_count, 0)
+        outcome = PlanningLifecycleCoordinator(ports).run(updated)
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.NO_CHANGE)
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertEqual(ports.agent.resumed_session, "saved-session")
+        self.assertIsNone(ports.state.snapshot.planning_error)
+        self.assertIsNone(ports.state.snapshot.planning_preserved_state)
+
+    def test_remote_change_at_activation_keeps_preserved_result(self):
+        ports = self.failed_ports()
+        PlanningLifecycleCoordinator(ports).run(self.context)
+        saved = ports.state.snapshot
+        ports.state.schedule_result.runnable_ready = object()
+        ports.git.remote = "new-base"
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        self.assertEqual(ports.state.snapshot, saved)
+        self.assertEqual(ports.agent.run_count, 0)
+
+
+class PlanningReleaseGitTest(unittest.TestCase):
+    def test_release_checks_shared_operations_unmerged_index_and_workspace(self):
+        from loop_manager_internal.planning.git_ports import _PlanningGitPorts
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / 'planning'
+            worktree.mkdir()
+            for failure in ('none', 'worktree-operation', 'shared-operation', 'unmerged', 'missing'):
+                with self.subTest(failure=failure):
+                    effects = SimpleNamespace(
+                        git=mock.Mock(side_effect=lambda _repo, *args, **_kwargs: SimpleNamespace(
+                            stdout='conflict' if args == ('ls-files', '--unmerged') and failure == 'unmerged' else '')),
+                        _nul_git_paths=mock.Mock(),
+                        _git_operation_entries=lambda path: {'operation': 'active'} if (
+                            failure == 'worktree-operation' and path == worktree
+                            or failure == 'shared-operation' and path == root) else {},
+                    )
+                    port = _PlanningGitPorts(effects, None, root, root / 'state')
+                    target = root / 'missing' if failure == 'missing' else worktree
+                    if failure == 'none':
+                        port.validate_planning_release('/repo', target)
+                    else:
+                        with self.assertRaises(PlanningWorkspaceOwnershipError):
+                            port.validate_planning_release('/repo', target)
+
+    def test_release_pending_agent_is_read_without_modifying_invocations(self):
+        from loop_manager_internal.planning.state_ports import _PlanningStatePorts
+        from loop_manager_internal.storage import agent_invocation_state
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        agent_invocation_state.ensure_schema(connection)
+        connection.execute("""INSERT INTO agent_invocations (
+            invocation_id, repo, role, provider, model, effort, transition, attempt, started_at
+        ) VALUES ('call', '/repo', 'planner', 'codex', 'model', 'high', 'start', 1, 'time')""")
+        port = _PlanningStatePorts(None, connection, None, None, Path('/state'))
+        self.assertTrue(port.planning_release_pending('/repo'))
+        self.assertFalse(port.planning_release_pending('/other'))
+        connection.execute("UPDATE agent_invocations SET finished_at = 'time'")
+        self.assertFalse(port.planning_release_pending('/repo'))
