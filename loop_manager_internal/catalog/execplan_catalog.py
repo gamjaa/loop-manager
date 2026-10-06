@@ -15,6 +15,7 @@ import re
 import stat
 from types import MappingProxyType
 from typing import AbstractSet, Iterable, Mapping
+from loop_manager_internal.catalog import execplan_drafts
 
 
 PRIORITIES = frozenset({"critical", "high", "normal", "low"})
@@ -269,10 +270,14 @@ def parse_execplan_text(
     """Parse one plan without consulting Git, SQLite, or external services."""
 
     legacy = {"id", "title", "sources", "depends_on", "complexity", "risk"}
-    allowed = legacy | {"priority"}
+    allowed = legacy | {"priority", "draft"}
     values = parse_frontmatter(text)
-    if set(values) not in {frozenset(legacy), frozenset(allowed)}:
+    if not legacy <= set(values) <= allowed:
         raise RuntimeError("ExecPlan frontmatter key가 docs/PLANS.md 형식과 다릅니다.")
+    if "draft" in values:
+        if not isinstance(values["draft"], str) or values["draft"] not in {"true", "false"}:
+            raise RuntimeError("ExecPlan draft는 true 또는 false여야 합니다.")
+        values["draft"] = values["draft"] == "true"
     if "priority" not in values:
         if require_priority:
             raise RuntimeError("새 ExecPlan에는 priority가 필요합니다.")
@@ -319,6 +324,7 @@ def parse_execplan_text(
         raise RuntimeError("ExecPlan risk가 유효하지 않습니다.")
     if values["priority"] not in PRIORITIES:
         raise RuntimeError("ExecPlan priority가 유효하지 않습니다.")
+    values.update(execplan_drafts.metadata(text, values))
     return values
 
 
@@ -338,6 +344,7 @@ class ExecPlanCatalogEntry:
     content_hash: str
     text: str
     archived: bool
+    draft_metadata: Mapping[str, object] | None = None
 
     def metadata(self) -> dict[str, object]:
         return {
@@ -348,6 +355,7 @@ class ExecPlanCatalogEntry:
             "complexity": self.complexity,
             "risk": self.risk,
             "priority": self.priority,
+            **(self.draft_metadata or {}),
         }
 
 
@@ -461,6 +469,7 @@ def _entry(relative_path: str, text: str, values: Mapping[str, object]) -> ExecP
         content_hash=plan_content_hash(text),
         text=text,
         archived=archived,
+        draft_metadata={key: value for key, value in values.items() if key.startswith("draft")},
     )
 
 

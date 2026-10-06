@@ -17,6 +17,9 @@ EXECPLAN_AUTHORING_GUIDANCE = """
 - Acceptance Criteria는 관찰·검증 가능한 결과로, Implementation은 변경할 책임 경계와 핵심 방향으로 작성하라. 구현자가 코드에서 결정할 수 있는 파일·함수별 절차는 미리 고정하지 말고, 순서가 안전성이나 계약을 보장하는 경우만 구체화하라.
 - Validation에는 이 작업 고유의 targeted test와 전체 verify 회귀 조건을 남겨라. Progress는 실제 진행, Decision Log는 중요한 결정과 이유를 기록하고 상세 실행 로그는 필요한 증거만 참조하라.
 - 간결화해도 결정·예외·실패 시 보존과 재개·Acceptance Criteria를 생략하지 마라. 기존 계획 개정에서는 해당 snapshot·mode의 변경 범위와 목표 보존 조건을 우선하고, 길이 제한으로 내용을 삭제하거나 권한을 확대하지 마라.
+- 일반 계획 작성에서 구현 방향에 사용자 판단이 필요하면 유효한 ID/sources/depends_on과 목표를 보존한 계획에 frontmatter `draft: true`를 선언하라. `Draft Decision` 절에 Question, Facts, Options, Impact를 각각 비어 있지 않은 `필드: 내용` 줄로 적고 미결정 구현은 명시하라. draft와 독립 실행 가능 계획은 같은 batch로 게시된다. 같은 질문은 기존 ID에서 보존·개정하며 새 계획으로 반복하지 마라.
+- draft와 그 의존 작업은 Worker·workspace·branch·PR을 시작하지 않고 독립 작업은 계속한다. draft는 planning 오류나 완료가 아니다. snapshot 밖·실행 이력·소유권이 있는 계획은 draft로 전환하지 마라. 기존 사용자 판단 대기 draft를 삭제하지 마라.
+- `User Decision` 절은 사용자만 작성한다. 사용자는 원격 계획의 draft 표시를 제거하고 Decision: approve, Revision: compact catalog의 decision_wait.revision 판단 지문, Answer: 질문에 대한 구체적 답변을 기록한다. reject/defer 또는 불완전한 결정은 계속 대기한다. 관련 목표·질문·source·설계 근거가 바뀌면 새로운 revision에 대한 결정을 받아야 한다. Agent는 결정 작성·변경이나 draft 해제로 자기 승인하지 마라. 기존 문서 draft와 AGENTS User Decision은 별도 계약이다.
 """.strip()
 
 
@@ -266,6 +269,7 @@ AGENTS.md와 {plan_path}를 읽고 해당 ExecPlan 하나만 구현하라.
 {AGENT_QUALITY_GUIDANCE}
 관련 targeted test를 작성하되 commit, push, PR 생성과 scripts/verify 실행은 하지 마라.
 docs/plans에 새 ExecPlan을 만들지 말고 불필요한 후속 기능도 구현하지 마라.
+ExecPlan의 사용자 판단 대기 draft 표시와 User Decision은 사용자를 대신해 해제·작성·변경하지 마라.
 현재 ExecPlan 구현에 필요한 대응표·구현 기록은 docs/plans의 다른 기존 ExecPlan에도 갱신할 수 있다. 다른 계획의 목표를 추가 구현하거나 실행 상태를 문서에 기록하지 마라.
 {plans_scope}
 {guidance_instruction}

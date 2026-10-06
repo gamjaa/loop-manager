@@ -10,6 +10,7 @@ from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
 from loop_manager_internal.runtime.contracts import WORKSPACE_RESERVED
 from loop_manager_internal.runtime.contracts import WORKSPACE_UNOWNED
 from loop_manager_internal.storage import execplan_catalog_state
+from loop_manager_internal.storage import execplan_draft_state
 from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.storage import planner_check_state
 from loop_manager_internal.storage import runtime_state
@@ -126,6 +127,7 @@ def compact_execplan_catalog(effects: CompactExecplanCatalogEffects, connection:
     held = {str(row[0]): json.loads(str(row[1])) for row in connection.execute(
         "SELECT plan_id, evidence FROM execplan_catalog_holds WHERE repo = ?", (repo,),
     )}
+    drafts = execplan_draft_state.pending_ids(connection, repo)
     catalog = [
         {
             "id": row["plan_id"],
@@ -134,6 +136,8 @@ def compact_execplan_catalog(effects: CompactExecplanCatalogEffects, connection:
             "sources": json.loads(row["sources"]),
             "depends_on": json.loads(row["depends_on"]),
             "priority": row["priority"],
+            **({"draft": True, "decision_wait": execplan_draft_state.prompt_evidence(connection, repo, str(row["plan_id"]))}
+               if str(row["plan_id"]) in drafts else {}),
             **({"catalog_error": held[str(row["plan_id"])]} if str(row["plan_id"]) in held else {}),
         }
         for row in rows
@@ -318,14 +322,15 @@ def catalog_schedule_decision(
         for row in rows
     }
     held = scoped_blocking.catalog_held_plan_ids(connection, repo)
+    drafts = execplan_draft_state.pending_ids(connection, repo)
     ready = [
         row
         for row in rows
-        if row["status"] == "READY" and str(row["plan_id"]) not in historical_ids | held
+        if row["status"] == "READY" and str(row["plan_id"]) not in historical_ids | held | drafts
     ]
     execution_rows = [
         row for row in rows
-        if str(row["plan_id"]) not in held and (str(row["plan_id"]) not in historical_ids
+        if str(row["plan_id"]) not in held | drafts and (str(row["plan_id"]) not in historical_ids
         or (
             historical_confirmation[str(row["plan_id"])]
             and row["status"] == "MERGED"
@@ -396,6 +401,7 @@ def catalog_schedule_decision(
             and str(row["plan_id"]) not in historical_ids for row in rows
         ),
         project_blocked=project_is_blocked,
+        has_draft=bool(drafts),
     )
 
 

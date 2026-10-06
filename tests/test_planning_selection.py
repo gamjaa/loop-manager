@@ -49,6 +49,7 @@ from tests.support.planning_case import (
     PlanningCase, FakePorts, FakeStatePort, FakeGitPort, FakeAgentPort,
     FakeValidationPort, FakeEventPort, planning_snapshot, maintenance_cycle,
 )
+from tests.support.catalog import plan_text
 
 class PlanningSelectionTest(PlanningCase):
     def test_legacy_release_resumes_after_removal_and_state_clear_interruptions(self):
@@ -697,11 +698,12 @@ class PlanningSelectionTest(PlanningCase):
         ports.git.fingerprint = "new-full"
         ports.git.fingerprints["old-base"] = "old-full"
         ports.state.has_general_baseline = True
+        text = plan_text("G-001", "Ready")
         plan = ReadyPlanSnapshot(
             plan_id="G-001", path="docs/plans/[G-001] Ready.md", title="Ready",
             sources=("docs/PRODUCT.md",), depends_on=(), complexity="low",
-            risk="low", priority="normal", content_hash="plan-hash",
-            plan_sha="base", text="plan", current_complexity="low",
+            risk="low", priority="normal", content_hash=hashlib.sha256(text.encode()).hexdigest(),
+            plan_sha="base", text=text, current_complexity="low",
             current_risk="low", current_metadata_recorded=True,
         )
         ports.validation.snapshot = MutableReadySnapshot(

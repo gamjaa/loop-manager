@@ -48,10 +48,11 @@ class CatalogScheduleDecision:
     has_pr_open: bool = False
     project_blocked: bool = False
     selection_reason: str | None = None
+    has_draft: bool = False
 
     @property
     def has_waiting(self) -> bool:
-        return self.has_plan_blocked or self.has_pr_open or self.project_blocked
+        return self.has_plan_blocked or self.has_pr_open or self.project_blocked or self.has_draft
 
 
 @dataclass(frozen=True)

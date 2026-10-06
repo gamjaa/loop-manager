@@ -66,6 +66,7 @@ class MutableReadySnapshot:
                         "priority": plan.priority,
                         "content_hash": plan.content_hash,
                         "plan_revision": plan.plan_sha,
+                        "draft": plan.draft,
                     }
                     for plan in self.plans
                 ],

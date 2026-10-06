@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.catalog import execplan_catalog, project_catalog_refresh
+from loop_manager_internal.catalog import execplan_drafts
 from loop_manager_internal.application.contracts import ValidatedPlanningResult
 from loop_manager_internal.application.contracts import _FUTURE_IDEA_ITEM
 from loop_manager_internal.git.command_adapter import (
@@ -257,6 +258,11 @@ def validate_planner_result(
             ) from error
         if effects.contains_guidance_sections(planner_text):
             raise PlannerValidationError("Planner는 AGENTS.md guidance를 제안할 수 없습니다.")
+        try:
+            original = snapshot.by_id.get(str(parsed["id"]))
+            execplan_drafts.validate_agent_change(parsed, original.text if original else None)
+        except RuntimeError as error:
+            raise PlannerValidationError(str(error)) from error
         current_plans[changed_path] = parsed
         plan_paths.append(changed_path)
 
@@ -281,6 +287,11 @@ def validate_planner_result(
             withheld_ids = local.withheld_ids
         else:
             catalog = effects.load_execplan_catalog(worktree)
+        if connection is not None and repo is not None:
+            from loop_manager_internal.storage import execplan_draft_state
+            execplan_draft_state.validate_questions(connection, repo, catalog)
+        else:
+            execplan_drafts.validate_questions(catalog)
         project_catalog_refresh.assert_planning_dependencies_unheld(
             catalog, current_plans.items(), unresolved_holds)
         remote_deletions.validate_recovery(worktree, snapshot, current_plans, catalog)
@@ -319,6 +330,8 @@ def validate_planner_result(
         for path in sorted(displaced_paths):
             original = snapshot.by_path[path]
             if original.plan_id not in renamed_ids:
+                if execplan_catalog.parse_frontmatter(original.text).get("draft") == "true":
+                    raise RuntimeError("사용자 판단 대기 draft를 삭제할 수 없습니다.")
                 deletions.append(PlanDeletion(original))
 
         if connection is not None and repo is not None and deletions:

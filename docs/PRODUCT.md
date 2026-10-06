@@ -120,6 +120,10 @@ R-023의 원격 실행·self handoff 목표는 유지하며 로컬 갱신 gate�
 7. 게시 직전 base나 후보 근거가 바뀌었으면 필요한 교정·후보 확인·검증·Review를 다시 수행한 뒤 기존 PR을 복구하거나 새 PR을 생성한다.
 8. 안정된 PR_OPEN은 실행 자리를 비운다. 해당 계획에 직접·간접 의존하지 않는 READY는 순차적으로 시작할 수 있고, 연결 PR의 Merge 확인 뒤 의존 작업이 시작된다.
 
+계획의 `draft: true`는 사용자 판단이 필요한 작성 준비도 선언이다. 유효한 draft는 독립 실행 가능 계획과 같은 batch로 게시·등록하며 질문·선택 영향·원격 링크·판단 revision을 보존한다. draft에는 Worker·workspace 예약·구현 branch·PR을 시작하지 않고, 직접·간접 의존 계획도 대기한다. 독립 READY·planning·PR 관측은 계속한다. 같은 근거와 질문을 새 ID로 반복 게시하지 않는다.
+
+사용자는 원격 계획의 `Draft Decision` 질문을 해소하고 draft 표시를 제거한 뒤 `User Decision` 절에 `Decision: approve`, `Revision: compact catalog의 decision_wait.revision 판단 지문`, `Answer: 구체적 답변`을 기록한다. 판단 지문은 계획·관련 명세·설계 근거와 해당 근거를 확인한 원격 revision에 결합된다. Manager는 최신 원격 catalog·관련 명세와 설계 근거·무소유 상태를 확인하고 결정 대기를 해제한다. 질문·목표·관련 근거 변경, 불완전한 답변, reject/defer와 표시만 제거한 변경은 대기로 보존한다. Agent는 결정 작성·변경·자기 승인을 할 수 없다. 실행에는 기존 dependency·소유권 gate도 충족해야 한다. 이 계약은 문서 수정 draft 승인 및 AGENTS 변경 승인과 구분한다.
+
 계획 게시의 원자 적용, 작업 공간 복구와 단계별 Git 처리는 [ARCHITECTURE.md](ARCHITECTURE.md#계획-게시와-작업-공간)를 따른다.
 
 ### 실패와 재시도
@@ -358,7 +362,7 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 - due 또는 활성 유지보수 cycle과 해결되지 않은 유지보수 planning error가 없어야 하며, 실제 Merge·게시·catalog 확인에 결합된 cycle 종료 기준이 있어야 한다. 최신 코드와 평가 receipt의 차이만으로 추가 유지보수를 요구하지 않는다
 - 해결되지 않은 `planning_error`가 없어야 한다
 - `cleanup_pending`은 프로젝트 완료를 막지 않는다
-- Requirement와 ExecPlan에는 별도의 초안 상태를 두지 않는다
+- Requirement에는 별도의 초안 상태를 두지 않는다. ExecPlan의 draft 준비도·사용자 판단 대기는 실행 phase와 분리하며 프로젝트 완료와 관련 Requirement archive를 막는다
 - 프로젝트 완료 알림은 프로젝트별로 관리한다
 - 새로운 PRODUCT/Requirement 변경으로 작업 주기가 시작되고 다시 완료되면 새 완료 알림을 전송한다
 - Requirement archive 이동만으로 완료 알림을 다시 활성화하지 않는다
