@@ -528,7 +528,7 @@ class PreservationBoundaryTests(unittest.TestCase):
         order = []
         ports.state.retry_diagnostic_preservation.side_effect = lambda *args: order.append('preservation')
         service._continue_published_work = lambda run: order.append('independent work') or 'continue'
-        run = SimpleNamespace(row=expected, context=SimpleNamespace(repo='repo', repo_path=Path('/repo')),
+        run = SimpleNamespace(row=expected, context=SimpleNamespace(repo='repo', repo_path=Path('/repo'), local_environment_recheck=False),
             base_sha='base', publication_recovery_verified=False, maintenance_planning=False,
             maintenance_cycle=SimpleNamespace(phase=maintenance_state.MaintenancePhase.IDLE))
         self.assertEqual(service._gate_preserved_error(run), 'continue')
