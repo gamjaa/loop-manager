@@ -125,3 +125,57 @@ class InvocationRepositoryTests(TestCase):
         self.repository.finish(unknown, "success", 0, 10, None, Usage(None, 5))
         rows = {item["role"]: item for item in self.repository.summary("repo")}
         self.assertIsNone(rows["reviewer"]["cache_ratio"])
+
+
+class CommonGuidanceStateTests(TestCase):
+    def test_additive_migration_preserves_legacy_invocation_and_session_audit(self):
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        ensure_schema(connection)
+        repository = InvocationRepository(connection)
+        identity = repository.start(InvocationContext('repo', 'G-147'), 'worker', 'codex',
+                                    ResolvedProfile('old', 'high'), 'old-session')
+        repository.finish(identity, 'transient_failure', 1, 17, 'old-session', Usage(5, 2))
+        before = dict(connection.execute('SELECT * FROM agent_invocations').fetchone())
+        ensure_schema(connection)
+        self.assertEqual(dict(connection.execute('SELECT * FROM agent_invocations').fetchone()), before)
+        self.assertIsNone(before['guidance_content_hash'])
+        self.assertEqual(connection.execute('SELECT COUNT(*) FROM common_guidance_versions').fetchone()[0], 0)
+
+    def test_snapshot_and_session_binding_survive_database_reopen_without_reloading_runtime(self):
+        from pathlib import Path
+        import tempfile
+        from unittest import mock
+        from loop_manager_internal.agents import common_guidance
+        from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runtime = root / 'runtime'
+            (runtime / 'docs').mkdir(parents=True)
+            (runtime / common_guidance.COMMON_PATH).write_text('original', encoding='utf-8')
+            database = root / 'state.db'
+            context = InvocationContext('repo', 'G-147')
+            with sqlite3.connect(database) as connection, mock.patch.object(common_guidance, 'RUNTIME_ROOT', runtime), \
+                 mock.patch.object(common_guidance.subprocess, 'run', return_value=type('Revision', (), {'returncode': 0, 'stdout': 'a' * 40})()):
+                repository = GuidanceRepository(connection)
+                snapshot = common_guidance.resolve(repository, context, 'worker', root / 'project', root / 'state')
+                repository.bind_session('repo', 'codex', 'session', snapshot.task_id)
+            (runtime / common_guidance.COMMON_PATH).unlink()
+            with sqlite3.connect(database) as restarted, mock.patch.object(common_guidance, 'RUNTIME_ROOT', runtime):
+                self.addCleanup(restarted.close)
+                repository = GuidanceRepository(restarted)
+                resumed = common_guidance.resolve(repository, context, 'reviewer', root / 'project', root / 'state')
+                self.assertEqual(resumed, snapshot)
+                self.assertEqual(repository.session_task('repo', 'codex', 'session'), snapshot.task_id)
+
+    def test_changed_plan_guidance_invalidates_all_candidate_result_tokens(self):
+        from dataclasses import replace
+        from loop_manager_internal.execution.execution_revision import DefinitionSnapshot, classify_definition_delta, DefinitionDelta
+        original = DefinitionSnapshot('a' * 40, 'docs/plans/[G-147] Test.md', 'Test', ('docs/PRODUCT.md',), (),
+                                      'high', 'high', 'high', 'body', 'source', (), 'old')
+        changed = replace(original, guidance_hash='new')
+        self.assertEqual(classify_definition_delta(original, changed), {DefinitionDelta.GUIDANCE})
+        for method in ('worker_candidate_token', 'verify_token', 'review_token', 'publication_token'):
+            self.assertNotEqual(getattr(original, method)('head'), getattr(changed, method)('head'))
+        self.assertEqual(DefinitionSnapshot.deserialize(original.serialize()), original)

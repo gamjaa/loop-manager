@@ -382,6 +382,7 @@ def run_codex(
     isolation_snapshot_digest: Callable[[], str] | None = None,
     expected_repository: str | None = None,
     on_isolation_checked: Callable[[agent_write_isolation.IsolationEvidence], None] | None = None,
+    common_guidance: object | None = None,
 ) -> tuple[int, str] | CodexResult:
     return provider_adapters.run_codex(
         worktree,
@@ -400,6 +401,7 @@ def run_codex(
         isolation_snapshot_digest=isolation_snapshot_digest,
         expected_repository=expected_repository,
         on_isolation_checked=on_isolation_checked,
+        common_guidance=common_guidance,
         effects=effects._provider_adapters_effects(),
     )
 
@@ -464,6 +466,7 @@ def run_claude(
     on_isolation_checked: Callable[[agent_write_isolation.IsolationEvidence], None] | None = None,
     isolation_snapshot_digest: Callable[[], str] | None = None,
     expected_repository: str | None = None,
+    common_guidance: object | None = None,
 ) -> tuple[int, str] | AgentResult:
     return provider_adapters.run_claude(
         worktree,
@@ -480,6 +483,7 @@ def run_claude(
         on_isolation_checked=on_isolation_checked,
         isolation_snapshot_digest=isolation_snapshot_digest,
         expected_repository=expected_repository,
+        common_guidance=common_guidance,
         effects=effects._provider_adapters_effects(),
     )
 

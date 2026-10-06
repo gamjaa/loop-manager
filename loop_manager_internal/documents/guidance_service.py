@@ -7,6 +7,7 @@ from loop_manager_internal.agents.scope_contracts import AgentScopeError
 from loop_manager_internal.documents.guidance_approval import GuidanceDocument
 from loop_manager_internal.documents.guidance_approval import GuidanceFormatError
 from loop_manager_internal.documents.guidance_approval import GuidanceProposal
+from loop_manager_internal.documents.guidance_approval import parse_guidance_document
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.scoped_blocking import GUIDANCE_BLOCK_REASON
@@ -28,16 +29,33 @@ def _validate_guidance_proposal_scope(
     common_allowed: bool,
 ) -> None:
     for proposal in proposals:
-        if common_allowed and proposal.scope == "project":
-            raise AgentScopeError(
-                "Loop Manager 루트 AGENTS.md는 공통 원본이므로 "
-                "Scope common으로 명시적으로 승인해야 합니다."
-            )
         if proposal.scope == "common" and not common_allowed:
             raise AgentScopeError(
-                "공통 AGENTS.md guidance는 Loop Manager 자체 저장소의 "
-                f"Worker만 제안할 수 있습니다: {proposal.proposal_id}"
+                "신규 AGENTS.md 제안은 자체 저장소도 Scope project만 허용됩니다: "
+                f"{proposal.proposal_id}"
             )
+
+
+def legacy_common_identities(git, repo_path: Path, revision: str, plan_path: str) -> set[str]:
+    """Recognize original proposals before injection, including prepared docs.
+
+    The common document existed as a draft before runtime injection. Its mere
+    presence cannot invalidate an old pending root-AGENTS approval.
+    """
+    marker = "loop_manager_internal/agents/common_guidance.py"
+    if not revision:
+        return set()
+    baseline = revision
+    # Retain the migration boundary even if a later refactor moves its module.
+    additions = git(repo_path, "log", "--reverse", "--format=%H", "--diff-filter=A",
+                    revision, "--", marker).stdout.splitlines()
+    if additions:
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", additions[0]):
+            raise AgentScopeError("과거 common 제안의 주입 전 기준을 확인할 수 없습니다.")
+        baseline = additions[0] + "^"
+    published = git(repo_path, "show", f"{baseline}:{plan_path}", check=False)
+    original = parse_guidance_document(published.stdout) if published.returncode == 0 else None
+    return {p.identity for p in original.proposals if p.scope == "common"} if original else set()
 
 
 @dataclass(frozen=True)
@@ -187,6 +205,7 @@ class BlockForNewGuidanceEffects:
     capture_git_snapshot: Callable[..., object]
     guidance_patch_hash: Callable[..., object]
     is_loop_manager_repository: Callable[..., object]
+    git: Callable[..., object]
 
 
 def _block_for_new_guidance(
@@ -201,10 +220,17 @@ def _block_for_new_guidance(
 ) -> None:
     if not new_proposals:
         raise RuntimeError("차단할 새 guidance 제안이 없습니다.")
-    effects._validate_guidance_proposal_scope(
-        new_proposals,
-        common_allowed=effects.is_loop_manager_repository(repo_path),
-    )
+    # A saved/published pre-migration pending proposal remains bound to its
+    # original root target. A Worker cannot introduce another common proposal.
+    revision = str((plan['current_revision_sha'] if 'current_revision_sha' in plan.keys() else None)
+                   or plan['plan_sha'] or '')
+    is_self = effects.is_loop_manager_repository(repo_path)
+    legacy = (legacy_common_identities(effects.git, repo_path, revision, str(plan['path']))
+              if is_self and any(p.scope == 'common' for p in new_proposals) else set())
+    for proposal in new_proposals:
+        effects._validate_guidance_proposal_scope(
+            (proposal,), common_allowed=(is_self and proposal.identity in legacy),
+        )
     for proposal in new_proposals:
         if proposal.decision.decision != "pending":
             raise AgentScopeError(

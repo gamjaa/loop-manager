@@ -39,7 +39,7 @@ def configure_registry(
             if not projects:
                 effects.operation_print("등록된 프로젝트가 없습니다.")
             for project in projects:
-                approval = "approved" if project.agents_approved else "common"
+                approval = "legacy-approved" if project.agents_approved else "project"
                 effects.operation_print(
                     f"{project.repo}\t{project.base_branch}\t"
                     f"{project.provider}\tAGENTS:{approval}"
@@ -134,7 +134,7 @@ def _document_drafts_command(
                     str(project["provider"]), effects.ROOT, state_dir, config_path,
                     "planner", prompt, read_only=True,
                     connection=connection,
-                    invocation=InvocationContext(repo, None),
+                    invocation=InvocationContext(repo, None, task_id='document-draft:' + str(identity)),
                 ),
                 None,
             )

@@ -75,7 +75,10 @@ class TieredMaintenancePort:
                 paths=tuple(sorted(paths)), request_id=prior["request_id"])
         else:
             selection = replace(selection, request_id=cycle.cycle_request_id)
-        return self.repository.prepare(context.repo, cycle.revision, selection, cycle_id=cycle.cycle_id, review_mode=review_mode)
+        guidance_hash = (prior.get('guidance_hash') if prior is not None
+                         and prior.get('cycle_id') == cycle.cycle_id else None)
+        return self.repository.prepare(context.repo, cycle.revision, selection, cycle_id=cycle.cycle_id,
+                                       review_mode=review_mode, guidance_hash=guidance_hash)
 
     def export(self, run, assessment, unit=None):
         directory = run.context.state_dir / "maintenance-evidence"

@@ -2807,6 +2807,7 @@ _guidance_batch_id = guidance_service._guidance_batch_id
 
 _block_for_new_guidance = _bind_effects(
     guidance_service._block_for_new_guidance, lambda: guidance_service.BlockForNewGuidanceEffects(
+        git=lambda *args, **kwargs: git(*args, **kwargs),
         _final_block_recovery_decision=lambda *args, **kwargs: _final_block_recovery_decision(*args, **kwargs),
         _guidance_batch_id=lambda *args, **kwargs: _guidance_batch_id(*args, **kwargs),
         _guidance_block_message=lambda *args, **kwargs: _guidance_block_message(*args, **kwargs),
@@ -4115,7 +4116,7 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument(
         "--approve-agents-mismatch",
         action="store_true",
-        help="현재 AGENTS.md 해시에 결합해 공통 규칙 불일치를 승인",
+        help="이전 CLI와의 호환 옵션 (공통 본문 포함 승인은 더 이상 필요하지 않음)",
     )
     remove = config_commands.add_parser("remove", help="프로젝트 등록 해제")
     remove.add_argument("repository", help="등록 해제할 저장소 루트")

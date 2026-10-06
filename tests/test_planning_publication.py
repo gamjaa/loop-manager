@@ -45,6 +45,101 @@ from tests.support.planning_case import (
 )
 
 class PlanningPublicationTest(PlanningCase):
+    def _reviewed_publication_connection(self):
+        from loop_manager_internal.storage import planning_review_state as reviews
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        connection.execute(loop_manager.SCHEMA)
+        connection.execute(GENERAL_PLANNING_PUBLICATIONS_SCHEMA)
+        reviews.begin(connection, '/repo', purpose='general', revision='base',
+            input_fingerprint='input', specification_fingerprint='spec',
+            work_cycle='cycle', comparison_revision=None)
+        reviews.validate(connection, '/repo', 'base', 'validated review', 'complete')
+        connection.commit()
+        return connection
+
+    def test_general_batch_confirms_review_and_pinned_guidance_before_clear_atomically(self):
+        from loop_manager_internal.planning import planner_publication
+        from loop_manager_internal.storage import planning_input_state, planning_review_state as reviews
+        from loop_manager_internal.agents import common_guidance
+        for fail_clear in (False, True):
+            with self.subTest(fail_clear=fail_clear):
+                connection = self._reviewed_publication_connection()
+                snapshot = MutableReadySnapshot('/repo', 'base', (), 'token')
+                result = loop_manager.ValidatedPlanningResult(plans=(), publication_paths=(), mutable_snapshot=snapshot)
+                intent = SimpleNamespace(stage='prepared', base_sha='base', commit_sha='commit',
+                    snapshot_token='token', specification_fingerprint='spec', planning_fingerprint='input')
+                entries = {'docs/plans/G-001.md': ('G-001', 'plan-hash')}
+                def clear(*_args, **_kwargs):
+                    self.assertEqual(reviews.get(connection, '/repo', 'general')['confirmed_revision'], 'commit')
+                    baseline = connection.execute('SELECT guidance_hash FROM planning_input_baselines').fetchone()
+                    self.assertEqual(baseline['guidance_hash'], 'pinned-guidance')
+                    self.assertTrue(planning_input_state.matches(connection, '/repo', entries))
+                    if fail_clear:
+                        raise RuntimeError('clear interrupted')
+                effects = planner_publication.ApplyGeneralPlanningBatchEffects(
+                    mock.Mock(), clear, mock.Mock(return_value=False), mock.Mock(), mock.Mock(),
+                    mock.Mock(return_value=intent), mock.Mock(return_value=False), mock.Mock(return_value=entries))
+                with mock.patch.object(planner_publication.planning_publication_state, 'apply_mutable_catalog_changes'), \
+                     mock.patch('loop_manager_internal.catalog.remote_deletions.resolve_recovery'), \
+                     mock.patch.object(common_guidance, 'planning_content_hash', return_value='pinned-guidance'), \
+                     mock.patch.object(common_guidance, 'runtime_content_hash', side_effect=AssertionError('reload')):
+                    if fail_clear:
+                        with self.assertRaisesRegex(RuntimeError, 'clear interrupted'):
+                            planner_publication._apply_general_planning_batch(effects, connection, '/repo',
+                                Path('/worktree'), result, 'commit', 'spec', 'input')
+                    else:
+                        planner_publication._apply_general_planning_batch(effects, connection, '/repo',
+                            Path('/worktree'), result, 'commit', 'spec', 'input')
+                self.assertEqual(reviews.get(connection, '/repo', 'general') is None, fail_clear)
+                self.assertEqual(reviews.get(connection, '/repo', 'attempt') is not None, fail_clear)
+                self.assertEqual(planning_input_state.has_baseline(connection, '/repo'), not fail_clear)
+
+    def test_no_change_confirms_review_and_guidance_with_cleanup_transaction(self):
+        from loop_manager_internal.storage import planning_input_state, planning_review_state as reviews
+        from loop_manager_internal.agents import common_guidance
+        for fail_cleanup in (False, True):
+            with self.subTest(fail_cleanup=fail_cleanup), tempfile.TemporaryDirectory() as directory:
+                connection = self._reviewed_publication_connection()
+                worktree = Path(directory)
+                ports = FakePorts(planning_snapshot(phase='PLANNING', active_sha='base',
+                    worktree=directory, planning_attempt_fingerprint='input', planning_workspace_owned=1))
+                ports.state.confirm_planning_review = lambda *args: reviews.confirm(connection, *args)
+                ports.state.record_general_plan_declarations = lambda *args: planning_input_state.record_general(connection, *args)
+                original_transaction = ports.state.transaction
+                @contextmanager
+                def transaction():
+                    with original_transaction(), connection:
+                        yield
+                ports.state.transaction = transaction
+                original_clear = ports.state.clear_active_in_transaction
+                def clear(*args, **kwargs):
+                    self.assertEqual(reviews.get(connection, '/repo', 'general')['confirmed_revision'], 'base')
+                    self.assertEqual(connection.execute('SELECT guidance_hash FROM planning_input_baselines')
+                                     .fetchone()[0], 'pinned-guidance')
+                    original_clear(*args, **kwargs)
+                ports.state.clear_active_in_transaction = clear
+                if fail_cleanup:
+                    ports.git.remove_error = RuntimeError('cleanup interrupted')
+                coordinator = PlanningLifecycleCoordinator(ports)
+                run = coordinator._new_run(self.context)
+                run.planning_worktree = worktree
+                run.current_fingerprint = 'input'
+                with mock.patch.object(common_guidance, 'planning_content_hash', return_value='pinned-guidance'), \
+                     mock.patch.object(common_guidance, 'runtime_content_hash', side_effect=AssertionError('reload')):
+                    outcome = coordinator._publication._publish_planner_result(run)
+                if fail_cleanup:
+                    self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+                else:
+                    self.assertIsNone(outcome)
+                self.assertEqual(reviews.get(connection, '/repo', 'general') is None, fail_cleanup)
+                self.assertEqual(reviews.get(connection, '/repo', 'attempt') is not None, fail_cleanup)
+                self.assertEqual(planning_input_state.has_baseline(connection, '/repo'), not fail_cleanup)
+                if fail_cleanup:
+                    self.assertEqual(ports.state.snapshot.worktree, directory)
+                    self.assertEqual(ports.state.snapshot.phase, 'PLANNING')
+
     def test_publication_intent_rejects_bad_hash_before_insert_and_recovers(self):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

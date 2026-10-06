@@ -21,7 +21,7 @@ from loop_manager_internal.agents import agent_sandbox_exec as probe
 from loop_manager_internal.agents import agent_write_isolation as isolation
 from loop_manager_internal.agents import provider_adapters
 from loop_manager_internal.storage import agent_invocation_state as state
-from tests.support.workspace import native_agent_boundary
+from tests.support.workspace import native_agent_boundary, pin_common_guidance
 
 
 class NativePlatformAgentTests(unittest.TestCase):
@@ -169,6 +169,8 @@ class NativePlatformAgentTests(unittest.TestCase):
                             ledger = state.InvocationRepository(connection)
                             profile = invocation.ResolvedProfile('model', 'high')
                             context = invocation.InvocationContext(str(boundary.source), 'G-114', attempt=2)
+                            pin_common_guidance(connection, context, boundary.worktree, state_root,
+                                                sessions=(session,) if session else ())
                             prior = ledger.start(invocation.InvocationContext(str(boundary.source), 'G-114'),
                                                  role, 'codex', profile, 'saved-session')
                             ledger.record_isolation(prior, isolation.IsolationEvidence(

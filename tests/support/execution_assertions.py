@@ -1,6 +1,7 @@
 """Shared assertions for checkpoint and publication boundaries."""
 
 from dataclasses import replace
+import json
 from types import SimpleNamespace
 from unittest import mock
 
@@ -24,13 +25,19 @@ def _assert_post_push_pr_attachment(test, case, pr_head, accepted, *,
          'headRefName': 'loop-manager/G-047'} if 'push' in case.calls else None
     )
     case.effects.publication.reconcile_existing_pull_request.return_value = 0
+    case.effects.publication.command.side_effect = lambda *_args, **_kwargs: SimpleNamespace(
+        returncode=0, stdout=json.dumps({'body': 'User summary', 'headRefOid': pr_head, 'state': pr_state}))
     result = case.handler.publish(case.context('PUBLISHING'), case.handler)
     test.assertEqual(result.kind, reconciled_kind if accepted
                      else ExecutionOutcomeKind.FINAL_BLOCK)
     test.assertEqual(case.effects.publication.reconcile_existing_pull_request.call_count,
                      int(accepted))
     case.effects.publication.push_managed_publication_branch.assert_called_once()
-    case.effects.publication.command.assert_not_called()
+    if accepted and pr_state == 'OPEN':
+        case.effects.publication.command.assert_called_once()
+        test.assertEqual(case.effects.publication.command.call_args.args[0][:3], ['gh', 'pr', 'view'])
+    else:
+        case.effects.publication.command.assert_not_called()
 
 
 def _assert_manual_autostash_recovery(test, case, *, interruption=None):

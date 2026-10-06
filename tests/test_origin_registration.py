@@ -25,6 +25,36 @@ from loop_manager_internal.runtime import bootstrap
 
 
 class OriginRegistrationTests(unittest.TestCase):
+    def test_project_only_agents_are_accepted_and_invalid_utf8_missing_inputs_are_rejected(self):
+        from loop_manager_internal.runtime import project_registry
+        documents = {'AGENTS.md': '프로젝트 규칙\r\n'.encode(),
+                     'docs/PLANS.md': (loop_manager.ROOT / 'docs/PLANS.md').read_bytes(),
+                     'docs/ARCHITECTURE.md': b'# Custom architecture\n',
+                     'docs/PRODUCT.md': b'# Custom product\n'}
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        connection.execute('CREATE TABLE projects (repo TEXT PRIMARY KEY, base_branch TEXT, provider TEXT)')
+        project_registry.ensure_registry_schema(connection)
+        connection.execute("INSERT INTO projects (repo, base_branch, provider, agents_hash, agents_approved) "
+                           "VALUES ('old', 'main', 'codex', 'legacy-hash', 1)")
+        with mock.patch.object(loop_manager, '_git_tree_entries', return_value={}), mock.patch.object(
+            loop_manager, '_revision_blob', side_effect=lambda _root, _entries, path: documents.get(path)):
+            for approve in (False, True):
+                self.assertEqual(loop_manager.inspect_registration_files(Path('/repo'), 'selected',
+                    approve_agents_mismatch=approve), (hashlib.sha256(documents['AGENTS.md']).hexdigest(), False))
+            documents['AGENTS.md'] = b'\xff'
+            with self.assertRaisesRegex(RuntimeError, 'UTF-8'):
+                loop_manager.inspect_registration_files(Path('/repo'), 'selected', approve_agents_mismatch=True)
+            del documents['AGENTS.md']
+            with self.assertRaisesRegex(RuntimeError, 'AGENTS.md'):
+                loop_manager.inspect_registration_files(Path('/repo'), 'selected', approve_agents_mismatch=True)
+            documents['AGENTS.md'] = b'project'
+            del documents['docs/PRODUCT.md']
+            with self.assertRaisesRegex(RuntimeError, 'PRODUCT'):
+                loop_manager.inspect_registration_files(Path('/repo'), 'selected', approve_agents_mismatch=False)
+        self.assertEqual(connection.execute('SELECT agents_hash, agents_approved FROM projects').fetchone(),
+                         ('legacy-hash', 1))
+
     def test_registration_normalizes_document_line_endings_but_hashes_agent_bytes(self):
         for newline in (b'\n', b'\r\n'):
             with self.subTest(newline=newline):

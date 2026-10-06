@@ -104,6 +104,25 @@ class CleanupFixture:
         return connection
 
 
+def pin_common_guidance(connection, context, worktree: Path, state_dir: Path, *, sessions=()):
+    """Seed known versions before native-policy unit doubles replace subprocess.
+
+    Real instruction resolution/session fallback is covered by invocation tests;
+    these fixtures isolate the provider's sandbox and handoff contract.
+    """
+    from types import SimpleNamespace
+    from unittest import mock
+    from loop_manager_internal.agents import common_guidance
+    from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
+    repository = GuidanceRepository(connection)
+    with mock.patch.object(common_guidance.subprocess, 'run',
+                           return_value=SimpleNamespace(returncode=0, stdout='a' * 40)):
+        guidance = common_guidance.resolve(repository, context, 'worker', worktree, state_dir)
+    for session in sessions:
+        repository.bind_session(context.repo, 'codex', session, guidance.task_id)
+    return guidance
+
+
 def native_agent_boundary(root: Path):
     """Build synthetic linked-worktree/config files for native provider unit tests."""
     root = root.resolve()
@@ -123,3 +142,13 @@ def native_agent_boundary(root: Path):
     (home / 'config.toml').write_text('model="test"\n')
     return isolation.WorktreeBoundary(selected, source, (other,), git_dir, common,
                                      'repository'), state_root, home
+
+
+def native_developer_texts(arguments, _worktree, _environment):
+    """Native-policy fixtures isolate sandbox checks from prompt inspection.
+
+    Provider tests exercise real sentinel projection and effective layer checks.
+    """
+    import tomllib
+    return [tomllib.loads(argument)['developer_instructions'] for argument in arguments
+            if argument.startswith('developer_instructions=')]

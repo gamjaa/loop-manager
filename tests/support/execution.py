@@ -124,6 +124,7 @@ class ExecutionFixture:
         self.effects.validation.validate_active_execplan_metadata.return_value = self.plan
         self.effects.validation.parse_worker_result.return_value = SimpleNamespace(
             commit_title='Concrete change', test_evidence='targeted test: PASS',
+            summary='Implement the selected product change.',
         )
         self.effects.validation.verify.side_effect = lambda _: (self.calls.append('verify') or True, 'OK')
         self.effects.validation.parse_reviewer_result.return_value = ('PASS', ())

@@ -15,6 +15,7 @@ from loop_manager_internal.documents.guidance_approval import (
 )
 from loop_manager_internal.documents.guidance_service import (
     _guidance_batch_id, _guidance_document_matches_rows, _guidance_target_state,
+    legacy_common_identities,
 )
 
 
@@ -107,9 +108,13 @@ def prepare_guidance_preapprovals(
     ancestor = effects.git(repo_path, "merge-base", "--is-ancestor", baseline_revision, revision, check=False)
     if ancestor.returncode:
         raise AgentScopeError("사전 승인 Baseline은 채택한 원격 기준 revision의 선행 commit이어야 합니다.")
-    effects._validate_guidance_proposal_scope(
-        source.proposals, common_allowed=effects.is_loop_manager_repository(repo_path),
-    )
+    legacy = (legacy_common_identities(effects.git, repo_path, revision, str(plan['path']))
+              if effects.is_loop_manager_repository(repo_path)
+              and any(p.scope == 'common' for p in source.proposals) else set())
+    for proposal in source.proposals:
+        effects._validate_guidance_proposal_scope(
+            (proposal,), common_allowed=proposal.identity in legacy,
+        )
     local = effects._guidance_document(worktree, str(plan["path"]))
     if local is None or tuple(
         (p.identity, p.decision.identity) for p in local.proposals

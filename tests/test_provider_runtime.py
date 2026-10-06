@@ -649,17 +649,17 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
 
     def test_provider_dispatch_and_environment_strip_manager_secrets(self):
         result = loop_manager.AgentResult(0, "ok", "session")
-        with mock.patch(
+        with tempfile.TemporaryDirectory() as directory, mock.patch(
             "loop_manager.run_codex", return_value=result
         ) as codex, mock.patch(
             "loop_manager.run_claude", return_value=result
         ) as claude:
             loop_manager.run_agent(
-                "codex", Path("worktree"), Path("state"), Path("config"), "planner", "p",
+                "codex", Path("worktree"), Path(directory), Path("config"), "planner", "p",
                 read_only=False,
             )
             loop_manager.run_agent(
-                "claude", Path("worktree"), Path("state"), Path("config"), "reviewer", "p",
+                "claude", Path("worktree"), Path(directory), Path("config"), "reviewer", "p",
                 read_only=True,
             )
         codex.assert_called_once()
@@ -696,3 +696,154 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             loop_manager.build_parser().parse_args(
                 ["run", "--provider", "claude"]
             )
+
+
+class CommonGuidanceProviderTests(unittest.TestCase):
+    def setUp(self):
+        from loop_manager_internal.agents import common_guidance, provider_guidance
+        self.provider_guidance = provider_guidance
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.worktree = self.root / 'project'
+        self.worktree.mkdir()
+        self.text = '한글 "quotes" \\backslash\n다음 줄\t😀\n'
+        snapshot = self.root / 'snapshot.md'
+        snapshot.write_text(self.text, encoding='utf-8')
+        import hashlib
+        self.guidance = common_guidance.CommonGuidance('task', self.text,
+            hashlib.sha256(self.text.encode()).hexdigest(), 'b' * 40, snapshot)
+        self.existing = 'cloud/profile/project 추가 지침'
+        self.defaults = '기본 developer 지침과 sandbox 정책'
+
+    def native_probe(self, arguments, **context):
+        if arguments == ['codex', '--version']:
+            return 'codex-cli 0.159.3'
+        if arguments == ['claude', '--help']:
+            return '--append-system-prompt-file --system-prompt-snapshot'
+        self.assertEqual(arguments[-2:], ['debug', 'prompt-input'])
+        self.assertEqual(context['cwd'], self.worktree)
+        import tomllib
+        content = next((tomllib.loads(argument)['developer_instructions'] for argument in arguments
+                        if argument.startswith('developer_instructions=')), self.existing)
+        items = [{'type': 'input_text', 'text': self.defaults}]
+        if content:
+            items.append({'type': 'input_text', 'text': '<developer_instructions>' + content + '</developer_instructions>'})
+        return json.dumps([{'type': 'message', 'role': 'developer', 'content': items},
+                           {'type': 'message', 'role': 'user', 'content': [
+                               {'type': 'input_text', 'text': 'project AGENTS'}]}])
+
+    def test_codex_lossless_toml_preserves_native_cloud_profile_and_project_instructions(self):
+        import tomllib
+        with mock.patch.object(self.provider_guidance, '_probe', side_effect=self.native_probe) as probe:
+            args = self.provider_guidance.codex_arguments(self.guidance, self.worktree,
+                context_arguments=('-m', 'selected-model', '--strict-config', '--ignore-rules'),
+                environment={'CODEX_HOME': 'runtime-home'})
+        self.assertEqual(args[0], '-c')
+        self.assertEqual(tomllib.loads(args[1])['developer_instructions'], self.existing + '\n\n' + self.text)
+        self.assertNotIn('model_instructions_file', repr(args))
+        self.assertEqual(probe.call_count, 4)
+        for call in probe.call_args_list[1:]:
+            self.assertIn('selected-model', call.args[0])
+            self.assertNotIn('--strict-config', call.args[0])
+            self.assertEqual(call.kwargs['env'], {'CODEX_HOME': 'runtime-home'})
+        self.assertEqual(self.guidance.snapshot_path.read_text(), self.text)
+
+    def test_untrusted_project_is_not_promoted_and_managed_override_is_rejected(self):
+        import tomllib
+        (self.worktree / '.codex').mkdir()
+        project = self.worktree / '.codex/config.toml'
+        project.write_text('developer_instructions="untrusted"')
+        self.existing = 'native effective user'
+        with mock.patch.object(self.provider_guidance, '_probe', side_effect=self.native_probe):
+            args = self.provider_guidance.codex_arguments(self.guidance, self.worktree)
+        self.assertEqual(tomllib.loads(args[1])['developer_instructions'], self.existing + '\n\n' + self.text)
+        baseline = self.native_probe(['debug', 'prompt-input'], cwd=self.worktree)
+        def locked(arguments, **context):
+            return 'codex-cli 0.159.3' if arguments == ['codex', '--version'] else baseline
+        with mock.patch.object(self.provider_guidance, '_probe', side_effect=locked):
+            with self.assertRaisesRegex(self.provider_guidance.GuidanceError, '관리 설정'):
+                self.provider_guidance.codex_arguments(self.guidance, self.worktree)
+        self.assertEqual(project.read_text(), 'developer_instructions="untrusted"')
+
+    def test_empty_additional_instructions_preserve_native_defaults(self):
+        import tomllib
+        self.existing = ''
+        with mock.patch.object(self.provider_guidance, '_probe', side_effect=self.native_probe):
+            args = self.provider_guidance.codex_arguments(self.guidance, self.worktree)
+        self.assertEqual(tomllib.loads(args[1])['developer_instructions'], self.text)
+        self.assertNotIn(self.defaults, repr(args))
+
+    def test_ambiguous_native_inputs_and_ineffective_final_override_fail_closed(self):
+        for defect in ('json', 'defaults', 'final'):
+            def defective(arguments, **context):
+                if arguments == ['codex', '--version']:
+                    return 'codex-cli 0.159.3'
+                if defect == 'json':
+                    return '{}'
+                value = self.native_probe(arguments, **context)
+                override = next((arg for arg in arguments if arg.startswith('developer_instructions=')), '')
+                if defect == 'defaults' and override:
+                    items = json.loads(value)
+                    items[0]['content'][0]['text'] = 'changed defaults'
+                    return json.dumps(items)
+                if defect == 'final' and 'loop-manager-guidance-' not in override and override:
+                    return self.native_probe(['debug', 'prompt-input'], **context)
+                return value
+            with self.subTest(defect=defect), mock.patch.object(self.provider_guidance, '_probe', side_effect=defective):
+                with self.assertRaises(self.provider_guidance.GuidanceError):
+                    self.provider_guidance.codex_arguments(self.guidance, self.worktree)
+
+    def test_provider_adapters_send_guidance_in_new_resume_and_read_only_calls(self):
+        from loop_manager_internal.agents import provider_adapters
+        from loop_manager_internal.agents.agent_invocation import ResolvedProfile
+        for provider in ('codex', 'claude'):
+            for role, session in (('worker', None), ('worker', 'saved'), ('reviewer', 'saved')):
+                with self.subTest(provider=provider, role=role, session=session):
+                    run = mock.Mock(return_value=subprocess.CompletedProcess([], 0, '{}'))
+                    process = mock.Mock()
+                    process.stdin = io.StringIO()
+                    process.stdout = io.StringIO('')
+                    process.wait.return_value = 0
+                    popen = mock.Mock(return_value=process)
+                    effects = provider_adapters.ProviderEffects(mock.Mock(), mock.Mock(), mock.Mock(), popen, run)
+                    with mock.patch.object(self.provider_guidance, '_probe', side_effect=self.native_probe):
+                        result = getattr(provider_adapters, 'run_' + provider)(
+                            self.worktree, self.root / 'state', self.root / 'config', role, 'delta',
+                            read_only=role == 'reviewer', session_id=session,
+                            resolved_profile=ResolvedProfile('model', 'high'), common_guidance=self.guidance,
+                            effects=effects,
+                        )
+                    call = popen.call_args if popen.called else run.call_args
+                    args = call.args[0]
+                    if provider == 'codex':
+                        self.assertTrue(any(arg.startswith('developer_instructions=') for arg in args))
+                        self.assertIn('--sandbox', args)
+                        self.assertIn('approvals_reviewer="auto_review"', args)
+                    else:
+                        self.assertEqual(args[args.index('--append-system-prompt-file') + 1], str(self.guidance.snapshot_path))
+                        self.assertEqual(args[args.index('--system-prompt-snapshot') + 1], 'on')
+                        self.assertIn('--permission-mode', args)
+                    self.assertNotIn(self.text, call.kwargs.get('input', ''))
+                    if session:
+                        self.assertIn(session, args)
+                    if role == 'reviewer' and provider == 'claude':
+                        self.assertIn('--disallowedTools', args)
+
+    def test_unsupported_settings_and_snapshot_changes_reject_without_launch(self):
+        from loop_manager_internal.agents import provider_adapters
+        from loop_manager_internal.agents.agent_invocation import ResolvedProfile
+        for provider, supported in (('codex', 'codex-cli 0.158.0'), ('claude', '--system-prompt-file')):
+            effects = provider_adapters.ProviderEffects(mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock())
+            with self.subTest(provider=provider), mock.patch.object(self.provider_guidance, '_probe', return_value=supported):
+                with self.assertRaises(self.provider_guidance.GuidanceError):
+                    getattr(provider_adapters, 'run_' + provider)(
+                        self.worktree, self.root / 'state', self.root / 'config', 'worker', 'delta',
+                        read_only=False, resolved_profile=ResolvedProfile('model', 'high'),
+                        common_guidance=self.guidance, effects=effects,
+                    )
+            effects._handoff_run.assert_not_called()
+            effects._handoff_popen.assert_not_called()
+        self.guidance.snapshot_path.write_text('changed', encoding='utf-8')
+        with self.assertRaises(self.provider_guidance.GuidanceError):
+            self.provider_guidance.claude_arguments(self.guidance)

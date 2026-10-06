@@ -2,6 +2,7 @@ from contextlib import closing
 import io
 import hashlib
 import os
+import re
 import sqlite3
 import subprocess
 import tempfile
@@ -17,6 +18,37 @@ from loop_manager_internal.runtime import project_registry
 
 
 class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
+    def test_copy_tools_share_minimal_requirement_first_guidance(self):
+        bash = (loop_manager.ROOT / 'scripts/copy-project-files.sh').read_text(encoding='utf-8')
+        powershell = (loop_manager.ROOT / 'scripts/copy-project-files.ps1').read_text(encoding='utf-8')
+        bash_body = re.search(r"<<'GUIDANCE'\n(.*?)\nGUIDANCE", bash, re.S).group(1)
+        powershell_body = re.search(r"\$minimalAgents = @'\n(.*?)\n'@", powershell, re.S).group(1)
+        self.assertEqual(bash_body, powershell_body)
+        for phrase in ('프로젝트 전용', 'Requirement에서 시작', 'docs/PRODUCT.md',
+                       'docs/requirements/*.md', 'docs/ARCHITECTURE.md'):
+            self.assertIn(phrase, bash_body)
+        for phrase in ('ExecPlan', 'Worker', 'SQLite'):
+            self.assertNotIn(phrase, bash_body)
+
+    def test_copy_project_files_preserves_existing_agents_bytes(self):
+        # Manager verify exercises the executable scripts; Worker runs only
+        # the template unit case above.
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / 'project'
+            target.mkdir()
+            original = b'custom project rules\r\n\xff\n'
+            (target / 'AGENTS.md').write_bytes(original)
+            command = (['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+                        str(loop_manager.ROOT / 'scripts/copy-project-files.ps1'), '-TargetPath', str(target)]
+                       if os.name == 'nt' else ['bash', str(loop_manager.ROOT / 'scripts/copy-project-files.sh'), str(target)])
+            subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.assertEqual((target / 'AGENTS.md').read_bytes(), original)
+            self.assertTrue((target / 'docs/PLANS.md').is_file())
+            # The remaining directory overwrite guards still stop repeated setup.
+            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertEqual((target / 'AGENTS.md').read_bytes(), original)
+
     def _git(self, root: Path, *arguments: str) -> None:
         subprocess.run(
             ["git", "-C", str(root), *arguments],
@@ -280,19 +312,19 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
                 self.assertEqual(loop_manager.main(), 1)
             self.assertFalse((state_dir / "loop-manager.db").exists())
 
-    def test_registration_files_require_active_documents_and_hash_bound_agents_approval(self):
+    def test_registration_files_require_active_documents_and_accept_project_agents(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self._project_files(root, common_agents=False)
 
-            with self.assertRaisesRegex(RuntimeError, "승인"):
-                loop_manager.inspect_registration_files(
-                    root, "HEAD", approve_agents_mismatch=False
-                )
+            _, approved_without_flag = loop_manager.inspect_registration_files(
+                root, "HEAD", approve_agents_mismatch=False
+            )
+            self.assertFalse(approved_without_flag)
             agents_hash, approved = loop_manager.inspect_registration_files(
                 root, "HEAD", approve_agents_mismatch=True
             )
-            self.assertTrue(approved)
+            self.assertFalse(approved)
             self.assertEqual(agents_hash, hashlib.sha256(loop_manager.git_bytes(root, "show", "HEAD:AGENTS.md")).hexdigest())
 
             (root / "docs/PLANS.md").write_text("different\n", encoding="utf-8")
@@ -319,8 +351,10 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             skill = (target / ".agents/skills/specification-docs/SKILL.md").read_text(
                 encoding="utf-8"
             )
-            self.assertEqual((target / "AGENTS.md").read_bytes(),
-                             (loop_manager.ROOT / "AGENTS.md").read_bytes())
+            minimal = (target / "AGENTS.md").read_text(encoding="utf-8")
+            self.assertIn("새로운 기능이나 정책 변경은 Requirement에서 시작한다.", minimal)
+            self.assertNotIn("Worker", minimal)
+            self.assertNotIn("ExecPlan", minimal)
             self.assertEqual((target / "docs/PLANS.md").read_bytes(),
                              (loop_manager.ROOT / "docs/PLANS.md").read_bytes())
             self.assertEqual((target / "docs/ARCHITECTURE.md").read_bytes(),

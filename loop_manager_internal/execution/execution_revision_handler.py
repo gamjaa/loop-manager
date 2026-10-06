@@ -1,5 +1,6 @@
 """Revision execution policy and narrow typed ports."""
 from __future__ import annotations
+from loop_manager_internal.agents import common_guidance
 from dataclasses import dataclass, replace
 from typing import Callable, Any, Mapping
 import json
@@ -396,6 +397,9 @@ class RevisionHandler:
                     self.ports.identity.repo_path, latest_sha, catalog_plan
                 ),
                 archive_candidates=tuple(sorted(archive_candidates)),
+                guidance_hash=common_guidance.plan_content_hash(
+                    self.ports.state.connection, self.ports.identity.repo, str(catalog_plan['plan_id']),
+                ),
             )
             previous = DefinitionSnapshot.deserialize(
                 self.ports._row()['definition_snapshot']

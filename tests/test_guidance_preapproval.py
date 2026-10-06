@@ -12,6 +12,63 @@ from loop_manager_internal.documents import guidance_approval as ga
 from tests.support.guidance import PATCH, active_connection, git, guidance_plan, repository
 
 
+class CommonGuidanceApprovalCompatibilityTests(unittest.TestCase):
+    def test_published_legacy_common_keeps_original_target_baseline_and_patch(self):
+        from types import SimpleNamespace
+        from tests.support.database import runtime_connection
+        from loop_manager_internal.documents import guidance_preapproval as pre, guidance_service as service
+        baseline = 'a' * 40
+        old = guidance_plan().replace('Scope: `project`', 'Scope: `common`')
+        approved = guidance_plan(decision='approve', revision='user-1').replace(
+            'Scope: `project`', 'Scope: `common`').replace('Revision: `user-1`\n',
+                f'Revision: `user-1`\nBaseline: `{baseline}`\n')
+        source = ga.parse_guidance_document(approved)
+        def git_port(_repo, *args, **_kwargs):
+            if args[0] == 'log':
+                return SimpleNamespace(returncode=0, stdout='c' * 40 + '\n')
+            if args[0] == 'ls-tree':
+                return SimpleNamespace(returncode=0, stdout='100644 blob oid\tAGENTS.md\n')
+            return SimpleNamespace(returncode=0, stdout=old if args[-1].startswith('c' * 40 + '^:') else approved)
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        effects = pre.PrepareGuidancePreapprovalsEffects(
+            _guidance_document=mock.Mock(return_value=source), _guidance_rows=mock.Mock(return_value=()),
+            _invalidate_guidance_approval=mock.Mock(), _validate_guidance_proposal_scope=service._validate_guidance_proposal_scope,
+            git=git_port, is_loop_manager_repository=mock.Mock(return_value=True))
+        plan = {'plan_id': 'G-047', 'path': 'docs/plans/old.md', 'plan_sha': 'b' * 40,
+                'current_revision_sha': 'b' * 40, 'agent_snapshot': None}
+        native_run = pre.subprocess.run
+        def run(arguments, **kwargs):
+            if arguments[:2] == ['git', 'show']:
+                return SimpleNamespace(returncode=0, stdout=b'# Agents\n')
+            return native_run(arguments, **kwargs)
+        with mock.patch.object(pre, '_guidance_target_state', return_value=(b'# Agents\n', 0o644)), mock.patch.object(
+            pre.subprocess, 'run', side_effect=run):
+            self.assertFalse(pre.prepare_guidance_preapprovals(effects, connection, Path('/repo'), 'repo', Path('/worktree'), plan))
+        row = connection.execute('SELECT * FROM guidance_approvals').fetchone()
+        self.assertEqual((row['target_path'], row['scope'], row['baseline_content'], row['approved_patch']),
+                         ('AGENTS.md', 'common', b'# Agents\n', source.proposals[0].patch))
+        self.assertEqual(row['decision_hash'], source.proposals[0].decision.identity)
+        effects._invalidate_guidance_approval.assert_not_called()
+
+    def test_new_common_proposal_is_rejected_before_worker_scope_or_storage(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.documents import guidance_service as service
+        old = guidance_plan().replace('Scope: `project`', 'Scope: `common`')
+        source = ga.parse_guidance_document(old)
+        git_port = mock.Mock(side_effect=lambda _repo, *args, **_kwargs: SimpleNamespace(
+            returncode=0 if args[0] != 'show' else 1,
+            stdout='c' * 40 + '\n' if args[0] == 'log' else ''))
+        effects = SimpleNamespace(is_loop_manager_repository=lambda _: True, git=git_port,
+            _validate_guidance_proposal_scope=service._validate_guidance_proposal_scope)
+        connection = mock.Mock()
+        with self.assertRaisesRegex(lm.AgentScopeError, 'Scope project'):
+            service._block_for_new_guidance(effects, connection, Path('/repo'), 'repo', Path('/worktree'),
+                {'current_revision_sha': 'b' * 40, 'plan_sha': 'b' * 40, 'path': 'docs/plans/new.md'},
+                source, source.proposals, '')
+        connection.execute.assert_not_called()
+
+
 class GuidancePreapprovalTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory()

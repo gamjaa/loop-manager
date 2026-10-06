@@ -316,6 +316,26 @@ class ReconciliationUnitTest(unittest.TestCase):
 
 
 class SynthesisPagingTest(unittest.TestCase):
+    def test_guidance_change_rechecks_pages_and_preserves_old_sessions_results_and_failures(self):
+        from loop_manager_internal.agents import common_guidance
+        with mock.patch.object(common_guidance, 'runtime_content_hash', return_value='a' * 64):
+            first = self.repository.prepare('repo', 1, REVISION, self.progress)
+            self.finish(first)
+            second = self.repository.prepare('repo', 1, REVISION, self.progress)
+            self.repository.session('repo', second, 'old-session')
+        self.connection.execute('INSERT INTO provisional_synthesis_resolutions VALUES (?, ?, ?, ?, ?, ?, ?)',
+            ('repo', 0, first.digest, 'old-decision', None, 'resolution-session', 'saved failure'))
+        with mock.patch.object(common_guidance, 'runtime_content_hash', return_value='b' * 64):
+            changed = self.repository.prepare('repo', 1, REVISION, self.progress)
+        self.assertNotEqual(changed.digest, first.digest)
+        self.assertEqual((changed.index, changed.session_id), (0, None))
+        history = json.loads(self.connection.execute(
+            'SELECT snapshot_json FROM provisional_synthesis_history WHERE repo = ? AND digest = ?',
+            ('repo', first.digest)).fetchone()[0])
+        self.assertEqual((history['next_page'], history['session_id']), (1, 'old-session'))
+        self.assertEqual(json.loads(history['results_json'])[0]['key'], first.key)
+        self.assertEqual(history['resolutions'][0][-2:], ['resolution-session', 'saved failure'])
+
     def test_small_records_share_pages_without_losing_any_source_or_review(self):
         sources = tuple(source(f"src/{index}.py", b"def calculate(): return 1\n") for index in range(100))
         reviews = tuple({"path": item.path, "evidence": "A small grounded review."} for item in sources)

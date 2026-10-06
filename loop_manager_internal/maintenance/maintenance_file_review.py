@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+from loop_manager_internal.agents import common_guidance
 import json
 from pathlib import Path
 import re
@@ -407,6 +408,13 @@ class ProvisionalReviewRepository:
     def __init__(self, connection: sqlite3.Connection):
         self.connection = connection
         ensure_schema(connection)
+        columns = {row[1] for row in connection.execute('PRAGMA table_info(provisional_file_reviews)')}
+        for field in ('guidance_hash', 'prior_guidance_results'):
+            if field not in columns:
+                connection.execute(f'ALTER TABLE provisional_file_reviews ADD COLUMN {field} TEXT')
+        connection.execute("""CREATE TABLE IF NOT EXISTS provisional_file_review_guidance_history (
+            repo TEXT NOT NULL, path TEXT NOT NULL, record_hash TEXT NOT NULL,
+            snapshot_json TEXT NOT NULL, PRIMARY KEY (repo, path, record_hash))""")
         connection.execute("""CREATE TABLE IF NOT EXISTS provisional_review_receipts (
             repo TEXT NOT NULL, path TEXT NOT NULL, identity TEXT NOT NULL,
             PRIMARY KEY (repo, path))""")
@@ -426,6 +434,29 @@ class ProvisionalReviewRepository:
         if root_source is not None:
             expected[root_source.path] = root_source
         with self.connection:
+            guidance_hash = common_guidance.effective_planning_hash(self.connection, repo)
+            for path, saved_hash, session, error, raw, prior, cycle, revision, source_hash, mode in self.connection.execute(
+                'SELECT path, guidance_hash, session_id, validation_error, result_json, prior_guidance_results, '
+                'cycle_revision, source_revision, content_hash, mode '
+                'FROM provisional_file_reviews WHERE repo = ?', (repo,),
+            ).fetchall():
+                if saved_hash != guidance_hash:
+                    snapshot = json.dumps({'guidance_hash': saved_hash, 'cycle_revision': cycle,
+                        'source_revision': revision, 'content_hash': source_hash, 'mode': mode,
+                        'session_id': session, 'validation_error': error, 'result_json': raw},
+                        ensure_ascii=False, sort_keys=True)
+                    self.connection.execute(
+                        'INSERT OR IGNORE INTO provisional_file_review_guidance_history VALUES (?, ?, ?, ?)',
+                        (repo, path, hashlib.sha256(snapshot.encode()).hexdigest(), snapshot),
+                    )
+                    history = json.loads(prior or '[]')
+                    history.append({'guidance_hash': saved_hash, 'session_id': session,
+                                    'validation_error': error, 'result_json': raw})
+                    self.connection.execute(
+                        'UPDATE provisional_file_reviews SET guidance_hash = ?, prior_guidance_results = ?, '
+                        'result_json = NULL, session_id = NULL WHERE repo = ? AND path = ?',
+                        (guidance_hash, json.dumps(history, ensure_ascii=False), repo, path),
+                    )
             rows = self.connection.execute(
                 "SELECT path, cycle_revision, source_revision, content_hash, mode, "
                 "session_id, validation_error, result_json "
@@ -536,10 +567,10 @@ class ProvisionalReviewRepository:
         with self.connection:
             self.connection.execute(
                 "INSERT OR IGNORE INTO provisional_file_reviews "
-                "(repo, path, cycle_revision, source_revision, content_hash, mode) "
-                "VALUES (?, ?, ?, ?, ?, ?)",
+                "(repo, path, cycle_revision, source_revision, content_hash, mode, guidance_hash) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (repo, source.path, cycle_revision, source.revision,
-                 source.content_hash, source.mode),
+                 source.content_hash, source.mode, common_guidance.effective_planning_hash(self.connection, repo)),
             )
 
     def session(self, repo: str, cycle_revision: int, source: TrackedSource, session_id: str) -> None:

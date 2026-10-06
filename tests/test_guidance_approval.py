@@ -10,6 +10,31 @@ from tests.support.guidance import PATCH, active_connection, git, git_result, gu
 
 
 class GuidanceFormatTest(unittest.TestCase):
+    def test_legacy_common_provenance_survives_injection_and_decision_updates(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.documents.guidance_service import legacy_common_identities
+        old = guidance_plan().replace('Scope: `project`', 'Scope: `common`')
+        proposal, = guidance_approval.parse_guidance_document(old).proposals
+        calls = []
+        def git_port(_root, *args, **_kwargs):
+            calls.append(args)
+            if args[0] == 'log':
+                return SimpleNamespace(returncode=0, stdout='a' * 40 + '\n')
+            if args[0] == 'show':
+                return SimpleNamespace(returncode=0, stdout=old)
+            return SimpleNamespace(returncode=0, stdout='')
+        self.assertEqual(legacy_common_identities(git_port, Path('/repo'), 'b' * 40, 'docs/plans/old.md'),
+                         {proposal.identity})
+        self.assertIn(('show', 'a' * 40 + '^:docs/plans/old.md'), calls)
+        self.assertEqual(proposal.target, 'AGENTS.md')
+        changed = guidance_approval.parse_guidance_document(old.replace('Approved rule', 'Different rule')).proposals[0]
+        self.assertNotIn(changed.identity, {proposal.identity})
+        def before_injection(_root, *args, **_kwargs):
+            return SimpleNamespace(returncode=1 if args[0] == 'cat-file' else 0,
+                                   stdout=old if args[0] == 'show' else '')
+        self.assertEqual(legacy_common_identities(before_injection, Path('/repo'), 'b' * 40, 'old.md'),
+                         {proposal.identity})
+
     def test_preapproval_baseline_is_bound_without_changing_legacy_decisions(self):
         approved = guidance_plan(decision='approve', revision='published')
         with_baseline = approved.replace('Revision: `published`\n', 'Revision: `published`\nBaseline: `' + 'a' * 40 + '`\n')
@@ -727,17 +752,16 @@ Patch:
                     )
                 )
 
-    def test_common_source_rejects_project_scope_and_prompts_common(self):
+    def test_self_project_scope_is_accepted_and_new_prompts_use_project(self):
         document = guidance_approval.parse_guidance_document(guidance_plan())
-        with self.assertRaisesRegex(loop_manager.AgentScopeError, "공통 원본"):
-            loop_manager._validate_guidance_proposal_scope(
-                document.proposals, common_allowed=True
-            )
+        loop_manager._validate_guidance_proposal_scope(
+            document.proposals, common_allowed=True
+        )
         loop_manager._validate_guidance_proposal_scope(
             document.proposals, common_allowed=False
         )
         prompt = loop_manager.worker_prompt("plan.md", None, guidance_common_allowed=True)
-        self.assertIn("Scope: `common`", prompt)
+        self.assertIn("Scope: `project`", prompt)
 
     def test_publication_rechecks_applied_approval_and_changed_base(self):
         for changed_base, changed_result in ((False, False), (False, True), (True, False)):

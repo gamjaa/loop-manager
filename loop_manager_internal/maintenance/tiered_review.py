@@ -8,6 +8,7 @@ from pathlib import Path
 import sqlite3
 
 from loop_manager_internal.maintenance import code_index
+from loop_manager_internal.agents import common_guidance
 from loop_manager_internal.maintenance.maintenance_file_inventory import cached_source_inventory, root_placement_inventory
 
 RESULT_PREFIX = "MODULE_REVIEW_RESULT: "
@@ -189,12 +190,14 @@ class TieredReviewRepository:
             selected = tuple(index.records)
         return Selection(True, "targeted", tuple(sorted(reasons)), selected, index, roots, merged_count)
 
-    def prepare(self, repo, cycle, selection: Selection, *, cycle_id=None, review_mode=None):
+    def prepare(self, repo, cycle, selection: Selection, *, cycle_id=None, review_mode=None,
+                guidance_hash=None):
         value = {"version": 1, "mode": selection.mode, "reasons": list(selection.reasons),
             "records": selection.index.records, "roots": list(selection.roots), "paths": list(selection.paths),
             "merged_count": selection.merged_count, "request_id": selection.request_id,
             "source_revision": selection.index.revision, "cycle": cycle, "cycle_id": cycle_id,
             "review_mode": review_mode or selection.mode}
+        value["guidance_hash"] = guidance_hash or common_guidance.effective_planning_hash(self.connection, repo)
         value["digest"] = digest(value)
         row = self.connection.execute("SELECT cycle, source_revision, digest, assessment_json FROM tiered_maintenance_assessments "
                                       "WHERE repo = ?", (repo,)).fetchone()
@@ -202,7 +205,16 @@ class TieredReviewRepository:
             saved = json.loads(row[3])
             if saved["records"] != value["records"] or saved["roots"] != value["roots"]:
                 raise TieredReviewError("같은 assessment identity의 코드맵이 달라졌습니다.")
-            return saved
+            if saved.get('guidance_hash'):
+                return saved
+            # A legacy assessment is not evidence of the newly injected rules.
+            # Keep its source/task scope and audit, but recheck its judgments.
+            previous = dict(saved)
+            saved['guidance_hash'] = value['guidance_hash']
+            saved['prior_guidance_assessment'] = previous
+            saved.pop('digest', None)
+            saved['digest'] = digest(saved)
+            value = saved
         with self.connection:
             self.connection.execute("INSERT OR REPLACE INTO tiered_maintenance_assessments VALUES (?, ?, ?, ?, ?)",
                                     (repo, cycle, selection.index.revision, value["digest"], code_index.encode(value)))
@@ -243,7 +255,8 @@ class TieredReviewRepository:
             batches.append(batch)
         review_mode = assessment.get("review_mode", assessment["mode"])
         epoch = {"mode": review_mode, "full_merge": assessment["merged_count"] if review_mode == "full" else None,
-                 "request": assessment["request_id"], "roots": assessment["roots"], "version": code_index.VERSION}
+                 "request": assessment["request_id"], "roots": assessment["roots"], "version": code_index.VERSION,
+                 "guidance_hash": assessment.get("guidance_hash")}
         return tuple({"digest": digest({"parts": parts, "epoch": epoch}), "parts": parts} for parts in batches)
 
     def pending(self, repo, assessment):

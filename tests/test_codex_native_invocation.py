@@ -16,7 +16,8 @@ from loop_manager_internal.agents import agent_codex_sandbox as envelope
 from loop_manager_internal.agents import agent_sandbox_exec as gate
 from loop_manager_internal.storage import agent_invocation_state as state
 import loop_manager as manager
-from tests.support.workspace import native_agent_boundary
+from loop_manager_internal.agents import provider_guidance
+from tests.support.workspace import native_agent_boundary, pin_common_guidance, native_developer_texts
 
 
 @skipUnless(isolation.platform.system() == "Linux", "native tool policy probe requires Linux")
@@ -254,6 +255,8 @@ class NativeWriteIsolationTests(TestCase):
                 connection = sqlite3.connect(':memory:')
                 self.addCleanup(connection.close)
                 state.ensure_schema(connection)
+                pin_common_guidance(connection, invocation.InvocationContext(str(boundary.source), 'G-088'),
+                    boundary.worktree, state_root, sessions=(session,) if session else ())
                 commands = []
 
                 def run(command, **kwargs):
@@ -288,7 +291,8 @@ class NativeWriteIsolationTests(TestCase):
                     result = run(command, **kwargs)
                     return self.reviewer_process(result.stdout or '', result.returncode)
 
-                with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
+                with mock.patch.object(provider_guidance, '_developer_texts', side_effect=native_developer_texts), \
+                     mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
                      mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
                      mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
                      mock.patch.object(manager, 'capture_git_snapshot', return_value=
@@ -321,6 +325,8 @@ class NativeWriteIsolationTests(TestCase):
                 connection = sqlite3.connect(':memory:')
                 self.addCleanup(connection.close)
                 state.ensure_schema(connection)
+                pin_common_guidance(connection, invocation.InvocationContext(str(boundary.source), 'G-097'),
+                    boundary.worktree, state_root, sessions=('saved-session',))
                 product = boundary.worktree / 'work-product.txt'
                 product.write_text('saved work product')
                 calls = []
@@ -367,7 +373,8 @@ class NativeWriteIsolationTests(TestCase):
                     result = run(command, **kwargs)
                     return self.reviewer_process(result.stdout or '', result.returncode)
 
-                with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
+                with mock.patch.object(provider_guidance, '_developer_texts', side_effect=native_developer_texts), \
+                     mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
                      mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
                      mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
                      mock.patch.object(manager, 'capture_git_snapshot', return_value=
@@ -397,6 +404,8 @@ class NativeWriteIsolationTests(TestCase):
                 connection = sqlite3.connect(':memory:')
                 self.addCleanup(connection.close)
                 state.ensure_schema(connection)
+                pin_common_guidance(connection, invocation.InvocationContext(str(boundary.source), 'G-088'),
+                    boundary.worktree, state_root, sessions=(session,) if session else ())
                 logs = state_root / 'logs' / manager.hashlib.sha256(
                     str(boundary.worktree).encode()).hexdigest()[:16]
                 logs.mkdir(parents=True)
@@ -405,7 +414,8 @@ class NativeWriteIsolationTests(TestCase):
                 handoff = manager.RuntimeHandoffGate(threading.Event(), threading.Lock())
                 token = manager._runtime_handoff_signal.set(handoff)
                 try:
-                    with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
+                    with mock.patch.object(provider_guidance, '_developer_texts', side_effect=native_developer_texts), \
+                         mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
                          mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
                          mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
                          mock.patch.object(manager, 'capture_git_snapshot', return_value=
@@ -442,6 +452,8 @@ class NativeWriteIsolationTests(TestCase):
                 connection = sqlite3.connect(':memory:')
                 self.addCleanup(connection.close)
                 state.ensure_schema(connection)
+                pin_common_guidance(connection, invocation.InvocationContext(str(boundary.source), 'G-088'),
+                    boundary.worktree, state_root, sessions=(session,) if session else ())
                 handoff = manager.RuntimeHandoffGate(threading.Event(), threading.Lock())
                 process = mock.Mock(pid=4321, returncode=0)
                 if role == 'reviewer':
@@ -486,7 +498,8 @@ class NativeWriteIsolationTests(TestCase):
 
                 token = manager._runtime_handoff_signal.set(handoff)
                 try:
-                    with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
+                    with mock.patch.object(provider_guidance, '_developer_texts', side_effect=native_developer_texts), \
+                         mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
                          mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
                          mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
                          mock.patch.object(manager, 'capture_git_snapshot', return_value=
@@ -535,6 +548,8 @@ class NativeWriteIsolationTests(TestCase):
             connection = sqlite3.connect(':memory:')
             self.addCleanup(connection.close)
             state.ensure_schema(connection)
+            pin_common_guidance(connection, invocation.InvocationContext(str(boundary.source), 'G-088'),
+                boundary.worktree, state_root)
             process = mock.Mock(pid=4321)
             process.stdin = io.StringIO()
             process.stdout = io.StringIO('{"type":"thread.started","thread_id":"new-session"}\n')
@@ -554,7 +569,8 @@ class NativeWriteIsolationTests(TestCase):
                 Path(command[command.index('-o') + 1]).write_text('streamed result')
                 return process
 
-            with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
+            with mock.patch.object(provider_guidance, '_developer_texts', side_effect=native_developer_texts), \
+                 mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
                  mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
                  mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
                  mock.patch.object(manager, 'capture_git_snapshot', return_value=
@@ -579,6 +595,8 @@ class NativeWriteIsolationTests(TestCase):
             connection = sqlite3.connect(':memory:')
             self.addCleanup(connection.close)
             state.ensure_schema(connection)
+            pin_common_guidance(connection, invocation.InvocationContext(str(boundary.source), None),
+                boundary.worktree, state_root)
             logs = state_root / 'logs' / manager.hashlib.sha256(str(boundary.worktree).encode()).hexdigest()[:16]
             logs.mkdir(parents=True)
             (logs / 'planner.log').write_text('old log')
@@ -594,7 +612,8 @@ class NativeWriteIsolationTests(TestCase):
                 kwargs['stdout'].write('agent write boundary verification failed')
                 return manager.subprocess.CompletedProcess(command, 125)
 
-            with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
+            with mock.patch.object(provider_guidance, '_developer_texts', side_effect=native_developer_texts), \
+                 mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
                  mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
                  mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
                  mock.patch.object(manager, 'capture_git_snapshot', return_value=
