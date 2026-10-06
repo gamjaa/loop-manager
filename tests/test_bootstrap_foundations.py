@@ -1,4 +1,5 @@
 """Unit tests for bootstrap effects, ownership evidence and lock handoff."""
+from dataclasses import replace
 from pathlib import Path
 import shutil
 import tempfile
@@ -8,7 +9,7 @@ from unittest import mock
 
 from loop_manager_internal.runtime import bootstrap, process_lock, runtime_identity
 from loop_manager_internal.runtime.contracts import (
-    BaseWorktreeSyncResult, BootstrapRefreshHandoff, RuntimeWorktree,
+    BaseWorktreeSyncResult, RuntimeWorktree,
     ProcessLockBusyError, WorkspaceOwnershipError,
 )
 
@@ -53,20 +54,37 @@ class BootstrapFoundationTests(unittest.TestCase):
             Path('/source'), 'main', remote_sha=selected.commit_sha,
             state_dir=Path('/state'), owner='bootstrap')
 
-    def test_refresh_handoff_and_failure_never_start_runtime(self):
+    def test_sync_update_skip_failure_and_exception_still_select_remote_runtime(self):
         service = runtime_service(Path('/runtime'))
         sha = 'a' * 40
         service.fetch_bootstrap_revision = mock.Mock(return_value=('main', sha))
-        service.prepare_runtime_worktree = mock.Mock()
-        for status in ('updated', 'skipped'):
+        selected = RuntimeWorktree(Path('/runtime'), sha, 'b' * 32)
+        service.prepare_runtime_worktree = mock.Mock(return_value=selected)
+        service.validate_bootstrap_revision = mock.Mock()
+        for status in ('updated', 'skipped', 'failed'):
             service.effects.synchronize_base_worktree.return_value = BaseWorktreeSyncResult(status, 'reason', sha)
-            if status == 'updated':
-                self.assertEqual(service.prepare_bootstrap_runtime(Path('/source'), Path('/state'), 'b' * 32),
-                                 BootstrapRefreshHandoff('main', sha))
-            else:
-                with self.assertRaisesRegex(RuntimeError, '갱신 불가'):
-                    service.prepare_bootstrap_runtime(Path('/source'), Path('/state'), 'b' * 32)
+            self.assertEqual(service.prepare_bootstrap_runtime(Path('/source'), Path('/state'), 'b' * 32), selected)
+        service.effects.synchronize_base_worktree.side_effect = RuntimeError('source unavailable')
+        self.assertEqual(service.prepare_bootstrap_runtime(Path('/source'), Path('/state'), 'b' * 32), selected)
+        self.assertEqual(service.prepare_runtime_worktree.call_count, 4)
+        service.prepare_runtime_worktree.assert_called_with(
+            Path('/source'), Path('/state'), mutation_id='b' * 32, commit_sha=sha)
+
+    def test_remote_revision_race_prevents_runtime_selection(self):
+        service = runtime_service(Path('/runtime'), git=lambda *a: SimpleNamespace(stdout='c' * 40))
+        with self.assertRaisesRegex(RuntimeError, 'bootstrap revision 변경'):
+            service.validate_bootstrap_revision(Path('/source'), 'develop', 'a' * 40)
+        service.fetch_bootstrap_revision = mock.Mock(return_value=('develop', 'a' * 40))
+        service.effects.synchronize_base_worktree.return_value = BaseWorktreeSyncResult('failed', 'local failure', 'a' * 40)
+        service.prepare_runtime_worktree = mock.Mock()
+        with self.assertRaisesRegex(RuntimeError, 'bootstrap revision 변경'):
+            service.prepare_bootstrap_runtime(Path('/source'), Path('/state'), 'b' * 32)
         service.prepare_runtime_worktree.assert_not_called()
+        service.effects = replace(service.effects, git=mock.Mock(side_effect=[SimpleNamespace(stdout='a' * 40), SimpleNamespace(stdout='c' * 40)]))
+        service.prepare_runtime_worktree.return_value = RuntimeWorktree(Path('/runtime'), 'a' * 40, 'b' * 32)
+        with self.assertRaisesRegex(RuntimeError, 'bootstrap revision 변경'):
+            service.prepare_bootstrap_runtime(Path('/source'), Path('/state'), 'b' * 32)
+        service.prepare_runtime_worktree.assert_called_once()
 
     def test_external_config_interpreter_and_exit_code_survive_cleanup_failure(self):
         service = runtime_service(Path('/runtime'))

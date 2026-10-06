@@ -46,10 +46,25 @@ clean diverged base의 확인된 로컬 전용 commit을 원격 base 위로 안�
 - [x] 2026-10-05 fef5741의 mutable READY snapshot과 원본 hash를 대조하고 R-023·R-056의 원격 bootstrap 실행 조건을 같은 계획에 명시함. 구현·테스트 실행은 하지 않음.
 - [x] 2026-10-05 최신 planning 기준 32e496c와 제공된 mutable READY snapshot에서 재평가함. G-114의 probe 실패·파일 보존 회귀 보강은 bootstrap gate·diverged 동기화의 미충족 범위를 바꾸지 않으며 기존 개정 목표를 유지함. 구현·테스트 실행은 하지 않음.
 - [x] 2026-10-06 a1db7e8의 최신 원격 코드·테스트로 R-010 전체 기준을 재평가함. source HEAD·branch 및 갱신 성공·재실행 gate의 미충족 목표를 기존 G-161에 연결함. 구현·테스트 실행은 하지 않음.
-- [ ] 구현 및 관련 targeted unit 검증
+- [x] 구현 및 관련 targeted unit 검증: source sync·bootstrap foundation/entry·journal의 45개 unit case와 self handoff의 1개 case 통과. source journal 손상의 프로젝트 간 비차단 보강 후 journal class 3개 case 추가 재검증 통과.
+- [x] 2026-10-06 Manager verify 피드백의 `test_equal_base_worktree_sync_records_noop` 실패를 수정함. 기존 기대 문자열에 원격 SHA를 추가하고 단일 호출·`error=False` 검증을 유지했으며, 해당 unit case만 동일 명령으로 재실행해 통과함.
+- [x] 2026-10-06 Review의 첫 receipt 이전 편집 손실과 미적용 intent·lock 해소 후 재시도 문제를 회귀 테스트로 재현하고 수정함. `python3 -m unittest tests.test_source_sync` 재실행에서 28개 unit case 통과.
+- [x] 2026-10-06 관리 rebase 이후 현재 근거 문서와 base `6c01d0e` 대비 최종 diff 15개 파일을 다시 확인함. 현재 후보에서 `python3 -m unittest tests.test_source_sync tests.test_bootstrap_foundations tests.test_bootstrap_entry tests.test_manager_git_journal.PendingProjectMutationTest tests.test_self_merge_handoff.SelfMergeHandoffTest.test_local_sync_status_never_gates_verified_self_merge_handoff tests.test_worker_publication_validation.WorkerPublicationValidationTest.test_equal_base_worktree_sync_records_noop`를 새로 실행해 52개 unit case 통과.
+- [x] 2026-10-06 Worker 결과 검증 피드백 이후 같은 현재 후보·근거·최종 diff를 다시 확인하고 위 targeted 명령을 새로 실행해 52개 unit case 통과(exit code 0). 기존 결과 검사기로 이전 보고 문구의 거부와 교정한 PASS 보고의 수용을 확인함.
+- [x] 2026-10-06 Review 2의 복수 충돌 부분 staging 손실을 단일 unit case의 marker·modify/delete subcase에서 재현함. 수정 후 `python3 -m unittest tests.test_source_sync.SourceSynchronizationTests.test_multiple_conflicts_preserve_partial_staging_before_first_observation`를 동일하게 재실행해 통과했으며, 사용자 staging·파일·operation과 재시도 보존 및 손대지 않은 복수 text conflict의 정상 abort를 확인함. base `6c01d0e` 대비 현재 최종 diff와 근거를 다시 확인하고 위 관련 targeted 명령을 새로 실행해 53개 unit case 통과(exit code 0).
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- 2026-10-06 Review 2 교정: `AUTO_MERGE`와 같은 stage 0도 사용자 staging일 수 있으므로 blob 일치만으로 소유권을 인정하지 않는다. base·현재 HEAD·재적용 commit의 전체 tree를 비교해 양쪽 결과가 같거나 한쪽이 base와 같은 경로만 stage 0으로 인정한다. 원래 base 경로 삭제로 rename·directory conflict 가능성이 있거나 양쪽 변경의 stage 0을 구분할 수 없으면 index·파일·operation을 보존한다. 기존 Git tree·index helper를 재사용하며 검증용 Git 쓰기는 추가하지 않는다.
+
+- 2026-10-06 결과 보고 교정: 이전 `TARGETED_TESTS`의 “실패 없음” 표현을 기존 검사기가 실패 증거로 판정했다. 새 실행 결과는 명령과 명시적 PASS로 보고하며, 결과 검사기·verify 스크립트·runner는 변경하지 않는다.
+
+- 2026-10-06 Review 교정: conflict receipt의 첫 관측을 Git 생성 결과로 간주하지 않는다. `AUTO_MERGE` tree, 원래 commit·현재 HEAD에 결합된 index stage, 필터 없는 파일 blob과 mode를 읽기 전용으로 대조한 경우만 abort한다. tree 증거가 없거나 사용자 편집·staging·raw byte 차이·checkout 변환이 있으면 파일·index·operation을 보존한다. 시작 marker만 있고 결과가 없으면 ref·reflog·index·파일과 operation 부재로 미적용을 확인해 재개하며, 확인된 실패는 관련 Git lock 지문까지 같은 입력에서만 반복 보류한다. Manager는 lock을 제거하지 않고 사용자 lock 해소를 새 입력으로 재검사한다. 실패 반환 직후 관측 전에 lock이 해소되는 경우도 시작 지문을 보존해 재개한다.
+
+- 2026-10-06: `git/source_rebase.py`에 source 전용 intent·invocation·result와 복구 경계를 분리하고 기존 journal 저장·reflog 표식·commit 보존 helper를 재사용했다. clean 선형 commit만 rebase하며 dirty·merge commit·중간 replay 경로의 ignored 충돌은 보존한다. 실패 receipt와 실제 파일·index·operation이 일치하는 소유 conflict만 abort하고, receipt 없는 중단·후속 사용자 수정은 보존한다. 완료·abort 뒤 journal 확정 중단은 Git 쓰기를 반복하지 않고 확정한다. 같은 실패 입력의 rebase·fast-forward는 반복 보류하며 새 관련 입력에서 재검사한다.
+- 2026-10-06: bootstrap의 source HEAD·branch·operation 일치 및 갱신 후 외부 재실행 gate를 제거했다. lock 아래 확정한 원격 SHA의 detached runtime 자식이 그 revision의 `main` bootstrap에서 repository·runtime·부모 lock을 검증한 뒤 요청 명령을 실행한다. sync skip·실패·예외는 진단하고 원격 SHA·runtime 소유권 오류는 보존·중단한다. 기존 config·interpreter·인자 전달과 부모 lock 유지 helper를 그대로 사용하며 별도 clone·updater·ignored 복제를 추가하지 않았다. 선택된 source journal은 원격 planning release의 gate에서 제외하고 PRODUCT에 지속 규칙을 반영했다.
+- 2026-10-06: Linux 전체 검증 경로는 기존 `scripts/verify.sh`와 전체 unit manifest를 실행하는 verification runner를 재사용한다. Worker는 전체 verify·suite·lint·build·type check를 실행하지 않았으며 Manager 검증·Review·사용자 Merge는 남겨둔다.
 
 - 2026-10-06: R-010의 남은 원격 runtime 실행 목표는 기존 G-161과 같아 source와 G-012 선행 gate를 연결한다. pinned runtime 이전 임시 updater는 이미 제거됐다. 로컬 dirty 상태의 일괄 skip·diverged 금지는 최신 R-023·R-056의 disjoint fast-forward·보존형 rebase 정책으로 대체된 조건이므로 되살리지 않고 원격 격리·사용자 상태 보존을 검증한다. 기존 별도 관리 worktree·등록·Worker Git 쓰기 금지 구현은 중복 계획하지 않는다.
 

@@ -7,7 +7,6 @@ from loop_manager_internal.agents import agent_scope_decision
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.application.contracts import RemoteBranchMissingError
 from loop_manager_internal.git import manager_git_journal
-from loop_manager_internal.runtime.contracts import BootstrapRefreshHandoff
 from loop_manager_internal.runtime.contracts import RuntimeWorktree
 from pathlib import Path
 import json
@@ -99,7 +98,7 @@ class PrepareBootstrapRuntimeEffects:
 
 def prepare_bootstrap_runtime(
     effects: PrepareBootstrapRuntimeEffects, source: Path, state_dir: Path, mutation_id: str,
-) -> RuntimeWorktree | BootstrapRefreshHandoff:
+) -> RuntimeWorktree:
     return effects._bootstrap_service().prepare_bootstrap_runtime(source, state_dir, mutation_id)
 
 

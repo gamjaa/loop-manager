@@ -14,7 +14,7 @@ import subprocess
 import sys
 
 from loop_manager_internal.git import manager_git_journal
-from .contracts import BootstrapRefreshHandoff, RuntimeMutation, RuntimeWorktree, WorkspaceOwnershipError
+from .contracts import RuntimeMutation, RuntimeWorktree, WorkspaceOwnershipError
 from .process_lock import _held_process_lock_identity
 from .runtime_identity import (
     _canonical_path, _read_runtime_intent, _record_legacy_runtime_adoption,
@@ -393,41 +393,36 @@ class BootstrapService:
 
 
     def validate_bootstrap_revision(self, source: Path, base: str, sha: str) -> None:
-        """Reject a source or remote race before starting work at the selected SHA."""
-
-        current = self.effects.git(source, "rev-parse", "HEAD").stdout.strip()
-        branch_result = self.effects.git(source, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
-        branch = branch_result.stdout.strip() if branch_result.returncode == 0 else None
+        """Reject a remote race without making the user's checkout an execution gate."""
         remote = self.effects.git(
             source, "rev-parse", "--verify", f"refs/remotes/origin/{base}^{{commit}}"
         ).stdout.strip()
-        if current != sha or remote != sha or branch != base:
+        if remote != sha:
             raise RuntimeError(
-                f"bootstrap revision 변경: source={current} branch={branch} "
-                f"origin/{base}={remote} expected={sha}"
+                f"bootstrap revision 변경: origin/{base}={remote} expected={sha}"
             )
-        operations = self.effects._git_operation_entries(source)
-        if operations:
-            raise RuntimeError("진행 중 Git operation: " + ", ".join(sorted(operations)))
 
 
     def prepare_bootstrap_runtime(self,
         source: Path, state_dir: Path, mutation_id: str,
-    ) -> RuntimeWorktree | BootstrapRefreshHandoff:
-        """Refresh an old source and hand control to the next external invocation."""
+    ) -> RuntimeWorktree:
+        """Select remote code independently of best-effort source synchronization.
+
+        The child enters this revision's main bootstrap under the parent's lease
+        and validates its runtime identity before executing the requested command.
+        """
 
         base, sha = self.fetch_bootstrap_revision(source, state_dir)
-        result = self.effects.synchronize_base_worktree(
-            source, base, remote_sha=sha, state_dir=state_dir, owner="bootstrap",
-        )
-        if result.status == "updated":
-            self.effects.operation_log(f"bootstrap source 갱신 완료: origin/{base} {sha}; 다음 실행에 인계")
-            return BootstrapRefreshHandoff(base, sha)
-        if result.status != "equal":
-            raise RuntimeError(
-                f"bootstrap source 갱신 불가 (origin/{base} {sha}): "
-                f"{result.status}: {result.reason}"
+        try:
+            result = self.effects.synchronize_base_worktree(
+                source, base, remote_sha=sha, state_dir=state_dir, owner="bootstrap",
             )
+            self.effects.operation_log(
+                f"bootstrap source 동기화 {result.status} (origin/{base} {sha}): {result.reason}",
+                error=result.status in {"skipped", "failed"},
+            )
+        except (RuntimeError, OSError) as error:
+            self.effects.operation_log(f"bootstrap source 동기화 보류 (origin/{base} {sha}): {error}", error=True)
         self.validate_bootstrap_revision(source, base, sha)
         runtime = self.prepare_runtime_worktree(
             source, state_dir, mutation_id=mutation_id, commit_sha=sha,

@@ -1,11 +1,11 @@
-"""Preserving source checkout fast-forward effects."""
+"""Preserving source checkout synchronization effects."""
 from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
 from collections.abc import Mapping
 from loop_manager_internal.agents.scope_observation import _git_operation_path_signature
-from loop_manager_internal.git import manager_git_journal
+from loop_manager_internal.git import manager_git_journal, source_rebase
 from loop_manager_internal.runtime.contracts import BaseWorktreeSnapshot
 from loop_manager_internal.runtime.contracts import BaseWorktreeSyncResult
 from loop_manager_internal.runtime.contracts import GitLockError
@@ -188,6 +188,20 @@ def _source_expected_index(effects: SourceExpectedIndexEffects,
     return expected
 
 
+def _source_git_lock_state(effects, repo: Path, base: str) -> dict[str, str]:
+    """Observe relevant user locks without acquiring, removing or bypassing them."""
+    state = {}
+    for name in ("index.lock", "HEAD.lock", "ORIG_HEAD.lock", "REBASE_HEAD.lock",
+                 "AUTO_MERGE.lock", "packed-refs.lock", f"refs/heads/{base}.lock"):
+        path = Path(effects.git(repo, "rev-parse", "--git-path", name).stdout.strip())
+        if not path.is_absolute():
+            path = repo / path
+        if path.exists() or path.is_symlink():
+            stat = path.lstat()
+            state[name] = f"{stat.st_dev}:{stat.st_ino}:{stat.st_mtime_ns}:" + _git_operation_path_signature(path)
+    return state
+
+
 def synchronize_base_worktree(effects: SynchronizeBaseWorktreeEffects,
     repo: Path,
     base: str,
@@ -196,11 +210,14 @@ def synchronize_base_worktree(effects: SynchronizeBaseWorktreeEffects,
     state_dir: Path | None = None,
     owner: str = "project",
 ) -> BaseWorktreeSyncResult:
-    """Best-effort fast-forward of an eligible primary checkout."""
+    """Best-effort synchronization; source results never gate remote work."""
 
     selected_remote = remote_sha or ""
     try:
         if state_dir is not None:
+            recovered = source_rebase.recover(effects, repo, state_dir, base)
+            if recovered is not None:
+                return recovered
             manager_git_journal.recover_active(
                 state_dir, repo=str(_canonical_path(repo)),
                 kind="source_fast_forward", target=str(_canonical_path(repo)),
@@ -293,8 +310,11 @@ def synchronize_base_worktree(effects: SynchronizeBaseWorktreeEffects,
                     + ahead.stdout[-2000:].strip(),
                     selected_remote,
                 )
-            reason = "ahead" if ahead.returncode == 0 else "diverged"
-            return BaseWorktreeSyncResult("skipped", reason, selected_remote)
+            if ahead.returncode == 0:
+                return BaseWorktreeSyncResult("skipped", "ahead", selected_remote)
+            return source_rebase.synchronize(
+                effects, repo, state_dir, base, selected_remote, before, owner,
+            )
 
         changed_paths = tuple(
             effects._nul_git_paths(
@@ -366,14 +386,57 @@ def synchronize_base_worktree(effects: SynchronizeBaseWorktreeEffects,
                     repo, selected_remote, before_state["index"], changed_paths,
                 ),
             }
+            slot = manager_git_journal._slot(
+                state_dir, str(_canonical_path(repo)), "source_fast_forward",
+                str(_canonical_path(repo)),
+            )
+            if (slot / "active.json").exists():
+                prior = manager_git_journal._read(slot / "active.json")
+                if prior["before"] == before_state and prior["expected"] == expected_state:
+                    receipt_path = slot / f"{prior['id']}.invocation.json"
+                    started_path = slot / f"{prior['id']}.started.json"
+                    if receipt_path.exists() or started_path.exists():
+                        receipt = manager_git_journal._read(receipt_path if receipt_path.exists() else started_path)
+                        if receipt.get("id") != prior["id"]:
+                            raise manager_git_journal.MutationEvidenceError("source fast-forward invocation identity 불일치")
+                        if receipt_path.exists() and (
+                            not receipt.get("returncode") or receipt.get("observed") != before_state
+                        ):
+                            raise manager_git_journal.MutationEvidenceError("source fast-forward 결과와 현재 상태 불일치; 기존 근거 보존")
+                        same_locks = receipt.get("locks") == _source_git_lock_state(effects, repo, base)
+                        if receipt_path.exists() and same_locks:
+                            return BaseWorktreeSyncResult(
+                                "failed", "동일 입력의 확인된 실패 fast-forward 반복 보류; intent 보존", selected_remote,
+                            )
+                        # Lock disappearance is a relevant new input. Retire
+                        # only an unchanged source attempt, retaining its audit.
+                        if not same_locks:
+                            manager_git_journal._finish(slot, slot / "active.json", prior, before_state, {}, "aborted")
+                    # A start marker without a result does not prove failure.
+                    # execute() rechecks the unchanged source before resuming.
 
             def apply(token: str) -> None:
+                locks_before = _source_git_lock_state(effects, repo, base)
+                start = {"id": token, "locks": locks_before}
+                start_path = slot / f"{token}.started.json"
+                if start_path.exists():
+                    if manager_git_journal._read(start_path) != start:
+                        raise manager_git_journal.MutationEvidenceError("source fast-forward 시작 입력 변경; intent 보존")
+                else:
+                    manager_git_journal._write_new(start_path, start)
                 environment = {**os.environ,
                                "GIT_REFLOG_ACTION": f"loop-manager-source:{token}"}
                 updated = effects.git(
                     repo, "merge", "--ff-only", "--no-autostash", selected_remote,
                     check=False, env=environment,
                 )
+                locks_after = _source_git_lock_state(effects, repo, base)
+                manager_git_journal._write_new(slot / f"{token}.invocation.json", {
+                    "id": token, "returncode": updated.returncode,
+                    "locks": (locks_after or locks_before) if updated.returncode else locks_after,
+                    "observed": effects._source_transition_state(repo),
+                    "diagnostic": updated.stdout[-2000:].strip(),
+                })
                 if updated.returncode:
                     raise RuntimeError("fast-forward 실패: " + updated.stdout[-2000:].strip())
 
@@ -412,6 +475,6 @@ def ensure_safe_base_worktree(effects: EnsureSafeBaseWorktreeEffects,
 
 def log_base_worktree_sync(effects: LogBaseWorktreeSyncEffects, repo: Path, result: BaseWorktreeSyncResult) -> None:
     effects.operation_log(
-        f"기본 worktree 동기화 {result.status} ({repo}): {result.reason}",
+        f"기본 worktree 동기화 {result.status} ({repo}, remote={result.remote_sha}): {result.reason}",
         error=result.status in {"skipped", "failed"},
     )

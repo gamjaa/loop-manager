@@ -632,6 +632,18 @@ def _read(path: Path, *, require_rebase_branch: bool = False) -> dict[str, Any]:
                         and isinstance(item.get('changes'), list)
                         and isinstance(item.get('operations'), list)
                         for item in (before, expected))
+        elif value.get('kind') == 'source_rebase':
+            valid = (value.get('version') == 1
+                     and re.fullmatch(r'[0-9a-f]{32}', value['id']) is not None
+                     and all(isinstance(before.get(key), str) for key in (
+                         'head', 'branch', 'ref', 'remote', 'origin', 'head_reflog', 'branch_reflog'))
+                     and isinstance(before.get('index'), dict)
+                     and isinstance(before.get('files'), dict)
+                     and isinstance(before.get('changes'), list)
+                     and isinstance(before.get('operations'), list)
+                     and isinstance(expected.get('base'), str)
+                     and isinstance(expected.get('remote'), str)
+                     and isinstance(expected.get('affected'), list))
         elif value.get('kind') == 'managed_rebase' or legacy_rebase:
             valid = (isinstance(before.get('head'), str)
                      and ('branch' not in expected
@@ -678,14 +690,38 @@ def _slot(state_dir: Path, repo: str, kind: str, target: str) -> Path:
 
 
 def has_pending_project_mutation(state_dir: Path, repo: str) -> bool:
-    """Unsealed intents cannot be treated as a released mutation slot."""
+    """Unsealed managed-work intents block release; source sync is independent."""
     root = state_dir / "manager-git-journal"
     if not root.exists():
         return False
+    source_slots = {_slot(state_dir, repo, kind, repo)
+                    for kind in ("source_fast_forward", "source_rebase")}
     for slot in root.iterdir():
+        # Even an unreadable source journal is diagnosed by source sync rather
+        # than becoming a gate for a separate, verified planning workspace.
+        if slot in source_slots:
+            continue
         active = slot / "active.json"
-        if active.is_file() and _read(active).get("repo") == repo:
-            return True
+        if active.is_file():
+            try:
+                intent = _read(active)
+            except MutationEvidenceError:
+                # A torn optional-source pointer belonging to another project
+                # still has its immutable intent. Prove the resource slot;
+                # never infer a managed-work exception from a damaged pointer.
+                optional_source = False
+                for path in slot.glob("*.intent.json"):
+                    saved = _read(path)
+                    if (saved.get("kind") in {"source_fast_forward", "source_rebase"}
+                            and saved.get("target") == saved.get("repo")
+                            and slot == _slot(state_dir, saved["repo"], saved["kind"], saved["target"])):
+                        optional_source = True
+                        break
+                if optional_source:
+                    continue
+                raise
+            if intent.get("repo") == repo and intent.get("kind") not in {"source_fast_forward", "source_rebase"}:
+                return True
     return False
 
 

@@ -385,6 +385,28 @@ if __name__ == '__main__':
 
 
 class PendingProjectMutationTest(unittest.TestCase):
+    def test_optional_source_intents_preserve_evidence_without_gating_remote_planning(self):
+        for kind in ('source_fast_forward', 'source_rebase'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                state = Path(directory)
+                before = {'head': OLD, 'branch': 'main', 'ref': OLD, 'remote': NEW,
+                          'origin': 'origin', 'head_reflog': 'original', 'branch_reflog': 'original',
+                          'index': {}, 'changes': [], 'operations': [], 'files': {}}
+                expected = (dict(before, head=NEW) if kind == 'source_fast_forward'
+                            else {'base': 'main', 'remote': NEW, 'affected': []})
+                slot = journal._slot(state, '/repo', kind, '/repo')
+                slot.mkdir(parents=True)
+                intent = {'version': 1, 'id': 'a' * 32, 'owner': 'project', 'kind': kind, 'repo': '/repo',
+                          'target': '/repo', 'before': before, 'expected': expected}
+                journal._write_new(slot / ('a' * 32 + '.intent.json'), intent)
+                journal._write_new(slot / 'active.json', intent)
+                saved = (slot / 'active.json').read_bytes()
+                self.assertFalse(journal.has_pending_project_mutation(state, '/repo'))
+                self.assertEqual((slot / 'active.json').read_bytes(), saved)
+                (slot / 'active.json').write_text('{interrupted source intent')
+                self.assertFalse(journal.has_pending_project_mutation(state, '/repo'))
+                self.assertFalse(journal.has_pending_project_mutation(state, '/other'))
+
     def test_unsealed_mutation_blocks_only_owning_project_without_writing(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
