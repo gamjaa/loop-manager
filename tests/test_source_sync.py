@@ -24,6 +24,62 @@ from loop_manager_internal.git import source_rebase
 
 
 class SourceSynchronizationTests(unittest.TestCase):
+    def test_multiple_conflicts_preserve_partial_staging_before_first_observation(self):
+        for scenario in ("untouched", "staged-markers", "staged-modify-delete"):
+            with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
+                _remote, source, writer = remote_fixture(directory)
+                (source / "tracked.txt").write_text("local conflict\n")
+                (source / "loop_manager.py").write_text("local conflict\n")
+                (source / "local.txt").write_text("local addition\n")
+                original = commit_all(source, "Two local changes")
+                (writer / "tracked.txt").write_text("remote conflict\n")
+                if scenario == "staged-modify-delete":
+                    (writer / "loop_manager.py").unlink()
+                else:
+                    (writer / "loop_manager.py").write_text("remote conflict\n")
+                (writer / "remote.txt").write_text("remote addition\n")
+                remote = commit_all(writer, "Two remote changes")
+                git(writer, "push", "origin", "main")
+                state = Path(directory) / "state"
+                loop_manager._recorded_base_fetch(source, state, "main", owner="project")
+                effects = loop_manager._source_sync_effects_synchronize_base_worktree()
+                start = source_rebase._observe(effects, source, "main")
+                observed = []
+                real_git = loop_manager.git
+                def stage_before_observation(repo, *args, **kwargs):
+                    result = real_git(repo, *args, **kwargs)
+                    if "rebase" in args and "--abort" not in args and result.returncode:
+                        conflicts = git(repo, "ls-files", "--unmerged")
+                        self.assertIn("tracked.txt", conflicts)
+                        self.assertIn("loop_manager.py", conflicts)
+                        if scenario != "untouched":
+                            path = "tracked.txt" if scenario == "staged-markers" else "loop_manager.py"
+                            git(repo, "add", path)
+                            self.assertEqual(git(repo, "rev-parse", ":" + path),
+                                             git(repo, "rev-parse", "AUTO_MERGE:" + path))
+                            self.assertTrue(git(repo, "ls-files", "--unmerged"))
+                        observed.append(source_rebase._observe(effects, repo, "main"))
+                    return result
+                with mock.patch("loop_manager.git", side_effect=stage_before_observation) as commands:
+                    result = loop_manager.synchronize_base_worktree(source, "main", remote_sha=remote, state_dir=state)
+                self.assertEqual(result.status, "failed", result.reason)
+                self.assertEqual(len(observed), 1)
+                self.assertEqual(git(source, "rev-parse", "refs/heads/main"), original)
+                current = source_rebase._observe(effects, source, "main")
+                aborts = [call for call in commands.call_args_list if "--abort" in call.args]
+                if scenario == "untouched":
+                    self.assertEqual(len(aborts), 1)
+                    self.assertEqual({key: value for key, value in current.items() if key != "head_reflog"},
+                                     {key: value for key, value in start.items() if key != "head_reflog"})
+                else:
+                    self.assertEqual(len(aborts), 0)
+                    self.assertEqual(current, observed[0])
+                    with mock.patch("loop_manager.git", wraps=loop_manager.git) as retry_commands:
+                        retry = loop_manager.synchronize_base_worktree(source, "main", remote_sha=remote, state_dir=state)
+                    self.assertEqual(retry.status, "failed", retry.reason)
+                    self.assertEqual(source_rebase._observe(effects, source, "main"), observed[0])
+                    self.assertFalse(any("rebase" in call.args[1:] for call in retry_commands.call_args_list))
+
     def test_conflict_edits_before_first_observation_are_never_aborted(self):
         for scenario in ("conflict-file", "staged-resolution", "replayed-file"):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:

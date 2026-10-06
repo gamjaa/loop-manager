@@ -51,9 +51,12 @@ clean diverged base의 확인된 로컬 전용 commit을 원격 base 위로 안�
 - [x] 2026-10-06 Review의 첫 receipt 이전 편집 손실과 미적용 intent·lock 해소 후 재시도 문제를 회귀 테스트로 재현하고 수정함. `python3 -m unittest tests.test_source_sync` 재실행에서 28개 unit case 통과.
 - [x] 2026-10-06 관리 rebase 이후 현재 근거 문서와 base `6c01d0e` 대비 최종 diff 15개 파일을 다시 확인함. 현재 후보에서 `python3 -m unittest tests.test_source_sync tests.test_bootstrap_foundations tests.test_bootstrap_entry tests.test_manager_git_journal.PendingProjectMutationTest tests.test_self_merge_handoff.SelfMergeHandoffTest.test_local_sync_status_never_gates_verified_self_merge_handoff tests.test_worker_publication_validation.WorkerPublicationValidationTest.test_equal_base_worktree_sync_records_noop`를 새로 실행해 52개 unit case 통과.
 - [x] 2026-10-06 Worker 결과 검증 피드백 이후 같은 현재 후보·근거·최종 diff를 다시 확인하고 위 targeted 명령을 새로 실행해 52개 unit case 통과(exit code 0). 기존 결과 검사기로 이전 보고 문구의 거부와 교정한 PASS 보고의 수용을 확인함.
+- [x] 2026-10-06 Review 2의 복수 충돌 부분 staging 손실을 단일 unit case의 marker·modify/delete subcase에서 재현함. 수정 후 `python3 -m unittest tests.test_source_sync.SourceSynchronizationTests.test_multiple_conflicts_preserve_partial_staging_before_first_observation`를 동일하게 재실행해 통과했으며, 사용자 staging·파일·operation과 재시도 보존 및 손대지 않은 복수 text conflict의 정상 abort를 확인함. base `6c01d0e` 대비 현재 최종 diff와 근거를 다시 확인하고 위 관련 targeted 명령을 새로 실행해 53개 unit case 통과(exit code 0).
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- 2026-10-06 Review 2 교정: `AUTO_MERGE`와 같은 stage 0도 사용자 staging일 수 있으므로 blob 일치만으로 소유권을 인정하지 않는다. base·현재 HEAD·재적용 commit의 전체 tree를 비교해 양쪽 결과가 같거나 한쪽이 base와 같은 경로만 stage 0으로 인정한다. 원래 base 경로 삭제로 rename·directory conflict 가능성이 있거나 양쪽 변경의 stage 0을 구분할 수 없으면 index·파일·operation을 보존한다. 기존 Git tree·index helper를 재사용하며 검증용 Git 쓰기는 추가하지 않는다.
 
 - 2026-10-06 결과 보고 교정: 이전 `TARGETED_TESTS`의 “실패 없음” 표현을 기존 검사기가 실패 증거로 판정했다. 새 실행 결과는 명령과 명시적 PASS로 보고하며, 결과 검사기·verify 스크립트·runner는 변경하지 않는다.
 

@@ -82,9 +82,17 @@ def _git_conflict_files_match(effects, repo: Path, before: dict, current: dict) 
         return False
     # Verify the index independently, including an edit staged before our first
     # read. Renames whose stages cannot be bound to these same paths defer abort.
-    candidates = tuple(current["index"])
+    revisions = (tree_oid, source_oid + "^", current["head"], source_oid)
+    candidates = tuple(sorted(set(current["index"]).union(*(
+        effects._nul_git_paths(repo, "ls-tree", "-r", "--name-only", "-z", revision)
+        for revision in revisions
+    ))))
     trees = [effects._source_expected_index(repo, revision, {}, candidates)
-             for revision in (tree_oid, source_oid + "^", current["head"], source_oid)]
+             for revision in revisions]
+    # Missing base paths can hide rename or directory-conflict stages. Without
+    # an independent original index for these forms, retain the operation.
+    if any(trees[1].keys() - side.keys() for side in trees[2:]):
+        return False
     # A filtered diff could hide raw edits (for example line-ending changes).
     # Compare file blobs without filters; symlinks/submodules or transformed
     # checkouts without this proof conservatively retain the conflict.
@@ -119,7 +127,15 @@ def _git_conflict_files_match(effects, repo: Path, before: dict, current: dict) 
                     or fields != ["H" if stage == 0 else "M", *expected[0].split()[1:3], str(stage)]):
                 return False
             stages.add(stage)
-        if stages != {0}:
+        if stages == {0}:
+            base, ours, theirs = (tree.get(path) for tree in trees[1:])
+            # AUTO_MERGE also contains unresolved file contents. A user can
+            # stage those bytes verbatim while another path stays unmerged.
+            # Only a provable trivial three-way selection authorizes stage 0;
+            # ambiguous clean merges also retain the operation.
+            if not (ours == theirs or base == ours or base == theirs):
+                return False
+        else:
             unmerged = True
             if 0 in stages or stages != {stage for stage in (1, 2, 3) if path in trees[stage]}:
                 return False
