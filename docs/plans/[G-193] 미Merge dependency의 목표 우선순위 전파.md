@@ -53,3 +53,5 @@ priority: critical
 - 공통 계산은 `catalog/effective_priority.py`에 두고 매 선택의 검증·hold 제외 view에서 재계산한다. 불완전·순환 closure는 전파·실행 후보에서 제외하고 planning 미확정 대상과 전이 의존 계획의 보류를 유지한다. 유지보수 범위 계산과 리팩터링 DAG의 숫자 ID 정렬은 재사용한다.
 - 기존 루트 진입·composition 파일 `loop_manager.py`에는 선택 로그 effect 연결만 추가했다. 새 루트 항목·파일 이동은 없으며 기존 Linux verify는 unittest discovery와 전체 compile 경로를 이미 제공해 수정이 필요하지 않다.
 - targeted 검증의 초기 두 실패는 새 테스트 fixture의 enum 저장값과 cycle 범위 초기화 오류였다. fixture를 수정하고 동일 명령을 재실행해 14개 모두 통과했다.
+
+- Manager verify 피드백의 catalog reconciliation·프로젝트 scheduler 두 기존 테스트가 선언값 정렬을 기대했다. R-075에 맞게 critical 목표의 선행 G-002·G-099 선택으로 갱신하고 선언값 보존·전파 경로·목표 대기·단일 실행 보호 검증을 유지·보강했다. 해당 두 test case만 targeted 실행해 모두 통과했으며 전체 verify는 재실행하지 않았다.
