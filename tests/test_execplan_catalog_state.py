@@ -1010,7 +1010,6 @@ class CatalogReconciliationTest(CatalogReconciliationFixture, unittest.TestCase)
         self.connection.commit()
 
         cases = (
-            ({"docs/plans/[G-004] Gap.md": self._text("G-004", "Gap")}, "unknown-plan-id"),
             ({"docs/plans/archive/[G-003] Archive.md": self._text("G-003", "Archive")}, "unknown-plan-id"),
             ({"docs/plans/[G-003] Legacy.md": self._text(
                 "G-003", "Legacy"
@@ -1030,7 +1029,7 @@ class CatalogReconciliationTest(CatalogReconciliationFixture, unittest.TestCase)
             "docs/plans/[G-001] Old.md": documents["docs/plans/[G-001] Old.md"],
             "docs/plans/[G-003] Third.md": self._text("G-003", "Third"),
         })).reconcile("/repo")
-        self.assertEqual(missing.diagnostic.code, "ambiguous-id-change")
+        self.assertEqual(missing.diagnostic.code, "missing-plan")
 
         archived_source = active_snapshot("e" * 40, {
             **documents,
@@ -1049,6 +1048,15 @@ class CatalogReconciliationTest(CatalogReconciliationFixture, unittest.TestCase)
         self.assertIsNone(self.connection.execute(
             "SELECT 1 FROM exec_plans WHERE plan_id = 'G-003'"
         ).fetchone())
+
+    def test_remote_number_gaps_are_not_missing_plans(self):
+        result = self._service(active_snapshot("e" * 40, {
+            "docs/plans/[G-001] Old.md": self._text("G-001", "Old"),
+            "docs/plans/[G-002] Dependency.md": self._text("G-002", "Dependency"),
+            "docs/plans/[G-007] Gap.md": self._text("G-007", "Gap"),
+        })).reconcile("/repo")
+        self.assertTrue(result.usable)
+        self.assertIsNotNone(self.connection.execute("SELECT 1 FROM exec_plans WHERE plan_id='G-007'").fetchone())
 
     def test_cancelled_number_and_sqlite_ownership_race_reject_registration(self):
         documents = {

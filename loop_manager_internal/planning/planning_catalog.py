@@ -33,6 +33,7 @@ class MutableReadySnapshot:
     active_sha: str
     plans: tuple[ReadyPlanSnapshot, ...]
     token: str
+    recovery_goals: tuple[str, ...] = ()
 
     @property
     def by_id(self) -> dict[str, ReadyPlanSnapshot]:
@@ -46,6 +47,13 @@ class MutableReadySnapshot:
         return json.dumps(
             {
                 "token": self.token,
+                "deleted_goals": [
+                    {"id": goal["id"], "path": goal["path"],
+                     "deletion_revision": goal["deletion_revision"], "affected_ids": goal["affected_ids"],
+                     "text": json.loads(goal["evidence"])["text"],
+                     "sources": json.loads(json.loads(goal["evidence"])["row"]["sources"])}
+                    for goal in (json.loads(raw) for raw in self.recovery_goals)
+                ],
                 "plans": [
                     {
                         "id": plan.plan_id,
@@ -79,6 +87,7 @@ def mutable_snapshot_token(
     repo: str,
     active_sha: str,
     plans: Sequence[ReadyPlanSnapshot],
+    recovery_goals: tuple[str, ...] = (),
 ) -> str:
     """Hash every CAS-relevant declaration into a deterministic token."""
 
@@ -88,6 +97,8 @@ def mutable_snapshot_token(
         "active_sha": active_sha,
         "plans": [snapshot_to_dict(plan) for plan in plans],
     }
+    if recovery_goals:
+        payload["deleted_goals"] = list(recovery_goals)
     encoded = json.dumps(
         payload,
         ensure_ascii=True,

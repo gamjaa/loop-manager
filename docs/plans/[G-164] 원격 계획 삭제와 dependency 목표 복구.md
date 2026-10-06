@@ -36,9 +36,33 @@ priority: critical
 ## Progress
 
 - [x] 2026-10-05 planning 기준 a049a76의 명세·원본·관련 테스트와 비종료 catalog에서 미충족 범위를 확인함. 구현·테스트 실행은 하지 않음.
-- [ ] 구현 및 관련 targeted unit 검증
+- [x] 원격 삭제 증명·취소 감사·삭제 목표 snapshot 및 검증된 게시 복구 구현과 관련 targeted unit 검증
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
 
 - 원격 관계·목표 판단·원자적 채택이 연결되어 complexity high, 선행 목표 손실의 영향으로 risk high다. 취소를 Merge나 Requirement 충족으로 간주하지 않는다.
+- `remote_deletions.reference_issues`는 취소 적격성에 앞서 모든 삭제 관측의 기존·신규 참조를 탐지한다. `prove_deletions`는 이전 채택 revision의 일반 파일·hash·metadata와 최신 원격 ancestry/부재, 기존 무소유 READY 판정 및 게시 CAS로 취소를 제한한다. 실행/PR/별도 감사·프로젝트 소유권 또는 증거 미확정으로 취소할 수 없는 삭제의 본문 참조와 dependency closure는 `missing-plan-reference` hold로 보존하고 Planner snapshot에서 제외한다. 미등록 참조를 제거해도 선행 선언이 복원되기 전에는 기존 hold 근거를 유지한다. archive는 같은 ID 관측으로 구분하고 삭제·신규 추가를 ID 변경으로 추측하지 않는다.
+- 취소 감사의 nullable `recovery_evidence` 추가는 기존 DB와 호환된다. 삭제 원문·source·최초 게시 및 채택 row를 보존하고, 확인된 원격 revision에서 취소와 독립 신규 등록을 같은 transaction으로 적용한다. 취소·복구 감사도 reconciliation CAS와 refresh cache identity에 포함한다.
+- 삭제 목표의 영향은 기존 dependency·채택 본문과 최신 pinned 선언 전체의 참조를 함께 검사해 식별한다. SQLite row가 없는 신규 선언의 동시 Implementation·Validation·dependency 참조도 감사·보류 대상이며, 격리된 선언은 해당 pinned revision의 일반 파일에서 읽는다. 신규 형식·활성 source 검증과 dependency 오류의 영향 범위를 보존하며, 유효한 영향 신규 선언은 취소 감사·등록·hold를 같은 transaction에서 반영해 일반 mutable snapshot으로 복구한다. 아직 등록할 수 없는 선언도 보류 ID로 목표 감사를 유지한다. 목표 판단 없이 원격 참조만 제거해도 보존된 근거에 따라 계속 보류하며, 실행된 계획과 snapshot 밖 보류 파일은 보존한다.
+- Planner는 영향 계획의 Decision Log에 `DEPENDENCY_RECOVERY` JSON으로 삭제 ID, 최신 source, 이유와 대체 dependency 또는 목표 불필요 판단을 기록한다. 코드가 목표 의미를 합성하지 않고 판단의 존재·source·유효한 전체 graph와 대체 gate를 검증한다. 불확실한 영향은 보류한 채 독립 batch를 게시할 수 있다. snapshot token·publication manifest에 목표 감사를 결합하고, 원격 게시 확인 뒤 개정·대체 등록·판단 감사·해당 hold 해제를 함께 확정한다.
+
+### 삭제·복구 경계 대응표
+
+| 경계 | 조건과 scope | 보호·복구 및 사용자 조치 |
+|---|---|---|
+| `catalog_service` / `remote_deletions.reference_issues`·`prove_deletions` | 취소 적격성과 별개인 참조 영향 탐지, 원격 ID 부재와 이전 채택 bytes·ancestry 확인 | 미착수·무소유만 취소한다. 취소 불가·미확정 삭제의 참조는 기존 hold 경계로 보존한다. 번호 공백·archive 이동·동시 신규 추가는 삭제나 ID 변경의 추정 근거가 아니다. |
+| `CatalogReconciliationService` / `DefinitionStateRepository.apply` | 삭제 이력 미확인·실행/PR 이력·삭제 목표의 영향 | ID·실행·PR·취소 감사와 dependency closure를 보존해 해당 범위만 hold한다. 유효한 영향 신규 등록도 같은 transaction에서 hold하며 등록 불가 선언의 목표 감사를 유지한다. 독립 선언·PR 관측은 계속하며, 공유 실행 소유권이 서로 다를 때만 프로젝트 안전 진단을 유지한다. |
+| `mutable_ready_snapshot` / `validate_planner_result` | 일반 snapshot에 속한 무소유 READY의 삭제 목표 복구 | 보존 원문과 최신 source를 Planner에게 전달한다. 명시적 목표 판단 없는 dependency 제거·대체 gate 누락·snapshot 밖 개정·미해결 graph는 거부한다. 불확실한 목표는 사용자 명세/계획 판단까지 보류한다. |
+| 일반 planning publication intent / batch apply | snapshot·감사·Git 후보 및 원격 확인 일치 | 기존 단일 commit·manifest·SQLite transaction을 사용한다. 중단은 저장 intent로 복구하고 경쟁은 rollback/CAS로 거부하며 동일 취소·대체·게시를 중복하지 않는다. |
+
+### 검증 근거
+
+- `tests.test_incremental_planning.IncrementalPlanningCatalogTest`의 `remote_deletion` 선택 unit case: 취소·archive·번호 공백/신규 추가·실행/소유권 보존·본문 참조·목표 판단/gate·독립 batch·원격 dependency 제거·hash 미확인·감사 경쟁·중단/원격 경쟁·게시 후 intent 복구/멱등성을 검증한다.
+- 기존 catalog 신규 등록/취소 ID 보호, mutable 실행 이력 제외, 혼합 batch 원자성, 게시 intent 복구와 nullable snapshot manifest의 개별 unit case도 통과했다. 최초 targeted 실패는 테스트의 nullable 최초 게시 SHA 기대값과 손상 감사 JSON 예외를 수정한 뒤 같은 명령으로 재검증했다.
+- 기존 Linux `scripts/verify.sh`는 표준 verification runner를 실행하고 실패 종료 코드를 전달하므로 유지한다. Worker는 전체 verify를 실행하지 않았으며 Manager 검증·Review·사용자 Merge는 별도 완료 조건이다.
+- Manager 검증에서 발견된 기존 선언 오류의 실행 보류·재개 회귀는 삭제 소유권 검사가 모든 hold에 적용된 것이 원인이었다. 추가 검사를 실제 `missing-plan` 원인으로 제한했다. 두 기존 보류·재개 unit case와 실제 삭제 시 충돌 소유권·원본 보존 case를 확인하며, 기존 공유 branch/worktree 및 Agent scope 검사는 유지한다.
+- Review의 동시 참조 추가 누락은 기존 row·채택 본문만 검사하던 영향 탐지를 최신 pinned 본문까지 확장해 수정했다. 동시 Implementation 참조·Validation 경로 참조·격리되는 dependency 참조의 세 unit case는 영향 감사, 최신 복구 snapshot, 독립 실행과 재조회 멱등성을 검증한다. 기존 본문 참조 case는 같은 삭제 commit에서 참조를 제거해도 보존 근거의 hold가 유지되는지 검증하도록 강화했다.
+- 신규 선언 누락은 최신 pinned 선언의 별도 순회와 등록 시 목표 hold로 수정했다. 신규 Implementation·Validation·dependency 참조의 세 unit case는 최초 등록·감사·복구 snapshot·반복 조회와 판단 없는 개정 거부를 검증한다. 신규 priority·source·dependency 오류의 세 case는 등록 제한, 미등록 목표 감사의 지속, 교정 후 보류 및 명시적 판단의 수용을 검증한다. 최초 legacy refresh도 삭제 reconciliation의 등록 검증을 거치며, 이때 invalid dependency의 신규 영향 계획이 등록되지 않는 unit case를 확인했다.
+- catalog 초기화 전 snapshot/CAS 조회에서 hold 테이블 직접 조회가 중단되던 회귀는 기존 `catalog_held_plan_ids` helper를 재사용해 수정했다. 읽기 전용 목표 조회는 테이블을 생성하지 않으며 등록된 영향 대상·감사 비교를 유지한다. 두 metadata CAS unit case와 초기화 전 감사 보존·미등록 목표 보류의 개별 case를 검증했다.
+- 실행 이력이 있는 삭제의 본문 참조 누락은 취소 적격성에서 영향 탐지를 분리해 수정했다. 이전 채택 Implementation 참조·동시 Validation 참조·소유 PR 보존·신규 참조 제거 뒤 보류 유지와 선행 선언 복원의 네 unit case를 확인했다. 기존 dependency 보류·독립 Planner·미착수 취소/신규 등록·신규 본문 참조·복구 게시와 중단/경쟁의 개별 case도 확인했다.
