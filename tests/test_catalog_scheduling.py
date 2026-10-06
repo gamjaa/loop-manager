@@ -766,6 +766,120 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
 
 
 class PreservedPlanningSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
+    def test_failed_general_handoff_holds_targets_and_transitive_dependents(self):
+        from loop_manager_internal.storage import runtime_state, planner_check_state
+        for stage in ('handoff', 'superseded'):
+            with self.subTest(stage=stage):
+                connection = self._connection()
+                self._insert_plan(connection, 'G-001', 'READY', priority='critical')
+                self._insert_plan(connection, 'G-002', 'READY', depends_on=('G-001',))
+                self._insert_plan(connection, 'G-003', 'READY', priority='low')
+                self._insert_plan(connection, 'G-004', 'MERGED')
+                self._insert_plan(connection, 'G-005', 'MERGED', depends_on=('G-004',))
+                self._insert_plan(connection, 'G-006', 'READY', depends_on=('G-005',), priority='critical')
+                planner_check_state.begin(
+                    connection, 'repo', input_fingerprint='input',
+                    specification_fingerprint='spec', target_fingerprint='targets',
+                    base_sha='base', comparison_sha='old-base',
+                )
+                result = 'PLANNER_CHECK_RESULT: ' + json.dumps({
+                    'outcome': 'needs_revision', 'evidence': 'changed API',
+                    'reason': 'validation needs correction', 'plan_ids': ['G-001', 'G-004'],
+                })
+                planner_check_state.advance(connection, 'repo', 'pending', 'result', result=result)
+                planner_check_state.advance(connection, 'repo', 'result', 'handoff')
+                if stage == 'superseded':
+                    planner_check_state.advance(connection, 'repo', 'handoff', 'superseded')
+                runtime = runtime_state.RuntimeStateRepository(connection)
+                runtime.update_project('repo', {
+                    'phase': 'PLANNING', 'active_sha': 'base', 'worktree': '/planning',
+                    'planning_workspace_owned': 1,
+                    'planning_attempt_fingerprint': 'input', 'planning_error_fingerprint': 'input',
+                    'planner_session_id': 'general-session', 'planning_error': 'correction failed',
+                    'planning_result': 'unpublished correction',
+                }, enqueue=False)
+                runtime.suspend_planning(runtime.planning('repo'))
+                preserved = runtime.planning('repo')
+                check = dict(planner_check_state.get(connection, 'repo'))
+                self.assertEqual(loop_manager.catalog_schedule_decision(connection, 'repo').runnable_ready['plan_id'], 'G-003')
+                connection.execute("UPDATE exec_plans SET status = 'PR_OPEN' WHERE plan_id = 'G-003'")
+                for _ in range(2):
+                    decision = loop_manager.catalog_schedule_decision(connection, 'repo')
+                    self.assertTrue(decision.has_ready)
+                    self.assertIsNone(decision.runnable_ready)
+                    self.assertEqual(runtime.planning('repo'), preserved)
+                    self.assertEqual(dict(planner_check_state.get(connection, 'repo')), check)
+                # A changed input alone cannot certify the unresolved targets.
+                runtime.resume_planning(preserved)
+                runtime.update_project('repo', {'planning_attempt_fingerprint': 'changed-input'}, enqueue=False)
+                runtime.suspend_planning(runtime.planning('repo'))
+                self.assertIsNone(loop_manager.catalog_schedule_decision(connection, 'repo').runnable_ready)
+                # Only a successful full planning baseline resolves the handoff.
+                runtime.resume_planning(runtime.planning('repo'))
+                with connection:
+                    runtime.clear('repo', planning_fingerprint='published-correction')
+                    planning_input_state.record_general(connection, 'repo', 'corrected-commit', {})
+                resolved = planner_check_state.get(connection, 'repo')
+                self.assertEqual(resolved['stage'], 'accepted')
+                self.assertEqual(resolved['base_sha'], 'corrected-commit')
+                self.assertEqual(resolved['result'], check['result'])
+                runtime.update_project('repo', {
+                    'planning_attempt_fingerprint': 'later-input',
+                    'planning_error': 'later failure', 'planning_error_fingerprint': 'later-input',
+                }, enqueue=False)
+                runtime.suspend_planning(runtime.planning('repo'))
+                self.assertEqual(loop_manager.catalog_schedule_decision(connection, 'repo').runnable_ready['plan_id'], 'G-001')
+
+    def test_uncertain_or_invalid_general_check_does_not_release_unknown_targets(self):
+        from loop_manager_internal.storage import runtime_state, planner_check_state
+        for result in ('invalid', 'PLANNER_CHECK_RESULT: ' + json.dumps({
+                'outcome': 'uncertain', 'evidence': 'missing evidence',
+                'reason': 'cannot establish validity', 'plan_ids': []})):
+            with self.subTest(result=result):
+                connection = self._connection()
+                self._insert_plan(connection, 'G-001', 'READY')
+                planner_check_state.begin(
+                    connection, 'repo', input_fingerprint='input',
+                    specification_fingerprint='spec', target_fingerprint='targets',
+                    base_sha='base', comparison_sha='old-base',
+                )
+                planner_check_state.advance(connection, 'repo', 'pending', 'handoff', result=result)
+                runtime = runtime_state.RuntimeStateRepository(connection)
+                runtime.update_project('repo', {'planning_error': 'correction failed',
+                                               'planning_attempt_fingerprint': 'input'}, enqueue=False)
+                runtime.suspend_planning(runtime.planning('repo'))
+                decision = loop_manager.catalog_schedule_decision(connection, 'repo')
+                self.assertTrue(decision.has_ready)
+                self.assertIsNone(decision.runnable_ready)
+
+    def test_interrupted_general_acceptance_rolls_back_baseline_and_target_release(self):
+        from loop_manager_internal.storage import runtime_state, planner_check_state
+        connection = self._connection()
+        self._insert_plan(connection, 'G-001', 'READY')
+        planner_check_state.begin(
+            connection, 'repo', input_fingerprint='input',
+            specification_fingerprint='spec', target_fingerprint='targets',
+            base_sha='base', comparison_sha='old-base',
+        )
+        planner_check_state.advance(connection, 'repo', 'pending', 'handoff',
+                                    result='PLANNER_CHECK_RESULT: ' + json.dumps({
+                                        'outcome': 'needs_revision', 'evidence': 'changed API',
+                                        'reason': 'needs correction', 'plan_ids': ['G-001'],
+                                    }), session_id='check-session')
+        runtime = runtime_state.RuntimeStateRepository(connection)
+        runtime.update_project('repo', {'planning_error': 'failed correction',
+                                       'planning_attempt_fingerprint': 'input'}, enqueue=False)
+        runtime.suspend_planning(runtime.planning('repo'))
+        connection.commit()
+        check = dict(planner_check_state.get(connection, 'repo'))
+        with self.assertRaisesRegex(RuntimeError, 'interrupted'):
+            with connection:
+                planning_input_state.record_general(connection, 'repo', 'corrected-commit', {})
+                raise RuntimeError('interrupted')
+        self.assertFalse(planning_input_state.has_baseline(connection, 'repo'))
+        self.assertEqual(dict(planner_check_state.get(connection, 'repo')), check)
+        self.assertIsNone(loop_manager.catalog_schedule_decision(connection, 'repo').runnable_ready)
+
     def test_unvalidated_targets_and_dependents_wait_while_independent_ready_runs(self):
         from loop_manager_internal.storage import runtime_state, maintenance_state
         connection = self._connection()

@@ -159,8 +159,9 @@ class _PlanningGitPorts:
             self._effects.git(worktree, "rev-parse", "--verify", "HEAD^{commit}")
             if self._effects.git(worktree, "ls-files", "--unmerged").stdout.strip():
                 raise PlanningWorkspaceOwnershipError("planning index에 미해결 충돌이 남아 있습니다.")
-        if self._effects._git_operation_entries(self._repo_path):
-            raise PlanningWorkspaceOwnershipError("공유 저장소 Git operation이 진행 중입니다.")
+        # Rebase/bisect metadata belongs to its checkout, including the primary
+        # checkout. Shared mutation evidence is checked through the Manager
+        # journal here and the saved Agent scope at the release boundary.
 
     def make_planning_worktree(
         self,

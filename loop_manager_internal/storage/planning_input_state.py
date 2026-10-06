@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import sqlite3
 from typing import Mapping
+from loop_manager_internal.storage import planner_check_state
 
 
 FORMAT = "active-plan-content-sha256-v1"
@@ -84,6 +85,17 @@ def record_general(
         "full_input_format = excluded.full_input_format, entries = excluded.entries",
         (repo, SCOPE, revision, revision, FORMAT, FULL_FORMAT, _encoded(entries)),
     )
+    check = planner_check_state.get(connection, repo)
+    if check is not None and check['stage'] != 'accepted':
+        # A full validated planning result resolves its preceding check/handoff.
+        # Keep the decision and session audit; move the comparison revision to
+        # the same successfully published baseline in this transaction.
+        if not planner_check_state.advance(
+            connection, repo, str(check['stage']), 'accepted',
+            expected_input=str(check['input_fingerprint']),
+            expected_target=str(check['target_fingerprint']), base_sha=revision,
+        ):
+            raise RuntimeError('일반 planning 확정 전 점검 상태가 변경됐습니다.')
 
 
 def advance_verified_delta(

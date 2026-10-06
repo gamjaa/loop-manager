@@ -903,6 +903,38 @@ class PlanningSelectionTest(PlanningCase):
         self.assertEqual(ports.agent.roles, [(None, False)])
         self.assertEqual(ports.state.check_record["stage"], "handoff")
 
+    def test_failed_general_handoff_preserves_check_targets_without_second_planner(self):
+        from loop_manager_internal.planning.planning_contracts import MAX_PLANNER_VALIDATION_RETRIES
+        ports = self._code_check_ports()
+        result = 'PLANNER_CHECK_RESULT: ' + json.dumps({
+            'outcome': 'needs_revision', 'evidence': 'changed API',
+            'reason': 'validation needs correction', 'plan_ids': ['G-001'],
+        })
+        ports.agent.results = [
+            PlanningAgentResult(0, result, 'check-session', PlanningAgentResultKind.SUCCESS),
+            PlanningAgentResult(0, 'invalid correction', 'general-session', PlanningAgentResultKind.SUCCESS),
+        ]
+        ports.agent.result = ports.agent.results[-1]
+        ports.validation.general_error = 'correction failed validation'
+        # The first validation has no correction retry; exhausted validation
+        # persists its error and the next invocation releases the slot.
+        for _ in range(MAX_PLANNER_VALIDATION_RETRIES + 1):
+            self.assertEqual(PlanningLifecycleCoordinator(ports).run(self.context).kind,
+                             PlanningOutcomeKind.VALIDATION_RETRY)
+        self.assertEqual(ports.state.snapshot.planning_error, 'correction failed validation')
+        calls = ports.agent.run_count
+        check = dict(ports.state.check_record)
+        self.assertEqual(check['stage'], 'handoff')
+        self.assertEqual(json.loads(check['result'].split(': ', 1)[1])['plan_ids'], ['G-001'])
+        ports.state.schedule_result.runnable_ready = None
+        self.assertEqual(PlanningLifecycleCoordinator(ports).run(self.context).kind,
+                         PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        self.assertEqual(PlanningLifecycleCoordinator(ports).run(self.context).kind,
+                         PlanningOutcomeKind.WAITING)
+        self.assertEqual(ports.agent.run_count, calls)
+        self.assertEqual(ports.state.check_record, check)
+        self.assertEqual(json.loads(ports.state.snapshot.planning_preserved_state)['planner_session_id'], 'general-session')
+
     def test_interrupted_general_result_after_handoff_is_not_recalled(self):
         ports = self._code_check_ports()
         ports.state.check_record = {
@@ -1466,13 +1498,50 @@ class PreservedPlanningSelectionTest(PlanningCase):
 
 
 class PlanningReleaseGitTest(unittest.TestCase):
-    def test_release_checks_shared_operations_unmerged_index_and_workspace(self):
+    def test_checkout_operation_metadata_is_preserved_and_shared_journal_still_blocks(self):
+        from tests.support.git import git_command
+        from loop_manager_internal.planning.git_ports import _PlanningGitPorts
+        from loop_manager_internal.git import manager_git_journal
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / 'repo'
+            root.mkdir()
+            git_command(root, 'init', '--initial-branch=main')
+            git_command(root, 'config', 'user.name', 'Release Test')
+            git_command(root, 'config', 'user.email', 'release@example.com')
+            (root / 'tracked').write_text('original\n', encoding='utf-8')
+            git_command(root, 'add', 'tracked')
+            git_command(root, 'commit', '-m', 'Initial')
+            worktree = Path(directory) / 'planning'
+            git_command(root, 'worktree', 'add', '--detach', str(worktree), 'HEAD')
+            state = Path(directory) / 'state'
+            effects = SimpleNamespace(git=loop_manager.git, _nul_git_paths=mock.Mock(),
+                                      _git_operation_entries=loop_manager._git_operation_entries)
+            port = _PlanningGitPorts(effects, None, root, state)
+            head = git_command(root, 'rev-parse', 'HEAD')
+            for operation in ('rebase-merge/head-name', 'BISECT_LOG'):
+                metadata = root / git_command(root, 'rev-parse', '--git-path', operation)
+                metadata.parent.mkdir(exist_ok=True)
+                metadata.write_bytes(b'user operation\n')
+                self.assertTrue(loop_manager._git_operation_entries(root))
+                port.validate_planning_release(str(root), worktree)
+                self.assertEqual(metadata.read_bytes(), b'user operation\n')
+                self.assertEqual(git_command(root, 'rev-parse', 'HEAD'), head)
+                self.assertEqual(git_command(root, 'status', '--porcelain'), '')
+            manager_git_journal.begin_rebase(
+                state, owner='plan:G-165', repo=str(root), target=str(worktree),
+                before={'head': head}, expected={'run_id': 'saved-run', 'branch': 'planning'},
+            )
+            with self.assertRaisesRegex(PlanningWorkspaceOwnershipError, '미확정 Manager Git'):
+                port.validate_planning_release(str(root), worktree)
+            self.assertEqual(metadata.read_bytes(), b'user operation\n')
+
+    def test_release_checks_managed_operations_unmerged_index_and_workspace(self):
         from loop_manager_internal.planning.git_ports import _PlanningGitPorts
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             worktree = root / 'planning'
             worktree.mkdir()
-            for failure in ('none', 'worktree-operation', 'shared-operation', 'unmerged', 'missing'):
+            for failure in ('none', 'worktree-operation', 'local-rebase', 'local-bisect', 'unmerged', 'missing', 'shared-write'):
                 with self.subTest(failure=failure):
                     effects = SimpleNamespace(
                         git=mock.Mock(side_effect=lambda _repo, *args, **_kwargs: SimpleNamespace(
@@ -1480,15 +1549,17 @@ class PlanningReleaseGitTest(unittest.TestCase):
                         _nul_git_paths=mock.Mock(),
                         _git_operation_entries=lambda path: {'operation': 'active'} if (
                             failure == 'worktree-operation' and path == worktree
-                            or failure == 'shared-operation' and path == root) else {},
+                            or failure in ('local-rebase', 'local-bisect') and path == root) else {},
                     )
                     port = _PlanningGitPorts(effects, None, root, root / 'state')
                     target = root / 'missing' if failure == 'missing' else worktree
-                    if failure == 'none':
-                        port.validate_planning_release('/repo', target)
-                    else:
-                        with self.assertRaises(PlanningWorkspaceOwnershipError):
+                    with mock.patch('loop_manager_internal.git.manager_git_journal.has_pending_project_mutation',
+                                    return_value=failure == 'shared-write'):
+                        if failure in ('none', 'local-rebase', 'local-bisect'):
                             port.validate_planning_release('/repo', target)
+                        else:
+                            with self.assertRaises(PlanningWorkspaceOwnershipError):
+                                port.validate_planning_release('/repo', target)
 
     def test_release_pending_agent_is_read_without_modifying_invocations(self):
         from loop_manager_internal.planning.state_ports import _PlanningStatePorts

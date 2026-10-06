@@ -11,7 +11,10 @@ from loop_manager_internal.runtime.contracts import WORKSPACE_RESERVED
 from loop_manager_internal.runtime.contracts import WORKSPACE_UNOWNED
 from loop_manager_internal.storage import execplan_catalog_state
 from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.storage import planner_check_state
 from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.planning.planner_check import parse_planner_check_result
+from loop_manager_internal.planning.planning_catalog import PlanningResultInvalid
 import json
 import re
 import sqlite3
@@ -249,6 +252,29 @@ class CatalogScheduleDecisionEffects:
     select_cycle_ready_execplan: Callable[..., object]
 
 
+def _unconfirmed_general_targets(
+    effects: CatalogScheduleDecisionEffects, connection: sqlite3.Connection,
+    repo: str, rows: list[sqlite3.Row],
+) -> set[str]:
+    """A failed handoff does not certify the plans flagged by its check."""
+    check = planner_check_state.get(connection, repo)
+    if check is None or check['stage'] == 'accepted':
+        return set()
+    unknown = {str(row['plan_id']) for row in rows if effects.is_unowned_ready(row)}
+    if check['stage'] in {'result', 'handoff', 'superseded'} and check['result']:
+        try:
+            decision = parse_planner_check_result(
+                check['result'], frozenset(str(row['plan_id']) for row in rows),
+            )
+        except PlanningResultInvalid:
+            return unknown
+        if decision.outcome in {'needs_revision', 'uncertain'} and decision.plan_ids:
+            return set(decision.plan_ids)
+    # Pending/invalid checks and an uncertain result without IDs give no
+    # evidence that any never-started declaration remains valid.
+    return unknown
+
+
 def catalog_schedule_decision(
     effects: CatalogScheduleDecisionEffects, connection: sqlite3.Connection,
     repo: str,
@@ -308,17 +334,18 @@ def catalog_schedule_decision(
     suspended = bool(project is not None and project["planning_preserved_state"]
                      and not runtime_state.planning_owns_execution_slot(project))
     if suspended:
+        affected = _unconfirmed_general_targets(effects, connection, repo, rows)
         if cycle.phase is maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION:
             # These goals still need validation after refactoring. An error
             # releases the mutation slot, not the target's execution gate.
-            affected = set(cycle.revalidation_plan_ids)
-            while True:
-                dependents = {str(row["plan_id"]) for row in rows
-                              if affected.intersection(json.loads(row["depends_on"]))}
-                if dependents.issubset(affected):
-                    break
-                affected.update(dependents)
-            candidates = [row for row in candidates if str(row["plan_id"]) not in affected]
+            affected.update(cycle.revalidation_plan_ids)
+        while affected:
+            dependents = {str(row["plan_id"]) for row in rows
+                          if affected.intersection(json.loads(row["depends_on"]))}
+            if dependents.issubset(affected):
+                break
+            affected.update(dependents)
+        candidates = [row for row in candidates if str(row["plan_id"]) not in affected]
         if active is None and not project_is_blocked and candidates:
             selected = min(candidates, key=lambda row: (
                 PRIORITY_ORDER[str(row["priority"])], int(str(row["plan_id"])[2:]),

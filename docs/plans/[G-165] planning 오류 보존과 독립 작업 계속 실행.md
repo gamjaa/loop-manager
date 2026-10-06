@@ -48,12 +48,16 @@ preserved planning_error가 실행 자리를 계속 점유하는 현재 gate를 
 | 경로 | 변경·유지 이유와 검증 |
 |---|---|
 | `planning/selection_service.py` preserved-error gate | 같은 입력은 신규 Planner를 호출하지 않는다. 확인된 실패 작업을 보존해 슬롯을 비운 뒤 독립 READY 선택 또는 대기를 반환한다. 활성 Worker·PR 교정은 선점하지 않는다. |
-| `planning/git_ports.py`, `planning/state_ports.py`, `git/manager_git_journal.py` | 소유권·현재 Agent 범위·미종료 호출·공유 Git operation·미해결 index·미확정 쓰기를 검사한다. prepared publication과 확인할 수 없는 workspace는 release하지 않으며 원인·결과를 보존한다. |
+| `planning/git_ports.py`, `planning/state_ports.py`, `git/manager_git_journal.py` | 소유권·현재 Agent 범위·미종료 호출·planning worktree Git operation·미해결 index·미확정 공유 쓰기를 검사한다. 기본 checkout 전용 rebase·bisect는 실행 슬롯을 점유하지 않는다. prepared publication과 확인할 수 없는 workspace는 release하지 않으며 원인·결과를 보존한다. |
 | `storage/runtime_state.py`, `storage/database.py`, `storage/execplan_catalog_state.py` | 보존과 실행 투영을 transaction으로 분리하고 catalog CAS에 보존 상태를 포함한다. 재시작·중단 rollback·Worker/PR/Merge 정리 뒤 원래 planning을 복원한다. 손상된 보존 상태나 stale snapshot은 슬롯 해제 근거가 아니다. |
-| `catalog/project_selection.py`, `application/project_runner.py` | 유지보수 오류에서도 catalog hold·dependency·PROJECT_BLOCKED·활성 실행 gate를 유지한 채 독립 READY를 순차 선택한다. post-refactor 재검증 대상과 전이 의존 계획은 목표 보존을 확정하기 전까지 선택하지 않는다. 보존된 planning 대기는 WAITING, 실제 Worker 오류는 실패로 반환하며 완료 판정은 보류한다. |
+| `catalog/project_selection.py`, `application/project_runner.py` | planning 오류에서도 catalog hold·dependency·PROJECT_BLOCKED·활성 실행 gate를 유지한 채 독립 READY를 순차 선택한다. post-refactor 재검증 대상과 일반 점검의 미확정 대상 및 전이 의존 계획은 목표 보존을 확정하기 전까지 선택하지 않는다. 보존된 planning 대기는 WAITING, 실제 Worker 오류는 실패로 반환하며 완료 판정은 보류한다. |
 | `recovery/project_block_service.py`, `storage/runtime_state.py` rebase 복구 | 별도 planning 오류의 존재만으로 독립 복구를 막던 중복 gate를 슬롯 소유 판정으로 통일한다. 미해제 planning 슬롯과 대상 계획의 기존 소유권·dependency·scope·checkpoint 검사는 유지한다. |
 
 - 관련 unit 검증은 `tests/test_planning_selection.py`, `tests/test_runtime_state.py`, `tests/test_catalog_scheduling.py`, `tests/test_manager_git_journal.py`의 변경한 class·case에 한정했다. 실행 결과 경계에서 누락된 import를 발견해 수정하고 같은 23개 case 명령을 재실행해 모두 통과했으며, 기존 session 복원 후 오류 해제를 별도 1개 case로 확인했다.
 - 기존 `scripts/verify.sh`는 프로젝트 verification runner의 test discovery를 사용하므로 이번 테스트도 포함한다. 스크립트 변경이 필요하지 않으며 전체 verify는 Manager가 수행한다.
 - Manager 진단에서 미확정 재검증 대상을 Worker로 시작하는 오류를 확인해 위 대상 gate를 추가했다. unit case는 MERGED 경유 전이 의존 계획까지 보류하고, 독립 READY 선택·planning 보존·복구 후 대상 선택 재개를 검증한다. 유지보수 fixture는 실제 cycle row를 생성하고 phase를 확인하도록 수정했다.
 - 교정한 3개 unit case가 통과했다. 같은 실패 입력에서 반환값은 안전한 보존 전이 후 WAITING이며, 기존 session·결과·피드백과 Planner 호출 횟수는 유지됨을 확인했다. 전달된 maintenance integration 실패는 로그와 원본으로 분석했으며 직접 재실행하지 않았다. 전체 경로 재검증은 Manager가 수행한다.
+- Review의 일반 planning 대상 누락은 기존 `planner_checks`의 미수용 결과를 scheduler에 연결해 수정했다. `needs_revision`·대상 ID가 있는 `uncertain`은 해당 대상과 MERGED 경유 전이 의존 계획을 보류한다. 대상 없는 불확실·미확정·손상된 점검은 미착수 READY의 유효성을 확정하지 않는다. 입력 변경·독립 실행만으로 인계·superseded 대상 보류를 해제하지 않는다. `storage/planning_input_state.py`의 일반 planning 성공 baseline transaction에서만 점검을 accepted로 확정하고 비교 revision을 갱신하며 결과·session 감사는 보존한다.
+- 기본 checkout의 operation metadata는 그 checkout의 상태로 취급한다. 관리 planning worktree의 operation·index·소유권, Agent의 공유 ref·설정 범위와 Manager Git journal 검사는 유지한다. 로컬 Git port unit case에서 사용자 rebase·bisect metadata·HEAD·index를 보존하면서 안전한 release를 허용하고 미확정 공유 쓰기는 거부함을 확인했다.
+- Review 대응 targeted unit 10개가 통과했다. 새 인계 테스트의 오류 반환·재시도 예상값을 실제 validation 소진 흐름에 맞게 수정한 뒤 동일 명령을 재실행했다. 성공 baseline과 대상 해제의 transaction rollback도 확인했다. 전체 verify와 integration 경로는 직접 실행하지 않았다.
+- Worker 결과의 추가 거부는 보고 형식에서 발생했다. `TARGETED_TESTS`의 실패 시나리오 설명이 미해결 테스트 실패로 해석됐고 실패·재실행 이력은 해당 절 밖에 있었다. 기존 parser를 수정하지 않고 이력을 같은 절에 배치해 수용됨을 확인했다. 동일 targeted 명령을 다시 실행해 10개 모두 OK·종료 코드 0을 확인했다.
