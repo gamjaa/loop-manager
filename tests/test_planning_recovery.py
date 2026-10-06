@@ -1451,5 +1451,27 @@ class PlanningConflictCorrectionUnitTests(PlanningCase):
         self.assertEqual(ports.state.snapshot.planning_error_fingerprint, "failed-input")
         self.assertEqual(ports.state.snapshot.planning_error, "original error")
         self.assertIs(ports.state.general_intent, intent)
+        self.assertEqual(ports.state.diagnostics, [ports.state.snapshot])
         ports.git.complete_planning_rebase.assert_not_called()
         self.assertEqual(ports.state.clear_calls, [])
+
+    def test_unresolved_workspace_conflict_dispatches_diagnostics_without_releasing_slot(self):
+        for original_error in (None, 'original error'):
+            with self.subTest(original_error=original_error):
+                ports = FakePorts(planning_snapshot(
+                    phase='PLANNING', active_sha='base', worktree=str(self.worktree),
+                    planning_workspace_owned=1, planner_session_id='saved-session',
+                    planning_error=original_error, planning_error_fingerprint='failed-input' if original_error else None))
+                ports.git.remote = 'target'
+                ports.git.rebase_planning_workspace = mock.Mock(return_value=SimpleNamespace(
+                    target='target', conflict=True, detail='conflict remains'))
+                coordinator = PlanningLifecycleCoordinator(ports)
+                with mock.patch('loop_manager_internal.planning.workspace_service.PlanningConflictCorrection') as boundary:
+                    boundary.return_value.resolve.return_value = False
+                    outcome = coordinator._workspace._prepare_workspace(coordinator._new_run(self.context))
+                self.assertEqual(outcome.kind, PlanningOutcomeKind.TRANSIENT_PAUSE)
+                self.assertEqual(ports.state.snapshot.planning_error, original_error)
+                self.assertEqual(ports.state.snapshot.active_sha, 'base')
+                self.assertEqual(ports.state.diagnostics, [ports.state.snapshot])
+                self.assertTrue(ports.state.snapshot.planning_error or ports.state.snapshot.planning_validation_error)
+                self.assertEqual(ports.state.clear_calls, [])

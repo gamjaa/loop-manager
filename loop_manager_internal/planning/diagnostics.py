@@ -115,6 +115,7 @@ def preserve_remote_planning_diagnostics(effects: RemotePlanningDiagnosticsEffec
     from dataclasses import replace
     from loop_manager_internal.agents.scope_contracts import GitSnapshot
     from loop_manager_internal.planning import planning_rebase
+    from loop_manager_internal.git import rebase_file_evidence
     from loop_manager_internal.recovery import blocked_checkpoint, diagnostic_preservation
     from loop_manager_internal.storage import runtime_state
     from loop_manager_internal.storage.blocked_checkpoint_state import DiagnosticPublicationRepository
@@ -182,11 +183,23 @@ def preserve_remote_planning_diagnostics(effects: RemotePlanningDiagnosticsEffec
             revisions.update(start=journal['head'], target=journal['target'])
             stash = planning_rebase._stash(effects.git, worktree, 'loop-manager-planning-rebase:' + journal['nonce'])
             if stash:
-                revisions['stash'] = stash[1]
-                revisions['staged-original'] = effects.git(worktree, 'rev-parse', stash[1] + '^2').stdout.strip()
-                untracked = effects.git(worktree, 'rev-parse', '--verify', stash[1] + '^3', check=False)
-                if untracked.returncode == 0:
-                    revisions['untracked-original'] = untracked.stdout.strip()
+                revisions.update(rebase_file_evidence.stash_originals(worktree, stash[1], effects.git))
+                if revisions['stash-base'] != journal['head']:
+                    raise RuntimeError('planning stash의 시작 commit이 관리 journal과 다릅니다.')
+            elif journal['dirty']:
+                raise RuntimeError('planning 원형의 관리 stash가 없어 완전 보존할 수 없습니다.')
+        stashed_untracked = set()
+        if revisions.get('untracked-original'):
+            stashed_untracked = set(filter(None, effects.git(worktree, 'ls-tree', '-r',
+                '--name-only', '-z', revisions['untracked-original']).stdout.split('\0')))
+        approved = GitSnapshot.deserialize(row.agent_result_snapshot).dirty if row.agent_result_snapshot else {}
+        def allowed(name):
+            if not planning_rebase._correction_path_allowed(name):
+                return False
+            state = snapshot.dirty.get(name)
+            if name in stashed_untracked or state and 'untracked' in state[0]:
+                return state is not None and approved.get(name) == state
+            return True
         source = diagnostic_preservation.PreservationSource(
             repo, 'planning', 'planning', cause_identity, branch, worktree, revisions,
             dict(phase=row.phase, evidence=diagnostic_preservation.redact_detail(str(
@@ -194,10 +207,10 @@ def preserve_remote_planning_diagnostics(effects: RemotePlanningDiagnosticsEffec
                 input_fingerprint=row.planning_attempt_fingerprint,
                 operations=sorted(snapshot.operations),
                 selection_revisions=[oid for label, oid in revisions.items()
-                                     if label not in {'base', 'target', 'untracked-original'}
+                                     if label not in {'base', 'target', 'untracked-original', 'stash-base', 'stash', 'staged-original'}
                                      and not (journal and label == 'head')],
                 untracked_revision=revisions.get('untracked-original')),
-            planning_rebase._correction_path_allowed, validate)
+            allowed, validate)
         request = blocked_checkpoint.CheckpointRequest(repo, 'planning', cause_identity,
             blocked_checkpoint.CheckpointPhase.REQUESTED, 'planning_error', '', branch, str(worktree))
         adapter = effects.adapter_factory(connection, Path(repo), state_dir, repo)

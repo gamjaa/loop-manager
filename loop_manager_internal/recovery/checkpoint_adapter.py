@@ -10,6 +10,7 @@ from loop_manager_internal.agents.agent_scope_decision import _worker_path_allow
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.documents.guidance_approval import content_hash as guidance_content_hash
 from loop_manager_internal.git import manager_git_journal
+from loop_manager_internal.git import rebase_file_evidence
 from loop_manager_internal.recovery import blocked_checkpoint
 from loop_manager_internal.recovery import project_blocked_recovery
 from loop_manager_internal.recovery import scoped_blocking
@@ -23,6 +24,7 @@ from pathlib import Path
 import json
 import hashlib
 import os
+import re
 import secrets
 import sqlite3
 import tempfile
@@ -99,8 +101,32 @@ class CheckpointSafetyAdapter:
         metadata = dict(observed.metadata or ())
         worktree = Path(request.worktree)
         snapshot = self.safety_effects.capture_git_snapshot(worktree)
+        def stash_identity():
+            current = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(request.repo, request.plan_id)
+            stash = (current.snapshot or {}).get('stash_oid') if current.operation == 'rebase' else None
+            if stash and (not isinstance(stash, str) or not re.fullmatch(r'[0-9a-fA-F]{7,64}', stash)):
+                raise RuntimeError('진단 autostash identity가 안전하지 않습니다.')
+            if metadata:
+                for directory in ('rebase-merge', 'rebase-apply'):
+                    path = self.safety_effects.git(worktree, 'rev-parse', '--git-path', directory + '/autostash')
+                    location = Path(path.stdout.strip())
+                    location = location if location.is_absolute() else worktree / location
+                    if location.is_symlink():
+                        raise RuntimeError('진단 autostash identity가 안전하지 않습니다.')
+                    if location.is_file():
+                        pending = location.read_text(encoding='ascii').strip()
+                        if not re.fullmatch(r'[0-9a-fA-F]{7,64}', pending) or stash and stash != pending:
+                            raise RuntimeError('진단 autostash identity가 일치하지 않습니다.')
+                        stash = pending
+            return stash
+        stash = stash_identity()
         revisions = dict(base=target, head=snapshot.head,
                          start=metadata.get('orig-head', snapshot.head))
+        if stash:
+            revisions.update(rebase_file_evidence.stash_originals(worktree, stash, self.safety_effects.git))
+            before = metadata.get('orig-head') or checkpoint.expected_head
+            if not before or revisions['stash-base'] != before:
+                raise RuntimeError('진단 autostash의 시작 commit이 관리 rebase와 다릅니다.')
         replay = self.safety_effects.git(worktree, 'rev-parse', '--verify', 'REBASE_HEAD^{commit}', check=False)
         if metadata and replay.returncode == 0:
             revisions['replay'] = replay.stdout.strip()
@@ -115,6 +141,10 @@ class CheckpointSafetyAdapter:
         for index, oid in enumerate(remaining):
             revisions['local-' + str(index)] = oid
         selection_revisions.extend(oid for oid in remaining if oid not in selection_revisions)
+        stashed_untracked = set()
+        if revisions.get('untracked-original'):
+            stashed_untracked = set(filter(None, self.safety_effects.git(worktree, 'ls-tree', '-r',
+                '--name-only', '-z', revisions['untracked-original']).stdout.split('\0')))
         def validate():
             current = self._plan(request)
             current_block = scoped_blocking.project_block(self.connection, request.repo) if self.project_recovery_scope else scoped_blocking.plan_block(
@@ -124,6 +154,8 @@ class CheckpointSafetyAdapter:
                     or not slot_available(self.connection, request.repo, request.plan_id)):
                 raise RuntimeError('진단 보존의 원인·소유권이 변경됐습니다.')
             observe()
+            if stash_identity() != stash:
+                raise RuntimeError('진단 수집 중 autostash identity가 변경됐습니다.')
             result = self.safety_effects.capture_git_snapshot(worktree)
             origin_error = self._origin_safety_error(request, result)
             if origin_error:
@@ -131,9 +163,10 @@ class CheckpointSafetyAdapter:
             return result
         approved = GitSnapshot.deserialize(plan['agent_result_snapshot']).dirty if plan['agent_result_snapshot'] else {}
         def allowed(name):
-            if ('untracked' in snapshot.dirty.get(name, ((), ''))[0]
-                    and approved.get(name) != snapshot.dirty.get(name)):
-                return False
+            state = snapshot.dirty.get(name)
+            if name in stashed_untracked or state and 'untracked' in state[0]:
+                if state is None or approved.get(name) != state:
+                    return False
             return bool(service.adapters.path_allowed(name))
         scope = 'project' if self.project_recovery_scope else 'plan'
         return PreservationSource(
@@ -143,7 +176,8 @@ class CheckpointSafetyAdapter:
             dict(reason=request.reason_code, evidence=redact_detail(str(block['evidence'])),
                  phase=plan['status'], operations=sorted(snapshot.operations),
                  rebase=metadata, remaining_commits=remaining,
-                 selection_base=selection_base, selection_revisions=selection_revisions), allowed, validate)
+                 selection_base=selection_base, selection_revisions=selection_revisions,
+                 untracked_revision=revisions.get('untracked-original')), allowed, validate)
 
     def _plan(self, request: blocked_checkpoint.CheckpointRequest) -> sqlite3.Row:
         if self.project_recovery_scope:

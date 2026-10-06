@@ -1444,6 +1444,28 @@ class PreservedPlanningSelectionTest(PlanningCase):
                 self.assertEqual(ports.state.snapshot, original)
                 self.assertEqual(ports.agent.run_count, 0)
 
+    def test_conflict_diagnostics_dispatch_before_release_refusal_and_keep_context(self):
+        ports = self.failed_ports()
+        original = ports.state.snapshot
+        order = []
+        preserve = ports.state.preserve_diagnostics
+        def capture(repo, row):
+            order.append('preservation')
+            preserve(repo, row)
+        def refuse(*args):
+            order.append('release')
+            raise PlanningWorkspaceOwnershipError('unresolved planning conflict')
+        ports.state.preserve_diagnostics = capture
+        ports.git.validate_planning_release = refuse
+        coordinator = PlanningLifecycleCoordinator(ports)
+        outcome = coordinator._selection._suspend_failed_planning(coordinator._new_run(self.context))
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+        self.assertEqual(order, ['preservation', 'release'])
+        self.assertEqual(ports.state.diagnostics, [original])
+        self.assertEqual(ports.state.snapshot, original)
+        self.assertEqual(ports.state.clear_calls, [])
+        self.assertEqual(ports.agent.run_count, 0)
+
     def test_active_pr_correction_keeps_slot_even_when_failed_input_changes(self):
         ports = self.failed_ports()
         PlanningLifecycleCoordinator(ports).run(self.context)

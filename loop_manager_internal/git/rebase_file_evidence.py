@@ -7,6 +7,26 @@ import stat
 import subprocess
 
 
+def stash_originals(worktree: Path, stash: str, git) -> dict[str, str]:
+    """Resolve a proven stash and its original index without applying it."""
+    def revision(expression):
+        result = git(worktree, 'rev-parse', '--verify', expression, check=False)
+        if result.returncode or not result.stdout.strip():
+            raise RuntimeError('diagnostic stash original revision unavailable')
+        return result.stdout.strip()
+    oid = revision(stash + '^{commit}')
+    revisions = {'stash': oid, 'stash-base': revision(oid + '^1'),
+                 'staged-original': revision(oid + '^2')}
+    untracked = git(worktree, 'rev-parse', '--verify', oid + '^3', check=False)
+    if untracked.returncode == 0:
+        if not untracked.stdout.strip():
+            raise RuntimeError('diagnostic stash untracked revision unavailable')
+        revisions['untracked-original'] = untracked.stdout.strip()
+    elif untracked.returncode not in (1, 128):
+        raise RuntimeError('diagnostic stash untracked revision unavailable')
+    return revisions
+
+
 def capture_originals(worktree: Path, paths: tuple[str, ...], revisions: dict,
                       git_bytes) -> tuple[dict, dict[str, bytes]]:
     """Read exact tree/index/worktree bytes without staging or resolving files.

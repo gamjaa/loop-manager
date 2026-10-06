@@ -461,6 +461,57 @@ class PreservationBoundaryTests(unittest.TestCase):
             self.assertEqual(publish.call_args.args[3].validate(), current)
             self.assertEqual(runtime.planning('repo'), expected)
 
+    def test_planning_retry_excludes_new_untracked_document_and_changed_unapproved_result(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            name, unrelated = 'docs/plans/[G-001] New.md', 'docs/plans/Unrelated.md'
+            (root / name).parent.mkdir(parents=True)
+            (root / name).write_bytes(b'approved result\n')
+            accepted = GitSnapshot('head', None, {}, {name: (('untracked',), 'approved')}, {}, {}, {}, {})
+            self.connection.execute("UPDATE projects SET phase='PLANNING', planning_error='failure', "
+                "planning_error_incident_id='incident', planning_workspace_owned=1, worktree=?, "
+                "active_sha='base', agent_result_snapshot=?", (str(root), accepted.serialize()))
+            self.connection.commit()
+            expected = runtime_state.RuntimeStateRepository(self.connection).planning('repo')
+            current = accepted
+            manifests, remotes = [], {}
+            def raw(_root, *args):
+                if 'diff' in args:
+                    return b'' if '--name-only' in args else b'approved diff'
+                if 'ls-tree' in args or 'ls-files' in args:
+                    return b''
+                raise AssertionError(args)
+            def commit(_effects, _state, _source, assets):
+                manifest = json.loads(assets['manifest.json'])
+                manifests.append(manifest)
+                self.assertNotIn(b'unrelated private notes', b''.join(assets.values()))
+                oid = hashlib.sha256(assets['manifest.json']).hexdigest()
+                return oid, oid
+            adapter = mock.Mock()
+            adapter.observe_remote.side_effect = lambda request: remotes.get(request.branch)
+            def push(_adapter, request, head):
+                remotes[request.branch] = head
+            effects = diagnostics.RemotePlanningDiagnosticsEffects(
+                lambda: preservation.PreservationEffects(lambda *args, **kwargs: result('', 1), raw, push),
+                lambda *args: adapter, lambda *args: current, mock.Mock(), mock.Mock(), mock.Mock())
+            with mock.patch.object(preservation, '_commit', side_effect=commit):
+                first = diagnostics.preserve_remote_planning_diagnostics(effects, self.connection, root, 'repo', expected)
+                self.assertEqual(first['result'], 'published', first)
+                (root / unrelated).write_bytes(b'unrelated private notes')
+                current = replace(accepted, dirty={**accepted.dirty, unrelated: (('untracked',), 'unrelated')})
+                second = diagnostics.preserve_remote_planning_diagnostics(effects, self.connection, root, 'repo', expected)
+                self.assertEqual(second['result'], 'published', second)
+                self.assertEqual(set(manifests[-1]['files']), {name})
+                self.assertIn(unrelated, manifests[-1]['omitted'])
+                self.assertFalse(manifests[-1]['complete'])
+                (root / name).write_bytes(b'changed without approved result')
+                current = replace(current, dirty={name: (('untracked',), 'changed'), unrelated: current.dirty[unrelated]})
+                third = diagnostics.preserve_remote_planning_diagnostics(effects, self.connection, root, 'repo', expected)
+                self.assertEqual(third['result'], 'published', third)
+                self.assertEqual(manifests[-1]['files'], {})
+                self.assertEqual(set(manifests[-1]['omitted']), {name, unrelated})
+            self.assertEqual(runtime_state.RuntimeStateRepository(self.connection).planning('repo'), expected)
+
     def test_same_failed_input_retries_artifacts_before_continuing_independent_work(self):
         from loop_manager_internal.planning.selection_service import PlanningSelectionService
         from loop_manager_internal.storage import maintenance_state
@@ -484,6 +535,77 @@ class PreservationBoundaryTests(unittest.TestCase):
         self.assertEqual(order, ['preservation', 'independent work'])
         ports.state.resume_planning.assert_not_called()
         self.assertEqual(runtime.planning('repo'), expected)
+
+    def test_owned_planning_conflict_preserves_stash_index_but_omits_unapproved_untracked_tree(self):
+        from loop_manager_internal.planning import planning_rebase
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / 'state'
+            name, unrelated = 'docs/plans/[G-001] Plan.md', 'docs/plans/Unrelated.md'
+            (root / name).parent.mkdir(parents=True)
+            (root / name).write_bytes(b'conflict manual bytes\n')
+            metadata = root / 'rebase-merge'
+            metadata.mkdir()
+            (metadata / 'orig-head').write_text('original')
+            (metadata / 'onto').write_text('target')
+            planning_rebase._write(planning_rebase._journal_path(state, 'repo', root),
+                dict(repo='repo', worktree=str(root.resolve()), old='base', target='target',
+                     head='original', nonce='nonce', dirty=True, phase='rebasing'))
+            current = GitSnapshot('target', None, {name: ('100644 original 1', '100644 original 2', '100644 original 3')},
+                {name: (('unstaged',), 'conflict')}, {}, {}, {}, {'rebase-merge': 'owned'})
+            self.connection.execute("UPDATE projects SET phase='PLANNING', planning_error='original error', "
+                "planning_error_incident_id='incident', planning_workspace_owned=1, worktree=?, active_sha='base'", (str(root),))
+            self.connection.commit()
+            expected = runtime_state.RuntimeStateRepository(self.connection).planning('repo')
+            stash = 'a' * 40
+            parents = {stash + '^{commit}': stash, stash + '^1': 'original', stash + '^2': 'staged', stash + '^3': 'untracked'}
+            def git(_root, *args, **kwargs):
+                if args[:2] == ('rev-parse', '--git-path'):
+                    return result(str(root / args[-1]))
+                if args[:2] == ('rev-parse', '--verify'):
+                    return result(parents[args[-1]])
+                if args[:2] == ('stash', 'list'):
+                    return result('stash@{0}\0' + stash + '\0loop-manager-planning-rebase:nonce\n')
+                if 'ls-tree' in args:
+                    return result(unrelated + '\0')
+                if 'check-ignore' in args:
+                    return result('', 1)
+                raise AssertionError(args)
+            def raw(_root, *args):
+                if 'diff' in args:
+                    return (name + '\0').encode() if '--name-only' in args else b'conflict diff'
+                if 'ls-tree' in args:
+                    if '-r' in args:
+                        return (unrelated + '\0').encode()
+                    oid = 'staged' if args[-3] == 'staged' else 'original'
+                    return f'100644 blob {oid}\t{name}\0'.encode()
+                if 'ls-files' in args:
+                    return b''.join(f'100644 original {stage}\t{name}\0'.encode() for stage in (1, 2, 3))
+                if 'cat-file' in args:
+                    return b'staged plan bytes' if args[-1] == 'staged' else b'original plan bytes'
+                raise AssertionError(args)
+            effects = diagnostics.RemotePlanningDiagnosticsEffects(
+                lambda: preservation.PreservationEffects(git, raw, mock.Mock()), mock.Mock(),
+                lambda *args: current, mock.Mock(), mock.Mock(), git)
+            def publish(material_effects, _connection, _state, source, *_args):
+                assets, manifest = preservation.collect(material_effects, source, source.validate())
+                self.assertEqual(set(manifest['files']), {name})
+                self.assertEqual(set(manifest['files'][name]['index']), {'1', '2', '3'})
+                self.assertIn(b'staged plan bytes', assets.values())
+                self.assertEqual(manifest['omitted'], {unrelated: 'outside verified scope or private path'})
+                self.assertFalse(manifest['complete'])
+                self.assertEqual(source.validate(), current)
+                return dict(result='published', complete=False)
+            with mock.patch.object(preservation, 'preserve', side_effect=publish) as publication:
+                self.assertEqual(diagnostics.preserve_remote_planning_diagnostics(
+                    effects, self.connection, state, 'repo', expected)['result'], 'published')
+                parents[stash + '^1'] = 'foreign'
+                refused = diagnostics.preserve_remote_planning_diagnostics(effects, self.connection, state, 'repo', expected)
+                self.assertEqual(refused['result'], 'local_only')
+                self.assertFalse(refused['complete'])
+                self.assertIn('시작 commit', refused['reason'])
+                self.assertEqual(publication.call_count, 1)
+            self.assertEqual(runtime_state.RuntimeStateRepository(self.connection).planning('repo'), expected)
 
     def test_notification_rendering_reports_partial_artifacts_and_original_failure(self):
         from loop_manager_internal.notifications.rendering import _message
@@ -528,6 +650,92 @@ class PreservationBoundaryTests(unittest.TestCase):
             self.connection.execute("UPDATE execplan_blocks SET evidence='new cause'")
             with self.assertRaises(RuntimeError):
                 source.validate()
+
+    def test_autostash_preserves_hidden_staged_and_unstaged_bytes_and_binds_identity(self):
+        from loop_manager_internal.recovery import checkpoint_adapter
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            meta = root / 'rebase-merge'
+            meta.mkdir()
+            stash = 'a' * 40
+            stash_file = meta / 'autostash'
+            stash_file.write_text(stash)
+            (root / 'code.py').write_bytes(b'conflict manual edit\n')
+            self.connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED', branch='branch', "
+                                    "worktree=?, active_sha='base'", (str(root),))
+            self.connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                                    "VALUES ('repo', 'G-047', 'plan', 'managed_worktree_conflict', 'conflict')")
+            self.connection.execute('CREATE TABLE IF NOT EXISTS blocked_remote_observations (repo TEXT, plan_id TEXT, branch_oid TEXT)')
+            request = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection).request(
+                repo='repo', plan_id='G-047', reason_code='managed_worktree_conflict', evidence='conflict',
+                branch='branch', worktree=str(root), expected_remote_oid=None, rebase_recovery=False)
+            snapshot = GitSnapshot('head', None, {}, {'code.py': (('unstaged',), 'conflict')}, {}, {}, {}, {'rebase-merge': 'owned'})
+            service = mock.Mock()
+            service.require_owned.return_value = (SimpleNamespace(metadata=(('orig-head', 'original'), ('onto', 'base'))), mock.Mock())
+            parents = {stash + '^{commit}': stash, stash + '^1': 'original', stash + '^2': 'staged'}
+            missing_index = False
+            def git(_root, *args, **kwargs):
+                if 'check-ignore' in args:
+                    return result('', 1)
+                if args[:2] == ('rev-parse', '--git-path'):
+                    return result(str(root / args[-1]))
+                if args[:2] == ('rev-parse', '--verify'):
+                    expression = args[-1]
+                    if expression == stash + '^3' or missing_index and expression == stash + '^2':
+                        return result('', 128)
+                    return result(parents.get(expression, 'replay'))
+                return result('original')
+            adapter = checkpoint_adapter.BlockedCheckpointAdapter(self.connection, Path('/repo'), root, 'repo',
+                safety_effects=lambda: replace(loop_manager._checkpoint_safety_effects(),
+                    current_scope_effects=lambda: SimpleNamespace(_current_rebase_service=lambda *args, **kwargs: service),
+                    capture_git_snapshot=lambda *args: snapshot, git=git,
+                    _published_plan_allows_common_plans=lambda *args: False), publication_effects=mock.Mock())
+            data = {'before': b'original\0bytes', 'index': b'staged\0bytes', 'working': b'unstaged\0bytes'}
+            def raw(_root, *args):
+                if 'diff' in args:
+                    return (b'hidden.bin\0' if args[-2:] in (('original', stash), ('original', 'staged'))
+                            else b'code.py\0') if '--name-only' in args else b'conflict diff'
+                if 'ls-tree' in args:
+                    revision, name = args[-3], args[-1]
+                    oid = 'working' if revision == stash else 'index' if revision == 'staged' else 'before'
+                    return f'100644 blob {oid}\t{name}\0'.encode()
+                if 'ls-files' in args:
+                    return b''
+                if 'cat-file' in args:
+                    return data[args[-1]]
+                raise AssertionError(args)
+            with (mock.patch('loop_manager_internal.recovery.blocked_plan_reconciliation.slot_available', return_value=True),
+                  mock.patch.object(adapter, '_origin_safety_error', return_value=None)):
+                source = adapter.diagnostic_source(request)
+                assets, manifest = preservation.collect(preservation.PreservationEffects(git, raw, mock.Mock()), source, snapshot)
+                self.assertTrue(manifest['complete'])
+                item = manifest['files']['hidden.bin']
+                self.assertTrue(item['worktree']['absent'])
+                self.assertEqual(assets['blobs/' + item['stash']['blob']], data['working'])
+                self.assertEqual(assets['blobs/' + item['staged-original']['blob']], data['index'])
+                self.assertIn('diff/stash.patch', assets)
+                self.assertIn('diff/staged-original.patch', assets)
+                self.assertEqual(source.validate(), snapshot)
+                stash_file.write_text('b' * 40)
+                with self.assertRaisesRegex(RuntimeError, 'autostash identity'):
+                    source.validate()
+                stash_file.unlink()
+                checkpoint = ExecutionCheckpointRepository(self.connection)
+                checkpoint.record('repo', 'G-047', expected_generation=0, operation='rebase',
+                    expected_head='original', target_base_oid='base', observed_remote_oid=None,
+                    snapshot={'stash_oid': stash})
+                service.require_owned.return_value = (SimpleNamespace(metadata=None), mock.Mock())
+                source = adapter.diagnostic_source(request)
+                self.assertEqual(source.revisions['stash'], stash)
+                self.assertEqual(source.revisions['staged-original'], 'staged')
+                missing_index = True
+                with self.assertRaisesRegex(RuntimeError, 'original revision unavailable'):
+                    adapter.diagnostic_source(request)
+                missing_index = False
+                parents[stash + '^1'] = 'foreign'
+                with self.assertRaisesRegex(RuntimeError, 'autostash의 시작 commit'):
+                    adapter.diagnostic_source(request)
 
     def test_composition_connects_plan_project_and_planning_preservation(self):
         with mock.patch.object(loop_manager, 'preserve_blocked_diagnostics') as preserve:

@@ -109,10 +109,15 @@ def collect(effects, source, snapshot):
     paths = set(snapshot.dirty)
     paths.update(name for name, entries in snapshot.index.items()
                  if any(entry.split()[-1] != '0' for entry in entries))
-    for revision in source.detail.get('selection_revisions', [source.revisions['head']]):
+    pairs = [(source.detail.get('selection_base', source.revisions['base']), revision)
+             for revision in source.detail.get('selection_revisions', [source.revisions['head']])]
+    if 'stash-base' in source.revisions:
+        pairs.extend((source.revisions['stash-base'], source.revisions[label])
+                     for label in ('stash', 'staged-original'))
+    for base, revision in pairs:
         raw = effects.git_bytes(source.worktree, 'diff', '--no-ext-diff', '--no-textconv',
                                 '--name-only', '--no-renames', '-z',
-                                source.detail.get('selection_base', source.revisions['base']), revision)
+                                base, revision)
         paths.update(name.decode('utf-8', 'surrogateescape') for name in raw.split(b'\0') if name)
     if source.detail.get('untracked_revision'):
         raw = effects.git_bytes(source.worktree, 'ls-tree', '-r', '--name-only', '-z', source.detail['untracked_revision'])
@@ -142,11 +147,15 @@ def collect(effects, source, snapshot):
         blobs.update(contents)
     assets = {'blobs/' + key: value for key, value in blobs.items()}
     if records:
-        for label, args in (
+        diffs = [
             ('worktree', (source.revisions['base'],)),
             ('staged', ('--cached', 'HEAD')),
             ('unstaged', ()),
-        ):
+        ]
+        if 'stash-base' in source.revisions:
+            diffs.extend((label, (source.revisions['stash-base'], source.revisions[label]))
+                         for label in ('stash', 'staged-original'))
+        for label, args in diffs:
             diff = effects.git_bytes(source.worktree, '-c', 'diff.autoRefreshIndex=false', '--literal-pathspecs', 'diff',
                                      '--no-ext-diff', '--no-textconv', '--binary',
                                      '--no-renames', *args, '--', *sorted(records))
