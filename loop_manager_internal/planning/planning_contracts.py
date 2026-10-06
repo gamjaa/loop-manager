@@ -296,6 +296,9 @@ class PlanningStatePort(Protocol):
         remote_commit: str,
     ) -> maintenance_state.MaintenanceCycle: ...
 
+    def record_maintenance_scope(self, repo: str, revision: int, plan_ids: tuple[str, ...],
+                                 prerequisite_plan_ids: tuple[str, ...] = ()) -> None: ...
+
     def file_assessment_evidence(
         self, repo: str, repository: Path, base_branch: str,
         cycle_revision: int, source_sha: str,

@@ -306,14 +306,15 @@ def select_cycle_ready_execplan(
     """Select only the current cycle's runnable READY plan, if any."""
 
     if cycle.phase is maintenance_state.MaintenancePhase.PREREQUISITE_WAIT:
-        allowed = cycle.prerequisite_plan_ids
+        allowed = cycle_scope_plan_ids(rows, cycle)
         priority_order = {"critical": 0, "high": 1, "normal": 2, "low": 3}
         order = lambda row: (
             priority_order[str(row["priority"])],
             _plan_sort_key(str(row["plan_id"])),
         )
-    elif cycle.phase is maintenance_state.MaintenancePhase.REFACTORING:
-        allowed = cycle.refactoring_plan_ids
+    elif cycle.phase in {maintenance_state.MaintenancePhase.REFACTORING,
+                         maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION}:
+        allowed = cycle_scope_plan_ids(rows, cycle)
         order = lambda row: _plan_sort_key(str(row["plan_id"]))
     else:
         return None
@@ -338,14 +339,19 @@ def cycle_plan_status_error(
 ) -> str | None:
     """Return a diagnostic when a cycle plan set cannot make safe progress."""
 
-    if cycle.phase is maintenance_state.MaintenancePhase.PREREQUISITE_WAIT:
-        plan_ids = cycle.prerequisite_plan_ids
-        label = "선행"
-    elif cycle.phase is maintenance_state.MaintenancePhase.REFACTORING:
-        plan_ids = cycle.refactoring_plan_ids
-        label = "리팩터링"
-    else:
+    legacy_prerequisites = (cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT
+                            and cycle.cycle_id is None and cycle.prerequisite_plan_ids)
+    if not legacy_prerequisites and cycle.phase not in {maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
+                           maintenance_state.MaintenancePhase.REFACTORING,
+                           maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION}:
         return None
+    try:
+        plan_ids = cycle_scope_plan_ids(rows, cycle)
+    except MaintenanceOrchestrationError as error:
+        return str(error)
+    label = "확정 범위"
+    if not plan_ids:
+        return "기존 유지보수 cycle의 확정 범위와 종료 경계를 확인할 수 없습니다."
     by_id = {str(row["plan_id"]): row for row in rows}
     for plan_id in plan_ids:
         row = by_id.get(plan_id)
@@ -355,6 +361,40 @@ def cycle_plan_status_error(
         if status not in {"READY", "MERGED", "PR_OPEN", "PLAN_BLOCKED"}:
             return f"활성 유지보수 주기의 {label} 계획 상태가 유효하지 않습니다: {plan_id} ({status})"
     return None
+
+
+def cycle_scope_plan_ids(rows, cycle) -> tuple[str, ...]:
+    """The fixed finding targets plus their required dependency closure."""
+    roots = set(cycle.prerequisite_plan_ids) | set(cycle.refactoring_plan_ids) | set(cycle.assessment_plan_ids)
+    return dependency_plan_ids(rows, roots)
+
+
+def dependency_plan_ids(rows, roots) -> tuple[str, ...]:
+    """Validate the catalog identities and acyclic closure of required targets."""
+    by_id = {str(row["plan_id"]): row for row in rows}
+    visited, visiting = set(), set()
+    def visit(plan_id):
+        if plan_id in visiting:
+            raise MaintenanceOrchestrationError(f"유지보수 dependency 순환: {plan_id}")
+        if plan_id in visited:
+            return
+        row = by_id.get(plan_id)
+        if row is None:
+            raise MaintenanceOrchestrationError(f"유지보수 확정 범위 dependency가 catalog에 없습니다: {plan_id}")
+        visiting.add(plan_id)
+        try:
+            dependencies = json.loads(str(row["depends_on"]))
+        except (ValueError, TypeError) as error:
+            raise MaintenanceOrchestrationError(f"유지보수 dependency 형식 오류: {plan_id}") from error
+        if not isinstance(dependencies, list) or any(not isinstance(item, str) for item in dependencies):
+            raise MaintenanceOrchestrationError(f"유지보수 dependency 형식 오류: {plan_id}")
+        for dependency in dependencies:
+            visit(dependency)
+        visiting.remove(plan_id)
+        visited.add(plan_id)
+    for plan_id in roots:
+        visit(plan_id)
+    return tuple(sorted(visited, key=_plan_sort_key))
 
 
 def all_cycle_plans_merged(

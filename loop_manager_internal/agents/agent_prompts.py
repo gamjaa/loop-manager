@@ -122,9 +122,10 @@ def maintenance_planner_prompt(
 현재 mode는 maintenance barrier다. 구체적인 구조 문제와 대상 책임 경계를 코드에서 확인한 경우에만 새 리팩터링 ExecPlan을 작성하라.
 각 새 계획은 사용자 동작·공개 계약·저장 형식 보존 조건, targeted unit test와 전체 verify 회귀 조건을 명시하고 독립적으로 검증·Merge 가능한 DAG로 나눠라.
 기본 priority는 normal이며 데이터 손실·보안·자동 실행 차단·반복 수동 복구의 구체적 근거가 본문에 있을 때만 상향하라.
-새 DAG의 모든 말단 ID를 다음 eligible READY 계획의 기존 depends_on 뒤에 추가하라: {targets}
+새 DAG의 모든 말단 ID를 다음 eligible READY 중 이번 DAG의 필요한 선행 dependency closure를 제외한 계획의 기존 depends_on 뒤에 추가하라: {targets}
 eligible 계획은 ID, 파일 경로, title, sources, complexity, risk, priority, 본문과 기존 depends_on을 그대로 보존하고 dependency 추가 외에는 수정하지 마라.
-현재 코드보다 먼저 필요한 기존 READY 계획이 있으면 새 파일을 만들지 말고 최소 dependency-closed 선행 plan ID 집합을 반환하라.
+필요한 기존 READY 선행 계획은 새 리팩터링 DAG의 depends_on에 연결하고, 선행 계획에는 장벽 dependency를 추가하지 마라. 기존 선행만으로 발견을 처리하면 새 파일 없이 최소 dependency-closed 선행 plan ID 집합을 반환하라.
+이번 평가에서 prerequisite·리팩터링·필요한 dependency 범위를 모두 확정하라. 선행 Merge 뒤 새 평가를 시작하거나 마지막 Merge 뒤 사후 재검증을 요구하지 마라.
 기존 비종료 계획이 같은 구조 문제를 해결하면 중복 리팩터링 계획을 만들지 마라. 파일 길이·함수 길이·변경 횟수 하나만으로 계획을 만들지 마라.
 {general_contract}
 최종 응답에는 아래 protocol 중 하나를 정확히 한 줄로 기록하라. JSON 밖의 결과 표시는 판단에 사용되지 않는다.

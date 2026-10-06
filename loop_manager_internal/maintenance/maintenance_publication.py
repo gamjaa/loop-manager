@@ -454,9 +454,11 @@ def _maintenance_publication_already_applied(
     context = result.maintenance_context
     assert context is not None
     cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
-    if context.mode is MaintenancePlanMode.BARRIER and result.refactoring_plan_ids:
+    if context.mode is MaintenancePlanMode.BARRIER and (result.refactoring_plan_ids or cycle.assessment_plan_ids or cycle.prerequisite_plan_ids):
         cycle_matches = (
-            cycle.phase is maintenance_state.MaintenancePhase.REFACTORING
+            cycle.phase is (maintenance_state.MaintenancePhase.PREREQUISITE_WAIT
+                            if cycle.prerequisite_plan_ids and not result.refactoring_plan_ids
+                            else maintenance_state.MaintenancePhase.REFACTORING)
             and cycle.revision == context.cycle_revision + 1
             and cycle.refactoring_plan_ids == result.refactoring_plan_ids
             and cycle.revalidation_plan_ids == result.revalidation_plan_ids
@@ -468,7 +470,7 @@ def _maintenance_publication_already_applied(
         cycle_matches = (
             cycle.phase is maintenance_state.MaintenancePhase.IDLE
             and cycle.revision == context.cycle_revision + 1
-            and cycle.last_success_commit == plan_commit
+            and cycle.last_cycle_commit == plan_commit
         )
     if (cycle_matches and context.mode is MaintenancePlanMode.BARRIER
         and ((cycle.file_assessment_start_merged_count is not None
@@ -652,13 +654,15 @@ def _apply_maintenance_planning_batch(
 
         if (
             context.mode is MaintenancePlanMode.BARRIER
-            and result.refactoring_plan_ids
+            and (result.refactoring_plan_ids or cycle.assessment_plan_ids or cycle.prerequisite_plan_ids)
         ):
             next_cycle = repository.transition(
                 repo,
                 expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,
                 expected_revision=context.cycle_revision,
-                next_phase=maintenance_state.MaintenancePhase.REFACTORING,
+                next_phase=(maintenance_state.MaintenancePhase.PREREQUISITE_WAIT
+                            if cycle.prerequisite_plan_ids and not result.refactoring_plan_ids
+                            else maintenance_state.MaintenancePhase.REFACTORING),
                 refactoring_plan_ids=result.refactoring_plan_ids,
                 revalidation_plan_ids=result.revalidation_plan_ids,
                 publication_stage="remote_confirmed",

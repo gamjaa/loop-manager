@@ -2,6 +2,7 @@
 from __future__ import annotations
 from pathlib import Path
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningError, MaintenancePlanningRestart
+from loop_manager_internal.maintenance.maintenance_orchestration import MaintenanceOutcome
 from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.planning.planning_service import PlanningService
 from loop_manager_internal.planning.planning_contracts import _PlanningRun, PlanningOutcome, PlanningOutcomeKind
@@ -236,12 +237,21 @@ class PlanningPublicationService(PlanningService):
                                 run.maintenance_cycle.revision, str(row.active_sha),
                                 evidence,
                             )
-                        self._ports.state.advance_success_baseline(
-                            context.repo,
-                            expected_phase=run.maintenance_cycle.phase,
-                            expected_revision=run.maintenance_cycle.revision,
-                            remote_commit=str(row.active_sha or ""),
-                        )
+                        if run.maintenance_decision is not None and run.maintenance_decision.outcome is MaintenanceOutcome.PREREQUISITES:
+                            self._ports.state.transition_maintenance(
+                                context.repo, expected_phase=run.maintenance_cycle.phase,
+                                expected_revision=run.maintenance_cycle.revision,
+                                next_phase=maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
+                                prerequisite_plan_ids=run.maintenance_decision.plan_ids,
+                                include_general_planning=False,
+                            )
+                        else:
+                            self._ports.state.advance_success_baseline(
+                                context.repo,
+                                expected_phase=run.maintenance_cycle.phase,
+                                expected_revision=run.maintenance_cycle.revision,
+                                remote_commit=str(row.active_sha or ""),
+                            )
                         self._ports.state.clear_active_in_transaction(
                             context.repo,
                             processed_sha=(

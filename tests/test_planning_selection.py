@@ -51,6 +51,60 @@ from tests.support.planning_case import (
 )
 
 class PlanningSelectionTest(PlanningCase):
+    def test_uncertain_maintenance_boundaries_preserve_diagnostics_without_activation(self):
+        for operation in ("advance_maintenance_cycle", "maintenance_due"):
+            with self.subTest(operation=operation):
+                ports = FakePorts(planning_snapshot(), maintenance_cycle())
+                ports.state.schedule_result.has_ready = True
+                setattr(ports.state, operation, mock.Mock(side_effect=
+                    maintenance_state.MaintenanceStateError("종료 경계 확인 불가")))
+                ports.state.activate_ready = mock.Mock(side_effect=AssertionError("uncertain boundary"))
+                coordinator = PlanningLifecycleCoordinator(ports)
+                outcome = coordinator._selection._select_planning_work(coordinator._new_run(
+                    replace(self.context, registered_only=True)))
+                self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+                self.assertEqual(ports.state.snapshot.planning_error, "종료 경계 확인 불가")
+                self.assertEqual(ports.state.snapshot.planning_error_fingerprint, "maintenance-cycle:idle:0")
+                self.assertEqual(ports.state.cycle.phase, maintenance_state.MaintenancePhase.IDLE)
+                ports.state.activate_ready.assert_not_called()
+
+    def test_project_safety_block_prevents_maintenance_completion_transition(self):
+        ports = FakePorts(planning_snapshot(), maintenance_cycle(
+            phase=maintenance_state.MaintenancePhase.REFACTORING, refactoring_plan_ids=("G-001",)))
+        ports.state.schedule_result.project_blocked = True
+        ports.state.advance_maintenance_cycle = mock.Mock(side_effect=AssertionError("blocked cycle must remain active"))
+        coordinator = PlanningLifecycleCoordinator(ports)
+        outcome = coordinator._selection._select_planning_work(coordinator._new_run(self.context))
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.WAITING)
+        ports.state.advance_maintenance_cycle.assert_not_called()
+
+    def test_legacy_post_revalidation_clean_slot_releases_without_new_planner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            ports = FakePorts(planning_snapshot(phase="PLANNING", active_sha="base", worktree=directory,
+                planning_workspace_owned=1, planning_attempt_fingerprint="saved"), maintenance_cycle(
+                phase=maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION, refactoring_plan_ids=("G-001",)))
+            ports.git.validate_planning_release = mock.Mock()
+            coordinator = PlanningLifecycleCoordinator(ports)
+            outcome = coordinator._selection._select_planning_work(coordinator._new_run(self.context))
+            self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+            self.assertIsNone(ports.state.snapshot.phase)
+            self.assertEqual(len(ports.state.diagnostics), 1)
+            self.assertEqual(ports.agent.run_count, 0)
+
+    def test_legacy_post_revalidation_unpublished_edits_preserve_slot_without_new_planner(self):
+        with tempfile.TemporaryDirectory() as directory:
+            original = planning_snapshot(phase="PLANNING", active_sha="base", worktree=directory,
+                planning_workspace_owned=1, planning_attempt_fingerprint="saved")
+            ports = FakePorts(original, maintenance_cycle(
+                phase=maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION, refactoring_plan_ids=("G-001",)))
+            ports.git.validate_planning_release = mock.Mock()
+            ports.git.dirty_files = ["docs/plans/[G-002] Preserved.md"]
+            coordinator = PlanningLifecycleCoordinator(ports)
+            outcome = coordinator._selection._select_planning_work(coordinator._new_run(self.context))
+            self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+            self.assertEqual(ports.state.snapshot, original)
+            self.assertEqual(ports.agent.run_count, 0)
+
     def test_outstanding_requirement_work_adds_no_retirement_model_call(self):
         ports = FakePorts(planning_snapshot(
             processed_sha="base", planning_fingerprint="fingerprint",

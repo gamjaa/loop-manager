@@ -2,10 +2,10 @@
 from __future__ import annotations
 from pathlib import Path
 import subprocess
-from loop_manager_internal.maintenance.maintenance_orchestration import assessment_can_yield, maintenance_planning_fingerprint
+from loop_manager_internal.maintenance.maintenance_orchestration import maintenance_planning_fingerprint
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningError
 from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventoryError
-from loop_manager_internal.storage import maintenance_state, maintenance_file_ledger, runtime_state
+from loop_manager_internal.storage import maintenance_state, runtime_state
 from loop_manager_internal.storage.planner_check_state import target_fingerprint
 from loop_manager_internal.planning.planning_catalog import PlanningResultInvalid
 from loop_manager_internal.planning.planner_check import parse_planner_check_result
@@ -17,6 +17,15 @@ from loop_manager_internal.planning.planning_contracts import (
 )
 
 class PlanningSelectionService(PlanningService):
+    def _maintenance_error(self, run: _PlanningRun, error: RuntimeError) -> PlanningOutcome:
+        cycle = run.maintenance_cycle
+        message = str(error)
+        self._ports.state.update(run.context.repo, planning_error=message,
+            planning_error_fingerprint=f"maintenance-cycle:{cycle.phase.value}:{cycle.revision}",
+            last_error=message)
+        self._ports.events.error(message)
+        return self._operational_error()
+
     def _plan_declarations_match(
         self, context: PlanningContext, base_sha: str,
     ) -> bool:
@@ -203,53 +212,39 @@ class PlanningSelectionService(PlanningService):
         context = run.context
         row = run.row
         cycle = run.maintenance_cycle
-        if (
-            row.phase == "PLANNING"
-            and assessment_can_yield(cycle)
-            and not hasattr(self._ports, "tiered")
-            and not row.planning_error
-            and not row.planning_validation_error
-            and self._ports.state.general_publication(context.repo) is None
-        ):
-            decision = self._ports.state.schedule(context.repo)
-            if (decision.runnable_ready is not None
-                and getattr(decision, "active", None) is None
-                and not getattr(decision, "project_blocked", False)):
-                worktree = Path(str(row.worktree or ""))
-                self._ports.git.validate_worktree_ownership(
-                    context.repo, str(row.planning_attempt_fingerprint or ""), worktree,
-                )
-                clean = not self._ports.git.run(worktree, "status", "--porcelain").stdout.strip()
-                head = self._ports.git.run(worktree, "rev-parse", "HEAD").stdout.strip()
-                if clean and head == row.active_sha:
-                    self._ports.state.preserve_diagnostics(context.repo, row)
-                    with self._ports.state.transaction():
-                        if worktree.exists():
-                            self._ports.git.run(context.repo_path, "worktree", "remove", str(worktree))
-                        self._ports.state.clear_active_in_transaction(
-                            context.repo,
-                            processed_sha=row.processed_sha,
-                            specification_fingerprint=row.specification_fingerprint,
-                            planning_fingerprint=row.planning_fingerprint,
-                        )
-                    return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        if (row.phase == "PLANNING" and cycle.phase is maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION
+                and cycle.publication_stage != "prepared" and not row.planning_result_completed):
+            worktree = Path(str(row.worktree or ""))
+            try:
+                self._ports.git.validate_worktree_ownership(context.repo, str(row.planning_attempt_fingerprint or ""), worktree)
+                self._ports.git.validate_planning_release(context.repo, worktree)
+                if self._ports.git.changed_files(worktree) or self._ports.git.run(worktree, "rev-parse", "HEAD").stdout.strip() != row.active_sha:
+                    raise MaintenancePlanningError("기존 사후 재검증의 미확정 작성 결과를 보존해 게시 복구가 필요합니다.")
+                if row.agent_snapshot:
+                    scope = self._ports.agent.validate_saved_scope("maintenance_planner", worktree, row.agent_snapshot)
+                    if scope.error:
+                        raise MaintenancePlanningError(scope.error)
+                self._ports.state.preserve_diagnostics(context.repo, row)
+                self._ports.git.run(context.repo_path, "worktree", "remove", str(worktree))
+                self._ports.state.clear_active(context.repo)
+            except RuntimeError as error:
+                self._ports.events.error(str(error))
+                return self._operational_error()
+            return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART)
         if row.phase:
             return None
+        if getattr(self._ports.state.schedule(context.repo), "project_blocked", False):
+            self._ports.events.info("PROJECT_BLOCKED 해제 전에는 유지보수 종료나 새 작업을 시작하지 않습니다.")
+            return PlanningOutcome(PlanningOutcomeKind.WAITING)
+        previous_phase = cycle.phase
         try:
             cycle = self._ports.state.advance_maintenance_cycle(
                 context.repo, run.base_sha
             )
-        except MaintenancePlanningError as error:
-            message = str(error)
-            fingerprint = f"maintenance-cycle:{cycle.phase.value}:{cycle.revision}"
-            self._ports.state.update(
-                context.repo,
-                planning_error=message,
-                planning_error_fingerprint=fingerprint,
-                last_error=message,
-            )
-            self._ports.events.error(message)
-            return self._operational_error()
+        except (MaintenancePlanningError, maintenance_state.MaintenanceStateError) as error:
+            return self._maintenance_error(run, error)
+        if previous_phase is not maintenance_state.MaintenancePhase.IDLE and cycle.phase is maintenance_state.MaintenancePhase.IDLE:
+            self._ports.events.log(f"유지보수 마지막 Merge 확인·cycle 종료: 다음 주기 기준={cycle.last_cycle_merged_count}, 일반 작업으로 복귀합니다.")
         if run.error_input_changed:
             run.maintenance_planning = cycle.phase in {
                 maintenance_state.MaintenancePhase.ASSESSMENT,
@@ -262,9 +257,9 @@ class PlanningSelectionService(PlanningService):
         if getattr(decision, "project_blocked", False):
             self._ports.events.info("PROJECT_BLOCKED 해제 전에는 새 점검이나 작업을 시작하지 않습니다.")
             return PlanningOutcome(PlanningOutcomeKind.WAITING)
-        waiting_for_pr = decision.has_waiting
-        if hasattr(self._ports, "tiered"):
-            waiting_for_pr = any(str(item["status"]) == "PR_OPEN" for item in self._ports.state.execplan_rows(context.repo))
+        waiting_for_pr = any(str(item["status"]) == "PR_OPEN" for item in self._ports.state.execplan_rows(context.repo))
+        if context.registered_only and waiting_for_pr and cycle.phase is maintenance_state.MaintenancePhase.IDLE:
+            self._ports.events.log("실제 Open PR 대기: 새 due 유지보수는 PR 동기화·종료 확인 뒤 선택합니다.")
         approval_pending = (
             context.self_repository
             and cycle.phase is maintenance_state.MaintenancePhase.IDLE
@@ -278,87 +273,29 @@ class PlanningSelectionService(PlanningService):
             and not waiting_for_pr
             and not approval_pending
         ):
-            completion_candidate = bool(
-                not decision.has_ready and not decision.has_waiting
-                and getattr(decision, "active", None) is None
-                and not getattr(decision, "project_blocked", False)
-                and row.planning_fingerprint
-            )
-            if completion_candidate:
-                run.general_fingerprint = self._ports.git.input_fingerprint(
-                    context.repo_path, run.base_sha,
-                )
-                run.specification_fingerprint = self._ports.git.specification_fingerprint(
-                    context.repo_path, run.base_sha,
-                )
-                completion_candidate = not (
-                    self._general_planning_required(
-                        row, context, run.base_sha, run.general_fingerprint,
-                    ) or self._specification_planning_required(
-                        row, context, run.base_sha,
-                        run.specification_fingerprint, run.general_fingerprint,
-                    )
-                )
             tiered_selection = None
+            try:
+                due = self._ports.state.maintenance_due(
+                    context.repo, context.refactoring_review_interval,
+                    self_repository=context.self_repository,
+                )
+            except maintenance_state.MaintenanceStateError as error:
+                return self._maintenance_error(run, error)
             if hasattr(self._ports, "tiered"):
                 try:
-                    tiered_selection = self._ports.tiered.select(context, run.base_sha)
-                    self._ports.events.log(
-                        f"유지보수 정적 분석: {len(tiered_selection.index.records)}파일, "
-                        f"갱신 {tiered_selection.index.parsed}, 재사용 {tiered_selection.index.reused}, "
-                        f"선택 {tiered_selection.mode}, 이유={','.join(tiered_selection.reasons)}")
+                    due = self._ports.tiered.due(context)
+                    if due.required:
+                        tiered_selection = self._ports.tiered.select(context, run.base_sha)
+                        self._ports.events.log(
+                            f"유지보수 평가 시작: 이유={due.reason}, 정적={len(tiered_selection.index.records)}파일, "
+                            f"범위={tiered_selection.mode}, interval={context.refactoring_review_interval}")
+                    else:
+                        self._ports.events.log(f"유지보수 다음 주기 대기: 이유={due.reason}, Merge={due.merged_since_baseline}/{context.refactoring_review_interval}")
+                except maintenance_state.MaintenanceStateError as error:
+                    return self._maintenance_error(run, error)
                 except (SourceInventoryError, ValueError, OSError) as error:
                     self._ports.events.error(str(error))
                     return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART, detail=str(error), error=True)
-            due = (maintenance_state.ReviewDue(tiered_selection.required,
-                tiered_selection.mode, 0, cycle.phase) if tiered_selection is not None else self._ports.state.maintenance_due(
-                context.repo, context.refactoring_review_interval,
-                self_repository=context.self_repository,
-                completion_candidate=completion_candidate,
-            ))
-            if due.reason == "stabilization_due" and hasattr(
-                self._ports, "file_review"
-            ):
-                try:
-                    empty_inventory = self._ports.file_review.empty_selection_inventory(
-                        context.repo, context.repo_path, context.base_branch,
-                        run.base_sha,
-                    )
-                except (
-                    SourceInventoryError,
-                    maintenance_file_ledger.FileReviewLedgerError,
-                ) as error:
-                    self._ports.events.error(str(error))
-                    return PlanningOutcome(
-                        PlanningOutcomeKind.REMOTE_BASE_RESTART,
-                        detail=str(error),
-                        error=True,
-                    )
-                if empty_inventory is not None:
-                    try:
-                        cycle = self._ports.state.settle_empty_stabilization_assessment(
-                            context.repo,
-                            context.refactoring_review_interval,
-                            source_sha=run.base_sha,
-                            repository_path=str(context.repo_path),
-                            base_branch=context.base_branch,
-                            inventory=empty_inventory,
-                        )
-                    except (
-                        maintenance_state.MaintenanceStateError,
-                        maintenance_file_ledger.FileReviewLedgerError,
-                        SourceInventoryError,
-                    ) as error:
-                        self._ports.events.error(str(error))
-                        return PlanningOutcome(
-                            PlanningOutcomeKind.REMOTE_BASE_RESTART,
-                            detail=str(error),
-                            error=True,
-                        )
-                    due = maintenance_state.ReviewDue(
-                        False, "no_selected_files", due.merged_since_baseline,
-                        cycle.phase,
-                    )
             if due.required:
                 include_general = False
                 if not decision.has_ready and tiered_selection is None:
@@ -374,24 +311,8 @@ class PlanningSelectionService(PlanningService):
                     run.base_sha,
                     include_general_planning=include_general,
                     self_repository=context.self_repository,
-                    completion_candidate=completion_candidate,
                     **({"due_override": due} if tiered_selection is not None else {}),
                 )
-        if assessment_can_yield(cycle) and not hasattr(self._ports, "tiered"):
-            decision = self._ports.state.schedule(context.repo)
-            if (
-                decision.runnable_ready is not None
-                and getattr(decision, "active", None) is None
-                and not getattr(decision, "project_blocked", False)
-            ):
-                latest_sha = self._fetch_remote_head(context)
-                if latest_sha != run.base_sha:
-                    return self._restart_for_new_input()
-                selected = self._ports.state.activate_ready(context.repo, latest_sha)
-                if selected is None:
-                    return PlanningOutcome(PlanningOutcomeKind.WAITING)
-                self._ports.events.info("기존 READY 실행을 재개하고 미게시 유지보수 평가를 보류합니다.")
-                return PlanningOutcome(PlanningOutcomeKind.EXECUTION_READY)
         if (
             waiting_for_pr
             and cycle.phase
@@ -402,17 +323,14 @@ class PlanningSelectionService(PlanningService):
         ):
             self._ports.events.info(
                 "Merge 대기 PR 종료 전 유지보수 평가를 보류합니다."
-                if hasattr(self._ports, "tiered") else "PLAN_BLOCKED 또는 PR_OPEN 종료 전 유지보수 평가를 보류합니다."
             )
             return PlanningOutcome(PlanningOutcomeKind.WAITING)
-        if cycle.phase in {
-            maintenance_state.MaintenancePhase.ASSESSMENT,
-            maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
-        }:
+        if cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT:
             run.maintenance_planning = True
         elif cycle.phase in {
             maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
             maintenance_state.MaintenancePhase.REFACTORING,
+            maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
         }:
             decision = self._ports.state.schedule(context.repo)
             if decision.runnable_ready is None:

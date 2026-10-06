@@ -189,11 +189,12 @@ class TieredReviewRepository:
             selected = tuple(index.records)
         return Selection(True, "targeted", tuple(sorted(reasons)), selected, index, roots, merged_count)
 
-    def prepare(self, repo, cycle, selection: Selection):
+    def prepare(self, repo, cycle, selection: Selection, *, cycle_id=None, review_mode=None):
         value = {"version": 1, "mode": selection.mode, "reasons": list(selection.reasons),
             "records": selection.index.records, "roots": list(selection.roots), "paths": list(selection.paths),
             "merged_count": selection.merged_count, "request_id": selection.request_id,
-            "source_revision": selection.index.revision, "cycle": cycle}
+            "source_revision": selection.index.revision, "cycle": cycle, "cycle_id": cycle_id,
+            "review_mode": review_mode or selection.mode}
         value["digest"] = digest(value)
         row = self.connection.execute("SELECT cycle, source_revision, digest, assessment_json FROM tiered_maintenance_assessments "
                                       "WHERE repo = ?", (repo,)).fetchone()
@@ -210,6 +211,10 @@ class TieredReviewRepository:
     def active(self, repo, cycle, revision):
         row = self.connection.execute("SELECT assessment_json FROM tiered_maintenance_assessments WHERE repo = ? "
                                       "AND cycle = ? AND source_revision = ?", (repo, cycle, revision)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def latest(self, repo):
+        row = self.connection.execute("SELECT assessment_json FROM tiered_maintenance_assessments WHERE repo = ?", (repo,)).fetchone()
         return json.loads(row[0]) if row else None
 
     def units(self, assessment):
@@ -236,7 +241,8 @@ class TieredReviewRepository:
             batch.append(part)
         if batch:
             batches.append(batch)
-        epoch = {"mode": assessment["mode"], "full_merge": assessment["merged_count"] if assessment["mode"] == "full" else None,
+        review_mode = assessment.get("review_mode", assessment["mode"])
+        epoch = {"mode": review_mode, "full_merge": assessment["merged_count"] if review_mode == "full" else None,
                  "request": assessment["request_id"], "roots": assessment["roots"], "version": code_index.VERSION}
         return tuple({"digest": digest({"parts": parts, "epoch": epoch}), "parts": parts} for parts in batches)
 

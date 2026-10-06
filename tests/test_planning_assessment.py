@@ -41,6 +41,50 @@ from tests.support.planning_case import (
 )
 
 class PlanningAssessmentTest(PlanningCase):
+    def test_legacy_prerequisites_finish_assessment_evidence_before_waiting_for_merge(self):
+        source = "a" * 40
+        report = {"source_revision": source,
+            "coverage": {key: "Reviewed the original responsibility boundary." for key in ("code", "tests", "documents")},
+            "findings": [{"id": "existing-boundary", "kind": "code", "path": "module.py", "source_hash": "hash",
+                "evidence": "The existing required plan implements the reviewed boundary.", "status": "existing_plan", "plan_ids": ["G-001"]}]}
+        result = 'MAINTENANCE_RESULT: {"outcome":"prerequisites","plan_ids":["G-001"]}\nFULL_ASSESSMENT_RESULT: ' + json.dumps(report)
+        ports = FakePorts(planning_snapshot(phase="PLANNING", active_sha=source, planning_result_completed=True,
+            planning_result=result), maintenance_cycle(phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                cycle_base_sha=source, revision=1))
+        plan = {"plan_id": "G-001", "status": "READY", "depends_on": "[]", "workspace_owned": 0, "pr_conflict_recovery": 0}
+        plan.update({key: None for key in ("branch", "worktree", "worker_session_id", "reviewer_session_id",
+            "pr_url", "pr_head_oid", "pr_conflict_head_oid", "pr_conflict_base_oid")})
+        ports.state.execplan_rows = lambda _repo: [plan]
+        ports.state.record_full_assessment = mock.Mock(return_value=ports.state.cycle)
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(replace(self.context, self_repository=True))
+        run.planning_worktree = Path("/planning")
+        run.maintenance_context = SimpleNamespace(active_sha=source)
+        run.dirty_files = []
+        with mock.patch("loop_manager_internal.planning.assessment_port.maintenance_file_inventory.source_inventory",
+                return_value={"module.py": "hash"}):
+            self.assertIsNone(coordinator._assessment._validate_planner_result(run))
+        ports.state.record_full_assessment.assert_called_once()
+        self.assertEqual(ports.state.cycle.assessment_plan_ids, ("G-001",))
+        self.assertEqual(ports.agent.run_count, 0)
+
+    def test_existing_legacy_finding_targets_are_saved_in_fixed_cycle_scope(self):
+        ports = FakePorts(planning_snapshot(phase="PLANNING", active_sha="base",
+            planning_result_completed=True, planning_result='MAINTENANCE_RESULT: {"outcome":"no_change"}'),
+            maintenance_cycle(phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                cycle_base_sha="base", file_assessment_start_merged_count=0, revision=1))
+        ports.reconciliation = SimpleNamespace(validate=mock.Mock(return_value={
+            "findings": [{"status": "existing_plan", "plan_id": "G-001"}]}))
+        ports.validation.validate_maintenance_result = mock.Mock(return_value=None)
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(replace(self.context, self_repository=False))
+        run.planning_worktree = Path("/planning")
+        run.maintenance_context = SimpleNamespace(active_sha="base")
+        run.dirty_files = []
+        self.assertIsNone(coordinator._assessment._validate_planner_result(run))
+        self.assertEqual(ports.state.cycle.assessment_plan_ids, ("G-001",))
+        self.assertEqual(ports.agent.run_count, 0)
+
     def test_saved_snapshot_rejects_malformed_collections(self):
         original = {
             "plan_id": "G-001", "path": "docs/plans/[G-001] Plan.md",
@@ -118,7 +162,7 @@ class PlanningAssessmentTest(PlanningCase):
         ports.assessment.validate.assert_called_once()
         self.assertIn("invalid report", ports.state.snapshot.planning_validation_error)
 
-    def test_assessment_resume_restarts_selection_if_remote_base_changes(self):
+    def test_assessment_keeps_selection_slot_until_input_reconciliation(self):
         ports = FakePorts(planning_snapshot(), maintenance_cycle(
             phase=maintenance_state.MaintenancePhase.ASSESSMENT, cycle_base_sha="base",
         ))
@@ -127,11 +171,11 @@ class PlanningAssessmentTest(PlanningCase):
         ports.git.remote = "new-base"
         coordinator = PlanningLifecycleCoordinator(ports)
         outcome = coordinator._selection._select_planning_work(coordinator._new_run(self.context))
-        self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+        self.assertIsNone(outcome)
         ports.state.activate_ready.assert_not_called()
         self.assertEqual(ports.state.updates, [])
 
-    def test_due_and_unpublished_assessment_yield_without_advancing_success(self):
+    def test_due_and_unpublished_assessment_keep_priority_without_advancing_success(self):
         for phase in (maintenance_state.MaintenancePhase.IDLE,
                       maintenance_state.MaintenancePhase.ASSESSMENT):
             with self.subTest(phase=phase):
@@ -146,11 +190,12 @@ class PlanningAssessmentTest(PlanningCase):
                 run = coordinator._new_run(replace(self.context, registered_only=True))
                 run.base_sha = "base"
                 outcome = coordinator._selection._select_planning_work(run)
-                self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
+                self.assertIsNone(outcome)
+                self.assertTrue(run.maintenance_planning)
                 self.assertEqual(ports.state.cycle.last_success_merged_count, 5)
                 self.assertEqual(ports.state.cycle.last_success_file_assessment_merged_count, 5)
                 self.assertEqual(ports.state.updates, [])
-                self.assertEqual(ports.state.snapshot.phase, "WORKING")
+                self.assertIsNone(ports.state.snapshot.phase)
 
     def test_assessment_reconciles_one_relation_before_final_planner(self):
         left_content = b"def calculate(): return helper()\n"

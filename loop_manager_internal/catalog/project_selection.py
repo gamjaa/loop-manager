@@ -361,6 +361,7 @@ def catalog_schedule_decision(
     elif active is None and not project_is_blocked and cycle.phase in {
         maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
         maintenance_state.MaintenancePhase.REFACTORING,
+        maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
     }:
         selected = effects.select_cycle_ready_execplan(execution_rows, cycle)
     elif active is None and not project_is_blocked and effects.assessment_can_yield(cycle):

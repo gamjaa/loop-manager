@@ -189,6 +189,12 @@ class PlanningRecoveryTest(PlanningCase):
                     self.assertIsNone(coordinator._workspace._prepare_workspace(run))
                     self.assertEqual(len(ports.state.diagnostics), diagnostic_count)
                     ports.git.relevant_document_changes.assert_called_once()
+                    if maintenance and recheck:
+                        outcome = coordinator._assessment._run_planner_turn(run)
+                        self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+                        self.assertEqual(ports.agent.run_count, 0)
+                        self.assertEqual(ports.state.snapshot.planning_error, error)
+                        continue
                     self.assertIsNone(coordinator._assessment._run_planner_turn(run))
                     self.assertEqual(ports.agent.run_count, int(recheck))
                     if recheck:
@@ -345,7 +351,7 @@ class PlanningRecoveryTest(PlanningCase):
         self.assertIsNone(coordinator._assessment._validate_planner_result(run))
         self.assertIsNone(ports.state.snapshot.planning_error)
 
-    def test_saved_unsafe_rechecks_changed_target_and_releases_only_linked_error(self):
+    def test_saved_unsafe_target_change_preserves_error_without_new_post_planner(self):
         original_result = 'MAINTENANCE_RESULT: {"outcome":"unsafe","reason":"old evidence"}'
         revised_result = 'MAINTENANCE_RESULT: {"outcome":"revalidated"}'
         old_error = "post-refactor revalidation이 제품 목표 보존을 확정하지 못했습니다: old evidence"
@@ -388,18 +394,12 @@ class PlanningRecoveryTest(PlanningCase):
                 run = coordinator._new_run(self.context)  # restart after base adoption
                 self.assertIsNone(coordinator._workspace._prepare_workspace(run))
                 ports.git.relevant_document_changes.assert_called_once()
-                self.assertIsNone(coordinator._assessment._run_planner_turn(run))
-                self.assertEqual(ports.agent.resumed_session, "saved-session")
-                if linked:
-                    ports.git.remote = "later-base"
-                    stale = coordinator._assessment._validate_planner_result(run)
-                    self.assertEqual(stale.kind,
-                                     PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED)
-                    self.assertEqual(ports.state.snapshot.planning_error, old_error)
-                    ports.git.remote = "new-base"
-                self.assertIsNone(coordinator._assessment._validate_planner_result(run))
+                outcome = coordinator._assessment._run_planner_turn(run)
+                self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+                self.assertEqual(ports.agent.run_count, 0)
                 self.assertEqual(ports.state.snapshot.planning_error,
-                                 None if linked else "independent error")
+                                 old_error if linked else "independent error")
+                self.assertEqual(ports.state.diagnostics[-1].planning_result, original_result)
 
     def test_unrelated_advance_does_not_schedule_completed_unsafe_again(self):
         result = 'MAINTENANCE_RESULT: {"outcome":"unsafe","reason":"old evidence"}'

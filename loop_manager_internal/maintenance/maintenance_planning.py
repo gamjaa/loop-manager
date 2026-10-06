@@ -435,8 +435,8 @@ def assessment_prompt(
         "중복과 변경 충돌을 검토하라. 생성물·의존성·archive를 제외하라. "
         "기존 비종료 계획과 대조해 새 리팩터링 계획을 중복 생성하지 마라. "
         "문서 원본과 AGENTS.md를 바꾸지 말고 문서 후보와 정책 결정 대상을 구분하라. "
-        "선행 READY 계획 실행이 필요해 prerequisites 결과를 반환하면 평가를 재개할 때 "
-        "최종 전수 평가 결과를 작성하라. "
+        "선행 READY·리팩터링과 필요한 dependency를 이번 평가에서 확정하고 최종 전수 평가 결과를 "
+        "함께 작성하라. 선행 Merge 뒤 새 평가를 요구하지 마라. "
         "코드·테스트·문서 각각의 평가 근거와 발견을 최종 응답에 JSON 한 줄로 기록하라. "
         "형식: FULL_ASSESSMENT_RESULT: "
         '{"source_revision":"<SHA>","coverage":{"code":"<근거>",'

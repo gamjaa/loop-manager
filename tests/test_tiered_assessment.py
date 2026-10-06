@@ -10,7 +10,7 @@ from loop_manager_internal.maintenance import code_index, maintenance_file_revie
 from loop_manager_internal.maintenance.tiered_ports import TieredMaintenancePort
 from loop_manager_internal.planning import tiered_assessment
 from loop_manager_internal.planning.planning_runtime import PlanningAgentResult, PlanningAgentResultKind, PlanningLifecycleCoordinator, PlanningOutcomeKind
-from loop_manager_internal.storage.maintenance_state import MaintenancePhase
+from loop_manager_internal.storage.maintenance_state import MaintenancePhase, ReviewDue
 from loop_manager_internal.storage import maintenance_file_ledger
 from tests.support.planning_case import PlanningCase, FakePorts, planning_snapshot, maintenance_cycle
 from tests.support.maintenance import inventory
@@ -42,6 +42,7 @@ class TieredAssessmentTest(PlanningCase):
         self.ports.tiered.content = lambda _repo, _sha, path: self.contents[path]
         self.ports.tiered.select = mock.Mock(return_value=tiered_review.Selection(
             True, "full", ("initial_full",), tuple(self.contents), self.index, (), 0))
+        self.ports.tiered.due = mock.Mock(return_value=ReviewDue(True, "initial_full", 0, MaintenancePhase.IDLE))
         self.ports.validation.validate_maintenance_result = mock.Mock(return_value=None)
         self.coordinator = PlanningLifecycleCoordinator(self.ports)
         self.run = self.coordinator._new_run(self.context)
@@ -153,6 +154,77 @@ class TieredAssessmentTest(PlanningCase):
         self.run.row = self.ports.state.snapshot
         self.assertEqual(self.coordinator._selection._activate_next_execplan(self.run).kind,
                          PlanningOutcomeKind.MAINTENANCE_COMPLETE)
+
+    def test_interval_pending_skips_static_assessment_even_with_changed_code_and_completion_candidate(self):
+        self.ports.state.snapshot = planning_snapshot(processed_sha=self.sha,
+            planning_fingerprint="fingerprint", specification_fingerprint="specification")
+        self.ports.state.cycle = maintenance_cycle(last_cycle_merged_count=5)
+        self.ports.tiered.due.return_value = ReviewDue(False, "interval_pending", 19, MaintenancePhase.IDLE)
+        context = replace(self.context, registered_only=True, base_sha=self.sha)
+        run = self.coordinator._new_run(context)
+        self.coordinator._selection._select_planning_work(run)
+        self.ports.tiered.select.assert_not_called()
+        self.assertEqual(self.ports.state.maintenance_begin_count, 0)
+        self.assertFalse(run.maintenance_planning)
+        self.assertEqual(self.ports.agent.run_count, 0)
+
+    def test_source_drift_resumes_original_scope_and_request_without_exploring_new_module(self):
+        self.model()
+        self.assertEqual(self.turn().kind, PlanningOutcomeKind.ASSESSMENT_PROGRESS)
+        self.contents["src/a.py"] = b"def calculate(value):\n    return value + 2\n"
+        self.contents["src/c.py"] = b"def same_module():\n    return 4\n"
+        self.contents["unrelated/new.py"] = b"def independent():\n    return 3\n"
+        revision = "b" * 40
+        index = code_index.build_index(self.connection, "/repo:remote", inventory(self.contents, revision),
+            lambda source: self.contents[source.path])
+        self.ports.tiered.select.return_value = tiered_review.Selection(
+            True, "full", ("requested_full",), tuple(self.contents), index, (), 0, "new-request")
+        self.run.row = replace(self.run.row, active_sha=revision)
+        self.run.maintenance_cycle = replace(self.run.maintenance_cycle, revision=2)
+        resumed = self.ports.tiered.prepare(self.run)
+        self.assertNotIn("unrelated/new.py", resumed["paths"])
+        self.assertIn("src/c.py", resumed["paths"])
+        self.assertIsNone(resumed["request_id"])
+        self.assertEqual(resumed["reasons"], ["resume_related_scope"])
+        self.assertEqual(resumed["mode"], "targeted")
+        self.assertIsNone(self.ports.tiered.repository.success("/repo"))
+
+    def test_unrelated_source_drift_reuses_receipts_without_claiming_current_full_review(self):
+        self.model()
+        self.turn()
+        self.contents["unrelated/new.py"] = b"def independent():\n    return 3\n"
+        revision = "b" * 40
+        index = code_index.build_index(self.connection, "/repo:remote", inventory(self.contents, revision),
+            lambda source: self.contents[source.path])
+        self.ports.tiered.select.return_value = tiered_review.Selection(
+            True, "full", ("initial_full",), tuple(self.contents), index, (), 0)
+        self.run.row = replace(self.run.row, active_sha=revision)
+        self.run.maintenance_cycle = replace(self.run.maintenance_cycle, revision=2)
+        assessment = self.ports.tiered.prepare(self.run)
+        self.assertIsNone(self.ports.tiered.repository.pending("/repo", assessment))
+        evidence = self.ports.tiered.repository.evidence("/repo", 2, revision)
+        self.ports.tiered.repository.promote("/repo", evidence)
+        success = self.ports.tiered.repository.success("/repo")
+        self.assertIsNone(success["full_source_revision"])
+        self.assertIsNone(success["full_merged_count"])
+        self.assertEqual(self.ports.agent.run_count, 1)
+
+    def test_rejected_and_existing_findings_need_dispositions_and_keep_existing_scope(self):
+        from loop_manager_internal.maintenance.maintenance_orchestration import MaintenancePlannerDecision, MaintenanceOutcome
+        finding = {"path": "src/a.py", "excerpt": "def calculate(value):",
+                   "reason": "This boundary is handled by an existing declared plan."}
+        self.model(findings=[finding])
+        self.turn()
+        plan_dir = self.run.planning_worktree / "docs/plans"
+        plan_dir.mkdir(parents=True)
+        (plan_dir / "[G-001] Existing.md").write_text("Implementation references src/a.py", encoding="utf-8")
+        self.connection.execute("INSERT INTO exec_plans VALUES ('/repo', 'G-001', 'READY', 'docs/plans/[G-001] Existing.md')")
+        decision = MaintenancePlannerDecision(MaintenanceOutcome.NO_CHANGE)
+        for status, plan_id, expected in (("existing_plan", "G-001", ("G-001",)), ("rejected", None, ())):
+            disposition = [{"index": 0, "status": status, "plan_id": plan_id,
+                            "reason": "Concrete source evidence explains this disposition."}]
+            self.run.row = replace(self.run.row, planning_result="MODULE_FINDINGS_RESULT: " + json.dumps(disposition))
+            self.assertEqual(self.ports.tiered.validate_final(self.run, decision), expected)
 
 
 if __name__ == "__main__":

@@ -112,6 +112,12 @@ class MaintenanceCycle:
     full_assessment_source_sha: str | None
     full_assessment_result: str | None
     revision: int
+    last_cycle_commit: str | None = None
+    last_cycle_merged_count: int | None = None
+    cycle_request_id: str | None = None
+    consumed_request_id: str | None = None
+    assessment_plan_ids: tuple[str, ...] = ()
+    cycle_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -136,6 +142,12 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         for row in connection.execute("PRAGMA table_info(maintenance_cycles)")
     }
     migrations = {
+        "last_cycle_commit": "TEXT",
+        "last_cycle_merged_count": "INTEGER",
+        "cycle_request_id": "TEXT",
+        "consumed_request_id": "TEXT",
+        "assessment_plan_ids": "TEXT NOT NULL DEFAULT '[]'",
+        "cycle_id": "TEXT",
         "include_general_planning": "INTEGER NOT NULL DEFAULT 0",
         "publication_refactoring_plan_ids": "TEXT NOT NULL DEFAULT '[]'",
         "publication_revalidation_plan_ids": "TEXT NOT NULL DEFAULT '[]'",
@@ -150,6 +162,12 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
             connection.execute(
                 f"ALTER TABLE maintenance_cycles ADD COLUMN {column} {definition}"
             )
+    connection.execute(
+        "UPDATE maintenance_cycles SET last_cycle_commit = last_success_commit, "
+        "last_cycle_merged_count = last_success_merged_count WHERE phase = 'idle' "
+        "AND publication_stage IS NULL AND last_cycle_merged_count IS NULL "
+        "AND last_success_commit IS NOT NULL AND last_success_merged_count >= 0"
+    )
     draft_columns = {
         str(row[1]) for row in connection.execute("PRAGMA table_info(document_drafts)")
     }
@@ -321,7 +339,7 @@ class MaintenanceRepository:
                 "WHERE h.repo = exec_plans.repo "
                 "AND h.currently_archived = 1 "
                 "AND h.plan_id = exec_plans.plan_id "
-                "AND (h.merge_confirmed = 0 OR h.diagnostic_code IS NOT NULL))"
+                "AND (h.merge_confirmed = 0 OR h.identity_verified = 0 OR h.proof_revision IS NULL OR h.diagnostic_code IS NOT NULL))"
             )
         return int(
             self.connection.execute(
@@ -335,6 +353,15 @@ class MaintenanceRepository:
         """Return the existing catalog-backed MERGED count for a project."""
 
         return self._merged_count(repo)
+
+    def plan_rows(self, repo: str) -> list[sqlite3.Row]:
+        """Use only catalog rows whose archived identity and Merge are confirmed."""
+        return self.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND NOT EXISTS (SELECT 1 FROM execplan_catalog_history h "
+            "WHERE h.repo = exec_plans.repo AND h.plan_id = exec_plans.plan_id AND h.currently_archived = 1 "
+            "AND (h.merge_confirmed = 0 OR h.identity_verified = 0 OR h.proof_revision IS NULL OR h.diagnostic_code IS NOT NULL))",
+            (repo,),
+        ).fetchall()
 
     @staticmethod
     def _empty(repo: str) -> MaintenanceCycle:
@@ -460,58 +487,96 @@ class MaintenanceRepository:
             full_assessment_source_sha=row["full_assessment_source_sha"],
             full_assessment_result=row["full_assessment_result"],
             revision=int(row["revision"]),
+            last_cycle_commit=row["last_cycle_commit"],
+            last_cycle_merged_count=row["last_cycle_merged_count"],
+            cycle_request_id=row["cycle_request_id"],
+            consumed_request_id=row["consumed_request_id"],
+            assessment_plan_ids=stored_plan_ids("assessment_plan_ids"),
+            cycle_id=row["cycle_id"],
         )
 
     def due(self, repo: str, interval: int, *, self_repository: bool = False) -> ReviewDue:
-        if interval <= 0:
-            raise ValueError("refactoring review interval must be positive")
-        state = self.get(repo)
-        if self_repository and state.phase is MaintenancePhase.IDLE and not state.full_assessment_completed:
-            return ReviewDue(True, "one_time_full_assessment", 0, state.phase)
-        return calculate_review_due(
-            state.last_success_merged_count,
-            self._merged_count(repo),
-            interval,
-            state.phase,
-        )
+        return self.file_assessment_due(repo, interval, self_repository=self_repository)
 
     def file_assessment_due(
         self, repo: str, interval: int, *, completion_candidate: bool = False,
         self_repository: bool = False,
     ) -> ReviewDue:
         state = self.get(repo)
-        from loop_manager_internal.maintenance import tiered_review
-        if self.connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'tiered_maintenance_success'").fetchone():
-            repository = tiered_review.TieredReviewRepository(self.connection)
-            success = repository.success(repo)
-            request = self.connection.execute("SELECT 1 FROM tiered_maintenance_requests WHERE repo = ?", (repo,)).fetchone()
-            if success is not None or request is not None:
-                if interval <= 0:
-                    raise ValueError("refactoring review interval must be positive")
-                if state.phase is not MaintenancePhase.IDLE:
-                    return ReviewDue(False, "active_cycle", 0, state.phase)
-                baseline = success["full_merged_count"] if success else None
-                if baseline is None:
-                    return ReviewDue(True, "initial_full", 0, state.phase)
-                delta = self._merged_count(repo) - baseline
-                if delta < 0:
-                    raise MaintenanceStateError("전체 정밀 Merge 기준이 현재 이력보다 큽니다.")
-                return ReviewDue(bool(request) or delta >= interval,
-                    "requested_full" if request else "periodic_full" if delta >= interval else "interval_not_reached", delta, state.phase)
-        if (
-            self_repository
-            and state.phase is MaintenancePhase.IDLE
-            and not state.full_assessment_completed
-        ):
-            return ReviewDue(True, "one_time_full_assessment", 0, state.phase)
-        return calculate_file_assessment_due(
-            state.file_assessment_start_merged_count,
-            state.last_success_file_assessment_merged_count,
-            self._merged_count(repo),
-            interval,
-            state.phase,
-            completion_candidate=completion_candidate,
-        )
+        # Legacy idle success was written only after confirmed publication and
+        # revalidation. Its count is a completion boundary, unlike a module receipt.
+        baseline = state.last_cycle_merged_count
+        if baseline is None and state.last_success_commit:
+            baseline = state.last_success_merged_count
+        due = calculate_review_due(baseline, self._merged_count(repo), interval, state.phase)
+        if state.phase is not MaintenancePhase.IDLE:
+            return due
+        request = self.pending_request(repo)
+        if request and request != state.consumed_request_id:
+            return ReviewDue(True, "requested_full", due.merged_since_baseline, state.phase)
+        if baseline is None:
+            # A receipt alone does not prove the legacy cycle ended safely.
+            if (state.last_success_merged_count is not None
+                    or state.last_success_file_assessment_merged_count is not None
+                    or state.full_assessment_completed):
+                raise MaintenanceStateError("기존 유지보수 성공 기록의 종료 경계를 확인할 수 없습니다.")
+            if self.connection.execute("SELECT 1 FROM sqlite_master WHERE name = 'tiered_maintenance_success'").fetchone():
+                if self.connection.execute("SELECT 1 FROM tiered_maintenance_success WHERE repo = ?", (repo,)).fetchone():
+                    raise MaintenanceStateError("평가 근거는 있으나 유지보수 종료 경계를 확인할 수 없습니다.")
+            return ReviewDue(True, "initial_full", 0, state.phase)
+        return due
+
+    def pending_request(self, repo: str) -> str | None:
+        if not self.connection.execute("SELECT 1 FROM sqlite_master WHERE name = 'tiered_maintenance_requests'").fetchone():
+            return None
+        row = self.connection.execute("SELECT request_id FROM tiered_maintenance_requests WHERE repo = ?", (repo,)).fetchone()
+        return str(row[0]) if row else None
+
+    def record_assessment_plans(self, repo: str, expected_revision: int, plan_ids: Sequence[str],
+                                prerequisite_plan_ids: Sequence[str] = ()) -> None:
+        """Save validated existing finding targets before publication, without changing its identity."""
+        with _transaction(self.connection):
+            encoded = self._serialize_plan_ids(repo, plan_ids, "assessment_plan_ids")
+            prerequisites = self._serialize_plan_ids(repo, prerequisite_plan_ids, "prerequisite_plan_ids")
+            cursor = self.connection.execute(
+                "UPDATE maintenance_cycles SET assessment_plan_ids = ?, prerequisite_plan_ids = ? "
+                "WHERE repo = ? AND phase = 'assessment' AND revision = ?",
+                (encoded, prerequisites, repo, expected_revision),
+            )
+            if cursor.rowcount != 1:
+                raise MaintenanceStateError("평가 범위를 기록할 cycle identity가 변경됐습니다.")
+
+    def finish_cycle(self, repo: str, *, expected: MaintenanceCycle, source_sha: str) -> MaintenanceCycle:
+        """Close confirmed work atomically; never turn the merged source into a review receipt."""
+        with _transaction(self.connection):
+            state = self.get(repo)
+            if state != expected or state.phase not in {
+                MaintenancePhase.ASSESSMENT, MaintenancePhase.PREREQUISITE_WAIT, MaintenancePhase.REFACTORING,
+                MaintenancePhase.POST_REFACTOR_REVALIDATION,
+            }:
+                raise MaintenanceStateError("유지보수 종료 단계 또는 revision이 변경됐습니다.")
+            if state.phase is MaintenancePhase.ASSESSMENT and (state.cycle_id is not None or not state.prerequisite_plan_ids):
+                raise MaintenanceStateError("미확정 평가를 Merge 종료로 처리할 수 없습니다.")
+            if state.publication_stage not in (None, "remote_confirmed"):
+                raise MaintenanceStateError("미확정 유지보수 게시를 종료할 수 없습니다.")
+            if state.publication_stage == "remote_confirmed" and (
+                not state.publication_base_sha or not state.publication_commit_sha
+                or state.publication_remote_oid != state.publication_commit_sha
+            ):
+                raise MaintenanceStateError("확정된 유지보수 게시 identity가 완전하지 않습니다.")
+            from loop_manager_internal.maintenance.maintenance_orchestration import cycle_scope_plan_ids
+            rows = self.plan_rows(repo)
+            scope = cycle_scope_plan_ids(rows, state)
+            by_id = {row["plan_id"]: row["status"] for row in rows}
+            if not scope or any(by_id[plan_id] != "MERGED" for plan_id in scope):
+                raise MaintenanceStateError("유지보수 확정 범위의 실제 Merge가 완료되지 않았습니다.")
+            count = self._verified_merged_count(repo, source_sha, self._merged_count(repo))
+            self.connection.execute(
+                "UPDATE maintenance_cycles SET phase = 'idle', last_cycle_commit = ?, last_cycle_merged_count = ?, publication_stage = NULL, "
+                "include_general_planning = 0, revision = revision + 1, updated_at = CURRENT_TIMESTAMP WHERE repo = ?",
+                (source_sha, count, repo),
+            )
+            return self.get(repo)
 
     def _verified_merged_count(
         self, repo: str, source_sha: str, expected_merged_count: int
@@ -630,8 +695,13 @@ class MaintenanceRepository:
             state = self.get(repo)
             if inventory.revision != source_sha:
                 raise MaintenanceStateError("빈 안정화 평가 inventory source가 다릅니다.")
-            decision = self.file_assessment_due(
-                repo, interval, completion_candidate=True,
+            # Compatibility for a saved legacy empty-selection settlement;
+            # automatic selection no longer enters this stabilization path.
+            decision = calculate_file_assessment_due(
+                state.file_assessment_start_merged_count,
+                state.last_success_file_assessment_merged_count,
+                self._merged_count(repo), interval, state.phase,
+                completion_candidate=True,
             )
             if (
                 state.phase is not MaintenancePhase.IDLE
@@ -744,6 +814,12 @@ class MaintenanceRepository:
                     updated_at = CURRENT_TIMESTAMP
                 """,
                 (repo, base_sha, merged_count, int(include_general_planning)),
+            )
+            request_id = self.pending_request(repo)
+            self.connection.execute(
+                "UPDATE maintenance_cycles SET cycle_request_id = ?, consumed_request_id = COALESCE(?, consumed_request_id), "
+                "assessment_plan_ids = '[]', cycle_id = ? WHERE repo = ?",
+                (request_id, request_id, uuid4().hex, repo),
             )
             return self.get(repo), True
 
@@ -1042,7 +1118,7 @@ class MaintenanceRepository:
                     if cycle_base_sha == state.full_assessment_source_sha else None
                 )
                 updates["full_assessment_source_sha"] = cycle_base_sha
-            if (next_phase is MaintenancePhase.REFACTORING
+            if (next_phase in {MaintenancePhase.REFACTORING, MaintenancePhase.PREREQUISITE_WAIT}
                 and state.full_assessment_result is not None):
                 updates["full_assessment_completed"] = 1
             if prerequisite_plan_ids is not None:
@@ -1089,11 +1165,27 @@ class MaintenanceRepository:
                 "이 단계에서는 성공 기준선을 전진시킬 수 없습니다."
             )
         with _transaction(self.connection):
+            state = self.get(repo)
+            if expected_phase is MaintenancePhase.POST_REFACTOR_REVALIDATION:
+                from loop_manager_internal.maintenance.maintenance_orchestration import cycle_scope_plan_ids
+                rows = self.plan_rows(repo)
+                scope = cycle_scope_plan_ids(rows, state)
+                statuses = {row["plan_id"]: row["status"] for row in rows}
+                if not scope or any(statuses[plan_id] != "MERGED" for plan_id in scope):
+                    raise MaintenanceStateError("기존 사후 단계의 확정 범위 Merge가 완료되지 않았습니다.")
+            if expected_phase is MaintenancePhase.ASSESSMENT and (state.assessment_plan_ids or state.prerequisite_plan_ids):
+                return self.transition(
+                    repo, expected_phase=expected_phase, expected_revision=expected_revision,
+                    next_phase=(MaintenancePhase.PREREQUISITE_WAIT if state.prerequisite_plan_ids
+                                else MaintenancePhase.REFACTORING), include_general_planning=False,
+                )
             merged_count = self._merged_count(repo)
             cursor = self.connection.execute(
                 """
                 UPDATE maintenance_cycles
-                SET last_success_commit = ?, last_success_merged_count = ?,
+                SET last_success_commit = CASE WHEN phase = 'assessment' THEN ? ELSE last_success_commit END,
+                    last_success_merged_count = CASE WHEN phase = 'assessment' THEN ? ELSE last_success_merged_count END,
+                    last_cycle_commit = ?, last_cycle_merged_count = ?,
                     full_assessment_completed = CASE
                         WHEN full_assessment_result IS NOT NULL THEN 1
                         ELSE full_assessment_completed END,
@@ -1114,6 +1206,8 @@ class MaintenanceRepository:
                 WHERE repo = ? AND phase = ? AND revision = ?
                 """,
                 (
+                    remote_commit,
+                    merged_count,
                     remote_commit,
                     merged_count,
                     repo,
