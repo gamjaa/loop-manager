@@ -77,7 +77,7 @@ def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes):
             current_complexity=row["current_complexity"], current_risk=row["current_risk"],
             current_metadata_recorded=True,
         )
-        affected = []
+        affected = set()
         reference = re.compile(rb"(?<![A-Za-z0-9-])" + key.encode("ascii") + rb"(?![A-Za-z0-9-])")
         reference_path = path.encode("utf-8")
         for other in rows:
@@ -85,8 +85,16 @@ def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes):
             if other_id == key:
                 continue
             if key in json.loads(other["depends_on"]):
-                affected.append(other_id)
+                affected.add(other_id)
                 continue
+            adopted = str(other["current_revision_sha"] or other["plan_sha"] or "")
+            if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", adopted):
+                previous = git_bytes(repository, "show", f"{adopted}:{other['path']}")
+                if (catalog.plan_content_hash(previous) == other["content_hash"]
+                        and (reference_path in previous or reference.search(previous))):
+                    affected.add(other_id)
+        # Newly observed declarations have no SQLite row yet.
+        for other_id in pinned.snapshot.observed_ids - {key}:
             latest = latest_contents.get(other_id)
             latest_path = withheld_paths.get(other_id)
             if (latest is None and latest_path is not None and pinned.regular_paths is not None
@@ -95,14 +103,7 @@ def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes):
                 latest = git_bytes(repository, "show", f"{pinned.revision_sha}:{latest_path}")
                 latest_contents[other_id] = latest
             if latest is not None and (reference_path in latest or reference.search(latest)):
-                affected.append(other_id)
-                continue
-            adopted = str(other["current_revision_sha"] or other["plan_sha"] or "")
-            if re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", adopted):
-                previous = git_bytes(repository, "show", f"{adopted}:{other['path']}")
-                if (catalog.plan_content_hash(previous) == other["content_hash"]
-                        and (reference_path in previous or reference.search(previous))):
-                    affected.append(other_id)
+                affected.add(other_id)
         evidence = json.dumps({"text": text, "row": dict(row), "affected": sorted(affected),
                                "resolved": {}}, ensure_ascii=False, sort_keys=True)
         deletions.append(RemoteDeletion(original, evidence))
@@ -110,14 +111,15 @@ def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes):
 
 
 def recovery_definitions(connection, repo, repository, pinned, *, git_bytes):
-    """Adopt valid READY declarations under a hold, even if the user edited them."""
+    """Adopt affected READY and new declarations under a hold for Planner repair."""
     affected = {key for raw in recovery_goals(connection, repo) for key in json.loads(raw)["affected_ids"]}
     affected.update(key for item in pinned.deletions for key in json.loads(item.evidence)["affected"])
     paths = {key: path for key, path, _hash in pinned.snapshot.withheld}
     paths.update({key: entry.path for key, entry in pinned.snapshot.all.items()})
+    stored_ids = {str(row[0]) for row in connection.execute("SELECT plan_id FROM exec_plans WHERE repo=?", (repo,))}
     entries = []
     for key in sorted(affected):
-        if (key not in paths or mutable_row(connection, repo, key) is None
+        if (key not in paths or (key in stored_ids and mutable_row(connection, repo, key) is None)
                 or any(issue.plan_id == key and issue.code != "missing-dependency" for issue in pinned.snapshot.issues)):
             continue
         path = paths[key]
@@ -125,7 +127,9 @@ def recovery_definitions(connection, repo, repository, pinned, *, git_bytes):
             continue
         text = git_bytes(repository, "show", f"{pinned.revision_sha}:{path}").decode("utf-8")
         plan = catalog.parse_execplan_text(path, text, validate_sources=False)
-        entries.append(catalog._entry(path, text, plan))
+        entry = catalog._entry(path, text, plan)
+        if key in stored_ids or not entry.archived:
+            entries.append(entry)
     return tuple(entries)
 
 
@@ -133,6 +137,8 @@ def recovery_goals(connection, repo):
     """Keep cancellation evidence immutable; resolution is publication-bound."""
     goals = []
     rows = connection.execute("SELECT * FROM exec_plans WHERE repo=?", (repo,)).fetchall()
+    observed_ids = {str(row["plan_id"]) for row in rows}
+    observed_ids.update(str(row[0]) for row in connection.execute("SELECT plan_id FROM execplan_catalog_holds WHERE repo=?", (repo,)))
     for cancelled in connection.execute(
         "SELECT * FROM execplan_cancellations WHERE repo=? AND recovery_evidence IS NOT NULL ORDER BY plan_id", (repo,),
     ):
@@ -146,9 +152,8 @@ def recovery_goals(connection, repo):
         except (ValueError, TypeError) as error:
             raise PlannerValidationError("삭제 목표 감사 JSON이 유효하지 않습니다.") from error
         key = str(cancelled["plan_id"])
-        affected = sorted(str(row["plan_id"]) for row in rows
-            if (str(row["plan_id"]) in evidence["affected"] or key in json.loads(row["depends_on"]))
-            and (str(row["plan_id"]) not in evidence["resolved"] or key in json.loads(row["depends_on"])))
+        affected = sorted(((set(evidence["affected"]) & observed_ids) - evidence["resolved"].keys())
+            | {str(row["plan_id"]) for row in rows if key in json.loads(row["depends_on"])})
         if affected:
             goals.append(json.dumps({"id": key, "path": cancelled["path"],
                 "deletion_revision": cancelled["deletion_commit"], "evidence": cancelled["recovery_evidence"],

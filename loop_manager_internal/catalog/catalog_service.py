@@ -401,7 +401,9 @@ def reconcile_execplan_catalog(
         try:
             with execplan_catalog_state._transaction(connection):
                 pinned = port.load()
-                if pinned.snapshot.isolation_enabled:
+                # Deletion reconciliation validates new declarations before
+                # goal holds remove their dependency graph from the snapshot.
+                if pinned.snapshot.isolation_enabled and not pinned.deletions:
                     issues = execplan_catalog_state.new_declaration_issues(pinned, repository.capture(repo).plan_ids)
                     if issues:
                         pinned = replace(pinned, snapshot=execplan_catalog.withhold_catalog_issues(pinned.snapshot, issues))

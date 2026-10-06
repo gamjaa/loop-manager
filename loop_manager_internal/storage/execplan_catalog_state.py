@@ -243,7 +243,9 @@ def new_declaration_issues(
 ) -> tuple[CatalogIssue, ...]:
     """Apply publication rules against a pinned tree or a planning checkout."""
     issues = []
-    for key, entry in pinned.snapshot.active.items():
+    entries = dict(pinned.snapshot.active)
+    entries.update({entry.plan_id: entry for entry in pinned.recovery_definitions if not entry.archived})
+    for key, entry in entries.items():
         if key in known_ids:
             continue
         try:
@@ -1029,7 +1031,6 @@ class CatalogReconciliationService:
         missing_history = sorted(
             historical_ids - stored_ids - catalog_ids
         )
-        unknown_active = sorted(set(pinned.snapshot.active) - stored_ids)
         unknown_archived = sorted(
             set(pinned.snapshot.archived) - stored_ids - historical_ids
         )
@@ -1052,6 +1053,22 @@ class CatalogReconciliationService:
                     if reserved_id == plan_id
                 ),
             )
+        # Validate new declarations before deletion-goal holds remove them from
+        # the executable catalog. Recovery registration uses the same rules.
+        new_issues = new_declaration_issues(pinned, stored_ids)
+        if new_issues:
+            if not pinned.snapshot.isolation_enabled:
+                issue = new_issues[0]
+                return self._invalid(pinned.revision_sha, issue.code, issue.message,
+                                     path=issue.path, source=issue.source)
+            entries = dict(pinned.snapshot.active)
+            entries.update({entry.plan_id: entry for entry in pinned.recovery_definitions if not entry.archived})
+            validation = replace(pinned.snapshot, active=entries, issues=(), withheld=())
+            invalid_ids = withhold_catalog_issues(validation, new_issues).withheld_ids
+            pinned = replace(pinned,
+                snapshot=withhold_catalog_issues(pinned.snapshot, new_issues),
+                recovery_definitions=tuple(entry for entry in pinned.recovery_definitions
+                                           if entry.plan_id not in invalid_ids))
         if pinned.snapshot.isolation_enabled:
             from loop_manager_internal.catalog import remote_deletions
             issues = []
@@ -1073,13 +1090,16 @@ class CatalogReconciliationService:
             goals = [json.loads(raw) for raw in remote_deletions.recovery_goals(self.repository.connection, repo)]
             goals.extend({"id": item.snapshot.plan_id, "affected_ids": json.loads(item.evidence)["affected"]}
                          for item in pinned.deletions)
+            observed_paths = {key: path for key, path, _hash in withheld}
+            observed_paths.update({key: entry.path for key, entry in pinned.snapshot.all.items()})
             for goal in goals:
                 for key in goal["affected_ids"]:
                     row = next((row for row in expected.rows if row.plan_id == key), None)
-                    if row is not None and key not in cancelled:
-                        issues.append(CatalogIssue(key, str(row.values[1]), "deleted-goal",
+                    path = str(row.values[1]) if row is not None else observed_paths.get(key)
+                    if path is not None and key not in cancelled:
+                        issues.append(CatalogIssue(key, path, "deleted-goal",
                             f"삭제된 선행 목표의 명시적 복구 판단을 기다립니다: {key} -> {goal['id']}"))
-                        if key not in pinned.snapshot.observed_ids:
+                        if row is not None and key not in pinned.snapshot.observed_ids:
                             withheld.append((key, str(row.values[1]), str(row.values[6])))
             if issues:
                 snapshot = replace(pinned.snapshot, withheld=tuple(sorted(set(withheld))))
@@ -1096,7 +1116,9 @@ class CatalogReconciliationService:
             key: path for key, path, _hash in pinned.snapshot.withheld
             if key not in stored_ids and key not in historical_ids
         }
-        new_observations.update({key: pinned.snapshot.active[key].path for key in unknown_active})
+        new_observations.update({key: entry.path for key, entry in pinned.snapshot.active.items() if key not in stored_ids})
+        new_observations.update({entry.plan_id: entry.path for entry in pinned.recovery_definitions
+                                 if entry.plan_id not in stored_ids})
         if new_observations:
             if pinned.regular_paths is None:
                 return self._invalid(pinned.revision_sha, "unknown-plan-id",
@@ -1109,14 +1131,6 @@ class CatalogReconciliationService:
                 if key in reserved_ids or path in reserved_paths:
                     return self._invalid(pinned.revision_sha, "unknown-plan-id",
                         f"신규 ExecPlan identity가 예약 이력과 충돌합니다: {key}", path=path)
-            issues = new_declaration_issues(pinned, stored_ids)
-            if issues:
-                if not pinned.snapshot.isolation_enabled:
-                    issue = issues[0]
-                    return self._invalid(pinned.revision_sha, issue.code, issue.message,
-                                         path=issue.path, source=issue.source)
-                pinned = replace(pinned, snapshot=withhold_catalog_issues(pinned.snapshot, tuple(issues)))
-                unknown_active = sorted(set(pinned.snapshot.active) - stored_ids)
         if pinned.snapshot.issues:
             unsafe = self._shared_ownership_failure(pinned, expected)
             if unsafe is not None:
@@ -1132,7 +1146,8 @@ class CatalogReconciliationService:
             revision_is_current=(
                 lambda: self.catalog.current_revision() == pinned.revision_sha
             ),
-            new_plan_ids=tuple(unknown_active),
+            new_plan_ids=tuple(sorted((set(pinned.snapshot.active)
+                | {entry.plan_id for entry in pinned.recovery_definitions}) - stored_ids)),
         )
         if changed is None:
             return CatalogReconciliationResult(
