@@ -284,7 +284,9 @@ class ExistingPrPlanRecoveryTests(PlanRemoteRecoveryFixture, unittest.TestCase):
             self.connection.execute('UPDATE projects SET planning_attempt_fingerprint = NULL')
             service.state.repo, service.state.repo_path, service.state.base = self.repo, Path('/repo'), 'main'
             service.state.row = self.connection.execute('SELECT * FROM projects WHERE repo = ?', (self.repo,)).fetchone()
-            service.state.recovered_planning_outcome = PlanningOutcome(PlanningOutcomeKind.EXECUTION_READY)
+            service.state.recovered_planning_outcome = PlanningOutcome(
+                PlanningOutcomeKind.EXECUTION_READY if runtime.projected(self.repo) is not None
+                else PlanningOutcomeKind.WAITING)
         # Repository/catalog effects and Agent processes are fake unit ports;
         # project PR recovery and execution phase dispatch remain production code.
         with (mock.patch.object(ProjectService, '_prepare_repository', prepare),
@@ -294,6 +296,9 @@ class ExistingPrPlanRecoveryTests(PlanRemoteRecoveryFixture, unittest.TestCase):
               mock.patch.object(loop_manager, '_recorded_base_fetch', return_value=self.base),
               mock.patch.object(loop_manager, '_check_runtime_handoff'),
               mock.patch.object(loop_manager, '_ExecutionLifecyclePorts', return_value=execution),
+              mock.patch.object(loop_manager, '_fetch_pr_conflict_recovery_refs'),
+              mock.patch.object(loop_manager, 'remote_branch_oid',
+                                side_effect=lambda *_: self.pull_request['headRefOid']),
               mock.patch.object(loop_manager, 'make_worktree'),
               mock.patch.object(loop_manager, 'operation_print')):
             result = loop_manager._run_project_step(self.connection, Path('/state'), self.repo,
@@ -351,6 +356,88 @@ class ExistingPrPlanRecoveryTests(PlanRemoteRecoveryFixture, unittest.TestCase):
         execution.prepare.assert_not_called()
         self.assertEqual(self.plan()['status'], 'PR_OPEN')
         self.assertEqual(self.plan()['pr_url'], 'saved-pr')
+
+    def _approved_final_push(self):
+        from tests.support.publication import seed_validated_candidate
+        self._resume_general_pr_candidate()
+        before = self.head
+        self.head = self.pull_request['headRefOid'] = 'd' * 40
+        plan = self.plan()
+        with (mock.patch('tests.support.publication.git_command', side_effect=[self.base, self.head]),
+              mock.patch.object(loop_manager, '_revision_execplan_body_hash', return_value='body'),
+              mock.patch.object(loop_manager, '_revision_execplan_source_fingerprint', return_value='sources')):
+            approval = seed_validated_candidate(self.connection, Path(self.repo), Path(plan['worktree']), 'G-106')
+        loop_manager.update_project(self.connection, self.repo,
+            phase='PUBLISHING', active_sha=self.base, validated_base_sha=self.base,
+            pr_conflict_recovery=1, pr_conflict_head_oid=before, pr_conflict_base_oid=self.base,
+            publication_token=approval.publication_token(self.base, self.head))
+
+    def test_approved_final_push_recovers_at_project_entry_without_repush(self):
+        self._approved_final_push()
+        for _ in range(2):
+            result, execution = self._enter_general_pr_candidate()
+            self.assertEqual(result, 0)
+            execution.prepare.assert_not_called()
+            plan = self.plan()
+            self.assertEqual(plan['status'], 'PR_OPEN')
+            self.assertEqual(plan['publication_remote_oid'], self.head)
+            self.assertEqual(plan['pr_head_oid'], self.head)
+            self.assertEqual(plan['pr_conflict_recovery'], 0)
+            self.assertIsNone(plan['pr_conflict_head_oid'])
+            self.assertIsNone(plan['pr_conflict_base_oid'])
+        self.assertFalse(any(call.args[1:2] == ('push',) for call in loop_manager.git.call_args_list))
+
+    def test_final_push_ownership_failure_preserves_publishing_and_recovery(self):
+        self._approved_final_push()
+        before = dict(self.plan())
+        for port, damage in (('validate_execplan_workspace_identity', 'missing-worktree'),
+                             ('validate_managed_worktree', 'wrong-branch')):
+            with self.connection:
+                scoped_blocking.clear_project_block(self.connection, self.repo)
+            loop_manager.update_project(self.connection, self.repo, phase='PUBLISHING')
+            with self.subTest(damage=damage), mock.patch.object(loop_manager, port,
+                    side_effect=loop_manager.WorkspaceOwnershipError(damage)) as validate:
+                result, execution = self._enter_general_pr_candidate()
+                self.assertEqual(result, 1)
+                validate.assert_called_once()
+                execution.prepare.assert_not_called()
+                plan = self.plan()
+                self.assertEqual(plan['status'], 'PUBLISHING')
+                self.assertIn('PR 충돌 복구 안전 검증 실패', plan['last_error'])
+                for field in ('pr_url', 'pr_head_oid', 'publication_remote_oid', 'pr_conflict_recovery',
+                              'pr_conflict_head_oid', 'pr_conflict_base_oid', 'publication_token'):
+                    self.assertEqual(plan[field], before[field])
+        self.assertFalse(any(call.args[1:2] == ('push',) for call in loop_manager.git.call_args_list))
+
+    def test_final_push_confirmation_rejects_missing_mismatched_or_pending_approval(self):
+        from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
+        self._approved_final_push()
+        approval = self.plan()['publication_token']
+        definition = DefinitionSnapshot.deserialize(self.plan()['definition_snapshot'])
+        checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        for condition in ('missing', 'mismatched', 'stale', 'rebase', 'rebase_publish'):
+            with self.subTest(condition=condition):
+                loop_manager.update_project(self.connection, self.repo,
+                    publication_token=None if condition == 'missing' else approval)
+                if condition == 'mismatched':
+                    self.connection.execute("UPDATE projects SET publication_token = 'other-approval'")
+                    self.connection.commit()
+                elif condition == 'stale':
+                    loop_manager.update_project(self.connection, self.repo,
+                        publication_token=definition.publication_token(self.base, 'previous-head'))
+                current = checkpoints.get(self.repo, 'G-106')
+                checkpoints.record(self.repo, 'G-106', expected_generation=current.generation,
+                    operation=condition if condition in {'rebase', 'rebase_publish'} else None,
+                    expected_head=current.expected_head, target_base_oid=current.target_base_oid,
+                    observed_remote_oid=current.observed_remote_oid, snapshot=current.snapshot)
+                plan, checkpoint = dict(self.plan()), checkpoints.get(self.repo, 'G-106')
+                project = self.connection.execute('SELECT * FROM projects').fetchone()
+                with mock.patch.object(loop_manager, 'validate_execplan_workspace_identity') as workspace:
+                    self.assertFalse(loop_manager.recover_confirmed_pr_conflict_push(
+                        self.connection, Path('/repo'), Path('/state'), self.repo, project, self.pull_request))
+                    workspace.assert_not_called()
+                self.assertEqual(dict(self.plan()), plan)
+                self.assertEqual(checkpoints.get(self.repo, 'G-106'), checkpoint)
 
     def test_user_push_rebase_publication_and_cause_recheck_resume_same_pr_recovery(self):
         from loop_manager_internal.git import managed_rebase_adoption, managed_rebase_validation

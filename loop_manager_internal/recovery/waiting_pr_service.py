@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
+from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
 from loop_manager_internal.application.contracts import PRIORITY_ORDER
 from loop_manager_internal.application.contracts import PullRequestSyncResult
 from loop_manager_internal.application.contracts import WaitingPullRequestObservation
@@ -417,12 +418,17 @@ def _resume_reopened_pull_request(
         raise ValueError("PR 충돌 복구 OID는 복구 전이에만 기록할 수 있습니다.")
     checkpoint = ExecutionCheckpointRepository(connection).get(repo, str(plan["plan_id"]))
     saved_recovery = recovery_state.RecoveryRepository(connection).row(repo, str(plan["plan_id"]))
+    definition = DefinitionSnapshot.deserialize(plan["definition_snapshot"])
+    publication_approved = bool(definition is not None and plan["validated_base_sha"]
+        and plan["publication_token"] == definition.publication_token(
+            str(plan["validated_base_sha"]), str(head_oid or "")))
     revalidate_candidate = bool(
         plan["blocked_reason"] == PR_CLOSED_BLOCK_REASON
         and (checkpoint.operation in {"rebase", "rebase_publish"}
              or saved_recovery is not None
              and saved_recovery["reason_code"] == RecoveryReason.PULL_REQUEST_CLOSED.value
-             and saved_recovery["phase"] in runtime_state.ACTIVE_STATUSES))
+             and saved_recovery["phase"] in runtime_state.ACTIVE_STATUSES
+             and (saved_recovery["phase"] != "PUBLISHING" or not publication_approved)))
     recovery = recovery or revalidate_candidate
     phase = "WORKING" if recovery else "PR_OPEN"
     status = "IMPLEMENTING" if recovery else "PR_OPEN"

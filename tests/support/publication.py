@@ -12,8 +12,8 @@ from tests.support.worker import worker_result
 
 def seed_validated_candidate(
     connection: sqlite3.Connection, repo: Path, worktree: Path, plan_id: str,
-) -> None:
-    """Give a publication fixture evidence for its exact base and HEAD."""
+) -> DefinitionSnapshot:
+    """Seed exact candidate evidence; return the definition for publication tokens."""
 
     row = connection.execute(
         "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
@@ -55,6 +55,7 @@ def seed_validated_candidate(
             "archive_token = ?, verify_token = ?, review_token = ? WHERE repo = ?",
             (*values, str(repo)),
         )
+    return snapshot
 
 def matching_branch_pr_lookup(responses):
     """Model a PR on the current branch when a publication fixture omits HEAD.

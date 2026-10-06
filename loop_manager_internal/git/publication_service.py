@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
+from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
 from loop_manager_internal.git import managed_rebase_adoption
 from loop_manager_internal.runtime.contracts import PublicationSafetyError
 from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
@@ -429,7 +430,17 @@ def recover_confirmed_pr_conflict_push(
         or not target_base
         or str(project["active_sha"] or "") != target_base
         or str(project["validated_base_sha"] or "") != target_base
+        or not project["publication_token"]
+        or plan["publication_token"] != project["publication_token"]
     ):
+        return False
+    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+        repo, str(plan["plan_id"]))
+    if checkpoint.operation in {"rebase", "rebase_publish"}:
+        return False
+    definition = DefinitionSnapshot.deserialize(plan["definition_snapshot"])
+    if (definition is None
+            or plan["publication_token"] != definition.publication_token(target_base, remote_head)):
         return False
     effects.validate_execplan_workspace_identity(
         state_dir, repo, str(plan["plan_id"]), branch, worktree

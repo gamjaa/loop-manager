@@ -395,6 +395,58 @@ class ImmediateRebasePublicationTests(TestCase):
         self.assertEqual(self.checkpoints.get('repo', 'G-047'), confirmed)
         self.assertEqual(len(self.pushes), 1)
 
+    def _approve_current_pr_candidate(self):
+        from tests.support.publication import seed_validated_candidate
+        self._existing_pr()
+        self.complete()
+        with (mock.patch('tests.support.publication.git_command', side_effect=['base', 'owned-head']),
+              mock.patch.object(lm, '_revision_execplan_body_hash', return_value='body'),
+              mock.patch.object(lm, '_revision_execplan_source_fingerprint', return_value='sources')):
+            approval = seed_validated_candidate(self.fixture.connection, Path('repo'),
+                Path('/state/G-047'), 'G-047')
+        lm.update_project(self.fixture.connection, 'repo', phase='PUBLISHING',
+            active_sha='base', validated_base_sha='base', pr_conflict_recovery=0,
+            publication_token=approval.publication_token('base', 'owned-head'))
+        self.restart()
+        return approval
+
+    def test_approved_final_candidate_closed_pr_reopens_into_merge_wait(self):
+        from loop_manager_internal.recovery import scoped_blocking
+        approval = self._approve_current_pr_candidate()
+        runtime = runtime_state.RuntimeStateRepository(self.fixture.connection)
+        confirmed = self.checkpoints.get('repo', 'G-047')
+        self.pr_changes = {'state': 'CLOSED'}
+        self.assertEqual(self._terminal_project_step('PLAN_BLOCKED'), 1)
+        closed = runtime.get('repo', 'G-047')
+        self.assertEqual(closed.status, 'PLAN_BLOCKED')
+        self.assertEqual(closed.publication_token, approval.publication_token('base', 'owned-head'))
+        self.assertIsNone(scoped_blocking.project_block(self.fixture.connection, 'repo'))
+        self.pr_changes = {}
+        for _ in range(2):
+            self.assertEqual(self._terminal_project_step('PR_OPEN'), 0)
+            reopened = runtime.get('repo', 'G-047')
+            self.assertEqual(reopened.status, 'PR_OPEN')
+            self.assertEqual(reopened.pr_url, closed.pr_url)
+            self.assertEqual(reopened.pr_head_oid, closed.pr_head_oid)
+            self.assertEqual(reopened.publication_token, closed.publication_token)
+        self.assertIsNone(scoped_blocking.plan_block(self.fixture.connection, 'repo', 'G-047'))
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), confirmed)
+        self.assertEqual(len(self.pushes), 1)
+
+    def test_stale_final_approval_closed_pr_reopens_through_worker_revalidation(self):
+        approval = self._approve_current_pr_candidate()
+        self.state.update_project('repo', publication_token=approval.publication_token('base', 'previous-head'))
+        confirmed = self.checkpoints.get('repo', 'G-047')
+        self.pr_changes = {'state': 'CLOSED'}
+        self.assertEqual(self._terminal_project_step('PLAN_BLOCKED'), 1)
+        self.pr_changes = {}
+        self.assertEqual(self._terminal_project_step('IMPLEMENTING'), 0)
+        reopened = runtime_state.RuntimeStateRepository(self.fixture.connection).get('repo', 'G-047')
+        self.assertEqual(reopened.status, 'IMPLEMENTING')
+        self.assertIsNone(reopened.publication_token)
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), confirmed)
+        self.assertEqual(len(self.pushes), 1)
+
     def test_confirmed_checkpoint_keeps_validation_stages_active_without_final_approval(self):
         for phase in ('WORKING', 'VERIFYING', 'REVIEWING', 'PUBLISHING'):
             with self.subTest(phase=phase):
