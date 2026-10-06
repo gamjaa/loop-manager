@@ -1,6 +1,7 @@
 """Invocation audit, physical retries and session transition contracts."""
 
 import sqlite3
+import tempfile
 from pathlib import Path
 from unittest import TestCase, mock
 
@@ -11,6 +12,9 @@ import loop_manager as manager
 
 class RunnerTests(TestCase):
     def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.state_dir = Path(self.temporary.name)
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row
         self.addCleanup(self.connection.close)
@@ -32,7 +36,7 @@ class RunnerTests(TestCase):
         with mock.patch.object(manager, '_agent_profile') as resolve, \
              mock.patch.object(manager, 'agent_provider', return_value=Provider()):
             result = manager.run_agent(
-                'codex', Path('/worktree'), Path('/state'), Path('/config'),
+                'codex', Path('/worktree'), self.state_dir, Path('/config'),
                 'worker', 'prompt', read_only=False, level=5,
                 connection=self.connection,
                 invocation=invocation.InvocationContext('repo', 'G-041'),
@@ -55,10 +59,16 @@ class RunnerTests(TestCase):
                 return manager.AgentResult(0, "done", "new-session",
                                            usage=invocation.Usage(20, 10, None, 2))
 
+        from loop_manager_internal.agents import common_guidance
+        from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
+        guidance_repo = GuidanceRepository(self.connection)
+        snapshot = common_guidance.resolve(guidance_repo, invocation.InvocationContext("repo", "G-039"),
+                                          "worker", Path("/worktree"), self.state_dir)
+        guidance_repo.bind_session("repo", "codex", "old-session", snapshot.task_id)
         attempts = invocation.AttemptSequence("repo", "G-039", "revision")
         call = invocation.TrackedAgentCall(
             lambda session, fallback, context: manager.run_agent(
-                "codex", Path("/worktree"), Path("/state"), Path("/config"),
+                "codex", Path("/worktree"), self.state_dir, Path("/config"),
                 "worker", "secret prompt", read_only=False, level=3,
                 persist_session=True, session_id=session, connection=self.connection,
                 invocation=context), attempts)
@@ -89,7 +99,7 @@ class RunnerTests(TestCase):
             for role, plan in (("planner", None), ("worker", "G-039"),
                                ("reviewer", "G-039")):
                 result = manager.run_agent(
-                    "codex", Path("/worktree"), Path("/state"), Path("/config"),
+                    "codex", Path("/worktree"), self.state_dir, Path("/config"),
                     role, "secret prompt", read_only=role == "reviewer",
                     level=3 if role == "worker" else None,
                     connection=self.connection,
@@ -119,7 +129,7 @@ class RunnerTests(TestCase):
         with mock.patch.object(manager, "_agent_profile", return_value=manager.AgentProfile("check-model", "low")), \
              mock.patch.object(manager, "agent_provider", return_value=Provider()):
             result = manager.run_agent(
-                "codex", Path("/worktree"), Path("/state"), Path("/config"),
+                "codex", Path("/worktree"), self.state_dir, Path("/config"),
                 "planner_check", "secret prompt", read_only=True,
                 connection=self.connection,
                 invocation=invocation.InvocationContext("repo", None),
@@ -140,7 +150,7 @@ class RunnerTests(TestCase):
         with mock.patch.object(manager, "_agent_profile", return_value=manager.AgentProfile("model", "low")), \
              mock.patch.object(manager, "agent_provider", return_value=Provider()):
             result = manager.run_agent(
-                "codex", Path("/worktree"), Path("/state"), Path("/config"),
+                "codex", Path("/worktree"), self.state_dir, Path("/config"),
                 "planner", "secret", read_only=False, connection=self.connection,
                 invocation=invocation.InvocationContext("repo", None))
         self.assertEqual(result.code, 0)
@@ -156,7 +166,7 @@ class RunnerTests(TestCase):
 
         with mock.patch.object(manager, "agent_provider", return_value=Provider()):
             result = manager.run_agent(
-                "codex", Path("/worktree"), Path("/state"), Path("/config"),
+                "codex", Path("/worktree"), self.state_dir, Path("/config"),
                 "planner", "secret", read_only=False, connection=self.connection,
                 invocation=invocation.InvocationContext("repo", None),
                 resolved_profile=manager.AgentProfile("model", "low"),
@@ -177,7 +187,7 @@ class RunnerTests(TestCase):
         with mock.patch.object(manager, "_agent_profile", side_effect=RuntimeError("missing config")), \
              mock.patch.object(manager, "agent_provider", return_value=Provider()):
             result = manager.run_agent(
-                "codex", Path("/worktree"), Path("/state"), Path("/config"),
+                "codex", Path("/worktree"), self.state_dir, Path("/config"),
                 "planner", "secret", read_only=False, connection=self.connection,
                 invocation=invocation.InvocationContext("repo", None))
         self.assertEqual((result.code, result.collection_status), (0, "error"))
@@ -197,7 +207,7 @@ class RunnerTests(TestCase):
         attempts = invocation.AttemptSequence("repo", None)
         call = invocation.TrackedAgentCall(
             lambda session, fallback, context: manager.run_agent(
-                "codex", Path("/worktree"), Path("/state"), Path("/config"),
+                "codex", Path("/worktree"), self.state_dir, Path("/config"),
                 "planner", "secret", read_only=False, session_id=session,
                 connection=self.connection, invocation=context), attempts)
         with mock.patch.object(manager, "_agent_profile", return_value=manager.AgentProfile("model", "low")), \
@@ -220,7 +230,7 @@ class RunnerTests(TestCase):
                  mock.patch.object(manager, "agent_provider", return_value=Provider()):
                 Provider.message = message
                 result = manager.run_agent(
-                    "codex", Path("/worktree"), Path("/state"), Path("/config"),
+                    "codex", Path("/worktree"), self.state_dir, Path("/config"),
                     "planner", "secret", read_only=False, connection=self.connection,
                     invocation=invocation.InvocationContext("repo", None),
                     resolved_profile=manager.AgentProfile("model", "low"),
@@ -232,6 +242,12 @@ class RunnerTests(TestCase):
         self.assertEqual([row["result_kind"] for row in rows], ["timeout", "timeout"])
 
     def test_latest_attempt_without_final_session_clears_saved_session(self):
+        from loop_manager_internal.agents import common_guidance
+        from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
+        guidance_repo = GuidanceRepository(self.connection)
+        snapshot = common_guidance.resolve(guidance_repo, invocation.InvocationContext('repo', None),
+                                          'planner', Path('/worktree'), self.state_dir)
+        guidance_repo.bind_session('repo', 'codex', 'saved-session', snapshot.task_id)
         class Provider:
             def run(self, request):
                 self_outer.assertEqual(request.session_id, "saved-session")
@@ -240,7 +256,7 @@ class RunnerTests(TestCase):
         self_outer = self
         with mock.patch.object(manager, "agent_provider", return_value=Provider()):
             manager.run_agent(
-                "codex", Path("/worktree"), Path("/state"), Path("/config"),
+                "codex", Path("/worktree"), self.state_dir, Path("/config"),
                 "planner", "secret", read_only=False, session_id="saved-session",
                 connection=self.connection,
                 invocation=invocation.InvocationContext("repo", None),
@@ -288,7 +304,7 @@ class RunnerTests(TestCase):
              mock.patch.object(state.InvocationRepository, "observe_session",
                                side_effect=sqlite3.OperationalError("unavailable")):
             result = manager.run_agent(
-                "codex", Path("/worktree"), Path("/state"), Path("/config"),
+                "codex", Path("/worktree"), self.state_dir, Path("/config"),
                 "planner", "secret", read_only=False, connection=self.connection,
                 invocation=invocation.InvocationContext("repo", None))
         self.assertEqual((result.code, result.collection_status), (0, "error"))
@@ -305,7 +321,7 @@ class RunnerTests(TestCase):
              mock.patch.object(manager, "agent_provider", return_value=Provider()):
             with self.assertRaises(KeyboardInterrupt):
                 manager.run_agent(
-                    "codex", Path("/worktree"), Path("/state"), Path("/config"),
+                    "codex", Path("/worktree"), self.state_dir, Path("/config"),
                     "worker", "secret", read_only=False, level=1,
                     connection=self.connection,
                     invocation=invocation.InvocationContext("repo", "G-039"))
@@ -315,3 +331,228 @@ class RunnerTests(TestCase):
         self.assertEqual((row["session_id"], row["result_kind"]),
                          ("observed", "interrupted"))
         self.assertIsNotNone(row["finished_at"])
+
+
+class CommonGuidanceInvocationTests(TestCase):
+    """All roles share the same durable instruction resolution boundary."""
+    def setUp(self):
+        import tempfile
+        from loop_manager_internal.agents import common_guidance
+        self.guidance_module = common_guidance
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.runtime = self.root / 'runtime'
+        (self.runtime / 'docs').mkdir(parents=True)
+        self.source = self.runtime / common_guidance.COMMON_PATH
+        self.source.write_text('자동 지침 "quoted" \\path\n두 번째 줄\n', encoding='utf-8')
+        self.state_dir = self.root / 'state'
+        self.worktree = self.root / 'candidate'
+        self.worktree.mkdir()
+        self.connection = sqlite3.connect(':memory:')
+        self.connection.row_factory = sqlite3.Row
+        self.addCleanup(self.connection.close)
+        state.ensure_schema(self.connection)
+        self.addCleanup(mock.patch.stopall)
+        mock.patch.object(common_guidance, 'RUNTIME_ROOT', self.runtime).start()
+        mock.patch.object(common_guidance.subprocess, 'run', return_value=
+                          manager.subprocess.CompletedProcess(['git'], 0, 'a' * 40)).start()
+        self.requests = []
+        outer = self
+        class Provider:
+            def run(self, request):
+                outer.requests.append(request)
+                request.on_session_started('session-' + str(len(outer.requests)))
+                return manager.AgentResult(0, 'done', 'session-' + str(len(outer.requests)))
+        self.provider = Provider()
+        self.provider_mock = mock.patch.object(manager, 'agent_provider', return_value=self.provider).start()
+
+    def invoke(self, role='worker', plan='G-147', session=None, task=None, provider='codex'):
+        return manager.run_agent(
+            provider, self.worktree, self.state_dir, self.root / 'config.ini', role,
+            'delta only', read_only=role in {'reviewer', 'planner_check'},
+            persist_session=True, session_id=session, connection=self.connection,
+            invocation=invocation.InvocationContext('repo', plan, task_id=task),
+            resolved_profile=invocation.ResolvedProfile('model', 'high'),
+        )
+
+    def test_modern_session_fixture_binds_selected_plan_and_models_only_pr_body_reads(self):
+        from types import SimpleNamespace
+        from tests.support.worker import dummy_worker_context
+        from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
+        repository = mock.Mock()
+        repository.projected.return_value = SimpleNamespace(
+            plan_id='G-147', worktree=str(self.worktree), worker_session_id='saved-worker',
+            reviewer_session_id='saved-reviewer', worker_session_binding=None)
+        pr = {'body': '', 'state': 'OPEN', 'headRefOid': 'head'}
+        with mock.patch.object(manager, '_ExecutionLifecyclePorts', return_value='ports') as ports, \
+             mock.patch.object(manager, 'command', return_value='delegated') as command, \
+             mock.patch.object(manager, 'git', return_value=SimpleNamespace(stdout='branch')), \
+             mock.patch.object(manager, 'pr_for_branch', return_value=pr):
+            with dummy_worker_context():
+                for provider in ('codex', 'claude'):
+                    result = manager._ExecutionLifecyclePorts(self.connection, repository,
+                        repo='repo', state_dir=self.state_dir, config_path=Path('unused.ini'), provider=provider)
+                    self.assertEqual(result, 'ports')
+                observation = manager.command(['gh', 'pr', 'view', 'url', '--json',
+                    'body,headRefOid,state'], cwd=self.worktree)
+                import json
+                self.assertEqual(json.loads(observation.stdout), pr)
+                self.assertEqual(manager.command(['gh', 'pr', 'create']), 'delegated')
+        self.assertEqual(ports.call_count, 2)
+        command.assert_called_once_with(['gh', 'pr', 'create'])
+        saved = GuidanceRepository(self.connection)
+        context = invocation.InvocationContext('repo', 'G-147')
+        identity = self.guidance_module.task_identity(context, 'worker', self.worktree)
+        self.assertEqual(saved.session_task('repo', 'codex', 'saved-worker'), identity)
+        self.assertEqual(saved.session_task('repo', 'codex', 'saved-reviewer'), identity)
+        self.assertEqual(saved.session_task('repo', 'claude', 'saved-worker'), identity)
+        self.assertEqual(saved.session_task('repo', 'claude', 'saved-reviewer'), identity)
+        self.assertEqual(len(self.requests), 0)
+
+    def test_independent_planner_and_worker_keep_separate_session_bindings(self):
+        from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
+        planner = self.invoke(role='planner', plan=None, task='planning-input')
+        worker = self.invoke()
+        self.assertEqual((planner.code, worker.code), (0, 0))
+        repository = GuidanceRepository(self.connection)
+        planner_task = repository.session_task('repo', 'codex', planner.session_id)
+        worker_task = repository.session_task('repo', 'codex', worker.session_id)
+        self.assertNotEqual(planner.session_id, worker.session_id)
+        self.assertNotEqual(planner_task, worker_task)
+        self.assertEqual(planner_task, self.requests[0].common_guidance.task_id)
+        self.assertEqual(worker_task, self.requests[1].common_guidance.task_id)
+        with self.assertRaisesRegex(RuntimeError, '다른 공통 지침 작업'):
+            repository.bind_session('repo', 'codex', planner.session_id, worker_task)
+        self.assertEqual(repository.session_task('repo', 'codex', planner.session_id), planner_task)
+
+    def test_started_independent_session_keeps_guidance_after_interruption_and_runtime_change(self):
+        outer = self
+        class InterruptedProvider:
+            def run(self, request):
+                outer.requests.append(request)
+                request.on_session_started('interrupted-planner')
+                raise KeyboardInterrupt()
+        self.provider_mock.return_value = InterruptedProvider()
+        with self.assertRaises(KeyboardInterrupt):
+            self.invoke(role='planner', plan=None, task='planning-input')
+        original = self.requests[-1].common_guidance
+        self.source.write_text('new runtime instructions')
+        self.provider_mock.return_value = self.provider
+        result = self.invoke(role='planner', plan=None, task='planning-input', session='interrupted-planner')
+        self.assertEqual(result.code, 0)
+        self.assertEqual(self.requests[-1].common_guidance, original)
+        self.assertEqual(self.requests[-1].session_id, 'interrupted-planner')
+        audit = self.connection.execute(
+            "SELECT result_kind, session_id FROM agent_invocations WHERE result_kind = 'interrupted'").fetchall()
+        self.assertEqual([tuple(row) for row in audit], [('interrupted', 'interrupted-planner')])
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM agent_invocations').fetchone()[0], 2)
+
+    def test_worker_reviewer_retry_and_new_tasks_preserve_runtime_version(self):
+        self.assertEqual(self.invoke().code, 0)
+        original = self.requests[-1].common_guidance
+        rows = self.connection.execute('SELECT guidance_task_id, guidance_content_hash FROM agent_invocations').fetchall()
+        self.assertEqual(tuple(rows[0]), (original.task_id, original.content_hash))
+        (self.worktree / 'docs').mkdir()
+        (self.worktree / self.guidance_module.COMMON_PATH).write_text('candidate changes', encoding='utf-8')
+        self.source.write_text('새 runtime 지침\n', encoding='utf-8')
+        for role, session in (('worker', 'session-1'), ('reviewer', None), ('worker', None)):
+            self.assertEqual(self.invoke(role=role, session=session).code, 0)
+            self.assertEqual(self.requests[-1].common_guidance, original)
+            self.assertEqual(self.requests[-1].prompt, 'delta only')
+        self.assertEqual(self.invoke(plan='G-148').code, 0)
+        self.assertNotEqual(self.requests[-1].common_guidance.content_hash, original.content_hash)
+        for role in ('planner', 'planner_check', 'reviewer'):
+            self.assertEqual(self.invoke(role=role, plan=None, task='independent-' + role).code, 0)
+            self.assertEqual(self.requests[-1].common_guidance.content, '새 runtime 지침\n')
+
+    def test_one_shot_rejects_state_inside_candidate_before_any_database_write(self):
+        state_dir = self.worktree / 'state'
+        result = manager.run_agent('codex', self.worktree, state_dir, self.root / 'config',
+            'worker', 'delta only', read_only=False, resolved_profile=invocation.ResolvedProfile('model', 'high'))
+        self.assertEqual(result.kind, invocation.AgentResultKind.PERMANENT_CONFIGURATION)
+        self.assertFalse(state_dir.exists())
+        self.provider_mock.assert_not_called()
+
+    def test_legacy_session_uses_existing_minimal_context_fallback_and_keeps_audit(self):
+        attempts = invocation.AttemptSequence('repo', 'G-147')
+        call = invocation.TrackedAgentCall(
+            lambda session, fallback, context: manager.run_agent(
+                'codex', self.worktree, self.state_dir, self.root / 'config', 'worker',
+                'new role/task context' if fallback else 'delta only', read_only=False,
+                connection=self.connection, invocation=context, session_id=session, persist_session=True,
+                resolved_profile=invocation.ResolvedProfile('model', 'high')),
+            attempts,
+        )
+        result = manager.run_agent_with_retries(call, session_id='legacy')
+        self.assertEqual(result.code, 0)
+        self.assertEqual(len(self.requests), 1)
+        self.assertIsNone(self.requests[0].session_id)
+        self.assertEqual(self.requests[0].prompt, 'new role/task context')
+        rows = self.connection.execute('SELECT session_id, transition, result_code FROM agent_invocations ORDER BY rowid').fetchall()
+        self.assertEqual([tuple(row) for row in rows], [('legacy', 'resume', 1), ('session-1', 'fallback', 0)])
+
+    def test_corrupt_or_missing_snapshot_never_reloads_latest_or_starts_provider(self):
+        for damage in ('hash', 'missing', 'encoding', 'directory', 'reference'):
+            with self.subTest(damage=damage):
+                self.assertEqual(self.invoke(plan='G-' + damage).code, 0)
+                saved = self.requests[-1].common_guidance
+                before = len(self.requests)
+                if damage == 'missing':
+                    saved.snapshot_path.unlink()
+                elif damage == 'directory':
+                    saved.snapshot_path.unlink()
+                    saved.snapshot_path.mkdir()
+                elif damage == 'reference':
+                    self.connection.execute('UPDATE common_guidance_versions SET snapshot_path = ? WHERE task_id = ?',
+                                            (str(self.source), saved.task_id))
+                else:
+                    saved.snapshot_path.write_bytes(b'changed' if damage == 'hash' else b'\xff')
+                self.source.write_text('latest ' + damage, encoding='utf-8')
+                result = self.invoke(role='reviewer', plan='G-' + damage)
+                self.assertEqual(result.result_kind, invocation.AgentResultKind.PERMANENT_CONFIGURATION)
+                self.assertEqual(len(self.requests), before)
+                self.assertIn('공통 지침', result.message)
+
+    def test_invalid_runtime_and_failed_storage_reject_before_process(self):
+        for value in (b'', b' \n', b'\xff', b'a\0b'):
+            with self.subTest(value=value):
+                self.source.write_bytes(value)
+                self.assertEqual(self.invoke().code, 1)
+                self.assertEqual(self.requests, [])
+        self.source.unlink()
+        self.assertEqual(self.invoke().code, 1)
+        self.source.mkdir()
+        self.assertEqual(self.invoke().code, 1)
+        self.source.rmdir()
+        self.source.write_text('valid', encoding='utf-8')
+        with mock.patch.object(self.guidance_module.GuidanceRepository, 'save', side_effect=sqlite3.OperationalError('disk full')):
+            result = self.invoke()
+        self.assertEqual(result.code, 1)
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM common_guidance_versions').fetchone()[0], 0)
+
+    def test_same_content_new_revision_and_restart_keep_stored_origin(self):
+        self.assertEqual(self.invoke().code, 0)
+        saved = self.requests[-1].common_guidance
+        with mock.patch.object(self.guidance_module.subprocess, 'run', return_value=
+                               manager.subprocess.CompletedProcess(['git'], 0, 'b' * 40)):
+            self.assertEqual(self.invoke(role='reviewer').code, 0)
+            self.assertEqual(self.requests[-1].common_guidance.source_revision, 'a' * 40)
+            self.assertEqual(self.invoke(plan='G-148').code, 0)
+        latest = self.requests[-1].common_guidance
+        self.assertEqual(latest.content_hash, saved.content_hash)
+        self.assertEqual(latest.snapshot_path, saved.snapshot_path)
+        self.assertEqual(latest.source_revision, 'b' * 40)
+
+    def test_session_cannot_cross_tasks_or_provider_preflight_failures(self):
+        self.invoke()
+        before = len(self.requests)
+        result = self.invoke(plan='G-148', session='session-1')
+        self.assertEqual(result.code, 1)
+        self.assertEqual(len(self.requests), before)
+        with mock.patch.object(self.provider, 'run', side_effect=self.guidance_module.GuidanceError('unsupported')):
+            result = self.invoke()
+        self.assertEqual(result.code, 1)
+        row = self.connection.execute('SELECT result_kind, result_code FROM agent_invocations ORDER BY rowid DESC LIMIT 1').fetchone()
+        self.assertEqual(tuple(row), ('permanent_configuration', 1))

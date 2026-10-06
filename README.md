@@ -22,9 +22,9 @@ pwsh -File scripts/copy-project-files.ps1 -TargetPath D:\repo\my-project
 bash scripts/copy-project-files.sh /path/to/my-project
 ```
 
-복사 스크립트는 공통 AGENTS·Specification Skill·문서 템플릿과 빈 작업 폴더, PRODUCT·ARCHITECTURE 초안을 준비한다. 대상에 `AGENTS.md`, `.agents` 또는 `docs`가 있으면 덮어쓰지 않고 중단한다. 자동 Loop에서는 호출하지 않는다.
+복사 스크립트는 최소 프로젝트 AGENTS·Specification Skill·문서 템플릿과 빈 작업 폴더, PRODUCT·ARCHITECTURE 초안을 준비한다. 기존 일반 파일 `AGENTS.md`는 byte 그대로 보존한다. `.agents`·`docs` 충돌이나 AGENTS의 symlink·디렉터리는 중단한다. 자동 Loop에서는 호출하지 않는다.
 
-기존 프로젝트에는 필요한 공통 파일(`AGENTS.md`, `.agents/skills/`, `docs/PLANS.md`, `docs/*.template.md`)만 선택적으로 병합한다.
+기존 프로젝트에는 필요한 Skill·문서 파일(`.agents/skills/`, `docs/PLANS.md`, `docs/*.template.md`)만 선택적으로 병합한다. AGENTS에는 프로젝트 전용 규칙을 유지하며 공통 본문을 복사할 필요가 없다.
 
 ### 2. 프로젝트 문서 작성·게시
 
@@ -33,7 +33,7 @@ bash scripts/copy-project-files.sh /path/to/my-project
 | `docs/PRODUCT.md` | 현재 제품의 동작·경계·장기 규칙 |
 | `docs/requirements/*.md` | 새 기능·정책 변경과 Acceptance Criteria |
 | `docs/ARCHITECTURE.md` | 제품 규칙을 보장하는 구조·기술 결정·복구 방식 |
-| `AGENTS.md` | 공통 작업 원칙을 유지하면서 필요한 프로젝트 작업 규칙 추가 |
+| `AGENTS.md` | 프로젝트 전용 언어·코딩·빌드 규칙 |
 
 PRODUCT와 활성 Requirement 중 하나 이상은 반드시 있어야 한다. 초기 제품은 PRODUCT로 정의하고 운영 중 변경은 Requirement로 작성한다. Requirement는 frontmatter·상태 없이 `docs/requirements/` 바로 아래에 두며 모두 Planner 입력이 된다.
 
@@ -59,7 +59,7 @@ Loop Manager 자체 verify는 `[loop] verify_parallelism = auto`가 기본이다
 
 Manager 실행의 시간 이벤트·worker 원문·manifest·집계는 상태 디렉터리 `logs/verify/<실행 ID>/`에 남는다. 단독 스크립트는 `.cache/verify/<실행 ID>/`를 사용한다. 기존 두 OS 스크립트가 같은 runner로 전체 unittest와 compile을 수행하며 실제 Agent CLI·외부 API 연결은 테스트 프로세스에서 차단된다. 시간 집계만 읽으려면 `python -m loop_manager_internal.verification.runner --report <직렬 기록 디렉터리> <auto 기록 디렉터리>`를 사용한다. 이 명령은 테스트를 실행하지 않는다. 비교 결과의 범위·관측 환경 일치와 원본의 부하·메모리 제한을 확인한 뒤 시간을 해석한다.
 
-실제 config에는 비밀값이 들어갈 수 있으므로 Git에 commit하지 않는다. 상태·PR·session은 source checkout 밖 사용자 상태 디렉터리의 SQLite에 저장한다. 상태 디렉터리는 백업해 둔다.
+실제 config에는 비밀값이 들어갈 수 있으므로 Git에 commit하지 않는다. 상태·PR·session은 source checkout 밖 사용자 상태 디렉터리의 SQLite에 저장한다. 공통 지침 snapshot은 같은 디렉터리의 `agent-guidance/<내용 SHA-256>.md`에 저장하며 SQLite의 작업·session 결합과 함께 백업한다. 누락·손상된 snapshot을 최신 지침으로 바꿔 재개하지 않는다.
 
 ### 4. 상태 초기화와 프로젝트 등록
 
@@ -75,9 +75,9 @@ Manager 실행의 시간 이벤트·worker 원문·manifest·집계는 상태 �
 .venv/bin/python loop_manager.py config list
 ```
 
-init은 한 번 실행하고 프로젝트마다 add한다. provider를 생략하면 codex를 사용한다. 등록 검사는 fetch한 원격 base의 필수 문서·공통 파일·provider를 기준으로 하며 로컬 전용 편집은 반영하지 않는다.
+init은 한 번 실행하고 프로젝트마다 add한다. provider를 생략하면 codex를 사용한다. 등록 검사는 fetch한 원격 base의 필수 문서·provider를 기준으로 하며 로컬 전용 편집은 반영하지 않는다.
 
-공통 AGENTS 내용이 없으면 등록을 거부한다. 파일 내용을 확인한 경우에만 `--approve-agents-mismatch`로 해당 blob 해시에 결합된 승인을 저장할 수 있다. 진행 중인 계획·프로젝트 차단·미해결 planning 오류가 없으면 `config remove <path>`로 등록만 해제하며 파일·branch·worktree·PR·MERGED 감사는 보존한다.
+원격 루트 AGENTS의 존재와 UTF-8을 확인하며 공통 내용 포함·일치 승인을 요구하지 않는다. `--approve-agents-mismatch`와 과거 승인 기록은 호환을 위해 남긴다. 진행 중인 계획·프로젝트 차단·미해결 planning 오류가 없으면 `config remove <path>`로 등록만 해제하며 파일·branch·worktree·PR·MERGED 감사는 보존한다.
 
 Planner는 검증된 계획을 base branch에 fast-forward push하므로 Loop Manager 계정의 직접 push가 허용돼야 한다. 구현은 `loop-manager/<execplan-id>` branch에서 진행하고 PR로 제출한다.
 
@@ -97,6 +97,10 @@ cron 또는 Windows 작업 스케줄러에는 `run --skip-if-running`을 등록�
 
 bootstrap은 최신 `origin/main`의 정확한 SHA에서 runtime을 실행한다. source checkout의 로컬 main·미커밋 변경·로컬 전용 commit은 실행 revision이 아니다. 기본 프로젝트 checkout은 안전한 경우에만 fast-forward하고 그 밖의 로컬 상태는 보존한다. [실행·동기화 구조](docs/ARCHITECTURE.md#git과-worktree-실행-모델)
 
+공통 자동 지침은 이 runtime의 `docs/AGENTS.common.md`에서 확정해 Codex의 추가 developer 지침 또는 Claude의 append system prompt 파일로 전달한다. 기본 지침·기존 추가 지침·프로젝트 규칙을 보존하며, 지원되지 않는 CLI·설정 충돌은 모델 실행 전에 중단한다. Claude의 기존 격리 검증 gate도 유지한다. ExecPlan의 Worker·Reviewer·재시도와 복구는 같은 snapshot을 사용하고 새 작업만 최신 공통 내용을 선택한다. 내용이 같으면 runtime SHA 갱신만으로 재계획하지 않는다.
+
+작업 worktree의 `docs/AGENTS.common.md`는 일반 파일 권한으로 수정하고 PR에 최종 경로·diff·이유·영향을 보고한다. 후보 파일은 현재 실행 지침을 바꾸지 않는다. 새 프로젝트 AGENTS 제안은 self 저장소도 루트 `AGENTS.md`·`project` scope로 사용자 판단을 받으며, 과거 `common` 승인은 원래 대상·기준·patch로 처리한다. 이 저장소 루트의 기존 공통 본문 정리는 G-174의 정확한 사전 승인과 선행 Merge·runtime 검증 후 별도 PR로 수행한다.
+
 ## 실행 후 사용자가 할 일
 
 | 상황 | 조치 |
@@ -107,6 +111,8 @@ bootstrap은 최신 `origin/main`의 정확한 SHA에서 runtime을 실행한다
 | cleanup_pending | 미커밋·미게시 작업 또는 불확실한 worktree가 보존돼 있다. 안전 조건 충족·경로 부재 시 자동 해제되며 다음 작업·완료를 막지 않는다. |
 
 정상 실행에서는 코드·테스트·ExecPlan·SQLite 상태를 직접 작성할 필요가 없다. Planner가 계획을 만들고 Worker가 구현·targeted test·verify 스크립트를 준비한다. 전체 verify는 Manager가 실행하고 실패 출력만 Worker에게 전달한다. Reviewer는 읽기 전용으로 검토하고 사용자가 PR을 Merge한다.
+
+사용자의 직접 작업과 대화형 Agent의 로컬 구현에는 자동 Worker 역할·SQLite 전이·ExecPlan 선작성·자동 완료 절차를 요구하지 않는다. 새 기능·정책은 동일하게 Requirement에서 시작한다. 직접 구현과 활성 Requirement를 원격 base에 게시하면 Planner는 실제 미충족 작업만 재점검하며 소급·중복 계획이나 자동 검증 성공 기록을 만들지 않는다.
 
 Merge 확인 뒤 worktree가 clean하고 PR head에 없는 로컬 commit이 없으면 Merge·Squash·Rebase 방식과 관계없이 정리한다. 안전성을 확인할 수 없는 작업 공간은 보존한다.
 

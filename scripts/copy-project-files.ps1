@@ -13,16 +13,38 @@ if (-not (Test-Path -LiteralPath $TargetPath -PathType Container)) {
 
 $target = (Resolve-Path -LiteralPath $TargetPath).Path
 $conflicts = @(
-    (Join-Path $target 'AGENTS.md')
     (Join-Path $target '.agents')
     (Join-Path $target 'docs')
-) | Where-Object { Test-Path -LiteralPath $_ }
+) | Where-Object { $null -ne (Get-Item -LiteralPath $_ -Force -ErrorAction SilentlyContinue) }
+$agentsPath = Join-Path $target 'AGENTS.md'
+$existingAgents = Get-Item -LiteralPath $agentsPath -Force -ErrorAction SilentlyContinue
+if ($existingAgents -and ($existingAgents.PSIsContainer -or
+        ($existingAgents.Attributes -band [IO.FileAttributes]::ReparsePoint))) {
+    $conflicts += "$agentsPath (일반 파일이 아님)"
+}
 
 if ($conflicts) {
     throw "이미 존재하는 파일 또는 폴더가 있습니다: $($conflicts -join ', ')"
 }
 
-Copy-Item -LiteralPath (Join-Path $sourceRoot 'AGENTS.md') -Destination (Join-Path $target 'AGENTS.md')
+if (-not $existingAgents) {
+    $minimalAgents = @'
+# Project instructions
+
+프로젝트 전용 언어·코딩·빌드 규칙은 이 파일에 기록한다.
+새로운 기능이나 정책 변경은 Requirement에서 시작한다.
+구현 전에 존재하는 관련 문서를 확인한다:
+- docs/PRODUCT.md: 현재 제품 동작과 장기 규칙
+- docs/requirements/*.md: 원하는 변경, 이유와 Acceptance Criteria
+- docs/ARCHITECTURE.md: 시스템 설계
+docs/PRODUCT.md 또는 활성 Requirement 중 하나는 반드시 존재해야 한다.
+'@
+    $stream = [IO.File]::Open($agentsPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)
+    try {
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes($minimalAgents + "`n")
+        $stream.Write($bytes, 0, $bytes.Length)
+    } finally { $stream.Dispose() }
+}
 Copy-Item -LiteralPath (Join-Path $sourceRoot '.agents') -Destination (Join-Path $target '.agents') -Recurse
 
 $directories = @(

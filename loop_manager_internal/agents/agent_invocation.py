@@ -7,9 +7,12 @@ from enum import Enum
 from pathlib import Path
 import re
 import subprocess
-from typing import Callable
+from typing import Callable, TYPE_CHECKING
 
 from loop_manager_internal.agents.agent_write_isolation import IsolationEvidence
+
+if TYPE_CHECKING:
+    from loop_manager_internal.agents.common_guidance import CommonGuidance
 
 
 @dataclass(frozen=True)
@@ -132,6 +135,7 @@ class AgentRequest:
     on_isolation_checked: Callable[[IsolationEvidence], None] | None = None
     isolation_snapshot_digest: Callable[[], str] | None = None
     expected_repository: str | None = None
+    common_guidance: CommonGuidance | None = None
 
 
 @dataclass(frozen=True)
@@ -147,6 +151,7 @@ class InvocationContext:
     previous_model: str | None = None
     previous_effort: str | None = None
     previous_session_id: str | None = None
+    task_id: str | None = None
 
 
 class AttemptSequence:
@@ -154,12 +159,13 @@ class AttemptSequence:
 
     def __init__(self, repo: str, plan_id: str | None, revision: str | None = None,
                  initial_transition: str | None = None,
-                 initial_cause: str | None = None):
+                 initial_cause: str | None = None, task_id: str | None = None):
         self.repo = repo
         self.plan_id = plan_id
         self.revision = revision
         self.initial_transition = initial_transition
         self.initial_cause = initial_cause
+        self.task_id = task_id
         self.count = 0
         self.previous_failure: str | None = None
         self.fallback_recorded = False
@@ -177,7 +183,8 @@ class AttemptSequence:
             transition = "resume" if session_id else "start"
             cause = self.previous_failure
         return InvocationContext(
-            self.repo, self.plan_id, self.revision, transition, cause, self.count
+            self.repo, self.plan_id, self.revision, transition, cause, self.count,
+            task_id=self.task_id,
         )
 
 

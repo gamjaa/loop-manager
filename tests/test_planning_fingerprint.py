@@ -384,3 +384,62 @@ class PlanningFingerprintTest(unittest.TestCase):
             self.assertEqual(roles, ["planner", "worker"])
             self.assertEqual(row["phase"], "WORKING")
             self.assertEqual(row["planning_fingerprint"], expected_fingerprint)
+
+
+class CommonGuidanceFingerprintTest(unittest.TestCase):
+    def test_common_content_changes_all_planning_inputs_but_not_revision_or_location(self):
+        from loop_manager_internal.agents import common_guidance
+        from loop_manager_internal.planning import input_fingerprints
+        entries = [(b'AGENTS.md', b'blob', b'project')]
+        functions = (input_fingerprints._planning_input_digest,
+                     input_fingerprints._nonplan_input_digest,
+                     input_fingerprints._specification_input_digest)
+        with mock.patch.object(common_guidance, 'runtime_content_hash', return_value='a' * 64):
+            initial = [function(entries) for function in functions]
+        with mock.patch.object(common_guidance, 'runtime_content_hash', return_value='b' * 64):
+            changed = [function(entries) for function in functions]
+            pinned = [function(entries, guidance_hash='a' * 64) for function in functions]
+        self.assertEqual(initial, pinned)
+        self.assertTrue(all(before != after for before, after in zip(initial, changed)))
+
+    def test_same_remote_sha_cannot_hide_common_change_behind_archive_or_nonplan_comparison(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.agents import common_guidance
+        from loop_manager_internal.storage import planning_input_state
+        from loop_manager_internal.planning.selection_service import PlanningSelectionService
+        connection = sqlite3.connect(':memory:')
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        with mock.patch.object(common_guidance, 'runtime_content_hash', return_value='a' * 64):
+            planning_input_state.record_general(connection, 'repo', 'revision', {})
+            self.assertFalse(planning_input_state.guidance_changed(connection, 'repo'))
+        git = SimpleNamespace(runtime_guidance_changed=lambda _path: planning_input_state.guidance_changed(connection, 'repo'),
+                              nonplan_fingerprint=mock.Mock(return_value='same'),
+                              specification_fingerprint=mock.Mock(return_value='same'),
+                              requirement_archive_only=mock.Mock(return_value=True))
+        service = PlanningSelectionService(SimpleNamespace(git=git))
+        context = SimpleNamespace(repo_path=Path('repo'))
+        with mock.patch.object(common_guidance, 'runtime_content_hash', return_value='b' * 64):
+            self.assertTrue(service._general_planning_required(None, context, 'same-sha', 'current'))
+            self.assertTrue(service._specification_planning_required(None, context, 'same-sha', 'current', 'current'))
+        git.nonplan_fingerprint.assert_not_called()
+        git.requirement_archive_only.assert_not_called()
+
+    def test_owned_planning_workspace_keeps_version_across_runtime_and_remote_changes(self):
+        from loop_manager_internal.agents import common_guidance
+        from loop_manager_internal.agents.agent_invocation import InvocationContext
+        from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        connection.execute('CREATE TABLE projects (repo TEXT, phase TEXT, worktree TEXT, planning_attempt_fingerprint TEXT)')
+        connection.execute("INSERT INTO projects VALUES ('repo', 'PLANNING', '/worktree', 'attempt-one')")
+        context = common_guidance.independent_context(connection, InvocationContext('repo', None), Path('/worktree'))
+        repository = GuidanceRepository(connection)
+        repository.save(common_guidance.task_identity(context, 'planner', Path('/worktree')),
+                        'repo', 'a' * 64, 'b' * 40, '/snapshot')
+        with mock.patch.object(common_guidance, 'runtime_content_hash', return_value='c' * 64):
+            self.assertEqual(common_guidance.planning_content_hash(connection, 'repo'), 'a' * 64)
+            connection.execute("UPDATE projects SET worktree = '/rebased-worktree'")
+            self.assertEqual(common_guidance.planning_content_hash(connection, 'repo'), 'a' * 64)
+            connection.execute("UPDATE projects SET phase = NULL")
+            self.assertIsNone(common_guidance.planning_content_hash(connection, 'repo'))

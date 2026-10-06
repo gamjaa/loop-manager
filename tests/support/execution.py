@@ -10,6 +10,8 @@ from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.execution.execution_state import ExecutionStatePort
 from tests.support.database import runtime_connection
 from loop_manager_internal.execution.worker_session import SessionBinding
+from loop_manager_internal.agents.common_guidance import plan_content_hash
+import json
 
 
 READY_WORKER_RESULT = 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\nresult'
@@ -124,6 +126,7 @@ class ExecutionFixture:
         self.effects.validation.validate_active_execplan_metadata.return_value = self.plan
         self.effects.validation.parse_worker_result.return_value = SimpleNamespace(
             commit_title='Concrete change', test_evidence='targeted test: PASS',
+            summary='Implement the selected product change.',
         )
         self.effects.validation.verify.side_effect = lambda _: (self.calls.append('verify') or True, 'OK')
         self.effects.validation.parse_reviewer_result.return_value = ('PASS', ())
@@ -138,7 +141,7 @@ class ExecutionFixture:
             self.effects.workspace.remote_branch_oid.return_value = self.remote
             return self.remote
         self.effects.publication.push_managed_publication_branch.side_effect = push
-        self.effects.publication.command.side_effect = lambda *a, **k: self.calls.append('pr') or SimpleNamespace(stdout='https://example/pr/1')
+        self.effects.publication.command.side_effect = self.publication_command
         self.effects.revision.reconcile_catalog.side_effect = lambda *_: SimpleNamespace(
             kind=SimpleNamespace(value='reconciled'), revision_sha=self.remote
         )
@@ -228,6 +231,16 @@ class ExecutionFixture:
             output = ' M app.py'
         return SimpleNamespace(stdout=output, returncode=0)
 
+    def publication_command(self, arguments, **_kwargs):
+        if arguments[:3] == ['gh', 'pr', 'view']:
+            row = self.state.row()
+            return SimpleNamespace(returncode=0, stdout=json.dumps({
+                'body': '', 'state': 'OPEN',
+                'headRefOid': row['publication_remote_oid'] or row['pr_head_oid'] or self.remote,
+            }))
+        self.calls.append('pr')
+        return SimpleNamespace(returncode=0, stdout='https://example/pr/1')
+
     def agent(self, *args, **kwargs):
         self.calls.append(args[4])
         kwargs['on_session_started']('session')
@@ -244,6 +257,7 @@ class ExecutionFixture:
             title='Runtime', sources=('docs/PRODUCT.md',), depends_on=(),
             complexity='medium', risk='medium', priority='normal',
             body_hash='body', source_fingerprint='source', archive_candidates=(),
+            guidance_hash=plan_content_hash(self.connection, 'repo', 'G-047'),
         )
         self.handler._definition_snapshot = snapshot
         self.state.update_project(

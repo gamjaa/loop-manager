@@ -199,3 +199,99 @@ class ExecutionDocumentsTests(ExecutionRecoveryScenarios, ExecutionPhaseScenario
         self.assertNotIsInstance(outcome, ExecutionOutcome)
         self.assertEqual(self.handler.archive_sources, ())
         self.effects.archive.requirement_archive_sources.assert_not_called()
+
+
+class CommonGuidancePrReportTests(TestCase):
+    def test_existing_pr_push_refreshes_report_for_confirmed_head_before_merge_wait(self):
+        from loop_manager_internal.execution import execution_publication_handler as publication
+        context = SimpleNamespace(branch='branch', worktree=Path('/candidate'))
+        row = {'pr_url': 'https://github.com/o/r/pull/1', 'publication_remote_oid': 'previous',
+               'validated_base_sha': 'latest-base', 'pr_conflict_recovery': 0, 'worker_result': 'result'}
+        state = mock.Mock()
+        ports = SimpleNamespace(
+            identity=SimpleNamespace(repo='repo', repo_path=Path('/repo'), state_dir=Path('/state')),
+            pr_for_branch=lambda *_: {'state': 'OPEN'}, _row=lambda: row, checkpoint=None,
+            state=state, _context=lambda: context, _post_effect_guard=lambda c: c,
+            push_owned_pr_conflict_recovery=mock.Mock(return_value='confirmed-head'),
+            snapshot=lambda: SimpleNamespace(plan={}), parse_worker_result=lambda *_: SimpleNamespace(summary='reason'),
+            git=mock.Mock(return_value=SimpleNamespace(stdout='git@github.com:o/r.git\n')),
+            command=mock.Mock(), operation_print=mock.Mock())
+        with mock.patch.object(publication, 'common_guidance_report', return_value='final report') as report, mock.patch.object(
+            publication, 'refresh_common_guidance_pr') as refresh:
+            result = publication.PublicationHandler(ports)._publish_existing_pull_request(context, row, 'confirmed-head')
+        self.assertEqual(result.kind, ExecutionOutcomeKind.SUCCESS)
+        state.confirm_existing_pr_push.assert_called_once_with(None, 'confirmed-head')
+        self.assertEqual(report.call_args.args[2:4], ('latest-base', 'confirmed-head'))
+        self.assertEqual(refresh.call_args.args[-2:],
+                         ({'url': row['pr_url'], 'state': 'OPEN', 'headRefOid': 'confirmed-head'}, 'final report'))
+        state.open_pull_request.assert_called_once()
+
+    def test_open_pr_refresh_preserves_user_body_and_removes_stale_common_report(self):
+        import json
+        import tempfile
+        from loop_manager_internal.documents import pr_description as pr
+        old = pr.COMMON_REPORT_START + '\nold diff\n' + pr.COMMON_REPORT_END
+        new = pr.COMMON_REPORT_START + '\nfinal diff\n' + pr.COMMON_REPORT_END
+        original = 'User summary\n\n' + old + '\n\nUser notes\n'
+        updated = []
+        def command(args, **_kwargs):
+            if args[2] == 'view':
+                return SimpleNamespace(returncode=0, stdout=json.dumps(
+                    {'body': original, 'headRefOid': 'head', 'state': 'OPEN'}))
+            updated.append(Path(args[-1]).read_text(encoding='utf-8'))
+            return SimpleNamespace(returncode=0, stdout='')
+        pull_request = {'url': 'https://github.com/o/r/pull/1', 'state': 'OPEN', 'headRefOid': 'head'}
+        with tempfile.TemporaryDirectory() as directory:
+            for report in (new, ''):
+                pr.refresh_common_guidance_pr(command, Path('/candidate'), Path(directory), pull_request, report)
+                self.assertIn('User summary', updated[-1])
+                self.assertIn('User notes', updated[-1])
+                self.assertNotIn('old diff', updated[-1])
+            self.assertIn('final diff', updated[0])
+            self.assertNotIn(pr.COMMON_REPORT_START, updated[1])
+            self.assertEqual(list((Path(directory) / 'logs').iterdir()), [])
+            for malformed in (pr.COMMON_REPORT_END + pr.COMMON_REPORT_START,
+                              pr.COMMON_REPORT_START,
+                              old + old):
+                original = malformed
+                previous = len(updated)
+                with self.assertRaises(RuntimeError):
+                    pr.refresh_common_guidance_pr(command, Path('/candidate'), Path(directory), pull_request, new)
+                self.assertEqual(len(updated), previous)
+            for state in ('MERGED', 'CLOSED'):
+                never = mock.Mock()
+                pr.refresh_common_guidance_pr(never, Path('/candidate'), Path(directory), dict(pull_request, state=state), new)
+                never.assert_not_called()
+
+    def test_final_candidate_change_facts_patch_reason_impact_and_link_are_reported(self):
+        from loop_manager_internal.documents.pr_description import common_guidance_report
+        for status in ('A', 'M', 'D', 'R100'):
+            with self.subTest(status=status):
+                paths = ['docs/AGENTS.common.md', 'docs/rules.md'] if status.startswith('R') else ['docs/AGENTS.common.md']
+                names = '\0'.join([status, *paths, ''])
+                patch = 'diff --git a/docs/AGENTS.common.md b/docs/AGENTS.common.md\n-old\n+new ``` guidance\n'
+                def git(_worktree, *args):
+                    return SimpleNamespace(stdout=names if '--name-status' in args else patch)
+                report = common_guidance_report(git, Path('/candidate'), 'a' * 40, 'b' * 40,
+                                                'git@github.com:org/project.git', '권한 경계를 보존한다.')
+                for value in ('docs/AGENTS.common.md', status, patch.rstrip(), '권한 경계를 보존한다.',
+                              '현재 작업', '/compare/' + 'a' * 40 + '...' + 'b' * 40):
+                    self.assertIn(value, report)
+                updated = common_guidance_report(git, Path('/candidate'), 'c' * 40, 'd' * 40,
+                                                 'git@github.com:org/project.git', 'Updated reason')
+                self.assertNotIn('a' * 40, updated)
+                self.assertIn('d' * 40, updated)
+
+    def test_unrelated_change_has_no_guidance_report_and_summary_is_preserved(self):
+        from loop_manager_internal.documents.pr_description import common_guidance_report
+        git = mock.Mock(return_value=SimpleNamespace(stdout='M\0src/app.py\0'))
+        self.assertEqual(common_guidance_report(git, Path('/candidate'), 'a' * 40, 'b' * 40,
+                                               'git@github.com:org/project.git', 'summary'), '')
+        git.assert_called_once()
+        worker = lm.WorkerPublication('Title', 'actual summary', 'test: PASS')
+        body = lm.build_pr_body(worker, {'id': 'G-147', 'title': 'Guidance', 'sources': ['docs/PRODUCT.md']},
+                                'docs/plans/[G-147] Plan.md', '## Purpose\n\nKeep instructions.\n',
+                                'git@github.com:org/project.git', 'a' * 40,
+                                common_guidance_change='final common change')
+        self.assertIn('actual summary', body)
+        self.assertIn('final common change', body)

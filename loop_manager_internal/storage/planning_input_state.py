@@ -5,6 +5,7 @@ import json
 import sqlite3
 from typing import Mapping
 from loop_manager_internal.storage import planner_check_state
+from loop_manager_internal.agents import common_guidance
 
 
 FORMAT = "active-plan-content-sha256-v1"
@@ -28,6 +29,16 @@ PlanEntries = Mapping[str, tuple[str, str]]
 
 def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(SCHEMA)
+    columns = {row[1] for row in connection.execute('PRAGMA table_info(planning_input_baselines)')}
+    if 'guidance_hash' not in columns:
+        connection.execute('ALTER TABLE planning_input_baselines ADD COLUMN guidance_hash TEXT')
+
+
+def guidance_changed(connection: sqlite3.Connection, repo: str) -> bool:
+    ensure_schema(connection)
+    row = connection.execute('SELECT guidance_hash FROM planning_input_baselines WHERE repo = ? AND scope = ?',
+                             (repo, SCOPE)).fetchone()
+    return row is None or row[0] != common_guidance.runtime_content_hash()
 
 
 def _encoded(entries: PlanEntries) -> str:
@@ -76,14 +87,15 @@ def record_general(
     ensure_schema(connection)
     connection.execute(
         "INSERT INTO planning_input_baselines "
-        "(repo, scope, reference_revision, last_verified_revision, fingerprint_format, full_input_format, entries) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?) "
+        "(repo, scope, reference_revision, last_verified_revision, fingerprint_format, full_input_format, entries, guidance_hash) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
         "ON CONFLICT(repo, scope) DO UPDATE SET "
         "reference_revision = excluded.reference_revision, "
         "last_verified_revision = excluded.last_verified_revision, "
         "fingerprint_format = excluded.fingerprint_format, "
-        "full_input_format = excluded.full_input_format, entries = excluded.entries",
-        (repo, SCOPE, revision, revision, FORMAT, FULL_FORMAT, _encoded(entries)),
+        "full_input_format = excluded.full_input_format, entries = excluded.entries, guidance_hash = excluded.guidance_hash",
+        (repo, SCOPE, revision, revision, FORMAT, FULL_FORMAT, _encoded(entries),
+         common_guidance.planning_content_hash(connection, repo) or common_guidance.runtime_content_hash()),
     )
     check = planner_check_state.get(connection, repo)
     if check is not None and check['stage'] != 'accepted':

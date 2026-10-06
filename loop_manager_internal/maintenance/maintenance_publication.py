@@ -1,5 +1,6 @@
 """maintenance maintenance publication boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.agents import common_guidance
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.application.contracts import ValidatedPlanningResult
@@ -687,28 +688,27 @@ def _apply_maintenance_planning_batch(
                 expected_revision=context.cycle_revision,
                 remote_commit=plan_commit,
             )
+        guidance_hash = common_guidance.effective_planning_hash(connection, repo)
+        from loop_manager_internal.storage import planning_input_state
+        after = effects.plan_declarations(worktree, plan_commit)
+        if include_general_planning:
+            planning_input_state.record_general(connection, repo, plan_commit, after)
         effects._clear_active_in_current_transaction(
             connection,
             repo,
             processed_sha=plan_commit if include_general_planning else None,
             specification_fingerprint=(
-                effects._specification_input_fingerprint(worktree, plan_commit)
+                effects._specification_input_fingerprint(worktree, plan_commit, guidance_hash=guidance_hash)
                 if include_general_planning
                 else None
             ),
             planning_fingerprint=(
-                effects._planning_input_fingerprint(worktree, plan_commit)
+                effects._planning_input_fingerprint(worktree, plan_commit, guidance_hash=guidance_hash)
                 if include_general_planning
                 else None
             ),
         )
-        from loop_manager_internal.storage import planning_input_state
-        after = effects.plan_declarations(worktree, plan_commit)
-        if include_general_planning:
-            planning_input_state.record_general(
-                connection, repo, plan_commit, after,
-            )
-        else:
+        if not include_general_planning:
             before = effects.plan_declarations(worktree, context.active_sha)
             planning_input_state.advance_verified_delta(
                 connection, repo, plan_commit,

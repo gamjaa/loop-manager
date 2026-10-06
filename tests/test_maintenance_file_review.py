@@ -603,3 +603,64 @@ class ReviewReceiptUnitTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CommonGuidanceReviewReuseTest(unittest.TestCase):
+    def setUp(self):
+        from tests.support.maintenance import inventory
+        self.connection = sqlite3.connect(':memory:')
+        self.addCleanup(self.connection.close)
+        self.connection.execute('CREATE TABLE projects (repo TEXT PRIMARY KEY, phase TEXT)')
+        self.connection.execute("INSERT INTO projects VALUES ('repo', 'PLANNING')")
+        self.inventory = inventory({'pkg/a.py': b'def run():\n    return 1\n'}, 'revision')
+        self.inventory = maintenance_file_inventory.SourceInventory(
+            'revision', tuple(maintenance_file_inventory.TrackedSource(
+                source.path, source.content_hash, source.mode, 'revision', 'source',
+            ) for source in self.inventory.sources), (),
+        )
+        self.ledger = maintenance_file_ledger.FileReviewRepository(self.connection)
+
+    def test_file_success_reuse_checks_common_hash_while_audit_stays_readable(self):
+        from loop_manager_internal.agents import common_guidance
+        source = self.inventory.sources[0]
+        self.connection.execute('INSERT INTO file_review_ledger VALUES (?, ?, ?, ?, ?, ?, 1)',
+                                ('repo', source.path, source.content_hash, source.mode, 'revision', 'time'))
+        self.connection.execute('INSERT INTO file_assessment_successes VALUES (?, ?, ?, ?)',
+                                ('repo', 'revision', 'time', 'a' * 64))
+        with mock.patch.object(common_guidance, 'runtime_content_hash', return_value='a' * 64):
+            self.assertEqual(self.ledger.selected_sources('repo', self.inventory), ())
+        with mock.patch.object(common_guidance, 'runtime_content_hash', return_value='b' * 64):
+            self.assertEqual(self.ledger.selected_sources('repo', self.inventory), self.inventory.sources)
+            self.assertEqual(len(self.ledger.reviews('repo')), 1)
+
+    def test_legacy_provisional_result_is_preserved_and_rechecked_with_current_guidance(self):
+        from loop_manager_internal.agents import common_guidance
+        repository = review.ProvisionalReviewRepository(self.connection)
+        source = self.inventory.sources[0]
+        self.connection.execute('INSERT INTO provisional_file_reviews '
+                                '(repo, path, cycle_revision, source_revision, content_hash, mode, session_id, validation_error, result_json) '
+                                'VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+                                ('repo', source.path, 1, 'revision', source.content_hash, source.mode,
+                                 'legacy-session', 'old-failure', '{"old":"judgment"}'))
+        with mock.patch.object(common_guidance, 'runtime_content_hash', return_value='a' * 64), \
+             mock.patch.object(review, 'cached_source_inventory', return_value=self.inventory), \
+             mock.patch.object(self.ledger.__class__, 'reusable_root_reviews', return_value=()):
+            result = repository.progress('repo', Path('repo'), 'main', 1, self.inventory)
+        self.assertEqual(result.completed, ())
+        row = self.connection.execute('SELECT guidance_hash, session_id, result_json, prior_guidance_results '
+                                      'FROM provisional_file_reviews').fetchone()
+        self.assertEqual(row[:3], ('a' * 64, None, None))
+        history = json.loads(row[3])
+        self.assertEqual(history[0]['session_id'], 'legacy-session')
+        self.assertEqual(history[0]['result_json'], '{"old":"judgment"}')
+        self.assertEqual(history[0]['validation_error'], 'old-failure')
+        empty = maintenance_file_inventory.SourceInventory('new-revision', (), ())
+        with mock.patch.object(common_guidance, 'runtime_content_hash', return_value='a' * 64), \
+             mock.patch.object(review, 'cached_source_inventory', return_value=empty), \
+             mock.patch.object(self.ledger.__class__, 'reusable_root_reviews', return_value=()):
+            repository.progress('repo', Path('repo'), 'main', 1, empty)
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM provisional_file_reviews').fetchone()[0], 0)
+        audit = json.loads(self.connection.execute(
+            'SELECT snapshot_json FROM provisional_file_review_guidance_history').fetchone()[0])
+        self.assertEqual((audit['session_id'], audit['source_revision'], audit['result_json']),
+                         ('legacy-session', 'revision', '{"old":"judgment"}'))

@@ -10,6 +10,8 @@ from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
 from pathlib import Path
 import sqlite3
 import subprocess
+from loop_manager_internal.agents import common_guidance
+from loop_manager_internal.storage import planning_input_state
 
 
 @dataclass(frozen=True)
@@ -104,16 +106,23 @@ class _PlanningGitPorts:
         restore_conflict(self._connection, repo, worktree, stash_sha)
 
     def input_fingerprint(self, repo_path: Path, sha: str) -> str:
-        return self._effects._planning_input_fingerprint(repo_path, sha)
+        return self._effects._planning_input_fingerprint(repo_path, sha, **self._guidance_argument(repo_path))
 
     def nonplan_fingerprint(self, repo_path: Path, sha: str) -> str:
-        return self._effects._nonplan_input_fingerprint(repo_path, sha)
+        return self._effects._nonplan_input_fingerprint(repo_path, sha, **self._guidance_argument(repo_path))
 
     def plan_declarations(self, repo_path: Path, sha: str) -> dict[str, tuple[str, str]]:
         return self._effects.plan_declarations(repo_path, sha)
 
     def specification_fingerprint(self, repo_path: Path, sha: str) -> str:
-        return self._effects._specification_input_fingerprint(repo_path, sha)
+        return self._effects._specification_input_fingerprint(repo_path, sha, **self._guidance_argument(repo_path))
+
+    def _guidance_argument(self, repo_path: Path) -> dict:
+        saved = common_guidance.planning_content_hash(self._connection, str(repo_path))
+        return {'guidance_hash': saved} if saved else {}
+
+    def runtime_guidance_changed(self, repo_path: Path) -> bool:
+        return planning_input_state.guidance_changed(self._connection, str(repo_path))
 
     def requirement_archive_only(
         self, repo_path: Path, old_sha: str, new_sha: str,

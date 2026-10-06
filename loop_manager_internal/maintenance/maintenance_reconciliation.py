@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+from loop_manager_internal.agents import common_guidance
 import json
 from pathlib import Path
 import re
@@ -322,7 +323,8 @@ class ReconciliationRepository:
         maps = self.valid_maps(repo, inventory)
         selected = {item.path for item in reviews.selected}
         query = hashlib.sha256(json.dumps(
-            ["reverse-symbol-v1", sorted(reviews.completed, key=lambda item: item["path"])],
+            ["reverse-symbol-v1", common_guidance.effective_planning_hash(self.connection, repo),
+             sorted(reviews.completed, key=lambda item: item["path"])],
             ensure_ascii=False, sort_keys=True,
         ).encode()).hexdigest()
         signals, remaining, reads = [], False, 0
@@ -742,18 +744,33 @@ class SynthesisRepository:
             repo TEXT NOT NULL REFERENCES projects(repo), page_index INTEGER NOT NULL,
             digest TEXT NOT NULL, decision_digest TEXT NOT NULL, result_json TEXT,
             session_id TEXT, validation_error TEXT, PRIMARY KEY (repo, page_index))""")
+        connection.execute("""CREATE TABLE IF NOT EXISTS provisional_synthesis_history (
+            repo TEXT NOT NULL, digest TEXT NOT NULL, snapshot_json TEXT NOT NULL,
+            PRIMARY KEY (repo, digest))""")
 
     def prepare(self, repo: str, cycle: int, revision: str,
                 progress: ReconciliationProgress) -> SynthesisPage:
         pages = synthesis_pages(progress)
         digest = hashlib.sha256(json.dumps(
-            ["packed-pages-v3", cycle, revision, pages], ensure_ascii=False,
+            ["packed-pages-v3", cycle, revision, pages,
+             common_guidance.effective_planning_hash(self.connection, repo)], ensure_ascii=False,
         ).encode()).hexdigest()
         with self.connection:
             row = self.connection.execute(
-                "SELECT digest, next_page, session_id FROM provisional_synthesis WHERE repo = ?", (repo,),
+                "SELECT digest, next_page, session_id, results_json FROM provisional_synthesis WHERE repo = ?", (repo,),
             ).fetchone()
             if row is None or row[0] != digest:
+                if row is not None:
+                    resolutions = self.connection.execute(
+                        'SELECT page_index, digest, decision_digest, result_json, session_id, validation_error '
+                        'FROM provisional_synthesis_resolutions WHERE repo = ? AND digest = ?',
+                        (repo, row[0]),
+                    ).fetchall()
+                    self.connection.execute(
+                        'INSERT OR IGNORE INTO provisional_synthesis_history VALUES (?, ?, ?)',
+                        (repo, row[0], json.dumps({'next_page': row[1], 'session_id': row[2],
+                            'results_json': row[3], 'resolutions': [tuple(item) for item in resolutions]}, ensure_ascii=False)),
+                    )
                 self.connection.execute(
                     "INSERT OR REPLACE INTO provisional_synthesis VALUES (?, ?, 0, NULL, '[]')",
                     (repo, digest),

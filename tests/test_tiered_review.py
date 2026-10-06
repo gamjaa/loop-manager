@@ -143,6 +143,30 @@ class TieredReviewTest(unittest.TestCase):
         assessment = self.repository.prepare("repo", 2, selection)
         self.assertEqual(assessment["paths"], ["other/c.py"])
 
+    def test_common_hash_binds_reusable_module_receipts_and_ongoing_assessment(self):
+        from loop_manager_internal.agents import common_guidance
+        with mock.patch.object(common_guidance, 'runtime_content_hash', return_value='a' * 64):
+            selection = self.select()
+            first = self.complete(selection)
+        with mock.patch.object(common_guidance, 'runtime_content_hash', return_value='b' * 64):
+            resumed = self.repository.prepare('repo', 1, selection)
+            self.assertEqual(resumed, {key: value for key, value in first.items() if key != 'receipts'})
+            self.assertIsNone(self.repository.pending('repo', resumed))
+            new = self.repository.prepare('repo', 2, selection)
+            self.assertEqual(new['guidance_hash'], 'b' * 64)
+            self.assertIsNotNone(self.repository.pending('repo', new))
+            previous_ids = {unit['digest'] for unit in self.repository.units(first)}
+            self.assertFalse(previous_ids & {unit['digest'] for unit in self.repository.units(new)})
+        legacy = dict(new)
+        legacy.pop('guidance_hash')
+        self.connection.execute('UPDATE tiered_maintenance_assessments SET assessment_json = ? WHERE repo = ?',
+                                (json.dumps(legacy), 'repo'))
+        with mock.patch.object(common_guidance, 'runtime_content_hash', return_value='c' * 64):
+            migrated = self.repository.prepare('repo', 2, selection)
+        self.assertEqual(migrated['guidance_hash'], 'c' * 64)
+        self.assertEqual(migrated['prior_guidance_assessment'], legacy)
+        self.assertIsNotNone(self.repository.pending('repo', migrated))
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -57,6 +57,31 @@ def ensure_registry_schema(connection: sqlite3.Connection) -> None:
                     connection.execute(
                         f"ALTER TABLE projects ADD COLUMN {column} {definition}"
                     )
+    with _transaction(connection):
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS project_agents_approval_audit (
+                id INTEGER PRIMARY KEY,
+                repo TEXT NOT NULL,
+                agents_hash TEXT,
+                agents_approved INTEGER NOT NULL,
+                origin TEXT,
+                recorded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE (repo, agents_hash, agents_approved, origin)
+            )
+        """)
+        # Capture legacy approvals before registration can replace their hash.
+        # IS also deduplicates old rows whose hash/origin was never recorded.
+        connection.execute("""
+            INSERT INTO project_agents_approval_audit
+                (repo, agents_hash, agents_approved, origin)
+            SELECT p.repo, p.agents_hash, p.agents_approved, p.origin
+            FROM projects AS p
+            WHERE p.agents_approved = 1 AND NOT EXISTS (
+                SELECT 1 FROM project_agents_approval_audit AS a
+                WHERE a.repo = p.repo AND a.agents_hash IS p.agents_hash
+                    AND a.agents_approved = p.agents_approved AND a.origin IS p.origin
+            )
+        """)
 
 
 def list_projects(connection: sqlite3.Connection) -> tuple[RegisteredProject, ...]:

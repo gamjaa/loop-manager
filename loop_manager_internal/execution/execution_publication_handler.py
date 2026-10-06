@@ -1,5 +1,6 @@
 """Publication execution policy and narrow typed ports."""
 from __future__ import annotations
+from loop_manager_internal.documents.pr_description import common_guidance_report, refresh_common_guidance_pr
 from loop_manager_internal.execution.execution_runtime import LatestBasePort
 from dataclasses import dataclass, replace
 from typing import Callable, Any, Mapping
@@ -516,6 +517,17 @@ class PublicationHandler:
         if isinstance(guarded, ExecutionOutcome):
             return guarded
         context = guarded
+        try:
+            worker = self.ports.parse_worker_result(str(row['worker_result'] or ''), self.ports.snapshot().plan)
+            origin = self.ports.git(context.worktree, 'remote', 'get-url', 'origin').stdout.strip()
+            report = common_guidance_report(self.ports.git, context.worktree,
+                str(row['validated_base_sha']), head_oid, origin, worker.summary)
+            refresh_common_guidance_pr(self.ports.command, context.worktree,
+                self.ports.identity.state_dir,
+                {'url': row['pr_url'], 'state': 'OPEN', 'headRefOid': head_oid}, report)
+        except RuntimeError as error:
+            self.ports.state.update_project(self.ports.identity.repo, phase='PUBLISHING', last_error=str(error))
+            return self.ports._recover(RecoveryReason.PUBLICATION_RETRY, str(error), context=context)
         self.ports.state.open_pull_request(
             self.ports.identity.repo,
             publication_remote_oid=head_oid,
@@ -570,6 +582,11 @@ class PublicationHandler:
                 context=context,
             )
         origin_url = self.ports.git(context.worktree, 'remote', 'get-url', 'origin').stdout.strip()
+        head_sha = self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+        common_change = common_guidance_report(
+            self.ports.git, context.worktree, str(row['validated_base_sha']), head_sha, origin_url,
+            worker_publication.summary,
+        )
         body = self.ports.build_pr_body(
             worker_publication,
             self.ports.snapshot().plan,
@@ -577,6 +594,7 @@ class PublicationHandler:
             plan_text,
             origin_url,
             plan_sha,
+            **({'common_guidance_change': common_change} if common_change else {}),
         )
         try:
             publication = self._publication_resume().observe(
@@ -598,6 +616,8 @@ class PublicationHandler:
                     '게시 직전 원격 branch 또는 PR head가 변경됐습니다.'
                 )
             if action is PublicationNext.ATTACH_PR:
+                refresh_common_guidance_pr(self.ports.command, context.worktree,
+                    self.ports.identity.state_dir, publication.pull_request, common_change)
                 reconciliation = self.ports.reconcile_existing_pull_request(
                     self.ports.identity.repo_path, self.ports.identity.state_dir, self.ports.identity.repo, row,
                     publication.pull_request,
@@ -689,6 +709,12 @@ class PublicationHandler:
                     reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
                 )
         if existing_after_push is not None:
+            try:
+                refresh_common_guidance_pr(self.ports.command, context.worktree,
+                    self.ports.identity.state_dir, existing_after_push, common_change)
+            except RuntimeError as error:
+                self.ports.state.update_project(self.ports.identity.repo, phase='PUBLISHING', last_error=str(error))
+                return self.ports._recover(RecoveryReason.PUBLICATION_RETRY, str(error), context=context)
             reconciliation = self.ports.reconcile_existing_pull_request(
                 self.ports.identity.repo_path, self.ports.identity.state_dir, self.ports.identity.repo, self.ports._row(),
                 existing_after_push,
@@ -721,4 +747,3 @@ class PublicationHandler:
         self._complete_publication_intent(context)
         self.ports.operation_print(f"PR 생성 완료: {url}")
         return ExecutionOutcome(ExecutionOutcomeKind.SUCCESS)
-

@@ -10,6 +10,7 @@ from loop_manager_internal.agents.agent_invocation import InvocationContext, Res
 from loop_manager_internal.agents.agent_write_isolation import IsolationEvidence
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
+from loop_manager_internal.storage import common_guidance_state
 
 
 SCHEMA = """
@@ -68,9 +69,11 @@ CREATE TABLE IF NOT EXISTS agent_isolation_evidence (
 def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(SCHEMA)
     connection.execute(ISOLATION_SCHEMA)
+    common_guidance_state.ensure_schema(connection)
     columns = {row[1] for row in connection.execute("PRAGMA table_info(agent_invocations)")}
     for field in ("transition_id", "previous_provider", "previous_model",
-                  "previous_effort", "previous_session_id", "scope_id"):
+                  "previous_effort", "previous_session_id", "scope_id", "guidance_task_id",
+                  "guidance_content_hash"):
         if field not in columns:
             connection.execute(f"ALTER TABLE agent_invocations ADD COLUMN {field} TEXT")
     connection.execute("""CREATE INDEX IF NOT EXISTS agent_invocations_analysis
@@ -156,6 +159,13 @@ class InvocationRepository:
         with self.connection:
             self.connection.execute("""UPDATE agent_invocations SET session_id = ?
                 WHERE invocation_id = ? AND finished_at IS NULL""", (session_id, identity))
+
+    def bind_guidance(self, identity: str, task_id: str, content_hash: str) -> None:
+        with self.connection:
+            self.connection.execute(
+                "UPDATE agent_invocations SET guidance_task_id = ?, guidance_content_hash = ? "
+                "WHERE invocation_id = ? AND finished_at IS NULL", (task_id, content_hash, identity),
+            )
 
     def record_isolation(self, identity: str, evidence: IsolationEvidence) -> None:
         """Tie preflight to one invocation, never to a reusable session alone."""

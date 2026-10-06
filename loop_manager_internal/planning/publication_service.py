@@ -252,6 +252,13 @@ class PlanningPublicationService(PlanningService):
                                 expected_revision=run.maintenance_cycle.revision,
                                 remote_commit=str(row.active_sha or ""),
                             )
+                        if run.maintenance_cycle.include_general_planning:
+                            self._ports.state.record_general_plan_declarations(
+                                context.repo, str(row.active_sha or ""),
+                                self._ports.git.plan_declarations(
+                                    context.repo_path, str(row.active_sha or ""),
+                                ),
+                            )
                         self._ports.state.clear_active_in_transaction(
                             context.repo,
                             processed_sha=(
@@ -270,18 +277,17 @@ class PlanningPublicationService(PlanningService):
                                 else None
                             ),
                         )
-                        if run.maintenance_cycle.include_general_planning:
-                            self._ports.state.record_general_plan_declarations(
-                                context.repo, str(row.active_sha or ""),
-                                self._ports.git.plan_declarations(
-                                    context.repo_path, str(row.active_sha or ""),
-                                ),
-                            )
                     else:
                         if hasattr(self._ports.state, "confirm_planning_review"):
                             self._ports.state.confirm_planning_review(
                                 context.repo, str(row.active_sha), str(row.active_sha),
                             )
+                        self._ports.state.record_general_plan_declarations(
+                            context.repo, str(row.active_sha or ""),
+                            self._ports.git.plan_declarations(
+                                context.repo_path, str(row.active_sha or ""),
+                            ),
+                        )
                         self._ports.state.clear_active_in_transaction(
                             context.repo,
                             processed_sha=row.active_sha,
@@ -289,12 +295,6 @@ class PlanningPublicationService(PlanningService):
                                 completed_specification_fingerprint
                             ),
                             planning_fingerprint=completed_fingerprint,
-                        )
-                        self._ports.state.record_general_plan_declarations(
-                            context.repo, str(row.active_sha or ""),
-                            self._ports.git.plan_declarations(
-                                context.repo_path, str(row.active_sha or ""),
-                            ),
                         )
                     self._ports.git.run(
                         context.repo_path,

@@ -15,6 +15,8 @@ from loop_manager_internal.agents.agent_invocation import AgentRequest, AgentRes
 from loop_manager_internal.agents.agent_profiles import agent_environment
 from loop_manager_internal.agents.agent_provider_usage import claude_usage, codex_log_usage
 from loop_manager_internal.agents import agent_write_isolation
+from loop_manager_internal.agents import provider_guidance
+from loop_manager_internal.agents.common_guidance import CommonGuidance
 from loop_manager_internal.execution.validation_feedback import redact_secrets
 
 AGENT_CLI_TIMEOUT_SECONDS = 3600
@@ -170,6 +172,7 @@ def run_codex(
     isolation_snapshot_digest: Callable[[], str] | None = None,
     expected_repository: str | None = None,
     on_isolation_checked: Callable[[agent_write_isolation.IsolationEvidence], None] | None = None,
+    common_guidance: CommonGuidance | None = None,
     effects: ProviderEffects,
 ) -> tuple[int, str] | CodexResult:
     if resolved_profile is not None:
@@ -211,6 +214,11 @@ def run_codex(
             isolation_evidence, worktree, state_dir, config_path,
             expected_repository, read_only, isolation_snapshot_digest,
         )
+    guidance_context = tuple(isolation_arguments or codex_sandbox_arguments(read_only))
+    additional = (provider_guidance.codex_arguments(
+        common_guidance, worktree, environment=launch_environment,
+        context_arguments=("-m", model, "-c", f'model_reasoning_effort="{effort}"', *guidance_context),
+    ) if common_guidance else [])
     project_dir = _provider_log_directory(worktree, state_dir)
     last_message = project_dir / f"{role_name}-last.txt"
     saved_log = project_dir / f"{role_name}.log"
@@ -235,6 +243,7 @@ def run_codex(
             model,
             "-c",
             f'model_reasoning_effort="{effort}"',
+            *additional,
             *([] if role_name == "reviewer" else ["-o", str(provider_last_message)]),
             session_id,
             "-",
@@ -252,6 +261,7 @@ def run_codex(
             model,
             "-c",
             f'model_reasoning_effort="{effort}"',
+            *additional,
             *([] if role_name == "reviewer" else ["-o", str(provider_last_message)]),
             "-",
         ]
@@ -425,12 +435,14 @@ def run_claude(
     on_isolation_checked: Callable[[agent_write_isolation.IsolationEvidence], None] | None = None,
     isolation_snapshot_digest: Callable[[], str] | None = None,
     expected_repository: str | None = None,
+    common_guidance: CommonGuidance | None = None,
     effects: ProviderEffects,
 ) -> tuple[int, str] | AgentResult:
     profile = resolved_profile or effects._agent_profile(
         config_path, "claude", role_name, level, worktree
     )
     model, effort = profile.model, profile.effort
+    additional = provider_guidance.claude_arguments(common_guidance) if common_guidance else []
     if on_isolation_checked is not None:
         agent_write_isolation.prepare_isolation(
             "claude", role_name, worktree, state_dir, read_only,
@@ -455,6 +467,7 @@ def run_claude(
         "--effort",
         effort,
         *claude_permission_arguments(read_only),
+        *additional,
         *(["--resume", session_id] if session_id else []),
     ]
     resolved_session_id = session_id
@@ -688,6 +701,7 @@ class CodexAgentAdapter:
             isolation_snapshot_digest=request.isolation_snapshot_digest,
             expected_repository=request.expected_repository,
             on_isolation_checked=request.on_isolation_checked,
+            common_guidance=request.common_guidance,
         )
 
 
@@ -713,4 +727,5 @@ class ClaudeAgentAdapter:
             on_isolation_checked=request.on_isolation_checked,
             isolation_snapshot_digest=request.isolation_snapshot_digest,
             expected_repository=request.expected_repository,
+            common_guidance=request.common_guidance,
         )

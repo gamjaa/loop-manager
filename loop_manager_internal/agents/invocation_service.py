@@ -9,11 +9,13 @@ import sqlite3
 import subprocess
 import time
 
-from loop_manager_internal.agents.agent_invocation import AgentRequest, AgentResult, InvocationContext, ResolvedProfile, Usage, _coerce_agent_result
+from loop_manager_internal.agents.agent_invocation import AgentRequest, AgentResult, AgentResultKind, InvocationContext, ResolvedProfile, Usage, _coerce_agent_result
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.agents.provider_adapters import AgentProvider
 from loop_manager_internal.storage import agent_invocation_state
 from loop_manager_internal.agents import agent_write_isolation
+from loop_manager_internal.agents import common_guidance
+from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
 
 
 @dataclass(frozen=True)
@@ -48,6 +50,31 @@ def run_agent(
     """Execute one provider-neutral Agent request."""
 
     effects._check_runtime_handoff()
+    # Managed calls already supply this connection. Preserve the public one-shot
+    # port by using the same state DB, never a provider-local instruction cache.
+    owned_connection = None
+    guidance_context = invocation or InvocationContext(str(worktree.resolve()), None)
+    try:
+        common_guidance.validate_state_root(guidance_context, worktree, state_dir)
+        if connection is None:
+            state_dir.mkdir(parents=True, exist_ok=True)
+            owned_connection = sqlite3.connect(state_dir / "loop-manager.db")
+        guidance_repository = GuidanceRepository(connection or owned_connection)
+        guidance_context = common_guidance.independent_context(
+            guidance_repository.connection, guidance_context, worktree,
+        )
+        guidance = common_guidance.resolve(
+            guidance_repository, guidance_context, role_name, worktree, state_dir,
+        )
+        session_task = (guidance_repository.session_task(guidance_context.repo, provider, session_id)
+                        if session_id else None)
+        if session_task is not None and session_task != guidance.task_id:
+            raise common_guidance.GuidanceError("Agent session과 공통 지침 작업 identity가 다릅니다.")
+    except (common_guidance.GuidanceError, sqlite3.Error, OSError) as error:
+        if owned_connection is not None:
+            owned_connection.close()
+        return AgentResult(1, f"공통 지침 호출 준비 실패: {error}", session_id,
+                           AgentResultKind.PERMANENT_CONFIGURATION)
     resolved: ResolvedProfile | None = resolved_profile
     collection_status = "unknown"
     if invocation is not None and resolved is None:
@@ -69,12 +96,14 @@ def run_agent(
         try:
             identity = effects.start_invocation(ledger, invocation, role_name, provider,
                                         resolved, session_id, scope_id=scope_id)
+            ledger.bind_guidance(identity, guidance.task_id, guidance.content_hash)
             collection_status = "pending"
         except sqlite3.Error:
             collection_status = "error"
 
     def observe_session(started_session_id: str) -> None:
         nonlocal collection_status
+        guidance_repository.bind_session(guidance_context.repo, provider, started_session_id, guidance.task_id)
         if ledger is not None and identity is not None:
             try:
                 ledger.observe_session(identity, started_session_id)
@@ -111,10 +140,25 @@ def run_agent(
         isolation_snapshot_digest=lambda: hashlib.sha256(
             effects.capture_git_snapshot(worktree).serialize().encode()).hexdigest(),
         expected_repository=invocation.repo if invocation is not None else None,
+        common_guidance=guidance,
     )
     started = time.monotonic()
     try:
-        raw = effects.agent_provider(provider).run(request)
+        if session_id and session_task is None:
+            # The existing retry runner rebuilds role/task context once. Keep
+            # the old session and artifacts, without claiming it had these rules.
+            raw = AgentResult(1, "cannot resume: 기존 session에 공통 지침 버전 기록이 없습니다. "
+                              "최소 문맥으로 새 session에서 작업을 이어가야 합니다.", session_id)
+        else:
+            try:
+                raw = effects.agent_provider(provider).run(request)
+            except common_guidance.GuidanceError as error:
+                raw = AgentResult(1, f"공통 지침 provider 준비 실패: {error}", session_id,
+                                  AgentResultKind.PERMANENT_CONFIGURATION)
+            completed = _coerce_agent_result(raw, session_id)
+            if completed.session_id:
+                guidance_repository.bind_session(guidance_context.repo, provider,
+                                                 completed.session_id, guidance.task_id)
     except BaseException as error:
         if ledger is not None and identity is not None:
             kind = ("interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else
@@ -127,6 +171,9 @@ def run_agent(
             except sqlite3.Error:
                 pass
         raise
+    finally:
+        if owned_connection is not None:
+            owned_connection.close()
     result = _coerce_agent_result(raw, session_id)
     if result.collection_status == "error":
         collection_status = "error"

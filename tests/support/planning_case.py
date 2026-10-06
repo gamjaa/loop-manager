@@ -399,6 +399,9 @@ class FakeGitPort:
         self.guidance_changed = False
         self.diff_name_status = ""
 
+    def runtime_guidance_changed(self, _repo_path):
+        return False
+
     def fetch_base(self, repo_path, base):
         self.calls.append((str(repo_path), ("recorded_base_fetch", base), True))
         return self.remote

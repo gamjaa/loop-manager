@@ -214,18 +214,13 @@ def inspect_registration_files(
         )
 
     try:
-        target_agents = agents.decode("utf-8").replace("\r\n", "\n")
+        agents.decode("utf-8")
     except UnicodeDecodeError as error:
         raise RuntimeError("origin의 AGENTS.md가 UTF-8이 아닙니다.") from error
-    common_agents = effects.normalized_text(effects.ROOT / "AGENTS.md")
     agents_hash = hashlib.sha256(agents).hexdigest()
-    mismatch = common_agents not in target_agents
-    if mismatch and not approve_agents_mismatch:
-        raise RuntimeError(
-            "AGENTS.md에 공통 규칙이 없습니다. 내용을 확인한 뒤 "
-            "`config add --approve-agents-mismatch`로 승인하세요."
-        )
-    return agents_hash, mismatch
+    # Registry storage archives old approval/hash pairs before replacing these
+    # current-registration values. Project rules need no common-content approval.
+    return agents_hash, False
 
 
 @dataclass(frozen=True)

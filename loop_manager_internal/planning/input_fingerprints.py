@@ -5,11 +5,14 @@ from dataclasses import dataclass
 from loop_manager_internal.catalog import execplan_catalog
 from pathlib import Path
 import hashlib
+from loop_manager_internal.agents import common_guidance
 
 
-def _input_digest(entries: list[tuple[bytes, bytes, bytes]], version: bytes) -> str:
+def _input_digest(entries: list[tuple[bytes, bytes, bytes]], version: bytes,
+                  guidance_hash: str | None = None) -> str:
     digest = hashlib.sha256()
     digest.update(version)
+    digest.update((guidance_hash or common_guidance.runtime_content_hash()).encode("ascii"))
     for path, object_type, contents in sorted(entries, key=lambda entry: entry[0]):
         for part in (path, object_type, contents):
             digest.update(len(part).to_bytes(8, "big"))
@@ -17,19 +20,21 @@ def _input_digest(entries: list[tuple[bytes, bytes, bytes]], version: bytes) -> 
     return digest.hexdigest()
 
 
-def _planning_input_digest(entries: list[tuple[bytes, bytes, bytes]]) -> str:
-    return _input_digest(entries, b"loop-manager-planning-input-v3\0")
+def _planning_input_digest(entries: list[tuple[bytes, bytes, bytes]], *, guidance_hash: str | None = None) -> str:
+    return _input_digest(entries, b"loop-manager-planning-input-v3\0", guidance_hash)
 
 
-def _nonplan_input_digest(entries: list[tuple[bytes, bytes, bytes]]) -> str:
-    return _input_digest(entries, b"loop-manager-planning-input-v2\0")
+def _nonplan_input_digest(entries: list[tuple[bytes, bytes, bytes]], *, guidance_hash: str | None = None) -> str:
+    return _input_digest(entries, b"loop-manager-planning-input-v2\0", guidance_hash)
 
 
 def _specification_input_digest(
     entries: list[tuple[bytes, bytes, bytes]],
+    *, guidance_hash: str | None = None,
 ) -> str:
     digest = hashlib.sha256()
     digest.update(b"loop-manager-specification-input-v1\0")
+    digest.update((guidance_hash or common_guidance.runtime_content_hash()).encode("ascii"))
     for path, object_type, contents in sorted(entries, key=lambda entry: entry[0]):
         digest.update(len(path).to_bytes(8, "big"))
         digest.update(path)
@@ -49,7 +54,8 @@ class InternalPlanningInputFingerprintEffects:
     git_bytes: Callable[..., object]
 
 
-def _planning_input_fingerprint(effects: InternalPlanningInputFingerprintEffects, repo: Path, revision: str) -> str:
+def _planning_input_fingerprint(effects: InternalPlanningInputFingerprintEffects, repo: Path, revision: str,
+                                *, guidance_hash: str | None = None) -> str:
     entries: list[tuple[bytes, bytes, bytes]] = []
     for path, (object_type, object_id) in effects._git_tree_entries(repo, revision).items():
         if effects._is_planning_input(path):
@@ -58,11 +64,12 @@ def _planning_input_fingerprint(effects: InternalPlanningInputFingerprintEffects
             else:
                 contents = object_id
             entries.append((path, object_type, contents))
-    return effects._planning_input_digest(entries)
+    return effects._planning_input_digest(entries, **({'guidance_hash': guidance_hash} if guidance_hash else {}))
 
 
 def _nonplan_input_fingerprint(
     effects: InternalPlanningInputFingerprintEffects, repo: Path, revision: str,
+    *, guidance_hash: str | None = None,
 ) -> str:
     entries: list[tuple[bytes, bytes, bytes]] = []
     for path, (object_type, object_id) in effects._git_tree_entries(repo, revision).items():
@@ -73,7 +80,7 @@ def _nonplan_input_fingerprint(
             if object_type == b"blob" else object_id
         )
         entries.append((path, object_type, contents))
-    return _nonplan_input_digest(entries)
+    return _nonplan_input_digest(entries, guidance_hash=guidance_hash)
 
 
 @dataclass(frozen=True)
@@ -95,7 +102,8 @@ class InternalSpecificationInputFingerprintEffects:
     git_bytes: Callable[..., object]
 
 
-def _specification_input_fingerprint(effects: InternalSpecificationInputFingerprintEffects, repo: Path, revision: str) -> str:
+def _specification_input_fingerprint(effects: InternalSpecificationInputFingerprintEffects, repo: Path, revision: str,
+                                     *, guidance_hash: str | None = None) -> str:
     entries: list[tuple[bytes, bytes, bytes]] = []
     for path, (object_type, object_id) in effects._git_tree_entries(repo, revision).items():
         if not effects._is_specification_input(path):
@@ -106,7 +114,7 @@ def _specification_input_fingerprint(effects: InternalSpecificationInputFingerpr
             else object_id
         )
         entries.append((path, object_type, contents))
-    return effects._specification_input_digest(entries)
+    return effects._specification_input_digest(entries, **({'guidance_hash': guidance_hash} if guidance_hash else {}))
 
 
 @dataclass(frozen=True)

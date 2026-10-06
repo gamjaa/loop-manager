@@ -23,6 +23,7 @@ class DefinitionDelta(str, Enum):
     BODY = "body"
     SOURCE_INPUT = "source_input"
     ARCHIVE_SCOPE = "archive_scope"
+    GUIDANCE = "guidance"
 
 
 class RevisionGateKind(str, Enum):
@@ -108,6 +109,7 @@ class DefinitionSnapshot:
     body_hash: str
     source_fingerprint: str
     archive_candidates: tuple[str, ...]
+    guidance_hash: str = ""
 
     def serialize(self) -> str:
         return json.dumps(
@@ -123,6 +125,7 @@ class DefinitionSnapshot:
                 "body_hash": self.body_hash,
                 "source_fingerprint": self.source_fingerprint,
                 "archive_candidates": list(self.archive_candidates),
+                "guidance_hash": self.guidance_hash,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -151,6 +154,7 @@ class DefinitionSnapshot:
                 archive_candidates=tuple(
                     str(item) for item in payload["archive_candidates"]
                 ),
+                guidance_hash=str(payload.get("guidance_hash", "")),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise ValueError("저장된 execution definition snapshot이 유효하지 않습니다.") from error
@@ -172,6 +176,7 @@ class DefinitionSnapshot:
                 self.body_hash,
                 self.source_fingerprint,
                 self.archive_candidates,
+                self.guidance_hash,
             ),
         )
 
@@ -186,6 +191,7 @@ class DefinitionSnapshot:
                 self.depends_on,
                 self.body_hash,
                 self.archive_candidates,
+                self.guidance_hash,
             ),
         )
 
@@ -255,6 +261,8 @@ def classify_definition_delta(
         changed.add(DefinitionDelta.SOURCE_INPUT)
     if previous.archive_candidates != current.archive_candidates:
         changed.add(DefinitionDelta.ARCHIVE_SCOPE)
+    if previous.guidance_hash != current.guidance_hash:
+        changed.add(DefinitionDelta.GUIDANCE)
     return frozenset(changed)
 
 
@@ -264,6 +272,7 @@ WORKER_INVALIDATING_DELTAS = frozenset(
         DefinitionDelta.DEPENDENCIES,
         DefinitionDelta.BODY,
         DefinitionDelta.ARCHIVE_SCOPE,
+        DefinitionDelta.GUIDANCE,
     }
 )
 

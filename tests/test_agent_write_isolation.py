@@ -4,7 +4,8 @@ import sqlite3
 from pathlib import Path
 import tempfile
 from unittest import TestCase, mock
-from tests.support.workspace import symlink_or_skip
+from tests.support.workspace import symlink_or_skip, pin_common_guidance
+from loop_manager_internal.agents import provider_guidance
 
 from loop_manager_internal.agents import agent_invocation as invocation
 from loop_manager_internal.agents import agent_write_isolation as isolation
@@ -18,6 +19,7 @@ class WriteIsolationTests(TestCase):
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         root = Path(directory.name)
+        self.state_dir = root / 'state'
         (root / '.git').mkdir()
         temporary_root = mock.patch.object(tempfile, 'tempdir', str(root))
         temporary_root.start()
@@ -304,7 +306,8 @@ class WriteIsolationTests(TestCase):
             provider_home.mkdir()
             boundary = isolation.WorktreeBoundary(
                 root, root / 'source', (), root / 'git', root / 'common', 'repository')
-            log_dir = root / 'logs' / manager.hashlib.sha256(str(root).encode()).hexdigest()[:16]
+            pin_common_guidance(connection, invocation.InvocationContext(str(root / 'source'), None), root, self.state_dir)
+            log_dir = self.state_dir / 'logs' / manager.hashlib.sha256(str(root).encode()).hexdigest()[:16]
             log_dir.mkdir(parents=True)
             prior = log_dir / 'planner-last.txt'
             prior.write_text('previous result', encoding='utf-8')
@@ -321,7 +324,7 @@ class WriteIsolationTests(TestCase):
                 with self.assertRaisesRegex(isolation.IsolationError, '파일 도구'):
                     manager.run_agent(
                         'codex',
-                        root, root, root / 'config', 'planner', 'prompt',
+                        root, self.state_dir, root / 'config', 'planner', 'prompt',
                         read_only=False,
                         resolved_profile=invocation.ResolvedProfile('model', 'high'),
                         connection=connection,
@@ -404,6 +407,8 @@ class WriteIsolationTests(TestCase):
         connection = sqlite3.connect(':memory:')
         self.addCleanup(connection.close)
         state.ensure_schema(connection)
+        pin_common_guidance(connection, invocation.InvocationContext('repo', 'G-088'),
+                            Path('/worktree'), self.state_dir)
         profile = invocation.ResolvedProfile('model', 'high')
 
         def reject(*args, **_kwargs):
@@ -413,9 +418,10 @@ class WriteIsolationTests(TestCase):
             raise isolation.IsolationError('sandbox unavailable')
 
         with mock.patch.object(isolation, 'prepare_isolation', side_effect=reject), \
+             mock.patch.object(provider_guidance, '_probe', return_value='codex-cli 0.159.3'), \
              mock.patch.object(manager.subprocess, 'Popen') as launch:
             with self.assertRaisesRegex(isolation.IsolationError, 'sandbox unavailable'):
-                manager.run_agent('codex', Path('/worktree'), Path('/state'),
+                manager.run_agent('codex', Path('/worktree'), self.state_dir,
                                   Path('/config'), 'worker', 'secret prompt',
                                   read_only=False, level=1, connection=connection,
                                   invocation=invocation.InvocationContext('repo', 'G-088'),
@@ -486,7 +492,7 @@ class WriteIsolationTests(TestCase):
 
         with mock.patch.object(manager, 'agent_provider', return_value=Provider()):
             result = manager.run_agent(
-                'codex', Path('/worktree'), Path('/state'), Path('/config'),
+                'codex', Path('/worktree'), self.state_dir, Path('/config'),
                 'worker', 'prompt', read_only=False, level=1,
                 connection=connection,
                 invocation=invocation.InvocationContext('repo', 'G-088'),

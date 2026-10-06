@@ -17,7 +17,7 @@
 
 ### Current Goals
 
-- 여러 로컬 GitHub 프로젝트를 등록하고 공통 파일을 코드로 검증한다. `AGENTS.md` 불일치는 사용자 확인으로 승인할 수 있다.
+- 여러 로컬 GitHub 프로젝트의 필수 문서를 검증해 등록하고 runtime 공통 Agent 지침을 모델 호출에 전달한다. 프로젝트 `AGENTS.md`는 공통 본문 없이도 사용할 수 있다.
 - Specification Skill로 PRODUCT·Requirement·ARCHITECTURE 작성을 지원한다.
 - 미충족 PRODUCT·Requirement 작업을 Worker 시작 전에 ExecPlan catalog로 만들고, 메타데이터·의존성·우선순위에 따라 처리한다.
 - 계획별 상태·재시도·Agent session·작업 공간을 SQLite에 보존해 중단 후 재개한다.
@@ -92,9 +92,8 @@ R-023의 원격 실행·self handoff 목표는 유지하며 로컬 갱신 gate�
 1. 프로젝트별로 사용할 AI Agent provider를 선택한다
 2. 대상 프로젝트 경로를 추가하거나 제거한다
 3. 프로젝트의 필수 조건과 공통 파일을 코드로 검증한다
-4. `AGENTS.md`에 Loop Manager 공통 내용이 없으면 경고한다
-5. 사용자가 동의하면 파일을 바꾸지 않고 현재 `AGENTS.md`로 강제 등록한다
-6. `max_workers`를 포함한 유효한 설정을 저장한다
+4. 원격 루트 `AGENTS.md`의 존재·UTF-8과 나머지 필수 문서를 확인한다
+5. `max_workers`를 포함한 유효한 설정을 저장한다
 
 규칙:
 - READY, IMPLEMENTING, VERIFYING, REVIEWING, PUBLISHING, PR_OPEN 또는 PLAN_BLOCKED ExecPlan, PROJECT_BLOCKED 레코드가 있거나 해결되지 않은 `planning_error`가 있는 프로젝트는 등록 해제할 수 없다
@@ -271,8 +270,8 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 - fetch된 `origin/<base-branch>` tree에 `docs/PRODUCT.md` 또는 `docs/requirements/` 바로 아래 Requirement가 하나 이상 있어야 한다
 - 변경되지 않은 PRODUCT/ARCHITECTURE 템플릿만 있는 프로젝트는 작업 가능 상태로 등록하지 않는다
 - `docs/PLANS.md`는 Loop Manager 기준 파일과 SHA-256 해시가 같아야 한다
-- 공통 내용이 없는 `AGENTS.md`는 사용자 확인 후 강제 등록할 수 있다
-- `AGENTS.md` 포함 검사와 `docs/PLANS.md` 해시 검사는 프로젝트 등록 시 선택한 원격 commit blob에만 수행하며 자동 Loop에서는 반복하지 않는다
+- 프로젝트 `AGENTS.md`에 공통 본문 포함·일치 승인을 요구하지 않는다. 과거 mismatch 승인·해시 기록은 감사로 보존한다
+- `AGENTS.md` 존재·UTF-8과 `docs/PLANS.md` 해시 검사는 프로젝트 등록 시 선택한 원격 commit blob에만 수행하며 자동 Loop에서는 반복하지 않는다
 - 자동 작업의 기준은 `origin/<base-branch>`다
 - 사용자는 원격 기준에 게시하는 ExecPlan의 정확한 AGENTS.md Proposal과 User Decision으로 사전 승인할 수 있다. Worker 시작 전에 결정과 당시 기준 파일을 대조하고 유효한 patch만 허용한다. 기준이 바뀌면 재승인을 기다리며 로컬 본문·포괄적 허락·Agent가 작성한 승인은 인정하지 않는다. 실제 결과와 최신 base 검증, Review와 사용자 Merge는 유지한다.
 - 기본 worktree의 로컬 변경, checkout branch와 ahead·diverged 이력은 자동 작업을 막지 않으며 local-only 내용은 자동 입력에 포함하지 않는다
@@ -281,6 +280,16 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 
 - Loop Manager가 만드는 계획과 구현 변경은 대상 프로젝트 밖의 Loop Manager 관리 경로에 만든 별도 worktree와 branch에만 기록한다
 - 자동 실행 중 기본 worktree에서는 검증된 `git merge --ff-only` 상당의 safe fast-forward 외에 checkout, pull, reset, stash, clean, commit과 파일 생성을 수행하지 않는다
+
+### 공통 Agent 지침과 직접 작업
+
+- 실행 원본은 bootstrap이 선택한 immutable runtime의 `docs/AGENTS.common.md`다. 모델 실행 전에 UTF-8 내용·내용 SHA-256·source revision·snapshot 참조를 작업에 결합해 Manager 상태 디렉터리와 SQLite에 보존한다. 모든 역할·provider·신규·재개 호출은 같은 해결 경계를 사용한다
+- ExecPlan의 Worker·Reviewer·재시도·fallback은 같은 버전을 사용한다. 독립 planning·점검·유지보수 작업도 각 버전을 고정하고 새 작업만 최신 공통 내용을 선택한다. 내용이 같으면 runtime SHA 변경만으로 재계획하지 않으며 새 지침이 진행 작업을 선점하지 않는다. 관련 planning 입력과 성공 결과 재사용은 실제 내용 해시를 포함한다
+- Codex의 추가 developer 지침과 Claude의 append system prompt·snapshot 기능으로 기본 지침·기존 추가 지침·프로젝트 규칙·실행 경계를 보존한다. 잘못된 원본·snapshot·저장 실패·미지원 기능·설정 충돌은 모델 실행 전에 거부한다. 버전 없는 과거 세션은 기존 작업물·session·실패 기록을 남기고 최소 문맥의 새 세션으로 복구한다
+- 작업 worktree의 공통 파일은 현재 역할·목표의 일반 파일 권한으로 수정한다. 별도 guidance 제안·사전 승인을 요구하지 않으며 후보 편집이나 Reviewer의 diff 읽기로 실행 snapshot을 바꾸지 않는다. 변경 PR에 실제 최종 경로·변경 사실·내용·이유·영향·diff 링크를 보고하고 Manager가 누락을 보완한다
+- 새 AGENTS 제안의 Target은 루트 `AGENTS.md`, Scope는 self 저장소도 `project`다. 과거 `common` 승인·대기는 원래 대상·baseline·patch에 결합해 처리하고 적용 불가는 원래 판단 대기로 보존한다. 공통 파일로 대상을 이관하지 않는다
+- 준비 도구는 기존 일반 파일 AGENTS를 byte 그대로 보존하고 새 AGENTS에는 프로젝트 규칙·Requirement 우선·필수 문서 안내만 작성한다. 다른 덮어쓰기·경로 보호는 유지하며 기존 프로젝트의 공통 본문을 자동 제거하지 않는다
+- 직접 작업·대화형 Agent의 로컬 구현에는 자동 Worker 역할·SQLite 전이·ExecPlan 선작성·자동 완료 절차를 요구하지 않는다. 새 기능·정책은 양쪽 모두 Requirement에서 시작한다. 직접 구현과 활성 Requirement의 원격 반영 후 기존 Planner가 실제 미충족 작업만 재점검하며 소급·중복 계획·자동 검증 성공 합성을 하지 않는다. 자동 작업의 ExecPlan·dependency·검증·사용자 Merge gate는 유지한다
 
 ### 작업 선택과 동시 실행
 

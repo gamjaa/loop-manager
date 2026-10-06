@@ -11,6 +11,8 @@ from tests.support.profiles import profile_config
 from tests.support.catalog import write_execplan
 from tests.support.git import make_remote_repository
 from tests.support.worker import dummy_worker_sessions
+from loop_manager_internal.agents import provider_guidance
+from tests.support.workspace import native_developer_texts
 
 
 class PlannerInterruptionRecoveryTest(unittest.TestCase):
@@ -227,7 +229,8 @@ class PlannerInterruptionRecoveryTest(unittest.TestCase):
             config = profile_config(self)
             connection = loop_manager.connect_database(state_dir, create=True)
 
-            with mock.patch(
+            with mock.patch.object(provider_guidance, '_probe', return_value='codex-cli 0.159.3'), mock.patch.object(
+                provider_guidance, '_developer_texts', side_effect=native_developer_texts), mock.patch(
                 "loop_manager.validate_repository", return_value=repo
             ), mock.patch(
                 "loop_manager.remote_base", return_value="main"

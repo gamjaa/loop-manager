@@ -4,6 +4,7 @@ import subprocess
 from pathlib import Path
 import loop_manager
 from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
+from loop_manager_internal.agents.common_guidance import plan_content_hash
 from loop_manager_internal.storage import planning_input_state
 from tests.support.catalog import write_execplan
 from tests.support.git import git_command, make_remote_repository, commit_and_push
@@ -37,6 +38,7 @@ def seed_validated_candidate(
             repo, base_sha, row,
         ),
         archive_candidates=(),
+        guidance_hash=plan_content_hash(connection, str(repo), plan_id),
     )
     values = (
         snapshot.serialize(), snapshot.worker_token, snapshot.archive_token,

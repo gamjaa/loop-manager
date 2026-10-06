@@ -7,6 +7,7 @@ from copy import deepcopy
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import hashlib
+from loop_manager_internal.agents import common_guidance
 from pathlib import Path
 import re
 import json
@@ -199,6 +200,9 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(FILE_REVIEW_SCHEMA)
     connection.execute(FILE_ASSESSMENT_SUCCESS_SCHEMA)
     connection.execute(ROOT_PLACEMENT_REVIEW_SCHEMA)
+    columns = {row[1] for row in connection.execute('PRAGMA table_info(file_assessment_successes)')}
+    if 'guidance_hash' not in columns:
+        connection.execute('ALTER TABLE file_assessment_successes ADD COLUMN guidance_hash TEXT')
 
 
 @contextmanager
@@ -264,6 +268,8 @@ class FileReviewRepository:
     def reusable_root_reviews(self, repo: str, inventory: SourceInventory) -> tuple[dict, ...] | None:
         if not root_placement_inventory(inventory):
             return ()
+        if not self._same_guidance(repo):
+            return None
         rows = self.connection.execute(
             "SELECT reason, source_revision FROM root_placement_reviews WHERE repo = ? AND active = 1 ORDER BY path",
             (repo,),
@@ -284,7 +290,8 @@ class FileReviewRepository:
         paths = [source.path for source in inventory.sources]
         if paths != sorted(set(paths)):
             raise FileReviewLedgerError("inventory 경로가 중복되거나 정렬되지 않았습니다.")
-        previous = {review.path: review for review in self.reviews(repo)}
+        previous = ({review.path: review for review in self.reviews(repo)}
+                    if self._same_guidance(repo) else {})
         return tuple(
             source for source in inventory.sources
             if source.path not in previous
@@ -292,6 +299,11 @@ class FileReviewRepository:
                 previous[source.path].content_hash, previous[source.path].mode
             )
         )
+
+    def _same_guidance(self, repo: str) -> bool:
+        row = self.connection.execute('SELECT guidance_hash FROM file_assessment_successes WHERE repo = ?',
+                                      (repo,)).fetchone()
+        return row is not None and row[0] == common_guidance.effective_planning_hash(self.connection, repo)
 
     def _prepare_evidence(
         self, repo: str, repository_path: str, base_branch: str,
@@ -428,10 +440,12 @@ class FileReviewRepository:
                      inventory.revision, reviewed_at),
                 )
             self.connection.execute(
-                "INSERT INTO file_assessment_successes (repo, source_revision, reviewed_at) "
-                "VALUES (?, ?, ?) ON CONFLICT(repo) DO UPDATE SET "
-                "source_revision = excluded.source_revision, reviewed_at = excluded.reviewed_at",
-                (repo, inventory.revision, reviewed_at),
+                "INSERT INTO file_assessment_successes (repo, source_revision, reviewed_at, guidance_hash) "
+                "VALUES (?, ?, ?, ?) ON CONFLICT(repo) DO UPDATE SET "
+                "source_revision = excluded.source_revision, reviewed_at = excluded.reviewed_at, "
+                "guidance_hash = excluded.guidance_hash",
+                (repo, inventory.revision, reviewed_at,
+                 None if legacy else common_guidance.effective_planning_hash(self.connection, repo)),
             )
             project = self.connection.execute(
                 "SELECT base_branch FROM projects WHERE repo = ?", (repo,),

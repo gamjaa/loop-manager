@@ -17,16 +17,34 @@ fi
 target="$(cd -- "$target" && pwd)"
 conflicts=()
 
-for path in "$target/AGENTS.md" "$target/.agents" "$target/docs"; do
-    [[ -e "$path" ]] && conflicts+=("$path")
+for path in "$target/.agents" "$target/docs"; do
+    [[ -e "$path" || -L "$path" ]] && conflicts+=("$path")
 done
+if [[ -e "$target/AGENTS.md" || -L "$target/AGENTS.md" ]]; then
+    if [[ ! -f "$target/AGENTS.md" || -L "$target/AGENTS.md" ]]; then
+        conflicts+=("$target/AGENTS.md (일반 파일이 아님)")
+    fi
+fi
 
 if (( ${#conflicts[@]} > 0 )); then
     printf '이미 존재하는 파일 또는 폴더: %s\n' "${conflicts[@]}" >&2
     exit 1
 fi
 
-cp "$source_root/AGENTS.md" "$target/AGENTS.md"
+if [[ ! -e "$target/AGENTS.md" ]]; then
+    (set -o noclobber; cat > "$target/AGENTS.md" <<'GUIDANCE'
+# Project instructions
+
+프로젝트 전용 언어·코딩·빌드 규칙은 이 파일에 기록한다.
+새로운 기능이나 정책 변경은 Requirement에서 시작한다.
+구현 전에 존재하는 관련 문서를 확인한다:
+- docs/PRODUCT.md: 현재 제품 동작과 장기 규칙
+- docs/requirements/*.md: 원하는 변경, 이유와 Acceptance Criteria
+- docs/ARCHITECTURE.md: 시스템 설계
+docs/PRODUCT.md 또는 활성 Requirement 중 하나는 반드시 존재해야 한다.
+GUIDANCE
+    )
+fi
 cp -R "$source_root/.agents" "$target/.agents"
 
 mkdir -p \

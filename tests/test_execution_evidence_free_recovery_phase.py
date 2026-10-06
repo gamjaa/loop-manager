@@ -67,8 +67,7 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
         self.effects.agent.run_agent.side_effect = self.agent
         self.effects.validation.verify.side_effect = (
             lambda _: (self.lifecycle.append('verify') or True, 'fresh candidate: OK'))
-        self.effects.publication.command.side_effect = (
-            lambda *_args, **_kwargs: SimpleNamespace(stdout='https://example.test/pr/47'))
+        self.effects.publication.command.side_effect = self.fixture.publication_command
         saved = self.case.checkpoint.get('repo', 'G-047')
         # There is no saved Worker correction, stage approval or journal proof.
         self.case.checkpoint.record('repo', 'G-047', expected_generation=saved.generation,
@@ -213,7 +212,8 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
         self.assertEqual(self.lifecycle, ['manager_continue', 'worker_confirmation',
             'targeted_tests', 'verify', 'review', 'publication'])
         self.effects.publication.push_owned_pr_conflict_recovery.assert_called_once()
-        self.effects.publication.command.assert_not_called()
+        self.effects.publication.command.assert_called_once()
+        self.assertEqual(self.effects.publication.command.call_args.args[0][:3], ['gh', 'pr', 'view'])
         self.assertEqual(self.state.repository.get('repo', 'G-047').status, 'PR_OPEN')
 
     def test_absent_live_remote_ignores_stale_tracking_ref_after_adoption(self):

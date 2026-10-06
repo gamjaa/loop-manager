@@ -557,16 +557,16 @@ def _apply_general_planning_batch(
             except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
                 raise PlannerValidationError(str(error)) from error
         planning_review_state.confirm(connection, repo, snapshot.active_sha, plan_commit)
+        planning_input_state.record_general(
+            connection, repo, plan_commit,
+            effects.plan_declarations(worktree, plan_commit),
+        )
         effects._clear_active_in_current_transaction(
             connection,
             repo,
             processed_sha=plan_commit,
             specification_fingerprint=specification_fingerprint,
             planning_fingerprint=planning_fingerprint,
-        )
-        planning_input_state.record_general(
-            connection, repo, plan_commit,
-            effects.plan_declarations(worktree, plan_commit),
         )
         for source in result.retirement_moves:
             changed = connection.execute(
