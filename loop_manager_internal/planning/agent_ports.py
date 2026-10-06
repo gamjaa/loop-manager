@@ -115,6 +115,8 @@ class _PlanningAgentPorts:
         on_session_started: Callable[[str], None],
         *, profile_role: str | None = None, read_only: bool = False,
     ) -> PlanningAgentResult:
+        from loop_manager_internal.planning.manual_planning_context import protect
+        prompt=protect(self._connection,self._context.repo,prompt)
         context = self._context
         role_name = "planner_check" if profile_role == "planner_check" else "planner"
         if role_name == "planner_check":

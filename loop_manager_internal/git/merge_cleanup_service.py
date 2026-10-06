@@ -1,5 +1,6 @@
 """git merge cleanup service boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
@@ -117,6 +118,7 @@ class CompleteMergedWorktreeEffects:
     remove_cleanup_worktree: Callable[..., object]
     validate_execplan_workspace_identity: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
+    pr_for_branch: Callable[..., object] | None = None
 
 
 def complete_merged_worktree(
@@ -139,7 +141,7 @@ def complete_merged_worktree(
     branch = str(project["branch"] or "")
     effects._ensure_execplans_schema(connection)
     plan = connection.execute(
-        "SELECT branch, worktree, workspace_owned, title FROM exec_plans "
+        "SELECT * FROM exec_plans "
         "WHERE repo = ? AND plan_id = ?",
         (repo, plan_id),
     ).fetchone()
@@ -147,6 +149,11 @@ def complete_merged_worktree(
         raise WorkspaceOwnershipError(
             f"Merge cleanup ExecPlan을 찾을 수 없습니다: {plan_id}"
         )
+    from loop_manager_internal.recovery import manual_work_recovery
+    from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+    manual_store=ManualWorkRepository(connection)
+    manual_work_recovery.validate_merge(connection,repo,plan,pr_url,pr_head_oid,
+                                       pr_for_branch=effects.pr_for_branch)
     workspace_owned = WORKSPACE_OWNED
     cleanup_registration: tuple[str, ...] | None = None
     worktree_present = worktree.exists() or worktree.is_symlink()
@@ -168,7 +175,7 @@ def complete_merged_worktree(
             effects.validate_execplan_workspace_identity(
                 state_dir,
                 repo,
-                plan_id,
+                manual_workspace_owner(connection, repo, plan_id),
                 branch,
                 worktree,
             )
@@ -214,6 +221,7 @@ def complete_merged_worktree(
             project_values=project_values,
             enqueue=False,
         )
+        manual_store.mark_group_merged(repo,plan_id)
         effects._record_merged_worktree_cleanup(
             connection, repo_path, repo, plan_id, worktree, branch,
             pr_head_oid, assessment, cleanup_registration,
@@ -236,6 +244,7 @@ class CompleteMergedExecplanWorktreeEffects:
     remove_cleanup_worktree: Callable[..., object]
     validate_execplan_workspace_identity: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
+    pr_for_branch: Callable[..., object] | None = None
 
 
 def complete_merged_execplan_worktree(
@@ -248,6 +257,12 @@ def complete_merged_execplan_worktree(
     pr_head_oid: str | None,
 ) -> CleanupAssessment:
     """Complete exactly one merge-wait plan without hydrating another plan."""
+
+    from loop_manager_internal.recovery import manual_work_recovery
+    from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+    manual_store = ManualWorkRepository(connection)
+    manual_work_recovery.validate_merge(connection,repo,plan,pr_url,pr_head_oid,
+                                       pr_for_branch=effects.pr_for_branch)
 
     effects._ensure_cleanup_pending_schema(connection)
     branch = str(plan["branch"] or "")
@@ -275,7 +290,7 @@ def complete_merged_execplan_worktree(
             effects.validate_execplan_workspace_identity(
                 state_dir,
                 repo,
-                str(plan["plan_id"]),
+                manual_store.workspace_owner(repo,str(plan['plan_id'])),
                 branch,
                 worktree,
             )
@@ -330,6 +345,7 @@ def complete_merged_execplan_worktree(
             project_values=project_values,
             enqueue=False,
         )
+        manual_store.mark_group_merged(repo,plan_id)
         effects._record_merged_worktree_cleanup(
             connection, repo_path, repo, plan_id, worktree, branch,
             pr_head_oid, assessment, cleanup_registration,

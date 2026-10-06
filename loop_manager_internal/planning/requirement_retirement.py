@@ -8,6 +8,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import hashlib
 import json
+from loop_manager_internal.storage.manual_work_state import live_requirement_paths
 import os
 from pathlib import Path, PurePosixPath
 import re
@@ -222,6 +223,7 @@ class RequirementRetirementPort:
         draft_paths = {str(row["target_path"]) for row in drafts}
         from loop_manager_internal.storage.execplan_draft_state import pending_ids
         plan_drafts = pending_ids(self.connection, repo)
+        manual_sources=live_requirement_paths(self.connection,repo)
         for path, (mode, oid) in sorted(tree.items()):
             if not SOURCE.fullmatch(path):
                 continue
@@ -233,7 +235,7 @@ class RequirementRetirementPort:
                 continue
             if any(str(row["plan_id"]) in plan_drafts for row in related):
                 continue
-            if path in draft_paths or "docs/PRODUCT.md" in draft_paths or "docs/ARCHITECTURE.md" in draft_paths:
+            if path in manual_sources or path in draft_paths or "docs/PRODUCT.md" in draft_paths or "docs/ARCHITECTURE.md" in draft_paths:
                 continue
             destination = "docs/requirements/archive/" + path.removeprefix("docs/requirements/")
             if destination in tree:
@@ -484,6 +486,8 @@ class RequirementRetirementPort:
                              tuple(sorted(str(row["plan_id"]) for row in cancelled)),
                              self._token(repo, repository, revision, source, oid,
                                          related, tree, relevant)))
+            if source in live_requirement_paths(self.connection,repo):
+                token=_digest(('live-manual-intake',token))
             if previous is not None and previous["input_token"] == token:
                 if previous["outcome"] == "restore" and previous["stage"] != "published":
                     restorations.append(source)
@@ -496,6 +500,8 @@ class RequirementRetirementPort:
                 outcome, reason = "uncertain", "historical archive mode or active-path collision"
             elif cancelled:
                 outcome, reason = "uncertain", "cancelled source relationship is not Merge proof"
+            elif source in live_requirement_paths(self.connection,repo):
+                outcome, reason = "restore", "live manual intake protects Requirement"
             elif any(str(row["status"]) != "MERGED" for row in related):
                 outcome, reason = "restore", "live unfinished source-linked ExecPlan"
             elif related:

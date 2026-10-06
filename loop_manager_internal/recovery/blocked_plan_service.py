@@ -1,5 +1,6 @@
 """recovery blocked plan service boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.agents.scope_contracts import AgentScopeError
@@ -371,7 +372,7 @@ def resume_blocked_execplan_if_inputs_changed(
             effects.validate_execplan_workspace_identity(
                 state_dir,
                 repo,
-                str(plan["plan_id"]),
+                manual_workspace_owner(connection, repo, str(plan["plan_id"])),
                 branch,
                 worktree,
             )
@@ -423,7 +424,7 @@ def resume_blocked_execplan_if_inputs_changed(
         effects.validate_execplan_workspace_identity(
             state_dir,
             repo,
-            str(plan["plan_id"]),
+            manual_workspace_owner(connection, repo, str(plan["plan_id"])),
             branch,
             worktree,
         )

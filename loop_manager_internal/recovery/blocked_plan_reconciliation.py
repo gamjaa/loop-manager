@@ -4,6 +4,7 @@ The additive recovery state preserves original causes and publication audit.
 Current rebase acceptance never requires historical execution evidence.
 """
 from __future__ import annotations
+from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 
 import json
 from pathlib import Path
@@ -304,7 +305,7 @@ class BlockedPlanReconciler:
 
     def _validate(self, plan, *, rebase=False):
         worktree, branch = Path(plan['worktree']), str(plan['branch'])
-        self.ports.validate_execplan_workspace_identity(self.state_dir, self.repo, plan['plan_id'], branch, worktree)
+        self.ports.validate_execplan_workspace_identity(self.state_dir, self.repo, manual_workspace_owner(self.connection, self.repo, plan['plan_id']), branch, worktree)
         self.ports.validate_managed_worktree(self.repo_path, worktree, branch, allow_rebase=rebase)
         self.ports.validate_blocked_agent_scope(
             self.connection, self.repo_path, self.repo, self.base, worktree, plan['path'],
@@ -628,7 +629,7 @@ class BlockedPlanReconciler:
                         and integration.get('remote') != context['branch_oid']
                         or base_adoption_pending(checkpoint, plan['branch'], plan['worktree'])):
                     self.ports.validate_execplan_workspace_identity(
-                        self.state_dir, self.repo, plan_id, plan['branch'], Path(plan['worktree']))
+                        self.state_dir, self.repo, manual_workspace_owner(self.connection, self.repo, plan_id), plan['branch'], Path(plan['worktree']))
                 else:
                     self._validate(plan, rebase=checkpoint.operation in {'rebase', 'rebase_publish'})
                 self._adopt(plan, context)

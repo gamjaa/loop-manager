@@ -90,6 +90,7 @@ class RunProjectStepEffects:
     update_project: Callable[..., object]
     validate_persisted_agent_scope: Callable[..., object]
     validate_repository: Callable[..., object]
+    resume_manual_work: Callable[..., object] | None = None
 
 
 @dataclass(frozen=True)
@@ -146,6 +147,7 @@ class ProjectService:
             self._prepare_repository,
             self._reconcile_catalog_and_cleanup,
             self._synchronize_pull_requests,
+            self._resume_manual_work,
             self._resume_existing_execution,
             self._run_coordinators,
         ):
@@ -153,6 +155,13 @@ class ProjectService:
             if result is not None:
                 return ProjectStepResult(result)
         raise AssertionError("execution coordinator must return a project result")
+
+    def _resume_manual_work(self):
+        if self.effects.resume_manual_work is not None:
+            self.effects.resume_manual_work(self.identity.connection, self.identity.state_dir,
+                self.state.repo_path, self.identity.config_path, self.identity.runtime_mutation)
+            self.state.row = self.identity.connection.execute('SELECT * FROM projects WHERE repo=?',
+                (self.state.repo,)).fetchone()
 
     def _prepare_repository(self) -> int | None:
         self.effects._check_runtime_handoff()
@@ -585,7 +594,12 @@ class ProjectService:
             if pending_result is not None:
                 return pending_result
             existing_pr = self.effects.pr_for_branch(self.state.repo_path, self.state.row["branch"], self.state.row["pr_url"])
-            if existing_pr:
+            from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+            manual = ManualWorkRepository(self.identity.connection).for_plan(
+                self.state.repo, self.effects._plan_id_from_path(str(self.state.row['plan_path'] or '')))
+            defer_manual_pr = bool(manual and manual['state']=='AUTOMATIC'
+                                   and self.state.row['phase']!='PUBLISHING')
+            if existing_pr and not defer_manual_pr:
                 try:
                     reconciliation = self.effects.reconcile_existing_pull_request(
                         self.identity.connection,
@@ -764,6 +778,9 @@ class ProjectService:
         self.effects._check_runtime_handoff()
         prepared = execution.prepare()
         if isinstance(prepared, ExecutionOutcome):
+            from loop_manager_internal.recovery import manual_work_recovery
+            manual_work_recovery.release_wait(self.identity.connection,self.state.repo,prepared,
+                self.identity.state_dir,self.effects.git)
             return self.effects._execution_outcome_step_result(prepared)
         execution_context = prepared
         while True:
@@ -775,6 +792,9 @@ class ProjectService:
             ):
                 execution_context = execution_outcome.context
                 continue
+            from loop_manager_internal.recovery import manual_work_recovery
+            manual_work_recovery.release_wait(self.identity.connection,self.state.repo,execution_outcome,
+                self.identity.state_dir,self.effects.git)
             return self.effects._execution_outcome_step_result(execution_outcome)
 
     def _refresh_catalog(self, revision: str | None = None) -> str:

@@ -292,6 +292,8 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
     if isinstance(connection, StateConnection) and connection.execplans_schema_ready:
         return
     connection.execute(EXEC_PLANS_SCHEMA)
+    from loop_manager_internal.storage import manual_work_state
+    manual_work_state.ensure_schema(connection)
     execplan_catalog_state.ensure_schema(connection)
     execplan_archive_state.ensure_schema(connection)
     requirement_archive_state.ensure_schema(connection)

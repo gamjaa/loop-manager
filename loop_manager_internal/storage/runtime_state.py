@@ -1418,11 +1418,12 @@ class RuntimeStateRepository:
             values["pr_conflict_recovery"] = pr_conflict_recovery
             values["pr_conflict_head_oid"] = pr_conflict_head_oid
             values["pr_conflict_base_oid"] = pr_conflict_base_oid
-        return self.transition_and_clear(
-            repo,
-            snapshot.plan_id,
-            plan_values=values,
-        )
+        with _transaction(self.connection):
+            result = self.transition_and_clear(repo, snapshot.plan_id, plan_values=values)
+            from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+            ManualWorkRepository(self.connection).publish_group(repo,snapshot.plan_id,
+                {key:getattr(result,key) for key in ('pr_url','pr_head_oid','publication_remote_oid')})
+            return result
 
     def mark_merged(
         self,

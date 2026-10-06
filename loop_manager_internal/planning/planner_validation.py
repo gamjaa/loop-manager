@@ -368,6 +368,9 @@ def validate_planner_result(
                     (repo, repo),
                 )
             )
+            if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='manual_work_members'").fetchone():
+                reserved_ids.update(row[0] for row in connection.execute(
+                    'SELECT plan_id FROM manual_work_members WHERE repo=?', (repo,)))
         archived_directory = worktree / "docs/plans/archive"
         if archived_directory.is_dir():
             for archived in archived_directory.glob("*.md"):

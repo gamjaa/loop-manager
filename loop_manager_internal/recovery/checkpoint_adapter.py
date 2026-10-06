@@ -1,5 +1,6 @@
 """Checkpoint safety, Git publication and durable result adapters."""
 from __future__ import annotations
+from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -282,7 +283,7 @@ class CheckpointSafetyAdapter:
             self.safety_effects.validate_execplan_workspace_identity(
                 self.state_dir,
                 request.repo,
-                request.plan_id,
+                manual_workspace_owner(self.connection, request.repo, request.plan_id),
                 branch,
                 worktree,
             )

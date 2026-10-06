@@ -67,6 +67,7 @@ class ObserveWaitingPullRequestsEffects:
     operation_log: Callable[..., object]
     operation_print: Callable[..., object]
     pr_for_branch: Callable[..., object]
+    base_head: Callable[..., object] | None = None
 
 
 def observe_waiting_pull_requests(
@@ -97,7 +98,21 @@ def observe_waiting_pull_requests(
     conflicts: list[tuple[sqlite3.Row, Mapping[str, object]]] = []
     merged = False
     merged_pr_urls: list[str] = []
+    from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+    manual_store=ManualWorkRepository(connection)
+    seen_groups=set()
     for stored in rows:
+        current = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
+                                     (repo,stored['plan_id'])).fetchone()
+        if current and current['status'] not in {'PR_OPEN','PLAN_BLOCKED'}:
+            continue  # Shared cleanup already completed atomically.
+        stored=current or stored
+        group=manual_store.for_plan(repo,stored['plan_id'])
+        if group:
+            manual_store.workspace_owner(repo,stored['plan_id'])
+            if group['group_id'] in seen_groups:
+                continue
+            seen_groups.add(group['group_id'])
         branch = str(stored["branch"] or "")
         if not branch:
             raise RuntimeError(
@@ -169,6 +184,11 @@ def observe_waiting_pull_requests(
             continue
         if state != "OPEN":
             raise RuntimeError(f"지원하지 않는 GitHub PR 상태입니다: {state}")
+        if group and effects.base_head and stored['status']=='PR_OPEN':
+            from loop_manager_internal.recovery import manual_work_recovery
+            if manual_work_recovery.revalidate_waiting(connection,repo,stored,pull_request,
+                    effects.base_head(repo_path,registered_base)):
+                continue
         if (
             stored["status"] == "PLAN_BLOCKED"
             and stored["blocked_reason"] == PR_CLOSED_BLOCK_REASON
@@ -213,6 +233,11 @@ def observe_waiting_pull_requests(
                 # An unvalidated candidate resumes execution when its slot is
                 # available; it never joins the Merge-wait conflict selection.
                 continue
+            if group and effects.base_head:
+                from loop_manager_internal.recovery import manual_work_recovery
+                if manual_work_recovery.revalidate_waiting(connection,repo,stored,pull_request,
+                        effects.base_head(repo_path,registered_base)):
+                    continue
         with connection:
             resumed = notifications.record_work_start(
                 connection, repo, "PR handling", plan_id=str(stored["plan_id"]),
@@ -395,6 +420,8 @@ def _block_closed_pull_request(
             },
             clear_projection=clear_projection,
         )
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        ManualWorkRepository(connection).reflect_pr_state(repo,str(plan['plan_id']))
 
 
 @dataclass(frozen=True)
@@ -422,6 +449,14 @@ def _resume_reopened_pull_request(
     publication_approved = bool(definition is not None and plan["validated_base_sha"]
         and plan["publication_token"] == definition.publication_token(
             str(plan["validated_base_sha"]), str(head_oid or "")))
+    from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+    manual_store=ManualWorkRepository(connection)
+    group=manual_store.for_plan(repo,str(plan['plan_id']))
+    if group and group['state']=='CLOSED' and group['resume_phase']=='PR_OPEN':
+        publication=connection.execute('SELECT * FROM manual_work_publications WHERE repo=? AND group_id=?',
+                                       (repo,group['group_id'])).fetchone()
+        publication_approved=bool(publication and publication['pr_url']==url
+                                  and publication['head']==str(head_oid or ''))
     revalidate_candidate = bool(
         plan["blocked_reason"] == PR_CLOSED_BLOCK_REASON
         and (checkpoint.operation in {"rebase", "rebase_publish"}
@@ -503,6 +538,7 @@ def _resume_reopened_pull_request(
         scoped_blocking.clear_plan_block(
             connection, repo, str(plan["plan_id"])
         )
+        manual_store.reflect_pr_state(repo,str(plan['plan_id']))
         resumed = notifications.record_work_start(
             connection, repo, "PR handling", plan_id=str(plan["plan_id"]),
         )

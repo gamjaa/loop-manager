@@ -299,9 +299,12 @@ class RevisionHandler:
             'verify_token': None, 'review_token': None,
             'publication_token': None,
         })
+        from loop_manager_internal.execution.manual_candidate import get_manual
+        manual=get_manual(self.ports.state)
+        resumed_phase='VERIFYING' if manual and manual.user_submission(row) else 'IMPLEMENTING'
         self._install_revision_state(
             snapshot,
-            replace(decision, kind=RevisionGateKind.INVALIDATE_TO_PHASE, phase='IMPLEMENTING'),
+            replace(decision, kind=RevisionGateKind.INVALIDATE_TO_PHASE, phase=resumed_phase),
             latest_sha,
             legacy_baseline=False,
         )
@@ -323,6 +326,12 @@ class RevisionHandler:
         """Refresh and reconcile before any phase effect consumes its snapshot."""
 
         self.ports.state.check_context(context)
+        from loop_manager_internal.execution.manual_candidate import get_manual
+        pending_manual = get_manual(self.ports.state)
+        if pending_manual and pending_manual.enabled() and pending_manual.group()['pending_source_head'] \
+                and not pending_manual.group()['source_update_conflict']:
+            return ExecutionOutcome(ExecutionOutcomeKind.STABLE_WAIT,context=context,
+                detail='수락한 새 source 후보를 안전한 실행 자리에서 반영하기 위해 대기합니다.')
         if context.phase is ExecutionPhase.PUBLISHING:
             terminal = self.ports._reconcile_terminal_publication(context)
             if terminal is not None:
@@ -381,26 +390,35 @@ class RevisionHandler:
             archive_sources = ()
             archive_snapshot = None
             archive_candidates = ()
-            snapshot = DefinitionSnapshot(
-                revision_sha=latest_sha,
-                path=str(catalog_plan['path']),
-                title=str(catalog_plan['title']),
-                sources=tuple(json.loads(str(catalog_plan['sources']))),
-                depends_on=tuple(json.loads(str(catalog_plan['depends_on']))),
-                complexity=str(catalog_plan['current_complexity'] or self.ports.snapshot().plan['complexity']),
-                risk=str(catalog_plan['current_risk'] or self.ports.snapshot().plan['risk']),
-                priority=str(catalog_plan['priority']),
-                body_hash=self.ports.body_hash(
-                    self.ports.identity.repo_path, latest_sha, str(catalog_plan['path'])
-                ),
-                source_fingerprint=self.ports.source_fingerprint(
-                    self.ports.identity.repo_path, latest_sha, catalog_plan
-                ),
-                archive_candidates=tuple(sorted(archive_candidates)),
-                guidance_hash=common_guidance.plan_content_hash(
-                    self.ports.state.connection, self.ports.identity.repo, str(catalog_plan['plan_id']),
-                ),
-            )
+            from loop_manager_internal.execution.manual_candidate import get_manual
+            manual = get_manual(self.ports.state)
+            if manual and manual.enabled():
+                snapshot = manual.definition(context, catalog_plan, latest_sha)
+                try:
+                    manual.confirm_dependencies(context)
+                except RuntimeError as error:
+                    return ExecutionOutcome(ExecutionOutcomeKind.STABLE_WAIT,context=context,detail=str(error))
+            else:
+                snapshot = DefinitionSnapshot(
+                    revision_sha=latest_sha,
+                    path=str(catalog_plan['path']),
+                    title=str(catalog_plan['title']),
+                    sources=tuple(json.loads(str(catalog_plan['sources']))),
+                    depends_on=tuple(json.loads(str(catalog_plan['depends_on']))),
+                    complexity=str(catalog_plan['current_complexity'] or self.ports.snapshot().plan['complexity']),
+                    risk=str(catalog_plan['current_risk'] or self.ports.snapshot().plan['risk']),
+                    priority=str(catalog_plan['priority']),
+                    body_hash=self.ports.body_hash(
+                        self.ports.identity.repo_path, latest_sha, str(catalog_plan['path'])
+                    ),
+                    source_fingerprint=self.ports.source_fingerprint(
+                        self.ports.identity.repo_path, latest_sha, catalog_plan
+                    ),
+                    archive_candidates=tuple(sorted(archive_candidates)),
+                    guidance_hash=common_guidance.plan_content_hash(
+                        self.ports.state.connection, self.ports.identity.repo, str(catalog_plan['plan_id']),
+                    ),
+                )
             previous = DefinitionSnapshot.deserialize(
                 self.ports._row()['definition_snapshot']
             )
@@ -460,13 +478,16 @@ class RevisionHandler:
             active_base_token=active_sha,
             current_base_token=latest_sha,
             artifacts=StageArtifacts(
+                manual_submission=bool(manual and manual.user_submission(row)),
                 require_worker_candidate=bool(self.ports.checkpoint and
                     (self.ports.checkpoint.get(self.ports.identity.repo, context.plan.plan_id).snapshot or {}).get('current_rebase_acceptance')),
                 worker_candidate_token=((self.ports.checkpoint.get(self.ports.identity.repo, context.plan.plan_id).snapshot or {}).get('worker_candidate_token')
                                         if self.ports.checkpoint else None),
                 worker_result=row['worker_result'] is not None,
-                verify_result=row['verify_result'] is not None,
-                review_result=row['review_result'] is not None,
+                verify_result=(manual.valid_evidence(context,'verify',row['verify_result'])
+                               if manual and manual.enabled() else row['verify_result'] is not None),
+                review_result=(manual.valid_evidence(context,'review',row['review_result'])
+                               if manual and manual.enabled() else row['review_result'] is not None),
                 worker_input_token=(
                     snapshot.worker_token
                     if legacy_baseline and row['worker_result'] is not None

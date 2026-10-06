@@ -1,5 +1,6 @@
 """recovery pr ownership boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -123,7 +124,7 @@ def _validate_pr_conflict_recovery_ownership(
     )
     plan_id = str(plan["plan_id"])
     effects.validate_execplan_workspace_identity(
-        state_dir, repo, plan_id, branch, worktree
+        state_dir, repo, manual_workspace_owner(connection, repo, plan_id), branch, worktree
     )
     effects.make_worktree(
         repo_path,
@@ -215,7 +216,7 @@ def _validate_blocked_pr_without_conflict(
         connection, repo, project, pull_request, expected_status="PLAN_BLOCKED"
     )
     effects.validate_execplan_workspace_identity(
-        state_dir, repo, str(plan["plan_id"]), branch, worktree
+        state_dir, repo, manual_workspace_owner(connection, repo, str(plan["plan_id"])), branch, worktree
     )
     if not worktree.is_dir():
         raise WorkspaceOwnershipError("PR 충돌 복구 worktree가 존재하지 않습니다.")
@@ -313,7 +314,7 @@ def _validate_active_pr_conflict_recovery(
             "진행 중인 PR의 원격 head가 복구 시작 시 관측값과 달라졌습니다."
         )
     effects.validate_execplan_workspace_identity(
-        state_dir, repo, str(plan["plan_id"]), branch, worktree
+        state_dir, repo, manual_workspace_owner(connection, repo, str(plan["plan_id"])), branch, worktree
     )
     effects.make_worktree(
         repo_path,

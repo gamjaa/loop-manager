@@ -269,8 +269,12 @@ class PlanningSelectionService(PlanningService):
             self._ports.events.info("PROJECT_BLOCKED 해제 전에는 새 점검이나 작업을 시작하지 않습니다.")
             return PlanningOutcome(PlanningOutcomeKind.WAITING)
         waiting_for_pr = any(str(item["status"]) == "PR_OPEN" for item in self._ports.state.execplan_rows(context.repo))
+        waiting_for_manual = any(str(item["status"]) == "MANUAL_WORKING"
+                                 for item in self._ports.state.execplan_rows(context.repo))
         if context.registered_only and waiting_for_pr and cycle.phase is maintenance_state.MaintenancePhase.IDLE:
             self._ports.events.log("실제 Open PR 대기: 새 due 유지보수는 PR 동기화·종료 확인 뒤 선택합니다.")
+        if context.registered_only and waiting_for_manual and cycle.phase is maintenance_state.MaintenancePhase.IDLE:
+            self._ports.events.log("수동 구현 대기: 새 유지보수 cycle을 보류하고 독립 일반 READY 선택을 계속합니다.")
         approval_pending = (
             context.self_repository
             and cycle.phase is maintenance_state.MaintenancePhase.IDLE
@@ -282,6 +286,7 @@ class PlanningSelectionService(PlanningService):
             context.registered_only
             and cycle.phase is maintenance_state.MaintenancePhase.IDLE
             and not waiting_for_pr
+            and not waiting_for_manual
             and not approval_pending
         ):
             tiered_selection = None

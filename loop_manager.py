@@ -301,7 +301,8 @@ from loop_manager_internal.application.compatibility import bind_effects as _bin
 from loop_manager_internal.agents import agent_adapter
 from loop_manager_internal.agents import scope_adapter
 from loop_manager_internal.agents import scope_state_service
-from loop_manager_internal.application import commands
+from loop_manager_internal.application import commands, manual_work
+from loop_manager_internal.planning import manual_plan_generation
 from loop_manager_internal.application import contracts
 from loop_manager_internal.application import project_outcomes
 from loop_manager_internal.application import project_runner
@@ -3245,6 +3246,7 @@ _reconciled_manager_scope_metadata = _bind_effects(
 
 complete_merged_worktree = _bind_effects(
     merge_cleanup_service.complete_merged_worktree, lambda: merge_cleanup_service.CompleteMergedWorktreeEffects(
+        pr_for_branch=lambda *a, **kw: pr_for_branch(*a, **kw),
         _assess_missing_managed_cleanup=lambda *args, **kwargs: _assess_missing_managed_cleanup(*args, **kwargs),
         _canonical_path=lambda *args, **kwargs: _canonical_path(*args, **kwargs),
         _clear_active_values=lambda *args, **kwargs: _clear_active_values(*args, **kwargs),
@@ -3263,6 +3265,7 @@ complete_merged_worktree = _bind_effects(
 
 complete_merged_execplan_worktree = _bind_effects(
     merge_cleanup_service.complete_merged_execplan_worktree, lambda: merge_cleanup_service.CompleteMergedExecplanWorktreeEffects(
+        pr_for_branch=lambda *a, **kw: pr_for_branch(*a, **kw),
         _assess_missing_managed_cleanup=lambda *args, **kwargs: _assess_missing_managed_cleanup(*args, **kwargs),
         _canonical_path=lambda *args, **kwargs: _canonical_path(*args, **kwargs),
         _clear_active_values=lambda *args, **kwargs: _clear_active_values(*args, **kwargs),
@@ -3283,6 +3286,7 @@ WaitingPullRequestObservation = contracts.WaitingPullRequestObservation
 
 observe_waiting_pull_requests = _bind_effects(
     waiting_pr_service.observe_waiting_pull_requests, lambda: waiting_pr_service.ObserveWaitingPullRequestsEffects(
+        base_head=lambda repo, base: git(repo, "rev-parse", f"refs/remotes/origin/{base}").stdout.strip(),
         _block_closed_pull_request=lambda *args, **kwargs: _block_closed_pull_request(*args, **kwargs),
         _recorded_base_fetch=lambda *args, **kwargs: _recorded_base_fetch(*args, **kwargs),
         _resume_reopened_pull_request=lambda *args, **kwargs: _resume_reopened_pull_request(*args, **kwargs),
@@ -3721,6 +3725,7 @@ observe_blocked_plan_remotes = _bind_effects(
 
 _run_project_step = _bind_effects(
     project_service._run_project_step, lambda: project_service.RunProjectStepEffects(
+        resume_manual_work=lambda *args, **kwargs: _resume_manual_work(*args, **kwargs),
         ExecutionPhaseCoordinator=lambda *args, **kwargs: ExecutionPhaseCoordinator(*args, **kwargs),
         ManagerGitCheckpoint=ManagerGitCheckpoint,
         _ExecutionLifecyclePorts=lambda *args, **kwargs: _ExecutionLifecyclePorts(*args, **kwargs),
@@ -3922,6 +3927,37 @@ _document_drafts_command = _bind_effects(
     ),
 )
 
+_run_manual_project = _bind_effects(
+    manual_work.run_manual_project, lambda: manual_work.ManualProjectDriverEffects(
+        load_managed_config=lambda *a, **kw: load_managed_config(*a, **kw),
+        run_project_result=lambda *a, **kw: run_project_result(*a, **kw),
+    ),
+)
+
+_manual_work_effects = lambda: manual_work.ManualWorkEffects(
+        connect_database=lambda *a, **kw: connect_database(*a, **kw),
+        validate_repository=lambda *a, **kw: validate_repository(*a, **kw),
+        fetch_base=lambda *a, **kw: _recorded_base_fetch(*a, **kw),
+        git=lambda *a, **kw: git(*a, **kw),
+        git_bytes=lambda *a, **kw: git_bytes(*a, **kw),
+        make_worktree=lambda *a, **kw: make_worktree(*a, **kw),
+        validate_workspace=lambda *a, **kw: validate_managed_worktree(*a, **kw),
+        capture_snapshot=lambda *a, **kw: capture_git_snapshot(*a, **kw),
+        pr_for_branch=lambda *a, **kw: pr_for_branch(*a, **kw),
+        generate_plans=lambda *a, **kw: manual_plan_generation.generate(
+            manual_plan_generation.ManualGenerationEffects(
+                git=lambda *ga, **gkw: git(*ga, **gkw),
+                run_agent=lambda *aa, **akw: run_agent(*aa, **akw)), *a, **kw),
+        run_project=lambda *a, **kw: _run_manual_project(*a, **kw),
+        operation_print=lambda *a, **kw: operation_print(*a, **kw),
+    )
+
+
+_manual_command = _bind_effects(manual_work.manual_command, lambda: _manual_work_effects())
+
+_resume_manual_work = _bind_effects(manual_work.resume_manual_work, lambda: _manual_work_effects())
+
+
 execute_runtime_command = _bind_effects(
     commands.execute_runtime_command, lambda: commands.ExecuteRuntimeCommandEffects(
         _document_drafts_command=lambda *args, **kwargs: _document_drafts_command(*args, **kwargs),
@@ -3930,6 +3966,7 @@ execute_runtime_command = _bind_effects(
         load_managed_config=lambda *args, **kwargs: load_managed_config(*args, **kwargs),
         operation_print=lambda *args, **kwargs: operation_print(*args, **kwargs),
         run_registered_projects=lambda *args, **kwargs: run_registered_projects(*args, **kwargs),
+        manual_command=lambda *args, **kwargs: _manual_command(*args, **kwargs),
     ),
 )
 
@@ -4143,6 +4180,22 @@ def build_parser() -> argparse.ArgumentParser:
                               help="의미 보존이 불확실하면 승인 대신 새 검토 요구")
     draft_commands.add_parser("approved", help="현재 원본에 유효한 승인 조회")
 
+    manual = subcommands.add_parser('manual', help='수동 G 구현 시작·완료와 원격 R·코드 제출')
+    manual_commands = manual.add_subparsers(dest='manual_command', required=True)
+    for name in ('start', 'complete', 'submit'):
+        command = manual_commands.add_parser(name)
+        command.add_argument('repository', help='등록된 Git 저장소 루트')
+        if name == 'submit':
+            command.add_argument('--branch', required=True, help='읽기 입력 원격 branch')
+            command.add_argument('--requirement', action='append', required=True, help='제출 commit의 R 문서 경로')
+        else:
+            command.add_argument('plan_id', help='정확한 G ID')
+        if name != 'start':
+            command.add_argument('--skip-verify', action='store_true')
+            command.add_argument('--skip-review', action='store_true')
+            command.add_argument('--expected-head')
+            command.add_argument('--skip-reason')
+
     maintenance = subcommands.add_parser("maintenance-review", help="등록 프로젝트의 전체 정밀 점검을 다음 안전한 경계에 요청")
     maintenance.add_argument("repository", help="등록된 Git 저장소 루트")
 
@@ -4158,6 +4211,11 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     raw_arguments = sys.argv[1:]
     args = build_parser().parse_args(raw_arguments)
+    if args.command == 'manual' and args.manual_command != 'start':
+        try:
+            manual_work.validate_options(args)
+        except ValueError as error:
+            build_parser().error(str(error))
     state_dir = state_directory(args.state_dir)
     config_path = source_config_path(ROOT, args.config)
     try:

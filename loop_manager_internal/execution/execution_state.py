@@ -205,7 +205,7 @@ class ExecutionStatePort:
     def open_pull_request(self, repo, **values):
         if repo != self.repo:
             raise runtime_state.RuntimeStateError("execution repository identity 불일치")
-        with self.connection:
+        with runtime_state._transaction(self.connection):
             expected = self.check()
             if expected is None:
                 raise runtime_state.RuntimeStateError("execution projection이 없습니다.")
@@ -214,6 +214,8 @@ class ExecutionStatePort:
                 plan_values={"status": "PR_OPEN", "last_error": None, **values},
                 project_values=runtime_state.clear_project_values(),
             )
+            from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+            ManualWorkRepository(self.connection).publish_group(repo, self.plan_id, values)
             self.expected = None
             return result
 

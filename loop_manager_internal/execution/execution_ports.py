@@ -166,10 +166,22 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
     """Bind named effects to legacy helpers, preserving their patch points."""
     verify_timeout_seconds = identity.pop("verify_timeout_seconds", 600)
     state = _ExecutionStatePort(connection, runtime_repository, identity["repo"])
+    from loop_manager_internal.execution.manual_candidate import ManualCandidate, MANUAL_TEST_EVIDENCE
+    manual = ManualCandidate(connection, identity['repo'], state.plan_id, dependencies.git,
+                             lambda repo, *args: dependencies.git(repo, *args).stdout.encode(), dependencies.pr_for_branch)
+    state.manual = manual
+    def workspace_identity(state_dir, repo, plan_id, branch, worktree):
+        return dependencies.validate_execplan_workspace_identity(state_dir, repo,
+            manual.store.workspace_owner(repo, plan_id), branch, worktree)
+    def publication(message, plan):
+        return manual.publication(message, plan, dependencies.parse_worker_result)
+    def targeted_reason(evidence):
+        return ('수동 제출의 외부 targeted test 결과는 Manager가 확인하지 않았습니다.'
+                if evidence == MANUAL_TEST_EVIDENCE else dependencies.reviewer_targeted_test_reason(evidence))
     effects = execution_handlers.ExecutionEffects(
         state=state,
         checkpoint=execution_checkpoint_state.ExecutionCheckpointRepository(connection),
-        contract=ExecutionContract(AgentResultKind=AgentResultKind, AgentScopeError=AgentScopeError, ExecPlanMetadataError=ExecPlanMetadataError, GitLockError=GitLockError, MAX_REVIEWER_PROTOCOL_ATTEMPTS=MAX_REVIEWER_PROTOCOL_ATTEMPTS, MAX_VALIDATION_FINGERPRINT_REPEATS=MAX_VALIDATION_FINGERPRINT_REPEATS, PROJECT_STEP_RETRY=PROJECT_STEP_RETRY, PROJECT_STEP_TRANSIENT_PAUSE=PROJECT_STEP_TRANSIENT_PAUSE, PROJECT_STEP_USAGE_PAUSE=PROJECT_STEP_USAGE_PAUSE, PROJECT_STEP_PLANNING_PENDING=PROJECT_STEP_PLANNING_PENDING, PublicationSafetyError=PublicationSafetyError, REBASE_CONFLICT_PREFIX=REBASE_CONFLICT_PREFIX, REBASE_IN_PROGRESS_ERROR=REBASE_IN_PROGRESS_ERROR, RequirementArchiveCollisionError=RequirementArchiveCollisionError, RequirementArchiveError=RequirementArchiveError, ReviewerProtocolError=ReviewerProtocolError, TRANSIENT_AGENT_ERROR_PREFIX=TRANSIENT_AGENT_ERROR_PREFIX, USAGE_LIMIT_ERROR_PREFIX=USAGE_LIMIT_ERROR_PREFIX, WORKSPACE_OWNED=WORKSPACE_OWNED, WORKSPACE_RESERVED=WORKSPACE_RESERVED, WorkerResultError=WorkerResultError, WorkspaceOwnershipError=WorkspaceOwnershipError, reviewer_targeted_test_reason=dependencies.reviewer_targeted_test_reason, VerifyTerminationUncertain=VerifyTerminationUncertain),
+        contract=ExecutionContract(AgentResultKind=AgentResultKind, AgentScopeError=AgentScopeError, ExecPlanMetadataError=ExecPlanMetadataError, GitLockError=GitLockError, MAX_REVIEWER_PROTOCOL_ATTEMPTS=MAX_REVIEWER_PROTOCOL_ATTEMPTS, MAX_VALIDATION_FINGERPRINT_REPEATS=MAX_VALIDATION_FINGERPRINT_REPEATS, PROJECT_STEP_RETRY=PROJECT_STEP_RETRY, PROJECT_STEP_TRANSIENT_PAUSE=PROJECT_STEP_TRANSIENT_PAUSE, PROJECT_STEP_USAGE_PAUSE=PROJECT_STEP_USAGE_PAUSE, PROJECT_STEP_PLANNING_PENDING=PROJECT_STEP_PLANNING_PENDING, PublicationSafetyError=PublicationSafetyError, REBASE_CONFLICT_PREFIX=REBASE_CONFLICT_PREFIX, REBASE_IN_PROGRESS_ERROR=REBASE_IN_PROGRESS_ERROR, RequirementArchiveCollisionError=RequirementArchiveCollisionError, RequirementArchiveError=RequirementArchiveError, ReviewerProtocolError=ReviewerProtocolError, TRANSIENT_AGENT_ERROR_PREFIX=TRANSIENT_AGENT_ERROR_PREFIX, USAGE_LIMIT_ERROR_PREFIX=USAGE_LIMIT_ERROR_PREFIX, WORKSPACE_OWNED=WORKSPACE_OWNED, WORKSPACE_RESERVED=WORKSPACE_RESERVED, WorkerResultError=WorkerResultError, WorkspaceOwnershipError=WorkspaceOwnershipError, reviewer_targeted_test_reason=targeted_reason, VerifyTerminationUncertain=VerifyTerminationUncertain),
         workspace=execution_handlers.WorkspaceEffects(
             is_directory=lambda path: path.is_dir(),
             git=state.bind(dependencies._typed_execution_git, name="git", connected=False, mutates=False),
@@ -177,7 +189,7 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
             branch_has_changes=state.bind(dependencies.branch_has_changes, name="branch_has_changes", connected=False, mutates=False),
             remote_branch_oid=state.bind(dependencies.remote_branch_oid, name="remote_branch_oid", connected=False, mutates=False),
             _rebase_in_progress_for_branch=state.bind(dependencies._rebase_in_progress_for_branch, name="_rebase_in_progress_for_branch", connected=False, mutates=False),
-            validate_execplan_workspace_identity=state.bind(dependencies.validate_execplan_workspace_identity, name="validate_execplan_workspace_identity", connected=False, mutates=False),
+            validate_execplan_workspace_identity=state.bind(workspace_identity, name="validate_execplan_workspace_identity", connected=False, mutates=False),
             validate_managed_worktree=state.bind(dependencies.validate_managed_worktree, name="validate_managed_worktree", connected=False, mutates=False),
             _plan_id_from_path=state.bind(dependencies._plan_id_from_path, name="_plan_id_from_path", connected=False, mutates=False),
             reserve_execplan_workspace=state.bind(dependencies.reserve_execplan_workspace, name="reserve_execplan_workspace", connected=True, mutates=True),
@@ -213,8 +225,8 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
             validate_guidance_publication=state.bind(dependencies.validate_guidance_publication, name="validate_guidance_publication", connected=True, mutates=True),
             run_agent=state.bind(dependencies._run_agent_with_connection, name="run_agent", connected=True, mutates=False),
             run_agent_with_retries=state.bind(dependencies.run_agent_with_retries, name="run_agent_with_retries", connected=False, mutates=False),
-            worker_prompt=state.bind(dependencies.worker_prompt, name="worker_prompt", connected=False, mutates=False),
-            reviewer_prompt=state.bind(dependencies.reviewer_prompt, name="reviewer_prompt", connected=False, mutates=False),
+            worker_prompt=state.bind(lambda *a, **kw: manual.prompt(dependencies.worker_prompt(*a, **kw)), name="worker_prompt", connected=False, mutates=False),
+            reviewer_prompt=state.bind(lambda *a, **kw: manual.prompt(dependencies.reviewer_prompt(*a, **kw), review=True), name="reviewer_prompt", connected=False, mutates=False),
             resolve_worker_profile=lambda config_path, provider, level, worktree: dependencies._agent_profile(
                 config_path, provider, "worker", level, worktree,
             ),
@@ -230,7 +242,7 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
                 dependencies.block_verify_timeout_limit, name="block_verify_timeout_limit",
                 connected=True, mutates=True,
             ),
-            parse_worker_result=state.bind(dependencies.parse_worker_result, name="parse_worker_result", connected=False, mutates=False),
+            parse_worker_result=state.bind(publication, name="parse_worker_result", connected=False, mutates=False),
             parse_reviewer_result=state.bind(dependencies.parse_reviewer_result, name="parse_reviewer_result", connected=False, mutates=False),
             validate_active_execplan_metadata=state.bind(dependencies.validate_active_execplan_metadata, name="validate_active_execplan_metadata", connected=False, mutates=False),
             ensure_worker_level_state=state.bind(dependencies.ensure_worker_level_state, name="ensure_worker_level_state", connected=True, mutates=True),
@@ -256,7 +268,7 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
             push_managed_publication_branch=state.bind(dependencies.push_managed_publication_branch, name="push_managed_publication_branch", connected=True, mutates=True),
             push_owned_pr_conflict_recovery=state.bind(dependencies.push_owned_pr_conflict_recovery, name="push_owned_pr_conflict_recovery", connected=True, mutates=True),
             published_execplan=state.bind(dependencies.published_execplan, name="published_execplan", connected=False, mutates=False),
-            build_pr_body=state.bind(dependencies.build_pr_body, name="build_pr_body", connected=False, mutates=False),
+            build_pr_body=state.bind(lambda *a, **kw: manual.decorate_body(dependencies.build_pr_body(*a, **kw)), name="build_pr_body", connected=False, mutates=False),
             command=state.bind(dependencies._typed_execution_command, name="command", connected=False, mutates=False),
         ),
         blocking=execution_handlers.BlockingEffects(
