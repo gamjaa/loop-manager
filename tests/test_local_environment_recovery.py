@@ -47,6 +47,46 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
             run_project_result=run_project_result,
         )
 
+    def test_plan_command_resolves_with_independent_planning_error(self):
+        self.config_path.write_text("[loop]\n", encoding="utf-8")
+        repo = str(self.repository.resolve())
+        with closing(loop_manager.connect_database(self.state_dir)) as connection, connection:
+            connection.execute("UPDATE projects SET planning_error = 'independent planning error' WHERE repo = ?", (repo,))
+            connection.execute(
+                "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, priority, content_hash, status, plan_sha) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (repo, 'G-001', 'docs/plans/G-001.md', 'one', '[]', '[]', 'normal', 'hash', 'READY', 'base'))
+        args = loop_manager.build_parser().parse_args(['recover', repo, '--plan', 'G-001'])
+        run = mock.Mock(return_value=ProjectRunResult(ProjectRunKind.WAITING, 0))
+        self.assertEqual(recover_local_environment(self.effects(run), args, self.state_dir, self.config_path), 0)
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            self.assertEqual(connection.execute("SELECT planning_error FROM projects WHERE repo = ?", (repo,)).fetchone()[0], 'independent planning error')
+            self.assertEqual(connection.execute("SELECT result FROM local_environment_recovery_requests").fetchone()[0], 'resolved')
+        self.assertEqual(recover_local_environment(self.effects(run), self.arguments, self.state_dir, self.config_path), 1)
+
+    def test_project_command_checks_second_block_after_first_remains_blocked(self):
+        from loop_manager_internal.storage import local_recovery_state
+        self.config_path.write_text("[loop]\n", encoding="utf-8")
+        repo = str(self.repository.resolve())
+        with closing(loop_manager.connect_database(self.state_dir)) as connection, connection:
+            for plan in ('G-001', 'G-002'):
+                connection.execute(
+                    "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, priority, content_hash, status, plan_sha, blocked_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (repo, plan, f'docs/plans/{plan}.md', plan, '[]', '[]', 'normal', 'hash', 'PLAN_BLOCKED', 'base', 'verify_retry_exhausted'))
+        checked = []
+        def run(connection, *_args, **kwargs):
+            target = kwargs['recovery_plan_id'] or 'G-001'
+            checked.append(target)
+            with connection:
+                self.assertTrue(local_recovery_state.consume_recheck(connection, kwargs['recovery_request_id'], target, 'verify'))
+                if target == 'G-002':
+                    connection.execute("UPDATE exec_plans SET status = 'READY', blocked_reason = NULL WHERE repo = ? AND plan_id = ?", (repo, target))
+            return ProjectRunResult(ProjectRunKind.OPERATIONAL_ERROR, 1) if target == 'G-001' else ProjectRunResult(ProjectRunKind.WAITING, 0)
+        self.assertEqual(recover_local_environment(self.effects(run), self.arguments, self.state_dir, self.config_path), 1)
+        self.assertEqual(checked, ['G-001', 'G-002'])
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            self.assertEqual([row[0] for row in connection.execute("SELECT status FROM exec_plans ORDER BY plan_id")], ['PLAN_BLOCKED', 'READY'])
+            self.assertEqual(connection.execute("SELECT COUNT(*) FROM local_environment_recheck_consumption").fetchone()[0], 2)
+
     def test_manual_resume_runs_in_normal_order_and_is_scoped_out_of_recover(self):
         for request_id in (None, "request"):
             with self.subTest(request_id=request_id):

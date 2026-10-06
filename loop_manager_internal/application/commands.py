@@ -207,7 +207,7 @@ class ExecuteRuntimeCommandEffects:
 
 
 def _local_recovery_causes_remain(after: dict, plan_id: str | None) -> bool:
-    if after["phase"] == "PROJECT_BLOCKED" or after["planning_error_sha256"]:
+    if after["phase"] == "PROJECT_BLOCKED" or (plan_id is None and after["planning_error_sha256"]):
         return True
     relevant = [item for item in after["plans"] if plan_id is None or item["plan_id"] == plan_id]
     if any(item["status"] == "PLAN_BLOCKED" for item in relevant):
@@ -217,7 +217,8 @@ def _local_recovery_causes_remain(after: dict, plan_id: str | None) -> bool:
         if item["scope"] == "project"
         or plan_id is None or item["plan_id"] == plan_id
     ]
-    if after["current_failures"]:
+    if any(subject != "__project__" or plan_id is None or not after["planning_error_sha256"]
+           for subject in after["current_failures"]):
         return True
     if relevant_blocks:
         return True
@@ -267,22 +268,39 @@ def recover_local_environment(
             connection, enabled=bool(config.telegram_token and config.telegram_chat_id),
         )
         connection.commit()
-        outcome = effects.run_project_result(
-            connection,
-            state_dir,
-            repository,
-            config.path,
-            None,
-            False,
-            str(project["provider"]),
-            registered_only=True,
-            planner_mutex=threading.Lock(),
-            refactoring_review_interval=config.refactoring_review_interval,
-            verify_timeout_seconds=config.verify_timeout_seconds,
-            external_run_id=request.request_id,
-            recovery_request_id=request.request_id,
-            recovery_plan_id=plan_id,
-        )
+        # Freeze this request's candidates before execution changes the active
+        # projection. A failed first check must not starve independent plans.
+        targets = [plan_id]
+        if plan_id is None:
+            targets.extend(str(row[0]) for row in connection.execute(
+                "SELECT plan_id FROM exec_plans WHERE repo = ? AND status = 'PLAN_BLOCKED' "
+                "AND blocked_reason IN ('verify_timeout_limit_insufficient', 'verify_retry_exhausted') "
+                "ORDER BY plan_id", (repository,)))
+        outcomes = []
+        for target in targets:
+            if plan_id is None and target is not None and local_recovery_state.recheck_consumed(
+                    connection, request.request_id, target, "verify"):
+                continue
+            outcome = effects.run_project_result(
+                connection,
+                state_dir,
+                repository,
+                config.path,
+                None,
+                False,
+                str(project["provider"]),
+                registered_only=True,
+                planner_mutex=threading.Lock(),
+                refactoring_review_interval=config.refactoring_review_interval,
+                verify_timeout_seconds=config.verify_timeout_seconds,
+                external_run_id=request.request_id,
+                recovery_request_id=request.request_id,
+                recovery_plan_id=target,
+            )
+            outcomes.append(outcome)
+        outcome = next((item for item in outcomes if item.exit_code or item.kind not in {
+            ProjectRunKind.COMPLETED, ProjectRunKind.WAITING,
+        }), outcomes[-1])
         after = local_recovery_state.snapshot(connection, repository, plan_id)
         unresolved = _local_recovery_causes_remain(after, plan_id)
         in_progress = _local_recovery_in_progress(after, plan_id)
