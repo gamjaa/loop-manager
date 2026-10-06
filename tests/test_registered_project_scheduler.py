@@ -768,10 +768,24 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
         connection.commit()
 
         selected = loop_manager.select_ready_execplan(connection, "repo")
-        self.assertEqual(selected["plan_id"], "G-003")
+        self.assertEqual(selected["plan_id"], "G-099")
+        decision = loop_manager.catalog_schedule_decision(connection, "repo")
+        self.assertIn("G-002 -> G-099", decision.selection_reason)
+        self.assertEqual(
+            tuple(connection.execute(
+                "SELECT priority, status FROM exec_plans WHERE plan_id = 'G-099'"
+            ).fetchone()),
+            ("low", "READY"),
+        )
+        self.assertEqual(
+            connection.execute(
+                "SELECT status FROM exec_plans WHERE plan_id = 'G-002'"
+            ).fetchone()[0],
+            "READY",
+        )
         connection.execute(
             "UPDATE exec_plans SET status = 'IMPLEMENTING' "
-            "WHERE repo = 'repo' AND plan_id = 'G-003'"
+            "WHERE repo = 'repo' AND plan_id = 'G-099'"
         )
         connection.commit()
         self.assertIsNone(loop_manager.select_ready_execplan(connection, "repo"))

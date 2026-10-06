@@ -287,8 +287,9 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 - READY ExecPlan은 모든 `depends_on`이 MERGED이고 다른 현재 작업이 없을 때만 시작한다
 - dependency를 충족하지 못한 READY만 남아도 변경 입력에 해당하는 Planner 역할을 한 번 실행하고, 확인 기준과 입력·대상이 같으면 대기한다
 - 제품 우선순위는 안전한 무인 실행을 막거나 반복적인 사용자 복구를 요구하는 작업, 정상 경로의 사용자 개입을 제거하는 핵심 자동화, 그 밖의 Current Goal, 선택적 편의와 최적화 순이다
-- 실행 가능한 READY ExecPlan이 여럿이면 제품 우선순위가 높은 계획을 먼저 선택하고 같은 우선순위에서는 숫자 ExecPlan ID가 가장 작은 계획을 선택한다
-- 활성 유지보수 prerequisite 집합은 dependency gate 뒤 priority와 숫자 ID 순으로, 리팩터링 DAG는 dependency gate 뒤 숫자 ID 순으로 선택하며 집합 밖 READY는 cycle이 끝날 때까지 시작하지 않는다. 이때도 `PROJECT_BLOCKED`는 일반 실행을 막고, 다른 `PLAN_BLOCKED`·`PR_OPEN`과 dependency로 연결된 계획은 건너뛴다
+- 일반·재개·planning 오류 보존 중 독립 READY와 유지보수 prerequisite는 기존 단계가 허용한 실행 후보 안에서 유효 우선순위, 숫자 ExecPlan ID 오름차순으로 선택한다. 유효값은 게시·검증된 같은 프로젝트 catalog에서 자신의 선언값과 자신을 직접·간접 미Merge dependency로 필요로 하는 미완료 목표의 선언값 중 가장 높은 값이며, MERGED에서 전파를 끝낸다. priority 생략은 normal이고 critical·high·normal·low 순서를 유지한다
+- 선언값과 dependency·실행 상태는 전파로 변경하지 않는다. 검증된 priority·dependency·catalog 추가/삭제와 실제 Merge 반영 뒤 다음 안전한 선택에서 다시 계산하며, 선택 로그는 선언값·유효값·상향 목표와 dependency 경로를 기록한다. 격리·미확정·유효하지 않은 관계는 기존 검증·보류 경계를 유지한다
+- 활성 유지보수 prerequisite 집합은 dependency gate 뒤 유효 우선순위와 숫자 ID 순으로, 리팩터링 DAG는 dependency gate 뒤 숫자 ID 순으로 선택하며 집합 밖 READY는 cycle이 끝날 때까지 시작하지 않는다. 이때도 `PROJECT_BLOCKED`는 일반 실행을 막고, 다른 `PLAN_BLOCKED`·`PR_OPEN`과 dependency로 연결된 계획은 건너뛴다
 - 확정 범위의 마지막 계획 Merge와 필요한 원격 관측·게시·catalog 반영 뒤 cycle을 종료하고 장벽 뒤 READY의 일반 선택으로 돌아간다. 별도 사후 재검증이나 이를 대신하는 일반 Planner 호출을 종료 조건으로 추가하지 않는다
 - 각 ExecPlan은 고유하고 결정적인 이름의 branch와 별도 관리 worktree에서 작업한다
 - 서로 다른 프로젝트는 `max_workers` 범위에서 병렬로 처리한다
@@ -297,7 +298,7 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 - self Merge 없음, 다른 프로젝트 Merge와 일반 push는 handoff 근거가 아니다. repository·origin·PR base·fetch·ancestry를 확인할 수 없으면 성공으로 처리하지 않고 기존 상태를 보존한다.
 
 - `max_workers` 기본값은 3이며 `config/config.ini`에서 변경할 수 있다
-- PLAN_BLOCKED 또는 안정된 PR_OPEN이 있어도 명세·전체 계획 입력 변경 trigger를 먼저 평가한다. 입력이 같으면 독립 READY 하나를 기존 priority와 숫자 ID 순으로 시작하며, 없으면 대기·완료 조건을 평가한다
+- PLAN_BLOCKED 또는 안정된 PR_OPEN이 있어도 명세·전체 계획 입력 변경 trigger를 먼저 평가한다. 입력이 같으면 독립 READY 하나를 유효 우선순위와 숫자 ID 순으로 시작하며, 없으면 대기·완료 조건을 평가한다
 - `PROJECT_BLOCKED` 동안에는 새 Planner, maintenance Planner, Worker와 일반 저장소 변경 단계를 시작하지 않는다. 연결 계획이 기존 실행 자리를 점유했거나 자리가 비어 있고 현재 작업 범위를 독립적으로 검증한 경우에만 해당 관리 worktree의 원격 복구·보존 Git 쓰기를 허용한다
 
 ### 유지보수 평가

@@ -47,6 +47,7 @@ class CatalogScheduleDecision:
     has_plan_blocked: bool = False
     has_pr_open: bool = False
     project_blocked: bool = False
+    selection_reason: str | None = None
 
     @property
     def has_waiting(self) -> bool:

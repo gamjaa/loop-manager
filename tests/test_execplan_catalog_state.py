@@ -769,7 +769,16 @@ class CatalogReconciliationTest(CatalogReconciliationFixture, unittest.TestCase)
             self.connection, "/repo"
         )
 
-        self.assertEqual(selected["plan_id"], "G-003")
+        # G-002 inherits critical from G-001 and wins the numeric-ID tie.
+        self.assertEqual(selected["plan_id"], "G-002")
+        decision = loop_manager.catalog_schedule_decision(self.connection, "/repo")
+        self.assertIn("declared_priority=low", decision.selection_reason)
+        self.assertIn("effective_priority=critical", decision.selection_reason)
+        self.assertIn("G-001 -> G-002", decision.selection_reason)
+        declaration = self.connection.execute(
+            "SELECT priority, status FROM exec_plans WHERE plan_id = 'G-002'"
+        ).fetchone()
+        self.assertEqual(tuple(declaration), ("low", "READY"))
         blocked = self.connection.execute(
             "SELECT depends_on FROM exec_plans WHERE plan_id = 'G-001'"
         ).fetchone()
