@@ -40,6 +40,18 @@ def prompt_evidence(connection: sqlite3.Connection, repo: str, plan_id: str) -> 
     return {key: saved[key] for key in ("question", "path", "revision", "url") if key in saved}
 
 
+def cancel(connection: sqlite3.Connection, repo: str, plan_id: str, revision: str) -> None:
+    """Retain decision history when a proven remote deletion cancels the plan."""
+    saved = evidence(connection, repo, plan_id)
+    if saved is None:
+        return
+    saved.update(pending=False, cancelled_revision=revision)
+    connection.execute(
+        "UPDATE execplan_drafts SET pending=0, evidence=? WHERE repo=? AND plan_id=?",
+        (json.dumps(saved, ensure_ascii=False, sort_keys=True), repo, plan_id),
+    )
+
+
 def validate_questions(connection: sqlite3.Connection, repo: str,
                        catalog: Mapping[str, Mapping[str, object]]) -> None:
     """A remote removal of the question cannot enable Agent duplicate drafts."""
@@ -70,7 +82,11 @@ def observe(connection: sqlite3.Connection, repo: str, path: str, plan: Mapping[
     unchanged = bool(previous and previous["basis"] == basis and plan.get("draft_question"))
     if agent and previous and not plan.get("draft") and (previous["pending"] or not unchanged):
         raise RuntimeError("Agent는 게시된 draft의 사용자 판단 대기를 해제할 수 없습니다.")
-    held_revision = previous["revision"] if unchanged else content_hash
+    # Include the inputs and their observation revision, even when plan bytes
+    # did not change. A basis that changes and later returns also needs consent.
+    held_revision = previous["revision"] if unchanged else execplan_drafts.content_digest(
+        json.dumps({"basis": basis, "content_hash": content_hash, "revision": revision},
+                   ensure_ascii=False, sort_keys=True).encode("utf-8"))
     decision = dict(plan.get("draft_decision", {}))
     approved = bool(not agent and not plan.get("draft") and unchanged
                     and decision.get("Decision") == "approve"

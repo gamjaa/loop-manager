@@ -598,11 +598,16 @@ class DefinitionStateRepository:
             if table not in available_tables:
                 continue
             selected_path = path_column or "''"
+            # Decision holds are not execution ownership. Only an orphan audit
+            # reserves the ID here; live drafts remain eligible for user cancellation.
+            orphan_draft = (" AND NOT EXISTS (SELECT 1 FROM exec_plans p "
+                            "WHERE p.repo=execplan_drafts.repo AND p.plan_id=execplan_drafts.plan_id)"
+                            if table == "execplan_drafts" else "")
             reserved_values.update(
                 (str(row[0]), str(row[1]))
                 for row in self.connection.execute(
                     f"SELECT DISTINCT plan_id, {selected_path} FROM {table} "
-                    "WHERE repo = ? AND plan_id IS NOT NULL",
+                    "WHERE repo = ? AND plan_id IS NOT NULL" + orphan_draft,
                     (repo,),
                 )
             )
@@ -759,7 +764,7 @@ class DefinitionStateRepository:
                     apply_mutable_catalog_changes(
                         self.connection, repo, deletions=(PlanDeletion(deletion.snapshot),), revisions=(),
                         snapshot_token="remote-deletion", plan_commit=pinned.revision_sha,
-                        content_hash=lambda _path: "",
+                        content_hash=lambda _path: "", agent=False,
                     )
                     self.connection.execute(
                         "UPDATE execplan_cancellations SET recovery_evidence=? WHERE repo=? AND plan_id=?",

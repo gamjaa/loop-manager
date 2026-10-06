@@ -122,7 +122,7 @@ R-023의 원격 실행·self handoff 목표는 유지하며 로컬 갱신 gate�
 
 계획의 `draft: true`는 사용자 판단이 필요한 작성 준비도 선언이다. 유효한 draft는 독립 실행 가능 계획과 같은 batch로 게시·등록하며 질문·선택 영향·원격 링크·판단 revision을 보존한다. draft에는 Worker·workspace 예약·구현 branch·PR을 시작하지 않고, 직접·간접 의존 계획도 대기한다. 독립 READY·planning·PR 관측은 계속한다. 같은 근거와 질문을 새 ID로 반복 게시하지 않는다.
 
-사용자는 원격 계획의 `Draft Decision` 질문을 해소하고 draft 표시를 제거한 뒤 `User Decision` 절에 `Decision: approve`, `Revision: 판단 대기의 계획 내용 해시`, `Answer: 구체적 답변`을 기록한다. Manager는 최신 원격 catalog·관련 명세와 설계 근거·무소유 상태를 확인하고 결정 대기를 해제한다. 질문·목표·관련 근거 변경, 불완전한 답변, reject/defer와 표시만 제거한 변경은 대기로 보존한다. Agent는 결정 작성·변경·자기 승인을 할 수 없다. 실행에는 기존 dependency·소유권 gate도 충족해야 한다. 이 계약은 문서 수정 draft 승인 및 AGENTS 변경 승인과 구분한다.
+사용자는 원격 계획의 `Draft Decision` 질문을 해소하고 draft 표시를 제거한 뒤 `User Decision` 절에 `Decision: approve`, `Revision: compact catalog의 decision_wait.revision 판단 지문`, `Answer: 구체적 답변`을 기록한다. 판단 지문은 계획·관련 명세·설계 근거와 해당 근거를 확인한 원격 revision에 결합된다. Manager는 최신 원격 catalog·관련 명세와 설계 근거·무소유 상태를 확인하고 결정 대기를 해제한다. 질문·목표·관련 근거 변경, 불완전한 답변, reject/defer와 표시만 제거한 변경은 대기로 보존한다. Agent는 결정 작성·변경·자기 승인을 할 수 없다. 실행에는 기존 dependency·소유권 gate도 충족해야 한다. 이 계약은 문서 수정 draft 승인 및 AGENTS 변경 승인과 구분한다.
 
 계획 게시의 원자 적용, 작업 공간 복구와 단계별 Git 처리는 [ARCHITECTURE.md](ARCHITECTURE.md#계획-게시와-작업-공간)를 따른다.
 

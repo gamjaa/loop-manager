@@ -191,14 +191,14 @@ def apply_mutable_catalog_changes(
     connection: sqlite3.Connection, repo: str, *,
     deletions: tuple[PlanDeletion, ...], revisions: tuple[PlanRevision, ...],
     snapshot_token: str, plan_commit: str, content_hash: Callable[[str], str],
-    draft_inputs: Callable | None = None,
+    draft_inputs: Callable | None = None, agent: bool = True,
 ) -> None:
     """Apply cache changes and cancellation audit in the caller's transaction."""
     cas = _mutable_ready_cas_where()
     for deletion in deletions:
         original = deletion.snapshot
         from . import execplan_draft_state
-        if original.plan_id in execplan_draft_state.pending_ids(connection, repo):
+        if agent and original.plan_id in execplan_draft_state.pending_ids(connection, repo):
             raise PlannerValidationError("사용자 판단 대기 draft를 삭제할 수 없습니다.")
         changed = connection.execute(
             f"""
@@ -251,6 +251,7 @@ def apply_mutable_catalog_changes(
                 plan_commit,
             ),
         )
+        execplan_draft_state.cancel(connection, repo, original.plan_id, plan_commit)
 
     staged_paths: dict[str, str] = {}
     for revision in revisions:
@@ -343,7 +344,7 @@ def apply_mutable_catalog_changes(
             )
         from . import execplan_draft_state
         execplan_draft_state.observe(connection, repo, revision.path, plan,
-            content_hash(revision.path), plan_commit, agent=True,
+            content_hash(revision.path), plan_commit, agent=agent,
             inputs=draft_inputs(plan) if draft_inputs else None)
 
 

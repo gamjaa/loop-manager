@@ -9,13 +9,15 @@ import unittest
 from unittest import mock
 
 import loop_manager
-from loop_manager_internal.catalog import execplan_catalog, execplan_drafts, catalog_service
+from loop_manager_internal.catalog import execplan_catalog, execplan_drafts, catalog_service, remote_deletions
 from loop_manager_internal.planning import planner_publication, planner_validation
 from loop_manager_internal.planning.planning_catalog import (
-    MutableReadySnapshot, mutable_snapshot_token, snapshot_from_dict, snapshot_to_dict,
+    MutableReadySnapshot, PlanDeletion, mutable_snapshot_token, snapshot_from_dict, snapshot_to_dict,
 )
 from loop_manager_internal.planning.planning_contracts import choose_planning_decision, PlanningDecisionKind
-from loop_manager_internal.storage import execplan_catalog_state, execplan_draft_state, runtime_state
+from loop_manager_internal.storage import (
+    execplan_catalog_state, execplan_draft_state, planning_publication_state, runtime_state,
+)
 from loop_manager_internal.notifications import work_exhaustion
 from tests.support.catalog import plan_text, make_catalog_root, FakeDefinitionPort
 from tests.support.database import AutomationCatalogFixture
@@ -91,6 +93,7 @@ class ExecPlanDraftDocumentTest(unittest.TestCase):
         prompt = loop_manager.planner_prompt(None, mutable_snapshot=batch)
         self.assertIn("draft: true", prompt)
         self.assertIn("decision_wait.revision", prompt)
+        self.assertIn("판단 지문", prompt)
         self.assertIn("자기 승인", prompt)
         for text, expected in ((text, True), (plan_text("G-001", "Decision"), False),
                                (text.replace("draft: true", "draft: false"), False)):
@@ -138,8 +141,10 @@ class ExecPlanDraftCatalogTest(AutomationCatalogFixture, unittest.TestCase):
 
     def reconcile(self, documents, revision="b" * 40, *, inputs=None, fault=None, revisions=None):
         snapshot = execplan_catalog.snapshot_from_documents(documents, revision_sha=revision)
+        inputs = self.inputs if inputs is None else inputs
         pinned = execplan_catalog_state.PinnedCatalog(revision, snapshot,
-            frozenset({"docs/PRODUCT.md"}), draft_inputs=self.inputs if inputs is None else inputs,
+            frozenset({"docs/PRODUCT.md"} | {key for key in inputs if key.startswith("docs/requirements/")}),
+            draft_inputs=inputs,
             remote_url="https://github.com/owner/project")
         repository = execplan_catalog_state.DefinitionStateRepository(self.connection, fault_hook=fault)
         return execplan_catalog_state.CatalogReconciliationService(
@@ -250,6 +255,97 @@ class ExecPlanDraftCatalogTest(AutomationCatalogFixture, unittest.TestCase):
         self.assertNotEqual(self.waiting()["revision"], revision)
         self.reconcile({PATH: accepted + "\n## New Goal\n\nChanged goal\n"})
         self.assertTrue(self.waiting()["pending"])
+
+    def test_related_input_only_advance_rejects_previous_revision(self):
+        requirement = "docs/requirements/Decision.md"
+        text = self.text.replace("  - docs/PRODUCT.md", "  - docs/PRODUCT.md\n  - " + requirement)
+        inputs = {**self.inputs, requirement: "requirement"}
+        self.reconcile({PATH: text}, "c" * 40, inputs=inputs)
+        initial_revision = self.waiting()["revision"]
+        initial_inputs = dict(inputs)
+        for index, path in enumerate(inputs):
+            with self.subTest(path=path):
+                self.reconcile({PATH: text}, f"{index * 4 + 1:040x}", inputs=inputs)
+                previous_revision = self.waiting()["revision"]
+                inputs = {**inputs, path: inputs[path] + " changed"}
+                self.reconcile({PATH: text}, f"{index * 4 + 2:040x}", inputs=inputs)
+                current_revision = self.waiting()["revision"]
+                self.assertNotEqual(current_revision, previous_revision)
+                self.assertEqual(self.connection.execute(
+                    "SELECT content_hash FROM exec_plans WHERE plan_id='G-001'",
+                ).fetchone()[0], execplan_catalog.plan_content_hash(text.encode()))
+                self.reconcile({PATH: accepted_text(text, previous_revision)},
+                               f"{index * 4 + 3:040x}", inputs=inputs)
+                self.assertTrue(self.waiting()["pending"])
+                self.assertFalse(self.waiting()["decisions"][-1]["accepted"])
+                self.assertIsNone(loop_manager.select_ready_execplan(self.connection, "repo"))
+                self.reconcile({PATH: accepted_text(text, current_revision)},
+                               f"{index * 4 + 4:040x}", inputs=inputs)
+                self.assertFalse(self.waiting()["pending"])
+        self.reconcile({PATH: text}, "d" * 40, inputs=initial_inputs)
+        self.assertNotEqual(self.waiting()["revision"], initial_revision)
+        self.reconcile({PATH: accepted_text(text, initial_revision)}, "e" * 40, inputs=initial_inputs)
+        self.assertTrue(self.waiting()["pending"])
+
+    def test_remote_draft_deletion_preserves_audit_and_independent_work(self):
+        paths = {key: f"docs/plans/[{key}] {title}.md" for key, title in
+                 (("G-002", "Dependent"), ("G-003", "Independent"), ("G-004", "Open PR"))}
+        documents = {**self.documents,
+            paths["G-002"]: plan_text("G-002", "Dependent", depends_on=("G-001",)),
+            paths["G-003"]: plan_text("G-003", "Independent"),
+            paths["G-004"]: plan_text("G-004", "Open PR")}
+        self.reconcile(documents, "b" * 40)
+        self.connection.execute("UPDATE exec_plans SET status='PR_OPEN', ever_started=1, pr_url=? WHERE plan_id='G-004'",
+                                ("https://github.com/owner/project/pull/4",))
+        self.connection.commit()
+        previous = self.waiting()
+        snapshot = execplan_catalog.snapshot_from_documents(
+            {path: text for path, text in documents.items() if path != PATH},
+            revision_sha="c" * 40, isolate_errors=True)
+        pinned = execplan_catalog_state.PinnedCatalog("c" * 40, snapshot, frozenset({"docs/PRODUCT.md"}),
+            draft_inputs=self.inputs, remote_url="https://github.com/owner/project")
+        def git_bytes(_repo, *args):
+            if args[0] == "ls-tree":
+                return b"100644 blob " + b"a" * 40 + b"\t" + PATH.encode() + b"\0"
+            self.assertEqual(args[0], "show")
+            self.assertTrue(args[1].startswith("b" * 40 + ":"))
+            return documents[args[1].split(":", 1)[1]].encode()
+        deletions = remote_deletions.prove_deletions(self.connection, "repo", Path("/repo"), pinned,
+            git=mock.Mock(return_value=SimpleNamespace(returncode=0)), git_bytes=git_bytes)
+        self.assertEqual([item.snapshot.plan_id for item in deletions], ["G-001"])
+        repository = execplan_catalog_state.DefinitionStateRepository(self.connection)
+        before = repository.capture("repo")
+        with self.assertRaisesRegex(loop_manager.PlannerValidationError, "draft"), self.connection:
+            planning_publication_state.apply_mutable_catalog_changes(self.connection, "repo",
+                deletions=(PlanDeletion(deletions[0].snapshot),), revisions=(),
+                snapshot_token="planner", plan_commit="c" * 40, content_hash=lambda _path: "")
+        self.assertEqual(repository.capture("repo"), before)
+        pinned = replace(pinned, deletions=deletions)
+        def fault(stage):
+            if stage == "after-cancellation:G-001":
+                raise KeyboardInterrupt("catalog interrupted")
+        with self.assertRaises(KeyboardInterrupt):
+            execplan_catalog_state.CatalogReconciliationService(
+                execplan_catalog_state.DefinitionStateRepository(self.connection, fault_hook=fault),
+                FakeDefinitionPort(pinned)).reconcile("repo")
+        self.assertEqual(repository.capture("repo"), before)
+        result = execplan_catalog_state.CatalogReconciliationService(repository, FakeDefinitionPort(pinned)).reconcile("repo")
+        self.assertEqual(result.withheld_plan_ids, ("G-002",))
+        self.assertIsNone(self.connection.execute("SELECT 1 FROM exec_plans WHERE plan_id='G-001'").fetchone())
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM execplan_cancellations WHERE plan_id='G-001'").fetchone()[0], 1)
+        self.assertEqual(self.waiting(), {**previous, "pending": False, "cancelled_revision": "c" * 40})
+        self.assertNotIn("G-001", execplan_draft_state.pending_ids(self.connection, "repo"))
+        self.assertIn("G-001", {item[0] for item in repository.capture("repo").reserved})
+        decision = loop_manager.catalog_schedule_decision(self.connection, "repo")
+        self.assertEqual(decision.runnable_ready["plan_id"], "G-003")
+        self.assertFalse(decision.project_blocked)
+        self.assertTrue(decision.has_pr_open)
+        self.assertEqual(self.connection.execute("SELECT status, pr_url FROM exec_plans WHERE plan_id='G-004'").fetchone()[:],
+                         ("PR_OPEN", "https://github.com/owner/project/pull/4"))
+        pinned = replace(pinned, deletions=())
+        execplan_catalog_state.CatalogReconciliationService(repository, FakeDefinitionPort(pinned)).reconcile("repo")
+        self.assertEqual(self.waiting(), {**previous, "pending": False, "cancelled_revision": "c" * 40})
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM execplan_cancellations WHERE plan_id='G-001'").fetchone()[0], 1)
 
     def test_unrelated_remote_advance_keeps_wait_identity_and_question(self):
         previous = self.waiting()

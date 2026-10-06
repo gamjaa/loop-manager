@@ -19,7 +19,7 @@ EXECPLAN_AUTHORING_GUIDANCE = """
 - 간결화해도 결정·예외·실패 시 보존과 재개·Acceptance Criteria를 생략하지 마라. 기존 계획 개정에서는 해당 snapshot·mode의 변경 범위와 목표 보존 조건을 우선하고, 길이 제한으로 내용을 삭제하거나 권한을 확대하지 마라.
 - 일반 계획 작성에서 구현 방향에 사용자 판단이 필요하면 유효한 ID/sources/depends_on과 목표를 보존한 계획에 frontmatter `draft: true`를 선언하라. `Draft Decision` 절에 Question, Facts, Options, Impact를 각각 비어 있지 않은 `필드: 내용` 줄로 적고 미결정 구현은 명시하라. draft와 독립 실행 가능 계획은 같은 batch로 게시된다. 같은 질문은 기존 ID에서 보존·개정하며 새 계획으로 반복하지 마라.
 - draft와 그 의존 작업은 Worker·workspace·branch·PR을 시작하지 않고 독립 작업은 계속한다. draft는 planning 오류나 완료가 아니다. snapshot 밖·실행 이력·소유권이 있는 계획은 draft로 전환하지 마라. 기존 사용자 판단 대기 draft를 삭제하지 마라.
-- `User Decision` 절은 사용자만 작성한다. 사용자는 원격 계획의 draft 표시를 제거하고 Decision: approve, Revision: compact catalog의 decision_wait.revision 내용 해시, Answer: 질문에 대한 구체적 답변을 기록한다. reject/defer 또는 불완전한 결정은 계속 대기한다. 관련 목표·질문·source·설계 근거가 바뀌면 새로운 revision에 대한 결정을 받아야 한다. Agent는 결정 작성·변경이나 draft 해제로 자기 승인하지 마라. 기존 문서 draft와 AGENTS User Decision은 별도 계약이다.
+- `User Decision` 절은 사용자만 작성한다. 사용자는 원격 계획의 draft 표시를 제거하고 Decision: approve, Revision: compact catalog의 decision_wait.revision 판단 지문, Answer: 질문에 대한 구체적 답변을 기록한다. reject/defer 또는 불완전한 결정은 계속 대기한다. 관련 목표·질문·source·설계 근거가 바뀌면 새로운 revision에 대한 결정을 받아야 한다. Agent는 결정 작성·변경이나 draft 해제로 자기 승인하지 마라. 기존 문서 draft와 AGENTS User Decision은 별도 계약이다.
 """.strip()
 
 
