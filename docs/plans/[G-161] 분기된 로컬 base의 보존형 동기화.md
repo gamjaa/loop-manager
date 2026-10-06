@@ -47,6 +47,7 @@ clean diverged base의 확인된 로컬 전용 commit을 원격 base 위로 안�
 - [x] 2026-10-05 최신 planning 기준 32e496c와 제공된 mutable READY snapshot에서 재평가함. G-114의 probe 실패·파일 보존 회귀 보강은 bootstrap gate·diverged 동기화의 미충족 범위를 바꾸지 않으며 기존 개정 목표를 유지함. 구현·테스트 실행은 하지 않음.
 - [x] 2026-10-06 a1db7e8의 최신 원격 코드·테스트로 R-010 전체 기준을 재평가함. source HEAD·branch 및 갱신 성공·재실행 gate의 미충족 목표를 기존 G-161에 연결함. 구현·테스트 실행은 하지 않음.
 - [x] 구현 및 관련 targeted unit 검증: source sync·bootstrap foundation/entry·journal의 45개 unit case와 self handoff의 1개 case 통과. source journal 손상의 프로젝트 간 비차단 보강 후 journal class 3개 case 추가 재검증 통과.
+- [x] 2026-10-06 Manager verify 피드백의 `test_equal_base_worktree_sync_records_noop` 실패를 수정함. 기존 기대 문자열에 원격 SHA를 추가하고 단일 호출·`error=False` 검증을 유지했으며, 해당 unit case만 동일 명령으로 재실행해 통과함.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
