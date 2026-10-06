@@ -267,6 +267,50 @@ class CheckpointRebaseGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.Te
         self.assertEqual(json.loads(restart['baseline'])['version'], 2)
         self.assertIsNone(saved.operation)
 
+    def test_manual_work_branch_completion_then_successor_push_keeps_completed_result(self):
+        repo, _ = self._remote_refresh_fixture(branch_changed=True)
+        (self.worktree / 'code.py').write_text('local resolution\n')
+        self.run_git(self.worktree, 'add', 'code.py')
+        self.run_git(self.worktree, 'commit', '-m', 'Local conflicting input')
+        self.assertFalse(loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir, repo, 'main'))
+        self.assertTrue(self.run_git(self.worktree, 'ls-files', '-u'))
+        checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+        original = checkpoints.get(repo, 'G-034').snapshot['work_branch_integration']
+        audit = tuple(self.connection.execute(
+            'SELECT agent_snapshot, agent_result_snapshot, worker_session_id FROM exec_plans '
+            'WHERE plan_id = ?', ('G-034',)).fetchone())
+        (self.worktree / 'code.py').write_text('local resolution\n')
+        self.run_git(self.worktree, 'add', 'code.py')
+        self.run_git(self.worktree, '-c', 'core.editor=true', 'rebase', '--continue')
+        completed = self.run_git(self.worktree, 'rev-parse', 'HEAD')
+        self.assertEqual(checkpoints.get(repo, 'G-034').operation, 'rebase')
+        successor = self.user_commit('dependency.py', 'new user dependency\n')
+        loop_manager.observe_blocked_plan_remotes(self.connection, self.repo, repo,
+            self.connection.execute('SELECT * FROM projects').fetchone())
+        with mock.patch.object(loop_manager, '_evaluate_remote_checkpoint_cause',
+                               return_value=(False, 'same cause', None)) as probe, \
+             mock.patch('loop_manager_internal.recovery.work_branch_integration._abort_preserved_rebase',
+                        side_effect=AssertionError('completed rebase must not be aborted')):
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, self.repo, self.state_dir, repo, 'main'))
+        probe.assert_called_once()
+        saved = checkpoints.get(repo, 'G-034')
+        self.assertEqual(saved.snapshot['work_branch_integration_history'][0],
+                         {**original, 'phase': 'complete', 'head': completed})
+        self.assertEqual(json.loads(saved.snapshot['work_branch_integration']['before'])['head'], completed)
+        self.assertIsNone(saved.operation)
+        self.run_git(self.worktree, 'merge-base', '--is-ancestor', successor, 'HEAD')
+        self.assertEqual((self.worktree / 'code.py').read_text(), 'local resolution\n')
+        self.assertEqual((self.worktree / 'dependency.py').read_text(), 'new user dependency\n')
+        self.assertEqual(tuple(self.connection.execute(
+            'SELECT agent_snapshot, agent_result_snapshot, worker_session_id FROM exec_plans '
+            'WHERE plan_id = ?', ('G-034',)).fetchone()), audit)
+        with mock.patch.object(loop_manager, '_journaled_direct_rebase',
+                               side_effect=AssertionError('duplicate integration')):
+            self.assertFalse(loop_manager.resume_plan_blocks(
+                self.connection, self.repo, self.state_dir, repo, 'main'))
+
     def test_remote_refresh_base_only_with_same_specification(self):
         self._assert_remote_refresh(base_changed=True, branch_changed=False, resolved=False)
 

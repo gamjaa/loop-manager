@@ -83,10 +83,12 @@ class CheckpointRefreshFixture:
                     index={'code.py': ('M 100644 ours 2', 'M 100644 theirs 3')},
                     dirty={'code.py': (('staged', 'unstaged'), 'manual conflict bytes')})
             execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).record(
-                'repo', 'G-106', expected_generation=0, operation='rebase', expected_head=local,
+                'repo', 'G-106', expected_generation=0,
+                operation=None if pending_restart == 'completed' else 'rebase', expected_head=local,
                 target_base_oid=integration_remote, observed_remote_oid=pending_head,
                 snapshot={'work_branch_integration': {
-                    'phase': 'rebasing', 'remote': integration_remote, 'before': restored.serialize(),
+                    'phase': 'complete' if pending_restart == 'completed' else 'rebasing',
+                    'remote': integration_remote, 'before': restored.serialize(),
                     'branch': branch, 'worktree': worktree,
                     'restart': {'remote': pending_head, 'baseline': 'pinned-conflict'}},
                     'remote_adoption_intent': {
@@ -191,6 +193,15 @@ class BlockedCheckpointRefreshUnitTests(CheckpointRefreshFixture, unittest.TestC
     def test_successor_after_abort_retargets_pending_adoption(self):
         result, _ = self._adoption(pending_restart='after_abort')
         self.assertEqual(result, 'adopted')
+        self.assertEqual(self.row()['accepted_remote_oid'], 'b' * 40)
+
+    def test_successor_after_completion_save_retargets_pending_adoption(self):
+        result, _ = self._adoption(pending_restart='completed')
+        self.assertEqual(result, 'adopted')
+        saved = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get('repo', 'G-106')
+        self.assertIsNone(saved.snapshot['remote_adoption_intent'])
+        self.assertEqual(saved.snapshot['remote_adoption_scope']['head'], 'd' * 40)
+        self.assertEqual(saved.observed_remote_oid, 'b' * 40)
         self.assertEqual(self.row()['accepted_remote_oid'], 'b' * 40)
 
     def test_successor_must_include_pending_restart_input(self):

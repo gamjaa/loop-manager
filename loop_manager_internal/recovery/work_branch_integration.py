@@ -119,6 +119,38 @@ def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, sna
     intent = (current.snapshot or {}).get('work_branch_integration')
     if intent and (intent['branch'], intent['worktree']) != (branch, str(worktree)):
         raise RuntimeError('진행 중인 작업 branch 통합의 소유권이 다릅니다.')
+    def save(value, *, head=None, operation=None, history=None):
+        nonlocal current, intent
+        current = checkpoints.get(repo, plan_id)
+        current = checkpoints.record(
+            repo, plan_id, expected_generation=current.generation,
+            operation=operation, expected_head=head or current.expected_head,
+            target_base_oid=current.target_base_oid if operation == 'rebase' else value['remote'],
+            observed_remote_oid=remote,
+            snapshot={**(current.snapshot or {}), 'integration_repo': repo,
+                      'work_branch_integration': value,
+                      **({'work_branch_integration_history': history} if history is not None else {})})
+        intent = value
+
+    def complete(service, observed, decision):
+        # Bind completion to both the stable current result and this intent's
+        # generation. A newer fetched lease does not change the completed target.
+        with runtime_state._transaction(connection):
+            if service.observe()[1] != decision or checkpoints.get(repo, plan_id) != current:
+                raise RuntimeError('작업 branch 통합 완료 관측이 변경됐습니다.')
+            save({**intent, 'phase': 'complete', 'head': observed.head}, head=observed.head)
+
+    if intent and intent['remote'] != remote and current.operation == 'rebase':
+        service = effects._current_rebase_service(
+            connection, repo_path, state_dir, repo, plan_id, worktree, branch,
+            remote_oid=remote)
+        observed, decision = service.require_owned(checkpoint=current)
+        if decision.status.value == 'complete':
+            # Manual continue may have finished Git before SQLite caught up.
+            # Accept that result before integrating the successor; never abort it.
+            complete(service, observed, decision)
+            snapshot = effects.capture_git_snapshot(worktree)
+
     if intent and intent['phase'] == 'complete' and intent['remote'] != remote and current.operation is None:
         current = checkpoints.record(
             repo, plan_id, expected_generation=current.generation,
@@ -128,19 +160,6 @@ def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, sna
                       'work_branch_integration_history': [
                           *(current.snapshot or {}).get('work_branch_integration_history', ()), intent]})
         intent = None
-
-    def save(value, *, head=None, operation=None, history=None):
-        nonlocal current, intent
-        current = checkpoints.get(repo, plan_id)
-        current = checkpoints.record(
-            repo, plan_id, expected_generation=current.generation,
-            operation=operation, expected_head=head or current.expected_head,
-            target_base_oid=current.target_base_oid if operation == 'rebase' else remote,
-            observed_remote_oid=remote,
-            snapshot={**(current.snapshot or {}), 'integration_repo': repo,
-                      'work_branch_integration': value,
-                      **({'work_branch_integration_history': history} if history is not None else {})})
-        intent = value
 
     if (intent and intent['remote'] != remote and current.operation is None
             and intent['phase'] in {'preserving', 'rebasing'}):
@@ -245,6 +264,7 @@ def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, sna
                 observed_remote=(remote,), agent_session_id=plan['worker_session_id'])
             if result.returncode:
                 raise RuntimeError('작업 branch 통합이 충돌 해결을 기다립니다: ' + result.stdout[-2000:])
+        current = checkpoints.get(repo, plan_id)
         service = effects._current_rebase_service(
             connection, repo_path, state_dir, repo, plan_id, worktree, branch,
             target=remote, remote_oid=remote)
@@ -255,15 +275,16 @@ def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, sna
                 observed_remote=(remote,), agent_session_id=plan['worker_session_id'])
             if result.returncode:
                 raise RuntimeError('작업 branch 통합이 충돌 해결을 기다립니다: ' + result.stdout[-2000:])
+            current = checkpoints.get(repo, plan_id)
+            service = effects._current_rebase_service(
+                connection, repo_path, state_dir, repo, plan_id, worktree, branch,
+                target=remote, remote_oid=remote)
             observed, decision = service.require_owned()
         if decision.status.value != 'complete':
             raise RuntimeError('작업 branch 통합의 수동 해결을 기다립니다.')
         # Accept only the stable current result. Publication stays with the
         # existing checkpoint/base boundary and its exact remote lease.
-        with runtime_state._transaction(connection):
-            if service.observe()[1] != decision:
-                raise RuntimeError('작업 branch 통합 완료 관측이 변경됐습니다.')
-            save({**intent, 'phase': 'complete', 'head': observed.head}, head=observed.head)
+        complete(service, observed, decision)
     return effects.capture_git_snapshot(worktree)
 
 

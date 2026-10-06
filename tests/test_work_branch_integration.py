@@ -39,8 +39,7 @@ class WorkBranchIntegrationUnitTests(unittest.TestCase):
                                       index_tree='index-tree', worktree_tree='working-tree'))
         self.accepted = SimpleNamespace(status=SimpleNamespace(value='complete'))
         self.service = mock.Mock()
-        self.service.require_owned.side_effect = lambda **kw: (
-            SimpleNamespace(head=self.now.head), self.accepted)
+        self.service.require_owned.side_effect = self.owned
         self.service.observe.side_effect = lambda: (None, self.accepted)
         self.effects = SimpleNamespace(
             _capture_agent_baseline=mock.Mock(return_value=self.baseline),
@@ -50,6 +49,15 @@ class WorkBranchIntegrationUnitTests(unittest.TestCase):
             git=mock.Mock(side_effect=self.git),
             _journaled_direct_rebase=mock.Mock(side_effect=self.rebase),
             _current_rebase_service=mock.Mock(return_value=self.service))
+
+    def owned(self, **kwargs):
+        current = self.store.get('repo', 'G-166')
+        decision = self.accepted
+        if self.now.operations:
+            decision = SimpleNamespace(status=SimpleNamespace(value='waiting_for_resolution'))
+        elif current.operation == 'rebase' and self.now.head == current.expected_head:
+            decision = SimpleNamespace(status=SimpleNamespace(value='ready_to_start'))
+        return SimpleNamespace(head=self.now.head), decision
 
     def git(self, _, *args, **kwargs):
         output = ''
@@ -218,6 +226,135 @@ class WorkBranchIntegrationUnitTests(unittest.TestCase):
         self.run_integration()
         self.effects._journaled_direct_rebase.assert_called_once()
         self.assertIsNone(self.store.get('repo', 'G-166').operation)
+
+    def _manually_complete_pending_rebase(self):
+        self.accepted.status.value = 'waiting_for_resolution'
+        with self.assertRaisesRegex(RuntimeError, '수동 해결'):
+            self.run_integration()
+        original = self.store.get('repo', 'G-166').snapshot['work_branch_integration']
+        self.now = replace(self.now, head='manual-completion', dirty={}, index={}, operations={})
+        self.accepted.status.value = 'complete'
+        self.effects._capture_agent_baseline.return_value = None
+        self.effects.git.reset_mock()
+        return original
+
+    def _assert_completed_successor(self, original):
+        current = self.store.get('repo', 'G-166')
+        self.assertIsNone(current.operation)
+        self.assertEqual(current.expected_head, 'combined')
+        completed = current.snapshot['work_branch_integration_history'][0]
+        self.assertEqual(completed, {**original, 'phase': 'complete', 'head': 'manual-completion'})
+        saved = current.snapshot['work_branch_integration']
+        self.assertEqual(GitSnapshot.deserialize(saved['before']).head, 'manual-completion')
+        self.assertEqual(saved['local_commit'], 'manual-completion')
+        self.assertEqual(saved['phase'], 'complete')
+        self.assertFalse(any(call.args[-2:] == ('rebase', '--abort')
+                             for call in self.effects.git.call_args_list))
+        self.effects._commit_tree.assert_called_once()
+        self.assertEqual(self.effects._journaled_direct_rebase.call_count, 2)
+        self.assertEqual(self.effects._journaled_direct_rebase.call_args.kwargs['agent_session_id'],
+                         'same-session')
+
+    def test_manual_completion_is_accepted_before_integrating_successor(self):
+        original = self._manually_complete_pending_rebase()
+        self.run_integration('successor')
+        self._assert_completed_successor(original)
+        self.assertEqual(self.store.get('repo', 'G-166').target_base_oid, 'successor')
+        self.assertEqual(self.store.get('repo', 'G-166').observed_remote_oid, 'successor')
+        self.run_integration('successor')
+        self._assert_completed_successor(original)
+
+    def test_push_after_completion_save_interruption_keeps_completed_target_and_head(self):
+        original = self._manually_complete_pending_rebase()
+        record = ExecutionCheckpointRepository.record
+        def interrupted(store, *args, **kwargs):
+            if kwargs['snapshot'].get('work_branch_integration') is None:
+                raise KeyboardInterrupt
+            return record(store, *args, **kwargs)
+        with mock.patch.object(ExecutionCheckpointRepository, 'record', interrupted):
+            with self.assertRaises(KeyboardInterrupt):
+                self.run_integration('successor')
+        current = self.store.get('repo', 'G-166')
+        self.assertIsNone(current.operation)
+        self.assertEqual(current.expected_head, 'manual-completion')
+        self.assertEqual(current.target_base_oid, 'remote')
+        self.assertEqual(current.observed_remote_oid, 'successor')
+        self.assertEqual(current.snapshot['work_branch_integration'],
+                         {**original, 'phase': 'complete', 'head': 'manual-completion'})
+        self.run_integration('third-input')
+        self._assert_completed_successor(original)
+        self.assertEqual(self.store.get('repo', 'G-166').observed_remote_oid, 'third-input')
+
+    def test_interruption_during_manual_completion_recheck_retries_without_abort(self):
+        original = self._manually_complete_pending_rebase()
+        self.service.observe.side_effect = KeyboardInterrupt
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_integration('successor')
+        self.assertEqual(self.store.get('repo', 'G-166').operation, 'rebase')
+        self.assertEqual(self.store.get('repo', 'G-166').snapshot['work_branch_integration'], original)
+        self.service.observe.side_effect = lambda: (None, self.accepted)
+        self.run_integration('successor')
+        self._assert_completed_successor(original)
+
+    def test_changed_manual_completion_is_refused_before_abort_or_successor_rebase(self):
+        original = self._manually_complete_pending_rebase()
+        self.service.observe.return_value = (None, SimpleNamespace(status='changed'))
+        self.service.observe.side_effect = None
+        with self.assertRaisesRegex(RuntimeError, '완료 관측'):
+            self.run_integration('successor')
+        self.assertEqual(self.store.get('repo', 'G-166').snapshot['work_branch_integration'], original)
+        self.assertEqual(self.now.head, 'manual-completion')
+        self.effects.git.assert_not_called()
+        self.assertEqual(self.effects._journaled_direct_rebase.call_count, 1)
+
+    def test_checkpoint_change_during_completion_recheck_is_not_adopted(self):
+        original = self._manually_complete_pending_rebase()
+        def changed():
+            current = self.store.get('repo', 'G-166')
+            self.store.record('repo', 'G-166', expected_generation=current.generation,
+                operation=current.operation, expected_head=current.expected_head,
+                target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+                snapshot={**current.snapshot, 'other-intent': True})
+            return None, self.accepted
+        self.service.observe.side_effect = changed
+        with self.assertRaisesRegex(RuntimeError, '완료 관측'):
+            self.run_integration('successor')
+        self.assertEqual(self.store.get('repo', 'G-166').snapshot['work_branch_integration'], original)
+        self.assertEqual(self.store.get('repo', 'G-166').operation, 'rebase')
+        self.effects.git.assert_not_called()
+        self.assertEqual(self.effects._journaled_direct_rebase.call_count, 1)
+
+    def test_manual_completion_successor_still_requires_current_ownership(self):
+        original = self._manually_complete_pending_rebase()
+        self.service.require_owned.side_effect = RuntimeError('origin or Agent scope changed')
+        with self.assertRaisesRegex(RuntimeError, 'origin or Agent scope'):
+            self.run_integration('successor')
+        self.assertEqual(self.store.get('repo', 'G-166').snapshot['work_branch_integration'], original)
+        self.effects.git.assert_not_called()
+        self.assertEqual(self.effects._journaled_direct_rebase.call_count, 1)
+
+    def test_pending_rebase_start_refreshes_service_generation_before_completion(self):
+        def interrupted(*args, **kwargs):
+            current = self.store.get('repo', 'G-166')
+            self.store.record('repo', 'G-166', expected_generation=current.generation,
+                operation='rebase', expected_head=self.now.head, target_base_oid=args[-1],
+                observed_remote_oid=kwargs['observed_remote'][0], snapshot=current.snapshot)
+            raise KeyboardInterrupt
+        self.effects._journaled_direct_rebase.side_effect = interrupted
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_integration()
+        pending_generation = self.store.get('repo', 'G-166').generation
+        generations = []
+        def service(*args, **kwargs):
+            generations.append(self.store.get('repo', 'G-166').generation)
+            return self.service
+        self.effects._current_rebase_service.side_effect = service
+        self.effects._journaled_direct_rebase.side_effect = self.rebase
+        self.run_integration()
+        self.assertEqual(generations, [pending_generation, pending_generation + 1])
+        self.assertIsNone(self.store.get('repo', 'G-166').operation)
+        self.assertEqual(self.store.get('repo', 'G-166').expected_head, 'combined')
+        self.effects._commit_tree.assert_called_once()
 
     def test_pending_conflict_never_records_success(self):
         self.accepted.status.value = 'waiting_for_resolution'
