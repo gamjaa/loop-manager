@@ -410,7 +410,7 @@ class ExecutionRecoveryScenarios:
             if arguments[:3] == ['gh', 'pr', 'view']:
                 return SimpleNamespace(returncode=0, stdout=json.dumps({
                     'body': '', 'state': 'OPEN',
-                    'headRefOid': state.row()['publication_remote_oid'],
+                    'headRefOid': observe_live_pull_request(fixture.repo, pull_request)['headRefOid'],
                 }))
             return SimpleNamespace(returncode=0, stdout='https://example/pr/1')
         effects.publication.command.side_effect = publication_command

@@ -410,6 +410,22 @@ class CommonGuidanceInvocationTests(TestCase):
         self.assertEqual(saved.session_task('repo', 'claude', 'saved-reviewer'), identity)
         self.assertEqual(len(self.requests), 0)
 
+    def test_independent_planner_and_worker_keep_separate_session_bindings(self):
+        from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
+        planner = self.invoke(role='planner', plan=None, task='planning-input')
+        worker = self.invoke()
+        self.assertEqual((planner.code, worker.code), (0, 0))
+        repository = GuidanceRepository(self.connection)
+        planner_task = repository.session_task('repo', 'codex', planner.session_id)
+        worker_task = repository.session_task('repo', 'codex', worker.session_id)
+        self.assertNotEqual(planner.session_id, worker.session_id)
+        self.assertNotEqual(planner_task, worker_task)
+        self.assertEqual(planner_task, self.requests[0].common_guidance.task_id)
+        self.assertEqual(worker_task, self.requests[1].common_guidance.task_id)
+        with self.assertRaisesRegex(RuntimeError, '다른 공통 지침 작업'):
+            repository.bind_session('repo', 'codex', planner.session_id, worker_task)
+        self.assertEqual(repository.session_task('repo', 'codex', planner.session_id), planner_task)
+
     def test_started_independent_session_keeps_guidance_after_interruption_and_runtime_change(self):
         outer = self
         class InterruptedProvider:

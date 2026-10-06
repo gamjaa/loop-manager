@@ -50,7 +50,7 @@ def dummy_worker_context(*, roles=("worker",)):
                         identity['provider'], 'fixture-worker-model', 'medium',
                     ).serialize(),
                 }, enqueue=False)
-            if saved and saved.worktree:
+            if saved and getattr(saved, 'worktree', None):
                 from tests.support.workspace import pin_common_guidance
                 from loop_manager_internal.agents.agent_invocation import InvocationContext
                 sessions = tuple(session for session in

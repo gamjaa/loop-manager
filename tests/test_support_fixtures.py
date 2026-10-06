@@ -136,7 +136,8 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
         repository.projected.return_value = saved
         ports = mock.Mock(return_value='real ports')
         identity = dict(config_path=Path('unused.ini'), repo='repo', provider='codex')
-        with mock.patch.object(loop_manager, '_ExecutionLifecyclePorts', ports):
+        with mock.patch.object(loop_manager, '_ExecutionLifecyclePorts', ports), \
+             mock.patch.object(workspace_fixture, 'pin_common_guidance') as pin:
             with dummy_worker_context():
                 self.assertEqual(loop_manager._ExecutionLifecyclePorts('db', repository, **identity), 'real ports')
                 repository.update_project.assert_called_once_with('repo', {
@@ -159,6 +160,32 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
             loop_manager._ExecutionLifecyclePorts('db', repository, **identity)
             repository.update_project.assert_not_called()
             self.assertEqual(ports.call_count, 5)
+            pin.assert_not_called()
+
+    def test_pr_body_observation_uses_pushed_remote_head_without_git_execution(self):
+        from tests.support import pr_recovery
+        from loop_manager_internal.documents.pr_description import refresh_common_guidance_pr
+        pr = {'url': 'https://example.test/pr/34', 'state': 'OPEN',
+              'headRefName': 'loop-manager/G-034', 'headRefOid': 'old-checkpoint', 'body': ''}
+        repo, worktree = Path('/repo'), Path('/worktree')
+        branch_ref = 'refs/heads/loop-manager/G-034'
+        with mock.patch.object(pr_recovery, 'git_command',
+                side_effect=[f'{head}\t{branch_ref}' for head in
+                             ('first-push', 'final-push', 'final-push')]) as git:
+            for head in ('first-push', 'final-push'):
+                command = mock.Mock(side_effect=lambda *_a, **_k: SimpleNamespace(
+                    returncode=0, stdout=json.dumps(pr_recovery.observe_live_pull_request(repo, pr))))
+                refresh_common_guidance_pr(command, worktree, Path('/state'),
+                    {**pr, 'headRefOid': head}, '')
+                command.assert_called_once_with(['gh', 'pr', 'view', pr['url'], '--json',
+                                                'body,headRefOid,state'], cwd=worktree)
+            command.reset_mock()
+            with self.assertRaisesRegex(RuntimeError, '현재 HEAD'):
+                refresh_common_guidance_pr(command, worktree, Path('/state'), pr, '')
+            command.assert_called_once_with(['gh', 'pr', 'view', pr['url'], '--json',
+                                            'body,headRefOid,state'], cwd=worktree)
+            self.assertEqual(git.call_args_list, [mock.call(repo, 'ls-remote', 'origin', branch_ref)] * 3)
+        self.assertEqual(pr['headRefOid'], 'old-checkpoint')
 
     def test_decorated_case_does_not_change_following_profile_lookup(self):
         real_profile = mock.Mock(return_value='unpatched')

@@ -188,7 +188,7 @@ class ScopeRebaseRecoveryTest(AgentScopeFixture, unittest.TestCase):
                 return loop_manager.CodexResult(
                     1,
                     "stop after automatic commit isolation",
-                    "planner-session",
+                    "worker-session",
                 )
 
             with mock.patch(
