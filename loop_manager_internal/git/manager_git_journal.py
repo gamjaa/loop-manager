@@ -489,15 +489,15 @@ def verified_transition(
             or not isinstance(kind, str) or not isinstance(target, str)):
         raise MutationEvidenceError("Manager Git intent 형식이 유효하지 않습니다.")
     oid = re.compile(r"(?:[0-9a-fA-F]{40}|[0-9a-fA-F]{64})\Z")
-    if kind in {"bootstrap_fetch", "project_fetch"}:
+    if kind in {"bootstrap_fetch", "project_fetch", "manual_branch_push"}:
         valid = (
-            target.startswith("refs/remotes/origin/")
+            target.startswith("refs/heads/loop-manager/G-" if kind == "manual_branch_push" else "refs/remotes/origin/")
             and set(before) == set(expected) == {"oid"}
             and isinstance(expected["oid"], str) and oid.fullmatch(expected["oid"])
             and (before["oid"] is None or (
                 isinstance(before["oid"], str) and oid.fullmatch(before["oid"])))
         )
-    elif kind == "source_fast_forward":
+    elif kind in {"source_fast_forward", "manual_fast_forward"}:
         valid = (
             set(before) == set(expected) == {"head", "branch", "index", "changes", "operations"}
             and isinstance(before["head"], str) and oid.fullmatch(before["head"])
@@ -570,7 +570,7 @@ def verified_transition(
         raise MutationEvidenceError("Manager Git intent의 허용 전이가 유효하지 않습니다.")
     if observed != expected or (before != expected and not marker):
         raise MutationEvidenceError("Manager Git 결과 또는 작업 소유 표식이 일치하지 않습니다.")
-    if kind in {"bootstrap_fetch", "project_fetch"}:
+    if kind in {"bootstrap_fetch", "project_fetch", "manual_branch_push"}:
         return {"refs": {target: expected["oid"]}, "worktrees": {}}
     if kind == "runtime_create":
         return {"refs": {}, "worktrees": {target: expected["registration"]}}
@@ -580,7 +580,7 @@ def verified_transition(
         return {"refs": {}, "worktrees": {target: expected["registration"]}}
     if kind == "managed_worktree_remove":
         return {"refs": {}, "worktrees": {target: None}}
-    if kind == "source_fast_forward":
+    if kind in {"source_fast_forward", "manual_fast_forward"}:
         return {"refs": {}, "worktrees": {}}
     raise MutationEvidenceError(f"지원하지 않는 Manager Git 작업: {kind}")
 
@@ -624,10 +624,10 @@ def _read(path: Path, *, require_rebase_branch: bool = False) -> dict[str, Any]:
                 or not isinstance(value.get('expected'), dict)):
             raise MutationEvidenceError("Manager Git intent 형식이 유효하지 않습니다.")
         before, expected = value['before'], value['expected']
-        if value.get('kind') in {'bootstrap_fetch', 'project_fetch'}:
+        if value.get('kind') in {'bootstrap_fetch', 'project_fetch', 'manual_branch_push'}:
             valid = (isinstance(before.get('oid'), (str, type(None)))
                      and isinstance(expected.get('oid'), str))
-        elif value.get('kind') == 'source_fast_forward':
+        elif value.get('kind') in {'source_fast_forward', 'manual_fast_forward'}:
             valid = all(isinstance(item.get('index'), dict)
                         and isinstance(item.get('changes'), list)
                         and isinstance(item.get('operations'), list)
@@ -689,7 +689,7 @@ def _slot(state_dir: Path, repo: str, kind: str, target: str) -> Path:
     return state_dir / "manager-git-journal" / digest
 
 
-def has_pending_project_mutation(state_dir: Path, repo: str) -> bool:
+def has_pending_project_mutation(state_dir: Path, repo: str, *, recoverable=None) -> bool:
     """Unsealed managed-work intents block release; source sync is independent."""
     root = state_dir / "manager-git-journal"
     if not root.exists():
@@ -720,7 +720,8 @@ def has_pending_project_mutation(state_dir: Path, repo: str) -> bool:
                 if optional_source:
                     continue
                 raise
-            if intent.get("repo") == repo and intent.get("kind") not in {"source_fast_forward", "source_rebase"}:
+            if (intent.get("repo") == repo and intent.get("kind") not in {"source_fast_forward", "source_rebase"}
+                    and not (recoverable and recoverable(intent))):
                 return True
     return False
 

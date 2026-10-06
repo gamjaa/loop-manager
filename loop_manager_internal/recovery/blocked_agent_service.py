@@ -1,5 +1,6 @@
 """recovery blocked agent service boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -839,7 +840,7 @@ def resume_interrupted_blocked_agent_recovery(
         effects.validate_execplan_workspace_identity(
             state_dir,
             repo,
-            str(plan["plan_id"]),
+            manual_workspace_owner(connection, repo, str(plan["plan_id"])),
             branch,
             worktree,
         )

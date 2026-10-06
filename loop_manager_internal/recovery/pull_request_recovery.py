@@ -1,5 +1,6 @@
 """Existing PR reconciliation and owned conflict rebase recovery."""
 from __future__ import annotations
+from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -400,7 +401,7 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
             effects.validate_execplan_workspace_identity(
                 state_dir,
                 repo,
-                plan_id,
+                manual_workspace_owner(connection, repo, plan_id),
                 branch,
                 worktree,
             )

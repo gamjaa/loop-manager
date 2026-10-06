@@ -1,5 +1,6 @@
 """Checkpoint successor adoption and cause-specific candidate revalidation."""
 from __future__ import annotations
+from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -124,7 +125,7 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
     unchanged = observed == accepted and not row["pending_remote_oid"]
     try:
         effects.validate_execplan_workspace_identity(
-            state_dir, repo, str(blocked["plan_id"]), branch, worktree,
+            state_dir, repo, manual_workspace_owner(connection, repo, str(blocked["plan_id"])), branch, worktree,
         )
         effects.validate_managed_worktree(repo_path, worktree, branch, allow_rebase=integrating)
         if integrating and current.operation == 'rebase':

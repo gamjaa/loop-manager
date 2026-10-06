@@ -1,5 +1,6 @@
 """recovery project block service boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.agents import agent_scope_decision
@@ -95,7 +96,7 @@ def _reconcile_guidance_double_block(
     oid = str(plan["publication_remote_oid"])
     try:
         effects.validate_execplan_workspace_identity(
-            state_dir, repo, str(plan["plan_id"]), branch, worktree,
+            state_dir, repo, manual_workspace_owner(connection, repo, str(plan["plan_id"])), branch, worktree,
         )
         effects.validate_managed_worktree(repo_path, worktree, branch)
         before = GitSnapshot.deserialize(str(plan["agent_snapshot"]))
@@ -377,7 +378,7 @@ def _reconcile_scope_baseline_plan_block(effects: ReconcileScopeBaselinePlanBloc
     try:
         def observe():
             current = effects.capture_git_snapshot(worktree)
-            effects.validate_execplan_workspace_identity(state_dir, repo, plan_id, branch, worktree)
+            effects.validate_execplan_workspace_identity(state_dir, repo, manual_workspace_owner(connection, repo, plan_id), branch, worktree)
             effects.validate_managed_worktree(repo_path, worktree, branch)
             effects.validate_blocked_agent_scope(connection, repo_path, repo, project['base_branch'],
                                          worktree, plan['path'], saved_plan=plan, require_safe_result=True)

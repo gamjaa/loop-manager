@@ -1,5 +1,6 @@
 """Independent plan and project safety gate reconciliation."""
 from __future__ import annotations
+from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -190,7 +191,7 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
         branch = str(plan["branch"] or "")
         try:
             effects.validate_execplan_workspace_identity(
-                state_dir, repo, plan_id, branch, worktree
+                state_dir, repo, manual_workspace_owner(connection, repo, plan_id), branch, worktree
             )
         except WorkspaceOwnershipError:
             return False
@@ -228,7 +229,7 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
     try:
         checked = effects.capture_git_snapshot(worktree) if plan['agent_snapshot'] else None
         effects.validate_execplan_workspace_identity(
-            state_dir, repo, plan_id, branch, worktree
+            state_dir, repo, manual_workspace_owner(connection, repo, plan_id), branch, worktree
         )
         effects.validate_managed_worktree(
             repo_path,
@@ -438,7 +439,7 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
             worktree = Path(str(blocked["worktree"]))
             try:
                 effects.validate_execplan_workspace_identity(
-                    state_dir, repo, str(blocked["plan_id"]),
+                    state_dir, repo, manual_workspace_owner(connection, repo, str(blocked["plan_id"])),
                     str(blocked["branch"]), worktree,
                 )
                 effects.validate_blocked_agent_scope(
@@ -580,7 +581,7 @@ def _resume_owned_checkpoint_project_block(effects: ResumeOwnedCheckpointProject
     if review_marker is not None and not isinstance(review_marker, dict):
         return False
     try:
-        effects.validate_execplan_workspace_identity(state_dir, repo, plan_id, branch, worktree)
+        effects.validate_execplan_workspace_identity(state_dir, repo, manual_workspace_owner(connection, repo, plan_id), branch, worktree)
         effects.validate_managed_worktree(repo_path, worktree, branch)
         current = effects.capture_git_snapshot(worktree)
         if (current.operations or current.dirty or current.branch != branch
@@ -793,7 +794,7 @@ def _resume_legacy_review_count_block(effects: ResumeLegacyReviewCountBlockEffec
         return False
     published_resume = None
     try:
-        effects.validate_execplan_workspace_identity(state_dir, repo, plan_id, branch, worktree)
+        effects.validate_execplan_workspace_identity(state_dir, repo, manual_workspace_owner(connection, repo, plan_id), branch, worktree)
         effects.validate_managed_worktree(repo_path, worktree, branch)
         if effects._rebase_in_progress_for_branch(worktree, branch):
             return False

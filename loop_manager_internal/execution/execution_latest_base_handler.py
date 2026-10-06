@@ -109,6 +109,13 @@ class LatestBaseHandler:
                 rebase_failure, context=context,
             )
         self.ports._complete_rebase_intent(context, project_values=managed_rebase_adoption.revalidation_values(latest_sha))
+        from loop_manager_internal.execution.manual_candidate import get_manual
+        manual=get_manual(self.ports.state)
+        if manual and manual.user_submission(row):
+            # Cleanly integrating base does not require manufacturing a
+            # Worker result for a user candidate. Conflict recovery still
+            # follows the existing Worker path above.
+            self.ports.state.update_project(self.ports.identity.repo,phase='VERIFYING')
         if self.ports.validate_guidance_publication(
             self.ports.identity.repo,
             context.worktree,
@@ -227,4 +234,3 @@ class LatestBaseHandler:
                 context=context,
             )
         return None
-

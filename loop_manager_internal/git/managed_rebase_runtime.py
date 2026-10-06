@@ -1,5 +1,6 @@
 """Adapters from existing runtime policies to current rebase adoption."""
 from __future__ import annotations
+from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 from dataclasses import dataclass
 from collections.abc import Callable
 from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
@@ -122,7 +123,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
     )
 
     def validate_identity(_expected):
-        ports.validate_execplan_workspace_identity(state_dir, repo, plan_id, branch, worktree)
+        ports.validate_execplan_workspace_identity(state_dir, repo, manual_workspace_owner(connection, repo, plan_id), branch, worktree)
         ports.validate_managed_worktree(repo_path, worktree, branch, allow_rebase=True)
         current = connection.execute('SELECT branch, worktree, workspace_owned FROM exec_plans '
                                      'WHERE repo = ? AND plan_id = ?', (repo, plan_id)).fetchone()

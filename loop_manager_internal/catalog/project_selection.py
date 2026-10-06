@@ -392,8 +392,10 @@ def catalog_schedule_decision(
         active=active,
         has_ready=bool(ready),
         runnable_ready=selected,
-        has_plan_blocked=bool(held) or any(
-            row["status"] == "PLAN_BLOCKED"
+        has_plan_blocked=bool(held) or connection.execute(
+            "SELECT 1 FROM manual_work_groups WHERE repo=? AND state NOT IN ('MERGED','PR_OPEN') LIMIT 1",
+            (repo,)).fetchone() is not None or any(
+            row["status"] in {"PLAN_BLOCKED", "MANUAL_WORKING", "MANUAL_PENDING"}
             and str(row["plan_id"]) not in historical_ids for row in rows
         ),
         has_pr_open=any(

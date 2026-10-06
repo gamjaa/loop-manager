@@ -101,6 +101,33 @@ bootstrap은 최신 `origin/main`의 정확한 SHA에서 runtime을 실행한다
 
 작업 worktree의 `docs/AGENTS.common.md`는 일반 파일 권한으로 수정하고 PR에 최종 경로·diff·이유·영향을 보고한다. 후보 파일은 현재 실행 지침을 바꾸지 않는다. 새 프로젝트 AGENTS 제안은 self 저장소도 루트 `AGENTS.md`·`project` scope로 사용자 판단을 받으며, 과거 `common` 승인은 원래 대상·기준·patch로 처리한다. 이 저장소 루트의 기존 공통 본문 정리는 G-174의 정확한 사전 승인과 선행 Merge·runtime 검증 후 별도 PR로 수행한다.
 
+## 수동 구현과 제출
+
+기존 G를 다른 기기에서 구현하려면 등록된 저장소와 계획 ID를 지정한다.
+
+```sh
+python loop_manager.py manual start /path/to/project G-012
+```
+
+선행 작업의 실제 원격 base Merge를 확인한 뒤 Manager 소유 branch를 생성·push한다. 안내된 branch를 다른 기기에서 checkout해 코드·테스트와 필요한 R 변경을 함께 push한다. 수동 작업 대기는 실행 자리를 점유하지 않으며 독립 G는 계속 처리한다.
+
+```sh
+python loop_manager.py manual complete /path/to/project G-012
+```
+
+G 없이 R부터 구현까지 올린 경우에는 원격 source branch와 R 경로를 제출한다. `--requirement`는 반복할 수 있다.
+
+```sh
+python loop_manager.py manual submit /path/to/project \
+  --branch feature/manual --requirement 'docs/requirements/[R-001] Feature.md'
+```
+
+Manager가 완성된 G를 생성하고 별도 소유 branch에 source 이력과 함께 보존한다. 복수 G는 같은 최종 후보·PR을 공유하며 내부 선행 Merge가 필요한 묶음은 분리 제출해야 한다. 이후 수정은 안내된 소유 branch로 push한다. 최초 source의 새 변경은 같은 source·R 범위로 submit을 다시 실행해야 반영된다.
+
+complete·submit은 기본적으로 전체 verify와 읽기 전용 Review를 수행하고 실패하면 자동 교정·재검증을 이어간다. 외부 검증을 생략 근거로 쓰려면 `--skip-verify`와 `--skip-review`를 각각 지정하고, 원격 commit의 전체 SHA인 `--expected-head`와 `--skip-reason`을 함께 제공한다. 생략은 `SKIPPED_BY_USER`로 기록하며 실제 PASS와 구분한다. SHA·base·G/R·환경 또는 관련 단계 입력이 달라지면 기본 검증을 다시 실행한다. submit에서 생성되는 G commit도 SHA를 바꾸므로 source SHA의 생략 승인을 무효화한다.
+
+종료 코드 0은 수동 준비 또는 PR 연결 완료를 뜻한다. 수락 후 대기·자동 복구 중이면 1이며 저장된 요청은 다음 run에서 이어진다. 인자 오류는 2다. PR 생성이나 생략은 완료 근거가 아니며 저장된 동일 branch·PR의 실제 Merge를 확인해야 구성 G 전체가 MERGED가 된다.
+
 ## 실행 후 사용자가 할 일
 
 | 상황 | 조치 |

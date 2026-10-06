@@ -1,5 +1,6 @@
 """agents scope state service boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.agents import scope_recovery
@@ -151,7 +152,7 @@ def recover_persisted_agent_worktree(
         effects.validate_execplan_workspace_identity(
             state_dir,
             repo,
-            plan_id,
+            manual_workspace_owner(connection, repo, plan_id),
             branch,
             worktree,
         )

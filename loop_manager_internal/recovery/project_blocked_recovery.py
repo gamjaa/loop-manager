@@ -3,6 +3,7 @@
 Current-state scope is independent of publication lineage. Diagnostic refs
 preserve artifacts but never update the original branch's ownership records.
 """
+from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 from dataclasses import dataclass, replace
 from collections.abc import Callable
 import json
@@ -217,7 +218,7 @@ class ProjectBlockedReconciler(BlockedPlanReconciler):
 
     def _validate(self, plan, *, rebase=False):
         self.ports.validate_execplan_workspace_identity(
-            self.state_dir, self.repo, plan['plan_id'], plan['branch'], Path(plan['worktree']))
+            self.state_dir, self.repo, manual_workspace_owner(self.connection, self.repo, plan['plan_id']), plan['branch'], Path(plan['worktree']))
         self.ports.validate_managed_worktree(self.repo_path, Path(plan['worktree']), plan['branch'], allow_rebase=rebase)
         request = BlockedCheckpointRepository(self.connection).get(self.repo, plan['plan_id'])
         adapter = self.ports._BlockedCheckpointAdapter(

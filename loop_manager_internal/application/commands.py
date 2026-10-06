@@ -198,6 +198,7 @@ class ExecuteRuntimeCommandEffects:
     load_managed_config: Callable[..., object]
     operation_print: Callable[..., object]
     run_registered_projects: Callable[..., object]
+    manual_command: Callable[..., object] | None = None
 
 
 def execute_runtime_command(
@@ -216,6 +217,12 @@ def execute_runtime_command(
         return effects.configure_registry(args, state_dir, config_path)
     if args.command == "document-drafts":
         return effects._document_drafts_command(args, state_dir, config_path)
+    if args.command == "manual":
+        if effects.manual_command is None:
+            raise RuntimeError('수동 명령 composition이 없습니다.')
+        with closing(effects.connect_database(state_dir)) as connection, connection:
+            agent_invocation_state.InvocationRepository(connection).reconcile_interrupted()
+        return effects.manual_command(args, state_dir, config_path, runtime_mutation)
     if args.command == "maintenance-review":
         from uuid import uuid4
         from loop_manager_internal.maintenance import tiered_review

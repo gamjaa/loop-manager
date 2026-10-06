@@ -279,6 +279,7 @@ WORKER_INVALIDATING_DELTAS = frozenset(
 
 @dataclass(frozen=True)
 class StageArtifacts:
+    manual_submission: bool = False
     require_worker_candidate: bool = False
     worker_candidate_token: str | None = None
     worker_result: bool = False
@@ -330,14 +331,14 @@ def decide_revision_gate(
         else frozenset()
     )
     target = phase
-    if previous is None and phase != "IMPLEMENTING":
+    if previous is None and phase != "IMPLEMENTING" and not artifacts.manual_submission:
         # A pre-G-037 row may contain successful artifacts without evidence of
         # the definition that produced them. Conservatively resume its Worker.
         target = "IMPLEMENTING"
     elif deltas & WORKER_INVALIDATING_DELTAS:
-        target = "IMPLEMENTING"
+        target = "VERIFYING" if artifacts.manual_submission and phase != 'IMPLEMENTING' else "IMPLEMENTING"
 
-    if phase != "IMPLEMENTING" and (
+    if phase != "IMPLEMENTING" and not artifacts.manual_submission and (
         not artifacts.worker_result
         or artifacts.worker_input_token != current.worker_token
         or artifacts.archive_token != current.archive_token

@@ -241,6 +241,8 @@ class PinnedCatalog:
     recovery_definitions: tuple[ExecPlanCatalogEntry, ...] = ()
     draft_inputs: Mapping[str, str | None] | None = None
     remote_url: str | None = None
+    definition_revisions: tuple[tuple[str, str], ...] = ()
+    reserved_intake_ids: frozenset[str] = frozenset()
 
 
 def new_declaration_issues(
@@ -578,6 +580,7 @@ class DefinitionStateRepository:
         # interrupted migration. An ID linked to any such history stays owned.
         for table, path_column in (
             ("execplan_archive_items", "active_path"),
+            ("manual_work_members", None),
             ("execution_checkpoints", None),
             ("blocked_checkpoints", None),
             ("rebase_corrections", None),
@@ -839,7 +842,7 @@ class DefinitionStateRepository:
                         entry.content_hash,
                         entry.complexity,
                         entry.risk,
-                        pinned.revision_sha,
+                        dict(pinned.definition_revisions).get(entry.plan_id,pinned.revision_sha),
                         initial_level,
                         effective_level,
                     )
@@ -1056,7 +1059,7 @@ class CatalogReconciliationService:
             return self._invalid(pinned.revision_sha, "missing-plan",
                 "보류한 원격 ExecPlan 파일이 없습니다: " + ", ".join(missing_pending))
         missing_history = sorted(
-            historical_ids - stored_ids - catalog_ids
+            historical_ids - stored_ids - catalog_ids - pinned.reserved_intake_ids
         )
         unknown_archived = sorted(
             set(pinned.snapshot.archived) - stored_ids - historical_ids

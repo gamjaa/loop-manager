@@ -64,6 +64,15 @@ class VerifyHandler:
 
     def _verify_once(self, context):
         assert self.ports.snapshot().catalog_plan is not None and self.ports.snapshot().plan is not None
+        from loop_manager_internal.execution.manual_candidate import get_manual
+        manual = get_manual(self.ports.state)
+        waiver = manual.waive(context, 'verify') if manual else None
+        if waiver:
+            self.ports.operation_print(waiver)
+            return None, waiver
+        notice = manual.invalid_waiver_notice(context,'verify') if manual else None
+        if notice:
+            self.ports.operation_print(notice)
         self.ports.operation_log(f"전체 verify 시작: {self.ports.snapshot().plan['id']} {self.ports.snapshot().plan['title']}")
         verify_scope_before = self.ports.begin_agent_scope(
             self.ports.identity.repo,
@@ -82,6 +91,8 @@ class VerifyHandler:
             self.ports.operation_print(detail, file=sys.stderr)
             return (self.ports._final(detail), detail)
         raw_output = redact_secrets(str(getattr(output, 'fingerprint_source', output)))
+        if manual:
+            manual.record(context, 'verify', passed, raw_output)
         if not hasattr(output, 'fingerprint_source'):
             output = raw_output
         feedback_repo = self.ports.feedback.repository if self.ports.feedback else None
@@ -192,13 +203,16 @@ class VerifyHandler:
         ):
             return self.ports._final()
         try:
-            disposition = self.ports._parse_worker_outcome(
-                context, str(row['worker_result'] or ''), allow_legacy_ready=True,
-            )
-            if disposition.kind == 'needs_user_decision':
-                return self.ports._block_worker_decision(
-                    context, str(row['worker_result'] or ''), disposition,
+            from loop_manager_internal.execution.manual_candidate import get_manual
+            manual = get_manual(self.ports.state)
+            if not (manual and manual.user_submission(row)):
+                disposition = self.ports._parse_worker_outcome(
+                    context, str(row['worker_result'] or ''), allow_legacy_ready=True,
                 )
+                if disposition.kind == 'needs_user_decision':
+                    return self.ports._block_worker_decision(
+                        context, str(row['worker_result'] or ''), disposition,
+                    )
             worker_publication = self.ports.parse_worker_result(str(row['worker_result'] or ''), self.ports.snapshot().plan)
         except (WorkerOutcomeError, self.ports.contract.WorkerResultError) as error:
             validation_error = f"Worker 결과 검증 실패:\n{error}"
@@ -270,10 +284,11 @@ class VerifyHandler:
             self.ports._commit_owned(context, worker_publication.commit_title)
             return self.ports._retry('전체 verify 중 허용된 변경을 commit했습니다. 새 후보를 다시 검증합니다.')
         with runtime_state._transaction(self.ports.state.connection):
-            review_correction_state.verified(
-                self.ports.state.connection, self.ports.identity.repo,
-                context.plan.plan_id, candidate_head,
-            )
+            if not (manual and manual.user_submission(self.ports._row())):
+                review_correction_state.verified(
+                    self.ports.state.connection, self.ports.identity.repo,
+                    context.plan.plan_id, candidate_head,
+                )
             self.ports.clear_validation_failure_history(self.ports.identity.repo, 'verify')
             self.ports.state.update_project(
                 self.ports.identity.repo, preserve_transaction=True,

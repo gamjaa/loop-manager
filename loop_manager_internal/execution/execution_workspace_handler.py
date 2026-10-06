@@ -206,6 +206,11 @@ class WorkspaceHandler:
                     or stable_pr != pull_request):
                 return self.ports._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
                                      'checkpoint observation changed', context=context)
+            from loop_manager_internal.execution.manual_candidate import get_manual
+            manual = get_manual(self.ports.state)
+            if manual and manual.adopt_remote(context,remote_oid,base_oid,pull_request,
+                                               self.ports.state,checkpoint):
+                return self.ports._context()
             current_catalog = self.ports.state.active_execplan(self.ports.identity.repo)
             if (
                 int(current_catalog['catalog_generation']),
@@ -618,4 +623,3 @@ class WorkspaceHandler:
         ))
         self.ports.update_snapshot(catalog_plan=catalog_plan)
         return self.ports._context()
-

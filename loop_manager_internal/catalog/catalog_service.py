@@ -419,6 +419,12 @@ def reconcile_execplan_catalog(
         except execplan_catalog_state.InvalidPinnedCatalog:
             pass  # The service records the same pinned declaration diagnostic.
     service = execplan_catalog_state.CatalogReconciliationService(repository, port)
+    from loop_manager_internal.catalog import manual_catalog
+    try:
+        pinned = port.load()
+        port.loaded = manual_catalog.overlay(connection, repo, pinned, git=effects.git)
+    except execplan_catalog_state.InvalidPinnedCatalog:
+        pass
     legacy = connection.execute(
         "SELECT 1 FROM execplan_catalog_revisions WHERE repo = ? "
         "UNION SELECT 1 FROM execplan_catalog_views WHERE repo = ?", (repo, repo),

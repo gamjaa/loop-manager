@@ -6,6 +6,7 @@ from loop_manager_internal.documents import document_drafts
 from loop_manager_internal.documents import document_publication
 import sys
 from loop_manager_internal.storage import review_correction_state
+import json
 from loop_manager_internal.agents.agent_invocation import AttemptSequence, TrackedAgentCall
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, classify_exception
@@ -156,6 +157,19 @@ class ReviewHandler:
             review_level = (pending['level'] if pending and pending['completed']
                             and pending['verified_head'] == candidate_head
                             else correction['level'])
+        from loop_manager_internal.execution.manual_candidate import get_manual
+        manual = get_manual(self.ports.state)
+        waiver = manual.waive(context, 'review') if manual else None
+        if waiver:
+            self.ports.operation_print(waiver)
+            self.ports.state.update_project(self.ports.identity.repo, phase='PUBLISHING', last_error=None,
+                review_result=waiver, review_token=self.ports.snapshot()._definition_snapshot.review_token(
+                    str(row['validated_base_sha'] or row['active_sha']),
+                    self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()), publication_token=None)
+            return self.ports._advanced()
+        notice = manual.invalid_waiver_notice(context,'review') if manual else None
+        if notice:
+            self.ports.operation_print(notice)
         targeted_test_reason = self.ports.contract.reviewer_targeted_test_reason(
             entry_evidence.test_evidence,
         )
@@ -287,6 +301,8 @@ class ReviewHandler:
                 return ExecutionOutcome(outcome, detail=reviewer_error, error=True)
             try:
                 verdict, review_details = self.ports.parse_reviewer_result(review)
+                if manual:
+                    manual.review_results(context, verdict, review)
                 if verdict == 'SPEC_BLOCKED':
                     if not isinstance(review_details, SpecificationDeadlock):
                         raise self.ports.contract.ReviewerProtocolError(
@@ -296,11 +312,16 @@ class ReviewHandler:
                         validate_locations(
                             review_details,
                             str(self.ports.snapshot().catalog_plan['path']),
-                            tuple(str(path) for path in self.ports.snapshot().plan.get('sources', ())),
+                            (tuple(path for item in json.loads(manual.group()['documents'])
+                                   for path in (item['path'],*item['plan']['sources']))
+                             if manual and manual.enabled() else
+                             tuple(str(path) for path in self.ports.snapshot().plan.get('sources', ()))),
                         )
                     except ValueError as error:
                         raise self.ports.contract.ReviewerProtocolError(str(error)) from error
             except self.ports.contract.ReviewerProtocolError as error:
+                if manual:
+                    manual.record(context,'review',False,f'Reviewer protocol failure: {error}\n{review}')
                 if feedback_repo is not None:
                     feedback_repo.record_result(
                         self.ports.identity.repo, str(self.ports.snapshot().plan['id']), context.plan.definition_revision_sha,
@@ -340,6 +361,8 @@ class ReviewHandler:
                 + review[-6000:],
             )
         if verdict == 'SPEC_BLOCKED':
+            if manual:
+                manual.record(context,'review',False,review)
             self.ports.state.update_project(self.ports.identity.repo, review_result=review)
             self.ports.operation_log(
                 f"사용자 명세 결정 필요: {self.ports.snapshot().plan['id']} {self.ports.snapshot().plan['title']}",

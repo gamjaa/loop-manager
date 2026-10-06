@@ -1,5 +1,6 @@
 """git publication service boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -69,10 +70,11 @@ def _owned_publication_plan(
         raise PublicationSafetyError(
             "publication branch의 Loop Manager 소유권을 SQLite에서 확인할 수 없습니다."
         )
+    from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
     effects.validate_execplan_workspace_identity(
         state_dir,
         repo,
-        str(plan["plan_id"]),
+        ManualWorkRepository(connection).workspace_owner(repo,str(plan['plan_id'])),
         branch,
         worktree,
     )
@@ -317,7 +319,7 @@ def push_owned_pr_conflict_recovery(
             "기존 PR 충돌 복구의 lease OID와 검증 base가 완전하지 않습니다."
         )
     effects.validate_execplan_workspace_identity(
-        state_dir, repo, str(plan["plan_id"]), branch, worktree
+        state_dir, repo, manual_workspace_owner(connection, repo, str(plan["plan_id"])), branch, worktree
     )
     effects.validate_managed_worktree(repo_path, worktree, branch)
     local_oid = effects.git(worktree, "rev-parse", "HEAD").stdout.strip()
@@ -468,7 +470,7 @@ def recover_confirmed_pr_conflict_push(
             or plan["publication_token"] != definition.publication_token(target_base, remote_head)):
         return False
     effects.validate_execplan_workspace_identity(
-        state_dir, repo, str(plan["plan_id"]), branch, worktree
+        state_dir, repo, manual_workspace_owner(connection, repo, str(plan["plan_id"])), branch, worktree
     )
     effects.validate_managed_worktree(repo_path, worktree, branch)
     local_oid = effects.git(worktree, "rev-parse", "HEAD").stdout.strip()
