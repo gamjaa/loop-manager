@@ -841,7 +841,9 @@ class ProjectService:
             return planning_step_result
         self.state.base_sha = planning_outcome.base_sha or self.state.base_sha
         newly_activated = planning_outcome.newly_activated
-        return self._dispatch_execution(runtime_repository, newly_activated)
+        return self._dispatch_execution(
+            runtime_repository, newly_activated=newly_activated,
+        )
 
     def _dispatch_execution(self, runtime_repository, *, newly_activated: bool) -> int:
         execution_ports = self.effects._ExecutionLifecyclePorts(
