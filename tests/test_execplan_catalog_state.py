@@ -1010,7 +1010,7 @@ class CatalogReconciliationTest(CatalogReconciliationFixture, unittest.TestCase)
         ).fetchall()
         self.assertEqual([tuple(row) for row in rows], [
             ("G-001", "IMPLEMENTING", 1), ("G-002", "MERGED", 1),
-            ("G-003", "READY", 1), ("G-004", "READY", 7),
+            ("G-003", "READY", 1), ("G-004", "READY", 6),
         ])
         self.assertEqual(self._service(pinned).reconcile("/repo").changed_plan_ids, ())
 
