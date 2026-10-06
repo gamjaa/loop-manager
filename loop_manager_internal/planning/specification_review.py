@@ -24,13 +24,13 @@ def current_receipt(receipt, *, repo, revision, input_fingerprint,
                        specification_fingerprint=specification_fingerprint,
                        work_cycle=work_cycle):
         return True
-    # Only a verified, content-preserving Manager retirement can bridge the
-    # observed full specifications to their published archive representation.
+    # Callers first match the durable verified plan declarations. Only exact,
+    # content-preserving Requirement/ExecPlan archive moves may bridge inputs.
     return bool(valid_final_receipt(receipt)
         and receipt["outcome"] == "fulfilled" and receipt["confirmed_revision"]
         and receipt["work_cycle"] == work_cycle
         and archive_only(repo, receipt["revision"], revision,
-                         verified_plan_declarations=True))
+                         verified_plan_declarations=True, allow_execplan_only=True))
 
 
 def valid_final_receipt(receipt) -> bool:

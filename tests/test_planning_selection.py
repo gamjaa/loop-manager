@@ -1945,6 +1945,66 @@ class SpecificationReviewSelectionTest(PlanningCase):
         PlanningLifecycleCoordinator(ports).run(self.context)
         self.assertEqual(ports.agent.run_count, 3)
 
+    def test_merged_plan_archive_reuses_final_receipt_without_planner(self):
+        from loop_manager_internal.planning.git_ports import _PlanningGitPorts
+        plan = b'docs/plans/[G-001] Done.md'
+        archived = b'docs/plans/archive/[G-001] Done.md'
+        previous = {plan: (b'blob', b'plan')}
+        for change in ('verified', 'unverified', 'archive-edit', 'code', 'specification', 'cycle'):
+            with self.subTest(change=change):
+                current = {archived: previous[plan]}
+                if change == 'archive-edit':
+                    current[archived] = (b'blob', b'edited')
+                elif change == 'code':
+                    current[b'src/app.py'] = (b'blob', b'new-code')
+                elif change == 'specification':
+                    current[b'docs/PRODUCT.md'] = (b'blob', b'new-specification')
+                ports = self.review_ports(planning_snapshot(
+                    processed_sha='old-base', planning_fingerprint='old-full',
+                    specification_fingerprint='specification',
+                ))
+                ports.git.fingerprints = {'old-base': 'old-full', 'base': 'archived-full'}
+                ports.git.nonplan_fingerprints = {'old-base': 'same-code', 'base': 'same-code'}
+                ports.git.specification_fingerprints['old-base'] = 'specification'
+                effects = IsRequirementArchiveOnlyChangeEffects(
+                    _git_tree_entries=lambda _repo, sha: previous if sha == 'old-base' else current,
+                    _is_planning_input=loop_manager._is_planning_input,
+                )
+                # Exercise the real Git port's forwarding and the archive classifier.
+                git_port = _PlanningGitPorts(SimpleNamespace(
+                    _is_requirement_archive_only_change=lambda *args, **kwargs: (
+                        _is_requirement_archive_only_change(effects, *args, **kwargs)),
+                    git=mock.Mock(), _nul_git_paths=mock.Mock(),
+                ), ports.review_connection, Path('/repo'), Path('/state'))
+                ports.git.requirement_archive_only = git_port.requirement_archive_only
+                if change == 'verified':
+                    self.assertFalse(git_port.requirement_archive_only(
+                        Path('/repo'), 'old-base', 'base', verified_plan_declarations=True))
+                    self.assertFalse(git_port.requirement_archive_only(
+                        Path('/repo'), 'old-base', 'base', allow_execplan_only=True))
+                planning_input_state.record_general(
+                    ports.review_connection, '/repo', 'old-base', {plan.decode(): ('blob', 'plan')},
+                )
+                if change != 'unverified':
+                    planning_input_state.advance_verified_delta(
+                        ports.review_connection, '/repo', 'base', {plan.decode(): (('blob', 'plan'), None)},
+                    )
+                ports.state.plan_declarations_match = lambda repo, entries: planning_input_state.matches(
+                    ports.review_connection, repo, entries)
+                self.record(ports, purpose='final', outcome='fulfilled')
+                if change == 'cycle':
+                    ports.state.cycle = replace(ports.state.cycle, revision=1)
+                if change == 'verified':
+                    for _ in range(2):
+                        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+                        self.assertEqual(outcome.kind, PlanningOutcomeKind.FINGERPRINT_SKIPPED)
+                    self.assertEqual(ports.agent.run_count, 0)
+                    self.assertEqual(ports.state.snapshot.planning_fingerprint, 'old-full')
+                    self.assertEqual(ports.state.planning_review('/repo', 'final')['revision'], 'old-base')
+                else:
+                    PlanningLifecycleCoordinator(ports).run(self.context)
+                    self.assertEqual(ports.agent.run_count, 1)
+
     def test_final_attempt_rebases_with_its_purpose_and_invalid_result_retries(self):
         from loop_manager_internal.planning.specification_review import prepare_review
         ports = self.review_ports(planning_snapshot(processed_sha='base',

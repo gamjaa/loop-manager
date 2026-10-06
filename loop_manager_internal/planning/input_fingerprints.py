@@ -157,12 +157,14 @@ def _is_requirement_archive_only_change(
     previous_revision: str,
     current_revision: str,
     *, verified_plan_declarations: bool = False,
+    allow_execplan_only: bool = False,
 ) -> bool:
     previous_tree = effects._git_tree_entries(repo, previous_revision)
     current_tree = effects._git_tree_entries(repo, current_revision)
     archive_prefix = b"docs/requirements/archive/"
     # The caller must match the durable verified declaration baseline first.
     # Recovery of an unfinished Planner result uses the strict default.
+    # Final receipt reuse may additionally accept a verified ExecPlan-only move.
 
     def relevant(path: bytes) -> bool:
         return (effects._is_planning_input(path) or path.startswith(archive_prefix)
@@ -181,8 +183,9 @@ def _is_requirement_archive_only_change(
     change = execplan_catalog.classify_archive_only_tree_change(previous, current)
     return change.requirement_only or (
         verified_plan_declarations and change.archive_only
-        and any(move.kind is execplan_catalog.ArchiveDocumentKind.REQUIREMENT
-                for move in change.moves)
+        and (allow_execplan_only
+             or any(move.kind is execplan_catalog.ArchiveDocumentKind.REQUIREMENT
+                    for move in change.moves))
     )
 
 

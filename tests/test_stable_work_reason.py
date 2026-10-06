@@ -139,17 +139,24 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
             self.assertIsNone(check())
 
     def test_dual_archive_completion_requires_verified_plan_baseline(self):
+        self._assert_archive_completion(include_requirement=True)
+
+    def test_execplan_archive_completion_requires_verified_plan_baseline(self):
+        self._assert_archive_completion(include_requirement=False)
+
+    def _assert_archive_completion(self, *, include_requirement):
         connection, repo = self._connection()
         self.addCleanup(connection.close)
         plan = "docs/plans/[G-018] Work.md"
         previous = {
-            b"docs/requirements/R.md": (b"blob", b"requirement"),
             plan.encode(): (b"blob", b"plan"),
         }
         current = {
-            b"docs/requirements/archive/R.md": (b"blob", b"requirement"),
             b"docs/plans/archive/[G-018] Work.md": (b"blob", b"plan"),
         }
+        if include_requirement:
+            previous[b"docs/requirements/R.md"] = (b"blob", b"requirement")
+            current[b"docs/requirements/archive/R.md"] = (b"blob", b"requirement")
         connection.execute("UPDATE projects SET processed_sha = 'old-base' WHERE repo = ?", (repo,))
         connection.execute("UPDATE exec_plans SET status = 'MERGED' WHERE repo = ?", (repo,))
         planning_input_state.record_general(connection, repo, "old-base", {plan: ("blob", "plan")})
@@ -157,7 +164,10 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
         with mock.patch("loop_manager.git") as command, mock.patch(
             "loop_manager._planning_input_fingerprint", return_value="archived-full"
         ), mock.patch(
-            "loop_manager._specification_input_fingerprint", return_value="archived-spec"
+            "loop_manager._specification_input_fingerprint",
+            return_value="archived-spec" if include_requirement else "spec-one",
+        ), mock.patch(
+            "loop_manager._nonplan_input_fingerprint", return_value="unchanged-code"
         ), mock.patch(
             "loop_manager._git_tree_entries",
             side_effect=lambda _repo, sha: previous if sha == "old-base" else current,
@@ -175,6 +185,11 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
                 )
                 self.assertIsNotNone(result)
                 self.assertTrue(result.completed)
+                self.assertEqual(result.cycle, "cycle-one")
+            current[b"docs/plans/archive/[G-018] Work.md"] = (b"blob", b"edited")
+            self.assertIsNone(loop_manager._stable_work_reason(
+                connection, repo, refactoring_review_interval=5,
+            ))
 
     def test_legacy_processed_sha_cannot_confirm_unreviewed_plan(self):
         connection, repo = self._connection()
