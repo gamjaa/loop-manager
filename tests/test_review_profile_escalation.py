@@ -7,6 +7,7 @@ from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 import loop_manager
+from loop_manager_internal.storage import review_correction_state
 from tests.support.profiles import profile_config
 from tests.support.catalog import make_catalog_root, write_execplan
 from tests.support.worker import dummy_worker_sessions
@@ -36,12 +37,10 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
 
     @dummy_worker_sessions
     def test_new_execplan_stores_capped_initial_and_effective_level(self):
-        cases = (
-            ("low", "low", 1),
-            ("low", "critical", 2),
-            ("medium", "critical", 4),
-            ("high", "high", 5),
-            ("high", "critical", 6),
+        cases = tuple(
+            (complexity, risk, base + (risk == 'critical'))
+            for complexity, base in (('low', 1), ('medium', 3), ('high', 5))
+            for risk in ('low', 'medium', 'high', 'critical')
         )
         for complexity, risk, expected in cases:
             with self.subTest(complexity=complexity, risk=risk):
@@ -95,36 +94,85 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
         self.assertEqual(stored["effective_worker_level"], 6)
         self.assertEqual(json.loads(stored["review_level_history"]), {})
 
-    @dummy_worker_sessions
-    def test_review_state_transition_escalates_one_level_and_caps_at_eight(self):
-        history: dict[str, dict[str, int]] = {}
-        effective_level = 1
-
-        for expected_level in range(2, 9):
-            fingerprint = f"same-at-{effective_level}"
-            first = loop_manager.evaluate_review_worker_level(
-                effective_level, history, (fingerprint,)
-            )
-            self.assertFalse(first.escalated)
-            second = loop_manager.evaluate_review_worker_level(
-                effective_level, first.review_history, (fingerprint,)
-            )
-            self.assertTrue(second.escalated)
-            self.assertEqual(second.effective_level, expected_level)
-            history = second.review_history
-            effective_level = second.effective_level
-
-        capped = loop_manager.evaluate_review_worker_level(
-            8, history, ("distinct-a", "distinct-b", "distinct-c")
+    def _completed_fail(self, previous, fingerprints, *, level=None, head='candidate'):
+        state = json.loads(json.dumps(previous.correction_state))
+        state['pending'] = {'source': 1, 'level': previous.effective_level,
+                            'completed': True, 'verified_head': head}
+        return loop_manager.evaluate_review_worker_level(
+            previous.effective_level, previous.review_history, fingerprints, state,
+            review_level=level or previous.effective_level, candidate_head=head,
         )
+
+    def test_review_state_transition_escalates_one_level_and_caps_at_eight(self):
+        history = {}
+        effective_level = 1
+        for expected_level in range(2, 9):
+            issue = (f'same-at-{effective_level}',)
+            first = loop_manager.evaluate_review_worker_level(effective_level, history, issue)
+            self.assertFalse(first.escalated)
+            second = self._completed_fail(first, issue)
+            self.assertFalse(second.escalated)
+            third = self._completed_fail(second, issue)
+            self.assertTrue(third.escalated)
+            self.assertEqual(third.effective_level, expected_level)
+            history, effective_level = third.review_history, third.effective_level
+        capped = loop_manager.evaluate_review_worker_level(8, history, ('a', 'b', 'c'))
+        for _ in range(4):
+            capped = self._completed_fail(capped, ('a', 'b', 'c'))
         self.assertFalse(capped.escalated)
         self.assertEqual(capped.effective_level, 8)
 
-        distinct = loop_manager.evaluate_review_worker_level(
-            4, {}, ("issue-a", "issue-b", "issue-c")
+    def test_multi_issue_baseline_and_changing_corrections_count_results(self):
+        first = loop_manager.evaluate_review_worker_level(4, {}, ('a', 'b', 'c'))
+        self.assertFalse(first.escalated)
+        second = self._completed_fail(first, ('d', 'e', 'f'))
+        third = self._completed_fail(second, ('g', 'h', 'i'))
+        self.assertFalse(third.escalated)
+        fourth = self._completed_fail(third, ('j', 'k', 'l'))
+        self.assertEqual(fourth.effective_level, 5)
+        self.assertEqual(fourth.correction_state['failures'], 3)
+
+    def test_a_b_a_requires_two_completed_a_corrections(self):
+        first = loop_manager.evaluate_review_worker_level(1, {}, ('a',))
+        second = self._completed_fail(first, ('b',))
+        third = self._completed_fail(second, ('a',))
+        self.assertFalse(third.escalated)
+        self.assertEqual(self._completed_fail(third, ('a',)).effective_level, 2)
+
+    def test_legacy_history_duplicate_review_and_stale_level_do_not_escalate(self):
+        first = loop_manager.evaluate_review_worker_level(4, {'4': {'a': 10}}, ('a',))
+        self.assertFalse(first.escalated)
+        duplicate = loop_manager.evaluate_review_worker_level(
+            4, first.review_history, ('a',), first.correction_state,
         )
-        self.assertTrue(distinct.escalated)
-        self.assertEqual(distinct.effective_level, 5)
+        self.assertEqual(duplicate, first)
+        stale = self._completed_fail(first, ('a',), level=3)
+        self.assertFalse(stale.escalated)
+        self.assertEqual(stale.correction_state['failures'], 0)
+        state = json.loads(json.dumps(stale.correction_state))
+        state['pending']['completed'] = False
+        incomplete = loop_manager.evaluate_review_worker_level(
+            4, first.review_history, ('a',), state, candidate_head='candidate',
+        )
+        self.assertEqual(incomplete.correction_state['failures'], 0)
+        state['pending']['completed'] = True
+        mismatched = loop_manager.evaluate_review_worker_level(
+            4, first.review_history, ('a',), state, candidate_head='different-head',
+        )
+        self.assertEqual(mismatched.correction_state['failures'], 0)
+
+    def _correct_review(self, connection, root, output, source):
+        repo = str(root)
+        level = connection.execute(
+            "SELECT effective_worker_level FROM exec_plans WHERE plan_id = 'G-019'"
+        ).fetchone()[0]
+        review_correction_state.begin_worker(connection, repo, 'G-019', level, source)
+        review_correction_state.complete_worker(connection, repo, 'G-019', level)
+        review_correction_state.verified(connection, repo, 'G-019', 'candidate')
+        return loop_manager.transition_validation_failure(
+            connection, repo, root, 'review', output,
+            review_level=level, candidate_head='candidate',
+        )
 
     @dummy_worker_sessions
     def test_review_level_persists_with_global_history_and_blocked_reset(self):
@@ -157,9 +205,11 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
                 1,
             )
 
-            second = loop_manager.transition_validation_failure(
-                reopened, str(root), root, "review", output
-            )
+            second = self._correct_review(reopened, root, output, 1)
+            self.assertEqual(reopened.execute(
+                "SELECT effective_worker_level FROM exec_plans WHERE plan_id = 'G-019'"
+            ).fetchone()[0], 7)
+            second = self._correct_review(reopened, root, output, 2)
             escalated = reopened.execute(
                 """
                 SELECT effective_worker_level, review_level_history,
@@ -171,13 +221,13 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
             self.assertEqual(escalated["effective_worker_level"], 8)
             self.assertEqual(
                 json.loads(escalated["review_level_history"])["7"][second.fingerprint],
-                2,
+                3,
             )
             self.assertEqual(
                 json.loads(escalated["review_failure_history"])[second.fingerprint][
                     "occurrences"
                 ],
-                2,
+                3,
             )
 
             reopened.execute(
@@ -196,7 +246,7 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
             reset = reopened.execute(
                 """
                 SELECT initial_worker_level, effective_worker_level,
-                       review_level_history, review_failure_history
+                       review_level_history, review_failure_history, review_correction_state
                 FROM exec_plans WHERE repo = ? AND plan_id = 'G-019'
                 """,
                 (str(root),),
@@ -207,6 +257,90 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
         self.assertEqual(reset["effective_worker_level"], 7)
         self.assertEqual(json.loads(reset["review_level_history"]), {})
         self.assertEqual(json.loads(reset["review_failure_history"]), {})
+        self.assertEqual(json.loads(reset["review_correction_state"]), {})
+
+    def test_incomplete_verified_turn_restart_and_duplicate_observation(self):
+        issue = 'ISSUE_ID: app.py::persistent::blocking\nFix it\nVERDICT: FAIL'
+        with tempfile.TemporaryDirectory() as directory:
+            root, state_dir, connection = self._level_state(directory, initial_level=4)
+            try:
+                loop_manager.transition_validation_failure(connection, str(root), root, 'review', issue)
+                review_correction_state.begin_worker(connection, str(root), 'G-019', 4, 1)
+                # CLI/protocol failure cannot turn an incomplete Worker into a correction.
+                review_correction_state.verified(connection, str(root), 'G-019', 'candidate')
+                loop_manager.transition_validation_failure(connection, str(root), root, 'review', issue)
+                self.assertEqual(review_correction_state.load(connection, str(root), 'G-019')['failures'], 0)
+                review_correction_state.complete_worker(connection, str(root), 'G-019', 4)
+                before_verify = review_correction_state.load(connection, str(root), 'G-019')
+                loop_manager.transition_validation_failure(connection, str(root), root, 'verify', 'unit failed')
+                self.assertEqual(review_correction_state.load(connection, str(root), 'G-019'), before_verify)
+            finally:
+                connection.close()
+            connection = loop_manager.connect_database(state_dir)
+            try:
+                pending = review_correction_state.load(connection, str(root), 'G-019')['pending']
+                self.assertTrue(pending['completed'])
+                self.assertIsNone(pending['verified_head'])
+                # Verify remediation remains the same Review feedback turn.
+                review_correction_state.begin_worker(connection, str(root), 'G-019', 4, None)
+                self.assertEqual(review_correction_state.load(connection, str(root), 'G-019')['pending']['source'], 1)
+                self._correct_review(connection, root, issue, 1)
+                counted = review_correction_state.load(connection, str(root), 'G-019')
+                self.assertEqual(counted['failures'], 1)
+                loop_manager.transition_validation_failure(connection, str(root), root, 'review', issue)
+                self.assertEqual(review_correction_state.load(connection, str(root), 'G-019'), counted)
+                self._correct_review(connection, root, issue, 2)
+                self.assertEqual(connection.execute(
+                    "SELECT effective_worker_level FROM exec_plans WHERE plan_id = 'G-019'"
+                ).fetchone()[0], 5)
+                # PASS ends the active episode while keeping level/audit.
+                audit = connection.execute(
+                    "SELECT review_level_history FROM exec_plans WHERE plan_id = 'G-019'"
+                ).fetchone()[0]
+                loop_manager.clear_validation_failure_history(connection, str(root), 'review')
+                closed = review_correction_state.load(connection, str(root), 'G-019')
+                self.assertTrue(closed['closed'])
+                self.assertEqual(closed['failures'], 0)
+                self.assertEqual([entry['source_review_id'] for entry in closed['audit']
+                                  if entry['kind'] == 'correction'], [1, 2])
+                next_baseline = loop_manager.evaluate_review_worker_level(5, {}, ('new',), closed)
+                self.assertFalse(next_baseline.escalated)
+                self.assertEqual(next_baseline.correction_state['failures'], 0)
+                self.assertEqual(len(next_baseline.correction_state['audit']), 4)
+                self.assertEqual(connection.execute(
+                    "SELECT review_level_history FROM exec_plans WHERE plan_id = 'G-019'"
+                ).fetchone()[0], audit)
+            finally:
+                connection.close()
+
+    def test_failed_transition_does_not_consume_completed_correction(self):
+        from loop_manager_internal.storage import runtime_state
+        issue = 'ISSUE_ID: app.py::persistent::blocking\nFix it\nVERDICT: FAIL'
+        with tempfile.TemporaryDirectory() as directory:
+            root, _state_dir, connection = self._level_state(directory, initial_level=4)
+            try:
+                loop_manager.transition_validation_failure(connection, str(root), root, 'review', issue)
+                self._correct_review(connection, root, issue, 1)
+                before = review_correction_state.load(connection, str(root), 'G-019')
+                with mock.patch.object(runtime_state.RuntimeStateRepository, 'transition', side_effect=RuntimeError('write failed')):
+                    with self.assertRaisesRegex(RuntimeError, 'write failed'):
+                        self._correct_review(connection, root, issue, 2)
+                after = review_correction_state.load(connection, str(root), 'G-019')
+                self.assertEqual(after['failures'], before['failures'])
+                self.assertTrue(after['pending']['completed'])
+                self.assertEqual(connection.execute(
+                    "SELECT effective_worker_level FROM exec_plans WHERE plan_id = 'G-019'"
+                ).fetchone()[0], 4)
+                # Retry the same verified result; consume it once with the level update.
+                loop_manager.transition_validation_failure(
+                    connection, str(root), root, 'review', issue,
+                    review_level=4, candidate_head='candidate',
+                )
+                self.assertEqual(connection.execute(
+                    "SELECT effective_worker_level FROM exec_plans WHERE plan_id = 'G-019'"
+                ).fetchone()[0], 5)
+            finally:
+                connection.close()
 
     @dummy_worker_sessions
     def test_verify_and_invalid_review_do_not_change_escalation_history(self):
@@ -224,7 +358,7 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
             )
             before = connection.execute(
                 """
-                SELECT effective_worker_level, review_level_history
+                SELECT effective_worker_level, review_level_history, review_correction_state
                 FROM exec_plans WHERE repo = ? AND plan_id = 'G-019'
                 """,
                 (str(root),),
@@ -243,7 +377,7 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
                 )
             after = connection.execute(
                 """
-                SELECT effective_worker_level, review_level_history
+                SELECT effective_worker_level, review_level_history, review_correction_state
                 FROM exec_plans WHERE repo = ? AND plan_id = 'G-019'
                 """,
                 (str(root),),
@@ -253,14 +387,16 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
         self.assertEqual(before["effective_worker_level"], 4)
         self.assertEqual(after["effective_worker_level"], 4)
         self.assertEqual(after["review_level_history"], before["review_level_history"])
+        self.assertEqual(after["review_correction_state"], before["review_correction_state"])
 
     @dummy_worker_sessions
-    def test_worker_uses_escalated_level_only_after_second_matching_review(self):
+    def test_worker_uses_escalated_level_after_two_completed_matching_corrections(self):
         issue = (
             "ISSUE_ID: app.py::persistent-issue::blocking\n"
             "Actionable issue\nVERDICT: FAIL"
         )
         reviews = (
+            loop_manager.CodexResult(0, issue, "reviewer-session"),
             loop_manager.CodexResult(0, issue, "reviewer-session"),
             loop_manager.CodexResult(0, issue, "reviewer-session"),
             loop_manager.CodexResult(0, "VERDICT: PASS", "reviewer-session"),
@@ -271,12 +407,12 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
             )
 
         self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
-        self.assertEqual(worker_levels, [1, 1, 2])
+        self.assertEqual(worker_levels, [1, 1, 1, 2])
         self.assertEqual(plan["initial_worker_level"], 1)
         self.assertEqual(plan["effective_worker_level"], 2)
         self.assertEqual(json.loads(plan["review_failure_history"]), {})
         level_history = json.loads(plan["review_level_history"])
-        self.assertEqual(sorted(level_history["1"].values()), [2])
+        self.assertEqual(sorted(level_history["1"].values()), [3])
 
     @dummy_worker_sessions
     def test_reviewer_cli_failure_does_not_escalate_worker(self):

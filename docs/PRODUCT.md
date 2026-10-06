@@ -147,9 +147,9 @@ ExecPlan 게시 실패:
 4. 전체 verify의 실패 지문 이력은 Review와 독립적으로 유지한다. 새로운 verify 지문이 나타나는 동안에는 총 실패 횟수와 관계없이 Worker 수정과 전체 검증을 계속한다
 5. 같은 verify 지문이 Worker 수정 후 세 번 다시 발생하면 구조화된 원인과 지문을 기록하고 ExecPlan을 `PLAN_BLOCKED`로 변경하며, 중간에 다른 지문이 발생해도 이전 이력을 유지한다. Review의 ISSUE_ID와 진단·해결 이력은 피드백과 감사에 보존하되 발생 횟수만으로 최종 차단하지 않는다
 6. 한 외부 실행에서 계획별 Review FAIL에 따른 Worker 교정은 최대 세 번 시작한다. 복수 issue는 한 교정으로 세며 CLI 재시도와 중단된 동일 turn의 복구는 중복 집계하지 않는다. 세 번째 교정의 verify·Review가 성공하면 게시를 계속하고, 추가 교정이 필요하면 Worker 호출 전에 phase·작업물·세션·피드백을 보존해 이번 실행을 일시 중단한다. 다음 외부 실행은 저장된 피드백과 세션으로 재개하며 이 중단은 BLOCKED·checkpoint·차단 알림을 만들지 않는다
-7. 유효한 Review FAIL이 같은 effective level에서 동일 지문으로 두 번 확인되거나 서로 다른 지문 세 개로 확인되면 다음 Worker 수정부터 level을 한 단계 올리며 level 8을 상한으로 한다
-8. 전체 verify 실패, Worker 결과 형식 오류, Reviewer 실행 오류와 유효한 FAIL이 없는 결과는 effective level과 Review 승격 이력을 변경하지 않는다
-9. 전체 검증 성공은 verify 지문 이력만, Review 성공은 Review 지문 이력만 초기화하며 effective level과 level별 승격 이력은 유지한다
+7. 각 effective level의 첫 유효 Review FAIL은 기준선이며 교정 결과에 포함하지 않는다. 이후 Review 피드백에 대한 Worker 교정 완료·전체 verify 통과·유효 Review FAIL이 결합된 결과만 집계한다. 기준선의 같은 ISSUE_ID가 두 교정 결과에 다시 나타나거나, issue가 달라도 교정 결과가 세 번 연속 FAIL이면 다음 Worker 호출부터 한 단계 올리며 level 8을 상한으로 한다. 복수 issue는 한 교정 결과로 센다. 새 level에서는 기준선을 다시 시작한다
+8. 교정 없는 Review 재실행, CLI·Reviewer 프로토콜 재시도, 중단된 동일 Worker turn 재개는 교정 결과를 늘리지 않는다. 전체 verify 실패, Worker 결과 형식 오류, Reviewer 실행 오류와 유효하지 않은 Review는 승격 집계에 포함하지 않고 진행 중인 집계도 초기화하지 않는다. 기준선·미완료 교정·검증 후보 identity와 effective level은 SQLite에 보존해 재시작과 같은 결과 재관측에서 중복 승격하지 않는다
+9. 전체 검증 성공은 verify 지문 이력만 초기화한다. 유효 Review PASS는 Review 지문 이력과 진행 중인 교정 집계를 끝내며 effective level과 과거 level별 승격·실패 감사는 유지한다
 
 과거 `review_retry_exhausted` 차단은 저장된 원인과 현재 작업 공간·branch·원격 OID·Agent 범위·PR·rebase 상태를 재확인한다. Review 횟수 외 유효한 차단이 없고 소유권이 확인되면 기존 세션·실패 피드백·감사를 보존한 채 같은 교정 경로로 재개한다. 안전 근거가 부족하거나 별도 차단 원인이 있으면 그 상태를 유지한다.
 
@@ -338,11 +338,11 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 
 - Planner가 ExecPlan의 complexity와 risk를 판단한다
 - 프로그램은 complexity를 low=1, medium=3, high=5로 환산한다
-- 프로그램은 risk를 low=0, medium=1, high=2, critical=3으로 환산한다
-- 두 점수의 합을 최대 7로 제한해 `level1`부터 `level7`까지의 Worker level로 사용한다
-- 정확한 Model 이름과 Effort는 `config/config.ini`에서 관리한다
-- 최초 Worker level 계산은 level 8을 반환하지 않는다
-- 유효한 Review FAIL의 저장된 반복 진행만 effective level을 한 단계씩 올릴 수 있으며 한 ExecPlan 안에서는 level을 낮추지 않는다
+- 프로그램은 risk를 low·medium·high=0, critical=1로 환산한다
+- 두 점수의 합으로 최초 Worker level 1~6을 선택한다. level 7·8은 완료한 Worker 교정 뒤의 Review 반복에 따른 승격으로만 도달한다
+- 선택 provider의 Worker level 1~8은 `config/config.ini`에 Model alias·Effort와 참조 alias의 실제 Model 이름을 모두 명시해야 한다. 누락·빈 값·잘못된 형식·CLI 미지원 조합은 Worker 시작 전 오류로 보고하며 코드·CLI 기본값이나 다른 profile로 보충하지 않는다. 예시 설정은 선택 규칙이나 fallback이 아니다
+- 실제 provider·Model·Effort는 설정대로 호출·기록한다. Model 또는 Effort가 바뀌면 기존 session 전이 정책을 따르고 작업물·검증 이력은 보존한다
+- 위 실패 정책의 완료한 교정 결과만 effective level을 한 단계씩 올릴 수 있으며 한 ExecPlan 안에서는 level을 낮추지 않는다. 과거 지문 횟수에서 교정 완료를 추정하지 않고, 관계를 확인할 수 없는 기존 기록은 다음 유효 Review부터 기준선을 시작한다
 - Codex와 Claude의 level 8도 `config/config.ini`에서 지정한 Model alias와 Effort를 사용하며 CLI가 지원하는 조합인지 검증한다. level 8보다 높은 자동 profile은 없다
 - effective level과 level별 Review 승격 이력은 SQLite에 저장하고 새 ExecPlan 또는 정상적인 BLOCKED 해제에서 최초 level로 초기화한다
 

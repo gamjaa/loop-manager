@@ -130,6 +130,7 @@ class ExecutionFixture:
         )
         self.effects.validation.verify.side_effect = lambda _: (self.calls.append('verify') or True, 'OK')
         self.effects.validation.parse_reviewer_result.return_value = ('PASS', ())
+        self.effects.validation.ensure_worker_level_state.return_value = 1
         self.effects.agent.run_agent_with_retries.side_effect = lambda call, session_id: call(session_id, False)
         self.effects.agent.run_agent.side_effect = self.agent
         self.effects.agent.resolve_worker_profile.return_value = lm.ResolvedProfile(

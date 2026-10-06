@@ -300,6 +300,8 @@ class ExecutionRetryPolicyTest(BoundedRecoveryFixture, unittest.TestCase):
         self.assertEqual(project["phase"], "WORKING")
         self.assertEqual(plan["status"], "IMPLEMENTING")
         self.assertEqual(len(json.loads(plan["review_failure_history"])), 4)
+        self.assertEqual(plan['effective_worker_level'], 2)
+        self.assertEqual(set(json.loads(plan['review_level_history'])), {'1'})
 
     @dummy_worker_sessions
     def test_review_issue_in_changing_sets_pauses_after_three_corrections(self):
@@ -358,3 +360,7 @@ class ExecutionRetryPolicyTest(BoundedRecoveryFixture, unittest.TestCase):
             sorted(record["occurrences"] for record in history.values()),
             [1, 1, 1, 1, 4],
         )
+        self.assertEqual(plan['effective_worker_level'], 2)
+        # The fourth result establishes the new level's baseline; it is not
+        # another failed correction at that level despite the shared issue.
+        self.assertEqual(sorted(json.loads(plan['review_level_history'])), ['1', '2'])

@@ -330,6 +330,7 @@ _ROW_VERSION_FIELDS = (
     "initial_worker_level",
     "effective_worker_level",
     "review_level_history",
+    "review_correction_state",
     "blocked_reason",
     "guidance_plan_hash",
     "blocked_fingerprint",
@@ -734,6 +735,7 @@ class DefinitionStateRepository:
             or str(row["verify_failure_history"] or "{}") != "{}"
             or str(row["review_failure_history"] or "{}") != "{}"
             or str(row["review_level_history"] or "{}") != "{}"
+            or str(row["review_correction_state"] or "{}") != "{}"
         )
 
     def apply(

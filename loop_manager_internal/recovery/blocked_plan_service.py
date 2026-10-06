@@ -65,6 +65,7 @@ def _requeue_blocked_execplan(
                     "initial_worker_level": initial_level,
                     "effective_worker_level": initial_level,
                     "review_level_history": "{}",
+                    "review_correction_state": "{}",
                     "worker_session_transition": None,
                     "worker_session_binding": (
                         plan["worker_session_binding"]
@@ -126,6 +127,7 @@ def _requeue_blocked_execplan(
                 "initial_worker_level": initial_level,
                 "effective_worker_level": initial_level,
                 "review_level_history": "{}",
+                "review_correction_state": "{}",
             },
             project_values=effects._clear_active_values(),
             enqueue=False,

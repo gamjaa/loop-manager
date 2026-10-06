@@ -161,10 +161,11 @@ def _external_run_id(connection: sqlite3.Connection) -> str | None:
 
 def pending_review_correction(
     connection: sqlite3.Connection, repo: str, plan_id: str, review_result: str | None,
+    *, source_id: int | None = None,
 ) -> int | None:
-    """Identify only the latest undischarged Review FAIL as Worker input."""
+    """Identify an undischarged Review FAIL, including a source retained across rebase."""
 
-    if not review_result:
+    if not review_result and source_id is None:
         return None
     recovery = connection.execute(
         "SELECT reason_code FROM recovery_records "
@@ -174,6 +175,13 @@ def pending_review_correction(
     if (recovery is not None
             and recovery["reason_code"] == RecoveryReason.WORKER_CORRECTION.value):
         return None
+    if not review_result:
+        row = connection.execute(
+            "SELECT id FROM validation_results WHERE repo = ? AND plan_id = ? "
+            "AND id = ? AND stage = 'review' AND classification IN ('failure', 'legacy_failure')",
+            (repo, plan_id, source_id),
+        ).fetchone()
+        return int(row['id']) if row is not None else None
     row = connection.execute(
         "SELECT id, stage, classification, raw_output FROM validation_results "
         "WHERE repo = ? AND plan_id = ? ORDER BY id DESC LIMIT 1",

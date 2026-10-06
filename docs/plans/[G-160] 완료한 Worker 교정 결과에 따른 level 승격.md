@@ -40,10 +40,22 @@ priority: high
 
 - [x] 2026-10-05 planning 기준 a049a76의 명세·원본·관련 테스트와 비종료 catalog에서 미충족 범위를 확인함. 구현·테스트 실행은 하지 않음.
 - [x] 2026-10-06 기준 029067f의 G-159 Merge 결과·PRODUCT·R-052와 관련 테스트를 대조해 기존 목표 안에 제품 규칙 정합성 조건을 보완함. 구현·테스트 실행은 하지 않음.
-- [ ] 구현 및 관련 targeted unit 검증
+- [x] 구현 및 관련 targeted unit 검증
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
 
 - 완료한 교정 identity·level별 기준선·중단 재관측의 원자 집계를 설계해야 하므로 complexity high다. 집계 오류는 여러 계획의 저장된 effective level·실제 profile 호출·session 전이를 잘못 승격시킬 수 있고 적용된 level을 자동으로 낮출 수 없어 risk high다. 원문·결합 identity·기존 이력을 보존해 새 집계를 교정·재검증하며 이미 발생한 호출 비용을 코드 rollback으로 복구한다고 가정하지 않는다. 최초 FAIL을 교정 실패로 소급 간주하지 않는다.
 - G-159 Merge(6c01d0e) 뒤에도 PRODUCT의 최초 level 설명에 이전 산식이 남아 있다. 별도 구현 계획을 만들지 않고 같은 R-052의 후속 G-160에서 이미 Merge된 산식과 새 승격 규칙을 함께 문서화한다. ID·sources·dependency와 원래 승격 목표는 보존한다.
+
+- 구현은 기존 ISSUE_ID 지문, 검증 원문 감사, Review 교정 예약과 profile/session 전이를 재사용한다. 호환 가능한 `exec_plans.review_correction_state` JSON 열에 현재 level의 기준선·완료 교정 집계·미완료 turn·verify 후보 HEAD를 저장하며, 기존 level별 지문 이력에서 완료 횟수를 소급 추정하지 않는다. `storage/review_correction_state.py`는 이 저장 경계만 담당한다.
+- Worker의 정상 결과와 VERIFYING 전이, 성공한 후보 verify와 검증 토큰, 유효 FAIL의 교정 소비와 level 갱신을 기존 중첩 transaction helper로 묶는다. 낡은 level 후보의 Review, CLI/프로토콜 재시도와 교정 없는 재관측은 승격하지 않는다. 기준선·교정의 원본 Review ID·검증 HEAD·결과 지문·적용 level을 감사에 보존하며 PASS는 진행 중인 집계만 끝낸다. 정상 사용자 차단 해제만 새 교정 상태도 초기화한다.
+- PRODUCT의 최초 12개 level 조합과 명시 설정·교정 후 승격 규칙을 반영했다. 기존 `scripts/verify.sh`는 unittest manifest 자동 탐색으로 변경된 unit test를 포함하므로 수정할 필요가 없다. Worker는 전체 verify를 실행하지 않았으며 Manager 검증·읽기 전용 Review·사용자 Merge는 남아 있다.
+
+- Manager verify 진단에서 공통 `update_project`의 commit 동작을 바꾼 영향으로 rebase 완료가 열린 외부 transaction을 거절하는 회귀를 확인했다. 기존 호출의 commit 의미를 유지하고 새 Worker·verify의 결합 저장에서만 `preserve_transaction=True`로 기존 transaction helper를 사용한다. 유효 Review의 level·후보 HEAD는 전이 인자로 전달해 임시 관측 상태 저장을 제거했다. 재현한 unit case, 관련 복구 경계와 원자 rollback을 targeted 검증하며 전체 verify 재실행은 Manager에 맡긴다.
+
+- Reviewer 교정: `review_result`가 rebase로 사라져도 source ID와 별개인 Worker 후보의 실제 level·완료 여부·검증 HEAD를 저장한다. 이 후보를 새 기준선에도 보존해 승격 직후 첫 검증된 FAIL을 해당 level의 기준선으로 집계하고, 교정 없는 낡은 후보 재관측은 계속 제외한다. 원격 checkpoint의 정상 차단 해제와 Review 이력 초기화 경계는 새 교정 상태도 같은 transaction에서 초기화한다. 승격→rebase→Worker→verify→Review 뒤 두 교정의 승격, 기존 집계가 있는 checkpoint 재개 뒤 첫 FAIL, 낡은 후보와 rollback 회귀를 targeted 검증했다. phase fixture도 유효한 초기 Worker level을 명시한다.
+
+- 2026-10-06 새 Worker 세션에서 관리 rebase 후 HEAD `f3c9028`의 base `f91f925` 대비 전체 diff와 최신 입력을 다시 대조했다. 두 Reviewer 피드백의 수정·회귀 테스트가 이미 반영돼 추가 코드 변경은 필요하지 않았다. `tests.test_review_profile_escalation` module과 Review phase 3개·checkpoint adoption 1개·Review retry policy 2개 unit case를 새로 실행해 총 20개가 통과했다. verify 호출은 unit fixture의 mock이며 실제 전체 verify는 Manager에 맡긴다.
+
+- 추가 Reviewer 교정: 유효 FAIL 전이에서 피드백 감사의 원본 Review ID를 다음 미완료 교정으로 함께 저장한다. rebase로 `review_result`가 사라지면 같은 계획의 저장된 FAIL identity를 확인해 기존 교정 예산 예약을 재사용한다. 완료한 turn의 verify 보정과 Worker 결과 형식 교정은 새 Review 교정으로 예약하지 않는다. 같은 level의 기준선→rebase→Worker→mock verify→FAIL을 두 번 반복해 승격·원본 ID 감사·예산 보존을 검증했다. 현재 후보에서 승격 module과 관련 phase·retry unit case 20개가 통과했고, 마지막 예약 조건 보완 뒤 직접 관련된 2개 case도 다시 통과했다. 전체 verify와 Review는 Manager에 맡긴다.

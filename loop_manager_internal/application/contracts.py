@@ -80,6 +80,7 @@ class WorkerLevelDecision:
     previous_level: int
     effective_level: int
     review_history: dict[str, dict[str, int]]
+    correction_state: dict | None = None
 
     @property
     def escalated(self) -> bool:

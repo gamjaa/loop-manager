@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from typing import Callable, Any, Mapping
 from loop_manager_internal.documents import document_drafts
 import sys
+from loop_manager_internal.storage import review_correction_state, runtime_state
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, RecoveryFailure, classify_exception
 from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind, LatestBaseCheckpoint
@@ -268,18 +269,23 @@ class VerifyHandler:
             self.ports.git(context.worktree, 'add', '-A')
             self.ports._commit_owned(context, worker_publication.commit_title)
             return self.ports._retry('전체 verify 중 허용된 변경을 commit했습니다. 새 후보를 다시 검증합니다.')
-        self.ports.clear_validation_failure_history(self.ports.identity.repo, 'verify')
-        self.ports.state.update_project(
-            self.ports.identity.repo,
-            validated_base_sha=context.active_sha,
-            verify_result=output,
-            verify_token=(
-                self.ports.snapshot()._definition_snapshot.verify_token(context.active_sha, candidate_head)
-                if self.ports.snapshot()._definition_snapshot is not None else None
-            ),
-            review_token=None,
-            publication_token=None,
-        )
+        with runtime_state._transaction(self.ports.state.connection):
+            review_correction_state.verified(
+                self.ports.state.connection, self.ports.identity.repo,
+                context.plan.plan_id, candidate_head,
+            )
+            self.ports.clear_validation_failure_history(self.ports.identity.repo, 'verify')
+            self.ports.state.update_project(
+                self.ports.identity.repo, preserve_transaction=True,
+                validated_base_sha=context.active_sha,
+                verify_result=output,
+                verify_token=(
+                    self.ports.snapshot()._definition_snapshot.verify_token(context.active_sha, candidate_head)
+                    if self.ports.snapshot()._definition_snapshot is not None else None
+                ),
+                review_token=None,
+                publication_token=None,
+            )
         self.ports.update_snapshot(_latest_verify_output=output)
         return self._finish_verified(context)
 

@@ -184,6 +184,7 @@ CREATE TABLE IF NOT EXISTS exec_plans (
     initial_worker_level INTEGER,
     effective_worker_level INTEGER,
     review_level_history TEXT NOT NULL DEFAULT '{}',
+    review_correction_state TEXT NOT NULL DEFAULT '{}',
     blocked_reason TEXT,
     guidance_plan_hash TEXT,
     workspace_owned INTEGER NOT NULL DEFAULT 0,
@@ -328,6 +329,7 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
         "initial_worker_level": "INTEGER",
         "effective_worker_level": "INTEGER",
         "review_level_history": "TEXT NOT NULL DEFAULT '{}'",
+        "review_correction_state": "TEXT NOT NULL DEFAULT '{}'",
         "blocked_reason": "TEXT",
         "guidance_plan_hash": "TEXT",
         "agent_role": "TEXT",
@@ -443,6 +445,7 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
         "verify_failure_history",
         "review_failure_history",
         "review_level_history",
+        "review_correction_state",
     ):
         if field in migrated_columns:
             evidence.append(f"{field} != '{{}}'")
