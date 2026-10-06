@@ -254,7 +254,8 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 - source와 dependency 변경은 같은 reconciliation 결과를 Requirement 판단 자격·입력 지문·READY 선택에 사용하고 priority 변경은 다음 선택부터 반영한다. complexity·risk 변경은 최초 Worker level을 다시 계산하되 실행 이력이 있는 계획의 effective level과 Review 승격 이력을 낮추지 않는다
 - 현재 path와 title은 compact catalog, 로그·알림과 이후 파일 조회에 사용하지만 기존 PR의 ExecPlan 링크는 최초 게시 SHA와 최초 active path를 계속 사용한다
 - 최초 또는 비교 가능한 전체 계획 성공 기준이 없거나, PRODUCT·활성 Requirement·ARCHITECTURE·AGENTS·사용자 active ExecPlan이 바뀌면 일반 Planner를 READY 선택보다 먼저 실행한다. 일반 Planner는 비종료 compact catalog와 미착수 READY snapshot으로 현재 식별 가능한 미충족 작업을 한 번에 계획한다
-- 문서·지침·active ExecPlan은 그대로이고 코드·테스트·설정만 바뀌면 수정 가능한 미착수 READY를 읽기 전용 점검 Planner가 먼저 확인한다. dependency 대기 READY도 포함하며 실행 이력·소유 증거가 있는 계획은 대상에서 제외한다. 대상이 없으면 일반 Planner가 전체 미충족 작업을 확인한다
+- 일반 Planner는 마지막으로 원격 적용한 성공 검토와 비교 가능한 경우 변경·삭제·rename과 현재 catalog부터 확인한다. 영향받은 명세 절·코드·테스트·계획과 dependency를 읽고 불확실하면 범위를 넓힌다. 비교 근거가 없거나 손상되면 활성 명세 전문을 확인하며, 매 변경 검토에서 무관한 문서 전문을 반복하지 않는다
+- 문서·지침·active ExecPlan은 그대로이고 코드·테스트·설정만 바뀌면 수정 가능한 미착수 READY를 읽기 전용 점검 Planner가 먼저 확인한다. dependency 대기 READY도 포함하며 실행 이력·소유 증거가 있는 계획은 대상에서 제외한다. 대상이 없으면 일반 Planner가 위 비교 기준에 따라 미충족 작업을 확인한다
 - 점검의 수정 불필요 결과는 같은 입력과 대상에서 재사용하고 일반 Planner 없이 기존 READY 선택을 이어간다. 수정 필요·판단 불확실은 근거와 대상을 일반 Planner에 인계한다. 점검 성공은 예정 작업의 유지 가능성만 확인하며 전체 계획·유지보수 성공 기준이나 프로젝트 완료를 확정하지 않는다
 - `docs/FUTURE_IDEAS.md`는 계획 입력 지문, 활성 Requirement와 프로젝트 완료 판정에서 제외하며 그 항목을 자동으로 Requirement 또는 ExecPlan으로 승격하지 않는다
 - MERGED ExecPlan은 Planner 입력에서 제외하며 프로그램만 ID 고유성, 의존성 충족과 감사 이력을 위해 관리한다
@@ -357,7 +358,8 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 
 ### 프로젝트 완료 조건
 
-- Planner가 현재 PRODUCT와 활성 Requirement에서 추가 ExecPlan이 필요 없다고 판단해야 한다
+- 입력 변경 검토가 끝나고 비종료 계획·실행·PR·draft·차단·planning 오류와 활성 또는 due 유지보수가 없는 완료 후보에서 일반 Planner가 최신 원격 PRODUCT(존재하면)·ARCHITECTURE와 남은 활성 Requirement 전문을 구현·테스트·검증 근거와 대조한다. 최근 diff 밖의 미충족 작업은 source에 연결된 후속 계획으로, 필수 사용자 결정은 draft로 남긴다
+- 최종 전문 확인의 입력 지문·관측 revision·게시 확인 revision·작업 주기와 결과를 변경 검토 및 Requirement별 판단과 별도로 보존한다. 동일한 유효 입력·주기의 성공은 재시작 뒤 재사용하며, 입력·작업 주기 변경이나 검토·게시 실패로 성공을 합성하지 않는다. 빠른 점검이나 변경 검토의 추가 계획 없음은 최종 확인을 대신하지 않는다
 - READY, IMPLEMENTING, VERIFYING, REVIEWING, PUBLISHING, PR_OPEN 또는 PLAN_BLOCKED 상태의 ExecPlan과 PROJECT_BLOCKED 레코드가 없어야 한다
 - due 또는 활성 유지보수 cycle과 해결되지 않은 유지보수 planning error가 없어야 하며, 실제 Merge·게시·catalog 확인에 결합된 cycle 종료 기준이 있어야 한다. 최신 코드와 평가 receipt의 차이만으로 추가 유지보수를 요구하지 않는다
 - 해결되지 않은 `planning_error`가 없어야 한다
@@ -366,7 +368,7 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 - 프로젝트 완료 알림은 프로젝트별로 관리한다
 - 새로운 PRODUCT/Requirement 변경으로 작업 주기가 시작되고 다시 완료되면 새 완료 알림을 전송한다
 - Requirement archive 이동만으로 완료 알림을 다시 활성화하지 않는다
-- 안정적인 작업 선택에서 Planner가 최신 입력에 추가 작업이 없음을 확인하고 활성 Requirement·비종료 ExecPlan·프로젝트 차단·planning error·활성 또는 due 유지보수 작업이 모두 없을 때만 완료로 판정한다
+- 안정적인 작업 선택에서 최신 입력의 성공한 최종 전문 확인과 활성 Requirement·비종료 ExecPlan·프로젝트 차단·planning error·활성 또는 due 유지보수 작업이 모두 없는 조건을 함께 만족할 때만 완료로 판정한다. 이 최종 확인은 유지보수 종료의 추가 조건이나 종료만을 이유로 한 Planner 호출로 사용하지 않는다
 - 시작 가능한 계획이 없지만 활성 Requirement 또는 비종료 ExecPlan이 남으면 계획별 dependency 상태, PR Merge 대기, 구조화된 차단 원인과 확인된 사용자 조치, 활성 Requirement의 대기 이유를 결과·로그에 남기고 별도 대기 사건으로 한 번 알린다
 - 실행 가능한 READY, 진행·복구 중인 단계, 일시 오류 대기에는 작업 소진 알림을 만들지 않으며, 기존 BLOCKED 사건만으로 설명되는 상태는 대기 알림을 중복 생성하지 않는다
 

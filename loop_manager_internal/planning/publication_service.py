@@ -278,6 +278,10 @@ class PlanningPublicationService(PlanningService):
                                 ),
                             )
                     else:
+                        if hasattr(self._ports.state, "confirm_planning_review"):
+                            self._ports.state.confirm_planning_review(
+                                context.repo, str(row.active_sha), str(row.active_sha),
+                            )
                         self._ports.state.clear_active_in_transaction(
                             context.repo,
                             processed_sha=row.active_sha,

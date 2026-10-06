@@ -18,6 +18,7 @@ from loop_manager_internal.maintenance.maintenance_orchestration import (
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanMode, MaintenancePlanningContext
 from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.storage import planning_input_state
+from loop_manager_internal.storage import planning_review_state
 from loop_manager_internal.planning import planning_runtime
 from loop_manager_internal.catalog.execplan_catalog import plan_content_hash
 from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventoryError
@@ -917,6 +918,26 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
         planning_input_state.record_general(connection, repo, "a" * 40, {})
         repository = maintenance_state.MaintenanceRepository(connection)
         cycle, _ = self._legacy_cycle(connection, repo, "a" * 40)
+
+        def record_final_review():
+            # The mocked project step skips Planner; arrange its confirmed receipt.
+            revision = "a" * 40
+            work_cycle = planning_review_state.work_cycle(connection, repo)
+            planning_review_state.begin(
+                connection, repo, purpose="final", revision=revision,
+                input_fingerprint="cycle-one", specification_fingerprint="spec-one",
+                work_cycle=work_cycle, comparison_revision=None,
+            )
+            result = "FINAL_SPECIFICATION_REVIEW: " + json.dumps({
+                "revision": revision, "input_fingerprint": "cycle-one",
+                "specification_fingerprint": "spec-one", "work_cycle": work_cycle,
+                "outcome": "fulfilled", "evidence": ["docs/PRODUCT.md", "src/app.py"],
+                "reason": "Full specifications and implementation reviewed",
+            })
+            planning_review_state.validate(connection, repo, revision, result, "fulfilled")
+            planning_review_state.confirm(connection, repo, revision, revision)
+
+        record_final_review()
         with mock.patch.object(loop_manager, "_run_project_step", return_value=0), mock.patch.object(
             loop_manager.notifications, "enqueue_completion_if_ready"
         ) as enqueue, mock.patch.object(
@@ -944,6 +965,19 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
                 expected_revision=cycle.revision,
                 remote_commit="a" * 40,
             )
+            # Maintenance closes independently and invalidates the earlier receipt.
+            result = loop_manager.run_project_result(
+                connection,
+                Path("/state"),
+                repo,
+                Path("/config.ini"),
+                None,
+                False,
+            )
+            self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+            enqueue.assert_not_called()
+
+            record_final_review()
             result = loop_manager.run_project_result(
                 connection,
                 Path("/state"),

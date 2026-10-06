@@ -7,7 +7,7 @@ from loop_manager_internal.application.contracts import ValidatedPlanningResult
 from loop_manager_internal.maintenance import maintenance_file_inventory
 from loop_manager_internal.maintenance import maintenance_file_publication
 from loop_manager_internal.storage import maintenance_state
-from loop_manager_internal.storage import runtime_state, planning_input_state, planner_check_state
+from loop_manager_internal.storage import runtime_state, planning_input_state, planner_check_state, planning_review_state
 from loop_manager_internal.storage.planning_publication_state import GeneralPlanningPublication
 from loop_manager_internal.planning.planning_workspace import legacy_release_identity
 from pathlib import Path
@@ -109,6 +109,43 @@ class _PlanningStatePorts:
 
     def general_baseline(self, repo: str) -> bool:
         return planning_input_state.has_baseline(self._connection, repo)
+
+    def planning_review(self, repo: str, slot: str):
+        if slot == "final":
+            return planning_review_state.current_final(self._connection, repo)
+        return planning_review_state.get(self._connection, repo, slot)
+
+    def review_work_cycle(self, repo: str) -> str:
+        return planning_review_state.work_cycle(self._connection, repo)
+
+    def review_validation_context(self, repo: str) -> str:
+        import json
+        return json.dumps(planning_review_state.validation_evidence(self._connection, repo), ensure_ascii=False)
+
+    def final_review_candidate(self, repo: str, interval: int, *, self_repository: bool = False) -> bool:
+        from loop_manager_internal.notifications import work_exhaustion
+        row = self.planning(repo)
+        schedule = self.schedule(repo)
+        cycle = self.maintenance_cycle(repo)
+        snapshot = work_exhaustion.collect(self._connection, repo, cycle="", active_requirements=())
+        return bool(snapshot is not None and snapshot.completed
+            and not schedule.project_blocked and schedule.active is None
+            and not schedule.has_ready and not schedule.has_waiting
+            and not row.planning_error and not row.planning_preserved_state
+            and cycle.phase is maintenance_state.MaintenancePhase.IDLE
+            and cycle.publication_stage is None and self.general_publication(repo) is None
+            and not self.maintenance_due(repo, interval, self_repository=self_repository).required)
+
+    def begin_planning_review(self, repo: str, **values) -> None:
+        with self.transaction():
+            planning_review_state.begin(self._connection, repo, **values)
+
+    def validate_planning_review(self, repo: str, revision: str, result: str, outcome: str) -> None:
+        with self.transaction():
+            planning_review_state.validate(self._connection, repo, revision, result, outcome)
+
+    def confirm_planning_review(self, repo: str, reviewed_revision: str, confirmed_revision: str) -> None:
+        planning_review_state.confirm(self._connection, repo, reviewed_revision, confirmed_revision)
 
     def planner_check(self, repo: str) -> sqlite3.Row | None:
         return planner_check_state.get(self._connection, repo)

@@ -1,9 +1,10 @@
 import sqlite3
+import json
 import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
-from loop_manager_internal.storage import planning_input_state
+from loop_manager_internal.storage import planning_input_state, planning_review_state
 from tests.support.git import git_command
 from tests.support.worker import dummy_worker_sessions
 
@@ -69,25 +70,104 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
             ))
         connection.close()
 
+    def final_receipt(self, connection, repo, revision, input_fingerprint="cycle-one", specification_fingerprint="spec-one"):
+        cycle = planning_review_state.work_cycle(connection, repo)
+        planning_review_state.begin(connection, repo, purpose="final", revision=revision,
+            input_fingerprint=input_fingerprint, specification_fingerprint=specification_fingerprint,
+            work_cycle=cycle, comparison_revision=None)
+        result = "FINAL_SPECIFICATION_REVIEW: " + json.dumps({
+            "revision": revision, "input_fingerprint": input_fingerprint,
+            "specification_fingerprint": specification_fingerprint, "work_cycle": cycle,
+            "outcome": "fulfilled", "evidence": ["docs/PRODUCT.md", "src/app.py"],
+            "reason": "Full specifications and implementation reviewed",
+        })
+        planning_review_state.validate(connection, repo, revision, result, "fulfilled")
+        planning_review_state.confirm(connection, repo, revision, revision)
+
+    def test_real_state_port_only_accepts_idle_unowned_completion_candidate(self):
+        from loop_manager_internal.planning.state_ports import _PlanningStatePorts
+        from loop_manager_internal.storage import runtime_state
+        from types import SimpleNamespace
+        connection, repo = self._connection()
+        self.addCleanup(connection.close)
+        connection.execute("UPDATE exec_plans SET status = 'MERGED' WHERE repo = ?", (repo,))
+        effects = SimpleNamespace(
+            catalog_schedule_decision=loop_manager.catalog_schedule_decision,
+            general_planning_publication=lambda *_args: None,
+        )
+        port = _PlanningStatePorts(effects, connection, runtime_state.RuntimeStateRepository(connection),
+            loop_manager.maintenance_state.MaintenanceRepository(connection), Path('/unused'))
+        self.assertTrue(port.final_review_candidate(repo, 5))
+        self.assertEqual(json.loads(port.review_validation_context(repo))[0]['plan_id'], 'G-018')
+        self.assertIsNone(json.loads(port.review_validation_context(repo))[0]['verify_result_sha256'])
+        connection.execute("UPDATE exec_plans SET status = 'READY' WHERE repo = ?", (repo,))
+        self.assertFalse(port.final_review_candidate(repo, 5))
+        connection.execute("UPDATE exec_plans SET status = 'MERGED' WHERE repo = ?", (repo,))
+        connection.execute("UPDATE projects SET planning_error = 'unresolved' WHERE repo = ?", (repo,))
+        self.assertFalse(port.final_review_candidate(repo, 5))
+        connection.execute("UPDATE projects SET planning_error = NULL WHERE repo = ?", (repo,))
+        self.assertFalse(port.final_review_candidate(repo, 1))  # Maintenance is due.
+        connection.execute("UPDATE maintenance_cycles SET phase = 'refactoring' WHERE repo = ?", (repo,))
+        self.assertFalse(port.final_review_candidate(repo, 5))
+
+    def test_final_receipt_is_required_and_bound_to_input_and_work_cycle(self):
+        connection, repo = self._connection()
+        self.addCleanup(connection.close)
+        connection.execute("UPDATE exec_plans SET status = 'MERGED' WHERE repo = ?", (repo,))
+        with (mock.patch("loop_manager.git") as command,
+              mock.patch("loop_manager._planning_input_fingerprint", return_value="cycle-one"),
+              mock.patch("loop_manager._specification_input_fingerprint", return_value="spec-one"),
+              mock.patch("loop_manager.plan_declarations", return_value={}),
+              mock.patch("loop_manager._git_tree_entries", return_value={})):
+            command.return_value.stdout = "base-sha\n"
+            check = lambda: loop_manager._stable_work_reason(connection, repo, refactoring_review_interval=5)
+            self.assertIsNone(check())  # Ordinary planning no-change is insufficient.
+            self.final_receipt(connection, repo, "base-sha")
+            self.assertTrue(check().completed)
+            for _ in range(2):
+                self.assertTrue(check().completed)
+            connection.execute("UPDATE planning_reviews SET result = NULL WHERE slot = 'final'")
+            self.assertIsNone(check())
+            self.final_receipt(connection, repo, "base-sha")
+            connection.execute("UPDATE planning_reviews SET input_fingerprint = 'stale' WHERE slot = 'final'")
+            self.assertIsNone(check())
+            self.final_receipt(connection, repo, "base-sha")
+            connection.execute("UPDATE exec_plans SET verify_token = 'different-candidate' WHERE repo = ?", (repo,))
+            self.assertIsNone(check())
+            self.final_receipt(connection, repo, "base-sha")
+            connection.execute("UPDATE maintenance_cycles SET revision = revision + 1 WHERE repo = ?", (repo,))
+            self.assertIsNone(check())
+
     def test_dual_archive_completion_requires_verified_plan_baseline(self):
+        self._assert_archive_completion(include_requirement=True)
+
+    def test_execplan_archive_completion_requires_verified_plan_baseline(self):
+        self._assert_archive_completion(include_requirement=False)
+
+    def _assert_archive_completion(self, *, include_requirement):
         connection, repo = self._connection()
         self.addCleanup(connection.close)
         plan = "docs/plans/[G-018] Work.md"
         previous = {
-            b"docs/requirements/R.md": (b"blob", b"requirement"),
             plan.encode(): (b"blob", b"plan"),
         }
         current = {
-            b"docs/requirements/archive/R.md": (b"blob", b"requirement"),
             b"docs/plans/archive/[G-018] Work.md": (b"blob", b"plan"),
         }
+        if include_requirement:
+            previous[b"docs/requirements/R.md"] = (b"blob", b"requirement")
+            current[b"docs/requirements/archive/R.md"] = (b"blob", b"requirement")
         connection.execute("UPDATE projects SET processed_sha = 'old-base' WHERE repo = ?", (repo,))
         connection.execute("UPDATE exec_plans SET status = 'MERGED' WHERE repo = ?", (repo,))
         planning_input_state.record_general(connection, repo, "old-base", {plan: ("blob", "plan")})
+        self.final_receipt(connection, repo, "old-base")
         with mock.patch("loop_manager.git") as command, mock.patch(
             "loop_manager._planning_input_fingerprint", return_value="archived-full"
         ), mock.patch(
-            "loop_manager._specification_input_fingerprint", return_value="archived-spec"
+            "loop_manager._specification_input_fingerprint",
+            return_value="archived-spec" if include_requirement else "spec-one",
+        ), mock.patch(
+            "loop_manager._nonplan_input_fingerprint", return_value="unchanged-code"
         ), mock.patch(
             "loop_manager._git_tree_entries",
             side_effect=lambda _repo, sha: previous if sha == "old-base" else current,
@@ -105,6 +185,11 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
                 )
                 self.assertIsNotNone(result)
                 self.assertTrue(result.completed)
+                self.assertEqual(result.cycle, "cycle-one")
+            current[b"docs/plans/archive/[G-018] Work.md"] = (b"blob", b"edited")
+            self.assertIsNone(loop_manager._stable_work_reason(
+                connection, repo, refactoring_review_interval=5,
+            ))
 
     def test_legacy_processed_sha_cannot_confirm_unreviewed_plan(self):
         connection, repo = self._connection()

@@ -37,7 +37,7 @@ def planner_prompt(
     )
     return f"""
 당신은 Loop Manager의 Planner다.
-AGENTS.md, 활성 PRODUCT와 Requirement, docs/ARCHITECTURE.md, docs/PLANS.md 및 현재 코드·테스트를 읽어라.
+AGENTS.md와 docs/PLANS.md의 공통 경계를 지켜라. 제공된 검토 목적과 원격 비교 기준에 따라 변경·catalog부터 확인하고 필요한 명세·코드·테스트 문맥을 읽어라. 최초 또는 유효 비교 기준이 없으면 활성 PRODUCT·Requirement·ARCHITECTURE 전문을 확인하라.
 {AGENT_QUALITY_GUIDANCE}
 {EXECPLAN_AUTHORING_GUIDANCE}
 아래 compact catalog는 SQLite의 비종료 ExecPlan만 코드로 직렬화한 것이다. MERGED 계획은 제외됐다.
@@ -46,7 +46,7 @@ AGENTS.md, 활성 PRODUCT와 Requirement, docs/ARCHITECTURE.md, docs/PLANS.md �
 아래 mutable READY snapshot은 SQLite와 planning 기준 commit에 결합돼 있다. token과 각 ID/path/revision을 변경 권한의 경계로 사용하라.
 {snapshot.prompt_payload()}
 
-현재 입력에서 식별 가능한 미충족 작업 전체를 독립적으로 검증·Merge 가능한 ExecPlan들로 나누어 한 번에 작성하라.
+선택된 검토 범위에서 식별한 미충족 작업을 독립적으로 검증·Merge 가능한 ExecPlan들로 나누어 한 번에 작성하라. 변경 검토의 추가 계획 없음과 프로젝트 최종 전문 확인을 구분하라.
 catalog가 이미 충족하는 작업이나 코드·테스트에 이미 구현된 작업은 중복 계획하지 마라.
 catalog에서 현재 입력과 겹치는 비종료 계획만 필요할 때 전문을 읽고, 기존 docs/plans 전체를 기본 입력으로 읽지 마라.
 새 ExecPlan마다 priority를 기록하라. mutable READY snapshot의 계획은 같은 ID를 보존한 채 필요하면 본문·metadata를 수정하거나 title에 맞게 rename하거나 삭제할 수 있다.

@@ -239,4 +239,15 @@ def _stable_work_reason(
         connection, repo, cycle=str(row["planning_fingerprint"]),
         active_requirements=active_requirements,
     )
-    return None if snapshot is not None and snapshot.completed and row["phase"] else snapshot
+    if snapshot is not None and snapshot.completed:
+        from loop_manager_internal.storage import planning_review_state
+        from loop_manager_internal.planning.specification_review import current_receipt
+        if row["phase"] or not current_receipt(
+            planning_review_state.current_final(connection, repo),
+            repo=repo_path, revision=base_sha, input_fingerprint=current_input,
+            specification_fingerprint=current_specification,
+            work_cycle=planning_review_state.work_cycle(connection, repo),
+            archive_only=effects._is_requirement_archive_only_change,
+        ):
+            return None
+    return snapshot

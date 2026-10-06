@@ -39,10 +39,17 @@ priority: critical
 
 - [x] 2026-10-05 planning 기준 a049a76의 명세·원본·관련 테스트와 비종료 catalog에서 미충족 범위를 확인함. 구현·테스트 실행은 하지 않음.
 - [x] 2026-10-06 b8ac37e의 G-176 Merge와 PRODUCT 변경을 확인하고 유지보수 종료와 프로젝트 최종 확인의 서로 다른 조건을 명확히 함.
-- [ ] 구현 및 관련 targeted unit 검증
+- [x] 2026-10-06 변경 비교·최종 전문 확인의 입력/결과 저장, 완료 gate와 게시 transaction 연결 및 관련 targeted unit 검증을 구현함.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
 
 - 성공 기준선·역할 선택·완료 gate가 연결되어 complexity high, 누락된 목표의 조기 완료 영향으로 risk high다.
 - G-176의 단일 평가·확정 범위 종료를 유지한다. R-057의 최종 전문 확인은 프로젝트 완료 판단에만 결합하며 유지보수 주기를 다시 열거나 사후 재검증을 복원하지 않는다.
+- 검토 문맥·결과 검증은 `planning/specification_review.py`, 원격 적용 전 attempt와 성공 기준선·최종 receipt는 `storage/planning_review_state.py`로 분리했다. 기존 입력 지문·역할 선택·mutable snapshot·Requirement judgment·게시 복구 helper를 재사용하며 루트 항목을 추가·이동하지 않는다.
+- 최초/비교 실패는 전문 검토, 비교 가능한 일반 호출은 delta 검토를 한다. 변경 검토·Requirement 판단 게시 후 입력과 catalog가 안정적인 완료 후보에서만 별도 최종 확인을 선택한다. 최종 확인에는 원격 입력 identity, 모든 활성 명세와 구현·검증 파일 근거 및 fulfilled/followup/needs_decision 결과를 요구한다. 후속 계획·draft의 source·기존 권한·사용자 결정 경계를 유지한다.
+- 성공 근거는 기존 원격 확인·SQLite 원자 적용 transaction에서만 확정한다. 최종 확인 도중 base 전진·불완전한 결과·게시/적용 실패는 성공을 전진시키지 않는다. 새 일반 검토 성공과 실제 Merge 수·유지보수 revision·저장된 후보/verify/review identity 변경은 오래된 최종 완료 근거를 무효화하며 이력은 보존한다. 최종 Planner에 검증 identity를 전달하고 누락·오래된 근거를 성공으로 합성하지 않도록 명시한다.
+- `docs/PRODUCT.md`의 일반 planning·프로젝트 완료 장기 규칙을 구현과 맞췄다. Requirement·ARCHITECTURE·PLANS·AGENTS와 사용자 결정은 수정하지 않았다. 기존 Linux `scripts/verify.sh`는 전체 검증 runner를 실행하고 실패 코드를 반환하므로 변경 없이 유지했다.
+- 검증: `SpecificationReviewSelectionTest` 9개와 완료 지문·archive·원격 게시 원자 적용 unit case 3개, 실제 state port 완료 후보 및 기존 DB의 additive schema 적용 unit case 각 1개를 통과했다. 첫 실행의 fixture 비교 지문·transaction 설정 오류를 교정한 뒤 같은 명령으로 재실행했다. 전체 verify·Review·사용자 Merge는 Manager의 후속 단계다.
+- Manager verify가 지적한 유지보수 완료 통지 unit case의 fixture를 최종 확인 계약에 맞췄다. Planner 실행을 mock한 경계에서 확인된 receipt를 준비하고, 활성 유지보수의 통지 차단·최종 확인 없이 가능한 cycle 종료·종료 후 오래된 receipt의 통지 차단·새 receipt 후 완료 통지를 검증한다. 해당 단일 case를 재현한 뒤 같은 명령으로 재실행해 통과했으며 제품 완료 gate는 변경하지 않았다.
+- Review의 `merged-plan-archive-reuse` 지적을 반영해 기존 archive 판별 helper와 Git port에 최종 receipt 재사용 전용 ExecPlan 단독 이동 허용을 추가했다. 호출자는 기존의 검증된 선언 대응표를 먼저 확인하며, 작업 주기와 정확한 내용 보존 이동 조건을 유지한다. 복구 등 기존 호출의 기본 판별 범위는 그대로다. 단독 이동의 Planner 미호출·재시작 재사용·완료 cycle 유지와 미검증 선언·archive 내용 변경·코드/명세 변경·새 작업 주기의 재검토를 검증했으며, 단독/동반 archive 완료와 선택 경계의 targeted unit case 3개를 통과했다.

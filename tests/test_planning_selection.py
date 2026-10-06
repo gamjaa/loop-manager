@@ -1853,3 +1853,325 @@ class PlanningReleaseGitTest(unittest.TestCase):
         self.assertFalse(port.planning_release_pending('/other'))
         connection.execute("UPDATE agent_invocations SET finished_at = 'time'")
         self.assertFalse(port.planning_release_pending('/repo'))
+
+
+class SpecificationReviewSelectionTest(PlanningCase):
+    """Exercise real receipt storage through the existing lifecycle test ports."""
+
+    def review_ports(self, snapshot=None):
+        from loop_manager_internal.storage import planning_review_state as reviews
+        connection = sqlite3.connect(':memory:')
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        ports = FakePorts(snapshot or planning_snapshot())
+        ports.review_connection = connection
+        ports.state.planning_review = lambda repo, slot: reviews.current_final(connection, repo) if slot == 'final' else reviews.get(connection, repo, slot)
+        ports.state.review_work_cycle = lambda _repo: f'cycle-{ports.state.cycle.revision}'
+        ports.state.final_review_candidate = lambda _repo, _interval, **_kwargs: not (
+            ports.state.schedule_result.active or ports.state.schedule_result.has_ready
+            or ports.state.schedule_result.has_waiting or ports.state.schedule_result.project_blocked
+            or ports.state.snapshot.planning_error or ports.state.snapshot.planning_preserved_state
+            or ports.state.cycle.phase is not maintenance_state.MaintenancePhase.IDLE
+            or ports.state.general_intent or ports.state.maintenance_due_required)
+        def begin(repo, **values):
+            with connection:
+                reviews.begin(connection, repo, **values)
+        def validate(*args):
+            with connection:
+                reviews.validate(connection, *args)
+        ports.state.begin_planning_review = begin
+        ports.state.validate_planning_review = validate
+        ports.state.confirm_planning_review = lambda *args: reviews.confirm(connection, *args)
+        old_transaction = ports.state.transaction
+        @contextmanager
+        def transaction():
+            with old_transaction(), connection:
+                yield
+        ports.state.transaction = transaction
+        ports.validation.result = None
+        original_git = ports.git.run
+        def run(repo, *args, **kwargs):
+            if args[:3] == ('ls-tree', '-r', '-z'):
+                paths = args[args.index('--') + 1:]
+                return SimpleNamespace(stdout=''.join(f'100644 blob oid\t{path}\0' for path in paths if path in self.evidence), returncode=0)
+            if args[:4] == ('ls-tree', '-r', '--name-only', '-z'):
+                return SimpleNamespace(stdout='docs/PRODUCT.md\0docs/ARCHITECTURE.md\0', returncode=0)
+            return original_git(repo, *args, **kwargs)
+        ports.git.run = run
+        original_agent = ports.agent.run_planner
+        def agent(*args, **kwargs):
+            attempt = ports.state.planning_review('/repo', 'attempt')
+            if attempt is not None and attempt['purpose'] == 'final':
+                ports.agent.result = replace(ports.agent.result, message=self.final_result(attempt))
+            return original_agent(*args, **kwargs)
+        ports.agent.run_planner = agent
+        return ports
+
+    evidence = ('docs/PRODUCT.md', 'docs/ARCHITECTURE.md', 'src/app.py', 'tests/test_app.py')
+
+    def final_result(self, attempt, **changes):
+        result = {key: attempt[key] for key in (
+            'revision', 'input_fingerprint', 'specification_fingerprint', 'work_cycle')}
+        result.update(outcome='fulfilled', evidence=list(self.evidence), reason='All rules have implementation and unit coverage')
+        result.update(changes)
+        return 'FINAL_SPECIFICATION_REVIEW: ' + json.dumps(result)
+
+    def record(self, ports, purpose='delta', outcome='reviewed', revision='old-base', result='reviewed changes'):
+        from loop_manager_internal.storage import planning_review_state as reviews
+        reviews.begin(ports.review_connection, '/repo', purpose=purpose, revision=revision,
+            input_fingerprint=ports.git.input_fingerprint(Path('/repo'), revision),
+            specification_fingerprint=ports.git.specification_fingerprint(Path('/repo'), revision),
+            work_cycle=ports.state.review_work_cycle('/repo'), comparison_revision=None)
+        if purpose == 'final':
+            result = self.final_result(ports.state.planning_review('/repo', 'attempt'), outcome=outcome)
+        reviews.validate(ports.review_connection, '/repo', revision, result, outcome)
+        reviews.confirm(ports.review_connection, '/repo', revision, revision)
+        ports.review_connection.commit()
+
+    def test_initial_then_final_then_restart_reuses_receipt(self):
+        ports = self.review_ports()
+        coordinator = PlanningLifecycleCoordinator(ports)
+        self.assertEqual(coordinator.run(self.context).kind, PlanningOutcomeKind.NO_CHANGE)
+        self.assertIn('활성 Requirement 전문', ports.agent.prompts[0])
+        self.assertEqual(ports.state.planning_review('/repo', 'general')['purpose'], 'full')
+        self.assertIsNone(ports.state.planning_review('/repo', 'final'))
+        self.assertEqual(PlanningLifecycleCoordinator(ports).run(self.context).kind, PlanningOutcomeKind.NO_CHANGE)
+        self.assertIn('최종 전문 확인', ports.agent.prompts[1])
+        self.assertEqual(ports.state.planning_review('/repo', 'final')['outcome'], 'fulfilled')
+        for _ in range(2):
+            self.assertEqual(PlanningLifecycleCoordinator(ports).run(self.context).kind, PlanningOutcomeKind.FINGERPRINT_SKIPPED)
+        self.assertEqual(ports.agent.run_count, 2)
+        ports.state.cycle = replace(ports.state.cycle, revision=1)
+        PlanningLifecycleCoordinator(ports).run(self.context)
+        self.assertEqual(ports.agent.run_count, 3)
+
+    def test_merged_plan_archive_reuses_final_receipt_without_planner(self):
+        from loop_manager_internal.planning.git_ports import _PlanningGitPorts
+        plan = b'docs/plans/[G-001] Done.md'
+        archived = b'docs/plans/archive/[G-001] Done.md'
+        previous = {plan: (b'blob', b'plan')}
+        for change in ('verified', 'unverified', 'archive-edit', 'code', 'specification', 'cycle'):
+            with self.subTest(change=change):
+                current = {archived: previous[plan]}
+                if change == 'archive-edit':
+                    current[archived] = (b'blob', b'edited')
+                elif change == 'code':
+                    current[b'src/app.py'] = (b'blob', b'new-code')
+                elif change == 'specification':
+                    current[b'docs/PRODUCT.md'] = (b'blob', b'new-specification')
+                ports = self.review_ports(planning_snapshot(
+                    processed_sha='old-base', planning_fingerprint='old-full',
+                    specification_fingerprint='specification',
+                ))
+                ports.git.fingerprints = {'old-base': 'old-full', 'base': 'archived-full'}
+                ports.git.nonplan_fingerprints = {'old-base': 'same-code', 'base': 'same-code'}
+                ports.git.specification_fingerprints['old-base'] = 'specification'
+                effects = IsRequirementArchiveOnlyChangeEffects(
+                    _git_tree_entries=lambda _repo, sha: previous if sha == 'old-base' else current,
+                    _is_planning_input=loop_manager._is_planning_input,
+                )
+                # Exercise the real Git port's forwarding and the archive classifier.
+                git_port = _PlanningGitPorts(SimpleNamespace(
+                    _is_requirement_archive_only_change=lambda *args, **kwargs: (
+                        _is_requirement_archive_only_change(effects, *args, **kwargs)),
+                    git=mock.Mock(), _nul_git_paths=mock.Mock(),
+                ), ports.review_connection, Path('/repo'), Path('/state'))
+                ports.git.requirement_archive_only = git_port.requirement_archive_only
+                if change == 'verified':
+                    self.assertFalse(git_port.requirement_archive_only(
+                        Path('/repo'), 'old-base', 'base', verified_plan_declarations=True))
+                    self.assertFalse(git_port.requirement_archive_only(
+                        Path('/repo'), 'old-base', 'base', allow_execplan_only=True))
+                planning_input_state.record_general(
+                    ports.review_connection, '/repo', 'old-base', {plan.decode(): ('blob', 'plan')},
+                )
+                if change != 'unverified':
+                    planning_input_state.advance_verified_delta(
+                        ports.review_connection, '/repo', 'base', {plan.decode(): (('blob', 'plan'), None)},
+                    )
+                ports.state.plan_declarations_match = lambda repo, entries: planning_input_state.matches(
+                    ports.review_connection, repo, entries)
+                self.record(ports, purpose='final', outcome='fulfilled')
+                if change == 'cycle':
+                    ports.state.cycle = replace(ports.state.cycle, revision=1)
+                if change == 'verified':
+                    for _ in range(2):
+                        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+                        self.assertEqual(outcome.kind, PlanningOutcomeKind.FINGERPRINT_SKIPPED)
+                    self.assertEqual(ports.agent.run_count, 0)
+                    self.assertEqual(ports.state.snapshot.planning_fingerprint, 'old-full')
+                    self.assertEqual(ports.state.planning_review('/repo', 'final')['revision'], 'old-base')
+                else:
+                    PlanningLifecycleCoordinator(ports).run(self.context)
+                    self.assertEqual(ports.agent.run_count, 1)
+
+    def test_final_attempt_rebases_with_its_purpose_and_invalid_result_retries(self):
+        from loop_manager_internal.planning.specification_review import prepare_review
+        ports = self.review_ports(planning_snapshot(processed_sha='base',
+            planning_fingerprint='fingerprint', specification_fingerprint='fingerprint'))
+        instruction, first = prepare_review(ports.state, ports.git, self.context, 'base', final_required=True)
+        instruction, resumed = prepare_review(ports.state, ports.git, self.context, 'advanced', final_required=False)
+        self.assertEqual(resumed['purpose'], 'final')
+        self.assertEqual(resumed['revision'], 'advanced')
+        self.assertIn('최종 전문 확인', instruction)
+        ports.state.begin_planning_review('/repo', purpose='final', revision='base',
+            input_fingerprint='fingerprint', specification_fingerprint='fingerprint',
+            work_cycle='cycle-0', comparison_revision=None)
+        original_agent = ports.agent.run_planner
+        call_count = 0
+        def agent(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            result = original_agent(*args, **kwargs)
+            return replace(result, message='missing full review') if call_count == 1 else result
+        ports.agent.run_planner = agent
+        self.assertEqual(PlanningLifecycleCoordinator(ports).run(self.context).kind, PlanningOutcomeKind.VALIDATION_RETRY)
+        self.assertIsNone(ports.state.planning_review('/repo', 'final'))
+        self.assertEqual(PlanningLifecycleCoordinator(ports).run(self.context).kind, PlanningOutcomeKind.NO_CHANGE)
+        self.assertEqual(ports.agent.resumed_session, 'session-1')
+        self.assertEqual(ports.state.planning_review('/repo', 'final')['outcome'], 'fulfilled')
+
+    def test_later_general_success_revokes_old_final_without_erasing_evidence(self):
+        from loop_manager_internal.storage import planning_review_state as reviews
+        ports = self.review_ports()
+        self.record(ports, purpose='final', outcome='fulfilled', revision='base')
+        self.assertIsNotNone(ports.state.planning_review('/repo', 'final'))
+        self.record(ports, purpose='delta', revision='changed')
+        self.assertIsNone(ports.state.planning_review('/repo', 'final'))
+        self.assertEqual(reviews.get(ports.review_connection, '/repo', 'final')['outcome'], 'fulfilled')
+
+    def test_delta_reads_deletion_rename_and_catalog_without_full_scan(self):
+        ports = self.review_ports(planning_snapshot(processed_sha='old-base',
+            planning_fingerprint='old-input', specification_fingerprint='old-spec'))
+        ports.git.fingerprints['old-base'] = 'old-input'
+        ports.git.nonplan_fingerprints['old-base'] = 'old-input'
+        ports.git.specification_fingerprints['old-base'] = 'old-spec'
+        self.record(ports)
+        ports.git.diff_name_status = 'D\0docs/requirements/A.md\0R100\0src/old.py\0src/new.py\0M\0docs/PRODUCT.md\0'
+        ports.state.schedule_result.has_waiting = True
+        PlanningLifecycleCoordinator(ports).run(self.context)
+        self.assertEqual(ports.state.planning_review('/repo', 'general')['purpose'], 'delta')
+        self.assertIn('docs/requirements/A.md', ports.agent.prompts[0])
+        self.assertIn('src/old.py', ports.agent.prompts[0])
+        self.assertIn('dependency', ports.agent.prompts[0])
+        self.assertNotIn('활성 Requirement 전문을 읽고', ports.agent.prompts[0])
+        PlanningLifecycleCoordinator(ports).run(self.context)
+        self.assertEqual(ports.agent.run_count, 1)
+
+    def test_missing_corrupt_or_unreadable_comparison_uses_full_review(self):
+        for fault in ('missing', 'fingerprint', 'ancestry', 'diff'):
+            with self.subTest(fault=fault):
+                ports = self.review_ports(planning_snapshot(processed_sha='old-base', planning_fingerprint='old-input'))
+                ports.state.schedule_result.has_waiting = True
+                ports.git.fingerprints['old-base'] = 'old-input'
+                ports.git.nonplan_fingerprints['old-base'] = 'old-input'
+                if fault != 'missing':
+                    self.record(ports)
+                if fault == 'fingerprint':
+                    ports.git.fingerprints['old-base'] = 'corrupted'
+                elif fault == 'ancestry':
+                    ports.git.ancestor = False
+                elif fault == 'diff':
+                    original = ports.git.run
+                    def unreadable(repo, *args, **kwargs):
+                        if args[:2] == ('diff', '--name-status'):
+                            raise RuntimeError('comparison unavailable')
+                        return original(repo, *args, **kwargs)
+                    ports.git.run = unreadable
+                PlanningLifecycleCoordinator(ports).run(self.context)
+                self.assertEqual(ports.state.planning_review('/repo', 'general')['purpose'], 'full')
+                self.assertIn('활성 Requirement 전문', ports.agent.prompts[0])
+
+    def test_waiting_catalog_active_and_maintenance_do_not_trigger_final(self):
+        for gate in ('ready', 'draft-or-pr', 'active', 'blocked', 'maintenance', 'due'):
+            with self.subTest(gate=gate):
+                ports = self.review_ports(planning_snapshot(processed_sha='base',
+                    planning_fingerprint='fingerprint', specification_fingerprint='fingerprint'))
+                if gate == 'ready':
+                    ports.state.schedule_result.has_ready = True
+                elif gate == 'draft-or-pr':
+                    ports.state.schedule_result.has_waiting = True
+                elif gate == 'active':
+                    ports.state.snapshot = replace(ports.state.snapshot, phase='WORKING')
+                    ports.state.schedule_result.active = object()
+                elif gate == 'blocked':
+                    ports.state.schedule_result.project_blocked = True
+                elif gate == 'maintenance':
+                    ports.state.cycle = replace(ports.state.cycle, phase=maintenance_state.MaintenancePhase.REFACTORING)
+                else:
+                    ports.state.maintenance_due_required = True
+                PlanningLifecycleCoordinator(ports).run(self.context)
+                self.assertEqual(ports.agent.run_count, 0)
+                self.assertIsNone(ports.state.planning_review('/repo', 'final'))
+
+    def test_final_remote_race_and_cleanup_failure_do_not_confirm(self):
+        for fault in ('remote', 'cleanup'):
+            with self.subTest(fault=fault):
+                ports = self.review_ports(planning_snapshot(processed_sha='base',
+                    planning_fingerprint='fingerprint', specification_fingerprint='fingerprint'))
+                original_agent = ports.agent.run_planner
+                def agent(*args, **kwargs):
+                    result = original_agent(*args, **kwargs)
+                    if fault == 'remote':
+                        ports.git.remote = 'advanced'
+                    else:
+                        ports.git.remove_error = RuntimeError('cleanup failed')
+                    return result
+                ports.agent.run_planner = agent
+                outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+                self.assertTrue(outcome.error)
+                self.assertIsNone(ports.state.planning_review('/repo', 'final'))
+                self.assertIsNotNone(ports.state.planning_review('/repo', 'attempt'))
+
+    def test_final_followup_and_decision_require_matching_plans(self):
+        from loop_manager_internal.planning.specification_review import validate_final
+        ports = self.review_ports()
+        ports.state.begin_planning_review('/repo', purpose='final', revision='base',
+            input_fingerprint='fingerprint', specification_fingerprint='fingerprint',
+            work_cycle='cycle-0', comparison_revision=None)
+        attempt = ports.state.planning_review('/repo', 'attempt')
+        batch = SimpleNamespace(plans=(('docs/plans/G.md', {'id': 'G-001', 'sources': ['docs/PRODUCT.md']}),),
+            revisions=(), deletions=(), restoration_moves=())
+        self.assertEqual(validate_final(attempt, self.final_result(attempt, outcome='followup'), batch,
+            ports.git, Path('/repo')), 'followup')
+        with self.assertRaises(PlanningResultInvalid):
+            validate_final(attempt, self.final_result(attempt, outcome='needs_decision'), batch, ports.git, Path('/repo'))
+        batch.plans[0][1]['draft'] = True
+        self.assertEqual(validate_final(attempt, self.final_result(attempt, outcome='needs_decision'), batch,
+            ports.git, Path('/repo')), 'needs_decision')
+        for output in ('', self.final_result(attempt, outcome='followup'),
+                       self.final_result(attempt, revision='other'),
+                       self.final_result(attempt, evidence=['src/app.py']),
+                       self.final_result(attempt, evidence=['docs/PRODUCT.md', 'docs/ARCHITECTURE.md']),
+                       self.final_result(attempt, evidence=[*self.evidence, '../secret']),
+                       self.final_result(attempt) + '\n' + self.final_result(attempt)):
+            with self.subTest(output=output), self.assertRaises(PlanningResultInvalid):
+                validate_final(attempt, output, None, ports.git, Path('/repo'))
+        with self.assertRaises(PlanningResultInvalid):
+            validate_final(attempt, self.final_result(attempt), batch, ports.git, Path('/repo'))
+
+    def test_final_review_without_product_uses_requirements_and_rejects_symlink_evidence(self):
+        from loop_manager_internal.planning.specification_review import validate_final
+        ports = self.review_ports()
+        source = 'docs/requirements/Only.md'
+        self.evidence = (*self.evidence, source)
+        ports.state.begin_planning_review('/repo', purpose='final', revision='base',
+            input_fingerprint='fingerprint', specification_fingerprint='fingerprint',
+            work_cycle='cycle-0', comparison_revision=None)
+        attempt = ports.state.planning_review('/repo', 'attempt')
+        output = self.final_result(attempt, evidence=['docs/ARCHITECTURE.md', source, 'src/app.py'])
+        original = ports.git.run
+        def without_product(repo, *args, **kwargs):
+            if args[:4] == ('ls-tree', '-r', '--name-only', '-z'):
+                return SimpleNamespace(stdout='docs/ARCHITECTURE.md\0' + source + '\0', returncode=0)
+            return original(repo, *args, **kwargs)
+        ports.git.run = without_product
+        self.assertEqual(validate_final(attempt, output, None, ports.git, Path('/repo')), 'fulfilled')
+        def symlink(repo, *args, **kwargs):
+            result = without_product(repo, *args, **kwargs)
+            if args[:3] == ('ls-tree', '-r', '-z'):
+                result.stdout = result.stdout.replace('100644 blob oid\tsrc/app.py', '120000 blob oid\tsrc/app.py')
+            return result
+        ports.git.run = symlink
+        with self.assertRaises(PlanningResultInvalid):
+            validate_final(attempt, output, None, ports.git, Path('/repo'))

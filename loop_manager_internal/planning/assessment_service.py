@@ -216,6 +216,14 @@ class PlanningAssessmentService(PlanningService):
                     self._ports.state.compact_catalog(context.repo),
                     run.mutable_ready_snapshot,
                 )
+                if hasattr(self._ports.state, "planning_review"):
+                    from loop_manager_internal.planning.specification_review import prepare_review
+                    instruction, attempt = prepare_review(
+                        self._ports.state, self._ports.git, context, str(row.active_sha),
+                        final_required=run.final_review_required,
+                    )
+                    prompt += instruction
+                    self._ports.events.log(f"일반 planning 검토: purpose={attempt['purpose']}, revision={attempt['revision']}, 비교={attempt['comparison_revision']}, cycle={attempt['work_cycle']}")
                 if hasattr(self._ports, "retirement"):
                     from loop_manager_internal.planning.requirement_retirement import assessment_prompt, audit_prompt
                     run.retirement_pending = self._ports.retirement.pending(
@@ -566,6 +574,14 @@ class PlanningAssessmentService(PlanningService):
                     run.mutable_ready_snapshot,
                     **({"manager_paths": manager_paths} if manager_paths else {}),
                 )
+                if hasattr(self._ports.state, "planning_review"):
+                    from loop_manager_internal.planning.specification_review import validate_final
+                    attempt = self._ports.state.planning_review(context.repo, "attempt")
+                    if attempt is not None:
+                        if attempt["revision"] != row.active_sha or attempt["work_cycle"] != self._ports.state.review_work_cycle(context.repo):
+                            raise PlanningResultInvalid("일반 planning 검토 입력이 변경됐습니다. 최신 입력을 다시 확인하세요.")
+                        outcome = (validate_final(attempt, str(row.planning_result or ""), validated_result,
+                                   self._ports.git, context.repo_path) if attempt["purpose"] == "final" else "reviewed")
                 if hasattr(self._ports, "retirement"):
                     from dataclasses import replace
                     from loop_manager_internal.application.contracts import ValidatedPlanningResult
@@ -651,6 +667,10 @@ class PlanningAssessmentService(PlanningService):
                             ),
                         )
                         run.dirty_files = sorted(set(dirty_files) | set(manager_paths))
+            if not run.maintenance_planning and hasattr(self._ports.state, "planning_review") and attempt is not None:
+                self._ports.state.validate_planning_review(
+                    context.repo, str(row.active_sha), str(row.planning_result or ""), outcome,
+                )
             if (
                 decision is not None
                 and not tiered_assessment.enabled(self._ports, run)
