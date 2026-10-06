@@ -963,9 +963,10 @@ class CatalogReconciliationService:
         """Refuse execution views whose paused owners overlap shared resources."""
         project = dict(zip(_PROJECT_VERSION_FIELDS, expected.project_values or ()))
         owners = []
+        missing_ids = {issue.plan_id for issue in pinned.snapshot.issues if issue.code == "missing-plan"}
         for row in expected.rows:
             values = dict(zip(_ROW_VERSION_FIELDS, row.values))
-            if (row.plan_id in pinned.snapshot.withheld_ids
+            if (row.plan_id in missing_ids
                     and project.get("plan_path") == values["path"]
                     and project.get("phase") != "PLANNING"
                     and any(project.get(field) and project[field] != values[field]

@@ -61,3 +61,4 @@ priority: critical
 - `tests.test_incremental_planning.IncrementalPlanningCatalogTest`의 `remote_deletion` 선택 unit case: 취소·archive·번호 공백/신규 추가·실행/소유권 보존·본문 참조·목표 판단/gate·독립 batch·원격 dependency 제거·hash 미확인·감사 경쟁·중단/원격 경쟁·게시 후 intent 복구/멱등성을 검증한다.
 - 기존 catalog 신규 등록/취소 ID 보호, mutable 실행 이력 제외, 혼합 batch 원자성, 게시 intent 복구와 nullable snapshot manifest의 개별 unit case도 통과했다. 최초 targeted 실패는 테스트의 nullable 최초 게시 SHA 기대값과 손상 감사 JSON 예외를 수정한 뒤 같은 명령으로 재검증했다.
 - 기존 Linux `scripts/verify.sh`는 표준 verification runner를 실행하고 실패 종료 코드를 전달하므로 유지한다. Worker는 전체 verify를 실행하지 않았으며 Manager 검증·Review·사용자 Merge는 별도 완료 조건이다.
+- Manager 검증에서 발견된 기존 선언 오류의 실행 보류·재개 회귀는 삭제 소유권 검사가 모든 hold에 적용된 것이 원인이었다. 추가 검사를 실제 `missing-plan` 원인으로 제한했다. 두 기존 보류·재개 unit case와 실제 삭제 시 충돌 소유권·원본 보존 case를 확인하며, 기존 공유 branch/worktree 및 Agent scope 검사는 유지한다.

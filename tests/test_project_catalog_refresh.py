@@ -880,6 +880,20 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
         self.assertEqual(self.held(), set())
         self.assertEqual(manager.active_execplan(self.connection, self.repo)['plan_id'], 'G-002')
 
+    def test_missing_active_declaration_preserves_conflicting_project_owner(self):
+        self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', ever_started=1 WHERE plan_id='G-002'")
+        self.connection.execute("UPDATE projects SET plan_path=?", ('docs/plans/[G-002] Dependency.md',))
+        self.connection.commit()
+        original = dict(self.row('G-002'))
+        project = dict(self.connection.execute('SELECT * FROM projects').fetchone())
+        del self.documents['docs/plans/[G-002] Dependency.md']
+        result = self.fixture._service(self.pinned(self.sha)).reconcile(self.repo)
+        self.assertEqual(result.kind, state.ReconciliationKind.INVALID_CATALOG)
+        self.assertEqual(result.diagnostic.code, 'shared-ownership')
+        self.assertEqual(dict(self.row('G-002')), original)
+        self.assertEqual(dict(self.connection.execute('SELECT * FROM projects').fetchone()), project)
+        self.assertFalse(self.held())
+
     def test_planning_reuses_execution_view(self):
         self.boundary.refresh()
         outcome, _ports = self.prepare_planning_workspace()
