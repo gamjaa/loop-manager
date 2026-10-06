@@ -31,6 +31,13 @@ def _message(kind: str, payload: dict[str, object]) -> str:
         lines = [f"[{payload['project']}] 다음 작업 대기"]
         for plan in payload["plans"]:
             lines.append(f"- {plan['id']} {plan['title']}: {plan['reason']}")
+            if plan.get("question"):
+                from loop_manager_internal.catalog.execplan_drafts import fields
+                lines.append("  " + fields(str(plan["question"])).get("Question", str(plan["question"])))
+            if plan.get("url"):
+                lines.append("  " + str(plan["url"]))
+            if plan.get("revision"):
+                lines.append("  Revision: " + str(plan["revision"]))
             if plan.get("action_targets"):
                 lines.append("  사용자 확인 대상: " + ", ".join(plan["action_targets"]))
         for requirement in payload["requirements"]:

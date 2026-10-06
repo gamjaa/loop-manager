@@ -70,6 +70,16 @@ class FakeGit:
 
 
 class RequirementRetirementTest(unittest.TestCase):
+    def test_execplan_decision_hold_prevents_final_requirement_judgment(self):
+        from loop_manager_internal.storage import execplan_draft_state
+        self.add_plan()
+        self.assertEqual(len(self.port.pending("repo", self.root, "base")), 1)
+        execplan_draft_state.ensure_schema(self.connection)
+        execplan_draft_state.observe(self.connection, "repo", "docs/plans/[G-001] Feature.md",
+            {"id": "G-001", "sources": [SOURCE], "draft": True,
+             "draft_question": "Question: choose storage", "draft_scope": "scope"}, "hash", "base", agent=True)
+        self.assertEqual(self.port.pending("repo", self.root, "base"), ())
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

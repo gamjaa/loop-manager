@@ -355,6 +355,8 @@ def validate_active_execplan_metadata(
 ) -> dict[str, object]:
     try:
         current = effects.validate_execplan(worktree, relative_path)
+        if current.get("draft"):
+            raise ExecPlanMetadataError("사용자 판단 대기 draft ExecPlan은 실행할 수 없습니다.")
     except (ExternalObservationError, GitLockError):
         raise
     except OSError:

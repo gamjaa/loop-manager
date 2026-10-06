@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 import re
 import sqlite3
+from loop_manager_internal.storage import execplan_draft_state
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,13 @@ class WorkReasonSnapshot:
             reason = plan.get("reason") or plan["status"]
             if plan.get("action_targets"):
                 reason = f"{reason} (사용자 확인 대상: {', '.join(plan['action_targets'])})"
+            if plan.get("question"):
+                from loop_manager_internal.catalog.execplan_drafts import fields
+                reason += ": " + fields(str(plan["question"])).get("Question", str(plan["question"]))
+            if plan.get("url"):
+                reason += " " + str(plan["url"])
+            if plan.get("revision"):
+                reason += " (Revision: " + str(plan["revision"]) + ")"
             parts.append(f"{plan['id']} {plan['title']}: {reason}")
         for requirement in self.requirements:
             parts.append(f"{requirement['id']}: {requirement['reason']}")
@@ -119,6 +127,8 @@ def collect(
         )
         for row in rows
     }
+    drafts = execplan_draft_state.pending_ids(connection, repo)
+    statuses.update({plan_id: "DRAFT" for plan_id in drafts if plan_id not in holds})
     blocks = {}
     if _table_exists(connection, "execplan_blocks"):
         blocks = {
@@ -140,6 +150,12 @@ def collect(
         if status == "CATALOG_HELD":
             item.update(reason="ExecPlan catalog 오류의 교정 대기",
                         reason_code="execplan_catalog_invalid", evidence=holds[plan_id])
+        elif status == "DRAFT":
+            waiting = execplan_draft_state.evidence(connection, repo, plan_id)
+            item.update(reason="ExecPlan 사용자 판단 대기", question=waiting["question"],
+                        path=waiting["path"], revision=waiting["revision"])
+            if waiting.get("url"):
+                item["url"] = waiting["url"]
         elif status == "READY":
             dependencies = json.loads(str(row["depends_on"]))
             missing = [

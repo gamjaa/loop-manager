@@ -17,6 +17,7 @@ import re
 import sqlite3
 from typing import Callable, Iterator, Mapping, Protocol
 from uuid import uuid4
+from loop_manager_internal.storage import execplan_draft_state
 
 from loop_manager_internal.catalog.execplan_catalog import (
     CatalogIssue,
@@ -135,6 +136,7 @@ class CatalogRecoveryResult:
 
 
 def ensure_schema(connection: sqlite3.Connection) -> None:
+    execplan_draft_state.ensure_schema(connection)
     connection.execute(HISTORICAL_CATALOG_SCHEMA)
     connection.execute(CATALOG_DIAGNOSTICS_SCHEMA)
     connection.execute(CATALOG_REVISIONS_SCHEMA)
@@ -223,6 +225,7 @@ class CatalogStateSnapshot:
     reserved: tuple[tuple[str, str], ...] = ()
     holds: tuple[tuple[str, str, str, str | None], ...] = ()
     cancellations: tuple[tuple[str, str | None], ...] = ()
+    drafts: tuple[tuple[str, int, str], ...] = ()
 
     @property
     def plan_ids(self) -> frozenset[str]:
@@ -236,6 +239,8 @@ class PinnedCatalog:
     regular_paths: frozenset[str] | None = None
     deletions: tuple = ()
     recovery_definitions: tuple[ExecPlanCatalogEntry, ...] = ()
+    draft_inputs: Mapping[str, str | None] | None = None
+    remote_url: str | None = None
 
 
 def new_declaration_issues(
@@ -470,6 +475,8 @@ def insert_published_plan_row(
             initial_level, initial_level,
         ),
     )
+    execplan_draft_state.observe(connection, repo, path, plan, content_hash, revision_sha,
+                                agent=True)
 
 
 def _catalog_fingerprint(snapshot: ExecPlanCatalogSnapshot) -> str:
@@ -586,6 +593,7 @@ class DefinitionStateRepository:
             ("requirement_archive_targets", None),
             ("execplan_blocks", None),
             ("project_blocks", None),
+            ("execplan_drafts", None),
         ):
             if table not in available_tables:
                 continue
@@ -626,6 +634,9 @@ class DefinitionStateRepository:
             )),
             cancellations=tuple(tuple(row) for row in self.connection.execute(
                 "SELECT plan_id, recovery_evidence FROM execplan_cancellations WHERE repo=? ORDER BY plan_id", (repo,),
+            )),
+            drafts=tuple(tuple(row) for row in self.connection.execute(
+                "SELECT plan_id, pending, evidence FROM execplan_drafts WHERE repo=? ORDER BY plan_id", (repo,),
             )),
         )
 
@@ -770,9 +781,18 @@ class DefinitionStateRepository:
                                 entry.metadata(), entry.content_hash,
                                 pinned.revision_sha,
                             )
+                            execplan_draft_state.observe(
+                                self.connection, repo, entry.path, entry.metadata(), entry.content_hash,
+                                pinned.revision_sha, inputs=pinned.draft_inputs, remote_url=pinned.remote_url,
+                            )
                             changed.append(plan_id)
                             self._fault(f"after-plan:{plan_id}")
                         continue
+                    if not self._has_execution_history(row) and not row["workspace_owned"]:
+                        execplan_draft_state.observe(
+                            self.connection, repo, entry.path, entry.metadata(), entry.content_hash,
+                            pinned.revision_sha, inputs=pinned.draft_inputs, remote_url=pinned.remote_url,
+                        )
                     sources = json.dumps(
                         entry.sources, ensure_ascii=False, separators=(",", ":")
                     )
@@ -1056,7 +1076,16 @@ class CatalogReconciliationService:
             )
         # Validate new declarations before deletion-goal holds remove them from
         # the executable catalog. Recovery registration uses the same rules.
-        new_issues = new_declaration_issues(pinned, stored_ids)
+        new_issues = list(new_declaration_issues(pinned, stored_ids))
+        rows_by_id = {row.plan_id: row for row in expected.rows}
+        for key, entry in pinned.snapshot.active.items():
+            row = rows_by_id.get(key)
+            if entry.metadata().get("draft") and row:
+                values = dict(zip(_ROW_VERSION_FIELDS, row.values))
+                if (values["status"] != "READY" or values["ever_started"] or values["workspace_owned"]
+                        or any(values[field] for field in ("branch", "worktree", "worker_session_id", "reviewer_session_id", "pr_url"))):
+                    new_issues.append(CatalogIssue(key, entry.path, "draft-owned",
+                        "실행 이력·소유권이 있는 ExecPlan을 draft로 전환할 수 없습니다."))
         if new_issues:
             if not pinned.snapshot.isolation_enabled:
                 issue = new_issues[0]

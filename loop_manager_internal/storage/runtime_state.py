@@ -722,6 +722,11 @@ class RuntimeStateRepository:
         expected_status: str | None = None,
     ) -> None:
         self._validate_fields(values, EXECPLAN_RUNTIME_FIELDS)
+        if values.get("status") in ACTIVE_STATUSES or any(values.get(field) for field in (
+                "branch", "worktree", "worker_session_id", "reviewer_session_id", "pr_url", "workspace_owned")):
+            from .execplan_draft_state import pending_ids
+            if plan_id in pending_ids(self.connection, repo):
+                raise RuntimeStateError("사용자 판단 대기 draft ExecPlan을 실행할 수 없습니다.")
         assignments = ", ".join(f"{field} = ?" for field in values)
         expected = " AND status = ?" if expected_status is not None else ""
         parameters = [*values.values(), repo, plan_id]
@@ -1141,6 +1146,9 @@ class RuntimeStateRepository:
             raise ValueError("workspace 예약 허용 상태가 비어 있습니다.")
         placeholders = ", ".join("?" for _ in allowed_values)
         with _transaction(self.connection):
+            from .execplan_draft_state import pending_ids
+            if plan_id in pending_ids(self.connection, repo):
+                raise RuntimeStateError("사용자 판단 대기 draft ExecPlan의 workspace를 예약할 수 없습니다.")
             changed = self.connection.execute(
                 "UPDATE exec_plans SET workspace_owned = ? "
                 "WHERE repo = ? AND plan_id = ? "

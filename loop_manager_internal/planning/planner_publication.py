@@ -11,6 +11,8 @@ from loop_manager_internal.planning.planning_catalog import PlannerValidationErr
 from loop_manager_internal.storage import execplan_catalog_state
 from loop_manager_internal.storage import planning_publication_state, planning_input_state
 from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.storage import execplan_draft_state
+from loop_manager_internal.catalog import execplan_drafts
 from loop_manager_internal.storage.planning_publication_state import GeneralPlanningPublication
 from pathlib import Path
 import hashlib
@@ -23,6 +25,7 @@ class RegisterExecplanRowsEffects:
     """Named effects for _register_execplan_rows; no entry-point/module access."""
     _ensure_execplans_schema: Callable[..., object]
     file_hash: Callable[..., object]
+    git: Callable[..., object]
 
 
 def _register_execplan_rows(
@@ -35,10 +38,20 @@ def _register_execplan_rows(
     """Apply the new-row part shared by normal and maintenance batches."""
 
     effects._ensure_execplans_schema(connection)
+    remote_url = None
+    if any(plan.get("draft") for _path, plan in plans):
+        from loop_manager_internal.notifications.rendering import _checkpoint_link
+        origin = effects.git(worktree, "remote", "get-url", "origin").stdout.strip()
+        link = _checkpoint_link(origin, plan_commit)
+        remote_url = link.split("/tree/", 1)[0] if link else None
     for path, plan in plans:
         execplan_catalog_state.register_published_plan_row(
             connection, repo, path, plan, effects.file_hash(worktree / path), plan_commit,
         )
+        if plan.get("draft"):
+            execplan_draft_state.observe(connection, repo, path, plan,
+                effects.file_hash(worktree / path), plan_commit, inputs=execplan_drafts.input_digests(worktree, plan),
+                remote_url=remote_url, agent=True)
 
 
 @dataclass(frozen=True)
@@ -522,6 +535,7 @@ def _apply_general_planning_batch(
             connection, repo, deletions=result.deletions, revisions=result.revisions,
             snapshot_token=snapshot.token, plan_commit=plan_commit,
             content_hash=lambda path: effects.file_hash(worktree / path),
+            draft_inputs=lambda plan: execplan_drafts.input_digests(worktree, plan),
         )
         effects._register_execplan_rows(
             connection, repo, worktree, list(result.plans), plan_commit

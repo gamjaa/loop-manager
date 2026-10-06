@@ -220,6 +220,8 @@ class RequirementRetirementPort:
             "AND state IN ('pending', 'approved')", (repo,),
         ))
         draft_paths = {str(row["target_path"]) for row in drafts}
+        from loop_manager_internal.storage.execplan_draft_state import pending_ids
+        plan_drafts = pending_ids(self.connection, repo)
         for path, (mode, oid) in sorted(tree.items()):
             if not SOURCE.fullmatch(path):
                 continue
@@ -228,6 +230,8 @@ class RequirementRetirementPort:
             related = [row for row in rows if path in _sources(row["sources"], str(row["plan_id"]))]
             canceled = [row for row in cancellations if path in _sources(row["sources"], str(row["plan_id"]))]
             if canceled or not related or any(str(row["status"]) != "MERGED" for row in related):
+                continue
+            if any(str(row["plan_id"]) in plan_drafts for row in related):
                 continue
             if path in draft_paths or "docs/PRODUCT.md" in draft_paths or "docs/ARCHITECTURE.md" in draft_paths:
                 continue

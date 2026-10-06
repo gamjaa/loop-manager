@@ -327,8 +327,25 @@ class _GitCatalogDefinitionPort:
                 regular_paths.add(path.decode("utf-8"))
             except UnicodeDecodeError:
                 continue
+        from loop_manager_internal.catalog import execplan_drafts
+        decision_sources = set()
+        for entry in snapshot.active.values():
+            if entry.draft_metadata and (entry.draft_metadata.get("draft") or entry.draft_metadata.get("draft_question")):
+                decision_sources.update(entry.sources)
+                decision_sources.update(("docs/PRODUCT.md", "docs/ARCHITECTURE.md"))
+        draft_inputs = {path: execplan_drafts.content_digest(self._effects.git_bytes(
+            self.repo, "show", f"{revision_sha}:{path}")) if path in regular_paths else None
+            for path in sorted(decision_sources)}
+        remote_url = None
+        if decision_sources:
+            from loop_manager_internal.notifications.rendering import _checkpoint_link
+            origin = self._effects.git(self.repo, "remote", "get-url", "origin").stdout.strip()
+            link = _checkpoint_link(origin, revision_sha)
+            if link:
+                remote_url = link.split("/tree/", 1)[0]
         self.loaded = execplan_catalog_state.PinnedCatalog(
-            revision_sha, snapshot, frozenset(regular_paths)
+            revision_sha, snapshot, frozenset(regular_paths), draft_inputs=draft_inputs,
+            remote_url=remote_url,
         )
         return self.loaded
 

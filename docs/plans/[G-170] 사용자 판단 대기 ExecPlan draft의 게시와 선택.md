@@ -35,9 +35,14 @@ priority: high
 ## Progress
 
 - [x] 2026-10-05 planning 기준 a049a76의 명세·원본·관련 테스트와 비종료 catalog에서 미충족 범위를 확인함. 구현·테스트 실행은 하지 않음.
-- [ ] 구현 및 관련 targeted unit 검증
+- [x] 2026-10-06 draft 파싱·혼합 batch 등록·원격 결정 대기·선택 및 완료 gate 구현. 새 draft unit module과 Requirement retirement case 21개, 기존 metadata·compact catalog·READY 선택·runtime 예약/전이·retirement 회귀 case 6개 통과.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
 
 - catalog·게시·선택·완료에 걸쳐 새 대기 의미를 연결하므로 complexity high, 오실행·자기 승인 영향으로 risk high다. 알림 표현은 G-175에서 연결한다.
+- `catalog/execplan_drafts.py`는 문서 계약·질문 중복·Agent 자기 승인 검증, `storage/execplan_draft_state.py`는 결정 대기·근거·게시 링크·결정 감사 이력을 담당한다. 기존 READY phase와 publication transaction·snapshot CAS를 재사용하며 추가 SQLite table은 기존 실행 이력을 변경하지 않는다. draft와 직접·간접 의존 계획은 선택에서 제외하고 runtime 실행·workspace 예약 경계에서도 거부한다.
+- draft 문서의 `Draft Decision` 절에는 비어 있지 않은 `Question:`, `Facts:`, `Options:`, `Impact:` 줄을 둔다. 사용자는 해당 절을 보존하고 원격에서 draft 표시를 제거한 뒤 `User Decision` 절에 `Decision: approve`, `Revision: compact catalog의 decision_wait.revision 내용 해시`, `Answer: 구체적 답변`을 기록한다. reject/defer·불완전한 결정·표시만 제거한 변경은 계속 대기한다. 새 문서 draft 승인이나 AGENTS 승인 형식은 변경하지 않는다.
+- 판단 근거는 Progress·Decision Log·User Decision을 제외한 계획 선언·본문과 현재 source·PRODUCT·ARCHITECTURE의 내용 지문이다. 이 근거가 달라지면 이전 결정을 사용하지 않고 최신 판단 revision을 보존한다. 변경된 목표·구현 방향까지 함께 결정하려면 최신 질문·계획을 먼저 게시한 후 그 revision에 대한 결정을 기록한다. 질문을 원격에서 삭제해도 기존 대기 질문·결정 감사는 보존한다. 동일 근거의 원격 base 전진·재시작은 질문 링크와 대기 identity를 바꾸지 않는다.
+- 일반·허용된 유지보수 Planner의 작성 지침과 결과 검증을 연결했다. Worker의 결정 변경은 scope 검증에서 거부한다. 기존 안정 대기 결과·로그·알림에는 질문과 게시 링크를 제공하며 별도 진행 알림 정책은 구현하지 않았다. PRODUCT에는 이 Requirement 구현에서 앞으로 유지할 draft 동작만 반영했다. AGENTS·PLANS·ARCHITECTURE·Requirement와 루트 배치는 변경하지 않았다.
+- 검증: `python3 -m unittest tests.test_execplan_drafts tests.test_requirement_retirement.RequirementRetirementTest.test_execplan_decision_hold_prevents_final_requirement_judgment` (21개 통과). 추가로 `CatalogMetadataTest.test_execplan_catalog_validates_fixed_metadata`, `CatalogBatchesTest.test_compact_catalog_excludes_merged_bodies_and_has_only_allowed_fields`, `CatalogSchedulingTest.test_dependency_gate_then_priority_and_active_plan_preemption`, `RuntimeStateRepositoryTest.test_activation_update_hydrate_and_clear_round_trip_runtime_fields`, `RuntimeStateRepositoryTest.test_workspace_reservation_and_merge_are_repository_operations`, `RequirementRetirementTest.test_final_merge_defers_then_reuses_judgment_and_preserves_bytes` 6개를 개별 선택해 통과했다. Git·Agent는 fake이며 실제 게시·호출을 하지 않았다. Linux verify는 기존 unittest discovery runner가 새 module을 포함하므로 스크립트 변경이 필요 없고 전체 verify는 실행하지 않았다.

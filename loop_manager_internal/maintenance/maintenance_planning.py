@@ -51,6 +51,11 @@ class ReadyPlanSnapshot:
     current_risk: str | None = None
     current_metadata_recorded: bool = False
 
+    @property
+    def draft(self) -> bool:
+        from loop_manager_internal.catalog.execplan_catalog import parse_frontmatter
+        return parse_frontmatter(self.text).get("draft") == "true"
+
 
 @dataclass(frozen=True)
 class MaintenancePlanningContext:

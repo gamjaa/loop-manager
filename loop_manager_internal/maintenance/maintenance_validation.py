@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.application.contracts import ValidatedPlanningResult
-from loop_manager_internal.catalog import project_catalog_refresh
+from loop_manager_internal.catalog import project_catalog_refresh, execplan_drafts
 from loop_manager_internal.git.command_adapter import ExternalObservationError
 from loop_manager_internal.runtime.contracts import GitLockError
 from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
@@ -389,6 +389,7 @@ def validate_maintenance_planner_result(
                 raise MaintenancePlanningError(str(error)) from error
             try:
                 validated_plan = effects.published_execplan(path, planned_contents[path][1])
+                execplan_drafts.validate_agent_change(validated_plan)
             except RuntimeError as error:
                 raise MaintenancePlanningError(str(error)) from error
             if validated_plan != plan:
@@ -397,6 +398,8 @@ def validate_maintenance_planner_result(
                 )
             new_plans.append((path, validated_plan))
         try:
+            from loop_manager_internal.storage import execplan_draft_state
+            execplan_draft_state.validate_questions(connection, context.repo, catalog)
             project_catalog_refresh.assert_planning_dependencies_unheld(
                 catalog, new_plans + [(path, catalog[eligible[path].plan_id]) for path in revised_paths],
                 held_ids)
@@ -483,6 +486,7 @@ def validate_maintenance_planner_result(
             text = planned_contents[path][1]
             try:
                 validated_plan = effects.published_execplan(path, text)
+                execplan_drafts.validate_agent_change(validated_plan, snapshot.text)
             except RuntimeError as error:
                 raise MaintenancePlanningError(str(error)) from error
             if validated_plan != plan:
