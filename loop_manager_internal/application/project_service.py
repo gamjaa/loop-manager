@@ -654,6 +654,26 @@ class ProjectService:
                 self.effects._record_project_recovery(
                     self.identity.connection, self.state.repo, error.reason, str(error))
                 return PROJECT_STEP_RETRY
+            # GitHub terminal state takes priority over an unfinished receipt.
+            # Reobserve after refusal as the PR may have ended during push.
+            try:
+                pull_request = self.effects.pr_for_branch(
+                    self.state.repo_path, selected.branch, selected.pr_url)
+            except (OSError, RuntimeError) as observation_error:
+                self.effects._record_project_recovery(
+                    self.identity.connection, self.state.repo,
+                    recovery_runtime.RecoveryReason.PUBLICATION_RETRY,
+                    str(observation_error))
+                return PROJECT_STEP_RETRY
+            if (pull_request is not None
+                    and pull_request.get('url') == selected.pr_url
+                    and pull_request.get('headRefName') == selected.branch
+                    and pull_request.get('baseRefName', self.state.row['base_branch'])
+                    == self.state.row['base_branch']
+                    and str(pull_request.get('state') or '').upper() in {'CLOSED', 'MERGED'}):
+                return self.effects.reconcile_existing_pull_request(
+                    self.identity.connection, self.state.repo_path, self.identity.state_dir,
+                    self.state.repo, self.state.row, pull_request)
             self.effects.block_active_execplan_from_revision(
                 self.identity.connection, self.state.repo_path, self.state.repo,
                 f"refs/remotes/origin/{self.state.row['base_branch']}", str(error),

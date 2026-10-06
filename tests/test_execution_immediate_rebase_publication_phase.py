@@ -254,8 +254,10 @@ class ImmediateRebasePublicationTests(TestCase):
             with self.assertRaises(Exit):
                 self.complete()
         pending = self.checkpoints.get('repo', 'G-047')
-        for changes in ({'state': 'CLOSED'}, {'state': 'MERGED'}, {'url': 'different-pr'},
-                        {'headRefOid': 'user-head'}):
+        for changes in ({'url': 'different-pr'}, {'headRefOid': 'user-head'},
+                        {'state': 'CLOSED', 'url': 'different-pr'},
+                        {'state': 'MERGED', 'headRefName': 'other-branch'},
+                        {'state': 'CLOSED', 'baseRefName': 'other-base'}):
             with self.subTest(changes=changes):
                 self.pr_changes = changes
                 result, events, block = self._restart_through_project_entry()
@@ -265,6 +267,159 @@ class ImmediateRebasePublicationTests(TestCase):
                 self.assertEqual(len(self.pushes), 1)
                 self.assertEqual(self.state.row()['pr_conflict_head_oid'], 'remote')
                 self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+
+    def _interrupt_pr_checkpoint(self, *, pushed):
+        self._existing_pr()
+        self.state.update_project('repo', pr_conflict_recovery=1,
+            pr_conflict_head_oid='remote', pr_conflict_base_oid='base')
+        if pushed:
+            with mock.patch.object(self.state, 'complete_rebase_publication', side_effect=KeyboardInterrupt):
+                with self.assertRaises(KeyboardInterrupt):
+                    self.complete()
+        else:
+            self.push_failure = True
+            from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure
+            with self.assertRaises(RecoveryFailure):
+                self.complete()
+            self.push_failure = False
+        return self.checkpoints.get('repo', 'G-047')
+
+    def _terminal_project_step(self, next_status):
+        """Keep project entry, waiting PRs, blocking and Merge transitions real."""
+        from loop_manager_internal.application.project_service import ProjectService
+        def prepare(service):
+            self.fixture.connection.execute('UPDATE projects SET planning_attempt_fingerprint = NULL')
+            service.state.repo, service.state.repo_path = 'repo', Path('/repo')
+            service.state.base = 'main'
+            service.state.row = self.fixture.connection.execute('SELECT * FROM projects').fetchone()
+        def synchronize(service):
+            result = lm.synchronize_waiting_pull_requests(
+                self.fixture.connection, Path('/repo'), Path('/state'), 'repo')
+            service.state.row = self.fixture.connection.execute('SELECT * FROM projects').fetchone()
+            return result.step_result or None
+        def next_work(_service):
+            plan = runtime_state.RuntimeStateRepository(self.fixture.connection).get('repo', 'G-047')
+            self.assertEqual(plan.status, next_status)
+            return 0
+        with self.direct_ports(), ExitStack() as ports:
+            for patch in (
+                mock.patch.object(ProjectService, '_prepare_repository', autospec=True, side_effect=prepare),
+                mock.patch.object(ProjectService, '_reconcile_catalog_and_cleanup', return_value=None),
+                mock.patch.object(ProjectService, '_synchronize_pull_requests', autospec=True, side_effect=synchronize),
+                mock.patch.object(ProjectService, '_run_coordinators', autospec=True, side_effect=next_work),
+                mock.patch.object(lm, 'remote_base', return_value='base'),
+                mock.patch.object(lm, '_recorded_base_fetch', return_value='base'),
+                mock.patch.object(lm, 'classify_pull_request_mergeability', return_value='mergeable'),
+                mock.patch.object(lm, '_revision_execplan_input_fingerprint', return_value='input'),
+                mock.patch.object(lm, '_assess_missing_managed_cleanup',
+                                  return_value=lm.CleanupAssessment('deferred', 'preserved workspace')),
+                mock.patch.object(lm, 'operation_print'),
+            ):
+                ports.enter_context(patch)
+            return lm._run_project_step(self.fixture.connection, Path('/state'), 'repo',
+                                        Path('/config'), 'main', False)
+
+    def test_pending_checkpoint_closed_pr_blocks_only_plan_and_same_pr_reopens(self):
+        from loop_manager_internal.recovery import scoped_blocking
+        for timing in ('before-push', 'after-push', 'during-push'):
+            with self.subTest(timing=timing):
+                self._reset_publication_case()
+                pending = self._interrupt_pr_checkpoint(pushed=timing == 'after-push')
+                if timing == 'during-push':
+                    self.before_push = lambda: self.pr_changes.update(state='CLOSED')
+                else:
+                    self.pr_changes = {'state': 'CLOSED'}
+                self.assertEqual(self._terminal_project_step('PLAN_BLOCKED'), 1)
+                runtime = runtime_state.RuntimeStateRepository(self.fixture.connection)
+                closed = runtime.get('repo', 'G-047')
+                self.assertEqual(closed.status, 'PLAN_BLOCKED')
+                self.assertEqual(scoped_blocking.plan_block(
+                    self.fixture.connection, 'repo', 'G-047')['reason_code'], lm.PR_CLOSED_BLOCK_REASON)
+                self.assertEqual(closed.pr_url, self.seed.expected.remote.pull_request.identity)
+                self.assertEqual(closed.pr_head_oid, self.remote)
+                self.assertIsNotNone(scoped_blocking.plan_block(self.fixture.connection, 'repo', 'G-047'))
+                self.assertIsNone(scoped_blocking.project_block(self.fixture.connection, 'repo'))
+                self.assertIsNone(runtime.projected('repo'))
+                self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+                self.assertEqual(len(self.pushes), 2 if timing == 'during-push' else 1)
+                self.assertEqual(self._terminal_project_step('PLAN_BLOCKED'), 0)
+                self.pr_changes = {}
+                self.assertEqual(self._terminal_project_step('PR_OPEN'), 0)
+                reopened = runtime.get('repo', 'G-047')
+                self.assertEqual(reopened.status, 'PR_OPEN')
+                self.assertEqual(reopened.pr_url, closed.pr_url)
+                self.assertEqual(reopened.pr_head_oid, closed.pr_head_oid)
+                self.assertIsNone(scoped_blocking.plan_block(self.fixture.connection, 'repo', 'G-047'))
+                self.assertIsNone(scoped_blocking.project_block(self.fixture.connection, 'repo'))
+                self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+                self.assertEqual(len(self.pushes), 2 if timing == 'during-push' else 1)
+
+    def test_pending_checkpoint_merged_pr_records_merge_and_preserves_workspace(self):
+        from loop_manager_internal.recovery import scoped_blocking
+        for timing in ('before-push', 'after-push', 'during-push'):
+            with self.subTest(timing=timing):
+                self._reset_publication_case()
+                pending = self._interrupt_pr_checkpoint(pushed=timing == 'after-push')
+                if timing == 'during-push':
+                    self.before_push = lambda: self.pr_changes.update(state='MERGED')
+                else:
+                    self.pr_changes = {'state': 'MERGED'}
+                self.assertEqual(self._terminal_project_step('MERGED'), lm.PROJECT_STEP_PLANNING_PENDING)
+                runtime = runtime_state.RuntimeStateRepository(self.fixture.connection)
+                merged = runtime.get('repo', 'G-047')
+                self.assertEqual(merged.status, 'MERGED')
+                self.assertEqual(merged.pr_head_oid, self.remote)
+                self.assertEqual(merged.worker_session_id, 'saved-worker')
+                self.assertIsNone(runtime.projected('repo'))
+                self.assertIsNone(scoped_blocking.project_block(self.fixture.connection, 'repo'))
+                cleanup = self.fixture.connection.execute('SELECT * FROM cleanup_pending').fetchone()
+                self.assertEqual(cleanup['worktree'], merged.worktree)
+                self.assertEqual(cleanup['pr_url'], merged.pr_url)
+                self.assertEqual(cleanup['pr_head_oid'], merged.pr_head_oid)
+                self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+                self.assertEqual(self._terminal_project_step('MERGED'), 0)
+                self.assertEqual(len(self.pushes), 2 if timing == 'during-push' else 1)
+
+    def test_pending_checkpoint_pr_close_and_reopen_preserve_independent_plan_block(self):
+        from loop_manager_internal.recovery import scoped_blocking
+        pending = self._interrupt_pr_checkpoint(pushed=True)
+        runtime = runtime_state.RuntimeStateRepository(self.fixture.connection)
+        runtime.block_plan('repo', 'G-047', reason_code='verify_retry_exhausted',
+                           evidence='independent verify cause', release_fingerprint='input')
+        runtime.hydrate('repo', 'G-047')
+        original = dict(scoped_blocking.plan_block(self.fixture.connection, 'repo', 'G-047'))
+        self.pr_changes = {'state': 'CLOSED'}
+        self.assertEqual(self._terminal_project_step('PLAN_BLOCKED'), 1)
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+        self.assertEqual(dict(scoped_blocking.plan_block(self.fixture.connection, 'repo', 'G-047')), original)
+        self.assertIsNone(scoped_blocking.project_block(self.fixture.connection, 'repo'))
+        self.pr_changes = {}
+        self.assertEqual(self._terminal_project_step('PLAN_BLOCKED'), 1)
+        self.assertEqual(runtime.get('repo', 'G-047').status, 'PLAN_BLOCKED')
+        self.assertEqual(dict(scoped_blocking.plan_block(self.fixture.connection, 'repo', 'G-047')), original)
+        self.assertIsNone(scoped_blocking.project_block(self.fixture.connection, 'repo'))
+        self.assertIsNone(self.checkpoints.get('repo', 'G-047').operation)
+        self.assertEqual(len(self.pushes), 1)
+
+    def test_pending_checkpoint_terminal_observation_failure_retries_without_project_block(self):
+        from loop_manager_internal.recovery import scoped_blocking
+        pending = self._interrupt_pr_checkpoint(pushed=True)
+        observed = self.handler.effects.publication.pr_for_branch.side_effect
+        reads = 0
+        def lookup(*args):
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                raise OSError('GitHub temporarily unavailable')
+            return observed(*args)
+        self.pr_changes = {'state': 'CLOSED'}
+        self.handler.effects.publication.pr_for_branch.side_effect = lookup
+        self.assertEqual(self._terminal_project_step('IMPLEMENTING'), lm.PROJECT_STEP_RETRY)
+        self.assertEqual(runtime_state.RuntimeStateRepository(self.fixture.connection).get(
+            'repo', 'G-047').status, 'IMPLEMENTING')
+        self.assertIsNone(scoped_blocking.project_block(self.fixture.connection, 'repo'))
+        self.assertEqual(self.checkpoints.get('repo', 'G-047'), pending)
+        self.assertEqual(self._terminal_project_step('PLAN_BLOCKED'), 1)
 
     def test_project_entry_retries_same_pending_pr_publication_before_candidate_work(self):
         from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure

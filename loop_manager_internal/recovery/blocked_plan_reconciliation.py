@@ -65,7 +65,8 @@ def slot_available(connection, repo, plan_id) -> bool:
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'general_planning_publications'").fetchone()
         and connection.execute('SELECT 1 FROM general_planning_publications WHERE repo = ?', (repo,)).fetchone())
     return bool(project is not None and runtime.recovery_slot_available(repo)
-                and not project['pr_conflict_recovery']
+                and (not project['pr_conflict_recovery']
+                     or projected is not None and projected['plan_id'] == plan_id)
                 and (active is None or active['plan_id'] == plan_id)
                 and (project['phase'] not in {'WORKING', 'IMPLEMENTING', 'VERIFYING',
                                              'REVIEWING', 'PUBLISHING'}
