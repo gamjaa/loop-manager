@@ -352,6 +352,7 @@ def validate_active_execplan_metadata(
     plan: sqlite3.Row,
     *,
     rebase_definition: execution_revision.DefinitionSnapshot | None = None,
+    rebase_target_metadata: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     try:
         current = effects.validate_execplan(worktree, relative_path)
@@ -363,6 +364,25 @@ def validate_active_execplan_metadata(
         raise
     except RuntimeError as error:
         raise ExecPlanMetadataError(str(error)) from error
+    if rebase_target_metadata is not None:
+        # Only the checkpoint-bound rebase service supplies this boundary.
+        # Compare whole declarations, never a mixture of old and new fields.
+        # Normal execution and final publication still compare with catalog.
+        if (rebase_definition is None or rebase_definition.path != relative_path
+                or relative_path != str(plan['path'])
+                or current['id'] != plan['plan_id']
+                or rebase_target_metadata['id'] != plan['plan_id']
+                or rebase_target_metadata.get('draft')):
+            raise ExecPlanMetadataError('소유된 rebase ExecPlan identity가 다릅니다.')
+        fields = ('title', 'sources', 'depends_on', 'complexity', 'risk', 'priority')
+        applied = {field: getattr(rebase_definition, field) for field in fields}
+        for field in ('sources', 'depends_on'):
+            applied[field] = list(applied[field])
+        if not any(all(current[field] == declaration[field] for field in fields)
+                   for declaration in (applied, rebase_target_metadata)):
+            raise ExecPlanMetadataError(
+                '소유된 rebase ExecPlan metadata가 적용된 선언 또는 target base와 다릅니다.')
+        return current
     comparison_plan = plan
     if rebase_definition is not None:
         # A paused rebase still contains its applied declaration. Scheduling,

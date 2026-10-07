@@ -10,13 +10,16 @@ import stat
 
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
+from loop_manager_internal.catalog.execplan_catalog import parse_execplan_text
+from loop_manager_internal.application.contracts import ExecPlanMetadataError
 from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseService
 from loop_manager_internal.git.managed_rebase_observation import ObservationAdapters
-from loop_manager_internal.git.managed_rebase_validation import RebaseExpectation, Remote, PullRequest, fingerprint
+from loop_manager_internal.git.managed_rebase_validation import RebaseExpectation, Remote, PullRequest, fingerprint, valid_acceptance
 from loop_manager_internal.git.manager_git_journal import MutationEvidenceError
 from loop_manager_internal.recovery.work_branch_integration import user_changes, matching_user_paths
 from loop_manager_internal.agents.agent_scope_decision import _worker_path_allowed
 from dataclasses import replace
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 
 
 @dataclass(frozen=True)
@@ -45,7 +48,7 @@ _UNSET = object()
 
 def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir, repo, plan_id,
                   worktree, branch, *, target=None, remote_oid=_UNSET):
-    """Use current declarations and exact live leases, never execution receipts."""
+    """Check checkpoint-bound declarations and exact live leases before revision adoption."""
     plan = connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
                               (repo, plan_id)).fetchone()
     if plan is None:
@@ -80,24 +83,34 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
             or int(plan['workspace_owned']) != WORKSPACE_OWNED):
         raise MutationEvidenceError('current rebase reservation differs')
     project = connection.execute('SELECT base_branch FROM projects WHERE repo = ?', (repo,)).fetchone()
+    common_dir = ports.git(repo_path, 'rev-parse', '--git-common-dir').stdout.strip()
+    identity = str((repo_path / common_dir).resolve())
+    applied = DefinitionSnapshot.deserialize(plan['definition_snapshot'])
+    # A historical declaration is usable only with this exact saved operation
+    # or acceptance target. A fresh candidate has no such metadata exception.
+    owned_definition = bool(applied is not None and target == checkpoint.target_base_oid
+        and (checkpoint.operation == 'rebase'
+             or valid_acceptance(proof) and all(proof[key] == value for key, value in (
+                 ('repo', repo), ('repository_identity', identity), ('plan_id', plan_id),
+                 ('plan_path', str(plan['path'])), ('worktree', str(worktree.resolve())),
+                 ('branch', branch), ('target_base_oid', target), ('role', 'worker')))))
 
     def current_contract():
         row = connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
                                  (repo, plan_id)).fetchone()
-        revision = str(row['current_revision_sha'] or row['plan_sha'] or '')
+        revision = target if owned_definition else str(row['current_revision_sha'] or row['plan_sha'] or '')
         if not revision:
             raise MutationEvidenceError('current rebase input revision is missing')
         archives = ports.requirement_archive_candidates(connection, repo_path, repo, revision, plan_id)
         common = ports._published_plan_allows_common_plans(repo_path, row)
         inputs = fingerprint((ports._revision_execplan_input_fingerprint(repo_path, revision, row),
                               ports._worktree_execplan_input_fingerprint(worktree, row),
-                              row['path'], row['sources'], row['depends_on']))
+                              row['path'], row['sources'], row['depends_on'],
+                              row['current_revision_sha'], row['definition_snapshot']))
         policy = fingerprint((row['path'], archives, common))
         return row, revision, archives, common, inputs, policy
 
     row, revision, archives, common, inputs, policy = current_contract()
-    common_dir = ports.git(repo_path, 'rev-parse', '--git-common-dir').stdout.strip()
-    identity = str((repo_path / common_dir).resolve())
     expected = RebaseExpectation(
         repo=repo, repository_identity=identity, plan_id=plan_id,
         plan_path=str(plan['path']), worktree=str(worktree.resolve()), branch=branch,
@@ -153,9 +166,22 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
     pending_metadata = ports._owned_rebase_metadata(worktree)
     pending_index = ports.git(worktree, 'ls-files', '-u', '-z').stdout
     if pending_metadata is None and not pending_index:
-        ports.validate_active_execplan_metadata(
-            repo_path, worktree, str(row['path']), row,
-            rebase_definition=DefinitionSnapshot.deserialize(row['definition_snapshot']))
+        options = {}
+        try:
+            if owned_definition:
+                target_text = ports.git(repo_path, 'show', f"{target}:{row['path']}").stdout
+                try:
+                    options['rebase_target_metadata'] = parse_execplan_text(
+                        str(row['path']), target_text, validate_sources=False)
+                except RuntimeError as error:
+                    raise ExecPlanMetadataError(str(error)) from error
+            ports.validate_active_execplan_metadata(
+                repo_path, worktree, str(row['path']), row,
+                rebase_definition=applied, **options)
+        except ExecPlanMetadataError as error:
+            # Deterministic declaration failures cannot improve by polling the
+            # same checkout. Preserve the diagnostic and use the input gate.
+            raise RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, str(error)) from error
     archive_ok = True
     archive_blobs = {}
     archive_signatures = {}
