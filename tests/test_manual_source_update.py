@@ -45,6 +45,16 @@ class ManualSourceUpdateRecoveryTests(unittest.TestCase):
                                   connection=connection, repo='/repo', repo_path=Path('/repo'),
                                   state_dir=Path(directory), runtime=runtime,
                                   fetch=lambda _branch: remote['oid'])
+        def fetch(branch):
+            # Model the preceding fetch journal too: its equal receipt must
+            # complete before the selected publication interruption.
+            journal.execute(service.state_dir, owner='project', kind='project_fetch',
+                            repo=service.repo, target=f'refs/remotes/origin/{branch}',
+                            before=remote.copy(), expected=remote.copy(),
+                            observe=lambda: remote.copy(), apply=lambda _: self.fail('Unexpected fetch write'),
+                            marker=lambda _: True)
+            return remote['oid']
+        service.fetch = fetch
         # The exact push completed but its result was interrupted.
         with self.assertRaises(KeyboardInterrupt):
             self.seed_push(service, group, remote)
@@ -66,10 +76,11 @@ class ManualSourceUpdateRecoveryTests(unittest.TestCase):
             for advances in (False, True):
                 with self.subTest(boundary=boundary, advances=advances), tempfile.TemporaryDirectory() as directory:
                     service, group, remote = self.fixture(directory)
+                    slot = journal._slot(service.state_dir, service.repo, 'manual_branch_push', f"refs/heads/{group['branch']}")
                     write = journal._write_new
                     def interrupt(path, value):
-                        equal = (value.get('before') == value.get('expected') == {'oid': LATER})
-                        result = value.get('status') == 'equal'
+                        equal = (path.parent == slot and value.get('before') == value.get('expected') == {'oid': LATER})
+                        result = path.parent == slot and value.get('status') == 'equal'
                         if boundary == 'before_result' and result:
                             raise KeyboardInterrupt('before equal receipt')
                         write(path, value)
@@ -80,6 +91,11 @@ class ManualSourceUpdateRecoveryTests(unittest.TestCase):
                         update_source(service, group)
                     slot = journal._slot(service.state_dir, service.repo, 'manual_branch_push', f"refs/heads/{group['branch']}")
                     receipts = {p: p.read_bytes() for p in slot.glob('*.result.json')}
+                    fetch_slot = journal._slot(service.state_dir, service.repo, 'project_fetch',
+                                               f"refs/remotes/origin/{group['branch']}")
+                    self.assertFalse((fetch_slot / 'active.json').exists())
+                    self.assertEqual([journal._read(p)['status'] for p in fetch_slot.glob('*.result.json')], ['equal'])
+
                     remote['oid'] = NEWER if advances else LATER
                     current = update_source(service, group)
                     self.assertEqual(current['prepared_head'], remote['oid'])
@@ -95,9 +111,10 @@ class ManualSourceUpdateRecoveryTests(unittest.TestCase):
         for boundary in ('before_result', 'sqlite'):
             with self.subTest(boundary=boundary), tempfile.TemporaryDirectory() as directory:
                 service, group, remote = self.fixture(directory)
+                slot = journal._slot(service.state_dir, service.repo, 'manual_branch_push', f"refs/heads/{group['branch']}")
                 write = journal._write_new
                 def interrupt(path, value):
-                    if boundary == 'before_result' and value.get('status') == 'equal':
+                    if boundary == 'before_result' and path.parent == slot and value.get('status') == 'equal':
                         raise KeyboardInterrupt('before equal receipt')
                     write(path, value)
                 service.runtime.update_plan.side_effect = KeyboardInterrupt('before SQLite confirmation')
@@ -114,10 +131,11 @@ class ManualSourceUpdateRecoveryTests(unittest.TestCase):
     def test_equal_receipt_with_different_owner_is_preserved_and_refused(self):
         with tempfile.TemporaryDirectory() as directory:
             service, group, remote = self.fixture(directory)
+            slot = journal._slot(service.state_dir, service.repo, 'manual_branch_push', f"refs/heads/{group['branch']}")
             write = journal._write_new
             def interrupt(path, value):
                 write(path, value)
-                if value.get('status') == 'equal':
+                if path.parent == slot and value.get('status') == 'equal':
                     raise KeyboardInterrupt('after equal receipt')
             with mock.patch.object(journal, '_write_new', side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
                 update_source(service, group)

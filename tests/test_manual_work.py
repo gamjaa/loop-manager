@@ -816,9 +816,11 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
                     saved=service.store.get(service.repo,group['group_id'])
                     service.fetch(group['branch'])
                     later=self.remote_followup(service,group,directory)
+                    slot=journal._slot(service.state_dir,service.repo,'manual_branch_push',
+                                       f"refs/heads/{group['branch']}")
                     write=journal._write_new
                     def interrupt_equal(path,value):
-                        equal=value.get('status')=='equal'
+                        equal=path.parent==slot and value.get('status')=='equal'
                         if equal and boundary=='before_result':
                             raise KeyboardInterrupt('before equal receipt')
                         write(path,value)
