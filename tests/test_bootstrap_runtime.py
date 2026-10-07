@@ -272,9 +272,13 @@ class BootstrapRuntimeTests(OriginScopeFixture, unittest.TestCase):
                         ) as execute:
                             self.assertEqual(loop_manager.main(), 0)
                             self.assertTrue(execute.call_args.args[3].legacy)
-                self.assertNotEqual(connection.execute(
+                self.assertEqual(connection.execute(
                     "SELECT agent_snapshot FROM projects WHERE repo = ?", (str(source),)
                 ).fetchone()[0], before.serialize())
+                audit = loop_manager.execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+                    str(source), '').snapshot['manager_metadata_agent_baseline']
+                self.assertEqual(audit['original'], hashlib.sha256(before.serialize().encode()).hexdigest())
+                self.assertIn(str(runtime.path), loop_manager.GitSnapshot.deserialize(audit['snapshot']).worktrees)
 
                 with loop_manager.process_lock(state_dir):
                     reused_legacy = loop_manager._bootstrap_service().prepare_runtime_worktree(source, state_dir)
@@ -687,7 +691,12 @@ class ReviewerRebaseScopeHandoffUnitTests(unittest.TestCase):
         checkpoint = ExecutionCheckpointRepository(connection)
         checkpoint.record('repo', 'G-047', expected_generation=0, operation=None,
                           expected_head='b', target_base_oid='b', observed_remote_oid=None,
-                          snapshot={'current_rebase_acceptance': {'fixture': 'owned'}})
+                          snapshot={'current_rebase_acceptance': {'fixture': 'owned'},
+                              'manager_metadata_agent_baseline': {
+                                  'role': 'reviewer',
+                                  'original': hashlib.sha256(before.serialize().encode()).hexdigest(),
+                                  'snapshot': replace(before, refs={**before.refs,
+                                      'refs/remotes/origin/main': ('b', '')}).serialize()}})
         effects = mock.Mock()
         effects.repository.return_value.scope_owner.return_value = row
         effects._plan_id_from_path.return_value = 'G-047'
@@ -707,6 +716,10 @@ class ReviewerRebaseScopeHandoffUnitTests(unittest.TestCase):
             self.assertNotEqual(resumed.scope_id, before.scope_id)
             self.assertEqual(effects.validate_agent_scope.call_count, 2)
             self.assertEqual(effects.validate_agent_scope.call_args_list[0].args[0], 'reviewer')
+            first_check = effects.validate_agent_scope.call_args_list[0]
+            self.assertEqual(first_check.args[2].refs, first_check.args[3].refs)
+            self.assertEqual(first_check.args[2].refs['refs/remotes/origin/main'], ('b', ''))
+            self.assertNotIn('refs/remotes/origin/main', before.refs)
             self.assertEqual(effects.update_project.call_args.kwargs['agent_role'], 'worker')
             audit = checkpoint.get('repo', 'G-047').snapshot['current_rebase_agent_baseline']
             self.assertEqual(audit['role'], 'reviewer')

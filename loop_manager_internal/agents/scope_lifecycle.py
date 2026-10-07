@@ -67,9 +67,13 @@ def begin_agent_scope(
             raise RuntimeError('Reviewer scope의 관리 rebase가 완료되지 않았습니다.')
         original = GitSnapshot.deserialize(str(row['agent_snapshot']))
         current = effects.capture_git_snapshot(worktree)
+        comparison = agent_scope_decision.manager_comparison_baseline(
+            original, original, checkpoint.snapshot or {}, 'reviewer')
         if row['agent_result_snapshot']:
-            effects.validate_agent_scope('reviewer', worktree, original,
-                GitSnapshot.deserialize(str(row['agent_result_snapshot'])),
+            result = agent_scope_decision.manager_comparison_baseline(
+                original, GitSnapshot.deserialize(str(row['agent_result_snapshot'])),
+                checkpoint.snapshot or {}, 'reviewer')
+            effects.validate_agent_scope('reviewer', worktree, comparison, result,
                 external_worktree=Path(repo), base_branch=row['base_branch'], connection=connection)
         baseline = managed_rebase_adoption.selected_baseline(
             original, current, row['branch'], str(worktree.resolve()), publication=checkpoint)

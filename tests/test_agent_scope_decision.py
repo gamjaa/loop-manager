@@ -515,7 +515,7 @@ class TaskRelevantScopeTests(unittest.TestCase):
         for role in ('planner', 'maintenance_planner'):
             resources = decision.used_git_resources(role=role, phase='PLANNING',
                 base_branch='develop', branch=None, worktree_key=WORKTREE)
-            self.assertEqual(resources.refs, frozenset({'refs/remotes/origin/develop'}))
+            self.assertEqual(resources.refs, frozenset({'refs/remotes/origin/develop', 'refs/remotes/origin/HEAD'}))
         self.assertIsNone(decision.used_git_resources(role='worker', phase='unknown',
             base_branch='develop', branch=self.before.branch, worktree_key=WORKTREE))
         scoped = replace(self.before, scope_id='invocation-scope', scope_start_digest='digest')

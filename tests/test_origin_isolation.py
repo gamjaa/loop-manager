@@ -251,9 +251,12 @@ class OriginIsolationScopeTest(OriginScopeFixture, unittest.TestCase):
                     saved = loop_manager.GitSnapshot.deserialize(connection.execute(
                         "SELECT agent_snapshot FROM projects WHERE repo = ?", (str(source),)
                     ).fetchone()[0])
-                    self.assertNotEqual(saved, before)
-                    self.assertIn(str(runtime.path), saved.worktrees)
-                    self.assertEqual(saved.refs["refs/remotes/origin/main"][0], selected_sha)
+                    self.assertEqual(saved, before)
+                    audit = loop_manager.execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+                        str(source), '').snapshot['manager_metadata_agent_baseline']
+                    comparison = loop_manager.GitSnapshot.deserialize(audit['snapshot'])
+                    self.assertIn(str(runtime.path), comparison.worktrees)
+                    self.assertEqual(comparison.refs["refs/remotes/origin/main"][0], selected_sha)
 
                 with mock.patch.object(loop_manager, "ROOT", runtime.path):
                     with self.assertRaisesRegex(RuntimeError, "process lock"):
@@ -419,7 +422,7 @@ class OriginIsolationScopeTest(OriginScopeFixture, unittest.TestCase):
                             (str(source),),
                         ).fetchone()
                         self.assertEqual(saved["agent_result_snapshot"], current.serialize())
-                        self.assertEqual(saved["agent_snapshot"] == before.serialize(), mixed)
+                        self.assertEqual(saved["agent_snapshot"], before.serialize())
                 connection.close()
 
 
@@ -560,8 +563,10 @@ class TaskRelevantInvocationScopeTests(unittest.TestCase):
         operation.unlink()
         new_base = advance_remote(self.writer)
         git(self.source, 'fetch', 'origin')
-        with self.assertRaises(loop_manager.AgentScopeError):
-            self.validate()
+        self.validate()  # Verified isolation and live fast-forward preserve this scope.
+        with mock.patch.object(loop_manager, '_agent_git_resources', return_value=None):
+            with self.assertRaises(loop_manager.AgentScopeError):
+                self.validate()
         loop_manager.validate_agent_scope('planner', self.worktree, self.before,
             loop_manager.capture_git_snapshot(self.worktree), external_worktree=self.source,
             base_branch='main', connection=self.connection,
@@ -626,6 +631,7 @@ class ManagerBaselineReconciliationUnitTests(unittest.TestCase):
         self.connection = sqlite3.connect(':memory:')
         self.connection.row_factory = sqlite3.Row
         self.addCleanup(self.connection.close)
+        self.connection.execute(loop_manager.SCHEMA)
         self.source = Path('/source').resolve()
         self.worktree = Path('/managed').resolve()
         self.ref = 'refs/remotes/origin/main'
@@ -1128,7 +1134,6 @@ class ManagerBaselineReconciliationUnitTests(unittest.TestCase):
         self.source = self.state / 'source'
         self.source.mkdir()
         runtime_path = self.state / 'runtime'
-        self.connection.execute(loop_manager.SCHEMA)
         for base in ('main', 'develop'):
             with self.subTest(base=base):
                 ref = 'refs/remotes/origin/' + base
@@ -1173,6 +1178,35 @@ class ManagerBaselineReconciliationUnitTests(unittest.TestCase):
                         loop_manager.validate_persisted_agent_scope(self.connection, self.source, self.state,
                             str(self.source), runtime_mutation=mutation)
                         update.assert_not_called()
+                    # Rebase rechecks the historical result after runtime
+                    # metadata has already advanced its comparison baseline.
+                    from types import SimpleNamespace
+                    from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
+                    checkpoints = loop_manager.execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+                    audit = checkpoints.get(str(self.source), '')
+                    comparison = dict(audit.snapshot['manager_metadata_agent_baseline'], role='reviewer')
+                    checkpoints.record(str(self.source), '', expected_generation=audit.generation,
+                        operation='rebase', expected_head=self.current.head, target_base_oid='b' * 40,
+                        observed_remote_oid=None,
+                        snapshot={**audit.snapshot, 'manager_metadata_agent_baseline': comparison})
+                    self.connection.execute("UPDATE projects SET agent_role='reviewer', phase='REVIEWING'")
+                    service = mock.Mock()
+                    service.require_owned.return_value = (None, SimpleNamespace(status=RebaseStatus.COMPLETE))
+                    with mock.patch.object(loop_manager.managed_rebase_adoption, 'needs_agent_comparison', return_value=True), \
+                            mock.patch.object(loop_manager.managed_rebase_adoption, 'selected_baseline', side_effect=lambda value, *_a, **_k: value), \
+                            mock.patch.object(loop_manager, '_current_rebase_service', return_value=service):
+                        loop_manager.validate_persisted_agent_scope(self.connection, self.source, self.state,
+                            str(self.source), runtime_mutation=mutation)
+                        violation = replace(self.before, refs={**self.before.refs, ref: ('foreign', '')})
+                        self.connection.execute('UPDATE projects SET agent_result_snapshot=?', (violation.serialize(),))
+                        with self.assertRaises(loop_manager.AgentScopeError):
+                            loop_manager.validate_persisted_agent_scope(self.connection, self.source, self.state,
+                                str(self.source), runtime_mutation=mutation)
+                    self.connection.execute("UPDATE projects SET agent_role='planner', phase='PLANNING'")
+                    checkpoints.record(str(self.source), '', expected_generation=checkpoints.get(str(self.source), '').generation,
+                        operation=audit.operation, expected_head=audit.expected_head,
+                        target_base_oid=audit.target_base_oid, observed_remote_oid=audit.observed_remote_oid,
+                        snapshot=audit.snapshot)
                     violation = replace(self.before, refs={**self.before.refs,
                         ref: ('foreign', '')})
                     self.connection.execute('UPDATE projects SET agent_snapshot=?, '

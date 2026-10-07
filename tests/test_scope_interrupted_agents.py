@@ -68,9 +68,10 @@ class ScopeInterruptedAgentsTest(AgentScopeFixture, unittest.TestCase):
                 self.assertEqual(project["reviewer_session_id"], "reviewer-existing")
                 self.assertEqual(plan["status"], "IMPLEMENTING")
                 self.assertEqual(plan["retry_count"], 0)
-                self.assertIn(str(runtime.path), loop_manager.GitSnapshot.deserialize(
-                    project["agent_snapshot"]
-                ).worktrees)
+                self.assertEqual(project['agent_snapshot'], before.serialize())
+                audit = loop_manager.execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+                    str(repo), 'G-001').snapshot['manager_metadata_agent_baseline']
+                self.assertIn(str(runtime.path), loop_manager.GitSnapshot.deserialize(audit['snapshot']).worktrees)
                 connection.close()
 
 

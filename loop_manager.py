@@ -4088,9 +4088,8 @@ def main() -> int:
             runtime_mutation = validate_runtime_mutation(
                 source, state_dir, str(args.runtime_sha), args.runtime_mutation_id, **runtime_options,
             )
-            if runtime_mutation is not None and not runtime_mutation.legacy:
-                base = bootstrap_base_branch(source, state_dir, repository_origin(source))
-                validate_bootstrap_revision(source, base, str(args.runtime_sha))
+            # Mutation validation binds the selected revision and verifies any
+            # later live base advance; equality here would reject that proof.
             return execute_runtime_command(
                 args, state_dir, config_path, runtime_mutation,
             )

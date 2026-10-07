@@ -459,6 +459,9 @@ def _validate_persisted_agent_scope(
             comparison = agent_scope_decision.manager_comparison_baseline(
                 GitSnapshot.deserialize(str(project['agent_snapshot'])), comparison,
                 rebase_checkpoint.snapshot or {}, role_name)
+            agent_result = agent_scope_decision.manager_comparison_baseline(
+                GitSnapshot.deserialize(str(project['agent_snapshot'])), agent_result,
+                rebase_checkpoint.snapshot or {}, role_name)
             comparison = effects._normalize_legacy_ignored_snapshot(
                 saved_worktree, effects._with_proven_legacy_ignore_config(comparison, current_config), current)
             effects.validate_agent_scope(
