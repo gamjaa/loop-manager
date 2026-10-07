@@ -25,11 +25,8 @@ class PlannerFutureIdeasTest(unittest.TestCase):
             prompt,
         )
         plans_contract = (loop_manager.ROOT / "docs/PLANS.md").read_text(encoding="utf-8")
-        self.assertIn("### Agent Guidance Proposal: guidance-example", plans_contract)
-        self.assertIn("### Agent Guidance User Decision: guidance-example", plans_contract)
-        self.assertIn("`approve`", plans_contract)
-        self.assertIn("`reject`", plans_contract)
-        self.assertIn("`replace`", plans_contract)
+        self.assertNotIn("Agent Guidance Proposal", plans_contract)
+        self.assertNotIn("Agent Guidance User Decision", plans_contract)
 
     def test_validation_and_scope_separate_future_ideas_from_new_plans(self):
         with tempfile.TemporaryDirectory() as directory:

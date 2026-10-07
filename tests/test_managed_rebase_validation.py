@@ -64,7 +64,7 @@ class CurrentRebasePolicyTests(unittest.TestCase):
             {'staged': current.committed},
             {'index': (IndexEntry('app.py', '100644', 'unmerged', 2, 'M', 0x2000),)},
             {'remote': replace(expected.remote, oid='changed')},
-            {'committed': (replace(current.committed[0], path='docs/ARCHITECTURE.md'),)},
+            {'committed': (replace(current.committed[0], path='docs/requirements/Protected.md'),)},
         ):
             with self.subTest(changes=changes):
                 self.assertEqual(decision_for(expected, replace(current, operations=auxiliary,
@@ -167,8 +167,8 @@ class CurrentRebasePolicyTests(unittest.TestCase):
             {'committed': (replace(current.committed[0], new_mode='040000'),)},
             {'staged': (replace(current.committed[0], path=forbidden),)},
             {'files': (WorktreeFile(forbidden, ('unstaged',), '100644', 'changed'),)},
-            {'files': (WorktreeFile('AGENTS.md', ('untracked',), '100644', 'new'),)},
-            {'files': (WorktreeFile('docs/ARCHITECTURE.md', ('ignored',), '100644', 'hidden'),)},
+            {'files': (WorktreeFile('docs/requirements/Protected.md', ('untracked',), '100644', 'new'),)},
+            {'files': (WorktreeFile('docs/requirements/Protected.md', ('ignored',), '100644', 'hidden'),)},
             {'files': (WorktreeFile('../escape', ('untracked',), '100644', 'outside'),)},
             {'files': (WorktreeFile('.GIT/config', ('ignored',), '100644', 'outside'),)},
             {'index': (replace(current.index[0], mode='040000'),)},
@@ -462,7 +462,7 @@ class CurrentRebaseObservationTests(unittest.TestCase):
         expected = self.expected
         adapters = self.adapters()
         snapshot = adapters.capture_snapshot.return_value
-        protected = 'docs/ARCHITECTURE.md'
+        protected = 'docs/requirements/Protected.md'
         snapshot.index = {protected: ('H 100644 blob 0',)}
         original_git = adapters.git.side_effect
         def git(context, *args, **kwargs):

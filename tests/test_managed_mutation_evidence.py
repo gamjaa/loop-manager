@@ -961,7 +961,7 @@ class ManagedTransitionTests(unittest.TestCase):
             for pending in (
                 replace(clean, index_clean=False, staged=(FileChange('app.py', '100644', '100644', 'old', 'manual', 'M'),)),
                 replace(clean, index_clean=False, index=(IndexEntry('app.py', '100644', 'unmerged', 2, 'M', 0x2000),)),
-                replace(clean, committed=(FileChange('AGENTS.md', '100644', '100644', 'old', 'foreign', 'M'),)),
+                replace(clean, committed=(FileChange('docs/requirements/UserGuidance.md', '100644', '100644', 'old', 'foreign', 'M'),)),
             ):
                 with self.subTest(pending=pending), self.assertRaises(journal.MutationEvidenceError):
                     case.observed = pending
@@ -1060,7 +1060,7 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
             case.handler._begin_rebase_continuation(case.fixture.context(), CorrectionAction.CONTINUE)
         self.assertNotIn('stage_evidence', begin.call_args.kwargs['expected'])
         self.assertEqual(case.checkpoint.get('repo', 'G-047'), current)
-        case.observed = replace(case.observed, staged=(FileChange('AGENTS.md', '100644', '100644', 'old', 'foreign', 'M'),))
+        case.observed = replace(case.observed, staged=(FileChange('docs/requirements/UserGuidance.md', '100644', '100644', 'old', 'foreign', 'M'),))
         with mock.patch.object(journal, 'begin_current_rebase') as begin:
             with self.assertRaises(journal.MutationEvidenceError):
                 case.handler._begin_rebase_continuation(case.fixture.context(), CorrectionAction.CONTINUE)
@@ -1227,7 +1227,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                 output = '/repo/.git'
             elif args[0] == 'diff':
                 output = ''.join(':100644 100644 old user M\0' + path + '\0'
-                    for path in ('AGENTS.md', 'docs/ARCHITECTURE.md'))
+                    for path in ('docs/requirements/UserGuidance.md', 'docs/requirements/UserDesign.md'))
             return SimpleNamespace(stdout=output, returncode=0)
         ports.git.side_effect = git
         ports.requirement_archive_candidates.return_value = ()
@@ -1247,7 +1247,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
             WorktreeFile, RebaseStatus, assess_scope, assess_current_rebase)
         ports, service = self._user_document_service()
         expected = service.expected
-        for path in ('AGENTS.md', 'docs/ARCHITECTURE.md'):
+        for path in ('docs/requirements/UserGuidance.md', 'docs/requirements/UserDesign.md'):
             with self.subTest(path=path):
                 pending = observation(expected, head='partial', branch=None,
                     branch_ref=('before', ''), registration=('HEAD=partial', 'detached=True'),
@@ -1296,9 +1296,9 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         pending = observation(expected,
             metadata=(('head-name', f'refs/heads/{expected.branch}'),
                       ('orig-head', 'before'), ('onto', 'base')),
-            committed=(), staged=(FileChange('AGENTS.md', '100644', '000000', 'old', '0', 'U'),),
-            files=(WorktreeFile('AGENTS.md', ('unstaged',), '100644', 'manual bytes'),),
-            index=(IndexEntry('AGENTS.md', '100644', 'ours', 2, 'M', 0x2000),))
+            committed=(), staged=(FileChange('docs/requirements/UserGuidance.md', '100644', '000000', 'old', '0', 'U'),),
+            files=(WorktreeFile('docs/requirements/UserGuidance.md', ('unstaged',), '100644', 'manual bytes'),),
+            index=(IndexEntry('docs/requirements/UserGuidance.md', '100644', 'ours', 2, 'M', 0x2000),))
         for metadata in (None, (('head-name', 'refs/heads/other'), ('orig-head', 'before'), ('onto', 'base')),
                          (('head-name', f'refs/heads/{expected.branch}'), ('orig-head', 'other'), ('onto', 'base')),
                          (('head-name', f'refs/heads/{expected.branch}'), ('orig-head', 'before'), ('onto', 'other'))):
@@ -1409,7 +1409,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(service.expected.before_head, 'before')
         self.assertIsNone(service.adapters.read_remote(service.expected).pull_request)
         self.assertTrue(service.adapters.path_allowed('app.py'))
-        self.assertFalse(service.adapters.path_allowed('docs/ARCHITECTURE.md'))
+        self.assertFalse(service.adapters.path_allowed('docs/requirements/UserDesign.md'))
         # Current Worker guidance permits updating other existing ExecPlan records.
         self.assertTrue(service.adapters.path_allowed('docs/plans/[G-048] Other.md'))
         self.assertFalse(service.adapters.path_allowed('docs/requirements/Other.md'))
@@ -1619,7 +1619,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
             staged = case.observed
             for unsafe in (
                 replace(staged, index=(IndexEntry('app.py', '100644', 'unmerged', 2, 'M', 0x2000),)),
-                replace(staged, committed=(FileChange('AGENTS.md', '100644', '100644', 'old', 'unsafe', 'M'),)),
+                replace(staged, committed=(FileChange('docs/requirements/UserGuidance.md', '100644', '100644', 'old', 'unsafe', 'M'),)),
                 replace(staged, remote=replace(staged.remote, oid='external')),
             ):
                 with self.subTest(unsafe=unsafe):

@@ -554,7 +554,7 @@ class PlanningDocumentRelevanceTest(unittest.TestCase):
 
             self.assertEqual(relevant_document_changes(
                 git, root, root, "old", "new", [], (), ("G-118",),
-            ), ("AGENTS.md", source))
+            ), (source,))
             changes = (unrelated,)
             self.assertEqual(relevant_document_changes(
                 git, root, root, "old", "new", [], (), ("G-118",),

@@ -247,8 +247,9 @@ class ExecutionRecoveryScenarios:
                                  expected_remote)
             if rejected:
                 completed = git(fixture.worktree, 'rev-parse', 'HEAD')
-                rejected_file = (fixture.worktree / 'docs/ARCHITECTURE.md'
+                rejected_file = (fixture.worktree / 'docs/requirements/Protected.md'
                                  if rejected in {'unstaged', 'late-file'} else app)
+                rejected_file.parent.mkdir(parents=True, exist_ok=True)
                 if rejected in {'unstaged', 'staged'}:
                     rejected_file.write_text(rejected_file.read_text() + 'unapproved change\n'
                                              if rejected_file.exists() else 'unapproved change\n')

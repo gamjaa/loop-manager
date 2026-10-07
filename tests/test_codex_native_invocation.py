@@ -247,7 +247,7 @@ class NativeWriteIsolationTests(TestCase):
 
     def test_actual_adapter_runs_direct_roles_and_resume_and_persists_evidence(self):
         cases = ((role, role == 'reviewer', session)
-                 for role in ('planner', 'worker', 'reviewer', 'maintenance')
+                 for role in ('planner', 'worker', 'reviewer', 'maintenance_planner')
                  for session in (None, 'saved'))
         for role, read_only, session in cases:
             with self.subTest(role=role, session=session), tempfile.TemporaryDirectory() as directory:
@@ -319,7 +319,7 @@ class NativeWriteIsolationTests(TestCase):
                 self.assertEqual(row, ('verified', 'success', session))
 
     def test_session_unavailable_fallback_rechecks_direct_policy_without_losing_history(self):
-        for role in ('planner', 'worker', 'maintenance', 'reviewer'):
+        for role in ('planner', 'worker', 'maintenance_planner', 'reviewer'):
             with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
                 boundary, state_root, home = self.boundary(Path(directory))
                 connection = sqlite3.connect(':memory:')

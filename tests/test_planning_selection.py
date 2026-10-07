@@ -848,19 +848,15 @@ class PlanningSelectionTest(PlanningCase):
         self.assertEqual(ports.agent.roles, [(None, False)])
         self.assertIsNone(ports.state.check_record)
 
-    def test_guidance_and_code_change_uses_general_planner(self):
+    def test_project_guidance_change_does_not_override_code_check_selection(self):
         ports = self._code_check_ports()
         ports.git.guidance_changed = True
-        ports.agent.result = PlanningAgentResult(
-            0, "general planner result", "general-session",
-            PlanningAgentResultKind.SUCCESS,
-        )
 
         outcome = PlanningLifecycleCoordinator(ports).run(self.context)
 
         self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
-        self.assertEqual(ports.agent.roles, [(None, False)])
-        self.assertIsNone(ports.state.check_record)
+        self.assertEqual(ports.agent.roles, [("planner_check", True)])
+        self.assertEqual(ports.state.check_record["stage"], "accepted")
 
     def test_accepted_check_does_not_claim_later_general_planning(self):
         ports = self._code_check_ports()

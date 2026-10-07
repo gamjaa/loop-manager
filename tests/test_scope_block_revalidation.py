@@ -373,7 +373,7 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
         _, result = self.scope_stage_result()
         for changed in (replace(result, index={'app.py': ('S 100644 manual 0',)}),
                         replace(result, index={'app.py': ('h 100644 manual 0',)}),
-                        replace(result, dirty={**result.dirty, 'AGENTS.md': (('unstaged',), 'foreign')}),
+                        replace(result, dirty={**result.dirty, 'docs/requirements/Protected.md': (('unstaged',), 'foreign')}),
                         replace(result, refs={**result.refs, 'refs/heads/other': ('foreign', '')})):
             self.connection.execute("UPDATE exec_plans SET agent_result_snapshot = ?", (changed.serialize(),))
             self.connection.commit()
