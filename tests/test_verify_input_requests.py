@@ -243,3 +243,88 @@ class VerifyInputPlanningPromptTest(unittest.TestCase):
         self.assertIn(manager_sources.PREFIX, port.maintenance_prompt(context, 'catalog', '', None,
                                                                     include_general_planning=True))
         self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM verify_input_requests').fetchone()[0], 1)
+
+
+class ManagerSourceManualDefinitionTest(unittest.TestCase):
+    setUp = ManagerSourceCatalogGateTest.setUp
+
+    def test_manual_completion_definition_uses_registered_rules_without_source_file_query(self):
+        from loop_manager_internal.execution.manual_candidate import ManualCandidate
+        from loop_manager_internal.storage.manual_work_state import digest
+        path = 'docs/plans/[G-003] Inputs.md'
+        text = self.documents[path]
+        plan = catalog.parse_execplan_text(path, text)
+        documents = [{'path': path, 'text': text, 'plan': plan}]
+        calls = []
+        def git(repo, *args, **kwargs):
+            calls.append(args)
+            if args == ('rev-parse', 'HEAD'):
+                return SimpleNamespace(stdout=SHA, returncode=0)
+            if args == ('show', f'{SHA}:{path}'):
+                return SimpleNamespace(stdout=text, returncode=0)
+            raise AssertionError('unexpected Git file query: ' + repr(args))
+        candidate = ManualCandidate(self.connection, '/repo', 'G-003', git,
+            lambda *args: f'100644 blob oid\t{path}\0'.encode())
+        group = {'kind': 'start', 'state': 'AUTOMATIC', 'request_id': 'manual-completion',
+                 'documents': json.dumps(documents)}
+        context = SimpleNamespace(worktree=Path('/candidate'))
+        with mock.patch.object(candidate, 'group', return_value=group):
+            snapshot = candidate.definition(context, None, SHA)
+            self.assertEqual(snapshot.sources, (manager_sources.SOURCE,))
+            self.assertEqual(snapshot.source_fingerprint,
+                             digest([(manager_sources.SOURCE, manager_sources.source_content(manager_sources.SOURCE))]))
+            self.connection.execute('DELETE FROM verify_input_requests')
+            with self.assertRaisesRegex(RuntimeError, 'unregistered'):
+                candidate.definition(context, None, SHA)
+        self.assertFalse(any(manager_sources.SOURCE in arg for args in calls for arg in args))
+
+
+class ManagerSourceFinalReviewTest(unittest.TestCase):
+    setUp = VerifyInputRequestTest.setUp
+
+    def test_final_followup_validates_registered_manager_request_and_keeps_document_gates(self):
+        from tempfile import TemporaryDirectory
+        from loop_manager_internal.planning.specification_review import validate_final
+        from loop_manager_internal.planning.planning_catalog import PlanningResultInvalid
+        from loop_manager_internal.planning.validation_ports import _PlanningValidationPorts
+        request = verify_input_requests.register(self.connection, self.repo, SHA)
+        attempt = {'revision': SHA, 'input_fingerprint': 'input',
+                   'specification_fingerprint': 'specification', 'work_cycle': 'cycle'}
+        evidence = ['docs/PRODUCT.md', 'docs/ARCHITECTURE.md', 'src/app.py']
+        value = dict(attempt, outcome='followup', reason='Create missing verify inputs', evidence=evidence)
+        def git_run(repo, *args, **kwargs):
+            if '--name-only' in args:
+                return SimpleNamespace(stdout='docs/PRODUCT.md\0docs/ARCHITECTURE.md\0')
+            paths = args[args.index('--') + 1:]
+            self.assertNotIn(manager_sources.SOURCE, paths)
+            return SimpleNamespace(stdout=''.join(f'100644 blob oid\t{path}\0' for path in paths))
+        git = SimpleNamespace(run=git_run)
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            path = 'docs/plans/[G-001] Inputs.md'
+            (root / path).parent.mkdir(parents=True)
+            text = plan_text(request)
+            (root / path).write_text(text)
+            plan = catalog.parse_execplan_text(path, text)
+            batch = SimpleNamespace(plans=((path, plan),), revisions=(), deletions=(), restoration_moves=())
+            port = _PlanningValidationPorts(SimpleNamespace(), self.connection)
+            validator = lambda path, plan: port.validate_manager_source(self.repo, root, path, plan)
+            def validate():
+                return validate_final(attempt, 'FINAL_SPECIFICATION_REVIEW: ' + json.dumps(value),
+                    batch, git, root, manager_source_validator=validator)
+            self.assertEqual(validate(), 'followup')
+            plan['draft'] = True
+            value['outcome'] = 'needs_decision'
+            self.assertEqual(validate(), 'needs_decision')
+            value['outcome'] = 'followup'
+            for sources in ([], ['manager:unknown'], [manager_sources.SOURCE, 'docs/PRODUCT.md'],
+                            ['docs/requirements/Missing.md']):
+                plan['sources'] = sources
+                with self.assertRaises(PlanningResultInvalid):
+                    validate()
+            plan['sources'] = [manager_sources.SOURCE]
+            with self.assertRaises(PlanningResultInvalid):
+                validate_final(attempt, 'FINAL_SPECIFICATION_REVIEW: ' + json.dumps(value), batch, git, root)
+            self.connection.execute('DELETE FROM verify_input_requests')
+            with self.assertRaisesRegex(PlanningResultInvalid, 'unregistered'):
+                validate()

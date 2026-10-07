@@ -569,7 +569,11 @@ class PlanningAssessmentService(PlanningService):
                         if attempt["revision"] != row.active_sha or attempt["work_cycle"] != self._ports.state.review_work_cycle(context.repo):
                             raise PlanningResultInvalid("일반 planning 검토 입력이 변경됐습니다. 최신 입력을 다시 확인하세요.")
                         outcome = (validate_final(attempt, str(row.planning_result or ""), validated_result,
-                                   self._ports.git, context.repo_path) if attempt["purpose"] == "final" else "reviewed")
+                                   self._ports.git, context.repo_path,
+                                   manager_source_validator=lambda path, plan:
+                                       self._ports.validation.validate_manager_source(
+                                           context.repo, worktree, path, plan))
+                                   if attempt["purpose"] == "final" else "reviewed")
                 if hasattr(self._ports, "retirement"):
                     from dataclasses import replace
                     from loop_manager_internal.application.contracts import ValidatedPlanningResult

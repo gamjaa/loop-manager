@@ -107,6 +107,11 @@ class _PlanningValidationPorts:
         return instruction(self._connection, repo, str(project["base_branch"]), active_sha,
                            git=self._effects.git, git_bytes=self._effects.git_bytes)
 
+    def validate_manager_source(self, repo: str, worktree: Path, path: str, plan) -> None:
+        from loop_manager_internal.storage import verify_input_requests
+        verify_input_requests.validate(self._connection, repo,
+            (worktree / path).read_text(encoding="utf-8"), plan["sources"])
+
     def maintenance_prompt(
         self,
         context: MaintenancePlanningContext,

@@ -155,6 +155,8 @@ class ManualCandidate:
         # Graph dependency existence is checked by the authoritative catalog;
         # each member is independently validated here with its external edges.
         for item in documents:
+            from loop_manager_internal.storage import verify_input_requests
+            verify_input_requests.validate(self.connection, self.repo, item['text'], item['plan']['sources'])
             if any(dep not in {row[0] for row in known} for dep in item['plan']['depends_on']):
                 raise RuntimeError('제출 G의 외부 dependency가 등록되지 않았습니다.')
             isolated = execplan_catalog.snapshot_from_documents(
@@ -175,6 +177,10 @@ class ManualCandidate:
         sources = sorted({path for item in documents for path in item['plan']['sources']})
         source_texts=[]
         for path in sources:
+            from loop_manager_internal.catalog.manager_sources import SOURCE, source_content
+            if path == SOURCE:
+                source_texts.append((path, source_content(path)))
+                continue
             result=self.git(context.worktree,'show',f'{head}:{path}',check=False)
             if result.returncode:
                 # The revision gate integrates this observed user base before

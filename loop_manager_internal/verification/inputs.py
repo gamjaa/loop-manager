@@ -17,7 +17,7 @@ import stat
 from typing import Mapping
 
 MANIFEST = "scripts/verify-inputs.json"
-RULES = "verify-inputs-v1:posix-case-sensitive-segments-star-question-globstar-dotfiles;kinds-modes;no-symlink-follow;git-venv-bytecode-separate"
+RULES = "verify-inputs-v1:posix-case-sensitive-segments-star-question-globstar-dotfiles;kinds-modes;no-symlink-follow;git-venv-bytecode-separate;exclusions-bound-selected-inputs"
 
 
 def digest(value) -> str:
@@ -123,7 +123,7 @@ def observe(root: Path, *, command: tuple[str, ...], environment: Mapping[str, s
         context = {"rules": RULES, "manifest": hashlib.sha256(raw).hexdigest(),
                    "command": command, "environment": dict(environment), "runtime": runtime,
                    "git": git_inputs, "external": external_inputs}
-        token = digest((context, uncovered))
+        token = digest((context, selected, uncovered))
         fingerprint = digest((context, selected))
         reason = None
         if not command or not runtime or git_inputs is None or external_inputs is None:

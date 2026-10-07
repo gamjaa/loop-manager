@@ -113,6 +113,23 @@ class VerifyInputObservationTest(unittest.TestCase):
         self.assertFalse(self.observe(completeness=current.completeness_token,
                                       environment={'MODE': 'changed'}).proven)
 
+    def test_exclusion_proof_expires_when_selected_script_or_settings_change(self):
+        self.manifest(['src/**', 'scripts/**', 'verify-config.json'])
+        script = self.root / 'scripts/verify.sh'
+        config = self.root / 'verify-config.json'
+        script.write_text('verify src')
+        config.write_text('src only')
+        (self.root / 'excluded.json').write_text('previously unused')
+        for target in (script, config):
+            with self.subTest(target=target.name):
+                initial = self.observe()
+                self.assertTrue(self.observe(completeness=initial.completeness_token).proven)
+                target.write_text('verify now reads excluded.json')
+                changed = self.observe(completeness=initial.completeness_token)
+                self.assertFalse(changed.proven)
+                self.assertNotEqual(initial.completeness_token, changed.completeness_token)
+                self.assertTrue(self.observe(completeness=changed.completeness_token).proven)
+
     def test_command_environment_runtime_git_external_and_unknown(self):
         first = self.observe()
         for context in (dict(environment={'MODE': 'changed'}), dict(runtime_identity='other-python'),

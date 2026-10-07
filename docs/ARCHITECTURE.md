@@ -458,8 +458,9 @@ glob의 빈 결과는 관측 가능한 빈 집합이다. 목록 자체와 실제
 확인되지 않은 입력은 재사용할 수 없다. Git 내부·bytecode는 생성물이고 `.venv`는 별도로
 측정한 runtime/외부 의존성 identity로 확인한다.
 
-목록 밖 파일은 경로·내용·kind·mode 및 검증 설정에 결합한 completeness token으로 제한된
-제외 검토가 필요하다. verify 성공은 이 근거를 만들지 않는다. 관측 API는 실행·성공 저장·
+목록 밖 파일의 제외 확인은 경로·내용·kind·mode, 실행 context와 목록에 포함된 모든 입력의
+경로·내용·kind·mode에 결합한 completeness token으로 제한한다. 검증 스크립트·설정 변경도
+기존 제외 확인을 무효화한다. verify 성공은 이 근거를 만들지 않는다. 관측 API는 실행·성공 저장·
 재사용 정책과 분리하며, 목록 부재/오류는 기존 전체 verify를 유지한다.
 
 일반 planning의 prompt 준비는 최신 `origin/<base>`의 고정 revision과 실제 목록을 조회한다.
@@ -468,7 +469,9 @@ glob의 빈 결과는 관측 가능한 빈 집합이다. 목록 자체와 실제
 `verify_input_requests`에 프로젝트·revision·목적·규칙 원문/버전을 보존하며 같은 요청을 재사용한다.
 `manager:verify-inputs` 계획은 요청 선언과 정확한 생성 Purpose를 유지해야 한다. Planner 결과와
 원격 catalog 등록에서 실제 등록 요청과 대조하며 임의 예약어·제품 목표 혼합을 거부한다.
-예약어는 문서 조회와 Requirement retirement에서 제외하고 규칙 내용을 source 지문에 결합한다.
+예약어는 수동 완료 후보를 포함한 문서 조회와 Requirement retirement에서 제외하고 규칙 내용을
+source 지문에 결합한다. 최종 전문 확인의 후속 계획도 등록 요청 검증을 통과한 예약 source를
+허용하며 활성 명세 전문·구현 근거 및 draft 조건은 유지한다.
 이는 성공 결과 재사용이나 일반 runner 도입을 구현하지 않는다.
 
 ## Architecture Change Policy

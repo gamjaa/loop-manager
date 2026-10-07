@@ -529,6 +529,8 @@ class PlanningValidationPort(Protocol):
         mutable_snapshot: MutableReadySnapshot,
     ) -> str: ...
 
+    def validate_manager_source(self, repo: str, worktree: Path, path: str, plan) -> None: ...
+
     def maintenance_prompt(
         self,
         context: MaintenancePlanningContext,
