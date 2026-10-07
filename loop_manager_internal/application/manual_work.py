@@ -522,6 +522,8 @@ class ManualWorkService:
             self.display(group,accepted=True)
             return 0
         source_changed=bool(group and group['source_head']!=head)
+        if group and group['source_update_candidate'] and group['pending_source_head']!=head:
+            raise ManualWorkError('이전 source 후보의 게시가 미확정입니다. 기존 요청·후보를 먼저 복구해야 합니다.')
         if group and group['state']=='PR_OPEN' and not source_changed:
             self.display(group,accepted=True)
             return 0
@@ -550,6 +552,7 @@ class ManualWorkService:
                     self.store.update(group,source_head=head,base_sha=base,attempts=0,last_error=None)
                 else:
                     self.store.update(group,pending_source_head=head,attempts=0,last_error=None,
+                        source_update_conflict=group['source_update_conflict'] if group['source_update_candidate'] else 0,
                         state=group['state'] if group['state']=='REGISTERING' else 'AUTOMATIC')
         group = self.store.get(self.repo, group['group_id'])
         if group['state']=='PREPARATION_CONFLICT':

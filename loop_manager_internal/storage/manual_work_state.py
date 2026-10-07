@@ -37,6 +37,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     for name, definition in (('resume_phase', "TEXT NOT NULL DEFAULT 'VERIFYING'"),
                              ('initial_source_head', "TEXT"), ('pending_source_head', 'TEXT'),
                              ('source_update_candidate','TEXT'),
+                             ('source_update_remote_oid','TEXT'),
                              ('source_update_conflict', 'INTEGER NOT NULL DEFAULT 0'),
                              ('workspace_created','INTEGER NOT NULL DEFAULT 0'),
                              ('definition_head','TEXT')):
@@ -127,6 +128,7 @@ class ManualWorkRepository:
         allowed = {'state','members','documents','owner_id','branch','worktree','prepared_head',
                    'active_id','request_id','last_error','attempts','source_head','base_sha',
                    'resume_phase','pending_source_head','source_update_candidate','source_update_conflict',
+                   'source_update_remote_oid',
                    'workspace_created','definition_head'}
         if not values or not set(values) <= allowed:
             raise ValueError('invalid manual group update')
