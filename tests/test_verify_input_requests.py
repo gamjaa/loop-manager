@@ -100,11 +100,34 @@ class VerifyInputRequestTest(unittest.TestCase):
         self.remote_file('docs/plans/[G-001] Inputs.md', text.encode())
         self.assertEqual(self.instruction(), '')
 
+    def test_invalid_remote_declaration_defers_only_missing_list_request(self):
+        request = {'id': 'f' * 64, 'revision': SHA,
+                   'purpose': manager_sources.PURPOSE, 'version': 1}
+        invalid = plan_text(request, source='docs/PRODUCT.md').replace('risk: medium', 'risk: unsupported')
+        for raw in (invalid.encode(), b'\xff'):
+            with self.subTest(raw=raw):
+                self.remote_file('docs/plans/[G-001] Inputs.md', raw)
+                self.assertEqual(self.instruction(), '')
+                self.assertEqual(self.connection.execute(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name='verify_input_requests'"
+                ).fetchone()[0], 0)
+
     def test_git_failure_is_not_absence(self):
         with mock.patch.object(self, 'git_bytes', side_effect=RuntimeError('unavailable')):
             with self.assertRaisesRegex(RuntimeError, 'unavailable'):
                 self.instruction()
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM sqlite_master WHERE name='verify_input_requests'").fetchone()[0], 0)
+
+    def test_plan_blob_query_failure_is_not_a_declaration_error(self):
+        self.remote_file('docs/plans/[G-001] Inputs.md', b'preserved remote plan')
+        original = self.git_bytes
+        def unreadable(repo, *args):
+            if args[0] == 'cat-file':
+                raise RuntimeError('plan blob unavailable')
+            return original(repo, *args)
+        with mock.patch.object(self, 'git_bytes', side_effect=unreadable):
+            with self.assertRaisesRegex(RuntimeError, 'plan blob unavailable'):
+                self.instruction()
 
     def test_unregistered_reserved_unknown_and_scope_mismatch_are_rejected(self):
         request = self.request()
@@ -224,6 +247,30 @@ class VerifyInputPlanningPromptTest(unittest.TestCase):
     setUp = VerifyInputRequestTest.setUp
     git = VerifyInputRequestTest.git
     git_bytes = VerifyInputRequestTest.git_bytes
+    remote_file = VerifyInputRequestTest.remote_file
+
+    def test_isolated_remote_plan_error_preserves_general_and_maintenance_prompts(self):
+        from loop_manager_internal.planning.validation_ports import _PlanningValidationPorts
+        from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot
+        self.connection.execute('CREATE TABLE projects (repo TEXT, base_branch TEXT)')
+        self.connection.execute('INSERT INTO projects VALUES (?, ?)', (self.repo, 'main'))
+        request = {'id': 'f' * 64, 'revision': SHA,
+                   'purpose': manager_sources.PURPOSE, 'version': 1}
+        invalid = plan_text(request, source='docs/PRODUCT.md').replace('risk: medium', 'risk: unsupported')
+        self.remote_file('docs/plans/[G-001] Inputs.md', invalid.encode())
+        effects = SimpleNamespace(planner_prompt=lambda *args: 'normal planning',
+            is_loop_manager_repository=lambda repo: False, git=self.git, git_bytes=self.git_bytes,
+            maintenance_planner_prompt=lambda *args, **kwargs: 'maintenance planning')
+        port = _PlanningValidationPorts(effects, self.connection)
+        snapshot = MutableReadySnapshot(self.repo, SHA, (), 'token')
+        self.assertEqual(port.planner_prompt(None, 'isolated catalog', snapshot), 'normal planning')
+        context = SimpleNamespace(repo=self.repo, active_sha=SHA)
+        self.assertEqual(port.maintenance_prompt(context, 'isolated catalog', '', None,
+                                                include_general_planning=True), 'maintenance planning')
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM sqlite_master WHERE name='verify_input_requests'"
+        ).fetchone()[0], 0)
+
     def test_general_and_combined_planning_register_request_but_maintenance_only_does_not(self):
         from loop_manager_internal.planning.validation_ports import _PlanningValidationPorts
         from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot

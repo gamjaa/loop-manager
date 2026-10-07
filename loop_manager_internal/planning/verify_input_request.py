@@ -43,9 +43,16 @@ def instruction(connection, repo: str, base: str, active_sha: str, *, git, git_b
     for path, (mode, kind, oid) in entries.items():
         if (path.startswith('docs/plans/') and path.count('/') == 2 and path.endswith('.md')
                 and mode in (b'100644', b'100755') and kind == b'blob'):
-            text = git_bytes(repository, 'cat-file', 'blob', oid.decode('ascii')).decode('utf-8')
+            raw = git_bytes(repository, 'cat-file', 'blob', oid.decode('ascii'))
             from loop_manager_internal.catalog.execplan_catalog import parse_execplan_text
-            plan = parse_execplan_text(path, text, validate_sources=False)
+            try:
+                text = raw.decode('utf-8')
+                plan = parse_execplan_text(path, text, validate_sources=False)
+            except (UnicodeError, RuntimeError):
+                # The authoritative catalog owns declaration-error isolation.
+                # An unreadable declaration cannot disprove related pending work;
+                # defer only this optional request, preserving normal planning.
+                return ''
             row = next((r for r in rows if r['plan_id'] == plan['id']), None)
             if row is not None and row['status'] in ('MERGED', 'CANCELLED'):
                 continue

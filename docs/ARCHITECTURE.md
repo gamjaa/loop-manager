@@ -465,7 +465,9 @@ glob의 빈 결과는 관측 가능한 빈 집합이다. 목록 자체와 실제
 
 일반 planning의 prompt 준비는 최신 `origin/<base>`의 고정 revision과 실제 목록을 조회한다.
 오래된 planning branch는 새 누락 요청을 만들지 않는다. 원격 활성 계획(draft 포함)과 SQLite의
-미종료 계획(PR 포함)에 관련 작업이 있으면 요청을 생략한다. Manager 요청은 additive SQLite
+미종료 계획(PR 포함)에 관련 작업이 있으면 요청을 생략한다. 원격 계획 선언 오류로 중복 여부가
+불확실하면 입력 목록 생성 요청만 보류하고, 기존 catalog의 오류 격리와 일반·유지보수 planning을
+유지한다. Git 조회 실패는 선언 오류로 숨기지 않는다. Manager 요청은 additive SQLite
 `verify_input_requests`에 프로젝트·revision·목적·규칙 원문/버전을 보존하며 같은 요청을 재사용한다.
 `manager:verify-inputs` 계획은 요청 선언과 정확한 생성 Purpose를 유지해야 한다. Planner 결과와
 원격 catalog 등록에서 실제 등록 요청과 대조하며 임의 예약어·제품 목표 혼합을 거부한다.
