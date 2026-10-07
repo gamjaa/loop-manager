@@ -6,7 +6,7 @@ from contextlib import contextmanager
 import json
 import sqlite3
 from .repository import adopt_legacy_block_notices, ensure_schema
-from .incidents import _current_block_key, _materialize_resumption
+from .incidents import _current_block_key, _materialize_resumption, _materialize_unnotified_start
 from .rendering import _message, _pieces
 from .transport import send_telegram
 
@@ -167,11 +167,10 @@ def _deliver_rows(
                     )
                     if row[1] == "blocked":
                         incident = connection.execute(
-                            "SELECT incident_id FROM block_notice_events WHERE event_key = ?",
-                            (row[0],),
+                            "SELECT incident_id FROM block_notice_events WHERE event_key = ?", (row[0],),
                         ).fetchone()
                         if incident is not None:
-                            _materialize_resumption(connection, int(incident[0]))
+                            _materialize_unnotified_start(connection, int(incident[0]))
                 break
             with connection:
                 connection.execute(

@@ -721,24 +721,55 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
 
 
 class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
+    def test_review_failure_projection_leaves_nonprotocol_errors_to_recovery(self):
+        connection = self.connection()
+        loop_manager.update_project(connection, '/projects/alpha',
+                                    phase='REVIEWING', last_error='Reviewer CLI execution failed')
+        self.assertEqual(self.events(connection), [])
+
     def test_review_failure_identity_preserves_changes_and_transaction_boundary(self):
         connection = self.connection()
         repo = '/projects/alpha'
         with self.assertRaisesRegex(RuntimeError, 'interrupted'):
             with connection:
-                connection.execute("UPDATE projects SET phase = 'REVIEWING', last_error = 'protocol error' WHERE repo = ?", (repo,))
+                connection.execute("UPDATE projects SET phase = 'REVIEWING', last_error = 'Reviewer 결과 프로토콜 오류: protocol error' WHERE repo = ?", (repo,))
                 notifications.enqueue_current_project_events(connection, repo)
                 raise RuntimeError('interrupted')
         self.assertEqual(self.events(connection), [])
-        loop_manager.update_project(connection, repo, phase='REVIEWING', last_error='protocol error')
+        loop_manager.update_project(connection, repo, phase='REVIEWING', last_error='Reviewer 결과 프로토콜 오류: protocol error')
         first = self.events(connection)[0]['payload']
-        loop_manager.update_project(connection, repo, last_error='protocol error')
+        loop_manager.update_project(connection, repo, last_error='Reviewer 결과 프로토콜 오류: protocol error')
         self.assertEqual(len(self.events(connection)), 1)
         self.assertEqual(self.events(connection)[0]['payload'], first)
-        loop_manager.update_project(connection, repo, last_error='different protocol error')
+        loop_manager.update_project(connection, repo, last_error='Reviewer 결과 프로토콜 오류: different protocol error')
         self.assertEqual(len(self.events(connection)), 2)
-        loop_manager.update_project(connection, repo, verify_token='new-candidate', last_error='protocol error')
+        loop_manager.update_project(connection, repo, verify_token='new-candidate', last_error='Reviewer 결과 프로토콜 오류: protocol error')
         self.assertEqual(len(self.events(connection)), 3)
+
+    def test_review_protocol_failure_is_durable_silent_and_deduplicated(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        cause = 'Reviewer 결과 프로토콜 오류: missing ISSUE_ID'
+        with connection:
+            connection.execute("UPDATE exec_plans SET verify_token = 'candidate-1' WHERE repo = ?", (repo,))
+        loop_manager.update_project(connection, repo, phase='REVIEWING', last_error=cause)
+        first = next(row for row in self.events(connection) if row['event_type'] == 'stage_failed')
+        payload = json.loads(first['payload'])
+        self.assertEqual(payload['execplan_id'], 'G-018')
+        self.assertEqual(payload['operation'], 'Reviewer')
+        self.assertEqual(payload['cause'], cause)
+        self.assertEqual(payload['status'], '자동 교정·재시도 대기')
+        self.assertTrue(payload['silent'])
+        self.assertIn('occurred_at', payload)
+        loop_manager.update_project(connection, repo, phase='REVIEWING', last_error=cause)
+        loop_manager.update_project(connection, repo, phase='PUBLISHING', last_error=None)
+        self.assertEqual(len([row for row in self.events(connection) if row['event_type'] == 'stage_failed']), 1)
+        self.assertEqual(connection.execute('SELECT payload FROM notification_outbox WHERE event_key = ?',
+                                            (first['event_key'],)).fetchone()[0], first['payload'])
+        with connection:
+            connection.execute("UPDATE exec_plans SET verify_token = 'candidate-2' WHERE repo = ?", (repo,))
+        loop_manager.update_project(connection, repo, phase='REVIEWING', last_error=cause)
+        self.assertEqual(len([row for row in self.events(connection) if row['event_type'] == 'stage_failed']), 2)
 
     def test_selection_is_silent_and_actual_start_is_durable_and_deduplicated(self):
         connection = self.connection()

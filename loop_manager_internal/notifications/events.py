@@ -81,7 +81,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
                          str(project[5]) + "\0" + str(project[7]) + "\0" + str(planning_failure),
                          operation="Planner", cause=str(planning_failure),
                          status="다음 실행 또는 자동 교정 대기", silent=True)
-    if project[0] == "REVIEWING" and project[3]:
+    if project[0] == "REVIEWING" and str(project[3] or "").startswith("Reviewer 결과 프로토콜 오류:"):
         plan = connection.execute(
             "SELECT plan_id, current_revision_sha, verify_token FROM exec_plans "
             "WHERE repo = ? AND path = ?", (repo, project[1]),
@@ -665,11 +665,13 @@ def record_process_start(connection, repo, role, identity, *, plan_id=None, resu
     # Delivery of a BLOCKED piece may still be in flight. The incident will
     # materialize its resumption when confirmation arrives; suppress the generic start too.
     pending_resume = connection.execute(
-        "SELECT 1 FROM notified_block_incidents i JOIN notification_outbox o "
-        "ON o.event_key = i.event_key WHERE i.repo = ? AND i.start_identity = ? "
-        "AND i.released_at IS NOT NULL AND i.resumed_at IS NULL "
-        "AND o.delivery_started_at IS NOT NULL LIMIT 1",
-        (repo, identity),
+        "SELECT 1 FROM notified_block_incidents i WHERE repo = ? AND started_operation = ? "
+        "AND start_identity = ? AND released_at IS NOT NULL AND resumed_at IS NULL "
+        "AND subject IN (?, 'project') AND EXISTS (SELECT 1 FROM block_notice_events b "
+        "JOIN notification_outbox o ON o.event_key = b.event_key "
+        "WHERE b.incident_id = i.id AND o.delivery_started_at IS NOT NULL "
+        "AND o.sent_at IS NULL) LIMIT 1",
+        (repo, operation, identity, f"plan:{plan_id}" if plan_id else "planning"),
     ).fetchone()
     if not blocked_resume and not pending_resume:
         enqueue_progress(connection, repo, "work_started", identity,

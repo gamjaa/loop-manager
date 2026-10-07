@@ -18,6 +18,7 @@ from loop_manager_internal.documents.reviewer_specification import Specification
 from loop_manager_internal.execution.execution_effects import ExecutionContract, FeedbackEffects
 from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot
 from loop_manager_internal.execution.execution_state import ExecutionStatePort
+from loop_manager_internal.notifications import notifications
 
 @dataclass(frozen=True)
 class ReviewHandlerPorts:

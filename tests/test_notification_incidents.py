@@ -193,8 +193,10 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
             "SELECT started_operation, resumed_at FROM notified_block_incidents "
             "WHERE id = ?", (first_id,),
         ).fetchone()
-        self.assertEqual(started["started_operation"], "Planner")
-        self.assertIsNotNone(started["resumed_at"])
+        self.assertIsNone(started["started_operation"])
+        self.assertIsNone(started["resumed_at"])
+        self.assertEqual(len([row for row in self.events(connection)
+                              if row["event_type"] == "work_started"]), 1)
         notice_created_at = connection.execute(
             "SELECT o.created_at FROM notification_outbox o "
             "JOIN notified_block_incidents i ON i.event_key = o.event_key "
@@ -1104,6 +1106,52 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
 
 
 class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
+    def test_unsent_released_block_does_not_suppress_physical_starts(self):
+        for failed_send in (False, True):
+            with self.subTest(failed_send=failed_send):
+                connection = self.connection()
+                repo = '/projects/alpha'
+                with connection:
+                    connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                                       "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'cause')", (repo,))
+                    notifications.enqueue_current_project_events(connection, repo)
+                if failed_send:
+                    notifications.dispatch_pending(connection, 'token', 'chat',
+                                                   adapter=mock.Mock(side_effect=OSError('offline')))
+                with connection:
+                    scoped_blocking.clear_plan_block(connection, repo, 'G-018')
+                    for identity in ('first-start', 'first-start', 'second-start'):
+                        notifications.record_process_start(connection, repo, 'worker', identity, plan_id='G-018')
+                starts = [row for row in self.events(connection) if row['event_type'] == 'work_started']
+                self.assertEqual(len(starts), 2)
+                self.assertFalse(any(row['event_type'] == 'resumed' for row in self.events(connection)))
+                incident = connection.execute('SELECT started_operation FROM notified_block_incidents').fetchone()
+                self.assertIsNone(incident[0])
+
+    def test_failed_inflight_block_send_materializes_start_without_resume(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        with connection:
+            connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
+                               "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'cause')", (repo,))
+            notifications.enqueue_current_project_events(connection, repo)
+        def failed_send(_token, _chat, _text):
+            with connection:
+                scoped_blocking.clear_plan_block(connection, repo, 'G-018')
+                notifications.record_process_start(connection, repo, 'worker', 'first-start', plan_id='G-018')
+            self.assertFalse(any(row['event_type'] == 'work_started' for row in self.events(connection)))
+            raise OSError('offline')
+        notifications.dispatch_pending(connection, 'token', 'chat', adapter=failed_send)
+        starts = [row for row in self.events(connection) if row['event_type'] == 'work_started']
+        self.assertEqual(len(starts), 1)
+        incident = connection.execute('SELECT started_at FROM notified_block_incidents').fetchone()
+        self.assertEqual(json.loads(starts[0]['payload'])['occurred_at'], incident[0])
+        with connection:
+            notifications.record_process_start(connection, repo, 'worker', 'first-start', plan_id='G-018')
+            notifications.record_process_start(connection, repo, 'worker', 'second-start', plan_id='G-018')
+        self.assertEqual(len([row for row in self.events(connection) if row['event_type'] == 'work_started']), 2)
+        self.assertFalse(any(row['event_type'] == 'resumed' for row in self.events(connection)))
+
     def test_matching_worker_and_pr_resume_preserve_planning_incident_and_safety_gates(self):
         for operation in ('Worker', 'PR handling'):
             with self.subTest(operation=operation):
