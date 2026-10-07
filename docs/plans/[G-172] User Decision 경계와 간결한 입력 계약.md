@@ -52,3 +52,5 @@ priority: high
 
 - Manager verify 대응: `guidance_hash`·`prior_guidance_results`와 검토 이력·receipt 테이블 초기화가 `ProvisionalReviewRepository` 생성자에만 있어, scheduler의 부모 연결 초기화 뒤에도 프로젝트별 첫 생성자가 컬럼 추가를 경쟁했다. 기존 additive migration 전체를 같은 모듈의 `ensure_schema`로 옮겨 기존 `maintenance_state.ensure_schema` 경로에서 프로젝트 thread 시작 전에 완료하도록 수정했다. 스키마·제품 정책은 바꾸지 않는다.
 - 해당 수정 검증: `python3 -m unittest tests.test_maintenance_file_review.ProvisionalReviewSchemaTest`의 2개 unit test 통과. 부모 초기화 뒤 두 프로젝트 연결에서 추가 ALTER 부재와 기존 행·caller transaction 보존을 확인했다. 보고된 catalog scheduling case는 실제 Git 저장소 두 개와 원격 게시·scheduler를 함께 사용하므로 integration test 실행 금지에 따라 직접 재실행하지 않았고, Manager의 후속 전체 verify에 남긴다. verify 스크립트는 수정하거나 실행하지 않았다.
+
+- 초기 대기 알림 Review 대응: `_block_for_new_guidance`의 Revision 필수·직접 작성 안내를 제거하고 Decision 확정과 수정 Patch의 replace 선택을 안내한다. 기존 `_guidance_block_message`의 ExecPlan 경로·제안·결정 줄 위치는 그대로 사용한다. `python3 -m unittest tests.test_guidance_approval.GuidanceNotificationTest.test_initial_wait_message_requires_decision_without_revision_input` 1개 통과: 실제 차단 경로에서 생성·저장한 알림에 Revision 입력 요구가 없고, 위치와 pending·빈 revision·미승인 patch 상태가 보존됨을 확인했다. 전체 verify는 실행하지 않았다.

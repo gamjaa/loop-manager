@@ -332,6 +332,42 @@ class LegacyGuidanceMarkerResumeTest(unittest.TestCase):
                     self.assertIn('User Decision 이외', effects._update_blocked_error.call_args.args[-1])
 
 
+class GuidanceNotificationTest(unittest.TestCase):
+    def test_initial_wait_message_requires_decision_without_revision_input(self):
+        from dataclasses import fields
+        from tests.support.database import runtime_connection
+        from loop_manager_internal.documents import guidance_service as service
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        plan = connection.execute("SELECT * FROM exec_plans WHERE plan_id = 'G-047'").fetchone()
+        text = guidance_plan(patch=PATCH).replace('Revision: ``\n', 'Comment: ``\n') + '<!-- END USER DECISION -->\n'
+        document = guidance_approval.parse_guidance_document(text)
+        ports = {field.name: mock.Mock() for field in fields(service.BlockForNewGuidanceEffects)}
+        ports.update(
+            _guidance_batch_id=service._guidance_batch_id,
+            _guidance_block_message=service._guidance_block_message,
+            _guidance_target_state=mock.Mock(return_value=(b'# Agents\n', 0o644)),
+            _validate_guidance_proposal_scope=service._validate_guidance_proposal_scope,
+            guidance_patch_hash=guidance_approval.guidance_patch_hash,
+            is_loop_manager_repository=mock.Mock(return_value=False),
+        )
+        ports['capture_git_snapshot'].return_value.serialize.return_value = 'snapshot'
+        effects = service.BlockForNewGuidanceEffects(**ports)
+        service._block_for_new_guidance(effects, connection, Path('/repo'), 'repo', Path('/work'),
+                                        plan, document, document.proposals, 'proposal recorded')
+        message = connection.execute("SELECT last_error FROM projects WHERE repo = 'repo'").fetchone()[0]
+        self.assertIn('Decision을 approve·reject·replace 중 하나로 확정', message)
+        self.assertIn('수정한 Patch를 적용하려면 replace', message)
+        self.assertNotIn('Revision', message)
+        proposal, = document.proposals
+        self.assertIn(f"User Decision: {plan['path']}:{proposal.decision.line}", message)
+        self.assertIn(f"제안 {proposal.proposal_id}: {plan['path']}:{proposal.line}", message)
+        self.assertEqual(effects._final_block_recovery_decision.call_args.args[5], message)
+        row = connection.execute('SELECT decision, decision_revision, approved_patch FROM guidance_approvals').fetchone()
+        self.assertEqual(tuple(row), ('pending', '', None))
+        self.assertEqual(connection.execute("SELECT status FROM exec_plans WHERE plan_id = 'G-047'").fetchone()[0], 'PLAN_BLOCKED')
+
+
 class GuidanceRuntimeTest(unittest.TestCase):
     def test_proposal_blocks_until_only_user_decision_changes_then_preserves_session(self):
         with tempfile.TemporaryDirectory() as directory:

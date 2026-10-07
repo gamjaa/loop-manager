@@ -262,7 +262,8 @@ def _block_for_new_guidance(
     message = effects._guidance_block_message(
         plan,
         new_proposals,
-        "각 User Decision의 Decision과 Revision을 사용자가 직접 확정해야 합니다.",
+        "각 User Decision의 Decision을 approve·reject·replace 중 하나로 확정하세요. "
+        "수정한 Patch를 적용하려면 replace를 선택하세요.",
     )
     result_snapshot = effects.capture_git_snapshot(worktree).serialize()
     with connection:
