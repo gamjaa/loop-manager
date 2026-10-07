@@ -87,6 +87,64 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
             self.assertEqual([row[0] for row in connection.execute("SELECT status FROM exec_plans ORDER BY plan_id")], ['PLAN_BLOCKED', 'READY'])
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM local_environment_recheck_consumption").fetchone()[0], 2)
 
+    def test_recover_dispatch_preserves_runtime_mutation(self):
+        from loop_manager_internal.application.commands import execute_runtime_command
+        self.config_path.write_text("[loop]\n", encoding="utf-8")
+        mutation = object()
+        run = mock.Mock(return_value=ProjectRunResult(ProjectRunKind.WAITING, 0))
+        self.assertEqual(execute_runtime_command(self.effects(run), self.arguments,
+            self.state_dir, self.config_path, runtime_mutation=mutation), 0)
+        self.assertIs(run.call_args.kwargs['runtime_mutation'], mutation)
+
+    def test_project_command_rechecks_planning_after_failed_verify(self):
+        from loop_manager_internal.storage import local_recovery_state
+        from loop_manager_internal.planning.planning_runtime import PlanningOutcome, PlanningOutcomeKind
+        self.config_path.write_text("[loop]\n", encoding="utf-8")
+        repo = str(self.repository.resolve())
+        with closing(loop_manager.connect_database(self.state_dir)) as connection, connection:
+            connection.execute("UPDATE projects SET planning_error = 'saved authentication error' WHERE repo = ?", (repo,))
+            connection.execute(
+                "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, priority, content_hash, status, plan_sha, blocked_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (repo, 'G-001', 'docs/plans/G-001.md', 'one', '[]', '[]', 'normal', 'hash', 'PLAN_BLOCKED', 'base', 'verify_retry_exhausted'))
+        checked = []
+        def run(connection, state_dir, repository, config_path, *_args, **kwargs):
+            request_id = kwargs['recovery_request_id']
+            if not local_recovery_state.recheck_consumed(connection, request_id, 'G-001', 'verify'):
+                with connection:
+                    local_recovery_state.consume_recheck(connection, request_id, 'G-001', 'verify')
+                checked.append('verify')
+                return ProjectRunResult(ProjectRunKind.OPERATIONAL_ERROR, 1)
+            effects = SimpleNamespace(_recorded_base_fetch=mock.Mock(), _check_runtime_handoff=mock.Mock(),
+                _PlanningLifecyclePorts=mock.Mock(), is_loop_manager_repository=mock.Mock(return_value=False),
+                _planning_outcome_step_result=mock.Mock(return_value=None))
+            identity = ProjectIdentity(connection=connection, state_dir=state_dir, repo_arg=repository,
+                config_path=config_path, requested_base=None, allow_agents_mismatch=False,
+                requested_provider='codex', registered_only=True, planner_mutex=None,
+                refactoring_review_interval=20, verify_timeout_seconds=600,
+                runtime_mutation=kwargs['runtime_mutation'], recovery_request_id=request_id)
+            service = ProjectService(effects, identity)
+            service.state.repo = repository
+            service.state.repo_path = Path(repository)
+            service.state.base = 'main'
+            service.state.row = connection.execute("SELECT * FROM projects WHERE repo = ?", (repo,)).fetchone()
+            def planning(context):
+                checked.append('planning')
+                self.assertEqual(context.recovery_request_id, request_id)
+                self.assertTrue(context.local_environment_recheck)
+                connection.execute("UPDATE projects SET planning_error = NULL WHERE repo = ?", (repo,))
+                return PlanningOutcome(PlanningOutcomeKind.NO_CHANGE)
+            with mock.patch.object(service, '_refresh_catalog', return_value='base'), \
+                 mock.patch.object(service, '_dispatch_execution', side_effect=AssertionError('unexpected execution')), \
+                 mock.patch('loop_manager_internal.application.project_service.PlanningLifecycleCoordinator') as coordinator:
+                coordinator.return_value.run.side_effect = planning
+                code = service._run_coordinators()
+            return ProjectRunResult(ProjectRunKind.COMPLETED, code)
+        self.assertEqual(recover_local_environment(self.effects(run), self.arguments, self.state_dir, self.config_path), 1)
+        self.assertEqual(checked, ['verify', 'planning'])
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            self.assertIsNone(connection.execute("SELECT planning_error FROM projects WHERE repo = ?", (repo,)).fetchone()[0])
+            self.assertEqual(connection.execute("SELECT status FROM exec_plans").fetchone()[0], 'PLAN_BLOCKED')
+
     def test_manual_resume_runs_in_normal_order_and_is_scoped_out_of_recover(self):
         for request_id in (None, "request"):
             with self.subTest(request_id=request_id):

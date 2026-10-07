@@ -240,13 +240,14 @@ def recover_local_environment(
     args: argparse.Namespace,
     state_dir: Path,
     config_path: Path,
+    runtime_mutation: RuntimeMutation | None = None,
 ) -> int:
     """Recheck one registered project under the normal process lock and recovery paths."""
     repository = str(Path(args.repository).expanduser().resolve())
     plan_id = args.plan
     with closing(effects.connect_database(state_dir)) as connection, connection:
         project = connection.execute(
-            "SELECT provider FROM projects WHERE repo = ? AND registered = 1", (repository,),
+            "SELECT provider, planning_error FROM projects WHERE repo = ? AND registered = 1", (repository,),
         ).fetchone()
         if project is None:
             raise ValueError(f"등록된 프로젝트가 아닙니다: {repository}")
@@ -276,6 +277,10 @@ def recover_local_environment(
                 "SELECT plan_id FROM exec_plans WHERE repo = ? AND status = 'PLAN_BLOCKED' "
                 "AND blocked_reason IN ('verify_timeout_limit_insufficient', 'verify_retry_exhausted') "
                 "ORDER BY plan_id", (repository,)))
+            # Once bounded verify checks have released the execution slot,
+            # revisit the project coordinator for its independent planning cause.
+            if len(targets) > 1 and project["planning_error"]:
+                targets.append(None)
         outcomes = []
         for target in targets:
             if plan_id is None and target is not None and local_recovery_state.recheck_consumed(
@@ -296,6 +301,7 @@ def recover_local_environment(
                 external_run_id=request.request_id,
                 recovery_request_id=request.request_id,
                 recovery_plan_id=target,
+                runtime_mutation=runtime_mutation,
             )
             outcomes.append(outcome)
         outcome = next((item for item in outcomes if item.exit_code or item.kind not in {
@@ -369,6 +375,7 @@ def execute_runtime_command(
             args,
             state_dir,
             config_path,
+            runtime_mutation=runtime_mutation,
         )
     config = effects.load_managed_config(config_path)
     if args.command == "init":
