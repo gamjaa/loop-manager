@@ -84,58 +84,6 @@ class CheckpointRecoveryBoundaryRegressionTests(unittest.TestCase):
                 effects.push_diagnostic_checkpoint('adapter', 'request', 'head')
         push.assert_called_once_with('adapter', 'request', 'head')
 
-    def test_guidance_double_block_restores_reason_and_request_identity(self):
-        reason, evidence = 'managed_worktree_scope_violation', 'guidance wait'
-        branch, worktree = self.snapshot.branch, str(Path('/state/G-047'))
-        self.connection.execute(
-            "UPDATE exec_plans SET blocked_reason = ?, guidance_plan_hash = 'guidance-hash', "
-            "publication_remote_oid = 'published', worker_session_id = 'session', "
-            "agent_role = 'worker', agent_snapshot = ?", (reason, self.snapshot.serialize()))
-        loop_manager.hydrate_execplan_project(self.connection, 'repo', self.plan())
-        store = loop_manager.blocked_checkpoint_state.BlockedCheckpointRepository(self.connection)
-        store.request(repo='repo', plan_id='G-047', reason_code=reason, evidence='scope error',
-            branch=branch, worktree=worktree, expected_remote_oid='published', rebase_recovery=False)
-        block_reason = loop_manager.BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION
-        loop_manager.scoped_blocking.record_plan_block(self.connection, 'repo', 'G-047', block_reason, 'scope error', None)
-        loop_manager.scoped_blocking.record_project_block(self.connection, 'repo',
-            loop_manager.BlockReasonCode.REPOSITORY_STATE_UNSAFE, 'scope error',
-            'fingerprint', plan_id='G-047', previous_phase='PLAN_BLOCKED')
-        guidance = dict(applied=False, invalidated_decision_hash='', decision_hash='rejected-decision',
-            proposal_id='guidance', target_path='AGENTS.md', baseline_content=b'# Agents\n', baseline_mode=0o644)
-        proposal = SimpleNamespace(decision=SimpleNamespace(identity='rejected-decision'))
-        replacements = dict(
-            validate_execplan_workspace_identity=None, validate_managed_worktree=None,
-            capture_git_snapshot=self.snapshot, _owned_checkpoint_remote_oid='published',
-            _guidance_checkpoint_commit_evidence=evidence,
-            _guidance_document=GuidanceDocument((), 'guidance-hash'), _guidance_rows=[guidance],
-            _guidance_document_matches_rows=({'guidance': proposal}, ()),
-            _guidance_target_state=(b'# Agents\n', 0o644), _proven_merged_cleanup_paths=frozenset(),
-            _proven_manager_base_refs=frozenset(), operation_log=None)
-        with ExitStack() as stack:
-            mocks = {name: stack.enter_context(mock.patch.object(loop_manager, name, return_value=value))
-                     for name, value in replacements.items()}
-            stack.enter_context(mock.patch.object(loop_manager, 'git', side_effect=[
-                SimpleNamespace(stdout='Checkpoint-Identity: commit-identity\n'), SimpleNamespace(stdout='tree')]))
-            def resume():
-                return loop_manager._reconcile_guidance_double_block(
-                    self.connection, Path('/repo'), Path('/state'), 'repo',
-                    loop_manager.scoped_blocking.project_block(self.connection, 'repo'),
-                    self.connection.execute('SELECT * FROM projects').fetchone(), self.plan())
-            mocks['_guidance_target_state'].return_value = (b'tampered', 0o644)
-            self.assertFalse(resume())
-            self.assertIsNotNone(loop_manager.scoped_blocking.project_block(self.connection, 'repo'))
-            mocks['_guidance_target_state'].return_value = (b'# Agents\n', 0o644)
-            self.assertTrue(resume())
-        restored = self.connection.execute('SELECT * FROM blocked_checkpoints').fetchone()
-        expected_identity = loop_manager.blocked_checkpoint_state.request_identity(
-            'repo', 'G-047', loop_manager.GUIDANCE_BLOCK_REASON, evidence, branch, worktree, 'guidance-hash')
-        self.assertEqual(restored['request_identity'], expected_identity)
-        self.assertEqual(restored['reason_code'], loop_manager.GUIDANCE_BLOCK_REASON)
-        self.assertEqual(restored['phase'], 'published')
-        self.assertEqual(restored['accepted_remote_oid'], 'published')
-        self.assertEqual(self.plan()['blocked_reason'], loop_manager.GUIDANCE_BLOCK_REASON)
-        self.assertIsNone(loop_manager.scoped_blocking.project_block(self.connection, 'repo'))
-        self.assertEqual(guidance['decision_hash'], 'rejected-decision')
 
 
 class WorkspaceEffectBoundaryTests(unittest.TestCase):

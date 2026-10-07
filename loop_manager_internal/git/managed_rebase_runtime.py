@@ -22,10 +22,6 @@ from dataclasses import replace
 @dataclass(frozen=True)
 class RebaseRuntimeEffects:
     """Explicit effects for this service; persisted decisions remain in repositories."""
-    _guidance_document: Callable[..., object]
-    _guidance_document_matches_rows: Callable[..., object]
-    _guidance_final_expected: Callable[..., object]
-    _guidance_target_state: Callable[..., object]
     _owned_rebase_metadata: Callable[..., object]
     _path_signature: Callable[..., object]
     _published_plan_allows_common_plans: Callable[..., object]
@@ -92,23 +88,14 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
         if not revision:
             raise MutationEvidenceError('current rebase input revision is missing')
         archives = ports.requirement_archive_candidates(connection, repo_path, repo, revision, plan_id)
-        guidance = tuple(item[0] for item in connection.execute(
-            'SELECT DISTINCT target_path FROM guidance_approvals WHERE repo = ? AND plan_id = ? '
-            "AND decision != 'pending' ORDER BY target_path", (repo, plan_id)))
         common = ports._published_plan_allows_common_plans(repo_path, row)
-        approvals = tuple(connection.execute(
-            'SELECT * FROM guidance_approvals WHERE repo = ? AND plan_id = ? ORDER BY rowid',
-            (repo, plan_id)))
-        approval_token = [(tuple(item[key] for key in item.keys() if key != 'baseline_content'),
-                           hashlib.sha256(bytes(item['baseline_content'])).hexdigest())
-                          for item in approvals]
         inputs = fingerprint((ports._revision_execplan_input_fingerprint(repo_path, revision, row),
                               ports._worktree_execplan_input_fingerprint(worktree, row),
                               row['path'], row['sources'], row['depends_on']))
-        policy = fingerprint((row['path'], archives, guidance, common, approval_token))
-        return row, revision, archives, guidance, common, inputs, policy
+        policy = fingerprint((row['path'], archives, common))
+        return row, revision, archives, common, inputs, policy
 
-    row, revision, archives, guidance, common, inputs, policy = current_contract()
+    row, revision, archives, common, inputs, policy = current_contract()
     common_dir = ports.git(repo_path, 'rev-parse', '--git-common-dir').stdout.strip()
     identity = str((repo_path / common_dir).resolve())
     expected = RebaseExpectation(
@@ -199,22 +186,6 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
             archive_blobs[archived] = (fields[0], fields[2])
             for path in (source, archived):
                 archive_signatures[path] = ports._path_signature(worktree, path)
-    guidance_ok = not guidance
-    guidance_signature = None
-    guidance_content = None
-    if guidance:
-        rows = tuple(connection.execute('SELECT * FROM guidance_approvals WHERE repo = ? '
-                                        'AND plan_id = ? ORDER BY rowid', (repo, plan_id)))
-        document = ports._guidance_document(worktree, str(row['path']))
-        if document is not None and rows:
-            proposals, new = ports._guidance_document_matches_rows(document, rows, require_decisions=True)
-            expected_files, _ = ports._guidance_final_expected(rows, proposals)
-            last = rows[-1]
-            actual = ports._guidance_target_state(worktree, 'AGENTS.md')
-            guidance_ok = not new and actual == expected_files[(last['batch_id'], 'AGENTS.md')]
-            guidance_signature = ports._path_signature(worktree, 'AGENTS.md')
-            guidance_content = actual[0]
-
     integration = saved.get('work_branch_integration') or {}
     user_sources = [source for item in [*saved.get('work_branch_integration_history', ()), integration]
                     for source in (item.get('remote'), item.get('local_commit'))]
@@ -240,24 +211,13 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
             if any(file.signature != archive_signatures.get(file.path)
                    for file in observed.files if file.path.startswith('docs/requirements/')):
                 return False
-        if 'AGENTS.md' in protected:
-            if not guidance_ok or guidance_content is None:
-                return False
-            blob = b'blob ' + str(len(guidance_content)).encode() + b'\0' + guidance_content
-            for change in (*observed.committed, *observed.staged):
-                if change.path == 'AGENTS.md':
-                    hash_fn = hashlib.sha256 if len(change.new_oid) == 64 else hashlib.sha1
-                    if change.new_oid != hash_fn(blob).hexdigest():
-                        return False
-            return all(file.signature == guidance_signature
-                                      for file in observed.files if file.path == 'AGENTS.md')
         return True
 
     # assess_scope's path callback has no blob argument. Check protected paths
     # in contracts using the complete observation instead of granting a blanket
     # path exemption to a later Agent invocation.
     worker_allowed = lambda path: ports._worker_path_allowed(
-        path, expected.plan_path, archives, guidance, common)
+        path, expected.plan_path, archives, (), common)
     checked_contracts = contracts
     def scoped_contracts(observed):
         # Conflict bytes are preservation input, never a final approval. Only
@@ -280,7 +240,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
         paths = {change.path for change in (*observed.committed, *observed.staged)}
         paths.update(file.path for file in observed.files)
         paths.update(entry.path for entry in observed.index if entry.stage)
-        return all(_worker_path_allowed(path, expected.plan_path, archives, guidance, common)
+        return all(_worker_path_allowed(path, expected.plan_path, archives, (), common)
                    or path in approved for path in paths) and checked_contracts(observed)
 
     return ManagedRebaseService(expected, ObservationAdapters(

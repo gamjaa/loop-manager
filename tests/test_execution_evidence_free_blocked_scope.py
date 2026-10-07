@@ -43,39 +43,40 @@ class EvidenceFreeBlockedScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
                 with self.assertRaises(lm.AgentScopeError):
                     self.validate()
 
-    def test_guidance_decision_resumes_after_accepted_rebase_with_original_agent_snapshot(self):
+    def test_historical_wait_resumes_after_owned_rebase_without_file_approval(self):
         connection = self.case.fixture.connection
-        plan = connection.execute("SELECT * FROM exec_plans WHERE repo='repo'").fetchone()
-        pending = lm.parse_guidance_document(guidance_plan().replace('G-020', 'G-047'))
-        approved = lm.parse_guidance_document(
-            guidance_plan(decision='approve', revision='user-1').replace('G-020', 'G-047'))
-        with (mock.patch.object(lm, 'is_loop_manager_repository', return_value=False),
-              mock.patch.object(lm, '_guidance_target_state', return_value=(b'# Agents\n', 0o100644)),
-              mock.patch.object(lm, 'capture_git_snapshot', return_value=self.original)):
-            lm._block_for_new_guidance(connection, Path('/repo'), 'repo', Path('/state/G-047'),
-                                      plan, pending, pending.proposals, 'proposal')
-        plan = connection.execute("SELECT * FROM exec_plans WHERE repo='repo'").fetchone()
-        lm.hydrate_execplan_project(connection, 'repo', plan)
-        self.assertEqual(plan['agent_snapshot'], self.original.serialize())
+        lm.runtime_state.RuntimeStateRepository(connection).block_plan(
+            'repo', 'G-047', reason_code=lm.GUIDANCE_BLOCK_REASON,
+            evidence='historical wait', release_fingerprint='old-document',
+        )
         with (mock.patch.object(lm, 'validate_execplan_workspace_identity'),
               mock.patch.object(lm, 'make_worktree'),
               mock.patch.object(lm, '_rebase_in_progress_for_branch', return_value=False),
-              mock.patch.object(lm, 'is_loop_manager_repository', return_value=False),
-              mock.patch.object(lm, '_guidance_document', return_value=pending) as decision_document,
-              mock.patch.object(lm, '_guidance_target_state', return_value=(b'# Agents\n', 0o100644)),
               mock.patch.object(lm, '_published_plan_allows_common_plans', return_value=False),
               mock.patch.object(lm, 'requirement_archive_candidates', return_value=()),
               mock.patch.object(lm, '_proven_manager_base_refs', return_value=frozenset())):
-            self.assertFalse(lm.resume_guidance_approval_if_decided(
+            self.assertTrue(lm.resume_retired_guidance_block(
                 connection, Path('/repo'), 'repo', 'main', Path('/state'), plan_id='G-047'))
-            self.assertEqual(connection.execute('SELECT agent_snapshot FROM exec_plans').fetchone()[0],
-                             self.original.serialize())
-            decision_document.return_value = approved
-            self.assertTrue(lm.resume_guidance_approval_if_decided(
-                connection, Path('/repo'), 'repo', 'main', Path('/state'), plan_id='G-047'),
-                connection.execute("SELECT last_error FROM exec_plans WHERE repo='repo'").fetchone()[0])
-        self.assertEqual(connection.execute('SELECT decision FROM guidance_approvals').fetchone()[0], 'approve')
-        self.assertIsNone(scoped_blocking.plan_block(connection, 'repo', 'G-047'))
+        self.assertEqual(connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'IMPLEMENTING')
+
+    def test_historical_wait_cannot_bypass_a_foreign_ref_scope_violation(self):
+        connection = self.case.fixture.connection
+        lm.runtime_state.RuntimeStateRepository(connection).block_plan(
+            'repo', 'G-047', reason_code=lm.GUIDANCE_BLOCK_REASON,
+            evidence='historical wait', release_fingerprint='old-document',
+        )
+        self.current = replace(self.original, refs={**self.original.refs, 'refs/heads/B': ('foreign', '')})
+        with (mock.patch.object(lm, 'validate_execplan_workspace_identity'),
+              mock.patch.object(lm, 'make_worktree'),
+              mock.patch.object(lm, '_rebase_in_progress_for_branch', return_value=False),
+              mock.patch.object(lm, '_published_plan_allows_common_plans', return_value=False),
+              mock.patch.object(lm, 'requirement_archive_candidates', return_value=()),
+              mock.patch.object(lm, '_proven_manager_base_refs', return_value=frozenset())):
+            self.assertFalse(lm.resume_retired_guidance_block(
+                connection, Path('/repo'), 'repo', 'main', Path('/state'), plan_id='G-047'))
+        row = connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual(row['status'], 'PLAN_BLOCKED')
+        self.assertEqual(row['blocked_reason'], lm.GUIDANCE_BLOCK_REASON)
 
     def _published_tracking_ref(self):
         remote_ref = 'refs/remotes/origin/loop-manager/G-047'
@@ -85,6 +86,7 @@ class EvidenceFreeBlockedScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
         lm.blocked_checkpoint_state.BlockedCheckpointRepository(self.case.fixture.connection).request(
             repo='repo', plan_id='G-047', reason_code='verify_retry_exhausted', evidence='original cause',
             branch='loop-manager/G-047', worktree=str(Path('/state/G-047').resolve()), expected_remote_oid='remote', rebase_recovery=False)
+
 
     def test_owned_checkpoint_tracking_update_does_not_rewrite_original_agent_snapshot(self):
         self._published_tracking_ref()

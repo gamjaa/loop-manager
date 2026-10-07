@@ -96,8 +96,6 @@ class ExecutionLifecyclePortsEffects:
     _agent_profile: Callable[..., object]
     _current_rebase_service: Callable[..., object]
     _git_operation_entries: Callable[..., object]
-    _guidance_worker_targets: Callable[..., object]
-    prepare_guidance_preapprovals: Callable[..., object]
     _path_signature: Callable[..., object]
     _plan_id_from_path: Callable[..., object]
     _published_plan_allows_common_plans: Callable[..., object]
@@ -121,8 +119,6 @@ class ExecutionLifecyclePortsEffects:
     clear_validation_failure_history: Callable[..., object]
     ensure_worker_level_state: Callable[..., object]
     git: Callable[..., object]
-    guidance_resume_context: Callable[..., object]
-    inspect_worker_guidance_result: Callable[..., object]
     is_loop_manager_repository: Callable[..., object]
     make_worktree: Callable[..., object]
     mark_execplan_workspace_owned: Callable[..., object]
@@ -154,7 +150,6 @@ class ExecutionLifecyclePortsEffects:
     validate_active_execplan_metadata: Callable[..., object]
     validate_agent_scope: Callable[..., object]
     validate_execplan_workspace_identity: Callable[..., object]
-    validate_guidance_publication: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
     validate_worker_workspace_scope: Callable[..., object]
     validation_failure_fingerprints: Callable[..., object]
@@ -216,13 +211,8 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
                 name="validate_worker_workspace_scope", connected=False, mutates=False),
             _worktree_execplan_input_fingerprint=state.bind(dependencies._worktree_execplan_input_fingerprint, name="_worktree_execplan_input_fingerprint", connected=False, mutates=False),
             _revision_execplan_input_fingerprint=state.bind(dependencies._revision_execplan_input_fingerprint, name="_revision_execplan_input_fingerprint", connected=False, mutates=False),
-            _guidance_worker_targets=state.bind(dependencies._guidance_worker_targets, name="_guidance_worker_targets", connected=True, mutates=False),
-            prepare_guidance_preapprovals=state.bind(dependencies.prepare_guidance_preapprovals, name="prepare_guidance_preapprovals", connected=True, mutates=True),
-            guidance_resume_context=state.bind(dependencies.guidance_resume_context, name="guidance_resume_context", connected=True, mutates=False),
             _published_plan_allows_common_plans=state.bind(dependencies._published_plan_allows_common_plans, name="_published_plan_allows_common_plans", connected=False, mutates=False),
             is_loop_manager_repository=state.bind(dependencies.is_loop_manager_repository, name="is_loop_manager_repository", connected=False, mutates=False),
-            inspect_worker_guidance_result=state.bind(dependencies.inspect_worker_guidance_result, name="inspect_worker_guidance_result", connected=True, mutates=True),
-            validate_guidance_publication=state.bind(dependencies.validate_guidance_publication, name="validate_guidance_publication", connected=True, mutates=True),
             run_agent=state.bind(dependencies._run_agent_with_connection, name="run_agent", connected=True, mutates=False),
             run_agent_with_retries=state.bind(dependencies.run_agent_with_retries, name="run_agent_with_retries", connected=False, mutates=False),
             worker_prompt=state.bind(lambda *a, **kw: manual.prompt(dependencies.worker_prompt(*a, **kw)), name="worker_prompt", connected=False, mutates=False),

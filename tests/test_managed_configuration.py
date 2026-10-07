@@ -18,17 +18,12 @@ from loop_manager_internal.runtime import project_registry
 
 
 class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
-    def test_copy_tools_share_minimal_project_guidance(self):
-        bash = (loop_manager.ROOT / 'scripts/copy-project-files.sh').read_text(encoding='utf-8')
-        powershell = (loop_manager.ROOT / 'scripts/copy-project-files.ps1').read_text(encoding='utf-8')
-        bash_body = re.search(r"<<'GUIDANCE'\n(.*?)\nGUIDANCE", bash, re.S).group(1)
-        powershell_body = re.search(r"\$minimalAgents = @'\n(.*?)\n'@", powershell, re.S).group(1)
-        self.assertEqual(bash_body, powershell_body)
-        for phrase in ('프로젝트 전용', '.agents/skills/specification-docs/SKILL.md'):
-            self.assertIn(phrase, bash_body)
-        for phrase in ('ExecPlan', 'Worker', 'SQLite', 'docs/REQUIREMENT.template.md',
-                       'Acceptance Criteria', 'docs/PRODUCT.md', '활성 Requirement'):
-            self.assertNotIn(phrase, bash_body)
+    def test_copy_tools_do_not_handle_cli_guidance(self):
+        for script in ('scripts/copy-project-files.sh', 'scripts/copy-project-files.ps1'):
+            with self.subTest(script=script):
+                contents = (loop_manager.ROOT / script).read_text(encoding='utf-8')
+                self.assertNotIn('AGENTS.md', contents)
+                self.assertIn('.agents', contents)
 
     def test_copy_project_files_preserves_existing_agents_bytes(self):
         # Manager verify exercises the executable scripts; Worker runs only
@@ -325,7 +320,7 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
                 root, "HEAD", approve_agents_mismatch=True
             )
             self.assertFalse(approved)
-            self.assertEqual(agents_hash, hashlib.sha256(loop_manager.git_bytes(root, "show", "HEAD:AGENTS.md")).hexdigest())
+            self.assertIsNone(agents_hash)
 
             (root / "docs/PLANS.md").write_text("different\n", encoding="utf-8")
             self._commit(root, "Change plans")
@@ -351,12 +346,9 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             skill = (target / ".agents/skills/specification-docs/SKILL.md").read_text(
                 encoding="utf-8"
             )
-            minimal = (target / "AGENTS.md").read_text(encoding="utf-8")
-            self.assertIn(".agents/skills/specification-docs/SKILL.md", minimal)
+            self.assertFalse((target / "AGENTS.md").exists())
             self.assertEqual((target / ".agents/skills/specification-docs/SKILL.md").read_bytes(),
                              (loop_manager.ROOT / ".agents/skills/specification-docs/SKILL.md").read_bytes())
-            self.assertNotIn("Worker", minimal)
-            self.assertNotIn("ExecPlan", minimal)
             self.assertEqual((target / "docs/PLANS.md").read_bytes(),
                              (loop_manager.ROOT / "docs/PLANS.md").read_bytes())
             self.assertEqual((target / "docs/ARCHITECTURE.md").read_bytes(),

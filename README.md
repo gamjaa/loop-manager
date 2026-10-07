@@ -22,9 +22,9 @@ pwsh -File scripts/copy-project-files.ps1 -TargetPath D:\repo\my-project
 bash scripts/copy-project-files.sh /path/to/my-project
 ```
 
-복사 스크립트는 최소 프로젝트 AGENTS·Specification Skill·문서 템플릿과 빈 작업 폴더, PRODUCT·ARCHITECTURE 초안을 준비한다. 기존 일반 파일 `AGENTS.md`는 byte 그대로 보존한다. `.agents`·`docs` 충돌이나 AGENTS의 symlink·디렉터리는 중단한다. 자동 Loop에서는 호출하지 않는다.
+복사 스크립트는 Specification Skill·문서 템플릿과 빈 작업 폴더, PRODUCT·ARCHITECTURE 초안을 준비한다. `.agents`·`docs` 충돌은 중단한다. 자동 Loop에서는 호출하지 않는다.
 
-기존 프로젝트에는 필요한 Skill·문서 파일(`.agents/skills/`, `docs/PLANS.md`, `docs/*.template.md`)만 선택적으로 병합한다. AGENTS에는 프로젝트 전용 규칙을 유지하며 공통 본문을 복사할 필요가 없다.
+기존 프로젝트에는 필요한 Skill·문서 파일(`.agents/skills/`, `docs/PLANS.md`, `docs/*.template.md`)만 선택적으로 병합한다.
 
 ### 2. 프로젝트 문서 작성·게시
 
@@ -33,7 +33,6 @@ bash scripts/copy-project-files.sh /path/to/my-project
 | `docs/PRODUCT.md` | 현재 제품의 동작·경계·장기 규칙 |
 | `docs/requirements/*.md` | 새 기능·정책 변경과 Acceptance Criteria |
 | `docs/ARCHITECTURE.md` | 제품 규칙을 보장하는 구조·기술 결정·복구 방식 |
-| `AGENTS.md` | 프로젝트 전용 언어·코딩·빌드 규칙 |
 
 PRODUCT와 활성 Requirement 중 하나 이상은 반드시 있어야 한다. 초기 제품은 PRODUCT로 정의하고 운영 중 변경은 Requirement로 작성한다. Requirement는 frontmatter·상태 없이 `docs/requirements/` 바로 아래에 두며 모두 Planner 입력이 된다.
 
@@ -77,7 +76,7 @@ Manager 실행의 시간 이벤트·worker 원문·manifest·집계는 상태 �
 
 init은 한 번 실행하고 프로젝트마다 add한다. provider를 생략하면 codex를 사용한다. 등록 검사는 fetch한 원격 base의 필수 문서·provider를 기준으로 하며 로컬 전용 편집은 반영하지 않는다.
 
-원격 루트 AGENTS의 존재와 UTF-8을 확인하며 공통 내용 포함·일치 승인을 요구하지 않는다. `--approve-agents-mismatch`와 과거 승인 기록은 호환을 위해 남긴다. 진행 중인 계획·프로젝트 차단·미해결 planning 오류가 없으면 `config remove <path>`로 등록만 해제하며 파일·branch·worktree·PR·MERGED 감사는 보존한다.
+진행 중인 계획·프로젝트 차단·미해결 planning 오류가 없으면 `config remove <path>`로 등록만 해제하며 파일·branch·worktree·PR·MERGED 감사는 보존한다.
 
 Planner는 검증된 계획을 base branch에 fast-forward push하므로 Loop Manager 계정의 직접 push가 허용돼야 한다. 구현은 `loop-manager/<execplan-id>` branch에서 진행하고 PR로 제출한다.
 
@@ -122,7 +121,7 @@ bootstrap은 최신 `origin/main`의 정확한 SHA에서 runtime을 실행한다
 
 작업 시작 시 모든 지침 원본을 함께 고정한다. 같은 ExecPlan의 Worker·Reviewer는 같은 원본 버전에서 각 역할의 내용만 합치며 재시도·새 세션·재개도 이 버전을 유지한다. 새 작업만 최신 원본을 선택하고 역할별 내용 변경도 planning·검증 결과 재사용의 입력에 반영한다. 기본 지침·기존 추가 지침·프로젝트 규칙과 격리 검증 gate는 보존하며 파일 오류·지원되지 않는 CLI·설정 충돌·알 수 없는 역할은 모델 실행 전에 중단한다.
 
-작업 worktree의 공통·역할별 `docs/AGENTS.*.md`는 일반 파일 권한으로 수정하고 PR에 최종 경로·diff·이유·영향을 보고한다. 후보 파일은 현재 실행 지침을 바꾸지 않는다. 자동 Worker의 새 프로젝트 AGENTS 제안은 self 저장소도 루트 `AGENTS.md`·`project` scope로 사용자 판단을 받으며, 과거 `common` 승인은 원래 대상·기준·patch로 처리한다. 이 저장소 루트 AGENTS에는 프로젝트 개발 규칙과 Requirement 우선 원칙을 유지하며, 다른 등록 프로젝트의 기존 공통 본문은 자동 제거하지 않는다.
+작업 worktree의 공통·역할별 `docs/AGENTS.*.md`는 일반 파일 권한으로 수정하고 PR에 최종 경로·diff·이유·영향을 보고한다. 후보 파일은 현재 실행 지침을 바꾸지 않는다. 이 저장소 루트 AGENTS에는 Loop Manager 개발 지침을 유지한다.
 
 ## 수동 구현과 제출
 

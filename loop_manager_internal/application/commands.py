@@ -43,10 +43,9 @@ def configure_registry(
             if not projects:
                 effects.operation_print("등록된 프로젝트가 없습니다.")
             for project in projects:
-                approval = "legacy-approved" if project.agents_approved else "project"
                 effects.operation_print(
                     f"{project.repo}\t{project.base_branch}\t"
-                    f"{project.provider}\tAGENTS:{approval}"
+                    f"{project.provider}"
                 )
             return 0
         if args.config_command == "add":
@@ -60,10 +59,9 @@ def configure_registry(
                 approve_agents_mismatch=args.approve_agents_mismatch,
                 state_dir=state_dir,
             )
-            approval = " (AGENTS.md 불일치 승인 저장)" if project.agents_approved else ""
             effects.operation_print(
                 f"프로젝트 등록 완료: {project.repo} "
-                f"({project.base_branch}, {project.provider}){approval}"
+                f"({project.base_branch}, {project.provider})"
             )
             return 0
         repo = str(Path(args.repository).expanduser().resolve())

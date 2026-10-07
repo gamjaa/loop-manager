@@ -137,6 +137,10 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
                 if pinned:
                     guidance=pin_common_guidance(service.connection,InvocationContext(service.repo,'G-012'),
                                                  worktree,service.state_dir)
+                    pinned_hash=service.connection.execute(
+                        'SELECT content_hash FROM common_guidance_versions WHERE task_id = ?',
+                        (guidance.task_id,),
+                    ).fetchone()[0]
                 args=completion()
                 args.skip_verify=args.skip_review=True
                 args.expected_head=git_command(worktree,'rev-parse','HEAD')
@@ -153,7 +157,7 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
                         self.assertIsNone(candidate.waive(context,'verify',record=False))
                         self.assertIsNone(candidate.waive(context,'review',record=False))
                     definition=candidate.definition(context,None,candidate.group()['base_sha'])
-                    self.assertEqual(definition.guidance_hash,guidance.content_hash if pinned else 'b'*64)
+                    self.assertEqual(definition.guidance_hash,pinned_hash if pinned else 'b'*64)
 
     def test_user_verify_does_not_verify_a_past_worker_correction_turn(self):
         from loop_manager_internal.storage import review_correction_state

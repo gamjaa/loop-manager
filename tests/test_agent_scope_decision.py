@@ -338,7 +338,7 @@ class ConflictIndexScopeTests(unittest.TestCase):
                                      selected_plan_path=PLAN, owned_rebase=True)
 
     def test_resolution_cannot_absorb_protected_path_or_shared_metadata(self):
-        for after in (replace(self.after, index={**self.after.index, 'AGENTS.md': ('H 100644 foreign 0',)}),
+        for after in (replace(self.after, index={**self.after.index, 'docs/requirements/Protected.md': ('H 100644 foreign 0',)}),
                       replace(self.after, refs={**self.after.refs, 'refs/heads/other': ('foreign', '')}),
                       replace(self.after, operations={'rebase-merge': 'different'})):
             with self.subTest(after=after), self.assertRaises(AgentScopeError):
@@ -352,7 +352,8 @@ class WorkerPlanDocumentScopeTests(unittest.TestCase):
         before = snapshot()
         for kinds in (("unstaged", "worktree"), ("staged",)):
             with self.subTest(kinds=kinds):
-                after = replace(before, dirty={self.related_plan: (kinds, "inventory-update")})
+                after = replace(before, dirty={path: (kinds, "inventory-update") for path in
+                    (self.related_plan, "AGENTS.md", "docs/PRODUCT.md", "docs/ARCHITECTURE.md")})
                 validate_agent_scope("worker", Path(WORKTREE), before, after,
                                      selected_plan_path=PLAN)
 
@@ -374,8 +375,7 @@ class WorkerPlanDocumentScopeTests(unittest.TestCase):
 
     def test_protected_documents_remain_blocked_with_related_plan_update(self):
         before = snapshot()
-        for path in ("AGENTS.md", "docs/ARCHITECTURE.md", "docs/PLANS.md",
-                     "docs/requirements/Active.md"):
+        for path in ("docs/PLANS.md", "docs/requirements/Active.md"):
             with self.subTest(path=path):
                 after = replace(before, dirty={
                     self.related_plan: (("unstaged",), "inventory-update"),
@@ -442,8 +442,8 @@ class TaskRelevantScopeTests(unittest.TestCase):
         self.validate(allowed)
         with self.assertRaises(AgentScopeError):
             self.validate(allowed, role='reviewer')
-        for after in (replace(self.before, dirty={'AGENTS.md': (('unstaged',), 'new')}),
-                      replace(self.before, index={'AGENTS.md': ('H oid 0',)}),
+        for after in (replace(self.before, dirty={'docs/requirements/Protected.md': (('unstaged',), 'new')}),
+                      replace(self.before, index={'docs/requirements/Protected.md': ('H oid 0',)}),
                       replace(self.before, index={'app.py': ('h oid 0',)})):
             with self.subTest(after=after), self.assertRaises(AgentScopeError):
                 self.validate(after)

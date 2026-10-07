@@ -11,8 +11,6 @@ from loop_manager_internal.agents.scope_contracts import AgentChange
 from loop_manager_internal.agents.scope_contracts import AgentScopeError
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.application.contracts import ExecPlanMetadataError
-from loop_manager_internal.documents.guidance_approval import GuidanceDocument
-from loop_manager_internal.documents.guidance_approval import GuidanceFormatError
 from loop_manager_internal.execution import execution_revision
 from pathlib import Path
 import sqlite3
@@ -402,17 +400,3 @@ def validate_worker_workspace_scope(
         allow_rebase=allow_rebase,
     )
     return plan
-
-
-@dataclass(frozen=True)
-class GuidanceDocumentEffects:
-    """Named effects for _guidance_document; no entry-point/module access."""
-    parse_guidance_document: Callable[..., object]
-
-
-def _guidance_document(effects: GuidanceDocumentEffects, worktree: Path, plan_path: str) -> GuidanceDocument | None:
-    try:
-        contents = (worktree / plan_path).read_text(encoding="utf-8")
-        return effects.parse_guidance_document(contents)
-    except (OSError, GuidanceFormatError) as error:
-        raise AgentScopeError(f"Worker guidance 제안 형식 위반: {error}") from error

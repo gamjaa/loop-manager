@@ -24,7 +24,6 @@ SPECIFICATIONS = ("docs/PRODUCT.md", "docs/ARCHITECTURE.md")
 
 SOURCE = re.compile(r"docs/requirements/[^/\\]+\.md\Z")
 ASSESSMENT = re.compile(r"^REQUIREMENT_JUDGMENTS:\s*(\[.*\])\s*$", re.MULTILINE)
-AUDIT_ASSESSMENT = re.compile(r"^REQUIREMENT_AUDIT:\s*(\[.*\])\s*$", re.MULTILINE)
 
 
 def _single_result(pattern: re.Pattern[str], text: str):
@@ -52,38 +51,6 @@ class FinalInput:
     reuse_from: Judgment | None = None
 
 
-@dataclass(frozen=True)
-class AuditInput:
-    path: str
-    token: str
-    criteria: tuple[str, ...]
-    related_ids: tuple[str, ...]
-
-
-def audit_prompt(inputs: tuple[AuditInput, ...]) -> str:
-    if not inputs:
-        return ""
-    payload = [
-        {"path": item.path, "input_token": item.token,
-         "related_plan_ids": item.related_ids, "criteria": item.criteria}
-        for item in inputs
-    ]
-    return (
-        "\n\n다음은 이미 archive된 과거 Requirement의 일회성 감사 입력이다. "
-        "일반 활성 Requirement 입력으로 취급하거나 파일을 수정하지 마라. "
-        "원래 전체 Acceptance Criteria와 실제 Merge된 구현·검증 근거를 대조하라. "
-        "각 항목에 path, input_token, outcome(fulfilled|premature|superseded|uncertain), "
-        "criteria_evidence(기준 순서대로 비어 있지 않은 근거), "
-        "relevant_paths(검토한 구현·테스트 상대 경로), reason을 넣어 "
-        "마지막 응답에 REQUIREMENT_AUDIT: JSON 배열을 한 줄로 적어라. "
-        "premature는 현재도 필요한 기준이 미충족임이 증명될 때만, "
-        "superseded는 제품 목표의 교체·철회 근거가 명확할 때만 사용하라. "
-        "premature 항목의 후속 계획은 원문 복원이 원격 확인된 다음 활성 입력에서 작성하라. "
-        "불확실하면 uncertain을 사용하라.\n"
-        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-    )
-
-
 def assessment_prompt(inputs: tuple[FinalInput, ...]) -> str:
     if not inputs:
         return ""
@@ -97,13 +64,14 @@ def assessment_prompt(inputs: tuple[FinalInput, ...]) -> str:
         for item in inputs
     ]
     return (
-        "\n\n아래 Requirement는 관련 ExecPlan이 모두 실제 MERGED다. 최신 원격 구현과 "
+        "\n\n아래 Requirement는 연결된 비종료 작업이 없다. 관련 ExecPlan이 있으면 모두 실제 MERGED다. 최신 원격 구현과 "
         "reuse_from이 없으면 검증 근거를 읽고 각 Acceptance Criterion의 전체 충족 여부를 판단하라. "
         "reuse_from이 있으면 구현·검증 입력은 같고 명세만 변경됐다. 먼저 assessed_sha부터 "
         "최신 revision까지 두 명세 전문의 diff(인용하지 않은 절·새 절 포함)를 검토하라. "
         "변경이 이 Requirement에 무관함을 확인하면 전체 충족 검사를 반복하지 말고 "
         "outcome=reuse와 이전 criteria_evidence·relevant_paths를 그대로 반환하라. "
         "새 관련 규칙 또는 불확실성이 있으면 전체 기준을 재평가하고 일반 결과를 반환하라. "
+        "충족 판단 전에 코드·검증과 필요한 PRODUCT·ARCHITECTURE의 현재 동작·설계 반영을 확인하라. "
         "계획 작성 완료만으로 충족을 추정하지 마라. 추가 작업은 일반 Planner 권한으로 "
         "ExecPlan에 연결하라. Requirement 파일은 수정하지 마라. "
         "마지막 응답에 REQUIREMENT_JUDGMENTS: JSON 배열을 정확히 한 줄로 적어라. "
@@ -231,7 +199,7 @@ class RequirementRetirementPort:
                 raise RetirementError(f"Requirement가 일반 파일이 아닙니다: {path}")
             related = [row for row in rows if path in _sources(row["sources"], str(row["plan_id"]))]
             canceled = [row for row in cancellations if path in _sources(row["sources"], str(row["plan_id"]))]
-            if canceled or not related or any(str(row["status"]) != "MERGED" for row in related):
+            if canceled or any(str(row["status"]) != "MERGED" for row in related):
                 continue
             if any(str(row["plan_id"]) in plan_drafts for row in related):
                 continue
@@ -239,8 +207,7 @@ class RequirementRetirementPort:
                 continue
             destination = "docs/requirements/archive/" + path.removeprefix("docs/requirements/")
             if destination in tree:
-                # The audit records this active/archive collision as uncertain.
-                # Other Requirements remain independently eligible.
+                # An existing archive cannot be overwritten; other inputs remain eligible.
                 continue
             yield path, oid, related, tree
 
@@ -447,264 +414,6 @@ class RequirementRetirementPort:
                 moves.append(path)
         return tuple(moves)
 
-    def audit_restorations(self, repo: str, repository: Path,
-                           revision: str) -> tuple[str, ...]:
-        """Pin historical archive evidence; restore only proven live unfinished goals."""
-        tree = _tree(self.git, repository, revision, "docs/requirements",
-                     "docs/PRODUCT.md", "docs/ARCHITECTURE.md")
-        rows = list(self.connection.execute(
-            "SELECT * FROM exec_plans WHERE repo = ?", (repo,),
-        ))
-        canceled = list(self.connection.execute(
-            "SELECT plan_id, sources FROM execplan_cancellations WHERE repo = ?", (repo,),
-        ))
-        restorations = []
-        observed_sources = set()
-        for archived, (mode, oid) in sorted(tree.items()):
-            if not archived.startswith("docs/requirements/archive/") or archived.count("/") != 3 or not archived.endswith(".md"):
-                continue
-            source = "docs/requirements/" + archived.removeprefix("docs/requirements/archive/")
-            if not SOURCE.fullmatch(source):
-                continue
-            managed_move = self.connection.execute(
-                "SELECT source_oid FROM requirement_move_receipts "
-                "WHERE repo = ? AND source_path = ? AND stage IN ('pending', 'published')",
-                (repo, source),
-            ).fetchone()
-            if managed_move is not None and str(managed_move["source_oid"]) == oid:
-                continue
-            observed_sources.add(source)
-            related = [row for row in rows if source in _sources(row["sources"], str(row["plan_id"]))]
-            cancelled = [row for row in canceled if source in _sources(row["sources"], str(row["plan_id"]))]
-            previous = self.connection.execute(
-                "SELECT * FROM requirement_audit WHERE repo = ? AND source_path = ?",
-                (repo, source),
-            ).fetchone()
-            relevant = (tuple(json.loads(str(previous["relevant_paths"])))
-                        if previous is not None else ())
-            token = _digest((mode, tree.get(source),
-                             tuple(sorted(str(row["plan_id"]) for row in cancelled)),
-                             self._token(repo, repository, revision, source, oid,
-                                         related, tree, relevant)))
-            if source in live_requirement_paths(self.connection,repo):
-                token=_digest(('live-manual-intake',token))
-            if previous is not None and previous["input_token"] == token:
-                if previous["outcome"] == "restore" and previous["stage"] != "published":
-                    restorations.append(source)
-                continue
-            if previous is not None and previous["stage"] == "staged":
-                # Preserve the inverse-move receipt until the owned worktree is
-                # reconciled. A read-only eligibility refresh cannot erase it.
-                continue
-            if mode not in {"100644", "100755"} or source in tree:
-                outcome, reason = "uncertain", "historical archive mode or active-path collision"
-            elif cancelled:
-                outcome, reason = "uncertain", "cancelled source relationship is not Merge proof"
-            elif source in live_requirement_paths(self.connection,repo):
-                outcome, reason = "restore", "live manual intake protects Requirement"
-            elif any(str(row["status"]) != "MERGED" for row in related):
-                outcome, reason = "restore", "live unfinished source-linked ExecPlan"
-            elif related:
-                outcome, reason = "pending", "historical full-Requirement judgment is absent"
-            else:
-                outcome, reason = "uncertain", "historical source relationship is absent"
-            criteria = ()
-            if outcome == "pending":
-                contents = self.git.run_bytes(repository, "cat-file", "blob", oid)
-                try:
-                    criteria = _criteria(contents)
-                except RetirementError as error:
-                    outcome, reason = "uncertain", str(error)
-            self.connection.execute(
-                "INSERT INTO requirement_audit "
-                "(repo, source_path, input_token, source_oid, observed_sha, outcome, reason, criteria, "
-                "criteria_evidence, relevant_paths, stage) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, '[]', ?, 'observed') "
-                "ON CONFLICT(repo, source_path) DO UPDATE SET "
-                "input_token=excluded.input_token, source_oid=excluded.source_oid, "
-                "observed_sha=excluded.observed_sha, outcome=excluded.outcome, "
-                "reason=excluded.reason, criteria=excluded.criteria, "
-                "criteria_evidence='[]', relevant_paths=excluded.relevant_paths, "
-                "stage='observed', updated_at=CURRENT_TIMESTAMP",
-                (repo, source, token, oid, revision, outcome, reason,
-                 json.dumps(criteria, ensure_ascii=False), json.dumps(relevant)),
-            )
-            if outcome == "restore":
-                self.judgments.invalidate(repo, source, "historical archive requires restoration")
-                restorations.append(source)
-        for row in list(self.connection.execute(
-            "SELECT source_path, source_oid FROM requirement_audit "
-            "WHERE repo = ? AND stage = 'observed'",
-            (repo,),
-        )):
-            source = str(row["source_path"])
-            if source not in observed_sources and source in tree:
-                if tree[source] == ("100644", str(row["source_oid"])) or tree[source] == (
-                    "100755", str(row["source_oid"]),
-                ):
-                    self.connection.execute(
-                        "UPDATE requirement_audit SET stage = 'published', "
-                        "reason = 'original bytes restored on remote', "
-                        "updated_at = CURRENT_TIMESTAMP WHERE repo = ? AND source_path = ?",
-                        (repo, source),
-                    )
-                else:
-                    self.connection.execute(
-                        "UPDATE requirement_audit SET outcome = 'uncertain', "
-                        "reason = 'restored active content differs from archived evidence', "
-                        "updated_at = CURRENT_TIMESTAMP WHERE repo = ? AND source_path = ?",
-                        (repo, source),
-                    )
-        return tuple(restorations)
-
-    def audit_pending(self, repo: str, repository: Path, revision: str) -> tuple[AuditInput, ...]:
-        self.audit_restorations(repo, repository, revision)
-        rows = self.connection.execute(
-            "SELECT source_path, input_token, criteria FROM requirement_audit "
-            "WHERE repo = ? AND outcome = 'pending' ORDER BY source_path LIMIT 8", (repo,),
-        )
-        plans = list(self.connection.execute(
-            "SELECT plan_id, sources FROM exec_plans WHERE repo = ?", (repo,),
-        ))
-        return tuple(AuditInput(
-            str(row["source_path"]), str(row["input_token"]),
-            tuple(json.loads(str(row["criteria"]))),
-            tuple(str(plan["plan_id"]) for plan in plans if str(row["source_path"]) in
-                  _sources(plan["sources"], str(plan["plan_id"]))),
-        ) for row in rows)
-
-    def record_audit_result(self, repo: str, repository: Path, revision: str,
-                            planner_text: str) -> None:
-        pending = {item.path: item for item in self.audit_pending(repo, repository, revision)}
-        match = _single_result(AUDIT_ASSESSMENT, planner_text)
-        if not pending:
-            if match is not None:
-                try:
-                    repeated = json.loads(match.group(1))
-                except ValueError as error:
-                    raise RetirementError("과거 Requirement 감사 JSON이 유효하지 않습니다.") from error
-                if not isinstance(repeated, list):
-                    raise RetirementError("과거 Requirement 감사 JSON 배열이 필요합니다.")
-                for value in repeated:
-                    if not isinstance(value, dict) or not isinstance(value.get("path"), str):
-                        raise RetirementError("보존된 과거 Requirement 감사가 유효하지 않습니다.")
-                    paths = value.get("relevant_paths")
-                    if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
-                        raise RetirementError("보존된 과거 Requirement 감사 경로가 유효하지 않습니다.")
-                    row = self.connection.execute(
-                        "SELECT * FROM requirement_audit WHERE repo = ? AND source_path = ?",
-                        (repo, value["path"]),
-                    ).fetchone()
-                    mapped = {"premature": "restore", "fulfilled": "fulfilled",
-                              "superseded": "superseded", "uncertain": "uncertain"}
-                    if (row is None
-                        or mapped.get(value.get("outcome")) != row["outcome"]
-                        or value.get("reason") != row["reason"]
-                        or value.get("criteria_evidence") != json.loads(str(row["criteria_evidence"]))
-                        or sorted(set(paths)) != json.loads(str(row["relevant_paths"]))):
-                        raise RetirementError("보존된 과거 Requirement 감사가 현재 입력과 다릅니다.")
-            return
-        if match is None:
-            raise RetirementError("일반 Planner의 과거 Requirement 감사 결과가 없습니다.")
-        try:
-            values = json.loads(match.group(1))
-        except ValueError as error:
-            raise RetirementError("과거 Requirement 감사 JSON이 유효하지 않습니다.") from error
-        if not isinstance(values, list) or len(values) != len(pending):
-            raise RetirementError("과거 Requirement 감사 대상 집합이 입력과 다릅니다.")
-        tree = _tree(self.git, repository, revision, "docs/requirements",
-                     "docs/PRODUCT.md", "docs/ARCHITECTURE.md")
-        plans = list(self.connection.execute("SELECT * FROM exec_plans WHERE repo = ?", (repo,)))
-        updates = []
-        seen = set()
-        for value in values:
-            if not isinstance(value, dict) or set(value) != {
-                "path", "input_token", "outcome", "criteria_evidence", "relevant_paths", "reason",
-            }:
-                raise RetirementError("과거 Requirement 감사 필드가 유효하지 않습니다.")
-            path = value["path"]
-            if not isinstance(path, str) or path not in pending or path in seen:
-                raise RetirementError("과거 Requirement 감사 path가 입력과 다릅니다.")
-            seen.add(path)
-            item = pending[path]
-            evidence, paths, reason = value["criteria_evidence"], value["relevant_paths"], value["reason"]
-            if (value["input_token"] != item.token
-                or value["outcome"] not in {"fulfilled", "premature", "superseded", "uncertain"}
-                or not isinstance(evidence, list) or len(evidence) != len(item.criteria)
-                or any(not isinstance(entry, str) or not entry.strip() or len(entry) > 4000
-                       for entry in evidence)
-                or not isinstance(paths, list) or len(paths) > 200
-                or any(not isinstance(entry, str) or not _valid_evidence_path(entry)
-                       for entry in paths)
-                or (value["outcome"] != "uncertain" and not paths)
-                or not isinstance(reason, str) or not reason.strip() or len(reason) > 4000):
-                raise RetirementError(f"과거 Requirement 감사 근거가 불완전합니다: {path}")
-            archived = "docs/requirements/archive/" + path.removeprefix("docs/requirements/")
-            if archived not in tree or path in tree:
-                raise RetirementError(f"과거 Requirement 감사 원본이 변경됐습니다: {path}")
-            related = [row for row in plans if path in _sources(row["sources"], str(row["plan_id"]))]
-            relevant = tuple(sorted(set(paths)))
-            if value["outcome"] in {"fulfilled", "superseded"}:
-                observed = self._evidence(repository, revision, relevant)
-                if any(not observed.get(entry) or observed[entry][0] == "120000"
-                       for entry in relevant):
-                    raise RetirementError(f"과거 Requirement 완료·교체 근거 파일이 없습니다: {path}")
-            token = _digest((tree[archived][0], tree.get(path), (),
-                             self._token(repo, repository, revision, path, tree[archived][1],
-                                         related, tree, relevant)))
-            updates.append((path, token, value["outcome"], tuple(evidence), relevant, reason))
-        for path, token, outcome, evidence, relevant, reason in updates:
-            self.connection.execute(
-                "UPDATE requirement_audit SET input_token = ?, outcome = ?, reason = ?, "
-                "criteria_evidence = ?, relevant_paths = ?, updated_at = CURRENT_TIMESTAMP "
-                "WHERE repo = ? AND source_path = ?",
-                (token, "restore" if outcome == "premature" else outcome, reason,
-                 json.dumps(evidence, ensure_ascii=False), json.dumps(relevant), repo, path),
-            )
-            if outcome == "premature":
-                self.judgments.invalidate(repo, path, "historical audit found unfinished criteria")
-
-    def stage_restorations(self, repo: str, repository: Path, revision: str,
-                           worktree: Path) -> tuple[str, ...]:
-        paths = []
-        candidates = self.audit_restorations(repo, repository, revision)
-        for source in candidates:
-            row = self.connection.execute(
-                "SELECT input_token, source_oid, stage FROM requirement_audit "
-                "WHERE repo = ? AND source_path = ?",
-                (repo, source),
-            ).fetchone()
-            assert row is not None
-            archived = "docs/requirements/archive/" + source.removeprefix("docs/requirements/")
-            origin, target = worktree / archived, worktree / source
-            _safe_parent(worktree, archived)
-            _safe_parent(worktree, source, create=True)
-            original = self.git.run_bytes(repository, "cat-file", "blob", str(row["source_oid"]))
-            if row["stage"] == "staged" and not origin.exists():
-                if target.is_symlink() or not target.is_file() or target.read_bytes() != original:
-                    raise RetirementError(f"Requirement 복원 영수증과 내용이 다릅니다: {source}")
-                self.connection.execute(
-                    "UPDATE requirement_audit SET observed_sha = ?, updated_at=CURRENT_TIMESTAMP "
-                    "WHERE repo = ? AND source_path = ?", (revision, repo, source),
-                )
-                paths.extend((archived, source))
-                continue
-            if (origin.is_symlink() or not origin.is_file() or origin.read_bytes() != original
-                or target.exists() or target.is_symlink()):
-                raise RetirementError(f"Requirement 복원 원본 또는 목적지가 안전하지 않습니다: {source}")
-            changed = self.connection.execute(
-                "UPDATE requirement_audit SET stage = 'staged', observed_sha = ?, updated_at=CURRENT_TIMESTAMP "
-                "WHERE repo = ? AND source_path = ? AND input_token = ?",
-                (revision, repo, source, row["input_token"]),
-            )
-            if changed.rowcount != 1:
-                raise RetirementError(f"Requirement 복원 입력이 변경됐습니다: {source}")
-            os.rename(origin, target)
-            if target.read_bytes() != original:
-                raise RetirementError(f"Requirement 복원 중 원문이 변경됐습니다: {source}")
-            paths.extend((archived, source))
-        return tuple(paths)
-
     def stage_moves(self, repo: str, repository: Path, revision: str,
                     worktree: Path, *, excluded_sources: tuple[str, ...] = ()) -> tuple[str, ...]:
         paths = []
@@ -806,6 +515,18 @@ class RequirementRetirementPort:
 
     def receipted_paths(self, repo: str, repository: Path, revision: str,
                         worktree: Path) -> tuple[str, ...]:
+        # Old versions could leave a Manager-owned inverse move unpublished.
+        # Withdraw it to the remote archive; never create or publish a restoration.
+        legacy = list(self.connection.execute(
+            "SELECT source_path, source_oid FROM requirement_audit "
+            "WHERE repo = ? AND outcome = 'restore' AND stage = 'staged'", (repo,),
+        ))
+        for row in legacy:
+            self._withdraw_move(repo, repository, revision, worktree, row, restoring=True)
+        if legacy:
+            raise RetirementReassessment(
+                "미게시된 과거 Requirement 복원을 철회했습니다. archive를 유지하고 최신 활성 입력을 다시 확인하세요."
+            )
         paths = []
         currently_fulfilled = set(self.fulfilled_moves(repo, repository, revision))
         for row in self.connection.execute(
@@ -832,34 +553,10 @@ class RequirementRetirementPort:
                     or target.read_bytes() != original):
                 raise RetirementError(f"Requirement 이동 영수증과 worktree가 다릅니다: {source}")
             # Revalidation proves this pending move against the current base.
-            # Restorations may defer stage_moves, which normally refreshes it.
             self.connection.execute(
                 "UPDATE requirement_move_receipts SET base_sha = ?, updated_at=CURRENT_TIMESTAMP "
                 "WHERE repo = ? AND source_path = ? AND stage = 'pending'",
                 (revision, repo, source),
             )
             paths.extend((source, destination))
-        valid_restorations = set(self.audit_restorations(repo, repository, revision))
-        for row in self.connection.execute(
-            "SELECT source_path, source_oid FROM requirement_audit "
-            "WHERE repo = ? AND outcome = 'restore' AND stage = 'staged'",
-            (repo,),
-        ):
-            source = str(row["source_path"])
-            if source not in valid_restorations:
-                self._withdraw_move(repo, repository, revision, worktree, row, restoring=True)
-                raise RetirementReassessment(
-                    f"Requirement 복원을 철회했습니다. 최신 계획·근거로 감사를 재평가하세요: {source}"
-                )
-            archived = "docs/requirements/archive/" + source.removeprefix("docs/requirements/")
-            origin, target = worktree / archived, worktree / source
-            _safe_parent(worktree, archived)
-            _safe_parent(worktree, source)
-            if origin.exists() and not target.exists():
-                continue
-            original = self.git.run_bytes(repository, "cat-file", "blob", str(row["source_oid"]))
-            if (origin.exists() or target.is_symlink() or not target.is_file()
-                    or target.read_bytes() != original):
-                raise RetirementError(f"Requirement 복원 영수증과 worktree가 다릅니다: {source}")
-            paths.extend((archived, source))
         return tuple(paths)

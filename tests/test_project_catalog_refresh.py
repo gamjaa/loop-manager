@@ -1160,7 +1160,6 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
                 mutable_snapshot_token=lambda *args: 'token',
                 git=lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=''),
                 _parse_execplan=catalog.parse_execplan_file,
-                contains_guidance_sections=lambda text: False,
                 load_execplan_catalog=manager.load_execplan_catalog)
             with self.assertRaisesRegex(planner_validation.PlannerValidationError, '보류 계획에 의존'):
                 planner_validation.validate_planner_result(effects, root, self.sha, [],
@@ -1185,7 +1184,6 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
                 mutable_snapshot_token=lambda *args: 'token',
                 git=lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=''),
                 _parse_execplan=catalog.parse_execplan_file,
-                contains_guidance_sections=lambda text: False,
                 load_execplan_catalog=manager.load_execplan_catalog)
             with self.assertRaisesRegex(planner_validation.PlannerValidationError,
                                         '존재하지 않는 depends_on ID.*G-999'):
@@ -1224,7 +1222,6 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
                 effects = SimpleNamespace(changed_files=lambda *args: [path],
                     mutable_snapshot_token=lambda *args: 'token', git=git,
                     _parse_execplan=catalog.parse_execplan_file,
-                    contains_guidance_sections=lambda text: False,
                     load_execplan_catalog=manager.load_execplan_catalog,
                     _validate_future_idea_separation=mock.Mock(),
                     file_hash=lambda target: catalog.plan_content_hash(target.read_bytes()))

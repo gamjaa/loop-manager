@@ -170,7 +170,6 @@ class ValidatePlannerResultEffects:
     _stored_string_list: Callable[..., object]
     _validate_future_idea_separation: Callable[..., object]
     changed_files: Callable[..., object]
-    contains_guidance_sections: Callable[..., object]
     file_hash: Callable[..., object]
     git: Callable[..., object]
     load_execplan_catalog: Callable[..., object]
@@ -256,8 +255,6 @@ def validate_planner_result(
             raise PlannerValidationError(
                 f"Planner ExecPlan을 읽을 수 없습니다: {changed_path} ({error})"
             ) from error
-        if effects.contains_guidance_sections(planner_text):
-            raise PlannerValidationError("Planner는 AGENTS.md guidance를 제안할 수 없습니다.")
         try:
             original = snapshot.by_id.get(str(parsed["id"]))
             execplan_drafts.validate_agent_change(parsed, original.text if original else None)

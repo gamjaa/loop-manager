@@ -560,7 +560,6 @@ class IsPlanningInputEffects:
 
 class PlanningInputKind(str, Enum):
     DOCUMENT = "document"
-    GUIDANCE = "guidance"
     ACTIVE_PLAN = "active_plan"
     OTHER = "other"
     EXCLUDED = "excluded"
@@ -572,7 +571,7 @@ def classify_planning_input(
     if path in {b"docs/PRODUCT.md", b"docs/ARCHITECTURE.md"} or is_active_requirement(path):
         return PlanningInputKind.DOCUMENT
     if path == b"AGENTS.md":
-        return PlanningInputKind.GUIDANCE
+        return PlanningInputKind.EXCLUDED
     if execplan_catalog.is_active_execplan_path(path):
         return PlanningInputKind.ACTIVE_PLAN
     if not path.startswith(b"docs/"):

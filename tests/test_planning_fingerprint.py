@@ -16,14 +16,14 @@ class PlanningFingerprintTest(unittest.TestCase):
             path, loop_manager._is_active_requirement,
         )
         self.assertEqual(classify(b"docs/PRODUCT.md"), catalog_service.PlanningInputKind.DOCUMENT)
-        self.assertEqual(classify(b"AGENTS.md"), catalog_service.PlanningInputKind.GUIDANCE)
+        self.assertEqual(classify(b"AGENTS.md"), catalog_service.PlanningInputKind.EXCLUDED)
         self.assertEqual(classify(b"docs/plans/[G-130] Plan.md"), catalog_service.PlanningInputKind.ACTIVE_PLAN)
         self.assertEqual(classify(b"src/app.py"), catalog_service.PlanningInputKind.OTHER)
         self.assertEqual(classify(b"docs/FUTURE_IDEAS.md"), catalog_service.PlanningInputKind.EXCLUDED)
 
     def test_planning_input_path_boundary(self):
         cases = {
-            b"AGENTS.md": True,
+            b"AGENTS.md": False,
             b"docs/PRODUCT.md": True,
             b"docs/ARCHITECTURE.md": True,
             b"docs/requirements/Active.md": True,
@@ -401,6 +401,24 @@ class CommonGuidanceFingerprintTest(unittest.TestCase):
             pinned = [function(entries, guidance_hash='a' * 64) for function in functions]
         self.assertEqual(initial, pinned)
         self.assertTrue(all(before != after for before, after in zip(initial, changed)))
+
+    def test_cli_guidance_content_does_not_change_planning_inputs(self):
+        tree = {b'src/app.py': (b'blob', b'code'),
+                b'docs/PRODUCT.md': (b'blob', b'product')}
+        functions = (loop_manager._planning_input_fingerprint,
+                     loop_manager._nonplan_input_fingerprint,
+                     loop_manager._specification_input_fingerprint)
+        def read(_repo, *arguments):
+            self.assertIn(arguments[-1], {'code', 'product'})
+            return arguments[-1].encode()
+        with mock.patch.object(loop_manager, '_git_tree_entries', return_value=tree), \
+             mock.patch.object(loop_manager, 'git_bytes', side_effect=read):
+            baseline = [function(Path('/repo'), 'revision', guidance_hash='pinned-runtime')
+                        for function in functions]
+            for object_id in (b'original', b'changed', b'invalid-utf8'):
+                tree[b'AGENTS.md'] = (b'blob', object_id)
+                self.assertEqual([function(Path('/repo'), 'revision', guidance_hash='pinned-runtime')
+                                  for function in functions], baseline)
 
     def test_same_remote_sha_cannot_hide_common_change_behind_archive_or_nonplan_comparison(self):
         from types import SimpleNamespace

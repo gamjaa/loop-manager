@@ -23,7 +23,7 @@ def generate(effects, connection, repo, state_dir, config_path, provider, group,
     reserved=[dict(row) for row in connection.execute('SELECT plan_id,title,sources,depends_on,status '
                                                      'FROM exec_plans WHERE repo=?',(str(repo),))]
     guidance = {}
-    for path in ('docs/PRODUCT.md','docs/ARCHITECTURE.md','docs/PLANS.md','AGENTS.md'):
+    for path in ('docs/PRODUCT.md','docs/ARCHITECTURE.md','docs/PLANS.md'):
         result=effects.git(repo,'show',f"{group['source_head']}:{path}",check=False)
         if result.returncode==0:
             guidance[path]=result.stdout

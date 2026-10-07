@@ -155,7 +155,7 @@ class TrackedSourceInventoryTest(unittest.TestCase):
         }
 
         self.assertEqual(placements[".agents"].category, "tool_required")
-        self.assertEqual(placements["AGENTS.md"].category, "tool_required")
+        self.assertEqual(placements["AGENTS.md"].category, "user_entry")
         self.assertEqual(placements["docs"].category, "tool_required")
         self.assertEqual(placements["README.md"].category, "user_entry")
         self.assertEqual(placements["config"].category, "execution_build_deploy")

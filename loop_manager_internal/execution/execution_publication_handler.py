@@ -43,7 +43,6 @@ class PublicationHandlerPorts:
     requirement_archive_move_set: Callable[..., Any]
     requirement_archive_reconciliation_error: Callable[..., Any]
     validate_execplan_workspace_identity: Callable[..., Any]
-    validate_guidance_publication: Callable[..., Any]
     validate_managed_worktree: Callable[..., Any]
     _archive_candidates_at: Callable[..., tuple[str, ...]]
     _archive_collision: Callable[..., ExecutionOutcome]
@@ -415,13 +414,6 @@ class PublicationHandler:
                 self.ports._record_archive_target('VALIDATED', moves=final_archive_moves)
             except RecoveryFailure as error:
                 return self.ports._recover(error.reason, str(error), context=context)
-        if self.ports.validate_guidance_publication(
-            self.ports.identity.repo,
-            context.worktree,
-            self.ports.snapshot().catalog_plan,
-            str(row['worker_result'] or ''),
-        ):
-            return self.ports._final()
         guarded = self.ports._post_effect_guard(context)
         if isinstance(guarded, ExecutionOutcome):
             return guarded

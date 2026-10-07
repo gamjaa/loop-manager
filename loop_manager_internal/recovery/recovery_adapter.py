@@ -110,7 +110,6 @@ class ScopeReconciliationEffectsResumeProjectBlockIfSafeEffects:
     _agent_git_resources: Callable[..., object]
     _clear_active_in_current_transaction: Callable[..., object]
     _clear_project_block_without_losing_planning_error: Callable[..., object]
-    _reconcile_guidance_double_block: Callable[..., object]
     _reconcile_rebase_evidence_block: Callable[..., object]
     _reconciled_manager_scope_metadata: Callable[..., object]
     _requeue_blocked_execplan: Callable[..., object]
@@ -130,7 +129,6 @@ def _scope_reconciliation_effects_resume_project_block_if_safe(effects: ScopeRec
         _agent_git_resources=effects._agent_git_resources,
         _clear_active_in_current_transaction=effects._clear_active_in_current_transaction,
         _clear_project_block_without_losing_planning_error=effects._clear_project_block_without_losing_planning_error,
-        _reconcile_guidance_double_block=effects._reconcile_guidance_double_block,
         _reconcile_rebase_evidence_block=effects._reconcile_rebase_evidence_block,
         _reconciled_manager_scope_metadata=effects._reconciled_manager_scope_metadata,
         _requeue_blocked_execplan=effects._requeue_blocked_execplan,
@@ -163,7 +161,7 @@ class ScopeReconciliationEffectsResumePlanBlocksEffects:
     plan_blocked_execplans: Callable[..., object]
     project_execplan: Callable[..., object]
     resume_blocked_execplan_if_inputs_changed: Callable[..., object]
-    resume_guidance_approval_if_decided: Callable[..., object]
+    resume_retired_guidance_block: Callable[..., object]
     unmet_execplan_dependencies: Callable[..., object]
     validate_blocked_agent_scope: Callable[..., object]
     validate_execplan_workspace_identity: Callable[..., object]
@@ -185,7 +183,7 @@ def _scope_reconciliation_effects_resume_plan_blocks(effects: ScopeReconciliatio
         plan_blocked_execplans=effects.plan_blocked_execplans,
         project_execplan=effects.project_execplan,
         resume_blocked_execplan_if_inputs_changed=effects.resume_blocked_execplan_if_inputs_changed,
-        resume_guidance_approval_if_decided=effects.resume_guidance_approval_if_decided,
+        resume_retired_guidance_block=effects.resume_retired_guidance_block,
         unmet_execplan_dependencies=effects.unmet_execplan_dependencies,
         validate_blocked_agent_scope=effects.validate_blocked_agent_scope,
         validate_execplan_workspace_identity=effects.validate_execplan_workspace_identity,
@@ -195,10 +193,6 @@ def _scope_reconciliation_effects_resume_plan_blocks(effects: ScopeReconciliatio
 @dataclass(frozen=True)
 class ManagedRebaseRuntimeEffectsEffects:
     """Named effects for _managed_rebase_runtime_effects; no entry-point/module access."""
-    _guidance_document: Callable[..., object]
-    _guidance_document_matches_rows: Callable[..., object]
-    _guidance_final_expected: Callable[..., object]
-    _guidance_target_state: Callable[..., object]
     _owned_rebase_metadata: Callable[..., object]
     _path_signature: Callable[..., object]
     _published_plan_allows_common_plans: Callable[..., object]
@@ -218,10 +212,6 @@ class ManagedRebaseRuntimeEffectsEffects:
 
 def _managed_rebase_runtime_effects(effects: ManagedRebaseRuntimeEffectsEffects, ) -> managed_rebase_runtime.RebaseRuntimeEffects:
     return managed_rebase_runtime.RebaseRuntimeEffects(
-        _guidance_document=effects._guidance_document,
-        _guidance_document_matches_rows=effects._guidance_document_matches_rows,
-        _guidance_final_expected=effects._guidance_final_expected,
-        _guidance_target_state=effects._guidance_target_state,
         _owned_rebase_metadata=effects._owned_rebase_metadata,
         _path_signature=effects._path_signature,
         _published_plan_allows_common_plans=effects._published_plan_allows_common_plans,

@@ -175,11 +175,11 @@ def inspect_registration_files(
     revision: str,
     *,
     approve_agents_mismatch: bool,
-) -> tuple[str, bool]:
+) -> tuple[str | None, bool]:
     """Validate registration documents from one immutable commit tree."""
 
     entries = effects._git_tree_entries(root, revision)
-    required_paths = ("AGENTS.md", "docs/PLANS.md", "docs/ARCHITECTURE.md")
+    required_paths = ("docs/PLANS.md", "docs/ARCHITECTURE.md")
     blobs = {
         relative_path: effects._revision_blob(root, entries, relative_path)
         for relative_path in required_paths
@@ -196,8 +196,7 @@ def inspect_registration_files(
 
     plans = blobs["docs/PLANS.md"]
     architecture = blobs["docs/ARCHITECTURE.md"]
-    agents = blobs["AGENTS.md"]
-    assert plans is not None and architecture is not None and agents is not None
+    assert plans is not None and architecture is not None
     if plans.replace(b"\r\n", b"\n") != effects.normalized_text(effects.ROOT / "docs/PLANS.md").encode("utf-8"):
         raise RuntimeError("docs/PLANS.md가 Loop Manager 기준 파일과 다릅니다.")
     if architecture.replace(b"\r\n", b"\n") == effects.normalized_text(
@@ -213,14 +212,8 @@ def inspect_registration_files(
             "docs/PRODUCT.md가 변경되지 않은 템플릿이라 등록할 수 없습니다."
         )
 
-    try:
-        agents.decode("utf-8")
-    except UnicodeDecodeError as error:
-        raise RuntimeError("origin의 AGENTS.md가 UTF-8이 아닙니다.") from error
-    agents_hash = hashlib.sha256(agents).hexdigest()
-    # Registry storage archives old approval/hash pairs before replacing these
-    # current-registration values. Project rules need no common-content approval.
-    return agents_hash, False
+    # Legacy registration fields remain nullable for existing audit records.
+    return None, False
 
 
 @dataclass(frozen=True)

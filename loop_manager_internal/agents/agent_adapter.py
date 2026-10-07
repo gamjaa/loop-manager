@@ -114,7 +114,6 @@ class ScopeLifecycleEffectsEffects:
     _agent_git_resources: Callable[..., object]
     _capture_agent_baseline: Callable[..., object]
     _current_rebase_service: Callable[..., object]
-    _guidance_worker_targets: Callable[..., object]
     _owned_rebase_state_dir: Callable[..., object]
     _plan_id_from_path: Callable[..., object]
     _published_plan_allows_common_plans: Callable[..., object]
@@ -132,7 +131,6 @@ def _scope_lifecycle_effects(effects: ScopeLifecycleEffectsEffects, ) -> scope_l
         _agent_git_resources=effects._agent_git_resources,
         _capture_agent_baseline=effects._capture_agent_baseline,
         _current_rebase_service=effects._current_rebase_service,
-        _guidance_worker_targets=effects._guidance_worker_targets,
         _owned_rebase_state_dir=effects._owned_rebase_state_dir,
         _plan_id_from_path=effects._plan_id_from_path,
         _published_plan_allows_common_plans=effects._published_plan_allows_common_plans,
@@ -151,7 +149,6 @@ class ScopeRecoveryEffectsEffects:
     _agent_git_resources: Callable[..., object]
     _config_entries: Callable[..., object]
     _current_rebase_service: Callable[..., object]
-    _guidance_worker_targets: Callable[..., object]
     _normalize_legacy_ignored_snapshot: Callable[..., object]
     _owned_checkpoint_remote_oid: Callable[..., object]
     _owned_rebase_state_dir: Callable[..., object]
@@ -182,7 +179,6 @@ def _scope_recovery_effects(effects: ScopeRecoveryEffectsEffects, ) -> scope_rec
         _agent_git_resources=effects._agent_git_resources,
         _config_entries=effects._config_entries,
         _current_rebase_service=effects._current_rebase_service,
-        _guidance_worker_targets=effects._guidance_worker_targets,
         _normalize_legacy_ignored_snapshot=effects._normalize_legacy_ignored_snapshot,
         _owned_checkpoint_remote_oid=effects._owned_checkpoint_remote_oid,
         _owned_rebase_state_dir=effects._owned_rebase_state_dir,

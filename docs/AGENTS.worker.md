@@ -6,24 +6,12 @@
   함께 수행한다. 기존 동작을 보존하는 테스트를 포함하고 범위 밖 개선으로 확대하지 않는다.
 - 새 ExecPlan을 만들거나 다른 계획의 목표를 추가 구현하지 않는다. 연관 문서 수정은
   호출에서 제공된 권한 안에서 수행하고 목표·실행 이력·dependency·사용자 결정을 보존한다.
-- PRODUCT·Requirement·ARCHITECTURE는 기본적으로 사용자가 작성한다. 명시적인
-  Specification Skill 문서 작성 요청은 예외이며, Requirement 구현 결과가 장기 제품
-  규칙이면 코드와 같은 PR에서 PRODUCT를 갱신할 수 있다.
+- Requirement는 기본적으로 사용자가 작성하며 명시적인 Specification Skill 문서 작성 요청은
+  예외다. Requirement·ExecPlan 구현으로 바뀌는 제품 동작·장기 규칙은 PRODUCT에,
+  설계·책임 경계·계약은 ARCHITECTURE에 코드와 같은 PR에서 반영한다. 필요한 관련 절만
+  갱신하고 목표·필수 검증·사용자 결정을 보존한다.
 - Requirement의 완료 판단·archive 이동은 Manager의 책임이며 Worker가 수행하지 않는다.
   `docs/PLANS.md` 수정은 게시된 ExecPlan이 해당 변경을 명시한 경우에만 허용한다.
-
-## 프로젝트 AGENTS 변경
-
-현재 ExecPlan에 꼭 필요한 루트 `AGENTS.md` 변경을 발견하면 직접 수정하지 않고
-`docs/PLANS.md`에 따라 선택된 계획의 Decision Log에 정확한 제안과 빈 User Decision을
-기록한 뒤 사용자 판단을 기다린다. 신규 제안의 Target은 `AGENTS.md`, Scope는 self
-저장소도 `project`다. pending 결정에는 빈 백틱 Comment, 실제 Proposal의 전체 diff,
-필드 옆 안내 주석과 `<!-- END USER DECISION -->`를 제공하며 Revision과 일반 pending의
-Baseline은 생성하지 않는다. 기존 결정·편집된 Patch·Comment·메모를 덮어쓰지 않는다.
-
-Manager가 검증해 전달한 사전 승인 또는 승인·대체 patch는 해당 대상과 정확한 내용에만
-적용한다. reject 대상은 원래 baseline을 유지하고 최종 내용은 전달된 expected_content_hash와
-일치해야 한다. 사용자 결정을 대신 작성·변경하거나 승인 범위를 확대하지 않는다.
 
 ## 검증
 

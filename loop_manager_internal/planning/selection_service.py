@@ -189,7 +189,7 @@ class PlanningSelectionService(PlanningService):
             ).stdout.split('\0')
             # Source comparisons alone cannot establish the effect of a code
             # or other unclassified change on existing goals and validation.
-            if any(path and not (path in {'AGENTS.md', 'docs/PRODUCT.md', 'docs/ARCHITECTURE.md', 'docs/PLANS.md'}
+            if any(path and not (path in {'docs/PRODUCT.md', 'docs/ARCHITECTURE.md', 'docs/PLANS.md'}
                     or path.startswith(('docs/requirements/', 'docs/plans/'))) for path in changed):
                 return ids
             affected = []
@@ -405,12 +405,6 @@ class PlanningSelectionService(PlanningService):
                 run.general_fingerprint,
             )
             if hasattr(self._ports, "retirement"):
-                run.audit_restorations = self._ports.retirement.audit_restorations(
-                    context.repo, context.repo_path, run.base_sha,
-                )
-                run.audit_pending = self._ports.retirement.audit_pending(
-                    context.repo, context.repo_path, run.base_sha,
-                )
                 run.retirement_pending = self._ports.retirement.pending(
                     context.repo, context.repo_path, run.base_sha,
                 )
@@ -428,36 +422,31 @@ class PlanningSelectionService(PlanningService):
                     if previous is not None and previous["stage"] == "accepted"
                     else str(row.processed_sha)
                 )
-                guidance_changed = bool(self._ports.git.run(
-                    context.repo_path, "diff", "--name-only", comparison_sha,
-                    run.base_sha, "--", "AGENTS.md",
-                ).stdout.strip())
-                if not guidance_changed:
-                    try:
-                        candidate = self._ports.validation.prepare_general_context(
-                            context.repo, context.repo_path, run.base_sha,
-                        )
-                    except PlanningResultInvalid as error:
-                        self._ports.events.error(str(error))
-                        return self._operational_error()
-                    if candidate.plans:
-                        identity = target_fingerprint(candidate)
-                        check_accepted = bool(
-                            previous is not None and previous["stage"] == "accepted"
-                            and previous["input_fingerprint"] == run.general_fingerprint
-                            and previous["specification_fingerprint"] == run.specification_fingerprint
-                            and previous["target_fingerprint"] == identity
-                        )
-                        check_ready = not check_accepted
-                        run.mutable_ready_snapshot = candidate
-                        if check_ready:
-                            run.check_comparison_sha = comparison_sha
+                try:
+                    candidate = self._ports.validation.prepare_general_context(
+                        context.repo, context.repo_path, run.base_sha,
+                    )
+                except PlanningResultInvalid as error:
+                    self._ports.events.error(str(error))
+                    return self._operational_error()
+                if candidate.plans:
+                    identity = target_fingerprint(candidate)
+                    check_accepted = bool(
+                        previous is not None and previous["stage"] == "accepted"
+                        and previous["input_fingerprint"] == run.general_fingerprint
+                        and previous["specification_fingerprint"] == run.specification_fingerprint
+                        and previous["target_fingerprint"] == identity
+                    )
+                    check_ready = not check_accepted
+                    run.mutable_ready_snapshot = candidate
+                    if check_ready:
+                        run.check_comparison_sha = comparison_sha
             if check_accepted:
                 planning_input_changed = False
                 run.fingerprint_skipped = True
             if (hasattr(self._ports.state, "planning_review") and not approval_pending
                     and not specification_changed and not planning_input_changed
-                    and not (run.audit_restorations or run.audit_pending or run.retirement_pending)
+                    and not run.retirement_pending
                     and self._ports.state.final_review_candidate(context.repo,
                         context.refactoring_review_interval, self_repository=context.self_repository)):
                 from loop_manager_internal.planning.specification_review import current_receipt
@@ -473,8 +462,6 @@ class PlanningSelectionService(PlanningService):
                 has_active=getattr(decision, "active", None) is not None,
                 specification_changed=(specification_changed or approval_pending
                                        or bool(run.retirement_pending)
-                                       or bool(run.audit_restorations)
-                                       or bool(run.audit_pending)
                                        or run.final_review_required),
                 runnable_ready=decision.runnable_ready is not None,
                 planning_input_changed=planning_input_changed,

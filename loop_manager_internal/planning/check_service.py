@@ -102,12 +102,7 @@ class PlanningCheckService(PlanningService):
                 latest = self._ports.git.fetch_base(
                     run.context.repo_path, run.context.base_branch,
                 )
-                guidance_changed = bool(self._ports.git.run(
-                    run.context.repo_path, "diff", "--name-only",
-                    str(check["comparison_sha"]), latest, "--", "AGENTS.md",
-                ).stdout.strip())
-                if (guidance_changed
-                        or self._ports.git.input_fingerprint(run.context.repo_path, latest)
+                if (self._ports.git.input_fingerprint(run.context.repo_path, latest)
                         != check["input_fingerprint"]
                         or self._ports.git.specification_fingerprint(run.context.repo_path, latest)
                         != check["specification_fingerprint"]
@@ -156,22 +151,18 @@ class PlanningCheckService(PlanningService):
         snapshot = run.mutable_ready_snapshot
         assert snapshot is not None
         identity = target_fingerprint(snapshot)
-        guidance = self._ports.git.run(
-            run.context.repo_path, "diff", "--name-only", str(check["comparison_sha"]),
-            run.base_sha, "--", "AGENTS.md",
-        ).stdout.strip()
         specification = self._ports.git.specification_fingerprint(
             run.context.repo_path, run.base_sha,
         )
         current_input = self._ports.git.input_fingerprint(
             run.context.repo_path, run.base_sha,
         )
-        if (guidance or specification != check["specification_fingerprint"]
+        if (specification != check["specification_fingerprint"]
                 or not self._ports.state.plan_declarations_match(
                     repo, self._ports.git.plan_declarations(run.context.repo_path, run.base_sha),
                 ) or not snapshot.plans):
             return self._handoff(
-                run, "점검 중 문서·지침 또는 예정 작업이 변경됐습니다. 최신 입력을 일반 Planner가 확인합니다.",
+                run, "점검 중 문서 또는 예정 작업이 변경됐습니다. 최신 입력을 일반 Planner가 확인합니다.",
             )
         if (current_input != check["input_fingerprint"]
                 or identity != check["target_fingerprint"]):
@@ -217,7 +208,7 @@ class PlanningCheckService(PlanningService):
         ).stdout.strip()
         changes = "\n".join(
             line for line in changes.splitlines()
-            if any(path != "AGENTS.md" and not path.startswith("docs/")
+            if any(not path.startswith("docs/")
                    for path in line.split("\t")[1:])
         )
         change_context = (

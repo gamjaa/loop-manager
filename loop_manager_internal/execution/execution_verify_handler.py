@@ -36,7 +36,6 @@ class VerifyHandlerPorts:
     parse_worker_result: Callable[..., Any]
     transition_validation_failure: Callable[..., Any]
     validate_active_execplan_metadata: Callable[..., Any]
-    validate_guidance_publication: Callable[..., Any]
     validate_worker_workspace_scope: Callable[..., Any]
     verify: Callable[..., Any]
     _advanced: Callable[[], ExecutionOutcome]
@@ -195,13 +194,6 @@ class VerifyHandler:
                 self.ports._document_guard(context, draft)
             except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
                 return self.ports._document_block(context, draft, error)
-        if self.ports.validate_guidance_publication(
-            self.ports.identity.repo,
-            context.worktree,
-            self.ports.snapshot().catalog_plan,
-            str(row['worker_result'] or ''),
-        ):
-            return self.ports._final()
         try:
             from loop_manager_internal.execution.manual_candidate import get_manual
             manual = get_manual(self.ports.state)

@@ -834,7 +834,6 @@ class BlockedUserInputScopeUnitTests(unittest.TestCase):
             _proven_merged_cleanup_paths=mock.Mock(return_value=frozenset()),
             _proven_manager_base_refs=mock.Mock(return_value=frozenset()),
             requirement_archive_candidates=mock.Mock(return_value=()),
-            _guidance_worker_targets=mock.Mock(return_value=()),
             _published_plan_allows_common_plans=mock.Mock(return_value=False),
             _agent_git_resources=mock.Mock(return_value=resources),
             validate_agent_scope=mock.Mock(),

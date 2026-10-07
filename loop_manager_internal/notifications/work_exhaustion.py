@@ -252,21 +252,6 @@ def collect(
             "independent_wait": independent_wait,
         })
 
-    if _table_exists(connection, "requirement_audit"):
-        for row in connection.execute(
-            "SELECT source_path, reason FROM requirement_audit "
-            "WHERE repo = ? AND outcome = 'uncertain' AND stage = 'observed' "
-            "ORDER BY source_path", (repo,),
-        ):
-            path = str(row["source_path"])
-            match = re.match(r"docs/requirements/(\[R-\d+\])", path)
-            requirement_reasons.append({
-                "id": match.group(1) if match else path, "path": path,
-                "reason": "과거 archive 근거가 불확실하여 사용자 결정을 기다립니다: "
-                          + str(row["reason"]),
-                "independent_wait": True,
-            })
-
     return WorkReasonSnapshot(
         cycle, tuple(plans), tuple(requirement_reasons), project_block, planning_error,
     )

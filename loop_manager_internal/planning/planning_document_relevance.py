@@ -62,7 +62,7 @@ def relevant_document_changes(
 ) -> tuple[str, ...]:
     """Compare remote plan inputs and, when requested, active requirements."""
     changed = set(git(repository, "diff", "--name-only", "-z", old, new, "--",
-                      "docs", "AGENTS.md").stdout.split("\0")) - {""}
+                      "docs").stdout.split("\0")) - {""}
     if not changed:
         return ()
     rows = {str(row["plan_id"]): row for row in catalog_rows}
@@ -80,7 +80,7 @@ def relevant_document_changes(
     old_paths = _plan_paths(git, repository, old, ids)
     new_paths = _plan_paths(git, repository, new, ids)
     relevant = {"docs/PRODUCT.md", "docs/ARCHITECTURE.md",
-                "docs/PLANS.md", "AGENTS.md"}
+                "docs/PLANS.md"}
     declarations = []
     dependency_ids: set[str] = set()
     for plan_id in ids:

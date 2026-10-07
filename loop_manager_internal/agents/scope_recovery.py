@@ -34,7 +34,6 @@ class ScopeRecoveryEffects:
     _agent_git_resources: Callable[..., agent_scope_decision.GitResources | None]
     _config_entries: Callable[..., dict[str, tuple[str, ...]]]
     _current_rebase_service: Callable[..., ManagedRebaseService]
-    _guidance_worker_targets: Callable[..., tuple[str, ...]]
     _normalize_legacy_ignored_snapshot: Callable[..., GitSnapshot]
     _owned_checkpoint_remote_oid: Callable[..., str | None]
     _owned_rebase_state_dir: Callable[..., Path | None]
@@ -203,9 +202,6 @@ def validate_persisted_agent_scope(
         )
         if active_plan is None:
             raise AgentScopeError("저장된 Worker ExecPlan 상태가 없습니다.")
-        guidance_targets = effects._guidance_worker_targets(
-            connection, repo, str(active_plan["plan_id"])
-        )
         allow_common_plans = effects._published_plan_allows_common_plans(
             repo_path, active_plan
         )
@@ -752,7 +748,7 @@ def validate_blocked_agent_scope(
             before, comparison, checkpoint.snapshot or {}, role_name)
         result = (GitSnapshot.deserialize(str(project['agent_result_snapshot']))
                   if project['agent_result_snapshot'] else None)
-        guidance = effects._guidance_worker_targets(connection, repo, plan_id)
+        guidance = ()
         common = effects._published_plan_allows_common_plans(repo_path, saved_plan)
         archive_sources = effects.requirement_archive_candidates(
             connection, repo_path, repo,
@@ -858,7 +854,6 @@ def validate_blocked_agent_scope(
                 effects.validate_agent_scope(
                     role_name, worktree, before, blocked_result,
                     selected_plan_path=selected_plan_path if role_name == 'worker' else None,
-                    allowed_guidance_targets=effects._guidance_worker_targets(connection, repo, plan_id),
                     allow_common_plans=effects._published_plan_allows_common_plans(repo_path, guidance_plan),
                     allowed_requirement_archives=archive_sources,
                     external_worktree=repo_path, base_branch=base, resources=resources,
@@ -896,7 +891,6 @@ def validate_blocked_agent_scope(
             effects.validate_agent_scope(
                 role_name, worktree, comparison, scope_result,
                 selected_plan_path=selected_plan_path if role_name == 'worker' else None,
-                allowed_guidance_targets=effects._guidance_worker_targets(connection, repo, plan_id),
                 allow_common_plans=effects._published_plan_allows_common_plans(repo_path, guidance_plan),
                 allowed_requirement_archives=archive_sources,
                 external_worktree=repo_path, base_branch=base, connection=connection)

@@ -9,7 +9,6 @@ from loop_manager_internal.agents.agent_scope_decision import _non_default_index
 from loop_manager_internal.agents.agent_scope_decision import _same_local_snapshot
 from loop_manager_internal.agents.agent_scope_decision import _worker_path_allowed
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
-from loop_manager_internal.documents.guidance_approval import content_hash as guidance_content_hash
 from loop_manager_internal.git import manager_git_journal
 from loop_manager_internal.git import rebase_file_evidence
 from loop_manager_internal.recovery import blocked_checkpoint
@@ -42,9 +41,6 @@ class PushDiagnosticCheckpointEffects:
 class CheckpointSafetyEffects:
     """Read-only ownership, path scope and current evidence gates."""
     _agent_git_resources: Callable[..., object]
-    _guidance_document: Callable[..., object]
-    _guidance_document_matches_rows: Callable[..., object]
-    _guidance_rows: Callable[..., object]
     _owned_checkpoint_remote_oid: Callable[..., object]
     _proven_manager_base_refs: Callable[..., object]
     _proven_merged_cleanup_paths: Callable[..., object]
@@ -207,28 +203,6 @@ class CheckpointSafetyAdapter:
         return row
 
 
-    def _approved_guidance_targets(self, request: blocked_checkpoint.CheckpointRequest) -> tuple[str, ...]:
-        targets = []
-        for row in self.connection.execute(
-            "SELECT target_path, expected_content_hash FROM guidance_approvals "
-            "WHERE repo = ? AND plan_id = ? AND applied = 1 "
-            "AND expected_content_hash IS NOT NULL ORDER BY target_path",
-            (request.repo, request.plan_id),
-        ):
-            target = str(row["target_path"])
-            path = Path(str(request.worktree or "")) / target
-            try:
-                matches = (
-                    path.is_file()
-                    and not path.is_symlink()
-                    and guidance_content_hash(path.read_bytes())
-                    == str(row["expected_content_hash"])
-                )
-            except OSError:
-                matches = False
-            if matches:
-                targets.append(target)
-        return tuple(targets)
 
 
     def assess(
@@ -341,7 +315,7 @@ class CheckpointSafetyAdapter:
                 if source.startswith("docs/requirements/")
                 and "/archive/" not in source
             )
-            guidance_targets = self._approved_guidance_targets(request)
+            guidance_targets = ()
             allow_common_plans = self.safety_effects._published_plan_allows_common_plans(
                 self.repo_path, plan
             )
@@ -415,7 +389,7 @@ class CheckpointSafetyAdapter:
                 plan["agent_recovery"]
                 or (
                     plan["agent_snapshot"]
-                    and not self._validated_guidance_checkpoint(request, plan, snapshot)
+                    and not self._validated_worker_checkpoint(request, plan, snapshot)
                     and not self._validated_reconciliation_scope(request, plan)
                 )
             ),
@@ -440,26 +414,18 @@ class CheckpointSafetyAdapter:
         return True
 
 
-    def _validated_guidance_checkpoint(
+    def _validated_worker_checkpoint(
         self, request: blocked_checkpoint.CheckpointRequest,
         plan: sqlite3.Row, current: GitSnapshot | None,
     ) -> bool:
         if (
-            request.reason_code != GUIDANCE_BLOCK_REASON
-            or plan["agent_role"] != "worker"
+            plan["agent_role"] != "worker"
             or current is None
             or not plan["agent_result_snapshot"]
         ):
             return False
-        rows = self.safety_effects._guidance_rows(self.connection, request.repo, request.plan_id)
-        if not rows or any(row["invalidated_decision_hash"] for row in rows):
-            return False
         worktree = Path(str(request.worktree))
         try:
-            document = self.safety_effects._guidance_document(worktree, str(plan["path"]))
-            if document is None or not document.matches_structure_hash(plan["guidance_plan_hash"]):
-                return False
-            self.safety_effects._guidance_document_matches_rows(document, rows, require_decisions=False)
             before = GitSnapshot.deserialize(str(plan["agent_snapshot"]))
             result = GitSnapshot.deserialize(str(plan["agent_result_snapshot"]))
             project = self.connection.execute(
@@ -467,7 +433,6 @@ class CheckpointSafetyAdapter:
             self.safety_effects.validate_agent_scope(
                 "worker", worktree, before, result,
                 selected_plan_path=str(plan["path"]),
-                allowed_guidance_targets=self._approved_guidance_targets(request),
                 allow_common_plans=self.safety_effects._published_plan_allows_common_plans(self.repo_path, plan),
                 external_worktree=self.repo_path, base_branch=project['base_branch'],
                 connection=self.connection,

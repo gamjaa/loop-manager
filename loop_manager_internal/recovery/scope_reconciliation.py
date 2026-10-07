@@ -32,7 +32,6 @@ class ResumeProjectBlockIfSafeEffects:
     _agent_git_resources: Callable[..., object]
     _clear_active_in_current_transaction: Callable[..., object]
     _clear_project_block_without_losing_planning_error: Callable[..., object]
-    _reconcile_guidance_double_block: Callable[..., object]
     _reconcile_rebase_evidence_block: Callable[..., object]
     _reconciled_manager_scope_metadata: Callable[..., object]
     _requeue_blocked_execplan: Callable[..., object]
@@ -62,7 +61,7 @@ class ResumePlanBlocksEffects:
     plan_blocked_execplans: Callable[..., object]
     project_execplan: Callable[..., object]
     resume_blocked_execplan_if_inputs_changed: Callable[..., object]
-    resume_guidance_approval_if_decided: Callable[..., object]
+    resume_retired_guidance_block: Callable[..., object]
     unmet_execplan_dependencies: Callable[..., object]
     plan_recovery_effects: Callable[[], blocked_plan_reconciliation.PlanRecoveryEffects]
     validate_blocked_agent_scope: Callable[..., object]
@@ -173,10 +172,6 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
         == BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value
     ):
         return False
-    if not planning_owns_slot and effects._reconcile_guidance_double_block(
-        connection, repo_path, state_dir, repo, block, project, plan,
-    ):
-        return True
     if block['reason_code'] == BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value:
         return effects._resume_owned_checkpoint_project_block(
             connection, repo_path, state_dir, repo, block, project, plan,
@@ -378,7 +373,7 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
                     (repo, blocked['plan_id']),
                 ).fetchone()
                 effects.hydrate_execplan_project(connection, repo, refreshed)
-                if effects.resume_guidance_approval_if_decided(
+                if effects.resume_retired_guidance_block(
                         connection, repo_path, repo, base, state_dir,
                         plan_id=str(blocked['plan_id'])):
                     return True
@@ -490,7 +485,7 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
             return True
         effects.hydrate_execplan_project(connection, repo, blocked)
         resume = (
-            effects.resume_guidance_approval_if_decided
+            effects.resume_retired_guidance_block
             if blocked["blocked_reason"] == GUIDANCE_BLOCK_REASON
             else effects.resume_blocked_execplan_if_inputs_changed
         )

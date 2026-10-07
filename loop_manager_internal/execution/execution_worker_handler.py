@@ -27,7 +27,6 @@ from loop_manager_internal.execution.worker_outcome import WorkerOutcome, Worker
 from loop_manager_internal.execution.execution_effects import ExecutionContract, FeedbackEffects
 from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot
 from loop_manager_internal.execution.execution_state import ExecutionStatePort
-from loop_manager_internal.documents.guidance_approval import GuidanceFormatError
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 
 @dataclass(frozen=True)
@@ -41,8 +40,6 @@ class WorkerHandlerPorts:
     feedback: FeedbackEffects | None
     rebase_corrections: RebaseCorrectionRepository
     state: ExecutionStatePort
-    _guidance_worker_targets: Callable[..., Any]
-    prepare_guidance_preapprovals: Callable[..., Any]
     _published_plan_allows_common_plans: Callable[..., Any]
     _rebase_in_progress_for_branch: Callable[..., Any]
     _revision_execplan_input_fingerprint: Callable[..., Any]
@@ -52,8 +49,6 @@ class WorkerHandlerPorts:
     clear_agent_scope: Callable[..., Any]
     current_rebase_service: Callable[..., Any] | None
     git: Callable[..., Any]
-    guidance_resume_context: Callable[..., Any]
-    inspect_worker_guidance_result: Callable[..., Any]
     is_loop_manager_repository: Callable[..., Any]
     operation_log: Callable[..., Any]
     operation_print: Callable[..., Any]
@@ -63,7 +58,6 @@ class WorkerHandlerPorts:
     resolve_worker_profile: Callable[..., ResolvedProfile]
     run_agent: Callable[..., Any]
     run_agent_with_retries: Callable[..., Any]
-    validate_guidance_publication: Callable[..., Any]
     validate_worker_workspace_scope: Callable[..., Any]
     worker_prompt: Callable[..., Any]
     _advanced: Callable[[], ExecutionOutcome]
@@ -280,23 +274,6 @@ class WorkerHandler:
                 base, revision, self.ports.identity.state_dir)
         except (ValueError, OSError, sqlite3.Error):
             pass  # Source facts are optional context; never block implementation.
-        try:
-            guidance_blocked = self.ports.prepare_guidance_preapprovals(
-                self.ports.identity.repo_path, self.ports.identity.repo,
-                context.worktree, catalog_plan,
-            )
-        except (self.ports.contract.AgentScopeError, GuidanceFormatError) as error:
-            return self.ports._block_final(
-                self.ports.identity.repo, context.worktree, str(error), '',
-                reason=BlockReasonCode.PLAN_INPUT_INVALID,
-            )
-        except (RuntimeError, OSError, subprocess.CalledProcessError) as error:
-            return self.ports._recover(
-                classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
-                str(error), context=context,
-            )
-        if guidance_blocked:
-            return self.ports._final(str(self.ports.state.blocked()['last_error']))
         worker_scope_before = self.ports.begin_agent_scope(
             self.ports.identity.repo,
             context.worktree,
@@ -361,8 +338,7 @@ class WorkerHandler:
             prompt = self.ports.worker_prompt(
                 row['plan_path'], prompt_error, row['worker_result'], validation_feedback,
                 archive_candidates=self.ports.snapshot().archive_candidates, session_recovery=recovering,
-                guidance_common_allowed=self.ports.is_loop_manager_repository(self.ports.identity.repo_path),
-                guidance_context=guidance_context, allow_common_plans=allow_common_plans)
+                allow_common_plans=allow_common_plans)
             if not current_session_id or recovering:
                 prompt = (prompt or '') + query_context
             checkpoint = self.ports.checkpoint
@@ -404,8 +380,6 @@ class WorkerHandler:
                           else f'Agent CLI 실행 실패: {error}')
                 return AgentResult(1, detail, observed_session_id,
                                    AgentResultKind.TRANSIENT_FAILURE)
-        guidance_targets = self.ports._guidance_worker_targets(self.ports.identity.repo, str(catalog_plan['plan_id']))
-        guidance_context = self.ports.guidance_resume_context(self.ports.identity.repo, str(catalog_plan['plan_id']))
         allow_common_plans = self.ports._published_plan_allows_common_plans(self.ports.identity.repo_path, catalog_plan)
         result = self.ports.run_agent_with_retries(
             TrackedAgentCall(worker_call, AttemptSequence(
@@ -435,7 +409,6 @@ class WorkerHandler:
                     row['definition_snapshot']
                 )} if context.resolving_rebase else {}),
                 allowed_requirement_archives=self.ports.snapshot().archive_scope_sources,
-                allowed_guidance_targets=guidance_targets,
                 allow_common_plans=allow_common_plans,
             ))
         except (self.ports.contract.AgentScopeError, self.ports.contract.WorkspaceOwnershipError) as error:
@@ -485,20 +458,6 @@ class WorkerHandler:
         row = self.ports._row()
         catalog_plan = self.ports.snapshot().catalog_plan
         assert catalog_plan is not None
-        guidance_blocked = self.ports.inspect_worker_guidance_result(
-            self.ports.identity.repo_path,
-            self.ports.identity.repo,
-            context.worktree,
-            catalog_plan,
-            message,
-        )
-        if guidance_blocked:
-            blocked = self.ports.state.blocked()
-            self.ports.operation_print(
-                str(blocked['last_error'] if blocked else 'guidance 승인 대기'),
-                file=sys.stderr,
-            )
-            return self.ports._final()
         if code:
             self.ports.clear_agent_scope(self.ports.identity.repo)
             if context.resolving_rebase:
@@ -624,11 +583,6 @@ class WorkerHandler:
                 self.ports.clear_agent_scope(self.ports.identity.repo)
             return guarded
         context = guarded
-        if self.ports.inspect_worker_guidance_result(
-            self.ports.identity.repo_path, self.ports.identity.repo, context.worktree, self.ports.snapshot().catalog_plan,
-            saved.worker_result,
-        ):
-            return self.ports._final()
         try:
             disposition = self._parse_worker_outcome(
                 context, saved.worker_result,
@@ -770,15 +724,6 @@ class WorkerHandler:
                 'verify_token': None, 'review_token': None,
                 'publication_token': None,
             })
-            if self.ports.validate_guidance_publication(
-                self.ports.identity.repo,
-                context.worktree,
-                self.ports.snapshot().catalog_plan,
-                message,
-                previous_base=str(row['active_sha']),
-                latest_base=latest_sha,
-            ):
-                return self.ports._final()
             return self.ports._advanced()
         if context.archive_sources:
             post_worker_revision = latest_sha if context.resolving_rebase else str(row['active_sha'] or '')

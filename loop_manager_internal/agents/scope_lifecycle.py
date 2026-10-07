@@ -27,7 +27,6 @@ class ScopeLifecycleEffects:
     _agent_git_resources: Callable[..., agent_scope_decision.GitResources | None]
     _capture_agent_baseline: Callable[..., str | None]
     _current_rebase_service: Callable[..., ManagedRebaseService]
-    _guidance_worker_targets: Callable[..., tuple[str, ...]]
     _owned_rebase_state_dir: Callable[..., Path | None]
     _plan_id_from_path: Callable[..., str | None]
     _published_plan_allows_common_plans: Callable[..., bool]
@@ -116,7 +115,6 @@ def begin_agent_scope(
                 connection, repo, plan_id, worktree, row, stored, current, checkpoint)
             effects.validate_agent_scope(role_name, worktree, effective, current,
                                  selected_plan_path=row['plan_path'] if role_name == 'worker' else None,
-                                 allowed_guidance_targets=effects._guidance_worker_targets(connection, repo, plan_id),
                                  allow_common_plans=effects._published_plan_allows_common_plans(
                                      Path(repo), effects.project_execplan(connection, repo)),
                                  external_worktree=Path(repo), base_branch=row['base_branch'], connection=connection)

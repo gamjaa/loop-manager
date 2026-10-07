@@ -17,7 +17,7 @@ from loop_manager_internal.planning.planning_catalog import (
     MutableReadySnapshot, PlannerValidationError, mutable_snapshot_token,
 )
 from loop_manager_internal.planning.requirement_retirement import (
-    RequirementRetirementPort, RetirementError,
+    RequirementRetirementPort, RetirementError, RetirementReassessment,
 )
 from loop_manager_internal.planning.assessment_service import PlanningAssessmentService
 
@@ -126,7 +126,15 @@ class PlanningRequirementMoveTest(unittest.TestCase):
         adapter = SimpleNamespace(run=loop_manager.git, run_bytes=loop_manager.git_bytes)
         port = RequirementRetirementPort(connection, adapter)
         if restore:
-            paths = port.stage_restorations("repo", root, base, root)
+            (root / origin).rename(root / destination)
+            oid = self.git(root, "rev-parse", base + ":" + origin)
+            connection.execute(
+                "INSERT INTO requirement_audit "
+                "(repo,source_path,input_token,source_oid,observed_sha,outcome,reason,stage) "
+                "VALUES ('repo',?,'legacy',?,?,'restore','old unfinished source','staged')",
+                (SOURCE, oid, base),
+            )
+            paths = (origin, destination)
         else:
             (item,) = port.pending("repo", root, base)
             result = "REQUIREMENT_JUDGMENTS: " + json.dumps([{
@@ -146,13 +154,46 @@ class PlanningRequirementMoveTest(unittest.TestCase):
             restore=restore,
         )
 
+    def test_legacy_restoration_manifest_is_readable_but_cannot_be_published(self):
+        case = self.case(restore=True)
+        self.git(case.root, "add", "-A")
+        self.git(case.root, "commit", "-m", "legacy restored candidate")
+        result = ValidatedPlanningResult(
+            (), case.paths, ((SOURCE, hashlib.sha256(CONTENTS).hexdigest()),),
+            mutable_snapshot=case.snapshot, restoration_moves=(ARCHIVE,),
+        )
+        resumed = loop_manager._planning_result_from_manifest(loop_manager._planning_result_manifest(result))
+        self.assertEqual(resumed, result)
+        with self.assertRaisesRegex(PlannerValidationError, "자동 복원"):
+            loop_manager._validate_general_planning_commit(
+                case.root, resumed, self.git(case.root, "rev-parse", "HEAD"))
+        self.assertEqual((case.root / SOURCE).read_bytes(), CONTENTS)
+
+    def test_legacy_unpublished_restoration_withdrawal_keeps_unrelated_retirement(self):
+        case = self.case(include_restoration=True)
+        (case.root / LEGACY_ARCHIVE).rename(case.root / LEGACY)
+        oid = self.git(case.root, "rev-parse", case.base + ":" + LEGACY_ARCHIVE)
+        case.connection.execute(
+            "INSERT INTO requirement_audit "
+            "(repo,source_path,input_token,source_oid,observed_sha,outcome,reason,stage) "
+            "VALUES ('repo',?,'legacy',?,?,'restore','old unfinished source','staged')",
+            (LEGACY, oid, case.base),
+        )
+        self.git(case.root, "add", "-A")
+        with self.assertRaises(RetirementReassessment):
+            case.port.receipted_paths("repo", case.root, case.base, case.root)
+        self.assertFalse((case.root / LEGACY).exists())
+        self.assertEqual((case.root / LEGACY_ARCHIVE).read_bytes(), CONTENTS)
+        restarted = RequirementRetirementPort(case.connection, case.adapter)
+        self.assertEqual(restarted.receipted_paths("repo", case.root, case.base, case.root), (SOURCE, ARCHIVE))
+        self.assertEqual((case.root / ARCHIVE).read_bytes(), CONTENTS)
+
     def test_receipt_revalidation_refreshes_base_without_new_retirements(self):
         case = self.case(include_restoration=True)
         old_base = case.base
         self.git(case.root, "commit", "--allow-empty", "-m", "unrelated base advance")
         new_base = self.git(case.root, "rev-parse", "HEAD")
         self.assertNotEqual(old_base, new_base)
-        case.port.stage_restorations("repo", case.root, new_base, case.root)
         paths = case.port.receipted_paths("repo", case.root, new_base, case.root)
         self.assertIn(SOURCE, paths)
         receipt = case.connection.execute(
@@ -169,7 +210,7 @@ class PlanningRequirementMoveTest(unittest.TestCase):
 
     def test_move_and_mixed_batch_observation_survives_index_state_and_restart(self):
         for restore, state, renames, mixed in itertools.product(
-            (False, True), ("unstaged", "staged", "committed"), ("true", "false"), (False, True),
+            (False,), ("unstaged", "staged", "committed"), ("true", "false"), (False, True),
         ):
             with self.subTest(restore=restore, state=state, renames=renames, mixed=mixed):
                 case = self.case(restore=restore, renames=renames)
@@ -219,12 +260,11 @@ class PlanningRequirementMoveTest(unittest.TestCase):
                 loop_manager._validate_general_planning_commit(case.root, resumed, commit)
                 self.assertEqual((case.root / case.destination).read_bytes(), CONTENTS)
                 # A repeated Manager stage uses the same receipt without another rename/commit.
-                stage = restarted.stage_restorations if restore else restarted.stage_moves
-                self.assertEqual(stage("repo", case.root, case.base, case.root), paths)
+                self.assertEqual(restarted.stage_moves("repo", case.root, case.base, case.root), paths)
                 self.assertEqual(self.git(case.root, "rev-parse", "HEAD"), commit)
 
     def test_missing_or_partial_receipt_does_not_authorize_requirement_changes(self):
-        for restore in (False, True):
+        for restore in (False,):
             case = self.case(restore=restore)
             self.git(case.root, "add", "-A")
             for paths in ((), case.paths[:1]):
@@ -262,7 +302,7 @@ class PlanningRequirementMoveTest(unittest.TestCase):
                     restarted.receipted_paths("repo", case.root, case.base, case.root)
 
     def test_commit_validation_refuses_tampering_even_with_matching_file_hash(self):
-        for restore in (False, True):
+        for restore in (False,):
             with self.subTest(restore=restore):
                 case = self.case(restore=restore)
                 (case.root / case.destination).write_bytes(b"changed")
@@ -297,11 +337,11 @@ class PlanningRequirementMoveTest(unittest.TestCase):
             row=row, context=SimpleNamespace(repo="repo", repo_path=case.root),
             planning_worktree=case.root, mutable_ready_snapshot=case.snapshot,
             dirty_files=[], maintenance_planning=False, planner_scope_error=None,
-            audit_restorations=(LEGACY,), current_fingerprint="input",
+            current_fingerprint="input",
         )
         return PlanningAssessmentService(ports, None), ports, run
 
-    def test_assessment_manifest_preserves_existing_retirements_during_restoration(self):
+    def test_assessment_manifest_preserves_retirements_with_historical_archive(self):
         for mixed in (False, True):
             with self.subTest(mixed=mixed):
                 case = self.case(include_restoration=True)
@@ -314,11 +354,11 @@ class PlanningRequirementMoveTest(unittest.TestCase):
                         self.assertIsNone(service._validate_planner_result(run))
                         result = run.validated_result
                         self.assertEqual(result.retirement_moves, (SOURCE,))
-                        self.assertEqual(result.restoration_moves, (LEGACY_ARCHIVE,))
+                        self.assertEqual(result.restoration_moves, ())
                         self.assertEqual(set(result.publication_paths),
-                                         {SOURCE, ARCHIVE, LEGACY, LEGACY_ARCHIVE} | ({PLAN} if mixed else set()))
+                                         {SOURCE, ARCHIVE} | ({PLAN} if mixed else set()))
                         self.assertEqual(set(dict(result.publication_hashes)),
-                                         {ARCHIVE, LEGACY} | ({PLAN} if mixed else set()))
+                                         {ARCHIVE} | ({PLAN} if mixed else set()))
                         if not resumed:
                             self.git(case.root, "add", "-A")
                             self.git(case.root, "commit", "-m", "combined planning batch")
@@ -333,14 +373,14 @@ class PlanningRequirementMoveTest(unittest.TestCase):
     def test_assessment_rechecks_old_receipts_after_staging_new_moves(self):
         case = self.case(include_restoration=True)
         service, ports, run = self.assessment(case)
-        stage = case.port.stage_restorations
+        stage = case.port.stage_moves
 
-        def corrupt_old_move_after_restoration(*args, **kwargs):
+        def corrupt_old_move_after_staging(*args, **kwargs):
             paths = stage(*args, **kwargs)
             (case.root / ARCHIVE).write_bytes(b"tampered after initial check")
             return paths
 
-        with mock.patch.object(case.port, "stage_restorations", side_effect=corrupt_old_move_after_restoration):
+        with mock.patch.object(case.port, "stage_moves", side_effect=corrupt_old_move_after_staging):
             outcome = service._validate_planner_result(run)
         self.assertTrue(outcome.error)
         self.assertEqual(outcome.kind.value, "operational_error")

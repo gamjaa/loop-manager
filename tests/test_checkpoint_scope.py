@@ -60,9 +60,6 @@ class CheckpointScopeTests(TestCase):
             _proven_manager_base_refs=lambda *_: frozenset(),
             _proven_merged_cleanup_paths=lambda *_: frozenset(),
             _owned_checkpoint_remote_oid=lambda *_: None,
-            _guidance_rows=lambda *_: [{'invalidated_decision_hash': None}],
-            _guidance_document=lambda *_: GuidanceDocument((), 'document'),
-            _guidance_document_matches_rows=lambda *_args, **_kwargs: None,
             _published_plan_allows_common_plans=lambda *_: False)
         self.adapter = checkpoint_adapter.BlockedCheckpointAdapter(
             self.connection, Path('repo'), Path('/state'), 'repo',
@@ -119,14 +116,12 @@ class CheckpointScopeTests(TestCase):
                     self.current = replace(self.before, **values)
                     self.assertFalse(self.adapter.assess(self.request).safe)
 
-    def test_guidance_result_validation_uses_saved_invocation_context(self):
-        self.effects = replace(self.effects,
-            _guidance_document=lambda *_: GuidanceDocument((), 'new-format', ('document',)))
+    def test_worker_result_validation_uses_saved_invocation_context(self):
         result = replace(self.before, refs={**self.before.refs, 'refs/heads/B': ('new', '')})
         self.connection.execute('UPDATE exec_plans SET agent_result_snapshot=?', (result.serialize(),))
         with (mock.patch.object(manager, '_agent_git_resources', return_value=self.resources),
               mock.patch.object(manager, '_scope_snapshot_with_start_ignore_rules', side_effect=lambda _w, _b, a: a)):
-            self.assertTrue(self.adapter._validated_guidance_checkpoint(self.request, self.plan(), result))
+            self.assertTrue(self.adapter._validated_worker_checkpoint(self.request, self.plan(), result))
 
     def test_manager_checkpoint_keeps_invocation_identity_for_restart(self):
         self.current = replace(self.before, head='checkpoint', scope_id=None, scope_start_digest=None)
@@ -216,41 +211,6 @@ class CheckpointScopeTests(TestCase):
                 finally:
                     self.connection.close()
 
-    def test_guidance_double_block_recovery_uses_the_same_resource_scope(self):
-        self.connection.execute(
-            "UPDATE exec_plans SET publication_remote_oid='head', blocked_reason=?",
-            (manager.GUIDANCE_BLOCK_REASON,))
-        self.connection.execute("UPDATE blocked_checkpoints SET phase='published', published_oid='head'")
-        self.connection.execute(
-            "INSERT INTO project_blocks (repo, scope, reason_code, evidence, plan_id, previous_phase) "
-            "VALUES ('repo', 'project', 'shared_ref_mutation', 'B changed', 'G-047', 'PLAN_BLOCKED')")
-        current = replace(self.before, refs={**self.before.refs, 'refs/heads/B': ('new', '')})
-        effects = {field.name: mock.Mock() for field in fields(project_block_service.ReconcileGuidanceDoubleBlockEffects)}
-        effects.update(_canonical_path=lambda path: path.resolve(),
-            _guidance_checkpoint_commit_evidence=lambda *_: '결정 대기',
-            _guidance_document=lambda *_: GuidanceDocument((), 'new-format', ('document',)),
-            _guidance_rows=lambda *_: [{'applied': 0, 'invalidated_decision_hash': None,
-                'decision_hash': None, 'target_path': 'AGENTS.md', 'baseline_content': b'rules', 'baseline_mode': 0o100644}],
-            _guidance_document_matches_rows=lambda *_args, **_kwargs: ({}, ()),
-            _guidance_target_state=lambda *_: (b'rules', 0o100644),
-            _owned_checkpoint_remote_oid=lambda *_: 'head',
-            _proven_manager_base_refs=lambda *_: frozenset(),
-            _proven_merged_cleanup_paths=lambda *_: frozenset(),
-            capture_git_snapshot=lambda _: current,
-            git=lambda _repo, *args: SimpleNamespace(stdout='Checkpoint-Identity: identity' if args[0] == 'show' else 'tree'))
-        project = self.connection.execute('SELECT * FROM projects').fetchone()
-        block = self.connection.execute('SELECT * FROM project_blocks').fetchone()
-        # 실행 격리 없는 과거 snapshot은 같은 예외를 받을 수 없다.
-        effects['_agent_git_resources'] = lambda *_args, **_kwargs: None
-        def recover():
-            return project_block_service._reconcile_guidance_double_block(
-                project_block_service.ReconcileGuidanceDoubleBlockEffects(**effects),
-                self.connection, Path('repo'), Path('/state'), 'repo', block, project, self.plan())
-        self.assertFalse(recover())
-        effects['_agent_git_resources'] = lambda *_args, **_kwargs: self.resources
-        self.assertTrue(recover())
-        self.assertIsNone(self.connection.execute('SELECT * FROM project_blocks').fetchone())
-        self.assertEqual(self.plan()['blocked_reason'], manager.GUIDANCE_BLOCK_REASON)
 
     def test_local_source_sync_failure_keeps_remote_catalog_available(self):
         for status in ('skipped', 'failed'):

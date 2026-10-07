@@ -90,7 +90,7 @@ _BUILD_FILES = {
     "build", "build.bazel", "workspace", "workspace.bazel", "package.json",
 }
 _DOCUMENT_NAMES = {"license", "license.txt", "notice", "notice.txt", "authors", "contributors"}
-_ROOT_TOOL_PATHS = {".agents", "docs", "scripts", "AGENTS.md"}
+_ROOT_TOOL_PATHS = {".agents", "docs", "scripts"}
 _ROOT_EXECUTION_PATHS = {"config", "tests", ".github", ".gitignore"}
 _ROOT_ENTRY_NAMES = {"readme", "license", "notice", "authors", "contributors"}
 

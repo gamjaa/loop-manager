@@ -126,7 +126,7 @@ def validate_root_reviews(repository: Path, inventory: SourceInventory, results:
             raise FileReviewLedgerError("안전한 상대 목적지가 필요합니다.")
         if destination is not None and (result["category"] != "internal_implementation" or destination == path):
             raise FileReviewLedgerError("필수·불확실한 루트 항목은 이동 후보가 될 수 없습니다.")
-        if path in {".agents", "docs", "scripts", "AGENTS.md"} and (
+        if path in {".agents", "docs", "scripts"} and (
             result["category"] != "tool_required" or destination is not None
         ):
             raise FileReviewLedgerError("필수 루트 경로는 유지해야 합니다.")

@@ -299,9 +299,6 @@ class CheckpointSafetyEffectsEffects:
     """Named effects for _checkpoint_safety_effects; no entry-point/module access."""
     _agent_git_resources: Callable[..., object]
     _current_rebase_service: Callable[..., object]
-    _guidance_document: Callable[..., object]
-    _guidance_document_matches_rows: Callable[..., object]
-    _guidance_rows: Callable[..., object]
     _owned_checkpoint_remote_oid: Callable[..., object]
     _proven_manager_base_refs: Callable[..., object]
     _proven_merged_cleanup_paths: Callable[..., object]
@@ -320,9 +317,6 @@ class CheckpointSafetyEffectsEffects:
 def _checkpoint_safety_effects(effects: CheckpointSafetyEffectsEffects, ) -> checkpoint_adapter.CheckpointSafetyEffects:
     return checkpoint_adapter.CheckpointSafetyEffects(
         _agent_git_resources=effects._agent_git_resources,
-        _guidance_document=effects._guidance_document,
-        _guidance_document_matches_rows=effects._guidance_document_matches_rows,
-        _guidance_rows=effects._guidance_rows,
         _owned_checkpoint_remote_oid=effects._owned_checkpoint_remote_oid,
         _proven_manager_base_refs=effects._proven_manager_base_refs,
         _proven_merged_cleanup_paths=effects._proven_merged_cleanup_paths,
