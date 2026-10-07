@@ -101,6 +101,8 @@ R-020의 Manager runtime 귀속을 실제 bootstrap부터 runtime 자식의 선�
 
 - 비교 기준에 저장된 이전 runtime의 제거도 정확한 결정적 경로·원래 registration·완료된 `runtime_remove` intent/result/receipt와 실제 경로 부재가 모두 일치할 때만 반영한다. 다른 경로·등록 상태·남아 있는 파일·불완전 receipt는 허용하지 않는다. 해당 좁은 unit의 lock marker fixture를 운영 형식으로 수정한 뒤 위 동일 targeted 명령을 재실행해 최종 36개 `OK`, 종료 코드 0을 확인했다. checkpoint의 두 unit 명령도 현재 최종 코드에서 다시 실행해 2개 `OK`, 종료 코드 0을 확인했다. 원본 snapshot·과거 receipt는 유지하며 통합 회귀·전체 verify·Review는 실행하지 않았다.
 
+- 관리 rebase 수용 후 HEAD `bd7861a84c2ac9dd390030262f66071204555442`와 base `e274984973050b36c5195496fb8fa8588c65ed95` 대비 20개 파일의 전체 최종 diff, 현재 계획과 R-020·R-023·R-055·PRODUCT·ARCHITECTURE 근거를 다시 확인했다. 위 36개 targeted unit 명령과 checkpoint 두 unit 명령을 현재 후보에서 새로 실행해 각각 `Ran 36 tests`, `OK`, 종료 코드 0 및 `Ran 2 tests`, `OK`, 종료 코드 0을 확인했다. 이번 재검증에서 추가 코드 변경은 없으며 bootstrap 통합 회귀·전체 verify·Review는 실행하지 않았다.
+
 ## Decision Log
 
 - 2026-10-07 사용자 요청으로 활성 R-020·R-023·R-055와 계획을 함께 보완했다. G-181의 base ref 재검사, G-171의 Manager 표식 불일치·stale checkpoint identity와 G-192의 runtime/HEAD 차단 메시지를 기존 코드 경계의 재현 시나리오로 연결한다. 관련 unit 11개와 최소 입력 검사는 기존 거부 경로의 근거이며 새 수용 동작의 구현 성공이 아니다. 운영 snapshot을 확보하지 않았으므로 개별 사건의 실제 원인을 확정하지 않는다. G-199의 legacy 기본 checkout 결정과 독립이며 이 개정으로 draft를 해제하지 않는다.
