@@ -4,6 +4,13 @@ from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from unittest import mock
+from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
+from loop_manager_internal.execution.execution_runtime import (
+    ExecutionOutcome,
+    ExecutionOutcomeKind,
+    ExecutionPhase,
+    ExecutionPhaseCoordinator,
+)
 
 import loop_manager
 from loop_manager_internal.recovery import scoped_blocking
@@ -15,6 +22,63 @@ from tests.support.scoped_recovery import CurrentRebaseBlockFixture
 
 
 class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
+    def test_ignored_plan_release_continues_after_saved_verify_without_rerunning(self):
+        start = replace(self.before, dirty={'cache.bin': (('untracked',), 'old')})
+        result = replace(self.current, dirty={**self.current.dirty,
+                                             'cache.bin': (('untracked',), 'result')},
+                         worktrees=self.before.worktrees)
+        definition = DefinitionSnapshot(
+            revision_sha='base', path='docs/plans/[G-047] Runtime.md',
+            title='Runtime', sources=('docs/PRODUCT.md',), depends_on=(),
+            complexity='medium', risk='medium', priority='normal',
+            body_hash='body', source_fingerprint='source', archive_candidates=(),
+        )
+        loop_manager.runtime_state.RuntimeStateRepository(self.connection).update_project(
+            'repo', {
+                'phase': 'VERIFYING', 'active_sha': 'base',
+                'validated_base_sha': 'base', 'worker_result': 'saved worker',
+                'verify_result': 'saved verify', 'definition_snapshot': definition.serialize(),
+                'verify_token': definition.verify_token('base', self.current.head),
+            }, enqueue=False,
+        )
+        self.connection.execute(
+            "UPDATE exec_plans SET agent_snapshot = ?, agent_result_snapshot = ?",
+            (start.serialize(), result.serialize()),
+        )
+        self.connection.commit()
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan('repo', 'G-047', reason_code='managed_worktree_scope_violation',
+                           evidence='legacy ignored cache', release_fingerprint='same')
+        block = scoped_blocking.plan_block(self.connection, 'repo', 'G-047')
+
+        def normalize(_worktree, saved, _current, **_options):
+            return replace(saved, dirty={key: value for key, value in saved.dirty.items()
+                                         if key != 'cache.bin'})
+
+        with mock.patch.object(loop_manager, '_normalize_legacy_ignored_snapshot', side_effect=normalize):
+            self.assertTrue(loop_manager._reconcile_scope_baseline_plan_block(
+                self.connection, self.repo_path, Path('/state'), 'repo', block))
+
+        resumed = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual(resumed['status'], 'REVIEWING')
+        self.assertEqual((resumed['verify_result'], resumed['verify_token']),
+                         ('saved verify', definition.verify_token('base', self.current.head)))
+        self.assertEqual(resumed['agent_result_snapshot'], result.serialize())
+
+        context = SimpleNamespace(phase=ExecutionPhase(resumed['status']))
+        phase_outcome = ExecutionOutcome(ExecutionOutcomeKind.SUCCESS)
+        ports = SimpleNamespace(
+            guard=mock.Mock(return_value=context),
+            work_started=mock.Mock(),
+            run=mock.Mock(return_value=phase_outcome),
+            verify=mock.Mock(return_value=phase_outcome),
+            review=mock.Mock(return_value=phase_outcome),
+            publish=mock.Mock(return_value=phase_outcome),
+        )
+        ExecutionPhaseCoordinator(ports).dispatch(context)
+        ports.verify.assert_not_called()
+        ports.review.assert_called_once_with(context)
+
     def test_ignored_plan_release_preserves_stage_with_proven_invocation_isolation(self):
         start = replace(self.before, dirty={'cache.bin': (('untracked',), 'old')})
         result = replace(self.current, dirty={**self.current.dirty,

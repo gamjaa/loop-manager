@@ -20,6 +20,7 @@ from loop_manager_internal.runtime.contracts import REBASE_IN_PROGRESS_ERROR
 from loop_manager_internal.runtime.contracts import RuntimeMutation
 from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
 from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
+from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
 from loop_manager_internal.storage import blocked_checkpoint_state
 from loop_manager_internal.storage import execution_checkpoint_state
 from loop_manager_internal.storage import recovery_state
@@ -78,6 +79,20 @@ def _clear_project_block_without_losing_planning_error(
             "UPDATE projects SET last_error = ? WHERE repo = ?",
             (project["planning_error"], repo),
         )
+
+
+def _saved_verify_matches_candidate(plan: sqlite3.Row, candidate_head: str) -> bool:
+    """Trust saved verify output only for its recorded base and exact candidate."""
+    active_sha = str(plan['active_sha'] or '')
+    if (plan['verify_result'] is None or not active_sha
+            or plan['validated_base_sha'] != active_sha or not candidate_head):
+        return False
+    try:
+        definition = DefinitionSnapshot.deserialize(plan['definition_snapshot'])
+    except ValueError:
+        return False
+    return bool(definition and plan['verify_token'] == definition.verify_token(
+        active_sha, candidate_head))
 
 
 @dataclass(frozen=True)
@@ -252,6 +267,9 @@ def _reconcile_scope_baseline_plan_block(effects: ReconcileScopeBaselinePlanBloc
                 if resume_status not in runtime_state.ACTIVE_STATUSES:
                     resume_status = ('REVIEWING' if plan['agent_role'] == 'reviewer'
                                      else 'VERIFYING' if plan['worker_result'] else 'IMPLEMENTING')
+                if (_saved_verify_matches_candidate(plan, observed.head)
+                        and resume_status not in {'REVIEWING', 'PUBLISHING'}):
+                    resume_status = 'REVIEWING'
                 values = {'last_error': None}
             else:
                 resume_status = 'IMPLEMENTING'
