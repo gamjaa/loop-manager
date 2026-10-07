@@ -143,17 +143,26 @@ class CheckpointScopeTests(TestCase):
         refreshed = self.store.get('repo', 'G-047')
         self.assertIsNone(refreshed.local_oid)
         self.assertIsNone(refreshed.commit_identity)
+        worker_result = replace(self.before, dirty={'src/app.py': (('staged',), 'worker-content')},
+            index={'src/app.py': ('H 100644 worker-blob 0',)})
+        self.connection.execute('UPDATE exec_plans SET agent_result_snapshot=?', (worker_result.serialize(),))
+        self.connection.commit()
         current = replace(self.before, head='published',
             refs={**self.before.refs, self.own_ref: ('published', ''), remote_ref: ('published', '')})
         observed = {'tree': 'tree', 'message': 'Checkpoint-Identity: owned-identity', 'remote': 'published'}
         def git(_repo, *args, **kwargs):
-            value = (observed['tree'] if args[0] == 'rev-parse' else observed['message']
+            value = ('https://github.com/owner/repo' if args[0] == 'remote' else
+                observed['tree'] if args[0] == 'rev-parse' else observed['message']
                 if args[0] == 'show' else observed['remote'] + '\trefs/heads/' + self.branch)
             return SimpleNamespace(stdout=value, returncode=0)
         owned_effects = checkpoint_service.OwnedCheckpointRemoteOidEffects(git=git)
         owned = lambda connection, repo, request, plan, snapshot: checkpoint_service._owned_checkpoint_remote_oid(
             owned_effects, connection, repo, request, plan, snapshot)
-        self.effects = replace(self.effects, _owned_checkpoint_remote_oid=owned)
+        self.effects = replace(self.effects, _owned_checkpoint_remote_oid=owned, git=git,
+            capture_git_snapshot=lambda _: current,
+            validate_execplan_workspace_identity=lambda *_: None,
+            validate_managed_worktree=lambda *_args, **_kwargs: None,
+            _rebase_in_progress_for_branch=lambda *_: False)
         with mock.patch.object(manager, '_agent_git_resources', return_value=None):
             for key, wrong in (('tree', 'wrong'), ('message', 'forged'), ('remote', 'foreign')):
                 previous = observed[key]
@@ -178,21 +187,35 @@ class CheckpointScopeTests(TestCase):
         # lease accepted during its actual safety check before pushing.
         self.connection.execute("UPDATE blocked_checkpoints SET expected_remote_oid='old'")
         self.connection.commit()
-        safety, publication, results = mock.Mock(), mock.Mock(), mock.Mock()
-        def assess(request):
-            with mock.patch.object(manager, '_agent_git_resources', return_value=None):
-                self.assertIsNone(self.adapter._shared_safety_error(request, self.plan(), current))
-            return blocked_checkpoint.SafetyVerdict(True, blocked_checkpoint.SafetyScope.PLAN,
-                None, None, 'published', ('src/app.py',))
-        safety.assess.side_effect = assess
+        publication, results = mock.Mock(), mock.Mock()
         publication.existing_pull_request.return_value = None
         publication.prepare.return_value = blocked_checkpoint.PreparedCheckpoint(
             'published', 'new-tree', 'new-identity', 'new cause', ('src/app.py',))
         publication.ensure_local_commit.return_value = 'new-candidate'
         publication.observe_remote.side_effect = ['published', 'new-candidate']
         publication.is_fast_forward.return_value = True
-        dispatcher = blocked_checkpoint.BlockedCheckpointDispatcher(self.store, safety, publication, results)
-        self.assertTrue(dispatcher._dispatch_one(refreshed))
+        dispatcher = blocked_checkpoint.BlockedCheckpointDispatcher(self.store, self.adapter, publication, results)
+        with (mock.patch.object(manager, '_agent_git_resources', return_value=None),
+              mock.patch.object(manager, '_scope_snapshot_with_start_ignore_rules', side_effect=lambda _w, _b, a: a)):
+            self.assertTrue(self.adapter.assess(refreshed).safe)
+            archived = self.connection.execute('SELECT publication_history FROM blocked_checkpoints').fetchone()[0]
+            self.connection.execute("UPDATE blocked_checkpoints SET publication_history='[]'")
+            self.assertEqual(self.adapter.assess(refreshed).reason_code, 'shared_ref_mutation')
+            self.assertFalse(self.adapter._validated_worker_checkpoint(refreshed, self.plan(), current))
+            self.connection.execute('UPDATE blocked_checkpoints SET publication_history=?', (archived,))
+            invalid_result = replace(worker_result, refs={**worker_result.refs, 'refs/heads/foreign': ('foreign', '')})
+            self.connection.execute('UPDATE exec_plans SET agent_result_snapshot=?', (invalid_result.serialize(),))
+            self.assertEqual(self.adapter.assess(refreshed).reason_code, 'agent_scope_recovery_pending')
+            self.connection.execute('UPDATE exec_plans SET agent_result_snapshot=?', (worker_result.serialize(),))
+            for key, value in (('tree', 'wrong'), ('message', 'forged')):
+                original_value = observed[key]
+                observed[key] = value
+                self.assertFalse(self.adapter._validated_worker_checkpoint(refreshed, self.plan(), current))
+                observed[key] = original_value
+            for altered in (replace(current, dirty={'src/app.py': (('unstaged',), 'after-commit')}),
+                            replace(current, head='foreign')):
+                self.assertFalse(self.adapter._validated_worker_checkpoint(refreshed, self.plan(), altered))
+            self.assertTrue(dispatcher._dispatch_one(refreshed))
         push = publication.push.call_args.args
         self.assertEqual(push[0].expected_remote_oid, 'published')
         self.assertEqual(push[2].mode, blocked_checkpoint.PushMode.FAST_FORWARD)

@@ -443,13 +443,22 @@ class CheckpointSafetyAdapter:
                 return True
             # A crash can occur after commit but before recording the Manager
             # snapshot. Accept only the durable prepared tree and identity.
-            return bool(
-                request.commit_identity and request.tree_oid
-                and not current.dirty
-                and self.safety_effects.git(worktree, "rev-parse", "HEAD^{tree}").stdout.strip() == request.tree_oid
-                and f"Checkpoint-Identity: {request.commit_identity}" in
-                self.safety_effects.git(worktree, "show", "-s", "--format=%B", "HEAD").stdout
-            )
+            if current.dirty:
+                return False
+            proofs = [(request.tree_oid, request.commit_identity)]
+            row = blocked_checkpoint_state.scope_request_row(self.connection, request.repo, request.plan_id)
+            if row is not None and row['request_identity'] == request.request_identity:
+                for entry in json.loads(row['publication_history']):
+                    prior = entry.get('superseded_request', {})
+                    if (prior.get('local_oid') == current.head
+                            and (prior.get('branch'), prior.get('worktree'), prior.get('pr_url'))
+                            == (request.branch, request.worktree, request.pr_url)):
+                        proofs.append((prior.get('tree_oid'), prior.get('commit_identity')))
+            return any(tree and identity
+                and self.safety_effects.git(worktree, "rev-parse", "HEAD^{tree}").stdout.strip() == tree
+                and f"Checkpoint-Identity: {identity}" in
+                    self.safety_effects.git(worktree, "show", "-s", "--format=%B", "HEAD").stdout
+                for tree, identity in proofs)
         except (RuntimeError, ValueError, TypeError, KeyError):
             return False
 
