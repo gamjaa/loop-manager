@@ -152,3 +152,68 @@ class ManualSourceUpdateRecoveryTests(unittest.TestCase):
             service.store.update.assert_not_called()
             self.assertEqual(remote['oid'], LATER)
             self.assertFalse(any(call.args[1] == 'push' for call in service.effects.git.call_args_list))
+
+    def test_retirement_receipt_survives_interruption_and_blocks_rewrite(self):
+        for boundary in ('after_receipt', 'before_equal'):
+            for next_remote in (LATER, NEWER, REWRITTEN):
+                with self.subTest(boundary=boundary, remote=next_remote), tempfile.TemporaryDirectory() as directory:
+                    service, group, remote = self.fixture(directory)
+                    slot = journal._slot(service.state_dir, service.repo, 'manual_branch_push', f"refs/heads/{group['branch']}")
+                    write, execute = journal._write_new, journal.execute
+                    def interrupt_receipt(path, value):
+                        write(path, value)
+                        if boundary == 'after_receipt' and path.parent == slot and value.get('status') == 'aborted':
+                            raise KeyboardInterrupt('after retirement receipt')
+                    def interrupt_equal(*args, **kwargs):
+                        if (boundary == 'before_equal' and kwargs['kind'] == 'manual_branch_push'
+                                and kwargs['before'] == kwargs['expected']):
+                            raise KeyboardInterrupt('before equal intent')
+                        return execute(*args, **kwargs)
+                    with mock.patch.object(journal, '_write_new', side_effect=interrupt_receipt), \
+                            mock.patch.object(journal, 'execute', side_effect=interrupt_equal), self.assertRaises(KeyboardInterrupt):
+                        update_source(service, group)
+                    receipts = {p: p.read_bytes() for p in slot.glob('*.result.json')}
+                    self.assertEqual(len(receipts), 1)
+                    result = journal._read(next(iter(receipts)))
+                    self.assertEqual(result['status'], 'aborted')
+                    self.assertEqual(result['observed'], {'oid': LATER})
+                    self.assertEqual(result['candidates'], {})
+                    self.assertEqual((slot / 'active.json').exists(), boundary == 'after_receipt')
+                    self.assertEqual(len(list(slot.glob('*.intent.json'))), 1)
+                    remote['oid'] = next_remote
+                    if next_remote == REWRITTEN:
+                        with self.assertRaisesRegex(RuntimeError, '게시 완료한 source 후보'):
+                            update_source(service, group)
+                        service.store.update.assert_not_called()
+                    else:
+                        current = update_source(service, group)
+                        self.assertEqual(current['prepared_head'], next_remote)
+                        self.assertEqual(current['request_id'], group['request_id'])
+                        self.assertEqual(current['members'], group['members'])
+                        self.assertIsNone(current['pending_source_head'])
+                        self.assertFalse(journal.has_pending_project_mutation(service.state_dir, service.repo))
+                    for path, content in receipts.items():
+                        self.assertEqual(path.read_bytes(), content)
+                    self.assertFalse(any(call.args[1] == 'push' for call in service.effects.git.call_args_list))
+
+    def test_retirement_receipt_with_changed_baseline_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service, group, remote = self.fixture(directory)
+            slot = journal._slot(service.state_dir, service.repo, 'manual_branch_push', f"refs/heads/{group['branch']}")
+            write = journal._write_new
+            def interrupt(path, value):
+                write(path, value)
+                if path.parent == slot and value.get('status') == 'aborted':
+                    raise KeyboardInterrupt('after retirement receipt')
+            with mock.patch.object(journal, '_write_new', side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+                update_source(service, group)
+            path = next(slot.glob('*.result.json'))
+            result = journal._read(path)
+            result['candidates'] = {'refs': {group['branch']: LATER}}
+            path.write_text(json.dumps(result))
+            saved = path.read_bytes()
+            with self.assertRaisesRegex(journal.MutationEvidenceError, '게시 완료 근거가 다릅니다'):
+                update_source(service, group)
+            self.assertEqual(path.read_bytes(), saved)
+            self.assertTrue((slot / 'active.json').exists())
+            service.store.update.assert_not_called()

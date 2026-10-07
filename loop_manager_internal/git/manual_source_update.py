@@ -36,6 +36,21 @@ def update_source(service, group):
                 and set(intent['expected'])=={'oid'} and bool(candidate)
                 and not effects.git(service.repo_path,'merge-base','--is-ancestor',
                     candidate,intent['expected']['oid'],check=False).returncode)
+    def validate_receipt(intent, result):
+        if not matches(intent) or result['id']!=intent['id']:
+            raise manager_git_journal.MutationEvidenceError('저장 source 후보의 게시 완료 근거가 다릅니다.')
+        if result['status']=='aborted':
+            # Retirement preserves an observation, not a completed exact push.
+            # Its empty baseline and forward history must remain intact.
+            valid=(result['candidates']=={} and set(result['observed'])=={'oid'}
+                   and isinstance(result['observed']['oid'],str)
+                   and not effects.git(service.repo_path,'merge-base','--is-ancestor',
+                       intent['before']['oid'],result['observed']['oid'],check=False).returncode)
+        else:
+            valid=(result['status'] in {'complete','equal'} and result['candidates']==
+                   manager_git_journal.verified_transition(intent,result['observed'],True))
+        if not valid:
+            raise manager_git_journal.MutationEvidenceError('저장 source 후보의 게시 완료 근거가 다릅니다.')
     if candidate:
         if not before or effects.git(service.repo_path,'rev-list','--parents','-n','1',candidate).stdout.split() != [candidate,*dict.fromkeys((before,incoming))]:
             raise RuntimeError('저장 source 후보의 원격 기준·제출 commit 근거가 없습니다. 후보와 작업물을 보존했습니다.')
@@ -54,13 +69,13 @@ def update_source(service, group):
                     raise RuntimeError('게시 완료한 source 후보가 원격 이력에서 제거됐습니다. 후보와 작업물을 보존했습니다.')
             for receipt in slot.glob('*.result.json'):
                 result=manager_git_journal._read(receipt)
-                if result['status'] in {'complete','equal'} and result['observed']=={'oid':candidate}:
+                if result['status'] in {'complete','equal','aborted'}:
                     intent=manager_git_journal._read(slot/f"{result['id']}.intent.json")
                     if matches(intent):
-                        if (result['id']!=intent['id'] or result['candidates']!=
-                                manager_git_journal.verified_transition(intent,result['observed'],True)):
-                            raise manager_git_journal.MutationEvidenceError('저장 source 후보의 게시 완료 근거가 다릅니다.')
-                        raise RuntimeError('게시 완료한 source 후보가 원격 이력에서 제거됐습니다. 후보와 작업물을 보존했습니다.')
+                        validate_receipt(intent,result)
+                        if not effects.git(service.repo_path,'merge-base','--is-ancestor',
+                                candidate,result['observed']['oid'],check=False).returncode:
+                            raise RuntimeError('게시 완료한 source 후보가 원격 이력에서 제거됐습니다. 후보와 작업물을 보존했습니다.')
         if remote not in (before,candidate):
             active=slot/'active.json'
             with resource_locks(service.state_dir,service.repo,['git:'+target],owner=owner):
@@ -69,12 +84,9 @@ def update_source(service, group):
                     receipt=slot/f"{intent['id']}.result.json"
                     if receipt.exists():
                         result=manager_git_journal._read(receipt)
-                        if (not matches(intent) or intent['repo']!=service.repo
-                                or intent['kind']!='manual_branch_push' or intent['target']!=target
-                                or manager_git_journal._read(slot/f"{intent['id']}.intent.json")!=intent
-                                or result['id']!=intent['id'] or result['status'] not in {'complete','equal'}
-                                or result['candidates']!=manager_git_journal.verified_transition(intent,result['observed'],True)):
+                        if manager_git_journal._read(slot/f"{intent['id']}.intent.json")!=intent:
                             raise manager_git_journal.MutationEvidenceError('저장 source 후보의 게시 완료 근거가 다릅니다.')
+                        validate_receipt(intent,result)
                         # 결과 저장 뒤 active 제거 전 중단: 완료 감사는 덮지 않는다.
                         manager_git_journal._finish(slot,active,intent,result['observed'],result['candidates'],result['status'])
             def retire(intent, current):

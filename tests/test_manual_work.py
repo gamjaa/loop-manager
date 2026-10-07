@@ -799,7 +799,7 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
     def test_source_update_descendant_equal_reinterruptions_and_rewrite(self):
         from loop_manager_internal.git import manager_git_journal as journal
         from loop_manager_internal.git.manual_source_update import update_source
-        for boundary in ('before_result','after_result','sqlite'):
+        for boundary in ('before_result','after_result','sqlite','aborted_receipt','before_equal'):
             for rewrite in (False,True):
                 with self.subTest(boundary=boundary,rewrite=rewrite),tempfile.TemporaryDirectory() as directory:
                     service,group,_=self.pending_source(directory)
@@ -826,8 +826,17 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
                         write(path,value)
                         if equal and boundary=='after_result':
                             raise KeyboardInterrupt('after equal receipt')
+                        if path.parent==slot and value.get('status')=='aborted' and boundary=='aborted_receipt':
+                            raise KeyboardInterrupt('after retirement receipt')
+                    execute=journal.execute
+                    def interrupt_before_equal(*args,**kwargs):
+                        if kwargs['kind']=='manual_branch_push' and kwargs['before']==kwargs['expected']:
+                            raise KeyboardInterrupt('before equal intent')
+                        return execute(*args,**kwargs)
                     with contextlib.ExitStack() as stack:
                         stack.enter_context(mock.patch.object(journal,'_write_new',side_effect=interrupt_equal))
+                        if boundary=='before_equal':
+                            stack.enter_context(mock.patch.object(journal,'execute',side_effect=interrupt_before_equal))
                         if boundary=='sqlite':
                             stack.enter_context(mock.patch.object(service.runtime,'update_plan',side_effect=KeyboardInterrupt))
                         with self.assertRaises(KeyboardInterrupt):
