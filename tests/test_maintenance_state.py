@@ -90,6 +90,18 @@ class DocumentDraftTest(unittest.TestCase):
         with self.assertRaises(document_drafts.DocumentDraftError):
             document_publication.validate_exact_worktree(approved, worktree, self.source_sha)
         (worktree / "AGENTS.md").unlink()
+        (worktree / "untracked.txt").write_text("unapproved\n", encoding="utf-8")
+        with self.assertRaises(document_drafts.DocumentDraftError):
+            document_publication.apply_approved_bytes(approved, worktree, self.source_sha)
+        (worktree / "untracked.txt").unlink()
+        (worktree / "AGENTS.md").write_text("staged unauthorized\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(worktree), "add", "AGENTS.md"],
+                       check=True, capture_output=True)
+        with self.assertRaises(document_drafts.DocumentDraftError):
+            document_publication.apply_approved_bytes(approved, worktree, self.source_sha)
+        subprocess.run(["git", "-C", str(worktree), "reset", "--", "AGENTS.md"],
+                       check=True, capture_output=True)
+        (worktree / "AGENTS.md").unlink()
         (worktree / approved.target_path).chmod(0o755)
         subprocess.run(["git", "-C", str(worktree), "update-index", "--chmod=+x", "--",
                         approved.target_path], check=True, capture_output=True)

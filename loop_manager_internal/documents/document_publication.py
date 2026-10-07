@@ -103,14 +103,8 @@ def planning_instruction(draft: DocumentDraft) -> str:
     )
 
 
-def apply_approved_bytes(
-    draft: DocumentDraft, worktree: Path, base_revision: str,
-) -> None:
-    """Apply once in a managed worktree, accepting only an exact interrupted write."""
-    target = _document_target(draft, worktree)
-    original = _git(worktree, "show", f"{base_revision}:{draft.target_path}")
-    if original != draft.original_content:
-        raise DocumentDraftError("작업 공간의 원본 바이트가 승인 원본과 다릅니다.")
+def _observed_changed_paths(worktree: Path, base_revision: str) -> tuple[set[str], set[bytes]]:
+    """Collect staged, unstaged, and untracked paths against one base."""
     changed = {
         path.decode("utf-8") for path in
         _git(worktree, "diff", "--name-only", "-z", base_revision).split(b"\0")
@@ -121,13 +115,25 @@ def apply_approved_bytes(
         _git(worktree, "diff", "--cached", "--name-only", "-z", base_revision).split(b"\0")
         if path
     )
-    changed.update(
-        path.decode("utf-8") for path in
+    untracked = {
+        path for path in
         _git(worktree, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0")
         if path
-    )
+    }
+    return changed, untracked
+
+
+def apply_approved_bytes(
+    draft: DocumentDraft, worktree: Path, base_revision: str,
+) -> None:
+    """Apply once in a managed worktree, accepting only an exact interrupted write."""
+    target = _document_target(draft, worktree)
+    original = _git(worktree, "show", f"{base_revision}:{draft.target_path}")
+    if original != draft.original_content:
+        raise DocumentDraftError("작업 공간의 원본 바이트가 승인 원본과 다릅니다.")
+    changed, untracked = _observed_changed_paths(worktree, base_revision)
     current = target.read_bytes()
-    if changed - {draft.target_path} or current not in {
+    if changed - {draft.target_path} or untracked or current not in {
         draft.original_content, draft.proposed_content,
     } or (changed and changed != {draft.target_path}):
         raise DocumentDraftError("작업 공간에 승인되지 않은 변경이 있습니다.")
@@ -141,19 +147,7 @@ def validate_exact_worktree(
 ) -> None:
     """Prove the whole proposed PR contains only the approved document bytes."""
     target = _document_target(draft, worktree)
-    changed = {
-        path.decode("utf-8") for path in
-        _git(worktree, "diff", "--name-only", "-z", base_revision).split(b"\0")
-        if path
-    }
-    changed.update(
-        path.decode("utf-8") for path in
-        _git(worktree, "diff", "--cached", "--name-only", "-z", base_revision).split(b"\0")
-        if path
-    )
-    untracked = [path for path in
-                 _git(worktree, "ls-files", "--others", "--exclude-standard", "-z").split(b"\0")
-                 if path]
+    changed, untracked = _observed_changed_paths(worktree, base_revision)
     if changed != {draft.target_path} or untracked:
         raise DocumentDraftError("문서 PR에 승인 대상 외의 변경이 있습니다.")
     if (_git(worktree, "diff", "--summary", base_revision, "--", draft.target_path)
