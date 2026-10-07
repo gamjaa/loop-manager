@@ -15,8 +15,10 @@ class RebaseCorrectionTests(TestCase):
     def observation(self, *, stages=None, files=None, position='commit-a',
                     source=CorrectionSource.REBASE, stash=None):
         return ConflictObservation(
-            'definition', 'base', 'before', stages or (('app.py', 1, 'blob-a'),),
-            files or (('app.py', 'content-a'),), 'staged-a', position, source, stash,
+            'definition', 'base', 'before',
+            (('app.py', 1, 'blob-a'),) if stages is None else stages,
+            (('app.py', 'content-a'),) if files is None else files,
+            'staged-a', position, source, stash,
         )
 
     def test_fingerprint_uses_stage_blobs_and_progress_uses_content_and_position(self):
@@ -102,3 +104,21 @@ class RebaseCorrectionTests(TestCase):
                          CorrectionAction.CONTINUE)
         self.assertEqual(next_action(resolved, worker_result=True, staged=False),
                          CorrectionAction.SKIP)
+
+        git.reset_mock()
+        continued = execute_git_step(CorrectionAction.CONTINUE, git=git, worktree='/worktree')
+        self.assertEqual(continued.returncode, 0)
+        self.assertEqual(continued.output, 'done')
+        git.assert_called_once_with('/worktree', '-c', 'core.editor=true',
+                                    'rebase', '--continue', check=False)
+
+        git.reset_mock()
+        git.return_value = SimpleNamespace(returncode=1, stdout='conflict remains')
+        skipped = execute_git_step(CorrectionAction.SKIP, git=git, worktree='/worktree')
+        self.assertEqual((skipped.returncode, skipped.output), (1, 'conflict remains'))
+        git.assert_called_once_with('/worktree', 'rebase', '--skip', check=False)
+
+    def test_observation_helper_preserves_explicit_empty_conflict_and_file_sets(self):
+        empty = self.observation(stages=(), files=())
+        self.assertEqual(empty.stages, ())
+        self.assertEqual(empty.worktree_files, ())

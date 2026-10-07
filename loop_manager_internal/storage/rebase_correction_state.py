@@ -152,6 +152,15 @@ class RebaseCorrectionRepository:
             except sqlite3.IntegrityError as error:
                 raise CorrectionRace("rebase correction record appeared") from error
         else:
+            # A repeated unchanged observation may resume its pending turn and
+            # retain its completed result. Every other field has its own
+            # preservation condition so a corrected/new observation resets it.
+            preserve_pending_turn = same and not corrected and worker_result is None
+            preserve_worker_session = worker_session is None
+            preserve_worker_result = same and not corrected and worker_result is None
+            preserve_worker_code = same and not corrected and worker_result is None
+            preserve_result_kind = same and not corrected and worker_result is None
+            preserve_scope_marker = same and not corrected and scope_marker is None
             changed = self.connection.execute(
                 "UPDATE rebase_corrections SET generation = generation + 1, "
                 "plan_revision = ?, target_base = ?, before_head = ?, source = ?, "
@@ -163,16 +172,14 @@ class RebaseCorrectionRepository:
                 (observation.plan_revision, observation.target_base,
                  observation.before_head, observation.source.value,
                  observation.stash_oid, payload, history_payload, audit_payload,
-                 row["pending_turn"] if same and not corrected and worker_result is None else None,
-                 worker_session or row["worker_session"],
-                 (row["worker_result"] if same and not corrected and worker_result is None
-                  else worker_result) if persist_worker_result else None,
-                 (row["worker_code"] if same and not corrected and worker_result is None
-                  else None),
-                 (row["result_kind"] if same and not corrected and worker_result is None
-                  else None),
-                 (row["scope_marker"] if same and not corrected and scope_marker is None
-                  else scope_marker), repo, plan_id, generation),
+                 row["pending_turn"] if preserve_pending_turn else None,
+                 worker_session if worker_session is not None else row["worker_session"],
+                 (row["worker_result"] if preserve_worker_result else worker_result)
+                 if persist_worker_result else None,
+                 row["worker_code"] if preserve_worker_code else None,
+                 row["result_kind"] if preserve_result_kind else None,
+                 (row["scope_marker"] if preserve_scope_marker else scope_marker),
+                 repo, plan_id, generation),
             )
             if changed.rowcount != 1:
                 raise CorrectionRace("rebase correction generation changed")
