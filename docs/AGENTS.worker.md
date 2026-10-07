@@ -9,7 +9,8 @@
 - Requirement는 기본적으로 사용자가 작성하며 명시적인 Specification Skill 문서 작성 요청은
   예외다. Requirement·ExecPlan 구현으로 바뀌는 제품 동작·장기 규칙은 PRODUCT에,
   설계·책임 경계·계약은 ARCHITECTURE에 코드와 같은 PR에서 반영한다. 필요한 관련 절만
-  갱신하고 목표·필수 검증·사용자 결정과 AGENTS 승인 경계를 보존한다.
+  갱신하고 목표·필수 검증·사용자 결정과 프로젝트 루트 `AGENTS.md` 변경에 대한
+  사용자 승인 조건을 보존한다.
 - Requirement의 완료 판단·archive 이동은 Manager의 책임이며 Worker가 수행하지 않는다.
   `docs/PLANS.md` 수정은 게시된 ExecPlan이 해당 변경을 명시한 경우에만 허용한다.
 
@@ -25,6 +26,10 @@ Baseline은 생성하지 않는다. 기존 결정·편집된 Patch·Comment·메
 Manager가 검증해 전달한 사전 승인 또는 승인·대체 patch는 해당 대상과 정확한 내용에만
 적용한다. reject 대상은 원래 baseline을 유지하고 최종 내용은 전달된 expected_content_hash와
 일치해야 한다. 사용자 결정을 대신 작성·변경하거나 승인 범위를 확대하지 않는다.
+
+공통·역할별 `docs/AGENTS.*.md` 원본 파일의 수정은 현재 역할·목표의 일반 문서 권한과
+PR 보고 규칙을 따르며 위 사전 승인 대상에 포함하지 않는다. 파일을 수정해도 현재 작업에
+고정된 Loop Manager instruction과 실행 권한은 바뀌지 않는다.
 
 ## 검증
 

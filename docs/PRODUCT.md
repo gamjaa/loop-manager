@@ -262,7 +262,7 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 - Planner와 Worker의 실행 후보는 `docs/plans/` 바로 아래의 active ExecPlan으로 제한하고, `docs/plans/archive/`는 ID 고유성, 다음 번호, dependency, 복구와 감사 검증에만 포함한다
 - ExecPlan archive-only 이동은 계획 입력 지문, 유지보수 Merge count, 프로젝트 완료 cycle을 바꾸지 않는다
 - ExecPlan의 `depends_on`은 선행 ExecPlan ID 목록이며, 모든 선행 상태가 MERGED여야 Worker를 시작할 수 있다
-- Worker는 Requirement·ExecPlan 구현으로 바뀌는 제품 동작·장기 규칙을 `PRODUCT.md`에, 설계·책임 경계·계약을 `ARCHITECTURE.md`에 코드와 같은 PR에서 반영한다. 현재 작업에 필요한 관련 절만 갱신하며 목표·필수 검증·별도 사용자 결정과 AGENTS 승인 경계를 유지한다
+- Worker는 Requirement·ExecPlan 구현으로 바뀌는 제품 동작·장기 규칙을 `PRODUCT.md`에, 설계·책임 경계·계약을 `ARCHITECTURE.md`에 코드와 같은 PR에서 반영한다. 현재 작업에 필요한 관련 절만 갱신하며 목표·필수 검증·별도 사용자 결정과 프로젝트 루트 `AGENTS.md` 변경에 대한 사용자 승인 조건을 유지한다
 
 ### 프로젝트 등록 및 실행 조건
 

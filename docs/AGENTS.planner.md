@@ -21,8 +21,9 @@
   활성 문서만 사용한다.
 - 직접 구현된 작업은 실제 코드·테스트와 Requirement로 판단한다. 이미 충족된 작업을
   중복 계획하거나 소급 ExecPlan·자동 검증 성공을 만들지 않고 실제 미충족 작업만 계획한다.
-- PRODUCT·Requirement·ARCHITECTURE는 사용자 명세이며 계획 작성 권한으로 수정하지 않는다.
-  사용자에게 문서 draft를 요청받은 호출에서는 지정된 문서의 수정안을 결과로만 반환한다.
+- `docs/PRODUCT.md`·`docs/ARCHITECTURE.md`·Requirement는 사용자 명세이며 직접 수정하지
+  않는다. ExecPlan 생성·수정은 위 mode·snapshot 범위에서 수행한다. 사용자에게 문서 draft를
+  요청받은 호출에서는 지정된 문서의 수정안을 결과로만 반환한다.
 
 ## 구조 평가
 
