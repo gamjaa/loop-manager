@@ -74,11 +74,12 @@ R-023의 원격 실행·self handoff 목표는 유지하며 로컬 갱신 gate�
 
 시작 조건:
 - 사용자가 PRODUCT, Requirement 또는 ARCHITECTURE 작성이나 검토를 요청한다
+- 사용자가 새 기능·정책 변경을 요청하면 대화형 Agent가 관련 Requirement를 작성·갱신한다. 별도 문서 작성 요청은 필요하지 않다
 
 흐름:
 1. Specification Skill이 기존 문서와 템플릿을 확인한다
 2. 확정된 내용과 사용자 결정이 필요한 내용을 구분한다
-3. 문서 역할에 맞는 가장 좁은 범위만 작성하거나 수정한다
+3. 문서 역할에 맞는 가장 좁은 범위만 작성하거나 수정한다. 관련 활성 Requirement가 요청과 Acceptance Criteria를 충분히 담으면 재사용하며 중복 생성하지 않는다. ExecPlan 생성·계획 작성은 매니저의 자동 계획 흐름이 담당한다
 4. 정상·실패 흐름, 상태 전이, 권한, Product Invariant와 edge case를 점검한다
 5. 구현자가 임의로 결정해야 하는 사항이 없을 때까지 사용자와 문서를 보완한다
 6. 완성된 Requirement는 `docs/requirements/` 바로 아래에 저장한다
@@ -285,13 +286,15 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 
 ### 공통 Agent 지침과 직접 작업
 
-- 실행 원본은 bootstrap이 선택한 immutable runtime의 `docs/AGENTS.common.md`다. 모델 실행 전에 UTF-8 내용·내용 SHA-256·source revision·snapshot 참조를 작업에 결합해 Manager 상태 디렉터리와 SQLite에 보존한다. 모든 역할·provider·신규·재개 호출은 같은 해결 경계를 사용한다
-- ExecPlan의 Worker·Reviewer·재시도·fallback은 같은 버전을 사용한다. 독립 planning·점검·유지보수 작업도 각 버전을 고정하고 새 작업만 최신 공통 내용을 선택한다. 내용이 같으면 runtime SHA 변경만으로 재계획하지 않으며 새 지침이 진행 작업을 선점하지 않는다. 관련 planning 입력과 성공 결과 재사용은 실제 내용 해시를 포함한다
+- 실행 원본은 bootstrap이 선택한 immutable runtime의 `docs/AGENTS.common.md`와 역할별 `docs/AGENTS.*.md`다. 공통에는 모든 역할의 기준을, 역할별 파일에는 권한·금지사항과 절차를 기록하며 파일 구성·합성·버전 관리에 대한 설명은 넣지 않는다. Planner·유지보수 Planner는 `AGENTS.planner.md`, 점검 Planner는 `AGENTS.planner_check.md`, Worker와 Reviewer는 각각 `AGENTS.worker.md`, `AGENTS.reviewer.md`를 사용한다
+- 모델 실행 전에 모든 원본의 UTF-8 내용·묶음 SHA-256·source revision·snapshot 참조를 작업에 결합해 Manager 상태 디렉터리와 SQLite에 보존한다. 호출할 때 공통과 해당 역할의 내용만 합치고 실제 전달 내용의 해시를 호출 기록에 남긴다. 합친 실행용 파일은 저장소 밖에서만 생성하며 커밋하지 않는다
+- ExecPlan의 Worker·Reviewer·재시도·fallback은 같은 원본 버전에서 각 역할의 지침을 사용한다. 독립 planning·점검·유지보수 작업도 각 버전을 고정하고 새 작업만 최신 원본을 선택한다. 내용이 같으면 runtime SHA 변경만으로 재계획하지 않으며 새 지침이 진행 작업을 선점하지 않는다. 관련 planning 입력과 성공 결과 재사용은 역할별 원본까지 포함한 내용 해시를 사용한다. 기존 단일 Markdown snapshot은 원래 내용으로 재개하며 새 역할 지침을 덧붙이지 않는다
 - Codex의 추가 developer 지침과 Claude의 append system prompt·snapshot 기능으로 기본 지침·기존 추가 지침·프로젝트 규칙·실행 경계를 보존한다. 잘못된 원본·snapshot·저장 실패·미지원 기능·설정 충돌은 모델 실행 전에 거부한다. 버전 없는 과거 세션은 기존 작업물·session·실패 기록을 남기고 최소 문맥의 새 세션으로 복구한다
-- 작업 worktree의 공통 파일은 현재 역할·목표의 일반 파일 권한으로 수정한다. 별도 guidance 제안·사전 승인을 요구하지 않으며 후보 편집이나 Reviewer의 diff 읽기로 실행 snapshot을 바꾸지 않는다. 변경 PR에 실제 최종 경로·변경 사실·내용·이유·영향·diff 링크를 보고하고 Manager가 누락을 보완한다
+- 작업 worktree의 공통·역할별 지침 파일은 현재 역할·목표의 일반 파일 권한으로 수정한다. 별도 guidance 제안·사전 승인을 요구하지 않으며 후보 편집이나 Reviewer의 diff 읽기로 실행 snapshot을 바꾸지 않는다. 변경 PR에 실제 최종 경로·변경 사실·내용·이유·영향·diff 링크를 보고하고 Manager가 누락을 보완한다
 - 새 AGENTS 제안의 Target은 루트 `AGENTS.md`, Scope는 self 저장소도 `project`다. 과거 `common` 승인·대기는 원래 대상·baseline·patch에 결합해 처리하고 적용 불가는 원래 판단 대기로 보존한다. 공통 파일로 대상을 이관하지 않는다
-- 준비 도구는 기존 일반 파일 AGENTS를 byte 그대로 보존하고 새 AGENTS에는 프로젝트 규칙·Requirement 우선·필수 문서 안내만 작성한다. 다른 덮어쓰기·경로 보호는 유지하며 기존 프로젝트의 공통 본문을 자동 제거하지 않는다
-- 직접 작업·대화형 Agent의 로컬 구현에는 자동 Worker 역할·SQLite 전이·ExecPlan 선작성·자동 완료 절차를 요구하지 않는다. 새 기능·정책은 양쪽 모두 Requirement에서 시작한다. 직접 구현과 활성 Requirement의 원격 반영 후 기존 Planner가 실제 미충족 작업만 재점검하며 소급·중복 계획·자동 검증 성공 합성을 하지 않는다. 자동 작업의 ExecPlan·dependency·검증·사용자 Merge gate는 유지한다
+- 프로젝트로 복제하는 Specification Skill에는 PRODUCT·ARCHITECTURE·Requirement·FUTURE_IDEAS 작성·검토에 필요한 내용만 둔다. 계획 생성·상태 전이·호출·게시·보관 판정 등 Manager 내부 절차는 제품·설계 문서에서 정의한다. 보관 Requirement의 읽기 전용 범위와 새 변경의 신규 Requirement 작성 기준은 Skill에 유지한다
+- 준비 도구는 기존 일반 파일 AGENTS를 byte 그대로 보존하고 새 AGENTS에는 프로젝트 전용 개발 안내와 Specification Skill 참조만 작성한다. 루트 AGENTS에는 Loop Manager 개발에 필요한 작업 지침만 두고 제품 규칙·명세·코드 구조·실행 방법을 반복하지 않는다. 필수 문서 검사는 기존 등록·계획 입력 경계에서 유지한다. 다른 덮어쓰기·경로 보호는 유지하며 기존 프로젝트의 공통 본문을 자동 제거하지 않는다
+- 직접 작업·대화형 Agent의 로컬 구현은 사용자 요청의 Requirement를 먼저 작성·갱신하거나 충분한 기존 활성 Requirement를 재사용하고 ExecPlan을 만들지 않는다. 자동 Worker 역할·SQLite 전이·자동 완료 절차도 요구하지 않는다. ExecPlan 생성·계획 작성은 매니저가 호출하는 Planner의 자동 흐름이 담당한다. 직접 구현과 활성 Requirement의 원격 반영 후 실제 미충족 작업만 재점검하며 소급·중복 계획·자동 검증 성공 합성을 하지 않는다. 자동 작업의 ExecPlan·dependency·검증·사용자 Merge gate는 유지한다
 
 ### 수동 명령의 준비와 수락
 

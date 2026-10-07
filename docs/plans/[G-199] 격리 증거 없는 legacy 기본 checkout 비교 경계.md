@@ -30,7 +30,7 @@ draft: true
 
 - 결정 전에는 구현하지 않는다. 현재 `agents/scope_validation.py`의 invocation 증거 gate, `agent_scope_decision.scoped_metadata`의 비교 투영, `recovery/scope_reconciliation.py`의 원인별 재검사를 재사용할 수 있는지 확정 정책으로 다시 확인한다.
 - 결정된 예외만 해당 공통 경계에 반영하고, PRODUCT의 장기 규칙과 필요한 역할 문맥을 같은 구현 PR에서 정합하게 유지한다. R-023의 다른 worktree·shared metadata 보호와 R-055의 독립 작업 진행을 유지한다. 프로젝트 AGENTS 변경은 이 계획에 포함하지 않는다.
-- 공통 역할·검증·문서 변경 경계는 AGENTS.md, docs/ARCHITECTURE.md와 docs/PLANS.md를 따른다. 새 루트 파일·범용 격리 체계를 추가하지 않는다.
+- 자동 역할·검증·문서 변경 경계는 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙·설계·계획 작성은 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 따른다. 새 루트 파일·범용 격리 체계를 추가하지 않는다.
 
 ## Validation
 

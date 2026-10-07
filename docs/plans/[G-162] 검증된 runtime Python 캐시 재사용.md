@@ -25,7 +25,7 @@ runtime bootstrap의 강제 -B와 캐시 부재를 요구하는 테스트를 R-0
 - runtime/bootstrap.py의 기존 runtime 생성·선택·실행 경계를 사용하고 Python의 표준 bytecode 무효화 동작을 먼저 검토한다. 필요한 소유 캐시 식별·fallback만 추가한다.
 - agents/agent_profiles.py의 환경 필터와 provider 최초·재개·verify 경계를 대조한다. 현재 필터가 버리는 명시적 무캐시 선택도 전달하되 필요한 비밀이 아닌 캐시 선택 값만 다루고 기존 환경·sandbox·범위 검사를 유지한다. 역할별 강제 bytecode 금지를 다시 만들지 않는다.
 - 현재 verify·테스트 진단에 캐시 조건을 연결하고 캐시 관리만을 위한 서비스나 새 루트 파일을 만들지 않는다. 전체 비교 실행은 Manager에 맡긴다.
-- 문서·권한·게시와 검증의 공통 경계는 AGENTS.md, docs/ARCHITECTURE.md, docs/PLANS.md를 따른다. 필요한 기존 helper와 관련 테스트를 우선 재사용하고 새 루트 항목을 만들지 않는다.
+- 자동 문서·권한·게시·검증 경계는 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙·설계·계획 작성은 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 따른다. 필요한 기존 helper와 관련 테스트를 우선 재사용하고 새 루트 항목을 만들지 않는다.
 
 ## Validation
 

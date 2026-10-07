@@ -1,5 +1,5 @@
 - 파일명 형식은 `docs/plans/[G-000] Title.md`다.
-- Planner가 현재 프로젝트에 필요한 ExecPlan을 하나 이상 완성된 형태로 작성할 수 있다.
+- ExecPlan 생성·계획 작성은 매니저가 호출하는 자동 Planner 흐름이 담당한다. 직접 작업·Specification Skill은 관련 Requirement를 작성·갱신하며 ExecPlan을 만들지 않는다. 자동 Planner는 현재 프로젝트에 필요한 ExecPlan을 하나 이상 완성된 형태로 작성할 수 있다.
 - ID는 프로젝트 안에서 고유하며 기존 최대 번호 다음 값을 사용한다.
 - 파일 상단 frontmatter에는 실행 상태가 아닌 계획의 고정 메타데이터만 기록한다.
 - `sources`에는 이 계획의 근거가 된 PRODUCT 또는 Requirement 경로를 기록한다.
@@ -16,7 +16,7 @@
 
 ## Planner 변경 범위
 
-상태·소유권과 실행 mode는 프로그램이 제공한 snapshot과 역할별 지침을 기준으로 판단한다.
+상태·소유권과 실행 mode는 프로그램이 제공한 snapshot과 runtime의 `docs/AGENTS.common.md`+해당 역할 지침을 합친 instruction을 기준으로 판단한다. 정적 역할·권한·검증 규칙은 해당 원본 파일에 두며 작업 prompt에는 작업별 문맥만 둔다. 루트 `AGENTS.md`는 프로젝트 개발 규칙이다.
 
 일반 Planner는 새 `docs/plans/*.md`를 생성하고, 현재 PRODUCT/Requirement 범위 밖이지만 보존 가치가 있는 아이디어만 `docs/FUTURE_IDEAS.md`에 생성하거나 수정할 수 있다.
 
@@ -54,7 +54,9 @@ Patch:
 ```
 ````
 
-Worker가 현재 ExecPlan 달성에 꼭 필요한 `AGENTS.md` 규칙 변경을 발견하면 파일을 직접 수정하지 않고 해당 ExecPlan의 `Decision Log` 끝에 아래 제안과 빈 사용자 결정을 한 쌍으로 추가한 뒤 작업을 중단한다. proposal ID는 ExecPlan 안에서 고유한 소문자·숫자·하이픈 값이어야 한다. `Target`은 저장소 루트의 `AGENTS.md`만 허용하며, `Scope`는 기본적으로 `project`다. 프로그램이 현재 작업을 공통 규칙 원본의 작업으로 명시한 경우에만 `common`을 사용한다. 대상과 범위는 제공된 작업 문맥을 따른다. Planner와 Reviewer는 제안하거나 적용하지 않는다.
+Worker가 현재 ExecPlan 달성에 꼭 필요한 프로젝트 루트 `AGENTS.md` 규칙 변경을 발견하면 파일을 직접 수정하지 않고 해당 ExecPlan의 `Decision Log` 끝에 아래 제안과 빈 사용자 결정을 한 쌍으로 추가한 뒤 작업을 중단한다. proposal ID는 ExecPlan 안에서 고유한 소문자·숫자·하이픈 값이어야 한다. `Target`은 저장소 루트의 `AGENTS.md`만 허용하며, 새 제안의 `Scope`는 Loop Manager 자체 저장소도 `project`다. Planner와 Reviewer는 제안하거나 적용하지 않는다. 과거 `common` 승인·대기는 원래 루트 대상·baseline·결정·patch의 의미로 유지하고 새 파일로 이관하지 않는다.
+
+작업 worktree의 공통·역할별 `docs/AGENTS.*.md`는 현재 역할·목표의 일반 문서 권한을 따르며 위 승인 대상으로 추가하지 않는다. 파일을 수정해도 현재 작업에 고정된 실행 지침·권한은 바뀌지 않는다. 변경은 최종 PR에서 경로·내용·이유·영향·diff로 보고한다.
 
 Worker가 만드는 새 pending 결정에는 Baseline을 추가하지 않는다. Baseline 없는 기존 사용자 결정 대기·승인 형식과 승인 기록은 그대로 유지한다.
 

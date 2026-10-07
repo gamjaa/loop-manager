@@ -51,7 +51,7 @@ priority: normal
 - Loop Manager unittest의 현재 수집·fixture·compile 계약으로 실제 사용 경로를 연결하고, adapter 규약의 정상·실패·중단 결과를 좁은 unit test로 검증한다. 외부 저장소·비Python 예제는 로컬 범위에 포함하지 않는다. 합성 단위·결과만으로 언어 독립성·실제 OS 격리를 검증했다고 표시하지 않는다.
 - 적합성 자료는 프로젝트 runtime·의존성·수집·독립 fixture·직렬 단계·필수 compile 또는 명령 단계·Manager/단독 호출을 확인할 수 있게 한다. 일반 명령 단계 결과를 테스트별 결과로 표시하지 않는다.
 - 적합성 검증은 manifest 누락·중복·버전 오류, 테스트 및 fixture 결과 의미, 내부 병렬 예산, 종료 코드·시작 실패·강제 중단·부분 결과·정리 비용을 다룬다. 새 adapter의 추가 방법과 지원하지 않는 도구의 기존 경로 유지를 설명한다.
-- 공통 AGENTS의 권한·검증 규칙을 유지하고 역할별 프롬프트에 명시적 adapter·지원 버전·참조 문서를 연결한다. Worker에는 수집·격리·Agent mock·진단 보존의 작성 지침, Reviewer에는 계약·범위·격리의 검토 기준, Planner에는 adapter 도입·연결 작업의 판단 기준만 제공한다. 역할·언어별 AGENTS 사본이나 상세 지침 전체의 공통 주입을 만들지 않는다. 기존 작업별 입력·snapshot 버전 보존을 사용하고 진행 세션에 최신 지침을 강제로 섞지 않는다.
+- `docs/AGENTS.common.md`에는 모든 자동 역할에 적용되는 경계만 유지하고, 정적 작성·판단·검토 규칙은 기존 `docs/AGENTS.worker.md`·`docs/AGENTS.planner.md`·`docs/AGENTS.reviewer.md`에 둔다. Worker에는 수집·격리·Agent mock·진단 보존의 작성 지침, Reviewer에는 계약·범위·격리의 검토 기준, Planner에는 adapter 도입·연결 작업의 판단 기준을 제공한다. Manager의 기존 공통+해당 역할 instruction 병합 경계를 재사용하고 작업별 prompt에는 선택 adapter·지원 버전·참조 문맥만 연결한다. 언어별 지침 사본이나 모든 역할의 상세 지침을 한 호출에 공통 주입하지 않는다. 원본 묶음의 고정 버전을 재사용하고 합친 파일은 저장소 밖 실행용으로만 사용하며 진행 세션에 최신 지침을 섞지 않는다.
 - 테스트마다 시간 기록·예약 구현을 요구하지 않는다. adapter가 수집하는 새 테스트를 작성하고, 공유 fixture·순서 의존을 발견하면 직렬 선언 또는 해당 작업 범위의 격리를 선택한다. 새 adapter·기존 프로젝트 연결은 필요할 때 그 프로젝트의 계획으로 진행한다.
 
 ### 4. 서버 인계: 후속 adapter·실제 검증·프로젝트 연결
@@ -89,3 +89,4 @@ priority: normal
 - R-067 전체 범위는 공통 core + unittest·비Python 도구의 최소 두 adapter + 적합성 예제다. G-148의 로컬 단계는 core와 자체 unittest를 먼저 제공한다. 언어 독립성은 서버 후속의 실제 다른 도구 연결로 확인한다. 도구별 adapter는 결과 의미가 달라 필요한 경계이며 범용 plugin framework·자동 도구 판별·일괄 마이그레이션은 도입하지 않는다.
 - 프로젝트 연결 선언은 명시적 opt-in이고, 연결된 규약의 오류는 실패다. 미지원 도구의 미연결 프로젝트는 기존 verify를 유지한다. 실제 Agent 차단은 지원 adapter의 실행 경계에서 검증하며 임의 언어의 모든 subprocess를 기존 Python guard 하나로 차단할 수 있다고 간주하지 않는다.
 - 현재 합의는 기능·규약 계획이며 전체 코드 구현이나 외부 저장소 변경의 완료를 뜻하지 않는다. G-148은 활성 ExecPlan으로 관리하며 서버 자동 입력은 원격 기준 branch에 게시된 활성 Requirement와 ExecPlan catalog다.
+- 2026-10-07 지침 분리 정합화: 역할별 작성·판단·검토 규칙의 원본을 기존 역할 지침 파일로 맞추고, 작업 prompt에는 adapter별 문맥만 남기도록 했다. 지침 배포 경계를 새로 만들거나 로컬 기반·서버 후속의 구현 범위를 변경하지 않는다.

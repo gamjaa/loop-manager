@@ -25,7 +25,7 @@ priority: normal
 
 - agents/invocation_service.py·실제 process callback과 storage/agent_invocation_state.py의 기존 ledger를 확장한다. 목적은 호출자가 명시하고 실행 여부는 실제 경계 증거로 기록한다.
 - 기존 session transition·provider usage·durable 로그를 재사용한다. optional 관측 실패와 필수 격리/소유권 검증의 예외 책임을 분리한다.
-- 공통 경계는 AGENTS.md, docs/ARCHITECTURE.md와 docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
+- 자동 역할·권한·검증은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙·설계·계획 작성은 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
 
 ## Validation
 

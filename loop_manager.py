@@ -79,7 +79,6 @@ from loop_manager_internal.config.managed_config import ManagedConfig, ManagedCo
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.notifications import work_exhaustion
 from loop_manager_internal.documents import reviewer_specification
-from loop_manager_internal.quality.quality_guidance import AGENT_QUALITY_GUIDANCE
 from loop_manager_internal.recovery import blocked_checkpoint
 from loop_manager_internal.storage import blocked_checkpoint_state
 from loop_manager_internal.recovery import project_blocked_recovery

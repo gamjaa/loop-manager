@@ -27,7 +27,7 @@ priority: normal
 
 - maintenance/maintenance_validation.py와 planning/planner_validation.py 및 기존 mutable snapshot·barrier·publication 경계를 재사용한다. DAG 판단 결과와 대상 token을 받은 Manager가 기존 선행 closure 계산으로 대상을 확정한 뒤 최소 dependency 편집을 수행한다. Agent가 직접 작성하던 장벽 diff 검증은 Manager가 생성한 실제 diff에도 유지한다.
 - 일반 Planner의 권한으로 이 편집을 확대하지 않고 barrier proof와 실제 diff를 대조한다. 기존 순서/내용 보존을 결정적 코드로 검증한다.
-- 공통 경계는 AGENTS.md, docs/ARCHITECTURE.md와 docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
+- 자동 역할·권한·검증은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙·설계·계획 작성은 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
 
 ## Validation
 

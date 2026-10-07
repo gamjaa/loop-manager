@@ -29,7 +29,7 @@ priority: normal
 
 - 구현 시작 시 최신 원격 코드에서 같은 조회 기능을 확인한다. `loop_manager.py`는 parser와 실행 초기화 이전의 조회 dispatch만 담당하고, 조회 연결·저장 사실 투영·출력 책임은 기존 application/storage 경계 안에서 분리한다. 새 루트 항목·별도 실행 엔진·관측 체계·설정은 추가하지 않는다.
 - 기존 schema·프로젝트 registry·작업 상태와 `recovery/recovery_runtime.py`, 선택·알림 사유의 순수 판단을 확인해 재사용한다. schema ensure나 기록 갱신을 숨긴 Repository·복구 helper를 조회에 연결하지 않는다. 쓰기 실행과 설명이 공유할 최소 순수 경계만 분리하며 정책을 복제하지 않는다.
-- 읽기 snapshot의 수명 안에서 범위 확인과 사실 조회를 완료한 뒤 사람이 읽는 출력과 JSON을 같은 결과에서 만든다. 오류·선택 정보 누락도 공통 계약으로 정규화하고 기존 README 등 사용자 문서를 갱신한다. 장기 제품 규칙 반영은 AGENTS.md의 문서 권한을 따른다.
+- 읽기 snapshot의 수명 안에서 범위 확인과 사실 조회를 완료한 뒤 사람이 읽는 출력과 JSON을 같은 결과에서 만든다. 오류·선택 정보 누락도 공통 계약으로 정규화하고 기존 README 등 사용자 문서를 갱신한다. 장기 제품 규칙 반영은 AGENTS.md와 docs/AGENTS.common.md·docs/AGENTS.worker.md의 문서 권한을 따른다.
 
 ## Validation
 

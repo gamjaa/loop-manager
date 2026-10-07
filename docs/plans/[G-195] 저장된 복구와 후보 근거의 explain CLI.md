@@ -27,7 +27,7 @@ priority: normal
 
 - 저장된 실행 checkpoint·검증 피드백·복구 상태의 책임 경계에서 설명에 필요한 사실만 읽고 G-194의 공통 상태 투영을 확장한다. 전환 이력이나 증명 체계를 새로 저장하지 않는다.
 - 기존 후보/입력 identity와 순수 복구 판단을 재사용해 결과 연결을 검증하고, 읽기만으로 확정할 수 없는 원격·소유권 조건은 재검사 필요로 남긴다. 정상 실행의 정책이나 상태 전이를 바꾸지 않는다.
-- CLI parser와 문서·출력 계약을 연결한다. 상위 문서와 검증 주체는 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 따른다.
+- CLI parser와 문서·출력 계약을 연결한다. 상위 문서는 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를, 자동 역할·검증 책임은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를 따른다.
 
 ## Validation
 

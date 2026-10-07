@@ -26,7 +26,7 @@ G-148의 공통 core에 최소 하나의 실제 비Python 도구를 연결하고
 
 - G-148의 정적 adapter registry·공통 process 계약을 재사용한다. 필요한 도구별 수집/fixture/reporter 책임만 추가하고 일반 DAG·자동 설치·새 infrastructure를 만들지 않는다.
 - 예제와 적합성 fixture는 기존 tests/support 또는 scripts 하위의 적절한 위치에 둔다. 실제 설치 도구를 구현 환경에서 확인하고 지원 버전·필수 의존성·지원하지 않는 계약을 명시한다.
-- 공통 경계는 AGENTS.md, docs/ARCHITECTURE.md와 docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
+- 자동 역할·권한·검증은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙·설계·계획 작성은 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
 
 ## Validation
 

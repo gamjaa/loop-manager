@@ -27,7 +27,7 @@ priority: high
 
 - execution의 rebase·revision 무효화와 verification handler·checkpoint 저장 경계를 연결한다. 입력 관측·receipt CAS·실제 검증 실행의 책임을 분리하고 G-181의 목록 계약을 사용한다.
 - 현재 검증 timeout·종료·실패 피드백·교정 예산을 보존한다. SHA만 비교하는 cache 또는 이전 테스트 결과로 현재 실패를 덮는 fallback을 만들지 않는다.
-- 공통 경계는 AGENTS.md, docs/ARCHITECTURE.md와 docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
+- 자동 역할·권한·검증은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙·설계·계획 작성은 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
 
 ## Validation
 

@@ -6,6 +6,8 @@
 
 ## Requirement
 
+이 양식은 자동 Worker의 프로젝트 루트 `AGENTS.md` 변경 제안·결정에 적용한다. R-064의 공통·역할별 `docs/AGENTS.*.md`는 일반 작업 파일 권한을 따르며 이 양식을 요구하지 않는다. 과거 루트 대상의 결정·감사 호환성은 유지한다.
+
 ### 결정 본문의 경계
 
 `### Agent Guidance User Decision: <proposal-id>`의 본문은 코드 블록 밖의 독립된 줄에 있는 `<!-- END USER DECISION -->` 직전까지만 읽는다. 마커 줄의 앞뒤 공백은 허용하고, 코드 블록이나 diff 내용 안의 같은 문자열은 종료 마커로 해석하지 않는다.

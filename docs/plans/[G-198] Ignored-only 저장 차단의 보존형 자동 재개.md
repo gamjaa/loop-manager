@@ -28,7 +28,7 @@ priority: high
 - `agents/scope_observation.py`의 시작 ignore 증명·legacy 정규화와 `scope_recovery.py`의 persisted 검사를 재사용한다. 저장 상태에서 비교용 view를 만드는 책임을 일관되게 공유해 일반 재개, 역사 Agent 결과 검사와 BLOCKED 검사 사이의 분류 차이를 없앤다. 원본 저장 값을 현재 snapshot으로 덮어쓰거나 공유 metadata 차이를 일괄 제외하지 않는다.
 - `recovery/scope_reconciliation.py`의 프로젝트·계획 scope 복구 및 raw dirty preflight를 같은 증명 경계에 연결한다. 선택 worktree의 파생 상태를 조정해야 한다면 권위 입력으로 재구성 가능한 부분만 다루고 다른 worktree·ref의 변화를 ignored로 추정하지 않는다.
 - `planning/selection_service.py`의 보존 오류 gate에서 기존 오류와 저장된 실행·결과가 ignored-only 오탐임을 검증할 수 있는 경우를 재평가한다. workspace 소유권과 현재 cause를 확인한 뒤 기존 복구·게시 상태 전이로 이어가며, 일반 실패의 입력 변경 gate나 결과 검증을 우회하지 않는다.
-- 기존 scope·planning recovery·Worker 검증 fixture를 확장해 누락된 역할별 동작과 같은 worktree 실행 연결을 검증한다. 현재 전체 verify의 unittest discovery를 유지한다. 구조·검증·승인 경계는 AGENTS.md, docs/PLANS.md와 docs/ARCHITECTURE.md의 실행별 Agent 범위·중단 복구·검증 절을 따른다.
+- 기존 scope·planning recovery·Worker 검증 fixture를 확장해 누락된 역할별 동작과 같은 worktree 실행 연결을 검증한다. 현재 전체 verify의 unittest discovery를 유지한다. 자동 역할·검증·승인 경계는 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 구조·계획 작성과 실행별 Agent 범위·중단 복구·검증 설계는 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 따른다.
 
 ## Validation
 

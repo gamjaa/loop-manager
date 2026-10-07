@@ -20,7 +20,7 @@ priority: high
 
 ## Acceptance Criteria
 
-- verify 성공 재사용 가능성과 마지막 승인 후보 대비 전체 PR diff·선택 ExecPlan/sources·PRODUCT/ARCHITECTURE·사용자 결정·공통/프로젝트 지침·Review provider/model/effort가 모두 유효하게 동일할 때만 Review를 생략한다.
+- verify 성공 재사용 가능성과 마지막 승인 후보 대비 전체 PR diff·선택 ExecPlan/sources·PRODUCT/ARCHITECTURE·사용자 결정·공통/역할별 원본 묶음·실제 Reviewer instruction·프로젝트 지침·Review provider/model/effort가 모두 유효하게 동일할 때만 Review를 생략한다.
 - 목록 부재/오류/누락 의심·입력 비교 불가, 문서나 승인 입력 변화, 부분 성공 근거는 Review를 실행한다. verify와 무관한 명세 변화에서는 verify 재사용과 새 Review를 구분한다.
 - 승인 receipt는 실제 PASS·검증된 후보/입력·작업 주기에 결합하고 최종 게시 직전 다시 확인한다. rebase·경쟁·중단/재시작에서 오래된 Review로 새 diff를 승인하거나 새 실패를 이전 PASS로 덮지 않는다.
 - 다른 계획/작업의 PASS·교정 이력·승인을 복제하지 않는다. 생략 이유와 원래 근거를 남기며 실제 Reviewer가 실행되면 기존 읽기 전용·검증 결과 전달·issue 교정 계약을 유지한다.
@@ -28,13 +28,13 @@ priority: high
 ## Implementation
 
 - execution Review handler·publication 후보 확인과 storage의 기존 validation/checkpoint 경계를 확장한다. verify receipt와 Review 입력/receipt를 분리하되 필수 선행 검증 관계를 유지한다.
-- G-147의 고정 공통 버전, 문서 source fallback/예약어 규칙 버전, G-171 최종 문서 diff 보고를 재사용한다. 실제 외부 검토 기준을 확인할 수 없으면 새 Review를 선택한다.
+- 기존 공통·역할별 원본 묶음 버전과 실제 Reviewer 합성 instruction의 hash, 문서 source fallback/예약어 규칙 버전, G-171 최종 문서 diff 보고를 재사용한다. 최신 runtime 원본을 진행 중 작업의 고정 버전에 섞거나 common 본문만 비교해 역할 규칙 변경을 놓치지 않는다. 실제 외부 검토 기준을 확인할 수 없으면 새 Review를 선택한다.
 - 실제 Reviewer 호출에는 G-197의 최종 후보 검증 근거 전달 경계를 재사용한다. verify 성공을 재사용했으면 원래 성공 근거와 현재 입력의 동일성 확인을 전달하고, 새 verify를 실행한 것으로 보고하지 않는다.
-- 공통 경계는 AGENTS.md, docs/ARCHITECTURE.md와 docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
+- 자동 역할·권한·검증은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙·설계·계획 작성은 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
 
 ## Validation
 
-- Review·publication revision 테스트에서 완전 동일/문서만 변경/검증 입력 변경·profile/지침/결정 변경·예약어 source·receipt 부재·게시 경쟁의 최소 unit case를 실행한다.
+- Review·publication revision 테스트에서 완전 동일/문서만 변경/검증 입력 변경·profile/공통 또는 역할 지침/결정 변경·예약어 source·receipt 부재·게시 경쟁의 최소 unit case를 실행한다. 고정 원본 묶음과 실제 Reviewer instruction의 동일성은 기존 guidance fixture로 확인한다.
 - Manager 전체 verify는 verify/Review 독립 선택, 실제 no-call/필수 call, 마지막 승인 기준·scope·최종 PR gate와 중단 재개를 검증한다.
 - 실제 Review가 필요한 경우 실행한 verify 또는 재사용한 verify의 유효한 근거가 같은 후보에 결합돼 전달되는지 확인한다. Review 생략은 새 Reviewer 호출·새 테스트 실행 근거를 만들지 않는다.
 

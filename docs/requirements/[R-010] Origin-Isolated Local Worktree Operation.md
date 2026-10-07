@@ -62,14 +62,14 @@ Worker는 관리 worktree의 파일과 targeted test만 담당하며 commit, fet
 - Planner 입력 지문은 `origin/<base-branch>`의 commit tree만 사용하며 로컬 파일, index와 로컬 전용 commit을 포함하지 않는다.
 - planning worktree는 `origin/<base-branch>`의 detached HEAD에서 만들고, ExecPlan 구현 branch와 worktree도 해당 원격 기준에서 만든다.
 - 기존 활성 ExecPlan은 저장된 Loop Manager 소유 branch와 관리 worktree에서만 재개한다.
-- 프로젝트 등록 시 필수 문서, 공통 `AGENTS.md` 내용과 `docs/PLANS.md` 검사는 `origin/<base-branch>`에 commit된 파일을 기준으로 수행한다.
+- 프로젝트 등록 시 필수 문서, 프로젝트 루트 `AGENTS.md`의 존재·UTF-8과 `docs/PLANS.md` 검사는 `origin/<base-branch>`에 commit된 파일을 기준으로 수행한다. R-064에 따라 프로젝트 AGENTS에 공통 본문 포함·일치 승인을 요구하지 않으며 실행 지침은 선택 runtime의 공통·역할별 원본을 사용한다.
 - 로컬에서만 추가·수정·삭제한 문서 때문에 등록 검사가 성공하거나 실패하지 않는다.
 - 등록 이후 자동 실행은 등록 시 전용 공통 파일 검사를 로컬 worktree에서 다시 수행하지 않는다.
 - safe fast-forward 대상이 아닌 기본 worktree의 파일 내용, index와 HEAD는 실행 전후에 동일하게 유지된다. 대상이면 HEAD, index와 tracked 파일만 정확한 `origin/<base-branch>`로 함께 전진한다.
 - 로컬 미commit 변경과 로컬 전용 commit은 관리 worktree로 복사하거나 자동 commit·push하지 않는다.
 - Planner가 base branch에 ExecPlan을 push하거나 구현 PR이 Merge돼 로컬 branch가 원격보다 뒤처지면 다음 fetch 뒤 safe fast-forward 조건을 다시 평가해 등록된 기본 worktree를 갱신한다.
 - Worker가 실행되는 동안 사용자가 기본 worktree의 파일, index, HEAD와 로컬 base branch를 변경해도 관리 worktree나 Loop Manager 소유 branch가 바뀌지 않은 한 Agent 범위 위반으로 차단하지 않는다.
-- Worker 반환 후 commit, 최신 base fetch·rebase, push와 PR 생성은 Loop Manager 코드가 수행하며 Worker prompt와 범위 검사는 Worker의 직접 Git 쓰기를 계속 금지한다.
+- Worker 반환 후 commit, 최신 base fetch·rebase, push와 PR 생성은 Loop Manager 코드가 수행하며 공통+Worker 역할 instruction과 범위 검사는 Worker의 직접 Git 쓰기를 계속 금지한다.
 - `git fetch`, 검증된 `git worktree add/remove`와 위 조건을 만족하는 기본 worktree의 `git merge --ff-only origin/<base-branch>`는 Loop Manager 코드가 수행할 수 있다.
 - 동시 commit 등으로 Git lock 충돌이 발생하면 dirty 상태와 별개인 일시적 Git 오류로 처리하며 잠금을 우회하거나 사용자 작업을 변경하지 않는다.
 - Loop Manager 저장소 자체가 관리 대상인 경우에도 같은 safe fast-forward 조건을 적용한다. 로컬 문서 변경이나 branch 차이로 갱신을 건너뛰더라도 자동 작업은 차단하지 않는다.

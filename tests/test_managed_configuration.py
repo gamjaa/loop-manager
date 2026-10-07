@@ -18,16 +18,16 @@ from loop_manager_internal.runtime import project_registry
 
 
 class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
-    def test_copy_tools_share_minimal_requirement_first_guidance(self):
+    def test_copy_tools_share_minimal_project_guidance(self):
         bash = (loop_manager.ROOT / 'scripts/copy-project-files.sh').read_text(encoding='utf-8')
         powershell = (loop_manager.ROOT / 'scripts/copy-project-files.ps1').read_text(encoding='utf-8')
         bash_body = re.search(r"<<'GUIDANCE'\n(.*?)\nGUIDANCE", bash, re.S).group(1)
         powershell_body = re.search(r"\$minimalAgents = @'\n(.*?)\n'@", powershell, re.S).group(1)
         self.assertEqual(bash_body, powershell_body)
-        for phrase in ('프로젝트 전용', 'Requirement에서 시작', 'docs/PRODUCT.md',
-                       'docs/requirements/*.md', 'docs/ARCHITECTURE.md'):
+        for phrase in ('프로젝트 전용', '.agents/skills/specification-docs/SKILL.md'):
             self.assertIn(phrase, bash_body)
-        for phrase in ('ExecPlan', 'Worker', 'SQLite'):
+        for phrase in ('ExecPlan', 'Worker', 'SQLite', 'docs/REQUIREMENT.template.md',
+                       'Acceptance Criteria', 'docs/PRODUCT.md', '활성 Requirement'):
             self.assertNotIn(phrase, bash_body)
 
     def test_copy_project_files_preserves_existing_agents_bytes(self):
@@ -352,7 +352,9 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
                 encoding="utf-8"
             )
             minimal = (target / "AGENTS.md").read_text(encoding="utf-8")
-            self.assertIn("새로운 기능이나 정책 변경은 Requirement에서 시작한다.", minimal)
+            self.assertIn(".agents/skills/specification-docs/SKILL.md", minimal)
+            self.assertEqual((target / ".agents/skills/specification-docs/SKILL.md").read_bytes(),
+                             (loop_manager.ROOT / ".agents/skills/specification-docs/SKILL.md").read_bytes())
             self.assertNotIn("Worker", minimal)
             self.assertNotIn("ExecPlan", minimal)
             self.assertEqual((target / "docs/PLANS.md").read_bytes(),
