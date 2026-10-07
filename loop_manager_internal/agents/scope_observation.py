@@ -462,14 +462,19 @@ def _ignore_rule_sources(worktree: Path, paths: list[str], *, effects: Observati
     if result.returncode not in {0, 1} or fields.pop() or len(fields) % 4:
         raise RuntimeError("ignored 경로의 Git 규칙 묶음을 확인할 수 없습니다.")
     sources = {}
+    matched = set()
     expected = set(paths)
     for offset in range(0, len(fields), 4):
         source, line, pattern, raw_path = fields[offset:offset + 4]
         path = os.fsdecode(raw_path)
-        if path not in expected or path in sources or not source or not line or not pattern:
+        if path not in expected or path in matched or not source or not line or not pattern:
             raise RuntimeError("ignored 경로의 Git 규칙 묶음이 불완전합니다.")
-        sources[path] = os.fsdecode(source)
-    if bool(sources) != (result.returncode == 0):
+        matched.add(path)
+        # Verbose check-ignore also reports the last matching negation rule.
+        # Such a path remains authoritative, including after its deletion.
+        if not pattern.startswith(b'!'):
+            sources[path] = os.fsdecode(source)
+    if bool(matched) != (result.returncode == 0):
         raise RuntimeError("ignored 경로의 Git 규칙 결과가 종료 코드와 다릅니다.")
     return sources
 

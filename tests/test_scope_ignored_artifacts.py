@@ -141,15 +141,22 @@ class ScopeIgnoredArtifactsTest(AgentScopeFixture, unittest.TestCase):
                                                "agent_result_snapshot = ?, worker_session_id = 'saved', retry_count = 3",
                                                (role, start.serialize(), result.serialize()))
                         loop_manager.validate_persisted_agent_scope(connection, repo, state, str(repo))
+                        manager = loop_manager.ManagerGitCheckpoint(result, frozenset()).serialize()
+                        with connection:
+                            connection.execute('UPDATE projects SET agent_manager_snapshot = ?', (manager,))
+                            connection.execute('UPDATE exec_plans SET agent_manager_snapshot = ?', (manager,))
+                        loop_manager.validate_persisted_agent_scope(connection, repo, state, str(repo))
                         with connection:
                             connection.execute("UPDATE projects SET phase = 'PLAN_BLOCKED'")
                             connection.execute("UPDATE exec_plans SET status = 'PLAN_BLOCKED'")
+                        loop_manager.validate_persisted_agent_scope(connection, repo, state, str(repo))
                         plan = connection.execute('SELECT * FROM exec_plans').fetchone()
                         loop_manager.validate_blocked_agent_scope(connection, repo, str(repo), 'main',
                             repo, plan_path, saved_plan=plan, require_safe_result=True)
                         saved = connection.execute('SELECT * FROM exec_plans').fetchone()
                         self.assertEqual(saved['agent_snapshot'], start.serialize())
                         self.assertEqual(saved['agent_result_snapshot'], result.serialize())
+                        self.assertEqual(saved['agent_manager_snapshot'], manager)
                         self.assertEqual((saved['worker_session_id'], saved['retry_count']), ('saved', 3))
                         if role == 'reviewer':
                             with connection:
@@ -208,6 +215,124 @@ class ScopeIgnoredArtifactsTest(AgentScopeFixture, unittest.TestCase):
             result = replace(current, dirty={'new.bin': (('untracked',), 'hidden')})
             self.assertEqual(loop_manager._normalize_legacy_ignored_snapshot(
                 repo, result, current, start=start), result)
+
+    def test_negated_ignore_rule_cannot_hide_deleted_nonignored_input(self):
+        for source in ('tracked', 'repository-exclude'):
+            with self.subTest(source=source), tempfile.TemporaryDirectory() as directory:
+                repo, _ = self._repository_with_plan(directory)
+                rule = repo / ('.gitignore' if source == 'tracked' else '.git/info/exclude')
+                rule.write_text('*.cache\n!visible.cache\n', encoding='utf-8')
+                if source == 'tracked':
+                    commit_and_push(repo, 'Keep visible cache authoritative')
+                path = repo / 'visible.cache'
+                path.write_bytes(b'nonignored input')
+                before = loop_manager.capture_git_snapshot(repo)
+                self.assertIn('visible.cache', before.dirty)
+                path.unlink()
+                current = loop_manager.capture_git_snapshot(repo)
+                self.assertEqual(loop_manager._normalize_legacy_ignored_snapshot(
+                    repo, before, current), before)
+
+    def test_ignored_planner_project_block_requires_current_workspace_ownership(self):
+        from loop_manager_internal.recovery import scoped_blocking
+        from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _ = self._repository_with_plan(directory)
+            (repo / '.gitignore').write_text('cache.bin\n', encoding='utf-8')
+            commit_and_push(repo, 'Ignore cache')
+            git_command(repo, 'switch', '--detach')
+            current = loop_manager.capture_git_snapshot(repo)
+            start = replace(current, dirty={'cache.bin': (('untracked',), 'legacy')})
+            state = Path(directory) / 'state'
+            state.mkdir()
+            connection = sqlite3.connect(':memory:')
+            connection.row_factory = sqlite3.Row
+            self.addCleanup(connection.close)
+            connection.execute(loop_manager.SCHEMA)
+            loop_manager._ensure_execplans_schema(connection)
+            connection.execute("INSERT INTO projects (repo, base_branch, phase, worktree, "
+                "agent_role, agent_snapshot, agent_result_snapshot, planning_workspace_owned, "
+                "planning_attempt_fingerprint) VALUES (?, 'main', 'PLANNING', ?, 'planner', ?, ?, 0, 'same')",
+                (str(repo), str(repo), start.serialize(), current.serialize()))
+            connection.commit()
+            scoped_blocking.record_project_block(connection, str(repo),
+                BlockReasonCode.DEFAULT_WORKTREE_MUTATION, 'legacy cache', 'same',
+                plan_id=None, previous_phase='PLANNING')
+            original = dict(scoped_blocking.project_block(connection, str(repo)))
+            self.assertFalse(loop_manager.resume_project_block_if_safe(
+                connection, repo, state, str(repo)))
+            self.assertEqual(dict(scoped_blocking.project_block(connection, str(repo))), original)
+            with connection:
+                connection.execute('UPDATE projects SET planning_workspace_owned = 1')
+            # A confirmed flag cannot replace the deterministic owned path.
+            self.assertFalse(loop_manager.resume_project_block_if_safe(
+                connection, repo, state, str(repo)))
+            self.assertEqual(dict(scoped_blocking.project_block(connection, str(repo))), original)
+
+    def test_owned_ignored_planner_project_resume_rechecks_owner_and_saved_result(self):
+        from loop_manager_internal.recovery import scoped_blocking
+        from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
+        from loop_manager_internal.planning.planning_workspace import planning_workspace_path
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _ = self._repository_with_plan(directory)
+            (repo / '.gitignore').write_text('cache.bin\n', encoding='utf-8')
+            commit_and_push(repo, 'Ignore cache')
+            state = Path(directory) / 'state'
+            state.mkdir()
+            managed = planning_workspace_path(state, str(repo), 'same')
+            git_command(repo, 'worktree', 'add', '--detach', str(managed), 'HEAD')
+            cache = managed / 'cache.bin'
+            cache.write_bytes(b'kept artifact')
+            current = loop_manager.capture_git_snapshot(managed)
+            start = replace(current, dirty={'cache.bin': (('untracked',), 'legacy')})
+            result = replace(current, dirty={'cache.bin': (('untracked',), 'result')})
+            connection = sqlite3.connect(':memory:')
+            connection.row_factory = sqlite3.Row
+            self.addCleanup(connection.close)
+            connection.execute(loop_manager.SCHEMA)
+            loop_manager._ensure_execplans_schema(connection)
+            connection.execute("INSERT INTO projects (repo, base_branch, phase, worktree, "
+                "agent_role, agent_snapshot, agent_result_snapshot, planning_workspace_owned, "
+                "planning_attempt_fingerprint, planning_error, planner_session_id) "
+                "VALUES (?, 'main', 'PLANNING', ?, 'planner', ?, ?, 1, 'same', 'independent', 'saved')",
+                (str(repo), str(managed), start.serialize(), result.serialize()))
+            connection.commit()
+            scoped_blocking.record_project_block(connection, str(repo),
+                BlockReasonCode.DEFAULT_WORKTREE_MUTATION, 'legacy cache', 'same',
+                plan_id=None, previous_phase='PLANNING')
+            block = dict(scoped_blocking.project_block(connection, str(repo)))
+            original_validator = loop_manager.validate_planning_worktree_ownership
+            calls = 0
+            def changed_owner(*args):
+                nonlocal calls
+                calls += 1
+                if calls == 2:
+                    connection.execute('UPDATE projects SET planning_workspace_owned = 0')
+                return original_validator(*args)
+            with mock.patch.object(loop_manager, 'validate_planning_worktree_ownership',
+                                   side_effect=changed_owner):
+                self.assertFalse(loop_manager.resume_project_block_if_safe(
+                    connection, repo, state, str(repo)))
+            self.assertEqual(calls, 2)
+            self.assertEqual(dict(scoped_blocking.project_block(connection, str(repo))), block)
+            with connection:
+                connection.execute('UPDATE projects SET planning_workspace_owned = 1')
+            # A new allowed Planner path still changes the preserved result.
+            new_plan = write_execplan(managed, 'G-002', 'Later input')
+            self.assertFalse(loop_manager.resume_project_block_if_safe(
+                connection, repo, state, str(repo)))
+            self.assertEqual(dict(scoped_blocking.project_block(connection, str(repo))), block)
+            new_plan.unlink()
+            self.assertTrue(loop_manager.resume_project_block_if_safe(
+                connection, repo, state, str(repo)))
+            self.assertFalse(loop_manager.resume_project_block_if_safe(
+                connection, repo, state, str(repo)))
+            saved = connection.execute('SELECT * FROM projects').fetchone()
+            self.assertEqual((saved['phase'], saved['planning_error'], saved['planner_session_id']),
+                             ('PLANNING', 'independent', 'saved'))
+            self.assertEqual(saved['agent_snapshot'], start.serialize())
+            self.assertEqual(saved['agent_result_snapshot'], result.serialize())
+            self.assertEqual(cache.read_bytes(), b'kept artifact')
 
     def test_legacy_snapshot_does_not_trust_unrecorded_exclude_rules(self):
         with tempfile.TemporaryDirectory() as directory:

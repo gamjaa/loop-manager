@@ -41,7 +41,9 @@ priority: high
 - [x] 2026-10-06 기준 de2c655609c667f6032eb3608116a801a806766f의 활성 명세·코드·테스트와 비종료 catalog를 대조함. 일반 persisted 정규화는 있으나 BLOCKED/raw 결과 비교와 동일 입력 planning_error gate의 누락을 확인함. 구현·테스트 실행은 하지 않음.
 - [x] 2026-10-07 구현 및 관련 targeted unit 검증: 저장 시작·역사 결과·BLOCKED 비교 view, 동일 입력 planning_error 재개와 단계·결과 보존을 구현함. 관련 회귀 109개 통과.
 - [x] 2026-10-07 Manager 전체 verify: 201개 모듈, 3,086개 성공·2개 skip, 종료 코드 0.
-- [ ] 읽기 전용 Review·사용자 Merge
+- [x] 2026-10-07 origin/main rebase 및 계획 대조 검토: 이미 최신 기준 60b956d에 있었으며, ignore 해제 규칙의 삭제 오분류·Planner PROJECT_BLOCKED 소유권 검사 누락·증명된 실행 격리에서의 단계 무효화를 재현하고 보완함. Manager checkpoint 비교도 역할별 생성·수정·삭제 회귀에 포함함.
+- [x] 2026-10-07 검토 보완 후 전체 verify 재실행: 201개 모듈, 3,090개 성공·2개 skip, 종료 코드 0. 같은 G-198 worktree에서 검증했으며 재개 단계·소유권 변경·독립 원인 보존 회귀가 통과함.
+- [ ] 사용자 Merge
 
 ## Decision Log
 

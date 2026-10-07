@@ -15,6 +15,40 @@ from tests.support.scoped_recovery import CurrentRebaseBlockFixture
 
 
 class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
+    def test_ignored_plan_release_preserves_stage_with_proven_invocation_isolation(self):
+        start = replace(self.before, dirty={'cache.bin': (('untracked',), 'old')})
+        result = replace(self.current, dirty={**self.current.dirty,
+                                             'cache.bin': (('untracked',), 'result')},
+                         worktrees=self.before.worktrees)
+        self.connection.execute("UPDATE exec_plans SET status = 'REVIEWING', "
+                                "agent_snapshot = ?, agent_result_snapshot = ?, "
+                                "verify_result = 'saved verify', verify_token = 'saved token'",
+                                (start.serialize(), result.serialize()))
+        self.connection.commit()
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan('repo', 'G-047', reason_code='managed_worktree_scope_violation',
+                           evidence='legacy ignored cache', release_fingerprint='same')
+        block = scoped_blocking.plan_block(self.connection, 'repo', 'G-047')
+        # This test isolates classification from the separately tested Git rule proof.
+        def normalize(_worktree, saved, _current, **_options):
+            return replace(saved, dirty={key: value for key, value in saved.dirty.items()
+                                         if key != 'cache.bin'})
+        with mock.patch.object(loop_manager, '_normalize_legacy_ignored_snapshot', side_effect=normalize):
+            observed = self.current
+            self.current = replace(observed, refs={**observed.refs,
+                'refs/heads/loop-manager/G-047': ('foreign', '')})
+            self.assertFalse(loop_manager._reconcile_scope_baseline_plan_block(
+                self.connection, self.repo_path, Path('/state'), 'repo', block))
+            self.assertEqual(dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-047')),
+                             dict(block))
+            self.current = observed
+            self.assertTrue(loop_manager._reconcile_scope_baseline_plan_block(
+                self.connection, self.repo_path, Path('/state'), 'repo', block))
+        resumed = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual((resumed['status'], resumed['verify_result'], resumed['verify_token']),
+                         ('REVIEWING', 'saved verify', 'saved token'))
+        self.assertEqual(resumed['agent_result_snapshot'], result.serialize())
+
     def test_related_plan_document_scope_block_resumes_without_discarding_worker(self):
         related_plan = 'docs/plans/[G-060] Project Root Placement Policy and Inventory.md'
         self.current = replace(self.current, dirty={
