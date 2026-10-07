@@ -34,11 +34,13 @@ Agent가 선택된 관리 worktree 밖의 파일과 shared Git metadata를 쓸 �
 
 Planner·Worker·Reviewer와 유지보수 Planner는 각 호출에서 선택된 관리 worktree를 workspace로 사용하며, provider의 내장 쓰기 제한을 우선 적용한다. 작업 디렉터리 지정만으로 제한이 적용됐다고 간주하지 않는다. 기본 source checkout, 다른 worktree와 shared Git metadata는 쓰기 허용 범위에 포함하지 않고, Reviewer는 선택된 worktree도 읽기 전용으로 사용한다. workspace 쓰기 허용은 해당 역할의 문서·파일 변경 범위를 확대하지 않으며, 기존 역할별 변경 검사는 유지한다. 필요한 임시 작업은 해당 실행에 소유권이 있는 제한된 경로에서만 허용한다.
 
+Codex를 기본 provider와 기능·검증 수준의 기준으로 삼고 Claude도 같은 기능을 제공하는 전제로 지원한다. provider별 명칭·설정·호출 방식의 차이는 해당 provider 정책으로 대응한다. Claude만 별도의 유료 계정 확보나 실제 모델 호출 성공을 지원 구현의 완료 조건으로 요구하지 않는다. 개발 환경에 Claude CLI·인증 계정이 없으면 공식 지원 정책과 설정 병합·역할별 경계를 검토하고 모의 호출로 검증하며, 실제 호출 검증은 이용 가능한 환경에서 추가한다. 실제 호출을 수행하지 못한 범위는 검증 결과에 명시하고 모의 테스트를 실계정 호출 성공으로 기록하지 않는다. Claude 지원의 미검증 범위나 실행 실패는 Codex의 독립적인 구현·검증·자동 실행을 막지 않으며, 선택된 Claude 프로젝트를 다른 provider로 임의 전환하지 않는다.
+
 Codex와 Claude의 자동 승인 검토는 쓰기 제한과 함께 유지한다. 쓰기 경계 확대와 격리 밖 재실행 요청은 자동 검토의 승인으로 허용할 수 없는 거부 대상으로 두고, 나머지 검토 대상은 provider의 자동 검토로 처리한다. 허용 범위 안의 모든 동작에 검토가 발생한다고 보장하지 않으며, 자동 검토가 비활성화된 설정이나 단순 편집 자동 승인 모드를 이 요구사항의 자동 검토 유지로 간주하지 않는다. Worker 결과에 대한 Loop Manager의 Reviewer 검토는 provider의 실행 전 승인 검토와 별개로 유지한다.
 
 새 호출에서 요구한 쓰기 제한과 자동 검토의 적용을 확인할 수 없거나, 격리 때문에 기존 허용 작업을 수행할 수 없으면 제한을 해제하거나 자동 검토를 끈 채 진행하지 않는다. 지원하지 않는 provider·운영체제·CLI 버전, 설정 충돌과 격리 초기화 실패의 구체적 원인을 남기고 작업물·session·재시도 이력을 보존한 채 해당 자동 실행을 중단한다. 내장 sandbox를 지원하지 않는 Claude native Windows는 이러한 미지원 환경으로 명확히 판정하며, 이 요구사항을 근거로 WSL·컨테이너 등 새로운 실행 infrastructure를 자동 도입하지 않는다. 격리 증거가 없는 과거 실행의 Git 판정은 기존 엄격 감시를 유지한다.
 
-격리 적용·거부와 실제 효력 확인 결과는 provider·CLI 버전·실행 환경·역할·선택된 canonical worktree·repository identity·유효 설정·Agent session 및 개별 호출에 결합해 보존한다. CLI 인자나 설정의 존재만으로 격리 확인을 기록하지 않는다. Codex의 직접 실행과 확인 범위는 R-050을 따른다. Agent의 파일 변경·도구 실행에 적용되는 내장 정책을 확인하며, Codex 프로세스 전체의 내부 쓰기·mount 상태나 중첩 sandbox 호환성을 추가 증명 조건으로 요구하지 않는다. 정상 인증·session·로그 저장과 기존 PRODUCT가 허용한 Codex 임시 ref는 Agent의 workspace 밖 쓰기 권한과 구분한다. Claude의 기존 경계 확인 요구는 유지한다. 세션 재개, provider·설정 변경과 중단 뒤의 새 호출에서는 다시 확인한다. 비밀값이나 source checkout의 로컬 파일 내용은 증거에 저장하지 않는다.
+격리 적용·거부와 실제 효력 확인 결과는 provider·CLI 버전·실행 환경·역할·선택된 canonical worktree·repository identity·유효 설정·Agent session 및 개별 호출에 결합해 보존한다. CLI 인자나 설정의 존재만으로 격리 확인을 기록하지 않는다. Codex의 직접 실행과 확인 범위는 R-050을 따른다. Agent의 파일 변경·도구 실행에 적용되는 내장 정책을 확인하며, Codex 프로세스 전체의 내부 쓰기·mount 상태나 중첩 sandbox 호환성을 추가 증명 조건으로 요구하지 않는다. 정상 인증·session·로그 저장과 기존 PRODUCT가 허용한 Codex 임시 ref는 Agent의 workspace 밖 쓰기 권한과 구분한다. Claude도 같은 확인 수준을 적용한다. 공식 지원 기능, 병합 후 유효 정책, 역할별 workspace·파일 도구·shared Git 보호 설정과 호출 연결을 확인하며, 유료 모델 호출로 금지 쓰기나 승인 검토를 매번 시연하는 절차는 시작 조건으로 요구하지 않는다. 실제 실행에서 확인된 미지원·정책 충돌·초기화 실패는 해당 호출을 중단하고 보존하며, 개발 환경의 CLI·계정 부재만으로 별도의 사용자 정책 결정이나 지원 구현 차단을 만들지 않는다. 세션 재개, provider·설정 변경과 중단 뒤의 새 호출에서는 다시 확인한다. 비밀값이나 source checkout의 로컬 파일 내용은 증거에 저장하지 않는다.
 
 Loop Manager 자신이 process lock 아래 수행한 fetch, 관리 worktree 생성·정리·rebase, source safe fast-forward와 runtime worktree 생성·정리는 각 작업의 소유 대상, 실행 전 기대 상태와 실행 뒤 실제 결과를 연결한 durable checkpoint로 증명한다. Agent 시작 snapshot 이후 Manager 작업이 있었다면, 해당 checkpoint와 실제 Git 상태가 정확히 일치하는 부분만 Agent 범위 판정 전에 기준선에 반영한다. Agent의 원래 허용 파일 변경과 session·실행 증거는 보존하며, 불완전한 checkpoint나 관측 OID만으로 Manager 소유권을 추정하지 않는다. Git 작업과 상태 저장 사이에 중단돼도 같은 증거로 재개하고, 다른 주체의 변화가 섞였으면 영향을 받는 작업을 차단한다.
 
@@ -85,9 +87,10 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 - runtime handoff는 해석한 `<base-branch>`, 현재 runtime SHA, fetch된 원격 SHA, self repository, Merge된 PR과 source sync 결과를 비밀값 없이 로그에 남기며 오류나 BLOCKED 알림으로 취급하지 않는다.
 - 자동 테스트는 `main`과 대체 base branch, 시작 시 equal bootstrap/runtime의 clean·dirty 진행, 시작 시 behind source의 clean·non-overlap dirty 갱신 후 runtime·PR 미시작, overlap dirty·ahead·diverged에서 구 bootstrap의 최신 runtime 실행 거부, 다음 실행의 최신 bootstrap/runtime 일치, Merge 직전 `PR_OPEN` mirror, 다중 Open PR 중 하나의 Merge, Agent 실행 중 bootstrap dirty 변화의 비귀속과 stale `default_worktree_mutation` 자동 해제, source dirty 상태의 managed rebase 지속, 실행 중 runtime보다 앞선 self Merge의 종료, 이미 최신 runtime에서 새로 확인한 Merge의 계속 실행, self Planner push 비트리거, 다른 clone·origin·runtime path 오인 방지, fetch 실패·non-fast-forward SHA 관계와 다중 프로젝트 scheduling 중 새 작업 미시작을 검증한다.
 - Agent 범위 테스트는 다른 local branch·tag·ref와 다른 worktree가 독립적으로 변경된 경우의 비차단, 실제 작업에 쓰는 ref·worktree 및 범위 밖 파일·index 변경의 차단, 격리 검증 실패 시 완화 거부, Manager rebase·fetch·worktree 작업 전후의 기준선 재조정, Git 작업과 checkpoint 저장 사이의 중단·재시작, Manager 변화와 영향권 외부 변화의 혼합, 기존 차단의 증거 기반 복구와 session·작업물 보존을 검증한다.
-- 각 역할의 신규 호출과 session 재개에서 workspace 및 허용 파일 쓰기와 source checkout·다른 worktree·shared Git metadata 쓰기 거부를 검증한다. Reviewer의 worktree 쓰기도 거부한다. Codex는 R-050의 직접 실행과 내장 정책 확인 범위를 적용하며, 파일 쓰기 제한과 R-064의 common+Reviewer 역할 instruction에 담긴 테스트 재실행 금지를 구분한다. Claude는 기존 provider 경계를 확인할 수 없으면 격리 확인을 기록하지 않는다.
+- 각 역할의 신규 호출과 session 재개에서 workspace 및 허용 파일 쓰기와 source checkout·다른 worktree·shared Git metadata 쓰기 거부를 검증한다. Reviewer의 worktree 쓰기도 거부한다. Codex는 R-050의 직접 실행과 내장 정책 확인 범위를 적용하며, 파일 쓰기 제한과 R-064의 common+Reviewer 역할 instruction에 담긴 테스트 재실행 금지를 구분한다. Claude도 Codex와 같은 기능·검증 수준으로 provider별 정책을 대응하며, 확인된 유효 정책과 실제 호출 결과를 구분해 기록한다.
 - Codex·Claude의 지원 환경에서 쓰기 경계 확대와 격리 밖 재실행은 거부하면서 나머지 승인 검토 대상의 자동 검토가 유지됨을 검증한다. 단순 편집 자동 승인으로 대체하거나 자동 검토를 전부 비활성화한 설정은 실패로 판정한다. 기존 Loop Manager Reviewer 흐름도 유지한다.
 - CLI 버전·provider·설정 변경, session 재개와 중단 뒤의 증거 재확인, 설정 충돌·격리 초기화 실패·Claude native Windows 미지원 시 안전 중단과 상태 보존, 증거 없는 과거 실행의 엄격 판정을 검증한다. 확인·거부 기록에는 비밀값과 source checkout의 로컬 파일 내용을 포함하지 않는다.
+- Claude CLI·유료 계정이 없는 개발 환경에서도 공식 정책에 대응하는 설정·호출 구성과 모의 테스트로 지원 구현을 검증할 수 있다. 신규·재개·fallback의 역할별 쓰기 제한, 명령과 파일 도구의 shared Git 보호, 자동 승인 검토 유지 및 권한 확대 거부를 확인한다. 실제 호출 검증 미수행은 명시하되 구현 완료나 독립 Codex 작업의 차단 사유로 삼지 않는다. 실제 Claude 호출에서 관측한 인증·지원·정책 오류는 상태를 보존하고 해당 호출에 한해 처리한다.
 - 전체 verify에서 exact-SHA runtime bootstrap, process lock, Manager runtime scope reconciliation, PR conflict recovery, source checkout 보존과 origin-only Planner·Worker 입력 규칙이 유지된다.
 
 ## Product Impact
@@ -99,6 +102,7 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 - source checkout을 갱신할 수 없는 로컬 상태는 시작·복구 시점 모두 원격 bootstrap·runtime과 관리 worktree 작업을 막지 않는다.
 - bootstrap이 이미 원격 base revision이면 dirty 상태를 정리하지 않고 실행하며, Agent 실행 중 bootstrap 파일 상태가 바뀌어도 관리 worktree 위반으로 오인하거나 과거 signature에 프로젝트를 영구 차단하지 않는다.
 - Agent 범위 검사는 현재 계획의 안전에 필요한 Git 상태로 제한된다. 무관한 branch·worktree 변화는 실행을 막지 않고, Manager 소유 Git 작업은 검증된 checkpoint로 재개되며, 실제 영향권 위반은 계속 차단된다.
+- Codex를 기본과 기능·검증 기준으로 삼고 Claude는 같은 기능을 provider별 정책으로 대응한다. 개발 환경의 Claude CLI·계정 부재만으로 지원 구현이나 독립 Codex 작업을 차단하지 않는다.
 - provider의 내장 workspace 쓰기 제한과 자동 승인 검토를 함께 사용한다. 격리 밖 쓰기 권한을 자동 승인하지 않으며, 지원하지 않거나 확인할 수 없는 환경에서는 상태를 보존하고 자동 실행을 멈춘다.
 
 ## Non-Goals
