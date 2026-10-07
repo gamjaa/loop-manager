@@ -189,9 +189,10 @@ def reconcile_runtime_snapshot(
     original: GitSnapshot,
     current: GitSnapshot,
     runtime_path: str,
+    base_branch: str = "main",
 ) -> GitSnapshot:
-    """Carry only the verified parent runtime and origin/main delta forward."""
-    ref = "refs/remotes/origin/main"
+    """Carry only the verified parent runtime and registered base delta forward."""
+    ref = f"refs/remotes/origin/{base_branch}"
     worktrees = dict(snapshot.worktrees)
     refs = dict(snapshot.refs)
     if snapshot.worktrees.get(runtime_path) == original.worktrees.get(runtime_path):
@@ -202,6 +203,10 @@ def reconcile_runtime_snapshot(
     if (
         original.refs.get(symbolic_head) != current.refs.get(symbolic_head)
         and snapshot.refs.get(symbolic_head) == original.refs.get(symbolic_head)
+        and original.refs.get(ref) is not None
+        and original.refs.get(symbolic_head) == (original.refs[ref][0], ref)
+        and current.refs.get(ref) is not None
+        and current.refs.get(symbolic_head) == (current.refs[ref][0], ref)
     ):
         refs[symbolic_head] = current.refs[symbolic_head]
     return replace(snapshot, worktrees=worktrees, refs=refs)
@@ -320,8 +325,9 @@ def decide_persisted_scope(
     if manager_runtime is not None:
         runtime_path, runtime_sha = manager_runtime
         registration = current.worktrees.get(runtime_path)
-        origin = current.refs.get("refs/remotes/origin/main")
-        previous_origin = before.refs.get("refs/remotes/origin/main")
+        ref = f"refs/remotes/origin/{base_branch}"
+        origin = current.refs.get(ref)
+        previous_origin = before.refs.get(ref)
         previous_head = before.refs.get("refs/remotes/origin/HEAD")
         current_head = current.refs.get("refs/remotes/origin/HEAD")
         previous_registration = before.worktrees.get(runtime_path)
@@ -338,22 +344,22 @@ def decide_persisted_scope(
             or not registration_matches
             or (previous_head != current_head and (
                 previous_origin is None
-                or previous_head != (previous_origin[0], "refs/remotes/origin/main")
-                or current_head != (runtime_sha, "refs/remotes/origin/main")
+                or previous_head != (previous_origin[0], ref)
+                or current_head != (runtime_sha, ref)
             ))
         ):
             raise ScopeDecisionError(
                 f"runtime 기준선 증거가 일치하지 않습니다: {runtime_path} sha={runtime_sha}"
             )
         original_before = before
-        before = reconcile_runtime_snapshot(before, original_before, current, runtime_path)
+        before = reconcile_runtime_snapshot(before, original_before, current, runtime_path, base_branch)
         if result is not None:
-            result = reconcile_runtime_snapshot(result, original_before, current, runtime_path)
+            result = reconcile_runtime_snapshot(result, original_before, current, runtime_path, base_branch)
         if checkpoint is not None:
             checkpoint = replace(
                 checkpoint,
                 snapshot=reconcile_runtime_snapshot(
-                    checkpoint.snapshot, original_before, current, runtime_path,
+                    checkpoint.snapshot, original_before, current, runtime_path, base_branch,
                 ),
             )
 

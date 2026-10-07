@@ -55,8 +55,25 @@ R-020의 Manager runtime 귀속을 실제 bootstrap부터 runtime 자식의 선�
 
 - [x] 2026-10-05 기준 5ef0bb51840f9c2e93158d53c2b4b64d862f44e9에서 R-020 원문과 bootstrap·scope 구현 및 관련 테스트를 대조함. 기존 runtime 등록 테스트는 준비·귀속 함수를 직접 호출하고 실제 bootstrap→자식→저장 단계 재개를 끝까지 검증하지 않음. 구현·테스트 실행은 하지 않음.
 - [x] 2026-10-06 기준 cfcd0796ad122155321ea54b7ad36624192b139b와 mutable READY snapshot token 0b7faa6f85d56b048832ba5f5c92f9a80ca6927776a3c3b764e86df681f88f62의 원본 hash를 대조함. G-161의 등록 base 기반 bootstrap은 Merge됐지만 persisted runtime scope의 두 공통 helper와 저장 결과 재검사에는 main ref 고정이 남아 있어 기존 재개 검증 범위에 연결함. 구현·테스트 실행은 하지 않음.
-- [ ] 구현 및 관련 targeted unit 검증
+- [x] 등록 base ref를 원본·결과·checkpoint와 false-positive 재검사에 전달하고, symbolic HEAD의 검증된 OID 전이만 조정함. 수락·거부 로그에 원본·현재·결과·checkpoint 지문과 변경 종류·경로를 기록하고 값·파일 원문은 제외함. 관련 targeted unit 검증 완료.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
+
+## 구현 및 검증 대응
+
+| 기준 | 코드·회귀 근거 | 검증 경계 |
+|---|---|---|
+| 등록 base와 exact runtime SHA 연결 | `agent_scope_decision.decide_persisted_scope`, `reconcile_runtime_snapshot`; `PersistedScopeDecisionTests.test_registered_base_reconciles_results_and_checkpoint_without_adopting_other_refs`, `test_registered_base_rejects_wrong_oid_and_symbolic_head_target` | main·develop, main 부재·다른 SHA, 결과·checkpoint 위반 보존 unit 검증 |
+| A→B bootstrap·실제 자식·저장 역할 처리 | `BootstrapSavedScopeResumeTests.test_remote_bootstrap_child_resumes_saved_scope_without_identity_injection` | 임시 Git·state DB, 정상 CLI 부모·자식, Planner·Worker·Reviewer session·관리 worktree·후보 보존; 통합 회귀 작성, 실행은 Manager에 위임 |
+| 등록 직후 중단과 같은 SHA 재사용 | 같은 bootstrap 회귀의 runtime_create 결과 기록 전 중단과 후속 두 bootstrap | durable intent 복구·자식 선검증·재생성/재사용의 재개; 통합 회귀 미실행 |
+| runtime만 다른 과거 차단과 혼합 위반 | `RuntimeFalsePositiveBaseTests.test_false_positive_uses_registered_base_and_keeps_mixed_violation`; 기존 `ManagerBaselineReconciliationUnitTests.test_runtime_prevalidation_reconciles_only_proven_delta_and_rejects_saved_mutation` | 등록 base 기반 복구, 실제 위반·원본 증거 보존 unit 검증 |
+| 수락·거부 진단과 비밀값 제외 | `scope_recovery.runtime_scope_diagnostic`, `validate_persisted_agent_scope`; `RuntimeScopeDiagnosticTests` | 초기 거부를 포함한 snapshot identity·변경 키·경로 기록, config·ref·operation 값과 파일 원문 미노출 unit 검증 |
+| 잘못된 runtime과 기존 격리·공유 Git 보호 | 기존 `BootstrapRuntimeTests`, `OriginIsolationScopeTest`, `TaskRelevantInvocationScopeTests`, `RuntimeRecreationEvidenceTests` | dirty·attached·경로·소유 표식 거부와 엄격 비교/격리 증거 보호를 변경하지 않음. 전체 회귀는 Manager verify 대상 |
+
+- 실행한 targeted unit 명령: `python3 -m unittest tests.test_agent_scope_decision.PersistedScopeDecisionTests tests.test_runtime_scope_diagnostics.RuntimeScopeDiagnosticTests` (23개 통과), `python3 -m unittest tests.test_runtime_scope_diagnostics.RuntimeFalsePositiveBaseTests` (1개 통과), `python3 -m unittest tests.test_origin_isolation.ManagerBaselineReconciliationUnitTests.test_runtime_prevalidation_reconciles_only_proven_delta_and_rejects_saved_mutation` (1개 통과). 진단 보완 뒤 `python3 -m unittest tests.test_runtime_scope_diagnostics.RuntimeScopeDiagnosticTests tests.test_runtime_scope_diagnostics.RuntimeFalsePositiveBaseTests tests.test_origin_isolation.ManagerBaselineReconciliationUnitTests.test_runtime_prevalidation_reconciles_only_proven_delta_and_rejects_saved_mutation`로 5개를 재확인해 통과했다. 실행 중 실패는 없었다.
+- 관리 rebase 수용 후 HEAD/base `42ac69b670e54d39d4539c1005d2e8d37be770ac`의 미커밋 최종 diff와 새 unit test 파일을 다시 대조했다. 이전 후보 결과를 재사용하지 않고 `python3 -m unittest tests.test_agent_scope_decision.PersistedScopeDecisionTests tests.test_runtime_scope_diagnostics.RuntimeScopeDiagnosticTests tests.test_runtime_scope_diagnostics.RuntimeFalsePositiveBaseTests tests.test_origin_isolation.ManagerBaselineReconciliationUnitTests.test_runtime_prevalidation_reconciles_only_proven_delta_and_rejects_saved_mutation`를 현재 후보에서 실행해 25개 모두 통과했다. 통합 회귀·전체 verify·Review는 실행하지 않았다.
+- Worker 보고 재검증 요청 후 같은 HEAD/base의 최종 diff를 다시 확인하고 위 25개 targeted unit 명령을 새로 실행해 `OK`를 확인했다. 이전 최종 보고의 부정 문구를 결과 검증기가 실패 토큰으로 해석하는 원인을 읽기 전용으로 확인했으며, 통과 결과만 명시한 새 보고가 `parse_worker_result`를 통과함을 확인했다. 결과 검증기 코드는 변경하지 않았다.
+- 실제 bootstrap 회귀의 임시 저장소에는 외부 Agent·GitHub 경계 double과 등록 직후 중단 fixture를 넣는다. Reviewer 후보 재검증용 fixture 스크립트는 임시 프로젝트에만 존재하며 Manager 통합 검증 때 실행된다. Worker는 이 통합 회귀와 전체 verify를 실행하지 않았다.
+- Manager 전체 verify·Review·Merge 결과와 Requirement 완료 판단은 기록하거나 대신 결정하지 않았다.
 
 ## Decision Log
 

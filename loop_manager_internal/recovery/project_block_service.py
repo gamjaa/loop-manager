@@ -24,6 +24,7 @@ from loop_manager_internal.storage import execution_checkpoint_state
 from loop_manager_internal.storage import recovery_state
 from loop_manager_internal.storage import runtime_state
 from pathlib import Path
+import hashlib
 import sqlite3
 
 
@@ -283,8 +284,15 @@ def reconcile_false_positive_runtime_block(
         saved_worktree = Path(str(project["worktree"] or repo))
         current = effects.capture_git_snapshot(saved_worktree)
         runtime_path = str(effects._canonical_path(runtime_mutation.path))
+        effects.operation_log(
+            "runtime 차단 비교: "
+            f"before={hashlib.sha256(before.serialize().encode()).hexdigest()[:16]} "
+            f"result={hashlib.sha256(result.serialize().encode()).hexdigest()[:16]} "
+            f"current={hashlib.sha256(current.serialize().encode()).hexdigest()[:16]} "
+            f"path={runtime_path} sha={runtime_mutation.commit_sha}"
+        )
         expected = agent_scope_decision.reconcile_runtime_snapshot(
-            before, before, current, runtime_path,
+            before, before, current, runtime_path, str(project["base_branch"]),
         )
         if result != current:
             effects.operation_log(

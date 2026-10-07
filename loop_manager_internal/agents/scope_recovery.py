@@ -136,7 +136,77 @@ def _diagnosed_blocked_commit_allowances(
     )
 
 
+def runtime_scope_diagnostic(before: GitSnapshot | None, current: GitSnapshot | None,
+                             mutation: RuntimeMutation, *, accepted: bool,
+                             result: GitSnapshot | None = None,
+                             checkpoint: GitSnapshot | None = None) -> str:
+    """Report identities and changed keys, never snapshot values or file contents."""
+    def identity(snapshot):
+        return hashlib.sha256(snapshot.serialize().encode()).hexdigest()[:16] if snapshot else "unavailable"
+    def delta(observed):
+        changes = []
+        if before is not None and observed is not None:
+            for label in ("refs", "worktrees", "config", "operations", "index", "dirty"):
+                older, newer = getattr(before, label), getattr(observed, label)
+                changed = sorted(key for key in older.keys() | newer.keys()
+                                 if older.get(key) != newer.get(key))
+                if changed:
+                    changes.append(f"{label}={','.join(changed[:8])}")
+            changes.extend(key for key in ("head", "branch")
+                           if getattr(before, key) != getattr(observed, key))
+        return '; '.join(changes) or ('none' if observed is not None else 'unavailable')
+    return (f"runtime scope {'수락' if accepted else '거부'}: "
+            f"before={identity(before)} current={identity(current)} "
+            f"result={identity(result)} checkpoint={identity(checkpoint)} "
+            f"path={mutation.path} sha={mutation.commit_sha} "
+            f"delta={delta(current)} result_delta={delta(result)} checkpoint_delta={delta(checkpoint)}")
+
+
 def validate_persisted_agent_scope(
+    connection: sqlite3.Connection, repo_path: Path, state_dir: Path, repo: str, *,
+    allow_planner_worktree_correction: bool = False,
+    manager_cleanup_worktrees: frozenset[str] = frozenset(),
+    runtime_mutation: RuntimeMutation | None = None,
+    effects: ScopeRecoveryEffects,
+) -> GitSnapshot | None:
+    before = current = saved_result = saved_checkpoint = None
+    diagnose = (runtime_mutation is not None
+                and _canonical_path(repo_path) == _canonical_path(runtime_mutation.source))
+    if diagnose:
+        # Capture original evidence before any reconciliation or early rejection.
+        project = effects.repository(connection).scope_owner(repo)
+        if project is not None and project['agent_snapshot']:
+            try:
+                before = GitSnapshot.deserialize(str(project['agent_snapshot']))
+                if 'agent_result_snapshot' in project.keys() and project['agent_result_snapshot']:
+                    saved_result = GitSnapshot.deserialize(str(project['agent_result_snapshot']))
+                if 'agent_manager_snapshot' in project.keys() and project['agent_manager_snapshot']:
+                    saved_checkpoint = ManagerGitCheckpoint.deserialize(str(project['agent_manager_snapshot'])).snapshot
+                worktree = Path(str(project['worktree'] or repo))
+                if worktree.is_dir():
+                    current = effects.capture_git_snapshot(worktree)
+            except (RuntimeError, ValueError, TypeError, KeyError, OSError):
+                pass  # Diagnostic availability must not change the validation verdict.
+    try:
+        result = _validate_persisted_agent_scope(
+            connection, repo_path, state_dir, repo,
+            allow_planner_worktree_correction=allow_planner_worktree_correction,
+            manager_cleanup_worktrees=manager_cleanup_worktrees,
+            runtime_mutation=runtime_mutation, effects=effects)
+    except (RuntimeError, ValueError, KeyError, OSError):
+        if diagnose:
+            effects.operation_log(runtime_scope_diagnostic(before, current, runtime_mutation,
+                                                          accepted=False, result=saved_result,
+                                                          checkpoint=saved_checkpoint), error=True)
+        raise
+    if diagnose:
+        effects.operation_log(runtime_scope_diagnostic(before, current, runtime_mutation,
+                                                      accepted=True, result=saved_result,
+                                                      checkpoint=saved_checkpoint))
+    return result
+
+
+def _validate_persisted_agent_scope(
     connection: sqlite3.Connection,
     repo_path: Path,
     state_dir: Path,
@@ -480,21 +550,14 @@ def validate_persisted_agent_scope(
             # The runtime identity and exact registration were checked above.
             # Carry only unchanged original keys; retain actual Agent mutations.
             comparison = agent_scope_decision.reconcile_runtime_snapshot(
-                comparison, original, current, manager_runtime[0])
+                comparison, original, current, manager_runtime[0], str(project["base_branch"]))
             actual_result = agent_scope_decision.reconcile_runtime_snapshot(
-                actual_result, original, current, manager_runtime[0])
+                actual_result, original, current, manager_runtime[0], str(project["base_branch"]))
         effects.validate_agent_scope(role_name, saved_worktree, comparison, actual_result,
             selected_plan_path=selected_plan_path if role_name == 'worker' else None,
             allowed_guidance_targets=guidance_targets, allow_common_plans=allow_common_plans,
             allowed_requirement_archives=archive_sources,
             external_worktree=repo_path, base_branch=str(project['base_branch']), resources=resources)
-    if manager_runtime is not None:
-        effects.operation_log(
-            "runtime scope 기준선 검증: "
-            f"before={hashlib.sha256(before.serialize().encode()).hexdigest()[:16]} "
-            f"current={hashlib.sha256(current.serialize().encode()).hexdigest()[:16]} "
-            f"path={manager_runtime[0]} sha={manager_runtime[1]}"
-        )
     for check in decision.checks:
         try:
             check_refs = check.allowed_refs
