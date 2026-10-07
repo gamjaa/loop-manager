@@ -51,6 +51,34 @@ def begin_agent_scope(
     row = effects.repository(connection).scope_owner(repo)
     if row is None:
         raise RuntimeError("Agent scope를 저장할 프로젝트가 없습니다.")
+    if row['agent_snapshot'] and row['agent_role'] == 'reviewer' and role_name == 'worker':
+        # Rebase requires a new Worker turn. Recheck the preserved Reviewer
+        # output and live Manager result before beginning a distinct scope.
+        plan_id = effects._plan_id_from_path(str(row['plan_path'] or ''))
+        scope_state_dir = state_dir or effects._owned_rebase_state_dir(repo, plan_id, worktree)
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id or '')
+        if (scope_state_dir is None or not plan_id
+                or not (checkpoint.snapshot or {}).get('current_rebase_acceptance')):
+            raise RuntimeError('Reviewer scope에서 Worker 재검증으로 전환할 rebase 증거가 없습니다.')
+        _, verdict = effects._current_rebase_service(
+            connection, Path(repo), scope_state_dir, repo, plan_id,
+            worktree, row['branch']).require_owned(checkpoint=checkpoint)
+        if verdict.status is not managed_rebase_adoption.RebaseStatus.COMPLETE:
+            raise RuntimeError('Reviewer scope의 관리 rebase가 완료되지 않았습니다.')
+        original = GitSnapshot.deserialize(str(row['agent_snapshot']))
+        current = effects.capture_git_snapshot(worktree)
+        if row['agent_result_snapshot']:
+            effects.validate_agent_scope('reviewer', worktree, original,
+                GitSnapshot.deserialize(str(row['agent_result_snapshot'])),
+                external_worktree=Path(repo), base_branch=row['base_branch'], connection=connection)
+        baseline = managed_rebase_adoption.selected_baseline(
+            original, current, row['branch'], str(worktree.resolve()), publication=checkpoint)
+        effects.validate_agent_scope('reviewer', worktree, baseline, current,
+            external_worktree=Path(repo), base_branch=row['base_branch'], connection=connection)
+        managed_rebase_adoption.remember_agent_baseline(
+            execution_checkpoint_state.ExecutionCheckpointRepository(connection),
+            repo, plan_id, original, baseline, 'reviewer')
+        row = {**dict(row), 'agent_snapshot': None}
     if row["agent_snapshot"]:
         if row["agent_role"] != role_name:
             raise RuntimeError(

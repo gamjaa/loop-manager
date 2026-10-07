@@ -63,7 +63,7 @@ R-020의 Manager runtime 귀속을 실제 bootstrap부터 runtime 자식의 선�
 | 기준 | 코드·회귀 근거 | 검증 경계 |
 |---|---|---|
 | 등록 base와 exact runtime SHA 연결 | `agent_scope_decision.decide_persisted_scope`, `reconcile_runtime_snapshot`; `ManagerBaselineReconciliationUnitTests.test_runtime_prevalidation_persists_all_operands_and_is_idempotent`; `PersistedScopeDecisionTests.test_registered_base_reconciles_results_and_checkpoint_without_adopting_other_refs`, `test_registered_base_rejects_wrong_oid_and_symbolic_head_target` | main·develop, main 부재·다른 SHA, 결과·checkpoint 위반 보존 unit 검증 |
-| A→B bootstrap·실제 자식·저장 역할 처리 | `BootstrapSavedScopeResumeTests.test_remote_bootstrap_child_resumes_saved_scope_without_identity_injection`; `BootstrapSavedScopeFixtureUnitTests` | 임시 Git·state DB, 정상 CLI 부모·자식, Planner·Worker·Reviewer session·관리 worktree·후보 보존; 통합 회귀 작성, 실행은 Manager에 위임 |
+| A→B bootstrap·실제 자식·저장 역할 처리 | `BootstrapSavedScopeResumeTests.test_remote_bootstrap_child_resumes_saved_scope_without_identity_injection`; `BootstrapSavedScopeFixtureUnitTests`, `ReviewerRebaseScopeHandoffUnitTests` | 임시 Git·state DB, 정상 CLI 부모·자식, Planner·Worker·Reviewer session·관리 worktree·후보 보존; 통합 회귀 작성, 실행은 Manager에 위임 |
 | 등록 직후 중단과 같은 SHA 재사용 | 같은 bootstrap 회귀의 runtime_create 결과 기록 전 중단과 후속 두 bootstrap | durable intent 복구·자식 선검증·재생성/재사용의 재개; 통합 회귀 미실행 |
 | runtime만 다른 과거 차단과 혼합 위반 | `RuntimeFalsePositiveBaseTests.test_false_positive_uses_registered_base_and_keeps_mixed_violation`; 기존 `ManagerBaselineReconciliationUnitTests.test_runtime_prevalidation_reconciles_only_proven_delta_and_rejects_saved_mutation` | 등록 base 기반 복구, 실제 위반·원본 증거 보존 unit 검증 |
 | 수락·거부 진단과 비밀값 제외 | `scope_recovery.runtime_scope_diagnostic`, `validate_persisted_agent_scope`; `RuntimeScopeDiagnosticTests` | 초기 거부를 포함한 snapshot identity·변경 키·경로 기록, config·ref·operation 값과 파일 원문 미노출 unit 검증 |
@@ -83,6 +83,11 @@ R-020의 Manager runtime 귀속을 실제 bootstrap부터 runtime 자식의 선�
 - 현재 HEAD `8870205069da458aa9d8fb2848f8549911c994f0`의 base `42ac69b670e54d39d4539c1005d2e8d37be770ac` 대비 전체 diff와 이번 보완을 다시 확인했다. `python3 -m unittest tests.test_origin_isolation.ManagerBaselineReconciliationUnitTests.test_runtime_prevalidation_persists_all_operands_and_is_idempotent tests.test_origin_isolation.ManagerBaselineReconciliationUnitTests.test_runtime_prevalidation_reconciles_only_proven_delta_and_rejects_saved_mutation tests.test_bootstrap_runtime.BootstrapSavedScopeFixtureUnitTests tests.test_agent_scope_decision.PersistedScopeDecisionTests tests.test_runtime_scope_diagnostics.RuntimeScopeDiagnosticTests tests.test_runtime_scope_diagnostics.RuntimeFalsePositiveBaseTests`를 실행했다. 새 unit의 DB schema 초기화 누락을 수정하고 동일 명령을 재실행해 최종 27개 `OK`를 확인했다. main·develop의 세 저장 operand 영속화와 중복 갱신 방지, 실제 ref 위반 거부 시 모든 원본 필드 보존을 확인했다. 통합 회귀·전체 verify·Review는 실행하지 않았다.
 
 - 관리 rebase 수용 후 HEAD `139c272b081ad5b96a352f7dcf7b9632d3a98b14`와 base `418e8cec1b77f10bf017ea9d1b32b4459267f45c` 대비 최종 diff 및 현재 근거 입력을 다시 확인했다. 전달된 진단은 기존 로그이며 결과·checkpoint 동시 영속화와 Planner `active_sha` 보완이 현재 후보에 유지됨을 확인했다. 위 27개 targeted unit 명령을 현재 후보에서 새로 실행해 `Ran 27 tests`, `OK`와 종료 코드 0을 확인했다. 추가 코드 변경과 통합 회귀·전체 verify·Review 실행은 하지 않았다.
+
+
+- 후속 진단에서 Worker scope 수락 뒤 모델 목록 조회가 외부 CLI 경계 double을 우회하는 fixture 결함을 확인해 임시 child의 `codex_model_efforts`도 대체했다. Planner의 scope는 원격 planning rebase·호출 결과 검사 뒤 정상 종료되므로 첫 재개에는 scope 수락을, 두 번째 실행에는 실제 runtime 검증과 같은 역할·session·worktree를 확인한다.
+- Reviewer scope가 남은 상태에서 base rebase가 후보를 WORKING으로 돌리면 격리 증거를 단계 불일치로 버리고 source 갱신을 다시 위반으로 보는 연결 결함을 수정했다. scope·호출·session 격리 검증과 실제 소유 rebase의 COMPLETE 재확인이 모두 통과한 경우에만 기존 Reviewer 자원 판정을 사용한다. 새 Worker scope를 시작하기 전 저장 Reviewer 결과와 현재 Manager 결과를 검증하고 기존 checkpoint 비교 이력에 남긴다. 미완료·증거 없는 rebase와 실제 Reviewer 위반은 전환하지 않는다. Reviewer의 읽기 전용 규칙·Agent 쓰기 권한은 유지한다.
+- 현재 HEAD `67146dfe6360f271df4901ee567f7e53d233c6fe`와 base `418e8cec1b77f10bf017ea9d1b32b4459267f45c`의 전체 diff·계획·근거를 확인했다. 기존 27개 targeted unit 명령에 `tests.test_bootstrap_runtime.ReviewerRebaseScopeHandoffUnitTests`를 추가해 28개를 실행했다. 새 fixture의 checkpoint 필수 인자 누락을 수정한 뒤 동일 명령을 재실행해 최종 28개 `OK`와 종료 코드 0을 확인했다. 통합 회귀·전체 verify·Review는 실행하지 않았다.
 
 ## Decision Log
 

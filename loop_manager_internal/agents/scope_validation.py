@@ -99,6 +99,18 @@ def _agent_git_resources(
             safety = scoped_blocking.project_block(connection, repo)
             phase = str(safety['previous_phase'] or '') if safety is not None else ''
         owned_branch = owner['branch'] if role in {'worker', 'reviewer'} else saved.branch
+        if role == 'reviewer' and phase in {'WORKING', 'IMPLEMENTING'} and plan_id:
+            # A base refresh invalidates the candidate stages before the
+            # completed read-only Reviewer scope has been retired. Keep its
+            # invocation-bound monitoring only with a live, owned rebase.
+            state_dir = effects._owned_rebase_state_dir(repo, plan_id, worktree)
+            if state_dir is not None:
+                checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id)
+                _, verdict = effects._current_rebase_service(
+                    connection, repo_path, state_dir, repo, plan_id, worktree,
+                    owned_branch).require_owned(checkpoint=checkpoint)
+                if verdict.status is managed_rebase_validation.RebaseStatus.COMPLETE:
+                    phase = 'REVIEWING'
         resources = agent_scope_decision.used_git_resources(
             role=role, phase=phase, base_branch=str(project['base_branch']),
             branch=owned_branch, worktree_key=str(_canonical_path(worktree)),
