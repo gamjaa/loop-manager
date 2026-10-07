@@ -71,6 +71,31 @@ def batch_prompt(prompts: list[str], prefix: str) -> str:
     )
 
 
+def _process_receipts(output, prefix, receipt_identity, units, unit_identity,
+                     missing_message, validate_and_save, fail, handled_errors):
+    """Apply a batch envelope while preserving independently resumable units."""
+    expected = {unit_identity(unit) for unit in units}
+    try:
+        receipts = batch_outputs(output, prefix, receipt_identity, expected)
+    except BatchResultError as error:
+        for unit in units:
+            fail(unit, str(error))
+        return 0, [str(error)]
+
+    accepted, errors = 0, []
+    for unit in units:
+        key = unit_identity(unit)
+        try:
+            if key not in receipts:
+                raise BatchResultError(missing_message(key))
+            validate_and_save(unit, receipts[key])
+            accepted += 1
+        except handled_errors as error:
+            fail(unit, str(error))
+            errors.append(str(error))
+    return accepted, errors
+
+
 class MaintenanceAssessmentBatches:
     def __init__(self, ports):
         self.ports = ports
@@ -104,6 +129,9 @@ class MaintenanceAssessmentBatches:
     @staticmethod
     def _progress():
         return PlanningOutcome(PlanningOutcomeKind.ASSESSMENT_PROGRESS)
+
+    def _receipt_outcome(self, errors):
+        return self._failure(BatchResultError("\n".join(errors))) if errors else self._progress()
 
     def review_files(self, run, worktree):
         context, port = run.context, self.ports.file_review
@@ -148,30 +176,26 @@ class MaintenanceAssessmentBatches:
                               units[0].session_id, save_session)
         if isinstance(result, PlanningOutcome):
             return result
+
+        def validate_and_save(unit, receipt):
+            content = port.content(context.repo_path, context.base_branch, unit.source)
+            parsed = files.parse_review(receipt, unit.source, content,
+                                        source_paths=progress.source_paths)
+            port.complete(context.repo, run.maintenance_cycle.revision, unit.source, parsed)
+
         try:
-            receipts = batch_outputs(result.message, files.RESULT_PREFIX, "path",
-                                     {unit.source.path for unit in units})
-        except BatchResultError as error:
-            for unit in units:
-                port.fail(context.repo, run.maintenance_cycle.revision, unit.source, str(error))
+            accepted, errors = _process_receipts(
+                result.message, files.RESULT_PREFIX, "path", units,
+                lambda unit: unit.source.path,
+                lambda key: f"일괄 검토 결과 누락: {key}", validate_and_save,
+                lambda unit, error: port.fail(context.repo, run.maintenance_cycle.revision,
+                                              unit.source, error),
+                (BatchResultError, files.FileReviewError),
+            )
+        except SourceInventoryError as error:
             return self._failure(error)
-        errors, accepted = [], 0
-        for unit in units:
-            try:
-                if unit.source.path not in receipts:
-                    raise BatchResultError(f"일괄 검토 결과 누락: {unit.source.path}")
-                content = port.content(context.repo_path, context.base_branch, unit.source)
-                parsed = files.parse_review(receipts[unit.source.path], unit.source, content,
-                                            source_paths=progress.source_paths)
-                port.complete(context.repo, run.maintenance_cycle.revision, unit.source, parsed)
-                accepted += 1
-            except SourceInventoryError as error:
-                return self._failure(error)
-            except (BatchResultError, files.FileReviewError) as error:
-                port.fail(context.repo, run.maintenance_cycle.revision, unit.source, str(error))
-                errors.append(str(error))
         self.ports.events.log(f"유지보수 파일 검토 저장: {accepted}/{len(units)}개")
-        return self._failure(BatchResultError("\n".join(errors))) if errors else self._progress()
+        return self._receipt_outcome(errors)
 
     def review_relations(self, run, worktree, progress):
         context, port = run.context, self.ports.reconciliation
@@ -213,28 +237,26 @@ class MaintenanceAssessmentBatches:
         result = self._invoke(run, worktree, prompts, relations.RELATION_PREFIX, units[0][1], save_session)
         if isinstance(result, PlanningOutcome):
             return result
+
+        def validate_and_save(item, receipt):
+            relation, _ = item
+            left = port.content(context.repo_path, context.base_branch, relation.left)
+            right = port.content(context.repo_path, context.base_branch, relation.right)
+            parsed = relations.parse_relation(receipt, relation, left, right)
+            port.complete(context.repo, run.maintenance_cycle.revision, relation, parsed)
+
         try:
-            receipts = batch_outputs(result.message, relations.RELATION_PREFIX, "key",
-                                     {relation.key for relation, _ in units})
-        except BatchResultError as error:
-            for relation, _ in units:
-                port.fail(context.repo, run.maintenance_cycle.revision, relation, str(error))
+            _, errors = _process_receipts(
+                result.message, relations.RELATION_PREFIX, "key", units,
+                lambda item: item[0].key,
+                lambda key: f"관계 결과 누락: {key}", validate_and_save,
+                lambda item, error: port.fail(context.repo, run.maintenance_cycle.revision,
+                                              item[0], error),
+                (BatchResultError, relations.ReconciliationError, files.FileReviewError),
+            )
+        except SourceInventoryError as error:
             return self._failure(error)
-        errors = []
-        for relation, _ in units:
-            try:
-                if relation.key not in receipts:
-                    raise BatchResultError(f"관계 결과 누락: {relation.key}")
-                left = port.content(context.repo_path, context.base_branch, relation.left)
-                right = port.content(context.repo_path, context.base_branch, relation.right)
-                parsed = relations.parse_relation(receipts[relation.key], relation, left, right)
-                port.complete(context.repo, run.maintenance_cycle.revision, relation, parsed)
-            except SourceInventoryError as error:
-                return self._failure(error)
-            except (BatchResultError, relations.ReconciliationError, files.FileReviewError) as error:
-                port.fail(context.repo, run.maintenance_cycle.revision, relation, str(error))
-                errors.append(str(error))
-        return self._failure(BatchResultError("\n".join(errors))) if errors else self._progress()
+        return self._receipt_outcome(errors)
 
     def synthesize(self, run, worktree, progress, page):
         context, port = run.context, self.ports.reconciliation
@@ -314,21 +336,15 @@ class MaintenanceAssessmentBatches:
                               first.session_id, save_session)
         if isinstance(result, PlanningOutcome):
             return result
-        try:
-            receipts = batch_outputs(result.message, relations.RESOLUTION_PREFIX, "key",
-                                     {unit.assessment["key"] for unit in units})
-        except BatchResultError as error:
-            for unit in units:
-                port.resolution_fail(context.repo, unit, str(error))
-            return self._failure(error)
-        errors = []
-        for unit in units:
-            try:
-                key = unit.assessment["key"]
-                if key not in receipts:
-                    raise BatchResultError(f"최종 판단 결과 누락: {key}")
-                port.resolution_complete(context.repo, unit, receipts[key])
-            except (BatchResultError, relations.ReconciliationError) as error:
-                port.resolution_fail(context.repo, unit, str(error))
-                errors.append(str(error))
-        return self._failure(BatchResultError("\n".join(errors))) if errors else self._progress()
+
+        def validate_and_save(unit, receipt):
+            port.resolution_complete(context.repo, unit, receipt)
+
+        _, errors = _process_receipts(
+            result.message, relations.RESOLUTION_PREFIX, "key", units,
+            lambda unit: unit.assessment["key"],
+            lambda key: f"최종 판단 결과 누락: {key}", validate_and_save,
+            lambda unit, error: port.resolution_fail(context.repo, unit, error),
+            (BatchResultError, relations.ReconciliationError),
+        )
+        return self._receipt_outcome(errors)
