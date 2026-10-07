@@ -237,30 +237,28 @@ class PlanningSelectionTest(PlanningCase):
         self.assertIn("REQUIREMENT_JUDGMENTS", ports.agent.prompts[0])
         self.assertNotEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
 
-    def test_historical_audit_uses_general_planner_once(self):
+    def test_historical_audit_does_not_call_planner_or_resume_restoration(self):
         ports = FakePorts(planning_snapshot(
             processed_sha="base", planning_fingerprint="fingerprint",
             specification_fingerprint="specification",
         ))
-        item = SimpleNamespace(
-            path="docs/requirements/R.md", token="audit-pinned",
-            criteria=("Works",), related_ids=("G-001",),
-        )
+        unused = mock.Mock(side_effect=AssertionError("Archived Requirement must not be reassessed"))
         ports.retirement = SimpleNamespace(
-            pending=lambda *_args: (), audit_restorations=lambda *_args: (),
-            audit_pending=lambda *_args: (item,),
+            pending=lambda *_args: (), audit_restorations=unused,
+            audit_pending=unused,
             validate_result=lambda *_args: (), record=lambda *_args: None,
             record_audit_result=lambda *_args: None,
-            stage_restorations=lambda *_args: (), stage_moves=lambda *_args, **_kwargs: (),
+            stage_restorations=unused, stage_moves=lambda *_args, **_kwargs: (),
             receipted_paths=lambda *_args: (),
         )
 
         outcome = PlanningLifecycleCoordinator(ports).run(self.context)
 
-        self.assertEqual(ports.agent.run_count, 1)
-        self.assertFalse(ports.agent.roles[0][1])
-        self.assertIn("REQUIREMENT_AUDIT", ports.agent.prompts[0])
-        self.assertNotEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
+        self.assertEqual(ports.agent.run_count, 0)
+        unused.assert_not_called()
+        self.assertIn(outcome.kind, {
+            PlanningOutcomeKind.FINGERPRINT_SKIPPED, PlanningOutcomeKind.NO_CHANGE,
+        })
 
     def test_unfulfilled_final_judgment_requires_source_linked_followup_plan(self):
         ports = FakePorts(planning_snapshot(

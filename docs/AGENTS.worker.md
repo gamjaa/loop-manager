@@ -6,9 +6,10 @@
   함께 수행한다. 기존 동작을 보존하는 테스트를 포함하고 범위 밖 개선으로 확대하지 않는다.
 - 새 ExecPlan을 만들거나 다른 계획의 목표를 추가 구현하지 않는다. 연관 문서 수정은
   호출에서 제공된 권한 안에서 수행하고 목표·실행 이력·dependency·사용자 결정을 보존한다.
-- PRODUCT·Requirement·ARCHITECTURE는 기본적으로 사용자가 작성한다. 명시적인
-  Specification Skill 문서 작성 요청은 예외이며, Requirement 구현 결과가 장기 제품
-  규칙이면 코드와 같은 PR에서 PRODUCT를 갱신할 수 있다.
+- Requirement는 기본적으로 사용자가 작성하며 명시적인 Specification Skill 문서 작성 요청은
+  예외다. Requirement·ExecPlan 구현으로 바뀌는 제품 동작·장기 규칙은 PRODUCT에,
+  설계·책임 경계·계약은 ARCHITECTURE에 코드와 같은 PR에서 반영한다. 필요한 관련 절만
+  갱신하고 목표·필수 검증·사용자 결정과 AGENTS 승인 경계를 보존한다.
 - Requirement의 완료 판단·archive 이동은 Manager의 책임이며 Worker가 수행하지 않는다.
   `docs/PLANS.md` 수정은 게시된 ExecPlan이 해당 변경을 명시한 경우에만 허용한다.
 

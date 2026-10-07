@@ -240,10 +240,10 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 - Requirement는 원하는 변화·이유·Acceptance Criteria만 기록하며 frontmatter·상태·complexity·risk를 두지 않는다
 - 기존 ExecPlan의 활성 Requirement source가 없으면 동일 파일명의 `docs/requirements/archive/` 문서를 조회하되 원래 source 경로는 바꾸지 않는다
 - 새 ExecPlan의 source와 Planner 입력은 활성 PRODUCT 또는 `docs/requirements/` 바로 아래 문서로 제한한다
-- 관련 ExecPlan·draft가 미완료이면 Requirement 전체 충족 확인을 미룬다. 마지막 관련 계획이 실제 MERGED가 된 뒤 일반 Planner가 최신 원격 구현·검증 근거로 각 Acceptance Criterion을 충족·미충족·불확실로 판단한다. 계획 작성 완료나 관련 계획의 Merge만으로 충족을 추정하지 않는다
+- source로 참조하는 비종료 ExecPlan·draft가 있으면 Requirement 전체 충족 확인과 archive를 미룬다. 연결된 활성 작업이 없어지면 일반 Planner가 최신 원격 구현·검증과 관련 제품·설계 문서로 각 Acceptance Criterion을 충족·미충족·불확실로 판단한다. 관련 계획이 있으면 모두 실제 MERGED여야 하며, 계획 없이 직접 구현한 변경도 실제 근거로 판단한다. 계획 작성 완료나 관련 계획의 Merge만으로 충족을 추정하지 않는다
 - Manager는 Requirement 원문, 관련 명세·계획 관계, 구현·검증 근거에 결합된 판단을 보존한다. 동일한 유효 입력의 충족·미충족 판단은 재사용하고 관련 입력이 바뀌면 미완료 작업이 없는 시점에 일반 Planner가 다시 확인한다. 빠른 Planner는 이 판단·이동에 참여하지 않으며 기존 계획 변경 영향 점검만 수행한다
 - 유효한 최종 충족 판단과 source 관계·Merge 상태가 확인되면 Manager가 원문 그대로 일반 planning 게시에서 Requirement를 이동한다. 새 계획과 이동을 함께 게시하거나 이동만 게시할 수 있으며 원격 확인 전에는 활성 입력으로 유지한다. 충돌·불확실성은 덮어쓰기나 임의 완료 없이 보존한다
-- 일회성 과거 archive 감사는 비종료 source 관계와 완료 근거를 revision에 묶어 보존한다. 확인된 조기 이동만 planning 게시로 복원하며 과거 archive를 평소 활성 Planner 입력으로 사용하지 않는다
+- archive된 Requirement는 완료한 변경의 보관이며 재평가·새 작업·프로젝트 완료 대기의 입력으로 사용하거나 자동 복원하지 않는다. 기존 ExecPlan의 source 조회·검증을 위한 읽기 호환성과 과거 감사 기록은 보존한다
 - `PLAN_BLOCKED` 해제 지문은 원래 활성 Requirement 경로만 사용하고 archive 변경에는 반응하지 않는다
 - Requirement는 PRODUCT의 변경 요청이며 ExecPlan의 구현 상세나 실행 상태를 포함하지 않는다
 - Requirement 파일 경로를 안정적인 식별자로 사용한다
@@ -262,7 +262,7 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 - Planner와 Worker의 실행 후보는 `docs/plans/` 바로 아래의 active ExecPlan으로 제한하고, `docs/plans/archive/`는 ID 고유성, 다음 번호, dependency, 복구와 감사 검증에만 포함한다
 - ExecPlan archive-only 이동은 계획 입력 지문, 유지보수 Merge count, 프로젝트 완료 cycle을 바꾸지 않는다
 - ExecPlan의 `depends_on`은 선행 ExecPlan ID 목록이며, 모든 선행 상태가 MERGED여야 Worker를 시작할 수 있다
-- Worker는 장기 제품 규칙이 바뀌는 경우에만 코드와 같은 PR에서 `PRODUCT.md`를 갱신한다
+- Worker는 Requirement·ExecPlan 구현으로 바뀌는 제품 동작·장기 규칙을 `PRODUCT.md`에, 설계·책임 경계·계약을 `ARCHITECTURE.md`에 코드와 같은 PR에서 반영한다. 현재 작업에 필요한 관련 절만 갱신하며 목표·필수 검증·별도 사용자 결정과 AGENTS 승인 경계를 유지한다
 
 ### 프로젝트 등록 및 실행 조건
 

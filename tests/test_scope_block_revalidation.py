@@ -575,7 +575,7 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
                                  registration=('HEAD=before', 'branch=refs/heads/loop-manager/G-047')),
                          replace(original, operations=(('MERGE_HEAD', 'foreign'),)),
                          replace(original, index=(IndexEntry('app.py', '100644', 'blob', 0, 'S', 0x40000000),)),
-                         replace(original, committed=(FileChange('docs/ARCHITECTURE.md',
+                         replace(original, committed=(FileChange('docs/requirements/change.md',
                              '100644', '100644', 'old', 'new', 'M'),))):
             with self.subTest(observed=observed):
                 self.case.observed = observed

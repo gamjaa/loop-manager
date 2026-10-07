@@ -405,12 +405,6 @@ class PlanningSelectionService(PlanningService):
                 run.general_fingerprint,
             )
             if hasattr(self._ports, "retirement"):
-                run.audit_restorations = self._ports.retirement.audit_restorations(
-                    context.repo, context.repo_path, run.base_sha,
-                )
-                run.audit_pending = self._ports.retirement.audit_pending(
-                    context.repo, context.repo_path, run.base_sha,
-                )
                 run.retirement_pending = self._ports.retirement.pending(
                     context.repo, context.repo_path, run.base_sha,
                 )
@@ -457,7 +451,7 @@ class PlanningSelectionService(PlanningService):
                 run.fingerprint_skipped = True
             if (hasattr(self._ports.state, "planning_review") and not approval_pending
                     and not specification_changed and not planning_input_changed
-                    and not (run.audit_restorations or run.audit_pending or run.retirement_pending)
+                    and not run.retirement_pending
                     and self._ports.state.final_review_candidate(context.repo,
                         context.refactoring_review_interval, self_repository=context.self_repository)):
                 from loop_manager_internal.planning.specification_review import current_receipt
@@ -473,8 +467,6 @@ class PlanningSelectionService(PlanningService):
                 has_active=getattr(decision, "active", None) is not None,
                 specification_changed=(specification_changed or approval_pending
                                        or bool(run.retirement_pending)
-                                       or bool(run.audit_restorations)
-                                       or bool(run.audit_pending)
                                        or run.final_review_required),
                 runnable_ready=decision.runnable_ready is not None,
                 planning_input_changed=planning_input_changed,

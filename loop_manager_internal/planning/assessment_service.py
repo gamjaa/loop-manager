@@ -36,19 +36,6 @@ class PlanningAssessmentService(PlanningService):
         context = run.context
         worktree = run.planning_worktree
         assert worktree is not None
-        if not run.maintenance_planning and hasattr(self._ports, "retirement"):
-            run.audit_restorations = self._ports.retirement.audit_restorations(
-                context.repo, context.repo_path, str(row.active_sha),
-            )
-            if (run.audit_restorations and not row.planning_result_completed
-                    and not row.planning_result_pending_validation
-                    and not row.planner_session_id and not row.agent_snapshot):
-                self._ports.state.update(
-                    context.repo, planning_result_completed=1, planning_result="",
-                )
-                run.row = self._ports.state.planning(context.repo)
-                run.dirty_files = self._ports.git.changed_files(worktree)
-                return None
         head = self._ports.git.run(worktree, "rev-parse", "HEAD").stdout.strip()
         dirty_files = self._ports.git.changed_files(worktree)
         if row.planning_validation_error and head != row.active_sha:
@@ -226,15 +213,11 @@ class PlanningAssessmentService(PlanningService):
                     prompt += instruction
                     self._ports.events.log(f"일반 planning 검토: purpose={attempt['purpose']}, revision={attempt['revision']}, 비교={attempt['comparison_revision']}, cycle={attempt['work_cycle']}")
                 if hasattr(self._ports, "retirement"):
-                    from loop_manager_internal.planning.requirement_retirement import assessment_prompt, audit_prompt
+                    from loop_manager_internal.planning.requirement_retirement import assessment_prompt
                     run.retirement_pending = self._ports.retirement.pending(
                         context.repo, context.repo_path, str(row.active_sha),
                     )
                     prompt += assessment_prompt(run.retirement_pending)
-                    run.audit_pending = self._ports.retirement.audit_pending(
-                        context.repo, context.repo_path, str(row.active_sha),
-                    )
-                    prompt += audit_prompt(run.audit_pending)
                 check = getattr(self._ports.state, "planner_check", lambda _repo: None)(context.repo)
                 if check is not None and check["stage"] == "handoff":
                     prompt += (
@@ -591,11 +574,10 @@ class PlanningAssessmentService(PlanningService):
                     from dataclasses import replace
                     from loop_manager_internal.application.contracts import ValidatedPlanningResult
                     try:
-                        judgments = (() if run.audit_restorations else
-                            self._ports.retirement.validate_result(
-                                context.repo, context.repo_path, str(row.active_sha),
-                                str(row.planning_result or ""),
-                            ))
+                        judgments = self._ports.retirement.validate_result(
+                            context.repo, context.repo_path, str(row.active_sha),
+                            str(row.planning_result or ""),
+                        )
                         planned_sources = {
                             source
                             for _path, plan in (validated_result.plans if validated_result else ())
@@ -615,25 +597,14 @@ class PlanningAssessmentService(PlanningService):
                                     f"미충족 Requirement의 후속 ExecPlan이 없습니다: {judgment.source_path}"
                                 )
                         self._ports.retirement.record(context.repo, judgments)
-                        if not run.audit_restorations:
-                            self._ports.retirement.record_audit_result(
-                                context.repo, context.repo_path, str(row.active_sha),
-                                str(row.planning_result or ""),
-                            )
                     except RetirementError as error:
                         raise PlanningResultInvalid(str(error)) from error
                     try:
-                        restored = self._ports.retirement.stage_restorations(
+                        self._ports.retirement.stage_moves(
                             context.repo, context.repo_path, str(row.active_sha), worktree,
+                            excluded_sources=tuple(sorted(planned_sources)),
                         )
-                        if not restored:
-                            self._ports.retirement.stage_moves(
-                                context.repo, context.repo_path, str(row.active_sha), worktree,
-                                excluded_sources=tuple(sorted(planned_sources)),
-                            )
-                        # A restoration can defer new retirements while older
-                        # retirements are already staged. Keep every currently
-                        # proven receipt, not just paths staged in this turn.
+                        # Include every proven pending retirement after restart.
                         manager_paths = self._ports.retirement.receipted_paths(
                             context.repo, context.repo_path, str(row.active_sha), worktree,
                         )
@@ -664,12 +635,8 @@ class PlanningAssessmentService(PlanningService):
                             publication_hashes=tuple(sorted(hashes.items())),
                             retirement_moves=tuple(
                                 source for source in manager_paths[::2]
-                                if not source.startswith("docs/requirements/archive/")
                             ),
-                            restoration_moves=tuple(
-                                source for source in manager_paths[::2]
-                                if source.startswith("docs/requirements/archive/")
-                            ),
+                            restoration_moves=(),
                         )
                         run.dirty_files = sorted(set(dirty_files) | set(manager_paths))
             if not run.maintenance_planning and hasattr(self._ports.state, "planning_review") and attempt is not None:

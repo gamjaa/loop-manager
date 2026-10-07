@@ -115,6 +115,54 @@ class RequirementRetirementTest(unittest.TestCase):
             "relevant_paths": paths if paths is not None else ["feature.py", "docs/PRODUCT.md", "docs/ARCHITECTURE.md"],
         }])
 
+    def seed_legacy_restoration(self):
+        """Seed a move already made by an older Manager, without enabling new restores."""
+        oid = hashlib.sha1(b"blob " + str(len(CONTENTS)).encode() + b"\0" + CONTENTS).hexdigest()
+        (self.root / SOURCE).parent.mkdir(parents=True, exist_ok=True)
+        (self.root / ARCHIVE).rename(self.root / SOURCE)
+        self.connection.execute(
+            "INSERT INTO requirement_audit "
+            "(repo,source_path,input_token,source_oid,observed_sha,outcome,reason,stage) "
+            "VALUES ('repo',?,'legacy',?,'base','restore','old unfinished source','staged')",
+            (SOURCE, oid),
+        )
+
+    def test_archived_requirement_is_not_reassessed_when_old_plan_or_implementation_changes(self):
+        self.git.files.pop(SOURCE)
+        self.git.files[ARCHIVE] = CONTENTS
+        self.add_plan(status="PR_OPEN")
+        before_reads = self.git.blob_reads
+        for status in ("PR_OPEN", "MERGED", "PLAN_BLOCKED"):
+            self.connection.execute("UPDATE exec_plans SET status=?", (status,))
+            self.git.files["feature.py"] = status.encode()
+            self.assertEqual(self.port.pending("repo", self.root, status), ())
+            self.assertEqual(self.port.stage_moves("repo", self.root, status, self.root), ())
+        self.assertEqual(self.git.blob_reads, before_reads)
+        self.assertFalse((self.root / SOURCE).exists())
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM requirement_audit").fetchone()[0], 0)
+
+    def test_no_linked_plan_requires_final_judgment_before_archiving_direct_implementation(self):
+        (item,) = self.port.pending("repo", self.root, "base")
+        self.assertEqual(item.related_ids, ())
+        self.assertEqual(self.port.fulfilled_moves("repo", self.root, "base"), ())
+        origin = self.root / SOURCE
+        origin.parent.mkdir(parents=True)
+        origin.write_bytes(CONTENTS)
+        self.port.record("repo", self.port.validate_result(
+            "repo", self.root, "base", self.judgment_line(item)))
+        self.assertEqual(self.port.stage_moves("repo", self.root, "base", self.root), (SOURCE, ARCHIVE))
+        self.assertEqual((self.root / ARCHIVE).read_bytes(), CONTENTS)
+
+    def test_all_nonterminal_source_linked_plans_defer_final_judgment(self):
+        self.add_plan()
+        self.add_plan("G-002", status="READY")
+        for status in ("READY", "PR_OPEN", "PLAN_BLOCKED"):
+            self.connection.execute("UPDATE exec_plans SET status=? WHERE plan_id='G-002'", (status,))
+            self.assertEqual(self.port.pending("repo", self.root, "base"), ())
+            self.assertEqual(self.port.fulfilled_moves("repo", self.root, "base"), ())
+        self.connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id='G-002'")
+        self.assertEqual(len(self.port.pending("repo", self.root, "base")), 1)
+
     def test_final_merge_defers_then_reuses_judgment_and_preserves_bytes(self):
         self.add_plan(status="PR_OPEN")
         self.assertEqual(self.port.pending("repo", self.root, "base"), ())
@@ -263,16 +311,15 @@ class RequirementRetirementTest(unittest.TestCase):
         self.assertIsNone(self.port.judgments.get("repo", SOURCE))
         self.assertEqual(self.port.fulfilled_moves("repo", self.root, "base"), ())
 
-    def test_invalidated_staged_restoration_keeps_receipt_until_safe_withdrawal(self):
+    def test_legacy_staged_restoration_is_withdrawn_without_new_audit(self):
         self.git.files.pop(SOURCE)
         self.git.files[ARCHIVE] = CONTENTS
         self.add_plan(status="PR_OPEN")
         archived = self.root / ARCHIVE
         archived.parent.mkdir(parents=True)
         archived.write_bytes(CONTENTS)
-        self.port.stage_restorations("repo", self.root, "base", self.root)
+        self.seed_legacy_restoration()
         self.connection.execute("UPDATE exec_plans SET status = 'MERGED'")
-        self.assertEqual(self.port.audit_restorations("repo", self.root, "advanced"), ())
         self.assertEqual(self.connection.execute("SELECT stage FROM requirement_audit").fetchone()[0], "staged")
         restarted = RequirementRetirementPort(self.connection, self.git)
         with self.assertRaises(RetirementReassessment):
@@ -280,7 +327,7 @@ class RequirementRetirementTest(unittest.TestCase):
         self.assertEqual(archived.read_bytes(), CONTENTS)
         self.assertFalse((self.root / SOURCE).exists())
         self.assertEqual(restarted.receipted_paths("repo", self.root, "advanced", self.root), ())
-        self.assertEqual(len(restarted.audit_pending("repo", self.root, "advanced")), 1)
+        self.assertEqual(restarted.pending("repo", self.root, "advanced"), ())
         self.assertEqual(self.git.index_resets, [("reset", "advanced", "--", ARCHIVE, SOURCE)])
 
     def test_restoration_withdrawal_resumes_after_inverse_rename_interruption(self):
@@ -290,7 +337,7 @@ class RequirementRetirementTest(unittest.TestCase):
         archived = self.root / ARCHIVE
         archived.parent.mkdir(parents=True)
         archived.write_bytes(CONTENTS)
-        self.port.stage_restorations("repo", self.root, "base", self.root)
+        self.seed_legacy_restoration()
         self.connection.execute("UPDATE exec_plans SET status = 'MERGED'")
         with mock.patch.object(self.git, "run", side_effect=RuntimeError("interrupted index reset")):
             with self.assertRaises(RuntimeError):
@@ -301,16 +348,16 @@ class RequirementRetirementTest(unittest.TestCase):
         with self.assertRaises(RetirementReassessment):
             restarted.receipted_paths("repo", self.root, "advanced", self.root)
         self.assertEqual(restarted.receipted_paths("repo", self.root, "advanced", self.root), ())
-        self.assertEqual(len(restarted.audit_pending("repo", self.root, "advanced")), 1)
+        self.assertEqual(restarted.pending("repo", self.root, "advanced"), ())
 
-    def test_invalidated_restoration_preserves_local_edits_and_receipt(self):
+    def test_legacy_restoration_withdrawal_preserves_local_edits_and_receipt(self):
         self.git.files.pop(SOURCE)
         self.git.files[ARCHIVE] = CONTENTS
         self.add_plan(status="PR_OPEN")
         archived = self.root / ARCHIVE
         archived.parent.mkdir(parents=True)
         archived.write_bytes(CONTENTS)
-        self.port.stage_restorations("repo", self.root, "base", self.root)
+        self.seed_legacy_restoration()
         (self.root / SOURCE).write_bytes(b"user edit")
         self.connection.execute("UPDATE exec_plans SET status = 'MERGED'")
         with self.assertRaises(RetirementError):
@@ -399,21 +446,6 @@ class RequirementRetirementTest(unittest.TestCase):
         with self.assertRaises(RetirementError):
             self.port.receipted_paths("repo", self.root, "later", self.root)
 
-    def test_staged_restoration_rebinds_receipt_after_unrelated_base_advance(self):
-        self.git.files.pop(SOURCE)
-        self.git.files[ARCHIVE] = CONTENTS
-        self.add_plan(status="PR_OPEN")
-        archived = self.root / ARCHIVE
-        archived.parent.mkdir(parents=True)
-        archived.write_bytes(CONTENTS)
-        self.port.stage_restorations("repo", self.root, "base", self.root)
-        self.git.files["unrelated.py"] = b"new"
-        self.assertEqual(self.port.receipted_paths("repo", self.root, "advanced", self.root),
-                         (ARCHIVE, SOURCE))
-        self.port.stage_restorations("repo", self.root, "advanced", self.root)
-        row = self.connection.execute("SELECT observed_sha FROM requirement_audit").fetchone()
-        self.assertEqual(row[0], "advanced")
-        self.assertEqual((self.root / SOURCE).read_bytes(), CONTENTS)
 
     def test_uncertain_judgment_exposes_decision_and_resumes_on_requirement_edit(self):
         self.add_plan()
@@ -475,7 +507,8 @@ class RequirementRetirementTest(unittest.TestCase):
         self.git.files[ARCHIVE] = CONTENTS
         reads_before_audit = self.git.blob_reads
 
-        self.assertEqual(self.port.audit_pending("repo", self.root, "published"), ())
+        self.assertEqual(self.port.pending("repo", self.root, "published"), ())
+        self.assertEqual(self.port.stage_moves("repo", self.root, "published", self.root), ())
         self.assertEqual(self.git.blob_reads, reads_before_audit)
 
     def test_cancelled_source_does_not_become_merged_proof(self):
@@ -527,11 +560,8 @@ class RequirementRetirementTest(unittest.TestCase):
         pending = self.port.pending("repo", self.root, "base")
 
         self.assertEqual(tuple(item.path for item in pending), (second,))
-        self.assertEqual(self.port.audit_restorations("repo", self.root, "base"), ())
-        row = self.connection.execute(
-            "SELECT outcome FROM requirement_audit WHERE source_path = ?", (SOURCE,),
-        ).fetchone()
-        self.assertEqual(row["outcome"], "uncertain")
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM requirement_audit").fetchone()[0], 0)
+        self.assertEqual(self.git.files[ARCHIVE], b"historical version")
 
     def test_malformed_requirement_keeps_uncertain_result_without_blocking_other_input(self):
         second = "docs/requirements/[R-002] Other.md"
@@ -547,110 +577,6 @@ class RequirementRetirementTest(unittest.TestCase):
                          (second,))
         self.assertEqual(self.git.blob_reads, reads + 1)
         self.assertEqual(self.port.judgments.get("repo", SOURCE).outcome, "uncertain")
-
-    def test_audit_restores_only_proven_unfinished_source_and_resumes(self):
-        self.git.files.pop(SOURCE)
-        self.git.files[ARCHIVE] = CONTENTS
-        self.add_plan(status="PR_OPEN")
-        self.assertEqual(self.port.audit_restorations("repo", self.root, "base"), (SOURCE,))
-        self.assertEqual(self.git.blob_reads, 0)
-        self.assertEqual(self.port.audit_restorations("repo", self.root, "base"), (SOURCE,))
-        self.assertEqual(self.git.blob_reads, 0)
-        archived = self.root / ARCHIVE
-        archived.parent.mkdir(parents=True)
-        archived.write_bytes(CONTENTS)
-        self.assertEqual(self.port.stage_restorations("repo", self.root, "base", self.root),
-                         (ARCHIVE, SOURCE))
-        self.assertEqual((self.root / SOURCE).read_bytes(), CONTENTS)
-        self.assertEqual(self.port.receipted_paths("repo", self.root, "base", self.root),
-                         (ARCHIVE, SOURCE))
-        self.assertEqual(self.port.stage_restorations("repo", self.root, "base", self.root),
-                         (ARCHIVE, SOURCE))
-
-    def test_audit_asks_planner_once_for_all_merged_partial_coverage(self):
-        self.git.files.pop(SOURCE)
-        self.git.files[ARCHIVE] = CONTENTS
-        self.add_plan()
-        self.port.judgments.put("repo", Judgment(
-            SOURCE, "old-fulfilled", "fulfilled", ("old evidence",), ("feature.py",), "old",
-        ))
-        self.assertEqual(self.port.audit_restorations("repo", self.root, "base"), ())
-        self.assertEqual(self.git.blob_reads, 1)
-        (item,) = self.port.audit_pending("repo", self.root, "base")
-        self.assertEqual(item.criteria, ("Works end to end",))
-        self.assertEqual(self.port.audit_restorations("repo", self.root, "base"), ())
-        self.assertEqual(self.git.blob_reads, 1)
-        self.port.record_audit_result("repo", self.root, "base", "REQUIREMENT_AUDIT: " + json.dumps([{
-            "path": SOURCE, "input_token": item.token, "outcome": "premature",
-            "criteria_evidence": ["Merged code lacks the required behavior"],
-            "relevant_paths": ["feature.py"], "reason": "Partial coverage remains",
-        }]))
-        self.assertEqual(self.port.audit_pending("repo", self.root, "base"), ())
-        self.assertEqual(self.port.audit_restorations("repo", self.root, "base"), (SOURCE,))
-        self.assertEqual(self.git.blob_reads, 1)
-        self.assertIsNotNone(self.port.judgments.get("repo", SOURCE).invalidation_reason)
-        row = self.connection.execute(
-            "SELECT outcome, reason FROM requirement_audit WHERE source_path = ?",
-            (SOURCE,),
-        ).fetchone()
-        self.assertEqual(row["outcome"], "restore")
-        self.git.files["feature.py"] = b"implemented = False\n"
-        self.assertEqual(len(self.port.audit_pending("repo", self.root, "base")), 1)
-
-    def test_audit_preserves_superseded_goal_and_cancellation_uncertainty(self):
-        self.git.files.pop(SOURCE)
-        self.git.files[ARCHIVE] = CONTENTS
-        self.add_plan()
-        (item,) = self.port.audit_pending("repo", self.root, "base")
-        self.port.record_audit_result("repo", self.root, "base", "REQUIREMENT_AUDIT: " + json.dumps([{
-            "path": SOURCE, "input_token": item.token, "outcome": "superseded",
-            "criteria_evidence": ["Product replacement decision covers the former goal"],
-            "relevant_paths": ["feature.py"], "reason": "Goal was replaced",
-        }]))
-        self.assertEqual(self.port.audit_restorations("repo", self.root, "base"), ())
-        self.assertEqual(self.port.audit_pending("repo", self.root, "base"), ())
-        row = self.connection.execute(
-            "SELECT outcome FROM requirement_audit WHERE source_path = ?", (SOURCE,),
-        ).fetchone()
-        self.assertEqual(row["outcome"], "superseded")
-        self.connection.execute("UPDATE exec_plans SET status = 'PR_OPEN'")
-        self.connection.execute(
-            "INSERT INTO execplan_cancellations VALUES (?, ?, ?)",
-            ("repo", "G-002", json.dumps([SOURCE])),
-        )
-        self.assertEqual(self.port.audit_restorations("repo", self.root, "base"), ())
-        row = self.connection.execute(
-            "SELECT outcome, reason FROM requirement_audit WHERE source_path = ?",
-            (SOURCE,),
-        ).fetchone()
-        self.assertEqual(row["outcome"], "uncertain")
-        self.assertIn("cancelled", row["reason"])
-
-    def test_audit_rejects_missing_criterion_evidence(self):
-        self.git.files.pop(SOURCE)
-        self.git.files[ARCHIVE] = CONTENTS
-        self.add_plan()
-        (item,) = self.port.audit_pending("repo", self.root, "base")
-        with self.assertRaises(RetirementError):
-            self.port.record_audit_result("repo", self.root, "base", "REQUIREMENT_AUDIT: " + json.dumps([{
-                "path": SOURCE, "input_token": item.token, "outcome": "premature",
-                "criteria_evidence": [], "relevant_paths": ["feature.py"], "reason": "Partial",
-            }]))
-        self.assertEqual(len(self.port.audit_pending("repo", self.root, "base")), 1)
-
-    def test_audit_keeps_malformed_historical_criteria_uncertain_without_rereading(self):
-        self.git.files.pop(SOURCE)
-        self.git.files[ARCHIVE] = b"# Former goal without criteria\n"
-        self.add_plan()
-
-        self.assertEqual(self.port.audit_pending("repo", self.root, "base"), ())
-        self.assertEqual(self.port.audit_pending("repo", self.root, "base"), ())
-        self.assertEqual(self.git.blob_reads, 1)
-        row = self.connection.execute(
-            "SELECT outcome, reason FROM requirement_audit WHERE source_path = ?", (SOURCE,),
-        ).fetchone()
-        self.assertEqual(row["outcome"], "uncertain")
-        self.assertIn("Acceptance Criteria", row["reason"])
 
 
 class RetirementPublicationManifestTest(unittest.TestCase):
@@ -674,7 +600,7 @@ class RetirementPublicationManifestTest(unittest.TestCase):
         self.assertEqual(ports.state.update.call_args.kwargs["planning_result_pending_validation"], 0)
 
 
-    def test_remote_confirmed_move_marks_receipt_and_audit_together(self):
+    def test_remote_confirmed_move_marks_receipt_and_preserves_old_audit(self):
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
         self.addCleanup(connection.close)
@@ -726,7 +652,7 @@ class RetirementPublicationManifestTest(unittest.TestCase):
             "SELECT (SELECT stage FROM requirement_move_receipts), "
             "(SELECT stage FROM requirement_audit)",
         ).fetchone()
-        self.assertEqual(tuple(stages), ("published", "published"))
+        self.assertEqual(tuple(stages), ("published", "observed"))
         receipt = planning_review_state.get(connection, "repo", "final")
         self.assertEqual(receipt["confirmed_revision"], "commit")
         self.assertEqual(receipt["revision"], "base")
@@ -813,7 +739,7 @@ class RetirementPublicationManifestTest(unittest.TestCase):
 
 
 class RequirementAuditWaitReasonTest(unittest.TestCase):
-    def test_uncertain_archive_audit_prevents_false_project_completion(self):
+    def test_uncertain_historical_archive_does_not_delay_project_completion(self):
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
         self.addCleanup(connection.close)
@@ -834,9 +760,10 @@ class RequirementAuditWaitReasonTest(unittest.TestCase):
             connection, "repo", cycle="fingerprint", active_requirements=(),
         )
 
-        self.assertFalse(snapshot.completed)
-        self.assertEqual(snapshot.requirements[0]["path"], SOURCE)
-        self.assertIn("사용자 결정", snapshot.requirements[0]["reason"])
+        self.assertTrue(snapshot.completed)
+        self.assertEqual(snapshot.requirements, ())
+        self.assertEqual(connection.execute("SELECT reason FROM requirement_audit").fetchone()[0],
+                         "historical proof absent")
 
 
 if __name__ == "__main__":

@@ -16,6 +16,9 @@
 - 구현·테스트·전체 verify를 실행하지 않는다. 프로젝트 `AGENTS.md` 변경을 제안하거나 적용하지 않는다.
 - Requirement는 frontmatter나 상태가 없는 순수 문서다. `docs/requirements/` 바로 아래 문서만
   활성 입력으로 사용하고 `docs/REQUIREMENT.template.md`와 `docs/requirements/archive/`는 제외한다.
+- archive된 Requirement는 완료한 변경의 보관이다. 기존 ExecPlan source 조회의 호환성
+  외에는 재평가·새 작업의 근거로 읽거나 활성 경로로 복원하지 않는다. 새 계획의 sources는
+  활성 문서만 사용한다.
 - 직접 구현된 작업은 실제 코드·테스트와 Requirement로 판단한다. 이미 충족된 작업을
   중복 계획하거나 소급 ExecPlan·자동 검증 성공을 만들지 않고 실제 미충족 작업만 계획한다.
 - PRODUCT·Requirement·ARCHITECTURE는 사용자 명세이며 계획 작성 권한으로 수정하지 않는다.

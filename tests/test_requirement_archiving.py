@@ -673,8 +673,8 @@ Test fallback.
         ).read_text(encoding="utf-8")
         agents = (loop_manager.ROOT / "AGENTS.md").read_text(encoding="utf-8")
 
-        self.assertIn("일반 Planner가 최신 원격 구현", skill)
-        self.assertIn("Loop Manager가 일반 planning 게시", skill)
+        self.assertIn("활성 위치로 되돌리지 않는다", skill)
+        self.assertIn("명세 작성 중 활성 Requirement를 완료로 간주해 보관 위치로 옮기지 않는다", skill)
         self.assertNotIn("마지막 관련 ExecPlan의 구현 PR", agents)
         product = (loop_manager.ROOT / "docs/PRODUCT.md").read_text(encoding="utf-8")
         template = (loop_manager.ROOT / "docs/REQUIREMENT.template.md").read_text(encoding="utf-8")

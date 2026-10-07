@@ -85,7 +85,11 @@ SQLite 손실이나 손상에서의 자동 상태 재구성은 지원하지 않�
 
 ExecPlan의 `Progress` 체크 항목과 본문은 구현 내용·판단·검증 기록이다. 체크가 끝났다는 이유로 `READY`, `PLAN_BLOCKED`, `MERGED` 같은 실행 상태를 바꾸지 않으며, 단계·재시도·session은 SQLite, 실제 PR Merge는 GitHub 확인을 기준으로 한다. 본문 변경은 재평가 입력이고 명시적 `User Decision`은 승인 판정 입력이므로, 본문을 읽지 않거나 변경을 무시한다는 뜻은 아니다.
 
-활성 Requirement 경로는 안정적인 식별자이고 `docs/requirements/` 바로 아래 문서만 새 계획 입력이다. archive는 기존 source 조회와 감사·복구에 필요한 범위에서만 사용한다. FUTURE_IDEAS는 계획 입력·실행 상태가 아니다.
+활성 Requirement 경로는 안정적인 식별자이고 `docs/requirements/` 바로 아래 문서만 새 계획 입력이다. archive는 기존 ExecPlan source의 조회·검증 호환성에만 사용하며 재평가하거나 활성 경로로 자동 복원하지 않는다. FUTURE_IDEAS는 계획 입력·실행 상태가 아니다.
+
+Requirement 최종 판단은 source로 연결된 비종료 계획·draft와 수동 제출이 없는 시점에 일반 Planner가 담당한다. 관련 계획이 있으면 모두 실제 MERGED여야 하며 연결 계획 없는 직접 구현도 코드·검증·관련 제품·설계 문서로 판단한다. Manager는 유효한 기준별 충족 판단과 입력 지문·source 관계를 확인한 원문만 내용 보존 이동으로 게시한다. 미충족이면 후속 ExecPlan을 연결하며, 원격 확인 전 입력 변경에 따른 이동 철회와 원격 확인 후 archive를 구분한다.
+
+과거 Requirement 감사 row와 저장된 복원 manifest 필드는 읽기 호환성과 이력 보존을 위해 유지한다. 새 감사·복원 판단과 완료 대기를 만들지 않으며 복원 manifest는 새 게시 전 거부한다. 미게시 Manager 복원 영수증은 해당 worktree에서 원문·원격 archive·경로 소유 범위를 확인해 archive로 철회하고 활성 입력을 재평가한다. index reset 중 중단도 같은 영수증으로 재개하고 사용자 수정·충돌·게시된 후보는 덮어쓰지 않는다.
 
 ExecPlan은 [PLANS.md](PLANS.md)의 고정 key/value와 `sources`·`depends_on` 목록만 파싱하며 전체 YAML을 지원하지 않는다. 필수 메타데이터, source, ID 고유성 및 dependency graph를 검증한다. 새 계획에는 priority가 필수이고 도입 전 계획의 생략 값은 normal로 해석한다. priority 형식 변경은 공통 PLANS와 파서를 같은 변경에서 갱신한다.
 
@@ -246,7 +250,7 @@ planning batch의 원격 게시·catalog 반영과 현재 원격 입력 일치�
 - Planner는 MERGED ExecPlan 메타데이터와 본문을 기본 입력으로 받거나 읽지 않는다. 프로그램만 ID 고유성, 번호 할당, 의존성 충족과 감사 이력을 위해 이를 유지한다
 - Planner는 안전한 무인 실행 차단과 반복적인 사용자 복구 제거를 최우선으로 priority를 정하고, 정상 경로 자동화, 그 밖의 Current Goal, 선택적 편의와 최적화 순으로 계획한다
 - Planner는 새 `docs/plans/*.md`를 생성하고 `docs/FUTURE_IDEAS.md`를 생성하거나 수정할 수 있다. 프로그램이 snapshot으로 지정한 미착수 READY만 같은 ID로 수정·rename·삭제할 수 있으며, 실행된 계획, snapshot 밖 기존 계획과 그 밖의 파일은 변경할 수 없다. 프로그램은 Agent 실행 전후 diff와 SQLite snapshot으로 범위를 검증한다
-- Worker는 ExecPlan·관련 unit test·verify 스크립트를 구현한다. 장기 제품 규칙이 바뀔 때만 PRODUCT를 갱신하며, 현재 구현에 필요한 대응표·구현 기록은 다른 기존 ExecPlan에도 갱신할 수 있다. 다른 계획의 목표를 구현하거나 상태를 문서에 기록하지 않는다. 범위 밖 아이디어는 FUTURE_IDEAS에 기록한다
+- Worker는 ExecPlan·관련 unit test·verify 스크립트를 구현한다. Requirement·ExecPlan 구현으로 바뀌는 제품 동작·장기 규칙은 PRODUCT에, 설계·책임 경계·계약은 ARCHITECTURE에 같은 변경에서 반영하며 문서 경로만으로 설계 수정을 거부하지 않는다. 현재 구현에 필요한 대응표·구현 기록은 다른 기존 ExecPlan에도 갱신할 수 있다. 다른 계획의 목표를 구현하거나 상태를 문서에 기록하지 않는다. 범위 밖 아이디어는 FUTURE_IDEAS에 기록한다
 - Worker는 수정한 코드와 새로 작성하거나 변경한 테스트를 직접 검증하는 최소 범위의 targeted unit test만 실행한다. 실패하면 같은 세션에서 수정하고 해당 테스트를 다시 실행하며, 실행 가능한 관련 unit test가 없으면 그 사유를 결과에 포함한다
 - Worker는 전체 test suite, integration test, end-to-end test, 프로젝트 전체 lint·build·type check와 전체 검증 스크립트를 직접 실행하지 않는다
 - Reviewer는 Worker의 targeted unit test와 프로그램의 전체 verify가 통과한 뒤 실행되며 테스트 command나 verify 스크립트를 다시 실행하지 않는다. 파일을 수정하지 않고 코드, 테스트, verify 스크립트의 diff와 전달된 결과를 읽어 요구사항 충족, 회귀, 테스트 누락과 verify 약화를 포함한 blocking issue를 확인한다

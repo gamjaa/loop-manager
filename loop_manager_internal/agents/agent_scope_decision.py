@@ -430,14 +430,12 @@ def _worker_path_allowed(
         return True
     if normalized in allowed_guidance_targets:
         return True
-    if lowered in {"docs/product.md", "docs/future_ideas.md"}:
+    if lowered in {"docs/product.md", "docs/architecture.md", "docs/future_ideas.md"}:
         return True
     if Path(normalized).name.casefold() == "agents.md":
         return False
     if lowered == "docs/plans.md":
         return allow_common_plans
-    if lowered == "docs/architecture.md":
-        return False
     if lowered.startswith("docs/requirements/"):
         allowed_paths = {
             candidate

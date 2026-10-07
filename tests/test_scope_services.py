@@ -177,7 +177,7 @@ class ScopeValidationTests(TestCase):
             with self.subTest(path=path):
                 with self.assertRaises(AgentScopeError):
                     self.validate('reviewer', snapshot(), changed)
-                if path == 'src/app.py':
+                if path in {'src/app.py', 'docs/ARCHITECTURE.md'}:
                     self.validate('worker', snapshot(), changed)
                 else:
                     with self.assertRaises(AgentScopeError):

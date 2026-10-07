@@ -88,6 +88,19 @@ class ScopeRoleBoundariesTest(AgentScopeFixture, unittest.TestCase):
                     selected_plan_path=selected,
                 )
 
+    def test_architecture_changes_are_worker_only(self):
+        for role in ("worker", "planner", "maintenance_planner", "reviewer", "planner_check"):
+            with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
+                repo, plan_path = self._repository_with_plan(directory)
+                before = loop_manager.capture_git_snapshot(repo)
+                (repo / "docs/ARCHITECTURE.md").write_text("# Updated implementation design\n", encoding="utf-8")
+                after = loop_manager.capture_git_snapshot(repo)
+                if role == "worker":
+                    loop_manager.validate_agent_scope(role, repo, before, after, selected_plan_path=plan_path)
+                else:
+                    with self.assertRaises(loop_manager.AgentScopeError):
+                        loop_manager.validate_agent_scope(role, repo, before, after)
+
     def test_planner_existing_plan_change_reaches_snapshot_validator(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, plan_path = self._repository_with_plan(directory)
