@@ -59,7 +59,7 @@ class TieredAssessmentTest(PlanningCase):
             unit = self.ports.tiered.repository.pending("/repo", assessment)
             value = {"digest": unit["digest"], "reviews": [{"module": part["module"],
                 "summary": "The module has a cohesive responsibility and concrete source relations.",
-                "citations": [{"path": next(iter(part["records"])), "excerpt": self.contents[next(iter(part["records"]))].decode().splitlines()[0]}]}
+                "citations": [{"path": next(iter(part["records"])), "excerpt": (self.contents[next(iter(part["records"]))].decode().splitlines() or [""])[0]}]}
                 for part in unit["parts"]], "findings": findings or []}
             return PlanningAgentResult(0, output if output is not None else tiered_review.RESULT_PREFIX + json.dumps(value), "unit-session", PlanningAgentResultKind.SUCCESS)
         self.ports.agent.run_planner = invoke
@@ -67,6 +67,77 @@ class TieredAssessmentTest(PlanningCase):
     def turn(self):
         self.run.row = self.ports.state.planning("/repo")
         return self.coordinator._assessment._run_planner_turn(self.run)
+
+    def test_all_blank_assessment_finishes_without_any_agent_call(self):
+        self.contents = {"src/a.py": b"", "src/b.py": b" \t\n"}
+        index = code_index.build_index(self.connection, "/repo:remote", inventory(self.contents, self.sha),
+            lambda source: self.contents[source.path])
+        self.ports.tiered.select.return_value = tiered_review.Selection(
+            True, "full", ("initial_full",), tuple(self.contents), index, (), 0)
+        self.ports.agent.run_planner = mock.Mock(side_effect=AssertionError("blank facts must not call the model"))
+        outcome, context = tiered_assessment.prepare_turn(self.ports, self.run, self.run.planning_worktree)
+        self.assertIsNone(outcome)
+        self.assertEqual(context, "no_model_needed")
+        self.ports.agent.run_planner.assert_not_called()
+        evidence = self.ports.tiered.repository.evidence("/repo", 1, self.sha)
+        self.assertEqual(evidence["receipts"], [])
+        self.assertEqual(set(evidence["records"]), set(self.contents))
+        outcome, context = tiered_assessment.prepare_turn(self.ports, self.run, self.run.planning_worktree)
+        self.assertEqual(context, "no_model_needed")
+        self.ports.agent.run_planner.assert_not_called()
+
+    def test_legacy_active_blank_assessment_is_reparsed_at_actual_turn_without_model(self):
+        self.contents = {"src/a.py": b"", "src/b.py": b" \t\n"}
+        index = code_index.build_index(self.connection, "/repo:remote", inventory(self.contents, self.sha),
+            lambda source: self.contents[source.path])
+        selection = tiered_review.Selection(True, "full", ("initial_full",), tuple(self.contents), index, (), 0)
+        self.ports.tiered.select.return_value = selection
+        active = self.ports.tiered.prepare(self.run)
+        legacy = json.loads(json.dumps(active))
+        legacy.pop('analysis_version')
+        for record in legacy['records'].values():
+            record['facts'].pop('whitespace_only')
+        self.connection.execute('UPDATE tiered_maintenance_assessments SET assessment_json = ?', (json.dumps(legacy),))
+        self.ports.agent.run_planner = mock.Mock(side_effect=AssertionError('blank source facts must not call the model'))
+        outcome, context = tiered_assessment.prepare_turn(self.ports, self.run, self.run.planning_worktree)
+        self.assertIsNone(outcome)
+        self.assertEqual(context, 'no_model_needed')
+        self.ports.agent.run_planner.assert_not_called()
+        refreshed = self.ports.tiered.repository.active('/repo', 1, self.sha)
+        self.assertEqual(refreshed['prior_analysis_assessment'], legacy)
+        self.assertEqual(refreshed['paths'], legacy['paths'])
+
+    def test_uncertain_empty_module_still_gets_a_source_bound_semantic_review(self):
+        self.contents = {"src/empty.js": b""}
+        index = code_index.build_index(self.connection, "/repo:remote", inventory(self.contents, self.sha),
+            lambda source: self.contents[source.path])
+        self.ports.tiered.select.return_value = tiered_review.Selection(
+            True, "full", ("initial_full",), tuple(self.contents), index, (), 0)
+        value = {"reviews": [{"summary": "The empty module has no implementation; unsupported relations remain uncertain.",
+            "citations": [{"path": "src/empty.js", "excerpt": ""}]}], "findings": []}
+        self.model(output=tiered_review.RESULT_PREFIX + json.dumps(value))
+        self.assertEqual(self.turn().kind, PlanningOutcomeKind.ASSESSMENT_PROGRESS)
+        self.assertIsNone(self.turn())
+        self.assertEqual(self.ports.agent.run_count, 1)
+        self.assertEqual(self.ports.state.snapshot.planning_retry_count, 0)
+        evidence = self.ports.tiered.repository.evidence('/repo', 1, self.sha)
+        self.assertEqual(evidence['records']['src/empty.js']['facts']['uncertainties'], ['unsupported_source_format'])
+
+    def test_formatted_module_result_needs_one_call_and_no_validation_retry(self):
+        self.model()
+        original = self.ports.agent.run_planner
+        def formatted(*args, **kwargs):
+            result = original(*args, **kwargs)
+            value = json.loads(result.message.removeprefix(tiered_review.RESULT_PREFIX))
+            value.pop('digest')
+            for item in value['reviews']:
+                item.pop('module')
+            return replace(result, message='**MODULE_REVIEW_RESULT** =\n' + json.dumps(value, indent=2))
+        self.ports.agent.run_planner = formatted
+        self.assertEqual(self.turn().kind, PlanningOutcomeKind.ASSESSMENT_PROGRESS)
+        self.assertIsNone(self.turn())
+        self.assertEqual(self.ports.agent.run_count, 1)
+        self.assertEqual(self.ports.state.snapshot.planning_retry_count, 0)
 
     def test_full_module_review_then_no_extra_synthesis_or_planner_call(self):
         self.model()

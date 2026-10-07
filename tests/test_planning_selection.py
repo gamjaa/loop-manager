@@ -2117,6 +2117,22 @@ class SpecificationReviewSelectionTest(PlanningCase):
                 self.assertIsNone(ports.state.planning_review('/repo', 'final'))
                 self.assertIsNotNone(ports.state.planning_review('/repo', 'attempt'))
 
+    def test_final_format_normalization_binds_only_verified_attempt_identity(self):
+        from loop_manager_internal.planning.specification_review import validate_final, valid_final_receipt
+        ports = self.review_ports()
+        ports.state.begin_planning_review('/repo', purpose='final', revision='base',
+            input_fingerprint='fingerprint', specification_fingerprint='fingerprint',
+            work_cycle='cycle-0', comparison_revision=None)
+        attempt = ports.state.planning_review('/repo', 'attempt')
+        value = {'outcome': 'fulfilled', 'reason': 'All source contracts and validation evidence were reviewed',
+                 'evidence': list(self.evidence)}
+        output = '**FINAL_SPECIFICATION_REVIEW** =\n' + json.dumps(value, indent=2)
+        self.assertEqual(validate_final(attempt, output, None, ports.git, Path('/repo')), 'fulfilled')
+        self.assertTrue(valid_final_receipt(dict(attempt) | {'result': output, 'outcome': 'fulfilled'}))
+        for change in ({'revision': 'other'}, {'evidence': []}, {'reason': ''}, {'outcome': 'followup'}):
+            with self.subTest(change=change), self.assertRaises(PlanningResultInvalid):
+                validate_final(attempt, 'FINAL_SPECIFICATION_REVIEW: ' + json.dumps(value | change), None, ports.git, Path('/repo'))
+
     def test_final_followup_and_decision_require_matching_plans(self):
         from loop_manager_internal.planning.specification_review import validate_final
         ports = self.review_ports()

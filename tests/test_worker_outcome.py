@@ -76,7 +76,6 @@ class WorkerOutcomeTests(unittest.TestCase):
             decision(question=' '),
             decision() + '\nCOMMIT_TITLE: premature',
             decision() + '\n  TARGETED_TESTS: premature',
-            '  ' + decision(),
             decision(locations=[{"path": '../secret', 'section': 'x'}]),
             decision(locations=[{"path": 'docs/ARCHITECTURE.md',
                                  'section': 'Missing heading'}]),

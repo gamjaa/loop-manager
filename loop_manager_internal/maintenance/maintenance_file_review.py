@@ -7,6 +7,8 @@ later assessment stage.
 
 from __future__ import annotations
 
+from loop_manager_internal.application.result_normalization import bind_identity
+
 from dataclasses import dataclass
 import hashlib
 from loop_manager_internal.agents import common_guidance
@@ -196,10 +198,25 @@ def _chunk_spans(content: bytes) -> tuple[tuple[int, int], ...]:
 def _validate_chunk_reviews(value: object, content: bytes) -> list[dict]:
     """Require separately grounded evidence for every deterministic byte span."""
     spans = _chunk_spans(content)
-    if not isinstance(value, list) or len(value) != len(spans):
+    if not isinstance(value, list):
         raise FileReviewError("원본의 모든 검토 구간에 대한 근거가 필요합니다.")
+    supplied = {}
+    for item in value:
+        if not isinstance(item, dict) or type(item.get("index")) is not int or item["index"] in supplied or not 0 <= item["index"] < len(spans):
+            raise FileReviewError("검토 구간의 index가 중복되거나 범위 밖입니다.")
+        supplied[item["index"]] = item
     normalized = []
-    for index, ((start, end), item) in enumerate(zip(spans, value)):
+    for index, (start, end) in enumerate(spans):
+        item = supplied.get(index)
+        if item is None:
+            if content[start:end].strip():
+                raise FileReviewError("원본의 모든 검토 구간에 대한 근거가 필요합니다.")
+            rendered = _source_text(content[start:end])
+            middle_start = max(0, len(rendered) // 2 - 128)
+            item = {"index": index, "start": start, "end": end,
+                "chunk_hash": hashlib.sha256(content[start:end]).hexdigest(),
+                "opening_excerpt": rendered[:48], "middle_excerpt": rendered[middle_start:middle_start + 48],
+                "closing_excerpt": rendered[-48:], "review": compact_file_review.BLANK_CHUNK_NOTE}
         require_fields(item, CHUNK_FIELDS, f"evidence.chunk_reviews[{index}]")
         if (type(item["index"]) is not int or item["index"] != index
             or type(item["start"]) is not int or item["start"] != start
@@ -221,7 +238,7 @@ def _validate_chunk_reviews(value: object, content: bytes) -> list[dict]:
             raise FileReviewError("검토 구간의 지문 또는 시작·중간·끝 인용이 원본과 다릅니다.")
         note = _string(item["review"], f"evidence.chunk_reviews[{index}].review",
                        minimum=MIN_CHUNK_REVIEW_CHARS)
-        if not review_cites_source(note, (opening, middle, closing)):
+        if content[start:end].strip() and not review_cites_source(note, (opening, middle, closing)):
             raise FileReviewError(
                 f"evidence.chunk_reviews[{index}].review의 검토 근거가 원본 인용과 연결되지 않았습니다. "
                 f"세 excerpt 중 하나에 포함된 {MIN_REVIEW_CITATION_CHARS}자 이상의 연속 원본문자열을 "
@@ -241,6 +258,13 @@ def parse_review(output: str, source: TrackedSource, content: bytes, *,
     # Bound individual fields and lists below, not the serialized document:
     # mandatory chunk evidence grows with the source and JSON escaping varies.
     result = decode_result(output)
+    if hashlib.sha256(content).hexdigest() != source.content_hash:
+        raise FileReviewError("검토 원본 지문이 선정 파일과 다릅니다.")
+    try:
+        result = bind_identity(result, {"path": source.path, "content_hash": source.content_hash,
+            "mode": source.mode, "source_revision": source.revision})
+    except ValueError as error:
+        raise FileReviewError("검토 결과의 source identity가 선정 파일과 다릅니다.") from error
     if source.reason != ROOT_REVIEW_REASON and "version" in result:
         result = compact_file_review.expand_result(
             result, source, content, source_paths, chunk_bytes=MAX_EMBEDDED_SOURCE_BYTES,
@@ -358,7 +382,7 @@ def review_prompt(
             source_instruction += (
                 "검증된 원본은 0 byte이거나 공백만 포함한다. summary에는 실행 코드가 없는 "
                 "사실과 경로에서 확인할 수 있는 역할을 설명하라. 심벌·직접 참조를 만들어내지 마라. "
-                "0 byte이면 chunks는 []이며 공백 byte가 있으면 모든 구간의 공백 인용과 검토 근거가 필요하다.\n"
+                "0 byte이면 chunks는 []이며 공백 구간은 null로 두어 Manager 확정 사실을 재사용하라.\n"
             )
         facts = compact_file_review.source_facts(
             source, content, source_paths, chunk_bytes=MAX_EMBEDDED_SOURCE_BYTES,
@@ -384,8 +408,7 @@ def review_prompt(
             "검증된 원본은 0 byte이거나 공백만 포함한다. excerpts는 []로 기록하고 "
             "각 평가 항목과 code_map.responsibility에 실행 코드가 없는 사실과 "
             "경로에서 확인할 수 있는 역할을 설명하라. 심벌·직접 참조를 만들어내지 마라. "
-            "0 byte이면 chunk_reviews도 []이며, 공백 byte가 있으면 모든 구간의 "
-            "지문과 공백 인용 및 검토 근거를 기록하라.\n"
+            "공백 chunk는 생략하면 Manager가 실제 byte 범위와 지문·인용·공백 사실을 결합한다.\n"
         )
     root_inventory = json.dumps(
         [item.__dict__ for item in root_placements], ensure_ascii=False,
@@ -406,7 +429,8 @@ def review_prompt(
         "각 구간의 byte 범위는 index*chunk_bytes부터 다음 경계 또는 원본 끝까지이며 "
         "chunk_hash는 해당 byte 구간 SHA256이다. opening_excerpt는 구간의 처음 256자, "
         "middle_excerpt는 구간의 중간을 중심으로 앞뒤 128자, closing_excerpt는 마지막 256자에서 "
-        "각각 인용하라. review에는 이 인용 중 하나를 직접 언급하는 구체적인 근거가 필요하다.\n"
+        "각각 인용하라. review에는 이 인용 중 하나를 직접 언급하는 구체적인 근거가 필요하다. "
+        "공백만 있는 구간은 생략하면 Manager가 원본에 결합된 사실을 재사용한다.\n"
         + result_instructions()
     )
 

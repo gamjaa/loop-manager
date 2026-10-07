@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from loop_manager_internal.application.result_normalization import tagged_json
+
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
@@ -47,20 +49,11 @@ def parse_maintenance_planner_decision(
 ) -> MaintenancePlannerDecision:
     """Parse the single JSON result line emitted by a maintenance Planner."""
 
-    payloads = [
-        line[len(RESULT_PREFIX) :]
-        for line in output.splitlines()
-        if line.startswith(RESULT_PREFIX)
-    ]
-    if len(payloads) != 1:
-        raise MaintenanceOrchestrationError(
-            "유지보수 Planner는 MAINTENANCE_RESULT JSON 줄을 정확히 하나 반환해야 합니다."
-        )
     try:
-        payload = json.loads(payloads[0])
-    except json.JSONDecodeError as error:
+        payload = tagged_json(output, "MAINTENANCE_RESULT")
+    except (ValueError, RecursionError) as error:
         raise MaintenanceOrchestrationError(
-            "MAINTENANCE_RESULT 값이 올바른 JSON object가 아닙니다."
+            "MAINTENANCE_RESULT 값이 올바른 단일 JSON object가 아닙니다."
         ) from error
     if not isinstance(payload, dict):
         raise MaintenanceOrchestrationError(
@@ -81,6 +74,8 @@ def parse_maintenance_planner_decision(
         ) from error
 
     raw_ids = payload.get("plan_ids", [])
+    if isinstance(raw_ids, list):
+        raw_ids = [item.strip() if isinstance(item, str) else item for item in raw_ids]
     if not isinstance(raw_ids, list) or any(
         not isinstance(plan_id, str) or _PLAN_ID.fullmatch(plan_id) is None
         for plan_id in raw_ids

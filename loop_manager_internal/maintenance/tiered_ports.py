@@ -1,6 +1,8 @@
 """Composition boundary for the static index and semantic maintenance units."""
 from __future__ import annotations
 
+from loop_manager_internal.application.result_normalization import tagged_json
+
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -40,7 +42,7 @@ class TieredMaintenancePort:
     def prepare(self, run, selection=None):
         context, cycle = run.context, run.maintenance_cycle
         active = self.repository.active(context.repo, cycle.revision, str(run.row.active_sha))
-        if active is not None:
+        if active is not None and active.get("analysis_version", 1) == code_index.VERSION:
             return active
         selection = selection or self.select(context, str(run.row.active_sha))
         if not selection.required:
@@ -125,13 +127,9 @@ class TieredMaintenancePort:
         # may reject a candidate, link an existing plan, or link a newly validated plan.
         if findings:
             from loop_manager_internal.maintenance.maintenance_orchestration import MaintenanceOutcome
-            lines = [line[len("MODULE_FINDINGS_RESULT: "):] for line in str(run.row.planning_result or "").splitlines()
-                     if line.startswith("MODULE_FINDINGS_RESULT: ")]
-            if len(lines) != 1:
-                raise tiered_review.TieredReviewError("각 모듈 발견의 처리 결과가 필요합니다.")
             try:
-                dispositions = json.loads(lines[0], object_pairs_hook=tiered_review._unique)
-            except ValueError as error:
+                dispositions = tagged_json(str(run.row.planning_result or ""), "MODULE_FINDINGS_RESULT")
+            except (ValueError, RecursionError) as error:
                 raise tiered_review.TieredReviewError("모듈 발견 처리 결과 JSON이 잘못됐습니다.") from error
             if not isinstance(dispositions, list) or len(dispositions) != len(findings):
                 raise tiered_review.TieredReviewError("모듈 발견의 처리 결과가 누락됐습니다.")

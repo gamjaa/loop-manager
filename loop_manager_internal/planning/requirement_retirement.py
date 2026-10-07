@@ -5,6 +5,8 @@ infers fulfillment from a plan graph or from an unmerged Worker candidate.
 """
 from __future__ import annotations
 
+from loop_manager_internal.application.result_normalization import bind_identity, normalize_markers, tagged_json
+
 from dataclasses import dataclass
 import hashlib
 import json
@@ -23,14 +25,17 @@ from loop_manager_internal.storage.requirement_judgment_state import (
 SPECIFICATIONS = ("docs/PRODUCT.md", "docs/ARCHITECTURE.md")
 
 SOURCE = re.compile(r"docs/requirements/[^/\\]+\.md\Z")
-ASSESSMENT = re.compile(r"^REQUIREMENT_JUDGMENTS:\s*(\[.*\])\s*$", re.MULTILINE)
-
-
-def _single_result(pattern: re.Pattern[str], text: str):
-    matches = list(pattern.finditer(text))
-    if len(matches) > 1:
-        raise RetirementError("Requirement 판단 결과가 중복됐습니다.")
-    return matches[0] if matches else None
+def _judgment_result(text: str):
+    normalized = normalize_markers(text, ("REQUIREMENT_JUDGMENTS",))
+    if re.search(r"(?m)^REQUIREMENT_JUDGMENTS:", normalized) is None:
+        return None
+    try:
+        values = tagged_json(normalized, "REQUIREMENT_JUDGMENTS")
+    except (ValueError, TypeError, RecursionError) as error:
+        raise RetirementError("Requirement 판단 JSON이 유효하지 않습니다.") from error
+    if not isinstance(values, list):
+        raise RetirementError("Requirement 판단 JSON 배열이 필요합니다.")
+    return values
 
 
 class RetirementError(RuntimeError):
@@ -304,20 +309,16 @@ class RequirementRetirementPort:
     def validate_result(self, repo: str, repository: Path, revision: str,
                         planner_text: str) -> tuple[Judgment, ...]:
         expected = {item.path: item for item in self.pending(repo, repository, revision)}
-        match = _single_result(ASSESSMENT, planner_text)
+        values = _judgment_result(planner_text)
         if not expected:
-            if match is None:
+            if values is None:
                 return ()
-            try:
-                repeated = json.loads(match.group(1))
-            except ValueError as error:
-                raise RetirementError("Requirement 판단 JSON이 유효하지 않습니다.") from error
-            if not isinstance(repeated, list):
-                raise RetirementError("Requirement 판단 JSON 배열이 필요합니다.")
+            repeated = values
             preserved = []
             for value in repeated:
                 if not isinstance(value, dict) or not isinstance(value.get("path"), str):
                     raise RetirementError("보존된 Requirement 판단이 유효하지 않습니다.")
+                value = dict(value, path=value["path"].strip())
                 paths = value.get("relevant_paths")
                 if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
                     raise RetirementError("보존된 Requirement 판단 경로가 유효하지 않습니다.")
@@ -335,22 +336,25 @@ class RequirementRetirementPort:
                     raise RetirementError("보존된 Requirement 판단이 현재 입력과 다릅니다.")
                 preserved.append(prior)
             return tuple(preserved)
-        if match is None:
+        if values is None:
             raise RetirementError("일반 Planner의 Requirement 최종 판단이 없습니다.")
-        try:
-            values = json.loads(match.group(1))
-        except ValueError as error:
-            raise RetirementError("Requirement 판단 JSON이 유효하지 않습니다.") from error
         if not isinstance(values, list) or len(values) != len(expected):
             raise RetirementError("Requirement 판단 대상 집합이 입력과 다릅니다.")
         judgments = []
         for value in values:
+            if isinstance(value, dict) and isinstance(value.get("path"), str):
+                value = dict(value, path=value["path"].strip())
+                if value["path"] in expected:
+                    try:
+                        value = bind_identity(value, {"input_token": expected[value["path"]].token})
+                    except ValueError as error:
+                        raise RetirementError("Requirement 판단 input_token이 검증된 입력과 다릅니다.") from error
             if not isinstance(value, dict) or set(value) != {
                 "path", "input_token", "outcome", "criteria_evidence", "relevant_paths",
             }:
                 raise RetirementError("Requirement 판단 필드가 유효하지 않습니다.")
             path = value["path"]
-            if path not in expected or any(item.source_path == path for item in judgments):
+            if not isinstance(path, str) or path not in expected or any(item.source_path == path for item in judgments):
                 raise RetirementError("Requirement 판단 path가 입력과 다릅니다.")
             item = expected[path]
             if value["input_token"] != item.token or value["outcome"] not in {

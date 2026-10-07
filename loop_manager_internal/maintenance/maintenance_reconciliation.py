@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from loop_manager_internal.application.result_normalization import tagged_json
+
 from dataclasses import dataclass
 import hashlib
 from loop_manager_internal.agents import common_guidance
@@ -81,12 +83,9 @@ def _note(value: object, field: str, minimum: int = 12) -> str:
 
 
 def _single_json(output: str, prefix: str) -> dict:
-    lines = [line[len(prefix):] for line in output.splitlines() if line.startswith(prefix)]
-    if len(lines) != 1:
-        raise ReconciliationError(f"{prefix.strip()} JSON 줄이 정확히 하나 필요합니다.")
     try:
-        value = json.loads(lines[0])
-    except json.JSONDecodeError as error:
+        value = tagged_json(output, prefix)
+    except (ValueError, RecursionError) as error:
         raise ReconciliationError("종합 결과 JSON이 유효하지 않습니다.") from error
     if not isinstance(value, dict):
         raise ReconciliationError("종합 결과는 JSON object여야 합니다.")

@@ -1,6 +1,8 @@
 """Deterministic maintenance selection and durable module-level model receipts."""
 from __future__ import annotations
 
+from loop_manager_internal.application.result_normalization import bind_identity, tagged_json
+
 from dataclasses import dataclass
 import hashlib
 import json
@@ -12,6 +14,7 @@ from loop_manager_internal.agents import common_guidance
 from loop_manager_internal.maintenance.maintenance_file_inventory import cached_source_inventory, root_placement_inventory
 
 RESULT_PREFIX = "MODULE_REVIEW_RESULT: "
+RESULT_PROTOCOL = 2
 MAX_UNIT_BYTES = 160_000
 MAX_MODULES = 8
 MAX_OVERVIEW_SYMBOLS = 256
@@ -26,6 +29,10 @@ CREATE TABLE IF NOT EXISTS tiered_maintenance_assessments (
 CREATE TABLE IF NOT EXISTS tiered_maintenance_units (
     repo TEXT NOT NULL, digest TEXT NOT NULL, session_id TEXT, result_json TEXT,
     error TEXT, PRIMARY KEY (repo, digest));
+CREATE TABLE IF NOT EXISTS tiered_maintenance_result_audit (
+    repo TEXT NOT NULL, digest TEXT NOT NULL, protocol INTEGER NOT NULL,
+    source_revision TEXT, scope_json TEXT NOT NULL, raw_result TEXT NOT NULL,
+    normalized_result TEXT NOT NULL, PRIMARY KEY (repo, digest));
 CREATE TABLE IF NOT EXISTS tiered_maintenance_requests (
     repo TEXT PRIMARY KEY, request_id TEXT NOT NULL);
 """
@@ -98,6 +105,7 @@ def _model_record(record):
         "references": sorted({item["path"] for item in facts["references"]}),
         "dependent_modules": sorted({code_index.module_group(path) for path in facts["dependents"]}),
         "related_tests": facts["related_tests"], "uncertainties": facts["uncertainties"],
+        "whitespace_only": facts.get("whitespace_only", False),
         "boundary": facts["boundary"], "duplicates": facts["duplicates"],
         "contracts_digest": digest(facts["contracts"]), "facts_digest": digest(facts)}}
 
@@ -192,7 +200,7 @@ class TieredReviewRepository:
 
     def prepare(self, repo, cycle, selection: Selection, *, cycle_id=None, review_mode=None,
                 guidance_hash=None):
-        value = {"version": 1, "mode": selection.mode, "reasons": list(selection.reasons),
+        value = {"version": 1, "analysis_version": code_index.VERSION, "mode": selection.mode, "reasons": list(selection.reasons),
             "records": selection.index.records, "roots": list(selection.roots), "paths": list(selection.paths),
             "merged_count": selection.merged_count, "request_id": selection.request_id,
             "source_revision": selection.index.revision, "cycle": cycle, "cycle_id": cycle_id,
@@ -203,8 +211,24 @@ class TieredReviewRepository:
                                       "WHERE repo = ?", (repo,)).fetchone()
         if row and (row[0], row[1]) == (cycle, selection.index.revision):
             saved = json.loads(row[3])
-            if saved["records"] != value["records"] or saved["roots"] != value["roots"]:
+            if saved["roots"] != value["roots"]:
                 raise TieredReviewError("같은 assessment identity의 코드맵이 달라졌습니다.")
+            if saved["records"] != value["records"]:
+                identities = lambda records: {path: (item["content_hash"], item["mode"])
+                                               for path, item in records.items()}
+                if (saved.get("analysis_version", 1) == code_index.VERSION
+                        or identities(saved["records"]) != identities(value["records"])):
+                    raise TieredReviewError("같은 assessment identity의 코드맵이 달라졌습니다.")
+                # Reparse the same immutable sources after an analysis upgrade,
+                # retaining the original task scope and provenance.
+                previous = saved
+                saved = {**saved, "records": value["records"], "analysis_version": code_index.VERSION,
+                         "prior_analysis_assessment": previous}
+                saved.pop("digest", None)
+                saved["digest"] = digest(saved)
+                with self.connection:
+                    self.connection.execute("UPDATE tiered_maintenance_assessments SET digest = ?, assessment_json = ? "
+                        "WHERE repo = ?", (saved["digest"], code_index.encode(saved), repo))
             if saved.get('guidance_hash'):
                 return saved
             # A legacy assessment is not evidence of the newly injected rules.
@@ -234,7 +258,9 @@ class TieredReviewRepository:
             return ()
         modules = {}
         for path in assessment["paths"]:
-            modules.setdefault(code_index.module_group(path), {})[path] = _model_record(assessment["records"][path])
+            record = _model_record(assessment["records"][path])
+            if not _confirmed_blank(record):
+                modules.setdefault(code_index.module_group(path), {})[path] = record
         parts = []
         for module, records in sorted(modules.items()):
             current = {}
@@ -256,7 +282,7 @@ class TieredReviewRepository:
         review_mode = assessment.get("review_mode", assessment["mode"])
         epoch = {"mode": review_mode, "full_merge": assessment["merged_count"] if review_mode == "full" else None,
                  "request": assessment["request_id"], "roots": assessment["roots"], "version": code_index.VERSION,
-                 "guidance_hash": assessment.get("guidance_hash")}
+                 "guidance_hash": assessment.get("guidance_hash"), "protocol": RESULT_PROTOCOL}
         return tuple({"digest": digest({"parts": parts, "epoch": epoch}), "parts": parts} for parts in batches)
 
     def pending(self, repo, assessment):
@@ -278,45 +304,16 @@ class TieredReviewRepository:
                 "ON CONFLICT(repo, digest) DO UPDATE SET error = excluded.error", (repo, unit["digest"], error))
 
     def complete(self, repo, unit, output, loader):
-        lines = [line[len(RESULT_PREFIX):] for line in output.splitlines() if line.startswith(RESULT_PREFIX)]
-        if len(lines) != 1:
-            raise TieredReviewError("정밀 묶음은 MODULE_REVIEW_RESULT JSON 한 줄을 반환해야 합니다.")
-        try:
-            value = json.loads(lines[0], object_pairs_hook=_unique)
-        except ValueError as error:
-            raise TieredReviewError("정밀 묶음 JSON이 잘못됐습니다.") from error
-        if not isinstance(value, dict) or set(value) != {"digest", "reviews", "findings"} or value["digest"] != unit["digest"]:
-            raise TieredReviewError("정밀 묶음 identity 또는 필드가 다릅니다.")
+        active = self.latest(repo)
+        if active is None or not any(candidate == {"digest": unit["digest"], "parts": unit["parts"]}
+                                     for candidate in self.units(active)):
+            raise TieredReviewError("정밀 결과의 scope가 현재 assessment와 다릅니다.")
+        value = parse_module_result(unit, output, loader)
         parts = unit["parts"]
-        reviews, findings = value["reviews"], value["findings"]
-        if not isinstance(reviews, list) or len(reviews) != len(parts) or not isinstance(findings, list) or len(findings) > 64:
-            raise TieredReviewError("정밀 모듈 검토가 누락됐거나 발견 형식이 다릅니다.")
-        allowed = {path: record for part in parts for path, record in part["records"].items()}
-        def citation(item, paths):
-            if (not isinstance(item, dict) or set(item) != {"path", "excerpt"}
-                    or not isinstance(item["path"], str) or item["path"] not in paths):
-                raise TieredReviewError("정밀 근거 경로가 검토 범위 밖입니다.")
-            text = loader(item["path"])
-            if hashlib.sha256(text).hexdigest() != allowed[item["path"]]["content_hash"]:
-                raise TieredReviewError("정밀 근거의 원본 hash가 다릅니다.")
-            excerpt = item["excerpt"]
-            decoded = text.decode("utf-8", "replace")
-            if not isinstance(excerpt, str) or not min(12, len(decoded)) <= len(excerpt) <= 1200 or excerpt not in decoded:
-                raise TieredReviewError("정밀 인용이 실제 원본에서 확인되지 않습니다.")
-        for review, part in zip(reviews, parts):
-            if not isinstance(review, dict) or set(review) != {"module", "summary", "citations"} or review["module"] != part["module"]:
-                raise TieredReviewError("정밀 검토의 모듈 순서·범위가 다릅니다.")
-            _note(review["summary"])
-            if not isinstance(review["citations"], list) or not 1 <= len(review["citations"]) <= 16:
-                raise TieredReviewError("각 정밀 모듈의 원본 인용이 필요합니다.")
-            for item in review["citations"]:
-                citation(item, part["records"])
-        for finding in findings:
-            if not isinstance(finding, dict) or set(finding) != {"path", "excerpt", "reason"}:
-                raise TieredReviewError("정밀 발견의 필드가 다릅니다.")
-            _note(finding["reason"])
-            citation({"path": finding["path"], "excerpt": finding["excerpt"]}, allowed)
         with self.connection:
+            self.connection.execute("INSERT OR REPLACE INTO tiered_maintenance_result_audit VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (repo, unit["digest"], RESULT_PROTOCOL, active["source_revision"],
+                 code_index.encode(parts), output, code_index.encode(value)))
             self.connection.execute("INSERT INTO tiered_maintenance_units (repo, digest, result_json) VALUES (?, ?, ?) "
                 "ON CONFLICT(repo, digest) DO UPDATE SET result_json = excluded.result_json, error = NULL, session_id = NULL",
                 (repo, unit["digest"], code_index.encode(value)))
@@ -331,7 +328,20 @@ class TieredReviewRepository:
                                           (repo, unit["digest"])).fetchone()
             if row is None or row[0] is None:
                 raise TieredReviewError("정밀 모듈의 검토가 아직 완료되지 않았습니다.")
-            receipts.append(json.loads(row[0]))
+            audit = self.connection.execute(
+                "SELECT protocol, scope_json, raw_result, normalized_result, source_revision FROM tiered_maintenance_result_audit "
+                "WHERE repo = ? AND digest = ?", (repo, unit["digest"])).fetchone()
+            try:
+                receipt = json.loads(row[0])
+                if (audit is None or audit[0] != RESULT_PROTOCOL or json.loads(audit[1]) != unit["parts"]
+                        or not isinstance(audit[4], str) or not audit[4].strip()):
+                    raise ValueError("result audit scope differs")
+                normalized = parse_module_result(unit, audit[2])
+                if normalized != receipt or json.loads(audit[3]) != receipt:
+                    raise ValueError("raw and normalized results differ")
+            except (ValueError, TypeError, KeyError, RecursionError) as error:
+                raise TieredReviewError("보존된 모듈 결과의 원문·정규화·scope가 다릅니다.") from error
+            receipts.append(receipt)
         return {**assessment, "receipts": receipts}
 
     def promote(self, repo, evidence):
@@ -351,13 +361,63 @@ class TieredReviewRepository:
                                     (repo, evidence["request_id"]))
 
 
-def _unique(pairs):
-    value = {}
-    for key, item in pairs:
-        if key in value:
-            raise ValueError("duplicate key")
-        value[key] = item
+def parse_module_result(unit, output, loader=None):
+    """Validate judgments on first acceptance and when replaying the same raw audit."""
+    try:
+        value = tagged_json(output, RESULT_PREFIX)
+        if not isinstance(value, dict):
+            raise ValueError("module result must be an object")
+        value = bind_identity(value, {"digest": unit["digest"]})
+    except (ValueError, RecursionError) as error:
+        raise TieredReviewError("정밀 묶음 JSON 또는 identity가 잘못됐습니다.") from error
+    if set(value) != {"digest", "reviews", "findings"}:
+        raise TieredReviewError("정밀 묶음 identity 또는 필드가 다릅니다.")
+    parts = unit["parts"]
+    reviews, findings = value["reviews"], value["findings"]
+    if not isinstance(reviews, list) or len(reviews) != len(parts) or not isinstance(findings, list) or len(findings) > 64:
+        raise TieredReviewError("정밀 모듈 검토가 누락됐거나 발견 형식이 다릅니다.")
+    allowed = {path: record for part in parts for path, record in part["records"].items()}
+    def citation(item, paths, *, allow_blank=False):
+        if (not isinstance(item, dict) or set(item) != {"path", "excerpt"}
+                or not isinstance(item["path"], str) or item["path"] not in paths):
+            raise TieredReviewError("정밀 근거 경로가 검토 범위 밖입니다.")
+        if not isinstance(item["excerpt"], str) or (not item["excerpt"] and not allow_blank):
+            raise TieredReviewError("정밀 원본 인용이 누락됐습니다.")
+        if loader is None:
+            return  # The audit preserves the previously source-validated quotes.
+        text = loader(item["path"])
+        if hashlib.sha256(text).hexdigest() != allowed[item["path"]]["content_hash"]:
+            raise TieredReviewError("정밀 근거의 원본 hash가 다릅니다.")
+        excerpt = item["excerpt"]
+        decoded = text.decode("utf-8", "replace")
+        if (not allow_blank and not decoded.strip()) or not isinstance(excerpt, str) or not min(12, len(decoded)) <= len(excerpt) <= 1200 or excerpt not in decoded:
+            raise TieredReviewError("정밀 인용이 실제 원본에서 확인되지 않습니다.")
+    for index, (review, part) in enumerate(zip(reviews, parts)):
+        if isinstance(review, dict):
+            try:
+                review = bind_identity(review, {"module": part["module"]})
+            except ValueError as error:
+                raise TieredReviewError("정밀 검토의 모듈 identity가 다릅니다.") from error
+            reviews[index] = review
+        if not isinstance(review, dict) or set(review) != {"module", "summary", "citations"} or review["module"] != part["module"]:
+            raise TieredReviewError("정밀 검토의 모듈 순서·범위가 다릅니다.")
+        _note(review["summary"])
+        if not isinstance(review["citations"], list) or not 1 <= len(review["citations"]) <= 16:
+            raise TieredReviewError("각 정밀 모듈의 원본 인용이 필요합니다.")
+        allow_blank = all(record["facts"].get("whitespace_only") is True for record in part["records"].values())
+        for item in review["citations"]:
+            citation(item, part["records"], allow_blank=allow_blank)
+    for finding in findings:
+        if not isinstance(finding, dict) or set(finding) != {"path", "excerpt", "reason"}:
+            raise TieredReviewError("정밀 발견의 필드가 다릅니다.")
+        _note(finding["reason"])
+        citation({"path": finding["path"], "excerpt": finding["excerpt"]}, allowed)
     return value
+
+
+def _confirmed_blank(record):
+    facts = record["facts"]
+    return facts.get("whitespace_only") is True and not facts["uncertainties"]
 
 
 def has_assessment(connection, repo, cycle, revision):

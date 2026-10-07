@@ -273,7 +273,8 @@ _TARGETED_TEST_EXCEPTION_FAILURE = re.compile(
 
 
 _TARGETED_TEST_SUCCESS = re.compile(
-    r"(?i)(?<![\w])(?:PASS(?:ED)?|SUCCESS|OK|성공|통과)(?![\w])"
+    r"(?i)(?<![\w])(?:PASS(?:ED)?|SUCCESS|OK|"
+    r"(?:성공|통과)(?:했(?:습니다|다|음)|함)?)(?![\w])"
 )
 
 

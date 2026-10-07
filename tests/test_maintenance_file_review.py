@@ -238,6 +238,24 @@ class ProvisionalFileReviewTest(unittest.TestCase):
                         with self.assertRaises(review.FileReviewError):
                             review.parse_review(review.RESULT_PREFIX + json.dumps(forged), source, content)
 
+    def test_missing_source_identity_is_joined_but_explicit_mismatch_rejected(self):
+        content = b"def calculate(): return 1\n"
+        source = self.publish({"src/calc.py": content}).sources[0]
+        payload = result_for(source, "def calculate(): return 1", content)
+        for key in ("path", "content_hash", "mode", "source_revision"):
+            del payload[key]
+        output = "**FILE_REVIEW_RESULT** =\n" + json.dumps(payload, indent=2)
+        parsed = review.parse_review(output, source, content)
+        self.assertEqual(parsed["source_revision"], source.revision)
+        for key in ("path", "content_hash", "mode", "source_revision"):
+            with self.subTest(key=key), self.assertRaises(review.FileReviewError):
+                review.parse_review(review.RESULT_PREFIX + json.dumps(payload | {key: "wrong"}), source, content)
+        with self.assertRaises(review.FileReviewError):
+            review.parse_review(output, source, content + b"# changed\n")
+        payload["evidence"]["excerpts"] = []
+        with self.assertRaises(review.FileReviewError):
+            review.parse_review(review.RESULT_PREFIX + json.dumps(payload), source, content)
+
     def test_non_utf8_source_has_byte_preserving_prompt_and_review(self):
         content = b"def calculate(): return '\xff'\n"
         inventory = self.publish({"src/calc.py": content})
@@ -469,7 +487,7 @@ class ProvisionalFileReviewTest(unittest.TestCase):
         line = review.RESULT_PREFIX + json.dumps(payload)
         with self.assertRaisesRegex(review.FileReviewError, "정확히 하나"):
             review.parse_review(line + "\n" + line, source, content)
-        with self.assertRaisesRegex(review.FileReviewError, "빈 원본"):
+        with self.assertRaisesRegex(review.FileReviewError, "원본 지문"):
             review.parse_review(line, source, b"")
         payload["mode"] = "100755"
         with self.assertRaisesRegex(review.FileReviewError, "identity"):

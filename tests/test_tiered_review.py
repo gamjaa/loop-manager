@@ -43,6 +43,93 @@ class TieredReviewTest(unittest.TestCase):
         self.connection.commit()
         return evidence
 
+    def test_normalized_result_binds_identity_preserves_raw_and_rejects_missing_judgments(self):
+        assessment = self.repository.prepare("repo", 1, self.select())
+        unit = self.repository.pending("repo", assessment)
+        value = {"reviews": [{"summary": "Actual responsibility and source relationships were reviewed.",
+            "citations": [{"path": next(iter(part["records"])),
+                          "excerpt": self.sources[next(iter(part["records"]))].decode().splitlines()[0]}]}
+            for part in unit["parts"]], "findings": []}
+        output = " **MODULE_REVIEW_RESULT** =\n```json\n" + json.dumps(value, indent=2) + "\n```"
+        self.repository.complete("repo", unit, output, self.sources.__getitem__)
+        restarted = tiered_review.TieredReviewRepository(self.connection)
+        self.assertIsNone(restarted.pending("repo", assessment))
+        receipt = restarted.evidence("repo", 1, "sha")["receipts"][0]
+        self.assertEqual(receipt["digest"], unit["digest"])
+        self.assertEqual([r["module"] for r in receipt["reviews"]], [p["module"] for p in unit["parts"]])
+        audit = self.connection.execute("SELECT raw_result, normalized_result, source_revision, protocol "
+            "FROM tiered_maintenance_result_audit").fetchone()
+        self.assertEqual(audit[0], output)
+        self.assertEqual(json.loads(audit[1]), receipt)
+        self.assertEqual((audit[2], audit[3]), ("sha", tiered_review.RESULT_PROTOCOL))
+        for change in ({"digest": "other"}, {"findings": None}, {"reviews": []}):
+            with self.subTest(change=change), self.assertRaises(tiered_review.TieredReviewError):
+                self.repository.complete("repo", unit, tiered_review.RESULT_PREFIX + json.dumps(value | change), self.sources.__getitem__)
+        for field in ("summary", "citations"):
+            missing = json.loads(json.dumps(value))
+            del missing["reviews"][0][field]
+            with self.subTest(field=field), self.assertRaises(tiered_review.TieredReviewError):
+                self.repository.complete("repo", unit, tiered_review.RESULT_PREFIX + json.dumps(missing), self.sources.__getitem__)
+        wrong_module = json.loads(json.dumps(value))
+        wrong_module["reviews"][0]["module"] = "another/module"
+        with self.assertRaises(tiered_review.TieredReviewError):
+            self.repository.complete("repo", unit, tiered_review.RESULT_PREFIX + json.dumps(wrong_module), self.sources.__getitem__)
+
+    def test_analysis_upgrade_rebinds_facts_only_for_identical_sources_and_keeps_scope(self):
+        selection = self.select()
+        assessment = self.repository.prepare("repo", 1, selection)
+        legacy = json.loads(json.dumps(assessment))
+        legacy.pop("analysis_version")
+        legacy["paths"] = ["pkg/a.py"]
+        for record in legacy["records"].values():
+            record["facts"].pop("whitespace_only")
+        self.connection.execute("UPDATE tiered_maintenance_assessments SET assessment_json = ?",
+                                (json.dumps(legacy),))
+        rebound = self.repository.prepare("repo", 1, selection)
+        self.assertEqual(rebound["paths"], ["pkg/a.py"])
+        self.assertEqual(rebound["prior_analysis_assessment"], legacy)
+        self.assertEqual(rebound["analysis_version"], code_index.VERSION)
+        self.assertEqual(self.repository.prepare("repo", 1, selection), rebound)
+        forged = json.loads(json.dumps(legacy))
+        forged["records"]["pkg/a.py"]["content_hash"] = "wrong"
+        self.connection.execute("UPDATE tiered_maintenance_assessments SET assessment_json = ?",
+                                (json.dumps(forged),))
+        with self.assertRaises(tiered_review.TieredReviewError):
+            self.repository.prepare("repo", 1, selection)
+
+    def test_restart_refuses_result_without_matching_raw_audit(self):
+        self.complete(self.select())
+        self.connection.execute("UPDATE tiered_maintenance_units SET result_json = '{}' ")
+        with self.assertRaises(tiered_review.TieredReviewError):
+            tiered_review.TieredReviewRepository(self.connection).evidence("repo", 1, "sha")
+
+    def test_resume_rejects_missing_judgment_even_if_raw_and_normalized_are_equal(self):
+        self.complete(self.select())
+        row = self.connection.execute('SELECT digest,result_json FROM tiered_maintenance_units LIMIT 1').fetchone()
+        for field, replacement in (('reviews', []), ('findings', None)):
+            invalid = json.loads(row[1])
+            invalid[field] = replacement
+            encoded = json.dumps(invalid)
+            self.connection.execute('UPDATE tiered_maintenance_units SET result_json = ? WHERE digest = ?', (encoded, row[0]))
+            self.connection.execute('UPDATE tiered_maintenance_result_audit SET raw_result = ?, normalized_result = ? WHERE digest = ?',
+                (tiered_review.RESULT_PREFIX + encoded, encoded, row[0]))
+            with self.subTest(field=field), self.assertRaises(tiered_review.TieredReviewError):
+                self.repository.evidence('repo', 1, 'sha')
+
+    def test_blank_facts_skip_only_blank_modules_and_keep_uncertain_sources(self):
+        self.sources = {"blank/a.py": b"", "blank/b.py": b" \n\t", "pkg/empty.py": b" \n",
+            "pkg/meaningful.py": b"def calculate(): return 1\n", "unknown/file.js": b" \n",
+            "dynamic/a.py": b"__import__('anything')\n", "broken/a.py": b"def (\n"}
+        assessment = self.repository.prepare("repo", 1, self.select())
+        units = self.repository.units(assessment)
+        parts = [part for unit in units for part in unit["parts"]]
+        self.assertNotIn("blank", [part["module"] for part in parts])
+        self.assertTrue({"pkg", "unknown", "dynamic", "broken"} <= {part["module"] for part in parts})
+        pkg = next(part for part in parts if part["module"] == "pkg")
+        self.assertNotIn("pkg/empty.py", pkg["records"])
+        self.assertTrue(assessment["records"]["pkg/empty.py"]["facts"]["whitespace_only"])
+        self.assertIn("blank/a.py", assessment["records"])
+
     def test_first_full_then_zero_model_fast_and_separate_global_clock(self):
         first = self.select(7)
         self.assertEqual((first.mode, first.reasons), ("full", ("initial_full",)))

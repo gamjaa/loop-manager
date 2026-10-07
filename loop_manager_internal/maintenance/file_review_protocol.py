@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from loop_manager_internal.application.result_normalization import normalize_markers
+
 import hashlib
 import json
 import re
@@ -138,6 +140,7 @@ def _reject_constant(value: str) -> None:
 
 def decode_result(output: str) -> dict:
     """Decode one tagged object across harmless whitespace and JSON line breaks."""
+    output = normalize_markers(output, (RESULT_MARKER,))
     markers = list(re.finditer(r"(?m)^[ \t]*FILE_REVIEW_RESULT:[ \t]*", output))
     if len(markers) != 1:
         raise FileReviewError("FILE_REVIEW_RESULT JSON 결과가 정확히 하나 필요합니다.")

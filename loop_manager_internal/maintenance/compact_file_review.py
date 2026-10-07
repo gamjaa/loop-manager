@@ -15,6 +15,7 @@ from loop_manager_internal.maintenance.file_review_protocol import (
 
 
 VERSION = 2
+BLANK_CHUNK_NOTE = "Manager 확정 사실: 이 원본 byte 구간에는 공백만 있고 실행 코드가 없습니다."
 REQUIRED_FIELDS = ("version", "path", "content_hash", "mode", "source_revision", "summary", "chunks")
 OPTIONAL_FIELDS = ("issues", "symbols", "entry_points", "references", "tests", "pending", "similar")
 
@@ -114,6 +115,8 @@ def expand_result(result: dict, source, content: bytes, source_paths=(), *, chun
         raise FileReviewError("compact 검토에도 원본의 모든 검토 구간에 대한 근거가 필요합니다.")
     chunks = []
     for fact, note in zip(facts["chunk_reviews"], notes):
+        if note is None and not content[fact["start"]:fact["end"]].strip():
+            note = BLANK_CHUNK_NOTE
         review_string(note, "chunk review", minimum=MIN_CHUNK_REVIEW_CHARS)
         chunks.append({**fact, "review": note})
     text = content.decode("utf-8", "backslashreplace")
@@ -153,7 +156,8 @@ def result_instructions() -> str:
         "summary와 issues의 각 값은 12~1200자다. chunks에는 모든 구간의 순서대로 "
         "20~1200자의 구체적인 검토 근거를 하나씩 기록하고, 제공한 세 excerpt 중 하나의 "
         "연속 원본문자열을 12자 이상 그대로 인용하라(더 짧은 원본 인용은 전체 사용). "
-        "각 구간 전체를 읽지 못했으면 완료를 주장하지 마라. "
+        "공백만 있는 구간의 chunks 항목은 null로 두면 Manager가 원본 사실을 결합한다. "
+        "내용이 있는 구간 전체를 읽지 못했으면 완료를 주장하지 마라. "
         "Manager가 계산한 hash·범위·인용은 재계산하거나 결과에 복사하지 마라. "
         "symbols·entry_points는 Manager symbols의 0부터 시작하는 index 또는 실제 심벌 문자열이다. "
         "references·pending은 Manager references의 index 또는 기존 "

@@ -26,6 +26,25 @@ class CompactFileReviewTest(unittest.TestCase):
                                   source or self.source, self.content if content is None else content,
                                   source_paths=self.paths)
 
+    def test_blank_chunk_facts_reused_without_filling_meaningful_judgment(self):
+        content = b"\n" * review.MAX_EMBEDDED_SOURCE_BYTES + b"def calculate(): return 1\n"
+        source = self.source_for(content)
+        payload = compact_result(source, content)
+        payload["chunks"][0] = None
+        parsed = self.parse(payload, source=source, content=content)
+        self.assertEqual(parsed["evidence"]["chunk_reviews"][0]["review"], compact.BLANK_CHUNK_NOTE)
+        self.assertEqual(parsed["evidence"]["chunk_reviews"][0]["chunk_hash"],
+                         hashlib.sha256(content[:review.MAX_EMBEDDED_SOURCE_BYTES]).hexdigest())
+        parsed["evidence"]["chunk_reviews"].pop(0)
+        restored = self.parse(parsed, source=source, content=content)
+        self.assertEqual(len(restored["evidence"]["chunk_reviews"]), 2)
+        payload["chunks"][1] = None
+        with self.assertRaises(review.FileReviewError):
+            self.parse(payload, source=source, content=content)
+        parsed["evidence"]["chunk_reviews"][0]["chunk_hash"] = "wrong"
+        with self.assertRaises(review.FileReviewError):
+            self.parse(parsed, source=source, content=content)
+
     def test_selected_static_candidates_expand_to_source_grounded_legacy_contract(self):
         self.payload.update(symbols=[1], entry_points=[1], references=[0], pending=[0],
                             tests=["tests/test_review.py"])
@@ -86,6 +105,11 @@ class CompactFileReviewTest(unittest.TestCase):
 
     def test_missing_unknown_or_invalid_fields_cannot_be_accepted(self):
         for key in compact.REQUIRED_FIELDS:
+            if key in {"path", "content_hash", "mode", "source_revision"}:
+                payload = dict(self.payload)
+                del payload[key]
+                self.assertEqual(self.parse(payload)[key], self.payload[key])
+                continue
             payload = dict(self.payload)
             del payload[key]
             with self.subTest(missing=key), self.assertRaises(review.FileReviewError):

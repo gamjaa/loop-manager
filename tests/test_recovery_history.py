@@ -175,7 +175,6 @@ class RecoveryHistoryTest(BoundedRecoveryFixture, unittest.TestCase):
             "ISSUE_ID: app.py::missing-verdict::blocking\nblocking issue",
             "VERDICT: PASS\nVERDICT: FAIL",
             "ISSUE_ID: app.py::unknown-verdict::blocking\nVERDICT: MAYBE",
-            "VERDICT: PASS\ntrailing explanation",
         )
         with RecoveryBoundary() as boundary:
             for variant, review in enumerate(invalid_reviews):

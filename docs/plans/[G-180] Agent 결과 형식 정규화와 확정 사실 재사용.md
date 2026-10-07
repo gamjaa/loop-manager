@@ -36,8 +36,14 @@ priority: normal
 ## Progress
 
 - [x] 2026-10-05 planning 기준 a049a76의 명세·원본·관련 테스트와 비종료 catalog에서 미충족 범위를 확인함. 구현·테스트 실행은 하지 않음.
-- [ ] 구현 및 관련 targeted unit 검증
-- [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
+- [x] 2026-10-07 결과 marker·구분자·공백·다중 줄 JSON 정규화, 검증된 호출 identity 결합, 공백 파일·chunk 사실 재사용과 원문·정규화·scope·protocol 재개 검증을 구현함. Worker·Reviewer·Planner·모듈·파일 결과의 targeted unit 검증을 통과함. (이전 실행 기록이며 외부 결과가 현재 수동 후보에 제공되지 않아 현재 검증 근거로 승계하지 않음.)
+- [x] 2026-10-07 `bash scripts/verify.sh` 전체 verify 통과 기록: 199개 모듈, 3,038개 성공·2개 skip, 종료 코드 0. (이전 실행 기록이며 현재 수동 후보의 전체 verify 근거는 NOT_RUN.)
+- [x] 2026-10-07 `origin/main` 60b956d rebase 뒤 AC와 실제 경로를 대조하고 회귀를 보완했다는 이전 실행 기록: 관련 테스트 84개 통과. (외부 결과가 현재 수동 후보에 제공되지 않아 현재 검증 근거로 승계하지 않음.)
+- [x] 2026-10-07 rebase 후 upstream verify 입력·최종 전문 검증·모듈 평가 관련 테스트 60개와 전체 verify 3,101개 성공·2개 skip을 기록함. 보고서 경로: `.cache/verify/6abde7eaf42d4b0eb0bc30e1a45ef3f7/summary.json`. (이전 실행 기록이며 현재 수동 후보의 전체 verify 근거는 NOT_RUN.)
+- [x] 2026-10-07 수동 후보의 rebase 충돌 파일에서 upstream PASS/FAIL 복구 경계 검증과 형식 정규화 no-retry 검증을 함께 보존함. 기존 중복 테스트만 통합하고 충돌 표식을 제거함.
+- [x] 2026-10-07 제목 필드 줄바꿈과 한국어 성공 활용형이 Worker 결과 검증에서 거부되던 경계를 정규화함. Manager rebase 기준 HEAD `f81225f`의 현재 후보에서 좁은 targeted unit 30개(14개 명령) 통과: Worker 성공 보고·제목, Reviewer/Planner 결과, 복구 이력, 파일·모듈 근거, 빈 chunk·공백 module 및 no-call 검증. 전체 verify는 실행하지 않음.
+- [x] 2026-10-07 저장된 Requirement 판단의 재검증 분기에도 경로 공백 정규화를 적용함. 공백 경로의 저장 후 새 port 재개 회귀 테스트 1개 통과: `python3 -m unittest tests.test_requirement_retirement.RequirementRetirementTest.test_saved_judgment_replay_normalizes_requirement_path_whitespace`.
+- [ ] 현재 후보의 Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
 

@@ -271,7 +271,6 @@ class RecoveryFingerprintsTest(BoundedRecoveryFixture, unittest.TestCase):
             "c:/repo/plan.md",
             "docs/plans/control\x01.md",
             "docs/ plan.md",
-            "docs/plans/plan.md ",
         )
         for path in invalid_paths:
             review = (
@@ -283,6 +282,13 @@ class RecoveryFingerprintsTest(BoundedRecoveryFixture, unittest.TestCase):
                 "ISSUE_ID 형식이 유효하지 않습니다",
             ):
                 loop_manager.parse_reviewer_result(review)
+
+        self.assertEqual(
+            loop_manager.parse_reviewer_result(
+                "ISSUE_ID: docs/plans/plan.md ::stable-symbol::blocking\nVERDICT: FAIL"
+            ),
+            ("FAIL", ("ISSUE_ID:docs/plans/plan.md::stable-symbol::blocking",)),
+        )
 
     def test_verify_fingerprint_uses_full_output_before_feedback_truncation(self):
         with tempfile.TemporaryDirectory() as directory:

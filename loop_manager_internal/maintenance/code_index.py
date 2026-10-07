@@ -16,7 +16,7 @@ import sqlite3
 import stat
 import subprocess
 
-VERSION = 1
+VERSION = 2
 ARTIFACT_VERSION = 2
 ARTIFACT_PATH = "docs/maintenance/code-map.jsonl"
 _SCHEMA = """CREATE TABLE IF NOT EXISTS static_code_index (
@@ -58,7 +58,8 @@ def parse_source(path: str, content: bytes) -> dict:
     """No model-generated descriptions are introduced into static facts."""
     facts = {"symbols": [], "imports": [], "exports": [], "attribute_uses": [], "contracts": [], "duplicates": [],
              "uncertainties": [], "semantic_hash": hashlib.sha256(content).hexdigest(),
-             "boundary": bool(_BOUNDARY.search(path.lower()))}
+             "boundary": bool(_BOUNDARY.search(path.lower())),
+             "whitespace_only": not content.strip(b" \t\r\n\v\f")}
     if not path.endswith((".py", ".pyi")):
         facts["uncertainties"].append("unsupported_source_format")
         return facts

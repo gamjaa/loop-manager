@@ -47,7 +47,7 @@ class CodeIndexTest(unittest.TestCase):
         sources["a.py"] = b"def value():\n    return 2\n"
         index = self.build(sources)
         lines = index.serialize().splitlines()
-        self.assertEqual(json.loads(lines[0]), {"version": 2, "kind": "static", "analysis_version": 1})
+        self.assertEqual(json.loads(lines[0]), {"version": 2, "kind": "static", "analysis_version": code_index.VERSION})
         self.assertNotIn("responsibility", json.loads(lines[1])["facts"])
         self.assertEqual(index.serialize(), self.build(sources).serialize())
 
