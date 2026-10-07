@@ -49,6 +49,8 @@ CREATE TABLE IF NOT EXISTS notified_block_incidents (
     released_at TEXT,
     resumed_at TEXT,
     started_operation TEXT,
+    started_at TEXT,
+    start_identity TEXT,
     confirmed_before INTEGER NOT NULL DEFAULT 0,
     version INTEGER NOT NULL DEFAULT 0,
     FOREIGN KEY (repo) REFERENCES projects(repo)
@@ -99,6 +101,10 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         connection.execute(
             "ALTER TABLE notified_block_incidents ADD COLUMN started_operation TEXT"
         )
+    if "start_identity" not in incident_columns:
+        connection.execute("ALTER TABLE notified_block_incidents ADD COLUMN start_identity TEXT")
+    if "started_at" not in incident_columns:
+        connection.execute("ALTER TABLE notified_block_incidents ADD COLUMN started_at TEXT")
     if "confirmed_before" not in incident_columns:
         connection.execute(
             "ALTER TABLE notified_block_incidents ADD COLUMN confirmed_before "
@@ -290,6 +296,7 @@ def _insert(
     kind: str,
     payload: dict[str, object],
 ) -> None:
+    payload = _event_payload(kind, payload)
     connection.execute(
         "INSERT OR IGNORE INTO notification_outbox "
         "(event_key, repo, event_type, payload) VALUES (?, ?, ?, ?)",
@@ -300,3 +307,13 @@ def _insert(
 def _encode_payload(payload: dict[str, object]) -> str:
     """Use the same JSON representation for incidents and outbox rows."""
     return json.dumps(payload, ensure_ascii=False)
+
+
+def _event_payload(kind: str, payload: dict[str, object]) -> dict[str, object]:
+    from datetime import datetime, timezone
+    payload = dict(payload)
+    payload.setdefault("occurred_at", datetime.now(timezone.utc).isoformat())
+    payload.setdefault("silent", kind in {"resumed", "project_completed", "work_started", "planning_result"})
+    payload.setdefault("status", {"pr_created": "PR Merge 대기", "blocked": "사용자 조치 대기",
+                                  "resumed": "작업 중", "project_completed": "완료"}.get(kind, "대기"))
+    return payload

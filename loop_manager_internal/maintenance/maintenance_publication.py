@@ -575,6 +575,8 @@ def _apply_maintenance_planning_batch(
         effects._register_execplan_rows(
             connection, repo, worktree, list(result.plans), plan_commit
         )
+        from loop_manager_internal.notifications import notifications
+        notifications.record_planning_publication(connection, repo, result.plans, plan_commit)
         for revision in result.revisions:
             snapshot = revision.snapshot
             _sources, dependencies, _priority = effects._execplan_metadata(

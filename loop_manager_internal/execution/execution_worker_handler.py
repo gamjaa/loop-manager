@@ -366,15 +366,6 @@ class WorkerHandler:
                     self.ports.state.connection, self.ports.identity.repo, str(plan['id']),
                     review_turn_run_id, review_result_id,
                 )
-                with self.ports.state.connection:
-                    resumed = notifications.record_work_start(
-                        self.ports.state.connection, self.ports.identity.repo, "Worker",
-                        plan_id=str(plan['id']),
-                    )
-                if resumed:
-                    self.ports.operation_log(
-                        f"차단 해제 후 Worker 작업 재개: {plan['id']}"
-                    )
                 return self.ports.run_agent(
                     target.provider, context.worktree, self.ports.identity.state_dir,
                     self.ports.identity.config_path, 'worker',

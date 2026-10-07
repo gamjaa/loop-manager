@@ -124,6 +124,31 @@ def run_agent(
                 "Agent 격리 증거 저장 실패"
             ) from error
 
+    from loop_manager_internal.notifications import notifications
+
+    def observe_process() -> None:
+        if connection is None or identity is None or invocation is None:
+            return
+        if role_name not in {"worker", "planner", "maintenance_planner"}:
+            return
+        try:
+            observed_role = role_name
+            if role_name == "planner" and scope_id is not None:
+                from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
+                owner = RuntimeStateRepository(connection).scope_owner(invocation.repo)
+                if owner is not None and owner["agent_role"] == "maintenance_planner":
+                    observed_role = "maintenance_planner"
+            with connection:
+                notifications.record_process_start(
+                    connection, invocation.repo, observed_role, invocation.notification_id or identity,
+                    plan_id=invocation.plan_id, resumed=bool(session_id),
+                )
+            notifications.flush_project_events(connection, invocation.repo)
+        except sqlite3.Error:
+            pass  # A failed event write must not change the physical call.
+
+    if connection is not None and invocation is not None:
+        notifications.flush_project_events(connection, invocation.repo)
     request = AgentRequest(
         worktree=worktree,
         state_dir=state_dir,
@@ -135,6 +160,8 @@ def run_agent(
         persist_session=persist_session,
         session_id=session_id,
         on_session_started=observe_session,
+        on_process_started=(observe_process if role_name in {"worker", "planner", "maintenance_planner"}
+                            and connection is not None and invocation is not None else None),
         profile=resolved,
         on_isolation_checked=observe_isolation,
         isolation_snapshot_digest=lambda: hashlib.sha256(

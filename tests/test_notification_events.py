@@ -520,9 +520,9 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
             notifications.dispatch_pending(
                 connection, "token", "chat", adapter=delivered,
             ),
-            1,
+            2,
         )
-        delivered.assert_called_once()
+        self.assertEqual(delivered.call_count, 2)
 
     def test_pr_and_blocked_payloads_are_complete_and_deduplicated(self):
         connection = self.connection()
@@ -568,6 +568,8 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
                 "execplan_id": "G-018",
                 "execplan_title": "Reliable notices",
                 "pr_url": "https://example.test/pr/18",
+                "occurred_at": payloads["pr_created"]["occurred_at"],
+                "status": "PR Merge 대기", "silent": False,
             },
         )
         blocked = payloads["blocked"]
@@ -716,3 +718,160 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
         self.assertIn("docs/PRODUCT.md", payload["paths"])
         self.assertIn("docs/requirements/*.md", payload["paths"])
         self.assertIn("docs/ARCHITECTURE.md", payload["paths"])
+
+
+class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
+    def test_review_failure_identity_preserves_changes_and_transaction_boundary(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        with self.assertRaisesRegex(RuntimeError, 'interrupted'):
+            with connection:
+                connection.execute("UPDATE projects SET phase = 'REVIEWING', last_error = 'protocol error' WHERE repo = ?", (repo,))
+                notifications.enqueue_current_project_events(connection, repo)
+                raise RuntimeError('interrupted')
+        self.assertEqual(self.events(connection), [])
+        loop_manager.update_project(connection, repo, phase='REVIEWING', last_error='protocol error')
+        first = self.events(connection)[0]['payload']
+        loop_manager.update_project(connection, repo, last_error='protocol error')
+        self.assertEqual(len(self.events(connection)), 1)
+        self.assertEqual(self.events(connection)[0]['payload'], first)
+        loop_manager.update_project(connection, repo, last_error='different protocol error')
+        self.assertEqual(len(self.events(connection)), 2)
+        loop_manager.update_project(connection, repo, verify_token='new-candidate', last_error='protocol error')
+        self.assertEqual(len(self.events(connection)), 3)
+
+    def test_selection_is_silent_and_actual_start_is_durable_and_deduplicated(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        loop_manager.update_project(connection, repo, phase='IMPLEMENTING')
+        self.assertEqual(self.events(connection), [])
+        with connection:
+            notifications.record_process_start(connection, repo, 'worker', 'process-1', plan_id='G-018')
+            notifications.record_process_start(connection, repo, 'worker', 'process-1', plan_id='G-018')
+        event = self.events(connection)[0]
+        payload = json.loads(event['payload'])
+        self.assertEqual(len(self.events(connection)), 1)
+        self.assertEqual(payload['execplan_title'], 'Reliable notices')
+        self.assertTrue(payload['silent'])
+        self.assertEqual(payload['status'], '작업 중')
+        self.assertIn(payload['occurred_at'], notifications._message('work_started', payload))
+        with connection:
+            notifications.record_process_start(connection, repo, 'worker', 'process-2', plan_id='G-018', resumed=True)
+        self.assertEqual(len(self.events(connection)), 2)
+
+    def test_publication_and_draft_share_one_decision_notice_with_waiting(self):
+        from loop_manager_internal.storage import execplan_draft_state
+        connection = self.connection()
+        repo = '/projects/alpha'
+        plan = {'id': 'G-018', 'title': 'Reliable notices', 'sources': ['docs/PRODUCT.md'],
+                'draft': True, 'draft_scope': 'scope', 'draft_question':
+                'Question: Choose A or B?\nOptions: A, B\nImpact: A retains history',
+                'draft_question_identity': 'question-1'}
+        with connection:
+            execplan_draft_state.observe(connection, repo, 'docs/plans/choice.md', plan, 'hash', 'remote-sha',
+                                        remote_url='https://github.com/org/repo')
+            notifications.record_planning_publication(connection, repo, [('docs/plans/choice.md', plan)], 'remote-sha')
+            notifications.enqueue_current_project_events(connection, repo)
+        snapshot = work_exhaustion.collect(connection, repo, cycle='cycle', active_requirements=())
+        self.assertIsNotNone(snapshot)
+        notifications.enqueue_waiting_reason(connection, repo, snapshot)
+        events = self.events(connection)
+        self.assertEqual([row['event_type'] for row in events], ['draft_decision'])
+        payload = json.loads(events[0]['payload'])
+        self.assertFalse(payload['silent'])
+        self.assertIn('/blob/remote-sha/', payload['url'])
+        self.assertIn('Impact:', payload['question'])
+        self.assertIn('사용자 판단 대기', payload['status'])
+        with connection:
+            execplan_draft_state.cancel(connection, repo, 'G-018', 'deleted-revision')
+        delivered = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=delivered), 0)
+        delivered.assert_not_called()
+        self.assertIsNotNone(self.events(connection)[0]['canceled_at'])
+
+    def test_automatic_failure_deduplicates_retry_but_separates_progress(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        repository = RecoveryRepository(connection)
+        for marker in ('head-a', 'head-a', 'head-b'):
+            with connection:
+                repository.observe(RecoveryObservation(
+                    RecoveryReason.FETCH_FAILED, repo, 'G-018', 'PUBLISHING',
+                    'plan-sha', 'base-sha', 'fetch-failure', marker, 'fetch failed'))
+        events = [row for row in self.events(connection) if row['event_type'] == 'stage_failed']
+        self.assertEqual(len(events), 2)
+        self.assertTrue(all(json.loads(row['payload'])['silent'] for row in events))
+
+    def test_failed_uncommitted_publication_never_leaves_success_event(self):
+        connection = self.connection()
+        with self.assertRaises(RuntimeError):
+            with connection:
+                notifications.record_planning_publication(connection, '/projects/alpha',
+                    [('plan.md', {'id': 'G-018', 'title': 'Reliable notices'})], 'sha')
+                raise RuntimeError('catalog apply failed')
+        self.assertEqual(self.events(connection), [])
+
+    def test_pr_registration_reports_merge_wait_with_original_time(self):
+        connection = self.connection()
+        loop_manager.update_project(connection, '/projects/alpha', phase='PR_OPEN', pr_url='https://example.test/pr/18')
+        row = next(row for row in self.events(connection) if row['event_type'] == 'pr_created')
+        payload = json.loads(row['payload'])
+        self.assertFalse(payload['silent'])
+        self.assertEqual(payload['status'], 'PR Merge 대기')
+        self.assertIn(payload['occurred_at'], notifications._message('pr_created', payload))
+
+    def test_planning_result_no_plan_dedup_and_unpublished_plan_identity(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.planning.state_ports import _PlanningStatePorts
+        connection = self.connection()
+        state = object.__new__(_PlanningStatePorts)
+        state._connection = connection
+        for _ in range(2):
+            state.record_planning_result('/projects/alpha', 'input-1', None)
+        self.assertEqual(len(self.events(connection)), 1)
+        self.assertEqual(json.loads(self.events(connection)[0]['payload'])['status'], '새 계획 없음')
+        state.record_planning_result('/projects/alpha', 'input-1', SimpleNamespace(plans=(
+            ('plan.md', {'id': 'G-018', 'title': 'Reliable notices'}),)))
+        self.assertEqual(len(self.events(connection)), 2)
+        self.assertEqual({json.loads(row['payload'])['status'] for row in self.events(connection)},
+                         {'새 계획 없음', '작성 완료 · 미게시'})
+        self.assertFalse(any(row['event_type'] == 'plans_published' for row in self.events(connection)))
+
+    def test_same_failure_after_resolution_is_a_separate_incident(self):
+        connection = self.connection()
+        repository = RecoveryRepository(connection)
+        observation = RecoveryObservation(RecoveryReason.FETCH_FAILED, '/projects/alpha', 'G-018',
+                                          'PUBLISHING', 'plan', 'base', 'failure', 'head', 'fetch failed')
+        for _ in range(2):
+            with connection:
+                repository.observe(observation)
+                repository.clear('/projects/alpha', 'G-018')
+        self.assertEqual(len(self.events(connection)), 2)
+
+    def test_planning_failure_owns_transaction_and_does_not_claim_publication(self):
+        from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
+        connection = self.connection()
+        repository = RuntimeStateRepository(connection)
+        with self.assertRaises(RuntimeError):
+            with connection:
+                connection.execute("BEGIN")
+                repository.update_project('/projects/alpha', {
+                    'phase': 'PLANNING', 'planning_attempt_fingerprint': 'input',
+                    'planning_validation_error': 'invalid result',
+                })
+                raise RuntimeError('rollback')
+        self.assertEqual(self.events(connection), [])
+        loop_manager.update_project(connection, '/projects/alpha', phase='PLANNING',
+                                    planning_attempt_fingerprint='input', planning_validation_error='invalid result')
+        event = self.events(connection)[0]
+        self.assertEqual(event['event_type'], 'stage_failed')
+        self.assertTrue(json.loads(event['payload'])['silent'])
+        self.assertIn('invalid result', notifications._message('stage_failed', json.loads(event['payload'])))
+
+    def test_unplanned_maintenance_start_names_its_stage(self):
+        connection = self.connection()
+        with connection:
+            notifications.record_process_start(connection, '/projects/alpha', 'maintenance_planner', 'assessment-1')
+        payload = json.loads(self.events(connection)[0]['payload'])
+        self.assertIsNone(payload['execplan_id'])
+        self.assertEqual(payload['operation'], '유지보수 평가')

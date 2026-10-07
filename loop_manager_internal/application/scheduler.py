@@ -68,49 +68,40 @@ def _run_registered_project(
             # owns and durably commits its intended transaction boundary.
             connection.commit()
 
-            def deliver_new_pr_notifications() -> None:
+            def deliver_new_notifications() -> None:
                 try:
-                    notifications.dispatch_new_pr_notifications(
-                        connection,
-                        telegram_token,
-                        telegram_chat_id,
-                        project.repo,
-                    )
+                    notifications.flush_project_events(connection, project.repo)
                 except Exception as error:
                     effects.operation_log(
-                        f"즉시 PR 알림 전송 실패 ({type(error).__name__})",
+                        f"즉시 알림 전송 실패 ({type(error).__name__})",
                         error=True,
                     )
 
-            request = next_local_recovery_request(connection, project.repo)
-            if request is not None:
-                result = execute_local_recovery_request(
-                    LocalRecoveryExecutionEffects(effects.operation_log, effects.run_project_result),
-                    connection, state_dir, request, config_path,
-                    planner_mutex=planner_mutex,
-                    refactoring_review_interval=refactoring_review_interval,
-                    verify_timeout_seconds=verify_timeout_seconds,
-                    runtime_mutation=runtime_mutation,
-                    on_step_completed=deliver_new_pr_notifications,
-                )
-            else:
-                # An unrelated active owner keeps progressing; the recovery
-                # request stays pending for a later scheduler visit.
-                result = effects.run_project_result(
-                    connection,
-                    state_dir,
-                    project.repo,
-                    config_path,
-                    None,
-                    False,
-                    registered_only=True,
-                    planner_mutex=planner_mutex,
-                    refactoring_review_interval=refactoring_review_interval,
-                    verify_timeout_seconds=verify_timeout_seconds,
-                    on_step_completed=deliver_new_pr_notifications,
-                    external_run_id=external_run_id,
-                    **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
-                )
+            with notifications.immediate_delivery(connection, telegram_token, telegram_chat_id, project.repo):
+                request = next_local_recovery_request(connection, project.repo)
+                if request is not None:
+                    result = execute_local_recovery_request(
+                        LocalRecoveryExecutionEffects(effects.operation_log, effects.run_project_result),
+                        connection, state_dir, request, config_path,
+                        planner_mutex=planner_mutex,
+                        refactoring_review_interval=refactoring_review_interval,
+                        verify_timeout_seconds=verify_timeout_seconds,
+                        runtime_mutation=runtime_mutation,
+                        on_step_completed=deliver_new_notifications,
+                    )
+                else:
+                    # An unrelated active owner keeps progressing; the recovery
+                    # request stays pending for a later scheduler visit.
+                    result = effects.run_project_result(
+                        connection, state_dir, project.repo, config_path,
+                        None, False, registered_only=True,
+                        planner_mutex=planner_mutex,
+                        refactoring_review_interval=refactoring_review_interval,
+                        verify_timeout_seconds=verify_timeout_seconds,
+                        on_step_completed=deliver_new_notifications,
+                        external_run_id=external_run_id,
+                        **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
+                    )
     except SelfMergeRuntimeHandoff:
         if handoff_gate is not None:
             handoff_gate.stop()

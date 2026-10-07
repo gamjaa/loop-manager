@@ -149,12 +149,6 @@ class _PlanningAgentPorts:
                 profile_arguments["resolved_profile"] = profile
                 self._effects.operation_log(
                     f"{profile_role} 설정: {context.provider}, {profile.model}, {profile.effort}")
-            with self._connection:
-                resumed = notifications.record_work_start(
-                    self._connection, context.repo, "Planner",
-                )
-            if resumed:
-                self._effects.operation_log(f"차단 해제 후 Planner 작업 재개: {context.repo}")
             result = self._effects.run_agent_with_retries(
                 TrackedAgentCall(lambda current_session_id, _session_recovery, invocation: self._effects.run_agent(
                     context.provider,

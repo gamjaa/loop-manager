@@ -11,7 +11,7 @@ from .repository import (adopt_legacy_block_notices, ensure_schema, _enabled,
                          _insert)
 from .incidents import (_key, _remote_inspection_suffix, _queue_block,
                         _plan_block_key, _project_block_key,
-                        _project_checkpoint, _project_checkpoint_suffix)
+                        _project_checkpoint, _project_checkpoint_suffix, record_work_start)
 from .incidents import _preservation_checkpoint
 from .rendering import _checkpoint_link
 
@@ -67,13 +67,32 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
     ensure_schema(connection)
     adopt_legacy_block_notices(connection)
     project = connection.execute(
-        "SELECT phase, plan_path, pr_url, last_error, planning_error "
+        "SELECT phase, plan_path, pr_url, last_error, planning_error, "
+        "planning_attempt_fingerprint, planning_validation_error, active_sha "
         "FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
     if project is None:
         return
     name = Path(repo).name or repo
+    planning_failure = project[3] or project[6]
+    if project[0] == "PLANNING" and planning_failure and not project[4]:
+        enqueue_progress(connection, repo, "stage_failed",
+                         str(project[5]) + "\0" + str(project[7]) + "\0" + str(planning_failure),
+                         operation="Planner", cause=str(planning_failure),
+                         status="다음 실행 또는 자동 교정 대기", silent=True)
+    if project[0] == "REVIEWING" and project[3]:
+        plan = connection.execute(
+            "SELECT plan_id, current_revision_sha, verify_token FROM exec_plans "
+            "WHERE repo = ? AND path = ?", (repo, project[1]),
+        ).fetchone()
+        if plan:
+            enqueue_progress(
+                connection, repo, "stage_failed",
+                "review\0" + "\0".join(str(value) for value in (*plan, project[3])),
+                execplan_id=str(plan[0]), operation="Reviewer", cause=str(project[3]),
+                status="자동 교정·재시도 대기", silent=True,
+            )
     recovery_available = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'recovery_records'"
     ).fetchone() is not None
@@ -88,6 +107,13 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         if row is None or row[1] is None:
             return None, None
         return str(row[0]), json.loads(str(row[1]))
+
+    from loop_manager_internal.storage import execplan_draft_state
+    for draft_id in execplan_draft_state.pending_ids(connection, repo):
+        draft = connection.execute("SELECT title FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                                   (repo, draft_id)).fetchone()
+        if draft:
+            enqueue_draft_decision(connection, repo, draft_id, str(draft[0]))
 
     for plan in connection.execute(
         "SELECT plan_id, title, pr_url FROM exec_plans "
@@ -559,6 +585,10 @@ def enqueue_waiting_reason(
         return False
     ensure_schema(connection)
     payload = snapshot.payload(Path(repo).name or repo)
+    for plan in payload["plans"]:
+        if plan.get("question"):
+            enqueue_draft_decision(connection, repo, plan["id"], plan["title"])
+    payload["plans"] = [plan for plan in payload["plans"] if not plan.get("question")]
     signature = hashlib.sha256(
         json.dumps(payload, sort_keys=True, ensure_ascii=False,
                    separators=(",", ":")).encode()
@@ -578,7 +608,7 @@ def enqueue_waiting_reason(
             "signature = excluded.signature, generation = excluded.generation",
             (repo, signature, generation),
         )
-        if not snapshot.has_distinct_wait:
+        if not snapshot.has_distinct_wait or not (payload["plans"] or payload["requirements"]):
             _cancel_pending_waiting(connection, repo)
             return False
         event_key = _key("waiting", repo, f"{generation}\0{signature}")
@@ -590,5 +620,83 @@ def enqueue_waiting_reason(
         )
         if not _enabled(connection):
             return False
+        payload["silent"] = not (payload.get("project_block") or payload.get("planning_error") or any(
+            plan.get("status") in {"PR_OPEN", "PLAN_BLOCKED", "CATALOG_HELD", "MANUAL_PENDING", "MANUAL_WORKING"}
+            for plan in payload["plans"]
+        ))
+        payload["status"] = "다음 작업 대기"
         _insert(connection, event_key, repo, "work_waiting", payload)
     return True
+
+
+def enqueue_progress(connection, repo, kind, identity, **payload):
+    """Persist a boundary observation in the owning state transaction."""
+    if not _enabled(connection):
+        return
+    ensure_schema(connection)
+    plan_id = payload.get("execplan_id")
+    if plan_id:
+        plan = connection.execute("SELECT title FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                                  (repo, plan_id)).fetchone()
+        if plan:
+            payload.setdefault("execplan_title", str(plan[0]))
+    _insert(connection, _key(kind, repo, identity), repo, kind,
+            {"project": Path(repo).name or repo, **payload})
+
+
+def record_process_start(connection, repo, role, identity, *, plan_id=None, resumed=False):
+    """A physical process has started, rather than just been selected."""
+    from loop_manager_internal.storage import execplan_draft_state
+    ensure_schema(connection)
+    if connection.execute(
+        "SELECT 1 FROM notification_outbox WHERE event_key = ?", (_key("work_started", repo, identity),),
+    ).fetchone() or connection.execute(
+        "SELECT 1 FROM notified_block_incidents WHERE repo = ? AND start_identity = ?", (repo, identity),
+    ).fetchone():
+        return
+    if connection.execute("SELECT 1 FROM project_blocks WHERE repo = ?", (repo,)).fetchone():
+        return
+    if plan_id and (plan_id in execplan_draft_state.pending_ids(connection, repo) or connection.execute(
+        "SELECT 1 FROM execplan_blocks WHERE repo = ? AND plan_id = ?", (repo, plan_id),
+    ).fetchone()):
+        return
+    operation = "Worker" if role == "worker" else "Planner"
+    blocked_resume = record_work_start(connection, repo, operation, plan_id=plan_id, start_identity=identity)
+    # Delivery of a BLOCKED piece may still be in flight. The incident will
+    # materialize its resumption when confirmation arrives; suppress the generic start too.
+    pending_resume = connection.execute(
+        "SELECT 1 FROM notified_block_incidents i JOIN notification_outbox o "
+        "ON o.event_key = i.event_key WHERE i.repo = ? AND i.start_identity = ? "
+        "AND i.released_at IS NOT NULL AND i.resumed_at IS NULL "
+        "AND o.delivery_started_at IS NOT NULL LIMIT 1",
+        (repo, identity),
+    ).fetchone()
+    if not blocked_resume and not pending_resume:
+        enqueue_progress(connection, repo, "work_started", identity,
+                         execplan_id=plan_id, operation="유지보수 평가" if role == "maintenance_planner" else operation,
+                         status="작업 재개 중" if resumed else "작업 중", silent=True)
+
+
+def record_planning_publication(connection, repo, plans, revision):
+    from loop_manager_internal.storage import execplan_draft_state
+    ordinary = []
+    for path, plan in plans:
+        plan_id = str(plan["id"])
+        if plan_id in execplan_draft_state.pending_ids(connection, repo):
+            enqueue_draft_decision(connection, repo, plan_id, str(plan["title"]))
+        else:
+            ordinary.append({"id": plan_id, "title": str(plan["title"])})
+    if ordinary:
+        enqueue_progress(connection, repo, "plans_published", revision,
+                         plans=ordinary, status="실행 또는 dependency 대기", silent=True)
+
+
+def enqueue_draft_decision(connection, repo, plan_id, title):
+    from loop_manager_internal.storage import execplan_draft_state
+    saved = execplan_draft_state.evidence(connection, repo, plan_id)
+    if saved and saved.get("pending"):
+        enqueue_progress(connection, repo, "draft_decision",
+                         str(saved.get("identity")) + "\0" + str(saved["revision"]),
+                         execplan_id=plan_id, execplan_title=title,
+                         question=saved["question"], url=saved.get("url"), decision_revision=saved["revision"],
+                         status="사용자 판단 대기", silent=False)

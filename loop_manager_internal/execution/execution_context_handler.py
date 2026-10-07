@@ -129,14 +129,4 @@ class ContextHandler:
         return ExecutionOutcome.advanced(self._context())
 
     def work_started(self, context):
-        with self.ports.state.connection:
-            resumed = notifications.record_work_start(
-                self.ports.state.connection, self.ports.identity.repo,
-                f"ExecPlan {context.phase.value}",
-                plan_id=context.plan.plan_id,
-            )
-        if resumed:
-            self.ports.operation_log(
-                f"차단 해제 후 ExecPlan 작업 재개: {context.plan.plan_id}"
-            )
-
+        notifications.flush_project_events(self.ports.state.connection, self.ports.identity.repo)

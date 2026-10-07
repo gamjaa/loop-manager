@@ -1,6 +1,8 @@
 """Claim, confirm and retry persisted Telegram message pieces."""
 from __future__ import annotations
 from collections.abc import Callable
+from contextvars import ContextVar
+from contextlib import contextmanager
 import json
 import sqlite3
 from .repository import adopt_legacy_block_notices, ensure_schema
@@ -38,6 +40,13 @@ def _claim_piece(
         if row is None or (first_attempt_only and row[5] != 0):
             return None
         payload = json.loads(str(row[2]))
+        if row[1] == "draft_decision":
+            from loop_manager_internal.storage import execplan_draft_state
+            saved = execplan_draft_state.evidence(connection, str(row[0]), str(payload["execplan_id"]))
+            if not saved or not saved.get("pending") or saved["revision"] != payload.get("decision_revision"):
+                connection.execute("UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP, "
+                                   "delivery_started_at = NULL WHERE event_key = ?", (event_key,))
+                return None
         if row[1] == "blocked":
             incident = connection.execute(
                 "SELECT released_at, block_key FROM notified_block_incidents "
@@ -142,7 +151,11 @@ def _deliver_rows(
             piece, cursor, total = claimed
             first_piece = False
             try:
-                adapter(token, chat_id, piece)
+                if adapter is send_telegram:
+                    adapter(token, chat_id, piece, disable_notification=bool(
+                        json.loads(str(row[2])).get("silent", False)))
+                else:
+                    adapter(token, chat_id, piece)
             except Exception as error:
                 failure = f"Telegram delivery failed ({type(error).__name__})"
                 with connection:
@@ -152,6 +165,13 @@ def _deliver_rows(
                         "AND confirmed_pieces = ?",
                         (failure, row[0], cursor),
                     )
+                    if row[1] == "blocked":
+                        incident = connection.execute(
+                            "SELECT incident_id FROM block_notice_events WHERE event_key = ?",
+                            (row[0],),
+                        ).fetchone()
+                        if incident is not None:
+                            _materialize_resumption(connection, int(incident[0]))
                 break
             with connection:
                 connection.execute(
@@ -186,3 +206,33 @@ def _deliver_rows(
                 sent += 1
                 break
     return sent
+
+
+_immediate_delivery = ContextVar("notification_immediate_delivery", default=None)
+
+
+@contextmanager
+def immediate_delivery(connection, token, chat_id, repo):
+    binding = _immediate_delivery.set((connection, token, chat_id, repo))
+    try:
+        yield
+    finally:
+        _immediate_delivery.reset(binding)
+
+
+def flush_project_events(connection, repo):
+    binding = _immediate_delivery.get()
+    if binding is None or binding[0] is not connection or binding[3] != repo or connection.in_transaction:
+        return 0
+    _, token, chat_id, _ = binding
+    if not token or not chat_id:
+        return 0
+    try:
+        rows = connection.execute(
+            "SELECT event_key, event_type, payload FROM notification_outbox "
+            "WHERE repo = ? AND sent_at IS NULL AND canceled_at IS NULL AND attempts = 0 "
+            "ORDER BY rowid", (repo,),
+        ).fetchall()
+        return _deliver_rows(connection, token, chat_id, rows, send_telegram, first_attempt_only=True)
+    except Exception:
+        return 0

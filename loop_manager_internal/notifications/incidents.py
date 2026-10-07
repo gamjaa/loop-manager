@@ -4,7 +4,7 @@ import hashlib
 import json
 import sqlite3
 from .repository import (adopt_legacy_block_notices, ensure_schema, _enabled,
-                         _insert, _encode_payload, _planner_started_after_notice)
+                         _insert, _encode_payload, _event_payload, _planner_started_after_notice)
 from .rendering import _checkpoint_link
 
 def _key(kind: str, repo: str, identity: str) -> str:
@@ -105,6 +105,8 @@ def _queue_block(
     block_key: str, payload: dict[str, object],
 ) -> None:
     """Give each separately notified block its own durable delivery identity."""
+
+    payload = _event_payload("blocked", payload)
 
     active = connection.execute(
         "SELECT id, block_key, event_key, confirmed_before, version, payload FROM "
@@ -255,17 +257,17 @@ def release_block(connection: sqlite3.Connection, repo: str, subject: str) -> No
             "WHERE id = ?", (row[0],),
         )
         connection.execute(
-            "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP, "
-            "delivery_started_at = NULL WHERE event_key = ? "
+            "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP "
+            "WHERE event_key = ? "
             "AND sent_at IS NULL AND canceled_at IS NULL", (row[1],),
         )
 
 
 def record_work_start(
     connection: sqlite3.Connection, repo: str, operation: str,
-    *, plan_id: str | None = None,
+    *, plan_id: str | None = None, start_identity: str | None = None,
 ) -> int:
-    """Enqueue resumption for released, confirmed incidents at a real start."""
+    """Record a real start and choose resumption or an unnotified-block start."""
 
     tables = {
         str(row[0]) for row in connection.execute(
@@ -288,10 +290,10 @@ def record_work_start(
     project = connection.execute(
         "SELECT planning_error FROM projects WHERE repo = ?", (repo,),
     ).fetchone()
-    if project is None or project[0]:
+    if project is None:
         return 0
-    subjects = ["project"]
-    if operation == "Planner":
+    subjects = [] if project[0] else ["project"]
+    if operation == "Planner" and not project[0]:
         subjects.append("planning")
     elif plan_id is not None and operation in {"Worker", "PR handling"}:
         subjects.append(f"plan:{plan_id}")
@@ -329,9 +331,10 @@ def record_work_start(
                 )
                 continue
             connection.execute(
-                "UPDATE notified_block_incidents SET started_operation = ? "
+                "UPDATE notified_block_incidents SET started_operation = ?, start_identity = ?, started_at = "
+                "strftime('%Y-%m-%dT%H:%M:%fZ', 'now') "
                 "WHERE id = ? AND started_operation IS NULL",
-                (operation, row[0]),
+                (operation, start_identity, row[0]),
             )
             queued += _materialize_resumption(connection, int(row[0]))
     return queued
@@ -340,14 +343,29 @@ def record_work_start(
 def _materialize_resumption(connection: sqlite3.Connection, incident_id: int) -> int:
     row = connection.execute(
         "SELECT i.repo, i.payload, i.started_operation, o.confirmed_pieces, "
-        "i.confirmed_before "
+        "i.confirmed_before, i.started_at, i.start_identity, o.delivery_started_at "
         "FROM notified_block_incidents i JOIN notification_outbox o "
         "ON o.event_key = i.event_key WHERE i.id = ? "
         "AND i.released_at IS NOT NULL AND i.resumed_at IS NULL",
         (incident_id,),
     ).fetchone()
-    if row is None or not row[2] or max(int(row[3]), int(row[4])) == 0:
+    if row is None or not row[2]:
         return 0
+    if max(int(row[3]), int(row[4])) == 0:
+        if row[7] is not None or not row[6]:
+            return 0
+        # No BLOCKED piece was delivered. Preserve the actual start as a
+        # generic event instead of waiting forever for a resumption.
+        from .events import enqueue_progress
+        old = json.loads(str(row[1]))
+        enqueue_progress(connection, str(row[0]), "work_started", str(row[6]),
+                         execplan_id=old.get("execplan_id"), operation=str(row[2]),
+                         occurred_at=row[5], status="작업 중", silent=True)
+        connection.execute(
+            "UPDATE notified_block_incidents SET resumed_at = CURRENT_TIMESTAMP WHERE id = ?",
+            (incident_id,),
+        )
+        return 1
     if not _enabled(connection):
         connection.execute(
             "UPDATE notified_block_incidents SET resumed_at = CURRENT_TIMESTAMP "
@@ -360,7 +378,7 @@ def _materialize_resumption(connection: sqlite3.Connection, incident_id: int) ->
         "project": old["project"], "scope": old["scope"],
         "execplan_id": old.get("execplan_id"),
         "reason_code": old["reason_code"], "cause": old["cause"],
-        "operation": str(row[2]),
+        "operation": str(row[2]), "occurred_at": row[5], "silent": True, "status": "작업 중",
     }
     _insert(connection, _key("resumed", repo, str(incident_id)), repo,
             "resumed", payload)

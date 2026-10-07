@@ -787,3 +787,49 @@ class CommonGuidanceInvocationTests(TestCase):
             self.assertEqual(self.invoke(role=role, plan='G-legacy').code, 0)
             self.assertEqual(self.requests[-1].common_guidance.content, text)
             self.assertEqual(self.requests[-1].common_guidance.snapshot_path, path)
+
+
+class ProcessStartNotificationTests(TestCase):
+    setUp = RunnerTests.setUp
+    def test_process_callback_precedes_work_and_internal_retry_does_not_notify(self):
+        from loop_manager_internal.notifications import notifications
+        self.connection.execute(manager.SCHEMA)
+        manager._ensure_execplans_schema(self.connection)
+        notifications.ensure_schema(self.connection)
+        notifications.configure_session(self.connection, enabled=True)
+        self.connection.execute("INSERT INTO projects (repo, base_branch) VALUES ('repo', 'main')")
+        self.connection.execute("INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, priority, content_hash, status) "
+                                "VALUES ('repo','G-041','plan.md','Named plan','[]','[]','normal','hash','IMPLEMENTING')")
+        self.connection.commit()
+        outer = self
+        class Provider:
+            def run(self, request):
+                outer.assertEqual(outer.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], 0 if request.prompt == 'first' else 1)
+                request.on_process_started()
+                outer.assertEqual(outer.connection.execute("SELECT COUNT(*) FROM notification_outbox").fetchone()[0], 1)
+                return manager.AgentResult(0, 'done')
+        with mock.patch.object(manager, 'agent_provider', return_value=Provider()):
+            for attempt in (1, 2):
+                result = manager.run_agent('codex', Path('/worktree'), self.state_dir, Path('/config'),
+                    'worker', 'first' if attempt == 1 else 'retry', read_only=False, level=5,
+                    connection=self.connection, invocation=invocation.InvocationContext('repo','G-041',attempt=attempt,notification_id='retry-sequence'),
+                    resolved_profile=invocation.ResolvedProfile('model','high'))
+                self.assertEqual(result.code, 0)
+
+    def test_prelaunch_failure_keeps_notified_block_unresumed(self):
+        from loop_manager_internal.notifications import notifications
+        # Start callback is never reached when provider launch fails.
+        calls = []
+        class Provider:
+            def run(self, request):
+                calls.append(request.on_process_started)
+                raise OSError('launch failed')
+        with mock.patch.object(manager, 'agent_provider', return_value=Provider()), \
+             mock.patch.object(notifications, 'record_process_start') as start:
+            with self.assertRaises(OSError):
+                manager.run_agent('codex', Path('/worktree'), self.state_dir, Path('/config'),
+                    'worker', 'first', read_only=False, level=5, connection=self.connection,
+                    invocation=invocation.InvocationContext('repo','G-041'),
+                    resolved_profile=invocation.ResolvedProfile('model','high'))
+        self.assertTrue(calls)
+        start.assert_not_called()

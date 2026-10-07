@@ -826,3 +826,38 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
             ['reviewer', 'reviewer'],
         )
         self.effects.blocking.block_active_execplan.assert_not_called()
+
+
+    def test_protocol_failure_is_silently_sent_before_successful_reviewer_retry(self):
+        import json
+        from loop_manager_internal.notifications import notifications
+        notifications.configure_session(self.connection, enabled=True)
+        self.connection.commit()
+        context = self.review_context()
+        self.effects.validation.parse_reviewer_result.side_effect = [
+            lm.ReviewerProtocolError('missing verdict'),
+            lm.ReviewerProtocolError('missing verdict'), ('PASS', ()),
+        ]
+        sent = []
+        attempts = []
+        def reviewer(*args, **kwargs):
+            if attempts:
+                self.assertEqual(len(sent), 1)
+                self.assertTrue(sent[0][1]['disable_notification'])
+                self.assertIn('missing verdict', sent[0][0])
+            attempts.append(True)
+            return self.agent(*args, **kwargs)
+        self.effects.agent.run_agent.side_effect = reviewer
+        with mock.patch('loop_manager_internal.notifications.delivery.send_telegram',
+                        side_effect=lambda _t, _c, text, **options: sent.append((text, options))), \
+                notifications.immediate_delivery(self.connection, 'token', 'chat', 'repo'):
+            outcome = self.handler.review(context)
+        self.assertEqual(outcome.context.phase, ExecutionPhase.PUBLISHING)
+        self.assertEqual(len(attempts), 3)
+        events = self.connection.execute("SELECT payload, sent_at FROM notification_outbox WHERE event_type = 'stage_failed'").fetchall()
+        self.assertEqual(len(events), 1)
+        self.assertIsNotNone(events[0]['sent_at'])
+        payload = json.loads(events[0]['payload'])
+        self.assertEqual(payload['execplan_id'], 'G-047')
+        self.assertEqual(payload['operation'], 'Reviewer')
+        self.assertEqual(payload['status'], '자동 교정·재시도 대기')

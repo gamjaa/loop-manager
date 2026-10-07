@@ -6,6 +6,7 @@ from loop_manager_internal.documents import document_drafts
 from loop_manager_internal.documents import document_publication
 import sys
 from loop_manager_internal.storage import review_correction_state
+from loop_manager_internal.notifications import notifications
 import json
 from loop_manager_internal.agents.agent_invocation import AttemptSequence, TrackedAgentCall
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
@@ -177,6 +178,9 @@ class ReviewHandler:
         verdict: str | None = None
         review = ''
         for protocol_attempt in range(1, self.ports.contract.MAX_REVIEWER_PROTOCOL_ATTEMPTS + 1):
+            notifications.flush_project_events(
+                self.ports.state.connection, self.ports.identity.repo,
+            )
             if protocol_attempt == 1:
                 self.ports.operation_log(f"Reviewer 시작: {self.ports.snapshot().plan['id']} {self.ports.snapshot().plan['title']}")
             else:
