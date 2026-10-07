@@ -472,9 +472,9 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                         branch = None
                         with connection:
                             connection.execute("UPDATE projects SET phase='PLANNING', worktree=?, "
-                                "plan_sha=?, planning_attempt_fingerprint=?, planning_workspace_owned=1, "
+                                "plan_sha=?, active_sha=?, planning_attempt_fingerprint=?, planning_workspace_owned=1, "
                                 "planner_session_id='planner-existing' WHERE repo=?",
-                                (str(workspace), sha_a, fingerprint, str(source)))
+                                (str(workspace), sha_a, sha_a, fingerprint, str(source)))
                     else:
                         loop_manager.register_execplans(connection, str(source), source,
                             [(plan_path, loop_manager._parse_execplan(source, plan_file))], sha_a, fingerprint)

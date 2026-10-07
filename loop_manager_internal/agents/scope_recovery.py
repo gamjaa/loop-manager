@@ -608,10 +608,24 @@ def _validate_persisted_agent_scope(
         effects.update_project(connection, repo, **recovered_values)
     if (not rebase_scope_normalized and decision.reconciled_before is not None
             and decision.reconciled_before != before):
-        effects.update_project(
-            connection, repo,
-            agent_snapshot=decision.reconciled_before.serialize(),
-        )
+        # Persist the same exact runtime delta in every saved operand only
+        # after all checks pass. Otherwise the next validation mistakes the
+        # result's old base ref for Agent evidence against the advanced start.
+        original = GitSnapshot.deserialize(str(project['agent_snapshot']))
+        runtime_values = {'agent_snapshot': decision.reconciled_before.serialize()}
+        if project['agent_result_snapshot']:
+            saved_result = (recovered_result_baseline or
+                            GitSnapshot.deserialize(str(project['agent_result_snapshot'])))
+            runtime_values['agent_result_snapshot'] = agent_scope_decision.reconcile_runtime_snapshot(
+                saved_result, original, current, manager_runtime[0], str(project['base_branch'])).serialize()
+        if project['agent_manager_snapshot']:
+            saved_checkpoint = (recovered_manager_checkpoint or
+                                ManagerGitCheckpoint.deserialize(str(project['agent_manager_snapshot'])))
+            runtime_values['agent_manager_snapshot'] = replace(saved_checkpoint,
+                snapshot=agent_scope_decision.reconcile_runtime_snapshot(
+                    saved_checkpoint.snapshot, original, current, manager_runtime[0],
+                    str(project['base_branch']))).serialize()
+        effects.update_project(connection, repo, **runtime_values)
         effects.operation_log(
             f"runtime scope 기준선 반영: path={manager_runtime[0]} sha={manager_runtime[1]}"
         )
