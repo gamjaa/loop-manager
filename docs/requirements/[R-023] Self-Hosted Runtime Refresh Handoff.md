@@ -30,6 +30,14 @@ bootstrap/source checkout의 HEAD·index·tracked·untracked·ignored 파일 상
 
 사용자는 Agent 실행 중에도 문서나 코드를 `<base-branch>`에 직접 commit·push할 수 있다. 원격 base의 편집·게시 주체가 Loop Manager뿐이라는 전제를 두지 않는다. 이 원격 전진이 현재 원격과 Git 상태로 확인되고 Agent의 공유 Git metadata 쓰기와 구분되면, 진행 중인 계획의 기존 branch·worktree·session을 보존한 채 Manager가 최신 base를 fetch하고 필요한 관리 rebase, 후보 검증과 Review를 다시 수행한다. 사용자 push를 관측했다는 사실만으로 Worker의 공유 ref 쓰기나 원격 lease·소유권 불일치를 허용하지 않는다.
 
+같은 repository의 다른 branch·worktree에서 수행한 fetch/push가 `refs/remotes/origin/<base-branch>`를 갱신한 경우도 이 원격 전진에 포함한다. 현재 호출에 결합된 유효한 쓰기 격리, 등록 origin의 실제 원격 OID와 정상 전진, 선택 작업의 소유권·파일/index·사용 ref를 확인하면 Manager의 과거 fetch 뒤에 외부 변경이 끼었다는 이유만으로 최종 Agent 범위 차단을 만들지 않는다. 확인한 최신 원격을 기준으로 관리 rebase와 후보 재검증을 진행한다. 일시 관측 실패·동시 갱신은 작업을 보존하는 재관측으로 처리하며, 원격 삭제·재작성·분기, 사용 branch의 lease 불일치와 실제 Agent 위반은 기존 보호 조건을 유지한다.
+
+외부 전진의 확인은 Manager가 과거 변경을 실행했다는 증명과 구분한다. 과거 journal·receipt·reflog·원본 Agent 시작/결과 snapshot을 고치거나 새 격리 증거를 합성하지 않는다. 과거 결과에 실제 위반이 있으면 현재 ref가 정상이라는 이유로 지우지 않으며, 외부 변경을 Agent 쓰기와 구분할 증거가 없는 실행에는 기존 엄격 판정을 유지한다.
+
+`refs/remotes/origin/HEAD`가 현재 작업의 판정 대상이면 symbolic target과 그 target에서 파생된 OID를 구분한다. target이 그대로인 정상 base 전진의 OID 변화는 검증된 base 전이와 함께 처리한다. HEAD가 없던 상태에서 생성된 경우는 유효한 호출 격리와 등록 origin·예상 base target·OID의 일치를 확인한 정상 외부 최신화만 수용한다. 설명되지 않은 target 변경·삭제·잘못된 target/OID와 실제 Agent의 ref 쓰기는 자동 허용하지 않는다.
+
+위 Git metadata 귀속 판정은 Agent 결과 검사, 저장 단계 선검증, PLAN_BLOCKED·PROJECT_BLOCKED 재평가와 정상·진단 checkpoint 안전 검사에 일관되게 적용한다. snapshot·호출 증거·현재 Git 상태가 같으면 검사 경로만 바뀌었다는 이유로 정상 base 전진이나 파생 HEAD 변화를 다시 공유 ref 위반으로 판정하지 않는다. R-020의 선택 runtime identity와 R-055의 checkpoint 요청 재검증도 같은 경계를 따른다. 자료 수집·정상 게시·진단 게시의 개별 소유권·범위·Git operation 허용 조건은 유지한다.
+
 Agent가 선택된 관리 worktree 밖의 파일과 shared Git metadata를 쓸 권한은 없다. 무관한 변화의 범위 검사 제외는 이 쓰기 격리가 실제 실행에서 유효함을 검증할 수 있을 때만 적용한다. 격리를 증명할 수 없는 실행이나 과거 기록에서는 무관한 shared ref·다른 worktree 변화를 단순 관측만으로 외부 변경이라 추정해 허용하지 않는다. 감시 축소는 Agent의 Git 쓰기 권한, worktree·branch·push·PR 소유권을 넓히지 않는다.
 
 Planner·Worker·Reviewer와 유지보수 Planner는 각 호출에서 선택된 관리 worktree를 workspace로 사용하며, provider의 내장 쓰기 제한을 우선 적용한다. 작업 디렉터리 지정만으로 제한이 적용됐다고 간주하지 않는다. 기본 source checkout, 다른 worktree와 shared Git metadata는 쓰기 허용 범위에 포함하지 않고, Reviewer는 선택된 worktree도 읽기 전용으로 사용한다. workspace 쓰기 허용은 해당 역할의 문서·파일 변경 범위를 확대하지 않으며, 기존 역할별 변경 검사는 유지한다. 필요한 임시 작업은 해당 실행에 소유권이 있는 제한된 경로에서만 허용한다.
@@ -72,6 +80,8 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 - source checkout의 dirty·sync skip·HEAD 차이는 검증한 `origin/<base-branch>`에서 수행하는 Planner·Worker workspace 생성, 기존 workspace 재개, PR conflict rebase와 검증을 막지 않는다.
 - Planner·Worker·Reviewer 실행 전후 bootstrap/default worktree의 HEAD·index·파일·dirty 상태만 달라진 경우 이를 해당 Agent의 변경으로 귀속하거나 `PROJECT_BLOCKED`를 만들지 않는다.
 - 선택된 관리 worktree와 현재 단계가 실제로 사용하는 ref·worktree·Git config·operation만 Agent 범위와 Git 작업 직전 안전 검사의 대상으로 삼는다. 실행과 무관한 `draft` 등 다른 local branch·tag·ref 또는 다른 worktree의 독립적인 변동만으로 Agent 범위 위반이나 프로젝트 차단을 만들지 않는다. 사용하게 되는 자원은 사용 직전에 다시 검증한다.
+- 유효한 호출 격리가 있는 실행에서 Manager fetch 사이 또는 저장 단계 재개 전에 다른 worktree의 정상 fetch/push로 base 추적 ref가 전진해도, 현재 원격·소유권·범위를 재확인한 뒤 같은 작업물·session에서 관리 rebase와 재검증으로 진행한다. Manager 소유 표식의 불연속만으로 최종 차단하지 않으며 과거 실행 증거를 다시 쓰지 않는다.
+- 같은 target의 파생 `origin/HEAD` OID 전진과 증명된 최초 생성은 위 조건에서 처리하고, target 변조·삭제·OID 불일치와 실제 Agent 위반 혼합은 거부한다. Agent 결과·저장 선검증·계획/프로젝트 복구·checkpoint에서 동일 증거의 수락·거부 결과가 일치한다.
 - 사용자가 Worker 실행 중 `<base-branch>`에 문서 또는 코드 commit을 직접 push하고 원격 base가 전진해도, 확인된 외부 변경을 Worker 범위 위반으로 차단하지 않는다. Manager는 기존 작업물과 session을 보존해 최신 base에 rebase하고 변경된 후보의 필요한 Worker 확인·targeted test·전체 verify·Review를 거친다. 같은 시점의 실제 Agent 공유 ref 변경이나 증명되지 않은 Git 변화는 이 예외로 해제하지 않는다.
 - 선택된 관리 worktree의 범위 밖 파일·index·branch·HEAD 변화, 소유 branch·게시 ref·PR head의 예상 밖 변화, 검증된 fetch·rebase로 처리할 수 없는 원격 base 변화, 사용 중인 worktree 등록·Git operation·config 불일치 또는 영향 여부를 증명할 수 없는 변화는 기존 안전 차단을 유지한다. Agent의 다른 worktree·shared Git metadata 쓰기 격리가 검증되지 않으면 무관한 변화에 최소 범위 예외를 적용하지 않는다.
 - Agent 시작 뒤 Manager가 수행한 fetch·worktree 생성/정리·rebase·source 갱신은 실행 전후 상태와 durable checkpoint가 일치할 때만 기준선에 반영한다. Manager rebase로 HEAD·소유 branch ref·선택된 worktree index가 바뀐 뒤 재시작해도 낡은 Agent 시작 snapshot과의 차이만으로 차단하지 않으며, Agent의 허용 파일 변경과 session을 보존한다. Manager 변화와 예상 밖 영향권 변화가 섞였거나 checkpoint가 불완전하면 해당 영향을 안전 차단한다.
