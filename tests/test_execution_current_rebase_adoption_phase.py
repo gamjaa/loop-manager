@@ -18,6 +18,30 @@ from tests.support.execution_assertions import _assert_manual_autostash_recovery
 class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
     """Real handler/CAS policies with immutable fake Git observations only."""
 
+    def test_adoption_shares_inspection_and_rejects_drift_at_transaction(self):
+        from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseService
+        from loop_manager_internal.storage.runtime_state import RuntimeStateError
+        self._prepare_current_checkpoint_recovery()
+        original = self.checkpoint.get('repo', 'G-047')
+        observe = ManagedRebaseService.observe
+        owner = self.handler._owned_checkpoint_remote
+
+        def drift(*args, **kwargs):
+            owned = owner(*args, **kwargs)
+            self.observed = replace(self.observed,
+                remote=replace(self.observed.remote, oid='changed-after-inspection'))
+            return owned
+
+        with mock.patch.object(ManagedRebaseService, 'observe', autospec=True,
+                side_effect=observe) as read, mock.patch.object(
+                self.handler, '_owned_checkpoint_remote', side_effect=drift):
+            with self.assertRaisesRegex(RuntimeStateError, 'changed after validation'):
+                self.handler._complete_rebase_intent(self.fixture.context())
+            self.assertEqual(read.call_count, 2)
+        self.assertEqual(self.checkpoint.get('repo', 'G-047'), original)
+        self.assertEqual(self.state.row()['verify_result'], 'old verify')
+        self.handler._publish_rebased_checkpoint.assert_not_called()
+
     def test_ownership_reuses_only_matching_inspect_evidence(self):
         from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseService
         self._prepare_current_checkpoint_recovery()
@@ -33,6 +57,8 @@ class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
             read.assert_not_called()
             for field, value in (('repo', 'other'), ('repository_identity', 'other'),
                     ('worktree', '/other'), ('branch', 'other'), ('target_base_oid', 'other'),
+                    ('plan_id', 'G-999'), ('plan_path', 'docs/plans/[G-999] Other.md'),
+                    ('before_head', 'other'), ('role', 'reviewer'),
                     ('input_fingerprint', 'other'), ('scope_fingerprint', 'other'),
                     ('generation', current.generation + 1),
                     ('remote', replace(service.expected.remote, oid='other'))):

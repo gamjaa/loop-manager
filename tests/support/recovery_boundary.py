@@ -84,10 +84,13 @@ class RecoveryBoundary:
             self.temporary_tables = _temporary_tables(connection)
             connection.backup(self.database)
             self.sql = tuple(self.database.iterdump())
-            self.digest = _tree_digest(Path(self.directory))
-            shutil.copytree(self.directory, self.archive / 'files', symlinks=True)
-            if _tree_digest(self.archive / 'files') != self.digest:
-                raise RuntimeError('복구 경계 복사 불일치')
+            with phase('git_fixture:boundary_confirmation'):
+                self.digest = _tree_digest(Path(self.directory))
+            with phase('git_fixture:boundary_copy'):
+                shutil.copytree(self.directory, self.archive / 'files', symlinks=True)
+            with phase('git_fixture:boundary_confirmation'):
+                if _tree_digest(self.archive / 'files') != self.digest:
+                    raise RuntimeError('복구 경계 복사 불일치')
             self.saved = True
             self.stack.callback(connection.close)
 
@@ -106,9 +109,11 @@ class RecoveryBoundary:
                 os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
                 function(path)
             shutil.rmtree(self.directory, onerror=writable)
-            shutil.copytree(self.archive / 'files', self.directory, symlinks=True)
-            if _tree_digest(Path(self.directory)) != self.digest:
-                raise RuntimeError('복구 시작 파일 재현 불일치')
+            with phase('git_fixture:boundary_copy'):
+                shutil.copytree(self.archive / 'files', self.directory, symlinks=True)
+            with phase('git_fixture:boundary_confirmation'):
+                if _tree_digest(Path(self.directory)) != self.digest:
+                    raise RuntimeError('복구 시작 파일 재현 불일치')
             if self.database_path:
                 connection = sqlite3.connect(self.database_path)
                 connection.row_factory = sqlite3.Row
@@ -117,8 +122,9 @@ class RecoveryBoundary:
                 connection.rollback()
                 self.database.backup(connection)
             _restore_temporary_tables(connection, self.temporary_tables)
-            if tuple(connection.iterdump()) != self.sql or _temporary_tables(connection) != self.temporary_tables:
-                raise RuntimeError('복구 시작 상태 재현 불일치')
+            with phase('git_fixture:boundary_confirmation'):
+                if tuple(connection.iterdump()) != self.sql or _temporary_tables(connection) != self.temporary_tables:
+                    raise RuntimeError('복구 시작 상태 재현 불일치')
             return connection
 
     def __exit__(self, *error):

@@ -1,6 +1,8 @@
 """실제 Git 경로·재관측과 snapshot 계측의 비용·실패 계약을 확인한다."""
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
+import json
 import subprocess
 import tempfile
 import unittest
@@ -20,6 +22,81 @@ from tests.support.rebase_observations import expectation
 
 
 class GitSnapshotCostTests(unittest.TestCase):
+    def test_adoption_shares_owner_inspection_but_reobserves_confirmation(self):
+        from loop_manager_internal.execution.execution_ownership_handler import OwnershipHandler
+        from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseService
+        from loop_manager_internal.git.managed_rebase_validation import Remote
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            head = git_command(repo, 'rev-parse', 'HEAD')
+            expected = expectation(repo=str(repo.resolve()), worktree=str(repo.resolve()),
+                repository_identity=str((repo / '.git').resolve()), branch='main',
+                target_base_oid=head, before_head=head,
+                remote=Remote(str(repo.resolve()), 'main', head))
+            current = SimpleNamespace(operation='rebase', generation=expected.generation,
+                expected_head=head, snapshot={})
+            context = SimpleNamespace(plan=SimpleNamespace(plan_id=expected.plan_id),
+                branch=expected.branch, worktree=repo)
+            costs = {}
+            for reuse in (False, True):
+                with self.subTest(reuse=reuse):
+                    root = Path(directory) / str(reuse)
+                    root.mkdir()
+                    writer = EventWriter(root / 'worker.jsonl')
+                    capture = mock.Mock(wraps=manager.capture_git_snapshot)
+                    service = ManagedRebaseService(expected, ObservationAdapters(
+                        git=manager.git, capture_snapshot=capture,
+                        validate_identity=mock.Mock(), read_rebase_metadata=manager._owned_rebase_metadata,
+                        read_remote=lambda _: expected.remote,
+                        read_inputs=lambda _: ('inputs', 'worker-contract'),
+                        read_file=lambda root, path: ('100644', manager._path_signature(root, path)),
+                        path_allowed=lambda _: True, contracts_allowed=lambda _: True))
+                    owner = OwnershipHandler(SimpleNamespace(
+                        state=SimpleNamespace(connection=None),
+                        identity=SimpleNamespace(repo_path=repo, repo=expected.repo),
+                        git=manager.git, _current_rebase_service=lambda *_a, **_k: service))
+
+                    def validate(observed=None, decision=None):
+                        self.assertTrue(owner._owned_current_checkpoint_rebase(
+                            context, {'publication_remote_oid': head}, head, current,
+                            {'accepted_remote_oid': head}, None,
+                            rebase_observation=(expected, observed, decision) if reuse else None))
+
+                    state = mock.Mock()
+                    def complete(_checkpoint, *, acceptance, reobserve, **_kwargs):
+                        # Confirmation is a separate observation, after owner
+                        # inspection. Each observation still reads twice.
+                        self.assertEqual(reobserve().acceptance, acceptance)
+                    state.complete_rebase.side_effect = complete
+                    try:
+                        with writer.activate(), git_command_timing(), phase('rebase:cost_scenario'), mock.patch(
+                                'loop_manager_internal.recovery.checkpoint_ownership.owned_remote_oid',
+                                return_value=head):
+                            writer.current_test = self.id()
+                            if not reuse:
+                                validate()
+                            service.adopt(state, mock.sentinel.checkpoint,
+                                validate_ownership=validate if reuse else None)
+                    finally:
+                        writer.close()
+                    summary = summarize(root)
+                    costs['reuse' if reuse else 'independent'] = {
+                        'snapshots': capture.call_count,
+                        'commands': sum(cost['count'] for cost in summary['git_commands']),
+                        'git_seconds': sum(cost['seconds'] for cost in summary['git_commands']),
+                        'seconds': next(p['duration'] for p in summary['phases']
+                                        if p['name'] == 'rebase:cost_scenario'),
+                    }
+            self.assertEqual(costs['independent']['snapshots'], 6)
+            self.assertEqual(costs['reuse']['snapshots'], 4)
+            # Fixed clean-repository query budget, including reads outside
+            # capture_snapshot. Deliberate new evidence must update this budget.
+            self.assertEqual(costs['independent']['commands'], 102)
+            self.assertEqual(costs['reuse']['commands'], 68)
+            self.assertLess(costs['reuse']['commands'], costs['independent']['commands'])
+            print('G188_ADOPTION_COST ' + json.dumps(costs, sort_keys=True))
+
     def test_git_bytes_separates_warnings_and_preserves_failure_diagnostics(self):
         from loop_manager_internal.git.command_adapter import GitBytesEffects, git_bytes
         from loop_manager_internal.runtime.contracts import GitLockError

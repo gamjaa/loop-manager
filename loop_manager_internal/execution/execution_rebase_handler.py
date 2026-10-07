@@ -649,12 +649,15 @@ class RebaseHandler:
         if current.operation != 'rebase' and not legacy_completed:
             return
         service = self.ports._current_rebase_service(context)
-        row = self.ports._row()
-        if not self.ports._owned_checkpoint_remote(
-                context, row, service.expected.remote.oid,
-                checkpoint.get(self.ports.identity.repo, context.plan.plan_id)):
-            raise manager_git_journal.MutationEvidenceError('current checkpoint remote ownership differs')
-        service.adopt(self.ports.state, checkpoint)
+
+        def validate_ownership(observed, decision):
+            selected = checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
+            if selected != current or not self.ports._owned_checkpoint_remote(
+                    context, self.ports._row(), service.expected.remote.oid, selected,
+                    rebase_observation=(service.expected, observed, decision)):
+                raise manager_git_journal.MutationEvidenceError('current checkpoint remote ownership differs')
+
+        service.adopt(self.ports.state, checkpoint, validate_ownership=validate_ownership)
         self.ports._publish_rebased_checkpoint(context)
 
     def _publish_rebased_checkpoint(self, context):
@@ -669,4 +672,3 @@ class RebaseHandler:
                 context, self.ports._row(), oid, selected, **evidence),
             git=self.ports.git,
             lookup_pr=self.ports.pr_for_branch)
-
