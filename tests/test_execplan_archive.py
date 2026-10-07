@@ -38,6 +38,7 @@ class FakeRepository:
     def __init__(self, candidates):
         self.candidates = tuple(candidates)
         self.pending = {}
+        self.operation_pending = []
         self.archived = set()
         self.prepared = {}
         self.success_results = {}
@@ -73,8 +74,9 @@ class FakeRepository:
         )
 
     def record_operation_pending(
-        self, _repo, _operation_id, candidates, *, reason, **_kwargs
+        self, _repo, operation_id, candidates, *, reason, **kwargs
     ):
+        self.operation_pending.append((operation_id, reason, kwargs))
         for item in candidates:
             self.pending[item.plan_id] = reason
 
@@ -93,7 +95,14 @@ class FakeRepository:
 
 
 class FakeGit:
-    def __init__(self, observations, *, bases=None, pushes=None):
+    def __init__(
+        self,
+        observations,
+        *,
+        bases=None,
+        pushes=None,
+        commit_match_results=None,
+    ):
         self.observations = observations
         self.bases = list(bases or ["base"])
         self.pushes = list(
@@ -104,6 +113,7 @@ class FakeGit:
         self.prepared_moves = []
         self.pushed = []
         self.match_count = 0
+        self.commit_match_results = list(commit_match_results or [])
         self.cleaned = []
 
     def fetch_remote_base(self, _base_branch):
@@ -131,6 +141,11 @@ class FakeGit:
 
     def commit_matches(self, _prepared, _moves):
         self.match_count += 1
+        if self.commit_match_results:
+            result = self.commit_match_results.pop(0)
+            if isinstance(result, Exception):
+                raise result
+            return result
         return True
 
     def cleanup_prepared(self, prepared):
@@ -156,6 +171,78 @@ class DefinitionValidatingFakeGit(FakeGit):
 
 
 class ExecPlanArchiveTest(unittest.TestCase):
+    def test_stored_commit_mismatch_is_reprepared_before_push(self):
+        item = candidate("G-001")
+        repository = FakeRepository((item,))
+        operation_id = execplan_archive.archive_operation_id(
+            "base",
+            (execplan_archive.ArchiveMove(
+                item.plan_id, item.active_path, item.archive_path,
+                item.content_hash, item.revision_sha,
+            ),),
+        )
+        repository.prepared[operation_id] = (
+            execplan_archive_state.PreparedArchiveOperation(
+                operation_id, "base", "stale-tree", "stale-commit"
+            )
+        )
+        git = FakeGit(
+            {"base": {"G-001": (entry("G-001"), None)}},
+            commit_match_results=[False, True],
+        )
+
+        outcome = execplan_archive.ExecPlanArchiveDispatcher(repository, git).dispatch("/repo", "main")
+
+        self.assertEqual(outcome.archived_plan_ids, ("G-001",))
+        self.assertEqual(git.match_count, 2)
+        self.assertEqual(git.prepared, [("base", ("G-001",))])
+        self.assertEqual(git.pushed, ["commit-base"])
+
+    def test_stored_commit_validation_exception_is_reprepared_before_push(self):
+        item = candidate("G-001")
+        repository = FakeRepository((item,))
+        operation_id = execplan_archive.archive_operation_id(
+            "base",
+            (execplan_archive.ArchiveMove(
+                item.plan_id, item.active_path, item.archive_path,
+                item.content_hash, item.revision_sha,
+            ),),
+        )
+        repository.prepared[operation_id] = (
+            execplan_archive_state.PreparedArchiveOperation(
+                operation_id, "base", "stale-tree", "stale-commit"
+            )
+        )
+        git = FakeGit(
+            {"base": {"G-001": (entry("G-001"), None)}},
+            commit_match_results=[RuntimeError("stored commit is invalid"), True],
+        )
+
+        outcome = execplan_archive.ExecPlanArchiveDispatcher(repository, git).dispatch("/repo", "main")
+
+        self.assertEqual(outcome.archived_plan_ids, ("G-001",))
+        self.assertEqual(git.match_count, 2)
+        self.assertEqual(git.prepared, [("base", ("G-001",))])
+        self.assertEqual(git.pushed, ["commit-base"])
+
+    def test_new_commit_rename_only_validation_failure_is_pending_without_push(self):
+        item = candidate("G-001")
+        repository = FakeRepository((item,))
+        git = FakeGit(
+            {"base": {"G-001": (entry("G-001"), None)}},
+            commit_match_results=[False],
+        )
+
+        outcome = execplan_archive.ExecPlanArchiveDispatcher(repository, git).dispatch("/repo", "main")
+
+        reason = "commit_preparation_failed:prepared archive commit failed rename-only validation"
+        self.assertEqual(outcome.kind, execplan_archive.ArchiveDispatchKind.TRANSIENT)
+        self.assertEqual(dict(outcome.pending), {"G-001": reason})
+        self.assertEqual(repository.pending["G-001"], reason)
+        self.assertEqual(repository.operation_pending[0][1], reason)
+        self.assertEqual(git.match_count, 1)
+        self.assertEqual(git.pushed, [])
+
     def test_optional_definition_validation_is_skipped_for_legacy_port(self):
         item = candidate("G-001")
         repository = FakeRepository((item,))
