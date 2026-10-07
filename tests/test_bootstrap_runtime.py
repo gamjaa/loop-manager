@@ -390,7 +390,7 @@ class BootstrapRuntimeTests(OriginScopeFixture, unittest.TestCase):
 class BootstrapSavedScopeResumeTests(unittest.TestCase):
     """Real subprocess regressions; run only in Manager's full verification."""
 
-    def test_remote_bootstrap_child_resumes_saved_scope_without_identity_injection(self):
+    def test_remote_bootstrap_child_resumes_saved_scope_without_identity_injection(self, advance_after_selection=False):
         import json
         import shutil
         import sys
@@ -442,6 +442,18 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
     codex_model_efforts = lambda *args: {model: frozenset({'medium', 'high', 'max', 'xhigh'})
         for model in ('test-fast', 'test-balanced', 'test-strong')}
     run_codex = fake_agent
+    if '--runtime-child' in sys.argv:
+        from loop_manager_internal.runtime.bootstrap import BootstrapService
+        validate_mutation = BootstrapService.validate_runtime_mutation
+        def advance_remote_then_validate(service, source, state_dir, *args, **kwargs):
+            advance = state_dir / 'advance-after-selection.json'
+            if advance.exists():
+                writer, base = json.loads(advance.read_text())
+                subprocess.run(['git', '-C', writer, 'push', 'origin', 'HEAD:' + base], check=True)
+                subprocess.run(['git', '-C', str(source), 'fetch', 'origin', base], check=True)
+                advance.unlink()
+            return validate_mutation(service, source, state_dir, *args, **kwargs)
+        BootstrapService.validate_runtime_mutation = advance_remote_then_validate
     raise SystemExit(main())'''), encoding='utf-8')
                     for name in ('PLANS.md', 'AGENTS.common.md', 'AGENTS.planner.md',
                                  'AGENTS.planner_check.md', 'AGENTS.worker.md', 'AGENTS.reviewer.md'):
@@ -542,6 +554,10 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                     (writer / 'README.md').write_text('Remote B\n', encoding='utf-8')
                     sha_b = commit_all(writer, 'Advance to B')
                     git(writer, 'push', 'origin', f'HEAD:{base}')
+                    if advance_after_selection:
+                        (writer / 'README.md').write_text('External C\n', encoding='utf-8')
+                        sha_c = commit_all(writer, 'External base C after runtime B selection')
+                        (state / 'advance-after-selection.json').write_text(json.dumps([str(writer), base]), encoding='utf-8')
                     config = profile_config(self)
                     (state / 'stop-after-registration').touch()
                     interrupted = subprocess.run([sys.executable, '-B', str(manager_file),
@@ -563,7 +579,7 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                         expected_role = role
                         self.assertEqual(proof['role'], expected_role)
                         self.assertEqual(proof['session'], expected_role + '-existing')
-                        self.assertEqual(proof['sha'], sha_b)
+                        self.assertEqual(proof['sha'], sha_c if advance_after_selection and attempt else sha_b)
                         self.assertEqual(proof['worktree'], str(workspace))
                         self.assertIn('runtime mutation 검증', completed.stdout)
                         if attempt == 0:
@@ -571,7 +587,7 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                         if role != 'planner':
                             self.assertEqual((workspace / 'src/app.py').read_text(), 'VALUE = 2\n')
                         with sqlite3.connect(state / 'loop-manager.db') as check:
-                            self.assertEqual(check.execute('SELECT COUNT(*) FROM project_blocks').fetchone()[0], 0)
+                            self.assertEqual(check.execute('SELECT COUNT(*) FROM project_blocks').fetchone()[0], 0, completed.stdout)
                             if role != 'planner':
                                 row = check.execute("SELECT status, worker_session_id, reviewer_session_id, retry_count "
                                     "FROM exec_plans WHERE plan_id='G-001'").fetchone()
@@ -580,6 +596,9 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                         # Leave the proof absent so same-SHA reuse must dispatch again.
                         proof_path.unlink()
 
+    def test_selected_runtime_b_survives_external_base_c_before_child_prevalidation(self):
+        self.test_remote_bootstrap_child_resumes_saved_scope_without_identity_injection(advance_after_selection=True)
+
 
 class BootstrapSavedScopeFixtureUnitTests(unittest.TestCase):
     def test_saved_invocation_proof_is_bound_to_role_session_repository_and_scope(self):
@@ -587,7 +606,7 @@ class BootstrapSavedScopeFixtureUnitTests(unittest.TestCase):
         from tests.support.database import runtime_connection
         from tests.support.runtime import record_saved_scope_invocation
         from loop_manager_internal.agents import scope_validation
-        from tests.test_agent_scope_decision import snapshot
+        from tests.support.scope import snapshot
 
         connection = runtime_connection()
         self.addCleanup(connection.close)
@@ -654,7 +673,7 @@ class ReviewerRebaseScopeHandoffUnitTests(unittest.TestCase):
         from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
         from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
         from tests.support.database import runtime_connection
-        from tests.test_agent_scope_decision import snapshot
+        from tests.support.scope import snapshot
 
         connection = runtime_connection()
         self.addCleanup(connection.close)

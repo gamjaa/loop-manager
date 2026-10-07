@@ -1,4 +1,5 @@
 import sqlite3
+from dataclasses import replace
 from pathlib import Path
 import loop_manager
 from loop_manager_internal.storage import planning_input_state
@@ -86,3 +87,13 @@ class AgentScopeFixture:
                 ),
             )
         database.close()
+
+
+def snapshot(**changes):
+    base = loop_manager.GitSnapshot(
+        head="a", branch="loop-manager/G-051", index={}, dirty={},
+        refs={"refs/heads/loop-manager/G-051": ("a", "commit")},
+        worktrees={"/managed": ("HEAD=a", "branch=refs/heads/loop-manager/G-051")},
+        config={}, operations={},
+    )
+    return replace(base, **changes)

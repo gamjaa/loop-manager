@@ -2,18 +2,60 @@
 from __future__ import annotations
 from collections.abc import Callable
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from loop_manager_internal.agents import agent_scope_decision
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.application.contracts import RemoteBranchMissingError
 from loop_manager_internal.git import manager_git_journal
+from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 from loop_manager_internal.runtime.contracts import RuntimeWorktree
 from loop_manager_internal.runtime.resource_lock import fetch_resource
+from loop_manager_internal.runtime.runtime_scope import proven_runtime_removal
 from pathlib import Path
 import json
 import re
 import secrets
 import sqlite3
+
+
+def reconcile_external_base(git, repo, base, before, current, resources):
+    """Compare a live remote fast-forward only with invocation-bound isolation.
+
+    This does not fabricate Manager receipts or alter saved Agent evidence.
+    Missing/rewritten refs and symbolic target changes retain strict comparison.
+    """
+    ref, head = f'refs/remotes/origin/{base}', 'refs/remotes/origin/HEAD'
+    old, new = before.refs.get(ref), current.refs.get(ref)
+    if (resources is None or ref not in resources.refs or old is None or new is None
+            or old[1] or new[1]):
+        return before
+    previous_head, observed_head = before.refs.get(head), current.refs.get(head)
+    if previous_head != observed_head:
+        if observed_head != (new[0], ref) or (previous_head is not None and previous_head != (old[0], ref)):
+            return before
+    if old == new and previous_head == observed_head:
+        return before
+    try:
+        remote_ref = f'refs/heads/{base}'
+        remote = git(repo, 'ls-remote', '--heads', 'origin', remote_ref, check=False)
+        if remote.returncode or remote.stdout.split() != [new[0], remote_ref]:
+            return before
+        if git(repo, 'merge-base', '--is-ancestor', old[0], new[0], check=False).returncode:
+            return before
+        if previous_head is None and observed_head is not None:
+            symbolic = git(repo, 'ls-remote', '--symref', 'origin', 'HEAD', check=False)
+            if symbolic.returncode or symbolic.stdout.split() != ['ref:', remote_ref, 'HEAD', new[0], 'HEAD']:
+                return before
+        # The tracking resource must still match the captured observation.
+        live = git(repo, 'rev-parse', '--verify', ref, check=False)
+        if live.returncode or live.stdout.strip() != new[0]:
+            return before
+    except (RuntimeError, OSError):
+        return before
+    refs = {**before.refs, ref: new}
+    if previous_head != observed_head:
+        refs[head] = observed_head
+    return replace(before, refs=refs)
 
 
 @dataclass(frozen=True)
@@ -413,6 +455,18 @@ class ReconciledManagerScopeMetadataEffects:
 def _reconciled_manager_scope_metadata(effects: ReconciledManagerScopeMetadataEffects, connection, repo_path, state_dir, repo,
                                       plan_id, before, current, resources=None):
     """Use fetch receipts/CAS effects and exact Merge cleanup, never ref drift."""
+    saved = ExecutionCheckpointRepository(connection).get(repo, plan_id or '').snapshot or {}
+    baseline = saved.get('manager_metadata_agent_baseline')
+    if isinstance(baseline, dict):
+        before = agent_scope_decision.manager_comparison_baseline(before, before, saved, baseline.get('role'))
+    removed = frozenset(path for path, registration in before.worktrees.items()
+        if path not in current.worktrees and proven_runtime_removal(
+            state_dir, Path(repo), Path(path), registration))
+    before = agent_scope_decision.reconcile_manager_metadata(
+        before, current, refs=frozenset(), worktrees=removed)
+    project = connection.execute('SELECT base_branch FROM projects WHERE repo = ?', (repo,)).fetchone()
+    if project is not None:
+        before = reconcile_external_base(effects.git, repo_path, project[0], before, current, resources)
     scope_before, scope_current = agent_scope_decision.scoped_metadata(before, current, resources)
     effects._ensure_cleanup_pending_schema(connection)
     proven_refs = effects._proven_manager_base_refs(

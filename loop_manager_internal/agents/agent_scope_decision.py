@@ -143,7 +143,7 @@ def used_git_resources(*, role: str, phase: str, base_branch: str,
     }
     if phase not in stages.get(role, ()) or not base_branch or not worktree_key:
         return None
-    refs = {f"refs/remotes/origin/{base_branch}"}
+    refs = {f"refs/remotes/origin/{base_branch}", "refs/remotes/origin/HEAD"}
     branches = {base_branch}
     if role in {"worker", "reviewer"}:
         if not branch:
@@ -315,6 +315,7 @@ def decide_persisted_scope(
     manager_runtime: tuple[str, str] | None = None,
     runtime_recreation_proven: bool = False,
     manager_refs: frozenset[str] = frozenset(),
+    runtime_base_oid: str | None = None,
 ) -> ScopeDecision:
     """Describe ordered scope checks without reading Git or persisted state."""
     if role not in {"planner", "planner_check", "maintenance_planner", "worker", "reviewer"}:
@@ -340,12 +341,12 @@ def decide_persisted_scope(
             registration is None
             or f"HEAD={runtime_sha}" not in registration
             or "detached=True" not in registration
-            or origin is None or origin[0] != runtime_sha
+            or origin is None or origin != (runtime_base_oid or runtime_sha, "")
             or not registration_matches
             or (previous_head != current_head and (
                 previous_origin is None
                 or previous_head != (previous_origin[0], ref)
-                or current_head != (runtime_sha, ref)
+                or current_head != (runtime_base_oid or runtime_sha, ref)
             ))
         ):
             raise ScopeDecisionError(

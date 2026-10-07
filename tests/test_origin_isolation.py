@@ -1163,10 +1163,10 @@ class ManagerBaselineReconciliationUnitTests(unittest.TestCase):
                     for key, value in original_fields.items():
                         if key not in {'agent_snapshot', 'agent_result_snapshot', 'agent_manager_snapshot'}:
                             self.assertEqual(saved[key], value, key)
-                    self.assertEqual(saved['agent_snapshot'], self.current.serialize())
-                    self.assertEqual(saved['agent_result_snapshot'], self.current.serialize())
+                    self.assertEqual(saved['agent_snapshot'], self.before.serialize())
+                    self.assertEqual(saved['agent_result_snapshot'], self.before.serialize())
                     self.assertEqual(loop_manager.ManagerGitCheckpoint.deserialize(
-                        saved['agent_manager_snapshot']), replace(saved_checkpoint, snapshot=self.current))
+                        saved['agent_manager_snapshot']), saved_checkpoint)
                     # A second prevalidation must neither reject the saved
                     # result nor produce another baseline update.
                     with mock.patch.object(loop_manager, 'update_project') as update:

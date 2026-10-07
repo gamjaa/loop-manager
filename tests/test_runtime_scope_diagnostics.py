@@ -7,7 +7,7 @@ from unittest import mock
 from loop_manager_internal.agents import scope_recovery
 from loop_manager_internal.agents.scope_contracts import AgentScopeError
 from loop_manager_internal.runtime.contracts import RuntimeMutation
-from tests.test_agent_scope_decision import snapshot
+from tests.support.scope import snapshot
 
 
 class RuntimeScopeDiagnosticTests(unittest.TestCase):
@@ -99,3 +99,112 @@ class RuntimeFalsePositiveBaseTests(unittest.TestCase):
                         self.assertIn('refs/heads/foreign', effects.operation_log.call_args.args[0])
                     else:
                         effects.validate_persisted_agent_scope.assert_called_once()
+
+
+class ExternalBaseAdvanceUnitTests(unittest.TestCase):
+    def test_live_forward_and_symbolic_head_require_isolation_and_keep_original(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.git.base_fetch_service import reconcile_external_base
+        from loop_manager_internal.agents.agent_scope_decision import used_git_resources
+        for base in ('main', 'develop'):
+            ref, head = 'refs/remotes/origin/' + base, 'refs/remotes/origin/HEAD'
+            resources = used_git_resources(role='worker', phase='WORKING', base_branch=base,
+                branch='loop-manager/G-051', worktree_key='/managed')
+            for created in (False, True):
+                before = snapshot(refs={ref: ('a', '')} if created else {ref: ('a', ''), head: ('a', ref)})
+                current = replace(before, refs={ref: ('c', ''), head: ('c', ref)})
+                original = before.serialize()
+                def git(_repo, *args, **kwargs):
+                    if args[0] == 'ls-remote':
+                        output = ('ref: refs/heads/' + base + '\tHEAD\nc\tHEAD\n'
+                                  if '--symref' in args else 'c\trefs/heads/' + base + '\n')
+                        return SimpleNamespace(returncode=0, stdout=output)
+                    return SimpleNamespace(returncode=0, stdout='c\n')
+                self.assertEqual(reconcile_external_base(git, Path('/source'), base,
+                    before, current, resources).refs, current.refs)
+                self.assertEqual(before.serialize(), original)
+                self.assertIs(reconcile_external_base(git, Path('/source'), base, before, current, None), before)
+                for invalid in (({ref: ('c', '')},) if not created else ()) + ({ref: ('c', ''), head: ('c', 'refs/heads/other')},
+                                {ref: ('c', ''), head: ('wrong', ref)}, {head: ('c', ref)}):
+                    self.assertIs(reconcile_external_base(git, Path('/source'), base,
+                        before, replace(current, refs=invalid), resources), before)
+                for failure in ('ls-remote', 'merge-base', 'rev-parse'):
+                    def unavailable(repo, *args, **kwargs):
+                        return SimpleNamespace(returncode=1, stdout='') if args[0] == failure else git(repo, *args, **kwargs)
+                    self.assertIs(reconcile_external_base(unavailable, Path('/source'), base,
+                        before, current, resources), before)
+
+    def test_checkpoint_accepts_only_proven_derived_head_and_preserves_other_refs(self):
+        # Test the same pure normalization used before checkpoint ref checks.
+        from loop_manager_internal.agents.agent_scope_decision import reconcile_manager_metadata
+        ref, head = 'refs/remotes/origin/develop', 'refs/remotes/origin/HEAD'
+        before = snapshot(refs={ref: ('a', ''), head: ('a', ref), 'refs/tags/foreign': ('old', '')})
+        current = replace(before, refs={ref: ('b', ''), head: ('b', ref), 'refs/tags/foreign': ('new', '')})
+        normalized = reconcile_manager_metadata(before, current, refs=frozenset({ref}), worktrees=frozenset())
+        self.assertEqual(normalized.refs[head], ('b', ref))
+        self.assertEqual(normalized.refs['refs/tags/foreign'], ('old', ''))
+        for target in ('refs/remotes/origin/main', ''):
+            changed = replace(current, refs={**current.refs, head: ('b', target)})
+            self.assertEqual(reconcile_manager_metadata(before, changed, refs=frozenset({ref}),
+                worktrees=frozenset()).refs[head], before.refs[head])
+
+
+class RuntimeSelectionEvidenceUnitTests(unittest.TestCase):
+    def test_selected_fetch_remains_valid_after_live_forward_but_not_rewrite(self):
+        import tempfile
+        from types import SimpleNamespace
+        from loop_manager_internal.runtime.bootstrap import BootstrapService
+        from loop_manager_internal.git import manager_git_journal as journal
+        with tempfile.TemporaryDirectory() as directory:
+            state, source = Path(directory), Path('/source')
+            ref, a, b, c = 'refs/remotes/origin/develop', 'a' * 40, 'b' * 40, 'c' * 40
+            observed = {'oid': a}
+            journal.execute(state, owner='bootstrap', kind='bootstrap_fetch', repo=str(source), target=ref,
+                before={'oid': a}, expected={'oid': b}, observe=lambda: observed,
+                apply=lambda _token: observed.update(oid=b), marker=lambda _intent: True)
+            path = next(journal._slot(state, str(source), 'bootstrap_fetch', ref).glob('*.intent.json'))
+            token = journal._read(path)['id']
+            def git(_repo, *args, **kwargs):
+                stdout = (c + '\trefs/heads/develop\n' if args[0] == 'ls-remote' else
+                          c if args[0] == 'rev-parse' else b + '\0loop-manager-base-fetch:' + token)
+                return SimpleNamespace(returncode=0, stdout=stdout)
+            effects = mock.Mock(git=git)
+            service = BootstrapService(effects, runtime_root=Path('/runtime'))
+            self.assertTrue(service._selected_runtime_revision(source, state, 'develop', b, c))
+            original = path.read_bytes()
+            effects.git = lambda *_args, **_kwargs: SimpleNamespace(returncode=1, stdout='')
+            self.assertFalse(service._selected_runtime_revision(source, state, 'develop', b, c))
+            self.assertEqual(path.read_bytes(), original)
+            effects.git = git
+            self.assertFalse(service._selected_runtime_revision(source, state, 'develop', a, c))
+
+    def test_removed_comparison_runtime_requires_exact_receipt_and_absence(self):
+        import tempfile
+        import json
+        from loop_manager_internal.runtime.runtime_scope import proven_runtime_removal
+        from loop_manager_internal.runtime.runtime_identity import expected_runtime_worktree
+        from loop_manager_internal.git import manager_git_journal as journal
+        with tempfile.TemporaryDirectory() as directory:
+            state, source, sha = Path(directory), Path('/source'), 'b' * 40
+            runtime = expected_runtime_worktree(state, source, sha)
+            registration = ('HEAD=' + sha, 'detached=True', 'locked=loop-manager-runtime:owned')
+            before = {'exists': True, 'registration': {'head': sha, 'detached': True, 'locked': 'loop-manager-runtime:owned'}}
+            live = dict(before)
+            def remove(token):
+                live.update(exists=False, registration=None)
+                receipts = state / 'runtime-removals'
+                receipts.mkdir()
+                (receipts / (token + '.json')).write_text(json.dumps(
+                    {'id': token, 'repo': str(source), 'target': str(runtime), 'before': before}))
+            journal.execute(state, owner='bootstrap', kind='runtime_remove', repo=str(source), target=str(runtime),
+                before=before, expected={'exists': False, 'registration': None},
+                observe=lambda: live, apply=remove, marker=lambda _intent: True)
+            self.assertTrue(proven_runtime_removal(state, source, runtime, registration))
+            self.assertFalse(proven_runtime_removal(state, source, runtime, (*registration, 'unknown=True')))
+            self.assertFalse(proven_runtime_removal(state, source, runtime.with_name('other'), registration))
+            runtime.mkdir(parents=True)
+            self.assertFalse(proven_runtime_removal(state, source, runtime, registration))
+            runtime.rmdir()
+            receipt = next((state / 'runtime-removals').glob('*.json'))
+            receipt.write_text('{}')
+            self.assertFalse(proven_runtime_removal(state, source, runtime, registration))

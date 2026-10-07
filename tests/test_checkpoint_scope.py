@@ -70,6 +70,64 @@ class CheckpointScopeTests(TestCase):
     def plan(self):
         return self.connection.execute('SELECT * FROM exec_plans').fetchone()
 
+    def test_stale_checkpoint_cause_refresh_cancel_and_competing_request(self):
+        original = self.request
+        self.connection.execute("UPDATE execplan_blocks SET reason_code='worker_failed', evidence='new cause'")
+        self.connection.commit()
+        updated = self.store.reconcile_cause(original)
+        self.assertNotEqual(updated.request_identity, original.request_identity)
+        self.assertEqual(updated.evidence, 'new cause')
+        self.assertEqual(updated.expected_remote_oid, original.expected_remote_oid)
+        self.assertEqual(updated.branch, original.branch)
+        self.assertIsNone(self.store.reconcile_cause(original))
+        row = self.connection.execute('SELECT publication_history FROM blocked_checkpoints').fetchone()
+        self.assertIn(original.request_identity, row[0])
+        self.connection.execute('DELETE FROM execplan_blocks')
+        self.connection.commit()
+        self.assertIsNone(self.store.reconcile_cause(updated))
+        self.assertEqual(self.store.get('repo', 'G-047').phase.value, 'unpublished')
+        self.assertEqual(self.connection.execute('SELECT retry_count FROM exec_plans').fetchone()[0], 0)
+
+    def test_checkpoint_accepts_manager_base_derived_head_and_rejects_target_change(self):
+        for base in ('main', 'develop'):
+            ref, head = 'refs/remotes/origin/' + base, 'refs/remotes/origin/HEAD'
+            before = replace(self.before, refs={**self.before.refs, ref: ('a', ''), head: ('a', ref)})
+            current = replace(before, refs={**before.refs, ref: ('b', ''), head: ('b', ref)})
+            self.connection.execute('UPDATE exec_plans SET agent_snapshot=?', (before.serialize(),))
+            self.effects = replace(self.effects, _proven_manager_base_refs=lambda *_: frozenset({ref}))
+            with mock.patch.object(manager, '_agent_git_resources', return_value=None):
+                self.assertIsNone(self.adapter._shared_safety_error(self.request, self.plan(), current))
+                for altered in (('b', 'refs/heads/foreign'), ('foreign', ref)):
+                    changed = replace(current, refs={**current.refs, head: altered})
+                    self.assertEqual(self.adapter._shared_safety_error(self.request, self.plan(), changed).reason_code,
+                                     'shared_ref_mutation')
+
+    def test_dispatcher_rechecks_cause_before_safety_and_publication_completion(self):
+        safety, publication, results = mock.Mock(), mock.Mock(), mock.Mock()
+        safety.assess.return_value = blocked_checkpoint.SafetyVerdict(
+            False, blocked_checkpoint.SafetyScope.PLAN, 'git_operation_in_progress', 'waiting', None, ())
+        dispatcher = blocked_checkpoint.BlockedCheckpointDispatcher(self.store, safety, publication, results)
+        self.connection.execute("UPDATE execplan_blocks SET evidence='current cause'")
+        self.connection.commit()
+        self.assertTrue(dispatcher._dispatch_one(self.request))
+        inspected = safety.assess.call_args.args[0]
+        self.assertEqual(inspected.evidence, 'current cause')
+        self.assertNotEqual(inspected.request_identity, self.request.request_identity)
+        results.promote_project_block.assert_not_called()
+        publication.prepare.assert_not_called()
+        self.connection.execute("UPDATE execplan_blocks SET evidence='changed after push'")
+        self.connection.commit()
+        dispatcher._finish_published(inspected, 'candidate')
+        current = self.store.get('repo', 'G-047')
+        self.assertEqual(current.phase.value, 'requested')
+        self.assertEqual(current.evidence, 'changed after push')
+        self.connection.execute('DELETE FROM execplan_blocks')
+        self.connection.commit()
+        safety.reset_mock()
+        self.assertTrue(dispatcher._dispatch_one(current))
+        safety.assess.assert_not_called()
+        self.assertEqual(self.connection.execute('SELECT retry_count FROM exec_plans').fetchone()[0], 0)
+
     def test_checkpoint_ignores_unrelated_resources_only_with_invocation_proof(self):
         changes = (
             {'refs': {**self.before.refs, 'refs/heads/B': ('new', ''),

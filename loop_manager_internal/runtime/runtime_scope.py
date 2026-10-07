@@ -4,6 +4,39 @@ from pathlib import Path
 from typing import Callable
 
 from loop_manager_internal.git import manager_git_journal as journal
+from loop_manager_internal.runtime.runtime_identity import expected_runtime_worktree
+
+
+def proven_runtime_removal(state_dir, source, runtime, registration):
+    """Read an exact completed removal without trusting a runtime path prefix."""
+    heads = [entry[5:] for entry in registration if entry.startswith('HEAD=')]
+    locks = [entry[7:] for entry in registration if entry.startswith('locked=')]
+    if (len(heads) != 1 or len(locks) != 1 or 'detached=True' not in registration
+            or set(registration) != {f'HEAD={heads[0]}', 'detached=True', f'locked={locks[0]}'}):
+        return False
+    try:
+        if runtime != expected_runtime_worktree(state_dir, source, heads[0]) or runtime.exists() or runtime.is_symlink():
+            return False
+    except (RuntimeError, ValueError, OSError):
+        return False
+    before = {'exists': True, 'registration': {'head': heads[0], 'detached': True, 'locked': locks[0]}}
+    slot = journal._slot(state_dir, str(source), 'runtime_remove', str(runtime))
+    try:
+        for path in slot.glob('*.result.json'):
+            result = journal._read(path)
+            intent = journal._read(slot / f"{result['id']}.intent.json")
+            receipt = journal._read(state_dir / 'runtime-removals' / f"{result['id']}.json")
+            if (intent.get('owner') != 'bootstrap' or intent.get('repo') != str(source)
+                    or intent.get('kind') != 'runtime_remove' or intent.get('target') != str(runtime)
+                    or intent.get('before') != before or intent.get('id') != result.get('id')
+                    or result.get('status') != 'complete'
+                    or receipt != {'id': result['id'], 'repo': str(source), 'target': str(runtime), 'before': before}):
+                continue
+            if journal.verified_transition(intent, result['observed'], True) == result['candidates']:
+                return True
+    except (RuntimeError, OSError, ValueError, KeyError, TypeError):
+        pass
+    return False
 
 
 def proven_runtime_recreation(

@@ -3564,6 +3564,8 @@ reconcile_false_positive_runtime_block = _bind_effects(
         capture_git_snapshot=lambda *args, **kwargs: capture_git_snapshot(*args, **kwargs),
         operation_log=lambda *args, **kwargs: operation_log(*args, **kwargs),
         validate_persisted_agent_scope=lambda *args, **kwargs: validate_persisted_agent_scope(*args, **kwargs),
+        _agent_git_resources=lambda *args, **kwargs: _agent_git_resources(*args, **kwargs),
+        _reconciled_manager_scope_metadata=lambda *args, **kwargs: _reconciled_manager_scope_metadata(*args, **kwargs),
     ),
 )
 

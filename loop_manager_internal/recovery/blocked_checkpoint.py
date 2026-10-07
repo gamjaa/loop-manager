@@ -402,6 +402,11 @@ class BlockedCheckpointDispatcher:
         return completed
 
     def _finish_published(self, request, local_oid):
+        reconcile = getattr(type(self._state), 'reconcile_cause', None)
+        if reconcile is not None:
+            current = reconcile(self._state, request)
+            if current is None or current.request_identity != request.request_identity:
+                return
         if request.pr_url:
             self._state.finish_published(
                 request, local_oid, reobserve=lambda: self._publication.confirm(request, local_oid))
@@ -409,7 +414,19 @@ class BlockedCheckpointDispatcher:
             self._state.finish_published(request, local_oid)
 
     def _dispatch_one(self, request: CheckpointRequest) -> bool:
+        reconcile = getattr(type(self._state), 'reconcile_cause', None)
+        if reconcile is not None:
+            request = reconcile(self._state, request)
+            if request is None:
+                return True
         verdict = self._safety.assess(request)
+        if reconcile is not None and verdict.reason_code == 'checkpoint_identity_changed':
+            refreshed = reconcile(self._state, request)
+            if refreshed is None:
+                return True
+            if refreshed.request_identity != request.request_identity:
+                request = refreshed
+                verdict = self._safety.assess(request)
         if not verdict.safe:
             if (
                 verdict.scope is SafetyScope.PROJECT

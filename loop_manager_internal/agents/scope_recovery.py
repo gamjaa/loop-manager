@@ -4,6 +4,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass, replace
 import hashlib
+import re
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -22,6 +23,7 @@ from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseServi
 from loop_manager_internal.runtime.process_lock import _held_process_lock_identity
 from loop_manager_internal.runtime.contracts import RuntimeMutation, WorkspaceOwnershipError
 from loop_manager_internal.runtime import runtime_scope
+from loop_manager_internal.git.base_fetch_service import reconcile_external_base
 
 GUIDANCE_BLOCK_REASON = BlockReasonCode.GUIDANCE_APPROVAL_REQUIRED.value
 
@@ -139,10 +141,13 @@ def _diagnosed_blocked_commit_allowances(
 def runtime_scope_diagnostic(before: GitSnapshot | None, current: GitSnapshot | None,
                              mutation: RuntimeMutation, *, accepted: bool,
                              result: GitSnapshot | None = None,
-                             checkpoint: GitSnapshot | None = None) -> str:
+                             checkpoint: GitSnapshot | None = None, base_branch: str = 'main') -> str:
     """Report identities and changed keys, never snapshot values or file contents."""
     def identity(snapshot):
         return hashlib.sha256(snapshot.serialize().encode()).hexdigest()[:16] if snapshot else "unavailable"
+    base_oid = current.refs.get(f'refs/remotes/origin/{base_branch}', ('', ''))[0] if current else ''
+    if not re.fullmatch(r'[0-9a-fA-F]{40}|[0-9a-fA-F]{64}', base_oid):
+        base_oid = 'unavailable'
     def delta(observed):
         changes = []
         if before is not None and observed is not None:
@@ -159,6 +164,7 @@ def runtime_scope_diagnostic(before: GitSnapshot | None, current: GitSnapshot | 
             f"before={identity(before)} current={identity(current)} "
             f"result={identity(result)} checkpoint={identity(checkpoint)} "
             f"path={mutation.path} sha={mutation.commit_sha} "
+            f"current_base={base_oid} "
             f"delta={delta(current)} result_delta={delta(result)} checkpoint_delta={delta(checkpoint)}")
 
 
@@ -170,11 +176,14 @@ def validate_persisted_agent_scope(
     effects: ScopeRecoveryEffects,
 ) -> GitSnapshot | None:
     before = current = saved_result = saved_checkpoint = None
+    base_branch = 'main'
     diagnose = (runtime_mutation is not None
                 and _canonical_path(repo_path) == _canonical_path(runtime_mutation.source))
     if diagnose:
         # Capture original evidence before any reconciliation or early rejection.
         project = effects.repository(connection).scope_owner(repo)
+        if project is not None and 'base_branch' in project.keys():
+            base_branch = str(project['base_branch'])
         if project is not None and project['agent_snapshot']:
             try:
                 before = GitSnapshot.deserialize(str(project['agent_snapshot']))
@@ -197,12 +206,12 @@ def validate_persisted_agent_scope(
         if diagnose:
             effects.operation_log(runtime_scope_diagnostic(before, current, runtime_mutation,
                                                           accepted=False, result=saved_result,
-                                                          checkpoint=saved_checkpoint), error=True)
+                                                          checkpoint=saved_checkpoint, base_branch=base_branch), error=True)
         raise
     if diagnose:
         effects.operation_log(runtime_scope_diagnostic(before, current, runtime_mutation,
                                                       accepted=True, result=saved_result,
-                                                      checkpoint=saved_checkpoint))
+                                                      checkpoint=saved_checkpoint, base_branch=base_branch))
     return result
 
 
@@ -474,6 +483,7 @@ def _validate_persisted_agent_scope(
             checkpoint = replace(checkpoint, snapshot=accepted_baseline(checkpoint.snapshot))
 
     manager_runtime: tuple[str, str] | None = None
+    runtime_base_oid = None
     runtime_recreation_proven = False
     if runtime_mutation is not None and _canonical_path(repo_path) == _canonical_path(runtime_mutation.source):
         try:
@@ -507,6 +517,15 @@ def _validate_persisted_agent_scope(
         manager_runtime = (
             str(_canonical_path(runtime_mutation.path)), runtime_mutation.commit_sha,
         )
+        ref = f"refs/remotes/origin/{project['base_branch']}"
+        runtime_selection = replace(before, refs={**before.refs, ref: (runtime_mutation.commit_sha, '')})
+        if runtime_selection.refs.get('refs/remotes/origin/HEAD') is not None:
+            runtime_selection = replace(runtime_selection, refs={**runtime_selection.refs,
+                'refs/remotes/origin/HEAD': (runtime_mutation.commit_sha, ref)})
+        verified = reconcile_external_base(effects.git, repo_path, project['base_branch'],
+                                           runtime_selection, current, resources)
+        if verified is not runtime_selection:
+            runtime_base_oid = verified.refs[ref][0]
         runtime_recreation_proven = runtime_scope.proven_runtime_recreation(
             state_dir, _canonical_path(runtime_mutation.source),
             _canonical_path(runtime_mutation.path), runtime_mutation.commit_sha,
@@ -534,6 +553,7 @@ def _validate_persisted_agent_scope(
             manager_runtime=manager_runtime,
             runtime_recreation_proven=runtime_recreation_proven,
             manager_refs=guidance_ref_allowances or frozenset(),
+            runtime_base_oid=runtime_base_oid,
         )
     except agent_scope_decision.ScopeDecisionError as error:
         raise AgentScopeError(str(error)) from error
@@ -606,29 +626,25 @@ def _validate_persisted_agent_scope(
                 recovered_manager_checkpoint.serialize()
             )
         effects.update_project(connection, repo, **recovered_values)
-    if (not rebase_scope_normalized and decision.reconciled_before is not None
-            and decision.reconciled_before != before):
-        # Persist the same exact runtime delta in every saved operand only
-        # after all checks pass. Otherwise the next validation mistakes the
-        # result's old base ref for Agent evidence against the advanced start.
+    if manager_runtime is not None and not rebase_scope_normalized:
         original = GitSnapshot.deserialize(str(project['agent_snapshot']))
-        runtime_values = {'agent_snapshot': decision.reconciled_before.serialize()}
-        if project['agent_result_snapshot']:
-            saved_result = (recovered_result_baseline or
-                            GitSnapshot.deserialize(str(project['agent_result_snapshot'])))
-            runtime_values['agent_result_snapshot'] = agent_scope_decision.reconcile_runtime_snapshot(
-                saved_result, original, current, manager_runtime[0], str(project['base_branch'])).serialize()
-        if project['agent_manager_snapshot']:
-            saved_checkpoint = (recovered_manager_checkpoint or
-                                ManagerGitCheckpoint.deserialize(str(project['agent_manager_snapshot'])))
-            runtime_values['agent_manager_snapshot'] = replace(saved_checkpoint,
-                snapshot=agent_scope_decision.reconcile_runtime_snapshot(
-                    saved_checkpoint.snapshot, original, current, manager_runtime[0],
-                    str(project['base_branch']))).serialize()
-        effects.update_project(connection, repo, **runtime_values)
-        effects.operation_log(
-            f"runtime scope 기준선 반영: path={manager_runtime[0]} sha={manager_runtime[1]}"
-        )
+        effective = decision.reconciled_before
+        if effective is not None and effective != original:
+            checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+            plan_id = effects._plan_id_from_path(selected_plan_path) or ''
+            audit = checkpoints.get(repo, plan_id)
+            saved = dict(audit.snapshot or {})
+            baseline = {'role': role_name, 'original': hashlib.sha256(original.serialize().encode()).hexdigest(),
+                        'snapshot': effective.serialize()}
+            previous = saved.get('manager_metadata_agent_baseline')
+            if previous != baseline:
+                if previous is not None:
+                    saved['manager_metadata_agent_baseline_history'] = [
+                        *saved.get('manager_metadata_agent_baseline_history', ()), previous]
+                checkpoints.record(repo, plan_id, expected_generation=audit.generation,
+                    operation=audit.operation, expected_head=audit.expected_head,
+                    target_base_oid=audit.target_base_oid, observed_remote_oid=audit.observed_remote_oid,
+                    snapshot={**saved, 'manager_metadata_agent_baseline': baseline})
     return current
 
 

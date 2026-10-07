@@ -4,21 +4,12 @@ from pathlib import Path
 
 from loop_manager_internal.agents import agent_scope_decision as decision
 from loop_manager import GitSnapshot, ManagerGitCheckpoint, AgentScopeError, validate_agent_scope
+from tests.support.scope import snapshot
 
 
 WORKTREE = "/managed"
 REPO = "/source"
 PLAN = "docs/plans/[G-051] Plan.md"
-
-
-def snapshot(**changes):
-    base = GitSnapshot(
-        head="a", branch="loop-manager/G-051", index={}, dirty={},
-        refs={"refs/heads/loop-manager/G-051": ("a", "commit")},
-        worktrees={WORKTREE: ("HEAD=a", "branch=refs/heads/loop-manager/G-051")},
-        config={}, operations={},
-    )
-    return replace(base, **changes)
 
 
 def decide(before, current, *, role="worker", phase="IMPLEMENTING", result=None,
@@ -36,6 +27,24 @@ def decide(before, current, *, role="worker", phase="IMPLEMENTING", result=None,
 
 
 class PersistedScopeDecisionTests(unittest.TestCase):
+    def test_selected_runtime_and_proven_current_base_are_distinct_operands(self):
+        ref, head, runtime = 'refs/remotes/origin/develop', 'refs/remotes/origin/HEAD', '/state/runtime/b'
+        before = snapshot(refs={ref: ('a', ''), head: ('a', ref)})
+        current = replace(before, refs={ref: ('c', ''), head: ('c', ref)},
+                          worktrees={**before.worktrees, runtime: ('HEAD=b', 'detached=True')})
+        kwargs = dict(role='worker', phase='WORKING', base_branch='develop', selected_plan_path=PLAN,
+            before=before, current=current, result=before, checkpoint=ManagerGitCheckpoint(before, frozenset()),
+            worktree_key=WORKTREE, repo_key=REPO, planner_correction=False,
+            manager_cleanup_worktrees=frozenset(), manager_runtime=(runtime, 'b'))
+        with self.assertRaises(decision.ScopeDecisionError):
+            decision.decide_persisted_scope(**kwargs)
+        accepted = decision.decide_persisted_scope(**kwargs, runtime_base_oid='c')
+        self.assertEqual(accepted.reconciled_before.worktrees[runtime], ('HEAD=b', 'detached=True'))
+        self.assertEqual(accepted.reconciled_before.refs[ref], ('c', ''))
+        with self.assertRaises(decision.ScopeDecisionError):
+            decision.decide_persisted_scope(**{**kwargs, 'current': replace(current,
+                worktrees={**current.worktrees, runtime: ('HEAD=c', 'detached=True')})}, runtime_base_oid='c')
+
     def test_verified_runtime_reconciles_only_selected_registration_and_origin(self):
         before = snapshot()
         runtime = "/state/runtimes/source/b"

@@ -18,6 +18,7 @@ from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode, BlockScope
 from loop_manager_internal.git import managed_rebase_validation
+from loop_manager_internal.git.base_fetch_service import reconcile_external_base
 from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseService, selected_baseline
 
 
@@ -202,6 +203,8 @@ def validate_agent_scope(
             connection, external_worktree, worktree, before, role_name,
             selected_plan_path=selected_plan_path,
         )
+    if external_worktree is not None and base_branch is not None:
+        before = reconcile_external_base(effects.git, external_worktree, base_branch, before, after, resources)
     original = before
     before = _completed_worker_rebase_baseline(
         role_name, worktree, before, after, selected_plan_path,
