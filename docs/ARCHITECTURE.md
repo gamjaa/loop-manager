@@ -362,9 +362,9 @@ PR 없는 게시 checkpoint의 Review 횟수 차단을 rebase 없이 해제할 �
 
 ### 로컬 복구 요청의 접수와 실행
 
-`recover`의 별도 runtime은 프로젝트별 요청 자원 잠금 아래 기존 `local_environment_recovery_requests`에 요청을 생성하거나 같은 범위의 pending 요청을 재사용한다. 접수 잠금을 해제한 뒤 전역 process lock을 비차단 방식으로 얻고, 선택한 계획의 실행 자리도 확인해 실행 가능할 때만 기존 복구 executor를 호출한다. 잠금·다른 실행 자리로 대기하면 요청을 완료하거나 제한 재검사를 소비하지 않는다.
+`recover`의 별도 runtime은 짧은 SQLite `BEGIN IMMEDIATE` transaction 안에서 `local_environment_recovery_requests`에 범위별 요청을 생성하거나 같은 범위의 pending 요청을 재사용한다. 기존 프로젝트별 단일 pending 인덱스를 프로젝트 전체·계획별 부분 unique 인덱스로 교체해 감사와 소비 기록을 보존한다. 접수 transaction을 commit한 뒤 전역 process lock을 비차단 방식으로 얻고, 선택한 계획의 실행 자리도 확인해 실행 가능할 때만 기존 복구 executor를 호출한다. 잠금·다른 실행 자리로 대기하면 요청을 완료하거나 제한 재검사를 소비하지 않는다.
 
-등록 프로젝트 scheduler는 worker connection에서 DDL 없이 pending 요청을 읽는다. 범위가 실행 가능하면 같은 executor에 저장된 요청 identity·계획 범위와 현재 설정, 공유 Planner mutex·verify coordinator·runtime mutation·단계 알림 경계를 전달한다. 선택한 계획과 다른 실행 소유자가 있으면 일반 project runner를 호출하고 요청은 보존한다. executor는 즉시 실행과 지연 실행의 결과·제한 재검사 소비를 동일하게 기록하며 완료한 요청은 다시 처리하지 않는다.
+등록 프로젝트 scheduler는 worker connection에서 DDL 없이 pending 요청을 접수 시각·삽입 순서로 읽고 실행 가능한 첫 요청을 선택한다. 즉시 명령 실행도 같은 선택을 적용해 앞선 실행 가능 요청이 있으면 자기 요청은 대기로 보존한다. 선택한 범위가 실행 가능하면 같은 executor에 저장된 요청 identity·계획 범위와 현재 설정, 공유 Planner mutex·verify coordinator·runtime mutation·단계 알림 경계를 전달한다. 앞선 요청이 다른 실행 소유자 때문에 대기하면 뒤의 실행 가능한 요청을 선택하고, 그런 요청도 없으면 일반 project runner를 호출하며 대기 요청은 보존한다. 프로젝트별 한 번의 scheduler 방문에서는 선택한 요청 하나를 처리한다. executor는 즉시 실행과 지연 실행의 결과·제한 재검사 소비를 동일하게 기록하며 완료한 요청은 다시 처리하지 않는다.
 
 ## 검증과 재시도
 
