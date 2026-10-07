@@ -87,6 +87,41 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
             self.assertEqual([row[0] for row in connection.execute("SELECT status FROM exec_plans ORDER BY plan_id")], ['PLAN_BLOCKED', 'READY'])
             self.assertEqual(connection.execute("SELECT COUNT(*) FROM local_environment_recheck_consumption").fetchone()[0], 2)
 
+    def test_project_reentry_does_not_dispatch_retained_paused_execution(self):
+        from loop_manager_internal.storage import local_recovery_state
+        self.config_path.write_text("[loop]\n", encoding="utf-8")
+        repo = str(self.repository.resolve())
+        with closing(loop_manager.connect_database(self.state_dir)) as connection, connection:
+            connection.execute("UPDATE projects SET planning_error = 'saved planning error' WHERE repo = ?", (repo,))
+            connection.execute(
+                "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, priority, content_hash, status, plan_sha, blocked_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (repo, 'G-001', 'docs/plans/G-001.md', 'one', '[]', '[]', 'normal', 'hash', 'PLAN_BLOCKED', 'base', 'verify_retry_exhausted'))
+        for kind in (ProjectRunKind.TRANSIENT_PAUSE, ProjectRunKind.USAGE_LIMIT_PAUSE):
+            for consumed in (False, True):
+                with self.subTest(kind=kind, consumed=consumed):
+                    with closing(loop_manager.connect_database(self.state_dir)) as connection, connection:
+                        connection.execute("UPDATE exec_plans SET status = 'PLAN_BLOCKED' WHERE repo = ?", (repo,))
+                        runtime_state.RuntimeStateRepository(connection).clear(repo)
+                        connection.execute("UPDATE projects SET planning_error = 'saved planning error' WHERE repo = ?", (repo,))
+                    calls = []
+                    def run(connection, *_args, **kwargs):
+                        calls.append(kwargs['recovery_plan_id'])
+                        self.assertEqual(len(calls), 1, 'paused execution dispatched twice')
+                        with connection:
+                            connection.execute("UPDATE exec_plans SET status = 'READY' WHERE repo = ?", (repo,))
+                            runtime_state.RuntimeStateRepository(connection).activate(
+                                repo, 'G-001', activation_sha='base', branch='branch', worktree='/worktree')
+                            connection.execute("UPDATE projects SET planning_error = 'saved planning error' WHERE repo = ?", (repo,))
+                            if consumed:
+                                local_recovery_state.consume_recheck(connection, kwargs['recovery_request_id'], 'G-001', 'verify')
+                        return ProjectRunResult(kind, 0, 'paused')
+                    self.assertEqual(recover_local_environment(self.effects(run), self.arguments, self.state_dir, self.config_path), 1)
+                    self.assertEqual(calls, [None])
+                    with closing(loop_manager.connect_database(self.state_dir)) as connection:
+                        self.assertEqual(runtime_state.RuntimeStateRepository(connection).active_row(repo)['plan_id'], 'G-001')
+                        self.assertEqual(connection.execute("SELECT planning_error FROM projects WHERE repo = ?", (repo,)).fetchone()[0], 'saved planning error')
+                        self.assertEqual(connection.execute("SELECT result FROM local_environment_recovery_requests ORDER BY rowid DESC LIMIT 1").fetchone()[0], 'unresolved')
+
     def test_recover_dispatch_preserves_runtime_mutation(self):
         from loop_manager_internal.application.commands import execute_runtime_command
         self.config_path.write_text("[loop]\n", encoding="utf-8")

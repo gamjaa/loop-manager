@@ -9,7 +9,7 @@ from loop_manager_internal.agents.agent_invocation import InvocationContext
 from loop_manager_internal.config.managed_config import ManagedConfigError
 from loop_manager_internal.runtime import project_registry
 from loop_manager_internal.runtime.contracts import RuntimeMutation
-from loop_manager_internal.storage import agent_invocation_state, local_recovery_state
+from loop_manager_internal.storage import agent_invocation_state, local_recovery_state, runtime_state
 from pathlib import Path
 import argparse
 import sys
@@ -282,7 +282,16 @@ def recover_local_environment(
             if len(targets) > 1 and project["planning_error"]:
                 targets.append(None)
         outcomes = []
-        for target in targets:
+        for index, target in enumerate(targets):
+            if index:
+                active = runtime_state.RuntimeStateRepository(connection).active_row(repository)
+                # The final project visit is for planning only. Never dispatch
+                # a retained execution again after a bounded check or pause.
+                if active is not None and (target is None or any(
+                    item.kind in {ProjectRunKind.TRANSIENT_PAUSE, ProjectRunKind.USAGE_LIMIT_PAUSE}
+                    for item in outcomes
+                )):
+                    continue
             if plan_id is None and target is not None and local_recovery_state.recheck_consumed(
                     connection, request.request_id, target, "verify"):
                 continue
