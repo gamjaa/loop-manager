@@ -91,6 +91,8 @@ R-020의 Manager runtime 귀속을 실제 bootstrap부터 runtime 자식의 선�
 
 - 관리 rebase 수용 후 HEAD `3e1b6ab90c795395d3828ae5f32a23bbc34cc17b`와 base `c515a37a8cea2151d034444d37198bd67d8d58b2` 대비 전체 최종 diff, 현재 계획과 R-020·R-023·PRODUCT·ARCHITECTURE 근거를 다시 확인했다. `python3 -m unittest tests.test_bootstrap_runtime.ReviewerRebaseScopeHandoffUnitTests tests.test_bootstrap_runtime.BootstrapSavedScopeFixtureUnitTests tests.test_origin_isolation.ManagerBaselineReconciliationUnitTests.test_runtime_prevalidation_persists_all_operands_and_is_idempotent tests.test_origin_isolation.ManagerBaselineReconciliationUnitTests.test_runtime_prevalidation_reconciles_only_proven_delta_and_rejects_saved_mutation tests.test_agent_scope_decision.PersistedScopeDecisionTests tests.test_runtime_scope_diagnostics.RuntimeScopeDiagnosticTests tests.test_runtime_scope_diagnostics.RuntimeFalsePositiveBaseTests`를 현재 후보에서 새로 실행해 `Ran 28 tests`, `OK`, 종료 코드 0을 확인했다. 추가 코드 변경과 통합 회귀·전체 verify·Review 실행은 하지 않았다.
 
+- 관리 rebase 수용 후 HEAD `74e713a8518e0c4a7c11ba34138f0047910e16a9`와 base `8910885dd11ee7f933efd9143cac9888b89eb754` 대비 전체 최종 diff와 현재 계획·근거 입력을 다시 확인했다. 직전 기록의 28개 targeted unit 명령을 현재 후보에서 새로 실행해 `Ran 28 tests`, `OK`, 종료 코드 0을 확인했다. 추가 코드 변경과 통합 회귀·전체 verify·Review 실행은 하지 않았다.
+
 ## Decision Log
 
 - 2026-10-07 사용자 요청으로 활성 R-020·R-023·R-055와 계획을 함께 보완했다. G-181의 base ref 재검사, G-171의 Manager 표식 불일치·stale checkpoint identity와 G-192의 runtime/HEAD 차단 메시지를 기존 코드 경계의 재현 시나리오로 연결한다. 관련 unit 11개와 최소 입력 검사는 기존 거부 경로의 근거이며 새 수용 동작의 구현 성공이 아니다. 운영 snapshot을 확보하지 않았으므로 개별 사건의 실제 원인을 확정하지 않는다. G-199의 legacy 기본 checkout 결정과 독립이며 이 개정으로 draft를 해제하지 않는다.
