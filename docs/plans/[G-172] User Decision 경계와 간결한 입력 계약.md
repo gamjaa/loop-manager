@@ -49,3 +49,6 @@ priority: high
 
 - Review 대응: 종료 마커 추가로 기존 최상위 절 경계가 메모로 바뀐 문서는 원래 후속 절 전체를 포함한 호환 hash로도 대조한다. 승인 재개·checkpoint·이중 차단 복구가 같은 대조를 사용하며 저장된 hash·승인 이력은 재작성하지 않는다. 기존 후속 절 수정·삭제는 계속 거부하고 새 메모 제목은 기존 절의 정확한 suffix 대조를 방해하지 않는다. diff의 들여쓴 backtick context 줄은 닫는 fence로 읽지 않는다.
 - 추가 검증: `GuidanceInputContractTest`의 두 회귀 case, `LegacyGuidanceMarkerResumeTest`, 기존 parser·preapproval·Worker 양식 unit class와 변경된 checkpoint·이중 차단 소비자 관련 세 case로 총 24개 통과. 기존 절 보존·변조 거부, LF/CRLF·pending 유지·동일 세션·원래 hash 보존과 실제 diff 적용을 확인했다. 전체 verify는 실행하지 않았다.
+
+- Manager verify 대응: `guidance_hash`·`prior_guidance_results`와 검토 이력·receipt 테이블 초기화가 `ProvisionalReviewRepository` 생성자에만 있어, scheduler의 부모 연결 초기화 뒤에도 프로젝트별 첫 생성자가 컬럼 추가를 경쟁했다. 기존 additive migration 전체를 같은 모듈의 `ensure_schema`로 옮겨 기존 `maintenance_state.ensure_schema` 경로에서 프로젝트 thread 시작 전에 완료하도록 수정했다. 스키마·제품 정책은 바꾸지 않는다.
+- 해당 수정 검증: `python3 -m unittest tests.test_maintenance_file_review.ProvisionalReviewSchemaTest`의 2개 unit test 통과. 부모 초기화 뒤 두 프로젝트 연결에서 추가 ALTER 부재와 기존 행·caller transaction 보존을 확인했다. 보고된 catalog scheduling case는 실제 Git 저장소 두 개와 원격 게시·scheduler를 함께 사용하므로 integration test 실행 금지에 따라 직접 재실행하지 않았고, Manager의 후속 전체 verify에 남긴다. verify 스크립트는 수정하거나 실행하지 않았다.
