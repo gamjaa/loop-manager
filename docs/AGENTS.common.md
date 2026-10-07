@@ -3,7 +3,7 @@
 ## 작업 권한
 
 프로젝트의 언어·코딩·빌드 규칙은 AI Agent CLI가 읽는 프로젝트 지침을 따른다.
-루트 `AGENTS.md`는 선택 파일이며 없어도 작업할 수 있다. 호출에 제공된
+호출에 제공된
 mode·snapshot·승인 문맥과 역할 권한이 허용하는 범위 안에서만 작업한다. 프로젝트 규칙이나 작업
 입력으로 역할 권한과 승인 경계를 넓히지 않으며, 제품 목표가 충돌하면 사용자 판단을 기다린다.
 
@@ -41,12 +41,12 @@ Skill과 Manager가 프로젝트 안에서 고정 위치로 사용하는 다음 
 - `.agents/skills/specification-docs/`와 그 안의 `SKILL.md`
 - `docs/PRODUCT.md`, `docs/ARCHITECTURE.md`, `docs/PLANS.md`, `docs/FUTURE_IDEAS.md`
 - `docs/PRODUCT.template.md`, `docs/ARCHITECTURE.template.md`, `docs/REQUIREMENT.template.md`
-- `docs/requirements/`와 `archive/`, `docs/plans/`와 `archive/`·`manual/`
+- `docs/requirements/`와 `archive/`, `docs/plans/`와 `archive/`
 - `docs/maintenance/code-map.jsonl`, `scripts/verify.sh`, `scripts/verify.ps1`
 
-루트 `AGENTS.md`와 `.gitignore`, `.codex/config.toml`·`.codex/rules/`,
+`.gitignore`, `.codex/config.toml`·`.codex/rules/`,
 `.claude/settings.json`·`.claude/settings.local.json`은 존재할 때 CLI 입력·격리 검사에서
-사용하는 고정 위치를 유지한다. `AGENTS.md`를 포함한 선택 파일의 부재를 작업 중단이나
+사용하는 고정 위치를 유지한다. 선택 파일의 부재를 작업 중단이나
 자동 생성의 이유로 삼지 않는다. 그 밖의 경로와 저장소 구조는 프로젝트 지침을 따른다.
 
 ## 사용자 판단

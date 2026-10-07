@@ -118,7 +118,7 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
                 replace(observed, identity_verified=False),
                 replace(observed, remote=replace(observed.remote, oid='foreign')),
                 replace(observed, input_fingerprint='changed-input'),
-                replace(observed, committed=(FileChange('AGENTS.md', '100644', '100644', 'old', 'new', 'M'),)),
+                replace(observed, committed=(FileChange('docs/requirements/Unexpected.md', '100644', '100644', 'old', 'new', 'M'),)),
                 replace(observed, index_clean=False),
             ):
                 with self.subTest(observed=invalid):
@@ -156,8 +156,7 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
         self.connection.execute("UPDATE exec_plans SET agent_role='worker', agent_snapshot=?, "
             "agent_result_snapshot=? WHERE plan_id='G-092'", (before_serialized, after_serialized))
         plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
-        with mock.patch.object(loop_manager, '_guidance_worker_targets', return_value=()), \
-             mock.patch.object(loop_manager, '_published_plan_allows_common_plans', return_value=False), \
+        with mock.patch.object(loop_manager, '_published_plan_allows_common_plans', return_value=False), \
              mock.patch.object(loop_manager, 'requirement_archive_candidates', return_value=()), \
              mock.patch.object(loop_manager, '_proven_manager_base_refs', return_value=frozenset()), \
              mock.patch.object(loop_manager, '_proven_merged_cleanup_paths', return_value=frozenset()), \

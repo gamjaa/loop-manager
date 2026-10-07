@@ -196,7 +196,6 @@ def inspect_registration_files(
 
     plans = blobs["docs/PLANS.md"]
     architecture = blobs["docs/ARCHITECTURE.md"]
-    agents = effects._revision_blob(root, entries, "AGENTS.md")
     assert plans is not None and architecture is not None
     if plans.replace(b"\r\n", b"\n") != effects.normalized_text(effects.ROOT / "docs/PLANS.md").encode("utf-8"):
         raise RuntimeError("docs/PLANS.md가 Loop Manager 기준 파일과 다릅니다.")
@@ -213,16 +212,8 @@ def inspect_registration_files(
             "docs/PRODUCT.md가 변경되지 않은 템플릿이라 등록할 수 없습니다."
         )
 
-    agents_hash = None
-    if agents is not None:
-        try:
-            agents.decode("utf-8")
-        except UnicodeDecodeError as error:
-            raise RuntimeError("origin의 AGENTS.md가 UTF-8이 아닙니다.") from error
-        agents_hash = hashlib.sha256(agents).hexdigest()
-    # Registry storage archives old approval/hash pairs before replacing these
-    # current-registration values. Project rules need no common-content approval.
-    return agents_hash, False
+    # Legacy registration fields remain nullable for existing audit records.
+    return None, False
 
 
 @dataclass(frozen=True)

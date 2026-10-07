@@ -54,17 +54,6 @@ from loop_manager_internal.recovery import checkpoint_recovery
 from loop_manager_internal.recovery.checkpoint_adapter import _BlockedCheckpointResults
 
 
-from loop_manager_internal.documents.guidance_approval import (
-    GuidanceDocument,
-    GuidanceFormatError,
-    GuidanceProposal,
-    apply_patch_to_content,
-    contains_guidance_sections,
-    content_hash as guidance_content_hash,
-    finalized_patch,
-    guidance_patch_hash,
-    parse_guidance_document,
-)
 from loop_manager_internal.execution.execution_runtime import (
     ExecutionContext,
     ExecutionOutcome,
@@ -314,7 +303,6 @@ from loop_manager_internal.catalog import legacy_migration
 from loop_manager_internal.catalog import project_selection
 from loop_manager_internal.catalog import requirement_archive_service
 from loop_manager_internal.documents import guidance_service
-from loop_manager_internal.documents import guidance_preapproval
 from loop_manager_internal.documents import pr_description
 from loop_manager_internal.execution import execution_ports
 from loop_manager_internal.execution import plan_validation
@@ -622,7 +610,6 @@ _scope_reconciliation_effects_resume_project_block_if_safe = _bind_effects(
         _agent_git_resources=lambda *args, **kwargs: _agent_git_resources(*args, **kwargs),
         _clear_active_in_current_transaction=lambda *args, **kwargs: _clear_active_in_current_transaction(*args, **kwargs),
         _clear_project_block_without_losing_planning_error=lambda *args, **kwargs: _clear_project_block_without_losing_planning_error(*args, **kwargs),
-        _reconcile_guidance_double_block=lambda *args, **kwargs: _reconcile_guidance_double_block(*args, **kwargs),
         _reconcile_rebase_evidence_block=lambda *args, **kwargs: _reconcile_rebase_evidence_block(*args, **kwargs),
         _reconciled_manager_scope_metadata=lambda *args, **kwargs: _reconciled_manager_scope_metadata(*args, **kwargs),
         _requeue_blocked_execplan=lambda *args, **kwargs: _requeue_blocked_execplan(*args, **kwargs),
@@ -654,7 +641,7 @@ _scope_reconciliation_effects_resume_plan_blocks = _bind_effects(
         plan_blocked_execplans=lambda *args, **kwargs: plan_blocked_execplans(*args, **kwargs),
         project_execplan=lambda *args, **kwargs: project_execplan(*args, **kwargs),
         resume_blocked_execplan_if_inputs_changed=lambda *args, **kwargs: resume_blocked_execplan_if_inputs_changed(*args, **kwargs),
-        resume_guidance_approval_if_decided=lambda *args, **kwargs: resume_guidance_approval_if_decided(*args, **kwargs),
+        resume_retired_guidance_block=lambda *args, **kwargs: resume_retired_guidance_block(*args, **kwargs),
         unmet_execplan_dependencies=lambda *args, **kwargs: unmet_execplan_dependencies(*args, **kwargs),
         validate_blocked_agent_scope=lambda *args, **kwargs: validate_blocked_agent_scope(*args, **kwargs),
         validate_execplan_workspace_identity=lambda *args, **kwargs: validate_execplan_workspace_identity(*args, **kwargs),
@@ -677,9 +664,6 @@ _checkpoint_safety_effects = _bind_effects(
     git_adapter._checkpoint_safety_effects, lambda: git_adapter.CheckpointSafetyEffectsEffects(
         _agent_git_resources=lambda *args, **kwargs: _agent_git_resources(*args, **kwargs),
         _current_rebase_service=lambda *args, **kwargs: _current_rebase_service(*args, **kwargs),
-        _guidance_document=lambda *args, **kwargs: _guidance_document(*args, **kwargs),
-        _guidance_document_matches_rows=lambda *args, **kwargs: _guidance_document_matches_rows(*args, **kwargs),
-        _guidance_rows=lambda *args, **kwargs: _guidance_rows(*args, **kwargs),
         _owned_checkpoint_remote_oid=lambda *args, **kwargs: _owned_checkpoint_remote_oid(*args, **kwargs),
         _proven_manager_base_refs=lambda *args, **kwargs: _proven_manager_base_refs(*args, **kwargs),
         _proven_merged_cleanup_paths=lambda *args, **kwargs: _proven_merged_cleanup_paths(*args, **kwargs),
@@ -714,10 +698,6 @@ _diagnostic_publication_effects = _bind_effects(
 
 _managed_rebase_runtime_effects = _bind_effects(
     recovery_adapter._managed_rebase_runtime_effects, lambda: recovery_adapter.ManagedRebaseRuntimeEffectsEffects(
-        _guidance_document=lambda *args, **kwargs: _guidance_document(*args, **kwargs),
-        _guidance_document_matches_rows=lambda *args, **kwargs: _guidance_document_matches_rows(*args, **kwargs),
-        _guidance_final_expected=lambda *args, **kwargs: _guidance_final_expected(*args, **kwargs),
-        _guidance_target_state=lambda *args, **kwargs: _guidance_target_state(*args, **kwargs),
         _owned_rebase_metadata=lambda *args, **kwargs: _owned_rebase_metadata(*args, **kwargs),
         _path_signature=lambda *args, **kwargs: _path_signature(*args, **kwargs),
         _published_plan_allows_common_plans=lambda *args, **kwargs: _published_plan_allows_common_plans(*args, **kwargs),
@@ -913,7 +893,6 @@ _scope_lifecycle_effects = _bind_effects(
         _agent_git_resources=lambda *args, **kwargs: _agent_git_resources(*args, **kwargs),
         _capture_agent_baseline=lambda *args, **kwargs: _capture_agent_baseline(*args, **kwargs),
         _current_rebase_service=lambda *args, **kwargs: _current_rebase_service(*args, **kwargs),
-        _guidance_worker_targets=lambda *args, **kwargs: _guidance_worker_targets(*args, **kwargs),
         _owned_rebase_state_dir=lambda *args, **kwargs: _owned_rebase_state_dir(*args, **kwargs),
         _plan_id_from_path=lambda *args, **kwargs: _plan_id_from_path(*args, **kwargs),
         _published_plan_allows_common_plans=lambda *args, **kwargs: _published_plan_allows_common_plans(*args, **kwargs),
@@ -931,7 +910,6 @@ _scope_recovery_effects = _bind_effects(
         _agent_git_resources=lambda *args, **kwargs: _agent_git_resources(*args, **kwargs),
         _config_entries=lambda *args, **kwargs: _config_entries(*args, **kwargs),
         _current_rebase_service=lambda *args, **kwargs: _current_rebase_service(*args, **kwargs),
-        _guidance_worker_targets=lambda *args, **kwargs: _guidance_worker_targets(*args, **kwargs),
         _normalize_legacy_ignored_snapshot=lambda *args, **kwargs: _normalize_legacy_ignored_snapshot(*args, **kwargs),
         _owned_checkpoint_remote_oid=lambda *args, **kwargs: _owned_checkpoint_remote_oid(*args, **kwargs),
         _owned_rebase_state_dir=lambda *args, **kwargs: _owned_rebase_state_dir(*args, **kwargs),
@@ -1402,7 +1380,6 @@ validate_planner_result = _bind_effects(
         _stored_string_list=lambda *args, **kwargs: _stored_string_list(*args, **kwargs),
         _validate_future_idea_separation=lambda *args, **kwargs: _validate_future_idea_separation(*args, **kwargs),
         changed_files=lambda *args, **kwargs: changed_files(*args, **kwargs),
-        contains_guidance_sections=lambda *args, **kwargs: contains_guidance_sections(*args, **kwargs),
         file_hash=lambda *args, **kwargs: file_hash(*args, **kwargs),
         git=lambda *args, **kwargs: git(*args, **kwargs),
         load_execplan_catalog=lambda *args, **kwargs: load_execplan_catalog(*args, **kwargs),
@@ -1519,7 +1496,6 @@ validate_maintenance_planner_result = _bind_effects(
         _parse_execplan=lambda *args, **kwargs: _parse_execplan(*args, **kwargs),
         _validate_future_idea_separation=lambda *args, **kwargs: _validate_future_idea_separation(*args, **kwargs),
         changed_files=lambda *args, **kwargs: changed_files(*args, **kwargs),
-        contains_guidance_sections=lambda *args, **kwargs: contains_guidance_sections(*args, **kwargs),
         git=lambda *args, **kwargs: git(*args, **kwargs),
         load_execplan_snapshot=lambda *args, **kwargs: load_execplan_snapshot(*args, **kwargs),
         published_execplan=lambda *args, **kwargs: published_execplan(*args, **kwargs),
@@ -2748,11 +2724,6 @@ validate_worker_workspace_scope = _bind_effects(
     ),
 )
 
-_guidance_document = _bind_effects(
-    scope_adapter._guidance_document, lambda: scope_adapter.GuidanceDocumentEffects(
-        parse_guidance_document=lambda *args, **kwargs: parse_guidance_document(*args, **kwargs),
-    ),
-)
 
 _git_common_directory = _bind_effects(
     bootstrap_adapter._git_common_directory, lambda: bootstrap_adapter.GitCommonDirectoryEffects(
@@ -2769,27 +2740,6 @@ is_loop_manager_repository = _bind_effects(
     ),
 )
 
-_validate_guidance_proposal_scope = guidance_service._validate_guidance_proposal_scope
-
-_guidance_rows = _bind_effects(
-    guidance_service._guidance_rows, lambda: guidance_service.GuidanceRowsEffects(
-        _ensure_execplans_schema=lambda *args, **kwargs: _ensure_execplans_schema(*args, **kwargs),
-    ),
-)
-
-_guidance_worker_targets = guidance_service._guidance_worker_targets
-
-prepare_guidance_preapprovals = _bind_effects(
-    guidance_preapproval.prepare_guidance_preapprovals,
-    lambda: guidance_preapproval.PrepareGuidancePreapprovalsEffects(
-        _guidance_document=lambda *args, **kwargs: _guidance_document(*args, **kwargs),
-        _guidance_rows=lambda *args, **kwargs: _guidance_rows(*args, **kwargs),
-        _invalidate_guidance_approval=lambda *args, **kwargs: _invalidate_guidance_approval(*args, **kwargs),
-        _validate_guidance_proposal_scope=lambda *args, **kwargs: _validate_guidance_proposal_scope(*args, **kwargs),
-        git=lambda *args, **kwargs: git(*args, **kwargs),
-        is_loop_manager_repository=lambda *args, **kwargs: is_loop_manager_repository(*args, **kwargs),
-    ),
-)
 
 _published_plan_allows_common_plans = _bind_effects(
     guidance_service._published_plan_allows_common_plans, lambda: guidance_service.PublishedPlanAllowsCommonPlansEffects(
@@ -2798,36 +2748,6 @@ _published_plan_allows_common_plans = _bind_effects(
     ),
 )
 
-_guidance_target_state = guidance_service._guidance_target_state
-
-_guidance_block_message = guidance_service._guidance_block_message
-
-_guidance_batch_id = guidance_service._guidance_batch_id
-
-_block_for_new_guidance = _bind_effects(
-    guidance_service._block_for_new_guidance, lambda: guidance_service.BlockForNewGuidanceEffects(
-        git=lambda *args, **kwargs: git(*args, **kwargs),
-        _final_block_recovery_decision=lambda *args, **kwargs: _final_block_recovery_decision(*args, **kwargs),
-        _guidance_batch_id=lambda *args, **kwargs: _guidance_batch_id(*args, **kwargs),
-        _guidance_block_message=lambda *args, **kwargs: _guidance_block_message(*args, **kwargs),
-        _guidance_target_state=lambda *args, **kwargs: _guidance_target_state(*args, **kwargs),
-        _validate_guidance_proposal_scope=lambda *args, **kwargs: _validate_guidance_proposal_scope(*args, **kwargs),
-        apply_patch_to_content=lambda *args, **kwargs: apply_patch_to_content(*args, **kwargs),
-        capture_git_snapshot=lambda *args, **kwargs: capture_git_snapshot(*args, **kwargs),
-        guidance_patch_hash=lambda *args, **kwargs: guidance_patch_hash(*args, **kwargs),
-        is_loop_manager_repository=lambda *args, **kwargs: is_loop_manager_repository(*args, **kwargs),
-    ),
-)
-
-_guidance_document_matches_rows = guidance_service._guidance_document_matches_rows
-
-_guidance_final_expected = _bind_effects(
-    guidance_service._guidance_final_expected, lambda: guidance_service.GuidanceFinalExpectedEffects(
-        apply_patch_to_content=lambda *args, **kwargs: apply_patch_to_content(*args, **kwargs),
-        finalized_patch=lambda *args, **kwargs: finalized_patch(*args, **kwargs),
-        guidance_content_hash=lambda *args, **kwargs: guidance_content_hash(*args, **kwargs),
-    ),
-)
 
 _plan_block_selected_for_release = _bind_effects(
     guidance_service._plan_block_selected_for_release, lambda: guidance_service.PlanBlockSelectedForReleaseEffects(
@@ -2836,23 +2756,13 @@ _plan_block_selected_for_release = _bind_effects(
     ),
 )
 
-resume_guidance_approval_if_decided = _bind_effects(
-    guidance_service.resume_guidance_approval_if_decided, lambda: guidance_service.ResumeGuidanceApprovalIfDecidedEffects(
+resume_retired_guidance_block = _bind_effects(
+    guidance_service.resume_retired_guidance_block, lambda: guidance_service.ResumeRetiredGuidanceBlockEffects(
         _current_rebase_service=lambda *args, **kwargs: _current_rebase_service(*args, **kwargs),
-        _guidance_block_message=lambda *args, **kwargs: _guidance_block_message(*args, **kwargs),
-        _guidance_document=lambda *args, **kwargs: _guidance_document(*args, **kwargs),
-        _guidance_document_matches_rows=lambda *args, **kwargs: _guidance_document_matches_rows(*args, **kwargs),
-        _guidance_final_expected=lambda *args, **kwargs: _guidance_final_expected(*args, **kwargs),
-        _guidance_rows=lambda *args, **kwargs: _guidance_rows(*args, **kwargs),
-        _guidance_target_state=lambda *args, **kwargs: _guidance_target_state(*args, **kwargs),
         _plan_block_selected_for_release=lambda *args, **kwargs: _plan_block_selected_for_release(*args, **kwargs),
         _rebase_in_progress_for_branch=lambda *args, **kwargs: _rebase_in_progress_for_branch(*args, **kwargs),
         _update_blocked_error=lambda *args, **kwargs: _update_blocked_error(*args, **kwargs),
-        _validate_guidance_proposal_scope=lambda *args, **kwargs: _validate_guidance_proposal_scope(*args, **kwargs),
         clear_agent_scope=lambda *args, **kwargs: clear_agent_scope(*args, **kwargs),
-        finalized_patch=lambda *args, **kwargs: finalized_patch(*args, **kwargs),
-        guidance_patch_hash=lambda *args, **kwargs: guidance_patch_hash(*args, **kwargs),
-        is_loop_manager_repository=lambda *args, **kwargs: is_loop_manager_repository(*args, **kwargs),
         make_worktree=lambda *args, **kwargs: make_worktree(*args, **kwargs),
         update_project=lambda *args, **kwargs: update_project(*args, **kwargs),
         validate_blocked_agent_scope=lambda *args, **kwargs: validate_blocked_agent_scope(*args, **kwargs),
@@ -2860,44 +2770,6 @@ resume_guidance_approval_if_decided = _bind_effects(
     ),
 )
 
-_invalidate_guidance_approval = _bind_effects(
-    guidance_service._invalidate_guidance_approval, lambda: guidance_service.InvalidateGuidanceApprovalEffects(
-        _final_block_recovery_decision=lambda *args, **kwargs: _final_block_recovery_decision(*args, **kwargs),
-        _guidance_block_message=lambda *args, **kwargs: _guidance_block_message(*args, **kwargs),
-        capture_git_snapshot=lambda *args, **kwargs: capture_git_snapshot(*args, **kwargs),
-    ),
-)
-
-inspect_worker_guidance_result = _bind_effects(
-    guidance_service.inspect_worker_guidance_result, lambda: guidance_service.InspectWorkerGuidanceResultEffects(
-        _block_for_new_guidance=lambda *args, **kwargs: _block_for_new_guidance(*args, **kwargs),
-        _guidance_document=lambda *args, **kwargs: _guidance_document(*args, **kwargs),
-        _guidance_document_matches_rows=lambda *args, **kwargs: _guidance_document_matches_rows(*args, **kwargs),
-        _guidance_final_expected=lambda *args, **kwargs: _guidance_final_expected(*args, **kwargs),
-        _guidance_rows=lambda *args, **kwargs: _guidance_rows(*args, **kwargs),
-        _guidance_target_state=lambda *args, **kwargs: _guidance_target_state(*args, **kwargs),
-        _invalidate_guidance_approval=lambda *args, **kwargs: _invalidate_guidance_approval(*args, **kwargs),
-        _validate_guidance_proposal_scope=lambda *args, **kwargs: _validate_guidance_proposal_scope(*args, **kwargs),
-        is_loop_manager_repository=lambda *args, **kwargs: is_loop_manager_repository(*args, **kwargs),
-    ),
-)
-
-validate_guidance_publication = _bind_effects(
-    guidance_service.validate_guidance_publication, lambda: guidance_service.ValidateGuidancePublicationEffects(
-        _guidance_document=lambda *args, **kwargs: _guidance_document(*args, **kwargs),
-        _guidance_document_matches_rows=lambda *args, **kwargs: _guidance_document_matches_rows(*args, **kwargs),
-        _guidance_target_state=lambda *args, **kwargs: _guidance_target_state(*args, **kwargs),
-        _invalidate_guidance_approval=lambda *args, **kwargs: _invalidate_guidance_approval(*args, **kwargs),
-        git=lambda *args, **kwargs: git(*args, **kwargs),
-        guidance_content_hash=lambda *args, **kwargs: guidance_content_hash(*args, **kwargs),
-    ),
-)
-
-guidance_resume_context = _bind_effects(
-    guidance_service.guidance_resume_context, lambda: guidance_service.GuidanceResumeContextEffects(
-        _guidance_rows=lambda *args, **kwargs: _guidance_rows(*args, **kwargs),
-    ),
-)
 
 _blocked_execplan_metadata_error = _bind_effects(
     block_service._blocked_execplan_metadata_error, lambda: block_service.BlockedExecplanMetadataErrorEffects(
@@ -3312,25 +3184,6 @@ synchronize_waiting_pull_requests = _bind_effects(
     ),
 )
 
-_reconcile_guidance_double_block = _bind_effects(
-    project_block_service._reconcile_guidance_double_block, lambda: project_block_service.ReconcileGuidanceDoubleBlockEffects(
-        _agent_git_resources=lambda *args, **kwargs: _agent_git_resources(*args, **kwargs),
-        _canonical_path=lambda *args, **kwargs: _canonical_path(*args, **kwargs),
-        _guidance_checkpoint_commit_evidence=lambda *args, **kwargs: _guidance_checkpoint_commit_evidence(*args, **kwargs),
-        _guidance_document=lambda *args, **kwargs: _guidance_document(*args, **kwargs),
-        _guidance_document_matches_rows=lambda *args, **kwargs: _guidance_document_matches_rows(*args, **kwargs),
-        _guidance_rows=lambda *args, **kwargs: _guidance_rows(*args, **kwargs),
-        _guidance_target_state=lambda *args, **kwargs: _guidance_target_state(*args, **kwargs),
-        _owned_checkpoint_remote_oid=lambda *args, **kwargs: _owned_checkpoint_remote_oid(*args, **kwargs),
-        _proven_manager_base_refs=lambda *args, **kwargs: _proven_manager_base_refs(*args, **kwargs),
-        _proven_merged_cleanup_paths=lambda *args, **kwargs: _proven_merged_cleanup_paths(*args, **kwargs),
-        capture_git_snapshot=lambda *args, **kwargs: capture_git_snapshot(*args, **kwargs),
-        git=lambda *args, **kwargs: git(*args, **kwargs),
-        operation_log=lambda *args, **kwargs: operation_log(*args, **kwargs),
-        validate_execplan_workspace_identity=lambda *args, **kwargs: validate_execplan_workspace_identity(*args, **kwargs),
-        validate_managed_worktree=lambda *args, **kwargs: validate_managed_worktree(*args, **kwargs),
-    ),
-)
 
 _published_review_commit_intent_matches = _bind_effects(
     project_block_service._published_review_commit_intent_matches, lambda: project_block_service.PublishedReviewCommitIntentMatchesEffects(
@@ -4051,8 +3904,6 @@ _ExecutionLifecyclePorts = _bind_effects(
         _agent_profile=lambda *args, **kwargs: _agent_profile(*args, **kwargs),
         _current_rebase_service=lambda *args, **kwargs: _current_rebase_service(*args, **kwargs),
         _git_operation_entries=lambda *args, **kwargs: _git_operation_entries(*args, **kwargs),
-        _guidance_worker_targets=lambda *args, **kwargs: _guidance_worker_targets(*args, **kwargs),
-        prepare_guidance_preapprovals=lambda *args, **kwargs: prepare_guidance_preapprovals(*args, **kwargs),
         _path_signature=lambda *args, **kwargs: _path_signature(*args, **kwargs),
         _plan_id_from_path=lambda *args, **kwargs: _plan_id_from_path(*args, **kwargs),
         _published_plan_allows_common_plans=lambda *args, **kwargs: _published_plan_allows_common_plans(*args, **kwargs),
@@ -4076,8 +3927,6 @@ _ExecutionLifecyclePorts = _bind_effects(
         clear_validation_failure_history=lambda *args, **kwargs: clear_validation_failure_history(*args, **kwargs),
         ensure_worker_level_state=lambda *args, **kwargs: ensure_worker_level_state(*args, **kwargs),
         git=lambda *args, **kwargs: git(*args, **kwargs),
-        guidance_resume_context=lambda *args, **kwargs: guidance_resume_context(*args, **kwargs),
-        inspect_worker_guidance_result=lambda *args, **kwargs: inspect_worker_guidance_result(*args, **kwargs),
         is_loop_manager_repository=lambda *args, **kwargs: is_loop_manager_repository(*args, **kwargs),
         make_worktree=lambda *args, **kwargs: make_worktree(*args, **kwargs),
         mark_execplan_workspace_owned=lambda *args, **kwargs: mark_execplan_workspace_owned(*args, **kwargs),
@@ -4109,7 +3958,6 @@ _ExecutionLifecyclePorts = _bind_effects(
         validate_active_execplan_metadata=lambda *args, **kwargs: validate_active_execplan_metadata(*args, **kwargs),
         validate_agent_scope=lambda *args, **kwargs: validate_agent_scope(*args, **kwargs),
         validate_execplan_workspace_identity=lambda *args, **kwargs: validate_execplan_workspace_identity(*args, **kwargs),
-        validate_guidance_publication=lambda *args, **kwargs: validate_guidance_publication(*args, **kwargs),
         validate_managed_worktree=lambda *args, **kwargs: validate_managed_worktree(*args, **kwargs),
         validate_worker_workspace_scope=lambda *args, **kwargs: validate_worker_workspace_scope(*args, **kwargs),
         validation_failure_fingerprints=lambda *args, **kwargs: validation_failure_fingerprints(*args, **kwargs),
@@ -4154,7 +4002,7 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument(
         "--approve-agents-mismatch",
         action="store_true",
-        help="이전 CLI와의 호환 옵션 (공통 본문 포함 승인은 더 이상 필요하지 않음)",
+        help=argparse.SUPPRESS,
     )
     remove = config_commands.add_parser("remove", help="프로젝트 등록 해제")
     remove.add_argument("repository", help="등록 해제할 저장소 루트")

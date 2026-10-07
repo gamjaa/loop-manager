@@ -70,7 +70,7 @@ class OriginRegistrationTests(unittest.TestCase):
                             config_path=Path('config.ini'), provider='codex', requested_base='main',
                             approve_agents_mismatch=approve)
                         self.assertFalse(added.agents_approved)
-                        expected_hash = hashlib.sha256(documents['AGENTS.md']).hexdigest() if present else None
+                        expected_hash = None
                         self.assertEqual(added.agents_hash, expected_hash)
                         self.assertEqual(project_registry.list_projects(connection), (added,))
                         audit = connection.execute('SELECT repo, agents_hash, agents_approved, origin '
@@ -80,7 +80,7 @@ class OriginRegistrationTests(unittest.TestCase):
                         if present:
                             documents['AGENTS.md'] = b'updated project rules'
 
-    def test_absent_agents_on_selected_revision_is_not_replaced_by_local_rules(self):
+    def test_registration_never_reads_root_cli_guidance(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             git(repo, "init", "-b", "main")
@@ -93,12 +93,10 @@ class OriginRegistrationTests(unittest.TestCase):
 
             self.assertEqual(loop_manager.inspect_registration_files(
                 repo, without_agents, approve_agents_mismatch=False), (None, False))
-            expected = hashlib.sha256(loop_manager.git_bytes(
-                repo, "show", f"{with_agents}:AGENTS.md")).hexdigest()
             self.assertEqual(loop_manager.inspect_registration_files(
-                repo, with_agents, approve_agents_mismatch=False), (expected, False))
+                repo, with_agents, approve_agents_mismatch=False), (None, False))
 
-    def test_agents_are_optional_and_present_invalid_utf8_or_missing_specs_are_rejected(self):
+    def test_cli_guidance_is_ignored_while_missing_specs_are_rejected(self):
         from loop_manager_internal.runtime import project_registry
         documents = {'AGENTS.md': '프로젝트 규칙\r\n'.encode(),
                      'docs/PLANS.md': (loop_manager.ROOT / 'docs/PLANS.md').read_bytes(),
@@ -111,13 +109,13 @@ class OriginRegistrationTests(unittest.TestCase):
         connection.execute("INSERT INTO projects (repo, base_branch, provider, agents_hash, agents_approved) "
                            "VALUES ('old', 'main', 'codex', 'legacy-hash', 1)")
         with mock.patch.object(loop_manager, '_git_tree_entries', return_value={}), mock.patch.object(
-            loop_manager, '_revision_blob', side_effect=lambda _root, _entries, path: documents.get(path)):
+            loop_manager, '_revision_blob', side_effect=lambda _root, _entries, path: documents.get(path) if path != 'AGENTS.md' else self.fail('CLI guidance was read')):
             for approve in (False, True):
                 self.assertEqual(loop_manager.inspect_registration_files(Path('/repo'), 'selected',
-                    approve_agents_mismatch=approve), (hashlib.sha256(documents['AGENTS.md']).hexdigest(), False))
+                    approve_agents_mismatch=approve), (None, False))
             documents['AGENTS.md'] = b'\xff'
-            with self.assertRaisesRegex(RuntimeError, 'UTF-8'):
-                loop_manager.inspect_registration_files(Path('/repo'), 'selected', approve_agents_mismatch=True)
+            self.assertEqual(loop_manager.inspect_registration_files(
+                Path('/repo'), 'selected', approve_agents_mismatch=True), (None, False))
             del documents['AGENTS.md']
             for approve in (False, True):
                 self.assertEqual(loop_manager.inspect_registration_files(Path('/repo'), 'selected',
@@ -128,7 +126,7 @@ class OriginRegistrationTests(unittest.TestCase):
         self.assertEqual(connection.execute('SELECT agents_hash, agents_approved FROM projects').fetchone(),
                          ('legacy-hash', 1))
 
-    def test_registration_normalizes_document_line_endings_but_hashes_agent_bytes(self):
+    def test_registration_normalizes_document_line_endings_without_cli_guidance(self):
         for newline in (b'\n', b'\r\n'):
             with self.subTest(newline=newline):
                 def common(path):
@@ -145,7 +143,7 @@ class OriginRegistrationTests(unittest.TestCase):
                 ):
                     self.assertEqual(
                         loop_manager.inspect_registration_files(Path('/repo'), 'revision', approve_agents_mismatch=False),
-                        (hashlib.sha256(documents['AGENTS.md']).hexdigest(), False),
+                        (None, False),
                     )
                     for path in ('docs/ARCHITECTURE.md', 'docs/PRODUCT.md'):
                         original = documents[path]
@@ -248,10 +246,7 @@ class OriginRegistrationTests(unittest.TestCase):
                 approve_agents_mismatch=False,
             )
             self.assertFalse(approved)
-            self.assertEqual(
-                agents_hash,
-                hashlib.sha256(loop_manager.git_bytes(repo, "show", f"{committed_agents}:AGENTS.md")).hexdigest(),
-            )
+            self.assertIsNone(agents_hash)
 
             def validate(_path, **kwargs):
                 kwargs["origin_result"].append("example/project")

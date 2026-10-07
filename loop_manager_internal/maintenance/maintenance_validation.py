@@ -259,7 +259,6 @@ class ValidateMaintenancePlannerResultEffects:
     _parse_execplan: Callable[..., object]
     _validate_future_idea_separation: Callable[..., object]
     changed_files: Callable[..., object]
-    contains_guidance_sections: Callable[..., object]
     git: Callable[..., object]
     load_execplan_snapshot: Callable[..., object]
     published_execplan: Callable[..., object]
@@ -345,10 +344,6 @@ def validate_maintenance_planner_result(
             contents = (worktree / path).read_bytes()
             text = contents.decode("utf-8")
             planned_contents[path] = (contents, text)
-            if effects.contains_guidance_sections(text):
-                raise MaintenancePlanningError(
-                    "유지보수 Planner는 AGENTS.md guidance를 제안할 수 없습니다."
-                )
             existed = path.encode("utf-8") in base_paths
             if existed:
                 if path not in eligible:

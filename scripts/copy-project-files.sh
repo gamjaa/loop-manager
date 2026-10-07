@@ -20,26 +20,11 @@ conflicts=()
 for path in "$target/.agents" "$target/docs"; do
     [[ -e "$path" || -L "$path" ]] && conflicts+=("$path")
 done
-if [[ -e "$target/AGENTS.md" || -L "$target/AGENTS.md" ]]; then
-    if [[ ! -f "$target/AGENTS.md" || -L "$target/AGENTS.md" ]]; then
-        conflicts+=("$target/AGENTS.md (일반 파일이 아님)")
-    fi
-fi
-
 if (( ${#conflicts[@]} > 0 )); then
     printf '이미 존재하는 파일 또는 폴더: %s\n' "${conflicts[@]}" >&2
     exit 1
 fi
 
-if [[ ! -e "$target/AGENTS.md" ]]; then
-    (set -o noclobber; cat > "$target/AGENTS.md" <<'GUIDANCE'
-# Project instructions
-
-프로젝트 전용 언어·코딩·빌드 규칙은 이 파일에 기록한다.
-문서 작성·검토 기준은 [Specification Skill](.agents/skills/specification-docs/SKILL.md)을 따른다.
-GUIDANCE
-    )
-fi
 cp -R "$source_root/.agents" "$target/.agents"
 
 mkdir -p \

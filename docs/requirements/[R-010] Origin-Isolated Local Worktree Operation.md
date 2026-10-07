@@ -62,7 +62,7 @@ Worker는 관리 worktree의 파일과 targeted test만 담당하며 commit, fet
 - Planner 입력 지문은 `origin/<base-branch>`의 commit tree만 사용하며 로컬 파일, index와 로컬 전용 commit을 포함하지 않는다.
 - planning worktree는 `origin/<base-branch>`의 detached HEAD에서 만들고, ExecPlan 구현 branch와 worktree도 해당 원격 기준에서 만든다.
 - 기존 활성 ExecPlan은 저장된 Loop Manager 소유 branch와 관리 worktree에서만 재개한다.
-- 프로젝트 등록 시 필수 문서, 프로젝트 루트 `AGENTS.md`의 존재·UTF-8과 `docs/PLANS.md` 검사는 `origin/<base-branch>`에 commit된 파일을 기준으로 수행한다. R-064에 따라 프로젝트 AGENTS에 공통 본문 포함·일치 승인을 요구하지 않으며 실행 지침은 선택 runtime의 공통·역할별 원본을 사용한다.
+- 프로젝트 등록 시 필수 문서와 `docs/PLANS.md` 검사는 `origin/<base-branch>`에 commit된 파일을 기준으로 수행한다. R-064에 따라 실행 지침은 선택 runtime의 공통·역할별 원본을 사용한다.
 - 로컬에서만 추가·수정·삭제한 문서 때문에 등록 검사가 성공하거나 실패하지 않는다.
 - 등록 이후 자동 실행은 등록 시 전용 공통 파일 검사를 로컬 worktree에서 다시 수행하지 않는다.
 - safe fast-forward 대상이 아닌 기본 worktree의 파일 내용, index와 HEAD는 실행 전후에 동일하게 유지된다. 대상이면 HEAD, index와 tracked 파일만 정확한 `origin/<base-branch>`로 함께 전진한다.

@@ -25,7 +25,6 @@ class LatestBaseHandlerPorts:
     git: Callable[..., Any]
     operation_print: Callable[..., Any]
     record_remote_publication_branch: Callable[..., Any]
-    validate_guidance_publication: Callable[..., Any]
     _block_final: Callable[..., ExecutionOutcome]
     _checkpoint_remote_oid: Callable[..., Any]
     _complete_rebase_intent: Callable[..., Any]
@@ -82,15 +81,6 @@ class LatestBaseHandler:
         if rebased.returncode:
             in_progress = self.ports._rebase_in_progress_for_branch(context.worktree, context.branch)
             if in_progress:
-                if self.ports.validate_guidance_publication(
-                    self.ports.identity.repo,
-                    context.worktree,
-                    self.ports.snapshot().catalog_plan,
-                    str(row['worker_result'] or ''),
-                    previous_base=str(row['active_sha']),
-                    latest_base=latest_sha,
-                ):
-                    return self.ports._final()
                 rebase_failure = self.ports.contract.REBASE_CONFLICT_PREFIX + rebased.stdout[-8000:]
                 self.ports.state.update_project(
                     self.ports.identity.repo,
@@ -116,15 +106,6 @@ class LatestBaseHandler:
             # Worker result for a user candidate. Conflict recovery still
             # follows the existing Worker path above.
             self.ports.state.update_project(self.ports.identity.repo,phase='VERIFYING')
-        if self.ports.validate_guidance_publication(
-            self.ports.identity.repo,
-            context.worktree,
-            self.ports.snapshot().catalog_plan,
-            str(row['worker_result'] or ''),
-            previous_base=str(row['active_sha']),
-            latest_base=latest_sha,
-        ):
-            return self.ports._final()
         return None
 
     def _latest_before_verify(self, context, observed_base_sha):

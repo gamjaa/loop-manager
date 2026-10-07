@@ -17,7 +17,7 @@ Loop Manager의 Agent 범위 검사와 관리 worktree 소유권·cleanliness �
 - tracked 파일과 index의 staged entry 및 non-default index flag
 - non-ignored untracked 파일
 - `HEAD`, branch, refs, 등록 worktree, Git config와 진행 중인 Git operation
-- 역할별 허용 경로, 선택된 ExecPlan과 승인된 guidance 범위를 벗어난 게시 가능한 변경
+- 역할별 허용 경로, 선택된 ExecPlan의 범위를 벗어난 게시 가능한 변경
 
 권위 있는 변경을 검사한다는 것은 Planner와 Worker의 정상적인 파일 생성·수정·삭제를 금지한다는 뜻이 아니다. Planner는 새 ExecPlan과 허용된 `docs/FUTURE_IDEAS.md` 변경을, Worker는 선택된 ExecPlan 구현에 필요한 코드·테스트·문서 변경을 기존 역할별 경계 안에서 만들고 commit할 수 있다. Reviewer만 권위 있는 파일 변경을 남길 수 없다.
 

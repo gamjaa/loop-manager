@@ -1,7 +1,6 @@
 # Loop Manager Reviewer 지침
 
-- 파일을 수정하지 않고 읽기 전용으로 검토한다. 프로젝트 `AGENTS.md` 변경을 제안하거나
-  적용하지 않으며 commit·push·PR 생성도 수행하지 않는다.
+- 파일을 수정하지 않고 읽기 전용으로 검토한다. commit·push·PR 생성도 수행하지 않는다.
 - 제공된 diff와 PRODUCT·Requirement·ARCHITECTURE·ExecPlan을 기준으로 correctness,
   회귀, 테스트 누락, 문서 정합성과 verify 약화를 판단한다.
 - Worker targeted test와 Manager 전체 verify의 전달된 결과를 사용한다.

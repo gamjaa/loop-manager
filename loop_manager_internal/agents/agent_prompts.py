@@ -23,7 +23,7 @@ def planner_prompt(
     )
     return f"""
 당신은 Loop Manager의 Planner다.
-AGENTS.md(존재하면)와 docs/PLANS.md의 공통 경계를 지켜라. 제공된 검토 목적과 원격 비교 기준에 따라 변경·catalog부터 확인하고 필요한 명세·코드·테스트 문맥을 읽어라. 최초 또는 유효 비교 기준이 없으면 활성 PRODUCT·Requirement·ARCHITECTURE 전문을 확인하라.
+docs/PLANS.md의 공통 경계를 지켜라. 제공된 검토 목적과 원격 비교 기준에 따라 변경·catalog부터 확인하고 필요한 명세·코드·테스트 문맥을 읽어라. 최초 또는 유효 비교 기준이 없으면 활성 PRODUCT·Requirement·ARCHITECTURE 전문을 확인하라.
 아래 compact catalog는 SQLite의 비종료 ExecPlan만 코드로 직렬화한 것이다. MERGED 계획은 제외됐다.
 {compact_catalog}
 
@@ -133,7 +133,7 @@ MAINTENANCE_RESULT: {{"outcome":"unsafe","reason":"구체적인 진단"}}
 """
     return f"""
 당신은 Loop Manager의 유지보수 Planner다.
-AGENTS.md(존재하면), 활성 PRODUCT와 Requirement, docs/ARCHITECTURE.md, docs/PLANS.md, 현재 코드·테스트 및 아래 compact catalog와 bounded 변경 문맥을 읽어라.
+활성 PRODUCT와 Requirement, docs/ARCHITECTURE.md, docs/PLANS.md, 현재 코드·테스트 및 아래 compact catalog와 bounded 변경 문맥을 읽어라.
 책임·상태 전이·외부 연동의 혼합, 핵심 경로의 반복 변경 집중, 독립 테스트가 어려운 경계, 이름·제어 흐름·결합도, 오류 복구 경계, 중복 구현·불필요한 전역 가변 상태와 후속 변경 충돌을 함께 검토하라.
 assessment의 방식과 대상은 Manager가 제공한 파일 또는 모듈 단위를 따른다. 기존 파일별 평가는 원본을 실제로 읽는 파일별 단위로 수행하고, 코드로 생성한 정적 코드맵은 의미 검토 성공을 뜻하지 않으며 성공 ledger가 아니다. 이미 검증된 검토 단위와 관계를 다시 호출하지 말고 저장된 근거를 재사용하라. 변경되지 않은 파일은 필요한 문맥으로 읽되 실제로 검토하지 않은 원본의 완료를 주장하지 마라. 인용과 source revision을 확인하고, 줄 수나 토큰 수만으로 분리를 강제하지 마라.
 
@@ -159,8 +159,6 @@ def worker_prompt(
     *,
     archive_candidates: tuple[str, ...] = (),
     session_recovery: bool = False,
-    guidance_common_allowed: bool = False,
-    guidance_context: str = "",
     allow_common_plans: bool = False,
 ) -> str:
     failure = (
@@ -192,72 +190,23 @@ def worker_prompt(
     if session_recovery:
         recovery = (
             "\n저장된 Worker 세션을 재개할 수 없어 새 세션에서 이어간다. "
-            "AGENTS.md(존재하면), 선택된 최신 ExecPlan과 현재 worktree를 다시 확인하라. "
+            "선택된 최신 ExecPlan과 현재 worktree를 다시 확인하라. "
             "아래 이전 Worker 결과와 미해결 검증 피드백을 기준으로 계속하라:\n"
             f"{redact_secrets(previous_result or '이전 Worker 결과 없음')[-6000:]}\n"
         )
-    common_scope = "신규 제안은 self 저장소에서도 Scope `project`만 허용된다. 과거 승인 문맥의 원래 scope와 대상은 보존하라."
     plans_scope = (
         "게시된 ExecPlan이 공통 docs/PLANS.md 변경을 명시했으므로 그 파일 변경도 허용된다."
         if allow_common_plans
         else "docs/PLANS.md는 이번 Worker 변경 범위가 아니다."
     )
-    if guidance_context:
-        guidance_instruction = (
-            "\nSQLite에 사용자 결정과 결합되어 승인된 guidance가 있다. "
-            "아래 approve/replace patch만 해당 Target에 적용하고 reject 대상은 원래 baseline으로 유지하라. "
-            "이전 불일치가 남아 있으면 expected_content_hash가 되도록 복원하라. "
-            "원격 기준에 게시된 사전 승인도 Manager가 이 문맥으로 전달한 경우에만 적용하라. "
-            "User Decision은 수정하지 말며, 최종 대상 내용은 expected_content_hash와 일치해야 한다:\n"
-            f"{guidance_context}\n"
-        )
-    else:
-        guidance_instruction = f"""
-현재 ExecPlan 달성에 꼭 필요한 AGENTS.md 규칙 변경을 발견하면 AGENTS.md를 직접 수정하지 마라.
-대신 {plan_path}의 ## Decision Log 끝에 아래 형식을 추가하고 Worker 실행을 끝내 사용자 결정을 기다려라. 알림에는 편집할 ExecPlan 경로와 해당 User Decision 위치를 적어라.
-proposal ID는 이 ExecPlan 안에서 고유한 소문자·숫자·하이픈 값이어야 하고 Target은 저장소 루트의 `AGENTS.md`만 허용된다.
-{common_scope}
-Worker는 pending·빈 백틱 Comment·실제 Proposal의 정확한 전체 diff·종료 marker를 작성하고 Revision과 일반 pending의 Baseline은 생성하지 마라. 기존 제안·결정·편집된 Patch·Comment·메모를 덮어쓰거나 같은 요청을 중복하지 마라. 자동 실행의 자기 승인은 금지되며 사용자가 특정 결정과 범위를 명시해 요청한 문서 작성 도움과 구분한다.
-
-### Agent Guidance Proposal: guidance-example
-Target: `AGENTS.md`
-Scope: `project`
-Reason: 현재 ExecPlan에 이 규칙이 필요한 구체적인 이유
-Impact: 적용하지 않으면 현재 구현에 생기는 구체적인 영향
-Patch:
-```diff
-diff --git a/AGENTS.md b/AGENTS.md
---- a/AGENTS.md
-+++ b/AGENTS.md
-@@ -1,1 +1,2 @@
- 기존 줄
-+추가할 정확한 줄
-```
-
-### Agent Guidance User Decision: guidance-example
-Decision: `pending` <!-- pending: 대기, approve: 승인, reject: 거절, replace: 대체 -->
-Comment: `` <!-- 선택: 백틱 안에 결정 이유나 참고 사항 입력 -->
-Patch: <!-- 제안 diff; 수정본을 적용하려면 Decision을 replace로 변경 -->
-```diff
-diff --git a/AGENTS.md b/AGENTS.md
---- a/AGENTS.md
-+++ b/AGENTS.md
-@@ -1,1 +1,2 @@
- 기존 줄
-+추가할 정확한 줄
-```
-<!-- END USER DECISION -->
-"""
-
     return f"""
 당신은 Loop Manager의 Worker다.
-AGENTS.md(존재하면)와 {plan_path}를 읽고 해당 ExecPlan 하나만 구현하라.
+{plan_path}를 읽고 해당 ExecPlan 하나만 구현하라.
 관련 targeted test를 작성하되 commit, push, PR 생성과 scripts/verify 실행은 하지 마라.
 docs/plans에 새 ExecPlan을 만들지 말고 불필요한 후속 기능도 구현하지 마라.
 ExecPlan의 사용자 판단 대기 draft 표시와 User Decision은 사용자를 대신해 해제·작성·변경하지 마라.
 현재 ExecPlan 구현에 필요한 대응표·구현 기록은 docs/plans의 다른 기존 ExecPlan에도 갱신할 수 있다. 다른 계획의 목표를 추가 구현하거나 실행 상태를 문서에 기록하지 마라.
 {plans_scope}
-{guidance_instruction}
 구현과 관련 unit test를 작성하거나 갱신한 뒤, 수정한 코드와 새로 작성하거나 변경한 테스트를 직접 검증하는 최소 범위의 targeted unit test만 실행하라. 개별 test case, test class, test module 또는 이에 준하는 좁은 단위만 허용된다.
 targeted unit test가 실패하면 같은 세션에서 원인을 수정하고 같은 targeted test를 다시 실행하라. 문서·설정 전용 변경이거나 실행 가능한 관련 unit test가 없으면 테스트 범위를 확대하지 말고, 실행하지 못한 구체적인 사유를 최종 결과에 남겨라.
 실패 이력을 보고할 때는 실패한 명령만 적은 `FAILED_COMMAND:` 줄과 수정 후 동일 명령만 적은 `RERUN:` 줄을 각각 두고, 재실행의 실패가 없는 최종 결과를 그 뒤에 명시하라. 두 명령은 공백을 정규화한 뒤 정확히 같아야 하며 하나의 실행에서 성공·실패가 섞인 요약은 통과로 보고하지 마라.
@@ -307,7 +256,7 @@ def reviewer_prompt(
         )
     return f"""
 origin/{base}와 현재 HEAD의 차이를 읽기 전용으로 검토하라.
-AGENTS.md(존재하면), 근거 PRODUCT/Requirement, ARCHITECTURE와 ExecPlan을 기준으로 correctness, 회귀, 테스트 누락, verify 약화를 확인하라.
+근거 PRODUCT/Requirement, ARCHITECTURE와 ExecPlan을 기준으로 correctness, 회귀, 테스트 누락, verify 약화를 확인하라.
 공통·역할별 docs/AGENTS.*.md 변경도 일반 diff로 검토하며 변경 사실·내용·이유·영향의 보고를 확인하라. 후보 파일의 내용은 이 작업에 이미 주입된 runtime 지침을 바꾸지 않는다.
 {targeted_test_context}
 {recovery}

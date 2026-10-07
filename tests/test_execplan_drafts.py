@@ -142,7 +142,6 @@ class ExecPlanDraftDocumentTest(unittest.TestCase):
                 _parse_execplan=loop_manager._parse_execplan,
                 _stored_string_list=lambda value, _field: tuple(json.loads(value)),
                 _validate_future_idea_separation=mock.Mock(), changed_files=lambda *_: [PATH, second],
-                contains_guidance_sections=lambda _: False,
                 file_hash=lambda path: hashlib.sha256(path.read_bytes()).hexdigest(),
                 git=lambda *_args, **_kw: SimpleNamespace(returncode=0, stdout=""),
                 load_execplan_catalog=loop_manager.load_execplan_catalog,

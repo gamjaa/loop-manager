@@ -17,7 +17,7 @@
 
 ### Current Goals
 
-- 여러 로컬 GitHub 프로젝트의 필수 문서를 검증해 등록하고 runtime 공통 Agent 지침을 모델 호출에 전달한다. 프로젝트 `AGENTS.md`는 공통 본문 없이도 사용할 수 있다.
+- 여러 로컬 GitHub 프로젝트의 필수 문서를 검증해 등록하고 runtime 공통 Agent 지침을 모델 호출에 전달한다.
 - Specification Skill로 PRODUCT·Requirement·ARCHITECTURE 작성을 지원한다.
 - 미충족 PRODUCT·Requirement 작업을 Worker 시작 전에 ExecPlan catalog로 만들고, 메타데이터·의존성·우선순위에 따라 처리한다.
 - 계획별 상태·재시도·Agent session·작업 공간을 SQLite에 보존해 중단 후 재개한다.
@@ -93,7 +93,7 @@ R-023의 원격 실행·self handoff 목표는 유지하며 로컬 갱신 gate�
 1. 프로젝트별로 사용할 AI Agent provider를 선택한다
 2. 대상 프로젝트 경로를 추가하거나 제거한다
 3. 프로젝트의 필수 조건과 공통 파일을 코드로 검증한다
-4. 원격 루트 `AGENTS.md`의 존재·UTF-8과 나머지 필수 문서를 확인한다
+4. 원격 필수 문서를 확인한다
 5. `max_workers`를 포함한 유효한 설정을 저장한다
 
 규칙:
@@ -122,7 +122,7 @@ R-023의 원격 실행·self handoff 목표는 유지하며 로컬 갱신 gate�
 
 계획의 `draft: true`는 사용자 판단이 필요한 작성 준비도 선언이다. 유효한 draft는 독립 실행 가능 계획과 같은 batch로 게시·등록하며 질문·선택 영향·원격 링크·판단 revision을 보존한다. draft에는 Worker·workspace 예약·구현 branch·PR을 시작하지 않고, 직접·간접 의존 계획도 대기한다. 독립 READY·planning·PR 관측은 계속한다. 같은 근거와 질문을 새 ID로 반복 게시하지 않는다.
 
-사용자는 원격 계획의 `Draft Decision` 질문을 해소하고 draft 표시를 제거한 뒤 `User Decision` 절에 `Decision: approve`, `Revision: compact catalog의 decision_wait.revision 판단 지문`, `Answer: 구체적 답변`을 기록한다. 판단 지문은 계획·관련 명세·설계 근거와 해당 근거를 확인한 원격 revision에 결합된다. Manager는 최신 원격 catalog·관련 명세와 설계 근거·무소유 상태를 확인하고 결정 대기를 해제한다. 질문·목표·관련 근거 변경, 불완전한 답변, reject/defer와 표시만 제거한 변경은 대기로 보존한다. Agent는 결정 작성·변경·자기 승인을 할 수 없다. 실행에는 기존 dependency·소유권 gate도 충족해야 한다. 이 계약은 문서 수정 draft 승인 및 AGENTS 변경 승인과 구분한다.
+사용자는 원격 계획의 `Draft Decision` 질문을 해소하고 draft 표시를 제거한 뒤 `User Decision` 절에 `Decision: approve`, `Revision: compact catalog의 decision_wait.revision 판단 지문`, `Answer: 구체적 답변`을 기록한다. 판단 지문은 계획·관련 명세·설계 근거와 해당 근거를 확인한 원격 revision에 결합된다. Manager는 최신 원격 catalog·관련 명세와 설계 근거·무소유 상태를 확인하고 결정 대기를 해제한다. 질문·목표·관련 근거 변경, 불완전한 답변, reject/defer와 표시만 제거한 변경은 대기로 보존한다. Agent는 결정 작성·변경·자기 승인을 할 수 없다. 실행에는 기존 dependency·소유권 gate도 충족해야 한다. 이 계약은 문서 수정 draft 승인과 구분한다.
 
 계획 게시의 원자 적용, 작업 공간 복구와 단계별 Git 처리는 [ARCHITECTURE.md](ARCHITECTURE.md#계획-게시와-작업-공간)를 따른다.
 
@@ -166,7 +166,7 @@ PR 없는 게시 checkpoint의 과거 Review 횟수 차단은 현재 게시 소�
 
 | 차단·변경 조건 | 허용되는 처리 |
 |---|---|
-| PLAN_BLOCKED | 해당 계획의 입력·guidance 결정·같은 PR reopen 조건만 재평가한다. 독립 READY는 계속 선택할 수 있다. |
+| PLAN_BLOCKED | 해당 계획의 입력·사용자 결정·같은 PR reopen 조건만 재평가한다. 독립 READY는 계속 선택할 수 있다. |
 | PROJECT_BLOCKED | 일반 Agent·Git 변경을 멈춘다. PR 상태·계획별 원격 관측·알림은 계속하며, 실행 자리와 현재 범위가 검증된 연결 계획만 복구·보존할 수 있다. |
 | 안전한 원격 후속 commit 또는 base 전진 | 기존 branch·worktree·session과 로컬 작업을 보존해 반영하고 원래 차단 원인을 다시 검사한다. 새 OID나 checkpoint 게시만으로 해제하지 않는다. |
 | 삭제·재작성·경쟁·소유권 불명확 또는 미해결 충돌 | 원격 ref를 덮지 않고 차단·작업물과 실제 미게시 이유를 보존한다. |
@@ -253,7 +253,7 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 
 - source와 dependency 변경은 같은 reconciliation 결과를 Requirement 판단 자격·입력 지문·READY 선택에 사용하고 priority 변경은 다음 선택부터 반영한다. complexity·risk 변경은 최초 Worker level을 다시 계산하되 실행 이력이 있는 계획의 effective level과 Review 승격 이력을 낮추지 않는다
 - 현재 path와 title은 compact catalog, 로그·알림과 이후 파일 조회에 사용하지만 기존 PR의 ExecPlan 링크는 최초 게시 SHA와 최초 active path를 계속 사용한다
-- 최초 또는 비교 가능한 전체 계획 성공 기준이 없거나, PRODUCT·활성 Requirement·ARCHITECTURE·AGENTS·사용자 active ExecPlan이 바뀌면 일반 Planner를 READY 선택보다 먼저 실행한다. 일반 Planner는 비종료 compact catalog와 미착수 READY snapshot으로 현재 식별 가능한 미충족 작업을 한 번에 계획한다
+- 최초 또는 비교 가능한 전체 계획 성공 기준이 없거나, PRODUCT·활성 Requirement·ARCHITECTURE·사용자 active ExecPlan이 바뀌면 일반 Planner를 READY 선택보다 먼저 실행한다. 일반 Planner는 비종료 compact catalog와 미착수 READY snapshot으로 현재 식별 가능한 미충족 작업을 한 번에 계획한다
 - 일반 Planner는 마지막으로 원격 적용한 성공 검토와 비교 가능한 경우 변경·삭제·rename과 현재 catalog부터 확인한다. 영향받은 명세 절·코드·테스트·계획과 dependency를 읽고 불확실하면 범위를 넓힌다. 비교 근거가 없거나 손상되면 활성 명세 전문을 확인하며, 매 변경 검토에서 무관한 문서 전문을 반복하지 않는다
 - 문서·지침·active ExecPlan은 그대로이고 코드·테스트·설정만 바뀌면 수정 가능한 미착수 READY를 읽기 전용 점검 Planner가 먼저 확인한다. dependency 대기 READY도 포함하며 실행 이력·소유 증거가 있는 계획은 대상에서 제외한다. 대상이 없으면 일반 Planner가 위 비교 기준에 따라 미충족 작업을 확인한다
 - 점검의 수정 불필요 결과는 같은 입력과 대상에서 재사용하고 일반 Planner 없이 기존 READY 선택을 이어간다. 수정 필요·판단 불확실은 근거와 대상을 일반 Planner에 인계한다. 점검 성공은 예정 작업의 유지 가능성만 확인하며 전체 계획·유지보수 성공 기준이나 프로젝트 완료를 확정하지 않는다
@@ -262,7 +262,7 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 - Planner와 Worker의 실행 후보는 `docs/plans/` 바로 아래의 active ExecPlan으로 제한하고, `docs/plans/archive/`는 ID 고유성, 다음 번호, dependency, 복구와 감사 검증에만 포함한다
 - ExecPlan archive-only 이동은 계획 입력 지문, 유지보수 Merge count, 프로젝트 완료 cycle을 바꾸지 않는다
 - ExecPlan의 `depends_on`은 선행 ExecPlan ID 목록이며, 모든 선행 상태가 MERGED여야 Worker를 시작할 수 있다
-- Worker는 Requirement·ExecPlan 구현으로 바뀌는 제품 동작·장기 규칙을 `PRODUCT.md`에, 설계·책임 경계·계약을 `ARCHITECTURE.md`에 코드와 같은 PR에서 반영한다. 현재 작업에 필요한 관련 절만 갱신하며 목표·필수 검증·별도 사용자 결정과 프로젝트 루트 `AGENTS.md` 변경에 대한 사용자 승인 조건을 유지한다
+- Worker는 Requirement·ExecPlan 구현으로 바뀌는 제품 동작·장기 규칙을 `PRODUCT.md`에, 설계·책임 경계·계약을 `ARCHITECTURE.md`에 코드와 같은 PR에서 반영한다. 현재 작업에 필요한 관련 절만 갱신하며 목표·필수 검증·별도 사용자 결정을 유지한다
 
 ### 프로젝트 등록 및 실행 조건
 
@@ -271,11 +271,7 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 - fetch된 `origin/<base-branch>` tree에 `docs/PRODUCT.md` 또는 `docs/requirements/` 바로 아래 Requirement가 하나 이상 있어야 한다
 - 변경되지 않은 PRODUCT/ARCHITECTURE 템플릿만 있는 프로젝트는 작업 가능 상태로 등록하지 않는다
 - `docs/PLANS.md`는 Loop Manager 기준 파일과 SHA-256 해시가 같아야 한다
-- 루트 `AGENTS.md`는 AI Agent CLI가 읽는 선택 개발 지침이며 없어도 등록·자동 실행할 수 있다. 공통 본문 포함·일치 승인을 요구하지 않는다. 과거 mismatch 승인·해시 기록은 감사로 보존한다
-- 존재하는 `AGENTS.md`의 UTF-8·내용 해시와 `docs/PLANS.md` 해시 검사는 프로젝트 등록 시 선택한 원격 commit blob에만 수행하며 자동 Loop에서는 반복하지 않는다. `AGENTS.md`가 없으면 내용 해시도 없는 값으로 기록한다
 - 자동 작업의 기준은 `origin/<base-branch>`다
-- 사용자는 원격 기준에 게시하는 ExecPlan의 정확한 AGENTS.md Proposal과 User Decision으로 사전 승인할 수 있다. Worker 시작 전에 결정과 당시 기준 파일을 대조하고 유효한 patch만 허용한다. 기준이 바뀌면 재승인을 기다리며 로컬 본문·포괄적 허락·자동 실행 Agent의 자기 승인은 인정하지 않는다. 사용자가 특정 결정과 범위를 명시해 요청한 모델의 문서 작성 도움은 허용한다. 실제 결과와 최신 base 검증, Review와 사용자 Merge는 유지한다.
-- AGENTS User Decision은 fence 밖 독립 줄의 `<!-- END USER DECISION -->`로 끝내고 뒤에 메모를 둘 수 있다. 마커 없는 기존 결정은 다음 guidance 제목·최상위 절·EOF로 끝난다. Revision은 선택적이며 기존 Revision·승인 identity는 보존한다. 안내 주석·Comment·종료 뒤 메모는 결정 identity에 포함하지 않는다. 요청 양식은 pending·빈 Comment·원안 전체 diff를 제공한다. pending의 Patch 편집은 대기를 유지하고 approve는 원안만, replace는 확정한 전체 diff를 적용하며 reject는 파일을 변경하지 않는다. 표시된 원안과 빈 Patch는 같은 의미이며, 값이 있는 모든 Patch는 대상·형식을 검증한다.
 - 기본 worktree의 로컬 변경, checkout branch와 ahead·diverged 이력은 자동 작업을 막지 않으며 local-only 내용은 자동 입력에 포함하지 않는다
 
 - 기본 worktree는 equal이면 무변경, ahead이면 보존·skip, behind이면 disjoint 로컬 변경과 index·ignored 파일을 보존하는 safe fast-forward로 처리한다. clean diverged의 확인된 선형 로컬 commit은 durable intent 아래 원격 base 위로 rebase하며 자동 push하지 않는다. dirty 작업·merge commit·겹치는 ignored 경로·사용자 operation·소유권 불확실은 보존·skip한다. 실패·중단에서 소유 작업과 실제 ref·index·파일이 일치할 때만 복구하고 동일 입력의 실패 Git 쓰기를 반복하지 않는다.
@@ -295,12 +291,11 @@ Skill과 Manager가 프로젝트 안에서 고정 위치로 조회·작성하는
 | 문서 작성 Skill | `.agents/skills/specification-docs/`와 `SKILL.md` |
 | 명세·계획 규칙·아이디어 | `docs/PRODUCT.md`, `docs/ARCHITECTURE.md`, `docs/PLANS.md`, `docs/FUTURE_IDEAS.md` |
 | 문서 템플릿 | `docs/PRODUCT.template.md`, `docs/ARCHITECTURE.template.md`, `docs/REQUIREMENT.template.md` |
-| Requirement·ExecPlan | `docs/requirements/`·`archive/`, `docs/plans/`·`archive/`·`manual/` |
+| Requirement·ExecPlan | `docs/requirements/`·`archive/`, `docs/plans/`·`archive/` |
 | 코드맵 | `docs/maintenance/code-map.jsonl` |
 | 전체 검증 | `scripts/verify.sh`, `scripts/verify.ps1` |
 
-이 경로들의 루트 `.agents/`·`docs/`·`scripts/`도 고정한다. 선택적인 CLI 지침 `AGENTS.md`와
-프로젝트의 `.gitignore`·`.codex/config.toml`·`.codex/rules/`·`.claude/settings.json`·
+이 경로들의 루트 `.agents/`·`docs/`·`scripts/`도 고정한다. 프로젝트의 `.gitignore`·`.codex/config.toml`·`.codex/rules/`·`.claude/settings.json`·
 `.claude/settings.local.json`은 존재할 때 CLI 입력·격리 검사에 사용되는 위치를 유지한다.
 Loop Manager runtime에서만 읽는 `docs/AGENTS.*.md`와 저장소 밖 Manager 상태 경로는
 프로젝트 예약 경로가 아니며 프로젝트에 복사하거나 생성하도록 요구하지 않는다.
@@ -311,10 +306,9 @@ Loop Manager runtime에서만 읽는 `docs/AGENTS.*.md`와 저장소 밖 Manager
 - 모델 실행 전에 모든 원본의 UTF-8 내용·묶음 SHA-256·source revision·snapshot 참조를 작업에 결합해 Manager 상태 디렉터리와 SQLite에 보존한다. 호출할 때 공통과 해당 역할의 내용만 합치고 실제 전달 내용의 해시를 호출 기록에 남긴다. 합친 실행용 파일은 저장소 밖에서만 생성하며 커밋하지 않는다
 - ExecPlan의 Worker·Reviewer·재시도·fallback은 같은 원본 버전에서 각 역할의 지침을 사용한다. 독립 planning·점검·유지보수 작업도 각 버전을 고정하고 새 작업만 최신 원본을 선택한다. 내용이 같으면 runtime SHA 변경만으로 재계획하지 않으며 새 지침이 진행 작업을 선점하지 않는다. 관련 planning 입력과 성공 결과 재사용은 역할별 원본까지 포함한 내용 해시를 사용한다. 기존 단일 Markdown snapshot은 원래 내용으로 재개하며 새 역할 지침을 덧붙이지 않는다
 - Codex의 추가 developer 지침과 Claude의 append system prompt·snapshot 기능으로 기본 지침·기존 추가 지침·프로젝트 규칙·실행 경계를 보존한다. 잘못된 원본·snapshot·저장 실패·미지원 기능·설정 충돌은 모델 실행 전에 거부한다. 버전 없는 과거 세션은 기존 작업물·session·실패 기록을 남기고 최소 문맥의 새 세션으로 복구한다
-- Loop Manager 자체 저장소의 작업 worktree에서 공통·역할별 지침 원본 파일은 현재 역할·목표의 일반 파일 권한으로 수정한다. 별도 guidance 제안·사전 승인을 요구하지 않으며 후보 편집이나 Reviewer의 diff 읽기로 실행 snapshot을 바꾸지 않는다. 변경 PR에 실제 최종 경로·변경 사실·내용·이유·영향·diff 링크를 보고하고 Manager가 누락을 보완한다
-- 새 AGENTS 제안의 Target은 루트 `AGENTS.md`, Scope는 self 저장소도 `project`다. 과거 `common` 승인·대기는 원래 대상·baseline·patch에 결합해 처리하고 적용 불가는 원래 판단 대기로 보존한다. 공통 파일로 대상을 이관하지 않는다
+- Loop Manager 자체 저장소의 작업 worktree에서 공통·역할별 지침 원본 파일은 현재 역할·목표의 일반 파일 권한으로 수정한다. 후보 편집이나 Reviewer의 diff 읽기로 실행 snapshot을 바꾸지 않는다. 변경 PR에 실제 최종 경로·변경 사실·내용·이유·영향·diff 링크를 보고하고 Manager가 누락을 보완한다
 - 프로젝트로 복제하는 Specification Skill에는 PRODUCT·ARCHITECTURE·Requirement·FUTURE_IDEAS 작성·검토에 필요한 내용만 둔다. 계획 생성·상태 전이·호출·게시·보관 판정 등 Manager 내부 절차는 제품·설계 문서에서 정의한다. 보관 Requirement의 읽기 전용 범위와 새 변경의 신규 Requirement 작성 기준은 Skill에 유지한다
-- 준비 도구는 기존 일반 파일 AGENTS를 byte 그대로 보존하고 새 AGENTS에는 프로젝트 전용 개발 안내와 Specification Skill 참조만 작성한다. 루트 AGENTS에는 Loop Manager 개발에 필요한 작업 지침만 두고 제품 규칙·명세·코드 구조·실행 방법을 반복하지 않는다. 필수 문서 검사는 기존 등록·계획 입력 경계에서 유지한다. 다른 덮어쓰기·경로 보호는 유지하며 기존 프로젝트의 공통 본문을 자동 제거하지 않는다
+- 준비 도구는 Specification Skill·문서 템플릿·기본 명세와 작업 폴더를 준비한다. 이 저장소 루트 AGENTS에는 Loop Manager 개발 지침만 둔다.
 - 직접 작업·대화형 Agent의 로컬 구현은 사용자 요청의 Requirement를 먼저 작성·갱신하거나 충분한 기존 활성 Requirement를 재사용하고 ExecPlan을 만들지 않는다. 자동 Worker 역할·SQLite 전이·자동 완료 절차도 요구하지 않는다. ExecPlan 생성·계획 작성은 매니저가 호출하는 Planner의 자동 흐름이 담당한다. 직접 구현과 활성 Requirement의 원격 반영 후 실제 미충족 작업만 재점검하며 소급·중복 계획·자동 검증 성공 합성을 하지 않는다. 자동 작업의 ExecPlan·dependency·검증·사용자 Merge gate는 유지한다
 
 ### 수동 명령의 준비와 수락

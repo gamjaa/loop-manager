@@ -67,7 +67,7 @@ PR #138은 Loop Manager 자체 unittest용 구현을 준비했으며 아직 Merg
 - 여러 ExecPlan·Worker의 동일 프로젝트 동시 실행 또는 여러 호스트·Manager 인스턴스·단독 runner 사이의 예약 공유.
 - 새 상주 서비스·외부 모니터링·범용 작업 DAG·adapter 배포 marketplace·새 sandbox infrastructure.
 - 기존 전체 검증 축소, 필수 테스트 skip, 자동 timeout 증가, 특정 절감률·프로세스의 CPU 사용량에 대한 새로운 OS 강제 제한 보장.
-- 프로젝트 AGENTS 변경 승인, Git·게시·Review·Merge 경계의 완화.
+- Git·게시·Review·Merge 경계의 완화.
 
 ## Open Questions
 

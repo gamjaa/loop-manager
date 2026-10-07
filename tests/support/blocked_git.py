@@ -347,7 +347,8 @@ class CheckpointGitRecoveryFixture(BlockedGitFixture):
                 self.run_git(self.worktree, 'diff', '--cached', '--name-only'), '',
             )
         if tamper:
-            (self.worktree / 'AGENTS.md').write_text('unexpected scope edit\n')
+            (self.worktree / 'docs/requirements').mkdir(parents=True, exist_ok=True)
+            (self.worktree / 'docs/requirements/Unexpected.md').write_text('unexpected scope edit\n')
         if tamper_preserved:
             (self.worktree / 'dependency.py').write_text('changed after rebase\n')
         resumed = loop_manager.resume_blocked_execplan_if_inputs_changed(
@@ -498,62 +499,14 @@ class CheckpointGitRecoveryFixture(BlockedGitFixture):
             "worker", self.worktree, before, loop_manager.capture_git_snapshot(self.worktree),
             selected_plan_path=plan_path,
         )
-        document = loop_manager._guidance_document(self.worktree, plan_path)
-        with mock.patch("loop_manager.is_loop_manager_repository", return_value=False):
-            loop_manager._block_for_new_guidance(
-                self.connection, self.repo, repo, self.worktree, plan,
-                document, document.proposals, "proposal recorded",
-            )
+        after = loop_manager.capture_git_snapshot(self.worktree)
+        loop_manager.update_project(self.connection, repo, agent_result_snapshot=after.serialize())
+        runtime_state.RuntimeStateRepository(self.connection).block_plan(
+            repo, str(plan['plan_id']), reason_code=loop_manager.GUIDANCE_BLOCK_REASON,
+            evidence='historical wait', release_fingerprint='historical-document',
+            plan_values={'guidance_plan_hash': 'historical-document'},
+        )
         return repo, plan_path, text
-
-
-    def _assert_guidance_checkpoint_tree_and_restart(self, *, implementation_changes):
-        repo, plan_path, _ = self.prepare_guidance_block(
-            implementation_changes=implementation_changes,
-        )
-        with mock.patch("loop_manager.pr_for_branch", return_value=None):
-            self.assertEqual(loop_manager.dispatch_blocked_checkpoints(
-                self.connection, self.repo, self.state_dir, repo,
-            ), 1)
-        oid = self.run_git(self.worktree, "rev-parse", "HEAD")
-        paths = set(self.run_git(
-            self.worktree, "diff-tree", "--no-commit-id", "--name-only", "-r", oid,
-        ).splitlines())
-        expected = {plan_path}
-        if implementation_changes:
-            expected.update(("code.py", "tests/test_app.py"))
-        self.assertEqual(paths, expected)
-        self.assertEqual(
-            set(self.run_git(self.worktree, "ls-tree", "-r", "--name-only", oid).splitlines())
-            - set(self.run_git(self.worktree, "ls-tree", "-r", "--name-only", self.base_oid).splitlines()),
-            ({"AGENTS.md", "tests/test_app.py"} if implementation_changes
-             else {"AGENTS.md"}),
-        )
-        notified = self.connection.execute(
-            "SELECT count(*) FROM notification_outbox WHERE event_type = 'blocked'",
-        ).fetchone()[0]
-        restored = sqlite3.connect(":memory:")
-        restored.row_factory = sqlite3.Row
-        self.connection.backup(restored)
-        self.addCleanup(restored.close)
-        self.assertEqual(
-            loop_manager.validate_persisted_agent_scope(
-                restored, self.repo, self.state_dir, repo,
-            ).head,
-            oid,
-        )
-        with mock.patch("loop_manager.pr_for_branch", return_value=None) as lookup:
-            self.assertEqual(loop_manager.dispatch_blocked_checkpoints(
-                restored, self.repo, self.state_dir, repo,
-            ), 0)
-        lookup.assert_not_called()
-        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"), oid)
-        self.assertEqual(restored.execute(
-            "SELECT count(*) FROM notification_outbox WHERE event_type = 'blocked'",
-        ).fetchone()[0], notified)
-        self.assertEqual(restored.execute(
-            "SELECT blocked_reason FROM exec_plans WHERE plan_id = 'G-034'",
-        ).fetchone()[0], loop_manager.GUIDANCE_BLOCK_REASON)
 
 
     def _advance_base_remote(self):
@@ -566,38 +519,3 @@ class CheckpointGitRecoveryFixture(BlockedGitFixture):
         self.run_git(other, "commit", "-m", "advance base")
         self.run_git(other, "push", "origin", "main")
         return self.run_git(other, "rev-parse", "HEAD")
-
-
-    def _induce_guidance_double_block(self, *, decide=False):
-        repo, plan_path, text = self.prepare_guidance_block()
-        with mock.patch("loop_manager.pr_for_branch", return_value=None):
-            loop_manager.dispatch_blocked_checkpoints(
-                self.connection, self.repo, self.state_dir, repo,
-            )
-        oid = self.run_git(self.worktree, "rev-parse", "HEAD")
-        if decide:
-            (self.worktree / plan_path).write_text(
-                text.replace("Decision: `pending`", "Decision: `reject`")
-                .replace("Revision: ``", "Revision: `user-1`"),
-            )
-        with self.connection:
-            self.connection.execute(
-                "UPDATE exec_plans SET blocked_reason = 'managed_worktree_scope_violation'"
-            )
-            self.connection.execute(
-                "UPDATE execplan_blocks SET reason_code = 'managed_worktree_scope_violation', "
-                "evidence = 'false positive'"
-            )
-            blocked_checkpoint_state.BlockedCheckpointRepository(self.connection).request(
-                repo=repo, plan_id="G-034",
-                reason_code="managed_worktree_scope_violation",
-                evidence="false positive", branch="loop-manager/G-034",
-                worktree=str(self.worktree), expected_remote_oid=None,
-                rebase_recovery=False,
-            )
-            scoped_blocking.record_project_block(
-                self.connection, repo, BlockReasonCode.SHARED_REF_MUTATION,
-                "Agent 범위 선검증 실패: checkpoint ref", None,
-                plan_id="G-034", previous_phase="PLAN_BLOCKED",
-            )
-        return repo, oid

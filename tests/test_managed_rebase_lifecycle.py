@@ -347,7 +347,6 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             effects.agent.path_signature.side_effect = lm._path_signature
             effects.agent.begin_agent_scope.side_effect = lambda _repo, path, *_a, **_k: lm.capture_git_snapshot(path)
             effects.agent.validate_agent_scope.side_effect = lm.validate_agent_scope
-            effects.agent._guidance_worker_targets.return_value = ()
             effects.publication.pr_for_branch.return_value = (
                 {'state': 'OPEN', 'headRefOid': original, 'url': 'https://example.test/pr/47',
                  'headRefName': branch, 'baseRefName': 'main'}
