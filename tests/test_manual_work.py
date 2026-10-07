@@ -11,32 +11,12 @@ import loop_manager
 from loop_manager_internal.application.manual_work import ManualWorkService, ManualWorkError, validate_options
 from loop_manager_internal.execution.manual_candidate import ManualCandidate
 from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
-from tests.support.workspace import WorkspaceFixture
+from tests.support.manual_work import ManualWorkFixture, completion, generated
 from tests.support.git import git_command
 from types import SimpleNamespace
 
 
-def completion(plan_id='G-012', **values):
-    return argparse.Namespace(plan_id=plan_id,skip_verify=False,skip_review=False,
-                              expected_head=None,skip_reason=None,**values)
-
-
-def generated(title, source='docs/requirements/Active.md', depends_on=(), identity='draft-1'):
-    return {'id':identity,'title':title,'sources':[source],'depends_on':list(depends_on),
-        'complexity':'medium','risk':'medium','priority':'normal',
-        'body':'\n\n'.join(f'## {section}\n\nConcrete requirement and implementation checks.'
-            for section in ('Purpose','Acceptance Criteria','Implementation','Validation','Progress','Decision Log'))}
-
-
-class ManualWorkTest(WorkspaceFixture, unittest.TestCase):
-    def fixture(self, directory):
-        repo,state,connection,plan,sha,branch,worktree=self._ready_execplan(directory)
-        connection.execute('UPDATE projects SET registered=1 WHERE repo=?',(str(repo),))
-        connection.commit()
-        effects=replace(loop_manager._manual_work_effects(),validate_repository=mock.Mock(),
-                        run_project=mock.Mock(),generate_plans=mock.Mock(),operation_print=mock.Mock())
-        return ManualWorkService(effects,connection,state,repo,Path('unused.ini')),branch,worktree
-
+class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
     def test_options_require_exact_head_and_reason_independently(self):
         for values in ({'skip_verify':True},{'skip_review':True},{'skip_reason':'external'},
                        {'expected_head':'main'},{'expected_head':'a'*12}):
@@ -318,7 +298,7 @@ class ManualWorkTest(WorkspaceFixture, unittest.TestCase):
             self.assertNotEqual(group['prepared_head'],sha)
             rows=service.connection.execute('SELECT status,branch FROM exec_plans WHERE plan_id IN (?,?)',
                 tuple(json.loads(group['members']))).fetchall()
-            self.assertEqual(sum(row['status']=='VERIFYING' for row in rows),1)
+            self.assertEqual({row['status'] for row in rows},{'MANUAL_PENDING'})
             self.assertEqual({row['branch'] for row in rows},{group['branch']})
             self.assertFalse(any(row['status']=='READY' for row in rows))
             result=loop_manager.reconcile_execplan_catalog(service.connection,service.repo_path,service.repo,'main')
@@ -680,7 +660,8 @@ class ManualWorkTest(WorkspaceFixture, unittest.TestCase):
             git_command(user,'push','origin','source')
             incoming=git_command(user,'rev-parse','HEAD')
             service.submit(args)
-            self.assertEqual(service.store.for_source(service.repo,'source',args.requirement)['pending_source_head'],incoming)
+            self.assertIsNone(service.store.for_source(service.repo,'source',args.requirement)['pending_source_head'])
+            self.assertEqual(service.store.for_source(service.repo,'source',args.requirement)['source_head'],incoming)
             service.runtime.transition_and_clear(service.repo,original['owner_id'],plan_values={'status':'MANUAL_PENDING'},enqueue=False)
             service.resume()
             current=service.store.for_source(service.repo,'source',args.requirement)

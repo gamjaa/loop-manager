@@ -31,10 +31,11 @@ def is_lock_contention(error: OSError) -> bool:
 
 
 @contextlib.contextmanager
-def process_lock(state_dir: Path, *, identity: str = "0"):
-    # ponytail: 부트스트랩은 전역 직렬화한다. 실제 병렬 처리 도입 시 프로젝트별 잠금으로 교체한다.
+def process_lock(state_dir: Path, *, identity: str = "0", name: str = "loop-manager.lock"):
+    if Path(name).name != name or name in {".", ".."}:
+        raise ValueError("잠금 파일 이름이 유효하지 않습니다.")
     state_dir.mkdir(parents=True, exist_ok=True)
-    lock_path = state_dir / "loop-manager.lock"
+    lock_path = state_dir / name
     handle = os.fdopen(os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600), "r+b")
     handle.seek(0)
     try:
@@ -76,9 +77,9 @@ def _write_process_lock_identity(handle, identity: str) -> None:
     os.fsync(handle.fileno())
 
 
-def _held_process_lock_identity(state_dir: Path) -> str:
+def _held_process_lock_identity(state_dir: Path, *, name: str = "loop-manager.lock") -> str:
     """Read the parent lease only after proving another process still holds it."""
-    with (state_dir / "loop-manager.lock").open("r+b", buffering=0) as handle:
+    with (state_dir / name).open("r+b", buffering=0) as handle:
         handle.seek(1 if os.name == "nt" else 0)
         identity = handle.read(128).decode("ascii", errors="replace")
         handle.seek(0)

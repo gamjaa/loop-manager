@@ -52,10 +52,11 @@ class BootstrapService:
         state_dir: Path,
         runtime: Path,
         commit_sha: str,
+        *, command_id: str | None = None,
     ) -> None:
         """Prove that an existing runtime is the clean detached worktree we own."""
 
-        expected = expected_runtime_worktree(state_dir, source, commit_sha)
+        expected = expected_runtime_worktree(state_dir, source, commit_sha, command_id=command_id)
         self.effects._validate_managed_path_boundary(state_dir, runtime, expected, "runtime worktree")
         self.effects.validate_managed_worktree(source, runtime, None)
         head = self.effects.git(runtime, "rev-parse", "HEAD").stdout.strip()
@@ -177,14 +178,15 @@ class BootstrapService:
 
     def prepare_runtime_worktree(self,
         source: Path, state_dir: Path, *, mutation_id: str | None = None,
-        commit_sha: str | None = None,
+        commit_sha: str | None = None, concurrent: bool = False,
     ) -> RuntimeWorktree:
         """Select an immutable linked runtime worktree at a fetched commit."""
 
         source = _canonical_path(source)
         if commit_sha is None:
             _, commit_sha = self.fetch_bootstrap_revision(source, state_dir)
-        runtime = expected_runtime_worktree(state_dir, source, commit_sha)
+        runtime = expected_runtime_worktree(state_dir, source, commit_sha,
+            command_id=mutation_id if concurrent else None)
         self.effects._validate_managed_path_boundary(
             state_dir,
             runtime,
@@ -204,7 +206,7 @@ class BootstrapService:
         )
         if (removal_slot / "active.json").exists():
             self.remove_runtime_worktree(
-                source, state_dir, RuntimeWorktree(runtime, commit_sha, mutation_id),
+                source, state_dir, RuntimeWorktree(runtime, commit_sha, mutation_id, concurrent),
             )
         if mutation_id is not None:
             manager_git_journal.recover_active(
@@ -219,7 +221,8 @@ class BootstrapService:
                 raise WorkspaceOwnershipError(
                     f"runtime 경로가 디렉터리가 아닙니다: {runtime}"
                 )
-            self.validate_runtime_worktree(source, state_dir, runtime, commit_sha)
+            self.validate_runtime_worktree(source, state_dir, runtime, commit_sha,
+                command_id=mutation_id if concurrent else None)
             if mutation_id is not None:
                 record = self._runtime_catalog_record(source, runtime)
                 lock_reason = record.get("locked")
@@ -235,11 +238,13 @@ class BootstrapService:
                         raise WorkspaceOwnershipError(f"runtime 등록 증거가 유효하지 않습니다: {runtime}")
                 else:
                     _validate_legacy_runtime_adoption(state_dir, source, runtime, commit_sha)
+                if lock_reason == f"loop-manager-runtime:{mutation_id}":
+                    return RuntimeWorktree(runtime, commit_sha, mutation_id, concurrent)
                 _write_runtime_intent(
                     state_dir, mutation_id, source, runtime, commit_sha,
                     created=False, lock_reason=lock_reason if isinstance(lock_reason, str) else None,
                 )
-            return RuntimeWorktree(runtime, commit_sha, mutation_id)
+            return RuntimeWorktree(runtime, commit_sha, mutation_id, concurrent)
 
         expected_path = _canonical_path(runtime)
         registered = next(
@@ -274,7 +279,8 @@ class BootstrapService:
                 )
                 self.effects.git(source, "worktree", "add", "--detach", "--lock",
                     f"--reason={lock_reason}", str(runtime), commit_sha)
-                self.validate_runtime_worktree(source, state_dir, runtime, commit_sha)
+                self.validate_runtime_worktree(source, state_dir, runtime, commit_sha,
+                    command_id=mutation_id if concurrent else None)
 
             manager_git_journal.execute(
                 state_dir, owner="bootstrap", kind="runtime_create",
@@ -286,8 +292,9 @@ class BootstrapService:
             )
         else:
             self.effects.git(source, "worktree", "add", "--detach", str(runtime), commit_sha)
-        self.validate_runtime_worktree(source, state_dir, runtime, commit_sha)
-        return RuntimeWorktree(runtime, commit_sha, mutation_id)
+        self.validate_runtime_worktree(source, state_dir, runtime, commit_sha,
+            command_id=mutation_id if concurrent else None)
+        return RuntimeWorktree(runtime, commit_sha, mutation_id, concurrent)
 
 
     def remove_runtime_worktree(self,
@@ -302,7 +309,8 @@ class BootstrapService:
         path = runtime.path
         sha = runtime.commit_sha
         self.effects._validate_managed_path_boundary(
-            state_dir, path, expected_runtime_worktree(state_dir, source, sha),
+            state_dir, path, expected_runtime_worktree(state_dir, source, sha,
+                command_id=runtime.mutation_id if runtime.concurrent else None),
             "runtime worktree",
         )
         receipts = state_dir / "runtime-removals"
@@ -319,7 +327,8 @@ class BootstrapService:
             observe=lambda: self._runtime_transition_state(source, path), marker=marker,
         ):
             return
-        self.validate_runtime_worktree(source, state_dir, path, sha)
+        self.validate_runtime_worktree(source, state_dir, path, sha,
+            command_id=runtime.mutation_id if runtime.concurrent else None)
         before = self._runtime_transition_state(source, path)
         lock_reason = before["registration"]["locked"]
         self._validate_runtime_lock_origin(state_dir, source, path, sha, lock_reason)
@@ -330,7 +339,8 @@ class BootstrapService:
         manager_git_journal._sync_directory(state_dir)
 
         def apply(token: str) -> None:
-            self.validate_runtime_worktree(source, state_dir, path, sha)
+            self.validate_runtime_worktree(source, state_dir, path, sha,
+                command_id=runtime.mutation_id if runtime.concurrent else None)
             if self._runtime_transition_state(source, path) != before or self.effects._ignored_worktree_paths(path):
                 raise WorkspaceOwnershipError("runtime 정리 직전 상태가 변경됐습니다.")
             self.effects.git(source, "worktree", "unlock", str(path))
@@ -405,6 +415,7 @@ class BootstrapService:
 
     def prepare_bootstrap_runtime(self,
         source: Path, state_dir: Path, mutation_id: str,
+        *, concurrent: bool = False,
     ) -> RuntimeWorktree:
         """Select remote code independently of best-effort source synchronization.
 
@@ -413,6 +424,12 @@ class BootstrapService:
         """
 
         base, sha = self.fetch_bootstrap_revision(source, state_dir)
+        if concurrent:
+            runtime = self.prepare_runtime_worktree(
+                source, state_dir, mutation_id=mutation_id, commit_sha=sha, concurrent=True,
+            )
+            self.validate_bootstrap_revision(source, base, sha)
+            return runtime
         try:
             result = self.effects.synchronize_base_worktree(
                 source, base, remote_sha=sha, state_dir=state_dir, owner="bootstrap",
@@ -468,18 +485,25 @@ class BootstrapService:
         source: Path,
         state_dir: Path,
         commit_sha: str,
+        *, command_id: str | None = None,
     ) -> None:
-        self.validate_runtime_worktree(source, state_dir, self.runtime_root, commit_sha)
+        self.validate_runtime_worktree(source, state_dir, self.runtime_root, commit_sha,
+            command_id=command_id)
 
 
     def validate_runtime_mutation(self,
         source: Path, state_dir: Path, sha: str, mutation_id: str | None,
+        *, concurrent: bool = False,
     ) -> RuntimeMutation:
         """Bind a child invocation to the held parent lock and actual Git runtime."""
-        runtime = expected_runtime_worktree(state_dir, source, sha)
+        if concurrent and mutation_id is None:
+            raise RuntimeError("수동 runtime에는 고유 mutation ID가 필요합니다.")
+        runtime = expected_runtime_worktree(state_dir, source, sha,
+            command_id=mutation_id if concurrent else None)
         if _canonical_path(self.runtime_root) != _canonical_path(runtime):
             raise RuntimeError(f"runtime 경로가 선택한 SHA와 다릅니다: {self.runtime_root} (expected {runtime})")
-        identity = _held_process_lock_identity(state_dir)
+        identity = _held_process_lock_identity(state_dir,
+            name=f"manual-{mutation_id}.lock" if concurrent else "loop-manager.lock")
         if mutation_id is None:
             if identity != "0":
                 raise RuntimeError("mutation ID가 없는 새 형식 runtime 호출은 허용되지 않습니다.")
@@ -498,7 +522,8 @@ class BootstrapService:
                 f"runtime SHA가 현재 origin/{base}와 다릅니다: "
                 f"{sha} (origin/{base} {origin_sha})"
             )
-        self.validate_runtime_worktree(source, state_dir, runtime, sha)
+        self.validate_runtime_worktree(source, state_dir, runtime, sha,
+            command_id=mutation_id if concurrent else None)
         lock_reason = self._validated_runtime_registration_marker(
             source, state_dir, runtime, sha, mutation_id,
             legacy=legacy, record_legacy_adoption=True,
@@ -507,4 +532,4 @@ class BootstrapService:
             f"runtime mutation 검증: path={runtime} sha={sha} "
             f"mode={'legacy' if legacy else 'owned'}"
         )
-        return RuntimeMutation(source, runtime, sha, mutation_id, legacy, lock_reason)
+        return RuntimeMutation(source, runtime, sha, mutation_id, legacy, lock_reason, concurrent)

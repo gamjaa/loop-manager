@@ -24,13 +24,13 @@
 - Worker가 구현·관련 테스트·전체 검증 스크립트를 작성하고, 프로그램이 전체 검증과 독립 Review를 실행한다. 실패는 기존 작업에서 교정한다.
 - 검증된 작업으로 PR을 생성하고 사용자 Merge를 기다린다.
 - 전체 충족이 확인된 Requirement는 일반 planning 게시에서, MERGED ExecPlan은 별도 정리 commit에서 자동 archive한다.
-- 같은 프로젝트의 변경은 직렬로, 다른 프로젝트는 설정한 동시 실행 수 안에서 병렬로 처리한다.
+- 같은 프로젝트의 자동 변경은 직렬로, 다른 프로젝트는 설정한 동시 실행 수 안에서 병렬로 처리한다. 자원이 충돌하지 않는 수동 명령의 준비는 자동 실행 중에도 수행한다.
 - 변경되지 않은 입력에서는 Planner를 반복 호출하지 않는다.
 - PR 생성·차단·프로젝트 완료를 Telegram으로 알린다.
 
 ### Non-Goals
 
-- 같은 프로젝트 안의 병렬 작업
+- 같은 프로젝트 안의 자동 변경 작업 병렬 실행
 - 자동 Merge
 - 내장 스케줄러
 - 지정된 이벤트 외 실시간 상태 알림
@@ -47,7 +47,7 @@
 - 실패·중단·차단 시 작업물·session·진단을 보존한다. 원인과 안전 조건이 실제로 해소된 작업만 재개한다.
 - 최종 후보의 관련 테스트·전체 검증·독립 Review가 성공해야 PR을 생성한다. 연결 PR의 실제 Merge만 MERGED와 완료의 근거다.
 - 사용자 변경을 승인 없이 삭제하거나 덮어쓰지 않는다. 정리 안전성을 확인할 수 없는 worktree는 보존한다.
-- 같은 사용자 상태 디렉터리에서는 Loop Manager 실행을 하나만 허용한다.
+- 같은 사용자 상태 디렉터리에서는 자동 실행을 하나만 허용한다. 수동 명령의 준비는 계획과 실제 자원의 소유권을 원자적으로 확인·예약한 뒤 동시에 수행할 수 있다.
 - 동일한 PR·차단·완료 사건은 중복 통지하지 않는다.
 
 문서 입력·등록·작업 선택·실패·게시의 상세 정책은 아래 해당 절에서 정의한다. 저장·검증·Git 적용 방식은 [ARCHITECTURE.md](ARCHITECTURE.md), ExecPlan 형식은 [PLANS.md](PLANS.md), 설치와 실행은 [README.md](../README.md)를 따른다.
@@ -277,7 +277,7 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 - 기본 worktree의 로컬 변경, checkout branch와 ahead·diverged 이력은 자동 작업을 막지 않으며 local-only 내용은 자동 입력에 포함하지 않는다
 
 - 기본 worktree는 equal이면 무변경, ahead이면 보존·skip, behind이면 disjoint 로컬 변경과 index·ignored 파일을 보존하는 safe fast-forward로 처리한다. clean diverged의 확인된 선형 로컬 commit은 durable intent 아래 원격 base 위로 rebase하며 자동 push하지 않는다. dirty 작업·merge commit·겹치는 ignored 경로·사용자 operation·소유권 불확실은 보존·skip한다. 실패·중단에서 소유 작업과 실제 ref·index·파일이 일치할 때만 복구하고 동일 입력의 실패 Git 쓰기를 반복하지 않는다.
-- bootstrap은 process lock 아래 등록된 self base(미등록이면 `main`)의 원격 SHA를 확정하고 그 revision의 bootstrap·runtime을 같은 실행에서 시작한다. source HEAD·branch·동기화 성공은 실행 조건이 아니며 로컬 코드를 실행 입력으로 사용하지 않는다. source 기준 절대 config 경로·interpreter·인자를 전달하고 자식 종료까지 부모 lock을 유지한다. 원격 revision·runtime 소유권 검증 실패는 보존·진단하며 로컬 HEAD나 오래된 코드로 대체 실행하지 않는다.
+- 자동 명령의 bootstrap은 process lock 아래 등록된 self base(미등록이면 `main`)의 원격 SHA를 확정하고 그 revision의 bootstrap·runtime을 같은 실행에서 시작한다. source HEAD·branch·동기화 성공은 실행 조건이 아니며 로컬 코드를 실행 입력으로 사용하지 않는다. source 기준 절대 config 경로·interpreter·인자를 전달하고 자식 종료까지 부모 lock을 유지한다. 원격 revision·runtime 소유권 검증 실패는 보존·진단하며 로컬 HEAD나 오래된 코드로 대체 실행하지 않는다.
 
 - Loop Manager가 만드는 계획과 구현 변경은 대상 프로젝트 밖의 Loop Manager 관리 경로에 만든 별도 worktree와 branch에만 기록한다
 - 자동 실행 중 기본 worktree에서는 위의 safe fast-forward와 소유권·로컬 commit 보존이 검증된 rebase·abort 외에 checkout, pull, reset, stash, clean, commit과 파일 생성을 수행하지 않는다
@@ -291,6 +291,14 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 - 새 AGENTS 제안의 Target은 루트 `AGENTS.md`, Scope는 self 저장소도 `project`다. 과거 `common` 승인·대기는 원래 대상·baseline·patch에 결합해 처리하고 적용 불가는 원래 판단 대기로 보존한다. 공통 파일로 대상을 이관하지 않는다
 - 준비 도구는 기존 일반 파일 AGENTS를 byte 그대로 보존하고 새 AGENTS에는 프로젝트 규칙·Requirement 우선·필수 문서 안내만 작성한다. 다른 덮어쓰기·경로 보호는 유지하며 기존 프로젝트의 공통 본문을 자동 제거하지 않는다
 - 직접 작업·대화형 Agent의 로컬 구현에는 자동 Worker 역할·SQLite 전이·ExecPlan 선작성·자동 완료 절차를 요구하지 않는다. 새 기능·정책은 양쪽 모두 Requirement에서 시작한다. 직접 구현과 활성 Requirement의 원격 반영 후 기존 Planner가 실제 미충족 작업만 재점검하며 소급·중복 계획·자동 검증 성공 합성을 하지 않는다. 자동 작업의 ExecPlan·dependency·검증·사용자 Merge gate는 유지한다
+
+### 수동 명령의 준비와 수락
+
+`manual start`는 선행 계획의 실제 원격 Merge와 승인·차단·유지보수 조건을 확인하고, 계획 및 작업 자원이 충돌하지 않으면 같은 명령에서 소유 브랜치·워크트리 생성과 원격 푸시를 완료한다. 자동 매니저나 독립된 계획의 실행 여부만으로 준비를 거부하지 않는다. `complete/submit`의 후보 확인·추적 계획 등록·소유 작업 공간 준비도 이 원칙을 따른다.
+
+실행 중인 동일 계획, 겹치는 브랜치·워크트리·게시 대상, Planner 게시 예약과 미완료 Git 작업은 충돌 자원과 소유자를 설명하며 거부한다. 거부된 충돌 요청을 자동 대기 제출로 바꾸지 않는다. 충돌 확인과 소유 예약은 Worker 선택·Planner 게시·다른 수동 명령과 원자적으로 조율하며, 준비 중단 시 저장된 소유권과 작업물을 보존한다. 명령마다 원격 커밋에 고정된 별도 런타임을 사용하고 자기 작업 공간만 정리한다.
+
+수동 구현 대기와 완료·제출 수락 이후의 자동 처리는 구분한다. 수락된 제출은 기존 프로젝트 실행에서 저장소 준비, catalog 확인·정리, 기존 PR 상태 동기화 뒤 실행 자리가 비었을 때 등록 순서로 재개한다. 그 뒤 기존 실행 재개와 일반 coordinator 순서를 유지하며 dependency·차단·유지보수 조건을 통과해야 한다. 별도의 최우선 처리나 현재 작업 종료 직후 즉시 검토를 보장하지 않는다.
 
 ### 작업 선택과 동시 실행
 

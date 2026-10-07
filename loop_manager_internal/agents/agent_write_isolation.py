@@ -103,6 +103,19 @@ def _inspect_read_only_runtime(selected: Path, state_root: Path, source: Path) -
     head = _git(selected, "rev-parse", "HEAD")
     repository_id = sha256(str(source).encode()).hexdigest()[:16]
     expected = state_root / "runtimes" / repository_id / head
+    if selected.parent.parent.name == 'commands':
+        from loop_manager_internal.runtime.runtime_identity import expected_runtime_worktree, _read_runtime_intent
+        mutation_id = selected.parent.name
+        try:
+            expected = expected_runtime_worktree(state_root, source, head, command_id=mutation_id)
+            created, reason = _read_runtime_intent(state_root, mutation_id, source, selected, head)
+            records = _git(source, 'worktree', 'list', '--porcelain').split('\n\n')
+            marker = next((record.splitlines() for record in records
+                           if record.startswith('worktree ' + str(selected) + '\n')), ())
+            if not created or reason != 'loop-manager-runtime:' + mutation_id or 'locked ' + reason not in marker:
+                raise IsolationError('수동 runtime의 durable 소유 표식이 다릅니다.')
+        except (RuntimeError, OSError) as error:
+            raise IsolationError('수동 runtime의 durable 소유권을 확인할 수 없습니다.') from error
     if (len(head) not in (40, 64) or any(char not in "0123456789abcdef" for char in head)
             or selected != expected
             or _git(selected, "rev-parse", "--abbrev-ref", "HEAD") != "HEAD"

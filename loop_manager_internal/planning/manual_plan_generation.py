@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 from collections.abc import Callable
 import json
+import hashlib
 
 from loop_manager_internal.agents.agent_invocation import InvocationContext
 
@@ -10,6 +11,8 @@ from loop_manager_internal.agents.agent_invocation import InvocationContext
 class ManualGenerationEffects:
     git: Callable
     run_agent: Callable
+    prepare_worktree: Callable
+    remove_worktree: Callable
 
 
 def generate(effects, connection, repo, state_dir, config_path, provider, group, requirements):
@@ -43,9 +46,15 @@ def generate(effects, connection, repo, state_dir, config_path, provider, group,
         +json.dumps({'source_head':group['source_head'],'base':group['base_sha'],
                     'requirements':requirements,'guidance':guidance,'catalog':existing,'reserved':reserved,
                     'diff_stat':diff,'implementation_diff':implementation},ensure_ascii=False))
-    result=effects.run_agent(provider,repo,state_dir,config_path,'planner',prompt,read_only=True,
+    mutation_id=hashlib.sha256((group['group_id']+group['source_head']).encode()).hexdigest()[:32]
+    runtime=effects.prepare_worktree(repo,state_dir,mutation_id=mutation_id,
+                                    commit_sha=group['source_head'],concurrent=True)
+    result=effects.run_agent(provider,runtime.path,state_dir,config_path,'planner',prompt,read_only=True,
                             connection=connection,invocation=InvocationContext(str(repo),None,
                                 task_id='manual-submit:'+group['group_id']))
+    # Interrupted/unknown Agents retain their runtime; only an observed return
+    # reaches the clean, non-forced removal boundary.
+    effects.remove_worktree(repo,state_dir,runtime)
     code,message=result
     if code:
         raise RuntimeError('수동 제출 G 생성 Planner가 실패했습니다. 제출 intent는 보존됐습니다.')

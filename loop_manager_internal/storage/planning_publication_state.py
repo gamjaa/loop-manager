@@ -70,7 +70,8 @@ def record_general_planning_publication(
         publication.manifest_hash,
         publication.manifest,
     )
-    with connection:
+    from .runtime_state import _transaction
+    with _transaction(connection):
         if (
             not isinstance(publication.manifest, str)
             or not isinstance(publication.manifest_hash, str)

@@ -226,17 +226,24 @@ class InvocationRepository:
                     SET status = 'invalidated', reason = 'agent_attempt_not_successful'
                     WHERE invocation_id = ? AND status IN ('verified', 'prepared')""", (identity,))
 
-    def reconcile_interrupted(self) -> int:
-        with self.connection:
-            self.connection.execute("""UPDATE agent_isolation_evidence
-                SET status = 'invalidated', reason = 'agent_attempt_interrupted'
-                WHERE status IN ('verified', 'prepared') AND invocation_id IN (
-                    SELECT invocation_id FROM agent_invocations WHERE finished_at IS NULL
-                )""")
-            cursor = self.connection.execute("""UPDATE agent_invocations SET
-                finished_at = ?, result_kind = 'interrupted', collection_status = 'unknown'
-                WHERE finished_at IS NULL""", (utc_now(),))
-        return cursor.rowcount
+    def reconcile_interrupted(self, *, state_dir=None) -> int:
+        from .runtime_state import _transaction
+        from .work_claims import live_manual_tasks
+        count = 0
+        with _transaction(self.connection):
+            protected = live_manual_tasks(self.connection, state_dir) if state_dir is not None else frozenset()
+            pending = self.connection.execute(
+                'SELECT invocation_id,guidance_task_id FROM agent_invocations WHERE finished_at IS NULL').fetchall()
+            for identity, task in pending:
+                if task in protected:
+                    continue
+                self.connection.execute("""UPDATE agent_isolation_evidence
+                    SET status = 'invalidated', reason = 'agent_attempt_interrupted'
+                    WHERE status IN ('verified', 'prepared') AND invocation_id = ?""", (identity,))
+                count += self.connection.execute("""UPDATE agent_invocations SET
+                    finished_at = ?, result_kind = 'interrupted', collection_status = 'unknown'
+                    WHERE invocation_id = ? AND finished_at IS NULL""", (utc_now(),identity)).rowcount
+        return count
 
     def summary(self, repo: str) -> list[sqlite3.Row]:
         """Return comparable counters; unknown usage stays NULL."""
