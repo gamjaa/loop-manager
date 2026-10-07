@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.application.contracts import WorkerPublication
+from loop_manager_internal.agents.common_guidance import GUIDANCE_PATHS
 from pathlib import Path
 import hashlib
 import json
@@ -16,8 +17,7 @@ COMMON_REPORT_END = '<!-- loop-manager:common-guidance:end -->'
 
 def common_guidance_report(git, worktree: Path, base_sha: str, head_sha: str,
                            origin_url: str, summary: str) -> str:
-    """Report the final candidate, including renamed/deleted common files."""
-    path = "docs/AGENTS.common.md"
+    """Report the final candidate, including renamed/deleted instruction files."""
     fields = git(worktree, "diff", "--no-ext-diff", "--name-status", "-z", "--find-renames",
                  base_sha, head_sha).stdout.split("\0")
     changes, index = [], 0
@@ -27,12 +27,13 @@ def common_guidance_report(git, worktree: Path, base_sha: str, head_sha: str,
         paths = fields[index + 1:index + 1 + count]
         if len(paths) != count:
             raise RuntimeError("공통 지침 최종 diff 경로를 확인할 수 없습니다.")
-        if path in paths:
+        if any(path in GUIDANCE_PATHS for path in paths):
             changes.append((status, paths))
         index += 1 + count
     if not changes:
         return ""
     affected = list(dict.fromkeys(p for _, paths in changes for p in paths))
+    path = next(path for path in affected if path in GUIDANCE_PATHS)
     patch = git(worktree, "diff", "--no-ext-diff", "--no-textconv", "--find-renames",
                 base_sha, head_sha, "--", *affected).stdout
     url = "https://github.com/" + github_repository(origin_url)
@@ -40,12 +41,12 @@ def common_guidance_report(git, worktree: Path, base_sha: str, head_sha: str,
     fence = "`" * max(3, 1 + max((len(m[0]) for m in re.finditer(r"`+", patch)), default=0))
     return "\n".join([
         COMMON_REPORT_START,
-        "## 공통 실행 지침 변경", "",
+        "## 공통·역할별 실행 지침 변경", "",
         f"- 경로·변경 사실: {', '.join(status + ' ' + ' → '.join(paths) for status, paths in changes)}",
         f"- 이유: {summary}",
         "- 영향: Merge 뒤 새 runtime의 새 작업에 적용한다. 현재 작업의 Worker·Reviewer·재개 지침 snapshot과 프로젝트 AGENTS 승인은 보존한다.",
         f"- [최종 내용 diff]({link})", "",
-        "<details><summary>최종 후보의 공통 지침 변경 내용</summary>", "",
+        "<details><summary>최종 후보의 실행 지침 변경 내용</summary>", "",
         fence + "diff", patch.rstrip(), fence, "", "</details>", COMMON_REPORT_END,
     ])
 

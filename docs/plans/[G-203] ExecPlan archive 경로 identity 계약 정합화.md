@@ -33,7 +33,7 @@ Impact: A는 기존 구현이 이미 만족하는 부분을 유지하므로 명�
 
 - 미결정: A/B의 저장 필드·파일명·복구 해석을 선택하지 않는다. 사용자 소유 R-014·ARCHITECTURE는 Planner가 수정하지 않는다.
 - 결정 뒤 기존 `catalog/project_catalog_refresh.py`, `catalog/execplan_archive.py`, `storage/execplan_catalog_state.py`, `storage/execplan_archive_state.py` 및 `storage/catalog_migration.py`의 관측·원자 적용·재개 책임을 재사용한다. 선택에 필요한 최소 변경만 수행하며 새 상태 원본이나 루트 파일을 만들지 않는다.
-- 역할·문서·검증 권한은 AGENTS.md와 docs/PLANS.md, 설계는 ARCHITECTURE의 원격 catalog·계획 게시·MERGED ExecPlan archive 절을 따른다. R-027 감사의 원문 복원 대기는 이 계획의 구현 범위에 포함하지 않는다.
+- 자동 역할·문서·검증 권한은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙·계획 작성은 AGENTS.md·docs/PLANS.md를, 설계는 ARCHITECTURE의 원격 catalog·계획 게시·MERGED ExecPlan archive 절을 따른다. R-027 감사의 원문 복원 대기는 이 계획의 구현 범위에 포함하지 않는다.
 
 ## Validation
 

@@ -36,11 +36,7 @@ if [[ ! -e "$target/AGENTS.md" ]]; then
 # Project instructions
 
 프로젝트 전용 언어·코딩·빌드 규칙은 이 파일에 기록한다.
-새로운 기능이나 정책 변경은 Requirement에서 시작한다.
-구현 전에 존재하는 관련 문서를 확인한다:
-- docs/PRODUCT.md: 현재 제품 동작과 장기 규칙
-- docs/requirements/*.md: 원하는 변경, 이유와 Acceptance Criteria
-- docs/ARCHITECTURE.md: 시스템 설계
+문서 작성·검토 기준은 [Specification Skill](.agents/skills/specification-docs/SKILL.md)을 따른다.
 docs/PRODUCT.md 또는 활성 Requirement 중 하나는 반드시 존재해야 한다.
 GUIDANCE
     )

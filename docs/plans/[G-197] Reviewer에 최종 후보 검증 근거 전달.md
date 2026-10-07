@@ -25,10 +25,10 @@ Reviewer가 현재 후보의 Worker targeted unit test 결과와 Manager 전체 
 
 ## Implementation
 
-- agents/agent_prompts.py, execution/result_validation.py와 execution Review/verify handler의 기존 결과 파싱·후보 token·checkpoint·feedback 경계를 재사용한다. 검증된 TARGETED_TESTS와 Manager verify 근거를 compact한 검토 입력으로 연결하고, 미실행 사유만 남기는 현재 helper의 책임을 이 전달 계약에 맞춘다. 별도 Worker 반환 schema나 범용 증거 서비스를 도입하지 않는다.
+- agents/agent_prompts.py, execution/result_validation.py와 execution Review/verify handler의 기존 결과 파싱·후보 token·checkpoint·feedback 경계를 재사용한다. 검증된 TARGETED_TESTS와 Manager verify 근거를 작업별 compact한 사용자 prompt에 연결하고, 미실행 사유만 남기는 현재 helper의 책임을 이 전달 계약에 맞춘다. 읽기 전용·검증 재실행 금지 규칙은 고정된 docs/AGENTS.common.md+docs/AGENTS.reviewer.md instruction을 재사용하며 결과 전달로 권한을 확대하지 않는다. 별도 Worker 반환 schema나 범용 증거 서비스를 도입하지 않는다.
 - 실제 호출 직전 기존 진입 gate와 전달 근거의 후보를 함께 확인한다. 정상 실행·verify/Review 교정·저장 단계 재개에 같은 경계를 적용하고, 긴 출력은 판정에 필요한 command·결과·미실행 사유를 잃지 않도록 처리한다. 성공 시 Worker 재호출이나 추가 검증 실행을 결과 전달 수단으로 사용하지 않는다.
 - Merge된 `execution/manual_candidate.py`의 수동 prompt·unconfirmed targeted 표식과 실제/생략 단계 결과를 같은 전달 경계에서 유지한다. 수동 외부 입력의 성공으로 채우지 않으며 생략 identity·운영 설정 자체의 교정은 G-200에 남긴다.
-- 문서·역할·검증 권한은 AGENTS.md, docs/ARCHITECTURE.md의 검증과 재시도, docs/PLANS.md를 따른다. 관련 helper·fixture를 우선 재사용하고 지정 루트 경로를 보존한다.
+- 자동 문서·역할·검증 권한은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙·계획 작성과 검증·재시도 설계는 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 따른다. 관련 helper·fixture를 우선 재사용하고 지정 루트 경로를 보존한다.
 
 ## Validation
 

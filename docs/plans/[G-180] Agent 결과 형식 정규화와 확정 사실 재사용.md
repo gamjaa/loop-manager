@@ -26,7 +26,7 @@ priority: normal
 
 - execution/result_validation.py·planning 및 maintenance 결과 parser의 공통 정규화 책임을 필요한 최소 helper로 묶는다. 각 역할의 의미 검증과 결과 저장·범위 검사를 보존한다.
 - maintenance의 현재 code index·모듈 manifest 생성에서 객관적 사실 재작성만을 제거한다. 원본을 확인할 수 없는 결과는 보수적으로 기존 의미 판단에 남긴다.
-- 공통 경계는 AGENTS.md, docs/ARCHITECTURE.md와 docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
+- 자동 역할·권한·검증은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙·설계·계획 작성은 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
 
 ## Validation
 

@@ -1,4 +1,4 @@
-"""Resolve runtime instructions once, independently of candidate project files."""
+"""Freeze runtime common/role sources and compose provider instructions outside Git."""
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
@@ -10,11 +10,20 @@ import re
 import sqlite3
 import stat
 import subprocess
+import tempfile
 
 from loop_manager_internal.agents.agent_invocation import InvocationContext
 from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
 
 COMMON_PATH = "docs/AGENTS.common.md"
+ROLE_PATHS = {
+    "planner": "docs/AGENTS.planner.md",
+    "maintenance_planner": "docs/AGENTS.planner.md",
+    "planner_check": "docs/AGENTS.planner_check.md",
+    "worker": "docs/AGENTS.worker.md",
+    "reviewer": "docs/AGENTS.reviewer.md",
+}
+GUIDANCE_PATHS = (COMMON_PATH, *dict.fromkeys(ROLE_PATHS.values()))
 RUNTIME_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -43,8 +52,15 @@ def _read(path: Path) -> bytes:
         raise GuidanceError(f"공통 지침 읽기/UTF-8 확인 실패: {path}") from error
 
 
+def _runtime_bundle() -> bytes:
+    files = {path: _read(RUNTIME_ROOT / path).decode("utf-8") for path in GUIDANCE_PATHS}
+    return (json.dumps({"version": 1, "files": files}, ensure_ascii=False,
+                       sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
+
+
 def runtime_content_hash() -> str:
-    return hashlib.sha256(_read(RUNTIME_ROOT / COMMON_PATH)).hexdigest()
+    """Fingerprint all instructions, including roles not yet called by a task."""
+    return hashlib.sha256(_runtime_bundle()).hexdigest()
 
 
 def validate_state_root(context: InvocationContext, worktree: Path, state_dir: Path) -> None:
@@ -95,20 +111,69 @@ def independent_context(connection: sqlite3.Connection, context: InvocationConte
     return replace(context, task_id='planning:' + str(row[2])) if row[2] else context
 
 
-def load_saved(task_id: str, row, state_dir: Path) -> CommonGuidance:
+def _store_snapshot(directory: Path, contents: bytes, suffix: str) -> Path:
+    snapshot = directory / (hashlib.sha256(contents).hexdigest() + suffix)
+    # Publish complete bytes atomically; concurrent tasks may share this hash.
+    if not snapshot.exists():
+        temporary = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=directory, prefix=".guidance-", delete=False) as stream:
+                temporary = Path(stream.name)
+                stream.write(contents)
+                stream.flush()
+                os.fsync(stream.fileno())
+            try:
+                os.link(temporary, snapshot)
+            except FileExistsError:
+                pass
+        finally:
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+    if _read(snapshot) != contents:
+        raise GuidanceError("공통 지침 snapshot이 기존 내용과 다릅니다.")
+    return snapshot
+
+
+def _bundle_files(contents: bytes) -> dict[str, str]:
+    try:
+        bundle = json.loads(contents)
+        if (not isinstance(bundle, dict) or set(bundle) != {"version", "files"}
+                or type(bundle["version"]) is not int or bundle["version"] != 1
+                or not isinstance(bundle["files"], dict)
+                or set(bundle["files"]) != set(GUIDANCE_PATHS)
+                or any(not isinstance(value, str) or not value.strip() or "\0" in value
+                       for value in bundle["files"].values())):
+            raise ValueError("invalid instruction bundle")
+        for value in bundle["files"].values():
+            value.encode("utf-8")
+        return bundle["files"]
+    except (ValueError, UnicodeError, RecursionError) as error:
+        raise GuidanceError("공통·역할별 지침 snapshot 형식이 유효하지 않습니다.") from error
+
+
+def load_saved(task_id: str, row, state_dir: Path, role: str) -> CommonGuidance:
+    if role not in ROLE_PATHS:
+        raise GuidanceError(f"지원하지 않는 Agent 지침 역할입니다: {role}")
     content_hash, revision, reference = row
     if not re.fullmatch(r"[0-9a-f]{64}", str(content_hash)) or not re.fullmatch(
         r"[0-9a-f]{40}|[0-9a-f]{64}", str(revision),
     ):
         raise GuidanceError("저장된 공통 지침 hash/revision이 유효하지 않습니다.")
-    expected = state_dir.resolve() / "agent-guidance" / f"{content_hash}.md"
     path = Path(reference)
+    # Old Markdown snapshots remain authoritative for their existing tasks.
+    suffix = ".json" if path.suffix == ".json" else ".md"
+    expected = state_dir.resolve() / "agent-guidance" / (content_hash + suffix)
     if path != expected or path.resolve() != expected:
         raise GuidanceError("저장된 공통 지침 snapshot 경로가 Manager 경계와 다릅니다.")
     _check_snapshot_directory(expected.parent)
     contents = _read(path)
     if hashlib.sha256(contents).hexdigest() != content_hash:
         raise GuidanceError("저장된 공통 지침 snapshot의 내용 hash가 다릅니다.")
+    if suffix == ".json":
+        files = _bundle_files(contents)
+        contents = (files[COMMON_PATH].rstrip("\n") + "\n\n" + files[ROLE_PATHS[role]]).encode("utf-8")
+        path = _store_snapshot(expected.parent, contents, ".md")
+        content_hash = hashlib.sha256(contents).hexdigest()
     return CommonGuidance(task_id, contents.decode("utf-8"), content_hash, revision, path)
 
 
@@ -119,8 +184,10 @@ def resolve(repository: GuidanceRepository, context: InvocationContext,
         validate_state_root(context, worktree, state_dir)
         saved = repository.get(identity)
         if saved is not None:
-            return load_saved(identity, saved, state_dir)
-        contents = _read(RUNTIME_ROOT / COMMON_PATH)
+            return load_saved(identity, saved, state_dir, role)
+        if role not in ROLE_PATHS:
+            raise GuidanceError(f"지원하지 않는 Agent 지침 역할입니다: {role}")
+        contents = _runtime_bundle()
         result = subprocess.run(
             ["git", "-C", str(RUNTIME_ROOT), "rev-parse", "HEAD"],
             capture_output=True, text=True, encoding="utf-8", timeout=15, check=False,
@@ -132,19 +199,9 @@ def resolve(repository: GuidanceRepository, context: InvocationContext,
         directory = state_dir.resolve() / "agent-guidance"
         directory.mkdir(mode=0o700, parents=True, exist_ok=True)
         _check_snapshot_directory(directory)
-        snapshot = directory / f"{content_hash}.md"
-        # Exclusive creation preserves a previous snapshot after interruption.
-        try:
-            with snapshot.open("xb") as stream:
-                stream.write(contents)
-                stream.flush()
-                os.fsync(stream.fileno())
-        except FileExistsError:
-            pass
-        if _read(snapshot) != contents:
-            raise GuidanceError("공통 지침 snapshot이 기존 내용과 다릅니다.")
+        snapshot = _store_snapshot(directory, contents, ".json")
         repository.save(identity, context.repo, content_hash, revision, str(snapshot))
-        return load_saved(identity, repository.get(identity), state_dir)
+        return load_saved(identity, repository.get(identity), state_dir, role)
     except (OSError, sqlite3.Error, subprocess.SubprocessError) as error:
         raise GuidanceError("공통 지침 버전 보존 실패") from error
 

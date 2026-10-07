@@ -26,7 +26,7 @@ priority: high
 
 - guidance preapproval·실행 guidance·최종 scope 검사와 기존 승인 저장소에 request 생성/소비 lifecycle을 연결한다. 최신 기준 fingerprint와 기존 확정 결정을 별도로 보존한다.
 - R-069 parser의 정규화 identity를 사용하되 기존 결정의 의미를 추정해 새 승인으로 이식하지 않는다. 변경된 파일과 pending 자료를 보존한 채 사용자 대기로 전환한다.
-- 공통 경계는 AGENTS.md, docs/ARCHITECTURE.md와 docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
+- 자동 역할·권한·검증은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙·설계·계획 작성은 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
 
 ## Validation
 

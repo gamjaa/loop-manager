@@ -38,7 +38,6 @@ from loop_manager_internal.storage.maintenance_file_ledger import (
     FileReviewRepository, FileReviewLedgerError, ROOT_REVIEW_PATH, ROOT_REVIEW_REASON,
     root_review_source, validate_root_reviews,
 )
-from loop_manager_internal.quality.quality_guidance import AGENT_QUALITY_GUIDANCE
 
 
 MAX_EMBEDDED_SOURCE_BYTES = 48_000
@@ -311,7 +310,6 @@ def review_prompt(
             "source_revision의 원본을 git show REVISION:PATH로 확인하고 실제 사용 근거를 인용하라. "
             "확인할 수 없는 항목은 category=uncertain, destination=null과 구체적인 판단 근거를 남겨라. "
             "도구 필수 루트는 category=tool_required, destination=null로 보존하라.\n"
-            f"{AGENT_QUALITY_GUIDANCE}\n"
             "source identity: " + json.dumps({"path": source.path, "content_hash": source.content_hash,
                 "mode": source.mode, "source_revision": source.revision}, ensure_ascii=False) + "\n"
             "revision-bound root placement inventory: " + json.dumps(
@@ -359,7 +357,6 @@ def review_prompt(
             "길이만으로 개선을 강제하지 말고 읽기 쉬움, 책임과 외부 연동, 오류 복구, 테스트 경계, "
             "중복 및 후속 작업의 관련 없는 문맥 감소를 모두 평가하라. 직접 참조·유사 책임 중 "
             "나중에 확인할 후보만 pending·similar에 남기고 문맥 파일은 완료 대상으로 세지 마라.\n"
-            f"{AGENT_QUALITY_GUIDANCE}\n"
             "루트 항목의 실제 참조·사용자 경로·소유권·안전한 목적지 조사는 별도 root 조사 단위에서 기록한다. "
             "이 일반 파일 검토에서 root inventory는 문맥이며 root 전용 결과 필드를 추가하지 마라. "
             "근거가 불명확하면 이동·삭제 후보로 만들지 마라.\n"
@@ -388,7 +385,6 @@ def review_prompt(
         "책임과 외부 연동, 오류 복구, 테스트 경계, 중복 및 후속 작업의 관련 없는 문맥 "
         "감소를 각각 구체적으로 평가하라. 현재 원본에서 확인한 직접 참조·유사 책임 중 "
         "나중에 확인할 후보만 pending에 남겨라. 문맥 파일은 검토 완료 대상으로 세지 마라.\n"
-        f"{AGENT_QUALITY_GUIDANCE}\n"
         f"source identity: {source_location}\n"
         "revision-bound root placement inventory: " + root_inventory + "\n"
         "루트 항목의 실제 참조·사용자 경로·소유권·안전한 목적지 조사는 별도 root 조사 단위에서 기록한다. "

@@ -154,6 +154,8 @@ class CommonGuidanceStateTests(TestCase):
             runtime = root / 'runtime'
             (runtime / 'docs').mkdir(parents=True)
             (runtime / common_guidance.COMMON_PATH).write_text('original', encoding='utf-8')
+            for path in set(common_guidance.ROLE_PATHS.values()):
+                (runtime / path).write_text('role: ' + path, encoding='utf-8')
             database = root / 'state.db'
             context = InvocationContext('repo', 'G-147')
             with sqlite3.connect(database) as connection, mock.patch.object(common_guidance, 'RUNTIME_ROOT', runtime), \
@@ -161,12 +163,16 @@ class CommonGuidanceStateTests(TestCase):
                 repository = GuidanceRepository(connection)
                 snapshot = common_guidance.resolve(repository, context, 'worker', root / 'project', root / 'state')
                 repository.bind_session('repo', 'codex', 'session', snapshot.task_id)
-            (runtime / common_guidance.COMMON_PATH).unlink()
+            for path in common_guidance.GUIDANCE_PATHS:
+                (runtime / path).unlink()
             with sqlite3.connect(database) as restarted, mock.patch.object(common_guidance, 'RUNTIME_ROOT', runtime):
                 self.addCleanup(restarted.close)
                 repository = GuidanceRepository(restarted)
                 resumed = common_guidance.resolve(repository, context, 'reviewer', root / 'project', root / 'state')
-                self.assertEqual(resumed, snapshot)
+                self.assertEqual(resumed.task_id, snapshot.task_id)
+                self.assertEqual(resumed.source_revision, snapshot.source_revision)
+                self.assertEqual(resumed.content, 'original\n\nrole: docs/AGENTS.reviewer.md')
+                self.assertEqual(snapshot.content, 'original\n\nrole: docs/AGENTS.worker.md')
                 self.assertEqual(repository.session_task('repo', 'codex', 'session'), snapshot.task_id)
 
     def test_changed_plan_guidance_invalidates_all_candidate_result_tokens(self):

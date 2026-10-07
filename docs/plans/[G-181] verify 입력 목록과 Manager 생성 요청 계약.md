@@ -25,7 +25,7 @@ priority: high
 
 - verification의 기존 Manager adapter와 catalog source 검증·planning 요청 경계를 확장한다. 이 저장소의 runner·scripts·tests·의존성·runtime 입력을 전체 구조에서 확인해 목록을 작성한다.
 - 목록 파싱/입력 관측과 생성 요청을 분리하고 공통 runner 도입을 전제하지 않는다. 저장소 밖/동적 입력을 표준 목록으로 확인할 수 없으면 보수적으로 전체 실행을 선택한다.
-- 공통 경계는 AGENTS.md, docs/ARCHITECTURE.md와 docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
+- 자동 역할·권한·검증은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙·설계·계획 작성은 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
 
 ## Validation
 

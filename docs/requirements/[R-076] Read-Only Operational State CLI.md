@@ -117,7 +117,7 @@ python loop_manager.py [--state-dir <dir>] usage <repository> [--plan <id>] [--j
 - 각 명령의 정상·오류·JSON 경로에서 provider CLI·Git·원격 API·외부 변경 작업·알림 호출을 차단하는 fixture로 호출이 발생하지 않음을 확인한다. bootstrap·runtime 자식·에이전트·verify도 시작되지 않는다.
 - 조회 전후 DB schema와 작업·복구·호출·검증·알림 기록이 같음을 확인한다. 재시도 횟수·중단 호출·outbox·완료 기록을 포함한다. 다른 실행 프로세스가 DB를 사용하는 상황에서는 조회가 실행 잠금을 변경하지 않고 일관된 snapshot을 읽거나 유한 시간 안에 조회 오류로 종료함을 확인한다.
 - 정상·미확인·부분 수집·조회 오류에서 기본 출력과 JSON의 의미, JSON stdout 순수성, 문서화한 필드·자료형·단위와 종료 코드 계약을 확인한다.
-- 실제 provider·모델을 호출하지 않는 관련 targeted unit test와 저장소에서 요구하는 전체 검증이 통과한다. 검증 주체와 실행 범위는 AGENTS.md와 docs/PLANS.md의 기존 규칙을 따른다.
+- 실제 provider·모델을 호출하지 않는 관련 targeted unit test와 저장소에서 요구하는 전체 검증이 통과한다. 자동 검증 주체와 실행 범위는 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙·계획 작성은 AGENTS.md와 docs/PLANS.md를 따른다.
 
 ## Product Impact
 

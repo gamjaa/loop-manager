@@ -14,7 +14,7 @@ from loop_manager_internal.storage import maintenance_file_ledger
 
 
 class FileReviewPromptTest(unittest.TestCase):
-    def test_quality_guidance_preserves_single_file_review_contract(self):
+    def test_task_prompt_preserves_single_file_review_contract(self):
         for content in (b"", b"def calculate(): return 1\n",
                         b"x" * (review.MAX_EMBEDDED_SOURCE_BYTES + 1)):
             with self.subTest(size=len(content)):
@@ -24,10 +24,6 @@ class FileReviewPromptTest(unittest.TestCase):
                 )
                 prompt = review.review_prompt(source, content)
                 for phrase in (
-                    "기존 구현·공유 helper·관련 테스트와 표준 도구",
-                    "현재 목표에 필요하지 않은 추상화·설정·파일 추가",
-                    "오류 처리·보안·접근성·회귀 검증",
-                    "결정·예외·실패 흐름과 Acceptance Criteria의 의미",
                     "파일이나 문서를 수정하지 마라",
                     "길이만으로 개선을 강제하지 말고",
                     "FILE_REVIEW_RESULT:",

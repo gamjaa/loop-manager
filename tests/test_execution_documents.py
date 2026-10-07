@@ -282,6 +282,25 @@ class CommonGuidancePrReportTests(TestCase):
                 self.assertNotIn('a' * 40, updated)
                 self.assertIn('d' * 40, updated)
 
+    def test_role_instruction_changes_are_reported_with_renames_and_final_diff(self):
+        from loop_manager_internal.agents.common_guidance import ROLE_PATHS
+        from loop_manager_internal.documents.pr_description import common_guidance_report
+        import hashlib
+        for path in set(ROLE_PATHS.values()):
+            for status in ('A', 'M', 'D', 'R100'):
+                with self.subTest(path=path, status=status):
+                    paths = [path, 'docs/renamed.md'] if status.startswith('R') else [path]
+                    names = '\0'.join([status, *paths, ''])
+                    patch = f'diff --git a/{path} b/{paths[-1]}\n-old\n+new\n'
+                    git = mock.Mock(side_effect=(SimpleNamespace(stdout=names), SimpleNamespace(stdout=patch)))
+                    report = common_guidance_report(git, Path('/candidate'), 'a' * 40, 'b' * 40,
+                                                    'git@github.com:org/project.git', 'role constraints')
+                    self.assertIn(path, report)
+                    self.assertIn(status, report)
+                    self.assertIn(patch.rstrip(), report)
+                    self.assertIn('#diff-' + hashlib.sha256(path.encode()).hexdigest(), report)
+                    self.assertEqual(git.call_args.args[-len(paths):], tuple(paths))
+
     def test_unrelated_change_has_no_guidance_report_and_summary_is_preserved(self):
         from loop_manager_internal.documents.pr_description import common_guidance_report
         git = mock.Mock(return_value=SimpleNamespace(stdout='M\0src/app.py\0'))

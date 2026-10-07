@@ -25,7 +25,7 @@ priority: normal
 
 - planning/planner_validation.py와 catalog batch·게시의 기존 번호/고유성 검사에 deterministic normalization을 앞단으로 연결한다. 허용 새 파일과 구조적 참조만 처리한다.
 - 원래 결과·배정 mapping·확정 revision을 보존해 재시작 시 실제 diff와 대조한다. 모호함의 검증 실패는 성공으로 보충하지 않는다.
-- 공통 경계는 AGENTS.md, docs/ARCHITECTURE.md와 docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
+- 자동 역할·권한·검증은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙·설계·계획 작성은 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
 
 ## Validation
 

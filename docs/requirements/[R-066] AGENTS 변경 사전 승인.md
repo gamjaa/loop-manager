@@ -6,6 +6,8 @@
 
 ## Requirement
 
+이 사전 승인 절차의 대상은 자동 Worker가 변경하는 프로젝트 루트 `AGENTS.md`다. Loop Manager 자체 저장소도 새 제안은 `project` scope를 사용한다. R-064의 공통·역할별 `docs/AGENTS.*.md`는 일반 작업 파일 권한과 PR 검토를 따르며 이 승인 대상으로 확대하지 않는다. 과거 `common` 승인은 원래 루트 대상·baseline·patch의 의미를 유지한다.
+
 사용자는 게시할 ExecPlan의 Decision Log에 기존 Proposal과 User Decision 형식으로 AGENTS.md 변경을 사전 승인할 수 있다. 정확한 patch와 approve 또는 replace 결정, 비어 있지 않은 Revision 및 기준 commit의 전체 SHA를 담은 Baseline이 필요하며 reject도 변경 없는 결정으로 처리한다. 사전 승인 배치는 같은 Baseline을 사용한다. 채팅의 포괄적 허락이나 일반 본문만으로 승인하지 않는다.
 
 Loop Manager는 Worker 시작 전에 원격 기준에서 채택한 계획 revision의 결정과 Baseline의 AGENTS.md를 확인한다. Baseline은 같은 원격 기준 이력의 commit이어야 한다. 현재 작업 파일의 제안·결정과 승인 대상의 기준 내용·파일 mode가 같아야 승인된 변경 범위를 전달한다. 승인 문구를 유지한 채 원격 기준만 갱신해도 승인 기준을 새 파일로 바꾸지 않는다. 실제 적용은 Worker가 계획의 목표와 dependency 조건에 따라 수행하며 Manager는 AGENTS.md를 직접 편집하지 않는다.

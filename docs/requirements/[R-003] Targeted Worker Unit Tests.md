@@ -16,9 +16,11 @@ Reviewer는 Worker의 targeted unit test와 Loop Manager의 전체 verify가 통
 
 문서·설정만 변경했거나 프로젝트에 실행 가능한 관련 unit test가 없는 경우 Worker는 테스트를 임의로 확대하지 않고 실행하지 못한 사유를 남긴다. 이 경우에도 Loop Manager의 전체 verify는 생략하지 않는다.
 
+정적 검증 책임과 허용·금지 명령은 R-064의 공통·역할별 instruction으로 전달한다. Worker는 `docs/AGENTS.common.md`+`docs/AGENTS.worker.md`, Reviewer는 common+`docs/AGENTS.reviewer.md`를 사용한다. 작업 prompt에는 테스트 대상·결과·실패 피드백 등의 작업별 사실을 전달하고 정적 권한 규칙을 중복하지 않는다.
+
 ## Acceptance Criteria
 
-- Worker prompt는 수정한 코드와 새로 작성하거나 변경한 테스트에 직접 관련된 최소 범위의 unit test를 실행하도록 명시한다.
+- 실제 Worker 호출의 공통+Worker instruction은 수정한 코드와 새로 작성하거나 변경한 테스트에 직접 관련된 최소 범위의 unit test를 실행하도록 명시한다.
 - Worker가 실행하는 테스트 command는 개별 test case, test class, test module 또는 이에 준하는 좁은 범위로 제한된다.
 - targeted unit test가 실패하면 Worker는 알려진 실패를 성공으로 보고하지 않고 같은 세션에서 수정한 뒤 관련 unit test를 재실행한다.
 - 문서·설정 전용 변경 또는 실행 가능한 관련 unit test가 없는 경우 Worker는 그 사유를 결과에 남기고 전체 test suite로 범위를 확대하지 않는다.
@@ -27,7 +29,7 @@ Reviewer는 Worker의 targeted unit test와 Loop Manager의 전체 verify가 통
 - verify 실패만 기존 재시도 예산과 상태 전이를 사용해 같은 Worker 세션으로 전달되며, targeted unit test의 내부 수정·재실행은 별도 SQLite 재시도 횟수를 소비하지 않는다.
 - Reviewer는 Worker의 targeted unit test와 Loop Manager의 전체 verify 성공 후에만 실행되며 테스트 command와 `scripts/verify`를 다시 실행하지 않는다.
 - Reviewer는 코드, 테스트, verify 스크립트의 diff와 전달된 테스트 결과만으로 테스트 누락, 회귀 위험과 검증 약화를 검토한다.
-- Worker와 Reviewer prompt의 허용·금지 명령 경계, Worker 반환 후 전체 verify 실행과 verify 성공 후 Reviewer 호출을 자동 테스트로 검증한다.
+- Worker와 Reviewer의 실제 instruction에 전달된 허용·금지 명령 경계와 사용자 prompt의 정적 규칙 중복 부재, Worker 반환 후 전체 verify 실행과 verify 성공 후 Reviewer 호출을 자동 테스트로 검증한다.
 
 ## Product Impact
 

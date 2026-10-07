@@ -285,10 +285,6 @@ class PlanningAssessmentTest(PlanningCase):
         self.assertEqual(ports.agent.run_count, 1)
         prompt = ports.agent.run_planner.call_args.args[1]
         for phrase in (
-            "기존 구현·공유 helper·관련 테스트와 표준 도구",
-            "현재 목표에 필요하지 않은 추상화·설정·파일 추가",
-            "오류 처리·보안·접근성·회귀 검증",
-            "결정·예외·실패 흐름과 Acceptance Criteria의 의미",
             "파일이나 문서를 수정하지 마라",
             "FILE_REVIEW_RESULT:",
             "revision-bound root placement inventory:",

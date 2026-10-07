@@ -37,7 +37,7 @@ bash scripts/copy-project-files.sh /path/to/my-project
 
 PRODUCT와 활성 Requirement 중 하나 이상은 반드시 있어야 한다. 초기 제품은 PRODUCT로 정의하고 운영 중 변경은 Requirement로 작성한다. Requirement는 frontmatter·상태 없이 `docs/requirements/` 바로 아래에 두며 모두 Planner 입력이 된다.
 
-Specification Skill로 역할에 맞는 초안을 작성하고 누락된 조건을 확인할 수 있다. 작성이 끝나면 commit·push한다. Loop Manager는 최신 원격 base만 입력으로 사용하므로 로컬 전용 파일·commit은 자동 작업에 포함되지 않는다.
+새 기능·정책 변경을 요청받은 대화형 Agent는 별도 문서 작성 요청을 기다리지 않고 관련 Requirement를 먼저 작성·갱신한다. 기존 활성 Requirement가 요청과 Acceptance Criteria를 충분히 담으면 재사용한다. Specification Skill은 필요한 명세와 누락된 조건을 정리하며 ExecPlan 생성·계획 작성은 매니저가 호출하는 Planner의 자동 흐름에서 담당한다. 작성이 끝나면 commit·push한다. Loop Manager는 최신 원격 base만 입력으로 사용하므로 로컬 전용 파일·commit은 자동 작업에 포함되지 않는다.
 
 ### 3. 환경과 설정 준비
 
@@ -59,7 +59,7 @@ Loop Manager 자체 verify는 `[loop] verify_parallelism = auto`가 기본이다
 
 Manager 실행의 시간 이벤트·worker 원문·manifest·집계는 상태 디렉터리 `logs/verify/<실행 ID>/`에 남는다. 단독 스크립트는 `.cache/verify/<실행 ID>/`를 사용한다. 기존 두 OS 스크립트가 같은 runner로 전체 unittest와 compile을 수행하며 실제 Agent CLI·외부 API 연결은 테스트 프로세스에서 차단된다. 시간 집계만 읽으려면 `python -m loop_manager_internal.verification.runner --report <직렬 기록 디렉터리> <auto 기록 디렉터리>`를 사용한다. 이 명령은 테스트를 실행하지 않는다. 비교 결과의 범위·관측 환경 일치와 원본의 부하·메모리 제한을 확인한 뒤 시간을 해석한다.
 
-실제 config에는 비밀값이 들어갈 수 있으므로 Git에 commit하지 않는다. 상태·PR·session은 source checkout 밖 사용자 상태 디렉터리의 SQLite에 저장한다. 공통 지침 snapshot은 같은 디렉터리의 `agent-guidance/<내용 SHA-256>.md`에 저장하며 SQLite의 작업·session 결합과 함께 백업한다. 누락·손상된 snapshot을 최신 지침으로 바꿔 재개하지 않는다.
+실제 config에는 비밀값이 들어갈 수 있으므로 Git에 commit하지 않는다. 상태·PR·session은 source checkout 밖 사용자 상태 디렉터리의 SQLite에 저장한다. 공통·역할별 지침 원본 snapshot은 같은 디렉터리의 `agent-guidance/<내용 SHA-256>.json`에 저장하며 SQLite의 작업·session 결합과 함께 백업한다. 역할별로 합친 실행용 `.md` 파일도 이 디렉터리에서만 생성하며 커밋하지 않는다. 합친 파일은 고정 원본에서 재생성할 수 있지만 누락·손상된 원본 snapshot을 최신 지침으로 바꿔 재개하지 않는다. 기존 작업의 단일 `.md` snapshot은 원래 내용으로 유지한다.
 
 ### 4. 상태 초기화와 프로젝트 등록
 
@@ -111,9 +111,18 @@ cron 또는 Windows 작업 스케줄러에는 `run --skip-if-running`을 등록�
 
 bootstrap은 최신 `origin/main`의 정확한 SHA에서 runtime을 실행한다. source checkout의 로컬 main·미커밋 변경·로컬 전용 commit은 실행 revision이 아니다. 기본 프로젝트 checkout은 안전한 경우에만 fast-forward하고 그 밖의 로컬 상태는 보존한다. [실행·동기화 구조](docs/ARCHITECTURE.md#git과-worktree-실행-모델)
 
-공통 자동 지침은 이 runtime의 `docs/AGENTS.common.md`에서 확정해 Codex의 추가 developer 지침 또는 Claude의 append system prompt 파일로 전달한다. 기본 지침·기존 추가 지침·프로젝트 규칙을 보존하며, 지원되지 않는 CLI·설정 충돌은 모델 실행 전에 중단한다. Claude의 기존 격리 검증 gate도 유지한다. ExecPlan의 Worker·Reviewer·재시도와 복구는 같은 snapshot을 사용하고 새 작업만 최신 공통 내용을 선택한다. 내용이 같으면 runtime SHA 갱신만으로 재계획하지 않는다.
+자동 실행 지침은 선택 runtime의 `docs/AGENTS.common.md`와 역할별 파일을 합쳐 Codex의 추가 developer 지침 또는 Claude의 append system prompt 파일로 전달한다. 공통에는 모든 역할의 작업·승인·품질 기준을, 역할별 파일에는 권한·금지사항과 절차를 기록한다.
 
-작업 worktree의 `docs/AGENTS.common.md`는 일반 파일 권한으로 수정하고 PR에 최종 경로·diff·이유·영향을 보고한다. 후보 파일은 현재 실행 지침을 바꾸지 않는다. 새 프로젝트 AGENTS 제안은 self 저장소도 루트 `AGENTS.md`·`project` scope로 사용자 판단을 받으며, 과거 `common` 승인은 원래 대상·기준·patch로 처리한다. 이 저장소 루트의 기존 공통 본문 정리는 G-174의 정확한 사전 승인과 선행 Merge·runtime 검증 후 별도 PR로 수행한다.
+| 호출 역할 | 공통 지침에 합칠 파일 |
+|---|---|
+| Planner·유지보수 Planner | `docs/AGENTS.planner.md` |
+| 읽기 전용 점검 Planner | `docs/AGENTS.planner_check.md` |
+| Worker | `docs/AGENTS.worker.md` |
+| Reviewer | `docs/AGENTS.reviewer.md` |
+
+작업 시작 시 모든 지침 원본을 함께 고정한다. 같은 ExecPlan의 Worker·Reviewer는 같은 원본 버전에서 각 역할의 내용만 합치며 재시도·새 세션·재개도 이 버전을 유지한다. 새 작업만 최신 원본을 선택하고 역할별 내용 변경도 planning·검증 결과 재사용의 입력에 반영한다. 기본 지침·기존 추가 지침·프로젝트 규칙과 격리 검증 gate는 보존하며 파일 오류·지원되지 않는 CLI·설정 충돌·알 수 없는 역할은 모델 실행 전에 중단한다.
+
+작업 worktree의 공통·역할별 `docs/AGENTS.*.md`는 일반 파일 권한으로 수정하고 PR에 최종 경로·diff·이유·영향을 보고한다. 후보 파일은 현재 실행 지침을 바꾸지 않는다. 자동 Worker의 새 프로젝트 AGENTS 제안은 self 저장소도 루트 `AGENTS.md`·`project` scope로 사용자 판단을 받으며, 과거 `common` 승인은 원래 대상·기준·patch로 처리한다. 이 저장소 루트 AGENTS에는 프로젝트 개발 규칙과 Requirement 우선 원칙을 유지하며, 다른 등록 프로젝트의 기존 공통 본문은 자동 제거하지 않는다.
 
 ## 수동 구현과 제출
 
@@ -153,7 +162,7 @@ complete·submit은 기본적으로 전체 verify와 읽기 전용 Review를 수
 
 정상 실행에서는 코드·테스트·ExecPlan·SQLite 상태를 직접 작성할 필요가 없다. Planner가 계획을 만들고 Worker가 구현·targeted test·verify 스크립트를 준비한다. 전체 verify는 Manager가 실행하고 실패 출력만 Worker에게 전달한다. Reviewer는 읽기 전용으로 검토하고 사용자가 PR을 Merge한다.
 
-사용자의 직접 작업과 대화형 Agent의 로컬 구현에는 자동 Worker 역할·SQLite 전이·ExecPlan 선작성·자동 완료 절차를 요구하지 않는다. 새 기능·정책은 동일하게 Requirement에서 시작한다. 직접 구현과 활성 Requirement를 원격 base에 게시하면 Planner는 실제 미충족 작업만 재점검하며 소급·중복 계획이나 자동 검증 성공 기록을 만들지 않는다.
+직접 작업과 대화형 Agent의 로컬 구현은 관련 Requirement 작성·갱신 또는 충분한 기존 활성 Requirement의 재사용으로 시작하고 ExecPlan을 만들지 않는다. 자동 Worker 역할·SQLite 전이·자동 완료 절차도 요구하지 않는다. 직접 구현과 활성 Requirement를 원격 base에 게시하면 매니저의 Planner는 실제 미충족 작업만 재점검하며 소급·중복 계획이나 자동 검증 성공 기록을 만들지 않는다.
 
 Merge 확인 뒤 worktree가 clean하고 PR head에 없는 로컬 commit이 없으면 Merge·Squash·Rebase 방식과 관계없이 정리한다. 안전성을 확인할 수 없는 작업 공간은 보존한다.
 

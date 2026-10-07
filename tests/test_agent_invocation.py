@@ -346,6 +346,10 @@ class CommonGuidanceInvocationTests(TestCase):
         (self.runtime / 'docs').mkdir(parents=True)
         self.source = self.runtime / common_guidance.COMMON_PATH
         self.source.write_text('자동 지침 "quoted" \\path\n두 번째 줄\n', encoding='utf-8')
+        self.role_texts = {}
+        for path in set(common_guidance.ROLE_PATHS.values()):
+            self.role_texts[path] = '정적 역할: ' + path + '\n'
+            (self.runtime / path).write_text(self.role_texts[path], encoding='utf-8')
         self.state_dir = self.root / 'state'
         self.worktree = self.root / 'candidate'
         self.worktree.mkdir()
@@ -458,13 +462,22 @@ class CommonGuidanceInvocationTests(TestCase):
         self.source.write_text('새 runtime 지침\n', encoding='utf-8')
         for role, session in (('worker', 'session-1'), ('reviewer', None), ('worker', None)):
             self.assertEqual(self.invoke(role=role, session=session).code, 0)
-            self.assertEqual(self.requests[-1].common_guidance, original)
+            selected = self.requests[-1].common_guidance
+            self.assertEqual(selected.task_id, original.task_id)
+            self.assertEqual(selected.source_revision, original.source_revision)
+            if role == 'worker':
+                self.assertEqual(selected, original)
+            else:
+                self.assertIn(self.role_texts[self.guidance_module.ROLE_PATHS[role]], selected.content)
+                self.assertNotIn('새 runtime 지침', selected.content)
             self.assertEqual(self.requests[-1].prompt, 'delta only')
         self.assertEqual(self.invoke(plan='G-148').code, 0)
         self.assertNotEqual(self.requests[-1].common_guidance.content_hash, original.content_hash)
         for role in ('planner', 'planner_check', 'reviewer'):
             self.assertEqual(self.invoke(role=role, plan=None, task='independent-' + role).code, 0)
-            self.assertEqual(self.requests[-1].common_guidance.content, '새 runtime 지침\n')
+            selected = self.requests[-1].common_guidance.content
+            self.assertTrue(selected.startswith('새 runtime 지침\n\n'))
+            self.assertTrue(selected.endswith(self.role_texts[self.guidance_module.ROLE_PATHS[role]]))
 
     def test_one_shot_rejects_state_inside_candidate_before_any_database_write(self):
         state_dir = self.worktree / 'state'
@@ -497,17 +510,21 @@ class CommonGuidanceInvocationTests(TestCase):
             with self.subTest(damage=damage):
                 self.assertEqual(self.invoke(plan='G-' + damage).code, 0)
                 saved = self.requests[-1].common_guidance
+                reference = self.connection.execute(
+                    'SELECT snapshot_path FROM common_guidance_versions WHERE task_id = ?',
+                    (saved.task_id,)).fetchone()[0]
+                bundle = Path(reference)
                 before = len(self.requests)
                 if damage == 'missing':
-                    saved.snapshot_path.unlink()
+                    bundle.unlink()
                 elif damage == 'directory':
-                    saved.snapshot_path.unlink()
-                    saved.snapshot_path.mkdir()
+                    bundle.unlink()
+                    bundle.mkdir()
                 elif damage == 'reference':
                     self.connection.execute('UPDATE common_guidance_versions SET snapshot_path = ? WHERE task_id = ?',
                                             (str(self.source), saved.task_id))
                 else:
-                    saved.snapshot_path.write_bytes(b'changed' if damage == 'hash' else b'\xff')
+                    bundle.write_bytes(b'changed' if damage == 'hash' else b'\xff')
                 self.source.write_text('latest ' + damage, encoding='utf-8')
                 result = self.invoke(role='reviewer', plan='G-' + damage)
                 self.assertEqual(result.result_kind, invocation.AgentResultKind.PERMANENT_CONFIGURATION)
@@ -556,3 +573,134 @@ class CommonGuidanceInvocationTests(TestCase):
         self.assertEqual(result.code, 1)
         row = self.connection.execute('SELECT result_kind, result_code FROM agent_invocations ORDER BY rowid DESC LIMIT 1').fetchone()
         self.assertEqual(tuple(row), ('permanent_configuration', 1))
+
+    def test_each_role_receives_only_common_and_its_role_outside_git(self):
+        common = self.source.read_text(encoding='utf-8')
+        for role, path in self.guidance_module.ROLE_PATHS.items():
+            with self.subTest(role=role):
+                self.assertEqual(self.invoke(role=role, plan=None, task=role).code, 0)
+                request = self.requests[-1]
+                guidance = request.common_guidance
+                self.assertEqual(guidance.content, common.rstrip('\n') + '\n\n' + self.role_texts[path])
+                self.assertEqual(guidance.snapshot_path.read_text(encoding='utf-8'), guidance.content)
+                self.assertTrue(guidance.snapshot_path.is_relative_to(self.state_dir))
+                self.assertFalse(guidance.snapshot_path.is_relative_to(self.worktree))
+                self.assertFalse(guidance.snapshot_path.is_relative_to(self.runtime))
+                self.assertEqual(request.prompt, 'delta only')
+                self.assertEqual(request.role_name, role)
+
+    def test_reviewer_uses_worker_pinned_role_sources_after_runtime_is_removed(self):
+        self.assertEqual(self.invoke().code, 0)
+        original = self.requests[-1].common_guidance
+        common = self.source.read_text(encoding='utf-8')
+        for path in self.guidance_module.GUIDANCE_PATHS:
+            (self.runtime / path).unlink()
+        self.assertEqual(self.invoke(role='reviewer', provider='claude').code, 0)
+        reviewer = self.requests[-1].common_guidance
+        self.assertEqual(reviewer.task_id, original.task_id)
+        self.assertEqual(reviewer.source_revision, original.source_revision)
+        self.assertEqual(reviewer.content, common.rstrip('\n') + '\n\n' +
+                         self.role_texts[self.guidance_module.ROLE_PATHS['reviewer']])
+        original.snapshot_path.unlink()
+        self.assertEqual(self.invoke(session='session-1').code, 0)
+        self.assertEqual(self.requests[-1].common_guidance, original)
+
+    def test_role_only_change_invalidates_new_task_bundle_and_preserves_old_task(self):
+        original_hash = self.guidance_module.runtime_content_hash()
+        self.assertEqual(self.invoke().code, 0)
+        reviewer_path = self.runtime / self.guidance_module.ROLE_PATHS['reviewer']
+        reviewer_path.write_text('new reviewer constraints\n', encoding='utf-8')
+        changed_hash = self.guidance_module.runtime_content_hash()
+        self.assertNotEqual(changed_hash, original_hash)
+        self.assertEqual(self.guidance_module.plan_content_hash(self.connection, 'repo', 'G-147'), original_hash)
+        self.assertEqual(self.invoke(role='reviewer').code, 0)
+        self.assertNotIn('new reviewer constraints', self.requests[-1].common_guidance.content)
+        self.assertEqual(self.invoke(role='reviewer', plan='G-148').code, 0)
+        self.assertIn('new reviewer constraints', self.requests[-1].common_guidance.content)
+        self.assertEqual(self.guidance_module.plan_content_hash(self.connection, 'repo', 'G-148'), changed_hash)
+
+    def test_missing_invalid_role_sources_and_unknown_roles_never_start_provider(self):
+        path = self.runtime / self.guidance_module.ROLE_PATHS['reviewer']
+        for value in (b'', b' \n', b'\xff', b'a\0b'):
+            with self.subTest(value=value):
+                path.write_bytes(value)
+                self.assertEqual(self.invoke().result_kind, invocation.AgentResultKind.PERMANENT_CONFIGURATION)
+        path.unlink()
+        self.assertEqual(self.invoke().code, 1)
+        path.mkdir()
+        self.assertEqual(self.invoke().code, 1)
+        path.rmdir()
+        path.symlink_to(self.source)
+        self.assertEqual(self.invoke().code, 1)
+        path.unlink()
+        path.write_text('valid role', encoding='utf-8')
+        self.assertEqual(self.invoke(role='../worker').code, 1)
+        self.assertEqual(self.requests, [])
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM common_guidance_versions').fetchone()[0], 0)
+
+    def test_changed_combined_file_is_rejected_instead_of_overwritten(self):
+        self.assertEqual(self.invoke().code, 0)
+        saved = self.requests[-1].common_guidance
+        saved.snapshot_path.write_text('changed derived instructions', encoding='utf-8')
+        self.assertEqual(self.invoke().code, 1)
+        self.assertEqual(len(self.requests), 1)
+        self.assertEqual(saved.snapshot_path.read_text(encoding='utf-8'), 'changed derived instructions')
+
+    def test_concurrent_snapshot_publication_never_exposes_partial_bytes(self):
+        from concurrent.futures import ThreadPoolExecutor
+        directory = self.state_dir / 'agent-guidance'
+        directory.mkdir(parents=True, mode=0o700)
+        contents = ('shared instructions\n' * 10000).encode()
+        with ThreadPoolExecutor(max_workers=4) as workers:
+            futures = [workers.submit(self.guidance_module._store_snapshot, directory, contents, '.md')
+                       for _ in range(8)]
+            paths = [future.result() for future in futures]
+        self.assertEqual(len(set(paths)), 1)
+        self.assertEqual(paths[0].read_bytes(), contents)
+        self.assertEqual(list(directory.iterdir()), [paths[0]])
+
+    def test_invalid_stored_bundle_schema_never_starts_provider(self):
+        import hashlib
+        import json
+        from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
+        directory = self.state_dir / 'agent-guidance'
+        directory.mkdir(parents=True, mode=0o700)
+        files = {path: 'valid instructions' for path in self.guidance_module.GUIDANCE_PATHS}
+        variants = (
+            {'version': 2, 'files': files},
+            {'version': 1, 'files': {}},
+            {'version': 1, 'files': dict(files, **{'docs/foreign.md': 'expanded role'})},
+            {'version': 1, 'files': {**files, self.guidance_module.COMMON_PATH: '\ud800'}},
+        )
+        for index, bundle in enumerate(variants):
+            with self.subTest(bundle=index):
+                plan = 'G-schema-' + str(index)
+                identity = self.guidance_module.task_identity(
+                    invocation.InvocationContext('repo', plan), 'worker', self.worktree)
+                contents = json.dumps(bundle).encode('utf-8')
+                digest = hashlib.sha256(contents).hexdigest()
+                path = directory / (digest + '.json')
+                path.write_bytes(contents)
+                GuidanceRepository(self.connection).save(identity, 'repo', digest, 'a' * 40, str(path))
+                self.assertEqual(self.invoke(plan=plan).result_kind,
+                                 invocation.AgentResultKind.PERMANENT_CONFIGURATION)
+        self.assertEqual(self.requests, [])
+
+    def test_legacy_markdown_snapshot_resumes_without_adding_current_role_rules(self):
+        import hashlib
+        from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
+        context = invocation.InvocationContext('repo', 'G-legacy')
+        identity = self.guidance_module.task_identity(context, 'worker', self.worktree)
+        text = 'legacy common and all role instructions\n'
+        digest = hashlib.sha256(text.encode()).hexdigest()
+        directory = self.state_dir / 'agent-guidance'
+        directory.mkdir(parents=True, mode=0o700)
+        path = directory / (digest + '.md')
+        path.write_text(text, encoding='utf-8')
+        GuidanceRepository(self.connection).save(identity, 'repo', digest, 'a' * 40, str(path))
+        for filename in self.guidance_module.GUIDANCE_PATHS:
+            (self.runtime / filename).unlink()
+        for role in ('worker', 'reviewer'):
+            self.assertEqual(self.invoke(role=role, plan='G-legacy').code, 0)
+            self.assertEqual(self.requests[-1].common_guidance.content, text)
+            self.assertEqual(self.requests[-1].common_guidance.snapshot_path, path)

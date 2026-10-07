@@ -28,7 +28,7 @@ priority: normal
 
 - 현재 summary와 provider fixture를 재사용해 같은 집계 경계에 optional plan 필터와 지표별 알려진/미수집 분모를 추가한다. 기본 summary 소비자의 의미를 유지하고 별도의 중복 SQL·provider 집계 규칙을 만들지 않는다.
 - G-194의 조회 연결과 결과·출력 경계에 usage를 연결한다. schema 변경이나 새로운 수집 서비스 없이 읽기 가능한 기존 기록의 한계를 표시하며 R-073의 기간·목적·실행 여부 확장은 G-185에서 같은 경계를 확장한다.
-- 상위 명세와 검증 주체는 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 따른다.
+- 상위 명세는 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를, 자동 역할·검증 책임은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를 따른다.
 
 ## Validation
 

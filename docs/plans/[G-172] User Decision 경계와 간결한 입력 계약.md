@@ -26,7 +26,7 @@ priority: high
 
 - documents/guidance_approval.py의 경계/parser·identity 정규화와 기존 PLANS 템플릿·Worker 안내를 함께 갱신한다. 문법 정규화와 결정 의미 검증을 분리하고 fence 내용을 임의 확장하지 않는다.
 - preapproval·scope·Decision Log 검증의 소비자가 동일한 parser 계약을 사용하게 한다. 기존 결정·감사 기록을 재작성하거나 삭제하지 않는다.
-- 공통 경계는 AGENTS.md, docs/ARCHITECTURE.md와 docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
+- 자동 역할·권한·검증은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙·설계·계획 작성은 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
 
 ## Validation
 

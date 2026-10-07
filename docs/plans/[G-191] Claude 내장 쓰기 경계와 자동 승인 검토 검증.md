@@ -28,7 +28,7 @@ Claude의 관리 호출을 provider 이름만으로 일괄 거부하는 현재 �
 - docs/ARCHITECTURE.md의 `R-023: workspace 쓰기 제한과 자동 승인 검토 (구현 예정)` 설계를 적용한다. 기존 provider adapter의 Claude permission·sandbox 설정, isolation evidence와 invocation 저장 경계를 재사용하며 필요 부분만 provider 책임으로 분리한다. Codex 전용 launch 값을 Claude 검증 성공으로 대용하거나 범용 격리 framework를 추가하지 않는다.
 - 설치 CLI의 공식 지원 기능·병합 우선순위·모델/계정 조건과 실제 도구 경계를 확인한다. 정책 작성, 효력 확인, 증거 영속화와 실제 호출 직전 재검증을 같은 호출에 결합한다. 기존 provider 내부 경계를 확인할 수 없으면 verified를 기록하지 않고 원인별 미지원으로 보존한다.
 - 공유 Git 및 source 보호와 소유 임시 경로 판정에는 기존 canonical worktree·repository 검증을 사용한다. 실제 파일 도구와 명령의 허용·거부 확인은 보호 파일을 변경하지 않도록 설계한다. 새로운 외부 격리 infrastructure, OS 전환, 별도 승인 서비스나 루트 항목은 도입하지 않는다.
-- session 재개·fallback의 기존 recovery context와 결과·사용량·중단 계약을 유지한다. AGENTS.md와 docs/PLANS.md의 문서·역할 권한을 따르며 정책 확인 실패를 문서 교정이나 무조건 새 session 시작으로 우회하지 않는다.
+- session 재개·fallback의 기존 recovery context와 결과·사용량·중단 계약을 유지한다. docs/AGENTS.common.md·해당 역할의 docs/AGENTS.*.md·AGENTS.md·docs/PLANS.md의 문서·역할 경계를 따르며 정책 확인 실패를 문서 교정이나 무조건 새 session 시작으로 우회하지 않는다.
 
 ## Validation
 

@@ -27,7 +27,7 @@ priority: normal
 
 - 현재 resource/coordination/timing 진단과 G-186 예제를 재사용해 bounded 실제 검증/비교 진입을 기존 verify 경계에 연결한다. 별도 상시 benchmark 서비스나 새 루트 launcher를 만들지 않는다.
 - 검증 자료에 환경·revision·run identity·원래 결과·종료 확인·비교 조건을 남기고 시간 상한 증가/필수 테스트 축소로 성능을 만들지 않는다.
-- 공통 경계는 AGENTS.md, docs/ARCHITECTURE.md와 docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
+- 자동 역할·권한·검증은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙·설계·계획 작성은 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
 
 ## Validation
 

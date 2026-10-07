@@ -71,13 +71,13 @@ SQLite 손실이나 손상에서의 자동 상태 재구성은 지원하지 않�
 - `docs/PRODUCT.md` 또는 `docs/requirements/` 바로 아래 Requirement가 하나 이상 있어야 한다
 - `docs/PLANS.md`의 SHA-256 해시가 Loop Manager 기준 파일과 다르면 등록을 거부한다
 - 변경되지 않은 PRODUCT 또는 ARCHITECTURE 템플릿만 있으면 작업 가능 상태로 등록하지 않는다
-- `AGENTS.md`는 줄바꿈을 정규화한 뒤 Loop Manager 기준 내용이 연속해서 포함돼있는지 코드로 확인한다
-- 기준 내용이 없으면 경고하고, 사용자가 승인한 경우에만 현재 파일 해시를 저장해 강제 등록한다
+- 프로젝트 루트 `AGENTS.md`의 존재·읽기·UTF-8을 확인하며 공통 본문 포함·내용 일치·불일치 승인을 요구하지 않는다
+- 과거 불일치 승인 설정과 파일 해시는 호환·감사로 보존하고 새 실행 지침의 원본이나 등록 승인 조건으로 사용하지 않는다
 - `AGENTS.md`와 `docs/PLANS.md` 검사는 등록할 때만 수행하며 자동 Loop에서는 다시 검사하지 않는다
 - 등록 해제의 비종료 계획·프로젝트 차단·planning 오류 gate는 PRODUCT를 따른다. 해제는 registry만 변경한다
 - 등록 해제는 프로젝트 파일, branch, worktree와 PR을 삭제하지 않는다
 
-공통 파일 검사는 AI가 아니라 프로그램 코드가 수행한다.
+등록 조건과 runtime 실행 지침 원본 검사는 AI가 아니라 프로그램 코드가 수행한다.
 
 ## 문서 입력과 ExecPlan 파싱
 
@@ -234,8 +234,13 @@ planning batch의 원격 게시·catalog 반영과 현재 원격 입력 일치�
 
 ## AI Agent 실행
 
-- Planner, Worker와 Reviewer prompt는 Loop Manager에 내장한다
-- 프로젝트별 prompt 재정의는 지원하지 않는다
+- 사용자 요청의 새 기능·정책 변경은 대화형 Agent가 관련 Requirement를 먼저 작성·갱신하거나 충분한 기존 활성 Requirement를 재사용한다. Specification Skill과 프로젝트 AGENTS는 이 문서 작성 기준을 제공하며 직접 작업에 ExecPlan 작성을 요구하지 않는다. ExecPlan 생성·계획 작성은 매니저가 호출하는 자동 Planner 흐름에서 수행한다
+- 정적 자동 실행 규칙은 선택 runtime의 `docs/AGENTS.common.md`와 `docs/AGENTS.planner.md`·`docs/AGENTS.planner_check.md`·`docs/AGENTS.worker.md`·`docs/AGENTS.reviewer.md`에 둔다. common에는 모든 역할의 기준만, 역할 파일에는 해당 역할의 권한·금지사항·절차만 남긴다. 프로젝트 루트 `AGENTS.md`는 프로젝트 개발 규칙이다
+- Manager는 작업 시작 시 모든 원본을 묶음으로 고정하고 내용 해시·source revision·snapshot과 작업·session 관계를 상태 디렉터리와 SQLite에 보존한다. 일반·유지보수·수동 제출 Planner는 common+planner, 점검은 common+planner_check, Worker와 Reviewer는 common+각 역할을 사용한다. 재시도·새 세션·runtime 갱신에도 같은 작업의 원본 버전을 유지한다
+- 실제 합친 내용을 Codex의 추가 developer instruction 또는 Claude의 append system prompt로 전달하고 실제 내용 해시를 호출 기록에 남긴다. 기본·기존 추가 지침·프로젝트 규칙과 실행 경계를 보존하며 원본·snapshot 오류, 미지원 전달 기능·설정 충돌·알 수 없는 역할은 모델 실행 전에 거부한다
+- 원본 묶음 snapshot은 저장소 밖 Manager 상태 디렉터리의 JSON으로 보존하고 역할별 합친 Markdown은 같은 디렉터리의 실행용 파일로만 생성하며 커밋하지 않는다. 합친 파일은 고정 원본에서 재생성하지만 원본 누락·손상은 최신 내용으로 대체하지 않는다. 기존 단일 Markdown snapshot은 원래 내용으로 재개하며 최신 역할 지침을 덧붙이지 않는다. 관련 planning·성공 결과 재사용에는 모든 역할 원본을 포함한 묶음 해시를 사용한다
+- Planner, Worker와 Reviewer의 작업별 prompt는 Loop Manager에 내장하며 목표·snapshot·승인 사실·피드백·결과 형식 등의 문맥을 구성한다. 정적 공통·역할 규칙을 이 사용자 메시지에 중복하지 않는다
+- 프로젝트별 prompt 재정의는 지원하지 않으며 프로젝트 파일이나 작업 prompt로 자동 역할 권한을 확대하지 않는다
 - 프로그램은 전체 ExecPlan을 코드로 파싱하되 Planner에게는 비종료 계획의 ID, 제목, 상태, sources, depends_on과 priority만 compact catalog로 전달한다
 - Planner는 PRODUCT, 활성 Requirement, ARCHITECTURE, 관련 코드·테스트, 비종료 ExecPlan compact catalog와 프로그램이 제공한 미착수 READY snapshot을 읽고 현재 식별 가능한 미충족 작업 전체를 한 계획 주기에 반영하며, 범위 밖의 보존 가치가 있는 아이디어는 `docs/FUTURE_IDEAS.md`에 분리한다
 - Planner는 MERGED ExecPlan 메타데이터와 본문을 기본 입력으로 받거나 읽지 않는다. 프로그램만 ID 고유성, 번호 할당, 의존성 충족과 감사 이력을 위해 이를 유지한다
@@ -269,15 +274,17 @@ provider adapter는 실제 호출 직전에 선택된 canonical worktree, Git wo
 
 단순 CLI 옵션, cwd 지정, 자동 검토의 승인 또는 사후 Git diff만으로 호출 전 격리를 증명하지 않는다. 실제 적용되는 정책과 허용 경로 쓰기·금지 경로 쓰기 거부를 확인하며, source checkout의 로컬 상태를 바꾸지 않고 증명해야 한다. Codex 확인은 Agent의 파일 변경·도구 실행에 적용되는 내장 정책을 대상으로 한다. 설치 CLI의 공식 지원 설정, 병합 우선순위와 역할별 실제 허용·거부 동작을 확인하며, exec JSONL에 유효 정책 전용 필드가 없다는 이유로 transport를 바꾸거나 바깥 wrapper를 추가하지 않는다. Codex 프로세스 전체의 mount·내부 쓰기 및 중첩 도구 실행 성공은 증명 조건이 아니다. 정상 인증·session·로그 저장과 PRODUCT의 `refs/codex/turn-diffs/*` 예외는 구분하며 그 밖의 Git·Agent 쓰기 권한은 확대하지 않는다. Claude는 기존 provider 내부 경계 확인 요구를 유지한다. 신규 호출에서 요구 정책을 적용·확인할 수 없거나 기존 허용 작업과 양립하지 않으면 원인과 기존 작업물·session을 보존한 채 중단한다. 격리 증거가 없는 과거 snapshot과 session의 판정은 기존 엄격한 shared ref·다른 worktree 감시를 유지한다. Loop Manager의 Worker 이후 Reviewer 검토는 provider의 실행 전 자동 승인 검토와 별도로 유지한다.
 
-Reviewer의 `read-only`는 workspace 파일 쓰기를 제한한다. 검색·diff·기존 결과 읽기에 필요한 명령은 내장 sandbox 안에서 실행할 수 있다. 테스트 command와 verify를 재실행하지 않는 규칙은 Reviewer 프롬프트에 별도로 유지하며, 쓰기 없는 테스트도 역할상 실행하지 않는다. Worker의 targeted test 결과와 Manager의 전체 verify 결과를 전달하는 기존 흐름을 유지하고, read-only 정책이 테스트 명령을 모두 차단한다고 취급하지 않는다.
+Reviewer의 `read-only`는 workspace 파일 쓰기를 제한한다. 검색·diff·기존 결과 읽기에 필요한 명령은 내장 sandbox 안에서 실행할 수 있다. 테스트 command와 verify를 재실행하지 않는 규칙은 고정된 common+Reviewer 역할 instruction에 유지하며, 쓰기 없는 테스트도 역할상 실행하지 않는다. Worker의 targeted test 결과와 Manager의 전체 verify 결과를 작업별 prompt로 전달하는 기존 흐름을 유지하고, read-only 정책이 테스트 명령을 모두 차단한다고 취급하지 않는다.
 
 설정 의미와 지원 범위는 구현 시 설치된 CLI와 공식 문서를 대조한다: [OpenAI 승인 정책 설정](https://learn.chatgpt.com/docs/config-file/config-reference), [Codex 자동 검토](https://learn.chatgpt.com/docs/sandboxing/auto-review), [Claude sandbox](https://code.claude.com/docs/en/sandboxing), [Claude permission mode](https://code.claude.com/docs/en/permission-modes). 지원되지 않는 key를 무시한 실행을 격리 확인으로 기록하지 않는다.
 
 ### AGENTS.md 변경 제안과 승인
 
-- Worker는 현재 ExecPlan에 필요한 `AGENTS.md` 변경을 발견해도 파일을 직접 수정하지 않고 선택된 ExecPlan의 `Decision Log`에 대상 경로, 프로젝트 전용·공통 범위, 이유, 영향과 정확한 patch를 기록한다
+- Worker는 현재 ExecPlan에 필요한 프로젝트 루트 `AGENTS.md` 변경을 발견해도 파일을 직접 수정하지 않고 선택된 ExecPlan의 `Decision Log`에 루트 대상 경로, project 범위, 이유, 영향과 정확한 patch를 기록한다
 - 일반 등록 프로젝트의 Worker는 현재 프로젝트에만 적용되는 `AGENTS.md` 변경을 `project` scope로 제안할 수 있다
-- Loop Manager 자체 저장소의 루트 `AGENTS.md`는 향후 프로젝트 설정에 사용하는 공통 원본이므로 Loop Manager Worker는 `common` scope만 제안할 수 있고 `project` scope 제안은 거부한다. Loop Manager에만 적용되는 제품 동작, 정책과 기술 설계는 `docs/PRODUCT.md`, 활성 Requirement와 `docs/ARCHITECTURE.md`에 기록하며 `AGENTS.md`에 기록하지 않는다
+- Loop Manager 자체 저장소의 루트 `AGENTS.md`도 프로젝트 개발 규칙이며 새 Worker 제안은 `project` scope를 사용한다. 자동 실행 지침의 원본은 runtime의 공통·역할별 docs 파일이다. 제품 동작·정책·기술 설계는 PRODUCT·Requirement·ARCHITECTURE의 역할을 유지한다
+- 과거 루트 대상의 `common` 승인·대기는 원래 대상·baseline·결정·patch 의미로 처리한다. 새 지침 파일의 승인으로 이관하거나 새 project 제안의 포괄적 허락으로 사용하지 않는다
+- 작업 worktree의 공통·역할별 `docs/AGENTS.*.md`는 현재 역할·목표의 일반 파일 권한을 따르고 별도 guidance 제안·사전 승인을 요구하지 않는다. 현재 실행의 고정 원본과 권한은 바뀌지 않으며 실행 중 runtime 편집 권한으로 확대하지 않는다. 최종 PR에는 해당 경로·내용·이유·영향·diff 링크를 보고하고 Manager가 실제 diff와 대조한다
 - 프로그램은 Worker 결과와 ExecPlan diff에서 완전한 제안을 확인한 뒤 제안이 포함된 ExecPlan 및 기존 구현 변경을 보존하고, commit과 검증 전에 ExecPlan을 BLOCKED로 전환한다
 - AGENTS 변경 승인 BLOCKED에는 일반적인 source 내용 해시 해제를 적용하지 않는다. 사용자는 보존된 관리 worktree의 같은 ExecPlan에서 해당 제안의 `User Decision`만 수정해 승인, 거절 또는 정확한 대체 patch를 기록한다
 - 프로그램은 결정이 참조하는 제안, 대상 경로와 확정 patch를 정규화해 hash하고 SQLite 승인 기록과 결합한다. 결정란 밖의 문서 변경은 승인으로 해석하지 않는다
@@ -285,7 +292,7 @@ Reviewer의 `read-only`는 workspace 파일 쓰기를 제한한다. 검색·diff
 - Agent 실행 후 실제 `AGENTS.md` diff를 승인된 대상과 patch에 결정적으로 대조한다. 차이가 있으면 게시하지 않고 승인을 무효화한 뒤 최신 patch 제안을 요구한다
 - 승인된 변경을 적용한 뒤에는 일반 Worker 변경과 동일하게 targeted test, 전체 verify와 읽기 전용 Review를 거쳐 같은 구현 PR에 포함한다
 - Planner와 Reviewer의 `AGENTS.md` 변경, 승인 전 Worker의 직접 변경 및 승인 대상 밖의 변경은 제안 흐름이 아니라 역할 범위 위반으로 처리한다
-- 승인된 기준 `AGENTS.md`는 이후 프로젝트 설정의 공통 원본으로만 사용하고 기존 등록 프로젝트에는 자동 배포하지 않는다
+- 승인된 루트 `AGENTS.md`는 해당 프로젝트 규칙으로 유지하며 실행 지침 원본이나 다른 프로젝트의 공통 복사본으로 사용하지 않는다. 준비 도구는 기존 프로젝트 AGENTS를 보존하고 없는 경우 프로젝트 규칙·Specification Skill 참조·필수 문서 조건을 담은 최소 파일만 만든다
 
 ## Model과 Effort
 

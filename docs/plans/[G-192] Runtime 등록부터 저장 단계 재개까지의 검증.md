@@ -32,7 +32,7 @@ R-020의 Manager runtime 귀속을 실제 bootstrap부터 runtime 자식의 선�
 - 등록 base를 사용하는 bootstrap과 persisted scope의 원격 ref 선택을 연결한다. 현재 `agent_scope_decision.decide_persisted_scope`와 `reconcile_runtime_snapshot` 및 저장 결과를 다시 검사하는 호출 경로는 `refs/remotes/origin/main`을 고정한다. 이미 검증한 self 등록·runtime 입력으로 정확한 base ref를 전달하고, 원본·결과·checkpoint 모두에 같은 제한된 조정을 적용한다. 다른 ref를 통째로 채택하거나 로컬 HEAD로 원격 기준을 대체하지 않는다.
 - 현재 tests/test_origin_isolation.py, tests/test_bootstrap_runtime.py와 tests/test_scope_interrupted_agents.py의 함수별 사례를 연결하는 bootstrap 재개 회귀를 추가한다. 실제 Git·임시 state DB·부모와 자식의 identity 전달 및 선검증·단계 전이는 사용하고 외부 Agent·GitHub 호출만 테스트 경계에서 대체한다. 운영 DB나 실제 외부 서비스는 사용하지 않는다.
 - 현재 scope_recovery의 snapshot hash 로그는 판정 성공 뒤에 있어 앞선 거부가 비교 identity를 남기지 못한다. 기존 로그·비밀값 제거 경계에서 거부 진단도 남기고, 확인된 연결 결함만 해당 책임 경계에서 교정한다. 전체 snapshot 채택이나 prefix 예외를 추가하지 않는다.
-- 역할·문서·검증 권한은 AGENTS.md, docs/ARCHITECTURE.md와 docs/PLANS.md를 따른다. 새 루트 항목과 범용 테스트 infrastructure는 만들지 않는다.
+- 자동 역할·문서·검증 권한은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙·설계·계획 작성은 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 따른다. 새 루트 항목과 범용 테스트 infrastructure는 만들지 않는다.
 
 ## Validation
 
