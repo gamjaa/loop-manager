@@ -10,7 +10,6 @@ from loop_manager_internal.config.managed_config import ManagedConfigError
 from loop_manager_internal.runtime import project_registry
 from loop_manager_internal.runtime.contracts import ProcessLockBusyError, RuntimeMutation
 from loop_manager_internal.runtime.process_lock import process_lock
-from loop_manager_internal.runtime.resource_lock import resource_locks
 from loop_manager_internal.storage import agent_invocation_state, local_recovery_state, runtime_state
 from pathlib import Path
 import argparse
@@ -258,8 +257,7 @@ def recover_local_environment(
         ).fetchone() is None:
             raise ValueError(f"등록 프로젝트에 없는 계획입니다: {plan_id}")
 
-        with resource_locks(state_dir, repository, ["local-recovery"], owner="recover-intake"):
-            request = local_recovery_state.begin_request(connection, repository, plan_id)
+        request = local_recovery_state.begin_request(connection, repository, plan_id)
         try:
             config = effects.load_managed_config(config_path)
         except ManagedConfigError as error:
@@ -271,14 +269,15 @@ def recover_local_environment(
             connection, enabled=bool(config.telegram_token and config.telegram_chat_id),
         )
         connection.commit()
-        # Only request intake may overlap automatic execution. Release its
-        # resource lease before trying the automatic process lease.
+        # Only request intake may overlap automatic execution. Commit its
+        # short DB transaction before trying the automatic process lease.
         with ExitStack() as stack:
             try:
                 stack.enter_context(process_lock(state_dir, identity="recover:" + request.request_id))
             except ProcessLockBusyError:
                 return _local_recovery_waiting(effects, request)
-            if not local_recovery_request_ready(connection, request):
+            next_request = next_local_recovery_request(connection, repository)
+            if next_request is None or next_request.request_id != request.request_id:
                 return _local_recovery_waiting(effects, request)
             return execute_local_recovery_request(
                 LocalRecoveryExecutionEffects(effects.operation_print, effects.run_project_result),
@@ -310,6 +309,14 @@ def local_recovery_request_ready(
     project = connection.execute("SELECT phase FROM projects WHERE repo = ?", (request.repo,)).fetchone()
     cycle = connection.execute("SELECT phase FROM maintenance_cycles WHERE repo = ?", (request.repo,)).fetchone()
     return project["phase"] != "PLANNING" and (cycle is None or cycle["phase"] == "idle")
+
+
+def next_local_recovery_request(
+    connection: sqlite3.Connection, repo: str,
+) -> local_recovery_state.LocalRecoveryRequest | None:
+    """Skip occupied scopes while keeping intake order among executable requests."""
+    return next((request for request in local_recovery_state.pending_requests(connection, repo)
+                 if local_recovery_request_ready(connection, request)), None)
 
 
 @dataclass(frozen=True)

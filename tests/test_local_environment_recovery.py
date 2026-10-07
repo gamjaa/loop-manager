@@ -1,5 +1,7 @@
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
+import sqlite3
 import threading
 import tempfile
 from types import SimpleNamespace
@@ -144,21 +146,139 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
         self.assertEqual(resume.call_args.kwargs['recovery_request_id'], request.request_id)
         self.assertEqual(resume.call_args.kwargs['recovery_plan_id'], 'G-001')
 
-    def test_queued_scope_conflict_and_invalid_config_do_not_execute(self):
+    def test_different_scopes_queue_and_invalid_config_does_not_execute(self):
         self.config_path.write_text('[loop]\n', encoding='utf-8')
         args = self.add_recovery_plans('G-001')
         run = mock.Mock()
         effects = self.effects(run)
         with process_lock(self.state_dir, identity='automatic-running'):
             self.assertEqual(recover_local_environment(effects, args, self.state_dir, self.config_path), 1)
-            with self.assertRaisesRegex(local_recovery_state.LocalRecoveryRequestError, '다른 범위'):
-                recover_local_environment(effects, self.arguments, self.state_dir, self.config_path)
+            self.assertEqual(recover_local_environment(effects, self.arguments, self.state_dir, self.config_path), 1)
             self.config_path.write_text('[loop]\nverify_timeout_seconds = bad\n', encoding='utf-8')
             with self.assertRaises(loop_manager.ManagedConfigError):
                 recover_local_environment(effects, args, self.state_dir, self.config_path)
         run.assert_not_called()
         with closing(loop_manager.connect_database(self.state_dir)) as connection:
-            self.assertEqual(local_recovery_state.pending_request(connection, str(self.repository.resolve())).plan_id, 'G-001')
+            requests = local_recovery_state.pending_requests(connection, str(self.repository.resolve()))
+            self.assertEqual([request.plan_id for request in requests], ['G-001', None])
+
+    def test_all_scopes_queue_in_order_and_each_run_processes_one_request(self):
+        self.config_path.write_text('[loop]\n', encoding='utf-8')
+        first = self.add_recovery_plans('G-001', 'G-002')
+        second = loop_manager.build_parser().parse_args(['recover', str(self.repository), '--plan', 'G-002'])
+        immediate = mock.Mock()
+        with process_lock(self.state_dir, identity='automatic-running'):
+            for args in (first, second, self.arguments, second, self.arguments, first):
+                self.assertEqual(recover_local_environment(self.effects(immediate), args, self.state_dir, self.config_path), 1)
+        immediate.assert_not_called()
+        repo = str(self.repository.resolve())
+        with closing(loop_manager.connect_database(self.state_dir)) as connection, connection:
+            # UUID ordering must not reorder intake when timestamps are equal.
+            connection.execute("UPDATE local_environment_recovery_requests SET created_at = '2026-10-07 00:00:00'")
+            queued = local_recovery_state.pending_requests(connection, repo)
+        self.assertEqual([request.plan_id for request in queued], ['G-001', 'G-002', None])
+        calls = []
+        def recheck(_connection, *_args, **kwargs):
+            calls.append((kwargs['recovery_request_id'], kwargs['recovery_plan_id']))
+            return ProjectRunResult(ProjectRunKind.WAITING, 0)
+        for index, request in enumerate(queued):
+            self.assertEqual(self.scheduled_recovery_run(recheck), 0)
+            self.assertEqual(len(calls), index + 1)
+            self.assertEqual(calls[-1], (request.request_id, request.plan_id))
+            with closing(loop_manager.connect_database(self.state_dir)) as connection:
+                self.assertEqual(len(local_recovery_state.pending_requests(connection, repo)), len(queued) - index - 1)
+        normal = mock.Mock(return_value=ProjectRunResult(ProjectRunKind.WAITING, 0))
+        self.assertEqual(self.scheduled_recovery_run(normal), 0)
+        self.assertNotIn('recovery_request_id', normal.call_args.kwargs)
+
+    def test_occupied_queue_head_does_not_block_recovery_of_active_plan(self):
+        self.config_path.write_text('[loop]\n', encoding='utf-8')
+        first = self.add_recovery_plans('G-001', 'G-002')
+        second = loop_manager.build_parser().parse_args(['recover', str(self.repository), '--plan', 'G-002'])
+        repo = str(self.repository.resolve())
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            runtime_state.RuntimeStateRepository(connection).activate(
+                repo, 'G-002', activation_sha='base', branch='branch', worktree='/worktree')
+        with process_lock(self.state_dir, identity='automatic-running'):
+            for args in (first, second):
+                recover_local_environment(self.effects(mock.Mock()), args, self.state_dir, self.config_path)
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            queued = local_recovery_state.pending_requests(connection, repo)
+        def recover_active(connection, *_args, **kwargs):
+            self.assertEqual(kwargs['recovery_request_id'], queued[1].request_id)
+            self.assertEqual(kwargs['recovery_plan_id'], 'G-002')
+            runtime_state.RuntimeStateRepository(connection).transition_and_clear(
+                repo, 'G-002', plan_values={'status': 'PR_OPEN'}, enqueue=False)
+            return ProjectRunResult(ProjectRunKind.WAITING, 0)
+        self.assertEqual(self.scheduled_recovery_run(recover_active), 0)
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            self.assertEqual(local_recovery_state.pending_requests(connection, repo), (queued[0],))
+            self.assertFalse(local_recovery_state.recheck_consumed(connection, queued[0].request_id, 'G-001', 'verify'))
+        resume = mock.Mock(return_value=ProjectRunResult(ProjectRunKind.WAITING, 0))
+        self.assertEqual(self.scheduled_recovery_run(resume), 0)
+        self.assertEqual(resume.call_args.kwargs['recovery_request_id'], queued[0].request_id)
+
+    def test_immediate_command_does_not_overtake_earlier_executable_request(self):
+        self.config_path.write_text('[loop]\n', encoding='utf-8')
+        first = self.add_recovery_plans('G-001', 'G-002')
+        second = loop_manager.build_parser().parse_args(['recover', str(self.repository), '--plan', 'G-002'])
+        with process_lock(self.state_dir, identity='automatic-running'):
+            recover_local_environment(self.effects(mock.Mock()), first, self.state_dir, self.config_path)
+        run = mock.Mock(return_value=ProjectRunResult(ProjectRunKind.WAITING, 0))
+        self.assertEqual(recover_local_environment(self.effects(run), second, self.state_dir, self.config_path), 1)
+        run.assert_not_called()
+        self.assertEqual(recover_local_environment(self.effects(run), first, self.state_dir, self.config_path), 0)
+        run.assert_called_once()
+        self.assertEqual(run.call_args.kwargs['recovery_plan_id'], 'G-001')
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            self.assertEqual([r.plan_id for r in local_recovery_state.pending_requests(connection, str(self.repository.resolve()))], ['G-002'])
+
+    def test_simultaneous_intake_accepts_every_distinct_scope_and_deduplicates(self):
+        self.config_path.write_text('[loop]\n', encoding='utf-8')
+        first = self.add_recovery_plans('G-001', 'G-002')
+        second = loop_manager.build_parser().parse_args(['recover', str(self.repository), '--plan', 'G-002'])
+        run = mock.Mock()
+        effects = self.effects(run)
+        with process_lock(self.state_dir, identity='automatic-running'), ThreadPoolExecutor(max_workers=6) as pool:
+            futures = [pool.submit(recover_local_environment, effects, args, self.state_dir, self.config_path)
+                       for args in (first, second, self.arguments, first, second, self.arguments)]
+            self.assertEqual([future.result(timeout=30) for future in futures], [1] * 6)
+        run.assert_not_called()
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            queued = local_recovery_state.pending_requests(connection, str(self.repository.resolve()))
+            self.assertEqual({request.plan_id for request in queued}, {'G-001', 'G-002', None})
+            self.assertEqual(len(queued), 3)
+
+    def test_legacy_single_request_migration_preserves_audit_and_enforces_scope_uniqueness(self):
+        self.add_recovery_plans('G-001', 'G-002')
+        repo = str(self.repository.resolve())
+        with closing(loop_manager.connect_database(self.state_dir)) as connection, connection:
+            legacy = local_recovery_state.begin_request(connection, repo, 'G-001')
+            local_recovery_state.consume_recheck(connection, legacy.request_id, 'G-001', 'verify')
+            before = dict(connection.execute('SELECT * FROM local_environment_recovery_requests').fetchone())
+            connection.execute('DROP INDEX one_pending_local_recovery_per_plan')
+            connection.execute('DROP INDEX one_pending_project_local_recovery')
+            connection.execute("CREATE UNIQUE INDEX one_pending_local_recovery_per_repo "
+                               "ON local_environment_recovery_requests(repo) WHERE status = 'pending'")
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            second = local_recovery_state.begin_request(connection, repo, 'G-002')
+            project = local_recovery_state.begin_request(connection, repo, None)
+            self.assertEqual(local_recovery_state.begin_request(connection, repo, 'G-001').request_id, legacy.request_id)
+            self.assertEqual(dict(connection.execute('SELECT * FROM local_environment_recovery_requests '
+                                                    'WHERE request_id = ?', (legacy.request_id,)).fetchone()), before)
+            self.assertTrue(local_recovery_state.recheck_consumed(connection, legacy.request_id, 'G-001', 'verify'))
+            self.assertEqual([r.request_id for r in local_recovery_state.pending_requests(connection, repo)],
+                             [legacy.request_id, second.request_id, project.request_id])
+            for scope in ('G-002', None):
+                with self.subTest(scope=scope), self.assertRaises(sqlite3.IntegrityError), connection:
+                    connection.execute("INSERT INTO local_environment_recovery_requests "
+                                       "(request_id, repo, plan_id, status, before_state) VALUES (?, ?, ?, 'pending', '{}')",
+                                       ('duplicate', repo, scope))
+            local_recovery_state.complete_request(connection, legacy, 'unresolved')
+            renewed = local_recovery_state.begin_request(connection, repo, 'G-001')
+            self.assertNotEqual(renewed.request_id, legacy.request_id)
+            self.assertFalse(local_recovery_state.recheck_consumed(connection, renewed.request_id, 'G-001', 'verify'))
+            self.assertTrue(local_recovery_state.recheck_consumed(connection, legacy.request_id, 'G-001', 'verify'))
 
     def test_interrupted_scheduled_recheck_preserves_request_and_consumption(self):
         self.config_path.write_text('[loop]\n', encoding='utf-8')

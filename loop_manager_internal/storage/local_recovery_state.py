@@ -28,13 +28,18 @@ CREATE TABLE IF NOT EXISTS local_environment_recheck_consumption (
     cause TEXT NOT NULL,
     PRIMARY KEY (request_id, subject, cause)
 );
-CREATE UNIQUE INDEX IF NOT EXISTS one_pending_local_recovery_per_repo
-ON local_environment_recovery_requests(repo) WHERE status = 'pending';
+DROP INDEX IF EXISTS one_pending_local_recovery_per_repo;
+CREATE UNIQUE INDEX IF NOT EXISTS one_pending_local_recovery_per_plan
+ON local_environment_recovery_requests(repo, plan_id)
+WHERE status = 'pending' AND plan_id IS NOT NULL;
+CREATE UNIQUE INDEX IF NOT EXISTS one_pending_project_local_recovery
+ON local_environment_recovery_requests(repo)
+WHERE status = 'pending' AND plan_id IS NULL;
 """
 
 
 class LocalRecoveryRequestError(RuntimeError):
-    """A recovery request conflicts with the current durable request scope."""
+    """A recovery request cannot be recorded or resumed safely."""
 
 
 @dataclass(frozen=True)
@@ -142,49 +147,44 @@ def begin_request(
     connection: sqlite3.Connection, repo: str, plan_id: str | None,
 ) -> LocalRecoveryRequest:
     ensure_schema(connection)
-    pending = connection.execute(
-        "SELECT request_id, plan_id FROM local_environment_recovery_requests "
-        "WHERE repo = ? AND status = 'pending'",
-        (repo,),
-    ).fetchone()
-    if pending is not None:
-        current_plan = str(pending[1]) if pending[1] is not None else None
-        if current_plan != plan_id:
-            raise LocalRecoveryRequestError(
-                "다른 범위의 로컬 환경 재검사 요청이 중단된 채 남아 있습니다. "
-                f"같은 명령으로 먼저 재개하세요 (계획: {current_plan or 'project'})."
-            )
-        return LocalRecoveryRequest(str(pending[0]), repo, plan_id, "pending", True)
-    before = json.dumps(snapshot(connection, repo, plan_id), sort_keys=True, separators=(",", ":"))
-    request_id = uuid.uuid4().hex
-    try:
-        with connection:
-            connection.execute(
-                "INSERT INTO local_environment_recovery_requests "
-                "(request_id, repo, plan_id, status, before_state) VALUES (?, ?, ?, 'pending', ?)",
-                (request_id, repo, plan_id, before),
-            )
-    except sqlite3.IntegrityError as error:
-        raise LocalRecoveryRequestError(
-            "다른 로컬 환경 재검사 요청이 먼저 시작됐습니다. 같은 명령으로 재개하세요."
-        ) from error
+    # A short write transaction serializes intake even across independent CLI
+    # processes. Different scopes queue; repeated scopes reuse the same identity.
+    with connection:
+        connection.execute("BEGIN IMMEDIATE")
+        pending = connection.execute(
+            "SELECT request_id FROM local_environment_recovery_requests "
+            "WHERE repo = ? AND plan_id IS ? AND status = 'pending'",
+            (repo, plan_id),
+        ).fetchone()
+        if pending is not None:
+            return LocalRecoveryRequest(str(pending[0]), repo, plan_id, "pending", True)
+        before = json.dumps(snapshot(connection, repo, plan_id), sort_keys=True, separators=(",", ":"))
+        request_id = uuid.uuid4().hex
+        connection.execute(
+            "INSERT INTO local_environment_recovery_requests "
+            "(request_id, repo, plan_id, status, before_state) VALUES (?, ?, ?, 'pending', ?)",
+            (request_id, repo, plan_id, before),
+        )
     return LocalRecoveryRequest(request_id, repo, plan_id, "pending", False)
 
 
-def pending_request(connection: sqlite3.Connection, repo: str) -> LocalRecoveryRequest | None:
-    """Read durable requests without running DDL in scheduler worker threads."""
+def pending_requests(connection: sqlite3.Connection, repo: str) -> tuple[LocalRecoveryRequest, ...]:
+    """Read a stable intake order without DDL in scheduler worker threads."""
     if not connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' "
         "AND name = 'local_environment_recovery_requests'",
     ).fetchone():
-        return None
-    row = connection.execute(
+        return ()
+    rows = connection.execute(
         "SELECT request_id, plan_id FROM local_environment_recovery_requests "
-        "WHERE repo = ? AND status = 'pending'", (repo,),
-    ).fetchone()
-    if row is None:
-        return None
-    return LocalRecoveryRequest(str(row[0]), repo, row[1], "pending", True)
+        "WHERE repo = ? AND status = 'pending' ORDER BY created_at, rowid", (repo,),
+    )
+    return tuple(LocalRecoveryRequest(str(row[0]), repo, row[1], "pending", True) for row in rows)
+
+
+def pending_request(connection: sqlite3.Connection, repo: str) -> LocalRecoveryRequest | None:
+    requests = pending_requests(connection, repo)
+    return requests[0] if requests else None
 
 
 def recheck_consumed(connection: sqlite3.Connection, request_id: str, subject: str, cause: str) -> bool:

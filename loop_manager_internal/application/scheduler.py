@@ -8,7 +8,7 @@ from loop_manager_internal.application.contracts import ProjectRunKind
 from loop_manager_internal.application.contracts import ProjectRunResult
 from loop_manager_internal.application.contracts import ScheduledProjectResult
 from loop_manager_internal.application.commands import (
-    LocalRecoveryExecutionEffects, execute_local_recovery_request, local_recovery_request_ready,
+    LocalRecoveryExecutionEffects, execute_local_recovery_request, next_local_recovery_request,
 )
 from loop_manager_internal.config.managed_config import ManagedConfig
 from loop_manager_internal.config.managed_config import ManagedConfigError
@@ -18,7 +18,6 @@ from loop_manager_internal.runtime.contracts import RuntimeMutation
 from loop_manager_internal.runtime.handoff_gate import RuntimeHandoffGate
 from loop_manager_internal.runtime.handoff_gate import SelfMergeRuntimeHandoff
 from loop_manager_internal.runtime.handoff_gate import _runtime_handoff_signal
-from loop_manager_internal.storage import local_recovery_state
 from pathlib import Path
 import secrets
 import sqlite3
@@ -83,8 +82,8 @@ def _run_registered_project(
                         error=True,
                     )
 
-            request = local_recovery_state.pending_request(connection, project.repo)
-            if request is not None and local_recovery_request_ready(connection, request):
+            request = next_local_recovery_request(connection, project.repo)
+            if request is not None:
                 result = execute_local_recovery_request(
                     LocalRecoveryExecutionEffects(effects.operation_log, effects.run_project_result),
                     connection, state_dir, request, config_path,
