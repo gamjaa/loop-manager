@@ -3492,7 +3492,7 @@ execplan_purpose = result_validation.execplan_purpose
 
 published_execplan = _bind_effects(
     requirement_archive_service.published_execplan, lambda: requirement_archive_service.PublishedExecplanEffects(
-        parse_frontmatter=lambda *args, **kwargs: parse_frontmatter(*args, **kwargs),
+        parse_execplan_text=lambda *args, **kwargs: execplan_catalog.parse_execplan_text(*args, **kwargs),
     ),
 )
 

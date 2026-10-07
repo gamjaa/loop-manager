@@ -44,6 +44,32 @@ def accepted_text(text, revision, decision="approve", answer="Use policy A and r
 
 
 class ExecPlanDraftDocumentTest(unittest.TestCase):
+    def test_published_plan_uses_the_same_draft_contract_as_the_catalog(self):
+        legacy = plan_text("G-001", "Decision").replace("priority: normal\n", "")
+        for text in (legacy, draft_text(), draft_text().replace("draft: true", "draft: false")):
+            with self.subTest(text=text[:160]):
+                published = loop_manager.published_execplan(PATH, text)
+                self.assertEqual(published, execplan_catalog.parse_execplan_text(
+                    PATH, text, validate_sources=False))
+                self.assertEqual(published["priority"], "normal")
+        # Published history remains readable after its source leaves the live tree.
+        text = draft_text().replace("docs/PRODUCT.md", "docs/requirements/[R-999] Retired.md")
+        self.assertIs(loop_manager.published_execplan(PATH, text)["draft"], True)
+
+    def test_published_draft_rejects_invalid_readiness_and_decision_fields(self):
+        for value in ("yes", "TRUE", "1", "[]", ""):
+            with self.subTest(value=value), self.assertRaisesRegex(RuntimeError, "draft"):
+                loop_manager.published_execplan(PATH, draft_text().replace("draft: true", "draft: " + value))
+        for field in ("Question", "Facts", "Options", "Impact"):
+            with self.subTest(field=field), self.assertRaisesRegex(RuntimeError, "Draft Decision"):
+                loop_manager.published_execplan(PATH, draft_text().replace(field + ":", "Missing:"))
+        for text in (draft_text().replace("risk: low", "risk: invalid"),
+                     draft_text().replace("docs/PRODUCT.md", "README.md"),
+                     draft_text().replace("depends_on: []", "depends_on:\n  - invalid"),
+                     draft_text().replace("draft: true", "draft: true\nstatus: READY")):
+            with self.subTest(text=text[:160]), self.assertRaises(RuntimeError):
+                loop_manager.published_execplan(PATH, text)
+
     def test_optional_strict_readiness_and_required_question_contract(self):
         legacy = execplan_catalog.parse_execplan_text(PATH, plan_text("G-001", "Decision"))
         self.assertNotIn("draft", legacy)
@@ -132,6 +158,17 @@ class ExecPlanDraftDocumentTest(unittest.TestCase):
 
 
 class ExecPlanDraftCatalogTest(AutomationCatalogFixture, unittest.TestCase):
+    def test_published_draft_can_be_snapshotted_without_releasing_its_hold(self):
+        row = self.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-001'"
+        ).fetchone()
+        snapshot = loop_manager._ready_plan_snapshot_from_contents(row, self.text.encode())
+        self.assertIs(snapshot.draft, True)
+        self.assertEqual(snapshot.text, self.text)
+        self.assertEqual(snapshot.content_hash, row["content_hash"])
+        self.assertEqual(execplan_draft_state.pending_ids(self.connection, "repo"), {"G-001"})
+        self.assertIsNone(loop_manager.select_ready_execplan(self.connection, "repo"))
+
     def setUp(self):
         self.connection = self._connection()
         self.inputs = {"docs/PRODUCT.md": "product", "docs/ARCHITECTURE.md": "architecture"}
