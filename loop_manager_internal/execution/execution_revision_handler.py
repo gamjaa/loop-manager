@@ -9,8 +9,6 @@ from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, RecoveryFailure
 from loop_manager_internal.execution.execution_revision import DefinitionDelta, DefinitionSnapshot, RevisionGateKind, StageArtifacts, WORKER_INVALIDATING_DELTAS, decide_revision_gate
 from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind, ExecutionPhase
-from loop_manager_internal.storage.requirement_archive_state import ArchiveTargetRepository, ArchiveTargetConflict
-from loop_manager_internal.catalog.requirement_archive_recovery import ArchiveRecoveryPorts, ArchiveRecoveryService
 from loop_manager_internal.execution.worker_outcome import WorkerOutcomeError
 from loop_manager_internal.git.command_adapter import ExternalObservationError
 
@@ -37,17 +35,11 @@ class RevisionHandlerPorts:
     operation_log: Callable[..., Any]
     operation_print: Callable[..., Any]
     parse_worker_result: Callable[..., Any]
-    pr_for_branch: Callable[..., Any]
     reconcile_catalog: Callable[..., Any]
     record_remote_publication_branch: Callable[..., Any]
-    requirement_archive_snapshot: Callable[..., Any]
-    requirement_archive_sources: Callable[..., Any]
-    requirement_archive_touched_sources: Callable[..., Any]
     source_fingerprint: Callable[..., Any]
     unmet_dependencies: Callable[..., Any]
     validate_active_execplan_metadata: Callable[..., Any]
-    _archive_collision: Callable[..., ExecutionOutcome]
-    _archive_workspace_owned: Callable[..., Any]
     _block_final: Callable[..., ExecutionOutcome]
     _block_worker_decision: Callable[..., ExecutionOutcome]
     _cached_plan: Callable[..., Mapping[str, object]]
@@ -382,14 +374,7 @@ class RevisionHandler:
         self.ports.update_snapshot(catalog_plan=catalog_plan)
         self.ports.update_snapshot(plan=self.ports._cached_plan(catalog_plan))
         try:
-            # Document approval identity remains mandatory independently of
-            # the retired execution-time Requirement archive calculation.
             self.ports._document_draft(context)
-            # Requirement retirement is assessed after the related plans MERGE.
-            # An old execution archive target is never an implementation input.
-            archive_sources = ()
-            archive_snapshot = None
-            archive_candidates = ()
             from loop_manager_internal.execution.manual_candidate import get_manual
             manual = get_manual(self.ports.state)
             if manual and manual.enabled():
@@ -414,7 +399,7 @@ class RevisionHandler:
                     source_fingerprint=self.ports.source_fingerprint(
                         self.ports.identity.repo_path, latest_sha, catalog_plan
                     ),
-                    archive_candidates=tuple(sorted(archive_candidates)),
+                    archive_candidates=(),
                     guidance_hash=common_guidance.plan_content_hash(
                         self.ports.state.connection, self.ports.identity.repo, str(catalog_plan['plan_id']),
                     ),
@@ -437,18 +422,6 @@ class RevisionHandler:
             raise
         except self.ports.contract.GitLockError as error:
             return self.ports._recover(RecoveryReason.GIT_LOCK, str(error), context=context)
-        except self.ports.contract.RequirementArchiveCollisionError as error:
-            return self.ports._archive_collision(context, error)
-        except self.ports.contract.RequirementArchiveError as error:
-            if self.ports._fetch_latest_base() != latest_sha:
-                return self.ports._recover(
-                    RecoveryReason.REMOTE_SNAPSHOT_RACE,
-                    'Requirement archive 계산 중 원격 base가 변경됐습니다.',
-                    context=context,
-                )
-            return self._revision_error(
-                context, f"ExecPlan revision gate 확인 실패: {error}"
-            )
         except (ExternalObservationError, OSError) as error:
             return self.ports._recover(RecoveryReason.STATUS_FAILED, str(error), context=context)
         except (RuntimeError, ValueError) as error:
@@ -522,11 +495,12 @@ class RevisionHandler:
             unmet_dependencies=tuple(unmet),
             candidate_head=candidate_head,
         )
-        self.ports.update_snapshot(archive_sources=tuple(archive_sources))
-        self.ports.update_snapshot(archive_candidates=tuple(archive_candidates))
-        self.ports.update_snapshot(archive_scope_sources=tuple(sorted(set(archive_candidates))))
-        self.ports.update_snapshot(_archive_snapshot=archive_snapshot)
-
+        self.ports.update_snapshot(
+            archive_sources=(),
+            archive_candidates=(),
+            archive_scope_sources=(),
+            _archive_snapshot=None,
+        )
         if decision.kind is RevisionGateKind.FINAL_SAFETY_ERROR:
             return self._revision_error(context, str(decision.detail))
         if decision.kind is RevisionGateKind.WAIT:
@@ -589,47 +563,6 @@ class RevisionHandler:
             ))
             return self.ports._context()
         if str(row['active_sha'] or '') != latest_sha:
-            if self.ports.snapshot()._archive_snapshot is not None:
-                try:
-                    workspace_owned = self.ports._archive_workspace_owned(context)
-                except RecoveryFailure as error:
-                    return self.ports._recover(error.reason, str(error), context=context)
-                if not workspace_owned:
-                    return self.ports._recover(
-                        RecoveryReason.OWNERSHIP_UNCERTAIN,
-                        'Requirement archive 관리 worktree와 ExecPlan HEAD의 소유권을 확인할 수 없습니다.',
-                        context=context,
-                    )
-                repository = ArchiveTargetRepository(self.ports.state.connection)
-                previous_target = repository.get(self.ports.identity.repo, str(self.ports.snapshot().plan['id']))
-                try:
-                    repository.put(
-                        self.ports.identity.repo, self.ports.snapshot()._archive_snapshot,
-                        expected_execution=self.ports.state.expected,
-                        expected_generation=(
-                            previous_target.generation if previous_target else None
-                        ),
-                        base_is_current=lambda oid: self.ports._fetch_latest_base() == oid,
-                        snapshot_is_current=lambda: (
-                            self.ports.requirement_archive_snapshot(
-                                self.ports.identity.repo_path, self.ports.identity.repo, latest_sha,
-                                str(self.ports.snapshot().plan['id']),
-                            ).token == self.ports.snapshot()._archive_snapshot.token
-                        ),
-                        stage='OBSERVED',
-                    )
-                except ArchiveTargetConflict:
-                    return self.ports._recover(
-                        RecoveryReason.REMOTE_SNAPSHOT_RACE,
-                        'Requirement archive rebase 대상 snapshot이 변경됐습니다.',
-                        context=context,
-                    )
-                except self.ports.contract.RequirementArchiveCollisionError as error:
-                    return self.ports._archive_collision(context, error)
-                except self.ports.contract.RequirementArchiveError as error:
-                    return self.ports._recover(
-                        RecoveryReason.CATALOG_INVALID, str(error), context=context
-                    )
             return self.ports._refresh_revision_base(
                 context,
                 snapshot,
@@ -655,109 +588,12 @@ class RevisionHandler:
             self.ports.update_snapshot(level=self.ports.ensure_worker_level_state(
                 self.ports.identity.repo, self.ports.snapshot().plan
             ))
-            if self.ports.snapshot().archive_sources and self.ports._row()['phase'] == 'WORKING':
-                self.ports.update_snapshot(archive_scope_sources=tuple(
-                    sorted(
-                        set(self.ports.snapshot().archive_candidates)
-                        | set(
-                            self.ports.requirement_archive_touched_sources(
-                                self.ports.identity.repo_path,
-                                latest_sha,
-                                context.worktree,
-                            )
-                        )
-                    )
-                ))
         except RecoveryFailure:
             raise
         except (ExternalObservationError, OSError) as error:
             return self.ports._recover(RecoveryReason.STATUS_FAILED, str(error), context=context)
         except RuntimeError as error:
             return self._revision_error(context, str(error))
-        if self.ports.snapshot()._archive_snapshot is not None:
-            def require_next_guard(_base):
-                raise RecoveryFailure(
-                    RecoveryReason.BASE_BEHIND,
-                    'Requirement archive 복구 중 새 원격 base를 관측했습니다.',
-                )
-
-            def reconcile_catalog(_base):
-                try:
-                    return self.ports.reconcile_catalog(
-                        self.ports.identity.repo_path, self.ports.identity.repo, self.ports.identity.base
-                    )
-                except self.ports.contract.GitLockError as error:
-                    raise RecoveryFailure(RecoveryReason.GIT_LOCK, str(error)) from error
-
-            def applied_base():
-                try:
-                    return self.ports.git(
-                        context.worktree, 'merge-base', 'HEAD',
-                        f'origin/{self.ports.identity.base}',
-                    ).stdout.strip()
-                except self.ports.contract.GitLockError as error:
-                    raise RecoveryFailure(RecoveryReason.GIT_LOCK, str(error)) from error
-                except RuntimeError as error:
-                    raise RecoveryFailure(RecoveryReason.STATUS_FAILED, str(error)) from error
-
-            def calculate_snapshot(oid):
-                try:
-                    return self.ports.requirement_archive_snapshot(
-                        self.ports.identity.repo_path, self.ports.identity.repo, oid, str(self.ports.snapshot().plan['id'])
-                    )
-                except self.ports.contract.GitLockError as error:
-                    raise RecoveryFailure(RecoveryReason.GIT_LOCK, str(error)) from error
-
-            ports = ArchiveRecoveryPorts(
-                fetch_base=self.ports._fetch_latest_base,
-                observe_pull_request=lambda: self.ports.pr_for_branch(
-                    self.ports.identity.repo_path, context.branch, context.pr_url or ''
-                ),
-                reconcile_catalog=reconcile_catalog,
-                workspace_owned=lambda: self.ports._archive_workspace_owned(context),
-                applied_base=applied_base,
-                refresh_worktree=require_next_guard,
-                calculate_snapshot=calculate_snapshot,
-                current_base=self.ports._fetch_latest_base,
-                execution_snapshot=lambda: self.ports.state.expected,
-                plan_revision=lambda: (
-                    str(self.ports.snapshot().catalog_plan['current_revision_sha'])
-                    if self.ports.snapshot().catalog_plan is not None
-                    and self.ports.snapshot().catalog_plan['current_revision_sha'] is not None
-                    else None
-                ),
-            )
-            try:
-                recovered = ArchiveRecoveryService(
-                    ArchiveTargetRepository(self.ports.state.connection),
-                    ports,
-                ).run()
-            except RecoveryFailure as error:
-                return self.ports._recover(
-                    error.reason, str(error), context=context
-                )
-            except self.ports.contract.RequirementArchiveCollisionError as error:
-                return self.ports._archive_collision(context, error)
-            except self.ports.contract.RequirementArchiveError as error:
-                reason = (
-                    RecoveryReason.REMOTE_SNAPSHOT_RACE
-                    if self.ports._fetch_latest_base() != latest_sha
-                    else RecoveryReason.CATALOG_INVALID
-                )
-                return self.ports._recover(reason, str(error), context=context)
-            if recovered.decision is not None:
-                return self.ports._recover(
-                    recovered.decision.observation.reason,
-                    recovered.decision.observation.detail,
-                    context=context, attempts=recovered.decision.attempts,
-                    user_targets=recovered.decision.observation.user_targets,
-                )
-            if recovered.snapshot is None or recovered.snapshot.token != self.ports.snapshot()._archive_snapshot.token:
-                return self.ports._recover(
-                    RecoveryReason.CATALOG_CACHE_STALE,
-                    'Requirement archive snapshot이 변경되어 최신 선언으로 다시 평가합니다.',
-                    context=context,
-                )
         return self.ports._context()
 
     def _post_effect_guard(self, context):

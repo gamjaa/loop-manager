@@ -415,6 +415,12 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
     def test_guard_ignores_stale_archive_target_without_resetting_worker_session(self):
         source = 'docs/requirements/source.md'
         self.effects.archive.requirement_archive_sources.return_value = (source,)
+        self.handler.archive_sources = (source,)
+        self.handler.archive_candidates = (source,)
+        self.handler.archive_scope_sources = (source,)
+        self.handler._archive_snapshot = ArchiveSnapshot(
+            'base', 'old-catalog', 'old-state', 'G-047', (source,), (),
+        )
         from loop_manager_internal.storage.requirement_archive_state import ensure_schema
         ensure_schema(self.connection)
         self.connection.execute(
@@ -425,12 +431,16 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
             ('repo', 'G-047', 4, 'base', 'stale', 'stale', 'stale',
              '["docs/requirements/source.md"]', None, 'VALIDATED', 0),
         )
-        self.state.update_project('repo', worker_session_id='saved-session')
+        self.state.update_project(
+            'repo', worker_session_id='saved-session',
+            archive_token='saved-archive-token',
+        )
 
         result = self.handler.guard(self.context())
 
         self.assertNotIsInstance(result, ExecutionOutcome)
         self.assertEqual(result.archive_sources, ())
+        self.assertEqual(result.archive_candidate_scope, ())
         self.assertIsNone(result.archive_snapshot_token)
         target = self.connection.execute(
             'SELECT snapshot_token, stage FROM requirement_archive_targets '
@@ -438,7 +448,10 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
         ).fetchone()
         self.assertEqual((target['snapshot_token'], target['stage']), ('stale', 'VALIDATED'))
         self.assertEqual(self.state.row()['worker_session_id'], 'saved-session')
+        self.assertEqual(self.state.row()['archive_token'], 'saved-archive-token')
+        self.effects.archive.requirement_archive_sources.assert_not_called()
         self.effects.archive.requirement_archive_snapshot.assert_not_called()
+        self.effects.archive.requirement_archive_touched_sources.assert_not_called()
         self.effects.blocking.block_active_execplan.assert_not_called()
 
 
@@ -727,6 +740,7 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
         self.assertEqual(self.state.row()['phase'], 'WORKING')
         self.assertEqual(self.state.row()['verify_result'], 'saved verify')
         self.assertEqual(self.state.row()['review_result'], 'saved review')
+        self.effects.archive.requirement_archive_candidates.assert_called_once()
         self.effects.blocking.block_active_execplan.assert_not_called()
 
 
