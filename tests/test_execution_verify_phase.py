@@ -466,8 +466,13 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
 
 
     def test_review_entry_accepts_empty_successful_verify_output(self):
-        context = self.review_context()
-        self.state.update_project('repo', verify_result='')
+        self.review_context()
+        definition = self.handler._snapshot()._definition_snapshot
+        self.state.update_project(
+            'repo', verify_result='',
+            verify_token=definition.verify_token('base', 'base', ''),
+        )
+        context = self.handler._context()
 
         outcome = self.handler.review(context)
 
