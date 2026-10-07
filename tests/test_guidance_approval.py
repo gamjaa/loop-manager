@@ -145,6 +145,35 @@ class GuidanceInputContractTest(unittest.TestCase):
         second = self.parse(guidance_plan() + "\n## Other section\nEdited\n")
         self.assertNotEqual(first.structure_hash, second.structure_hash)
 
+    def test_marker_addition_matches_saved_legacy_suffix_without_ignoring_edits(self):
+        suffix = "## Existing section\nProtected text\n## Another section\nMore text\n"
+        original = self.parse(guidance_plan() + suffix)
+        for memo in ("", "A note\n", "## Memo\nDecision: `reject`\n"):
+            text = self.form("approve") + memo + suffix
+            document = self.parse(text)
+            self.assertTrue(document.matches_structure_hash(original.structure_hash))
+            for edited in (text.replace("Protected text", "Edited text"),
+                           text.replace("More text", "Edited text"),
+                           text.replace("Test.", "Edited purpose")):
+                self.assertFalse(self.parse(edited).matches_structure_hash(original.structure_hash))
+        for text in (self.form("approve"), self.form("approve") + suffix.split("## Another", 1)[0]):
+            self.assertFalse(self.parse(text).matches_structure_hash(original.structure_hash))
+
+    def test_indented_backticks_in_real_diff_context_do_not_close_fence(self):
+        original = b"# Agents\n    ```\n"
+        patch = "diff --git a/AGENTS.md b/AGENTS.md\n--- a/AGENTS.md\n+++ b/AGENTS.md\n@@ -1,2 +1,3 @@\n # Agents\n     ```\n+Approved rule\n"
+        text = guidance_plan(decision="approve", patch=patch).replace(PATCH, patch)
+        for value in (text, text + "<!-- END USER DECISION -->\n", text.replace("\n", "\r\n")):
+            proposal, = self.parse(value).proposals
+            self.assertEqual(proposal.patch, patch)
+            self.assertEqual(guidance_approval.finalized_patch(proposal), patch)
+        self.assertEqual(guidance_approval.apply_patch_to_content(original, "AGENTS.md", patch),
+                         b"# Agents\n    ```\nApproved rule\n")
+        for indentation in (1, 3, 5, 8):
+            context_patch = patch.replace("     ```", " " * indentation + "```")
+            proposal, = self.parse(guidance_plan(decision="replace", patch=context_patch).replace(PATCH, context_patch)).proposals
+            self.assertEqual(proposal.decision.patch, context_patch)
+
     def test_pending_edited_patch_waits_approve_requires_replace(self):
         edited = PATCH.replace("Approved rule", "Edited rule")
         pending = self.parse(self.form(patch=edited)).proposals[0]
@@ -239,6 +268,68 @@ class GuidanceInputContractTest(unittest.TestCase):
         self.assertEqual(first.structure_hash, second.structure_hash)
         with self.assertRaises(guidance_approval.GuidanceFormatError):
             self.parse(valid + "## Validation\n### Agent Guidance User Decision: hidden\n")
+
+
+class LegacyGuidanceMarkerResumeTest(unittest.TestCase):
+    def test_decision_and_marker_resume_with_unchanged_legacy_sections(self):
+        from dataclasses import fields
+        from tests.support.database import runtime_connection
+        from loop_manager_internal.documents import guidance_service as service
+        suffix = "## Existing section\nProtected text\n"
+        saved = guidance_approval.parse_guidance_document(guidance_plan() + suffix)
+        for newline, decision, changed, expected in (
+            ("\n", "approve", False, True), ("\r\n", "approve", False, True),
+            ("\n", "pending", False, False), ("\n", "approve", True, False),
+        ):
+            with self.subTest(newline=newline, decision=decision, changed=changed):
+                connection = runtime_connection()
+                self.addCleanup(connection.close)
+                connection.execute(
+                    "UPDATE exec_plans SET status = 'PLAN_BLOCKED', branch = 'branch', worktree = '/work', "
+                    "worker_session_id = 'same-session', guidance_plan_hash = ? WHERE plan_id = 'G-047'",
+                    (saved.structure_hash,),
+                )
+                proposal, = saved.proposals
+                connection.execute(
+                    "INSERT INTO guidance_approvals (repo, plan_id, proposal_id, proposal_hash, target_path, scope, "
+                    "proposal_patch, proposal_patch_hash, proposal_line, decision_line, batch_id, sequence, baseline_content, baseline_mode) "
+                    "VALUES ('repo', 'G-047', ?, ?, 'AGENTS.md', 'project', ?, ?, ?, ?, 'batch', 0, ?, 420)",
+                    (proposal.proposal_id, proposal.identity, PATCH, guidance_approval.guidance_patch_hash('AGENTS.md', PATCH),
+                     proposal.line, proposal.decision.line, b'# Agents\n'),
+                )
+                connection.commit()
+                plan = connection.execute("SELECT * FROM exec_plans WHERE plan_id = 'G-047'").fetchone()
+                updated = (guidance_plan(decision=decision) + "<!-- END USER DECISION -->\n## Memo\nA user note\n" + suffix)
+                if changed:
+                    updated = updated.replace('Protected text', 'Changed section')
+                document = guidance_approval.parse_guidance_document(updated.replace('\n', newline))
+                ports = {field.name: mock.Mock() for field in fields(service.ResumeGuidanceApprovalIfDecidedEffects)}
+                ports.update(
+                    _plan_block_selected_for_release=mock.Mock(return_value=plan),
+                    _rebase_in_progress_for_branch=mock.Mock(return_value=False),
+                    _guidance_document=mock.Mock(return_value=document),
+                    _guidance_rows=lambda *args: tuple(connection.execute('SELECT * FROM guidance_approvals')),
+                    _guidance_document_matches_rows=service._guidance_document_matches_rows,
+                    _guidance_final_expected=loop_manager._guidance_final_expected,
+                    _guidance_target_state=mock.Mock(return_value=(b'# Agents\n', 0o644)),
+                    is_loop_manager_repository=mock.Mock(return_value=False),
+                    finalized_patch=guidance_approval.finalized_patch,
+                    guidance_patch_hash=guidance_approval.guidance_patch_hash,
+                )
+                effects = service.ResumeGuidanceApprovalIfDecidedEffects(**ports)
+                self.assertEqual(service.resume_guidance_approval_if_decided(
+                    effects, connection, Path('/repo'), 'repo', 'main', Path('/state')), expected)
+                stored = connection.execute("SELECT * FROM exec_plans WHERE plan_id = 'G-047'").fetchone()
+                self.assertEqual(stored['status'], 'IMPLEMENTING' if expected else 'PLAN_BLOCKED')
+                self.assertEqual(stored['worker_session_id'], 'same-session')
+                self.assertEqual(stored['guidance_plan_hash'], saved.structure_hash)
+                row = connection.execute('SELECT * FROM guidance_approvals').fetchone()
+                self.assertEqual(row['decision'], 'approve' if expected else 'pending')
+                self.assertEqual(row['approved_patch'], PATCH if expected else None)
+                if expected:
+                    effects._update_blocked_error.assert_not_called()
+                elif changed:
+                    self.assertIn('User Decision 이외', effects._update_blocked_error.call_args.args[-1])
 
 
 class GuidanceRuntimeTest(unittest.TestCase):

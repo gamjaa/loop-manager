@@ -15,6 +15,7 @@ from loop_manager_internal.application import project_service
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.recovery import blocked_checkpoint, checkpoint_adapter, project_block_service
 from loop_manager_internal.storage import agent_invocation_state, blocked_checkpoint_state
+from loop_manager_internal.documents.guidance_approval import GuidanceDocument
 from tests.support.database import runtime_connection
 
 
@@ -60,7 +61,7 @@ class CheckpointScopeTests(TestCase):
             _proven_merged_cleanup_paths=lambda *_: frozenset(),
             _owned_checkpoint_remote_oid=lambda *_: None,
             _guidance_rows=lambda *_: [{'invalidated_decision_hash': None}],
-            _guidance_document=lambda *_: SimpleNamespace(structure_hash='document'),
+            _guidance_document=lambda *_: GuidanceDocument((), 'document'),
             _guidance_document_matches_rows=lambda *_args, **_kwargs: None,
             _published_plan_allows_common_plans=lambda *_: False)
         self.adapter = checkpoint_adapter.BlockedCheckpointAdapter(
@@ -119,6 +120,8 @@ class CheckpointScopeTests(TestCase):
                     self.assertFalse(self.adapter.assess(self.request).safe)
 
     def test_guidance_result_validation_uses_saved_invocation_context(self):
+        self.effects = replace(self.effects,
+            _guidance_document=lambda *_: GuidanceDocument((), 'new-format', ('document',)))
         result = replace(self.before, refs={**self.before.refs, 'refs/heads/B': ('new', '')})
         self.connection.execute('UPDATE exec_plans SET agent_result_snapshot=?', (result.serialize(),))
         with (mock.patch.object(manager, '_agent_git_resources', return_value=self.resources),
@@ -225,7 +228,7 @@ class CheckpointScopeTests(TestCase):
         effects = {field.name: mock.Mock() for field in fields(project_block_service.ReconcileGuidanceDoubleBlockEffects)}
         effects.update(_canonical_path=lambda path: path.resolve(),
             _guidance_checkpoint_commit_evidence=lambda *_: '결정 대기',
-            _guidance_document=lambda *_: SimpleNamespace(structure_hash='document'),
+            _guidance_document=lambda *_: GuidanceDocument((), 'new-format', ('document',)),
             _guidance_rows=lambda *_: [{'applied': 0, 'invalidated_decision_hash': None,
                 'decision_hash': None, 'target_path': 'AGENTS.md', 'baseline_content': b'rules', 'baseline_mode': 0o100644}],
             _guidance_document_matches_rows=lambda *_args, **_kwargs: ({}, ()),

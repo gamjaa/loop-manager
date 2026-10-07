@@ -74,6 +74,11 @@ class GuidanceProposal:
 class GuidanceDocument:
     proposals: tuple[GuidanceProposal, ...]
     structure_hash: str
+    legacy_structure_hashes: tuple[str, ...] = ()
+
+    def matches_structure_hash(self, expected: str) -> bool:
+        """Also recognize a saved legacy boundary without discarding its suffix."""
+        return expected == self.structure_hash or expected in self.legacy_structure_hashes
 
 
 _PROPOSAL_ID = r"[a-z0-9][a-z0-9-]{0,63}"
@@ -100,16 +105,22 @@ def _outside_fences(text: str) -> str:
     """Mask fenced code while preserving offsets and line numbers."""
     lines = []
     fence = ""
+    closing_indent = 3
     for line in text.splitlines(keepends=True):
-        stripped = line.strip()
         if fence:
-            if re.fullmatch(re.escape(fence[0]) + "{" + str(len(fence)) + r",}[ \t]*", stripped):
+            if re.fullmatch(
+                r"[ \t]{0," + str(closing_indent) + "}" + re.escape(fence[0])
+                + "{" + str(len(fence)) + r",}[ \t]*\n?", line,
+            ):
                 fence = ""
             lines.append(re.sub(r"[^\n]", " ", line))
         else:
             opening = re.match(r"^[ \t]{0,3}(`{3,}|~{3,})", line)
             if opening:
                 fence = opening.group(1)
+                # Unified diff context begins with a space. Only a column-zero
+                # fence closes our diff format; indented backticks are data.
+                closing_indent = 0 if line[opening.end():].strip() == "diff" else 3
                 lines.append(re.sub(r"[^\n]", " ", line))
             else:
                 lines.append(line)
@@ -423,7 +434,20 @@ def parse_guidance_document(text: str) -> GuidanceDocument | None:
         + normalized[log_start + len(decision_log):]
     )
     structure_hash = _identity("loop-manager-guidance-plan-v1", structure)
-    return GuidanceDocument(tuple(proposals), structure_hash)
+    legacy_structure_hashes = []
+    for section in re.finditer(r"(?m)^## (?!#)", visible_log):
+        if any(heading.start() > section.start() for _, heading in headings):
+            continue
+        # A marker/memo may precede a formerly protected section. Compare its
+        # exact suffix against the saved legacy hash; never rewrite that hash
+        # or infer an existing section from its title. New memo headings before
+        # the original suffix do not prevent this exact comparison.
+        legacy_structure = (
+            normalized[:log_start] + "".join(structure_parts)
+            + normalized[log_start + section.start():]
+        )
+        legacy_structure_hashes.append(_identity("loop-manager-guidance-plan-v1", legacy_structure))
+    return GuidanceDocument(tuple(proposals), structure_hash, tuple(legacy_structure_hashes))
 
 
 def finalized_patch(proposal: GuidanceProposal) -> str | None:

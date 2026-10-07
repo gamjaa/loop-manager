@@ -15,6 +15,7 @@ from loop_manager_internal.git import command_adapter, manager_git_journal, sour
 from loop_manager_internal.recovery import pull_request_recovery
 from loop_manager_internal.runtime.contracts import BaseWorktreeSnapshot, WorkspaceOwnershipError
 from loop_manager_internal.storage.execplan_archive_state import MergedArchiveCandidate
+from loop_manager_internal.documents.guidance_approval import GuidanceDocument
 from tests.support.database import runtime_connection
 
 
@@ -106,7 +107,7 @@ class CheckpointRecoveryBoundaryRegressionTests(unittest.TestCase):
             validate_execplan_workspace_identity=None, validate_managed_worktree=None,
             capture_git_snapshot=self.snapshot, _owned_checkpoint_remote_oid='published',
             _guidance_checkpoint_commit_evidence=evidence,
-            _guidance_document=SimpleNamespace(structure_hash='guidance-hash'), _guidance_rows=[guidance],
+            _guidance_document=GuidanceDocument((), 'guidance-hash'), _guidance_rows=[guidance],
             _guidance_document_matches_rows=({'guidance': proposal}, ()),
             _guidance_target_state=(b'# Agents\n', 0o644), _proven_merged_cleanup_paths=frozenset(),
             _proven_manager_base_refs=frozenset(), operation_log=None)

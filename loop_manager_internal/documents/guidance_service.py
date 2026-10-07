@@ -535,7 +535,7 @@ def resume_guidance_approval_if_decided(
         document = effects._guidance_document(worktree, str(plan["path"]))
         if document is None:
             raise AgentScopeError("저장된 guidance 제안이 ExecPlan에서 사라졌습니다.")
-        if document.structure_hash != str(plan["guidance_plan_hash"] or ""):
+        if not document.matches_structure_hash(str(plan["guidance_plan_hash"] or "")):
             raise AgentScopeError(
                 "User Decision 이외의 ExecPlan 변경으로 guidance 승인을 해제할 수 없습니다."
             )
