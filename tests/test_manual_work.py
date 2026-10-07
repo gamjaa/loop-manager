@@ -796,6 +796,63 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
                     update_source(service,current)
                     spy.assert_not_called()
 
+    def test_source_update_descendant_equal_reinterruptions_and_rewrite(self):
+        from loop_manager_internal.git import manager_git_journal as journal
+        from loop_manager_internal.git.manual_source_update import update_source
+        for boundary in ('before_result','after_result','sqlite'):
+            for rewrite in (False,True):
+                with self.subTest(boundary=boundary,rewrite=rewrite),tempfile.TemporaryDirectory() as directory:
+                    service,group,_=self.pending_source(directory)
+                    real_git=service.effects.git
+                    def after_push(target,*arguments,**kwargs):
+                        result=real_git(target,*arguments,**kwargs)
+                        if arguments[0]=='push':
+                            raise KeyboardInterrupt('after exact push')
+                        return result
+                    service.effects=replace(service.effects,git=after_push)
+                    with self.assertRaises(KeyboardInterrupt):
+                        update_source(service,group)
+                    service.effects=replace(service.effects,git=real_git)
+                    saved=service.store.get(service.repo,group['group_id'])
+                    service.fetch(group['branch'])
+                    later=self.remote_followup(service,group,directory)
+                    write=journal._write_new
+                    def interrupt_equal(path,value):
+                        equal=value.get('status')=='equal'
+                        if equal and boundary=='before_result':
+                            raise KeyboardInterrupt('before equal receipt')
+                        write(path,value)
+                        if equal and boundary=='after_result':
+                            raise KeyboardInterrupt('after equal receipt')
+                    with contextlib.ExitStack() as stack:
+                        stack.enter_context(mock.patch.object(journal,'_write_new',side_effect=interrupt_equal))
+                        if boundary=='sqlite':
+                            stack.enter_context(mock.patch.object(service.runtime,'update_plan',side_effect=KeyboardInterrupt))
+                        with self.assertRaises(KeyboardInterrupt):
+                            update_source(service,saved)
+                    ref=f"refs/heads/{group['branch']}"
+                    if rewrite:
+                        tree=git_command(service.repo_path,'rev-parse',f"{group['prepared_head']}^{{tree}}")
+                        later=git_command(service.repo_path,'commit-tree',tree,'-p',group['prepared_head'],
+                                          '-m','Remove published candidate and descendant')
+                        git_command(service.repo_path,'push','--force','origin',f'{later}:{ref}')
+                    spy=mock.Mock(wraps=real_git)
+                    service.effects=replace(service.effects,git=spy)
+                    if rewrite:
+                        with self.assertRaisesRegex(RuntimeError,'게시 완료한 source 후보'):
+                            update_source(service,saved)
+                        self.assertEqual(dict(service.store.get(service.repo,group['group_id'])),dict(saved))
+                    else:
+                        current=update_source(service,saved)
+                        self.assertEqual(current['prepared_head'],later)
+                        self.assertEqual(current['request_id'],group['request_id'])
+                        self.assertEqual(current['members'],group['members'])
+                        self.assertIsNone(current['pending_source_head'])
+                        self.assertFalse(journal.has_pending_project_mutation(service.state_dir,service.repo))
+                    self.assertFalse(any(call.args[1]=='push' for call in spy.call_args_list))
+                    self.assertEqual(service.fetch(group['branch']),later)
+                    self.assertEqual(service.fetch('source'),group['pending_source_head'])
+
     def test_saved_source_candidate_without_matching_basis_never_pushes(self):
         from loop_manager_internal.git.manual_source_update import update_source
         with tempfile.TemporaryDirectory() as directory:

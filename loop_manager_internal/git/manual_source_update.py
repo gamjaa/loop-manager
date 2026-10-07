@@ -25,8 +25,17 @@ def update_source(service, group):
     def observe():
         return {'oid':manager_git_journal.live_remote_branch_oid(effects.git,service.repo_path,group['branch'])}
     def matches(intent):
-        return (intent['owner']==owner and intent['before']=={'oid':before}
-                and intent['expected']=={'oid':candidate})
+        if (intent['owner']!=owner or intent['repo']!=service.repo
+                or intent['kind']!='manual_branch_push' or intent['target']!=target):
+            return False
+        if intent['before']=={'oid':before} and intent['expected']=={'oid':candidate}:
+            return True
+        # A durable equal observation can belong to this candidate's later
+        # history. It grants no lease to republish the saved candidate.
+        return (intent['before']==intent['expected']
+                and set(intent['expected'])=={'oid'} and bool(candidate)
+                and not effects.git(service.repo_path,'merge-base','--is-ancestor',
+                    candidate,intent['expected']['oid'],check=False).returncode)
     if candidate:
         if not before or effects.git(service.repo_path,'rev-list','--parents','-n','1',candidate).stdout.split() != [candidate,*dict.fromkeys((before,incoming))]:
             raise RuntimeError('저장 source 후보의 원격 기준·제출 commit 근거가 없습니다. 후보와 작업물을 보존했습니다.')
@@ -35,12 +44,22 @@ def update_source(service, group):
         published=not effects.git(service.repo_path,'merge-base','--is-ancestor',candidate,remote,check=False).returncode
         slot=manager_git_journal._slot(service.state_dir,service.repo,'manual_branch_push',target)
         if not published:
+            # Equal intents are written only after observing their exact OID.
+            # Even interruption before their receipt (or later retirement)
+            # must not erase the fact that this candidate was published.
+            for path in slot.glob('*.intent.json'):
+                intent=manager_git_journal._read(path)
+                if intent['before']==intent['expected'] and matches(intent):
+                    manager_git_journal.verified_transition(intent,intent['expected'],True)
+                    raise RuntimeError('게시 완료한 source 후보가 원격 이력에서 제거됐습니다. 후보와 작업물을 보존했습니다.')
             for receipt in slot.glob('*.result.json'):
                 result=manager_git_journal._read(receipt)
                 if result['status'] in {'complete','equal'} and result['observed']=={'oid':candidate}:
                     intent=manager_git_journal._read(slot/f"{result['id']}.intent.json")
                     if matches(intent):
-                        manager_git_journal.verified_transition(intent,result['observed'],True)
+                        if (result['id']!=intent['id'] or result['candidates']!=
+                                manager_git_journal.verified_transition(intent,result['observed'],True)):
+                            raise manager_git_journal.MutationEvidenceError('저장 source 후보의 게시 완료 근거가 다릅니다.')
                         raise RuntimeError('게시 완료한 source 후보가 원격 이력에서 제거됐습니다. 후보와 작업물을 보존했습니다.')
         if remote not in (before,candidate):
             active=slot/'active.json'
