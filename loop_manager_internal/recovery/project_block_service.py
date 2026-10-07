@@ -113,7 +113,7 @@ def _legacy_verify_matches_candidate(connection, plan, start, result, current) -
     ).fetchone()
     return bool(audit and audit['classification'] == 'success'
                 and audit['raw_output'] == str(plan['verify_result'])
-                and audit['definition_revision'] == definition.revision_sha)
+                and audit['definition_revision'] == plan['current_revision_sha'])
 
 
 @dataclass(frozen=True)
