@@ -1,17 +1,20 @@
 """application commands boundaries and named composition effects."""
 from __future__ import annotations
 from collections.abc import Callable
-from dataclasses import dataclass
-from contextlib import closing
-from loop_manager_internal.application.contracts import ProjectRunKind
+from dataclasses import dataclass, replace
+from contextlib import closing, ExitStack
+from loop_manager_internal.application.contracts import ProjectRunKind, ProjectRunResult
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.agents.agent_invocation import InvocationContext
 from loop_manager_internal.config.managed_config import ManagedConfigError
 from loop_manager_internal.runtime import project_registry
-from loop_manager_internal.runtime.contracts import RuntimeMutation
+from loop_manager_internal.runtime.contracts import ProcessLockBusyError, RuntimeMutation
+from loop_manager_internal.runtime.process_lock import process_lock
+from loop_manager_internal.runtime.resource_lock import resource_locks
 from loop_manager_internal.storage import agent_invocation_state, local_recovery_state, runtime_state
 from pathlib import Path
 import argparse
+import sqlite3
 import sys
 import threading
 
@@ -240,7 +243,7 @@ def recover_local_environment(
     config_path: Path,
     runtime_mutation: RuntimeMutation | None = None,
 ) -> int:
-    """Recheck one registered project under the normal process lock and recovery paths."""
+    """Accept a request concurrently; drive it only under the normal process lease."""
     repository = str(Path(args.repository).expanduser().resolve())
     plan_id = args.plan
     with closing(effects.connect_database(state_dir)) as connection, connection:
@@ -255,7 +258,8 @@ def recover_local_environment(
         ).fetchone() is None:
             raise ValueError(f"등록 프로젝트에 없는 계획입니다: {plan_id}")
 
-        request = local_recovery_state.begin_request(connection, repository, plan_id)
+        with resource_locks(state_dir, repository, ["local-recovery"], owner="recover-intake"):
+            request = local_recovery_state.begin_request(connection, repository, plan_id)
         try:
             config = effects.load_managed_config(config_path)
         except ManagedConfigError as error:
@@ -267,93 +271,153 @@ def recover_local_environment(
             connection, enabled=bool(config.telegram_token and config.telegram_chat_id),
         )
         connection.commit()
-        # Freeze this request's candidates before execution changes the active
-        # projection. A failed first check must not starve independent plans.
-        targets = [plan_id]
-        if plan_id is None:
-            targets.extend(str(row[0]) for row in connection.execute(
-                "SELECT plan_id FROM exec_plans WHERE repo = ? AND status = 'PLAN_BLOCKED' "
-                "AND blocked_reason IN ('verify_timeout_limit_insufficient', 'verify_retry_exhausted') "
-                "ORDER BY plan_id", (repository,)))
-            # Once bounded verify checks have released the execution slot,
-            # revisit the project coordinator for its independent planning cause.
-            if len(targets) > 1 and project["planning_error"]:
-                targets.append(None)
-        outcomes = []
-        for index, target in enumerate(targets):
-            if index:
-                active = runtime_state.RuntimeStateRepository(connection).active_row(repository)
-                # The final project visit is for planning only. Never dispatch
-                # a retained execution again after a bounded check or pause.
-                if active is not None and (target is None or any(
-                    item.kind in {ProjectRunKind.TRANSIENT_PAUSE, ProjectRunKind.USAGE_LIMIT_PAUSE}
-                    for item in outcomes
-                )):
-                    continue
-            if plan_id is None and target is not None and local_recovery_state.recheck_consumed(
-                    connection, request.request_id, target, "verify"):
-                continue
-            outcome = effects.run_project_result(
-                connection,
-                state_dir,
-                repository,
-                config.path,
-                None,
-                False,
-                str(project["provider"]),
-                registered_only=True,
+        # Only request intake may overlap automatic execution. Release its
+        # resource lease before trying the automatic process lease.
+        with ExitStack() as stack:
+            try:
+                stack.enter_context(process_lock(state_dir, identity="recover:" + request.request_id))
+            except ProcessLockBusyError:
+                return _local_recovery_waiting(effects, request)
+            if not local_recovery_request_ready(connection, request):
+                return _local_recovery_waiting(effects, request)
+            return execute_local_recovery_request(
+                LocalRecoveryExecutionEffects(effects.operation_print, effects.run_project_result),
+                connection, state_dir, request, config.path,
                 planner_mutex=threading.Lock(),
                 refactoring_review_interval=config.refactoring_review_interval,
                 verify_timeout_seconds=config.verify_timeout_seconds,
-                external_run_id=request.request_id,
-                recovery_request_id=request.request_id,
-                recovery_plan_id=target,
                 runtime_mutation=runtime_mutation,
-            )
-            outcomes.append(outcome)
-        outcome = next((item for item in outcomes if item.exit_code or item.kind not in {
-            ProjectRunKind.COMPLETED, ProjectRunKind.WAITING,
-        }), outcomes[-1])
-        after = local_recovery_state.snapshot(connection, repository, plan_id)
-        unresolved = _local_recovery_causes_remain(after, plan_id)
-        in_progress = _local_recovery_in_progress(after, plan_id)
-        paused = outcome.kind not in {ProjectRunKind.COMPLETED, ProjectRunKind.WAITING}
-        result_code = 1 if outcome.exit_code or paused or unresolved or in_progress else 0
-        result = "resolved" if result_code == 0 else (
-            "in_progress" if in_progress and not unresolved and not outcome.exit_code and not paused
-            else "unresolved"
+            ).exit_code
+
+
+def _local_recovery_waiting(effects, request: local_recovery_state.LocalRecoveryRequest) -> int:
+    effects.operation_print(
+        f"로컬 환경 재검사 요청 저장·실행 대기: {request.repo}; "
+        f"계획={request.plan_id or 'project'}; 요청={request.request_id}; 다음 run에서 이어집니다."
+    )
+    return 1
+
+
+def local_recovery_request_ready(
+    connection: sqlite3.Connection, request: local_recovery_state.LocalRecoveryRequest,
+) -> bool:
+    """Do not consume a selected plan's check while another scope owns the slot."""
+    if request.plan_id is None:
+        return True
+    active = runtime_state.RuntimeStateRepository(connection).active_row(request.repo)
+    if active is not None and str(active["plan_id"]) != request.plan_id:
+        return False
+    project = connection.execute("SELECT phase FROM projects WHERE repo = ?", (request.repo,)).fetchone()
+    cycle = connection.execute("SELECT phase FROM maintenance_cycles WHERE repo = ?", (request.repo,)).fetchone()
+    return project["phase"] != "PLANNING" and (cycle is None or cycle["phase"] == "idle")
+
+
+@dataclass(frozen=True)
+class LocalRecoveryExecutionEffects:
+    operation_print: Callable[..., object]
+    run_project_result: Callable[..., object]
+
+
+def execute_local_recovery_request(
+    effects: LocalRecoveryExecutionEffects, connection: sqlite3.Connection, state_dir: Path,
+    request: local_recovery_state.LocalRecoveryRequest, config_path: Path,
+    *, planner_mutex: threading.Lock, refactoring_review_interval: int,
+    verify_timeout_seconds: int, runtime_mutation: RuntimeMutation | None = None,
+    on_step_completed: Callable[[], None] | None = None,
+) -> ProjectRunResult:
+    """Drive a saved bounded request only while the caller owns the process lease."""
+    repository, plan_id = request.repo, request.plan_id
+    project = connection.execute(
+        "SELECT provider, planning_error FROM projects WHERE repo = ? AND registered = 1", (repository,),
+    ).fetchone()
+    # Freeze this request's candidates before execution changes the active
+    # projection. A failed first check must not starve independent plans.
+    targets = [plan_id]
+    if plan_id is None:
+        targets.extend(str(row[0]) for row in connection.execute(
+            "SELECT plan_id FROM exec_plans WHERE repo = ? AND status = 'PLAN_BLOCKED' "
+            "AND blocked_reason IN ('verify_timeout_limit_insufficient', 'verify_retry_exhausted') "
+            "ORDER BY plan_id", (repository,)))
+        # Once bounded verify checks have released the execution slot,
+        # revisit the project coordinator for its independent planning cause.
+        if len(targets) > 1 and project["planning_error"]:
+            targets.append(None)
+    outcomes = []
+    for index, target in enumerate(targets):
+        if index:
+            active = runtime_state.RuntimeStateRepository(connection).active_row(repository)
+            # The final project visit is for planning only. Never dispatch
+            # a retained execution again after a bounded check or pause.
+            if active is not None and (target is None or any(
+                item.kind in {ProjectRunKind.TRANSIENT_PAUSE, ProjectRunKind.USAGE_LIMIT_PAUSE}
+                for item in outcomes
+            )):
+                continue
+        if plan_id is None and target is not None and local_recovery_state.recheck_consumed(
+                connection, request.request_id, target, "verify"):
+            continue
+        outcome = effects.run_project_result(
+            connection,
+            state_dir,
+            repository,
+            config_path,
+            None,
+            False,
+            str(project["provider"]),
+            registered_only=True,
+            planner_mutex=planner_mutex,
+            refactoring_review_interval=refactoring_review_interval,
+            verify_timeout_seconds=verify_timeout_seconds,
+            external_run_id=request.request_id,
+            recovery_request_id=request.request_id,
+            recovery_plan_id=target,
+            runtime_mutation=runtime_mutation,
+            **({"on_step_completed": on_step_completed} if on_step_completed is not None else {}),
         )
-        if result == "in_progress":
-            local_recovery_state.record_progress(connection, request, after)
-        else:
-            local_recovery_state.complete_request(connection, request, result)
-        request_action = "재개" if request.resumed else "요청"
-        effects.operation_print(
-            f"로컬 환경 재검사 {'완료' if result_code == 0 else '진행 중' if result == 'in_progress' else '미해결'}: "
-            f"{repository}; 계획={plan_id or 'project'}; {request_action}={request.request_id}"
-        )
-        if result_code:
-            from loop_manager_internal.execution.validation_feedback import redact_secrets
-            for table, scope in (("project_blocks", "project"), ("execplan_blocks", "plan")):
-                exists = connection.execute(
-                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", (table,),
-                ).fetchone()
-                if exists is None:
-                    continue
-                sql = f"SELECT plan_id, reason_code, evidence FROM {table} WHERE repo = ?"
-                parameters: tuple[object, ...] = (repository,)
-                if scope == "plan" and plan_id is not None:
-                    sql += " AND plan_id = ?"
-                    parameters += (plan_id,)
-                for block in connection.execute(sql, parameters):
-                    evidence = redact_secrets(str(block[2] or ""))
-                    effects.operation_print(
-                        f"남은 차단: {scope} {block[0] or repository} ({block[1]})\n{evidence}",
-                        error=True,
-                    )
-            if outcome.detail:
-                effects.operation_print(redact_secrets(str(outcome.detail)), error=True)
-        return result_code
+        outcomes.append(outcome)
+    outcome = next((item for item in outcomes if item.exit_code or item.kind not in {
+        ProjectRunKind.COMPLETED, ProjectRunKind.WAITING,
+    }), outcomes[-1])
+    after = local_recovery_state.snapshot(connection, repository, plan_id)
+    unresolved = _local_recovery_causes_remain(after, plan_id)
+    in_progress = _local_recovery_in_progress(after, plan_id)
+    paused = outcome.kind not in {ProjectRunKind.COMPLETED, ProjectRunKind.WAITING}
+    result_code = 1 if outcome.exit_code or paused or unresolved or in_progress else 0
+    result = "resolved" if result_code == 0 else (
+        "in_progress" if in_progress and not unresolved and not outcome.exit_code and not paused
+        else "unresolved"
+    )
+    if result == "in_progress":
+        local_recovery_state.record_progress(connection, request, after)
+    else:
+        local_recovery_state.complete_request(connection, request, result)
+    request_action = "재개" if request.resumed else "요청"
+    effects.operation_print(
+        f"로컬 환경 재검사 {'완료' if result_code == 0 else '진행 중' if result == 'in_progress' else '미해결'}: "
+        f"{repository}; 계획={plan_id or 'project'}; {request_action}={request.request_id}"
+    )
+    if result_code:
+        from loop_manager_internal.execution.validation_feedback import redact_secrets
+        for table, scope in (("project_blocks", "project"), ("execplan_blocks", "plan")):
+            exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name = ?", (table,),
+            ).fetchone()
+            if exists is None:
+                continue
+            sql = f"SELECT plan_id, reason_code, evidence FROM {table} WHERE repo = ?"
+            parameters: tuple[object, ...] = (repository,)
+            if scope == "plan" and plan_id is not None:
+                sql += " AND plan_id = ?"
+                parameters += (plan_id,)
+            for block in connection.execute(sql, parameters):
+                evidence = redact_secrets(str(block[2] or ""))
+                effects.operation_print(
+                    f"남은 차단: {scope} {block[0] or repository} ({block[1]})\n{evidence}",
+                    error=True,
+                )
+        if outcome.detail:
+            effects.operation_print(redact_secrets(str(outcome.detail)), error=True)
+    return replace(outcome, exit_code=result_code)
 
 
 @dataclass(frozen=True)

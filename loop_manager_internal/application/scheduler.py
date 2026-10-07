@@ -7,6 +7,9 @@ from dataclasses import dataclass
 from loop_manager_internal.application.contracts import ProjectRunKind
 from loop_manager_internal.application.contracts import ProjectRunResult
 from loop_manager_internal.application.contracts import ScheduledProjectResult
+from loop_manager_internal.application.commands import (
+    LocalRecoveryExecutionEffects, execute_local_recovery_request, local_recovery_request_ready,
+)
 from loop_manager_internal.config.managed_config import ManagedConfig
 from loop_manager_internal.config.managed_config import ManagedConfigError
 from loop_manager_internal.notifications import notifications
@@ -15,6 +18,7 @@ from loop_manager_internal.runtime.contracts import RuntimeMutation
 from loop_manager_internal.runtime.handoff_gate import RuntimeHandoffGate
 from loop_manager_internal.runtime.handoff_gate import SelfMergeRuntimeHandoff
 from loop_manager_internal.runtime.handoff_gate import _runtime_handoff_signal
+from loop_manager_internal.storage import local_recovery_state
 from pathlib import Path
 import secrets
 import sqlite3
@@ -79,21 +83,35 @@ def _run_registered_project(
                         error=True,
                     )
 
-            result = effects.run_project_result(
-                connection,
-                state_dir,
-                project.repo,
-                config_path,
-                None,
-                False,
-                registered_only=True,
-                planner_mutex=planner_mutex,
-                refactoring_review_interval=refactoring_review_interval,
-                verify_timeout_seconds=verify_timeout_seconds,
-                on_step_completed=deliver_new_pr_notifications,
-                external_run_id=external_run_id,
-                **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
-            )
+            request = local_recovery_state.pending_request(connection, project.repo)
+            if request is not None and local_recovery_request_ready(connection, request):
+                result = execute_local_recovery_request(
+                    LocalRecoveryExecutionEffects(effects.operation_log, effects.run_project_result),
+                    connection, state_dir, request, config_path,
+                    planner_mutex=planner_mutex,
+                    refactoring_review_interval=refactoring_review_interval,
+                    verify_timeout_seconds=verify_timeout_seconds,
+                    runtime_mutation=runtime_mutation,
+                    on_step_completed=deliver_new_pr_notifications,
+                )
+            else:
+                # An unrelated active owner keeps progressing; the recovery
+                # request stays pending for a later scheduler visit.
+                result = effects.run_project_result(
+                    connection,
+                    state_dir,
+                    project.repo,
+                    config_path,
+                    None,
+                    False,
+                    registered_only=True,
+                    planner_mutex=planner_mutex,
+                    refactoring_review_interval=refactoring_review_interval,
+                    verify_timeout_seconds=verify_timeout_seconds,
+                    on_step_completed=deliver_new_pr_notifications,
+                    external_run_id=external_run_id,
+                    **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
+                )
     except SelfMergeRuntimeHandoff:
         if handoff_gate is not None:
             handoff_gate.stop()

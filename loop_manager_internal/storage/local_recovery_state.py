@@ -171,6 +171,22 @@ def begin_request(
     return LocalRecoveryRequest(request_id, repo, plan_id, "pending", False)
 
 
+def pending_request(connection: sqlite3.Connection, repo: str) -> LocalRecoveryRequest | None:
+    """Read durable requests without running DDL in scheduler worker threads."""
+    if not connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'local_environment_recovery_requests'",
+    ).fetchone():
+        return None
+    row = connection.execute(
+        "SELECT request_id, plan_id FROM local_environment_recovery_requests "
+        "WHERE repo = ? AND status = 'pending'", (repo,),
+    ).fetchone()
+    if row is None:
+        return None
+    return LocalRecoveryRequest(str(row[0]), repo, row[1], "pending", True)
+
+
 def recheck_consumed(connection: sqlite3.Connection, request_id: str, subject: str, cause: str) -> bool:
     return connection.execute(
         "SELECT 1 FROM local_environment_recheck_consumption WHERE request_id = ? AND subject = ? AND cause = ?",

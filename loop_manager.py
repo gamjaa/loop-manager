@@ -4079,7 +4079,7 @@ def main() -> int:
             if not args.runtime_source or not args.runtime_sha:
                 raise RuntimeError("runtime 자식 소유권 정보가 없습니다.")
             source = Path(args.runtime_source).expanduser().resolve()
-            concurrent = args.command == "manual"
+            concurrent = args.command in {"manual", "recover"}
             runtime_options = {"concurrent": True} if concurrent else {}
             child_options = {"command_id": args.runtime_mutation_id} if concurrent else {}
             validate_runtime_child(source, state_dir, str(args.runtime_sha), **child_options)
@@ -4095,7 +4095,7 @@ def main() -> int:
 
         source = ROOT
         mutation_id = secrets.token_hex(16)
-        concurrent = args.command == "manual"
+        concurrent = args.command in {"manual", "recover"}
         lock_options = {"name": f"manual-{mutation_id}.lock"} if concurrent else {}
         runtime_options = {"concurrent": True} if concurrent else {}
         with process_lock(state_dir, identity=f"bootstrap:{mutation_id}", **lock_options) as lock_handle:
