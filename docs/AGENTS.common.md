@@ -52,7 +52,7 @@ ExecPlan의 실행 상태, 재시도 횟수, 세션과 작업 공간 정보는 L
 유지보수 Planner도 기존 파일의 삭제·이름 변경, 대상 snapshot 밖 계획의 수정 및 AGENTS.md 변경을 할 수 없다. 이 예외는 일반 Planner 권한이나 사용자의 직접 문서 편집 규칙을 변경하지 않는다.
 Planner는 `docs/FUTURE_IDEAS.md`의 항목을 같은 계획 주기의 ExecPlan 범위나 현재 미충족 작업의 근거로 사용하지 않는다.
 Planner와 Reviewer는 `AGENTS.md` 변경을 제안하거나 적용하지 않는다.
-Worker는 현재 ExecPlan에 꼭 필요한 프로젝트 루트 `AGENTS.md` 변경을 발견하면 승인 전에 수정하지 않고 선택된 ExecPlan의 `Decision Log`에 제안과 빈 `User Decision`을 기록한 뒤 사용자 판단을 기다린다. 신규 제안의 Target은 `AGENTS.md`, Scope는 self 저장소도 `project`다. 저장된 과거 `common` 결정은 원래 루트 대상·baseline·patch에만 유효하며 새 파일로 이관하지 않는다.
+Worker는 현재 ExecPlan에 꼭 필요한 프로젝트 루트 `AGENTS.md` 변경을 발견하면 승인 전에 수정하지 않고 선택된 ExecPlan의 `Decision Log`에 제안과 `pending` User Decision을 기록한 뒤 사용자 판단을 기다린다. 결정란에는 빈 백틱 Comment, 실제 Proposal의 전체 diff, 필드 옆 안내 주석과 `<!-- END USER DECISION -->`를 제공하고 Revision과 일반 pending의 Baseline은 생성하지 않는다. 기존 결정·편집된 Patch·Comment·메모는 덮어쓰지 않는다. 신규 제안의 Target은 `AGENTS.md`, Scope는 self 저장소도 `project`다. 저장된 과거 `common` 결정은 원래 루트 대상·baseline·patch에만 유효하며 새 파일로 이관하지 않는다.
 
 Worker는 구현, 관련 targeted unit test 작성·실행과 전체 검증 스크립트 생성을 담당한다.
 

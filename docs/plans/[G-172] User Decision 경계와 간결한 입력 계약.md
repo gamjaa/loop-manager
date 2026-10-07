@@ -36,9 +36,13 @@ priority: high
 ## Progress
 
 - [x] 2026-10-05 planning 기준 a049a76의 명세·원본·관련 테스트와 비종료 catalog에서 미충족 범위를 확인함. 구현·테스트 실행은 하지 않음.
-- [ ] 구현 및 관련 targeted unit 검증
+- [x] 공통 파서·Worker 요청 양식 구현 및 관련 targeted unit 검증
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
 
 - 여러 승인 소비자의 경계·identity 호환 때문에 complexity high, 잘못된 사용자 승인 채택 영향으로 risk high다. R-069가 이 범위에서 R-066의 필수 Revision/빈 patch 형식을 대체한다.
+
+- 구현 기록: `guidance_approval.py`에서 fence 밖 종료·legacy 경계, 선택 Revision·Comment·안내 주석, 결정별 Patch 검증과 legacy identity 정규화를 처리한다. 기존 preapproval·scope·Decision Log 소비자는 같은 parser를 그대로 사용한다. Worker prompt와 `docs/AGENTS.common.md`는 원안 diff를 표시한 pending 양식을 안내하며 PRODUCT는 장기 규칙을 기록한다.
+- 변경 경계: 이번 Worker 호출의 명시적 지시에 따라 `docs/PLANS.md`는 수정하지 않았다. 해당 파일의 기존 Revision 필수·빈 Patch 예시는 새 계약과 다르므로 문서 정합성 갱신은 별도 권한이 있는 작업에 남긴다. 기준 변경 시 새 요청 생성은 G-173 범위이며 이번 변경에 포함하지 않는다. 새 루트 항목·파일 이동·Requirement 편집은 없다.
+- 검증 기록: `GuidanceFormatTest`·`GuidanceInputContractTest` 14개, `CommonGuidanceApprovalCompatibilityTests`·`WorkerGuidanceInputTests` 4개로 총 18개 통과. 실행 명령은 `python3 -m unittest tests.test_guidance_approval.GuidanceFormatTest tests.test_guidance_approval.GuidanceInputContractTest tests.test_guidance_preapproval.CommonGuidanceApprovalCompatibilityTests tests.test_execution_guidance.WorkerGuidanceInputTests`다. `scripts/verify.sh`는 기존 전체 검증 runner와 테스트 자동 탐색을 유지하므로 변경하지 않았고 실행하지 않았다.

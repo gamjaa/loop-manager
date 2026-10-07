@@ -163,3 +163,27 @@ class ExecutionGuidanceTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios
         self.effects.publication.command.assert_not_called()
         with self.assertRaises(runtime_state.RuntimeStateError):
             self.handler.run(context)
+
+
+class WorkerGuidanceInputTests(TestCase):
+    def test_worker_request_example_is_complete_pending_and_parses_with_proposal_diff(self):
+        from loop_manager_internal.documents import guidance_approval as ga
+        prompt = lm.worker_prompt('docs/plans/test.md', None)
+        start = prompt.index('### Agent Guidance Proposal: guidance-example')
+        end = prompt.index(ga.END_USER_DECISION, start) + len(ga.END_USER_DECISION)
+        form = prompt[start:end]
+        document = ga.parse_guidance_document('## Decision Log\n' + form)
+        proposal, = document.proposals
+        self.assertEqual(proposal.decision.decision, 'pending')
+        self.assertEqual(proposal.decision.revision, '')
+        self.assertEqual(proposal.decision.patch, '')
+        self.assertIn('Comment: ``', form)
+        self.assertNotIn('Revision:', form)
+        self.assertNotIn('Baseline:', form)
+        self.assertEqual(form.count(proposal.patch), 2)
+        self.assertIn('덮어쓰거나 같은 요청을 중복하지 마라', prompt)
+        self.assertIn('자동 실행의 자기 승인은 금지', prompt)
+        self.assertIn('사용자가 특정 결정과 범위를 명시', prompt)
+        for decision in ('approve', 'reject', 'replace'):
+            decided = ga.parse_guidance_document('## Decision Log\n' + form.replace('Decision: `pending`', f'Decision: `{decision}`'))
+            self.assertEqual(decided.proposals[0].decision.decision, decision)
