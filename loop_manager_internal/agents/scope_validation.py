@@ -18,6 +18,7 @@ from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode, BlockScope
 from loop_manager_internal.git import managed_rebase_validation
+from loop_manager_internal.git.base_fetch_service import reconcile_external_base
 from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseService, selected_baseline
 
 
@@ -99,6 +100,18 @@ def _agent_git_resources(
             safety = scoped_blocking.project_block(connection, repo)
             phase = str(safety['previous_phase'] or '') if safety is not None else ''
         owned_branch = owner['branch'] if role in {'worker', 'reviewer'} else saved.branch
+        if role == 'reviewer' and phase in {'WORKING', 'IMPLEMENTING'} and plan_id:
+            # A base refresh invalidates the candidate stages before the
+            # completed read-only Reviewer scope has been retired. Keep its
+            # invocation-bound monitoring only with a live, owned rebase.
+            state_dir = effects._owned_rebase_state_dir(repo, plan_id, worktree)
+            if state_dir is not None:
+                checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id)
+                _, verdict = effects._current_rebase_service(
+                    connection, repo_path, state_dir, repo, plan_id, worktree,
+                    owned_branch).require_owned(checkpoint=checkpoint)
+                if verdict.status is managed_rebase_validation.RebaseStatus.COMPLETE:
+                    phase = 'REVIEWING'
         resources = agent_scope_decision.used_git_resources(
             role=role, phase=phase, base_branch=str(project['base_branch']),
             branch=owned_branch, worktree_key=str(_canonical_path(worktree)),
@@ -190,6 +203,8 @@ def validate_agent_scope(
             connection, external_worktree, worktree, before, role_name,
             selected_plan_path=selected_plan_path,
         )
+    if external_worktree is not None and base_branch is not None:
+        before = reconcile_external_base(effects.git, external_worktree, base_branch, before, after, resources)
     original = before
     before = _completed_worker_rebase_baseline(
         role_name, worktree, before, after, selected_plan_path,

@@ -24,6 +24,7 @@ from loop_manager_internal.storage import execution_checkpoint_state
 from loop_manager_internal.storage import recovery_state
 from loop_manager_internal.storage import runtime_state
 from pathlib import Path
+import hashlib
 import sqlite3
 
 
@@ -258,6 +259,8 @@ class ReconcileFalsePositiveRuntimeBlockEffects:
     capture_git_snapshot: Callable[..., object]
     operation_log: Callable[..., object]
     validate_persisted_agent_scope: Callable[..., object]
+    _agent_git_resources: Callable[..., object] | None = None
+    _reconciled_manager_scope_metadata: Callable[..., object] | None = None
 
 
 def reconcile_false_positive_runtime_block(
@@ -283,17 +286,40 @@ def reconcile_false_positive_runtime_block(
         saved_worktree = Path(str(project["worktree"] or repo))
         current = effects.capture_git_snapshot(saved_worktree)
         runtime_path = str(effects._canonical_path(runtime_mutation.path))
-        expected = agent_scope_decision.reconcile_runtime_snapshot(
-            before, before, current, runtime_path,
+        effects.operation_log(
+            "runtime 차단 비교: "
+            f"before={hashlib.sha256(before.serialize().encode()).hexdigest()[:16]} "
+            f"result={hashlib.sha256(result.serialize().encode()).hexdigest()[:16]} "
+            f"current={hashlib.sha256(current.serialize().encode()).hexdigest()[:16]} "
+            f"path={runtime_path} sha={runtime_mutation.commit_sha}"
         )
-        if result != current:
+        expected = agent_scope_decision.reconcile_runtime_snapshot(
+            before, before, current, runtime_path, str(project["base_branch"]),
+        )
+        resources = (effects._agent_git_resources(connection, repo_path, saved_worktree, before,
+            str(project['agent_role'] or ''), selected_plan_path=str(project['plan_path'] or ''))
+            if effects._agent_git_resources is not None else None)
+        if resources is not None and effects._reconciled_manager_scope_metadata is not None:
+            plan_id = None
+            plan = connection.execute('SELECT plan_id FROM exec_plans WHERE repo=? AND path=?',
+                (repo, str(project['plan_path'] or ''))).fetchone()
+            if plan is not None:
+                plan_id = plan[0]
+            result = effects._reconciled_manager_scope_metadata(
+                connection, repo_path, state_dir, repo, plan_id, result, current, resources)
+            _, result = agent_scope_decision.scoped_metadata(before, result, resources)
+            _, current_comparison = agent_scope_decision.scoped_metadata(before, current, resources)
+            expected, _ = agent_scope_decision.scoped_metadata(expected, current, resources)
+        else:
+            current_comparison = current
+        if result != current_comparison:
             effects.operation_log(
                 f"runtime 차단 재조정 거부: 결과 snapshot 불일치 "
                 f"path={runtime_path} sha={runtime_mutation.commit_sha}",
                 error=True,
             )
             return False
-        if expected != current:
+        if resources is None and expected != current:
             deltas = []
             for label, older, newer in (
                 ("refs", expected.refs, current.refs),

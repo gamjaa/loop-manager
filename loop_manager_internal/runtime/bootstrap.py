@@ -491,6 +491,35 @@ class BootstrapService:
             command_id=command_id)
 
 
+    def _selected_runtime_revision(self, source, state_dir, base, sha, current):
+        """Prove the selected fetch historically; a later base is separate input."""
+        ref = f'refs/remotes/origin/{base}'
+        try:
+            remote = self.effects.git(source, 'ls-remote', '--heads', 'origin', f'refs/heads/{base}', check=False)
+            if remote.returncode or remote.stdout.split() != [current, f'refs/heads/{base}']:
+                return False
+            if self.effects.git(source, 'merge-base', '--is-ancestor', sha, current, check=False).returncode:
+                return False
+            slot = manager_git_journal._slot(state_dir, str(_canonical_path(source)), 'bootstrap_fetch', ref)
+            lines = self.effects.git(source, 'reflog', 'show', '--format=%H%x00%gs', ref, check=False)
+            if lines.returncode:
+                return False
+            for path in slot.glob('*.result.json'):
+                result = manager_git_journal._read(path)
+                intent = manager_git_journal._read(slot / f"{result['id']}.intent.json")
+                if (intent['id'] != result['id'] or intent['owner'] != 'bootstrap'
+                        or intent['repo'] != str(_canonical_path(source))
+                        or intent['kind'] != 'bootstrap_fetch' or intent['target'] != ref
+                        or intent['expected'] != {'oid': sha} or result['status'] != 'complete'):
+                    continue
+                if (manager_git_journal.verified_transition(intent, result['observed'], True) == result['candidates']
+                        and lines.stdout.splitlines().count(f"{sha}\0loop-manager-base-fetch:{intent['id']}") == 1):
+                    live = self.effects.git(source, 'rev-parse', '--verify', ref, check=False)
+                    return live.returncode == 0 and live.stdout.strip() == current
+        except (RuntimeError, OSError, ValueError, KeyError, TypeError):
+            pass
+        return False
+
     def validate_runtime_mutation(self,
         source: Path, state_dir: Path, sha: str, mutation_id: str | None,
         *, concurrent: bool = False,
@@ -517,7 +546,7 @@ class BootstrapService:
         origin_sha = self.effects.git(
             source, "rev-parse", "--verify", f"refs/remotes/origin/{base}^{{commit}}"
         ).stdout.strip()
-        if origin_sha != sha:
+        if origin_sha != sha and not self._selected_runtime_revision(source, state_dir, base, sha, origin_sha):
             raise RuntimeError(
                 f"runtime SHA가 현재 origin/{base}와 다릅니다: "
                 f"{sha} (origin/{base} {origin_sha})"

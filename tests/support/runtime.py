@@ -27,3 +27,22 @@ def runtime_rebase_fixture(test, *, legacy=False):
                            remote=dataclasses.replace(expectation().remote, branch=current.branch))
     decision = decision_for(expected, observation(expected))
     return connection, runtime, checkpoint, current, expected, decision
+
+
+def record_saved_scope_invocation(connection, repo, state_dir, worktree, role, before,
+                                  session_id, *, plan_id=None):
+    """Model a completed isolated Agent call, without injecting runtime allowances."""
+    from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, Usage
+    from loop_manager_internal.agents.agent_write_isolation import IsolationEvidence, inspect_worktree
+    from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
+
+    ledger = InvocationRepository(connection)
+    identity = ledger.start(InvocationContext(str(repo), plan_id), role, 'codex',
+                            ResolvedProfile('test-fast', 'medium'), session_id,
+                            scope_id=before.scope_id)
+    ledger.record_isolation(identity, IsolationEvidence(
+        'codex', 'codex fixture', 'Linux:fixture', role, str(worktree.resolve()),
+        inspect_worktree(worktree, state_dir).repository_identity, 'a' * 64, 'verified',
+        snapshot_digest=before.scope_start_digest, configuration_digest='b' * 64))
+    ledger.finish(identity, 'success', 0, 10, session_id, Usage())
+    return identity

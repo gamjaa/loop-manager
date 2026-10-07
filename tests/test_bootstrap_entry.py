@@ -399,6 +399,17 @@ class BootstrapEntryTests(unittest.TestCase):
         self.assertIn("loop_manager.py", powershell)
         self.assertIn("run @args", powershell)
 
+    def test_owned_child_dispatch_uses_validated_selection_when_tracking_base_advances(self):
+        identity = loop_manager.RuntimeMutation(loop_manager.ROOT, Path('/state/runtime'), 'a' * 40, 'b' * 32)
+        with mock.patch.object(loop_manager.sys, 'argv', ['loop_manager.py', '--runtime-child',
+                '--runtime-source', str(loop_manager.ROOT), '--runtime-sha', 'a' * 40, 'run']), \
+                mock.patch.object(loop_manager, 'validate_runtime_child'), \
+                mock.patch.object(loop_manager, 'validate_runtime_mutation', return_value=identity), \
+                mock.patch.object(loop_manager, 'validate_bootstrap_revision', side_effect=RuntimeError('stale equality')), \
+                mock.patch.object(loop_manager, 'execute_runtime_command', return_value=0) as execute:
+            self.assertEqual(loop_manager.main(), 0)
+        self.assertEqual(execute.call_args.args[3], identity)
+
     def test_runtime_child_does_not_reacquire_process_lock(self):
         with mock.patch.object(
             loop_manager.sys,

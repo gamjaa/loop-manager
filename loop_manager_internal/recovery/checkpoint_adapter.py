@@ -11,6 +11,7 @@ from loop_manager_internal.agents.agent_scope_decision import _worker_path_allow
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.git import manager_git_journal
 from loop_manager_internal.git import rebase_file_evidence
+from loop_manager_internal.git.base_fetch_service import reconcile_external_base
 from loop_manager_internal.recovery import blocked_checkpoint
 from loop_manager_internal.recovery import project_blocked_recovery
 from loop_manager_internal.recovery import scoped_blocking
@@ -20,6 +21,7 @@ from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
 from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
 from loop_manager_internal.runtime.runtime_identity import _canonical_path
 from loop_manager_internal.storage import execution_checkpoint_state
+from loop_manager_internal.storage import blocked_checkpoint_state
 from pathlib import Path
 import json
 import hashlib
@@ -428,6 +430,13 @@ class CheckpointSafetyAdapter:
         try:
             before = GitSnapshot.deserialize(str(plan["agent_snapshot"]))
             result = GitSnapshot.deserialize(str(plan["agent_result_snapshot"]))
+            original = before
+            checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(
+                request.repo, request.plan_id)
+            before = agent_scope_decision.manager_comparison_baseline(
+                original, before, checkpoint.snapshot or {}, 'worker')
+            result = agent_scope_decision.manager_comparison_baseline(
+                original, result, checkpoint.snapshot or {}, 'worker')
             project = self.connection.execute(
                 'SELECT base_branch FROM projects WHERE repo = ?', (request.repo,)).fetchone()
             self.safety_effects.validate_agent_scope(
@@ -441,13 +450,22 @@ class CheckpointSafetyAdapter:
                 return True
             # A crash can occur after commit but before recording the Manager
             # snapshot. Accept only the durable prepared tree and identity.
-            return bool(
-                request.commit_identity and request.tree_oid
-                and not current.dirty
-                and self.safety_effects.git(worktree, "rev-parse", "HEAD^{tree}").stdout.strip() == request.tree_oid
-                and f"Checkpoint-Identity: {request.commit_identity}" in
-                self.safety_effects.git(worktree, "show", "-s", "--format=%B", "HEAD").stdout
-            )
+            if current.dirty:
+                return False
+            proofs = [(request.tree_oid, request.commit_identity)]
+            row = blocked_checkpoint_state.scope_request_row(self.connection, request.repo, request.plan_id)
+            if row is not None and row['request_identity'] == request.request_identity:
+                for entry in json.loads(row['publication_history']):
+                    prior = entry.get('superseded_request', {})
+                    if (prior.get('local_oid') == current.head
+                            and (prior.get('branch'), prior.get('worktree'), prior.get('pr_url'))
+                            == (request.branch, request.worktree, request.pr_url)):
+                        proofs.append((prior.get('tree_oid'), prior.get('commit_identity')))
+            return any(tree and identity
+                and self.safety_effects.git(worktree, "rev-parse", "HEAD^{tree}").stdout.strip() == tree
+                and f"Checkpoint-Identity: {identity}" in
+                    self.safety_effects.git(worktree, "show", "-s", "--format=%B", "HEAD").stdout
+                for tree, identity in proofs)
         except (RuntimeError, ValueError, TypeError, KeyError):
             return False
 
@@ -514,6 +532,10 @@ class CheckpointSafetyAdapter:
             before = GitSnapshot.deserialize(str(serialized))
             if not before.shared_metadata_complete:
                 raise ValueError("persisted shared metadata가 없습니다.")
+            saved_comparison = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(
+                request.repo, request.plan_id)
+            before = agent_scope_decision.manager_comparison_baseline(
+                before, before, saved_comparison.snapshot or {}, str(plan['agent_role'] or ''))
             resources = self.safety_effects._agent_git_resources(
                 self.connection, self.repo_path, Path(request.worktree), before,
                 str(plan['agent_role'] or ''), selected_plan_path=str(plan['path']))
@@ -523,6 +545,8 @@ class CheckpointSafetyAdapter:
                 resources = agent_scope_decision.used_git_resources(
                     role='worker', phase='PLAN_BLOCKED', base_branch=base,
                     branch=request.branch, worktree_key=str(_canonical_path(Path(request.worktree))))
+            base = self.connection.execute('SELECT base_branch FROM projects WHERE repo = ?', (request.repo,)).fetchone()[0]
+            before = reconcile_external_base(self.safety_effects.git, self.repo_path, base, before, current, resources)
             before, current = agent_scope_decision.scoped_metadata(before, current, resources)
         except (ValueError, TypeError, KeyError, RuntimeError) as error:
             return reject("workspace_ownership_uncertain", str(error))
@@ -545,6 +569,8 @@ class CheckpointSafetyAdapter:
             self.connection, self.repo_path, request.repo, request.plan_id,
             before, current,
         )
+        before = agent_scope_decision.reconcile_manager_metadata(
+            before, current, refs=fetched_refs, worktrees=frozenset(), resources=resources)
         for name in before.refs.keys() | current.refs.keys():
             if name == own_ref or name in fetched_refs or name in baselines or name.startswith("refs/codex/turn-diffs/"):
                 continue
@@ -561,6 +587,9 @@ class CheckpointSafetyAdapter:
             if (path != own_path and path not in cleaned
                     and before.worktrees.get(path) != current.worktrees.get(path)):
                 return reject("outside_managed_worktree_mutation", f"checkpoint 외부 worktree 변경: {path}")
+        if owned_remote_oid is not None:
+            blocked_checkpoint_state.BlockedCheckpointRepository(self.connection).accept_superseded_publication(
+                request, owned_remote_oid)
         return None
 
 

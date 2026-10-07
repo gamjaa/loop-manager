@@ -854,7 +854,7 @@ class BlockedUserInputScopeUnitTests(unittest.TestCase):
         self.assertEqual(checks[-1].args[2].dirty, self.current.dirty)
         self.assertEqual(checks[-1].kwargs['resources'].refs,
             frozenset({'refs/heads/loop-manager/G-166', 'refs/remotes/origin/main',
-                       'refs/remotes/origin/loop-manager/G-166'}))
+                       'refs/remotes/origin/HEAD', 'refs/remotes/origin/loop-manager/G-166'}))
 
     def test_same_head_input_needs_no_ancestry_command(self):
         self.effects.capture_git_snapshot.return_value = replace(self.current, head=self.result.head)

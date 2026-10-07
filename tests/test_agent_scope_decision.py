@@ -4,6 +4,7 @@ from pathlib import Path
 
 from loop_manager_internal.agents import agent_scope_decision as decision
 from loop_manager import GitSnapshot, ManagerGitCheckpoint, AgentScopeError, validate_agent_scope
+from tests.support.scope import snapshot
 
 
 WORKTREE = "/managed"
@@ -11,21 +12,12 @@ REPO = "/source"
 PLAN = "docs/plans/[G-051] Plan.md"
 
 
-def snapshot(**changes):
-    base = GitSnapshot(
-        head="a", branch="loop-manager/G-051", index={}, dirty={},
-        refs={"refs/heads/loop-manager/G-051": ("a", "commit")},
-        worktrees={WORKTREE: ("HEAD=a", "branch=refs/heads/loop-manager/G-051")},
-        config={}, operations={},
-    )
-    return replace(base, **changes)
-
-
 def decide(before, current, *, role="worker", phase="IMPLEMENTING", result=None,
            checkpoint=None, planner_correction=False, cleanup=frozenset(),
-           manager_runtime=None, runtime_recreation_proven=False, manager_refs=frozenset()):
+           manager_runtime=None, runtime_recreation_proven=False, manager_refs=frozenset(),
+           base_branch="main"):
     return decision.decide_persisted_scope(
-        role=role, phase=phase, base_branch="main", selected_plan_path=PLAN,
+        role=role, phase=phase, base_branch=base_branch, selected_plan_path=PLAN,
         before=before, current=current, result=result, checkpoint=checkpoint,
         worktree_key=WORKTREE, repo_key=REPO,
         planner_correction=planner_correction, manager_cleanup_worktrees=cleanup,
@@ -35,6 +27,24 @@ def decide(before, current, *, role="worker", phase="IMPLEMENTING", result=None,
 
 
 class PersistedScopeDecisionTests(unittest.TestCase):
+    def test_selected_runtime_and_proven_current_base_are_distinct_operands(self):
+        ref, head, runtime = 'refs/remotes/origin/develop', 'refs/remotes/origin/HEAD', '/state/runtime/b'
+        before = snapshot(refs={ref: ('a', ''), head: ('a', ref)})
+        current = replace(before, refs={ref: ('c', ''), head: ('c', ref)},
+                          worktrees={**before.worktrees, runtime: ('HEAD=b', 'detached=True')})
+        kwargs = dict(role='worker', phase='WORKING', base_branch='develop', selected_plan_path=PLAN,
+            before=before, current=current, result=before, checkpoint=ManagerGitCheckpoint(before, frozenset()),
+            worktree_key=WORKTREE, repo_key=REPO, planner_correction=False,
+            manager_cleanup_worktrees=frozenset(), manager_runtime=(runtime, 'b'))
+        with self.assertRaises(decision.ScopeDecisionError):
+            decision.decide_persisted_scope(**kwargs)
+        accepted = decision.decide_persisted_scope(**kwargs, runtime_base_oid='c')
+        self.assertEqual(accepted.reconciled_before.worktrees[runtime], ('HEAD=b', 'detached=True'))
+        self.assertEqual(accepted.reconciled_before.refs[ref], ('c', ''))
+        with self.assertRaises(decision.ScopeDecisionError):
+            decision.decide_persisted_scope(**{**kwargs, 'current': replace(current,
+                worktrees={**current.worktrees, runtime: ('HEAD=c', 'detached=True')})}, runtime_base_oid='c')
+
     def test_verified_runtime_reconciles_only_selected_registration_and_origin(self):
         before = snapshot()
         runtime = "/state/runtimes/source/b"
@@ -56,6 +66,52 @@ class PersistedScopeDecisionTests(unittest.TestCase):
         self.assertNotIn("/external", check.before.worktrees)
         with self.assertRaisesRegex(decision.ScopeDecisionError, "runtime 기준선"):
             decide(before, current, manager_runtime=(runtime, "other"))
+
+    def test_registered_base_reconciles_results_and_checkpoint_without_adopting_other_refs(self):
+        runtime = "/state/runtime/b"
+        for base, main_oid in (("main", None), ("develop", None), ("develop", "unrelated")):
+            with self.subTest(base=base, main=main_oid):
+                ref = f"refs/remotes/origin/{base}"
+                refs = {ref: ("a", ""), "refs/remotes/origin/HEAD": ("a", ref)}
+                if main_oid:
+                    refs["refs/remotes/origin/main"] = (main_oid, "")
+                before = snapshot(refs=refs)
+                current = replace(before, refs={**refs, ref: ("b", ""),
+                    "refs/remotes/origin/HEAD": ("b", ref)},
+                    worktrees={**before.worktrees, runtime: ("HEAD=b", "detached=True")})
+                saved = replace(before, dirty={"app.py": (("unstaged",), "work")})
+                outcome = decide(before, current, base_branch=base, result=saved,
+                    checkpoint=ManagerGitCheckpoint(saved, frozenset()), manager_runtime=(runtime, "b"))
+                first, second = outcome.checks
+                self.assertEqual(first.before.refs, current.refs)
+                self.assertEqual(first.after.refs, current.refs)
+                self.assertEqual(second.before.refs, current.refs)
+                self.assertEqual(first.after.dirty, saved.dirty)
+                self.assertEqual(decision.reconcile_runtime_snapshot(saved, before, current, runtime, base).refs,
+                                 current.refs)
+                # A changed result/checkpoint base ref or symbolic target is Agent evidence.
+                for key in (ref, "refs/remotes/origin/HEAD", "refs/heads/foreign"):
+                    violation = replace(saved, refs={**saved.refs, key: ("foreign", "refs/heads/foreign")})
+                    reconciled = decision.reconcile_runtime_snapshot(violation, before, current, runtime, base)
+                    self.assertEqual(reconciled.refs[key], violation.refs[key])
+                    failed = decide(before, current, base_branch=base,
+                        checkpoint=ManagerGitCheckpoint(violation, frozenset()), manager_runtime=(runtime, "b"))
+                    self.assertEqual(failed.checks[0].after.refs[key], violation.refs[key])
+                    with self.assertRaises(AgentScopeError):
+                        validate_agent_scope("worker", Path(WORKTREE), failed.checks[0].before,
+                                             failed.checks[0].after, selected_plan_path=PLAN)
+
+    def test_registered_base_rejects_wrong_oid_and_symbolic_head_target(self):
+        runtime = "/state/runtime/b"
+        ref = "refs/remotes/origin/develop"
+        before = snapshot(refs={ref: ("a", ""), "refs/remotes/origin/HEAD": ("a", ref)})
+        current = replace(before, refs={ref: ("b", ""), "refs/remotes/origin/HEAD": ("b", ref)},
+                          worktrees={**before.worktrees, runtime: ("HEAD=b", "detached=True")})
+        for changed in ({ref: ("wrong", "")},
+                        {"refs/remotes/origin/HEAD": ("b", "refs/remotes/origin/main")}):
+            with self.subTest(changed=changed), self.assertRaises(decision.ScopeDecisionError):
+                decide(before, replace(current, refs={**current.refs, **changed}),
+                       base_branch="develop", manager_runtime=(runtime, "b"))
 
     def test_runtime_lock_replacement_requires_proof_and_preserves_other_changes(self):
         runtime = "/state/runtime"
@@ -459,7 +515,7 @@ class TaskRelevantScopeTests(unittest.TestCase):
         for role in ('planner', 'maintenance_planner'):
             resources = decision.used_git_resources(role=role, phase='PLANNING',
                 base_branch='develop', branch=None, worktree_key=WORKTREE)
-            self.assertEqual(resources.refs, frozenset({'refs/remotes/origin/develop'}))
+            self.assertEqual(resources.refs, frozenset({'refs/remotes/origin/develop', 'refs/remotes/origin/HEAD'}))
         self.assertIsNone(decision.used_git_resources(role='worker', phase='unknown',
             base_branch='develop', branch=self.before.branch, worktree_key=WORKTREE))
         scoped = replace(self.before, scope_id='invocation-scope', scope_start_digest='digest')

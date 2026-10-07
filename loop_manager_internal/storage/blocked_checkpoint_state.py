@@ -130,6 +130,68 @@ class BlockedCheckpointRepository:
         self.connection = connection
         ensure_schema(connection)
 
+    def reconcile_cause(self, request):
+        """CAS a stale request to this owned plan's current cause before inspection."""
+        with self.connection:
+            if not self.connection.in_transaction:
+                self.connection.execute('BEGIN IMMEDIATE')
+            row = self.connection.execute('SELECT * FROM blocked_checkpoints WHERE repo=? AND plan_id=?',
+                                          (request.repo, request.plan_id)).fetchone()
+            if row is None or row['request_identity'] != request.request_identity:
+                return None  # Another dispatcher owns the newer request.
+            plan = self.connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
+                                           (request.repo, request.plan_id)).fetchone()
+            block = self.connection.execute('SELECT * FROM execplan_blocks WHERE repo=? AND plan_id=?',
+                                            (request.repo, request.plan_id)).fetchone()
+            project_block = self.connection.execute('SELECT * FROM project_blocks WHERE repo=?',
+                                                    (request.repo,)).fetchone()
+            if project_block is not None:
+                return request  # Preserve the separate project safety gate.
+            if plan is None or (plan['branch'], plan['worktree'], plan['pr_url']) != (
+                    request.branch, request.worktree, request.pr_url):
+                return request  # A resource/lease change still needs safety rejection.
+            if block is None or plan['status'] != 'PLAN_BLOCKED':
+                self._update(request, phase=CheckpointPhase.UNPUBLISHED.value,
+                             unpublished_reason='checkpoint 원인이 해소되어 요청을 취소했습니다.', retryable=0)
+                return None
+            if (block['reason_code'], block['evidence']) == (request.reason_code, request.evidence):
+                return request
+            history = json.loads(row['publication_history'])
+            history.append({'superseded_request': {key: row[key] for key in (
+                'request_identity', 'reason_code', 'evidence', 'phase', 'commit_identity',
+                'tree_oid', 'local_oid', 'published_oid', 'expected_remote_oid',
+                'branch', 'worktree', 'pr_url')}})
+            identity = request_identity(request.repo, request.plan_id, block['reason_code'],
+                block['evidence'], request.branch, request.worktree, block['release_fingerprint'], request.pr_url)
+            self._update(request, request_identity=identity, reason_code=block['reason_code'],
+                evidence=block['evidence'], phase=CheckpointPhase.REQUESTED.value,
+                commit_identity=None, tree_oid=None, local_oid=None,
+                publication_history=json.dumps(history, sort_keys=True), result=None,
+                unpublished_reason=None, retryable=0)
+            return self.get(request.repo, request.plan_id)
+
+    def accept_superseded_publication(self, request: CheckpointRequest, verified_oid: str) -> None:
+        """Advance only the old lease of a live-verified, archived local commit."""
+        with self.connection:
+            if not self.connection.in_transaction:
+                self.connection.execute('BEGIN IMMEDIATE')
+            row = scope_request_row(self.connection, request.repo, request.plan_id)
+            if row is None or row['request_identity'] != request.request_identity:
+                return
+            plan = self.connection.execute('SELECT branch, worktree, pr_url FROM exec_plans WHERE repo=? AND plan_id=?',
+                (request.repo, request.plan_id)).fetchone()
+            if plan is None or tuple(plan) != (request.branch, request.worktree, request.pr_url):
+                return
+            for entry in json.loads(row['publication_history']):
+                prior = entry.get('superseded_request', {})
+                if (prior.get('local_oid') == verified_oid and prior.get('commit_identity')
+                        and prior.get('tree_oid') and request.expected_remote_oid == prior.get('expected_remote_oid')
+                        and row['expected_remote_oid'] == request.expected_remote_oid
+                        and (prior.get('branch'), prior.get('worktree'), prior.get('pr_url'))
+                        == (request.branch, request.worktree, request.pr_url)):
+                    self._update(request, expected_remote_oid=verified_oid, remote_observed=1)
+                    return
+
     def request(
         self,
         *,

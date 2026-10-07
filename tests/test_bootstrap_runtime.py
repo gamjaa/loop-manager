@@ -272,9 +272,13 @@ class BootstrapRuntimeTests(OriginScopeFixture, unittest.TestCase):
                         ) as execute:
                             self.assertEqual(loop_manager.main(), 0)
                             self.assertTrue(execute.call_args.args[3].legacy)
-                self.assertNotEqual(connection.execute(
+                self.assertEqual(connection.execute(
                     "SELECT agent_snapshot FROM projects WHERE repo = ?", (str(source),)
                 ).fetchone()[0], before.serialize())
+                audit = loop_manager.execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+                    str(source), '').snapshot['manager_metadata_agent_baseline']
+                self.assertEqual(audit['original'], hashlib.sha256(before.serialize().encode()).hexdigest())
+                self.assertIn(str(runtime.path), loop_manager.GitSnapshot.deserialize(audit['snapshot']).worktrees)
 
                 with loop_manager.process_lock(state_dir):
                     reused_legacy = loop_manager._bootstrap_service().prepare_runtime_worktree(source, state_dir)
@@ -385,3 +389,353 @@ class BootstrapRuntimeTests(OriginScopeFixture, unittest.TestCase):
                 str(outside),
                 git(source, "worktree", "list", "--porcelain"),
             )
+
+
+class BootstrapSavedScopeResumeTests(unittest.TestCase):
+    """Real subprocess regressions; run only in Manager's full verification."""
+
+    def test_remote_bootstrap_child_resumes_saved_scope_without_identity_injection(self, advance_after_selection=False):
+        import json
+        import shutil
+        import sys
+        from tests.support.git import make_remote_repository, copy_manager_import_fixture
+        from tests.support.catalog import write_execplan
+        from tests.support.profiles import profile_config
+        from tests.support.runtime import record_saved_scope_invocation
+        from loop_manager_internal.execution.worker_session import SessionBinding
+        from loop_manager_internal.planning.planning_workspace import planning_workspace_path
+
+        for base in ('main', 'develop'):
+            for role in ('planner', 'worker', 'reviewer'):
+                with self.subTest(base=base, role=role), tempfile.TemporaryDirectory() as directory:
+                    source = make_remote_repository(directory)
+                    state = Path(directory) / 'state'
+                    state.mkdir()
+                    copy_manager_import_fixture(source)
+                    # The only child doubles are external Agent/GitHub boundaries.
+                    # All bootstrap, identity, SQLite, scope and dispatch code is real.
+                    manager_file = source / 'loop_manager.py'
+                    manager_file.write_text(manager_file.read_text().replace(
+                        'if __name__ == "__main__":\n    raise SystemExit(main())',
+                        '''if __name__ == "__main__":
+    def fake_agent(worktree, state_dir, config, role, prompt, **options):
+        proof = state_dir / 'resumed-agent.json'
+        proof.write_text(json.dumps({'role': role, 'session': options.get('session_id'),
+                                    'runtime': str(ROOT),
+                                    'sha': git(ROOT, 'rev-parse', 'HEAD').stdout.strip(),
+                                    'worktree': str(worktree)}))
+        if (state_dir / 'expected-role').read_text() == 'reviewer' and role == 'worker':
+            return CodexResult(0, 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\\n'
+                'COMMIT_TITLE: Preserve saved candidate\\nPR_SUMMARY: Preserve saved candidate\\n'
+                'TARGETED_TESTS: fixture unit PASS', options.get('session_id'))
+        return CodexResult(1, 'usage limit reached', options.get('session_id'))
+    if '--runtime-child' not in sys.argv:
+        stop_file = Path(sys.argv[sys.argv.index('--state-dir') + 1]) / 'stop-after-registration'
+        if stop_file.exists():
+            from loop_manager_internal.git import manager_git_journal
+            finish = manager_git_journal._finish
+            def interrupted_finish(slot, active, intent, *args, **kwargs):
+                if intent['kind'] == 'runtime_create':
+                    stop_file.unlink()
+                    raise RuntimeError('test interruption after runtime registration')
+                return finish(slot, active, intent, *args, **kwargs)
+            manager_git_journal._finish = interrupted_finish
+    github_repository = lambda value: 'owner/repo'
+    validate_runtime_prerequisites = lambda *args, **kwargs: None
+    pr_for_branch = lambda *args, **kwargs: None
+    codex_model_efforts = lambda *args: {model: frozenset({'medium', 'high', 'max', 'xhigh'})
+        for model in ('test-fast', 'test-balanced', 'test-strong')}
+    run_codex = fake_agent
+    if '--runtime-child' in sys.argv:
+        from loop_manager_internal.runtime.bootstrap import BootstrapService
+        validate_mutation = BootstrapService.validate_runtime_mutation
+        def advance_remote_then_validate(service, source, state_dir, *args, **kwargs):
+            advance = state_dir / 'advance-after-selection.json'
+            if advance.exists():
+                writer, base = json.loads(advance.read_text())
+                subprocess.run(['git', '-C', writer, 'push', 'origin', 'HEAD:' + base], check=True)
+                subprocess.run(['git', '-C', str(source), 'fetch', 'origin', base], check=True)
+                advance.unlink()
+            return validate_mutation(service, source, state_dir, *args, **kwargs)
+        BootstrapService.validate_runtime_mutation = advance_remote_then_validate
+    raise SystemExit(main())'''), encoding='utf-8')
+                    for name in ('PLANS.md', 'AGENTS.common.md', 'AGENTS.planner.md',
+                                 'AGENTS.planner_check.md', 'AGENTS.worker.md', 'AGENTS.reviewer.md'):
+                        shutil.copy(loop_manager.ROOT / 'docs' / name, source / 'docs' / name)
+                    (source / 'scripts').mkdir(exist_ok=True)
+                    (source / 'scripts/verify.sh').write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
+                    (source / 'scripts/verify.ps1').write_text('exit 0\n', encoding='utf-8')
+                    (state / 'expected-role').write_text(role, encoding='utf-8')
+                    (source / 'docs/plans').mkdir()
+                    plan_file = write_execplan(source, 'G-001', 'Resume saved scope')
+                    plan_path = plan_file.relative_to(source).as_posix()
+                    if base != 'main':
+                        git(source, 'checkout', '-b', base)
+                    sha_a = commit_all(source, 'Manager fixture at A')
+                    git(source, 'push', 'origin', f'HEAD:{base}')
+                    git(source, 'fetch', 'origin')
+                    if base == 'develop':
+                        # Keep main at another SHA: it cannot serve as the runtime base.
+                        git(source, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/develop')
+
+                    connection = loop_manager.connect_database(state, create=True)
+                    with connection:
+                        connection.execute('INSERT INTO projects (repo, base_branch, origin) VALUES (?, ?, ?)',
+                                           (str(source), base, 'owner/repo'))
+                    fingerprint = loop_manager.planning_input_fingerprint(source, base)
+                    if role == 'planner':
+                        workspace = planning_workspace_path(state, str(source), fingerprint)
+                        workspace.parent.mkdir(parents=True, exist_ok=True)
+                        git(source, 'worktree', 'add', '--detach', str(workspace), sha_a)
+                        branch = None
+                        with connection:
+                            connection.execute("UPDATE projects SET phase='PLANNING', worktree=?, "
+                                "plan_sha=?, active_sha=?, planning_attempt_fingerprint=?, planning_workspace_owned=1, "
+                                "planner_session_id='planner-existing' WHERE repo=?",
+                                (str(workspace), sha_a, sha_a, fingerprint, str(source)))
+                    else:
+                        loop_manager.register_execplans(connection, str(source), source,
+                            [(plan_path, loop_manager._parse_execplan(source, plan_file))], sha_a, fingerprint)
+                        branch, workspace = loop_manager.expected_execplan_workspace(state, str(source), 'G-001')
+                        loop_manager.make_worktree(source, workspace, branch, base)
+                        with connection:
+                            connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', active_sha=?, "
+                                "branch=?, worktree=?, workspace_owned=1, worker_session_id='worker-existing', "
+                                "reviewer_session_id='reviewer-existing', worker_session_binding=? "
+                                "WHERE repo=? AND plan_id='G-001'", (sha_a, branch, str(workspace),
+                                    SessionBinding('codex', 'test-fast', 'medium').serialize(), str(source)))
+                    if role != 'planner':
+                        with connection:
+                            connection.execute("UPDATE projects SET phase='WORKING', worktree=?, branch=?, "
+                                "plan_path=?, plan_sha=?, active_sha=?, worker_session_id='worker-existing', "
+                                "reviewer_session_id='reviewer-existing', worker_session_binding=? WHERE repo=?",
+                                (str(workspace), branch, plan_path, sha_a, sha_a,
+                                 SessionBinding('codex', 'test-fast', 'medium').serialize(), str(source)))
+                    if role == 'reviewer':
+                        (workspace / 'src/app.py').write_text('VALUE = 2\n', encoding='utf-8')
+                        commit_all(workspace, 'Saved Worker candidate awaiting Reviewer')
+                    before = loop_manager.begin_agent_scope(connection, str(source), workspace, role)
+                    if role == 'worker':
+                        (workspace / 'src/app.py').write_text('VALUE = 2\n', encoding='utf-8')
+                    saved_result = replace(loop_manager.capture_git_snapshot(workspace),
+                        scope_id=before.scope_id, scope_start_digest=before.scope_start_digest)
+                    record_saved_scope_invocation(connection, source, state, workspace, role, before,
+                        role + '-existing', plan_id='G-001' if role != 'planner' else None)
+                    with connection:
+                        connection.execute('UPDATE projects SET agent_role=?, agent_snapshot=?, '
+                            'agent_result_snapshot=? WHERE repo=?',
+                            (role, before.serialize(), saved_result.serialize(), str(source)))
+                        if role != 'planner':
+                            connection.execute('UPDATE exec_plans SET agent_role=?, agent_snapshot=?, '
+                                'agent_result_snapshot=? WHERE repo=? AND plan_id=?',
+                                (role, before.serialize(), saved_result.serialize(), str(source), 'G-001'))
+                    from loop_manager_internal.agents import common_guidance
+                    from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
+                    guidance_repository = GuidanceRepository(connection)
+                    context = InvocationContext(str(source), 'G-001' if role != 'planner' else None,
+                                                task_id='planning:' + fingerprint if role == 'planner' else None)
+                    guidance = common_guidance.resolve(guidance_repository, context, role, workspace, state)
+                    for session in ('planner-existing',) if role == 'planner' else ('worker-existing', 'reviewer-existing'):
+                        guidance_repository.bind_session(str(source), 'codex', session, guidance.task_id)
+                    if role == 'reviewer':
+                        with connection:
+                            connection.execute("UPDATE exec_plans SET status='REVIEWING', "
+                                "worker_result=?, verify_result=? WHERE repo=? AND plan_id='G-001'",
+                                ('WORKER_OUTCOME: {"kind":"ready_for_validation"}',
+                                 'historical fixture verification', str(source)))
+                            connection.execute("UPDATE projects SET phase='REVIEWING', worker_result=?, "
+                                "verify_result=? WHERE repo=?",
+                                ('WORKER_OUTCOME: {"kind":"ready_for_validation"}',
+                                 'historical fixture verification', str(source)))
+                    connection.commit()
+                    connection.close()
+
+                    writer = Path(directory) / 'writer'
+                    git(source, 'clone', str(Path(directory) / 'remote.git'), str(writer))
+                    configure_identity(writer)
+                    git(writer, 'checkout', base)
+                    # B changes executable-independent input, retaining the saved plan definition.
+                    (writer / 'README.md').write_text('Remote B\n', encoding='utf-8')
+                    sha_b = commit_all(writer, 'Advance to B')
+                    git(writer, 'push', 'origin', f'HEAD:{base}')
+                    if advance_after_selection:
+                        (writer / 'README.md').write_text('External C\n', encoding='utf-8')
+                        sha_c = commit_all(writer, 'External base C after runtime B selection')
+                        (state / 'advance-after-selection.json').write_text(json.dumps([str(writer), base]), encoding='utf-8')
+                    config = profile_config(self)
+                    (state / 'stop-after-registration').touch()
+                    interrupted = subprocess.run([sys.executable, '-B', str(manager_file),
+                        '--state-dir', str(state), '--config', str(config), 'run'],
+                        cwd=source, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                        timeout=90, check=False)
+                    self.assertNotEqual(interrupted.returncode, 0, interrupted.stdout)
+                    self.assertIn('test interruption after runtime registration', interrupted.stdout)
+                    self.assertFalse((state / 'resumed-agent.json').exists())
+                    self.assertTrue(list((state / 'manager-git-journal').glob('*/active.json')))
+                    for attempt in range(2):
+                        completed = subprocess.run([sys.executable, '-B', str(manager_file),
+                            '--state-dir', str(state), '--config', str(config), 'run'],
+                            cwd=source, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            timeout=90, check=False)
+                        proof_path = state / 'resumed-agent.json'
+                        self.assertTrue(proof_path.exists(), completed.stdout)
+                        proof = json.loads(proof_path.read_text())
+                        expected_role = role
+                        self.assertEqual(proof['role'], expected_role)
+                        self.assertEqual(proof['session'], expected_role + '-existing')
+                        self.assertEqual(proof['sha'], sha_c if advance_after_selection and attempt else sha_b)
+                        self.assertEqual(proof['worktree'], str(workspace))
+                        self.assertIn('runtime mutation 검증', completed.stdout)
+                        if attempt == 0:
+                            self.assertIn('runtime scope 수락', completed.stdout)
+                        if role != 'planner':
+                            self.assertEqual((workspace / 'src/app.py').read_text(), 'VALUE = 2\n')
+                        with sqlite3.connect(state / 'loop-manager.db') as check:
+                            self.assertEqual(check.execute('SELECT COUNT(*) FROM project_blocks').fetchone()[0], 0, completed.stdout)
+                            if role != 'planner':
+                                row = check.execute("SELECT status, worker_session_id, reviewer_session_id, retry_count "
+                                    "FROM exec_plans WHERE plan_id='G-001'").fetchone()
+                                self.assertEqual(row, ('REVIEWING' if role == 'reviewer' else 'IMPLEMENTING',
+                                                       'worker-existing', 'reviewer-existing', 0))
+                        # Leave the proof absent so same-SHA reuse must dispatch again.
+                        proof_path.unlink()
+
+    def test_selected_runtime_b_survives_external_base_c_before_child_prevalidation(self):
+        self.test_remote_bootstrap_child_resumes_saved_scope_without_identity_injection(advance_after_selection=True)
+
+
+class BootstrapSavedScopeFixtureUnitTests(unittest.TestCase):
+    def test_saved_invocation_proof_is_bound_to_role_session_repository_and_scope(self):
+        from types import SimpleNamespace
+        from tests.support.database import runtime_connection
+        from tests.support.runtime import record_saved_scope_invocation
+        from loop_manager_internal.agents import scope_validation
+        from tests.support.scope import snapshot
+
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        ledger = agent_invocation_state.InvocationRepository(connection)
+        for role in ('planner', 'worker', 'reviewer'):
+            with self.subTest(role=role):
+                before = snapshot(scope_id=role + '-scope', scope_start_digest='c' * 64,
+                                  branch=None if role == 'planner' else 'loop-manager/G-047')
+                plan_id = None if role == 'planner' else 'G-047'
+                worktree = Path('/managed')
+                repository_identity = hashlib.sha256(b'/common\0origin').hexdigest()
+                with mock.patch('loop_manager_internal.agents.agent_write_isolation.inspect_worktree',
+                                return_value=SimpleNamespace(repository_identity=repository_identity)):
+                    record_saved_scope_invocation(connection, 'repo', Path('/state'), worktree,
+                                                  role, before, role + '-existing', plan_id=plan_id)
+                expected = dict(repo='repo', plan_id=plan_id, role=role, provider='codex',
+                                session_id=role + '-existing', worktree=str(worktree.resolve()),
+                                repository_identity=repository_identity, start_digest='c' * 64)
+                self.assertTrue(ledger.verified_scope(before.scope_id, **expected))
+                for key, value in (('role', 'other'), ('session_id', 'other'),
+                                   ('repository_identity', 'other'), ('worktree', '/other'),
+                                   ('start_digest', 'd' * 64), ('plan_id', 'G-999')):
+                    with self.subTest(mismatch=key):
+                        self.assertFalse(ledger.verified_scope(before.scope_id, **{**expected, key: value}))
+                self.assertFalse(ledger.verified_scope('unbound-scope', **expected))
+                owner = {'agent_snapshot': before.serialize(), 'agent_role': role,
+                         'worktree': str(worktree), 'plan_path': 'docs/plans/[G-047] Runtime.md',
+                         'provider': 'codex', 'base_branch': 'main', 'branch': before.branch,
+                         'phase': 'PLANNING' if role == 'planner' else
+                                  'REVIEWING' if role == 'reviewer' else 'WORKING',
+                         role + '_session_id': role + '-existing'}
+                effects = mock.Mock()
+                effects.repository.return_value.scope_owner.return_value = owner
+                effects._plan_id_from_path.return_value = plan_id
+                effects._git_common_directory.return_value = Path('/common')
+                effects.git.return_value = SimpleNamespace(stdout='origin\n')
+                effects._rebase_in_progress_for_branch.return_value = False
+                resources = scope_validation._agent_git_resources(
+                    connection, Path('repo'), worktree, before, role, effects=effects)
+                self.assertIsNotNone(resources)
+                self.assertEqual(resources.worktrees, frozenset((str(worktree.resolve()),)))
+                if role == 'reviewer':
+                    from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
+                    owner['phase'] = 'WORKING'
+                    effects._owned_rebase_state_dir.return_value = Path('/state')
+                    effects._current_rebase_service.return_value.require_owned.return_value = (
+                        None, SimpleNamespace(status=RebaseStatus.COMPLETE))
+                    self.assertIsNotNone(scope_validation._agent_git_resources(
+                        connection, Path('repo'), worktree, before, role, effects=effects))
+                    effects._current_rebase_service.return_value.require_owned.return_value = (
+                        None, SimpleNamespace(status=RebaseStatus.WAITING))
+                    self.assertIsNone(scope_validation._agent_git_resources(
+                        connection, Path('repo'), worktree, before, role, effects=effects))
+                    owner['phase'] = 'REVIEWING'
+                owner[role + '_session_id'] = 'unmatched-session'
+                self.assertIsNone(scope_validation._agent_git_resources(
+                    connection, Path('repo'), worktree, before, role, effects=effects))
+
+
+class ReviewerRebaseScopeHandoffUnitTests(unittest.TestCase):
+    def test_owned_completed_rebase_rechecks_reviewer_before_fresh_worker_scope(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.agents import scope_lifecycle
+        from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        from tests.support.database import runtime_connection
+        from tests.support.scope import snapshot
+
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        before = snapshot(branch='loop-manager/G-047', scope_id='a' * 32,
+                          scope_start_digest='c' * 64,
+                          refs={'refs/heads/loop-manager/G-047': ('a', 'commit')})
+        current = replace(before, head='b', refs={'refs/heads/loop-manager/G-047': ('b', 'commit')})
+        row = {'agent_snapshot': before.serialize(), 'agent_result_snapshot': before.serialize(),
+               'agent_role': 'reviewer', 'plan_path': 'docs/plans/[G-047] Runtime.md',
+               'branch': before.branch, 'base_branch': 'main'}
+        checkpoint = ExecutionCheckpointRepository(connection)
+        checkpoint.record('repo', 'G-047', expected_generation=0, operation=None,
+                          expected_head='b', target_base_oid='b', observed_remote_oid=None,
+                          snapshot={'current_rebase_acceptance': {'fixture': 'owned'},
+                              'manager_metadata_agent_baseline': {
+                                  'role': 'reviewer',
+                                  'original': hashlib.sha256(before.serialize().encode()).hexdigest(),
+                                  'snapshot': replace(before, refs={**before.refs,
+                                      'refs/remotes/origin/main': ('b', '')}).serialize()}})
+        effects = mock.Mock()
+        effects.repository.return_value.scope_owner.return_value = row
+        effects._plan_id_from_path.return_value = 'G-047'
+        effects._owned_rebase_state_dir.return_value = Path('/state')
+        effects.capture_git_snapshot.return_value = current
+        effects._capture_agent_baseline.return_value = None
+        for status in (RebaseStatus.WAITING, RebaseStatus.COMPLETE):
+            effects._current_rebase_service.return_value.require_owned.return_value = (
+                None, SimpleNamespace(status=status))
+            if status is RebaseStatus.WAITING:
+                with self.assertRaises(RuntimeError):
+                    scope_lifecycle.begin_agent_scope(connection, 'repo', Path('/managed'), 'worker', effects=effects)
+                effects.update_project.assert_not_called()
+                continue
+            resumed = scope_lifecycle.begin_agent_scope(
+                connection, 'repo', Path('/managed'), 'worker', effects=effects)
+            self.assertNotEqual(resumed.scope_id, before.scope_id)
+            self.assertEqual(effects.validate_agent_scope.call_count, 2)
+            self.assertEqual(effects.validate_agent_scope.call_args_list[0].args[0], 'reviewer')
+            first_check = effects.validate_agent_scope.call_args_list[0]
+            self.assertEqual(first_check.args[2].refs, first_check.args[3].refs)
+            self.assertEqual(first_check.args[2].refs['refs/remotes/origin/main'], ('b', ''))
+            self.assertNotIn('refs/remotes/origin/main', before.refs)
+            self.assertEqual(effects.update_project.call_args.kwargs['agent_role'], 'worker')
+            audit = checkpoint.get('repo', 'G-047').snapshot['current_rebase_agent_baseline']
+            self.assertEqual(audit['role'], 'reviewer')
+            self.assertEqual(audit['original'], hashlib.sha256(before.serialize().encode()).hexdigest())
+        effects.reset_mock()
+        effects.validate_agent_scope.side_effect = loop_manager.AgentScopeError('Reviewer write rejected')
+        prior = checkpoint.get('repo', 'G-047')
+        with self.assertRaises(loop_manager.AgentScopeError):
+            scope_lifecycle.begin_agent_scope(connection, 'repo', Path('/managed'), 'worker', effects=effects)
+        effects.update_project.assert_not_called()
+        self.assertEqual(checkpoint.get('repo', 'G-047'), prior)
+        effects.validate_agent_scope.side_effect = None
+        effects.reset_mock()
+        checkpoint.record('repo', 'G-047', expected_generation=checkpoint.get('repo', 'G-047').generation,
+                          operation=None, expected_head='b', target_base_oid='b', observed_remote_oid=None,
+                          snapshot={})
+        with self.assertRaises(RuntimeError):
+            scope_lifecycle.begin_agent_scope(connection, 'repo', Path('/managed'), 'worker', effects=effects)
+        effects.update_project.assert_not_called()

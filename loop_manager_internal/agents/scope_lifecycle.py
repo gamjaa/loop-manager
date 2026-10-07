@@ -51,6 +51,38 @@ def begin_agent_scope(
     row = effects.repository(connection).scope_owner(repo)
     if row is None:
         raise RuntimeError("Agent scope를 저장할 프로젝트가 없습니다.")
+    if row['agent_snapshot'] and row['agent_role'] == 'reviewer' and role_name == 'worker':
+        # Rebase requires a new Worker turn. Recheck the preserved Reviewer
+        # output and live Manager result before beginning a distinct scope.
+        plan_id = effects._plan_id_from_path(str(row['plan_path'] or ''))
+        scope_state_dir = state_dir or effects._owned_rebase_state_dir(repo, plan_id, worktree)
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id or '')
+        if (scope_state_dir is None or not plan_id
+                or not (checkpoint.snapshot or {}).get('current_rebase_acceptance')):
+            raise RuntimeError('Reviewer scope에서 Worker 재검증으로 전환할 rebase 증거가 없습니다.')
+        _, verdict = effects._current_rebase_service(
+            connection, Path(repo), scope_state_dir, repo, plan_id,
+            worktree, row['branch']).require_owned(checkpoint=checkpoint)
+        if verdict.status is not managed_rebase_adoption.RebaseStatus.COMPLETE:
+            raise RuntimeError('Reviewer scope의 관리 rebase가 완료되지 않았습니다.')
+        original = GitSnapshot.deserialize(str(row['agent_snapshot']))
+        current = effects.capture_git_snapshot(worktree)
+        comparison = agent_scope_decision.manager_comparison_baseline(
+            original, original, checkpoint.snapshot or {}, 'reviewer')
+        if row['agent_result_snapshot']:
+            result = agent_scope_decision.manager_comparison_baseline(
+                original, GitSnapshot.deserialize(str(row['agent_result_snapshot'])),
+                checkpoint.snapshot or {}, 'reviewer')
+            effects.validate_agent_scope('reviewer', worktree, comparison, result,
+                external_worktree=Path(repo), base_branch=row['base_branch'], connection=connection)
+        baseline = managed_rebase_adoption.selected_baseline(
+            original, current, row['branch'], str(worktree.resolve()), publication=checkpoint)
+        effects.validate_agent_scope('reviewer', worktree, baseline, current,
+            external_worktree=Path(repo), base_branch=row['base_branch'], connection=connection)
+        managed_rebase_adoption.remember_agent_baseline(
+            execution_checkpoint_state.ExecutionCheckpointRepository(connection),
+            repo, plan_id, original, baseline, 'reviewer')
+        row = {**dict(row), 'agent_snapshot': None}
     if row["agent_snapshot"]:
         if row["agent_role"] != role_name:
             raise RuntimeError(
@@ -72,26 +104,38 @@ def begin_agent_scope(
         scope_state_dir = state_dir or (
             effects._owned_rebase_state_dir(repo, plan_id, worktree) if plan_id else None)
         if scope_state_dir is not None:
+            current = effects.capture_git_snapshot(worktree)
+            resources = effects._agent_git_resources(
+                connection, Path(repo), worktree, stored, role_name,
+                selected_plan_path=str(row['plan_path'] or ''))
             stored = effects._reconciled_manager_scope_metadata(
-                connection, Path(repo), scope_state_dir, repo, plan_id, stored,
-                effects.capture_git_snapshot(worktree),
-                effects._agent_git_resources(connection, Path(repo), worktree, stored, role_name,
-                                     selected_plan_path=str(row['plan_path'] or '')))
+                connection, Path(repo), scope_state_dir, repo, plan_id, stored, current, resources)
+            if resources is not None:
+                # These independent resources were observed before this call,
+                # under the previous completed invocation's isolation proof.
+                # A failed new attempt must still compare its own full delta.
+                stored = replace(stored,
+                    refs={**{key: value for key, value in current.refs.items() if key not in resources.refs},
+                          **{key: value for key, value in stored.refs.items() if key in resources.refs}},
+                    worktrees={**{key: value for key, value in current.worktrees.items() if key not in resources.worktrees},
+                               **{key: value for key, value in stored.worktrees.items() if key in resources.worktrees}})
         checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id or '')
         if stored != original_scope:
             checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
             saved = dict(checkpoint.snapshot or {})
             previous = saved.get('manager_metadata_agent_baseline')
-            if previous is not None:
-                saved['manager_metadata_agent_baseline_history'] = [
-                    *saved.get('manager_metadata_agent_baseline_history', ()), previous]
-            checkpoints.record(repo, plan_id or '', expected_generation=checkpoint.generation,
-                operation=checkpoint.operation, expected_head=checkpoint.expected_head,
-                target_base_oid=checkpoint.target_base_oid, observed_remote_oid=checkpoint.observed_remote_oid,
-                snapshot={**saved, 'manager_metadata_agent_baseline': {
-                    'role': role_name, 'original': hashlib.sha256(original_scope.serialize().encode()).hexdigest(),
-                    'snapshot': stored.serialize()}})
-            checkpoint = checkpoints.get(repo, plan_id or '')
+            baseline = {'role': role_name,
+                'original': hashlib.sha256(original_scope.serialize().encode()).hexdigest(),
+                'snapshot': stored.serialize()}
+            if previous != baseline:
+                if previous is not None:
+                    saved['manager_metadata_agent_baseline_history'] = [
+                        *saved.get('manager_metadata_agent_baseline_history', ()), previous]
+                checkpoints.record(repo, plan_id or '', expected_generation=checkpoint.generation,
+                    operation=checkpoint.operation, expected_head=checkpoint.expected_head,
+                    target_base_oid=checkpoint.target_base_oid, observed_remote_oid=checkpoint.observed_remote_oid,
+                    snapshot={**saved, 'manager_metadata_agent_baseline': baseline})
+                checkpoint = checkpoints.get(repo, plan_id or '')
         if (plan_id and not blocked_plan_reconciliation.remote_adoption_is_current(checkpoint)
                 and (checkpoint.operation == 'rebase'
                      or (checkpoint.snapshot or {}).get('current_rebase_acceptance'))):
