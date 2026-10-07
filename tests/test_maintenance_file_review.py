@@ -1,4 +1,6 @@
 from tests.support.maintenance import root_results_for, result_for
+from concurrent.futures import ThreadPoolExecutor
+import threading
 import hashlib
 import json
 from pathlib import Path
@@ -11,6 +13,58 @@ from unittest import mock
 from loop_manager_internal.maintenance import maintenance_file_inventory
 from loop_manager_internal.maintenance import maintenance_file_review as review
 from loop_manager_internal.storage import maintenance_file_ledger
+from loop_manager_internal.storage import database
+
+
+class ConcurrentProvisionalReviewSchemaTest(unittest.TestCase):
+    def test_legacy_review_is_migrated_before_project_connections_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            with sqlite3.connect(state_dir / 'loop-manager.db') as connection:
+                connection.execute(database.SCHEMA)
+                connection.execute(review._SCHEMA)
+                connection.execute(
+                    'INSERT INTO provisional_file_reviews VALUES '
+                    "('repo', 'src/a.py', 7, 'revision', 'hash', '100644', "
+                    "'saved-session', 'saved-error', '{\"saved\":true}')"
+                )
+            connection = database.connect_database(state_dir)
+            self.addCleanup(connection.close)
+            columns = {row[1] for row in connection.execute(
+                'PRAGMA table_info(provisional_file_reviews)')}
+            self.assertTrue({'guidance_hash', 'prior_guidance_results'} <= columns)
+            saved = connection.execute(
+                'SELECT cycle_revision, session_id, validation_error, result_json, '
+                'guidance_hash, prior_guidance_results FROM provisional_file_reviews'
+            ).fetchone()
+            self.assertEqual(tuple(saved),
+                             (7, 'saved-session', 'saved-error', '{"saved":true}', None, None))
+            for table in ('provisional_file_review_guidance_history', 'provisional_review_receipts'):
+                self.assertIsNotNone(connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", (table,)
+                ).fetchone())
+
+    def test_project_threads_construct_repositories_without_altering_schema(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            connection = database.connect_database(state_dir, create=True)
+            connection.close()
+            barrier = threading.Barrier(2)
+
+            def project():
+                connection = database.connect_database(state_dir, run_migrations=False)
+                try:
+                    statements = []
+                    connection.set_trace_callback(statements.append)
+                    barrier.wait(timeout=10)
+                    review.ProvisionalReviewRepository(connection)
+                    return [sql for sql in statements if sql.lstrip().upper().startswith('ALTER TABLE')]
+                finally:
+                    connection.close()
+
+            with ThreadPoolExecutor(max_workers=2) as executor:
+                futures = [executor.submit(project) for _ in range(2)]
+                self.assertEqual([future.result(timeout=30) for future in futures], [[], []])
 
 
 class ProvisionalReviewSchemaTest(unittest.TestCase):
