@@ -44,6 +44,7 @@ priority: high
 - [x] 2026-10-07 origin/main rebase 및 계획 대조 검토: 이미 최신 기준 60b956d에 있었으며, ignore 해제 규칙의 삭제 오분류·Planner PROJECT_BLOCKED 소유권 검사 누락·증명된 실행 격리에서의 단계 무효화를 재현하고 보완함. Manager checkpoint 비교도 역할별 생성·수정·삭제 회귀에 포함함.
 - [x] 2026-10-07 검토 보완 후 전체 verify 재실행: 201개 모듈, 3,090개 성공·2개 skip, 종료 코드 0. 같은 G-198 worktree에서 검증했으며 재개 단계·소유권 변경·독립 원인 보존 회귀가 통과함.
 - [x] 2026-10-07 review delta 보완: 저장 verify의 base·정의·후보 token 증명 시 차단 재개를 REVIEWING으로 이어가도록 보완하고, 해당 targeted unit 1개 통과.
+- [x] 2026-10-07 추가 review delta 보완: verify 재호출 전 이전 성공 표식을 지우고, 통과한 호출의 후보·출력 결합 token을 scope 검사 전에 저장함. 저장 출력이 token과 다르면 차단 재개에서 완료 검증으로 인정하지 않으며 관련 targeted unit 7개 통과.
 - [ ] 사용자 Merge
 
 ## Decision Log

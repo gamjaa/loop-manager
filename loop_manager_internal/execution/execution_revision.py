@@ -205,8 +205,16 @@ class DefinitionSnapshot:
     def worker_candidate_token(self, head: str) -> str:
         return _digest('worker-candidate', (self.worker_token, head))
 
-    def verify_token(self, base_token: str, candidate_head: str | None = None) -> str:
-        return _digest("verify-stage", (self.worker_token, base_token, candidate_head))
+    def verify_token(
+        self, base_token: str, candidate_head: str | None = None,
+        verify_output: str | None = None,
+    ) -> str:
+        values = (self.worker_token, base_token, candidate_head)
+        if verify_output is not None:
+            # A successful verify marker must describe the output stored beside
+            # it, so a later failed attempt cannot inherit stale success.
+            return _digest("verify-stage-output", (*values, verify_output))
+        return _digest("verify-stage", values)
 
     def review_token(self, base_token: str, candidate_head: str | None = None) -> str:
         return _digest("review-stage", (self.verify_token(base_token, candidate_head),))
@@ -288,6 +296,7 @@ class StageArtifacts:
     worker_input_token: str | None = None
     archive_token: str | None = None
     verify_token: str | None = None
+    verify_output: str | None = None
     review_token: str | None = None
     publication_token: str | None = None
 
@@ -352,7 +361,9 @@ def decide_revision_gate(
     if base_changed and target != "IMPLEMENTING":
         target = _earlier_phase(target, "VERIFYING")
 
-    expected_verify = current.verify_token(current_base_token, candidate_head)
+    expected_verify = current.verify_token(
+        current_base_token, candidate_head, artifacts.verify_output,
+    )
     if target in {"REVIEWING", "PUBLISHING"} and (
         not artifacts.verify_result or artifacts.verify_token != expected_verify
     ):

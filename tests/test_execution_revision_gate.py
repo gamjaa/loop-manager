@@ -94,7 +94,9 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
         self.assertIsNotNone(completed.publication_token)
         snapshot = DefinitionSnapshot.deserialize(completed.definition_snapshot)
         assert snapshot is not None
-        self.assertEqual(completed.verify_token, snapshot.verify_token('base', 'base'))
+        self.assertEqual(completed.verify_token, snapshot.verify_token(
+            'base', 'base', str(completed.verify_result),
+        ))
         self.assertEqual(completed.review_token, snapshot.review_token('base', 'base'))
 
 
@@ -116,7 +118,7 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
             review_result='review-result',
             worker_input_token=snapshot.worker_token,
             archive_token=snapshot.archive_token,
-            verify_token=snapshot.verify_token('base', 'base'),
+            verify_token=snapshot.verify_token('base', 'base', 'verify-result'),
             review_token=snapshot.review_token('base', 'base'),
             publication_token=snapshot.publication_token('base', 'base'),
         )

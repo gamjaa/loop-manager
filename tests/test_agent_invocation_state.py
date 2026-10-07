@@ -209,6 +209,8 @@ class CommonGuidanceStateTests(TestCase):
              mock.patch.object(common_guidance, 'runtime_content_hash', return_value='b' * 64):
             snapshot = seed_validated_candidate(connection, Path('repo'), Path('/candidate'), 'G-047')
         self.assertEqual(snapshot.guidance_hash, 'a' * 64)
-        row = connection.execute('SELECT verify_token, review_token FROM exec_plans').fetchone()
-        self.assertEqual(row['verify_token'], snapshot.verify_token('base', 'candidate'))
+        row = connection.execute('SELECT verify_result, verify_token, review_token FROM exec_plans').fetchone()
+        self.assertEqual(row['verify_token'], snapshot.verify_token(
+            'base', 'candidate', row['verify_result'],
+        ))
         self.assertEqual(row['review_token'], snapshot.review_token('base', 'candidate'))

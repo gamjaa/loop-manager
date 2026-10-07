@@ -38,7 +38,9 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
                 'phase': 'VERIFYING', 'active_sha': 'base',
                 'validated_base_sha': 'base', 'worker_result': 'saved worker',
                 'verify_result': 'saved verify', 'definition_snapshot': definition.serialize(),
-                'verify_token': definition.verify_token('base', self.current.head),
+                'verify_token': definition.verify_token(
+                    'base', self.current.head, 'saved verify',
+                ),
             }, enqueue=False,
         )
         self.connection.execute(
@@ -62,7 +64,9 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
         resumed = self.connection.execute('SELECT * FROM exec_plans').fetchone()
         self.assertEqual(resumed['status'], 'REVIEWING')
         self.assertEqual((resumed['verify_result'], resumed['verify_token']),
-                         ('saved verify', definition.verify_token('base', self.current.head)))
+                         ('saved verify', definition.verify_token(
+                             'base', self.current.head, 'saved verify',
+                         )))
         self.assertEqual(resumed['agent_result_snapshot'], result.serialize())
 
         context = SimpleNamespace(phase=ExecutionPhase(resumed['status']))
@@ -78,6 +82,27 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
         ExecutionPhaseCoordinator(ports).dispatch(context)
         ports.verify.assert_not_called()
         ports.review.assert_called_once_with(context)
+
+    def test_saved_verify_success_token_does_not_cover_replaced_failure_output(self):
+        definition = DefinitionSnapshot(
+            revision_sha='base', path='docs/plans/[G-047] Runtime.md',
+            title='Runtime', sources=('docs/PRODUCT.md',), depends_on=(),
+            complexity='medium', risk='medium', priority='normal',
+            body_hash='body', source_fingerprint='source', archive_candidates=(),
+        )
+        plan = {
+            'active_sha': 'base',
+            'validated_base_sha': 'base',
+            'verify_result': 'failed output from resumed verify',
+            'verify_token': definition.verify_token(
+                'base', self.current.head, 'prior successful output',
+            ),
+            'definition_snapshot': definition.serialize(),
+        }
+
+        self.assertFalse(loop_manager.project_block_service._saved_verify_matches_candidate(
+            plan, self.current.head,
+        ))
 
     def test_ignored_plan_release_preserves_stage_with_proven_invocation_isolation(self):
         start = replace(self.before, dirty={'cache.bin': (('untracked',), 'old')})

@@ -590,8 +590,8 @@ class ExecutionHandlers:
             },
         )
 
-    def _verify_once(self, context):
-        return self._verify_handler()._verify_once(context)
+    def _verify_once(self, context, candidate_head=None):
+        return self._verify_handler()._verify_once(context, candidate_head)
 
     def verify(self, context, latest_base):
         return self._verify_handler().verify(context, latest_base)

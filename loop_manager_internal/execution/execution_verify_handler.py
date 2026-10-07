@@ -61,7 +61,7 @@ class VerifyHandler:
     def __init__(self, ports: VerifyHandlerPorts):
         self.ports = ports
 
-    def _verify_once(self, context):
+    def _verify_once(self, context, candidate_head: str | None = None):
         assert self.ports.snapshot().catalog_plan is not None and self.ports.snapshot().plan is not None
         from loop_manager_internal.execution.manual_candidate import get_manual
         manual = get_manual(self.ports.state)
@@ -94,6 +94,23 @@ class VerifyHandler:
             manual.record(context, 'verify', passed, raw_output)
         if not hasattr(output, 'fingerprint_source'):
             output = raw_output
+        definition = self.ports.snapshot()._definition_snapshot
+        if passed and candidate_head and context.active_sha and definition is not None:
+            observed_head = self.ports.git(
+                context.worktree, 'rev-parse', 'HEAD',
+            ).stdout.strip()
+            if observed_head == candidate_head:
+                self.ports.state.update_project(
+                    self.ports.identity.repo,
+                    validated_base_sha=context.active_sha,
+                    verify_result=output,
+                    verify_token=definition.verify_token(
+                        context.active_sha, candidate_head, str(output),
+                    ),
+                    review_result=None,
+                    review_token=None,
+                    publication_token=None,
+                )
         feedback_repo = self.ports.feedback.repository if self.ports.feedback else None
         if feedback_repo is not None:
             fingerprints = () if passed else self.ports.feedback.fingerprints(
@@ -250,7 +267,18 @@ class VerifyHandler:
         candidate_head = self.ports.git(
             context.worktree, 'rev-parse', 'HEAD'
         ).stdout.strip()
-        outcome, output = self._verify_once(context)
+        # A new invocation invalidates any previous success marker first. If
+        # this run fails before replacing its output, stale evidence cannot be
+        # paired with the new candidate or a later scope block.
+        self.ports.state.update_project(
+            self.ports.identity.repo,
+            validated_base_sha=None,
+            verify_token=None,
+            review_result=None,
+            review_token=None,
+            publication_token=None,
+        )
+        outcome, output = self._verify_once(context, candidate_head)
         if outcome is not None:
             return outcome
         if self.ports.git(
@@ -287,7 +315,9 @@ class VerifyHandler:
                 validated_base_sha=context.active_sha,
                 verify_result=output,
                 verify_token=(
-                    self.ports.snapshot()._definition_snapshot.verify_token(context.active_sha, candidate_head)
+                    self.ports.snapshot()._definition_snapshot.verify_token(
+                        context.active_sha, candidate_head, str(output),
+                    )
                     if self.ports.snapshot()._definition_snapshot is not None else None
                 ),
                 review_token=None,

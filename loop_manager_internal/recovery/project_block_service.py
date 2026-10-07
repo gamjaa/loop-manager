@@ -92,7 +92,7 @@ def _saved_verify_matches_candidate(plan: sqlite3.Row, candidate_head: str) -> b
     except ValueError:
         return False
     return bool(definition and plan['verify_token'] == definition.verify_token(
-        active_sha, candidate_head))
+        active_sha, candidate_head, str(plan['verify_result'])))
 
 
 @dataclass(frozen=True)
