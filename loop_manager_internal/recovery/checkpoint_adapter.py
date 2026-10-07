@@ -457,7 +457,7 @@ class CheckpointSafetyAdapter:
         worktree = Path(str(request.worktree))
         try:
             document = self.safety_effects._guidance_document(worktree, str(plan["path"]))
-            if document is None or document.structure_hash != plan["guidance_plan_hash"]:
+            if document is None or not document.matches_structure_hash(plan["guidance_plan_hash"]):
                 return False
             self.safety_effects._guidance_document_matches_rows(document, rows, require_decisions=False)
             before = GitSnapshot.deserialize(str(plan["agent_snapshot"]))

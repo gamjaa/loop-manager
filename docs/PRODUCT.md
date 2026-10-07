@@ -273,7 +273,8 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 - 프로젝트 `AGENTS.md`에 공통 본문 포함·일치 승인을 요구하지 않는다. 과거 mismatch 승인·해시 기록은 감사로 보존한다
 - `AGENTS.md` 존재·UTF-8과 `docs/PLANS.md` 해시 검사는 프로젝트 등록 시 선택한 원격 commit blob에만 수행하며 자동 Loop에서는 반복하지 않는다
 - 자동 작업의 기준은 `origin/<base-branch>`다
-- 사용자는 원격 기준에 게시하는 ExecPlan의 정확한 AGENTS.md Proposal과 User Decision으로 사전 승인할 수 있다. Worker 시작 전에 결정과 당시 기준 파일을 대조하고 유효한 patch만 허용한다. 기준이 바뀌면 재승인을 기다리며 로컬 본문·포괄적 허락·Agent가 작성한 승인은 인정하지 않는다. 실제 결과와 최신 base 검증, Review와 사용자 Merge는 유지한다.
+- 사용자는 원격 기준에 게시하는 ExecPlan의 정확한 AGENTS.md Proposal과 User Decision으로 사전 승인할 수 있다. Worker 시작 전에 결정과 당시 기준 파일을 대조하고 유효한 patch만 허용한다. 기준이 바뀌면 재승인을 기다리며 로컬 본문·포괄적 허락·자동 실행 Agent의 자기 승인은 인정하지 않는다. 사용자가 특정 결정과 범위를 명시해 요청한 모델의 문서 작성 도움은 허용한다. 실제 결과와 최신 base 검증, Review와 사용자 Merge는 유지한다.
+- AGENTS User Decision은 fence 밖 독립 줄의 `<!-- END USER DECISION -->`로 끝내고 뒤에 메모를 둘 수 있다. 마커 없는 기존 결정은 다음 guidance 제목·최상위 절·EOF로 끝난다. Revision은 선택적이며 기존 Revision·승인 identity는 보존한다. 안내 주석·Comment·종료 뒤 메모는 결정 identity에 포함하지 않는다. 요청 양식은 pending·빈 Comment·원안 전체 diff를 제공한다. pending의 Patch 편집은 대기를 유지하고 approve는 원안만, replace는 확정한 전체 diff를 적용하며 reject는 파일을 변경하지 않는다. 표시된 원안과 빈 Patch는 같은 의미이며, 값이 있는 모든 Patch는 대상·형식을 검증한다.
 - 기본 worktree의 로컬 변경, checkout branch와 ahead·diverged 이력은 자동 작업을 막지 않으며 local-only 내용은 자동 입력에 포함하지 않는다
 
 - 기본 worktree는 equal이면 무변경, ahead이면 보존·skip, behind이면 disjoint 로컬 변경과 index·ignored 파일을 보존하는 safe fast-forward로 처리한다. clean diverged의 확인된 선형 로컬 commit은 durable intent 아래 원격 base 위로 rebase하며 자동 push하지 않는다. dirty 작업·merge commit·겹치는 ignored 경로·사용자 operation·소유권 불확실은 보존·skip한다. 실패·중단에서 소유 작업과 실제 ref·index·파일이 일치할 때만 복구하고 동일 입력의 실패 Git 쓰기를 반복하지 않는다.

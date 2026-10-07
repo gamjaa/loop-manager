@@ -262,7 +262,8 @@ def _block_for_new_guidance(
     message = effects._guidance_block_message(
         plan,
         new_proposals,
-        "각 User Decision의 Decision과 Revision을 사용자가 직접 확정해야 합니다.",
+        "각 User Decision의 Decision을 approve·reject·replace 중 하나로 확정하세요. "
+        "수정한 Patch를 적용하려면 replace를 선택하세요.",
     )
     result_snapshot = effects.capture_git_snapshot(worktree).serialize()
     with connection:
@@ -535,7 +536,7 @@ def resume_guidance_approval_if_decided(
         document = effects._guidance_document(worktree, str(plan["path"]))
         if document is None:
             raise AgentScopeError("저장된 guidance 제안이 ExecPlan에서 사라졌습니다.")
-        if document.structure_hash != str(plan["guidance_plan_hash"] or ""):
+        if not document.matches_structure_hash(str(plan["guidance_plan_hash"] or "")):
             raise AgentScopeError(
                 "User Decision 이외의 ExecPlan 변경으로 guidance 승인을 해제할 수 없습니다."
             )

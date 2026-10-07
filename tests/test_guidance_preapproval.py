@@ -51,6 +51,44 @@ class CommonGuidanceApprovalCompatibilityTests(unittest.TestCase):
         self.assertEqual(row['decision_hash'], source.proposals[0].decision.identity)
         effects._invalidate_guidance_approval.assert_not_called()
 
+    def test_revisionless_preapproval_uses_shared_parser_and_keeps_registered_identity(self):
+        from types import SimpleNamespace
+        from tests.support.database import runtime_connection
+        from loop_manager_internal.documents import guidance_preapproval as pre, guidance_service as service
+        baseline = 'a' * 40
+        published = guidance_plan(decision='approve', patch=PATCH).replace(
+            'Revision: ``\n', f'Baseline: `{baseline}` <!-- 실제 기준 commit 전체 SHA -->\nComment: ``\n'
+        ) + '<!-- END USER DECISION -->\n## 메모\nDecision: `reject`\n'
+        source = ga.parse_guidance_document(published)
+        effects = pre.PrepareGuidancePreapprovalsEffects(
+            _guidance_document=mock.Mock(return_value=source),
+            _guidance_rows=mock.Mock(return_value=()),
+            _invalidate_guidance_approval=mock.Mock(),
+            _validate_guidance_proposal_scope=service._validate_guidance_proposal_scope,
+            git=mock.Mock(side_effect=lambda _repo, *args, **kwargs: SimpleNamespace(
+                returncode=0, stdout='100644 blob oid\tAGENTS.md\n' if args[0] == 'ls-tree' else published)),
+            is_loop_manager_repository=mock.Mock(return_value=False),
+        )
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        plan = {'plan_id': 'G-020', 'path': 'docs/plans/test.md', 'plan_sha': 'b' * 40,
+                'current_revision_sha': 'b' * 40, 'agent_snapshot': None}
+        with mock.patch.object(pre, '_guidance_target_state', return_value=(b'# Agents\n', 0o644)), mock.patch.object(
+            pre, 'subprocess', mock.Mock(run=mock.Mock(return_value=SimpleNamespace(stdout=b'# Agents\n')))
+        ):
+            self.assertFalse(pre.prepare_guidance_preapprovals(effects, connection, Path('/repo'), 'repo', Path('/work'), plan))
+            row = connection.execute('SELECT * FROM guidance_approvals').fetchone()
+            self.assertEqual((row['decision'], row['decision_revision'], row['approved_patch']), ('approve', '', PATCH))
+            self.assertEqual(row['decision_hash'], source.proposals[0].decision.identity)
+            effects._guidance_rows.return_value = (row,)
+            # Display-only changes on restart do not register another approval.
+            edited = published.replace('Comment: ``', 'Comment: `user explanation`').replace('## 메모', '## changed memo')
+            edited = edited.replace(f'```diff\n{PATCH}```\n<!-- END', '```diff\n```\n<!-- END')
+            effects._guidance_document.return_value = ga.parse_guidance_document(edited)
+            self.assertFalse(pre.prepare_guidance_preapprovals(effects, connection, Path('/repo'), 'repo', Path('/work'), plan))
+        self.assertEqual(connection.execute('SELECT COUNT(*) FROM guidance_approvals').fetchone()[0], 1)
+        effects._invalidate_guidance_approval.assert_not_called()
+
     def test_new_common_proposal_is_rejected_before_worker_scope_or_storage(self):
         from types import SimpleNamespace
         from loop_manager_internal.documents import guidance_service as service
