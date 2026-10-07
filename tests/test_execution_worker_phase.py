@@ -117,7 +117,7 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         with mock.patch.object(self.handler, '_finish_worker', return_value=SimpleNamespace(kind='done')):
             self.handler.run(self.context())
         self.assertEqual(len(prompts), 2)
-        self.assertIn('AGENTS.md, 선택된 최신 ExecPlan과 현재 worktree', prompts[1])
+        self.assertIn('AGENTS.md(존재하면), 선택된 최신 ExecPlan과 현재 worktree', prompts[1])
         self.assertIn('previous result', prompts[1])
         self.assertIn('review:a.py::f::bug occurrence=1 revision=1', prompts[1])
         self.assertIn('Fix the assertion', prompts[1])
@@ -173,7 +173,7 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
             self.assertIsNone(kwargs['session_id'])
             self.assertEqual(kwargs['invocation'].transition_cause,
                              'unbound_session_recovery')
-            self.assertIn('AGENTS.md, 선택된 최신 ExecPlan과 현재 worktree', args[5])
+            self.assertIn('AGENTS.md(존재하면), 선택된 최신 ExecPlan과 현재 worktree', args[5])
             kwargs['on_session_started']('bound-session')
             return lm.AgentResult(0, VALID_WORKER_RESULT, session_id='bound-session')
         self.effects.agent.run_agent.side_effect = invoke
@@ -348,7 +348,7 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         )
         with mock.patch.object(self.handler, '_finish_worker', return_value=SimpleNamespace(kind='done')):
             self.handler.run(self.context())
-        self.assertIn('AGENTS.md, 선택된 최신 ExecPlan과 현재 worktree', prompts[-1])
+        self.assertIn('AGENTS.md(존재하면), 선택된 최신 ExecPlan과 현재 worktree', prompts[-1])
         self.assertIn('previous result', prompts[-1])
         self.assertIn('verify:fingerprint occurrence=1 revision=1', prompts[-1])
         self.assertNotIn('raw full failure', prompts[-1])

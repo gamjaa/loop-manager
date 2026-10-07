@@ -60,7 +60,7 @@ class ProjectRegistrationInspection:
     root: Path
     base_branch: str
     provider: str
-    agents_hash: str
+    agents_hash: str | None
     agents_approved: bool
     origin: str | None = None
     source_revision: str | None = None

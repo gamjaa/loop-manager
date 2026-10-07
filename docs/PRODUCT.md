@@ -267,12 +267,12 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 ### 프로젝트 등록 및 실행 조건
 
 - 대상 경로는 origin이 GitHub 저장소인 Git 프로젝트여야 한다
-- fetch된 `origin/<base-branch>` tree에 `AGENTS.md`, `docs/PLANS.md`, `docs/ARCHITECTURE.md`가 있어야 한다
+- fetch된 `origin/<base-branch>` tree에 `docs/PLANS.md`, `docs/ARCHITECTURE.md`가 있어야 한다
 - fetch된 `origin/<base-branch>` tree에 `docs/PRODUCT.md` 또는 `docs/requirements/` 바로 아래 Requirement가 하나 이상 있어야 한다
 - 변경되지 않은 PRODUCT/ARCHITECTURE 템플릿만 있는 프로젝트는 작업 가능 상태로 등록하지 않는다
 - `docs/PLANS.md`는 Loop Manager 기준 파일과 SHA-256 해시가 같아야 한다
-- 프로젝트 `AGENTS.md`에 공통 본문 포함·일치 승인을 요구하지 않는다. 과거 mismatch 승인·해시 기록은 감사로 보존한다
-- `AGENTS.md` 존재·UTF-8과 `docs/PLANS.md` 해시 검사는 프로젝트 등록 시 선택한 원격 commit blob에만 수행하며 자동 Loop에서는 반복하지 않는다
+- 루트 `AGENTS.md`는 AI Agent CLI가 읽는 선택 개발 지침이며 없어도 등록·자동 실행할 수 있다. 공통 본문 포함·일치 승인을 요구하지 않는다. 과거 mismatch 승인·해시 기록은 감사로 보존한다
+- 존재하는 `AGENTS.md`의 UTF-8·내용 해시와 `docs/PLANS.md` 해시 검사는 프로젝트 등록 시 선택한 원격 commit blob에만 수행하며 자동 Loop에서는 반복하지 않는다. `AGENTS.md`가 없으면 내용 해시도 없는 값으로 기록한다
 - 자동 작업의 기준은 `origin/<base-branch>`다
 - 사용자는 원격 기준에 게시하는 ExecPlan의 정확한 AGENTS.md Proposal과 User Decision으로 사전 승인할 수 있다. Worker 시작 전에 결정과 당시 기준 파일을 대조하고 유효한 patch만 허용한다. 기준이 바뀌면 재승인을 기다리며 로컬 본문·포괄적 허락·자동 실행 Agent의 자기 승인은 인정하지 않는다. 사용자가 특정 결정과 범위를 명시해 요청한 모델의 문서 작성 도움은 허용한다. 실제 결과와 최신 base 검증, Review와 사용자 Merge는 유지한다.
 - AGENTS User Decision은 fence 밖 독립 줄의 `<!-- END USER DECISION -->`로 끝내고 뒤에 메모를 둘 수 있다. 마커 없는 기존 결정은 다음 guidance 제목·최상위 절·EOF로 끝난다. Revision은 선택적이며 기존 Revision·승인 identity는 보존한다. 안내 주석·Comment·종료 뒤 메모는 결정 identity에 포함하지 않는다. 요청 양식은 pending·빈 Comment·원안 전체 diff를 제공한다. pending의 Patch 편집은 대기를 유지하고 approve는 원안만, replace는 확정한 전체 diff를 적용하며 reject는 파일을 변경하지 않는다. 표시된 원안과 빈 Patch는 같은 의미이며, 값이 있는 모든 Patch는 대상·형식을 검증한다.
@@ -283,6 +283,27 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 
 - Loop Manager가 만드는 계획과 구현 변경은 대상 프로젝트 밖의 Loop Manager 관리 경로에 만든 별도 worktree와 branch에만 기록한다
 - 자동 실행 중 기본 worktree에서는 위의 safe fast-forward와 소유권·로컬 commit 보존이 검증된 rebase·abort 외에 checkout, pull, reset, stash, clean, commit과 파일 생성을 수행하지 않는다
+
+### 프로젝트 예약 경로
+
+Skill과 Manager가 프로젝트 안에서 고정 위치로 조회·작성하는 다음 경로는 위치를 유지한다.
+예약은 모든 파일의 존재·생성 의무를 뜻하지 않으며 필수 문서 조건은 위 등록 규칙을 따른다.
+문서 내용 수정, 개별 계획의 rename과 Requirement·ExecPlan archive는 기존 역할·Manager 권한을 따른다.
+
+| 용도 | 예약 경로 |
+|---|---|
+| 문서 작성 Skill | `.agents/skills/specification-docs/`와 `SKILL.md` |
+| 명세·계획 규칙·아이디어 | `docs/PRODUCT.md`, `docs/ARCHITECTURE.md`, `docs/PLANS.md`, `docs/FUTURE_IDEAS.md` |
+| 문서 템플릿 | `docs/PRODUCT.template.md`, `docs/ARCHITECTURE.template.md`, `docs/REQUIREMENT.template.md` |
+| Requirement·ExecPlan | `docs/requirements/`·`archive/`, `docs/plans/`·`archive/`·`manual/` |
+| 코드맵 | `docs/maintenance/code-map.jsonl` |
+| 전체 검증 | `scripts/verify.sh`, `scripts/verify.ps1` |
+
+이 경로들의 루트 `.agents/`·`docs/`·`scripts/`도 고정한다. 선택적인 CLI 지침 `AGENTS.md`와
+프로젝트의 `.gitignore`·`.codex/config.toml`·`.codex/rules/`·`.claude/settings.json`·
+`.claude/settings.local.json`은 존재할 때 CLI 입력·격리 검사에 사용되는 위치를 유지한다.
+Loop Manager runtime에서만 읽는 `docs/AGENTS.*.md`와 저장소 밖 Manager 상태 경로는
+프로젝트 예약 경로가 아니며 프로젝트에 복사하거나 생성하도록 요구하지 않는다.
 
 ### 공통 Agent 지침과 직접 작업
 

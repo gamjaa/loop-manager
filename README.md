@@ -77,7 +77,7 @@ Manager 실행의 시간 이벤트·worker 원문·manifest·집계는 상태 �
 
 init은 한 번 실행하고 프로젝트마다 add한다. provider를 생략하면 codex를 사용한다. 등록 검사는 fetch한 원격 base의 필수 문서·provider를 기준으로 하며 로컬 전용 편집은 반영하지 않는다.
 
-원격 루트 AGENTS의 존재와 UTF-8을 확인하며 공통 내용 포함·일치 승인을 요구하지 않는다. `--approve-agents-mismatch`와 과거 승인 기록은 호환을 위해 남긴다. 진행 중인 계획·프로젝트 차단·미해결 planning 오류가 없으면 `config remove <path>`로 등록만 해제하며 파일·branch·worktree·PR·MERGED 감사는 보존한다.
+루트 `AGENTS.md`는 AI Agent CLI가 읽는 선택 지침이며 없어도 등록·실행할 수 있다. 원격에 존재할 때만 UTF-8·감사용 해시를 확인하고 공통 내용 포함·일치 승인을 요구하지 않는다. `--approve-agents-mismatch`와 과거 승인 기록은 호환을 위해 남긴다. 진행 중인 계획·프로젝트 차단·미해결 planning 오류가 없으면 `config remove <path>`로 등록만 해제하며 파일·branch·worktree·PR·MERGED 감사는 보존한다.
 
 Planner는 검증된 계획을 base branch에 fast-forward push하므로 Loop Manager 계정의 직접 push가 허용돼야 한다. 구현은 `loop-manager/<execplan-id>` branch에서 진행하고 PR로 제출한다.
 

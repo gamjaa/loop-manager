@@ -63,20 +63,42 @@ class OriginRegistrationTests(unittest.TestCase):
                      mock.patch.object(loop_manager, 'migrate_legacy_execplans'), \
                      mock.patch.object(loop_manager, 'revision_execplan_snapshot',
                          return_value=ExecPlanCatalogSnapshot({}, {}, revision_sha=revision)):
-                    for approve in (False, True):
+                    for present, approve in ((True, False), (True, True), (False, False)):
+                        if not present:
+                            del documents['AGENTS.md']
                         added = loop_manager.add_registered_project(connection, root,
                             config_path=Path('config.ini'), provider='codex', requested_base='main',
                             approve_agents_mismatch=approve)
                         self.assertFalse(added.agents_approved)
-                        self.assertEqual(added.agents_hash, hashlib.sha256(documents['AGENTS.md']).hexdigest())
+                        expected_hash = hashlib.sha256(documents['AGENTS.md']).hexdigest() if present else None
+                        self.assertEqual(added.agents_hash, expected_hash)
                         self.assertEqual(project_registry.list_projects(connection), (added,))
                         audit = connection.execute('SELECT repo, agents_hash, agents_approved, origin '
                             'FROM project_agents_approval_audit').fetchall()
                         self.assertEqual([tuple(row) for row in audit], [(str(root), old_hash, 1, old_origin)])
                         project_registry.remove_project(connection, str(root))
-                        documents['AGENTS.md'] = b'updated project rules'
+                        if present:
+                            documents['AGENTS.md'] = b'updated project rules'
 
-    def test_project_only_agents_are_accepted_and_invalid_utf8_missing_inputs_are_rejected(self):
+    def test_absent_agents_on_selected_revision_is_not_replaced_by_local_rules(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory)
+            git(repo, "init", "-b", "main")
+            configure_identity(repo)
+            write_registration_files(repo)
+            with_agents = commit_all(repo, "Project with optional instructions")
+            (repo / "AGENTS.md").unlink()
+            without_agents = commit_all(repo, "Project without optional instructions")
+            (repo / "AGENTS.md").write_text("# Local instructions\n", encoding="utf-8")
+
+            self.assertEqual(loop_manager.inspect_registration_files(
+                repo, without_agents, approve_agents_mismatch=False), (None, False))
+            expected = hashlib.sha256(loop_manager.git_bytes(
+                repo, "show", f"{with_agents}:AGENTS.md")).hexdigest()
+            self.assertEqual(loop_manager.inspect_registration_files(
+                repo, with_agents, approve_agents_mismatch=False), (expected, False))
+
+    def test_agents_are_optional_and_present_invalid_utf8_or_missing_specs_are_rejected(self):
         from loop_manager_internal.runtime import project_registry
         documents = {'AGENTS.md': '프로젝트 규칙\r\n'.encode(),
                      'docs/PLANS.md': (loop_manager.ROOT / 'docs/PLANS.md').read_bytes(),
@@ -97,9 +119,9 @@ class OriginRegistrationTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, 'UTF-8'):
                 loop_manager.inspect_registration_files(Path('/repo'), 'selected', approve_agents_mismatch=True)
             del documents['AGENTS.md']
-            with self.assertRaisesRegex(RuntimeError, 'AGENTS.md'):
-                loop_manager.inspect_registration_files(Path('/repo'), 'selected', approve_agents_mismatch=True)
-            documents['AGENTS.md'] = b'project'
+            for approve in (False, True):
+                self.assertEqual(loop_manager.inspect_registration_files(Path('/repo'), 'selected',
+                    approve_agents_mismatch=approve), (None, False))
             del documents['docs/PRODUCT.md']
             with self.assertRaisesRegex(RuntimeError, 'PRODUCT'):
                 loop_manager.inspect_registration_files(Path('/repo'), 'selected', approve_agents_mismatch=False)

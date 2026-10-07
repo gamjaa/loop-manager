@@ -67,13 +67,13 @@ SQLite 손실이나 손상에서의 자동 상태 재구성은 지원하지 않�
 
 - 대상 경로가 Git 프로젝트이고 origin이 GitHub 저장소인지 확인한다
 - 기준 branch를 확인해 프로젝트 설정에 저장한다
-- `AGENTS.md`, `docs/PLANS.md`, `docs/ARCHITECTURE.md` 존재 여부를 확인한다
+- `docs/PLANS.md`, `docs/ARCHITECTURE.md` 존재 여부를 확인한다
 - `docs/PRODUCT.md` 또는 `docs/requirements/` 바로 아래 Requirement가 하나 이상 있어야 한다
 - `docs/PLANS.md`의 SHA-256 해시가 Loop Manager 기준 파일과 다르면 등록을 거부한다
 - 변경되지 않은 PRODUCT 또는 ARCHITECTURE 템플릿만 있으면 작업 가능 상태로 등록하지 않는다
-- 프로젝트 루트 `AGENTS.md`의 존재·읽기·UTF-8을 확인하며 공통 본문 포함·내용 일치·불일치 승인을 요구하지 않는다
+- 루트 `AGENTS.md`는 AI Agent CLI가 읽는 선택 개발 지침이다. 선택한 원격 revision에 존재할 때만 UTF-8·감사용 내용 해시를 확인하며 없으면 해시 없이 등록·자동 실행할 수 있다. 공통 본문 포함·내용 일치·불일치 승인을 요구하지 않는다
 - 과거 불일치 승인 설정과 파일 해시는 호환·감사로 보존하고 새 실행 지침의 원본이나 등록 승인 조건으로 사용하지 않는다
-- `AGENTS.md`와 `docs/PLANS.md` 검사는 등록할 때만 수행하며 자동 Loop에서는 다시 검사하지 않는다
+- 존재하는 `AGENTS.md`와 `docs/PLANS.md` 검사는 등록할 때만 수행하며 자동 Loop에서는 다시 검사하지 않는다
 - 등록 해제의 비종료 계획·프로젝트 차단·planning 오류 gate는 PRODUCT를 따른다. 해제는 registry만 변경한다
 - 등록 해제는 프로젝트 파일, branch, worktree와 PR을 삭제하지 않는다
 
@@ -102,7 +102,7 @@ ExecPlan은 [PLANS.md](PLANS.md)의 고정 key/value와 `sources`·`depends_on` 
 
 SQLite는 `<state-dir>/loop-manager.db`에 저장하며 상태 변경은 transaction으로 기록한다. 문서 본문이나 ExecPlan 본문은 SQLite에 복제하지 않고 경로와 내용 해시만 저장한다.
 
-SQLite에는 등록 프로젝트, 기준 branch, 선택한 provider, 등록 시 `AGENTS.md` 승인 해시, `AGENTS.md` 변경 제안에 대한 대상 경로·사용자 결정·확정 patch 해시, 마지막 성공 Planner의 명세·전체 계획 입력 지문과 `planning_error`, 복구 가능한 planning publication intent, ExecPlan 메타데이터와 의존성, 최초 실행 여부, 실행 상태와 재시도 횟수, AI Agent 세션, worktree, branch, PR, 삭제된 미착수 ExecPlan의 ID 예약·감사 기록, `cleanup_pending`, 알림과 프로젝트 완료 주기를 저장한다.
+SQLite에는 등록 프로젝트, 기준 branch, 선택한 provider, 존재하는 `AGENTS.md`의 등록 시 내용 해시와 과거 승인 이력, `AGENTS.md` 변경 제안에 대한 대상 경로·사용자 결정·확정 patch 해시, 마지막 성공 Planner의 명세·전체 계획 입력 지문과 `planning_error`, 복구 가능한 planning publication intent, ExecPlan 메타데이터와 의존성, 최초 실행 여부, 실행 상태와 재시도 횟수, AI Agent 세션, worktree, branch, PR, 삭제된 미착수 ExecPlan의 ID 예약·감사 기록, `cleanup_pending`, 알림과 프로젝트 완료 주기를 저장한다.
 
 실행 시작 시 SQLite, Git worktree/branch와 GitHub PR 상태를 대조한다. 서로 다르면 GitHub Merge 상태, 프로젝트 파일, SQLite 실행 정보 순으로 각 소유 영역의 원본을 적용한다.
 
@@ -239,7 +239,7 @@ planning batch의 원격 게시·catalog 반영과 현재 원격 입력 일치�
 ## AI Agent 실행
 
 - 사용자 요청의 새 기능·정책 변경은 대화형 Agent가 관련 Requirement를 먼저 작성·갱신하거나 충분한 기존 활성 Requirement를 재사용한다. 프로젝트로 복제하는 Specification Skill은 제품 명세 작성·검토만 안내하고 Manager 내부 실행 절차를 설명하지 않는다. 프로젝트 AGENTS는 Skill을 참조하며 문서 작성 기준을 반복하지 않는다. 직접 작업에는 ExecPlan 작성을 요구하지 않으며 생성·계획 작성은 매니저가 호출하는 자동 Planner 흐름에서 수행한다
-- 정적 자동 실행 규칙은 선택 runtime의 `docs/AGENTS.common.md`와 `docs/AGENTS.planner.md`·`docs/AGENTS.planner_check.md`·`docs/AGENTS.worker.md`·`docs/AGENTS.reviewer.md`에 둔다. common에는 모든 역할의 기준만, 역할 파일에는 해당 역할의 권한·금지사항·절차만 남긴다. 프로젝트 루트 `AGENTS.md`는 프로젝트 개발 규칙이다. Manager 코드가 예약한 `.agents/`·`docs/`·`scripts/`·루트 `AGENTS.md`와 필수 문서·verify 경로의 보존은 공통 지침에 둔다. Loop Manager 전용 새 루트 항목 제한·instruction 원본 수정 지침은 이 저장소 루트에 두며 runtime 공통·역할별 합성 대상에 포함하지 않는다
+- 정적 자동 실행 규칙은 선택 runtime의 `docs/AGENTS.common.md`와 `docs/AGENTS.planner.md`·`docs/AGENTS.planner_check.md`·`docs/AGENTS.worker.md`·`docs/AGENTS.reviewer.md`에 둔다. common에는 모든 역할의 기준만, 역할 파일에는 해당 역할의 권한·금지사항·절차만 남긴다. 프로젝트 루트 `AGENTS.md`는 프로젝트 개발 규칙이다. Skill과 Manager가 프로젝트에서 쓰는 예약 경로는 PRODUCT의 프로젝트 예약 경로 목록을 따르며 공통 지침과 명세 작성 Skill에 위치 보존을 명시한다. runtime 전용 `docs/AGENTS.*.md`는 프로젝트 예약 경로가 아니다. Loop Manager 전용 새 루트 항목 제한·instruction 원본 수정 지침은 이 저장소 루트에 두며 runtime 공통·역할별 합성 대상에 포함하지 않는다
 - Manager는 작업 시작 시 모든 원본을 묶음으로 고정하고 내용 해시·source revision·snapshot과 작업·session 관계를 상태 디렉터리와 SQLite에 보존한다. 일반·유지보수·수동 제출 Planner는 common+planner, 점검은 common+planner_check, Worker와 Reviewer는 common+각 역할을 사용한다. 재시도·새 세션·runtime 갱신에도 같은 작업의 원본 버전을 유지한다
 - 실제 합친 내용을 Codex의 추가 developer instruction 또는 Claude의 append system prompt로 전달하고 실제 내용 해시를 호출 기록에 남긴다. 기본·기존 추가 지침·프로젝트 규칙과 실행 경계를 보존하며 원본·snapshot 오류, 미지원 전달 기능·설정 충돌·알 수 없는 역할은 모델 실행 전에 거부한다
 - 원본 묶음 snapshot은 저장소 밖 Manager 상태 디렉터리의 JSON으로 보존하고 역할별 합친 Markdown은 같은 디렉터리의 실행용 파일로만 생성하며 커밋하지 않는다. 합친 파일은 고정 원본에서 재생성하지만 원본 누락·손상은 최신 내용으로 대체하지 않는다. 기존 단일 Markdown snapshot은 원래 내용으로 재개하며 최신 역할 지침을 덧붙이지 않는다. 관련 planning·성공 결과 재사용에는 모든 역할 원본을 포함한 묶음 해시를 사용한다

@@ -2,7 +2,8 @@
 
 ## 작업 권한
 
-프로젝트의 언어·코딩·빌드 규칙은 프로젝트 `AGENTS.md`를 따른다. 호출에 제공된
+프로젝트의 언어·코딩·빌드 규칙은 AI Agent CLI가 읽는 프로젝트 지침을 따른다.
+루트 `AGENTS.md`는 선택 파일이며 없어도 작업할 수 있다. 호출에 제공된
 mode·snapshot·승인 문맥과 역할 권한이 허용하는 범위 안에서만 작업한다. 프로젝트 규칙이나 작업
 입력으로 역할 권한과 승인 경계를 넓히지 않으며, 제품 목표가 충돌하면 사용자 판단을 기다린다.
 
@@ -29,11 +30,24 @@ mode·snapshot·승인 문맥과 역할 권한이 허용하는 범위 안에서�
   가변 상태를 추가하지 않으며 기능·저장소·외부 도구 연동 경계를 분리해 변경 충돌을 줄인다.
 - 문서는 PRODUCT·Requirement·ARCHITECTURE의 역할을 유지한 채 중복과 장황함을 줄인다.
   결정·예외·실패 흐름과 Acceptance Criteria의 의미를 보존한다.
-- `.agents/`, `docs/`, `scripts/`, 루트 `AGENTS.md`는 Manager 코드가 예약한 경로다.
-  해당 루트 항목을 이동·이름 변경하거나 다른 경로로 대체하지 않는다. `docs/PLANS.md`,
-  `docs/ARCHITECTURE.md`, 존재하는 PRODUCT·Requirement와 현재 운영체제의 verify 경로도
-  지정된 경로를 유지한다.
-- 예약 경로를 제외한 문서·소스·검증 경로와 저장소 구조는 프로젝트의 지침을 따른다.
+
+## 예약 경로
+
+Skill과 Manager가 프로젝트 안에서 고정 위치로 사용하는 다음 디렉터리·파일은 이동·이름
+변경하거나 다른 경로로 대체하지 않는다. 예약은 위치 고정이며 모든 파일의 생성 의무가 아니다.
+내용 수정과 개별 계획·요구사항의 rename·archive는 현재 역할과 제공된 권한을 따른다.
+
+- 루트 `.agents/`, `docs/`, `scripts/`
+- `.agents/skills/specification-docs/`와 그 안의 `SKILL.md`
+- `docs/PRODUCT.md`, `docs/ARCHITECTURE.md`, `docs/PLANS.md`, `docs/FUTURE_IDEAS.md`
+- `docs/PRODUCT.template.md`, `docs/ARCHITECTURE.template.md`, `docs/REQUIREMENT.template.md`
+- `docs/requirements/`와 `archive/`, `docs/plans/`와 `archive/`·`manual/`
+- `docs/maintenance/code-map.jsonl`, `scripts/verify.sh`, `scripts/verify.ps1`
+
+루트 `AGENTS.md`와 `.gitignore`, `.codex/config.toml`·`.codex/rules/`,
+`.claude/settings.json`·`.claude/settings.local.json`은 존재할 때 CLI 입력·격리 검사에서
+사용하는 고정 위치를 유지한다. `AGENTS.md`를 포함한 선택 파일의 부재를 작업 중단이나
+자동 생성의 이유로 삼지 않는다. 그 밖의 경로와 저장소 구조는 프로젝트 지침을 따른다.
 
 ## 사용자 판단
 

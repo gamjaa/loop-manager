@@ -17,6 +17,15 @@ description: Create, review, and refine PRODUCT.md, ARCHITECTURE.md, requirement
 
 대상 프로젝트에 같은 템플릿이 있으면 대상 프로젝트의 파일을 우선한다. 기존 문서가 있으면 템플릿으로 덮어쓰지 않고 필요한 부분만 수정한다.
 
+## Reserved Paths
+
+이 Skill이 사용하는 `.agents/skills/specification-docs/`와 `SKILL.md`, `docs/PRODUCT.md`,
+`docs/ARCHITECTURE.md`, `docs/FUTURE_IDEAS.md`, `docs/requirements/`와 그 아래 `archive/`,
+세 문서의 `docs/*.template.md` 경로는 예약 경로다. Skill·템플릿·문서를 다른 위치로 옮기거나
+이름을 바꾸어 조회 경로와 상대 참조를 깨뜨리지 않는다. 예약은 위치 고정이며 모든 파일의
+생성 의무가 아니다. 문서 내용은 이 Skill의 작성 범위에서 갱신하고 Requirement의 archive
+취급은 아래 Lifecycle을 따른다. 루트 `AGENTS.md`는 AI Agent CLI가 읽는 선택 지침이다.
+
 ## Document Boundaries
 
 | 문서 | 중심 질문 | 작성 방향 |
