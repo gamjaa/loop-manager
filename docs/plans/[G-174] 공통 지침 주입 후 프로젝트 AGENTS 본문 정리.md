@@ -31,6 +31,7 @@ G-147의 실제 Merge·runtime 주입 확인 뒤 이 저장소의 중복 공통 
 
 - 기존 `agents/common_guidance.py`의 runtime 원본 묶음·역할별 합성·호출 snapshot과 guidance 승인·scope 경계를 재사용한다. 최신 루트 본문에 실제 남은 변경이 있을 때만 Worker가 정확한 제안과 R-069의 완전한 pending 양식(빈 Comment·원안 전체 diff·종료 마커, Revision 및 일반 Baseline 없음)을 작성하고 승인 전에 중단한다. 기존 사용자 결정·편집본·메모는 덮어쓰지 않는다. Planner·Reviewer는 루트 AGENTS patch를 제안하거나 적용하지 않는다.
 - 유효한 사용자 결정 후 필요한 문서/설정 안내만 같은 프로젝트 규칙에 맞춘다. 기존 docs/AGENTS.common.md·역할별 파일과 호출 병합을 재사용하고 모든 역할 규칙을 common에 다시 모으거나 새로운 루트 파일·독립 지침 배포 경로를 만들지 않는다. 역할 지침 파일의 일반 문서 변경과 루트 AGENTS의 정확한 승인 대상을 구분한다.
+- 루트에는 개발 작업에 필요한 지침과 Specification Skill 참조만 남긴다. 제품 규칙·스펙·코드 구조·실행 방법을 반복하지 않고 Requirement 작성 기준은 Skill에서 유지한다. 프로젝트로 복제하는 Skill에 Manager 실행 절차를 되넣거나 역할 instruction에 파일 구성·합성·버전 관리 설명을 추가하지 않는다.
 - 자동 역할·권한·검증은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙·설계·계획 작성은 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
 
 ## Validation
@@ -54,3 +55,4 @@ G-147의 실제 Merge·runtime 주입 확인 뒤 이 저장소의 중복 공통 
 - 2026-10-07 사용자 직접 요청에 따른 로컬 지침 분리를 반영했다. 자동 후속은 최신 Merge 결과와 실제 전달 근거에서 남은 차이만 확인한다. 이 개정은 기존 ID·sources·dependency·실행 상태를 유지하며 직접 작업의 허락을 자동 Worker의 승인 token이나 완료 근거로 만들지 않는다.
 - complexity medium: 고정 runtime 주입 근거·프로젝트 본문·기존 승인 및 실패 보존이라는 명확한 경계를 연결하는 제한된 정리다. risk high: 필수 프로젝트 지침을 잘못 제거하면 후속 자동 작업의 동작 계약에 넓게 영향을 주며, Merge 후에는 원본 Git·승인 근거에 따른 수동 복원이 필요하다. 주입 확인과 exact 승인, 실패 시 보존 및 Review 시나리오로 이를 검증한다.
 - mutable READY token 9843ff4e2fce9d360eb7cf3a46aeeeeae6307ef8303d801a65e8197db34e0a6c와 원본 hash를 대조한 개정이며 ID·metadata·목표·dependency를 보존한다. 새 pending 양식은 자동 자기 승인을 허용하지 않으며 사용자 주도의 문서 작성 도움은 R-069를 따른다.
+- 2026-10-07 사용자 요청에 따라 루트 개발 지침·프로젝트 명세 작성 Skill·역할 행동 instruction의 범위를 좁혔다. Manager 동작과 지침 파일 관리 설명은 제품·설계 명세에서 정의하며 본문 정리 과정에서 중복 설명을 복원하지 않는다.

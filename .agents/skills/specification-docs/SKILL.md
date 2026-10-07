@@ -1,6 +1,6 @@
 ---
 name: specification-docs
-description: Create, review, and refine PRODUCT.md, ARCHITECTURE.md, requirements/*.md, and FUTURE_IDEAS.md through conversation with the user. Use when defining product behavior, documenting a requested change, recording technical design or deferred ideas, finding missing scenarios or edge cases, or deciding whether a specification is ready for Planner.
+description: Create, review, and refine PRODUCT.md, ARCHITECTURE.md, requirements/*.md, and FUTURE_IDEAS.md through conversation with the user. Use when defining product behavior, documenting a requested change, recording technical design or deferred ideas, finding missing scenarios or edge cases, or deciding whether a specification is ready for implementation.
 ---
 
 # Specification Docs
@@ -19,8 +19,6 @@ description: Create, review, and refine PRODUCT.md, ARCHITECTURE.md, requirement
 
 ## Document Boundaries
 
-AGENTS.md는 프로젝트 개발 규칙, 이 Skill은 사람이 읽는 명세 문서의 작성 기준을 담당한다. ExecPlan 생성·계획 작성은 매니저의 자동 계획 흐름이 담당하며 이 Skill로 작업 전 ExecPlan을 작성하지 않는다. 자동 역할의 권한·검증은 runtime의 공통·역할별 instruction을 따른다. 문서 정리를 이유로 작업 권한이나 실행 상태를 바꾸지 않는다.
-
 | 문서 | 중심 질문 | 작성 방향 |
 |---|---|---|
 | PRODUCT | 제품이 무엇을 보장하는가? | 현재 동작·핵심 규칙·상태·완료 조건. 구현 기술과 단계별 처리 방식은 ARCHITECTURE에 둔다. |
@@ -30,7 +28,7 @@ AGENTS.md는 프로젝트 개발 규칙, 이 Skill은 사람이 읽는 명세 �
 
 초기 제품은 `PRODUCT.md`에서 정의할 수 있다. 사용자 요청에 따른 새 기능이나 정책 변경은 관련 Requirement를 먼저 작성하거나 갱신한다. 기존 활성 Requirement가 요청과 Acceptance Criteria를 충분히 담으면 재사용하며 중복 생성하지 않는다. 별도의 문서 작성 요청을 기다리지 않는다. 구현이 완료된 뒤 계속 유지할 규칙만 PRODUCT에 반영하고 구현 세부·실행 계획이나 상태를 Requirement에 넣지 않는다.
 
-Requirement는 사용자 요청을 근거로 Agent가 작성·갱신하며 미결정 제품 정책은 사용자와 확정한다. PRODUCT·ARCHITECTURE는 기본적으로 사용자 명세이며 명시적인 문서 작성 요청과 Requirement 구현 결과의 장기 규칙을 PRODUCT에 반영하는 경우는 예외다.
+제품 정책과 설계는 사용자와 확정한 내용을 반영하고, 미결정 사항은 임의로 확정하지 않는다.
 
 ## Quality Guidance
 
@@ -39,8 +37,6 @@ Requirement는 사용자 요청을 근거로 Agent가 작성·갱신하며 미�
 문서의 첫 문단과 각 절은 해당 질문의 답부터 제시한다. 동일 정책의 조건·예외·결과는 소유 문서의 한 절에서 정의하고, 다른 절과 문서는 필요한 요약과 링크로 연결한다. 순서가 제품 의미를 바꾸는 흐름만 단계로 쓰고, 조건별 허용·거부·보존 결과는 비교하기 쉬운 표나 짧은 항목으로 표현한다.
 
 상세 구현 순서·파일·함수 목록과 작업 이력은 현재 판단에 필요한 만큼만 남긴다. 현재 구조와 미구현 목표 설계를 구분하고 대체된 설계를 현행 규칙처럼 남기지 않는다. 간결화 전후에 적용 조건·판단 주체·허용 및 거부·실패 시 보존과 재개·검증 기준을 대조한다. 단순한 줄 수·항목 수 제한으로 필요한 완전성을 줄이지 않는다.
-
-작업·권한·검증·완료 규칙은 AGENTS와 PLANS에, 제품 규칙·변경 요청·설계 조건은 각 제품 문서에 유지한다. 대상 프로젝트의 문서와 제공된 작업 지침에서 필요한 규칙과 판단 조건을 확인할 수 있어야 하며, 간결화를 이유로 소유 문서에서 생략하지 않는다.
 
 ## Write Scope
 
@@ -53,13 +49,11 @@ Requirement는 사용자 요청을 근거로 Agent가 작성·갱신하며 미�
 
 코드, 테스트, 설정, AGENTS, 템플릿, 다른 Skill 파일을 포함한 나머지 파일은 수정하지 않는다. 필요한 변경을 발견하면 이유와 대상만 사용자에게 알린다.
 
-`docs/plans/*.md`의 생성·계획 작성은 매니저가 담당한다. 이 Skill은 Requirement 작성·갱신으로 필요한 변경을 기록하고 새 ExecPlan을 만들지 않는다. 기존 계획은 다른 Agent가 작업 중일 수 있으므로 일반적으로 수정·삭제하지 않는다. 사용자가 특정 기존 ExecPlan의 구체적인 편집을 요청한 경우에만 그 파일과 요청 범위에서 수정할 수 있으며 일반적인 문서 정리를 계획 작성 권한으로 확대하지 않는다.
-
 ## Workflow
 
 1. 대상 프로젝트의 기존 `PRODUCT.md`, Requirement, `ARCHITECTURE.md`와 관련 템플릿을 확인한다.
 2. 사용자 입력에서 확정된 사실, 가정, 사용자 결정이 필요한 항목을 구분한다.
-3. 새 기능·정책 변경은 관련 활성 Requirement를 작성·갱신하거나 충분한 기존 활성 문서를 재사용한다. 다른 문서도 요청에 필요한 가장 좁은 범위만 수정하고 ExecPlan은 작성하지 않는다.
+3. 새 기능·정책 변경은 관련 활성 Requirement를 작성·갱신하거나 충분한 기존 활성 문서를 재사용한다. 다른 문서도 요청에 필요한 가장 좁은 범위만 수정한다.
 4. 주요 정상 흐름, 실패 흐름, 상태 전이, 권한, Product Invariant, Non-Goal과 edge case의 누락을 찾는다.
 5. 제품 정책을 임의로 결정하지 않는다. 구현 방향을 바꿀 질문은 사용자에게 먼저 묻고 `Open Questions`에 남긴다.
 6. 답변과 편집을 반영한 뒤 문서별 역할·중복·상호 링크와 현재 규칙의 일치를 확인한다. 기존 조건·예외·실패·검증 의미가 빠지지 않았는지 대조한다.
@@ -69,11 +63,11 @@ Requirement는 사용자 요청을 근거로 Agent가 작성·갱신하며 미�
 
 ## Requirement Lifecycle
 
-Requirement는 frontmatter나 별도 상태 없이 제품에 원하는 변화와 Acceptance Criteria를 기록하는 순수 문서다. `docs/requirements/` 바로 아래의 모든 Requirement가 Planner 입력이 되므로, 사용자 결정이 필요한 항목을 해소하고 Ready Check를 통과한 뒤 해당 위치에 저장한다. 파일 경로는 안정적인 식별자로 유지한다.
+Requirement는 frontmatter나 별도 상태 없이 제품에 원하는 변화와 Acceptance Criteria를 기록하는 순수 문서다. 사용자 결정이 필요한 항목을 해소하고 Ready Check를 통과한 뒤 `docs/requirements/` 바로 아래에 저장한다. 파일 경로는 안정적인 식별자로 유지한다.
 
 `docs/requirements/archive/`의 Requirement는 배경과 과거 결정을 확인하기 위해 읽기만 한다. 현재 변경의 Requirement로 재사용하거나 수정·삭제하지 않고 활성 위치로 되돌리지 않는다. 보관 문서와 관련된 새 변경은 사용자 요청을 기준으로 새로운 고유 ID·경로의 Requirement를 작성한다. 보관 문서의 ID·경로를 다시 쓰거나 원문을 편집용 복사본으로 만들지 않는다. 이 Skill의 기존 Requirement 재사용·갱신은 활성 문서에만 적용한다.
 
-완료된 Requirement는 사용자가 직접 archive하지 않는다. 관련 ExecPlan이 모두 실제 Merge되고 일반 Planner가 최신 원격 구현·검증 근거로 전체 Acceptance Criteria 충족을 확인하면 Loop Manager가 일반 planning 게시에서 내용 변경 없이 `docs/requirements/archive/`로 이동한다. 원격 게시 확인 전에는 활성 Planner 입력에 남으며, 비종료 계획·draft, 이동 충돌 또는 source 관계·충족 판단의 불확실성이 있으면 이동하지 않는다. 대화형 문서 작성 과정에서도 이 판단과 게시 경계를 우회해 Requirement를 이동하지 않는다.
+명세 작성 중 활성 Requirement를 완료로 간주해 보관 위치로 옮기지 않는다.
 
 ## Ready Check
 
@@ -88,4 +82,4 @@ Requirement는 frontmatter나 별도 상태 없이 제품에 원하는 변화와
 - PRODUCT, Requirement와 ARCHITECTURE가 서로 모순되지 않는다.
 - 대상 프로젝트의 문서와 제공된 작업 지침에서 필요한 규칙과 판단 조건을 확인할 수 있다.
 
-명시적인 문서 작성 요청은 해당 사용자 명세를 함께 작성하는 위임으로 취급한다. 새 기능·정책 변경 요청도 관련 Requirement 작성·갱신의 위임으로 취급한다. 이 Skill 단계에서는 명세를 작성하며 코드 구현을 함께 수행하지 않는다. ExecPlan은 위 Write Scope의 명시적 기존 문서 편집 예외가 없으면 변경하지 않는다.
+명시적인 문서 작성 요청은 해당 사용자 명세를 함께 작성하는 위임으로 취급한다. 새 기능·정책 변경 요청도 관련 Requirement 작성·갱신의 위임으로 취급한다. 이 Skill 단계에서는 명세를 작성하며 코드 구현을 함께 수행하지 않는다.

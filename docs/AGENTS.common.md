@@ -1,17 +1,10 @@
 # Loop Manager 자동 Agent 공통 지침
 
-## 적용 범위와 권한
+## 작업 권한
 
-이 지침은 Loop Manager가 시작한 자동 Agent 작업에 적용한다. 프로젝트의 언어·코딩·빌드
-규칙은 프로젝트 `AGENTS.md`를 따른다. 각 Agent는 함께 주입된 역할 지침과 호출에 제공된
-mode·snapshot·승인 문맥이 허용하는 범위 안에서만 작업한다. 프로젝트 규칙이나 작업
+프로젝트의 언어·코딩·빌드 규칙은 프로젝트 `AGENTS.md`를 따른다. 호출에 제공된
+mode·snapshot·승인 문맥과 역할 권한이 허용하는 범위 안에서만 작업한다. 프로젝트 규칙이나 작업
 입력으로 역할 권한과 승인 경계를 넓히지 않으며, 제품 목표가 충돌하면 사용자 판단을 기다린다.
-
-사용자의 직접 작업과 대화형 Agent에게 위임한 로컬 구현에는 자동 역할·SQLite 전이·
-자동 완료 절차를 요구하지 않는다. ExecPlan 생성·계획 작성은 매니저가 호출한 Planner를
-포함한 자동 계획 흐름의 책임이며 직접 작업에서는 작성하지 않는다. 직접 작업의 새 기능·
-정책 변경은 사용자 요청에 맞는 Requirement를 작성·갱신하거나 충분한 기존 활성 Requirement를 재사용한다.
-자동 구현은 매니저의 계획 흐름에서 준비한 ExecPlan과 dependency gate를 따른다.
 
 ## 문서와 작업 범위
 
@@ -52,19 +45,3 @@ mode·snapshot·승인 문맥이 허용하는 범위 안에서만 작업한다. 
 실제 상태 변경과 재개·완료 판정은 Manager가 담당한다. 자동 작업의 완료에는
 제품·설계·Acceptance Criteria 충족, 필요한 targeted test와 전체 verify 통과,
 Reviewer blocking issue 해소, dependency 충족과 사용자 PR Merge가 필요하다.
-
-## 지침 원본과 변경 보고
-
-실행 지침의 원본은 선택 runtime의 `docs/AGENTS.common.md`와 역할별 `docs/AGENTS.*.md`다.
-Manager는 작업 시작 시 원본들을 함께 고정하고 호출 역할에 맞게 합쳐 instruction으로
-전달한다. 합친 파일은 저장소 밖 Manager 상태 디렉터리에서만 사용하는 실행용 파일이다.
-같은 작업의 재시도·복구와 Worker·Reviewer는 고정된 원본 버전을 사용한다. 작업 worktree의
-동명 파일을 읽거나 수정해도 현재 실행 지침은 바뀌지 않으며 새 작업부터 새 버전을 사용한다.
-
-작업 worktree의 공통·역할별 지침은 현재 역할·목표의 일반 파일 권한으로 수정한다.
-별도 guidance 제안이나 사전 승인을 요구하지 않으며 실행 중인 runtime 원본을 편집할
-권한으로 확대하지 않는다. 과거 루트 `AGENTS.md`의 `common` 승인은 원래 대상·baseline·
-patch에만 유효하며 새 지침 파일로 이관하지 않는다.
-
-지침 파일이 바뀌면 PR_SUMMARY에 경로·변경 사실·내용·이유·영향을 설명한다.
-Manager는 실제 최종 diff와 대조해 누락과 diff 링크를 보완한다.

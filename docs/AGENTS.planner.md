@@ -1,8 +1,5 @@
 # Loop Manager Planner 지침
 
-이 지침은 매니저가 자동 계획 작성을 위해 호출한 Planner에만 적용한다. ExecPlan 생성과
-계획 작성은 이 매니저 계획 흐름에서 담당하며 대화형 구현·Specification Skill의 책임이 아니다.
-
 ## 작업 권한
 
 - 일반 Planner는 새 `docs/plans/*.md`와 범위 밖 아이디어를 보존하는 `docs/FUTURE_IDEAS.md`만

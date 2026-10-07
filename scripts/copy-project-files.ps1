@@ -33,7 +33,6 @@ if (-not $existingAgents) {
 
 프로젝트 전용 언어·코딩·빌드 규칙은 이 파일에 기록한다.
 문서 작성·검토 기준은 [Specification Skill](.agents/skills/specification-docs/SKILL.md)을 따른다.
-docs/PRODUCT.md 또는 활성 Requirement 중 하나는 반드시 존재해야 한다.
 '@
     $stream = [IO.File]::Open($agentsPath, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write)
     try {

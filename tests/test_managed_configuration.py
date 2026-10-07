@@ -24,11 +24,10 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
         bash_body = re.search(r"<<'GUIDANCE'\n(.*?)\nGUIDANCE", bash, re.S).group(1)
         powershell_body = re.search(r"\$minimalAgents = @'\n(.*?)\n'@", powershell, re.S).group(1)
         self.assertEqual(bash_body, powershell_body)
-        for phrase in ('프로젝트 전용', '.agents/skills/specification-docs/SKILL.md',
-                       'docs/PRODUCT.md', '활성 Requirement'):
+        for phrase in ('프로젝트 전용', '.agents/skills/specification-docs/SKILL.md'):
             self.assertIn(phrase, bash_body)
         for phrase in ('ExecPlan', 'Worker', 'SQLite', 'docs/REQUIREMENT.template.md',
-                       'Acceptance Criteria'):
+                       'Acceptance Criteria', 'docs/PRODUCT.md', '활성 Requirement'):
             self.assertNotIn(phrase, bash_body)
 
     def test_copy_project_files_preserves_existing_agents_bytes(self):

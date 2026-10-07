@@ -39,3 +39,5 @@ Manager가 검증해 전달한 사전 승인 또는 승인·대체 patch는 해�
 - 전체 test suite·integration·end-to-end test, 프로젝트 전체 lint·build·type check와
   전체 verify는 직접 실행하지 않는다. Manager가 Agent 밖에서 실행하며 실패 출력만
   같은 Worker 세션에 전달한다.
+
+PR_SUMMARY에는 변경한 경로·내용·이유·영향을 설명한다.

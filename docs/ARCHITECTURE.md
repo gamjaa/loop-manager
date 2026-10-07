@@ -234,7 +234,7 @@ planning batch의 원격 게시·catalog 반영과 현재 원격 입력 일치�
 
 ## AI Agent 실행
 
-- 사용자 요청의 새 기능·정책 변경은 대화형 Agent가 관련 Requirement를 먼저 작성·갱신하거나 충분한 기존 활성 Requirement를 재사용한다. Specification Skill과 프로젝트 AGENTS는 이 문서 작성 기준을 제공하며 직접 작업에 ExecPlan 작성을 요구하지 않는다. ExecPlan 생성·계획 작성은 매니저가 호출하는 자동 Planner 흐름에서 수행한다
+- 사용자 요청의 새 기능·정책 변경은 대화형 Agent가 관련 Requirement를 먼저 작성·갱신하거나 충분한 기존 활성 Requirement를 재사용한다. 프로젝트로 복제하는 Specification Skill은 제품 명세 작성·검토만 안내하고 Manager 내부 실행 절차를 설명하지 않는다. 프로젝트 AGENTS는 Skill을 참조하며 문서 작성 기준을 반복하지 않는다. 직접 작업에는 ExecPlan 작성을 요구하지 않으며 생성·계획 작성은 매니저가 호출하는 자동 Planner 흐름에서 수행한다
 - 정적 자동 실행 규칙은 선택 runtime의 `docs/AGENTS.common.md`와 `docs/AGENTS.planner.md`·`docs/AGENTS.planner_check.md`·`docs/AGENTS.worker.md`·`docs/AGENTS.reviewer.md`에 둔다. common에는 모든 역할의 기준만, 역할 파일에는 해당 역할의 권한·금지사항·절차만 남긴다. 프로젝트 루트 `AGENTS.md`는 프로젝트 개발 규칙이다
 - Manager는 작업 시작 시 모든 원본을 묶음으로 고정하고 내용 해시·source revision·snapshot과 작업·session 관계를 상태 디렉터리와 SQLite에 보존한다. 일반·유지보수·수동 제출 Planner는 common+planner, 점검은 common+planner_check, Worker와 Reviewer는 common+각 역할을 사용한다. 재시도·새 세션·runtime 갱신에도 같은 작업의 원본 버전을 유지한다
 - 실제 합친 내용을 Codex의 추가 developer instruction 또는 Claude의 append system prompt로 전달하고 실제 내용 해시를 호출 기록에 남긴다. 기본·기존 추가 지침·프로젝트 규칙과 실행 경계를 보존하며 원본·snapshot 오류, 미지원 전달 기능·설정 충돌·알 수 없는 역할은 모델 실행 전에 거부한다
@@ -292,7 +292,7 @@ Reviewer의 `read-only`는 workspace 파일 쓰기를 제한한다. 검색·diff
 - Agent 실행 후 실제 `AGENTS.md` diff를 승인된 대상과 patch에 결정적으로 대조한다. 차이가 있으면 게시하지 않고 승인을 무효화한 뒤 최신 patch 제안을 요구한다
 - 승인된 변경을 적용한 뒤에는 일반 Worker 변경과 동일하게 targeted test, 전체 verify와 읽기 전용 Review를 거쳐 같은 구현 PR에 포함한다
 - Planner와 Reviewer의 `AGENTS.md` 변경, 승인 전 Worker의 직접 변경 및 승인 대상 밖의 변경은 제안 흐름이 아니라 역할 범위 위반으로 처리한다
-- 승인된 루트 `AGENTS.md`는 해당 프로젝트 규칙으로 유지하며 실행 지침 원본이나 다른 프로젝트의 공통 복사본으로 사용하지 않는다. 준비 도구는 기존 프로젝트 AGENTS를 보존하고 없는 경우 프로젝트 규칙·Specification Skill 참조·필수 문서 조건을 담은 최소 파일만 만든다
+- 승인된 루트 `AGENTS.md`는 해당 프로젝트의 개발 작업 지침으로 유지하며 문서·코드로 확인할 수 있는 제품 규칙·스펙·구조·실행 방법을 반복하지 않는다. 실행 지침 원본이나 다른 프로젝트의 공통 복사본으로 사용하지 않는다. 준비 도구는 기존 프로젝트 AGENTS를 보존하고 없는 경우 프로젝트 전용 개발 안내·Specification Skill 참조만 담은 최소 파일을 만든다. 필수 문서 조건은 등록·계획 입력 검사에서 유지한다
 
 ## Model과 Effort
 
