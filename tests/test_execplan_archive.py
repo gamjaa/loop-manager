@@ -141,7 +141,59 @@ class FakeGit:
         return self.pushes.pop(0)
 
 
+class DefinitionValidatingFakeGit(FakeGit):
+    def __init__(self, observations, *, definitions_result=True, definitions_error=None, **kwargs):
+        super().__init__(observations, **kwargs)
+        self.definitions_result = definitions_result
+        self.definitions_error = definitions_error
+        self.definition_checks = []
+
+    def definitions_current(self, base_sha, candidates):
+        self.definition_checks.append((base_sha, tuple(item.plan_id for item in candidates)))
+        if self.definitions_error is not None:
+            raise self.definitions_error
+        return self.definitions_result
+
+
 class ExecPlanArchiveTest(unittest.TestCase):
+    def test_optional_definition_validation_is_skipped_for_legacy_port(self):
+        item = candidate("G-001")
+        repository = FakeRepository((item,))
+        git = FakeGit({"base": {"G-001": (entry("G-001"), None)}})
+
+        outcome = execplan_archive.ExecPlanArchiveDispatcher(repository, git).dispatch("/repo", "main")
+
+        self.assertEqual(outcome.archived_plan_ids, ("G-001",))
+
+    def test_optional_definition_validation_accepts_and_rejects_explicit_capability(self):
+        item = candidate("G-001")
+        states = {"base": {"G-001": (entry("G-001"), None)}}
+        for accepted in (True, False):
+            with self.subTest(accepted=accepted):
+                repository = FakeRepository((item,))
+                git = DefinitionValidatingFakeGit(states, definitions_result=accepted)
+
+                outcome = execplan_archive.ExecPlanArchiveDispatcher(repository, git).dispatch("/repo", "main")
+
+                self.assertEqual(bool(outcome.archived_plan_ids), accepted)
+                self.assertEqual(len(git.definition_checks), 2 if accepted else 3)
+                self.assertEqual(bool(git.pushed), accepted)
+
+    def test_definition_validation_exception_uses_pending_recovery_path(self):
+        item = candidate("G-001")
+        repository = FakeRepository((item,))
+        git = DefinitionValidatingFakeGit(
+            {"base": {"G-001": (entry("G-001"), None)}},
+            definitions_error=RuntimeError("definition read failed"),
+        )
+
+        outcome = execplan_archive.ExecPlanArchiveDispatcher(repository, git).dispatch("/repo", "main")
+
+        self.assertEqual(outcome.kind, execplan_archive.ArchiveDispatchKind.TRANSIENT)
+        self.assertEqual(dict(outcome.pending), {"G-001": "commit_preparation_failed:definition read failed"})
+        self.assertEqual(git.prepared, [])
+        self.assertEqual(git.pushed, [])
+
     def test_push_uses_all_resolved_urls_and_preserves_remote_result_checks(self):
         prepared = execplan_archive.PreparedArchive('archive', 'base', 'tree', 'commit')
         urls = ('https://example.test/repo.git', 'ssh://example.test/repo.git')

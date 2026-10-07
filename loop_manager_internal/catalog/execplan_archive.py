@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
-from typing import Callable, Mapping, Protocol, Sequence
+from typing import Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 from loop_manager_internal.catalog.execplan_catalog import final_content_matches
 
@@ -115,6 +115,17 @@ class ExecPlanArchiveGitPort(Protocol):
         prepared: PreparedArchive,
         base_branch: str,
     ) -> ArchivePushResult: ...
+
+
+@runtime_checkable
+class ExecPlanArchiveDefinitionValidationPort(Protocol):
+    """Optional capability for validating source definitions at a base revision."""
+
+    def definitions_current(
+        self,
+        base_sha: str,
+        candidates: Sequence[MergedArchiveCandidate],
+    ) -> bool: ...
 
 
 def validate_candidate(
@@ -311,7 +322,28 @@ class ExecPlanArchiveDispatcher:
                         base_sha=base_sha,
                     )
                     continue
-                if not self._definitions_current(repo, base_sha, safe_candidates):
+                try:
+                    definitions_current = self._definitions_current(
+                        repo, base_sha, safe_candidates
+                    )
+                except Exception as error:
+                    reason = f"commit_preparation_failed:{error}"
+                    self.repository.record_operation_pending(
+                        repo,
+                        operation_id,
+                        safe_candidates,
+                        reason=reason,
+                        push_result="prepare_failed",
+                        base_sha=base_sha,
+                    )
+                    last_pending.update(
+                        (candidate.plan_id, reason)
+                        for candidate in safe_candidates
+                    )
+                    return self._outcome(
+                        archived_ids, last_pending, transient=True
+                    )
+                if not definitions_current:
                     continue
                 try:
                     prepared = self.git.prepare_commit(
@@ -408,7 +440,30 @@ class ExecPlanArchiveDispatcher:
                     final_hash=prepared.final_hash,
                 )
                 continue
-            if not self._definitions_current(repo, base_sha, safe_candidates):
+            try:
+                definitions_current = self._definitions_current(
+                    repo, base_sha, safe_candidates
+                )
+            except Exception as error:
+                reason = f"commit_preparation_failed:{error}"
+                self.repository.record_operation_pending(
+                    repo,
+                    operation_id,
+                    safe_candidates,
+                    reason=reason,
+                    push_result="prepare_failed",
+                    base_sha=base_sha,
+                    commit_oid=prepared.commit_oid,
+                    final_hash=prepared.final_hash,
+                )
+                last_pending.update(
+                    (candidate.plan_id, reason)
+                    for candidate in safe_candidates
+                )
+                return self._outcome(
+                    archived_ids, last_pending, transient=True
+                )
+            if not definitions_current:
                 continue
 
             try:
@@ -473,8 +528,9 @@ class ExecPlanArchiveDispatcher:
     ) -> bool:
         if not self.repository.candidates_current(repo, candidates):
             return False
-        check = getattr(self.git, "definitions_current", None)
-        return check(base_sha, candidates) if check is not None else True
+        if isinstance(self.git, ExecPlanArchiveDefinitionValidationPort):
+            return self.git.definitions_current(base_sha, candidates)
+        return True
 
     @staticmethod
     def _outcome(
