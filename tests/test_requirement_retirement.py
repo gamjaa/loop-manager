@@ -540,6 +540,23 @@ class RequirementRetirementTest(unittest.TestCase):
         restarted = RequirementRetirementPort(self.connection, self.git)
         self.assertEqual(restarted.validate_result('repo', self.root, 'base', output), judgments)
 
+    def test_saved_judgment_replay_normalizes_requirement_path_whitespace(self):
+        self.add_plan()
+        (item,) = self.port.pending("repo", self.root, "base")
+        values = json.loads(self.judgment_line(item).split(": ", 1)[1])
+        values[0]["path"] = f" {item.path} "
+        original = "REQUIREMENT_JUDGMENTS: " + json.dumps(values)
+
+        judgments = self.port.validate_result("repo", self.root, "base", original)
+        self.port.record("repo", judgments)
+
+        resumed = RequirementRetirementPort(self.connection, self.git)
+        self.assertEqual(resumed.pending("repo", self.root, "base"), ())
+        self.assertEqual(
+            resumed.validate_result("repo", self.root, "base", original),
+            judgments,
+        )
+
     def test_duplicate_final_judgments_are_rejected(self):
         self.add_plan()
         (item,) = self.port.pending("repo", self.root, "base")

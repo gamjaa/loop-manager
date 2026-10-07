@@ -318,6 +318,7 @@ class RequirementRetirementPort:
             for value in repeated:
                 if not isinstance(value, dict) or not isinstance(value.get("path"), str):
                     raise RetirementError("보존된 Requirement 판단이 유효하지 않습니다.")
+                value = dict(value, path=value["path"].strip())
                 paths = value.get("relevant_paths")
                 if not isinstance(paths, list) or any(not isinstance(path, str) for path in paths):
                     raise RetirementError("보존된 Requirement 판단 경로가 유효하지 않습니다.")
