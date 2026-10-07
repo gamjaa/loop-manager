@@ -9,8 +9,11 @@ Reviewer 성공 기록은 생성하지 않았다.
 사용자 요청에 따른 재검토에서 호출 경로 identity 거부와 고정 Git 호출 예산을
 보강했다. 재검토 후보의 코드·테스트 diff SHA-256은
 `99137840519e5a7e24fbd5c4f4cb3f4529619311bb9be51032226b12e4c8ce07`이며,
-커밋 후에도 `git diff --binary 44a5a916598669631ffd7183e399b656f2656ed5 -- loop_manager_internal tests | sha256sum`으로 확인할 수 있다.
-원본 진단에서 추출한 환경·단계·snapshot 이유·전체 Git 경로 비용은
+관리 rebase 뒤 현재 base `60b956ddc1b5f24f0d4cfcc53fb1ecfd996b097a`와 HEAD
+`798e2816c439d758ab0cdebfaac645801c952327` 사이에서도 같다. 현재 patch의 재현 명령은
+`git diff --binary 60b956ddc1b5f24f0d4cfcc53fb1ecfd996b097a...HEAD -- loop_manager_internal tests | sha256sum`이다.
+전체 verify 비교와 원본 측정의 기준 revision `44a5a916598669631ffd7183e399b656f2656ed5`는
+당시 실행의 역사적 기록으로 유지한다. 원본 진단에서 추출한 환경·단계·snapshot 이유·전체 Git 경로 비용은
 `G-188-costs.json`에 함께 보존한다. 아래 최초 비교 기록과 재검토 후보의 기록을 구분한다.
 
 ## 환경과 집계
@@ -163,5 +166,22 @@ snapshot 4,956회·내부 Git 명령 88,878회다. 미완료 단계·미집계 G
 변경 전·최초 후보·최종 후보의 환경·개별/모듈 누적 비용과 단계·이유별 snapshot,
 Git 명령 수·시간은 함께 게시하는 `G-188-costs.json`에 보존했다.
 
-현재 구현을 게시할 blocking issue는 없다. 이 결과는 사용자 요청에 따른
+당시 후보의 대화형 검토에서 게시할 blocking issue는 없었다. 이 결과는 사용자 요청에 따른
 대화형 재검토이며 자동 Manager/Reviewer 성공 기록이나 사용자 Merge를 대신하지 않는다.
+
+## 관리 rebase 뒤 현재 HEAD 확인
+
+2026-10-07, 현재 HEAD `798e2816c439d758ab0cdebfaac645801c952327`의 base
+`60b956ddc1b5f24f0d4cfcc53fb1ecfd996b097a` 대비 최종 diff 전체를 다시 확인했다.
+변경은 12개 경로에 걸쳐 있으며 코드·테스트 patch hash는 위의 reviewed hash와 같다.
+이 재검토에서 과거 후보의 테스트 성공을 현재 결과로 사용하지 않았다.
+
+현재 HEAD에서 다음 최소 범위 targeted unit test를 실행해 **6개 PASS**를 확인했다.
+
+```text
+python3 -m unittest -v tests.test_review_protocol_recovery.ReviewProtocolRecoveryTest.test_review_protocol_correction_preserves_pass_and_fail_transitions tests.test_recovery_boundary.RecoveryBoundaryTests.test_real_git_and_sqlite_restore_without_rewriting_identity tests.test_recovery_boundary.RecoveryBoundaryTests.test_independent_parallel_variants_and_failed_variant_restore tests.test_git_snapshot_cost.GitSnapshotCostTests.test_adoption_shares_owner_inspection_but_reobserves_confirmation tests.test_execution_current_rebase_adoption_phase.CurrentRebaseAdoptionTests.test_adoption_shares_inspection_and_rejects_drift_at_transaction tests.test_execution_current_rebase_adoption_phase.CurrentRebaseAdoptionTests.test_ownership_reuses_only_matching_inspect_evidence
+```
+
+이번 Worker 세션에서는 `scripts/verify.sh`와 전체 verify를 실행하지 않았다. 위의 과거
+전체 verify 결과는 rebase 뒤 후보의 검증으로 간주하지 않으며, 현재 후보의 전체 verify와
+독립 Review는 Manager 작업으로 남아 있다.
