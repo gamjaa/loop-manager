@@ -3524,6 +3524,8 @@ _PlanningValidationPorts = _bind_effects(
         validate_maintenance_planner_result=lambda *args, **kwargs: validate_maintenance_planner_result(*args, **kwargs),
         validate_maintenance_publication_base=lambda *args, **kwargs: validate_maintenance_publication_base(*args, **kwargs),
         validate_planner_result=lambda *args, **kwargs: validate_planner_result(*args, **kwargs),
+        git=lambda *args, **kwargs: git(*args, **kwargs),
+        git_bytes=lambda *args, **kwargs: git_bytes(*args, **kwargs),
     ),
 )
 

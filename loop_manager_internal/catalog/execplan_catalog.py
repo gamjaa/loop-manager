@@ -15,7 +15,7 @@ import re
 import stat
 from types import MappingProxyType
 from typing import AbstractSet, Iterable, Mapping
-from loop_manager_internal.catalog import execplan_drafts
+from loop_manager_internal.catalog import execplan_drafts, manager_sources
 
 
 PRIORITIES = frozenset({"critical", "high", "normal", "low"})
@@ -242,6 +242,8 @@ def _source_exists(
     allow_archive_fallback: bool,
     available_regular_paths: AbstractSet[str] | None = None,
 ) -> bool:
+    if source == manager_sources.SOURCE:
+        return True  # Registration is checked at Manager state/publication gates.
     if available_regular_paths is not None:
         return source in available_regular_paths or bool(
             allow_archive_fallback and source != "docs/PRODUCT.md"
@@ -299,7 +301,8 @@ def parse_execplan_text(
         raise RuntimeError("ExecPlan depends_on이 유효하지 않습니다.")
     for source in sources:
         if not isinstance(source, str) or not (
-            source == "docs/PRODUCT.md"
+            source == manager_sources.SOURCE
+            or source == "docs/PRODUCT.md"
             or re.fullmatch(r"docs/requirements/[^/\\]+\.md", source)
         ):
             raise RuntimeError(f"허용되지 않는 ExecPlan source입니다: {source}")
@@ -313,6 +316,8 @@ def parse_execplan_text(
             )
         ):
             raise RuntimeError(f"존재하지 않는 ExecPlan source입니다: {source}")
+    if manager_sources.SOURCE in sources:
+        manager_sources.validate_scope(text, sources)
     for dependency in dependencies:
         if not isinstance(dependency, str) or _PLAN_ID.fullmatch(dependency) is None:
             raise RuntimeError(
@@ -612,6 +617,14 @@ def snapshot_from_documents(
                     reject(plan_id, path, "missing-source",
                            f"존재하지 않는 ExecPlan source입니다: {source} ({path})", source)
 
+    manager_requests = {}
+    for entry in entries.values():
+        if not entry.archived and manager_sources.SOURCE in entry.sources:
+            request_id = manager_sources.declaration(entry.text)["id"]
+            if request_id in manager_requests:
+                reject(entry.plan_id, entry.path, "duplicate-manager-request",
+                       "동일 Manager 요청의 생성 계획이 중복됐습니다.")
+            manager_requests[request_id] = entry.plan_id
     for issue in _graph_issues(entries, frozenset(identities)):
         reject(issue.plan_id, issue.path, issue.code, issue.message)
     ordered = dict(sorted(entries.items(), key=lambda item: int(item[0][2:])))

@@ -95,7 +95,7 @@ def review_instruction(attempt, git, repo) -> str:
     return text
 
 
-def validate_final(attempt, result: str, batch, git, repo) -> str:
+def validate_final(attempt, result: str, batch, git, repo, *, manager_source_validator=None) -> str:
     matches = re.findall(r"^FINAL_SPECIFICATION_REVIEW:\s*(.+)$", result, re.MULTILINE)
     try:
         if len(matches) != 1:
@@ -143,8 +143,15 @@ def validate_final(attempt, result: str, batch, git, repo) -> str:
             raise ValueError("최종 확인의 미충족 작업에 후속 계획이 없습니다.")
         if outcome == "needs_decision" and not any(plan.get("draft") for _path, plan in plans):
             raise ValueError("사용자 판단 결과에 draft가 없습니다.")
-        if any(not plan.get("sources") or not set(plan["sources"]).issubset(specifications) for _path, plan in plans):
-            raise ValueError("최종 확인의 후속 계획에 활성 명세 source 연결이 없습니다.")
+        from loop_manager_internal.catalog.manager_sources import SOURCE
+        for path, plan in plans:
+            sources = plan.get("sources")
+            if sources == [SOURCE]:
+                if manager_source_validator is None:
+                    raise ValueError("최종 확인의 Manager source에 등록 요청 검증이 없습니다.")
+                manager_source_validator(path, plan)
+            elif not sources or not set(sources).issubset(specifications):
+                raise ValueError("최종 확인의 후속 계획에 활성 명세 source 연결이 없습니다.")
         return outcome
     except (ValueError, TypeError, RuntimeError, subprocess.SubprocessError) as error:
         raise PlanningResultInvalid(str(error)) from error

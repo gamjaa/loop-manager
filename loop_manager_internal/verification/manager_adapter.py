@@ -53,3 +53,16 @@ def run(effects, arguments, worktree, timeout, *, launch=None):
             finally:
                 if context is None:
                     coordinator.close()
+
+
+def observe_inputs(worktree, arguments, *, environment, runtime_identity,
+                   git_inputs=None, external_inputs=None, completeness=None):
+    """Provide candidate observations independently of execution/request creation.
+
+    The caller must supply the actual effective command/environment and measured
+    identities. Unconfirmed Git or external inputs remain unusable for reuse.
+    """
+    from loop_manager_internal.verification.inputs import observe
+    return observe(Path(worktree), command=tuple(arguments), environment=environment,
+                   runtime=runtime_identity, git_inputs=git_inputs,
+                   external_inputs=external_inputs, completeness=completeness)

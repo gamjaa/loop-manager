@@ -108,7 +108,7 @@ def relevant_document_changes(
         for revision, path in ((old, previous_path), (new, current_path)):
             declaration = _declaration(git, repository, revision, path)
             declarations.append((revision, declaration))
-            relevant.update(str(source) for source in declaration["sources"])
+            relevant.update(str(source) for source in declaration["sources"] if not str(source).startswith("manager:"))
             dependency_ids.update(str(value) for value in declaration["depends_on"])
     old_dependencies = _plan_paths(git, repository, old, dependency_ids)
     new_dependencies = _plan_paths(git, repository, new, dependency_ids)
@@ -133,7 +133,7 @@ def relevant_document_changes(
             )
         except (OSError, UnicodeError, RuntimeError):
             continue  # The ordinary Planner validation reports incomplete files.
-        relevant.update(str(source) for source in parsed["sources"])
+        relevant.update(str(source) for source in parsed["sources"] if not str(source).startswith("manager:"))
         for dependency in parsed["depends_on"]:
             row = rows.get(str(dependency))
             if row is not None:

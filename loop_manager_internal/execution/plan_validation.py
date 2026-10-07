@@ -88,6 +88,10 @@ def _revision_execplan_source_fingerprint(
 
     entries = []
     for relative_path in json.loads(str(plan["sources"])):
+        if relative_path == "manager:verify-inputs":
+            from loop_manager_internal.catalog.manager_sources import source_content
+            entries.append((relative_path, source_content(relative_path)))
+            continue
         contents = revision_document_or_none(effects.git, repo_path, revision, relative_path)
         if contents is None and relative_path != "docs/PRODUCT.md":
             archive_path = execplan_catalog.requirement_archive_path(
