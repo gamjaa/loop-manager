@@ -139,11 +139,12 @@ class NormalizeLegacyIgnoredSnapshotEffects:
     _scope_observation_effects: Callable[..., object]
 
 
-def _normalize_legacy_ignored_snapshot(effects: NormalizeLegacyIgnoredSnapshotEffects, worktree: Path, saved: GitSnapshot, current: GitSnapshot) -> GitSnapshot:
+def _normalize_legacy_ignored_snapshot(effects: NormalizeLegacyIgnoredSnapshotEffects, worktree: Path, saved: GitSnapshot, current: GitSnapshot, *, start: GitSnapshot | None = None) -> GitSnapshot:
     return scope_observation._normalize_legacy_ignored_snapshot(
         worktree,
         saved,
         current,
+        start=start,
         effects=effects._scope_observation_effects(),
     )
 

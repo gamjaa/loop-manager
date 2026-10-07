@@ -481,16 +481,37 @@ class WorkerValidationTest(ActiveWorkerFixture, unittest.TestCase):
     def test_verify_success_keeps_worker_and_verify_logs_out_of_reviewer(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, state_dir, connection = self._make_active_worker_project(directory)
+            managed = Path(connection.execute('SELECT worktree FROM projects').fetchone()[0])
+            exclude = Path(git_command(managed, 'rev-parse', '--git-path', 'info/exclude'))
+            if not exclude.is_absolute():
+                exclude = managed / exclude
+            exclude.write_text(exclude.read_text() + '\n__pycache__/\n')
+            artifact = managed / '__pycache__' / 'targeted.pyc'
+            artifact.parent.mkdir(exist_ok=True)
             calls = []
+            sequence = []
             logs = []
 
             def agent(worktree, _state, _config, role_name, prompt, **kwargs):
+                self.assertEqual(worktree, managed)
                 calls.append((role_name, prompt, kwargs))
                 if role_name == "worker":
+                    sequence.append('targeted')
+                    artifact.write_bytes(b'targeted test artifact')
                     (worktree / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
                     return loop_manager.CodexResult(0, worker_result("Persist worker change"), "worker-session")
                 self.assertEqual(role_name, "reviewer")
+                sequence.append('reviewer')
+                self.assertEqual(artifact.read_bytes(), b'verify artifact')
+                artifact.unlink()
                 return 0, "VERDICT: PASS"
+
+            def full_verify(worktree, *_args, **_kwargs):
+                self.assertEqual(worktree, managed)
+                sequence.append('verify')
+                self.assertEqual(artifact.read_bytes(), b'targeted test artifact')
+                artifact.write_bytes(b'verify artifact')
+                return True, 'verify: PASS'
 
             with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
                 "loop_manager.remote_base", return_value="main"
@@ -499,7 +520,7 @@ class WorkerValidationTest(ActiveWorkerFixture, unittest.TestCase):
                     connection, "https://example.test/pr/1"
                 )
             ), mock.patch("loop_manager.run_codex", side_effect=agent), mock.patch(
-                "loop_manager.verify", return_value=(True, "verify: PASS")
+                "loop_manager.verify", side_effect=full_verify
             ) as verify, mock.patch("loop_manager.operation_log", side_effect=lambda message, **kwargs: logs.append((message, kwargs))):
                 self.assertEqual(
                     loop_manager.run_project(
@@ -509,6 +530,8 @@ class WorkerValidationTest(ActiveWorkerFixture, unittest.TestCase):
                 )
                 verify.assert_called_once()
 
+            self.assertEqual(sequence, ['targeted', 'verify', 'reviewer'])
+            self.assertFalse(artifact.exists())
             self.assertEqual(logs[:3], [("Worker 시작: G-001 Worker Boundary", {}), ("전체 verify 시작: G-001 Worker Boundary", {}), ("Reviewer 시작: G-001 Worker Boundary", {})])
             self.assertEqual([role for role, _prompt, _kwargs in calls], ["worker", "reviewer"])
             reviewer_prompt = calls[1][1]

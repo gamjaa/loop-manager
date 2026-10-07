@@ -40,21 +40,23 @@ def seed_validated_candidate(
         archive_candidates=(),
         guidance_hash=plan_content_hash(connection, str(repo), plan_id),
     )
+    verify_output = str(row['verify_result'] or 'validated candidate: OK')
     values = (
         snapshot.serialize(), snapshot.worker_token, snapshot.archive_token,
-        snapshot.verify_token(base_sha, candidate_head),
+        verify_output,
+        snapshot.verify_token(base_sha, candidate_head, verify_output),
         snapshot.review_token(base_sha, candidate_head),
     )
     with connection:
         connection.execute(
             "UPDATE exec_plans SET definition_snapshot = ?, worker_input_token = ?, "
-            "archive_token = ?, verify_token = ?, review_token = ? "
+            "archive_token = ?, verify_result = ?, verify_token = ?, review_token = ? "
             "WHERE repo = ? AND plan_id = ?",
             (*values, str(repo), plan_id),
         )
         connection.execute(
             "UPDATE projects SET definition_snapshot = ?, worker_input_token = ?, "
-            "archive_token = ?, verify_token = ?, review_token = ? WHERE repo = ?",
+            "archive_token = ?, verify_result = ?, verify_token = ?, review_token = ? WHERE repo = ?",
             (*values, str(repo)),
         )
     return snapshot

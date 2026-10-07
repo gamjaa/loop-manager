@@ -486,6 +486,8 @@ class RevisionHandler:
                 worker_result=row['worker_result'] is not None,
                 verify_result=(manual.valid_evidence(context,'verify',row['verify_result'])
                                if manual and manual.enabled() else row['verify_result'] is not None),
+                verify_output=(str(row['verify_result'])
+                               if row['verify_result'] is not None else None),
                 review_result=(manual.valid_evidence(context,'review',row['review_result'])
                                if manual and manual.enabled() else row['review_result'] is not None),
                 worker_input_token=(

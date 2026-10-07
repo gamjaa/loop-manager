@@ -32,9 +32,37 @@ class PlanningSelectionService(PlanningService):
         current = self._ports.git.plan_declarations(context.repo_path, base_sha)
         return self._ports.state.plan_declarations_match(context.repo, current)
 
+    def _recover_ignored_error(self, run: _PlanningRun) -> bool:
+        row, context = run.row, run.context
+        recover = getattr(getattr(self._ports, 'agent', None), 'recover_ignored_scope_error', None)
+        if not row.planning_error or recover is None:
+            return False
+        try:
+            with self._ports.state.transaction():
+                if self._ports.state.planning(context.repo) != row:
+                    return False
+                if self._ports.state.schedule(context.repo).active is not None:
+                    return False
+                worktree = Path(str(row.preserved_worktree or ''))
+                values = (runtime_state._preserved_planning_values(row.planning_preserved_state)
+                          if row.planning_preserved_state else None)
+                fingerprint = (values['planning_attempt_fingerprint'] if values
+                               else row.planning_attempt_fingerprint)
+                self._ports.git.validate_workspace_identity(context.repo, str(fingerprint or ''), worktree)
+                if self._ports.state.planning_release_pending(context.repo):
+                    return False
+                self._ports.state.preserve_diagnostics(context.repo, row)
+                if not recover(row):
+                    return False
+        except (RuntimeError, OSError, ValueError):
+            return False
+        run.row = self._ports.state.planning(context.repo)
+        return True
+
     def _gate_preserved_error(self, run: _PlanningRun) -> PlanningOutcome | None:
         """Check the failed input before scheduling or stale-workspace cleanup."""
 
+        self._recover_ignored_error(run)
         row = run.row
         if (run.context.recovery_request_id
                 and self._ports.state.local_recheck_consumed(run.context.recovery_request_id)

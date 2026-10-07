@@ -113,7 +113,7 @@ class ReviewHandler:
             context.worktree, 'rev-parse', 'HEAD',
         ).stdout.strip()
         expected_verify = self.ports.snapshot()._definition_snapshot.verify_token(
-            latest_sha, candidate_head,
+            latest_sha, candidate_head, str(row['verify_result'] or ''),
         )
         if (
             row['verify_result'] is None

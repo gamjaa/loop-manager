@@ -828,6 +828,10 @@ class BlockedUserInputScopeUnitTests(unittest.TestCase):
         self.effects = SimpleNamespace(
             repository=mock.Mock(return_value=SimpleNamespace(scope_owner=lambda *args: self.plan,
                                                                scope_catalog_available=lambda: False)),
+            _config_entries=mock.Mock(return_value={}),
+            _with_proven_legacy_ignore_config=mock.Mock(side_effect=lambda saved, _config: saved),
+            _normalize_legacy_ignored_snapshot=mock.Mock(
+                side_effect=lambda _worktree, saved, _current, **_kwargs: saved),
             capture_git_snapshot=mock.Mock(return_value=self.current),
             _plan_id_from_path=mock.Mock(return_value='G-166'),
             _owned_rebase_state_dir=mock.Mock(return_value=None),

@@ -267,7 +267,9 @@ class ExecutionFixture:
             verify_result='successful verify output',
             worker_input_token=snapshot.worker_token,
             archive_token=snapshot.archive_token,
-            verify_token=snapshot.verify_token('base', 'base'),
+            verify_token=snapshot.verify_token(
+                'base', 'base', 'successful verify output',
+            ),
         )
         return self.handler._context()
 

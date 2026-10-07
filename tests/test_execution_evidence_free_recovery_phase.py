@@ -143,7 +143,9 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
         self.assertEqual(self.state.row()['verify_result'], 'fresh candidate: OK')
         self.assertEqual(self.state.row()['review_result'], 'VERDICT: PASS')
         current = self.handler._definition_snapshot
-        self.assertEqual(self.state.row()['verify_token'], current.verify_token('base', self.final_head))
+        self.assertEqual(self.state.row()['verify_token'], current.verify_token(
+            'base', self.final_head, 'fresh candidate: OK',
+        ))
         self.assertEqual(self.state.row()['review_token'], current.review_token('base', self.final_head))
         self.remote = self.final_head
         self.case.expected = replace(self.case.expected,

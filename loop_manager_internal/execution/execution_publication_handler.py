@@ -231,7 +231,10 @@ class PublicationHandler:
         if expected_oid is not None and head != expected_oid:
             raise self.ports.contract.PublicationSafetyError('게시 관측 중 관리 HEAD가 변경됐습니다.')
         if self.ports.snapshot()._definition_snapshot is not None and (
-                row['verify_token'] != self.ports.snapshot()._definition_snapshot.verify_token(str(row['validated_base_sha'] or ''), head)
+                row['verify_token'] != self.ports.snapshot()._definition_snapshot.verify_token(
+                    str(row['validated_base_sha'] or ''), head,
+                    str(row['verify_result'] or ''),
+                )
                 or row['review_token'] != self.ports.snapshot()._definition_snapshot.review_token(str(row['validated_base_sha'] or ''), head)):
             raise self.ports.contract.PublicationSafetyError('게시 HEAD가 verify·Review를 통과한 후보와 다릅니다.')
 

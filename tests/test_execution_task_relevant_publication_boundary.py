@@ -191,7 +191,9 @@ class TaskRelevantPublicationBoundaryTests(TestCase):
         self.case.review_context()
         snapshot = self.handler._definition_snapshot
         self.case.state.update_project('repo',
-            verify_token=snapshot.verify_token('base', head),
+            verify_token=snapshot.verify_token(
+                'base', head, str(self.case.state.row()['verify_result'] or ''),
+            ),
             review_token=snapshot.review_token('base', head))
         self.effects.publication.push_managed_publication_branch.side_effect = (
             lambda *args: lm.push_managed_publication_branch(self.case.connection, *args))

@@ -462,14 +462,19 @@ def _ignore_rule_sources(worktree: Path, paths: list[str], *, effects: Observati
     if result.returncode not in {0, 1} or fields.pop() or len(fields) % 4:
         raise RuntimeError("ignored 경로의 Git 규칙 묶음을 확인할 수 없습니다.")
     sources = {}
+    matched = set()
     expected = set(paths)
     for offset in range(0, len(fields), 4):
         source, line, pattern, raw_path = fields[offset:offset + 4]
         path = os.fsdecode(raw_path)
-        if path not in expected or path in sources or not source or not line or not pattern:
+        if path not in expected or path in matched or not source or not line or not pattern:
             raise RuntimeError("ignored 경로의 Git 규칙 묶음이 불완전합니다.")
-        sources[path] = os.fsdecode(source)
-    if bool(sources) != (result.returncode == 0):
+        matched.add(path)
+        # Verbose check-ignore also reports the last matching negation rule.
+        # Such a path remains authoritative, including after its deletion.
+        if not pattern.startswith(b'!'):
+            sources[path] = os.fsdecode(source)
+    if bool(matched) != (result.returncode == 0):
         raise RuntimeError("ignored 경로의 Git 규칙 결과가 종료 코드와 다릅니다.")
     return sources
 
@@ -484,25 +489,42 @@ def _normalize_legacy_ignored_snapshot(
     current: GitSnapshot,
     *,
     effects: ObservationEffects,
+    start: GitSnapshot | None = None,
 ) -> GitSnapshot:
-    """Discard old untracked entries only when their starting ignore rule is proven."""
+    """Build a comparison view, retaining the original invocation evidence."""
+
+    start = start or saved
 
     dirty = dict(saved.dirty)
     for path, (kinds, _signature) in saved.dirty.items():
         if kinds != ("untracked",) or path in current.dirty:
             continue
-        if path in saved.index or path in current.index:
+        if path in start.index or path in saved.index or path in current.index:
             continue
         source = _ignore_rule_source(worktree, path, effects=effects)
         if source is None:
             continue
-        if not (source == ".gitignore" or source.endswith("/.gitignore")):
+        if not (source in start.index
+                and (source == ".gitignore" or source.endswith("/.gitignore"))):
+            source_path = Path(source)
+            if not source_path.is_absolute():
+                source_path = worktree / source_path
+            source_key = str(_canonical_path(source_path))
+            proven = any(
+                key.startswith('ignore-source:') and len(value) == 2
+                and value[0] == source_key and value[1] not in {'missing', 'disabled'}
+                and start.config.get(key) == saved.config.get(key) == value
+                for key, value in current.config.items()
+            )
+            if proven:
+                dirty.pop(path)
             continue
-        if source not in saved.index or saved.index.get(source) != current.index.get(source):
+        if (source not in start.index or start.index.get(source) != saved.index.get(source)
+                or saved.index.get(source) != current.index.get(source)):
             continue
-        if source in saved.dirty or source in current.dirty:
+        if source in start.dirty or source in saved.dirty or source in current.dirty:
             continue
-        old_rule = effects.git(worktree, "rev-parse", f"{saved.head}:{source}", check=False)
+        old_rule = effects.git(worktree, "rev-parse", f"{start.head}:{source}", check=False)
         new_rule = effects.git(worktree, "rev-parse", f"{current.head}:{source}", check=False)
         if old_rule.returncode or new_rule.returncode or old_rule.stdout != new_rule.stdout:
             continue

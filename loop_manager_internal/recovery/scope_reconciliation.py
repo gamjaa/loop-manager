@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.agents.scope_contracts import AgentScopeError
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
+from loop_manager_internal.agents.scope_recovery import ignored_comparison_view
 from loop_manager_internal.git import rebase_block_reconciliation
 from loop_manager_internal.recovery import blocked_plan_reconciliation
 from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
@@ -36,6 +37,8 @@ class ResumeProjectBlockIfSafeEffects:
     _reconciled_manager_scope_metadata: Callable[..., object]
     _requeue_blocked_execplan: Callable[..., object]
     _resume_owned_checkpoint_project_block: Callable[..., object]
+    _with_proven_legacy_ignore_config: Callable[..., object]
+    _normalize_legacy_ignored_snapshot: Callable[..., object]
     capture_git_snapshot: Callable[..., object]
     git: Callable[..., object]
     hydrate_execplan_project: Callable[..., object]
@@ -108,6 +111,7 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
         try:
             worktree = Path(str(project['worktree'] or repo_path))
             checked = None
+            ignored_only_comparison = False
             if block["reason_code"] == BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value:
                 worktree = Path(str(project["worktree"] or ""))
                 fingerprint = str(project["planning_attempt_fingerprint"] or "")
@@ -124,10 +128,15 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
             elif project["agent_snapshot"]:
                 before = GitSnapshot.deserialize(str(project["agent_snapshot"]))
                 after = checked = effects.capture_git_snapshot(worktree)
+                start = before
+                before = ignored_comparison_view(worktree, start, before, after, effects=effects)
+                ignored_only_comparison = before.dirty != start.dirty
                 resources = effects._agent_git_resources(connection, repo_path, worktree, before,
                                                 str(project['agent_role'] or 'planner'))
                 if scoped_blocking.is_scope_baseline_block(block) and project['agent_result_snapshot']:
-                    result = GitSnapshot.deserialize(str(project['agent_result_snapshot']))
+                    saved_result = GitSnapshot.deserialize(str(project['agent_result_snapshot']))
+                    result = ignored_comparison_view(worktree, start, saved_result, after, effects=effects)
+                    ignored_only_comparison |= result.dirty != saved_result.dirty
                     comparison = effects._reconciled_manager_scope_metadata(
                         connection, repo_path, state_dir, repo, None, before, after, resources)
                     result = effects._reconciled_manager_scope_metadata(
@@ -135,6 +144,14 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
                     effects.validate_agent_scope(str(project['agent_role'] or 'planner'), worktree,
                         comparison, result, external_worktree=repo_path,
                         base_branch=str(project['base_branch']), resources=resources)
+                    if ignored_only_comparison:
+                        effects.validate_agent_scope('reviewer', worktree, result, after,
+                            external_worktree=repo_path, base_branch=str(project['base_branch']),
+                            resources=resources)
+                if ignored_only_comparison:
+                    effects.validate_planning_worktree_ownership(
+                        connection, repo_path, state_dir, repo,
+                        str(project['planning_attempt_fingerprint'] or ''), worktree)
                 before = effects._reconciled_manager_scope_metadata(
                     connection, repo_path, state_dir, repo, None, before, after, resources)
                 effects.validate_agent_scope(
@@ -151,6 +168,13 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
         except (AgentScopeError, RuntimeError, WorkspaceOwnershipError, ValueError):
             return False
         with runtime_state._transaction(connection):
+            if ignored_only_comparison:
+                try:
+                    effects.validate_planning_worktree_ownership(
+                        connection, repo_path, state_dir, repo,
+                        str(project['planning_attempt_fingerprint'] or ''), worktree)
+                except (RuntimeError, WorkspaceOwnershipError, ValueError):
+                    return False
             if (not scoped_blocking.project_cause_matches(connection, block)
                     or dict(connection.execute('SELECT * FROM projects WHERE repo = ?',
                                                (repo,)).fetchone()) != dict(project)
@@ -527,6 +551,8 @@ class ResumeOwnedCheckpointProjectBlockEffects:
 class ResumeLegacyReviewCountBlockEffects:
     """Effects for resume legacy review count block; preserve existing safety gates."""
     _rebase_in_progress_for_branch: Callable[..., object]
+    _with_proven_legacy_ignore_config: Callable[..., object]
+    _normalize_legacy_ignored_snapshot: Callable[..., object]
     capture_git_snapshot: Callable[..., object]
     git: Callable[..., object]
     pr_for_branch: Callable[..., object]
@@ -817,6 +843,10 @@ def _resume_legacy_review_count_block(effects: ResumeLegacyReviewCountBlockEffec
         if snapshot.branch != branch or snapshot.operations or not snapshot.head:
             return False
         blocked_snapshot = GitSnapshot.deserialize(str(plan["agent_result_snapshot"]))
+        if plan['agent_snapshot']:
+            start = GitSnapshot.deserialize(str(plan['agent_snapshot']))
+            blocked_snapshot = ignored_comparison_view(
+                worktree, start, blocked_snapshot, snapshot, effects=effects)
         if (not snapshot.shared_metadata_complete
                 or not blocked_snapshot.shared_metadata_complete):
             return False

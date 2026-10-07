@@ -1,5 +1,6 @@
 """recovery project block service boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.agents.scope_recovery import ignored_comparison_view
 from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -19,6 +20,7 @@ from loop_manager_internal.runtime.contracts import REBASE_IN_PROGRESS_ERROR
 from loop_manager_internal.runtime.contracts import RuntimeMutation
 from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
 from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
+from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
 from loop_manager_internal.storage import blocked_checkpoint_state
 from loop_manager_internal.storage import execution_checkpoint_state
 from loop_manager_internal.storage import recovery_state
@@ -77,6 +79,41 @@ def _clear_project_block_without_losing_planning_error(
             "UPDATE projects SET last_error = ? WHERE repo = ?",
             (project["planning_error"], repo),
         )
+
+
+def _saved_verify_matches_candidate(plan: sqlite3.Row, candidate_head: str) -> bool:
+    """Trust saved verify output only for its recorded base and exact candidate."""
+    active_sha = str(plan['active_sha'] or '')
+    if (plan['verify_result'] is None or not active_sha
+            or plan['validated_base_sha'] != active_sha or not candidate_head):
+        return False
+    try:
+        definition = DefinitionSnapshot.deserialize(plan['definition_snapshot'])
+    except ValueError:
+        return False
+    return bool(definition and plan['verify_token'] == definition.verify_token(
+        active_sha, candidate_head, str(plan['verify_result'])))
+
+
+def _legacy_verify_matches_candidate(connection, plan, start, result, current) -> bool:
+    """Migrate a legacy marker only with matching immutable success evidence."""
+    if (result.dirty or current.dirty or start.head != result.head
+            or result.head != current.head or not plan['definition_snapshot']
+            or plan['validated_base_sha'] != plan['active_sha']):
+        return False
+    definition = DefinitionSnapshot.deserialize(plan['definition_snapshot'])
+    if (definition is None or plan['verify_result'] is None
+            or plan['verify_token'] != definition.verify_token(
+                str(plan['active_sha']), current.head)):
+        return False
+    audit = connection.execute(
+        "SELECT classification, raw_output, definition_revision FROM validation_results "
+        "WHERE repo = ? AND plan_id = ? AND stage = 'verify' ORDER BY id DESC LIMIT 1",
+        (plan['repo'], plan['plan_id']),
+    ).fetchone()
+    return bool(audit and audit['classification'] == 'success'
+                and audit['raw_output'] == str(plan['verify_result'])
+                and audit['definition_revision'] == plan['current_revision_sha'])
 
 
 @dataclass(frozen=True)
@@ -160,6 +197,10 @@ def _reconcile_rebase_evidence_block(
 class ReconcileScopeBaselinePlanBlockEffects:
     """Named effects for _reconcile_scope_baseline_plan_block; no entry-point/module access."""
     _owned_checkpoint_remote_oid: Callable[..., object]
+    _with_proven_legacy_ignore_config: Callable[..., object]
+    _normalize_legacy_ignored_snapshot: Callable[..., object]
+    _agent_git_resources: Callable[..., object]
+    _reconciled_manager_scope_metadata: Callable[..., object]
     capture_git_snapshot: Callable[..., object]
     operation_log: Callable[..., object]
     unmet_execplan_dependencies: Callable[..., object]
@@ -209,12 +250,38 @@ def _reconcile_scope_baseline_plan_block(effects: ReconcileScopeBaselinePlanBloc
                 raise AgentScopeError('scope 차단 검사 중 Git 상태가 변경됐습니다.')
             return current
         observed = observe()
+        # Legacy ignored evidence must not invalidate already completed stages.
+        preserve_stage = False
+        legacy_verify = False
+        clean_candidate = False
+        if plan['agent_result_snapshot']:
+            start = GitSnapshot.deserialize(plan['agent_snapshot'])
+            result = GitSnapshot.deserialize(plan['agent_result_snapshot'])
+            before_view = ignored_comparison_view(worktree, start, start, observed, effects=effects)
+            result_view = ignored_comparison_view(worktree, start, result, observed, effects=effects)
+            if before_view.dirty != start.dirty or result_view.dirty != result.dirty:
+                resources = effects._agent_git_resources(
+                    connection, repo_path, worktree, start, str(plan['agent_role']),
+                    selected_plan_path=str(plan['path']))
+                result_view = effects._reconciled_manager_scope_metadata(
+                    connection, repo_path, state_dir, repo, plan_id,
+                    result_view, observed, resources)
+                result_scope, current_scope = agent_scope_decision.scoped_metadata(
+                    result_view, observed, resources)
+                preserve_stage = result_scope == current_scope
+                clean_candidate = not result_scope.dirty and not current_scope.dirty
+                if preserve_stage and clean_candidate:
+                    legacy_verify = _legacy_verify_matches_candidate(
+                        connection, plan, start, result_scope, current_scope)
         with runtime_state._transaction(connection):
             if (dict(connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
                                          (repo, plan_id)).fetchone()) != dict(plan)
                     or dict(connection.execute('SELECT * FROM projects WHERE repo = ?', (repo,)).fetchone()) != dict(project)
                     or checkpoints.get(repo, plan_id) != checkpoint or observe() != observed):
                 raise AgentScopeError('scope 차단 해제 중 소유 상태가 변경됐습니다.')
+            if legacy_verify and not _legacy_verify_matches_candidate(
+                    connection, plan, start, result_scope, current_scope):
+                raise AgentScopeError('scope 차단 해제 중 저장 verify 감사가 변경됐습니다.')
             scoped_blocking.clear_revalidated_rebase_block(connection, block, is_plan_block=True)
             recovery_state.RecoveryRepository(connection).resolve_rebase_block(repo, plan_id, block)
             checkpoints.record(repo, plan_id, expected_generation=checkpoint.generation,
@@ -225,9 +292,24 @@ def _reconcile_scope_baseline_plan_block(effects: ReconcileScopeBaselinePlanBloc
                     {'block': dict(block), 'candidate': observed.serialize(),
                      'prior_artifacts': {key: plan[key] for key in (
                          'worker_result', 'verify_result', 'review_result', 'last_error')}}]})
-            values = managed_rebase_adoption.revalidation_values(plan['active_sha'])
-            values.pop('phase')
-            values.update(status='IMPLEMENTING', blocked_reason=None, blocked_fingerprint=None,
+            if preserve_stage:
+                resume_status = (checkpoint.snapshot or {}).get('scope_block_resume_status')
+                if resume_status not in runtime_state.ACTIVE_STATUSES:
+                    resume_status = ('REVIEWING' if plan['agent_role'] == 'reviewer'
+                                     else 'VERIFYING' if plan['worker_result'] else 'IMPLEMENTING')
+                if (clean_candidate and (legacy_verify or _saved_verify_matches_candidate(plan, observed.head))
+                        and resume_status not in {'REVIEWING', 'PUBLISHING'}):
+                    resume_status = 'REVIEWING'
+                values = {'last_error': None}
+                if legacy_verify:
+                    definition = DefinitionSnapshot.deserialize(plan['definition_snapshot'])
+                    values['verify_token'] = definition.verify_token(
+                        str(plan['active_sha']), observed.head, str(plan['verify_result']))
+            else:
+                resume_status = 'IMPLEMENTING'
+                values = managed_rebase_adoption.revalidation_values(plan['active_sha'])
+                values.pop('phase')
+            values.update(status=resume_status, blocked_reason=None, blocked_fingerprint=None,
                           blocked_worktree_fingerprint=None, blocked_review_fingerprint=None)
             updated = runtime.update_plan(repo, plan_id, plan_values=values, enqueue=False)
             runtime.hydrate_snapshot(repo, updated)

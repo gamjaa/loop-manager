@@ -4,6 +4,13 @@ from types import SimpleNamespace
 import unittest
 from pathlib import Path
 from unittest import mock
+from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
+from loop_manager_internal.execution.execution_runtime import (
+    ExecutionOutcome,
+    ExecutionOutcomeKind,
+    ExecutionPhase,
+    ExecutionPhaseCoordinator,
+)
 
 import loop_manager
 from loop_manager_internal.recovery import scoped_blocking
@@ -15,6 +22,184 @@ from tests.support.scoped_recovery import CurrentRebaseBlockFixture
 
 
 class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
+    def test_ignored_plan_release_continues_after_saved_verify_without_rerunning(self):
+        self._assert_saved_verify_resume(legacy=False)
+
+    def test_legacy_ignored_plan_release_migrates_audited_verify_without_rerunning(self):
+        self._assert_saved_verify_resume(legacy=True)
+
+    def test_ignored_plan_release_keeps_dirty_verified_candidate_in_verifying(self):
+        self._assert_saved_verify_resume(legacy=False, dirty=True)
+
+    def test_legacy_verify_resumes_with_definition_commit_different_from_base(self):
+        self._assert_saved_verify_resume(legacy=True, definition_revision='submitted-definition')
+
+    def _assert_saved_verify_resume(self, *, legacy, dirty=False, definition_revision='base'):
+        if not dirty:
+            self.current = replace(self.current, dirty={})
+        start = replace(self.before, dirty={'cache.bin': (('untracked',), 'old')})
+        result = replace(self.current, dirty={**self.current.dirty,
+                                             'cache.bin': (('untracked',), 'result')},
+                         worktrees=self.before.worktrees)
+        definition = DefinitionSnapshot(
+            revision_sha='base', path='docs/plans/[G-047] Runtime.md',
+            title='Runtime', sources=('docs/PRODUCT.md',), depends_on=(),
+            complexity='medium', risk='medium', priority='normal',
+            body_hash='body', source_fingerprint='source', archive_candidates=(),
+        )
+        loop_manager.runtime_state.RuntimeStateRepository(self.connection).update_project(
+            'repo', {
+                'phase': 'VERIFYING', 'active_sha': 'base',
+                'validated_base_sha': 'base', 'worker_result': 'saved worker',
+                'verify_result': 'saved verify', 'definition_snapshot': definition.serialize(),
+                'verify_token': definition.verify_token(
+                    'base', self.current.head, None if legacy else 'saved verify',
+                ),
+            }, enqueue=False,
+        )
+        if legacy:
+            from loop_manager_internal.storage.validation_feedback_state import ValidationFeedbackRepository
+            ValidationFeedbackRepository(self.connection).record_result(
+                'repo', 'G-047', definition_revision, 'verify', 'success', 'saved verify')
+        self.connection.execute(
+            "UPDATE exec_plans SET agent_snapshot = ?, agent_result_snapshot = ?, current_revision_sha = ?",
+            (start.serialize(), result.serialize(), definition_revision),
+        )
+        self.connection.commit()
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan('repo', 'G-047', reason_code='managed_worktree_scope_violation',
+                           evidence='legacy ignored cache', release_fingerprint='same')
+        block = scoped_blocking.plan_block(self.connection, 'repo', 'G-047')
+
+        def normalize(_worktree, saved, _current, **_options):
+            return replace(saved, dirty={key: value for key, value in saved.dirty.items()
+                                         if key != 'cache.bin'})
+
+        with mock.patch.object(loop_manager, '_normalize_legacy_ignored_snapshot', side_effect=normalize):
+            self.assertTrue(loop_manager._reconcile_scope_baseline_plan_block(
+                self.connection, self.repo_path, Path('/state'), 'repo', block))
+
+        resumed = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual(resumed['status'], 'VERIFYING' if dirty else 'REVIEWING')
+        self.assertEqual((resumed['verify_result'], resumed['verify_token']),
+                         ('saved verify', definition.verify_token(
+                             'base', self.current.head, 'saved verify',
+                         )))
+        self.assertEqual(resumed['agent_result_snapshot'], result.serialize())
+
+        if dirty:
+            return
+        if legacy:
+            from loop_manager_internal.execution.execution_revision import (
+                StageArtifacts, decide_revision_gate)
+            decision = decide_revision_gate(
+                phase='REVIEWING', previous=definition, current=definition,
+                active_base_token='base', current_base_token='base',
+                candidate_head=self.current.head,
+                artifacts=StageArtifacts(
+                    manual_submission=True, verify_result=True,
+                    verify_output=resumed['verify_result'], verify_token=resumed['verify_token']))
+            self.assertEqual(decision.phase, 'REVIEWING')
+        context = SimpleNamespace(phase=ExecutionPhase(resumed['status']))
+        phase_outcome = ExecutionOutcome(ExecutionOutcomeKind.SUCCESS)
+        ports = SimpleNamespace(
+            guard=mock.Mock(return_value=context),
+            work_started=mock.Mock(),
+            run=mock.Mock(return_value=phase_outcome),
+            verify=mock.Mock(return_value=phase_outcome),
+            review=mock.Mock(return_value=phase_outcome),
+            publish=mock.Mock(return_value=phase_outcome),
+        )
+        ExecutionPhaseCoordinator(ports).dispatch(context)
+        ports.verify.assert_not_called()
+        ports.review.assert_called_once_with(context)
+
+    def test_legacy_verify_requires_clean_snapshots_and_latest_matching_success(self):
+        from loop_manager_internal.storage.validation_feedback_state import ValidationFeedbackRepository
+        definition = DefinitionSnapshot(
+            revision_sha='base', path='docs/plans/[G-047] Runtime.md', title='Runtime',
+            sources=('docs/PRODUCT.md',), depends_on=(), complexity='medium',
+            risk='medium', priority='normal', body_hash='body', source_fingerprint='source',
+            archive_candidates=())
+        plan = dict(repo='repo', plan_id='G-047', active_sha='base', validated_base_sha='base',
+                    current_revision_sha='submitted-definition',
+                    definition_snapshot=definition.serialize(), verify_result='saved verify',
+                    verify_token=definition.verify_token('base', self.before.head))
+        proof = loop_manager.project_block_service._legacy_verify_matches_candidate
+        clean = replace(self.current, dirty={})
+        self.assertFalse(proof(self.connection, plan, self.before, clean, clean))
+        audit = ValidationFeedbackRepository(self.connection)
+        audit.record_result('repo', 'G-047', 'submitted-definition', 'verify', 'success', 'saved verify')
+        self.assertTrue(proof(self.connection, plan, self.before, clean, clean))
+        audit.record_result('repo', 'G-047', 'base', 'verify', 'success', 'saved verify')
+        self.assertFalse(proof(self.connection, plan, self.before, clean, clean))
+        audit.record_result('repo', 'G-047', 'submitted-definition', 'verify', 'success', 'saved verify')
+        self.assertFalse(proof(self.connection, plan, self.before, self.current, self.current))
+        self.assertFalse(proof(self.connection, plan, self.before, self.current, clean))
+        self.assertFalse(proof(self.connection, plan, self.before, clean, self.current))
+        self.assertFalse(proof(self.connection, plan, self.before, clean, replace(clean, head='other')))
+        audit.record_result('repo', 'G-047', 'other', 'verify', 'success', 'saved verify')
+        self.assertFalse(proof(self.connection, plan, self.before, clean, clean))
+        audit.record_result('repo', 'G-047', 'submitted-definition', 'verify', 'success', 'replaced output')
+        self.assertFalse(proof(self.connection, plan, self.before, clean, clean))
+        audit.record_result('repo', 'G-047', 'submitted-definition', 'verify', 'failure', 'saved verify')
+        self.assertFalse(proof(self.connection, plan, self.before, clean, clean))
+
+    def test_saved_verify_success_token_does_not_cover_replaced_failure_output(self):
+        definition = DefinitionSnapshot(
+            revision_sha='base', path='docs/plans/[G-047] Runtime.md',
+            title='Runtime', sources=('docs/PRODUCT.md',), depends_on=(),
+            complexity='medium', risk='medium', priority='normal',
+            body_hash='body', source_fingerprint='source', archive_candidates=(),
+        )
+        plan = {
+            'active_sha': 'base',
+            'validated_base_sha': 'base',
+            'verify_result': 'failed output from resumed verify',
+            'verify_token': definition.verify_token(
+                'base', self.current.head, 'prior successful output',
+            ),
+            'definition_snapshot': definition.serialize(),
+        }
+
+        self.assertFalse(loop_manager.project_block_service._saved_verify_matches_candidate(
+            plan, self.current.head,
+        ))
+
+    def test_ignored_plan_release_preserves_stage_with_proven_invocation_isolation(self):
+        start = replace(self.before, dirty={'cache.bin': (('untracked',), 'old')})
+        result = replace(self.current, dirty={**self.current.dirty,
+                                             'cache.bin': (('untracked',), 'result')},
+                         worktrees=self.before.worktrees)
+        self.connection.execute("UPDATE exec_plans SET status = 'REVIEWING', "
+                                "agent_snapshot = ?, agent_result_snapshot = ?, "
+                                "verify_result = 'saved verify', verify_token = 'saved token'",
+                                (start.serialize(), result.serialize()))
+        self.connection.commit()
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan('repo', 'G-047', reason_code='managed_worktree_scope_violation',
+                           evidence='legacy ignored cache', release_fingerprint='same')
+        block = scoped_blocking.plan_block(self.connection, 'repo', 'G-047')
+        # This test isolates classification from the separately tested Git rule proof.
+        def normalize(_worktree, saved, _current, **_options):
+            return replace(saved, dirty={key: value for key, value in saved.dirty.items()
+                                         if key != 'cache.bin'})
+        with mock.patch.object(loop_manager, '_normalize_legacy_ignored_snapshot', side_effect=normalize):
+            observed = self.current
+            self.current = replace(observed, refs={**observed.refs,
+                'refs/heads/loop-manager/G-047': ('foreign', '')})
+            self.assertFalse(loop_manager._reconcile_scope_baseline_plan_block(
+                self.connection, self.repo_path, Path('/state'), 'repo', block))
+            self.assertEqual(dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-047')),
+                             dict(block))
+            self.current = observed
+            self.assertTrue(loop_manager._reconcile_scope_baseline_plan_block(
+                self.connection, self.repo_path, Path('/state'), 'repo', block))
+        resumed = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual((resumed['status'], resumed['verify_result'], resumed['verify_token']),
+                         ('REVIEWING', 'saved verify', 'saved token'))
+        self.assertEqual(resumed['agent_result_snapshot'], result.serialize())
+
     def test_related_plan_document_scope_block_resumes_without_discarding_worker(self):
         related_plan = 'docs/plans/[G-060] Project Root Placement Policy and Inventory.md'
         self.current = replace(self.current, dirty={
