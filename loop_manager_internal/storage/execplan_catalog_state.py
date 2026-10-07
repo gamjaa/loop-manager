@@ -779,6 +779,8 @@ class DefinitionStateRepository:
                 entries = dict(pinned.snapshot.all)
                 entries.update({entry.plan_id: entry for entry in pinned.recovery_definitions})
                 for plan_id, entry in entries.items():
+                    from . import verify_input_requests
+                    verify_input_requests.validate(self.connection, repo, entry.text, entry.sources)
                     row = self.connection.execute(
                         "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
                         (repo, plan_id),
@@ -1086,6 +1088,13 @@ class CatalogReconciliationService:
         # Validate new declarations before deletion-goal holds remove them from
         # the executable catalog. Recovery registration uses the same rules.
         new_issues = list(new_declaration_issues(pinned, stored_ids))
+        from . import verify_input_requests
+        for entry in pinned.snapshot.all.values():
+            try:
+                verify_input_requests.validate(self.repository.connection, repo, entry.text, entry.sources)
+            except RuntimeError as error:
+                new_issues.append(CatalogIssue(entry.plan_id, entry.path,
+                    "unregistered-manager-source", str(error), "manager:verify-inputs"))
         rows_by_id = {row.plan_id: row for row in expected.rows}
         for key, entry in pinned.snapshot.active.items():
             row = rows_by_id.get(key)

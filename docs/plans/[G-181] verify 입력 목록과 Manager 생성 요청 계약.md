@@ -38,6 +38,12 @@ priority: high
 - [ ] 구현 및 관련 targeted unit 검증
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
+## Implementation Notes
+
+- version 1 해석·파일 관측·bounded completeness token은 `verification/inputs.py`, 실제 명령/환경 전달은 `manager_adapter.observe_inputs`에 분리했다. 성공 저장·재사용 실행 gate는 G-182/G-183 범위로 유지한다.
+- 일반 planning prompt에서 고정된 최신 원격 base의 목록과 기존 관련 계획/draft/PR을 확인하며, additive 요청 registry와 catalog/Planner 검증으로 예약어의 실제 요청·목적·규칙 버전을 결합한다.
+- 이 저장소의 입력 목록은 runner의 compile/discovery, 테스트 support가 읽는 원본·문서·Skill·설정·실행 스크립트를 포함한다. 외부 Python/Git/OS·환경 입력은 별도 관측 identity가 없으면 재사용할 수 없다.
+
 ## Decision Log
 
 - 프로젝트 입력·source·planning 요청의 결합으로 complexity high, 누락된 검증 입력 영향으로 risk high다. 예약어는 이번 계획의 source로 자체 생성하지 않고 R-072를 구현 근거로 사용한다.

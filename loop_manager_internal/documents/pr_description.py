@@ -117,6 +117,7 @@ def build_pr_body(
     sources = plan["sources"]
     assert isinstance(sources, list)
     source_lines = [
+        f"- `{source}` (Manager verify 입력 목록 유지 규칙 v1)" if source == "manager:verify-inputs" else
         f"- [{source}]({effects.immutable_github_blob_url(origin_url, plan_sha, str(source))})"
         for source in sources
     ]

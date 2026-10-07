@@ -25,6 +25,14 @@
   않는다. ExecPlan 생성·수정은 위 mode·snapshot 범위에서 수행한다. 사용자에게 문서 draft를
   요청받은 호출에서는 지정된 문서의 수정안을 결과로만 반환한다.
 
+## Manager 입력 목록 생성 요청
+
+일반 planning(일반 계획을 포함한 유지보수 호출 포함)에 실제 Manager 누락 요청이 전달된
+경우에만 `manager:verify-inputs` source를 사용할 수 있다. 요청 선언·규칙 버전과 정확한
+Purpose를 유지하고 전체 프로젝트 구조·실제 verify 명령을 확인하는 생성 계획 하나만
+작성한다. 기존 미완료 계획·draft·미Merge PR과 중복하지 않으며 예약어를 제품 목표 근거나
+문서 조회·Requirement retirement 대상으로 사용하지 않는다.
+
 ## 구조 평가
 
 첫 정상 파일별 구조 평가와 이동 계획에서는 모든 루트 항목의 실제 참조·사용자 경로·

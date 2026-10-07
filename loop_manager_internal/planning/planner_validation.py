@@ -255,6 +255,14 @@ def validate_planner_result(
             raise PlannerValidationError(
                 f"Planner ExecPlan을 읽을 수 없습니다: {changed_path} ({error})"
             ) from error
+        from loop_manager_internal.storage import verify_input_requests
+        if any(str(source).startswith("manager:") for source in parsed["sources"]):
+            if connection is None or repo is None:
+                raise PlannerValidationError("Manager source requires registered request context")
+            try:
+                verify_input_requests.validate(connection, repo, planner_text, parsed["sources"])
+            except RuntimeError as error:
+                raise PlannerValidationError(str(error)) from error
         try:
             original = snapshot.by_id.get(str(parsed["id"]))
             execplan_drafts.validate_agent_change(parsed, original.text if original else None)

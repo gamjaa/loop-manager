@@ -333,7 +333,8 @@ class _GitCatalogDefinitionPort:
             if entry.draft_metadata and (entry.draft_metadata.get("draft") or entry.draft_metadata.get("draft_question")):
                 decision_sources.update(entry.sources)
                 decision_sources.update(("docs/PRODUCT.md", "docs/ARCHITECTURE.md"))
-        draft_inputs = {path: execplan_drafts.content_digest(self._effects.git_bytes(
+        from loop_manager_internal.catalog.manager_sources import SOURCE, source_content
+        draft_inputs = {path: execplan_drafts.content_digest(source_content(path).encode()) if path == SOURCE else execplan_drafts.content_digest(self._effects.git_bytes(
             self.repo, "show", f"{revision_sha}:{path}")) if path in regular_paths else None
             for path in sorted(decision_sources)}
         remote_url = None

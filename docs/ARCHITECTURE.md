@@ -447,6 +447,30 @@ Codex가 Agent turn 추적을 위해 자동 생성·갱신·정리하는 `refs/c
 
 Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내장 쓰기 제한과 granular 자동 승인 검토를 유지한다. Reviewer는 읽기 전용이고 테스트·verify 재실행 금지는 별도의 역할 지침으로 유지한다. Codex 프로세스 전체를 감싸는 바깥 sandbox와 중첩 sandbox 호환성은 호출 조건이 아니며, 정상 session·로그 저장을 Agent의 workspace 밖 쓰기 권한과 구분한다
 
+## Verify 입력 관측과 생성 요청
+
+`verification/inputs.py`는 version 1 목록과 작업 파일을 관측하고 `manager_adapter.observe_inputs`
+경계로 제공한다. POSIX 상대 경로를 대소문자 구분하여 해석하며 `*`·`?`는 한 경로 segment,
+독립된 `**` segment는 0개 이상의 segment와 일치한다. 숨김 파일도 포함한다. 절대 경로·
+상위 이동·역슬래시·문자 class·중복 key/경로·미지원 버전은 거부하며 literal 누락은 오류,
+glob의 빈 결과는 관측 가능한 빈 집합이다. 목록 자체와 실제 파일의 경로·내용·kind·mode,
+실제 명령·환경·측정한 runtime·Git/외부 입력 identity를 결합한다. symlink를 따라가지 않으며
+확인되지 않은 입력은 재사용할 수 없다. Git 내부·bytecode는 생성물이고 `.venv`는 별도로
+측정한 runtime/외부 의존성 identity로 확인한다.
+
+목록 밖 파일은 경로·내용·kind·mode 및 검증 설정에 결합한 completeness token으로 제한된
+제외 검토가 필요하다. verify 성공은 이 근거를 만들지 않는다. 관측 API는 실행·성공 저장·
+재사용 정책과 분리하며, 목록 부재/오류는 기존 전체 verify를 유지한다.
+
+일반 planning의 prompt 준비는 최신 `origin/<base>`의 고정 revision과 실제 목록을 조회한다.
+오래된 planning branch는 새 누락 요청을 만들지 않는다. 원격 활성 계획(draft 포함)과 SQLite의
+미종료 계획(PR 포함)에 관련 작업이 있으면 요청을 생략한다. Manager 요청은 additive SQLite
+`verify_input_requests`에 프로젝트·revision·목적·규칙 원문/버전을 보존하며 같은 요청을 재사용한다.
+`manager:verify-inputs` 계획은 요청 선언과 정확한 생성 Purpose를 유지해야 한다. Planner 결과와
+원격 catalog 등록에서 실제 등록 요청과 대조하며 임의 예약어·제품 목표 혼합을 거부한다.
+예약어는 문서 조회와 Requirement retirement에서 제외하고 규칙 내용을 source 지문에 결합한다.
+이는 성공 결과 재사용이나 일반 runner 도입을 구현하지 않는다.
+
 ## Architecture Change Policy
 
 다음 변경은 ExecPlan을 BLOCKED로 만들고 사용자 승인을 받은 뒤 진행한다.

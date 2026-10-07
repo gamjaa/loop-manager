@@ -25,6 +25,8 @@ class PlanningValidationPortsEffects:
     validate_maintenance_planner_result: Callable[..., object]
     validate_maintenance_publication_base: Callable[..., object]
     validate_planner_result: Callable[..., object]
+    git: Callable[..., object] | None = None
+    git_bytes: Callable[..., bytes] | None = None
 
 
 class _PlanningValidationPorts:
@@ -89,7 +91,21 @@ class _PlanningValidationPorts:
                 )
                 if candidate is not None:
                     prompt += document_publication.planning_instruction(candidate)
+                    return prompt  # This call is reserved for the approved document draft.
+        prompt += self._verify_request_prompt(mutable_snapshot.repo, mutable_snapshot.active_sha)
         return prompt
+
+    def _verify_request_prompt(self, repo: str, active_sha: str) -> str:
+        if self._effects.git is None or self._effects.git_bytes is None:
+            return ""
+        project = self._connection.execute(
+            "SELECT base_branch FROM projects WHERE repo = ?", (repo,),
+        ).fetchone()
+        if project is None:
+            return ""
+        from loop_manager_internal.planning.verify_input_request import instruction
+        return instruction(self._connection, repo, str(project["base_branch"]), active_sha,
+                           git=self._effects.git, git_bytes=self._effects.git_bytes)
 
     def maintenance_prompt(
         self,
@@ -100,13 +116,16 @@ class _PlanningValidationPorts:
         *,
         include_general_planning: bool,
     ) -> str:
-        return self._effects.maintenance_planner_prompt(
+        prompt = self._effects.maintenance_planner_prompt(
             context,
             catalog,
             change_context,
             error,
             include_general_planning=include_general_planning,
         )
+        if include_general_planning:
+            prompt += self._verify_request_prompt(context.repo, context.active_sha)
+        return prompt
 
     def validate_general_result(
         self,

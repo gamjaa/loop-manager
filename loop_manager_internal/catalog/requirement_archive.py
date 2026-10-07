@@ -46,7 +46,7 @@ def stored_requirement_sources(rows) -> tuple[str, ...]:
                 f"ExecPlan {plan_id}의 SQLite source를 해석할 수 없습니다."
             )
         for source in stored:
-            if source == "docs/PRODUCT.md":
+            if source in {"docs/PRODUCT.md", "manager:verify-inputs"}:
                 continue
             if re.fullmatch(r"docs/requirements/[^/\\]+\.md", source) is None:
                 raise ArchiveSnapshotError(

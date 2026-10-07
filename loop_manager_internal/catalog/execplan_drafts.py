@@ -17,7 +17,8 @@ def content_digest(content: bytes) -> str:
 
 def input_digests(root: Path, plan: Mapping[str, object]) -> dict[str, str | None]:
     paths = set(plan["sources"]) | {"docs/PRODUCT.md", "docs/ARCHITECTURE.md"}
-    return {path: content_digest((root / path).read_bytes()) if (root / path).is_file() else None
+    from loop_manager_internal.catalog.manager_sources import SOURCE, source_content
+    return {path: content_digest(source_content(path).encode()) if path == SOURCE else content_digest((root / path).read_bytes()) if (root / path).is_file() else None
             for path in sorted(paths)}
 
 

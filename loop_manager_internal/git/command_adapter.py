@@ -112,6 +112,9 @@ def revision_path_exists(git: Callable[..., object], repo: Path,
 def revision_document_or_none(git: Callable[..., object], repo: Path,
                               revision: str, path: str) -> str | None:
     """Read a revision path; only a successful tree query can prove absence."""
+    if path.startswith("manager:"):
+        from loop_manager_internal.catalog.manager_sources import source_content
+        return source_content(path)
     try:
         shown = git(repo, "show", f"{revision}:{path}")
     except GitLockError:
