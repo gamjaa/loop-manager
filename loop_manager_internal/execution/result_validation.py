@@ -688,8 +688,9 @@ def parse_worker_result(effects: ParseWorkerResultEffects, message: str, plan: d
         for index, item in enumerate(labels) if item.group(1) != "WORKER_OUTCOME"
     }
     title, summary, test_evidence = (fields[key] for key in markers[:3])
-    if "\n" in title:
-        raise WorkerResultError("Worker commit 제목은 한 줄이어야 합니다.")
+    # A wrapped title is still one declared field. Fold its whitespace before
+    # passing it to Git so formatting alone does not trigger a Worker retry.
+    title = " ".join(title.split())
     if not title:
         raise WorkerResultError("Worker commit 제목이 비어 있습니다.")
     if not summary:

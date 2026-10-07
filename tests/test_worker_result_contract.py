@@ -7,6 +7,24 @@ from tests.support.worker import worker_result
 class WorkerResultContractTest(unittest.TestCase):
     plan = {"id": "G-008", "title": "Descriptive Worker Commits"}
 
+    def test_korean_inflected_test_success_is_recognized_without_accepting_negation(self):
+        message = worker_result(
+            "Recognize Korean test evidence",
+            "Accept ordinary Korean success wording.",
+            "29개 targeted unit case 통과했습니다.",
+        )
+        publication = loop_manager.parse_worker_result(message, self.plan)
+        self.assertIn("통과했습니다", publication.test_evidence)
+        with self.assertRaises(loop_manager.WorkerResultError):
+            loop_manager.parse_worker_result(
+                worker_result(
+                    "Reject negative Korean test evidence",
+                    "A negated result is not a successful test.",
+                    "targeted unit test 통과하지 못했습니다.",
+                ),
+                self.plan,
+            )
+
     def test_worker_result_fixture_satisfies_new_and_publication_contracts(self):
         message = worker_result(
             "Store immutable plan links", "Adds immutable PR context.",
@@ -29,6 +47,14 @@ class WorkerResultContractTest(unittest.TestCase):
         self.assertEqual(publication.commit_title, "Store immutable plan links")
         self.assertEqual(publication.summary, "Adds immutable PR context.")
         self.assertEqual(publication.test_evidence, "test_one: PASS")
+        wrapped_title = loop_manager.parse_worker_result(
+            'WORKER_OUTCOME: {"kind":"ready_for_validation"}\n'
+            'COMMIT_TITLE: Normalize result\nformat without retry\n'
+            'PR_SUMMARY: Accept the same title with folded whitespace.\n'
+            'TARGETED_TESTS: parser case: PASS',
+            self.plan,
+        )
+        self.assertEqual(wrapped_title.commit_title, "Normalize result format without retry")
         resolved = loop_manager.parse_worker_result(
             worker_result(
                 "Record resolved test evidence",
@@ -85,7 +111,6 @@ class WorkerResultContractTest(unittest.TestCase):
                 "Summary",
                 "test: FAIL",
             ),
-            "COMMIT_TITLE: First line\nsecond line\nPR_SUMMARY: Summary\nTARGETED_TESTS:\ntest: PASS",
             worker_result("Descriptive Worker Commits", "Summary", "test: PASS"),
             worker_result("Implement G-008: Descriptive Worker Commits", "Summary", "test: PASS"),
             worker_result("Update", "Summary", "test: PASS"),
