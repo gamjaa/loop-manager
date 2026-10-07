@@ -45,6 +45,8 @@ priority: high
 - [x] 2026-10-07 검토 보완 후 전체 verify 재실행: 201개 모듈, 3,090개 성공·2개 skip, 종료 코드 0. 같은 G-198 worktree에서 검증했으며 재개 단계·소유권 변경·독립 원인 보존 회귀가 통과함.
 - [x] 2026-10-07 review delta 보완: 저장 verify의 base·정의·후보 token 증명 시 차단 재개를 REVIEWING으로 이어가도록 보완하고, 해당 targeted unit 1개 통과.
 - [x] 2026-10-07 추가 review delta 보완: verify 재호출 전 이전 성공 표식을 지우고, 통과한 호출의 후보·출력 결합 token을 scope 검사 전에 저장함. 저장 출력이 token과 다르면 차단 재개에서 완료 검증으로 인정하지 않으며 관련 targeted unit 7개 통과.
+- [x] 2026-10-07 재개 세션 review delta 보완: verify 성공 token은 권위 있는 미커밋 변경이 없는 동일 HEAD에만 발급하며 혼합 scope 차단은 VERIFYING에서 기존 commit·재검증을 유지함. 구형 token은 깨끗한 저장·현재 snapshot과 최신 성공 감사의 definition·출력을 확인하고 해제 transaction에서 재확인한 뒤 출력 결합 token으로 전환함. 현재 후보의 관련 unit 경계 84개, 보완 후 직접 관련 case 5개 통과. 새 fixture의 Mock 구성 오류 두 차례를 수정하고 동일 명령 최종 통과; 전체 verify는 실행하지 않음.
+- [x] 2026-10-07 결과 보고 재검증: 현재 worktree의 dirty 후보 증거 거부·구형 token 재개·stale token·빈 출력 직접 관련 unit case 8개를 다시 실행해 모두 통과함. 이전 보고의 명령 앞 실패 설명이 결과 계약에서 미대응 실패로 해석됨을 확인했고, 제품의 실패 검사 정책은 변경하지 않음.
 - [ ] 사용자 Merge
 
 ## Decision Log

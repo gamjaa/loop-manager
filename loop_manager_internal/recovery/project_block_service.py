@@ -95,6 +95,27 @@ def _saved_verify_matches_candidate(plan: sqlite3.Row, candidate_head: str) -> b
         active_sha, candidate_head, str(plan['verify_result'])))
 
 
+def _legacy_verify_matches_candidate(connection, plan, start, result, current) -> bool:
+    """Migrate a legacy marker only with matching immutable success evidence."""
+    if (result.dirty or current.dirty or start.head != result.head
+            or result.head != current.head or not plan['definition_snapshot']
+            or plan['validated_base_sha'] != plan['active_sha']):
+        return False
+    definition = DefinitionSnapshot.deserialize(plan['definition_snapshot'])
+    if (definition is None or plan['verify_result'] is None
+            or plan['verify_token'] != definition.verify_token(
+                str(plan['active_sha']), current.head)):
+        return False
+    audit = connection.execute(
+        "SELECT classification, raw_output, definition_revision FROM validation_results "
+        "WHERE repo = ? AND plan_id = ? AND stage = 'verify' ORDER BY id DESC LIMIT 1",
+        (plan['repo'], plan['plan_id']),
+    ).fetchone()
+    return bool(audit and audit['classification'] == 'success'
+                and audit['raw_output'] == str(plan['verify_result'])
+                and audit['definition_revision'] == definition.revision_sha)
+
+
 @dataclass(frozen=True)
 class ReconcileRebaseEvidenceBlockEffects:
     """Named effects for _reconcile_rebase_evidence_block; no entry-point/module access."""
@@ -231,6 +252,8 @@ def _reconcile_scope_baseline_plan_block(effects: ReconcileScopeBaselinePlanBloc
         observed = observe()
         # Legacy ignored evidence must not invalidate already completed stages.
         preserve_stage = False
+        legacy_verify = False
+        clean_candidate = False
         if plan['agent_result_snapshot']:
             start = GitSnapshot.deserialize(plan['agent_snapshot'])
             result = GitSnapshot.deserialize(plan['agent_result_snapshot'])
@@ -246,12 +269,19 @@ def _reconcile_scope_baseline_plan_block(effects: ReconcileScopeBaselinePlanBloc
                 result_scope, current_scope = agent_scope_decision.scoped_metadata(
                     result_view, observed, resources)
                 preserve_stage = result_scope == current_scope
+                clean_candidate = not result_scope.dirty and not current_scope.dirty
+                if preserve_stage and clean_candidate:
+                    legacy_verify = _legacy_verify_matches_candidate(
+                        connection, plan, start, result_scope, current_scope)
         with runtime_state._transaction(connection):
             if (dict(connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
                                          (repo, plan_id)).fetchone()) != dict(plan)
                     or dict(connection.execute('SELECT * FROM projects WHERE repo = ?', (repo,)).fetchone()) != dict(project)
                     or checkpoints.get(repo, plan_id) != checkpoint or observe() != observed):
                 raise AgentScopeError('scope 차단 해제 중 소유 상태가 변경됐습니다.')
+            if legacy_verify and not _legacy_verify_matches_candidate(
+                    connection, plan, start, result_scope, current_scope):
+                raise AgentScopeError('scope 차단 해제 중 저장 verify 감사가 변경됐습니다.')
             scoped_blocking.clear_revalidated_rebase_block(connection, block, is_plan_block=True)
             recovery_state.RecoveryRepository(connection).resolve_rebase_block(repo, plan_id, block)
             checkpoints.record(repo, plan_id, expected_generation=checkpoint.generation,
@@ -267,10 +297,14 @@ def _reconcile_scope_baseline_plan_block(effects: ReconcileScopeBaselinePlanBloc
                 if resume_status not in runtime_state.ACTIVE_STATUSES:
                     resume_status = ('REVIEWING' if plan['agent_role'] == 'reviewer'
                                      else 'VERIFYING' if plan['worker_result'] else 'IMPLEMENTING')
-                if (_saved_verify_matches_candidate(plan, observed.head)
+                if (clean_candidate and (legacy_verify or _saved_verify_matches_candidate(plan, observed.head))
                         and resume_status not in {'REVIEWING', 'PUBLISHING'}):
                     resume_status = 'REVIEWING'
                 values = {'last_error': None}
+                if legacy_verify:
+                    definition = DefinitionSnapshot.deserialize(plan['definition_snapshot'])
+                    values['verify_token'] = definition.verify_token(
+                        str(plan['active_sha']), observed.head, str(plan['verify_result']))
             else:
                 resume_status = 'IMPLEMENTING'
                 values = managed_rebase_adoption.revalidation_values(plan['active_sha'])

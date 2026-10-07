@@ -23,6 +23,17 @@ from tests.support.scoped_recovery import CurrentRebaseBlockFixture
 
 class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
     def test_ignored_plan_release_continues_after_saved_verify_without_rerunning(self):
+        self._assert_saved_verify_resume(legacy=False)
+
+    def test_legacy_ignored_plan_release_migrates_audited_verify_without_rerunning(self):
+        self._assert_saved_verify_resume(legacy=True)
+
+    def test_ignored_plan_release_keeps_dirty_verified_candidate_in_verifying(self):
+        self._assert_saved_verify_resume(legacy=False, dirty=True)
+
+    def _assert_saved_verify_resume(self, *, legacy, dirty=False):
+        if not dirty:
+            self.current = replace(self.current, dirty={})
         start = replace(self.before, dirty={'cache.bin': (('untracked',), 'old')})
         result = replace(self.current, dirty={**self.current.dirty,
                                              'cache.bin': (('untracked',), 'result')},
@@ -39,10 +50,14 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
                 'validated_base_sha': 'base', 'worker_result': 'saved worker',
                 'verify_result': 'saved verify', 'definition_snapshot': definition.serialize(),
                 'verify_token': definition.verify_token(
-                    'base', self.current.head, 'saved verify',
+                    'base', self.current.head, None if legacy else 'saved verify',
                 ),
             }, enqueue=False,
         )
+        if legacy:
+            from loop_manager_internal.storage.validation_feedback_state import ValidationFeedbackRepository
+            ValidationFeedbackRepository(self.connection).record_result(
+                'repo', 'G-047', definition.revision_sha, 'verify', 'success', 'saved verify')
         self.connection.execute(
             "UPDATE exec_plans SET agent_snapshot = ?, agent_result_snapshot = ?",
             (start.serialize(), result.serialize()),
@@ -62,13 +77,26 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
                 self.connection, self.repo_path, Path('/state'), 'repo', block))
 
         resumed = self.connection.execute('SELECT * FROM exec_plans').fetchone()
-        self.assertEqual(resumed['status'], 'REVIEWING')
+        self.assertEqual(resumed['status'], 'VERIFYING' if dirty else 'REVIEWING')
         self.assertEqual((resumed['verify_result'], resumed['verify_token']),
                          ('saved verify', definition.verify_token(
                              'base', self.current.head, 'saved verify',
                          )))
         self.assertEqual(resumed['agent_result_snapshot'], result.serialize())
 
+        if dirty:
+            return
+        if legacy:
+            from loop_manager_internal.execution.execution_revision import (
+                StageArtifacts, decide_revision_gate)
+            decision = decide_revision_gate(
+                phase='REVIEWING', previous=definition, current=definition,
+                active_base_token='base', current_base_token='base',
+                candidate_head=self.current.head,
+                artifacts=StageArtifacts(
+                    manual_submission=True, verify_result=True,
+                    verify_output=resumed['verify_result'], verify_token=resumed['verify_token']))
+            self.assertEqual(decision.phase, 'REVIEWING')
         context = SimpleNamespace(phase=ExecutionPhase(resumed['status']))
         phase_outcome = ExecutionOutcome(ExecutionOutcomeKind.SUCCESS)
         ports = SimpleNamespace(
@@ -82,6 +110,33 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
         ExecutionPhaseCoordinator(ports).dispatch(context)
         ports.verify.assert_not_called()
         ports.review.assert_called_once_with(context)
+
+    def test_legacy_verify_requires_clean_snapshots_and_latest_matching_success(self):
+        from loop_manager_internal.storage.validation_feedback_state import ValidationFeedbackRepository
+        definition = DefinitionSnapshot(
+            revision_sha='base', path='docs/plans/[G-047] Runtime.md', title='Runtime',
+            sources=('docs/PRODUCT.md',), depends_on=(), complexity='medium',
+            risk='medium', priority='normal', body_hash='body', source_fingerprint='source',
+            archive_candidates=())
+        plan = dict(repo='repo', plan_id='G-047', active_sha='base', validated_base_sha='base',
+                    definition_snapshot=definition.serialize(), verify_result='saved verify',
+                    verify_token=definition.verify_token('base', self.before.head))
+        proof = loop_manager.project_block_service._legacy_verify_matches_candidate
+        clean = replace(self.current, dirty={})
+        self.assertFalse(proof(self.connection, plan, self.before, clean, clean))
+        audit = ValidationFeedbackRepository(self.connection)
+        audit.record_result('repo', 'G-047', 'base', 'verify', 'success', 'saved verify')
+        self.assertTrue(proof(self.connection, plan, self.before, clean, clean))
+        self.assertFalse(proof(self.connection, plan, self.before, self.current, self.current))
+        self.assertFalse(proof(self.connection, plan, self.before, self.current, clean))
+        self.assertFalse(proof(self.connection, plan, self.before, clean, self.current))
+        self.assertFalse(proof(self.connection, plan, self.before, clean, replace(clean, head='other')))
+        audit.record_result('repo', 'G-047', 'other', 'verify', 'success', 'saved verify')
+        self.assertFalse(proof(self.connection, plan, self.before, clean, clean))
+        audit.record_result('repo', 'G-047', 'base', 'verify', 'success', 'replaced output')
+        self.assertFalse(proof(self.connection, plan, self.before, clean, clean))
+        audit.record_result('repo', 'G-047', 'base', 'verify', 'failure', 'saved verify')
+        self.assertFalse(proof(self.connection, plan, self.before, clean, clean))
 
     def test_saved_verify_success_token_does_not_cover_replaced_failure_output(self):
         definition = DefinitionSnapshot(

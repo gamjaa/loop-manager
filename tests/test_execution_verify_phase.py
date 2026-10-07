@@ -21,6 +21,7 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestCase):
     def test_successful_verify_saves_candidate_proof_before_scope_block(self):
         self.review_context()
+        self.dirty = False
         self.state.update_project('repo', phase='VERIFYING')
         context = self.handler._context()
         definition = self.handler._snapshot()._definition_snapshot
@@ -44,6 +45,29 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
 
         self.assertIs(outcome, final)
         self.assertEqual(output, 'completed verify output')
+
+    def test_successful_verify_with_dirty_candidate_and_scope_block_has_no_proof(self):
+        for dirty_status in (' M app.py', 'M  app.py', '?? new.py'):
+            with self.subTest(status=dirty_status):
+                self.review_context()
+                self.state.update_project('repo', phase='VERIFYING', verify_token=None,
+                                          validated_base_sha=None)
+                context = self.handler._context()
+                self.effects.validation.verify.side_effect = None
+                self.effects.validation.verify.return_value = (True, 'completed verify output')
+                self.effects.agent.validate_worker_workspace_scope.side_effect = lm.AgentScopeError(
+                    'ignored artifact scope block')
+                original_git = self.git
+                def git(worktree, *args, **kwargs):
+                    if args[:2] == ('status', '--porcelain'):
+                        return SimpleNamespace(stdout=dirty_status)
+                    return original_git(worktree, *args, **kwargs)
+                self.effects.workspace.git.side_effect = git
+                with mock.patch.object(self.handler, '_block_final'), \
+                        mock.patch.object(self.handler, '_final'):
+                    self.handler._verify_once(context, candidate_head='base')
+                self.assertIsNone(self.state.row()['verify_token'])
+                self.assertIsNone(self.state.row()['validated_base_sha'])
 
     def test_failed_verify_scope_block_cannot_reuse_prior_success_token(self):
         self.review_context()

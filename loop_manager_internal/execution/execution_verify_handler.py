@@ -99,7 +99,9 @@ class VerifyHandler:
             observed_head = self.ports.git(
                 context.worktree, 'rev-parse', 'HEAD',
             ).stdout.strip()
-            if observed_head == candidate_head:
+            if (observed_head == candidate_head and not self.ports.git(
+                    context.worktree, 'status', '--porcelain',
+            ).stdout.strip()):
                 self.ports.state.update_project(
                     self.ports.identity.repo,
                     validated_base_sha=context.active_sha,
