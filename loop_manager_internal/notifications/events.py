@@ -678,6 +678,8 @@ def record_process_start(connection, repo, role, identity, *, plan_id=None, resu
 
 
 def record_planning_publication(connection, repo, plans, revision):
+    if not _enabled(connection):
+        return
     from loop_manager_internal.storage import execplan_draft_state
     ordinary = []
     for path, plan in plans:

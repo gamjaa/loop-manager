@@ -675,9 +675,12 @@ Test fallback.
 
         self.assertIn("활성 위치로 되돌리지 않는다", skill)
         self.assertIn("명세 작성 중 활성 Requirement를 완료로 간주해 보관 위치로 옮기지 않는다", skill)
+        self.assertIn("보관 문서의 ID·경로를 다시 쓰거나 원문을 편집용 복사본으로 만들지 않는다", skill)
         self.assertNotIn("마지막 관련 ExecPlan의 구현 PR", agents)
         product = (loop_manager.ROOT / "docs/PRODUCT.md").read_text(encoding="utf-8")
         template = (loop_manager.ROOT / "docs/REQUIREMENT.template.md").read_text(encoding="utf-8")
+        self.assertIn("일반 Planner가 최신 원격 구현", product)
+        self.assertIn("Manager가 원문 그대로 일반 planning 게시에서 Requirement를 이동한다", product)
         self.assertIn("각 Acceptance Criterion", product)
         self.assertIn("일반 planning 게시", product)
         self.assertIn("일반 planning 게시", template)

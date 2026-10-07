@@ -149,6 +149,9 @@ def run_agent(
 
     if connection is not None and invocation is not None:
         notifications.flush_project_events(connection, invocation.repo)
+    has_notification_session = (connection is not None and connection.execute(
+        "SELECT 1 FROM sqlite_temp_master WHERE name = 'notification_session'"
+    ).fetchone() is not None)
     request = AgentRequest(
         worktree=worktree,
         state_dir=state_dir,
@@ -161,7 +164,7 @@ def run_agent(
         session_id=session_id,
         on_session_started=observe_session,
         on_process_started=(observe_process if role_name in {"worker", "planner", "maintenance_planner"}
-                            and connection is not None and invocation is not None else None),
+                            and has_notification_session and invocation is not None else None),
         profile=resolved,
         on_isolation_checked=observe_isolation,
         isolation_snapshot_digest=lambda: hashlib.sha256(

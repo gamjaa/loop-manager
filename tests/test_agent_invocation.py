@@ -833,3 +833,18 @@ class ProcessStartNotificationTests(TestCase):
                     resolved_profile=invocation.ResolvedProfile('model','high'))
         self.assertTrue(calls)
         start.assert_not_called()
+
+    def test_unconfigured_notifications_preserve_provider_invocation_shape(self):
+        outer = self
+        class Provider:
+            def run(self, request):
+                outer.assertIsNone(request.on_process_started)
+                return manager.AgentResult(0, 'done')
+        with mock.patch.object(manager, 'agent_provider', return_value=Provider()):
+            result = manager.run_agent(
+                'codex', Path('/worktree'), self.state_dir, Path('/config'),
+                'planner', 'prompt', read_only=False, connection=self.connection,
+                invocation=invocation.InvocationContext('repo', None),
+                resolved_profile=invocation.ResolvedProfile('model', 'high'),
+            )
+        self.assertEqual(result.code, 0)
