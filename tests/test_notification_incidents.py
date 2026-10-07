@@ -193,7 +193,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
             "SELECT started_operation, resumed_at FROM notified_block_incidents "
             "WHERE id = ?", (first_id,),
         ).fetchone()
-        self.assertIsNone(started["started_operation"])
+        self.assertEqual(started["started_operation"], "Planner")
         self.assertIsNone(started["resumed_at"])
         self.assertEqual(len([row for row in self.events(connection)
                               if row["event_type"] == "work_started"]), 1)
@@ -1106,6 +1106,23 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
 
 
 class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
+    def test_unsent_planner_start_keeps_new_episode_and_generic_notice(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        loop_manager.update_project(connection, repo, planning_error='same cause')
+        loop_manager.update_project(connection, repo, planning_error=None)
+        with connection:
+            notifications.record_process_start(connection, repo, 'planner', 'planner-start')
+            notifications.record_process_start(connection, repo, 'planner', 'planner-start')
+        loop_manager.update_project(connection, repo, planning_error='same cause')
+        self.assertEqual(connection.execute(
+            "SELECT COUNT(*) FROM notified_block_incidents WHERE subject = 'planning'"
+        ).fetchone()[0], 2)
+        starts = [row for row in self.events(connection) if row['event_type'] == 'work_started']
+        self.assertEqual(len(starts), 1)
+        self.assertEqual(json.loads(starts[0]['payload'])['operation'], 'Planner')
+        self.assertFalse(any(row['event_type'] == 'resumed' for row in self.events(connection)))
+
     def test_unsent_released_block_does_not_suppress_physical_starts(self):
         for failed_send in (False, True):
             with self.subTest(failed_send=failed_send):
@@ -1126,7 +1143,7 @@ class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
                 self.assertEqual(len(starts), 2)
                 self.assertFalse(any(row['event_type'] == 'resumed' for row in self.events(connection)))
                 incident = connection.execute('SELECT started_operation FROM notified_block_incidents').fetchone()
-                self.assertIsNone(incident[0])
+                self.assertEqual(incident[0], 'Worker')
 
     def test_failed_inflight_block_send_materializes_start_without_resume(self):
         connection = self.connection()

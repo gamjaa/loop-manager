@@ -273,7 +273,7 @@ def record_work_start(
     connection: sqlite3.Connection, repo: str, operation: str,
     *, plan_id: str | None = None, start_identity: str | None = None,
 ) -> int:
-    """Record a real start for confirmed or in-flight block incidents."""
+    """Preserve real starts; enqueue resumption only for confirmed notices."""
 
     tables = {
         str(row[0]) for row in connection.execute(
@@ -335,16 +335,6 @@ def record_work_start(
                     "UPDATE notified_block_incidents SET resumed_at = CURRENT_TIMESTAMP "
                     "WHERE id = ? AND resumed_at IS NULL", (row[0],),
                 )
-                continue
-            observed = connection.execute(
-                "SELECT 1 FROM notified_block_incidents i WHERE i.id = ? AND "
-                "(i.confirmed_before > 0 OR EXISTS (SELECT 1 FROM block_notice_events b "
-                "JOIN notification_outbox o ON o.event_key = b.event_key "
-                "WHERE b.incident_id = i.id AND (o.confirmed_pieces > 0 OR "
-                "(o.delivery_started_at IS NOT NULL AND o.sent_at IS NULL))))",
-                (row[0],),
-            ).fetchone()
-            if observed is None:
                 continue
             connection.execute(
                 "UPDATE notified_block_incidents SET started_operation = ?, start_identity = ?, started_at = "
