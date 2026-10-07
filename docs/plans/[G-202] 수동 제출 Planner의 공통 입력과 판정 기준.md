@@ -5,7 +5,16 @@ sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-052] Worker Classification and Initial Level Calibration.md
   - docs/requirements/[R-077] Manual Plan Work Start and Completion.md
-depends_on: []
+depends_on:
+  - G-208
+  - G-209
+  - G-210
+  - G-211
+  - G-212
+  - G-213
+  - G-215
+  - G-216
+  - G-217
 complexity: low
 risk: medium
 priority: normal

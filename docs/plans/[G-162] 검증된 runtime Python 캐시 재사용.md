@@ -4,7 +4,16 @@ title: 검증된 runtime Python 캐시 재사용
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-059] Safe Python Bytecode Cache Use.md
-depends_on: []
+depends_on:
+  - G-208
+  - G-209
+  - G-210
+  - G-211
+  - G-212
+  - G-213
+  - G-215
+  - G-216
+  - G-217
 complexity: medium
 risk: high
 priority: normal

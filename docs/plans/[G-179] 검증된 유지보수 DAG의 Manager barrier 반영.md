@@ -8,6 +8,15 @@ sources:
 depends_on:
   - G-176
   - G-178
+  - G-208
+  - G-209
+  - G-210
+  - G-211
+  - G-212
+  - G-213
+  - G-215
+  - G-216
+  - G-217
 complexity: medium
 risk: high
 priority: normal

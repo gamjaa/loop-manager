@@ -6,6 +6,15 @@ sources:
   - docs/requirements/[R-067] 프로젝트 공통 verify 실행 규약.md
 depends_on:
   - G-148
+  - G-208
+  - G-209
+  - G-210
+  - G-211
+  - G-212
+  - G-213
+  - G-215
+  - G-216
+  - G-217
 complexity: high
 risk: high
 priority: normal
