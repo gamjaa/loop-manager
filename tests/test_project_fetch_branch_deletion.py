@@ -1,6 +1,7 @@
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
+import tempfile
 from unittest import mock
 
 import loop_manager
@@ -8,9 +9,13 @@ import loop_manager
 
 class ProjectFetchBranchDeletionTest(unittest.TestCase):
     repo = Path('/repo')
-    state_dir = Path('/state')
     oid = 'a' * 40
     branch = 'loop-manager/G-115'
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.state_dir = Path(temporary.name) / 'state'
 
     def result(self, stdout='', returncode=0):
         return SimpleNamespace(stdout=stdout, returncode=returncode)

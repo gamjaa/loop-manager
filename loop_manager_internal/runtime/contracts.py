@@ -30,6 +30,7 @@ class RuntimeWorktree:
     path: Path
     commit_sha: str
     mutation_id: str | None = None
+    concurrent: bool = False
 
 
 @dataclass(frozen=True)
@@ -40,6 +41,7 @@ class RuntimeMutation:
     mutation_id: str | None
     legacy: bool = False
     registration_lock_reason: str | None = None
+    concurrent: bool = False
 
 
 class GitLockError(RuntimeError):
@@ -51,7 +53,7 @@ class WorkspaceOwnershipError(RuntimeError):
 
 
 class ProcessLockBusyError(RuntimeError):
-    """The single Loop Manager process lock is already held."""
+    """An automatic invocation or concrete resource lease is already held."""
 
 
 class PublicationSafetyError(RuntimeError):

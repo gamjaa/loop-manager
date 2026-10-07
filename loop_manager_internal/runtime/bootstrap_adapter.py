@@ -76,8 +76,9 @@ def validate_runtime_worktree(
     state_dir: Path,
     runtime: Path,
     commit_sha: str,
+    *, command_id: str | None = None,
 ) -> None:
-    return effects._bootstrap_service().validate_runtime_worktree(source, state_dir, runtime, commit_sha)
+    return effects._bootstrap_service().validate_runtime_worktree(source, state_dir, runtime, commit_sha, command_id=command_id)
 
 
 @dataclass(frozen=True)
@@ -262,9 +263,10 @@ class PrepareRuntimeWorktreeEffects:
 
 def prepare_runtime_worktree(
     effects: PrepareRuntimeWorktreeEffects, source: Path, state_dir: Path, *, mutation_id: str | None = None,
-    commit_sha: str | None = None,
+    commit_sha: str | None = None, concurrent: bool = False,
 ) -> RuntimeWorktree:
-    return effects._bootstrap_service().prepare_runtime_worktree(source, state_dir, mutation_id=mutation_id, commit_sha=commit_sha)
+    options = {"concurrent": True} if concurrent else {}
+    return effects._bootstrap_service().prepare_runtime_worktree(source, state_dir, mutation_id=mutation_id, commit_sha=commit_sha, **options)
 
 
 @dataclass(frozen=True)
@@ -326,8 +328,9 @@ def validate_runtime_child(
     effects: ValidateRuntimeChildEffects, source: Path,
     state_dir: Path,
     commit_sha: str,
+    *, command_id: str | None = None,
 ) -> None:
-    return effects._bootstrap_service().validate_runtime_child(source, state_dir, commit_sha)
+    return effects._bootstrap_service().validate_runtime_child(source, state_dir, commit_sha, command_id=command_id)
 
 
 @dataclass(frozen=True)
@@ -338,8 +341,9 @@ class ValidateRuntimeMutationEffects:
 
 def validate_runtime_mutation(
     effects: ValidateRuntimeMutationEffects, source: Path, state_dir: Path, sha: str, mutation_id: str | None,
+    *, concurrent: bool = False,
 ) -> RuntimeMutation:
-    return effects._bootstrap_service().validate_runtime_mutation(source, state_dir, sha, mutation_id)
+    return effects._bootstrap_service().validate_runtime_mutation(source, state_dir, sha, mutation_id, concurrent=concurrent)
 
 
 @dataclass(frozen=True)

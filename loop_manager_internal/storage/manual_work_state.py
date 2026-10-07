@@ -83,7 +83,7 @@ def live_requirement_paths(connection, repo):
     if not connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='manual_work_groups'").fetchone():
         return frozenset()
     return frozenset(source for group in connection.execute(
-        "SELECT requirements,documents FROM manual_work_groups WHERE repo=? AND state!='MERGED'",(repo,))
+        "SELECT requirements,documents FROM manual_work_groups WHERE repo=? AND state NOT IN ('MERGED','PREPARATION_CONFLICT')",(repo,))
         for source in (*json.loads(group['requirements']),
             *(path for item in json.loads(group['documents']) for path in item['plan']['sources'])))
 
@@ -108,7 +108,7 @@ class ManualWorkRepository:
 
     def pending(self, repo):
         return self.connection.execute("SELECT * FROM manual_work_groups WHERE repo=? "
-            "AND state IN ('GENERATING','REGISTERING','AUTOMATIC') ORDER BY rowid", (repo,)).fetchall()
+            "AND state IN ('GENERATING','REGISTERING','AUTOMATIC') AND request_id IS NOT NULL ORDER BY rowid", (repo,)).fetchall()
 
     def create(self, repo, kind, branch, requirements, head, base, *, members=(), documents=()):
         group_id = uuid4().hex
