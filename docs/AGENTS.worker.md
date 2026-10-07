@@ -18,18 +18,14 @@
 
 현재 ExecPlan에 꼭 필요한 루트 `AGENTS.md` 변경을 발견하면 직접 수정하지 않고
 `docs/PLANS.md`에 따라 선택된 계획의 Decision Log에 정확한 제안과 빈 User Decision을
-기록한 뒤 사용자 판단을 기다린다. 신규 제안의 Target은 `AGENTS.md`, Scope는 self
-저장소도 `project`다. pending 결정에는 빈 백틱 Comment, 실제 Proposal의 전체 diff,
+기록한 뒤 사용자 판단을 기다린다. 신규 제안의 Target은 `AGENTS.md`, Scope는 `project`다.
+pending 결정에는 빈 백틱 Comment, 실제 Proposal의 전체 diff,
 필드 옆 안내 주석과 `<!-- END USER DECISION -->`를 제공하며 Revision과 일반 pending의
 Baseline은 생성하지 않는다. 기존 결정·편집된 Patch·Comment·메모를 덮어쓰지 않는다.
 
 Manager가 검증해 전달한 사전 승인 또는 승인·대체 patch는 해당 대상과 정확한 내용에만
 적용한다. reject 대상은 원래 baseline을 유지하고 최종 내용은 전달된 expected_content_hash와
 일치해야 한다. 사용자 결정을 대신 작성·변경하거나 승인 범위를 확대하지 않는다.
-
-공통·역할별 `docs/AGENTS.*.md` 원본 파일의 수정은 현재 역할·목표의 일반 문서 권한과
-PR 보고 규칙을 따르며 위 사전 승인 대상에 포함하지 않는다. 파일을 수정해도 현재 작업에
-고정된 Loop Manager instruction과 실행 권한은 바뀌지 않는다.
 
 ## 검증
 

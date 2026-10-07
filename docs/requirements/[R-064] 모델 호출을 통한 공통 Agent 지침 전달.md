@@ -10,6 +10,7 @@
 
 ### 공통·역할별 규칙과 프로젝트 규칙
 
+- Loop Manager 자체 개발에만 필요한 지정 루트 경로·새 루트 항목 제한·instruction 원본 파일 수정 안내는 이 저장소의 루트 `AGENTS.md`에 둔다. 등록 프로젝트에 전달하는 공통·역할별 지침에는 등록 프로젝트 전반에 적용되는 자동 실행 기준만 남기고, 각 프로젝트의 개발·구조 규칙은 해당 프로젝트 지침을 따른다.
 - 실행 지침의 원본은 Loop Manager runtime의 `docs/AGENTS.common.md`와 역할별 `docs/AGENTS.planner.md`·`docs/AGENTS.planner_check.md`·`docs/AGENTS.worker.md`·`docs/AGENTS.reviewer.md`다. 공통에는 모든 자동 역할에 적용되는 기준만 남기고, 특정 역할의 권한·금지사항·작성·판단·검토·검증 절차는 해당 역할 파일에 둔다. 파일들은 이어붙일 실행 지침이므로 자신의 구성·합성·snapshot·버전 관리에 대한 설명을 넣지 않는다. 초기 분리는 기존 루트 AGENTS와 역할 prompt의 규칙을 기준으로 필요한 내용만 옮기며 기준 revision·분리 내용·이유를 구현 PR에서 설명한다. 루트에는 Loop Manager 개발에 필요한 작업 지침만 두며 docs의 규칙·스펙과 코드·문서로 쉽게 확인할 수 있는 설명을 반복하지 않는다.
 - 게시된 공통·역할별 파일이 이후 실행 원본이다. 각 프로젝트에 복사하지 않고 프로그램이 선택한 게시된 runtime worktree의 내용을 사용한다. 매 호출마다 루트 `AGENTS.md`에서 원본을 재생성하지 않으며, source checkout의 로컬 편집이나 선택한 작업 worktree·등록 프로젝트의 동명 파일을 실행 지침의 원본으로 사용하지 않는다.
 - Manager는 일반·유지보수·수동 제출 Planner에 common+planner, 읽기 전용 점검에 common+planner_check, Worker에 common+worker, Reviewer에 common+reviewer를 합쳐 전달한다. 다른 역할의 상세 지침을 한 호출에 함께 넣지 않는다. 합친 실행용 파일은 저장소 밖 Manager 상태 디렉터리에만 만들며 커밋하지 않는다. 고정된 원본 묶음에서 같은 내용을 재생성할 수 있어야 한다.
@@ -56,7 +57,7 @@
 - runtime의 common에는 모든 역할의 공통 기준만, 역할 파일에는 해당 역할의 규칙만 남는다. 초기 분리의 기준 revision·내용·이유를 확인할 수 있고 이후 원본은 게시된 공통·역할별 파일이다. 루트 AGENTS나 작업별 사용자 prompt에서 원본을 재생성하지 않는다.
 - 이 저장소 루트와 새 프로젝트의 최소 `AGENTS.md`에는 구현 전 ExecPlan 선작성 의무가 없다. 자동 작업의 ExecPlan 준비·dependency gate는 Planner·작업 선택 흐름에서 유지되며 다른 프로젝트의 기존 본문은 임의로 삭제하지 않는다.
 - Specification Skill은 네 종류의 제품 명세 작성·검토와 보관 Requirement 취급 기준만 설명하며 Manager 내부 동작은 포함하지 않는다. 루트 AGENTS·새 프로젝트용 복사 스크립트는 같은 Skill을 참조하며 작성 절차·문서 역할을 중복하지 않는다. 별도 문서 작성 요청이 없다는 이유로 대화형 Agent의 사용자 요청에 따른 Requirement 작성을 거부하지 않는다.
-- 루트 AGENTS에는 Loop Manager 개발에 필요한 작업 지침만 남고, 새 프로젝트의 최소 AGENTS는 프로젝트 전용 개발 안내와 Skill 참조만 담는다. 문서·코드에 있는 규칙·스펙·구조·실행 설명을 중복하지 않으며 필수 문서 조건은 등록·계획 입력 검사에서 유지한다.
+- 루트 AGENTS에는 Loop Manager 개발에 필요한 작업 지침만 남고, 새 프로젝트의 최소 AGENTS는 프로젝트 전용 개발 안내와 Skill 참조만 담는다. Loop Manager 전용 경로·새 루트 항목 제한·instruction 원본 파일 수정 안내는 다른 프로젝트에 주입하지 않는다. 문서·코드에 있는 규칙·스펙·구조·실행 설명을 중복하지 않으며 필수 문서 조건은 등록·계획 입력 검사에서 유지한다.
 - 공통·역할별 instruction에는 해당 역할의 행동 기준만 있고 지침 파일 자체의 구성·합성·snapshot·버전 관리 설명은 없다. 실행용 파일 생성과 원본 고정은 기존 Manager 코드와 제품·설계 명세에서 유지된다.
 - 직접 구현과 활성 Requirement를 원격 base에 반영하면 기존 Planner 선택 정책에 따른 재점검이 이루어진다. 충족된 구현의 중복 계획·소급 ExecPlan 요구·자동 검증 성공 합성 없이 남은 작업만 계획하며, 로컬 전용 변경과 기존 archive·반복 호출 억제 조건을 보존한다.
 - 프로젝트 전용 `AGENTS.md`로 불일치 승인 없이 등록·실행할 수 있고, 다른 필수 문서·원격 입력 조건은 유지된다.

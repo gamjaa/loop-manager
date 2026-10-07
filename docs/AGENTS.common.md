@@ -29,9 +29,7 @@ mode·snapshot·승인 문맥과 역할 권한이 허용하는 범위 안에서�
   가변 상태를 추가하지 않으며 기능·저장소·외부 도구 연동 경계를 분리해 변경 충돌을 줄인다.
 - 문서는 PRODUCT·Requirement·ARCHITECTURE의 역할을 유지한 채 중복과 장황함을 줄인다.
   결정·예외·실패 흐름과 Acceptance Criteria의 의미를 보존한다.
-- `.agents/`, `docs/`, `scripts/`, `AGENTS.md`, `docs/PLANS.md`, `docs/ARCHITECTURE.md`,
-  존재하는 PRODUCT·Requirement와 현재 운영체제의 verify 경로는 지정된 루트 경로를 유지한다.
-  새 루트 항목은 사용자 진입, 실행·빌드·배포 또는 도구의 필수 탐색이라는 근거가 필요하다.
+- 문서·소스·검증 경로와 저장소 구조는 대상 프로젝트의 지침을 따른다.
 
 ## 사용자 판단
 
@@ -39,7 +37,7 @@ mode·snapshot·승인 문맥과 역할 권한이 허용하는 범위 안에서�
 
 - 새로운 Current Goal·Requirement 또는 Non-Goal 기능 추가, 기존 사용자 동작의 의미 변경
 - 데이터 삭제·비가역 migration, 비용 발생 외부 서비스나 새로운 주요 infrastructure 도입
-- `ARCHITECTURE.md`의 Architecture Change Policy에 해당하는 변경
+- 대상 프로젝트 `ARCHITECTURE.md`의 Architecture Change Policy에 해당하는 변경
 - 서로 모순된 요구사항 중 하나를 선택해야 하는 경우
 
 실제 상태 변경과 재개·완료 판정은 Manager가 담당한다. 자동 작업의 완료에는

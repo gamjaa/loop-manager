@@ -6,7 +6,7 @@ Requirement 구현 결과는 코드와 제품·설계 문서에 남아야 한다
 
 ## Requirement
 
-- Worker는 선택한 Requirement·ExecPlan 구현에 필요한 PRODUCT·ARCHITECTURE를 같은 변경에서 갱신한다. 파일 경로만으로 ARCHITECTURE 수정을 거부하지 않는다. 합의된 목표·별도 사용자 결정과 프로젝트 루트 `AGENTS.md` 변경에 대한 사용자 승인 조건은 유지한다. 공통·역할별 `docs/AGENTS.*.md` 원본 파일은 현재 역할·목표의 일반 문서 수정과 PR 보고 규칙을 따르며, 파일을 수정해도 현재 작업에 고정된 Loop Manager instruction은 바뀌지 않는다.
+- Worker는 선택한 Requirement·ExecPlan 구현에 필요한 PRODUCT·ARCHITECTURE를 같은 변경에서 갱신한다. 파일 경로만으로 ARCHITECTURE 수정을 거부하지 않는다. 합의된 목표·별도 사용자 결정과 프로젝트 루트 `AGENTS.md` 변경에 대한 사용자 승인 조건은 유지한다. Loop Manager 자체 저장소의 공통·역할별 `docs/AGENTS.*.md` 원본 파일은 현재 역할·목표의 일반 문서 수정과 PR 보고 규칙을 따르며, 파일을 수정해도 현재 작업에 고정된 Loop Manager instruction은 바뀌지 않는다.
 - 활성 ExecPlan·draft가 해당 Requirement를 source로 참조하면 archive하지 않는다. 연결된 활성 작업이 없어지면 일반 Planner가 최신 원격 코드·검증·관련 제품·설계 문서로 전체 Acceptance Criteria를 다시 판단한다. 미충족이면 후속 ExecPlan을 작성하고, 충족이면 Manager가 원문 그대로 archive한다. 연결 계획이 없는 직접 구현도 실제 근거로 판단한다.
 - 관련 계획의 실제 MERGED 확인, 미완료 수동 제출·문서 draft, 취소된 source 관계의 불확실성, 이동 충돌, 판단 캐시의 입력 결합과 원격 게시 확인은 기존 보호 조건을 유지한다. 게시 전 입력 변화에 따른 이동 철회는 완료된 archive의 복원이 아니다.
 - archive된 Requirement는 Planner의 재평가·새 작업·프로젝트 완료 대기 입력으로 사용하지 않으며 자동으로 복원하지 않는다. 기존 ExecPlan의 source 조회·검증을 위한 읽기 호환성은 유지하지만 새 ExecPlan은 archived Requirement를 source로 사용할 수 없다.
