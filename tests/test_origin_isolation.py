@@ -703,6 +703,57 @@ class ManagerBaselineReconciliationUnitTests(unittest.TestCase):
         return loop_manager._reconciled_manager_scope_metadata(
             self.connection, self.source, self.state, str(self.source), 'G-092', self.before, self.current)
 
+    def test_resume_records_independent_metadata_before_a_failed_attempt(self):
+        from loop_manager_internal.agents import agent_scope_decision
+        worktree = self.state / 'managed'
+        worktree.mkdir()
+        own_ref = 'refs/heads/loop-manager/G-092'
+        independent_ref = 'refs/heads/main'
+        self.before = replace(self.before, refs={self.ref: ('a' * 40, ''),
+            own_ref: ('owned', ''), independent_ref: ('old-source', '')},
+            worktrees={str(worktree): ('HEAD=owned',), '/source': ('HEAD=old-source',)})
+        self.current = replace(self.before,
+            refs={**self.before.refs, independent_ref: ('new-source', '')},
+            worktrees={**self.before.worktrees, '/source': ('HEAD=new-source',)})
+        self.prepare_project(worktree)
+        resources = agent_scope_decision.used_git_resources(role='worker', phase='WORKING',
+            base_branch='main', branch=self.before.branch, worktree_key=str(worktree))
+        for proof in (None, resources):
+            with self.subTest(isolated=proof is not None), \
+                    mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=self.current), \
+                    mock.patch.object(loop_manager, '_owned_rebase_state_dir', return_value=self.state), \
+                    mock.patch.object(loop_manager, '_agent_git_resources', return_value=proof):
+                effective = loop_manager.begin_agent_scope(self.connection, str(self.source), worktree, 'worker')
+            if proof is None:
+                self.assertEqual(effective, self.before)
+                continue
+            self.assertEqual(effective.refs, self.current.refs)
+            self.assertEqual(effective.worktrees, self.current.worktrees)
+            self.assertEqual(effective.dirty, self.before.dirty)
+            checkpoints = loop_manager.execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
+            prior = checkpoints.get(str(self.source), 'G-092')
+            with mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=self.current), \
+                    mock.patch.object(loop_manager, '_owned_rebase_state_dir', return_value=self.state), \
+                    mock.patch.object(loop_manager, '_agent_git_resources', return_value=proof):
+                self.assertEqual(loop_manager.begin_agent_scope(self.connection, str(self.source), worktree, 'worker'), effective)
+            self.assertEqual(checkpoints.get(str(self.source), 'G-092'), prior)
+            self.assertEqual(self.connection.execute('SELECT agent_snapshot FROM projects').fetchone()[0],
+                             self.before.serialize())
+            audit = loop_manager.execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(
+                str(self.source), 'G-092').snapshot
+            self.assertEqual(agent_scope_decision.manager_comparison_baseline(
+                self.before, self.before, audit, 'worker'), effective)
+            # Loss of proof after a failed attempt cannot attribute pre-call
+            # metadata to this call, or hide any new shared write during it.
+            loop_manager.validate_agent_scope('worker', worktree, effective, self.current,
+                selected_plan_path='docs/plans/[G-092] Work.md')
+            for changed in (replace(self.current, refs={**self.current.refs, independent_ref: ('during-call', '')}),
+                            replace(self.current, refs={**self.current.refs, own_ref: ('wrong-owner', '')}),
+                            replace(self.current, worktrees={**self.current.worktrees, '/source': ('HEAD=during-call',)})):
+                with self.assertRaises(loop_manager.AgentScopeError):
+                    loop_manager.validate_agent_scope('worker', worktree, effective, changed,
+                        selected_plan_path='docs/plans/[G-092] Work.md')
+
     def test_completed_fetch_advances_only_its_ref_and_keeps_worker_changes(self):
         self.record_fetch()
         self.current = replace(self.current, refs={**self.current.refs, 'refs/heads/other': ('foreign', '')})

@@ -104,26 +104,38 @@ def begin_agent_scope(
         scope_state_dir = state_dir or (
             effects._owned_rebase_state_dir(repo, plan_id, worktree) if plan_id else None)
         if scope_state_dir is not None:
+            current = effects.capture_git_snapshot(worktree)
+            resources = effects._agent_git_resources(
+                connection, Path(repo), worktree, stored, role_name,
+                selected_plan_path=str(row['plan_path'] or ''))
             stored = effects._reconciled_manager_scope_metadata(
-                connection, Path(repo), scope_state_dir, repo, plan_id, stored,
-                effects.capture_git_snapshot(worktree),
-                effects._agent_git_resources(connection, Path(repo), worktree, stored, role_name,
-                                     selected_plan_path=str(row['plan_path'] or '')))
+                connection, Path(repo), scope_state_dir, repo, plan_id, stored, current, resources)
+            if resources is not None:
+                # These independent resources were observed before this call,
+                # under the previous completed invocation's isolation proof.
+                # A failed new attempt must still compare its own full delta.
+                stored = replace(stored,
+                    refs={**{key: value for key, value in current.refs.items() if key not in resources.refs},
+                          **{key: value for key, value in stored.refs.items() if key in resources.refs}},
+                    worktrees={**{key: value for key, value in current.worktrees.items() if key not in resources.worktrees},
+                               **{key: value for key, value in stored.worktrees.items() if key in resources.worktrees}})
         checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id or '')
         if stored != original_scope:
             checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
             saved = dict(checkpoint.snapshot or {})
             previous = saved.get('manager_metadata_agent_baseline')
-            if previous is not None:
-                saved['manager_metadata_agent_baseline_history'] = [
-                    *saved.get('manager_metadata_agent_baseline_history', ()), previous]
-            checkpoints.record(repo, plan_id or '', expected_generation=checkpoint.generation,
-                operation=checkpoint.operation, expected_head=checkpoint.expected_head,
-                target_base_oid=checkpoint.target_base_oid, observed_remote_oid=checkpoint.observed_remote_oid,
-                snapshot={**saved, 'manager_metadata_agent_baseline': {
-                    'role': role_name, 'original': hashlib.sha256(original_scope.serialize().encode()).hexdigest(),
-                    'snapshot': stored.serialize()}})
-            checkpoint = checkpoints.get(repo, plan_id or '')
+            baseline = {'role': role_name,
+                'original': hashlib.sha256(original_scope.serialize().encode()).hexdigest(),
+                'snapshot': stored.serialize()}
+            if previous != baseline:
+                if previous is not None:
+                    saved['manager_metadata_agent_baseline_history'] = [
+                        *saved.get('manager_metadata_agent_baseline_history', ()), previous]
+                checkpoints.record(repo, plan_id or '', expected_generation=checkpoint.generation,
+                    operation=checkpoint.operation, expected_head=checkpoint.expected_head,
+                    target_base_oid=checkpoint.target_base_oid, observed_remote_oid=checkpoint.observed_remote_oid,
+                    snapshot={**saved, 'manager_metadata_agent_baseline': baseline})
+                checkpoint = checkpoints.get(repo, plan_id or '')
         if (plan_id and not blocked_plan_reconciliation.remote_adoption_is_current(checkpoint)
                 and (checkpoint.operation == 'rebase'
                      or (checkpoint.snapshot or {}).get('current_rebase_acceptance'))):
