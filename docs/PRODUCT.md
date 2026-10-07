@@ -24,7 +24,7 @@
 - Worker가 구현·관련 테스트·전체 검증 스크립트를 작성하고, 프로그램이 전체 검증과 독립 Review를 실행한다. 실패는 기존 작업에서 교정한다.
 - 검증된 작업으로 PR을 생성하고 사용자 Merge를 기다린다.
 - 전체 충족이 확인된 Requirement는 일반 planning 게시에서, MERGED ExecPlan은 별도 정리 commit에서 자동 archive한다.
-- 같은 프로젝트의 자동 변경은 직렬로, 다른 프로젝트는 설정한 동시 실행 수 안에서 병렬로 처리한다. 자원이 충돌하지 않는 수동 명령의 준비는 자동 실행 중에도 수행한다.
+- 같은 프로젝트의 자동 변경은 직렬로, 다른 프로젝트는 설정한 동시 실행 수 안에서 병렬로 처리한다. 자원이 충돌하지 않는 수동 명령의 준비와 로컬 복구 요청 접수는 자동 실행 중에도 수행한다.
 - 변경되지 않은 입력에서는 Planner를 반복 호출하지 않는다.
 - PR 생성·차단·프로젝트 완료를 Telegram으로 알린다.
 
@@ -47,7 +47,7 @@
 - 실패·중단·차단 시 작업물·session·진단을 보존한다. 원인과 안전 조건이 실제로 해소된 작업만 재개한다.
 - 최종 후보의 관련 테스트·전체 검증·독립 Review가 성공해야 PR을 생성한다. 연결 PR의 실제 Merge만 MERGED와 완료의 근거다.
 - 사용자 변경을 승인 없이 삭제하거나 덮어쓰지 않는다. 정리 안전성을 확인할 수 없는 worktree는 보존한다.
-- 같은 사용자 상태 디렉터리에서는 자동 실행을 하나만 허용한다. 수동 명령의 준비는 계획과 실제 자원의 소유권을 원자적으로 확인·예약한 뒤 동시에 수행할 수 있다.
+- 같은 사용자 상태 디렉터리에서는 자동 실행을 하나만 허용한다. 수동 명령의 준비는 계획과 실제 자원의 소유권을 원자적으로 확인·예약한 뒤 동시에 수행할 수 있다. 로컬 복구 요청도 동시에 접수할 수 있으며 실제 복구는 전역 실행 잠금과 프로젝트 실행 자리를 준수한다.
 - 동일한 PR·차단·완료 사건은 중복 통지하지 않는다.
 
 문서 입력·등록·작업 선택·실패·게시의 상세 정책은 아래 해당 절에서 정의한다. 저장·검증·Git 적용 방식은 [ARCHITECTURE.md](ARCHITECTURE.md), ExecPlan 형식은 [PLANS.md](PLANS.md), 설치와 실행은 [README.md](../README.md)를 따른다.
@@ -60,7 +60,7 @@
 |---|---|
 | Planner 역할 선택·변경 중심 검토·최종 확인·draft와 Agent 문서 권한 | [R-049](requirements/archive/%5BR-049%5D%20Input-Specific%20Planner%20Roles.md), [R-057](requirements/%5BR-057%5D%20Change-Focused%20Planning%20and%20Final%20Full%20Verification.md), [R-061](requirements/%5BR-061%5D%20Agent%20Roles%20and%20Draft%20ExecPlan%20Decisions.md) |
 | Worker 최초 level·Review 승격·Planner와 Worker의 명시적 모델 설정 | [R-052](requirements/%5BR-052%5D%20Worker%20Classification%20and%20Initial%20Level%20Calibration.md) |
-| 차단 범위·비차단 로컬 base 동기화·Git 통합과 원격 보존·로컬 환경 재검사 | [R-055](requirements/%5BR-055%5D%20Blocking%20Path%20Audit%20and%20Minimal%20Interruption.md), [R-056](requirements/%5BR-056%5D%20Non-Blocking%20Local%20Base%20Synchronization.md), [R-060](requirements/archive/%5BR-060%5D%20Collaborative%20Git%20Recovery%20and%20Remote%20Blocked%20Snapshots.md), [R-062](requirements/%5BR-062%5D%20Local%20Environment%20Recovery%20Command.md) |
+| 차단 범위·비차단 로컬 base 동기화·Git 통합과 원격 보존·로컬 환경 재검사 | [R-055](requirements/%5BR-055%5D%20Blocking%20Path%20Audit%20and%20Minimal%20Interruption.md), [R-056](requirements/%5BR-056%5D%20Non-Blocking%20Local%20Base%20Synchronization.md), [R-060](requirements/archive/%5BR-060%5D%20Collaborative%20Git%20Recovery%20and%20Remote%20Blocked%20Snapshots.md), [R-062](requirements/archive/%5BR-062%5D%20Local%20Environment%20Recovery%20Command.md), [R-078](requirements/%5BR-078%5D%20Concurrent%20Local%20Recovery%20Requests.md) |
 | Merge 대기 PR이 없는 due 리팩터링의 우선 처리 | [R-054](requirements/%5BR-054%5D%20Due%20Refactoring%20Priority.md) |
 | 이벤트 시점의 진행·사용자 조치 알림과 무음 구분 | [R-053](requirements/%5BR-053%5D%20Timely%20Progress%20Notifications.md) |
 | 테스트별 시간·실제 Agent 없는 테스트·안전한 Python 캐시 | [R-058](requirements/%5BR-058%5D%20Test%20Timing%20and%20Agent-Free%20Test%20Execution.md), [R-059](requirements/%5BR-059%5D%20Safe%20Python%20Bytecode%20Cache%20Use.md) |
@@ -318,6 +318,12 @@ Loop Manager runtime에서만 읽는 `docs/AGENTS.*.md`와 저장소 밖 Manager
 실행 중인 동일 계획, 겹치는 브랜치·워크트리·게시 대상, Planner 게시 예약과 미완료 Git 작업은 충돌 자원과 소유자를 설명하며 거부한다. 거부된 충돌 요청을 자동 대기 제출로 바꾸지 않는다. 충돌 확인과 소유 예약은 Worker 선택·Planner 게시·다른 수동 명령과 원자적으로 조율하며, 준비 중단 시 저장된 소유권과 작업물을 보존한다. 명령마다 원격 커밋에 고정된 별도 런타임을 사용하고 자기 작업 공간만 정리한다.
 
 수동 구현 대기와 완료·제출 수락 이후의 자동 처리는 구분한다. 수락된 제출은 기존 프로젝트 실행에서 저장소 준비, catalog 확인·정리, 기존 PR 상태 동기화 뒤 실행 자리가 비었을 때 등록 순서로 재개한다. 그 뒤 기존 실행 재개와 일반 coordinator 순서를 유지하며 dependency·차단·유지보수 조건을 통과해야 한다. 별도의 최우선 처리나 현재 작업 종료 직후 즉시 검토를 보장하지 않는다.
+
+### 로컬 환경 복구 요청
+
+`recover <repository> [--plan <id>]`는 등록 대상과 현재 설정을 확인하고 로컬 원인의 제한 재검사를 요청한다. 다른 작업 중에도 요청을 저장하며, 실제 복구는 기존 직렬 실행·소유권·승인 조건에서 진행한다. 즉시 실행할 수 없으면 요청을 보존하고 다음 `run`에서 이어진다. 다른 계획·planning·유지보수가 선택한 계획의 실행 자리를 사용하면 그 작업을 계속하고 복구 요청은 대기한다.
+
+프로젝트별 미완료 요청은 하나이고 같은 범위의 재요청은 동일 identity와 이미 소비한 제한 재검사를 유지한다. 다른 범위는 거부하며 실패·교정·승격 이력을 초기화하지 않는다. 복구 완료는 0, 접수 후 대기·진행 중·미해결·입력 거부는 0이 아닌 종료 코드로 보고한다.
 
 ### 작업 선택과 동시 실행
 

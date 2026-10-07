@@ -28,9 +28,9 @@ Loop Manager는 Windows와 Linux에서 동작하는 Python 3 프로그램이다.
 - Git과 gh(GitHub CLI)가 설치되고 대상 저장소에 접근할 수 있어야 한다
 - Python 3 venv를 만들 수 있어야 한다
 - Windows와 Linux용 실행 진입점을 제공한다
-- 같은 사용자 상태 디렉터리를 사용하는 중복 실행은 `<state-dir>/loop-manager.lock`으로 차단한다
+- 같은 사용자 상태 디렉터리의 자동 실행과 실제 복구 실행은 `<state-dir>/loop-manager.lock`으로 직렬화한다. 수동 준비와 복구 요청 접수는 별도 command runtime과 자원 잠금을 사용한다
 - `run.sh`와 `run.ps1`은 Git을 실행하지 않고 source checkout의 Python 부트스트랩만 시작한다
-- 부트스트랩은 다른 Git 작업 전에 process lock을 획득하고, Loop Manager 저장소의 `origin/main`을 fetch해 exact SHA의 detached runtime worktree를 선택한 뒤 같은 lock을 유지한 채 runtime 자식을 실행한다
+- 부트스트랩은 다른 Git 작업 전에 부모 process lock을 획득하고, Loop Manager 저장소의 `origin/main`을 fetch해 exact SHA의 detached runtime worktree를 선택한 뒤 같은 lock을 유지한 채 runtime 자식을 실행한다. `manual`과 `recover`는 command별 부모 lock과 고유 runtime 경로로 자동 실행과 분리한다
 - runtime worktree는 source checkout의 object database를 공유하며 사용자 `main`의 파일, index, HEAD와 로컬 전용 commit을 사용하지 않는다. push된 새 SHA는 다음 실행에서만 선택한다
 - source checkout의 bootstrap은 기존 `config/config.ini` 또는 명시된 `--config`를 source checkout 기준의 절대 경로로 확정해 runtime 자식에 전달하며 설정 파일을 runtime worktree에 복사·이동·symlink하지 않는다
 - launcher가 선택한 source checkout의 Python interpreter를 runtime 자식도 사용한다. 그 밖의 ignored 파일과 cache는 runtime worktree로 전달하지 않는다
@@ -164,7 +164,7 @@ ExecPlan ID만 Git 선언과 SQLite 실행 이력을 잇는 안정적인 identit
 
 ### 자체 runtime 선택과 handoff
 
-Loop Manager 프로그램 자체의 실행 revision은 다음 순서로 고정한다.
+자동 명령의 실행 revision은 다음 순서로 고정한다. `manual`과 `recover`의 병행 command runtime도 같은 원격 SHA·소유권 검증을 적용하며, 전역 잠금 대신 고유 부모 잠금과 `commands/<mutation-id>/<sha>/` 경로를 사용한다.
 
 1. source checkout의 좁은 Python 부트스트랩이 `<state-dir>/loop-manager.lock`을 획득한다
 2. lock을 보유한 부모만 source checkout을 anchor로 `git fetch origin`을 실행한다
@@ -359,6 +359,12 @@ rebase로 후보 HEAD 또는 ExecPlan·근거 입력이 바뀌면 이전 Worker 
 PR 없는 게시 checkpoint의 Review 횟수 차단을 rebase 없이 해제할 때는 checkpoint 요청 identity·게시 commit의 tree와 identity·마지막 채택 원격 OID 및 현재 원격 ref, 동일 계획의 branch·관리 worktree와 로컬 HEAD·ref·index·작업 파일·등록 상태를 확인한다. 실행 checkpoint에 게시 소유권 근거를 보존하고 재시작과 Worker 교정 뒤에도 다시 대조한다. 이 경로는 rebase 완료 표식을 만들지 않으며, 이후 실제 rebase가 필요하면 관리 rebase의 현재 상태 판정과 정확한 원격 lease를 요구한다. 게시 소유권 오탐으로 생긴 프로젝트 차단은 같은 증거를 재검증한 경우에만 해제하고, 남아 있는 Review issue의 교정·검증과 다른 READY 계획의 선택을 계속한다.
 
 원격 관측 기록은 origin identity·정확한 ref·OID·실패 원인·시각을 계획별로 보존한다. 조회 실패는 마지막 확정 OID를 덮지 않는다. 처리 키는 원래 원인·검사 지문·관측 base/work branch OID·로컬 작업 지문을 포함한다. 같은 키의 확정 결과를 재사용하며 관련 입력이 달라지면 재평가한다.
+
+### 로컬 복구 요청의 접수와 실행
+
+`recover`의 별도 runtime은 프로젝트별 요청 자원 잠금 아래 기존 `local_environment_recovery_requests`에 요청을 생성하거나 같은 범위의 pending 요청을 재사용한다. 접수 잠금을 해제한 뒤 전역 process lock을 비차단 방식으로 얻고, 선택한 계획의 실행 자리도 확인해 실행 가능할 때만 기존 복구 executor를 호출한다. 잠금·다른 실행 자리로 대기하면 요청을 완료하거나 제한 재검사를 소비하지 않는다.
+
+등록 프로젝트 scheduler는 worker connection에서 DDL 없이 pending 요청을 읽는다. 범위가 실행 가능하면 같은 executor에 저장된 요청 identity·계획 범위와 현재 설정, 공유 Planner mutex·verify coordinator·runtime mutation·단계 알림 경계를 전달한다. 선택한 계획과 다른 실행 소유자가 있으면 일반 project runner를 호출하고 요청은 보존한다. executor는 즉시 실행과 지연 실행의 결과·제한 재검사 소비를 동일하게 기록하며 완료한 요청은 다시 처리하지 않는다.
 
 ## 검증과 재시도
 

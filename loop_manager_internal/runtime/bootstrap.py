@@ -497,7 +497,7 @@ class BootstrapService:
     ) -> RuntimeMutation:
         """Bind a child invocation to the held parent lock and actual Git runtime."""
         if concurrent and mutation_id is None:
-            raise RuntimeError("수동 runtime에는 고유 mutation ID가 필요합니다.")
+            raise RuntimeError("병행 runtime에는 고유 mutation ID가 필요합니다.")
         runtime = expected_runtime_worktree(state_dir, source, sha,
             command_id=mutation_id if concurrent else None)
         if _canonical_path(self.runtime_root) != _canonical_path(runtime):

@@ -1,5 +1,6 @@
 from contextlib import closing
 from pathlib import Path
+import threading
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -15,7 +16,8 @@ from loop_manager_internal.application.project_runner import (
 from loop_manager_internal.application.project_service import ProjectIdentity, ProjectService
 from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, ExecutionOutcomeKind
 from loop_manager_internal.runtime.project_registry import RegisteredProject, add_project
-from loop_manager_internal.storage import blocked_checkpoint_state
+from loop_manager_internal.runtime.process_lock import process_lock, _held_process_lock_identity
+from loop_manager_internal.storage import blocked_checkpoint_state, local_recovery_state
 from loop_manager_internal.storage import runtime_state
 from tests.support.database import runtime_connection
 
@@ -46,6 +48,171 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
             operation_print=mock.Mock(),
             run_project_result=run_project_result,
         )
+
+    def add_recovery_plans(self, *plan_ids):
+        repo = str(self.repository.resolve())
+        with closing(loop_manager.connect_database(self.state_dir)) as connection, connection:
+            for plan_id in plan_ids:
+                connection.execute(
+                    "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, "
+                    "priority, content_hash, status, plan_sha) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (repo, plan_id, f'docs/plans/{plan_id}.md', plan_id, '[]', '[]',
+                     'normal', 'hash', 'READY', 'base'))
+        return loop_manager.build_parser().parse_args(['recover', repo, '--plan', plan_ids[0]])
+
+    def scheduled_recovery_run(self, run):
+        config = loop_manager.load_managed_config(self.config_path)
+        with process_lock(self.state_dir, identity='automatic-next-run'), \
+             closing(loop_manager.connect_database(self.state_dir)) as connection, \
+             mock.patch.object(loop_manager, 'run_project_result', side_effect=run), \
+             mock.patch.object(loop_manager, 'operation_log'):
+            return loop_manager.run_registered_projects(connection, self.state_dir, config)
+
+    def test_busy_command_saves_and_reuses_request_without_project_mutation(self):
+        self.config_path.write_text('[loop]\n', encoding='utf-8')
+        run = mock.Mock()
+        effects = self.effects(run)
+        repo = str(self.repository.resolve())
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            before = dict(connection.execute('SELECT * FROM projects WHERE repo = ?', (repo,)).fetchone())
+        with process_lock(self.state_dir, identity='automatic-running'):
+            for _ in range(2):
+                self.assertEqual(recover_local_environment(effects, self.arguments, self.state_dir, self.config_path), 1)
+            self.assertEqual(_held_process_lock_identity(self.state_dir), 'automatic-running')
+        run.assert_not_called()
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            request = local_recovery_state.pending_request(connection, repo)
+            self.assertIsNotNone(request)
+            self.assertEqual(connection.execute('SELECT COUNT(*) FROM local_environment_recovery_requests').fetchone()[0], 1)
+            self.assertEqual(dict(connection.execute('SELECT * FROM projects WHERE repo = ?', (repo,)).fetchone()), before)
+        for call in effects.operation_print.call_args_list:
+            self.assertIn(request.request_id, call.args[0])
+            self.assertIn('다음 run', call.args[0])
+
+    def test_next_run_consumes_saved_plan_request_once(self):
+        self.config_path.write_text('[loop]\nverify_timeout_seconds = 937\n', encoding='utf-8')
+        args = self.add_recovery_plans('G-001')
+        with process_lock(self.state_dir, identity='automatic-running'):
+            self.assertEqual(recover_local_environment(self.effects(mock.Mock()), args, self.state_dir, self.config_path), 1)
+        repo = str(self.repository.resolve())
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            request = local_recovery_state.pending_request(connection, repo)
+        def recheck(connection, state_dir, repository, config_path, *_args, **kwargs):
+            self.assertEqual((state_dir, repository, config_path), (self.state_dir, repo, self.config_path))
+            self.assertEqual(_held_process_lock_identity(self.state_dir), 'automatic-next-run')
+            self.assertEqual(kwargs['recovery_request_id'], request.request_id)
+            self.assertEqual(kwargs['external_run_id'], request.request_id)
+            self.assertEqual(kwargs['recovery_plan_id'], 'G-001')
+            self.assertEqual(kwargs['verify_timeout_seconds'], 937)
+            self.assertIsInstance(kwargs['planner_mutex'], type(threading.Lock()))
+            self.assertTrue(callable(kwargs['on_step_completed']))
+            self.assertTrue(local_recovery_state.consume_recheck(connection, request.request_id, 'G-001', 'verify'))
+            return ProjectRunResult(ProjectRunKind.WAITING, 0)
+        self.assertEqual(self.scheduled_recovery_run(recheck), 0)
+        normal = mock.Mock(return_value=ProjectRunResult(ProjectRunKind.WAITING, 0))
+        self.assertEqual(self.scheduled_recovery_run(normal), 0)
+        self.assertNotIn('recovery_request_id', normal.call_args.kwargs)
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            self.assertIsNone(local_recovery_state.pending_request(connection, repo))
+            self.assertTrue(local_recovery_state.recheck_consumed(connection, request.request_id, 'G-001', 'verify'))
+            self.assertEqual(connection.execute('SELECT COUNT(*) FROM local_environment_recovery_requests').fetchone()[0], 1)
+
+    def test_other_active_plan_progresses_and_keeps_recovery_pending(self):
+        self.config_path.write_text('[loop]\n', encoding='utf-8')
+        args = self.add_recovery_plans('G-001', 'G-002')
+        repo = str(self.repository.resolve())
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            runtime_state.RuntimeStateRepository(connection).activate(
+                repo, 'G-002', activation_sha='base', branch='branch', worktree='/worktree')
+        immediate = mock.Mock()
+        self.assertEqual(recover_local_environment(self.effects(immediate), args, self.state_dir, self.config_path), 1)
+        immediate.assert_not_called()
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            request = local_recovery_state.pending_request(connection, repo)
+        def finish_other(connection, *_args, **kwargs):
+            self.assertNotIn('recovery_request_id', kwargs)
+            runtime = runtime_state.RuntimeStateRepository(connection)
+            self.assertEqual(runtime.active_row(repo)['plan_id'], 'G-002')
+            runtime.transition_and_clear(repo, 'G-002', plan_values={'status': 'PR_OPEN'}, enqueue=False)
+            return ProjectRunResult(ProjectRunKind.WAITING, 0)
+        self.assertEqual(self.scheduled_recovery_run(finish_other), 0)
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            self.assertEqual(local_recovery_state.pending_request(connection, repo).request_id, request.request_id)
+            self.assertFalse(local_recovery_state.recheck_consumed(connection, request.request_id, 'G-001', 'verify'))
+        resume = mock.Mock(return_value=ProjectRunResult(ProjectRunKind.WAITING, 0))
+        self.assertEqual(self.scheduled_recovery_run(resume), 0)
+        self.assertEqual(resume.call_args.kwargs['recovery_request_id'], request.request_id)
+        self.assertEqual(resume.call_args.kwargs['recovery_plan_id'], 'G-001')
+
+    def test_queued_scope_conflict_and_invalid_config_do_not_execute(self):
+        self.config_path.write_text('[loop]\n', encoding='utf-8')
+        args = self.add_recovery_plans('G-001')
+        run = mock.Mock()
+        effects = self.effects(run)
+        with process_lock(self.state_dir, identity='automatic-running'):
+            self.assertEqual(recover_local_environment(effects, args, self.state_dir, self.config_path), 1)
+            with self.assertRaisesRegex(local_recovery_state.LocalRecoveryRequestError, '다른 범위'):
+                recover_local_environment(effects, self.arguments, self.state_dir, self.config_path)
+            self.config_path.write_text('[loop]\nverify_timeout_seconds = bad\n', encoding='utf-8')
+            with self.assertRaises(loop_manager.ManagedConfigError):
+                recover_local_environment(effects, args, self.state_dir, self.config_path)
+        run.assert_not_called()
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            self.assertEqual(local_recovery_state.pending_request(connection, str(self.repository.resolve())).plan_id, 'G-001')
+
+    def test_interrupted_scheduled_recheck_preserves_request_and_consumption(self):
+        self.config_path.write_text('[loop]\n', encoding='utf-8')
+        args = self.add_recovery_plans('G-001')
+        repo = str(self.repository.resolve())
+        with process_lock(self.state_dir, identity='automatic-running'):
+            recover_local_environment(self.effects(mock.Mock()), args, self.state_dir, self.config_path)
+        with closing(loop_manager.connect_database(self.state_dir)) as connection:
+            request = local_recovery_state.pending_request(connection, repo)
+        def interrupted(connection, *_args, **kwargs):
+            self.assertEqual(kwargs['recovery_request_id'], request.request_id)
+            with connection:
+                local_recovery_state.consume_recheck(connection, request.request_id, 'G-001', 'verify')
+            raise RuntimeError('interrupted after durable check')
+        self.assertEqual(self.scheduled_recovery_run(interrupted), 1)
+        def resumed(connection, *_args, **kwargs):
+            self.assertEqual(kwargs['recovery_request_id'], request.request_id)
+            self.assertFalse(local_recovery_state.consume_recheck(connection, request.request_id, 'G-001', 'verify'))
+            return ProjectRunResult(ProjectRunKind.WAITING, 0)
+        self.assertEqual(self.scheduled_recovery_run(resumed), 0)
+
+    def test_selected_plan_waits_for_planning_and_maintenance_slots(self):
+        self.config_path.write_text('[loop]\n', encoding='utf-8')
+        args = self.add_recovery_plans('G-001')
+        repo = str(self.repository.resolve())
+        for owner in ('planning', 'maintenance'):
+            with self.subTest(owner=owner):
+                with closing(loop_manager.connect_database(self.state_dir)) as connection, connection:
+                    connection.execute('UPDATE projects SET phase = ? WHERE repo = ?',
+                                       ('PLANNING' if owner == 'planning' else None, repo))
+                    connection.execute('INSERT INTO maintenance_cycles (repo, phase) VALUES (?, ?) '
+                                       'ON CONFLICT(repo) DO UPDATE SET phase = excluded.phase',
+                                       (repo, 'assessment' if owner == 'maintenance' else 'idle'))
+                immediate = mock.Mock()
+                self.assertEqual(recover_local_environment(self.effects(immediate), args, self.state_dir, self.config_path), 1)
+                immediate.assert_not_called()
+                normal = mock.Mock(return_value=ProjectRunResult(ProjectRunKind.WAITING, 0))
+                self.assertEqual(self.scheduled_recovery_run(normal), 0)
+                self.assertNotIn('recovery_request_id', normal.call_args.kwargs)
+                with closing(loop_manager.connect_database(self.state_dir)) as connection:
+                    self.assertIsNotNone(local_recovery_state.pending_request(connection, repo))
+
+    def test_recover_runtime_child_uses_concurrent_ownership_validation(self):
+        token, sha = 'a' * 32, 'b' * 40
+        argv = ['loop_manager.py', '--state-dir', str(self.state_dir), '--runtime-child',
+                '--runtime-source', str(self.repository), '--runtime-sha', sha,
+                '--runtime-mutation-id', token, 'recover', str(self.repository)]
+        with mock.patch.object(loop_manager.sys, 'argv', argv), \
+             mock.patch.object(loop_manager, 'validate_runtime_child') as child, \
+             mock.patch.object(loop_manager, 'validate_runtime_mutation', return_value=None) as mutation, \
+             mock.patch.object(loop_manager, 'execute_runtime_command', return_value=1):
+            self.assertEqual(loop_manager.main(), 1)
+        child.assert_called_once_with(self.repository.resolve(), self.state_dir, sha, command_id=token)
+        mutation.assert_called_once_with(self.repository.resolve(), self.state_dir, sha, token, concurrent=True)
 
     def test_plan_command_resolves_with_independent_planning_error(self):
         self.config_path.write_text("[loop]\n", encoding="utf-8")
@@ -389,7 +556,10 @@ class LocalEnvironmentRecoveryCommandTests(unittest.TestCase):
                                        None, False, recovery_request_id=kwargs["recovery_request_id"], recovery_plan_id="G-001")
         self.assertEqual(recover_local_environment(self.effects(run), args, self.state_dir, self.config_path), 1)
         with closing(loop_manager.connect_database(self.state_dir)) as connection:
-            self.assertEqual(connection.execute("SELECT result FROM local_environment_recovery_requests").fetchone()[0], "unresolved")
+            request = local_recovery_state.pending_request(connection, repo)
+            self.assertIsNotNone(request)
+            self.assertEqual(request.plan_id, "G-001")
+            self.assertFalse(local_recovery_state.recheck_consumed(connection, request.request_id, "G-001", "verify"))
 
     def test_planning_result_and_consumption_survive_database_reopen(self):
         from loop_manager_internal.storage import local_recovery_state, maintenance_state

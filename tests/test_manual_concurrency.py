@@ -477,28 +477,31 @@ class ManualConcurrencyTests(WorkspaceFixture, unittest.TestCase):
 
 
 class ManualBootstrapConcurrencyTests(OriginScopeFixture, unittest.TestCase):
-    def test_manual_entry_reaches_child_while_automatic_lease_is_held(self):
-        with tempfile.TemporaryDirectory() as directory:
-            _, source, _writer = remote_fixture(directory)
-            state = Path(directory) / 'state'
-            def child(_source, _state, _config, runtime, _arguments):
-                self.assertTrue(runtime.concurrent)
-                self.assertIn('/commands/', str(runtime.path))
-                self.assertEqual(_held_process_lock_identity(state), 'automatic-run')
-                self.assertEqual(_held_process_lock_identity(state, name=f'manual-{runtime.mutation_id}.lock'), 'runtime:' + runtime.mutation_id)
-                service = manager._bootstrap_service()
-                service.runtime_root = runtime.path
-                service.validate_runtime_child(source, state, runtime.commit_sha, command_id=runtime.mutation_id)
-                service.validate_runtime_mutation(source, state, runtime.commit_sha, runtime.mutation_id, concurrent=True)
-                service.remove_runtime_worktree(source, state, runtime)
-                return 0
-            with process_lock(state, identity='automatic-run'), mock.patch.object(manager, 'ROOT', source), \
-                 mock.patch.object(manager, 'github_repository', return_value='owner/repo'), \
-                 mock.patch.object(manager.sys, 'argv', ['loop_manager.py', '--state-dir', str(state), 'manual', 'start', str(source), 'G-188']), \
-                 mock.patch.object(manager, 'run_runtime_child', side_effect=child), \
-                 mock.patch.object(manager, 'synchronize_base_worktree') as sync:
-                self.assertEqual(manager.main(), 0)
-                sync.assert_not_called()
+    def test_concurrent_entries_reach_child_while_automatic_lease_is_held(self):
+        for command in ("manual", "recover"):
+            with self.subTest(command=command), tempfile.TemporaryDirectory() as directory:
+                _, source, _writer = remote_fixture(directory)
+                state = Path(directory) / 'state'
+                command_args = (['manual', 'start', str(source), 'G-188'] if command == 'manual'
+                                else ['recover', str(source), '--plan', 'G-188'])
+                def child(_source, _state, _config, runtime, _arguments):
+                    self.assertTrue(runtime.concurrent)
+                    self.assertIn('/commands/', str(runtime.path))
+                    self.assertEqual(_held_process_lock_identity(state), 'automatic-run')
+                    self.assertEqual(_held_process_lock_identity(state, name=f'manual-{runtime.mutation_id}.lock'), 'runtime:' + runtime.mutation_id)
+                    service = manager._bootstrap_service()
+                    service.runtime_root = runtime.path
+                    service.validate_runtime_child(source, state, runtime.commit_sha, command_id=runtime.mutation_id)
+                    service.validate_runtime_mutation(source, state, runtime.commit_sha, runtime.mutation_id, concurrent=True)
+                    service.remove_runtime_worktree(source, state, runtime)
+                    return 0
+                with process_lock(state, identity='automatic-run'), mock.patch.object(manager, 'ROOT', source), \
+                     mock.patch.object(manager, 'github_repository', return_value='owner/repo'), \
+                     mock.patch.object(manager.sys, 'argv', ['loop_manager.py', '--state-dir', str(state), *command_args]), \
+                     mock.patch.object(manager, 'run_runtime_child', side_effect=child), \
+                     mock.patch.object(manager, 'synchronize_base_worktree') as sync:
+                    self.assertEqual(manager.main(), 0)
+                    sync.assert_not_called()
 
     def test_same_revision_manual_runtimes_are_isolated_and_cleanup_is_owned(self):
         with tempfile.TemporaryDirectory() as directory:
