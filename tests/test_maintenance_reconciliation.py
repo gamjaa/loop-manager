@@ -255,6 +255,24 @@ class ReconciliationUnitTest(unittest.TestCase):
                 self.contents[relation.left.path], self.contents[relation.right.path],
             )
 
+    def test_formatted_relation_result_keeps_identity_and_source_evidence_checks(self):
+        relation = reconciliation.relation_candidates(
+            self.inventory, self.progress((self.sources["src/a.py"],), (self.review_a,)),
+            {}, {},
+        )[0]
+        value = {"key": relation.key, "status": "confirmed", "left_excerpt": "helper()",
+                 "right_excerpt": "def helper()",
+                 "reason": "The caller and implementation share this concrete helper relationship."}
+        output = "**RELATION_RESULT** =\n" + json.dumps(value, indent=2)
+        self.assertEqual(reconciliation.parse_relation(
+            output, relation, self.contents[relation.left.path], self.contents[relation.right.path],
+        ), value)
+        with self.assertRaises(reconciliation.ReconciliationError):
+            reconciliation.parse_relation(
+                "RELATION_RESULT: " + json.dumps(value | {"key": "another-relation"}),
+                relation, self.contents[relation.left.path], self.contents[relation.right.path],
+            )
+
     def test_no_issue_requires_each_completed_relation_reason(self):
         result = {"key": "relation-key", "status": "excluded",
                   "reason": "The helpers implement distinct responsibilities for their callers."}

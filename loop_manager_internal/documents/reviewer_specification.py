@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-import json
+from loop_manager_internal.application.result_normalization import tagged_json
 
 
 @dataclass(frozen=True)
@@ -34,15 +34,9 @@ def validate_locations(
 
 
 def parse_evidence(output: str) -> SpecificationDeadlock:
-    declarations = [
-        line.strip() for line in output.splitlines()
-        if line.lstrip().upper().startswith("SPEC_DEADLOCK:")
-    ]
-    if len(declarations) != 1:
-        raise ValueError("SPEC_DEADLOCK 증거가 정확히 하나 필요합니다.")
     try:
-        value = json.loads(declarations[0].split(":", 1)[1].strip())
-    except (ValueError, TypeError) as error:
+        value = tagged_json(output, "SPEC_DEADLOCK")
+    except (ValueError, TypeError, RecursionError) as error:
         raise ValueError("SPEC_DEADLOCK JSON 형식이 유효하지 않습니다.") from error
     if not isinstance(value, dict) or set(value) != {
         "kind", "locations", "problem", "implementation_choice", "question"

@@ -152,6 +152,8 @@ ExecPlan 게시 실패:
 8. 교정 없는 Review 재실행, CLI·Reviewer 프로토콜 재시도, 중단된 동일 Worker turn 재개는 교정 결과를 늘리지 않는다. 전체 verify 실패, Worker 결과 형식 오류, Reviewer 실행 오류와 유효하지 않은 Review는 승격 집계에 포함하지 않고 진행 중인 집계도 초기화하지 않는다. 기준선·미완료 교정·검증 후보 identity와 effective level은 SQLite에 보존해 재시작과 같은 결과 재관측에서 중복 승격하지 않는다
 9. 전체 검증 성공은 verify 지문 이력만 초기화한다. 유효 Review PASS는 Review 지문 이력과 진행 중인 교정 집계를 끝내며 effective level과 과거 level별 승격·실패 감사는 유지한다
 
+Worker·Reviewer·Planner·모듈 검토 결과의 명확한 marker 배치·구분자·공백 차이는 Manager가 처리한다. 검증된 호출 입력의 identity만 결합하며 형식 처리만으로 추가 모델 호출·실패 집계·level 승격을 만들지 않는다. 상충 verdict·명시적 identity 불일치와 필수 판단·issue·원본 인용·검증 근거 누락은 기존 역할의 교정 대상으로 남긴다. 빈 원본·공백 chunk의 확정 사실은 재사용하되 내용이 있는 모듈의 의미 검토와 불확실한 관계의 보수적 처리를 유지한다.
+
 과거 `review_retry_exhausted` 차단은 저장된 원인과 현재 작업 공간·branch·원격 OID·Agent 범위·PR·rebase 상태를 재확인한다. Review 횟수 외 유효한 차단이 없고 소유권이 확인되면 기존 세션·실패 피드백·감사를 보존한 채 같은 교정 경로로 재개한다. 안전 근거가 부족하거나 별도 차단 원인이 있으면 그 상태를 유지한다.
 
 PR 없는 게시 checkpoint의 과거 Review 횟수 차단은 현재 게시 소유권과 작업 범위를 재검증해 해당 원인만 해제한다. 이 복구는 수행하지 않은 rebase의 완료 증거를 만들지 않으며, 남은 Review issue와 다른 차단은 보존한다.

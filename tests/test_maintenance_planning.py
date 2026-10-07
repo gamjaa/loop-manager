@@ -396,6 +396,29 @@ class FullAssessmentEvidenceTest(unittest.TestCase):
             inventory, revision, None,
         ))
 
+    def test_formatted_assessment_binds_revision_and_rejects_mismatch(self):
+        revision = "a" * 40
+        inventory = {"module.py": "b" * 64}
+        report = {
+            "source_revision": revision,
+            "coverage": {key: "Reviewed source responsibility evidence."
+                         for key in ("code", "tests", "documents")},
+            "findings": [],
+        }
+        omitted_identity = {key: value for key, value in report.items()
+                            if key != "source_revision"}
+        output = "**FULL_ASSESSMENT_RESULT** =\n" + json.dumps(omitted_identity, indent=2)
+        parsed = maintenance_validation.parse_assessment_result(
+            output, inventory, revision, (), set(),
+        )
+        self.assertEqual(json.loads(parsed), report)
+        mismatch = report | {"source_revision": "c" * 40}
+        with self.assertRaises(maintenance_file_inventory.AssessmentError):
+            maintenance_validation.parse_assessment_result(
+                maintenance_validation.RESULT_PREFIX + json.dumps(mismatch),
+                inventory, revision, (), set(),
+            )
+
     def test_malformed_finding_types_raise_validation_error(self):
         revision = "a" * 40
         inventory = {"module.py": "b" * 64}

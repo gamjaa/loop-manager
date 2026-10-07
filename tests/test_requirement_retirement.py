@@ -519,6 +519,27 @@ class RequirementRetirementTest(unittest.TestCase):
         )
         self.assertEqual(self.port.pending("repo", self.root, "base"), ())
 
+    def test_formatted_judgments_bind_verified_input_without_filling_criteria_evidence(self):
+        self.add_plan()
+        (item,) = self.port.pending('repo', self.root, 'base')
+        values = json.loads(self.judgment_line(item).split(': ', 1)[1])
+        values[0].pop('input_token')
+        output = '**REQUIREMENT_JUDGMENTS** =\n' + json.dumps(values, indent=2)
+        judgments = self.port.validate_result('repo', self.root, 'base', output)
+        self.assertEqual(judgments[0].outcome, 'fulfilled')
+        for change in ({'input_token': 'wrong'}, {'criteria_evidence': []}, {'relevant_paths': []}, {'path': 'other'}):
+            changed = [values[0] | change]
+            with self.subTest(change=change), self.assertRaises(RetirementError):
+                self.port.validate_result('repo', self.root, 'base', '**REQUIREMENT_JUDGMENTS** =\n' + json.dumps(changed))
+        with self.assertRaises(RetirementError):
+            self.port.validate_result('repo', self.root, 'base', output + '\n' + output)
+        duplicate = json.dumps(values).replace('"outcome": "fulfilled"', '"outcome":"unfulfilled","outcome":"fulfilled"')
+        with self.assertRaises(RetirementError):
+            self.port.validate_result('repo', self.root, 'base', 'REQUIREMENT_JUDGMENTS: ' + duplicate)
+        self.port.record('repo', judgments)
+        restarted = RequirementRetirementPort(self.connection, self.git)
+        self.assertEqual(restarted.validate_result('repo', self.root, 'base', output), judgments)
+
     def test_duplicate_final_judgments_are_rejected(self):
         self.add_plan()
         (item,) = self.port.pending("repo", self.root, "base")

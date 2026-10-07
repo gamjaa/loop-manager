@@ -1,6 +1,8 @@
 """Pinned change context and full specification review result validation."""
 from __future__ import annotations
 
+from loop_manager_internal.application.result_normalization import bind_identity, tagged_json
+
 import json
 import re
 import subprocess
@@ -37,8 +39,10 @@ def valid_final_receipt(receipt) -> bool:
     if receipt is None or receipt["purpose"] != "final" or not receipt["result"]:
         return False
     try:
-        matches = re.findall(r"^FINAL_SPECIFICATION_REVIEW:\s*(.+)$", receipt["result"], re.MULTILINE)
-        value = json.loads(matches[0]) if len(matches) == 1 else None
+        value = tagged_json(receipt["result"], "FINAL_SPECIFICATION_REVIEW")
+        if isinstance(value, dict):
+            value = bind_identity(value, {key: receipt[key] for key in (
+                "revision", "input_fingerprint", "specification_fingerprint", "work_cycle")})
         return bool(isinstance(value, dict) and value.get("outcome") == receipt["outcome"] == "fulfilled"
             and isinstance(value.get("reason"), str) and value["reason"].strip()
             and isinstance(value.get("evidence"), list) and value["evidence"]
@@ -96,16 +100,12 @@ def review_instruction(attempt, git, repo) -> str:
 
 
 def validate_final(attempt, result: str, batch, git, repo, *, manager_source_validator=None) -> str:
-    matches = re.findall(r"^FINAL_SPECIFICATION_REVIEW:\s*(.+)$", result, re.MULTILINE)
     try:
-        if len(matches) != 1:
-            raise ValueError("최종 전문 확인 결과는 정확히 하나여야 합니다.")
-        value = json.loads(matches[0])
+        value = tagged_json(result, "FINAL_SPECIFICATION_REVIEW")
         if not isinstance(value, dict):
             raise ValueError("최종 전문 확인은 JSON object여야 합니다.")
-        for key in ("revision", "input_fingerprint", "specification_fingerprint", "work_cycle"):
-            if value.get(key) != attempt[key]:
-                raise ValueError(f"최종 전문 확인 입력이 다릅니다: {key}")
+        value = bind_identity(value, {key: attempt[key] for key in (
+            "revision", "input_fingerprint", "specification_fingerprint", "work_cycle")})
         outcome = value.get("outcome")
         if outcome not in {"fulfilled", "followup", "needs_decision"}:
             raise ValueError("최종 전문 확인 outcome이 유효하지 않습니다.")

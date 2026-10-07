@@ -1,5 +1,6 @@
 """maintenance maintenance validation boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.application.result_normalization import bind_identity, tagged_json
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.application.contracts import ValidatedPlanningResult
@@ -553,14 +554,12 @@ def parse_assessment_result(
     new_plan_ids: tuple[str, ...], known_plan_ids: set[str],
 ) -> str:
     """Validate evidence and return canonical JSON suitable for SQLite."""
-    lines = [line[len(RESULT_PREFIX):] for line in output.splitlines()
-             if line.startswith(RESULT_PREFIX)]
-    if len(lines) != 1 or len(lines[0].encode("utf-8")) > 65536:
-        raise AssessmentError("전수 평가 결과 JSON 줄이 하나 필요하며 64 KiB를 넘을 수 없습니다.")
     try:
-        report = json.loads(lines[0])
-    except json.JSONDecodeError as error:
-        raise AssessmentError("전수 평가 결과가 올바른 JSON이 아닙니다.") from error
+        report = tagged_json(output, RESULT_PREFIX, max_bytes=65536)
+        if isinstance(report, dict):
+            report = bind_identity(report, {"source_revision": revision})
+    except (ValueError, RecursionError) as error:
+        raise AssessmentError("전수 평가 결과가 올바른 JSON 또는 source identity가 아닙니다.") from error
     if not isinstance(report, dict) or set(report) != {"source_revision", "coverage", "findings"}:
         raise AssessmentError("전수 평가 결과 필드가 올바르지 않습니다.")
     if report["source_revision"] != revision:

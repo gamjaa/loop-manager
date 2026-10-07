@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from loop_manager_internal.application.result_normalization import normalize_markers, tagged_json
+
 from dataclasses import dataclass
-import json
 from pathlib import PurePosixPath
 import re
 from typing import Mapping
@@ -45,15 +46,6 @@ _HEADING = re.compile(r"(?m)^#{1,6}[ \t]+(.+?)[ \t]*#*[ \t]*$")
 _PUBLICATION = re.compile(r"(?m)^[ \t]*(?:COMMIT_TITLE|PR_SUMMARY|TARGETED_TESTS):")
 
 
-def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise WorkerOutcomeError(f"Worker 결과의 중복 JSON 필드: {key}")
-        result[key] = value
-    return result
-
-
 def _required_text(value: object, name: str) -> str:
     if not isinstance(value, str) or not value.strip() or len(value) > 2000:
         raise WorkerOutcomeError(f"Worker 결정 대기의 {name} 값이 비어 있거나 너무 깁니다.")
@@ -72,9 +64,8 @@ def parse_worker_outcome(
 ) -> WorkerOutcome:
     """Read one explicit disposition, except for a stored legacy completion."""
 
+    message = normalize_markers(message, ("WORKER_OUTCOME", "COMMIT_TITLE", "PR_SUMMARY", "TARGETED_TESTS"))
     declarations = _DECLARATION.findall(message)
-    if re.search(r"(?m)^[ \t]+WORKER_OUTCOME:", message):
-        raise WorkerOutcomeError("Worker 결과 선언은 줄 시작에서 작성해야 합니다.")
     if not declarations:
         if allow_legacy_ready:
             return WorkerOutcome("ready_for_validation")
@@ -82,7 +73,7 @@ def parse_worker_outcome(
     if len(declarations) != 1 or len(message) > 65536 or len(declarations[0]) > 12000:
         raise WorkerOutcomeError("Worker 결과 선언이 중복되거나 너무 깁니다.")
     try:
-        value = json.loads(declarations[0], object_pairs_hook=_unique_object)
+        value = tagged_json(message, "WORKER_OUTCOME", max_bytes=12000)
     except (ValueError, TypeError) as error:
         raise WorkerOutcomeError("Worker 결과 선언 JSON이 유효하지 않습니다.") from error
     if not isinstance(value, dict):

@@ -2,6 +2,7 @@
 from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
+from loop_manager_internal.application.result_normalization import normalize_markers
 from loop_manager_internal.agents import agent_profiles
 from loop_manager_internal.application.contracts import ReviewerProtocolError
 from loop_manager_internal.application.contracts import VerifyOutput
@@ -282,7 +283,7 @@ class NormalizeReviewIssueIdsEffects:
 
 
 def _normalize_review_issue_ids(effects: NormalizeReviewIssueIdsEffects, output: str) -> tuple[str, ...]:
-    output = output.replace("\r\n", "\n").replace("\r", "\n")
+    output = normalize_markers(output, ("ISSUE_ID",))
     declarations = [
         line
         for line in output.splitlines()
@@ -298,7 +299,7 @@ def _normalize_review_issue_ids(effects: NormalizeReviewIssueIdsEffects, output:
             "Reviewer FAIL 결과의 ISSUE_ID 형식이 유효하지 않습니다."
         )
     raw_identifiers = [
-        match.group("identifier").strip().casefold()
+        "::".join(part.strip() for part in match.group("identifier").split("::")).casefold()
         for match in matches
     ]
     if any(
@@ -323,7 +324,8 @@ def parse_reviewer_result(
 ) -> tuple[str, tuple[str, ...] | reviewer_specification.SpecificationDeadlock]:
     """Validate the Reviewer response contract before any state transition."""
 
-    lines = output.replace("\r\n", "\n").replace("\r", "\n").splitlines()
+    output = normalize_markers(output, ("VERDICT", "ISSUE_ID", "SPEC_DEADLOCK"))
+    lines = output.splitlines()
     meaningful_lines = [
         (index, line)
         for index, line in enumerate(lines)
@@ -338,15 +340,11 @@ def parse_reviewer_result(
         raise ReviewerProtocolError(
             "Reviewer 결과는 정확히 하나의 VERDICT를 포함해야 합니다."
         )
-    verdict_index, verdict_line = verdict_lines[0]
+    _verdict_index, verdict_line = verdict_lines[0]
     verdict_match = _REVIEW_VERDICT.fullmatch(verdict_line)
     if verdict_match is None:
         raise ReviewerProtocolError(
             "Reviewer VERDICT는 PASS, FAIL 또는 SPEC_BLOCKED이어야 합니다."
-        )
-    if verdict_index != meaningful_lines[-1][0]:
-        raise ReviewerProtocolError(
-            "Reviewer VERDICT는 마지막 비어 있지 않은 줄이어야 합니다."
         )
 
     verdict = verdict_match.group(1).upper()
@@ -395,9 +393,10 @@ def _review_issue_paths(effects: ReviewIssuePathsEffects, output: object) -> lis
         return sorted(details.paths)
     if verdict != "FAIL":
         return []
+    output = normalize_markers(output, ("ISSUE_ID",))
     return sorted(
         {
-            match.group("identifier").strip().split("::", 1)[0]
+            match.group("identifier").strip().split("::", 1)[0].strip()
             for match in _REVIEW_ISSUE_ID.finditer(output)
         }
     )
@@ -678,21 +677,19 @@ class ParseWorkerResultEffects:
 
 def parse_worker_result(effects: ParseWorkerResultEffects, message: str, plan: dict[str, object]) -> WorkerPublication:
     """Parse and validate the Worker final-result contract before publishing."""
-    match = re.search(
-        r"(?ms)^COMMIT_TITLE:[ \t]*(?P<title>[^\r\n]*)\r?\nPR_SUMMARY:[ \t]*(?P<summary>.*?)\r?\nTARGETED_TESTS:\s*(?P<tests>.+)\Z",
-        message.strip(),
-    )
-    if not match:
-        title_line = re.search(r"(?m)^COMMIT_TITLE:.*$", message)
-        if title_line and not re.match(r"\r?\nPR_SUMMARY:", message[title_line.end():]):
-            raise WorkerResultError("Worker commit 제목은 한 줄이어야 합니다.")
-        raise WorkerResultError(
-            "Worker 결과에는 COMMIT_TITLE, PR_SUMMARY, TARGETED_TESTS 형식이 모두 필요합니다."
-        )
-
-    title = match.group("title").strip()
-    summary = match.group("summary").strip()
-    test_evidence = match.group("tests").strip()
+    markers = ("COMMIT_TITLE", "PR_SUMMARY", "TARGETED_TESTS", "WORKER_OUTCOME")
+    message = normalize_markers(message, markers)
+    labels = list(re.finditer(r"(?m)^(COMMIT_TITLE|PR_SUMMARY|TARGETED_TESTS|WORKER_OUTCOME): *", message))
+    publication_labels = [item.group(1) for item in labels if item.group(1) != "WORKER_OUTCOME"]
+    if len(publication_labels) != 3 or set(publication_labels) != set(markers[:3]):
+        raise WorkerResultError("Worker publication 선언이 누락되거나 중복됐습니다.")
+    fields = {
+        item.group(1): message[item.end():labels[index + 1].start() if index + 1 < len(labels) else len(message)].strip()
+        for index, item in enumerate(labels) if item.group(1) != "WORKER_OUTCOME"
+    }
+    title, summary, test_evidence = (fields[key] for key in markers[:3])
+    if "\n" in title:
+        raise WorkerResultError("Worker commit 제목은 한 줄이어야 합니다.")
     if not title:
         raise WorkerResultError("Worker commit 제목이 비어 있습니다.")
     if not summary:

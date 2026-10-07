@@ -1,5 +1,6 @@
 from tests.support.recovery import BoundedRecoveryFixture
 from tests.support.recovery_boundary import RecoveryBoundary
+import tempfile
 import unittest
 import loop_manager
 from unittest import mock
@@ -7,6 +8,20 @@ from tests.support.worker import dummy_worker_sessions
 
 
 class ReviewProtocolRecoveryTest(BoundedRecoveryFixture, unittest.TestCase):
+    @dummy_worker_sessions
+    def test_format_normalization_needs_no_retry_or_failure_transition(self):
+        with tempfile.TemporaryDirectory() as directory:
+            data = self._run_review_sequence(
+                directory,
+                (" **VERDICT** = PASS\nVerified source and scope.",),
+                publish=True,
+            )
+        self.assertEqual(data["roles"], ["worker", "reviewer"])
+        self.assertEqual(data["verify_calls"], 1)
+        self.assertEqual(data["transitions"], [])
+        self.assertEqual(data["plan"]["status"], "PR_OPEN")
+        self.assertEqual(data["plan"]["effective_worker_level"], 1)
+
     @dummy_worker_sessions
     def test_review_protocol_correction_preserves_pass_and_fail_transitions(self):
         invalid = "blocking issue without an identifier\nVERDICT: FAIL"
