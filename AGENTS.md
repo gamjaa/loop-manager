@@ -4,8 +4,6 @@
 
 ## 저장소 구조
 
-- `.agents/`, `docs/`, `scripts/`, `AGENTS.md`, `docs/PLANS.md`, `docs/ARCHITECTURE.md`,
-  존재하는 PRODUCT·Requirement와 현재 운영체제의 verify 경로는 지정된 루트 경로를 유지한다.
 - 새 루트 항목은 사용자 진입, 실행·빌드·배포 또는 도구의 필수 탐색이라는 근거가 필요하다.
   그 근거가 없는 새 루트 항목은 Review에서 blocking issue로 보고한다.
 
