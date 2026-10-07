@@ -323,7 +323,8 @@ class PlanningWorkspaceService(PlanningService):
                     )
                 if (row.planning_error and (not relevant_input_changed or mode_failure)
                         and not row.planning_result_completed
-                        and not row.planning_result_pending_validation):
+                        and not row.planning_result_pending_validation
+                        and not context.local_environment_recheck):
                     self._ports.events.error(
                         f"원격 base만 반영하고 동일 입력의 planning 오류를 보존합니다: {row.planning_error}"
                     )
@@ -435,5 +436,19 @@ class PlanningWorkspaceService(PlanningService):
                 return PlanningOutcome(
                     PlanningOutcomeKind.TRANSIENT_PAUSE, detail=str(error), error=True,
                 )
+        if (context.local_environment_recheck and row.planning_error
+                and (row.planning_error_origin != "unsafe" or self._linked_failed_result(run))):
+            # Link this checked workspace to the existing incident. Only fresh
+            # result validation may release it; retry counts remain untouched.
+            self._ports.state.preserve_diagnostics(context.repo, row)
+            incident_id = row.planning_error_incident_id or uuid4().hex
+            self._ports.state.update(
+                context.repo, planning_error_incident_id=incident_id,
+                planning_correction_error=row.planning_error,
+                planning_correction_incident_id=incident_id,
+                planning_correction_sha=str(row.active_sha),
+                planning_correction_context=self._correction_context(run),
+            )
+            run.row = self._ports.state.planning(context.repo)
         run.planning_worktree = worktree
         return None

@@ -616,9 +616,12 @@ class RecoveryRepository:
         *,
         resolved: bool,
         blocked_subjects: frozenset[str] = frozenset(),
+        resolved_subjects: frozenset[str] | None = None,
     ) -> None:
         """Resolve successful attempts or suppress final BLOCKED duplicates."""
 
+        if resolved_subjects is not None:
+            blocked_subjects = blocked_subjects & resolved_subjects
         where = "repo = ?" + (" AND last_run_id = ?" if run_id is not None else "")
         parameters: tuple[object, ...] = (repo,) + ((run_id,) if run_id is not None else ())
         if blocked_subjects or resolved:
@@ -628,7 +631,8 @@ class RecoveryRepository:
                 "FROM persistent_execution_failures WHERE repo = ? "
                 "AND notification_queued = 1", (repo,),
             ):
-                if resolved or str(row[0]) in blocked_subjects:
+                if ((resolved and (resolved_subjects is None or str(row[0]) in resolved_subjects))
+                        or str(row[0]) in blocked_subjects):
                     notifications.cancel_pending_persistent_execution_failure_event(
                         self.connection, repo, str(row[0]), int(row[1]),
                         str(row[2]), str(row[3]), str(row[4]),
@@ -645,13 +649,18 @@ class RecoveryRepository:
         if resolved:
             placeholders = ", ".join("?" for _ in blocked_subjects)
             exclusion = f" AND subject NOT IN ({placeholders})" if placeholders else ""
+            scope = ""
+            scope_parameters = ()
+            if resolved_subjects is not None:
+                scope = " AND subject IN (" + ",".join("?" for _ in resolved_subjects) + ")"
+                scope_parameters = tuple(resolved_subjects)
             self.connection.execute(
                 "UPDATE persistent_execution_failures SET active = 0, "
                 "consecutive_runs = 0, notification_eligible = 0, "
                 "notification_queued = 0, suppressed_by_block = 0, "
                 "updated_at = CURRENT_TIMESTAMP, resolved_at = CURRENT_TIMESTAMP "
-                f"WHERE repo = ?{exclusion}",
-                (repo, *blocked_subjects),
+                f"WHERE repo = ?{exclusion}{scope}",
+                (repo, *blocked_subjects, *scope_parameters),
             )
         if run_id is not None:
             self.connection.execute("DELETE FROM recovery_external_run")

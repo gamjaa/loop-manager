@@ -410,8 +410,15 @@ def resume_plan_blocks(
     base: str,
     config_path: Path | None = None,
     verify_timeout_seconds: int | None = None,
+    plan_id: str | None = None,
+    force_timeout_recheck: bool = False,
+    recovery_request_id: str | None = None,
 ) -> bool:
-    return scope_reconciliation.resume_plan_blocks(effects._scope_reconciliation_effects_resume_plan_blocks(), connection, repo_path, state_dir, repo, base, config_path, verify_timeout_seconds)
+    return scope_reconciliation.resume_plan_blocks(
+        effects._scope_reconciliation_effects_resume_plan_blocks(), connection,
+        repo_path, state_dir, repo, base, config_path, verify_timeout_seconds,
+        plan_id, force_timeout_recheck, recovery_request_id,
+    )
 
 
 @dataclass(frozen=True)
@@ -554,6 +561,7 @@ def dispatch_blocked_checkpoints(
     state_dir: Path,
     repo: str,
     *,
+    plan_id: str | None = None,
     skip_identities: frozenset[str] = frozenset(),
 ) -> int:
     """Commit prior block state, then process its network-independent request."""
@@ -572,7 +580,7 @@ def dispatch_blocked_checkpoints(
         max_push_attempts=MAX_TRANSIENT_AGENT_RETRIES,
     )
     completed = 0
-    for request in repository.pending(repo):
+    for request in repository.pending(repo, plan_id=plan_id):
         if request.request_identity in skip_identities:
             continue
         try:

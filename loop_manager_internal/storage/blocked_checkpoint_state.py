@@ -250,18 +250,24 @@ class BlockedCheckpointRepository:
             raise RuntimeError(f"checkpoint request를 찾을 수 없습니다: {plan_id}")
         return self._from_row(row)
 
-    def pending(self, repo: str) -> tuple[CheckpointRequest, ...]:
-        rows = self.connection.execute(
+    def pending(
+        self, repo: str, plan_id: str | None = None,
+    ) -> tuple[CheckpointRequest, ...]:
+        sql = (
             "SELECT * FROM blocked_checkpoints WHERE repo = ? "
-            "AND phase IN (?, ?, ?, ?) ORDER BY plan_id",
-            (
-                repo,
-                CheckpointPhase.REQUESTED.value,
-                CheckpointPhase.PREPARED.value,
-                CheckpointPhase.LOCAL_COMMITTED.value,
-                CheckpointPhase.RETRY_PENDING.value,
-            ),
-        ).fetchall()
+            "AND phase IN (?, ?, ?, ?)"
+        )
+        parameters: tuple[object, ...] = (
+            repo,
+            CheckpointPhase.REQUESTED.value,
+            CheckpointPhase.PREPARED.value,
+            CheckpointPhase.LOCAL_COMMITTED.value,
+            CheckpointPhase.RETRY_PENDING.value,
+        )
+        if plan_id is not None:
+            sql += " AND plan_id = ?"
+            parameters += (plan_id,)
+        rows = self.connection.execute(sql + " ORDER BY plan_id", parameters).fetchall()
         return tuple(self._from_row(row) for row in rows)
 
     def _update(self, request: CheckpointRequest, **values: object) -> None:

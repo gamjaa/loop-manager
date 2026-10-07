@@ -174,6 +174,16 @@ class _PlanningStatePorts:
     def update(self, repo: str, **values: object) -> None:
         self._effects.update_project(self._connection, repo, **values)
 
+    def local_recheck_consumed(self, request_id: str) -> bool:
+        from loop_manager_internal.storage import local_recovery_state
+        return local_recovery_state.recheck_consumed(self._connection, request_id, "planning", "planner")
+
+    def update_local_recheck_result(self, repo: str, request_id: str, **values: object) -> None:
+        from loop_manager_internal.storage import local_recovery_state
+        with self.transaction():
+            self.update(repo, **values)
+            local_recovery_state.consume_recheck(self._connection, request_id, "planning", "planner")
+
     def release_planning_correction(
         self, repo: str, *, error: str, active_sha: str, context: str,
     ) -> bool:

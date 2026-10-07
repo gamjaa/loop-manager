@@ -36,6 +36,24 @@ class PlanningSelectionService(PlanningService):
         """Check the failed input before scheduling or stale-workspace cleanup."""
 
         row = run.row
+        if (run.context.recovery_request_id
+                and self._ports.state.local_recheck_consumed(run.context.recovery_request_id)
+                and not row.planning_result_completed):
+            return self._operational_error()
+        if run.context.local_environment_recheck and row.planning_error:
+            if row.planning_preserved_state:
+                if self._ports.state.schedule(run.context.repo).active is not None:
+                    return PlanningOutcome(PlanningOutcomeKind.WAITING)
+                self._ports.state.resume_planning(row)
+                row = self._ports.state.planning(run.context.repo)
+                run.row = row
+                run.maintenance_planning = bool(row.phase == "PLANNING" and run.maintenance_cycle.phase in {
+                    maintenance_state.MaintenancePhase.ASSESSMENT,
+                    maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+                })
+            # Authorize one current check, retaining failure and promotion history.
+            run.error_input_changed = True
+            return None
         if row.planning_preserved_state:
             decision = self._ports.state.schedule(run.context.repo)
             if getattr(decision, "active", None) is not None:
@@ -881,6 +899,8 @@ class PlanningSelectionService(PlanningService):
     ) -> PlanningOutcome:
         context = run.context
         row = run.row
+        if context.local_environment_recheck:
+            return PlanningOutcome(PlanningOutcomeKind.NO_CHANGE, base_sha=run.base_sha)
         newly_activated = run.ready_activated_before_planning
         if (hasattr(self._ports, "tiered") and run.maintenance_planning and not row.phase
                 and self._ports.state.maintenance_cycle(context.repo).phase is maintenance_state.MaintenancePhase.IDLE):

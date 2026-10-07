@@ -73,6 +73,8 @@ class PlanningLifecycleCoordinator:
                     break
                 if outcome.kind is not PlanningOutcomeKind.ASSESSMENT_PROGRESS:
                     return outcome
+                if context.local_environment_recheck:
+                    return PlanningOutcome(PlanningOutcomeKind.WAITING)
                 completed += 1
                 if (completed >= MAX_ASSESSMENT_BATCHES
                     or time.monotonic() - started >= ASSESSMENT_RUN_SECONDS):

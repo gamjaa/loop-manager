@@ -93,6 +93,20 @@ Planner는 검증된 계획을 base branch에 fast-forward push하므로 Loop Ma
 
 저장소 인자 없이 등록된 프로젝트를 처리한다. 한 프로젝트의 차단·일시 실패는 다른 프로젝트를 막지 않는다. 안정된 열린 PR이나 계획별 차단이 있어도 독립 READY는 처리할 수 있으며, 의존 작업은 선행 PR Merge를 기다린다. 같은 성공 입력에서 할 일이 없으면 Agent를 반복 호출하지 않는다.
 
+등록 프로젝트의 로컬 설정·인증·도구·권한·timeout을 고친 뒤에는 원격 변경 없이 선택한 원인을 다시 검사할 수 있다.
+
+```powershell
+& .\.venv\Scripts\python.exe loop_manager.py recover D:\repo\my-project
+& .\.venv\Scripts\python.exe loop_manager.py recover D:\repo\my-project --plan G-001
+```
+
+```sh
+.venv/bin/python loop_manager.py recover /path/to/my-project
+.venv/bin/python loop_manager.py recover /path/to/my-project --plan G-001
+```
+
+계획을 지정하면 해당 계획만 검사한다. 로컬 문제를 고친 뒤 재개할 때 사용하며, 원격 코드·문서 변경은 기존 `run`의 자동 복구 경로에서 처리한다. 잘못된 대상·미해결 원인·실행 자리 대기는 0이 아닌 종료 코드로 보고하고, 같은 상태 디렉터리의 전역 실행 잠금을 사용한다.
+
 cron 또는 Windows 작업 스케줄러에는 `run --skip-if-running`을 등록한다. 정상적인 중복 실행은 조용히 건너뛴다. 옵션 없이 전역 lock이 충돌하면 시각이 포함된 오류와 종료 코드 1을 반환하며, lock 외 오류는 그대로 보고한다.
 
 bootstrap은 최신 `origin/main`의 정확한 SHA에서 runtime을 실행한다. source checkout의 로컬 main·미커밋 변경·로컬 전용 commit은 실행 revision이 아니다. 기본 프로젝트 checkout은 안전한 경우에만 fast-forward하고 그 밖의 로컬 상태는 보존한다. [실행·동기화 구조](docs/ARCHITECTURE.md#git과-worktree-실행-모델)

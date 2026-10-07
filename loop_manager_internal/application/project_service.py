@@ -107,6 +107,8 @@ class ProjectIdentity:
     refactoring_review_interval: int
     verify_timeout_seconds: int
     runtime_mutation: RuntimeMutation | None
+    recovery_request_id: str | None = None
+    recovery_plan_id: str | None = None
 
 
 @dataclass
@@ -143,14 +145,17 @@ class ProjectService:
         self.state = ProjectObservations(Path(identity.repo_arg))
 
     def run(self) -> ProjectStepResult:
-        for step in (
+        steps = [
             self._prepare_repository,
             self._reconcile_catalog_and_cleanup,
-            self._synchronize_pull_requests,
-            self._resume_manual_work,
-            self._resume_existing_execution,
-            self._run_coordinators,
-        ):
+        ]
+        if self.identity.recovery_request_id is None:
+            steps.append(self._synchronize_pull_requests)
+            steps.append(self._resume_manual_work)
+        else:
+            steps.append(self._recheck_local_plan_blocks)
+        steps.extend((self._resume_existing_execution, self._run_coordinators))
+        for step in steps:
             result = step()
             if result is not None:
                 return ProjectStepResult(result)
@@ -181,6 +186,16 @@ class ProjectService:
             raise RuntimeError(f"등록되지 않은 프로젝트입니다: {self.state.repo}")
         if self.state.row is None and self.identity.registered_only:
             raise RuntimeError(f"등록되지 않은 프로젝트입니다: {self.state.repo}")
+        if self.identity.recovery_request_id and self.identity.recovery_plan_id is not None:
+            active = runtime_state.RuntimeStateRepository(self.identity.connection).active_row(
+                self.state.repo,
+            )
+            if active is not None and str(active["plan_id"]) != self.identity.recovery_plan_id:
+                self.effects.operation_print(
+                    "다른 계획이 프로젝트 실행 자리를 사용 중이어서 선택한 계획을 재검사하지 않았습니다: "
+                    + str(active["plan_id"]), file=sys.stderr,
+                )
+                return 1
         self.state.require_self_pr_base = self.effects._self_runtime_project(
             self.identity.connection, self.state.repo, self.identity.state_dir, self.identity.runtime_mutation,
         ) is not None
@@ -196,7 +211,13 @@ class ProjectService:
                 f"등록된 provider는 {self.state.provider}이며 {self.identity.requested_provider}로 변경할 수 없습니다."
             )
         if self.state.row is not None:
-            self.effects.observe_blocked_plan_remotes(self.identity.connection, self.state.repo_path, self.state.repo, self.state.row)
+            self.effects.observe_blocked_plan_remotes(
+                self.identity.connection, self.state.repo_path, self.state.repo,
+                self.state.row,
+                **({"plan_id": self.identity.recovery_plan_id}
+                   if self.identity.recovery_request_id and self.identity.recovery_plan_id
+                   else {}),
+            )
         self.effects._ensure_cleanup_pending_schema(self.identity.connection)
         initial_project_block = (
             scoped_blocking.project_block(self.identity.connection, self.state.repo) if self.state.row is not None else None
@@ -212,6 +233,12 @@ class ProjectService:
             and initial_project_block["reason_code"]
             != BlockReasonCode.EXECPLAN_CATALOG_INVALID.value
         ):
+            if self.identity.recovery_request_id:
+                self.effects.operation_print(
+                    "프로젝트 안전 차단은 로컬 재검사 명령으로 해제하지 않습니다: "
+                    + str(initial_project_block["reason_code"]), file=sys.stderr,
+                )
+                return 1
             self.effects.observe_waiting_pull_requests(
                 self.identity.connection, self.state.repo_path, self.identity.state_dir, self.state.repo,
                 require_base_identity=self.state.require_self_pr_base, read_only=True,
@@ -246,7 +273,14 @@ class ProjectService:
             ).fetchall()
         )
         self.state.checkpoint_cleanup_candidates = self.state.cleanup_candidates
-        if self.state.row and self.state.row["agent_recovery"]:
+        active_plan = self.effects.active_execplan(self.identity.connection, self.state.repo)
+        active_plan_matches_recovery = (
+            self.identity.recovery_request_id is None
+            or self.identity.recovery_plan_id is None
+            or active_plan is not None
+            and str(active_plan["plan_id"]) == self.identity.recovery_plan_id
+        )
+        if self.state.row and self.state.row["agent_recovery"] and active_plan_matches_recovery:
             try:
                 self.effects.resume_interrupted_blocked_agent_recovery(
                     self.identity.connection,
@@ -406,6 +440,12 @@ class ProjectService:
         if self.state.row is not None and execplan_catalog_state.DefinitionStateRepository(
             self.identity.connection
         ).has_publication_intent(self.state.repo):
+            if self.identity.recovery_request_id and self.identity.recovery_plan_id is not None:
+                self.effects.operation_print(
+                    "계획별 재검사에서는 planning 게시 복구를 실행하지 않습니다.",
+                    file=sys.stderr,
+                )
+                return 1
             # The owning publication must recover its manifest before the catalog
             # can classify new IDs. No PR/archive/selection consumer runs here.
             context = PlanningContext(
@@ -415,6 +455,8 @@ class ProjectService:
                 refactoring_review_interval=self.identity.refactoring_review_interval,
                 self_repository=self.identity.registered_only and self.effects.is_loop_manager_repository(self.state.repo_path),
                 refresh_catalog=self._refresh_catalog,
+                local_environment_recheck=bool(self.identity.recovery_request_id),
+                recovery_request_id=self.identity.recovery_request_id,
             )
             self.state.recovered_planning_outcome = PlanningLifecycleCoordinator(self.effects._PlanningLifecyclePorts(
                 self.identity.connection, runtime_state.RuntimeStateRepository(self.identity.connection),
@@ -460,7 +502,8 @@ class ProjectService:
                 (self.state.repo, WORKSPACE_OWNED),
             ).fetchall()
         )
-        if self.state.row is not None and runtime_state.planning_owns_execution_slot(self.state.row):
+        if (self.identity.recovery_request_id is not None
+                or self.state.row is not None and runtime_state.planning_owns_execution_slot(self.state.row)):
             cleanup_pending = self.identity.connection.execute(
                 "SELECT * FROM cleanup_pending WHERE repo = ?", (self.state.repo,)
             ).fetchall()
@@ -559,9 +602,18 @@ class ProjectService:
                 )
                 self.effects.operation_print(message, file=sys.stderr)
                 return 1
+        return self._recheck_local_plan_blocks()
+
+    def _recheck_local_plan_blocks(self) -> int | None:
+        """Use the same block policy without synchronizing unrelated PRs."""
         self.effects.resume_plan_blocks(
             self.identity.connection, self.state.repo_path, self.identity.state_dir, self.state.repo, self.state.base, self.identity.config_path,
             self.identity.verify_timeout_seconds,
+            **({
+                "plan_id": self.identity.recovery_plan_id,
+                "force_timeout_recheck": True,
+                "recovery_request_id": self.identity.recovery_request_id,
+            } if self.identity.recovery_request_id else {}),
         )
         if scoped_blocking.project_block(self.identity.connection, self.state.repo) is not None:
             return 1
@@ -570,6 +622,13 @@ class ProjectService:
         ).fetchone()
 
     def _resume_existing_execution(self) -> int | None:
+        if (self.identity.recovery_request_id
+                and self.identity.recovery_plan_id is not None):
+            active = runtime_state.RuntimeStateRepository(
+                self.identity.connection,
+            ).active_row(self.state.repo)
+            if active is None or str(active["plan_id"]) != self.identity.recovery_plan_id:
+                return None
         if (
             self.state.row and self.state.row["branch"]
             and not runtime_state.planning_owns_execution_slot(self.state.row)
@@ -708,6 +767,41 @@ class ProjectService:
             return self._catalog_stop(error)
         runtime_repository = runtime_state.RuntimeStateRepository(self.identity.connection)
         maintenance_repository = maintenance_state.MaintenanceRepository(self.identity.connection)
+        if self.identity.recovery_request_id:
+            active = runtime_repository.active_row(self.state.repo)
+            if self.identity.recovery_plan_id is not None:
+                target = self.identity.connection.execute(
+                    "SELECT status FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                    (self.state.repo, self.identity.recovery_plan_id),
+                ).fetchone()
+                if target is None:
+                    self.effects.operation_print(
+                        f"선택한 계획이 더 이상 존재하지 않습니다: {self.identity.recovery_plan_id}",
+                        file=sys.stderr,
+                    )
+                    return 1
+                if active is not None and str(active["plan_id"]) != self.identity.recovery_plan_id:
+                    self.effects.operation_print(
+                        "다른 계획이 프로젝트 실행 자리를 사용 중이어서 재검사하지 않았습니다: "
+                        + str(active["plan_id"]), file=sys.stderr,
+                    )
+                    return 1
+                if active is None:
+                    self.effects.operation_print(
+                        f"선택한 계획에 실행할 로컬 복구 단계가 없습니다: {target['status']}",
+                    )
+                    return 0
+            elif active is None and not (
+                self.state.row["planning_error"]
+                or runtime_state.planning_owns_execution_slot(self.state.row)
+                or self.state.recovered_planning_outcome is not None
+            ):
+                self.effects.operation_print(
+                    "실행 중인 로컬 복구 단계가 없습니다. 프로젝트 환경과 저장된 차단 원인을 확인했습니다."
+                )
+                return 0
+            if active is not None or self.identity.recovery_plan_id is not None:
+                return self._dispatch_execution(runtime_repository, newly_activated=False)
         planning_context = PlanningContext(
             repo=self.state.repo,
             repo_path=self.state.repo_path,
@@ -720,6 +814,8 @@ class ProjectService:
             refactoring_review_interval=self.identity.refactoring_review_interval,
             self_repository=self.identity.registered_only and self.effects.is_loop_manager_repository(self.state.repo_path),
             refresh_catalog=self._refresh_catalog,
+            local_environment_recheck=bool(self.identity.recovery_request_id),
+            recovery_request_id=self.identity.recovery_request_id,
         )
         self.effects._check_runtime_handoff()
         if self.state.recovered_planning_outcome is not None:
@@ -760,7 +856,14 @@ class ProjectService:
         if planning_step_result is not None:
             return planning_step_result
         self.state.base_sha = planning_outcome.base_sha or self.state.base_sha
+        if self.identity.recovery_request_id:
+            return 0
         newly_activated = planning_outcome.newly_activated
+        return self._dispatch_execution(
+            runtime_repository, newly_activated=newly_activated,
+        )
+
+    def _dispatch_execution(self, runtime_repository, *, newly_activated: bool) -> int:
         execution_ports = self.effects._ExecutionLifecyclePorts(
             self.identity.connection,
             runtime_repository,
@@ -912,6 +1015,8 @@ def _run_project_step(
     refactoring_review_interval: int = 20,
     verify_timeout_seconds: int = 600,
     runtime_mutation: RuntimeMutation | None = None,
+    recovery_request_id: str | None = None,
+    recovery_plan_id: str | None = None,
 ) -> int:
     """Integer compatibility adapter for the typed project service result."""
     identity = ProjectIdentity(
@@ -927,5 +1032,7 @@ def _run_project_step(
         refactoring_review_interval=refactoring_review_interval,
         verify_timeout_seconds=verify_timeout_seconds,
         runtime_mutation=runtime_mutation,
+        recovery_request_id=recovery_request_id,
+        recovery_plan_id=recovery_plan_id,
     )
     return ProjectService(effects, identity).run().code

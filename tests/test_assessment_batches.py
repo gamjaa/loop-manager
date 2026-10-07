@@ -303,7 +303,7 @@ class AssessmentContinuationTest(unittest.TestCase):
             PlanningOutcome(PlanningOutcomeKind.ASSESSMENT_PROGRESS),
             PlanningOutcome(PlanningOutcomeKind.NO_CHANGE)]))
         with mock.patch.object(planning_runtime, "snapshot_run", side_effect=lambda run: run):
-            outcome = coordinator.run(SimpleNamespace(base_sha=REVISION, repo_path=Path("/repo"), base_branch="main"))
+            outcome = coordinator.run(SimpleNamespace(base_sha=REVISION, repo_path=Path("/repo"), base_branch="main", local_environment_recheck=False))
         self.assertEqual(outcome.kind, PlanningOutcomeKind.NO_CHANGE)
         self.assertEqual(gate.step.call_count, 2)
         self.assertEqual(coordinator._new_run.call_count, 2)
@@ -313,23 +313,35 @@ class AssessmentContinuationTest(unittest.TestCase):
             PlanningOutcome(PlanningOutcomeKind.ASSESSMENT_PROGRESS)]))
         coordinator._ports.git.fetch_base.return_value = "b" * 40
         with mock.patch.object(planning_runtime, "snapshot_run", side_effect=lambda run: run):
-            outcome = coordinator.run(SimpleNamespace(base_sha=REVISION, repo_path=Path("/repo"), base_branch="main"))
+            outcome = coordinator.run(SimpleNamespace(base_sha=REVISION, repo_path=Path("/repo"), base_branch="main", local_environment_recheck=False))
         self.assertEqual((outcome.kind, outcome.base_sha),
                          (PlanningOutcomeKind.REMOTE_BASE_RESTART, "b" * 40))
         self.assertEqual(assessment.step.call_count, 1)
+
+    def test_local_environment_recheck_stops_after_one_batch(self):
+        coordinator, gate, assessment = self.coordinator(iter([
+            PlanningOutcome(PlanningOutcomeKind.ASSESSMENT_PROGRESS)]))
+        context = SimpleNamespace(base_sha=REVISION, repo_path=Path("/repo"),
+                                  base_branch="main", local_environment_recheck=True)
+        with mock.patch.object(planning_runtime, "snapshot_run", side_effect=lambda run: run):
+            outcome = coordinator.run(context)
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.WAITING)
+        self.assertEqual(gate.step.call_count, 1)
+        self.assertEqual(assessment.step.call_count, 1)
+        coordinator._ports.git.fetch_base.assert_not_called()
 
     def test_budget_yields_durably_and_errors_do_not_trigger_another_batch(self):
         coordinator, gate, assessment = self.coordinator(iter([
             PlanningOutcome(PlanningOutcomeKind.ASSESSMENT_PROGRESS)]))
         with mock.patch.object(planning_runtime, "snapshot_run", side_effect=lambda run: run), \
              mock.patch.object(planning_runtime, "MAX_ASSESSMENT_BATCHES", 1):
-            self.assertEqual(coordinator.run(mock.Mock()).kind, PlanningOutcomeKind.WAITING)
+            self.assertEqual(coordinator.run(mock.Mock(local_environment_recheck=False)).kind, PlanningOutcomeKind.WAITING)
         self.assertEqual(assessment.step.call_count, 1)
         for kind in (PlanningOutcomeKind.VALIDATION_RETRY, PlanningOutcomeKind.REMOTE_BASE_RESTART,
                      PlanningOutcomeKind.USAGE_LIMIT_PAUSE):
             coordinator, gate, assessment = self.coordinator(iter([PlanningOutcome(kind)]))
             with mock.patch.object(planning_runtime, "snapshot_run", side_effect=lambda run: run):
-                self.assertEqual(coordinator.run(mock.Mock()).kind, kind)
+                self.assertEqual(coordinator.run(mock.Mock(local_environment_recheck=False)).kind, kind)
             self.assertEqual(assessment.step.call_count, 1)
 
 

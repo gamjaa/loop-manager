@@ -119,6 +119,7 @@ class FakeStatePort:
         self.updates = []
         self.diagnostics = []
         self.remote_diagnostics = []
+        self.local_recheck_results = set()
         self.clear_calls = []
         self.activate_result = None
         self.recovered_cycle = self.cycle
@@ -213,6 +214,13 @@ class FakeStatePort:
         }
         if snapshot_values:
             self.snapshot = replace(self.snapshot, **snapshot_values)
+
+    def local_recheck_consumed(self, request_id):
+        return request_id in self.local_recheck_results
+
+    def update_local_recheck_result(self, repo, request_id, **values):
+        self.update(repo, **values)
+        self.local_recheck_results.add(request_id)
 
     def release_planning_correction(self, _repo, *, error, active_sha, context):
         row = self.snapshot

@@ -46,6 +46,8 @@ def run_project_result(
     on_step_completed: Callable[[], None] | None = None,
     runtime_mutation: RuntimeMutation | None = None,
     external_run_id: str | None = None,
+    recovery_request_id: str | None = None,
+    recovery_plan_id: str | None = None,
 ) -> ProjectRunResult:
     """Run one scheduler invocation and project its external failure outcome."""
 
@@ -58,6 +60,7 @@ def run_project_result(
     # recovery observation durable on its own bounded state transition.
     connection.commit()
     outcome: ProjectRunResult | None = None
+    recovery_active = runtime_state.RuntimeStateRepository(connection).active_row(repo) if recovery_request_id else None
     try:
         outcome = effects._run_project_result(
             connection, state_dir, repo_arg, config_path, requested_base,
@@ -66,6 +69,10 @@ def run_project_result(
             refactoring_review_interval=refactoring_review_interval,
             verify_timeout_seconds=verify_timeout_seconds,
             on_step_completed=on_step_completed, runtime_mutation=runtime_mutation,
+            **({
+                "recovery_request_id": recovery_request_id,
+                "recovery_plan_id": recovery_plan_id,
+            } if recovery_request_id is not None else {}),
         )
         return outcome
     except SelfMergeRuntimeHandoff:
@@ -75,6 +82,25 @@ def run_project_result(
         # Failure observations are saved in their recovery transaction.  This
         # boundary only resolves an execution that reached a stable outcome.
         with connection:
+            resolved_subjects = None
+            if recovery_request_id is not None:
+                # Local recovery may resolve only inspected subjects. Planning
+                # errors are independent of the selected execution's outcome.
+                if recovery_plan_id is not None:
+                    subjects = {recovery_plan_id}
+                    project = connection.execute("SELECT planning_error FROM projects WHERE repo = ?", (repo,)).fetchone()
+                    if project is not None and not project[0]:
+                        subjects.add("__project__")
+                    resolved_subjects = frozenset(subjects)
+                else:
+                    project = connection.execute("SELECT planning_error FROM projects WHERE repo = ?", (repo,)).fetchone()
+                    subjects = {str(recovery_active["plan_id"])} if recovery_active is not None else set()
+                    current_active = runtime_state.RuntimeStateRepository(connection).active_row(repo)
+                    if current_active is not None:
+                        subjects.add(str(current_active["plan_id"]))
+                    if project is not None and not project[0]:
+                        subjects.add("__project__")
+                    resolved_subjects = frozenset(subjects)
             recovery_repository.finish_external_run(
                 repo, run_id,
                 resolved=(
@@ -87,6 +113,7 @@ def run_project_result(
                         ProjectRunKind.RUNTIME_HANDOFF,
                     }
                 ),
+                resolved_subjects=resolved_subjects,
                 blocked_subjects=(
                     frozenset() if outcome is not None
                     and outcome.kind is ProjectRunKind.RUNTIME_HANDOFF
@@ -125,6 +152,8 @@ def _run_project_result(
     verify_timeout_seconds: int = 600,
     on_step_completed: Callable[[], None] | None = None,
     runtime_mutation: RuntimeMutation | None = None,
+    recovery_request_id: str | None = None,
+    recovery_plan_id: str | None = None,
 ) -> ProjectRunResult:
     """Run retryable validation progress to a stable project-level outcome."""
 
@@ -134,8 +163,18 @@ def _run_project_result(
         recovery_state.ensure_schema(connection)
     recovery_attempts: dict[str, int] = {}
     pause_detail: str | None = None
+
+    def checkpoint_dispatch_scope() -> tuple[bool, str | None]:
+        if recovery_request_id is None or recovery_plan_id is None:
+            return True, None
+        active = runtime_state.RuntimeStateRepository(connection).active_row(repo)
+        if active is not None and str(active["plan_id"]) != recovery_plan_id:
+            return False, recovery_plan_id
+        return True, recovery_plan_id
+
     while True:
-        if effects._checkpoint_dispatch_ready(connection, repo):
+        dispatch_checkpoints, checkpoint_plan_id = checkpoint_dispatch_scope()
+        if dispatch_checkpoints and effects._checkpoint_dispatch_ready(connection, repo):
             project_before = connection.execute(
                 "SELECT phase, pr_conflict_recovery FROM projects WHERE repo = ?",
                 (repo,),
@@ -157,7 +196,7 @@ def _run_project_result(
             pending_before = (
                 blocked_checkpoint_state.BlockedCheckpointRepository(
                     connection
-                ).pending(repo)
+                ).pending(repo, plan_id=checkpoint_plan_id)
             )
             if any(
                 request.request_identity not in checkpoint_attempts
@@ -168,6 +207,7 @@ def _run_project_result(
                     Path(repo),
                     state_dir,
                     repo,
+                    plan_id=checkpoint_plan_id,
                     skip_identities=frozenset(checkpoint_attempts),
                 )
                 checkpoint_attempts.update(
@@ -197,6 +237,10 @@ def _run_project_result(
             step_result = effects._run_project_step(
                 *step_arguments,
                 **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
+                **({
+                    "recovery_request_id": recovery_request_id,
+                    "recovery_plan_id": recovery_plan_id,
+                } if recovery_request_id is not None else {}),
             )
         except GitLockError as error:
             effects._record_project_recovery(
@@ -236,11 +280,12 @@ def _run_project_result(
                     step_result = PROJECT_STEP_TRANSIENT_PAUSE
                     pause_detail = str(record["detail"])
                     break
-        if effects._checkpoint_dispatch_ready(connection, repo):
+        dispatch_checkpoints, checkpoint_plan_id = checkpoint_dispatch_scope()
+        if dispatch_checkpoints and effects._checkpoint_dispatch_ready(connection, repo):
             pending_after = (
                 blocked_checkpoint_state.BlockedCheckpointRepository(
                     connection
-                ).pending(repo)
+                ).pending(repo, plan_id=checkpoint_plan_id)
             )
             if any(
                 request.request_identity not in checkpoint_attempts
@@ -251,6 +296,7 @@ def _run_project_result(
                     Path(repo),
                     state_dir,
                     repo,
+                    plan_id=checkpoint_plan_id,
                     skip_identities=frozenset(checkpoint_attempts),
                 )
                 checkpoint_attempts.update(
@@ -258,7 +304,8 @@ def _run_project_result(
                 )
             schedule = effects.catalog_schedule_decision(connection, repo)
             if (
-                step_result not in {
+                recovery_request_id is None
+                and step_result not in {
                     PROJECT_STEP_TRANSIENT_PAUSE,
                     PROJECT_STEP_USAGE_PAUSE,
                     PROJECT_STEP_PLANNING_PENDING,
@@ -273,6 +320,8 @@ def _run_project_result(
                 ).fetchone()
                 if project_after is not None and not runtime_state.planning_owns_execution_slot(project_after):
                     step_result = PROJECT_STEP_RETRY
+        if recovery_request_id is not None and step_result == PROJECT_STEP_RETRY:
+            step_result = PROJECT_STEP_TRANSIENT_PAUSE
         if step_result != PROJECT_STEP_RETRY:
             break
 
@@ -303,6 +352,8 @@ def _run_project_result(
         if step_result == 0:
             effects.operation_log(reason)
             return ProjectRunResult(ProjectRunKind.WAITING, 0, reason)
+    if recovery_request_id is not None and step_result != 0:
+        return ProjectRunResult(ProjectRunKind.OPERATIONAL_ERROR, 1, detail)
     snapshot = None
     if step_result == 0 or (step_result == 1 and connection.execute(
         "SELECT 1 FROM exec_plans WHERE repo = ? AND status = 'PLAN_BLOCKED' "
