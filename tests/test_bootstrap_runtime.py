@@ -397,6 +397,7 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
         from tests.support.git import make_remote_repository, copy_manager_import_fixture
         from tests.support.catalog import write_execplan
         from tests.support.profiles import profile_config
+        from tests.support.runtime import record_saved_scope_invocation
         from loop_manager_internal.execution.worker_session import SessionBinding
         from loop_manager_internal.planning.planning_workspace import planning_workspace_path
 
@@ -422,7 +423,7 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
         if (state_dir / 'expected-role').read_text() == 'reviewer' and role == 'worker':
             return CodexResult(0, 'WORKER_OUTCOME: {"kind":"ready_for_validation"}\\n'
                 'COMMIT_TITLE: Preserve saved candidate\\nPR_SUMMARY: Preserve saved candidate\\n'
-                'TARGETED_TESTS: fixture verification', options.get('session_id'))
+                'TARGETED_TESTS: fixture unit PASS', options.get('session_id'))
         return CodexResult(1, 'usage limit reached', options.get('session_id'))
     if '--runtime-child' not in sys.argv:
         stop_file = Path(sys.argv[sys.argv.index('--state-dir') + 1]) / 'stop-after-registration'
@@ -485,17 +486,6 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                                 "reviewer_session_id='reviewer-existing', worker_session_binding=? "
                                 "WHERE repo=? AND plan_id='G-001'", (sha_a, branch, str(workspace),
                                     SessionBinding('codex', 'test-fast', 'medium').serialize(), str(source)))
-                    before = loop_manager.capture_git_snapshot(workspace)
-                    if role != 'planner':
-                        (workspace / 'src/app.py').write_text('VALUE = 2\n', encoding='utf-8')
-                    if role == 'reviewer':
-                        commit_all(workspace, 'Saved Worker candidate awaiting Reviewer')
-                        before = loop_manager.capture_git_snapshot(workspace)
-                    saved_result = loop_manager.capture_git_snapshot(workspace)
-                    with connection:
-                        connection.execute('UPDATE projects SET agent_role=?, agent_snapshot=?, '
-                            'agent_result_snapshot=? WHERE repo=?',
-                            (role, before.serialize(), saved_result.serialize(), str(source)))
                     if role != 'planner':
                         with connection:
                             connection.execute("UPDATE projects SET phase='WORKING', worktree=?, branch=?, "
@@ -503,6 +493,21 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                                 "reviewer_session_id='reviewer-existing', worker_session_binding=? WHERE repo=?",
                                 (str(workspace), branch, plan_path, sha_a, sha_a,
                                  SessionBinding('codex', 'test-fast', 'medium').serialize(), str(source)))
+                    if role == 'reviewer':
+                        (workspace / 'src/app.py').write_text('VALUE = 2\n', encoding='utf-8')
+                        commit_all(workspace, 'Saved Worker candidate awaiting Reviewer')
+                    before = loop_manager.begin_agent_scope(connection, str(source), workspace, role)
+                    if role == 'worker':
+                        (workspace / 'src/app.py').write_text('VALUE = 2\n', encoding='utf-8')
+                    saved_result = replace(loop_manager.capture_git_snapshot(workspace),
+                        scope_id=before.scope_id, scope_start_digest=before.scope_start_digest)
+                    record_saved_scope_invocation(connection, source, state, workspace, role, before,
+                        role + '-existing', plan_id='G-001' if role != 'planner' else None)
+                    with connection:
+                        connection.execute('UPDATE projects SET agent_role=?, agent_snapshot=?, '
+                            'agent_result_snapshot=? WHERE repo=?',
+                            (role, before.serialize(), saved_result.serialize(), str(source)))
+                        if role != 'planner':
                             connection.execute('UPDATE exec_plans SET agent_role=?, agent_snapshot=?, '
                                 'agent_result_snapshot=? WHERE repo=? AND plan_id=?',
                                 (role, before.serialize(), saved_result.serialize(), str(source), 'G-001'))
@@ -570,3 +575,56 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                                                        'worker-existing', 'reviewer-existing', 0))
                         # Leave the proof absent so same-SHA reuse must dispatch again.
                         proof_path.unlink()
+
+
+class BootstrapSavedScopeFixtureUnitTests(unittest.TestCase):
+    def test_saved_invocation_proof_is_bound_to_role_session_repository_and_scope(self):
+        from types import SimpleNamespace
+        from tests.support.database import runtime_connection
+        from tests.support.runtime import record_saved_scope_invocation
+        from loop_manager_internal.agents import scope_validation
+        from tests.test_agent_scope_decision import snapshot
+
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        ledger = agent_invocation_state.InvocationRepository(connection)
+        for role in ('planner', 'worker', 'reviewer'):
+            with self.subTest(role=role):
+                before = snapshot(scope_id=role + '-scope', scope_start_digest='c' * 64,
+                                  branch=None if role == 'planner' else 'loop-manager/G-047')
+                plan_id = None if role == 'planner' else 'G-047'
+                worktree = Path('/managed')
+                repository_identity = hashlib.sha256(b'/common\0origin').hexdigest()
+                with mock.patch('loop_manager_internal.agents.agent_write_isolation.inspect_worktree',
+                                return_value=SimpleNamespace(repository_identity=repository_identity)):
+                    record_saved_scope_invocation(connection, 'repo', Path('/state'), worktree,
+                                                  role, before, role + '-existing', plan_id=plan_id)
+                expected = dict(repo='repo', plan_id=plan_id, role=role, provider='codex',
+                                session_id=role + '-existing', worktree=str(worktree.resolve()),
+                                repository_identity=repository_identity, start_digest='c' * 64)
+                self.assertTrue(ledger.verified_scope(before.scope_id, **expected))
+                for key, value in (('role', 'other'), ('session_id', 'other'),
+                                   ('repository_identity', 'other'), ('worktree', '/other'),
+                                   ('start_digest', 'd' * 64), ('plan_id', 'G-999')):
+                    with self.subTest(mismatch=key):
+                        self.assertFalse(ledger.verified_scope(before.scope_id, **{**expected, key: value}))
+                self.assertFalse(ledger.verified_scope('unbound-scope', **expected))
+                owner = {'agent_snapshot': before.serialize(), 'agent_role': role,
+                         'worktree': str(worktree), 'plan_path': 'docs/plans/[G-047] Runtime.md',
+                         'provider': 'codex', 'base_branch': 'main', 'branch': before.branch,
+                         'phase': 'PLANNING' if role == 'planner' else
+                                  'REVIEWING' if role == 'reviewer' else 'WORKING',
+                         role + '_session_id': role + '-existing'}
+                effects = mock.Mock()
+                effects.repository.return_value.scope_owner.return_value = owner
+                effects._plan_id_from_path.return_value = plan_id
+                effects._git_common_directory.return_value = Path('/common')
+                effects.git.return_value = SimpleNamespace(stdout='origin\n')
+                effects._rebase_in_progress_for_branch.return_value = False
+                resources = scope_validation._agent_git_resources(
+                    connection, Path('repo'), worktree, before, role, effects=effects)
+                self.assertIsNotNone(resources)
+                self.assertEqual(resources.worktrees, frozenset((str(worktree.resolve()),)))
+                owner[role + '_session_id'] = 'unmatched-session'
+                self.assertIsNone(scope_validation._agent_git_resources(
+                    connection, Path('repo'), worktree, before, role, effects=effects))

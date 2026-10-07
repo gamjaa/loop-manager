@@ -63,7 +63,7 @@ R-020의 Manager runtime 귀속을 실제 bootstrap부터 runtime 자식의 선�
 | 기준 | 코드·회귀 근거 | 검증 경계 |
 |---|---|---|
 | 등록 base와 exact runtime SHA 연결 | `agent_scope_decision.decide_persisted_scope`, `reconcile_runtime_snapshot`; `PersistedScopeDecisionTests.test_registered_base_reconciles_results_and_checkpoint_without_adopting_other_refs`, `test_registered_base_rejects_wrong_oid_and_symbolic_head_target` | main·develop, main 부재·다른 SHA, 결과·checkpoint 위반 보존 unit 검증 |
-| A→B bootstrap·실제 자식·저장 역할 처리 | `BootstrapSavedScopeResumeTests.test_remote_bootstrap_child_resumes_saved_scope_without_identity_injection` | 임시 Git·state DB, 정상 CLI 부모·자식, Planner·Worker·Reviewer session·관리 worktree·후보 보존; 통합 회귀 작성, 실행은 Manager에 위임 |
+| A→B bootstrap·실제 자식·저장 역할 처리 | `BootstrapSavedScopeResumeTests.test_remote_bootstrap_child_resumes_saved_scope_without_identity_injection`; `BootstrapSavedScopeFixtureUnitTests` | 임시 Git·state DB, 정상 CLI 부모·자식, Planner·Worker·Reviewer session·관리 worktree·후보 보존; 통합 회귀 작성, 실행은 Manager에 위임 |
 | 등록 직후 중단과 같은 SHA 재사용 | 같은 bootstrap 회귀의 runtime_create 결과 기록 전 중단과 후속 두 bootstrap | durable intent 복구·자식 선검증·재생성/재사용의 재개; 통합 회귀 미실행 |
 | runtime만 다른 과거 차단과 혼합 위반 | `RuntimeFalsePositiveBaseTests.test_false_positive_uses_registered_base_and_keeps_mixed_violation`; 기존 `ManagerBaselineReconciliationUnitTests.test_runtime_prevalidation_reconciles_only_proven_delta_and_rejects_saved_mutation` | 등록 base 기반 복구, 실제 위반·원본 증거 보존 unit 검증 |
 | 수락·거부 진단과 비밀값 제외 | `scope_recovery.runtime_scope_diagnostic`, `validate_persisted_agent_scope`; `RuntimeScopeDiagnosticTests` | 초기 거부를 포함한 snapshot identity·변경 키·경로 기록, config·ref·operation 값과 파일 원문 미노출 unit 검증 |
@@ -74,6 +74,9 @@ R-020의 Manager runtime 귀속을 실제 bootstrap부터 runtime 자식의 선�
 - Worker 보고 재검증 요청 후 같은 HEAD/base의 최종 diff를 다시 확인하고 위 25개 targeted unit 명령을 새로 실행해 `OK`를 확인했다. 이전 최종 보고의 부정 문구를 결과 검증기가 실패 토큰으로 해석하는 원인을 읽기 전용으로 확인했으며, 통과 결과만 명시한 새 보고가 `parse_worker_result`를 통과함을 확인했다. 결과 검증기 코드는 변경하지 않았다.
 - 실제 bootstrap 회귀의 임시 저장소에는 외부 Agent·GitHub 경계 double과 등록 직후 중단 fixture를 넣는다. Reviewer 후보 재검증용 fixture 스크립트는 임시 프로젝트에만 존재하며 Manager 통합 검증 때 실행된다. Worker는 이 통합 회귀와 전체 verify를 실행하지 않았다.
 - Manager 전체 verify·Review·Merge 결과와 Requirement 완료 판단은 기록하거나 대신 결정하지 않았다.
+
+- Manager의 bootstrap 회귀 진단에서 임시 fixture의 raw snapshot에는 scope ID·시작 지문·격리 호출 ledger가 없어 source checkout의 A→B 전이가 과거 엄격 비교로 차단됨을 확인했다. fixture는 `begin_agent_scope`로 원본을 저장하고 `tests/support/runtime.py`의 `record_saved_scope_invocation`으로 역할·session·repository·worktree·시작 지문에 연결된 기존 ledger 증거를 저장하도록 수정했다. Reviewer는 후보 commit 뒤 읽기 전용 scope를 시작하고 Worker 결과는 같은 scope identity를 유지한다. 운영 격리 규칙과 증거 없는 과거 실행의 엄격 판정은 변경하지 않았다.
+- 관리 rebase의 현재 HEAD `2ec69f8bcaf2d86f8d9227b2f288f54fe8d9d1b0`와 base `42ac69b670e54d39d4539c1005d2e8d37be770ac` 사이 최종 diff 및 이번 fixture 보완을 검토했다. `python3 -m unittest tests.test_bootstrap_runtime.BootstrapSavedScopeFixtureUnitTests tests.test_agent_scope_decision.PersistedScopeDecisionTests tests.test_runtime_scope_diagnostics.RuntimeScopeDiagnosticTests tests.test_runtime_scope_diagnostics.RuntimeFalsePositiveBaseTests tests.test_origin_isolation.ManagerBaselineReconciliationUnitTests.test_runtime_prevalidation_reconciles_only_proven_delta_and_rejects_saved_mutation`를 현재 후보에서 실행해 26개 `OK`를 확인했다. 새 unit은 세 역할의 격리 증거 수락, 역할·session·repository·worktree·계획·시작 지문 불일치 거부, 실제 scope resource 선택과 session 불일치 시 엄격 판정 유지를 확인한다. bootstrap 통합 회귀의 재실행과 전체 verify·Review는 Manager에 남긴다.
 
 ## Decision Log
 
