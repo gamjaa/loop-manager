@@ -3,61 +3,24 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.storage.project_state_adapter import KNOWN_EXECPLAN_STATUSES
-from loop_manager_internal.application.contracts import PRIORITY_ORDER
 from loop_manager_internal.application.contracts import RequirementArchiveCollisionError
 from loop_manager_internal.application.contracts import RequirementArchiveError
 from loop_manager_internal.catalog import requirement_archive
 from loop_manager_internal.runtime.contracts import GitLockError
 from pathlib import Path
 import json
-import re
 import sqlite3
 
 
 @dataclass(frozen=True)
 class PublishedExecplanEffects:
     """Named effects for published_execplan; no entry-point/module access."""
-    parse_frontmatter: Callable[..., object]
+    parse_execplan_text: Callable[..., object]
 
 
 def published_execplan(effects: PublishedExecplanEffects, plan_path: str, plan_text: str) -> dict[str, object]:
     """Read metadata from the immutable ExecPlan commit without live source checks."""
-    plan = effects.parse_frontmatter(plan_text)
-    required = {"id", "title", "sources", "depends_on", "complexity", "risk"}
-    if set(plan) not in {frozenset(required), frozenset(required | {"priority"})}:
-        raise RuntimeError("게시된 ExecPlan frontmatter가 올바르지 않습니다.")
-    if "priority" not in plan:
-        plan["priority"] = "normal"
-    if plan["priority"] not in PRIORITY_ORDER:
-        raise RuntimeError("게시된 ExecPlan priority가 유효하지 않습니다.")
-    plan_id = plan["id"]
-    title = plan["title"]
-    if not isinstance(plan_id, str) or not isinstance(title, str):
-        raise RuntimeError("게시된 ExecPlan ID 또는 제목이 유효하지 않습니다.")
-    if Path(plan_path).name != f"[{plan_id}] {title}.md":
-        raise RuntimeError("게시된 ExecPlan 경로가 메타데이터와 일치하지 않습니다.")
-    sources = plan["sources"]
-    if not isinstance(sources, list) or not sources:
-        raise RuntimeError("게시된 ExecPlan source가 하나 이상 필요합니다.")
-    for source in sources:
-        if not isinstance(source, str) or not (
-            source == "docs/PRODUCT.md"
-            or re.fullmatch(r"docs/requirements/[^/\\]+\.md", source)
-        ):
-            raise RuntimeError(f"게시된 ExecPlan source가 유효하지 않습니다: {source}")
-    dependencies = plan["depends_on"]
-    if not isinstance(dependencies, list):
-        raise RuntimeError("게시된 ExecPlan depends_on이 유효하지 않습니다.")
-    if any(
-        not isinstance(dependency, str) or not re.fullmatch(r"G-\d{3,}", dependency)
-        for dependency in dependencies
-    ):
-        raise RuntimeError("게시된 ExecPlan depends_on ID가 유효하지 않습니다.")
-    if plan["complexity"] not in {"low", "medium", "high"}:
-        raise RuntimeError("게시된 ExecPlan complexity가 유효하지 않습니다.")
-    if plan["risk"] not in {"low", "medium", "high", "critical"}:
-        raise RuntimeError("게시된 ExecPlan risk가 유효하지 않습니다.")
-    return plan
+    return effects.parse_execplan_text(plan_path, plan_text, validate_sources=False)
 
 
 @dataclass(frozen=True)
