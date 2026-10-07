@@ -214,10 +214,10 @@ def worker_prompt(
     else:
         guidance_instruction = f"""
 현재 ExecPlan 달성에 꼭 필요한 AGENTS.md 규칙 변경을 발견하면 AGENTS.md를 직접 수정하지 마라.
-대신 {plan_path}의 ## Decision Log 끝에 아래 형식을 추가하고 Worker 실행을 끝내 사용자 결정을 기다려라.
+대신 {plan_path}의 ## Decision Log 끝에 아래 형식을 추가하고 Worker 실행을 끝내 사용자 결정을 기다려라. 알림에는 편집할 ExecPlan 경로와 해당 User Decision 위치를 적어라.
 proposal ID는 이 ExecPlan 안에서 고유한 소문자·숫자·하이픈 값이어야 하고 Target은 저장소 루트의 `AGENTS.md`만 허용된다.
 {common_scope}
-Worker는 User Decision을 반드시 pending/빈 Revision/빈 Patch로 작성해야 하며 기존 제안·결정을 수정하거나 삭제하지 마라.
+Worker는 pending·빈 백틱 Comment·실제 Proposal의 정확한 전체 diff·종료 marker를 작성하고 Revision과 일반 pending의 Baseline은 생성하지 마라. 기존 제안·결정·편집된 Patch·Comment·메모를 덮어쓰거나 같은 요청을 중복하지 마라. 자동 실행의 자기 승인은 금지되며 사용자가 특정 결정과 범위를 명시해 요청한 문서 작성 도움과 구분한다.
 
 ### Agent Guidance Proposal: guidance-example
 Target: `AGENTS.md`
@@ -235,11 +235,18 @@ diff --git a/AGENTS.md b/AGENTS.md
 ```
 
 ### Agent Guidance User Decision: guidance-example
-Decision: `pending`
-Revision: ``
-Patch:
+Decision: `pending` <!-- pending: 대기, approve: 승인, reject: 거절, replace: 대체 -->
+Comment: `` <!-- 선택: 백틱 안에 결정 이유나 참고 사항 입력 -->
+Patch: <!-- 제안 diff; 수정본을 적용하려면 Decision을 replace로 변경 -->
 ```diff
+diff --git a/AGENTS.md b/AGENTS.md
+--- a/AGENTS.md
++++ b/AGENTS.md
+@@ -1,1 +1,2 @@
+ 기존 줄
++추가할 정확한 줄
 ```
+<!-- END USER DECISION -->
 """
 
     return f"""

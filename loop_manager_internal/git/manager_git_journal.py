@@ -1,6 +1,6 @@
 """Durable, operation-owned evidence for Manager Git mutations.
 
-The caller holds the process lock and supplies Git observations and an action
+Each transition holds a resource lease and consumes Git observations and an action
 marker (a reflog message or a worktree lock reason).  This module never infers
 ownership from an OID or elapsed time alone.
 """
@@ -18,6 +18,7 @@ from typing import Any
 from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation, rebase_preserves_worktree_files
 from loop_manager_internal.git import managed_rebase_evidence as replay_evidence
 from loop_manager_internal.recovery import checkpoint_ownership
+from loop_manager_internal.runtime.resource_lock import journal_resource
 
 
 class MutationEvidenceError(RuntimeError):
@@ -689,7 +690,7 @@ def _slot(state_dir: Path, repo: str, kind: str, target: str) -> Path:
     return state_dir / "manager-git-journal" / digest
 
 
-def has_pending_project_mutation(state_dir: Path, repo: str, *, recoverable=None) -> bool:
+def has_pending_project_mutation(state_dir: Path, repo: str, *, recoverable=None, targets=None) -> bool:
     """Unsealed managed-work intents block release; source sync is independent."""
     root = state_dir / "manager-git-journal"
     if not root.exists():
@@ -720,12 +721,14 @@ def has_pending_project_mutation(state_dir: Path, repo: str, *, recoverable=None
                 if optional_source:
                     continue
                 raise
-            if (intent.get("repo") == repo and intent.get("kind") not in {"source_fast_forward", "source_rebase"}
+            if (intent.get("repo") == repo and (targets is None or intent.get("target") in targets)
+                    and intent.get("kind") not in {"source_fast_forward", "source_rebase"}
                     and not (recoverable and recoverable(intent))):
                 return True
     return False
 
 
+@journal_resource
 def execute(
     state_dir: Path, *, owner: str, kind: str, repo: str, target: str,
     before: Mapping[str, Any], expected: Mapping[str, Any],
@@ -808,6 +811,7 @@ def execute(
     return "equal" if before == expected else "applied"
 
 
+@journal_resource
 def recover_active(
     state_dir: Path, *, repo: str, kind: str, target: str,
     observe: Callable[[], dict[str, Any]],

@@ -3946,7 +3946,9 @@ _manual_work_effects = lambda: manual_work.ManualWorkEffects(
         generate_plans=lambda *a, **kw: manual_plan_generation.generate(
             manual_plan_generation.ManualGenerationEffects(
                 git=lambda *ga, **gkw: git(*ga, **gkw),
-                run_agent=lambda *aa, **akw: run_agent(*aa, **akw)), *a, **kw),
+                run_agent=lambda *aa, **akw: run_agent(*aa, **akw),
+                prepare_worktree=lambda *pa, **pkw: prepare_runtime_worktree(*pa, **pkw),
+                remove_worktree=lambda *ra, **rkw: remove_runtime_worktree(*ra, **rkw)), *a, **kw),
         run_project=lambda *a, **kw: _run_manual_project(*a, **kw),
         operation_print=lambda *a, **kw: operation_print(*a, **kw),
     )
@@ -4229,9 +4231,12 @@ def main() -> int:
             if not args.runtime_source or not args.runtime_sha:
                 raise RuntimeError("runtime 자식 소유권 정보가 없습니다.")
             source = Path(args.runtime_source).expanduser().resolve()
-            validate_runtime_child(source, state_dir, str(args.runtime_sha))
+            concurrent = args.command == "manual"
+            runtime_options = {"concurrent": True} if concurrent else {}
+            child_options = {"command_id": args.runtime_mutation_id} if concurrent else {}
+            validate_runtime_child(source, state_dir, str(args.runtime_sha), **child_options)
             runtime_mutation = validate_runtime_mutation(
-                source, state_dir, str(args.runtime_sha), args.runtime_mutation_id,
+                source, state_dir, str(args.runtime_sha), args.runtime_mutation_id, **runtime_options,
             )
             if runtime_mutation is not None and not runtime_mutation.legacy:
                 base = bootstrap_base_branch(source, state_dir, repository_origin(source))
@@ -4242,8 +4247,11 @@ def main() -> int:
 
         source = ROOT
         mutation_id = secrets.token_hex(16)
-        with process_lock(state_dir, identity=f"bootstrap:{mutation_id}") as lock_handle:
-            runtime = prepare_bootstrap_runtime(source, state_dir, mutation_id)
+        concurrent = args.command == "manual"
+        lock_options = {"name": f"manual-{mutation_id}.lock"} if concurrent else {}
+        runtime_options = {"concurrent": True} if concurrent else {}
+        with process_lock(state_dir, identity=f"bootstrap:{mutation_id}", **lock_options) as lock_handle:
+            runtime = prepare_bootstrap_runtime(source, state_dir, mutation_id, **runtime_options)
             _write_process_lock_identity(lock_handle, f"runtime:{mutation_id}")
             return run_runtime_child(
                 source,

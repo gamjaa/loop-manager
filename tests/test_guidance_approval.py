@@ -74,7 +74,7 @@ class GuidanceFormatTest(unittest.TestCase):
     def test_parser_rejects_incomplete_ambiguous_and_out_of_scope_patches(self):
         cases = (
             guidance_plan().replace("Impact: The Worker cannot finish safely without it.\n", ""),
-            guidance_plan().replace("Decision: `pending`", "Decision: `approve`"),
+            guidance_plan().replace("Decision: `pending`", "Decision: `unknown`"),
             guidance_plan().replace("b/AGENTS.md", "b/docs/PLANS.md"),
             guidance_plan() + "\n### Agent Guidance User Decision: worker-rule\n",
         )
@@ -83,6 +83,289 @@ class GuidanceFormatTest(unittest.TestCase):
                 guidance_approval.GuidanceFormatError
             ):
                 guidance_approval.parse_guidance_document(value)
+
+
+class GuidanceInputContractTest(unittest.TestCase):
+    def parse(self, text):
+        return guidance_approval.parse_guidance_document(text)
+
+    def form(self, decision="pending", patch=PATCH):
+        return guidance_plan(decision=decision, patch=patch).replace(
+            "Revision: ``\n", "Comment: `` <!-- 선택: 이유 -->\n"
+        ).replace(f"Decision: `{decision}`", f"Decision: `{decision}` <!-- 승인 안내 -->") + "<!-- END USER DECISION -->\n"
+
+    def test_all_decisions_accept_optional_revision_and_displayed_original(self):
+        for decision in ("pending", "approve", "reject", "replace"):
+            with self.subTest(decision=decision):
+                document = self.parse(self.form(decision))
+                proposal, = document.proposals
+                for text in (self.form(decision).rstrip("\n"), self.form(decision).replace("\n", "\r\n")):
+                    self.assertEqual(self.parse(text).proposals[0].decision.identity, proposal.decision.identity)
+                self.assertEqual(proposal.decision.revision, "")
+                if decision == "pending":
+                    with self.assertRaisesRegex(guidance_approval.GuidanceFormatError, "확정"):
+                        guidance_approval.finalized_patch(proposal)
+                else:
+                    self.assertEqual(guidance_approval.finalized_patch(proposal), None if decision == "reject" else PATCH)
+
+    def test_persisted_legacy_identity_fixtures_are_unchanged(self):
+        legacy = guidance_plan(decision="approve", revision="legacy-revision")
+        for text, expected in (
+            (legacy, "e23ce09ed64f995fa237254fce1b62e80717587d3d1fc7fe2657adb20f55fdd6"),
+            (legacy.replace("Revision: `legacy-revision`\n", "Revision: `legacy-revision`\nBaseline: `" + "a" * 40 + "`\n"),
+             "2eecb5d4edb8a5643b3445e102947bfeb8749209da58ba6d7e133484bc541210"),
+        ):
+            self.assertEqual(self.parse(text).proposals[0].decision.identity, expected)
+
+    def test_display_comments_and_memos_preserve_legacy_identities(self):
+        for decision in ("pending", "approve", "reject"):
+            revision = "" if decision == "pending" else "old-user-revision"
+            legacy = guidance_plan(decision=decision, revision=revision)
+            original = self.parse(legacy)
+            displayed = guidance_plan(decision=decision, revision=revision, patch=PATCH)
+            displayed = displayed.replace(f"Decision: `{decision}`", f"Decision: `{decision}` <!-- help -->")
+            displayed = displayed.replace("Patch:\n```diff\n```", "Patch: <!-- help -->\n```diff\n```")
+            displayed += "  <!-- END USER DECISION -->  \n## 메모\nDecision: `replace`\n- 자유 메모\n"
+            for text in (displayed, displayed.replace("Revision:", "Comment: `why` <!-- 선택 -->\nRevision:")):
+                actual = self.parse(text)
+                self.assertEqual(actual.structure_hash, original.structure_hash)
+                self.assertEqual(actual.proposals[0].decision.identity, original.proposals[0].decision.identity)
+                self.assertEqual(actual.proposals[0].identity, original.proposals[0].identity)
+
+    def test_legacy_eof_and_top_level_boundaries_and_line_endings(self):
+        for tail in ("", "\n## Other section\nProtected text\n"):
+            for newline in ("\n", "\r\n"):
+                for final_newline in (True, False):
+                    text = (guidance_plan(decision="approve", revision="legacy") + tail)
+                    if not final_newline:
+                        text = text.rstrip("\n")
+                    actual = self.parse(text.replace("\n", newline))
+                    self.assertEqual(actual.proposals[0].decision.revision, "legacy")
+        first = self.parse(guidance_plan() + "\n## Other section\nOriginal\n")
+        second = self.parse(guidance_plan() + "\n## Other section\nEdited\n")
+        self.assertNotEqual(first.structure_hash, second.structure_hash)
+
+    def test_marker_addition_matches_saved_legacy_suffix_without_ignoring_edits(self):
+        suffix = "## Existing section\nProtected text\n## Another section\nMore text\n"
+        original = self.parse(guidance_plan() + suffix)
+        for memo in ("", "A note\n", "## Memo\nDecision: `reject`\n"):
+            text = self.form("approve") + memo + suffix
+            document = self.parse(text)
+            self.assertTrue(document.matches_structure_hash(original.structure_hash))
+            for edited in (text.replace("Protected text", "Edited text"),
+                           text.replace("More text", "Edited text"),
+                           text.replace("Test.", "Edited purpose")):
+                self.assertFalse(self.parse(edited).matches_structure_hash(original.structure_hash))
+        for text in (self.form("approve"), self.form("approve") + suffix.split("## Another", 1)[0]):
+            self.assertFalse(self.parse(text).matches_structure_hash(original.structure_hash))
+
+    def test_indented_backticks_in_real_diff_context_do_not_close_fence(self):
+        original = b"# Agents\n    ```\n"
+        patch = "diff --git a/AGENTS.md b/AGENTS.md\n--- a/AGENTS.md\n+++ b/AGENTS.md\n@@ -1,2 +1,3 @@\n # Agents\n     ```\n+Approved rule\n"
+        text = guidance_plan(decision="approve", patch=patch).replace(PATCH, patch)
+        for value in (text, text + "<!-- END USER DECISION -->\n", text.replace("\n", "\r\n")):
+            proposal, = self.parse(value).proposals
+            self.assertEqual(proposal.patch, patch)
+            self.assertEqual(guidance_approval.finalized_patch(proposal), patch)
+        self.assertEqual(guidance_approval.apply_patch_to_content(original, "AGENTS.md", patch),
+                         b"# Agents\n    ```\nApproved rule\n")
+        for indentation in (1, 3, 5, 8):
+            context_patch = patch.replace("     ```", " " * indentation + "```")
+            proposal, = self.parse(guidance_plan(decision="replace", patch=context_patch).replace(PATCH, context_patch)).proposals
+            self.assertEqual(proposal.decision.patch, context_patch)
+
+    def test_pending_edited_patch_waits_approve_requires_replace(self):
+        edited = PATCH.replace("Approved rule", "Edited rule")
+        pending = self.parse(self.form(patch=edited)).proposals[0]
+        self.assertEqual(pending.decision.decision, "pending")
+        with self.assertRaisesRegex(guidance_approval.GuidanceFormatError, "replace"):
+            self.parse(self.form("approve", edited))
+        replacement = self.parse(self.form("replace", edited)).proposals[0]
+        self.assertEqual(guidance_approval.finalized_patch(replacement), edited)
+        rejected = self.parse(self.form("reject", edited)).proposals[0]
+        self.assertIsNone(guidance_approval.finalized_patch(rejected))
+        for decision in ("pending", "approve", "reject", "replace"):
+            with self.subTest(decision=decision), self.assertRaises(guidance_approval.GuidanceFormatError):
+                self.parse(self.form(decision, edited.replace("AGENTS.md", "other.md")))
+        with self.assertRaisesRegex(guidance_approval.GuidanceFormatError, "Patch"):
+            self.parse(self.form("replace", ""))
+
+    def test_marker_and_heading_strings_in_fences_remain_literal(self):
+        patch = PATCH.replace("+Approved rule", "+<!-- END USER DECISION -->\n+### Agent Guidance User Decision: hidden")
+        text = self.form("replace", patch)
+        actual = self.parse(text).proposals[0]
+        self.assertEqual(actual.decision.patch, patch)
+        # A standalone marker in a fenced memo is also literal.
+        memo = "```text\n<!-- END USER DECISION -->\n### Agent Guidance User Decision: hidden\n```\n"
+        self.assertEqual(self.parse(text + memo).structure_hash, self.parse(text).structure_hash)
+        # A marker inside an unclosed diff does not repair the missing fence.
+        with self.assertRaises(guidance_approval.GuidanceFormatError):
+            self.parse(text.rsplit("```", 1)[0] + "<!-- END USER DECISION -->")
+
+    def test_multiple_pairs_after_memo_still_validate_guidance(self):
+        first = self.form()
+        second = self.form("approve").split("### Agent Guidance Proposal:", 1)[1]
+        text = first + "## 메모\nDecision: `reject`\n### Agent Guidance Proposal:" + second.replace("worker-rule", "second-rule")
+        actual = self.parse(text)
+        self.assertEqual([p.proposal_id for p in actual.proposals], ["worker-rule", "second-rule"])
+        for suffix in (
+            "### Agent Guidance User Decision: worker-rule\n",
+            "### Agent Guidance Proposal: INVALID ID\n",
+            "### Agent Guidance Proposal:" + second,
+        ):
+            with self.subTest(suffix=suffix[:60]), self.assertRaises(guidance_approval.GuidanceFormatError):
+                self.parse(first + suffix)
+
+    def test_invalid_fields_markers_and_incomplete_blocks_are_rejected(self):
+        valid = self.form()
+        invalid = (
+            valid + "<!-- END USER DECISION -->\n",
+            "<!-- END USER DECISION -->\n" + valid,
+            valid.replace("## Decision Log\n", "## Decision Log\n<!-- END USER DECISION -->\n"),
+            valid.replace("Target:", "<!-- END USER DECISION -->\nTarget:"),
+            valid.replace("Comment: ``", "Comment: ``\nComment: `duplicate`"),
+            valid.replace("Comment: ``", "Comment: no-backticks"),
+            valid.replace("Comment: ``", "Baseline: `HEAD`"),
+            valid.replace("Comment: ``", "Revision: `bad`value`"),
+            valid.replace("Comment: ``", "Decision: `approve`"),
+            valid.replace("Comment: ``", "Unknown: `value`"),
+            valid.replace("Comment: ``", "Baseline: `" + "a" * 40 + "`"),
+            valid.replace("Comment:", "<!-- END USER DECISION -->\nComment:"),
+        )
+        for text in invalid:
+            with self.subTest(text=text[-100:]), self.assertRaises(guidance_approval.GuidanceFormatError):
+                self.parse(text)
+        with self.assertRaisesRegex(guidance_approval.GuidanceFormatError, "밖"):
+            self.parse("<!-- END USER DECISION -->")
+
+    def test_fences_do_not_swallow_trailing_content_or_expand_patch(self):
+        original = self.parse(guidance_plan(decision="approve", revision="legacy<!-- literal -->"))
+        self.assertEqual(original.proposals[0].decision.revision, "legacy<!-- literal -->")
+        # Fence-looking text on an added diff line is retained in full.
+        patch = PATCH.replace("+Approved rule", "+```")
+        actual = self.parse(self.form("replace", patch))
+        self.assertEqual(actual.proposals[0].decision.patch, patch)
+        self.assertEqual(actual.proposals[0].patch, PATCH)
+        for text in (
+            guidance_plan().replace("Revision: ``", "Comment: ``\nRevision: ``\nRevision: ``"),
+            guidance_plan().replace("Patch:\n```diff\n```", "Patch:\n```diff\n```\nextra text\n```"),
+            guidance_plan().replace("Patch:\n```diff\n```", "Patch:\n```diff\n```\nPatch:\n```diff\n```"),
+            guidance_plan().replace("+Approved rule\n```", "+Approved rule\n```\nextra text\n```", 1),
+        ):
+            with self.subTest(text=text[-120:]), self.assertRaises(guidance_approval.GuidanceFormatError):
+                self.parse(text)
+
+    def test_only_decision_metadata_is_excluded_from_structure(self):
+        valid = self.form("approve")
+        document = self.parse(valid)
+        self.assertNotEqual(document.structure_hash, self.parse(valid.replace("Test.", "Changed purpose")).structure_hash)
+        changed = self.parse(valid.replace("needs this rule", "needs another rule"))
+        self.assertNotEqual(document.structure_hash, changed.structure_hash)
+        self.assertNotEqual(document.proposals[0].identity, changed.proposals[0].identity)
+        # Markdown titles in an explicitly terminated memo area are notes.
+        first = self.parse(valid + "## Validation\nOriginal memo\n")
+        second = self.parse(valid + "## Validation\nChanged memo\n")
+        self.assertEqual(first.structure_hash, second.structure_hash)
+        with self.assertRaises(guidance_approval.GuidanceFormatError):
+            self.parse(valid + "## Validation\n### Agent Guidance User Decision: hidden\n")
+
+
+class LegacyGuidanceMarkerResumeTest(unittest.TestCase):
+    def test_decision_and_marker_resume_with_unchanged_legacy_sections(self):
+        from dataclasses import fields
+        from tests.support.database import runtime_connection
+        from loop_manager_internal.documents import guidance_service as service
+        suffix = "## Existing section\nProtected text\n"
+        saved = guidance_approval.parse_guidance_document(guidance_plan() + suffix)
+        for newline, decision, changed, expected in (
+            ("\n", "approve", False, True), ("\r\n", "approve", False, True),
+            ("\n", "pending", False, False), ("\n", "approve", True, False),
+        ):
+            with self.subTest(newline=newline, decision=decision, changed=changed):
+                connection = runtime_connection()
+                self.addCleanup(connection.close)
+                connection.execute(
+                    "UPDATE exec_plans SET status = 'PLAN_BLOCKED', branch = 'branch', worktree = '/work', "
+                    "worker_session_id = 'same-session', guidance_plan_hash = ? WHERE plan_id = 'G-047'",
+                    (saved.structure_hash,),
+                )
+                proposal, = saved.proposals
+                connection.execute(
+                    "INSERT INTO guidance_approvals (repo, plan_id, proposal_id, proposal_hash, target_path, scope, "
+                    "proposal_patch, proposal_patch_hash, proposal_line, decision_line, batch_id, sequence, baseline_content, baseline_mode) "
+                    "VALUES ('repo', 'G-047', ?, ?, 'AGENTS.md', 'project', ?, ?, ?, ?, 'batch', 0, ?, 420)",
+                    (proposal.proposal_id, proposal.identity, PATCH, guidance_approval.guidance_patch_hash('AGENTS.md', PATCH),
+                     proposal.line, proposal.decision.line, b'# Agents\n'),
+                )
+                connection.commit()
+                plan = connection.execute("SELECT * FROM exec_plans WHERE plan_id = 'G-047'").fetchone()
+                updated = (guidance_plan(decision=decision) + "<!-- END USER DECISION -->\n## Memo\nA user note\n" + suffix)
+                if changed:
+                    updated = updated.replace('Protected text', 'Changed section')
+                document = guidance_approval.parse_guidance_document(updated.replace('\n', newline))
+                ports = {field.name: mock.Mock() for field in fields(service.ResumeGuidanceApprovalIfDecidedEffects)}
+                ports.update(
+                    _plan_block_selected_for_release=mock.Mock(return_value=plan),
+                    _rebase_in_progress_for_branch=mock.Mock(return_value=False),
+                    _guidance_document=mock.Mock(return_value=document),
+                    _guidance_rows=lambda *args: tuple(connection.execute('SELECT * FROM guidance_approvals')),
+                    _guidance_document_matches_rows=service._guidance_document_matches_rows,
+                    _guidance_final_expected=loop_manager._guidance_final_expected,
+                    _guidance_target_state=mock.Mock(return_value=(b'# Agents\n', 0o644)),
+                    is_loop_manager_repository=mock.Mock(return_value=False),
+                    finalized_patch=guidance_approval.finalized_patch,
+                    guidance_patch_hash=guidance_approval.guidance_patch_hash,
+                )
+                effects = service.ResumeGuidanceApprovalIfDecidedEffects(**ports)
+                self.assertEqual(service.resume_guidance_approval_if_decided(
+                    effects, connection, Path('/repo'), 'repo', 'main', Path('/state')), expected)
+                stored = connection.execute("SELECT * FROM exec_plans WHERE plan_id = 'G-047'").fetchone()
+                self.assertEqual(stored['status'], 'IMPLEMENTING' if expected else 'PLAN_BLOCKED')
+                self.assertEqual(stored['worker_session_id'], 'same-session')
+                self.assertEqual(stored['guidance_plan_hash'], saved.structure_hash)
+                row = connection.execute('SELECT * FROM guidance_approvals').fetchone()
+                self.assertEqual(row['decision'], 'approve' if expected else 'pending')
+                self.assertEqual(row['approved_patch'], PATCH if expected else None)
+                if expected:
+                    effects._update_blocked_error.assert_not_called()
+                elif changed:
+                    self.assertIn('User Decision 이외', effects._update_blocked_error.call_args.args[-1])
+
+
+class GuidanceNotificationTest(unittest.TestCase):
+    def test_initial_wait_message_requires_decision_without_revision_input(self):
+        from dataclasses import fields
+        from tests.support.database import runtime_connection
+        from loop_manager_internal.documents import guidance_service as service
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        plan = connection.execute("SELECT * FROM exec_plans WHERE plan_id = 'G-047'").fetchone()
+        text = guidance_plan(patch=PATCH).replace('Revision: ``\n', 'Comment: ``\n') + '<!-- END USER DECISION -->\n'
+        document = guidance_approval.parse_guidance_document(text)
+        ports = {field.name: mock.Mock() for field in fields(service.BlockForNewGuidanceEffects)}
+        ports.update(
+            _guidance_batch_id=service._guidance_batch_id,
+            _guidance_block_message=service._guidance_block_message,
+            _guidance_target_state=mock.Mock(return_value=(b'# Agents\n', 0o644)),
+            _validate_guidance_proposal_scope=service._validate_guidance_proposal_scope,
+            guidance_patch_hash=guidance_approval.guidance_patch_hash,
+            is_loop_manager_repository=mock.Mock(return_value=False),
+        )
+        ports['capture_git_snapshot'].return_value.serialize.return_value = 'snapshot'
+        effects = service.BlockForNewGuidanceEffects(**ports)
+        service._block_for_new_guidance(effects, connection, Path('/repo'), 'repo', Path('/work'),
+                                        plan, document, document.proposals, 'proposal recorded')
+        message = connection.execute("SELECT last_error FROM projects WHERE repo = 'repo'").fetchone()[0]
+        self.assertIn('Decision을 approve·reject·replace 중 하나로 확정', message)
+        self.assertIn('수정한 Patch를 적용하려면 replace', message)
+        self.assertNotIn('Revision', message)
+        proposal, = document.proposals
+        self.assertIn(f"User Decision: {plan['path']}:{proposal.decision.line}", message)
+        self.assertIn(f"제안 {proposal.proposal_id}: {plan['path']}:{proposal.line}", message)
+        self.assertEqual(effects._final_block_recovery_decision.call_args.args[5], message)
+        row = connection.execute('SELECT decision, decision_revision, approved_patch FROM guidance_approvals').fetchone()
+        self.assertEqual(tuple(row), ('pending', '', None))
+        self.assertEqual(connection.execute("SELECT status FROM exec_plans WHERE plan_id = 'G-047'").fetchone()[0], 'PLAN_BLOCKED')
 
 
 class GuidanceRuntimeTest(unittest.TestCase):

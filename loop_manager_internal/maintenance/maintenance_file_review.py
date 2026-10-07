@@ -59,7 +59,18 @@ CREATE TABLE IF NOT EXISTS provisional_file_reviews (
 
 
 def ensure_schema(connection: sqlite3.Connection) -> None:
+    """Complete additive migrations before the scheduler opens project threads."""
     connection.execute(_SCHEMA)
+    columns = {row[1] for row in connection.execute('PRAGMA table_info(provisional_file_reviews)')}
+    for field in ('guidance_hash', 'prior_guidance_results'):
+        if field not in columns:
+            connection.execute(f'ALTER TABLE provisional_file_reviews ADD COLUMN {field} TEXT')
+    connection.execute("""CREATE TABLE IF NOT EXISTS provisional_file_review_guidance_history (
+        repo TEXT NOT NULL, path TEXT NOT NULL, record_hash TEXT NOT NULL,
+        snapshot_json TEXT NOT NULL, PRIMARY KEY (repo, path, record_hash))""")
+    connection.execute("""CREATE TABLE IF NOT EXISTS provisional_review_receipts (
+        repo TEXT NOT NULL, path TEXT NOT NULL, identity TEXT NOT NULL,
+        PRIMARY KEY (repo, path))""")
 
 
 @dataclass(frozen=True)
@@ -404,16 +415,6 @@ class ProvisionalReviewRepository:
     def __init__(self, connection: sqlite3.Connection):
         self.connection = connection
         ensure_schema(connection)
-        columns = {row[1] for row in connection.execute('PRAGMA table_info(provisional_file_reviews)')}
-        for field in ('guidance_hash', 'prior_guidance_results'):
-            if field not in columns:
-                connection.execute(f'ALTER TABLE provisional_file_reviews ADD COLUMN {field} TEXT')
-        connection.execute("""CREATE TABLE IF NOT EXISTS provisional_file_review_guidance_history (
-            repo TEXT NOT NULL, path TEXT NOT NULL, record_hash TEXT NOT NULL,
-            snapshot_json TEXT NOT NULL, PRIMARY KEY (repo, path, record_hash))""")
-        connection.execute("""CREATE TABLE IF NOT EXISTS provisional_review_receipts (
-            repo TEXT NOT NULL, path TEXT NOT NULL, identity TEXT NOT NULL,
-            PRIMARY KEY (repo, path))""")
 
     def progress(
         self, repo: str, repository: Path, base: str,

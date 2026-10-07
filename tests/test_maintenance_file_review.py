@@ -13,6 +13,46 @@ from loop_manager_internal.maintenance import maintenance_file_review as review
 from loop_manager_internal.storage import maintenance_file_ledger
 
 
+class ProvisionalReviewSchemaTest(unittest.TestCase):
+    def test_parent_initializes_guidance_schema_before_project_connections(self):
+        from loop_manager_internal.storage import database
+        with tempfile.TemporaryDirectory() as directory:
+            state_dir = Path(directory)
+            parent = database.connect_database(state_dir, create=True)
+            self.addCleanup(parent.close)
+            columns = {row[1] for row in parent.execute('PRAGMA table_info(provisional_file_reviews)')}
+            self.assertTrue({'guidance_hash', 'prior_guidance_results'} <= columns)
+            for _ in range(2):
+                worker = database.connect_database(state_dir, run_migrations=False)
+                try:
+                    statements = []
+                    worker.set_trace_callback(statements.append)
+                    review.ProvisionalReviewRepository(worker)
+                    self.assertFalse(any(sql.startswith('ALTER TABLE') for sql in statements), statements)
+                    tables = {row[0] for row in worker.execute("SELECT name FROM sqlite_master WHERE type = 'table'")}
+                    self.assertTrue({'provisional_file_review_guidance_history', 'provisional_review_receipts'} <= tables)
+                finally:
+                    worker.close()
+
+    def test_legacy_schema_migration_preserves_audit_and_caller_transaction(self):
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        connection.execute(review._SCHEMA)
+        original = ('repo', 'source.py', 1, 'revision', 'hash', '100644', 'session', 'failure', '{"audit": true}')
+        connection.execute('INSERT INTO provisional_file_reviews VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)', original)
+        connection.commit()
+        connection.execute("UPDATE provisional_file_reviews SET session_id = 'uncommitted-session'")
+        review.ensure_schema(connection)
+        self.assertTrue(connection.in_transaction)
+        connection.rollback()
+        self.assertEqual(connection.execute('SELECT * FROM provisional_file_reviews').fetchone(), original)
+        review.ensure_schema(connection)
+        review.ensure_schema(connection)
+        row = connection.execute('SELECT * FROM provisional_file_reviews').fetchone()
+        self.assertEqual(row[:9], original)
+        self.assertEqual(row[9:], (None, None))
+
+
 class FileReviewPromptTest(unittest.TestCase):
     def test_task_prompt_preserves_single_file_review_contract(self):
         for content in (b"", b"def calculate(): return 1\n",

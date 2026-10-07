@@ -114,7 +114,7 @@ def _reconcile_guidance_double_block(
         document = effects._guidance_document(worktree, str(plan["path"]))
         rows = effects._guidance_rows(connection, repo, str(plan["plan_id"]))
         if (
-            document is None or document.structure_hash != plan["guidance_plan_hash"]
+            document is None or not document.matches_structure_hash(plan["guidance_plan_hash"])
             or not rows or any(row["applied"] or row["invalidated_decision_hash"] for row in rows)
         ):
             raise ValueError("guidance 제안 또는 승인 대기 상태가 변경됐습니다.")

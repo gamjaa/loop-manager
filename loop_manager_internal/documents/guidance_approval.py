@@ -14,6 +14,7 @@ PROPOSAL_HEADING = "### Agent Guidance Proposal:"
 DECISION_HEADING = "### Agent Guidance User Decision:"
 DECISION_LOG_HEADING = "## Decision Log"
 GUIDANCE_TARGET = "AGENTS.md"
+END_USER_DECISION = "<!-- END USER DECISION -->"
 
 
 class GuidanceFormatError(RuntimeError):
@@ -73,6 +74,11 @@ class GuidanceProposal:
 class GuidanceDocument:
     proposals: tuple[GuidanceProposal, ...]
     structure_hash: str
+    legacy_structure_hashes: tuple[str, ...] = ()
+
+    def matches_structure_hash(self, expected: str) -> bool:
+        """Also recognize a saved legacy boundary without discarding its suffix."""
+        return expected == self.structure_hash or expected in self.legacy_structure_hashes
 
 
 _PROPOSAL_ID = r"[a-z0-9][a-z0-9-]{0,63}"
@@ -90,16 +96,75 @@ _PROPOSAL_BODY_RE = re.compile(
     r"[ \t]*Scope:[ \t]*`(?P<scope>project|common)`[ \t]*\n"
     r"[ \t]*Reason:[ \t]*(?P<reason>[^\r\n]*\S)[ \t]*\n"
     r"[ \t]*Impact:[ \t]*(?P<impact>[^\r\n]*\S)[ \t]*\n"
-    r"[ \t]*Patch:[ \t]*\n```diff[ \t]*\n(?P<patch>.*?)```(?:[ \t]*\n)*\Z",
-    re.DOTALL,
+    r"[ \t]*Patch:[ \t]*\n```diff[ \t]*\n(?P<patch>(?:(?!^```[ \t]*(?:\n|\Z)).)*?)^```(?:[ \t]*\n)*\Z",
+    re.DOTALL | re.MULTILINE,
 )
-_DECISION_BODY_RE = re.compile(
-    r"\A[ \t]*Decision:[ \t]*`(?P<decision>pending|approve|reject|replace)`[ \t]*\n"
-    r"[ \t]*Revision:[ \t]*`(?P<revision>[^`\r\n]*)`[ \t]*\n"
-    r"(?:[ \t]*Baseline:[ \t]*`(?P<baseline>[0-9a-f]{40}|[0-9a-f]{64})`[ \t]*\n)?"
-    r"[ \t]*Patch:[ \t]*\n```diff[ \t]*\n(?P<patch>.*?)```(?:[ \t]*\n)*\Z",
-    re.DOTALL,
-)
+
+
+def _outside_fences(text: str) -> str:
+    """Mask fenced code while preserving offsets and line numbers."""
+    lines = []
+    fence = ""
+    closing_indent = 3
+    for line in text.splitlines(keepends=True):
+        if fence:
+            if re.fullmatch(
+                r"[ \t]{0," + str(closing_indent) + "}" + re.escape(fence[0])
+                + "{" + str(len(fence)) + r",}[ \t]*\n?", line,
+            ):
+                fence = ""
+            lines.append(re.sub(r"[^\n]", " ", line))
+        else:
+            opening = re.match(r"^[ \t]{0,3}(`{3,}|~{3,})", line)
+            if opening:
+                fence = opening.group(1)
+                # Unified diff context begins with a space. Only a column-zero
+                # fence closes our diff format; indented backticks are data.
+                closing_indent = 0 if line[opening.end():].strip() == "diff" else 3
+                lines.append(re.sub(r"[^\n]", " ", line))
+            else:
+                lines.append(line)
+    return "".join(lines)
+
+
+def _decision_fields(body: str, proposal_id: str) -> dict[str, str]:
+    # Strip explanatory comments only outside code; patch bytes remain literal.
+    outside = _outside_fences(body)
+    # Backtick field values are literal, including legacy Revision strings.
+    outside = re.sub(r"`[^`\n]*`", lambda match: " " * len(match.group()), outside)
+    comments = list(re.finditer(r"<!--.*?-->", outside, re.DOTALL))
+    for comment in reversed(comments):
+        body = body[:comment.start()] + body[comment.end():]
+    fields: dict[str, str] = {}
+    lines = body.splitlines(keepends=True)
+    for index, line in enumerate(lines):
+        if not line.strip():
+            continue
+        if re.fullmatch(r"[ \t]*Patch:[ \t]*\n", line):
+            patch = re.fullmatch(
+                r"```diff[ \t]*\n(?P<patch>(?:(?!^```[ \t]*(?:\n|\Z)).)*?)^```[ \t]*(?:\n[ \t]*)*\Z",
+                "".join(lines[index + 1:]), re.DOTALL | re.MULTILINE,
+            )
+            if patch is None:
+                raise GuidanceFormatError(f"User Decision diff 블록 형식 오류: {proposal_id}")
+            fields["patch"] = patch.group("patch")
+            break
+        match = re.fullmatch(
+            r"[ \t]*(Decision|Revision|Baseline|Comment):[ \t]*`([^`\r\n]*)`[ \t]*\n?", line,
+        )
+        if match is None:
+            raise GuidanceFormatError(f"User Decision 필드 형식 오류: {proposal_id}: {line.strip()}")
+        key = match.group(1).lower()
+        if key in fields:
+            raise GuidanceFormatError(f"User Decision {key} 필드 중복: {proposal_id}")
+        fields[key] = match.group(2)
+    if "decision" not in fields or "patch" not in fields:
+        raise GuidanceFormatError(f"User Decision Decision·Patch 누락: {proposal_id}")
+    if fields["decision"] not in ("pending", "approve", "reject", "replace"):
+        raise GuidanceFormatError(f"User Decision Decision 값 오류: {proposal_id}")
+    if "baseline" in fields and not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", fields["baseline"]):
+        raise GuidanceFormatError(f"User Decision Baseline 전체 SHA 형식 오류: {proposal_id}")
+    return fields
 
 
 def _normalize_text(value: str) -> str:
@@ -154,21 +219,31 @@ def normalize_target(target: str) -> str:
 
 
 def contains_guidance_sections(text: str) -> bool:
-    return _ANY_GUIDANCE_HEADING_RE.search(_normalize_text(text)) is not None
+    return _ANY_GUIDANCE_HEADING_RE.search(_outside_fences(_normalize_text(text))) is not None
 
 
 def _decision_log(text: str) -> tuple[str, int, int]:
-    headings = list(
-        re.finditer(r"(?m)^## Decision Log[ \t]*$", text)
-    )
+    outside = _outside_fences(text)
+    headings = list(re.finditer(r"(?m)^## Decision Log[ \t]*$", outside))
     if len(headings) != 1:
-        raise GuidanceFormatError(
-            "guidance 제안에는 정확히 하나의 ## Decision Log가 필요합니다."
-        )
+        raise GuidanceFormatError("guidance 제안에는 정확히 하나의 ## Decision Log가 필요합니다.")
     start = headings[0].end()
-    next_section = re.search(r"(?m)^## (?!#)", text[start:])
-    end = start + next_section.start() if next_section else len(text)
-    return text[start:end], start, end
+    # An explicit terminator starts a memo area, including Markdown headings.
+    # Legacy blocks still end at the next top-level section.
+    memo = False
+    for event in re.finditer(
+        r"(?m)^[ \t]*<!-- END USER DECISION -->[ \t]*$|^### Agent Guidance (?:Proposal|User Decision):.*$|^## (?!#).*$",
+        outside[start:],
+    ):
+        line = event.group().strip()
+        if line == END_USER_DECISION:
+            memo = True
+        elif line.startswith("### Agent Guidance"):
+            memo = False
+        elif not memo:
+            end = start + event.start()
+            return text[start:end], start, end
+    return text[start:], start, len(text)
 
 
 def _line_number(text: str, offset: int) -> int:
@@ -179,20 +254,36 @@ def parse_guidance_document(text: str) -> GuidanceDocument | None:
     """Parse paired proposal/decision blocks from one ExecPlan Decision Log."""
 
     normalized = _normalize_text(text)
+    outside = _outside_fences(normalized)
+    markers = list(re.finditer(r"(?m)^[ \t]*<!-- END USER DECISION -->[ \t]*$", outside))
     if not contains_guidance_sections(normalized):
+        if markers:
+            raise GuidanceFormatError("User Decision 밖의 종료 marker입니다.")
         return None
     decision_log, log_start, _log_end = _decision_log(normalized)
+    visible_log = _outside_fences(decision_log)
     headings = sorted(
         (
-            *(('proposal', match) for match in _PROPOSAL_HEADING_RE.finditer(decision_log)),
-            *(('decision', match) for match in _DECISION_HEADING_RE.finditer(decision_log)),
+            *(('proposal', match) for match in _PROPOSAL_HEADING_RE.finditer(visible_log)),
+            *(('decision', match) for match in _DECISION_HEADING_RE.finditer(visible_log)),
         ),
         key=lambda item: item[1].start(),
     )
+    actual_headings = list(_ANY_GUIDANCE_HEADING_RE.finditer(outside))
+    valid_offsets = {log_start + heading.start() for _, heading in headings}
+    for heading in actual_headings:
+        if heading.start() not in valid_offsets:
+            line = _line_number(normalized, heading.start())
+            title = normalized[heading.start():].splitlines()[0]
+            raise GuidanceFormatError(f"guidance ID 형식 또는 Decision Log 위치 오류 (line {line}): {title}")
+    if any(not log_start <= marker.start() < _log_end for marker in markers):
+        raise GuidanceFormatError("User Decision 밖의 종료 marker입니다.")
     if not headings:
         raise GuidanceFormatError(
             "guidance heading은 ## Decision Log 안에 있어야 합니다."
         )
+    if any(marker.start() < log_start + headings[0][1].start() for marker in markers):
+        raise GuidanceFormatError("User Decision 밖의 종료 marker입니다.")
     if len(headings) % 2:
         raise GuidanceFormatError(
             "guidance proposal 바로 뒤에는 같은 ID의 User Decision이 필요합니다."
@@ -215,7 +306,7 @@ def parse_guidance_document(text: str) -> GuidanceDocument | None:
         )
 
     raw_proposals: dict[str, tuple[re.Match[str], re.Match[str]]] = {}
-    raw_decisions: dict[str, tuple[re.Match[str], re.Match[str]]] = {}
+    raw_decisions: dict[str, tuple[re.Match[str], dict[str, str]]] = {}
     structure_parts: list[str] = []
     cursor = 0
     for index, (kind, heading) in enumerate(headings):
@@ -230,6 +321,15 @@ def parse_guidance_document(text: str) -> GuidanceDocument | None:
         body = decision_log[body_start:body_end]
         proposal_id = heading.group("id")
         structure_parts.append(decision_log[cursor:heading.start()])
+        body_markers = list(re.finditer(
+            r"(?m)^[ \t]*<!-- END USER DECISION -->[ \t]*$", _outside_fences(body),
+        ))
+        if body_markers and kind != "decision":
+            raise GuidanceFormatError(f"User Decision 밖의 종료 marker: {proposal_id}")
+        if len(body_markers) > 1:
+            raise GuidanceFormatError(f"User Decision 종료 marker 중복: {proposal_id}")
+        if body_markers:
+            body = body[:body_markers[0].start()]
         if kind == "proposal":
             if proposal_id in raw_proposals:
                 raise GuidanceFormatError(
@@ -247,12 +347,12 @@ def parse_guidance_document(text: str) -> GuidanceDocument | None:
                 raise GuidanceFormatError(
                     f"guidance User Decision ID가 중복됩니다: {proposal_id}"
                 )
-            match = _DECISION_BODY_RE.fullmatch(body)
-            if match is None:
-                raise GuidanceFormatError(
-                    f"guidance User Decision 형식이 완전하지 않습니다: {proposal_id}"
-                )
-            raw_decisions[proposal_id] = (heading, match)
+            try:
+                fields = _decision_fields(body, proposal_id)
+            except GuidanceFormatError as error:
+                line = _line_number(normalized, log_start + heading.start())
+                raise GuidanceFormatError(f"{error} (line {line})") from error
+            raw_decisions[proposal_id] = (heading, fields)
             structure_parts.append(
                 f"### Agent Guidance User Decision: {proposal_id}\n"
                 "<USER-DECISION>\n"
@@ -285,30 +385,28 @@ def parse_guidance_document(text: str) -> GuidanceDocument | None:
             )
         target = normalize_target(proposal_match.group("target"))
         validate_patch_target(proposal_patch, target)
-        decision_kind = decision_match.group("decision")
-        revision = decision_match.group("revision").strip()
-        decision_patch = _normalize_patch(decision_match.group("patch"))
-        baseline = decision_match.group("baseline") or ""
-        if decision_kind == "pending":
-            if revision or decision_patch or baseline:
-                raise GuidanceFormatError(
-                    f"pending User Decision의 Revision·Patch·Baseline은 비어 있어야 합니다: {proposal_id}"
-                )
-        else:
-            if not revision:
-                raise GuidanceFormatError(
-                    f"확정 User Decision에는 비어 있지 않은 Revision이 필요합니다: {proposal_id}"
-                )
-            if decision_kind == "replace":
-                if not decision_patch:
-                    raise GuidanceFormatError(
-                        f"replace User Decision에는 Patch가 필요합니다: {proposal_id}"
-                    )
-                validate_patch_target(decision_patch, target)
-            elif decision_patch:
-                raise GuidanceFormatError(
-                    f"{decision_kind} User Decision의 Patch는 비어 있어야 합니다: {proposal_id}"
-                )
+        decision_kind = decision_match["decision"]
+        revision = decision_match.get("revision", "").strip()
+        decision_patch = _normalize_patch(decision_match["patch"])
+        baseline = decision_match.get("baseline", "")
+        if decision_patch:
+            validate_patch_target(decision_patch, target)
+        if decision_kind == "pending" and (revision or baseline):
+            raise GuidanceFormatError(
+                f"pending User Decision의 Revision·Baseline은 비어 있어야 합니다: {proposal_id}"
+            )
+        if decision_kind == "approve" and decision_patch not in ("", proposal_patch):
+            raise GuidanceFormatError(
+                f"approve Patch가 원안과 다릅니다. 수정본은 replace로 확정해야 합니다: {proposal_id}"
+            )
+        if decision_kind == "replace" and not decision_patch:
+            raise GuidanceFormatError(f"replace User Decision에는 Patch가 필요합니다: {proposal_id}")
+        # Preserve legacy identities: displayed originals and empty blocks have
+        # the same meaning. Only a replacement or edited review patch is bound.
+        if decision_kind != "replace" and decision_patch == proposal_patch:
+            decision_patch = ""
+        if decision_kind == "reject":
+            decision_patch = ""
         decision = GuidanceDecision(
             proposal_id=proposal_id,
             decision=decision_kind,
@@ -336,7 +434,20 @@ def parse_guidance_document(text: str) -> GuidanceDocument | None:
         + normalized[log_start + len(decision_log):]
     )
     structure_hash = _identity("loop-manager-guidance-plan-v1", structure)
-    return GuidanceDocument(tuple(proposals), structure_hash)
+    legacy_structure_hashes = []
+    for section in re.finditer(r"(?m)^## (?!#)", visible_log):
+        if any(heading.start() > section.start() for _, heading in headings):
+            continue
+        # A marker/memo may precede a formerly protected section. Compare its
+        # exact suffix against the saved legacy hash; never rewrite that hash
+        # or infer an existing section from its title. New memo headings before
+        # the original suffix do not prevent this exact comparison.
+        legacy_structure = (
+            normalized[:log_start] + "".join(structure_parts)
+            + normalized[log_start + section.start():]
+        )
+        legacy_structure_hashes.append(_identity("loop-manager-guidance-plan-v1", legacy_structure))
+    return GuidanceDocument(tuple(proposals), structure_hash, tuple(legacy_structure_hashes))
 
 
 def finalized_patch(proposal: GuidanceProposal) -> str | None:

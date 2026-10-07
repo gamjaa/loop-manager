@@ -1175,6 +1175,9 @@ class RuntimeStateRepository:
 
         with _transaction(self.connection):
             if plan_values.get("status") in ACTIVE_STATUSES:
+                from .work_claims import publication_claims
+                if plan_id in publication_claims(self.connection, repo)[0]:
+                    raise RuntimeStateError(f"{plan_id}: Planner 게시가 계획을 소유 예약 중입니다.")
                 from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
                 if plan_id in catalog_held_plan_ids(self.connection, repo):
                     raise RuntimeStateError("catalog 오류로 보류된 ExecPlan을 실행할 수 없습니다.")

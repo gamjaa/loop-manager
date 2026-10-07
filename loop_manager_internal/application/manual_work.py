@@ -7,16 +7,19 @@ from pathlib import Path
 import json
 import re
 from contextlib import closing
+from .manual_errors import ManualWorkError
+from .manual_concurrency import (ManualConflictError, manual_preparation, preparation_gate,
+                                 group_resources, serial_manual_drive)
+from loop_manager_internal.runtime.resource_lock import resource_locks
+from loop_manager_internal.runtime.contracts import (ProcessLockBusyError, WorkspaceOwnershipError,
+                                                     PublicationSafetyError, GitLockError)
+from loop_manager_internal.storage import work_claims
 
 from loop_manager_internal.catalog import execplan_catalog
 from loop_manager_internal.git import manager_git_journal, workspace
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.storage import execplan_catalog_state, runtime_state, maintenance_state
 from loop_manager_internal.storage.manual_work_state import ManualWorkRepository, digest, live_requirement_paths
-
-
-class ManualWorkError(RuntimeError):
-    pass
 
 
 class ManualDependencyWait(ManualWorkError):
@@ -134,7 +137,7 @@ class ManualWorkService:
         self.base = str(self.project['base_branch'])
 
     def validate_repository(self):
-        self.effects.validate_repository(self.repo_path, provider=self.project['provider'],
+        self.effects.validate_repository(self.repo_path, allow_agents_mismatch=False, provider=self.project['provider'],
             config_path=self.config_path, registration_checks=False, expected_origin=self.project['origin'])
 
     def slot_available(self, *, recovering=None, releasing_plan=None):
@@ -172,6 +175,7 @@ class ManualWorkService:
             raise ManualWorkError(f'원격 commit의 일반 문서가 없습니다: {path}')
         return self.effects.git_bytes(self.repo_path, 'show', f'{head}:{path}').decode('utf-8')
 
+    @manual_preparation
     def start(self, plan_id):
         group = self.store.for_plan(self.repo, plan_id)
         row = self.connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (self.repo, plan_id)).fetchone()
@@ -192,8 +196,7 @@ class ManualWorkService:
         if row['status'] == 'PLAN_BLOCKED' and row['blocked_reason'] not in {
                 'verify_retry_exhausted','review_retry_exhausted','review_protocol_exhausted','worker_output_invalid'}:
             raise ManualWorkError(f"수동 인계할 수 없는 차단: {row['blocked_reason']}")
-        if not self.slot_available(recovering=group,releasing_plan=row):
-            raise ManualWorkError('프로젝트 실행 자리 또는 안전 gate가 사용 중입니다. 수락되지 않았습니다.')
+        preparation_gate(self, plan_ids=[plan_id], group=group)
         base_head = self.fetch(self.base)
         text = self.document(str(row['path']), base_head)
         validated_plan=execplan_catalog.parse_execplan_text(str(row['path']),text,validate_sources=False)
@@ -222,6 +225,15 @@ class ManualWorkService:
                 raise ManualWorkError('동일 이름의 기존 branch/worktree에 SQLite 소유 근거가 없습니다.')
         start_base=(row['active_sha'] or base_head) if owned or group is not None else base_head
         with runtime_state._transaction(self.connection):
+            preparation_gate(self, plan_ids=[plan_id], group=group)
+            current = self.connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
+                                             (self.repo, plan_id)).fetchone()
+            if dict(current) != dict(row):
+                raise ManualWorkError(f'{plan_id}: 준비 중 계획·실행 소유권이 변경됐습니다. 다시 실행하세요.')
+            collision = self.connection.execute('SELECT plan_id FROM exec_plans WHERE repo=? AND plan_id!=? '
+                'AND (branch=? OR worktree=?)', (self.repo, plan_id, branch, str(worktree))).fetchone()
+            if collision:
+                raise ManualWorkError(f"자원 소유자 {collision['plan_id']}와 branch·worktree 충돌: {branch}; {worktree}")
             if group is None:
                 group = self.store.create(self.repo,'start',branch,(),base_head,base_head,
                                           members=(plan_id,),documents=documents)
@@ -256,13 +268,14 @@ class ManualWorkService:
                 existing=self.connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
                     (self.repo,item['plan']['id'])).fetchone()
                 if existing is not None and (existing['branch']!=group['branch'] or existing['worktree']!=group['worktree']):
-                    raise ManualWorkError(f"예약된 수동 G ID에 기존 계획 충돌이 있습니다: {item['plan']['id']}")
+                    raise ManualConflictError(f"예약된 수동 G ID에 기존 계획 충돌이 있습니다: {item['plan']['id']}")
         confirm_dependencies(self.connection,self.effects,self.repo_path,documents,self.base)
         owner = group['owner_id']
         row = self.connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (self.repo,owner)).fetchone()
         worktree, branch = Path(group['worktree']), group['branch']
         reserved = not group['workspace_created'] and (row is None or int(row['workspace_owned']) == 2)
         start_head = group['source_head'] if group['kind'] == 'submit' else str(row['active_sha'])
+        preparation_gate(self, plan_ids=json.loads(group['members']), group=group)
         self.effects.make_worktree(self.repo_path,worktree,branch,self.base,allow_create_branch=False,
             allow_recovery=True,allow_existing=True,ownership_reserved=reserved,expected_head=start_head,
             journal_state_dir=self.state_dir,journal_owner=f'plan:{owner}')
@@ -291,7 +304,7 @@ class ManualWorkService:
             # A successful push interrupted before SQLite confirmation is
             # recoverable only from the saved intent. Other commits are kept.
             if not row or not row['publication_remote_oid']:
-                raise ManualWorkError('수동 branch의 원격 소유 checkpoint를 확인할 수 없습니다. 변경을 보존했습니다.')
+                raise ManualConflictError(f'원격 게시 대상의 소유 checkpoint와 충돌: {branch}; 원격={remote}; 예상={head}. 변경을 보존했습니다.')
         with self.connection:
             if group['kind'] == 'submit':
                 for item in documents:
@@ -337,6 +350,7 @@ class ManualWorkService:
         with self.connection:
             self.store.update(group,prepared_head=head)
 
+    @manual_preparation
     def complete(self, args):
         group = self.store.for_plan(self.repo,args.plan_id)
         row = self.connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (self.repo,args.plan_id)).fetchone()
@@ -373,6 +387,7 @@ class ManualWorkService:
         previous_request=self.store.request(group)
         repaired=bool(previous_request and previous_request['source_head']!=head)
         with runtime_state._transaction(self.connection):
+            preparation_gate(self, plan_ids=json.loads(group['members']), group=group)
             group=self.store.update(group,documents=json.dumps(documents,ensure_ascii=False),definition_head=definition_head)
             self.store.accept(group,head=head,base=base_head,input_token=candidate_input(
                 self.effects,self.repo_path,head,base_head,json.loads(group['documents']),connection=self.connection),
@@ -391,15 +406,13 @@ class ManualWorkService:
                             'last_error':None,'verify_result':None,'review_result':None,'worker_result':None,
                             'verify_token':None,'review_token':None,'publication_token':None,'worker_input_token':None},enqueue=False)
                         self.store.update(group,resume_phase='VERIFYING')
-        return self.drive(group['group_id'])
+        return group['group_id']
 
     def drive(self, group_id):
-        self.resume()
-        selected=self.runtime.active_row(self.repo)
-        members=json.loads(self.store.get(self.repo,group_id)['members'])
-        if selected is not None and selected['plan_id'] in members:
-            self.effects.run_project(self.connection,self.state_dir,self.repo,self.config_path,
-                self.base,False,registered_only=True,runtime_mutation=self.runtime_mutation)
+        with serial_manual_drive(self.state_dir) as available:
+            if available and self.slot_available():
+                self.effects.run_project(self.connection,self.state_dir,self.repo,self.config_path,
+                    self.base,False,registered_only=True,runtime_mutation=self.runtime_mutation)
         group = self.store.get(self.repo,group_id)
         self.display(group,accepted=True)
         return 0 if group['state'] in {'PR_OPEN','MERGED'} else 1
@@ -414,38 +427,49 @@ class ManualWorkService:
             return
         for group in pending:
             try:
-                if group['state'] in {'GENERATING','REGISTERING'} and group['attempts']>=3:
-                    continue
-                if group['state']=='GENERATING':
-                    self.generate(group)
-                    group = self.store.get(self.repo,group['group_id'])
-                if group['state']=='REGISTERING':
-                    self.prepare(group)
-                    group = self.store.get(self.repo,group['group_id'])
-                if group['pending_source_head'] and (not group['source_update_conflict'] or group['source_update_candidate']):
-                    from loop_manager_internal.git.manual_source_update import update_source
-                    group=update_source(self,group)
-                confirm_dependencies(self.connection,self.effects,self.repo_path,json.loads(group['documents']),self.base)
-                owner = group['active_id'] or group['owner_id']
-                row = self.runtime.get(self.repo,owner)
-                if row.status=='PLAN_BLOCKED':
-                    continue  # Existing scoped recovery owns final blocks.
-                if row.status in {'PR_OPEN','MERGED'}:
-                    continue
-                from loop_manager_internal.execution.manual_candidate import ManualCandidate
-                from types import SimpleNamespace
-                ManualCandidate(self.connection,self.repo,owner,self.effects.git,self.effects.git_bytes).note_pending(
-                    SimpleNamespace(worktree=Path(group['worktree']),base_branch=self.base))
-                with self.connection:
-                    self.runtime.update_plan(self.repo,owner,plan_values={'status':group['resume_phase']},enqueue=False)
-                    self.runtime.hydrate(self.repo,owner)
-                    self.store.update(group,active_id=owner)
-                return
+                with resource_locks(self.state_dir, self.repo, group_resources(group), owner='manual-resume'):
+                    self._resume_group(group)
+                    if self.runtime.active_row(self.repo) is not None:
+                        return
+            except ProcessLockBusyError:
+                continue
             except (RuntimeError, OSError, ValueError, TypeError, KeyError) as error:
                 with self.connection:
                     self.store.update(group,last_error=str(error),
                         attempts=group['attempts']+(0 if isinstance(error,ManualDependencyWait) else 1))
                 self.effects.operation_print(f"수락됨·보존됨: {group['group_id']}; {error}")
+
+    def _resume_group(self, group):
+        group = self.store.get(self.repo, group['group_id'])
+        if group['state'] not in {'GENERATING','REGISTERING','AUTOMATIC'} or not group['request_id']:
+            return
+        if group['state'] in {'GENERATING','REGISTERING'} and group['attempts']>=3:
+            return
+        if group['state']=='GENERATING':
+            self.generate(group)
+            group = self.store.get(self.repo,group['group_id'])
+        if group['state']=='REGISTERING':
+            self.prepare(group)
+            group = self.store.get(self.repo,group['group_id'])
+        if group['pending_source_head'] and (not group['source_update_conflict'] or group['source_update_candidate']):
+            from loop_manager_internal.git.manual_source_update import update_source
+            group=update_source(self,group)
+        confirm_dependencies(self.connection,self.effects,self.repo_path,json.loads(group['documents']),self.base)
+        owner = group['active_id'] or group['owner_id']
+        row = self.runtime.get(self.repo,owner)
+        if row.status=='PLAN_BLOCKED':
+            return  # Existing scoped recovery owns final blocks.
+        if row.status in {'PR_OPEN','MERGED'}:
+            return
+        from loop_manager_internal.execution.manual_candidate import ManualCandidate
+        from types import SimpleNamespace
+        ManualCandidate(self.connection,self.repo,owner,self.effects.git,self.effects.git_bytes).note_pending(
+            SimpleNamespace(worktree=Path(group['worktree']),base_branch=self.base))
+        with self.connection:
+            self.runtime.update_plan(self.repo,owner,plan_values={'status':group['resume_phase']},enqueue=False)
+            self.runtime.hydrate(self.repo,owner)
+            self.store.update(group,active_id=owner)
+        return
 
     def display(self, group, *, accepted):
         from loop_manager_internal.execution.validation_feedback import redact_secrets
@@ -479,6 +503,7 @@ class ManualWorkService:
             self.effects.operation_print(f"git fetch origin; git switch --track origin/{group['branch']}\n"
                 f"완료: python loop_manager.py manual complete {self.repo} {group['owner_id']}")
 
+    @manual_preparation
     def submit(self, args):
         requirements = sorted(set(args.requirement))
         if not all(re.fullmatch(r'docs/requirements/[^/\\]+\.md',path) for path in requirements):
@@ -512,88 +537,128 @@ class ManualWorkService:
                 raise ManualWorkError('진행 중인 기존 G와 같은 R입니다. 목표 중복을 안전하게 배제할 수 없습니다: '+', '.join(overlap))
             if set(requirements) & live_requirement_paths(self.connection,self.repo):
                 raise ManualWorkError('같은 R의 미완료 수동 제출이 있습니다. 기존 source·R 범위로 다시 제출하세요.')
-        with self.connection:
+        with runtime_state._transaction(self.connection):
+            preparation_gate(self, plan_ids=json.loads(group['members']) if group else [],
+                             group=group, requirements=requirements)
             if group is None:
+                current_overlap = self.connection.execute("SELECT plan_id,sources FROM exec_plans WHERE repo=? AND status!='MERGED'", (self.repo,)).fetchall()
+                if any(set(json.loads(row['sources'])) & set(requirements) for row in current_overlap) or set(requirements) & live_requirement_paths(self.connection,self.repo):
+                    raise ManualWorkError('같은 R의 실행·수동 소유 예약이 준비 중 변경됐습니다.')
                 group = self.store.create(self.repo,'submit',args.branch,requirements,head,base)
-            self.store.accept(group,head=head,base=base,input_token=candidate_input(
-                self.effects,self.repo_path,head,base,json.loads(group['documents']),connection=self.connection),
-                skip_verify=args.skip_verify,skip_review=args.skip_review,reason=args.skip_reason or '')
             if source_changed:
                 if group['state']=='GENERATING':
                     self.store.update(group,source_head=head,base_sha=base,attempts=0,last_error=None)
                 else:
                     self.store.update(group,pending_source_head=head,attempts=0,last_error=None,
                         state=group['state'] if group['state']=='REGISTERING' else 'AUTOMATIC')
-        return self.drive(group['group_id'])
+        group = self.store.get(self.repo, group['group_id'])
+        if group['state']=='PREPARATION_CONFLICT':
+            with self.connection:
+                group=self.store.update(group, state='REGISTERING' if group['owner_id'] else 'GENERATING',
+                                        last_error=None, attempts=0)
+        try:
+            if group['state']=='GENERATING':
+                self.generate(group)
+                group = self.store.get(self.repo, group['group_id'])
+            if group['state']=='REGISTERING':
+                self.prepare(group)
+                group = self.store.get(self.repo, group['group_id'])
+            if group['pending_source_head'] and (not group['source_update_conflict'] or group['source_update_candidate']):
+                from loop_manager_internal.git.manual_source_update import update_source
+                update_source(self, group)
+        except (ManualConflictError, ProcessLockBusyError, WorkspaceOwnershipError, PublicationSafetyError, GitLockError) as error:
+            with self.connection:
+                if not group['request_id']:
+                    self.store.update(group, state='PREPARATION_CONFLICT', last_error=str(error))
+            raise ManualConflictError(str(error)) from error
+        except (RuntimeError, OSError, ValueError, TypeError, KeyError) as error:
+            with self.connection:
+                self.store.update(group, last_error=str(error),
+                    attempts=group['attempts']+(0 if isinstance(error,ManualDependencyWait) else 1))
+            self._accept_submit(group, args, head, base)
+            self.display(self.store.get(self.repo, group['group_id']), accepted=True)
+            return 1
+        self._accept_submit(group, args, head, base)
+        return group['group_id']
+
+    def _accept_submit(self, group, args, head, base):
+        with runtime_state._transaction(self.connection):
+            group=self.store.get(self.repo, group['group_id'])
+            preparation_gate(self, plan_ids=json.loads(group['members']), group=group,
+                             requirements=json.loads(group['requirements']))
+            self.store.accept(group,head=head,base=base,input_token=candidate_input(
+                self.effects,self.repo_path,head,base,json.loads(group['documents']),connection=self.connection),
+                skip_verify=args.skip_verify,skip_review=args.skip_review,reason=args.skip_reason or '')
 
     def generate(self, group):
         if group['attempts'] >= 3:
             raise ManualWorkError('G 생성·등록 재시도 한도에 도달했습니다. 기존 제출 초안을 보존했습니다.')
         requirements=json.loads(group['requirements'])
         r_text={path:self.document(path,group['source_head']) for path in requirements}
-        catalog=self.effects.git(self.repo_path,'ls-tree','-r','--name-only',group['base_sha'],'--','docs/plans').stdout
-        records=self.connection.execute('SELECT plan_id FROM exec_plans WHERE repo=? UNION SELECT plan_id '
-            'FROM manual_work_members WHERE repo=? UNION SELECT plan_id FROM execplan_catalog_history WHERE repo=? '
-            'UNION SELECT plan_id FROM execplan_cancellations WHERE repo=?', (self.repo,)*4).fetchall()
-        used=set(re.findall(r'G-\d{3,}',catalog)) | {row[0] for row in records}
-        used.update(re.findall(r'G-\d{3,}',self.effects.git(self.repo_path,'ls-tree','-r','--name-only',
-                                                        group['source_head'],'--','docs/plans').stdout))
-        used.update(key for key,_path in execplan_catalog_state.DefinitionStateRepository(self.connection).capture(self.repo).reserved)
         response=self.effects.generate_plans(self.connection,self.repo_path,self.state_dir,self.config_path,
             self.project['provider'],group,r_text)
         payload=json.loads(response)
         drafts=payload.get('plans')
         if not isinstance(drafts,list) or not drafts or len(drafts)>32:
             raise ManualWorkError('완성된 G 목록과 확정 가능한 제출 범위가 필요합니다.')
-        first=max((int(key[2:]) for key in used),default=0)+1
-        ids=[f'G-{first+index:03d}' for index in range(len(drafts))]
-        aliases={str(item.get('id',index)):ids[index] for index,item in enumerate(drafts)}
-        if len(aliases)!=len(drafts):
-            raise ManualWorkError('생성 G의 임시 ID가 중복됐습니다. dependency를 임의 변경하지 않습니다.')
-        if set(aliases)&used:
-            raise ManualWorkError('생성 G의 임시 ID가 기존 G ID와 충돌합니다. 외부 dependency를 임의 변경하지 않습니다.')
-        documents=[]
-        for index,item in enumerate(drafts):
-            title=item['title']
-            if not isinstance(title,str) or not title.strip() or re.search(r'[/\\\n\r:]',title):
-                raise ManualWorkError('생성 G title이 유효하지 않습니다.')
-            sources=item['sources']
-            if not sources or not set(sources)<=set(requirements) or not set(sources)&set(requirements):
-                raise ManualWorkError('생성 G sources는 제출한 R 범위여야 합니다.')
-            dependencies=[aliases.get(key,key) for key in item.get('depends_on',[])]
-            plan={'id':ids[index],'title':title,'sources':sources,'depends_on':dependencies,
-                  'complexity':item['complexity'],'risk':item['risk'],'priority':item['priority']}
-            lines=['---',f"id: {plan['id']}",f'title: {title}','sources:',*[f'  - {path}' for path in sources],
-                'depends_on:' if dependencies else 'depends_on: []',*[f'  - {key}' for key in dependencies],
-                f"complexity: {plan['complexity']}",f"risk: {plan['risk']}",f"priority: {plan['priority']}",'---','',item['body']]
-            text='\n'.join(lines).rstrip()+'\n'
-            for section in ('Purpose','Acceptance Criteria','Implementation','Validation','Progress','Decision Log'):
-                if not re.search(rf'(?m)^## {section}\s*$',text):
-                    raise ManualWorkError(f'생성 G에 {section}이 없습니다.')
-            path=f"docs/plans/[{ids[index]}] {title}.md"
-            snapshot=execplan_catalog.snapshot_from_documents({path:text.encode()},validate_sources=False,isolate_errors=True)
-            issues=[issue for issue in snapshot.issues if issue.code!='missing-dependency']
-            if issues:
-                raise ManualWorkError('; '.join(issue.message for issue in issues))
-            plan=execplan_catalog.parse_execplan_text(path,text,validate_sources=False,require_priority=True)
-            from loop_manager_internal.catalog import execplan_drafts
-            execplan_drafts.validate_agent_change(plan)
-            documents.append({'path':path,'text':text,'plan':plan})
-        if set(requirements)!={path for item in documents for path in item['plan']['sources']}:
-            raise ManualWorkError('생성 G가 제출한 R 전체를 추적하지 않습니다.')
-        validate_group_dependencies(documents)
-        validate_dependency_scope(self.connection,self.repo,documents)
-        branch,worktree=workspace.expected_execplan_workspace(self.state_dir,self.repo,ids[0])
-        if worktree.exists() or self.effects.git(self.repo_path,'show-ref','--verify','--quiet',
-                f'refs/heads/{branch}',check=False).returncode==0 \
-                or manager_git_journal.live_remote_branch_oid(self.effects.git,self.repo_path,branch):
-            raise ManualWorkError('생성 G의 새 소유 자원 이름에 충돌이 있습니다.')
-        with self.connection:
+        with runtime_state._transaction(self.connection):
+            preparation_gate(self, group=group, requirements=requirements)
+            catalog=self.effects.git(self.repo_path,'ls-tree','-r','--name-only',group['base_sha'],'--','docs/plans').stdout
+            records=self.connection.execute('SELECT plan_id FROM exec_plans WHERE repo=? UNION SELECT plan_id '
+                'FROM manual_work_members WHERE repo=? UNION SELECT plan_id FROM execplan_catalog_history WHERE repo=? '
+                'UNION SELECT plan_id FROM execplan_cancellations WHERE repo=?', (self.repo,)*4).fetchall()
+            used=set(re.findall(r'G-\d{3,}',catalog)) | {row[0] for row in records}
+            used.update(re.findall(r'G-\d{3,}',self.effects.git(self.repo_path,'ls-tree','-r','--name-only',
+                                                            group['source_head'],'--','docs/plans').stdout))
+            used.update(key for key,_path in execplan_catalog_state.DefinitionStateRepository(self.connection).capture(self.repo).reserved)
+            used.update(work_claims.publication_claims(self.connection, self.repo)[0])
+            first=max((int(key[2:]) for key in used),default=0)+1
+            ids=[f'G-{first+index:03d}' for index in range(len(drafts))]
+            aliases={str(item.get('id',index)):ids[index] for index,item in enumerate(drafts)}
+            if len(aliases)!=len(drafts):
+                raise ManualWorkError('생성 G의 임시 ID가 중복됐습니다. dependency를 임의 변경하지 않습니다.')
+            if set(aliases)&used:
+                raise ManualWorkError('생성 G의 임시 ID가 기존 G ID와 충돌합니다. 외부 dependency를 임의 변경하지 않습니다.')
+            documents=[]
+            for index,item in enumerate(drafts):
+                title=item['title']
+                if not isinstance(title,str) or not title.strip() or re.search(r'[/\\\n\r:]',title):
+                    raise ManualWorkError('생성 G title이 유효하지 않습니다.')
+                sources=item['sources']
+                if not sources or not set(sources)<=set(requirements) or not set(sources)&set(requirements):
+                    raise ManualWorkError('생성 G sources는 제출한 R 범위여야 합니다.')
+                dependencies=[aliases.get(key,key) for key in item.get('depends_on',[])]
+                plan={'id':ids[index],'title':title,'sources':sources,'depends_on':dependencies,
+                      'complexity':item['complexity'],'risk':item['risk'],'priority':item['priority']}
+                lines=['---',f"id: {plan['id']}",f'title: {title}','sources:',*[f'  - {path}' for path in sources],
+                    'depends_on:' if dependencies else 'depends_on: []',*[f'  - {key}' for key in dependencies],
+                    f"complexity: {plan['complexity']}",f"risk: {plan['risk']}",f"priority: {plan['priority']}",'---','',item['body']]
+                text='\n'.join(lines).rstrip()+'\n'
+                for section in ('Purpose','Acceptance Criteria','Implementation','Validation','Progress','Decision Log'):
+                    if not re.search(rf'(?m)^## {section}\s*$',text):
+                        raise ManualWorkError(f'생성 G에 {section}이 없습니다.')
+                path=f"docs/plans/[{ids[index]}] {title}.md"
+                snapshot=execplan_catalog.snapshot_from_documents({path:text.encode()},validate_sources=False,isolate_errors=True)
+                issues=[issue for issue in snapshot.issues if issue.code!='missing-dependency']
+                if issues:
+                    raise ManualWorkError('; '.join(issue.message for issue in issues))
+                plan=execplan_catalog.parse_execplan_text(path,text,validate_sources=False,require_priority=True)
+                from loop_manager_internal.catalog import execplan_drafts
+                execplan_drafts.validate_agent_change(plan)
+                documents.append({'path':path,'text':text,'plan':plan})
+            if set(requirements)!={path for item in documents for path in item['plan']['sources']}:
+                raise ManualWorkError('생성 G가 제출한 R 전체를 추적하지 않습니다.')
+            validate_group_dependencies(documents)
+            validate_dependency_scope(self.connection,self.repo,documents)
+            branch,worktree=workspace.expected_execplan_workspace(self.state_dir,self.repo,ids[0])
+            if worktree.exists() or self.effects.git(self.repo_path,'show-ref','--verify','--quiet',
+                    f'refs/heads/{branch}',check=False).returncode==0 \
+                    or manager_git_journal.live_remote_branch_oid(self.effects.git,self.repo_path,branch):
+                raise ManualConflictError(f'생성 G 자원 충돌: {ids[0]}; branch={branch}; worktree={worktree}')
             for key in ids:
                 self.connection.execute('INSERT INTO manual_work_members VALUES (?,?,?)',(self.repo,key,group['group_id']))
             self.store.update(group,members=json.dumps(ids),documents=json.dumps(documents,ensure_ascii=False),
-                owner_id=ids[0],active_id=ids[0],branch=branch,worktree=str(worktree),state='REGISTERING')
-
+                    owner_id=ids[0],active_id=ids[0],branch=branch,worktree=str(worktree),state='REGISTERING')
 
 def resume_manual_work(effects: ManualWorkEffects, connection, state_dir, repo_path,
                        config_path, runtime_mutation=None):

@@ -399,8 +399,6 @@ def execute_runtime_command(
     if args.command == "manual":
         if effects.manual_command is None:
             raise RuntimeError('수동 명령 composition이 없습니다.')
-        with closing(effects.connect_database(state_dir)) as connection, connection:
-            agent_invocation_state.InvocationRepository(connection).reconcile_interrupted()
         return effects.manual_command(args, state_dir, config_path, runtime_mutation)
     if args.command == "maintenance-review":
         from uuid import uuid4
@@ -416,7 +414,7 @@ def execute_runtime_command(
         effects.operation_print(f"전체 정밀 점검 요청 저장: {repo}; 다음 안전한 작업 선택 경계에서 실행합니다.")
         return 0
     with closing(effects.connect_database(state_dir)) as connection, connection:
-        agent_invocation_state.InvocationRepository(connection).reconcile_interrupted()
+        agent_invocation_state.InvocationRepository(connection).reconcile_interrupted(state_dir=state_dir)
         return effects.run_registered_projects(
             connection, state_dir, config,
             **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),

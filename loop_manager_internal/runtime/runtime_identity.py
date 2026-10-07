@@ -138,8 +138,13 @@ def expected_runtime_worktree(
     state_dir: Path,
     source: Path,
     commit_sha: str,
+    *, command_id: str | None = None,
 ) -> Path:
-    return state_dir / "runtimes" / runtime_repository_id(source) / commit_sha
+    root = state_dir / "runtimes" / runtime_repository_id(source)
+    if command_id is not None:
+        _runtime_intent_path(state_dir, command_id)  # Validate the path component.
+        root = root / "commands" / command_id
+    return root / commit_sha
 
 
 def source_config_path(source: Path, value: str) -> Path:

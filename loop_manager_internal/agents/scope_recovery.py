@@ -411,7 +411,9 @@ def validate_persisted_agent_scope(
     runtime_recreation_proven = False
     if runtime_mutation is not None and _canonical_path(repo_path) == _canonical_path(runtime_mutation.source):
         try:
-            held_identity = _held_process_lock_identity(state_dir)
+            lease_options = ({"name": f"manual-{runtime_mutation.mutation_id}.lock"}
+                             if runtime_mutation.concurrent else {})
+            held_identity = _held_process_lock_identity(state_dir, **lease_options)
             expected_identity = (
                 "0" if runtime_mutation.legacy
                 else f"runtime:{runtime_mutation.mutation_id}"
@@ -423,6 +425,7 @@ def validate_persisted_agent_scope(
             effects.validate_runtime_worktree(
                 runtime_mutation.source, state_dir,
                 runtime_mutation.path, runtime_mutation.commit_sha,
+                **({"command_id": runtime_mutation.mutation_id} if runtime_mutation.concurrent else {}),
             )
             current_lock_reason = effects._validated_runtime_registration_marker(
                 runtime_mutation.source, state_dir,

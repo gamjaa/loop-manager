@@ -8,6 +8,7 @@ from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.application.contracts import RemoteBranchMissingError
 from loop_manager_internal.git import manager_git_journal
 from loop_manager_internal.runtime.contracts import RuntimeWorktree
+from loop_manager_internal.runtime.resource_lock import fetch_resource
 from pathlib import Path
 import json
 import re
@@ -23,6 +24,7 @@ class RecordedBaseFetchEffects:
     git: Callable[..., object]
 
 
+@fetch_resource
 def _recorded_base_fetch(
     effects: RecordedBaseFetchEffects, repo: Path, state_dir: Path, base: str, *, owner: str,
 ) -> str:
@@ -98,8 +100,9 @@ class PrepareBootstrapRuntimeEffects:
 
 def prepare_bootstrap_runtime(
     effects: PrepareBootstrapRuntimeEffects, source: Path, state_dir: Path, mutation_id: str,
+    *, concurrent: bool = False,
 ) -> RuntimeWorktree:
-    return effects._bootstrap_service().prepare_bootstrap_runtime(source, state_dir, mutation_id)
+    return effects._bootstrap_service().prepare_bootstrap_runtime(source, state_dir, mutation_id, concurrent=concurrent)
 
 
 @dataclass(frozen=True)
@@ -310,6 +313,7 @@ class JournaledManagerBaseFetchEffects:
     _tracking_ref_oid: Callable[..., object]
 
 
+@fetch_resource
 def _journaled_manager_base_fetch(
     effects: JournaledManagerBaseFetchEffects, connection: sqlite3.Connection, repo_path: Path, state_dir: Path,
     intent_id: int, base: str, plan_id: str,
