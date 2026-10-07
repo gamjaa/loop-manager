@@ -430,6 +430,13 @@ class CheckpointSafetyAdapter:
         try:
             before = GitSnapshot.deserialize(str(plan["agent_snapshot"]))
             result = GitSnapshot.deserialize(str(plan["agent_result_snapshot"]))
+            original = before
+            checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get(
+                request.repo, request.plan_id)
+            before = agent_scope_decision.manager_comparison_baseline(
+                original, before, checkpoint.snapshot or {}, 'worker')
+            result = agent_scope_decision.manager_comparison_baseline(
+                original, result, checkpoint.snapshot or {}, 'worker')
             project = self.connection.execute(
                 'SELECT base_branch FROM projects WHERE repo = ?', (request.repo,)).fetchone()
             self.safety_effects.validate_agent_scope(

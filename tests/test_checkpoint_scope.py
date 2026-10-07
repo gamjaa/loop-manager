@@ -276,6 +276,57 @@ class CheckpointScopeTests(TestCase):
               mock.patch.object(manager, '_scope_snapshot_with_start_ignore_rules', side_effect=lambda _w, _b, a: a)):
             self.assertTrue(self.adapter._validated_worker_checkpoint(self.request, self.plan(), result))
 
+    def test_saved_worker_result_uses_bound_baseline_after_live_base_advances(self):
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        for base in ('main', 'develop'):
+            with self.subTest(base=base):
+                ref, head = 'refs/remotes/origin/' + base, 'refs/remotes/origin/HEAD'
+                original = replace(self.before, refs={**self.before.refs, ref: ('a', ''), head: ('a', ref)})
+                baseline = replace(original, refs={**original.refs, ref: ('b', ''), head: ('b', ref)})
+                result = replace(baseline, dirty={'src/app.py': (('unstaged',), 'worker-content')})
+                current = replace(result, refs={**result.refs, ref: ('c', ''), head: ('c', ref)})
+                self.connection.execute('UPDATE projects SET base_branch=?', (base,))
+                self.connection.execute('UPDATE exec_plans SET agent_snapshot=?, agent_result_snapshot=?',
+                    (original.serialize(), result.serialize()))
+                def record(digest):
+                    previous = checkpoints.get('repo', 'G-047')
+                    checkpoints.record('repo', 'G-047', expected_generation=previous.generation,
+                        operation=None, expected_head='head', target_base_oid=None, observed_remote_oid=None,
+                        snapshot={'manager_metadata_agent_baseline': {'role': 'worker',
+                            'original': digest, 'snapshot': baseline.serialize()}})
+                digest = hashlib.sha256(original.serialize().encode()).hexdigest()
+                record(digest)
+                def git(_repo, *args, **kwargs):
+                    if args[0] == 'ls-remote':
+                        value = 'c\trefs/heads/' + base
+                    elif args[0] == 'rev-parse':
+                        value = 'c'
+                    elif args[0] == 'remote':
+                        value = 'https://github.com/owner/repo'
+                    else:
+                        value = ''
+                    return SimpleNamespace(stdout=value, returncode=1 if args[0] == 'check-ignore' else 0)
+                resources = agent_scope_decision.used_git_resources(role='worker', phase='PLAN_BLOCKED',
+                    base_branch=base, branch=self.branch, worktree_key=str(self.worktree))
+                self.effects = replace(self.effects, git=git, capture_git_snapshot=lambda _: current,
+                    validate_execplan_workspace_identity=lambda *_: None,
+                    validate_managed_worktree=lambda *_args, **_kwargs: None,
+                    _rebase_in_progress_for_branch=lambda *_: False)
+                with (mock.patch.object(manager, 'git', side_effect=git),
+                      mock.patch.object(manager, '_agent_git_resources', return_value=resources),
+                      mock.patch.object(manager, '_scope_snapshot_with_start_ignore_rules', side_effect=lambda _w, _b, a: a)):
+                    self.assertTrue(self.adapter._validated_worker_checkpoint(self.request, self.plan(), current))
+                    self.assertTrue(self.adapter.assess(self.request).safe)
+                    record('wrong-original')
+                    self.assertFalse(self.adapter._validated_worker_checkpoint(self.request, self.plan(), current))
+                    record(digest)
+                    invalid = replace(result, refs={**result.refs, head: ('b', 'refs/heads/foreign')})
+                    self.connection.execute('UPDATE exec_plans SET agent_result_snapshot=?', (invalid.serialize(),))
+                    self.assertEqual(self.adapter.assess(self.request).reason_code, 'agent_scope_recovery_pending')
+                self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
+                self.assertEqual(self.plan()['agent_result_snapshot'], invalid.serialize())
+
     def test_manager_checkpoint_keeps_invocation_identity_for_restart(self):
         self.current = replace(self.before, head='checkpoint', scope_id=None, scope_start_digest=None)
         self.adapter._record_guidance_checkpoint_scope(self.request)
