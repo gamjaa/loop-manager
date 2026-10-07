@@ -15,6 +15,7 @@ from loop_manager_internal.git.managed_rebase_validation import (
 )
 from loop_manager_internal.git.manager_git_journal import MutationEvidenceError
 from loop_manager_internal.git import manager_git_journal
+from loop_manager_internal.verification.timing import phase
 
 
 def checkpoint_remote_oid(checkpoint, repo, branch, *, git, read_fetched):
@@ -62,13 +63,25 @@ class ManagedRebaseService:
             raise MutationEvidenceError('current rebase rejected: ' + decision.reason + detail)
         return observed, decision
 
-    def adopt(self, state, checkpoint):
-        observed, decision = self.require_owned()
+    def adopt(self, state, checkpoint, *, validate_ownership=None):
+        with phase('rebase:adoption_inspect'):
+            observed, decision = self.require_owned()
         if decision.status is not RebaseStatus.COMPLETE:
             raise MutationEvidenceError('current rebase is still waiting for resolution')
+        # The caller may consume this inspection for its separate durable-owner
+        # check. It must be read-only; transaction confirmation below observes
+        # again, and no inspection survives adoption or publication.
+        if validate_ownership is not None:
+            with phase('rebase:adoption_owner'):
+                validate_ownership(observed, decision)
+
+        def confirm():
+            with phase('rebase:adoption_confirm'):
+                return self.observe()[1]
+
         state.complete_rebase(
             checkpoint, acceptance=decision.acceptance,
-            reobserve=lambda: self.observe()[1],
+            reobserve=confirm,
             project_values=revalidation_values(self.expected.target_base_oid),
         )
         return observed

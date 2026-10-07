@@ -1,5 +1,5 @@
 import json
-from contextlib import nullcontext
+from contextlib import ExitStack
 import sqlite3
 from pathlib import Path
 from unittest import mock
@@ -8,6 +8,7 @@ from tests.support.catalog import make_catalog_root, write_execplan
 from tests.support.git import git_command, make_remote_repository, commit_and_push
 from tests.support.worker import worker_result
 from tests.support.publication import matching_branch_pr_lookup
+from loop_manager_internal.verification.timing import phase
 
 
 class BoundedRecoveryFixture:
@@ -110,23 +111,41 @@ class BoundedRecoveryFixture:
         publish: bool,
         boundary=None,
     ) -> dict[str, object]:
-        if boundary is not None and boundary.saved:
+        if boundary is not None and Path(directory).resolve() != Path(boundary.directory).resolve():
+            raise RuntimeError('Review 준비 경로가 복구 경계와 다릅니다')
+        reused = boundary is not None and boundary.saved
+        if reused:
+            if boundary.review_inputs != (publish,):
+                raise RuntimeError('Review 준비 입력이 다릅니다')
             repo, state_dir, connection = boundary.review_state
-            boundary.restore(connection)
+            connection = boundary.restore(connection)
+            boundary.review_state = repo, state_dir, connection
+            with phase('git_fixture:review_confirmation'):
+                # Compare freshly read evidence at the same owned paths. The
+                # saved snapshot is a comparison, never a current receipt.
+                if loop_manager.capture_git_snapshot(boundary.review_worktree) != boundary.review_snapshot:
+                    raise RuntimeError('Review 준비 Git 상태가 다릅니다')
         else:
-            repo, state_dir, connection = self._active_worker_project(directory)
+            with phase('git_fixture:review_initialization'):
+                repo, state_dir, connection = self._active_worker_project(directory)
         from loop_manager_internal.execution.execution_handlers import ExecutionHandlers
         review_entry = ExecutionHandlers.review
 
         def save_review_entry(handler, context):
-            if not boundary.saved:
+            preparation.close()
+            if boundary is not None and not boundary.saved:
                 boundary.review_state = repo, state_dir, connection
+                boundary.review_inputs = (publish,)
+                boundary.review_worker_version = worker_version
+                boundary.review_worktree = context.worktree
+                with phase('git_fixture:review_confirmation'):
+                    boundary.review_snapshot = loop_manager.capture_git_snapshot(context.worktree)
                 boundary.save(connection)
             return review_entry(handler, context)
         roles = []
         reviewer_sessions = []
         reviewer_prompts = []
-        worker_version = 1
+        worker_version = boundary.review_worker_version if reused else 1
         transitions = []
         original_transition = loop_manager.transition_validation_failure
 
@@ -171,8 +190,9 @@ class BoundedRecoveryFixture:
                 return {"url": "https://example.test/pr/13"}
             return None
 
-        with (mock.patch.object(ExecutionHandlers, 'review', save_review_entry)
-              if boundary is not None else nullcontext()), mock.patch(
+        with ExitStack() as preparation, mock.patch.object(
+            ExecutionHandlers, 'review', save_review_entry
+        ), mock.patch(
             "loop_manager.validate_repository", return_value=repo
         ), mock.patch(
             "loop_manager.remote_base", return_value="main"
@@ -188,6 +208,8 @@ class BoundedRecoveryFixture:
             "loop_manager.transition_validation_failure",
             side_effect=record_transition,
         ):
+            if not reused:
+                preparation.enter_context(phase('git_fixture:review_worker_verify'))
             result = loop_manager.run_project_result(
                 connection,
                 state_dir,
