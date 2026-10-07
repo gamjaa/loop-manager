@@ -445,13 +445,23 @@ def _owned_checkpoint_remote_oid(
     candidate = tracked[0]
     published = str(plan["publication_remote_oid"] or (plan["pr_head_oid"] if request.pr_url else None) or "")
     durable = candidate == published and bool(published)
-    if not durable and request.local_oid == candidate and request.tree_oid and request.commit_identity:
+    proofs = [(request.local_oid, request.tree_oid, request.commit_identity)]
+    row = blocked_checkpoint_state.scope_request_row(connection, request.repo, request.plan_id)
+    if row is not None and row['request_identity'] == request.request_identity:
+        for entry in json.loads(row['publication_history']):
+            prior = entry.get('superseded_request', {})
+            if (prior.get('branch'), prior.get('worktree'), prior.get('pr_url')) == (
+                    request.branch, request.worktree, request.pr_url):
+                proofs.append((prior.get('local_oid'), prior.get('tree_oid'), prior.get('commit_identity')))
+    for local_oid, tree_oid, identity in proofs:
+        if durable or local_oid != candidate or not tree_oid or not identity:
+            continue
         try:
             durable = (
                 current.head == candidate
                 and effects.git(repo_path, "rev-parse", f"{candidate}^{{tree}}").stdout.strip()
-                == request.tree_oid
-                and f"Checkpoint-Identity: {request.commit_identity}" in
+                == tree_oid
+                and f"Checkpoint-Identity: {identity}" in
                 effects.git(repo_path, "show", "-s", "--format=%B", candidate).stdout
             )
         except RuntimeError:

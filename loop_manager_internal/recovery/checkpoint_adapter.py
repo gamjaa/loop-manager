@@ -21,6 +21,7 @@ from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
 from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
 from loop_manager_internal.runtime.runtime_identity import _canonical_path
 from loop_manager_internal.storage import execution_checkpoint_state
+from loop_manager_internal.storage import blocked_checkpoint_state
 from pathlib import Path
 import json
 import hashlib
@@ -570,6 +571,9 @@ class CheckpointSafetyAdapter:
             if (path != own_path and path not in cleaned
                     and before.worktrees.get(path) != current.worktrees.get(path)):
                 return reject("outside_managed_worktree_mutation", f"checkpoint 외부 worktree 변경: {path}")
+        if owned_remote_oid is not None:
+            blocked_checkpoint_state.BlockedCheckpointRepository(self.connection).accept_superseded_publication(
+                request, owned_remote_oid)
         return None
 
 

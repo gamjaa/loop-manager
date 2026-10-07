@@ -128,6 +128,78 @@ class CheckpointScopeTests(TestCase):
         safety.assess.assert_not_called()
         self.assertEqual(self.connection.execute('SELECT retry_count FROM exec_plans').fetchone()[0], 0)
 
+    def test_cause_change_after_push_reuses_archived_proof_on_next_dispatch(self):
+        from loop_manager_internal.recovery import checkpoint_service
+        remote_ref = 'refs/remotes/origin/' + self.branch
+        self.connection.execute("UPDATE blocked_checkpoints SET expected_remote_oid='old', remote_observed=1")
+        original = self.store.get('repo', 'G-047')
+        prepared = blocked_checkpoint.PreparedCheckpoint('head', 'tree', 'owned-identity', 'message', ())
+        self.store.record_prepared(original, prepared)
+        self.store.record_local(original, 'published')
+        self.connection.execute("UPDATE execplan_blocks SET evidence='cause changed after push'")
+        self.connection.commit()
+        dispatcher = blocked_checkpoint.BlockedCheckpointDispatcher(self.store, mock.Mock(), mock.Mock(), mock.Mock())
+        dispatcher._finish_published(self.store.get('repo', 'G-047'), 'published')
+        refreshed = self.store.get('repo', 'G-047')
+        self.assertIsNone(refreshed.local_oid)
+        self.assertIsNone(refreshed.commit_identity)
+        current = replace(self.before, head='published',
+            refs={**self.before.refs, self.own_ref: ('published', ''), remote_ref: ('published', '')})
+        observed = {'tree': 'tree', 'message': 'Checkpoint-Identity: owned-identity', 'remote': 'published'}
+        def git(_repo, *args, **kwargs):
+            value = (observed['tree'] if args[0] == 'rev-parse' else observed['message']
+                if args[0] == 'show' else observed['remote'] + '\trefs/heads/' + self.branch)
+            return SimpleNamespace(stdout=value, returncode=0)
+        owned_effects = checkpoint_service.OwnedCheckpointRemoteOidEffects(git=git)
+        owned = lambda connection, repo, request, plan, snapshot: checkpoint_service._owned_checkpoint_remote_oid(
+            owned_effects, connection, repo, request, plan, snapshot)
+        self.effects = replace(self.effects, _owned_checkpoint_remote_oid=owned)
+        with mock.patch.object(manager, '_agent_git_resources', return_value=None):
+            for key, wrong in (('tree', 'wrong'), ('message', 'forged'), ('remote', 'foreign')):
+                previous = observed[key]
+                observed[key] = wrong
+                self.assertEqual(self.adapter._shared_safety_error(refreshed, self.plan(), current).reason_code,
+                    'shared_ref_mutation')
+                self.assertEqual(self.store.get('repo', 'G-047').expected_remote_oid, 'old')
+                observed[key] = previous
+            self.assertIsNone(self.adapter._shared_safety_error(refreshed, self.plan(), current))
+        self.assertEqual(self.store.get('repo', 'G-047').expected_remote_oid, 'published')
+        self.connection.execute("UPDATE blocked_checkpoints SET expected_remote_oid='competing'")
+        competing = self.store.get('repo', 'G-047')
+        self.store.accept_superseded_publication(competing, 'published')
+        self.assertEqual(self.store.get('repo', 'G-047').expected_remote_oid, 'competing')
+        self.connection.execute("UPDATE blocked_checkpoints SET expected_remote_oid='old'")
+        self.connection.execute("UPDATE exec_plans SET worktree='/competing'")
+        self.connection.commit()
+        self.store.accept_superseded_publication(refreshed, 'published')
+        self.assertEqual(self.store.get('repo', 'G-047').expected_remote_oid, 'old')
+        self.connection.execute('UPDATE exec_plans SET worktree=?', (str(self.worktree),))
+        # Replay the restart from the old lease, so dispatch must load the
+        # lease accepted during its actual safety check before pushing.
+        self.connection.execute("UPDATE blocked_checkpoints SET expected_remote_oid='old'")
+        self.connection.commit()
+        safety, publication, results = mock.Mock(), mock.Mock(), mock.Mock()
+        def assess(request):
+            with mock.patch.object(manager, '_agent_git_resources', return_value=None):
+                self.assertIsNone(self.adapter._shared_safety_error(request, self.plan(), current))
+            return blocked_checkpoint.SafetyVerdict(True, blocked_checkpoint.SafetyScope.PLAN,
+                None, None, 'published', ('src/app.py',))
+        safety.assess.side_effect = assess
+        publication.existing_pull_request.return_value = None
+        publication.prepare.return_value = blocked_checkpoint.PreparedCheckpoint(
+            'published', 'new-tree', 'new-identity', 'new cause', ('src/app.py',))
+        publication.ensure_local_commit.return_value = 'new-candidate'
+        publication.observe_remote.side_effect = ['published', 'new-candidate']
+        publication.is_fast_forward.return_value = True
+        dispatcher = blocked_checkpoint.BlockedCheckpointDispatcher(self.store, safety, publication, results)
+        self.assertTrue(dispatcher._dispatch_one(refreshed))
+        push = publication.push.call_args.args
+        self.assertEqual(push[0].expected_remote_oid, 'published')
+        self.assertEqual(push[2].mode, blocked_checkpoint.PushMode.FAST_FORWARD)
+        self.assertEqual(self.store.get('repo', 'G-047').phase.value, 'published')
+        results.promote_project_block.assert_not_called()
+        self.assertEqual(self.connection.execute('SELECT retry_count FROM exec_plans').fetchone()[0], 0)
+
     def test_checkpoint_ignores_unrelated_resources_only_with_invocation_proof(self):
         changes = (
             {'refs': {**self.before.refs, 'refs/heads/B': ('new', ''),

@@ -8,6 +8,7 @@ from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.application.contracts import RemoteBranchMissingError
 from loop_manager_internal.git import manager_git_journal
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
 from loop_manager_internal.runtime.contracts import RuntimeWorktree
 from loop_manager_internal.runtime.resource_lock import fetch_resource
 from loop_manager_internal.runtime.runtime_scope import proven_runtime_removal
@@ -458,7 +459,15 @@ def _reconciled_manager_scope_metadata(effects: ReconciledManagerScopeMetadataEf
     saved = ExecutionCheckpointRepository(connection).get(repo, plan_id or '').snapshot or {}
     baseline = saved.get('manager_metadata_agent_baseline')
     if isinstance(baseline, dict):
-        before = agent_scope_decision.manager_comparison_baseline(before, before, saved, baseline.get('role'))
+        repository = RuntimeStateRepository(connection)
+        owner = (repository.scope_owner(repo, plan_id)
+                 if plan_id and repository.scope_catalog_available() else None)
+        if owner is None:
+            owner = repository.scope_owner(repo)
+        if owner is not None and owner['agent_snapshot']:
+            original = GitSnapshot.deserialize(str(owner['agent_snapshot']))
+            before = agent_scope_decision.manager_comparison_baseline(
+                original, before, saved, str(owner['agent_role'] or ''))
     removed = frozenset(path for path, registration in before.worktrees.items()
         if path not in current.worktrees and proven_runtime_removal(
             state_dir, Path(repo), Path(path), registration))

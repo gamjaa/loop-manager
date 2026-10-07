@@ -441,6 +441,11 @@ class BlockedCheckpointDispatcher:
             self._results.finalized(request)
             return True
 
+        if reconcile is not None:
+            current = self._state.get(request.repo, request.plan_id)
+            if current.request_identity != request.request_identity:
+                return True
+            request = current
         pull_request = self._publication.existing_pull_request(request)
         if not any(checkpoint_pr_matches(
                 pull_request, url=request.pr_url, branch=request.branch, head=head)
