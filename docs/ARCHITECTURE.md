@@ -441,6 +441,10 @@ ExecPlan archive는 원본 hash, regular-file source, 비어 있는 destination�
 
 ### 실행별 Agent 범위와 Manager 전이
 
+저장된 시작·Agent 결과·Manager checkpoint와 BLOCKED의 사전 비교는 같은 ignored 비교 view를 사용한다. 시작 시 tracked ignore 규칙의 blob·index·작업 상태 또는 기록된 외부 exclude의 경로·내용 서명이 저장 결과·현재 상태와 일치할 때만 index에 없는 과거 untracked artifact를 비교에서 제외한다. 원본 snapshot과 활성 파일은 수정하지 않으며 새로 숨긴 경로, 강제 stage, index flag와 권위 있는 Git 변경은 기존 검사를 유지한다.
+
+동일 입력의 planning_error도 보존된 작업의 소유권·종료 호출·저장 결과를 확인해 재평가한다. 원본 결과가 저장된 scope 오류를 재현하고 ignored 비교 view만 통과하며 결과 이후의 권위 변경이 없을 때만 해당 오류를 해제한다. 차단 identity·현재 Git 상태를 transaction에서 다시 대조하고 session·retry·실패 진단을 보존한다. ignored-only PLAN_BLOCKED는 저장한 차단 전 실행 단계와 Worker·verify·Review 결과를 이어가며, 다른 원인이나 변경된 후보에는 기존 재검증 경계를 적용한다.
+
 실행별 쓰기 격리 증거가 저장된 작업 기준선·호출·역할·session·repository 및 관리 worktree와 일치할 때만 Agent Git 감시를 선택 worktree의 identity·등록·branch·HEAD·index·허용 파일, 작업 소유 branch·원격 base·게시 ref와 영향을 주는 config·operation으로 좁힌다. 무관한 ref·다른 worktree 변화는 진단에 보존하며, 사용 중인 자원의 예상 밖 변화와 영향이 불확실한 config는 차단한다. 증거가 없거나 불완전한 과거 snapshot은 기존 엄격 비교를 유지하고, 이후 사용할 자원은 사용 직전에 실제 값·소유권·기대 OID를 재검증한다
 
 Agent 시작 이후 Manager의 fetch·worktree 전이는 작업별 전후 기대값·소유 표식·checkpoint와 현재 Git 상태가 일치하는 자원만 비교 기준선에 반영한다. 관측 OID, SQLite 완료 상태나 예정된 cleanup만으로 전체 ref·worktree를 갱신하지 않으며, Git 변경 뒤 receipt 저장 전 중단에서도 같은 증거를 읽기 전용으로 확인한다. 원본 scope와 재개 호출의 비교 시작값을 별도로 보존해 후속 Manager 전이가 실제 Agent 위반을 덮지 않게 하며, Agent 허용 변경·session·격리 증거를 유지한다

@@ -114,6 +114,8 @@ class ScopeReconciliationEffectsResumeProjectBlockIfSafeEffects:
     _reconciled_manager_scope_metadata: Callable[..., object]
     _requeue_blocked_execplan: Callable[..., object]
     _resume_owned_checkpoint_project_block: Callable[..., object]
+    _with_proven_legacy_ignore_config: Callable[..., object]
+    _normalize_legacy_ignored_snapshot: Callable[..., object]
     capture_git_snapshot: Callable[..., object]
     git: Callable[..., object]
     hydrate_execplan_project: Callable[..., object]
@@ -133,6 +135,8 @@ def _scope_reconciliation_effects_resume_project_block_if_safe(effects: ScopeRec
         _reconciled_manager_scope_metadata=effects._reconciled_manager_scope_metadata,
         _requeue_blocked_execplan=effects._requeue_blocked_execplan,
         _resume_owned_checkpoint_project_block=effects._resume_owned_checkpoint_project_block,
+        _with_proven_legacy_ignore_config=effects._with_proven_legacy_ignore_config,
+        _normalize_legacy_ignored_snapshot=effects._normalize_legacy_ignored_snapshot,
         capture_git_snapshot=effects.capture_git_snapshot,
         git=effects.git,
         hydrate_execplan_project=effects.hydrate_execplan_project,
@@ -468,6 +472,8 @@ def _scope_reconciliation_effects_resume_owned_checkpoint_project_block(effects:
 class ScopeReconciliationEffectsResumeLegacyReviewCountBlockEffects:
     """Named effects for _scope_reconciliation_effects_resume_legacy_review_count_block; no entry-point/module access."""
     _rebase_in_progress_for_branch: Callable[..., object]
+    _with_proven_legacy_ignore_config: Callable[..., object]
+    _normalize_legacy_ignored_snapshot: Callable[..., object]
     capture_git_snapshot: Callable[..., object]
     git: Callable[..., object]
     pr_for_branch: Callable[..., object]
@@ -480,6 +486,8 @@ class ScopeReconciliationEffectsResumeLegacyReviewCountBlockEffects:
 def _scope_reconciliation_effects_resume_legacy_review_count_block(effects: ScopeReconciliationEffectsResumeLegacyReviewCountBlockEffects, ) -> scope_reconciliation.ResumeLegacyReviewCountBlockEffects:
     return scope_reconciliation.ResumeLegacyReviewCountBlockEffects(
         _rebase_in_progress_for_branch=effects._rebase_in_progress_for_branch,
+        _with_proven_legacy_ignore_config=effects._with_proven_legacy_ignore_config,
+        _normalize_legacy_ignored_snapshot=effects._normalize_legacy_ignored_snapshot,
         capture_git_snapshot=effects.capture_git_snapshot,
         git=effects.git,
         pr_for_branch=effects.pr_for_branch,

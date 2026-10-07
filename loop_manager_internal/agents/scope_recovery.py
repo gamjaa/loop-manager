@@ -60,6 +60,17 @@ class ScopeRecoveryEffects:
     validate_runtime_worktree: Callable[..., None]
 
 
+def ignored_comparison_view(worktree, start, saved, current, *, effects):
+    """Normalize only paths proven ignored by the invocation's starting rules."""
+    if any(key.startswith('ignore-source:') for key in current.config):
+        saved = effects._with_proven_legacy_ignore_config(saved, current.config)
+    if not any(kinds == ("untracked",) and path not in current.dirty
+               for path, (kinds, _) in saved.dirty.items()):
+        return saved
+    return effects._normalize_legacy_ignored_snapshot(
+        worktree, saved, current, start=start)
+
+
 def _proven_recovered_worktree_baseline(
     before: GitSnapshot,
     current: GitSnapshot,
@@ -383,18 +394,18 @@ def _validate_persisted_agent_scope(
         ))
         recovered_manager_checkpoint = checkpoint
 
-    before = effects._normalize_legacy_ignored_snapshot(saved_worktree, before, current)
+    start = before
+    def comparison_view(value):
+        return ignored_comparison_view(saved_worktree, start, value, current, effects=effects)
+
+    before = comparison_view(before)
     if result is not None:
         result = effects._with_proven_legacy_ignore_config(result, current_config)
-        result = effects._normalize_legacy_ignored_snapshot(saved_worktree, result, current)
+        result = comparison_view(result)
     if checkpoint is not None:
         checkpoint = replace(
             checkpoint,
-            snapshot=effects._normalize_legacy_ignored_snapshot(
-                saved_worktree,
-                effects._with_proven_legacy_ignore_config(checkpoint.snapshot, current_config),
-                current,
-            ),
+            snapshot=comparison_view(checkpoint.snapshot),
         )
 
     def reconcile_metadata(value, observed=current):
@@ -416,8 +427,7 @@ def _validate_persisted_agent_scope(
         comparison = managed_rebase_adoption.agent_comparison_baseline(
             GitSnapshot.deserialize(str(project['agent_snapshot'])),
             rebase_checkpoint.snapshot or {}, role_name)
-        before = effects._normalize_legacy_ignored_snapshot(
-            saved_worktree, effects._with_proven_legacy_ignore_config(comparison, current_config), current)
+        before = comparison_view(comparison)
         before = reconcile_metadata(before)
     if role_name in {'worker', 'reviewer'} and remote_adoption_current:
         plan_id = effects._plan_id_from_path(selected_plan_path)
@@ -431,7 +441,7 @@ def _validate_persisted_agent_scope(
             result = None
             checkpoint = None
         else:
-            result = GitSnapshot.deserialize(str(adoption_project['agent_result_snapshot']))
+            result = comparison_view(GitSnapshot.deserialize(str(adoption_project['agent_result_snapshot'])))
             effects.validate_agent_scope(
                 role_name, saved_worktree, before, result,
                 selected_plan_path=selected_plan_path if role_name == 'worker' else None,
@@ -462,8 +472,8 @@ def _validate_persisted_agent_scope(
             agent_result = agent_scope_decision.manager_comparison_baseline(
                 GitSnapshot.deserialize(str(project['agent_snapshot'])), agent_result,
                 rebase_checkpoint.snapshot or {}, role_name)
-            comparison = effects._normalize_legacy_ignored_snapshot(
-                saved_worktree, effects._with_proven_legacy_ignore_config(comparison, current_config), current)
+            comparison = comparison_view(comparison)
+            agent_result = comparison_view(agent_result)
             effects.validate_agent_scope(
                 role_name, saved_worktree, comparison, agent_result,
                 selected_plan_path=selected_plan_path if role_name == 'worker' else None,
@@ -568,7 +578,8 @@ def _validate_persisted_agent_scope(
         original = GitSnapshot.deserialize(str(project['agent_snapshot']))
         comparison = agent_scope_decision.manager_comparison_baseline(
             original, original, rebase_checkpoint.snapshot or {}, role_name)
-        actual_result = GitSnapshot.deserialize(str(project['agent_result_snapshot']))
+        comparison = comparison_view(comparison)
+        actual_result = comparison_view(GitSnapshot.deserialize(str(project['agent_result_snapshot'])))
         if manager_runtime is not None:
             # The runtime identity and exact registration were checked above.
             # Carry only unchanged original keys; retain actual Agent mutations.
@@ -809,6 +820,10 @@ def validate_blocked_agent_scope(
             f"저장된 BLOCKED Agent Git snapshot이 유효하지 않습니다: {error}"
         ) from error
     current = effects.capture_git_snapshot(worktree)
+    start = before
+    def comparison_view(value):
+        return ignored_comparison_view(worktree, start, value, current, effects=effects)
+    before = comparison_view(before)
     plan_id = effects._plan_id_from_path(selected_plan_path)
     checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, plan_id)
     if blocked_plan_reconciliation.remote_adoption_is_current(checkpoint):
@@ -818,6 +833,8 @@ def validate_blocked_agent_scope(
         saved_plan=saved_plan, accepted_rebase=accepted_rebase, effects=effects)
     scope_result = (GitSnapshot.deserialize(str(project['agent_result_snapshot']))
                     if project['agent_result_snapshot'] else None)
+    if scope_result is not None:
+        scope_result = comparison_view(scope_result)
     scope_state_dir = effects._owned_rebase_state_dir(repo, plan_id, worktree) if plan_id else None
     def reconcile_metadata(value, observed=current):
         if scope_state_dir is None:
@@ -857,7 +874,7 @@ def validate_blocked_agent_scope(
         # Check actual Agent output before substituting the accepted selected
         # rebase state. Shared and external mutations are never normalized.
         if result is not None:
-            effects.validate_agent_scope(role_name, worktree, comparison, result,
+            effects.validate_agent_scope(role_name, worktree, comparison_view(comparison), comparison_view(result),
                                  **scope_options, connection=connection)
         comparison = reconcile_metadata(comparison)
         normalized = managed_rebase_adoption.selected_baseline(
@@ -929,7 +946,7 @@ def validate_blocked_agent_scope(
                 f"저장된 BLOCKED Agent 결과 snapshot이 유효하지 않습니다: {error}"
             ) from error
 
-        blocked_result = reconcile_metadata(blocked_result)
+        blocked_result = reconcile_metadata(comparison_view(blocked_result))
         # A finished, isolated invocation gives us a separate Agent result.
         # Validate that result first, then classify later selected-worktree
         # edits as user input. Legacy/in-flight scopes retain strict comparison.
@@ -985,7 +1002,7 @@ def validate_blocked_agent_scope(
             comparison = agent_scope_decision.manager_comparison_baseline(
                 original, original, checkpoint.snapshot or {}, role_name)
             effects.validate_agent_scope(
-                role_name, worktree, comparison, scope_result,
+                role_name, worktree, comparison_view(comparison), scope_result,
                 selected_plan_path=selected_plan_path if role_name == 'worker' else None,
                 allow_common_plans=effects._published_plan_allows_common_plans(repo_path, guidance_plan),
                 allowed_requirement_archives=archive_sources,

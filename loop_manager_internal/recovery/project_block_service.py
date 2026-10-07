@@ -1,5 +1,7 @@
 """recovery project block service boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.agents.scope_recovery import ignored_comparison_view
+from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -160,6 +162,8 @@ def _reconcile_rebase_evidence_block(
 class ReconcileScopeBaselinePlanBlockEffects:
     """Named effects for _reconcile_scope_baseline_plan_block; no entry-point/module access."""
     _owned_checkpoint_remote_oid: Callable[..., object]
+    _with_proven_legacy_ignore_config: Callable[..., object]
+    _normalize_legacy_ignored_snapshot: Callable[..., object]
     capture_git_snapshot: Callable[..., object]
     operation_log: Callable[..., object]
     unmet_execplan_dependencies: Callable[..., object]
@@ -209,6 +213,15 @@ def _reconcile_scope_baseline_plan_block(effects: ReconcileScopeBaselinePlanBloc
                 raise AgentScopeError('scope 차단 검사 중 Git 상태가 변경됐습니다.')
             return current
         observed = observe()
+        # Legacy ignored evidence must not invalidate already completed stages.
+        preserve_stage = False
+        if plan['agent_result_snapshot']:
+            start = GitSnapshot.deserialize(plan['agent_snapshot'])
+            result = GitSnapshot.deserialize(plan['agent_result_snapshot'])
+            before_view = ignored_comparison_view(worktree, start, start, observed, effects=effects)
+            result_view = ignored_comparison_view(worktree, start, result, observed, effects=effects)
+            preserve_stage = (result_view == observed and
+                              (before_view.dirty != start.dirty or result_view.dirty != result.dirty))
         with runtime_state._transaction(connection):
             if (dict(connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
                                          (repo, plan_id)).fetchone()) != dict(plan)
@@ -225,9 +238,17 @@ def _reconcile_scope_baseline_plan_block(effects: ReconcileScopeBaselinePlanBloc
                     {'block': dict(block), 'candidate': observed.serialize(),
                      'prior_artifacts': {key: plan[key] for key in (
                          'worker_result', 'verify_result', 'review_result', 'last_error')}}]})
-            values = managed_rebase_adoption.revalidation_values(plan['active_sha'])
-            values.pop('phase')
-            values.update(status='IMPLEMENTING', blocked_reason=None, blocked_fingerprint=None,
+            if preserve_stage:
+                resume_status = (checkpoint.snapshot or {}).get('scope_block_resume_status')
+                if resume_status not in runtime_state.ACTIVE_STATUSES:
+                    resume_status = ('REVIEWING' if plan['agent_role'] == 'reviewer'
+                                     else 'VERIFYING' if plan['worker_result'] else 'IMPLEMENTING')
+                values = {'last_error': None}
+            else:
+                resume_status = 'IMPLEMENTING'
+                values = managed_rebase_adoption.revalidation_values(plan['active_sha'])
+                values.pop('phase')
+            values.update(status=resume_status, blocked_reason=None, blocked_fingerprint=None,
                           blocked_worktree_fingerprint=None, blocked_review_fingerprint=None)
             updated = runtime.update_plan(repo, plan_id, plan_values=values, enqueue=False)
             runtime.hydrate_snapshot(repo, updated)

@@ -6,6 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from dataclasses import replace
 from pathlib import Path
 import loop_manager
@@ -15,11 +16,10 @@ from tests.support.git import git_command, commit_and_push
 
 class ScopeIgnoredArtifactsTest(AgentScopeFixture, unittest.TestCase):
     def test_ignored_untracked_creation_change_and_deletion_are_allowed(self):
-        scenarios = (
-            ("planner", None, "created by planner\n"),
-            ("worker", "before work\n", "changed by worker\n"),
-            ("reviewer", "before review\n", "changed by reviewer\n"),
-            ("reviewer", "before review\n", None),
+        scenarios = tuple(
+            (role, before, after)
+            for role in ('planner', 'worker', 'reviewer')
+            for before, after in ((None, 'created\n'), ('old\n', 'changed\n'), ('old\n', None))
         )
         for role_name, before_contents, after_contents in scenarios:
             with self.subTest(role=role_name), tempfile.TemporaryDirectory() as directory:
@@ -103,6 +103,111 @@ class ScopeIgnoredArtifactsTest(AgentScopeFixture, unittest.TestCase):
                 )
             finally:
                 connection.close()
+
+    def test_historical_and_blocked_ignored_results_preserve_original_evidence(self):
+        for role in ('planner', 'worker', 'reviewer'):
+            for action in ('create', 'modify', 'delete'):
+                with self.subTest(role=role, action=action), tempfile.TemporaryDirectory() as directory:
+                    repo, plan_path = self._repository_with_plan(directory)
+                    (repo / '.gitignore').write_text('cache.bin\n', encoding='utf-8')
+                    commit_and_push(repo, 'Ignore cache')
+                    git_command(repo, 'switch', '-c', 'loop-manager/G-001')
+                    cache = repo / 'cache.bin'
+                    if action != 'create':
+                        cache.write_bytes(b'old')
+                    current = loop_manager.capture_git_snapshot(repo)
+                    start = replace(current, dirty=({'cache.bin': (('untracked',), 'old')}
+                                                    if action != 'create' else {}))
+                    result = replace(current, dirty=({'cache.bin': (('untracked',), 'result')}
+                                                     if action != 'delete' else {}))
+                    legacy_config = {key: value for key, value in current.config.items()
+                                     if not key.startswith('ignore-source:')}
+                    start = replace(start, config=legacy_config)
+                    result = replace(result, config=legacy_config)
+                    if action == 'delete':
+                        cache.unlink()
+                    else:
+                        cache.write_bytes(b'changed')
+                    state = Path(directory) / 'state'
+                    self._persist_interrupted_worker(state, repo, plan_path, start)
+                    connection = sqlite3.connect(state / 'loop-manager.db')
+                    connection.row_factory = sqlite3.Row
+                    try:
+                        loop_manager._ensure_execplans_schema(connection)
+                        with connection:
+                            connection.execute("UPDATE projects SET agent_role = ?, agent_result_snapshot = ?",
+                                               (role, result.serialize()))
+                            connection.execute("UPDATE exec_plans SET agent_role = ?, agent_snapshot = ?, "
+                                               "agent_result_snapshot = ?, worker_session_id = 'saved', retry_count = 3",
+                                               (role, start.serialize(), result.serialize()))
+                        loop_manager.validate_persisted_agent_scope(connection, repo, state, str(repo))
+                        with connection:
+                            connection.execute("UPDATE projects SET phase = 'PLAN_BLOCKED'")
+                            connection.execute("UPDATE exec_plans SET status = 'PLAN_BLOCKED'")
+                        plan = connection.execute('SELECT * FROM exec_plans').fetchone()
+                        loop_manager.validate_blocked_agent_scope(connection, repo, str(repo), 'main',
+                            repo, plan_path, saved_plan=plan, require_safe_result=True)
+                        saved = connection.execute('SELECT * FROM exec_plans').fetchone()
+                        self.assertEqual(saved['agent_snapshot'], start.serialize())
+                        self.assertEqual(saved['agent_result_snapshot'], result.serialize())
+                        self.assertEqual((saved['worker_session_id'], saved['retry_count']), ('saved', 3))
+                        if role == 'reviewer':
+                            with connection:
+                                connection.execute("UPDATE exec_plans SET status = 'REVIEWING', "
+                                    "worker_result = 'saved worker', verify_result = 'saved verify', "
+                                    "worker_input_token = 'worker-token', verify_token = 'verify-token'")
+                                loop_manager._clear_active_in_current_transaction(connection, str(repo))
+                            runtime = loop_manager.runtime_state.RuntimeStateRepository(connection)
+                            runtime.block_plan(str(repo), 'G-001',
+                                reason_code='managed_worktree_scope_violation', evidence='legacy cache',
+                                release_fingerprint='same')
+                            from loop_manager_internal.recovery import scoped_blocking
+                            block = scoped_blocking.plan_block(connection, str(repo), 'G-001')
+                            with mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'):
+                                self.assertTrue(loop_manager._reconcile_scope_baseline_plan_block(
+                                    connection, repo, state, str(repo), block))
+                                self.assertFalse(loop_manager._reconcile_scope_baseline_plan_block(
+                                    connection, repo, state, str(repo), block))
+                            resumed = connection.execute('SELECT * FROM exec_plans').fetchone()
+                            self.assertEqual(resumed['status'], 'REVIEWING')
+                            self.assertEqual((resumed['worker_result'], resumed['verify_result'],
+                                              resumed['worker_input_token'], resumed['verify_token']),
+                                             ('saved worker', 'saved verify', 'worker-token', 'verify-token'))
+                        if action != 'delete':
+                            self.assertEqual(cache.read_bytes(), b'changed')
+                    finally:
+                        connection.close()
+
+    def test_external_ignore_rule_requires_recorded_unchanged_start_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _ = self._repository_with_plan(directory)
+            exclude = repo / '.git/info/exclude'
+            exclude.write_text(exclude.read_text() + '\ncache.bin\n')
+            current = loop_manager.capture_git_snapshot(repo)
+            legacy = replace(current, dirty={'cache.bin': (('untracked',), 'old')})
+            self.assertEqual(loop_manager._normalize_legacy_ignored_snapshot(
+                repo, legacy, current, start=legacy).dirty, {})
+            unproven = replace(legacy, config={key: value for key, value in legacy.config.items()
+                                              if not key.startswith('ignore-source:')})
+            self.assertEqual(loop_manager._normalize_legacy_ignored_snapshot(
+                repo, legacy, current, start=unproven), legacy)
+            exclude.write_text(exclude.read_text() + 'new.bin\n')
+            changed = loop_manager.capture_git_snapshot(repo)
+            self.assertEqual(loop_manager._normalize_legacy_ignored_snapshot(
+                repo, legacy, changed, start=legacy), legacy)
+
+    def test_result_ignore_rule_must_be_proven_at_invocation_start(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, _ = self._repository_with_plan(directory)
+            (repo / '.gitignore').write_text('old.bin\n', encoding='utf-8')
+            commit_and_push(repo, 'Starting ignore rule')
+            start = loop_manager.capture_git_snapshot(repo)
+            (repo / '.gitignore').write_text('old.bin\nnew.bin\n', encoding='utf-8')
+            commit_and_push(repo, 'Agent hides a new path')
+            current = loop_manager.capture_git_snapshot(repo)
+            result = replace(current, dirty={'new.bin': (('untracked',), 'hidden')})
+            self.assertEqual(loop_manager._normalize_legacy_ignored_snapshot(
+                repo, result, current, start=start), result)
 
     def test_legacy_snapshot_does_not_trust_unrecorded_exclude_rules(self):
         with tempfile.TemporaryDirectory() as directory:

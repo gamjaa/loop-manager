@@ -39,8 +39,9 @@ priority: high
 ## Progress
 
 - [x] 2026-10-06 기준 de2c655609c667f6032eb3608116a801a806766f의 활성 명세·코드·테스트와 비종료 catalog를 대조함. 일반 persisted 정규화는 있으나 BLOCKED/raw 결과 비교와 동일 입력 planning_error gate의 누락을 확인함. 구현·테스트 실행은 하지 않음.
-- [ ] 구현 및 관련 targeted unit 검증
-- [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
+- [x] 2026-10-07 구현 및 관련 targeted unit 검증: 저장 시작·역사 결과·BLOCKED 비교 view, 동일 입력 planning_error 재개와 단계·결과 보존을 구현함. 관련 회귀 109개 통과.
+- [x] 2026-10-07 Manager 전체 verify: 201개 모듈, 3,086개 성공·2개 skip, 종료 코드 0.
+- [ ] 읽기 전용 Review·사용자 Merge
 
 ## Decision Log
 

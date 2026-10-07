@@ -7,6 +7,9 @@ from loop_manager_internal.agents.agent_invocation import AttemptSequence
 from loop_manager_internal.agents.agent_invocation import TrackedAgentCall
 from loop_manager_internal.agents.scope_contracts import AgentScopeError
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
+from loop_manager_internal.agents.scope_recovery import ignored_comparison_view
+from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.application.contracts import TRANSIENT_AGENT_ERROR_PREFIX
 from loop_manager_internal.application.contracts import USAGE_LIMIT_ERROR_PREFIX
 from loop_manager_internal.notifications import notifications
@@ -78,6 +81,8 @@ class PlanningAgentPortsEffects:
     _agent_profile: Callable[..., object]
     _reconciled_manager_scope_metadata: Callable[..., object]
     begin_agent_scope: Callable[..., object]
+    _with_proven_legacy_ignore_config: Callable[..., object]
+    _normalize_legacy_ignored_snapshot: Callable[..., object]
     capture_git_snapshot: Callable[..., object]
     clear_agent_scope: Callable[..., object]
     operation_log: Callable[..., object]
@@ -221,6 +226,7 @@ class _PlanningAgentPorts:
         try:
             before = GitSnapshot.deserialize(snapshot)
             after = self._effects.capture_git_snapshot(worktree)
+            before = ignored_comparison_view(worktree, before, before, after, effects=self._effects)
             before = self._effects._reconciled_manager_scope_metadata(
                 self._connection, self._context.repo_path, self._context.state_dir,
                 self._context.repo, None, before, after,
@@ -243,6 +249,73 @@ class _PlanningAgentPorts:
                 str(error), after.serialize() if after is not None else None
             )
         return PlanningScopeResult()
+
+    def recover_ignored_scope_error(self, expected: runtime_state.PlanningSnapshot) -> bool:
+        """Release only a proven legacy ignored false positive, atomically."""
+        context = self._context
+        repository = runtime_state.RuntimeStateRepository(self._connection)
+        row = self._connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (context.repo,),
+        ).fetchone()
+        if repository.planning(context.repo) != expected:
+            return False
+        values = dict(row)
+        if expected.planning_preserved_state:
+            values.update(runtime_state._preserved_planning_values(expected.planning_preserved_state))
+        if (values['phase'] != 'PLANNING' or values['planning_workspace_owned'] != 1
+                or values['agent_role'] not in {'planner', 'maintenance_planner'}
+                or values['agent_recovery'] or not values['agent_snapshot']
+                or not values['agent_result_snapshot']
+                or values['planning_error'] != values['planning_validation_error']
+                or not values['planner_session_id']
+                or values['planning_result'] is None):
+            return False
+        worktree = Path(str(values['worktree'] or ''))
+        try:
+            start = GitSnapshot.deserialize(values['agent_snapshot'])
+            result = GitSnapshot.deserialize(values['agent_result_snapshot'])
+            current = self._effects.capture_git_snapshot(worktree)
+            before = ignored_comparison_view(worktree, start, start, current, effects=self._effects)
+            after = ignored_comparison_view(worktree, start, result, current, effects=self._effects)
+            if before.dirty == start.dirty and after.dirty == result.dirty:
+                return False
+            resources = self._effects._agent_git_resources(
+                self._connection, context.repo_path, worktree, start, values['agent_role'])
+            def validate(older, newer, role=None):
+                older = self._effects._reconciled_manager_scope_metadata(
+                    self._connection, context.repo_path, context.state_dir,
+                    context.repo, None, older, current, resources)
+                self._effects.validate_agent_scope(role or values['agent_role'], worktree, older, newer,
+                    external_worktree=context.repo_path, base_branch=context.base_branch,
+                    connection=self._connection, resources=resources)
+            # The same validator must reject the original evidence for exactly
+            # the stored cause. A coincidental ignored delta cannot free an error.
+            try:
+                validate(start, result)
+            except AgentScopeError as error:
+                if str(error) != values['planning_error']:
+                    return False
+            else:
+                return False
+            validate(before, after)
+            validate(after, current, role='reviewer')
+            self._effects.validate_managed_worktree(context.repo_path, worktree, None)
+        except (RuntimeError, ValueError, OSError):
+            return False
+        with runtime_state._transaction(self._connection):
+            if (repository.planning(context.repo) != expected
+                    or scoped_blocking.project_block(self._connection, context.repo) is not None
+                    or self._effects.capture_git_snapshot(worktree) != current):
+                return False
+            if expected.planning_preserved_state:
+                repository.resume_planning(expected)
+            repository._update_project_row(context.repo, {
+                'planning_error': None, 'planning_error_fingerprint': None,
+                'planning_error_origin': None, 'planning_validation_error': None,
+                'planning_result_completed': 1, 'planning_result_pending_validation': 0,
+                'last_error': None,
+            })
+        return True
 
     def clear_scope(self, repo: str) -> None:
         self._effects.clear_agent_scope(self._connection, repo)

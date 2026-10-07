@@ -1479,6 +1479,7 @@ class RuntimeStateRepository:
             last_error=evidence,
         )
         with _transaction(self.connection):
+            prior_status = str(self._plan_row(repo, plan_id)['status'])
             self._update_plan_row(
                 repo, plan_id, values, expected_status=expected_status
             )
@@ -1521,6 +1522,15 @@ class RuntimeStateRepository:
                 self.connection
             )
             current = execution_checkpoint.get(repo, plan_id)
+            from loop_manager_internal.recovery.scoped_blocking import SCOPE_BASELINE_REASONS
+            if reason_code in SCOPE_BASELINE_REASONS and prior_status in ACTIVE_STATUSES:
+                current = execution_checkpoint.record(
+                    repo, plan_id, expected_generation=current.generation,
+                    operation=current.operation, expected_head=current.expected_head,
+                    target_base_oid=current.target_base_oid,
+                    observed_remote_oid=current.observed_remote_oid,
+                    snapshot={**(current.snapshot or {}), 'scope_block_resume_status': prior_status},
+                )
             if current.snapshot and 'blocked_resume' in current.snapshot:
                 snapshot = dict(current.snapshot)
                 del snapshot['blocked_resume']

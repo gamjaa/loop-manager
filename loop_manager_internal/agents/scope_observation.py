@@ -484,25 +484,42 @@ def _normalize_legacy_ignored_snapshot(
     current: GitSnapshot,
     *,
     effects: ObservationEffects,
+    start: GitSnapshot | None = None,
 ) -> GitSnapshot:
-    """Discard old untracked entries only when their starting ignore rule is proven."""
+    """Build a comparison view, retaining the original invocation evidence."""
+
+    start = start or saved
 
     dirty = dict(saved.dirty)
     for path, (kinds, _signature) in saved.dirty.items():
         if kinds != ("untracked",) or path in current.dirty:
             continue
-        if path in saved.index or path in current.index:
+        if path in start.index or path in saved.index or path in current.index:
             continue
         source = _ignore_rule_source(worktree, path, effects=effects)
         if source is None:
             continue
-        if not (source == ".gitignore" or source.endswith("/.gitignore")):
+        if not (source in start.index
+                and (source == ".gitignore" or source.endswith("/.gitignore"))):
+            source_path = Path(source)
+            if not source_path.is_absolute():
+                source_path = worktree / source_path
+            source_key = str(_canonical_path(source_path))
+            proven = any(
+                key.startswith('ignore-source:') and len(value) == 2
+                and value[0] == source_key and value[1] not in {'missing', 'disabled'}
+                and start.config.get(key) == saved.config.get(key) == value
+                for key, value in current.config.items()
+            )
+            if proven:
+                dirty.pop(path)
             continue
-        if source not in saved.index or saved.index.get(source) != current.index.get(source):
+        if (source not in start.index or start.index.get(source) != saved.index.get(source)
+                or saved.index.get(source) != current.index.get(source)):
             continue
-        if source in saved.dirty or source in current.dirty:
+        if source in start.dirty or source in saved.dirty or source in current.dirty:
             continue
-        old_rule = effects.git(worktree, "rev-parse", f"{saved.head}:{source}", check=False)
+        old_rule = effects.git(worktree, "rev-parse", f"{start.head}:{source}", check=False)
         new_rule = effects.git(worktree, "rev-parse", f"{current.head}:{source}", check=False)
         if old_rule.returncode or new_rule.returncode or old_rule.stdout != new_rule.stdout:
             continue

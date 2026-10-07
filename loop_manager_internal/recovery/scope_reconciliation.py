@@ -6,6 +6,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.agents.scope_contracts import AgentScopeError
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
+from loop_manager_internal.agents.scope_recovery import ignored_comparison_view
 from loop_manager_internal.git import rebase_block_reconciliation
 from loop_manager_internal.recovery import blocked_plan_reconciliation
 from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
@@ -36,6 +37,8 @@ class ResumeProjectBlockIfSafeEffects:
     _reconciled_manager_scope_metadata: Callable[..., object]
     _requeue_blocked_execplan: Callable[..., object]
     _resume_owned_checkpoint_project_block: Callable[..., object]
+    _with_proven_legacy_ignore_config: Callable[..., object]
+    _normalize_legacy_ignored_snapshot: Callable[..., object]
     capture_git_snapshot: Callable[..., object]
     git: Callable[..., object]
     hydrate_execplan_project: Callable[..., object]
@@ -124,10 +127,13 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
             elif project["agent_snapshot"]:
                 before = GitSnapshot.deserialize(str(project["agent_snapshot"]))
                 after = checked = effects.capture_git_snapshot(worktree)
+                start = before
+                before = ignored_comparison_view(worktree, start, before, after, effects=effects)
                 resources = effects._agent_git_resources(connection, repo_path, worktree, before,
                                                 str(project['agent_role'] or 'planner'))
                 if scoped_blocking.is_scope_baseline_block(block) and project['agent_result_snapshot']:
-                    result = GitSnapshot.deserialize(str(project['agent_result_snapshot']))
+                    result = ignored_comparison_view(worktree, start,
+                        GitSnapshot.deserialize(str(project['agent_result_snapshot'])), after, effects=effects)
                     comparison = effects._reconciled_manager_scope_metadata(
                         connection, repo_path, state_dir, repo, None, before, after, resources)
                     result = effects._reconciled_manager_scope_metadata(
@@ -527,6 +533,8 @@ class ResumeOwnedCheckpointProjectBlockEffects:
 class ResumeLegacyReviewCountBlockEffects:
     """Effects for resume legacy review count block; preserve existing safety gates."""
     _rebase_in_progress_for_branch: Callable[..., object]
+    _with_proven_legacy_ignore_config: Callable[..., object]
+    _normalize_legacy_ignored_snapshot: Callable[..., object]
     capture_git_snapshot: Callable[..., object]
     git: Callable[..., object]
     pr_for_branch: Callable[..., object]
@@ -817,6 +825,10 @@ def _resume_legacy_review_count_block(effects: ResumeLegacyReviewCountBlockEffec
         if snapshot.branch != branch or snapshot.operations or not snapshot.head:
             return False
         blocked_snapshot = GitSnapshot.deserialize(str(plan["agent_result_snapshot"]))
+        if plan['agent_snapshot']:
+            start = GitSnapshot.deserialize(str(plan['agent_snapshot']))
+            blocked_snapshot = ignored_comparison_view(
+                worktree, start, blocked_snapshot, snapshot, effects=effects)
         if (not snapshot.shared_metadata_complete
                 or not blocked_snapshot.shared_metadata_complete):
             return False
