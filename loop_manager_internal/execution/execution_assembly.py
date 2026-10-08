@@ -392,6 +392,7 @@ def review(effects: ExecutionEffects, identity: ExecutionIdentity,
         _recover=callbacks["_recover"],
         _retry=callbacks["_retry"],
         _row=callbacks["_row"],
+        observe_verify_inputs=effects.validation.observe_verify_inputs,
     ))
 
 

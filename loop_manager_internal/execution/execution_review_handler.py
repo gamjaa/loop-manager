@@ -5,7 +5,7 @@ from typing import Callable, Any, Mapping
 from loop_manager_internal.documents import document_drafts
 from loop_manager_internal.documents import document_publication
 import sys
-from loop_manager_internal.storage import review_correction_state, runtime_state
+from loop_manager_internal.storage import review_correction_state, runtime_state, verify_receipts
 from loop_manager_internal.notifications import notifications
 import json
 from loop_manager_internal.agents.agent_invocation import AttemptSequence, TrackedAgentCall
@@ -56,6 +56,7 @@ class ReviewHandlerPorts:
     _recover: Callable[..., ExecutionOutcome]
     _retry: Callable[..., ExecutionOutcome]
     _row: Callable[[], Mapping[str, object]]
+    observe_verify_inputs: Callable[..., Any] | None = None
 
 
 class ReviewHandler:
@@ -129,7 +130,59 @@ class ReviewHandler:
             )
             self.ports.operation_print(detail, file=sys.stderr)
             return self.ports._retry(detail)
-        return worker_publication
+        observation = None
+        if self.ports.observe_verify_inputs is not None:
+            try:
+                observation = self.ports.observe_verify_inputs(context.worktree)
+            except (OSError, RuntimeError, TypeError, ValueError):
+                pass
+        verify_evidence = verify_receipts.candidate_evidence(
+            self.ports.state.connection,
+            self.ports.identity.repo,
+            context.plan.plan_id,
+            candidate_head,
+            str(row['verify_result']),
+            observation,
+        )
+        from loop_manager_internal.execution.manual_candidate import get_manual
+        manual = get_manual(self.ports.state)
+        if verify_evidence and verify_evidence['kind'] == 'waiver':
+            waiver = manual.waive(context, 'verify', record=False) if manual else None
+            if waiver != row['verify_result']:
+                verify_evidence = None
+        elif (verify_evidence and manual and manual.user_submission(row)
+              and not manual.valid_evidence(context, 'verify', str(row['verify_result']))):
+            verify_evidence = None
+        if verify_evidence is None:
+            detail = 'Reviewer 시작 전 현재 후보에 연결된 Manager verify receipt가 없습니다. 다시 검증합니다.'
+            self.ports.state.update_project(
+                self.ports.identity.repo, phase='VERIFYING', validated_base_sha=None,
+                verify_result=None, review_result=None, verify_token=None,
+                review_token=None, publication_token=None, last_error=detail,
+            )
+            self.ports.operation_print(detail, file=sys.stderr)
+            return self.ports._retry(detail)
+
+        return worker_publication, self._format_verify_evidence(
+            verify_evidence, candidate_head, latest_sha,
+        )
+
+    @staticmethod
+    def _format_verify_evidence(evidence, candidate_head, base_sha):
+        receipt = evidence['receipt']
+        output = '기록된 출력 없음' if not receipt['result'] else '비공개로 저장된 출력 있음'
+        if evidence['kind'] == 'run':
+            return (f"Manager 확인: 전체 verify PASS (실제 실행 receipt={receipt['id']}); "
+                    f"candidate HEAD={candidate_head}; base={base_sha}; {output}.")
+        if evidence['kind'] == 'reuse':
+            origin = evidence['origin']
+            return (f"Manager 확인: 전체 verify PASS (같은 작업 주기의 증명된 입력 재사용; "
+                    f"현재 후보 receipt={receipt['id']}; 원래 실제 실행 receipt={origin['id']}; "
+                    f"입력 fingerprint={receipt['fingerprint']}); candidate HEAD={candidate_head}; "
+                    f"base={base_sha}; 새 verify 실행은 하지 않았고 {output}.")
+        return (f"Manager 확인: 유효한 사용자 verify 생략 (SKIPPED_BY_USER; receipt={receipt['id']}); "
+                f"candidate HEAD={candidate_head}; base={base_sha}; 전체 verify PASS가 아닙니다. "
+                f"{redact_secrets(str(receipt['result']))}.")
 
     def review(self, context: ExecutionContext) -> ExecutionOutcome:
         self.ports.state.check_context(context)
@@ -145,6 +198,7 @@ class ReviewHandler:
         entry_evidence = self._review_entry_evidence(context)
         if isinstance(entry_evidence, ExecutionOutcome):
             return entry_evidence
+        worker_publication, verify_evidence = entry_evidence
         candidate_head = self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
         correction = review_correction_state.load(
             self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id,
@@ -171,8 +225,11 @@ class ReviewHandler:
         notice = manual.invalid_waiver_notice(context,'review') if manual else None
         if notice:
             self.ports.operation_print(notice)
-        targeted_test_reason = self.ports.contract.reviewer_targeted_test_reason(
-            entry_evidence.test_evidence,
+        from loop_manager_internal.execution.result_validation import reviewer_targeted_test_evidence
+        targeted_test_evidence = (
+            '수동 제출 후보: Worker targeted unit test는 실행되지 않았고 외부 targeted test 결과도 Manager가 확인하지 않았습니다.'
+            if manual and manual.user_submission(row)
+            else 'Worker 보고:\n' + reviewer_targeted_test_evidence(worker_publication.test_evidence)
         )
         protocol_error: str | None = None
         verdict: str | None = None
@@ -204,8 +261,9 @@ class ReviewHandler:
                     self.ports._document_review_prompt(
                         self.ports.reviewer_prompt(
                             self.ports.identity.base,
-                            targeted_test_reason,
+                            targeted_test_evidence,
                             row['review_result'],
+                            verify_evidence=verify_evidence,
                             session_recovery=session_recovery,
                             protocol_error=protocol_error,
                         ),

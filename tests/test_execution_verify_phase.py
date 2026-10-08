@@ -10,7 +10,9 @@ from loop_manager_internal.execution import execution_handlers as handlers
 import loop_manager as lm
 from loop_manager_internal.storage.validation_feedback_state import ValidationFeedbackRepository
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+from loop_manager_internal.storage import verify_receipts
 from loop_manager_internal.execution.execution_runtime import ExecutionPhase, ExecutionOutcome, ExecutionOutcomeKind
+from loop_manager_internal.verification.inputs import InputObservation
 from tests.support.worker import decision as worker_decision
 from tests.support.execution import READY_WORKER_RESULT, VALID_WORKER_RESULT
 
@@ -71,6 +73,10 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
 
     def test_failed_verify_scope_block_cannot_reuse_prior_success_token(self):
         self.review_context()
+        # The seeded successful receipt is reusable only while its observed inputs match.
+        self.effects.validation.observe_verify_inputs.return_value = InputObservation(
+            'changed verify inputs',
+        )
         definition = self.handler._snapshot()._definition_snapshot
         self.state.update_project(
             'repo', phase='VERIFYING', validated_base_sha='base',
@@ -353,6 +359,7 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
         reviewed = self.handler.review(verified.context)
 
         self.assertEqual(reviewed.context.phase, ExecutionPhase.PUBLISHING)
+        self.effects.validation.verify.assert_called_once()
         calls = self.effects.agent.run_agent.call_args_list
         self.assertEqual([call.args[4] for call in calls], ['worker', 'reviewer'])
         for call in calls:
@@ -490,18 +497,66 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
 
 
     def test_review_entry_accepts_empty_successful_verify_output(self):
-        self.review_context()
-        definition = self.handler._snapshot()._definition_snapshot
-        self.state.update_project(
-            'repo', verify_result='',
-            verify_token=definition.verify_token('base', 'base', ''),
-        )
-        context = self.handler._context()
+        self.effects.agent.reviewer_prompt.side_effect = lm.reviewer_prompt
+        context = self.review_context(verify_output='')
 
         outcome = self.handler.review(context)
 
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
         self.effects.agent.run_agent.assert_called_once()
+        prompt = self.effects.agent.run_agent.call_args.args[5]
+        self.assertIn('Manager 확인: 전체 verify PASS', prompt)
+        self.assertIn('기록된 출력 없음', prompt)
+        self.assertIn('candidate HEAD=base', prompt)
+
+    def test_review_entry_rejects_run_when_known_inputs_become_unobservable(self):
+        context = self.review_context()
+        self.effects.validation.observe_verify_inputs.return_value = InputObservation(
+            None, reason='unconfirmed native loader inputs',
+        )
+
+        outcome = self.handler.review(context)
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        self.effects.agent.run_agent.assert_not_called()
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
+
+    def test_review_entry_accepts_direct_run_with_unchanged_unobservable_inputs(self):
+        self.effects.agent.reviewer_prompt.side_effect = lm.reviewer_prompt
+        context = self.review_context()
+        observation = InputObservation(None, reason='verify input fingerprint unavailable')
+        selection = verify_receipts.selected(self.connection, 'repo', 'G-047')
+        identifier, selection = verify_receipts.record(
+            self.connection, selection, head='base', observation=observation,
+            kind='run', reason='inputs unavailable',
+        )
+        verify_receipts.complete(
+            self.connection, selection, identifier, passed=True,
+            output=self.state.row()['verify_result'],
+        )
+        self.effects.validation.observe_verify_inputs.return_value = observation
+
+        outcome = self.handler.review(context)
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.effects.agent.run_agent.assert_called_once()
+        self.assertIn('Manager 확인: 전체 verify PASS',
+                      self.effects.agent.run_agent.call_args.args[5])
+
+    def test_review_entry_rejects_missing_current_candidate_receipt(self):
+        self.review_context()
+        selection = verify_receipts.selected(self.connection, 'repo', 'G-047')
+        self.connection.execute(
+            "UPDATE verify_receipts SET status='failure' WHERE id=?",
+            (selection['receipt_id'],),
+        )
+
+        outcome = self.handler.review(self.handler._context())
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
+        self.assertIsNone(self.state.row()['verify_token'])
+        self.effects.agent.run_agent.assert_not_called()
 
 
     def test_head_change_during_verify_does_not_save_success(self):

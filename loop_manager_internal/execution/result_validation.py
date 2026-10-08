@@ -28,6 +28,7 @@ from loop_manager_internal.application.contracts import _TEMP_DIRECTORY_CONTEXT
 from loop_manager_internal.application.contracts import _TEMP_PATH_NOISE
 from loop_manager_internal.application.contracts import _TIMESTAMP_NOISE
 from loop_manager_internal.documents import reviewer_specification
+from loop_manager_internal.execution.validation_feedback import redact_secrets
 from loop_manager_internal.git import github_observation
 from loop_manager_internal.runtime.handoff_gate import _runtime_handoff_signal
 from loop_manager_internal.storage import review_correction_state
@@ -39,6 +40,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 
@@ -790,6 +792,63 @@ def reviewer_targeted_test_reason(test_evidence: str) -> str | None:
             ):
                 return reason[:600]
     return None
+
+
+def _looks_like_reported_test_command(line: str) -> bool:
+    """Recognize executable paths and generic commands with test arguments."""
+    try:
+        words = shlex.split(line.strip())
+    except ValueError:
+        return False
+    if not words:
+        return False
+    executable = words[0]
+    if "/" in executable or "\\" in executable:
+        return True
+    if not re.fullmatch(r"[A-Za-z0-9_.+-]+", executable):
+        return False
+    if (executable[0].isupper() and "/" not in executable
+            and "\\" not in executable
+            and not executable.lower().endswith((".exe", ".cmd", ".bat"))):
+        return False
+    return any(
+        argument.startswith(("-", "./", "../", "/", ".\\", "..\\", "\\"))
+        or "/" in argument
+        or "\\" in argument
+        or re.search(r"\.[A-Za-z0-9]{1,10}$", argument)
+        for argument in words[1:]
+    )
+
+
+def reviewer_targeted_test_evidence(test_evidence: str) -> str:
+    """Keep Worker-reported commands and outcomes without forwarding raw logs."""
+    reason = reviewer_targeted_test_reason(test_evidence)
+    if reason:
+        return redact_secrets(reason)
+
+    relevant = []
+    lines = test_evidence.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index].strip()
+        while line.endswith(("\\", "`")) and index + 1 < len(lines):
+            line = line[:-1].rstrip() + " " + lines[index + 1].strip()
+            index += 1
+        if (re.match(r"(?i)^COMMAND:\s*\S", line)
+                or _TARGETED_TEST_COMMAND.search(line)
+                or _INLINE_TEST_COMMAND.search(line)
+                or _looks_like_reported_test_command(line)):
+            relevant.append(line)
+            index += 1
+            continue
+        for clause in re.split(r"[;|]", line):
+            if (_TARGETED_TEST_SUCCESS.search(clause)
+                    or _TARGETED_TEST_FAILURE.search(clause)
+                    or _TARGETED_TEST_EXCEPTION_FAILURE.search(clause)):
+                relevant.append(clause.strip())
+        index += 1
+    return redact_secrets("\n".join(relevant) if relevant else
+                          'Worker targeted test 결과를 요약할 수 없습니다.')
 
 
 @dataclass(frozen=True)

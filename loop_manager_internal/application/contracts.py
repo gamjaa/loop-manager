@@ -305,5 +305,11 @@ _TARGETED_TEST_METADATA = re.compile(
 
 
 _INLINE_TEST_COMMAND = re.compile(
-    r"(?i)(?<![\w])(?:python\d*(?:\.\d+)?\s+-m\s+unittest|pytest|npm\s+test)\b"
+    r"(?i)(?<![\w])(?:"
+    r"python\d*(?:\.\d+)?\s+-m\s+unittest|pytest|"
+    r"(?:npm|npx|yarn|pnpm|bun)\s+(?:(?:run\s+)?(?:test|jest|vitest|mocha))|"
+    r"go\s+test|cargo\s+test|dotnet\s+test|"
+    r"(?:mvnw?|gradlew?|gradle)\s+(?:[^\n]*\s+)?test|"
+    r"swift\s+test|(?:dart|flutter|deno|mix)\s+test|rake(?:\s+test)?"
+    r")\b"
 )

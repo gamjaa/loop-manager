@@ -1,5 +1,6 @@
 import unittest
 import loop_manager
+from loop_manager_internal.execution.result_validation import reviewer_targeted_test_evidence
 from loop_manager_internal.execution.worker_outcome import parse_worker_outcome
 from tests.support.worker import worker_result
 
@@ -157,6 +158,132 @@ class WorkerResultContractTest(unittest.TestCase):
                 self.assertNotIn("python3 -m unittest tests.test_api", prompt)
                 self.assertNotIn("npm test: 3 tests passed", prompt)
 
+    def test_reviewer_targeted_evidence_keeps_reported_commands_and_results_only(self):
+        secret = 'sk-' + 'A' * 24
+        evidence = (
+            f"FAILED_COMMAND: python3 -m unittest tests.test_case --token {secret}\n"
+            "Initial run: FAIL (1 failure)\n"
+            f"RERUN: python3 -m unittest tests.test_case --token {secret}\n"
+            "Final run: PASS; API_KEY=hidden-value\n"
+            "unrelated raw log: do not forward this line"
+        )
+
+        compact = reviewer_targeted_test_evidence(evidence)
+
+        self.assertIn('FAILED_COMMAND: python3 -m unittest tests.test_case', compact)
+        self.assertIn('RERUN: python3 -m unittest tests.test_case', compact)
+        self.assertIn('Initial run: FAIL', compact)
+        self.assertIn('Final run: PASS', compact)
+        self.assertIn('<REDACTED>', compact)
+        self.assertNotIn(secret, compact)
+        self.assertNotIn('hidden-value', compact)
+        self.assertNotIn('unrelated raw log', compact)
+        self.assertEqual(
+            reviewer_targeted_test_evidence('unrecognized private output'),
+            'Worker targeted test 결과를 요약할 수 없습니다.',
+        )
+
+    def test_reviewer_targeted_evidence_keeps_other_language_and_continued_commands(self):
+        evidence = (
+            "go test ./internal/foo \\\n"
+            "  -run TestFoo\n"
+            "Result: PASS\n"
+            "cargo test --package api\n"
+            "test result: ok, 3 passed, 0 failed\n"
+            "python3 tests/test_api.py\n"
+            "Result: PASS\n"
+            "unrelated raw log: omit this"
+        )
+
+        compact = reviewer_targeted_test_evidence(evidence)
+
+        self.assertIn("go test ./internal/foo -run TestFoo", compact)
+        self.assertIn("Result: PASS", compact)
+        self.assertIn("cargo test --package api", compact)
+        self.assertIn("test result: ok, 3 passed, 0 failed", compact)
+        self.assertIn("python3 tests/test_api.py", compact)
+        self.assertIn("Result: PASS", compact)
+        self.assertEqual(
+            compact,
+            "go test ./internal/foo -run TestFoo\n"
+            "Result: PASS\n"
+            "cargo test --package api\n"
+            "test result: ok, 3 passed, 0 failed\n"
+            "python3 tests/test_api.py\n"
+            "Result: PASS",
+        )
+        self.assertNotIn("unrelated raw log", compact)
+
+    def test_reviewer_targeted_evidence_keeps_absolute_executable_paths(self):
+        for command in (
+            '/usr/bin/python3 tests/test_api.py',
+            '/opt/tools/python3 tests/test_api.py',
+        ):
+            with self.subTest(command=command):
+                evidence = command + '\nResult: PASS'
+                self.assertEqual(reviewer_targeted_test_evidence(evidence), evidence)
+
+    def test_reviewer_targeted_evidence_keeps_labeled_and_powershell_commands(self):
+        cases = (
+            ('COMMAND: /usr/bin/python3 tests/test_api.py',
+             'COMMAND: /usr/bin/python3 tests/test_api.py'),
+            ('python3 -m unittest `\n  tests.test_api',
+             'python3 -m unittest tests.test_api'),
+            ('COMMAND: /usr/bin/python3 `\n  tests/test_api.py',
+             'COMMAND: /usr/bin/python3 tests/test_api.py'),
+        )
+        for reported, expected in cases:
+            with self.subTest(reported=reported):
+                evidence = reported + '\nResult: PASS\nunrelated raw log: omit this'
+                publication = loop_manager.parse_worker_result(
+                    worker_result('Preserve reported test scope', 'Summary', evidence),
+                    self.plan,
+                )
+                self.assertEqual(
+                    reviewer_targeted_test_evidence(publication.test_evidence),
+                    expected + '\nResult: PASS',
+                )
+
+    def test_reviewer_targeted_evidence_keeps_argumentless_test_paths(self):
+        for command in (
+            'COMMAND: ./build/tests/test_api',
+            './build/tests/test_api',
+            'COMMAND: /opt/tests/test_api',
+            'COMMAND: ./tests/test_api.sh',
+        ):
+            with self.subTest(command=command):
+                publication = loop_manager.parse_worker_result(
+                    worker_result('Preserve individual test paths', 'Summary',
+                                  command + '\nResult: PASS\nunrelated raw log'),
+                    self.plan,
+                )
+                self.assertEqual(
+                    reviewer_targeted_test_evidence(publication.test_evidence),
+                    command + '\nResult: PASS',
+                )
+        self.assertEqual(reviewer_targeted_test_evidence('unrelated\nResult: PASS'),
+                         'Result: PASS')
+
+    def test_reviewer_targeted_evidence_preserves_explicit_commands_and_quoted_paths(self):
+        for command in (
+            'COMMAND: test_api.exe',
+            'COMMAND: test_api',
+            'COMMAND: "/opt/test tools/test_api"',
+            'COMMAND: "/opt/test tools/python3" tests/test_api.py',
+            '"/opt/test tools/test_api"',
+            '"/opt/test tools/python3" tests/test_api.py',
+        ):
+            with self.subTest(command=command):
+                publication = loop_manager.parse_worker_result(
+                    worker_result('Preserve explicit test commands', 'Summary',
+                                  command + '\nResult: PASS\nunrelated raw log'),
+                    self.plan,
+                )
+                self.assertEqual(
+                    reviewer_targeted_test_evidence(publication.test_evidence),
+                    command + '\nResult: PASS',
+                )
+
     def test_targeted_test_evidence_requires_a_clean_explicit_rerun(self):
         valid_evidence = (
             "pytest: 0 failed, 2 passed",
@@ -237,6 +364,11 @@ class WorkerResultContractTest(unittest.TestCase):
         for ambiguous in (
             f"FAILED_COMMAND: {first}\nRERUN: {first}\nFinal run: PASS",
             evidence + "\n재실행 실패 없음.",
+            (
+                "실패 이력 설명\n"
+                f"FAILED_COMMAND: {first}\nInitial run: FAIL\n"
+                f"RERUN: {first}\nFinal run: PASS"
+            ),
         ):
             with self.subTest(evidence=ambiguous):
                 with self.assertRaises(loop_manager.WorkerResultError):

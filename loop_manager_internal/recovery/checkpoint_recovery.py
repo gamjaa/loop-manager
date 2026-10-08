@@ -12,6 +12,7 @@ from loop_manager_internal.agents.agent_scope_decision import scoped_metadata, u
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.documents import reviewer_specification
 from loop_manager_internal.execution import execution_revision
+from loop_manager_internal.execution.result_validation import reviewer_targeted_test_evidence
 from loop_manager_internal.execution.validation_feedback import normalize_feedback
 from loop_manager_internal.execution.verify_process import VerifyTerminationUncertain
 from loop_manager_internal.git import managed_rebase_adoption, managed_rebase_validation
@@ -672,6 +673,13 @@ def _evaluate_remote_checkpoint_cause(effects: EvaluateRemoteCheckpointCauseEffe
         ), str(output), "verify"
     if blocked["blocked_reason"] == BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value:
         return True, str(output), None
+    saved_candidate = str(blocked["publication_remote_oid"] or blocked["pr_head_oid"] or "")
+    if not saved_candidate or saved_candidate != revision[1]:
+        return (
+            True,
+            "원격 checkpoint Worker 결과가 현재 후보 HEAD와 연결되지 않아 Worker부터 재검증합니다.",
+            "worker",
+        )
     try:
         worker_publication = effects.parse_worker_result(
             str(blocked["worker_result"] or ""),
@@ -679,8 +687,15 @@ def _evaluate_remote_checkpoint_cause(effects: EvaluateRemoteCheckpointCauseEffe
         )
     except effects.WorkerResultError as error:
         return False, f"원격 checkpoint Worker 결과 검증 실패: {error}", "worker"
-    targeted_test_reason = effects.reviewer_targeted_test_reason(
-        worker_publication.test_evidence,
+    targeted_test_evidence = (
+        'Worker 보고:\n'
+        + reviewer_targeted_test_evidence(worker_publication.test_evidence)
+    )
+    verify_output = str(getattr(output, 'fingerprint_source', output))
+    verify_evidence = (
+        f"Manager 확인: 전체 verify PASS (checkpoint 복구 중 실제 실행); "
+        f"base={revision[0]}; candidate HEAD={revision[1]}; "
+        f"{'기록된 출력 없음' if not verify_output else '비공개로 저장된 출력 있음'}."
     )
     previous_review = blocked["review_result"]
     protocol_error = None
@@ -693,7 +708,8 @@ def _evaluate_remote_checkpoint_cause(effects: EvaluateRemoteCheckpointCauseEffe
         code, review = effects.run_agent(
             str(project["provider"]), worktree, state_dir, config, "reviewer",
             reviewer_prompt(
-                str(project["base_branch"]), targeted_test_reason, previous_review,
+                str(project["base_branch"]), targeted_test_evidence, previous_review,
+                verify_evidence=verify_evidence,
                 session_recovery=True,
                 protocol_error=protocol_error,
             ),

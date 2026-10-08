@@ -229,6 +229,7 @@ class RecoveryFingerprintsTest(BoundedRecoveryFixture, unittest.TestCase):
             plan_values={
                 'review_result': prior,
                 'worker_result': worker_result(),
+                'publication_remote_oid': 'head',
             }, clear_projection=True,
         )
         blocked = connection.execute(

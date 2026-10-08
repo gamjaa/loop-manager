@@ -835,6 +835,28 @@ class ManualRebaseContinuationUnitTests(unittest.TestCase):
 
 
 class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest.TestCase):
+    def test_review_successor_candidate_rechecks_worker_without_stale_reviewer_evidence(self):
+        published = self.publish_block(
+            reason="review_retry_exhausted",
+            evidence="code.py: reviewer requested a code correction",
+        )
+        corrected = self.user_commit("code.py", "review correction\n")
+        self.assertNotEqual(corrected, published)
+
+        resumed = loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir,
+            str(self.repo.resolve()), "main",
+        )
+
+        self.assertTrue(resumed)
+        plan = self.connection.execute(
+            "SELECT status, worker_result FROM exec_plans WHERE plan_id = 'G-034'"
+        ).fetchone()
+        self.assertEqual(tuple(plan), ("IMPLEMENTING", None))
+        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"), corrected)
+        self.verify_probe.assert_called_once()
+        self.reviewer_probe.assert_not_called()
+
     def test_published_remote_code_successor_resumes_worker_on_same_workspace(self):
         published = self.publish_block()
         binding = SessionBinding("codex", "model", "high").serialize()
@@ -1198,15 +1220,16 @@ class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest
     def test_new_review_issue_resumes_worker(self):
         old = "ISSUE_ID: code.py::old::bug\nOld issue\nVERDICT: FAIL"
         self.publish_block(reason="review_retry_exhausted", evidence=old)
-        new = "ISSUE_ID: dependency.py::new::bug\nNew issue\nVERDICT: FAIL"
-        self.reviewer_probe.return_value = (0, new)
         self.user_commit("dependency.py", "fixed = True\n")
         self.assertTrue(loop_manager.resume_plan_blocks(
             self.connection, self.repo, self.state_dir, str(self.repo.resolve()), "main",
         ))
-        self.assertEqual(self.connection.execute(
-            "SELECT review_result FROM exec_plans WHERE plan_id = 'G-034'"
-        ).fetchone()[0], new)
+        row = self.connection.execute(
+            "SELECT status, worker_result, review_result FROM exec_plans WHERE plan_id = 'G-034'"
+        ).fetchone()
+        self.assertEqual(tuple(row), ("IMPLEMENTING", None, None))
+        self.verify_probe.assert_called_once()
+        self.reviewer_probe.assert_not_called()
 
 
     def test_uncertain_probe_termination_blocks_project_without_retry(self):
@@ -1248,18 +1271,16 @@ class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest
             0, "ISSUE_ID: code.py::function::bug\nStill present\nVERDICT: FAIL",
         )
         self.user_commit("unrelated.py", "unrelated = True\n")
-        self.assertFalse(loop_manager.resume_plan_blocks(
-            self.connection, self.repo, self.state_dir, str(self.repo.resolve()), "main",
-        ))
-        self.assertEqual(self.connection.execute(
-            "SELECT status FROM exec_plans WHERE plan_id = 'G-034'"
-        ).fetchone()[0], "PLAN_BLOCKED")
-        self.reviewer_probe.return_value = (0, "VERDICT: PASS")
-        self.user_commit("dependency.py", "fixed = True\n")
+        # Changed HEAD invalidates the saved Worker result, so Review waits for a fresh Worker turn.
         self.assertTrue(loop_manager.resume_plan_blocks(
             self.connection, self.repo, self.state_dir, str(self.repo.resolve()), "main",
         ))
-        self.assertTrue(self.reviewer_probe.call_args.kwargs["read_only"])
+        plan = self.connection.execute(
+            "SELECT status, worker_result, review_result FROM exec_plans WHERE plan_id = 'G-034'"
+        ).fetchone()
+        self.assertEqual(tuple(plan), ("IMPLEMENTING", None, None))
+        self.verify_probe.assert_called_once()
+        self.reviewer_probe.assert_not_called()
 
 
     def test_review_result_path_controls_remote_release(self):

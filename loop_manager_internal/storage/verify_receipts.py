@@ -4,6 +4,7 @@ Starting a run revokes the old success before any process is launched. All
 selection/confirmation writes use a generation CAS inside the caller's runtime
 transaction; a missing or interrupted completion is never a reusable result.
 """
+from dataclasses import asdict
 import json
 from uuid import uuid4
 
@@ -37,8 +38,53 @@ def selected(connection, repo, plan_id):
     return dict(row) if row else None
 
 
+def current_receipt(connection, selection):
+    """Return only the receipt selected by the active cycle generation."""
+    if selection is None or not selection['receipt_id']:
+        return None
+    row = connection.execute('SELECT * FROM verify_receipts WHERE id=?',
+                             (selection['receipt_id'],)).fetchone()
+    if (row is None or any(row[key] != selection[key]
+                           for key in ('repo', 'plan_id', 'cycle'))):
+        return None
+    return dict(row)
+
+
+def latest_decision(connection, selection):
+    if selection is None:
+        return None
+    row = connection.execute('''SELECT * FROM verify_receipts
+        WHERE repo=? AND plan_id=? AND cycle=? ORDER BY rowid DESC LIMIT 1''',
+        (selection['repo'], selection['plan_id'], selection['cycle'])).fetchone()
+    return dict(row) if row else None
+
+
+def _observation_matches(receipt, observation):
+    observed_fingerprint = (
+        None if observation is None else getattr(observation, 'fingerprint', None)
+    )
+    if (observed_fingerprint is not None
+            and (not isinstance(observed_fingerprint, str) or not observed_fingerprint)):
+        return False
+    try:
+        original = json.loads(receipt['observation'])
+    except (KeyError, TypeError, ValueError):
+        return False
+    if not isinstance(original, dict):
+        return False
+    if original.get('fingerprint') != receipt['fingerprint']:
+        return False
+    if observation is None or receipt['fingerprint'] != observed_fingerprint:
+        return False
+    # An initially unobservable run needs the same observation, not newly
+    # uncertain inputs. Known fingerprints ignore generated uncovered artifacts.
+    return (observed_fingerprint is not None
+            or original == json.loads(json.dumps(asdict(observation))))
+
+
 def success(connection, selection, observation):
-    if selection is None or not observation.proven or not selection['receipt_id']:
+    if (selection is None or observation is None or not observation.proven
+            or not selection['receipt_id']):
         return None
     row = connection.execute('SELECT * FROM verify_receipts WHERE id=?',
                              (selection['receipt_id'],)).fetchone()
@@ -54,6 +100,29 @@ def success(connection, selection, observation):
     except (KeyError, TypeError, ValueError):
         return None
     return dict(row)
+
+
+def candidate_evidence(connection, repo, plan_id, head, output, observation=None):
+    """Bind a run, proven reuse, or waiver to the current candidate result."""
+    selection = selected(connection, repo, plan_id)
+    receipt = current_receipt(connection, selection)
+    latest = latest_decision(connection, selection)
+    if (receipt and latest and latest['id'] == receipt['id']
+            and receipt['head'] == head and receipt['result'] == output):
+        if (receipt['kind'] == 'run' and receipt['status'] == 'success'
+                and _observation_matches(receipt, observation)):
+            return {'kind': 'run', 'receipt': receipt}
+        if receipt['kind'] == 'waiver' and receipt['status'] == 'waived':
+            return {'kind': 'waiver', 'receipt': receipt}
+
+    origin = (success(connection, selection, observation)
+              if getattr(observation, 'proven', False) else None)
+    reused = reused_candidate(connection, repo, plan_id, head, output)
+    if (origin and origin['result'] == output and reused
+            and reused['origin_id'] == origin['id']
+            and reused['fingerprint'] == observation.fingerprint):
+        return {'kind': 'reuse', 'receipt': reused, 'origin': origin}
+    return None
 
 
 def reused_candidate(connection, repo, plan_id, head, output):
@@ -77,7 +146,6 @@ def record(connection, selection, *, head, observation, kind, reason, origin=Non
          selection['plan_id'], selection['cycle'], selection['generation']))
     if result.rowcount != 1:
         raise CheckpointRace('verify receipt selection changed')
-    from dataclasses import asdict
     connection.execute('''INSERT INTO verify_receipts
         (id, repo, plan_id, cycle, kind, origin_id, head, fingerprint,
          observation, result, status, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',

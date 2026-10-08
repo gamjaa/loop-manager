@@ -155,6 +155,118 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
     def receipts(self):
         return [dict(row) for row in self.connection.execute('SELECT * FROM verify_receipts ORDER BY rowid')]
 
+    def test_reviewer_receipt_proof_distinguishes_run_reuse_and_waiver(self):
+        observation = self.observer(self.root)
+        verify_receipts.start_cycle(self.connection, 'repo', 'G-047')
+        selection = verify_receipts.selected(self.connection, 'repo', 'G-047')
+        run_id, selection = verify_receipts.record(
+            self.connection, selection, head='original-head', observation=observation,
+            kind='run', reason='no prior success',
+        )
+        verify_receipts.complete(
+            self.connection, selection, run_id, passed=True, output='',
+        )
+        self.assertEqual(verify_receipts.candidate_evidence(
+            self.connection, 'repo', 'G-047', 'original-head', '', observation,
+        )['kind'], 'run')
+        ignored_artifacts = inputs.InputObservation(
+            observation.fingerprint,
+            observation.files,
+            (('logs/verify.log', 'file', 0o644, 'generated'),),
+            'changed-completeness',
+            'unconfirmed inputs outside manifest',
+        )
+        self.assertEqual(verify_receipts.candidate_evidence(
+            self.connection, 'repo', 'G-047', 'original-head', '', ignored_artifacts,
+        )['kind'], 'run')
+        self.assertIsNone(verify_receipts.candidate_evidence(
+            self.connection, 'repo', 'G-047', 'original-head', '',
+        ))
+        self.assertIsNone(verify_receipts.candidate_evidence(
+            self.connection, 'repo', 'G-047', 'original-head', '',
+            inputs.InputObservation(None, reason='unconfirmed native loader inputs'),
+        ))
+        self.assertIsNone(verify_receipts.candidate_evidence(
+            self.connection, 'repo', 'G-047', 'original-head', '',
+            inputs.InputObservation('changed-inputs'),
+        ))
+        unproven_changed_inputs = inputs.InputObservation(
+            'changed-inputs',
+            observation.files,
+            observation.uncovered,
+            observation.completeness_token,
+            'verify command or runtime inputs are unconfirmed',
+        )
+        self.assertIsNone(verify_receipts.candidate_evidence(
+            self.connection, 'repo', 'G-047', 'original-head', '',
+            unproven_changed_inputs,
+        ))
+        origin = verify_receipts.success(
+            self.connection, selection, observation,
+        )
+        reused_id, _selection = verify_receipts.record(
+            self.connection, selection, head='current-head', observation=observation,
+            kind='reuse', origin=origin, reason='same proven inputs',
+        )
+
+        reused = verify_receipts.candidate_evidence(
+            self.connection, 'repo', 'G-047', 'current-head', '', observation,
+        )
+        self.assertEqual(reused['kind'], 'reuse')
+        self.assertEqual(reused['receipt']['id'], reused_id)
+        self.assertEqual(reused['origin']['id'], run_id)
+        self.assertIsNone(verify_receipts.candidate_evidence(
+            self.connection, 'repo', 'G-047', 'current-head', '',
+        ))
+        self.assertIsNone(verify_receipts.candidate_evidence(
+            self.connection, 'repo', 'G-047', 'original-head', '', observation,
+        ))
+        self.assertIsNone(verify_receipts.candidate_evidence(
+            self.connection, 'repo', 'G-047', 'other-head', '', observation,
+        ))
+        self.assertIsNone(verify_receipts.candidate_evidence(
+            self.connection, 'repo', 'G-047', 'current-head', '',
+            inputs.InputObservation('different-inputs'),
+        ))
+
+        unobservable = inputs.InputObservation(
+            None, reason='verify input fingerprint unavailable',
+        )
+        verify_receipts.start_cycle(self.connection, 'repo', 'G-047')
+        selection = verify_receipts.selected(self.connection, 'repo', 'G-047')
+        unobservable_id, selection = verify_receipts.record(
+            self.connection, selection, head='unobserved-head',
+            observation=unobservable, kind='run', reason='inputs unavailable',
+        )
+        verify_receipts.complete(
+            self.connection, selection, unobservable_id, passed=True, output='',
+        )
+        self.assertEqual(verify_receipts.candidate_evidence(
+            self.connection, 'repo', 'G-047', 'unobserved-head', '', unobservable,
+        )['kind'], 'run')
+
+        self.assertIsNone(verify_receipts.candidate_evidence(
+            self.connection, 'repo', 'G-047', 'unobserved-head', '',
+            inputs.InputObservation(None, reason='unconfirmed native loader inputs'),
+        ))
+
+        verify_receipts.start_cycle(self.connection, 'repo', 'G-047')
+        selection = verify_receipts.selected(self.connection, 'repo', 'G-047')
+        waiver_id, selection = verify_receipts.record(
+            self.connection, selection, head='current-head', observation=observation,
+            kind='run', reason='user waiver candidate',
+        )
+        verify_receipts.complete(
+            self.connection, selection, waiver_id, passed=True,
+            output='SKIPPED_BY_USER @current-head; user choice', executed=False,
+        )
+        waiver = verify_receipts.candidate_evidence(
+            self.connection, 'repo', 'G-047', 'current-head',
+            'SKIPPED_BY_USER @current-head; user choice', observation,
+        )
+        self.assertEqual(waiver['kind'], 'waiver')
+        self.assertNotEqual(waiver['receipt']['status'], 'success')
+
     def test_proven_success_reuses_original_run_without_new_invocation_or_audit(self):
         self.verify()
         self.ready()
