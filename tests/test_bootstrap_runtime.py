@@ -406,6 +406,7 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
         from tests.support.runtime import record_saved_scope_invocation
         from loop_manager_internal.execution.worker_session import SessionBinding
         from loop_manager_internal.planning.planning_workspace import planning_workspace_path
+        from loop_manager_internal.verification.timing import _current_writer
 
         for base in ('main', 'develop'):
             for role in ('planner', 'worker', 'reviewer'):
@@ -463,7 +464,19 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                 advance.unlink()
             return validate_mutation(service, source, state_dir, *args, **kwargs)
         BootstrapService.validate_runtime_mutation = advance_remote_then_validate
-    raise SystemExit(main())'''), encoding='utf-8')
+    from loop_manager_internal.verification.timing import EventWriter, phase
+    from loop_manager_internal.verification.git_timing import git_command_timing
+    costs = Path(sys.argv[sys.argv.index('--state-dir') + 1]) / 'bootstrap-costs'
+    costs.mkdir(exist_ok=True)
+    cost_writer = EventWriter(costs / (str(os.getpid()) + '.jsonl'))
+    cost_writer.current_test = BOOTSTRAP_TEST_LABEL
+    try:
+        with cost_writer.activate(), phase('bootstrap:runtime_child_cli' if '--runtime-child' in sys.argv
+                                          else 'bootstrap:parent_cli'), git_command_timing():
+            code = main()
+    finally:
+        cost_writer.close()
+    raise SystemExit(code)''').replace('BOOTSTRAP_TEST_LABEL', repr(self.id())), encoding='utf-8')
                     for name in ('PLANS.md', 'AGENTS.common.md', 'AGENTS.planner.md',
                                  'AGENTS.planner_check.md', 'AGENTS.worker.md', 'AGENTS.reviewer.md',
                                  'AGENTS.ponytail.md'):
@@ -605,6 +618,22 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                                                        'worker-existing', 'reviewer-existing', 0))
                         # Leave the proof absent so same-SHA reuse must dispatch again.
                         proof_path.unlink()
+                    # Child instrumentation stays in this owned fixture. Forward
+                    # original PID/time values so nested CLI durations aren't
+                    # presented as independent end-to-end time.
+                    records = []
+                    parent_writer = _current_writer.get()
+                    for path in sorted((state / 'bootstrap-costs').glob('*.jsonl')):
+                        contents = path.read_text(encoding='utf-8')
+                        records.extend(json.loads(line) for line in contents.splitlines())
+                        if parent_writer is not None:
+                            parent_writer.stream.write(contents)
+                    if parent_writer is not None:
+                        parent_writer.stream.flush()
+                    ends = [event for event in records if event['kind'] == 'phase_end']
+                    self.assertEqual(sum(event['name'] == 'bootstrap:parent_cli' for event in ends), 3)
+                    self.assertEqual(sum(event['name'] == 'bootstrap:runtime_child_cli' for event in ends), 2)
+                    self.assertTrue(any(event['kind'] == 'git_cost' and event['count'] > 0 for event in records))
 
     def test_selected_runtime_b_survives_external_base_c_before_child_prevalidation(self):
         self.test_remote_bootstrap_child_resumes_saved_scope_without_identity_injection(advance_after_selection=True)
