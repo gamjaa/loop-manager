@@ -828,72 +828,40 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         self.effects.blocking.block_active_execplan.assert_not_called()
 
 
-    def test_protocol_failure_is_silently_sent_before_successful_reviewer_retry(self):
-        import json
+    def test_protocol_failure_retry_succeeds_without_stage_notice(self):
         from loop_manager_internal.notifications import notifications
         notifications.configure_session(self.connection, enabled=True)
         self.connection.commit()
-        context = self.review_context()
-        self.effects.validation.parse_reviewer_result.side_effect = [
-            lm.ReviewerProtocolError('missing verdict'),
-            lm.ReviewerProtocolError('missing verdict'), ('PASS', ()),
-        ]
-        sent = []
+        self.effects.validation.parse_reviewer_result.side_effect = [lm.ReviewerProtocolError('missing verdict'), lm.ReviewerProtocolError('missing verdict'), ('PASS', ())]
         attempts = []
         def reviewer(*args, **kwargs):
-            if attempts:
-                self.assertEqual(len(sent), 1)
-                self.assertTrue(sent[0][1]['disable_notification'])
-                self.assertIn('missing verdict', sent[0][0])
             attempts.append(True)
             return self.agent(*args, **kwargs)
         self.effects.agent.run_agent.side_effect = reviewer
-        with mock.patch('loop_manager_internal.notifications.delivery.send_telegram',
-                        side_effect=lambda _t, _c, text, **options: sent.append((text, options))), \
-                notifications.immediate_delivery(self.connection, 'token', 'chat', 'repo'):
-            outcome = self.handler.review(context)
+        with mock.patch('loop_manager_internal.notifications.delivery.send_telegram') as sent, notifications.immediate_delivery(self.connection, 'token', 'chat', 'repo'):
+            outcome = self.handler.review(self.review_context())
         self.assertEqual(outcome.context.phase, ExecutionPhase.PUBLISHING)
         self.assertEqual(len(attempts), 3)
-        events = self.connection.execute("SELECT payload, sent_at FROM notification_outbox WHERE event_type = 'stage_failed'").fetchall()
-        self.assertEqual(len(events), 1)
-        self.assertIsNotNone(events[0]['sent_at'])
-        payload = json.loads(events[0]['payload'])
-        self.assertEqual(payload['execplan_id'], 'G-047')
-        self.assertEqual(payload['operation'], 'Reviewer')
-        self.assertEqual(payload['status'], '자동 교정·재시도 대기')
+        sent.assert_not_called()
+        self.assertFalse(self.connection.execute("SELECT 1 FROM notification_outbox WHERE event_type='stage_failed'").fetchone())
 
 
-    def test_usage_and_cli_return_paths_persist_and_send_silent_failure(self):
-        import json
+    def test_usage_and_cli_return_paths_persist_without_stage_notice(self):
         from loop_manager_internal.notifications import notifications
         notifications.configure_session(self.connection, enabled=True)
         self.connection.commit()
-        for kind, outcome_kind, status in (
-            (lm.AgentResultKind.USAGE_LIMIT, ExecutionOutcomeKind.USAGE_PAUSE,
-             '사용량 제한 해제 후 다음 실행에서 재개'),
-            (lm.AgentResultKind.PERMANENT_CONFIGURATION, ExecutionOutcomeKind.OPERATIONAL_ERROR,
-             '다음 실행에서 재개'),
-        ):
+        for kind, outcome_kind in ((lm.AgentResultKind.USAGE_LIMIT, ExecutionOutcomeKind.USAGE_PAUSE), (lm.AgentResultKind.PERMANENT_CONFIGURATION, ExecutionOutcomeKind.OPERATIONAL_ERROR)):
             with self.subTest(kind=kind):
                 context = self.review_context()
                 detail = 'reviewer ' + kind.value
                 self.effects.agent.run_agent.side_effect = lambda *a, **kw: lm.AgentResult(1, detail, kind=kind)
-                sent = mock.Mock()
-                with mock.patch('loop_manager_internal.notifications.delivery.send_telegram', sent), \
-                        notifications.immediate_delivery(self.connection, 'token', 'chat', 'repo'):
+                with mock.patch('loop_manager_internal.notifications.delivery.send_telegram') as sent, notifications.immediate_delivery(self.connection, 'token', 'chat', 'repo'):
                     for _ in range(2):
-                        outcome = self.handler.review(context)
-                        self.assertEqual(outcome.kind, outcome_kind)
-                sent.assert_called_once()
-                self.assertTrue(sent.call_args.kwargs['disable_notification'])
-                payload = json.loads(self.connection.execute(
-                    "SELECT payload FROM notification_outbox WHERE event_type='stage_failed' ORDER BY rowid DESC"
-                ).fetchone()[0])
-                self.assertEqual(payload['cause'], self.state.row()['last_error'])
-                self.assertEqual(payload['execplan_id'], 'G-047')
-                self.assertEqual(payload['status'], status)
-                self.assertIn(payload['occurred_at'], sent.call_args.args[2])
+                        self.assertEqual(self.handler.review(context).kind, outcome_kind)
+                sent.assert_not_called()
+                self.assertIn(detail, self.state.row()['last_error'])
                 self.assertFalse(self.connection.execute('SELECT 1 FROM recovery_records').fetchone())
+                self.assertFalse(self.connection.execute("SELECT 1 FROM notification_outbox WHERE event_type='stage_failed'").fetchone())
 
     def test_review_return_failure_event_rolls_back_with_state(self):
         from loop_manager_internal.notifications import notifications

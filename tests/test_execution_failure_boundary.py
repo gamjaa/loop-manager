@@ -50,7 +50,7 @@ class PersistentExecutionFailureBoundaryTest(AutomationCatalogFixture, unittest.
             connection.execute(
                 "SELECT COUNT(*) FROM notification_outbox WHERE repo = ?", (repo,)
             ).fetchone()[0],
-            1,
+            0,
         )
 
     @dummy_worker_sessions
@@ -75,7 +75,7 @@ class PersistentExecutionFailureBoundaryTest(AutomationCatalogFixture, unittest.
             return loop_manager.PROJECT_STEP_TRANSIENT_PAUSE
 
         with mock.patch("loop_manager._run_project_step", side_effect=failed_step):
-            for expected_events in (1, 1, 2):
+            for expected_events in (0, 0, 1):
                 outcome = loop_manager.run_project_result(
                     connection, Path("/unused-state"), repo, Path("/unused.ini"),
                     "main", False,
@@ -86,5 +86,5 @@ class PersistentExecutionFailureBoundaryTest(AutomationCatalogFixture, unittest.
                     (repo,),
                 ).fetchall()
                 self.assertEqual(len(events), expected_events)
-                self.assertEqual(sum(row[0] == "stage_failed" for row in events), 1)
-                self.assertEqual(sum(row[0] == "persistent_execution_failure" for row in events), expected_events - 1)
+                self.assertEqual(sum(row[0] == "stage_failed" for row in events), 0)
+                self.assertEqual(sum(row[0] == "persistent_execution_failure" for row in events), expected_events)

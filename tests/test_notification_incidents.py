@@ -196,7 +196,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(started["started_operation"], "Planner")
         self.assertIsNone(started["resumed_at"])
         self.assertEqual(len([row for row in self.events(connection)
-                              if row["event_type"] == "work_started"]), 1)
+                              if row["event_type"] == "work_started"]), 0)
         notice_created_at = connection.execute(
             "SELECT o.created_at FROM notification_outbox o "
             "JOIN notified_block_incidents i ON i.event_key = o.event_key "
@@ -1106,7 +1106,7 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
 
 
 class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
-    def test_unsent_planner_start_keeps_new_episode_and_generic_notice(self):
+    def test_unsent_planner_start_keeps_new_episode_without_generic_notice(self):
         connection = self.connection()
         repo = '/projects/alpha'
         loop_manager.update_project(connection, repo, planning_error='same cause')
@@ -1118,10 +1118,7 @@ class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(connection.execute(
             "SELECT COUNT(*) FROM notified_block_incidents WHERE subject = 'planning'"
         ).fetchone()[0], 2)
-        starts = [row for row in self.events(connection) if row['event_type'] == 'work_started']
-        self.assertEqual(len(starts), 1)
-        self.assertEqual(json.loads(starts[0]['payload'])['operation'], 'Planner')
-        self.assertFalse(any(row['event_type'] == 'resumed' for row in self.events(connection)))
+        self.assertFalse(any(row['event_type'] in {'work_started', 'resumed'} for row in self.events(connection)))
 
     def test_unsent_released_block_does_not_suppress_physical_starts(self):
         for failed_send in (False, True):
@@ -1140,7 +1137,7 @@ class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
                     for identity in ('first-start', 'first-start', 'second-start'):
                         notifications.record_process_start(connection, repo, 'worker', identity, plan_id='G-018')
                 starts = [row for row in self.events(connection) if row['event_type'] == 'work_started']
-                self.assertEqual(len(starts), 2)
+                self.assertEqual(len(starts), 1)
                 self.assertFalse(any(row['event_type'] == 'resumed' for row in self.events(connection)))
                 incident = connection.execute('SELECT started_operation FROM notified_block_incidents').fetchone()
                 self.assertEqual(incident[0], 'Worker')
@@ -1166,7 +1163,7 @@ class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
         with connection:
             notifications.record_process_start(connection, repo, 'worker', 'first-start', plan_id='G-018')
             notifications.record_process_start(connection, repo, 'worker', 'second-start', plan_id='G-018')
-        self.assertEqual(len([row for row in self.events(connection) if row['event_type'] == 'work_started']), 2)
+        self.assertEqual(len([row for row in self.events(connection) if row['event_type'] == 'work_started']), 1)
         self.assertFalse(any(row['event_type'] == 'resumed' for row in self.events(connection)))
 
     def test_matching_worker_and_pr_resume_preserve_planning_incident_and_safety_gates(self):
@@ -1248,7 +1245,7 @@ class UnsentBlockStartTest(NotificationFixture, unittest.TestCase):
                     notifications.record_process_start(connection, repo, 'worker', 'first', plan_id='G-018')
                     notifications.record_process_start(connection, repo, 'worker', 'second', plan_id='G-018')
                 starts = [row for row in self.events(connection) if row['event_type'] == 'work_started']
-                self.assertEqual(len(starts), 2)
+                self.assertEqual(len(starts), 1)
                 self.assertFalse(any(row['event_type'] == 'resumed' for row in self.events(connection)))
 
     def test_in_flight_failure_falls_back_to_saved_start_without_duplicate(self):

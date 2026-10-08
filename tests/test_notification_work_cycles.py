@@ -285,7 +285,7 @@ class WorkReasonOutboxTest(NotificationFixture, unittest.TestCase):
                         if remaining_requirement else (),
                     )
                     assert changed is not None
-                    self.assertEqual(changed.has_distinct_wait, remaining_requirement)
+                    self.assertTrue(changed.has_distinct_wait)
                     self.assertFalse(notifications.enqueue_waiting_reason(connection, repo, changed))
                     events = self.events(connection)
                     self.assertEqual(len(events), 1)
@@ -306,68 +306,33 @@ class WorkReasonOutboxTest(NotificationFixture, unittest.TestCase):
                     for _ in range(2):
                         self.assertEqual(notifications.enqueue_waiting_reason(
                             restarted, repo, changed,
-                        ), remaining_requirement)
+                        ), True)
                     self.assertEqual(notifications.dispatch_pending(
                         restarted, "token", "chat", adapter=delivered,
-                    ), int(remaining_requirement))
-                    self.assertEqual(len(self.events(restarted)), 1 + int(remaining_requirement))
+                    ), 1)
+                    self.assertEqual(len(self.events(restarted)), 2)
 
-    def test_block_only_suppresses_wait_and_disabled_delivery_keeps_reason(self):
+    def test_plan_block_wait_notifies_but_project_block_suppresses_wait(self):
+        from dataclasses import replace
         connection = self.connection(enabled=False)
-        repo = "/projects/alpha"
-        connection.execute(
-            "UPDATE exec_plans SET status = 'PLAN_BLOCKED' WHERE repo = ?", (repo,),
-        )
-        connection.execute(
-            "INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) "
-            "VALUES (?, 'G-018', 'plan', 'user_decision_required', 'Choose A')",
-            (repo,),
-        )
-        snapshot = work_exhaustion.collect(
-            connection, repo, cycle="cycle-one", active_requirements=(),
-        )
-        assert snapshot is not None
-        self.assertIn("Choose A", snapshot.describe())
+        repo = '/projects/alpha'
+        with connection:
+            connection.execute("UPDATE exec_plans SET status = 'PLAN_BLOCKED' WHERE repo = ?", (repo,))
+            connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) VALUES (?, 'G-018', 'plan', 'user_decision_required', 'Choose A')", (repo,))
+        snapshot = work_exhaustion.collect(connection, repo, cycle='cycle-one', active_requirements=())
+        self.assertIn('Choose A', snapshot.describe())
         self.assertFalse(notifications.enqueue_waiting_reason(connection, repo, snapshot))
         notifications.configure_session(connection, enabled=True)
-        self.assertFalse(notifications.enqueue_waiting_reason(connection, repo, snapshot))
-        self.assertEqual(self.events(connection), [])
-
-        requirement_path = "docs/requirements/[R-031] x.md"
-        connection.execute(
-            "UPDATE exec_plans SET sources = ? WHERE repo = ? AND plan_id = 'G-018'",
-            (json.dumps([requirement_path]), repo),
-        )
-        related = work_exhaustion.collect(
-            connection, repo, cycle="cycle-one",
-            active_requirements=(requirement_path,),
-        )
-        assert related is not None
-        self.assertIn("[R-031]", related.describe())
-        self.assertFalse(related.has_distinct_wait)
-        self.assertFalse(notifications.enqueue_waiting_reason(connection, repo, related))
-        self.assertEqual(self.events(connection), [])
-
-        connection.execute(
-            "UPDATE exec_plans SET sources = '[]' "
-            "WHERE repo = ? AND plan_id = 'G-018'", (repo,),
-        )
-        with_requirement = work_exhaustion.collect(
-            connection, repo, cycle="cycle-one",
-            active_requirements=(requirement_path,),
-        )
-        assert with_requirement is not None
-        self.assertTrue(with_requirement.has_distinct_wait)
-        notifications.enqueue_waiting_reason(connection, repo, with_requirement)
-        failed = mock.Mock(side_effect=RuntimeError("network unavailable"))
-        self.assertEqual(notifications.dispatch_pending(
-            connection, "token", "chat", adapter=failed,
-        ), 0)
-        event = self.events(connection)[0]
-        self.assertEqual(event["attempts"], 1)
-        self.assertIsNone(event["sent_at"])
-        delivered = mock.Mock()
-        self.assertEqual(notifications.dispatch_pending(
-            connection, "token", "chat", adapter=delivered,
-        ), 1)
-        self.assertIsNotNone(self.events(connection)[0]["sent_at"])
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+        notifications.dispatch_pending(connection, 'token', 'chat', adapter=mock.Mock())
+        self.assertTrue(notifications.enqueue_waiting_reason(connection, repo, snapshot))
+        waiting = next(row for row in self.events(connection) if row['event_type'] == 'work_waiting')
+        self.assertFalse(json.loads(waiting['payload'])['silent'])
+        self.assertIn('Choose A', notifications._message('work_waiting', json.loads(waiting['payload'])))
+        for _ in range(2):
+            notifications.enqueue_waiting_reason(connection, repo, snapshot)
+        self.assertEqual(len([row for row in self.events(connection) if row['event_type'] == 'work_waiting']), 1)
+        blocked = replace(snapshot, project_block={'code': 'unsafe_repository', 'reason': 'unsafe'})
+        self.assertFalse(notifications.enqueue_waiting_reason(connection, repo, blocked))
+        self.assertIsNotNone(next(row for row in self.events(connection) if row['event_type'] == 'work_waiting')['canceled_at'])

@@ -23,15 +23,7 @@ class WorkReasonSnapshot:
 
     @property
     def has_distinct_wait(self) -> bool:
-        # A BLOCKED event already owns a wait consisting only of blocks.
-        if any(plan["status"] != "PLAN_BLOCKED" for plan in self.plans):
-            return True
-        if not self.plans:
-            return bool(self.requirements)
-        return any(
-            requirement.get("independent_wait") is True
-            for requirement in self.requirements
-        )
+        return not self.project_block and bool(self.plans or self.requirements)
 
     def payload(self, project: str) -> dict[str, object]:
         return {

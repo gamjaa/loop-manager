@@ -382,6 +382,13 @@ def _materialize_unnotified_start(connection, incident_id):
     if row is None:
         return
     old = json.loads(row[1])
+    if row[2] != "Worker" or connection.execute(
+        "SELECT 1 FROM notification_outbox WHERE repo = ? "
+        "AND event_type IN ('work_started', 'resumed') "
+        "AND json_extract(payload, '$.execplan_id') = ? LIMIT 1",
+        (row[0], old.get("execplan_id")),
+    ).fetchone():
+        return
     _insert(connection, _key("work_started", row[0], row[3]), row[0], "work_started",
             {"project": old["project"], "execplan_id": old.get("execplan_id"),
              "execplan_title": old.get("execplan_title"), "operation": row[2],

@@ -585,7 +585,6 @@ def enqueue_waiting_reason(
     for plan in payload["plans"]:
         if plan.get("question"):
             enqueue_draft_decision(connection, repo, plan["id"], plan["title"])
-    payload["plans"] = [plan for plan in payload["plans"] if not plan.get("question")]
     signature = hashlib.sha256(
         json.dumps(payload, sort_keys=True, ensure_ascii=False,
                    separators=(",", ":")).encode()
@@ -617,10 +616,7 @@ def enqueue_waiting_reason(
         )
         if not _enabled(connection):
             return False
-        payload["silent"] = not (payload.get("project_block") or payload.get("planning_error") or any(
-            plan.get("status") in {"PR_OPEN", "PLAN_BLOCKED", "CATALOG_HELD", "MANUAL_PENDING", "MANUAL_WORKING"}
-            for plan in payload["plans"]
-        ))
+        payload["silent"] = False
         payload["status"] = "다음 작업 대기"
         _insert(connection, event_key, repo, "work_waiting", payload)
     return True
@@ -628,7 +624,7 @@ def enqueue_waiting_reason(
 
 def enqueue_progress(connection, repo, kind, identity, **payload):
     """Persist a boundary observation in the owning state transaction."""
-    if not _enabled(connection):
+    if kind in {"stage_failed", "planning_result"} or not _enabled(connection):
         return
     ensure_schema(connection)
     plan_id = payload.get("execplan_id")
@@ -675,6 +671,8 @@ def enqueue_worker_failure(connection, repo, plan_id, cause, *, status):
 
 def record_process_start(connection, repo, role, identity, *, plan_id=None, resumed=False):
     """A physical process has started, rather than just been selected."""
+    if role not in {"worker", "planner", "maintenance_planner"}:
+        return
     from loop_manager_internal.storage import execplan_draft_state
     ensure_schema(connection)
     if connection.execute(
@@ -702,10 +700,15 @@ def record_process_start(connection, repo, role, identity, *, plan_id=None, resu
         "AND o.sent_at IS NULL) LIMIT 1",
         (repo, operation, identity, f"plan:{plan_id}" if plan_id else "planning"),
     ).fetchone()
-    if not blocked_resume and not pending_resume:
+    already_started = plan_id and connection.execute(
+        "SELECT 1 FROM notification_outbox WHERE repo = ? "
+        "AND event_type IN ('work_started', 'resumed') "
+        "AND json_extract(payload, '$.execplan_id') = ? LIMIT 1", (repo, plan_id),
+    ).fetchone()
+    if role == "worker" and not resumed and not already_started and not blocked_resume and not pending_resume:
         enqueue_progress(connection, repo, "work_started", identity,
-                         execplan_id=plan_id, operation="유지보수 평가" if role == "maintenance_planner" else operation,
-                         status="작업 재개 중" if resumed else "작업 중", silent=True)
+                         execplan_id=plan_id, operation=operation,
+                         status="작업 중", silent=True)
 
 
 def record_planning_publication(connection, repo, plans, revision):
