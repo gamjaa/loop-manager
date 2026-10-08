@@ -33,7 +33,7 @@ Loop Manager는 Windows·Linux·macOS에서 동작하는 Python 3 프로그램�
 - 부트스트랩은 다른 Git 작업 전에 부모 process lock을 획득하고, Loop Manager 저장소의 `origin/main`을 fetch해 exact SHA의 detached runtime worktree를 선택한 뒤 같은 lock을 유지한 채 runtime 자식을 실행한다. `manual`과 `recover`는 command별 부모 lock과 고유 runtime 경로로 자동 실행과 분리한다
 - runtime worktree는 source checkout의 object database를 공유하며 사용자 `main`의 파일, index, HEAD와 로컬 전용 commit을 사용하지 않는다. push된 새 SHA는 다음 실행에서만 선택한다
 - source checkout의 bootstrap은 기존 `config/config.ini` 또는 명시된 `--config`를 source checkout 기준의 절대 경로로 확정해 runtime 자식에 전달하며 설정 파일을 runtime worktree에 복사·이동·symlink하지 않는다
-- launcher가 선택한 source checkout의 Python interpreter를 runtime 자식도 사용한다. 그 밖의 ignored 파일과 cache는 runtime worktree로 전달하지 않는다
+- launcher가 선택한 source checkout의 Python interpreter를 runtime 자식도 사용한다. source checkout의 ignored 파일과 cache는 runtime worktree로 전달하지 않는다
 - `config/config.ini`가 없거나 유효하지 않으면 설정 방법을 안내하고 작업을 시작하지 않는다
 - 최초 설정은 사용자가 설정 모드를 명시적으로 실행해 SQLite를 생성한다
 - 일반 Loop 모드에서 SQLite가 없거나 손상됐으면 자동으로 초기화하지 않고 복원 또는 명시적 재설정을 안내한 뒤 중단한다
@@ -52,7 +52,7 @@ Python 표준 라이브러리 `configparser`로 `config/config.ini`를 읽는다
 
 실제 `config/config.ini`는 Git에서 제외하고 현재 사용자만 읽을 수 있도록 권장한다. 기본 설정 파일은 source checkout에 그대로 두며 bootstrap이 해당 경로를 runtime 자식에 명시적으로 전달한다. 사용자가 `--config`를 지정하면 bootstrap은 상대 경로를 source checkout 기준으로 절대화한 뒤 전달한다. runtime은 전달된 파일을 시작 시 한 번 읽고 runtime `ROOT`를 기준으로 기본 경로를 다시 계산하지 않는다. 설정 파일을 SHA별 runtime에 복제하지 않으며 Telegram token과 chat ID가 모두 비어 있으면 알림을 비활성화하고, 하나만 설정돼 있으면 설정 오류로 처리한다. 비밀값은 자식 명령행, 로그, AI Agent prompt와 오류 메시지에 포함하지 않는다.
 
-ignored 상태는 runtime 전달 근거가 아니다. `.venv`는 launcher가 선택한 interpreter의 절대 경로를 자식 프로세스에도 사용해 재사용하고, `__pycache__`와 도구 cache 같은 파생 파일은 전달하지 않는다. 다른 ignored 파일이 필수 운영 입력이 되면 파일별 외부 경로, 소유권, 권한과 전달 방식을 Architecture에 먼저 정의하며 일반 복사나 runtime clean 검증 예외를 추가하지 않는다.
+ignored 상태는 runtime 전달 근거가 아니다. `.venv`는 launcher가 선택한 interpreter의 절대 경로를 자식 프로세스에도 사용해 재사용하고, source checkout의 `__pycache__`와 도구 cache 같은 파생 파일은 전달하지 않는다. runtime 자식의 표준 Python bytecode cache는 disposable worktree 바깥의 Manager 상태 경로에 repository·exact revision·interpreter별로 분리한다. 추적된 runtime Python 원본에서 표준 checked-hash `.pyc`를 준비해 같은 revision의 재생성 worktree에서도 원본 수정 시각에 의존하지 않고 재사용한다. 기존 hash·interpreter tag·revision이 맞지 않거나 cache 경로를 쓸 수 없으면 안전하게 다시 만들고, 실패해도 원본 실행을 계속한다. 사용자가 명시한 `-B`, `PYTHONDONTWRITEBYTECODE`와 `PYTHONPYCACHEPREFIX` 선택은 유지한다. cache 준비는 생성·재사용·대체·사용 불가 개수와 소요 시간을 기록한다. 이 cache는 runtime revision·source·검증·Git 소유권의 근거가 아니며 ignored 파일 판정이나 cleanup 검사를 완화하지 않는다. 다른 ignored 파일이 필수 운영 입력이 되면 파일별 외부 경로, 소유권, 권한과 전달 방식을 Architecture에 먼저 정의하며 일반 복사나 runtime clean 검증 예외를 추가하지 않는다.
 
 런타임 상태 디렉터리는 source checkout 밖의 운영체제 사용자 상태 경로를 사용한다.
 
@@ -262,7 +262,7 @@ planning batch의 원격 게시·catalog 반영과 현재 원격 입력 일치�
 - 세션을 재개할 수 없으면 같은 worktree, ExecPlan과 저장된 실패 내용을 전달해 새 세션을 시작한다
 - 상태 분류, 설정 검증, Git/GitHub 명령과 verify 실행은 프로그램 코드가 담당한다
 - Worker는 commit, fetch, pull, rebase, push, worktree 등록과 PR 생성을 수행하지 않는다. Worker 반환 뒤의 모든 Git 쓰기는 Agent 호출 밖의 프로그램 코드가 소유한다
-- AI Agent와 verify subprocess에는 역할 수행에 필요한 환경 변수만 전달하고 Telegram token을 포함한 Loop Manager 비밀값을 상속하지 않는다. verify 조율 endpoint·secret·session은 runner 자체 조율에 필요해 runner에만 전달한다. runner의 자식 subprocess에는 해당 세 값을 뺀 환경 복사본을 넘기며 부모 환경과 호출자 mapping은 변경하지 않는다. 기존 marker·`PYTHONPATH`와 필요한 일반 환경은 자식에서 유지한다
+- AI Agent와 verify subprocess에는 역할 수행에 필요한 환경 변수만 전달하고 Telegram token을 포함한 Loop Manager 비밀값을 상속하지 않는다. provider 환경 필터는 비밀이 아닌 `PYTHONDONTWRITEBYTECODE`와 `PYTHONPYCACHEPREFIX`도 보존한다. verify 조율 endpoint·secret·session은 runner 자체 조율에 필요해 runner에만 전달한다. runner의 자식 subprocess에는 해당 세 값을 뺀 환경 복사본을 넘기며 부모 환경과 호출자 mapping은 변경하지 않는다. 명령행 Python에서 선택한 bytecode 정책과 prefix도 자식 Python에 반영한다. 기존 marker·`PYTHONPATH`와 필요한 일반 환경은 자식에서 유지한다
 
 ### Ponytail 지침
 
@@ -517,6 +517,11 @@ glob의 빈 결과는 관측 가능한 빈 집합이다. 목록 자체와 실제
 실제 명령·환경·측정한 runtime·Git/외부 입력 identity를 결합한다. symlink를 따라가지 않으며
 확인되지 않은 입력은 재사용할 수 없다. Git 내부·bytecode는 생성물이고 `.venv`는 별도로
 측정한 runtime/외부 의존성 identity로 확인한다.
+
+verify 기록은 실행 시 Python의 bytecode write 정책·cache tag·prefix와 프로젝트 Python cache의
+전후 개수, 생성·변경·유지·삭제 수를 남기며 snapshot 소요 시간을 별도 phase로 기록한다.
+비교는 bytecode 설정이 같은지 표시하고 실제 run 시간과 cache 변화를 함께 제공한다. cache 존재를
+실제 재사용·검증 성공이나 속도 향상으로 대신 판단하지 않는다.
 
 목록 밖 파일의 제외 확인은 경로·내용·kind·mode, 실행 context와 목록에 포함된 모든 입력의
 경로·내용·kind·mode에 결합한 completeness token으로 제한한다. 검증 스크립트·설정 변경도

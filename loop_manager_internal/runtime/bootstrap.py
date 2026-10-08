@@ -8,10 +8,15 @@ from contextlib import closing
 
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+import hashlib
+import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
 import sys
+import tempfile
+import time
 
 from loop_manager_internal.git import manager_git_journal
 from .contracts import RuntimeMutation, RuntimeWorktree, WorkspaceOwnershipError
@@ -19,8 +24,66 @@ from .process_lock import _held_process_lock_identity
 from .runtime_identity import (
     _canonical_path, _read_runtime_intent, _record_legacy_runtime_adoption,
     _validate_legacy_runtime_adoption, _write_runtime_intent,
-    expected_runtime_worktree, runtime_child_arguments,
+    expected_runtime_worktree, runtime_child_arguments, runtime_repository_id,
 )
+
+
+_RUNTIME_BYTECODE_PREPARE = r'''
+import importlib.util, json, marshal, pathlib, py_compile, sys, types
+
+counts = {"created": 0, "reused": 0, "replaced": 0, "unavailable": 0, "missing": 0}
+request = json.load(sys.stdin)
+
+def valid_cache(data, source_bytes):
+    try:
+        return (
+            len(data) >= 16
+            and data[:4] == importlib.util.MAGIC_NUMBER
+            and int.from_bytes(data[4:8], "little") == 3
+            and data[8:16] == importlib.util.source_hash(source_bytes)
+            and isinstance(marshal.loads(data[16:]), types.CodeType)
+        )
+    except (EOFError, TypeError, ValueError, OverflowError, RecursionError):
+        return False
+
+for name in request["sources"]:
+    source = pathlib.Path(name)
+    try:
+        if source.is_symlink() or not source.is_file():
+            counts["unavailable"] += 1
+            continue
+        source_bytes = source.read_bytes()
+        cache = pathlib.Path(importlib.util.cache_from_source(str(source.absolute())))
+        if cache.is_symlink():
+            counts["unavailable"] += 1
+            continue
+        try:
+            data = cache.read_bytes()
+        except FileNotFoundError:
+            data = None
+        except OSError:
+            counts["unavailable"] += 1
+            continue
+        if data is not None and valid_cache(data, source_bytes):
+            counts["reused"] += 1
+            continue
+        existed = data is not None
+        if not request["write_enabled"]:
+            counts["unavailable" if existed else "missing"] += 1
+            continue
+        py_compile.compile(
+            str(source.absolute()), str(cache), doraise=True,
+            invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH,
+        )
+        if not valid_cache(cache.read_bytes(), source_bytes):
+            counts["unavailable"] += 1
+            continue
+        counts["replaced" if existed else "created"] += 1
+    except (OSError, ValueError, py_compile.PyCompileError):
+        counts["unavailable"] += 1
+print(json.dumps(counts))
+'''
+_DEFAULT_BYTECODE_PREFIX_MARKER = "LOOP_MANAGER_RUNTIME_DEFAULT_PYCACHEPREFIX"
 
 
 @dataclass(frozen=True)
@@ -45,6 +108,97 @@ class BootstrapService:
         self.effects = effects
         self.runtime_root = runtime_root
         self.interpreter = interpreter if interpreter is not None else sys.executable
+
+
+    def _runtime_bytecode_cache_prefix(
+        self, source: Path, state_dir: Path, runtime: RuntimeWorktree,
+    ) -> Path:
+        """Keep standard Python caches outside disposable exact-revision worktrees."""
+        interpreter = Path(self.interpreter).expanduser().resolve()
+        try:
+            metadata = interpreter.stat()
+            identity = "\0".join((
+                str(interpreter), str(metadata.st_dev), str(metadata.st_ino),
+                str(metadata.st_size), str(metadata.st_mtime_ns),
+            ))
+        except OSError:
+            identity = str(interpreter)
+        interpreter_key = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:20]
+        cache_tag = sys.implementation.cache_tag or "untagged"
+        return (_canonical_path(state_dir) / "runtime-bytecode" / runtime_repository_id(source)
+                / runtime.commit_sha / f"{cache_tag}-{interpreter_key}")
+
+
+    def _runtime_child_environment(
+        self,
+    ) -> dict[str, str]:
+        environment = dict(os.environ)
+        environment.pop(_DEFAULT_BYTECODE_PREFIX_MARKER, None)
+        if sys.dont_write_bytecode:
+            environment["PYTHONDONTWRITEBYTECODE"] = "1"
+        if sys.pycache_prefix is not None:
+            environment["PYTHONPYCACHEPREFIX"] = sys.pycache_prefix
+        if (sys.pycache_prefix is None and not any(
+            key.casefold() == "pythonpycacheprefix" and value
+            for key, value in environment.items()
+        )):
+            environment[_DEFAULT_BYTECODE_PREFIX_MARKER] = "1"
+        return environment
+
+
+    def _runtime_cache_prefix(
+        self, source: Path, state_dir: Path, runtime: RuntimeWorktree,
+    ) -> str:
+        if sys.pycache_prefix is not None:
+            return sys.pycache_prefix
+        selected = next((value for key, value in os.environ.items()
+                         if key.casefold() == "pythonpycacheprefix" and value), None)
+        return selected or str(self._runtime_bytecode_cache_prefix(source, state_dir, runtime))
+
+
+    def _prepare_runtime_bytecode_cache(
+        self, runtime: RuntimeWorktree, environment: Mapping[str, str], cache_prefix: str,
+    ) -> bool:
+        write_enabled = not (sys.dont_write_bytecode or any(
+            key.casefold() == "pythondontwritebytecode" and value
+            for key, value in environment.items()
+        ))
+        started = time.perf_counter()
+        try:
+            result = self.effects.git(runtime.path, "ls-files", "-z", check=False)
+            if result.returncode:
+                raise RuntimeError("tracked runtime source 목록을 확인하지 못했습니다.")
+            tracked = result.stdout
+            if isinstance(tracked, bytes):
+                tracked = os.fsdecode(tracked)
+            sources = [path for path in tracked.split("\0") if path.endswith(".py")
+                       and (path == "loop_manager.py" or path.startswith("loop_manager_internal/"))]
+            if not sources:
+                return False
+            prepared = subprocess.run(
+                [self.interpreter, "-X", f"pycache_prefix={cache_prefix}",
+                 "-S", "-c", _RUNTIME_BYTECODE_PREPARE],
+                input=json.dumps({"sources": sources, "write_enabled": write_enabled}),
+                cwd=runtime.path, env=dict(environment),
+                capture_output=True, text=True, check=False,
+            )
+            if prepared.returncode:
+                raise RuntimeError("Python cache 사전 검증 프로세스가 실패했습니다.")
+            counts = json.loads(prepared.stdout)
+            self.effects.operation_log(
+                "runtime Python bytecode cache: "
+                f"checked-hash created={counts['created']} reused={counts['reused']} "
+                f"replaced={counts['replaced']} unavailable={counts['unavailable']} "
+                f"missing={counts['missing']} write_enabled={write_enabled} "
+                f"seconds={time.perf_counter() - started:.3f}"
+            )
+            return counts["unavailable"] > 0
+        except (OSError, RuntimeError, ValueError, KeyError, TypeError) as error:
+            self.effects.operation_log(
+                "runtime Python bytecode cache 사전 확인을 건너뜀: "
+                f"{error} (seconds={time.perf_counter() - started:.3f})", error=True,
+            )
+            return True
 
 
     def validate_runtime_worktree(self,
@@ -462,17 +616,49 @@ class BootstrapService:
             config_path=config_path,
             runtime=runtime,
         )
-        completed = subprocess.run(
-            [
-                self.interpreter,
-                "-B",  # Keep immutable runtime imports from creating ignored bytecode.
-                "-u",
-                str(runtime.path / "loop_manager.py"),
-                *child_arguments,
-            ],
-            cwd=runtime.path,
-            check=False,
-        )
+        environment = self._runtime_child_environment()
+        cache_prefix = self._runtime_cache_prefix(source, state_dir, runtime)
+        fallback_cache = None
+        if self._prepare_runtime_bytecode_cache(runtime, environment, cache_prefix):
+            try:
+                fallback_cache = tempfile.TemporaryDirectory(prefix="loop-manager-runtime-bytecode-")
+                cache_prefix = fallback_cache.name
+            except OSError as error:
+                # A source file cannot contain pyc entries beneath it, so imports
+                # use source and best-effort cache writes fail without temp storage.
+                cache_prefix = str(runtime.path / "loop_manager.py")
+                self.effects.operation_log(
+                    "runtime Python bytecode cache 임시 디렉터리 생성 실패; "
+                    f"source fallback 사용: {error}", error=True,
+                )
+            if environment.get(_DEFAULT_BYTECODE_PREFIX_MARKER) != "1":
+                environment["PYTHONPYCACHEPREFIX"] = cache_prefix
+            self.effects.operation_log(
+                "runtime Python bytecode cache: 검증되지 않은 cache를 피하기 위해 임시 prefix 사용"
+            )
+        try:
+            completed = subprocess.run(
+                [
+                    self.interpreter,
+                    *(["-B"] if sys.dont_write_bytecode else []),
+                    "-X",
+                    f"pycache_prefix={cache_prefix}",
+                    "-u",
+                    str(runtime.path / "loop_manager.py"),
+                    *child_arguments,
+                ],
+                cwd=runtime.path,
+                check=False,
+                env=environment,
+            )
+        finally:
+            if fallback_cache is not None:
+                try:
+                    fallback_cache.cleanup()
+                except OSError as error:
+                    self.effects.operation_log(
+                        f"runtime Python bytecode 임시 cache 정리 보류: {error}", error=True,
+                    )
         if runtime.mutation_id is not None:
             try:
                 self.remove_runtime_worktree(source, state_dir, runtime)

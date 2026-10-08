@@ -55,7 +55,10 @@ class PlannerSessionsTest(unittest.TestCase):
             worktree = Path(directory) / "worktree"
             worktree.mkdir()
             state_dir = Path(directory) / "state"
-            with mock.patch(
+            with mock.patch.dict(os.environ, {
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONPYCACHEPREFIX": "/provider-cache",
+            }), mock.patch(
                 "loop_manager.codex_model_efforts",
                 return_value={"test-strong": frozenset({"xhigh"})},
             ), mock.patch(
@@ -97,8 +100,9 @@ class PlannerSessionsTest(unittest.TestCase):
         self.assertIn(started.session_id, calls[1])
         self.assertEqual(call_options[0]["cwd"], worktree)
         self.assertEqual(call_options[1]["cwd"], worktree)
-        self.assertNotIn("PYTHONDONTWRITEBYTECODE", call_options[0]["env"])
-        self.assertNotIn("PYTHONDONTWRITEBYTECODE", call_options[1]["env"])
+        for options in call_options:
+            self.assertEqual(options["env"]["PYTHONDONTWRITEBYTECODE"], "1")
+            self.assertEqual(options["env"]["PYTHONPYCACHEPREFIX"], "/provider-cache")
 
     def test_planner_environment_does_not_override_parent_bytecode_policy(self):
         parent_environment = {
@@ -113,10 +117,10 @@ class PlannerSessionsTest(unittest.TestCase):
             worker_codex = loop_manager.agent_environment("codex", "worker")
             self.assertEqual(os.environ["PYTHONDONTWRITEBYTECODE"], "0")
 
-        self.assertNotIn("PYTHONDONTWRITEBYTECODE", planner_codex)
-        self.assertNotIn("PYTHONDONTWRITEBYTECODE", planner_claude)
-        self.assertNotIn("PYTHONPYCACHEPREFIX", planner_codex)
-        self.assertNotIn("PYTHONDONTWRITEBYTECODE", worker_codex)
+        self.assertEqual(planner_codex["PYTHONDONTWRITEBYTECODE"], "0")
+        self.assertEqual(planner_claude["PYTHONDONTWRITEBYTECODE"], "0")
+        self.assertEqual(worker_codex["PYTHONDONTWRITEBYTECODE"], "0")
+        self.assertEqual(planner_codex["PYTHONPYCACHEPREFIX"], "/parent-cache")
 
     def test_resumed_read_only_codex_keeps_managed_worktree_boundary(self):
         session_id = "0199a213-81c0-7800-8aa1-bbab2a035a53"

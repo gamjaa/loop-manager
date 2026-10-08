@@ -130,7 +130,10 @@ class BootstrapRuntimeTests(OriginScopeFixture, unittest.TestCase):
             return subprocess.CompletedProcess(args, 7)
         def cleanup(*args):
             events.append("remove")
-        with mock.patch.object(loop_manager.subprocess, "run", side_effect=child), mock.patch.object(
+        with mock.patch(
+            "loop_manager.git",
+            return_value=subprocess.CompletedProcess([], 1, stdout="", stderr=""),
+        ), mock.patch.object(loop_manager.subprocess, "run", side_effect=child), mock.patch.object(
             bootstrap.BootstrapService, "remove_runtime_worktree", side_effect=cleanup,
         ) as remove:
             result = loop_manager._bootstrap_service().run_runtime_child(
