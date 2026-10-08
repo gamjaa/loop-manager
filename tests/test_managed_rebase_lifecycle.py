@@ -37,7 +37,51 @@ class SimulatedProcessExit(BaseException):
     pass
 
 
+def _restart_execution_effects(effects, database, repo):
+    effects.state.connection.commit()
+    effects.state.connection.close()
+    connection = sqlite3.connect(database)
+    connection.row_factory = sqlite3.Row
+    return replace(effects, state=ExecutionStatePort(
+        connection, runtime_state.RuntimeStateRepository(connection), repo),
+        checkpoint=ExecutionCheckpointRepository(connection))
+
+
 class RebaseObservationFailureTests(unittest.TestCase):
+    def test_restarted_fixture_updates_audit_on_current_connection_and_keeps_checkpoint(self):
+        fixture = execution_fixture(self)
+        with TemporaryDirectory() as directory:
+            database = Path(directory) / 'execution.db'
+            connection = sqlite3.connect(database)
+            self.addCleanup(connection.close)
+            fixture.connection.commit()
+            fixture.connection.backup(connection)
+            connection.row_factory = sqlite3.Row
+            effects = replace(fixture.effects, state=ExecutionStatePort(
+                connection, runtime_state.RuntimeStateRepository(connection), fixture.repo),
+                checkpoint=ExecutionCheckpointRepository(connection))
+            effects.state.update_project(fixture.repo, worker_session_id='saved-worker')
+            effects.checkpoint.record(fixture.repo, 'G-047', expected_generation=0,
+                operation='rebase', expected_head='saved-head', target_base_oid='base',
+                observed_remote_oid=None, snapshot={'failure': 'prior failure'})
+            checkpoint = effects.checkpoint.get(fixture.repo, 'G-047')
+            for count in (1, 2):
+                previous = effects.state.repository
+                effects = _restart_execution_effects(effects, database, fixture.repo)
+                self.addCleanup(effects.state.connection.close)
+                with self.assertRaises(sqlite3.ProgrammingError):
+                    previous.projected(fixture.repo)
+                effects.state.repository.update_plan(fixture.repo, 'G-047', plan_values={
+                    'retry_count': count, 'verify_failure_history': '["prior failure"]'}, enqueue=False)
+                effects.state.expected = effects.state.repository.projected(fixture.repo)
+                self.assertEqual(effects.state.active_execplan(fixture.repo)['retry_count'], count)
+                self.assertEqual(effects.state.active_execplan(fixture.repo)['verify_failure_history'],
+                                 '["prior failure"]')
+                self.assertEqual(effects.state.row()['worker_session_id'], 'saved-worker')
+                self.assertEqual(effects.checkpoint.get(fixture.repo, 'G-047'), checkpoint)
+                self.assertIs(effects.checkpoint.connection, effects.state.connection)
+            fixture.effects.workspace.git.assert_not_called()
+
     def test_preflight_database_failure_preserves_publication_intent(self):
         intent = {'remote_before': 'old', 'head': 'new'}
         current = SimpleNamespace(
@@ -417,13 +461,8 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
 
             def restart():
                 nonlocal connection, effects
-                connection.commit()
-                connection.close()
-                connection = sqlite3.connect(database)
-                connection.row_factory = sqlite3.Row
-                effects = replace(effects, state=ExecutionStatePort(
-                    connection, runtime_state.RuntimeStateRepository(connection), repo_key),
-                    checkpoint=ExecutionCheckpointRepository(connection))
+                effects = _restart_execution_effects(effects, database, repo_key)
+                connection = effects.state.connection
                 return new_handler()
 
             if legacy:
@@ -500,9 +539,9 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 git(repo, 'fetch', 'origin')
                 fixture.remote = git(repo, 'rev-parse', 'HEAD').stdout.strip()
                 connection.execute('UPDATE exec_plans SET current_revision_sha=?', (fixture.remote,))
-                repository.update_plan(repo_key, 'G-047', plan_values={
+                effects.state.repository.update_plan(repo_key, 'G-047', plan_values={
                     'retry_count': 2, 'verify_failure_history': '["prior failure"]'}, enqueue=False)
-                effects.state.expected = repository.projected(repo_key)
+                effects.state.expected = effects.state.repository.projected(repo_key)
                 def git_state():
                     return (git(worktree, 'rev-parse', 'HEAD').stdout,
                             git(worktree, 'rev-parse', 'REBASE_HEAD').stdout,
