@@ -9,25 +9,14 @@ from tests.support.worker import dummy_worker_sessions
 
 
 class PrConflictScopeTest(PrRecoveryFixture, unittest.TestCase):
-    def _add_ignored_cache(self, worktree: Path) -> Path:
-        exclude = Path(
-            git_command(worktree, "rev-parse", "--git-path", "info/exclude")
-        )
-        if not exclude.is_absolute():
-            exclude = worktree / exclude
-        exclude.write_text(
-            exclude.read_text(encoding="utf-8") + "\n__pycache__/\n",
-            encoding="utf-8",
-        )
-        cache = worktree / "__pycache__/verify.cpython-312.pyc"
-        cache.parent.mkdir()
-        cache.write_bytes(b"ignored verify artifact")
-        self.assertEqual(git_command(worktree, "status", "--porcelain"), "")
-        self.assertNotIn(
-            cache.relative_to(worktree).as_posix(),
-            loop_manager.capture_git_snapshot(worktree).dirty,
-        )
-        return cache
+    def test_shared_ignored_cache_preparation_is_clean_and_absent_from_snapshot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, _, _, _, worktree, _, _ = self._pr_open_state(directory)
+            cache = self._add_ignored_cache(worktree)
+            self.assertTrue(cache.is_file())
+            self.assertEqual(git_command(worktree, "status", "--porcelain"), "")
+            self.assertNotIn(cache.relative_to(worktree).as_posix(),
+                             loop_manager.capture_git_snapshot(worktree).dirty)
 
     @dummy_worker_sessions
     def test_unknown_and_mergeable_prs_do_not_rebase_run_agents_or_push(self):

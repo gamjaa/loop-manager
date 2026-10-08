@@ -36,27 +36,6 @@ class LivePullRequestObservationTests(unittest.TestCase):
 
 
 class PrConflictCorrectionsTestFixture(PrRecoveryFixture):
-    def _add_ignored_cache(self, worktree: Path) -> Path:
-        exclude = Path(
-            git_command(worktree, "rev-parse", "--git-path", "info/exclude")
-        )
-        if not exclude.is_absolute():
-            exclude = worktree / exclude
-        exclude.write_text(
-            exclude.read_text(encoding="utf-8") + "\n__pycache__/\n",
-            encoding="utf-8",
-        )
-        cache = worktree / "__pycache__/verify.cpython-312.pyc"
-        cache.parent.mkdir()
-        cache.write_bytes(b"ignored verify artifact")
-        self.assertEqual(git_command(worktree, "status", "--porcelain"), "")
-        self.assertNotIn(
-            cache.relative_to(worktree).as_posix(),
-            loop_manager.capture_git_snapshot(worktree).dirty,
-        )
-        return cache
-
-
 class PrConflictLeaseTests(PrConflictCorrectionsTestFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_conflicting_pr_reuses_sessions_revalidates_new_base_and_leases_push(self):
