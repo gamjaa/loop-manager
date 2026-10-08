@@ -19,7 +19,8 @@ class VerifyWindowsTests(unittest.TestCase):
             scripts = root / 'scripts'
             scripts.mkdir(parents=True)
             shutil.copyfile(source, scripts / 'verify.ps1')
-            temporary = root / '.cache/verify/tmp'
+            temporary = root.parent / '.cache/verify/tmp'
+            self.assertFalse(temporary.is_relative_to(root))
             sentinel = temporary / 'existing-file'
             harness = Path(directory) / 'check.ps1'
             harness.write_text(r'''
@@ -46,7 +47,7 @@ try {
 } catch {
     if ($env:VERIFY_TEST_RESULT -ne 'throw' -or $_.Exception.Message -ne '테스트용 예외') { throw }
 }
-$expected = Join-Path $env:VERIFY_TEST_ROOT '.cache/verify/tmp'
+$expected = Join-Path (Split-Path -Parent $env:VERIFY_TEST_ROOT) '.cache/verify/tmp'
 if ($script:observed[0] -ne $env:VERIFY_TEST_ROOT) { throw 'checkout에서 실행되지 않았습니다.' }
 foreach ($value in $script:observed[1..4]) {
     if ($value -ne $expected) { throw "잘못된 자식 임시 경로: $value" }
