@@ -190,6 +190,8 @@ class WorkerResultContractTest(unittest.TestCase):
             "Result: PASS\n"
             "cargo test --package api\n"
             "test result: ok, 3 passed, 0 failed\n"
+            "python3 tests/test_api.py\n"
+            "Result: PASS\n"
             "unrelated raw log: omit this"
         )
 
@@ -199,6 +201,17 @@ class WorkerResultContractTest(unittest.TestCase):
         self.assertIn("Result: PASS", compact)
         self.assertIn("cargo test --package api", compact)
         self.assertIn("test result: ok, 3 passed, 0 failed", compact)
+        self.assertIn("python3 tests/test_api.py", compact)
+        self.assertIn("Result: PASS", compact)
+        self.assertEqual(
+            compact,
+            "go test ./internal/foo -run TestFoo\n"
+            "Result: PASS\n"
+            "cargo test --package api\n"
+            "test result: ok, 3 passed, 0 failed\n"
+            "python3 tests/test_api.py\n"
+            "Result: PASS",
+        )
         self.assertNotIn("unrelated raw log", compact)
 
     def test_targeted_test_evidence_requires_a_clean_explicit_rerun(self):

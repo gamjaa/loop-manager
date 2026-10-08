@@ -59,16 +59,21 @@ def latest_decision(connection, selection):
 
 
 def _observation_matches(receipt, observation):
-    if observation is None or not getattr(observation, 'proven', False):
+    if observation is None:
         # A direct run is bound to its candidate HEAD; reuse needs a proven observation.
         return True
+    observed_fingerprint = getattr(observation, 'fingerprint', None)
+    if not isinstance(observed_fingerprint, str) or not observed_fingerprint:
+        return False
     try:
         original = json.loads(receipt['observation'])
     except (KeyError, TypeError, ValueError):
         return False
+    if not isinstance(original, dict):
+        return False
     return (
         original.get('fingerprint') == receipt['fingerprint']
-        and receipt['fingerprint'] == observation.fingerprint
+        and receipt['fingerprint'] == observed_fingerprint
     )
 
 

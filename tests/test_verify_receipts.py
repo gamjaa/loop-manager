@@ -186,6 +186,17 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
             self.connection, 'repo', 'G-047', 'original-head', '',
             inputs.InputObservation('changed-inputs'),
         ))
+        unproven_changed_inputs = inputs.InputObservation(
+            'changed-inputs',
+            observation.files,
+            observation.uncovered,
+            observation.completeness_token,
+            'verify command or runtime inputs are unconfirmed',
+        )
+        self.assertIsNone(verify_receipts.candidate_evidence(
+            self.connection, 'repo', 'G-047', 'original-head', '',
+            unproven_changed_inputs,
+        ))
         origin = verify_receipts.success(
             self.connection, selection, observation,
         )

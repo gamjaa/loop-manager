@@ -40,6 +40,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import sqlite3
 
@@ -793,6 +794,33 @@ def reviewer_targeted_test_reason(test_evidence: str) -> str | None:
     return None
 
 
+def _looks_like_reported_test_command(line: str) -> bool:
+    """Recognize generic executable lines with an option or file argument."""
+    try:
+        words = shlex.split(line.strip())
+    except ValueError:
+        return False
+    if len(words) < 2:
+        return False
+    executable = words[0]
+    if not re.fullmatch(
+        r"(?:[A-Za-z]:)?(?:[A-Za-z0-9_.+-]+[/\\])*[A-Za-z0-9_.+-]+",
+        executable,
+    ):
+        return False
+    if (executable[0].isupper() and "/" not in executable
+            and "\\" not in executable
+            and not executable.lower().endswith((".exe", ".cmd", ".bat"))):
+        return False
+    return any(
+        argument.startswith(("-", "./", "../", "/", ".\\", "..\\", "\\"))
+        or "/" in argument
+        or "\\" in argument
+        or re.search(r"\.[A-Za-z0-9]{1,10}$", argument)
+        for argument in words[1:]
+    )
+
+
 def reviewer_targeted_test_evidence(test_evidence: str) -> str:
     """Keep Worker-reported commands and outcomes without forwarding raw logs."""
     reason = reviewer_targeted_test_reason(test_evidence)
@@ -804,7 +832,9 @@ def reviewer_targeted_test_evidence(test_evidence: str) -> str:
     index = 0
     while index < len(lines):
         line = lines[index]
-        if _TARGETED_TEST_COMMAND.search(line) or _INLINE_TEST_COMMAND.search(line):
+        if (_TARGETED_TEST_COMMAND.search(line)
+                or _INLINE_TEST_COMMAND.search(line)
+                or _looks_like_reported_test_command(line)):
             command = line.strip()
             while command.endswith("\\") and index + 1 < len(lines):
                 command = command[:-1].rstrip() + " " + lines[index + 1].strip()
