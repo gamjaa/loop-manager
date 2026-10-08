@@ -61,6 +61,7 @@ class RevisionHandlerPorts:
     _row: Callable[[], Mapping[str, object]]
     _run_managed_rebase: Callable[..., Any]
     guard: Callable[[ExecutionContext], ExecutionContext | ExecutionOutcome]
+    observe_verify_inputs: Callable[..., Any] | None = None
 
 
 class RevisionHandler:
@@ -284,7 +285,10 @@ class RevisionHandler:
             )
             self.ports.operation_print(no_change_error, file=sys.stderr)
             return self.ports._final(no_change_error)
-        self.ports._complete_rebase_intent(context, project_values={
+        unchanged_worker = (decision.phase != 'IMPLEMENTING'
+                            and context.phase is not ExecutionPhase.IMPLEMENTING
+                            and not bool(decision.deltas & WORKER_INVALIDATING_DELTAS))
+        self.ports._complete_rebase_intent(context, worker_definition=snapshot if unchanged_worker else None, project_values={
             'phase': 'WORKING', 'active_sha': latest_sha,
             'validated_base_sha': None, 'last_error': None,
             'verify_result': None, 'review_result': None,
@@ -293,7 +297,10 @@ class RevisionHandler:
         })
         from loop_manager_internal.execution.manual_candidate import get_manual
         manual=get_manual(self.ports.state)
-        resumed_phase='VERIFYING' if manual and manual.user_submission(row) else 'IMPLEMENTING'
+        retained_worker = (unchanged_worker and row['worker_result']
+                           and row['worker_input_token'] == snapshot.worker_token
+                           and row['archive_token'] == snapshot.archive_token)
+        resumed_phase='VERIFYING' if retained_worker or (manual and manual.user_submission(row)) else 'IMPLEMENTING'
         self._install_revision_state(
             snapshot,
             replace(decision, kind=RevisionGateKind.INVALIDATE_TO_PHASE, phase=resumed_phase),
@@ -384,6 +391,9 @@ class RevisionHandler:
                 except RuntimeError as error:
                     return ExecutionOutcome(ExecutionOutcomeKind.STABLE_WAIT,context=context,detail=str(error))
             else:
+                observed_body = self.ports.body_hash(
+                    self.ports.identity.repo_path, latest_sha, str(catalog_plan['path'])
+                )
                 snapshot = DefinitionSnapshot(
                     revision_sha=latest_sha,
                     path=str(catalog_plan['path']),
@@ -393,9 +403,9 @@ class RevisionHandler:
                     complexity=str(catalog_plan['current_complexity'] or self.ports.snapshot().plan['complexity']),
                     risk=str(catalog_plan['current_risk'] or self.ports.snapshot().plan['risk']),
                     priority=str(catalog_plan['priority']),
-                    body_hash=self.ports.body_hash(
-                        self.ports.identity.repo_path, latest_sha, str(catalog_plan['path'])
-                    ),
+                    body_hash=str(observed_body),
+                    body_text=(observed_body.body_text
+                               if isinstance(getattr(observed_body, 'body_text', None), str) else None),
                     source_fingerprint=self.ports.source_fingerprint(
                         self.ports.identity.repo_path, latest_sha, catalog_plan
                     ),
@@ -410,6 +420,18 @@ class RevisionHandler:
             previous = DefinitionSnapshot.deserialize(
                 self.ports._row()['definition_snapshot']
             )
+            if previous is not None and previous.body_text is None and snapshot.body_text is not None:
+                # Upgrade only from the original revision, never today's plan.
+                original = self.ports.body_hash(
+                    self.ports.identity.repo_path, previous.revision_sha, previous.path,
+                )
+                if original == previous.body_hash and isinstance(getattr(original, 'body_text', None), str):
+                    old_token = previous.worker_token
+                    previous = replace(previous, body_text=original.body_text)
+                    if self.ports._row()['worker_input_token'] == old_token:
+                        self.ports.state.update_project(
+                            self.ports.identity.repo, worker_input_token=previous.worker_token,
+                        )
             unmet = self.ports.unmet_dependencies(
                 self.ports.identity.repo, str(catalog_plan['plan_id'])
             )
@@ -443,6 +465,20 @@ class RevisionHandler:
         candidate_head = self.ports.git(
             context.worktree, 'rev-parse', 'HEAD'
         ).stdout.strip()
+        from loop_manager_internal.storage import verify_receipts
+        from loop_manager_internal.verification.inputs import InputObservation
+        reused = verify_receipts.reused_candidate(self.ports.state.connection,
+            self.ports.identity.repo, context.plan.plan_id, candidate_head,
+            str(row['verify_result']) if row['verify_result'] is not None else None)
+        reusable_now = True
+        if reused is not None:
+            observer = self.ports.observe_verify_inputs
+            try:
+                observed = observer(context.worktree) if observer else None
+                reusable_now = (isinstance(observed, InputObservation) and observed.proven
+                                and observed.fingerprint == reused['fingerprint'])
+            except (OSError, RuntimeError, ValueError):
+                reusable_now = False
         decision = decide_revision_gate(
             phase=ExecutionPhase(str(catalog_plan['status'])).value,
             # Rows created before G-037 have valid phase artifacts but no
@@ -460,7 +496,7 @@ class RevisionHandler:
                 worker_candidate_token=((self.ports.checkpoint.get(self.ports.identity.repo, context.plan.plan_id).snapshot or {}).get('worker_candidate_token')
                                         if self.ports.checkpoint else None),
                 worker_result=row['worker_result'] is not None,
-                verify_result=(manual.valid_evidence(context,'verify',row['verify_result'])
+                verify_result=reusable_now and (manual.valid_evidence(context,'verify',row['verify_result'])
                                if manual and manual.enabled() else row['verify_result'] is not None),
                 verify_output=(str(row['verify_result'])
                                if row['verify_result'] is not None else None),

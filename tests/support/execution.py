@@ -179,7 +179,8 @@ class ExecutionFixture:
             return_value='test-rebase-token',
         )
         self.handler._finish_rebase_journal = mock.Mock(return_value=True)
-        def fake_complete_rebase(context, *, project_values=None):
+        def fake_complete_rebase(context, *, project_values=None, worker_definition=None):
+            prior = self.state.row()
             checkpoint = self.handler.effects.checkpoint
             if checkpoint is not None:
                 current = checkpoint.get(self.repo, context.plan.plan_id)
@@ -194,6 +195,12 @@ class ExecutionFixture:
             from loop_manager_internal.git.managed_rebase_adoption import revalidation_values
             target = (project_values or {}).get('active_sha') or self.remote
             self.state.update_project(self.repo, **revalidation_values(target))
+            if (worker_definition is not None and prior['worker_result']
+                    and prior['worker_input_token'] == worker_definition.worker_token
+                    and prior['archive_token'] == worker_definition.archive_token):
+                self.state.update_project(self.repo, phase='VERIFYING',
+                    worker_result=prior['worker_result'], worker_input_token=prior['worker_input_token'],
+                    archive_token=prior['archive_token'])
         self.handler._complete_rebase_intent = mock.Mock(side_effect=fake_complete_rebase)
         def fake_current_service(context, **options):
             from loop_manager_internal.git.managed_rebase_validation import RebaseDecision, RebaseStatus, Remote

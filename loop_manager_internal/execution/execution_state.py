@@ -104,6 +104,37 @@ class ExecutionStatePort:
                 expected, transition_id, session_id, binding,
             )
 
+    def retain_clean_rebase_worker(self, prior, definition, checkpoints):
+        """Bind an unchanged implementation result after a completed clean rebase.
+
+        Called only by the successful Manager invocation, never conflict or
+        interrupted-result adoption. Validation and Review remain invalidated.
+        """
+        if (not prior['worker_result'] or prior['worker_input_token'] != definition.worker_token
+                or prior['archive_token'] != definition.archive_token):
+            return
+        with runtime_state._transaction(self.connection):
+            self.check()
+            current = checkpoints.get(self.repo, self.plan_id)
+            accepted = (current.snapshot or {}).get('current_rebase_acceptance')
+            from loop_manager_internal.git.managed_rebase_validation import valid_acceptance
+            if (not valid_acceptance(accepted) or current.operation is not None
+                    or accepted['repo'] != self.repo or accepted['plan_id'] != self.plan_id
+                    or accepted['head'] != current.expected_head
+                    or accepted['target_base_oid'] != current.target_base_oid
+                    or accepted['target_base_oid'] != self.expected.active_sha
+                    or accepted['branch'] != self.expected.branch
+                    or accepted['worktree'] != self.expected.worktree):
+                return
+            checkpoints.record(self.repo, self.plan_id, expected_generation=current.generation,
+                operation=None, expected_head=current.expected_head,
+                target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+                snapshot={**current.snapshot,
+                          'worker_candidate_token': definition.worker_candidate_token(current.expected_head)})
+            self.update_project(self.repo, preserve_transaction=True, phase='VERIFYING',
+                worker_result=prior['worker_result'], worker_input_token=prior['worker_input_token'],
+                archive_token=prior['archive_token'], revision_resume_status=None)
+
     def confirm_existing_pr_push(self, checkpoints, head):
         """Advance the owned PR receipt and clear its push intent atomically."""
         if checkpoints is None or checkpoints.connection is not self.connection:

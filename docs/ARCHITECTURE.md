@@ -329,7 +329,15 @@ Git·journal 파일·SQLite는 단일 원자 transaction이 아니다. 저장 in
 
 현재 rebase 정책은 작업 수행 이력을 필수 증거로 삼던 R-045 설계를 대체한다. 자동 Worker 교정과 사용자 수동 해결·stage·continue·완료를 같은 현재 상태 판정으로 다룬다. 과거 기록은 감사 자료로 보존하며 누락 자체를 거부 조건으로 사용하지 않는다.
 
-Worker 결과와 작업 범위를 확인한 뒤 최신 `origin/<base-branch>`를 fetch하고 소유 변경을 commit하여 필요한 rebase를 완료한 다음 게시 후보 HEAD에서 전체 검증과 Review를 수행한다. 기준이 안정적이면 한 Worker 결과의 전체 검증은 한 번 수행한다. 이후 base 또는 후보 HEAD가 바뀌면 기존 검증과 Review를 무효화하고 최종 revision을 다시 검증한다
+Worker 결과와 작업 범위를 확인한 뒤 최신 `origin/<base-branch>`를 fetch하고 소유 변경을 commit하여 필요한 rebase를 완료한 다음 게시 후보 HEAD에서 검증 근거와 Review를 판단한다. `RevisionHandler`·`LatestBaseHandler`의 정상 rebase 호출이 충돌 없이 완료되면 source 내용 지문을 포함한 기존 구현 입력 token·archive token·완료 Worker 결과를 대조한다. 일치하는 결과만 현재 수용 HEAD의 `worker_candidate_token`에 checkpoint CAS와 runtime transaction으로 연결해 VERIFYING으로 이어간다. `decide_revision_gate()`가 현재 후보 확인 불일치 등으로 IMPLEMENTING을 요구하면 clean 완료도 그 판정을 유지한다. 구현 교정 중인 작업, 실제 조건 변경, 충돌·미완료·중단 뒤 수용에는 이 예외를 적용하지 않는다. 같은 게시 lease·중간 checkpoint 경계를 유지하며 verify·Review·publication은 독립적으로 무효화한다.
+
+definition snapshot에는 원래 ExecPlan 전문과 전체 body hash를 함께 보존한다. Worker body 비교는 Progress의 체크 상태만 정규화하고 Progress/Decision Log에서 다음 단독 실행 기록 형식만 분리한다(PASS 또는 FAIL, 날짜·명령·test 수는 실제 과거 사실).
+
+```text
+- 2026-10-08 실행 기록: `python3 -m unittest tests.test_code` → PASS (2 tests).
+```
+
+그 밖의 자유 문장·새 조건·승인은 해당 절 안에서도 입력이다. 두 원문과 hash가 일치해야 기록 분리를 적용하며 legacy snapshot은 원래 revision/path를 다시 읽어 저장 hash를 확인한 경우에만 보강한다. 원문이 없으면 현재 기록으로 합성하지 않는다. 전체 definition·verify 단계 token에는 전체 body hash를 유지해 기록 변경을 Review·승인 예외로 확대하지 않는다.
 
 모든 관리 rebase의 시작·충돌 해결·완료·중단 복구는 현재 repository·계획·canonical worktree·소유 branch·target base·원격 OID와 PR identity/head를 확인한다. Worker 교정 turn, 승인 stage tree, 명령 receipt, reflog 표식, 원본 commit별 replay와 journal 완전성은 완료 조건이 아니며 기존 기록과 실패 감사는 보존한다
 
@@ -347,7 +355,7 @@ push 전후 및 SQLite 반영 전 중단에서는 같은 intent와 실제 원격
 
 PR 없는 게시 checkpoint의 원격 OID가 rebased HEAD의 조상이 아니어도 동일 계획의 게시 identity·마지막 채택 원격 OID·현재 branch/worktree·target·허용 최종 변경이 일치하면 소유권을 유지한다. 원격 후속 commit·삭제·재작성과 PR head 변경은 수용하지 않으며 journal/replay 완전성을 ownership 조건으로 다시 요구하지 않는다
 
-rebase로 후보 HEAD 또는 ExecPlan·근거 입력이 바뀌면 이전 Worker 후보 확인·전체 verify·Review·publication 증거를 무효화한다. 기존 또는 정상 fallback Worker 세션이 현재 입력과 최종 diff를 재확인하고 관련 targeted test 결과를 반환한 뒤 Manager 전체 verify와 Reviewer를 다시 통과해야 한다. 같은 확인 후보에서는 Worker를 반복 호출하지 않는다. 수용 자체는 구현 완료·게시 승인·차단 해제가 아니며 중간 checkpoint 게시도 최종 성공을 대신하지 않는다
+rebase로 후보 HEAD 또는 ExecPlan·근거 입력이 바뀌면 전체 verify·Review·publication 증거를 무효화해 입력을 다시 판단한다. 위의 정상 호출에서 증명된 clean rebase는 Worker 결과를 보존하며, 그 밖의 수용은 기존 또는 정상 fallback Worker 세션이 현재 입력과 최종 diff를 재확인하고 관련 targeted test 결과를 반환한다. 같은 확인 후보에서는 Worker를 반복 호출하지 않는다. 수용 자체는 구현 완료·게시 승인·차단 해제가 아니며 중간 checkpoint 게시도 최종 성공을 대신하지 않는다.
 
 현재 결과는 선택 branch/worktree의 비교 기준선에만 반영한다. Agent 원본 snapshot·session·허용 범위와 과거 감사를 보존하고 수동 복구를 Manager 실행·Agent 격리 증거로 표시하지 않는다. 실제 Agent 범위 위반, 다른 Manager Git 작업의 증거와 별도 Review·사용자 결정·planning 차단은 기존 경계를 유지한다
 
@@ -523,7 +531,47 @@ glob의 빈 결과는 관측 가능한 빈 집합이다. 목록 자체와 실제
 예약어는 수동 완료 후보를 포함한 문서 조회와 Requirement retirement에서 제외하고 규칙 내용을
 source 지문에 결합한다. 최종 전문 확인의 후속 계획도 등록 요청 검증을 통과한 예약 source를
 허용하며 활성 명세 전문·구현 근거 및 draft 조건은 유지한다.
-이는 성공 결과 재사용이나 일반 runner 도입을 구현하지 않는다.
+`storage/verify_receipts.py`는 additive `verify_receipt_cycles`와 `verify_receipts`에 작업 주기,
+generation, 실제 run·입력 관측·출력·결과와 reuse의 원래 run·현재 HEAD·이유를 보존한다.
+일반 activation은 새 주기를 만들고 유지보수의 기존 작업 재개는 주기를 보존한다. 구형 활성
+작업은 새 주기부터 시작하며 과거 성공 token을 receipt로 합성하지 않는다. 새 실행 intent는
+현재 receipt 선택을 CAS로 교체해 실패·중단 뒤 오래된 성공으로 되돌아갈 수 없게 한다.
+실행 전후 입력·HEAD·작업 파일과 runtime 소유 상태를 확인하고 성공 receipt와 후보 token을
+같은 transaction에서 확정한다. 저장 경쟁·실패는 현재 후보의 재사용 성공으로 처리하지 않는다.
+수동 waiver는 실제 run 성공 receipt가 아니며 기존 수동 후보 계약을 유지한다.
+
+`ValidationEffects.observe_verify_inputs`는 실제 명령·유효 환경·runtime·Git/외부 identity를
+증명하는 실행 adapter의 관측 경계다. 기본 임의 프로젝트 스크립트 adapter는 해당 동적 입력을
+측정하지 못하므로 unknown으로 반환해 전체 verify를 계속 실행한다. 문자열 분석으로 의존성
+없음을 추정하거나 단순 tree/SHA cache로 대체하지 않는다.
+
+운영 port가 연결한 `result_validation.observe_verify_inputs`는 Linux에서
+`manager_adapter.ISOLATED_COMPILE_SCRIPT`와 전체 bytes가 같은 아래 계약도 지원한다.
+프로젝트가 이 명령을 전체 verify로 선택한 경우에만 적용한다. 실제 명령은 PATH에서 확인한
+Python 절대 경로로 `-I -S -B -c`와 같은 프로그램을 직접 실행하며 source를 실행하거나
+bytecode를 쓰지 않는다. 관측 목록이 제외하는 `.git`·`.venv`·`__pycache__` 아래 source도
+컴파일 대상에서 제외한다. 현재 자체 verify 스크립트와 필수 검증은 그대로 유지한다.
+
+```bash
+#!/usr/bin/env bash
+# loop-manager: isolated-compile-v1
+set -eu
+exec python3 -I -S -B -c 'from pathlib import Path; root = Path("src"); assert root.is_dir(); [compile(path.read_text(encoding="utf-8"), str(path), "exec") for path in root.rglob("*.py") if not {".git", ".venv", "__pycache__"}.intersection(path.relative_to(root).parts)]'
+```
+
+이 고정 계약은 프로젝트 import·site package·Git·네트워크를 사용하지 않는다. 별도 관측
+subprocess가 같은 격리 Python의 executable·sys.path runtime 파일·stdlib·실제 native library
+mapping의 bytes와 mode, Python flags·filesystem encoding·사용자·OS identity를 매번 측정한다.
+관측 프로그램 자체·실행 환경·cwd도 지문에 결합한다. manifest는 script와 src 입력을 모두
+포함해야 하고 입력 누락·symlink·관측 중 변경은 기존 불확실성 계약으로 거부한다. native loader
+hook, runtime 측정 불가/timeout, Linux 이외 환경 및 자체 runner의 추가 조율 환경은 unknown이다.
+임의 스크립트의 의미를 이 계약으로 추정하지 않으며 새 공통 runner를 필수로 요구하지 않는다.
+
+증명된 관측만 같은 주기의 실제
+성공 run과 비교하며 reuse 직전 transaction에서 다시 관측한다. Review·게시 revision gate도
+재사용 후보의 입력을 재관측하고 달라졌거나 관측할 수 없으면 VERIFYING으로 돌아간다.
+reuse는 verify 프로세스·validation 실행 감사·사용량을 새로 만들거나 실패 이력을 초기화하지
+않는다. Reviewer 승인과 최종 publication token·원격 lease는 계속 별도로 판단한다.
 
 ## Architecture Change Policy
 

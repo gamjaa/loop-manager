@@ -108,7 +108,13 @@ def observe(root: Path, *, command: tuple[str, ...], environment: Mapping[str, s
                 mode = before.st_mode
                 kind = "file" if stat.S_ISREG(mode) else "symlink" if stat.S_ISLNK(mode) else "special"
                 content = target.read_bytes() if kind == "file" else os.fsencode(os.readlink(target)) if kind == "symlink" else b""
-                if target.lstat() != before:
+                after = target.lstat()
+                # Reading may update atime; compare file identity and mutation
+                # metadata without treating our own access as an input change.
+                if any(getattr(after, key) != getattr(before, key) for key in (
+                    'st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_uid', 'st_gid',
+                    'st_size', 'st_mtime_ns', 'st_ctime_ns',
+                )):
                     raise ValueError("verify input changed during observation: " + path)
                 inventory.append((path, kind, stat.S_IMODE(mode), hashlib.sha256(content).hexdigest()))
         if manifest.read_bytes() != raw or not stat.S_ISREG(manifest.lstat().st_mode):

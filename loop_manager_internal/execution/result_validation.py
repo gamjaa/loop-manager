@@ -209,15 +209,37 @@ class VerifyEffects:
     run_verify_process: Callable[..., object]
 
 
-def verify(effects: VerifyEffects, worktree: Path, timeout_seconds: int = 600) -> tuple[bool, str]:
-    effects._check_runtime_handoff()
+def verify_arguments(worktree: Path):
     if os.name == "nt":
         script = worktree / "scripts/verify.ps1"
         executable = shutil.which("pwsh") or shutil.which("powershell")
         arguments = [executable or "pwsh", "-NoProfile", "-File", str(script)]
     else:
         script = worktree / "scripts/verify.sh"
-        arguments = ["bash", str(script)]
+        from loop_manager_internal.verification.manager_adapter import isolated_compile_arguments
+        arguments = isolated_compile_arguments(script, worktree) or ["bash", str(script)]
+    return script, arguments
+
+
+def observe_verify_inputs(worktree: Path):
+    """Arbitrary scripts have unmeasured dynamic/Git/external dependencies.
+
+    Never infer their absence from source spelling or a passing invocation.
+    The exact isolated compile contract has a bounded, measured adapter.
+    Everything else keeps the existing full verify fallback.
+    """
+    from loop_manager_internal.verification.manager_adapter import (
+        observe_inputs, observe_isolated_compile, isolated_compile_arguments)
+    script, arguments = verify_arguments(worktree)
+    if arguments == isolated_compile_arguments(script, worktree):
+        return observe_isolated_compile(worktree, script, arguments, dict(os.environ))
+    return observe_inputs(worktree, arguments, environment=dict(os.environ),
+                          runtime_identity=None)
+
+
+def verify(effects: VerifyEffects, worktree: Path, timeout_seconds: int = 600) -> tuple[bool, str]:
+    effects._check_runtime_handoff()
+    script, arguments = verify_arguments(worktree)
     if not script.is_file():
         return False, f"전체 검증 스크립트가 없습니다: {script.relative_to(worktree)}"
     gate = _runtime_handoff_signal.get()

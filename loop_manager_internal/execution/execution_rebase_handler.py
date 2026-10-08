@@ -637,7 +637,7 @@ class RebaseHandler:
                 return reject('approved blob')
         return True
 
-    def _complete_rebase_intent(self, context, *, project_values=None):
+    def _complete_rebase_intent(self, context, *, project_values=None, worker_definition=None):
         checkpoint = self.ports.checkpoint
         if checkpoint is None:
             return
@@ -657,8 +657,11 @@ class RebaseHandler:
                     rebase_observation=(service.expected, observed, decision)):
                 raise manager_git_journal.MutationEvidenceError('current checkpoint remote ownership differs')
 
+        prior = self.ports._row()
         service.adopt(self.ports.state, checkpoint, validate_ownership=validate_ownership)
         self.ports._publish_rebased_checkpoint(context)
+        if worker_definition is not None:
+            self.ports.state.retain_clean_rebase_worker(prior, worker_definition, checkpoint)
 
     def _publish_rebased_checkpoint(self, context):
         if self.ports.checkpoint is None:

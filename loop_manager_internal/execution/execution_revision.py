@@ -111,6 +111,7 @@ class DefinitionSnapshot:
     archive_candidates: tuple[str, ...]
     guidance_hash: str = ""
     worker_guidance_hash: str = ""
+    body_text: str | None = None
 
     def serialize(self) -> str:
         return json.dumps(
@@ -128,6 +129,7 @@ class DefinitionSnapshot:
                 "archive_candidates": list(self.archive_candidates),
                 "guidance_hash": self.guidance_hash,
                 "worker_guidance_hash": self.worker_guidance_hash,
+                "body_text": self.body_text,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -158,6 +160,7 @@ class DefinitionSnapshot:
                 ),
                 guidance_hash=str(payload.get("guidance_hash", "")),
                 worker_guidance_hash=str(payload.get("worker_guidance_hash", "")),
+                body_text=payload.get("body_text"),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise ValueError("저장된 execution definition snapshot이 유효하지 않습니다.") from error
@@ -189,7 +192,8 @@ class DefinitionSnapshot:
         values = (
             self.sources,
             self.depends_on,
-            self.body_hash,
+            self.worker_body_hash,
+            self.source_fingerprint,
             self.archive_candidates,
             self.guidance_hash,
         )
@@ -197,6 +201,12 @@ class DefinitionSnapshot:
         if self.worker_guidance_hash:
             values += (self.worker_guidance_hash,)
         return _digest('worker-input', values)
+
+    @property
+    def worker_body_hash(self) -> str:
+        if isinstance(self.body_text, str) and execplan_body_hash(self.body_text) == self.body_hash:
+            return execplan_worker_body_hash(self.body_text)
+        return self.body_hash
 
     @property
     def archive_token(self) -> str:
@@ -213,6 +223,8 @@ class DefinitionSnapshot:
         verify_output: str | None = None,
     ) -> str:
         values = (self.worker_token, base_token, candidate_head)
+        if self.body_text is not None:
+            values += (self.body_hash,)
         if verify_output is not None:
             # A successful verify marker must describe the output stored beside
             # it, so a later failed attempt cannot inherit stale success.
@@ -244,6 +256,37 @@ def execplan_body_hash(text: str) -> str:
     return hashlib.sha256(body).hexdigest()
 
 
+class ExecPlanBodyHash(str):
+    """Retain the observed original alongside its compatible full-body digest."""
+    def __new__(cls, text: str):
+        value = super().__new__(cls, execplan_body_hash(text))
+        value.body_text = text
+        return value
+
+
+def execplan_worker_body_hash(text: str) -> str:
+    """Normalize only check marks and unambiguous, atomic past test records.
+
+    Free-form prose stays an input even under Progress or Decision Log. This
+    deliberately small grammar does not infer intent from section names.
+    """
+    section = None
+    lines = []
+    # ponytail: Free-form past records cause conservative reassessment; extend
+    # only the explicit fact grammar with regression cases, never omit sections.
+    for line in text.replace('\r\n', '\n').replace('\r', '\n').split('\n'):
+        if line.startswith('#'):
+            section = line if line in {'## Progress', '## Decision Log'} else None
+        if section == '## Progress':
+            line = re.sub(r'^(\s*- \[)[ xX](\] )', r'\1 \2', line)
+        if section and re.fullmatch(
+            r'- \d{4}-\d{2}-\d{2} 실행 기록: `[^`\n]+` → (?:PASS|FAIL) \(\d+ tests\)\.', line,
+        ):
+            continue
+        lines.append(line)
+    return execplan_body_hash('\n'.join(lines))
+
+
 def classify_definition_delta(
     previous: DefinitionSnapshot,
     current: DefinitionSnapshot,
@@ -266,7 +309,12 @@ def classify_definition_delta(
         changed.add(DefinitionDelta.PROFILE)
     if previous.priority != current.priority:
         changed.add(DefinitionDelta.PRIORITY)
-    if previous.body_hash != current.body_hash:
+    # One-sided normalization could accidentally match a legacy full hash.
+    # Both original documents are required for a record-only comparison.
+    previous_body, current_body = previous.body_hash, current.body_hash
+    if previous.body_text is not None and current.body_text is not None:
+        previous_body, current_body = previous.worker_body_hash, current.worker_body_hash
+    if previous_body != current_body:
         changed.add(DefinitionDelta.BODY)
     if previous.source_fingerprint != current.source_fingerprint:
         changed.add(DefinitionDelta.SOURCE_INPUT)
@@ -280,6 +328,7 @@ def classify_definition_delta(
 WORKER_INVALIDATING_DELTAS = frozenset(
     {
         DefinitionDelta.SOURCES,
+        DefinitionDelta.SOURCE_INPUT,
         DefinitionDelta.DEPENDENCIES,
         DefinitionDelta.BODY,
         DefinitionDelta.ARCHIVE_SCOPE,

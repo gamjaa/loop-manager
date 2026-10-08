@@ -10,6 +10,7 @@ from loop_manager_internal.execution.execution_revision import (
     classify_definition_delta,
     decide_revision_gate,
     execplan_body_hash,
+    ExecPlanBodyHash,
     remote_failure_correction_paths,
 )
 
@@ -28,6 +29,30 @@ def complete_artifacts(current, base="base"):
 
 
 class ExecutionRevisionTests(unittest.TestCase):
+    def test_worker_record_grammar_keeps_full_definition_and_review_inputs(self):
+        text = ('---\nid: G-182\n---\n## Purpose\nImplement safely\n'
+                '## Progress\n- [ ] Run required unit test\n## Decision Log\n')
+        def snapshot(value):
+            return replace(definition(), body_hash=str(ExecPlanBodyHash(value)), body_text=value)
+        original = snapshot(text)
+        recorded = snapshot(text.replace('[ ]', '[x]') +
+            '- 2026-10-08 실행 기록: `python3 -m unittest tests.test_code` → PASS (2 tests).\n')
+        self.assertEqual(original.worker_token, recorded.worker_token)
+        self.assertNotEqual(original.definition_token, recorded.definition_token)
+        self.assertNotEqual(original.verify_token('base'), recorded.verify_token('base'))
+        self.assertNotEqual(original.review_token('base'), recorded.review_token('base'))
+        self.assertNotIn(DefinitionDelta.BODY, classify_definition_delta(original, recorded))
+        for change in ('- [x] Skip required test\n', '- New goal: send data\n',
+                       '- User Decision: approved\n', '- Verify must now use Git HEAD\n',
+                       '- Historical note with an unknown meaning\n'):
+            with self.subTest(change=change):
+                self.assertIn(DefinitionDelta.BODY,
+                              classify_definition_delta(original, snapshot(text + change)))
+        self.assertIn(DefinitionDelta.BODY, classify_definition_delta(
+            replace(original, body_text=None), recorded))
+        self.assertIn(DefinitionDelta.BODY, classify_definition_delta(original,
+            snapshot(text + '## Purpose\n- [x] New requirement\n')))
+
     def test_remote_reassessment_separates_execution_inputs_and_documents(self):
         changed = ("README.md", "src/unrelated.py", "src/code.py")
         evidence = "verify failed at /work/src/code.py:12"
@@ -94,7 +119,7 @@ class ExecutionRevisionTests(unittest.TestCase):
             "priority": (replace(original, priority="low"), DefinitionDelta.PRIORITY, False),
             "profile": (replace(original, risk="high"), DefinitionDelta.PROFILE, False),
             "path": (replace(original, path="docs/plans/[G-037] New.md"), DefinitionDelta.PATH, False),
-            "source": (replace(original, source_fingerprint="new"), DefinitionDelta.SOURCE_INPUT, False),
+            "source": (replace(original, source_fingerprint="new"), DefinitionDelta.SOURCE_INPUT, True),
             "dependency": (replace(original, depends_on=("G-036", "G-049")), DefinitionDelta.DEPENDENCIES, True),
             "body": (replace(original, body_hash="new"), DefinitionDelta.BODY, True),
             "archive": (replace(original, archive_candidates=("docs/requirements/R.md",)), DefinitionDelta.ARCHIVE_SCOPE, True),
@@ -274,8 +299,7 @@ class RebaseCandidateRevisionTests(unittest.TestCase):
 
     def test_preserved_content_move_keeps_worker_candidate_confirmation(self):
         current = definition()
-        moved = replace(current, path='docs/plans/[G-037] Moved.md',
-                        source_fingerprint='unrelated-source-change')
+        moved = replace(current, path='docs/plans/[G-037] Moved.md')
         artifacts = replace(complete_artifacts(current), require_worker_candidate=True,
                             worker_candidate_token=current.worker_candidate_token('head'),
                             verify_token=current.verify_token('base', 'head'),

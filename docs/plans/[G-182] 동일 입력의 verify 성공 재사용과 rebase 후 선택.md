@@ -51,10 +51,17 @@ priority: high
 ## Progress
 
 - [x] 2026-10-05 planning 기준 a049a76의 명세·원본·관련 테스트와 비종료 catalog에서 미충족 범위를 확인함. 구현·테스트 실행은 하지 않음.
-- [ ] 구현 및 관련 targeted unit 검증
+- [x] 구현 및 관련 targeted unit 검증: 정상 clean rebase의 완료 Worker 보존, 원문에 결합된 제한적 기록 비교, 작업 주기별 verify run/reuse receipt CAS와 재관측 gate를 구현했다. 임의 스크립트의 미확인 동적·외부 입력은 전체 verify 실행을 유지한다.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
 
 - 2026-10-07 사용자 요청으로 활성 R-072와 계획을 함께 보완했다. G-173의 구현 입력 변경 메시지는 실제 조건 변경과 순수 기록 변화 모두를 구분해 회귀에 연결한다. Progress 체크만의 변경이 BODY/Worker 무효화로 분류되는 현재 경로를 최소 입력으로 확인했지만 운영 사건의 원인은 확정하지 않았으며 새 동작은 미구현이다. G-173의 재승인 lifecycle과 G-183의 Review 재사용을 대신하지 않는다.
 - 후보 채택·검증 input·성공 기록의 결합 때문에 complexity high, 거짓 검증 성공의 영향으로 risk high다. Review 재사용은 G-183에서 별도 판단한다.
+
+## Implementation Notes
+
+- `execution_revision.py`·`plan_validation.py`·`execution_revision_handler.py`: 원래 전문/전체 hash와 Worker 기록 비교를 분리하며 legacy 원문을 원래 revision에서만 보강한다. 자유 문장과 실제 조건 변경은 제외하지 않는다.
+- `execution_rebase_handler.py`·`execution_state.py`·latest-base/revision handler: 정상 호출의 clean 완료만 Worker 결과를 수용 HEAD에 연결한다. `ExecutionHandlers` facade도 Worker definition을 전달한다. 현재 후보 확인 불일치의 IMPLEMENTING 판정을 덮지 않으며 source 내용 지문 변화도 Worker 무효화와 token에 반영한다. 별도 교정·충돌·미완료·중단 복구는 기존 경로를 따른다.
+- `storage/verify_receipts.py`·activation·verify handler: 실제 run intent/성공과 reuse 링크를 주기·generation으로 저장하고 새 실패·중단·저장 경쟁에서 과거 성공 재사용을 차단한다. 측정 가능한 입력은 기존 `verification/inputs.py`를 재사용한다. Linux의 고정 격리 UTF-8 문법 검증 계약은 운영 observer가 Python·stdlib·native runtime을 측정하여 재사용 판정에 연결한다. 임의 동적 스크립트와 관측 불가는 unknown으로 전체 verify를 수행한다. 관측 중 파일 읽기의 atime 갱신은 제외하고 identity·mode·size·mtime·ctime 변화는 계속 거부한다.
+- `tests/test_verify_receipts.py`·`tests/test_execution_revision.py` 및 revision gate의 개별 unit case: 파일/목록/환경/Git 입력 변화, 재사용·실행 중 변화, 새 실패·중단·cycle·CAS·저장 실패·waiver, clean rebase와 교정 보존, 기록 변경·legacy 근거 부재를 검사한다. `tests/test_verify_inputs.py`는 읽기 atime과 실제 변경을 구분하고 플랫폼 API·실행 파일 탐색을 mock으로 분리해 Linux 입력 측정과 Windows 전체 실행 fallback을 검사하며, publication 공통 fixture도 원문과 현재 단계 token을 함께 저장한다. facade 인자 전달·fixture snapshot은 Git/CLI 없는 unit으로 확인한다. PR 충돌 통합 회귀의 후속 clean rebase는 Worker를 추가 호출하지 않는 기대값으로 맞추고 verify·Review·session·lease 검사를 유지한다. 이 조건의 unit은 미확인 검증 입력에서 verify 재실행과 Review 재진입을 확인한다. `tests/test_managed_rebase_lifecycle.py`의 두 Manager 전용 회귀는 실제 Git 충돌에서 원문에 결합된 기록 변경과 같은 절의 새 조건을 각각 SQLite 종료·재개와 결합한다. 실제 HEAD·REBASE_HEAD·index stage·diff·operation, session·retry·실패 이력 보존과 같은 Worker 재개/조건 변경 거부를 확인하고 후속 verify·게시를 반복하지 않는다. 실제 전체 verify·Git lifecycle·Manager 전체 검증은 이 Worker에서 실행하지 않았다.

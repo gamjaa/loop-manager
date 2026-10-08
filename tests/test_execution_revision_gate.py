@@ -7,7 +7,8 @@ from unittest import TestCase, mock
 
 from loop_manager_internal.execution import execution_handlers as handlers
 from loop_manager_internal.execution import plan_validation
-from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
+from loop_manager_internal.execution.execution_revision import DefinitionSnapshot, ExecPlanBodyHash
+from dataclasses import replace
 from loop_manager_internal.git.command_adapter import ExternalObservationError
 import loop_manager as lm
 from loop_manager_internal.catalog.requirement_archive import ArchiveSnapshot
@@ -21,6 +22,45 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 
 class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+    def test_conflicted_rebase_uses_original_legacy_body_for_record_comparison(self):
+        self.handler.guard(self.context())
+        text = '---\nid: G-047\n---\n## Purpose\nImplement\n## Progress\n- [ ] Run unit test\n'
+        original = ExecPlanBodyHash(text)
+        previous = replace(self.handler._definition_snapshot, body_hash=str(original))
+        self.state.update_project('repo', phase='WORKING', definition_snapshot=previous.serialize(),
+            worker_session_id='saved-session', worker_result=READY_WORKER_RESULT,
+            worker_input_token=previous.worker_token,
+            last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict')
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.remote = 'new-base'
+        current = ExecPlanBodyHash(text.replace('[ ]', '[x]'))
+        self.effects.revision.body_hash.side_effect = lambda _repo, revision, _path: (
+            original if revision == 'base' else current)
+        result = self.handler.guard(self.context())
+        self.assertNotIsInstance(result, ExecutionOutcome)
+        self.assertEqual(self.state.row()['worker_session_id'], 'saved-session')
+        self.assertEqual(self.state.row()['worker_result'], READY_WORKER_RESULT)
+        self.assertEqual(self.state.row()['definition_snapshot'], previous.serialize())
+        self.assertNotIn('rebase', self.calls)
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
+    def test_conflicted_rebase_without_original_body_cannot_ignore_records(self):
+        self.handler.guard(self.context())
+        text = '---\nid: G-047\n---\n## Progress\n- [ ] Run unit test\n'
+        previous = replace(self.handler._definition_snapshot, body_hash=str(ExecPlanBodyHash(text)))
+        self.state.update_project('repo', phase='WORKING', definition_snapshot=previous.serialize(),
+            worker_session_id='saved-session', last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict')
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.remote = 'new-base'
+        self.effects.revision.body_hash.side_effect = lambda _repo, revision, _path: (
+            'unavailable-original' if revision == 'base' else ExecPlanBodyHash(text.replace('[ ]', '[x]')))
+        result = self.handler.guard(self.context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertIn('ExecPlan 구현 입력', result.detail)
+        self.assertEqual(self.state.row()['worker_session_id'], 'saved-session')
+
     def test_revision_document_observation_failure_preserves_worker_session(self):
         self.state.update_project('repo', worker_session_id='saved-session')
         def git(_repo, operation, *args, **kwargs):
@@ -100,7 +140,7 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
         self.assertEqual(completed.review_token, snapshot.review_token('base', 'base'))
 
 
-    def test_source_revision_without_execplan_change_keeps_specification_artifacts(self):
+    def test_source_revision_without_execplan_change_invalidates_worker_but_keeps_sessions(self):
         guarded = self.handler.guard(self.context())
         self.assertNotIsInstance(guarded, handlers.ExecutionOutcome)
         snapshot = DefinitionSnapshot.deserialize(
@@ -126,12 +166,12 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
 
         outcome = self.handler.guard(self.handler._context())
 
-        self.assertNotIsInstance(outcome, ExecutionOutcome)
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
         row = self.state.row()
-        self.assertEqual(row['phase'], 'PUBLISHING')
-        self.assertEqual(row['worker_result'], 'worker-result')
-        self.assertEqual(row['verify_result'], 'verify-result')
-        self.assertEqual(row['review_result'], 'review-result')
+        self.assertEqual(row['phase'], 'WORKING')
+        self.assertIsNone(row['worker_result'])
+        self.assertIsNone(row['verify_result'])
+        self.assertIsNone(row['review_result'])
         self.assertEqual(row['worker_session_id'], 'worker-session')
         self.assertEqual(row['reviewer_session_id'], 'reviewer-session')
         self.assertEqual(row['branch'], 'loop-manager/G-047')

@@ -15,7 +15,7 @@ from loop_manager_internal.application.contracts import ReviewerProtocolError
 from loop_manager_internal.application.contracts import TRANSIENT_AGENT_ERROR_PREFIX
 from loop_manager_internal.application.contracts import USAGE_LIMIT_ERROR_PREFIX
 from loop_manager_internal.application.contracts import WorkerResultError
-from loop_manager_internal.execution import execution_handlers
+from loop_manager_internal.execution import execution_handlers, result_validation
 from loop_manager_internal.execution.execution_state import ExecutionStatePort as _ExecutionStatePort
 from loop_manager_internal.execution.verify_process import VerifyTerminationUncertain
 from loop_manager_internal.git import manager_git_journal
@@ -222,6 +222,10 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
             ),
         ),
         validation=execution_handlers.ValidationEffects(
+            observe_verify_inputs=state.bind(
+                result_validation.observe_verify_inputs,
+                name="observe_verify_inputs", connected=False, mutates=False,
+            ),
             verify=state.bind(
                 lambda worktree: dependencies.verify(
                     worktree, verify_timeout_seconds,

@@ -176,7 +176,7 @@ PR 없는 게시 checkpoint의 과거 Review 횟수 차단은 현재 게시 소�
 1. 최종 차단 상태와 원인을 먼저 보존한다. 검증 가능한 대상 작업은 안전한 원격 checkpoint 또는 별도 진단 branch에 보존하고 결과를 알린다. 기존 PR은 저장된 URL·Open 상태·작업 branch·정확한 원격 head를 재확인해 같은 branch에 게시하며 새 PR·Draft PR을 만들지 않는다.
 2. 저장된 원인과 현재 입력·작업 상태를 대조한다. 같은 입력의 실패를 반복하지 않으며 다른 계획·planning·사용자 결정의 차단을 함께 해제하지 않는다.
 3. 일반적인 입력·승인·PR reopen 해제는 해당 계획의 재시도·실패 지문과 Worker level을 초기화해 READY 또는 PR_OPEN으로 되돌린다. 원격 복구는 기존 session·실패·승격 감사를 보존한다.
-4. 후보가 바뀐 작업은 Worker의 현재 입력·최종 diff 확인과 targeted test, 프로그램 전체 verify·Review를 다시 통과한다. 첫 PR도 최종 검증과 Review 성공 뒤에만 생성한다.
+4. 후보가 바뀐 작업은 유효한 Worker·targeted test·전체 verify·Review 근거를 다시 확인한다. 아래의 충돌 없는 rebase·동일 verify 입력 예외 외에는 필요한 단계를 다시 수행한다. 첫 PR도 최종 검증과 Review 성공 뒤에만 생성한다.
 
 현재 상태 기반 rebase 판정, checkpoint lease, 진단 ref와 중단 복구의 상세 조건은 [ARCHITECTURE.md](ARCHITECTURE.md#차단-작업의-원격-반영과-보존)를 따른다.
 
@@ -392,10 +392,14 @@ Loop Manager runtime에서만 읽는 `docs/AGENTS.*.md`와 저장소 밖 Manager
 - 자체 verify의 `verify_parallelism`은 생략 시 `auto`, 양의 정수는 상한, `1`은 직렬이다. 실행량은 코드가 CPU 제한·실제 부하·메모리 여유와 미반영 예약으로 결정하며 등록 프로젝트 수로 고정 분할하지 않는다. 관측 실패는 직렬로 축소하고 자원 대기도 전체 timeout에 포함한다.
 - Manager 실행 인스턴스가 동시 verify의 확인·예약을 조율한다. 예약은 해당 자식 종료 또는 미시작을 확인한 뒤 해제하며 종료 불명은 보존한다. 기존 프로젝트 선택과 같은 프로젝트의 ExecPlan 동시 실행 정책은 유지한다. 과거 시간 자료는 현재 후보 검증을 대신하지 않는다.
 - 최종 후보에서 관련 targeted test와 전체 verify가 통과하고 Reviewer blocking issue가 없어야 한다.
-- 최신 base 반영이나 후보·관련 입력 변경으로 기존 성공 근거가 무효화되면 Worker 후보 확인·targeted test·전체 verify·Review를 다시 수행한다.
+- Manager가 먼저 안전한 rebase를 시도한다. 충돌 없이 완료되고 source 내용까지 포함한 구현 입력과 완료 Worker 결과가 같으면 SHA 변경만으로 Worker·완료한 targeted test를 반복하지 않는다. 현재 HEAD의 Worker 후보 확인 불일치나 별도 교정 사유, 충돌·미완료·과거 근거 부재는 기존 Worker/session 경로를 유지한다.
+- rebase 충돌 중 Progress 체크 상태와 명확한 기존 실행 결과만 바뀌고 구현 조건의 동일성이 증명되면 session·작업물·index·rebase 상태·retry·실패 감사를 보존해 해결을 이어간다. 절 이름만으로 목표·제약·검증 조건·사용자 결정을 제외하지 않으며 불확실한 기록이나 과거 원문 근거 부재는 기존 재확인·차단을 유지한다. 이 구분은 verify·Review 입력을 제외하지 않는다.
+- 같은 프로젝트·ExecPlan·작업 주기의 실제 전체 verify 성공과 파일 bytes·경로·종류·mode·목록·명령·환경·runtime·실제 Git/외부 입력의 지문이 같고 현재 후보에서 다시 확인되면 원래 run을 연결해 verify를 재사용한다. 목록 부재·오류·누락 의심, dirty/untracked 입력 변경, 미확인 동적·외부 입력과 유효한 성공 부재는 전체 verify를 실행한다. 일반 스크립트의 입력을 명령 문자열만으로 증명하지 않는다.
+- 운영 입력 증명 adapter는 고정된 격리 UTF-8 Python 문법 검증 계약을 지원한다. 해당 전체 verify 계약의 명령·프로젝트 입력·Python/stdlib/native runtime을 실제로 관측한 경우만 재사용하며, 임의 스크립트와 미지원 환경은 전체 실행을 유지한다. 정확한 계약과 지원 범위는 [ARCHITECTURE.md](ARCHITECTURE.md#verify-입력-관측과-생성-요청)에 둔다.
+- 새 verify 실행은 과거 성공의 재사용 자격을 먼저 무효화한다. 실행·재사용 판정 중 입력 변경, 새 실패, 저장 중단·경쟁과 다른 작업 주기의 결과로 현재 후보를 통과시키지 않는다. 생략은 새 invocation·성공 실행·미측정 절감량을 만들거나 실패 감사를 초기화하지 않는다. Review·게시 gate는 독립적으로 유지한다.
 - 구현 PR 게시에는 Requirement 전체 완료나 archive 이동을 강제하지 않는다. Requirement 이동은 별도 planning 게시에서 최신 판단·원문·목적지와 원격 base를 다시 확인한다.
 - 관리 rebase는 자동 Worker 해결과 사용자 수동 해결을 같은 현재 상태 기준으로 수용한다. 현재 소유권·범위·Git 상태·원격 기대값을 검증하며, 과거 turn·stage·receipt·journal 완전성을 완료 조건으로 요구하지 않는다.
-- 동일 계획의 기존 원격 작업 branch를 rebase한 결과는 다음 Worker·verify·Review·추가 rebase보다 먼저 중간 checkpoint 게시 또는 안전한 거부를 확정한다. 기존 PR도 저장된 PR identity와 실제 원격 OID의 정확한 lease에 결합해 게시한다. intent·원격 결과·SQLite 확정 사이에 중단되면 같은 결과를 재사용하며 예상 밖 원격 commit을 덮지 않는다. 이 게시는 차단 해제·검증 성공·PR 승인을 대신하지 않고, 바뀐 PR 후보의 Worker·verify·Review·publication 승인은 무효화한다.
+- 동일 계획의 기존 원격 작업 branch를 rebase한 결과는 다음 Worker·verify·Review·추가 rebase보다 먼저 중간 checkpoint 게시 또는 안전한 거부를 확정한다. 기존 PR도 저장된 PR identity와 실제 원격 OID의 정확한 lease에 결합해 게시한다. intent·원격 결과·SQLite 확정 사이에 중단되면 같은 결과를 재사용하며 예상 밖 원격 commit을 덮지 않는다. 이 게시는 차단 해제·검증 성공·PR 승인을 대신하지 않고, 후보의 verify·Review·publication 근거를 다시 판단한다. Worker 보존은 위의 완료된 충돌 없는 rebase 조건에만 적용한다.
 - 같은 branch의 기존 PR을 복구해 사용하며 중복 PR을 만들지 않는다. PR은 사용자가 Merge한다.
 
 | Merge 후 작업 공간 | 처리 |

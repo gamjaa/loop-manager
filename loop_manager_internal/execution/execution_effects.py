@@ -96,6 +96,7 @@ class ValidationEffects:
     ensure_worker_level_state: Callable[..., Any]
     clear_validation_failure_history: Callable[..., Any]
     transition_validation_failure: Callable[..., Any]
+    observe_verify_inputs: Callable[..., Any] | None = None
 
 @dataclass(frozen=True)
 class FeedbackEffects:
@@ -155,4 +156,3 @@ class ExecutionEffects:
     revision: RevisionEffects
     checkpoint: ExecutionCheckpointRepository | None = None
     feedback: FeedbackEffects | None = None
-

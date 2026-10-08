@@ -23,6 +23,7 @@ def seed_validated_candidate(
     ).fetchone()
     base_sha = git_command(repo, "rev-parse", "origin/main")
     candidate_head = git_command(worktree, "rev-parse", "HEAD")
+    body = loop_manager._revision_execplan_body_hash(repo, base_sha, str(row["path"]))
     snapshot = DefinitionSnapshot(
         revision_sha=base_sha,
         path=str(row["path"]),
@@ -32,9 +33,8 @@ def seed_validated_candidate(
         complexity=str(row["current_complexity"]),
         risk=str(row["current_risk"]),
         priority=str(row["priority"]),
-        body_hash=loop_manager._revision_execplan_body_hash(
-            repo, base_sha, str(row["path"]),
-        ),
+        body_hash=str(body),
+        body_text=getattr(body, 'body_text', None),
         source_fingerprint=loop_manager._revision_execplan_source_fingerprint(
             repo, base_sha, row,
         ),
