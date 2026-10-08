@@ -1,9 +1,16 @@
-from tests.support.database import AutomationCatalogFixture
+import hashlib
 import json
 import tempfile
 import unittest
+from pathlib import Path
+from types import SimpleNamespace
 import loop_manager
-from tests.support.catalog import make_catalog_root, write_execplan, planner_git_observations
+from loop_manager_internal.application.contracts import PlanIdAllocation
+from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
+from loop_manager_internal.planning import planner_publication
+from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot, mutable_snapshot_token
+from tests.support.database import AutomationCatalogFixture
+from tests.support.catalog import make_catalog_root, plan_text, write_execplan, planner_git_observations
 
 
 class CatalogBatchesTest(AutomationCatalogFixture, unittest.TestCase):
@@ -46,17 +53,20 @@ class CatalogBatchesTest(AutomationCatalogFixture, unittest.TestCase):
         self.assertIn("G-002", prompt)
         self.assertIn("기존 docs/plans 전체를 기본 입력으로 읽지 마라", prompt)
 
-    def test_batch_validation_requires_new_consecutive_priority_plans(self):
+    def test_batch_validation_normalizes_new_plan_ids_and_structural_dependencies(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = make_catalog_root(directory)
             existing = write_execplan(repo, "G-001", "Existing", priority=None)
-            second = write_execplan(repo, "G-002", "Second", priority="high")
+            second = write_execplan(repo, "G-005", "Second", priority="high")
+            second.write_text(
+                second.read_text(encoding="utf-8") + "\nPlanning note: G-999 remains literal prose.\n",
+                encoding="utf-8",
+            )
             third = write_execplan(
-                repo,
-                "G-003",
+                repo, "G-006",
                 "Third",
                 priority="critical",
-                depends_on=("G-002",),
+                depends_on=("G-005",),
             )
 
             with planner_git_observations({existing.relative_to(repo).as_posix(): existing.read_text(encoding='utf-8')}):
@@ -66,19 +76,271 @@ class CatalogBatchesTest(AutomationCatalogFixture, unittest.TestCase):
                 )
 
             self.assertEqual([plan["id"] for _path, plan in plans.plans], ["G-002", "G-003"])
+            self.assertEqual(
+                [allocation.source_id for allocation in plans.id_allocations],
+                ["G-005", "G-006"],
+            )
+            self.assertEqual(plans.plans[1][1]["depends_on"], ["G-002"])
+            self.assertIn(
+                "Planning note: G-999 remains literal prose.",
+                (repo / "docs/plans/[G-002] Second.md").read_text(encoding="utf-8"),
+            )
 
         with tempfile.TemporaryDirectory() as directory:
             repo = make_catalog_root(directory)
             existing = write_execplan(repo, "G-001", "Existing")
             gap = write_execplan(repo, "G-003", "Gap")
 
-            with planner_git_observations({existing.relative_to(repo).as_posix(): existing.read_text(encoding='utf-8')}), \
-                 self.assertRaisesRegex(loop_manager.PlannerValidationError, "연속"):
-                loop_manager.validate_planner_result(
+            with planner_git_observations({existing.relative_to(repo).as_posix(): existing.read_text(encoding='utf-8')}):
+                result = loop_manager.validate_planner_result(
                     repo,
                     'base',
                     [gap.relative_to(repo).as_posix()],
                 )
+            self.assertEqual([plan["id"] for _path, plan in result.plans], ["G-002"])
+            self.assertFalse(gap.exists())
+            self.assertTrue((repo / "docs/plans/[G-002] Gap.md").is_file())
+
+    def test_new_plan_id_collision_skips_archived_registered_and_cancelled_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_catalog_root(directory)
+            existing = write_execplan(repo, "G-001", "Existing")
+            archived = write_execplan(repo, "G-004", "Archived")
+            archive_path = repo / "docs/plans/archive" / archived.name
+            archived_text = archived.read_text(encoding="utf-8")
+            archive_path.parent.mkdir()
+            archived.rename(archive_path)
+            existing_text = existing.read_text(encoding="utf-8") + (
+                "\n## User Decision\n\n"
+                "Decision: approve\n"
+                f"Revision: {'a' * 64}\n"
+                "Answer: Keep the existing behavior and history.\n"
+            )
+            existing.write_text(existing_text, encoding="utf-8")
+            candidate = write_execplan(repo, "G-001", "Decision")
+            draft = plan_text("G-001", "Decision").replace(
+                "risk: low\n", "risk: low\ndraft: true\n"
+            ) + (
+                "\n## Draft Decision\n\n"
+                "Question: Which approach should this goal use?\n"
+                "Facts: Both preserve the current behavior.\n"
+                "Options: A keeps history; B keeps only the latest value.\n"
+                "Impact: The choice changes recovery behavior.\n"
+            )
+            candidate.write_text(draft, encoding="utf-8")
+            connection = self._connection(str(repo))
+            self._insert_plan(connection, "G-001", "READY", repo=str(repo), title="Existing")
+            existing_path = existing.relative_to(repo).as_posix()
+            snapshot_plan = ReadyPlanSnapshot(
+                "G-001", existing_path, "Existing", ("docs/PRODUCT.md",), (),
+                "low", "low", "normal",
+                hashlib.sha256(existing_text.encode("utf-8")).hexdigest(),
+                "a" * 40, existing_text,
+            )
+            mutable_snapshot = MutableReadySnapshot(
+                str(repo), "base", (snapshot_plan,),
+                mutable_snapshot_token(str(repo), "base", (snapshot_plan,)),
+            )
+            connection.execute(
+                "INSERT INTO execplan_cancellations "
+                "(repo, plan_id, path, title, sources, depends_on, complexity, risk, "
+                "priority, content_hash, plan_sha, deletion_commit) "
+                "VALUES (?, 'G-009', 'docs/plans/[G-009] Cancelled.md', 'Cancelled', "
+                "'[\"docs/PRODUCT.md\"]', '[]', 'low', 'low', 'normal', 'hash', 'sha', 'commit')",
+                (str(repo),),
+            )
+            connection.commit()
+
+            with planner_git_observations({
+                existing.relative_to(repo).as_posix(): existing_text,
+            }):
+                result = loop_manager.validate_planner_result(
+                    repo, "base", [candidate.relative_to(repo).as_posix()],
+                    connection=connection, repo=str(repo), mutable_snapshot=mutable_snapshot,
+                )
+                resumed = loop_manager.validate_planner_result(
+                    repo, "base", ["docs/plans/[G-010] Decision.md"],
+                    connection=connection, repo=str(repo), mutable_snapshot=mutable_snapshot,
+                )
+
+            target = repo / "docs/plans/[G-010] Decision.md"
+            target_text = target.read_text(encoding="utf-8")
+            self.assertEqual([path for path, _plan in result.plans], ["docs/plans/[G-010] Decision.md"])
+            self.assertEqual(result.id_allocations[0].source_id, "G-001")
+            self.assertEqual(result.id_allocations[0].target_id, "G-010")
+            self.assertEqual([plan["id"] for _path, plan in resumed.plans], ["G-010"])
+            self.assertIs(loop_manager._parse_execplan(repo, target)["draft"], True)
+            self.assertIn("Question: Which approach should this goal use?", target_text)
+            self.assertEqual(target_text.replace("id: G-010", "id: G-001"), draft)
+            self.assertEqual(existing.read_text(encoding="utf-8"), existing_text)
+            self.assertEqual(archive_path.read_text(encoding="utf-8"), archived_text)
+
+    def test_batch_path_renames_free_destination_paths_before_assigning_them(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_catalog_root(directory)
+            existing = write_execplan(repo, "G-010", "Existing")
+            first = write_execplan(repo, "G-001", "Shared title")
+            first.write_text(
+                first.read_text(encoding="utf-8").replace("Test plan.", "First goal."),
+                encoding="utf-8",
+            )
+            second = write_execplan(
+                repo, "G-011", "Shared title", depends_on=("G-001",),
+            )
+            second.write_text(
+                second.read_text(encoding="utf-8").replace("Test plan.", "Second goal."),
+                encoding="utf-8",
+            )
+
+            with planner_git_observations({
+                existing.relative_to(repo).as_posix(): existing.read_text(encoding="utf-8"),
+            }):
+                result = loop_manager.validate_planner_result(
+                    repo, "base", [
+                        first.relative_to(repo).as_posix(),
+                        second.relative_to(repo).as_posix(),
+                    ],
+                )
+
+            self.assertEqual(
+                [path for path, _plan in result.plans],
+                ["docs/plans/[G-011] Shared title.md", "docs/plans/[G-012] Shared title.md"],
+            )
+            self.assertEqual(result.plans[1][1]["depends_on"], ["G-011"])
+            self.assertFalse(first.exists())
+            self.assertIn("First goal.", (repo / result.plans[0][0]).read_text(encoding="utf-8"))
+            self.assertIn("Second goal.", (repo / result.plans[1][0]).read_text(encoding="utf-8"))
+
+    def test_ambiguous_batch_ids_and_collision_dependencies_are_preserved(self):
+        for dependency in ((), ("G-001",)):
+            with self.subTest(dependency=dependency), tempfile.TemporaryDirectory() as directory:
+                repo = make_catalog_root(directory)
+                existing = write_execplan(repo, "G-001", "Existing")
+                first = write_execplan(repo, "G-001", "First")
+                second = write_execplan(
+                    repo, "G-001" if not dependency else "G-008", "Second",
+                    depends_on=dependency,
+                )
+                originals = {path: path.read_bytes() for path in (first, second)}
+                documents = {existing.relative_to(repo).as_posix(): existing.read_text(encoding="utf-8")}
+                with planner_git_observations(documents), self.assertRaisesRegex(
+                    loop_manager.PlannerValidationError, "모호"
+                ):
+                    loop_manager.validate_planner_result(
+                        repo, "base", [path.relative_to(repo).as_posix() for path in (first, second)],
+                    )
+                self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+
+    def test_remapped_id_in_plan_body_requires_planner_clarification(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_catalog_root(directory)
+            existing = write_execplan(repo, "G-001", "Existing")
+            candidate = write_execplan(repo, "G-005", "Candidate")
+            original = candidate.read_text(encoding="utf-8")
+            candidate.write_text(original + "\nThe G-005 implementation note is historical.\n", encoding="utf-8")
+            original = candidate.read_bytes()
+
+            with planner_git_observations({
+                existing.relative_to(repo).as_posix(): existing.read_text(encoding="utf-8"),
+            }), self.assertRaisesRegex(loop_manager.PlannerValidationError, "본문 참조"):
+                loop_manager.validate_planner_result(
+                    repo, "base", [candidate.relative_to(repo).as_posix()],
+                )
+
+            self.assertEqual(candidate.read_bytes(), original)
+
+    def test_new_plan_symlink_is_rejected_without_changing_its_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_catalog_root(directory)
+            existing = write_execplan(repo, "G-001", "Existing")
+            candidate = write_execplan(repo, "G-005", "Candidate")
+            target = Path(directory) / "outside.md"
+            target_text = plan_text("G-005", "Candidate")
+            target.write_text(target_text, encoding="utf-8")
+            candidate.unlink()
+            try:
+                candidate.symlink_to(target)
+            except (NotImplementedError, OSError) as error:
+                self.skipTest(f"symlink setup unavailable: {error}")
+
+            with planner_git_observations({
+                existing.relative_to(repo).as_posix(): existing.read_text(encoding="utf-8"),
+            }), self.assertRaisesRegex(loop_manager.PlannerValidationError, "일반 파일"):
+                loop_manager.validate_planner_result(
+                    repo, "base", [candidate.relative_to(repo).as_posix()],
+                )
+
+            self.assertTrue(candidate.is_symlink())
+            self.assertEqual(target.read_text(encoding="utf-8"), target_text)
+
+    def test_id_allocation_mapping_round_trips_in_publication_manifest(self):
+        snapshot = MutableReadySnapshot(
+            "repo", "base", (), mutable_snapshot_token("repo", "base", ()),
+        )
+        result = loop_manager.ValidatedPlanningResult(
+            plans=(("docs/plans/[G-003] Candidate.md", {"id": "G-003", "title": "Candidate"}),),
+            publication_paths=("docs/plans/[G-003] Candidate.md",),
+            mutable_snapshot=snapshot,
+            id_allocations=(PlanIdAllocation(
+                "docs/plans/[G-001] Candidate.md", "G-001",
+                "docs/plans/[G-003] Candidate.md", "G-003",
+            ),),
+        )
+        manifest = loop_manager._planning_result_manifest(result)
+        restored = loop_manager._planning_result_from_manifest(manifest)
+
+        self.assertEqual(restored.id_allocations, result.id_allocations)
+
+    def test_id_allocation_commit_check_binds_target_path_and_contents(self):
+        target = "docs/plans/[G-003] Candidate.md"
+        contents = plan_text("G-003", "Candidate")
+        parsed = loop_manager.published_execplan(target, contents)
+        snapshot = MutableReadySnapshot(
+            "repo", "base", (), mutable_snapshot_token("repo", "base", ()),
+        )
+        result = loop_manager.ValidatedPlanningResult(
+            plans=((target, parsed),),
+            publication_paths=(target,),
+            publication_hashes=((target, hashlib.sha256(contents.encode()).hexdigest()),),
+            mutable_snapshot=snapshot,
+            id_allocations=(PlanIdAllocation(
+                "docs/plans/[G-001] Candidate.md", "G-001", target, "G-003",
+            ),),
+        )
+
+        def git(_worktree, *args, **_kwargs):
+            if args == ("rev-parse", "HEAD"):
+                return SimpleNamespace(stdout="commit\n")
+            if args[:2] == ("rev-list", "--parents"):
+                return SimpleNamespace(stdout="commit base\n")
+            if args[:2] == ("cat-file", "-e"):
+                return SimpleNamespace(returncode=int(args[2] != f"commit:{target}"))
+            raise AssertionError(args)
+
+        effects = planner_publication.ValidateGeneralPlanningCommitEffects(
+            _nul_git_paths=lambda *_args: (target,),
+            git=git,
+            git_bytes=lambda _worktree, _operation, _path: contents.encode(),
+        )
+        planner_publication._validate_general_planning_commit(effects, Path("/repo"), result, "commit")
+
+        tampered = plan_text("G-004", "Candidate")
+        bad_result = loop_manager.ValidatedPlanningResult(
+            plans=result.plans,
+            publication_paths=result.publication_paths,
+            publication_hashes=((target, hashlib.sha256(tampered.encode()).hexdigest()),),
+            mutable_snapshot=snapshot,
+            id_allocations=result.id_allocations,
+        )
+        bad_effects = planner_publication.ValidateGeneralPlanningCommitEffects(
+            _nul_git_paths=lambda *_args: (target,),
+            git=git,
+            git_bytes=lambda _worktree, _operation, _path: tampered.encode(),
+        )
+        with self.assertRaisesRegex(loop_manager.PlannerValidationError, "유효하지 않습니다"):
+            planner_publication._validate_general_planning_commit(
+                bad_effects, Path("/repo"), bad_result, "commit",
+            )
 
     def test_batch_registration_is_atomic_and_idempotent(self):
         with tempfile.TemporaryDirectory() as directory:

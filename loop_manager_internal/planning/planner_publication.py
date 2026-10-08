@@ -2,7 +2,7 @@
 from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
-from loop_manager_internal.application.contracts import ValidatedPlanningResult
+from loop_manager_internal.application.contracts import PlanIdAllocation, ValidatedPlanningResult
 from loop_manager_internal.documents import document_publication
 from loop_manager_internal.maintenance.maintenance_planning import PlanRevision
 from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot
@@ -12,11 +12,12 @@ from loop_manager_internal.storage import execplan_catalog_state
 from loop_manager_internal.storage import planning_publication_state, planning_input_state, planning_review_state
 from loop_manager_internal.storage import runtime_state, work_claims
 from loop_manager_internal.storage import execplan_draft_state
-from loop_manager_internal.catalog import execplan_drafts
+from loop_manager_internal.catalog import execplan_catalog, execplan_drafts
 from loop_manager_internal.storage.planning_publication_state import GeneralPlanningPublication
 from pathlib import Path
 import hashlib
 import json
+import re
 import sqlite3
 
 
@@ -99,6 +100,15 @@ def _planning_result_manifest(effects: PlanningResultManifestEffects, result: Va
         "retirement_moves": list(result.retirement_moves),
         "restoration_moves": list(result.restoration_moves),
         "plans": [[path, plan] for path, plan in result.plans],
+        "id_allocations": [
+            {
+                "source_path": allocation.source_path,
+                "source_id": allocation.source_id,
+                "target_path": allocation.target_path,
+                "target_id": allocation.target_id,
+            }
+            for allocation in result.id_allocations
+        ],
         "revisions": [
             {
                 "path": revision.path,
@@ -158,6 +168,29 @@ def _planning_result_from_manifest(effects: PlanningResultFromManifestEffects, m
         plans = tuple(
             (str(item[0]), dict(item[1])) for item in payload["plans"]
         )
+        allocations = []
+        raw_allocations = payload.get("id_allocations", ())
+        if not isinstance(raw_allocations, (list, tuple)):
+            raise ValueError("invalid ID allocation list")
+        for item in raw_allocations:
+            if not isinstance(item, dict) or set(item) != {
+                "source_path", "source_id", "target_path", "target_id",
+            }:
+                raise ValueError("invalid ID allocation")
+            allocation = PlanIdAllocation(
+                source_path=str(item["source_path"]),
+                source_id=str(item["source_id"]),
+                target_path=str(item["target_path"]),
+                target_id=str(item["target_id"]),
+            )
+            if (
+                re.fullmatch(r"G-\d{3,}", allocation.source_id) is None
+                or re.fullmatch(r"G-\d{3,}", allocation.target_id) is None
+                or re.fullmatch(r"docs/plans/\[[^/]+\] [^/]+\.md", allocation.source_path) is None
+                or re.fullmatch(r"docs/plans/\[[^/]+\] [^/]+\.md", allocation.target_path) is None
+            ):
+                raise ValueError("invalid ID allocation identity")
+            allocations.append(allocation)
         revisions = tuple(
             PlanRevision(
                 str(item["path"]),
@@ -182,6 +215,7 @@ def _planning_result_from_manifest(effects: PlanningResultFromManifestEffects, m
                 str(path) for path in payload["publication_paths"]
             ),
             publication_hashes=publication_hashes,
+            id_allocations=tuple(allocations),
             retirement_moves=tuple(str(path) for path in payload.get("retirement_moves", ())),
             restoration_moves=tuple(str(path) for path in payload.get("restoration_moves", ())),
             revisions=revisions,
@@ -290,6 +324,61 @@ def _validate_general_planning_commit(
         moved = effects.git_bytes(worktree, "show", f"{plan_commit}:{destination}")
         if moved != original:
             raise PlannerValidationError(f"Requirement 이동 중 원문이 변경됐습니다: {source}")
+
+    if result.id_allocations:
+        plans_by_path = {path: plan for path, plan in result.plans}
+        if len(plans_by_path) != len(result.plans):
+            raise PlannerValidationError("정규화된 새 계획 경로가 중복됐습니다.")
+        if {item.target_path for item in result.id_allocations} != set(plans_by_path):
+            raise PlannerValidationError("ID 배정 manifest가 새 계획 batch와 다릅니다.")
+        if (len({item.source_path for item in result.id_allocations}) != len(result.id_allocations)
+                or len({item.source_id for item in result.id_allocations}) != len(result.id_allocations)
+                or len({item.target_id for item in result.id_allocations}) != len(result.id_allocations)):
+            raise PlannerValidationError("ID 배정 manifest에 중복 identity가 있습니다.")
+        for allocation in result.id_allocations:
+            plan = plans_by_path.get(allocation.target_path)
+            if (
+                plan is None
+                or str(plan.get("id")) != allocation.target_id
+                or allocation.source_path != (
+                    f"docs/plans/[{allocation.source_id}] {plan.get('title')}.md"
+                )
+                or allocation.target_path != (
+                    f"docs/plans/[{allocation.target_id}] {plan.get('title')}.md"
+                )
+                or allocation.target_path not in result.publication_paths
+                or allocation.target_path not in hashes
+            ):
+                raise PlannerValidationError("ID 배정 manifest가 게시 계획과 다릅니다.")
+            for path in {allocation.source_path, allocation.target_path}:
+                if effects.git(
+                    worktree, "cat-file", "-e", f"{snapshot.active_sha}:{path}",
+                    check=False,
+                ).returncode == 0:
+                    raise PlannerValidationError(
+                        f"ID 배정이 기존 원격 계획 경로를 덮으려 합니다: {path}"
+                    )
+            try:
+                published_plan = execplan_catalog.parse_execplan_text(
+                    allocation.target_path,
+                    effects.git_bytes(
+                        worktree, "show", f"{plan_commit}:{allocation.target_path}"
+                    ).decode("utf-8"),
+                    validate_sources=False,
+                )
+            except (RuntimeError, UnicodeError) as error:
+                raise PlannerValidationError(
+                    f"ID 배정 대상 ExecPlan이 commit에서 유효하지 않습니다: {allocation.target_path}"
+                ) from error
+            if (
+                str(published_plan["id"]) != allocation.target_id
+                or str(published_plan["title"]) != str(plan.get("title"))
+                or tuple(str(item) for item in published_plan["depends_on"])
+                != tuple(str(item) for item in plan.get("depends_on", ()))
+            ):
+                raise PlannerValidationError(
+                    f"ID 배정 대상 ExecPlan이 검증 결과와 다릅니다: {allocation.target_path}"
+                )
 
 
 @dataclass(frozen=True)

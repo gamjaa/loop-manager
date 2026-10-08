@@ -133,6 +133,16 @@ class RemoteBranchMissingError(RuntimeError):
 
 
 @dataclass(frozen=True)
+class PlanIdAllocation:
+    """One unpublished Planner path/ID assignment and its normalized target."""
+
+    source_path: str
+    source_id: str
+    target_path: str
+    target_id: str
+
+
+@dataclass(frozen=True)
 class ValidatedPlanningResult:
     """Validated files to publish, separated from executable plans."""
 
@@ -148,6 +158,7 @@ class ValidatedPlanningResult:
     maintenance_code_map_hash: str | None = None
     retirement_moves: tuple[str, ...] = ()
     restoration_moves: tuple[str, ...] = ()
+    id_allocations: tuple[PlanIdAllocation, ...] = ()
 
 
 class VerifyOutput(str):
