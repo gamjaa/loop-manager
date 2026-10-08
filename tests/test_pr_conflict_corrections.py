@@ -35,8 +35,7 @@ class LivePullRequestObservationTests(unittest.TestCase):
                         observe_live_pull_request(Path('/repo'), {'headRefName': 'branch'})
 
 
-class PrConflictCorrectionsTestFixture(PrRecoveryFixture):
-class PrConflictLeaseTests(PrConflictCorrectionsTestFixture, unittest.TestCase):
+class PrConflictLeaseTests(PrRecoveryFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_conflicting_pr_reuses_sessions_revalidates_new_base_and_leases_push(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -231,7 +230,7 @@ class PrConflictLeaseTests(PrConflictCorrectionsTestFixture, unittest.TestCase):
             synchronize.assert_not_called()
 
 
-class PrConflictCauseRevalidationTests(PrConflictCorrectionsTestFixture, unittest.TestCase):
+class PrConflictCauseRevalidationTests(PrRecoveryFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_worker_failure_blocks_after_three_corrections_and_stays_blocked(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -405,7 +404,7 @@ class PrConflictCauseRevalidationTests(PrConflictCorrectionsTestFixture, unittes
             )
 
 
-class PrConflictInterruptionTests(PrConflictCorrectionsTestFixture, unittest.TestCase):
+class PrConflictInterruptionTests(PrRecoveryFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_transient_and_usage_limit_pauses_resume_same_recovery(self):
         pauses = (
