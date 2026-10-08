@@ -284,26 +284,51 @@ class ExecutionFailurePolicyTests(ExecutionRecoveryScenarios, ExecutionPhaseScen
         self.assertEqual(row['worker_session_id'], 'worker-session')
 
 
-    def test_working_source_change_preserves_retry_artifacts_without_execplan_change(self):
+    def test_working_source_change_invalidates_artifacts_but_preserves_retry_history(self):
         self.handler.guard(self.context())
         worker_token = DefinitionSnapshot.deserialize(
             self.state.row()['definition_snapshot'],
         ).worker_token
         self.state.update_project(
             'repo',
+            worker_session_id='worker-session',
+            reviewer_session_id='reviewer-session',
             worker_result='previous worker result',
             verify_result='failed verify result',
+            review_result='previous review result',
+            validated_base_sha='base',
             worker_input_token=worker_token,
+            archive_token='previous-archive',
+            verify_token='previous-verify',
+            review_token='previous-review',
+            publication_token='previous-publication',
         )
+        self.repository.update_plan('repo', 'G-047', plan_values={
+            'retry_count': 2, 'verify_failure_history': '{"past": 1}',
+        }, enqueue=False)
+        self.state.expected = self.repository.projected('repo')
+        before = self.state.row()
         self.effects.revision.source_fingerprint.return_value = 'revised-source'
 
         guarded = self.handler.guard(self.handler._context())
 
         self.assertNotIsInstance(guarded, ExecutionOutcome)
         row = self.state.row()
-        self.assertEqual(row['worker_result'], 'previous worker result')
-        self.assertEqual(row['verify_result'], 'failed verify result')
-        self.assertEqual(row['worker_input_token'], worker_token)
+        self.assertEqual(row['phase'], 'WORKING')
+        for field in ('worker_result', 'verify_result', 'review_result',
+                      'validated_base_sha', 'worker_input_token', 'archive_token',
+                      'verify_token', 'review_token', 'publication_token'):
+            with self.subTest(field=field):
+                self.assertIsNone(row[field])
+        for field in ('worker_session_id', 'reviewer_session_id', 'branch', 'worktree'):
+            with self.subTest(field=field):
+                self.assertEqual(row[field], before[field])
+        plan = self.repository.active_row('repo')
+        self.assertEqual(plan['retry_count'], 2)
+        self.assertEqual(plan['verify_failure_history'], '{"past": 1}')
+        current = DefinitionSnapshot.deserialize(row['definition_snapshot'])
+        self.assertEqual(current.source_fingerprint, 'revised-source')
+        self.assertNotEqual(current.worker_token, worker_token)
 
 
     def test_dependency_gate_reports_unmerged_direct_and_indirect_plans(self):
