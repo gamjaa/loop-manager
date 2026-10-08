@@ -169,9 +169,9 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.assertEqual(verify_receipts.candidate_evidence(
             self.connection, 'repo', 'G-047', 'original-head', '', observation,
         )['kind'], 'run')
-        self.assertIsNone(verify_receipts.candidate_evidence(
+        self.assertEqual(verify_receipts.candidate_evidence(
             self.connection, 'repo', 'G-047', 'original-head', '',
-        ))
+        )['kind'], 'run')
         self.assertIsNone(verify_receipts.candidate_evidence(
             self.connection, 'repo', 'G-047', 'original-head', '',
             inputs.InputObservation('changed-inputs'),
@@ -190,6 +190,9 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.assertEqual(reused['kind'], 'reuse')
         self.assertEqual(reused['receipt']['id'], reused_id)
         self.assertEqual(reused['origin']['id'], run_id)
+        self.assertIsNone(verify_receipts.candidate_evidence(
+            self.connection, 'repo', 'G-047', 'current-head', '',
+        ))
         self.assertIsNone(verify_receipts.candidate_evidence(
             self.connection, 'repo', 'G-047', 'original-head', '', observation,
         ))

@@ -60,7 +60,8 @@ def latest_decision(connection, selection):
 
 def _observation_matches(receipt, observation):
     if observation is None:
-        return False
+        # A direct run is bound to its candidate HEAD; reuse needs a proven observation.
+        return True
     try:
         from dataclasses import asdict
         current = json.loads(json.dumps(asdict(observation), sort_keys=True))
