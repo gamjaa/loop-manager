@@ -12,7 +12,6 @@ import hashlib
 import json
 import os
 from pathlib import Path
-import secrets
 import sqlite3
 import subprocess
 import sys
@@ -625,13 +624,12 @@ class BootstrapService:
                 fallback_cache = tempfile.TemporaryDirectory(prefix="loop-manager-runtime-bytecode-")
                 cache_prefix = fallback_cache.name
             except OSError as error:
-                # A fresh, not-yet-created prefix makes Python read source and
-                # lets its normal best-effort pyc write fail without blocking import.
-                cache_prefix = str(Path(tempfile.gettempdir())
-                                   / f"loop-manager-runtime-bytecode-{secrets.token_hex(16)}")
+                # A source file cannot contain pyc entries beneath it, so imports
+                # use source and best-effort cache writes fail without temp storage.
+                cache_prefix = str(runtime.path / "loop_manager.py")
                 self.effects.operation_log(
                     "runtime Python bytecode cache 임시 디렉터리 생성 실패; "
-                    f"새 prefix에서 원본 실행: {error}", error=True,
+                    f"source fallback 사용: {error}", error=True,
                 )
             if environment.get(_DEFAULT_BYTECODE_PREFIX_MARKER) != "1":
                 environment["PYTHONPYCACHEPREFIX"] = cache_prefix

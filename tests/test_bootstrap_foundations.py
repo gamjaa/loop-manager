@@ -286,12 +286,15 @@ class BootstrapFoundationTests(unittest.TestCase):
                     }), mock.patch.object(
                         bootstrap.tempfile, 'TemporaryDirectory',
                         side_effect=OSError('temporary storage unavailable'),
+                    ), mock.patch.object(
+                        bootstrap.tempfile, 'gettempdir',
+                        side_effect=FileNotFoundError('no writable temporary directory'),
                     ):
                 self.assertEqual(service.run_runtime_child(
                     source, root / 'state', source / 'config.ini', runtime, []), 7)
 
             observed_prefix = Path((runtime_path / 'observed-cache-prefix').read_text())
-            self.assertNotEqual(observed_prefix, user_cache)
+            self.assertEqual(observed_prefix, runtime_path / 'loop_manager.py')
             self.assertEqual(sentinel.read_text(encoding='utf-8'), 'keep user cache\n')
             self.assertTrue(any(
                 '임시 디렉터리 생성 실패' in call.args[0]
