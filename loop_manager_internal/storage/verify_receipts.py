@@ -4,6 +4,7 @@ Starting a run revokes the old success before any process is launched. All
 selection/confirmation writes use a generation CAS inside the caller's runtime
 transaction; a missing or interrupted completion is never a reusable result.
 """
+from dataclasses import asdict
 import json
 from uuid import uuid4
 
@@ -73,9 +74,12 @@ def _observation_matches(receipt, observation):
         return False
     if original.get('fingerprint') != receipt['fingerprint']:
         return False
-    # Direct runs remain usable when inputs cannot be observed; reuse still
-    # requires proven inputs, and any known fingerprint change rejects the run.
-    return observed_fingerprint is None or receipt['fingerprint'] == observed_fingerprint
+    if observation is None or receipt['fingerprint'] != observed_fingerprint:
+        return False
+    # An initially unobservable run needs the same observation, not newly
+    # uncertain inputs. Known fingerprints ignore generated uncovered artifacts.
+    return (observed_fingerprint is not None
+            or original == json.loads(json.dumps(asdict(observation))))
 
 
 def success(connection, selection, observation):
@@ -142,7 +146,6 @@ def record(connection, selection, *, head, observation, kind, reason, origin=Non
          selection['plan_id'], selection['cycle'], selection['generation']))
     if result.rowcount != 1:
         raise CheckpointRace('verify receipt selection changed')
-    from dataclasses import asdict
     connection.execute('''INSERT INTO verify_receipts
         (id, repo, plan_id, cycle, kind, origin_id, head, fingerprint,
          observation, result, status, reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)''',

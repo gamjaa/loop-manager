@@ -214,6 +214,15 @@ class WorkerResultContractTest(unittest.TestCase):
         )
         self.assertNotIn("unrelated raw log", compact)
 
+    def test_reviewer_targeted_evidence_keeps_absolute_executable_paths(self):
+        for command in (
+            '/usr/bin/python3 tests/test_api.py',
+            '/opt/tools/python3 tests/test_api.py',
+        ):
+            with self.subTest(command=command):
+                evidence = command + '\nResult: PASS'
+                self.assertEqual(reviewer_targeted_test_evidence(evidence), evidence)
+
     def test_targeted_test_evidence_requires_a_clean_explicit_rerun(self):
         valid_evidence = (
             "pytest: 0 failed, 2 passed",

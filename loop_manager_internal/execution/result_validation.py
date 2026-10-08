@@ -804,7 +804,7 @@ def _looks_like_reported_test_command(line: str) -> bool:
         return False
     executable = words[0]
     if not re.fullmatch(
-        r"(?:[A-Za-z]:)?(?:[A-Za-z0-9_.+-]+[/\\])*[A-Za-z0-9_.+-]+",
+        r"(?:[A-Za-z]:)?[/\\]?(?:[A-Za-z0-9_.+-]+[/\\])*[A-Za-z0-9_.+-]+",
         executable,
     ):
         return False

@@ -508,21 +508,39 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
         self.assertIn('기록된 출력 없음', prompt)
         self.assertIn('candidate HEAD=base', prompt)
 
-    def test_review_entry_accepts_direct_run_when_inputs_are_unobservable(self):
-        self.effects.agent.reviewer_prompt.side_effect = lm.reviewer_prompt
+    def test_review_entry_rejects_run_when_known_inputs_become_unobservable(self):
         context = self.review_context()
         self.effects.validation.observe_verify_inputs.return_value = InputObservation(
-            None, reason='verify input fingerprint unavailable',
+            None, reason='unconfirmed native loader inputs',
         )
+
+        outcome = self.handler.review(context)
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        self.effects.agent.run_agent.assert_not_called()
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
+
+    def test_review_entry_accepts_direct_run_with_unchanged_unobservable_inputs(self):
+        self.effects.agent.reviewer_prompt.side_effect = lm.reviewer_prompt
+        context = self.review_context()
+        observation = InputObservation(None, reason='verify input fingerprint unavailable')
+        selection = verify_receipts.selected(self.connection, 'repo', 'G-047')
+        identifier, selection = verify_receipts.record(
+            self.connection, selection, head='base', observation=observation,
+            kind='run', reason='inputs unavailable',
+        )
+        verify_receipts.complete(
+            self.connection, selection, identifier, passed=True,
+            output=self.state.row()['verify_result'],
+        )
+        self.effects.validation.observe_verify_inputs.return_value = observation
 
         outcome = self.handler.review(context)
 
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
         self.effects.agent.run_agent.assert_called_once()
-        self.assertIn(
-            'Manager 확인: 전체 verify PASS',
-            self.effects.agent.run_agent.call_args.args[5],
-        )
+        self.assertIn('Manager 확인: 전체 verify PASS',
+                      self.effects.agent.run_agent.call_args.args[5])
 
     def test_review_entry_rejects_missing_current_candidate_receipt(self):
         self.review_context()

@@ -179,13 +179,13 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.assertEqual(verify_receipts.candidate_evidence(
             self.connection, 'repo', 'G-047', 'original-head', '', ignored_artifacts,
         )['kind'], 'run')
-        self.assertEqual(verify_receipts.candidate_evidence(
+        self.assertIsNone(verify_receipts.candidate_evidence(
             self.connection, 'repo', 'G-047', 'original-head', '',
-        )['kind'], 'run')
-        self.assertEqual(verify_receipts.candidate_evidence(
+        ))
+        self.assertIsNone(verify_receipts.candidate_evidence(
             self.connection, 'repo', 'G-047', 'original-head', '',
-            inputs.InputObservation(None, reason='verify input fingerprint unavailable'),
-        )['kind'], 'run')
+            inputs.InputObservation(None, reason='unconfirmed native loader inputs'),
+        ))
         self.assertIsNone(verify_receipts.candidate_evidence(
             self.connection, 'repo', 'G-047', 'original-head', '',
             inputs.InputObservation('changed-inputs'),
@@ -244,6 +244,11 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.assertEqual(verify_receipts.candidate_evidence(
             self.connection, 'repo', 'G-047', 'unobserved-head', '', unobservable,
         )['kind'], 'run')
+
+        self.assertIsNone(verify_receipts.candidate_evidence(
+            self.connection, 'repo', 'G-047', 'unobserved-head', '',
+            inputs.InputObservation(None, reason='unconfirmed native loader inputs'),
+        ))
 
         verify_receipts.start_cycle(self.connection, 'repo', 'G-047')
         selection = verify_receipts.selected(self.connection, 'repo', 'G-047')
