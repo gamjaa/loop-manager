@@ -12,6 +12,7 @@ from loop_manager_internal.storage.validation_feedback_state import ValidationFe
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 from loop_manager_internal.storage import verify_receipts
 from loop_manager_internal.execution.execution_runtime import ExecutionPhase, ExecutionOutcome, ExecutionOutcomeKind
+from loop_manager_internal.verification.inputs import InputObservation
 from tests.support.worker import decision as worker_decision
 from tests.support.execution import READY_WORKER_RESULT, VALID_WORKER_RESULT
 
@@ -72,6 +73,10 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
 
     def test_failed_verify_scope_block_cannot_reuse_prior_success_token(self):
         self.review_context()
+        # The seeded successful receipt is reusable only while its observed inputs match.
+        self.effects.validation.observe_verify_inputs.return_value = InputObservation(
+            'changed verify inputs',
+        )
         definition = self.handler._snapshot()._definition_snapshot
         self.state.update_project(
             'repo', phase='VERIFYING', validated_base_sha='base',
