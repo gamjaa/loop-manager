@@ -656,13 +656,6 @@ def _evaluate_remote_checkpoint_cause(effects: EvaluateRemoteCheckpointCauseEffe
     )
     if revision is None:
         return False, "원격 checkpoint 후보가 최신 base를 포함하지 않습니다.", "stale_base"
-    saved_candidate = str(blocked["publication_remote_oid"] or blocked["pr_head_oid"] or "")
-    if not saved_candidate or saved_candidate != revision[1]:
-        return (
-            True,
-            "원격 checkpoint Worker 결과가 현재 후보 HEAD와 연결되지 않아 Worker부터 재검증합니다.",
-            "worker",
-        )
     before = effects.capture_git_snapshot(worktree)
     passed, output = effects.verify(worktree, timeout)
     effects.validate_agent_scope(
@@ -678,6 +671,13 @@ def _evaluate_remote_checkpoint_cause(effects: EvaluateRemoteCheckpointCauseEffe
         return effects._remote_checkpoint_has_new_failure(
             connection, repo, blocked, "verify", output, worktree,
         ), str(output), "verify"
+    saved_candidate = str(blocked["publication_remote_oid"] or blocked["pr_head_oid"] or "")
+    if not saved_candidate or saved_candidate != revision[1]:
+        return (
+            True,
+            "원격 checkpoint Worker 결과가 현재 후보 HEAD와 연결되지 않아 Worker부터 재검증합니다.",
+            "worker",
+        )
     if blocked["blocked_reason"] == BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value:
         return True, str(output), None
     try:
