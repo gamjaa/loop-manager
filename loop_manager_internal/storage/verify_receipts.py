@@ -59,16 +59,17 @@ def latest_decision(connection, selection):
 
 
 def _observation_matches(receipt, observation):
-    if observation is None:
+    if observation is None or not getattr(observation, 'proven', False):
         # A direct run is bound to its candidate HEAD; reuse needs a proven observation.
         return True
     try:
-        from dataclasses import asdict
-        current = json.loads(json.dumps(asdict(observation), sort_keys=True))
         original = json.loads(receipt['observation'])
-    except (AttributeError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError):
         return False
-    return current == original
+    return (
+        original.get('fingerprint') == receipt['fingerprint']
+        and receipt['fingerprint'] == observation.fingerprint
+    )
 
 
 def success(connection, selection, observation):

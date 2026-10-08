@@ -800,15 +800,24 @@ def reviewer_targeted_test_evidence(test_evidence: str) -> str:
         return redact_secrets(reason)
 
     relevant = []
-    for line in test_evidence.splitlines():
+    lines = test_evidence.splitlines()
+    index = 0
+    while index < len(lines):
+        line = lines[index]
         if _TARGETED_TEST_COMMAND.search(line) or _INLINE_TEST_COMMAND.search(line):
-            relevant.append(line.strip())
+            command = line.strip()
+            while command.endswith("\\") and index + 1 < len(lines):
+                command = command[:-1].rstrip() + " " + lines[index + 1].strip()
+                index += 1
+            relevant.append(command)
+            index += 1
             continue
         for clause in re.split(r"[;|]", line):
             if (_TARGETED_TEST_SUCCESS.search(clause)
                     or _TARGETED_TEST_FAILURE.search(clause)
                     or _TARGETED_TEST_EXCEPTION_FAILURE.search(clause)):
                 relevant.append(clause.strip())
+        index += 1
     return redact_secrets("\n".join(relevant) if relevant else
                           'Worker targeted test 결과를 요약할 수 없습니다.')
 

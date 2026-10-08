@@ -835,6 +835,28 @@ class ManualRebaseContinuationUnitTests(unittest.TestCase):
 
 
 class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest.TestCase):
+    def test_review_successor_candidate_rechecks_worker_before_verify_or_reviewer(self):
+        published = self.publish_block(
+            reason="review_retry_exhausted",
+            evidence="code.py: reviewer requested a code correction",
+        )
+        corrected = self.user_commit("code.py", "review correction\n")
+        self.assertNotEqual(corrected, published)
+
+        resumed = loop_manager.resume_plan_blocks(
+            self.connection, self.repo, self.state_dir,
+            str(self.repo.resolve()), "main",
+        )
+
+        self.assertTrue(resumed)
+        plan = self.connection.execute(
+            "SELECT status, worker_result FROM exec_plans WHERE plan_id = 'G-034'"
+        ).fetchone()
+        self.assertEqual(tuple(plan), ("IMPLEMENTING", None))
+        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"), corrected)
+        self.verify_probe.assert_not_called()
+        self.reviewer_probe.assert_not_called()
+
     def test_published_remote_code_successor_resumes_worker_on_same_workspace(self):
         published = self.publish_block()
         binding = SessionBinding("codex", "model", "high").serialize()

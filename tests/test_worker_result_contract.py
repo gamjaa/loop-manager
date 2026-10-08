@@ -183,6 +183,24 @@ class WorkerResultContractTest(unittest.TestCase):
             'Worker targeted test 결과를 요약할 수 없습니다.',
         )
 
+    def test_reviewer_targeted_evidence_keeps_other_language_and_continued_commands(self):
+        evidence = (
+            "go test ./internal/foo \\\n"
+            "  -run TestFoo\n"
+            "Result: PASS\n"
+            "cargo test --package api\n"
+            "test result: ok, 3 passed, 0 failed\n"
+            "unrelated raw log: omit this"
+        )
+
+        compact = reviewer_targeted_test_evidence(evidence)
+
+        self.assertIn("go test ./internal/foo -run TestFoo", compact)
+        self.assertIn("Result: PASS", compact)
+        self.assertIn("cargo test --package api", compact)
+        self.assertIn("test result: ok, 3 passed, 0 failed", compact)
+        self.assertNotIn("unrelated raw log", compact)
+
     def test_targeted_test_evidence_requires_a_clean_explicit_rerun(self):
         valid_evidence = (
             "pytest: 0 failed, 2 passed",

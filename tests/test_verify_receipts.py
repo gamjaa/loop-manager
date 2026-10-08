@@ -169,6 +169,16 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.assertEqual(verify_receipts.candidate_evidence(
             self.connection, 'repo', 'G-047', 'original-head', '', observation,
         )['kind'], 'run')
+        ignored_artifacts = inputs.InputObservation(
+            observation.fingerprint,
+            observation.files,
+            (('logs/verify.log', 'file', 0o644, 'generated'),),
+            'changed-completeness',
+            'unconfirmed inputs outside manifest',
+        )
+        self.assertEqual(verify_receipts.candidate_evidence(
+            self.connection, 'repo', 'G-047', 'original-head', '', ignored_artifacts,
+        )['kind'], 'run')
         self.assertEqual(verify_receipts.candidate_evidence(
             self.connection, 'repo', 'G-047', 'original-head', '',
         )['kind'], 'run')

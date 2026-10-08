@@ -598,43 +598,102 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
                           .publication('',{'id':'G-012','title':'Test'},mock.Mock()).test_evidence)
 
     def test_reviewer_prompt_distinguishes_a_valid_user_verify_waiver(self):
-        with tempfile.TemporaryDirectory() as directory:
-            service,branch,worktree=self.fixture(directory)
-            service.start('G-012')
-            (worktree/'src/app.py').write_text('VALUE = 2\n')
-            git_command(worktree,'add','src/app.py')
-            git_command(worktree,'commit','-m','Manual implementation')
-            git_command(worktree,'push','origin',branch)
-            args=completion()
-            args.skip_verify=True
-            args.expected_head=git_command(worktree,'rev-parse','HEAD')
-            args.skip_reason='password: waiver-secret-value'
-            service.complete(args)
-            with mock.patch('loop_manager.validate_repository',return_value=service.repo_path), \
-                 mock.patch('loop_manager.ensure_safe_base_worktree'), \
-                 mock.patch('loop_manager.pr_for_branch',return_value=None), \
-                 mock.patch('loop_manager.verify') as verify, \
-                 mock.patch('loop_manager.run_agent',return_value=(0,'MANUAL_PLAN_RESULT: G-012 PASS\nVERDICT: PASS')) as agent, \
-                 mock.patch('loop_manager._ExecutionLifecyclePorts',wraps=loop_manager._ExecutionLifecyclePorts) as ports:
-                effects_ports=ports._mock_wraps
-                def composition(*call_args,**kwargs):
-                    handler=effects_ports(*call_args,**kwargs)
-                    handler.publish=mock.Mock(return_value=loop_manager.ExecutionOutcome(
-                        loop_manager.ExecutionOutcomeKind.STABLE_WAIT,detail='publication boundary'))
-                    return handler
-                ports.side_effect=composition
-                loop_manager._run_project_step(service.connection,service.state_dir,service.repo,
-                    Path('unused.ini'),'main',False,registered_only=True)
+        from types import SimpleNamespace
+        from tests.support.execution import execution_fixture
+        from loop_manager_internal.execution.manual_candidate import ManualCandidate, candidate_token
+        from loop_manager_internal.agents.agent_invocation import AgentResult
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        from loop_manager_internal.storage import verify_receipts
+        from loop_manager_internal.verification.inputs import InputObservation
 
-            verify.assert_not_called()
-            self.assertEqual(agent.call_args.args[4],'reviewer')
-            prompt=agent.call_args.args[5]
-            self.assertIn('Worker targeted unit test는 실행되지 않았고 외부 targeted test 결과도',prompt)
-            self.assertIn('유효한 사용자 verify 생략 (SKIPPED_BY_USER',prompt)
-            self.assertIn('전체 verify PASS가 아닙니다',prompt)
-            self.assertIn('<REDACTED>',prompt)
-            self.assertNotIn('waiver-secret-value',prompt)
-            self.assertNotIn('Manager 확인: 전체 verify PASS',prompt)
+        fixture = execution_fixture(self)
+        head, base = 'candidate-head', 'base'
+        fixture.effects.workspace.git.side_effect = lambda _path, *args, **_kwargs: SimpleNamespace(
+            stdout=(head if args == ('rev-parse', 'HEAD') else base), returncode=0,
+        )
+        context = fixture.review_context(verify_output='placeholder verify result')
+        documents = [{
+            'path': 'docs/plans/[G-047] Runtime.md',
+            'text': '# Runtime',
+            'plan': dict(fixture.plan),
+        }]
+        store = ManualWorkRepository(fixture.connection)
+        group = store.create(
+            fixture.repo, 'start', 'loop-manager/G-047', (), head, base,
+            members=('G-047',), documents=documents,
+        )
+        store.update(group, state='AUTOMATIC', owner_id='G-047',
+                     branch='loop-manager/G-047', worktree=str(context.worktree))
+        group = store.for_plan(fixture.repo, 'G-047')
+
+        def candidate_git(_path, *args, **_kwargs):
+            value = head if args == ('rev-parse', 'HEAD') else base
+            return SimpleNamespace(stdout=value, returncode=0)
+
+        candidate = ManualCandidate(
+            fixture.connection, fixture.repo, 'G-047', candidate_git, mock.Mock(),
+        )
+        candidate.documents = mock.Mock(return_value=documents)
+        candidate_input = candidate_token(fixture.connection, fixture.repo, head, base, documents)
+        store.accept(
+            group, head=head, base=base, input_token=candidate_input,
+            skip_verify=True, reason='password: waiver-secret-value',
+        )
+        fixture.state.manual = candidate
+        waiver = candidate.waive(context, 'verify')
+        self.assertIn('SKIPPED_BY_USER', waiver)
+
+        definition = fixture.handler._definition_snapshot
+        fixture.state.update_project(
+            fixture.repo, phase='REVIEWING', worker_result=None,
+            active_sha=base, validated_base_sha=base, verify_result=waiver,
+            verify_token=definition.verify_token(base, head, waiver),
+        )
+        context = fixture.handler._context()
+        observation = InputObservation('manual-waiver-review-inputs')
+        verify_receipts.start_cycle(fixture.connection, fixture.repo, 'G-047')
+        selection = verify_receipts.selected(fixture.connection, fixture.repo, 'G-047')
+        receipt_id, selection = verify_receipts.record(
+            fixture.connection, selection, head=head, observation=observation,
+            kind='run', reason='user verify waiver',
+        )
+        verify_receipts.complete(
+            fixture.connection, selection, receipt_id, passed=True,
+            output=waiver, executed=False,
+        )
+        fixture.effects.validation.observe_verify_inputs.return_value = observation
+        fixture.effects.agent.reviewer_prompt.side_effect = lambda *args, **kwargs: candidate.prompt(
+            loop_manager.reviewer_prompt(*args, **kwargs), review=True,
+        )
+        review_result = 'MANUAL_PLAN_RESULT: G-047 PASS\nVERDICT: PASS'
+
+        def reviewer(*_args, **kwargs):
+            kwargs['on_session_started']('review-session')
+            return AgentResult(0, review_result, session_id='review-session')
+
+        fixture.effects.agent.run_agent.side_effect = reviewer
+        fixture.handler._fetch_latest_base = lambda: base
+        fixture.handler._post_effect_guard = lambda current: current
+        fixture.handler._document_draft = lambda _context: None
+        fixture.handler._document_review_prompt = lambda prompt, _draft: prompt
+
+        outcome = fixture.handler.review(context)
+
+        self.assertEqual(outcome.kind, loop_manager.ExecutionOutcomeKind.PHASE_ADVANCED)
+        fixture.effects.validation.verify.assert_not_called()
+        prompt = fixture.effects.agent.run_agent.call_args.args[5]
+        self.assertIn('Worker targeted unit test는 실행되지 않았고 외부 targeted test 결과도', prompt)
+        self.assertIn('유효한 사용자 verify 생략 (SKIPPED_BY_USER', prompt)
+        self.assertIn('전체 verify PASS가 아닙니다', prompt)
+        self.assertIn('<REDACTED>', prompt)
+        self.assertNotIn('waiver-secret-value', prompt)
+        self.assertNotIn('Manager 확인: 전체 verify PASS', prompt)
+        self.assertEqual(fixture.connection.execute(
+            "SELECT result FROM manual_work_results WHERE stage='verify'"
+        ).fetchone()['result'], 'SKIPPED_BY_USER')
+        self.assertEqual(fixture.connection.execute(
+            "SELECT result FROM manual_work_results WHERE stage='review'"
+        ).fetchone()['result'], 'PASS')
 
     def test_grant_expires_for_environment_new_sha_and_new_default_request(self):
         with tempfile.TemporaryDirectory() as directory:
