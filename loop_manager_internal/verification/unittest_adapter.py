@@ -21,7 +21,7 @@ from loop_manager_internal.verification.timing import EventWriter, TimedResult, 
 
 def project_imports():
     """Test imports must resolve the candidate, never the Manager's runtime tree."""
-    root = Path.cwd().resolve()
+    root = Path(os.environ.get("LOOP_MANAGER_VERIFY_PROJECT_ROOT", Path.cwd())).resolve()
     runtime = Path(__file__).resolve().parents[2]
     if runtime != root:
         for name in list(sys.modules):

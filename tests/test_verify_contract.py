@@ -253,7 +253,8 @@ class VerifyContractTests(unittest.TestCase):
         runtime = Path(unittest_adapter.__file__).resolve().parents[2]
         candidate = SimpleNamespace(__file__=str(self.root / 'loop_manager.py'))
         modules = {'loop_manager': candidate, 'loop_manager_internal.existing': candidate, 'third_party': candidate}
-        with mock.patch.object(unittest_adapter.Path, 'cwd', return_value=self.root), \
+        with mock.patch.dict(os.environ, {"LOOP_MANAGER_VERIFY_PROJECT_ROOT": str(self.root)}), \
+                mock.patch.object(unittest_adapter.Path, 'cwd', return_value=self.root / 'tests'), \
                 mock.patch.object(sys, 'modules', modules), mock.patch.object(sys, 'path', [str(runtime), '/dependency']):
             unittest_adapter.project_imports()
             self.assertNotIn('loop_manager', sys.modules)
@@ -504,6 +505,9 @@ class ReviewBoundaryRegressionTests(unittest.TestCase):
             candidate = Path(directory)
             package = candidate / 'loop_manager_internal/verification'
             package.mkdir(parents=True)
+            stage = candidate / 'tests'
+            stage.mkdir()
+            (candidate / 'loop_manager.py').write_text("SOURCE = 'candidate'\n")
             for relative in ('loop_manager_internal/__init__.py',
                              'loop_manager_internal/verification/__init__.py',
                              'loop_manager_internal/verification/timing.py',
@@ -515,6 +519,9 @@ from unittest import mock
 sys.path.insert(0, sys.argv[1])
 from loop_manager_internal.verification import unittest_adapter as adapter
 adapter.project_imports()
+import loop_manager
+assert loop_manager.SOURCE == 'candidate'
+assert pathlib.Path(loop_manager.__file__).parent == pathlib.Path(sys.argv[2])
 from loop_manager_internal.verification import git_timing as candidate
 from loop_manager_internal.verification import timing
 assert pathlib.Path(candidate.__file__).is_relative_to(pathlib.Path(sys.argv[2]))
@@ -546,5 +553,31 @@ assert sum(cost['commands']['status']['count'] for cost in summary['git_snapshot
 assert not summary['active'], summary
 '''
             result = subprocess.run([sys.executable, '-I', '-c', code, str(runtime), str(candidate)],
-                cwd=candidate, capture_output=True, text=True, timeout=10, check=False)
+                cwd=stage, env=dict(os.environ, LOOP_MANAGER_VERIFY_PROJECT_ROOT=str(candidate)),
+                capture_output=True, text=True, timeout=10, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+
+class StageCwdImportTests(unittest.TestCase):
+    def test_standalone_runtime_keeps_project_imports_from_tests_cwd(self):
+        # A fresh interpreter verifies sys.modules and sys.path under the actual child cwd.
+        import subprocess
+        root = Path(unittest_adapter.__file__).resolve().parents[2]
+        code = """
+import pathlib, sys
+sys.path.insert(0, sys.argv[1])
+from loop_manager_internal.verification import unittest_adapter as adapter
+original = adapter.instrumentation
+adapter.project_imports()
+import loop_manager
+from loop_manager_internal.verification import git_timing, timing
+assert pathlib.Path(loop_manager.__file__) == pathlib.Path(sys.argv[1]) / 'loop_manager.py'
+assert timing is original
+assert git_timing._current_writer is original._current_writer
+assert git_timing._phase_names is original._phase_names
+assert pathlib.Path.cwd() == pathlib.Path(sys.argv[1]) / 'tests'
+"""
+        result = subprocess.run([sys.executable, '-I', '-c', code, str(root)], cwd=root / 'tests',
+            env=dict(os.environ, LOOP_MANAGER_VERIFY_PROJECT_ROOT=str(root)),
+            capture_output=True, text=True, timeout=10, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
