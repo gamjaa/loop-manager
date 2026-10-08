@@ -362,6 +362,8 @@ class PublicationConflictRecoveryTests(PublicationRebaseRecoveryTestFixture, uni
 
 
 class PublicationRebaseInterruptionTests(PublicationRebaseRecoveryTestFixture, unittest.TestCase):
+    # Real rebase metadata, conflict files and autostash/index preservation must
+    # survive Agent pause and validation failure before the same recovery resumes.
     @dummy_worker_sessions
     def test_rebase_recovery_marker_survives_agent_pause(self):
         cases = (

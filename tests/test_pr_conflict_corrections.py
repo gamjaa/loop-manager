@@ -405,6 +405,8 @@ class PrConflictCauseRevalidationTests(PrRecoveryFixture, unittest.TestCase):
 
 
 class PrConflictInterruptionTests(PrRecoveryFixture, unittest.TestCase):
+    # Keep real Git: assertions inspect the surviving operation/index, remote
+    # lease and resumed publication after interruption at mutating commands.
     @dummy_worker_sessions
     def test_transient_and_usage_limit_pauses_resume_same_recovery(self):
         pauses = (

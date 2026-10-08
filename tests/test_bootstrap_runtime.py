@@ -392,6 +392,8 @@ class BootstrapRuntimeTests(OriginScopeFixture, unittest.TestCase):
 
 
 class BootstrapSavedScopeResumeTests(unittest.TestCase):
+    # Real Git and child CLI are the contract here: imported runtime B, saved
+    # Agent scopes, and later base C must stay connected across process restart.
     """Real subprocess regressions; run only in Manager's full verification."""
 
     def test_remote_bootstrap_child_resumes_saved_scope_without_identity_injection(self, advance_after_selection=False):
@@ -412,8 +414,9 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                     state = Path(directory) / 'state'
                     state.mkdir()
                     copy_manager_import_fixture(source)
-                    # The only child doubles are external Agent/GitHub boundaries.
-                    # All bootstrap, identity, SQLite, scope and dispatch code is real.
+                    # Keep bootstrap, identity, SQLite, scope and dispatch real.
+                    # Optional source-fact prompt enrichment has no assertion
+                    # here; its Git/source parsing is covered by code-map tests.
                     manager_file = source / 'loop_manager.py'
                     manager_file.write_text(manager_file.read_text().replace(
                         'if __name__ == "__main__":\n    raise SystemExit(main())',
@@ -446,6 +449,8 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
     codex_model_efforts = lambda *args: {model: frozenset({'medium', 'high', 'max', 'xhigh'})
         for model in ('test-fast', 'test-balanced', 'test-strong')}
     run_codex = fake_agent
+    from loop_manager_internal.maintenance import tiered_ports
+    tiered_ports.prepare_query_context = lambda *args, **kwargs: ''
     if '--runtime-child' in sys.argv:
         from loop_manager_internal.runtime.bootstrap import BootstrapService
         validate_mutation = BootstrapService.validate_runtime_mutation

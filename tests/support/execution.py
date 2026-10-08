@@ -79,12 +79,18 @@ class ExecutionFixture:
     """Reusable setup and adapters; no discoverable test methods."""
 
     def setUp(self):
-        self.connection = runtime_connection()
+        self.repo = getattr(self, 'repo', 'repo')
+        self.connection = runtime_connection(self.repo)
         self.addCleanup(self.connection.close)
+        # Optional source-fact enrichment is not a phase-policy assertion.
+        from loop_manager_internal.maintenance import code_index
+        source_index = mock.patch.object(code_index, 'git', side_effect=ValueError('no source index'))
+        source_index.start()
+        self.addCleanup(source_index.stop)
         self.repository = runtime_state.RuntimeStateRepository(self.connection)
-        self.repository.activate('repo', 'G-047', activation_sha='base',
+        self.repository.activate(self.repo, 'G-047', activation_sha='base',
                                  branch='loop-manager/G-047', worktree=str(Path('/state/G-047')))
-        self.state = ExecutionStatePort(self.connection, self.repository, 'repo')
+        self.state = ExecutionStatePort(self.connection, self.repository, self.repo)
         # Existing saved-session fixtures represent sessions started by this
         # configured provider; explicit None still exercises legacy recovery.
         original_update = self.state.update_project
@@ -152,12 +158,12 @@ class ExecutionFixture:
         self.effects.revision.unmet_dependencies.return_value = ()
         self.effects.archive.requirement_archive_sources.return_value = ()
         self.handler = handlers.ExecutionHandlers(
-            self.effects, repo='repo', repo_path=Path('/repo'), state_dir=Path('/state'),
+            self.effects, repo=self.repo, repo_path=Path('/repo'), state_dir=Path('/state'),
             base='main', base_sha='base', provider='codex', config_path=Path('/config'),
             newly_activated=False,
         )
         self.handler.plan = self.plan
-        self.handler.catalog_plan = self.repository.active_row('repo')
+        self.handler.catalog_plan = self.repository.active_row(self.repo)
         # This class exercises phase policy with fake Git effects. Journal
         # persistence and ownership are covered by test_managed_mutation_evidence;
         # keep these legacy policy tests at the Git operation boundary.
@@ -176,10 +182,10 @@ class ExecutionFixture:
         def fake_complete_rebase(context, *, project_values=None):
             checkpoint = self.handler.effects.checkpoint
             if checkpoint is not None:
-                current = checkpoint.get('repo', context.plan.plan_id)
+                current = checkpoint.get(self.repo, context.plan.plan_id)
                 if current.operation == 'rebase':
                     checkpoint.record(
-                        'repo', context.plan.plan_id,
+                        self.repo, context.plan.plan_id,
                         expected_generation=current.generation, operation=None,
                         expected_head=self.remote, target_base_oid=current.target_base_oid,
                         observed_remote_oid=current.observed_remote_oid,
@@ -187,15 +193,15 @@ class ExecutionFixture:
                     )
             from loop_manager_internal.git.managed_rebase_adoption import revalidation_values
             target = (project_values or {}).get('active_sha') or self.remote
-            self.state.update_project('repo', **revalidation_values(target))
+            self.state.update_project(self.repo, **revalidation_values(target))
         self.handler._complete_rebase_intent = mock.Mock(side_effect=fake_complete_rebase)
         def fake_current_service(context, **options):
             from loop_manager_internal.git.managed_rebase_validation import RebaseDecision, RebaseStatus, Remote
-            current = self.handler.effects.checkpoint.get('repo', context.plan.plan_id)
+            current = self.handler.effects.checkpoint.get(self.repo, context.plan.plan_id)
             in_progress = bool(self.effects.workspace._rebase_in_progress_for_branch(
                 context.worktree, context.branch))
             stages = self.handler._unmerged_stages(context.worktree)
-            remote = Remote('repo', context.branch, options.get('remote_oid', current.observed_remote_oid))
+            remote = Remote(self.repo, context.branch, options.get('remote_oid', current.observed_remote_oid))
             observed = SimpleNamespace(remote=remote, head=self.remote,
                 metadata=(('onto', current.target_base_oid),) if in_progress else None,
                 index=(SimpleNamespace(stage=1),) if stages else ())
@@ -249,7 +255,7 @@ class ExecutionFixture:
 
     def context(self, phase=None):
         if phase is not None:
-            self.state.update_project('repo', phase=phase)
+            self.state.update_project(self.repo, phase=phase)
         return self.handler._context()
 
     def review_context(self):
@@ -258,11 +264,11 @@ class ExecutionFixture:
             title='Runtime', sources=('docs/PRODUCT.md',), depends_on=(),
             complexity='medium', risk='medium', priority='normal',
             body_hash='body', source_fingerprint='source', archive_candidates=(),
-            guidance_hash=plan_content_hash(self.connection, 'repo', 'G-047'),
+            guidance_hash=plan_content_hash(self.connection, self.repo, 'G-047'),
         )
         self.handler._definition_snapshot = snapshot
         self.state.update_project(
-            'repo', phase='REVIEWING', active_sha='base',
+            self.repo, phase='REVIEWING', active_sha='base',
             validated_base_sha='base', worker_result='worker result',
             verify_result='successful verify output',
             worker_input_token=snapshot.worker_token,
@@ -290,7 +296,129 @@ class ExecutionFixture:
         return self.git(path, *args, **kwargs)
 
 
-def execution_fixture(test):
+def execution_fixture(test, *, repo='repo'):
     fixture = fixture_cleanup(test, ExecutionFixture())
+    fixture.repo = repo
     fixture.setUp()
     return fixture
+
+
+def execution_policy_fixture(test):
+    """Run retry/escalation policy with real handlers and SQLite, fake Git IO."""
+    fixture = execution_fixture(test, repo=str(Path('/repo').resolve()))
+    from loop_manager_internal.storage.validation_feedback_state import ValidationFeedbackRepository
+    fixture.plan.update(complexity='low', risk='low')
+    fixture.connection.execute(
+        'UPDATE projects SET planning_fingerprint = NULL WHERE repo = ?', (fixture.repo,))
+    fixture.connection.commit()
+    fixture.state.update_project(fixture.repo, phase='WORKING')
+    fixture.effects.workspace.remote_branch_oid.return_value = None
+    fixture.effects.workspace.is_directory.return_value = True
+    fixture.effects.agent.is_loop_manager_repository.return_value = False
+    fixture.candidate = 'candidate-0'
+    fixture.commits = 0
+
+    def git(_path, *args, **_kwargs):
+        fixture.calls.append(args[0])
+        if args == ('rev-parse', 'HEAD'):
+            output = fixture.candidate
+        elif args == ('rev-parse', 'origin/main'):
+            output = 'base'
+        elif args == ('status', '--porcelain'):
+            output = ' M app.py' if fixture.dirty else ''
+        elif args[:2] == ('commit', '-m') and len(args) == 3 and args[2]:
+            fixture.commits += 1
+            fixture.candidate = f'candidate-{fixture.commits}'
+            fixture.dirty = False
+            output = ''
+        elif args == ('remote', 'get-url', 'origin'):
+            output = 'https://example.test/owner/repo.git'
+        elif args == ('diff', '--no-ext-diff', '--name-status', '-z', '--find-renames',
+                      'base', fixture.candidate):
+            output = ''
+        elif args in {
+            ('fetch', 'origin'), ('add', '-A'),
+            ('show', 'plan-sha:docs/plans/[G-047] Runtime.md'),
+        }:
+            output = ''
+        else:
+            raise AssertionError(f'unexpected policy Git: {args}')
+        return SimpleNamespace(returncode=0, stdout=output)
+
+    fixture.effects.workspace.git.side_effect = git
+    fixture.effects.agent.capture_git_snapshot.side_effect = lambda *_: lm.GitSnapshot(
+        fixture.candidate, 'loop-manager/G-047', {}, {}, {}, {}, {}, {})
+    def push(*_args):
+        fixture.effects.workspace.remote_branch_oid.return_value = fixture.candidate
+        return fixture.candidate
+    fixture.effects.publication.push_managed_publication_branch.side_effect = push
+    from loop_manager_internal.recovery import block_service
+    block_effects = block_service.BlockActiveExecplanEffects(**{
+        field.name: {
+            'capture_git_snapshot': fixture.effects.agent.capture_git_snapshot,
+            '_worktree_execplan_input_fingerprint': lambda *_: 'worktree-input',
+            '_revision_execplan_input_fingerprint': lambda *_: 'remote-input',
+            '_revision_review_issue_fingerprint': lambda *_: 'review-input',
+        }.get(field.name, getattr(lm, field.name))
+        for field in fields(block_service.BlockActiveExecplanEffects)
+    })
+    fixture.effects.blocking.block_active_execplan.side_effect = lambda *args, **kwargs: (
+        block_service.block_active_execplan(block_effects, fixture.connection, *args, **kwargs))
+    validation = replace(fixture.effects.validation, **{
+        name: fixture.state.bind(getattr(lm, name), connected=connected,
+                                 mutates=connected, name=name)
+        for name, connected in (
+            ('ensure_worker_level_state', True),
+            ('clear_validation_failure_history', True),
+            ('transition_validation_failure', True),
+            ('parse_worker_result', False), ('parse_reviewer_result', False),
+        )
+    })
+    fixture.effects = replace(fixture.effects, validation=validation,
+        contract=handlers.ExecutionContract.from_source(lm),
+        feedback=handlers.FeedbackEffects(ValidationFeedbackRepository(fixture.connection),
+                                         lm.validation_failure_fingerprints),
+        agent=replace(fixture.effects.agent, run_agent_with_retries=lm.run_agent_with_retries,
+                      worker_prompt=lm.worker_prompt, reviewer_prompt=lm.reviewer_prompt))
+    fixture.handler.effects = fixture.effects
+    return fixture
+
+
+def run_execution_policy(fixture):
+    """Use the production phase coordinator, retry loop and run budget storage."""
+    # ponytail: This fixture starts at an activated plan. Keep discovery,
+    # workspace preparation and process wiring in the real-Git regressions;
+    # add inputs here only when a phase-policy scenario needs them.
+    from loop_manager_internal.application import project_runner
+    from loop_manager_internal.execution.execution_runtime import (
+        ExecutionPhaseCoordinator, ExecutionOutcomeKind,
+    )
+
+    def step(*_args, **_kwargs):
+        context = fixture.context()
+        while True:
+            outcome = ExecutionPhaseCoordinator(fixture.handler).dispatch(context)
+            if outcome.kind is not ExecutionOutcomeKind.PHASE_ADVANCED:
+                return lm._execution_outcome_step_result(outcome)
+            context = outcome.context
+
+    effects = project_runner.InternalRunProjectResultEffects(**{
+        field.name: (step if field.name == '_run_project_step'
+                     else fixture.effects.agent.is_loop_manager_repository
+                     if field.name == 'is_loop_manager_repository' else getattr(lm, field.name))
+        for field in fields(project_runner.InternalRunProjectResultEffects)
+    })
+    # Publishing blocked diagnostics is a separate Git effect. Keep its queued
+    # SQLite request pending; checkpoint publication is exercised independently.
+    effects = replace(effects, dispatch_blocked_checkpoints=mock.Mock(return_value=None))
+    outer = project_runner.RunProjectResultEffects(
+        _blocked_recovery_subjects=lm._blocked_recovery_subjects,
+        _run_project_result=lambda *args, **kwargs: project_runner._run_project_result(
+            effects, *args, **kwargs),
+    )
+    # Every unexpected process call fails instead of silently returning success.
+    with mock.patch('subprocess.Popen', side_effect=AssertionError('unexpected policy process')):
+        return project_runner.run_project_result(
+            outer, fixture.connection, Path('/state'), fixture.repo,
+            Path('/config'), 'main', False,
+        )

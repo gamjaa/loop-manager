@@ -8,11 +8,36 @@ from pathlib import Path
 from unittest import mock
 import loop_manager
 from tests.support.worker import worker_result
-from tests.support.publication import publishing_branch_pr_lookup
+from tests.support.execution import execution_policy_fixture, run_execution_policy
 from tests.support.worker import dummy_worker_sessions
 
 
 class ExecutionRetryPolicyTest(BoundedRecoveryFixture, unittest.TestCase):
+    def test_git_observation_failure_pauses_without_discarding_saved_worker(self):
+        fixture = execution_policy_fixture(self)
+        fixture.state.update_project(
+            fixture.repo, worker_result='saved worker evidence', worker_session_id='worker-session')
+        observe = fixture.effects.workspace.git.side_effect
+
+        def unavailable(path, *args, **kwargs):
+            if args == ('fetch', 'origin'):
+                raise loop_manager.GitLockError('external Git lock')
+            return observe(path, *args, **kwargs)
+
+        fixture.effects.workspace.git.side_effect = unavailable
+        result = run_execution_policy(fixture)
+        project = fixture.connection.execute(
+            'SELECT * FROM projects WHERE repo = ?', (fixture.repo,)).fetchone()
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.TRANSIENT_PAUSE)
+        self.assertEqual(project['worker_result'], 'saved worker evidence')
+        self.assertEqual(project['worker_session_id'], 'worker-session')
+        fixture.effects.agent.run_agent.assert_not_called()
+        recovery = fixture.connection.execute(
+            'SELECT * FROM recovery_records WHERE repo = ?', (fixture.repo,)).fetchone()
+        self.assertEqual(recovery['attempts'], 3)
+        with self.assertRaisesRegex(AssertionError, 'unexpected policy Git'):
+            observe(Path('/repo'), 'unexpected-command')
+
     @dummy_worker_sessions
     def test_verify_port_uses_supplied_timeout_without_rereading_config(self):
         from tests.support.database import runtime_connection
@@ -171,76 +196,34 @@ class ExecutionRetryPolicyTest(BoundedRecoveryFixture, unittest.TestCase):
                     self.assertEqual(result.kind, expected_kind)
                     self.assertEqual(result.exit_code, expected_code)
 
-    @dummy_worker_sessions
     def test_distinct_verify_failures_recover_in_one_run_with_persistent_sessions(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repo, state_dir, connection = self._active_worker_project(directory)
-            roles = []
-            worker_sessions = []
-            reviewer_sessions = []
-            worker_version = 1
+        fixture = execution_policy_fixture(self)
+        roles, worker_sessions, reviewer_sessions = [], [], []
 
-            def agent(worktree, _state, _config, role_name, _prompt, **kwargs):
-                nonlocal worker_version
-                roles.append(role_name)
-                if role_name == "worker":
-                    worker_sessions.append(kwargs["session_id"])
-                    worker_version += 1
-                    (worktree / "src/app.py").write_text(
-                        f"VALUE = {worker_version}\n", encoding="utf-8"
-                    )
-                    return loop_manager.CodexResult(
-                        0,
-                        worker_result(f"Record recovery {worker_version}"),
-                        "worker-session",
-                    )
-                reviewer_sessions.append(kwargs["session_id"])
-                return loop_manager.CodexResult(
-                    0, "VERDICT: PASS", "reviewer-session"
-                )
+        def agent(*args, **kwargs):
+            role_name = args[4]
+            roles.append(role_name)
+            kwargs['on_session_started'](role_name + '-session')
+            if role_name == 'worker':
+                worker_sessions.append(kwargs['session_id'])
+                fixture.dirty = True
+                return loop_manager.AgentResult(
+                    0, worker_result(f'Record recovery {len(worker_sessions)}'),
+                    session_id='worker-session')
+            reviewer_sessions.append(kwargs['session_id'])
+            return loop_manager.AgentResult(0, 'VERDICT: PASS', session_id='reviewer-session')
 
-            verify_results = [
-                (False, "failure A"),
-                (False, "failure B"),
-                (False, "failure C"),
-                (False, "failure D"),
-                (True, "verify: PASS"),
-            ]
-            with mock.patch(
-                "loop_manager.validate_repository", return_value=repo
-            ), mock.patch(
-                "loop_manager.remote_base", return_value="main"
-            ), mock.patch(
-                "loop_manager.ensure_safe_base_worktree"
-            ), mock.patch(
-                "loop_manager.pr_for_branch", side_effect=publishing_branch_pr_lookup(
-                    connection, "https://example.test/pr/13"
-                )
-            ), mock.patch(
-                "loop_manager.run_codex", side_effect=agent
-            ), mock.patch(
-                "loop_manager.verify", side_effect=verify_results
-            ) as verify:
-                result = loop_manager.run_project_result(
-                    connection,
-                    state_dir,
-                    str(repo),
-                    Path("unused.ini"),
-                    "main",
-                    False,
-                )
-
-            project = connection.execute(
-                "SELECT phase, worker_session_id, reviewer_session_id "
-                "FROM projects WHERE repo = ?",
-                (str(repo),),
-            ).fetchone()
-            plan = connection.execute(
-                "SELECT status, worker_session_id, reviewer_session_id, "
-                "verify_failure_history, review_failure_history "
-                "FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
-                (str(repo),),
-            ).fetchone()
+        fixture.effects.agent.run_agent.side_effect = agent
+        verify = fixture.effects.validation.verify
+        verify.side_effect = [
+            (False, 'failure A'), (False, 'failure B'),
+            (False, 'failure C'), (False, 'failure D'), (True, 'verify: PASS'),
+        ]
+        result = run_execution_policy(fixture)
+        project = fixture.connection.execute(
+            'SELECT * FROM projects WHERE repo = ?', (fixture.repo,)).fetchone()
+        plan = fixture.connection.execute(
+            'SELECT * FROM exec_plans WHERE repo = ?', (fixture.repo,)).fetchone()
 
         self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
         self.assertEqual(result.exit_code, 0)

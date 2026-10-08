@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 from contextlib import ExitStack
 import sqlite3
 from pathlib import Path
@@ -9,6 +10,7 @@ from tests.support.worker import make_active_worker_project, worker_result
 from tests.support.publication import matching_branch_pr_lookup
 from loop_manager_internal.verification.timing import phase
 from tests.support.lifecycle import register_connection_cleanup
+from tests.support.execution import execution_policy_fixture, run_execution_policy
 
 
 class BoundedRecoveryFixture:
@@ -83,6 +85,10 @@ class BoundedRecoveryFixture:
         publish: bool,
         boundary=None,
     ) -> dict[str, object]:
+        if boundary is None:
+            return self._mock_review_sequence(review_messages, publish=publish)
+        # This explicit boundary variant verifies restoration of the same real
+        # Git/index evidence and SQLite preparation, not just Review policy.
         if boundary is not None and Path(directory).resolve() != Path(boundary.directory).resolve():
             raise RuntimeError('Review 준비 경로가 복구 경계와 다릅니다')
         reused = boundary is not None and boundary.saved
@@ -212,3 +218,48 @@ class BoundedRecoveryFixture:
             "plan": plan,
             "verify_calls": verify.call_count,
         }
+
+    def _mock_review_sequence(self, review_messages, *, publish):
+        fixture = execution_policy_fixture(self)
+        roles, sessions, prompts, transitions = [], [], [], []
+        responses = iter(review_messages)
+        original = fixture.effects.validation.transition_validation_failure
+
+        def transition(*args, **kwargs):
+            decision = original(*args, **kwargs)
+            transitions.append((decision.stage, decision.fingerprint,
+                                decision.occurrences, decision.blocked))
+            return decision
+
+        fixture.effects = replace(fixture.effects, validation=replace(
+            fixture.effects.validation, transition_validation_failure=transition))
+        fixture.handler.effects = fixture.effects
+
+        def agent(*args, **kwargs):
+            role, prompt = args[4:6]
+            roles.append(role)
+            kwargs['on_session_started'](role + '-session')
+            if role == 'worker':
+                fixture.dirty = True
+                return loop_manager.AgentResult(0, worker_result(
+                    f'Record review sequence {len(roles)}'), session_id='worker-session')
+            sessions.append(kwargs['session_id'])
+            prompts.append(prompt)
+            return loop_manager.AgentResult(0, next(responses), session_id='reviewer-session')
+
+        fixture.effects.agent.run_agent.side_effect = agent
+        result = run_execution_policy(fixture)
+        if not publish:
+            fixture.effects.publication.command.assert_not_called()
+            fixture.effects.publication.push_managed_publication_branch.assert_not_called()
+        project = fixture.connection.execute(
+            'SELECT * FROM projects WHERE repo = ?', (fixture.repo,)).fetchone()
+        plan = fixture.connection.execute(
+            'SELECT * FROM exec_plans WHERE repo = ?', (fixture.repo,)).fetchone()
+        checkpoint = fixture.connection.execute(
+            'SELECT phase, published_oid FROM blocked_checkpoints WHERE repo = ?',
+            (fixture.repo,)).fetchone()
+        return dict(result=result, roles=roles, reviewer_sessions=sessions,
+                    reviewer_prompts=prompts, transitions=transitions,
+                    project=project, plan=plan, blocked_checkpoint=checkpoint,
+                    verify_calls=fixture.effects.validation.verify.call_count)

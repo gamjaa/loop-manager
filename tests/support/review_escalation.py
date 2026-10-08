@@ -1,11 +1,10 @@
 import json
 import sqlite3
 from pathlib import Path
-from unittest import mock
 import loop_manager
 from tests.support.catalog import make_catalog_root, write_execplan
 from tests.support.worker import make_active_worker_project, worker_result
-from tests.support.publication import publishing_branch_pr_lookup
+from tests.support.execution import execution_policy_fixture, run_execution_policy
 
 
 class WorkerEscalationFixture:
@@ -78,59 +77,28 @@ class WorkerEscalationFixture:
         list[int],
         sqlite3.Row,
     ]:
-        repo, state_dir, connection = self._active_worker_project(directory)
-        worker_levels: list[int] = []
-        worker_version = 1
+        fixture = execution_policy_fixture(self)
+        worker_levels = []
         responses = iter(reviewer_results)
 
-        def agent(worktree, _state, _config, role_name, _prompt, **kwargs):
-            nonlocal worker_version
-            if role_name == "worker":
-                worker_levels.append(kwargs["level"])
-                worker_version += 1
-                (worktree / "src/app.py").write_text(
-                    f"VALUE = {worker_version}\n", encoding="utf-8"
-                )
-                return loop_manager.CodexResult(
-                    0,
-                    worker_result(f"Record escalation {worker_version}"),
-                    "worker-session",
+        def agent(*args, **kwargs):
+            role = args[4]
+            kwargs['on_session_started'](role + '-session')
+            if role == 'worker':
+                worker_levels.append(kwargs['level'])
+                fixture.dirty = True
+                return loop_manager.AgentResult(
+                    0, worker_result(f'Record escalation {len(worker_levels)}'),
+                    session_id='worker-session',
                 )
             return next(responses)
 
-        pr_lookup = (publishing_branch_pr_lookup(connection, "https://example.test/pr/19")
-                     if publish else lambda *_args, **_kwargs: None)
-
-        with mock.patch(
-            "loop_manager.validate_repository", return_value=repo
-        ), mock.patch(
-            "loop_manager.remote_base", return_value="main"
-        ), mock.patch(
-            "loop_manager.ensure_safe_base_worktree"
-        ), mock.patch(
-            "loop_manager.pr_for_branch", side_effect=pr_lookup
-        ), mock.patch(
-            "loop_manager.run_codex", side_effect=agent
-        ), mock.patch(
-            "loop_manager.verify", return_value=(True, "verify: PASS")
-        ):
-            result = loop_manager.run_project_result(
-                connection,
-                state_dir,
-                str(repo),
-                Path("unused.ini"),
-                "main",
-                False,
-            )
-
-        plan = connection.execute(
-            """
-            SELECT status, review_failure_history, initial_worker_level,
-                   effective_worker_level, review_level_history
-            FROM exec_plans
-            WHERE repo = ? AND plan_id = 'G-019'
-            """,
-            (str(repo),),
+        fixture.effects.agent.run_agent.side_effect = agent
+        result = run_execution_policy(fixture)
+        if not publish:
+            fixture.effects.publication.command.assert_not_called()
+            fixture.effects.publication.push_managed_publication_branch.assert_not_called()
+        plan = fixture.connection.execute(
+            'SELECT * FROM exec_plans WHERE repo = ?', (fixture.repo,),
         ).fetchone()
-        connection.close()
         return result, worker_levels, plan

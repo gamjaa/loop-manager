@@ -403,9 +403,22 @@ PR 없는 게시 checkpoint의 Review 횟수 차단을 rebase 없이 해제할 �
 
 verify 지문 이력, Review 지문·level 승격 이력과 실행별 Worker 교정 횟수는 별도로 저장한다. 최종 반복·일시 중단·BLOCKED 해제 조건은 PRODUCT의 실패 정책을 따른다. verify 성공은 verify 이력만, Review 성공은 Review 이력만 초기화하고 effective level·승격 이력은 유지한다.
 
-자체 복구 테스트의 `RecoveryBoundary`는 한 테스트 안의 직렬 변형만 같은 소유 경로에 복원한다. 다른 테스트·병렬 실행은 별도 경로·원격·DB를 소유한다. Review 프로토콜 변형은 실제 Worker·verify를 통과한 Review 진입 직전을 보존하며, 파일/mode·Git 객체/ref/index/config·SQLite/TEMP 상태의 digest와 복원 후 새 Git snapshot을 대조한다. 교정 Worker의 파일 version도 경계에서 이어받아 실제 새 작업물이 생성되게 한다. 호출 경로·준비 입력 불일치는 복원 전에 거부하며 자료 손상·재현 실패도 실패로 보고한다. 이전 receipt를 현재 증거로 사용하지 않는다. `git_fixture:review_*`와 `git_fixture:boundary_*` 단계는 생성·Worker/verify 준비·복사·복원·identity 및 재현 확인·정리를 기록한다. `git_fixture_seconds`는 같은 PID의 유효한 `start`·`duration` 경계에서 완전히 포함된 하위 fixture 시간만 총계에서 제외한다. 개별 phase event와 duration은 보존하며, 별도 프로세스나 중첩 경계가 불완전한 이벤트는 포함 관계를 추정하지 않는다. duration이 없는 이벤트의 시간을 만들지 않는다.
-
 외부 CLI의 실행 실패, timeout과 일시적 서비스 오류는 프로그램 실행당 최대 3회 재시도한다. 모두 실패하면 현재 상태를 유지하고 해당 프로젝트를 건너뛴다. 다음 Loop Manager 실행에서는 다시 최대 3회 시도한다. AI 사용 한도 소진이 확인되면 현재 실행에서는 재시도하지 않는다.
+
+### 자체 테스트의 Git 경계
+
+자체 테스트의 전환 목표는 [R-080](requirements/%5BR-080%5D%20Git%20Mock%20Defaults%20for%20Tests.md)에 따라 Git 호출을 mock으로 처리하는 것을 기본으로 삼는 것이다. 실제 Git은 mock으로 확인할 수 없는 Git 동작이나 프로세스 연결 계약을 검증할 때만 사용하며, 해당 테스트에서 이유와 확인할 효과가 드러나야 한다. 통합 테스트라는 이름이나 기존 fixture의 준비 편의는 실제 Git 실행의 근거가 아니다.
+
+| 검증 대상 | Git 경계 |
+|---|---|
+| 상태 전이·재시도·차단·복구 정책과 입력 조건 조합 | 관측값·명령 결과를 mock으로 제공하고 실제 판단·저장 로직 실행 |
+| 명령 인자·출력 파싱·종료 코드·관측 실패 처리 | 명령 경계를 mock으로 처리하고 실제 구성·파싱·오류 처리 실행 |
+| 실제 충돌·rebase·index·worktree·원격 lease의 효과 | 해당 Git 계약을 확인하는 필요한 통합 회귀에서 실제 Git 사용 |
+| bootstrap의 부모/자식 실행과 exact-SHA runtime 연결 | 실제 연결 계약을 확인하는 필요한 통합 회귀 유지 |
+
+mock은 기존 Git adapter나 관측 경계에 적용하고 `ExecutionFixture`·`CurrentRebaseFixture`·관측값 생성 도구를 재사용한다. SQLite·파일 보존이 검증 대상이면 실제 저장을 유지한다. 정상·오류·중단과 연속 관측 사이의 HEAD·원격 OID 변화를 재현하며, 검증할 판정 함수나 상태 전이를 성공값으로 대체하지 않는다. 전환 시 기존 검증 조건·assertion의 대응과 필수 통합 회귀를 보존하고, 테스트 skip·timeout 확대·수집 범위 축소로 비용 감소를 대신하지 않는다.
+
+실제 Git이 필요한 자체 복구 통합 테스트의 `RecoveryBoundary`는 한 테스트 안의 직렬 변형만 같은 소유 경로에 복원한다. 다른 테스트·병렬 실행은 별도 경로·원격·DB를 소유한다. Review 프로토콜 변형은 실제 Worker·verify를 통과한 Review 진입 직전을 보존하며, 파일/mode·Git 객체/ref/index/config·SQLite/TEMP 상태의 digest와 복원 후 새 Git snapshot을 대조한다. 교정 Worker의 파일 version도 경계에서 이어받아 실제 새 작업물이 생성되게 한다. 호출 경로·준비 입력 불일치는 복원 전에 거부하며 자료 손상·재현 실패도 실패로 보고한다. 이전 receipt를 현재 증거로 사용하지 않는다. `git_fixture:review_*`와 `git_fixture:boundary_*` 단계는 생성·Worker/verify 준비·복사·복원·identity 및 재현 확인·정리를 기록한다. `git_fixture_seconds`는 같은 PID의 유효한 `start`·`duration` 경계에서 완전히 포함된 하위 fixture 시간만 총계에서 제외한다. 개별 phase event와 duration은 보존하며, 별도 프로세스나 중첩 경계가 불완전한 이벤트는 포함 관계를 추정하지 않는다. duration이 없는 이벤트의 시간을 만들지 않는다.
 
 ## GitHub와 PR
 
