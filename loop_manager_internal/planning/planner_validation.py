@@ -163,16 +163,17 @@ def _validate_future_idea_separation(
             )
 
 
-def _planning_reserved_ids(
+def _planning_id_inventory(
     worktree: Path,
     new_plan_paths: set[str],
     snapshot: MutableReadySnapshot,
     connection: sqlite3.Connection | None,
     repo: str | None,
     held_ids: frozenset[str],
-) -> set[str]:
-    """Collect occupied IDs without parsing a catalog that may contain a collision."""
-    reserved = {plan.plan_id for plan in snapshot.plans} | set(held_ids)
+) -> tuple[set[str], set[str]]:
+    """Collect occupied IDs and actual plan identities before normalization."""
+    existing_plan_ids = {plan.plan_id for plan in snapshot.plans}
+    reserved = existing_plan_ids | set(held_ids)
     for relative_directory in ("docs/plans", "docs/plans/archive"):
         directory = worktree / relative_directory
         try:
@@ -205,6 +206,7 @@ def _planning_reserved_ids(
                 continue
             if isinstance(plan_id, str) and re.fullmatch(r"G-\d{3,}", plan_id):
                 reserved.add(plan_id)
+                existing_plan_ids.add(plan_id)
 
     if connection is not None and repo is not None:
         tables = {
@@ -219,8 +221,11 @@ def _planning_reserved_ids(
             for row in connection.execute(
                 f"SELECT plan_id FROM {table} WHERE repo = ?", (repo,)
             ):
-                reserved.add(str(row[0]))
-    return reserved
+                plan_id = str(row[0])
+                reserved.add(plan_id)
+                if table == "exec_plans":
+                    existing_plan_ids.add(plan_id)
+    return reserved, existing_plan_ids
 
 
 def _rewrite_plan_identity(text: str, plan_id: str, dependency_ids: dict[str, str]) -> str:
@@ -242,12 +247,17 @@ def _rewrite_plan_identity(text: str, plan_id: str, dependency_ids: dict[str, st
                 lines[index] = f"  - {dependency_ids[dependency]}{ending}"
             continue
         in_dependencies = False
-        match = re.fullmatch(r"(id:\s*)(G-\d{3,})(\s*)", content)
-        if match is not None:
-            lines[index] = f"{match.group(1)}{plan_id}{match.group(3)}{ending}"
+        if ":" not in content:
+            continue
+        key, raw_value = content.split(":", 1)
+        if key.strip() == "id":
+            match = re.fullmatch(r"(\s*)G-\d{3,}(\s*)", raw_value)
+            if match is None:
+                raise PlannerValidationError("ExecPlan ID 항목을 정규화할 수 없습니다.")
+            lines[index] = f"{key}:{match.group(1)}{plan_id}{match.group(2)}{ending}"
             replaced_id = True
             continue
-        if content == "depends_on:":
+        if key.strip() == "depends_on" and not raw_value.strip():
             in_dependencies = True
     if not replaced_id:
         raise PlannerValidationError("ExecPlan ID 항목을 정규화할 수 없습니다.")
@@ -266,6 +276,8 @@ def _normalize_new_plan_batch(
     worktree: Path,
     plans: list[tuple[str, dict[str, object]]],
     reserved_ids: set[str],
+    existing_plan_ids: set[str],
+    parse_execplan: Callable[..., object],
 ) -> tuple[list[tuple[str, dict[str, object]]], tuple[PlanIdAllocation, ...]]:
     """Assign new plans a fresh consecutive range and rewrite only certain edges."""
     if not plans:
@@ -287,12 +299,22 @@ def _normalize_new_plan_batch(
         source_id for source_id, target_id in id_mapping.items()
         if source_id != target_id
     }
+    batch_ids = set(claimed)
     for path, plan in ordered:
-        ambiguous = sorted(set(str(item) for item in plan["depends_on"]) & collisions)
+        dependencies = {str(item) for item in plan["depends_on"]}
+        ambiguous = sorted(dependencies & collisions)
         if ambiguous:
             raise PlannerValidationError(
                 "새 batch dependency가 기존 ID와 충돌 ID를 함께 가리켜 모호합니다: "
                 f"{path} -> {', '.join(ambiguous)}"
+            )
+        missing = sorted(
+            dependencies - batch_ids - existing_plan_ids
+        )
+        if missing:
+            raise PlannerValidationError(
+                "새 ExecPlan dependency 대상이 없습니다: "
+                f"{path} -> {', '.join(missing)}"
             )
         try:
             source = worktree / path
@@ -399,11 +421,27 @@ def _normalize_new_plan_batch(
                 raise ExternalObservationError(
                     f"새 ExecPlan 정규화 파일을 쓸 수 없습니다: {target_path}"
                 ) from error
-        updated_plan = dict(plan)
-        updated_plan["id"] = new_id
-        updated_plan["depends_on"] = [
-            id_mapping.get(str(item), str(item)) for item in plan["depends_on"]
-        ]
+        try:
+            updated_plan = dict(parse_execplan(
+                worktree,
+                destination,
+                require_priority=True,
+                allow_archive_fallback=False,
+            ))
+        except (UnicodeError, RuntimeError) as error:
+            if isinstance(error, (ExternalObservationError, GitLockError)):
+                raise
+            raise PlannerValidationError(
+                f"정규화된 ExecPlan을 다시 읽을 수 없습니다: {target_path} ({error})"
+            ) from error
+        if (
+            str(updated_plan.get("id")) != new_id
+            or tuple(str(item) for item in updated_plan.get("depends_on", ()))
+            != tuple(id_mapping.get(str(item), str(item)) for item in plan["depends_on"])
+        ):
+            raise PlannerValidationError(
+                f"정규화된 ExecPlan identity가 배정 결과와 다릅니다: {target_path}"
+            )
         normalized.append((target_path, updated_plan))
         allocations.append(PlanIdAllocation(source_path, old_id, target_path, new_id))
     return normalized, tuple(allocations)
@@ -578,11 +616,12 @@ def validate_planner_result(
                 plans.append((path, parsed))
 
         new_source_paths = {path for path, _plan in plans}
-        reserved_before_normalization = _planning_reserved_ids(
+        reserved_before_normalization, existing_plan_ids = _planning_id_inventory(
             worktree, new_source_paths, snapshot, connection, repo, held_ids
         )
         plans, id_allocations = _normalize_new_plan_batch(
-            worktree, plans, reserved_before_normalization
+            worktree, plans, reserved_before_normalization, existing_plan_ids,
+            effects._parse_execplan,
         )
         if id_allocations:
             for path in new_source_paths:
@@ -645,7 +684,7 @@ def validate_planner_result(
         new_plan_paths = [path for path, _plan in plans]
         effects._validate_future_idea_separation(worktree, active_sha, new_plan_paths)
         new_ids = {str(plan["id"]) for _, plan in plans}
-        reserved_ids = _planning_reserved_ids(
+        reserved_ids, _existing_plan_ids = _planning_id_inventory(
             worktree, set(new_plan_paths), snapshot, connection, repo, held_ids
         )
         if new_ids & reserved_ids:

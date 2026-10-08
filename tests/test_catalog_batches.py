@@ -175,6 +175,133 @@ class CatalogBatchesTest(AutomationCatalogFixture, unittest.TestCase):
             self.assertEqual(existing.read_text(encoding="utf-8"), existing_text)
             self.assertEqual(archive_path.read_text(encoding="utf-8"), archived_text)
 
+            from loop_manager_internal.catalog import execplan_catalog, execplan_drafts
+            from loop_manager_internal.storage import execplan_draft_state
+            published_plan = result.plans[0][1]
+            observed_plan = loop_manager._parse_execplan(repo, target)
+            self.assertEqual(published_plan["draft_scope"], observed_plan["draft_scope"])
+            execplan_draft_state.ensure_schema(connection)
+            content_hash = execplan_catalog.plan_content_hash(target_text)
+            inputs = execplan_drafts.input_digests(repo, published_plan)
+            execplan_draft_state.observe(
+                connection, str(repo), result.plans[0][0], published_plan,
+                content_hash, "b" * 40, inputs=inputs, agent=True,
+            )
+            published_revision = execplan_draft_state.evidence(
+                connection, str(repo), "G-010",
+            )["revision"]
+            execplan_draft_state.observe(
+                connection, str(repo), result.plans[0][0], observed_plan,
+                content_hash, "b" * 40,
+                inputs=execplan_drafts.input_digests(repo, observed_plan),
+            )
+            self.assertEqual(
+                execplan_draft_state.evidence(connection, str(repo), "G-010")["revision"],
+                published_revision,
+            )
+            approved_text = target_text.replace("draft: true\n", "") + (
+                "\n## User Decision\n\n"
+                "Decision: approve\n"
+                f"Revision: {published_revision}\n"
+                "Answer: Keep the existing behavior and history.\n"
+            )
+            approved_plan = execplan_catalog.parse_execplan_text(
+                result.plans[0][0], approved_text, root=repo,
+                require_priority=True, allow_archive_fallback=False,
+            )
+            execplan_draft_state.observe(
+                connection, str(repo), result.plans[0][0], approved_plan,
+                execplan_catalog.plan_content_hash(approved_text), "c" * 40,
+                inputs=execplan_drafts.input_digests(repo, approved_plan),
+            )
+            self.assertFalse(
+                execplan_draft_state.evidence(connection, str(repo), "G-010")["pending"]
+            )
+
+    def test_unknown_dependency_cannot_be_captured_by_reallocated_plan_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_catalog_root(directory)
+            existing = write_execplan(repo, "G-001", "Existing")
+            first = write_execplan(repo, "G-005", "First")
+            second = write_execplan(
+                repo, "G-006", "Second", depends_on=("G-002",),
+            )
+            originals = {path: path.read_bytes() for path in (first, second)}
+
+            with planner_git_observations({
+                existing.relative_to(repo).as_posix(): existing.read_text(encoding="utf-8"),
+            }), self.assertRaisesRegex(
+                loop_manager.PlannerValidationError, "dependency 대상이 없습니다"
+            ):
+                loop_manager.validate_planner_result(
+                    repo, "base", [
+                        first.relative_to(repo).as_posix(),
+                        second.relative_to(repo).as_posix(),
+                    ],
+                )
+
+            self.assertEqual({path: path.read_bytes() for path in originals}, originals)
+
+    def test_frontmatter_whitespace_is_supported_for_remapped_and_consecutive_ids(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_catalog_root(directory)
+            existing = write_execplan(repo, "G-001", "Existing")
+            first = write_execplan(repo, "G-005", "First")
+            second = write_execplan(
+                repo, "G-006", "Second", depends_on=("G-005",),
+            )
+            first.write_text(
+                first.read_text(encoding="utf-8").replace("id: G-005", "id : G-005"),
+                encoding="utf-8",
+            )
+            second.write_text(
+                second.read_text(encoding="utf-8")
+                .replace("id: G-006", "id : G-006")
+                .replace("depends_on:\n", "depends_on: \n"),
+                encoding="utf-8",
+            )
+
+            with planner_git_observations({
+                existing.relative_to(repo).as_posix(): existing.read_text(encoding="utf-8"),
+            }):
+                result = loop_manager.validate_planner_result(
+                    repo, "base", [
+                        first.relative_to(repo).as_posix(),
+                        second.relative_to(repo).as_posix(),
+                    ],
+                )
+
+            self.assertEqual(
+                [plan["id"] for _path, plan in result.plans], ["G-002", "G-003"],
+            )
+            self.assertEqual(result.plans[1][1]["depends_on"], ["G-002"])
+            self.assertIn("id : G-002", (repo / result.plans[0][0]).read_text(encoding="utf-8"))
+            self.assertIn(
+                "depends_on: \n  - G-002",
+                (repo / result.plans[1][0]).read_text(encoding="utf-8"),
+            )
+
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_catalog_root(directory)
+            existing = write_execplan(repo, "G-001", "Existing")
+            consecutive = write_execplan(repo, "G-002", "Consecutive")
+            consecutive.write_text(
+                consecutive.read_text(encoding="utf-8")
+                .replace("id: G-002", "id : G-002")
+                .replace("depends_on: []", "depends_on: "),
+                encoding="utf-8",
+            )
+
+            with planner_git_observations({
+                existing.relative_to(repo).as_posix(): existing.read_text(encoding="utf-8"),
+            }):
+                result = loop_manager.validate_planner_result(
+                    repo, "base", [consecutive.relative_to(repo).as_posix()],
+                )
+
+            self.assertEqual(result.plans[0][1]["id"], "G-002")
+            self.assertIn("id : G-002", consecutive.read_text(encoding="utf-8"))
+
     def test_batch_path_renames_free_destination_paths_before_assigning_them(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = make_catalog_root(directory)
