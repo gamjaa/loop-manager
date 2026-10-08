@@ -313,6 +313,8 @@ worktree가 없고 소유 branch가 있으면 재등록할 수 있다. 둘 다 �
 
 일반적인 PLAN_BLOCKED는 계획·원래 활성 sources의 내용 해시를 기준으로 재평가한다. 닫힌 PR은 같은 PR reopen을 요구한다. 과거 파일 승인 대기는 일반 작업·소유권 검사를 통과하면 기록을 보존한 채 재개한다. 독립 차단·planning 오류·실패 감사는 함께 지우지 않는다. planning_error는 실제 교정·재검증·게시 복구로 원인이 해소된 뒤에만 지운다. cleanup_pending과 ExecPlan archive pending은 상태 전이를 만들지 않는다.
 
+Worker session binding과 pending transition은 판정 전에 저장 JSON의 객체·필수 필드·문자열·지원 kind·중첩 binding을 검증한다. 손상값은 기존 `STATUS_FAILED` 복구 경계에서 진단하며 원문, phase, 작업물과 실패·level 승격 감사를 보존한다. 손상 pending을 건너뛰어 기존 session을 실행하거나 성공·차단 해제를 만들지 않는다.
+
 Git·journal 파일·SQLite는 단일 원자 transaction이 아니다. 저장 intent, 현재 Git 결과와 SQLite generation을 대조해 이미 끝난 단계를 반복하지 않고 결과만 멱등하게 반영한다. 과거 증거·실패·알림 감사는 삭제하지 않는다.
 
 반복 수동 제출의 저장 후보는 생성 당시 원격 OID·incoming 부모와 결합한다. exact 게시 전이 또는 후보를 포함하는 후속 이력의 equal 관측은 같은 저장소·소유자·종류·대상 ref로 검증한다. equal intent는 정확한 OID 관측 뒤 저장되므로 결과 저장 전 재중단과 후속 관측으로 종료된 전이에도 게시 근거를 유지한다. 종료된 exact 전이의 aborted receipt는 소유 intent·빈 기준 근거·원격 후속 계보를 검증해 원문 그대로 확정한다. 그 관측에 후보가 포함돼 있으면 다음 equal intent가 없어도 게시 후보 제거를 감지한다. 완료 receipt는 변경하지 않으며, 원격에서 게시 후보가 제거되면 새 lease나 대체 후보를 만들지 않는다.

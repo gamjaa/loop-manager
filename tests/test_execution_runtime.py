@@ -65,15 +65,6 @@ class FakeWorkerPort:
         )
 
 
-class FakeLatestBasePort:
-    def __init__(self):
-        self.calls = []
-
-    def reconcile(self, context, checkpoint):
-        self.calls.append((context, checkpoint))
-        return None
-
-
 class FakeValidationPort:
     def __init__(self):
         self.verify_calls = []
@@ -108,7 +99,6 @@ class FakePorts:
     def __init__(self, prepared):
         self.workspace = FakeWorkspacePort(prepared)
         self.worker = FakeWorkerPort()
-        self.latest_base = FakeLatestBasePort()
         self.validation = FakeValidationPort()
         self.publication = FakePublicationPort()
         self.guard_calls = []
@@ -128,13 +118,16 @@ class FakePorts:
         return self.worker.run(context)
 
     def verify(self, context, latest_base):
-        return self.validation.verify(context, self.latest_base)
+        return self.validation.verify(context, latest_base)
 
     def review(self, context):
         return self.validation.review(context)
 
     def publish(self, context, latest_base):
-        return self.publication.publish(context, self.latest_base)
+        return self.publication.publish(context, latest_base)
+
+    def reconcile(self, context, checkpoint, observed_base_sha=None):
+        return None
 
 
 class CoordinatorRecoveryTests(unittest.TestCase):
@@ -155,6 +148,7 @@ class CoordinatorRecoveryTests(unittest.TestCase):
         coordinator.dispatch(prepared)
         self.assertEqual(len(ports.validation.verify_calls), 1)
         self.assertEqual(ports.publication.calls, [])
+        self.assertEqual(calls, ['recover'])
 
 
 class ExecutionPhaseCoordinatorTests(unittest.TestCase):
@@ -224,9 +218,9 @@ class ExecutionPhaseCoordinatorTests(unittest.TestCase):
         self.assertEqual(review_outcome.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
         self.assertEqual(publication_outcome.kind, ExecutionOutcomeKind.SUCCESS)
         self.assertEqual(ports.worker.calls, [implementing])
-        self.assertEqual(ports.validation.verify_calls, [(verifying, ports.latest_base)])
+        self.assertEqual(ports.validation.verify_calls, [(verifying, ports)])
         self.assertEqual(ports.validation.review_calls, [reviewing])
-        self.assertEqual(ports.publication.calls, [(publishing, ports.latest_base)])
+        self.assertEqual(ports.publication.calls, [(publishing, ports)])
         self.assertEqual(
             ports.guard_calls,
             [implementing, verifying, reviewing, publishing],

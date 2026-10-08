@@ -3,6 +3,7 @@
 from tests.support.current_rebase import current_rebase_case
 from tests.support.execution import ExecutionFixture
 from dataclasses import fields, replace
+import json
 from types import SimpleNamespace
 from unittest import TestCase, mock
 
@@ -11,8 +12,11 @@ import loop_manager as lm
 from loop_manager_internal.execution.validation_feedback import Feedback
 from loop_manager_internal.storage.validation_feedback_state import ValidationFeedbackRepository
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
-from loop_manager_internal.execution.execution_runtime import ExecutionPhase, ExecutionOutcomeKind
+from loop_manager_internal.execution.execution_runtime import (
+    ExecutionOutcomeKind, ExecutionPhase, ExecutionPhaseCoordinator,
+)
 from loop_manager_internal.execution.worker_session import SessionBinding, SessionTransition
+from loop_manager_internal.recovery.recovery_runtime import RecoveryReason
 from tests.support.execution import VALID_WORKER_RESULT
 
 
@@ -140,6 +144,179 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         self.assertIn('Fix the assertion', prompts[1])
         self.assertNotIn('raw Review detail omitted from prompt', prompts[1])
         self.assertEqual(feedback.prepare('repo', 'G-047', 'replacement').rows, ())
+
+
+    def test_replacement_start_failure_reuses_pending_target_after_restart(self):
+        old = SessionBinding('codex', 'old-model', 'low')
+        self.state.update_project('repo', worker_session_id='old-session',
+                                  worker_session_binding=old.serialize())
+        self.effects.agent.resolve_worker_profile.return_value = lm.ResolvedProfile(
+            'new-model', 'high',
+        )
+        self.effects.agent.run_agent.side_effect = RuntimeError('start interrupted')
+        with self.assertRaisesRegex(RuntimeError, 'start interrupted'):
+            self.handler.run(self.context())
+        pending = SessionTransition.deserialize(
+            self.state.row()['worker_session_transition'],
+        )
+        self.assertIsNone(self.state.row()['worker_session_id'])
+        self.effects.agent.resolve_worker_profile.return_value = lm.ResolvedProfile(
+            'old-model', 'low',
+        )
+
+        def invoke(*args, **kwargs):
+            self.assertIsNone(kwargs['session_id'])
+            self.assertEqual(kwargs['resolved_profile'].model, 'new-model')
+            kwargs['on_session_started']('new-session')
+            return lm.AgentResult(0, VALID_WORKER_RESULT, session_id='new-session')
+
+        self.effects.agent.run_agent.side_effect = invoke
+        with mock.patch.object(self.handler, '_finish_worker',
+                               return_value=SimpleNamespace(kind='done')):
+            self.handler.run(self.context())
+        self.assertEqual(self.state.row()['worker_session_id'], 'new-session')
+        self.assertIsNone(self.state.row()['worker_session_transition'])
+        self.assertEqual(pending.identity,
+                         self.effects.agent.run_agent.call_args.kwargs['invocation'].transition_id)
+
+
+    def test_unavailable_fallback_intent_survives_failed_new_start(self):
+        self.state.update_project('repo', worker_session_id='old-session',
+                                  worker_result='saved result',
+                                  verify_result='raw verify')
+        self.effects.agent.worker_prompt.side_effect = lm.worker_prompt
+        self.effects.agent.run_agent_with_retries.side_effect = lm.run_agent_with_retries
+        calls = []
+
+        def interrupted(*args, **kwargs):
+            calls.append(kwargs['session_id'])
+            if kwargs['session_id']:
+                return lm.AgentResult(1, 'unknown session', session_id='old-session')
+            pending = SessionTransition.deserialize(
+                self.state.row()['worker_session_transition'],
+            )
+            self.assertEqual((pending.kind, pending.previous_session),
+                             ('fallback', 'old-session'))
+            self.assertIn('saved result', args[5])
+            raise RuntimeError('new session interrupted')
+
+        self.effects.agent.run_agent.side_effect = interrupted
+        with self.assertRaisesRegex(RuntimeError, 'new session interrupted'):
+            self.handler.run(self.context())
+        self.assertEqual(calls, ['old-session', None])
+        pending = SessionTransition.deserialize(
+            self.state.row()['worker_session_transition'],
+        )
+        self.assertIsNone(self.state.row()['worker_session_id'])
+        self.assertEqual(self.state.row()['verify_result'], 'raw verify')
+
+        def recovered(*args, **kwargs):
+            self.assertIsNone(kwargs['session_id'])
+            self.assertIn('saved result', args[5])
+            self.assertEqual(kwargs['invocation'].transition_id, pending.identity)
+            kwargs['on_session_started']('replacement-session')
+            return lm.AgentResult(0, VALID_WORKER_RESULT,
+                                  session_id='replacement-session')
+
+        self.effects.agent.run_agent.side_effect = recovered
+        with mock.patch.object(self.handler, '_finish_worker',
+                               return_value=SimpleNamespace(kind='done')):
+            self.handler.run(self.context())
+        self.assertEqual(self.state.row()['worker_session_id'], 'replacement-session')
+        self.assertIsNone(self.state.row()['worker_session_transition'])
+
+
+    def test_corrupt_session_binding_recovers_before_worker_call_and_preserves_audits(self):
+        bad_binding = '{"provider": 7, "model": "model", "effort": "high"}'
+        self.state.update_project(
+            'repo', worker_session_id='saved-session',
+            worker_session_binding=bad_binding, worker_session_transition=None,
+            worker_result='saved worker result', verify_result='saved verify result',
+            review_result='saved review result',
+        )
+        self.repository.update_plan(
+            'repo', 'G-047', plan_values={
+                'initial_worker_level': 3,
+                'effective_worker_level': 4,
+                'review_level_history': '{"3":{"issue":1}}',
+                'review_correction_state': json.dumps({
+                    'version': 1, 'level': 3, 'closed': False,
+                    'baseline': ['review:issue'], 'failures': 1,
+                    'issues': {'review:issue': 1},
+                    'audit': [{'kind': 'baseline', 'level': 3,
+                               'issues': ['review:issue'], 'effective_level': 3}],
+                    'pending': {'source': 1, 'level': 3, 'completed': False,
+                                'verified_head': None},
+                    'candidate': {'level': 3, 'completed': False,
+                                  'verified_head': None},
+                }, sort_keys=True),
+                'verify_failure_history': '{"failures":1}',
+                'review_failure_history': '{"failures":2}',
+            },
+        )
+        before = self.state.row()
+        audit_fields = (
+            'initial_worker_level', 'effective_worker_level', 'review_level_history',
+            'review_correction_state', 'verify_failure_history', 'review_failure_history',
+        )
+        before_audit = self.connection.execute(
+            'SELECT initial_worker_level, effective_worker_level, review_level_history, '
+            'review_correction_state, verify_failure_history, review_failure_history '
+            'FROM exec_plans WHERE repo = ? AND plan_id = ?',
+            ('repo', 'G-047'),
+        ).fetchone()
+        context = self.context()
+
+        with mock.patch.object(self.handler, 'guard', return_value=context), \
+             mock.patch.object(self.handler, 'work_started'):
+            outcome = ExecutionPhaseCoordinator(self.handler).dispatch(context)
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(outcome.recovery.observation.reason, RecoveryReason.STATUS_FAILED)
+        self.effects.agent.run_agent.assert_not_called()
+        after = self.state.row()
+        for field in (
+            'worker_session_id', 'worker_session_binding', 'worker_session_transition',
+            'phase', 'worker_result', 'verify_result', 'review_result',
+        ):
+            self.assertEqual(after[field], before[field], field)
+        after_audit = self.connection.execute(
+            'SELECT initial_worker_level, effective_worker_level, review_level_history, '
+            'review_correction_state, verify_failure_history, review_failure_history '
+            'FROM exec_plans WHERE repo = ? AND plan_id = ?',
+            ('repo', 'G-047'),
+        ).fetchone()
+        for field in audit_fields:
+            self.assertEqual(after_audit[field], before_audit[field], field)
+
+
+    def test_corrupt_pending_transition_does_not_resume_saved_session(self):
+        valid_binding = SessionBinding('codex', 'model', 'high').serialize()
+        bad_pending = (
+            '{"identity":"change-one","kind":"start","cause":"start",'
+            '"previous_session":"saved-session","previous_binding":null,'
+            '"target":{"provider":"codex","model":"model","effort":"high"}}'
+        )
+        self.state.update_project(
+            'repo', worker_session_id='saved-session',
+            worker_session_binding=valid_binding, worker_session_transition=bad_pending,
+        )
+        before = self.state.row()
+        context = self.context()
+
+        with mock.patch.object(self.handler, 'guard', return_value=context), \
+             mock.patch.object(self.handler, 'work_started'):
+            outcome = ExecutionPhaseCoordinator(self.handler).dispatch(context)
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(outcome.recovery.observation.reason, RecoveryReason.STATUS_FAILED)
+        self.effects.agent.run_agent.assert_not_called()
+        after = self.state.row()
+        self.assertEqual(after['worker_session_id'], 'saved-session')
+        self.assertEqual(after['worker_session_transition'], bad_pending)
+        self.assertEqual(after['phase'], before['phase'])
+        self.assertEqual(after['worker_result'], before['worker_result'])
+        self.assertEqual(after['verify_result'], before['verify_result'])
 
 
     def test_model_replacement_records_intent_before_agent_and_binds_event(self):

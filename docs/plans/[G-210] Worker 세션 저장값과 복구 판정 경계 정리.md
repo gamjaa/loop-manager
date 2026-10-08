@@ -28,6 +28,7 @@ Worker 세션 저장값의 해석과 실행 복구를 명시적으로 연결하�
 - `loop_manager_internal/execution/worker_session.py`의 codec 검증과 `execution_worker_handler`의 복구 연결을 분리한다. 기존 오류 판정/진단 경계를 사용하며 저장 format 버전·migration·새 복구 서비스는 추가하지 않는다.
 - `tests/test_execution_failure_policy.py`의 서로 다른 책임을 기존 phase별 테스트에 배치하고 통합 사례는 남긴다. G-214의 활성 Worker 준비 계약을 재사용하며 테스트 이동/수집 대응을 기록한다.
 - `tests/test_execution_runtime.py`의 FakePorts가 받은 인자를 기록·검증한 뒤 위임하도록 한다. 대역이 복구/상태 전이를 대신 수행하지 않게 한다.
+- `test_replacement_start_failure_reuses_pending_target_after_restart`와 `test_unavailable_fallback_intent_survives_failed_new_start`는 `tests/test_execution_worker_phase.py`에서 세션 전이·재시작 책임으로 검증한다. codec 형식은 `tests/test_worker_session.py`, coordinator의 `latest_base` 전달과 단일 recover는 `tests/test_execution_runtime.py`가 소유한다.
 
 ## Validation
 

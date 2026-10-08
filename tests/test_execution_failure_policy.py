@@ -14,9 +14,7 @@ from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 from loop_manager_internal.execution.execution_runtime import ExecutionPhase, ExecutionOutcome, ExecutionOutcomeKind
 from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
-from loop_manager_internal.execution.worker_session import SessionBinding, SessionTransition
 from tests.support.worker import decision as worker_decision
-from tests.support.execution import VALID_WORKER_RESULT
 
 
 from tests.support.execution_recovery_scenarios import ExecutionRecoveryScenarios
@@ -60,80 +58,6 @@ class ExecutionFailurePolicyTests(ExecutionRecoveryScenarios, ExecutionPhaseScen
         self.assertEqual(len(resumed), 1)
         self.assertEqual(json.loads(resumed[0][0])['operation'],
                          'ExecPlan IMPLEMENTING')
-
-
-    def test_replacement_start_failure_reuses_pending_target_after_restart(self):
-        old = SessionBinding('codex', 'old-model', 'low')
-        self.state.update_project('repo', worker_session_id='old-session',
-                                  worker_session_binding=old.serialize())
-        self.effects.agent.resolve_worker_profile.return_value = lm.ResolvedProfile(
-            'new-model', 'high',
-        )
-        self.effects.agent.run_agent.side_effect = RuntimeError('start interrupted')
-        with self.assertRaisesRegex(RuntimeError, 'start interrupted'):
-            self.handler.run(self.context())
-        pending = SessionTransition.deserialize(
-            self.state.row()['worker_session_transition'],
-        )
-        self.assertIsNone(self.state.row()['worker_session_id'])
-        self.effects.agent.resolve_worker_profile.return_value = lm.ResolvedProfile(
-            'old-model', 'low',
-        )
-        def invoke(*args, **kwargs):
-            self.assertIsNone(kwargs['session_id'])
-            self.assertEqual(kwargs['resolved_profile'].model, 'new-model')
-            kwargs['on_session_started']('new-session')
-            return lm.AgentResult(0, VALID_WORKER_RESULT, session_id='new-session')
-        self.effects.agent.run_agent.side_effect = invoke
-        with mock.patch.object(self.handler, '_finish_worker',
-                               return_value=SimpleNamespace(kind='done')):
-            self.handler.run(self.context())
-        self.assertEqual(self.state.row()['worker_session_id'], 'new-session')
-        self.assertIsNone(self.state.row()['worker_session_transition'])
-        self.assertEqual(pending.identity,
-                         self.effects.agent.run_agent.call_args.kwargs['invocation'].transition_id)
-
-
-    def test_unavailable_fallback_intent_survives_failed_new_start(self):
-        self.state.update_project('repo', worker_session_id='old-session',
-                                  worker_result='saved result',
-                                  verify_result='raw verify')
-        self.effects.agent.worker_prompt.side_effect = lm.worker_prompt
-        self.effects.agent.run_agent_with_retries.side_effect = lm.run_agent_with_retries
-        calls = []
-        def interrupted(*args, **kwargs):
-            calls.append(kwargs['session_id'])
-            if kwargs['session_id']:
-                return lm.AgentResult(1, 'unknown session', session_id='old-session')
-            pending = SessionTransition.deserialize(
-                self.state.row()['worker_session_transition'],
-            )
-            self.assertEqual((pending.kind, pending.previous_session),
-                             ('fallback', 'old-session'))
-            self.assertIn('saved result', args[5])
-            raise RuntimeError('new session interrupted')
-        self.effects.agent.run_agent.side_effect = interrupted
-        with self.assertRaisesRegex(RuntimeError, 'new session interrupted'):
-            self.handler.run(self.context())
-        self.assertEqual(calls, ['old-session', None])
-        pending = SessionTransition.deserialize(
-            self.state.row()['worker_session_transition'],
-        )
-        self.assertIsNone(self.state.row()['worker_session_id'])
-        self.assertEqual(self.state.row()['verify_result'], 'raw verify')
-        def recovered(*args, **kwargs):
-            self.assertIsNone(kwargs['session_id'])
-            self.assertIn('saved result', args[5])
-            self.assertEqual(kwargs['invocation'].transition_id, pending.identity)
-            kwargs['on_session_started']('replacement-session')
-            return lm.AgentResult(0, VALID_WORKER_RESULT,
-                                  session_id='replacement-session')
-        self.effects.agent.run_agent.side_effect = recovered
-        with mock.patch.object(self.handler, '_finish_worker',
-                               return_value=SimpleNamespace(kind='done')):
-            self.handler.run(self.context())
-        self.assertEqual(self.state.row()['worker_session_id'], 'replacement-session')
-        self.assertIsNone(self.state.row()['worker_session_transition'])
 
 
     def test_worker_decision_without_file_change_bypasses_no_change_gate(self):
