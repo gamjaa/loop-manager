@@ -795,12 +795,12 @@ def reviewer_targeted_test_reason(test_evidence: str) -> str | None:
 
 
 def _looks_like_reported_test_command(line: str) -> bool:
-    """Recognize generic executable lines with an option or file argument."""
+    """Recognize executable paths and generic commands with test arguments."""
     try:
         words = shlex.split(re.sub(r"(?i)^COMMAND:\s*", "", line.strip()))
     except ValueError:
         return False
-    if len(words) < 2:
+    if not words:
         return False
     executable = words[0]
     if not re.fullmatch(
@@ -812,7 +812,7 @@ def _looks_like_reported_test_command(line: str) -> bool:
             and "\\" not in executable
             and not executable.lower().endswith((".exe", ".cmd", ".bat"))):
         return False
-    return any(
+    return "/" in executable or "\\" in executable or any(
         argument.startswith(("-", "./", "../", "/", ".\\", "..\\", "\\"))
         or "/" in argument
         or "\\" in argument

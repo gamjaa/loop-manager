@@ -244,6 +244,26 @@ class WorkerResultContractTest(unittest.TestCase):
                     expected + '\nResult: PASS',
                 )
 
+    def test_reviewer_targeted_evidence_keeps_argumentless_test_paths(self):
+        for command in (
+            'COMMAND: ./build/tests/test_api',
+            './build/tests/test_api',
+            'COMMAND: /opt/tests/test_api',
+            'COMMAND: ./tests/test_api.sh',
+        ):
+            with self.subTest(command=command):
+                publication = loop_manager.parse_worker_result(
+                    worker_result('Preserve individual test paths', 'Summary',
+                                  command + '\nResult: PASS\nunrelated raw log'),
+                    self.plan,
+                )
+                self.assertEqual(
+                    reviewer_targeted_test_evidence(publication.test_evidence),
+                    command + '\nResult: PASS',
+                )
+        self.assertEqual(reviewer_targeted_test_evidence('unrelated\nResult: PASS'),
+                         'Result: PASS')
+
     def test_targeted_test_evidence_requires_a_clean_explicit_rerun(self):
         valid_evidence = (
             "pytest: 0 failed, 2 passed",
