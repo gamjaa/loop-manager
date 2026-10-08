@@ -40,7 +40,7 @@ class BootstrapEntryTests(unittest.TestCase):
                 if "-c" in command:
                     return subprocess.CompletedProcess(
                         command, 0,
-                        stdout='{"created":1,"reused":0,"replaced":0,"unavailable":0}',
+                        stdout='{"created":1,"reused":0,"replaced":0,"unavailable":0,"missing":0}',
                         stderr="",
                     )
                 path = Path(command[command.index("-u") + 1])

@@ -3,8 +3,10 @@ from dataclasses import replace
 import importlib.util
 import os
 from pathlib import Path
+import py_compile
 import shutil
 import sys
+import subprocess
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -75,9 +77,10 @@ class BootstrapFoundationTests(unittest.TestCase):
                     if caches:
                         prepared_cache_bytes.append(caches[0].read_bytes())
             service.effects.operation_log.side_effect = record_prepared_cache
-            with mock.patch.object(bootstrap.sys, 'pycache_prefix', None), mock.patch.dict(os.environ, {
-                'PYTHONDONTWRITEBYTECODE': '', 'PYTHONPYCACHEPREFIX': '',
-            }):
+            with mock.patch.object(bootstrap.sys, 'dont_write_bytecode', False), \
+                    mock.patch.object(bootstrap.sys, 'pycache_prefix', None), mock.patch.dict(os.environ, {
+                        'PYTHONDONTWRITEBYTECODE': '', 'PYTHONPYCACHEPREFIX': '',
+                    }):
                 self.assertEqual(service.run_runtime_child(source, state, source / 'config.ini', runtime, []), 7)
                 cache_files = list(prefix.rglob('runtime_helper.*.pyc'))
                 self.assertEqual(len(cache_files), 1)
@@ -97,6 +100,12 @@ class BootstrapFoundationTests(unittest.TestCase):
                 self.assertEqual(int.from_bytes(cached[4:8], 'little'), 3)
                 self.assertEqual(cached[8:16], importlib.util.source_hash(helper.read_bytes()))
 
+                cache_files[0].write_bytes(cached[:16])
+                self.assertEqual(service.run_runtime_child(source, state, source / 'config.ini', runtime, []), 7)
+                cached = cache_files[0].read_bytes()
+                self.assertEqual(int.from_bytes(cached[4:8], 'little'), 3)
+                self.assertEqual(cached[8:16], importlib.util.source_hash(helper.read_bytes()))
+
                 cache_files[0].write_bytes(b'corrupt cache')
                 self.assertEqual(service.run_runtime_child(source, state, source / 'config.ini', runtime, []), 7)
 
@@ -106,7 +115,85 @@ class BootstrapFoundationTests(unittest.TestCase):
             logs = [call.args[0] for call in service.effects.operation_log.call_args_list]
             self.assertTrue(any('created=3 reused=0' in line for line in logs), logs)
             self.assertTrue(any('created=0 reused=3' in line for line in logs), logs)
-            self.assertTrue(any('created=0 reused=2 replaced=1' in line for line in logs), logs)
+            self.assertEqual(
+                sum('created=0 reused=2 replaced=1' in line for line in logs), 2, logs,
+            )
+
+
+    def test_runtime_child_propagates_command_line_cache_prefix_to_environment(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'; source.mkdir()
+            runtime_path = root / 'runtime'; runtime_path.mkdir()
+            cache_prefix = root / 'command-line-cache'
+            service = runtime_service(runtime_path)
+            service._prepare_runtime_bytecode_cache = mock.Mock(return_value=False)
+            runtime = RuntimeWorktree(runtime_path, 'a' * 40)
+            with mock.patch.object(bootstrap.sys, 'dont_write_bytecode', False), \
+                    mock.patch.object(bootstrap.sys, 'pycache_prefix', str(cache_prefix)), \
+                    mock.patch.dict(os.environ, {
+                        'PYTHONDONTWRITEBYTECODE': '', 'PYTHONPYCACHEPREFIX': '',
+                    }), mock.patch.object(
+                        bootstrap.subprocess, 'run', return_value=SimpleNamespace(returncode=0),
+                    ) as child:
+                self.assertEqual(service.run_runtime_child(
+                    source, root / 'state', source / 'config.ini', runtime, []), 0)
+
+            command = child.call_args.args[0]
+            self.assertEqual(command[command.index('-X') + 1], f'pycache_prefix={cache_prefix}')
+            self.assertEqual(child.call_args.kwargs['env']['PYTHONPYCACHEPREFIX'], str(cache_prefix))
+
+
+    def test_runtime_child_uses_fresh_prefix_when_corrupt_cache_cannot_be_repaired(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'; source.mkdir()
+            runtime_path = root / 'runtime'; runtime_path.mkdir()
+            helper = runtime_path / 'runtime_helper.py'
+            helper.write_text('VALUE = 7\n', encoding='utf-8')
+            (runtime_path / 'loop_manager.py').write_text(
+                'import runtime_helper\nfrom pathlib import Path\n'
+                'Path("observed-cache-path").write_text(runtime_helper.__cached__)\n'
+                'raise SystemExit(runtime_helper.VALUE)\n', encoding='utf-8')
+            service = runtime_service(runtime_path)
+            service.interpreter = sys.executable
+            service.effects.git.return_value = SimpleNamespace(
+                stdout='loop_manager.py\0runtime_helper.py\0', returncode=0,
+            )
+            runtime = RuntimeWorktree(runtime_path, 'a' * 40)
+            cache_prefix = root / 'user-cache'
+            with mock.patch.object(bootstrap.sys, 'dont_write_bytecode', False), \
+                    mock.patch.object(bootstrap.sys, 'pycache_prefix', str(cache_prefix)), \
+                    mock.patch.dict(os.environ, {
+                        'PYTHONDONTWRITEBYTECODE': '',
+                        'PYTHONPYCACHEPREFIX': str(cache_prefix),
+                    }):
+                cache = Path(importlib.util.cache_from_source(str(helper)))
+                cache.parent.mkdir(parents=True)
+                py_compile.compile(
+                    str(helper), str(cache), doraise=True,
+                    invalidation_mode=py_compile.PycInvalidationMode.CHECKED_HASH,
+                )
+                cache.write_bytes(cache.read_bytes()[:16])
+                corrupt_cache = cache.read_bytes()
+                real_run = subprocess.run
+
+                def fail_cache_repair(command, *args, **options):
+                    if '-c' in command:
+                        return subprocess.CompletedProcess(
+                            command, 0,
+                            stdout='{"created":0,"reused":0,"replaced":0,"unavailable":1,"missing":0}',
+                            stderr='',
+                        )
+                    return real_run(command, *args, **options)
+
+                with mock.patch.object(bootstrap.subprocess, 'run', side_effect=fail_cache_repair):
+                    self.assertEqual(service.run_runtime_child(
+                        source, root / 'state', source / 'config.ini', runtime, []), 7)
+
+            self.assertEqual(cache.read_bytes(), corrupt_cache)
+            used_cache = Path((runtime_path / 'observed-cache-path').read_text())
+            self.assertFalse(used_cache.is_relative_to(cache_prefix))
 
 
     def test_runtime_child_respects_explicit_bytecode_disable_and_cache_prefix(self):
@@ -149,7 +236,9 @@ class BootstrapFoundationTests(unittest.TestCase):
             cache_path.write_text('preserve user file\n', encoding='utf-8')
             (runtime_path / 'runtime_helper.py').write_text('VALUE = 7\n', encoding='utf-8')
             (runtime_path / 'loop_manager.py').write_text(
-                'import runtime_helper\nraise SystemExit(runtime_helper.VALUE)\n', encoding='utf-8')
+                'import runtime_helper\nfrom pathlib import Path\nimport sys\n'
+                'Path("observed-cache-prefix").write_text(sys.pycache_prefix)\n'
+                'raise SystemExit(runtime_helper.VALUE)\n', encoding='utf-8')
             service = runtime_service(runtime_path)
             service.interpreter = sys.executable
             service.effects.git.return_value = SimpleNamespace(
@@ -166,6 +255,10 @@ class BootstrapFoundationTests(unittest.TestCase):
 
             self.assertEqual(cache_path.read_text(encoding='utf-8'), 'preserve user file\n')
             self.assertFalse((runtime_path / '__pycache__').exists())
+            self.assertNotEqual(
+                (runtime_path / 'observed-cache-prefix').read_text(encoding='utf-8'),
+                str(cache_path),
+            )
 
 
     def test_lock_identity_contention_and_release(self):
