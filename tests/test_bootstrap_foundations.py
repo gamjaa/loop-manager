@@ -261,6 +261,44 @@ class BootstrapFoundationTests(unittest.TestCase):
             )
 
 
+    def test_runtime_child_executes_source_when_fallback_cache_creation_fails(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / 'source'; source.mkdir()
+            runtime_path = root / 'runtime'; runtime_path.mkdir()
+            user_cache = root / 'user-cache'; user_cache.mkdir()
+            sentinel = user_cache / 'preserve.txt'
+            sentinel.write_text('keep user cache\n', encoding='utf-8')
+            (runtime_path / 'runtime_helper.py').write_text('VALUE = 7\n', encoding='utf-8')
+            (runtime_path / 'loop_manager.py').write_text(
+                'import runtime_helper\nfrom pathlib import Path\nimport sys\n'
+                'Path("observed-cache-prefix").write_text(sys.pycache_prefix)\n'
+                'raise SystemExit(runtime_helper.VALUE)\n', encoding='utf-8')
+            service = runtime_service(runtime_path)
+            service.interpreter = sys.executable
+            service._prepare_runtime_bytecode_cache = mock.Mock(return_value=True)
+            runtime = RuntimeWorktree(runtime_path, 'a' * 40)
+            with mock.patch.object(bootstrap.sys, 'dont_write_bytecode', False), \
+                    mock.patch.object(bootstrap.sys, 'pycache_prefix', str(user_cache)), \
+                    mock.patch.dict(os.environ, {
+                        'PYTHONDONTWRITEBYTECODE': '',
+                        'PYTHONPYCACHEPREFIX': str(user_cache),
+                    }), mock.patch.object(
+                        bootstrap.tempfile, 'TemporaryDirectory',
+                        side_effect=OSError('temporary storage unavailable'),
+                    ):
+                self.assertEqual(service.run_runtime_child(
+                    source, root / 'state', source / 'config.ini', runtime, []), 7)
+
+            observed_prefix = Path((runtime_path / 'observed-cache-prefix').read_text())
+            self.assertNotEqual(observed_prefix, user_cache)
+            self.assertEqual(sentinel.read_text(encoding='utf-8'), 'keep user cache\n')
+            self.assertTrue(any(
+                '임시 디렉터리 생성 실패' in call.args[0]
+                for call in service.effects.operation_log.call_args_list
+            ))
+
+
     def test_lock_identity_contention_and_release(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)
@@ -329,9 +367,17 @@ class BootstrapFoundationTests(unittest.TestCase):
         runtime = RuntimeWorktree(Path('/runtime'), 'a' * 40, 'b' * 32)
         config = runtime_identity.source_config_path(Path('/source'), 'custom/config.ini')
         service.effects.git.return_value = SimpleNamespace(stdout='', returncode=0)
+        service._prepare_runtime_bytecode_cache = mock.Mock(return_value=True)
         events = []
         service.remove_runtime_worktree = mock.Mock(side_effect=lambda *a: (
             events.append('cleanup') or (_ for _ in ()).throw(RuntimeError('keep runtime'))))
+        def fail_cache_cleanup():
+            events.append('cache-cleanup')
+            raise OSError('cache cleanup denied')
+        fallback_cache = SimpleNamespace(
+            name='/tmp/loop-manager-runtime-bytecode-test',
+            cleanup=mock.Mock(side_effect=fail_cache_cleanup),
+        )
         def child(command, **options):
             events.append('child-exit')
             self.assertEqual(command[:2], ['/chosen/python', '-X'])
@@ -342,12 +388,22 @@ class BootstrapFoundationTests(unittest.TestCase):
             self.assertEqual(command[command.index('--runtime-mutation-id') + 1], 'b' * 32)
             self.assertEqual(options['cwd'], Path('/runtime'))
             self.assertFalse(options['check'])
-            self.assertNotIn('PYTHONPYCACHEPREFIX', options['env'])
+            self.assertFalse(options['env'].get('PYTHONPYCACHEPREFIX'))
             return SimpleNamespace(returncode=7)
-        with mock.patch.object(bootstrap.subprocess, 'run', side_effect=child):
+        with mock.patch.object(bootstrap.sys, 'dont_write_bytecode', False), \
+                mock.patch.object(bootstrap.sys, 'pycache_prefix', None), \
+                mock.patch.dict(os.environ, {
+                    'PYTHONDONTWRITEBYTECODE': '', 'PYTHONPYCACHEPREFIX': '',
+                }), mock.patch.object(
+                    bootstrap.tempfile, 'TemporaryDirectory', return_value=fallback_cache,
+                ), mock.patch.object(bootstrap.subprocess, 'run', side_effect=child):
             self.assertEqual(service.run_runtime_child(Path('/source'), Path('/state'), config, runtime,
                                                       ['--config=old.ini', 'run']), 7)
-        self.assertEqual(events, ['child-exit', 'cleanup'])
+        self.assertEqual(events, ['child-exit', 'cache-cleanup', 'cleanup'])
+        fallback_cache.cleanup.assert_called_once()
+        service.effects.operation_log.assert_any_call(
+            'runtime Python bytecode 임시 cache 정리 보류: cache cleanup denied', error=True,
+        )
         service.effects.operation_log.assert_any_call('runtime 정리 보류: keep runtime', error=True)
 
     def test_owned_runtime_can_be_recreated_at_same_sha(self):

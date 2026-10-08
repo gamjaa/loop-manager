@@ -12,6 +12,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import secrets
 import sqlite3
 import subprocess
 import sys
@@ -620,8 +621,18 @@ class BootstrapService:
         cache_prefix = self._runtime_cache_prefix(source, state_dir, runtime)
         fallback_cache = None
         if self._prepare_runtime_bytecode_cache(runtime, environment, cache_prefix):
-            fallback_cache = tempfile.TemporaryDirectory(prefix="loop-manager-runtime-bytecode-")
-            cache_prefix = fallback_cache.name
+            try:
+                fallback_cache = tempfile.TemporaryDirectory(prefix="loop-manager-runtime-bytecode-")
+                cache_prefix = fallback_cache.name
+            except OSError as error:
+                # A fresh, not-yet-created prefix makes Python read source and
+                # lets its normal best-effort pyc write fail without blocking import.
+                cache_prefix = str(Path(tempfile.gettempdir())
+                                   / f"loop-manager-runtime-bytecode-{secrets.token_hex(16)}")
+                self.effects.operation_log(
+                    "runtime Python bytecode cache 임시 디렉터리 생성 실패; "
+                    f"새 prefix에서 원본 실행: {error}", error=True,
+                )
             if environment.get(_DEFAULT_BYTECODE_PREFIX_MARKER) != "1":
                 environment["PYTHONPYCACHEPREFIX"] = cache_prefix
             self.effects.operation_log(
@@ -644,7 +655,12 @@ class BootstrapService:
             )
         finally:
             if fallback_cache is not None:
-                fallback_cache.cleanup()
+                try:
+                    fallback_cache.cleanup()
+                except OSError as error:
+                    self.effects.operation_log(
+                        f"runtime Python bytecode 임시 cache 정리 보류: {error}", error=True,
+                    )
         if runtime.mutation_id is not None:
             try:
                 self.remove_runtime_worktree(source, state_dir, runtime)
