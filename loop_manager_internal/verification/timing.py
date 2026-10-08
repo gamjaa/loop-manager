@@ -4,10 +4,13 @@ from collections import Counter
 from contextlib import contextmanager, ExitStack
 from contextvars import ContextVar
 from datetime import datetime, timezone
+import importlib.util
 import json
 import math
 import os
 from pathlib import Path
+import stat
+import sys
 import time
 import unittest
 from unittest import mock
@@ -178,11 +181,66 @@ def atomic_json(path: Path, value):
     os.replace(temporary, path)
 
 
+def bytecode_policy():
+    """Expose the effective interpreter cache choice without guessing outcomes."""
+    return {
+        "write_enabled": not sys.dont_write_bytecode,
+        "cache_tag": sys.implementation.cache_tag,
+        "cache_prefix": sys.pycache_prefix,
+        "optimization": sys.flags.optimize,
+    }
+
+
+def bytecode_cache_snapshot(root: Path):
+    """Observe this runner's Python sources and their current interpreter caches."""
+    root = Path(root)
+    sources = []
+    entrypoint = root / "loop_manager.py"
+    if entrypoint.is_file() and not entrypoint.is_symlink():
+        sources.append(entrypoint)
+    for base in (root / "loop_manager_internal", root / "tests"):
+        if not base.is_dir() or base.is_symlink():
+            continue
+        for directory, dirs, filenames in os.walk(base, followlinks=False):
+            parent = Path(directory)
+            dirs[:] = sorted(name for name in dirs
+                             if name != "__pycache__" and not (parent / name).is_symlink())
+            sources.extend(parent / name for name in filenames if name.endswith(".py"))
+
+    observed = {}
+    for source in sources:
+        try:
+            cache = Path(importlib.util.cache_from_source(str(source)))
+            metadata = cache.stat(follow_symlinks=False)
+        except (OSError, ValueError):
+            continue
+        if stat.S_ISREG(metadata.st_mode):
+            observed[source.relative_to(root).as_posix()] = (
+                metadata.st_dev, metadata.st_ino, metadata.st_size,
+                metadata.st_mtime_ns, metadata.st_ctime_ns,
+            )
+    return observed
+
+
+def bytecode_cache_changes(before, after):
+    """Count newly available, changed, retained and removed project caches."""
+    common = before.keys() & after.keys()
+    return {
+        "existing": len(before),
+        "present_after": len(after),
+        "created": len(after.keys() - before.keys()),
+        "changed": sum(before[path] != after[path] for path in common),
+        "unchanged": sum(before[path] == after[path] for path in common),
+        "removed": len(before.keys() - after.keys()),
+    }
+
+
 def summarize(directory: Path, *, now=None):
     now = time.monotonic() if now is None else now
     finished_at = None
     completed, active, phases, decisions, metadata, fixtures, result = [], {}, [], [], {}, [], None
     git_costs, git_incomplete = [], []
+    bytecode_cache = None
     for path in sorted(directory.glob("*.jsonl")):
         for line in path.read_text(encoding="utf-8").splitlines(keepends=True):
             if not line.endswith("\n"):
@@ -204,6 +262,7 @@ def summarize(directory: Path, *, now=None):
                 metadata = event
             elif kind == "run_end":
                 result = event
+                bytecode_cache = event.get("bytecode_cache")
             elif kind == "fixture_result":
                 fixtures.append(event)
             elif kind == 'git_cost':
@@ -226,14 +285,15 @@ def summarize(directory: Path, *, now=None):
                "phases": sorted(phases, key=lambda item: item["duration"], reverse=True),
                "active": [{**event, "elapsed": max(0, (finished_at if finished_at is not None else now) - event["at"])} for event in active.values()],
                "allocations": decisions, "git_snapshots": snapshots, "git_commands": git_costs,
-               "git_commands_incomplete": git_incomplete, "fixture_results": fixtures, "result": result}
+               "git_commands_incomplete": git_incomplete, "fixture_results": fixtures,
+               "bytecode_cache": bytecode_cache, "result": result}
     atomic_json(directory / "summary.json", summary)
     return summary
 
 
 def comparison(directories, summaries):
     """범위와 관측된 환경을 대조하고 실측 시간만 나란히 제공한다."""
-    scopes, contexts, runs = [], [], []
+    scopes, contexts, bytecode_policies, runs = [], [], [], []
     for directory, summary in zip(directories, summaries):
         path = directory / "manifest.json"
         modules = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else []
@@ -244,6 +304,7 @@ def comparison(directories, summaries):
         contexts.append((metadata.get("python"), metadata.get("git"), environment.get("host"),
                          environment.get("platform"), limits.get("cpus"), limits.get("affinity_cpus"),
                          limits.get("applied_quota"), limits.get("source")))
+        bytecode_policies.append(metadata.get("bytecode_policy"))
         def duration(name):
             return next((event["duration"] for event in summary["phases"] if event["name"] == name), None)
         fixture_phases = [event for event in summary["phases"]
@@ -278,20 +339,37 @@ def comparison(directories, summaries):
                                                   for command in cost["commands"].values()),
                      "git_commands": sum(cost['count'] for cost in summary.get('git_commands', [])),
                      "git_command_seconds": sum(cost['seconds'] for cost in summary.get('git_commands', [])),
+                     "bytecode_policy": metadata.get("bytecode_policy"),
+                     "bytecode_cache": summary.get("bytecode_cache"),
                      "passed": (summary.get("result") or {}).get("passed"), "counts": summary["counts"]})
     scope_matches = bool(scopes and scopes[0]) and all(scope == scopes[0] for scope in scopes)
+    bytecode_policy_matches = bool(bytecode_policies and isinstance(bytecode_policies[0], dict)) and all(
+        policy == bytecode_policies[0] for policy in bytecode_policies)
     environment_matches = bool(contexts and all(value is not None for value in contexts[0][:6])) and all(
         context == contexts[0] for context in contexts)
+    environment_matches = environment_matches and bytecode_policy_matches
     complete = all(run["passed"] is True and not summary["active"] for run, summary in zip(runs, summaries))
     return {"scope_matches": scope_matches, "observed_environment_matches": environment_matches,
+            "bytecode_policy_matches": bytecode_policy_matches,
             "comparable": len(runs) > 1 and scope_matches and environment_matches and complete,
-            "runs": runs, "note": "관측된 환경 일치만 확인합니다. 부하·메모리 제한도 원본 기록과 대조하세요. 포함 관계인 단계 시간은 합산하지 않습니다."}
+            "runs": runs, "note": "관측된 환경·bytecode 설정과 실제 캐시 파일 변화를 기록합니다. 속도 개선을 합성하지 않습니다. 부하·메모리 제한도 원본 기록과 대조하고, 포함 관계인 단계 시간은 합산하지 않습니다."}
 
 
 def diagnostic(directory: Path):
     summary = summarize(directory)
     lines = [f"verify 시간 진단: {directory / 'summary.json'}", f"완료 결과: {summary['counts']}",
              f"fixture 결과: {dict(Counter(event['result'] for event in summary['fixture_results']))}"]
+    policy = summary["metadata"].get("bytecode_policy")
+    cache = summary.get("bytecode_cache")
+    if isinstance(policy, dict) and isinstance(cache, dict):
+        mode = "enabled" if policy.get("write_enabled") else "disabled"
+        lines.append(
+            "Python bytecode: "
+            f"{mode}, tag={policy.get('cache_tag')}, prefix={policy.get('cache_prefix')}, "
+            f"existing={cache.get('existing')}, created={cache.get('created')}, "
+            f"changed={cache.get('changed')}, unchanged={cache.get('unchanged')}, "
+            f"removed={cache.get('removed')}"
+        )
     for event in summary["tests"][:5]:
         lines.append(f"느린 테스트 {event['duration']:.3f}s: {event['id']}")
     for event in summary["active"][:5]:

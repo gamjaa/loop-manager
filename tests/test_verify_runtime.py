@@ -5,6 +5,7 @@ import io
 import json
 import os
 from pathlib import Path
+import py_compile
 import subprocess
 import sys
 import tempfile
@@ -17,7 +18,10 @@ from loop_manager_internal.execution import verify_process, windows_job
 from loop_manager_internal.verification import guard, manifest, runner, manager_adapter
 from loop_manager_internal.verification.coordination import execution_settings
 from loop_manager_internal.execution.validation_feedback import MAX_DIAGNOSTIC, format_verify_failure
-from loop_manager_internal.verification.timing import EventWriter, TimedResult, comparison, fixture_timing, phase, summarize
+from loop_manager_internal.verification.timing import (
+    EventWriter, TimedResult, bytecode_cache_changes, bytecode_cache_snapshot,
+    comparison, fixture_timing, phase, summarize,
+)
 
 
 class TimingAndManifestTests(unittest.TestCase):
@@ -26,6 +30,8 @@ class TimingAndManifestTests(unittest.TestCase):
             root = Path(directory)
             (root / "manifest.json").write_text(json.dumps([{"ids": ["case"]}]))
             summary = {"metadata": {"revision": "first", "cap": 1, "python": "fake", "git": "fake",
+                       "bytecode_policy": {"write_enabled": True, "cache_tag": "cpython-312",
+                                           "cache_prefix": None, "optimization": 0},
                        "environment": {"host": "same", "platform": "fake", "limits": {
                            "cpus": 4, "affinity_cpus": 4, "applied_quota": None, "source": "fake"}}},
                        "phases": [{"name": "verify", "duration": 20}], "result": {"passed": True},
@@ -41,6 +47,11 @@ class TimingAndManifestTests(unittest.TestCase):
             other["metadata"]["environment"]["limits"]["cpus"] = 4
             other["active"] = [{"id": "unfinished"}]
             self.assertFalse(comparison([root, root], [summary, other])["comparable"])
+            other["active"] = []
+            other["metadata"]["bytecode_policy"]["cache_prefix"] = "/different-cache"
+            changed_policy = comparison([root, root], [summary, other])
+            self.assertFalse(changed_policy["bytecode_policy_matches"])
+            self.assertFalse(changed_policy["comparable"])
             changed = root / "changed"
             changed.mkdir()
             (changed / "manifest.json").write_text(json.dumps([{"ids": ["another"]}]))
@@ -97,6 +108,22 @@ class TimingAndManifestTests(unittest.TestCase):
 
         self.assertEqual(report["runs"][0]["git_fixture_seconds"], 43)
         self.assertEqual(summary["phases"], original_phases)
+
+    def test_bytecode_cache_snapshot_identifies_created_and_unchanged_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "loop_manager.py"
+            source.write_text("VALUE = 7\n", encoding="utf-8")
+            before = bytecode_cache_snapshot(root)
+            self.assertEqual(before, {})
+
+            py_compile.compile(str(source), doraise=True)
+            after = bytecode_cache_snapshot(root)
+            created = bytecode_cache_changes(before, after)
+            self.assertEqual((created["existing"], created["created"], created["unchanged"]), (0, 1, 0))
+
+            retained = bytecode_cache_changes(after, bytecode_cache_snapshot(root))
+            self.assertEqual((retained["existing"], retained["created"], retained["unchanged"]), (1, 0, 1))
 
     def run_suite(self, suite, root, clock=lambda: 1.0):
         writer = EventWriter(root / "events.jsonl", clock=clock)
@@ -252,6 +279,36 @@ class TimingAndManifestTests(unittest.TestCase):
 
 
 class GuardAndConfigurationTests(unittest.TestCase):
+    def test_worker_environment_preserves_explicit_bytecode_selection(self):
+        environment = {
+            "PATH": "fake",
+            "PYTHONDONTWRITEBYTECODE": "1",
+            "PYTHONPYCACHEPREFIX": "/user/cache",
+        }
+        with mock.patch.object(guard.sys, "dont_write_bytecode", False), \
+                mock.patch.object(guard.sys, "pycache_prefix", None):
+            child = guard.worker_environment(environment)
+        self.assertEqual(child["PYTHONDONTWRITEBYTECODE"], "1")
+        self.assertEqual(child["PYTHONPYCACHEPREFIX"], "/user/cache")
+        self.assertEqual(environment["PYTHONPYCACHEPREFIX"], "/user/cache")
+
+        with mock.patch.object(guard.sys, "dont_write_bytecode", True), \
+                mock.patch.object(guard.sys, "pycache_prefix", "/cli/cache"):
+            child = guard.worker_environment(environment)
+        self.assertEqual(child["PYTHONDONTWRITEBYTECODE"], "1")
+        self.assertEqual(child["PYTHONPYCACHEPREFIX"], "/cli/cache")
+
+        managed_default = {
+            "PATH": "fake",
+            "LOOP_MANAGER_RUNTIME_DEFAULT_PYCACHEPREFIX": "1",
+        }
+        with mock.patch.object(guard.sys, "dont_write_bytecode", False), \
+                mock.patch.object(guard.sys, "pycache_prefix", "/manager/default"):
+            child = guard.worker_environment(managed_default)
+        self.assertNotIn("PYTHONPYCACHEPREFIX", child)
+        self.assertNotIn("LOOP_MANAGER_RUNTIME_DEFAULT_PYCACHEPREFIX", child)
+
+
     def test_cli_guard_allows_git_and_fake_boundary_but_rejects_real_agent_commands(self):
         for command in (["codex", "exec"], ["C:\\bin\\claude.exe", "-p"], ["bash", "-c", "codex exec prompt"]):
             with self.subTest(command=command), self.assertRaises(RuntimeError):

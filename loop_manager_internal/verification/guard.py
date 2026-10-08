@@ -91,6 +91,11 @@ def _install_child_environment_guard():
 
 def worker_environment(environment):
     child = dict(os.environ if environment is None else environment)
+    manager_default_cache = child.pop("LOOP_MANAGER_RUNTIME_DEFAULT_PYCACHEPREFIX", None) == "1"
+    if sys.dont_write_bytecode:
+        child["PYTHONDONTWRITEBYTECODE"] = "1"
+    if sys.pycache_prefix is not None and not manager_default_cache:
+        child["PYTHONPYCACHEPREFIX"] = sys.pycache_prefix
     child[MARKER] = "1"
     child["PYTHONIOENCODING"] = "utf-8"
     root = str(Path(__file__).resolve().parents[2])

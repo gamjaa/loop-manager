@@ -151,6 +151,8 @@ def agent_environment(
         "LOCALAPPDATA",
         "PATH",
         "PATHEXT",
+        "PYTHONDONTWRITEBYTECODE",
+        "PYTHONPYCACHEPREFIX",
         "SSH_AUTH_SOCK",
         "SYSTEMROOT",
         "TEMP",

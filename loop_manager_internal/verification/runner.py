@@ -19,7 +19,11 @@ from loop_manager_internal.verification.guard import MARKER, install_guard, work
 from loop_manager_internal.verification.git_timing import git_command_timing
 from loop_manager_internal.verification.manifest import Module, discover, load_module, test_cases, validate_report
 from loop_manager_internal.verification.resources import DEFAULT_WORKER_BYTES, ResourceSampler, parse_parallelism, process_memory
-from loop_manager_internal.verification.timing import EventWriter, TimedResult, atomic_json, comparison, diagnostic, fixture_timing, phase, summarize
+from loop_manager_internal.verification.timing import (
+    EventWriter, TimedResult, atomic_json, bytecode_cache_changes,
+    bytecode_cache_snapshot, bytecode_policy, comparison, diagnostic,
+    fixture_timing, phase, summarize,
+)
 
 
 def worker_main():
@@ -269,10 +273,13 @@ def run(directory, cap):
             return subprocess.run(["git", *arguments], capture_output=True, text=True, check=True, timeout=5).stdout.strip()
         writer.emit("run_start", revision=git_value("rev-parse", "HEAD"), git=git_value("--version"),
                     python=sys.version, command=sys.argv, cap=cap, coordinated=coordinated,
+                    bytecode_policy=bytecode_policy(),
                     environment={"host": platform.node(), "platform": sys.platform,
                                  "limits": asdict(ResourceSampler().sample())},
                     estimate={"worker_bytes": DEFAULT_WORKER_BYTES, "measured": False})
         with writer.activate(), phase("verify"):
+            with phase("bytecode_cache_snapshot_before", writer=writer):
+                bytecode_before = bytecode_cache_snapshot(Path.cwd())
             with phase("discovery/import"):
                 modules = discover(Path.cwd() / "tests")
                 atomic_json(directory / "manifest.json", [asdict(module) for module in modules])
@@ -280,7 +287,10 @@ def run(directory, cap):
             if passed:
                 with phase("compile"):
                     compile_project(Path.cwd())
-            writer.emit("run_end", passed=passed, memory=process_memory())
+            with phase("bytecode_cache_snapshot_after", writer=writer):
+                bytecode_after = bytecode_cache_snapshot(Path.cwd())
+            writer.emit("run_end", passed=passed, memory=process_memory(),
+                        bytecode_cache=bytecode_cache_changes(bytecode_before, bytecode_after))
             return 0 if passed else 1
     finally:
         writer.close()
