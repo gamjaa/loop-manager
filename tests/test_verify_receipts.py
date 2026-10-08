@@ -1,4 +1,5 @@
 """Narrow verify policy checks; all process, Agent and Git effects are fakes."""
+from contextlib import closing
 from dataclasses import replace
 import json
 import sqlite3
@@ -308,7 +309,7 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.verify()
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'state.sqlite'
-            with sqlite3.connect(path) as target:
+            with closing(sqlite3.connect(path)) as target, target:
                 self.connection.backup(target)
             reopened = sqlite3.connect(path)
             try:
