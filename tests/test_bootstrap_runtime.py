@@ -392,9 +392,11 @@ class BootstrapRuntimeTests(OriginScopeFixture, unittest.TestCase):
 
 
 class BootstrapSavedScopeResumeTests(unittest.TestCase):
-    """Real subprocess regressions; run only in Manager's full verification."""
+    # Real Git and child CLI are the contract here: imported runtime B, saved
+    # Agent scopes, and later base C must stay connected across process restart.
+    """Real subprocess regressions; use the coordinated verification runner."""
 
-    def test_remote_bootstrap_child_resumes_saved_scope_without_identity_injection(self, advance_after_selection=False):
+    def _assert_saved_scope_resume(self, advance_after_selection=False):
         import json
         import shutil
         import sys
@@ -404,6 +406,7 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
         from tests.support.runtime import record_saved_scope_invocation
         from loop_manager_internal.execution.worker_session import SessionBinding
         from loop_manager_internal.planning.planning_workspace import planning_workspace_path
+        from loop_manager_internal.verification.timing import _current_writer
 
         for base in ('main', 'develop'):
             for role in ('planner', 'worker', 'reviewer'):
@@ -412,8 +415,9 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                     state = Path(directory) / 'state'
                     state.mkdir()
                     copy_manager_import_fixture(source)
-                    # The only child doubles are external Agent/GitHub boundaries.
-                    # All bootstrap, identity, SQLite, scope and dispatch code is real.
+                    # Keep bootstrap, identity, SQLite, scope and dispatch real.
+                    # Optional source-fact prompt enrichment has no assertion
+                    # here; its Git/source parsing is covered by code-map tests.
                     manager_file = source / 'loop_manager.py'
                     manager_file.write_text(manager_file.read_text().replace(
                         'if __name__ == "__main__":\n    raise SystemExit(main())',
@@ -446,6 +450,8 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
     codex_model_efforts = lambda *args: {model: frozenset({'medium', 'high', 'max', 'xhigh'})
         for model in ('test-fast', 'test-balanced', 'test-strong')}
     run_codex = fake_agent
+    from loop_manager_internal.maintenance import tiered_ports
+    tiered_ports.prepare_query_context = lambda *args, **kwargs: ''
     if '--runtime-child' in sys.argv:
         from loop_manager_internal.runtime.bootstrap import BootstrapService
         validate_mutation = BootstrapService.validate_runtime_mutation
@@ -458,7 +464,19 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                 advance.unlink()
             return validate_mutation(service, source, state_dir, *args, **kwargs)
         BootstrapService.validate_runtime_mutation = advance_remote_then_validate
-    raise SystemExit(main())'''), encoding='utf-8')
+    from loop_manager_internal.verification.timing import EventWriter, phase
+    from loop_manager_internal.verification.git_timing import git_command_timing
+    costs = Path(sys.argv[sys.argv.index('--state-dir') + 1]) / 'bootstrap-costs'
+    costs.mkdir(exist_ok=True)
+    cost_writer = EventWriter(costs / (str(os.getpid()) + '.jsonl'))
+    cost_writer.current_test = BOOTSTRAP_TEST_LABEL
+    try:
+        with cost_writer.activate(), phase('bootstrap:runtime_child_cli' if '--runtime-child' in sys.argv
+                                          else 'bootstrap:parent_cli'), git_command_timing():
+            code = main()
+    finally:
+        cost_writer.close()
+    raise SystemExit(code)''').replace('BOOTSTRAP_TEST_LABEL', repr(self.id())), encoding='utf-8')
                     for name in ('PLANS.md', 'AGENTS.common.md', 'AGENTS.planner.md',
                                  'AGENTS.planner_check.md', 'AGENTS.worker.md', 'AGENTS.reviewer.md',
                                  'AGENTS.ponytail.md'):
@@ -564,16 +582,26 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                         sha_c = commit_all(writer, 'External base C after runtime B selection')
                         (state / 'advance-after-selection.json').write_text(json.dumps([str(writer), base]), encoding='utf-8')
                     config = profile_config(self)
-                    (state / 'stop-after-registration').touch()
-                    interrupted = subprocess.run([sys.executable, '-B', str(manager_file),
-                        '--state-dir', str(state), '--config', str(config), 'run'],
-                        cwd=source, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        timeout=90, check=False)
-                    self.assertNotEqual(interrupted.returncode, 0, interrupted.stdout)
-                    self.assertIn('test interruption after runtime registration', interrupted.stdout)
-                    self.assertFalse((state / 'resumed-agent.json').exists())
-                    self.assertTrue(list((state / 'manager-git-journal').glob('*/active.json')))
-                    for attempt in range(2):
+                    # All branch/role pairs still exercise the real child. The
+                    # common crash and same-SHA reuse need one process regression;
+                    # registration/scope rules are paired with BootstrapRuntimeTests
+                    # and BootstrapSavedScopeFixtureUnitTests below. B/C transitions
+                    # retain both resumes for each role's distinct saved state.
+                    # ponytail: crash/reuse process coverage is one main Worker;
+                    # add a role/base case if those pre-dispatch steps gain such logic.
+                    interrupted_registration = not advance_after_selection and (base, role) == ('main', 'worker')
+                    if interrupted_registration:
+                        (state / 'stop-after-registration').touch()
+                        interrupted = subprocess.run([sys.executable, '-B', str(manager_file),
+                            '--state-dir', str(state), '--config', str(config), 'run'],
+                            cwd=source, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            timeout=90, check=False)
+                        self.assertNotEqual(interrupted.returncode, 0, interrupted.stdout)
+                        self.assertIn('test interruption after runtime registration', interrupted.stdout)
+                        self.assertFalse((state / 'resumed-agent.json').exists())
+                        self.assertTrue(list((state / 'manager-git-journal').glob('*/active.json')))
+                    attempts = 2 if advance_after_selection or interrupted_registration else 1
+                    for attempt in range(attempts):
                         completed = subprocess.run([sys.executable, '-B', str(manager_file),
                             '--state-dir', str(state), '--config', str(config), 'run'],
                             cwd=source, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -598,11 +626,32 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                                     "FROM exec_plans WHERE plan_id='G-001'").fetchone()
                                 self.assertEqual(row, ('REVIEWING' if role == 'reviewer' else 'IMPLEMENTING',
                                                        'worker-existing', 'reviewer-existing', 0))
-                        # Leave the proof absent so same-SHA reuse must dispatch again.
+                        # A later parent must dispatch again, using the same SHA
+                        # in the crash/reuse case or C after the B/C transition.
                         proof_path.unlink()
+                    # Child instrumentation stays in this owned fixture. Forward
+                    # original PID/time values so nested CLI durations aren't
+                    # presented as independent end-to-end time.
+                    records = []
+                    parent_writer = _current_writer.get()
+                    for path in sorted((state / 'bootstrap-costs').glob('*.jsonl')):
+                        contents = path.read_text(encoding='utf-8')
+                        records.extend(json.loads(line) for line in contents.splitlines())
+                        if parent_writer is not None:
+                            parent_writer.stream.write(contents)
+                    if parent_writer is not None:
+                        parent_writer.stream.flush()
+                    ends = [event for event in records if event['kind'] == 'phase_end']
+                    self.assertEqual(sum(event['name'] == 'bootstrap:parent_cli' for event in ends),
+                                     attempts + int(interrupted_registration))
+                    self.assertEqual(sum(event['name'] == 'bootstrap:runtime_child_cli' for event in ends), attempts)
+                    self.assertTrue(any(event['kind'] == 'git_cost' and event['count'] > 0 for event in records))
+
+    def test_remote_bootstrap_child_resumes_saved_scope_without_identity_injection(self):
+        self._assert_saved_scope_resume()
 
     def test_selected_runtime_b_survives_external_base_c_before_child_prevalidation(self):
-        self.test_remote_bootstrap_child_resumes_saved_scope_without_identity_injection(advance_after_selection=True)
+        self._assert_saved_scope_resume(advance_after_selection=True)
 
 
 class BootstrapSavedScopeFixtureUnitTests(unittest.TestCase):

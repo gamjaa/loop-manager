@@ -4,7 +4,9 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
-from tests.support.catalog import write_execplan
+from tests.support.catalog import write_execplan, make_catalog_root, planner_git_observations
+from tests.support.scope import snapshot
+from dataclasses import replace
 from tests.support.git import git_command, make_remote_repository, commit_and_push
 from tests.support.worker import dummy_worker_sessions
 
@@ -29,22 +31,26 @@ class PlannerFutureIdeasTest(unittest.TestCase):
         self.assertNotIn("Agent Guidance User Decision", plans_contract)
 
     def test_validation_and_scope_separate_future_ideas_from_new_plans(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repo = make_remote_repository(directory)
-            (repo / "docs/plans").mkdir()
-            write_execplan(repo, "G-001", "Existing")
+        baseline = {}
+        with tempfile.TemporaryDirectory() as directory, planner_git_observations(baseline):
+            repo = make_catalog_root(directory)
+            existing = write_execplan(repo, "G-001", "Existing")
             future_ideas = repo / "docs/FUTURE_IDEAS.md"
             future_ideas.write_text("# Future Ideas\n", encoding="utf-8")
-            commit_and_push(repo, "Add planning fixtures")
-            active_sha = git_command(repo, "rev-parse", "HEAD")
-            before = loop_manager.capture_git_snapshot(repo)
+            baseline.update({existing.relative_to(repo).as_posix(): existing.read_text(encoding='utf-8'),
+                             'docs/FUTURE_IDEAS.md': future_ideas.read_text(encoding='utf-8')})
+            active_sha = 'base'
+            before = snapshot(head=active_sha, branch='loop-manager/planning')
 
             future_ideas.write_text(
                 "# Future Ideas\n\n- Deferred idea\n",
                 encoding="utf-8",
             )
             second = write_execplan(repo, "G-002", "Current Work")
-            after = loop_manager.capture_git_snapshot(repo)
+            after = replace(before, dirty={
+                'docs/FUTURE_IDEAS.md': (('unstaged',), 'changed-ideas'),
+                second.relative_to(repo).as_posix(): (('untracked',), 'new-plan'),
+            })
 
             loop_manager.validate_agent_scope("planner", repo, before, after)
             result = loop_manager.validate_planner_result(
@@ -78,13 +84,12 @@ class PlannerFutureIdeasTest(unittest.TestCase):
             self.assertEqual(future_only.plans, ())
 
     def test_validation_rejects_protected_files_and_existing_plan_changes(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repo = make_remote_repository(directory)
-            (repo / "docs/plans").mkdir()
+        baseline = {}
+        with tempfile.TemporaryDirectory() as directory, planner_git_observations(baseline):
+            repo = make_catalog_root(directory)
             existing = write_execplan(repo, "G-001", "Existing")
-            commit_and_push(repo, "Add existing plan")
-            active_sha = git_command(repo, "rev-parse", "HEAD")
-
+            baseline[existing.relative_to(repo).as_posix()] = existing.read_text(encoding='utf-8')
+            active_sha = 'base'
             notes = repo / "docs/notes.md"
             notes.write_text("# Planner changed protected notes\n", encoding="utf-8")
             with self.assertRaisesRegex(
@@ -114,19 +119,19 @@ class PlannerFutureIdeasTest(unittest.TestCase):
 
     def test_validation_rejects_future_idea_promoted_to_new_execplan(self):
         for future_idea_state in ("new", "existing", "removed"):
+            baseline = {}
             with self.subTest(
                 future_idea_state=future_idea_state
-            ), tempfile.TemporaryDirectory() as directory:
-                repo = make_remote_repository(directory)
-                (repo / "docs/plans").mkdir()
+            ), tempfile.TemporaryDirectory() as directory, planner_git_observations(baseline):
+                repo = make_catalog_root(directory)
                 future_ideas = repo / "docs/FUTURE_IDEAS.md"
                 if future_idea_state in {"existing", "removed"}:
                     future_ideas.write_text(
                         "# Future Ideas\n\n- Speculative deployment dashboard\n",
                         encoding="utf-8",
                     )
-                    commit_and_push(repo, "Add deferred idea")
-                active_sha = git_command(repo, "rev-parse", "HEAD")
+                    baseline['docs/FUTURE_IDEAS.md'] = future_ideas.read_text(encoding='utf-8')
+                active_sha = 'base'
                 if future_idea_state == "new":
                     future_ideas.write_text(
                         "# Future Ideas\n\n- Speculative deployment dashboard\n",
@@ -154,14 +159,13 @@ class PlannerFutureIdeasTest(unittest.TestCase):
                     )
 
     def test_validation_uses_token_boundaries_for_future_ideas(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repo = make_remote_repository(directory)
-            (repo / "docs/plans").mkdir()
+        baseline = {}
+        with tempfile.TemporaryDirectory() as directory, planner_git_observations(baseline):
+            repo = make_catalog_root(directory)
             future_ideas = repo / "docs/FUTURE_IDEAS.md"
             future_ideas.write_text("# Future Ideas\n\n- CI\n", encoding="utf-8")
             plan = write_execplan(repo, "G-001", "Decision Log Cleanup")
-            active_sha = git_command(repo, "rev-parse", "HEAD")
-
+            active_sha = 'base'
             result = loop_manager.validate_planner_result(
                 repo,
                 active_sha,
@@ -175,8 +179,11 @@ class PlannerFutureIdeasTest(unittest.TestCase):
             assert result is not None
             self.assertEqual([item[1]["id"] for item in result.plans], ["G-001"])
 
+
     @dummy_worker_sessions
     def test_future_ideas_publish_with_and_without_execplans(self):
+        # Real Git publication verifies both origin file contents and saved
+        # plan revision OIDs; the validation condition matrix above uses mocks.
         for with_plan in (False, True):
             with self.subTest(with_plan=with_plan), tempfile.TemporaryDirectory() as directory:
                 repo = make_remote_repository(directory)

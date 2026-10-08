@@ -3,8 +3,7 @@ import json
 import tempfile
 import unittest
 import loop_manager
-from tests.support.catalog import make_catalog_root, write_execplan
-from tests.support.git import git_command, make_remote_repository, commit_and_push
+from tests.support.catalog import make_catalog_root, write_execplan, planner_git_observations
 
 
 class CatalogBatchesTest(AutomationCatalogFixture, unittest.TestCase):
@@ -49,10 +48,8 @@ class CatalogBatchesTest(AutomationCatalogFixture, unittest.TestCase):
 
     def test_batch_validation_requires_new_consecutive_priority_plans(self):
         with tempfile.TemporaryDirectory() as directory:
-            repo = make_remote_repository(directory)
-            (repo / "docs/plans").mkdir()
-            write_execplan(repo, "G-001", "Existing", priority=None)
-            commit_and_push(repo, "Add existing plan")
+            repo = make_catalog_root(directory)
+            existing = write_execplan(repo, "G-001", "Existing", priority=None)
             second = write_execplan(repo, "G-002", "Second", priority="high")
             third = write_execplan(
                 repo,
@@ -62,28 +59,24 @@ class CatalogBatchesTest(AutomationCatalogFixture, unittest.TestCase):
                 depends_on=("G-002",),
             )
 
-            plans = loop_manager.validate_planner_result(
-                repo,
-                git_command(repo, "rev-parse", "HEAD"),
-                [
-                    second.relative_to(repo).as_posix(),
-                    third.relative_to(repo).as_posix(),
-                ],
-            )
+            with planner_git_observations({existing.relative_to(repo).as_posix(): existing.read_text(encoding='utf-8')}):
+                plans = loop_manager.validate_planner_result(
+                    repo, 'base',
+                    [second.relative_to(repo).as_posix(), third.relative_to(repo).as_posix()],
+                )
 
             self.assertEqual([plan["id"] for _path, plan in plans.plans], ["G-002", "G-003"])
 
         with tempfile.TemporaryDirectory() as directory:
-            repo = make_remote_repository(directory)
-            (repo / "docs/plans").mkdir()
-            write_execplan(repo, "G-001", "Existing")
-            commit_and_push(repo, "Add existing plan")
+            repo = make_catalog_root(directory)
+            existing = write_execplan(repo, "G-001", "Existing")
             gap = write_execplan(repo, "G-003", "Gap")
 
-            with self.assertRaisesRegex(loop_manager.PlannerValidationError, "연속"):
+            with planner_git_observations({existing.relative_to(repo).as_posix(): existing.read_text(encoding='utf-8')}), \
+                 self.assertRaisesRegex(loop_manager.PlannerValidationError, "연속"):
                 loop_manager.validate_planner_result(
                     repo,
-                    git_command(repo, "rev-parse", "HEAD"),
+                    'base',
                     [gap.relative_to(repo).as_posix()],
                 )
 

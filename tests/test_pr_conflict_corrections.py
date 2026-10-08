@@ -10,6 +10,7 @@ import loop_manager
 from tests.support.git import git_command
 from tests.support.worker import worker_result
 from tests.support.worker import dummy_worker_sessions
+from tests.support.execution import execution_policy_fixture, run_execution_policy
 
 
 class LivePullRequestObservationTests(unittest.TestCase):
@@ -231,117 +232,69 @@ class PrConflictLeaseTests(PrRecoveryFixture, unittest.TestCase):
 
 
 class PrConflictCauseRevalidationTests(PrRecoveryFixture, unittest.TestCase):
-    @dummy_worker_sessions
     def test_worker_failure_blocks_after_three_corrections_and_stays_blocked(self):
-        with tempfile.TemporaryDirectory() as directory:
-            (
-                repo,
-                state_dir,
-                connection,
-                branch,
-                worktree,
-                pr_url,
-                head_oid,
-            ) = self._pr_open_state(directory)
-            self._advance_base(
-                directory,
-                repo,
-                "src/app.py",
-                "VALUE = 3\n",
-                "Conflict for failed Worker",
-            )
-            pull_request = self._pull_request(
-                branch, pr_url, head_oid, "CONFLICTING"
-            )
-            failed_worker = loop_manager.CodexResult(
+        # Retry/block policy uses supplied conflict observations. Real conflict
+        # and marker preservation after blocking remain in publication recovery.
+        fixture = execution_policy_fixture(self, pr_conflict=True)
+        roles = []
+        def failed_agent(*args, **_kwargs):
+            roles.append(args[4])
+            return loop_manager.CodexResult(
                 1,
                 "Worker cannot resolve this conflict",
                 "worker-existing",
                 loop_manager.AgentResultKind.PERMANENT_CONFIGURATION,
             )
-            roles = []
-
-            def failed_agent(
-                _worktree,
-                _state,
-                _config,
-                role_name,
-                _prompt,
-                **_kwargs,
-            ):
-                roles.append(role_name)
-                if role_name == 'worker':
-                    return failed_worker
-                return loop_manager.CodexResult(failed_worker.code, failed_worker.message, 'failed-planner')
-
-            with mock.patch(
-                "loop_manager.validate_repository", return_value=repo
-            ), mock.patch(
-                "loop_manager.pr_for_branch", return_value=pull_request
-            ), mock.patch(
-                "loop_manager.run_codex", side_effect=failed_agent
-            ) as agent:
-                first = loop_manager.run_project_result(
-                    connection,
-                    state_dir,
-                    str(repo),
-                    Path("unused.ini"),
-                    "main",
-                    False,
-                )
-                second = loop_manager.run_project_result(
-                    connection,
-                    state_dir,
-                    str(repo),
-                    Path("unused.ini"),
-                    "main",
-                    False,
-                )
-
-            stored = connection.execute(
-                """
-                SELECT status, pr_conflict_recovery, pr_conflict_head_oid,
-                       worker_session_id, reviewer_session_id
-                FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'
-                """,
-                (str(repo),),
-            ).fetchone()
-            self.assertEqual(first.kind, loop_manager.ProjectRunKind.WAITING)
-            self.assertEqual(second.kind, loop_manager.ProjectRunKind.WAITING)
-            self.assertEqual(stored["status"], "PLAN_BLOCKED")
-            self.assertEqual(stored["pr_conflict_recovery"], 1)
-            self.assertEqual(stored["pr_conflict_head_oid"], head_oid)
-            self.assertEqual(stored["worker_session_id"], "worker-existing")
-            self.assertEqual(stored["reviewer_session_id"], "reviewer-existing")
-            self.assertTrue(
-                loop_manager._rebase_in_progress_for_branch(worktree, branch)
-            )
-            self.assertEqual(roles, ["worker", "worker", "worker", "worker", "planner"])
-            self.assertEqual(agent.call_count, 5)
+        agent = fixture.effects.agent.run_agent
+        agent.side_effect = failed_agent
+        first = run_execution_policy(fixture)
+        second = run_execution_policy(fixture)
+        blocked_plan = fixture.connection.execute(
+            'SELECT * FROM exec_plans WHERE repo = ?', (fixture.repo,),
+        ).fetchone()
+        loop_manager.hydrate_execplan_project(fixture.connection, fixture.repo, blocked_plan)
+        project = fixture.connection.execute(
+            'SELECT * FROM projects WHERE repo = ?', (fixture.repo,),
+        ).fetchone()
+        with mock.patch('subprocess.Popen', side_effect=AssertionError('unexpected policy process')):
+            self.assertEqual(loop_manager.reconcile_existing_pull_request(
+                fixture.connection, Path(fixture.repo), Path('/state'), fixture.repo, project,
+                self._pull_request('loop-manager/G-047', 'https://example.test/pr/26',
+                                   'remote', 'CONFLICTING')), 1)
+        stored = fixture.connection.execute(
+            "SELECT status, pr_conflict_recovery, pr_conflict_head_oid, "
+            "worker_session_id, reviewer_session_id FROM exec_plans WHERE repo = ?",
+            (fixture.repo,),
+        ).fetchone()
+        self.assertEqual(first.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertEqual(second.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertEqual(stored["status"], "PLAN_BLOCKED")
+        self.assertEqual(stored["pr_conflict_recovery"], 1)
+        self.assertEqual(stored["pr_conflict_head_oid"], 'remote')
+        self.assertEqual(stored["worker_session_id"], "worker-existing")
+        self.assertEqual(stored["reviewer_session_id"], "reviewer-existing")
+        self.assertEqual(roles, ["worker", "worker", "worker", "worker"])
+        self.assertEqual(agent.call_count, 4)
+        fixture.effects.publication.push_managed_publication_branch.assert_not_called()
+        fixture.effects.validation.verify.assert_not_called()
 
 
     def test_repeated_verify_fingerprint_blocks_recovery_without_auto_resume(self):
-        with tempfile.TemporaryDirectory() as directory:
-            (
-                repo,
-                state_dir,
-                connection,
-                branch,
-                worktree,
-                pr_url,
-                head_oid,
-            ) = self._pr_open_state(directory)
-            pull_request = self._pull_request(
-                branch, pr_url, head_oid, "CONFLICTING"
-            )
-            project = connection.execute(
-                "SELECT * FROM projects WHERE repo = ?", (str(repo),)
-            ).fetchone()
-            self.assertIsNone(
-                loop_manager.reconcile_existing_pull_request(
-                    connection, repo, state_dir, str(repo), project, pull_request
-                )
-            )
+        fixture = execution_policy_fixture(self, pr_conflict=True)
+        connection, repo = fixture.connection, fixture.repo
+        worktree = Path('/state/G-047')
+        pull_request = self._pull_request('loop-manager/G-047', 'https://example.test/pr/26',
+                                          'remote', 'CONFLICTING')
+        # Observe fixed inputs, but run the actual repetition threshold, block
+        # storage and refusal to restart the unchanged PR recovery.
+        with mock.patch.object(loop_manager, '_blocked_validation_input_fingerprints',
+                               return_value=('worktree-input', 'remote-input')), \
+             mock.patch.object(loop_manager, 'capture_git_snapshot',
+                               side_effect=fixture.effects.agent.capture_git_snapshot), \
+             mock.patch.object(loop_manager, 'block_active_execplan',
+                               side_effect=lambda _connection, *args, **kwargs:
+                                   fixture.effects.blocking.block_active_execplan(*args, **kwargs)), \
+             mock.patch('subprocess.Popen', side_effect=AssertionError('unexpected policy process')):
             output = (
                 "FAILED tests/test_conflict.py::test_owned_pr_recovery\n"
                 "AssertionError: same recovery failure"
@@ -351,12 +304,12 @@ class PrConflictCauseRevalidationTests(PrRecoveryFixture, unittest.TestCase):
                 loop_manager.MAX_VALIDATION_FINGERPRINT_REPEATS + 1
             ):
                 loop_manager.update_project(
-                    connection, str(repo), phase="VERIFYING"
+                    connection, repo, phase="VERIFYING"
                 )
                 decisions.append(
                     loop_manager.transition_validation_failure(
                         connection,
-                        str(repo),
+                        repo,
                         worktree,
                         "verify",
                         output,
@@ -364,21 +317,21 @@ class PrConflictCauseRevalidationTests(PrRecoveryFixture, unittest.TestCase):
                 )
 
             blocked_plan = connection.execute(
-                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'",
-                (str(repo),),
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-047'",
+                (repo,),
             ).fetchone()
             loop_manager.hydrate_execplan_project(
-                connection, str(repo), blocked_plan
+                connection, repo, blocked_plan
             )
             blocked_project = connection.execute(
-                "SELECT * FROM projects WHERE repo = ?", (str(repo),)
+                "SELECT * FROM projects WHERE repo = ?", (repo,)
             ).fetchone()
             self.assertEqual(
                 loop_manager.reconcile_existing_pull_request(
                     connection,
+                    Path(repo),
+                    Path('/state'),
                     repo,
-                    state_dir,
-                    str(repo),
                     blocked_project,
                     pull_request,
                 ),
@@ -388,16 +341,16 @@ class PrConflictCauseRevalidationTests(PrRecoveryFixture, unittest.TestCase):
                 """
                 SELECT status, pr_conflict_recovery, pr_conflict_head_oid,
                        verify_failure_history
-                FROM exec_plans WHERE repo = ? AND plan_id = 'G-026'
+                FROM exec_plans WHERE repo = ? AND plan_id = 'G-047'
                 """,
-                (str(repo),),
+                (repo,),
             ).fetchone()
             history = json.loads(stored["verify_failure_history"])
             self.assertFalse(any(item.blocked for item in decisions[:-1]))
             self.assertTrue(decisions[-1].blocked)
             self.assertEqual(stored["status"], "PLAN_BLOCKED")
             self.assertEqual(stored["pr_conflict_recovery"], 1)
-            self.assertEqual(stored["pr_conflict_head_oid"], head_oid)
+            self.assertEqual(stored["pr_conflict_head_oid"], 'remote')
             self.assertEqual(
                 next(iter(history.values()))["occurrences"],
                 loop_manager.MAX_VALIDATION_FINGERPRINT_REPEATS + 1,
@@ -405,6 +358,8 @@ class PrConflictCauseRevalidationTests(PrRecoveryFixture, unittest.TestCase):
 
 
 class PrConflictInterruptionTests(PrRecoveryFixture, unittest.TestCase):
+    # Mock pause/retry policy. Keep real Git for actual source preservation,
+    # surviving operations/index, remote lease and resumed publication.
     @dummy_worker_sessions
     def test_transient_and_usage_limit_pauses_resume_same_recovery(self):
         pauses = (
@@ -419,36 +374,57 @@ class PrConflictInterruptionTests(PrRecoveryFixture, unittest.TestCase):
                 "usage limit reached",
             ),
         )
-        with RecoveryBoundary() as boundary:
-            directory = boundary.directory
+        with tempfile.TemporaryDirectory() as directory:
             for result_kind, expected_kind, message in pauses:
                 with self.subTest(result_kind=result_kind):
-                    if not boundary.saved:
-                        (
-                            repo,
-                            state_dir,
-                            connection,
-                            branch,
-                            _worktree,
-                            pr_url,
-                            head_oid,
-                        ) = self._pr_open_state(directory)
-                        self._make_source_checkout_dirty_and_ahead(repo)
-                        self._advance_base(
-                            directory,
-                            repo,
-                            "src/app.py",
-                            "VALUE = 3\n",
-                            "Conflict before pause variants",
-                        )
-                        git_command(repo, "fetch", "origin")
-                        source_before = self._source_checkout_snapshot(repo)
-                        pull_request = self._pull_request(
-                            branch, pr_url, head_oid, "CONFLICTING"
-                        )
-                        boundary.save(connection)
-                    else:
-                        boundary.restore(connection)
+                    if result_kind is loop_manager.AgentResultKind.TRANSIENT_FAILURE:
+                        # Retry/pause policy uses real handlers and SQLite. The
+                        # usage-limit variant below keeps the actual conflict,
+                        # source preservation and full resumed publication.
+                        fixture = execution_policy_fixture(self, pr_conflict=True)
+                        try:
+                            agent = fixture.effects.agent.run_agent
+                            agent.side_effect = None
+                            agent.return_value = loop_manager.CodexResult(
+                                1, message, 'worker-existing', result_kind)
+                            query = (
+                                'SELECT status, pr_conflict_recovery, pr_conflict_head_oid, '
+                                'worker_session_id, reviewer_session_id FROM exec_plans WHERE repo = ?')
+                            before = tuple(fixture.connection.execute(query, (fixture.repo,)).fetchone())
+                            with mock.patch('subprocess.Popen', side_effect=AssertionError('unexpected policy process')):
+                                paused = run_execution_policy(fixture)
+                                self.assertEqual(paused.kind, expected_kind)
+                                self.assertEqual(agent.call_count, loop_manager.MAX_TRANSIENT_AGENT_RETRIES + 1)
+                                self.assertEqual(tuple(fixture.connection.execute(query, (fixture.repo,)).fetchone()), before)
+                                for call in agent.call_args_list:
+                                    self.assertEqual(call.args[4], 'worker')
+                                    self.assertEqual(call.kwargs['session_id'], 'worker-existing')
+                                agent.reset_mock()
+                                agent.return_value = loop_manager.CodexResult(
+                                    1, 'stop after recovery resumes', 'worker-existing',
+                                    loop_manager.AgentResultKind.USAGE_LIMIT)
+                                resumed = run_execution_policy(fixture)
+                                self.assertEqual(resumed.kind, loop_manager.ProjectRunKind.USAGE_LIMIT_PAUSE)
+                                agent.assert_called_once()
+                                self.assertEqual(agent.call_args.args[4], 'worker')
+                                self.assertEqual(agent.call_args.kwargs['session_id'], 'worker-existing')
+                                self.assertEqual(tuple(fixture.connection.execute(query, (fixture.repo,)).fetchone()), before)
+                                fixture.effects.validation.verify.assert_not_called()
+                                fixture.effects.publication.push_managed_publication_branch.assert_not_called()
+                        finally:
+                            # The policy fixture's patches must end before the
+                            # paired real-Git variant in this same test method.
+                            fixture.doCleanups()
+                        continue
+                    (
+                        repo, state_dir, connection, branch, _worktree, pr_url, head_oid,
+                    ) = self._pr_open_state(directory)
+                    self._make_source_checkout_dirty_and_ahead(repo)
+                    self._advance_base(directory, repo, 'src/app.py', 'VALUE = 3\n',
+                                       'Conflict before pause')
+                    git_command(repo, 'fetch', 'origin')
+                    source_before = self._source_checkout_snapshot(repo)
+                    pull_request = self._pull_request(branch, pr_url, head_oid, 'CONFLICTING')
                     paused_worker = loop_manager.CodexResult(
                         1,
                         message,
@@ -672,6 +648,14 @@ class PrConflictInterruptionTests(PrRecoveryFixture, unittest.TestCase):
                         self.assertEqual(self._source_checkout_snapshot(repo), source_before)
                         self.assertTrue(worktree.is_dir())
                         self.assertEqual(pushes, [])
+
+                        # Query/fetch failures end once the actual repository
+                        # and recovery checkpoint are proven intact. The rebase
+                        # variant below resumes that same starting checkpoint
+                        # through Worker/Reviewer and the leased publication;
+                        # don't repeat that whole flow for each observation error.
+                        if stage in ('github', 'fetch'):
+                            continue
 
                         resumed = loop_manager.run_project_result(
                             connection, state_dir, str(repo), Path("unused.ini"), "main", False

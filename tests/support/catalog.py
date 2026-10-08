@@ -2,6 +2,9 @@ from loop_manager_internal.storage import database
 from loop_manager_internal.storage import execplan_catalog_state
 from tests.support.lifecycle import fixture_cleanup
 import sqlite3
+from contextlib import contextmanager
+from types import SimpleNamespace
+from unittest import mock
 from pathlib import Path
 import loop_manager
 from loop_manager_internal.catalog import execplan_catalog
@@ -12,6 +15,26 @@ def make_catalog_root(directory: str) -> Path:
     (root / "docs/plans").mkdir(parents=True)
     (root / "docs/PRODUCT.md").write_text("# Product\n", encoding="utf-8")
     return root
+
+
+@contextmanager
+def planner_git_observations(documents, *, revision='base'):
+    """Supply revision tree/document observations; run actual Planner validation."""
+    def git(_repo, *args, **_kwargs):
+        if len(args) == 6 and args[:4] == ('ls-tree', '-z', '--full-tree', revision) and args[4] == '--':
+            path = args[5]
+            output = f'100644 blob observed\t{path}\0' if path in documents else ''
+            return SimpleNamespace(returncode=0, stdout=output)
+        if len(args) == 2 and args[0] == 'show' and args[1].startswith(revision + ':'):
+            path = args[1][len(revision) + 1:]
+            return SimpleNamespace(returncode=0 if path in documents else 128,
+                                   stdout=documents.get(path, 'missing document'))
+        raise AssertionError(f'unexpected Planner Git: {args}')
+
+    with mock.patch.object(loop_manager, 'git', side_effect=git) as observed, \
+         mock.patch.object(loop_manager, 'changed_files', return_value=[]), \
+         mock.patch('subprocess.Popen', side_effect=AssertionError('unexpected Planner process')):
+        yield observed
 
 
 def execplan_header(

@@ -6,7 +6,7 @@ from loop_manager_internal.notifications import notifications
 from tests.support.lifecycle import register_connection_cleanup
 
 
-def runtime_connection() -> sqlite3.Connection:
+def runtime_connection(repo: str = "repo") -> sqlite3.Connection:
     connection = sqlite3.connect(":memory:")
     try:
         connection.row_factory = sqlite3.Row
@@ -18,9 +18,9 @@ def runtime_connection() -> sqlite3.Connection:
             INSERT INTO projects (
                 repo, base_branch, provider, planning_fingerprint,
                 planning_attempt_fingerprint, phase
-            ) VALUES ('repo', 'main', 'codex', 'planning-kept',
+            ) VALUES (?, 'main', 'codex', 'planning-kept',
                       'planning-cleared', NULL)
-            """
+            """, (repo,),
         )
         connection.execute(
             """
@@ -29,11 +29,11 @@ def runtime_connection() -> sqlite3.Connection:
                 content_hash, status, plan_sha, active_sha, branch, worktree,
                 workspace_owned
             ) VALUES (
-                'repo', 'G-047', 'docs/plans/[G-047] Runtime.md', 'Runtime',
+                ?, 'G-047', 'docs/plans/[G-047] Runtime.md', 'Runtime',
                 '["docs/PRODUCT.md"]', '[]', 'normal', 'hash', 'READY',
                 'plan-sha', NULL, NULL, NULL, 1
             )
-            """
+            """, (repo,),
         )
         connection.commit()
         return connection
