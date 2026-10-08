@@ -41,6 +41,7 @@ class ManualWorkEffects:
     generate_plans: Callable
     run_project: Callable
     operation_print: Callable
+    resolve_profile: Callable
 
 
 @dataclass(frozen=True)
@@ -117,12 +118,15 @@ def confirm_dependencies(connection, effects, repo_path, documents, base):
         raise ManualDependencyWait('미충족 dependency: ' + '; '.join(errors))
 
 
-def candidate_input(effects, repo_path, head, base, documents, *, connection):
-    # HEAD pins all R, G, code, guidance, verify scripts and configuration.
-    # Environment is deliberately included separately: tree identity alone
-    # cannot prove the environment in which a user waived an execution.
-    from loop_manager_internal.execution.manual_candidate import candidate_token
-    return candidate_token(connection,repo_path,head,base,documents)
+def candidate_input(effects, repo_path, head, base, documents, *, connection,
+                    config_path, provider, worktree):
+    # The candidate token covers repository, environment and pinned guidance;
+    # stage tokens separately cover effective external operating settings.
+    from loop_manager_internal.execution.manual_candidate import candidate_token, stage_input_tokens
+    profile_worktree = Path(worktree) if worktree else Path(repo_path)
+    verify_token,review_token=stage_input_tokens(
+        config_path,provider,profile_worktree,effects.resolve_profile)
+    return (candidate_token(connection,repo_path,head,base,documents),verify_token,review_token)
 
 
 class ManualWorkService:
@@ -391,8 +395,11 @@ class ManualWorkService:
         with runtime_state._transaction(self.connection):
             preparation_gate(self, plan_ids=json.loads(group['members']), group=group)
             group=self.store.update(group,documents=json.dumps(documents,ensure_ascii=False),definition_head=definition_head)
-            self.store.accept(group,head=head,base=base_head,input_token=candidate_input(
-                self.effects,self.repo_path,head,base_head,json.loads(group['documents']),connection=self.connection),
+            candidate,verify_input,review_input=candidate_input(
+                self.effects,self.repo_path,head,base_head,json.loads(group['documents']),connection=self.connection,
+                config_path=self.config_path,provider=self.project['provider'],worktree=group['worktree'])
+            self.store.accept(group,head=head,base=base_head,input_token=candidate,
+                verify_input_token=verify_input,review_input_token=review_input,
                 skip_verify=args.skip_verify,skip_review=args.skip_review,reason=args.skip_reason or '')
             self.store.update(group,state='AUTOMATIC',base_sha=base_head,last_error=None)
             for member in json.loads(group['members']):
@@ -465,7 +472,9 @@ class ManualWorkService:
             return
         from loop_manager_internal.execution.manual_candidate import ManualCandidate
         from types import SimpleNamespace
-        ManualCandidate(self.connection,self.repo,owner,self.effects.git,self.effects.git_bytes).note_pending(
+        ManualCandidate(self.connection,self.repo,owner,self.effects.git,self.effects.git_bytes,
+            config_path=self.config_path,provider=self.project['provider'],
+            resolve_profile=self.effects.resolve_profile).note_pending(
             SimpleNamespace(worktree=Path(group['worktree']),base_branch=self.base))
         with self.connection:
             self.runtime.update_plan(self.repo,owner,plan_values={'status':group['resume_phase']},enqueue=False)
@@ -591,8 +600,11 @@ class ManualWorkService:
             group=self.store.get(self.repo, group['group_id'])
             preparation_gate(self, plan_ids=json.loads(group['members']), group=group,
                              requirements=json.loads(group['requirements']))
-            self.store.accept(group,head=head,base=base,input_token=candidate_input(
-                self.effects,self.repo_path,head,base,json.loads(group['documents']),connection=self.connection),
+            candidate,verify_input,review_input=candidate_input(
+                self.effects,self.repo_path,head,base,json.loads(group['documents']),connection=self.connection,
+                config_path=self.config_path,provider=self.project['provider'],worktree=group['worktree'])
+            self.store.accept(group,head=head,base=base,input_token=candidate,
+                verify_input_token=verify_input,review_input_token=review_input,
                 skip_verify=args.skip_verify,skip_review=args.skip_review,reason=args.skip_reason or '')
 
     def generate(self, group):

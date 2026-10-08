@@ -68,6 +68,7 @@ class ObserveWaitingPullRequestsEffects:
     operation_print: Callable[..., object]
     pr_for_branch: Callable[..., object]
     base_head: Callable[..., object] | None = None
+    resolve_profile: Callable[..., object] | None = None
 
 
 def observe_waiting_pull_requests(
@@ -78,6 +79,7 @@ def observe_waiting_pull_requests(
     *,
     require_base_identity: bool = False,
     read_only: bool = False,
+    config_path: Path | None = None,
 ) -> WaitingPullRequestObservation:
     """Commit every merge-wait observation before source or conflict work."""
 
@@ -90,7 +92,7 @@ def observe_waiting_pull_requests(
     registered_base = ""
     if rows:
         project = connection.execute(
-            "SELECT base_branch FROM projects WHERE repo = ?", (repo,)
+            "SELECT base_branch,provider FROM projects WHERE repo = ?", (repo,)
         ).fetchone()
         if project is None or not project["base_branch"]:
             raise RuntimeError("Merge 대기 PR의 등록 base branch를 확인할 수 없습니다.")
@@ -187,7 +189,8 @@ def observe_waiting_pull_requests(
         if group and effects.base_head and stored['status']=='PR_OPEN':
             from loop_manager_internal.recovery import manual_work_recovery
             if manual_work_recovery.revalidate_waiting(connection,repo,stored,pull_request,
-                    effects.base_head(repo_path,registered_base)):
+                    effects.base_head(repo_path,registered_base),config_path=config_path,
+                    provider=project['provider'],resolve_profile=effects.resolve_profile):
                 continue
         if (
             stored["status"] == "PLAN_BLOCKED"
@@ -362,10 +365,12 @@ def synchronize_waiting_pull_requests(
     after_reconciliation: Callable[[], None] | None = None,
     after_observation: Callable[[WaitingPullRequestObservation], None] | None = None,
     require_base_identity: bool = False,
+    config_path: Path | None = None,
 ) -> PullRequestSyncResult:
     observation = effects.observe_waiting_pull_requests(
         connection, repo_path, state_dir, repo,
         require_base_identity=require_base_identity,
+        config_path=config_path,
     )
     if after_observation is not None:
         after_observation(observation)

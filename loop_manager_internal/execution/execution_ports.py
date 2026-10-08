@@ -170,7 +170,9 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
         lambda repo, *args: dependencies.git(repo, *args).stdout.encode("utf-8")
     )
     manual = ManualCandidate(connection, identity['repo'], state.plan_id, dependencies.git,
-                             manual_git_bytes, dependencies.pr_for_branch)
+                             manual_git_bytes, dependencies.pr_for_branch,
+                             identity.get('config_path'), identity.get('provider'),
+                             dependencies._agent_profile)
     state.manual = manual
     def workspace_identity(state_dir, repo, plan_id, branch, worktree):
         return dependencies.validate_execplan_workspace_identity(state_dir, repo,

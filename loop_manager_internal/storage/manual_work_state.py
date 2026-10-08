@@ -62,6 +62,10 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         skip_verify INTEGER NOT NULL, skip_review INTEGER NOT NULL,
         reason TEXT NOT NULL, created_at TEXT NOT NULL
     )""")
+    request_columns = {row[1] for row in connection.execute('PRAGMA table_info(manual_work_requests)')}
+    for name in ('verify_input_token', 'review_input_token'):
+        if name not in request_columns:
+            connection.execute(f'ALTER TABLE manual_work_requests ADD COLUMN {name} TEXT')
     connection.execute("""CREATE TABLE IF NOT EXISTS manual_work_results (
         repo TEXT NOT NULL, group_id TEXT NOT NULL, plan_id TEXT NOT NULL,
         stage TEXT NOT NULL, head TEXT NOT NULL, base_sha TEXT NOT NULL,
@@ -136,16 +140,21 @@ class ManualWorkRepository:
             + " WHERE repo=? AND group_id=?", (*values.values(), group['repo'], group['group_id']))
         return self.get(group['repo'], group['group_id'])
 
-    def accept(self, group, *, head, base, input_token, skip_verify=False, skip_review=False, reason=''):
+    def accept(self, group, *, head, base, input_token, verify_input_token=None,
+               review_input_token=None, skip_verify=False, skip_review=False, reason=''):
         values = (group['repo'], group['group_id'], head, base, input_token,
-                  int(skip_verify), int(skip_review), reason)
+                  int(skip_verify), int(skip_review), reason,
+                  verify_input_token, review_input_token)
         current = self.request(group)
         if current and tuple(current[key] for key in ('repo','group_id','source_head','base_sha',
-                'input_token','skip_verify','skip_review','reason')) == values:
+                'input_token','skip_verify','skip_review','reason','verify_input_token',
+                'review_input_token')) == values:
             return current
         request_id = uuid4().hex
-        self.connection.execute("INSERT INTO manual_work_requests VALUES (?,?,?,?,?,?,?,?,?,?)",
-            (request_id, *values, datetime.now(timezone.utc).isoformat()))
+        self.connection.execute("INSERT INTO manual_work_requests "
+            "(request_id,repo,group_id,source_head,base_sha,input_token,skip_verify,skip_review,reason,created_at,"
+            "verify_input_token,review_input_token) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            (request_id, *values[:8], datetime.now(timezone.utc).isoformat(), *values[8:]))
         self.update(group, request_id=request_id)
         return self.connection.execute("SELECT * FROM manual_work_requests WHERE request_id=?", (request_id,)).fetchone()
 
@@ -157,7 +166,10 @@ class ManualWorkRepository:
         if result not in {'NOT_RUN','PASS','FAIL','SKIPPED_BY_USER'} or stage not in {'verify','review'}:
             raise ValueError('invalid manual stage receipt')
         for plan_id in plan_ids or json.loads(group['members']):
-            self.connection.execute("INSERT OR IGNORE INTO manual_work_results VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            self.connection.execute("INSERT INTO manual_work_results VALUES (?,?,?,?,?,?,?,?,?,?,?) "
+                "ON CONFLICT(repo,group_id,plan_id,stage,head,base_sha,input_token,result) DO UPDATE SET "
+                "detail=CASE WHEN excluded.result='NOT_RUN' AND excluded.detail LIKE '%생략 무효화%' "
+                "THEN excluded.detail ELSE manual_work_results.detail END",
                 (group['repo'], group['group_id'], plan_id, stage, head, base, token, result,
                  detail, group['request_id'] or '', datetime.now(timezone.utc).isoformat()))
         self.connection.commit()
@@ -178,7 +190,7 @@ class ManualWorkRepository:
             raise runtime_state.RuntimeStateError('수동 제출 묶음의 전체 소유 목록이 다릅니다.')
         return group['owner_id']
 
-    def publish_group(self, repo, plan_id, values):
+    def publish_group(self, repo, plan_id, values, *, stage_tokens=None):
         group = self.for_plan(repo, plan_id)
         if group is None:
             return
@@ -187,8 +199,8 @@ class ManualWorkRepository:
         selected = runtime.get(repo, plan_id)
         from loop_manager_internal.execution.manual_candidate import candidate_token
         token = candidate_token(self.connection,repo,head,selected.validated_base_sha,json.loads(group['documents']))
-        stage_tokens={stage:digest((token,stage,selected.verify_result if stage=='review' else None,group['members']))
-                      for stage in ('verify','review')}
+        if not stage_tokens or any(not stage_tokens.get(stage) for stage in ('verify','review')):
+            raise runtime_state.RuntimeStateError('게시 직전 수동 단계 설정 입력을 확인할 수 없습니다.')
         evidence = [row for row in self.connection.execute("SELECT plan_id,stage,result,input_token FROM manual_work_results "
             "WHERE repo=? AND group_id=? AND head=? AND base_sha=? AND result IN ('PASS','SKIPPED_BY_USER')",
             (repo,group['group_id'],head,selected.validated_base_sha)).fetchall()

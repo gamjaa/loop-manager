@@ -242,6 +242,7 @@ class ProjectService:
             self.effects.observe_waiting_pull_requests(
                 self.identity.connection, self.state.repo_path, self.identity.state_dir, self.state.repo,
                 require_base_identity=self.state.require_self_pr_base, read_only=True,
+                config_path=self.identity.config_path,
             )
             self.effects.resume_project_block_if_safe(self.identity.connection, self.state.repo_path, self.identity.state_dir, self.state.repo)
             project_block = scoped_blocking.project_block(self.identity.connection, self.state.repo)
@@ -528,6 +529,7 @@ class ProjectService:
                 self.identity.connection, self.state.repo_path, self.identity.state_dir, self.state.repo,
                 after_reconciliation=self._synchronize_source_after_pr_reconciliation,
                 require_base_identity=self.state.require_self_pr_base,
+                config_path=self.identity.config_path,
                 after_observation=lambda observation: self.effects._handoff_observed_self_merge(
                     self.identity.connection, self.state.repo, self.identity.state_dir, self.identity.runtime_mutation, observation,
                 ),

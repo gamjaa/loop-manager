@@ -39,6 +39,30 @@ def candidate_token(connection, repo, head, base, documents):
     return digest((head,base,documents,environment_identity(repo),guidance))
 
 
+def stage_input_tokens(config_path, provider, worktree, resolve_profile, *, stages=('verify','review')):
+    """Observe only the effective global settings that affect manual stages."""
+    if config_path is None:
+        return None, None
+    try:
+        from loop_manager_internal.config.managed_config import load_managed_config
+        config = load_managed_config(Path(config_path))
+    except Exception:
+        return None, None
+    verify = digest(('verify', config.verify_timeout_seconds, config.verify_parallelism))
+    review = None
+    if 'review' in stages and resolve_profile is not None:
+        try:
+            profile = resolve_profile(Path(config_path), provider, 'reviewer', None, Path(worktree))
+            review = digest(('review', provider, verify, profile.model, profile.effort))
+        except Exception:
+            pass
+    return verify, review
+
+
+def stage_result_token(candidate, stage, settings, verify_result, members):
+    return digest((candidate, stage, settings, verify_result if stage == 'review' else None, members))
+
+
 @dataclass(frozen=True)
 class ManualPublication:
     """Publication metadata from a user intake, never a Worker success result."""
@@ -48,11 +72,13 @@ class ManualPublication:
 
 
 class ManualCandidate:
-    def __init__(self, connection, repo, plan_id, git, git_bytes, pr_for_branch=None):
+    def __init__(self, connection, repo, plan_id, git, git_bytes, pr_for_branch=None,
+                 config_path=None, provider=None, resolve_profile=None):
         self.store = ManualWorkRepository(connection)
         self.connection, self.repo, self.plan_id = connection, repo, plan_id
         self.git, self.git_bytes = git, git_bytes
         self.pr_for_branch = pr_for_branch
+        self.config_path, self.provider, self.resolve_profile = config_path, provider, resolve_profile
 
     def group(self):
         return self.store.for_plan(self.repo, self.plan_id)
@@ -268,17 +294,31 @@ class ManualCandidate:
         base=str(self.git(Path(self.repo),'rev-parse',f'refs/remotes/origin/{context.base_branch}').stdout.strip())
         token=candidate_token(self.connection,self.repo,head,base,json.loads(group['documents']))
         row=self.connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (self.repo,self.plan_id)).fetchone()
-        stage_token=digest((token,stage,row['verify_result'] if stage=='review' else None,group['members']))
-        return group,head,base,token,stage_token
+        settings=stage_input_tokens(self.config_path,self.provider,context.worktree,self.resolve_profile,
+                                   stages=(stage,))
+        setting_token=settings[0 if stage=='verify' else 1]
+        stage_token=stage_result_token(token,stage,setting_token,row['verify_result'],group['members'])
+        return group,head,base,token,setting_token,stage_token,setting_token is not None
+
+    def publication_stage_tokens(self, context):
+        result={}
+        for stage in ('verify','review'):
+            _group,_head,_base,_token,_setting,stage_token,known=self.inputs(context,stage)
+            if not known:
+                return None
+            result[stage]=stage_token
+        return result
 
     def waive(self, context, stage, *, record=True):
         if not self.enabled():
             return None
-        group,head,base,token,stage_token=self.inputs(context,stage)
+        group,head,base,token,setting_token,stage_token,known=self.inputs(context,stage)
         request=self.store.request(group)
-        if not request or not request[f'skip_{stage}']:
+        if not request or not request[f'skip_{stage}'] or not known:
             return None
-        if request['source_head']!=head or request['base_sha']!=base or request['input_token']!=token:
+        if (request['source_head']!=head or request['base_sha']!=base or request['input_token']!=token
+                or request[f'{stage}_input_token'] is None
+                or request[f'{stage}_input_token']!=setting_token):
             return None
         if self.documents(context.worktree,head)!=json.loads(group['documents']):
             return None
@@ -297,7 +337,7 @@ class ManualCandidate:
         if not self.enabled():
             return
         for stage in ('verify','review'):
-            group,head,base,_token,stage_token=self.inputs(context,stage)
+            group,head,base,_token,_setting,stage_token,_known=self.inputs(context,stage)
             if not self.connection.execute('SELECT 1 FROM manual_work_results WHERE repo=? AND group_id=? '
                 'AND stage=? AND head=? AND base_sha=? AND input_token=?',
                 (self.repo,group['group_id'],stage,head,base,stage_token)).fetchone():
@@ -310,7 +350,9 @@ class ManualCandidate:
             return self.waive(context,stage,record=False) is not None
         if not self.enabled():
             return True
-        group,head,base,_token,stage_token=self.inputs(context,stage)
+        group,head,base,_token,_setting,stage_token,known=self.inputs(context,stage)
+        if not known:
+            return False
         required={(member,stage) for member in json.loads(group['members'])}
         passed={(row[0],stage) for row in self.connection.execute(
             "SELECT plan_id FROM manual_work_results WHERE repo=? AND group_id=? AND stage=? "
@@ -324,15 +366,26 @@ class ManualCandidate:
         group=self.group()
         request=self.store.request(group)
         if request and request[f'skip_{stage}'] and self.waive(context,stage,record=False) is None:
-            _group,head,base,_token,stage_token=self.inputs(context,stage)
-            detail=f'{stage} 생략 무효화: 제출 SHA·base·G/R·환경·단계 입력 또는 실제 실패 근거가 달라 기본 실행합니다.'
+            _group,head,base,token,setting_token,stage_token,known=self.inputs(context,stage)
+            if not known:
+                reason='현재 설정 입력을 확인할 수 없어 생략하지 않습니다.'
+            elif request[f'{stage}_input_token'] is None:
+                reason='수락 당시 단계 설정 지문이 없어 저장된 요청을 생략 근거로 쓸 수 없습니다.'
+            elif request[f'{stage}_input_token']!=setting_token:
+                reason=('요청 수락 후 verify 설정 지문이 달라졌습니다.' if stage=='verify'
+                        else '요청 수락 후 Reviewer profile·verify 설정 지문이 달라졌습니다.')
+            elif request['source_head']!=head or request['base_sha']!=base or request['input_token']!=token:
+                reason='제출 SHA·base·G/R·환경 입력이 달라졌습니다.'
+            else:
+                reason='같은 후보에 실제 실패 근거가 남아 있습니다.'
+            detail=f'{stage} 생략 무효화: {reason} 기본 단계를 실행합니다.'
             self.store.record(group,stage,head,base,stage_token,'NOT_RUN',detail)
             return detail
         return None
 
     def record(self, context, stage, passed, detail, *, plan_ids=None):
         if self.enabled():
-            group,head,base,_token,stage_token=self.inputs(context,stage)
+            group,head,base,_token,_setting,stage_token,_known=self.inputs(context,stage)
             self.store.record(group,stage,head,base,stage_token,'PASS' if passed else 'FAIL',detail,plan_ids=plan_ids)
 
     def prompt(self, prompt, *, review=False):

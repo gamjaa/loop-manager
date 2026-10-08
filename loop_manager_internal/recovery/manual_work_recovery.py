@@ -5,7 +5,9 @@ from types import SimpleNamespace
 
 from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.storage.manual_work_state import ManualWorkRepository, digest
-from loop_manager_internal.execution.manual_candidate import candidate_token
+from loop_manager_internal.execution.manual_candidate import (
+    candidate_token, stage_input_tokens, stage_result_token,
+)
 from loop_manager_internal.runtime.contracts import PublicationSafetyError
 
 
@@ -66,7 +68,8 @@ def validate_merge(connection, repo, plan, url, head, *, pr_for_branch):
         raise PublicationSafetyError('묶음 구성 G의 branch·PR·최종 근거 identity가 일치하지 않습니다.')
 
 
-def revalidate_waiting(connection, repo, plan, pr, base_head):
+def revalidate_waiting(connection, repo, plan, pr, base_head, *, config_path=None,
+                        provider=None, worktree=None, resolve_profile=None):
     """A changed shared PR becomes pending automatically, without taking a slot."""
     store=ManualWorkRepository(connection)
     group=store.for_plan(repo,str(plan['plan_id']))
@@ -76,19 +79,47 @@ def revalidate_waiting(connection, repo, plan, pr, base_head):
                                   (repo,group['group_id'])).fetchone()
     head=str(pr.get('headRefOid') or '')
     token=candidate_token(connection,repo,head,base_head,json.loads(group['documents']))
-    if publication and publication['head']==head and publication['input_token']==token:
+    current_worktree=worktree or group['worktree']
+    if current_worktree is not None:
+        current_worktree=Path(current_worktree)
+    verify_input,review_input=stage_input_tokens(config_path,provider,current_worktree,resolve_profile)
+    selected=runtime_state.RuntimeStateRepository(connection).get(repo,group['owner_id'])
+    stage_tokens={
+        'verify':stage_result_token(token,'verify',verify_input,selected.verify_result,group['members']),
+        'review':stage_result_token(token,'review',review_input,selected.verify_result,group['members']),
+    }
+    try:
+        evidence=json.loads(publication['evidence']) if publication else []
+        covered={stage:{row['plan_id'] for row in evidence
+                        if row['stage']==stage and row['input_token']==stage_tokens[stage]}
+                 for stage in ('verify','review')}
+    except (TypeError, ValueError, KeyError):
+        covered={'verify':set(),'review':set()}
+    members=set(json.loads(group['members']))
+    candidate_changed=not publication or publication['head']!=head or publication['input_token']!=token
+    verify_changed=(candidate_changed or verify_input is None or not members<=covered['verify'])
+    review_changed=(candidate_changed or review_input is None or not members<=covered['review'] or verify_changed)
+    if not verify_changed and not review_changed:
         return False
+    if candidate_changed:
+        reason='PR 후보, base 또는 환경 입력이 변경되어'
+    elif verify_changed:
+        reason='verify 설정 입력이 변경되어'
+    else:
+        reason='Reviewer profile 입력이 변경되어'
     with connection:
         runtime=runtime_state.RuntimeStateRepository(connection)
         for member in json.loads(group['members']):
             current=runtime.get(repo,member)
             if current.status=='PR_OPEN':
-                runtime.update_plan(repo,member,plan_values={'status':'MANUAL_PENDING',
-                    'verify_result':None,'review_result':None,'verify_token':None,'review_token':None,
-                    'publication_token':None,'worker_input_token':None,'archive_token':None,
-                    'worker_result':None,'validated_base_sha':None},enqueue=False)
-        store.update(group,state='AUTOMATIC',active_id=group['owner_id'],resume_phase='VERIFYING',
-                     last_error='PR 후보 또는 base·입력이 변경되어 자동 재검증합니다.')
+                values={'status':'MANUAL_PENDING','review_result':None,'review_token':None,
+                    'publication_token':None,'worker_input_token':None,'archive_token':None,'worker_result':None}
+                if verify_changed:
+                    values.update(verify_result=None,verify_token=None,validated_base_sha=None)
+                runtime.update_plan(repo,member,plan_values=values,enqueue=False)
+        phase='VERIFYING' if verify_changed else 'REVIEWING'
+        store.update(group,state='AUTOMATIC',active_id=group['owner_id'],resume_phase=phase,
+                     last_error=f'{reason} 자동 재검증합니다.')
     return True
 
 
