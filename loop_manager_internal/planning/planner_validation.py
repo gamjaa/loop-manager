@@ -313,7 +313,8 @@ def _normalize_new_plan_batch(
         )
         if missing:
             raise PlannerValidationError(
-                "새 ExecPlan dependency 대상이 없습니다: "
+                "새 ExecPlan dependency 대상이 없습니다. "
+                "존재하지 않는 depends_on ID: "
                 f"{path} -> {', '.join(missing)}"
             )
         try:
@@ -619,10 +620,13 @@ def validate_planner_result(
         reserved_before_normalization, existing_plan_ids = _planning_id_inventory(
             worktree, new_source_paths, snapshot, connection, repo, held_ids
         )
-        plans, id_allocations = _normalize_new_plan_batch(
-            worktree, plans, reserved_before_normalization, existing_plan_ids,
-            effects._parse_execplan,
-        )
+        if plans:
+            plans, id_allocations = _normalize_new_plan_batch(
+                worktree, plans, reserved_before_normalization, existing_plan_ids,
+                effects._parse_execplan,
+            )
+        else:
+            id_allocations = ()
         if id_allocations:
             for path in new_source_paths:
                 current_plans.pop(path, None)
