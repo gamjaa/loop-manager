@@ -21,7 +21,7 @@ from unittest import mock
 from loop_manager_internal.recovery import blocked_checkpoint
 from loop_manager_internal.execution import execution_handlers as handlers
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
-from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, ExecutionPhase
+from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, ExecutionOutcomeKind, ExecutionPhase
 from loop_manager_internal.execution.execution_state import ExecutionStatePort
 import loop_manager as lm
 from loop_manager_internal.git import manager_git_journal as journal
@@ -158,6 +158,12 @@ class RebaseObservationFailureTests(unittest.TestCase):
 
 @unittest.skipIf(os.name == "nt", "Linux mode-bit and bash verification fixture")
 class ManagedRebaseLifecycleTests(unittest.TestCase):
+    def test_conflict_record_change_survives_database_restart_and_resumes_same_worker(self):
+        self._lifecycle(with_pr=False, definition_change='record')
+
+    def test_conflict_condition_change_after_database_restart_blocks_without_touching_index(self):
+        self._lifecycle(with_pr=False, definition_change='condition')
+
     def test_checkpoint_multiconflict_skip_restart_verify_review(self):
         self._lifecycle(with_pr=False, sealed_restart=(False, True))
 
@@ -205,7 +211,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
 
     def _lifecycle(self, *, with_pr, legacy=False, sealed_restart=False,
                    manual=False, missing_journal=False, latest_base_advanced=False,
-                   publication_interruption=None, cumulative=False):
+                   publication_interruption=None, cumulative=False, definition_change=None):
         # Reuse only the deterministic service bundle, not the policy fixture's
         # substituted Manager rebase methods or its substituted journal writer.
         real_begin = journal.begin_rebase
@@ -229,7 +235,9 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             (repo / 'docs/plans/[G-047] Runtime.md').write_text(
                 '---\nid: G-047\ntitle: Runtime\nsources:\n  - docs/PRODUCT.md\n'
                 'depends_on: []\ncomplexity: low\nrisk: low\npriority: normal\n---\n'
-                '\n## Purpose\nResolve current changes.\n')
+                '\n## Purpose\nResolve current changes.\n' +
+                ('\n## Progress\n- [ ] Required targeted unit test\n## Decision Log\n'
+                 if definition_change else ''))
             (repo / 'app.txt').write_text(''.join(lines))
             (repo / 'skip.txt').write_text('initial\n')
             (repo / 'scripts').mkdir()
@@ -363,6 +371,13 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 return fixture.plan
 
             effects.agent.validate_worker_workspace_scope.side_effect = validate_worker
+            if definition_change:
+                effects.revision.body_hash.side_effect = lm._revision_execplan_body_hash
+                effects.revision.source_fingerprint.side_effect = lm._revision_execplan_source_fingerprint
+                effects.revision.changed_paths.side_effect = lm._revision_changed_paths
+                from tests.support.publication import seed_validated_candidate
+                seed_validated_candidate(connection, repo, worktree, 'G-047')
+                effects.state.expected = effects.state.repository.projected(repo_key)
 
             def agent(_provider, path, _state, _config, role, *_args, **kwargs):
                 events.append(role)
@@ -469,6 +484,60 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 self.assertNotIsInstance(conflict_context, ExecutionOutcome)
                 self.assertTrue(conflict_context.resolving_rebase)
             self.assertEqual(events, [])
+            if definition_change:
+                # Manager-only integration boundary: real conflict/index and
+                # durable SQLite are retained; no verify or publication follows.
+                plan_path = 'docs/plans/[G-047] Runtime.md'
+                text = (repo / plan_path).read_text()
+                changed_text = (text.replace('[ ]', '[x]') +
+                    '- 2026-10-08 실행 기록: `python3 -m unittest tests.test_code` → PASS (2 tests).\n')
+                if definition_change == 'condition':
+                    changed_text += '- New condition: skip required validation.\n'
+                (repo / plan_path).write_text(changed_text)
+                git(repo, 'add', '--', plan_path)
+                git(repo, 'commit', '-m', 'Change records or implementation condition')
+                git(repo, 'push', 'origin', 'main')
+                git(repo, 'fetch', 'origin')
+                fixture.remote = git(repo, 'rev-parse', 'HEAD').stdout.strip()
+                connection.execute('UPDATE exec_plans SET current_revision_sha=?', (fixture.remote,))
+                repository.update_plan(repo_key, 'G-047', plan_values={
+                    'retry_count': 2, 'verify_failure_history': '["prior failure"]'}, enqueue=False)
+                effects.state.expected = repository.projected(repo_key)
+                def git_state():
+                    return (git(worktree, 'rev-parse', 'HEAD').stdout,
+                            git(worktree, 'rev-parse', 'REBASE_HEAD').stdout,
+                            git(worktree, 'ls-files', '--stage').stdout,
+                            git(worktree, 'diff', '--binary', 'HEAD').stdout,
+                            lm._git_operation_entries(worktree))
+                before_git = git_state()
+                before_row = dict(effects.state.row())
+                handler = restart()
+                context = handler.recover(handler._context())
+                self.assertNotIsInstance(context, ExecutionOutcome)
+                self.assertTrue(context.resolving_rebase)
+                result = handler.guard(context)
+                self.assertEqual(git_state(), before_git)
+                self.assertEqual(effects.state.row()['worker_session_id'], 'worker-session')
+                plan = effects.state.active_execplan(repo_key)
+                self.assertEqual(plan['retry_count'], 2)
+                self.assertEqual(plan['verify_failure_history'], '["prior failure"]')
+                self.assertEqual(events, [])
+                if definition_change == 'condition':
+                    self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+                    self.assertIn('ExecPlan 구현 입력', result.detail)
+                    effects.agent.run_agent.assert_not_called()
+                else:
+                    self.assertNotIsInstance(result, ExecutionOutcome)
+                    for field in ('definition_snapshot', 'worker_result', 'last_error'):
+                        self.assertEqual(effects.state.row()[field], before_row[field])
+                    handler.run(result)
+                    self.assertEqual(events, ['worker'])
+                    self.assertEqual(effects.agent.run_agent.call_args.kwargs['session_id'], 'worker-session')
+                    self.assertEqual(len(resolutions), 1)
+                    self.assertEqual(git(worktree, 'diff', '--name-only', '--diff-filter=U').stdout.strip(), 'skip.txt')
+                effects.validation.verify.assert_not_called()
+                effects.publication.push_managed_publication_branch.assert_not_called()
+                return
             if not manual and not publication_interruption and not legacy:
                 handler.run(conflict_context)
                 self.assertEqual(len(resolutions), 1)

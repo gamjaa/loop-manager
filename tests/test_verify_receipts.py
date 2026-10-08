@@ -199,6 +199,8 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
 
     def test_production_ports_reuse_measured_contract_and_run_unknown_scripts(self):
         import loop_manager
+        from types import SimpleNamespace
+        from loop_manager_internal.execution import result_validation
         from loop_manager_internal.verification import manager_adapter
         script = self.root / 'scripts/verify.sh'
         script.write_bytes(manager_adapter.ISOLATED_COMPILE_SCRIPT)
@@ -213,7 +215,9 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.handler.effects = replace(self.handler.effects, state=self.state,
             validation=replace(self.handler.effects.validation,
                 observe_verify_inputs=production.effects.validation.observe_verify_inputs))
-        with mock.patch.dict('os.environ', {'PATH': '/usr/bin'}, clear=True), \
+        with mock.patch.object(result_validation, 'os', SimpleNamespace(name='posix', environ={})), \
+                mock.patch.object(manager_adapter, 'os', SimpleNamespace(name='posix')), \
+                mock.patch.object(manager_adapter.shutil, 'which', return_value=str(self.root / 'python')), \
                 mock.patch.object(manager_adapter.subprocess, 'run',
                     return_value=type('Result', (), {'stdout': 'a' * 64})()) as probe:
             self.verify()
@@ -233,6 +237,17 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
             self.verify()
             self.assertEqual(self.calls.count('verify'), 3)
             self.assertEqual(probe.call_count, before)
+        script.write_bytes(manager_adapter.ISOLATED_COMPILE_SCRIPT)
+        with mock.patch.object(result_validation, 'os', SimpleNamespace(name='nt', environ={})), \
+                mock.patch.object(manager_adapter, 'os', SimpleNamespace(name='nt')), \
+                mock.patch.object(result_validation.shutil, 'which', return_value=None), \
+                mock.patch.object(manager_adapter.subprocess, 'run') as probe:
+            for _ in range(2):
+                self.ready()
+                self.verify()
+            self.assertEqual(self.calls.count('verify'), 5)
+            self.assertTrue(all(row['kind'] == 'run' for row in self.receipts()[-2:]))
+            probe.assert_not_called()
 
     def test_later_completeness_proof_does_not_promote_an_unproven_original_run(self):
         (self.root / 'excluded.json').write_text('outside')

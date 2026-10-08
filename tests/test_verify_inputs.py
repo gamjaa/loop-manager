@@ -36,7 +36,7 @@ class VerifyInputObservationTest(unittest.TestCase):
         original_read = Path.read_text
         def read(path, *args, **kwargs):
             if path == Path('/proc/self/maps'):
-                return f'001-002 r-xp 000 00:00 0 {library}\n'
+                return '001-002 r-xp 000 00:00 0 /mapped-library.so\n'
             return original_read(path, *args, **kwargs)
         def identity():
             output = io.StringIO()
@@ -46,6 +46,12 @@ class VerifyInputObservationTest(unittest.TestCase):
         with mock.patch.object(sys, 'executable', str(interpreter)), \
                 mock.patch.object(sys, 'path', [str(self.root / 'src')]), \
                 mock.patch.object(sys, 'platform', 'linux'), \
+                mock.patch.object(os, 'geteuid', return_value=1000, create=True), \
+                mock.patch.object(os, 'getegid', return_value=1000, create=True), \
+                mock.patch.object(os, 'getgroups', return_value=[1000], create=True), \
+                mock.patch.object(os, 'uname', return_value=('Linux', 'fixture', '1', '1', 'x86_64'), create=True), \
+                mock.patch('pathlib.Path', side_effect=lambda path: (
+                    library if path == '/mapped-library.so' else Path(path))), \
                 mock.patch.object(Path, 'read_text', read):
             first = identity()
             self.assertEqual(len(first), 64)
@@ -64,7 +70,9 @@ class VerifyInputObservationTest(unittest.TestCase):
         self.manifest(['src/**', 'scripts/**'])
         effects = result_validation.VerifyEffects(mock.Mock(), mock.Mock(),
                                                   mock.Mock(return_value=(True, False, 'OK')))
-        with mock.patch.dict('os.environ', {'PATH': '/usr/bin'}, clear=True), \
+        with mock.patch.object(result_validation, 'os', SimpleNamespace(name='posix', environ={})), \
+                mock.patch.object(manager_adapter, 'os', SimpleNamespace(name='posix')), \
+                mock.patch.object(manager_adapter.shutil, 'which', return_value=str(self.root / 'python')), \
                 mock.patch.object(manager_adapter.subprocess, 'run',
                     return_value=SimpleNamespace(stdout='a' * 64)) as probe:
             observed = result_validation.observe_verify_inputs(self.root)
@@ -76,10 +84,28 @@ class VerifyInputObservationTest(unittest.TestCase):
             probe.side_effect = subprocess.TimeoutExpired('measurement', 30)
             self.assertFalse(result_validation.observe_verify_inputs(self.root).proven)
             probe.side_effect = None
-            with mock.patch.dict('os.environ', {'LD_PRELOAD': 'unmeasured'}):
+            with mock.patch.dict(result_validation.os.environ, {'LD_PRELOAD': 'unmeasured'}):
                 self.assertFalse(result_validation.observe_verify_inputs(self.root).proven)
             (self.root / inputs.MANIFEST).write_text('invalid')
             self.assertFalse(result_validation.observe_verify_inputs(self.root).proven)
+
+    def test_windows_compile_contract_falls_back_to_powershell_without_measurement(self):
+        from loop_manager_internal.execution import result_validation
+        (self.root / 'scripts/verify.sh').write_bytes(manager_adapter.ISOLATED_COMPILE_SCRIPT)
+        script = self.root / 'scripts/verify.ps1'
+        script.write_text('exit 0')
+        self.manifest(['src/**', 'scripts/**'])
+        effects = result_validation.VerifyEffects(mock.Mock(), mock.Mock(),
+                                                  mock.Mock(return_value=(True, False, 'OK')))
+        with mock.patch.object(result_validation, 'os', SimpleNamespace(name='nt', environ={})), \
+                mock.patch.object(manager_adapter, 'os', SimpleNamespace(name='nt')), \
+                mock.patch.object(result_validation.shutil, 'which', return_value=None), \
+                mock.patch.object(manager_adapter.subprocess, 'run') as probe:
+            self.assertFalse(result_validation.observe_verify_inputs(self.root).proven)
+            self.assertTrue(result_validation.verify(effects, self.root)[0])
+            self.assertEqual(effects.run_verify_process.call_args.args[0],
+                ['pwsh', '-NoProfile', '-File', str(script)])
+            probe.assert_not_called()
 
     def test_observation_ignores_read_access_time_but_detects_file_mutations(self):
         target = self.root / 'src/app.py'
