@@ -13,9 +13,6 @@ import loop_manager
 
 
 class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
-    def setUp(self):
-        self.enterContext(mock.patch.object(loop_manager, '_ponytail_installed', return_value=True))
-
     def test_handoff_run_reaps_child_and_closes_pipes_on_interruption(self):
         for error in (KeyboardInterrupt(), RuntimeError("communication failed")):
             with self.subTest(error=type(error).__name__):

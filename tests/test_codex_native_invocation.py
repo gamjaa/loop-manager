@@ -22,9 +22,6 @@ from tests.support.workspace import native_agent_boundary, pin_common_guidance, 
 
 @skipUnless(isolation.platform.system() == "Linux", "native tool policy probe requires Linux")
 class NativeWriteIsolationTests(TestCase):
-    def setUp(self):
-        self.enterContext(mock.patch.object(manager, '_ponytail_installed', return_value=True))
-
     @staticmethod
     def reviewer_process(output, code=0):
         process = mock.Mock(pid=4321, returncode=code)

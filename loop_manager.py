@@ -119,7 +119,6 @@ from loop_manager_internal.agents import agent_write_isolation
 from loop_manager_internal.storage import validation_feedback_state
 from loop_manager_internal.execution.validation_feedback import normalize_feedback, redact_secrets
 from loop_manager_internal.execution.worker_outcome import worker_outcome_instruction
-from loop_manager_internal.agents.ponytail_plugins import PonytailPlugins
 from loop_manager_internal.execution.verify_process import run_verify_process, VerifyTerminationUncertain
 from loop_manager_internal.execution.execution_state import ExecutionStatePort as _ExecutionStatePort
 from types import SimpleNamespace
@@ -425,12 +424,6 @@ _provider_adapters_effects = _bind_effects(
     ),
 )
 
-_ponytail_plugins = PonytailPlugins(log=lambda message: operation_log(message))
-
-
-_ponytail_installed = _ponytail_plugins.installed
-
-
 _invocation_service_effects = _bind_effects(
     agent_adapter._invocation_service_effects, lambda: agent_adapter.InvocationServiceEffectsEffects(
         _agent_profile=lambda *args, **kwargs: _agent_profile(*args, **kwargs),
@@ -438,7 +431,6 @@ _invocation_service_effects = _bind_effects(
         _start_agent_invocation=lambda *args, **kwargs: _start_agent_invocation(*args, **kwargs),
         agent_provider=lambda *args, **kwargs: agent_provider(*args, **kwargs),
         capture_git_snapshot=lambda *args, **kwargs: capture_git_snapshot(*args, **kwargs),
-        ponytail_installed=lambda provider: _ponytail_installed(provider),
     ),
 )
 
@@ -4087,7 +4079,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    _ponytail_plugins.reset()
     raw_arguments = sys.argv[1:]
     args = build_parser().parse_args(raw_arguments)
     if args.command == 'manual' and args.manual_command != 'start':

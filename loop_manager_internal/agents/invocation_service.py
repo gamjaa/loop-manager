@@ -27,7 +27,6 @@ class InvocationEffects:
     start_invocation: Callable[..., str]
     capture_git_snapshot: Callable[[Path], GitSnapshot]
     agent_provider: Callable[[str], AgentProvider]
-    ponytail_installed: Callable[[str], bool]
 
 
 def run_agent(
@@ -57,7 +56,6 @@ def run_agent(
     guidance_context = invocation or InvocationContext(str(worktree.resolve()), None)
     try:
         common_guidance.validate_state_root(guidance_context, worktree, state_dir)
-        include_ponytail = role_name == 'worker' and not effects.ponytail_installed(provider)
         if connection is None:
             state_dir.mkdir(parents=True, exist_ok=True)
             owned_connection = sqlite3.connect(state_dir / "loop-manager.db")
@@ -67,7 +65,6 @@ def run_agent(
         )
         guidance = common_guidance.resolve(
             guidance_repository, guidance_context, role_name, worktree, state_dir,
-            include_ponytail=include_ponytail,
         )
         session_task = (guidance_repository.session_task(guidance_context.repo, provider, session_id)
                         if session_id else None)

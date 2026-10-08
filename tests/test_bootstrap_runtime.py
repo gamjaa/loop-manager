@@ -446,7 +446,6 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
     codex_model_efforts = lambda *args: {model: frozenset({'medium', 'high', 'max', 'xhigh'})
         for model in ('test-fast', 'test-balanced', 'test-strong')}
     run_codex = fake_agent
-    _ponytail_installed = lambda provider: True
     if '--runtime-child' in sys.argv:
         from loop_manager_internal.runtime.bootstrap import BootstrapService
         validate_mutation = BootstrapService.validate_runtime_mutation
