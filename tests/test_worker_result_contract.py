@@ -1,5 +1,6 @@
 import unittest
 import loop_manager
+from loop_manager_internal.execution.result_validation import reviewer_targeted_test_evidence
 from loop_manager_internal.execution.worker_outcome import parse_worker_outcome
 from tests.support.worker import worker_result
 
@@ -157,6 +158,31 @@ class WorkerResultContractTest(unittest.TestCase):
                 self.assertNotIn("python3 -m unittest tests.test_api", prompt)
                 self.assertNotIn("npm test: 3 tests passed", prompt)
 
+    def test_reviewer_targeted_evidence_keeps_reported_commands_and_results_only(self):
+        secret = 'sk-' + 'A' * 24
+        evidence = (
+            f"FAILED_COMMAND: python3 -m unittest tests.test_case --token {secret}\n"
+            "Initial run: FAIL (1 failure)\n"
+            f"RERUN: python3 -m unittest tests.test_case --token {secret}\n"
+            "Final run: PASS; API_KEY=hidden-value\n"
+            "unrelated raw log: do not forward this line"
+        )
+
+        compact = reviewer_targeted_test_evidence(evidence)
+
+        self.assertIn('FAILED_COMMAND: python3 -m unittest tests.test_case', compact)
+        self.assertIn('RERUN: python3 -m unittest tests.test_case', compact)
+        self.assertIn('Initial run: FAIL', compact)
+        self.assertIn('Final run: PASS', compact)
+        self.assertIn('<REDACTED>', compact)
+        self.assertNotIn(secret, compact)
+        self.assertNotIn('hidden-value', compact)
+        self.assertNotIn('unrelated raw log', compact)
+        self.assertEqual(
+            reviewer_targeted_test_evidence('unrecognized private output'),
+            'Worker targeted test 결과를 요약할 수 없습니다.',
+        )
+
     def test_targeted_test_evidence_requires_a_clean_explicit_rerun(self):
         valid_evidence = (
             "pytest: 0 failed, 2 passed",
@@ -237,6 +263,11 @@ class WorkerResultContractTest(unittest.TestCase):
         for ambiguous in (
             f"FAILED_COMMAND: {first}\nRERUN: {first}\nFinal run: PASS",
             evidence + "\n재실행 실패 없음.",
+            (
+                "실패 이력 설명\n"
+                f"FAILED_COMMAND: {first}\nInitial run: FAIL\n"
+                f"RERUN: {first}\nFinal run: PASS"
+            ),
         ):
             with self.subTest(evidence=ambiguous):
                 with self.assertRaises(loop_manager.WorkerResultError):

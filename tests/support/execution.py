@@ -265,7 +265,7 @@ class ExecutionFixture:
             self.state.update_project(self.repo, phase=phase)
         return self.handler._context()
 
-    def review_context(self):
+    def review_context(self, verify_output='successful verify output'):
         snapshot = DefinitionSnapshot(
             revision_sha='base', path='docs/plans/[G-047] Runtime.md',
             title='Runtime', sources=('docs/PRODUCT.md',), depends_on=(),
@@ -277,12 +277,28 @@ class ExecutionFixture:
         self.state.update_project(
             self.repo, phase='REVIEWING', active_sha='base',
             validated_base_sha='base', worker_result='worker result',
-            verify_result='successful verify output',
+            verify_result=verify_output,
             worker_input_token=snapshot.worker_token,
             archive_token=snapshot.archive_token,
             verify_token=snapshot.verify_token(
-                'base', 'base', 'successful verify output',
+                'base', 'base', verify_output,
             ),
+        )
+        from loop_manager_internal.storage import verify_receipts
+        from loop_manager_internal.verification.inputs import InputObservation
+        observation = InputObservation('fixture-review-inputs')
+        self.effects.validation.observe_verify_inputs.return_value = observation
+        selection = verify_receipts.selected(self.connection, self.repo, 'G-047')
+        if selection is None:
+            verify_receipts.start_cycle(self.connection, self.repo, 'G-047')
+            selection = verify_receipts.selected(self.connection, self.repo, 'G-047')
+        identifier, selection = verify_receipts.record(
+            self.connection, selection, head='base',
+            observation=observation, kind='run',
+            reason='unit-test fixture',
+        )
+        verify_receipts.complete(
+            self.connection, selection, identifier, passed=True, output=verify_output,
         )
         return self.handler._context()
 

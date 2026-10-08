@@ -568,7 +568,7 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
             with mock.patch('loop_manager.validate_repository',return_value=service.repo_path), \
                  mock.patch('loop_manager.ensure_safe_base_worktree'), \
                  mock.patch('loop_manager.pr_for_branch',return_value=None), \
-                 mock.patch('loop_manager.verify',return_value=(True,'verify PASS')) as verify, \
+                 mock.patch('loop_manager.verify',return_value=(True,'private raw verify output')) as verify, \
                  mock.patch('loop_manager.run_agent',return_value=(0,'MANUAL_PLAN_RESULT: G-012 PASS\nVERDICT: PASS')) as agent, \
                  mock.patch('loop_manager._ExecutionLifecyclePorts',wraps=loop_manager._ExecutionLifecyclePorts) as ports:
                 # Keep this phase test local: stop at the publishing boundary.
@@ -586,9 +586,55 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
             self.assertEqual(agent.call_args.args[4],'reviewer')
             self.assertTrue(agent.call_args.kwargs['read_only'])
             self.assertIsNone(service.runtime.get(service.repo,'G-012').worker_result)
+            reviewer_prompt = agent.call_args.args[5]
+            self.assertIn('Worker targeted unit test는 실행되지 않았고 외부 targeted test 결과도',
+                          reviewer_prompt)
+            self.assertIn('Manager 확인: 전체 verify PASS', reviewer_prompt)
+            self.assertIn('수동 단계 결과 (로그 본문 생략)', reviewer_prompt)
+            self.assertIn('G-012 verify: PASS @', reviewer_prompt)
+            self.assertNotIn('private raw verify output', reviewer_prompt)
             self.assertIn('MANUAL_EXTERNAL_TARGETED_TESTS_UNCONFIRMED',
                           ManualCandidate(service.connection,service.repo,'G-012',service.effects.git,service.effects.git_bytes)
                           .publication('',{'id':'G-012','title':'Test'},mock.Mock()).test_evidence)
+
+    def test_reviewer_prompt_distinguishes_a_valid_user_verify_waiver(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service,branch,worktree=self.fixture(directory)
+            service.start('G-012')
+            (worktree/'src/app.py').write_text('VALUE = 2\n')
+            git_command(worktree,'add','src/app.py')
+            git_command(worktree,'commit','-m','Manual implementation')
+            git_command(worktree,'push','origin',branch)
+            args=completion()
+            args.skip_verify=True
+            args.expected_head=git_command(worktree,'rev-parse','HEAD')
+            args.skip_reason='password: waiver-secret-value'
+            service.complete(args)
+            with mock.patch('loop_manager.validate_repository',return_value=service.repo_path), \
+                 mock.patch('loop_manager.ensure_safe_base_worktree'), \
+                 mock.patch('loop_manager.pr_for_branch',return_value=None), \
+                 mock.patch('loop_manager.verify') as verify, \
+                 mock.patch('loop_manager.run_agent',return_value=(0,'MANUAL_PLAN_RESULT: G-012 PASS\nVERDICT: PASS')) as agent, \
+                 mock.patch('loop_manager._ExecutionLifecyclePorts',wraps=loop_manager._ExecutionLifecyclePorts) as ports:
+                effects_ports=ports._mock_wraps
+                def composition(*call_args,**kwargs):
+                    handler=effects_ports(*call_args,**kwargs)
+                    handler.publish=mock.Mock(return_value=loop_manager.ExecutionOutcome(
+                        loop_manager.ExecutionOutcomeKind.STABLE_WAIT,detail='publication boundary'))
+                    return handler
+                ports.side_effect=composition
+                loop_manager._run_project_step(service.connection,service.state_dir,service.repo,
+                    Path('unused.ini'),'main',False,registered_only=True)
+
+            verify.assert_not_called()
+            self.assertEqual(agent.call_args.args[4],'reviewer')
+            prompt=agent.call_args.args[5]
+            self.assertIn('Worker targeted unit test는 실행되지 않았고 외부 targeted test 결과도',prompt)
+            self.assertIn('유효한 사용자 verify 생략 (SKIPPED_BY_USER',prompt)
+            self.assertIn('전체 verify PASS가 아닙니다',prompt)
+            self.assertIn('<REDACTED>',prompt)
+            self.assertNotIn('waiver-secret-value',prompt)
+            self.assertNotIn('Manager 확인: 전체 verify PASS',prompt)
 
     def test_grant_expires_for_environment_new_sha_and_new_default_request(self):
         with tempfile.TemporaryDirectory() as directory:

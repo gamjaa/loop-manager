@@ -28,6 +28,7 @@ from loop_manager_internal.application.contracts import _TEMP_DIRECTORY_CONTEXT
 from loop_manager_internal.application.contracts import _TEMP_PATH_NOISE
 from loop_manager_internal.application.contracts import _TIMESTAMP_NOISE
 from loop_manager_internal.documents import reviewer_specification
+from loop_manager_internal.execution.validation_feedback import redact_secrets
 from loop_manager_internal.git import github_observation
 from loop_manager_internal.runtime.handoff_gate import _runtime_handoff_signal
 from loop_manager_internal.storage import review_correction_state
@@ -790,6 +791,26 @@ def reviewer_targeted_test_reason(test_evidence: str) -> str | None:
             ):
                 return reason[:600]
     return None
+
+
+def reviewer_targeted_test_evidence(test_evidence: str) -> str:
+    """Keep Worker-reported commands and outcomes without forwarding raw logs."""
+    reason = reviewer_targeted_test_reason(test_evidence)
+    if reason:
+        return redact_secrets(reason)
+
+    relevant = []
+    for line in test_evidence.splitlines():
+        if _TARGETED_TEST_COMMAND.search(line) or _INLINE_TEST_COMMAND.search(line):
+            relevant.append(line.strip())
+            continue
+        for clause in re.split(r"[;|]", line):
+            if (_TARGETED_TEST_SUCCESS.search(clause)
+                    or _TARGETED_TEST_FAILURE.search(clause)
+                    or _TARGETED_TEST_EXCEPTION_FAILURE.search(clause)):
+                relevant.append(clause.strip())
+    return redact_secrets("\n".join(relevant) if relevant else
+                          'Worker targeted test 결과를 요약할 수 없습니다.')
 
 
 @dataclass(frozen=True)

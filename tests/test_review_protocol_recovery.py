@@ -48,7 +48,8 @@ class ReviewProtocolNotificationTest(NotificationFixture, unittest.TestCase):
             return AgentResult(0, 'invalid' if len(calls) == 1 else 'VERDICT: PASS')
         ports.run_agent_with_retries.side_effect = reviewer
         handler = ReviewHandler(ports)
-        with mock.patch.object(handler, '_review_entry_evidence', return_value=SimpleNamespace(test_evidence='PASS')), \
+        with mock.patch.object(handler, '_review_entry_evidence', return_value=(
+                SimpleNamespace(test_evidence='PASS'), 'Manager verify PASS receipt fixture')), \
              mock.patch('loop_manager_internal.storage.review_correction_state.load', return_value={}), \
              mock.patch('loop_manager_internal.notifications.delivery.send_telegram', sent), \
              notifications.immediate_delivery(connection, 'token', 'chat', repo):

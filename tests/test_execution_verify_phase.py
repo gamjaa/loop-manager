@@ -10,6 +10,7 @@ from loop_manager_internal.execution import execution_handlers as handlers
 import loop_manager as lm
 from loop_manager_internal.storage.validation_feedback_state import ValidationFeedbackRepository
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+from loop_manager_internal.storage import verify_receipts
 from loop_manager_internal.execution.execution_runtime import ExecutionPhase, ExecutionOutcome, ExecutionOutcomeKind
 from tests.support.worker import decision as worker_decision
 from tests.support.execution import READY_WORKER_RESULT, VALID_WORKER_RESULT
@@ -490,18 +491,32 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
 
 
     def test_review_entry_accepts_empty_successful_verify_output(self):
-        self.review_context()
-        definition = self.handler._snapshot()._definition_snapshot
-        self.state.update_project(
-            'repo', verify_result='',
-            verify_token=definition.verify_token('base', 'base', ''),
-        )
-        context = self.handler._context()
+        self.effects.agent.reviewer_prompt.side_effect = lm.reviewer_prompt
+        context = self.review_context(verify_output='')
 
         outcome = self.handler.review(context)
 
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
         self.effects.agent.run_agent.assert_called_once()
+        prompt = self.effects.agent.run_agent.call_args.args[5]
+        self.assertIn('Manager 확인: 전체 verify PASS', prompt)
+        self.assertIn('기록된 출력 없음', prompt)
+        self.assertIn('candidate HEAD=base', prompt)
+
+    def test_review_entry_rejects_missing_current_candidate_receipt(self):
+        self.review_context()
+        selection = verify_receipts.selected(self.connection, 'repo', 'G-047')
+        self.connection.execute(
+            "UPDATE verify_receipts SET status='failure' WHERE id=?",
+            (selection['receipt_id'],),
+        )
+
+        outcome = self.handler.review(self.handler._context())
+
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
+        self.assertIsNone(self.state.row()['verify_token'])
+        self.effects.agent.run_agent.assert_not_called()
 
 
     def test_head_change_during_verify_does_not_save_success(self):

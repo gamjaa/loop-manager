@@ -311,6 +311,12 @@ class ReviewSpecificationRecoveryTest(BoundedRecoveryFixture, unittest.TestCase)
                 self.assertEqual(stage, 'revision_drift')
                 self.assertIn('base 또는 HEAD', message)
                 self.assertEqual(reviewer.call_count, expected_calls)
+                if expected_calls:
+                    prompt = reviewer.call_args.args[5]
+                    self.assertIn('Worker 보고:\ntargeted test: PASS', prompt)
+                    self.assertIn('Manager 확인: 전체 verify PASS', prompt)
+                    self.assertIn('candidate HEAD=head', prompt)
+                    self.assertIn('기록된 출력 없음', prompt)
         audit = connection.execute(
             "SELECT stage, classification, raw_output FROM validation_results "
             "WHERE repo = 'repo' AND plan_id = 'G-047' ORDER BY id"

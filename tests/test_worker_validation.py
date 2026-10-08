@@ -535,7 +535,9 @@ class WorkerValidationTest(ActiveWorkerFixture, unittest.TestCase):
             self.assertEqual(logs[:3], [("Worker 시작: G-001 Worker Boundary", {}), ("전체 verify 시작: G-001 Worker Boundary", {}), ("Reviewer 시작: G-001 Worker Boundary", {})])
             self.assertEqual([role for role, _prompt, _kwargs in calls], ["worker", "reviewer"])
             reviewer_prompt = calls[1][1]
-            self.assertNotIn("targeted test: PASS", reviewer_prompt)
+            self.assertIn("Worker 보고:\ntargeted test: PASS", reviewer_prompt)
+            self.assertIn("Manager 확인: 전체 verify PASS", reviewer_prompt)
+            self.assertIn("candidate HEAD=", reviewer_prompt)
             self.assertNotIn("verify: PASS", reviewer_prompt)
             self.assertIn("테스트 command와 scripts/verify를 실행하지 말고", reviewer_prompt)
 
