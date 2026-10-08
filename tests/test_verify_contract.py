@@ -348,3 +348,113 @@ class EntrypointAndGuidanceTests(unittest.TestCase):
             self.assertIn('scripts/verify.json', prompt)
             self.assertIn('docs/VERIFY.md', prompt)
             self.assertNotIn('테스트마다 자원 배정', prompt)
+
+
+class ManagerDeadlineHandoffTests(unittest.TestCase):
+    def test_coordinated_calls_inherit_missing_timeout_and_preserve_supplied_limit(self):
+        for supplied, argv, expected in ((None, [], None), ('1200', [], 1200),
+                                         ('1200', ['--timeout', '30'], 30)):
+            environment = {'LOOP_MANAGER_VERIFY_SESSION': 'manager',
+                           'LOOP_MANAGER_VERIFY_ENDPOINT': '["127.0.0.1", 1]',
+                           'LOOP_MANAGER_VERIFY_SECRET': 'test'}
+            if supplied is not None:
+                environment['LOOP_MANAGER_VERIFY_TIMEOUT'] = supplied
+            with mock.patch.dict(os.environ, environment, clear=True), \
+                    mock.patch.object(sys, 'argv', ['runner', *argv]), mock.patch.object(runner, 'run', return_value=0) as run:
+                self.assertEqual(runner.main(), 0)
+                self.assertEqual(run.call_args.args[2], expected)
+
+    def test_partial_coordination_cannot_disable_the_standalone_deadline(self):
+        with mock.patch.dict(os.environ, {'LOOP_MANAGER_VERIFY_SESSION': 'manager'}, clear=True),                 mock.patch.object(sys, 'argv', ['runner']), mock.patch.object(runner, 'run') as run:
+            with self.assertRaisesRegex(contract.ContractError, 'incomplete Manager'):
+                runner.main()
+            run.assert_not_called()
+
+    def test_invalid_explicit_deadline_fails_before_execution(self):
+        for value in ('0', '-1', 'nan', 'inf'):
+            with mock.patch.dict(os.environ, {}, clear=True),                     mock.patch.object(sys, 'argv', ['runner', '--timeout=' + value]),                     mock.patch.object(sys, 'stderr', io.StringIO()), mock.patch.object(runner, 'run') as run:
+                with self.assertRaises(SystemExit) as error:
+                    runner.main()
+                self.assertEqual(error.exception.code, 2)
+                run.assert_not_called()
+
+    def test_standalone_execute_keeps_default_timeout(self):
+        with mock.patch.dict(os.environ, {}, clear=True), mock.patch.object(sys, 'argv', ['runner', '--execute']), \
+                mock.patch.object(runner, 'run', return_value=0) as run:
+            self.assertEqual(runner.main(), 0)
+        self.assertEqual(run.call_args.args[2], 600)
+
+    def test_standalone_wrapper_keeps_configured_and_explicit_limits(self):
+        for argv, expected in (([], 900), (['--timeout', '30'], 30)):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / 'config').mkdir()
+                (root / 'config/config.ini').write_text('[loop]\nverify_timeout_seconds = 900\n')
+                with mock.patch.dict(os.environ, {}, clear=True), \
+                        mock.patch.object(sys, 'argv', ['runner', *argv]), \
+                        mock.patch.object(runner.Path, 'cwd', return_value=root), \
+                        mock.patch.object(runner.Path, 'is_file', return_value=True), \
+                        mock.patch('loop_manager_internal.config.managed_config.load_managed_config',
+                                   return_value=SimpleNamespace(verify_timeout_seconds=900, verify_parallelism=1)), \
+                        mock.patch.object(verify_process, 'run_verify_process', return_value=(True, False, '')) as process, \
+                        mock.patch.object(sys, 'stdout', io.StringIO()):
+                    self.assertEqual(runner.main(), 0)
+                    self.assertEqual(process.call_args.args[2], expected)
+                    command = process.call_args.args[0]
+                    self.assertEqual(float(command[command.index('--timeout') + 1]), expected)
+
+    def test_compile_after_612_seconds_obeys_the_manager_limit_instead_of_a_new_default(self):
+        stage = {'id': 'tests', 'kind': 'tests', 'cwd': '.', 'execution': 'independent'}
+        compile_stage = {'id': 'compile', 'kind': 'command', 'cwd': '.', 'argv': ['compile']}
+        for timeout in (None, 600):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                connection = contract.Connection(root, 'unittest', Path(sys.executable), (stage, compile_stage))
+                clock = [0]
+                def finish_tests(*args):
+                    clock[0] = 612
+                    return True
+                with mock.patch.dict(os.environ, {'LOOP_MANAGER_VERIFY_SESSION': 'manager',
+                        'LOOP_MANAGER_VERIFY_ENDPOINT': '["127.0.0.1", 1]', 'LOOP_MANAGER_VERIFY_SECRET': 'test'}, clear=True),                         mock.patch.object(runner, 'load', return_value=connection), mock.patch.object(runner, 'install_guard'),                         mock.patch.object(runner.time, 'monotonic', side_effect=lambda: clock[0]),                         mock.patch.object(runner.subprocess, 'run', return_value=SimpleNamespace(stdout='revision')),                         mock.patch.object(unittest_adapter, 'collect_project', return_value=([manifest.Module('unit', ('a',))], sys.version)),                         mock.patch.object(unittest_adapter, 'execute', side_effect=finish_tests),                         mock.patch.object(runner, 'execute_command', return_value=True) as compile_command,                         mock.patch.object(sys, 'stdout', io.StringIO()):
+                    if timeout is None:
+                        self.assertEqual(runner.run(root / 'logs', 1, timeout), 0)
+                        self.assertIsNone(compile_command.call_args.args[2])
+                    else:
+                        with self.assertRaisesRegex(TimeoutError, 'verify total timeout'):
+                            runner.run(root / 'logs', 1, timeout)
+                        compile_command.assert_not_called()
+
+    def test_command_with_inherited_limit_preserves_binding_and_confirmed_release(self):
+        with tempfile.TemporaryDirectory() as directory:
+            writer = EventWriter(Path(directory) / 'events.jsonl')
+            client = mock.Mock()
+            client.request.return_value = {'granted': True, 'reason': 'ready', 'token': 'owned'}
+            def process(argv, cwd, timeout, **options):
+                self.assertIsNone(timeout)
+                options['on_started'](SimpleNamespace(pid=123), None)
+                return True, False, verify_process.VerifyProcessOutput('', exit_code=0)
+            try:
+                self.assertTrue(core.execute_command(['compile'], Path(directory), None, writer, client,
+                                                    'manager', 'compile', run_process=process))
+            finally:
+                writer.close()
+            self.assertEqual([call.args[0] for call in client.request.call_args_list], ['acquire', 'bind', 'release'])
+
+    def test_process_and_windows_job_wait_inherit_outer_deadline(self):
+        from loop_manager_internal.execution import windows_job
+        process = mock.Mock(pid=123, returncode=0)
+        process.wait.return_value = 0
+        job = mock.Mock()
+        with mock.patch.object(verify_process.os, 'name', 'nt'), \
+                mock.patch.object(verify_process.subprocess, 'CREATE_NEW_PROCESS_GROUP', 0, create=True), \
+                mock.patch.object(windows_job, 'WindowsJob', return_value=job):
+            passed, timed_out, output = verify_process.run_verify_process(['compile'], Path('.'), None,
+                launch_process=mock.Mock(return_value=process), job_scope=True)
+        self.assertTrue(passed)
+        self.assertFalse(timed_out)
+        process.wait.assert_called_once_with(timeout=None)
+        job.wait.assert_called_once_with(None)
+        job.close.assert_called_once()
+        fake_job = SimpleNamespace(active=mock.Mock(side_effect=[1, 0]))
+        with mock.patch.object(windows_job.time, 'sleep'):
+            windows_job.WindowsJob.wait(fake_job, None)

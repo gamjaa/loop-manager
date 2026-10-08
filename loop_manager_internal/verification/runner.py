@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from dataclasses import asdict
 import json
+import math
 import os
 import platform
 from pathlib import Path
@@ -78,8 +79,8 @@ def run(directory, cap, timeout=600, project_python=None):
             passed = True
             manifest_stages = []
             for index, stage in enumerate(connection.stages):
-                remaining = timeout - (time.monotonic() - started_at)
-                if remaining <= 0:
+                remaining = None if timeout is None else timeout - (time.monotonic() - started_at)
+                if remaining is not None and remaining <= 0:
                     raise TimeoutError("verify total timeout")
                 stage_directory = directory / f"stage-{index}"
                 stage_directory.mkdir()
@@ -128,7 +129,7 @@ def main():
     parser.add_argument("--collect", type=Path)
     parser.add_argument("--compile", nargs="+", type=Path)
     parser.add_argument("--project-python", type=Path)
-    parser.add_argument("--timeout", type=float, default=600)
+    parser.add_argument("--timeout", type=float, default=os.environ.get("LOOP_MANAGER_VERIFY_TIMEOUT"))
     parser.add_argument("--report", nargs="+", type=Path)
     parser.add_argument("--parallelism", default=os.environ.get("LOOP_MANAGER_VERIFY_PARALLELISM", "auto"))
     parser.add_argument("--execute", action="store_true", help=argparse.SUPPRESS)
@@ -151,19 +152,28 @@ def main():
         print(json.dumps({"summaries": summaries, "comparison": comparison(arguments.report, summaries)},
                          ensure_ascii=False, indent=2))
         return 0
+    if arguments.timeout is not None and (not math.isfinite(arguments.timeout) or arguments.timeout <= 0):
+        parser.error("--timeout must be finite and positive")
     cap = parse_parallelism(arguments.parallelism)
     directory = Path(os.environ.get("LOOP_MANAGER_VERIFY_LOG_DIR", str(Path.cwd() / ".cache/verify" / uuid.uuid4().hex)))
-    if arguments.execute or "LOOP_MANAGER_VERIFY_SESSION" in os.environ:
-        return run(directory, cap, arguments.timeout, arguments.project_python)
+    coordinated = "LOOP_MANAGER_VERIFY_SESSION" in os.environ
+    if coordinated and not all(os.environ.get(name) for name in (
+            "LOOP_MANAGER_VERIFY_SESSION", "LOOP_MANAGER_VERIFY_ENDPOINT", "LOOP_MANAGER_VERIFY_SECRET")):
+        raise ContractError("incomplete Manager coordination context")
+    if arguments.execute or coordinated:
+        # Older coordinated Managers own the outer deadline but do not transmit it.
+        timeout = arguments.timeout if arguments.timeout is not None else (
+            None if coordinated else 600)
+        return run(directory, cap, timeout, arguments.project_python)
     # 단독 스크립트도 기존 전체 verify timeout과 자식 종료 확인 경계를 사용한다.
     from loop_manager_internal.execution.verify_process import run_verify_process
     environment = dict(os.environ, LOOP_MANAGER_VERIFY_LOG_DIR=str(directory), PYTHONIOENCODING="utf-8")
-    timeout = arguments.timeout
+    timeout = arguments.timeout if arguments.timeout is not None else 600
     config = Path("config/config.ini")
     if config.is_file():
         from loop_manager_internal.config.managed_config import load_managed_config
         managed = load_managed_config(config)
-        if "--timeout" not in sys.argv:
+        if arguments.timeout is None:
             timeout = managed.verify_timeout_seconds
         if "--parallelism" not in sys.argv and "LOOP_MANAGER_VERIFY_PARALLELISM" not in os.environ:
             cap = managed.verify_parallelism

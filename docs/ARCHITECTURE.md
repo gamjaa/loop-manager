@@ -400,7 +400,7 @@ PR 없는 게시 checkpoint의 Review 횟수 차단을 rebase 없이 해제할 �
 
 ## 공통 verify 실행 경계
 
-`verification/contract.py`가 `scripts/verify.json`의 version·정적 adapter registry·프로젝트 interpreter·수집 옵션·순서 있는 단계를 검증한다. `result_validation.verify`는 선언 부재만 기존 경로로 실행하고 잘못된 선언은 실패로 반환한다. `manager_adapter`는 고정 runtime의 Python·절대 진입점·protocol version·run/session·timeout과 기존 인스턴스 coordinator를 launcher에 전달한다. launcher는 프로젝트 interpreter를 선택한다. standalone도 같은 `entrypoint.py`와 선언을 사용하며 로컬 관측만 조율한다.
+`verification/contract.py`가 `scripts/verify.json`의 version·정적 adapter registry·프로젝트 interpreter·수집 옵션·순서 있는 단계를 검증한다. `result_validation.verify`는 선언 부재만 기존 경로로 실행하고 잘못된 선언은 실패로 반환한다. `manager_adapter`는 고정 runtime의 Python·절대 진입점·protocol version·run/session·timeout과 기존 인스턴스 coordinator를 launcher에 전달한다. launcher는 프로젝트 interpreter를 선택한다. standalone도 같은 `entrypoint.py`와 선언을 사용하며 로컬 관측만 조율한다. 시간 상한을 전달하지 않는 구형 조율 호출은 runner·명령·프로세스/Windows Job 대기에서 바깥 Manager의 상한을 상속하며 새 기본 상한을 중첩하지 않는다. 명시적 상한과 단독 실행의 설정·기본 상한은 유지한다.
 
 `runner.py`는 단계 순서를 유지한다. `core.py`는 도구별 결과 validator·worker IPC 경계를 받아 기존 자원 배정·예약·프로세스 시작·재사용·종료 확인을 수행하며 unittest 타입이나 자체 compile 경로를 소유하지 않는다. 수집과 직렬 command도 예약·전체 timeout을 적용한다. `unittest_adapter.py`는 프로젝트 interpreter의 discovery/`load_tests`·재수집·fixture·native reporter와 명시한 Python compile 범위를 소유한다. 자식 import와 Python 경로는 후보 worktree를 선택하며 Manager runtime 패키지가 후보 코드를 대신하지 않는다.
 

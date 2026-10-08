@@ -340,14 +340,14 @@ sys.exit(subprocess.call(sys.argv[1:], stdin=subprocess.DEVNULL))
 
 
 def run_verify_process(
-    arguments: list[str], worktree: Path, timeout_seconds: int,
+    arguments: list[str], worktree: Path, timeout_seconds: int | float | None,
     *,
     launch_process: Callable[..., subprocess.Popen] | None = None,
     environment: dict[str, str] | None = None,
     job_scope: bool = False,
     on_started: Callable[..., None] | None = None,
 ) -> tuple[bool, bool, str]:
-    """Return (passed, timed_out, output), only after owned descendants stop."""
+    """Confirm owned descendants; None inherits an enclosing Manager deadline."""
     job = None
     assigned = False
     process = None
@@ -382,10 +382,10 @@ def run_verify_process(
             if job:
                 process.stdin.write(b"start\n")
                 process.stdin.close()
-            remaining = max(0.001, timeout_seconds - (time.monotonic() - started))
+            remaining = None if timeout_seconds is None else max(0.001, timeout_seconds - (time.monotonic() - started))
             code = process.wait(timeout=remaining)
             if job:
-                job.wait(max(0.001, timeout_seconds - (time.monotonic() - started)))
+                job.wait(None if timeout_seconds is None else max(0.001, timeout_seconds - (time.monotonic() - started)))
             output.seek(0)
             return code == 0, False, VerifyProcessOutput(
                 output.read().decode("utf-8", errors="replace"), exit_code=code,
