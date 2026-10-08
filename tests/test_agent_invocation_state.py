@@ -172,7 +172,8 @@ class CommonGuidanceStateTests(TestCase):
                 self.assertEqual(resumed.task_id, snapshot.task_id)
                 self.assertEqual(resumed.source_revision, snapshot.source_revision)
                 self.assertEqual(resumed.content, 'original\n\nrole: docs/AGENTS.reviewer.md')
-                self.assertEqual(snapshot.content, 'original\n\nrole: docs/AGENTS.worker.md')
+                self.assertEqual(snapshot.content, 'original\n\nrole: docs/AGENTS.worker.md'
+                                 '\n\nrole: docs/AGENTS.ponytail.md')
                 self.assertEqual(repository.session_task('repo', 'codex', 'session'), snapshot.task_id)
 
     def test_changed_plan_guidance_invalidates_all_candidate_result_tokens(self):

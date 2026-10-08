@@ -154,8 +154,7 @@ def _bundle_files(contents: bytes) -> dict[str, str]:
         raise GuidanceError("공통·역할별 지침 snapshot 형식이 유효하지 않습니다.") from error
 
 
-def load_saved(task_id: str, row, state_dir: Path, role: str, *,
-               include_ponytail: bool = False) -> CommonGuidance:
+def load_saved(task_id: str, row, state_dir: Path, role: str) -> CommonGuidance:
     if role not in ROLE_PATHS:
         raise GuidanceError(f"지원하지 않는 Agent 지침 역할입니다: {role}")
     content_hash, revision, reference = row
@@ -176,7 +175,7 @@ def load_saved(task_id: str, row, state_dir: Path, role: str, *,
     if suffix == ".json":
         files = _bundle_files(contents)
         contents = (files[COMMON_PATH].rstrip("\n") + "\n\n" + files[ROLE_PATHS[role]]).encode("utf-8")
-        if role == 'worker' and include_ponytail and PONYTAIL_PATH in files:
+        if role == 'worker' and PONYTAIL_PATH in files:
             contents = contents.rstrip(b'\n') + b'\n\n' + files[PONYTAIL_PATH].encode('utf-8')
         path = _store_snapshot(expected.parent, contents, ".md")
         content_hash = hashlib.sha256(contents).hexdigest()
@@ -184,14 +183,13 @@ def load_saved(task_id: str, row, state_dir: Path, role: str, *,
 
 
 def resolve(repository: GuidanceRepository, context: InvocationContext,
-            role: str, worktree: Path, state_dir: Path, *,
-            include_ponytail: bool = False) -> CommonGuidance:
+            role: str, worktree: Path, state_dir: Path) -> CommonGuidance:
     identity = task_identity(context, role, worktree)
     try:
         validate_state_root(context, worktree, state_dir)
         saved = repository.get(identity)
         if saved is not None:
-            return load_saved(identity, saved, state_dir, role, include_ponytail=include_ponytail)
+            return load_saved(identity, saved, state_dir, role)
         if role not in ROLE_PATHS:
             raise GuidanceError(f"지원하지 않는 Agent 지침 역할입니다: {role}")
         contents = _runtime_bundle()
@@ -208,8 +206,7 @@ def resolve(repository: GuidanceRepository, context: InvocationContext,
         _check_snapshot_directory(directory)
         snapshot = _store_snapshot(directory, contents, ".json")
         repository.save(identity, context.repo, content_hash, revision, str(snapshot))
-        return load_saved(identity, repository.get(identity), state_dir, role,
-                          include_ponytail=include_ponytail)
+        return load_saved(identity, repository.get(identity), state_dir, role)
     except (OSError, sqlite3.Error, subprocess.SubprocessError) as error:
         raise GuidanceError("공통 지침 버전 보존 실패") from error
 

@@ -25,9 +25,6 @@ from tests.support.workspace import native_agent_boundary, pin_common_guidance
 
 
 class NativePlatformAgentTests(unittest.TestCase):
-    def setUp(self):
-        self.enterContext(mock.patch.object(manager, '_ponytail_installed', return_value=True))
-
     def test_windows_bootstrap_cannot_hide_real_agent_from_test_guard(self):
         from loop_manager_internal.agents import windows_runtime
         with mock.patch.dict(os.environ, {'LOOP_MANAGER_TEST_NO_AGENTS': '1'}), \
