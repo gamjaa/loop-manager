@@ -148,9 +148,10 @@ class ProjectCheckpointGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.T
 class CheckpointRebaseGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.TestCase):
     def test_dirty_attributes_preserve_raw_bytes_and_integrate_normalized_blobs(self):
         repo, _ = self._remote_refresh_fixture(branch_changed=True)
-        raw = {'crlf.txt': b'working\r\n', 'encoded.txt': 'working\n'.encode('utf-16')}
+        raw = {'crlf.txt': b'working\r\n', 'encoded.txt': b'\xff\xfe' + 'working\n'.encode('utf-16-le')}
         (self.worktree / '.gitattributes').write_text(
-            'crlf.txt text eol=crlf\nencoded.txt text working-tree-encoding=UTF-16\n')
+            'crlf.txt text eol=crlf\nencoded.txt text working-tree-encoding=UTF-16LE-BOM eol=lf\n',
+            encoding='utf-8', newline='\n')
         for path, data in raw.items():
             (self.worktree / path).write_bytes(data)
         with mock.patch.object(loop_manager, '_evaluate_remote_checkpoint_cause',
