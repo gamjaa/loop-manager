@@ -223,6 +223,27 @@ class WorkerResultContractTest(unittest.TestCase):
                 evidence = command + '\nResult: PASS'
                 self.assertEqual(reviewer_targeted_test_evidence(evidence), evidence)
 
+    def test_reviewer_targeted_evidence_keeps_labeled_and_powershell_commands(self):
+        cases = (
+            ('COMMAND: /usr/bin/python3 tests/test_api.py',
+             'COMMAND: /usr/bin/python3 tests/test_api.py'),
+            ('python3 -m unittest `\n  tests.test_api',
+             'python3 -m unittest tests.test_api'),
+            ('COMMAND: /usr/bin/python3 `\n  tests/test_api.py',
+             'COMMAND: /usr/bin/python3 tests/test_api.py'),
+        )
+        for reported, expected in cases:
+            with self.subTest(reported=reported):
+                evidence = reported + '\nResult: PASS\nunrelated raw log: omit this'
+                publication = loop_manager.parse_worker_result(
+                    worker_result('Preserve reported test scope', 'Summary', evidence),
+                    self.plan,
+                )
+                self.assertEqual(
+                    reviewer_targeted_test_evidence(publication.test_evidence),
+                    expected + '\nResult: PASS',
+                )
+
     def test_targeted_test_evidence_requires_a_clean_explicit_rerun(self):
         valid_evidence = (
             "pytest: 0 failed, 2 passed",

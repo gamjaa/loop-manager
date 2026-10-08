@@ -797,7 +797,7 @@ def reviewer_targeted_test_reason(test_evidence: str) -> str | None:
 def _looks_like_reported_test_command(line: str) -> bool:
     """Recognize generic executable lines with an option or file argument."""
     try:
-        words = shlex.split(line.strip())
+        words = shlex.split(re.sub(r"(?i)^COMMAND:\s*", "", line.strip()))
     except ValueError:
         return False
     if len(words) < 2:
@@ -831,15 +831,14 @@ def reviewer_targeted_test_evidence(test_evidence: str) -> str:
     lines = test_evidence.splitlines()
     index = 0
     while index < len(lines):
-        line = lines[index]
+        line = lines[index].strip()
+        while line.endswith(("\\", "`")) and index + 1 < len(lines):
+            line = line[:-1].rstrip() + " " + lines[index + 1].strip()
+            index += 1
         if (_TARGETED_TEST_COMMAND.search(line)
                 or _INLINE_TEST_COMMAND.search(line)
                 or _looks_like_reported_test_command(line)):
-            command = line.strip()
-            while command.endswith("\\") and index + 1 < len(lines):
-                command = command[:-1].rstrip() + " " + lines[index + 1].strip()
-                index += 1
-            relevant.append(command)
+            relevant.append(line)
             index += 1
             continue
         for clause in re.split(r"[;|]", line):
