@@ -19,9 +19,7 @@ class VerifyWindowsTests(unittest.TestCase):
             scripts = root / 'scripts'
             scripts.mkdir(parents=True)
             shutil.copyfile(source, scripts / 'verify.ps1')
-            temporary = root.parent / '.cache/verify/tmp'
-            self.assertFalse(temporary.is_relative_to(root))
-            sentinel = temporary / 'existing-file'
+            user_profile = Path(directory) / 'user'
             harness = Path(directory) / 'check.ps1'
             harness.write_text(r'''
 $ErrorActionPreference = 'Stop'
@@ -47,7 +45,7 @@ try {
 } catch {
     if ($env:VERIFY_TEST_RESULT -ne 'throw' -or $_.Exception.Message -ne '테스트용 예외') { throw }
 }
-$expected = Join-Path (Split-Path -Parent $env:VERIFY_TEST_ROOT) '.cache/verify/tmp'
+$expected = $env:VERIFY_TEST_TEMP_DIR
 if ($script:observed[0] -ne $env:VERIFY_TEST_ROOT) { throw 'checkout에서 실행되지 않았습니다.' }
 foreach ($value in $script:observed[1..4]) {
     if ($value -ne $expected) { throw "잘못된 자식 임시 경로: $value" }
@@ -58,11 +56,18 @@ foreach ($key in $keys) {
 if ((Get-Location).Path -ne $originalLocation) { throw '작업 경로가 복원되지 않았습니다.' }
 if ([Console]::OutputEncoding.CodePage -ne $encoding.CodePage) { throw '출력 인코딩이 복원되지 않았습니다.' }
 ''', encoding='utf-8-sig')
-            for configured in (False, True):
+            for configured, custom_state in ((False, False), (True, False), (True, True)):
+                temporary = user_profile / '.cache/loop-manager/verify/tmp'
+                self.assertFalse(temporary.is_relative_to(root))
+                sentinel = temporary / 'existing-file'
                 for result in ('0', '7', 'throw'):
-                    with self.subTest(configured=configured, result=result):
-                        environment = dict(os.environ, VERIFY_TEST_PYTHON=sys.executable,
-                                           VERIFY_TEST_ROOT=str(root), VERIFY_TEST_RESULT=result)
+                    with self.subTest(configured=configured, custom_state=custom_state, result=result):
+                        environment = dict(os.environ, USERPROFILE=str(user_profile), VERIFY_TEST_PYTHON=sys.executable,
+                                           VERIFY_TEST_ROOT=str(root), VERIFY_TEST_RESULT=result,
+                                           VERIFY_TEST_TEMP_DIR=str(temporary))
+                        environment.pop('LOOP_MANAGER_STATE_DIR', None)
+                        if custom_state:
+                            environment['LOOP_MANAGER_STATE_DIR'] = str(Path(directory) / 'custom-state')
                         for key in ('TEMP', 'TMP', 'TMPDIR'):
                             environment.pop(key, None)
                             if configured:

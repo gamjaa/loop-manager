@@ -410,8 +410,9 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
 
         for base in ('main', 'develop'):
             for role in ('planner', 'worker', 'reviewer'):
-                with self.subTest(base=base, role=role), tempfile.TemporaryDirectory() as directory:
+                with self.subTest(base=base, role=role), tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as cleanup:
                     source = make_remote_repository(directory)
+                    git(source, 'config', 'core.longpaths', 'true')
                     state = Path(directory) / 'state'
                     state.mkdir()
                     copy_manager_import_fixture(source)
@@ -498,6 +499,7 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                         git(source, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/develop')
 
                     connection = loop_manager.connect_database(state, create=True)
+                    cleanup.callback(connection.close)
                     with connection:
                         connection.execute('INSERT INTO projects (repo, base_branch, origin) VALUES (?, ?, ?)',
                                            (str(source), base, 'owner/repo'))
@@ -619,7 +621,7 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                             self.assertIn('runtime scope 수락', completed.stdout)
                         if role != 'planner':
                             self.assertEqual((workspace / 'src/app.py').read_text(), 'VALUE = 2\n')
-                        with sqlite3.connect(state / 'loop-manager.db') as check:
+                        with contextlib.closing(sqlite3.connect(state / 'loop-manager.db')) as check, check:
                             self.assertEqual(check.execute('SELECT COUNT(*) FROM project_blocks').fetchone()[0], 0, completed.stdout)
                             if role != 'planner':
                                 row = check.execute("SELECT status, worker_session_id, reviewer_session_id, retry_count "
@@ -671,7 +673,7 @@ class BootstrapSavedScopeFixtureUnitTests(unittest.TestCase):
                                   branch=None if role == 'planner' else 'loop-manager/G-047')
                 plan_id = None if role == 'planner' else 'G-047'
                 worktree = Path('/managed')
-                repository_identity = hashlib.sha256(b'/common\0origin').hexdigest()
+                repository_identity = hashlib.sha256((str(Path('/common')) + '\0origin').encode()).hexdigest()
                 with mock.patch('loop_manager_internal.agents.agent_write_isolation.inspect_worktree',
                                 return_value=SimpleNamespace(repository_identity=repository_identity)):
                     record_saved_scope_invocation(connection, 'repo', Path('/state'), worktree,
