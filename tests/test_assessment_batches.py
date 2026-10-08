@@ -157,6 +157,43 @@ class AssessmentBatchTest(unittest.TestCase):
                          PlanningOutcomeKind.REMOTE_BASE_RESTART)
         self.assertEqual(self.saved(), [])
 
+    def test_source_inventory_failure_keeps_prior_receipts_and_resumes_remaining_units(self):
+        calls = 0
+
+        def content_with_advance(repo, base, source):
+            nonlocal calls
+            calls += 1
+            if calls == 5:
+                raise SourceInventoryError("remote advanced after one receipt")
+            return self.contents[source.path]
+
+        self.port.content.side_effect = content_with_advance
+        self.answer(self.file_output())
+        with mock.patch.object(self.port, "complete", wraps=self.port.complete) as complete:
+            outcome = self.runner.review_files(self.run, self.worktree)
+            self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+            self.assertEqual([item["path"] for item in self.saved()], [self.sources[0].path])
+            self.assertEqual(calls, 5)
+
+            resumed_progress = files.FileReviewProgress(
+                self.sources, tuple(self.saved()),
+                files.ReviewUnit(self.sources[1], "batch-session", None),
+            )
+            self.port.progress.return_value = resumed_progress
+            self.port.content.side_effect = lambda repo, base, source: self.contents[source.path]
+            self.answer(self.file_output(self.sources[1:2]))
+            outcome = self.runner.review_files(self.run, self.worktree)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.ASSESSMENT_PROGRESS)
+        self.assertEqual([item.args[2].path for item in complete.call_args_list],
+                         [source.path for source in self.sources[:2]])
+        self.assertEqual({item["path"] for item in self.saved()},
+                         {source.path for source in self.sources[:2]})
+        remaining = self.port.pending_units(
+            "repo", files.FileReviewProgress(self.sources, tuple(self.saved()), None))
+        self.assertEqual(tuple(item.source.path for item in remaining), (self.sources[2].path,))
+        self.assertEqual(self.agent.run_planner.call_count, 2)
+
     def test_input_budget_bounds_batch_without_losing_pending_files(self):
         self.answer(self.file_output(self.sources[:1]))
         with mock.patch.object(batches, "MAX_BATCH_BYTES", 1):
