@@ -9,6 +9,7 @@ from loop_manager_internal.storage import planning_input_state
 from tests.support.catalog import write_execplan
 from tests.support.git import git_command, make_remote_repository, commit_and_push
 from tests.support.worker import worker_result
+from tests.support.lifecycle import register_connection_cleanup
 
 
 def seed_validated_candidate(
@@ -115,82 +116,87 @@ class PublicationFixture:
         commit_and_push(repo, "Add latest-base publication plan")
         plan_sha = git_command(repo, "rev-parse", "origin/main")
         connection = sqlite3.connect(":memory:")
-        connection.row_factory = sqlite3.Row
-        connection.execute(loop_manager.SCHEMA)
-        connection.execute(
-            "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
-            (str(repo),),
-        )
-        connection.commit()
-        relative_plan = plan.relative_to(repo).as_posix()
-        loop_manager.register_execplans(
-            connection,
-            str(repo),
-            repo,
-            [(relative_plan, loop_manager._parse_execplan(repo, plan))],
-            plan_sha,
-            loop_manager.planning_input_fingerprint(repo, "main"),
-        )
-        with connection:
-            planning_input_state.record_general(
-                connection, str(repo), plan_sha,
-                loop_manager.plan_declarations(repo, plan_sha),
-            )
-        branch, worktree = loop_manager.expected_execplan_workspace(
-            state_dir, str(repo), "G-014"
-        )
-        loop_manager.make_worktree(repo, worktree, branch, "main")
-        (worktree / "src/app.py").write_text(
-            "VALUE = 2\n", encoding="utf-8"
-        )
-        git_command(worktree, "add", "src/app.py")
-        git_command(worktree, "commit", "-m", "Change application value")
-        result = worker_result(
-            "Publish verified application value",
-            "Updates the application value after latest-base validation.",
-            "LatestBasePublicationTest: PASS",
-        )
-        with connection:
+        close_connection = register_connection_cleanup(self, connection)
+        try:
+            connection.row_factory = sqlite3.Row
+            connection.execute(loop_manager.SCHEMA)
             connection.execute(
-                """
-                UPDATE exec_plans
-                SET status = 'PUBLISHING', active_sha = ?,
-                    validated_base_sha = ?, branch = ?, worktree = ?,
-                    workspace_owned = 1, worker_result = ?,
-                    verify_result = 'verify: PASS',
-                    review_result = 'VERDICT: PASS'
-                WHERE repo = ? AND plan_id = 'G-014'
-                """,
-                (
-                    plan_sha,
-                    plan_sha,
-                    branch,
-                    str(worktree),
-                    result,
-                    str(repo),
-                ),
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (str(repo),),
             )
-            connection.execute(
-                """
-                UPDATE projects
-                SET active_sha = ?, validated_base_sha = ?, plan_sha = ?,
-                    phase = 'PUBLISHING', branch = ?, worktree = ?,
-                    plan_path = ?, worker_result = ?,
-                    verify_result = 'verify: PASS',
-                    review_result = 'VERDICT: PASS'
-                WHERE repo = ?
-                """,
-                (
-                    plan_sha,
-                    plan_sha,
-                    plan_sha,
-                    branch,
-                    str(worktree),
-                    relative_plan,
-                    result,
-                    str(repo),
-                ),
+            connection.commit()
+            relative_plan = plan.relative_to(repo).as_posix()
+            loop_manager.register_execplans(
+                connection,
+                str(repo),
+                repo,
+                [(relative_plan, loop_manager._parse_execplan(repo, plan))],
+                plan_sha,
+                loop_manager.planning_input_fingerprint(repo, "main"),
             )
+            with connection:
+                planning_input_state.record_general(
+                    connection, str(repo), plan_sha,
+                    loop_manager.plan_declarations(repo, plan_sha),
+                )
+            branch, worktree = loop_manager.expected_execplan_workspace(
+                state_dir, str(repo), "G-014"
+            )
+            loop_manager.make_worktree(repo, worktree, branch, "main")
+            (worktree / "src/app.py").write_text(
+                "VALUE = 2\n", encoding="utf-8"
+            )
+            git_command(worktree, "add", "src/app.py")
+            git_command(worktree, "commit", "-m", "Change application value")
+            result = worker_result(
+                "Publish verified application value",
+                "Updates the application value after latest-base validation.",
+                "LatestBasePublicationTest: PASS",
+            )
+            with connection:
+                connection.execute(
+                    """
+                    UPDATE exec_plans
+                    SET status = 'PUBLISHING', active_sha = ?,
+                        validated_base_sha = ?, branch = ?, worktree = ?,
+                        workspace_owned = 1, worker_result = ?,
+                        verify_result = 'verify: PASS',
+                        review_result = 'VERDICT: PASS'
+                    WHERE repo = ? AND plan_id = 'G-014'
+                    """,
+                    (
+                        plan_sha,
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        result,
+                        str(repo),
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE projects
+                    SET active_sha = ?, validated_base_sha = ?, plan_sha = ?,
+                        phase = 'PUBLISHING', branch = ?, worktree = ?,
+                        plan_path = ?, worker_result = ?,
+                        verify_result = 'verify: PASS',
+                        review_result = 'VERDICT: PASS'
+                    WHERE repo = ?
+                    """,
+                    (
+                        plan_sha,
+                        plan_sha,
+                        plan_sha,
+                        branch,
+                        str(worktree),
+                        relative_plan,
+                        result,
+                        str(repo),
+                    ),
+                )
+        except BaseException:
+            close_connection()
+            raise
         return repo, state_dir, connection, plan, branch, worktree
 
     def _command_stub(self, created_urls, git_calls=None):

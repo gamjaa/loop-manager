@@ -6,12 +6,14 @@ from pathlib import Path
 from unittest import mock
 import loop_manager
 from tests.support.git import git_command, make_remote_repository, commit_and_push
+from tests.support.lifecycle import register_connection_cleanup
 from tests.support.worker import dummy_worker_sessions
 
 
 class WorkspaceReservationsTest(WorkspaceFixture, unittest.TestCase):
     def test_planning_git_port_only_translates_workspace_ownership_errors(self):
         connection = sqlite3.connect(":memory:")
+        register_connection_cleanup(self, connection)
         port = loop_manager._PlanningGitPorts(
             connection,
             Path("/repo"),
@@ -190,6 +192,7 @@ class WorkspaceReservationsTest(WorkspaceFixture, unittest.TestCase):
             repo = make_remote_repository(directory)
             state_dir = Path(directory) / "state"
             connection = sqlite3.connect(":memory:")
+            register_connection_cleanup(self, connection)
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
             real_git = loop_manager.git
@@ -319,6 +322,7 @@ class WorkspaceReservationsTest(WorkspaceFixture, unittest.TestCase):
             repo = make_remote_repository(directory)
             state_dir = Path(directory) / "state"
             connection = sqlite3.connect(":memory:")
+            register_connection_cleanup(self, connection)
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
             real_make_planning_worktree = loop_manager.make_planning_worktree
@@ -521,6 +525,7 @@ class WorkspaceReservationsTest(WorkspaceFixture, unittest.TestCase):
 
     def test_existing_catalog_does_not_infer_workspace_ownership(self):
         connection = sqlite3.connect(":memory:")
+        register_connection_cleanup(self, connection)
         connection.row_factory = sqlite3.Row
         connection.execute(
             """

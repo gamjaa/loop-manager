@@ -3,6 +3,7 @@ import json
 import sqlite3
 
 from loop_manager_internal.notifications import notifications
+from tests.support.lifecycle import register_connection_cleanup
 
 
 def runtime_connection() -> sqlite3.Connection:
@@ -46,6 +47,7 @@ class AutomationCatalogFixture:
 
     def _connection(self, repo: str = "repo") -> sqlite3.Connection:
         connection = sqlite3.connect(":memory:")
+        close_connection = register_connection_cleanup(self, connection)
         try:
             connection.row_factory = sqlite3.Row
             connection.execute(database.SCHEMA)
@@ -56,9 +58,8 @@ class AutomationCatalogFixture:
             )
             connection.commit()
         except BaseException:
-            connection.close()
+            close_connection()
             raise
-        self.addCleanup(connection.close)
         return connection
 
     def _insert_plan(

@@ -1,23 +1,20 @@
-import sqlite3
 import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
+from tests.support.database import AutomationCatalogFixture
 from tests.support.worker import dummy_worker_sessions
 
 
-class PersistentExecutionFailureBoundaryTest(unittest.TestCase):
+class PersistentExecutionFailureBoundaryTest(AutomationCatalogFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_successful_run_resolves_its_observed_retry(self):
-        connection = sqlite3.connect(":memory:")
-        connection.row_factory = sqlite3.Row
-        self.addCleanup(connection.close)
         repo = str(Path("resolved-failure-repo").resolve())
-        connection.execute(loop_manager.SCHEMA)
-        loop_manager._ensure_execplans_schema(connection)
-        connection.execute(
-            "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')", (repo,)
-        )
+        connection = self._connection(repo)
+        with connection:
+            connection.execute(
+                "UPDATE projects SET phase = 'WORKING' WHERE repo = ?", (repo,)
+            )
         loop_manager.notifications.configure_session(connection, enabled=True)
         connection.commit()
 
@@ -32,11 +29,17 @@ class PersistentExecutionFailureBoundaryTest(unittest.TestCase):
             return loop_manager.ProjectRunResult(loop_manager.ProjectRunKind.WAITING, 0)
 
         with mock.patch("loop_manager._run_project_result", side_effect=recovered_run):
-            for _ in range(3):
+            outcomes = [
                 loop_manager.run_project_result(
                     connection, Path("/unused-state"), repo, Path("/unused.ini"),
                     "main", False,
                 )
+                for _ in range(3)
+            ]
+        self.assertEqual(
+            [outcome.kind for outcome in outcomes],
+            [loop_manager.ProjectRunKind.WAITING] * 3,
+        )
         diagnostic = connection.execute(
             "SELECT active, consecutive_runs, notification_eligible FROM "
             "persistent_execution_failures WHERE repo = ? AND subject = '__project__'",
@@ -52,16 +55,12 @@ class PersistentExecutionFailureBoundaryTest(unittest.TestCase):
 
     @dummy_worker_sessions
     def test_scheduler_invocations_enqueue_only_the_third_unchanged_failure(self):
-        connection = sqlite3.connect(":memory:")
-        connection.row_factory = sqlite3.Row
-        self.addCleanup(connection.close)
         repo = str(Path("persistent-failure-repo").resolve())
-        connection.execute(loop_manager.SCHEMA)
-        loop_manager._ensure_execplans_schema(connection)
-        connection.execute(
-            "INSERT INTO projects (repo, base_branch, phase) VALUES (?, 'main', 'WORKING')",
-            (repo,),
-        )
+        connection = self._connection(repo)
+        with connection:
+            connection.execute(
+                "UPDATE projects SET phase = 'WORKING' WHERE repo = ?", (repo,)
+            )
         loop_manager.notifications.configure_session(connection, enabled=True)
         connection.commit()
 

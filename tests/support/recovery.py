@@ -5,10 +5,10 @@ from pathlib import Path
 from unittest import mock
 import loop_manager
 from tests.support.catalog import make_catalog_root, write_execplan
-from tests.support.git import git_command, make_remote_repository, commit_and_push
-from tests.support.worker import worker_result
+from tests.support.worker import make_active_worker_project, worker_result
 from tests.support.publication import matching_branch_pr_lookup
 from loop_manager_internal.verification.timing import phase
+from tests.support.lifecycle import register_connection_cleanup
 
 
 class BoundedRecoveryFixture:
@@ -23,7 +23,10 @@ class BoundedRecoveryFixture:
         root = make_catalog_root(directory)
         plan = write_execplan(root, "G-013", "Bounded Recovery")
         owns_connection = connection is None
-        connection = connection or sqlite3.connect(":memory:")
+        close_connection = None
+        if owns_connection:
+            connection = sqlite3.connect(":memory:")
+            close_connection = register_connection_cleanup(self, connection)
         try:
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
@@ -55,53 +58,22 @@ class BoundedRecoveryFixture:
             )
             connection.commit()
         except BaseException:
-            if owns_connection:
-                connection.close()
+            if close_connection is not None:
+                close_connection()
             raise
-        if owns_connection:
-            self.addCleanup(connection.close)
         return root, connection
 
     def _active_worker_project(
         self, directory: str
     ) -> tuple[Path, Path, sqlite3.Connection]:
-        repo = make_remote_repository(directory)
-        state_dir = Path(directory) / "state"
-        state_dir.mkdir()
-        (repo / "docs/plans").mkdir()
-        plan = write_execplan(repo, "G-001", "Worker Boundary")
-        commit_and_push(repo, "Add worker plan")
-        plan_sha = git_command(repo, "rev-parse", "origin/main")
-        branch, worktree = loop_manager.expected_execplan_workspace(
-            state_dir, str(repo), "G-001"
+        return make_active_worker_project(
+            self,
+            directory,
+            plan_id="G-001",
+            title="Worker Boundary",
+            record_general_input=False,
+            commit_message="Add worker plan",
         )
-        loop_manager.make_worktree(repo, worktree, branch, "main")
-        connection = sqlite3.connect(":memory:")
-        try:
-            connection.row_factory = sqlite3.Row
-            connection.execute(loop_manager.SCHEMA)
-            connection.execute(
-                """
-                INSERT INTO projects (
-                    repo, base_branch, active_sha, plan_sha, phase, branch,
-                    worktree, plan_path
-                ) VALUES (?, 'main', ?, ?, 'WORKING', ?, ?, ?)
-                """,
-                (
-                    str(repo),
-                    plan_sha,
-                    plan_sha,
-                    branch,
-                    str(worktree),
-                    plan.relative_to(repo).as_posix(),
-                ),
-            )
-            connection.commit()
-        except BaseException:
-            connection.close()
-            raise
-        self.addCleanup(connection.close)
-        return repo, state_dir, connection
 
     def _run_review_sequence(
         self,
