@@ -797,22 +797,21 @@ def reviewer_targeted_test_reason(test_evidence: str) -> str | None:
 def _looks_like_reported_test_command(line: str) -> bool:
     """Recognize executable paths and generic commands with test arguments."""
     try:
-        words = shlex.split(re.sub(r"(?i)^COMMAND:\s*", "", line.strip()))
+        words = shlex.split(line.strip())
     except ValueError:
         return False
     if not words:
         return False
     executable = words[0]
-    if not re.fullmatch(
-        r"(?:[A-Za-z]:)?[/\\]?(?:[A-Za-z0-9_.+-]+[/\\])*[A-Za-z0-9_.+-]+",
-        executable,
-    ):
+    if "/" in executable or "\\" in executable:
+        return True
+    if not re.fullmatch(r"[A-Za-z0-9_.+-]+", executable):
         return False
     if (executable[0].isupper() and "/" not in executable
             and "\\" not in executable
             and not executable.lower().endswith((".exe", ".cmd", ".bat"))):
         return False
-    return "/" in executable or "\\" in executable or any(
+    return any(
         argument.startswith(("-", "./", "../", "/", ".\\", "..\\", "\\"))
         or "/" in argument
         or "\\" in argument
@@ -835,7 +834,8 @@ def reviewer_targeted_test_evidence(test_evidence: str) -> str:
         while line.endswith(("\\", "`")) and index + 1 < len(lines):
             line = line[:-1].rstrip() + " " + lines[index + 1].strip()
             index += 1
-        if (_TARGETED_TEST_COMMAND.search(line)
+        if (re.match(r"(?i)^COMMAND:\s*\S", line)
+                or _TARGETED_TEST_COMMAND.search(line)
                 or _INLINE_TEST_COMMAND.search(line)
                 or _looks_like_reported_test_command(line)):
             relevant.append(line)

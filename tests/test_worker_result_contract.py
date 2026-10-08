@@ -264,6 +264,26 @@ class WorkerResultContractTest(unittest.TestCase):
         self.assertEqual(reviewer_targeted_test_evidence('unrelated\nResult: PASS'),
                          'Result: PASS')
 
+    def test_reviewer_targeted_evidence_preserves_explicit_commands_and_quoted_paths(self):
+        for command in (
+            'COMMAND: test_api.exe',
+            'COMMAND: test_api',
+            'COMMAND: "/opt/test tools/test_api"',
+            'COMMAND: "/opt/test tools/python3" tests/test_api.py',
+            '"/opt/test tools/test_api"',
+            '"/opt/test tools/python3" tests/test_api.py',
+        ):
+            with self.subTest(command=command):
+                publication = loop_manager.parse_worker_result(
+                    worker_result('Preserve explicit test commands', 'Summary',
+                                  command + '\nResult: PASS\nunrelated raw log'),
+                    self.plan,
+                )
+                self.assertEqual(
+                    reviewer_targeted_test_evidence(publication.test_evidence),
+                    command + '\nResult: PASS',
+                )
+
     def test_targeted_test_evidence_requires_a_clean_explicit_rerun(self):
         valid_evidence = (
             "pytest: 0 failed, 2 passed",
