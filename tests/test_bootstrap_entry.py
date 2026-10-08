@@ -37,11 +37,21 @@ class BootstrapEntryTests(unittest.TestCase):
             def child(command, **options):
                 if command[0] == "git":
                     return real_run(command, **options)
-                path = Path(command[3])
-                self.assertEqual(command[:3], [loop_manager.sys.executable, "-B", "-u"])
+                if "-c" in command:
+                    return subprocess.CompletedProcess(
+                        command, 0,
+                        stdout='{"created":1,"reused":0,"replaced":0,"unavailable":0}',
+                        stderr="",
+                    )
+                path = Path(command[command.index("-u") + 1])
+                self.assertEqual(command[0], loop_manager.sys.executable)
+                self.assertIn("-X", command)
+                self.assertTrue(command[command.index("-X") + 1].startswith("pycache_prefix="))
                 self.assertEqual(path.read_text(), "VALUE = 'latest-remote-bootstrap'\n")
                 self.assertEqual(git(path.parent, "rev-parse", "HEAD"), remote)
-                self.assertEqual(options, {"cwd": path.parent, "check": False})
+                self.assertEqual(options["cwd"], path.parent)
+                self.assertFalse(options["check"])
+                self.assertIsInstance(options["env"], dict)
                 self.assertIn("--runtime-child", command)
                 self.assertEqual(command[-2:], ["run", "--skip-if-running"])
                 self.assertEqual(command[command.index("--config") + 1], str(config))
@@ -90,11 +100,18 @@ class BootstrapEntryTests(unittest.TestCase):
             return loop_manager.RuntimeWorktree(runtime.path, runtime.commit_sha, None)
 
         def child(arguments, **kwargs):
-            self.assertEqual(kwargs, {"cwd": runtime.path, "check": False})
+            if arguments[0] == "git":
+                return subprocess.CompletedProcess(arguments, 1, stdout="", stderr="")
+            self.assertEqual(kwargs["cwd"], runtime.path)
+            self.assertFalse(kwargs["check"])
+            self.assertIsInstance(kwargs["env"], dict)
+            self.assertEqual(arguments[0], loop_manager.sys.executable)
+            self.assertIn("-X", arguments)
+            self.assertTrue(arguments[arguments.index("-X") + 1].startswith("pycache_prefix="))
             self.assertEqual(
                 config_path.read_text(), f"[telegram]\ntoken = {sentinel}\n",
             )
-            self.assertIn(str(config_path), arguments)
+            self.assertIn(str(config_path), " ".join(arguments))
             self.assertEqual(arguments[-2:], ["run", "--skip-if-running"])
             self.assertNotIn(sentinel, " ".join(arguments))
             events.append("child")

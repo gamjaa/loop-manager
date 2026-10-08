@@ -383,7 +383,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
                 "excludedCommands": [],
             })
 
-    def test_claude_planner_processes_do_not_force_bytecode_isolation(self):
+    def test_claude_planner_processes_preserve_parent_bytecode_policy(self):
         config = profile_config(self)
         session_id = "claude-planner-session"
         stream = (
@@ -431,8 +431,8 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
 
         self.assertEqual(started.session_id, session_id)
         self.assertEqual(resumed.session_id, session_id)
-        self.assertNotIn("PYTHONDONTWRITEBYTECODE", popen.call_args.kwargs["env"])
-        self.assertNotIn("PYTHONDONTWRITEBYTECODE", run.call_args.kwargs["env"])
+        self.assertEqual(popen.call_args.kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "0")
+        self.assertEqual(run.call_args.kwargs["env"]["PYTHONDONTWRITEBYTECODE"], "0")
 
     def test_session_fallback_and_provider_errors_use_common_contract(self):
         sessions: list[tuple[str | None, bool]] = []
