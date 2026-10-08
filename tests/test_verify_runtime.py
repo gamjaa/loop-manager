@@ -277,13 +277,49 @@ class GuardAndConfigurationTests(unittest.TestCase):
         audit("subprocess.Popen", (sys.executable, [sys.executable, "-c", "pass"], None, environment))
         self.assertEqual(environment[guard.MARKER], "1")
         self.assertIn("child_guard", environment["PYTHONPATH"])
-        self.assertNotIn("LOOP_MANAGER_VERIFY_SECRET", guard.worker_environment(environment))
+        self.assertNotIn("LOOP_MANAGER_VERIFY_SECRET", environment)
         with self.assertRaises(RuntimeError):
             audit("subprocess.Popen", (None, 'cmd /c "codex exec"', None, {}))
         windows_environment = {}
         audit("subprocess.Popen", (None, 'git rev-parse HEAD', None, windows_environment))
         self.assertEqual(windows_environment[guard.MARKER], "1")
         self.assertIn("child_guard", windows_environment["PYTHONPATH"])
+
+    def test_subprocess_receives_sanitized_copy_for_inherited_and_explicit_environment(self):
+        guard.install_guard()
+        credential_names = ("LOOP_MANAGER_VERIFY_ENDPOINT", "LOOP_MANAGER_VERIFY_SECRET",
+                            "LOOP_MANAGER_VERIFY_SESSION")
+        script = (
+            "import json, os; names = " + repr(credential_names) + "; "
+            "print(json.dumps({'credentials': [name for name in names if name in os.environ], "
+            "'marker': os.environ.get('LOOP_MANAGER_TEST_NO_AGENTS'), "
+            "'child_guard': any(path.endswith('child_guard') for path in "
+            "os.environ.get('PYTHONPATH', '').split(os.pathsep)), "
+            "'ordinary': os.environ.get('VERIFY_CHILD_TEST')}))"
+        )
+        command = [sys.executable, "-c", script]
+        with mock.patch.dict(os.environ, {name: "private-test-value" for name in credential_names}, clear=False):
+            os.environ["VERIFY_CHILD_TEST"] = "inherited-value"
+            parent_environment = dict(os.environ)
+            inherited = subprocess.run(command, capture_output=True, text=True, check=True, timeout=10)
+            self.assertEqual(dict(os.environ), parent_environment)
+        inherited_result = json.loads(inherited.stdout)
+        self.assertEqual(inherited_result["credentials"], [])
+        self.assertEqual(inherited_result["marker"], "1")
+        self.assertTrue(inherited_result["child_guard"])
+        self.assertEqual(inherited_result["ordinary"], "inherited-value")
+
+        explicit_environment = {name: "private-test-value" for name in credential_names}
+        explicit_environment.update(PATH=os.environ.get("PATH", ""), VERIFY_CHILD_TEST="explicit-value")
+        original_environment = dict(explicit_environment)
+        explicit = subprocess.run(command, env=explicit_environment, capture_output=True,
+                                  text=True, check=True, timeout=10)
+        self.assertEqual(explicit_environment, original_environment)
+        explicit_result = json.loads(explicit.stdout)
+        self.assertEqual(explicit_result["credentials"], [])
+        self.assertEqual(explicit_result["marker"], "1")
+        self.assertTrue(explicit_result["child_guard"])
+        self.assertEqual(explicit_result["ordinary"], "explicit-value")
 
     def test_managed_parallelism_defaults_caps_and_invalid_values(self):
         with tempfile.TemporaryDirectory() as directory:

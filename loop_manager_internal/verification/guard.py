@@ -1,12 +1,17 @@
 """테스트에서 실제 Agent 명령과 외부 API 연결을 실행 전에 거부한다."""
-from functools import lru_cache
+from functools import lru_cache, wraps
+import inspect
 import ipaddress
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 
 MARKER = "LOOP_MANAGER_TEST_NO_AGENTS"
+_COORDINATION_ENV = (
+    "LOOP_MANAGER_VERIFY_ENDPOINT", "LOOP_MANAGER_VERIFY_SECRET", "LOOP_MANAGER_VERIFY_SESSION",
+)
 _agent = re.compile(r"(?i)(?:^|[\s/\\\"'])(?:codex|claude)(?:\.(?:exe|cmd|bat))?(?=$|[\s\"'])")
 
 
@@ -43,16 +48,17 @@ def _local(host):
 @lru_cache(maxsize=1)
 def install_guard():
     os.environ[MARKER] = "1"
+    _install_child_environment_guard()
     def audit(event, arguments):
         if event == "subprocess.Popen":
             if arguments[0] is not None:
                 check_command([arguments[0]], enabled=True)
             check_command(arguments[1], enabled=True)
             environment = arguments[3]
-            # env를 명시하거나 테스트가 부모 env를 비워도 Python 자식의 차단을 유지한다.
-            inherited = worker_environment(environment if environment is not None else os.environ)
-            target = environment if environment is not None else os.environ
-            target[MARKER], target["PYTHONPATH"] = "1", inherited["PYTHONPATH"]
+            if environment is not None:
+                prepared = worker_environment(environment)
+                environment.clear()
+                environment.update(prepared)
         elif event == "os.system":
             check_command(arguments[0], enabled=True)
         elif event in {"os.exec", "os.posix_spawn"}:
@@ -67,14 +73,30 @@ def install_guard():
     sys.addaudithook(audit)
 
 
+def _install_child_environment_guard():
+    original_init = subprocess.Popen.__init__
+    if getattr(original_init, "_loop_manager_environment_guard", False):
+        return
+    signature = inspect.signature(original_init)
+
+    @wraps(original_init)
+    def guarded_init(self, *args, **kwargs):
+        bound = signature.bind_partial(self, *args, **kwargs)
+        bound.arguments["env"] = worker_environment(bound.arguments.get("env"))
+        return original_init(*bound.args, **bound.kwargs)
+
+    guarded_init._loop_manager_environment_guard = True
+    subprocess.Popen.__init__ = guarded_init
+
+
 def worker_environment(environment):
-    child = dict(environment)
+    child = dict(os.environ if environment is None else environment)
     child[MARKER] = "1"
     child["PYTHONIOENCODING"] = "utf-8"
     root = str(Path(__file__).resolve().parents[2])
     paths = [str(Path(__file__).parent / "child_guard"), root,
              *child.get("PYTHONPATH", "").split(os.pathsep)]
     child["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(filter(None, paths)))
-    for name in ("LOOP_MANAGER_VERIFY_ENDPOINT", "LOOP_MANAGER_VERIFY_SECRET", "LOOP_MANAGER_VERIFY_SESSION"):
+    for name in _COORDINATION_ENV:
         child.pop(name, None)
     return child
