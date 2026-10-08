@@ -383,8 +383,8 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
         for length in (4096, 4097, 8193):
             with self.subTest(length=length):
                 connection = self.connection()
-                header = "[alpha] PR created\nG-018: "
-                suffix = "\nhttps://example.test/pr/18"
+                header = "[alpha] G-018 PR 생성\n"
+                suffix = "\nhttps://example.test/pr/18\n상태: PR 검토·Merge 대기"
                 title_length = length - len(header) - len(suffix)
                 title = ("한글🙂\n" * (title_length // 4 + 1))[:title_length]
                 body = self.add_event(connection, body=title)

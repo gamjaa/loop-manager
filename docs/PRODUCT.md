@@ -54,17 +54,17 @@
 
 ### 활성 변경 요구사항과 현재 동작
 
-이 문서의 본문은 현재 Merge된 동작을 설명한다. 다음 활성 Requirement는 해당 부분을 변경할 요청이며, 계획·구현에서는 명시한 변경 범위와 유지할 보호 조건을 함께 적용한다. 문서 작성·로컬 commit만으로 구현 완료로 취급하지 않으며, 구현 PR이 Merge된 뒤 해당 장기 규칙을 본문에 반영한다.
+본문은 현재 Merge된 동작을 설명한다. 아래 활성 Requirement의 변경 범위·보호 조건은 계획·구현에 적용하고, `archive/` 링크는 과거 결정의 배경으로만 참조한다. 문서 작성·로컬 commit만으로 구현 완료로 취급하지 않으며 구현 PR Merge 뒤 장기 규칙을 본문에 반영한다.
 
-| 변경 범위 | 적용할 Requirement |
+| 변경 범위 | 관련 Requirement |
 |---|---|
-| Planner 역할 선택·변경 중심 검토·최종 확인·draft와 Agent 문서 권한 | [R-049](requirements/archive/%5BR-049%5D%20Input-Specific%20Planner%20Roles.md), [R-057](requirements/%5BR-057%5D%20Change-Focused%20Planning%20and%20Final%20Full%20Verification.md), [R-061](requirements/%5BR-061%5D%20Agent%20Roles%20and%20Draft%20ExecPlan%20Decisions.md) |
+| Planner 역할 선택·변경 중심 검토·최종 확인·draft와 Agent 문서 권한 | [R-049](requirements/archive/%5BR-049%5D%20Input-Specific%20Planner%20Roles.md), [R-057](requirements/archive/%5BR-057%5D%20Change-Focused%20Planning%20and%20Final%20Full%20Verification.md), [R-061](requirements/%5BR-061%5D%20Agent%20Roles%20and%20Draft%20ExecPlan%20Decisions.md) |
 | Worker 최초 level·Review 승격·Planner와 Worker의 명시적 모델 설정 | [R-052](requirements/%5BR-052%5D%20Worker%20Classification%20and%20Initial%20Level%20Calibration.md) |
-| 차단 범위·비차단 로컬 base 동기화·Git 통합과 원격 보존·로컬 환경 재검사 | [R-055](requirements/%5BR-055%5D%20Blocking%20Path%20Audit%20and%20Minimal%20Interruption.md), [R-056](requirements/%5BR-056%5D%20Non-Blocking%20Local%20Base%20Synchronization.md), [R-060](requirements/archive/%5BR-060%5D%20Collaborative%20Git%20Recovery%20and%20Remote%20Blocked%20Snapshots.md), [R-062](requirements/archive/%5BR-062%5D%20Local%20Environment%20Recovery%20Command.md), [R-078](requirements/%5BR-078%5D%20Concurrent%20Local%20Recovery%20Requests.md) |
-| Merge 대기 PR이 없는 due 리팩터링의 우선 처리 | [R-054](requirements/%5BR-054%5D%20Due%20Refactoring%20Priority.md) |
+| 차단 범위·비차단 로컬 base 동기화·Git 통합과 원격 보존·로컬 환경 재검사 | [R-055](requirements/%5BR-055%5D%20Blocking%20Path%20Audit%20and%20Minimal%20Interruption.md), [R-056](requirements/%5BR-056%5D%20Non-Blocking%20Local%20Base%20Synchronization.md), [R-060](requirements/archive/%5BR-060%5D%20Collaborative%20Git%20Recovery%20and%20Remote%20Blocked%20Snapshots.md), [R-062](requirements/archive/%5BR-062%5D%20Local%20Environment%20Recovery%20Command.md), [R-078](requirements/archive/%5BR-078%5D%20Concurrent%20Local%20Recovery%20Requests.md) |
+| Merge 대기 PR이 없는 due 리팩터링의 우선 처리 | [R-054](requirements/archive/%5BR-054%5D%20Due%20Refactoring%20Priority.md) |
 | 이벤트 시점의 진행·사용자 조치 알림과 무음 구분 | [R-053](requirements/%5BR-053%5D%20Timely%20Progress%20Notifications.md) |
-| 테스트별 시간·실제 Agent 없는 테스트·안전한 Python 캐시 | [R-058](requirements/%5BR-058%5D%20Test%20Timing%20and%20Agent-Free%20Test%20Execution.md), [R-059](requirements/%5BR-059%5D%20Safe%20Python%20Bytecode%20Cache%20Use.md) |
-| 규칙 기반 작업의 Manager 처리·모델 호출과 입출력 감소·동일 입력 성공 결과 재사용 | [R-063](requirements/%5BR-063%5D%20Manager-Owned%20Deterministic%20Work%20and%20Minimal%20Model%20Use.md) |
+| 테스트별 시간·실제 Agent 없는 테스트·안전한 Python 캐시 | [R-058](requirements/archive/%5BR-058%5D%20Test%20Timing%20and%20Agent-Free%20Test%20Execution.md), [R-059](requirements/%5BR-059%5D%20Safe%20Python%20Bytecode%20Cache%20Use.md) |
+| 규칙 기반 작업의 Manager 처리·모델 호출과 입출력 감소·동일 입력 성공 결과 재사용 | [R-063](requirements/archive/%5BR-063%5D%20Manager-Owned%20Deterministic%20Work%20and%20Minimal%20Model%20Use.md) |
 
 R-023의 원격 실행·self handoff 목표는 유지하며 로컬 갱신 gate는 R-056, 역할별 파일 권한은 R-061을 따른다. R-055의 planning 오류와 R-061의 유효한 draft 사용자 판단 대기는 구분한다. draft는 planning 오류가 아니며 독립 작업을 막지 않지만 프로젝트 완료와 관련 Requirement archive를 허용하는 완료 상태도 아니다.
 
@@ -425,13 +425,13 @@ Loop Manager runtime에서만 읽는 `docs/AGENTS.*.md`와 저장소 밖 Manager
 
 - Telegram token과 chat ID가 모두 설정된 경우에만 알림을 생성하고 전송한다
 - 두 값이 모두 비어 있으면 알림을 비활성화하며 작업 흐름에는 영향을 주지 않는다
-- PR 생성 알림에는 PR 링크가 포함돼야 한다
-- 차단 알림에는 scope, 구조화 원인, 관련 ExecPlan, 실제 수정 대상이 확인된 경우에만 그 경로, checkpoint 성공 시 원격 commit link·OID 또는 미게시 시 local-only 보존 이유가 포함돼야 한다
+- PR 생성 알림은 프로젝트·ExecPlan·작업 내용·PR 링크와 Merge 대기 상태를 우선 표시한다
+- 차단 알림은 확인된 사용자 조치, 차단 작업·scope, 구체적 원인, 확인 대상·질문, 복구 상태·Checkpoint 순으로 구성한다. 확인되지 않은 수정 행동이나 복구 성공은 추측하지 않으며 실제 수정 대상이 확인된 경우에만 그 경로를 안내한다. checkpoint 성공 시 원격 commit link·OID, 미게시 시 local-only 보존 이유와 중요한 오류 근거를 유지한다
 - 차단 알림은 plan·scope·원인·지문·revision이 같을 때 같은 사건으로 중복 제거한다
 - 미해결 `planning_error`는 같은 입력의 반복 실행·재시작, 다른 계획·PR 상태 변경과 단순 원격 base 전진에도 같은 차단 사건을 유지한다. 실제 planning 오류 해제와 사건 해제·미전송 알림 취소를 하나의 SQLite transaction에 기록하며, 소유권 확인이나 정리가 실패하면 모두 미해결로 보존한다. 과거 중복 사건과 전송 감사 기록은 삭제하지 않고 현재 사건의 추가 분할과 중복 알림을 막는다
 - BLOCKED 알림의 한 조각 이상 전송이 확인된 차단이 해제되고 해당 계획의 Worker·PR 처리 또는 프로젝트·Planner의 정상 작업이 실제로 시작되면, 이전 scope·계획·원인과 시작한 작업을 담은 재개 알림을 사건당 한 번 전송한다. 단순 해제, 다른 계획의 시작, 미전송 차단과 Telegram 비활성화에는 만들지 않으며 해제된 차단의 미전송 조각은 취소한다. 같은 원인으로 별도 통지된 이후 차단은 새 사건으로 취급한다
 - 프로젝트 완료 알림은 해당 프로젝트의 현재 작업 주기가 완료됐을 때 전송한다
 - 완료 알림에는 Planner의 추가 작업 없음 확인, 활성 Requirement 없음과 마지막 완료 계획을 포함한다
-- 같은 안정적 대기 원인은 재실행·재시작 뒤 중복 알리지 않고, 작업 진행 또는 관련 입력·차단 원인이 바뀐 새 대기 상태는 한 번 다시 알릴 수 있다
+- 대기 알림은 확인된 사용자 행동이 필요한 항목을 먼저 표시하고 나머지 대기 사유도 보존한다. 자동 복구 가능한 오류만으로 사용자 조치를 요구하지 않는다. 같은 안정적 대기 원인은 재실행·재시작 뒤 중복 알리지 않고, 작업 진행 또는 관련 입력·차단 원인이 바뀐 새 대기 상태는 한 번 다시 알릴 수 있다
 - Telegram이 비활성화되거나 전송에 실패해도 완료·대기 이유는 실행 결과와 로그에 남는다
 - 동일한 이벤트는 한 번만 전송하며 실패한 알림만 다음 실행에서 재시도한다

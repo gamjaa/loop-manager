@@ -41,6 +41,45 @@ class ExecutionGuidanceTests(ExecutionFixture, TestCase):
         self.assertIn('선택된 최신 ExecPlan과 현재 worktree', prompts[1])
 
 
+class WorkerPromptFocusTests(TestCase):
+    def test_retry_puts_unresolved_feedback_before_protocol_and_ignores_previous_result(self):
+        feedback = 'verify:digest occurrence=2 revision=1\nFix the failing assertion'
+        prompt = lm.worker_prompt(
+            'docs/plans/plan.md', 'Worker 결과 검증 실패: missing title',
+            previous_result='already successful work', validation_feedback=feedback,
+        )
+        self.assertEqual(prompt.count(feedback), 1)
+        self.assertLess(prompt.index(feedback), prompt.index('COMMIT_TITLE:'))
+        self.assertLess(prompt.index('missing title'), prompt.index('COMMIT_TITLE:'))
+        self.assertIn('이미 성공한 작업을 불필요하게 반복', prompt)
+        self.assertNotIn('already successful work', prompt)
+        self.assertNotIn('실제 diff를', prompt)
+        for marker in ('WORKER_OUTCOME:', 'COMMIT_TITLE:', 'PR_SUMMARY:',
+                       'TARGETED_TESTS:', 'FAILED_COMMAND:', 'RERUN:'):
+            self.assertIn(marker, prompt)
+        self.assertIn('전체 verify는 Worker 종료 뒤 Loop Manager가 실행', prompt)
+
+    def test_recovery_reconciles_plan_diff_and_feedback_without_claiming_verification(self):
+        feedback = 'review:src/work.py::save::retention occurrence=1 revision=1'
+        prompt = lm.worker_prompt(
+            'docs/plans/plan.md', None, previous_result='Saved partial implementation',
+            validation_feedback=feedback, session_recovery=True,
+        )
+        self.assertIn('선택된 최신 ExecPlan과 현재 worktree', prompt)
+        self.assertIn('계획 목표와 실제 diff를', prompt)
+        self.assertIn('이미 수행한 변경과 남은 작업', prompt)
+        self.assertIn('다음 필요한 작업부터', prompt)
+        self.assertIn('이전 결과만으로 검증 성공을 주장하지 마라', prompt)
+        self.assertEqual(prompt.count(feedback), 1)
+        self.assertIn('Saved partial implementation', prompt)
+
+    def test_normal_turn_has_no_recovery_summary_or_correction_instruction(self):
+        prompt = lm.worker_prompt('docs/plans/plan.md', None)
+        self.assertNotIn('새 세션에서 이어간다', prompt)
+        self.assertNotIn('실제 diff를', prompt)
+        self.assertNotIn('미해결 검증 실패와 아래 오류', prompt)
+
+
 class WorkerCliGuidanceScopeTests(AgentScopeFixture, TestCase):
     def test_worker_can_change_cli_guidance_within_ordinary_worktree_scope(self):
         with tempfile.TemporaryDirectory() as directory:

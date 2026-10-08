@@ -162,7 +162,7 @@ def worker_prompt(
     allow_common_plans: bool = False,
 ) -> str:
     failure = (
-        f"\n이전 실행에서 다음 문제가 발생했다. 원인을 해결하라:\n"
+        "\n현재 교정할 오류:\n"
         f"{redact_secrets(error)[-6000:]}\n"
         if error else ""
     )
@@ -171,6 +171,11 @@ def worker_prompt(
         f"{validation_feedback}\n"
         if validation_feedback
         else ""
+    )
+    correction = (
+        "\n미해결 검증 실패와 아래 오류의 원인에 관련된 변경부터 처리하라. "
+        "이미 성공한 작업을 불필요하게 반복하거나 범위 밖 기능으로 확대하지 마라.\n"
+        if error or validation_feedback else ""
     )
     if "전체 verify 시간 초과:" in (error or "") or "전체 verify 시간 초과:" in (validation_feedback or ""):
         failure += (
@@ -191,7 +196,9 @@ def worker_prompt(
         recovery = (
             "\n저장된 Worker 세션을 재개할 수 없어 새 세션에서 이어간다. "
             "선택된 최신 ExecPlan과 현재 worktree를 다시 확인하라. "
-            "아래 이전 Worker 결과와 미해결 검증 피드백을 기준으로 계속하라:\n"
+            "계획 목표와 실제 diff를 아래 이전 Worker 결과·미해결 피드백과 대조해 "
+            "이미 수행한 변경과 남은 작업을 확인하고 다음 필요한 작업부터 이어가라. "
+            "이전 결과만으로 검증 성공을 주장하지 마라:\n"
             f"{redact_secrets(previous_result or '이전 Worker 결과 없음')[-6000:]}\n"
         )
     plans_scope = (
@@ -202,6 +209,10 @@ def worker_prompt(
     return f"""
 당신은 Loop Manager의 Worker다.
 {plan_path}를 읽고 해당 ExecPlan 하나만 구현하라.
+{correction}
+{saved_feedback}
+{failure}
+{recovery}
 관련 targeted test를 작성하되 commit, push, PR 생성과 scripts/verify 실행은 하지 마라.
 docs/plans에 새 ExecPlan을 만들지 말고 불필요한 후속 기능도 구현하지 마라.
 ExecPlan의 사용자 판단 대기 draft 표시와 User Decision은 사용자를 대신해 해제·작성·변경하지 마라.
@@ -218,9 +229,6 @@ TARGETED_TESTS:
 실행한 최소 범위 targeted unit test와 결과, 또는 실행하지 못한 구체적인 사유
 {worker_outcome_instruction()}
 {archive_instruction}
-{recovery}
-{saved_feedback}
-{failure}
 """.strip()
 
 

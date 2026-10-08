@@ -2,7 +2,7 @@
 
 ## Overview
 
-Loop Manager는 Windows와 Linux에서 동작하는 Python 3 프로그램이다. 외부 스케줄러가 프로그램을 반복 실행하며, 프로젝트 문서와 GitHub 상태를 확인하고 AI Agent CLI를 호출해 계획, 구현, 검증과 PR 생성을 진행한다.
+Loop Manager는 Windows·Linux·macOS에서 동작하는 Python 3 프로그램이다. 외부 스케줄러가 프로그램을 반복 실행하며, 프로젝트 문서와 GitHub 상태를 확인하고 AI Agent CLI를 호출해 계획, 구현, 검증과 PR 생성을 진행한다.
 
 하나의 프로젝트에는 여러 READY ExecPlan을 등록할 수 있지만 한 번에 하나만 처리한다. 서로 다른 프로젝트는 `max_workers` 범위에서 병렬로 처리한다.
 
@@ -10,7 +10,7 @@ Loop Manager는 Windows와 Linux에서 동작하는 Python 3 프로그램이다.
 
 | 기준 | 담당 내용 |
 |---|---|
-| [README.md](../README.md) | 설치·설정·실행·사용자 조치 |
+| [README.md](../README.md)·[운영 안내](OPERATIONS.md) | 첫 설치·실행과 상세 설정·수동 제출·장애 대응 |
 | [PRODUCT.md](PRODUCT.md)와 활성 Requirement | 현재 제품 동작·장기 규칙과 요청된 변화 |
 | 이 문서 | 책임 경계·정보 원본·저장·실행 격리·검증·복구 방식 |
 | [PLANS.md](PLANS.md) | 공통 ExecPlan 형식·메타데이터 |
@@ -20,14 +20,14 @@ Loop Manager는 Windows와 Linux에서 동작하는 Python 3 프로그램이다.
 
 현행 구조와 활성 변경 요청의 적용 범위는 [PRODUCT의 변경 요구사항 절](PRODUCT.md#활성-변경-요구사항과-현재-동작)에서 연결한다. 아래의 로컬 fast-forward 제한, PR 없는 checkpoint, Planner의 FUTURE_IDEAS 작성과 Worker 문서 제한은 현행 설명이며, 각각 R-056·R-060·R-061의 구현 목표를 거부하는 제약으로 사용하지 않는다. 구현 전 Agent의 실제 권한과 실행 gate를 문서만으로 변경하지 않는다.
 
-[R-063](requirements/%5BR-063%5D%20Manager-Owned%20Deterministic%20Work%20and%20Minimal%20Model%20Use.md)은 규칙 기반 편집·결과 형식 처리의 Manager 이관과 모델 호출 축소를 요청한다. 아래의 후보 revision 변경 후 Worker·verify·Review 재수행은 현행 설명이며, R-063 구현에서는 역할별 입력 동일성이 증명된 성공 결과의 재사용 범위에 한해 변경한다. 실제 변경과 비교 근거가 없는 경우의 재검증·최신 원격 게시 gate는 유지한다.
+[보관된 R-063](requirements/archive/%5BR-063%5D%20Manager-Owned%20Deterministic%20Work%20and%20Minimal%20Model%20Use.md)은 규칙 기반 처리의 Manager 이관과 모델 호출 축소의 설계 배경이다. 후보 성공 결과 재사용의 변경 요구는 [R-072](requirements/%5BR-072%5D%20Reuse%20Successful%20Candidate%20Results%20with%20Proven%20Inputs.md)를 따른다. 역할별 입력 동일성의 증거가 없는 경우의 재검증·최신 원격 게시 gate는 유지한다.
 
 ## 실행 환경과 시작
 
 - Codex 또는 Claude Code CLI 중 최소 하나가 설치되고 인증돼있어야 한다
 - Git과 gh(GitHub CLI)가 설치되고 대상 저장소에 접근할 수 있어야 한다
 - Python 3 venv를 만들 수 있어야 한다
-- Windows와 Linux용 실행 진입점을 제공한다
+- Windows는 PowerShell, Linux·macOS는 Bash 실행 진입점을 제공한다
 - 같은 사용자 상태 디렉터리의 자동 실행과 실제 복구 실행은 `<state-dir>/loop-manager.lock`으로 직렬화한다. 수동 준비와 복구 요청 접수는 별도 command runtime과 자원 잠금을 사용한다
 - `run.sh`와 `run.ps1`은 Git을 실행하지 않고 source checkout의 Python 부트스트랩만 시작한다
 - 부트스트랩은 다른 Git 작업 전에 부모 process lock을 획득하고, Loop Manager 저장소의 `origin/main`을 fetch해 exact SHA의 detached runtime worktree를 선택한 뒤 같은 lock을 유지한 채 runtime 자식을 실행한다. `manual`과 `recover`는 command별 부모 lock과 고유 runtime 경로로 자동 실행과 분리한다
@@ -57,7 +57,7 @@ ignored 상태는 runtime 전달 근거가 아니다. `.venv`는 launcher가 선
 런타임 상태 디렉터리는 source checkout 밖의 운영체제 사용자 상태 경로를 사용한다.
 
 - Windows: `%LOCALAPPDATA%\loop-manager\`
-- Linux: `${XDG_STATE_HOME:-~/.local/state}/loop-manager/`
+- Linux·macOS: `${XDG_STATE_HOME:-~/.local/state}/loop-manager/`
 
 SQLite, manager runtime worktree, 프로젝트 관리 worktree, 로그, 임시 파일과 프로세스 lock은 모두 이 경로 아래에 둔다.
 
@@ -141,7 +141,7 @@ ExecPlan ID만 Git 선언과 SQLite 실행 이력을 잇는 안정적인 identit
 
 활성 변경 단계와 maintenance publication이 없는 안전한 선택 경계에서 명세 또는 전체 계획 입력 지문이 마지막 성공 기준과 다르면, PRODUCT의 유지보수·역할 선택 순서를 적용해 READY보다 먼저 필요한 Planner를 한 번 실행한다. 입력이 같으면 활성 유지보수 prerequisite·리팩터링 DAG의 선택을 먼저 적용하고 일반 READY는 priority와 숫자 ID 순으로 시작한다. 성공한 두 지문이 최신 입력과 같으면 빈 catalog 또는 dependency 대기 상태에서도 Planner를 반복 실행하지 않는다.
 
-[R-054 구현 예정](requirements/%5BR-054%5D%20Due%20Refactoring%20Priority.md): Merge 대기 PR이 없는 due 유지보수는 평가가 아직 계획을 게시하지 않았어도 일반 Planner·빠른 점검·일반 READY보다 먼저 수행한다. 진행 작업은 선점하지 않으며 평가와 필요한 리팩터링 cycle이 끝난 뒤 일반 작업 선택으로 돌아간다.
+due 유지보수의 선택·진행 작업의 비선점 정책은 PRODUCT의 [작업 선택](PRODUCT.md#작업-선택과-동시-실행)·[유지보수 평가](PRODUCT.md#유지보수-평가)를 따른다. [보관된 R-054](requirements/archive/%5BR-054%5D%20Due%20Refactoring%20Priority.md)는 설계 배경으로만 참조한다.
 
 ## Git과 worktree 실행 모델
 
@@ -263,6 +263,12 @@ planning batch의 원격 게시·catalog 반영과 현재 원격 입력 일치�
 - 상태 분류, 설정 검증, Git/GitHub 명령과 verify 실행은 프로그램 코드가 담당한다
 - Worker는 commit, fetch, pull, rebase, push, worktree 등록과 PR 생성을 수행하지 않는다. Worker 반환 뒤의 모든 Git 쓰기는 Agent 호출 밖의 프로그램 코드가 소유한다
 - AI Agent와 verify subprocess에는 역할 수행에 필요한 환경 변수만 전달하고 Telegram token을 포함한 Loop Manager 비밀값을 상속하지 않는다
+
+### Ponytail 지침
+
+Worker에 추가하는 [AGENTS.ponytail.md](AGENTS.ponytail.md)는 [Ponytail](https://github.com/DietrichGebert/ponytail)의 코드 단순화·기존 구현 재사용 지침이다. upstream [552acd5](https://github.com/DietrichGebert/ponytail/blob/552acd5efd0aeae2583a12efe39373d2f076f25e/AGENTS.md)의 원문과 [MIT 라이선스](AGENTS.ponytail.LICENSE)를 보존한다. 적용·버전 경계는 위 원본 묶음 계약을 따른다.
+
+축약 원문은 전체 Skill·Hook과 동일한 효과를 보증하지 않는다. Codex 0.161.0의 [command Hook](https://github.com/openai/codex/blob/rust-v0.161.0/codex-rs/hooks/src/engine/command_runner.rs)은 별도 셸 프로세스로 실행되고 외부 MCP에도 내장 파일 sandbox 적용을 보장할 수 없으므로 기존 Plugin·App 비활성화와 쓰기 경계를 유지한다. 사용자 Plugin 설정·설치 상태는 변경하지 않으며 명시된 요구사항·안전·검증·역할·승인·게시 규칙을 보존한다.
 
 ### R-023: workspace 쓰기 제한과 자동 승인 검토 (구현 예정)
 
@@ -427,6 +433,8 @@ ExecPlan archive는 원본 hash, regular-file source, 비어 있는 destination�
 알림 이벤트·payload·차단 해제와 대기·완료의 의미는 PRODUCT의 알림 정책을 따른다. token과 chat ID가 모두 있어야 SQLite outbox에 이벤트를 저장하고 전송한다. 두 값이 모두 없으면 생성·전송하지 않고 일부만 있으면 설정 오류다.
 
 고유 사건 키로 중복을 방지하고 전송 결과·조각·실패 감사와 재시도 정보를 작업 상태와 분리해 보존한다. 실패한 전송만 다음 실행에서 재시도한다. planning 오류 해제와 해당 사건 해제·미전송 조각 취소는 한 transaction으로 반영하며 과거 전송 감사는 유지한다. 새 PRODUCT·Requirement 작업 주기와 내용 보존 archive를 구분한다.
+
+`notifications/rendering.py`는 기존 payload만으로 텍스트를 결정적으로 생성하며 모델을 호출하지 않는다. 확인된 질문·수정 대상·PR 상태로 정보 순서를 정하고, 원인·복구 시도·Checkpoint 근거는 보존한다. 긴 메시지는 기존 4096자 조각과 저장된 전송 진행률로 누락 없이 이어 보내며 이미 고정된 outbox 텍스트는 다시 구성하지 않는다.
 
 ## Repository Safety and Security
 

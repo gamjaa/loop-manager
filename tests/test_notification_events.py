@@ -22,6 +22,170 @@ from support.notification import NotificationFixture
 
 
 class NotificationRenderingTest(unittest.TestCase):
+    def test_pr_notice_names_work_link_and_merge_wait(self):
+        payload = {
+            "project": "alpha", "execplan_id": "G-018",
+            "execplan_title": "Preserve recovery evidence",
+            "pr_url": "https://example.test/pr/18",
+        }
+        message = rendering._message("pr_created", payload)
+        self.assertTrue(message.startswith("[alpha] G-018 PR 생성\n"))
+        positions = [message.index(value) for value in (
+            payload["execplan_title"], payload["pr_url"], "PR 검토·Merge 대기",
+        )]
+        self.assertEqual(positions, sorted(positions))
+
+    def test_block_notice_prioritizes_confirmed_decision_and_keeps_evidence(self):
+        payload = {
+            "project": "alpha", "scope": "plan", "execplan_id": "G-018",
+            "execplan_title": "Retain history", "reason_code": "user_decision_required",
+            "cause": "Retention policy is missing", "paths": ["docs/PRODUCT.md"],
+            "worker_decision": {"question": "How long should history be retained?"},
+            "recovery": {
+                "recovery_disposition": "user_decision", "unresolved": "retention criterion",
+                "recovery_attempts": {"git_lock": 2}, "last_stable_revision": "base-sha",
+            },
+            "checkpoint": {
+                "result": "published", "branch": "loop-manager/G-018",
+                "branch_url": "https://github.com/org/repo/tree/saved-sha",
+                "commit_oid": "saved-sha",
+            },
+        }
+        original = json.dumps(payload, sort_keys=True)
+        message = rendering._message("blocked", payload)
+        positions = [message.index(value) for value in (
+            "사용자 조치:", "작업: plan: G-018: Retain history",
+            "원인: Retention policy is missing", "확인 대상:", "Question:",
+            "Recovery status:", "Checkpoint:",
+        )]
+        self.assertEqual(positions, sorted(positions))
+        for value in ("retention criterion", "git_lock: 2", "base-sha", "saved-sha"):
+            self.assertIn(value, message)
+        self.assertEqual(message.count("docs/PRODUCT.md"), 1)
+        self.assertEqual(json.dumps(payload, sort_keys=True), original)
+
+    def test_unconfirmed_block_does_not_turn_paths_or_retries_into_edit_instructions(self):
+        payload = {
+            "project": "alpha", "scope": "project", "stage": "planning",
+            "reason_code": "git_lock", "cause": "lock busy",
+            "paths": ["docs/plans/plan.md"],
+            "recovery": {"recovery_attempts": {"git_lock": 3}},
+            "checkpoint": {"result": "local_only", "reason": "remote unavailable",
+                           "worktree": "/state/planning"},
+        }
+        message = rendering._message("blocked", payload)
+        self.assertNotIn("사용자 조치:", message)
+        self.assertNotIn("Files to edit", message)
+        for value in ("lock busy", "git_lock: 3", "remote unavailable", "/state/planning"):
+            self.assertIn(value, message)
+
+    def test_guidance_targets_and_closed_pr_each_supply_only_the_confirmed_action(self):
+        cases = (
+            ({"guidance_locations": [{"user_decision": "docs/plans/plan.md:22"}]},
+             "지침 제안과 User Decision"),
+            ({"recovery": {"user_targets": ["docs/plans/plan.md:22"]}},
+             "확인 대상의 보고된 원인"),
+            ({"reason_code": "pull_request_closed"}, "같은 PR을 다시 열어"),
+        )
+        for fields, expected in cases:
+            with self.subTest(fields=fields):
+                payload = {
+                    "project": "alpha", "scope": "plan", "execplan_id": "G-018",
+                    "reason_code": "guidance_approval_required", "cause": "saved cause",
+                    "paths": ["docs/plans/plan.md:22"], **fields,
+                }
+                message = rendering._message("blocked", payload)
+                self.assertIn(expected, message)
+                self.assertLess(message.index("사용자 조치:"), message.index("작업:"))
+                self.assertEqual(message.count("docs/plans/plan.md:22"), 1)
+
+    def test_persistent_failure_keeps_recorded_action_before_diagnostics(self):
+        payload = {
+            "project": "alpha", "stage": "PUBLISHING", "execplan_id": "G-018",
+            "required_action": "Check the reported remote permission",
+            "reason_code": "push_failed", "cause": "permission denied",
+            "consecutive_external_runs": 3, "recovery_attempts": {"push_failed": 2},
+        }
+        message = rendering._message("persistent_execution_failure", payload)
+        self.assertLess(message.index(payload["required_action"]), message.index(payload["cause"]))
+        self.assertIn("Consecutive external runs: 3", message)
+        self.assertIn("push_failed: 2", message)
+
+    def test_wait_notice_orders_actions_stably_without_losing_other_waits_or_links(self):
+        payload = {
+            "project": "alpha",
+            "plans": [
+                {"id": "G-001", "title": "Dependency", "status": "READY",
+                 "reason": "미충족 dependency G-003 (PR_OPEN)"},
+                {"id": "G-002", "title": "Merge", "status": "PR_OPEN",
+                 "reason": "PR Merge 대기", "pr_url": "https://example.test/pr/2"},
+                {"id": "G-003", "title": "Decision", "status": "DRAFT",
+                 "reason": "ExecPlan 사용자 판단 대기", "question": "Question: Choose A or B?",
+                 "path": "docs/plans/draft.md", "revision": "draft-sha",
+                 "url": "https://github.com/org/repo/blob/draft-sha/docs/plans/draft.md"},
+                {"id": "G-004", "title": "Catalog", "status": "CATALOG_HELD",
+                 "reason": "ExecPlan catalog 오류의 교정 대기",
+                 "reason_code": "execplan_catalog_invalid", "evidence": "duplicate ID"},
+                {"id": "G-005", "title": "Blocked choice", "status": "PLAN_BLOCKED",
+                 "reason_code": "user_decision_required", "reason": "Choose retention"},
+            ],
+            "requirements": [
+                {"id": "R-001", "reason": "Manager 게시 대기"},
+                {"id": "R-002", "path": "docs/requirements/criterion.md",
+                 "reason": "전체 충족 판단이 불확실하여 사용자 결정을 기다립니다: missing criterion"},
+            ],
+            "project_block": {"reason": "ownership uncertain"},
+            "planning_error": "planning validation failed",
+        }
+        original = json.dumps(payload, sort_keys=True)
+        message = rendering._message("work_waiting", payload)
+        positions = [message.index(value) for value in (
+            "사용자 확인 대기:", "- G-002", "- G-003", "- G-004", "- G-005", "- R-002",
+            "기타 대기:", "- G-001", "- R-001",
+        )]
+        self.assertEqual(positions, sorted(positions))
+        for value in (
+            "https://example.test/pr/2", "Choose A or B?", "draft-sha",
+            "docs/plans/draft.md", "duplicate ID", "ownership uncertain",
+            "planning validation failed", "미충족 dependency G-003 (PR_OPEN)",
+        ):
+            self.assertIn(value, message)
+        self.assertEqual(json.dumps(payload, sort_keys=True), original)
+
+    def test_project_decision_precedes_passive_waits_without_relabeling_planning_error(self):
+        payload = {
+            "project": "alpha", "plans": [],
+            "requirements": [{"id": "R-001", "reason": "Manager 게시 대기"}],
+            "project_block": {"code": "user_decision_required", "reason": "Confirm policy"},
+            "planning_error": "git lock busy; automatic retry pending",
+        }
+        message = rendering._message("work_waiting", payload)
+        self.assertLess(message.index("PROJECT_BLOCKED"), message.index("기타 대기:"))
+        self.assertLess(message.index("기타 대기:"), message.index("planning_error"))
+        self.assertIn("automatic retry pending", message)
+        self.assertNotIn("사용자 조치:", message)
+
+    def test_long_block_keeps_diagnostics_and_local_checkpoint_across_pieces(self):
+        payload = {
+            "project": "alpha", "scope": "plan", "execplan_id": "G-018",
+            "reason_code": "managed_worktree_conflict", "cause": "충돌 근거🙂\n" * 1500,
+            "paths": ["src/work.py"],
+            "checkpoint": {
+                "result": "local_only", "reason": "unresolved rebase", "diagnostic": True,
+                "original_branch": "loop-manager/G-018", "worktree": "/state/G-018",
+                "complete": False, "omitted": ["unsafe-symlink"],
+                "original_unpublished_reason": "remote changed",
+            },
+        }
+        message = rendering._message("blocked", payload)
+        pieces = rendering._pieces(message)
+        self.assertGreater(len(pieces), 1)
+        self.assertTrue(all(len(piece) <= rendering.MESSAGE_LIMIT for piece in pieces))
+        self.assertEqual("".join(pieces), message)
+        for value in ("unresolved rebase", "/state/G-018", "loop-manager/G-018",
+                      "unsafe-symlink", "remote changed"):
+            self.assertIn(value, pieces[-1])
+
     def test_checkpoint_links_accept_only_supported_github_origins(self):
         oid = "a" * 40
         expected = f"https://github.com/org/repo/tree/{oid}"
