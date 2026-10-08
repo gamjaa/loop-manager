@@ -5,6 +5,7 @@ from contextlib import contextmanager, ExitStack
 from contextvars import ContextVar
 from datetime import datetime, timezone
 import json
+import math
 import os
 from pathlib import Path
 import time
@@ -245,10 +246,33 @@ def comparison(directories, summaries):
                          limits.get("applied_quota"), limits.get("source")))
         def duration(name):
             return next((event["duration"] for event in summary["phases"] if event["name"] == name), None)
+        fixture_phases = [event for event in summary["phases"]
+                          if isinstance(event.get("name"), str) and event["name"].startswith("git_fixture:")]
+        fixture_durations = []
+        fixture_intervals = []
+        for index, event in enumerate(fixture_phases):
+            value = event.get("duration")
+            if (not isinstance(value, (int, float)) or isinstance(value, bool)
+                    or not math.isfinite(value) or value < 0):
+                continue
+            fixture_durations.append((index, value))
+            start, pid = event.get("start"), event.get("pid")
+            if (isinstance(start, (int, float)) and not isinstance(start, bool)
+                    and math.isfinite(start) and isinstance(pid, int) and not isinstance(pid, bool)):
+                fixture_intervals.append((index, pid, start, start + value))
+        nested_fixture_phases = set()
+        # ponytail: O(n²) over a small fixture event set; group and sort by PID if it grows.
+        for child_index, child_pid, child_start, child_end in fixture_intervals:
+            for parent_index, parent_pid, parent_start, parent_end in fixture_intervals:
+                if (child_index != parent_index and child_pid == parent_pid
+                        and parent_start <= child_start and child_end <= parent_end
+                        and (parent_start < child_start or child_end < parent_end)):
+                    nested_fixture_phases.add(child_index)
+                    break
         runs.append({"directory": str(directory), "revision": metadata.get("revision"), "cap": metadata.get("cap"),
                      "seconds": duration("verify_process") if duration("verify_process") is not None else duration("verify"),
-                     "git_fixture_seconds": sum(event["duration"] for event in summary["phases"]
-                                                if event["name"].startswith("git_fixture:")),
+                     "git_fixture_seconds": sum(value for index, value in fixture_durations
+                                                 if index not in nested_fixture_phases),
                      "git_snapshot_count": sum(cost["count"] for cost in summary.get("git_snapshots", {}).values()),
                      "git_snapshot_commands": sum(command["count"] for cost in summary.get("git_snapshots", {}).values()
                                                   for command in cost["commands"].values()),

@@ -355,10 +355,10 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
                              (loop_manager.ROOT / "docs/ARCHITECTURE.template.md").read_bytes())
 
         for phrase in (
-            "기존 문서와 템플릿의 재사용 가능성",
-            "현재 요청에 필요하지 않은 구조·파일·표현",
-            "결정, 예외, 실패 흐름, Acceptance Criteria의 의미",
-            "간결화를 위해",
+            "기존 문서·템플릿을 먼저 확인한다",
+            "문서 목적 밖 구현 세부·작업 이력을 정리한다",
+            "정상/실패/예외 흐름",
+            "길이·항목 수·토큰 수에 기계적인 제한을 두지 않는다",
         ):
             with self.subTest(phrase=phrase):
                 self.assertIn(phrase, skill)

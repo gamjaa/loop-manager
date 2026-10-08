@@ -17,7 +17,7 @@ from loop_manager_internal.execution import verify_process, windows_job
 from loop_manager_internal.verification import guard, manifest, runner, manager_adapter
 from loop_manager_internal.verification.coordination import execution_settings
 from loop_manager_internal.execution.validation_feedback import MAX_DIAGNOSTIC, format_verify_failure
-from loop_manager_internal.verification.timing import EventWriter, TimedResult, comparison, fixture_timing, summarize
+from loop_manager_internal.verification.timing import EventWriter, TimedResult, comparison, fixture_timing, phase, summarize
 
 
 class TimingAndManifestTests(unittest.TestCase):
@@ -45,6 +45,58 @@ class TimingAndManifestTests(unittest.TestCase):
             changed.mkdir()
             (changed / "manifest.json").write_text(json.dumps([{"ids": ["another"]}]))
             self.assertFalse(comparison([root, changed], [summary, summary])["scope_matches"])
+
+    def test_comparison_counts_nested_fixture_time_once_and_preserves_independent_phases(self):
+        clock = [0.0]
+
+        def advance(seconds):
+            clock[0] += seconds
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "manifest.json").write_text(json.dumps([{"ids": ["case"]}]))
+            writer = EventWriter(root / "events.jsonl", clock=lambda: clock[0])
+            try:
+                with writer.activate():
+                    with phase("git_fixture:boundary_save"):
+                        advance(1)
+                        with phase("git_fixture:boundary_confirmation"):
+                            advance(2)
+                        with phase("git_fixture:boundary_copy"):
+                            advance(4)
+                            with phase("git_fixture:boundary_confirmation"):
+                                advance(3)
+                    with phase("git_fixture:boundary_restore"):
+                        advance(1)
+                        with phase("git_fixture:boundary_copy"):
+                            advance(3)
+                        with phase("git_fixture:boundary_confirmation"):
+                            advance(2)
+                    with phase("git_fixture:boundary_cleanup"):
+                        advance(2)
+                    with phase("git_fixture:boundary_identity"):
+                        advance(5)
+                    # A second test's same-named phase is sequential and remains independent.
+                    clock[0] = 100
+                    with phase("git_fixture:boundary_copy"):
+                        advance(5)
+                    # Another process can have an overlapping clock interval without nesting.
+                    writer.emit("phase_end", name="git_fixture:boundary_copy", pid=os.getpid() + 1,
+                                start=2, duration=4, result="complete")
+                    writer.emit("phase_end", name="git_fixture:legacy", duration=3, result="complete")
+                    writer.emit("phase_end", name="git_fixture:unknown_process", pid=None, start=0, duration=8,
+                                result="complete")
+            finally:
+                writer.close()
+            summary = summarize(root)
+            summary["phases"].append({"name": "git_fixture:missing_duration", "start": 0,
+                                      "pid": os.getpid(), "result": "complete"})
+            original_phases = json.loads(json.dumps(summary["phases"]))
+
+            report = comparison([root], [summary])
+
+        self.assertEqual(report["runs"][0]["git_fixture_seconds"], 43)
+        self.assertEqual(summary["phases"], original_phases)
 
     def run_suite(self, suite, root, clock=lambda: 1.0):
         writer = EventWriter(root / "events.jsonl", clock=clock)
