@@ -9,6 +9,13 @@ from tests.support.worker import dummy_worker_sessions
 
 
 class PrConflictScopeTest(PrRecoveryFixture, unittest.TestCase):
+    def test_shared_ignored_cache_preparation_propagates_metadata_failure(self):
+        with mock.patch(
+            "tests.support.pr_recovery.git_command",
+            side_effect=RuntimeError("metadata unavailable"),
+        ), self.assertRaisesRegex(RuntimeError, "metadata unavailable"):
+            self._add_ignored_cache(Path("/worktree"))
+
     def test_shared_ignored_cache_preparation_is_clean_and_absent_from_snapshot(self):
         with tempfile.TemporaryDirectory() as directory:
             _, _, _, _, worktree, _, _ = self._pr_open_state(directory)

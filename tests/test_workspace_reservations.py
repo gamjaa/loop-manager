@@ -11,6 +11,40 @@ from tests.support.worker import dummy_worker_sessions
 
 
 class WorkspaceReservationsTest(WorkspaceFixture, unittest.TestCase):
+    def test_workspace_patch_helper_restores_patches_after_return_and_exception(self):
+        original = loop_manager.run_project
+        original_pr_for_branch = loop_manager.pr_for_branch
+        result = object()
+        def return_result(*_args):
+            self.assertIsNone(loop_manager.pr_for_branch)
+            return result
+
+        with mock.patch("loop_manager.run_project", side_effect=return_result) as run_project:
+            self.assertIs(
+                self._run_project_with_workspace_patches(
+                    mock.Mock(), Path("/state"), Path("/repo"),
+                    **{"loop_manager.pr_for_branch": None},
+                ),
+                result,
+            )
+            run_project.assert_called_once()
+            self.assertIs(loop_manager.pr_for_branch, original_pr_for_branch)
+        self.assertIs(loop_manager.run_project, original)
+
+        error = RuntimeError("scenario failed")
+        def raise_error(*_args):
+            self.assertIsNone(loop_manager.pr_for_branch)
+            raise error
+
+        with mock.patch("loop_manager.run_project", side_effect=raise_error):
+            with self.assertRaisesRegex(RuntimeError, "scenario failed"):
+                self._run_project_with_workspace_patches(
+                    mock.Mock(), Path("/state"), Path("/repo"),
+                    **{"loop_manager.pr_for_branch": None},
+                )
+            self.assertIs(loop_manager.pr_for_branch, original_pr_for_branch)
+        self.assertIs(loop_manager.run_project, original)
+
     def test_planning_git_port_only_translates_workspace_ownership_errors(self):
         connection = sqlite3.connect(":memory:")
         register_connection_cleanup(self, connection)

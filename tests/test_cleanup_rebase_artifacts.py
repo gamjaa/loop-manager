@@ -9,6 +9,21 @@ from tests.support.workspace import WorkspaceFixture
 
 
 class CleanupRebaseArtifactsTest(WorkspaceFixture, unittest.TestCase):
+    def test_git_metadata_path_preserves_absolute_and_resolves_relative_paths(self):
+        repo = Path("/repository")
+        absolute = Path("/git/common/info/exclude")
+        with mock.patch(
+            "tests.support.workspace.git_command", return_value=str(absolute)
+        ):
+            self.assertEqual(self._git_metadata_path(repo, "info/exclude"), absolute)
+        with mock.patch(
+            "tests.support.workspace.git_command", return_value=".git/info/exclude"
+        ):
+            self.assertEqual(
+                self._git_metadata_path(repo, "info/exclude"),
+                repo / ".git/info/exclude",
+            )
+
     def test_rebase_keeps_ignored_file_that_overlaps_target(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = make_remote_repository(directory)
