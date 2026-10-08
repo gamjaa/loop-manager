@@ -54,6 +54,18 @@ class RebaseCorrectionStateTests(TestCase):
         self.assertIsNone(reopened.worker_result)
         self.assertIsNone(reopened.pending_turn)
 
+    def test_empty_worker_session_preserves_saved_session(self):
+        current = self.repository.observe(
+            'repo', 'G-045', self.observation(), worker_session='session-a',
+        )
+
+        observed = self.repository.observe(
+            'repo', 'G-045', self.observation(), expected_generation=current.generation,
+            worker_session='',
+        )
+
+        self.assertEqual(observed.worker_session, 'session-a')
+
     def test_progress_and_conflict_cycle_preserve_old_history(self):
         a = self.observation()
         changed = self.observation(content='resolved')
