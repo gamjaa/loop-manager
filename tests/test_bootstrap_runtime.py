@@ -396,6 +396,17 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
     # Agent scopes, and later base C must stay connected across process restart.
     """Real subprocess regressions; use the coordinated verification runner."""
 
+    def _run_child(self, source, manager_file, state, config):
+        import sys
+        from loop_manager_internal.execution.verify_process import run_verify_process
+        # Native Windows file observations exceed 90s under parallel verify.
+        timeout = 180 if sys.platform == 'win32' else 90
+        command = [sys.executable, '-B', str(manager_file), '--state-dir', str(state),
+                   '--config', str(config), 'run']
+        _, timed_out, output = run_verify_process(command, source, timeout, job_scope=True)
+        self.assertFalse(timed_out, output)
+        return subprocess.CompletedProcess(command, output.exit_code, output)
+
     def _assert_saved_scope_resume(self, advance_after_selection=False):
         import json
         import shutil
@@ -595,20 +606,14 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                     interrupted_registration = not advance_after_selection and (base, role) == ('main', 'worker')
                     if interrupted_registration:
                         (state / 'stop-after-registration').touch()
-                        interrupted = subprocess.run([sys.executable, '-B', str(manager_file),
-                            '--state-dir', str(state), '--config', str(config), 'run'],
-                            cwd=source, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            timeout=90, check=False)
+                        interrupted = self._run_child(source, manager_file, state, config)
                         self.assertNotEqual(interrupted.returncode, 0, interrupted.stdout)
                         self.assertIn('test interruption after runtime registration', interrupted.stdout)
                         self.assertFalse((state / 'resumed-agent.json').exists())
                         self.assertTrue(list((state / 'manager-git-journal').glob('*/active.json')))
                     attempts = 2 if advance_after_selection or interrupted_registration else 1
                     for attempt in range(attempts):
-                        completed = subprocess.run([sys.executable, '-B', str(manager_file),
-                            '--state-dir', str(state), '--config', str(config), 'run'],
-                            cwd=source, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            timeout=90, check=False)
+                        completed = self._run_child(source, manager_file, state, config)
                         proof_path = state / 'resumed-agent.json'
                         self.assertTrue(proof_path.exists(), completed.stdout)
                         proof = json.loads(proof_path.read_text())
