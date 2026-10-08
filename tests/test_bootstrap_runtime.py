@@ -572,7 +572,8 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                     connection.close()
 
                     writer = Path(directory) / 'writer'
-                    git(source, 'clone', str(Path(directory) / 'remote.git'), str(writer))
+                    git(source, 'clone', '-c', 'core.longpaths=true', '-c', 'core.autocrlf=false',
+                        str(Path(directory) / 'remote.git'), str(writer))
                     configure_identity(writer)
                     git(writer, 'checkout', base)
                     # B changes executable-independent input, retaining the saved plan definition.
@@ -735,6 +736,8 @@ class ReviewerRebaseScopeHandoffUnitTests(unittest.TestCase):
         self.addCleanup(connection.close)
         before = snapshot(branch='loop-manager/G-047', scope_id='a' * 32,
                           scope_start_digest='c' * 64,
+                          worktrees={str(Path('/managed').resolve()): (
+                              'HEAD=a', 'branch=refs/heads/loop-manager/G-047')},
                           refs={'refs/heads/loop-manager/G-047': ('a', 'commit')})
         current = replace(before, head='b', refs={'refs/heads/loop-manager/G-047': ('b', 'commit')})
         row = {'agent_snapshot': before.serialize(), 'agent_result_snapshot': before.serialize(),

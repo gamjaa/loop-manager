@@ -1211,6 +1211,25 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
 
 class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
     """The production factory's identity/input adapters, with no Git process."""
+    def test_windows_file_modes_reuse_index_without_per_file_git_queries(self):
+        from loop_manager_internal.git import managed_rebase_runtime
+        ports, service = self._user_document_service()
+        ports.git.reset_mock()
+        ports._path_signature.return_value = 'current-bytes'
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'app.py').write_bytes(b'current bytes')
+            (root / 'submodule').mkdir()
+            with mock.patch.object(managed_rebase_runtime, 'os', SimpleNamespace(name='nt')):
+                for mode in ('100644', '100755', None):
+                    self.assertEqual(service.adapters.read_file(root, 'app.py', mode),
+                                     (mode or '100644', 'current-bytes'))
+                self.assertEqual(service.adapters.read_file(root, 'missing.py', '100755'),
+                                 ('000000', 'current-bytes'))
+                self.assertEqual(service.adapters.read_file(root, 'submodule', '160000'),
+                                 ('160000', 'current-bytes'))
+        ports.git.assert_not_called()
+
     def _user_document_service(self):
         from tests.support.runtime import runtime_rebase_fixture
         from loop_manager_internal.git.managed_rebase_runtime import build_service

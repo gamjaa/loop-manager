@@ -86,8 +86,9 @@ class ObservationAdapters:
     read_remote: Callable[[RebaseExpectation], Remote]
     # Recompute from current plan/source/approval inputs, not saved Worker turns.
     read_inputs: Callable[[RebaseExpectation], tuple[str, str]]
-    # Return the actual Git mode and full file signature, including ignored files.
-    read_file: Callable[[Path, str], tuple[str, str]]
+    # Return the actual Git mode and full file signature; pass this observation's
+    # first index mode for Windows, which has no POSIX executable-bit semantics.
+    read_file: Callable[[Path, str, str | None], tuple[str, str]]
     path_allowed: Callable[[str], bool]
     contracts_allowed: Callable[[RebaseObservation], bool]
 
@@ -163,12 +164,15 @@ def _once(expected: RebaseExpectation, adapters: ObservationAdapters) -> RebaseO
     # core.filemode=false can hide a tracked mode change from Git diff. Inspect
     # actual modes as well; the file reader handles platform Git mode semantics.
     tracked_modes = {entry.path: entry.mode for entry in index if entry.stage == 0}
+    index_modes = {}
+    for entry in index:
+        index_modes.setdefault(entry.path, entry.mode)
     files = []
     for path in sorted(kinds.keys() | tracked_modes.keys()):
         # Never follow a malformed Git path outside the selected worktree.
         if not _safe_path(path):
             raise ValueError('unsafe working file path')
-        mode, signature = adapters.read_file(worktree, path)
+        mode, signature = adapters.read_file(worktree, path, index_modes.get(path))
         path_kinds = set(kinds.get(path, ()))
         if path in tracked_modes and mode != tracked_modes[path]:
             path_kinds.add('unstaged')
