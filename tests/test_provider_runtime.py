@@ -709,7 +709,7 @@ class CommonGuidanceProviderTests(unittest.TestCase):
         self.worktree.mkdir()
         self.text = '한글 "quotes" \\backslash\n다음 줄\t😀\n'
         snapshot = self.root / 'snapshot.md'
-        snapshot.write_text(self.text, encoding='utf-8')
+        snapshot.write_text(self.text, encoding='utf-8', newline='\n')
         import hashlib
         self.guidance = common_guidance.CommonGuidance('task', self.text,
             hashlib.sha256(self.text.encode()).hexdigest(), 'b' * 40, snapshot)

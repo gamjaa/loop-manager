@@ -27,7 +27,7 @@ class RuntimeScopeDiagnosticTests(unittest.TestCase):
                     self.before, self.current, self.mutation, accepted=accepted,
                     result=self.current, checkpoint=self.current)
                 for expected in ('before=', 'current=', 'result=', 'checkpoint=', 'checkpoint_delta=',
-                                 'path=/state/runtime/b', 'sha=b',
+                                 f'path={self.mutation.path}', 'sha=b',
                                  'config=local:remote.origin.url', 'dirty=outside.txt',
                                  'operations=MERGE_HEAD', 'refs=refs/heads/foreign'):
                     self.assertIn(expected, message)
@@ -72,7 +72,7 @@ class RuntimeScopeDiagnosticTests(unittest.TestCase):
 class RuntimeFalsePositiveBaseTests(unittest.TestCase):
     def test_false_positive_uses_registered_base_and_keeps_mixed_violation(self):
         from loop_manager_internal.recovery import project_block_service
-        runtime = '/state/runtime/b'
+        runtime = str(Path('/state/runtime/b').resolve())
         mutation = RuntimeMutation(Path('/source'), Path(runtime), 'b', 'owned')
         for base in ('main', 'develop'):
             ref = 'refs/remotes/origin/' + base
@@ -156,7 +156,7 @@ class RuntimeSelectionEvidenceUnitTests(unittest.TestCase):
         from loop_manager_internal.runtime.bootstrap import BootstrapService
         from loop_manager_internal.git import manager_git_journal as journal
         with tempfile.TemporaryDirectory() as directory:
-            state, source = Path(directory), Path('/source')
+            state, source = Path(directory), Path('/source').resolve()
             ref, a, b, c = 'refs/remotes/origin/develop', 'a' * 40, 'b' * 40, 'c' * 40
             observed = {'oid': a}
             journal.execute(state, owner='bootstrap', kind='bootstrap_fetch', repo=str(source), target=ref,

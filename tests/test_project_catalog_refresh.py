@@ -1,5 +1,6 @@
 """Unit coverage of the catalog boundary and archive transaction adoption."""
 import contextlib
+import stat
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -758,6 +759,7 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
             self.fixture._insert(plan_id, title, status=status,
                                  branch='waiting' if status == 'PR_OPEN' else None,
                                  pr_url='https://example/pr/5' if status == 'PR_OPEN' else None)
+        self.connection.execute('UPDATE exec_plans SET repo = ?', (self.repo,))
         self.connection.commit()
         self.documents = {
             'docs/plans/[G-001] Updated.md': self.fixture._text('G-001', 'Updated'),
@@ -980,7 +982,7 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
                                    'docs/FUTURE_IDEAS.md': 'Deferred.'}.items():
                 target = root / path
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(contents, encoding='utf-8')
+                target.write_text(contents, encoding='utf-8', newline='\n')
             def git(_root, command, *arguments, **kwargs):
                 path = arguments[-1]
                 return SimpleNamespace(returncode=0, stdout=f'100644 blob abc\t{path}\0' if command == 'ls-tree' else '')
@@ -996,16 +998,19 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
                 with self.subTest(mutation=mutation):
                     target = root / 'docs/plans/[G-002] Dependency.md'
                     if mutation == 'cause':
-                        target.write_text(self.fixture._text('G-002', 'Dependency', risk='other-invalid'))
+                        target.write_text(self.fixture._text('G-002', 'Dependency', risk='other-invalid'), encoding='utf-8', newline='\n')
                     elif mutation == 'bytes':
-                        target.write_text(self.documents['docs/plans/[G-002] Dependency.md'])
+                        target.write_text(self.documents['docs/plans/[G-002] Dependency.md'], encoding='utf-8', newline='\n')
                         effects.git = lambda root, command, *args, **kwargs: (SimpleNamespace(returncode=1, stdout="")
                             if command == "diff" else git(root, command, *args, **kwargs))
                     else:
                         effects.git = git
-                        target.unlink()
-                        target.symlink_to(root / 'docs/PRODUCT.md')
-                    with self.assertRaises(planner_validation.PlannerValidationError):
+                    original_lstat = Path.lstat
+                    observed = (mock.patch.object(Path, 'lstat', autospec=True, side_effect=lambda candidate, *a, **kw:
+                                mock.Mock(st_mode=stat.S_IFLNK) if candidate == target
+                                else original_lstat(candidate, *a, **kw))
+                                if mutation == 'symlink' else contextlib.nullcontext())
+                    with observed, self.assertRaises(planner_validation.PlannerValidationError):
                         planner_validation.validate_planner_result(effects, root, self.sha, [],
                             connection=self.connection, repo=self.repo)
 
@@ -1155,7 +1160,7 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
             for relative, text in documents.items():
                 target = root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(text, encoding='utf-8')
+                target.write_text(text, encoding='utf-8', newline='\n')
             effects = SimpleNamespace(changed_files=lambda *args: [path],
                 mutable_snapshot_token=lambda *args: 'token',
                 git=lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=''),
@@ -1179,7 +1184,7 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
             for relative, text in documents.items():
                 target = root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(text, encoding='utf-8')
+                target.write_text(text, encoding='utf-8', newline='\n')
             effects = SimpleNamespace(changed_files=lambda *args: [path],
                 mutable_snapshot_token=lambda *args: 'token',
                 git=lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=''),
@@ -1214,7 +1219,7 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
                 for relative, contents in documents.items():
                     target = root / relative
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_text(contents, encoding='utf-8')
+                    target.write_text(contents, encoding='utf-8', newline='\n')
                 def git(_root, command, *args, **kwargs):
                     item = args[-1]
                     tree = f'100644 blob abc\t{item}\0' if item in self.documents else ''
@@ -1229,15 +1234,15 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
                     connection=self.connection, repo=self.repo)
                 self.assertEqual([plan['id'] for _, plan in result.plans], ['G-007'])
                 self.assertEqual(self.held(), {'G-002', 'G-003', 'G-004', 'G-006'})
-                (root / broken).write_text(text + '\nChanged withheld body.\n')
+                (root / broken).write_text(text + '\nChanged withheld body.\n', encoding='utf-8', newline='\n')
                 with self.assertRaisesRegex(planner_validation.PlannerValidationError, '원인이나 범위'):
                     planner_validation.validate_planner_result(effects, root, self.sha, [],
                         connection=self.connection, repo=self.repo)
-                (root / broken).write_text(text, encoding='utf-8')
+                (root / broken).write_text(text, encoding='utf-8', newline='\n')
                 if reason == 'priority':
-                    (root / broken).write_text(text.replace('risk: low\n', 'risk: low\npriority: normal\n'))
+                    (root / broken).write_text(text.replace('risk: low\n', 'risk: low\npriority: normal\n'), encoding='utf-8', newline='\n')
                 else:
-                    (root / 'docs/requirements/Moved.md').write_text('Moved.', encoding='utf-8')
+                    (root / 'docs/requirements/Moved.md').write_text('Moved.', encoding='utf-8', newline='\n')
                 with self.assertRaisesRegex(planner_validation.PlannerValidationError, '원인이나 범위'):
                     planner_validation.validate_planner_result(effects, root, self.sha, [],
                         connection=self.connection, repo=self.repo)
@@ -1304,7 +1309,7 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
             for relative, contents in {**self.documents, 'docs/PRODUCT.md': 'Product.'}.items():
                 target = root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(contents, encoding='utf-8')
+                target.write_text(contents, encoding='utf-8', newline='\n')
             def snapshot_at(worktree, sha, row):
                 return manager._ready_plan_snapshot_from_contents(row, (worktree / row['path']).read_bytes())
             with mock.patch.object(manager, '_ready_plan_snapshot', side_effect=snapshot_at) as snapshots:
@@ -1320,9 +1325,9 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
             self.assertNotEqual(self.row('G-002')['content_hash'], catalog.plan_content_hash(
                 (root / self.row('G-002')['path']).read_bytes()))
             path = 'docs/plans/[G-007] Refactor.md'
-            (root / path).write_text(fixtures.plan_text('G-007', 'Refactor'), encoding='utf-8')
+            (root / path).write_text(fixtures.plan_text('G-007', 'Refactor'), encoding='utf-8', newline='\n')
             ready = context.eligible_plans[0]
-            (root / ready.path).write_text(ready.text.replace('depends_on: []', 'depends_on:\n  - G-007'), encoding='utf-8')
+            (root / ready.path).write_text(ready.text.replace('depends_on: []', 'depends_on:\n  - G-007'), encoding='utf-8', newline='\n')
             def git(_root, command, *args, **kwargs):
                 item = args[-1]
                 tree = f'100644 blob abc\t{item}\0' if item in self.documents else ''
@@ -1337,20 +1342,20 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
                 self.assertEqual([revision.snapshot.plan_id for revision in result.revisions], ['G-001'])
                 for mutation in ('held-body', 'held-dependency', 'new-priority'):
                     with self.subTest(mutation=mutation):
-                        (root / broken).write_text(self.documents[broken], encoding='utf-8')
+                        (root / broken).write_text(self.documents[broken], encoding='utf-8', newline='\n')
                         text = fixtures.plan_text('G-007', 'Refactor')
                         if mutation == 'held-body':
-                            (root / broken).write_text(self.documents[broken] + '\nChanged.\n', encoding='utf-8')
+                            (root / broken).write_text(self.documents[broken] + '\nChanged.\n', encoding='utf-8', newline='\n')
                         elif mutation == 'held-dependency':
                             text = text.replace('depends_on: []', 'depends_on:\n  - G-002')
                         else:
                             text = text.replace('priority: normal\n', '')
-                        (root / path).write_text(text, encoding='utf-8')
+                        (root / path).write_text(text, encoding='utf-8', newline='\n')
                         with self.assertRaises(manager.PlannerValidationError):
                             manager.validate_maintenance_planner_result(
                                 self.connection, context, root, [ready.path, path])
-                (root / path).write_text(fixtures.plan_text('G-007', 'Refactor'), encoding='utf-8')
-                (root / broken).write_text(self.documents[broken], encoding='utf-8')
+                (root / path).write_text(fixtures.plan_text('G-007', 'Refactor'), encoding='utf-8', newline='\n')
+                (root / broken).write_text(self.documents[broken], encoding='utf-8', newline='\n')
                 self.connection.execute("INSERT INTO execplan_catalog_holds "
                     "SELECT repo, 'G-001', revision_sha, evidence, NULL FROM execplan_catalog_holds LIMIT 1")
                 with self.assertRaisesRegex(manager.PlannerValidationError, 'eligible READY snapshot'):
@@ -1390,16 +1395,16 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
             for relative, text in baseline.items():
                 target = root / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(text, encoding='utf-8')
+                target.write_text(text, encoding='utf-8', newline='\n')
             def snapshot_at(worktree, sha, row):
                 return manager._ready_plan_snapshot_from_contents(row, baseline[row['path']].encode())
             ports.enter_context(mock.patch.object(manager, '_ready_plan_snapshot', side_effect=snapshot_at))
             ports.enter_context(mock.patch.object(manager, '_ready_plan_snapshot_at_revision', side_effect=snapshot_at))
             context = manager.prepare_maintenance_planning_context(self.connection, self.repo, root, self.sha)
             path = 'docs/plans/[G-007] Refactor.md'
-            (root / path).write_text(fixtures.plan_text('G-007', 'Refactor'), encoding='utf-8')
+            (root / path).write_text(fixtures.plan_text('G-007', 'Refactor'), encoding='utf-8', newline='\n')
             ready = context.eligible_plans[0]
-            (root / ready.path).write_text(ready.text.replace('depends_on: []', 'depends_on:\n  - G-007'), encoding='utf-8')
+            (root / ready.path).write_text(ready.text.replace('depends_on: []', 'depends_on:\n  - G-007'), encoding='utf-8', newline='\n')
             batch = SimpleNamespace(root=root, context=context, commit='e' * 40, remote=self.sha,
                                     publication_paths=(ready.path, path), broken=broken)
             committed = {relative: (root / relative).read_bytes() for relative in batch.publication_paths}

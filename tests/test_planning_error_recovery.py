@@ -3,7 +3,7 @@ import io
 import sqlite3
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import ExitStack, redirect_stderr
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -25,7 +25,7 @@ class PlanningErrorRecoveryTest(unittest.TestCase):
         from loop_manager_internal.storage import runtime_state
         for preserved in (False, True):
             for mutation in ('ignored', 'tracked', 'config', 'current_tracked', 'race', 'ownership', 'other_error'):
-                with self.subTest(preserved=preserved, mutation=mutation), tempfile.TemporaryDirectory() as directory:
+                with self.subTest(preserved=preserved, mutation=mutation), tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
                     repo = make_remote_repository(directory)
                     (repo / '.gitignore').write_text('cache.bin\n')
                     commit_and_push(repo, 'Ignore cache')
@@ -66,7 +66,7 @@ class PlanningErrorRecoveryTest(unittest.TestCase):
                     # Reopen the persisted state, using the real scope validator.
                     connection = sqlite3.connect(database)
                     connection.row_factory = sqlite3.Row
-                    self.addCleanup(connection.close)
+                    cleanup.callback(connection.close)
                     repository = runtime_state.RuntimeStateRepository(connection)
                     context = SimpleNamespace(repo=str(repo), repo_path=repo, state_dir=state_dir,
                                               base_branch='main', recovery_request_id=None,

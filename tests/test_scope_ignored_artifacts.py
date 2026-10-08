@@ -109,6 +109,9 @@ class ScopeIgnoredArtifactsTest(AgentScopeFixture, unittest.TestCase):
             for action in ('create', 'modify', 'delete'):
                 with self.subTest(role=role, action=action), tempfile.TemporaryDirectory() as directory:
                     repo, plan_path = self._repository_with_plan(directory)
+                    exclude = repo / '.git/legacy-empty-exclude'
+                    exclude.write_bytes(b'')
+                    git_command(repo, 'config', 'core.excludesFile', str(exclude))
                     (repo / '.gitignore').write_text('cache.bin\n', encoding='utf-8')
                     commit_and_push(repo, 'Ignore cache')
                     git_command(repo, 'switch', '-c', 'loop-manager/G-001')

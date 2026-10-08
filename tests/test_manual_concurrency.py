@@ -1,5 +1,6 @@
 """수동 준비와 자동 실행·게시가 경합할 때의 소유권 및 작업물 보존."""
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, ExitStack
 from dataclasses import replace
 import hashlib
 import json
@@ -69,7 +70,7 @@ class ManualConcurrencyTests(WorkspaceFixture, unittest.TestCase):
             service, branch, path = self.fixture(directory)
             database = service.state_dir / 'test.db'
             service.state_dir.mkdir(parents=True, exist_ok=True)
-            with sqlite3.connect(database) as target:
+            with closing(sqlite3.connect(database)) as target, target:
                 service.connection.backup(target)
             entered, release = threading.Event(), threading.Event()
             real_make = service.effects.make_worktree
@@ -80,7 +81,7 @@ class ManualConcurrencyTests(WorkspaceFixture, unittest.TestCase):
                 return real_make(*args, **kwargs)
             make = mock.Mock(side_effect=paused)
             def command(effects):
-                with sqlite3.connect(database) as connection:
+                with closing(sqlite3.connect(database)) as connection, connection:
                     connection.row_factory = sqlite3.Row
                     return ManualWorkService(effects, connection, service.state_dir, service.repo_path, service.config_path).start('G-012')
             with ThreadPoolExecutor(max_workers=2) as executor:
@@ -94,7 +95,7 @@ class ManualConcurrencyTests(WorkspaceFixture, unittest.TestCase):
                     release.set()
                 self.assertEqual(first.result(timeout=10), 0)
             self.assertEqual(make.call_count, 1)
-            with sqlite3.connect(database) as connection:
+            with closing(sqlite3.connect(database)) as connection, connection:
                 self.assertEqual(connection.execute('SELECT count(*) FROM manual_work_groups').fetchone()[0], 1)
                 self.assertEqual(connection.execute('SELECT count(*) FROM manual_work_members').fetchone()[0], 1)
             self.assertTrue(path.is_dir())
@@ -220,7 +221,7 @@ class ManualConcurrencyTests(WorkspaceFixture, unittest.TestCase):
             service, _, path = self.fixture(directory)
             candidate = self.publication(service)
             database = Path(directory) / 'state.db'
-            with sqlite3.connect(database) as target:
+            with closing(sqlite3.connect(database)) as target, target:
                 service.connection.backup(target)
             checked, fetched, release = threading.Event(), threading.Event(), threading.Event()
             real_check = manager._assert_mutable_ready_snapshot_current
@@ -230,7 +231,7 @@ class ManualConcurrencyTests(WorkspaceFixture, unittest.TestCase):
                 if not release.wait(10):
                     raise RuntimeError('test synchronization timeout')
             def publish():
-                with sqlite3.connect(database) as connection:
+                with closing(sqlite3.connect(database)) as connection, connection:
                     connection.row_factory = sqlite3.Row
                     return manager.record_general_planning_publication_intent(connection, service.repo,
                         candidate[0], candidate[1], candidate[2], 'spec', 'planning')
@@ -240,7 +241,7 @@ class ManualConcurrencyTests(WorkspaceFixture, unittest.TestCase):
                 fetched.set()
                 return result
             def start():
-                with sqlite3.connect(database) as connection:
+                with closing(sqlite3.connect(database)) as connection, connection:
                     connection.row_factory = sqlite3.Row
                     command = ManualWorkService(replace(service.effects, fetch_base=after_fetch), connection,
                         service.state_dir, service.repo_path, service.config_path)
@@ -258,7 +259,7 @@ class ManualConcurrencyTests(WorkspaceFixture, unittest.TestCase):
                 with self.assertRaisesRegex(ManualWorkError, 'Planner 게시 소유 예약'):
                     manual.result(timeout=10)
             self.assertFalse(path.exists())
-            with sqlite3.connect(database) as connection:
+            with closing(sqlite3.connect(database)) as connection, connection:
                 connection.row_factory = sqlite3.Row
                 self.assertEqual(work_claims.publication_claims(connection, service.repo)[0], {'G-012'})
                 self.assertEqual(connection.execute('SELECT count(*) FROM manual_work_members').fetchone()[0], 0)
@@ -486,7 +487,7 @@ class ManualBootstrapConcurrencyTests(OriginScopeFixture, unittest.TestCase):
                                 else ['recover', str(source), '--plan', 'G-188'])
                 def child(_source, _state, _config, runtime, _arguments):
                     self.assertTrue(runtime.concurrent)
-                    self.assertIn('/commands/', str(runtime.path))
+                    self.assertIn('/commands/', runtime.path.as_posix())
                     self.assertEqual(_held_process_lock_identity(state), 'automatic-run')
                     self.assertEqual(_held_process_lock_identity(state, name=f'manual-{runtime.mutation_id}.lock'), 'runtime:' + runtime.mutation_id)
                     service = manager._bootstrap_service()
@@ -558,12 +559,12 @@ class ManualBootstrapConcurrencyTests(OriginScopeFixture, unittest.TestCase):
             apply.assert_not_called()
 
     def test_generation_uses_a_pinned_read_only_runtime_without_project_projection_changes(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             _, source, _writer = remote_fixture(directory)
             state = Path(directory) / 'state'
             state.mkdir()
             connection = manager.connect_database(state, create=True)
-            self.addCleanup(connection.close)
+            cleanup.callback(connection.close)
             head = git(source, 'rev-parse', 'HEAD')
             group = {'base_sha': head, 'source_head': head, 'group_id': 'a' * 32}
             def agent(_provider, path, *_args, **kwargs):
