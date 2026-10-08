@@ -25,11 +25,11 @@ class BlockedGitFixture:
             self.fail(result.stdout)
         return result.stdout.strip()
 
-    def setUp(self):
+    def setUp(self, *, directory=None):
         pr_query = mock.patch.object(loop_manager, 'pr_for_branch', return_value=None)
         pr_query.start()
         self.addCleanup(pr_query.stop)
-        self.temporary = tempfile.TemporaryDirectory()
+        self.temporary = tempfile.TemporaryDirectory(dir=directory)
         self.addCleanup(self.temporary.cleanup)
         root = Path(self.temporary.name)
         self.remote = root / "remote.git"
@@ -172,9 +172,9 @@ class BlockedGitFixture:
         return self.run_git(user, "rev-parse", "HEAD")
 
 
-def blocked_git_fixture(test):
+def blocked_git_fixture(test, *, directory=None):
     fixture = fixture_cleanup(test, BlockedGitFixture())
-    fixture.setUp()
+    fixture.setUp(directory=directory)
     test.addCleanup(fixture.tearDown)
     return fixture
 
