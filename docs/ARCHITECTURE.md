@@ -403,7 +403,7 @@ PR 없는 게시 checkpoint의 Review 횟수 차단을 rebase 없이 해제할 �
 
 verify 지문 이력, Review 지문·level 승격 이력과 실행별 Worker 교정 횟수는 별도로 저장한다. 최종 반복·일시 중단·BLOCKED 해제 조건은 PRODUCT의 실패 정책을 따른다. verify 성공은 verify 이력만, Review 성공은 Review 이력만 초기화하고 effective level·승격 이력은 유지한다.
 
-자체 복구 테스트의 `RecoveryBoundary`는 한 테스트 안의 직렬 변형만 같은 소유 경로에 복원한다. 다른 테스트·병렬 실행은 별도 경로·원격·DB를 소유한다. Review 프로토콜 변형은 실제 Worker·verify를 통과한 Review 진입 직전을 보존하며, 파일/mode·Git 객체/ref/index/config·SQLite/TEMP 상태의 digest와 복원 후 새 Git snapshot을 대조한다. 교정 Worker의 파일 version도 경계에서 이어받아 실제 새 작업물이 생성되게 한다. 호출 경로·준비 입력 불일치는 복원 전에 거부하며 자료 손상·재현 실패도 실패로 보고한다. 이전 receipt를 현재 증거로 사용하지 않는다. `git_fixture:review_*`와 `git_fixture:boundary_*` 단계는 생성·Worker/verify 준비·복사·복원·identity 및 재현 확인·정리를 기록한다. 포함된 하위 단계 시간은 상위 단계와 합산하지 않는다.
+자체 복구 테스트의 `RecoveryBoundary`는 한 테스트 안의 직렬 변형만 같은 소유 경로에 복원한다. 다른 테스트·병렬 실행은 별도 경로·원격·DB를 소유한다. Review 프로토콜 변형은 실제 Worker·verify를 통과한 Review 진입 직전을 보존하며, 파일/mode·Git 객체/ref/index/config·SQLite/TEMP 상태의 digest와 복원 후 새 Git snapshot을 대조한다. 교정 Worker의 파일 version도 경계에서 이어받아 실제 새 작업물이 생성되게 한다. 호출 경로·준비 입력 불일치는 복원 전에 거부하며 자료 손상·재현 실패도 실패로 보고한다. 이전 receipt를 현재 증거로 사용하지 않는다. `git_fixture:review_*`와 `git_fixture:boundary_*` 단계는 생성·Worker/verify 준비·복사·복원·identity 및 재현 확인·정리를 기록한다. `git_fixture_seconds`는 같은 PID의 유효한 `start`·`duration` 경계에서 완전히 포함된 하위 fixture 시간만 총계에서 제외한다. 개별 phase event와 duration은 보존하며, 별도 프로세스나 중첩 경계가 불완전한 이벤트는 포함 관계를 추정하지 않는다. duration이 없는 이벤트의 시간을 만들지 않는다.
 
 외부 CLI의 실행 실패, timeout과 일시적 서비스 오류는 프로그램 실행당 최대 3회 재시도한다. 모두 실패하면 현재 상태를 유지하고 해당 프로젝트를 건너뛴다. 다음 Loop Manager 실행에서는 다시 최대 3회 시도한다. AI 사용 한도 소진이 확인되면 현재 실행에서는 재시도하지 않는다.
 
