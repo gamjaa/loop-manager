@@ -54,7 +54,7 @@ class PersistentExecutionFailureBoundaryTest(AutomationCatalogFixture, unittest.
         )
 
     @dummy_worker_sessions
-    def test_scheduler_invocations_enqueue_silent_failure_once_then_actionable_streak(self):
+    def test_scheduler_invocations_only_notify_actionable_streak(self):
         repo = str(Path("persistent-failure-repo").resolve())
         connection = self._connection(repo)
         with connection:

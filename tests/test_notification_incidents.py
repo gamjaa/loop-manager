@@ -1106,6 +1106,22 @@ class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
 
 
 class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
+    def test_project_resume_keeps_started_plan_and_does_not_repeat_worker_start(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        with connection:
+            connection.execute("INSERT INTO project_blocks (repo, scope, reason_code, evidence) "
+                               "VALUES (?, 'project', 'repository_state_unsafe', 'unsafe')", (repo,))
+            notifications.enqueue_current_project_events(connection, repo)
+        notifications.dispatch_pending(connection, 'token', 'chat', adapter=mock.Mock())
+        with connection:
+            scoped_blocking.clear_project_block(connection, repo)
+            notifications.record_process_start(connection, repo, 'worker', 'resume', plan_id='G-018', resumed=True)
+            notifications.record_process_start(connection, repo, 'worker', 'correction', plan_id='G-018')
+        resumed = next(row for row in self.events(connection) if row['event_type'] == 'resumed')
+        self.assertEqual(json.loads(resumed['payload'])['execplan_id'], 'G-018')
+        self.assertFalse(any(row['event_type'] == 'work_started' for row in self.events(connection)))
+
     def test_unsent_planner_start_keeps_new_episode_without_generic_notice(self):
         connection = self.connection()
         repo = '/projects/alpha'

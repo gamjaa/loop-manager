@@ -1,6 +1,7 @@
 """Invocation audit, physical retries and session transition contracts."""
 
 import sqlite3
+import stat
 import tempfile
 from pathlib import Path
 from unittest import TestCase, mock
@@ -345,12 +346,12 @@ class CommonGuidanceInvocationTests(TestCase):
         self.runtime = self.root / 'runtime'
         (self.runtime / 'docs').mkdir(parents=True)
         self.source = self.runtime / common_guidance.COMMON_PATH
-        self.source.write_text('자동 지침 "quoted" \\path\n두 번째 줄\n', encoding='utf-8')
+        self.source.write_text('자동 지침 "quoted" \\path\n두 번째 줄\n', encoding='utf-8', newline='\n')
         self.role_texts = {}
-        (self.runtime / common_guidance.PONYTAIL_PATH).write_text('Ponytail fixture\n', encoding='utf-8')
+        (self.runtime / common_guidance.PONYTAIL_PATH).write_text('Ponytail fixture\n', encoding='utf-8', newline='\n')
         for path in set(common_guidance.ROLE_PATHS.values()):
             self.role_texts[path] = '정적 역할: ' + path + '\n'
-            (self.runtime / path).write_text(self.role_texts[path], encoding='utf-8')
+            (self.runtime / path).write_text(self.role_texts[path], encoding='utf-8', newline='\n')
         self.state_dir = self.root / 'state'
         self.worktree = self.root / 'candidate'
         self.worktree.mkdir()
@@ -538,8 +539,8 @@ class CommonGuidanceInvocationTests(TestCase):
         rows = self.connection.execute('SELECT guidance_task_id, guidance_content_hash FROM agent_invocations').fetchall()
         self.assertEqual(tuple(rows[0]), (original.task_id, original.content_hash))
         (self.worktree / 'docs').mkdir()
-        (self.worktree / self.guidance_module.COMMON_PATH).write_text('candidate changes', encoding='utf-8')
-        self.source.write_text('새 runtime 지침\n', encoding='utf-8')
+        (self.worktree / self.guidance_module.COMMON_PATH).write_text('candidate changes', encoding='utf-8', newline='\n')
+        self.source.write_text('새 runtime 지침\n', encoding='utf-8', newline='\n')
         for role, session in (('worker', 'session-1'), ('reviewer', None), ('worker', None)):
             self.assertEqual(self.invoke(role=role, session=session).code, 0)
             selected = self.requests[-1].common_guidance
@@ -605,7 +606,7 @@ class CommonGuidanceInvocationTests(TestCase):
                                             (str(self.source), saved.task_id))
                 else:
                     bundle.write_bytes(b'changed' if damage == 'hash' else b'\xff')
-                self.source.write_text('latest ' + damage, encoding='utf-8')
+                self.source.write_text('latest ' + damage, encoding='utf-8', newline='\n')
                 result = self.invoke(role='reviewer', plan='G-' + damage)
                 self.assertEqual(result.result_kind, invocation.AgentResultKind.PERMANENT_CONFIGURATION)
                 self.assertEqual(len(self.requests), before)
@@ -622,7 +623,7 @@ class CommonGuidanceInvocationTests(TestCase):
         self.source.mkdir()
         self.assertEqual(self.invoke().code, 1)
         self.source.rmdir()
-        self.source.write_text('valid', encoding='utf-8')
+        self.source.write_text('valid', encoding='utf-8', newline='\n')
         with mock.patch.object(self.guidance_module.GuidanceRepository, 'save', side_effect=sqlite3.OperationalError('disk full')):
             result = self.invoke()
         self.assertEqual(result.code, 1)
@@ -692,7 +693,7 @@ class CommonGuidanceInvocationTests(TestCase):
         original_hash = self.guidance_module.runtime_content_hash()
         self.assertEqual(self.invoke().code, 0)
         reviewer_path = self.runtime / self.guidance_module.ROLE_PATHS['reviewer']
-        reviewer_path.write_text('new reviewer constraints\n', encoding='utf-8')
+        reviewer_path.write_text('new reviewer constraints\n', encoding='utf-8', newline='\n')
         changed_hash = self.guidance_module.runtime_content_hash()
         self.assertNotEqual(changed_hash, original_hash)
         self.assertEqual(self.guidance_module.plan_content_hash(self.connection, 'repo', 'G-147'), original_hash)
@@ -713,10 +714,13 @@ class CommonGuidanceInvocationTests(TestCase):
         path.mkdir()
         self.assertEqual(self.invoke().code, 1)
         path.rmdir()
-        path.symlink_to(self.source)
-        self.assertEqual(self.invoke().code, 1)
-        path.unlink()
-        path.write_text('valid role', encoding='utf-8')
+        original_lstat = Path.lstat
+        # 파일 형식 거부는 OS 관측값으로 검사해 Windows symlink 권한에 의존하지 않는다.
+        with mock.patch.object(Path, 'lstat', autospec=True, side_effect=lambda candidate, *a, **kw:
+                               mock.Mock(st_mode=stat.S_IFLNK) if candidate == path
+                               else original_lstat(candidate, *a, **kw)):
+            self.assertEqual(self.invoke().code, 1)
+        path.write_text('valid role', encoding='utf-8', newline='\n')
         self.assertEqual(self.invoke(role='../worker').code, 1)
         self.assertEqual(self.requests, [])
         self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM common_guidance_versions').fetchone()[0], 0)
@@ -724,7 +728,7 @@ class CommonGuidanceInvocationTests(TestCase):
     def test_changed_combined_file_is_rejected_instead_of_overwritten(self):
         self.assertEqual(self.invoke().code, 0)
         saved = self.requests[-1].common_guidance
-        saved.snapshot_path.write_text('changed derived instructions', encoding='utf-8')
+        saved.snapshot_path.write_text('changed derived instructions', encoding='utf-8', newline='\n')
         self.assertEqual(self.invoke().code, 1)
         self.assertEqual(len(self.requests), 1)
         self.assertEqual(saved.snapshot_path.read_text(encoding='utf-8'), 'changed derived instructions')
@@ -779,7 +783,7 @@ class CommonGuidanceInvocationTests(TestCase):
         directory = self.state_dir / 'agent-guidance'
         directory.mkdir(parents=True, mode=0o700)
         path = directory / (digest + '.md')
-        path.write_text(text, encoding='utf-8')
+        path.write_text(text, encoding='utf-8', newline='\n')
         GuidanceRepository(self.connection).save(identity, 'repo', digest, 'a' * 40, str(path))
         for filename in self.guidance_module.GUIDANCE_PATHS:
             (self.runtime / filename).unlink()
