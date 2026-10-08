@@ -249,6 +249,18 @@ class PrConflictCauseRevalidationTests(PrRecoveryFixture, unittest.TestCase):
         agent.side_effect = failed_agent
         first = run_execution_policy(fixture)
         second = run_execution_policy(fixture)
+        blocked_plan = fixture.connection.execute(
+            'SELECT * FROM exec_plans WHERE repo = ?', (fixture.repo,),
+        ).fetchone()
+        loop_manager.hydrate_execplan_project(fixture.connection, fixture.repo, blocked_plan)
+        project = fixture.connection.execute(
+            'SELECT * FROM projects WHERE repo = ?', (fixture.repo,),
+        ).fetchone()
+        with mock.patch('subprocess.Popen', side_effect=AssertionError('unexpected policy process')):
+            self.assertEqual(loop_manager.reconcile_existing_pull_request(
+                fixture.connection, Path(fixture.repo), Path('/state'), fixture.repo, project,
+                self._pull_request('loop-manager/G-047', 'https://example.test/pr/26',
+                                   'remote', 'CONFLICTING')), 1)
         stored = fixture.connection.execute(
             "SELECT status, pr_conflict_recovery, pr_conflict_head_oid, "
             "worker_session_id, reviewer_session_id FROM exec_plans WHERE repo = ?",
