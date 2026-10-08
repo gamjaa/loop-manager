@@ -31,7 +31,7 @@ class CheckpointRefreshFixture:
             "VALUES ('repo', 'G-106', 'docs/plans/[G-106] Work.md', 'Work', '[]', '[]', 'critical', 'hash', 'PLAN_BLOCKED')")
         self.store = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection)
         self.request = self.store.request(repo='repo', plan_id='G-106', reason_code='verify_retry_exhausted',
-                                          evidence='original failure', branch='loop-manager/G-106', worktree=str(Path('/state/G-106')),
+                                          evidence='original failure', branch='loop-manager/G-106', worktree=str(Path('/state/G-106').resolve()),
                                           expected_remote_oid='a' * 40, rebase_recovery=False)
         self.store.record_prepared(self.request, blocked_checkpoint.PreparedCheckpoint(
             'a' * 40, 'c' * 40, 'identity', 'message', ()))
@@ -48,7 +48,7 @@ class CheckpointRefreshFixture:
                   pending_restart=None, pending_input_rewritten=False, foreign_pending=False,
                   completed_base_restart=False, base_completed=None,
                   existing_pr=False, projected=False, pr_conflict=False):
-        branch, worktree = 'loop-manager/G-106', str(Path('/state/G-106'))
+        branch, worktree = 'loop-manager/G-106', str(Path('/state/G-106').resolve())
         original, successor = 'a' * 40, 'b' * 40
         self.connection.execute("UPDATE projects SET origin = 'example/repo'")
         self.connection.execute(
@@ -331,7 +331,7 @@ class BlockedCheckpointRefreshUnitTests(CheckpointRefreshFixture, unittest.TestC
         review_correction_state.complete_worker(self.connection, 'repo', 'G-106', 1)
         review_correction_state.verified(self.connection, 'repo', 'G-106', 'rebased-head')
         loop_manager.transition_validation_failure(
-            self.connection, 'repo', Path('/state/G-106'), 'review',
+            self.connection, 'repo', Path('/state/G-106').resolve(), 'review',
             'ISSUE_ID: app.py::persistent::blocking\nFix it\nVERDICT: FAIL',
             review_level=1, candidate_head='rebased-head',
         )
@@ -524,7 +524,7 @@ class BlockedCheckpointRefreshUnitTests(CheckpointRefreshFixture, unittest.TestC
             return mock.Mock(returncode=0, stdout=output)
         self.assertEqual(checkpoint_ownership.owned_remote_oid(
             self.connection, Path('/repo'), 'repo', 'G-106', 'loop-manager/G-106',
-            Path('/state/G-106'), 'b' * 40, git, before_head='b' * 40, recorded_oid='b' * 40), 'b' * 40)
+            Path('/state/G-106').resolve(), 'b' * 40, git, before_head='b' * 40, recorded_oid='b' * 40), 'b' * 40)
 
 
     def test_refresh_preparation_retains_old_publication_audit(self):

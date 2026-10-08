@@ -161,10 +161,10 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         else:
             deleted.unlink()
         if target_text is not None:
-            (self.repo / self.paths["G-002"]).write_text(target_text, encoding="utf-8")
+            (self.repo / self.paths["G-002"]).write_text(target_text, encoding="utf-8", newline="\n")
         if new_plan or new_plan_text is not None:
             (self.repo / "docs/plans/[G-007] Independent.md").write_text(
-                new_plan_text if new_plan_text is not None else plan_text("G-007", "Independent"), encoding="utf-8")
+                new_plan_text if new_plan_text is not None else plan_text("G-007", "Independent"), encoding="utf-8", newline="\n")
         git(self.repo, "add", ".")
         git(self.repo, "commit", "-m", "user declaration")
         self.base = git(self.repo, "rev-parse", "HEAD")
@@ -257,7 +257,7 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
 
     def test_remote_deletion_started_reference_preserves_owned_pr(self):
         body = plan_text("G-002", "Second") + "\nUse G-001 as the validation foundation.\n"
-        (self.repo / self.paths["G-002"]).write_text(body, encoding="utf-8")
+        (self.repo / self.paths["G-002"]).write_text(body, encoding="utf-8", newline="\n")
         git(self.repo, "add", ".")
         git(self.repo, "commit", "-m", "owned validation reference")
         self.connection.execute("""UPDATE exec_plans SET status='PR_OPEN', ever_started=1,

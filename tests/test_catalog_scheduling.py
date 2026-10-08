@@ -951,7 +951,7 @@ class PreservedPlanningProjectResultTest(AutomationCatalogFixture, unittest.Test
         from loop_manager_internal.storage import runtime_state
         for step_result in (0, 1):
             with self.subTest(step_result=step_result):
-                repo = '/registered-project'
+                repo = str(Path('/registered-project').resolve())
                 connection = self._connection(repo=repo)
                 runtime = runtime_state.RuntimeStateRepository(connection)
                 runtime.update_project(repo, {'planning_error': 'preserved failure'}, enqueue=False)
@@ -980,7 +980,7 @@ class PreservedPlanningProjectResultTest(AutomationCatalogFixture, unittest.Test
         from loop_manager_internal.application import project_runner
         from loop_manager_internal.storage import runtime_state, blocked_checkpoint_state
         from loop_manager_internal.notifications import notifications
-        repo = '/registered-project'
+        repo = str(Path('/registered-project').resolve())
         connection = self._connection(repo=repo)
         notifications.ensure_schema(connection)
         blocked_checkpoint_state.ensure_schema(connection)

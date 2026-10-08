@@ -154,6 +154,10 @@ class NativePlatformAgentTests(unittest.TestCase):
                     self.assertEqual(pointer.read_bytes(), content)
 
     def test_probe_failure_blocks_provider_and_preserves_prior_invocation_and_files(self):
+        host_run = subprocess.run
+        host_spawn = subprocess.Popen
+        probe_prefix = (('codex', '-c', 'windows.sandbox="elevated"', 'sandbox')
+                        if os.name == 'nt' else ('codex', 'sandbox'))
         for system in ('Linux', 'Darwin', 'Windows'):
             for role in ('worker', 'reviewer'):
                 for session in (None, 'saved-session'):
@@ -188,12 +192,15 @@ class NativePlatformAgentTests(unittest.TestCase):
                                 path.write_text('saved content')
 
                             def run(command, **kwargs):
+                                if command[0] == 'powershell.exe':
+                                    with mock.patch.object(subprocess, 'Popen', host_spawn):
+                                        return host_run(command, **kwargs)
                                 if command == ['codex', '--version']:
                                     return subprocess.CompletedProcess(command, 0, 'codex-cli 0.159.3', '')
                                 if tuple(command[-2:]) == ('features', 'list'):
                                     return subprocess.CompletedProcess(command, 0,
                                         'plugins stable false\napps stable false\n', '')
-                                self.assertEqual(tuple(command[:2]), ('codex', 'sandbox'))
+                                self.assertEqual(tuple(command[:len(probe_prefix)]), probe_prefix)
                                 return subprocess.CompletedProcess(command, code, output, '')
 
                             with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
