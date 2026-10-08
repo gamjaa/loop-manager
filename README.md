@@ -116,7 +116,7 @@ bootstrap은 최신 `origin/main`의 정확한 SHA에서 runtime을 실행한다
 |---|---|
 | Planner·유지보수 Planner | `docs/AGENTS.planner.md` |
 | 읽기 전용 점검 Planner | `docs/AGENTS.planner_check.md` |
-| Worker | `docs/AGENTS.worker.md` |
+| Worker | `docs/AGENTS.worker.md`와 설치 여부에 따른 `docs/AGENTS.ponytail.md` |
 | Reviewer | `docs/AGENTS.reviewer.md` |
 
 작업 시작 시 모든 지침 원본을 함께 고정한다. 같은 ExecPlan의 Worker·Reviewer는 같은 원본 버전에서 각 역할의 내용만 합치며 재시도·새 세션·재개도 이 버전을 유지한다. 새 작업만 최신 원본을 선택하고 역할별 내용 변경도 planning·검증 결과 재사용의 입력에 반영한다. 기본 지침·기존 추가 지침·프로젝트 규칙과 격리 검증 gate는 보존하며 파일 오류·지원되지 않는 CLI·설정 충돌·알 수 없는 역할은 모델 실행 전에 중단한다.
@@ -173,3 +173,9 @@ Merge 확인 뒤 worktree가 clean하고 PR head에 없는 로컬 commit이 없�
 - 문서 작성·검토: [Specification Skill](.agents/skills/specification-docs/SKILL.md)
 
 PLANS와 템플릿은 복사된 공통 파일을 사용한다. 계획별 phase·branch·worktree·PR·재시도는 Manager가 SQLite에서 관리한다.
+
+## Ponytail
+
+Loop Manager는 Worker의 코드 단순화와 기존 구현 재사용을 위해 [Ponytail](https://github.com/DietrichGebert/ponytail)의 코딩 지침을 사용한다. 저장된 원문은 [AGENTS.ponytail.md](docs/AGENTS.ponytail.md)다. 첫 Worker 호출 전에 Codex·Claude Code의 설치 플러그인 목록을 각각 한 번 조회하며, Ponytail이 설치되어 있으면 비활성 상태도 Manager의 추가 주입을 생략한다. 미설치 또는 조회 실패 시에는 저장된 지침을 추가한다. 설치 상태는 다음 Manager 실행에서 다시 확인한다.
+
+원문은 upstream [552acd5](https://github.com/DietrichGebert/ponytail/blob/552acd5efd0aeae2583a12efe39373d2f076f25e/AGENTS.md)에서 가져왔으며 [MIT 라이선스](docs/AGENTS.ponytail.LICENSE)를 함께 보존한다. 설치 여부를 생략 기준으로 사용하며 Hook의 실제 실행이나 플러그인 전체 규칙과 축약 원문의 동일한 효과를 보증하지 않는다. 명시된 요구사항·안전·필수 검증과 Manager의 역할·권한·게시 규칙은 유지된다.

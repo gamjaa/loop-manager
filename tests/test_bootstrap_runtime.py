@@ -446,6 +446,7 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
     codex_model_efforts = lambda *args: {model: frozenset({'medium', 'high', 'max', 'xhigh'})
         for model in ('test-fast', 'test-balanced', 'test-strong')}
     run_codex = fake_agent
+    _ponytail_installed = lambda provider: True
     if '--runtime-child' in sys.argv:
         from loop_manager_internal.runtime.bootstrap import BootstrapService
         validate_mutation = BootstrapService.validate_runtime_mutation
@@ -460,7 +461,8 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
         BootstrapService.validate_runtime_mutation = advance_remote_then_validate
     raise SystemExit(main())'''), encoding='utf-8')
                     for name in ('PLANS.md', 'AGENTS.common.md', 'AGENTS.planner.md',
-                                 'AGENTS.planner_check.md', 'AGENTS.worker.md', 'AGENTS.reviewer.md'):
+                                 'AGENTS.planner_check.md', 'AGENTS.worker.md', 'AGENTS.reviewer.md',
+                                 'AGENTS.ponytail.md'):
                         shutil.copy(loop_manager.ROOT / 'docs' / name, source / 'docs' / name)
                     (source / 'scripts').mkdir(exist_ok=True)
                     (source / 'scripts/verify.sh').write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')

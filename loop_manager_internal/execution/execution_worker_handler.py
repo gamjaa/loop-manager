@@ -13,6 +13,7 @@ import subprocess
 import sys
 from uuid import uuid4
 from loop_manager_internal.agents.agent_invocation import AgentResult, AgentResultKind, AttemptSequence, TrackedAgentCall, ResolvedProfile
+from loop_manager_internal.agents import common_guidance
 from loop_manager_internal.execution.worker_session import SessionBinding, SessionTransition, decide_session, unavailable_transition
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, RecoveryFailure, classify_exception
@@ -824,6 +825,12 @@ class WorkerHandler:
                 )
             except RecoveryFailure as error:
                 return self.ports._recover(error.reason, str(error), context=context)
+        definition = self.ports.snapshot()._definition_snapshot
+        if definition is not None:
+            definition = replace(definition, worker_guidance_hash=common_guidance.worker_content_hash(
+                self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id,
+            ))
+            self.ports.update_snapshot(_definition_snapshot=definition)
         if self.ports.checkpoint is not None and self.ports.snapshot()._definition_snapshot is not None:
             current = self.ports.checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
             if (current.snapshot or {}).get('current_rebase_acceptance'):
@@ -845,6 +852,7 @@ class WorkerHandler:
             self.ports.state.update_project(
                 self.ports.identity.repo, preserve_transaction=True,
                 phase='VERIFYING',
+                **({'definition_snapshot': definition.serialize()} if definition is not None else {}),
                 validated_base_sha=None,
                 worker_result=message,
                 verify_result=None,

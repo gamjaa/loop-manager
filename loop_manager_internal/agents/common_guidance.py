@@ -23,7 +23,9 @@ ROLE_PATHS = {
     "worker": "docs/AGENTS.worker.md",
     "reviewer": "docs/AGENTS.reviewer.md",
 }
-GUIDANCE_PATHS = (COMMON_PATH, *dict.fromkeys(ROLE_PATHS.values()))
+PONYTAIL_PATH = 'docs/AGENTS.ponytail.md'
+LEGACY_GUIDANCE_PATHS = (COMMON_PATH, *dict.fromkeys(ROLE_PATHS.values()))
+GUIDANCE_PATHS = (*LEGACY_GUIDANCE_PATHS, PONYTAIL_PATH)
 RUNTIME_ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -54,7 +56,7 @@ def _read(path: Path) -> bytes:
 
 def _runtime_bundle() -> bytes:
     files = {path: _read(RUNTIME_ROOT / path).decode("utf-8") for path in GUIDANCE_PATHS}
-    return (json.dumps({"version": 1, "files": files}, ensure_ascii=False,
+    return (json.dumps({"version": 2, "files": files}, ensure_ascii=False,
                        sort_keys=True, separators=(",", ":")) + "\n").encode("utf-8")
 
 
@@ -138,9 +140,10 @@ def _bundle_files(contents: bytes) -> dict[str, str]:
     try:
         bundle = json.loads(contents)
         if (not isinstance(bundle, dict) or set(bundle) != {"version", "files"}
-                or type(bundle["version"]) is not int or bundle["version"] != 1
+                or type(bundle["version"]) is not int or bundle["version"] not in {1, 2}
                 or not isinstance(bundle["files"], dict)
-                or set(bundle["files"]) != set(GUIDANCE_PATHS)
+                or set(bundle["files"]) != set(
+                    LEGACY_GUIDANCE_PATHS if bundle['version'] == 1 else GUIDANCE_PATHS)
                 or any(not isinstance(value, str) or not value.strip() or "\0" in value
                        for value in bundle["files"].values())):
             raise ValueError("invalid instruction bundle")
@@ -151,7 +154,8 @@ def _bundle_files(contents: bytes) -> dict[str, str]:
         raise GuidanceError("공통·역할별 지침 snapshot 형식이 유효하지 않습니다.") from error
 
 
-def load_saved(task_id: str, row, state_dir: Path, role: str) -> CommonGuidance:
+def load_saved(task_id: str, row, state_dir: Path, role: str, *,
+               include_ponytail: bool = False) -> CommonGuidance:
     if role not in ROLE_PATHS:
         raise GuidanceError(f"지원하지 않는 Agent 지침 역할입니다: {role}")
     content_hash, revision, reference = row
@@ -172,19 +176,22 @@ def load_saved(task_id: str, row, state_dir: Path, role: str) -> CommonGuidance:
     if suffix == ".json":
         files = _bundle_files(contents)
         contents = (files[COMMON_PATH].rstrip("\n") + "\n\n" + files[ROLE_PATHS[role]]).encode("utf-8")
+        if role == 'worker' and include_ponytail and PONYTAIL_PATH in files:
+            contents = contents.rstrip(b'\n') + b'\n\n' + files[PONYTAIL_PATH].encode('utf-8')
         path = _store_snapshot(expected.parent, contents, ".md")
         content_hash = hashlib.sha256(contents).hexdigest()
     return CommonGuidance(task_id, contents.decode("utf-8"), content_hash, revision, path)
 
 
 def resolve(repository: GuidanceRepository, context: InvocationContext,
-            role: str, worktree: Path, state_dir: Path) -> CommonGuidance:
+            role: str, worktree: Path, state_dir: Path, *,
+            include_ponytail: bool = False) -> CommonGuidance:
     identity = task_identity(context, role, worktree)
     try:
         validate_state_root(context, worktree, state_dir)
         saved = repository.get(identity)
         if saved is not None:
-            return load_saved(identity, saved, state_dir, role)
+            return load_saved(identity, saved, state_dir, role, include_ponytail=include_ponytail)
         if role not in ROLE_PATHS:
             raise GuidanceError(f"지원하지 않는 Agent 지침 역할입니다: {role}")
         contents = _runtime_bundle()
@@ -201,7 +208,8 @@ def resolve(repository: GuidanceRepository, context: InvocationContext,
         _check_snapshot_directory(directory)
         snapshot = _store_snapshot(directory, contents, ".json")
         repository.save(identity, context.repo, content_hash, revision, str(snapshot))
-        return load_saved(identity, repository.get(identity), state_dir, role)
+        return load_saved(identity, repository.get(identity), state_dir, role,
+                          include_ponytail=include_ponytail)
     except (OSError, sqlite3.Error, subprocess.SubprocessError) as error:
         raise GuidanceError("공통 지침 버전 보존 실패") from error
 
@@ -211,6 +219,20 @@ def plan_content_hash(connection: sqlite3.Connection, repo: str, plan_id: str) -
     identity = task_identity(InvocationContext(repo, plan_id), "worker", Path(repo))
     row = GuidanceRepository(connection).get(identity)
     return str(row[0]) if row else runtime_content_hash()
+
+
+def worker_content_hash(connection: sqlite3.Connection, repo: str, plan_id: str) -> str:
+    """Actual delivery affects candidate reuse, not the pinned source contract."""
+    identity = task_identity(InvocationContext(repo, plan_id), 'worker', Path(repo))
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE name='agent_invocations'").fetchone():
+        worker = connection.execute(
+            "SELECT guidance_content_hash FROM agent_invocations WHERE repo=? AND role='worker' "
+            "AND guidance_task_id=? AND guidance_content_hash IS NOT NULL ORDER BY rowid DESC LIMIT 1",
+            (repo, identity),
+        ).fetchone()
+        if worker:
+            return str(worker[0])
+    return ''
 
 
 def planning_content_hash(connection: sqlite3.Connection, repo: str) -> str | None:

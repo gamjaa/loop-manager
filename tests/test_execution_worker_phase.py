@@ -21,6 +21,23 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 
 class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+    def test_successful_worker_tokens_use_actual_delivered_guidance_without_another_worker(self):
+        from loop_manager_internal.agents import common_guidance
+        from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
+        context = self.review_context()
+        previous = self.handler._definition_snapshot
+        with mock.patch.object(common_guidance, 'worker_content_hash', return_value='delivered-guidance'):
+            outcome = self.handler._finish_worker(context, self.state.row(), VALID_WORKER_RESULT)
+        row = self.state.row()
+        selected = DefinitionSnapshot.deserialize(row['definition_snapshot'])
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.assertEqual(row['phase'], 'VERIFYING')
+        self.assertEqual(selected.worker_guidance_hash, 'delivered-guidance')
+        self.assertEqual(selected.guidance_hash, previous.guidance_hash)
+        self.assertEqual(row['worker_input_token'], selected.worker_token)
+        self.assertNotEqual(row['worker_input_token'], previous.worker_token)
+        self.effects.agent.run_agent.assert_not_called()
+
     def test_rebase_completion_session_handles_optional_snapshot(self):
         context = SimpleNamespace(worker_session_id='current-session')
         cases = (

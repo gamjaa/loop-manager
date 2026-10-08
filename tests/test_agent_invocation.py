@@ -12,6 +12,7 @@ import loop_manager as manager
 
 class RunnerTests(TestCase):
     def setUp(self):
+        self.enterContext(mock.patch.object(manager, '_ponytail_installed', return_value=True))
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         self.state_dir = Path(self.temporary.name)
@@ -336,6 +337,8 @@ class RunnerTests(TestCase):
 class CommonGuidanceInvocationTests(TestCase):
     """All roles share the same durable instruction resolution boundary."""
     def setUp(self):
+        self.ponytail_installed = self.enterContext(
+            mock.patch.object(manager, '_ponytail_installed', return_value=True))
         import tempfile
         from loop_manager_internal.agents import common_guidance
         self.guidance_module = common_guidance
@@ -347,6 +350,7 @@ class CommonGuidanceInvocationTests(TestCase):
         self.source = self.runtime / common_guidance.COMMON_PATH
         self.source.write_text('자동 지침 "quoted" \\path\n두 번째 줄\n', encoding='utf-8')
         self.role_texts = {}
+        (self.runtime / common_guidance.PONYTAIL_PATH).write_text('Ponytail fixture\n', encoding='utf-8')
         for path in set(common_guidance.ROLE_PATHS.values()):
             self.role_texts[path] = '정적 역할: ' + path + '\n'
             (self.runtime / path).write_text(self.role_texts[path], encoding='utf-8')
@@ -379,6 +383,90 @@ class CommonGuidanceInvocationTests(TestCase):
             invocation=invocation.InvocationContext('repo', plan, task_id=task),
             resolved_profile=invocation.ResolvedProfile('model', 'high'),
         )
+
+    def test_absent_plugin_adds_ponytail_only_to_worker_and_records_actual_hash(self):
+        self.ponytail_installed.return_value = False
+        self.assertEqual(self.invoke().code, 0)
+        selected = self.requests[-1].common_guidance
+        self.assertEqual(selected.content.count('Ponytail fixture'), 1)
+        self.assertEqual(selected.snapshot_path.read_text(encoding='utf-8'), selected.content)
+        row = self.connection.execute('SELECT guidance_content_hash FROM agent_invocations').fetchone()
+        self.assertEqual(row[0], selected.content_hash)
+        self.assertEqual(self.invoke(session='session-1').code, 0)
+        self.assertEqual(self.requests[-1].common_guidance, selected)
+        self.ponytail_installed.reset_mock()
+        for role in ('planner', 'maintenance_planner', 'planner_check', 'reviewer'):
+            self.assertEqual(self.invoke(role=role, plan=None, task=role).code, 0)
+            self.assertNotIn('Ponytail fixture', self.requests[-1].common_guidance.content)
+            self.assertEqual(self.requests[-1].prompt, 'delta only')
+        self.ponytail_installed.assert_not_called()
+
+    def test_provider_switch_filters_the_same_pinned_ponytail_source_and_invalidates_reuse(self):
+        self.ponytail_installed.side_effect = lambda provider: provider == 'codex'
+        self.assertEqual(self.invoke(provider='codex').code, 0)
+        skipped = self.requests[-1].common_guidance
+        fingerprint = self.guidance_module.worker_content_hash(self.connection, 'repo', 'G-147')
+        source_fingerprint = self.guidance_module.plan_content_hash(self.connection, 'repo', 'G-147')
+        (self.runtime / self.guidance_module.PONYTAIL_PATH).write_text('updated Ponytail')
+        self.assertEqual(self.invoke(provider='claude').code, 0)
+        added = self.requests[-1].common_guidance
+        self.assertEqual(added.task_id, skipped.task_id)
+        self.assertEqual(added.source_revision, skipped.source_revision)
+        self.assertNotIn('Ponytail fixture', skipped.content)
+        self.assertIn('Ponytail fixture', added.content)
+        self.assertNotIn('updated Ponytail', added.content)
+        self.assertNotEqual(added.content_hash, skipped.content_hash)
+        self.assertNotEqual(fingerprint,
+                            self.guidance_module.worker_content_hash(self.connection, 'repo', 'G-147'))
+        self.assertEqual(source_fingerprint,
+                         self.guidance_module.plan_content_hash(self.connection, 'repo', 'G-147'))
+        self.assertEqual(self.invoke(provider='codex').code, 0)
+        self.assertEqual(self.requests[-1].common_guidance, skipped)
+        self.assertEqual(fingerprint,
+                         self.guidance_module.worker_content_hash(self.connection, 'repo', 'G-147'))
+
+    def test_ponytail_only_change_affects_new_tasks_without_changing_pinned_workers(self):
+        self.ponytail_installed.return_value = False
+        before = self.guidance_module.runtime_content_hash()
+        self.assertEqual(self.invoke().code, 0)
+        original = self.requests[-1].common_guidance
+        (self.runtime / self.guidance_module.PONYTAIL_PATH).write_text('updated Ponytail')
+        self.assertNotEqual(self.guidance_module.runtime_content_hash(), before)
+        self.assertEqual(self.invoke().code, 0)
+        self.assertEqual(self.requests[-1].common_guidance, original)
+        self.assertEqual(self.invoke(plan='G-148').code, 0)
+        self.assertIn('updated Ponytail', self.requests[-1].common_guidance.content)
+
+    def test_old_json_bundle_is_resumed_without_retrospective_ponytail(self):
+        import hashlib
+        import json
+        from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
+        self.ponytail_installed.return_value = False
+        files = {path: (self.runtime / path).read_text(encoding='utf-8')
+                 for path in self.guidance_module.LEGACY_GUIDANCE_PATHS}
+        contents = json.dumps({'version': 1, 'files': files}).encode()
+        digest = hashlib.sha256(contents).hexdigest()
+        directory = self.state_dir / 'agent-guidance'
+        directory.mkdir(parents=True, mode=0o700)
+        snapshot = directory / (digest + '.json')
+        snapshot.write_bytes(contents)
+        identity = self.guidance_module.task_identity(
+            invocation.InvocationContext('repo', 'G-147'), 'worker', self.worktree)
+        GuidanceRepository(self.connection).save(identity, 'repo', digest, 'a' * 40, str(snapshot))
+        for path in self.guidance_module.GUIDANCE_PATHS:
+            (self.runtime / path).unlink()
+        self.assertEqual(self.invoke().code, 0)
+        self.assertNotIn('Ponytail fixture', self.requests[-1].common_guidance.content)
+        self.assertEqual(self.requests[-1].common_guidance.source_revision, 'a' * 40)
+
+    def test_invalid_ponytail_source_is_a_guidance_failure_even_when_plugin_installed(self):
+        path = self.runtime / self.guidance_module.PONYTAIL_PATH
+        for value in (b'', b'\xff', b'instructions\0'):
+            path.write_bytes(value)
+            self.assertEqual(self.invoke().result_kind, invocation.AgentResultKind.PERMANENT_CONFIGURATION)
+        path.unlink()
+        self.assertEqual(self.invoke().result_kind, invocation.AgentResultKind.PERMANENT_CONFIGURATION)
+        self.assertEqual(self.requests, [])
 
     def test_modern_session_fixture_binds_selected_plan_and_models_only_pr_body_reads(self):
         from types import SimpleNamespace
@@ -667,7 +755,7 @@ class CommonGuidanceInvocationTests(TestCase):
         directory.mkdir(parents=True, mode=0o700)
         files = {path: 'valid instructions' for path in self.guidance_module.GUIDANCE_PATHS}
         variants = (
-            {'version': 2, 'files': files},
+            {'version': 3, 'files': files},
             {'version': 1, 'files': {}},
             {'version': 1, 'files': dict(files, **{'docs/foreign.md': 'expanded role'})},
             {'version': 1, 'files': {**files, self.guidance_module.COMMON_PATH: '\ud800'}},

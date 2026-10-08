@@ -32,6 +32,7 @@ def candidate_token(connection, repo, head, base, documents):
     """Bind receipts to the common version of every member, outside Git HEAD."""
     from loop_manager_internal.agents import common_guidance
     guidance=tuple((item['plan']['id'],common_guidance.plan_content_hash(
+        connection,str(repo),item['plan']['id']), common_guidance.worker_content_hash(
         connection,str(repo),item['plan']['id'])) for item in documents)
     return digest((head,base,documents,environment_identity(repo),guidance))
 
@@ -195,6 +196,8 @@ class ManualCandidate:
             tuple(sorted({dep for item in documents for dep in item['plan']['depends_on']})),
             plan['complexity'],plan['risk'],plan['priority'],digest(documents),digest(source_texts),(),
             guidance_hash=common_guidance.plan_content_hash(
+                self.connection,self.repo,self.plan_id),
+            worker_guidance_hash=common_guidance.worker_content_hash(
                 self.connection,self.repo,self.plan_id))
         return snapshot
 
