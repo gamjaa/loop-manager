@@ -21,6 +21,7 @@ from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCh
 from loop_manager_internal.execution.execution_state import ExecutionStatePort
 from loop_manager_internal.execution.execution_runtime import ExecutionPhase, ExecutionPhaseCoordinator, ExecutionOutcome, ExecutionOutcomeKind
 from tests.support.blocked_git import blocked_git_fixture
+from tests.support.recovery_boundary import RecoveryBoundary
 from loop_manager_internal.storage import blocked_checkpoint_state
 from loop_manager_internal.recovery import blocked_checkpoint
 from loop_manager_internal.execution.worker_session import SessionBinding
@@ -33,7 +34,8 @@ class ExecutionRecoveryScenarios:
                                           existing_pr=False, published_checkpoint=False,
                                           stale_cache=False, manual=None, scope_stage_block=False):
         self.journal_start.stop()
-        fixture = blocked_git_fixture(self)
+        boundary = self.enterContext(RecoveryBoundary()) if isinstance(rejected, tuple) else None
+        fixture = blocked_git_fixture(self, directory=boundary.directory if boundary else None)
         repo = str(fixture.repo.resolve())
         branch = 'loop-manager/G-034'
         git = fixture.run_git
@@ -222,6 +224,8 @@ class ExecutionRecoveryScenarios:
         fixture.connection = sqlite3.connect(database)
         fixture.connection.row_factory = sqlite3.Row
         connection = fixture.connection
+        if boundary:
+            boundary.save(connection)
         def resume():
             if plan_block:
                 return lm.resume_plan_blocks(
@@ -246,74 +250,79 @@ class ExecutionRecoveryScenarios:
                 self.assertEqual(journal.live_remote_branch_oid(lm.git, fixture.repo, branch),
                                  expected_remote)
             if rejected:
-                completed = git(fixture.worktree, 'rev-parse', 'HEAD')
-                rejected_file = (fixture.worktree / 'docs/requirements/Protected.md'
-                                 if rejected in {'unstaged', 'late-file'} else app)
-                rejected_file.parent.mkdir(parents=True, exist_ok=True)
-                if rejected in {'unstaged', 'staged'}:
-                    rejected_file.write_text(rejected_file.read_text() + 'unapproved change\n'
-                                             if rejected_file.exists() else 'unapproved change\n')
-                    if rejected == 'staged':
-                        git(fixture.worktree, 'add', 'code.py')
-                elif rejected == 'index-flags':
-                    git(fixture.worktree, 'update-index', '--skip-worktree', 'code.py')
-                elif rejected == 'remote-created':
-                    git(fixture.worktree, 'push', 'origin', f'{original}:refs/heads/{branch}')
-                    git(fixture.repo, 'update-ref', '-d', f'refs/remotes/origin/{branch}')
-                elif rejected == 'remote-changed':
-                    git(fixture.repo, 'push', 'origin', 'main')
-                    git(fixture.remote, 'update-ref', f'refs/heads/{branch}', target)
-                self.assertEqual(lm.remote_branch_oid(fixture.repo, branch), expected_remote)
-                # Catalog compatibility adoption is independent of block recovery.
-                lm.active_execplan(connection, repo)
-                before = dict(connection.execute('SELECT * FROM exec_plans').fetchone())
-                saved_recovery = dict(handlers.recovery_state.RecoveryRepository(
-                    connection,
-                ).row(repo, 'G-034'))
-                current_service = lm._current_rebase_service
-                def service_with_race(*args, **kwargs):
-                    service = current_service(*args, **kwargs)
-                    require_owned = service.require_owned
-                    calls = []
-                    def observe(**options):
-                        calls.append(None)
-                        if len(calls) == 2:
-                            if rejected == 'late-file':
-                                rejected_file.write_text('late unapproved change\n')
-                            elif rejected == 'late-remote':
-                                git(fixture.worktree, 'push', 'origin', f'{original}:refs/heads/{branch}')
-                                git(fixture.repo, 'update-ref', '-d', f'refs/remotes/origin/{branch}')
-                        return require_owned(**options)
-                    return SimpleNamespace(observe=observe, require_owned=observe)
-                with mock.patch.object(lm, '_current_rebase_service', side_effect=service_with_race):
-                    for _ in range(2):
-                        self.assertFalse(resume())
-                self.assertEqual(dict(connection.execute('SELECT * FROM exec_plans').fetchone()), before)
-                self.assertEqual(dict(handlers.recovery_state.RecoveryRepository(
-                    connection,
-                ).row(repo, 'G-034')), saved_recovery)
-                self.assertIsNone(connection.execute(
-                    'SELECT released_at FROM notified_block_incidents',
-                ).fetchone()[0])
-                slot = journal._slot(fixture.state_dir, repo, 'managed_rebase',
-                                     str(fixture.worktree.resolve()))
-                self.assertTrue((slot / 'active.json').exists())
-                self.assertFalse((slot / f'{continuation}.result.json').exists())
-                self.assertEqual(git(fixture.worktree, 'rev-parse', 'HEAD'), completed)
-                if rejected in {'unstaged', 'staged', 'late-file'}:
-                    self.assertIn('unapproved change', rejected_file.read_text())
-                if published_checkpoint:
-                    self.assertEqual(dict(connection.execute(
-                        'SELECT * FROM blocked_checkpoints',
-                    ).fetchone()), published_before)
-                    # Restoring the unexpected change must leave the same original
-                    # completion intent usable; a poisoned result would prevent this.
-                    if rejected == 'unstaged':
-                        rejected_file.unlink()
-                    else:
-                        git(fixture.worktree, 'restore', '--source=HEAD', '--staged', '--worktree',
-                            '--', 'code.py')
-                else:
+                rejections = rejected if boundary else (rejected,)
+                for index, rejected in enumerate(rejections):
+                    with self.subTest(rejected=rejected):
+                        if index:
+                            fixture.connection = connection = boundary.restore(connection)
+                        completed = git(fixture.worktree, 'rev-parse', 'HEAD')
+                        rejected_file = (fixture.worktree / 'docs/requirements/Protected.md'
+                                         if rejected in {'unstaged', 'late-file'} else app)
+                        rejected_file.parent.mkdir(parents=True, exist_ok=True)
+                        if rejected in {'unstaged', 'staged'}:
+                            rejected_file.write_text(rejected_file.read_text() + 'unapproved change\n'
+                                                     if rejected_file.exists() else 'unapproved change\n')
+                            if rejected == 'staged':
+                                git(fixture.worktree, 'add', 'code.py')
+                        elif rejected == 'index-flags':
+                            git(fixture.worktree, 'update-index', '--skip-worktree', 'code.py')
+                        elif rejected == 'remote-created':
+                            git(fixture.worktree, 'push', 'origin', f'{original}:refs/heads/{branch}')
+                            git(fixture.repo, 'update-ref', '-d', f'refs/remotes/origin/{branch}')
+                        elif rejected == 'remote-changed':
+                            git(fixture.repo, 'push', 'origin', 'main')
+                            git(fixture.remote, 'update-ref', f'refs/heads/{branch}', target)
+                        self.assertEqual(lm.remote_branch_oid(fixture.repo, branch), expected_remote)
+                        # Catalog compatibility adoption is independent of block recovery.
+                        lm.active_execplan(connection, repo)
+                        before = dict(connection.execute('SELECT * FROM exec_plans').fetchone())
+                        saved_recovery = dict(handlers.recovery_state.RecoveryRepository(
+                            connection,
+                        ).row(repo, 'G-034'))
+                        current_service = lm._current_rebase_service
+                        def service_with_race(*args, **kwargs):
+                            service = current_service(*args, **kwargs)
+                            require_owned = service.require_owned
+                            calls = []
+                            def observe(**options):
+                                calls.append(None)
+                                if len(calls) == 2:
+                                    if rejected == 'late-file':
+                                        rejected_file.write_text('late unapproved change\n')
+                                    elif rejected == 'late-remote':
+                                        git(fixture.worktree, 'push', 'origin', f'{original}:refs/heads/{branch}')
+                                        git(fixture.repo, 'update-ref', '-d', f'refs/remotes/origin/{branch}')
+                                return require_owned(**options)
+                            return SimpleNamespace(observe=observe, require_owned=observe)
+                        with mock.patch.object(lm, '_current_rebase_service', side_effect=service_with_race):
+                            for _ in range(2):
+                                self.assertFalse(resume())
+                        self.assertEqual(dict(connection.execute('SELECT * FROM exec_plans').fetchone()), before)
+                        self.assertEqual(dict(handlers.recovery_state.RecoveryRepository(
+                            connection,
+                        ).row(repo, 'G-034')), saved_recovery)
+                        self.assertIsNone(connection.execute(
+                            'SELECT released_at FROM notified_block_incidents',
+                        ).fetchone()[0])
+                        slot = journal._slot(fixture.state_dir, repo, 'managed_rebase',
+                                             str(fixture.worktree.resolve()))
+                        self.assertTrue((slot / 'active.json').exists())
+                        self.assertFalse((slot / f'{continuation}.result.json').exists())
+                        self.assertEqual(git(fixture.worktree, 'rev-parse', 'HEAD'), completed)
+                        if rejected in {'unstaged', 'staged', 'late-file'}:
+                            self.assertIn('unapproved change', rejected_file.read_text())
+                        if published_checkpoint:
+                            self.assertEqual(dict(connection.execute(
+                                'SELECT * FROM blocked_checkpoints',
+                            ).fetchone()), published_before)
+                            # Restoring the unexpected change must leave the same original
+                            # completion intent usable; a poisoned result would prevent this.
+                            if rejected == 'unstaged':
+                                rejected_file.unlink()
+                            else:
+                                git(fixture.worktree, 'restore', '--source=HEAD', '--staged', '--worktree',
+                                    '--', 'code.py')
+                if not published_checkpoint:
                     return
             self.assertTrue(resume())
             if manual in {'waiting', 'staged'}:

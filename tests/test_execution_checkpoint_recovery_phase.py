@@ -38,20 +38,15 @@ class ExecutionCheckpointRecoveryPhaseTests(ExecutionRecoveryScenarios, Executio
         self._legacy_rebase_false_block_recovery(plan_block=False)
 
 
-    def test_legacy_rebase_rejects_index_flags_after_git_completion(self):
-        self._legacy_rebase_false_block_recovery(plan_block=True, rejected='index-flags')
-
-
-    def test_legacy_rebase_rejects_remote_branch_created_without_fetch(self):
-        self._legacy_rebase_false_block_recovery(plan_block=True, rejected='remote-created')
+    def test_legacy_rebase_rejects_changes_after_git_completion(self):
+        # Same plan block and absent remote; vary only the post-restart mutation.
+        self._legacy_rebase_false_block_recovery(
+            plan_block=True, rejected=('index-flags', 'remote-created', 'late-file'),
+        )
 
 
     def test_legacy_rebase_rejects_remote_branch_changed_without_fetch(self):
         self._legacy_rebase_false_block_recovery(plan_block=False, rejected='remote-changed')
-
-
-    def test_legacy_rebase_rejects_file_change_after_journal_sealing(self):
-        self._legacy_rebase_false_block_recovery(plan_block=True, rejected='late-file')
 
 
     def test_legacy_rebase_rechecks_live_remote_after_journal_sealing(self):

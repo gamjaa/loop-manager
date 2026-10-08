@@ -13,6 +13,7 @@ from loop_manager_internal.execution.manual_candidate import ManualCandidate
 from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
 from tests.support.manual_work import ManualWorkFixture, completion, generated
 from tests.support.git import git_command
+from tests.support.recovery_boundary import RecoveryBoundary
 from types import SimpleNamespace
 
 
@@ -714,19 +715,25 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
     def test_source_update_recovers_each_boundary_and_preserves_remote_followups(self):
         from loop_manager_internal.git import manager_git_journal as journal
         from loop_manager_internal.git.manual_source_update import update_source
+        preparation=self.enterContext(RecoveryBoundary())
+        directory=preparation.directory
+        service,group,user=self.pending_source(directory)
+        incoming=group['pending_source_head']
+        request_id=group['request_id']
+        before=group['prepared_head']
+        real_git=service.effects.git
+        worktree=Path(group['worktree'])
+        (worktree/'staged.txt').write_text('Local staged work\n')
+        git_command(worktree,'add','staged.txt')
+        (worktree/'untracked.txt').write_text('Local untracked work\n')
+        local_status=git_command(worktree,'status','--porcelain')
+        effects=service.effects
+        preparation.save(service.connection)
         for boundary in ('candidate','before_push','after_push','receipt','sqlite'):
             for followup in (False,True):
-                with self.subTest(boundary=boundary,followup=followup),tempfile.TemporaryDirectory() as directory:
-                    service,group,user=self.pending_source(directory)
-                    incoming=group['pending_source_head']
-                    request_id=group['request_id']
-                    before=group['prepared_head']
-                    real_git=service.effects.git
-                    worktree=Path(group['worktree'])
-                    (worktree/'staged.txt').write_text('Local staged work\n')
-                    git_command(worktree,'add','staged.txt')
-                    (worktree/'untracked.txt').write_text('Local untracked work\n')
-                    local_status=git_command(worktree,'status','--porcelain')
+                with self.subTest(boundary=boundary,followup=followup):
+                    preparation.restore(service.connection)
+                    service.effects=effects
                     def interrupt(target,*arguments,**kwargs):
                         if boundary=='before_push' and arguments[0]=='push':
                             raise KeyboardInterrupt('before push')
@@ -799,23 +806,31 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
     def test_source_update_descendant_equal_reinterruptions_and_rewrite(self):
         from loop_manager_internal.git import manager_git_journal as journal
         from loop_manager_internal.git.manual_source_update import update_source
+        preparation=self.enterContext(RecoveryBoundary())
+        directory=preparation.directory
+        service,group,_=self.pending_source(directory)
+        real_git=service.effects.git
+        def after_push(target,*arguments,**kwargs):
+            result=real_git(target,*arguments,**kwargs)
+            if arguments[0]=='push':
+                raise KeyboardInterrupt('after exact push')
+            return result
+        service.effects=replace(service.effects,git=after_push)
+        with self.assertRaises(KeyboardInterrupt):
+            update_source(service,group)
+        service.effects=replace(service.effects,git=real_git)
+        saved=service.store.get(service.repo,group['group_id'])
+        service.fetch(group['branch'])
+        later=self.remote_followup(service,group,directory)
+        effects=service.effects
+        remote_head=later
+        preparation.save(service.connection)
         for boundary in ('before_result','after_result','sqlite','aborted_receipt','before_equal'):
             for rewrite in (False,True):
-                with self.subTest(boundary=boundary,rewrite=rewrite),tempfile.TemporaryDirectory() as directory:
-                    service,group,_=self.pending_source(directory)
-                    real_git=service.effects.git
-                    def after_push(target,*arguments,**kwargs):
-                        result=real_git(target,*arguments,**kwargs)
-                        if arguments[0]=='push':
-                            raise KeyboardInterrupt('after exact push')
-                        return result
-                    service.effects=replace(service.effects,git=after_push)
-                    with self.assertRaises(KeyboardInterrupt):
-                        update_source(service,group)
-                    service.effects=replace(service.effects,git=real_git)
-                    saved=service.store.get(service.repo,group['group_id'])
-                    service.fetch(group['branch'])
-                    later=self.remote_followup(service,group,directory)
+                with self.subTest(boundary=boundary,rewrite=rewrite):
+                    preparation.restore(service.connection)
+                    service.effects=effects
+                    later=remote_head
                     slot=journal._slot(service.state_dir,service.repo,'manual_branch_push',
                                        f"refs/heads/{group['branch']}")
                     write=journal._write_new
