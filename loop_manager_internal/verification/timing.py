@@ -21,12 +21,13 @@ _phase_names: ContextVar[tuple[str, ...]] = ContextVar("verify_phase_names", def
 
 
 class EventWriter:
-    def __init__(self, path: Path, *, clock=time.monotonic):
+    def __init__(self, path: Path, *, clock=time.monotonic, identity=None):
         self.path, self.clock = path, clock
+        self.identity = identity or {}
         self.stream = path.open("a", encoding="utf-8")
 
     def emit(self, kind: str, **values):
-        event = {"kind": kind, "at": self.clock(), "utc": datetime.now(timezone.utc).isoformat(),
+        event = {"version": 1, **self.identity, "kind": kind, "at": self.clock(), "utc": datetime.now(timezone.utc).isoformat(),
                  "pid": os.getpid(), **values}
         self.stream.write(json.dumps(event, ensure_ascii=False) + "\n")
         self.stream.flush()
@@ -241,7 +242,7 @@ def summarize(directory: Path, *, now=None):
     completed, active, phases, decisions, metadata, fixtures, result = [], {}, [], [], {}, [], None
     git_costs, git_incomplete = [], []
     bytecode_cache = None
-    for path in sorted(directory.glob("*.jsonl")):
+    for path in sorted(directory.rglob("*.jsonl")):
         for line in path.read_text(encoding="utf-8").splitlines(keepends=True):
             if not line.endswith("\n"):
                 break
@@ -293,10 +294,17 @@ def summarize(directory: Path, *, now=None):
 
 def comparison(directories, summaries):
     """범위와 관측된 환경을 대조하고 실측 시간만 나란히 제공한다."""
-    scopes, contexts, bytecode_policies, runs = [], [], [], []
+    scopes, contexts, bytecode_policies, runs, contracts = [], [], [], [], []
     for directory, summary in zip(directories, summaries):
         path = directory / "manifest.json"
         modules = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else []
+        contracts.append(None if isinstance(modules, list) else (
+            modules.get("version"), modules.get("adapter"), modules.get("adapter_version"),
+            [(stage["id"], stage.get("python"), stage.get("argv"), stage.get("cwd"),
+              [(unit.get("argv"), unit.get("cwd"), unit.get("execution")) for unit in stage.get("units", [])])
+             for stage in modules.get("stages", [])]))
+        if isinstance(modules, dict):
+            modules = [unit for stage in modules.get("stages", []) for unit in stage.get("units", [])]
         scopes.append(tuple(identity for module in modules for identity in module["ids"]))
         metadata = summary["metadata"]
         environment = metadata.get("environment", {})
@@ -342,7 +350,7 @@ def comparison(directories, summaries):
                      "bytecode_policy": metadata.get("bytecode_policy"),
                      "bytecode_cache": summary.get("bytecode_cache"),
                      "passed": (summary.get("result") or {}).get("passed"), "counts": summary["counts"]})
-    scope_matches = bool(scopes and scopes[0]) and all(scope == scopes[0] for scope in scopes)
+    scope_matches = bool(scopes and scopes[0]) and all(scope == scopes[0] for scope in scopes) and all(value == contracts[0] for value in contracts)
     bytecode_policy_matches = bool(bytecode_policies and isinstance(bytecode_policies[0], dict)) and all(
         policy == bytecode_policies[0] for policy in bytecode_policies)
     environment_matches = bool(contexts and all(value is not None for value in contexts[0][:6])) and all(

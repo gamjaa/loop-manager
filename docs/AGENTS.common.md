@@ -64,3 +64,9 @@ Skill과 Manager가 프로젝트 안에서 고정 위치로 사용하는 다음 
 실제 상태 변경과 재개·완료 판정은 Manager가 담당한다. 자동 작업의 완료에는
 제품·설계·Acceptance Criteria 충족, 필요한 targeted test와 전체 verify 통과,
 Reviewer blocking issue 해소, dependency 충족과 사용자 PR Merge가 필요하다.
+
+## 공통 verify 연결
+
+프로젝트가 `scripts/verify.json`으로 선택한 adapter·환경과 [공통 verify 계약](VERIFY.md)을
+적용한다. 미연결 프로젝트는 기존 검증을 유지하고 연결 오류를 fallback이나 필수 검증 생략으로
+우회하지 않는다. 전체 verify는 Manager가 Agent 밖에서 실행한다.

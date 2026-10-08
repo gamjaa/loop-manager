@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import shutil
 import subprocess
+import sys
 
 from loop_manager_internal.verification.coordination import VerifyCoordinator, descendant, settings
 from loop_manager_internal.verification.timing import EventWriter, atomic_json, diagnostic, phase
@@ -24,6 +25,11 @@ def run(effects, arguments, worktree, timeout, *, launch=None):
         directory.mkdir(parents=True, exist_ok=True)
         writer = EventWriter(directory / "manager.jsonl")
         environment = dict(os.environ, LOOP_MANAGER_VERIFY_LOG_DIR=str(directory),
+                           LOOP_MANAGER_VERIFY_RUNNER=str(Path(__file__).with_name("entrypoint.py").resolve()),
+                           LOOP_MANAGER_VERIFY_RUNTIME_PYTHON=sys.executable,
+                           LOOP_MANAGER_VERIFY_VERSION="1",
+                           LOOP_MANAGER_VERIFY_TIMEOUT=str(timeout),
+                           LOOP_MANAGER_VERIFY_PROJECT_ROOT=str(Path(worktree).resolve()),
                            PYTHONIOENCODING="utf-8",
                            LOOP_MANAGER_VERIFY_PARALLELISM=str(context.cap if context else "auto"),
                            LOOP_MANAGER_VERIFY_ENDPOINT=json.dumps(coordinator.endpoint),
@@ -141,7 +147,12 @@ def observe_isolated_compile(worktree, script, arguments, environment):
         return InputObservation(None, reason='unconfirmed script contract')
     if not (worktree / 'src').is_dir() or (worktree / 'src').is_symlink():
         return InputObservation(None, reason='unconfirmed source directory')
-    if (worktree / 'loop_manager_internal/verification/runner.py').is_file():
+    from loop_manager_internal.verification.contract import load, ContractError
+    try:
+        connected = load(worktree) is not None
+    except ContractError as error:
+        return InputObservation(None, reason=f"invalid verify connection: {error}")
+    if connected:
         return InputObservation(None, reason='unconfirmed coordinated runtime environment')
     # Native loader hooks would add executable dependencies outside this probe.
     if any(key.startswith(('LD_', 'DYLD_')) for key in environment):

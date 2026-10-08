@@ -108,6 +108,7 @@ PR 생성은 완료가 아니다. 같은 PR의 실제 Merge를 확인한 뒤 완
 
 ## 상세 문서
 
+- [공통 verify](docs/VERIFY.md): 선택 선언·단독 호출·unittest 지원과 adapter 계약
 - [운영 안내](docs/OPERATIONS.md): 인증·설정·등록·수동 제출·복구·verify 진단
 - [PRODUCT](docs/PRODUCT.md): 제품 동작·상태·완료 조건
 - [ARCHITECTURE](docs/ARCHITECTURE.md): 책임·저장·실행 격리·복구·지침 snapshot

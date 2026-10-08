@@ -111,6 +111,10 @@ class VerifyCoordinator:
             if owner is None or not secrets.compare_digest(owner["secret"], secret):
                 raise RuntimeError("verify 통신 인증 실패")
             if operation == "acquire":
+                for key in ("run_id", "unit_id"):
+                    value = data.get(key)
+                    if value is not None and (not isinstance(value, str) or not value):
+                        raise RuntimeError("verify unit identity 형식 오류")
                 if owner["require_guard"] and owner["guard"] is None:
                     return {"granted": False, "reason": "verify 모체 소유권 확인 대기"}
                 token = data.get("token")
@@ -158,6 +162,10 @@ class VerifyCoordinator:
                         self.reservations[token] = {"session": session, "active": True, "at": now,
                                                     "bytes": memory, "pid": None, "identity": None,
                                                     "uncertain": False, "born_at": now}
+                    for key in ("run_id", "unit_id"):
+                        value = data.get(key)
+                        if value is not None:
+                            self.reservations[token][key] = value
                     reply["token"] = token
                 return reply
             token = data.get("token")

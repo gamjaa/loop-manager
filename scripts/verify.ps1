@@ -25,7 +25,16 @@ try {
     } else {
         $pythonCommand = 'python'
     }
-    & $pythonCommand @pythonArguments -u -m loop_manager_internal.verification.runner
+    if ($env:LOOP_MANAGER_VERIFY_RUNNER) {
+        if (!(Test-Path -LiteralPath $env:LOOP_MANAGER_VERIFY_RUNNER) -or !$env:LOOP_MANAGER_VERIFY_RUNTIME_PYTHON -or !$env:LOOP_MANAGER_VERIFY_VERSION) {
+            throw 'Manager verify runner, runtime Python or version is missing'
+        }
+        $projectPython = & $pythonCommand @pythonArguments -c 'import sys; print(sys.executable)'
+        if ($LASTEXITCODE -ne 0) { throw 'Project Python lookup failed' }
+        & $env:LOOP_MANAGER_VERIFY_RUNTIME_PYTHON -u $env:LOOP_MANAGER_VERIFY_RUNNER --protocol-version $env:LOOP_MANAGER_VERIFY_VERSION --project-python $projectPython --timeout $env:LOOP_MANAGER_VERIFY_TIMEOUT
+    } else {
+        & $pythonCommand @pythonArguments -u -m loop_manager_internal.verification.runner --protocol-version 1
+    }
     $verifyExitCode = $LASTEXITCODE
 } finally {
     [Console]::OutputEncoding = $previousEncoding

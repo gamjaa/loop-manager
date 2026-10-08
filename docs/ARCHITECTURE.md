@@ -398,6 +398,16 @@ PR 없는 게시 checkpoint의 Review 횟수 차단을 rebase 없이 해제할 �
 
 등록 프로젝트 scheduler는 worker connection에서 DDL 없이 pending 요청을 접수 시각·삽입 순서로 읽고 실행 가능한 첫 요청을 선택한다. 즉시 명령 실행도 같은 선택을 적용해 앞선 실행 가능 요청이 있으면 자기 요청은 대기로 보존한다. 선택한 범위가 실행 가능하면 같은 executor에 저장된 요청 identity·계획 범위와 현재 설정, 공유 Planner mutex·verify coordinator·runtime mutation·단계 알림 경계를 전달한다. 앞선 요청이 다른 실행 소유자 때문에 대기하면 뒤의 실행 가능한 요청을 선택하고, 그런 요청도 없으면 일반 project runner를 호출하며 대기 요청은 보존한다. 프로젝트별 한 번의 scheduler 방문에서는 선택한 요청 하나를 처리한다. executor는 즉시 실행과 지연 실행의 결과·제한 재검사 소비를 동일하게 기록하며 완료한 요청은 다시 처리하지 않는다.
 
+## 공통 verify 실행 경계
+
+`verification/contract.py`가 `scripts/verify.json`의 version·정적 adapter registry·프로젝트 interpreter·수집 옵션·순서 있는 단계를 검증한다. `result_validation.verify`는 선언 부재만 기존 경로로 실행하고 잘못된 선언은 실패로 반환한다. `manager_adapter`는 고정 runtime의 Python·절대 진입점·protocol version·run/session·timeout과 기존 인스턴스 coordinator를 launcher에 전달한다. launcher는 프로젝트 interpreter를 선택한다. standalone도 같은 `entrypoint.py`와 선언을 사용하며 로컬 관측만 조율한다.
+
+`runner.py`는 단계 순서를 유지한다. `core.py`는 도구별 결과 validator·worker IPC 경계를 받아 기존 자원 배정·예약·프로세스 시작·재사용·종료 확인을 수행하며 unittest 타입이나 자체 compile 경로를 소유하지 않는다. 수집과 직렬 command도 예약·전체 timeout을 적용한다. `unittest_adapter.py`는 프로젝트 interpreter의 discovery/`load_tests`·재수집·fixture·native reporter와 명시한 Python compile 범위를 소유한다. 자식 import와 Python 경로는 후보 worktree를 선택하며 Manager runtime 패키지가 후보 코드를 대신하지 않는다.
+
+manifest·이벤트·결과는 version·run·단계·단위/테스트 identity를 결합하고 adapter가 예상 범위·fixture skip 근거·결과 완결성을 대조한다. command 종료 코드는 필수 단계 결과이며 테스트별 결과를 합성하지 않는다. 예약은 session·단위·PID/시작 identity에 결합하고 확인된 종료/미시작만 회수한다. 중단 자료와 종료 불명 예약 journal을 보존하고 다른 run은 제어하지 않는다. 단계별 이벤트를 전체 진단에 집계하며 외부 runtime·의존성·동적 입력이 미확인인 연결은 성공 재사용 근거를 제공하지 않는다.
+
+선언·호출·지원 근거와 adapter 적합성/추가 경계는 [VERIFY.md](VERIFY.md)가 소유한다. 역할별 정적 규칙은 기존 common+해당 역할의 고정 원본 묶음으로 전달하고, 작업 prompt는 선택 선언·지원 버전·참조 문맥만 연결한다. 언어별 지침 사본이나 새로운 배포·snapshot 경계는 만들지 않는다.
+
 ## 검증과 재시도
 
 - Worker는 구현과 관련 targeted unit test를 작성하고, 수정 범위에 직접 관련된 최소 unit test command만 실행한다

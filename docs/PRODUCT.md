@@ -41,7 +41,7 @@
 - 제품 문서는 동작과 장기 규칙, Requirement는 원하는 변화와 Acceptance Criteria, ExecPlan은 구현 계획을 기록한다. 자동 수정 권한은 각 문서의 기존 예외로 제한한다.
 - ExecPlan ID는 계획과 실행 이력을 연결하는 안정적인 식별자다. 실행 상태의 원본은 SQLite이며 문서에 상태를 기록하지 않는다.
 - 자동 작업은 최신으로 검증한 `origin/<base-branch>`를 기준으로 한다. 기본 worktree의 로컬 변경·commit은 보존하고 자동 입력에 포함하지 않는다.
-- 실행 중인 변경 작업은 새 계획 입력이 선점하지 않는다. 명세·전체 계획 입력 변경은 다음 안전한 선택 경계에서 반영한다.
+- 실행 중인 변경 작업은 다른 작업이 선점하지 않는다. 현재 작업에 적용되는 문서 변경은 각 단계 진입 전에 반영하며, 다른 작업의 선택은 기존 안전한 선택 경계를 따른다.
 - 같은 프로젝트의 변경 실행은 하나이며, 모든 선행 ExecPlan이 MERGED인 계획만 시작한다. 서로 다른 프로젝트는 `max_workers` 안에서 병렬 처리한다.
 - Agent는 선택된 관리 worktree와 역할별 허용 범위에서만 작업한다. 불확실한 소유권이나 실제 범위 위반은 자동으로 허용하지 않는다.
 - 실패·중단·차단 시 작업물·session·진단을 보존한다. 원인과 안전 조건이 실제로 해소된 작업만 재개한다.
@@ -64,7 +64,10 @@
 | Merge 대기 PR이 없는 due 리팩터링의 우선 처리 | [R-054](requirements/archive/%5BR-054%5D%20Due%20Refactoring%20Priority.md) |
 | 이벤트 시점의 진행·사용자 조치 알림과 무음 구분 | [R-053](requirements/%5BR-053%5D%20Timely%20Progress%20Notifications.md) |
 | 테스트별 시간·실제 Agent 없는 테스트·안전한 Python 캐시 | [R-058](requirements/archive/%5BR-058%5D%20Test%20Timing%20and%20Agent-Free%20Test%20Execution.md), [R-059](requirements/%5BR-059%5D%20Safe%20Python%20Bytecode%20Cache%20Use.md) |
-| 규칙 기반 작업의 Manager 처리·모델 호출과 입출력 감소·동일 입력 성공 결과 재사용 | [R-063](requirements/archive/%5BR-063%5D%20Manager-Owned%20Deterministic%20Work%20and%20Minimal%20Model%20Use.md) |
+| 규칙 기반 작업의 Manager 처리·모델 호출과 입출력 감소 | [R-063](requirements/archive/%5BR-063%5D%20Manager-Owned%20Deterministic%20Work%20and%20Minimal%20Model%20Use.md) |
+| 실제 검증 입력만의 목록·문서 원본을 고정 샘플로 대체·일반 verify와 후보 성공 결과 재사용 | [R-072](requirements/%5BR-072%5D%20Reuse%20Successful%20Candidate%20Results%20with%20Proven%20Inputs.md) |
+
+R-055의 공통 Git 변경 목표는 정상 fetch·legacy 기본 checkout 제외·BLOCKED 수동 입력 수용·로컬 수용과 게시 분리를 포함한다. 이 잔여 교정은 아직 구현 완료로 취급하지 않으며 G-199·G-189에서 확인한다. R-056은 dirty FF-only·clean rebase, R-082는 단계별 원격 문서 갱신을 담당한다.
 
 R-023의 원격 실행·self handoff 목표는 유지하며 로컬 갱신 gate는 R-056, 역할별 파일 권한은 R-061을 따른다. R-055의 planning 오류와 R-061의 유효한 draft 사용자 판단 대기는 구분한다. draft는 planning 오류가 아니며 독립 작업을 막지 않지만 프로젝트 완료와 관련 Requirement archive를 허용하는 완료 상태도 아니다.
 
@@ -113,7 +116,7 @@ R-023의 원격 실행·self handoff 목표는 유지하며 로컬 갱신 gate�
 
 1. 저장된 작업과 대기 PR을 확인한다. 안전 조건이 허용한 Merge·Close 반영을 먼저 수행하고, 최신 원격 입력과 catalog를 확인한다.
 2. 기존 변경 작업과 확정 PR 충돌 복구를 우선한다. 유지보수·일반 Planner·READY 선택은 아래 작업 선택 정책을 따른다.
-3. Planner가 현재 명세·코드·compact catalog와 허용된 미착수 READY snapshot을 확인한다. 새 작업을 계획하고 허용된 기존 계획만 조정한다.
+3. Planner가 현재 명세·코드·compact catalog와 허용된 PR 전 계획 snapshot을 확인한다. 새 작업을 계획하고 허용된 기존 계획만 조정한다.
 4. 프로그램이 범위·형식·source·의존성을 검증하고 계획을 원격 base에 게시한다. 원격 게시를 확인한 결과만 실행 대상으로 반영한다.
 5. dependency를 충족한 READY 하나를 선택해 전용 branch·worktree에서 Worker를 실행한다. Worker는 구현·관련 테스트와 verify 스크립트를 준비하며 Requirement를 이동하지 않는다.
 6. 프로그램이 Worker 결과를 검증하고 최신 base를 반영한다. 최종 후보의 전체 검증과 읽기 전용 Review를 수행하며 실패는 같은 작업에서 교정한다.
@@ -160,6 +163,8 @@ Worker·Reviewer·Planner·모듈 검토 결과의 명확한 marker 배치·구�
 
 PR 없는 게시 checkpoint의 과거 Review 횟수 차단은 현재 게시 소유권과 작업 범위를 재검증해 해당 원인만 해제한다. 이 복구는 수행하지 않은 rebase의 완료 증거를 만들지 않으며, 남은 Review issue와 다른 차단은 보존한다.
 
+게시 OID가 남았지만 재개 표식이 없는 작업도 동일 계획·branch·관리 worktree와 현재 게시 identity·tree·계보·실제 원격 lease·PR 상태를 재검증해 안전하게 재개한다. 현재 checkpoint 요청이 local-only여도 충분한 과거 게시 영수증은 읽기 전용으로 사용할 수 있다. 새 원인의 차단은 낡은 재개 표식을 무효화하되 게시 이력을 보존한다. 게시 소유권 오탐만 해제하며 미해결 Worker 실패와 별도 차단·승인·Agent 위반은 유지한다. OID 삭제나 로컬·원격 HEAD 일치만으로 검사를 우회하지 않는다.
+
 외부 CLI 실패:
 - 실행 실패, timeout 또는 일시적 외부 오류는 현재 프로그램 실행에서 최대 3회까지 재시도한다
 - 3회 재시도 후에도 실패하면 상태와 작업 공간을 보존하고 해당 프로젝트 처리를 이번 실행에서 중단한다
@@ -179,6 +184,8 @@ PR 없는 게시 checkpoint의 과거 Review 횟수 차단은 현재 게시 소�
 2. 저장된 원인과 현재 입력·작업 상태를 대조한다. 같은 입력의 실패를 반복하지 않으며 다른 계획·planning·사용자 결정의 차단을 함께 해제하지 않는다.
 3. 일반적인 입력·승인·PR reopen 해제는 해당 계획의 재시도·실패 지문과 Worker level을 초기화해 READY 또는 PR_OPEN으로 되돌린다. 원격 복구는 기존 session·실패·승격 감사를 보존한다.
 4. 후보가 바뀐 작업은 유효한 Worker·targeted test·전체 verify·Review 근거를 다시 확인한다. 아래의 충돌 없는 rebase·동일 verify 입력 예외 외에는 필요한 단계를 다시 수행한다. 첫 PR도 최종 검증과 Review 성공 뒤에만 생성한다.
+
+표식 없는 게시 checkpoint도 현재 repository·계획·branch·worktree·요청과 게시 identity/tree·실제 원격 lease·PR을 재검증해 재개할 수 있다. 요청 교체는 이전 게시 영수증을 역사 기록으로 보존하며 local-only 현재 결과를 과거 성공으로 덮지 않는다. 증명 저장과 해당 소유권 오탐 해제는 원자적으로 확정하고 별도 Worker 실패·승인·차단·session은 유지한다. 소유권 확인은 검증 성공을 대신하지 않는다.
 
 현재 상태 기반 rebase 판정, checkpoint lease, 진단 ref와 중단 복구의 상세 조건은 [ARCHITECTURE.md](ARCHITECTURE.md#차단-작업의-원격-반영과-보존)를 따른다.
 
@@ -257,7 +264,7 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 
 - source와 dependency 변경은 같은 reconciliation 결과를 Requirement 판단 자격·입력 지문·READY 선택에 사용하고 priority 변경은 다음 선택부터 반영한다. complexity·risk 변경은 최초 Worker level을 다시 계산하되 실행 이력이 있는 계획의 effective level과 Review 승격 이력을 낮추지 않는다
 - 현재 path와 title은 compact catalog, 로그·알림과 이후 파일 조회에 사용하지만 기존 PR의 ExecPlan 링크는 최초 게시 SHA와 최초 active path를 계속 사용한다
-- 최초 또는 비교 가능한 전체 계획 성공 기준이 없거나, PRODUCT·활성 Requirement·ARCHITECTURE·사용자 active ExecPlan이 바뀌면 일반 Planner를 READY 선택보다 먼저 실행한다. 일반 Planner는 비종료 compact catalog와 미착수 READY snapshot으로 현재 식별 가능한 미충족 작업을 한 번에 계획한다
+- 최초 또는 비교 가능한 전체 계획 성공 기준이 없거나, PRODUCT·활성 Requirement·ARCHITECTURE·사용자 active ExecPlan이 바뀌면 일반 Planner를 READY 선택보다 먼저 실행한다. 일반 Planner는 비종료 compact catalog와 PR 전 계획 snapshot으로 현재 식별 가능한 미충족 작업을 한 번에 계획한다. 실행 이력이 있어도 PR 전이면 같은 ID로 개정하며 작업물·세션·실패·Worker level 이력을 보존한다. PR 등록 후 Merge 대기 작업의 추가·변경 요구사항은 새 ExecPlan으로 작성한다
 - 일반 Planner는 마지막으로 원격 적용한 성공 검토와 비교 가능한 경우 변경·삭제·rename과 현재 catalog부터 확인한다. 영향받은 명세 절·코드·테스트·계획과 dependency를 읽고 불확실하면 범위를 넓힌다. 비교 근거가 없거나 손상되면 활성 명세 전문을 확인하며, 매 변경 검토에서 무관한 문서 전문을 반복하지 않는다
 - 문서·지침·active ExecPlan은 그대로이고 코드·테스트·설정만 바뀌면 수정 가능한 미착수 READY를 읽기 전용 점검 Planner가 먼저 확인한다. dependency 대기 READY도 포함하며 실행 이력·소유 증거가 있는 계획은 대상에서 제외한다. 대상이 없으면 일반 Planner가 위 비교 기준에 따라 미충족 작업을 확인한다
 - 점검의 수정 불필요 결과는 같은 입력과 대상에서 재사용하고 일반 Planner 없이 기존 READY 선택을 이어간다. 수정 필요·판단 불확실은 근거와 대상을 일반 Planner에 인계한다. 점검 성공은 예정 작업의 유지 가능성만 확인하며 전체 계획·유지보수 성공 기준이나 프로젝트 완료를 확정하지 않는다
@@ -278,7 +285,7 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 - 자동 작업의 기준은 `origin/<base-branch>`다
 - 기본 worktree의 로컬 변경, checkout branch와 ahead·diverged 이력은 자동 작업을 막지 않으며 local-only 내용은 자동 입력에 포함하지 않는다
 
-- 기본 worktree는 equal이면 무변경, ahead이면 보존·skip, behind이면 disjoint 로컬 변경과 index·ignored 파일을 보존하는 safe fast-forward로 처리한다. clean diverged의 확인된 선형 로컬 commit은 durable intent 아래 원격 base 위로 rebase하며 자동 push하지 않는다. dirty 작업·merge commit·겹치는 ignored 경로·사용자 operation·소유권 불확실은 보존·skip한다. 실패·중단에서 소유 작업과 실제 ref·index·파일이 일치할 때만 복구하고 동일 입력의 실패 Git 쓰기를 반복하지 않는다.
+- 기본 worktree는 equal이면 무변경, ahead이면 보존·skip, behind이면 disjoint 로컬 변경과 index·ignored 파일을 보존하는 safe fast-forward로 처리한다. clean diverged의 확인된 선형 로컬 commit은 durable intent 아래 원격 base 위로 rebase하며 자동 push하지 않는다. dirty 작업·merge commit·겹치는 ignored 경로·사용자 operation·소유권 불확실은 보존·skip한다. 시작 ignore 규칙으로 증명된 index-free 파일의 생성·수정·삭제만으로 정상 완료·실행 직전 검사·중단 복구를 거부하지 않는다. Git 쓰기 직전에는 현재 경로 충돌을 다시 확인하며 파일을 삭제·복원해 우회하지 않는다. 복구는 실제 ref·HEAD·index·권위 있는 파일·operation 전이와 소유 증거가 맞을 때만 완료하고 동일 입력의 실패 Git 쓰기를 반복하지 않는다. 과거 기록의 시작 규칙이나 소유 증거가 부족하면 기록과 사용자 파일을 보존한다.
 - 자동 명령의 bootstrap은 process lock 아래 등록된 self base(미등록이면 `main`)의 원격 SHA를 확정하고 그 revision의 bootstrap·runtime을 같은 실행에서 시작한다. source HEAD·branch·동기화 성공은 실행 조건이 아니며 로컬 코드를 실행 입력으로 사용하지 않는다. source 기준 절대 config 경로·interpreter·인자를 전달하고 자식 종료까지 부모 lock을 유지한다. 원격 revision·runtime 소유권 검증 실패는 보존·진단하며 로컬 HEAD나 오래된 코드로 대체 실행하지 않는다.
 - runtime의 Python bytecode 캐시는 선택 source·revision·interpreter에 맞는 표준 Python 캐시로 재사용한다. 기본 캐시는 일회성 runtime worktree 밖에 두며 source checkout의 ignored 파일은 runtime 입력이 아니다. 캐시 생성·갱신·부재·손상·쓰기 실패는 현재 원본 실행과 Git 범위 판정을 바꾸지 않고, 사용자가 명시한 bytecode 비활성화나 캐시 경로 선택을 존중한다.
 
@@ -339,7 +346,8 @@ Loop Manager runtime에서만 읽는 `docs/AGENTS.*.md`와 저장소 밖 Manager
 - Merge 대기 PR이 있으면 새 유지보수 평가는 보류한다. 독립 계획의 PLAN_BLOCKED 자체는 단계별 유지보수 평가를 막지 않으며, PROJECT_BLOCKED와 현재 변경 실행·공유 안전 gate는 유지한다.
 - 같은 프로젝트에 여러 READY ExecPlan이 대기할 수 있다
 - 같은 프로젝트에서는 IMPLEMENTING, VERIFYING, REVIEWING, PUBLISHING 또는 PR 충돌 복구 중인 ExecPlan 하나만 현재 변경 실행으로 둔다. `PLAN_BLOCKED`와 충돌 복구 중이 아닌 `PR_OPEN`은 이 자리를 점유하지 않는다
-- 새 계획 입력은 실행 중인 작업을 선점하지 않는다. 문서·지침·사용자 active ExecPlan 변경은 다음 안전한 선택 경계에서 일반 Planner로, 코드 전용 변경은 수정 가능한 READY가 있으면 점검 Planner로 READY 시작 전에 반영한다
+- 새 계획 입력은 실행 중인 작업을 다른 작업으로 선점하지 않는다. Worker·Manager verify·Reviewer 진입 전 최신 원본·작업 branch를 확인해 기존 규칙으로 rebase한다. 현재 ExecPlan·연결 Requirement·적용 상위 명세 변경은 해당 경계에서 현재 작업에 반영한다. 무관한 문서 변경은 현재 단계를 계속하며, 코드 변경의 충돌 복구·검증 무효화와 증명된 결과 재사용 규칙은 유지한다
+- Worker는 최신 작업 문서를 입력으로 구현한다. verify 직전에는 구현 보완이 필요한 경우만 Worker로 돌아간다. Reviewer 직전의 관련 문서 변경은 최신 문서·구현·과거 verify가 확인한 범위와 미검증 조건으로 Review를 먼저 진행하며, 구현 부족은 Worker 교정으로, 검증 근거 부족은 Manager 검증 보완으로 연결한다. 이전 문서 기준의 PASS와 선행 Review를 최신 조건의 검증·게시 승인으로 사용하지 않는다
 - READY ExecPlan은 모든 `depends_on`이 MERGED이고 다른 현재 작업이 없을 때만 시작한다
 - dependency를 충족하지 못한 READY만 남아도 변경 입력에 해당하는 Planner 역할을 한 번 실행하고, 확인 기준과 입력·대상이 같으면 대기한다
 - 제품 우선순위는 안전한 무인 실행을 막거나 반복적인 사용자 복구를 요구하는 작업, 정상 경로의 사용자 개입을 제거하는 핵심 자동화, 그 밖의 Current Goal, 선택적 편의와 최적화 순이다
@@ -362,6 +370,7 @@ Loop Manager runtime에서만 읽는 `docs/AGENTS.*.md`와 저장소 밖 Manager
 - 기존 활성 cycle을 먼저 복구·완료하고 과거 성공 이력은 유지한다. 새 평가는 최신 원격 입력을 정적으로 확인해 모델 없는 `fast`, 영향받은 모듈의 `targeted`, 전체 모듈의 `full` 점검 중 필요한 범위를 선택한다.
 - 첫 전체 정밀 점검은 초기 입력에서 수행한다. 이후에는 직전 cycle 정상 종료 시 마지막 유지보수 Merge까지 포함한 MERGED 수에서 `refactoring_review_interval`만큼 증가하거나 새 명시적 요청이 있을 때 시작한다. 설정은 양의 정수이며 기본값은 20이다. 활성 작업·실제 Open PR·프로젝트 안전 gate를 확인한 뒤 due 평가를 일반 Planner·빠른 점검·READY보다 먼저 수행한다.
 - 한 번의 평가에서 모듈 묶음 검토·필요한 종합을 수행하고 발견을 새 계획·기존 비종료 계획·근거 있는 제외에 연결해 prerequisite·리팩터링과 필요한 dependency closure를 확정한다. prerequisite Merge나 개선 결과로 새 평가를 시작해 범위를 늘리지 않는다. 주기 전 코드 영향·평가 receipt와 최신 원본의 차이·완료 후보는 자동 평가의 시작 조건이 아니다.
+- 유지보수 Planner는 필요한 선행과 리팩터링 DAG를 판단한다. Manager는 새 리팩터링 DAG의 모든 말단을 필요한 선행 dependency closure 밖의 적격 READY snapshot에 추가한다. 이 편집은 기존 dependency 순서와 계획 본문·metadata를 보존하며, 실행 이력·소유권·PR이 있거나 cycle·snapshot 범위 밖인 계획에는 적용하지 않는다.
 - 원본에 결합된 성공 모듈 검토는 해당 묶음의 입력이 같을 때 재사용한다. 검토에서 발견이 없고 일반 계획을 함께 수행할 필요도 없으면 별도 종합·계획 호출을 하지 않는다. 발견이 있으면 새 계획·기존 비종료 계획·근거 있는 제외에 연결해 처리한다.
 - 리팩터링은 동작·공개 계약·저장 형식을 보존한다. 각 계획의 targeted test·전체 verify·Review·사용자 Merge를 유지하고 확정 범위가 모두 실제 MERGED인 뒤 종료한다. 계획 없음·기존 계획 연결·근거 있는 제외도 검증·필요한 게시 뒤 종료한다.
 - 평가 성공 원본과 cycle 종료 cadence는 별도로 보존한다. 수정 뒤 검토하지 않은 원본의 receipt를 합성하지 않는다. 명시 요청은 cycle 시작에 identity를 결합해 한 번 소비하며 활성 cycle 중 새 요청은 다음 안전한 경계까지 보존한다. 중단·원본 변경은 같은 cycle의 미완료 게시와 필요한 관련 근거만 재검증한다.
@@ -388,6 +397,11 @@ Loop Manager runtime에서만 읽는 `docs/AGENTS.*.md`와 저장소 밖 Manager
 - effective level과 level별 Review 승격 이력은 SQLite에 저장하고 새 ExecPlan 또는 정상적인 BLOCKED 해제에서 최초 level로 초기화한다
 
 ### PR 생성과 Merge 후 정리
+
+- 시작 ignore 규칙으로 증명된 index-free ignored 파일의 생성·수정·삭제는 Planner·Worker·Reviewer·Manager verify의 scope 오류나 planning 오류의 단독 원인이 아니다. tracked·staged·non-ignored 파일과 index flag·사용 Git 자원의 보호는 유지한다.
+- Worker targeted test → Manager verify → Reviewer는 같은 ExecPlan worktree에서 이어간다. ignored 확장자 allowlist·원상 복원 의무·별도 검증 worktree를 추가하지 않는다. 활성 ignored 파일과 들어오는 tracked 경로가 겹치면 파일을 보존하고 해당 Git 쓰기만 보류한다.
+- 저장된 ignored-only 오탐은 시작 규칙·역사 결과·현재 소유권과 권위 상태를 검증해 기존 session·결과·단계에서 재개한다. 실제 위반·증거 부족·새로 숨긴 경로·강제 stage·독립 차단은 이 규칙으로 해제하지 않는다.
+- 정상 종료한 정확한 Manager 소유 planning/ExecPlan worktree는 ignored-only 상태에서도 전체 수명을 종료할 수 있다. 기본 checkout·소유권 불명·미게시 commit·권위 변경은 보존하며 활성 artifact를 임의로 삭제하지 않는다.
 
 - Worker는 현재 환경의 전체 검증 스크립트를 생성·유지하고, 프로그램이 Agent 밖에서 실행한다.
 - Loop Manager 자체 verify는 동일한 unittest manifest와 fixture 계약을 직렬·프로세스 병렬 모드에서 유지하고 전체 compile을 포함한다. 실제 Agent 실행을 테스트 경계에서 차단하며 테스트·fixture·대기·정리의 시간과 중단 진단을 성공 stdout과 분리해 보존한다.

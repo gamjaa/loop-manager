@@ -15,7 +15,7 @@ from unittest import mock
 
 from loop_manager_internal.config.managed_config import load_managed_config, ManagedConfigError
 from loop_manager_internal.execution import verify_process, windows_job
-from loop_manager_internal.verification import guard, manifest, runner, manager_adapter
+from loop_manager_internal.verification import guard, manifest, runner, manager_adapter, unittest_adapter
 from loop_manager_internal.verification.coordination import execution_settings
 from loop_manager_internal.execution.validation_feedback import MAX_DIAGNOSTIC, format_verify_failure
 from loop_manager_internal.verification.timing import (
@@ -603,7 +603,7 @@ class RunnerPoolTests(unittest.TestCase):
                        "pattern": expected.pattern, "directory": directory, "worker": 0, "result": str(root / "result.json")}
             stderr = io.StringIO()
             with mock.patch.dict(sys.modules, {module.__name__: module}), mock.patch.dict(os.environ), mock.patch.object(
-                runner, "install_guard"), mock.patch.object(runner, "process_memory", return_value=None), mock.patch.object(
+                unittest_adapter, "install_guard"), mock.patch.object(unittest_adapter, "process_memory", return_value=None), mock.patch.object(
                 sys, "platform", "win32"), mock.patch.object(sys, "path", list(sys.path)), mock.patch.object(
                 sys, "stdin", io.StringIO(json.dumps(request) + "\n")), mock.patch.object(sys, "stderr", stderr):
                 self.assertEqual(runner.worker_main(), 0)
@@ -681,6 +681,11 @@ class ManagerAdapterTests(unittest.TestCase):
             coordinator.close.assert_not_called()
             environment = effects.run_verify_process.call_args.kwargs["environment"]
             self.assertEqual(environment["LOOP_MANAGER_VERIFY_PARALLELISM"], "2")
+            self.assertEqual(environment["LOOP_MANAGER_VERIFY_VERSION"], "1")
+            self.assertEqual(environment["LOOP_MANAGER_VERIFY_RUNTIME_PYTHON"], sys.executable)
+            self.assertEqual(environment["LOOP_MANAGER_VERIFY_PROJECT_ROOT"], str(root.resolve()))
+            self.assertTrue(Path(environment["LOOP_MANAGER_VERIFY_RUNNER"]).is_absolute())
+            self.assertEqual(environment["LOOP_MANAGER_VERIFY_TIMEOUT"], "20")
             diagnostic = format_verify_failure(str(output), exit_code=1)
             self.assertIn("FAILED: failed_case", diagnostic)
             self.assertIn("[VERIFY_DIAGNOSTIC]", diagnostic)

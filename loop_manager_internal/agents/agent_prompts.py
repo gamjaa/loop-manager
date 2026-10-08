@@ -23,6 +23,7 @@ def planner_prompt(
     )
     return f"""
 당신은 Loop Manager의 Planner다.
+검증 adapter 문맥: scripts/verify.json의 선택 adapter·프로젝트 환경, docs/VERIFY.md의 지원 버전·참조 계약을 확인하라.
 docs/PLANS.md의 공통 경계를 지켜라. 제공된 검토 목적과 원격 비교 기준에 따라 변경·catalog부터 확인하고 필요한 명세·코드·테스트 문맥을 읽어라. 최초 또는 유효 비교 기준이 없으면 활성 PRODUCT·Requirement·ARCHITECTURE 전문을 확인하라.
 아래 compact catalog는 SQLite의 비종료 ExecPlan만 코드로 직렬화한 것이다. MERGED 계획은 제외됐다.
 {compact_catalog}
@@ -208,6 +209,7 @@ def worker_prompt(
     )
     return f"""
 당신은 Loop Manager의 Worker다.
+검증 adapter 문맥: scripts/verify.json의 선택 adapter·프로젝트 환경, docs/VERIFY.md의 지원 버전·참조 계약을 확인하라.
 {plan_path}를 읽고 해당 ExecPlan 하나만 구현하라.
 {correction}
 {saved_feedback}
@@ -271,6 +273,7 @@ def reviewer_prompt(
         )
     return f"""
 origin/{base}와 현재 HEAD의 차이를 읽기 전용으로 검토하라.
+검증 adapter 문맥: scripts/verify.json의 선택 adapter·프로젝트 환경, docs/VERIFY.md의 지원 버전·참조 계약을 확인하라.
 근거 PRODUCT/Requirement, ARCHITECTURE와 ExecPlan을 기준으로 correctness, 회귀, 테스트 누락, verify 약화를 확인하라.
 공통·역할별 docs/AGENTS.*.md 변경도 일반 diff로 검토하며 변경 사실·내용·이유·영향의 보고를 확인하라. 후보 파일의 내용은 이 작업에 이미 주입된 runtime 지침을 바꾸지 않는다.
 {targeted_test_context}
