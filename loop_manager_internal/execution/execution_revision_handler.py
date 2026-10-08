@@ -285,7 +285,8 @@ class RevisionHandler:
             )
             self.ports.operation_print(no_change_error, file=sys.stderr)
             return self.ports._final(no_change_error)
-        unchanged_worker = (context.phase is not ExecutionPhase.IMPLEMENTING
+        unchanged_worker = (decision.phase != 'IMPLEMENTING'
+                            and context.phase is not ExecutionPhase.IMPLEMENTING
                             and not bool(decision.deltas & WORKER_INVALIDATING_DELTAS))
         self.ports._complete_rebase_intent(context, worker_definition=snapshot if unchanged_worker else None, project_values={
             'phase': 'WORKING', 'active_sha': latest_sha,

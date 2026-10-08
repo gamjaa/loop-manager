@@ -197,6 +197,43 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.assertFalse(observed.proven)
         self.assertIn('unconfirmed', observed.reason)
 
+    def test_production_ports_reuse_measured_contract_and_run_unknown_scripts(self):
+        import loop_manager
+        from loop_manager_internal.verification import manager_adapter
+        script = self.root / 'scripts/verify.sh'
+        script.write_bytes(manager_adapter.ISOLATED_COMPILE_SCRIPT)
+        (self.root / inputs.MANIFEST).write_text(json.dumps(
+            {'version': 1, 'paths': ['src/**', 'scripts/**']}))
+        self.state.update_project('repo', worktree=str(self.root))
+        production = loop_manager._ExecutionLifecyclePorts(
+            self.connection, self.repository, repo='repo', repo_path=Path('/repo'),
+            state_dir=Path('/state'), base='main', base_sha='base', provider='codex',
+            config_path=Path('/config'), newly_activated=False)
+        self.state = production.effects.state
+        self.handler.effects = replace(self.handler.effects, state=self.state,
+            validation=replace(self.handler.effects.validation,
+                observe_verify_inputs=production.effects.validation.observe_verify_inputs))
+        with mock.patch.dict('os.environ', {'PATH': '/usr/bin'}, clear=True), \
+                mock.patch.object(manager_adapter.subprocess, 'run',
+                    return_value=type('Result', (), {'stdout': 'a' * 64})()) as probe:
+            self.verify()
+            self.ready()
+            self.verify()
+            self.assertEqual(self.calls.count('verify'), 1)
+            self.assertEqual(self.receipts()[-1]['kind'], 'reuse')
+            self.assertTrue(probe.called)
+            self.assertEqual(probe.call_args.args[0][1:5], ['-I', '-S', '-B', '-c'])
+            probe.return_value.stdout = 'b' * 64
+            self.ready()
+            self.verify()
+            self.assertEqual(self.calls.count('verify'), 2)
+            script.write_bytes(manager_adapter.ISOLATED_COMPILE_SCRIPT + b'# custom command\n')
+            self.ready()
+            before = probe.call_count
+            self.verify()
+            self.assertEqual(self.calls.count('verify'), 3)
+            self.assertEqual(probe.call_count, before)
+
     def test_later_completeness_proof_does_not_promote_an_unproven_original_run(self):
         (self.root / 'excluded.json').write_text('outside')
         self.verify()
@@ -323,6 +360,31 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.handler.guard(self.context())
         self.assertEqual(self.state.row()['phase'], 'WORKING')
         self.assertIsNone(self.state.row()['worker_result'])
+
+    def test_clean_rebase_does_not_override_candidate_worker_invalidation(self):
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.handler.effects = replace(self.handler.effects, checkpoint=checkpoint)
+        current = checkpoint.get('repo', 'G-047')
+        checkpoint.record('repo', 'G-047', expected_generation=current.generation,
+            operation=None, expected_head='old-head', target_base_oid='base',
+            observed_remote_oid=None, snapshot={
+                'current_rebase_acceptance': {'head': 'old-head'},
+                'worker_candidate_token': self.definition.worker_candidate_token('old-head')})
+        self.remote = 'new-base'
+        self.handler.guard(self.context())
+        self.assertEqual(self.state.row()['phase'], 'WORKING')
+        self.assertIsNone(self.state.row()['worker_result'])
+        self.handler._complete_rebase_intent.assert_called_once()
+        self.assertIsNone(self.handler._complete_rebase_intent.call_args.kwargs['worker_definition'])
+
+    def test_clean_rebase_with_changed_source_requires_worker(self):
+        self.effects.revision.source_fingerprint.return_value = 'new-requirement-content'
+        self.remote = 'new-base'
+        self.handler.guard(self.context())
+        self.assertEqual(self.state.row()['phase'], 'WORKING')
+        self.assertIsNone(self.state.row()['worker_result'])
+        self.assertIsNone(self.handler._complete_rebase_intent.call_args.kwargs['worker_definition'])
 
     def test_waiver_is_not_recorded_as_an_actual_verify_success(self):
         manual = mock.Mock()

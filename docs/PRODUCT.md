@@ -392,9 +392,10 @@ Loop Manager runtime에서만 읽는 `docs/AGENTS.*.md`와 저장소 밖 Manager
 - 자체 verify의 `verify_parallelism`은 생략 시 `auto`, 양의 정수는 상한, `1`은 직렬이다. 실행량은 코드가 CPU 제한·실제 부하·메모리 여유와 미반영 예약으로 결정하며 등록 프로젝트 수로 고정 분할하지 않는다. 관측 실패는 직렬로 축소하고 자원 대기도 전체 timeout에 포함한다.
 - Manager 실행 인스턴스가 동시 verify의 확인·예약을 조율한다. 예약은 해당 자식 종료 또는 미시작을 확인한 뒤 해제하며 종료 불명은 보존한다. 기존 프로젝트 선택과 같은 프로젝트의 ExecPlan 동시 실행 정책은 유지한다. 과거 시간 자료는 현재 후보 검증을 대신하지 않는다.
 - 최종 후보에서 관련 targeted test와 전체 verify가 통과하고 Reviewer blocking issue가 없어야 한다.
-- Manager가 먼저 안전한 rebase를 시도한다. 충돌 없이 완료되고 구현 입력과 완료 Worker 결과가 같으면 SHA 변경만으로 Worker·완료한 targeted test를 반복하지 않는다. 별도 교정 사유, 충돌·미완료·과거 근거 부재는 기존 Worker/session 경로를 유지한다.
+- Manager가 먼저 안전한 rebase를 시도한다. 충돌 없이 완료되고 source 내용까지 포함한 구현 입력과 완료 Worker 결과가 같으면 SHA 변경만으로 Worker·완료한 targeted test를 반복하지 않는다. 현재 HEAD의 Worker 후보 확인 불일치나 별도 교정 사유, 충돌·미완료·과거 근거 부재는 기존 Worker/session 경로를 유지한다.
 - rebase 충돌 중 Progress 체크 상태와 명확한 기존 실행 결과만 바뀌고 구현 조건의 동일성이 증명되면 session·작업물·index·rebase 상태·retry·실패 감사를 보존해 해결을 이어간다. 절 이름만으로 목표·제약·검증 조건·사용자 결정을 제외하지 않으며 불확실한 기록이나 과거 원문 근거 부재는 기존 재확인·차단을 유지한다. 이 구분은 verify·Review 입력을 제외하지 않는다.
 - 같은 프로젝트·ExecPlan·작업 주기의 실제 전체 verify 성공과 파일 bytes·경로·종류·mode·목록·명령·환경·runtime·실제 Git/외부 입력의 지문이 같고 현재 후보에서 다시 확인되면 원래 run을 연결해 verify를 재사용한다. 목록 부재·오류·누락 의심, dirty/untracked 입력 변경, 미확인 동적·외부 입력과 유효한 성공 부재는 전체 verify를 실행한다. 일반 스크립트의 입력을 명령 문자열만으로 증명하지 않는다.
+- 운영 입력 증명 adapter는 고정된 격리 UTF-8 Python 문법 검증 계약을 지원한다. 해당 전체 verify 계약의 명령·프로젝트 입력·Python/stdlib/native runtime을 실제로 관측한 경우만 재사용하며, 임의 스크립트와 미지원 환경은 전체 실행을 유지한다. 정확한 계약과 지원 범위는 [ARCHITECTURE.md](ARCHITECTURE.md#verify-입력-관측과-생성-요청)에 둔다.
 - 새 verify 실행은 과거 성공의 재사용 자격을 먼저 무효화한다. 실행·재사용 판정 중 입력 변경, 새 실패, 저장 중단·경쟁과 다른 작업 주기의 결과로 현재 후보를 통과시키지 않는다. 생략은 새 invocation·성공 실행·미측정 절감량을 만들거나 실패 감사를 초기화하지 않는다. Review·게시 gate는 독립적으로 유지한다.
 - 구현 PR 게시에는 Requirement 전체 완료나 archive 이동을 강제하지 않는다. Requirement 이동은 별도 planning 게시에서 최신 판단·원문·목적지와 원격 base를 다시 확인한다.
 - 관리 rebase는 자동 Worker 해결과 사용자 수동 해결을 같은 현재 상태 기준으로 수용한다. 현재 소유권·범위·Git 상태·원격 기대값을 검증하며, 과거 turn·stage·receipt·journal 완전성을 완료 조건으로 요구하지 않는다.

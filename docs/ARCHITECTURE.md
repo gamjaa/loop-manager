@@ -329,7 +329,7 @@ Git·journal 파일·SQLite는 단일 원자 transaction이 아니다. 저장 in
 
 현재 rebase 정책은 작업 수행 이력을 필수 증거로 삼던 R-045 설계를 대체한다. 자동 Worker 교정과 사용자 수동 해결·stage·continue·완료를 같은 현재 상태 판정으로 다룬다. 과거 기록은 감사 자료로 보존하며 누락 자체를 거부 조건으로 사용하지 않는다.
 
-Worker 결과와 작업 범위를 확인한 뒤 최신 `origin/<base-branch>`를 fetch하고 소유 변경을 commit하여 필요한 rebase를 완료한 다음 게시 후보 HEAD에서 검증 근거와 Review를 판단한다. `RevisionHandler`·`LatestBaseHandler`의 정상 rebase 호출이 충돌 없이 완료되면 기존 구현 입력 token·archive token·완료 Worker 결과를 대조한다. 일치하는 결과만 현재 수용 HEAD의 `worker_candidate_token`에 checkpoint CAS와 runtime transaction으로 연결해 VERIFYING으로 이어간다. 구현 교정 중인 작업, 실제 조건 변경, 충돌·미완료·중단 뒤 수용에는 이 예외를 적용하지 않는다. 같은 게시 lease·중간 checkpoint 경계를 유지하며 verify·Review·publication은 독립적으로 무효화한다.
+Worker 결과와 작업 범위를 확인한 뒤 최신 `origin/<base-branch>`를 fetch하고 소유 변경을 commit하여 필요한 rebase를 완료한 다음 게시 후보 HEAD에서 검증 근거와 Review를 판단한다. `RevisionHandler`·`LatestBaseHandler`의 정상 rebase 호출이 충돌 없이 완료되면 source 내용 지문을 포함한 기존 구현 입력 token·archive token·완료 Worker 결과를 대조한다. 일치하는 결과만 현재 수용 HEAD의 `worker_candidate_token`에 checkpoint CAS와 runtime transaction으로 연결해 VERIFYING으로 이어간다. `decide_revision_gate()`가 현재 후보 확인 불일치 등으로 IMPLEMENTING을 요구하면 clean 완료도 그 판정을 유지한다. 구현 교정 중인 작업, 실제 조건 변경, 충돌·미완료·중단 뒤 수용에는 이 예외를 적용하지 않는다. 같은 게시 lease·중간 checkpoint 경계를 유지하며 verify·Review·publication은 독립적으로 무효화한다.
 
 definition snapshot에는 원래 ExecPlan 전문과 전체 body hash를 함께 보존한다. Worker body 비교는 Progress의 체크 상태만 정규화하고 Progress/Decision Log에서 다음 단독 실행 기록 형식만 분리한다(PASS 또는 FAIL, 날짜·명령·test 수는 실제 과거 사실).
 
@@ -543,7 +543,31 @@ generation, 실제 run·입력 관측·출력·결과와 reuse의 원래 run·�
 `ValidationEffects.observe_verify_inputs`는 실제 명령·유효 환경·runtime·Git/외부 identity를
 증명하는 실행 adapter의 관측 경계다. 기본 임의 프로젝트 스크립트 adapter는 해당 동적 입력을
 측정하지 못하므로 unknown으로 반환해 전체 verify를 계속 실행한다. 문자열 분석으로 의존성
-없음을 추정하거나 단순 tree/SHA cache로 대체하지 않는다. 증명된 관측만 같은 주기의 실제
+없음을 추정하거나 단순 tree/SHA cache로 대체하지 않는다.
+
+운영 port가 연결한 `result_validation.observe_verify_inputs`는 Linux에서
+`manager_adapter.ISOLATED_COMPILE_SCRIPT`와 전체 bytes가 같은 아래 계약도 지원한다.
+프로젝트가 이 명령을 전체 verify로 선택한 경우에만 적용한다. 실제 명령은 PATH에서 확인한
+Python 절대 경로로 `-I -S -B -c`와 같은 프로그램을 직접 실행하며 source를 실행하거나
+bytecode를 쓰지 않는다. 관측 목록이 제외하는 `.git`·`.venv`·`__pycache__` 아래 source도
+컴파일 대상에서 제외한다. 현재 자체 verify 스크립트와 필수 검증은 그대로 유지한다.
+
+```bash
+#!/usr/bin/env bash
+# loop-manager: isolated-compile-v1
+set -eu
+exec python3 -I -S -B -c 'from pathlib import Path; root = Path("src"); assert root.is_dir(); [compile(path.read_text(encoding="utf-8"), str(path), "exec") for path in root.rglob("*.py") if not {".git", ".venv", "__pycache__"}.intersection(path.relative_to(root).parts)]'
+```
+
+이 고정 계약은 프로젝트 import·site package·Git·네트워크를 사용하지 않는다. 별도 관측
+subprocess가 같은 격리 Python의 executable·sys.path runtime 파일·stdlib·실제 native library
+mapping의 bytes와 mode, Python flags·filesystem encoding·사용자·OS identity를 매번 측정한다.
+관측 프로그램 자체·실행 환경·cwd도 지문에 결합한다. manifest는 script와 src 입력을 모두
+포함해야 하고 입력 누락·symlink·관측 중 변경은 기존 불확실성 계약으로 거부한다. native loader
+hook, runtime 측정 불가/timeout, Linux 이외 환경 및 자체 runner의 추가 조율 환경은 unknown이다.
+임의 스크립트의 의미를 이 계약으로 추정하지 않으며 새 공통 runner를 필수로 요구하지 않는다.
+
+증명된 관측만 같은 주기의 실제
 성공 run과 비교하며 reuse 직전 transaction에서 다시 관측한다. Review·게시 revision gate도
 재사용 후보의 입력을 재관측하고 달라졌거나 관측할 수 없으면 VERIFYING으로 돌아간다.
 reuse는 verify 프로세스·validation 실행 감사·사용량을 새로 만들거나 실패 이력을 초기화하지

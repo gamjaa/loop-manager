@@ -216,7 +216,8 @@ def verify_arguments(worktree: Path):
         arguments = [executable or "pwsh", "-NoProfile", "-File", str(script)]
     else:
         script = worktree / "scripts/verify.sh"
-        arguments = ["bash", str(script)]
+        from loop_manager_internal.verification.manager_adapter import isolated_compile_arguments
+        arguments = isolated_compile_arguments(script, worktree) or ["bash", str(script)]
     return script, arguments
 
 
@@ -224,11 +225,14 @@ def observe_verify_inputs(worktree: Path):
     """Arbitrary scripts have unmeasured dynamic/Git/external dependencies.
 
     Never infer their absence from source spelling or a passing invocation.
-    An execution adapter with measured identities can supply the existing
-    observe_inputs contract instead; the default safely keeps full verify.
+    The exact isolated compile contract has a bounded, measured adapter.
+    Everything else keeps the existing full verify fallback.
     """
-    from loop_manager_internal.verification.manager_adapter import observe_inputs
-    _script, arguments = verify_arguments(worktree)
+    from loop_manager_internal.verification.manager_adapter import (
+        observe_inputs, observe_isolated_compile, isolated_compile_arguments)
+    script, arguments = verify_arguments(worktree)
+    if arguments == isolated_compile_arguments(script, worktree):
+        return observe_isolated_compile(worktree, script, arguments, dict(os.environ))
     return observe_inputs(worktree, arguments, environment=dict(os.environ),
                           runtime_identity=None)
 

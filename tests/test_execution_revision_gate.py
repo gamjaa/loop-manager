@@ -140,7 +140,7 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
         self.assertEqual(completed.review_token, snapshot.review_token('base', 'base'))
 
 
-    def test_source_revision_without_execplan_change_keeps_specification_artifacts(self):
+    def test_source_revision_without_execplan_change_invalidates_worker_but_keeps_sessions(self):
         guarded = self.handler.guard(self.context())
         self.assertNotIsInstance(guarded, handlers.ExecutionOutcome)
         snapshot = DefinitionSnapshot.deserialize(
@@ -166,12 +166,12 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
 
         outcome = self.handler.guard(self.handler._context())
 
-        self.assertNotIsInstance(outcome, ExecutionOutcome)
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
         row = self.state.row()
-        self.assertEqual(row['phase'], 'PUBLISHING')
-        self.assertEqual(row['worker_result'], 'worker-result')
-        self.assertEqual(row['verify_result'], 'verify-result')
-        self.assertEqual(row['review_result'], 'review-result')
+        self.assertEqual(row['phase'], 'WORKING')
+        self.assertIsNone(row['worker_result'])
+        self.assertIsNone(row['verify_result'])
+        self.assertIsNone(row['review_result'])
         self.assertEqual(row['worker_session_id'], 'worker-session')
         self.assertEqual(row['reviewer_session_id'], 'reviewer-session')
         self.assertEqual(row['branch'], 'loop-manager/G-047')

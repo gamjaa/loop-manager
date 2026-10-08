@@ -11,6 +11,76 @@ from loop_manager_internal.verification import inputs, manager_adapter
 
 
 class VerifyInputObservationTest(unittest.TestCase):
+    def test_measured_compile_ignores_only_unobserved_generated_directories(self):
+        from loop_manager_internal.verification.manager_adapter import _ISOLATED_COMPILE_PROGRAM
+        for directory in ('.git', '.venv', '__pycache__'):
+            target = self.root / 'src' / directory
+            target.mkdir()
+            (target / 'ignored.py').write_text('invalid syntax !')
+        (self.root / 'src/app.py').write_text('valid = 1')
+        with mock.patch('pathlib.Path', side_effect=lambda path: self.root / path):
+            exec(_ISOLATED_COMPILE_PROGRAM, {})
+            (self.root / 'src/app.py').write_text('invalid syntax !')
+            with self.assertRaises(SyntaxError):
+                exec(_ISOLATED_COMPILE_PROGRAM, {})
+
+    def test_measured_compile_runtime_hashes_interpreter_stdlib_and_native_libraries(self):
+        import contextlib
+        import io
+        import sys
+        from loop_manager_internal.verification.manager_adapter import _COMPILE_RUNTIME_PROBE
+        interpreter = self.root / 'python'
+        interpreter.write_bytes(b'interpreter')
+        library = self.root / 'native.so'
+        library.write_bytes(b'native')
+        original_read = Path.read_text
+        def read(path, *args, **kwargs):
+            if path == Path('/proc/self/maps'):
+                return f'001-002 r-xp 000 00:00 0 {library}\n'
+            return original_read(path, *args, **kwargs)
+        def identity():
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output):
+                exec(_COMPILE_RUNTIME_PROBE, {})
+            return output.getvalue().strip()
+        with mock.patch.object(sys, 'executable', str(interpreter)), \
+                mock.patch.object(sys, 'path', [str(self.root / 'src')]), \
+                mock.patch.object(sys, 'platform', 'linux'), \
+                mock.patch.object(Path, 'read_text', read):
+            first = identity()
+            self.assertEqual(len(first), 64)
+            self.assertEqual(identity(), first)
+            for file in (interpreter, self.root / 'src/app.py', library):
+                before = identity()
+                file.write_bytes(file.read_bytes() + b'changed')
+                self.assertNotEqual(identity(), before)
+
+    def test_measured_compile_command_and_uncertainty_use_real_execution_boundary(self):
+        from loop_manager_internal.verification import manager_adapter
+        from loop_manager_internal.execution import result_validation
+        import subprocess
+        script = self.root / 'scripts/verify.sh'
+        script.write_bytes(manager_adapter.ISOLATED_COMPILE_SCRIPT)
+        self.manifest(['src/**', 'scripts/**'])
+        effects = result_validation.VerifyEffects(mock.Mock(), mock.Mock(),
+                                                  mock.Mock(return_value=(True, False, 'OK')))
+        with mock.patch.dict('os.environ', {'PATH': '/usr/bin'}, clear=True), \
+                mock.patch.object(manager_adapter.subprocess, 'run',
+                    return_value=SimpleNamespace(stdout='a' * 64)) as probe:
+            observed = result_validation.observe_verify_inputs(self.root)
+            self.assertTrue(observed.proven, observed.reason)
+            self.assertTrue(result_validation.verify(effects, self.root)[0])
+            arguments = effects.run_verify_process.call_args.args[0]
+            self.assertEqual(arguments, result_validation.verify_arguments(self.root)[1])
+            self.assertEqual(arguments[1:5], ['-I', '-S', '-B', '-c'])
+            probe.side_effect = subprocess.TimeoutExpired('measurement', 30)
+            self.assertFalse(result_validation.observe_verify_inputs(self.root).proven)
+            probe.side_effect = None
+            with mock.patch.dict('os.environ', {'LD_PRELOAD': 'unmeasured'}):
+                self.assertFalse(result_validation.observe_verify_inputs(self.root).proven)
+            (self.root / inputs.MANIFEST).write_text('invalid')
+            self.assertFalse(result_validation.observe_verify_inputs(self.root).proven)
+
     def test_observation_ignores_read_access_time_but_detects_file_mutations(self):
         target = self.root / 'src/app.py'
         original = target.lstat()

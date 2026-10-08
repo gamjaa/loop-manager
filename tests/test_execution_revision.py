@@ -119,7 +119,7 @@ class ExecutionRevisionTests(unittest.TestCase):
             "priority": (replace(original, priority="low"), DefinitionDelta.PRIORITY, False),
             "profile": (replace(original, risk="high"), DefinitionDelta.PROFILE, False),
             "path": (replace(original, path="docs/plans/[G-037] New.md"), DefinitionDelta.PATH, False),
-            "source": (replace(original, source_fingerprint="new"), DefinitionDelta.SOURCE_INPUT, False),
+            "source": (replace(original, source_fingerprint="new"), DefinitionDelta.SOURCE_INPUT, True),
             "dependency": (replace(original, depends_on=("G-036", "G-049")), DefinitionDelta.DEPENDENCIES, True),
             "body": (replace(original, body_hash="new"), DefinitionDelta.BODY, True),
             "archive": (replace(original, archive_candidates=("docs/requirements/R.md",)), DefinitionDelta.ARCHIVE_SCOPE, True),
@@ -299,8 +299,7 @@ class RebaseCandidateRevisionTests(unittest.TestCase):
 
     def test_preserved_content_move_keeps_worker_candidate_confirmation(self):
         current = definition()
-        moved = replace(current, path='docs/plans/[G-037] Moved.md',
-                        source_fingerprint='unrelated-source-change')
+        moved = replace(current, path='docs/plans/[G-037] Moved.md')
         artifacts = replace(complete_artifacts(current), require_worker_candidate=True,
                             worker_candidate_token=current.worker_candidate_token('head'),
                             verify_token=current.verify_token('base', 'head'),

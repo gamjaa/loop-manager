@@ -193,6 +193,7 @@ class DefinitionSnapshot:
             self.sources,
             self.depends_on,
             self.worker_body_hash,
+            self.source_fingerprint,
             self.archive_candidates,
             self.guidance_hash,
         )
@@ -327,6 +328,7 @@ def classify_definition_delta(
 WORKER_INVALIDATING_DELTAS = frozenset(
     {
         DefinitionDelta.SOURCES,
+        DefinitionDelta.SOURCE_INPUT,
         DefinitionDelta.DEPENDENCIES,
         DefinitionDelta.BODY,
         DefinitionDelta.ARCHIVE_SCOPE,
