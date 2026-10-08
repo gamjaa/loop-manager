@@ -721,6 +721,30 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
 
 
 class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
+    def test_progress_cause_redaction_preserves_identity_and_payload(self):
+        from loop_manager_internal.execution.validation_feedback import redact_secrets
+        connection = self.connection()
+        cause = 'request rejected\n{"password": "first-private\\nsecond-private"}\nBearer bearer-private\n' + 'sk-' + 'a' * 24
+        for identity in ('first-error', 'first-error', 'second-error'):
+            with connection:
+                notifications.enqueue_progress(connection, '/projects/alpha', 'stage_failed', identity,
+                    execplan_id='G-018', operation='Planner', cause=cause,
+                    status='자동 교정 대기', silent=True)
+        events = self.events(connection)
+        self.assertEqual(len(events), 2)
+        for row in events:
+            payload = json.loads(row['payload'])
+            self.assertEqual(payload['cause'], redact_secrets(cause))
+            self.assertEqual(payload['execplan_id'], 'G-018')
+            self.assertEqual(payload['status'], '자동 교정 대기')
+            self.assertTrue(payload['silent'])
+            text = notifications._message('stage_failed', payload)
+            self.assertIn('request rejected', text)
+            self.assertIn(payload['occurred_at'], text)
+            for secret in ('first-private', 'second-private', 'bearer-private', 'sk-' + 'a' * 24):
+                self.assertNotIn(secret, row['payload'])
+                self.assertNotIn(secret, text)
+
     def test_review_failure_projection_leaves_nonprotocol_errors_to_recovery(self):
         connection = self.connection()
         loop_manager.update_project(connection, '/projects/alpha',

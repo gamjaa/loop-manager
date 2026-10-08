@@ -25,6 +25,34 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 
 class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+    def test_worker_provider_credentials_are_redacted_before_storage_and_delivery(self):
+        from loop_manager_internal.notifications import notifications
+        from loop_manager_internal.execution.validation_feedback import redact_secrets
+        notifications.configure_session(self.connection, enabled=True)
+        self.connection.commit()
+        for kind in (lm.AgentResultKind.USAGE_LIMIT, lm.AgentResultKind.PERMANENT_CONFIGURATION):
+            with self.subTest(kind=kind):
+                detail = f'{kind.value}: request rejected api_key=private-api-value Authorization: Bearer private-bearer-value'
+                self.effects.agent.run_agent.side_effect = lambda *a, **kw: lm.AgentResult(1, detail, kind=kind)
+                with mock.patch('loop_manager_internal.notifications.delivery.send_telegram') as sent, \
+                        notifications.immediate_delivery(self.connection, 'token', 'chat', 'repo'):
+                    self.handler.run(self.context())
+                    self.handler.run(self.context())
+                sent.assert_called_once()
+                row = self.connection.execute(
+                    "SELECT payload, rendered_text FROM notification_outbox WHERE event_type='stage_failed' ORDER BY rowid DESC"
+                ).fetchone()
+                payload = json.loads(row['payload'])
+                self.assertEqual(payload['cause'], redact_secrets(self.state.row()['last_error']))
+                self.assertIn('request rejected', payload['cause'])
+                self.assertIn('<REDACTED>', payload['cause'])
+                self.assertEqual(row['rendered_text'], sent.call_args.args[2])
+                self.assertTrue(sent.call_args.kwargs['disable_notification'])
+                for secret in ('private-api-value', 'private-bearer-value'):
+                    self.assertNotIn(secret, row['payload'])
+                    self.assertNotIn(secret, row['rendered_text'])
+                    self.assertNotIn(secret, sent.call_args.args[2])
+
     def test_usage_and_cli_returns_persist_and_send_silent_failure(self):
         from loop_manager_internal.notifications import notifications
         notifications.configure_session(self.connection, enabled=True)

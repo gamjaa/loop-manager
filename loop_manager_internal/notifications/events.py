@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import sqlite3
 from loop_manager_internal.documents import reviewer_specification
+from loop_manager_internal.execution.validation_feedback import redact_secrets
 from .work_exhaustion import WorkReasonSnapshot
 from .repository import (adopt_legacy_block_notices, ensure_schema, _enabled,
                          _insert)
@@ -636,6 +637,8 @@ def enqueue_progress(connection, repo, kind, identity, **payload):
                                   (repo, plan_id)).fetchone()
         if plan:
             payload.setdefault("execplan_title", str(plan[0]))
+    if isinstance(payload.get("cause"), str):
+        payload["cause"] = redact_secrets(payload["cause"])
     _insert(connection, _key(kind, repo, identity), repo, kind,
             {"project": Path(repo).name or repo, **payload})
 
