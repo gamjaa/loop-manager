@@ -156,7 +156,6 @@ class RebaseCorrectionRepository:
             # retain its completed result. Every other field has its own
             # preservation condition so a corrected/new observation resets it.
             preserve_pending_turn = same and not corrected and worker_result is None
-            preserve_worker_session = worker_session is None
             preserve_worker_result = same and not corrected and worker_result is None
             preserve_worker_code = same and not corrected and worker_result is None
             preserve_result_kind = same and not corrected and worker_result is None
@@ -173,7 +172,7 @@ class RebaseCorrectionRepository:
                  observation.before_head, observation.source.value,
                  observation.stash_oid, payload, history_payload, audit_payload,
                  row["pending_turn"] if preserve_pending_turn else None,
-                 worker_session if worker_session is not None else row["worker_session"],
+                 worker_session or row["worker_session"],
                  (row["worker_result"] if preserve_worker_result else worker_result)
                  if persist_worker_result else None,
                  row["worker_code"] if preserve_worker_code else None,
