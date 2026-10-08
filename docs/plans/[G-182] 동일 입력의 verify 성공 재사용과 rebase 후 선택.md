@@ -51,10 +51,17 @@ priority: high
 ## Progress
 
 - [x] 2026-10-05 planning 기준 a049a76의 명세·원본·관련 테스트와 비종료 catalog에서 미충족 범위를 확인함. 구현·테스트 실행은 하지 않음.
-- [ ] 구현 및 관련 targeted unit 검증
+- [x] 구현 및 관련 targeted unit 검증: 정상 clean rebase의 완료 Worker 보존, 원문에 결합된 제한적 기록 비교, 작업 주기별 verify run/reuse receipt CAS와 재관측 gate를 구현했다. 임의 스크립트의 미확인 동적·외부 입력은 전체 verify 실행을 유지한다.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
 
 - 2026-10-07 사용자 요청으로 활성 R-072와 계획을 함께 보완했다. G-173의 구현 입력 변경 메시지는 실제 조건 변경과 순수 기록 변화 모두를 구분해 회귀에 연결한다. Progress 체크만의 변경이 BODY/Worker 무효화로 분류되는 현재 경로를 최소 입력으로 확인했지만 운영 사건의 원인은 확정하지 않았으며 새 동작은 미구현이다. G-173의 재승인 lifecycle과 G-183의 Review 재사용을 대신하지 않는다.
 - 후보 채택·검증 input·성공 기록의 결합 때문에 complexity high, 거짓 검증 성공의 영향으로 risk high다. Review 재사용은 G-183에서 별도 판단한다.
+
+## Implementation Notes
+
+- `execution_revision.py`·`plan_validation.py`·`execution_revision_handler.py`: 원래 전문/전체 hash와 Worker 기록 비교를 분리하며 legacy 원문을 원래 revision에서만 보강한다. 자유 문장과 실제 조건 변경은 제외하지 않는다.
+- `execution_rebase_handler.py`·`execution_state.py`·latest-base/revision handler: 정상 호출의 clean 완료만 Worker 결과를 수용 HEAD에 연결한다. 별도 교정·충돌·미완료·중단 복구는 기존 경로를 따른다.
+- `storage/verify_receipts.py`·activation·verify handler: 실제 run intent/성공과 reuse 링크를 주기·generation으로 저장하고 새 실패·중단·저장 경쟁에서 과거 성공 재사용을 차단한다. 측정 가능한 입력은 기존 `verification/inputs.py`를 재사용하며 기본 동적 스크립트는 unknown으로 전체 verify를 수행한다.
+- `tests/test_verify_receipts.py`·`tests/test_execution_revision.py` 및 revision gate의 개별 unit case: 파일/목록/환경/Git 입력 변화, 재사용·실행 중 변화, 새 실패·중단·cycle·CAS·저장 실패·waiver, clean rebase와 교정 보존, 기록 변경·legacy 근거 부재를 검사한다. 실제 전체 verify·Git lifecycle·Manager 전체 검증은 이 Worker에서 실행하지 않았다.

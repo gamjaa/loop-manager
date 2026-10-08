@@ -116,7 +116,7 @@ def _revision_execplan_body_hash(
     contents = revision_document_or_none(effects.git, repo_path, revision, path)
     if contents is None:
         raise RuntimeError(f"최신 ExecPlan 본문을 읽을 수 없습니다: {path}")
-    return execution_revision.execplan_body_hash(contents)
+    return execution_revision.ExecPlanBodyHash(contents)
 
 
 @dataclass(frozen=True)

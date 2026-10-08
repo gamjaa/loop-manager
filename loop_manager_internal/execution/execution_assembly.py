@@ -189,6 +189,7 @@ def revision(effects: ExecutionEffects, identity: ExecutionIdentity,
         snapshot: Callable[[], PreparationSnapshot], update_snapshot: Callable[..., None],
         callbacks: dict[str, Callable], *, recovery=None, rebase_corrections=None) -> RevisionHandler:
     return RevisionHandler(RevisionHandlerPorts(
+        observe_verify_inputs=effects.validation.observe_verify_inputs,
         identity=identity,
         snapshot=snapshot,
         update_snapshot=update_snapshot,
@@ -314,6 +315,7 @@ def verify(effects: ExecutionEffects, identity: ExecutionIdentity,
         snapshot: Callable[[], PreparationSnapshot], update_snapshot: Callable[..., None],
         callbacks: dict[str, Callable], *, recovery=None, rebase_corrections=None) -> VerifyHandler:
     return VerifyHandler(VerifyHandlerPorts(
+        observe_verify_inputs=effects.validation.observe_verify_inputs,
         identity=identity,
         snapshot=snapshot,
         update_snapshot=update_snapshot,

@@ -294,6 +294,8 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
     connection.execute(EXEC_PLANS_SCHEMA)
     from . import verify_input_requests
     verify_input_requests.ensure_schema(connection)
+    from . import verify_receipts
+    verify_receipts.ensure_schema(connection)
     from loop_manager_internal.storage import manual_work_state
     manual_work_state.ensure_schema(connection)
     execplan_catalog_state.ensure_schema(connection)

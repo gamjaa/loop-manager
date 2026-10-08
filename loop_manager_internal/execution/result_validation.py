@@ -209,8 +209,7 @@ class VerifyEffects:
     run_verify_process: Callable[..., object]
 
 
-def verify(effects: VerifyEffects, worktree: Path, timeout_seconds: int = 600) -> tuple[bool, str]:
-    effects._check_runtime_handoff()
+def verify_arguments(worktree: Path):
     if os.name == "nt":
         script = worktree / "scripts/verify.ps1"
         executable = shutil.which("pwsh") or shutil.which("powershell")
@@ -218,6 +217,25 @@ def verify(effects: VerifyEffects, worktree: Path, timeout_seconds: int = 600) -
     else:
         script = worktree / "scripts/verify.sh"
         arguments = ["bash", str(script)]
+    return script, arguments
+
+
+def observe_verify_inputs(worktree: Path):
+    """Arbitrary scripts have unmeasured dynamic/Git/external dependencies.
+
+    Never infer their absence from source spelling or a passing invocation.
+    An execution adapter with measured identities can supply the existing
+    observe_inputs contract instead; the default safely keeps full verify.
+    """
+    from loop_manager_internal.verification.manager_adapter import observe_inputs
+    _script, arguments = verify_arguments(worktree)
+    return observe_inputs(worktree, arguments, environment=dict(os.environ),
+                          runtime_identity=None)
+
+
+def verify(effects: VerifyEffects, worktree: Path, timeout_seconds: int = 600) -> tuple[bool, str]:
+    effects._check_runtime_handoff()
+    script, arguments = verify_arguments(worktree)
     if not script.is_file():
         return False, f"전체 검증 스크립트가 없습니다: {script.relative_to(worktree)}"
     gate = _runtime_handoff_signal.get()

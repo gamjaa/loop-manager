@@ -1265,7 +1265,18 @@ class RuntimeStateRepository:
             project_values=values,
         )
 
-    def activate(
+    def activate(self, repo: str, plan_id: str, *, activation_sha: str,
+                 branch: str, worktree: str, preserve_worker_session: bool = False) -> ExecutionSnapshot:
+        from loop_manager_internal.storage import verify_receipts
+        with _transaction(self.connection):
+            result = self._activate(repo, plan_id, activation_sha=activation_sha,
+                                    branch=branch, worktree=worktree,
+                                    preserve_worker_session=preserve_worker_session)
+            if not preserve_worker_session or verify_receipts.selected(self.connection, repo, plan_id) is None:
+                verify_receipts.start_cycle(self.connection, repo, plan_id)
+        return result
+
+    def _activate(
         self,
         repo: str,
         plan_id: str,

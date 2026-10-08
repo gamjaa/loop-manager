@@ -15,6 +15,8 @@ from loop_manager_internal.execution.worker_outcome import WorkerOutcomeError
 from loop_manager_internal.execution.execution_effects import ExecutionContract, FeedbackEffects
 from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot
 from loop_manager_internal.execution.execution_state import ExecutionStatePort
+from loop_manager_internal.storage import verify_receipts
+from loop_manager_internal.verification.inputs import InputObservation
 
 @dataclass(frozen=True)
 class VerifyHandlerPorts:
@@ -54,6 +56,7 @@ class VerifyHandlerPorts:
     _recover: Callable[..., ExecutionOutcome]
     _retry: Callable[..., ExecutionOutcome]
     _row: Callable[[], Mapping[str, object]]
+    observe_verify_inputs: Callable[..., Any] | None = None
 
 
 class VerifyHandler:
@@ -61,7 +64,18 @@ class VerifyHandler:
     def __init__(self, ports: VerifyHandlerPorts):
         self.ports = ports
 
+    def _observe(self, worktree):
+        observer = self.ports.observe_verify_inputs
+        if observer is None:
+            return InputObservation(None, reason='verify input observer unavailable')
+        try:
+            value = observer(worktree)
+            return value if isinstance(value, InputObservation) else InputObservation(None, reason='invalid verify observation')
+        except (OSError, RuntimeError, ValueError) as error:
+            return InputObservation(None, reason=str(error))
+
     def _verify_once(self, context, candidate_head: str | None = None):
+        self._verify_executed = False
         assert self.ports.snapshot().catalog_plan is not None and self.ports.snapshot().plan is not None
         from loop_manager_internal.execution.manual_candidate import get_manual
         manual = get_manual(self.ports.state)
@@ -80,6 +94,7 @@ class VerifyHandler:
             input_fingerprint=self.ports._worktree_execplan_input_fingerprint(context.worktree, self.ports.snapshot().catalog_plan),
         )
         try:
+            self._verify_executed = True
             passed, output = self.ports.verify(context.worktree)
         except self.ports.contract.VerifyTerminationUncertain as error:
             detail = str(error)
@@ -269,19 +284,58 @@ class VerifyHandler:
         candidate_head = self.ports.git(
             context.worktree, 'rev-parse', 'HEAD'
         ).stdout.strip()
+        observation = self._observe(context.worktree)
+        waived = bool(manual and manual.waive(context, 'verify', record=False))
+        connection = self.ports.state.connection
+        repo, plan_id = self.ports.identity.repo, context.plan.plan_id
+        with runtime_state._transaction(connection):
+            self.ports.state.check()
+            selection = verify_receipts.selected(connection, repo, plan_id)
+            if selection is None:
+                # Legacy active executions get a new cycle, never a fabricated
+                # success baseline from their old verify token.
+                verify_receipts.start_cycle(connection, repo, plan_id)
+                selection = verify_receipts.selected(connection, repo, plan_id)
+        origin = (verify_receipts.success(connection, selection, observation)
+                  if not waived and self.ports.snapshot()._definition_snapshot is not None else None)
+        if origin is not None:
+            with runtime_state._transaction(connection):
+                self.ports.state.check_context(context)
+                if (self._observe(context.worktree) != observation
+                        or self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip() != candidate_head
+                        or self.ports.git(context.worktree, 'status', '--porcelain').stdout.strip()):
+                    return self.ports._retry('verify 재사용 판정 중 입력이 변경되어 다시 확인합니다.')
+                verify_receipts.record(connection, selection, head=candidate_head,
+                    observation=observation, kind='reuse', origin=origin,
+                    reason='same proven verify inputs in the same execution cycle')
+                output = origin['result']
+                definition = self.ports.snapshot()._definition_snapshot
+                if not (manual and manual.user_submission(self.ports._row())):
+                    review_correction_state.verified(connection, repo, plan_id, candidate_head)
+                self.ports.state.update_project(repo, preserve_transaction=True,
+                    validated_base_sha=context.active_sha, verify_result=output,
+                    verify_token=definition.verify_token(context.active_sha, candidate_head, output),
+                    review_result=None, review_token=None, publication_token=None)
+            self.ports.operation_log(f"전체 verify 재사용: {plan_id}, 원래 run={origin['id']}, 입력={observation.fingerprint}")
+            self.ports.update_snapshot(_latest_verify_output=output)
+            return self._finish_verified(context)
         # A new invocation invalidates any previous success marker first. If
         # this run fails before replacing its output, stale evidence cannot be
         # paired with the new candidate or a later scope block.
-        self.ports.state.update_project(
-            self.ports.identity.repo,
-            validated_base_sha=None,
-            verify_token=None,
-            review_result=None,
-            review_token=None,
-            publication_token=None,
-        )
+        with runtime_state._transaction(connection):
+            self.ports.state.check()
+            identifier, selection = verify_receipts.record(connection, selection,
+                head=candidate_head, observation=observation, kind='run',
+                reason=observation.reason or 'no matching successful verify receipt')
+            self.ports.state.update_project(
+                repo, preserve_transaction=True, validated_base_sha=None,
+                verify_token=None, review_result=None, review_token=None, publication_token=None,
+            )
         outcome, output = self._verify_once(context, candidate_head)
         if outcome is not None:
+            with runtime_state._transaction(connection):
+                verify_receipts.complete(connection, selection, identifier, passed=False, output=output,
+                                         executed=self._verify_executed)
             return outcome
         if self.ports.git(
             context.worktree, 'rev-parse', 'HEAD'
@@ -306,6 +360,16 @@ class VerifyHandler:
             self.ports._commit_owned(context, worker_publication.commit_title)
             return self.ports._retry('전체 verify 중 허용된 변경을 commit했습니다. 새 후보를 다시 검증합니다.')
         with runtime_state._transaction(self.ports.state.connection):
+            self.ports.state.check()
+            after = self._observe(context.worktree)
+            if self._verify_executed and observation.proven and after != observation:
+                verify_receipts.complete(connection, selection, identifier, passed=False,
+                                         output='verify inputs changed during execution')
+                self.ports.state.update_project(repo, preserve_transaction=True,
+                    validated_base_sha=None, verify_token=None, review_token=None, publication_token=None)
+                return self.ports._retry('전체 verify 실행 중 입력이 변경되어 다시 검증합니다.')
+            verify_receipts.complete(connection, selection, identifier, passed=True, output=output,
+                                     executed=self._verify_executed)
             if not (manual and manual.user_submission(self.ports._row())):
                 review_correction_state.verified(
                     self.ports.state.connection, self.ports.identity.repo,

@@ -98,7 +98,9 @@ class LatestBaseHandler:
                 RecoveryReason.REBASE_CONFLICT if in_progress else RecoveryReason.WORKTREE_RECOVERY_FAILED,
                 rebase_failure, context=context,
             )
-        self.ports._complete_rebase_intent(context, project_values=managed_rebase_adoption.revalidation_values(latest_sha))
+        self.ports._complete_rebase_intent(context,
+            project_values=managed_rebase_adoption.revalidation_values(latest_sha),
+            worker_definition=self.ports.snapshot()._definition_snapshot)
         from loop_manager_internal.execution.manual_candidate import get_manual
         manual=get_manual(self.ports.state)
         if manual and manual.user_submission(row):
@@ -167,7 +169,7 @@ class LatestBaseHandler:
                     )
                     self.ports.operation_print(no_change_error, file=sys.stderr)
                     return self.ports._final(no_change_error)
-                return self.ports._retry('최신 rebase 후보를 Worker가 다시 확인합니다.')
+                return self.ports._retry('최신 rebase 후보의 verify 입력과 Review를 다시 확인합니다.')
             else:
                 self.ports.state.update_project(
                     self.ports.identity.repo,
@@ -202,7 +204,7 @@ class LatestBaseHandler:
                 )
                 if outcome is not None:
                     return outcome
-                return self.ports._retry('최신 rebase 후보를 Worker가 다시 확인합니다.')
+                return self.ports._retry('최신 rebase 후보의 verify 입력과 Review를 다시 확인합니다.')
             self.ports.state.update_project(
                 self.ports.identity.repo, active_sha=latest_sha, validated_base_sha=None,
                 phase='VERIFYING', verify_result=None, review_result=None,
