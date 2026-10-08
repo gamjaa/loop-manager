@@ -15,6 +15,7 @@ import loop_manager as manager
 
 class WriteIsolationTests(TestCase):
     def setUp(self):
+        self.enterContext(mock.patch.object(manager, '_ponytail_installed', return_value=True))
         # 임시 worktree의 상위 사용자 설정이 테스트로 유입되지 않게 한다.
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)

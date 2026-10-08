@@ -418,6 +418,9 @@ class RevisionHandler:
                     guidance_hash=common_guidance.plan_content_hash(
                         self.ports.state.connection, self.ports.identity.repo, str(catalog_plan['plan_id']),
                     ),
+                    worker_guidance_hash=common_guidance.worker_content_hash(
+                        self.ports.state.connection, self.ports.identity.repo, str(catalog_plan['plan_id']),
+                    ),
                 )
             previous = DefinitionSnapshot.deserialize(
                 self.ports._row()['definition_snapshot']

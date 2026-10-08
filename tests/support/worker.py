@@ -73,6 +73,7 @@ def dummy_worker_context(*, roles=("worker",)):
         return real_command(arguments, **kwargs)
 
     with mock.patch.object(loop_manager, '_agent_profile', side_effect=profile), \
+         mock.patch.object(loop_manager, '_ponytail_installed', return_value=True), \
          mock.patch.object(loop_manager, '_ExecutionLifecyclePorts', side_effect=ports), \
          mock.patch.object(loop_manager, 'command', side_effect=command):
         yield

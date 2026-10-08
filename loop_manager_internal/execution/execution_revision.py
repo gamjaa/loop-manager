@@ -110,6 +110,7 @@ class DefinitionSnapshot:
     source_fingerprint: str
     archive_candidates: tuple[str, ...]
     guidance_hash: str = ""
+    worker_guidance_hash: str = ""
 
     def serialize(self) -> str:
         return json.dumps(
@@ -126,6 +127,7 @@ class DefinitionSnapshot:
                 "source_fingerprint": self.source_fingerprint,
                 "archive_candidates": list(self.archive_candidates),
                 "guidance_hash": self.guidance_hash,
+                "worker_guidance_hash": self.worker_guidance_hash,
             },
             ensure_ascii=False,
             sort_keys=True,
@@ -155,6 +157,7 @@ class DefinitionSnapshot:
                     str(item) for item in payload["archive_candidates"]
                 ),
                 guidance_hash=str(payload.get("guidance_hash", "")),
+                worker_guidance_hash=str(payload.get("worker_guidance_hash", "")),
             )
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as error:
             raise ValueError("저장된 execution definition snapshot이 유효하지 않습니다.") from error
@@ -183,17 +186,17 @@ class DefinitionSnapshot:
     @property
     def worker_token(self) -> str:
         """Token for fields that require a fresh Worker result when changed."""
-
-        return _digest(
-            "worker-input",
-            (
-                self.sources,
-                self.depends_on,
-                self.body_hash,
-                self.archive_candidates,
-                self.guidance_hash,
-            ),
+        values = (
+            self.sources,
+            self.depends_on,
+            self.body_hash,
+            self.archive_candidates,
+            self.guidance_hash,
         )
+        # Keep legacy tokens byte-for-byte until actual delivery is recorded.
+        if self.worker_guidance_hash:
+            values += (self.worker_guidance_hash,)
+        return _digest('worker-input', values)
 
     @property
     def archive_token(self) -> str:

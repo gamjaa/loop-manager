@@ -154,7 +154,7 @@ class CommonGuidanceStateTests(TestCase):
             runtime = root / 'runtime'
             (runtime / 'docs').mkdir(parents=True)
             (runtime / common_guidance.COMMON_PATH).write_text('original', encoding='utf-8')
-            for path in set(common_guidance.ROLE_PATHS.values()):
+            for path in common_guidance.GUIDANCE_PATHS[1:]:
                 (runtime / path).write_text('role: ' + path, encoding='utf-8')
             database = root / 'state.db'
             context = InvocationContext('repo', 'G-147')
@@ -186,6 +186,36 @@ class CommonGuidanceStateTests(TestCase):
             self.assertNotEqual(getattr(original, method)('head'), getattr(changed, method)('head'))
         self.assertEqual(DefinitionSnapshot.deserialize(original.serialize()), original)
 
+
+    def test_changed_delivery_invalidates_results_without_changing_source_contract(self):
+        import json
+        from dataclasses import replace
+        from loop_manager_internal.execution.execution_revision import (
+            DefinitionSnapshot, RevisionGateKind, StageArtifacts,
+            classify_definition_delta, decide_revision_gate,
+        )
+        legacy = DefinitionSnapshot('a' * 40, 'docs/plans/[G-147] Test.md', 'Test', (), (),
+                                    'high', 'high', 'high', 'body', 'source', (), 'pinned')
+        payload = json.loads(legacy.serialize())
+        del payload['worker_guidance_hash']
+        restored = DefinitionSnapshot.deserialize(json.dumps(payload))
+        self.assertEqual(restored, legacy)
+        self.assertEqual(restored.worker_token, legacy.worker_token)
+        original = replace(legacy, worker_guidance_hash='with-ponytail')
+        changed = replace(original, worker_guidance_hash='without-ponytail')
+        self.assertEqual(original.definition_token, changed.definition_token)
+        self.assertEqual(classify_definition_delta(original, changed), frozenset())
+        for method in ('worker_candidate_token', 'verify_token', 'review_token', 'publication_token'):
+            self.assertNotEqual(getattr(original, method)('head'), getattr(changed, method)('head'))
+        decision = decide_revision_gate(
+            phase='VERIFYING', previous=original, current=changed,
+            active_base_token='base', current_base_token='base',
+            artifacts=StageArtifacts(worker_result=True, worker_input_token=original.worker_token,
+                                     archive_token=original.archive_token),
+        )
+        self.assertEqual((decision.kind, decision.phase),
+                         (RevisionGateKind.INVALIDATE_TO_PHASE, 'IMPLEMENTING'))
+        self.assertEqual(DefinitionSnapshot.deserialize(changed.serialize()), changed)
 
     def test_publication_fixture_tokens_use_saved_plan_guidance_without_git_execution(self):
         from pathlib import Path

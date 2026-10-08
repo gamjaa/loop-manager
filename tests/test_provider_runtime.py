@@ -16,6 +16,9 @@ from tests.support.worker import worker_result
 
 
 class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
+    def setUp(self):
+        self.enterContext(mock.patch.object(loop_manager, '_ponytail_installed', return_value=True))
+
     def test_policy_failure_stops_retry_and_session_fallback(self):
         failures = (
             "auto_review classifier timeout",

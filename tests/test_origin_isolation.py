@@ -455,6 +455,7 @@ class OriginIsolationScopeTest(OriginScopeFixture, unittest.TestCase):
 
 class TaskRelevantInvocationScopeTests(unittest.TestCase):
     def setUp(self):
+        self.enterContext(mock.patch.object(loop_manager, '_ponytail_installed', return_value=True))
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
         self.remote, self.source, self.writer = remote_fixture(directory.name)
