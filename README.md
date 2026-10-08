@@ -28,6 +28,8 @@ Copy-Item -LiteralPath config/config.ini.example -Destination config/config.ini
 
 `config/config.ini`에서 선택 provider의 모델·Effort를 확인한다. Telegram을 사용하려면 `token`과 `chat_id`를 모두 입력하고, 사용하지 않으면 둘 다 비워 둔다. **실제 config는 비밀값을 포함할 수 있으므로 commit하지 않는다.** [설정 항목](docs/OPERATIONS.md#설정)
 
+Windows에서 Defender 검사로 verify가 느리면 [검사 제외 설정](docs/OPERATIONS.md#windows-defender와-테스트-임시-폴더)을 확인한다.
+
 ### 2. 프로젝트 문서 준비와 게시
 
 새 프로젝트에는 다음 중 하나를 실행한다.

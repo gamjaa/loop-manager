@@ -402,6 +402,7 @@ PR 없는 게시 checkpoint의 Review 횟수 차단을 rebase 없이 해제할 �
   - Windows: `scripts/verify.ps1`
   - Linux: `scripts/verify.sh`
 - verify 스크립트는 프로젝트 전체 검증을 수행하고 실패 시 0이 아닌 종료 코드를 반환한다
+- 자체 Windows verify는 현재 checkout의 Git 제외 경로 `.cache/verify/tmp/`를 생성하고 `TEMP`·`TMP`·`TMPDIR`로 자식 프로세스에 전달한다. 종료 시 기존 환경을 복원하며 병렬 실행의 파일을 보존하기 위해 공유 임시 폴더 전체를 삭제하지 않는다. Defender 설정은 스크립트가 변경하지 않고 [운영 안내](OPERATIONS.md#windows-defender와-테스트-임시-폴더)에 따라 사용자가 선택한다
 - 전체 test suite, integration test, end-to-end test, 프로젝트 전체 lint·build·type check는 verify 스크립트만 실행한다
 - 프로그램은 verify 스크립트를 AI Agent 밖에서 실행한다
 - 프로그램은 verify 성공 시 Worker를 다시 호출하거나 성공 출력을 전달하지 않는다
