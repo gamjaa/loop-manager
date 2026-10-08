@@ -134,6 +134,12 @@ class ExecutionFixture:
             commit_title='Concrete change', test_evidence='targeted test: PASS',
             summary='Implement the selected product change.',
         )
+        from loop_manager_internal.verification.inputs import InputObservation
+        # Policy fakes need the same explicit observation at verify and Review.
+        # Unproven inputs keep actual verify calls in retry-policy assertions.
+        self.effects.validation.observe_verify_inputs.return_value = InputObservation(
+            None, reason='unit-test verify inputs unavailable',
+        )
         self.effects.validation.verify.side_effect = lambda _: (self.calls.append('verify') or True, 'OK')
         self.effects.validation.parse_reviewer_result.return_value = ('PASS', ())
         self.effects.validation.ensure_worker_level_state.return_value = 1

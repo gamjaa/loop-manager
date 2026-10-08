@@ -359,6 +359,7 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
         reviewed = self.handler.review(verified.context)
 
         self.assertEqual(reviewed.context.phase, ExecutionPhase.PUBLISHING)
+        self.effects.validation.verify.assert_called_once()
         calls = self.effects.agent.run_agent.call_args_list
         self.assertEqual([call.args[4] for call in calls], ['worker', 'reviewer'])
         for call in calls:
