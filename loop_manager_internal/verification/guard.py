@@ -97,7 +97,13 @@ def worker_environment(environment):
     paths = [str(Path(__file__).parent / "child_guard"), root,
              *child.get("PYTHONPATH", "").split(os.pathsep)]
     child["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(filter(None, paths)))
-    for name in _COORDINATION_ENV:
-        child.pop(name, None)
-        child.pop(os.fsencode(name), None)
+    if os.name == "nt":
+        coordination_names = {name.casefold() for name in _COORDINATION_ENV}
+        for key in tuple(child):
+            if isinstance(key, (str, bytes)) and os.fsdecode(key).casefold() in coordination_names:
+                child.pop(key, None)
+    else:
+        for name in _COORDINATION_ENV:
+            child.pop(name, None)
+            child.pop(os.fsencode(name), None)
     return child

@@ -341,6 +341,48 @@ class GuardAndConfigurationTests(unittest.TestCase):
         self.assertEqual(child["credentials"], [])
         self.assertEqual(child["ordinary"], "bytes-value")
 
+    def test_windows_environment_cleanup_ignores_credential_key_case(self):
+        credential_names = ("LOOP_MANAGER_VERIFY_ENDPOINT", "LOOP_MANAGER_VERIFY_SECRET",
+                            "LOOP_MANAGER_VERIFY_SESSION")
+        environment = {
+            "loop_manager_verify_endpoint": "private-test-value",
+            "LOOP_MANAGER_VERIFY_SECRET": "private-test-value",
+            "Loop_Manager_Verify_Session": "private-test-value",
+            b"lOoP_mAnAgEr_vErIfY_sEcReT": b"private-test-value",
+            "VERIFY_CHILD_TEST": "preserved-value",
+        }
+        original_environment = dict(environment)
+        windows_os = SimpleNamespace(name="nt", environ=os.environ, fsdecode=os.fsdecode,
+                                     fsencode=os.fsencode, pathsep=os.pathsep)
+        with mock.patch.object(guard, "os", windows_os):
+            child_environment = guard.worker_environment(environment)
+        self.assertEqual(environment, original_environment)
+        self.assertEqual(child_environment["VERIFY_CHILD_TEST"], "preserved-value")
+        normalized_names = {name.casefold() for name in credential_names}
+        self.assertFalse(any(isinstance(key, (str, bytes)) and os.fsdecode(key).casefold() in normalized_names
+                             for key in child_environment))
+
+    @unittest.skipUnless(os.name == "nt", "requires Windows environment key lookup semantics")
+    def test_windows_subprocess_drops_case_variant_verify_credentials(self):
+        guard.install_guard()
+        credential_names = ("LOOP_MANAGER_VERIFY_ENDPOINT", "LOOP_MANAGER_VERIFY_SECRET",
+                            "LOOP_MANAGER_VERIFY_SESSION")
+        script = (
+            "import json, os; names = " + repr(credential_names) + "; "
+            "print(json.dumps({'credentials': [name for name in names if os.environ.get(name) is not None], "
+            "'ordinary': os.environ.get('VERIFY_CHILD_TEST')}))"
+        )
+        environment = dict(os.environ)
+        environment.update({name.casefold(): "private-test-value" for name in credential_names})
+        environment["VERIFY_CHILD_TEST"] = "preserved-value"
+        original_environment = dict(environment)
+        result = subprocess.run([sys.executable, "-c", script], env=environment, capture_output=True,
+                                text=True, check=True, timeout=10)
+        self.assertEqual(environment, original_environment)
+        child = json.loads(result.stdout)
+        self.assertEqual(child["credentials"], [])
+        self.assertEqual(child["ordinary"], "preserved-value")
+
     def test_managed_parallelism_defaults_caps_and_invalid_values(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.ini"
