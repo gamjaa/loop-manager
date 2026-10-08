@@ -358,8 +358,8 @@ class PrConflictCauseRevalidationTests(PrRecoveryFixture, unittest.TestCase):
 
 
 class PrConflictInterruptionTests(PrRecoveryFixture, unittest.TestCase):
-    # Keep real Git: assertions inspect the surviving operation/index, remote
-    # lease and resumed publication after interruption at mutating commands.
+    # Mock pause/retry policy. Keep real Git for actual source preservation,
+    # surviving operations/index, remote lease and resumed publication.
     @dummy_worker_sessions
     def test_transient_and_usage_limit_pauses_resume_same_recovery(self):
         pauses = (
@@ -374,36 +374,57 @@ class PrConflictInterruptionTests(PrRecoveryFixture, unittest.TestCase):
                 "usage limit reached",
             ),
         )
-        with RecoveryBoundary() as boundary:
-            directory = boundary.directory
+        with tempfile.TemporaryDirectory() as directory:
             for result_kind, expected_kind, message in pauses:
                 with self.subTest(result_kind=result_kind):
-                    if not boundary.saved:
-                        (
-                            repo,
-                            state_dir,
-                            connection,
-                            branch,
-                            _worktree,
-                            pr_url,
-                            head_oid,
-                        ) = self._pr_open_state(directory)
-                        self._make_source_checkout_dirty_and_ahead(repo)
-                        self._advance_base(
-                            directory,
-                            repo,
-                            "src/app.py",
-                            "VALUE = 3\n",
-                            "Conflict before pause variants",
-                        )
-                        git_command(repo, "fetch", "origin")
-                        source_before = self._source_checkout_snapshot(repo)
-                        pull_request = self._pull_request(
-                            branch, pr_url, head_oid, "CONFLICTING"
-                        )
-                        boundary.save(connection)
-                    else:
-                        boundary.restore(connection)
+                    if result_kind is loop_manager.AgentResultKind.TRANSIENT_FAILURE:
+                        # Retry/pause policy uses real handlers and SQLite. The
+                        # usage-limit variant below keeps the actual conflict,
+                        # source preservation and full resumed publication.
+                        fixture = execution_policy_fixture(self, pr_conflict=True)
+                        try:
+                            agent = fixture.effects.agent.run_agent
+                            agent.side_effect = None
+                            agent.return_value = loop_manager.CodexResult(
+                                1, message, 'worker-existing', result_kind)
+                            query = (
+                                'SELECT status, pr_conflict_recovery, pr_conflict_head_oid, '
+                                'worker_session_id, reviewer_session_id FROM exec_plans WHERE repo = ?')
+                            before = tuple(fixture.connection.execute(query, (fixture.repo,)).fetchone())
+                            with mock.patch('subprocess.Popen', side_effect=AssertionError('unexpected policy process')):
+                                paused = run_execution_policy(fixture)
+                                self.assertEqual(paused.kind, expected_kind)
+                                self.assertEqual(agent.call_count, loop_manager.MAX_TRANSIENT_AGENT_RETRIES + 1)
+                                self.assertEqual(tuple(fixture.connection.execute(query, (fixture.repo,)).fetchone()), before)
+                                for call in agent.call_args_list:
+                                    self.assertEqual(call.args[4], 'worker')
+                                    self.assertEqual(call.kwargs['session_id'], 'worker-existing')
+                                agent.reset_mock()
+                                agent.return_value = loop_manager.CodexResult(
+                                    1, 'stop after recovery resumes', 'worker-existing',
+                                    loop_manager.AgentResultKind.USAGE_LIMIT)
+                                resumed = run_execution_policy(fixture)
+                                self.assertEqual(resumed.kind, loop_manager.ProjectRunKind.USAGE_LIMIT_PAUSE)
+                                agent.assert_called_once()
+                                self.assertEqual(agent.call_args.args[4], 'worker')
+                                self.assertEqual(agent.call_args.kwargs['session_id'], 'worker-existing')
+                                self.assertEqual(tuple(fixture.connection.execute(query, (fixture.repo,)).fetchone()), before)
+                                fixture.effects.validation.verify.assert_not_called()
+                                fixture.effects.publication.push_managed_publication_branch.assert_not_called()
+                        finally:
+                            # The policy fixture's patches must end before the
+                            # paired real-Git variant in this same test method.
+                            fixture.doCleanups()
+                        continue
+                    (
+                        repo, state_dir, connection, branch, _worktree, pr_url, head_oid,
+                    ) = self._pr_open_state(directory)
+                    self._make_source_checkout_dirty_and_ahead(repo)
+                    self._advance_base(directory, repo, 'src/app.py', 'VALUE = 3\n',
+                                       'Conflict before pause')
+                    git_command(repo, 'fetch', 'origin')
+                    source_before = self._source_checkout_snapshot(repo)
+                    pull_request = self._pull_request(branch, pr_url, head_oid, 'CONFLICTING')
                     paused_worker = loop_manager.CodexResult(
                         1,
                         message,
@@ -627,6 +648,14 @@ class PrConflictInterruptionTests(PrRecoveryFixture, unittest.TestCase):
                         self.assertEqual(self._source_checkout_snapshot(repo), source_before)
                         self.assertTrue(worktree.is_dir())
                         self.assertEqual(pushes, [])
+
+                        # Query/fetch failures end once the actual repository
+                        # and recovery checkpoint are proven intact. The rebase
+                        # variant below resumes that same starting checkpoint
+                        # through Worker/Reviewer and the leased publication;
+                        # don't repeat that whole flow for each observation error.
+                        if stage in ('github', 'fetch'):
+                            continue
 
                         resumed = loop_manager.run_project_result(
                             connection, state_dir, str(repo), Path("unused.ini"), "main", False

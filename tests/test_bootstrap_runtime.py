@@ -394,9 +394,9 @@ class BootstrapRuntimeTests(OriginScopeFixture, unittest.TestCase):
 class BootstrapSavedScopeResumeTests(unittest.TestCase):
     # Real Git and child CLI are the contract here: imported runtime B, saved
     # Agent scopes, and later base C must stay connected across process restart.
-    """Real subprocess regressions; run only in Manager's full verification."""
+    """Real subprocess regressions; use the coordinated verification runner."""
 
-    def test_remote_bootstrap_child_resumes_saved_scope_without_identity_injection(self, advance_after_selection=False):
+    def _assert_saved_scope_resume(self, advance_after_selection=False):
         import json
         import shutil
         import sys
@@ -582,16 +582,26 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                         sha_c = commit_all(writer, 'External base C after runtime B selection')
                         (state / 'advance-after-selection.json').write_text(json.dumps([str(writer), base]), encoding='utf-8')
                     config = profile_config(self)
-                    (state / 'stop-after-registration').touch()
-                    interrupted = subprocess.run([sys.executable, '-B', str(manager_file),
-                        '--state-dir', str(state), '--config', str(config), 'run'],
-                        cwd=source, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                        timeout=90, check=False)
-                    self.assertNotEqual(interrupted.returncode, 0, interrupted.stdout)
-                    self.assertIn('test interruption after runtime registration', interrupted.stdout)
-                    self.assertFalse((state / 'resumed-agent.json').exists())
-                    self.assertTrue(list((state / 'manager-git-journal').glob('*/active.json')))
-                    for attempt in range(2):
+                    # All branch/role pairs still exercise the real child. The
+                    # common crash and same-SHA reuse need one process regression;
+                    # registration/scope rules are paired with BootstrapRuntimeTests
+                    # and BootstrapSavedScopeFixtureUnitTests below. B/C transitions
+                    # retain both resumes for each role's distinct saved state.
+                    # ponytail: crash/reuse process coverage is one main Worker;
+                    # add a role/base case if those pre-dispatch steps gain such logic.
+                    interrupted_registration = not advance_after_selection and (base, role) == ('main', 'worker')
+                    if interrupted_registration:
+                        (state / 'stop-after-registration').touch()
+                        interrupted = subprocess.run([sys.executable, '-B', str(manager_file),
+                            '--state-dir', str(state), '--config', str(config), 'run'],
+                            cwd=source, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            timeout=90, check=False)
+                        self.assertNotEqual(interrupted.returncode, 0, interrupted.stdout)
+                        self.assertIn('test interruption after runtime registration', interrupted.stdout)
+                        self.assertFalse((state / 'resumed-agent.json').exists())
+                        self.assertTrue(list((state / 'manager-git-journal').glob('*/active.json')))
+                    attempts = 2 if advance_after_selection or interrupted_registration else 1
+                    for attempt in range(attempts):
                         completed = subprocess.run([sys.executable, '-B', str(manager_file),
                             '--state-dir', str(state), '--config', str(config), 'run'],
                             cwd=source, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -616,7 +626,8 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                                     "FROM exec_plans WHERE plan_id='G-001'").fetchone()
                                 self.assertEqual(row, ('REVIEWING' if role == 'reviewer' else 'IMPLEMENTING',
                                                        'worker-existing', 'reviewer-existing', 0))
-                        # Leave the proof absent so same-SHA reuse must dispatch again.
+                        # A later parent must dispatch again, using the same SHA
+                        # in the crash/reuse case or C after the B/C transition.
                         proof_path.unlink()
                     # Child instrumentation stays in this owned fixture. Forward
                     # original PID/time values so nested CLI durations aren't
@@ -631,12 +642,16 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                     if parent_writer is not None:
                         parent_writer.stream.flush()
                     ends = [event for event in records if event['kind'] == 'phase_end']
-                    self.assertEqual(sum(event['name'] == 'bootstrap:parent_cli' for event in ends), 3)
-                    self.assertEqual(sum(event['name'] == 'bootstrap:runtime_child_cli' for event in ends), 2)
+                    self.assertEqual(sum(event['name'] == 'bootstrap:parent_cli' for event in ends),
+                                     attempts + int(interrupted_registration))
+                    self.assertEqual(sum(event['name'] == 'bootstrap:runtime_child_cli' for event in ends), attempts)
                     self.assertTrue(any(event['kind'] == 'git_cost' and event['count'] > 0 for event in records))
 
+    def test_remote_bootstrap_child_resumes_saved_scope_without_identity_injection(self):
+        self._assert_saved_scope_resume()
+
     def test_selected_runtime_b_survives_external_base_c_before_child_prevalidation(self):
-        self.test_remote_bootstrap_child_resumes_saved_scope_without_identity_injection(advance_after_selection=True)
+        self._assert_saved_scope_resume(advance_after_selection=True)
 
 
 class BootstrapSavedScopeFixtureUnitTests(unittest.TestCase):

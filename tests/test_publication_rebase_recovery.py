@@ -497,6 +497,7 @@ class PublicationRebaseInterruptionTests(PublicationRebaseRecoveryTestFixture, u
                             1,
                             "stop after recovery assertion",
                             "worker-session",
+                            loop_manager.AgentResultKind.USAGE_LIMIT,
                         )
 
                     with mock.patch(
@@ -510,7 +511,7 @@ class PublicationRebaseInterruptionTests(PublicationRebaseRecoveryTestFixture, u
                     ), mock.patch(
                         "loop_manager.run_codex", side_effect=resumed_worker
                     ) as resumed_agent:
-                        resumed = loop_manager.run_project(
+                        resumed = loop_manager.run_project_result(
                             connection,
                             state_dir,
                             str(repo),
@@ -519,8 +520,8 @@ class PublicationRebaseInterruptionTests(PublicationRebaseRecoveryTestFixture, u
                             False,
                         )
 
-                    blocked = connection.execute(
-                        "SELECT phase FROM projects WHERE repo = ?",
+                    preserved = connection.execute(
+                        "SELECT phase, worker_session_id FROM projects WHERE repo = ?",
                         (str(repo),),
                     ).fetchone()
                     plan_status = connection.execute(
@@ -528,10 +529,15 @@ class PublicationRebaseInterruptionTests(PublicationRebaseRecoveryTestFixture, u
                         "WHERE repo = ? AND plan_id = 'G-014'",
                         (str(repo),),
                     ).fetchone()["status"]
-                    self.assertEqual(resumed, 0)
-                    self.assertIsNone(blocked["phase"])
-                    self.assertEqual(plan_status, "PLAN_BLOCKED")
-                    self.assertEqual(resumed_agent.call_count, 4)
+                    # Retry exhaustion and the actual blocked conflict/index
+                    # are covered by test_publication_rebase_conflict_blocks_when_worker_cannot_resolve.
+                    # This regression ends once the original recovery resumes.
+                    self.assertEqual(resumed.kind, loop_manager.ProjectRunKind.USAGE_LIMIT_PAUSE)
+                    self.assertEqual(preserved["phase"], "WORKING")
+                    self.assertEqual(preserved["worker_session_id"], "worker-session")
+                    self.assertEqual(plan_status, "IMPLEMENTING")
+                    self.assertEqual(resumed_agent.call_count, 1)
+                    self.assertTrue(loop_manager._rebase_in_progress_for_branch(worktree, branch))
 
 
     @dummy_worker_sessions
