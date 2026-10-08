@@ -157,7 +157,7 @@ def execute_manifest(modules, directory, writer, client, *, spawn, validate_repo
 
 def execute_command(argv, cwd, timeout, writer, client, run_id, unit_id, *, run_process=None, sleep=time.sleep):
     """Serial mandatory commands also reserve resources and confirm termination."""
-    from loop_manager_internal.execution.verify_process import run_verify_process
+    from loop_manager_internal.execution.verify_process import run_verify_process, VerifyTerminationUncertain
     from loop_manager_internal.verification.guard import worker_environment
     run_process = run_process or run_verify_process
     started = time.monotonic()
@@ -171,7 +171,7 @@ def execute_command(argv, cwd, timeout, writer, client, run_id, unit_id, *, run_
                 break
             sleep(0.05)
     token = reply["token"]
-    launched, stopped = False, False
+    launched, stopped, uncertain = False, False, False
     def bind(process, job):
         nonlocal launched
         launched = True
@@ -187,8 +187,11 @@ def execute_command(argv, cwd, timeout, writer, client, run_id, unit_id, *, run_
         writer.emit("unit_result", version=1, run_id=run_id, unit_id=unit_id, passed=passed,
                     exit_code=getattr(output, "exit_code", None), timed_out=timed_out, kind_of_unit="command")
         return passed
+    except VerifyTerminationUncertain:
+        uncertain = True
+        raise
     finally:
         if stopped:
             client.request("release", token=token)
-        elif not launched:
+        elif not launched and not uncertain:
             client.request("not_started", token=token)

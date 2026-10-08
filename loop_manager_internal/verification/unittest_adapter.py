@@ -1,6 +1,7 @@
 """unittest 수집, fixture, reporter와 프로젝트 interpreter 경계."""
 from __future__ import annotations
 from dataclasses import asdict, dataclass
+import importlib
 import json
 import os
 from pathlib import Path
@@ -28,6 +29,10 @@ def project_imports():
                 del sys.modules[name]
         sys.path[:] = [entry for entry in sys.path if Path(entry or ".").resolve() != runtime]
     sys.path.insert(0, str(root))
+    if (root / "loop_manager_internal/verification/timing.py").is_file():
+        # Bind before discovery/load_tests can import helpers with copied ContextVars.
+        importlib.import_module("loop_manager_internal.verification.timing")
+        bind_instrumentation()
 
 
 def bind_instrumentation():
@@ -59,7 +64,6 @@ def worker_main():
             try:
                 with writer.activate(), phase(f"import:{module.name}"):
                     suite = load_module(module)
-                    bind_instrumentation()
                     owners = {test.id(): (test.__class__.__module__,
                               f"{test.__class__.__module__}.{test.__class__.__qualname__}") for test in test_cases(suite)}
                 with writer.activate(), phase(f"module:{module.name}"), fixture_timing(), git_command_timing():

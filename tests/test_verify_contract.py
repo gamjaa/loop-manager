@@ -458,3 +458,93 @@ class ManagerDeadlineHandoffTests(unittest.TestCase):
         fake_job = SimpleNamespace(active=mock.Mock(side_effect=[1, 0]))
         with mock.patch.object(windows_job.time, 'sleep'):
             windows_job.WindowsJob.wait(fake_job, None)
+
+
+class ReviewBoundaryRegressionTests(unittest.TestCase):
+    def test_windows_assignment_and_cleanup_failure_before_callback_retains_reservation(self):
+        from loop_manager_internal.execution import windows_job
+        from loop_manager_internal.verification.coordination import VerifyCoordinator
+        from loop_manager_internal.verification.resources import Snapshot, MIB
+        sampler = SimpleNamespace(sample=lambda: Snapshot(10, 4, 0, 4096 * MIB, 'fake'))
+        coordinator = VerifyCoordinator(sampler=sampler, clock=lambda: 10)
+        session, secret = coordinator.open(1)
+        client = SimpleNamespace(request=lambda operation, **data: coordinator.request(session, secret, operation, **data))
+        process = mock.Mock(pid=123)
+        process.poll.return_value = None
+        job = mock.Mock()
+        job.assign.side_effect = OSError('assignment failed')
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            writer = EventWriter(root / 'events.jsonl')
+            try:
+                with mock.patch.object(verify_process, 'os', SimpleNamespace(name='nt')), \
+                        mock.patch.object(verify_process.subprocess, 'CREATE_NEW_PROCESS_GROUP', 0, create=True), \
+                        mock.patch.object(windows_job, 'WindowsJob', return_value=job), \
+                        mock.patch.object(verify_process.subprocess, 'Popen', return_value=process), \
+                        mock.patch.object(verify_process, 'terminate_verify_process',
+                                          side_effect=verify_process.VerifyTerminationUncertain('termination unknown')):
+                    with self.assertRaises(verify_process.VerifyTerminationUncertain):
+                        core.execute_command(['tool'], root, 10, writer, client, 'run', 'compile')
+            finally:
+                writer.close()
+        self.assertEqual(len(coordinator.reservations), 1)
+        reservation = next(iter(coordinator.reservations.values()))
+        self.assertEqual(reservation['session'], session)
+        self.assertEqual(reservation['unit_id'], 'compile')
+        self.assertIsNone(reservation['pid'])
+        process.stdin.write.assert_not_called()
+        job.close.assert_called_once()
+
+    def test_separate_candidate_imports_share_context_before_git_helpers_load(self):
+        # Purging runtime imports requires a fresh interpreter; mock Git process effects.
+        import shutil
+        import subprocess
+        runtime = Path(unittest_adapter.__file__).resolve().parents[2]
+        with tempfile.TemporaryDirectory() as directory:
+            candidate = Path(directory)
+            package = candidate / 'loop_manager_internal/verification'
+            package.mkdir(parents=True)
+            for relative in ('loop_manager_internal/__init__.py',
+                             'loop_manager_internal/verification/__init__.py',
+                             'loop_manager_internal/verification/timing.py',
+                             'loop_manager_internal/verification/git_timing.py'):
+                shutil.copyfile(runtime / relative, candidate / relative)
+            code = '''
+import dataclasses, pathlib, subprocess, sys
+from unittest import mock
+sys.path.insert(0, sys.argv[1])
+from loop_manager_internal.verification import unittest_adapter as adapter
+adapter.project_imports()
+from loop_manager_internal.verification import git_timing as candidate
+from loop_manager_internal.verification import timing
+assert pathlib.Path(candidate.__file__).is_relative_to(pathlib.Path(sys.argv[2]))
+assert candidate._current_writer is adapter.instrumentation._current_writer
+assert candidate._phase_names is adapter.instrumentation._phase_names
+writer = adapter.instrumentation.EventWriter(pathlib.Path('events.jsonl'))
+fields = ('git', 'git_bytes', '_worktree_catalog', '_handoff_run', 'run_config')
+Effects = dataclasses.make_dataclass('Effects', [(name, object) for name in fields])
+effects = Effects(*[lambda *args: 'mock result' for name in fields])
+def start(process, args, *rest, **kwargs):
+    process.returncode = None
+def wait(process, *args, **kwargs):
+    process.returncode = 0
+    return 0
+try:
+    with writer.activate(), adapter.instrumentation.phase('candidate:cost'):
+        with candidate.snapshot_timing(effects) as measured:
+            measured.git(pathlib.Path('.'), 'status')
+        with mock.patch.object(subprocess.Popen, '__init__', start), mock.patch.object(subprocess.Popen, 'wait', wait):
+            with candidate.git_command_timing():
+                process = subprocess.Popen(['git', 'status'])
+                process.wait()
+finally:
+    writer.close()
+summary = timing.summarize(pathlib.Path('.'))
+assert sum(item['count'] for item in summary['git_commands']) == 1, summary
+assert summary['git_commands'][0]['phases'] == ['candidate:cost'], summary
+assert sum(cost['commands']['status']['count'] for cost in summary['git_snapshots'].values()) == 1, summary
+assert not summary['active'], summary
+'''
+            result = subprocess.run([sys.executable, '-I', '-c', code, str(runtime), str(candidate)],
+                cwd=candidate, capture_output=True, text=True, timeout=10, check=False)
+        self.assertEqual(result.returncode, 0, result.stderr)
