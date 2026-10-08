@@ -358,7 +358,13 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
                          self.definition.worker_candidate_token(acceptance['head']))
 
     def test_clean_base_change_preserves_worker_and_session_but_invalidates_review(self):
-        self.state.update_project('repo', worker_session_id='saved')
+        # Match the production script adapter: unmeasured inputs require verify
+        # again even though a clean rebase retains the completed Worker.
+        self.observer.side_effect = lambda _: inputs.InputObservation(
+            None, reason='unconfirmed runtime/Git/external inputs')
+        self.verify()
+        self.state.update_project('repo', worker_session_id='saved',
+                                  review_result='VERDICT: PASS', review_token='old-review')
         self.audit()
         self.remote = 'new-base'
         result = self.handler.guard(self.context())
@@ -371,6 +377,10 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.assertEqual(self.repository.active_row('repo')['verify_failure_history'], '{"past": 1}')
         self.assertIsNone(row['verify_token'])
         self.assertIsNone(row['review_token'])
+        self.assertNotIn('worker', self.calls)
+        self.verify()
+        self.assertEqual(self.calls.count('verify'), 2)
+        self.assertEqual(self.state.row()['phase'], 'REVIEWING')
         self.assertNotIn('worker', self.calls)
 
     def test_conflict_progress_only_preserves_rebase_state_and_real_conditions_block(self):
