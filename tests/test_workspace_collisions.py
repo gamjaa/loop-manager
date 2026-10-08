@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 import loop_manager
 from tests.support.git import git_command, make_remote_repository, commit_and_push
+from tests.support.lifecycle import register_connection_cleanup
 from tests.support.worker import dummy_worker_sessions
 
 
@@ -232,6 +233,7 @@ class WorkspaceCollisionsTest(WorkspaceFixture, unittest.TestCase):
             marker.write_text("preserve me\n", encoding="utf-8")
             original_head = git_command(planning_worktree, "rev-parse", "HEAD")
             connection = sqlite3.connect(":memory:")
+            register_connection_cleanup(self, connection)
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
             connection.execute(
@@ -366,6 +368,7 @@ class WorkspaceCollisionsTest(WorkspaceFixture, unittest.TestCase):
             victim_head = git_command(victim, "rev-parse", "HEAD")
             plan_sha = git_command(repo, "rev-parse", "origin/main")
             connection = sqlite3.connect(":memory:")
+            register_connection_cleanup(self, connection)
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
             connection.execute(

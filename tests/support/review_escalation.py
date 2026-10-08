@@ -4,8 +4,7 @@ from pathlib import Path
 from unittest import mock
 import loop_manager
 from tests.support.catalog import make_catalog_root, write_execplan
-from tests.support.git import git_command, make_remote_repository, commit_and_push
-from tests.support.worker import worker_result
+from tests.support.worker import make_active_worker_project, worker_result
 from tests.support.publication import publishing_branch_pr_lookup
 
 
@@ -59,43 +58,14 @@ class WorkerEscalationFixture:
         self,
         directory: str,
     ) -> tuple[Path, Path, sqlite3.Connection]:
-        repo = make_remote_repository(directory)
-        state_dir = Path(directory) / "state"
-        state_dir.mkdir()
-        (repo / "docs/plans").mkdir()
-        plan = write_execplan(repo, "G-019", "Review Escalation")
-        commit_and_push(repo, "Add escalation plan")
-        plan_sha = git_command(repo, "rev-parse", "origin/main")
-        branch, worktree = loop_manager.expected_execplan_workspace(
-            state_dir, str(repo), "G-019"
+        return make_active_worker_project(
+            self,
+            directory,
+            plan_id="G-019",
+            title="Review Escalation",
+            record_general_input=False,
+            commit_message="Add escalation plan",
         )
-        loop_manager.make_worktree(repo, worktree, branch, "main")
-        connection = sqlite3.connect(":memory:")
-        try:
-            connection.row_factory = sqlite3.Row
-            connection.execute(loop_manager.SCHEMA)
-            connection.execute(
-                """
-                INSERT INTO projects (
-                    repo, base_branch, active_sha, plan_sha, phase, branch,
-                    worktree, plan_path
-                ) VALUES (?, 'main', ?, ?, 'WORKING', ?, ?, ?)
-                """,
-                (
-                    str(repo),
-                    plan_sha,
-                    plan_sha,
-                    branch,
-                    str(worktree),
-                    plan.relative_to(repo).as_posix(),
-                ),
-            )
-            connection.commit()
-        except BaseException:
-            connection.close()
-            raise
-        self.addCleanup(connection.close)
-        return repo, state_dir, connection
 
     def _run_reviews(
         self,

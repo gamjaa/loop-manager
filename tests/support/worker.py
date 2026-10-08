@@ -8,6 +8,7 @@ from loop_manager_internal.storage import planning_input_state
 from loop_manager_internal.execution.worker_session import SessionBinding
 from tests.support.catalog import write_execplan
 from tests.support.git import git_command, make_remote_repository, commit_and_push
+from tests.support.lifecycle import register_connection_cleanup
 
 
 def worker_result(
@@ -119,22 +120,30 @@ def decision(**changes):
     return "WORKER_OUTCOME: " + json.dumps(value, ensure_ascii=False)
 
 
-class ActiveWorkerFixture:
-    """Shared scenario setup; inheriting this fixture collects no tests."""
-
-    def _make_active_worker_project(self, directory: str):
-        repo = make_remote_repository(directory)
-        state_dir = Path(directory) / "state"
-        state_dir.mkdir()
-        (repo / "docs/plans").mkdir()
-        plan = write_execplan(repo, "G-001", "Worker Boundary")
-        commit_and_push(repo, "Add worker plan")
-        plan_sha = git_command(repo, "rev-parse", "origin/main")
-        branch, worktree = loop_manager.expected_execplan_workspace(
-            state_dir, str(repo), "G-001"
-        )
-        loop_manager.make_worktree(repo, worktree, branch, "main")
-        connection = sqlite3.connect(":memory:")
+def make_active_worker_project(
+    owner,
+    directory: str,
+    *,
+    plan_id: str,
+    title: str,
+    record_general_input: bool,
+    commit_message: str,
+) -> tuple[Path, Path, sqlite3.Connection]:
+    """Build a published plan, deterministic workspace, and WORKING projection."""
+    repo = make_remote_repository(directory)
+    state_dir = Path(directory) / "state"
+    state_dir.mkdir()
+    (repo / "docs/plans").mkdir()
+    plan = write_execplan(repo, plan_id, title)
+    commit_and_push(repo, commit_message)
+    plan_sha = git_command(repo, "rev-parse", "origin/main")
+    branch, worktree = loop_manager.expected_execplan_workspace(
+        state_dir, str(repo), plan_id
+    )
+    loop_manager.make_worktree(repo, worktree, branch, "main")
+    connection = sqlite3.connect(":memory:")
+    close_connection = register_connection_cleanup(owner, connection)
+    try:
         connection.row_factory = sqlite3.Row
         connection.execute(loop_manager.SCHEMA)
         connection.execute(
@@ -153,9 +162,27 @@ class ActiveWorkerFixture:
                 plan.relative_to(repo).as_posix(),
             ),
         )
-        planning_input_state.record_general(
-            connection, str(repo), plan_sha,
-            loop_manager.plan_declarations(repo, plan_sha),
-        )
+        if record_general_input:
+            planning_input_state.record_general(
+                connection, str(repo), plan_sha,
+                loop_manager.plan_declarations(repo, plan_sha),
+            )
         connection.commit()
-        return repo, state_dir, connection
+    except BaseException:
+        close_connection()
+        raise
+    return repo, state_dir, connection
+
+
+class ActiveWorkerFixture:
+    """Shared scenario setup; inheriting this fixture collects no tests."""
+
+    def _make_active_worker_project(self, directory: str):
+        return make_active_worker_project(
+            self,
+            directory,
+            plan_id="G-001",
+            title="Worker Boundary",
+            record_general_input=True,
+            commit_message="Add worker plan",
+        )

@@ -1,7 +1,7 @@
 """Unit regressions for import purity, fixture lifetime and scoped compatibility."""
 import ast
 import json
-from contextlib import ExitStack
+from contextlib import ExitStack, nullcontext
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -19,7 +19,9 @@ from tests.support.execution import ExecutionFixture, execution_fixture
 from tests.support import database as database_fixture
 from tests.support import notification as notification_fixture
 from tests.support import recovery as recovery_fixture
+from tests.support import review_escalation as escalation_fixture
 from tests.support import workspace as workspace_fixture
+from tests.support import worker as worker_fixture
 from tests.support.worker import dummy_worker_context, dummy_worker_sessions, legacy_planning_ports
 from tests.support.origin import OriginScopeFixture
 
@@ -221,6 +223,8 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
 
         with mock.patch.object(loop_manager, '_agent_profile', side_effect=real_profile) as profile, \
              mock.patch.object(loop_manager.project_registry, 'list_projects', return_value=projects), \
+             mock.patch('loop_manager_internal.application.scheduler.VerifyCoordinator',
+                        side_effect=lambda: nullcontext()), \
              mock.patch.object(loop_manager, '_run_registered_project', side_effect=run_project):
             results = run_scheduler()
             self.assertEqual([(repo, value) for repo, value, _thread in results], [
@@ -309,6 +313,131 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
                     recovery_fixture.BoundedRecoveryFixture._failure_state(owner, directory)
         connection.close.assert_called_once_with()
 
+    def test_recovery_fixture_does_not_close_a_borrowed_connection(self):
+        owner = SimpleNamespace(addCleanup=mock.Mock())
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        with tempfile.TemporaryDirectory() as directory:
+            _root, returned = recovery_fixture.BoundedRecoveryFixture._failure_state(
+                owner, directory, connection=connection
+            )
+        self.assertIs(returned, connection)
+        owner.addCleanup.assert_not_called()
+        self.assertEqual(connection.execute('SELECT 1').fetchone()[0], 1)
+
+    def test_active_worker_fixture_variants_preserve_preparation_contracts(self):
+        result = (Path('/repo'), Path('/state'), mock.Mock())
+        owner = SimpleNamespace()
+        variants = (
+            (
+                worker_fixture,
+                worker_fixture.ActiveWorkerFixture._make_active_worker_project,
+                {'plan_id': 'G-001', 'title': 'Worker Boundary',
+                 'record_general_input': True, 'commit_message': 'Add worker plan'},
+            ),
+            (
+                recovery_fixture,
+                recovery_fixture.BoundedRecoveryFixture._active_worker_project,
+                {'plan_id': 'G-001', 'title': 'Worker Boundary',
+                 'record_general_input': False, 'commit_message': 'Add worker plan'},
+            ),
+            (
+                escalation_fixture,
+                escalation_fixture.WorkerEscalationFixture._active_worker_project,
+                {'plan_id': 'G-019', 'title': 'Review Escalation',
+                 'record_general_input': False, 'commit_message': 'Add escalation plan'},
+            ),
+        )
+        for fixture_module, prepare, expected in variants:
+            with self.subTest(plan_id=expected['plan_id']), mock.patch.object(
+                fixture_module, 'make_active_worker_project', return_value=result
+            ) as shared_prepare:
+                returned = prepare(owner, '/fixture')
+            self.assertIs(returned, result)
+            shared_prepare.assert_called_once_with(owner, '/fixture', **expected)
+
+    def test_shared_active_worker_setup_keeps_working_state_and_input_choice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            for record_general_input in (False, True):
+                with self.subTest(record_general_input=record_general_input):
+                    scenario = Path(directory) / f'scenario-{record_general_input}'
+                    scenario.mkdir()
+                    repo = scenario / 'repo'
+                    repo.mkdir()
+                    (repo / 'docs').mkdir()
+                    worktree = scenario / 'worktree'
+                    with mock.patch.object(
+                        worker_fixture, 'make_remote_repository', return_value=repo
+                    ), mock.patch.object(
+                        worker_fixture, 'commit_and_push'
+                    ), mock.patch.object(
+                        worker_fixture, 'git_command', return_value='plan-sha'
+                    ), mock.patch.object(
+                        worker_fixture.loop_manager,
+                        'expected_execplan_workspace',
+                        return_value=('branch', worktree),
+                    ), mock.patch.object(
+                        worker_fixture.loop_manager, 'make_worktree'
+                    ), mock.patch.object(
+                        worker_fixture.planning_input_state, 'record_general'
+                    ) as record_input, mock.patch.object(
+                        worker_fixture.loop_manager, 'plan_declarations', return_value=[]
+                    ):
+                        prepared = worker_fixture.make_active_worker_project(
+                            self,
+                            str(scenario),
+                            plan_id='G-001',
+                            title='Worker Boundary',
+                            record_general_input=record_general_input,
+                            commit_message='Add worker plan',
+                        )
+                    self.assertEqual(len(prepared), 3)
+                    self.assertEqual(prepared[0], repo)
+                    self.assertEqual(prepared[2].execute(
+                        'SELECT phase FROM projects'
+                    ).fetchone()[0], 'WORKING')
+                    if record_general_input:
+                        record_input.assert_called_once()
+                    else:
+                        record_input.assert_not_called()
+
+    def test_active_worker_fixture_closes_connection_after_initialization_failure(self):
+        connection = mock.Mock()
+        connection.execute.side_effect = RuntimeError('schema setup failed')
+        cleanup_callbacks = []
+        owner = SimpleNamespace(addCleanup=cleanup_callbacks.append)
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Path(directory) / 'repo'
+            repo.mkdir()
+            (repo / 'docs').mkdir()
+            with mock.patch.object(
+                worker_fixture, 'make_remote_repository', return_value=repo
+            ), mock.patch.object(
+                worker_fixture, 'commit_and_push'
+            ), mock.patch.object(
+                worker_fixture, 'git_command', return_value='plan-sha'
+            ), mock.patch.object(
+                worker_fixture.loop_manager,
+                'expected_execplan_workspace',
+                return_value=('branch', Path(directory) / 'worktree'),
+            ), mock.patch.object(
+                worker_fixture.loop_manager, 'make_worktree'
+            ), mock.patch.object(
+                worker_fixture.sqlite3, 'connect', return_value=connection
+            ):
+                with self.assertRaisesRegex(RuntimeError, 'schema setup failed'):
+                    worker_fixture.make_active_worker_project(
+                        owner,
+                        directory,
+                        plan_id='G-001',
+                        title='Worker Boundary',
+                        record_general_input=True,
+                        commit_message='Add worker plan',
+                    )
+        connection.close.assert_called_once_with()
+        cleanup_callbacks[0]()
+        connection.close.assert_called_once_with()
+
     def test_workspace_fixture_closes_owned_connection_after_initialization_failure(self):
         connection = mock.Mock()
         connection.execute.side_effect = RuntimeError('schema setup failed')
@@ -326,7 +455,7 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
             with mock.patch.object(database_fixture.sqlite3, 'connect', return_value=connection):
                 with self.assertRaisesRegex(RuntimeError, 'schema setup failed'):
                     database_fixture.AutomationCatalogFixture._connection(owner)
-        self.assertGreaterEqual(connection.close.call_count, 1)
+        self.assertEqual(connection.close.call_count, 1)
 
     def test_git_factory_uses_explicit_repository_and_preserves_seed_files(self):
         from tests.support import git as fixture_git
