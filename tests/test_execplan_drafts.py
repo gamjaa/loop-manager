@@ -1,5 +1,6 @@
 """Unit coverage for published ExecPlan decision holds; Git/agents are fakes."""
 from dataclasses import replace
+from contextlib import closing
 import hashlib
 import json
 from pathlib import Path
@@ -266,9 +267,9 @@ class ExecPlanDraftCatalogTest(AutomationCatalogFixture, unittest.TestCase):
         previous = self.waiting()
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "state.sqlite"
-            with sqlite3.connect(path) as saved:
+            with closing(sqlite3.connect(path)) as saved, saved:
                 self.connection.backup(saved)
-            with sqlite3.connect(path) as restarted:
+            with closing(sqlite3.connect(path)) as restarted, restarted:
                 restarted.row_factory = sqlite3.Row
                 database._ensure_execplans_schema(restarted)
                 self.assertEqual(execplan_draft_state.evidence(restarted, "repo", "G-001"), previous)

@@ -1,6 +1,7 @@
 from tests.support.maintenance import root_results_for, result_for
 import hashlib
 import json
+from contextlib import closing
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -16,10 +17,10 @@ from loop_manager_internal.storage import maintenance_file_ledger
 class ProvisionalReviewSchemaTest(unittest.TestCase):
     def test_parent_initializes_guidance_schema_before_project_connections(self):
         from loop_manager_internal.storage import database
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, closing(
+            database.connect_database(Path(directory), create=True)
+        ) as parent:
             state_dir = Path(directory)
-            parent = database.connect_database(state_dir, create=True)
-            self.addCleanup(parent.close)
             columns = {row[1] for row in parent.execute('PRAGMA table_info(provisional_file_reviews)')}
             self.assertTrue({'guidance_hash', 'prior_guidance_results'} <= columns)
             for _ in range(2):

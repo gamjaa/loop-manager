@@ -600,7 +600,7 @@ class TimelyProgressDeliveryTest(NotificationFixture, unittest.TestCase):
         with notifications.immediate_delivery(connection, 'token', 'chat', repo), \
              mock.patch.object(delivery, 'send_telegram', side_effect=lambda *args, **kw: sent.append((args, kw))):
             with connection:
-                notifications.enqueue_progress(connection, repo, 'stage_failed', 'failure',
+                notifications.enqueue_progress(connection, repo, 'maintenance_started', 'failure',
                     cause='x' * 6000, status='자동 교정 대기', silent=True)
                 self.assertEqual(notifications.flush_project_events(connection, repo), 0)
             self.assertEqual(sent, [])
@@ -619,8 +619,8 @@ class TimelyProgressDeliveryTest(NotificationFixture, unittest.TestCase):
         database = Path(directory) / 'state.db'
         connection = self.connection(database=database)
         with connection:
-            notifications.enqueue_progress(connection, '/projects/alpha', 'stage_failed', 'failure',
-                cause='x' * 6000, status='자동 교정 대기', silent=True)
+            notifications._insert(connection, 'legacy-failure', '/projects/alpha', 'stage_failed',
+                {'project': 'alpha', 'cause': 'x' * 6000, 'status': '자동 교정 대기', 'silent': True})
         original = self.events(connection)[0]['payload']
         send = mock.Mock(side_effect=[None, RuntimeError('secret token')])
         self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=send), 0)
@@ -685,7 +685,8 @@ class InterruptedBlockStartupTest(NotificationFixture, unittest.TestCase):
                 with restarted:
                     notifications.record_process_start(restarted, repo, 'worker', 'saved-start', plan_id='G-018')
                     notifications.record_process_start(restarted, repo, 'worker', 'new-start', plan_id='G-018')
-                self.assertEqual(restarted.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type='work_started'").fetchone()[0], 1 if confirmed else 2)
+                self.assertEqual(restarted.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type='work_started'").fetchone()[0], 0 if confirmed else 1)
+                restarted.close()
 
     def test_disabled_startup_preserves_abandoned_record_without_notice(self):
         from types import SimpleNamespace

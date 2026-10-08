@@ -520,9 +520,9 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
             notifications.dispatch_pending(
                 connection, "token", "chat", adapter=delivered,
             ),
-            2,
+            1,
         )
-        self.assertEqual(delivered.call_count, 2)
+        self.assertEqual(delivered.call_count, 1)
 
     def test_pr_and_blocked_payloads_are_complete_and_deduplicated(self):
         connection = self.connection()
@@ -727,7 +727,7 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
         cause = 'request rejected\n{"password": "first-private\\nsecond-private"}\nBearer bearer-private\n' + 'sk-' + 'a' * 24
         for identity in ('first-error', 'first-error', 'second-error'):
             with connection:
-                notifications.enqueue_progress(connection, '/projects/alpha', 'stage_failed', identity,
+                notifications.enqueue_progress(connection, '/projects/alpha', 'maintenance_started', identity,
                     execplan_id='G-018', operation='Planner', cause=cause,
                     status='자동 교정 대기', silent=True)
         events = self.events(connection)
@@ -738,7 +738,7 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             self.assertEqual(payload['execplan_id'], 'G-018')
             self.assertEqual(payload['status'], '자동 교정 대기')
             self.assertTrue(payload['silent'])
-            text = notifications._message('stage_failed', payload)
+            text = notifications._message('maintenance_started', payload)
             self.assertIn('request rejected', text)
             self.assertIn(payload['occurred_at'], text)
             for secret in ('first-private', 'second-private', 'bearer-private', 'sk-' + 'a' * 24):
@@ -751,49 +751,29 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
                                     phase='REVIEWING', last_error='Reviewer CLI execution failed')
         self.assertEqual(self.events(connection), [])
 
-    def test_review_failure_identity_preserves_changes_and_transaction_boundary(self):
+    def test_review_failure_preserves_state_without_notification(self):
         connection = self.connection()
         repo = '/projects/alpha'
         with self.assertRaisesRegex(RuntimeError, 'interrupted'):
             with connection:
-                connection.execute("UPDATE projects SET phase = 'REVIEWING', last_error = 'Reviewer 결과 프로토콜 오류: protocol error' WHERE repo = ?", (repo,))
+                connection.execute("UPDATE projects SET phase = 'REVIEWING', last_error = 'protocol error' WHERE repo = ?", (repo,))
                 notifications.enqueue_current_project_events(connection, repo)
                 raise RuntimeError('interrupted')
+        self.assertIsNone(connection.execute('SELECT last_error FROM projects WHERE repo = ?', (repo,)).fetchone()[0])
+        for cause in ('protocol error', 'different protocol error'):
+            loop_manager.update_project(connection, repo, phase='REVIEWING', last_error='Reviewer 결과 프로토콜 오류: ' + cause)
+            self.assertIn(cause, connection.execute('SELECT last_error FROM projects WHERE repo = ?', (repo,)).fetchone()[0])
         self.assertEqual(self.events(connection), [])
-        loop_manager.update_project(connection, repo, phase='REVIEWING', last_error='Reviewer 결과 프로토콜 오류: protocol error')
-        first = self.events(connection)[0]['payload']
-        loop_manager.update_project(connection, repo, last_error='Reviewer 결과 프로토콜 오류: protocol error')
-        self.assertEqual(len(self.events(connection)), 1)
-        self.assertEqual(self.events(connection)[0]['payload'], first)
-        loop_manager.update_project(connection, repo, last_error='Reviewer 결과 프로토콜 오류: different protocol error')
-        self.assertEqual(len(self.events(connection)), 2)
-        loop_manager.update_project(connection, repo, verify_token='new-candidate', last_error='Reviewer 결과 프로토콜 오류: protocol error')
-        self.assertEqual(len(self.events(connection)), 3)
 
-    def test_review_protocol_failure_is_durable_silent_and_deduplicated(self):
+    def test_review_protocol_failure_and_candidate_changes_do_not_notify(self):
         connection = self.connection()
         repo = '/projects/alpha'
         cause = 'Reviewer 결과 프로토콜 오류: missing ISSUE_ID'
-        with connection:
-            connection.execute("UPDATE exec_plans SET verify_token = 'candidate-1' WHERE repo = ?", (repo,))
-        loop_manager.update_project(connection, repo, phase='REVIEWING', last_error=cause)
-        first = next(row for row in self.events(connection) if row['event_type'] == 'stage_failed')
-        payload = json.loads(first['payload'])
-        self.assertEqual(payload['execplan_id'], 'G-018')
-        self.assertEqual(payload['operation'], 'Reviewer')
-        self.assertEqual(payload['cause'], cause)
-        self.assertEqual(payload['status'], '자동 교정·재시도 대기')
-        self.assertTrue(payload['silent'])
-        self.assertIn('occurred_at', payload)
-        loop_manager.update_project(connection, repo, phase='REVIEWING', last_error=cause)
-        loop_manager.update_project(connection, repo, phase='PUBLISHING', last_error=None)
-        self.assertEqual(len([row for row in self.events(connection) if row['event_type'] == 'stage_failed']), 1)
-        self.assertEqual(connection.execute('SELECT payload FROM notification_outbox WHERE event_key = ?',
-                                            (first['event_key'],)).fetchone()[0], first['payload'])
-        with connection:
-            connection.execute("UPDATE exec_plans SET verify_token = 'candidate-2' WHERE repo = ?", (repo,))
-        loop_manager.update_project(connection, repo, phase='REVIEWING', last_error=cause)
-        self.assertEqual(len([row for row in self.events(connection) if row['event_type'] == 'stage_failed']), 2)
+        for token in ('candidate-1', 'candidate-1', 'candidate-2'):
+            with connection:
+                connection.execute('UPDATE exec_plans SET verify_token = ? WHERE repo = ?', (token, repo))
+            loop_manager.update_project(connection, repo, phase='REVIEWING', last_error=cause)
+        self.assertEqual(self.events(connection), [])
 
     def test_selection_is_silent_and_actual_start_is_durable_and_deduplicated(self):
         connection = self.connection()
@@ -812,7 +792,10 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
         self.assertIn(payload['occurred_at'], notifications._message('work_started', payload))
         with connection:
             notifications.record_process_start(connection, repo, 'worker', 'process-2', plan_id='G-018', resumed=True)
-        self.assertEqual(len(self.events(connection)), 2)
+        self.assertEqual(len(self.events(connection)), 1)
+        with connection:
+            notifications.record_process_start(connection, repo, 'worker', 'process-3', plan_id='G-018')
+        self.assertEqual(len(self.events(connection)), 1)
 
     def test_publication_and_draft_share_one_decision_notice_with_waiting(self):
         from loop_manager_internal.storage import execplan_draft_state
@@ -831,7 +814,9 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
         self.assertIsNotNone(snapshot)
         notifications.enqueue_waiting_reason(connection, repo, snapshot)
         events = self.events(connection)
-        self.assertEqual([row['event_type'] for row in events], ['draft_decision'])
+        self.assertEqual([row['event_type'] for row in events], ['draft_decision', 'work_waiting'])
+        self.assertFalse(json.loads(events[1]['payload'])['silent'])
+        self.assertEqual(json.loads(events[1]['payload'])['plans'][0]['status'], 'DRAFT')
         payload = json.loads(events[0]['payload'])
         self.assertFalse(payload['silent'])
         self.assertIn('/blob/remote-sha/', payload['url'])
@@ -839,6 +824,7 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
         self.assertIn('사용자 판단 대기', payload['status'])
         with connection:
             execplan_draft_state.cancel(connection, repo, 'G-018', 'deleted-revision')
+        notifications.mark_work_available(connection, repo)
         delivered = mock.Mock()
         self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=delivered), 0)
         delivered.assert_not_called()
@@ -854,8 +840,8 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
                     RecoveryReason.FETCH_FAILED, repo, 'G-018', 'PUBLISHING',
                     'plan-sha', 'base-sha', 'fetch-failure', marker, 'fetch failed'))
         events = [row for row in self.events(connection) if row['event_type'] == 'stage_failed']
-        self.assertEqual(len(events), 2)
-        self.assertTrue(all(json.loads(row['payload'])['silent'] for row in events))
+        self.assertEqual(events, [])
+        self.assertIsNotNone(connection.execute('SELECT detail FROM recovery_records').fetchone())
 
     def test_failed_uncommitted_publication_never_leaves_success_event(self):
         connection = self.connection()
@@ -875,22 +861,22 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(payload['status'], 'PR Merge 대기')
         self.assertIn(payload['occurred_at'], notifications._message('pr_created', payload))
 
-    def test_planning_result_no_plan_dedup_and_unpublished_plan_identity(self):
+    def test_planning_result_only_notifies_after_catalog_publication(self):
         from types import SimpleNamespace
         from loop_manager_internal.planning.state_ports import _PlanningStatePorts
         connection = self.connection()
         state = object.__new__(_PlanningStatePorts)
         state._connection = connection
-        for _ in range(2):
-            state.record_planning_result('/projects/alpha', 'input-1', None)
+        plans = [('plan.md', {'id': 'G-018', 'title': 'Reliable notices'})]
+        for result in (None, SimpleNamespace(plans=()), SimpleNamespace(plans=plans)):
+            state.record_planning_result('/projects/alpha', 'input-1', result)
+        self.assertEqual(self.events(connection), [])
+        with connection:
+            notifications.record_planning_publication(connection, '/projects/alpha', [], 'no-new-plans')
+            notifications.record_planning_publication(connection, '/projects/alpha', plans, 'remote-sha')
+            notifications.record_planning_publication(connection, '/projects/alpha', plans, 'remote-sha')
         self.assertEqual(len(self.events(connection)), 1)
-        self.assertEqual(json.loads(self.events(connection)[0]['payload'])['status'], '새 계획 없음')
-        state.record_planning_result('/projects/alpha', 'input-1', SimpleNamespace(plans=(
-            ('plan.md', {'id': 'G-018', 'title': 'Reliable notices'}),)))
-        self.assertEqual(len(self.events(connection)), 2)
-        self.assertEqual({json.loads(row['payload'])['status'] for row in self.events(connection)},
-                         {'새 계획 없음', '작성 완료 · 미게시'})
-        self.assertFalse(any(row['event_type'] == 'plans_published' for row in self.events(connection)))
+        self.assertEqual(self.events(connection)[0]['event_type'], 'plans_published')
 
     def test_same_failure_after_resolution_is_a_separate_incident(self):
         connection = self.connection()
@@ -901,7 +887,7 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
             with connection:
                 repository.observe(observation)
                 repository.clear('/projects/alpha', 'G-018')
-        self.assertEqual(len(self.events(connection)), 2)
+        self.assertEqual(self.events(connection), [])
 
     def test_planning_failure_owns_transaction_and_does_not_claim_publication(self):
         from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
@@ -918,15 +904,80 @@ class TimelyProgressEventTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(self.events(connection), [])
         loop_manager.update_project(connection, '/projects/alpha', phase='PLANNING',
                                     planning_attempt_fingerprint='input', planning_validation_error='invalid result')
-        event = self.events(connection)[0]
-        self.assertEqual(event['event_type'], 'stage_failed')
-        self.assertTrue(json.loads(event['payload'])['silent'])
-        self.assertIn('invalid result', notifications._message('stage_failed', json.loads(event['payload'])))
+        self.assertEqual(self.events(connection), [])
+        self.assertEqual(connection.execute('SELECT planning_validation_error FROM projects').fetchone()[0], 'invalid result')
 
-    def test_unplanned_maintenance_start_names_its_stage(self):
+    def test_planner_and_reviewer_process_boundaries_do_not_notify(self):
         connection = self.connection()
+        for role in ('planner', 'planner_check', 'maintenance_planner', 'reviewer'):
+            with self.subTest(role=role), connection:
+                notifications.record_process_start(connection, '/projects/alpha', role, role)
+                notifications.record_process_start(connection, '/projects/alpha', role, role + '-resume', resumed=True)
+        self.assertEqual(self.events(connection), [])
+
+
+class MaintenanceProgressEventTest(NotificationFixture, unittest.TestCase):
+    def test_cycle_start_empty_finish_and_rollback_keep_durable_identity(self):
+        from loop_manager_internal.storage import maintenance_state
+        from loop_manager_internal.planning.state_ports import _PlanningStatePorts
+        from loop_manager_internal.notifications import delivery
+        connection = self.connection()
+        repo = '/projects/alpha'
+        repository = maintenance_state.MaintenanceRepository(connection)
+        ports = object.__new__(_PlanningStatePorts)
+        ports._connection = connection
+        ports._maintenance_repository = repository
+        sent = mock.Mock()
+        with notifications.immediate_delivery(connection, 'token', 'chat', repo), mock.patch.object(delivery, 'send_telegram', sent):
+            cycle, created = ports.begin_maintenance_assessment(repo, 20, 'a' * 40, include_general_planning=False)
+            self.assertTrue(created)
+            sent.assert_called_once()
+            self.assertTrue(sent.call_args.kwargs['disable_notification'])
+            self.assertIn('최초 유지보수 평가', sent.call_args.args[2])
+            again, created = ports.begin_maintenance_assessment(repo, 20, 'a' * 40, include_general_planning=False)
+            self.assertFalse(created)
+            self.assertEqual(again, cycle)
+            with self.assertRaisesRegex(RuntimeError, 'interrupted'):
+                with connection:
+                    connection.execute('BEGIN')
+                    repository.advance_success_baseline(repo, expected_phase=cycle.phase, expected_revision=cycle.revision, remote_commit='a' * 40)
+                    raise RuntimeError('interrupted')
+            self.assertEqual(repository.get(repo), cycle)
+            self.assertEqual(len(self.events(connection)), 1)
+            done = repository.advance_success_baseline(repo, expected_phase=cycle.phase, expected_revision=cycle.revision, remote_commit='a' * 40)
+            ports.flush_notifications(repo)
+            self.assertEqual(done.phase, maintenance_state.MaintenancePhase.IDLE)
+            self.assertEqual(sent.call_count, 2)
+            self.assertIn('후속 계획 없이', sent.call_args.args[2])
+            with self.assertRaises(maintenance_state.MaintenanceStateError):
+                repository.advance_success_baseline(repo, expected_phase=cycle.phase, expected_revision=cycle.revision, remote_commit='a' * 40)
+            self.assertEqual(len(self.events(connection)), 2)
+
+    def test_cycle_with_followup_does_not_finish_until_confirmed_merge(self):
+        from loop_manager_internal.storage import maintenance_state
+        connection = self.connection()
+        repo = '/projects/alpha'
+        repository = maintenance_state.MaintenanceRepository(connection)
+        cycle, _ = repository.begin_assessment_if_due(repo, 20, 'a' * 40)
+        repository.record_assessment_plans(repo, cycle.revision, ('G-018',))
+        cycle = repository.advance_success_baseline(repo, expected_phase=cycle.phase, expected_revision=cycle.revision, remote_commit='a' * 40)
+        self.assertEqual(cycle.phase, maintenance_state.MaintenancePhase.REFACTORING)
+        self.assertEqual([row['event_type'] for row in self.events(connection)], ['maintenance_started'])
         with connection:
-            notifications.record_process_start(connection, '/projects/alpha', 'maintenance_planner', 'assessment-1')
-        payload = json.loads(self.events(connection)[0]['payload'])
-        self.assertIsNone(payload['execplan_id'])
-        self.assertEqual(payload['operation'], '유지보수 평가')
+            connection.execute("UPDATE exec_plans SET status = 'PR_OPEN' WHERE repo = ?", (repo,))
+        with self.assertRaises(maintenance_state.MaintenanceStateError):
+            repository.finish_cycle(repo, expected=cycle, source_sha='b' * 40)
+        with connection:
+            connection.execute("UPDATE exec_plans SET status = 'MERGED' WHERE repo = ?", (repo,))
+            connection.execute("INSERT INTO execplan_catalog_revisions (repo, revision_sha, catalog_fingerprint) VALUES (?, ?, ?)", (repo, 'b' * 40, 'catalog'))
+        with self.assertRaises(maintenance_state.MaintenanceStateError):
+            repository.finish_cycle(repo, expected=cycle, source_sha='c' * 40)
+        done = repository.finish_cycle(repo, expected=cycle, source_sha='b' * 40)
+        self.assertEqual(done.phase, maintenance_state.MaintenancePhase.IDLE)
+        completed = next(row for row in self.events(connection) if row['event_type'] == 'maintenance_completed')
+        payload = json.loads(completed['payload'])
+        self.assertEqual(payload['plans'], [{'id': 'G-018', 'title': 'Reliable notices'}])
+        self.assertTrue(payload['silent'])
+        with self.assertRaises(maintenance_state.MaintenanceStateError):
+            repository.finish_cycle(repo, expected=cycle, source_sha='b' * 40)
+        self.assertEqual(len(self.events(connection)), 2)

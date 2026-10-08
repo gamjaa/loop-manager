@@ -15,7 +15,7 @@ from tests.support.worker import dummy_worker_sessions
 
 
 class ReviewProtocolNotificationTest(NotificationFixture, unittest.TestCase):
-    def test_corrected_protocol_failure_is_sent_before_next_reviewer_call(self):
+    def test_corrected_protocol_failure_retries_without_stage_notice(self):
         connection = self.connection()
         repo = '/projects/alpha'
         context = SimpleNamespace(plan=SimpleNamespace(plan_id='G-018', definition_revision_sha='revision'),
@@ -41,12 +41,10 @@ class ReviewProtocolNotificationTest(NotificationFixture, unittest.TestCase):
         def reviewer(*args, **kwargs):
             calls.append('reviewer')
             if len(calls) == 2:
-                sent.assert_called_once()
-                payload = json.loads(connection.execute(
-                    "SELECT payload FROM notification_outbox WHERE event_type = 'stage_failed'"
-                ).fetchone()[0])
-                self.assertTrue(payload['silent'])
-                self.assertEqual(payload['operation'], 'Reviewer')
+                sent.assert_not_called()
+                self.assertIsNone(connection.execute(
+                    "SELECT 1 FROM notification_outbox WHERE event_type = 'stage_failed'"
+                ).fetchone())
             return AgentResult(0, 'invalid' if len(calls) == 1 else 'VERDICT: PASS')
         ports.run_agent_with_retries.side_effect = reviewer
         handler = ReviewHandler(ports)
@@ -57,7 +55,8 @@ class ReviewProtocolNotificationTest(NotificationFixture, unittest.TestCase):
             handler.review(context)
         self.assertEqual(len(calls), 2)
         self.assertIsNone(connection.execute('SELECT last_error FROM projects').fetchone()[0])
-        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'stage_failed'").fetchone()[0], 1)
+        sent.assert_not_called()
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'stage_failed'").fetchone()[0], 0)
 
 
 class ReviewProtocolRecoveryTest(BoundedRecoveryFixture, unittest.TestCase):

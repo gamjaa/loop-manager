@@ -805,12 +805,13 @@ class UserBlobProvenanceUnitTests(unittest.TestCase):
 
 class BlockedUserInputScopeUnitTests(unittest.TestCase):
     def setUp(self):
+        self.worktree = Path('/state/G-166').resolve()
         self.connection = sqlite3.connect(':memory:')
         self.connection.row_factory = sqlite3.Row
         self.addCleanup(self.connection.close)
         self.before = GitSnapshot('agent-start', 'loop-manager/G-166', {}, {},
             {'refs/heads/loop-manager/G-166': ('agent-start', '')},
-            {'/state/G-166': ('HEAD=agent-start', 'branch=refs/heads/loop-manager/G-166')}, {}, {},
+            {str(self.worktree): ('HEAD=agent-start', 'branch=refs/heads/loop-manager/G-166')}, {}, {},
             scope_id='finished-scope', scope_start_digest='start-digest')
         self.result = replace(self.before, dirty={'code.py': (('untracked',), 'agent-bytes')})
         self.current = replace(self.result, head='user-head',
@@ -820,11 +821,11 @@ class BlockedUserInputScopeUnitTests(unittest.TestCase):
             worktrees={**self.before.worktrees, '/source': ('HEAD=user-base',)})
         self.plan = dict(agent_snapshot=self.before.serialize(), agent_role='worker',
             agent_result_snapshot=self.result.serialize(), agent_recovery=None,
-            agent_manager_snapshot=None, branch=self.before.branch, worktree='/state/G-166',
+            agent_manager_snapshot=None, branch=self.before.branch, worktree=str(self.worktree),
             blocked_reason='verify_retry_exhausted', current_revision_sha='base', plan_sha='base')
         resources = agent_scope_decision.used_git_resources(
             role='worker', phase='PLAN_BLOCKED', base_branch='main',
-            branch=self.before.branch, worktree_key='/state/G-166')
+            branch=self.before.branch, worktree_key=str(self.worktree))
         self.effects = SimpleNamespace(
             repository=mock.Mock(return_value=SimpleNamespace(scope_owner=lambda *args: self.plan,
                                                                scope_catalog_available=lambda: False)),
@@ -846,7 +847,7 @@ class BlockedUserInputScopeUnitTests(unittest.TestCase):
 
     def validate(self, **options):
         scope_recovery.validate_blocked_agent_scope(
-            self.connection, Path('/source'), 'repo', 'main', Path('/state/G-166'),
+            self.connection, Path('/source'), 'repo', 'main', self.worktree,
             'docs/plans/[G-166] Work.md', saved_plan=self.plan, effects=self.effects, **options)
 
     def test_completed_isolated_agent_result_is_checked_before_local_user_changes(self):

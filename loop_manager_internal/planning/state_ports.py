@@ -212,9 +212,11 @@ class _PlanningStatePorts:
     def advance_maintenance_cycle(
         self, repo: str, base_sha: str
     ) -> maintenance_state.MaintenanceCycle:
-        return self._effects._advance_maintenance_cycle_after_merges(
+        cycle = self._effects._advance_maintenance_cycle_after_merges(
             self._connection, repo, base_sha
         )
+        self.flush_notifications(repo)
+        return cycle
 
     def schedule(self, repo: str) -> CatalogScheduleDecision:
         return self._effects.catalog_schedule_decision(self._connection, repo)
@@ -249,7 +251,7 @@ class _PlanningStatePorts:
         completion_candidate: bool = False,
         due_override: maintenance_state.ReviewDue | None = None,
     ) -> tuple[maintenance_state.MaintenanceCycle, bool]:
-        return self._maintenance_repository.begin_assessment_if_due(
+        result = self._maintenance_repository.begin_assessment_if_due(
             repo,
             interval,
             base_sha,
@@ -258,6 +260,8 @@ class _PlanningStatePorts:
             completion_candidate=completion_candidate,
             due_override=due_override,
         )
+        self.flush_notifications(repo)
+        return result
 
     def settle_empty_stabilization_assessment(
         self,

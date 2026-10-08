@@ -1,6 +1,7 @@
 """Durability and idempotence of the invocation ledger."""
 
 import sqlite3
+from contextlib import closing
 from unittest import TestCase
 
 from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, Usage
@@ -158,15 +159,14 @@ class CommonGuidanceStateTests(TestCase):
                 (runtime / path).write_text('role: ' + path, encoding='utf-8')
             database = root / 'state.db'
             context = InvocationContext('repo', 'G-147')
-            with sqlite3.connect(database) as connection, mock.patch.object(common_guidance, 'RUNTIME_ROOT', runtime), \
+            with closing(sqlite3.connect(database)) as connection, connection, mock.patch.object(common_guidance, 'RUNTIME_ROOT', runtime), \
                  mock.patch.object(common_guidance.subprocess, 'run', return_value=type('Revision', (), {'returncode': 0, 'stdout': 'a' * 40})()):
                 repository = GuidanceRepository(connection)
                 snapshot = common_guidance.resolve(repository, context, 'worker', root / 'project', root / 'state')
                 repository.bind_session('repo', 'codex', 'session', snapshot.task_id)
             for path in common_guidance.GUIDANCE_PATHS:
                 (runtime / path).unlink()
-            with sqlite3.connect(database) as restarted, mock.patch.object(common_guidance, 'RUNTIME_ROOT', runtime):
-                self.addCleanup(restarted.close)
+            with closing(sqlite3.connect(database)) as restarted, restarted, mock.patch.object(common_guidance, 'RUNTIME_ROOT', runtime):
                 repository = GuidanceRepository(restarted)
                 resumed = common_guidance.resolve(repository, context, 'reviewer', root / 'project', root / 'state')
                 self.assertEqual(resumed.task_id, snapshot.task_id)

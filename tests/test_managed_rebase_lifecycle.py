@@ -7,7 +7,7 @@ from tests.support.execution import execution_fixture
 from tests.support.pr_recovery import observe_live_pull_request
 from tests.support.recovery_boundary import RecoveryBoundary
 
-from contextlib import nullcontext
+from contextlib import ExitStack, nullcontext
 from dataclasses import replace
 import os
 from pathlib import Path
@@ -50,10 +50,10 @@ def _restart_execution_effects(effects, database, repo):
 class RebaseObservationFailureTests(unittest.TestCase):
     def test_restarted_fixture_updates_audit_on_current_connection_and_keeps_checkpoint(self):
         fixture = execution_fixture(self)
-        with TemporaryDirectory() as directory:
+        with TemporaryDirectory() as directory, ExitStack() as cleanup:
             database = Path(directory) / 'execution.db'
             connection = sqlite3.connect(database)
-            self.addCleanup(connection.close)
+            cleanup.callback(connection.close)
             fixture.connection.commit()
             fixture.connection.backup(connection)
             connection.row_factory = sqlite3.Row
@@ -68,7 +68,7 @@ class RebaseObservationFailureTests(unittest.TestCase):
             for count in (1, 2):
                 previous = effects.state.repository
                 effects = _restart_execution_effects(effects, database, fixture.repo)
-                self.addCleanup(effects.state.connection.close)
+                cleanup.callback(effects.state.connection.close)
                 with self.assertRaises(sqlite3.ProgrammingError):
                     previous.projected(fixture.repo)
                 effects.state.repository.update_plan(fixture.repo, 'G-047', plan_values={

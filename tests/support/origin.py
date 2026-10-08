@@ -10,6 +10,7 @@ from tests.support.git import git_command as git
 def configure_identity(repo: Path) -> None:
     git(repo, "config", "user.email", "loop@example.com")
     git(repo, "config", "user.name", "Loop Test")
+    git(repo, "config", "core.autocrlf", "false")
 
 
 

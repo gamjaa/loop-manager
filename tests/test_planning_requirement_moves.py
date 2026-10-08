@@ -1,5 +1,6 @@
 """Real-Git unit coverage of Manager move observation and validation."""
 from dataclasses import replace
+from contextlib import nullcontext
 import hashlib
 import itertools
 import json
@@ -294,11 +295,12 @@ class PlanningRequirementMoveTest(unittest.TestCase):
                     destination.write_bytes(b"changed")
                 elif violation == "collision":
                     (case.root / case.paths[0]).write_bytes(CONTENTS)
-                else:
-                    destination.unlink()
-                    destination.symlink_to(case.root / "feature.py")
                 restarted = RequirementRetirementPort(case.connection, case.adapter)
-                with self.assertRaises(RetirementError):
+                original_is_symlink = Path.is_symlink
+                observed = (mock.patch.object(Path, 'is_symlink', autospec=True,
+                            side_effect=lambda candidate: candidate == destination or original_is_symlink(candidate))
+                            if violation == 'symlink' else nullcontext())
+                with observed, self.assertRaises(RetirementError):
                     restarted.receipted_paths("repo", case.root, case.base, case.root)
 
     def test_commit_validation_refuses_tampering_even_with_matching_file_hash(self):

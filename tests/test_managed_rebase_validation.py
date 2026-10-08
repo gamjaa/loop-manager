@@ -292,6 +292,21 @@ class CurrentRebaseObservationTests(unittest.TestCase):
         forbidden_queries = {'reflog', 'rev-list', 'range-diff', 'rebase', 'add', 'commit'}
         self.assertFalse(any(call.args[1] in forbidden_queries for call in adapters.git.call_args_list))
 
+    def test_file_reader_receives_each_fresh_observations_index_mode(self):
+        adapters = self.adapters()
+        snapshot = adapters.capture_snapshot.return_value
+        snapshots = iter((snapshot, SimpleNamespace(**{**vars(snapshot),
+            'index': {'app.py': ('H 100755 blob 0',)}})))
+        adapters.capture_snapshot.side_effect = lambda *_args, **_kwargs: next(snapshots)
+        actual, scope = observe_current_rebase(self.expected, adapters)
+        self.assertIsInstance(actual, ObservationFailure)
+        self.assertEqual(actual.area, 'state_changed')
+        self.assertIsNone(scope)
+        root = Path(self.expected.worktree)
+        self.assertEqual(adapters.read_file.call_args_list, [
+            mock.call(root, 'app.py', '100644'), mock.call(root, 'ignored.pyc', None),
+            mock.call(root, 'app.py', '100755'), mock.call(root, 'ignored.pyc', None)])
+
     def test_snapshot_details_remove_duplicate_queries_but_recapture_both_observations(self):
         adapters = self.adapters()
         legacy, scope = observe_current_rebase(self.expected, adapters)
@@ -471,7 +486,7 @@ class CurrentRebaseObservationTests(unittest.TestCase):
                 result.stdout = result.stdout.replace('app.py\0', protected + '\0')
             return result
         adapters.git.side_effect = git
-        adapters.read_file.side_effect = lambda _worktree, path: (
+        adapters.read_file.side_effect = lambda _worktree, path, index_mode: (
             '100755' if path == protected else '100644', 'current-mode',
         )
         actual, scope = observe_current_rebase(expected, adapters)

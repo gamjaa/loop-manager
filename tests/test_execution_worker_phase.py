@@ -25,66 +25,37 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 
 class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
-    def test_worker_provider_credentials_are_redacted_before_storage_and_delivery(self):
+    def test_worker_provider_errors_with_credentials_do_not_emit_stage_notices(self):
         from loop_manager_internal.notifications import notifications
-        from loop_manager_internal.execution.validation_feedback import redact_secrets
         notifications.configure_session(self.connection, enabled=True)
         self.connection.commit()
         for kind in (lm.AgentResultKind.USAGE_LIMIT, lm.AgentResultKind.PERMANENT_CONFIGURATION):
             with self.subTest(kind=kind):
                 detail = f'{kind.value}: request rejected api_key=private-api-value Authorization: Bearer private-bearer-value'
                 self.effects.agent.run_agent.side_effect = lambda *a, **kw: lm.AgentResult(1, detail, kind=kind)
-                with mock.patch('loop_manager_internal.notifications.delivery.send_telegram') as sent, \
-                        notifications.immediate_delivery(self.connection, 'token', 'chat', 'repo'):
+                with mock.patch('loop_manager_internal.notifications.delivery.send_telegram') as sent, notifications.immediate_delivery(self.connection, 'token', 'chat', 'repo'):
                     self.handler.run(self.context())
                     self.handler.run(self.context())
-                sent.assert_called_once()
-                row = self.connection.execute(
-                    "SELECT payload, rendered_text FROM notification_outbox WHERE event_type='stage_failed' ORDER BY rowid DESC"
-                ).fetchone()
-                payload = json.loads(row['payload'])
-                self.assertEqual(payload['cause'], redact_secrets(self.state.row()['last_error']))
-                self.assertIn('request rejected', payload['cause'])
-                self.assertIn('<REDACTED>', payload['cause'])
-                self.assertEqual(row['rendered_text'], sent.call_args.args[2])
-                self.assertTrue(sent.call_args.kwargs['disable_notification'])
-                for secret in ('private-api-value', 'private-bearer-value'):
-                    self.assertNotIn(secret, row['payload'])
-                    self.assertNotIn(secret, row['rendered_text'])
-                    self.assertNotIn(secret, sent.call_args.args[2])
+                sent.assert_not_called()
+                self.assertIn(detail, self.state.row()['last_error'])
+                self.assertFalse(self.connection.execute("SELECT 1 FROM notification_outbox WHERE event_type='stage_failed'").fetchone())
 
-    def test_usage_and_cli_returns_persist_and_send_silent_failure(self):
+    def test_usage_and_cli_returns_persist_without_stage_notice(self):
         from loop_manager_internal.notifications import notifications
         notifications.configure_session(self.connection, enabled=True)
         self.connection.commit()
-        for kind, outcome_kind, status in (
-            (lm.AgentResultKind.USAGE_LIMIT, ExecutionOutcomeKind.USAGE_PAUSE,
-             '사용량 제한 해제 후 다음 실행에서 재개'),
-            (lm.AgentResultKind.PERMANENT_CONFIGURATION, ExecutionOutcomeKind.OPERATIONAL_ERROR,
-             '다음 실행에서 재개'),
-        ):
+        for kind, outcome_kind in ((lm.AgentResultKind.USAGE_LIMIT, ExecutionOutcomeKind.USAGE_PAUSE), (lm.AgentResultKind.PERMANENT_CONFIGURATION, ExecutionOutcomeKind.OPERATIONAL_ERROR)):
             with self.subTest(kind=kind):
                 detail = 'worker ' + kind.value
                 self.effects.agent.run_agent.side_effect = lambda *a, **kw: lm.AgentResult(1, detail, kind=kind)
-                sent = mock.Mock()
-                with mock.patch('loop_manager_internal.notifications.delivery.send_telegram', sent), \
-                        notifications.immediate_delivery(self.connection, 'token', 'chat', 'repo'):
+                with mock.patch('loop_manager_internal.notifications.delivery.send_telegram') as sent, notifications.immediate_delivery(self.connection, 'token', 'chat', 'repo'):
                     for _ in range(2):
-                        outcome = self.handler.run(self.context())
-                        self.assertEqual(outcome.kind, outcome_kind)
-                sent.assert_called_once()
-                self.assertTrue(sent.call_args.kwargs['disable_notification'])
-                payload = json.loads(self.connection.execute(
-                    "SELECT payload FROM notification_outbox WHERE event_type='stage_failed' ORDER BY rowid DESC"
-                ).fetchone()[0])
-                self.assertEqual(payload['cause'], self.state.row()['last_error'])
-                self.assertEqual(payload['execplan_id'], 'G-047')
-                self.assertEqual(payload['execplan_title'], 'Runtime')
-                self.assertEqual(payload['operation'], 'Worker')
-                self.assertEqual(payload['status'], status)
-                self.assertIn(payload['occurred_at'], sent.call_args.args[2])
-                self.assertFalse(self.connection.execute('SELECT 1 FROM recovery_records').fetchone())
+                        self.assertEqual(self.handler.run(self.context()).kind, outcome_kind)
+                sent.assert_not_called()
+                self.assertIn(detail, self.state.row()['last_error'])
                 self.assertEqual(self.state.row()['phase'], 'WORKING')
+                self.assertFalse(self.connection.execute('SELECT 1 FROM recovery_records').fetchone())
+                self.assertFalse(self.connection.execute("SELECT 1 FROM notification_outbox WHERE event_type='stage_failed'").fetchone())
 
     def test_worker_return_failure_rolls_back_with_state(self):
         from loop_manager_internal.notifications import notifications
@@ -99,31 +70,26 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         self.assertEqual(self.connection.execute("SELECT last_error FROM projects WHERE repo='repo'").fetchone()[0], before)
         self.assertFalse(self.connection.execute("SELECT 1 FROM notification_outbox WHERE event_type='stage_failed'").fetchone())
 
-    def test_worker_return_preserves_pending_event_after_delivery_error(self):
+    def test_worker_return_preserves_legacy_pending_event_after_delivery_error(self):
         from loop_manager_internal.notifications import notifications
         notifications.configure_session(self.connection, enabled=True)
-        self.connection.commit()
-        self.effects.agent.run_agent.side_effect = lambda *a, **kw: lm.AgentResult(
-            1, 'usage exhausted', kind=lm.AgentResultKind.USAGE_LIMIT)
-        with mock.patch('loop_manager_internal.notifications.delivery.send_telegram', side_effect=OSError('offline')), \
-                notifications.immediate_delivery(self.connection, 'token', 'chat', 'repo'):
+        with self.connection:
+            notifications._insert(self.connection, 'legacy-worker-failure', 'repo', 'stage_failed', {'project': 'repo', 'cause': 'usage exhausted', 'silent': True})
+        self.effects.agent.run_agent.side_effect = lambda *a, **kw: lm.AgentResult(1, 'usage exhausted', kind=lm.AgentResultKind.USAGE_LIMIT)
+        with mock.patch('loop_manager_internal.notifications.delivery.send_telegram', side_effect=OSError('offline')), notifications.immediate_delivery(self.connection, 'token', 'chat', 'repo'):
             outcome = self.handler.run(self.context())
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.USAGE_PAUSE)
-        original = self.connection.execute(
-            "SELECT event_key, payload, sent_at FROM notification_outbox WHERE event_type='stage_failed'"
-        ).fetchone()
+        original = self.connection.execute("SELECT event_key, payload, sent_at FROM notification_outbox WHERE event_type='stage_failed'").fetchone()
         self.assertIsNone(original['sent_at'])
         self.handler.run(self.context())
-        with mock.patch('loop_manager_internal.notifications.delivery.send_telegram') as sent:
+        from loop_manager_internal.notifications import delivery
+        with mock.patch.object(delivery, 'send_telegram') as sent:
             notifications.dispatch_pending(self.connection, 'token', 'chat', adapter=sent)
         sent.assert_called_once()
         self.assertTrue(sent.call_args.kwargs['disable_notification'])
         self.assertIn(json.loads(original['payload'])['occurred_at'], sent.call_args.args[2])
-        rows = self.connection.execute(
-            "SELECT event_key, payload, sent_at FROM notification_outbox WHERE event_type='stage_failed'"
-        ).fetchall()
+        rows = self.connection.execute("SELECT event_key, payload, sent_at FROM notification_outbox WHERE event_type='stage_failed'").fetchall()
         self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]['event_key'], original['event_key'])
         self.assertEqual(rows[0]['payload'], original['payload'])
         self.assertIsNotNone(rows[0]['sent_at'])
 
@@ -138,26 +104,18 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         self.assertEqual(self.state.row()['last_error'], 'invalid CLI option')
         self.assertFalse(self.connection.execute("SELECT 1 FROM notification_outbox WHERE event_type='stage_failed'").fetchone())
 
-    def test_saved_rebase_worker_usage_return_persists_silent_failure_without_agent(self):
+    def test_saved_rebase_worker_usage_return_preserves_state_without_notice_or_agent(self):
         from loop_manager_internal.notifications import notifications
         notifications.configure_session(self.connection, enabled=True)
         self.connection.commit()
-        saved = SimpleNamespace(scope_marker='owned-progress', generation=1,
-                                worker_code=1, worker_result='usage exhausted', result_kind='usage_limit')
-        with mock.patch.object(self.handler.rebase_corrections, 'abandon_turn'), \
-                mock.patch('loop_manager_internal.notifications.delivery.send_telegram') as sent, \
-                notifications.immediate_delivery(self.connection, 'token', 'chat', 'repo'):
-            outcome = self.handler._resume_saved_rebase_worker(
-                self.context(), saved, SimpleNamespace(progress='owned-progress'))
+        saved = SimpleNamespace(scope_marker='owned-progress', generation=1, worker_code=1, worker_result='usage exhausted', result_kind='usage_limit')
+        with mock.patch.object(self.handler.rebase_corrections, 'abandon_turn'), mock.patch('loop_manager_internal.notifications.delivery.send_telegram') as sent, notifications.immediate_delivery(self.connection, 'token', 'chat', 'repo'):
+            outcome = self.handler._resume_saved_rebase_worker(self.context(), saved, SimpleNamespace(progress='owned-progress'))
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.USAGE_PAUSE)
         self.effects.agent.run_agent.assert_not_called()
-        sent.assert_called_once()
-        payload = json.loads(self.connection.execute(
-            "SELECT payload FROM notification_outbox WHERE event_type='stage_failed'"
-        ).fetchone()[0])
-        self.assertEqual(payload['cause'], self.state.row()['last_error'])
-        self.assertEqual(payload['status'], '사용량 제한 해제 후 다음 실행에서 재개')
-        self.assertTrue(sent.call_args.kwargs['disable_notification'])
+        sent.assert_not_called()
+        self.assertIn('usage exhausted', self.state.row()['last_error'])
+        self.assertFalse(self.connection.execute("SELECT 1 FROM notification_outbox WHERE event_type='stage_failed'").fetchone())
 
     def test_successful_worker_tokens_use_actual_delivered_guidance_without_another_worker(self):
         from loop_manager_internal.agents import common_guidance

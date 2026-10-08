@@ -396,6 +396,17 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
     # Agent scopes, and later base C must stay connected across process restart.
     """Real subprocess regressions; use the coordinated verification runner."""
 
+    def _run_child(self, source, manager_file, state, config):
+        import sys
+        from loop_manager_internal.execution.verify_process import run_verify_process
+        # Native Windows file observations exceed 90s under parallel verify.
+        timeout = 180 if sys.platform == 'win32' else 90
+        command = [sys.executable, '-B', str(manager_file), '--state-dir', str(state),
+                   '--config', str(config), 'run']
+        _, timed_out, output = run_verify_process(command, source, timeout, job_scope=True)
+        self.assertFalse(timed_out, output)
+        return subprocess.CompletedProcess(command, output.exit_code, output)
+
     def _assert_saved_scope_resume(self, advance_after_selection=False):
         import json
         import shutil
@@ -410,8 +421,9 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
 
         for base in ('main', 'develop'):
             for role in ('planner', 'worker', 'reviewer'):
-                with self.subTest(base=base, role=role), tempfile.TemporaryDirectory() as directory:
+                with self.subTest(base=base, role=role), tempfile.TemporaryDirectory() as directory, contextlib.ExitStack() as cleanup:
                     source = make_remote_repository(directory)
+                    git(source, 'config', 'core.longpaths', 'true')
                     state = Path(directory) / 'state'
                     state.mkdir()
                     copy_manager_import_fixture(source)
@@ -498,6 +510,7 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                         git(source, 'symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/develop')
 
                     connection = loop_manager.connect_database(state, create=True)
+                    cleanup.callback(connection.close)
                     with connection:
                         connection.execute('INSERT INTO projects (repo, base_branch, origin) VALUES (?, ?, ?)',
                                            (str(source), base, 'owner/repo'))
@@ -570,7 +583,8 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                     connection.close()
 
                     writer = Path(directory) / 'writer'
-                    git(source, 'clone', str(Path(directory) / 'remote.git'), str(writer))
+                    git(source, 'clone', '-c', 'core.longpaths=true', '-c', 'core.autocrlf=false',
+                        str(Path(directory) / 'remote.git'), str(writer))
                     configure_identity(writer)
                     git(writer, 'checkout', base)
                     # B changes executable-independent input, retaining the saved plan definition.
@@ -592,20 +606,14 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                     interrupted_registration = not advance_after_selection and (base, role) == ('main', 'worker')
                     if interrupted_registration:
                         (state / 'stop-after-registration').touch()
-                        interrupted = subprocess.run([sys.executable, '-B', str(manager_file),
-                            '--state-dir', str(state), '--config', str(config), 'run'],
-                            cwd=source, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            timeout=90, check=False)
+                        interrupted = self._run_child(source, manager_file, state, config)
                         self.assertNotEqual(interrupted.returncode, 0, interrupted.stdout)
                         self.assertIn('test interruption after runtime registration', interrupted.stdout)
                         self.assertFalse((state / 'resumed-agent.json').exists())
                         self.assertTrue(list((state / 'manager-git-journal').glob('*/active.json')))
                     attempts = 2 if advance_after_selection or interrupted_registration else 1
                     for attempt in range(attempts):
-                        completed = subprocess.run([sys.executable, '-B', str(manager_file),
-                            '--state-dir', str(state), '--config', str(config), 'run'],
-                            cwd=source, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                            timeout=90, check=False)
+                        completed = self._run_child(source, manager_file, state, config)
                         proof_path = state / 'resumed-agent.json'
                         self.assertTrue(proof_path.exists(), completed.stdout)
                         proof = json.loads(proof_path.read_text())
@@ -619,7 +627,7 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                             self.assertIn('runtime scope 수락', completed.stdout)
                         if role != 'planner':
                             self.assertEqual((workspace / 'src/app.py').read_text(), 'VALUE = 2\n')
-                        with sqlite3.connect(state / 'loop-manager.db') as check:
+                        with contextlib.closing(sqlite3.connect(state / 'loop-manager.db')) as check, check:
                             self.assertEqual(check.execute('SELECT COUNT(*) FROM project_blocks').fetchone()[0], 0, completed.stdout)
                             if role != 'planner':
                                 row = check.execute("SELECT status, worker_session_id, reviewer_session_id, retry_count "
@@ -671,7 +679,7 @@ class BootstrapSavedScopeFixtureUnitTests(unittest.TestCase):
                                   branch=None if role == 'planner' else 'loop-manager/G-047')
                 plan_id = None if role == 'planner' else 'G-047'
                 worktree = Path('/managed')
-                repository_identity = hashlib.sha256(b'/common\0origin').hexdigest()
+                repository_identity = hashlib.sha256((str(Path('/common')) + '\0origin').encode()).hexdigest()
                 with mock.patch('loop_manager_internal.agents.agent_write_isolation.inspect_worktree',
                                 return_value=SimpleNamespace(repository_identity=repository_identity)):
                     record_saved_scope_invocation(connection, 'repo', Path('/state'), worktree,
@@ -733,6 +741,8 @@ class ReviewerRebaseScopeHandoffUnitTests(unittest.TestCase):
         self.addCleanup(connection.close)
         before = snapshot(branch='loop-manager/G-047', scope_id='a' * 32,
                           scope_start_digest='c' * 64,
+                          worktrees={str(Path('/managed').resolve()): (
+                              'HEAD=a', 'branch=refs/heads/loop-manager/G-047')},
                           refs={'refs/heads/loop-manager/G-047': ('a', 'commit')})
         current = replace(before, head='b', refs={'refs/heads/loop-manager/G-047': ('b', 'commit')})
         row = {'agent_snapshot': before.serialize(), 'agent_result_snapshot': before.serialize(),

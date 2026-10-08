@@ -50,7 +50,7 @@ class GitSnapshotCostTests(unittest.TestCase):
                         validate_identity=mock.Mock(), read_rebase_metadata=manager._owned_rebase_metadata,
                         read_remote=lambda _: expected.remote,
                         read_inputs=lambda _: ('inputs', 'worker-contract'),
-                        read_file=lambda root, path: ('100644', manager._path_signature(root, path)),
+                        read_file=lambda root, path, index_mode: ('100644', manager._path_signature(root, path)),
                         path_allowed=lambda _: True, contracts_allowed=lambda _: True))
                     owner = OwnershipHandler(SimpleNamespace(
                         state=SimpleNamespace(connection=None),
@@ -209,7 +209,7 @@ class GitSnapshotCostTests(unittest.TestCase):
                 validate_identity=mock.Mock(), read_rebase_metadata=manager._owned_rebase_metadata,
                 read_remote=mock.Mock(return_value=expected.remote),
                 read_inputs=lambda _: ('inputs', 'worker-contract'),
-                read_file=lambda root, path: ('100644', manager._path_signature(root, path)),
+                read_file=lambda root, path, index_mode: ('100644', manager._path_signature(root, path)),
                 path_allowed=lambda _: True, contracts_allowed=lambda _: True)
             legacy = observe_current_rebase(expected, replace(adapters,
                 capture_snapshot=lambda root, **_: manager.capture_git_snapshot(root)))

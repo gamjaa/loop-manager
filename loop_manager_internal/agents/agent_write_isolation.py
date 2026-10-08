@@ -111,7 +111,8 @@ def _inspect_read_only_runtime(selected: Path, state_root: Path, source: Path) -
             created, reason = _read_runtime_intent(state_root, mutation_id, source, selected, head)
             records = _git(source, 'worktree', 'list', '--porcelain').split('\n\n')
             marker = next((record.splitlines() for record in records
-                           if record.startswith('worktree ' + str(selected) + '\n')), ())
+                           if record.startswith('worktree ')
+                           and Path(record.splitlines()[0][9:]).resolve() == selected), ())
             if not created or reason != 'loop-manager-runtime:' + mutation_id or 'locked ' + reason not in marker:
                 raise IsolationError('수동 runtime의 durable 소유 표식이 다릅니다.')
         except (RuntimeError, OSError) as error:

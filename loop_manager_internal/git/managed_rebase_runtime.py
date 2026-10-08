@@ -141,7 +141,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
             raise MutationEvidenceError('current PR target differs')
         return Remote(repo, branch, oid, pull)
 
-    def read_file(root, path):
+    def read_file(root, path, index_mode):
         signature = ports._path_signature(root, path)
         try:
             mode = (root / path).lstat().st_mode
@@ -154,8 +154,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
         elif stat.S_ISREG(mode):
             git_mode = '100755' if mode & stat.S_IXUSR else '100644'
             if os.name == 'nt':
-                tracked = ports.git(root, 'ls-files', '--stage', '--', path).stdout
-                git_mode = tracked.split()[0] if tracked else '100644'
+                git_mode = index_mode or '100644'
         else:
             raise MutationEvidenceError('current rebase file type is unsupported')
         return git_mode, signature

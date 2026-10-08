@@ -10,7 +10,7 @@ Push-Location -LiteralPath $root
 try {
     [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
     $env:PYTHONIOENCODING = 'utf-8'
-    $tempDirectory = Join-Path $root '.cache/verify/tmp'
+    $tempDirectory = Join-Path $env:USERPROFILE '.cache/loop-manager/verify/tmp'
     New-Item -ItemType Directory -Path $tempDirectory -Force | Out-Null
     $env:TEMP = $tempDirectory
     $env:TMP = $tempDirectory

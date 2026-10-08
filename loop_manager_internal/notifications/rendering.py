@@ -47,10 +47,12 @@ def _message(kind: str, payload: dict[str, object]) -> str:
 
 
 def _event_message(kind: str, payload: dict[str, object]) -> str:
-    if kind in {"work_started", "stage_failed", "planning_result", "plans_published", "draft_decision"}:
+    if kind in {"work_started", "stage_failed", "planning_result", "plans_published", "draft_decision",
+                "maintenance_started", "maintenance_completed"}:
         labels = {"work_started": "작업 시작", "stage_failed": "단계 실패",
                   "planning_result": "계획 작성 결과", "plans_published": "새 계획 게시",
-                  "draft_decision": "계획 게시 · 사용자 판단 대기"}
+                  "draft_decision": "계획 게시 · 사용자 판단 대기",
+                  "maintenance_started": "유지보수 시작", "maintenance_completed": "유지보수 종료"}
         lines = [f"[{payload['project']}] {labels[kind]}"]
         if payload.get("execplan_id"):
             lines.append(f"{payload['execplan_id']}: {payload.get('execplan_title') or ''}")
@@ -68,7 +70,7 @@ def _event_message(kind: str, payload: dict[str, object]) -> str:
             f"시작한 작업: {payload['operation']}"
         )
     if kind == "work_waiting":
-        lines = [f"[{payload['project']}] 다음 작업 대기"]
+        lines = [f"[{payload['project']}] 다음 작업 대기 (시작 가능한 작업 없음)"]
         entries = [*payload["plans"], *payload["requirements"]]
         if payload.get("project_block"):
             entries.append({

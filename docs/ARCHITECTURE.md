@@ -402,7 +402,7 @@ PR 없는 게시 checkpoint의 Review 횟수 차단을 rebase 없이 해제할 �
   - Windows: `scripts/verify.ps1`
   - Linux: `scripts/verify.sh`
 - verify 스크립트는 프로젝트 전체 검증을 수행하고 실패 시 0이 아닌 종료 코드를 반환한다
-- 자체 Windows verify는 현재 checkout의 Git 제외 경로 `.cache/verify/tmp/`를 생성하고 `TEMP`·`TMP`·`TMPDIR`로 자식 프로세스에 전달한다. 종료 시 기존 환경을 복원하며 병렬 실행의 파일을 보존하기 위해 공유 임시 폴더 전체를 삭제하지 않는다. Defender 설정은 스크립트가 변경하지 않고 [운영 안내](OPERATIONS.md#windows-defender와-테스트-임시-폴더)에 따라 사용자가 선택한다
+- 자체 Windows verify는 checkout·runtime·상태 DB 위치와 무관한 `%USERPROFILE%\.cache\loop-manager\verify\tmp\`를 생성하고 `TEMP`·`TMP`·`TMPDIR`로 자식 프로세스에 전달한다. AppData 리다이렉션을 피하며 종료 시 기존 환경을 복원하고, 병렬 실행의 파일을 보존하기 위해 공유 임시 폴더 전체를 삭제하지 않는다. Defender 설정은 스크립트가 변경하지 않고 [운영 안내](OPERATIONS.md#windows-defender와-테스트-임시-폴더)에 따라 사용자가 선택한다
 - 전체 test suite, integration test, end-to-end test, 프로젝트 전체 lint·build·type check는 verify 스크립트만 실행한다
 - 프로그램은 verify 스크립트를 AI Agent 밖에서 실행한다
 - 프로그램은 verify 성공 시 Worker를 다시 호출하거나 성공 출력을 전달하지 않는다
@@ -465,6 +465,8 @@ ExecPlan archive는 원본 hash, regular-file source, 비어 있는 destination�
 알림 이벤트·payload·차단 해제와 대기·완료의 의미는 PRODUCT의 알림 정책을 따른다. token과 chat ID가 모두 있어야 SQLite outbox에 이벤트를 저장하고 전송한다. 두 값이 모두 없으면 생성·전송하지 않고 일부만 있으면 설정 오류다.
 
 고유 사건 키로 중복을 방지하고 전송 결과·조각·실패 감사와 재시도 정보를 작업 상태와 분리해 보존한다. 실패한 전송만 다음 실행에서 재시도한다. planning 오류 해제와 해당 사건 해제·미전송 조각 취소는 한 transaction으로 반영하며 과거 전송 감사는 유지한다. 새 PRODUCT·Requirement 작업 주기와 내용 보존 archive를 구분한다.
+
+새 사건 선택에서 계획 작성 결과와 단순 단계 실패를 제외하며, 기존 outbox의 해당 사건은 재작성·삭제하지 않고 이어 전송한다. Planner의 실제 시작은 차단 후 재개 판정을 위해 기록하되 일반 시작 알림은 만들지 않는다. Worker 최초 시작은 저장된 해당 계획의 시작·재개 사건으로 중복 제거한다. 유지보수 시작·종료 사건은 기존 cycle identity와 상태 전이를 같은 SQLite transaction에 기록하고 planning 단계 경계에서 commit 뒤 전송한다. 안정적 작업 소진은 draft·계획 차단도 보존하며 프로젝트 차단을 제외한 대기를 일반 알림으로 전달한다.
 
 `notifications/rendering.py`는 기존 payload만으로 텍스트를 결정적으로 생성하며 모델을 호출하지 않는다. 확인된 질문·수정 대상·PR 상태로 정보 순서를 정하고, 원인·복구 시도·Checkpoint 근거는 보존한다. 긴 메시지는 기존 4096자 조각과 저장된 전송 진행률로 누락 없이 이어 보내며 이미 고정된 outbox 텍스트는 다시 구성하지 않는다.
 
