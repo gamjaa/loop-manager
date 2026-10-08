@@ -671,6 +671,8 @@ def _evaluate_remote_checkpoint_cause(effects: EvaluateRemoteCheckpointCauseEffe
         return effects._remote_checkpoint_has_new_failure(
             connection, repo, blocked, "verify", output, worktree,
         ), str(output), "verify"
+    if blocked["blocked_reason"] == BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value:
+        return True, str(output), None
     saved_candidate = str(blocked["publication_remote_oid"] or blocked["pr_head_oid"] or "")
     if not saved_candidate or saved_candidate != revision[1]:
         return (
@@ -678,8 +680,6 @@ def _evaluate_remote_checkpoint_cause(effects: EvaluateRemoteCheckpointCauseEffe
             "원격 checkpoint Worker 결과가 현재 후보 HEAD와 연결되지 않아 Worker부터 재검증합니다.",
             "worker",
         )
-    if blocked["blocked_reason"] == BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value:
-        return True, str(output), None
     try:
         worker_publication = effects.parse_worker_result(
             str(blocked["worker_result"] or ""),

@@ -236,7 +236,10 @@ class ReviewSpecificationRecoveryTest(BoundedRecoveryFixture, unittest.TestCase)
                 repository.block_plan(
                     'repo', 'G-047', reason_code='review_retry_exhausted',
                     evidence='prior review failure', release_fingerprint='prior-input',
-                    plan_values={'worker_result': evidence}, clear_projection=True,
+                    plan_values={
+                        'worker_result': evidence,
+                        'publication_remote_oid': 'head',
+                    }, clear_projection=True,
                 )
                 blocked = connection.execute(
                     "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'"
