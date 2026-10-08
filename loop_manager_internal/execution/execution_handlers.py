@@ -392,8 +392,9 @@ class ExecutionHandlers:
     def _completed_autostash_correction(self, context, intent, sealed, live, *, rejection=None):
         return self._rebase_handler()._completed_autostash_correction(context, intent, sealed, live, rejection=rejection)
 
-    def _complete_rebase_intent(self, context, *, project_values=None):
-        return self._rebase_handler()._complete_rebase_intent(context, project_values=project_values)
+    def _complete_rebase_intent(self, context, *, project_values=None, worker_definition=None):
+        return self._rebase_handler()._complete_rebase_intent(
+            context, project_values=project_values, worker_definition=worker_definition)
 
     def _publish_rebased_checkpoint(self, context):
         return self._rebase_handler()._publish_rebased_checkpoint(context)

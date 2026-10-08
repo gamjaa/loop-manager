@@ -17,6 +17,44 @@ from loop_manager_internal.verification import inputs
 
 
 class CleanRebaseFixtureTest(unittest.TestCase):
+    def test_publication_fixture_seeds_original_body_and_current_stage_tokens(self):
+        import loop_manager
+        from tests.support.publication import seed_validated_candidate
+        from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
+
+        fixture = execution_fixture(self)
+        body = ExecPlanBodyHash('---\nid: G-047\n---\n## Purpose\nImplement\n## Progress\n- [x] Unit check\n')
+        with mock.patch('tests.support.publication.git_command', return_value='base'), \
+                mock.patch.object(loop_manager, '_revision_execplan_body_hash', return_value=body), \
+                mock.patch.object(loop_manager, '_revision_execplan_source_fingerprint', return_value='source'), \
+                mock.patch('tests.support.publication.plan_content_hash', return_value='guidance'):
+            snapshot = seed_validated_candidate(fixture.connection, Path(fixture.repo),
+                                               Path('worktree'), 'G-047')
+        row = fixture.connection.execute('SELECT * FROM projects WHERE repo=?',
+                                         (fixture.repo,)).fetchone()
+        stored = DefinitionSnapshot.deserialize(row['definition_snapshot'])
+        self.assertEqual(stored.body_text, body.body_text)
+        self.assertEqual(stored.worker_token, row['worker_input_token'])
+        self.assertEqual(stored.verify_token('base', 'base', row['verify_result']), row['verify_token'])
+        self.assertEqual(stored.review_token('base', 'base'), row['review_token'])
+        self.assertNotEqual(replace(snapshot, body_text=None).verify_token(
+            'base', 'base', row['verify_result']), row['verify_token'])
+
+    def test_rebase_facade_forwards_worker_definition_and_legacy_completion(self):
+        handler = object.__new__(handlers.ExecutionHandlers)
+        rebase = mock.Mock()
+        handler._rebase_handler = mock.Mock(return_value=rebase)
+        context, definition = object(), object()
+        values = {'active_sha': 'new-base'}
+        result = handler._complete_rebase_intent(context, project_values=values,
+                                               worker_definition=definition)
+        rebase._complete_rebase_intent.assert_called_once_with(
+            context, project_values=values, worker_definition=definition)
+        self.assertIs(result, rebase._complete_rebase_intent.return_value)
+        handler._complete_rebase_intent(context)
+        rebase._complete_rebase_intent.assert_called_with(
+            context, project_values=None, worker_definition=None)
+
     def test_clean_rebase_publication_evidence_uses_explicit_case_results(self):
         import loop_manager
         from tests.support.worker import worker_result
@@ -38,6 +76,20 @@ class CleanRebaseFixtureTest(unittest.TestCase):
         )
         publication = loop_manager.parse_worker_result(worker_result(title, summary, evidence), plan)
         self.assertEqual(publication.test_evidence, evidence)
+        # Command pairs alone are incomplete: the result contract requires an
+        # explicit initial outcome between FAILED_COMMAND and its RERUN.
+        commands = ('python3 -m unittest tests.test_verify_inputs',
+                    'python3 -m unittest tests.test_verify_receipts')
+        incomplete = '\n'.join(
+            f'FAILED_COMMAND: {command}\nRERUN: {command}\n2 tests, PASS.'
+            for command in commands)
+        with self.assertRaisesRegex(loop_manager.WorkerResultError, '해결되지 않은 targeted'):
+            loop_manager.parse_worker_result(worker_result(title, summary, incomplete), plan)
+        recovered = '\n'.join(
+            f'FAILED_COMMAND: {command}\nInitial result: FAIL.\nRERUN: {command}\n2 tests, PASS.'
+            for command in commands)
+        publication = loop_manager.parse_worker_result(worker_result(title, summary, recovered), plan)
+        self.assertEqual(publication.test_evidence, recovered)
 
     def test_clean_rebase_retains_worker_for_selected_repository(self):
         fixture = execution_fixture(self, repo='selected-repo')

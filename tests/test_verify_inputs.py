@@ -5,11 +5,31 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest import mock
+from types import SimpleNamespace
 
 from loop_manager_internal.verification import inputs, manager_adapter
 
 
 class VerifyInputObservationTest(unittest.TestCase):
+    def test_observation_ignores_read_access_time_but_detects_file_mutations(self):
+        target = self.root / 'src/app.py'
+        original = target.lstat()
+        fields = ('st_dev', 'st_ino', 'st_mode', 'st_nlink', 'st_uid', 'st_gid',
+                  'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_atime_ns')
+        before = SimpleNamespace(**{key: getattr(original, key) for key in fields})
+        lstat = Path.lstat
+        for field in ('st_atime_ns', 'st_size', 'st_mode', 'st_ino', 'st_mtime_ns', 'st_ctime_ns'):
+            after = SimpleNamespace(**{**vars(before), field: getattr(before, field) + 1})
+            samples = iter((before, after))
+            with self.subTest(field=field), mock.patch.object(Path, 'lstat',
+                    lambda path: next(samples) if path == target else lstat(path)):
+                observed = self.observe()
+            if field == 'st_atime_ns':
+                self.assertTrue(observed.proven, observed.reason)
+            else:
+                self.assertIsNone(observed.fingerprint)
+                self.assertIn('changed during observation', observed.reason)
+
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
