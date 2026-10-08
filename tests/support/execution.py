@@ -303,7 +303,7 @@ def execution_fixture(test, *, repo='repo'):
     return fixture
 
 
-def execution_policy_fixture(test):
+def execution_policy_fixture(test, *, pr_conflict=False):
     """Run retry/escalation policy with real handlers and SQLite, fake Git IO."""
     fixture = execution_fixture(test, repo=str(Path('/repo').resolve()))
     from loop_manager_internal.storage.validation_feedback_state import ValidationFeedbackRepository
@@ -317,6 +317,16 @@ def execution_policy_fixture(test):
     fixture.effects.agent.is_loop_manager_repository.return_value = False
     fixture.candidate = 'candidate-0'
     fixture.commits = 0
+    if pr_conflict:
+        fixture.candidate = 'remote'
+        fixture.dirty = False
+        fixture.state.update_project(fixture.repo, pr_conflict_recovery=1,
+            pr_conflict_head_oid='remote', pr_conflict_base_oid='base',
+            pr_url='https://example.test/pr/26', worker_session_id='worker-existing',
+            reviewer_session_id='reviewer-existing',
+            last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict')
+        fixture.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        fixture.effects.workspace.remote_branch_oid.return_value = 'remote'
 
     def git(_path, *args, **_kwargs):
         fixture.calls.append(args[0])
@@ -326,6 +336,12 @@ def execution_policy_fixture(test):
             output = 'base'
         elif args == ('status', '--porcelain'):
             output = ' M app.py' if fixture.dirty else ''
+        elif pr_conflict and args == ('ls-files', '-u', '-z'):
+            output = ''.join(f'100644 blob-{stage} {stage}\tapp.py\0' for stage in (1, 2, 3))
+        elif pr_conflict and args == ('diff', '--cached', '--raw', '--no-abbrev', '-z'):
+            output = ''
+        elif pr_conflict and args == ('rev-parse', '--verify', 'REBASE_HEAD'):
+            output = 'position'
         elif args[:2] == ('commit', '-m') and len(args) == 3 and args[2]:
             fixture.commits += 1
             fixture.candidate = f'candidate-{fixture.commits}'
@@ -347,7 +363,8 @@ def execution_policy_fixture(test):
 
     fixture.effects.workspace.git.side_effect = git
     fixture.effects.agent.capture_git_snapshot.side_effect = lambda *_: lm.GitSnapshot(
-        fixture.candidate, 'loop-manager/G-047', {}, {}, {}, {}, {}, {})
+        fixture.candidate, 'loop-manager/G-047', {},
+        {'app.py': (('unstaged',), 'conflicted-content')} if pr_conflict else {}, {}, {}, {}, {})
     def push(*_args):
         fixture.effects.workspace.remote_branch_oid.return_value = fixture.candidate
         return fixture.candidate
@@ -395,6 +412,10 @@ def run_execution_policy(fixture):
     )
 
     def step(*_args, **_kwargs):
+        # Planning after a block is outside this activated-execution fixture.
+        # Read actual SQLite scheduling state before touching its old context.
+        if fixture.repository.active_row(fixture.repo) is None:
+            return 0
         context = fixture.context()
         while True:
             outcome = ExecutionPhaseCoordinator(fixture.handler).dispatch(context)

@@ -418,6 +418,8 @@ verify 지문 이력, Review 지문·level 승격 이력과 실행별 Worker 교
 
 mock은 기존 Git adapter나 관측 경계에 적용하고 `ExecutionFixture`·`CurrentRebaseFixture`·관측값 생성 도구를 재사용한다. SQLite·파일 보존이 검증 대상이면 실제 저장을 유지한다. 정상·오류·중단과 연속 관측 사이의 HEAD·원격 OID 변화를 재현하며, 검증할 판정 함수나 상태 전이를 성공값으로 대체하지 않는다. 전환 시 기존 검증 조건·assertion의 대응과 필수 통합 회귀를 보존하고, 테스트 skip·timeout 확대·수집 범위 축소로 비용 감소를 대신하지 않는다.
 
+bootstrap 회귀의 부모·자식 CLI 계측은 실제 PID·시각과 테스트 이름을 보존해 전체 verify 기록에 포함한다. 부모 CLI 시간은 자식 실행을 포함하므로 둘을 합산해 전체 실행 시간으로 보고하지 않는다. 비용 개선은 같은 기준 코드·계측·병렬도와 테스트 수집 범위의 전후 실행을 비교하며, 준비·Git·snapshot 누적 시간과 전체 경과 시간을 구분한다.
+
 실제 Git이 필요한 자체 복구 통합 테스트의 `RecoveryBoundary`는 한 테스트 안의 직렬 변형만 같은 소유 경로에 복원한다. 다른 테스트·병렬 실행은 별도 경로·원격·DB를 소유한다. Review 프로토콜 변형은 실제 Worker·verify를 통과한 Review 진입 직전을 보존하며, 파일/mode·Git 객체/ref/index/config·SQLite/TEMP 상태의 digest와 복원 후 새 Git snapshot을 대조한다. 교정 Worker의 파일 version도 경계에서 이어받아 실제 새 작업물이 생성되게 한다. 호출 경로·준비 입력 불일치는 복원 전에 거부하며 자료 손상·재현 실패도 실패로 보고한다. 이전 receipt를 현재 증거로 사용하지 않는다. `git_fixture:review_*`와 `git_fixture:boundary_*` 단계는 생성·Worker/verify 준비·복사·복원·identity 및 재현 확인·정리를 기록한다. `git_fixture_seconds`는 같은 PID의 유효한 `start`·`duration` 경계에서 완전히 포함된 하위 fixture 시간만 총계에서 제외한다. 개별 phase event와 duration은 보존하며, 별도 프로세스나 중첩 경계가 불완전한 이벤트는 포함 관계를 추정하지 않는다. duration이 없는 이벤트의 시간을 만들지 않는다.
 
 ## GitHub와 PR

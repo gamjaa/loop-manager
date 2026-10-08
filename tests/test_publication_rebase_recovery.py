@@ -98,11 +98,17 @@ class PublicationConflictRecoveryTests(PublicationRebaseRecoveryTestFixture, uni
                 "WHERE repo = ? AND plan_id = 'G-014'",
                 (str(repo),),
             ).fetchone()
+            rebase_preserved = loop_manager._rebase_in_progress_for_branch(worktree, branch)
+            unmerged = git_command(worktree, 'ls-files', '-u')
 
         self.assertEqual(second, 0)
         self.assertIsNone(blocked["phase"])
         self.assertIn("cannot resolve conflict", plan["last_error"])
         self.assertEqual(plan["status"], "PLAN_BLOCKED")
+        # Paired with the PR retry-policy unit test: blocking must preserve the
+        # actual conflict, index and operation, not just a mocked marker value.
+        self.assertTrue(rebase_preserved)
+        self.assertIn('src/app.py', unmerged)
 
 
     @dummy_worker_sessions
