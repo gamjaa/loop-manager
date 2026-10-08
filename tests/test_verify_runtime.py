@@ -321,6 +321,26 @@ class GuardAndConfigurationTests(unittest.TestCase):
         self.assertTrue(explicit_result["child_guard"])
         self.assertEqual(explicit_result["ordinary"], "explicit-value")
 
+    @unittest.skipUnless(os.name == "posix", "POSIX subprocess environments accept bytes keys")
+    def test_subprocess_drops_bytes_aliases_of_verify_credentials(self):
+        guard.install_guard()
+        credential_names = ("LOOP_MANAGER_VERIFY_ENDPOINT", "LOOP_MANAGER_VERIFY_SECRET",
+                            "LOOP_MANAGER_VERIFY_SESSION")
+        script = (
+            "import json, os; names = " + repr(credential_names) + "; "
+            "print(json.dumps({'credentials': [name for name in names if name in os.environ], "
+            "'ordinary': os.environ.get('VERIFY_CHILD_TEST')}))"
+        )
+        environment = {os.fsencode(name): b"private-test-value" for name in credential_names}
+        environment.update(PATH=os.environ.get("PATH", ""), VERIFY_CHILD_TEST="bytes-value")
+        caller_environment = dict(environment)
+        result = subprocess.run([sys.executable, "-c", script], env=environment, capture_output=True,
+                                text=True, check=True, timeout=10)
+        self.assertEqual(environment, caller_environment)
+        child = json.loads(result.stdout)
+        self.assertEqual(child["credentials"], [])
+        self.assertEqual(child["ordinary"], "bytes-value")
+
     def test_managed_parallelism_defaults_caps_and_invalid_values(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "config.ini"

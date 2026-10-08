@@ -99,4 +99,5 @@ def worker_environment(environment):
     child["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(filter(None, paths)))
     for name in _COORDINATION_ENV:
         child.pop(name, None)
+        child.pop(os.fsencode(name), None)
     return child
