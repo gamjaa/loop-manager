@@ -655,6 +655,21 @@ def enqueue_review_failure(connection, repo, plan_id, cause, *, status):
                          status=status, silent=True)
 
 
+def enqueue_worker_failure(connection, repo, plan_id, cause, *, status):
+    """Persist a Worker return failure in its owning state transaction."""
+    if not _enabled(connection):
+        return
+    plan = connection.execute(
+        "SELECT plan_id, current_revision_sha, worker_input_token FROM exec_plans "
+        "WHERE repo = ? AND plan_id = ?", (repo, plan_id),
+    ).fetchone()
+    if plan:
+        enqueue_progress(connection, repo, "stage_failed",
+                         "worker\0" + "\0".join(str(value) for value in (*plan, cause)),
+                         execplan_id=plan_id, operation="Worker", cause=cause,
+                         status=status, silent=True)
+
+
 def record_process_start(connection, repo, role, identity, *, plan_id=None, resumed=False):
     """A physical process has started, rather than just been selected."""
     from loop_manager_internal.storage import execplan_draft_state

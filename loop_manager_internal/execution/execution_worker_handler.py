@@ -495,7 +495,7 @@ class WorkerHandler:
                 outcome = ExecutionOutcomeKind.OPERATIONAL_ERROR
             if context.resolving_rebase:
                 worker_error = self.ports.contract.REBASE_CONFLICT_PREFIX + worker_error
-            self.ports.state.update_project(self.ports.identity.repo, phase='WORKING', last_error=worker_error)
+            self._persist_return_failure(context, worker_error, outcome)
             self.ports.operation_print(worker_error, file=sys.stderr)
             return ExecutionOutcome(outcome, detail=worker_error, error=True)
         try:
@@ -540,6 +540,21 @@ class WorkerHandler:
             return self.ports._final(detail)
         return self.ports._finish_worker(context, row, message)
 
+    def _persist_return_failure(self, context, cause, outcome):
+        with runtime_state._transaction(self.ports.state.connection):
+            self.ports.state.update_project(
+                self.ports.identity.repo, preserve_transaction=True,
+                phase='WORKING', last_error=cause,
+            )
+            notifications.enqueue_worker_failure(
+                self.ports.state.connection, self.ports.identity.repo,
+                context.plan.plan_id, cause,
+                status=('사용량 제한 해제 후 다음 실행에서 재개'
+                        if outcome is ExecutionOutcomeKind.USAGE_PAUSE
+                        else '다음 실행에서 재개'),
+            )
+        notifications.flush_project_events(self.ports.state.connection, self.ports.identity.repo)
+
     def _resume_saved_rebase_worker(self, context, saved, observation):
         """Consume a completed Agent turn after interruption without invoking it twice."""
         checkpoint = self.ports.checkpoint
@@ -569,10 +584,11 @@ class WorkerHandler:
             detail = self.ports.contract.REBASE_CONFLICT_PREFIX + (
                 saved.worker_result or f'Agent 종료 코드 {saved.worker_code}'
             )
-            self.ports.state.update_project(self.ports.identity.repo, phase='WORKING', last_error=detail)
             if saved.result_kind == 'usage_limit':
+                self._persist_return_failure(context, detail, ExecutionOutcomeKind.USAGE_PAUSE)
                 return ExecutionOutcome(ExecutionOutcomeKind.USAGE_PAUSE,
                                         detail=detail)
+            self.ports.state.update_project(self.ports.identity.repo, phase='WORKING', last_error=detail)
             if saved.result_kind == 'transient_failure':
                 return self.ports._recover(RecoveryReason.SERVICE_UNAVAILABLE, detail,
                                      context=context, attempts=3)
