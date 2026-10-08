@@ -637,3 +637,70 @@ class TimelyProgressDeliveryTest(NotificationFixture, unittest.TestCase):
         delivered = mock.Mock()
         self.assertEqual(notifications.dispatch_pending(restarted, 'token', 'chat', adapter=delivered), 1)
         delivered.assert_called_once()
+
+
+class InterruptedBlockStartupTest(NotificationFixture, unittest.TestCase):
+    def test_restart_recovers_canceled_inflight_start_before_worker_and_deduplicates(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.notifications import delivery
+        for confirmed in (0, 1):
+            with self.subTest(confirmed=confirmed), tempfile.TemporaryDirectory() as directory:
+                database = Path(directory) / 'restart.db'
+                connection = self.connection(database=database)
+                repo = '/projects/alpha'
+                with connection:
+                    connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) VALUES (?, 'G-018', 'plan', 'user_decision_required', ?)", (repo, 'x' * 6000))
+                    notifications.enqueue_current_project_events(connection, repo)
+                    if confirmed:
+                        connection.execute("UPDATE notification_outbox SET confirmed_pieces=1")
+                key = self.events(connection)[0]['event_key']
+                # Claim the next piece, then stop before confirmation or the
+                # exception callback can observe its result.
+                self.assertIsNotNone(delivery._claim_piece(connection, key, first_attempt_only=False))
+                with connection:
+                    scoped_blocking.clear_plan_block(connection, repo, 'G-018')
+                    notifications.record_process_start(connection, repo, 'worker', 'saved-start', plan_id='G-018')
+                started_at = connection.execute('SELECT started_at FROM notified_block_incidents').fetchone()[0]
+                connection.close()
+                restarted = sqlite3.connect(database)
+                self.addCleanup(restarted.close)
+                restarted.row_factory = sqlite3.Row
+                config = SimpleNamespace(telegram_token='token', telegram_chat_id='chat')
+                expected = 'resumed' if confirmed else 'work_started'
+                sent = mock.Mock()
+                dispatch = notifications.dispatch_pending
+                def worker(*a, **kw):
+                    self.assertEqual(restarted.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type=? AND sent_at IS NOT NULL", (expected,)).fetchone()[0], 1)
+                    return ()
+                with mock.patch('loop_manager.schedule_registered_projects', side_effect=worker), \
+                        mock.patch.object(delivery, 'send_telegram', sent), \
+                        mock.patch.object(notifications, 'dispatch_pending', side_effect=lambda conn, token, chat: dispatch(conn, token, chat, adapter=sent)):
+                    self.assertEqual(loop_manager.run_registered_projects(restarted, Path(directory), config), 0)
+                    self.assertEqual(loop_manager.run_registered_projects(restarted, Path(directory), config), 0)
+                self.assertEqual(sent.call_count, 2 if confirmed else 1)
+                self.assertTrue(all(call.kwargs['disable_notification'] for call in sent.call_args_list))
+                event = restarted.execute("SELECT payload FROM notification_outbox WHERE event_type=?", (expected,)).fetchone()[0]
+                self.assertEqual(json.loads(event)['occurred_at'], started_at)
+                self.assertIsNotNone(restarted.execute('SELECT canceled_at FROM notification_outbox WHERE event_key=?', (key,)).fetchone()[0])
+                with restarted:
+                    notifications.record_process_start(restarted, repo, 'worker', 'saved-start', plan_id='G-018')
+                    notifications.record_process_start(restarted, repo, 'worker', 'new-start', plan_id='G-018')
+                self.assertEqual(restarted.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type='work_started'").fetchone()[0], 1 if confirmed else 2)
+
+    def test_disabled_startup_preserves_abandoned_record_without_notice(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.notifications import delivery
+        connection = self.connection()
+        repo = '/projects/alpha'
+        with connection:
+            connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) VALUES (?, 'G-018', 'plan', 'user_decision_required', 'cause')", (repo,))
+            notifications.enqueue_current_project_events(connection, repo)
+        key = self.events(connection)[0]['event_key']
+        delivery._claim_piece(connection, key, first_attempt_only=False)
+        with connection:
+            scoped_blocking.clear_plan_block(connection, repo, 'G-018')
+            notifications.record_process_start(connection, repo, 'worker', 'saved-start', plan_id='G-018')
+        with mock.patch('loop_manager.schedule_registered_projects', return_value=()):
+            loop_manager.run_registered_projects(connection, Path('/unused'), SimpleNamespace(telegram_token='', telegram_chat_id=''))
+        self.assertEqual(len(self.events(connection)), 1)
+        self.assertEqual(connection.execute('SELECT start_identity FROM notified_block_incidents').fetchone()[0], 'saved-start')

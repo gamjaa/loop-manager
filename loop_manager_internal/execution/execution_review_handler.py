@@ -5,7 +5,7 @@ from typing import Callable, Any, Mapping
 from loop_manager_internal.documents import document_drafts
 from loop_manager_internal.documents import document_publication
 import sys
-from loop_manager_internal.storage import review_correction_state
+from loop_manager_internal.storage import review_correction_state, runtime_state
 from loop_manager_internal.notifications import notifications
 import json
 from loop_manager_internal.agents.agent_invocation import AttemptSequence, TrackedAgentCall
@@ -295,11 +295,20 @@ class ReviewHandler:
                     outcome = ExecutionOutcomeKind.USAGE_PAUSE
                 else:
                     outcome = ExecutionOutcomeKind.OPERATIONAL_ERROR
-                self.ports.state.update_project(
-                    self.ports.identity.repo,
-                    phase='REVIEWING',
-                    last_error=reviewer_error,
-                    review_result=review,
+                with runtime_state._transaction(self.ports.state.connection):
+                    self.ports.state.update_project(
+                        self.ports.identity.repo, preserve_transaction=True,
+                        phase='REVIEWING', last_error=reviewer_error, review_result=review,
+                    )
+                    notifications.enqueue_review_failure(
+                        self.ports.state.connection, self.ports.identity.repo,
+                        context.plan.plan_id, reviewer_error,
+                        status=('사용량 제한 해제 후 다음 실행에서 재개'
+                                if outcome is ExecutionOutcomeKind.USAGE_PAUSE
+                                else '다음 실행에서 재개'),
+                    )
+                notifications.flush_project_events(
+                    self.ports.state.connection, self.ports.identity.repo,
                 )
                 self.ports.operation_print(reviewer_error, file=sys.stderr)
                 return ExecutionOutcome(outcome, detail=reviewer_error, error=True)

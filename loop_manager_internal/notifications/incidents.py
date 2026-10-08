@@ -346,6 +346,26 @@ def record_work_start(
     return queued
 
 
+def recover_interrupted_starts(connection):
+    """Reconcile abandoned sends at startup, before project workers exist."""
+    if not _enabled(connection):
+        return
+    ensure_schema(connection)
+    rows = connection.execute(
+        "SELECT id FROM notified_block_incidents WHERE released_at IS NOT NULL "
+        "AND resumed_at IS NULL AND start_identity IS NOT NULL",
+    ).fetchall()
+    for row in rows:
+        connection.execute(
+            "UPDATE notification_outbox SET delivery_started_at = NULL "
+            "WHERE canceled_at IS NOT NULL AND event_key IN "
+            "(SELECT event_key FROM block_notice_events WHERE incident_id = ?)",
+            (row[0],),
+        )
+        if not _materialize_resumption(connection, int(row[0])):
+            _materialize_unnotified_start(connection, int(row[0]))
+
+
 def _materialize_unnotified_start(connection, incident_id):
     """An in-flight block send failed after release and a physical start."""
     if not _enabled(connection):

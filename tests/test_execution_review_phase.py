@@ -861,3 +861,49 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         self.assertEqual(payload['execplan_id'], 'G-047')
         self.assertEqual(payload['operation'], 'Reviewer')
         self.assertEqual(payload['status'], '자동 교정·재시도 대기')
+
+
+    def test_usage_and_cli_return_paths_persist_and_send_silent_failure(self):
+        import json
+        from loop_manager_internal.notifications import notifications
+        notifications.configure_session(self.connection, enabled=True)
+        self.connection.commit()
+        for kind, outcome_kind, status in (
+            (lm.AgentResultKind.USAGE_LIMIT, ExecutionOutcomeKind.USAGE_PAUSE,
+             '사용량 제한 해제 후 다음 실행에서 재개'),
+            (lm.AgentResultKind.PERMANENT_CONFIGURATION, ExecutionOutcomeKind.OPERATIONAL_ERROR,
+             '다음 실행에서 재개'),
+        ):
+            with self.subTest(kind=kind):
+                context = self.review_context()
+                detail = 'reviewer ' + kind.value
+                self.effects.agent.run_agent.side_effect = lambda *a, **kw: lm.AgentResult(1, detail, kind=kind)
+                sent = mock.Mock()
+                with mock.patch('loop_manager_internal.notifications.delivery.send_telegram', sent), \
+                        notifications.immediate_delivery(self.connection, 'token', 'chat', 'repo'):
+                    for _ in range(2):
+                        outcome = self.handler.review(context)
+                        self.assertEqual(outcome.kind, outcome_kind)
+                sent.assert_called_once()
+                self.assertTrue(sent.call_args.kwargs['disable_notification'])
+                payload = json.loads(self.connection.execute(
+                    "SELECT payload FROM notification_outbox WHERE event_type='stage_failed' ORDER BY rowid DESC"
+                ).fetchone()[0])
+                self.assertEqual(payload['cause'], self.state.row()['last_error'])
+                self.assertEqual(payload['execplan_id'], 'G-047')
+                self.assertEqual(payload['status'], status)
+                self.assertIn(payload['occurred_at'], sent.call_args.args[2])
+                self.assertFalse(self.connection.execute('SELECT 1 FROM recovery_records').fetchone())
+
+    def test_review_return_failure_event_rolls_back_with_state(self):
+        from loop_manager_internal.notifications import notifications
+        notifications.configure_session(self.connection, enabled=True)
+        self.connection.commit()
+        context = self.review_context()
+        before = self.state.row()['last_error']
+        self.effects.agent.run_agent.side_effect = lambda *a, **kw: lm.AgentResult(1, 'invalid CLI option', kind=lm.AgentResultKind.PERMANENT_CONFIGURATION)
+        with mock.patch.object(notifications, 'enqueue_review_failure', side_effect=RuntimeError('event storage interrupted')):
+            with self.assertRaisesRegex(RuntimeError, 'event storage interrupted'):
+                self.handler.review(context)
+        self.assertEqual(self.connection.execute("SELECT last_error FROM projects WHERE repo='repo'").fetchone()[0], before)
+        self.assertFalse(self.connection.execute("SELECT 1 FROM notification_outbox WHERE event_type='stage_failed'").fetchone())

@@ -205,6 +205,11 @@ def run_registered_projects(
     """Run all registered projects and aggregate outcomes after every worker exits."""
 
     try:
+        with connection:
+            notifications.configure_session(
+                connection, enabled=bool(config.telegram_token and config.telegram_chat_id),
+            )
+            notifications.recover_interrupted_starts(connection)
         notifications.dispatch_pending(
             connection, config.telegram_token, config.telegram_chat_id
         )

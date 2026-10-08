@@ -87,12 +87,8 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
             "WHERE repo = ? AND path = ?", (repo, project[1]),
         ).fetchone()
         if plan:
-            enqueue_progress(
-                connection, repo, "stage_failed",
-                "review\0" + "\0".join(str(value) for value in (*plan, project[3])),
-                execplan_id=str(plan[0]), operation="Reviewer", cause=str(project[3]),
-                status="자동 교정·재시도 대기", silent=True,
-            )
+            enqueue_review_failure(connection, repo, str(plan[0]), str(project[3]),
+                                   status="자동 교정·재시도 대기")
     recovery_available = connection.execute(
         "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'recovery_records'"
     ).fetchone() is not None
@@ -642,6 +638,21 @@ def enqueue_progress(connection, repo, kind, identity, **payload):
             payload.setdefault("execplan_title", str(plan[0]))
     _insert(connection, _key(kind, repo, identity), repo, kind,
             {"project": Path(repo).name or repo, **payload})
+
+
+def enqueue_review_failure(connection, repo, plan_id, cause, *, status):
+    """Persist a Reviewer failure in its owning state transaction."""
+    if not _enabled(connection):
+        return
+    plan = connection.execute(
+        "SELECT plan_id, current_revision_sha, verify_token FROM exec_plans "
+        "WHERE repo = ? AND plan_id = ?", (repo, plan_id),
+    ).fetchone()
+    if plan:
+        enqueue_progress(connection, repo, "stage_failed",
+                         "review\0" + "\0".join(str(value) for value in (*plan, cause)),
+                         execplan_id=plan_id, operation="Reviewer", cause=cause,
+                         status=status, silent=True)
 
 
 def record_process_start(connection, repo, role, identity, *, plan_id=None, resumed=False):
