@@ -444,8 +444,6 @@ class ExecutionHandlers:
             self.effects, getattr(self, "_identity", ExecutionIdentity()),
             self._snapshot, self._update_snapshot,
             {
-                "_archive_collision": lambda *a, **kw: self._archive_collision(*a, **kw),
-                "_archive_workspace_owned": lambda *a, **kw: self._archive_workspace_owned(*a, **kw),
                 "_block_final": lambda *a, **kw: self._block_final(*a, **kw),
                 "_block_worker_decision": lambda *a, **kw: self._block_worker_decision(*a, **kw),
                 "_cached_plan": lambda *a, **kw: self._cached_plan(*a, **kw),

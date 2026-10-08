@@ -118,6 +118,23 @@ class ExecutionRevisionTests(unittest.TestCase):
                     self.assertEqual(decision.kind, RevisionGateKind.CONTINUE)
                     self.assertEqual(decision.phase, "PUBLISHING")
 
+    def test_stale_archive_candidate_invalidates_saved_worker_evidence(self):
+        previous = definition(archive_candidates=("docs/requirements/archive/old.md",))
+        current = replace(previous, archive_candidates=())
+
+        decision = decide_revision_gate(
+            phase="PUBLISHING",
+            previous=previous,
+            current=current,
+            active_base_token="base",
+            current_base_token="base",
+            artifacts=complete_artifacts(previous),
+        )
+
+        self.assertIn(DefinitionDelta.ARCHIVE_SCOPE, decision.deltas)
+        self.assertEqual(decision.kind, RevisionGateKind.INVALIDATE_TO_PHASE)
+        self.assertEqual(decision.phase, "IMPLEMENTING")
+
     def test_dependency_wait_preserves_identity_and_requests_earliest_phase(self):
         original = definition()
         current = replace(original, depends_on=("G-036", "G-049"))
