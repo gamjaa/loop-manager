@@ -148,12 +148,16 @@ class ReviewSpecificationRecoveryTest(BoundedRecoveryFixture, unittest.TestCase)
         runtime.block_plan(
             'repo', 'G-047', reason_code='review_retry_exhausted',
             evidence=old_review, release_fingerprint='prior-input',
-            plan_values={'review_result': old_review, 'worker_result': worker_result()},
+            plan_values={
+                'review_result': old_review,
+                'worker_result': worker_result(),
+                'publication_remote_oid': 'candidate-head',
+            },
             clear_projection=True,
         )
         checkpoints = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
         request = checkpoints.get('repo', 'G-047')
-        checkpoints.finish_published(request, 'published-oid')
+        checkpoints.finish_published(request, 'candidate-head')
         blocked = connection.execute(
             "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'"
         ).fetchone()
@@ -269,7 +273,10 @@ class ReviewSpecificationRecoveryTest(BoundedRecoveryFixture, unittest.TestCase)
         repository.block_plan(
             'repo', 'G-047', reason_code='review_retry_exhausted',
             evidence='prior review failure', release_fingerprint='prior-input',
-            plan_values={'worker_result': worker_result()}, clear_projection=True,
+            plan_values={
+                'worker_result': worker_result(),
+                'publication_remote_oid': 'head',
+            }, clear_projection=True,
         )
         blocked = connection.execute(
             "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'"
@@ -359,7 +366,10 @@ class ReviewSpecificationRecoveryTest(BoundedRecoveryFixture, unittest.TestCase)
         repository.block_plan(
             'repo', 'G-047', reason_code='review_retry_exhausted',
             evidence='prior review failure', release_fingerprint='prior-input',
-            plan_values={'worker_result': worker_result()},
+            plan_values={
+                'worker_result': worker_result(),
+                'publication_remote_oid': 'head',
+            },
             clear_projection=True,
         )
         blocked = connection.execute(
@@ -421,11 +431,14 @@ class ReviewSpecificationRecoveryTest(BoundedRecoveryFixture, unittest.TestCase)
         repository.block_plan(
             'repo', 'G-047', reason_code='review_retry_exhausted',
             evidence='prior review failure', release_fingerprint='prior-input',
-            plan_values={'worker_result': worker_result()},
+            plan_values={
+                'worker_result': worker_result(),
+                'publication_remote_oid': 'head',
+            },
             clear_projection=True,
         )
         checkpoint = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
-        checkpoint.finish_published(checkpoint.get('repo', 'G-047'), 'published-oid')
+        checkpoint.finish_published(checkpoint.get('repo', 'G-047'), 'head')
         request = checkpoint.get('repo', 'G-047')
         blocked = connection.execute(
             "SELECT * FROM exec_plans WHERE repo = 'repo' AND plan_id = 'G-047'"
