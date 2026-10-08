@@ -1245,6 +1245,25 @@ class IndependentPlanResumptionTest(NotificationFixture, unittest.TestCase):
 
 
 class UnsentBlockStartTest(NotificationFixture, unittest.TestCase):
+    def test_failed_in_flight_block_send_does_not_notify_automatic_worker_resume(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        with connection:
+            connection.execute("INSERT INTO execplan_blocks (repo, plan_id, scope, reason_code, evidence) VALUES (?, 'G-018', 'plan', 'user_decision_required', 'cause')", (repo,))
+            notifications.enqueue_current_project_events(connection, repo)
+        def resume_then_fail(*_args):
+            with connection:
+                scoped_blocking.clear_plan_block(connection, repo, 'G-018')
+                notifications.record_process_start(connection, repo, 'worker', 'resume', plan_id='G-018', resumed=True)
+            raise OSError('offline')
+        notifications.dispatch_pending(connection, 'token', 'chat', adapter=resume_then_fail)
+        with connection:
+            notifications.recover_interrupted_starts(connection)
+            notifications.record_process_start(connection, repo, 'worker', 'resume', plan_id='G-018', resumed=True)
+        self.assertFalse(any(row['event_type'] in {'work_started', 'resumed'} for row in self.events(connection)))
+        incident = connection.execute('SELECT payload FROM notified_block_incidents').fetchone()
+        self.assertTrue(json.loads(incident[0])['started_as_resume'])
+
     def test_unsent_and_failed_block_do_not_suppress_later_worker_starts(self):
         for attempted in (False, True):
             with self.subTest(attempted=attempted):

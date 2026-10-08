@@ -272,6 +272,7 @@ def release_block(connection: sqlite3.Connection, repo: str, subject: str) -> No
 def record_work_start(
     connection: sqlite3.Connection, repo: str, operation: str,
     *, plan_id: str | None = None, start_identity: str | None = None,
+    resumed: bool = False,
 ) -> int:
     """Preserve real starts; enqueue resumption only for confirmed notices."""
 
@@ -339,10 +340,10 @@ def record_work_start(
             connection.execute(
                 "UPDATE notified_block_incidents SET started_operation = ?, start_identity = ?, started_at = "
                 "strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), "
-                "payload = CASE WHEN ? IS NULL THEN payload "
-                "ELSE json_set(payload, '$.started_execplan_id', ?) END "
+                "payload = json_set(CASE WHEN ? IS NULL THEN payload "
+                "ELSE json_set(payload, '$.started_execplan_id', ?) END, '$.started_as_resume', ?) "
                 "WHERE id = ? AND started_operation IS NULL",
-                (operation, start_identity, plan_id, plan_id, row[0]),
+                (operation, start_identity, plan_id, plan_id, int(resumed), row[0]),
             )
             queued += _materialize_resumption(connection, int(row[0]))
     return queued
@@ -385,7 +386,7 @@ def _materialize_unnotified_start(connection, incident_id):
         return
     old = json.loads(row[1])
     plan_id = old.get("execplan_id") or old.get("started_execplan_id")
-    if row[2] != "Worker" or connection.execute(
+    if row[2] != "Worker" or old.get("started_as_resume") or connection.execute(
         "SELECT 1 FROM notification_outbox WHERE repo = ? "
         "AND event_type IN ('work_started', 'resumed') "
         "AND json_extract(payload, '$.execplan_id') = ? LIMIT 1",

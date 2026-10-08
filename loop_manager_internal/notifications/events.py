@@ -688,7 +688,8 @@ def record_process_start(connection, repo, role, identity, *, plan_id=None, resu
     ).fetchone()):
         return
     operation = "Worker" if role == "worker" else "Planner"
-    blocked_resume = record_work_start(connection, repo, operation, plan_id=plan_id, start_identity=identity)
+    blocked_resume = record_work_start(connection, repo, operation, plan_id=plan_id,
+                                      start_identity=identity, resumed=resumed)
     # Delivery of a BLOCKED piece may still be in flight. The incident will
     # materialize its resumption when confirmation arrives; suppress the generic start too.
     pending_resume = connection.execute(
