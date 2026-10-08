@@ -182,6 +182,10 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.assertEqual(verify_receipts.candidate_evidence(
             self.connection, 'repo', 'G-047', 'original-head', '',
         )['kind'], 'run')
+        self.assertEqual(verify_receipts.candidate_evidence(
+            self.connection, 'repo', 'G-047', 'original-head', '',
+            inputs.InputObservation(None, reason='verify input fingerprint unavailable'),
+        )['kind'], 'run')
         self.assertIsNone(verify_receipts.candidate_evidence(
             self.connection, 'repo', 'G-047', 'original-head', '',
             inputs.InputObservation('changed-inputs'),
@@ -224,6 +228,22 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
             self.connection, 'repo', 'G-047', 'current-head', '',
             inputs.InputObservation('different-inputs'),
         ))
+
+        unobservable = inputs.InputObservation(
+            None, reason='verify input fingerprint unavailable',
+        )
+        verify_receipts.start_cycle(self.connection, 'repo', 'G-047')
+        selection = verify_receipts.selected(self.connection, 'repo', 'G-047')
+        unobservable_id, selection = verify_receipts.record(
+            self.connection, selection, head='unobserved-head',
+            observation=unobservable, kind='run', reason='inputs unavailable',
+        )
+        verify_receipts.complete(
+            self.connection, selection, unobservable_id, passed=True, output='',
+        )
+        self.assertEqual(verify_receipts.candidate_evidence(
+            self.connection, 'repo', 'G-047', 'unobserved-head', '', unobservable,
+        )['kind'], 'run')
 
         verify_receipts.start_cycle(self.connection, 'repo', 'G-047')
         selection = verify_receipts.selected(self.connection, 'repo', 'G-047')
