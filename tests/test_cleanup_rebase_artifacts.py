@@ -5,9 +5,25 @@ from pathlib import Path
 from unittest import mock
 import loop_manager
 from tests.support.git import git_command, make_remote_repository
+from tests.support.workspace import WorkspaceFixture
 
 
-class CleanupRebaseArtifactsTest(unittest.TestCase):
+class CleanupRebaseArtifactsTest(WorkspaceFixture, unittest.TestCase):
+    def test_git_metadata_path_preserves_absolute_and_resolves_relative_paths(self):
+        repo = Path("/repository")
+        absolute = Path("/git/common/info/exclude")
+        with mock.patch(
+            "tests.support.workspace.git_command", return_value=str(absolute)
+        ):
+            self.assertEqual(self._git_metadata_path(repo, "info/exclude"), absolute)
+        with mock.patch(
+            "tests.support.workspace.git_command", return_value=".git/info/exclude"
+        ):
+            self.assertEqual(
+                self._git_metadata_path(repo, "info/exclude"),
+                repo / ".git/info/exclude",
+            )
+
     def test_rebase_keeps_ignored_file_that_overlaps_target(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = make_remote_repository(directory)
@@ -16,9 +32,7 @@ class CleanupRebaseArtifactsTest(unittest.TestCase):
             git_command(repo, "add", "collide.txt")
             git_command(repo, "commit", "-m", "Add target file")
             git_command(repo, "checkout", "main")
-            exclude = Path(git_command(repo, "rev-parse", "--git-path", "info/exclude"))
-            if not exclude.is_absolute():
-                exclude = repo / exclude
+            exclude = self._git_metadata_path(repo, "info/exclude")
             exclude.write_text(
                 exclude.read_text(encoding="utf-8") + "\ncollide.txt\n",
                 encoding="utf-8",
@@ -44,9 +58,7 @@ class CleanupRebaseArtifactsTest(unittest.TestCase):
             git_command(repo, "commit", "-m", "Next feature commit")
             original_head = git_command(repo, "rev-parse", "HEAD")
             git_command(repo, "checkout", "main")
-            exclude = Path(git_command(repo, "rev-parse", "--git-path", "info/exclude"))
-            if not exclude.is_absolute():
-                exclude = repo / exclude
+            exclude = self._git_metadata_path(repo, "info/exclude")
             exclude.write_text(
                 exclude.read_text(encoding="utf-8") + "\nlater.txt\n",
                 encoding="utf-8",
@@ -112,9 +124,7 @@ class CleanupRebaseArtifactsTest(unittest.TestCase):
             git_command(repo, "commit", "-m", "Change app")
             original_head = git_command(repo, "rev-parse", "HEAD")
             git_command(repo, "checkout", "main")
-            exclude = Path(git_command(repo, "rev-parse", "--git-path", "info/exclude"))
-            if not exclude.is_absolute():
-                exclude = repo / exclude
+            exclude = self._git_metadata_path(repo, "info/exclude")
             exclude.write_text(
                 exclude.read_text(encoding="utf-8") + "\nold.txt\n",
                 encoding="utf-8",
@@ -155,9 +165,7 @@ class CleanupRebaseArtifactsTest(unittest.TestCase):
                 git_command(repo, "commit", "-m", f"Add {filename}")
             original_head = git_command(repo, "rev-parse", "HEAD")
             git_command(repo, "checkout", "main")
-            exclude = Path(git_command(repo, "rev-parse", "--git-path", "info/exclude"))
-            if not exclude.is_absolute():
-                exclude = repo / exclude
+            exclude = self._git_metadata_path(repo, "info/exclude")
             exclude.write_text(
                 exclude.read_text(encoding="utf-8") + "\nold.txt\nlater.txt\n",
                 encoding="utf-8",

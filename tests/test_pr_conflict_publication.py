@@ -10,26 +10,6 @@ from tests.support.worker import dummy_worker_sessions
 
 
 class PrConflictPublicationTest(PrRecoveryFixture, unittest.TestCase):
-    def _add_ignored_cache(self, worktree: Path) -> Path:
-        exclude = Path(
-            git_command(worktree, "rev-parse", "--git-path", "info/exclude")
-        )
-        if not exclude.is_absolute():
-            exclude = worktree / exclude
-        exclude.write_text(
-            exclude.read_text(encoding="utf-8") + "\n__pycache__/\n",
-            encoding="utf-8",
-        )
-        cache = worktree / "__pycache__/verify.cpython-312.pyc"
-        cache.parent.mkdir()
-        cache.write_bytes(b"ignored verify artifact")
-        self.assertEqual(git_command(worktree, "status", "--porcelain"), "")
-        self.assertNotIn(
-            cache.relative_to(worktree).as_posix(),
-            loop_manager.capture_git_snapshot(worktree).dirty,
-        )
-        return cache
-
     @dummy_worker_sessions
     def test_external_remote_head_change_blocks_without_push(self):
         with tempfile.TemporaryDirectory() as directory:

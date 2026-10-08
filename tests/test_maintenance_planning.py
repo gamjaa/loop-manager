@@ -31,6 +31,29 @@ from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot
 from tests.support.maintenance_planning_case import git
 
 
+class MaintenanceGitAliasTest(unittest.TestCase):
+    def test_git_alias_strips_output_and_preserves_subprocess_failure(self):
+        repo = Path("/repo")
+        completed = SimpleNamespace(stdout="  output\n")
+        with mock.patch(
+            "tests.support.git.subprocess.run", return_value=completed
+        ) as run:
+            self.assertEqual(git(repo, "status"), "output")
+        run.assert_called_once_with(
+            ["git", "-C", str(repo), "status"],
+            check=True,
+            text=True,
+            encoding="utf-8",
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        failure = subprocess.CalledProcessError(1, "git", output="failure")
+        with mock.patch("tests.support.git.subprocess.run", side_effect=failure):
+            with self.assertRaises(subprocess.CalledProcessError) as raised:
+                git(repo, "status")
+        self.assertIs(raised.exception, failure)
+
+
 class MaintenanceSnapshotResumeTest(unittest.TestCase):
     def test_resumed_planner_reads_original_ready_blob(self):
         connection = sqlite3.connect(":memory:")

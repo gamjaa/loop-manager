@@ -1,6 +1,8 @@
 import sqlite3
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
+from unittest import mock
 import loop_manager
 from loop_manager_internal.storage import planning_input_state
 from loop_manager_internal.agents import agent_write_isolation as isolation
@@ -20,6 +22,25 @@ def symlink_or_skip(link: Path, target, *, target_is_directory=False):
 
 class WorkspaceFixture:
     """Shared scenario setup; inheriting this fixture collects no tests."""
+
+    def _git_metadata_path(self, repo: Path, path: str) -> Path:
+        metadata = Path(git_command(repo, "rev-parse", "--git-path", path))
+        return metadata if metadata.is_absolute() else repo / metadata
+
+    def _run_project_with_workspace_patches(
+        self, connection, state_dir: Path, repo: Path, **patches
+    ):
+        with ExitStack() as stack:
+            stack.enter_context(mock.patch(
+                "loop_manager.validate_repository", return_value=repo
+            ))
+            stack.enter_context(mock.patch("loop_manager.remote_base", return_value="main"))
+            stack.enter_context(mock.patch("loop_manager.ensure_safe_base_worktree"))
+            for target, value in patches.items():
+                stack.enter_context(mock.patch(target, value))
+            return loop_manager.run_project(
+                connection, state_dir, str(repo), Path("unused.ini"), "main", False
+            )
 
     def _workspace(
         self, directory: str

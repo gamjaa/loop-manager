@@ -35,29 +35,7 @@ class LivePullRequestObservationTests(unittest.TestCase):
                         observe_live_pull_request(Path('/repo'), {'headRefName': 'branch'})
 
 
-class PrConflictCorrectionsTestFixture(PrRecoveryFixture):
-    def _add_ignored_cache(self, worktree: Path) -> Path:
-        exclude = Path(
-            git_command(worktree, "rev-parse", "--git-path", "info/exclude")
-        )
-        if not exclude.is_absolute():
-            exclude = worktree / exclude
-        exclude.write_text(
-            exclude.read_text(encoding="utf-8") + "\n__pycache__/\n",
-            encoding="utf-8",
-        )
-        cache = worktree / "__pycache__/verify.cpython-312.pyc"
-        cache.parent.mkdir()
-        cache.write_bytes(b"ignored verify artifact")
-        self.assertEqual(git_command(worktree, "status", "--porcelain"), "")
-        self.assertNotIn(
-            cache.relative_to(worktree).as_posix(),
-            loop_manager.capture_git_snapshot(worktree).dirty,
-        )
-        return cache
-
-
-class PrConflictLeaseTests(PrConflictCorrectionsTestFixture, unittest.TestCase):
+class PrConflictLeaseTests(PrRecoveryFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_conflicting_pr_reuses_sessions_revalidates_new_base_and_leases_push(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -252,7 +230,7 @@ class PrConflictLeaseTests(PrConflictCorrectionsTestFixture, unittest.TestCase):
             synchronize.assert_not_called()
 
 
-class PrConflictCauseRevalidationTests(PrConflictCorrectionsTestFixture, unittest.TestCase):
+class PrConflictCauseRevalidationTests(PrRecoveryFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_worker_failure_blocks_after_three_corrections_and_stays_blocked(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -426,7 +404,7 @@ class PrConflictCauseRevalidationTests(PrConflictCorrectionsTestFixture, unittes
             )
 
 
-class PrConflictInterruptionTests(PrConflictCorrectionsTestFixture, unittest.TestCase):
+class PrConflictInterruptionTests(PrRecoveryFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_transient_and_usage_limit_pauses_resume_same_recovery(self):
         pauses = (

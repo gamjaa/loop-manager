@@ -11,6 +11,40 @@ from tests.support.worker import dummy_worker_sessions
 
 
 class WorkspaceReservationsTest(WorkspaceFixture, unittest.TestCase):
+    def test_workspace_patch_helper_restores_patches_after_return_and_exception(self):
+        original = loop_manager.run_project
+        original_pr_for_branch = loop_manager.pr_for_branch
+        result = object()
+        def return_result(*_args):
+            self.assertIsNone(loop_manager.pr_for_branch)
+            return result
+
+        with mock.patch("loop_manager.run_project", side_effect=return_result) as run_project:
+            self.assertIs(
+                self._run_project_with_workspace_patches(
+                    mock.Mock(), Path("/state"), Path("/repo"),
+                    **{"loop_manager.pr_for_branch": None},
+                ),
+                result,
+            )
+            run_project.assert_called_once()
+            self.assertIs(loop_manager.pr_for_branch, original_pr_for_branch)
+        self.assertIs(loop_manager.run_project, original)
+
+        error = RuntimeError("scenario failed")
+        def raise_error(*_args):
+            self.assertIsNone(loop_manager.pr_for_branch)
+            raise error
+
+        with mock.patch("loop_manager.run_project", side_effect=raise_error):
+            with self.assertRaisesRegex(RuntimeError, "scenario failed"):
+                self._run_project_with_workspace_patches(
+                    mock.Mock(), Path("/state"), Path("/repo"),
+                    **{"loop_manager.pr_for_branch": None},
+                )
+            self.assertIs(loop_manager.pr_for_branch, original_pr_for_branch)
+        self.assertIs(loop_manager.run_project, original)
+
     def test_planning_git_port_only_translates_workspace_ownership_errors(self):
         connection = sqlite3.connect(":memory:")
         register_connection_cleanup(self, connection)
@@ -69,29 +103,16 @@ class WorkspaceReservationsTest(WorkspaceFixture, unittest.TestCase):
                     )
                 return real_git(target, *arguments, **kwargs)
 
-            with mock.patch(
-                "loop_manager.validate_repository", return_value=repo
-            ), mock.patch(
-                "loop_manager.remote_base", return_value="main"
-            ), mock.patch(
-                "loop_manager.ensure_safe_base_worktree"
-            ), mock.patch(
-                "loop_manager.git", side_effect=interrupt_before_worktree_add
-            ), mock.patch(
-                "loop_manager.run_codex"
-            ) as interrupted_agent:
-                with self.assertRaisesRegex(
-                    KeyboardInterrupt,
-                    "before ExecPlan worktree creation",
-                ):
-                    loop_manager.run_project(
-                        connection,
-                        state_dir,
-                        str(repo),
-                        Path("unused.ini"),
-                        "main",
-                        False,
-                    )
+            interrupted_agent = mock.Mock()
+            with self.assertRaisesRegex(
+                KeyboardInterrupt,
+                "before ExecPlan worktree creation",
+            ):
+                self._run_project_with_workspace_patches(
+                    connection, state_dir, repo,
+                    **{"loop_manager.git": mock.Mock(side_effect=interrupt_before_worktree_add),
+                       "loop_manager.run_codex": interrupted_agent},
+                )
 
             reserved = connection.execute(
                 "SELECT workspace_owned FROM exec_plans "
@@ -136,25 +157,12 @@ class WorkspaceReservationsTest(WorkspaceFixture, unittest.TestCase):
             self.assertFalse(worktree.exists())
             self.assertNotEqual(external_head, plan_sha)
 
-            with mock.patch(
-                "loop_manager.validate_repository", return_value=repo
-            ), mock.patch(
-                "loop_manager.remote_base", return_value="main"
-            ), mock.patch(
-                "loop_manager.ensure_safe_base_worktree"
-            ), mock.patch(
-                "loop_manager.pr_for_branch", return_value=None
-            ), mock.patch(
-                "loop_manager.run_codex"
-            ) as resumed_agent:
-                result = loop_manager.run_project(
-                    connection,
-                    state_dir,
-                    str(repo),
-                    Path("unused.ini"),
-                    "main",
-                    False,
-                )
+            resumed_agent = mock.Mock()
+            result = self._run_project_with_workspace_patches(
+                connection, state_dir, repo,
+                **{"loop_manager.pr_for_branch": mock.Mock(return_value=None),
+                   "loop_manager.run_codex": resumed_agent},
+            )
 
             project = connection.execute(
                 "SELECT phase, last_error FROM projects WHERE repo = ?",

@@ -25,18 +25,7 @@ from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.storage import planning_input_state
 from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventory, TrackedSource
 from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot, mutable_snapshot_token
-
-
-def git(repo: Path, *arguments: str) -> str:
-    result = subprocess.run(
-        ["git", "-C", str(repo), *arguments],
-        check=True,
-        text=True,
-        encoding="utf-8",
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-    )
-    return result.stdout.strip()
+from tests.support.git import git_command as git
 
 
 class MaintenancePlanningCase(unittest.TestCase):
