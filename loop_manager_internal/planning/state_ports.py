@@ -171,8 +171,23 @@ class _PlanningStatePorts:
     ) -> maintenance_state.MaintenanceCycle:
         return self._maintenance_repository.get(repo)
 
+    def record_planning_result(self, repo, identity, result):
+        from loop_manager_internal.notifications import notifications
+        plans = [{"id": str(plan["id"]), "title": str(plan["title"])}
+                 for _path, plan in (result.plans if result else ())]
+        with self._connection:
+            notifications.enqueue_progress(
+                self._connection, repo, "planning_result", identity + "\0" + repr(plans),
+                plans=plans, status="작성 완료 · 미게시" if plans else "새 계획 없음", silent=True,
+            )
+
+    def flush_notifications(self, repo: str) -> None:
+        from loop_manager_internal.notifications import notifications
+        notifications.flush_project_events(self._connection, repo)
+
     def update(self, repo: str, **values: object) -> None:
         self._effects.update_project(self._connection, repo, **values)
+        self.flush_notifications(repo)
 
     def local_recheck_consumed(self, request_id: str) -> bool:
         from loop_manager_internal.storage import local_recovery_state

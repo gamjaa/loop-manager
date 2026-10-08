@@ -52,12 +52,17 @@ class ExecutionFailurePolicyTests(ExecutionRecoveryScenarios, ExecutionPhaseScen
         with self.connection:
             scoped_blocking.clear_project_block(self.connection, 'repo')
         self.handler.work_started(self.context())
+        self.assertIsNone(self.connection.execute(
+            "SELECT payload FROM notification_outbox WHERE event_type = 'resumed'"
+        ).fetchone())
+        with self.connection:
+            notifications.record_process_start(self.connection, 'repo', 'worker', 'actual-start', plan_id='G-047')
         resumed = self.connection.execute(
             "SELECT payload FROM notification_outbox WHERE event_type = 'resumed'"
         ).fetchall()
         self.assertEqual(len(resumed), 1)
         self.assertEqual(json.loads(resumed[0][0])['operation'],
-                         'ExecPlan IMPLEMENTING')
+                         'Worker')
 
 
     def test_worker_decision_without_file_change_bypasses_no_change_gate(self):

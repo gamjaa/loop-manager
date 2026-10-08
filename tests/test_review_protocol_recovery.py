@@ -3,8 +3,61 @@ from tests.support.recovery_boundary import RecoveryBoundary
 import tempfile
 import unittest
 import loop_manager
+import json
+from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
+from tests.support.notification import NotificationFixture
+from loop_manager_internal.agents.agent_invocation import AgentResult
+from loop_manager_internal.execution.execution_review_handler import ReviewHandler
+from loop_manager_internal.notifications import notifications
 from tests.support.worker import dummy_worker_sessions
+
+
+class ReviewProtocolNotificationTest(NotificationFixture, unittest.TestCase):
+    def test_corrected_protocol_failure_is_sent_before_next_reviewer_call(self):
+        connection = self.connection()
+        repo = '/projects/alpha'
+        context = SimpleNamespace(plan=SimpleNamespace(plan_id='G-018', definition_revision_sha='revision'),
+                                  worktree=Path(repo), branch='branch')
+        snapshot = SimpleNamespace(plan={'id': 'G-018', 'title': 'Reliable notices'}, level=1,
+                                   catalog_plan={'path': 'plan.md', 'current_revision_sha': 'revision'},
+                                   _definition_snapshot=mock.Mock())
+        snapshot._definition_snapshot.review_token.return_value = 'review-token'
+        ports = mock.Mock()
+        ports.identity = SimpleNamespace(repo=repo, repo_path=Path(repo), base='main')
+        ports.contract = loop_manager
+        ports.feedback = None
+        ports.state.connection = connection
+        ports.state.update_project.side_effect = lambda repo, **values: loop_manager.update_project(connection, repo, **values)
+        ports.snapshot.return_value = snapshot
+        ports._row.side_effect = lambda: connection.execute('SELECT * FROM projects WHERE repo = ?', (repo,)).fetchone()
+        ports._document_draft.return_value = None
+        ports.git.return_value = SimpleNamespace(stdout='candidate')
+        ports._post_effect_guard.return_value = context
+        ports.parse_reviewer_result.side_effect = [loop_manager.ReviewerProtocolError('missing ISSUE_ID'), ('PASS', ())]
+        sent = mock.Mock()
+        calls = []
+        def reviewer(*args, **kwargs):
+            calls.append('reviewer')
+            if len(calls) == 2:
+                sent.assert_called_once()
+                payload = json.loads(connection.execute(
+                    "SELECT payload FROM notification_outbox WHERE event_type = 'stage_failed'"
+                ).fetchone()[0])
+                self.assertTrue(payload['silent'])
+                self.assertEqual(payload['operation'], 'Reviewer')
+            return AgentResult(0, 'invalid' if len(calls) == 1 else 'VERDICT: PASS')
+        ports.run_agent_with_retries.side_effect = reviewer
+        handler = ReviewHandler(ports)
+        with mock.patch.object(handler, '_review_entry_evidence', return_value=SimpleNamespace(test_evidence='PASS')), \
+             mock.patch('loop_manager_internal.storage.review_correction_state.load', return_value={}), \
+             mock.patch('loop_manager_internal.notifications.delivery.send_telegram', sent), \
+             notifications.immediate_delivery(connection, 'token', 'chat', repo):
+            handler.review(context)
+        self.assertEqual(len(calls), 2)
+        self.assertIsNone(connection.execute('SELECT last_error FROM projects').fetchone()[0])
+        self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'stage_failed'").fetchone()[0], 1)
 
 
 class ReviewProtocolRecoveryTest(BoundedRecoveryFixture, unittest.TestCase):

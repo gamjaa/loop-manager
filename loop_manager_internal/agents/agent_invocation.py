@@ -7,6 +7,7 @@ from enum import Enum
 from pathlib import Path
 import re
 import subprocess
+from uuid import uuid4
 from typing import Callable, TYPE_CHECKING
 
 from loop_manager_internal.agents.agent_write_isolation import IsolationEvidence
@@ -136,6 +137,7 @@ class AgentRequest:
     isolation_snapshot_digest: Callable[[], str] | None = None
     expected_repository: str | None = None
     common_guidance: CommonGuidance | None = None
+    on_process_started: Callable[[], None] | None = None
 
 
 @dataclass(frozen=True)
@@ -152,6 +154,7 @@ class InvocationContext:
     previous_effort: str | None = None
     previous_session_id: str | None = None
     task_id: str | None = None
+    notification_id: str | None = None
 
 
 class AttemptSequence:
@@ -166,6 +169,7 @@ class AttemptSequence:
         self.initial_transition = initial_transition
         self.initial_cause = initial_cause
         self.task_id = task_id
+        self.notification_id = uuid4().hex
         self.count = 0
         self.previous_failure: str | None = None
         self.fallback_recorded = False
@@ -184,7 +188,7 @@ class AttemptSequence:
             cause = self.previous_failure
         return InvocationContext(
             self.repo, self.plan_id, self.revision, transition, cause, self.count,
-            task_id=self.task_id,
+            task_id=self.task_id, notification_id=self.notification_id,
         )
 
 

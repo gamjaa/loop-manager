@@ -35,6 +35,7 @@ CREATE TABLE IF NOT EXISTS recovery_records (
     occurrence_index TEXT NOT NULL DEFAULT '{}',
     detail TEXT NOT NULL,
     final_evidence TEXT,
+    notification_episode TEXT,
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (repo, subject)
 )
@@ -112,6 +113,8 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(PERSISTENT_FAILURE_SCHEMA)
     connection.execute(REVIEW_CORRECTION_SCHEMA)
     columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(recovery_records)")}
+    if "notification_episode" not in columns:
+        connection.execute("ALTER TABLE recovery_records ADD COLUMN notification_episode TEXT")
     if "recovery_counts" not in columns:
         connection.execute(
             "ALTER TABLE recovery_records ADD COLUMN recovery_counts TEXT NOT NULL DEFAULT '{}'"
@@ -387,6 +390,18 @@ class RecoveryRepository:
             from loop_manager_internal.notifications import notifications
             notifications.enqueue_persistent_execution_failure_events(
                 self.connection, observation.repo,
+            )
+        episode = str(previous["notification_episode"]) if previous is not None and previous["notification_episode"] else uuid.uuid4().hex
+        self.connection.execute("UPDATE recovery_records SET notification_episode = ? WHERE repo = ? AND subject = ?",
+                                (episode, observation.repo, self._subject(observation.plan_id)))
+        from loop_manager_internal.notifications import notifications
+        if decision.action is not RecoveryAction.FINAL_BLOCK:
+            notifications.enqueue_progress(
+                self.connection, observation.repo, "stage_failed",
+                episode + "\0" + observation.identity + "\0" + observation.progress_marker + "\0" + decision.disposition.value + "\0" + decision.action.value,
+                execplan_id=observation.plan_id, operation=observation.phase,
+                cause=observation.detail, status=("다음 실행에서 재개" if decision.action is RecoveryAction.PAUSE
+                                                  else "자동 교정·재시도 중"), silent=True,
             )
         return RecoveryRecord(next_generation, decision, evidence)
 

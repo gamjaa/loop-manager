@@ -533,6 +533,8 @@ def _apply_general_planning_batch(
         effects._register_execplan_rows(
             connection, repo, worktree, list(result.plans), plan_commit
         )
+        from loop_manager_internal.notifications import notifications
+        notifications.record_planning_publication(connection, repo, result.plans, plan_commit)
         from loop_manager_internal.catalog.remote_deletions import resolve_recovery
         resolve_recovery(connection, snapshot, plan_commit,
                          {item.snapshot.plan_id for item in result.revisions})

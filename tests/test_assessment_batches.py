@@ -340,7 +340,7 @@ class AssessmentContinuationTest(unittest.TestCase):
             PlanningOutcome(PlanningOutcomeKind.ASSESSMENT_PROGRESS),
             PlanningOutcome(PlanningOutcomeKind.NO_CHANGE)]))
         with mock.patch.object(planning_runtime, "snapshot_run", side_effect=lambda run: run):
-            outcome = coordinator.run(SimpleNamespace(base_sha=REVISION, repo_path=Path("/repo"), base_branch="main", local_environment_recheck=False))
+            outcome = coordinator.run(SimpleNamespace(repo="repo", base_sha=REVISION, repo_path=Path("/repo"), base_branch="main", local_environment_recheck=False))
         self.assertEqual(outcome.kind, PlanningOutcomeKind.NO_CHANGE)
         self.assertEqual(gate.step.call_count, 2)
         self.assertEqual(coordinator._new_run.call_count, 2)
@@ -350,7 +350,7 @@ class AssessmentContinuationTest(unittest.TestCase):
             PlanningOutcome(PlanningOutcomeKind.ASSESSMENT_PROGRESS)]))
         coordinator._ports.git.fetch_base.return_value = "b" * 40
         with mock.patch.object(planning_runtime, "snapshot_run", side_effect=lambda run: run):
-            outcome = coordinator.run(SimpleNamespace(base_sha=REVISION, repo_path=Path("/repo"), base_branch="main", local_environment_recheck=False))
+            outcome = coordinator.run(SimpleNamespace(repo="repo", base_sha=REVISION, repo_path=Path("/repo"), base_branch="main", local_environment_recheck=False))
         self.assertEqual((outcome.kind, outcome.base_sha),
                          (PlanningOutcomeKind.REMOTE_BASE_RESTART, "b" * 40))
         self.assertEqual(assessment.step.call_count, 1)
@@ -358,7 +358,7 @@ class AssessmentContinuationTest(unittest.TestCase):
     def test_local_environment_recheck_stops_after_one_batch(self):
         coordinator, gate, assessment = self.coordinator(iter([
             PlanningOutcome(PlanningOutcomeKind.ASSESSMENT_PROGRESS)]))
-        context = SimpleNamespace(base_sha=REVISION, repo_path=Path("/repo"),
+        context = SimpleNamespace(repo="repo", base_sha=REVISION, repo_path=Path("/repo"),
                                   base_branch="main", local_environment_recheck=True)
         with mock.patch.object(planning_runtime, "snapshot_run", side_effect=lambda run: run):
             outcome = coordinator.run(context)

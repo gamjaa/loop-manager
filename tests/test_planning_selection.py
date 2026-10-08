@@ -473,6 +473,15 @@ class PlanningSelectionTest(PlanningCase):
         )
         with mock.patch.object(loop_manager, "run_agent_with_retries", return_value=result):
             port.run_planner(Path("/worktree"), "prompt", None, lambda _: None)
+        self.assertIsNone(connection.execute(
+            "SELECT payload FROM notification_outbox WHERE event_type = 'resumed'"
+        ).fetchone())
+        def physical_start(*_args, **_kwargs):
+            with connection:
+                notifications.record_process_start(connection, repo, "planner", "actual-start")
+            return result
+        with mock.patch.object(loop_manager, "run_agent_with_retries", side_effect=physical_start):
+            port.run_planner(Path("/worktree"), "prompt", None, lambda _: None)
         resumed = connection.execute(
             "SELECT payload FROM notification_outbox WHERE event_type = 'resumed'"
         ).fetchall()

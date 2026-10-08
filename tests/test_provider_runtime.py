@@ -872,3 +872,30 @@ class CommonGuidanceProviderTests(unittest.TestCase):
         self.guidance.snapshot_path.write_text('changed', encoding='utf-8')
         with self.assertRaises(self.provider_guidance.GuidanceError):
             self.provider_guidance.claude_arguments(self.guidance)
+
+
+class ProcessStartBoundaryTests(unittest.TestCase):
+    def test_both_providers_observe_launch_before_prompt_and_not_on_launch_error(self):
+        config = profile_config(self)
+        for provider in ('codex', 'claude'):
+            with self.subTest(provider=provider), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                observed = []
+                process = mock.Mock()
+                process.stdout = io.StringIO('')
+                process.wait.return_value = 0
+                process.stdin.write.side_effect = lambda _prompt: self.assertEqual(observed, ['started'])
+                run = loop_manager.run_codex if provider == 'codex' else loop_manager.run_claude
+                profile = loop_manager.ResolvedProfile('model', 'high')
+                with mock.patch('loop_manager.subprocess.Popen', return_value=process):
+                    run(root, root / 'state', config, 'worker', 'prompt', read_only=False,
+                        level=5, persist_session=True, session_id='existing-session', resolved_profile=profile,
+                        on_process_started=lambda: observed.append('started'))
+                self.assertEqual(observed, ['started'])
+                observed.clear()
+                with mock.patch('loop_manager.subprocess.Popen', side_effect=OSError('launch failed')):
+                    with self.assertRaises(OSError):
+                        run(root, root / 'state', config, 'worker', 'prompt', read_only=False,
+                            level=5, persist_session=True, session_id='existing-session', resolved_profile=profile,
+                            on_process_started=lambda: observed.append('started'))
+                self.assertEqual(observed, [])

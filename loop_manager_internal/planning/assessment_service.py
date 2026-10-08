@@ -733,6 +733,9 @@ class PlanningAssessmentService(PlanningService):
         )
         run.maintenance_decision = decision
         run.validated_result = validated_result
+        record_result = getattr(self._ports.state, "record_planning_result", None)
+        if record_result is not None:
+            record_result(context.repo, str(run.current_fingerprint), validated_result)
         if decision is not None and run.maintenance_cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT:
             self._ports.state.record_maintenance_scope(context.repo, run.maintenance_cycle.revision, existing_plan_ids,
                 prerequisite_plan_ids=decision.plan_ids if decision.outcome is MaintenanceOutcome.PREREQUISITES else ())

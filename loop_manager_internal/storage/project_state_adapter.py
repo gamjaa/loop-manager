@@ -50,6 +50,7 @@ def update_project(effects: UpdateProjectEffects, connection: sqlite3.Connection
         effects._ensure_execplans_schema(connection)
     runtime_state.RuntimeStateRepository(connection).update_project(repo, values)
     connection.commit()
+    notifications.flush_project_events(connection, repo)
 
 
 @dataclass(frozen=True)

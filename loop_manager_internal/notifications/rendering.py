@@ -38,6 +38,28 @@ def _needs_user_attention(item: dict[str, object]) -> bool:
 
 
 def _message(kind: str, payload: dict[str, object]) -> str:
+    text = _event_message(kind, payload)
+    if payload.get("occurred_at"):
+        text += f"\n발생 시각: {payload['occurred_at']}"
+    if payload.get("status"):
+        text += f"\n처리 상태: {payload['status']}"
+    return text
+
+
+def _event_message(kind: str, payload: dict[str, object]) -> str:
+    if kind in {"work_started", "stage_failed", "planning_result", "plans_published", "draft_decision"}:
+        labels = {"work_started": "작업 시작", "stage_failed": "단계 실패",
+                  "planning_result": "계획 작성 결과", "plans_published": "새 계획 게시",
+                  "draft_decision": "계획 게시 · 사용자 판단 대기"}
+        lines = [f"[{payload['project']}] {labels[kind]}"]
+        if payload.get("execplan_id"):
+            lines.append(f"{payload['execplan_id']}: {payload.get('execplan_title') or ''}")
+        for field in ("operation", "cause", "question", "url"):
+            if payload.get(field):
+                lines.append(str(payload[field]))
+        for plan in payload.get("plans", []):
+            lines.append(f"{plan['id']}: {plan['title']}")
+        return "\n".join(lines)
     if kind == "resumed":
         subject = payload.get("execplan_id") or "project"
         return (

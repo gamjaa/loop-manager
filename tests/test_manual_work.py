@@ -138,10 +138,10 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
                 if pinned:
                     guidance=pin_common_guidance(service.connection,InvocationContext(service.repo,'G-012'),
                                                  worktree,service.state_dir)
-                    pinned_hash=service.connection.execute(
-                        'SELECT content_hash FROM common_guidance_versions WHERE task_id = ?',
-                        (guidance.task_id,),
-                    ).fetchone()[0]
+                pinned_hash = service.connection.execute(
+                    'SELECT content_hash FROM common_guidance_versions WHERE task_id = ?',
+                    (guidance.task_id,),
+                ).fetchone()[0] if pinned else None
                 args=completion()
                 args.skip_verify=args.skip_review=True
                 args.expected_head=git_command(worktree,'rev-parse','HEAD')

@@ -59,6 +59,9 @@ class PlanningLifecycleCoordinator:
             snapshot = snapshot_run(self._new_run(context))
             for service, phase in self._handlers:
                 step = service.step(phase, snapshot)
+                flush = getattr(self._ports.state, "flush_notifications", None)
+                if flush is not None:
+                    flush(context.repo)
                 snapshot = step.snapshot
                 outcome = step.outcome
                 if outcome is None:

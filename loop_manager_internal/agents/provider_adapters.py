@@ -172,6 +172,7 @@ def run_codex(
     isolation_snapshot_digest: Callable[[], str] | None = None,
     expected_repository: str | None = None,
     on_isolation_checked: Callable[[agent_write_isolation.IsolationEvidence], None] | None = None,
+    on_process_started: Callable[[], None] | None = None,
     common_guidance: CommonGuidance | None = None,
     effects: ProviderEffects,
 ) -> tuple[int, str] | CodexResult:
@@ -271,7 +272,7 @@ def run_codex(
     reviewer_message = ""
     reviewer_tail = ""
     reviewer_usage = ""
-    if (persist_session and not session_id) or role_name == "reviewer":
+    if (persist_session and not session_id) or role_name == "reviewer" or on_process_started is not None:
         with log.open("w", encoding="utf-8") as output:
             start = codex_launch.start if codex_launch else effects._handoff_popen
             process = start(
@@ -290,6 +291,8 @@ def run_codex(
 
             timeout = _start_timeout(process, timeout_triggered, codex_launch.stop if codex_launch else None)
             try:
+                if on_process_started is not None:
+                    on_process_started()
                 process.stdin.write(prompt)
                 process.stdin.close()
                 lines = (_bounded_reviewer_lines(process.stdout) if role_name == "reviewer"
@@ -435,6 +438,7 @@ def run_claude(
     on_isolation_checked: Callable[[agent_write_isolation.IsolationEvidence], None] | None = None,
     isolation_snapshot_digest: Callable[[], str] | None = None,
     expected_repository: str | None = None,
+    on_process_started: Callable[[], None] | None = None,
     common_guidance: CommonGuidance | None = None,
     effects: ProviderEffects,
 ) -> tuple[int, str] | AgentResult:
@@ -455,7 +459,7 @@ def run_claude(
     last_message = project_dir / f"claude-{role_name}-last.txt"
     last_message.unlink(missing_ok=True)
 
-    streaming = role_name == "reviewer" or (persist_session and session_id is None)
+    streaming = role_name == "reviewer" or (persist_session and session_id is None) or on_process_started is not None
     arguments = [
         "claude",
         "--print",
@@ -498,6 +502,8 @@ def run_claude(
 
             timeout = _start_timeout(process, timeout_triggered)
             try:
+                if on_process_started is not None:
+                    on_process_started()
                 process.stdin.write(prompt)
                 process.stdin.close()
                 lines = (_bounded_reviewer_lines(process.stdout) if role_name == "reviewer"
@@ -702,6 +708,7 @@ class CodexAgentAdapter:
             expected_repository=request.expected_repository,
             on_isolation_checked=request.on_isolation_checked,
             common_guidance=request.common_guidance,
+            on_process_started=request.on_process_started,
         )
 
 
@@ -728,4 +735,5 @@ class ClaudeAgentAdapter:
             isolation_snapshot_digest=request.isolation_snapshot_digest,
             expected_repository=request.expected_repository,
             common_guidance=request.common_guidance,
+            on_process_started=request.on_process_started,
         )
