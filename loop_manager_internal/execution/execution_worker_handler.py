@@ -14,7 +14,10 @@ import sys
 from uuid import uuid4
 from loop_manager_internal.agents.agent_invocation import AgentResult, AgentResultKind, AttemptSequence, TrackedAgentCall, ResolvedProfile
 from loop_manager_internal.agents import common_guidance
-from loop_manager_internal.execution.worker_session import SessionBinding, SessionTransition, decide_session, unavailable_transition
+from loop_manager_internal.execution.worker_session import (
+    SessionBinding, SessionTransition, WorkerSessionDataError, decide_session,
+    unavailable_transition,
+)
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, RecoveryFailure, classify_exception
 from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
@@ -147,6 +150,14 @@ class WorkerHandler:
     def run(self, context: ExecutionContext) -> ExecutionOutcome:
         self.ports.state.check_context(context)
         row = self.ports._row()
+        try:
+            worker_binding = SessionBinding.deserialize(row['worker_session_binding'])
+            worker_transition = SessionTransition.deserialize(row['worker_session_transition'])
+        except WorkerSessionDataError as error:
+            raise RecoveryFailure(
+                RecoveryReason.STATUS_FAILED,
+                f'저장된 Worker session 상태가 유효하지 않습니다: {error}',
+            ) from error
         catalog_plan = self.ports.snapshot().catalog_plan
         plan = self.ports.snapshot().plan
         assert catalog_plan is not None and plan is not None
@@ -249,8 +260,8 @@ class WorkerHandler:
             )
         decision = decide_session(
             row['worker_session_id'],
-            SessionBinding.deserialize(row['worker_session_binding']),
-            SessionTransition.deserialize(row['worker_session_transition']),
+            worker_binding,
+            worker_transition,
             self.ports.identity.provider, resolved, uuid4().hex,
         )
         active_transition = decision.transition
@@ -871,4 +882,3 @@ class WorkerHandler:
                 last_error=None,
             )
         return self.ports._advanced()
-

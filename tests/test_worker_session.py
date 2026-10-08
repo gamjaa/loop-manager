@@ -1,10 +1,13 @@
 """Resolved Worker profile compatibility and pending transition decisions."""
 
+import json
 from unittest import TestCase
 
 from loop_manager_internal.agents.agent_invocation import ResolvedProfile
-from loop_manager_internal.execution.worker_session import (SessionBinding, SessionTransition, decide_session,
-                            unavailable_transition)
+from loop_manager_internal.execution.worker_session import (
+    SessionBinding, SessionTransition, WorkerSessionDataError, decide_session,
+    unavailable_transition,
+)
 
 
 class WorkerSessionDecisionTests(TestCase):
@@ -44,3 +47,70 @@ class WorkerSessionDecisionTests(TestCase):
                                           decision.target, 'fallback-one')
         self.assertEqual((fallback.kind, fallback.cause, fallback.previous_session),
                          ('fallback', 'session_unavailable', 'new-session'))
+
+
+class WorkerSessionCodecTests(TestCase):
+    def test_binding_codec_preserves_nullable_legacy_value_and_rejects_invalid_shape(self):
+        binding = SessionBinding('codex', 'model', 'high')
+        self.assertIsNone(SessionBinding.deserialize(None))
+        self.assertEqual(SessionBinding.deserialize(binding.serialize()), binding)
+
+        invalid = (
+            'not json',
+            '[]',
+            json.dumps({'provider': 'codex', 'effort': 'high'}),
+            json.dumps({'provider': 'codex', 'model': 7, 'effort': 'high'}),
+            json.dumps({'provider': None, 'model': 'model', 'effort': 'high'}),
+        )
+        for value in invalid:
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                SessionBinding.deserialize(value)
+
+    def test_json_parser_limit_errors_are_session_data_errors(self):
+        invalid = (
+            ('nested JSON', '{"nested":' * 1500 + 'null' + '}' * 1500),
+            ('oversized integer',
+             '{"provider":' + '9' * 5000 + ',"model":"model","effort":"high"}'),
+        )
+        decoders = (
+            ('binding', SessionBinding.deserialize),
+            ('transition', SessionTransition.deserialize),
+        )
+        for error_kind, value in invalid:
+            for codec, decode in decoders:
+                with self.subTest(error=error_kind, codec=codec), \
+                        self.assertRaises(WorkerSessionDataError):
+                    decode(value)
+
+    def test_transition_codec_validates_kind_required_fields_and_nested_bindings(self):
+        transition = SessionTransition(
+            'change-one', 'replacement', 'model_changed', None, None,
+            SessionBinding('claude', 'new-model', 'medium'),
+        )
+        self.assertIsNone(SessionTransition.deserialize(None))
+        self.assertEqual(SessionTransition.deserialize(transition.serialize()), transition)
+
+        invalid_data = (
+            {'identity': 'change-one', 'kind': 'start', 'cause': 'start',
+             'previous_session': None, 'previous_binding': None,
+             'target': {'provider': 'claude', 'model': 'new-model', 'effort': 'medium'}},
+            {'identity': 'change-one', 'kind': 'fallback', 'cause': 'session_unavailable',
+             'previous_session': 'old-session', 'previous_binding': [],
+             'target': {'provider': 'claude', 'model': 'new-model', 'effort': 'medium'}},
+            {'identity': 'change-one', 'kind': 'replacement', 'cause': 'model_changed',
+             'previous_session': None, 'previous_binding': None,
+             'target': {'provider': 'claude', 'model': 'new-model'}},
+            {'identity': 'change-one', 'kind': 'replacement', 'cause': 'model_changed',
+             'previous_session': 7, 'previous_binding': None,
+             'target': {'provider': 'claude', 'model': 'new-model', 'effort': 'medium'}},
+            {'identity': 'change-one', 'kind': 'replacement', 'cause': 'model_changed',
+             'previous_session': None, 'previous_binding': None, 'target': []},
+            {'identity': 'change-one', 'kind': 'replacement', 'cause': 'model_changed',
+             'previous_session': None, 'previous_binding': None},
+        )
+        for data in invalid_data:
+            with self.subTest(data=data), self.assertRaises(ValueError):
+                SessionTransition.deserialize(json.dumps(data))
+        for value in ('not json', '[]'):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                SessionTransition.deserialize(value)

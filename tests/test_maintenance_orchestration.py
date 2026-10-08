@@ -63,7 +63,7 @@ class MaintenanceOrchestrationTest(MaintenanceCycleCase):
         self._insert_plan(connection, "/one", "G-058")
         binding = SessionBinding("codex", "existing-model", "high").serialize()
         transition = SessionTransition(
-            "existing-transition", "switch", "model_changed", "existing-session",
+            "existing-transition", "replacement", "model_changed", "existing-session",
             SessionBinding("codex", "existing-model", "high"),
             SessionBinding("codex", "next-model", "high"),
         ).serialize()
