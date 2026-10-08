@@ -33,13 +33,14 @@ from tests.support.maintenance_planning_case import git
 
 class MaintenanceGitAliasTest(unittest.TestCase):
     def test_git_alias_strips_output_and_preserves_subprocess_failure(self):
+        repo = Path("/repo")
         completed = SimpleNamespace(stdout="  output\n")
         with mock.patch(
             "tests.support.git.subprocess.run", return_value=completed
         ) as run:
-            self.assertEqual(git(Path("/repo"), "status"), "output")
+            self.assertEqual(git(repo, "status"), "output")
         run.assert_called_once_with(
-            ["git", "-C", "/repo", "status"],
+            ["git", "-C", str(repo), "status"],
             check=True,
             text=True,
             encoding="utf-8",
@@ -49,7 +50,7 @@ class MaintenanceGitAliasTest(unittest.TestCase):
         failure = subprocess.CalledProcessError(1, "git", output="failure")
         with mock.patch("tests.support.git.subprocess.run", side_effect=failure):
             with self.assertRaises(subprocess.CalledProcessError) as raised:
-                git(Path("/repo"), "status")
+                git(repo, "status")
         self.assertIs(raised.exception, failure)
 
 
