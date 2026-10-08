@@ -4,8 +4,10 @@ import json
 from unittest import TestCase
 
 from loop_manager_internal.agents.agent_invocation import ResolvedProfile
-from loop_manager_internal.execution.worker_session import (SessionBinding, SessionTransition, decide_session,
-                            unavailable_transition)
+from loop_manager_internal.execution.worker_session import (
+    SessionBinding, SessionTransition, WorkerSessionDataError, decide_session,
+    unavailable_transition,
+)
 
 
 class WorkerSessionDecisionTests(TestCase):
@@ -63,6 +65,22 @@ class WorkerSessionCodecTests(TestCase):
         for value in invalid:
             with self.subTest(value=value), self.assertRaises(ValueError):
                 SessionBinding.deserialize(value)
+
+    def test_json_parser_limit_errors_are_session_data_errors(self):
+        invalid = (
+            ('nested JSON', '{"nested":' * 1500 + 'null' + '}' * 1500),
+            ('oversized integer',
+             '{"provider":' + '9' * 5000 + ',"model":"model","effort":"high"}'),
+        )
+        decoders = (
+            ('binding', SessionBinding.deserialize),
+            ('transition', SessionTransition.deserialize),
+        )
+        for error_kind, value in invalid:
+            for codec, decode in decoders:
+                with self.subTest(error=error_kind, codec=codec), \
+                        self.assertRaises(WorkerSessionDataError):
+                    decode(value)
 
     def test_transition_codec_validates_kind_required_fields_and_nested_bindings(self):
         transition = SessionTransition(

@@ -226,8 +226,8 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         self.assertIsNone(self.state.row()['worker_session_transition'])
 
 
-    def test_corrupt_session_binding_recovers_before_worker_call_and_preserves_audits(self):
-        bad_binding = '{"provider": 7, "model": "model", "effort": "high"}'
+    def _assert_corrupt_session_binding_recovers_before_worker_call_and_preserves_audits(
+            self, bad_binding):
         self.state.update_project(
             'repo', worker_session_id='saved-session',
             worker_session_binding=bad_binding, worker_session_transition=None,
@@ -288,6 +288,26 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         ).fetchone()
         for field in audit_fields:
             self.assertEqual(after_audit[field], before_audit[field], field)
+
+
+    def test_corrupt_session_binding_recovers_before_worker_call_and_preserves_audits(self):
+        bad_binding = '{"provider": 7, "model": "model", "effort": "high"}'
+        self._assert_corrupt_session_binding_recovers_before_worker_call_and_preserves_audits(
+            bad_binding,
+        )
+
+
+    def test_json_parser_limit_errors_recover_without_worker_and_preserve_audits(self):
+        invalid = (
+            ('nested JSON', '{"nested":' * 1500 + 'null' + '}' * 1500),
+            ('oversized integer',
+             '{"provider":' + '9' * 5000 + ',"model":"model","effort":"high"}'),
+        )
+        for error_kind, bad_binding in invalid:
+            with self.subTest(error=error_kind):
+                self._assert_corrupt_session_binding_recovers_before_worker_call_and_preserves_audits(
+                    bad_binding,
+                )
 
 
     def test_corrupt_pending_transition_does_not_resume_saved_session(self):

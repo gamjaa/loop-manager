@@ -42,7 +42,7 @@ def _load_object(value: str, owner: str) -> dict:
         raise WorkerSessionDataError(f'{owner} must be a JSON string')
     try:
         data = json.loads(value)
-    except json.JSONDecodeError as error:
+    except (ValueError, RecursionError) as error:
         raise WorkerSessionDataError(f'{owner} must contain valid JSON') from error
     if not isinstance(data, dict):
         raise WorkerSessionDataError(f'{owner} must contain a JSON object')
