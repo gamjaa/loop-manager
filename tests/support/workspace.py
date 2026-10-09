@@ -1,3 +1,4 @@
+from tests.support.fixed_samples import use_fixed_guidance
 import sqlite3
 import unittest
 from contextlib import ExitStack
@@ -23,6 +24,10 @@ def symlink_or_skip(link: Path, target, *, target_is_directory=False):
 
 class WorkspaceFixture:
     """Shared scenario setup; inheriting this fixture collects no tests."""
+    def setUp(self):
+        use_fixed_guidance(self)
+        super().setUp()
+
 
     def _git_metadata_path(self, repo: Path, path: str) -> Path:
         metadata = Path(git_command(repo, "rev-parse", "--git-path", path))
@@ -56,6 +61,7 @@ class WorkspaceFixture:
         return repo, state_dir, branch, worktree
 
     def _ready_execplan(self, directory: str):
+        use_fixed_guidance(self)
         repo = make_remote_repository(directory)
         state_dir = Path(directory) / "state"
         (repo / "docs/plans").mkdir()

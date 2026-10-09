@@ -1,3 +1,4 @@
+from tests.support.fixed_samples import use_fixed_guidance
 import sqlite3
 import unittest
 
@@ -6,6 +7,7 @@ from loop_manager_internal.storage import execplan_archive_state, planning_input
 
 class ExecPlanArchiveStateTest(unittest.TestCase):
     def setUp(self):
+        use_fixed_guidance(self)
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row
         self.connection.execute(

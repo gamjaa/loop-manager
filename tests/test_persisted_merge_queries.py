@@ -1,3 +1,4 @@
+from tests.support.fixed_samples import use_fixed_guidance
 import contextlib
 import sqlite3
 import unittest
@@ -15,6 +16,7 @@ REPO = str(Path("/repo").resolve())
 
 class PersistedMergeProjectQueryTest(unittest.TestCase):
     def setUp(self):
+        use_fixed_guidance(self)
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row
         self.connection.execute(loop_manager.SCHEMA)

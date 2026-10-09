@@ -1,3 +1,4 @@
+from tests.support.fixed_samples import use_fixed_guidance
 import sqlite3
 import tempfile
 import unittest
@@ -11,6 +12,10 @@ from tests.support.worker import dummy_worker_sessions
 
 
 class PlanningFingerprintTest(unittest.TestCase):
+    def setUp(self):
+        use_fixed_guidance(self)
+        super().setUp()
+
     def test_input_kind_distinguishes_documents_plans_and_code(self):
         classify = lambda path: catalog_service.classify_planning_input(
             path, loop_manager._is_active_requirement,

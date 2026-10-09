@@ -27,6 +27,27 @@ from tests.support.origin import OriginScopeFixture
 
 
 class SupportFixtureTests(unittest.TestCase):
+    def test_fixed_guidance_covers_digest_and_baseline_until_cleanup(self):
+        from tests.support.fixed_samples import PROJECT_FILES, use_fixed_guidance
+        from loop_manager_internal.agents import common_guidance
+        from loop_manager_internal.storage import planning_input_state
+
+        connection = database_fixture.runtime_connection()
+        self.addCleanup(connection.close)
+        read = common_guidance._read
+        def read_sample(path):
+            self.assertTrue(path.is_relative_to(PROJECT_FILES), path)
+            return read(path)
+        with (mock.patch.object(common_guidance, 'RUNTIME_ROOT', Path('/missing-runtime')),
+              mock.patch.object(common_guidance, '_read', side_effect=read_sample)):
+            with ExitStack() as cleanup:
+                use_fixed_guidance(SimpleNamespace(addCleanup=cleanup.callback))
+                before = loop_manager._planning_input_digest([(b'app.py', b'blob', b'one')])
+                planning_input_state.record_general(connection, 'repo', 'base', {})
+                self.assertFalse(planning_input_state.guidance_changed(connection, 'repo'))
+                self.assertEqual(before, loop_manager._planning_input_digest([(b'app.py', b'blob', b'one')]))
+            self.assertEqual(common_guidance.RUNTIME_ROOT, Path('/missing-runtime'))
+
     def test_worker_decorator_keeps_planning_baseline_stable_across_nested_context(self):
         from loop_manager_internal.agents import common_guidance
         from loop_manager_internal.storage import planning_input_state
@@ -477,7 +498,9 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
             self.assertIs(returned, result)
             shared_prepare.assert_called_once_with(owner, '/fixture', **expected)
 
-    def test_shared_active_worker_setup_keeps_working_state_and_input_choice(self):
+    def test_active_worker_project_registers_owned_state_and_input_choice(self):
+        from loop_manager_internal.agents import common_guidance
+        from tests.support.fixed_samples import PROJECT_FILES
         with tempfile.TemporaryDirectory() as directory:
             for record_general_input in (False, True):
                 with self.subTest(record_general_input=record_general_input):
@@ -513,6 +536,7 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
                             commit_message='Add worker plan',
                         )
                     self.assertEqual(len(prepared), 3)
+                    self.assertEqual(common_guidance.RUNTIME_ROOT, PROJECT_FILES)
                     self.assertEqual(prepared[0], repo)
                     self.assertEqual(prepared[2].execute(
                         'SELECT phase FROM projects'

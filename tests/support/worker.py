@@ -1,3 +1,4 @@
+from tests.support.fixed_samples import use_fixed_guidance
 import json
 import contextlib
 import sqlite3
@@ -135,6 +136,7 @@ def make_active_worker_project(
     commit_message: str,
 ) -> tuple[Path, Path, sqlite3.Connection]:
     """Build a published plan, deterministic workspace, and WORKING projection."""
+    use_fixed_guidance(owner)
     repo = make_remote_repository(directory)
     state_dir = Path(directory) / "state"
     state_dir.mkdir()
@@ -181,6 +183,10 @@ def make_active_worker_project(
 
 class ActiveWorkerFixture:
     """Shared scenario setup; inheriting this fixture collects no tests."""
+    def setUp(self):
+        use_fixed_guidance(self)
+        super().setUp()
+
 
     def _make_active_worker_project(self, directory: str):
         return make_active_worker_project(

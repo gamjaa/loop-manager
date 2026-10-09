@@ -1,3 +1,4 @@
+from tests.support.fixed_samples import use_fixed_guidance
 import sqlite3
 from dataclasses import replace
 from pathlib import Path
@@ -9,6 +10,10 @@ from tests.support.git import git_command, make_remote_repository, commit_and_pu
 
 class AgentScopeFixture:
     """Shared scenario setup; inheriting this fixture collects no tests."""
+    def setUp(self):
+        use_fixed_guidance(self)
+        super().setUp()
+
 
     @staticmethod
     def _confirm_general_plan_input(connection, repo: Path, revision: str) -> None:

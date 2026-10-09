@@ -1,3 +1,4 @@
+from tests.support.fixed_samples import use_fixed_guidance
 import json
 import sqlite3
 import subprocess
@@ -103,8 +104,13 @@ def publishing_branch_pr_lookup(connection, url):
 
 class PublicationFixture:
     """Shared scenario setup; inheriting this fixture collects no tests."""
+    def setUp(self):
+        use_fixed_guidance(self)
+        super().setUp()
+
 
     def _publication_state(self, directory: str):
+        use_fixed_guidance(self)
         repo = make_remote_repository(directory)
         state_dir = Path(directory) / "state"
         state_dir.mkdir()

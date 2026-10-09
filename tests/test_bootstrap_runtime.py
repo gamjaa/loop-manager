@@ -1,4 +1,5 @@
 from tests.support.git import isolated_git_test
+from tests.support.fixed_samples import use_fixed_guidance
 import contextlib
 from dataclasses import replace
 import hashlib
@@ -403,6 +404,10 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
     # Real Git and child CLI are the contract here: imported runtime B, saved
     # Agent scopes, and later base C must stay connected across process restart.
     """Real subprocess regressions; use the coordinated verification runner."""
+    def setUp(self):
+        use_fixed_guidance(self)
+        super().setUp()
+
 
     def _run_child(self, source, manager_file, state, config):
         import sys
@@ -669,6 +674,29 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
 
 
 class BootstrapSavedScopeFixtureUnitTests(unittest.TestCase):
+    def test_saved_scope_setup_combines_git_isolation_and_fixed_guidance(self):
+        import os
+        from loop_manager_internal.agents import common_guidance
+
+        read = common_guidance._read
+        def read_sample(path):
+            self.assertTrue(path.is_relative_to(PROJECT_FILES), path)
+            return read(path)
+        with (mock.patch.object(common_guidance, 'RUNTIME_ROOT', Path('/missing-runtime')),
+              mock.patch.object(common_guidance, '_read', side_effect=read_sample),
+              mock.patch.dict(os.environ, {'GIT_CONFIG_GLOBAL': 'user-config'}),
+              mock.patch('subprocess.Popen', side_effect=AssertionError('unexpected process'))):
+            fixture = BootstrapSavedScopeResumeTests()
+            try:
+                fixture.setUp()
+                self.assertEqual(os.environ['GIT_CONFIG_GLOBAL'], os.devnull)
+                self.assertEqual(common_guidance.RUNTIME_ROOT, PROJECT_FILES)
+                self.assertEqual(len(common_guidance.runtime_content_hash()), 64)
+            finally:
+                fixture.doCleanups()
+            self.assertEqual(common_guidance.RUNTIME_ROOT, Path('/missing-runtime'))
+            self.assertEqual(os.environ['GIT_CONFIG_GLOBAL'], 'user-config')
+
     def test_saved_invocation_proof_is_bound_to_role_session_repository_and_scope(self):
         from types import SimpleNamespace
         from tests.support.database import runtime_connection

@@ -1,3 +1,4 @@
+from tests.support.fixed_samples import use_fixed_guidance
 from tests.support.database import AutomationCatalogFixture
 import json
 import tempfile
@@ -769,6 +770,10 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
 
 
 class PreservedPlanningSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
+    def setUp(self):
+        use_fixed_guidance(self)
+        super().setUp()
+
     def test_failed_general_handoff_holds_targets_and_transitive_dependents(self):
         from loop_manager_internal.storage import runtime_state, planner_check_state
         for stage in ('handoff', 'superseded'):
