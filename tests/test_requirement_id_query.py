@@ -118,6 +118,11 @@ class RequirementIdQueryTest(unittest.TestCase):
             parser = script_directory / "frontmatter.py"
             parser.write_bytes(Path(shared_frontmatter.__file__).read_bytes())
             self._write(root, "docs/requirements/one.md", "# [R-009] One\n")
+            before = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
 
             original_import = __import__
 
@@ -136,7 +141,13 @@ class RequirementIdQueryTest(unittest.TestCase):
                 deployed_tool = runpy.run_path(str(script))
                 status = deployed_tool["main"]()
 
+            after = {
+                path.relative_to(root): path.read_bytes()
+                for path in root.rglob("*")
+                if path.is_file()
+            }
             self.assertEqual((status, stdout.getvalue(), stderr.getvalue()), (0, "R-010\n", ""))
+            self.assertEqual(after, before)
 
     def test_invalid_documents_fail_without_partial_stdout(self):
         invalid_documents = (

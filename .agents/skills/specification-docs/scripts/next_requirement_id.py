@@ -3,11 +3,11 @@
 
 from __future__ import annotations
 
-import importlib.util
 import re
 import stat
 import sys
 from pathlib import Path
+from types import ModuleType
 
 _SHARED_FRONTMATTER = Path(__file__).with_name("frontmatter.py")
 if not _SHARED_FRONTMATTER.is_file():
@@ -15,13 +15,12 @@ if not _SHARED_FRONTMATTER.is_file():
         Path(__file__).resolve().parents[4]
         / "loop_manager_internal/catalog/frontmatter.py"
     )
-_FRONTMATTER_SPEC = importlib.util.spec_from_file_location(
-    "_loop_manager_frontmatter", _SHARED_FRONTMATTER
+_FRONTMATTER_MODULE = ModuleType("_loop_manager_frontmatter")
+_FRONTMATTER_MODULE.__file__ = str(_SHARED_FRONTMATTER)
+exec(
+    compile(_SHARED_FRONTMATTER.read_bytes(), str(_SHARED_FRONTMATTER), "exec"),
+    _FRONTMATTER_MODULE.__dict__,
 )
-if _FRONTMATTER_SPEC is None or _FRONTMATTER_SPEC.loader is None:
-    raise ImportError(f"공유 frontmatter parser를 읽을 수 없습니다: {_SHARED_FRONTMATTER}")
-_FRONTMATTER_MODULE = importlib.util.module_from_spec(_FRONTMATTER_SPEC)
-_FRONTMATTER_SPEC.loader.exec_module(_FRONTMATTER_MODULE)
 parse_frontmatter = _FRONTMATTER_MODULE.parse_frontmatter
 
 
