@@ -494,7 +494,8 @@ class ExecPlanDraftPublicationTest(AutomationCatalogFixture, unittest.TestCase):
             hashes = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
             git = mock.Mock(return_value=SimpleNamespace(stdout="git@github.com:owner/project.git"))
             rows = planner_publication.RegisterExecplanRowsEffects(
-                _ensure_execplans_schema=loop_manager._ensure_execplans_schema, file_hash=hashes, git=git)
+                _ensure_execplans_schema=loop_manager._ensure_execplans_schema, file_hash=hashes, git=git,
+                git_bytes=lambda _root, _show, spec: (root / spec.split(":", 1)[1]).read_bytes())
             def interrupted_hash(path):
                 if path.name == Path(second).name:
                     raise KeyboardInterrupt("registration interrupted")

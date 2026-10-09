@@ -246,9 +246,9 @@ PRODUCT의 `fast`·`targeted`·`full` 선택은 정적 비교와 마지막 성�
 
 모듈 의미 검토는 읽기 전용 Planner 호출로 필요한 원본과 보존 조건을 확인한다. Manager는 묶음 범위·판단·발견과 실제 원본 인용을 검증해 잠정 결과로 보존한다. 발견이 없고 일반 계획도 필요하지 않으면 추가 종합·계획 호출 없이 no-change 결과를 준비한다. 발견이 있으면 저장된 검토를 입력으로 계획 또는 근거 있는 제외에 연결하며, 파일별 검토·관계 확인·종합 페이지를 다시 기본 단계로 실행하지 않는다.
 
-유지보수 Planner의 barrier dependency·사후 구조 참조 개정은 계속 활성 mode와 무소유 READY snapshot에 한정한다. 새 단계별 평가의 일반 계획은 별도 필요한 계획 주기에서 수행한다. 일반 계획 결합 여부와 종전 결과를 이미 보존한 cycle은 해당 mode·게시 검증을 유지해 복구한다.
+barrier mode의 유지보수 Planner는 선행과 새 리팩터링 DAG를 판단한다. Manager는 DAG 말단과 SQLite cycle rows로 필요한 선행 dependency closure를 계산한 뒤, closure 밖의 적격 READY snapshot에 누락된 말단 dependency만 기존 순서 뒤에 추가한다. 파일을 수정하기 전 cycle·snapshot 소유권을 다시 확인하고, 예상한 dependency-only diff와 catalog의 acyclic 관계를 검증한다. 실제 Manager diff는 planning result의 hash·publication path에 포함되어 원격 게시·catalog transaction·복구 검증을 통과한다. 게시 본문은 검증한 checkout과 CRLF/LF 줄바꿈 차이만 허용하며 다른 clean filter 내용 변환은 거부한다. 새 계획 등록은 현재 checkout hash와 Git 게시 blob의 감사 hash를 분리해 보존하고, Merge·archive 복구는 publication SHA의 blob hash로 증명한다. 다른 READY 파일 변경, 사용자 결정·draft 해제, snapshot 밖 파일과 실행 중·소유된 계획은 허용하지 않는다. 새 단계별 평가의 일반 계획은 별도 필요한 계획 주기에서 수행한다. 일반 계획 결합 여부와 종전 결과를 이미 보존한 cycle은 해당 mode·게시 검증을 유지해 복구한다.
 
-planning batch의 원격 게시·catalog 반영과 현재 원격 입력 일치를 확인한 뒤 정적·모듈 평가 근거와 해당 성공 기준을 SQLite transaction에서 확정한다. 미게시·검증 실패·원격 source 변경은 성공 기준을 전진시키지 않으며 잠정 근거·publication intent를 보존해 복구한다. 새 리팩터링 계획은 기존 DAG·장벽·사후 재검증 경로를 따르고, 사후 재검증은 cycle 완료를 담당한다.
+planning batch의 원격 게시·catalog 반영과 현재 원격 입력 일치를 확인한 뒤 정적·모듈 평가 근거와 해당 성공 기준을 SQLite transaction에서 확정한다. 미게시·검증 실패·원격 source 변경은 성공 기준을 전진시키지 않으며 잠정 근거·publication intent를 보존해 복구한다. 새 리팩터링 계획은 검증된 DAG와 Manager barrier 편집을 포함해 게시한다. 이후 cycle 종료는 R-074의 마지막 Merge·원격 관측·catalog 반영 조건을 따르며 새 cycle에서 사후 재검증을 종료 조건으로 추가하지 않는다.
 
 역할별 기존 parser 경계는 공통 형식 helper로 marker·구분자·공백과 다중 줄 JSON을 정규화하고, 검증된 입력 identity만 누락 결과에 결합한다. 명시적 불일치·중복 선언·중복 JSON key와 의미 근거 누락은 거부한다. Worker·Reviewer·Planner의 저장된 원문은 같은 snapshot에서 다시 해석하며, 모듈 결과는 원문·정규화 결과·원본 revision·scope·protocol을 함께 보존한다. 모듈 묶음 identity에 결과 protocol을 포함해 다른 계약의 receipt를 재사용하지 않는다.
 

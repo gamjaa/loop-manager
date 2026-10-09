@@ -293,8 +293,10 @@ class VerifyInputObservationTest(unittest.TestCase):
         patterns = inputs.parse((root / inputs.MANIFEST).read_bytes())
         for path in ('loop_manager.py', 'loop_manager_internal/verification/runner.py',
                      'tests/support/origin.py', 'scripts/verify.sh', 'scripts/verify.ps1',
-                     'requirements.txt', 'config/config.ini.example', 'AGENTS.md',
-                     'docs/PLANS.md', 'docs/AGENTS.worker.md',
+                     'requirements.txt', 'config/config.ini.example', 'AGENTS.md', 'README.md',
+                     'docs/PLANS.md', 'docs/AGENTS.worker.md', 'docs/PRODUCT.md',
+                     'docs/FUTURE_IDEAS.md', 'docs/PRODUCT.template.md',
+                     'docs/ARCHITECTURE.template.md', 'docs/REQUIREMENT.template.md',
                      '.agents/skills/specification-docs/SKILL.md'):
             with self.subTest(path=path):
                 self.assertTrue(any(inputs.matches(path, pattern) for pattern in patterns))

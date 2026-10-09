@@ -454,6 +454,7 @@ def insert_published_plan_row(
     plan: Mapping[str, object],
     content_hash: str,
     revision_sha: str,
+    *, publication_content_hash: str | None = None,
 ) -> None:
     """Register validated publication metadata without reading a worktree."""
 
@@ -473,7 +474,7 @@ def insert_published_plan_row(
             repo, str(plan["id"]), path, str(plan["title"]), sources,
             dependencies, priority, content_hash,
             str(plan["complexity"]), str(plan["risk"]), revision_sha,
-            path, content_hash, revision_sha, revision_sha,
+            path, publication_content_hash or content_hash, revision_sha, revision_sha,
             initial_level, initial_level,
         ),
     )
@@ -1667,6 +1668,7 @@ def _merged_execplan_ids(
 def register_published_plan_row(
     connection: sqlite3.Connection, repo: str, path: str,
     plan: Mapping[str, object], content_hash: str, plan_commit: str,
+    *, publication_content_hash: str | None = None,
 ) -> None:
     """Apply a validated publication row without committing the caller event."""
     plan_id = str(plan["id"])
@@ -1691,10 +1693,12 @@ def register_published_plan_row(
             existing["plan_id"], existing["path"], existing["title"],
             existing["sources"], existing["depends_on"], existing["priority"],
             existing["content_hash"], existing["plan_sha"],
+            existing["publication_content_hash"],
         )
         expected = (
             plan_id, path, str(plan["title"]), sources, dependencies,
             priority, content_hash, plan_commit,
+            publication_content_hash or content_hash,
         )
         if immutable != expected:
             raise RuntimeError(f"게시된 ExecPlan 등록 정보가 충돌합니다: {plan_id}")
@@ -1707,6 +1711,7 @@ def register_published_plan_row(
         return
     insert_published_plan_row(
         connection, repo, path, plan, content_hash, plan_commit,
+        publication_content_hash=publication_content_hash,
     )
 
 

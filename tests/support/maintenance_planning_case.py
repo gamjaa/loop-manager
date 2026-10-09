@@ -168,12 +168,7 @@ class MaintenancePlanningCase(unittest.TestCase):
 
     def _write_barrier_batch(self) -> None:
         self._write_plan("G-002", "Extract Boundary")
-        self._write_plan(
-            "G-003", "Separate Adapter", depends_on=("G-002",)
-        )
-        self._write_plan(
-            "G-001", "Ready Feature", depends_on=("G-000", "G-003")
-        )
+        self._write_plan("G-003", "Separate Adapter")
 
     def _validate_barrier(
         self, context: loop_manager.MaintenancePlanningContext

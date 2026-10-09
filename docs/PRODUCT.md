@@ -366,6 +366,7 @@ Loop Manager runtime에서만 읽는 `docs/AGENTS.*.md`와 저장소 밖 Manager
 - 기존 활성 cycle을 먼저 복구·완료하고 과거 성공 이력은 유지한다. 새 평가는 최신 원격 입력을 정적으로 확인해 모델 없는 `fast`, 영향받은 모듈의 `targeted`, 전체 모듈의 `full` 점검 중 필요한 범위를 선택한다.
 - 첫 전체 정밀 점검은 초기 입력에서 수행한다. 이후에는 직전 cycle 정상 종료 시 마지막 유지보수 Merge까지 포함한 MERGED 수에서 `refactoring_review_interval`만큼 증가하거나 새 명시적 요청이 있을 때 시작한다. 설정은 양의 정수이며 기본값은 20이다. 활성 작업·실제 Open PR·프로젝트 안전 gate를 확인한 뒤 due 평가를 일반 Planner·빠른 점검·READY보다 먼저 수행한다.
 - 한 번의 평가에서 모듈 묶음 검토·필요한 종합을 수행하고 발견을 새 계획·기존 비종료 계획·근거 있는 제외에 연결해 prerequisite·리팩터링과 필요한 dependency closure를 확정한다. prerequisite Merge나 개선 결과로 새 평가를 시작해 범위를 늘리지 않는다. 주기 전 코드 영향·평가 receipt와 최신 원본의 차이·완료 후보는 자동 평가의 시작 조건이 아니다.
+- 유지보수 Planner는 필요한 선행과 리팩터링 DAG를 판단한다. Manager는 새 리팩터링 DAG의 모든 말단을 필요한 선행 dependency closure 밖의 적격 READY snapshot에 추가한다. 이 편집은 기존 dependency 순서와 계획 본문·metadata를 보존하며, 실행 이력·소유권·PR이 있거나 cycle·snapshot 범위 밖인 계획에는 적용하지 않는다.
 - 원본에 결합된 성공 모듈 검토는 해당 묶음의 입력이 같을 때 재사용한다. 검토에서 발견이 없고 일반 계획을 함께 수행할 필요도 없으면 별도 종합·계획 호출을 하지 않는다. 발견이 있으면 새 계획·기존 비종료 계획·근거 있는 제외에 연결해 처리한다.
 - 리팩터링은 동작·공개 계약·저장 형식을 보존한다. 각 계획의 targeted test·전체 verify·Review·사용자 Merge를 유지하고 확정 범위가 모두 실제 MERGED인 뒤 종료한다. 계획 없음·기존 계획 연결·근거 있는 제외도 검증·필요한 게시 뒤 종료한다.
 - 평가 성공 원본과 cycle 종료 cadence는 별도로 보존한다. 수정 뒤 검토하지 않은 원본의 receipt를 합성하지 않는다. 명시 요청은 cycle 시작에 identity를 결합해 한 번 소비하며 활성 cycle 중 새 요청은 다음 안전한 경계까지 보존한다. 중단·원본 변경은 같은 cycle의 미완료 게시와 필요한 관련 근거만 재검증한다.

@@ -7,10 +7,12 @@
 - 프로그램이 SQLite 상태와 Git revision에 결합된 PR 전 계획 snapshot을 제공한 경우에만
   snapshot 안의 계획을 같은 ID로 개정한다. 시작한 계획의 ID·경로·기존 수행 기록은 보존하며
   미착수 계획만 이름 변경·삭제한다. snapshot 밖, PR 등록·MERGED·archive 계획은 변경하지 않는다.
-- 유지보수 작업은 호출에 지정된 mode와 target snapshot의 범위만 개정한다. barrier·
-  post-refactor revalidation은 branch·worktree·workspace reservation·Worker·Reviewer session·
-  PR이 없는 READY 계획에 한하며 `docs/PLANS.md`의 metadata·목표 보존과 mode별 범위를 따른다.
-  기존 파일의 삭제·이름 변경이나 snapshot 밖 수정은 하지 않는다.
+- 유지보수 작업은 호출에 지정된 mode와 target snapshot의 범위만 다룬다. barrier mode에서는
+  구조 판단과 새 계획 DAG를 반환하고 eligible READY 계획 파일을 수정하지 않는다. Manager가
+  검증한 DAG 말단 dependency를 필요한 선행 closure 밖의 무소유 READY snapshot에 추가한다.
+  post-refactor revalidation mode의 계획 개정은 branch·worktree·workspace reservation·
+  Worker·Reviewer session·PR이 없는 READY 대상에 한하며 `docs/PLANS.md`의 metadata·목표 보존과
+  mode별 범위를 따른다. 기존 파일의 삭제·이름 변경이나 snapshot 밖 수정은 하지 않는다.
 - 읽기 전용 평가·문서 draft·수동 계획 생성 호출에서는 결과만 반환하고 어떤 파일도 변경하지 않는다.
   snapshot이나 catalog를 제공받은 사실만으로 쓰기 권한을 얻지 않는다.
 - 진행 중 작업의 문서 영향 판단 호출은 현재 구현과 최신 ExecPlan·연결 Requirement·적용

@@ -151,12 +151,18 @@ def _validate_maintenance_planning_commit(
         effects.load_execplan_catalog(repository, validate_sources=False)
     for path in result.publication_paths:
         local_contents = (repository / path).read_bytes()
-        remote_contents = effects.git_bytes(repository, "show", f"{plan_commit}:{path}")
         expected_hash = validated_hashes[path]
-        if (
-            hashlib.sha256(local_contents).hexdigest() != expected_hash
-            or hashlib.sha256(remote_contents).hexdigest() != expected_hash
-        ):
+        if hashlib.sha256(local_contents).hexdigest() != expected_hash:
+            raise MaintenancePlanningError(
+                "maintenance ExecPlan이 Planner 결과 검증 후 "
+                f"변경됐습니다: {path}"
+            )
+        remote_contents = effects.git_bytes(
+            repository, "show", f"{plan_commit}:{path}"
+        )
+        # Git may normalize CRLF checkout lines, but no other clean-filter
+        # transformation may alter the validated publication content.
+        if remote_contents.replace(b"\r\n", b"\n") != local_contents.replace(b"\r\n", b"\n"):
             raise MaintenancePlanningError(
                 "maintenance ExecPlan이 Planner 결과 검증 후 "
                 f"변경됐습니다: {path}"
@@ -653,7 +659,8 @@ def _apply_maintenance_planning_batch(
             from loop_manager_internal.storage import execplan_draft_state
             from loop_manager_internal.catalog import execplan_drafts
             execplan_draft_state.observe(connection, repo, revision.path, revision.plan,
-                effects.file_hash(worktree / revision.path), plan_commit, agent=True,
+                effects.file_hash(worktree / revision.path), plan_commit,
+                agent=context.mode is MaintenancePlanMode.REVALIDATION,
                 inputs=execplan_drafts.input_digests(worktree, revision.plan))
 
         cycle = repository.get(repo)
