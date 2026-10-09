@@ -653,7 +653,8 @@ def _apply_maintenance_planning_batch(
             from loop_manager_internal.storage import execplan_draft_state
             from loop_manager_internal.catalog import execplan_drafts
             execplan_draft_state.observe(connection, repo, revision.path, revision.plan,
-                effects.file_hash(worktree / revision.path), plan_commit, agent=True,
+                effects.file_hash(worktree / revision.path), plan_commit,
+                agent=context.mode is MaintenancePlanMode.REVALIDATION,
                 inputs=execplan_drafts.input_digests(worktree, revision.plan))
 
         cycle = repository.get(repo)

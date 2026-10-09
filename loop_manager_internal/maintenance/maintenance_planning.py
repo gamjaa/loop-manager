@@ -279,12 +279,62 @@ def validate_barrier_revision(
             f"{path}"
         )
     additions = new_dependencies[old_dependency_count:]
-    expected = set(terminal_plan_ids)
+    expected = set(terminal_plan_ids) - set(snapshot.depends_on)
     if set(additions) != expected or len(new_dependencies) != len(set(new_dependencies)):
         raise MaintenancePlanningError(
             "barrier mode는 검증된 리팩터링 DAG 말단 전체만 "
             f"depends_on에 추가해야 합니다: {path}"
         )
+
+
+def append_barrier_dependencies(
+    snapshot: ReadyPlanSnapshot,
+    terminal_plan_ids: Sequence[str],
+) -> str:
+    """Append missing DAG terminals while preserving every other plan byte."""
+
+    additions = tuple(
+        plan_id for plan_id in terminal_plan_ids
+        if plan_id not in snapshot.depends_on
+    )
+    if not additions:
+        return snapshot.text
+
+    lines = snapshot.text.splitlines(keepends=True)
+    try:
+        frontmatter_end = next(
+            index for index in range(1, len(lines))
+            if lines[index].rstrip("\r\n") == "---"
+        )
+    except StopIteration as error:
+        raise MaintenancePlanningError(
+            "ExecPlan frontmatter 종료 구분자가 없습니다."
+        ) from error
+    dependency_index = next(
+        (
+            index for index, line in enumerate(lines[1:frontmatter_end], start=1)
+            if re.fullmatch(
+                r"depends_on:\s*(?:\[\])?", line.rstrip("\r\n")
+            )
+        ),
+        None,
+    )
+    if dependency_index is None:
+        raise MaintenancePlanningError(
+            "ExecPlan depends_on frontmatter가 없습니다."
+        )
+
+    line = lines[dependency_index]
+    newline = "\r\n" if line.endswith("\r\n") else "\n"
+    if line.rstrip("\r\n").endswith("[]"):
+        lines[dependency_index] = "depends_on:" + newline
+        insert_at = dependency_index + 1
+    else:
+        insert_at = dependency_index + 1
+        while insert_at < frontmatter_end and lines[insert_at].startswith("  - "):
+            insert_at += 1
+    lines[insert_at:insert_at] = [f"  - {plan_id}{newline}" for plan_id in additions]
+    return "".join(lines)
 
 
 def validate_revalidation_revision(

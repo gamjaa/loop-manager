@@ -182,7 +182,9 @@ class MaintenancePublicationTest(MaintenancePlanningCase):
         self.assertEqual(repeated, cycle)
         self.assertEqual(cycle.refactoring_plan_ids, ("G-002", "G-003"))
         self.assertEqual(cycle.revalidation_plan_ids, ("G-001",))
-        self.assertEqual(json.loads(rows[1]["depends_on"]), ["G-000", "G-003"])
+        self.assertEqual(
+            json.loads(rows[1]["depends_on"]), ["G-000", "G-002", "G-003"],
+        )
         self.assertTrue(all(row["plan_sha"] == plan_commit for row in rows[1:]))
         self.assertTrue(
             all(row["current_revision_sha"] == plan_commit for row in rows[1:])
@@ -380,7 +382,9 @@ class MaintenancePublicationTest(MaintenancePlanningCase):
             [row["plan_id"] for row in rows],
             ["G-000", "G-001", "G-002", "G-003"],
         )
-        self.assertEqual(json.loads(rows[1]["depends_on"]), ["G-000", "G-003"])
+        self.assertEqual(
+            json.loads(rows[1]["depends_on"]), ["G-000", "G-002", "G-003"],
+        )
 
     def test_published_batch_recovers_after_remote_tip_advances(self):
         context = self._begin_barrier()

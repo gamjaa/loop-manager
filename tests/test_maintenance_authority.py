@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from loop_manager_internal.documents import document_drafts
 from loop_manager_internal.documents import document_publication
 from loop_manager_internal.catalog import execplan_catalog
+from loop_manager_internal.catalog import execplan_drafts
 from loop_manager_internal.storage import execplan_catalog_state
 import loop_manager
 from loop_manager_internal.maintenance import maintenance_planning
@@ -43,9 +44,6 @@ class MaintenanceAuthorityTest(MaintenancePlanningCase):
         self._write_plan(
             "G-006", "General Follow-up", depends_on=("G-005",),
         )
-        self._write_plan(
-            "G-001", "Ready Feature", depends_on=("G-000", "G-005"),
-        )
 
         result = loop_manager.validate_maintenance_planner_result(
             self.connection, context, self.repo,
@@ -62,6 +60,9 @@ class MaintenanceAuthorityTest(MaintenancePlanningCase):
         )
         self.assertEqual(result.plans[1][1]["depends_on"], ["G-002"])
         self.assertEqual(result.revisions[0].plan["depends_on"], ["G-000", "G-002"])
+        self.assertEqual(
+            self.ready_path.read_text(encoding="utf-8").count("G-002"), 1,
+        )
         self.assertEqual(result.refactoring_plan_ids, ("G-002",))
         self.assertEqual(result.revalidation_plan_ids, ("G-001", "G-003"))
         self.assertEqual(
@@ -108,10 +109,6 @@ class MaintenanceAuthorityTest(MaintenancePlanningCase):
         context = self._begin_barrier()
         self._write_plan("G-002", "First Refactor")
         self._write_plan("G-011", "Second Refactor")
-        self._write_plan(
-            "G-001", "Ready Feature",
-            depends_on=("G-000", "G-002", "G-011"),
-        )
 
         initial = loop_manager.validate_maintenance_planner_result(
             self.connection, context, self.repo,
@@ -426,7 +423,7 @@ class MaintenanceAuthorityTest(MaintenancePlanningCase):
                 loop_manager.changed_files(self.repo),
             )
 
-    def test_barrier_adds_every_dag_terminal_and_rejects_body_or_priority_drift(self):
+    def test_manager_adds_every_dag_terminal_and_rejects_planner_ready_edits(self):
         context = self._begin_barrier()
         self._write_barrier_batch()
         result = self._validate_barrier(context)
@@ -446,6 +443,8 @@ class MaintenanceAuthorityTest(MaintenancePlanningCase):
 
         self.assertIn("maintenance barrier", prompt)
         self.assertIn("G-001", prompt)
+        self.assertIn("Manager가 검증된 DAG", prompt)
+        self.assertIn("eligible READY 계획 파일은 수정하지 마라", prompt)
         self.assertIn("docs/FUTURE_IDEAS.md", prompt)
         self.assertIn("사용자 편집을 대행", prompt)
         self.assertIn("Manager가 제공한 파일 또는 모듈 단위", prompt)
@@ -456,17 +455,30 @@ class MaintenanceAuthorityTest(MaintenancePlanningCase):
         )
         self.assertEqual(
             result.revisions[0].plan["depends_on"],
-            ["G-000", "G-003"],
+            ["G-000", "G-002", "G-003"],
         )
+        original = context.eligible_plans[0].text
+        manager_revision = self.ready_path.read_text(encoding="utf-8")
+        self.assertEqual(
+            maintenance_planning._frontmatter_without_dependencies(original),
+            maintenance_planning._frontmatter_without_dependencies(manager_revision),
+        )
+        self.assertIn(
+            "docs/plans/[G-001] Ready Feature.md", result.publication_paths,
+        )
+        resumed = self._validate_barrier(context)
+        self.assertEqual(resumed.revisions[0].plan["depends_on"], [
+            "G-000", "G-002", "G-003",
+        ])
 
         self._write_plan(
             "G-001",
             "Ready Feature",
-            depends_on=("G-000", "G-003"),
+            depends_on=("G-000", "G-002", "G-003"),
             purpose="Changed product goal.",
         )
         with self.assertRaisesRegex(
-            loop_manager.PlannerValidationError, "depends_on 이외 본문"
+            loop_manager.PlannerValidationError, "Manager 편집 이외의 READY 계획 변경"
         ):
             self._validate_barrier(context)
 
@@ -474,25 +486,58 @@ class MaintenanceAuthorityTest(MaintenancePlanningCase):
             "G-001", "Ready Feature", depends_on=("G-003",)
         )
         with self.assertRaisesRegex(
-            loop_manager.PlannerValidationError, "기존 dependency의 값과 순서"
+            loop_manager.PlannerValidationError, "Manager 편집 이외의 READY 계획 변경"
         ):
             self._validate_barrier(context)
         self._write_plan(
             "G-001", "Ready Feature", depends_on=("G-003", "G-000")
         )
         with self.assertRaisesRegex(
-            loop_manager.PlannerValidationError, "기존 dependency의 값과 순서"
+            loop_manager.PlannerValidationError, "Manager 편집 이외의 READY 계획 변경"
         ):
             self._validate_barrier(context)
 
-        self._write_plan(
-            "G-001", "Ready Feature", depends_on=("G-000", "G-003")
-        )
+        self.ready_path.write_text(original, encoding="utf-8", newline="\n")
         self._write_plan("G-002", "Extract Boundary", priority="high")
         with self.assertRaisesRegex(
             loop_manager.PlannerValidationError, "상향된.*priority"
         ):
             self._validate_barrier(context)
+
+    def test_manager_barrier_append_preserves_draft_and_user_decision(self):
+        snapshot = self._begin_barrier().eligible_plans[0]
+        source = snapshot.text.replace(
+            "priority: normal\n", "priority: normal\ndraft: true\n",
+        )
+        source += (
+            "\n## Draft Decision\n"
+            "Question: Should this implementation stay deferred?\n"
+            "Facts: The scope is still under review.\n"
+            "Options: Keep the draft or revise the scope.\n"
+            "Impact: Work remains on hold.\n"
+            "\n## User Decision\n"
+            "Decision: defer\n"
+            "Revision: saved-revision\n"
+            "Answer: Keep the current scope pending.\n"
+        )
+        draft_snapshot = replace(snapshot, text=source)
+        revised = maintenance_planning.append_barrier_dependencies(
+            draft_snapshot, ("G-002", "G-003"),
+        )
+        before = loop_manager.published_execplan(snapshot.path, source)
+        after = loop_manager.published_execplan(snapshot.path, revised)
+
+        self.assertTrue(after["draft"])
+        self.assertEqual(after["draft_decision"], before["draft_decision"])
+        self.assertEqual(
+            maintenance_planning.markdown_sections(source).values["User Decision"],
+            maintenance_planning.markdown_sections(revised).values["User Decision"],
+        )
+        self.assertEqual(
+            maintenance_planning._frontmatter_without_dependencies(source),
+            maintenance_planning._frontmatter_without_dependencies(revised),
+        )
+        execplan_drafts.validate_agent_change(after, source)
 
     def test_refactoring_priority_justification_must_be_in_body(self):
         frontmatter_only_reason = plan_text(
@@ -964,6 +1009,8 @@ class MaintenanceAuthorityTest(MaintenancePlanningCase):
         self._write_plan("G-002", "Extract Boundary", depends_on=("G-099",))
         with self.assertRaises(loop_manager.PlannerValidationError):
             self._validate_barrier(context)
+        self.assertEqual(self.ready_path.read_text(encoding="utf-8"),
+                         context.eligible_plans[0].text)
 
     def test_prepared_barrier_restarts_after_remote_wins_push_race(self):
         self._assert_prepared_batch_restarts()
