@@ -1127,6 +1127,7 @@ class SinglePassMaintenanceCycleTest(MaintenanceCycleCase):
         self.assertIsNone(repository.get("/one").last_cycle_merged_count)
 
     def setUp(self):
+        super().setUp()
         self.connection = self._connection()
         self.addCleanup(self.connection.close)
         self.repository = maintenance_state.MaintenanceRepository(self.connection)
@@ -1302,6 +1303,8 @@ class SinglePassMaintenanceCycleTest(MaintenanceCycleCase):
         self.assertNotEqual(next_cycle.cycle_id, cycle.cycle_id)
 
     def test_prerequisite_scope_survives_artifact_publication_and_waits_for_merge(self):
+        from loop_manager_internal.agents import common_guidance
+        from tests.support.fixed_samples import PROJECT_FILES
         from loop_manager_internal.maintenance.maintenance_publication import (
             _apply_maintenance_planning_batch, ApplyMaintenancePlanningBatchEffects,
             _maintenance_publication_already_applied, MaintenancePublicationAlreadyAppliedEffects,
@@ -1315,7 +1318,14 @@ class SinglePassMaintenanceCycleTest(MaintenanceCycleCase):
         effects = ApplyMaintenancePlanningBatchEffects(**{name: mock.Mock() for name in ApplyMaintenancePlanningBatchEffects.__dataclass_fields__})
         effects._maintenance_publication_already_applied.return_value = False
         effects.plan_declarations.return_value = {}
-        published = _apply_maintenance_planning_batch(effects, self.connection, "/one", Path("/one"), "main", result, self.latest)
+        read = common_guidance._read
+        def read_sample(path):
+            self.assertTrue(path.is_relative_to(PROJECT_FILES), path)
+            return read(path)
+        with mock.patch.object(common_guidance, '_read', side_effect=read_sample) as reads:
+            published = _apply_maintenance_planning_batch(effects, self.connection, "/one", Path("/one"), "main", result, self.latest)
+        self.assertEqual({call.args[0] for call in reads.call_args_list},
+                         {PROJECT_FILES / path for path in common_guidance.GUIDANCE_PATHS})
         self.assertEqual(published.phase, maintenance_state.MaintenancePhase.PREREQUISITE_WAIT)
         self.assertEqual(published.prerequisite_plan_ids, ("G-001",))
         self.assertIsNone(published.last_cycle_merged_count)
