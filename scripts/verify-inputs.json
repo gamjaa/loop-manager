@@ -9,6 +9,11 @@
     "scripts/copy-project-files.sh",
     "scripts/copy-project-files.ps1",
     "requirements.txt",
+    "config/config.ini.example",
+    "AGENTS.md",
+    "docs/PLANS.md",
+    "docs/AGENTS.*.md",
+    ".agents/skills/specification-docs/SKILL.md",
     "run.sh",
     "run.ps1"
   ]

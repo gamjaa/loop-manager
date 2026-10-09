@@ -57,7 +57,9 @@ class OwnershipHandler:
             # 게시 checkpoint 이력이 없는 기존 PR은 별도 PR 게시 gate가 소유권 원본이다.
             if checkpoint['publication_history'] == '[]' and (
                     not row['publication_remote_oid']
-                    or (row['pr_url'] and not checkpoint['published_oid'])):
+                    or (row['pr_url'] and not checkpoint['published_oid'])
+                    or (not checkpoint['published_oid'] and not checkpoint['accepted_remote_oid']
+                        and checkpoint['expected_remote_oid'] is None and not checkpoint['remote_observed'])):
                 return True
             saved = (current.snapshot or {}) if current else {}
             resume = saved.get('published_review_resume')

@@ -59,3 +59,5 @@ priority: high
 - 게시 OID 삭제·HEAD 일치만의 승인·운영 영수증 재작성은 하지 않는다. 기존 `published_review_resume`의 소비·보존 경계를 재사용해 일반 무 rebase 게시 재개까지 적용한다. 새 차단은 이전 표식을 버린 뒤 현재 소유권을 다시 검사하며 rebase 완료·Agent 격리 성공을 합성하지 않는다.
 - risk high: 잘못된 소유권 수용은 실제 Agent 위반이나 다른 원격 ref의 변경을 숨길 수 있다. 역사 증거의 부족·손상, 원격·PR 변화와 독립 차단은 거부/보존하고 원인 해제 transaction에서 다시 확인한다.
 - 초기 관련 unit 110개가 WSL에서 통과했다. 추가 경쟁·관측 오류 회귀를 포함한 최종 검증 결과는 아래에 별도로 기록한다.
+- 첫 전체 verify는 정상 rebase 이후 최초 게시와 역사 영수증 형식의 기존 회귀를 발견했다. checkpoint가 한 번도 게시되지 않은 상태의 기존 PR/최초 게시 소유권 원본은 원래 게시 gate에 맡기며, 기록 OID는 있지만 역사 checkpoint 증명이 부족한 재개는 계속 거부한다. 같은 요청 refresh에서 추가된 원본 scoped 영수증과 기존 flat 감사가 모두 보존되는 assertion으로 보완했다.
+- 첫 전체 verify에서 `origin/main`의 `scripts/verify-inputs.json`이 이미 존재하는 `test_repository_manifest_covers_actual_fixture_documents_and_skills`의 설정·AGENTS·PLANS·역할 지침·Specification Skill 입력을 누락한 사실도 확인했다. 기존 계약을 만족하는 입력 목록 다섯 개만 추가하며 테스트 skip·수집 범위 축소로 우회하지 않는다.
