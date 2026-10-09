@@ -198,6 +198,7 @@ def _scope_reconciliation_effects_resume_plan_blocks(effects: ScopeReconciliatio
 class ManagedRebaseRuntimeEffectsEffects:
     """Named effects for _managed_rebase_runtime_effects; no entry-point/module access."""
     _owned_rebase_metadata: Callable[..., object]
+    _normalize_legacy_ignored_snapshot: Callable[..., object]
     _path_signature: Callable[..., object]
     _published_plan_allows_common_plans: Callable[..., object]
     _revision_execplan_input_fingerprint: Callable[..., object]
@@ -217,6 +218,7 @@ class ManagedRebaseRuntimeEffectsEffects:
 def _managed_rebase_runtime_effects(effects: ManagedRebaseRuntimeEffectsEffects, ) -> managed_rebase_runtime.RebaseRuntimeEffects:
     return managed_rebase_runtime.RebaseRuntimeEffects(
         _owned_rebase_metadata=effects._owned_rebase_metadata,
+        _normalize_legacy_ignored_snapshot=effects._normalize_legacy_ignored_snapshot,
         _path_signature=effects._path_signature,
         _published_plan_allows_common_plans=effects._published_plan_allows_common_plans,
         _revision_execplan_input_fingerprint=effects._revision_execplan_input_fingerprint,

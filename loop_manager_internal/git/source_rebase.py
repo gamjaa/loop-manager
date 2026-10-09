@@ -16,6 +16,16 @@ from loop_manager_internal.runtime.contracts import BaseWorktreeSyncResult
 from loop_manager_internal.runtime.runtime_identity import _canonical_path
 
 
+def _view(effects, repo, start, saved, current):
+    from .source_sync import comparison_view
+    return comparison_view(effects, repo, start, saved, current)
+
+
+def _matches(effects, repo, start, saved, current):
+    from .source_sync import state_matches
+    return state_matches(effects, repo, start, saved, current)
+
+
 def _observe(effects, repo: Path, base: str) -> dict:
     state = effects._source_transition_state(repo)
     paths = set(effects._nul_git_paths(repo, "ls-files", "-z"))
@@ -36,12 +46,14 @@ def _observe(effects, repo: Path, base: str) -> dict:
 
 def _completed(effects, repo: Path, intent: dict, current: dict) -> bool:
     before, expected = intent["before"], intent["expected"]
+    before_view = _view(effects, repo, before, before, current)
+    current_view = _view(effects, repo, before, current, current)
     return (
         current["branch"] == expected["base"] and not current["operations"]
         and current["head"] == current["ref"]
-        and current["remote"] == expected["remote"]
         and current["origin"] == before["origin"]
-        and current["changes"] == before["changes"]
+        and current_view["changes"] == before_view["changes"]
+        and current_view.get("config") == before_view.get("config")
         and not effects._base_worktree_index_error(effects._base_worktree_snapshot(repo))
         and journal.rebase_completion_matches(
             effects.git, repo, branch=expected["base"], head=current["head"],
@@ -148,6 +160,8 @@ def _git_conflict_files_match(effects, repo: Path, before: dict, current: dict) 
 
 def _owned_conflict(effects, repo: Path, intent: dict, current: dict) -> bool:
     before, expected = intent["before"], intent["expected"]
+    before_view = _view(effects, repo, before, before, current)
+    current_view = _view(effects, repo, before, current, current)
     names = {entry[0] for entry in current["operations"]}
     if (
         "rebase-merge" not in names or names - {"rebase-merge", "REBASE_HEAD", "AUTO_MERGE", "MERGE_MSG"}
@@ -168,11 +182,19 @@ def _owned_conflict(effects, repo: Path, intent: dict, current: dict) -> bool:
     if (directory / "autostash").exists():
         return False
     affected = set(expected["affected"])
+    from .source_sync import _overlaps
+    ignored = [("ignored", path, "") for path in effects._nul_git_paths(
+        repo, "ls-files", "--others", "--ignored", "--exclude-standard", "-z",
+    )]
+    if _overlaps(effects, ignored, affected):
+        return False
     return all(
         old.get(path) == new.get(path) or path in affected
-        for old, new in ((before["files"], current["files"]), (before["index"], current["index"]))
+        for old, new in ((before_view["files"], current_view["files"]), (before["index"], current["index"]))
         for path in old.keys() | new.keys()
-    ) and _git_conflict_files_match(effects, repo, before, current) and not _lock_state(effects, repo, expected["base"])
+    ) and before_view.get("config") == current_view.get("config") and _git_conflict_files_match(
+        effects, repo, before_view, current_view,
+    ) and not _lock_state(effects, repo, expected["base"])
 
 
 def _restore_failure(effects, repo: Path, slot: Path, intent: dict, current: dict) -> dict:
@@ -180,18 +202,22 @@ def _restore_failure(effects, repo: Path, slot: Path, intent: dict, current: dic
     if not receipt.is_file():
         raise journal.MutationEvidenceError("source rebase 중단: invocation 증거가 없어 현재 작업을 보존합니다.")
     recorded = journal._read(receipt)
-    if recorded.get("id") != intent["id"] or recorded.get("observed") != current or not recorded.get("returncode"):
+    if (recorded.get("id") != intent["id"] or not recorded.get("returncode")
+            or not _matches(effects, repo, intent["before"], recorded.get("observed"), current)):
         raise journal.MutationEvidenceError("source rebase 실패 뒤 상태가 변경되어 현재 작업을 보존합니다.")
-    if current == intent["before"]:
+    if _matches(effects, repo, intent["before"], intent["before"], current):
         return current
-    if not _owned_conflict(effects, repo, intent, current) or _observe(effects, repo, intent["expected"]["base"]) != current:
+    if (not _owned_conflict(effects, repo, intent, current)
+            or not _matches(effects, repo, intent["before"], current, _observe(effects, repo, intent["expected"]["base"]))):
         raise journal.MutationEvidenceError("source rebase abort 소유권을 증명할 수 없어 현재 작업을 보존합니다.")
     environment = {**os.environ, "GIT_REFLOG_ACTION": f"loop-manager-rebase:{intent['id']}"}
     effects.git(repo, "rebase", "--abort", env=environment)
     restored = _observe(effects, repo, intent["expected"]["base"])
     # Abort changes HEAD's reflog, so compare the actual ref, index and every
     # file against the frozen start; retain the post-abort reflog in the result.
-    if any(restored[key] != intent["before"][key] for key in restored if key != "head_reflog"):
+    restored_view = _view(effects, repo, intent["before"], restored, restored)
+    before_view = _view(effects, repo, intent["before"], intent["before"], restored)
+    if any(restored_view[key] != before_view[key] for key in restored_view if key != "head_reflog"):
         raise journal.MutationEvidenceError("source rebase abort 결과 불일치; 복구 근거를 보존합니다.")
     return restored
 
@@ -212,10 +238,14 @@ def recover(effects, repo: Path, state_dir: Path, base: str) -> BaseWorktreeSync
     result_path = slot / f"{intent['id']}.result.json"
     if result_path.exists():
         result = journal._read(result_path)
+        sealed_current = ({**current, "remote": result["observed"].get("remote")}
+                          if result.get("status") == "complete" else current)
         if (result.get("id") != intent["id"] or result.get("status") not in {"complete", "aborted", "unapplied"}
-                or result.get("candidates") != {} or result["observed"] != current):
+                or result.get("candidates") != {}
+                or not _matches(effects, repo, intent["before"], result["observed"], sealed_current)
+                or (result.get("status") == "complete" and not _completed(effects, repo, intent, current))):
             raise journal.MutationEvidenceError("source rebase 확정 뒤 상태 변경; 기존 근거를 보존합니다.")
-        journal._finish(slot, active, intent, current, {}, result["status"])
+        journal._finish(slot, active, intent, result["observed"], {}, result["status"])
         if result["status"] == "unapplied":
             return None
         return BaseWorktreeSyncResult("updated" if result["status"] == "complete" else "failed", "source rebase 확정 복구", remote)
@@ -223,7 +253,9 @@ def recover(effects, repo: Path, state_dir: Path, base: str) -> BaseWorktreeSync
         journal._finish(slot, active, intent, current, {}, "complete")
         return BaseWorktreeSyncResult("updated", "로컬 commit 보존 rebase 확정 복구", remote)
     before = intent["before"]
-    if all(current[key] == before[key] for key in current if key not in {"head_reflog", "remote"}):
+    current_view = _view(effects, repo, before, current, current)
+    before_view = _view(effects, repo, before, before, current)
+    if all(current_view[key] == before_view[key] for key in current_view if key not in {"head_reflog", "remote"}):
         if current["head_reflog"] == before["head_reflog"] or current["head_reflog"].startswith(
             f"{before['head']}\0loop-manager-rebase:{intent['id']} (abort): "
         ):
@@ -269,18 +301,18 @@ def synchronize(effects, repo: Path, state_dir: Path | None, base: str,
             saved = journal._read(slot / f"{result['id']}.intent.json")
             receipt = slot / f"{result['id']}.invocation.json"
             invocation = journal._read(receipt) if receipt.exists() else {}
-            if (result["status"] == "aborted" and result["observed"] == current
+            if (result["status"] == "aborted" and _matches(effects, repo, saved["before"], result["observed"], current)
                     and saved["expected"]["remote"] == remote and invocation.get("returncode")
                     and invocation.get("locks") == _lock_state(effects, repo, base)):
                 return BaseWorktreeSyncResult("skipped", "diverged: 동일 입력의 실패 rebase 반복 보류", remote)
-    if effects._base_worktree_snapshot(repo) != before:
+    from .source_sync import _snapshot_state, _overlaps
+    rechecked = effects._base_worktree_snapshot(repo)
+    if (not _matches(effects, repo, _snapshot_state(before), _snapshot_state(before), _snapshot_state(rechecked))
+            or _overlaps(effects, rechecked.changes, affected)):
         return BaseWorktreeSyncResult("skipped", "diverged: eligibility 뒤 상태가 변경됨", remote)
     start = _observe(effects, repo, base)
-    source_state = {"branch": before.branch, "head": before.head,
-                    "index": {path: list(entries) for path, entries in before.index},
-                    "changes": [list(entry) for entry in before.changes],
-                    "operations": [list(entry) for entry in before.operations]}
-    if (any(start[key] != value for key, value in source_state.items())
+    source_state = _snapshot_state(before)
+    if (not _matches(effects, repo, source_state, source_state, {key: start[key] for key in source_state})
             or start["ref"] != before.head or start["remote"] != remote):
         return BaseWorktreeSyncResult("skipped", "diverged: rebase 직전 상태 변경", remote)
     root = state_dir / "manager-git-journal"
@@ -294,7 +326,9 @@ def synchronize(effects, repo: Path, state_dir: Path | None, base: str,
               "expected": {"base": base, "remote": remote, "affected": affected}}
     journal._write_new(slot / f"{identity}.intent.json", intent)
     journal._write_new(slot / "active.json", intent)
-    if _observe(effects, repo, base) != start:
+    rechecked = _observe(effects, repo, base)
+    if (not _matches(effects, repo, start, start, rechecked)
+            or _overlaps(effects, rechecked["changes"], affected)):
         raise journal.MutationEvidenceError("source rebase intent 뒤 동시 변경; 현재 상태 보존")
     locks_before = _lock_state(effects, repo, base)
     journal._write_new(slot / f"{identity}.started.json", {

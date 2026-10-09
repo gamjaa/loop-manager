@@ -471,8 +471,16 @@ def verified_rebase_result(
     }
 
 
+def _matching_state(intent, saved, current, state_matches=None):
+    if state_matches is None:
+        return saved == current
+    if intent.get("kind") != "source_fast_forward":
+        raise MutationEvidenceError("ignored 비교는 source fast-forward에만 적용할 수 있습니다.")
+    return state_matches(intent, saved, current)
+
+
 def verified_transition(
-    intent: Mapping[str, Any], observed: Mapping[str, Any], marker: bool,
+    intent: Mapping[str, Any], observed: Mapping[str, Any], marker: bool, *, state_matches=None,
 ) -> dict[str, dict[str, Any]]:
     """Return only matching ref/worktree baseline candidates.
 
@@ -500,7 +508,9 @@ def verified_transition(
         )
     elif kind in {"source_fast_forward", "manual_fast_forward"}:
         valid = (
-            set(before) == set(expected) == {"head", "branch", "index", "changes", "operations"}
+            set(before) == set(expected)
+            and set(before) in ({"head", "branch", "index", "changes", "operations"},
+                                {"head", "branch", "index", "changes", "operations", "config"})
             and isinstance(before["head"], str) and oid.fullmatch(before["head"])
             and isinstance(expected["head"], str) and oid.fullmatch(expected["head"])
             and isinstance(before["branch"], str) and before["branch"] == expected["branch"]
@@ -508,6 +518,8 @@ def verified_transition(
             and isinstance(expected["index"], dict)
             and before["changes"] == expected["changes"]
             and before["operations"] == expected["operations"] == []
+            and before.get("config") == expected.get("config")
+            and ("config" not in before or isinstance(before["config"], dict))
         )
     elif kind in {"runtime_create", "runtime_remove"}:
         valid = (
@@ -569,7 +581,7 @@ def verified_transition(
         valid = False
     if not valid:
         raise MutationEvidenceError("Manager Git intent의 허용 전이가 유효하지 않습니다.")
-    if observed != expected or (before != expected and not marker):
+    if not _matching_state(intent, expected, observed, state_matches) or (before != expected and not marker):
         raise MutationEvidenceError("Manager Git 결과 또는 작업 소유 표식이 일치하지 않습니다.")
     if kind in {"bootstrap_fetch", "project_fetch", "manual_branch_push"}:
         return {"refs": {target: expected["oid"]}, "worktrees": {}}
@@ -736,6 +748,7 @@ def execute(
     apply: Callable[[str], None],
     marker: Callable[[Mapping[str, Any]], bool],
     restore_intermediate: Callable[[Mapping[str, Any], Mapping[str, Any]], Mapping[str, Any]] | None = None,
+    state_matches: Callable[[Mapping, Mapping, Mapping], bool] | None = None,
 ) -> str:
     """Execute or recover one transition. Return applied, recovered, or equal.
 
@@ -753,6 +766,7 @@ def execute(
     _sync_directory(root)
     active = slot / "active.json"
     current = observe()
+    matches = lambda intent, saved, observed: _matching_state(intent, saved, observed, state_matches)
     if active.exists():
         previous = _read(active)
         if (
@@ -763,32 +777,32 @@ def execute(
         ):
             raise MutationEvidenceError("Manager Git 활성 intent가 불완전합니다.")
         restored = None
-        if (current != previous["before"] and current != previous["expected"]
+        if (not matches(previous, previous["before"], current) and not matches(previous, previous["expected"], current)
                 and restore_intermediate is not None):
             restored = restore_intermediate(previous, current)
             current = observe()
-            if current != restored:
+            if not matches(previous, restored, current):
                 raise MutationEvidenceError("Manager Git 중간 상태 복원 뒤 자원이 다시 변경됐습니다.")
-        if restored is not None and current != previous["before"]:
-            _finish(slot, active, previous, current, {}, "aborted")
-        elif current == previous["expected"]:
-            candidates = verified_transition(previous, current, marker(previous))
-            _finish(slot, active, previous, current, candidates, "complete")
-            if previous["owner"] == owner and previous["expected"] == expected:
+        if restored is not None and not matches(previous, previous["before"], current):
+            _finish(slot, active, previous, current, {}, "aborted", state_matches=state_matches)
+        elif matches(previous, previous["expected"], current):
+            candidates = verified_transition(previous, current, marker(previous), state_matches=state_matches)
+            _finish(slot, active, previous, current, candidates, "complete", state_matches=state_matches)
+            if previous["owner"] == owner and matches(previous, previous["expected"], expected):
                 return "recovered"
-        elif current == previous["before"]:
-            if previous["owner"] != owner or previous["expected"] != expected:
-                _finish(slot, active, previous, current, {}, "aborted")
+        elif matches(previous, previous["before"], current):
+            if previous["owner"] != owner or not matches(previous, previous["expected"], expected):
+                _finish(slot, active, previous, current, {}, "aborted", state_matches=state_matches)
             else:
                 apply(str(previous["id"]))
                 after = observe()
-                candidates = verified_transition(previous, after, marker(previous))
-                _finish(slot, active, previous, after, candidates, "complete")
+                candidates = verified_transition(previous, after, marker(previous), state_matches=state_matches)
+                _finish(slot, active, previous, after, candidates, "complete", state_matches=state_matches)
                 return "applied"
         else:
             raise MutationEvidenceError("Manager Git intent 뒤 영향권 상태가 예상 밖으로 변경됐습니다.")
         current = observe()
-    if current != before:
+    if not matches({"kind": kind, "before": before}, before, current):
         raise MutationEvidenceError("Manager Git 작업 직전 상태가 기대값과 다릅니다.")
     if before == expected:
         # Equal is a durable observation, with no Git write to attribute.
@@ -806,8 +820,8 @@ def execute(
     if before != expected:
         apply(identity)
     after = observe()
-    candidates = verified_transition(intent, after, marker(intent))
-    _finish(slot, active, intent, after, candidates, outcome)
+    candidates = verified_transition(intent, after, marker(intent), state_matches=state_matches)
+    _finish(slot, active, intent, after, candidates, outcome, state_matches=state_matches)
     return "equal" if before == expected else "applied"
 
 
@@ -817,6 +831,7 @@ def recover_active(
     observe: Callable[[], dict[str, Any]],
     marker: Callable[[Mapping[str, Any]], bool],
     restore_intermediate: Callable[[Mapping[str, Any], Mapping[str, Any]], Mapping[str, Any]] | None = None,
+    state_matches: Callable[[Mapping, Mapping, Mapping], bool] | None = None,
 ) -> bool:
     """Finalize an interrupted write before a caller's early equal return."""
     slot = _slot(state_dir, repo, kind, target)
@@ -829,20 +844,21 @@ def recover_active(
     ) or _read(slot / f"{intent.get('id')}.intent.json") != intent:
         raise MutationEvidenceError("Manager Git 활성 intent가 불완전합니다.")
     current = observe()
+    matches = lambda saved, observed: _matching_state(intent, saved, observed, state_matches)
     restored = None
-    if (current != intent["before"] and current != intent["expected"]
+    if (not matches(intent["before"], current) and not matches(intent["expected"], current)
             and restore_intermediate is not None):
         restored = restore_intermediate(intent, current)
         current = observe()
-        if current != restored:
+        if not matches(restored, current):
             raise MutationEvidenceError("Manager Git 중간 상태 복원 뒤 자원이 다시 변경됐습니다.")
-    if restored is not None and current != intent["before"]:
-        _finish(slot, active, intent, current, {}, "aborted")
+    if restored is not None and not matches(intent["before"], current):
+        _finish(slot, active, intent, current, {}, "aborted", state_matches=state_matches)
         return False
-    if current == intent["before"]:
+    if matches(intent["before"], current):
         return False
-    candidates = verified_transition(intent, current, marker(intent))
-    _finish(slot, active, intent, current, candidates, "complete")
+    candidates = verified_transition(intent, current, marker(intent), state_matches=state_matches)
+    _finish(slot, active, intent, current, candidates, "complete", state_matches=state_matches)
     return True
 
 
@@ -850,6 +866,7 @@ def _finish(
     slot: Path, active: Path, intent: Mapping[str, Any],
     observed: Mapping[str, Any], candidates: Mapping[str, Any], status: str,
     replay_proof: list[dict[str, str]] | None = None,
+    *, state_matches: Callable[[Mapping, Mapping, Mapping], bool] | None = None,
 ) -> None:
     result_path = slot / f"{intent['id']}.result.json"
     result = {"id": intent["id"], "status": status,
@@ -857,7 +874,12 @@ def _finish(
     if replay_proof is not None:
         result['replay_proof'] = replay_proof
     if result_path.exists():
-        if _read(result_path) != result:
+        saved = _read(result_path)
+        if (saved != result and not (
+                state_matches is not None
+                and {key: value for key, value in saved.items() if key != "observed"}
+                == {key: value for key, value in result.items() if key != "observed"}
+                and _matching_state(intent, saved["observed"], observed, state_matches))):
             raise MutationEvidenceError("Manager Git 저장 결과가 현재 증거와 다릅니다.")
     else:
         _write_new(result_path, result)
@@ -933,8 +955,9 @@ def verified_candidates(
     slots = ((root.iterdir() if root.exists() else ()) if fetch_refs is None else (
         _slot(state_dir, repo, kind, ref)
         for kind in ('bootstrap_fetch', 'project_fetch') for ref in fetch_refs))
+    source_slots = {_slot(state_dir, repo, kind, repo) for kind in ('source_fast_forward', 'source_rebase')}
     for slot in slots:
-        if not slot.is_dir():
+        if slot in source_slots or not slot.is_dir():
             continue
         active = slot / "active.json"
         if active.exists():
@@ -1270,8 +1293,9 @@ def verified_managed_transitions(
     if (kind is None) != (target is None):
         raise MutationEvidenceError('Manager Git resource filter requires kind and target')
     slots = root.iterdir() if kind is None else (_slot(state_dir, repo, kind, target),)
+    source_slots = {_slot(state_dir, repo, source_kind, repo) for source_kind in ('source_fast_forward', 'source_rebase')}
     for slot in slots:
-        if not slot.is_dir():
+        if slot in source_slots or not slot.is_dir():
             continue
         active = slot / "active.json"
         active_id = _read(active).get("id") if active.exists() else None

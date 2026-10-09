@@ -5,6 +5,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from collections.abc import Mapping
 from loop_manager_internal.agents.scope_observation import _git_operation_path_signature
+from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.git import manager_git_journal, source_rebase
 from loop_manager_internal.runtime.contracts import BaseWorktreeSnapshot
 from loop_manager_internal.runtime.contracts import BaseWorktreeSyncResult
@@ -19,6 +20,7 @@ class BaseWorktreeSnapshotEffects:
     """Only the effects consumed by this boundary; no Manager module access."""
     _base_local_path_signature: Callable[..., object]
     _base_worktree_index_error: Callable[..., object]
+    _config_entries: Callable[..., object]
     _git_operation_entries: Callable[..., object]
     _ignored_worktree_paths: Callable[..., object]
     _index_entries: Callable[..., object]
@@ -53,6 +55,7 @@ class SynchronizeBaseWorktreeEffects:
     _base_worktree_index_error: Callable[..., object]
     _base_worktree_snapshot: Callable[..., object]
     _git_operation_entries: Callable[..., object]
+    _normalize_legacy_ignored_snapshot: Callable[..., object]
     _nul_git_paths: Callable[..., object]
     _source_expected_index: Callable[..., object]
     _source_transition_marker: Callable[..., object]
@@ -92,6 +95,7 @@ def _base_worktree_snapshot(effects: BaseWorktreeSnapshotEffects,
         index=tuple(sorted(index.items())),
         changes=(),
         operations=operations,
+        config=tuple(sorted(effects._config_entries(repo).items())),
     )
     if operations or effects._base_worktree_index_error(preliminary):
         return preliminary
@@ -117,6 +121,7 @@ def _base_worktree_snapshot(effects: BaseWorktreeSnapshotEffects,
         index=preliminary.index,
         changes=tuple(sorted(changes)),
         operations=operations,
+        config=preliminary.config,
     )
 
 
@@ -148,13 +153,89 @@ def _base_paths_overlap(effects: BasePathsOverlapEffects, left: str, right: str)
 
 
 def _source_transition_state(effects: SourceTransitionStateEffects, repo: Path) -> dict[str, object]:
-    snapshot = effects._base_worktree_snapshot(repo)
+    return _snapshot_state(effects._base_worktree_snapshot(repo))
+
+
+def _snapshot_state(snapshot: BaseWorktreeSnapshot) -> dict[str, object]:
     return {
         "branch": snapshot.branch, "head": snapshot.head,
         "index": {path: list(entries) for path, entries in snapshot.index},
         "changes": [list(entry) for entry in snapshot.changes],
         "operations": [list(entry) for entry in snapshot.operations],
+        "config": {key: list(value) for key, value in snapshot.config},
     }
+
+
+def comparison_view(effects, repo: Path, start: Mapping, saved: Mapping, current: Mapping) -> dict:
+    """원본 관측은 보존하고 시작 규칙으로 증명된 ignored 차이만 제외한다."""
+    for state in (start, saved, current):
+        if (not isinstance(state, Mapping) or not isinstance(state.get("head"), str)
+                or not isinstance(state.get("branch"), (str, type(None)))
+                or not isinstance(state.get("operations"), list)
+                or not isinstance(state.get("index"), dict)
+                or any(not isinstance(value, (list, tuple)) or not all(isinstance(item, str) for item in value)
+                       for value in state["index"].values())
+                or not isinstance(state.get("changes"), list)
+                or any(not isinstance(entry, (list, tuple)) or len(entry) != 3
+                       or not all(isinstance(value, str) for value in entry) for entry in state["changes"])
+                or not isinstance(state.get("config", {}), dict)
+                or not isinstance(state.get("files", {}), dict)
+                or any(not isinstance(value, str) for value in state.get("files", {}).values())
+                or any(not isinstance(value, (list, tuple)) or not all(isinstance(item, str) for item in value)
+                       for value in state.get("config", {}).values())):
+            raise manager_git_journal.MutationEvidenceError("source Git 비교 근거의 형식이 유효하지 않습니다.")
+    view = dict(saved)
+
+    def snapshot(state, *, ignored=None):
+        kinds, signatures = {}, {}
+        for kind, path, signature in state["changes"]:
+            if kind != "ignored":
+                kinds.setdefault(path, set()).add(kind)
+                signatures[path] = signature
+        dirty = {path: (tuple(sorted(value)), signatures[path]) for path, value in kinds.items()}
+        dirty.update({path: (("untracked",), signature)
+                      for path, signature in (ignored or {}).items() if path not in dirty})
+        return GitSnapshot(
+            state["head"], state["branch"],
+            {path: tuple(entries) for path, entries in state["index"].items()},
+            dirty, {}, {}, {key: tuple(value) for key, value in state.get("config", {}).items()}, {},
+        )
+
+    indexed = set(start["index"]) | set(saved["index"]) | set(current["index"])
+    ignored = {path: signature for kind, path, signature in saved["changes"]
+               if kind == "ignored" and path not in indexed}
+    ignored.update({path: signature for path, signature in saved.get("files", {}).items()
+                    if path not in indexed})
+    if "config" not in start:
+        known = {path for kind, path, _signature in start["changes"] if kind == "ignored"}
+        ignored = {path: signature for path, signature in ignored.items() if path in known}
+    if ignored:
+        observed = snapshot(current)
+        candidate = snapshot(saved, ignored=ignored)
+        normalized = effects._normalize_legacy_ignored_snapshot(
+            repo, candidate, observed, start=snapshot(start),
+        )
+        excluded = ignored.keys() - normalized.dirty.keys()
+        view["changes"] = [entry for entry in saved["changes"]
+                           if entry[0] != "ignored" or entry[1] not in excluded]
+        if "files" in view:
+            view["files"] = {path: signature for path, signature in saved["files"].items()
+                             if path not in excluded}
+    # 구형 journal에는 config 관측이 없다. 외부 ignore 증거를 새로 추정하지 않는다.
+    if "config" not in start:
+        view.pop("config", None)
+    return view
+
+
+def state_matches(effects, repo: Path, start: Mapping, saved: Mapping, current: Mapping) -> bool:
+    return comparison_view(effects, repo, start, saved, current) == comparison_view(
+        effects, repo, start, current, current,
+    )
+
+
+def _overlaps(effects, changes, changed_paths):
+    return sorted({(kind, path) for kind, path, _signature in changes
+                   if any(effects._base_paths_overlap(path, changed) for changed in changed_paths)})
 
 
 def _source_transition_marker(effects: SourceTransitionMarkerEffects, repo: Path, base: str, intent: Mapping[str, object]) -> bool:
@@ -216,13 +297,16 @@ def synchronize_base_worktree(effects: SynchronizeBaseWorktreeEffects,
     try:
         if state_dir is not None:
             recovered = source_rebase.recover(effects, repo, state_dir, base)
-            if recovered is not None:
+            if recovered is not None and (recovered.status != "updated" or effects.git(
+                    repo, "rev-parse", f"refs/remotes/origin/{base}").stdout.strip() == recovered.remote_sha):
                 return recovered
             manager_git_journal.recover_active(
                 state_dir, repo=str(_canonical_path(repo)),
                 kind="source_fast_forward", target=str(_canonical_path(repo)),
                 observe=lambda: effects._source_transition_state(repo),
                 marker=lambda intent: effects._source_transition_marker(repo, base, intent),
+                state_matches=lambda intent, saved, current: state_matches(
+                    effects, repo, intent["before"], saved, current),
             )
         observed_remote = effects.git(
             repo,
@@ -327,11 +411,7 @@ def synchronize_base_worktree(effects: SynchronizeBaseWorktreeEffects,
                 selected_remote,
             )
         )
-        overlaps = sorted({
-            (kind, path)
-            for kind, path, _ in before.changes
-            if any(effects._base_paths_overlap(path, changed) for changed in changed_paths)
-        })
+        overlaps = _overlaps(effects, before.changes, changed_paths)
         if overlaps:
             return BaseWorktreeSyncResult(
                 "skipped",
@@ -341,11 +421,16 @@ def synchronize_base_worktree(effects: SynchronizeBaseWorktreeEffects,
             )
 
         rechecked = effects._base_worktree_snapshot(repo)
-        if rechecked != before:
+        if not state_matches(effects, repo, _snapshot_state(before), _snapshot_state(before), _snapshot_state(rechecked)):
             return BaseWorktreeSyncResult(
                 "skipped",
                 "eligibility 확인 뒤 기본 worktree 상태가 변경됨",
                 selected_remote,
+            )
+        overlaps = _overlaps(effects, rechecked.changes, changed_paths)
+        if overlaps:
+            return BaseWorktreeSyncResult(
+                "skipped", "Git 쓰기 직전 경로 충돌: " + ", ".join(path for _kind, path in overlaps[:8]), selected_remote,
             )
         current_remote = effects.git(
             repo, "rev-parse", "--verify", f"refs/remotes/origin/{base}^{{commit}}"
@@ -356,7 +441,7 @@ def synchronize_base_worktree(effects: SynchronizeBaseWorktreeEffects,
             )
         if state_dir is None:
             updated = effects.git(
-                repo, "merge", "--ff-only", "--no-autostash", selected_remote,
+                repo, "merge", "--ff-only", "--no-autostash", "--no-overwrite-ignore", selected_remote,
                 check=False,
             )
             if updated.returncode:
@@ -371,12 +456,7 @@ def synchronize_base_worktree(effects: SynchronizeBaseWorktreeEffects,
                 raise manager_git_journal.MutationEvidenceError(
                     "source fast-forward 직전 HEAD 또는 branch가 변경됐습니다."
                 )
-            if before_state != {
-                "branch": before.branch, "head": before.head,
-                "index": {path: list(entries) for path, entries in before.index},
-                "changes": [list(entry) for entry in before.changes],
-                "operations": [list(entry) for entry in before.operations],
-            }:
+            if not state_matches(effects, repo, _snapshot_state(before), _snapshot_state(before), before_state):
                 raise manager_git_journal.MutationEvidenceError(
                     "source fast-forward 직전 로컬 상태가 변경됐습니다."
                 )
@@ -390,9 +470,10 @@ def synchronize_base_worktree(effects: SynchronizeBaseWorktreeEffects,
                 state_dir, str(_canonical_path(repo)), "source_fast_forward",
                 str(_canonical_path(repo)),
             )
+            matches = lambda intent, saved, current: state_matches(effects, repo, intent["before"], saved, current)
             if (slot / "active.json").exists():
                 prior = manager_git_journal._read(slot / "active.json")
-                if prior["before"] == before_state and prior["expected"] == expected_state:
+                if matches(prior, prior["before"], before_state) and matches(prior, prior["expected"], expected_state):
                     receipt_path = slot / f"{prior['id']}.invocation.json"
                     started_path = slot / f"{prior['id']}.started.json"
                     if receipt_path.exists() or started_path.exists():
@@ -400,7 +481,7 @@ def synchronize_base_worktree(effects: SynchronizeBaseWorktreeEffects,
                         if receipt.get("id") != prior["id"]:
                             raise manager_git_journal.MutationEvidenceError("source fast-forward invocation identity 불일치")
                         if receipt_path.exists() and (
-                            not receipt.get("returncode") or receipt.get("observed") != before_state
+                            not receipt.get("returncode") or not matches(prior, receipt.get("observed"), before_state)
                         ):
                             raise manager_git_journal.MutationEvidenceError("source fast-forward 결과와 현재 상태 불일치; 기존 근거 보존")
                         same_locks = receipt.get("locks") == _source_git_lock_state(effects, repo, base)
@@ -411,11 +492,15 @@ def synchronize_base_worktree(effects: SynchronizeBaseWorktreeEffects,
                         # Lock disappearance is a relevant new input. Retire
                         # only an unchanged source attempt, retaining its audit.
                         if not same_locks:
-                            manager_git_journal._finish(slot, slot / "active.json", prior, before_state, {}, "aborted")
+                            manager_git_journal._finish(slot, slot / "active.json", prior, before_state, {}, "aborted", state_matches=matches)
                     # A start marker without a result does not prove failure.
                     # execute() rechecks the unchanged source before resuming.
 
             def apply(token: str) -> None:
+                current = effects._source_transition_state(repo)
+                if (not state_matches(effects, repo, before_state, before_state, current)
+                        or _overlaps(effects, current["changes"], changed_paths)):
+                    raise manager_git_journal.MutationEvidenceError("source fast-forward 직전 상태 변경 또는 경로 충돌; 파일 보존")
                 locks_before = _source_git_lock_state(effects, repo, base)
                 start = {"id": token, "locks": locks_before}
                 start_path = slot / f"{token}.started.json"
@@ -427,7 +512,7 @@ def synchronize_base_worktree(effects: SynchronizeBaseWorktreeEffects,
                 environment = {**os.environ,
                                "GIT_REFLOG_ACTION": f"loop-manager-source:{token}"}
                 updated = effects.git(
-                    repo, "merge", "--ff-only", "--no-autostash", selected_remote,
+                    repo, "merge", "--ff-only", "--no-autostash", "--no-overwrite-ignore", selected_remote,
                     check=False, env=environment,
                 )
                 locks_after = _source_git_lock_state(effects, repo, base)
@@ -446,6 +531,7 @@ def synchronize_base_worktree(effects: SynchronizeBaseWorktreeEffects,
                 before=before_state, expected=expected_state,
                 observe=lambda: effects._source_transition_state(repo), apply=apply,
                 marker=lambda intent: effects._source_transition_marker(repo, base, intent),
+                state_matches=matches,
             )
         final_head = effects.git(repo, "rev-parse", "HEAD").stdout.strip()
         if final_head != selected_remote:

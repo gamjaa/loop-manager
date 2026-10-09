@@ -503,6 +503,7 @@ _source_sync_effects_base_worktree_snapshot = _bind_effects(
     git_adapter._source_sync_effects_base_worktree_snapshot, lambda: git_adapter.SourceSyncEffectsBaseWorktreeSnapshotEffects(
         _base_local_path_signature=lambda *args, **kwargs: _base_local_path_signature(*args, **kwargs),
         _base_worktree_index_error=lambda *args, **kwargs: _base_worktree_index_error(*args, **kwargs),
+        _config_entries=lambda *args, **kwargs: _config_entries(*args, **kwargs),
         _git_operation_entries=lambda *args, **kwargs: _git_operation_entries(*args, **kwargs),
         _ignored_worktree_paths=lambda *args, **kwargs: _ignored_worktree_paths(*args, **kwargs),
         _index_entries=lambda *args, **kwargs: _index_entries(*args, **kwargs),
@@ -541,6 +542,7 @@ _source_sync_effects_synchronize_base_worktree = _bind_effects(
         _base_worktree_index_error=lambda *args, **kwargs: _base_worktree_index_error(*args, **kwargs),
         _base_worktree_snapshot=lambda *args, **kwargs: _base_worktree_snapshot(*args, **kwargs),
         _git_operation_entries=lambda *args, **kwargs: _git_operation_entries(*args, **kwargs),
+        _normalize_legacy_ignored_snapshot=lambda *args, **kwargs: _normalize_legacy_ignored_snapshot(*args, **kwargs),
         _nul_git_paths=lambda *args, **kwargs: _nul_git_paths(*args, **kwargs),
         _source_expected_index=lambda *args, **kwargs: _source_expected_index(*args, **kwargs),
         _source_transition_marker=lambda *args, **kwargs: _source_transition_marker(*args, **kwargs),
@@ -701,6 +703,7 @@ _diagnostic_publication_effects = _bind_effects(
 _managed_rebase_runtime_effects = _bind_effects(
     recovery_adapter._managed_rebase_runtime_effects, lambda: recovery_adapter.ManagedRebaseRuntimeEffectsEffects(
         _owned_rebase_metadata=lambda *args, **kwargs: _owned_rebase_metadata(*args, **kwargs),
+        _normalize_legacy_ignored_snapshot=lambda *args, **kwargs: _normalize_legacy_ignored_snapshot(*args, **kwargs),
         _path_signature=lambda *args, **kwargs: _path_signature(*args, **kwargs),
         _published_plan_allows_common_plans=lambda *args, **kwargs: _published_plan_allows_common_plans(*args, **kwargs),
         _revision_execplan_input_fingerprint=lambda *args, **kwargs: _revision_execplan_input_fingerprint(*args, **kwargs),

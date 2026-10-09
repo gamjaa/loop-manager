@@ -496,12 +496,13 @@ def _normalize_legacy_ignored_snapshot(
     start = start or saved
 
     dirty = dict(saved.dirty)
-    for path, (kinds, _signature) in saved.dirty.items():
-        if kinds != ("untracked",) or path in current.dirty:
-            continue
-        if path in start.index or path in saved.index or path in current.index:
-            continue
-        source = _ignore_rule_source(worktree, path, effects=effects)
+    candidates = [path for path, (kinds, _signature) in saved.dirty.items()
+                  if kinds == ("untracked",) and path not in current.dirty
+                  and path not in start.index and path not in saved.index and path not in current.index]
+    sources = _ignore_rule_sources(worktree, candidates, effects=effects)
+    checked_rules = {}
+    for path in candidates:
+        source = sources.get(path)
         if source is None:
             continue
         if not (source in start.index
@@ -524,11 +525,12 @@ def _normalize_legacy_ignored_snapshot(
             continue
         if source in start.dirty or source in saved.dirty or source in current.dirty:
             continue
-        old_rule = effects.git(worktree, "rev-parse", f"{start.head}:{source}", check=False)
-        new_rule = effects.git(worktree, "rev-parse", f"{current.head}:{source}", check=False)
-        if old_rule.returncode or new_rule.returncode or old_rule.stdout != new_rule.stdout:
-            continue
-        dirty.pop(path)
+        if source not in checked_rules:
+            old_rule = effects.git(worktree, "rev-parse", f"{start.head}:{source}", check=False)
+            new_rule = effects.git(worktree, "rev-parse", f"{current.head}:{source}", check=False)
+            checked_rules[source] = not old_rule.returncode and not new_rule.returncode and old_rule.stdout == new_rule.stdout
+        if checked_rules[source]:
+            dirty.pop(path)
     return replace(saved, dirty=dirty) if dirty != saved.dirty else saved
 
 
