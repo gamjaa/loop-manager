@@ -18,10 +18,10 @@ Loop Manager의 Agent 범위 검사와 관리 worktree 소유권·cleanliness �
 
 - tracked 파일과 index의 staged entry 및 non-default index flag
 - non-ignored untracked 파일
-- `HEAD`, branch, refs, 등록 worktree, Git config와 진행 중인 Git operation
+- 실제 사용하는 HEAD·branch·refs·등록 worktree·Git config·진행 중인 Git operation. 정상 외부 fetch와 무관한 자원 변화·legacy 기본 checkout 제외는 R-055를 따른다.
 - 역할별 허용 경로, 선택된 ExecPlan의 범위를 벗어난 게시 가능한 변경
 
-권위 있는 변경을 검사한다는 것은 Planner와 Worker의 정상적인 파일 생성·수정·삭제를 금지한다는 뜻이 아니다. Planner는 새 ExecPlan과 허용된 `docs/FUTURE_IDEAS.md` 변경을, Worker는 선택된 ExecPlan 구현에 필요한 코드·테스트·문서 변경을 기존 역할별 경계 안에서 만들고 commit할 수 있다. Reviewer만 권위 있는 파일 변경을 남길 수 없다.
+권위 있는 변경을 검사한다는 것은 Planner와 Worker의 정상적인 파일 생성·수정·삭제를 금지한다는 뜻이 아니다. Planner는 새 ExecPlan과 허용된 `docs/FUTURE_IDEAS.md` 변경을, Worker는 선택된 ExecPlan 구현에 필요한 코드·테스트·문서 변경을 기존 역할별 경계 안에서 만들 수 있으며 commit·fetch·rebase·push는 Manager가 수행한다. Reviewer만 권위 있는 파일 변경을 남길 수 없다.
 
 Git의 기준 규칙에 따라 ignored로 분류되고 index에 없는 파일의 생성·수정·삭제만으로는 Planner, Worker 또는 Reviewer의 범위 위반, planning error, ExecPlan BLOCKED, 관리 worktree 소유권 실패 또는 PR 상태 복구 실패를 만들지 않아야 한다. Python bytecode, test cache, build cache와 임의의 다른 ignored 파일에 파일명별 예외나 allowlist를 추가하지 않고 같은 ignored-only 규칙을 적용한다.
 
@@ -37,7 +37,7 @@ Git 쓰기 직전에는 현재 ignored 경로와 해당 작업이 쓸 tracked �
 
 planning 결과가 게시됐거나 작업 없음으로 확정된 planning worktree, 그리고 PR Merge 뒤 모든 commit이 게시됐고 권위 있는 미커밋 변경이 없는 ExecPlan 관리 worktree는 정확한 Manager 소유권과 결정적 경로를 다시 검증한 뒤 전체 worktree 수명 종료 과정에서 제거할 수 있다. ignored-only 파일은 이 정상 정리를 막거나 `cleanup_pending`을 만들지 않는다. 이는 활성 작업의 개별 ignored 파일을 정리하는 권한이 아니며, 등록 프로젝트의 기본 worktree, 소유권이 불명확한 경로 또는 권위 있는 변경이 남은 worktree에는 적용하지 않는다.
 
-이전 정책으로 저장된 Agent snapshot 또는 범위 오류도 같은 분류로 재평가한다. 저장된 기준과 현재 상태의 차이가 ignored-only 파일뿐이고 `HEAD`, branch, index, tracked·non-ignored untracked 상태와 공유 Git metadata가 모두 기존 기대값과 일치하면, ignored 경로를 snapshot 기준으로 복사하거나 삭제하지 않고 비권위 차이로 제외해 기존 세션, worktree, 검증 결과와 작업 단계를 멱등하게 재개한다. 과거 Manager Git journal도 시작 ignore 규칙과 실제 전이·작업 소유 증거를 재구성할 수 있을 때만 같은 비교 기준으로 완료·복구한다. 완료 결과를 먼저 안전하게 기록한 뒤 활성 기록을 종료하며, 결과 기록 뒤 활성 기록 종료 전에 다시 중단돼도 기존 감사를 보존해 같은 복구를 이어간다. 권위 있는 변경이 하나라도 함께 있거나 시작 ignore 규칙·전이·소유 증거가 부족하면 snapshot이나 journal을 초기화하지 않고 기존 기록과 거부를 유지한다.
+이전 정책으로 저장된 Agent snapshot 또는 범위 오류도 같은 분류로 재평가한다. 저장된 기준과 현재 상태의 차이가 ignored-only 파일뿐이고 `HEAD`, branch, index, tracked·non-ignored untracked 상태와 R-055에 따라 실제 사용하는 공유 Git metadata의 현재 안전 조건이 충족되면, ignored 경로를 snapshot 기준으로 복사하거나 삭제하지 않고 비권위 차이로 제외해 기존 세션, worktree, 검증 결과와 작업 단계를 멱등하게 재개한다. 과거 Manager Git journal도 시작 ignore 규칙과 실제 전이·작업 소유 증거를 재구성할 수 있을 때만 같은 비교 기준으로 완료·복구한다. 완료 결과를 먼저 안전하게 기록한 뒤 활성 기록을 종료하며, 결과 기록 뒤 활성 기록 종료 전에 다시 중단돼도 기존 감사를 보존해 같은 복구를 이어간다. 권위 있는 변경이 하나라도 함께 있거나 시작 ignore 규칙·전이·소유 증거가 부족하면 snapshot이나 journal을 초기화하지 않고 기존 기록과 거부를 유지한다.
 
 기본 worktree의 오래된 journal을 안전하게 종료한 뒤에는 현재 원격 base에 대한 기존 동기화 판단을 계속한다. source 동기화는 best-effort 경계이며, 복구 성공·실패가 별도 관리 worktree의 원격 runtime 실행이나 계획 게시 소유권 증명을 대신하거나 차단하지 않는다.
 

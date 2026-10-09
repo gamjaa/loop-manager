@@ -6,7 +6,7 @@
 
 현재 실행 상태와 branch·worktree·PR 연결의 원본은 SQLite다. Manager 소유 작업 branch에 사용자가 push한 변경을 반영하는 경로는 있지만, 별도 외부 PR을 G 계획의 완료 근거로 자동 연결하는 기능은 확인되지 않았다. 실제 Merge 인식은 저장된 계획의 branch·PR identity를 기준으로 한다.
 
-이 Requirement는 수동 제출을 기존 Worker 제출과 구분하고, G 없는 R·코드 제출에서는 Manager가 추적용 G를 생성·등록하게 한다. 사용자가 외부에서 이미 수행한 전체 검증 또는 Review의 실행은 각각 명시적으로 생략할 수 있다. 완료·제출 요청을 수락한 뒤에는 Manager가 후속 처리를 맡으며 검증·Review·충돌 실패는 기본적으로 기존 자동 복구와 Worker 교정으로 처리한다. [R-060](%5BR-060%5D%20Collaborative%20Git%20Recovery%20and%20Remote%20Blocked%20Snapshots.md)의 사용자 변경 보존·협업 Git 복구·원격 보존 규칙은 유지한다. 기존 Worker 확인과 최종 검증 정책의 예외는 이 문서에 정의한 수동 제출 후보에만 적용하며 이후 자동 Worker 교정에는 기존 조건을 적용한다.
+이 Requirement는 수동 제출을 기존 Worker 제출과 구분하고, G 없는 R·코드 제출에서는 Manager가 추적용 G를 생성·등록하게 한다. 사용자가 외부에서 이미 수행한 전체 검증 또는 Review의 실행은 각각 명시적으로 생략할 수 있다. 완료·제출 요청을 수락한 뒤에는 Manager가 후속 처리를 맡으며 검증·Review·충돌 실패는 기본적으로 기존 자동 복구와 Worker 교정으로 처리한다. [R-060](archive/%5BR-060%5D%20Collaborative%20Git%20Recovery%20and%20Remote%20Blocked%20Snapshots.md)의 사용자 변경 보존·협업 Git 복구·원격 보존 규칙은 유지한다. 기존 Worker 확인과 최종 검증 정책의 예외는 이 문서에 정의한 수동 제출 후보에만 적용하며 이후 자동 Worker 교정에는 기존 조건을 적용한다.
 
 명시적 일시중지·수동 제출 취소·수동 대상 해제는 [R-076](%5BR-076%5D%20Read-Only%20Operational%20State%20CLI.md)의 추가 계약을 따른다. 미착수 유효 요청만 취소하고 작업물은 유지하며, 수동 작업의 reset은 취소만 수행하고 manual stop이 초기화·READY 복귀를 맡는다. 공유 제출은 묶음 전체에 적용하고 PR 생성·연결 뒤에는 취소·초기화로 되돌리지 않는다. 이 예외 외의 시작·수락·후속 처리와 실제 Merge 완료 조건은 이 문서대로 유지한다.
 

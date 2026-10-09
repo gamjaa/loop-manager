@@ -2,9 +2,9 @@
 
 ## Context
 
-현재 일반 Planner의 기존 ExecPlan 갱신 대상은 실행 이력이 없는 READY로 제한된다. 한 번 시작한 계획은 READY로 돌아와도 제외되므로, PR 등록 전인 진행 중 작업에 관련 Requirement 변경을 반영할 수 없다.
+PR 전 ExecPlan 개정과 stage_documents의 단계별 문서 반영은 이미 구현됐다. 같은 ID·작업물·기록 보존과 발견 단계별 대응을 유지하고 Planner 단계 경계의 갱신·정상 사용자 rebase 수용에 남은 조건만 보완한다.
 
-현재 실행 경로에는 단계 진입 전 원격 확인과 선언 재평가가 있지만, ExecPlan 본문·source 입력 변경은 Worker 복귀 사유가 되고 Reviewer 진입에는 현재 후보의 성공한 verify 근거를 요구한다. 원격을 확인하는 것과 변경의 관련성·발견 단계에 맞게 작업을 이어가는 것은 별도의 보장이다.
+원격 확인과 문서 관련성 판단은 후보 검증과 구분한다. ref 갱신만으로 차단하지 않고 실제 문서·후보·검증 입력 변화에 해당하는 단계만 다시 수행해야 한다.
 
 진행 중 작업은 최신 원격 문서에 맞춰 갱신하되, 문서 변경만으로 구현을 반복하지 않아야 한다. 이 Requirement는 [R-049](archive/%5BR-049%5D%20Input-Specific%20Planner%20Roles.md)의 미착수 READY 갱신 제한과 [R-051](archive/%5BR-051%5D%20Remote%20Change%20Rebase%20and%20Managed%20Work%20Resumption.md)의 Worker·Reviewer 문서 재확인 범위를 아래 정책으로 변경한다. [R-072](%5BR-072%5D%20Reuse%20Successful%20Candidate%20Results%20with%20Proven%20Inputs.md)의 입력 증명·성공 근거 재사용은 유지하되, 관련 문서 변경에 따른 단계 선택은 이 Requirement를 따른다.
 
@@ -20,9 +20,11 @@
 
 ### 원격 확인과 변경 관련성
 
+Planner도 최초 입력을 전체 주기 동안 고정하지 않고 진입·종료·교정·게시 전의 안전한 경계에서 최신 원격 원본을 확인한다. Agent와 같은 worktree에 pull/rebase를 겹치지 않으며 갱신된 명세·ExecPlan으로 기존 ID와 작업 결과를 보존해 재평가한다. 단계 중 동시 원격 변경은 종료 후 재관측하고 오래된 판단을 그대로 게시하지 않는다.
+
 Manager는 Worker, Manager verify, Reviewer 진입 전에 등록된 origin의 최신 원본 branch와 현재 작업 branch를 확인한다. 재시도·교정·중단 후 재개도 같은 진입 기준을 따른다. 로컬 원본 branch와 기본 checkout의 미커밋 변경을 원격 기준으로 대신하지 않는다.
 
-원격 작업 branch의 변경은 기존 동일 branch 채택·rebase 규칙으로 반영하고, 최신 원본도 기존 관리 rebase·충돌 복구·작업물 보존 규칙에 따라 반영한다. 반영 후 실제 문서·구현·검증 입력을 대조해 아래와 같이 처리한다.
+로컬 작업 수용·원격 작업 통합·게시 권한은 R-055대로 분리한다. 로컬을 원격 원본 위로 정상 rebase했으면 과거 원격 작업 tip의 조상 관계만으로 거부하지 않는다. 새 원격 작업은 기존 통합·보존 경계로 연결하며 바뀐 후보·문서·검증 입력을 대조해 아래와 같이 처리한다.
 
 | 변경 종류 | 처리 |
 |---|---|
@@ -62,11 +64,13 @@ Reviewer를 먼저 진행한 결과가 구현 부족이면 Worker 교정 후 필
 
 ## Acceptance Criteria
 
+- Planner의 진입·종료·교정·게시 경계마다 최신 원격 명세·ExecPlan을 확인한다. 작성 중 갱신은 writer 종료 뒤 반영하며 기존 ID·결과·실패 이력을 불필요하게 폐기하지 않는다.
+
 - 실행 이력이 있는 READY와 IMPLEMENTING·VERIFYING·REVIEWING 상태의 PR 미등록 ExecPlan은 관련 Requirement 변경에 따라 같은 ID로 갱신할 수 있다. 기존 branch·worktree·세션·원격 checkpoint만으로 대상에서 제외되지 않으며 작업물과 실행 이력이 보존된다.
 - PR 등록 후 Merge 대기 중인 ExecPlan에는 추가·변경 요구사항을 덧붙이지 않는다. 미충족 범위는 새 ExecPlan으로 작성하고 기존 계획·PR과의 중복·dependency를 확인한다.
 - 갱신 대상 선정 뒤 실제 PR이 등록되거나 SQLite에 미기록인 연결 PR이 발견되면 기존 ExecPlan 갱신을 적용하지 않고 PR 이후 정책을 따른다.
 - Worker·Manager verify·Reviewer의 최초 진입, 교정 재진입과 중단 후 재개에서 최신 원본·작업 branch를 확인한다. 실행 중인 프로세스와 worktree 변경을 겹치지 않는다.
-- 원격 작업 branch만 변경된 경우에도 기존 채택·rebase 규칙으로 받아온 뒤 단계 판단을 수행한다. branch 삭제·재작성·소유권 불확실을 정상 변경으로 덮어쓰지 않는다.
+- 원격 작업 branch 변경과 정상 원격 원본 기준 로컬 rebase를 R-055대로 수용·통합·게시로 나눠 판단한다. branch 삭제·재작성은 로컬 작업을 보존하고 해당 원격 통합·게시를 보류하며 무검증 덮어쓰기를 허용하지 않는다.
 - 각 진입 시점에서 현재 작업과 무관한 문서만 변경됐으면 rebase 후 해당 단계를 계속하며, 문서 변경만을 사유로 Planner·Worker를 반복하지 않는다. 실제 후보·검증 입력 변경은 기존 검증 규칙을 따른다.
 - ExecPlan이 그대로여도 연결 Requirement 또는 적용 상위 명세가 현재 작업의 조건을 바꾸면 각 단계에서 반영한다. 다음 작업 선택 경계까지 미루거나 `sources` 직접 나열 여부만으로 제외하지 않는다.
 - Worker 진입 전 관련 문서가 변경되면 최초·재개 Worker 모두 갱신·rebase가 완료된 최신 문서를 입력으로 구현한다.
@@ -89,7 +93,7 @@ Reviewer를 먼저 진행한 결과가 구현 부족이면 Worker 교정 후 필
 - Merge 대기 ExecPlan의 요구 범위를 확장하거나 PR을 자동 Merge·Close하지 않는다.
 - 진행 중 프로세스를 강제 중단하거나 같은 프로젝트의 작업·Planner를 병렬 실행하지 않는다.
 - 일반 Planner에 코드·설정 수정 권한을 주거나 Reviewer의 읽기 전용·테스트 미실행 원칙을 바꾸지 않는다.
-- 다른 작업의 선택·우선순위, 유지보수 주기, 사용자 승인 또는 기존 Git 소유권·충돌·lease 규칙을 변경하지 않는다.
+- 다른 작업의 선택·우선순위, 유지보수 주기와 사용자 승인 정책을 변경하지 않는다. 공통 Git 수용·통합·게시 분리는 R-055를 따른다.
 
 ## Open Questions
 

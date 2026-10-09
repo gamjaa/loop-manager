@@ -18,7 +18,7 @@ Loop Manager는 Windows·Linux·macOS에서 동작하는 Python 3 프로그램�
 
 상태의 의미와 허용 정책은 PRODUCT를 기준으로 하며 여기서는 이를 적용·보존하는 방법을 설명한다. 활성 Requirement의 미구현 설계는 구현 예정임을 구분한다.
 
-현행 구조와 활성 변경 요청의 적용 범위는 [PRODUCT의 변경 요구사항 절](PRODUCT.md#활성-변경-요구사항과-현재-동작)에서 연결한다. 아래의 로컬 fast-forward 제한, PR 없는 checkpoint, Planner의 FUTURE_IDEAS 작성과 Worker 문서 제한은 현행 설명이며, 각각 R-056·R-060·R-061의 구현 목표를 거부하는 제약으로 사용하지 않는다. 구현 전 Agent의 실제 권한과 실행 gate를 문서만으로 변경하지 않는다.
+현행 구조와 활성 변경 요청은 [PRODUCT의 변경 요구사항 절](PRODUCT.md#활성-변경-요구사항과-현재-동작)에서 연결한다. 아래는 Merge된 구조이며 R-055의 정상 Git 변경·legacy 기본 checkout 제외·BLOCKED 현재 입력·게시 분리와 R-082의 Planner 경계 보완은 구현 목표다. 문서 편집만으로 실행 gate나 검증 성공을 바꾸지 않는다.
 
 [보관된 R-063](requirements/archive/%5BR-063%5D%20Manager-Owned%20Deterministic%20Work%20and%20Minimal%20Model%20Use.md)은 규칙 기반 처리의 Manager 이관과 모델 호출 축소의 설계 배경이다. 후보 성공 결과 재사용의 변경 요구는 [R-072](requirements/%5BR-072%5D%20Reuse%20Successful%20Candidate%20Results%20with%20Proven%20Inputs.md)를 따른다. 역할별 입력 동일성의 증거가 없는 경우의 재검증·최신 원격 게시 gate는 유지한다.
 
@@ -30,7 +30,7 @@ Loop Manager는 Windows·Linux·macOS에서 동작하는 Python 3 프로그램�
 - Windows는 PowerShell, Linux·macOS는 Bash 실행 진입점을 제공한다
 - 같은 사용자 상태 디렉터리의 자동 실행과 실제 복구 실행은 `<state-dir>/loop-manager.lock`으로 직렬화한다. 수동 준비와 복구 요청 접수는 별도 command runtime과 자원 잠금을 사용한다
 - `run.sh`와 `run.ps1`은 Git을 실행하지 않고 source checkout의 Python 부트스트랩만 시작한다
-- 부트스트랩은 다른 Git 작업 전에 부모 process lock을 획득하고, Loop Manager 저장소의 `origin/main`을 fetch해 exact SHA의 detached runtime worktree를 선택한 뒤 같은 lock을 유지한 채 runtime 자식을 실행한다. `manual`과 `recover`는 command별 부모 lock과 고유 runtime 경로로 자동 실행과 분리한다
+- 부트스트랩은 다른 Git 작업 전에 부모 process lock을 획득하고, 등록 self base(미등록이면 main)의 origin/<base-branch>를 fetch해 exact SHA의 detached runtime worktree를 선택한 뒤 같은 lock을 유지한 채 runtime 자식을 실행한다. `manual`과 `recover`는 command별 부모 lock과 고유 runtime 경로로 자동 실행과 분리한다
 - runtime worktree는 source checkout의 object database를 공유하며 사용자 `main`의 파일, index, HEAD와 로컬 전용 commit을 사용하지 않는다. push된 새 SHA는 다음 실행에서만 선택한다
 - source checkout의 bootstrap은 기존 `config/config.ini` 또는 명시된 `--config`를 source checkout 기준의 절대 경로로 확정해 runtime 자식에 전달하며 설정 파일을 runtime worktree에 복사·이동·symlink하지 않는다
 - launcher가 선택한 source checkout의 Python interpreter를 runtime 자식도 사용한다. source checkout의 ignored 파일과 cache는 runtime worktree로 전달하지 않는다
@@ -173,10 +173,10 @@ source journal의 원본 intent·invocation·관측과 완료 감사는 비교 v
 
 1. source checkout의 좁은 Python 부트스트랩이 `<state-dir>/loop-manager.lock`을 획득한다
 2. lock을 보유한 부모만 source checkout을 anchor로 `git fetch origin`을 실행한다
-3. fetch된 `origin/main`을 immutable commit SHA로 resolve한다
+3. 등록 self base(미등록이면 기존 main 기본값)의 origin/<base-branch>를 immutable commit SHA로 resolve한다
 4. `<state-dir>/runtimes/<repository-id>/<sha>/`의 linked worktree가 같은 repository, clean detached HEAD와 exact SHA인지 검증하고, 없을 때만 `git worktree add --detach`로 만든다
 5. 부모가 source checkout 기준의 절대 config 경로와 내부 runtime 표식을 전달하고, 현재 Python interpreter로 runtime worktree의 `loop_manager.py`를 자식 실행해 종료 코드를 전달한다
-6. 부모는 자식 종료 뒤 lock을 해제한다. bootstrap은 실행 중인 runtime worktree를 이동하거나 사용자 `main`을 갱신하지 않는다. 다만 runtime 자식이 Loop Manager 저장소 자체를 등록 프로젝트로 처리하면 아래의 일반 safe fast-forward 조건을 적용할 수 있다
+6. 부모는 자식 종료 뒤 lock을 해제한다. source bootstrap의 부수 동기화와 runtime 자식의 일반 프로젝트 동기화는 원격 revision 선택과 별도 경계이며 위 기본 worktree 동기화 조건에서만 수행한다. source HEAD·branch·동기화 성공은 실행 gate가 아니다
 
 runtime 경로가 존재하지만 소유권, repository, detached HEAD, SHA 또는 clean 상태를 증명할 수 없으면 reset, clean, 제거 또는 덮어쓰기 없이 중단한다. 별도 clone은 만들지 않으며 SHA별 runtime 정리는 활성 실행과 분리된 검증된 관리 작업으로만 수행한다.
 
@@ -210,7 +210,7 @@ planning worktree는 `<state-dir>/worktrees/<project-id>/planning/<input-fingerp
 
 일반 planning snapshot은 실제 PR이 없는 READY·진행 중 선언을 Git 원문과 SQLite의 선언·실행 근거에 결합한다. 실행 이력·branch·worktree·세션·checkpoint는 개정 금지 사유가 아니며, 게시 직전에 실행 근거와 실제 PR 부재를 다시 확인한다. 개정은 실행 상태·세션·실패 이력을 보존하고 이미 시작한 계획의 effective level을 낮추지 않는다. 이름 변경·삭제와 유지보수 snapshot은 기존 미착수·무소유 READY 범위를 유지한다. 계획 삭제는 활성 row 제거와 ID 취소 감사를 같은 transaction에서 기록하며 ID를 재사용하지 않는다. 최초 activation marker는 이후 READY로 돌아와도 유지한다.
 
-사용자가 BLOCKED의 근거 PRODUCT/Requirement를 기본 branch에서 수정한 경우 변경을 commit하고 push해야 한다. Loop Manager는 변경된 `origin/<base-branch>`를 관리 branch에 rebase한 뒤 재개한다. rebase는 관리 worktree에서만 수행하며, 등록 프로젝트 동기화가 별도로 safe fast-forward 조건을 만족하지 않는 한 기본 worktree의 파일, index와 HEAD는 바꾸지 않는다. 사용자는 안내된 관리 worktree의 ExecPlan을 직접 수정할 수도 있다.
+사용자가 BLOCKED의 근거 PRODUCT/Requirement를 기본 branch에서 수정한 경우 변경을 commit하고 push해야 한다. Loop Manager는 변경된 `origin/<base-branch>`를 관리 branch에 rebase한 뒤 재개한다. 작업 rebase는 관리 worktree에서 수행하며, 기본 worktree의 파일·index·HEAD는 위 부수 동기화의 안전한 FF·clean 로컬 commit rebase 조건에서만 바꾼다. 사용자는 안내된 관리 worktree의 ExecPlan을 직접 수정할 수도 있다.
 
 원격 관측은 Agent·verify가 worktree를 사용하는 동안 파일을 바꾸지 않고 다음 안전한 경계에서 적용한다. planning rebase는 작업물과 stash를 보존한 채 Git 상태를 복구하고 새 base를 SQLite에 기록한 뒤 보존 stash를 정리한다. 현재 작업의 문서 반영은 아래 경계를 따른다. 후보 HEAD가 바뀐 실행은 기존 검증·Review 증거의 재사용 자격을 다시 판단하며 게시 직전의 fast-forward·lease·PR·checkpoint 정책을 유지한다.
 
@@ -306,7 +306,7 @@ provider adapter는 실제 호출 직전에 선택된 canonical worktree, Git wo
 
 격리 정책 작성과 유효 정책 확인은 provider 호출 경계의 독립 책임으로 두고, 기존 Agent invocation·session·snapshot 저장과 연결한다. SQLite에는 호환 가능한 추가 저장만 사용하며, 개별 호출마다 provider, CLI 버전, 실행 환경, 역할, canonical worktree, repository identity, 유효한 격리 정책의 지문, session/호출 identity와 확인·거부 결과를 보존한다. 증거 저장이나 확인이 실패하면 검증된 실행으로 취급하지 않는다. 재개·provider 전환·설정 변경·중단 뒤에는 이전 증거를 새 호출의 증거로 재사용하지 않는다. 비밀값, 인증 자료와 source checkout의 로컬 파일 내용은 저장하지 않는다.
 
-단순 CLI 옵션, cwd 지정, 자동 검토의 승인 또는 사후 Git diff만으로 호출 전 격리를 증명하지 않는다. 실제 적용되는 정책과 허용 경로 쓰기·금지 경로 쓰기 거부를 확인하며, source checkout의 로컬 상태를 바꾸지 않고 증명해야 한다. Codex 확인은 Agent의 파일 변경·도구 실행에 적용되는 내장 정책을 대상으로 한다. 설치 CLI의 공식 지원 설정, 병합 우선순위와 역할별 실제 허용·거부 동작을 확인하며, exec JSONL에 유효 정책 전용 필드가 없다는 이유로 transport를 바꾸거나 바깥 wrapper를 추가하지 않는다. Codex 프로세스 전체의 mount·내부 쓰기 및 중첩 도구 실행 성공은 증명 조건이 아니다. 정상 인증·session·로그 저장과 PRODUCT의 `refs/codex/turn-diffs/*` 예외는 구분하며 그 밖의 Git·Agent 쓰기 권한은 확대하지 않는다. Claude도 같은 확인 수준을 적용한다. 공식 정책의 지원 조건·설정 병합·resolved Git 경로와 파일 도구 권한을 대조하고 신규·재개·fallback의 호출 구성을 모의 테스트로 검증한다. 계정이 필요한 모델 호출이나 금지 쓰기·자동 검토의 실시간 시연을 호출 전 필수 probe로 추가하지 않는다. 정책 검토·모의 테스트와 실제 호출 검증의 근거를 구분해 저장하고, 실제 호출에서 관측한 미지원·정책 충돌·초기화 실패는 해당 Claude 작업에만 반영한다. Claude의 개발 환경 부재나 선택 프로젝트의 인증 실패 때문에 독립 Codex 작업을 막거나 다른 provider로 임의 전환하지 않는다. 신규 호출에서 요구 정책을 적용·확인할 수 없거나 기존 허용 작업과 양립하지 않으면 원인과 기존 작업물·session을 보존한 채 중단한다. 격리 증거가 없는 과거 snapshot과 session의 판정은 기존 엄격한 shared ref·다른 worktree 감시를 유지한다. Loop Manager의 Worker 이후 Reviewer 검토는 provider의 실행 전 자동 승인 검토와 별도로 유지한다.
+단순 CLI 옵션, cwd 지정, 자동 검토의 승인 또는 사후 Git diff만으로 호출 전 격리를 증명하지 않는다. 실제 적용되는 정책과 허용 경로 쓰기·금지 경로 쓰기 거부를 확인하며, source checkout의 로컬 상태를 바꾸지 않고 증명해야 한다. Codex 확인은 Agent의 파일 변경·도구 실행에 적용되는 내장 정책을 대상으로 한다. 설치 CLI의 공식 지원 설정, 병합 우선순위와 역할별 실제 허용·거부 동작을 확인하며, exec JSONL에 유효 정책 전용 필드가 없다는 이유로 transport를 바꾸거나 바깥 wrapper를 추가하지 않는다. Codex 프로세스 전체의 mount·내부 쓰기 및 중첩 도구 실행 성공은 증명 조건이 아니다. 정상 인증·session·로그 저장과 PRODUCT의 `refs/codex/turn-diffs/*` 예외는 구분하며 그 밖의 Git·Agent 쓰기 권한은 확대하지 않는다. Claude도 같은 확인 수준을 적용한다. 공식 정책의 지원 조건·설정 병합·resolved Git 경로와 파일 도구 권한을 대조하고 신규·재개·fallback의 호출 구성을 모의 테스트로 검증한다. 계정이 필요한 모델 호출이나 금지 쓰기·자동 검토의 실시간 시연을 호출 전 필수 probe로 추가하지 않는다. 정책 검토·모의 테스트와 실제 호출 검증의 근거를 구분해 저장하고, 실제 호출에서 관측한 미지원·정책 충돌·초기화 실패는 해당 Claude 작업에만 반영한다. Claude의 개발 환경 부재나 선택 프로젝트의 인증 실패 때문에 독립 Codex 작업을 막거나 다른 provider로 임의 전환하지 않는다. 신규 호출에서 요구 정책을 적용·확인할 수 없거나 기존 허용 작업과 양립하지 않으면 원인과 기존 작업물·session을 보존한 채 중단한다. 현행 legacy 감시와 R-055·G-199의 기본 checkout 제외 목표는 아래 실행별 범위 절에서 구분한다. Loop Manager의 Worker 이후 Reviewer 검토는 provider의 실행 전 자동 승인 검토와 별도로 유지한다.
 
 Reviewer의 `read-only`는 workspace 파일 쓰기를 제한한다. 검색·diff·기존 결과 읽기에 필요한 명령은 내장 sandbox 안에서 실행할 수 있다. 테스트 command와 verify를 재실행하지 않는 규칙은 고정된 common+Reviewer 역할 instruction에 유지하며, 쓰기 없는 테스트도 역할상 실행하지 않는다. Worker의 targeted test 결과와 Manager의 전체 verify 결과를 작업별 prompt로 전달하는 기존 흐름을 유지하고, read-only 정책이 테스트 명령을 모두 차단한다고 취급하지 않는다.
 
@@ -495,15 +495,15 @@ ExecPlan archive는 원본 hash, regular-file source, 비어 있는 destination�
 
 ## Repository Safety and Security
 
-- 등록 프로젝트 기본 worktree의 로컬 변경, ahead·diverged 이력과 checkout branch는 원격 SHA 기반 자동 작업을 막지 않는다. safe fast-forward 조건을 만족하지 않으면 기본 worktree 동기화만 건너뛴다
+- 등록 프로젝트 기본 worktree의 로컬 변경, ahead·diverged 이력과 checkout branch는 원격 SHA 기반 자동 작업을 막지 않는다. 위 fast-forward·clean diverged rebase의 보존 조건을 만족하지 않으면 기본 worktree 동기화만 건너뛴다
 - 사용자 파일 삭제, reset, 일반적인 강제 push와 자동 Merge를 수행하지 않는다
 - 계획 commit의 base branch 직접 push는 fast-forward만 허용한다. branch protection 등으로 거부되면 우회하지 않고 계획 오류로 보존한다
-- 기본 worktree에서는 검증된 `git merge --ff-only origin/<base-branch>` 외의 파일 쓰기, checkout, pull, rebase, reset, stash, clean과 commit을 수행하지 않는다
+- 기본 worktree의 Git 쓰기는 위 안전한 fast-forward와 clean diverged 로컬 commit을 보존하는 소유 rebase·abort에 한정한다. dirty rebase·자동 push·reset·stash·clean·강제 checkout은 수행하지 않는다
 - 관리 worktree, SQLite, 임시 파일, 로그와 lock은 source checkout 밖의 `<state-dir>`에만 만든다
 - 모든 계획과 구현 변경은 Loop Manager가 만든 관리 worktree 안에서만 수행한다
 - AI Agent가 접근하고 수정할 수 있는 경로를 해당 관리 worktree로 제한한다
-- `git fetch`와 `git worktree add/remove`는 공유 Git metadata만 변경한다. 기본 worktree의 파일, index와 HEAD 변경은 검증된 safe fast-forward synchronizer만 수행한다
-- 관리 worktree는 미커밋 변경과 PR head에 없는 로컬 commit이 없다고 확인된 때만 강제 옵션 없이 제거한다. base branch ancestry나 GitHub Merge 방식은 push 여부 판정에 사용하지 않는다
+- fetch·worktree 등록/정리는 공유 metadata를 다루며 기본 checkout 파일·index·HEAD 갱신은 위 소유 동기화 경계로 제한한다. 사용자 operation·동시 변경·ignored 경로 충돌은 덮어쓰지 않는다
+- 정상 종료한 정확한 Manager 소유 관리 worktree는 권위 있는 미커밋 변경과 미게시 commit이 없음을 확인한 뒤 수명을 종료한다. ignored-only는 정리를 막지 않지만 활성 작업·기본 checkout·불명확한 소유권·사용자 변경을 삭제하는 근거가 아니다. base ancestry나 GitHub Merge 방식으로 게시 여부를 추정하지 않는다
 - PR head 정보나 commit 관계를 확인할 수 없으면 worktree를 보존하고 `cleanup_pending`으로 기록한다
 - `cleanup_pending` worktree가 이후 clean해지거나 경로가 사라지면 기록을 지우고 강제 옵션 없이 정리한다
 - planning worktree·diff·session과 미게시 결과는 오류·게시 복구 동안 보존한다. 폐기·교체는 소유권과 보존 결과를 검증한 관리 경계에서만 수행한다
@@ -524,7 +524,7 @@ ExecPlan archive는 원본 hash, regular-file source, 비어 있는 destination�
 
 동일 입력의 planning_error도 보존된 작업의 소유권·종료 호출·저장 결과를 확인해 재평가한다. 원본 결과가 저장된 scope 오류를 재현하고 ignored 비교 view만 통과하며 결과 이후의 권위 변경이 없을 때만 해당 오류를 해제한다. 차단 identity·현재 Git 상태를 transaction에서 다시 대조하고 session·retry·실패 진단을 보존한다. Planner의 ignored-only PROJECT_BLOCKED 해제는 현재 planning worktree 소유권과 저장 결과 이후의 권위 변경을 검사하며 확정 transaction에서 소유권을 다시 확인한다. ignored-only PLAN_BLOCKED는 기존 실행 격리·Manager 전이 증거를 적용한 결과가 현재 후보와 같을 때 저장한 차단 전 실행 단계와 Worker·verify·Review 결과를 이어간다. 새 verify 호출은 먼저 이전 완료 표식을 무효화하고, 통과한 호출은 HEAD가 동일하고 tracked·staged·non-ignored 미커밋 변경이 없을 때만 scope 검사 전에 후보·저장 출력에 결합한 성공 token을 기록한다. 저장 verify 결과는 validated base와 definition·출력 token이 현재 후보 HEAD와 일치할 때만 완료 증거로 인정해 `REVIEWING`으로 재개하며, 구형 `verify-stage` token은 시작·저장 결과·현재 후보 HEAD가 같고 ignored 비교 view의 결과·현재 상태가 깨끗하며, 해당 계획의 최신 불변 verify 감사가 계획에 저장된 `current_revision_sha`(verify 감사의 정의 commit) 및 성공·저장 출력과 일치할 때만 해제 transaction에서 출력 결합 token으로 전환한다. 원본 snapshot·결과·감사는 보존하고 이후 revision gate·Review·게시에서도 전환한 증거를 사용한다. 그 증명이 불완전하거나 미커밋 변경이 있으면 기존 commit·새 후보 재검증 경계를 적용한다.
 
-실행별 쓰기 격리 증거가 저장된 작업 기준선·호출·역할·session·repository 및 관리 worktree와 일치할 때만 Agent Git 감시를 선택 worktree의 identity·등록·branch·HEAD·index·허용 파일, 작업 소유 branch·원격 base·게시 ref와 영향을 주는 config·operation으로 좁힌다. 무관한 ref·다른 worktree 변화는 진단에 보존하며, 사용 중인 자원의 예상 밖 변화와 영향이 불확실한 config는 차단한다. 증거가 없거나 불완전한 과거 snapshot은 기존 엄격 비교를 유지하고, 이후 사용할 자원은 사용 직전에 실제 값·소유권·기대 OID를 재검증한다
+현행 Agent 감시 축소는 호출·역할·session·repository·관리 worktree에 결합된 격리 증거를 요구하며 증거 없는 snapshot은 엄격 비교로 남는다. R-055·G-199는 이 중 legacy 기본 checkout 제외, 일반 verify의 실행 대상 검사와 전체 preflight digest gate 제거를 구현하도록 변경한다. 현재 자원·origin·보안 설정·writer·후보 입력은 계속 검사하고 수행하지 않은 과거 격리 성공을 합성하지 않는다. 신규 호출의 provider 격리는 유지한다.
 
 Agent 시작 이후 Manager의 fetch·worktree 전이는 작업별 전후 기대값·소유 표식·checkpoint와 현재 Git 상태가 일치하는 자원만 비교 기준선에 반영한다. 관측 OID, SQLite 완료 상태나 예정된 cleanup만으로 전체 ref·worktree를 갱신하지 않으며, Git 변경 뒤 receipt 저장 전 중단에서도 같은 증거를 읽기 전용으로 확인한다. 원본 scope와 재개 호출의 비교 시작값을 별도로 보존해 후속 Manager 전이가 실제 Agent 위반을 덮지 않게 하며, Agent 허용 변경·session·격리 증거를 유지한다
 
