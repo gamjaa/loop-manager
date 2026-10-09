@@ -31,7 +31,7 @@ def isolated_scope_resources(_connection, _repo, worktree, before, role_name, **
 
 
 @contextlib.contextmanager
-def dummy_worker_context(*, roles=("worker",), fixed_guidance=False):
+def dummy_worker_context(*, roles=("worker",), fixed_guidance=True):
     """Opt legacy unused.ini roles into fake profile/session preflight."""
     real_profile = loop_manager._agent_profile
     real_ports = loop_manager._ExecutionLifecyclePorts
@@ -82,7 +82,7 @@ def dummy_worker_context(*, roles=("worker",), fixed_guidance=False):
         yield
 
 
-def dummy_worker_sessions(test=None, *, fixed_guidance=False):
+def dummy_worker_sessions(test=None, *, fixed_guidance=True):
     """Limit compatibility patches to the explicitly decorated test method."""
     from functools import wraps
 
