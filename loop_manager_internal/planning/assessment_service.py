@@ -1,5 +1,6 @@
 """Planner invocation, source-bound file assessment, and result validation."""
 from __future__ import annotations
+from dataclasses import replace
 import json
 from pathlib import Path
 from loop_manager_internal.planning.agent_ports import run_scoped_planner_turn, planner_progress
@@ -575,7 +576,6 @@ class PlanningAssessmentService(PlanningService):
                                            context.repo, worktree, path, plan))
                                    if attempt["purpose"] == "final" else "reviewed")
                 if hasattr(self._ports, "retirement"):
-                    from dataclasses import replace
                     from loop_manager_internal.application.contracts import ValidatedPlanningResult
                     try:
                         judgments = self._ports.retirement.validate_result(
@@ -665,6 +665,22 @@ class PlanningAssessmentService(PlanningService):
                         {str(item["plan_id"]) for item in
                          self._ports.state.execplan_rows(context.repo)},
                     )
+                    if validated_result is not None and validated_result.id_allocations:
+                        id_mapping = {
+                            allocation.source_id: allocation.target_id
+                            for allocation in validated_result.id_allocations
+                        }
+                        normalized_report = json.loads(report)
+                        for finding in normalized_report["findings"]:
+                            if finding["status"] == "planned":
+                                finding["plan_ids"] = [
+                                    id_mapping.get(plan_id, plan_id)
+                                    for plan_id in finding["plan_ids"]
+                                ]
+                        report = json.dumps(
+                            normalized_report, ensure_ascii=False, sort_keys=True,
+                            separators=(",", ":"),
+                        )
                     run.maintenance_cycle = self._ports.state.record_full_assessment(
                         context.repo,
                         expected_revision=run.maintenance_cycle.revision,
@@ -731,6 +747,14 @@ class PlanningAssessmentService(PlanningService):
             decision is not None
             and decision.outcome is MaintenanceOutcome.REFACTORING
         )
+        if (
+            decision is not None
+            and decision.outcome is MaintenanceOutcome.REFACTORING
+            and validated_result is not None
+        ):
+            decision = replace(
+                decision, plan_ids=validated_result.refactoring_plan_ids,
+            )
         run.maintenance_decision = decision
         run.validated_result = validated_result
         record_result = getattr(self._ports.state, "record_planning_result", None)

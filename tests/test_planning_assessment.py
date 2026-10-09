@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 import loop_manager
+from loop_manager_internal.application.contracts import PlanIdAllocation, ValidatedPlanningResult
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.maintenance import maintenance_file_review
@@ -41,6 +42,66 @@ from tests.support.planning_case import (
 )
 
 class PlanningAssessmentTest(PlanningCase):
+    def test_normalized_maintenance_ids_are_saved_in_full_assessment_and_decision(self):
+        source = "a" * 40
+        inventory = {"module.py": "b" * 64}
+        report = {
+            "source_revision": source,
+            "coverage": {key: "Reviewed the original responsibility boundary."
+                         for key in ("code", "tests", "documents")},
+            "findings": [{
+                "id": "planned-boundary", "kind": "code", "path": "module.py",
+                "source_hash": inventory["module.py"],
+                "evidence": "The new plan separates the reviewed responsibility boundary.",
+                "status": "planned", "plan_ids": ["G-005"],
+            }],
+        }
+        planning_result = (
+            'MAINTENANCE_RESULT: {"outcome":"refactoring","plan_ids":["G-005"]}\n'
+            "FULL_ASSESSMENT_RESULT: " + json.dumps(report)
+        )
+        result = ValidatedPlanningResult(
+            plans=(("docs/plans/[G-002] Refactor Boundary.md", {
+                "id": "G-002", "title": "Refactor Boundary",
+            }),),
+            publication_paths=("docs/plans/[G-002] Refactor Boundary.md",),
+            refactoring_plan_ids=("G-002",),
+            id_allocations=(PlanIdAllocation(
+                "docs/plans/[G-005] Refactor Boundary.md", "G-005",
+                "docs/plans/[G-002] Refactor Boundary.md", "G-002",
+            ),),
+        )
+        cycle = maintenance_cycle(
+            phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+            cycle_base_sha=source, file_assessment_start_merged_count=1, revision=1,
+        )
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha=source, planning_result=planning_result,
+            planning_result_completed=True,
+        ), cycle)
+        ports.validation.validate_maintenance_result = mock.Mock(return_value=result)
+        ports.state.execplan_rows = lambda _repo: []
+        ports.state.record_full_assessment = mock.Mock(return_value=cycle)
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(replace(self.context, self_repository=True))
+        run.planning_worktree = Path("/planning")
+        run.maintenance_context = SimpleNamespace(active_sha=source)
+
+        with mock.patch(
+            "loop_manager_internal.planning.assessment_port.maintenance_file_inventory.source_inventory",
+            return_value=inventory,
+        ):
+            self.assertIsNone(coordinator._assessment._validate_planner_result(run))
+
+        ports.validation.validate_maintenance_result.assert_called_once()
+        self.assertEqual(
+            ports.validation.validate_maintenance_result.call_args.kwargs["refactoring_plan_ids"],
+            ("G-005",),
+        )
+        saved = json.loads(ports.state.record_full_assessment.call_args.kwargs["result"])
+        self.assertEqual(saved["findings"][0]["plan_ids"], ["G-002"])
+        self.assertEqual(run.maintenance_decision.plan_ids, ("G-002",))
+
     def test_legacy_prerequisites_finish_assessment_evidence_before_waiting_for_merge(self):
         source = "a" * 40
         report = {"source_revision": source,

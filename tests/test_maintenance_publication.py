@@ -320,6 +320,15 @@ class MaintenancePublicationTest(MaintenancePlanningCase):
         git(self.repo, "push", "origin", "HEAD:main")
         git(self.repo, "fetch", "origin")
 
+        self.connection.execute(
+            "ALTER TABLE maintenance_cycles DROP COLUMN publication_id_allocations"
+        )
+        maintenance_state.ensure_schema(self.connection)
+        migrated_intent = maintenance_state.MaintenanceRepository(self.connection).get(
+            str(self.repo)
+        )
+        self.assertEqual(migrated_intent.publication_id_allocations, ())
+
         row = self.connection.execute(
             "SELECT content_hash FROM exec_plans "
             "WHERE repo = ? AND plan_id = 'G-001'",

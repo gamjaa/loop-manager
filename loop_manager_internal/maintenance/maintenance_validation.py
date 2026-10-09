@@ -3,7 +3,7 @@ from __future__ import annotations
 from loop_manager_internal.application.result_normalization import bind_identity, tagged_json
 from collections.abc import Callable
 from dataclasses import dataclass
-from loop_manager_internal.application.contracts import ValidatedPlanningResult
+from loop_manager_internal.application.contracts import PlanIdAllocation, ValidatedPlanningResult
 from loop_manager_internal.catalog import project_catalog_refresh, execplan_drafts
 from loop_manager_internal.git.command_adapter import ExternalObservationError
 from loop_manager_internal.runtime.contracts import GitLockError
@@ -277,15 +277,23 @@ def validate_maintenance_planner_result(
     *,
     refactoring_plan_ids: tuple[str, ...] | None = None,
     allow_general_plans: bool = False,
+    expected_id_allocations: tuple[PlanIdAllocation, ...] | None = None,
 ) -> ValidatedPlanningResult | None:
     """Validate output without consuming correction retries on Git failures."""
 
     # Read Git outside the output-validation boundary. A tree query distinguishes
     # absent paths from an unreadable repository without interpreting cat-file's
     # nonzero status as proof that a path is new.
+    from loop_manager_internal.planning.planner_validation import (
+        _normalize_new_plan_batch, _planning_id_inventory,
+        _recover_interrupted_plan_id_normalization,
+    )
+    recovered_paths = _recover_interrupted_plan_id_normalization(worktree)
     from loop_manager_internal.maintenance import code_map_artifact
     planned_files = sorted(
-        set(dirty_files) | set(effects.changed_files(worktree, context.active_sha))
+        (set(dirty_files) - recovered_paths)
+        | set(effects.changed_files(worktree, context.active_sha))
+        | set(effects.changed_files(worktree))
     )
     base_paths = effects._git_tree_entries(worktree, context.active_sha)
     path_moves_by_sha: dict[str, dict[str, str]] = {}
@@ -359,20 +367,14 @@ def validate_maintenance_planner_result(
                     )
                 new_paths.append(path)
 
-        try:
-            held_ids = catalog_held_plan_ids(connection, context.repo)
-            if held_ids:
-                catalog_snapshot = project_catalog_refresh.validated_held_planning_snapshot(
-                    connection, context.repo, worktree, context.active_sha,
-                    git=effects.git, load_snapshot=effects.load_execplan_snapshot)
-            else:
-                catalog_snapshot = effects.load_execplan_snapshot(worktree, validate_sources=False)
-        except (ExternalObservationError, GitLockError):
-            raise
-        except RuntimeError as error:
-            raise MaintenancePlanningError(str(error)) from error
-        catalog = catalog_snapshot.active_metadata()
+        held_ids = catalog_held_plan_ids(connection, context.repo)
         new_plans: list[tuple[str, dict[str, object]]] = []
+        id_allocations: tuple[PlanIdAllocation, ...] = ()
+        reserved_before_normalization: set[str] = set()
+        if new_paths:
+            reserved_before_normalization, existing_plan_ids = _planning_id_inventory(
+                worktree, set(new_paths), None, connection, context.repo, held_ids,
+            )
         for path in new_paths:
             try:
                 plan = effects._parse_execplan(
@@ -398,6 +400,81 @@ def validate_maintenance_planner_result(
             except RuntimeError as error:
                 raise MaintenancePlanningError(str(error)) from error
             new_plans.append((path, validated_plan))
+
+        related_plans: list[tuple[str, dict[str, object]]] = []
+        for path in revised_paths:
+            try:
+                related_plans.append((
+                    path,
+                    effects._parse_execplan(
+                        worktree, worktree / path, require_priority=False,
+                        allow_archive_fallback=False,
+                    ),
+                ))
+            except RuntimeError as error:
+                raise MaintenancePlanningError(str(error)) from error
+
+        source_new_paths = set(new_paths)
+        if new_plans:
+            new_plans, id_allocations = _normalize_new_plan_batch(
+                worktree, new_plans, reserved_before_normalization,
+                existing_plan_ids, effects._parse_execplan,
+                related_plans=tuple(related_plans),
+            )
+            if id_allocations:
+                planned_files = sorted(
+                    (set(planned_files) - source_new_paths)
+                    | {path for path, _plan in new_plans}
+                )
+                for source_path in source_new_paths:
+                    planned_contents.pop(source_path, None)
+                new_paths = [path for path, _plan in new_plans]
+                for path, _plan in new_plans:
+                    contents = (worktree / path).read_bytes()
+                    planned_contents[path] = (contents, contents.decode("utf-8"))
+                for path in revised_paths:
+                    contents = (worktree / path).read_bytes()
+                    planned_contents[path] = (contents, contents.decode("utf-8"))
+
+        if expected_id_allocations is not None:
+            expected_by_target = {
+                allocation.target_path: allocation
+                for allocation in expected_id_allocations
+            }
+            if len(expected_by_target) != len(expected_id_allocations):
+                raise MaintenancePlanningError(
+                    "보존된 maintenance ID 배정 mapping이 중복됐습니다."
+                )
+            plans_by_path = dict(new_plans)
+            if set(expected_by_target) != set(plans_by_path):
+                raise MaintenancePlanningError(
+                    "보존된 maintenance ID 배정 mapping이 새 계획 batch와 다릅니다."
+                )
+            for path, plan in new_plans:
+                allocation = expected_by_target[path]
+                if (
+                    str(plan["id"]) != allocation.target_id
+                    or path != f"docs/plans/[{allocation.target_id}] {plan['title']}.md"
+                    or allocation.source_path
+                    != f"docs/plans/[{allocation.source_id}] {plan['title']}.md"
+                ):
+                    raise MaintenancePlanningError(
+                        f"보존된 maintenance ID 배정이 계획 identity와 다릅니다: {path}"
+                    )
+            id_allocations = expected_id_allocations
+
+        try:
+            if held_ids:
+                catalog_snapshot = project_catalog_refresh.validated_held_planning_snapshot(
+                    connection, context.repo, worktree, context.active_sha,
+                    git=effects.git, load_snapshot=effects.load_execplan_snapshot)
+            else:
+                catalog_snapshot = effects.load_execplan_snapshot(worktree, validate_sources=False)
+        except (ExternalObservationError, GitLockError):
+            raise
+        except RuntimeError as error:
+            raise MaintenancePlanningError(str(error)) from error
+        catalog = catalog_snapshot.active_metadata()
         try:
             from loop_manager_internal.storage import execplan_draft_state
             execplan_draft_state.validate_questions(connection, context.repo, catalog)
@@ -407,11 +484,20 @@ def validate_maintenance_planner_result(
         except RuntimeError as error:
             raise MaintenancePlanningError(str(error)) from error
         new_ids = {str(plan["id"]) for _, plan in new_plans}
-        declared_refactoring = (
-            new_ids
-            if refactoring_plan_ids is None
-            else set(refactoring_plan_ids)
-        )
+        id_mapping = {
+            allocation.source_id: allocation.target_id
+            for allocation in id_allocations
+        }
+        if refactoring_plan_ids is None:
+            declared_refactoring = new_ids
+        elif expected_id_allocations is not None:
+            # Recovery stores target IDs; applying source->target mapping again
+            # can collapse IDs when a target is another plan's source ID.
+            declared_refactoring = set(refactoring_plan_ids)
+        else:
+            declared_refactoring = {
+                id_mapping.get(plan_id, plan_id) for plan_id in refactoring_plan_ids
+            }
         if not declared_refactoring <= new_ids:
             unknown = sorted(declared_refactoring - new_ids)
             raise MaintenancePlanningError(
@@ -431,9 +517,7 @@ def validate_maintenance_planner_result(
             effects._validate_future_idea_separation(worktree, context.active_sha, new_paths)
 
         existing_ids = [
-            int(plan_id[2:])
-            for plan_id in catalog_snapshot.observed_ids
-            if plan_id not in new_ids
+            int(plan_id[2:]) for plan_id in reserved_before_normalization
         ]
         first_id = max(existing_ids, default=0) + 1
         expected_ids = list(range(first_id, first_id + len(new_plans)))
@@ -530,6 +614,7 @@ def validate_maintenance_planner_result(
                     )
                 ) if refactoring_plans else ()
             ),
+            id_allocations=id_allocations,
         )
         return (code_map_artifact.attach_candidate(connection, context, worktree, result)
                 if artifact_result is not None else result)

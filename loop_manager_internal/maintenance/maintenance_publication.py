@@ -3,7 +3,7 @@ from __future__ import annotations
 from loop_manager_internal.agents import common_guidance
 from collections.abc import Callable
 from dataclasses import dataclass
-from loop_manager_internal.application.contracts import ValidatedPlanningResult
+from loop_manager_internal.application.contracts import PlanIdAllocation, ValidatedPlanningResult
 from loop_manager_internal.catalog import execplan_catalog, project_catalog_refresh
 from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
 from loop_manager_internal.maintenance import maintenance_file_publication
@@ -333,6 +333,10 @@ def record_maintenance_publication_intent(
             commit_sha=plan_commit,
             refactoring_plan_ids=result.refactoring_plan_ids,
             revalidation_plan_ids=result.revalidation_plan_ids,
+            id_allocations=tuple(
+                (item.source_path, item.source_id, item.target_path, item.target_id)
+                for item in result.id_allocations
+            ),
         )
         if evidence is not None:
             maintenance_file_publication.save_intent(
@@ -419,6 +423,17 @@ def _assert_maintenance_publication_intent(
     result: ValidatedPlanningResult,
 ) -> None:
     cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
+    result_id_allocations = tuple(
+        (item.source_path, item.source_id, item.target_path, item.target_id)
+        for item in result.id_allocations
+    )
+    if not cycle.publication_id_allocations and all(
+        source_path == target_path and source_id == target_id
+        for source_path, source_id, target_path, target_id in result_id_allocations
+    ):
+        # Pre-mapping prepared intents migrate with []; treat identity allocations
+        # as the legacy equivalent while still binding non-identity mappings.
+        result_id_allocations = ()
     current = (
         cycle.publication_stage,
         cycle.publication_base_sha,
@@ -426,10 +441,12 @@ def _assert_maintenance_publication_intent(
         cycle.publication_remote_oid,
         cycle.publication_refactoring_plan_ids,
         cycle.publication_revalidation_plan_ids,
+        cycle.publication_id_allocations,
     )
     expected = (
         "prepared", context.active_sha, plan_commit, None,
         result.refactoring_plan_ids, result.revalidation_plan_ids,
+        result_id_allocations,
     )
     if current != expected:
         raise MaintenancePlanningError(
@@ -896,6 +913,10 @@ def recover_maintenance_planning_batch(
             effects.changed_files(worktree),
             refactoring_plan_ids=(cycle.publication_refactoring_plan_ids if context.mode is MaintenancePlanMode.BARRIER else ()),
             allow_general_plans=cycle.include_general_planning,
+            expected_id_allocations=(
+                tuple(PlanIdAllocation(*item) for item in cycle.publication_id_allocations)
+                or None
+            ),
         )
     except PlannerValidationError as error:
         raise MaintenancePlanningError(

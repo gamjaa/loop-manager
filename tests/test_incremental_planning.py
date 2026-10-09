@@ -951,18 +951,30 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         )
         reused = self.repo / "docs/plans/[G-002] Reused.md"
         reused.write_text(plan_text("G-002", "Reused"), encoding="utf-8")
+        result = loop_manager.validate_planner_result(
+            self.repo,
+            commit,
+            loop_manager.changed_files(self.repo),
+            connection=self.connection,
+            repo=str(self.repo),
+            mutable_snapshot=snapshot,
+        )
 
-        with self.assertRaisesRegex(
-            loop_manager.PlannerValidationError, "취소된 ID를 재사용"
-        ):
-            loop_manager.validate_planner_result(
-                self.repo,
-                commit,
-                loop_manager.changed_files(self.repo),
-                connection=self.connection,
-                repo=str(self.repo),
-                mutable_snapshot=snapshot,
-            )
+        target = self.repo / "docs/plans/[G-004] Reused.md"
+        self.assertEqual(
+            [(path, plan["id"]) for path, plan in result.plans],
+            [("docs/plans/[G-004] Reused.md", "G-004")],
+        )
+        self.assertEqual(result.id_allocations[0].source_id, "G-002")
+        self.assertEqual(result.id_allocations[0].target_id, "G-004")
+        self.assertFalse(reused.exists())
+        self.assertTrue(target.is_file())
+        self.assertIsNotNone(
+            self.connection.execute(
+                "SELECT 1 FROM execplan_cancellations WHERE repo = ? AND plan_id = ?",
+                (str(self.repo), "G-002"),
+            ).fetchone()
+        )
 
     def test_product_and_architecture_changes_have_specification_fingerprints(self):
         original = loop_manager._specification_input_fingerprint(

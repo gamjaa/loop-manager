@@ -44,7 +44,8 @@ priority: normal
 ## Progress
 
 - [x] 2026-10-05 planning 기준 a049a76의 명세·원본·관련 테스트와 비종료 catalog에서 미충족 범위를 확인함. 구현·테스트 실행은 하지 않음.
-- [ ] 구현 및 관련 targeted unit 검증
+- [x] 2026-10-08 새 계획 batch의 ID/path·확정 dependency 정규화와 publication manifest의 배정 대응 검증을 구현하고 targeted unit case를 통과함. draft·기존 User Decision과 애매한 충돌 보존도 확인함.
+- [x] 구현 및 관련 targeted unit 검증
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log

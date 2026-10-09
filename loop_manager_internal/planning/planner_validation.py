@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.catalog import execplan_catalog, project_catalog_refresh
 from loop_manager_internal.catalog import execplan_drafts
-from loop_manager_internal.application.contracts import ValidatedPlanningResult
+from loop_manager_internal.application.contracts import PlanIdAllocation, ValidatedPlanningResult
 from loop_manager_internal.application.contracts import _FUTURE_IDEA_ITEM
 from loop_manager_internal.git.command_adapter import (
     ExternalObservationError, revision_document_or_none, revision_path_exists,
@@ -19,12 +19,14 @@ from loop_manager_internal.runtime.contracts import GitLockError
 from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.storage.planning_publication_state import _MUTABLE_READY_EVIDENCE_FIELDS
 from pathlib import Path
+import base64
 import hashlib
 import json
 import os
 import re
 import sqlite3
 import stat
+from uuid import uuid4
 
 
 def _regular_file_or_absent(path: Path) -> bool:
@@ -163,6 +165,736 @@ def _validate_future_idea_separation(
             )
 
 
+def _planning_id_inventory(
+    worktree: Path,
+    new_plan_paths: set[str],
+    snapshot: MutableReadySnapshot | None,
+    connection: sqlite3.Connection | None,
+    repo: str | None,
+    held_ids: frozenset[str],
+) -> tuple[set[str], set[str]]:
+    """Collect occupied IDs and actual plan identities before normalization."""
+    existing_plan_ids = (
+        {plan.plan_id for plan in snapshot.plans} if snapshot is not None else set()
+    )
+    reserved = existing_plan_ids | set(held_ids)
+    for relative_directory in ("docs/plans", "docs/plans/archive"):
+        directory = worktree / relative_directory
+        try:
+            paths = sorted(directory.glob("*.md"))
+        except OSError as error:
+            raise ExternalObservationError(
+                f"ExecPlan directory를 읽을 수 없습니다: {relative_directory}"
+            ) from error
+        for path in paths:
+            relative_path = path.relative_to(worktree).as_posix()
+            if relative_path in new_plan_paths:
+                continue
+            try:
+                if not stat.S_ISREG(path.lstat().st_mode):
+                    continue
+                text = path.read_text(encoding="utf-8")
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                raise ExternalObservationError(
+                    f"ExecPlan ID를 읽을 수 없습니다: {relative_path}"
+                ) from error
+            except UnicodeError:
+                # The full catalog validation below reports invalid encoding.
+                continue
+            try:
+                plan_id = execplan_catalog.parse_frontmatter(text).get("id")
+            except RuntimeError:
+                # The full catalog validation below reports malformed documents.
+                continue
+            if isinstance(plan_id, str) and re.fullmatch(r"G-\d{3,}", plan_id):
+                reserved.add(plan_id)
+                existing_plan_ids.add(plan_id)
+
+    if connection is not None and repo is not None:
+        tables = {
+            str(row[0])
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        for table in ("exec_plans", "execplan_cancellations", "manual_work_members"):
+            if table not in tables:
+                continue
+            for row in connection.execute(
+                f"SELECT plan_id FROM {table} WHERE repo = ?", (repo,)
+            ):
+                plan_id = str(row[0])
+                reserved.add(plan_id)
+                if table == "exec_plans":
+                    existing_plan_ids.add(plan_id)
+    return reserved, existing_plan_ids
+
+
+def _plan_id_normalization_journal_path(worktree: Path) -> Path:
+    identity = hashlib.sha256(str(worktree.resolve()).encode("utf-8")).hexdigest()
+    return worktree.parent / f".loop-manager-plan-id-{identity}.json"
+
+
+def _sync_normalization_directory(directory: Path) -> None:
+    if os.name == "nt":
+        return
+    descriptor = os.open(directory, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_plan_normalization_temp(path: Path, contents: bytes) -> None:
+    with path.open("xb") as stream:
+        written = stream.write(contents)
+        if written != len(contents):
+            raise OSError("short plan normalization write")
+        stream.flush()
+        os.fsync(stream.fileno())
+
+
+def _persist_plan_id_normalization_journal(
+    worktree: Path, journal: dict[str, object],
+) -> Path:
+    path = _plan_id_normalization_journal_path(worktree)
+    payload = json.dumps(journal, ensure_ascii=True, sort_keys=True).encode("utf-8")
+    temporary = path.with_name(f".{path.name}.{uuid4().hex}.tmp")
+    try:
+        with temporary.open("xb") as stream:
+            written = stream.write(payload)
+            if written != len(payload):
+                raise OSError("short plan normalization journal write")
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary, path)
+        _sync_normalization_directory(path.parent)
+    except OSError as error:
+        temporary.unlink(missing_ok=True)
+        raise ExternalObservationError(
+            f"새 ExecPlan 정규화 복구 정보를 보존할 수 없습니다: {error}"
+        ) from error
+    return path
+
+
+def _read_plan_id_normalization_journal(
+    worktree: Path, path: Path,
+) -> tuple[str, list[dict[str, object]]]:
+    try:
+        journal = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise PlannerValidationError(
+            "새 ExecPlan 정규화 복구 정보를 읽을 수 없습니다. 작업 공간을 보존했습니다."
+        ) from error
+    if (
+        not isinstance(journal, dict)
+        or journal.get("version") != 1
+        or journal.get("worktree") != str(worktree.resolve())
+        or not isinstance(journal.get("transaction"), str)
+        or re.fullmatch(r"[0-9a-f]{32}", journal["transaction"]) is None
+        or not isinstance(journal.get("plans"), list)
+        or not journal["plans"]
+        or not isinstance(journal.get("related", []), list)
+    ):
+        raise PlannerValidationError(
+            "새 ExecPlan 정규화 복구 정보의 identity가 유효하지 않습니다. 작업 공간을 보존했습니다."
+        )
+    transaction = journal["transaction"]
+    plans: list[dict[str, object]] = []
+    sources: set[str] = set()
+    targets: set[str] = set()
+    source_ids: set[str] = set()
+    target_ids: set[str] = set()
+    id_mapping: dict[str, str] = {}
+    for item in journal["plans"] + journal.get("related", []):
+        if not isinstance(item, dict) or set(item) != {
+            "kind", "source_path", "target_path", "original", "original_hash",
+            "output_hash", "mode", "temporary_path",
+        } or item.get("kind") not in {"new", "related"}:
+            raise PlannerValidationError(
+                "새 ExecPlan 정규화 복구 정보에 유효하지 않은 항목이 있습니다. 작업 공간을 보존했습니다."
+            )
+        source = item["source_path"]
+        target = item["target_path"]
+        temporary = item["temporary_path"]
+        source_match = (
+            re.fullmatch(r"docs/plans/\[(G-\d{3,})\] ([^/\\]+)\.md", source)
+            if isinstance(source, str) else None
+        )
+        target_match = (
+            re.fullmatch(r"docs/plans/\[(G-\d{3,})\] ([^/\\]+)\.md", target)
+            if isinstance(target, str) else None
+        )
+        if (
+            source_match is None
+            or target_match is None
+            or source_match.group(2) != target_match.group(2)
+            or not isinstance(temporary, str)
+            or re.fullmatch(
+                rf"docs/plans/\.plan-id-normalize-{transaction}-\d+\.tmp",
+                temporary,
+            ) is None
+            or source in sources
+            or target in targets
+            or (item["kind"] == "new" and (
+                source_match.group(1) in source_ids
+                or target_match.group(1) in target_ids
+            ))
+            or (item["kind"] == "related" and (
+                source != target or source_match.group(1) != target_match.group(1)
+            ))
+            or type(item["mode"]) is not int
+            or not 0 <= item["mode"] <= 0o7777
+        ):
+            raise PlannerValidationError(
+                "새 ExecPlan 정규화 복구 경로가 유효하지 않습니다. 작업 공간을 보존했습니다."
+            )
+        try:
+            original = base64.b64decode(item["original"], validate=True)
+        except (TypeError, ValueError) as error:
+            raise PlannerValidationError(
+                "새 ExecPlan 정규화 원본 복구 데이터가 유효하지 않습니다. 작업 공간을 보존했습니다."
+            ) from error
+        if (
+            not isinstance(item["original_hash"], str)
+            or hashlib.sha256(original).hexdigest() != item["original_hash"]
+            or not isinstance(item["output_hash"], str)
+            or re.fullmatch(r"[0-9a-f]{64}", item["output_hash"]) is None
+        ):
+            raise PlannerValidationError(
+                "새 ExecPlan 정규화 복구 hash가 유효하지 않습니다. 작업 공간을 보존했습니다."
+            )
+        try:
+            original_text = original.decode("utf-8")
+            metadata = execplan_catalog.parse_frontmatter(original_text)
+            if (
+                metadata.get("id") != source_match.group(1)
+                or metadata.get("title") != source_match.group(2)
+            ):
+                raise ValueError("source identity mismatch")
+        except (UnicodeError, RuntimeError, ValueError) as error:
+            raise PlannerValidationError(
+                "새 ExecPlan 정규화 원본 identity가 복구 정보와 다릅니다. 작업 공간을 보존했습니다."
+            ) from error
+        validated = dict(item)
+        validated["original_bytes"] = original
+        validated["source_id"] = source_match.group(1)
+        validated["target_id"] = target_match.group(1)
+        plans.append(validated)
+        sources.add(source)
+        targets.add(target)
+        if item["kind"] == "new":
+            source_ids.add(source_match.group(1))
+            target_ids.add(target_match.group(1))
+            id_mapping[source_match.group(1)] = target_match.group(1)
+    for item in plans:
+        try:
+            rewritten = _rewrite_plan_identity(
+                bytes(item["original_bytes"]).decode("utf-8"),
+                str(item["target_id"]),
+                id_mapping,
+                rewrite_id=str(item["kind"]) == "new",
+            ).encode("utf-8")
+        except (UnicodeError, PlannerValidationError) as error:
+            raise PlannerValidationError(
+                "새 ExecPlan 정규화 출력이 복구 정보와 일치하지 않습니다. 작업 공간을 보존했습니다."
+            ) from error
+        if hashlib.sha256(rewritten).hexdigest() != item["output_hash"]:
+            raise PlannerValidationError(
+                "새 ExecPlan 정규화 출력 hash가 복구 정보와 다릅니다. 작업 공간을 보존했습니다."
+            )
+    return transaction, plans
+
+
+def _recover_interrupted_plan_id_normalization(worktree: Path) -> set[str]:
+    """Restore originals and return journal-owned paths removed by recovery."""
+    journal_path = _plan_id_normalization_journal_path(worktree)
+    try:
+        journal_info = journal_path.lstat()
+    except FileNotFoundError:
+        return set()
+    except OSError as error:
+        raise ExternalObservationError(
+            f"새 ExecPlan 정규화 복구 정보를 확인할 수 없습니다: {error}"
+        ) from error
+    if not stat.S_ISREG(journal_info.st_mode):
+        raise PlannerValidationError(
+            "새 ExecPlan 정규화 복구 정보가 일반 파일이 아닙니다. 작업 공간을 보존했습니다."
+        )
+    _transaction, plans = _read_plan_id_normalization_journal(worktree, journal_path)
+    source_paths = {str(item["source_path"]) for item in plans}
+    outputs_by_path: dict[str, set[str]] = {}
+    for item in plans:
+        outputs_by_path.setdefault(str(item["target_path"]), set()).add(
+            str(item["output_hash"])
+        )
+
+    for item in plans:
+        temporary = worktree / str(item["temporary_path"])
+        try:
+            info = temporary.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise ExternalObservationError(
+                f"새 ExecPlan 정규화 임시 파일을 확인할 수 없습니다: {error}"
+            ) from error
+        if stat.S_ISDIR(info.st_mode):
+            raise PlannerValidationError(
+                "새 ExecPlan 정규화 임시 경로가 디렉터리입니다. 작업 공간을 보존했습니다."
+            )
+        temporary.unlink()
+
+    unexpected_targets: list[str] = []
+    for target in set(outputs_by_path) - source_paths:
+        path = worktree / target
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            raise ExternalObservationError(
+                f"새 ExecPlan 정규화 대상을 확인할 수 없습니다: {target} ({error})"
+            ) from error
+        if not stat.S_ISREG(info.st_mode) or hashlib.sha256(path.read_bytes()).hexdigest() not in outputs_by_path[target]:
+            unexpected_targets.append(target)
+            continue
+        path.unlink()
+        _sync_normalization_directory(path.parent)
+
+    for item in plans:
+        source = worktree / str(item["source_path"])
+        temporary = worktree / str(item["temporary_path"])
+        original = bytes(item["original_bytes"])
+        allowed_hashes = {str(item["original_hash"])} | outputs_by_path.get(
+            str(item["source_path"]), set()
+        )
+        try:
+            info = source.lstat()
+        except FileNotFoundError:
+            info = None
+        except OSError as error:
+            raise ExternalObservationError(
+                f"새 ExecPlan 정규화 원본을 확인할 수 없습니다: {item['source_path']} ({error})"
+            ) from error
+        if info is not None:
+            if not stat.S_ISREG(info.st_mode) or hashlib.sha256(source.read_bytes()).hexdigest() not in allowed_hashes:
+                raise PlannerValidationError(
+                    f"새 ExecPlan 정규화 원본이 예상과 달라 복구를 보류했습니다: {item['source_path']}"
+                )
+        _write_plan_normalization_temp(temporary, original)
+        os.chmod(temporary, int(item["mode"]))
+        os.replace(temporary, source)
+        _sync_normalization_directory(source.parent)
+
+    if unexpected_targets:
+        raise PlannerValidationError(
+            "새 ExecPlan 정규화 대상을 안전하게 복구할 수 없습니다: "
+            + ", ".join(sorted(unexpected_targets))
+        )
+    journal_path.unlink()
+    _sync_normalization_directory(journal_path.parent)
+    return ({str(item["temporary_path"]) for item in plans}
+            | (set(outputs_by_path) - source_paths))
+
+
+def _rewrite_plan_identity(
+    text: str, plan_id: str | None, dependency_ids: dict[str, str], *,
+    rewrite_id: bool = True,
+) -> str:
+    """Change only frontmatter identity and structural dependency list entries."""
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].rstrip("\r\n") != "---":
+        raise PlannerValidationError("ExecPlan frontmatter를 정규화할 수 없습니다.")
+    in_dependencies = False
+    replaced_id = False
+    for index in range(1, len(lines)):
+        line = lines[index]
+        content = line.rstrip("\r\n")
+        ending = line[len(content):]
+        if content == "---":
+            break
+        if in_dependencies and content.startswith("  - "):
+            dependency = content[4:].strip()
+            if dependency in dependency_ids:
+                lines[index] = f"  - {dependency_ids[dependency]}{ending}"
+            continue
+        in_dependencies = False
+        if ":" not in content:
+            continue
+        key, raw_value = content.split(":", 1)
+        if key.strip() == "id" and rewrite_id:
+            match = re.fullmatch(r"(\s*)G-\d{3,}(\s*)", raw_value)
+            if match is None:
+                raise PlannerValidationError("ExecPlan ID 항목을 정규화할 수 없습니다.")
+            lines[index] = f"{key}:{match.group(1)}{plan_id}{match.group(2)}{ending}"
+            replaced_id = True
+            continue
+        if key.strip() == "depends_on" and not raw_value.strip():
+            in_dependencies = True
+    if rewrite_id and not replaced_id:
+        raise PlannerValidationError("ExecPlan ID 항목을 정규화할 수 없습니다.")
+    return "".join(lines)
+
+
+def _execplan_body(text: str) -> str:
+    lines = text.splitlines(keepends=True)
+    for index, line in enumerate(lines[1:], start=1):
+        if line.rstrip("\r\n") == "---":
+            return "".join(lines[index + 1:])
+    raise PlannerValidationError("ExecPlan frontmatter 종료 구분자를 찾을 수 없습니다.")
+
+
+def _normalize_new_plan_batch(
+    worktree: Path,
+    plans: list[tuple[str, dict[str, object]]],
+    reserved_ids: set[str],
+    existing_plan_ids: set[str],
+    parse_execplan: Callable[..., object],
+    related_plans: tuple[tuple[str, dict[str, object]], ...] = (),
+) -> tuple[list[tuple[str, dict[str, object]]], tuple[PlanIdAllocation, ...]]:
+    """Assign new plans a fresh consecutive range and rewrite only certain edges."""
+    _recover_interrupted_plan_id_normalization(worktree)
+    if not plans:
+        return [], ()
+    claimed = [str(plan["id"]) for _path, plan in plans]
+    if len(claimed) != len(set(claimed)):
+        raise PlannerValidationError(
+            "새 ExecPlan batch에 같은 ID가 여러 목표로 중복돼 assignment가 모호합니다."
+        )
+
+    ordered = sorted(plans, key=lambda item: (int(str(item[1]["id"])[2:]), item[0]))
+    first_number = max((int(plan_id[2:]) for plan_id in reserved_ids), default=0) + 1
+    id_mapping = {
+        str(plan["id"]): f"G-{first_number + index:03d}"
+        for index, (_path, plan) in enumerate(ordered)
+    }
+    collisions = set(id_mapping) & reserved_ids
+    changed_ids = {
+        source_id for source_id, target_id in id_mapping.items()
+        if source_id != target_id
+    }
+    batch_ids = set(claimed)
+    original_files: dict[str, tuple[bytes, int, str]] = {}
+    related_files: dict[str, tuple[bytes, int, str]] = {}
+    related_texts: dict[str, str] = {}
+    for path, plan in ordered:
+        dependencies = {str(item) for item in plan["depends_on"]}
+        ambiguous = sorted(dependencies & collisions)
+        if ambiguous:
+            raise PlannerValidationError(
+                "새 batch dependency가 기존 ID와 충돌 ID를 함께 가리켜 모호합니다: "
+                f"{path} -> {', '.join(ambiguous)}"
+            )
+        missing = sorted(
+            dependencies - batch_ids - existing_plan_ids
+        )
+        if missing:
+            raise PlannerValidationError(
+                "새 ExecPlan dependency 대상이 없습니다. "
+                "존재하지 않는 depends_on ID: "
+                f"{path} -> {', '.join(missing)}"
+            )
+        try:
+            source = worktree / path
+            info = source.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                raise PlannerValidationError(
+                    f"새 ExecPlan은 symlink가 아닌 일반 파일이어야 합니다: {path}"
+                )
+            original_bytes = source.read_bytes()
+            original_text = original_bytes.decode("utf-8")
+            original_files[path] = (
+                original_bytes, stat.S_IMODE(info.st_mode), original_text,
+            )
+            body = _execplan_body(original_text)
+        except FileNotFoundError as error:
+            raise ExternalObservationError(
+                f"새 ExecPlan ID 참조를 읽을 수 없습니다: {path}"
+            ) from error
+        except OSError as error:
+            raise ExternalObservationError(
+                f"새 ExecPlan ID 참조를 읽을 수 없습니다: {path}"
+            ) from error
+        except UnicodeError as error:
+            raise PlannerValidationError(
+                f"새 ExecPlan ID 참조가 UTF-8이 아닙니다: {path}"
+            ) from error
+        references = sorted(
+            plan_id for plan_id in changed_ids
+            if re.search(rf"(?<![A-Za-z0-9]){re.escape(plan_id)}(?!\d)", body)
+        )
+        if references:
+            raise PlannerValidationError(
+                "새 ID를 바꾸면 ExecPlan 본문 참조 대상을 확정할 수 없습니다: "
+                f"{path} -> {', '.join(references)}"
+            )
+
+    for path, plan in related_plans:
+        dependencies = {str(item) for item in plan["depends_on"]}
+        ambiguous = sorted(dependencies & collisions)
+        if ambiguous:
+            raise PlannerValidationError(
+                "수정 계획 dependency가 기존 ID와 충돌 ID를 함께 가리켜 모호합니다: "
+                f"{path} -> {', '.join(ambiguous)}"
+            )
+        missing = sorted(dependencies - batch_ids - existing_plan_ids)
+        if missing:
+            raise PlannerValidationError(
+                "수정 ExecPlan dependency 대상이 없습니다. "
+                "존재하지 않는 depends_on ID: "
+                f"{path} -> {', '.join(missing)}"
+            )
+        try:
+            source = worktree / path
+            info = source.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                raise PlannerValidationError(
+                    f"기존 ExecPlan은 symlink가 아닌 일반 파일이어야 합니다: {path}"
+                )
+            original_bytes = source.read_bytes()
+            original_text = original_bytes.decode("utf-8")
+            body = _execplan_body(original_text)
+            related_files[path] = (
+                original_bytes, stat.S_IMODE(info.st_mode), original_text,
+            )
+        except FileNotFoundError as error:
+            raise ExternalObservationError(
+                f"수정 ExecPlan ID 참조를 읽을 수 없습니다: {path}"
+            ) from error
+        except OSError as error:
+            raise ExternalObservationError(
+                f"수정 ExecPlan ID 참조를 읽을 수 없습니다: {path}"
+            ) from error
+        except UnicodeError as error:
+            raise PlannerValidationError(
+                f"수정 ExecPlan ID 참조가 UTF-8이 아닙니다: {path}"
+            ) from error
+        references = sorted(
+            plan_id for plan_id in changed_ids
+            if re.search(rf"(?<![A-Za-z0-9]){re.escape(plan_id)}(?!\d)", body)
+        )
+        if references:
+            raise PlannerValidationError(
+                "새 ID를 바꾸면 수정 ExecPlan 본문 참조 대상을 확정할 수 없습니다: "
+                f"{path} -> {', '.join(references)}"
+            )
+        updated_text = _rewrite_plan_identity(
+            original_text, None, id_mapping, rewrite_id=False,
+        )
+        if updated_text != original_text:
+            related_texts[path] = updated_text
+
+    allocations: list[PlanIdAllocation] = []
+    normalized: list[tuple[str, dict[str, object]]] = []
+    source_paths = {path for path, _plan in ordered}
+    moves: dict[str, str] = {}
+    for source_path, plan in ordered:
+        old_id = str(plan["id"])
+        new_id = id_mapping[old_id]
+        target_path = f"docs/plans/[{new_id}] {plan['title']}.md"
+        destination = worktree / target_path
+        if (target_path != source_path and os.path.lexists(destination)
+                and target_path not in source_paths):
+            raise PlannerValidationError(
+                f"새 ExecPlan 대상 경로가 이미 있어 보존했습니다: {target_path}"
+            )
+        if target_path != source_path:
+            moves[source_path] = target_path
+    if any(
+        target in source_paths and target not in moves
+        for target in moves.values()
+    ):
+        raise PlannerValidationError(
+            "새 ExecPlan 대상 경로가 batch의 기존 계획 파일과 충돌합니다."
+        )
+    transaction = uuid4().hex
+    journal_plans: list[dict[str, object]] = []
+    journal_related: list[dict[str, object]] = []
+    updated_texts: dict[str, str] = {}
+    temporary_paths: dict[str, Path] = {}
+    for index, (source_path, plan) in enumerate(ordered):
+        old_id = str(plan["id"])
+        new_id = id_mapping[old_id]
+        target_path = f"docs/plans/[{new_id}] {plan['title']}.md"
+        original_bytes, mode, original_text = original_files[source_path]
+        try:
+            updated_text = _rewrite_plan_identity(original_text, new_id, id_mapping)
+        except UnicodeError as error:
+            raise PlannerValidationError(
+                f"새 ExecPlan UTF-8 내용을 정규화할 수 없습니다: {source_path}"
+            ) from error
+        updated_bytes = updated_text.encode("utf-8")
+        updated_texts[target_path] = updated_text
+        temporary_relative = f"docs/plans/.plan-id-normalize-{transaction}-{index}.tmp"
+        temporary_paths[target_path] = worktree / temporary_relative
+        journal_plans.append({
+            "kind": "new",
+            "source_path": source_path,
+            "target_path": target_path,
+            "original": base64.b64encode(original_bytes).decode("ascii"),
+            "original_hash": hashlib.sha256(original_bytes).hexdigest(),
+            "output_hash": hashlib.sha256(updated_bytes).hexdigest(),
+            "mode": mode,
+            "temporary_path": temporary_relative,
+        })
+
+    for index, path in enumerate(sorted(related_texts), start=len(journal_plans)):
+        original_bytes, mode, original_text = related_files[path]
+        updated_bytes = related_texts[path].encode("utf-8")
+        temporary_relative = f"docs/plans/.plan-id-normalize-{transaction}-{index}.tmp"
+        temporary_paths[path] = worktree / temporary_relative
+        updated_texts[path] = related_texts[path]
+        journal_related.append({
+            "kind": "related",
+            "source_path": path,
+            "target_path": path,
+            "original": base64.b64encode(original_bytes).decode("ascii"),
+            "original_hash": hashlib.sha256(original_bytes).hexdigest(),
+            "output_hash": hashlib.sha256(updated_bytes).hexdigest(),
+            "mode": mode,
+            "temporary_path": temporary_relative,
+        })
+
+    changed = any(
+        item["source_path"] != item["target_path"]
+        or hashlib.sha256(
+            (original_files | related_files)[str(item["source_path"])][0]
+        ).hexdigest()
+            != str(item["output_hash"])
+        for item in journal_plans + journal_related
+    )
+    journal_path = None
+    if changed:
+        journal_path = _persist_plan_id_normalization_journal(
+            worktree,
+            {"version": 1, "worktree": str(worktree.resolve()),
+             "transaction": transaction, "plans": journal_plans,
+             "related": journal_related},
+        )
+    try:
+        if changed:
+            all_journal_items = journal_plans + journal_related
+            all_original_files = original_files | related_files
+            for item in all_journal_items:
+                target_path = str(item["target_path"])
+                original_bytes, mode, _text = all_original_files[str(item["source_path"])]
+                if (
+                    str(item["source_path"]) == target_path
+                    and hashlib.sha256(original_bytes).hexdigest() == str(item["output_hash"])
+                ):
+                    continue
+                temporary = temporary_paths[target_path]
+                _write_plan_normalization_temp(
+                    temporary, updated_texts[target_path].encode("utf-8"),
+                )
+                os.chmod(temporary, mode)
+
+            for item in all_journal_items:
+                source = worktree / str(item["source_path"])
+                try:
+                    info = source.lstat()
+                except OSError as error:
+                    raise ExternalObservationError(
+                        f"새 ExecPlan 정규화 원본을 다시 확인할 수 없습니다: {item['source_path']}"
+                    ) from error
+                if not stat.S_ISREG(info.st_mode):
+                    raise PlannerValidationError(
+                        f"새 ExecPlan 정규화 중 원본 파일 종류가 변경됐습니다: {item['source_path']}"
+                    )
+                try:
+                    current_hash = hashlib.sha256(source.read_bytes()).hexdigest()
+                except OSError as error:
+                    raise ExternalObservationError(
+                        f"새 ExecPlan 정규화 원본을 다시 읽을 수 없습니다: {item['source_path']}"
+                    ) from error
+                if current_hash != item["original_hash"]:
+                    raise PlannerValidationError(
+                        f"새 ExecPlan 정규화 중 원본이 변경됐습니다: {item['source_path']}"
+                    )
+
+            all_source_paths = source_paths | set(related_texts)
+            unchanged_paths = {
+                str(item["source_path"])
+                for item in all_journal_items
+                if (
+                    item["source_path"] == item["target_path"]
+                    and item["original_hash"] == item["output_hash"]
+                )
+            }
+            for source_path in sorted(all_source_paths - unchanged_paths):
+                (worktree / source_path).unlink()
+                _sync_normalization_directory((worktree / source_path).parent)
+            for item in all_journal_items:
+                source_path = str(item["source_path"])
+                target_path = str(item["target_path"])
+                original_bytes = all_original_files[source_path][0]
+                if (
+                    source_path == target_path
+                    and hashlib.sha256(original_bytes).hexdigest() == str(item["output_hash"])
+                ):
+                    continue
+                staged = temporary_paths[target_path]
+                destination = worktree / target_path
+                if source_path == target_path:
+                    os.replace(staged, destination)
+                else:
+                    # link creates the complete staged file atomically and
+                    # fails if another writer claimed the target meanwhile.
+                    os.link(staged, destination)
+                    staged.unlink()
+                _sync_normalization_directory(destination.parent)
+
+        normalized: list[tuple[str, dict[str, object]]] = []
+        allocations: list[PlanIdAllocation] = []
+        for source_path, plan in ordered:
+            old_id = str(plan["id"])
+            new_id = id_mapping[old_id]
+            target_path = f"docs/plans/[{new_id}] {plan['title']}.md"
+            try:
+                updated_plan = dict(parse_execplan(
+                    worktree,
+                    worktree / target_path,
+                    require_priority=True,
+                    allow_archive_fallback=False,
+                ))
+            except (OSError, UnicodeError, RuntimeError) as error:
+                if isinstance(error, (ExternalObservationError, GitLockError)):
+                    raise
+                raise PlannerValidationError(
+                    f"정규화된 ExecPlan을 다시 읽을 수 없습니다: {target_path} ({error})"
+                ) from error
+            if (
+                str(updated_plan.get("id")) != new_id
+                or tuple(str(item) for item in updated_plan.get("depends_on", ()))
+                != tuple(id_mapping.get(str(item), str(item)) for item in plan["depends_on"])
+            ):
+                raise PlannerValidationError(
+                    f"정규화된 ExecPlan identity가 배정 결과와 다릅니다: {target_path}"
+                )
+            normalized.append((target_path, updated_plan))
+            allocations.append(PlanIdAllocation(source_path, old_id, target_path, new_id))
+        if journal_path is not None:
+            journal_path.unlink()
+            _sync_normalization_directory(journal_path.parent)
+        return normalized, tuple(allocations)
+    except BaseException as error:
+        if journal_path is not None:
+            try:
+                _recover_interrupted_plan_id_normalization(worktree)
+            except BaseException as recovery_error:
+                raise ExternalObservationError(
+                    "새 ExecPlan 정규화 실패 후 원본 복구에 실패했습니다. 작업 공간과 복구 정보를 보존했습니다."
+                ) from recovery_error
+        if isinstance(error, OSError):
+            raise ExternalObservationError(
+                f"새 ExecPlan batch를 원자적으로 정규화할 수 없습니다: {error}"
+            ) from error
+        raise
+
+
 @dataclass(frozen=True)
 class ValidatePlannerResultEffects:
     """Named effects for validate_planner_result; no entry-point/module access."""
@@ -192,13 +924,14 @@ def validate_planner_result(
     dedicated exception. Operational Git failures must retain their normal
     recovery boundary and never consume the Planner validation retry budget.
     """
+    recovered_paths = _recover_interrupted_plan_id_normalization(worktree)
     # A resumed batch can still have Manager moves in the index/worktree.
     # Saved dirty paths are hints, not proof that a receipted move exists.
     observed = (set(effects.changed_files(worktree, active_sha))
                 | set(effects.changed_files(worktree)))
     if not set(manager_paths) <= observed:
         raise PlannerValidationError("Manager Requirement 이동 영수증이 실제 변경과 다릅니다.")
-    planned_files = sorted((observed | set(dirty_files)) - set(manager_paths))
+    planned_files = sorted((observed | (set(dirty_files) - recovered_paths)) - set(manager_paths))
     if not planned_files:
         return None
     snapshot = mutable_snapshot or MutableReadySnapshot(
@@ -238,14 +971,27 @@ def validate_planner_result(
                     f"{changed_path}"
                 )
             base_paths.add(changed_path)
-        if not _regular_file_or_absent(worktree / changed_path):
+        plan_file = worktree / changed_path
+        try:
+            file_info = plan_file.lstat()
+        except FileNotFoundError:
+            file_info = None
+        except OSError as error:
+            raise ExternalObservationError(
+                f"Planner ExecPlan 경로를 확인할 수 없습니다: {changed_path}"
+            ) from error
+        if file_info is not None and not stat.S_ISREG(file_info.st_mode):
+            raise PlannerValidationError(
+                f"Planner ExecPlan은 symlink가 아닌 일반 파일이어야 합니다: {changed_path}"
+            )
+        if file_info is None:
             plan_paths.append(changed_path)
             continue
         try:
-            planner_text = (worktree / changed_path).read_text(encoding="utf-8")
+            planner_text = plan_file.read_text(encoding="utf-8")
             parsed = effects._parse_execplan(
                 worktree,
-                worktree / changed_path,
+                plan_file,
                 require_priority=not existed,
                 allow_archive_fallback=False,
             )
@@ -263,11 +1009,6 @@ def validate_planner_result(
                 verify_input_requests.validate(connection, repo, planner_text, parsed["sources"])
             except RuntimeError as error:
                 raise PlannerValidationError(str(error)) from error
-        try:
-            original = snapshot.by_id.get(str(parsed["id"]))
-            execplan_drafts.validate_agent_change(parsed, original.text if original else None)
-        except RuntimeError as error:
-            raise PlannerValidationError(str(error)) from error
         current_plans[changed_path] = parsed
         plan_paths.append(changed_path)
 
@@ -279,27 +1020,6 @@ def validate_planner_result(
         changed_ids = {str(plan["id"]) for plan in current_plans.values()}
         recovery_ids = {key for raw in snapshot.recovery_goals for key in json.loads(raw)["affected_ids"]} & snapshot.by_id.keys() & changed_ids
         unresolved_holds = held_ids - recovery_ids
-        withheld_ids = frozenset()
-        if held_ids:
-            project_catalog_refresh.assert_planning_dependencies_unheld(
-                {}, current_plans.items(), unresolved_holds)
-            local = project_catalog_refresh.validated_held_planning_snapshot(
-                connection, repo, worktree, active_sha, git=effects.git,
-                load_snapshot=execplan_catalog.load_execplan_snapshot,
-                mutable_paths=frozenset(plan.path for plan in snapshot.plans if plan.plan_id in recovery_ids),
-                recovery_mode=bool(snapshot.recovery_goals))
-            catalog = local.active_metadata()
-            withheld_ids = local.withheld_ids
-        else:
-            catalog = effects.load_execplan_catalog(worktree)
-        if connection is not None and repo is not None:
-            from loop_manager_internal.storage import execplan_draft_state
-            execplan_draft_state.validate_questions(connection, repo, catalog)
-        else:
-            execplan_drafts.validate_questions(catalog)
-        project_catalog_refresh.assert_planning_dependencies_unheld(
-            catalog, current_plans.items(), unresolved_holds)
-        remote_deletions.validate_recovery(worktree, snapshot, current_plans, catalog)
         plans: list[tuple[str, dict[str, object]]] = []
         revisions: list[PlanRevision] = []
         deletions: list[PlanDeletion] = []
@@ -319,18 +1039,93 @@ def validate_planner_result(
             plan_id = str(parsed["id"])
             path_identity = snapshot.by_path.get(path)
             if path_identity is not None and plan_id == path_identity.plan_id:
+                try:
+                    execplan_drafts.validate_agent_change(parsed, path_identity.text)
+                except RuntimeError as error:
+                    raise PlannerValidationError(str(error)) from error
                 revisions.append(PlanRevision(path, parsed, path_identity))
                 continue
             original = snapshot.by_id.get(plan_id)
-            if original is not None:
-                if original.path not in displaced_paths or plan_id in renamed_ids:
+            if original is not None and original.path in displaced_paths:
+                if plan_id in renamed_ids:
                     raise RuntimeError(
                         f"ExecPlan rename identity가 모호합니다: {plan_id}"
                     )
+                try:
+                    execplan_drafts.validate_agent_change(parsed, original.text)
+                except RuntimeError as error:
+                    raise PlannerValidationError(str(error)) from error
                 revisions.append(PlanRevision(path, parsed, original))
                 renamed_ids.add(plan_id)
             else:
+                try:
+                    execplan_drafts.validate_agent_change(parsed)
+                except RuntimeError as error:
+                    raise PlannerValidationError(str(error)) from error
                 plans.append((path, parsed))
+
+        new_source_paths = {path for path, _plan in plans}
+        reserved_before_normalization, existing_plan_ids = _planning_id_inventory(
+            worktree, new_source_paths, snapshot, connection, repo, held_ids
+        )
+        if plans:
+            plans, id_allocations = _normalize_new_plan_batch(
+                worktree, plans, reserved_before_normalization, existing_plan_ids,
+                effects._parse_execplan,
+                related_plans=tuple(
+                    (revision.path, dict(revision.plan)) for revision in revisions
+                ),
+            )
+        else:
+            id_allocations = ()
+        if id_allocations:
+            for path in new_source_paths:
+                current_plans.pop(path, None)
+            current_plans.update(plans)
+            planned_files = sorted(
+                (set(planned_files) - new_source_paths)
+                | {path for path, _plan in plans}
+            )
+            normalized_revisions: list[PlanRevision] = []
+            for revision in revisions:
+                try:
+                    parsed = effects._parse_execplan(
+                        worktree, worktree / revision.path,
+                        require_priority=False, allow_archive_fallback=False,
+                    )
+                except RuntimeError as error:
+                    if isinstance(error, (ExternalObservationError, GitLockError)):
+                        raise
+                    raise PlannerValidationError(
+                        f"정규화된 ExecPlan을 다시 읽을 수 없습니다: {revision.path} ({error})"
+                    ) from error
+                current_plans[revision.path] = parsed
+                normalized_revisions.append(
+                    PlanRevision(revision.path, parsed, revision.snapshot)
+                )
+            revisions = normalized_revisions
+        if held_ids:
+            project_catalog_refresh.assert_planning_dependencies_unheld(
+                {}, current_plans.items(), unresolved_holds
+            )
+
+        if held_ids:
+            local = project_catalog_refresh.validated_held_planning_snapshot(
+                connection, repo, worktree, active_sha, git=effects.git,
+                load_snapshot=execplan_catalog.load_execplan_snapshot,
+                mutable_paths=frozenset(plan.path for plan in snapshot.plans if plan.plan_id in recovery_ids),
+                recovery_mode=bool(snapshot.recovery_goals))
+            catalog = local.active_metadata()
+        else:
+            catalog = effects.load_execplan_catalog(worktree)
+        if connection is not None and repo is not None:
+            from loop_manager_internal.storage import execplan_draft_state
+            execplan_draft_state.validate_questions(connection, repo, catalog)
+        else:
+            execplan_drafts.validate_questions(catalog)
+        project_catalog_refresh.assert_planning_dependencies_unheld(
+            catalog, current_plans.items(), unresolved_holds)
+        remote_deletions.validate_recovery(worktree, snapshot, current_plans, catalog)
 
         for path in sorted(displaced_paths):
             original = snapshot.by_path[path]
@@ -362,26 +1157,9 @@ def validate_planner_result(
         new_plan_paths = [path for path, _plan in plans]
         effects._validate_future_idea_separation(worktree, active_sha, new_plan_paths)
         new_ids = {str(plan["id"]) for _, plan in plans}
-        reserved_ids = (set(catalog) | withheld_ids) - new_ids
-        reserved_ids.update(plan.plan_id for plan in snapshot.plans)
-        if connection is not None and repo is not None:
-            reserved_ids.update(
-                str(row[0])
-                for row in connection.execute(
-                    "SELECT plan_id FROM exec_plans WHERE repo = ? "
-                    "UNION SELECT plan_id FROM execplan_cancellations WHERE repo = ?",
-                    (repo, repo),
-                )
-            )
-            if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='manual_work_members'").fetchone():
-                reserved_ids.update(row[0] for row in connection.execute(
-                    'SELECT plan_id FROM manual_work_members WHERE repo=?', (repo,)))
-        archived_directory = worktree / "docs/plans/archive"
-        if archived_directory.is_dir():
-            for archived in archived_directory.glob("*.md"):
-                match = re.match(r"\[(G-\d{3,})\]", archived.name)
-                if match is not None:
-                    reserved_ids.add(match.group(1))
+        reserved_ids, _existing_plan_ids = _planning_id_inventory(
+            worktree, set(new_plan_paths), snapshot, connection, repo, held_ids
+        )
         if new_ids & reserved_ids:
             raise RuntimeError(
                 "새 ExecPlan ID가 기존 또는 취소된 ID를 재사용합니다: "
@@ -403,6 +1181,7 @@ def validate_planner_result(
                 for path in planned_files
                 if _regular_file_or_absent(worktree / path)
             ),
+            id_allocations=id_allocations,
             revisions=tuple(
                 sorted(revisions, key=lambda item: int(item.snapshot.plan_id[2:]))
             ),
