@@ -6,6 +6,7 @@ sources:
   - docs/requirements/[R-010] Origin-Isolated Local Worktree Operation.md
   - docs/requirements/[R-023] Self-Hosted Runtime Refresh Handoff.md
   - docs/requirements/[R-056] Non-Blocking Local Base Synchronization.md
+  - docs/requirements/[R-059] Safe Python Bytecode Cache Use.md
 depends_on:
   - G-012
   - G-161
@@ -31,6 +32,7 @@ draft: true
 ## Acceptance Criteria
 
 - 사용자가 R-056의 legacy 기본 checkout 복원 불요와 R-023의 격리 증거 없는 실행의 엄격 감시가 함께 적용될 범위를 활성 Requirement에 명시하고, 해당 근거에 결합된 이 draft의 질문에 답한다. 자동 Agent가 결정이나 draft 해제를 작성하지 않는다.
+- 같은 결정이 R-059의 일곱 번째 기준에서 참조하는 로컬 base·기본 checkout 비교 제외에도 적용되는지 관련 활성 Requirement에 명시한다. cache 허용이나 계측 결과를 legacy 범위 완화의 근거로 사용하지 않으며 캐시 구현·측정은 이 계획에 추가하지 않는다.
 - 확정 정책은 현재 Agent 결과와 저장된 PLAN_BLOCKED·PROJECT_BLOCKED 재평가에 일관되게 적용된다. 기본 checkout의 파일·index·HEAD·로컬 base ref, 다른 worktree·shared ref와 선택 작업의 소유 자원을 구분하며 실제 Agent 쓰기를 외부 사용자 변화로 추정해 승인하지 않는다.
 - 재개가 허용되면 현재 repository·선택 worktree·소유 branch·원격 기대값·범위와 실행 자리를 검증하고 해당 원인만 처리한다. 허용되지 않거나 증거가 부족하면 작업물·원본 snapshot·결과·session·실패 및 승인 감사를 보존하고 필요한 증거와 조치를 구체적으로 알린다. 과거 실행에 격리·검증 성공을 합성하지 않는다.
 - 로컬 상태 복원·reset·clean·stash·사용자 lock 제거와 포괄적인 ref/worktree 기준선 교체를 하지 않는다. 후보가 바뀐 재개는 기존 targeted test·Manager verify·Review와 게시 lease를 통과하며 별도 차단·dependency·사용자 결정을 유지한다.
@@ -55,6 +57,8 @@ draft: true
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- 2026-10-09 delta 기준 b29bb81c9c3c76cc196b30fd04eed1f52a02d6fa, mutable READY token d249095f1d5c09428e872445c00ba5d442b3732eb5ea3eef1ecbf3c2a5833dac와 원본 hash cd18da799d1082dac4b5fc31e757f275ab6e36f26482d556284c8455cdaba71e를 확인했다. R-059 전체 기준 검토에서 AC 7의 R-056 참조에도 기존 legacy 비교 질문이 적용됨을 확인해 같은 ID에 source·정합성 확인만 연결한다. 기존 질문·Facts·Options·Impact·draft 대기·dependency·complexity medium·risk high·priority high를 보존하며 사용자 선택·승인·해제를 작성하지 않는다. source 변경에 결합된 최신 판단 revision은 Manager가 생성한다. 캐시 측정은 독립 계획이며 정책 선택 전 legacy 구현은 계속 보류한다. 구현·테스트·검증 성공을 만들지 않았다.
 
 - G-161의 Merge로 원격 runtime 선택·보존형 로컬 동기화는 구현됐으나 legacy source 변화의 귀속은 바뀌지 않았다. `tests/test_scope_block_revalidation.py`는 격리 증거 없는 같은 source 변화 차단을 유지하도록 명시적으로 검증한다. 구현 누락으로 단정해 검사를 제거하거나 충족으로 감추지 않는다.
 - complexity medium: 결정 후 비교·복구 경계는 기존 모듈과 원인별 판정으로 한정된다. 정책 모호함은 높은 effort로 해결하지 않는다. risk high: 잘못된 완화가 증거 없는 범위 밖 쓰기나 저장 차단을 승인할 수 있어 수동 감사·차단 재설정·보존 worktree 복구가 필요하다. 원본 증거 보존과 실제 위반 혼합 거부를 Acceptance Criteria·Validation·Review에 포함하며 외부 쓰기를 코드 rollback으로 되돌린다고 가정하지 않는다.

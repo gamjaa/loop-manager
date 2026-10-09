@@ -3,6 +3,7 @@ id: G-066
 title: Minimal Worker Session Prompts
 sources:
   - docs/PRODUCT.md
+  - docs/requirements/[R-003] Targeted Worker Unit Tests.md
   - docs/requirements/[R-033] Minimal Worker Session Prompts.md
   - docs/requirements/[R-064] 모델 호출을 통한 공통 Agent 지침 전달.md
   - docs/requirements/[R-066] AGENTS 변경 사전 승인.md
@@ -67,6 +68,7 @@ priority: low
 
 ## Validation
 
+- R-003의 Worker 경계는 실제 `worker_prompt`를 사용한 호출의 common+worker instruction과 사용자 메시지를 각각 검사한다. 최소 test case/class/module, 실패 뒤 동일 command 재실행, 문서·설정/관련 unit 부재의 구체적 사유와 전체 검증 금지는 고정 instruction에 유지하고 사용자 메시지의 중복을 제거한다. `tests/test_loop_manager.py`의 Worker prompt에 정적 규칙을 요구하는 assertion을 instruction 전달 검사로 옮기며, `tests/test_agent_invocation.py`의 임의 `delta only` fixture만으로 실제 prompt의 중복 부재를 확정하지 않는다. Reviewer prompt 교정은 별도 담당 계획에 남긴다.
 - Worker는 `tests/test_execution_worker_phase.py`의 prompt·fallback, `tests/test_worker_session.py`의 전이 및 `tests/test_validation_feedback_state.py`의 전달 확인·재개 중 변경한 경계의 최소 targeted unit case만 실행한다. `tests/support/execution.py`의 기존 fixture·Agent double을 재사용한다. 기존 재개 prompt의 역할 반복과 복구 prompt의 이전 결과 포함을 요구하는 assertion은 이 계획의 초기 전달·delta·최소 복구 계약에 맞춰 갱신한다.
 - 최초 turn, 같은 세션의 일반 수정·effort 변경·verify·Review 교정, archive·비검증 오류 변경 및 두 채널 중복 방지, resolved provider·Model 교체·legacy 복구·session-unavailable fallback을 검증한다. 루트 지침 관리 prompt 부재와 고정된 역할 instruction·Ponytail의 재사용, 사용자 메시지의 정적 규칙 중복 부재도 확인한다. 기존 `tests/test_agent_invocation.py`·`tests/test_provider_runtime.py`의 호출 fixture를 재사용하며 실제 Agent를 호출하지 않는다.
 - session 시작 직후 timeout, 잘못된 Worker 결과, fallback 시작 실패, 전달 확인 전후 중단·재시작·저장 실패와 호출 뒤 새 revision 발생에서 미확인 내용이 누락되지 않고 확인된 동일 내용을 반복하지 않는지 검증한다. 비밀값 가림과 승인 문맥은 `tests/test_validation_feedback.py`·`tests/test_execution_guidance.py`, 결과 형식은 `tests/test_worker_result_contract.py`의 직접 관련 case를 변경 시 연결한다.
@@ -84,6 +86,8 @@ priority: low
 - [ ] 관련 targeted 회귀 사례 추가
 
 ## Decision Log
+
+- 2026-10-09 delta 기준 b29bb81c9c3c76cc196b30fd04eed1f52a02d6fa, mutable READY token d249095f1d5c09428e872445c00ba5d442b3732eb5ea3eef1ecbf3c2a5833dac와 원본 hash 82d08b12f5b8797a95e26c3de9c9a976eb86386e2ca90fc395b3cf0f13faa0dd를 대조했다. G-197의 검증 근거 전달은 Merge됐지만 실제 Worker prompt와 PublicFacadeTest는 정적 테스트 규칙의 중복을 유지한다. 이 계획의 기존 첫 Acceptance Criterion이 이미 담당하는 제거 목표에 활성 R-003 source와 실제 호출 검증만 연결한다. ID·Purpose·기존 dependency·complexity high·risk medium·priority low와 초기/delta/복구 범위를 보존하며 Reviewer 교정을 추가 구현하지 않는다. 구현·테스트 실행 및 Requirement 충족·자동 검증 성공을 기록하지 않았다.
 
 - 2026-10-08 기준 a3ce7f88cef4cd46b34e0ead46ec5472fb5bd6f7, mutable READY token c309db89ee1035657daf102b0381c0ca72de2235143e2e7bbded9eede0b66e3a와 원본 hash 2a30673ba81e224490cd6803fa0f42f67f71cfeb766e7afe81c678418e4d8df6을 대조했다. 현재 R-066·R-064·PRODUCT와 tests/test_execution_guidance.py·test_planning_fingerprint.py는 CLI 루트 지침의 읽기·승인·patch 관리를 제거한다. 이 때문에 폐지된 파일 재승인 lifecycle의 G-173은 최소 prompt 구현의 선행 목표가 아니므로 dependency와 해당 전용 전달 요구만 제거한다. 일반 User Decision·실행 권한·고정 instruction·과거 감사는 보존한다. G-173 파일·실행 이력은 snapshot 밖이므로 변경하지 않았다. 원래 초기/delta/최소 복구 목표, ID·분류·priority와 나머지 dependency는 유지하며 구현·테스트·검증 성공을 만들지 않았다. 아래 과거 승인 전달 기록은 당시 결정의 감사이며 현행 구현 지시로 사용하지 않는다.
 

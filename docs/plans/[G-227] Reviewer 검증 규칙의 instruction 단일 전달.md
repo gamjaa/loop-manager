@@ -1,0 +1,47 @@
+---
+id: G-227
+title: Reviewer 검증 규칙의 instruction 단일 전달
+sources:
+  - docs/PRODUCT.md
+  - docs/requirements/[R-003] Targeted Worker Unit Tests.md
+  - docs/requirements/[R-064] 모델 호출을 통한 공통 Agent 지침 전달.md
+depends_on: []
+complexity: low
+risk: low
+priority: normal
+---
+
+## Purpose
+
+Reviewer의 정적 검증 책임은 고정된 common+reviewer instruction으로 전달하고 사용자 prompt에는 후보·diff·결과·교정 문맥만 남긴다. 현재 `reviewer_prompt`는 테스트·verify 재실행 금지를 다시 쓰며 `tests/test_loop_manager.py`와 `tests/test_worker_validation.py`도 그 중복을 요구한다. 이미 Merge된 최종 후보 검증 결과 전달과 진입 gate는 재사용한다.
+
+## Acceptance Criteria
+
+- 실제 Reviewer 호출의 고정 instruction에는 읽기 전용 검토, 테스트 command·전체 verify·lint·build·type check 재실행 금지와 전달 결과로 테스트 누락·회귀·검증 약화를 판단하는 책임이 유지된다. 사용자 prompt에는 이 정적 규칙을 중복하지 않는다.
+- 최초·같은 세션 재개·프로토콜 교정·새 세션 복구에 같은 경계가 적용된다. 현재 후보의 Worker 보고 또는 구체적 미실행 사유, Manager 실제 verify PASS/증명된 reuse/수동 생략의 구분, 후보 HEAD·base와 필요한 ISSUE_ID 결과 형식은 유지된다.
+- 자동 Reviewer는 유효한 Worker 결과와 현재 후보에 연결된 Manager 전체 verify 성공 뒤에만 시작한다. 누락·실패·후보 변경에는 기존 교정으로 돌아가며 수동 제출·waiver를 자동 경로의 성공으로 합성하지 않는다. 원격 checkpoint 재개도 최종 후보 근거를 전달한다.
+- 실제 prompt를 사용하는 호출을 자동 테스트로 검사해 고정 instruction의 허용·금지 경계와 사용자 메시지의 중복 부재를 함께 증명한다. 임의의 `delta only` 문자열 또는 prompt 함수 단독 검사만으로 실제 전달을 대신하지 않는다.
+
+## Implementation
+
+- `agents/agent_prompts.py`와 실제 Review/checkpoint 호출의 기존 prompt 조합을 확인해 instruction에 이미 있는 검증 규칙의 반복을 제거한다. 결과 형식과 후보별 사실은 사용자 메시지에 유지하고, 기존 common_guidance/provider 전달·snapshot·read_only 경계를 재사용한다.
+- `docs/AGENTS.common.md`·`docs/AGENTS.reviewer.md`의 현재 책임을 보존한다. 결과 전달을 위해 원본을 재작성하거나 진행 작업의 고정 버전을 교체하지 않는다. 대응 테스트에서 사용자 메시지에 금지 문구를 요구하던 기대값을 실제 instruction과 결과 문맥 검사로 분리한다.
+- Worker의 초기/delta/복구 prompt는 기존 G-066의 범위다. 이 계획은 Worker session cursor, Review 성공 재사용, receipt 정책과 알림을 추가 구현하지 않는다. PRODUCT·ARCHITECTURE의 현재 단일 전달 계약은 유지하고 필요한 관련 설명만 정합하게 갱신한다.
+
+## Validation
+
+- Worker는 `tests/test_loop_manager.py`의 Reviewer prompt case와 `tests/test_agent_invocation.py`의 역할별 전달 fixture를 재사용한 관련 최소 unit case만 실행한다. 실제 Reviewer prompt·고정 원본을 사용하는 provider double로 Codex·Claude의 신규/재개 요청에서 instruction과 사용자 문맥을 각각 확인한다. 실제 Agent·Git 관측은 mock으로 대체한다.
+- `tests/test_execution_verify_phase.py`·`tests/test_worker_validation.py`·`tests/test_review_specification_recovery.py`의 관련 assertion은 Worker 반환→Manager verify→Reviewer 순서, 빈 stdout 성공, 후보/receipt 누락 거부 및 checkpoint 근거 전달을 보존한다. 수동 결과 구분은 `tests/test_manual_work.py`의 기존 fixture를 재사용한다.
+- Manager 전체 verify는 실패 시 동일 Worker session 복귀, targeted 내부 재실행의 SQLite retry 비소비, 읽기 전용 Review와 최종 후보·게시 gate를 통과해야 한다. 검증 규칙의 전달 위치 변경으로 검증 실행·범위를 축소하지 않는다.
+
+## Progress
+
+- [x] 2026-10-09 제공된 delta revision에서 R-003·R-064, 실제 prompt·instruction 합성·Review gate와 관련 테스트를 정적으로 대조했다. 구현·테스트는 실행하지 않았다.
+- [ ] Reviewer prompt 정합화와 관련 targeted unit 검증
+- [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
+
+## Decision Log
+
+- complexity low: 기존 instruction과 호출 경계를 재사용하는 국소 prompt·assertion 교정이며 새 상태 전이 판단이 없다. risk low: 잘못된 문맥 제거는 검토 입력 누락을 만들 수 있으나 기존 결과/후보 gate와 읽기 전용 권한을 보존하고 해당 prompt를 교정해 복구할 수 있다. 필수 명세 정합화로 priority normal이다.
+- G-197의 검증 근거 전달을 중복 계획하지 않는다. 기존 G-066은 Worker prompt만 담당하므로 Reviewer의 확인된 중복과 실제 전달 회귀를 독립 범위로 둔다. Merge된 계획·archive·사용자 결정은 변경하지 않는다. 이 delta 검토는 프로젝트 최종 전문 확인이 아니다.
+
