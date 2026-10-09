@@ -42,8 +42,9 @@ ARCHITECTURE의 Worker 최초 level 산식과 profile 설정 설명을 실제 Me
 ## Progress
 
 - [x] 2026-10-07 `98f86422157333ff13f82e351f9721ee16558986`의 활성 명세 전문·level/profile 구현·관련 테스트 및 비종료 catalog를 정적으로 대조했다. 구현·테스트·verify는 실행하지 않았다.
-- [ ] 설계 문서 정합화
-- [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
+- [x] 설계 문서 정합화
+- [x] 2026-10-09 WSL 전체 verify 및 최종 문서 기준 읽기 전용 재검증: `bash scripts/verify.sh` 종료 코드 0, 3,356 성공·5 skip. Windows worktree의 Git pointer를 Linux Git이 해석하지 못해 현재 파일을 WSL 임시 Git 저장소에 복사해 실행했다. 문서만 변경하여 새 targeted unit test는 추가·실행하지 않았으며 기존 profile·Review 승격·상태 보존 테스트와 코드를 대조했다.
+- [ ] 사용자 Merge
 
 ## Decision Log
 

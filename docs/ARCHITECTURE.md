@@ -46,8 +46,8 @@ Python 표준 라이브러리 `configparser`로 `config/config.ini`를 읽는다
 
 - `[loop].max_workers`: 동시에 처리할 프로젝트 수, 기본값 3인 양의 정수
 - provider별 Model alias와 Effort
-- Planner, Reviewer profile
-- Worker `level1`부터 `level7`까지의 Model과 Effort
+- 일반 Planner(`planner`)·빠른 점검 Planner(`planner_check`), Reviewer profile
+- 선택 provider의 Worker `level1`부터 `level8`까지의 명시적 Model alias와 Effort
 - Telegram Bot token과 chat ID
 
 실제 `config/config.ini`는 Git에서 제외하고 현재 사용자만 읽을 수 있도록 권장한다. 기본 설정 파일은 source checkout에 그대로 두며 bootstrap이 해당 경로를 runtime 자식에 명시적으로 전달한다. 사용자가 `--config`를 지정하면 bootstrap은 상대 경로를 source checkout 기준으로 절대화한 뒤 전달한다. runtime은 전달된 파일을 시작 시 한 번 읽고 runtime `ROOT`를 기준으로 기본 경로를 다시 계산하지 않는다. 설정 파일을 SHA별 runtime에 복제하지 않으며 Telegram token과 chat ID가 모두 비어 있으면 알림을 비활성화하고, 하나만 설정돼 있으면 설정 오류로 처리한다. 비밀값은 자식 명령행, 로그, AI Agent prompt와 오류 메시지에 포함하지 않는다.
@@ -315,20 +315,21 @@ Reviewer의 `read-only`는 workspace 파일 쓰기를 제한한다. 검색·diff
 
 ## Model과 Effort
 
-기본 Model alias는 다음 계열을 사용한다.
+최초 Worker level은 complexity의 low=1, medium=3, high=5에 critical risk만 1을 가산해 1~6으로 계산한다. low·medium·high risk는 가산하지 않는다. [R-052](requirements/%5BR-052%5D%20Worker%20Classification%20and%20Initial%20Level%20Calibration.md)의 12개 조합은 다음과 같다.
 
-- Codex: Sol(strong), Terra(balanced), Luna(fast)
-- Claude Code: Opus(strong), Sonnet(balanced), Haiku(fast)
-
-정확한 Model 이름은 `config/config.ini`에서 관리한다. 프로그램은 complexity에 low=1, medium=3, high=5를, risk에 low=0, medium=1, high=2, critical=3을 부여하고 합계를 최대 7로 제한해 Worker level을 선택한다.
-
-| complexity | risk | Worker level |
+| complexity | risk | 최초 Worker level |
 |---|---|---:|
-| low | low / medium / high / critical | 1 / 2 / 3 / 4 |
-| medium | low / medium / high / critical | 3 / 4 / 5 / 6 |
-| high | low / medium / high / critical | 5 / 6 / 7 / 7 |
+| low | low / medium / high / critical | 1 / 1 / 1 / 2 |
+| medium | low / medium / high / critical | 3 / 3 / 3 / 4 |
+| high | low / medium / high / critical | 5 / 5 / 5 / 6 |
 
-설정된 provider, Model 또는 Effort가 없거나 CLI가 지원하지 않으면 Worker를 시작하지 않고 설정 오류를 보고한다.
+level 7·8은 완료한 Worker 교정·전체 verify 통과 뒤의 유효 Review FAIL에 따른 승격으로만 도달하며 상한은 8이다. 각 effective level의 첫 FAIL을 기준선으로 삼고 기준선의 같은 ISSUE_ID가 두 교정 결과에 다시 나타나거나 교정 결과가 세 번 연속 FAIL이면 다음 Worker 호출부터 한 단계 올린다. 집계 제외·재시작·PASS 조건은 [PRODUCT의 실패와 재시도](PRODUCT.md#실패와-재시도)를 따른다.
+
+실제 Model·Effort의 원본은 `config/config.ini`다. 선택 provider의 `[<provider>.worker]`에 level 1~8을, `[<provider>.roles]`에 일반 Planner `planner`와 빠른 점검 Planner `planner_check`를 각각 `Model alias,Effort` 형식으로 명시하고 참조 alias를 `[<provider>.models]`에 명시한다. 필수 profile·alias는 `DEFAULT`, 다른 역할·level, 코드·CLI 또는 설정 예시로 보충하지 않는다. section·profile·alias 누락, 빈 Model·Effort, 잘못된 형식과 CLI가 지원하지 않는 Model·Effort 조합은 Agent 실행 전 설정 오류로 거부한다. 미선택 provider의 설정은 요구하지 않는다. 서로 다른 level에 같은 지원 profile을 지정할 수 있고 level 8에도 특정 모델 계열·alias·Effort를 강제하지 않는다.
+
+유지보수 Planner는 별도 profile이 없으면 기존 일반 Planner 연결을 유지하며 Reviewer와 그 밖의 설정 기본값도 유지한다. `config/config.ini.example`의 모델명·alias·Effort는 운영 설정을 작성하는 예시이며 누락 fallback이나 강제 profile이 아니다.
+
+저장된 최초 level은 현재 선언과 산식으로 재계산하되 실행 이력이 있는 계획의 effective level을 낮추지 않고 session·branch·worktree·PR 연결, 작업물과 승격·실패 감사를 보존한다. 산식 변경만으로 BLOCKED를 해제하지 않으며 정상적인 BLOCKED 해제에서만 최초·effective level과 진행 중 승격 이력을 초기화한다. 원격 복구의 감사·session 보존 예외는 아래 중단 복구 계약을 따른다.
 
 ## 상태 저장과 중단 복구
 
