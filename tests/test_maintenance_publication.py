@@ -304,13 +304,28 @@ class MaintenancePublicationTest(MaintenancePlanningCase):
             completed.phase, maintenance_state.MaintenancePhase.REFACTORING
         )
 
-    def test_pushed_batch_recovers_from_durable_intent_after_restart(self):
+    def test_crlf_batch_recovers_from_durable_intent_after_restart(self):
+        git(self.repo, "config", "core.autocrlf", "true")
+        self.ready_path.write_bytes(
+            self.ready_path.read_bytes().replace(b"\n", b"\r\n")
+        )
         context = self._begin_barrier()
         self._write_barrier_batch()
         result = self._validate_barrier(context)
+        self.assertIn(b"\r\n", self.ready_path.read_bytes())
         git(self.repo, "add", "docs/plans")
         git(self.repo, "commit", "-m", "Prepare recoverable maintenance batch")
         plan_commit = git(self.repo, "rev-parse", "HEAD")
+        committed_ready = subprocess.run(
+            [
+                "git", "-C", str(self.repo), "show",
+                f"{plan_commit}:docs/plans/[G-001] Ready Feature.md",
+            ],
+            check=True,
+            stdout=subprocess.PIPE,
+        ).stdout
+        self.assertNotIn(b"\r\n", committed_ready)
+        self.assertIn(b"\n", committed_ready)
         loop_manager.record_maintenance_publication_intent(
             self.connection,
             str(self.repo),
@@ -385,6 +400,8 @@ class MaintenancePublicationTest(MaintenancePlanningCase):
         self.assertEqual(
             json.loads(rows[1]["depends_on"]), ["G-000", "G-002", "G-003"],
         )
+        self.assertIn(b"\r\n", self.ready_path.read_bytes())
+        self.assertNotIn(b"\n", self.ready_path.read_bytes().replace(b"\r\n", b""))
 
     def test_published_batch_recovers_after_remote_tip_advances(self):
         context = self._begin_barrier()
