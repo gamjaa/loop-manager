@@ -155,6 +155,9 @@ class ExecutionLifecyclePortsEffects:
     validation_failure_fingerprints: Callable[..., object]
     verify: Callable[..., object]
     worker_prompt: Callable[..., object]
+    mutable_ready_snapshot: Callable[..., object]
+    validate_planner_result: Callable[..., object]
+    _assert_mutable_ready_snapshot_current: Callable[..., object]
 
 
 def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, connection, runtime_repository, **identity):
@@ -173,6 +176,25 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
     def targeted_reason(evidence):
         return ('수동 제출의 외부 targeted test 결과는 Manager가 확인하지 않았습니다.'
                 if evidence == MANUAL_TEST_EVIDENCE else dependencies.reviewer_targeted_test_reason(evidence))
+    from loop_manager_internal.execution import stage_documents
+    document_checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+    document_effects = stage_documents.StageDocumentEffects(
+        git=state.bind(dependencies._typed_execution_git, name="document_git", connected=False, mutates=False),
+        begin_scope=state.bind(dependencies.begin_agent_scope, name="document_begin_scope", connected=True, mutates=True),
+        capture_scope=dependencies.capture_git_snapshot,
+        validate_scope=lambda *a, **kw: dependencies.validate_agent_scope(*a, connection=connection, **kw),
+        clear_scope=state.bind(dependencies.clear_agent_scope, name="document_clear_scope", connected=True, mutates=True),
+        run_agent=state.bind(dependencies._run_agent_with_connection, name="document_planner", connected=True, mutates=False),
+        prepare_snapshot=dependencies.mutable_ready_snapshot,
+        assert_snapshot=dependencies._assert_mutable_ready_snapshot_current,
+        validate_result=dependencies.validate_planner_result,
+        validate_worktree=dependencies.validate_managed_worktree,
+        pr_for_branch=dependencies.pr_for_branch,
+        log=dependencies.operation_log,
+        run_with_retries=dependencies.run_agent_with_retries,
+    )
+    from loop_manager_internal.execution.execution_session import ExecutionIdentity
+    document_identity = ExecutionIdentity(**identity)
     effects = execution_handlers.ExecutionEffects(
         state=state,
         checkpoint=execution_checkpoint_state.ExecutionCheckpointRepository(connection),
@@ -279,6 +301,9 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
             body_hash=state.bind(dependencies._revision_execplan_body_hash, name="_revision_execplan_body_hash", connected=False, mutates=False),
             changed_paths=state.bind(dependencies._revision_changed_paths, name="_revision_changed_paths", connected=False, mutates=False),
             unmet_dependencies=state.bind(dependencies.unmet_execplan_dependencies, name="unmet_execplan_dependencies", connected=True, mutates=False),
+            refresh_documents=lambda context, previous, definition, changed: None if manual.enabled() else stage_documents.refresh(
+                document_effects, state, document_checkpoints, document_identity,
+                context, previous, definition, changed),
         ),
     )
     return execution_handlers.ExecutionHandlers(effects, **identity)

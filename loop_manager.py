@@ -1452,6 +1452,7 @@ mutable_ready_snapshot = _bind_effects(
         _ready_plan_snapshot_at_revision=lambda *args, **kwargs: _ready_plan_snapshot_at_revision(*args, **kwargs),
         _row_is_mutable_ready=lambda *args, **kwargs: _row_is_mutable_ready(*args, **kwargs),
         mutable_snapshot_token=lambda *args, **kwargs: mutable_snapshot_token(*args, **kwargs),
+        pr_for_branch=lambda *args, **kwargs: pr_for_branch(*args, **kwargs),
     ),
 )
 
@@ -1459,6 +1460,7 @@ _assert_mutable_ready_snapshot_current = _bind_effects(
     planner_validation._assert_mutable_ready_snapshot_current, lambda: planner_validation.AssertMutableReadySnapshotCurrentEffects(
         _execplan_metadata=lambda *args, **kwargs: _execplan_metadata(*args, **kwargs),
         _row_is_mutable_ready=lambda *args, **kwargs: _row_is_mutable_ready(*args, **kwargs),
+        pr_for_branch=lambda *args, **kwargs: pr_for_branch(*args, **kwargs),
     ),
 )
 
@@ -3917,6 +3919,9 @@ _typed_execution_command = _bind_effects(
 
 _ExecutionLifecyclePorts = _bind_effects(
     execution_ports._ExecutionLifecyclePorts, lambda: execution_ports.ExecutionLifecyclePortsEffects(
+        mutable_ready_snapshot=lambda *args, **kwargs: mutable_ready_snapshot(*args, **kwargs),
+        validate_planner_result=lambda *args, **kwargs: validate_planner_result(*args, **kwargs),
+        _assert_mutable_ready_snapshot_current=lambda *args, **kwargs: _assert_mutable_ready_snapshot_current(*args, **kwargs),
         _agent_profile=lambda *args, **kwargs: _agent_profile(*args, **kwargs),
         _current_rebase_service=lambda *args, **kwargs: _current_rebase_service(*args, **kwargs),
         _git_operation_entries=lambda *args, **kwargs: _git_operation_entries(*args, **kwargs),

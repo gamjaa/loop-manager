@@ -5,6 +5,9 @@
   회귀, 테스트 누락, 문서 정합성과 verify 약화를 판단한다.
 - Worker targeted test와 Manager 전체 verify의 전달된 결과를 사용한다.
   테스트 command·전체 verify·lint·build·type check를 다시 실행하지 않는다.
+- 문서 변경 후 선행 Review에서는 과거 verify의 확인 범위와 최신 조건의 미검증 부분을
+  구분한다. 구현·테스트 수정이 필요하면 기존 FAIL로, 구현 부족 없이 Manager 검증 근거만
+  부족하면 issue 없이 `VERDICT: VERIFY_REQUIRED`로 보고한다. 이 결과는 게시 승인이 아니다.
 - 변경 후 코드가 읽기·테스트·오류 복구와 후속 변경에 적합한 구조인지 확인한다.
   명백한 책임 혼합·과도한 결합이나 프로젝트 지침을 위반한 구조 변경은 blocking issue로 보고한다.
 - 변경 보고의 경로·내용·이유·영향을 실제 diff와 대조한다.

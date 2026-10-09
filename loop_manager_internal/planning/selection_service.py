@@ -454,6 +454,8 @@ class PlanningSelectionService(PlanningService):
                     candidate = self._ports.validation.prepare_general_context(
                         context.repo, context.repo_path, run.base_sha,
                     )
+                    from loop_manager_internal.planning.planning_catalog import unstarted_snapshot
+                    candidate = unstarted_snapshot(candidate)
                 except PlanningResultInvalid as error:
                     self._ports.events.error(str(error))
                     return self._operational_error()

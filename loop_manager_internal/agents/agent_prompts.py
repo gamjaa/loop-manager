@@ -34,8 +34,8 @@ docs/PLANS.md의 공통 경계를 지켜라. 제공된 검토 목적과 원격 �
 catalog가 이미 충족하는 작업이나 코드·테스트에 이미 구현된 작업은 중복 계획하지 마라.
 원격 base에 반영된 직접 구현도 실제 코드·테스트와 Requirement로 판단하라. 직접 작업에 소급 ExecPlan이나 자동 검증 성공을 만들지 말고 남은 작업만 계획하라.
 catalog에서 현재 입력과 겹치는 비종료 계획만 필요할 때 전문을 읽고, 기존 docs/plans 전체를 기본 입력으로 읽지 마라.
-새 ExecPlan마다 priority를 기록하라. mutable READY snapshot의 계획은 같은 ID를 보존한 채 필요하면 본문·metadata를 수정하거나 title에 맞게 rename하거나 삭제할 수 있다.
-snapshot 밖의 기존 ExecPlan, 실행된 계획, MERGED·archive 계획은 수정·rename·삭제하지 마라. 삭제한 ID를 새 계획에 재사용하지 마라.
+새 ExecPlan마다 priority를 기록하라. PR 전 snapshot의 계획은 같은 ID를 보존한 채 필요한 본문·metadata를 개정하라. 미착수 계획만 title에 맞게 rename하거나 삭제할 수 있다.
+snapshot의 started 계획도 PR 등록 전이면 개정할 수 있다. started 계획의 ID·경로와 기존 구현·검증 기록은 보존하고 새 조건의 미충족 부분을 구분하라. snapshot 밖의 기존 ExecPlan과 PR 등록·MERGED·archive 계획은 수정하지 마라. 삭제한 ID를 새 계획에 재사용하지 마라.
 deleted_goals가 있으면 보존된 원문·source와 최신 제품 목표를 비교해 snapshot 안의 영향 계획을 개정하라. 필요한 선행 목표는 새 ID 대체 계획 또는 목표를 보존하는 기존 계획으로 depends_on을 연결하라. 번호 공백이나 삭제·신규 추가 동시 관측을 ID 변경으로 추정하지 마라.
 각 영향 계획의 Decision Log에 한 줄 DEPENDENCY_RECOVERY: JSON을 기록하라. 필드는 deleted_id, outcome(replaced|obsolete), replacement_ids(ID 배열), sources(판단에 사용한 최신 계획 source 경로 배열), reason(목표 보존 또는 최신 명세에서 불필요한 이유)다. 필요한 목표를 dependency 제거로 우회하지 마라. 의미·소유권이 불확실하면 해당 범위는 계속 보류하고 독립 작업만 계획하라.
 현재 PRODUCT/Requirement 범위 밖이지만 보존 가치가 있는 아이디어는 같은 계획 주기의 ExecPlan 범위나 미충족 작업의 근거로 사용하지 말고 docs/FUTURE_IDEAS.md에만 분리해 기록하라.

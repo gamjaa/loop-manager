@@ -368,7 +368,7 @@ def parse_reviewer_result(
     verdict_match = _REVIEW_VERDICT.fullmatch(verdict_line)
     if verdict_match is None:
         raise ReviewerProtocolError(
-            "Reviewer VERDICT는 PASS, FAIL 또는 SPEC_BLOCKED이어야 합니다."
+            "Reviewer VERDICT는 PASS, FAIL, SPEC_BLOCKED 또는 VERIFY_REQUIRED이어야 합니다."
         )
 
     verdict = verdict_match.group(1).upper()
@@ -390,10 +390,10 @@ def parse_reviewer_result(
             raise ReviewerProtocolError(str(error)) from error
     if specification_declarations:
         raise ReviewerProtocolError("PASS·FAIL 결과에는 SPEC_DEADLOCK이 없어야 합니다.")
-    if verdict == "PASS":
+    if verdict in {"PASS", "VERIFY_REQUIRED"}:
         if issue_declarations:
             raise ReviewerProtocolError(
-                "Reviewer PASS 결과에는 ISSUE_ID가 없어야 합니다."
+                "Reviewer PASS·VERIFY_REQUIRED 결과에는 ISSUE_ID가 없어야 합니다."
             )
         return verdict, ()
     return verdict, effects._normalize_review_issue_ids(output)

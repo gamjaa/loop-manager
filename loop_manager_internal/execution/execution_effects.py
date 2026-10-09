@@ -141,6 +141,7 @@ class RevisionEffects:
     body_hash: Callable[..., Any]
     changed_paths: Callable[..., Any]
     unmet_dependencies: Callable[..., Any]
+    refresh_documents: Callable[..., Any] | None = None
 
 @dataclass(frozen=True)
 class ExecutionEffects:

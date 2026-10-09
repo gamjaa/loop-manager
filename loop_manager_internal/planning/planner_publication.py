@@ -522,8 +522,8 @@ def _general_planning_batch_already_applied(
             priority,
             effects.file_hash(worktree / revision.path),
             plan_commit,
-            "READY",
-            False,
+            json.loads(revision.snapshot.execution_state)["status"] if revision.snapshot.execution_state else "READY",
+            bool(json.loads(revision.snapshot.execution_state)["ever_started"]) if revision.snapshot.execution_state else False,
         ):
             return False
     for deletion in result.deletions:

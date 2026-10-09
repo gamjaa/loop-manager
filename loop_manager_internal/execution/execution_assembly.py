@@ -189,6 +189,7 @@ def revision(effects: ExecutionEffects, identity: ExecutionIdentity,
         snapshot: Callable[[], PreparationSnapshot], update_snapshot: Callable[..., None],
         callbacks: dict[str, Callable], *, recovery=None, rebase_corrections=None) -> RevisionHandler:
     return RevisionHandler(RevisionHandlerPorts(
+        refresh_documents=effects.revision.refresh_documents,
         observe_verify_inputs=effects.validation.observe_verify_inputs,
         identity=identity,
         snapshot=snapshot,
@@ -358,6 +359,7 @@ def review(effects: ExecutionEffects, identity: ExecutionIdentity,
         snapshot: Callable[[], PreparationSnapshot], update_snapshot: Callable[..., None],
         callbacks: dict[str, Callable], *, recovery=None, rebase_corrections=None) -> ReviewHandler:
     return ReviewHandler(ReviewHandlerPorts(
+        checkpoint=effects.checkpoint,
         identity=identity,
         snapshot=snapshot,
         contract=ExecutionContract.from_source(effects.contract),

@@ -28,6 +28,7 @@ class ReviewProtocolNotificationTest(NotificationFixture, unittest.TestCase):
         ports.identity = SimpleNamespace(repo=repo, repo_path=Path(repo), base='main')
         ports.contract = loop_manager
         ports.feedback = None
+        ports.checkpoint = None
         ports.state.connection = connection
         ports.state.update_project.side_effect = lambda repo, **values: loop_manager.update_project(connection, repo, **values)
         ports.snapshot.return_value = snapshot
