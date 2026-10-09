@@ -9,6 +9,7 @@ from loop_manager_internal.execution.worker_session import SessionBinding
 from tests.support.catalog import write_execplan
 from tests.support.git import git_command, make_remote_repository, commit_and_push
 from tests.support.lifecycle import register_connection_cleanup
+from tests.support.fixed_samples import PROJECT_FILES
 
 
 def worker_result(
@@ -75,7 +76,8 @@ def dummy_worker_context(*, roles=("worker",)):
 
     with mock.patch.object(loop_manager, '_agent_profile', side_effect=profile), \
          mock.patch.object(loop_manager, '_ExecutionLifecyclePorts', side_effect=ports), \
-         mock.patch.object(loop_manager, 'command', side_effect=command):
+         mock.patch.object(loop_manager, 'command', side_effect=command), \
+         mock.patch('loop_manager_internal.agents.common_guidance.RUNTIME_ROOT', PROJECT_FILES):
         yield
 
 
