@@ -31,7 +31,7 @@ def isolated_scope_resources(_connection, _repo, worktree, before, role_name, **
 
 
 @contextlib.contextmanager
-def dummy_worker_context(*, roles=("worker",)):
+def dummy_worker_context(*, roles=("worker",), fixed_guidance=False):
     """Opt legacy unused.ini roles into fake profile/session preflight."""
     real_profile = loop_manager._agent_profile
     real_ports = loop_manager._ExecutionLifecyclePorts
@@ -74,22 +74,26 @@ def dummy_worker_context(*, roles=("worker",)):
             return subprocess.CompletedProcess(arguments, 0, stdout=json.dumps({'body': '', **pr}))
         return real_command(arguments, **kwargs)
 
+    runtime_root = (mock.patch('loop_manager_internal.agents.common_guidance.RUNTIME_ROOT', PROJECT_FILES)
+                    if fixed_guidance else contextlib.nullcontext())
     with mock.patch.object(loop_manager, '_agent_profile', side_effect=profile), \
          mock.patch.object(loop_manager, '_ExecutionLifecyclePorts', side_effect=ports), \
-         mock.patch.object(loop_manager, 'command', side_effect=command), \
-         mock.patch('loop_manager_internal.agents.common_guidance.RUNTIME_ROOT', PROJECT_FILES):
+         mock.patch.object(loop_manager, 'command', side_effect=command), runtime_root:
         yield
 
 
-def dummy_worker_sessions(test):
+def dummy_worker_sessions(test=None, *, fixed_guidance=False):
     """Limit compatibility patches to the explicitly decorated test method."""
     from functools import wraps
 
-    @wraps(test)
-    def run(*args, **kwargs):
-        with dummy_worker_context():
-            return test(*args, **kwargs)
-    return run
+    def decorate(test):
+        @wraps(test)
+        def run(*args, **kwargs):
+            with dummy_worker_context(fixed_guidance=fixed_guidance):
+                return test(*args, **kwargs)
+        return run
+
+    return decorate(test) if test is not None else decorate
 
 
 @contextlib.contextmanager
