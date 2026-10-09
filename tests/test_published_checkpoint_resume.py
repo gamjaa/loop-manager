@@ -144,6 +144,16 @@ class PublishedCheckpointResumeTests(ExecutionFixture, TestCase):
         self.assertTrue(self.owns())
         self.assertEqual(self.receipt(), original)
 
+    def test_history_for_another_repository_plan_or_workspace_is_refused(self):
+        self.replace_request()
+        history = json.loads(self.receipt()['publication_history'])
+        for key in ('repo', 'plan_id', 'branch', 'worktree', 'pr_url'):
+            with self.subTest(key=key):
+                entry = {**history[0]['superseded_request'], key: 'unrelated'}
+                self.connection.execute('UPDATE blocked_checkpoints SET publication_history=?',
+                    (json.dumps([{'superseded_request': entry}]),))
+                self.assertFalse(self.owns())
+
     def test_reblock_discards_old_resume_but_keeps_publication_for_reactivation(self):
         self.handler.recover(self.context())
         self.repository.block_plan(self.repo, 'G-047', reason_code='verify_retry_exhausted',

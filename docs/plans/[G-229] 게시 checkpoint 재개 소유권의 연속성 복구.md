@@ -28,7 +28,7 @@ priority: high
 |---|---|---|
 | Worker 실패 → `RuntimeStateRepository.block_plan` | 실패와 계획 차단을 저장하고 보존 checkpoint를 요청한다. 게시 OID는 유지되며 기존 `blocked_resume`은 제거된다. | 새 원인에서 `published_review_resume`도 무효화하고 이전 게시 영수증은 보존한다. `test_reblock_discards_old_resume_but_keeps_publication_for_reactivation` |
 | checkpoint 게시 → `BlockedCheckpointRepository.finish_published` | 게시 identity·tree·원격 OID와 결과를 확정한다. 게시 소유권은 실패 해결이나 verify 성공이 아니다. | 기존 게시 경계와 `tests.test_blocked_checkpoint_state` 유지 |
-| 차단 원인/요청 교체 → `request`·`refresh_current` | 현재 요청의 증명 필드를 초기화할 수 있다. | 초기화 전 소유 공간·요청·게시 근거를 포함한 원본 영수증을 역사 기록으로 남긴다. `test_historical_publication_is_read_without_rewriting_current_receipt` |
+| 차단 원인/요청 교체 → `request`·`refresh_current`·`refresh` | 현재 요청의 증명 필드나 게시 phase/result를 초기화할 수 있다. | 초기화 전 소유 공간·요청·게시 근거를 포함한 원본 영수증을 역사 기록으로 남긴다. 역사 게시 보존과 동일 요청 refresh 회귀 |
 | 실제 원인 해제 → 기존 계획 복구 | 원래 실패가 해결됐을 때만 READY/기존 교정 단계로 이어간다. | 게시 소유권 수용 자체는 실패를 지우지 않는다. 정상 재개·독립 계획 차단 회귀 |
 | `RuntimeStateRepository.activate` → `WorkspaceHandler.recover` | 계획의 게시 OID는 유지하지만 유효한 rebase acceptance가 없으면 snapshot 대부분을 초기화한다. | 기존 게시 재개 표식 보존과 표식 없는 상태의 재검증을 연결한다. `test_markerless_published_oid_revalidates_and_survives_restart` |
 | `OwnershipHandler._owned_checkpoint_remote` | 기존 분기는 OID가 있고 표식이 없으면 Git 검증 전에 거부한다. | 기존 identity·tree·계보·worktree·실제 ref 검증을 사용하며, 현재 요청/역사 영수증으로 확인한 근거를 기존 재개 소비자에 연결한다. 소유권·원격·PR·낡은 표식 거부 회귀 |

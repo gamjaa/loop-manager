@@ -30,7 +30,8 @@ def publication_receipt(row, remote_oid):
             if legacy and row['expected_remote_oid'] != remote_oid:
                 continue
             receipt = {**dict(row), **prior}
-            if (receipt['branch'] != row['branch'] or receipt['worktree'] != row['worktree']
+            if (receipt['repo'] != row['repo'] or receipt['plan_id'] != row['plan_id']
+                    or receipt['branch'] != row['branch'] or receipt['worktree'] != row['worktree']
                     or receipt['pr_url'] != row['pr_url']
                     or receipt['accepted_remote_oid'] != remote_oid
                     or not receipt['published_oid'] or not receipt['commit_identity']
