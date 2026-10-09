@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS maintenance_cycles (
     publication_remote_oid TEXT,
     publication_refactoring_plan_ids TEXT NOT NULL DEFAULT '[]',
     publication_revalidation_plan_ids TEXT NOT NULL DEFAULT '[]',
+    publication_id_allocations TEXT NOT NULL DEFAULT '[]',
     include_general_planning INTEGER NOT NULL DEFAULT 0,
     full_assessment_completed INTEGER NOT NULL DEFAULT 0,
     full_assessment_source_sha TEXT,
@@ -119,6 +120,7 @@ class MaintenanceCycle:
     assessment_plan_ids: tuple[str, ...] = ()
     cycle_id: str | None = None
     legacy_release_identity: str | None = None
+    publication_id_allocations: tuple[tuple[str, str, str, str], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -153,6 +155,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
         "include_general_planning": "INTEGER NOT NULL DEFAULT 0",
         "publication_refactoring_plan_ids": "TEXT NOT NULL DEFAULT '[]'",
         "publication_revalidation_plan_ids": "TEXT NOT NULL DEFAULT '[]'",
+        "publication_id_allocations": "TEXT NOT NULL DEFAULT '[]'",
         "full_assessment_completed": "INTEGER NOT NULL DEFAULT 0",
         "full_assessment_source_sha": "TEXT",
         "full_assessment_result": "TEXT",
@@ -301,6 +304,60 @@ def _encode_publication_plan_ids(values: Sequence[str], field: str) -> str:
     )
 
 
+def _encode_publication_id_allocations(
+    values: Sequence[tuple[str, str, str, str]],
+) -> str:
+    if isinstance(values, (str, bytes)):
+        raise MaintenanceStateError("publication ID 배정 mapping 형식이 유효하지 않습니다.")
+    allocations = []
+    seen_sources: set[str] = set()
+    seen_source_ids: set[str] = set()
+    seen_targets: set[str] = set()
+    seen_target_ids: set[str] = set()
+    for item in values:
+        if not isinstance(item, (tuple, list)) or len(item) != 4:
+            raise MaintenanceStateError("publication ID 배정 mapping 항목이 유효하지 않습니다.")
+        source_path, source_id, target_path, target_id = item
+        if any(not isinstance(value, str) for value in item):
+            raise MaintenanceStateError("publication ID 배정 mapping identity가 유효하지 않습니다.")
+        source_match = re.fullmatch(r"docs/plans/\[(G-\d{3,})\] ([^/]+)\.md", source_path)
+        target_match = re.fullmatch(r"docs/plans/\[(G-\d{3,})\] ([^/]+)\.md", target_path)
+        if (
+            not isinstance(source_id, str)
+            or not isinstance(target_id, str)
+            or source_match is None
+            or target_match is None
+            or source_match.group(1) != source_id
+            or target_match.group(1) != target_id
+            or source_match.group(2) != target_match.group(2)
+            or source_path in seen_sources
+            or source_id in seen_source_ids
+            or target_path in seen_targets
+            or target_id in seen_target_ids
+        ):
+            raise MaintenanceStateError("publication ID 배정 mapping identity가 유효하지 않습니다.")
+        seen_sources.add(source_path)
+        seen_source_ids.add(source_id)
+        seen_targets.add(target_path)
+        seen_target_ids.add(target_id)
+        allocations.append((source_path, source_id, target_path, target_id))
+    allocations.sort(key=lambda item: _plan_sort_key(item[3]))
+    return json.dumps(allocations, separators=(",", ":"))
+
+
+def _decode_publication_id_allocations(raw: object) -> tuple[tuple[str, str, str, str], ...]:
+    try:
+        values = json.loads(str(raw))
+        if not isinstance(values, list):
+            raise ValueError("not a list")
+        normalized = _encode_publication_id_allocations(values)
+        return tuple(tuple(item) for item in json.loads(normalized))
+    except (TypeError, ValueError, json.JSONDecodeError, MaintenanceStateError) as error:
+        raise MaintenanceStateError(
+            "publication ID 배정 mapping 저장값이 유효하지 않습니다."
+        ) from error
+
+
 @contextmanager
 def _transaction(connection: sqlite3.Connection) -> Iterator[None]:
     if not connection.in_transaction:
@@ -409,6 +466,7 @@ class MaintenanceRepository:
             full_assessment_source_sha=None,
             full_assessment_result=None,
             revision=0,
+            publication_id_allocations=(),
         )
 
     def get(self, repo: str) -> MaintenanceCycle:
@@ -515,6 +573,9 @@ class MaintenanceRepository:
             assessment_plan_ids=stored_plan_ids("assessment_plan_ids"),
             cycle_id=row["cycle_id"],
             legacy_release_identity=row["legacy_release_identity"],
+            publication_id_allocations=_decode_publication_id_allocations(
+                row["publication_id_allocations"]
+            ),
         )
 
     def due(self, repo: str, interval: int, *, self_repository: bool = False) -> ReviewDue:
@@ -849,6 +910,7 @@ class MaintenanceRepository:
                     publication_remote_oid = NULL,
                     publication_refactoring_plan_ids = '[]',
                     publication_revalidation_plan_ids = '[]',
+                    publication_id_allocations = '[]',
                     full_assessment_source_sha = CASE
                         WHEN full_assessment_completed = 0 THEN excluded.cycle_base_sha
                         ELSE full_assessment_source_sha END,
@@ -911,6 +973,7 @@ class MaintenanceRepository:
         commit_sha: str,
         refactoring_plan_ids: Sequence[str] = (),
         revalidation_plan_ids: Sequence[str] = (),
+        id_allocations: Sequence[tuple[str, str, str, str]] = (),
     ) -> MaintenanceCycle:
         """Persist a recoverable local batch before its remote push."""
 
@@ -922,6 +985,8 @@ class MaintenanceRepository:
             raise MaintenanceStateError(
                 "유지보수 publication 기준과 commit SHA가 유효하지 않습니다."
             )
+        serialized_allocations = _encode_publication_id_allocations(id_allocations)
+        expected_allocations = _decode_publication_id_allocations(serialized_allocations)
         expected = ("prepared", base_sha, commit_sha, None)
         with _transaction(self.connection):
             state = self.get(repo)
@@ -948,6 +1013,7 @@ class MaintenanceRepository:
                 if (
                     state.publication_refactoring_plan_ids != expected_refactoring
                     or state.publication_revalidation_plan_ids != expected_revalidation
+                    or state.publication_id_allocations != expected_allocations
                 ):
                     raise MaintenanceStateError(
                         "보존된 publication plan 집합이 현재 batch와 다릅니다."
@@ -972,6 +1038,7 @@ class MaintenanceRepository:
                     publication_remote_oid = NULL,
                     publication_refactoring_plan_ids = ?,
                     publication_revalidation_plan_ids = ?,
+                    publication_id_allocations = ?,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE repo = ? AND phase = ? AND revision = ?
                   AND publication_stage IS NULL
@@ -984,6 +1051,7 @@ class MaintenanceRepository:
                     commit_sha,
                     serialized_refactoring,
                     serialized_revalidation,
+                    serialized_allocations,
                     repo,
                     expected_phase.value,
                     expected_revision,
@@ -1042,6 +1110,7 @@ class MaintenanceRepository:
                     publication_remote_oid = NULL,
                     publication_refactoring_plan_ids = '[]',
                     publication_revalidation_plan_ids = '[]',
+                    publication_id_allocations = '[]',
                     revision = revision + 1,
                     updated_at = CURRENT_TIMESTAMP
                 WHERE repo = ? AND phase = ? AND revision = ?
@@ -1162,6 +1231,7 @@ class MaintenanceRepository:
         if publication_stage is None:
             updates["publication_refactoring_plan_ids"] = "[]"
             updates["publication_revalidation_plan_ids"] = "[]"
+            updates["publication_id_allocations"] = "[]"
         with _transaction(self.connection):
             state = self.get(repo)
             if cycle_base_sha is not None and not state.full_assessment_completed:
@@ -1252,6 +1322,7 @@ class MaintenanceRepository:
                     publication_remote_oid = NULL,
                     publication_refactoring_plan_ids = '[]',
                     publication_revalidation_plan_ids = '[]',
+                    publication_id_allocations = '[]',
                     include_general_planning = 0,
                     revision = revision + 1,
                     updated_at = CURRENT_TIMESTAMP

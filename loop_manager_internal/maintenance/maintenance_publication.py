@@ -3,7 +3,7 @@ from __future__ import annotations
 from loop_manager_internal.agents import common_guidance
 from collections.abc import Callable
 from dataclasses import dataclass
-from loop_manager_internal.application.contracts import ValidatedPlanningResult
+from loop_manager_internal.application.contracts import PlanIdAllocation, ValidatedPlanningResult
 from loop_manager_internal.catalog import execplan_catalog, project_catalog_refresh
 from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
 from loop_manager_internal.maintenance import maintenance_file_publication
@@ -333,6 +333,10 @@ def record_maintenance_publication_intent(
             commit_sha=plan_commit,
             refactoring_plan_ids=result.refactoring_plan_ids,
             revalidation_plan_ids=result.revalidation_plan_ids,
+            id_allocations=tuple(
+                (item.source_path, item.source_id, item.target_path, item.target_id)
+                for item in result.id_allocations
+            ),
         )
         if evidence is not None:
             maintenance_file_publication.save_intent(
@@ -426,10 +430,15 @@ def _assert_maintenance_publication_intent(
         cycle.publication_remote_oid,
         cycle.publication_refactoring_plan_ids,
         cycle.publication_revalidation_plan_ids,
+        cycle.publication_id_allocations,
     )
     expected = (
         "prepared", context.active_sha, plan_commit, None,
         result.refactoring_plan_ids, result.revalidation_plan_ids,
+        tuple(
+            (item.source_path, item.source_id, item.target_path, item.target_id)
+            for item in result.id_allocations
+        ),
     )
     if current != expected:
         raise MaintenancePlanningError(
@@ -896,6 +905,9 @@ def recover_maintenance_planning_batch(
             effects.changed_files(worktree),
             refactoring_plan_ids=(cycle.publication_refactoring_plan_ids if context.mode is MaintenancePlanMode.BARRIER else ()),
             allow_general_plans=cycle.include_general_planning,
+            expected_id_allocations=tuple(
+                PlanIdAllocation(*item) for item in cycle.publication_id_allocations
+            ),
         )
     except PlannerValidationError as error:
         raise MaintenancePlanningError(

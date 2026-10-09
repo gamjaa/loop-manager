@@ -16,6 +16,7 @@ from loop_manager_internal.catalog import execplan_catalog
 from loop_manager_internal.storage import execplan_catalog_state
 import loop_manager
 from loop_manager_internal.maintenance import maintenance_planning
+from loop_manager_internal.maintenance import maintenance_publication
 from loop_manager_internal.maintenance import maintenance_findings
 from loop_manager_internal.maintenance import maintenance_file_inventory
 from loop_manager_internal.storage import maintenance_file_ledger
@@ -29,6 +30,72 @@ from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot
 from tests.support.maintenance_planning_case import MaintenancePlanningCase, git
 
 class MaintenanceAuthorityTest(MaintenancePlanningCase):
+    def test_combined_maintenance_batch_normalizes_manifest_and_result_references(self):
+        self._begin_legacy_assessment(self.base_sha)
+        self.connection.execute(
+            "UPDATE maintenance_cycles SET include_general_planning = 1 WHERE repo = ?",
+            (str(self.repo),),
+        )
+        context = loop_manager.prepare_maintenance_planning_context(
+            self.connection, str(self.repo), self.repo, self.base_sha
+        )
+        self._write_plan("G-005", "Refactor Boundary")
+        self._write_plan(
+            "G-006", "General Follow-up", depends_on=("G-005",),
+        )
+        self._write_plan(
+            "G-001", "Ready Feature", depends_on=("G-000", "G-005"),
+        )
+
+        result = loop_manager.validate_maintenance_planner_result(
+            self.connection, context, self.repo,
+            loop_manager.changed_files(self.repo),
+            refactoring_plan_ids=("G-005",), allow_general_plans=True,
+        )
+
+        self.assertEqual(
+            [(path, plan["id"]) for path, plan in result.plans],
+            [
+                ("docs/plans/[G-002] Refactor Boundary.md", "G-002"),
+                ("docs/plans/[G-003] General Follow-up.md", "G-003"),
+            ],
+        )
+        self.assertEqual(result.plans[1][1]["depends_on"], ["G-002"])
+        self.assertEqual(result.revisions[0].plan["depends_on"], ["G-000", "G-002"])
+        self.assertEqual(result.refactoring_plan_ids, ("G-002",))
+        self.assertEqual(result.revalidation_plan_ids, ("G-001", "G-003"))
+        self.assertEqual(
+            [(item.source_id, item.target_id) for item in result.id_allocations],
+            [("G-005", "G-002"), ("G-006", "G-003")],
+        )
+
+        resumed = loop_manager.validate_maintenance_planner_result(
+            self.connection, context, self.repo,
+            loop_manager.changed_files(self.repo),
+            refactoring_plan_ids=("G-002",), allow_general_plans=True,
+            expected_id_allocations=result.id_allocations,
+        )
+        self.assertEqual(resumed.id_allocations, result.id_allocations)
+        self.assertEqual(resumed.refactoring_plan_ids, ("G-002",))
+
+        publication_effects = maintenance_publication.RecordMaintenancePublicationIntentEffects(
+            _assert_maintenance_context_current=lambda *_args: None,
+            _validate_maintenance_publication_commit=lambda *_args, **_kwargs: None,
+            is_loop_manager_repository=lambda _path: True,
+        )
+        intent = maintenance_publication.record_maintenance_publication_intent(
+            publication_effects, self.connection, str(self.repo), self.repo,
+            "main", result, "c" * 40,
+        )
+        self.assertEqual(
+            intent.publication_id_allocations,
+            tuple(
+                (item.source_path, item.source_id, item.target_path, item.target_id)
+                for item in result.id_allocations
+            ),
+        )
+        self.assertEqual(intent.publication_refactoring_plan_ids, ("G-002",))
+
     def test_single_assessment_dag_accepts_required_ready_without_reverse_barrier(self):
         context = self._begin_barrier()
         self._write_plan("G-002", "Refactor Boundary", depends_on=("G-001",))

@@ -1,13 +1,16 @@
 import hashlib
 import json
+import os
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 from types import SimpleNamespace
 import loop_manager
 from loop_manager_internal.application.contracts import PlanIdAllocation
 from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
 from loop_manager_internal.planning import planner_publication
+from loop_manager_internal.planning import planner_validation
 from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot, mutable_snapshot_token
 from tests.support.database import AutomationCatalogFixture
 from tests.support.catalog import make_catalog_root, plan_text, write_execplan, planner_git_observations
@@ -100,6 +103,138 @@ class CatalogBatchesTest(AutomationCatalogFixture, unittest.TestCase):
             self.assertEqual([plan["id"] for _path, plan in result.plans], ["G-002"])
             self.assertFalse(gap.exists())
             self.assertTrue((repo / "docs/plans/[G-002] Gap.md").is_file())
+
+    def test_batch_normalization_rewrites_planned_snapshot_dependency(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_catalog_root(directory)
+            existing = write_execplan(repo, "G-001", "Existing")
+            candidate = write_execplan(repo, "G-005", "Candidate")
+            base_text = existing.read_text(encoding="utf-8")
+            current_text = plan_text("G-001", "Existing", depends_on=("G-005",))
+            existing.write_text(current_text, encoding="utf-8")
+            existing_path = existing.relative_to(repo).as_posix()
+            snapshot_plan = ReadyPlanSnapshot(
+                "G-001", existing_path, "Existing", ("docs/PRODUCT.md",), (),
+                "low", "low", "normal",
+                hashlib.sha256(base_text.encode("utf-8")).hexdigest(),
+                "a" * 40, base_text,
+            )
+            snapshot = MutableReadySnapshot(
+                str(repo), "base", (snapshot_plan,),
+                mutable_snapshot_token(str(repo), "base", (snapshot_plan,)),
+            )
+
+            with planner_git_observations({existing_path: base_text}):
+                result = loop_manager.validate_planner_result(
+                    repo, "base",
+                    [existing_path, candidate.relative_to(repo).as_posix()],
+                    mutable_snapshot=snapshot,
+                )
+
+            self.assertEqual(result.plans[0][1]["id"], "G-002")
+            self.assertEqual(result.revisions[0].plan["id"], "G-001")
+            self.assertEqual(result.revisions[0].plan["depends_on"], ["G-002"])
+            self.assertEqual(loop_manager._parse_execplan(repo, existing)["depends_on"], ["G-002"])
+
+    def test_unknown_snapshot_dependency_cannot_be_captured_by_assigned_id(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_catalog_root(directory)
+            existing = write_execplan(repo, "G-001", "Existing")
+            candidate = write_execplan(repo, "G-005", "Candidate")
+            candidate_bytes = candidate.read_bytes()
+            base_text = existing.read_text(encoding="utf-8")
+            existing.write_text(
+                plan_text("G-001", "Existing", depends_on=("G-002",)),
+                encoding="utf-8",
+            )
+            existing_path = existing.relative_to(repo).as_posix()
+            snapshot_plan = ReadyPlanSnapshot(
+                "G-001", existing_path, "Existing", ("docs/PRODUCT.md",), (),
+                "low", "low", "normal",
+                hashlib.sha256(base_text.encode("utf-8")).hexdigest(),
+                "a" * 40, base_text,
+            )
+            snapshot = MutableReadySnapshot(
+                str(repo), "base", (snapshot_plan,),
+                mutable_snapshot_token(str(repo), "base", (snapshot_plan,)),
+            )
+
+            with planner_git_observations({existing_path: base_text}), self.assertRaisesRegex(
+                loop_manager.PlannerValidationError, "dependency 대상이 없습니다"
+            ):
+                loop_manager.validate_planner_result(
+                    repo, "base",
+                    [existing_path, candidate.relative_to(repo).as_posix()],
+                    mutable_snapshot=snapshot,
+                )
+
+            self.assertEqual(candidate.read_bytes(), candidate_bytes)
+            self.assertFalse((repo / "docs/plans/[G-002] Candidate.md").exists())
+
+    def test_batch_normalization_recovers_original_after_interrupted_target_install(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_catalog_root(directory)
+            existing = write_execplan(repo, "G-001", "Existing")
+            candidate = write_execplan(repo, "G-005", "Candidate")
+            original = candidate.read_bytes()
+            real_link = os.link
+            link_calls = 0
+
+            def interrupt_after_sources_are_removed(source, target, *args, **kwargs):
+                nonlocal link_calls
+                link_calls += 1
+                if link_calls == 1:
+                    raise KeyboardInterrupt("simulated normalization interruption")
+                real_link(source, target, *args, **kwargs)
+
+            with planner_git_observations({
+                existing.relative_to(repo).as_posix(): existing.read_text(encoding="utf-8"),
+            }), mock.patch.object(
+                planner_validation.os, "link", side_effect=interrupt_after_sources_are_removed,
+            ), self.assertRaisesRegex(KeyboardInterrupt, "simulated normalization interruption"):
+                loop_manager.validate_planner_result(
+                    repo, "base", [candidate.relative_to(repo).as_posix()],
+                )
+
+            self.assertEqual(link_calls, 1)
+            self.assertTrue(candidate.is_file())
+            self.assertEqual(candidate.read_bytes(), original)
+            self.assertFalse((repo / "docs/plans/[G-002] Candidate.md").exists())
+            self.assertFalse(planner_validation._plan_id_normalization_journal_path(repo).exists())
+
+    def test_batch_normalization_recovers_original_after_partial_stage_write(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_catalog_root(directory)
+            existing = write_execplan(repo, "G-001", "Existing")
+            candidate = write_execplan(repo, "G-005", "Candidate")
+            original = candidate.read_bytes()
+            real_write = planner_validation._write_plan_normalization_temp
+            write_calls = 0
+
+            def partially_write_first_temp(path, contents):
+                nonlocal write_calls
+                write_calls += 1
+                if write_calls == 1:
+                    with path.open("xb") as stream:
+                        stream.write(contents[:7])
+                        stream.flush()
+                    raise OSError("simulated partial normalization write")
+                real_write(path, contents)
+
+            with planner_git_observations({
+                existing.relative_to(repo).as_posix(): existing.read_text(encoding="utf-8"),
+            }), mock.patch.object(
+                planner_validation, "_write_plan_normalization_temp",
+                side_effect=partially_write_first_temp,
+            ), self.assertRaisesRegex(RuntimeError, "원자적으로 정규화"):
+                loop_manager.validate_planner_result(
+                    repo, "base", [candidate.relative_to(repo).as_posix()],
+                )
+
+            self.assertGreaterEqual(write_calls, 2)
+            self.assertEqual(candidate.read_bytes(), original)
+            self.assertFalse((repo / "docs/plans/[G-002] Candidate.md").exists())
+            self.assertFalse(planner_validation._plan_id_normalization_journal_path(repo).exists())
 
     def test_new_plan_id_collision_skips_archived_registered_and_cancelled_ids(self):
         with tempfile.TemporaryDirectory() as directory:
