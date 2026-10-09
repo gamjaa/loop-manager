@@ -27,6 +27,32 @@ from tests.support.origin import OriginScopeFixture
 
 
 class SupportFixtureTests(unittest.TestCase):
+    def test_worker_decorator_keeps_planning_baseline_stable_across_nested_context(self):
+        from loop_manager_internal.agents import common_guidance
+        from loop_manager_internal.storage import planning_input_state
+        from tests.support.fixed_samples import PROJECT_FILES
+
+        connection = database_fixture.runtime_connection()
+        self.addCleanup(connection.close)
+        read = common_guidance._read
+        def read_sample(path):
+            self.assertTrue(path.is_relative_to(PROJECT_FILES), path)
+            return read(path)
+
+        @dummy_worker_sessions
+        def scenario():
+            planning_input_state.record_general(connection, 'repo', 'base', [])
+            baseline = connection.execute(
+                'SELECT guidance_hash FROM planning_input_baselines').fetchone()[0]
+            with dummy_worker_context(roles=('worker', 'planner_check')):
+                self.assertEqual(common_guidance.runtime_content_hash(), baseline)
+            self.assertEqual(common_guidance.runtime_content_hash(), baseline)
+
+        with (mock.patch.object(common_guidance, 'RUNTIME_ROOT', Path('/unavailable-runtime')),
+              mock.patch.object(common_guidance, '_read', side_effect=read_sample)):
+            scenario()
+            self.assertEqual(common_guidance.RUNTIME_ROOT, Path('/unavailable-runtime'))
+
     def test_pr_recovery_pins_fixed_guidance_for_later_hash_consumers(self):
         from tests.support import pr_recovery
         from loop_manager_internal.agents import common_guidance

@@ -23,7 +23,7 @@ from loop_manager_internal.planning import planning_runtime
 from loop_manager_internal.catalog.execplan_catalog import plan_content_hash
 from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventoryError
 from tests.support.git import advance_remote_file, commit_and_push, git_command, make_remote_repository
-from tests.support.worker import dummy_worker_context
+from tests.support.worker import dummy_worker_context, dummy_worker_sessions
 from tests.support.catalog import plan_text
 
 
@@ -383,6 +383,7 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
         self.assertIsNotNone(cycle.last_success_commit)
         self.assertEqual(plan["status"], "IMPLEMENTING")
 
+    @dummy_worker_sessions
     def test_prerequisite_merge_returns_to_outside_ready_without_reassessment(self):
         with tempfile.TemporaryDirectory() as directory:
             repo_path, state_dir, connection, repo = self._integration_project(
@@ -452,6 +453,7 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
         self.assertEqual(completed.phase, maintenance_state.MaintenancePhase.IDLE)
         self.assertEqual(completed.last_cycle_commit, latest)
 
+    @dummy_worker_sessions
     def test_refactoring_batch_last_merge_releases_ready_without_revalidation(self):
         with tempfile.TemporaryDirectory() as directory:
             repo_path, state_dir, connection, repo = self._integration_project(
