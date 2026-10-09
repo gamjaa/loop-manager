@@ -304,6 +304,31 @@ class MaintenancePublicationTest(MaintenancePlanningCase):
             completed.phase, maintenance_state.MaintenancePhase.REFACTORING
         )
 
+    def test_publication_rejects_clean_filter_content_changes(self):
+        context = self._begin_barrier()
+        self._write_barrier_batch()
+        result = self._validate_barrier(context)
+        git(self.repo, "add", "docs/plans")
+        git(self.repo, "commit", "-m", "Prepare validated batch")
+        plan_commit = git(self.repo, "rev-parse", "HEAD")
+        path = result.plans[0][0]
+        original_git_bytes = loop_manager.git_bytes
+        # Mock the committed clean-filter output: only byte preservation is
+        # under test, so running an external filter adds no useful evidence.
+        for before, after in ((b"priority: normal", b"priority: high"),
+                              (b"Preserve", b"Discard")):
+            with self.subTest(change=before):
+                def filtered(root, *args):
+                    contents = original_git_bytes(root, *args)
+                    if args == ("show", f"{plan_commit}:{path}"):
+                        self.assertIn(before, contents)
+                        return contents.replace(before, after)
+                    return contents
+                with mock.patch("loop_manager.git_bytes", side_effect=filtered):
+                    with self.assertRaisesRegex(loop_manager.MaintenancePlanningError, "검증 후"):
+                        loop_manager._validate_maintenance_planning_commit(
+                            self.repo, result, plan_commit)
+
     def test_crlf_batch_recovers_from_durable_intent_after_restart(self):
         git(self.repo, "config", "core.autocrlf", "true")
         self.ready_path.write_bytes(
@@ -311,7 +336,12 @@ class MaintenancePublicationTest(MaintenancePlanningCase):
         )
         context = self._begin_barrier()
         self._write_barrier_batch()
+        # Actual Git CRLF cleaning must cover newly registered plans too.
+        for path in (self.repo / "docs/plans").glob("[[]G-00[23]]*.md"):
+            path.write_bytes(path.read_bytes().replace(b"\n", b"\r\n"))
         result = self._validate_barrier(context)
+        self.assertTrue(all(b"\r\n" in (self.repo / path).read_bytes()
+                            for path, _plan in result.plans))
         self.assertIn(b"\r\n", self.ready_path.read_bytes())
         git(self.repo, "add", "docs/plans")
         git(self.repo, "commit", "-m", "Prepare recoverable maintenance batch")
@@ -393,6 +423,20 @@ class MaintenancePublicationTest(MaintenancePlanningCase):
             recovered.phase, maintenance_state.MaintenancePhase.REFACTORING
         )
         self.assertEqual(repeated, recovered)
+        snapshot = execplan_catalog.load_execplan_snapshot(self.repo)
+        for path, plan in result.plans:
+            row = self.connection.execute(
+                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                (str(self.repo), plan["id"]),
+            ).fetchone()
+            published = loop_manager.git_bytes(self.repo, "show", f"{plan_commit}:{path}")
+            self.assertNotIn(b"\r\n", published)
+            self.assertEqual(row["publication_content_hash"], hashlib.sha256(published).hexdigest())
+            self.assertEqual(row["content_hash"], loop_manager.file_hash(self.repo / path))
+            self.assertNotEqual(row["content_hash"], row["publication_content_hash"])
+            identity = replace(execplan_catalog_state.publication_identity(row), status="MERGED")
+            proof = loop_manager._LegacyCatalogMergeProof(self.repo, plan_commit, {})
+            self.assertTrue(proof.verify_stored(snapshot.active[str(plan["id"])], identity).merged)
         self.assertEqual(
             [row["plan_id"] for row in rows],
             ["G-000", "G-001", "G-002", "G-003"],

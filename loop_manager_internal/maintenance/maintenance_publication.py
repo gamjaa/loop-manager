@@ -160,20 +160,13 @@ def _validate_maintenance_planning_commit(
         remote_contents = effects.git_bytes(
             repository, "show", f"{plan_commit}:{path}"
         )
-        if hashlib.sha256(remote_contents).hexdigest() != expected_hash:
-            # A checkout filter can make the verified worktree bytes differ from
-            # the committed blob (for example, CRLF is cleaned to LF).
-            worktree_blob = effects.git(
-                repository, "hash-object", f"--path={path}", "--", path,
-            ).stdout.strip()
-            committed_blob = effects.git(
-                repository, "rev-parse", "--verify", f"{plan_commit}:{path}",
-            ).stdout.strip()
-            if not worktree_blob or worktree_blob != committed_blob:
-                raise MaintenancePlanningError(
-                    "maintenance ExecPlan이 Planner 결과 검증 후 "
-                    f"변경됐습니다: {path}"
-                )
+        # Git may normalize CRLF checkout lines, but no other clean-filter
+        # transformation may alter the validated publication content.
+        if remote_contents.replace(b"\r\n", b"\n") != local_contents.replace(b"\r\n", b"\n"):
+            raise MaintenancePlanningError(
+                "maintenance ExecPlan이 Planner 결과 검증 후 "
+                f"변경됐습니다: {path}"
+            )
         if path == ARTIFACT_PATH:
             if result.maintenance_code_map_hash != expected_hash:
                 raise MaintenancePlanningError("Manager가 검증한 코드맵 출력이 아닙니다.")

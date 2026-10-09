@@ -1523,6 +1523,7 @@ _register_execplan_rows = _bind_effects(
     planner_publication._register_execplan_rows, lambda: planner_publication.RegisterExecplanRowsEffects(
         _ensure_execplans_schema=lambda *args, **kwargs: _ensure_execplans_schema(*args, **kwargs),
         file_hash=lambda *args, **kwargs: file_hash(*args, **kwargs),
+        git_bytes=lambda *args, **kwargs: git_bytes(*args, **kwargs),
         git=lambda *args, **kwargs: git(*args, **kwargs),
     ),
 )

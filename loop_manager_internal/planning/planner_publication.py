@@ -27,6 +27,7 @@ class RegisterExecplanRowsEffects:
     _ensure_execplans_schema: Callable[..., object]
     file_hash: Callable[..., object]
     git: Callable[..., object]
+    git_bytes: Callable[..., object]
 
 
 def _register_execplan_rows(
@@ -48,6 +49,9 @@ def _register_execplan_rows(
     for path, plan in plans:
         execplan_catalog_state.register_published_plan_row(
             connection, repo, path, plan, effects.file_hash(worktree / path), plan_commit,
+            publication_content_hash=hashlib.sha256(
+                effects.git_bytes(worktree, "show", f"{plan_commit}:{path}")
+            ).hexdigest(),
         )
         if plan.get("draft"):
             execplan_draft_state.observe(connection, repo, path, plan,
