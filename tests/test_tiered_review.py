@@ -1,3 +1,4 @@
+from tests.support.fixed_samples import use_fixed_guidance
 from dataclasses import replace
 import json
 from pathlib import Path
@@ -11,7 +12,23 @@ from tests.support.maintenance import inventory
 
 
 class TieredReviewTest(unittest.TestCase):
+    def test_assessment_reads_only_fixed_guidance_and_reuses_receipt(self):
+        from loop_manager_internal.agents import common_guidance
+        from tests.support.fixed_samples import PROJECT_FILES
+
+        read = common_guidance._read
+        def read_sample(path):
+            self.assertTrue(path.is_relative_to(PROJECT_FILES), path)
+            return read(path)
+        with mock.patch.object(common_guidance, '_read', side_effect=read_sample) as reads:
+            selected = self.select()
+            self.complete(selected)
+            self.assertFalse(self.select().required)
+            self.assertEqual({call.args[0] for call in reads.call_args_list},
+                             {PROJECT_FILES / path for path in common_guidance.GUIDANCE_PATHS})
+
     def setUp(self):
+        use_fixed_guidance(self)
         self.connection = sqlite3.connect(":memory:")
         self.connection.row_factory = sqlite3.Row
         self.addCleanup(self.connection.close)
