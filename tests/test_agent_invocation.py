@@ -60,12 +60,9 @@ class RunnerTests(TestCase):
                 return manager.AgentResult(0, "done", "new-session",
                                            usage=invocation.Usage(20, 10, None, 2))
 
-        from loop_manager_internal.agents import common_guidance
-        from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
-        guidance_repo = GuidanceRepository(self.connection)
-        snapshot = common_guidance.resolve(guidance_repo, invocation.InvocationContext("repo", "G-039"),
-                                          "worker", Path("/worktree"), self.state_dir)
-        guidance_repo.bind_session("repo", "codex", "old-session", snapshot.task_id)
+        from tests.support.workspace import pin_common_guidance
+        pin_common_guidance(self.connection, invocation.InvocationContext("repo", "G-039"),
+                            Path("/worktree"), self.state_dir, sessions=("old-session",))
         attempts = invocation.AttemptSequence("repo", "G-039", "revision")
         call = invocation.TrackedAgentCall(
             lambda session, fallback, context: manager.run_agent(
@@ -243,12 +240,10 @@ class RunnerTests(TestCase):
         self.assertEqual([row["result_kind"] for row in rows], ["timeout", "timeout"])
 
     def test_latest_attempt_without_final_session_clears_saved_session(self):
-        from loop_manager_internal.agents import common_guidance
-        from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
-        guidance_repo = GuidanceRepository(self.connection)
-        snapshot = common_guidance.resolve(guidance_repo, invocation.InvocationContext('repo', None),
-                                          'planner', Path('/worktree'), self.state_dir)
-        guidance_repo.bind_session('repo', 'codex', 'saved-session', snapshot.task_id)
+        from tests.support.workspace import pin_common_guidance
+        pin_common_guidance(self.connection, invocation.InvocationContext('repo', None),
+                            Path('/worktree'), self.state_dir, role='planner',
+                            sessions=('saved-session',))
         class Provider:
             def run(self, request):
                 self_outer.assertEqual(request.session_id, "saved-session")

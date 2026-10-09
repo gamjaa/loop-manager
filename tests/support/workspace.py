@@ -8,6 +8,7 @@ from loop_manager_internal.storage import planning_input_state
 from loop_manager_internal.agents import agent_write_isolation as isolation
 from tests.support.catalog import write_execplan
 from tests.support.git import git_command, make_remote_repository, commit_and_push
+from tests.support.fixed_samples import PROJECT_FILES
 
 
 def symlink_or_skip(link: Path, target, *, target_is_directory=False):
@@ -125,7 +126,8 @@ class CleanupFixture:
         return connection
 
 
-def pin_common_guidance(connection, context, worktree: Path, state_dir: Path, *, sessions=(), provider='codex'):
+def pin_common_guidance(connection, context, worktree: Path, state_dir: Path, *, sessions=(), provider='codex',
+                        role='worker'):
     """Seed known versions before native-policy unit doubles replace subprocess.
 
     Real instruction resolution/session fallback is covered by invocation tests;
@@ -136,9 +138,10 @@ def pin_common_guidance(connection, context, worktree: Path, state_dir: Path, *,
     from loop_manager_internal.agents import common_guidance
     from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
     repository = GuidanceRepository(connection)
-    with mock.patch.object(common_guidance.subprocess, 'run',
+    with mock.patch.object(common_guidance, 'RUNTIME_ROOT', PROJECT_FILES), \
+         mock.patch.object(common_guidance.subprocess, 'run',
                            return_value=SimpleNamespace(returncode=0, stdout='a' * 40)):
-        guidance = common_guidance.resolve(repository, context, 'worker', worktree, state_dir)
+        guidance = common_guidance.resolve(repository, context, role, worktree, state_dir)
     for session in sessions:
         repository.bind_session(context.repo, provider, session, guidance.task_id)
     return guidance

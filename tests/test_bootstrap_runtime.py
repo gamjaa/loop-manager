@@ -21,6 +21,7 @@ from tests.support.origin import (
     remote_fixture, advance_remote, OriginScopeFixture,
 )
 from tests.support.fixed_samples import PROJECT_FILES
+from tests.support.workspace import pin_common_guidance
 from loop_manager_internal.runtime import bootstrap
 
 
@@ -568,14 +569,12 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                             connection.execute('UPDATE exec_plans SET agent_role=?, agent_snapshot=?, '
                                 'agent_result_snapshot=? WHERE repo=? AND plan_id=?',
                                 (role, before.serialize(), saved_result.serialize(), str(source), 'G-001'))
-                    from loop_manager_internal.agents import common_guidance
-                    from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
-                    guidance_repository = GuidanceRepository(connection)
                     context = InvocationContext(str(source), 'G-001' if role != 'planner' else None,
                                                 task_id='planning:' + fingerprint if role == 'planner' else None)
-                    guidance = common_guidance.resolve(guidance_repository, context, role, workspace, state)
-                    for session in ('planner-existing',) if role == 'planner' else ('worker-existing', 'reviewer-existing'):
-                        guidance_repository.bind_session(str(source), 'codex', session, guidance.task_id)
+                    sessions = (('planner-existing',) if role == 'planner'
+                                else ('worker-existing', 'reviewer-existing'))
+                    pin_common_guidance(connection, context, workspace, state,
+                                        sessions=sessions, role=role)
                     if role == 'reviewer':
                         with connection:
                             connection.execute("UPDATE exec_plans SET status='REVIEWING', "

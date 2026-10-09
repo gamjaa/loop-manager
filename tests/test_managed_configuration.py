@@ -44,9 +44,12 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             target.mkdir()
             original = b'custom project rules\r\n\xff\n'
             (target / 'AGENTS.md').write_bytes(original)
-            command = (['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
-                        str(script), '-TargetPath', str(target)]
-                       if os.name == 'nt' else ['bash', str(script), str(target)])
+            def copy_command(destination):
+                return (['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
+                         str(script), '-TargetPath', str(destination)]
+                        if os.name == 'nt' else ['bash', str(script), str(destination)])
+
+            command = copy_command(target)
             subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             self.assertEqual((target / 'AGENTS.md').read_bytes(), original)
             copied_files = (
@@ -79,6 +82,13 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             protected_files = (*copied_files, tool_relative,
                                '.agents/skills/specification-docs/scripts/frontmatter.py')
             before = {relative: (target / relative).read_bytes() for relative in protected_files}
+
+            empty_target = root / 'empty-project'
+            empty_target.mkdir()
+            subprocess.run(copy_command(empty_target), check=True,
+                           stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+            self.assertFalse((empty_target / 'AGENTS.md').exists())
+
             result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual((target / 'AGENTS.md').read_bytes(), original)
