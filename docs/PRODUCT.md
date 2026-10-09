@@ -64,7 +64,8 @@
 | Merge 대기 PR이 없는 due 리팩터링의 우선 처리 | [R-054](requirements/archive/%5BR-054%5D%20Due%20Refactoring%20Priority.md) |
 | 이벤트 시점의 진행·사용자 조치 알림과 무음 구분 | [R-053](requirements/%5BR-053%5D%20Timely%20Progress%20Notifications.md) |
 | 테스트별 시간·실제 Agent 없는 테스트·안전한 Python 캐시 | [R-058](requirements/archive/%5BR-058%5D%20Test%20Timing%20and%20Agent-Free%20Test%20Execution.md), [R-059](requirements/%5BR-059%5D%20Safe%20Python%20Bytecode%20Cache%20Use.md) |
-| 규칙 기반 작업의 Manager 처리·모델 호출과 입출력 감소·동일 입력 성공 결과 재사용 | [R-063](requirements/archive/%5BR-063%5D%20Manager-Owned%20Deterministic%20Work%20and%20Minimal%20Model%20Use.md) |
+| 규칙 기반 작업의 Manager 처리·모델 호출과 입출력 감소 | [R-063](requirements/archive/%5BR-063%5D%20Manager-Owned%20Deterministic%20Work%20and%20Minimal%20Model%20Use.md) |
+| 실제 검증 입력만의 목록·문서 원본을 고정 샘플로 대체·일반 verify와 후보 성공 결과 재사용 | [R-072](requirements/%5BR-072%5D%20Reuse%20Successful%20Candidate%20Results%20with%20Proven%20Inputs.md) |
 
 R-023의 원격 실행·self handoff 목표는 유지하며 로컬 갱신 gate는 R-056, 역할별 파일 권한은 R-061을 따른다. R-055의 planning 오류와 R-061의 유효한 draft 사용자 판단 대기는 구분한다. draft는 planning 오류가 아니며 독립 작업을 막지 않지만 프로젝트 완료와 관련 Requirement archive를 허용하는 완료 상태도 아니다.
 

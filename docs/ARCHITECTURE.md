@@ -554,8 +554,8 @@ generation, 실제 run·입력 관측·출력·결과와 reuse의 원래 run·�
 
 `ValidationEffects.observe_verify_inputs`는 실제 명령·유효 환경·runtime·Git/외부 identity를
 증명하는 실행 adapter의 관측 경계다. 기본 임의 프로젝트 스크립트 adapter는 해당 동적 입력을
-측정하지 못하므로 unknown으로 반환해 전체 verify를 계속 실행한다. 문자열 분석으로 의존성
-없음을 추정하거나 단순 tree/SHA cache로 대체하지 않는다.
+측정하지 못하며 일반 경로는 `runtime_identity=None`으로 관측하므로 전체 verify를 계속 실행한다.
+문자열 분석으로 의존성 없음을 추정하거나 단순 tree/SHA cache로 대체하지 않는다.
 
 운영 port가 연결한 `result_validation.observe_verify_inputs`는 Linux에서
 `manager_adapter.ISOLATED_COMPILE_SCRIPT`와 전체 bytes가 같은 아래 계약도 지원한다.
