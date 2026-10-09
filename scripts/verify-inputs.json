@@ -4,6 +4,7 @@
     "loop_manager.py",
     "loop_manager_internal/**",
     "tests/**",
+    "scripts/verify.json",
     "scripts/verify.sh",
     "scripts/verify.ps1",
     "scripts/copy-project-files.sh",

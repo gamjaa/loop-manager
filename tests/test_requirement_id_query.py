@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest import mock
 import urllib.request
 
+from loop_manager_internal.catalog import frontmatter as shared_frontmatter
 
 ROOT = Path(__file__).resolve().parents[1]
 TOOL = runpy.run_path(
@@ -94,6 +95,48 @@ class RequirementIdQueryTest(unittest.TestCase):
                 TOOL["requirement_identity"]("# [R-012] Legacy title\n"),
                 ("R-012", "Legacy title"),
             )
+
+    def test_skill_and_execplan_use_the_same_frontmatter_parser_source(self):
+        skill_parser = TOOL["parse_frontmatter"]
+        self.assertEqual(
+            Path(skill_parser.__code__.co_filename).resolve(),
+            Path(shared_frontmatter.parse_frontmatter.__code__.co_filename).resolve(),
+        )
+        invalid_key = "---\nnot a key: value\n---\n"
+        with self.assertRaisesRegex(TOOL["RequirementIdError"], "frontmatter key"):
+            TOOL["requirement_identity"](invalid_key)
+        with self.assertRaisesRegex(RuntimeError, "frontmatter key"):
+            shared_frontmatter.parse_frontmatter(invalid_key)
+
+    def test_deployed_skill_uses_colocated_parser_without_manager_package(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            script_directory = root / ".agents/skills/specification-docs/scripts"
+            script_directory.mkdir(parents=True)
+            script = script_directory / "next_requirement_id.py"
+            script.write_bytes(Path(TOOL["__file__"]).read_bytes())
+            parser = script_directory / "frontmatter.py"
+            parser.write_bytes(Path(shared_frontmatter.__file__).read_bytes())
+            self._write(root, "docs/requirements/one.md", "# [R-009] One\n")
+
+            original_import = __import__
+
+            def reject_manager_import(name, *args, **kwargs):
+                if name == "loop_manager_internal" or name.startswith("loop_manager_internal."):
+                    raise AssertionError(f"unexpected Manager dependency: {name}")
+                return original_import(name, *args, **kwargs)
+
+            with (
+                mock.patch("builtins.__import__", side_effect=reject_manager_import),
+                mock.patch.object(Path, "cwd", return_value=root),
+                mock.patch.object(sys, "argv", ["next_requirement_id.py"]),
+                redirect_stdout(io.StringIO()) as stdout,
+                redirect_stderr(io.StringIO()) as stderr,
+            ):
+                deployed_tool = runpy.run_path(str(script))
+                status = deployed_tool["main"]()
+
+            self.assertEqual((status, stdout.getvalue(), stderr.getvalue()), (0, "R-010\n", ""))
 
     def test_invalid_documents_fail_without_partial_stdout(self):
         invalid_documents = (

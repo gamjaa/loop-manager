@@ -292,7 +292,7 @@ class VerifyInputObservationTest(unittest.TestCase):
         root = Path(__file__).resolve().parents[1]
         patterns = inputs.parse((root / inputs.MANIFEST).read_bytes())
         for path in ('loop_manager.py', 'loop_manager_internal/verification/runner.py',
-                     'tests/support/origin.py', 'scripts/verify.sh', 'scripts/verify.ps1',
+                     'tests/support/origin.py', 'scripts/verify.json', 'scripts/verify.sh', 'scripts/verify.ps1',
                      'requirements.txt', 'config/config.ini.example', 'AGENTS.md', 'README.md',
                      'docs/PLANS.md', 'docs/AGENTS.worker.md', 'docs/PRODUCT.md',
                      'docs/ARCHITECTURE.md',

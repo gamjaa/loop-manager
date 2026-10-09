@@ -3,61 +3,34 @@
 
 from __future__ import annotations
 
+import importlib.util
 import re
 import stat
 import sys
 from pathlib import Path
 
+_SHARED_FRONTMATTER = Path(__file__).with_name("frontmatter.py")
+if not _SHARED_FRONTMATTER.is_file():
+    _SHARED_FRONTMATTER = (
+        Path(__file__).resolve().parents[4]
+        / "loop_manager_internal/catalog/frontmatter.py"
+    )
+_FRONTMATTER_SPEC = importlib.util.spec_from_file_location(
+    "_loop_manager_frontmatter", _SHARED_FRONTMATTER
+)
+if _FRONTMATTER_SPEC is None or _FRONTMATTER_SPEC.loader is None:
+    raise ImportError(f"공유 frontmatter parser를 읽을 수 없습니다: {_SHARED_FRONTMATTER}")
+_FRONTMATTER_MODULE = importlib.util.module_from_spec(_FRONTMATTER_SPEC)
+_FRONTMATTER_SPEC.loader.exec_module(_FRONTMATTER_MODULE)
+parse_frontmatter = _FRONTMATTER_MODULE.parse_frontmatter
+
 
 _ID = re.compile(r"R-([0-9]{3,})\Z")
 _HEADING = re.compile(r"# \[(R-[0-9]{3,})\] (.+)")
-_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*\Z")
 
 
 class RequirementIdError(ValueError):
     """A Requirement document tree cannot provide an unambiguous ID set."""
-
-
-def _parse_frontmatter(text: str) -> dict[str, str | list[str]] | None:
-    lines = text.splitlines()
-    if not lines:
-        return None
-    if lines[0] != "---":
-        if lines[0].startswith("---"):
-            raise RequirementIdError("frontmatter 시작 구분자가 유효하지 않습니다")
-        return None
-    try:
-        end = lines.index("---", 1)
-    except ValueError as error:
-        raise RequirementIdError("frontmatter 종료 구분자가 없습니다") from error
-
-    values: dict[str, str | list[str]] = {}
-    current_list: str | None = None
-    for line in lines[1:end]:
-        if line.startswith("  - "):
-            if current_list is None:
-                raise RequirementIdError(f"유효하지 않은 frontmatter 줄입니다: {line}")
-            value = values[current_list]
-            assert isinstance(value, list)
-            value.append(line[4:].strip())
-            continue
-        if ":" not in line:
-            raise RequirementIdError(f"유효하지 않은 frontmatter 줄입니다: {line}")
-        key, value = (part.strip() for part in line.split(":", 1))
-        if not _KEY.fullmatch(key):
-            raise RequirementIdError(f"유효하지 않은 frontmatter key입니다: {key}")
-        if key in values:
-            raise RequirementIdError(f"중복 frontmatter key입니다: {key}")
-        if value == "":
-            values[key] = []
-            current_list = key
-        elif value == "[]":
-            values[key] = []
-            current_list = None
-        else:
-            values[key] = value
-            current_list = None
-    return values
 
 
 def _valid_id(value: object) -> tuple[str, int]:
@@ -75,7 +48,10 @@ def requirement_identity(text: str) -> tuple[str, str]:
     Kept importable so Manager-side checks can share this identity rule.
     """
     text = text.removeprefix("\ufeff")
-    frontmatter = _parse_frontmatter(text)
+    try:
+        frontmatter = parse_frontmatter(text)
+    except RuntimeError as error:
+        raise RequirementIdError(str(error)) from error
     if frontmatter is not None:
         requirement_id, _ = _valid_id(frontmatter.get("id"))
         title = frontmatter.get("title")
