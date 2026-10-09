@@ -74,7 +74,15 @@ description: Create, review, and refine PRODUCT.md, ARCHITECTURE.md, requirement
 
 ## Requirement Lifecycle
 
-Requirement는 frontmatter나 별도 상태 없이 제품에 원하는 변화와 Acceptance Criteria를 기록하는 순수 문서다. 사용자 결정이 필요한 항목을 해소하고 Ready Check를 통과한 뒤 `docs/requirements/` 바로 아래에 저장한다. 파일 경로는 안정적인 식별자로 유지한다.
+새 Requirement를 만들기 직전에 프로젝트 루트에서 다음 명령을 실행하고 출력된 ID를 파일명과 첫 제목에 사용한다.
+
+```sh
+python .agents/skills/specification-docs/scripts/next_requirement_id.py
+```
+
+이 명령은 활성·archive Requirement의 원본 ID 중 최댓값 다음 ID를 한 줄로 출력한다. archive 디렉터리가 없으면 빈 집합으로 취급한다. 결과는 로컬 작성용 후보이며 예약이 아니므로 문서를 만들기 직전에 조회한다. Skill은 파일을 직접 나열해 번호를 계산하지 않는다. 조회가 실패하면 번호를 계산하거나 기존 문서에서 추정하지 말고 오류를 해결한다.
+
+새 Requirement는 frontmatter나 별도 상태 없이 제품에 원하는 변화와 Acceptance Criteria를 기록하는 순수 문서다. 기존 문서에 유효한 `id`와 `title` frontmatter가 있으면 두 값을 원본으로 사용한다. frontmatter가 없으면 첫 `# [R-ID] 제목` 제목을 사용한다. frontmatter가 잘못됐거나 필요한 값이 없으면 본문이나 파일명으로 대체하지 않는다. 기존 Requirement에 frontmatter를 일괄 추가하지 않는다. 사용자 결정이 필요한 항목을 해소하고 Ready Check를 통과한 뒤 `docs/requirements/` 바로 아래에 저장한다. 파일 경로는 안정적인 식별자로 유지한다.
 
 `docs/requirements/archive/`의 Requirement는 배경과 과거 결정을 확인하기 위해 읽기만 한다. 현재 변경의 Requirement로 재사용하거나 수정·삭제하지 않고 활성 위치로 되돌리지 않는다. 보관 문서와 관련된 새 변경은 사용자 요청을 기준으로 새로운 고유 ID·경로의 Requirement를 작성한다. 보관 문서의 ID·경로를 다시 쓰거나 원문을 편집용 복사본으로 만들지 않는다. 이 Skill의 기존 Requirement 재사용·갱신은 활성 문서에만 적용한다.
 

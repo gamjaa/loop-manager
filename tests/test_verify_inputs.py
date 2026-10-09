@@ -295,8 +295,10 @@ class VerifyInputObservationTest(unittest.TestCase):
                      'tests/support/origin.py', 'scripts/verify.sh', 'scripts/verify.ps1',
                      'requirements.txt', 'config/config.ini.example', 'AGENTS.md', 'README.md',
                      'docs/PLANS.md', 'docs/AGENTS.worker.md', 'docs/PRODUCT.md',
+                     'docs/ARCHITECTURE.md',
                      'docs/FUTURE_IDEAS.md', 'docs/PRODUCT.template.md',
                      'docs/ARCHITECTURE.template.md', 'docs/REQUIREMENT.template.md',
-                     '.agents/skills/specification-docs/SKILL.md'):
+                     '.agents/skills/specification-docs/SKILL.md',
+                     '.agents/skills/specification-docs/scripts/next_requirement_id.py'):
             with self.subTest(path=path):
                 self.assertTrue(any(inputs.matches(path, pattern) for pattern in patterns))

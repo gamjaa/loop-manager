@@ -14,10 +14,12 @@
     "README.md",
     "docs/PLANS.md",
     "docs/PRODUCT.md",
+    "docs/ARCHITECTURE.md",
     "docs/FUTURE_IDEAS.md",
     "docs/*.template.md",
     "docs/AGENTS.*.md",
     ".agents/skills/specification-docs/SKILL.md",
+    ".agents/skills/specification-docs/scripts/**",
     "run.sh",
     "run.ps1"
   ]

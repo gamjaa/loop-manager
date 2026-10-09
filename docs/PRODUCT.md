@@ -248,7 +248,9 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 ### PRODUCT, Requirement와 ExecPlan
 
 - `PRODUCT.md`는 현재 Merge된 제품 동작, 경계와 장기 규칙의 기준이다
-- Requirement는 원하는 변화·이유·Acceptance Criteria만 기록하며 frontmatter·상태·complexity·risk를 두지 않는다
+- 새 Requirement는 원하는 변화·이유·Acceptance Criteria만 기록하며 frontmatter·상태·complexity·risk를 두지 않는다
+- 새 Requirement를 만들기 직전에 Specification Skill은 프로젝트 루트의 `python .agents/skills/specification-docs/scripts/next_requirement_id.py`를 실행해 출력된 ID를 사용한다. 조회는 활성·archive 문서의 원본 ID 중 최댓값 다음 후보를 반환하며, 중복이나 번호 공백은 허용하고 중간 번호를 채우지 않는다. 파일을 수정하거나 번호를 예약하지 않는다. 빈 집합은 R-001이고 archive 디렉터리 부재는 빈 집합이다. 조회 오류가 있으면 유효한 ID 없이 실패한다
+- 신규 문서는 frontmatter 없이 작성한다. 기존 문서의 ID·제목 조회는 유효한 `id`·`title` frontmatter를 우선하고, frontmatter가 없으면 첫 `# [R-ID] 제목`을 사용한다. 잘못되거나 불완전한 frontmatter는 파일명·본문으로 대체하지 않으며 기존 문서에 frontmatter를 일괄 추가하지 않는다
 - 기존 ExecPlan의 활성 Requirement source가 없으면 동일 파일명의 `docs/requirements/archive/` 문서를 조회하되 원래 source 경로는 바꾸지 않는다
 - 새 ExecPlan의 source와 Planner 입력은 활성 PRODUCT 또는 `docs/requirements/` 바로 아래 문서로 제한한다
 - source로 참조하는 비종료 ExecPlan·draft가 있으면 Requirement 전체 충족 확인과 archive를 미룬다. 연결된 활성 작업이 없어지면 일반 Planner가 최신 원격 구현·검증과 관련 제품·설계 문서로 각 Acceptance Criterion을 충족·미충족·불확실로 판단한다. 관련 계획이 있으면 모두 실제 MERGED여야 하며, 계획 없이 직접 구현한 변경도 실제 근거로 판단한다. 계획 작성 완료나 관련 계획의 Merge만으로 충족을 추정하지 않는다

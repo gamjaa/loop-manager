@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr
@@ -346,6 +347,14 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             skill = (target / ".agents/skills/specification-docs/SKILL.md").read_text(
                 encoding="utf-8"
             )
+            tool_path = ".agents/skills/specification-docs/scripts/next_requirement_id.py"
+            self.assertEqual((target / tool_path).read_bytes(),
+                             (loop_manager.ROOT / tool_path).read_bytes())
+            query = subprocess.run(
+                [sys.executable, tool_path], cwd=target, check=False,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            self.assertEqual((query.returncode, query.stdout, query.stderr), (0, "R-001\n", ""))
             self.assertFalse((target / "AGENTS.md").exists())
             self.assertEqual((target / ".agents/skills/specification-docs/SKILL.md").read_bytes(),
                              (loop_manager.ROOT / ".agents/skills/specification-docs/SKILL.md").read_bytes())
