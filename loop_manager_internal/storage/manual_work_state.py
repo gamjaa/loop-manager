@@ -103,6 +103,97 @@ def live_requirement_paths(connection, repo):
             *(path for item in json.loads(group['documents']) for path in item['plan']['sources'])))
 
 
+_MANUAL_PREPARATION_STATES = frozenset({
+    'STARTING', 'GENERATING', 'REGISTERING',
+})
+_MANUAL_ACTIVE_GROUP_STATES = frozenset({
+    'MANUAL_WORKING', 'MANUAL_PENDING', 'AUTOMATIC', 'PREPARATION_CONFLICT',
+})
+_MANUAL_INACTIVE_GROUP_STATES = frozenset({'PR_OPEN', 'CLOSED', 'MERGED'})
+
+
+def _validated_group_members(connection, repo, group):
+    try:
+        declared = json.loads(group['members'])
+    except (TypeError, json.JSONDecodeError) as error:
+        raise runtime_state.RuntimeStateError(
+            f"수동 제출 묶음의 소유 목록이 유효하지 않습니다: {group['group_id']}"
+        ) from error
+    stored = [row[0] for row in connection.execute(
+        "SELECT plan_id FROM manual_work_members WHERE repo=? AND group_id=? ORDER BY plan_id",
+        (repo, group['group_id']),
+    )]
+    if (not isinstance(declared, list) or any(not isinstance(item, str) for item in declared)
+            or len(set(declared)) != len(declared) or sorted(declared) != stored
+            or (declared and group['owner_id'] not in declared)
+            or (not declared and group['owner_id'] is not None)):
+        raise runtime_state.RuntimeStateError(
+            f"수동 제출 묶음의 전체 소유 목록이 다릅니다: {group['group_id']}"
+        )
+    return declared, stored
+
+
+def planning_ownership_state(connection, repo, plan_id, execution_row):
+    """Return a stable claim fingerprint and whether a live manual group owns the plan."""
+    tables = {row[0] for row in connection.execute(
+        "SELECT name FROM sqlite_master WHERE type='table'"
+    )}
+    has_groups = 'manual_work_groups' in tables
+    has_members = 'manual_work_members' in tables
+    if not has_groups and not has_members:
+        return digest([]), False
+    if has_groups != has_members:
+        raise runtime_state.RuntimeStateError('수동 소유권 catalog가 불완전합니다.')
+
+    memberships = {str(row[0]) for row in connection.execute(
+        "SELECT group_id FROM manual_work_members WHERE repo=? AND plan_id=? ORDER BY group_id",
+        (repo, plan_id),
+    ).fetchall()}
+    snapshot = []
+    owned = False
+    matched = set()
+    for group in connection.execute(
+            "SELECT * FROM manual_work_groups WHERE repo=? ORDER BY group_id", (repo,)):
+        group_id = str(group['group_id'])
+        declared, stored = _validated_group_members(connection, repo, group)
+        if plan_id not in declared and plan_id not in stored:
+            continue
+        matched.add(group_id)
+        group_state = str(group['state'])
+        if group_state in _MANUAL_PREPARATION_STATES:
+            owned = True
+        elif group_state in _MANUAL_ACTIVE_GROUP_STATES:
+            owned = owned or (group_state == 'AUTOMATIC' and group['request_id'] is not None)
+            if execution_row is not None:
+                fields = set(execution_row.keys())
+                owned = owned or (
+                    str(execution_row['status']) in WAITING_STATUSES
+                    or str(execution_row['status']) in runtime_state.ACTIVE_STATUSES
+                    or any(execution_row[field] for field in (
+                        'branch', 'worktree', 'workspace_owned', 'worker_session_id',
+                        'reviewer_session_id',
+                    ) if field in fields)
+                )
+        elif group_state not in _MANUAL_INACTIVE_GROUP_STATES:
+            raise runtime_state.RuntimeStateError(
+                f'수동 제출 묶음 상태를 확인할 수 없습니다: {group_id} ({group_state})'
+            )
+
+        group_state_data = {
+            key: group[key] for key in group.keys()
+            if key not in {'last_error', 'attempts'}
+        }
+        snapshot.append({
+            'group_id': group_id,
+            'group': group_state_data,
+            'members': stored,
+        })
+    for group_id in sorted(memberships - matched):
+        # Membership rows can remain as identity history after the live group ends.
+        snapshot.append({'group_id': group_id, 'group': None, 'members': [plan_id]})
+    return digest(snapshot), owned
+
+
 class ManualWorkRepository:
     def __init__(self, connection):
         self.connection = connection
@@ -193,10 +284,8 @@ class ManualWorkRepository:
         group = self.for_plan(repo, plan_id)
         if group is None:
             return plan_id
-        members = json.loads(group['members'])
-        stored = [row[0] for row in self.connection.execute("SELECT plan_id FROM manual_work_members "
-            "WHERE repo=? AND group_id=? ORDER BY plan_id", (repo, group['group_id']))]
-        if sorted(members) != stored or plan_id not in members or group['owner_id'] not in members:
+        members, _ = _validated_group_members(self.connection, repo, group)
+        if plan_id not in members:
             raise runtime_state.RuntimeStateError('수동 제출 묶음의 전체 소유 목록이 다릅니다.')
         return group['owner_id']
 

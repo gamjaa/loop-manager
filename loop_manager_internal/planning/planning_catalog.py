@@ -150,6 +150,8 @@ def snapshot_to_dict(snapshot: ReadyPlanSnapshot) -> dict[str, object]:
         payload["current_risk"] = snapshot.current_risk
     if snapshot.execution_state is not None:
         payload["execution_state"] = snapshot.execution_state
+    if snapshot.manual_ownership_state is not None:
+        payload["manual_ownership_state"] = snapshot.manual_ownership_state
     return payload
 
 
@@ -165,6 +167,9 @@ def snapshot_from_dict(value: Mapping[str, object]) -> ReadyPlanSnapshot:
         if execution_state is not None:
             if not isinstance(execution_state, str) or not isinstance(json.loads(execution_state), dict):
                 raise ValueError("invalid execution snapshot")
+        manual_ownership_state = value.get("manual_ownership_state")
+        if manual_ownership_state is not None and not isinstance(manual_ownership_state, str):
+            raise ValueError("invalid manual ownership snapshot")
         raw_sources = value["sources"]
         raw_dependencies = value["depends_on"]
         if (
@@ -195,6 +200,7 @@ def snapshot_from_dict(value: Mapping[str, object]) -> ReadyPlanSnapshot:
             current_risk=str(current_risk) if current_risk is not None else None,
             current_metadata_recorded=recorded,
             execution_state=execution_state,
+            manual_ownership_state=manual_ownership_state,
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("mutable READY snapshot manifest가 유효하지 않습니다.") from error

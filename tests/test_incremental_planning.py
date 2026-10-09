@@ -1180,6 +1180,77 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
             [plan.plan_id for plan in snapshot.plans], ["G-001", "G-002"]
         )
 
+    def test_mutable_snapshot_excludes_live_manual_owners_and_preparation_intents(self):
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+
+        store = ManualWorkRepository(self.connection)
+        start = store.create(
+            str(self.repo), 'start', 'manual-start', (), self.base, self.base,
+            members=('G-001',),
+        )
+        store.update(start, owner_id='G-001', branch='manual-start', worktree='/tmp/manual-start')
+        submit = store.create(
+            str(self.repo), 'submit', 'manual-submit', ('docs/requirements/R.md',),
+            self.base, self.base, members=('G-002',),
+        )
+        store.update(submit, state='REGISTERING', owner_id='G-002',
+                     branch='manual-submit', worktree='/tmp/manual-submit')
+
+        snapshot = loop_manager.mutable_ready_snapshot(
+            self.connection, str(self.repo), self.repo, self.base
+        )
+
+        self.assertEqual(snapshot.plans, ())
+        store.update(submit, state='AUTOMATIC')
+        store.accept(submit, head=self.base, base=self.base, input_token='accepted')
+        accepted_snapshot = loop_manager.mutable_ready_snapshot(
+            self.connection, str(self.repo), self.repo, self.base
+        )
+        self.assertEqual(accepted_snapshot.plans, ())
+
+    def test_mutable_snapshot_excludes_every_member_of_accepted_manual_group(self):
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+
+        store = ManualWorkRepository(self.connection)
+        group = store.create(
+            str(self.repo), 'submit', 'manual-submit', (), self.base, self.base,
+            members=('G-001', 'G-002'),
+        )
+        group = store.update(group, state='AUTOMATIC', owner_id='G-001',
+                             branch='manual-submit', worktree='/tmp/manual-submit')
+        store.accept(group, head=self.base, base=self.base, input_token='accepted')
+
+        snapshot = loop_manager.mutable_ready_snapshot(
+            self.connection, str(self.repo), self.repo, self.base
+        )
+
+        self.assertEqual(snapshot.plans, ())
+
+    def test_manual_membership_history_without_live_group_does_not_claim_ready_plan(self):
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+
+        store = ManualWorkRepository(self.connection)
+        orphan = store.create(
+            str(self.repo), 'start', 'released-start', (), self.base, self.base,
+            members=('G-001',),
+        )
+        self.connection.execute(
+            "DELETE FROM manual_work_groups WHERE repo=? AND group_id=?",
+            (str(self.repo), orphan['group_id']),
+        )
+        merged = store.create(
+            str(self.repo), 'submit', 'finished-submit', ('docs/requirements/R.md',),
+            self.base, self.base, members=('G-002',),
+        )
+        store.update(merged, state='MERGED', owner_id='G-002')
+        self.connection.commit()
+
+        snapshot = loop_manager.mutable_ready_snapshot(
+            self.connection, str(self.repo), self.repo, self.base
+        )
+
+        self.assertEqual([plan.plan_id for plan in snapshot.plans], ['G-001', 'G-002'])
+
     def test_started_revision_preserves_execution_audit_and_worker_level(self):
         from loop_manager_internal.storage.planning_publication_state import apply_mutable_catalog_changes
         self.connection.execute("UPDATE exec_plans SET ever_started=1, worker_session_id='saved', "
@@ -1208,6 +1279,82 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         with mock.patch.object(loop_manager, 'pr_for_branch', return_value={'url': 'https://example/pr/2'}):
             with self.assertRaisesRegex(loop_manager.PlannerValidationError, 'PR이 등록'):
                 loop_manager._assert_mutable_ready_snapshot_current(self.connection, snapshot)
+
+    def test_stage_document_cannot_publish_a_manual_owned_plan_revision(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.execution import stage_documents as documents
+        from loop_manager_internal.execution.execution_session import ExecutionIdentity
+        from loop_manager_internal.execution.execution_runtime import ExecutionPhase
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+        from tests.support.revision import definition
+
+        store = ManualWorkRepository(self.connection)
+        group = store.create(
+            str(self.repo), 'submit', 'manual-submit', (), self.base, self.base,
+            members=('G-001',),
+        )
+        group = store.update(group, state='AUTOMATIC', owner_id='G-001',
+                             branch='manual-work', worktree='/tmp/manual-work')
+        store.accept(group, head=self.base, base=self.base, input_token='accepted')
+        self.connection.execute(
+            "UPDATE exec_plans SET status='IMPLEMENTING', ever_started=1, active_sha=?, "
+            "branch='manual-work', worker_session_id='manual-session' WHERE plan_id='G-001'",
+            (self.base,),
+        )
+        self.connection.commit()
+
+        current = replace(definition(), revision_sha=self.base, path=self.paths['G-001'],
+                          title='First', sources=('docs/PRODUCT.md',))
+        state = SimpleNamespace(
+            connection=self.connection,
+            row=lambda: self.connection.execute(
+                "SELECT * FROM exec_plans WHERE repo=? AND plan_id='G-001'", (str(self.repo),)
+            ).fetchone(),
+        )
+        context = SimpleNamespace(
+            plan=SimpleNamespace(plan_id='G-001'), phase=ExecutionPhase.IMPLEMENTING,
+            worktree=self.repo, branch='manual-work', resolving_rebase=False,
+        )
+        identity = ExecutionIdentity(
+            repo=str(self.repo), repo_path=self.repo, state_dir=self.repo / '.state',
+            base='main', provider='codex',
+        )
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        proposal = plan_text('G-001', 'Revised')
+        documents.save(checkpoints, str(self.repo), 'G-001', {
+            'version': 1, 'stage': 'proposed', 'base': self.base,
+            'phase': 'IMPLEMENTING', 'paths': ['docs/PRODUCT.md'],
+            'document_only': True, 'previous': current.serialize(),
+            'assessment': {
+                'relevant': True, 'implementation': 'satisfied',
+                'plan_text': proposal, 'evidence': '현재 구현과 최신 명세를 대조했습니다.',
+            },
+            'candidate': self.base,
+        })
+        effects = documents.StageDocumentEffects(
+            git=loop_manager.git,
+            begin_scope=mock.Mock(), capture_scope=mock.Mock(), validate_scope=mock.Mock(),
+            clear_scope=mock.Mock(), run_agent=mock.Mock(),
+            prepare_snapshot=loop_manager.mutable_ready_snapshot,
+            assert_snapshot=loop_manager._assert_mutable_ready_snapshot_current,
+            validate_result=loop_manager.validate_planner_result,
+            validate_worktree=mock.Mock(), pr_for_branch=mock.Mock(return_value=None),
+            log=mock.Mock(), run_with_retries=mock.Mock(),
+        )
+
+        with mock.patch.object(loop_manager, 'pr_for_branch', return_value=None):
+            with self.assertRaisesRegex(loop_manager.PlannerValidationError, '갱신 권한'):
+                documents.refresh(
+                    effects, state, checkpoints, identity, context,
+                    current, current, ['docs/PRODUCT.md'],
+                )
+        effects.pr_for_branch.assert_called_once_with(self.repo, 'manual-work')
+        effects.validate_worktree.assert_not_called()
+        self.assertEqual(
+            git(self.repo, 'show', f"origin/main:{self.paths['G-001']}"),
+            plan_text('G-001', 'First').strip(),
+        )
 
     def test_active_document_proposal_publication_and_restart_use_one_model_result(self):
         from types import SimpleNamespace
@@ -1784,18 +1931,26 @@ class MutableReadyMetadataCasTest(unittest.TestCase):
                 )
 
     def test_manifest_round_trip_preserves_nullable_cache_snapshot(self):
+        plan = replace(self.snapshot.plans[0], manual_ownership_state='manual-history-digest')
+        snapshot = replace(
+            self.snapshot,
+            plans=(plan,),
+            token=mutable_snapshot_token(
+                self.snapshot.repo, self.snapshot.active_sha, (plan,), self.snapshot.recovery_goals
+            ),
+        )
         result = loop_manager.ValidatedPlanningResult(
             plans=(),
             publication_paths=(),
-            deletions=(PlanDeletion(self.snapshot.plans[0]),),
-            mutable_snapshot=self.snapshot,
+            deletions=(PlanDeletion(plan),),
+            mutable_snapshot=snapshot,
         )
 
         restored = loop_manager._planning_result_from_manifest(
             loop_manager._planning_result_manifest(result)
         )
 
-        self.assertEqual(restored.mutable_snapshot, self.snapshot)
+        self.assertEqual(restored.mutable_snapshot, snapshot)
         self.assertEqual(restored.deletions, result.deletions)
 
 
