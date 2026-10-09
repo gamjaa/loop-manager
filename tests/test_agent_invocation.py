@@ -7,8 +7,10 @@ from pathlib import Path
 from unittest import TestCase, mock
 
 from loop_manager_internal.agents import agent_invocation as invocation
+from loop_manager_internal.agents import common_guidance
 from loop_manager_internal.storage import agent_invocation_state as state
 import loop_manager as manager
+from tests.support.fixed_samples import PROJECT_FILES
 
 
 class RunnerTests(TestCase):
@@ -20,6 +22,9 @@ class RunnerTests(TestCase):
         self.connection.row_factory = sqlite3.Row
         self.addCleanup(self.connection.close)
         state.ensure_schema(self.connection)
+        runtime_root = mock.patch.object(common_guidance, 'RUNTIME_ROOT', PROJECT_FILES)
+        runtime_root.start()
+        self.addCleanup(runtime_root.stop)
 
     def test_execution_agent_port_supplies_ledger_connection(self):
         with mock.patch.object(manager, "run_agent", return_value=manager.AgentResult(0, "done")) as run:

@@ -577,11 +577,15 @@ class TaskRelevantInvocationScopeTests(unittest.TestCase):
         self.assertEqual(git(self.source, 'rev-parse', 'origin/main'), new_base)
 
     def test_run_agent_binds_the_physical_invocation_to_the_saved_scope(self):
+        from loop_manager_internal.agents import common_guidance
+        from tests.support.fixed_samples import PROJECT_FILES
+
         def run(request):
             request.on_isolation_checked(self.evidence)
             request.on_session_started('session')
             return loop_manager.AgentResult(0, 'done', 'session')
-        with mock.patch.object(loop_manager, 'agent_provider') as provider:
+        with mock.patch.object(common_guidance, 'RUNTIME_ROOT', PROJECT_FILES), \
+             mock.patch.object(loop_manager, 'agent_provider') as provider:
             provider.return_value.run.side_effect = run
             result = loop_manager.run_agent('codex', self.worktree, self.state,
                 self.state / 'config.ini', 'planner', 'prompt', read_only=False,

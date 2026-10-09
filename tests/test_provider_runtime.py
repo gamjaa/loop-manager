@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 import loop_manager
 from tests.support.profiles import profile_config
-from tests.support.fixed_samples import PROVIDER_PROFILES
+from tests.support.fixed_samples import PROJECT_FILES, PROVIDER_PROFILES
 from tests.support.worker import worker_result
 
 
@@ -654,7 +654,9 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             "loop_manager.run_codex", return_value=result
         ) as codex, mock.patch(
             "loop_manager.run_claude", return_value=result
-        ) as claude:
+        ) as claude, mock.patch(
+            "loop_manager_internal.agents.common_guidance.RUNTIME_ROOT", PROJECT_FILES
+        ):
             loop_manager.run_agent(
                 "codex", Path("worktree"), Path(directory), Path("config"), "planner", "p",
                 read_only=False,

@@ -478,6 +478,10 @@ class WriteIsolationTests(TestCase):
         connection = sqlite3.connect(':memory:')
         self.addCleanup(connection.close)
         state.ensure_schema(connection)
+        pin_common_guidance(
+            connection, invocation.InvocationContext('repo', 'G-088'),
+            Path('/worktree'), self.state_dir,
+        )
         profile = invocation.ResolvedProfile('model', 'high')
         evidence = isolation.IsolationEvidence(
             'codex', 'version', 'Linux:x:y', 'worker', '/worktree',
