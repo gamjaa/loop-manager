@@ -1129,6 +1129,8 @@ def validate_planner_result(
 
         for path in sorted(displaced_paths):
             original = snapshot.by_path[path]
+            if original.execution_state and json.loads(original.execution_state)["ever_started"]:
+                raise RuntimeError("시작한 계획의 ID와 작업 경로를 보존해야 합니다.")
             if original.plan_id not in renamed_ids:
                 if execplan_catalog.parse_frontmatter(original.text).get("draft") == "true":
                     raise RuntimeError("사용자 판단 대기 draft를 삭제할 수 없습니다.")
@@ -1223,6 +1225,7 @@ class ReadyPlanSnapshotFromContentsEffects:
 def _ready_plan_snapshot_from_contents(
     effects: ReadyPlanSnapshotFromContentsEffects, row: sqlite3.Row,
     contents: bytes,
+    *, allow_started: bool = False,
 ) -> ReadyPlanSnapshot:
     plan_id = str(row["plan_id"])
     path = str(row["path"])
@@ -1243,7 +1246,7 @@ def _ready_plan_snapshot_from_contents(
         for name, value in ownership.items()
         if value is not None and value != 0
     ]
-    if not effects.is_unowned_ready(row) or owned:
+    if not allow_started and (not effects.is_unowned_ready(row) or owned):
         detail = ", ".join(owned) if owned else str(row["status"])
         raise MaintenancePlanningError(
             f"유지보수 개정 대상은 무소유 READY 계획이어야 합니다: {plan_id} ({detail})"
@@ -1291,6 +1294,7 @@ def _ready_plan_snapshot_from_contents(
         current_complexity=row["current_complexity"],
         current_risk=row["current_risk"],
         current_metadata_recorded=True,
+        execution_state=planning_execution_state(row) if allow_started else None,
     )
 
 
@@ -1419,10 +1423,11 @@ def _ready_plan_snapshot_at_revision(
     effects: ReadyPlanSnapshotAtRevisionEffects, repository: Path,
     revision: str,
     row: sqlite3.Row,
+    *, allow_started: bool = False,
 ) -> ReadyPlanSnapshot:
     path = str(row["path"])
     contents = _ready_revision_contents(effects.git_bytes, repository, revision, path)
-    snapshot = effects._ready_plan_snapshot_from_contents(row, contents)
+    snapshot = effects._ready_plan_snapshot_from_contents(row, contents, allow_started=allow_started)
     effects._assert_ready_plan_revision(repository, revision, snapshot, contents)
     return snapshot
 
@@ -1436,27 +1441,15 @@ class RowIsMutableReadyEffects:
 def _row_is_mutable_ready(effects: RowIsMutableReadyEffects, row: sqlite3.Row) -> bool:
     """Keep the general Planner boundary conservative and evidence based."""
 
-    if not effects.is_unowned_ready(row):
-        return False
-    if any(row[field] is not None for field in _MUTABLE_READY_EVIDENCE_FIELDS):
-        return False
-    if any(
-        int(row[field] or 0) != 0
-        for field in (
-            "workspace_owned",
-            "retry_count",
-            "pr_conflict_recovery",
-        )
-    ):
-        return False
-    return all(
-        str(row[field] or "{}") == "{}"
-        for field in (
-            "verify_failure_history",
-            "review_failure_history",
-            "review_level_history",
-        )
-    )
+    return (str(row["status"]) in {"READY", "IMPLEMENTING", "VERIFYING", "REVIEWING", "PUBLISHING"}
+            and all(row[field] is None for field in ("pr_url", "pr_head_oid", "pr_conflict_head_oid", "pr_conflict_base_oid"))
+            and not int(row["pr_conflict_recovery"] or 0))
+
+
+def planning_execution_state(row) -> str:
+    """rename 중간 경로 외의 실행·선언 원본을 모두 CAS에 결합한다."""
+    return json.dumps({field: row[field] for field in row.keys() if field != "path"},
+                      ensure_ascii=False, sort_keys=True)
 
 
 @dataclass(frozen=True)
@@ -1466,6 +1459,7 @@ class MutableReadySnapshotEffects:
     _ready_plan_snapshot_at_revision: Callable[..., object]
     _row_is_mutable_ready: Callable[..., object]
     mutable_snapshot_token: Callable[..., object]
+    pr_for_branch: Callable[..., object] | None = None
 
 
 def mutable_ready_snapshot(
@@ -1474,7 +1468,7 @@ def mutable_ready_snapshot(
     worktree: Path,
     active_sha: str,
 ) -> MutableReadySnapshot:
-    """Bind every never-started READY declaration to Git and SQLite bytes."""
+    """PR 전 선언과 보존할 실행 상태를 Git·SQLite 원본에 결합한다."""
 
     effects._ensure_execplans_schema(connection)
     cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
@@ -1483,7 +1477,8 @@ def mutable_ready_snapshot(
             "활성 maintenance cycle 중에는 일반 mutable READY snapshot을 만들 수 없습니다."
         )
     rows = connection.execute(
-        "SELECT * FROM exec_plans WHERE repo = ? AND status = 'READY' "
+        "SELECT * FROM exec_plans WHERE repo = ? AND status IN "
+        "('READY', 'IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING') "
         "ORDER BY plan_id",
         (repo,),
     ).fetchall()
@@ -1496,10 +1491,15 @@ def mutable_ready_snapshot(
     for row in rows:
         if (str(row["plan_id"]) in held - recovery or not effects._row_is_mutable_ready(row)):
             continue
+        if row["branch"]:
+            if effects.pr_for_branch is None:
+                raise PlannerValidationError("기존 branch의 실제 PR 등록 여부를 확인할 수 없습니다.")
+            if effects.pr_for_branch(Path(repo), str(row["branch"])) is not None:
+                continue
         try:
             plans.append(
                 effects._ready_plan_snapshot_at_revision(
-                    worktree, active_sha, row
+                    worktree, active_sha, row, allow_started=True
                 )
             )
         except MaintenancePlanningError as error:
@@ -1519,6 +1519,7 @@ class AssertMutableReadySnapshotCurrentEffects:
     """Named effects for _assert_mutable_ready_snapshot_current; no entry-point/module access."""
     _execplan_metadata: Callable[..., object]
     _row_is_mutable_ready: Callable[..., object]
+    pr_for_branch: Callable[..., object] | None = None
 
 
 def _assert_mutable_ready_snapshot_current(
@@ -1549,6 +1550,19 @@ def _assert_mutable_ready_snapshot_current(
             raise PlannerValidationError(
                 f"mutable READY snapshot 이후 실행 상태가 변경됐습니다: {plan.plan_id}"
             )
+        if plan.execution_state is not None:
+            if planning_execution_state(row) != plan.execution_state:
+                raise PlannerValidationError(f"mutable READY snapshot 이후 실행 상태가 변경됐습니다: {plan.plan_id}")
+        elif (str(row['status']) != 'READY' or bool(row['ever_started'])
+                or row['branch'] or row['worktree'] or row['workspace_owned'] or row['retry_count']
+                or row['worker_session_id'] or row['reviewer_session_id']
+                or any(row[field] is not None for field in _MUTABLE_READY_EVIDENCE_FIELDS)
+                or any(row[field] != '{}' for field in
+                       ('verify_failure_history', 'review_failure_history', 'review_level_history'))):
+            raise PlannerValidationError(f"기존 미착수 snapshot의 실행 경계가 변경됐습니다: {plan.plan_id}")
+        if row["branch"]:
+            if effects.pr_for_branch is None or effects.pr_for_branch(Path(snapshot.repo), str(row["branch"])) is not None:
+                raise PlannerValidationError(f"계획 갱신 전에 PR이 등록됐거나 확인할 수 없습니다: {plan.plan_id}")
         sources, dependencies, priority = effects._execplan_metadata(
             {
                 "sources": list(plan.sources),

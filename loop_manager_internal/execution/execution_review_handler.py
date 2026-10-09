@@ -14,6 +14,7 @@ from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, clas
 from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind
 from loop_manager_internal.execution.validation_feedback import normalize_feedback, redact_secrets
 from loop_manager_internal.documents.reviewer_specification import SpecificationDeadlock, validate_locations
+from loop_manager_internal.execution import stage_documents
 
 from loop_manager_internal.execution.execution_effects import ExecutionContract, FeedbackEffects
 from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot
@@ -57,12 +58,21 @@ class ReviewHandlerPorts:
     _retry: Callable[..., ExecutionOutcome]
     _row: Callable[[], Mapping[str, object]]
     observe_verify_inputs: Callable[..., Any] | None = None
+    checkpoint: Any = None
 
 
 class ReviewHandler:
     """Review policy; durable transitions stay in the existing repositories."""
     def __init__(self, ports: ReviewHandlerPorts):
         self.ports = ports
+
+    def _pending_document_review(self, context):
+        definition = self.ports.snapshot()._definition_snapshot
+        if definition is None:
+            return False
+        candidate = self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+        return stage_documents.review_pending(self.ports.checkpoint, self.ports.identity.repo,
+                                             context.plan.plan_id, definition, candidate)
 
     def _run_reviewer_attempt(self, context, *args, **kwargs):
         """Persist returned provider failures before the retry runner advances."""
@@ -110,6 +120,15 @@ class ReviewHandler:
         latest_sha = self.ports._fetch_latest_base()
         if latest_sha != row['active_sha']:
             return self.ports._latest_before_verify(context, latest_sha)
+
+        if self._pending_document_review(context):
+            item = stage_documents.pending(self.ports.checkpoint, self.ports.identity.repo, context.plan.plan_id)
+            return worker_publication, (
+                f"원격 문서 변경 후 선행 Review입니다. 최신 완료 조건은 아직 검증되지 않았습니다. "
+                f"과거 후보={item.get('before_head', '기록 없음')}, verify 기준 base={item['verify_base']}. "
+                f"이전 선언·입력(새 조건의 검증 증명이 아님): {item.get('previous', '기록 없음')}\n"
+                f"과거 출력(최신 조건의 PASS가 아님):\n"
+                + redact_secrets(str(item['verify_result'] or '기록 없음')))
 
         candidate_head = self.ports.git(
             context.worktree, 'rev-parse', 'HEAD',
@@ -199,6 +218,12 @@ class ReviewHandler:
         if isinstance(entry_evidence, ExecutionOutcome):
             return entry_evidence
         worker_publication, verify_evidence = entry_evidence
+        document_review = self._pending_document_review(context)
+        document_instruction = (
+            '\n최신 문서의 선행 Review: 구현·테스트 수정이 필요하면 기존 FAIL과 ISSUE_ID로 보고하라. '
+            '구현 부족 없이 Manager 검증 근거만 부족하면 ISSUE_ID 없이 VERDICT: VERIFY_REQUIRED로 보고하라. '
+            '과거 verify를 최신 조건의 성공으로 취급하지 마라.\n'
+            if document_review else '')
         candidate_head = self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
         correction = review_correction_state.load(
             self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id,
@@ -259,14 +284,14 @@ class ReviewHandler:
                     self.ports.identity.config_path,
                     'reviewer',
                     self.ports._document_review_prompt(
-                        self.ports.reviewer_prompt(
+                        (self.ports.reviewer_prompt(
                             self.ports.identity.base,
                             targeted_test_evidence,
                             row['review_result'],
                             verify_evidence=verify_evidence,
                             session_recovery=session_recovery,
                             protocol_error=protocol_error,
-                        ),
+                        ) or '') + document_instruction,
                         draft,
                     ),
                     read_only=True,
@@ -372,6 +397,8 @@ class ReviewHandler:
                 return ExecutionOutcome(outcome, detail=reviewer_error, error=True)
             try:
                 verdict, review_details = self.ports.parse_reviewer_result(review)
+                if verdict == 'VERIFY_REQUIRED' and not document_review:
+                    raise self.ports.contract.ReviewerProtocolError('VERIFY_REQUIRED는 문서 변경 후 선행 Review에만 허용됩니다.')
                 if manual:
                     manual.review_results(context, verdict, review)
                 if verdict == 'SPEC_BLOCKED':
@@ -445,6 +472,17 @@ class ReviewHandler:
                 reason=BlockReasonCode.REVIEW_SPECIFICATION_DEADLOCK,
                 user_targets=review_details.paths,
             )
+        if document_review:
+            item = stage_documents.pending(self.ports.checkpoint, self.ports.identity.repo, context.plan.plan_id)
+            if verdict in {'PASS', 'VERIFY_REQUIRED'}:
+                with runtime_state._transaction(self.ports.state.connection):
+                    stage_documents.save(self.ports.checkpoint, self.ports.identity.repo, context.plan.plan_id,
+                                         {**item, 'verification_pending': False, 'preliminary_review': review})
+                    self.ports.state.update_project(self.ports.identity.repo, preserve_transaction=True, phase='VERIFYING',
+                        validated_base_sha=None, verify_token=None, review_token=None, publication_token=None,
+                        review_result=review, last_error=None)
+                return self.ports._advanced()
+            # FAIL 교정은 기존 전이 경로가 수행하며, 후보가 바뀌면 관측 marker도 만료된다.
         review_source_id = None
         if feedback_repo is not None:
             review_source_id = feedback_repo.observe(

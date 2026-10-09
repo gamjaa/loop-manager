@@ -267,7 +267,7 @@ _REVIEW_ISSUE_CATEGORY = re.compile(r"(?i)^[a-z0-9][a-z0-9-]*$")
 _REVIEW_VERDICT_DECLARATION = re.compile(r"(?i)^[ \t]*VERDICT\b")
 
 
-_REVIEW_VERDICT = re.compile(r"(?i)^[ \t]*VERDICT:[ \t]*(PASS|FAIL|SPEC_BLOCKED)[ \t]*$")
+_REVIEW_VERDICT = re.compile(r"(?i)^[ \t]*VERDICT:[ \t]*(PASS|FAIL|SPEC_BLOCKED|VERIFY_REQUIRED)[ \t]*$")
 
 
 _TARGETED_TEST_FAILURE = re.compile(

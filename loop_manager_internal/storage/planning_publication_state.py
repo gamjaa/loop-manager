@@ -297,6 +297,16 @@ def apply_mutable_catalog_changes(
     for revision in revisions:
         original = revision.snapshot
         plan = dict(revision.plan)
+        if original.execution_state is not None:
+            from loop_manager_internal.planning.planner_validation import planning_execution_state
+            row = connection.execute("SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                                     (repo, original.plan_id)).fetchone()
+            if row is None or planning_execution_state(row) != original.execution_state:
+                raise PlannerValidationError(f"계획 갱신 중 실행 근거가 변경됐습니다: {original.plan_id}")
+            revision_cas = ("status IN ('READY', 'IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING') "
+                            "AND pr_url IS NULL AND pr_head_oid IS NULL AND pr_conflict_recovery = 0")
+        else:
+            revision_cas = cas
         sources, dependencies, priority = serialize_plan_metadata(plan)
         initial_level = worker_level(plan)
         expected_path = staged_paths.get(original.plan_id, original.path)
@@ -306,12 +316,13 @@ def apply_mutable_catalog_changes(
             SET path = ?, title = ?, sources = ?, depends_on = ?,
                 priority = ?, content_hash = ?, current_revision_sha = ?,
                 current_complexity = ?, current_risk = ?,
-                initial_worker_level = ?, effective_worker_level = ?
+                initial_worker_level = ?, effective_worker_level =
+                    CASE WHEN ever_started THEN MAX(effective_worker_level, ?) ELSE ? END
             WHERE repo = ? AND plan_id = ? AND path = ? AND title = ?
               AND sources = ? AND depends_on = ? AND priority = ?
               AND current_complexity IS ? AND current_risk IS ?
               AND content_hash = ?
-              AND COALESCE(current_revision_sha, plan_sha) = ? AND {cas}
+              AND COALESCE(current_revision_sha, plan_sha) = ? AND {revision_cas}
             """,
             (
                 revision.path,
@@ -323,6 +334,7 @@ def apply_mutable_catalog_changes(
                 plan_commit,
                 str(plan["complexity"]),
                 str(plan["risk"]),
+                initial_level,
                 initial_level,
                 initial_level,
                 repo,

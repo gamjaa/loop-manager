@@ -207,8 +207,13 @@ class WorkspaceHandler:
                     or stable_pr != pull_request):
                 return self.ports._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
                                      'checkpoint observation changed', context=context)
+            from loop_manager_internal.execution import stage_documents
             from loop_manager_internal.execution.manual_candidate import get_manual
             manual = get_manual(self.ports.state)
+            if not manual or not manual.enabled():
+                stage_documents.remember_work_branch(self.ports.git, self.ports.state, checkpoint,
+                    self.ports.identity, context, remote_oid, snapshot.local_head, base_oid, pull_request)
+                current = checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
             if manual and manual.adopt_remote(context,remote_oid,base_oid,pull_request,
                                                self.ports.state,checkpoint):
                 return self.ports._context()

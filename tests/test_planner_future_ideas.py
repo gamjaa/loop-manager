@@ -18,12 +18,11 @@ class PlannerFutureIdeasTest(unittest.TestCase):
         self.assertIn("docs/FUTURE_IDEAS.md", prompt)
         self.assertIn("같은 계획 주기의 ExecPlan 범위나 미충족 작업의 근거로 사용하지 말고", prompt)
         self.assertIn(
-            "mutable READY snapshot의 계획은 같은 ID를 보존한 채",
+            "PR 전 snapshot의 계획은 같은 ID를 보존한 채",
             prompt,
         )
         self.assertIn(
-            "snapshot 밖의 기존 ExecPlan, 실행된 계획, MERGED·archive 계획은 "
-            "수정·rename·삭제하지 마라",
+            "snapshot 밖의 기존 ExecPlan과 PR 등록·MERGED·archive 계획은 수정하지 마라",
             prompt,
         )
         plans_contract = (loop_manager.ROOT / "docs/PLANS.md").read_text(encoding="utf-8")

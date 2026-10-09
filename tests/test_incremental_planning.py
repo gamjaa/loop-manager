@@ -1,6 +1,7 @@
 import hashlib
 import json
 from contextlib import closing
+from dataclasses import replace
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -825,7 +826,7 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
             )
         )
 
-    def test_mutable_snapshot_excludes_ready_with_execution_evidence(self):
+    def test_mutable_snapshot_includes_pr_free_ready_with_execution_evidence(self):
         self.connection.execute(
             "UPDATE exec_plans SET worker_session_id = 'worker-session' "
             "WHERE repo = ? AND plan_id = 'G-002'",
@@ -838,8 +839,94 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         )
 
         self.assertEqual(
-            [plan.plan_id for plan in snapshot.plans], ["G-001"]
+            [plan.plan_id for plan in snapshot.plans], ["G-001", "G-002"]
         )
+
+    def test_started_revision_preserves_execution_audit_and_worker_level(self):
+        from loop_manager_internal.storage.planning_publication_state import apply_mutable_catalog_changes
+        self.connection.execute("UPDATE exec_plans SET ever_started=1, worker_session_id='saved', "
+            "retry_count=2, effective_worker_level=8, review_failure_history='{\"issue\":2}' "
+            "WHERE plan_id='G-002'")
+        self.connection.commit()
+        snapshot = loop_manager.mutable_ready_snapshot(self.connection, str(self.repo), self.repo, self.base)
+        path = self.repo / self.paths['G-002']
+        path.write_text(path.read_text(encoding='utf-8') + '\n- 변경된 완료 조건을 확인한다.\n', encoding='utf-8')
+        result = loop_manager.validate_planner_result(self.repo, self.base, [self.paths['G-002']],
+            connection=self.connection, repo=str(self.repo), mutable_snapshot=snapshot)
+        with self.connection:
+            apply_mutable_catalog_changes(self.connection, str(self.repo), deletions=(), revisions=result.revisions,
+                snapshot_token=snapshot.token, plan_commit=self.base,
+                content_hash=lambda relative: hashlib.sha256((self.repo / relative).read_bytes()).hexdigest())
+        row = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-002'").fetchone()
+        self.assertEqual((row['status'], row['ever_started'], row['worker_session_id'], row['retry_count'],
+                          row['effective_worker_level'], row['review_failure_history']),
+                         ('READY', 1, 'saved', 2, 8, '{"issue":2}'))
+
+    def test_actual_pr_appearance_prevents_started_snapshot_publication(self):
+        self.connection.execute("UPDATE exec_plans SET ever_started=1, branch='work' WHERE plan_id='G-002'")
+        self.connection.commit()
+        with mock.patch.object(loop_manager, 'pr_for_branch', return_value=None):
+            snapshot = loop_manager.mutable_ready_snapshot(self.connection, str(self.repo), self.repo, self.base)
+        with mock.patch.object(loop_manager, 'pr_for_branch', return_value={'url': 'https://example/pr/2'}):
+            with self.assertRaisesRegex(loop_manager.PlannerValidationError, 'PR이 등록'):
+                loop_manager._assert_mutable_ready_snapshot_current(self.connection, snapshot)
+
+    def test_active_document_proposal_publication_and_restart_use_one_model_result(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.execution import stage_documents as documents
+        from loop_manager_internal.execution.execution_session import ExecutionIdentity
+        from loop_manager_internal.execution.execution_runtime import ExecutionPhase
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        from tests.support.revision import definition
+        with tempfile.TemporaryDirectory() as directory:
+            remote = Path(directory) / 'remote.git'
+            git(Path(directory), 'init', '--bare', str(remote))
+            git(self.repo, 'remote', 'add', 'origin', str(remote))
+            git(self.repo, 'push', 'origin', 'main')
+            git(self.repo, 'switch', '-c', 'work')
+            self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', ever_started=1, branch='work', "
+                "active_sha=?, worker_session_id='saved-session' WHERE plan_id='G-002'", (self.base,))
+            self.connection.commit()
+            row = lambda: self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-002'").fetchone()
+            state = SimpleNamespace(connection=self.connection, row=row)
+            context = SimpleNamespace(plan=SimpleNamespace(plan_id='G-002'), phase=ExecutionPhase.IMPLEMENTING,
+                worktree=self.repo, branch='work', resolving_rebase=False)
+            identity = ExecutionIdentity(repo=str(self.repo), repo_path=self.repo, state_dir=Path(directory) / 'state',
+                base='main', provider='codex')
+            current = replace(definition(), revision_sha=self.base, path=self.paths['G-002'],
+                              sources=('docs/PRODUCT.md',))
+            proposal = (self.repo / self.paths['G-002']).read_text(encoding='utf-8') + '\n- 최신 조건 반영.\n'
+            raw = 'DOCUMENT_RESULT: ' + json.dumps(dict(relevant=True, implementation='satisfied',
+                                                        plan_text=proposal, evidence='현재 구현과 최신 명세 대조'))
+            scope = SimpleNamespace(head=self.base, branch='work', index={}, dirty={}, operations={})
+            agent = mock.Mock(return_value=loop_manager.AgentResult(0, raw))
+            effects = documents.StageDocumentEffects(git=loop_manager.git,
+                begin_scope=mock.Mock(return_value=scope), capture_scope=mock.Mock(return_value=scope),
+                validate_scope=mock.Mock(), clear_scope=mock.Mock(), run_agent=agent,
+                prepare_snapshot=loop_manager.mutable_ready_snapshot,
+                assert_snapshot=loop_manager._assert_mutable_ready_snapshot_current,
+                validate_result=loop_manager.validate_planner_result,
+                validate_worktree=loop_manager.validate_managed_worktree,
+                pr_for_branch=mock.Mock(return_value=None), log=mock.Mock(),
+                run_with_retries=lambda call, session_id: call(session_id, False))
+            checkpoints = ExecutionCheckpointRepository(self.connection)
+            with mock.patch.object(loop_manager, 'pr_for_branch', return_value=None):
+                result = documents.refresh(effects, state, checkpoints, identity, context,
+                                           replace(current, source_fingerprint='old'), current, ['docs/PRODUCT.md'])
+            self.assertEqual(result['stage'], 'rebase')
+            self.assertEqual(git(self.repo, 'show', f"origin/main:{self.paths['G-002']}") + '\n', proposal)
+            self.assertEqual(git(self.repo, 'branch', '--show-current'), 'work')
+            updated_base = git(self.repo, 'rev-parse', 'origin/main')
+            git(self.repo, 'rebase', updated_base)
+            self.connection.execute("UPDATE exec_plans SET active_sha=? WHERE plan_id='G-002'", (updated_base,))
+            self.connection.commit()
+            updated = replace(current, revision_sha=updated_base, body_hash='updated')
+            first = documents.refresh(effects, state, checkpoints, identity, context, current, updated, [])
+            resumed = documents.refresh(effects, state, checkpoints, identity, context, updated, updated, [])
+            self.assertEqual(first, resumed)
+            self.assertEqual(first['stage'], 'done')
+            agent.assert_called_once()
+            self.assertEqual(row()['worker_session_id'], 'saved-session')
 
     def test_mutable_snapshot_uses_git_blob_with_crlf_checkout(self):
         path = self.repo / self.paths["G-001"]
@@ -863,7 +950,7 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
 
     def test_snapshot_authority_is_checked_before_changed_plan_contents(self):
         self.connection.execute(
-            "UPDATE exec_plans SET ever_started = 1 "
+            "UPDATE exec_plans SET pr_url = 'https://example/pr/2' "
             "WHERE repo = ? AND plan_id = 'G-002'",
             (str(self.repo),),
         )

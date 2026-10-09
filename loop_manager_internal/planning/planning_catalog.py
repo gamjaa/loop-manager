@@ -27,7 +27,7 @@ class PlannerValidationError(PlanningResultInvalid):
 
 @dataclass(frozen=True)
 class MutableReadySnapshot:
-    """Never-started READY plans that one general Planner turn may mutate."""
+    """PR-free declarations that one general Planner turn may revise."""
 
     repo: str
     active_sha: str
@@ -67,6 +67,7 @@ class MutableReadySnapshot:
                         "content_hash": plan.content_hash,
                         "plan_revision": plan.plan_sha,
                         "draft": plan.draft,
+                        "started": bool(plan.execution_state and json.loads(plan.execution_state).get("ever_started")),
                     }
                     for plan in self.plans
                 ],
@@ -82,6 +83,23 @@ class PlanDeletion:
     """One snapshot-bound READY plan removed by a general Planner batch."""
 
     snapshot: ReadyPlanSnapshot
+
+
+def unstarted_snapshot(snapshot: MutableReadySnapshot) -> MutableReadySnapshot:
+    """코드 전용 점검 Planner의 기존 미착수 범위를 유지한다."""
+    from loop_manager_internal.maintenance.maintenance_orchestration import is_unowned_ready
+    from loop_manager_internal.storage.planning_publication_state import _MUTABLE_READY_EVIDENCE_FIELDS
+    def eligible(plan):
+        if plan.execution_state is None:
+            return True
+        row = json.loads(plan.execution_state)
+        return (is_unowned_ready(row) and not row["retry_count"]
+                and all(row[field] is None for field in _MUTABLE_READY_EVIDENCE_FIELDS)
+                and all(row[field] == "{}" for field in
+                        ("verify_failure_history", "review_failure_history", "review_level_history")))
+    plans = tuple(plan for plan in snapshot.plans if eligible(plan))
+    return MutableReadySnapshot(snapshot.repo, snapshot.active_sha, plans,
+        mutable_snapshot_token(snapshot.repo, snapshot.active_sha, plans, snapshot.recovery_goals), snapshot.recovery_goals)
 
 
 def mutable_snapshot_token(
@@ -126,6 +144,8 @@ def snapshot_to_dict(snapshot: ReadyPlanSnapshot) -> dict[str, object]:
     if snapshot.current_metadata_recorded:
         payload["current_complexity"] = snapshot.current_complexity
         payload["current_risk"] = snapshot.current_risk
+    if snapshot.execution_state is not None:
+        payload["execution_state"] = snapshot.execution_state
     return payload
 
 
@@ -137,6 +157,10 @@ def snapshot_from_dict(value: Mapping[str, object]) -> ReadyPlanSnapshot:
             raise ValueError("incomplete current metadata")
         current_complexity = value.get("current_complexity")
         current_risk = value.get("current_risk")
+        execution_state = value.get("execution_state")
+        if execution_state is not None:
+            if not isinstance(execution_state, str) or not isinstance(json.loads(execution_state), dict):
+                raise ValueError("invalid execution snapshot")
         raw_sources = value["sources"]
         raw_dependencies = value["depends_on"]
         if (
@@ -166,6 +190,7 @@ def snapshot_from_dict(value: Mapping[str, object]) -> ReadyPlanSnapshot:
             ),
             current_risk=str(current_risk) if current_risk is not None else None,
             current_metadata_recorded=recorded,
+            execution_state=execution_state,
         )
     except (KeyError, TypeError, ValueError) as error:
         raise ValueError("mutable READY snapshot manifest가 유효하지 않습니다.") from error

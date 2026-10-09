@@ -20,7 +20,7 @@
 
 일반 Planner는 새 `docs/plans/*.md`를 생성하고, 현재 PRODUCT/Requirement 범위 밖이지만 보존 가치가 있는 아이디어만 `docs/FUTURE_IDEAS.md`에 생성하거나 수정할 수 있다.
 
-예외적으로 프로그램이 SQLite 상태와 Git revision에 결합된 mutable READY snapshot을 제공한 경우에만 snapshot 안의 미착수 READY ExecPlan을 같은 ID로 수정·이름 변경·삭제할 수 있다. snapshot 원본과 현재 content hash·revision·무소유 상태가 일치해야 하며, snapshot 밖의 기존 ExecPlan·실행된 계획·MERGED·archive 계획과 앞에서 허용한 파일 외의 파일은 변경하지 않는다.
+예외적으로 프로그램이 SQLite 상태와 Git revision에 결합된 PR 전 계획 snapshot을 제공한 경우에만 snapshot 안의 ExecPlan을 같은 ID로 개정할 수 있다. 시작한 계획은 ID·경로와 기존 구현·검증 기록을 보존하며, 미착수 계획만 이름 변경·삭제할 수 있다. 현재 선언·실행 근거와 실제 PR 부재를 게시 전에 재확인한다. snapshot 밖의 기존 ExecPlan·PR 등록·MERGED·archive 계획과 앞에서 허용한 파일 외의 파일은 변경하지 않는다. 기존 `mutable READY` 이름은 이 일반 planning 계약의 호환 이름이며 유지보수의 무소유 READY 제한을 넓히지 않는다.
 
 코드·설계·계획 변경으로 다른 ExecPlan의 경로·구현·검증·dependency가 영향을 받으면, Planner는 허용된 snapshot 안의 해당 계획도 함께 개정한다. 관련성이 있다는 이유로 snapshot 밖의 계획이나 실행 이력의 변경 권한을 확대하지 않는다.
 

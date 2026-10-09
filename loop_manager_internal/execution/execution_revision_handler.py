@@ -11,11 +11,13 @@ from loop_manager_internal.execution.execution_revision import DefinitionDelta, 
 from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind, ExecutionPhase
 from loop_manager_internal.execution.worker_outcome import WorkerOutcomeError
 from loop_manager_internal.git.command_adapter import ExternalObservationError
+from loop_manager_internal.planning.planning_catalog import PlannerValidationError
 
 from loop_manager_internal.execution.execution_effects import ExecutionContract
 from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot
 from loop_manager_internal.execution.execution_state import ExecutionStatePort
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+from loop_manager_internal.storage import runtime_state
 
 @dataclass(frozen=True)
 class RevisionHandlerPorts:
@@ -62,6 +64,7 @@ class RevisionHandlerPorts:
     _run_managed_rebase: Callable[..., Any]
     guard: Callable[[ExecutionContext], ExecutionContext | ExecutionOutcome]
     observe_verify_inputs: Callable[..., Any] | None = None
+    refresh_documents: Callable[..., Any] | None = None
 
 
 class RevisionHandler:
@@ -285,9 +288,14 @@ class RevisionHandler:
             )
             self.ports.operation_print(no_change_error, file=sys.stderr)
             return self.ports._final(no_change_error)
+        from loop_manager_internal.execution import stage_documents
+        document_revision = (stage_documents.pending(self.ports.checkpoint, self.ports.identity.repo,
+                             context.plan.plan_id) if self.ports.checkpoint else None)
+        document_only = bool(document_revision and document_revision['stage'] == 'rebase'
+                             and document_revision['document_only'])
         unchanged_worker = (decision.phase != 'IMPLEMENTING'
                             and context.phase is not ExecutionPhase.IMPLEMENTING
-                            and not bool(decision.deltas & WORKER_INVALIDATING_DELTAS))
+                            and (document_only or not bool(decision.deltas & WORKER_INVALIDATING_DELTAS)))
         self.ports._complete_rebase_intent(context, worker_definition=snapshot if unchanged_worker else None, project_values={
             'phase': 'WORKING', 'active_sha': latest_sha,
             'validated_base_sha': None, 'last_error': None,
@@ -301,6 +309,8 @@ class RevisionHandler:
                            and row['worker_input_token'] == snapshot.worker_token
                            and row['archive_token'] == snapshot.archive_token)
         resumed_phase='VERIFYING' if retained_worker or (manual and manual.user_submission(row)) else 'IMPLEMENTING'
+        if document_only:
+            resumed_phase = document_revision['phase']
         self._install_revision_state(
             snapshot,
             replace(decision, kind=RevisionGateKind.INVALIDATE_TO_PHASE, phase=resumed_phase),
@@ -417,6 +427,17 @@ class RevisionHandler:
                         self.ports.state.connection, self.ports.identity.repo, str(catalog_plan['plan_id']),
                     ),
                 )
+                if self.ports.checkpoint:
+                    from loop_manager_internal.execution import stage_documents
+                    branch_document = stage_documents.pending(self.ports.checkpoint, self.ports.identity.repo, context.plan.plan_id)
+                    adoption = (self.ports.checkpoint.get(self.ports.identity.repo, context.plan.plan_id).snapshot or {}).get('remote_adoption_scope')
+                    if (branch_document and branch_document.get('work_branch') and isinstance(adoption, dict)
+                            and adoption.get('remote') == branch_document['remote']):
+                        head = self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+                        branch_body = self.ports.body_hash(context.worktree, head, snapshot.path)
+                        snapshot = replace(snapshot,
+                            body_hash=str(branch_body), body_text=getattr(branch_body, 'body_text', None),
+                            source_fingerprint=self.ports.source_fingerprint(context.worktree, head, catalog_plan))
             previous = DefinitionSnapshot.deserialize(
                 self.ports._row()['definition_snapshot']
             )
@@ -453,9 +474,51 @@ class RevisionHandler:
 
         row = self.ports._row()
         active_sha = str(row['active_sha'] or '')
-        # Only the active ExecPlan calls for another specification check.
-        # Source and unrelated document changes still participate in Git,
-        # archive eligibility, and candidate validation below.
+        document_revision = None
+        if self.ports.refresh_documents is not None and self.ports.checkpoint is not None:
+            try:
+                document_revision = self.ports.refresh_documents(context, previous, snapshot, changed_paths)
+                if isinstance(document_revision, ExecutionOutcome):
+                    return document_revision
+            except PlannerValidationError as error:
+                return self._revision_error(context, str(error))
+            except self.ports.contract.AgentScopeError as error:
+                return self.ports._block_final(self.ports.identity.repo, context.worktree, str(error),
+                    str(row['verify_result'] or ''), reason=BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION)
+            except RecoveryFailure:
+                raise
+            except (RuntimeError, OSError) as error:
+                return self.ports._recover(RecoveryReason.STATUS_FAILED, str(error), context=context)
+            if document_revision and document_revision['base'] != latest_sha:
+                return self.ports._retry('현재 ExecPlan 개정을 원격에 게시했습니다. 최신 문서와 작업 branch를 반영합니다.')
+            if (document_revision and document_revision['stage'] == 'done'
+                    and document_revision['document_only'] and not document_revision.get('decision_applied')):
+                from loop_manager_internal.execution import stage_documents
+                phase = document_revision['phase']
+                if phase == 'PUBLISHING':
+                    phase = 'REVIEWING'
+                if phase == 'VERIFYING' and document_revision['assessment']['implementation'] == 'needed':
+                    phase = 'IMPLEMENTING'
+                values = {'phase': self._project_phase(phase), 'definition_snapshot': snapshot.serialize(),
+                          'validated_base_sha': None, 'verify_token': None, 'review_token': None, 'publication_token': None}
+                if phase == 'IMPLEMENTING':
+                    values.update(worker_result=None, worker_input_token=None, archive_token=None)
+                elif document_revision['worker_result'] is not None:
+                    values.update(worker_result=document_revision['worker_result'],
+                                  worker_input_token=snapshot.worker_token, archive_token=snapshot.archive_token)
+                candidate = self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
+                with runtime_state._transaction(self.ports.state.connection):
+                    self.ports.state.update_project(self.ports.identity.repo, preserve_transaction=True, **values)
+                    current = self.ports.checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
+                    self.ports.checkpoint.record(self.ports.identity.repo, context.plan.plan_id,
+                        expected_generation=current.generation, operation=current.operation, expected_head=current.expected_head,
+                        target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+                        snapshot={**(current.snapshot or {}),
+                            'document_revision': {**document_revision, 'decision_applied': True, 'review_candidate': candidate},
+                            'worker_candidate_token': snapshot.worker_candidate_token(candidate)})
+                self.ports.update_snapshot(_definition_snapshot=snapshot)
+                return self.ports._retry('최신 문서의 영향 판단에 따라 현재 작업의 필요한 단계부터 이어갑니다.')
+        # 문서 영향 판단 이후에도 기존 후보·Git·아카이브 경계를 적용한다.
         legacy_definition_changed = str(catalog_plan['path']) in changed_paths
         legacy_baseline = bool(
             previous is None
@@ -490,6 +553,11 @@ class RevisionHandler:
             active_base_token=active_sha,
             current_base_token=latest_sha,
             artifacts=StageArtifacts(
+                document_review_pending=bool(self.ports.checkpoint and document_revision
+                    and document_revision['stage'] == 'done'
+                    and document_revision.get('verification_pending')
+                    and document_revision.get('review_candidate') == candidate_head
+                    and document_revision.get('definition') == snapshot.definition_token),
                 manual_submission=bool(manual and manual.user_submission(row)),
                 require_worker_candidate=bool(self.ports.checkpoint and
                     (self.ports.checkpoint.get(self.ports.identity.repo, context.plan.plan_id).snapshot or {}).get('current_rebase_acceptance')),
@@ -555,6 +623,10 @@ class RevisionHandler:
                 context=context if context.resolving_rebase else self.ports._context(),
                 detail=decision.detail,
             )
+        if (document_revision and document_revision['stage'] == 'rebase'
+                and document_revision['document_only'] and not context.resolving_rebase):
+            decision = replace(decision, kind=RevisionGateKind.REFRESH_WORKTREE,
+                               phase=document_revision['phase'])
         if context.resolving_rebase:
             if (
                 (previous is None and not legacy_baseline)
