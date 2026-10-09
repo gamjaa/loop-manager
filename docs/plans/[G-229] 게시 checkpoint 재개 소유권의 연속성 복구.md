@@ -44,13 +44,28 @@ priority: high
 - 문서 재검증: R-081의 각 기준을 위 전이·전용 회귀 및 기존 통합 회귀와 대조하고 현재 PRODUCT·ARCHITECTURE와 모순이 없는지 확인한다. 테스트 판정을 성공값으로 대체하거나 운영 복구 성공을 추측하지 않는다.
 - 실제 Git의 효과는 기존 Review 재개·관리 rebase·lease 통합 회귀로 확인한다. 같은 정책 조합을 새 Git 저장소·전체 Agent 실행으로 반복하지 않는다.
 
+최종 WSL 검증은 구현 커밋 `78b31c695dfb8153316643d57ff59847e1073586`의 동일 Git 객체를 Ubuntu/Python 3.12의 독립 checkout에서 실행했다. 한 번의 전체 실행에서 206개 모듈·3,323개 discovery ID를 모두 완료했고 결과는 PASS 3,319개·기존 플랫폼 skip 4개, compile PASS다. manifest와 각 모듈의 completed/fixture-skipped ID 집합이 정확히 일치하며 미완료·실패는 없다. 원문·manifest·모듈 결과·compile event·summary는 전용 워크트리의 `.cache/verify/r081-wsl-final/`에 보존했다.
+
+### R-081 기준 재검증
+
+| 기준 | 확인한 근거·결과 |
+|---|---|
+| 1. 표식 없는 게시 OID 최소 재현 | `origin/main`의 원래 handler와 같은 SQLite 상태는 거부하며 Git 호출 0회다. 수정 handler는 같은 상태에서 기존 Git 소유권 검증을 실행해 수용한다. 전용 markerless 회귀 PASS |
+| 2. 전이별 수명과 사건 원인 구분 | 위 Implementation 표와 request/refresh·재차단·재활성화 테스트로 보존·무효화·소비 경계를 대조했다. G-179 최초 유실 전이는 미확정으로 남기며 다른 branch·rebase 원인으로 단정하지 않는다. |
+| 3. 정상 재개·재차단·재시작 | 기존 필드 보존, 새 증명 저장, 실제 DB backup과 새 handler/연결의 재시작, 재차단 뒤 활성화 회귀 PASS. 기존 Review·관리 rebase 통합 회귀도 전체 verify에서 PASS |
+| 4. 역사 영수증과 현재 local-only 보존 | scoped/구형 flat 이력의 정상 수용, 증거 부족·손상·다른 repository/계획/소유 공간 거부 PASS. 현재 요청 및 역사 영수증 전후 비교에서 덮어쓰기가 없다. |
+| 5. 원자 확정·중단·경쟁 | generation·원인·게시 기록·실제 원격 경쟁 거부, 해제 직후 중단의 증명/차단 rollback 및 재시작 PASS. 불필요한 commit·push·PR 없음 assertion과 기존 알림 transaction/dedup 회귀 PASS |
+| 6. 실제 위반·독립 차단 보존 | 원격 변경/삭제·identity/tree/lease/workspace 불일치·낡은 표식·예상 밖 PR 거부 PASS. 실제 저장 Reviewer 쓰기의 범위 판정과 미해결 계획 차단·Worker 실패·session 보존 PASS. 기존 dependency·승인·planning·PR reopen 회귀도 전체 verify에서 PASS |
+| 7. 관측 오류 | 실제 owner 판정의 Git 실패는 PUBLICATION_RETRY, PR 조회 실패는 RETRY로 보존한다. 손상 이력도 수용하지 않으며 성공 표식·불필요한 최종 차단을 만들지 않는 회귀 PASS. 기존 SQLite 관측 실패 회귀 PASS |
+| 8. 최소 unit·전체 verify·문서 정합성 | 전용 18개와 전체 발견 ID의 실행 완료를 확인했다. 판정 함수는 성공값으로 대체하지 않으며 실제 Git 효과는 기존 통합 회귀를 재사용한다. PRODUCT·ARCHITECTURE·R-081의 적용 조건·거부·원인별 해제·보존·검증을 읽기 전용으로 재대조했고 남은 blocking issue는 없다. |
+
 ## Progress
 
 - [x] 표식 없는 게시 OID 거부와 전이별 증명 수명 확인
 - [x] 현재/역사 게시 영수증의 읽기 전용 검증과 재개 증명 연결
 - [x] 재차단·재시작·독립 차단·실제 Agent 위반 및 중단/경쟁 회귀
-- [ ] 최종 WSL 전체 verify
-- [ ] 문서 기준 최종 재검증과 PR
+- [x] 최종 WSL 전체 verify
+- [x] 문서 기준 최종 재검증
 
 ## Decision Log
 
