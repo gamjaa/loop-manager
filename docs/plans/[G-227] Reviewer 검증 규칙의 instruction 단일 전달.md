@@ -3,7 +3,6 @@ id: G-227
 title: Reviewer 검증 규칙의 instruction 단일 전달
 sources:
   - docs/PRODUCT.md
-  - docs/requirements/[R-003] Targeted Worker Unit Tests.md
   - docs/requirements/[R-064] 모델 호출을 통한 공통 Agent 지침 전달.md
   - docs/requirements/[R-082] 단계별 원격 문서 반영과 PR 전 ExecPlan 갱신.md
 depends_on:

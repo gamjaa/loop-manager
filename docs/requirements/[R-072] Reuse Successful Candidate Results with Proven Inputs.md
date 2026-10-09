@@ -57,7 +57,7 @@ Worker 구현 입력에서 순수 기록을 구분해도 verify·Review·사용�
 
 - 현재 후보에 목록이 없거나 유효하지 않으면 전체 verify를 실행한다. 목록 부재만으로 해당 작업의 Worker를 호출하거나 Planner를 즉시 실행하지 않는다.
 - 다음 일반 Planner 실행 시 Manager는 최신 원격 base에서 목록 부재를 확인하고 생성 계획을 요청한다. 최신 base에 목록이 있으면 낡은 작업 branch의 부재를 새 생성 요청으로 취급하지 않는다.
-- Manager 요청에 따라 새로 생성하는 목록 생성 ExecPlan은 `priority: critical`로 작성한다. 반복적인 전체 verify 비용을 줄이는 기반 작업을 우선 확보하기 위한 R-001 일반 priority 기준의 명시적 예외다. Manager는 생성 요청에 이 조건을 전달하고 새 계획의 최초 등록 시 다른 priority를 거부한다. 실행 중 작업을 선점하지 않고 기존 dependency gate와 유지보수 장벽을 유지한다.
+- Manager 요청에 따라 새로 생성하는 목록 생성 ExecPlan은 `priority: critical`로 작성한다. 반복적인 전체 verify 비용을 줄이는 기반 작업을 우선 확보하기 위한 명시적 우선순위 조건이다. Manager는 생성 요청에 이 조건을 전달하고 새 계획의 최초 등록 시 다른 priority를 거부한다. 실행 중 작업을 선점하지 않고 기존 dependency gate와 유지보수 장벽을 유지한다.
 - 정책 적용 전에 등록된 미완료 계획·draft·미Merge PR은 기존 선언 priority와 실행 상태를 보존한다. 새 priority 조건만으로 기존 요청·계획을 무효화하거나 교체 계획을 생성하지 않는다.
 - 같은 프로젝트·목적의 미완료 ExecPlan·사용자 판단 대기 draft·미Merge PR이 있으면 추가 생성 계획을 요청하지 않는다. 생성 계획의 중단·실패 동안 기존 계획을 보존하고 중복 생성하지 않는다.
 - Planner는 전체 프로젝트 구조와 실제 verify 스크립트를 기준으로 목록 생성 계획을 작성한다. rebase 변경 파일만으로 전체 입력을 정하지 않는다. 계획이 Merge돼 목록과 유효한 성공 기준이 확보되기 전까지 기존 작업은 전체 verify를 실행한다.

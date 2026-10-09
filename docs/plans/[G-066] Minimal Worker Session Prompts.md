@@ -3,7 +3,6 @@ id: G-066
 title: Minimal Worker Session Prompts
 sources:
   - docs/PRODUCT.md
-  - docs/requirements/[R-003] Targeted Worker Unit Tests.md
   - docs/requirements/[R-033] Minimal Worker Session Prompts.md
   - docs/requirements/[R-064] 모델 호출을 통한 공통 Agent 지침 전달.md
   - docs/requirements/[R-066] AGENTS 변경 사전 승인.md
@@ -71,7 +70,7 @@ priority: low
 
 ## Validation
 
-- R-003의 Worker 경계는 실제 `worker_prompt`를 사용한 호출의 common+worker instruction과 사용자 메시지를 각각 검사한다. 최소 test case/class/module, 실패 뒤 동일 command 재실행, 문서·설정/관련 unit 부재의 구체적 사유와 전체 검증 금지는 고정 instruction에 유지하고 사용자 메시지의 중복을 제거한다. `tests/test_loop_manager.py`의 Worker prompt에 정적 규칙을 요구하는 assertion을 instruction 전달 검사로 옮기며, `tests/test_agent_invocation.py`의 임의 `delta only` fixture만으로 실제 prompt의 중복 부재를 확정하지 않는다. Reviewer prompt 교정은 별도 담당 계획에 남긴다.
+- 실제 `worker_prompt`를 사용한 호출에서 R-064의 common+worker instruction과 사용자 메시지를 각각 검사한다. 최소 test case/class/module, 실패 뒤 동일 command 재실행, 문서·설정/관련 unit 부재의 구체적 사유와 전체 검증 금지는 고정 instruction에 유지하고 사용자 메시지의 중복을 제거한다. `tests/test_loop_manager.py`의 Worker prompt에 정적 규칙을 요구하는 assertion을 instruction 전달 검사로 옮기며, `tests/test_agent_invocation.py`의 임의 `delta only` fixture만으로 실제 prompt의 중복 부재를 확정하지 않는다. Reviewer prompt 교정은 별도 담당 계획에 남긴다.
 - Worker는 `tests/test_execution_worker_phase.py`의 prompt·fallback, `tests/test_worker_session.py`의 전이 및 `tests/test_validation_feedback_state.py`의 전달 확인·재개 중 변경한 경계의 최소 targeted unit case만 실행한다. `tests/support/execution.py`의 기존 fixture·Agent double을 재사용한다. 기존 재개 prompt의 역할 반복과 복구 prompt의 이전 결과 포함을 요구하는 assertion은 이 계획의 초기 전달·delta·최소 복구 계약에 맞춰 갱신한다.
 - 최초 turn, 같은 세션의 일반 수정·effort 변경·verify·Review 교정, archive·비검증 오류 변경 및 두 채널 중복 방지, resolved provider·Model 교체·legacy 복구·session-unavailable fallback을 검증한다. 루트 지침 관리 prompt 부재와 고정된 역할 instruction·Ponytail의 재사용, 사용자 메시지의 정적 규칙 중복 부재도 확인한다. 기존 `tests/test_agent_invocation.py`·`tests/test_provider_runtime.py`의 호출 fixture를 재사용하며 실제 Agent를 호출하지 않는다.
 - session 시작 직후 timeout, 잘못된 Worker 결과, fallback 시작 실패, 전달 확인 전후 중단·재시작·저장 실패와 호출 뒤 새 revision 발생에서 미확인 내용이 누락되지 않고 확인된 동일 내용을 반복하지 않는지 검증한다. 비밀값 가림과 승인 문맥은 `tests/test_validation_feedback.py`·`tests/test_execution_guidance.py`, 결과 형식은 `tests/test_worker_result_contract.py`의 직접 관련 case를 변경 시 연결한다.
@@ -90,6 +89,8 @@ priority: low
 - [ ] 관련 targeted 회귀 사례 추가
 
 ## Decision Log
+
+- 2026-10-10 사용자 정리: R-003은 내용 보존 archive하고, 정적 검증 규칙의 instruction 단일 전달은 활성 R-064에 연결한다. Worker prompt의 초기·delta·복구 목표와 기존 검증·dependency는 유지하며 아래 R-003 참조는 당시 검토 기록이다.
 
 - 2026-10-09 full 기준 eb797d3a와 mutable token 324c039278646b522a5cbad59f1ba7ad5c4d543c36002cf4bdc2efc2bd0e05ed, 원본 hash 6cd0e0bfd53789f4f1619b65000721dcf97f2fd0677386023f1d10c8ca1334b3를 확인했다. 직접 구현된 R-082의 단계별 문서 갱신을 기존 초기/delta/복구 목표에 연결하고 G-242의 보완 뒤 실제 Worker 전달을 검증한다. 기존 ID·경로·분류·목표·기록을 보존하며 문서 판단/게시 기능을 중복 구현하지 않는다. 구현·테스트 실행 없음.
 

@@ -27,7 +27,7 @@ ARCHITECTURE의 Worker 최초 level 산식과 profile 설정 설명을 실제 Me
 
 - ARCHITECTURE의 `## 설정`과 `## Model과 Effort`가 complexity 1·3·5, critical risk만 +1인 최초 level 1~6 및 12개 조합을 정확히 설명한다. level 7·8은 완료한 교정 뒤 유효 Review 반복에 따른 승격으로만 도달하며 상한은 8이다.
 - 선택 provider의 Worker level 1~8, 일반·점검 Planner profile과 참조 alias의 명시 설정·지원 조합 검증, 유지보수 Planner의 기존 일반 Planner 연결을 현재 구현대로 설명한다. Model·Effort는 운영 설정이 원본이고 예시는 누락 fallback이나 강제 profile이 아니다.
-- 코드·PRODUCT·활성 R-052 및 관련 설계 설명 사이에 반대 산식·상한을 남기지 않는다. 실행된 계획의 effective level·session·작업물·승격 감사 보존과 정상 BLOCKED 해제의 초기화 계약은 유지한다. 사용자 결정 대기인 R-001·archive identity 정책을 변경하지 않는다. legacy scope는 R-055·G-199의 확정 A안을 따르며 이 profile 작업에서 구현하지 않는다.
+- 코드·PRODUCT·활성 R-052 및 관련 설계 설명 사이에 반대 산식·상한을 남기지 않는다. 실행된 계획의 effective level·session·작업물·승격 감사 보존과 정상 BLOCKED 해제의 초기화 계약은 유지한다. legacy scope는 R-055·G-199의 확정 A안을 따르며 이 profile 작업에서 구현하지 않는다.
 
 ## Implementation
 

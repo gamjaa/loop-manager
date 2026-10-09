@@ -4,7 +4,6 @@ title: 빠른 Planner 실제 시작의 차단 재개 알림 연결
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-053] Timely Progress Notifications.md
-  - docs/requirements/[R-034] Notified Block Resumption Alert.md
 depends_on: []
 complexity: low
 risk: low
@@ -27,7 +26,7 @@ priority: normal
 
 - invocation service의 물리적 시작 callback과 notification의 역할 해석에 빠른 Planner를 연결한다. 알림에 필요한 Planner 동작 분류만 기존 incident 소비자로 전달하고, provider request·실행 권한·저장된 원래 역할을 일반 Planner로 바꾸지 않는다.
 - 기존 `record_work_start`·process callback·commit 후 flush와 provider double을 재사용한다. 선택·scope 준비·session 등록을 물리적 시작으로 취급하거나 별도 시작 저장소를 추가하지 않는다.
-- R-053의 새 사건 제외 정책과 R-034의 통지 확인 조건을 함께 적용한다. 구현으로 영향받는 ARCHITECTURE의 알림 책임 설명만 필요한 경우 맞추며 작업 선택·차단 해제 정책을 변경하지 않는다. G-189는 이 교정 Merge 뒤 전체 재개 소비자를 감사한다.
+- R-053의 새 사건 제외 정책과 차단 통지 확인 조건을 함께 적용한다. 구현으로 영향받는 ARCHITECTURE의 알림 책임 설명만 필요한 경우 맞추며 작업 선택·차단 해제 정책을 변경하지 않는다. G-189는 이 교정 Merge 뒤 전체 재개 소비자를 감사한다.
 
 ## Validation
 

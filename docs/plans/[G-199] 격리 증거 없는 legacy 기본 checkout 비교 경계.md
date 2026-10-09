@@ -3,7 +3,6 @@ id: G-199
 title: 격리 증거 없는 legacy 기본 checkout 비교 경계
 sources:
   - docs/PRODUCT.md
-  - docs/requirements/[R-010] Origin-Isolated Local Worktree Operation.md
   - docs/requirements/[R-023] Self-Hosted Runtime Refresh Handoff.md
   - docs/requirements/[R-055] Blocking Path Audit and Minimal Interruption.md
   - docs/requirements/[R-056] Non-Blocking Local Base Synchronization.md
