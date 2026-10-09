@@ -11,7 +11,7 @@ from unittest import mock
 
 import loop_manager
 from loop_manager_internal.catalog import archive_git, execplan_archive
-from loop_manager_internal.git import command_adapter, manager_git_journal, source_sync, workspace
+from loop_manager_internal.git import command_adapter, git_adapter, manager_git_journal, source_sync, workspace
 from loop_manager_internal.recovery import pull_request_recovery
 from loop_manager_internal.runtime.contracts import BaseWorktreeSnapshot, WorkspaceOwnershipError
 from loop_manager_internal.storage.execplan_archive_state import MergedArchiveCandidate
@@ -158,6 +158,35 @@ class WorkspaceEffectBoundaryTests(unittest.TestCase):
         result = command_adapter.git(effects, Path('/repo'), 'rebase', 'base', check=False)
         self.assertEqual(result.returncode, 1)
         effects.command.assert_not_called()
+
+    def test_ignored_git_update_overlap_folds_case_for_same_parent_and_child_paths(self):
+        for ignored, tracked in (('CACHE/file', 'cache/file'), ('CACHE', 'cache/child'),
+                                  ('CACHE/file/child', 'cache/file')):
+            with self.subTest(ignored=ignored, tracked=tracked):
+                effects = fake_effects(git_adapter.IgnoredPathsOverlappingGitUpdateEffects)
+                effects._ignored_worktree_paths.return_value = (ignored,)
+                effects._nul_git_paths.return_value = [tracked]
+                effects._paths_overlap.side_effect = git_adapter._paths_overlap
+                effects.git.side_effect = lambda _repo, *args: subprocess.CompletedProcess(
+                    [], 0, 'base' if args[0] == 'merge-base' else '')
+                self.assertEqual(git_adapter._ignored_paths_overlapping_git_update(
+                    effects, Path('/repo'), 'target'), [ignored])
+
+    def test_ignored_rebase_resume_overlap_folds_case_for_every_action(self):
+        with tempfile.TemporaryDirectory() as directory:
+            metadata = Path(directory)
+            (metadata / 'orig-head').write_text('before')
+            (metadata / 'onto').write_text('target')
+            for action in ('--continue', '--skip', '--abort'):
+                with self.subTest(action=action):
+                    effects = fake_effects(git_adapter.RebaseResumeIgnoredOverlapEffects)
+                    effects._ignored_worktree_paths.return_value = ('CACHE/file',)
+                    effects._nul_git_paths.return_value = ['cache/file']
+                    effects._paths_overlap.side_effect = git_adapter._paths_overlap
+                    effects._remaining_rebase_commits.return_value = ['next']
+                    effects.git_bytes.return_value = os.fsencode(metadata)
+                    reason = git_adapter._rebase_resume_ignored_overlap(effects, Path('/repo'), action)
+                    self.assertIn('CACHE/file', reason)
 
     def test_owned_detached_rebase_is_the_only_branch_exception(self):
         with tempfile.TemporaryDirectory() as directory:

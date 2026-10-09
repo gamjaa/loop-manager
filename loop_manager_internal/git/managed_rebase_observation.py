@@ -6,7 +6,7 @@ No journal, turn, stage approval, reflog or original-commit reader is needed.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 import re
 from typing import Callable
@@ -91,6 +91,7 @@ class ObservationAdapters:
     read_file: Callable[[Path, str, str | None], tuple[str, str]]
     path_allowed: Callable[[str], bool]
     contracts_allowed: Callable[[RebaseObservation], bool]
+    normalize_ignored_snapshot: Callable | None = None
 
 
 def _stdout(adapters: ObservationAdapters, worktree: Path, *args: str) -> str:
@@ -100,7 +101,7 @@ def _stdout(adapters: ObservationAdapters, worktree: Path, *args: str) -> str:
     return result.stdout
 
 
-def _once(expected: RebaseExpectation, adapters: ObservationAdapters) -> RebaseObservation:
+def _once(expected: RebaseExpectation, adapters: ObservationAdapters, *, start=None):
     repo, worktree = Path(expected.repo), Path(expected.worktree)
     if str(repo.resolve()) != expected.repo or str(worktree.resolve()) != expected.worktree:
         raise ValueError('noncanonical repository or workspace')
@@ -180,8 +181,16 @@ def _once(expected: RebaseExpectation, adapters: ObservationAdapters) -> RebaseO
             raise ValueError('working file changed during observation')
         if path_kinds:
             files.append(WorktreeFile(path, tuple(sorted(path_kinds)), mode, signature))
+    if adapters.normalize_ignored_snapshot is not None:
+        ignored_files = {file.path: (("untracked",), file.signature) for file in files
+                         if file.kinds == ("ignored",) and file.path not in snapshot.index}
+        if ignored_files:
+            candidate = replace(snapshot, dirty={**snapshot.dirty, **ignored_files})
+            normalized = adapters.normalize_ignored_snapshot(worktree, candidate, snapshot, start=start or snapshot)
+            excluded = ignored_files.keys() - normalized.dirty.keys()
+            files = [file for file in files if file.path not in excluded]
     registration = snapshot.worktrees.get(expected.worktree)
-    return RebaseObservation(
+    observed = RebaseObservation(
         repo=expected.repo, repository_identity=identities[0], worktree=expected.worktree,
         identity_verified=True, head=snapshot.head, branch=snapshot.branch,
         branch_ref=snapshot.refs.get(f'refs/heads/{expected.branch}'),
@@ -200,6 +209,7 @@ def _once(expected: RebaseExpectation, adapters: ObservationAdapters) -> RebaseO
             'refs': snapshot.refs, 'worktrees': snapshot.worktrees, 'config': snapshot.config,
         }),
     )
+    return observed, snapshot
 
 
 def observe_current_rebase(
@@ -207,8 +217,8 @@ def observe_current_rebase(
 ) -> tuple[RebaseObservation | ObservationFailure, ScopeResult | None]:
     """Require stable observations; query failures cannot masquerade as absence."""
     try:
-        first = _once(expected, adapters)
-        observed = _once(expected, adapters)
+        first, start = _once(expected, adapters)
+        observed, _snapshot = _once(expected, adapters, start=start)
         if first != observed:
             return ObservationFailure('state_changed', 'Git, remote or inputs changed'), None
         scope = assess_scope(

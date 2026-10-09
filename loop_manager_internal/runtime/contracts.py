@@ -21,6 +21,7 @@ class BaseWorktreeSnapshot:
     index: tuple[tuple[str, tuple[str, ...]], ...]
     changes: tuple[tuple[str, str, str], ...]
     operations: tuple[tuple[str, str], ...]
+    config: tuple[tuple[str, tuple[str, ...]], ...] = ()
 
 
 @dataclass(frozen=True)

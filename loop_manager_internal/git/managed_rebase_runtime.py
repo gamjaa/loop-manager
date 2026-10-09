@@ -26,6 +26,7 @@ from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, Rec
 class RebaseRuntimeEffects:
     """Explicit effects for this service; persisted decisions remain in repositories."""
     _owned_rebase_metadata: Callable[..., object]
+    _normalize_legacy_ignored_snapshot: Callable[..., object]
     _path_signature: Callable[..., object]
     _published_plan_allows_common_plans: Callable[..., object]
     _revision_execplan_input_fingerprint: Callable[..., object]
@@ -275,4 +276,5 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
         read_file=read_file,
         path_allowed=lambda path: worker_allowed(path) or path in user_blobs,
         contracts_allowed=scoped_contracts,
+        normalize_ignored_snapshot=ports._normalize_legacy_ignored_snapshot,
     ))

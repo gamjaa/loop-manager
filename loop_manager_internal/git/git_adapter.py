@@ -149,6 +149,7 @@ class SourceSyncEffectsBaseWorktreeSnapshotEffects:
     """Named effects for _source_sync_effects_base_worktree_snapshot; no entry-point/module access."""
     _base_local_path_signature: Callable[..., object]
     _base_worktree_index_error: Callable[..., object]
+    _config_entries: Callable[..., object]
     _git_operation_entries: Callable[..., object]
     _ignored_worktree_paths: Callable[..., object]
     _index_entries: Callable[..., object]
@@ -160,6 +161,7 @@ def _source_sync_effects_base_worktree_snapshot(effects: SourceSyncEffectsBaseWo
     return source_sync.BaseWorktreeSnapshotEffects(
         _base_local_path_signature=effects._base_local_path_signature,
         _base_worktree_index_error=effects._base_worktree_index_error,
+        _config_entries=effects._config_entries,
         _git_operation_entries=effects._git_operation_entries,
         _ignored_worktree_paths=effects._ignored_worktree_paths,
         _index_entries=effects._index_entries,
@@ -223,6 +225,7 @@ class SourceSyncEffectsSynchronizeBaseWorktreeEffects:
     _base_worktree_index_error: Callable[..., object]
     _base_worktree_snapshot: Callable[..., object]
     _git_operation_entries: Callable[..., object]
+    _normalize_legacy_ignored_snapshot: Callable[..., object]
     _nul_git_paths: Callable[..., object]
     _source_expected_index: Callable[..., object]
     _source_transition_marker: Callable[..., object]
@@ -237,6 +240,7 @@ def _source_sync_effects_synchronize_base_worktree(effects: SourceSyncEffectsSyn
         _base_worktree_index_error=effects._base_worktree_index_error,
         _base_worktree_snapshot=effects._base_worktree_snapshot,
         _git_operation_entries=effects._git_operation_entries,
+        _normalize_legacy_ignored_snapshot=effects._normalize_legacy_ignored_snapshot,
         _nul_git_paths=effects._nul_git_paths,
         _source_expected_index=effects._source_expected_index,
         _source_transition_marker=effects._source_transition_marker,
@@ -487,7 +491,7 @@ def _ignored_paths_overlapping_git_update(effects: IgnoredPathsOverlappingGitUpd
         ))
     return sorted(
         path for path in ignored
-        if any(effects._paths_overlap(path, candidate) for candidate in changed)
+        if any(effects._paths_overlap(path.casefold(), candidate.casefold()) for candidate in changed)
     )
 
 
@@ -601,7 +605,7 @@ def _rebase_resume_ignored_overlap(effects: RebaseResumeIgnoredOverlapEffects, w
         ]
     overlaps = sorted(
         path for path in ignored
-        if any(effects._paths_overlap(path, candidate) for candidate in changed)
+        if any(effects._paths_overlap(path.casefold(), candidate.casefold()) for candidate in changed)
     )
     if overlaps:
         return (

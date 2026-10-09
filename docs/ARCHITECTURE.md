@@ -156,9 +156,14 @@ due 유지보수의 선택·진행 작업의 비선점 정책은 PRODUCT의 [작
 | 저장 base branch·Git operation 없음·HEAD가 원격과 equal | dirty 상태도 변경하지 않고 no-op |
 | behind-only이며 Git operation·비정상 index·경로 겹침 없음 | 로컬 변경과 index를 보존하는 safe fast-forward |
 | ahead-only이며 로컬에 미게시 commit이 있음 | 로컬 commit·checkout을 보존하고 동기화만 건너뜀. 자동 작업은 원격 SHA에서 계속 |
-| 다른 branch·detached·diverged·operation·비정상 index·겹침·동시 변경 | 이유를 기록하고 동기화만 건너뜀 |
+| clean diverged·선형 로컬 commit·durable 소유 intent·경로 충돌 없음 | 원격 base 위로 로컬 commit을 보존하는 rebase. 자동 push 없음 |
+| 다른 branch·detached·dirty 또는 비선형 diverged·operation·비정상 index·겹침·동시 권위 변경 | 이유를 기록하고 동기화만 건너뜀 |
 
 경로 겹침은 원격이 변경할 tracked 경로와 staged·unstaged·untracked·ignored 로컬 경로를 대소문자 및 부모·자식 관계까지 비교한다. eligibility 뒤 사용자 변경·Git lock·실패가 있으면 reset·clean·stash·강제 checkout이나 잠금 제거로 우회하지 않는다. safe fast-forward는 이미 fetch한 원격 ref에 대한 `git merge --ff-only` 상당의 적용이며 중복 fetch를 하지 않는다.
+
+source snapshot은 경로 충돌·파일 보존에 필요한 ignored 경로·서명과 Git config·외부 exclude 근거를 수집한다. 실행 직전·정상 완료·재시작 복구의 비교 view는 Agent 복구의 시작 ignore 규칙 검증을 재사용해 시작·저장·현재 index에 없는 경로만 제외한다. tracked ignore 규칙은 blob·index·작업 상태가, 외부 exclude는 저장된 경로·서명이 일치해야 한다. Git 쓰기 직전에 현재 경로를 다시 검사하고 fast-forward는 Git의 `--no-overwrite-ignore`도 적용한다. ignored-only 차이는 같은 실패 입력의 재시도를 허용하지 않으며 rebase abort의 실제 tracked 파일·index·operation 증명도 완화하지 않는다.
+
+source journal의 원본 intent·invocation·관측과 완료 감사는 비교 view로 덮어쓰지 않는다. 실제 전이와 소유 표식이 검증되면 결과를 먼저 기록한 뒤 활성 기록을 종료하며, 결과 기록 후 중단된 경우에도 기존 결과를 보존한다. config 근거가 없는 과거 기록은 시작에 관측된 ignored 경로의 unchanged tracked 규칙을 재구성할 수 있을 때만 차이를 제외한다. 새 경로나 외부 exclude의 시작 근거가 부족하면 기록·파일을 보존하고 거부한다. 안전하게 완료한 뒤 원격 base가 더 전진했으면 현재 원격의 동기화 판단을 이어간다. source 기록은 Agent의 ref·worktree 기준선 후보로 제공하지 않으며 별도 관리 작업의 실행·게시 차단 근거로 사용하지 않는다.
 
 동기화 수행·skip·실패와 관계없이 자동 작업은 원격 SHA에서 계속하고 PR 관측·알림도 유지한다. 로컬 전용 문서·commit은 사용자가 push한 뒤 입력이 된다. 기본 worktree의 사용자 변경은 별도 관리 worktree와 소유 branch가 유지되는 한 Agent 위반으로 귀속하지 않는다.
 
@@ -379,7 +384,7 @@ rebase로 후보 HEAD 또는 ExecPlan·근거 입력이 바뀌면 전체 verify�
 
 흐름:
 1. `PLAN_BLOCKED` 상태, scope, 구조화 원인과 판단 근거를 SQLite에 먼저 commit하고 PR이 없는 계획에 별도 durable checkpoint request를 기록한다
-2. 저장된 branch·결정적 worktree·workspace 소유권·HEAD와 Worker 허용 변경 범위가 모두 일치하고 미해결 Git operation, symlink, ignored 파일, 범위 밖 staged entry, index flag 또는 공유 metadata 불확실성이 없을 때만 검증된 pathspec으로 checkpoint commit을 만든다. 이미 commit된 변경이나 변경 없음에는 빈 commit을 만들지 않는다
+2. 저장된 branch·결정적 worktree·workspace 소유권·HEAD와 Worker 허용 변경 범위가 모두 일치하고 미해결 Git operation, symlink, index에 없는 ignored 경로의 stage 또는 tracked 경로 충돌, 범위 밖 staged entry, index flag 또는 공유 metadata 불확실성이 없을 때만 검증된 pathspec으로 checkpoint commit을 만든다. 충돌하지 않는 ignored artifact의 잔존만으로 checkpoint를 거부하지 않으며 이미 commit된 변경이나 변경 없음에는 빈 commit을 만들지 않는다
 3. 같은 소유 branch의 원격이 없으면 정확한 부재 lease로 생성하고, 저장된 expected OID의 정확한 lease에 결합된 fast-forward만 갱신한다. fast-forward가 아닌 갱신은 PR 없는 동일 소유 branch의 검증된 관리 rebase에만 허용하며 예상하지 못한 원격 commit, branch protection과 권한 거부를 우회하지 않는다
 4. commit·push phase와 local/remote OID를 저장해 중단 후 같은 checkpoint를 재개하고, 일시적 push 실패는 실행당 제한 횟수만 재시도한 뒤 local commit과 worktree를 보존한다. checkpoint 결과와 무관하게 ExecPlan은 `PLAN_BLOCKED`로 남고 독립 READY 선택 자리를 점유하지 않는다
 5. `planning_error`, 등록·branch 생성 전 실패, 기존 PR 또는 현재 대상 작업의 소유권·범위를 증명할 수 없는 차단에는 원격 쓰기를 수행하지 않고 미게시 이유를 저장한다. `PROJECT_BLOCKED`에서는 검증 가능한 대상 계획의 복구·보존만 15번의 경계에서 허용한다. 차단 알림은 checkpoint 결과 확정 뒤 성공 시 commit OID와 immutable branch link를, 미게시 시 local-only 이유를 포함한다
@@ -512,6 +517,10 @@ ExecPlan archive는 원본 hash, regular-file source, 비어 있는 destination�
 ### 실행별 Agent 범위와 Manager 전이
 
 저장된 시작·Agent 결과·Manager checkpoint와 BLOCKED의 사전 비교는 같은 ignored 비교 view를 사용한다. 시작 시 tracked ignore 규칙의 blob·index·작업 상태 또는 기록된 외부 exclude의 경로·내용 서명이 저장 결과·현재 상태와 일치할 때만 index에 없는 과거 untracked artifact를 비교에서 제외한다. `!` 규칙으로 ignore를 해제한 경로는 삭제된 뒤에도 권위 입력으로 유지한다. 원본 snapshot과 활성 파일은 수정하지 않으며 새로 숨긴 경로, 강제 stage, index flag와 권위 있는 Git 변경은 기존 검사를 유지한다.
+
+관리 rebase의 연속 관측과 현재 상태 수용도 같은 규칙 검증을 재사용한다. 첫 관측의 snapshot을 단계 시작 근거로 삼고, 증명된 ignored·index-free 파일만 비교·scope·수용 fingerprint에서 제외한다. 나머지 파일과 HEAD·index·공유 config·원격 OID·PR·입력의 변화는 기존 불안정 관측 또는 범위 위반으로 처리한다. 이 관측은 Agent 호출의 저장된 시작 범위나 게시 소유권 증명을 대신하지 않는다.
+
+공통 ignored 충돌 helper는 대상 tracked 경로와 대소문자·부모·자식 관계까지 비교한다. rebase 시작뿐 아니라 continue·skip·abort에도 같은 보존 검사를 적용하며, 대소문자를 구분하지 않는 파일시스템에서 ignored 파일을 tracked 경로의 alias로 덮어쓰지 않는다.
 
 동일 입력의 planning_error도 보존된 작업의 소유권·종료 호출·저장 결과를 확인해 재평가한다. 원본 결과가 저장된 scope 오류를 재현하고 ignored 비교 view만 통과하며 결과 이후의 권위 변경이 없을 때만 해당 오류를 해제한다. 차단 identity·현재 Git 상태를 transaction에서 다시 대조하고 session·retry·실패 진단을 보존한다. Planner의 ignored-only PROJECT_BLOCKED 해제는 현재 planning worktree 소유권과 저장 결과 이후의 권위 변경을 검사하며 확정 transaction에서 소유권을 다시 확인한다. ignored-only PLAN_BLOCKED는 기존 실행 격리·Manager 전이 증거를 적용한 결과가 현재 후보와 같을 때 저장한 차단 전 실행 단계와 Worker·verify·Review 결과를 이어간다. 새 verify 호출은 먼저 이전 완료 표식을 무효화하고, 통과한 호출은 HEAD가 동일하고 tracked·staged·non-ignored 미커밋 변경이 없을 때만 scope 검사 전에 후보·저장 출력에 결합한 성공 token을 기록한다. 저장 verify 결과는 validated base와 definition·출력 token이 현재 후보 HEAD와 일치할 때만 완료 증거로 인정해 `REVIEWING`으로 재개하며, 구형 `verify-stage` token은 시작·저장 결과·현재 후보 HEAD가 같고 ignored 비교 view의 결과·현재 상태가 깨끗하며, 해당 계획의 최신 불변 verify 감사가 계획에 저장된 `current_revision_sha`(verify 감사의 정의 commit) 및 성공·저장 출력과 일치할 때만 해제 transaction에서 출력 결합 token으로 전환한다. 원본 snapshot·결과·감사는 보존하고 이후 revision gate·Review·게시에서도 전환한 증거를 사용한다. 그 증명이 불완전하거나 미커밋 변경이 있으면 기존 commit·새 후보 재검증 경계를 적용한다.
 

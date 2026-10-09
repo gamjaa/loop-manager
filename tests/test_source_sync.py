@@ -262,7 +262,14 @@ class SourceSynchronizationTests(unittest.TestCase):
             original = commit_all(source, "Second local commit")
             git(source, "branch", "user-topic")
             git(source, "config", "rebase.updateRefs", "true")
-            result = loop_manager.synchronize_base_worktree(source, "main", remote_sha=remote, state_dir=state)
+            real_git = loop_manager.git
+            def updating_cache(repo, *args, **kwargs):
+                result = real_git(repo, *args, **kwargs)
+                if 'rebase' in args and not result.returncode:
+                    ignored.write_text('updated during rebase\n')
+                return result
+            with mock.patch('loop_manager.git', side_effect=updating_cache):
+                result = loop_manager.synchronize_base_worktree(source, "main", remote_sha=remote, state_dir=state)
             self.assertEqual(result.status, "updated", result.reason)
             self.assertEqual(result.remote_sha, remote)
             self.assertEqual(git(source, "rev-list", "--count", f"{remote}..HEAD"), "2")
@@ -270,7 +277,7 @@ class SourceSynchronizationTests(unittest.TestCase):
                 source, original, git(source, "rev-parse", "HEAD"), remote, loop_manager.git))
             self.assertEqual(git(source, "rev-parse", "user-topic"), original)
             self.assertEqual(git(writer, "ls-remote", "--heads", "origin", "main").split()[0], remote)
-            self.assertEqual(ignored.read_text(), "secret\n")
+            self.assertEqual(ignored.read_text(), "updated during rebase\n")
             self.assertEqual((source / "local.txt").read_text(), "local\n")
             self.assertEqual((source / "tracked.txt").read_text(), "two\n")
             self.assertEqual(git(source, "stash", "list"), "")
@@ -329,10 +336,14 @@ class SourceSynchronizationTests(unittest.TestCase):
         for mutation in (None, "ref", "index", "file"):
             with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as directory:
                 source, _writer, state, original, remote = self._diverged(directory)
+                cache = source / 'ignored/arbitrary.asset'
+                cache.parent.mkdir()
+                cache.write_text('before rebase')
                 with mock.patch.object(manager_git_journal, "_finish", side_effect=RuntimeError("interrupted")):
                     self.assertEqual(loop_manager.synchronize_base_worktree(source, "main", remote_sha=remote, state_dir=state).status, "failed")
                 head = git(source, "rev-parse", "HEAD")
                 self.assertNotEqual(head, original)
+                cache.write_text('changed after interruption')
                 if mutation == "ref":
                     git(source, "update-ref", "-m", "external away", "refs/heads/main", original)
                     git(source, "update-ref", "-m", "external back", "refs/heads/main", head)
@@ -451,6 +462,9 @@ class SourceSynchronizationTests(unittest.TestCase):
             (source / "local.txt").write_text("user\n", encoding="utf-8")
             (source / "staged.txt").write_text("staged\n", encoding="utf-8")
             git(source, "add", "staged.txt")
+            cache = source / 'ignored/arbitrary.asset'
+            cache.parent.mkdir()
+            cache.write_text('original')
             selected = advance_remote(writer)
             loop_manager._recorded_base_fetch(source, state_dir, "main", owner="project")
             with mock.patch.object(manager_git_journal, "_finish",
@@ -462,10 +476,16 @@ class SourceSynchronizationTests(unittest.TestCase):
             self.assertEqual(git(source, "rev-parse", "HEAD"), selected)
             self.assertEqual((source / "local.txt").read_text(), "user\n")
             self.assertEqual(git(source, "diff", "--cached", "--name-only"), "staged.txt")
+            cache.write_text('changed after interruption')
+            latest = advance_remote(writer, path='second-remote.txt')
+            loop_manager._recorded_base_fetch(source, state_dir, "main", owner="project")
             result = loop_manager.synchronize_base_worktree(
-                source, "main", remote_sha=selected, state_dir=state_dir,
+                source, "main", remote_sha=latest, state_dir=state_dir,
             )
-            self.assertEqual(result.status, "equal")
+            self.assertEqual(result.status, "updated", result.reason)
+            self.assertEqual(git(source, 'rev-parse', 'HEAD'), latest)
+            self.assertEqual(cache.read_text(), 'changed after interruption')
+            self.assertFalse(manager_git_journal.has_pending_project_mutation(state_dir, str(source)))
             self.assertEqual((source / "local.txt").read_text(), "user\n")
             self.assertEqual(git(source, "diff", "--cached", "--name-only"), "staged.txt")
 
@@ -864,7 +884,7 @@ class SourceSynchronizationTests(unittest.TestCase):
             self.assertEqual(git(primary, "ls-files", "--stage", "--", "staged.txt").count("staged.txt"), 1)
 
 
-    def test_concurrent_ignored_content_change_skips_without_cleanup(self):
+    def test_concurrent_ignored_content_change_continues_without_cleanup(self):
         with tempfile.TemporaryDirectory() as directory:
             _remote, primary, writer = remote_fixture(directory)
             ignored = primary / "ignored/local.txt"
@@ -888,9 +908,8 @@ class SourceSynchronizationTests(unittest.TestCase):
                     primary, "main", remote_sha=remote_sha
                 )
 
-            self.assertEqual(result.status, "skipped")
-            self.assertIn("상태가 변경", result.reason)
-            self.assertEqual(git(primary, "rev-parse", "HEAD"), before_head)
+            self.assertEqual(result.status, "updated", result.reason)
+            self.assertEqual(git(primary, "rev-parse", "HEAD"), remote_sha)
             self.assertEqual(ignored.read_text(), "changed\n")
 
 

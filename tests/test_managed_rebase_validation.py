@@ -9,6 +9,8 @@ import unittest
 from unittest import mock
 
 from loop_manager import _worker_path_allowed, capture_git_snapshot
+from loop_manager_internal.agents import scope_observation
+from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.git.managed_rebase_observation import (
     ObservationAdapters, observe_current_rebase, parse_index, parse_raw_changes,
 )
@@ -291,6 +293,51 @@ class CurrentRebaseObservationTests(unittest.TestCase):
                          RebaseStatus.COMPLETE)
         forbidden_queries = {'reflog', 'rev-list', 'range-diff', 'rebase', 'add', 'commit'}
         self.assertFalse(any(call.args[1] in forbidden_queries for call in adapters.git.call_args_list))
+
+    def test_proven_ignored_creation_modification_and_deletion_do_not_change_rebase_acceptance(self):
+        artifact = 'docs/requirements/arbitrary.asset'
+        for before_paths, after_paths in (((), (artifact,)), ((artifact,), (artifact,)), ((artifact,), ())):
+            for mutation in (None, 'rule', 'config', 'missing-evidence'):
+                with self.subTest(paths=(before_paths, after_paths), mutation=mutation):
+                    adapters = self.adapters()
+                    snapshot = GitSnapshot(**vars(adapters.capture_snapshot.return_value))
+                    snapshot.index['.gitignore'] = ('H 100644 rule-blob 0',)
+                    second = replace(snapshot, index=dict(snapshot.index), config=dict(snapshot.config))
+                    if mutation == 'rule':
+                        second.index['.gitignore'] = ('H 100644 new-rule 0',)
+                    elif mutation == 'config':
+                        second.config['ignore-source:repository-exclude'] = ('exclude', 'new-rule')
+                    elif mutation == 'missing-evidence':
+                        snapshot.index.pop('.gitignore')
+                        second.index.pop('.gitignore')
+                    calls = []
+                    def capture(_worktree, *, details):
+                        current = snapshot if not calls else second
+                        paths = before_paths if not calls else after_paths
+                        calls.append(current)
+                        details.update(index_debug=''.join(
+                            path + '\0  ctime: 1:1\n  mtime: 1:1\n  dev: 1\tino: 1\n'
+                            '  uid: 1\tgid: 1\n  size: 1\tflags: 0\n' for path in current.index),
+                            staged_raw='', ignored_paths=paths)
+                        return current
+                    def check_ignore(_command, *, input, **kwargs):
+                        raw = b''.join(b'.gitignore\0001\000*\000' + path + b'\0'
+                                       for path in input.rstrip(b'\0').split(b'\0'))
+                        return SimpleNamespace(returncode=0, stdout=raw)
+                    effects = SimpleNamespace(git=adapters.git, _handoff_run=check_ignore)
+                    adapters = replace(adapters, capture_snapshot=capture,
+                        read_file=lambda *_args: ('100644', f'contents-{len(calls)}' if _args[1] == artifact else 'stable-tracked'),
+                        normalize_ignored_snapshot=lambda *args, **kwargs:
+                        scope_observation._normalize_legacy_ignored_snapshot(*args, effects=effects, **kwargs))
+                    actual, scope = observe_current_rebase(self.expected, adapters)
+                    if mutation is None:
+                        self.assertIsInstance(actual, RebaseObservation)
+                        self.assertEqual(actual.files, ())
+                        self.assertTrue(scope.allowed)
+                    else:
+                        self.assertIsInstance(actual, ObservationFailure)
+                        self.assertEqual(actual.area, 'state_changed')
+                        self.assertIsNone(scope)
 
     def test_file_reader_receives_each_fresh_observations_index_mode(self):
         adapters = self.adapters()

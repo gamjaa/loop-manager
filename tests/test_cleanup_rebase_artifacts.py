@@ -1,4 +1,5 @@
 import subprocess
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -9,6 +10,31 @@ from tests.support.workspace import WorkspaceFixture
 
 
 class CleanupRebaseArtifactsTest(WorkspaceFixture, unittest.TestCase):
+    @unittest.skipUnless(os.name == 'nt', 'Windows의 실제 대소문자 경로 alias를 검사한다.')
+    def test_windows_case_alias_ignored_file_is_preserved_before_rebase(self):
+        # 실제 파일 alias와 Git의 overwrite 효과는 관측 mock만으로 증명할 수 없다.
+        with tempfile.TemporaryDirectory() as directory:
+            repo = make_remote_repository(directory)
+            ignore = repo / '.gitignore'
+            ignore.write_text((ignore.read_text() if ignore.exists() else '') + '\ncache/\n')
+            git_command(repo, 'add', '.gitignore')
+            git_command(repo, 'commit', '-m', 'Ignore cache')
+            git_command(repo, 'checkout', '-b', 'target')
+            (repo / 'cache').mkdir()
+            (repo / 'cache/file').write_text('remote tracked')
+            git_command(repo, 'add', '-f', 'cache/file')
+            git_command(repo, 'commit', '-m', 'Track target path')
+            git_command(repo, 'checkout', 'main')
+            (repo / 'CACHE').mkdir()
+            ignored = repo / 'CACHE/file'
+            ignored.write_text('user ignored')
+            head = git_command(repo, 'rev-parse', 'HEAD')
+            result = loop_manager.git(repo, 'rebase', 'target', check=False)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('CACHE/file', result.stdout)
+            self.assertEqual(ignored.read_text(), 'user ignored')
+            self.assertEqual(git_command(repo, 'rev-parse', 'HEAD'), head)
+
     def test_git_metadata_path_preserves_absolute_and_resolves_relative_paths(self):
         repo = Path("/repository")
         absolute = Path("/git/common/info/exclude")
