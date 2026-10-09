@@ -31,6 +31,7 @@ priority: normal
 - 기록된 input·cached input·cache write input·output·reasoning output token과 소요시간은 provider의 포함 관계를 보존한다. cache·reasoning을 input·output에 다시 더하지 않으며 비교 가능한 값만 기존 cache 비중에 사용한다.
 - 각 token·시간 지표에 알려진 부분 합계·알려진 호출 수·미수집 호출 수와 수집 상태를 제공한다. 전부 미수집이면 미확인, 일부 수집이면 부분 합계, 실측 0이면 0으로 표현한다. 진행 중·중단·실패 호출의 누락을 드러내며 빈 호출 범위에서도 미수집 token·시간을 가짜 0으로 채우지 않는다.
 - G-194의 일관된 읽기 snapshot, 관측 시각·출처·미확인 의미, 기본 출력/JSON 공통 envelope와 오류·종료 코드·비밀값 제거를 따른다. 실행·수집·invocation 정리·기록 갱신을 하지 않으며 금액 비용·예산·추정 절감은 제공하지 않는다.
+- 최신 R-076의 list/status/usage 공통 envelope를 사용하며 usage의 source는 null이다. 도움말·예시에서 통합 status와 새 등록 명령을 사용하고 별도 explain이나 제거된 config list/add/remove를 안내하지 않는다.
 - 기존 사용자 문서에 usage 범위와 모든 추가 필드·자료형·단위·nullable 의미·버전 호환, provider 포함 관계·ledger 집계 의미·수집 상태 및 정상·부분·전부 미수집·실측 0·오류 예시를 기록한다.
 
 ## Implementation
@@ -55,3 +56,4 @@ priority: normal
 
 - R-076은 R-073 전체 구현을 기다리지 않는다. G-184·G-185와 반대 방향의 dependency를 만들지 않고 G-185가 이 조회를 확장하게 한다.
 - 호출 행 수와 실제 실행 수는 다른 관측이다. 후속 수집 확대 후에도 기존 calls/retries 의미를 명시적으로 유지한다.
+- 2026-10-09: 제공된 snapshot과 원본 hash를 확인하고 확장된 R-076의 공통 출력만 반영한다. complexity medium은 기존 집계에 필터·미수집 분모와 읽기 전용 출력 연결을 추가하는 경계가 명확한 변경이다. risk medium은 조회 범위·부분 합계의 잘못된 표시이며 원본 ledger를 변경하지 않아 출력 교정으로 복구할 수 있다. 구현·테스트 실행 없음.

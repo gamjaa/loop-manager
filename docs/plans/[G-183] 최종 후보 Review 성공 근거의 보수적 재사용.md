@@ -4,6 +4,7 @@ title: 최종 후보 Review 성공 근거의 보수적 재사용
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-072] Reuse Successful Candidate Results with Proven Inputs.md
+  - docs/requirements/[R-082] 단계별 원격 문서 반영과 PR 전 ExecPlan 갱신.md
 depends_on:
   - G-182
   - G-147
@@ -18,6 +19,8 @@ depends_on:
   - G-215
   - G-216
   - G-217
+  - G-241
+  - G-242
 complexity: high
 risk: high
 priority: high
@@ -33,6 +36,7 @@ priority: high
 - 목록 부재/오류/누락 의심·입력 비교 불가, 문서나 승인 입력 변화, 부분 성공 근거는 Review를 실행한다. verify와 무관한 명세 변화에서는 verify 재사용과 새 Review를 구분한다.
 - 승인 receipt는 실제 PASS·검증된 후보/입력·작업 주기에 결합하고 최종 게시 직전 다시 확인한다. rebase·경쟁·중단/재시작에서 오래된 Review로 새 diff를 승인하거나 새 실패를 이전 PASS로 덮지 않는다.
 - 다른 계획/작업의 PASS·교정 이력·승인을 복제하지 않는다. 생략 이유와 원래 근거를 남기며 실제 Reviewer가 실행되면 기존 읽기 전용·검증 결과 전달·issue 교정 계약을 유지한다.
+- G-241의 일반 verify 입력 증명과 최신 완료 조건을 확인한다. R-082의 선행 Review PASS·VERIFY_REQUIRED와 과거 verify 참고 출력은 최종 승인 receipt가 아니며, 검증 보완 전에는 재사용·게시 근거로 승격하지 않는다.
 
 ## Implementation
 
@@ -46,15 +50,18 @@ priority: high
 - Review·publication revision 테스트에서 완전 동일/문서만 변경/검증 입력 변경·profile/공통 또는 역할 지침/결정 변경·예약어 source·receipt 부재·게시 경쟁의 최소 unit case를 실행한다. 고정 원본 묶음과 실제 Reviewer instruction의 동일성은 기존 guidance fixture로 확인한다.
 - Manager 전체 verify는 verify/Review 독립 선택, 실제 no-call/필수 call, 마지막 승인 기준·scope·최종 PR gate와 중단 재개를 검증한다.
 - 실제 Review가 필요한 경우 실행한 verify 또는 재사용한 verify의 유효한 근거가 같은 후보에 결합돼 전달되는지 확인한다. Review 생략은 새 Reviewer 호출·새 테스트 실행 근거를 만들지 않는다.
+- 단계별 문서 변경 뒤 선행 PASS·VERIFY_REQUIRED·최종 PASS를 구분하고, 일반 verify 재사용 및 새 완료 조건의 증거 부재에서 최종 Review를 잘못 생략하지 않는 최소 unit case를 확인한다.
 
 ## Progress
 
 - [x] 2026-10-05 planning 기준 a049a76의 명세·원본·관련 테스트와 비종료 catalog에서 미충족 범위를 확인함. 구현·테스트 실행은 하지 않음.
 - [x] 2026-10-06 f4e82b89646bebf33bb4812d393af98c045ae2aa와 mutable READY snapshot의 원본 hash를 대조해 G-197 선행 연결 및 실제 호출의 근거 전달 조건만 보완했다. 구현·테스트 실행은 하지 않음.
 - [ ] 구현 및 관련 targeted unit 검증
+- [x] 2026-10-09 eb797d3a의 R-072·R-082와 현재 verify adapter·문서 선행 Review를 정적으로 대조했다. 일반 verify 재사용은 미충족이며 선행 Review는 최종 승인이 아니다. 구현·테스트 실행 없음.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
 
 - 검증·전체 diff·검토 기준·게시를 결합해 complexity high, 승인 없는 후보 게시 영향으로 risk high다.
 - 2026-10-06: mutable READY token a382b8f255fc01e7ddfd58be4210b3263692ebb1e781025a65291808f7b619f3의 G-183만 개정한다. R-003 감사에서 기존 성공 결과 전달이 없음을 확인해 G-197의 실제 Merge를 선행 조건으로 추가한다. ID·경로·title·sources·Purpose와 기존 재사용 목표 및 dependency를 보존하고, 재사용한 성공을 새 실행으로 오인하지 않도록 전달 조건을 명확히 한다.
+- 2026-10-09: snapshot token 324c039278646b522a5cbad59f1ba7ad5c4d543c36002cf4bdc2efc2bd0e05ed와 원본 hash를 확인했다. 기존 dependency와 목표를 보존하며 일반 verify 증명 및 단계별 문서 판단 보완을 선행 연결한다. high complexity의 남은 판단은 마지막 승인·현재 후보·verify 증명·문서 선행 Review의 수명과 게시 경쟁을 일관되게 결합하는 것이다. risk high는 잘못된 승인 재사용으로 미검증 후보가 게시되는 영향이며 receipt 보존·재검증과 PR 수동 복구가 필요하다.

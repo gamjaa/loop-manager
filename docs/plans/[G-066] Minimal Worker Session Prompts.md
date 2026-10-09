@@ -7,6 +7,7 @@ sources:
   - docs/requirements/[R-033] Minimal Worker Session Prompts.md
   - docs/requirements/[R-064] 모델 호출을 통한 공통 Agent 지침 전달.md
   - docs/requirements/[R-066] AGENTS 변경 사전 승인.md
+  - docs/requirements/[R-082] 단계별 원격 문서 반영과 PR 전 ExecPlan 갱신.md
 depends_on:
   - G-058
   - G-065
@@ -39,6 +40,7 @@ depends_on:
   - G-215
   - G-216
   - G-217
+  - G-242
 complexity: high
 risk: medium
 priority: low
@@ -56,6 +58,7 @@ priority: low
 - 프로젝트 지침은 Agent CLI가 해석한다. 최초·재개·fallback 사용자 prompt에 루트 `AGENTS.md`의 읽기·승인·복원 지시를 넣지 않고 존재·인코딩·내용·자동 로딩 여부를 Manager의 추가 실행 gate로 삼지 않는다.
 - 축약 뒤에도 Worker 권한, 일반 draft·User Decision 보호, 고정 원본 묶음과 역할별 실제 instruction, 결과 protocol, targeted test 범위와 전체 verify 분리, 비밀값 가림 및 세션·작업 공간 복구 계약은 유지된다. 과거 파일 승인 감사·작업물·session은 보존한다. 전송 도중 중단·재시작해도 새 정보를 누락하지 않는다.
 - 수동 complete/submit 수락 뒤 자동 Worker 교정에도 같은 초기·delta·복구 계약을 적용한다. 수동 문맥을 덧붙이는 경로가 이미 전달한 결과나 verify·Review 원문을 다시 넣지 않는다. verify 성공 출력은 Worker에게 전달하지 않으며 미해결 실패는 기존 진단 helper의 필요한 피드백으로 전달한다. 수동 제출의 전체 G·후보 R·미확인 외부 테스트와 사용자 생략을 보존하고 실제 Worker 성공으로 합성하지 않는다.
+- R-082의 갱신·rebase를 마친 연결 Requirement/상위 명세 변경은 ExecPlan 내용이 같아도 최초·재개 Worker의 필요한 새 문맥으로 전달한다. 확인된 전달 cursor만 전진시키며, 새 세션 복구에도 현재 조건과 미완료 보완을 남긴다. 문서 영향 판단·계획 게시·후보 성공 재사용은 기존 담당 경계를 재사용한다.
 
 ## Implementation
 
@@ -75,6 +78,7 @@ priority: low
 - 전체 verify는 Agent 범위·고정 지침/과거 승인 감사 보존, Worker 결과·일반 사용자 결정 protocol, 피드백 audit·cursor, 실제 호출·session 복구와 rebase 후보 재확인 회귀를 유지한다. 기존 unittest manifest 수집·Agent 호출 차단을 사용하며 전체 verify와 Reviewer의 책임은 `docs/AGENTS.common.md`·`docs/AGENTS.worker.md`·`docs/AGENTS.reviewer.md`를, 계획 작성 규칙은 `docs/PLANS.md`를 따른다.
 
 - 기존 manual fixture로 수동 Worker prompt의 최소 unit case를 확인한다. Review 실패 뒤 저장된 verify PASS 출력, verify 실패 뒤 raw 출력 재추가, 동일 session 재개와 새 session fallback에서 중복·원문 복제가 없고 필요한 실패 진단·전체 G·후보 R은 남는지 검증한다. Manager 전체 verify는 생략 무효화·실제 Worker 교정·원문 및 실패 지문 보존과 수동/일반 Reviewer 입력의 회귀를 확인한다.
+- `tests/test_stage_documents.py`의 최신 문서 진입 fixture와 실제 Worker 호출을 연결해 ExecPlan 무변경/연결 Requirement·상위 명세 변경, 동일 session 재개·fallback·전달 중 중단에서 새 조건이 누락되지 않는지 최소 unit으로 확인한다. 문서 무관 판단만으로 Worker를 다시 호출하지 않는다.
 
 ## Progress
 
@@ -86,6 +90,8 @@ priority: low
 - [ ] 관련 targeted 회귀 사례 추가
 
 ## Decision Log
+
+- 2026-10-09 full 기준 eb797d3a와 mutable token 324c039278646b522a5cbad59f1ba7ad5c4d543c36002cf4bdc2efc2bd0e05ed, 원본 hash 6cd0e0bfd53789f4f1619b65000721dcf97f2fd0677386023f1d10c8ca1334b3를 확인했다. 직접 구현된 R-082의 단계별 문서 갱신을 기존 초기/delta/복구 목표에 연결하고 G-242의 보완 뒤 실제 Worker 전달을 검증한다. 기존 ID·경로·분류·목표·기록을 보존하며 문서 판단/게시 기능을 중복 구현하지 않는다. 구현·테스트 실행 없음.
 
 - 2026-10-09 delta 기준 b29bb81c9c3c76cc196b30fd04eed1f52a02d6fa, mutable READY token d249095f1d5c09428e872445c00ba5d442b3732eb5ea3eef1ecbf3c2a5833dac와 원본 hash 82d08b12f5b8797a95e26c3de9c9a976eb86386e2ca90fc395b3cf0f13faa0dd를 대조했다. G-197의 검증 근거 전달은 Merge됐지만 실제 Worker prompt와 PublicFacadeTest는 정적 테스트 규칙의 중복을 유지한다. 이 계획의 기존 첫 Acceptance Criterion이 이미 담당하는 제거 목표에 활성 R-003 source와 실제 호출 검증만 연결한다. ID·Purpose·기존 dependency·complexity high·risk medium·priority low와 초기/delta/복구 범위를 보존하며 Reviewer 교정을 추가 구현하지 않는다. 구현·테스트 실행 및 Requirement 충족·자동 검증 성공을 기록하지 않았다.
 

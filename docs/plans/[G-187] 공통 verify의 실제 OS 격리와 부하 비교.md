@@ -37,6 +37,7 @@ priority: normal
 - 현재 resource/coordination/timing 진단과 G-186 예제를 재사용해 bounded 실제 검증/비교 진입을 기존 verify 경계에 연결한다. 별도 상시 benchmark 서비스나 새 루트 launcher를 만들지 않는다.
 - 시간 비교는 G-216의 `git_fixture_seconds` 중첩 집계를 재사용한다. phase event·개별 duration을 보존하고, 같은 PID의 완전히 포함된 하위 구간만 fixture 총계에서 제외한다.
 - 검증 자료에 환경·revision·run identity·원래 결과·종료 확인·비교 조건을 남기고 시간 상한 증가/필수 테스트 축소로 성능을 만들지 않는다.
+- `docs/VERIFY.md`가 소유한 version 1 선언·adapter 지원·Manager/단독 호출·timeout 상속 계약을 사용한다. 현재 unittest의 Python 3.12/Linux targeted 근거와 mock Windows Job/프로세스 적합성을 실제 OS 격리·다른 지원 버전·동시 실행·성능 근거로 확대하지 않는다. G-186의 추가 도구와 같은 필수 범위로 Manager가 얻은 실제 자료 및 미실행 한계를 지원 문서에 반영한다.
 - 자동 역할·권한·검증은 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙·설계·계획 작성은 AGENTS.md·docs/ARCHITECTURE.md·docs/PLANS.md를 참조한다. 기존 helper·관련 테스트를 재사용하고 지정 루트 경로를 보존한다.
 
 ## Validation
@@ -47,6 +48,7 @@ priority: normal
 ## Progress
 
 - [x] 2026-10-05 planning 기준 a049a76의 명세·원본·관련 테스트와 비종료 catalog에서 미충족 범위를 확인함. 구현·테스트 실행은 하지 않음.
+- [x] 2026-10-09 `bac6f84e`와 mutable snapshot token `72f8256fbf8d111d1e3b5471dfeb314312d188d8eeec9fbcb704063918d9c50a`의 공통 runner·지원 문서·종료/예약 회귀를 읽었다. 두 언어·Windows/Linux 실제 격리·직렬/auto 동일 조건 실측 목표는 유지하며 구현·테스트·verify를 실행하지 않았다.
 - [ ] 구현 및 관련 targeted unit 검증
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
@@ -55,3 +57,4 @@ priority: normal
 - R-058의 시간 기록·Agent 없는 테스트는 현재 충족된 검증 보호 기준으로 재사용한다. 이 계획의 미충족 목표는 R-065·R-067의 실제 부하/OS/언어 검증이며 R-058의 재구현이나 새 잔여 목표로 등록하지 않는다.
 
 - 기존 core의 실제 검증 자료 연결로 complexity medium, 프로세스/예약 오정리와 범위 누락 영향으로 risk high다. R-065의 이미 구현된 배분 알고리즘은 중복 구현하지 않는다.
+- 현재 snapshot의 ID·경로·metadata·dependency·기록을 보존한다. medium complexity는 기존 runner·예약·진단에 범위가 정해진 실제 실행 자료를 연결하는 작업이다. high risk는 다른 실행의 자식을 종료하거나 종료 불명 예약을 회수해 독립 작업을 손상하는 영향이며, 종료된 외부 프로세스를 코드 rollback으로 복구할 수 없다. 예약과 작업물을 보존하고 해당 실행의 수동 재개를 지원하며 Validation의 실제 자식/예약 격리·미확인 종료 보존을 Review 근거로 확인한다.
