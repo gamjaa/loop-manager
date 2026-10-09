@@ -408,12 +408,13 @@ def _read_plan_id_normalization_journal(
     return transaction, plans
 
 
-def _recover_interrupted_plan_id_normalization(worktree: Path) -> None:
+def _recover_interrupted_plan_id_normalization(worktree: Path) -> set[str]:
+    """Restore originals and return journal-owned paths removed by recovery."""
     journal_path = _plan_id_normalization_journal_path(worktree)
     try:
         journal_info = journal_path.lstat()
     except FileNotFoundError:
-        return
+        return set()
     except OSError as error:
         raise ExternalObservationError(
             f"새 ExecPlan 정규화 복구 정보를 확인할 수 없습니다: {error}"
@@ -495,6 +496,8 @@ def _recover_interrupted_plan_id_normalization(worktree: Path) -> None:
         )
     journal_path.unlink()
     _sync_normalization_directory(journal_path.parent)
+    return ({str(item["temporary_path"]) for item in plans}
+            | (set(outputs_by_path) - source_paths))
 
 
 def _rewrite_plan_identity(
@@ -921,14 +924,14 @@ def validate_planner_result(
     dedicated exception. Operational Git failures must retain their normal
     recovery boundary and never consume the Planner validation retry budget.
     """
-    _recover_interrupted_plan_id_normalization(worktree)
+    recovered_paths = _recover_interrupted_plan_id_normalization(worktree)
     # A resumed batch can still have Manager moves in the index/worktree.
     # Saved dirty paths are hints, not proof that a receipted move exists.
     observed = (set(effects.changed_files(worktree, active_sha))
                 | set(effects.changed_files(worktree)))
     if not set(manager_paths) <= observed:
         raise PlannerValidationError("Manager Requirement 이동 영수증이 실제 변경과 다릅니다.")
-    planned_files = sorted((observed | set(dirty_files)) - set(manager_paths))
+    planned_files = sorted((observed | (set(dirty_files) - recovered_paths)) - set(manager_paths))
     if not planned_files:
         return None
     snapshot = mutable_snapshot or MutableReadySnapshot(

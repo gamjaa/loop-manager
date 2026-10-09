@@ -288,10 +288,11 @@ def validate_maintenance_planner_result(
         _normalize_new_plan_batch, _planning_id_inventory,
         _recover_interrupted_plan_id_normalization,
     )
-    _recover_interrupted_plan_id_normalization(worktree)
+    recovered_paths = _recover_interrupted_plan_id_normalization(worktree)
     from loop_manager_internal.maintenance import code_map_artifact
     planned_files = sorted(
-        set(dirty_files) | set(effects.changed_files(worktree, context.active_sha))
+        (set(dirty_files) - recovered_paths)
+        | set(effects.changed_files(worktree, context.active_sha))
     )
     base_paths = effects._git_tree_entries(worktree, context.active_sha)
     path_moves_by_sha: dict[str, dict[str, str]] = {}

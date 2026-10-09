@@ -202,6 +202,85 @@ class CatalogBatchesTest(AutomationCatalogFixture, unittest.TestCase):
             self.assertFalse((repo / "docs/plans/[G-002] Candidate.md").exists())
             self.assertFalse(planner_validation._plan_id_normalization_journal_path(repo).exists())
 
+    def test_validation_resumes_with_dirty_paths_from_interrupted_normalization(self):
+        from loop_manager_internal.maintenance.maintenance_planning import (
+            MaintenancePlanningContext, MaintenancePlanMode,
+        )
+
+        for maintenance in (False, True):
+            with self.subTest(maintenance=maintenance), tempfile.TemporaryDirectory() as directory:
+                repo = make_catalog_root(directory)
+                existing = write_execplan(repo, "G-001", "Existing")
+                first = write_execplan(repo, "G-005", "First")
+                second = write_execplan(repo, "G-006", "Second", depends_on=("G-005",))
+                documents = {existing.relative_to(repo).as_posix(): existing.read_text()}
+                originals = {path: path.read_bytes() for path in (first, second)}
+                real_link = os.link
+                calls = 0
+
+                def interrupt_second_install(source, target, *args, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 2:
+                        raise KeyboardInterrupt("process stopped")
+                    return real_link(source, target, *args, **kwargs)
+
+                # Leave the durable journal and staged files as a killed process would.
+                with planner_git_observations(documents), mock.patch.object(
+                    planner_validation, "_recover_interrupted_plan_id_normalization",
+                    return_value=set(),
+                ), mock.patch.object(planner_validation.os, "link", side_effect=interrupt_second_install):
+                    with self.assertRaises(KeyboardInterrupt):
+                        loop_manager.validate_planner_result(
+                            repo, "base", [path.relative_to(repo).as_posix() for path in originals],
+                        )
+                journal = planner_validation._plan_id_normalization_journal_path(repo)
+                self.assertTrue(journal.exists())
+                dirty = [path.relative_to(repo).as_posix() for path in (repo / "docs/plans").iterdir()
+                         if path != existing]
+                self.assertTrue(any(path.endswith(".tmp") for path in dirty))
+                self.assertIn("docs/plans/[G-002] First.md", dirty)
+
+                def changed_files(*_args):
+                    return [path.relative_to(repo).as_posix()
+                            for path in (repo / "docs/plans").iterdir()
+                            if path != existing]
+
+                with planner_git_observations(documents), mock.patch.object(
+                    loop_manager, "changed_files", side_effect=changed_files,
+                ), mock.patch.object(
+                    loop_manager, "_assert_maintenance_context_current",
+                ), mock.patch.object(loop_manager, "_git_tree_entries", return_value={
+                    path.encode(): (b"blob", b"observed") for path in documents
+                }):
+                    if maintenance:
+                        context = MaintenancePlanningContext(
+                            str(repo), MaintenancePlanMode.BARRIER, "base", 1, "assessment", (),
+                        )
+                        result = loop_manager.validate_maintenance_planner_result(
+                            self._connection(), context, repo, dirty,
+                            refactoring_plan_ids=(), allow_general_plans=True,
+                        )
+                    else:
+                        result = loop_manager.validate_planner_result(repo, "base", dirty)
+                    # An unrelated stale path has no recovery receipt and stays out of scope.
+                    unrelated = ["docs/plans/.plan-id-normalize-unowned.tmp"]
+                    with self.assertRaises(RuntimeError):
+                        if maintenance:
+                            loop_manager.validate_maintenance_planner_result(
+                                self._connection(), context, repo, unrelated,
+                                refactoring_plan_ids=(), allow_general_plans=True,
+                            )
+                        else:
+                            loop_manager.validate_planner_result(repo, "base", unrelated)
+                self.assertEqual([plan["id"] for _, plan in result.plans], ["G-002", "G-003"])
+                self.assertEqual(result.plans[1][1]["depends_on"], ["G-002"])
+                self.assertEqual([item.source_id for item in result.id_allocations], ["G-005", "G-006"])
+                self.assertFalse(journal.exists())
+                self.assertFalse(list((repo / "docs/plans").glob(".plan-id-normalize-*.tmp")))
+                self.assertFalse(first.exists())
+                self.assertFalse(second.exists())
+
     def test_batch_normalization_recovers_original_after_partial_stage_write(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = make_catalog_root(directory)
