@@ -301,6 +301,8 @@ class ManualCandidate:
         return group,head,base,token,setting_token,stage_token,setting_token is not None
 
     def publication_stage_tokens(self, context):
+        if not self.enabled():
+            return None
         result={}
         for stage in ('verify','review'):
             _group,_head,_base,_token,_setting,stage_token,known=self.inputs(context,stage)

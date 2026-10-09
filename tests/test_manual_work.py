@@ -53,6 +53,13 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
         self.assertIsNone(request['verify_input_token'])
         self.assertIsNone(request['review_input_token'])
 
+    def test_publication_stage_tokens_are_absent_without_manual_request(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service,_,worktree=self.fixture(directory)
+            candidate=self.candidate(service,'G-012')
+            context=SimpleNamespace(worktree=worktree,base_branch='main')
+            self.assertIsNone(candidate.publication_stage_tokens(context))
+
     def test_start_releases_projection_and_does_not_call_agent(self):
         with tempfile.TemporaryDirectory() as directory:
             service,branch,worktree=self.fixture(directory)
