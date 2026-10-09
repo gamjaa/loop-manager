@@ -1542,9 +1542,11 @@ class RuntimeStateRepository:
                     observed_remote_oid=current.observed_remote_oid,
                     snapshot={**(current.snapshot or {}), 'scope_block_resume_status': prior_status},
                 )
-            if current.snapshot and 'blocked_resume' in current.snapshot:
+            if current.snapshot and any(key in current.snapshot for key in (
+                    'blocked_resume', 'published_review_resume')):
                 snapshot = dict(current.snapshot)
-                del snapshot['blocked_resume']
+                snapshot.pop('blocked_resume', None)
+                snapshot.pop('published_review_resume', None)
                 execution_checkpoint.record(
                     repo, plan_id, expected_generation=current.generation,
                     operation=current.operation, expected_head=current.expected_head,

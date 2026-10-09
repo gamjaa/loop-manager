@@ -43,7 +43,7 @@ class OwnershipHandler:
         """Require the published checkpoint's durable owner on an active resume."""
         try:
             checkpoint = self.ports.state.connection.execute(
-                'SELECT phase, accepted_remote_oid, request_identity, branch, worktree '
+                'SELECT * '
                 'FROM blocked_checkpoints '
                 'WHERE repo = ? AND plan_id = ?',
                 (self.ports.identity.repo, context.plan.plan_id),
@@ -51,8 +51,21 @@ class OwnershipHandler:
         except sqlite3.OperationalError as error:
             raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
                                   'checkpoint database observation failed') from error
-        if checkpoint is None or checkpoint['phase'] != 'published':
+        if checkpoint is None:
             return True
+        if checkpoint['phase'] != 'published':
+            # 게시 checkpoint 이력이 없는 기존 PR은 별도 PR 게시 gate가 소유권 원본이다.
+            if checkpoint['publication_history'] == '[]' and (
+                    not row['publication_remote_oid']
+                    or (row['pr_url'] and not checkpoint['published_oid'])):
+                return True
+            saved = (current.snapshot or {}) if current else {}
+            resume = saved.get('published_review_resume')
+            owner = resume.get('owner_oid') if isinstance(resume, dict) else None
+            checkpoint = checkpoint_ownership.publication_receipt(
+                checkpoint, owner or row['publication_remote_oid'])
+            if checkpoint is None:
+                return False
         if current is not None and current.operation == 'rebase':
             return self._owned_current_checkpoint_rebase(
                 context, row, remote_oid, current, checkpoint, pull_request,
@@ -78,6 +91,15 @@ class OwnershipHandler:
         if marker:
             return self._owned_current_checkpoint_rebase(
                 context, row, remote_oid, current, checkpoint, pull_request)
+        if not marker and row['publication_remote_oid']:
+            if current is None or current.operation not in {None, 'commit'}:
+                return False
+            # OID 일치로 승인하지 않고 기존 게시·현재 공간·실제 원격 검증을 거친다.
+            return self._owned_published_review_resume(
+                context, row, remote_oid, current, checkpoint,
+                {'request_identity': checkpoint['request_identity'],
+                 'owner_oid': checkpoint['accepted_remote_oid'],
+                 'head': checkpoint['accepted_remote_oid']}, pull_request)
         if not marker and not row['publication_remote_oid']:
             # A reviewed correction is Worker input only when its remote head
             # is still the checkpoint's last accepted, owned ref.
@@ -146,7 +168,7 @@ class OwnershipHandler:
                     self.ports.state.connection, self.ports.identity.repo_path,
                     self.ports.identity.repo, context.plan.plan_id, context.branch,
                     context.worktree, accepted, self.ports.git, before_head=local,
-                    require_live=False, strict_observation=True) != accepted:
+                    require_live=False, strict_observation=True, allow_history=True) != accepted:
                 return False
             before = snapshot.get('remote_before')
             pending_push = (current.operation == 'push' and bool(before)
@@ -214,6 +236,9 @@ class OwnershipHandler:
             ).stdout.strip()
             if local != branch_ref:
                 return False
+            if (not (current.snapshot or {}).get('published_review_resume')
+                    and current.operation is None and local != original):
+                return False
             if (current.operation == 'commit'
                     and local != current.expected_head
                     and not checkpoint_ownership.committed_tree_matches_intent(
@@ -227,7 +252,7 @@ class OwnershipHandler:
                 context.plan.plan_id, context.branch, context.worktree,
                 original, self.ports.git,
                 before_head=local, require_live=False,
-                strict_observation=True,
+                strict_observation=True, allow_history=True,
             ) != original:
                 return False
             pending_push = (
@@ -318,7 +343,7 @@ class OwnershipHandler:
                 context.plan.plan_id, context.branch, context.worktree,
                 original, self.ports.git, recorded_oid=original,
                 require_live=remote_oid == original,
-                strict_observation=True,
+                strict_observation=True, allow_history=True,
             ) != original:
                 return False
             service = self.ports._current_rebase_service(context, remote_oid=remote_oid)

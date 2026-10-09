@@ -452,6 +452,8 @@ class ScopeReconciliationEffectsResumeOwnedCheckpointProjectBlockEffects:
     remote_branch_oid: Callable[..., object]
     validate_execplan_workspace_identity: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
+    validate_blocked_agent_scope: Callable[..., object]
+    unmet_execplan_dependencies: Callable[..., object]
 
 
 def _scope_reconciliation_effects_resume_owned_checkpoint_project_block(effects: ScopeReconciliationEffectsResumeOwnedCheckpointProjectBlockEffects, ) -> scope_reconciliation.ResumeOwnedCheckpointProjectBlockEffects:
@@ -465,6 +467,8 @@ def _scope_reconciliation_effects_resume_owned_checkpoint_project_block(effects:
         remote_branch_oid=effects.remote_branch_oid,
         validate_execplan_workspace_identity=effects.validate_execplan_workspace_identity,
         validate_managed_worktree=effects.validate_managed_worktree,
+        validate_blocked_agent_scope=effects.validate_blocked_agent_scope,
+        unmet_execplan_dependencies=effects.unmet_execplan_dependencies,
     )
 
 
