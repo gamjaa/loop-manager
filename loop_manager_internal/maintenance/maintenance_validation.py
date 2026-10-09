@@ -293,6 +293,7 @@ def validate_maintenance_planner_result(
     planned_files = sorted(
         (set(dirty_files) - recovered_paths)
         | set(effects.changed_files(worktree, context.active_sha))
+        | set(effects.changed_files(worktree))
     )
     base_paths = effects._git_tree_entries(worktree, context.active_sha)
     path_moves_by_sha: dict[str, dict[str, str]] = {}

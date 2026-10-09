@@ -241,14 +241,19 @@ class CatalogBatchesTest(AutomationCatalogFixture, unittest.TestCase):
                 self.assertTrue(any(path.endswith(".tmp") for path in dirty))
                 self.assertIn("docs/plans/[G-002] First.md", dirty)
 
-                def changed_files(*_args):
+                def changed_files(worktree, since=None):
+                    self.assertEqual(worktree, repo)
+                    if since is not None:
+                        self.assertEqual(since, "base")
+                        # No commits were made: base..HEAD excludes restored untracked plans.
+                        return []
                     return [path.relative_to(repo).as_posix()
                             for path in (repo / "docs/plans").iterdir()
                             if path != existing]
 
                 with planner_git_observations(documents), mock.patch.object(
                     loop_manager, "changed_files", side_effect=changed_files,
-                ), mock.patch.object(
+                ) as observed_changes, mock.patch.object(
                     loop_manager, "_assert_maintenance_context_current",
                 ), mock.patch.object(loop_manager, "_git_tree_entries", return_value={
                     path.encode(): (b"blob", b"observed") for path in documents
@@ -263,6 +268,9 @@ class CatalogBatchesTest(AutomationCatalogFixture, unittest.TestCase):
                         )
                     else:
                         result = loop_manager.validate_planner_result(repo, "base", dirty)
+                    self.assertIsNotNone(result)
+                    observed_changes.assert_any_call(repo, "base")
+                    observed_changes.assert_any_call(repo)
                     # An unrelated stale path has no recovery receipt and stays out of scope.
                     unrelated = ["docs/plans/.plan-id-normalize-unowned.tmp"]
                     with self.assertRaises(RuntimeError):
