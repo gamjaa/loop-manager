@@ -48,6 +48,8 @@ Worker 구현 입력에서 순수 기록을 구분해도 verify·Review·사용�
 
 - 현재 후보에 목록이 없거나 유효하지 않으면 전체 verify를 실행한다. 목록 부재만으로 해당 작업의 Worker를 호출하거나 Planner를 즉시 실행하지 않는다.
 - 다음 일반 Planner 실행 시 Manager는 최신 원격 base에서 목록 부재를 확인하고 생성 계획을 요청한다. 최신 base에 목록이 있으면 낡은 작업 branch의 부재를 새 생성 요청으로 취급하지 않는다.
+- Manager 요청에 따라 새로 생성하는 목록 생성 ExecPlan은 `priority: critical`로 작성한다. 반복적인 전체 verify 비용을 줄이는 기반 작업을 우선 확보하기 위한 R-001 일반 priority 기준의 명시적 예외다. Manager는 생성 요청에 이 조건을 전달하고 새 계획의 최초 등록 시 다른 priority를 거부한다. 실행 중 작업을 선점하지 않고 기존 dependency gate와 유지보수 장벽을 유지한다.
+- 정책 적용 전에 등록된 미완료 계획·draft·미Merge PR은 기존 선언 priority와 실행 상태를 보존한다. 새 priority 조건만으로 기존 요청·계획을 무효화하거나 교체 계획을 생성하지 않는다.
 - 같은 프로젝트·목적의 미완료 ExecPlan·사용자 판단 대기 draft·미Merge PR이 있으면 추가 생성 계획을 요청하지 않는다. 생성 계획의 중단·실패 동안 기존 계획을 보존하고 중복 생성하지 않는다.
 - Planner는 전체 프로젝트 구조와 실제 verify 스크립트를 기준으로 목록 생성 계획을 작성한다. rebase 변경 파일만으로 전체 입력을 정하지 않는다. 계획이 Merge돼 목록과 유효한 성공 기준이 확보되기 전까지 기존 작업은 전체 verify를 실행한다.
 
@@ -115,6 +117,7 @@ Manager는 실제 전체 verify 성공 결과와 입력 지문을 SQLite에 저�
 - 같은 기록 절의 목표·Acceptance Criteria·source·제약·검증 조건·지침·사용자 결정 변경은 실제 입력으로 구분한다. 분류 불확실성·과거 비교 근거 부재와 실제 새 조건에 맞지 않는 작업은 자동 수용하지 않으며, 필요한 재확인·차단과 verify·Review·게시 gate를 유지한다.
 - 목록이 없는 작업은 전체 verify를 실행하고 목록 생성만을 위한 Worker·Planner 즉시 호출을 하지 않는다. 다음 일반 Planner는 최신 원격 base와 기존 미완료 계획·draft·PR을 확인해 생성 계획을 중복 요청하지 않는다.
 - `manager:verify-inputs` 계획은 실제 Manager 누락 요청에 근거해 등록·실행된다. 미등록 예약어·범위 불일치는 거부되고 문서 조회·Requirement archive와 혼동되지 않으며 규칙 변경이 source 지문에 반영된다.
+- Manager의 목록 생성 요청은 `priority: critical`을 명시하고 Planner는 새 ExecPlan을 해당 값으로 작성한다. 다른 priority로 생성한 새 계획은 최초 등록되지 않으며, 실행 가능한 후보 안에서 기존 유효 우선순위·숫자 ID 정렬을 따른다. 정책 적용 전 등록된 미완료 계획·draft·PR의 선언 priority와 실행 상태는 보존하고 새 조건만으로 기존 요청·계획을 무효화·중복 생성하지 않는다. 목록이 확보되기 전에도 전체 verify를 계속 실행하고 진행 중 작업·dependency·유지보수 경계를 보존한다.
 - Worker가 실제 전체 검증 입력을 목록으로 유지하고 Reviewer가 누락을 검토한다. 문서·`.agents/`도 실제 입력이면 포함하며 중앙 설정에 경로 목록을 중복 저장하지 않는다.
 - 이전 성공 후보와 현재 후보의 입력이 같으면 verify를 재사용하고 main의 실제 입력 변경에는 실행한다. 파일 생성·삭제·이름·종류·권한·미커밋·untracked 변경과 목록·명령·환경·Git revision 의존성이 판정에 반영된다.
 - 성공 기록·목록 부재·오류·계산 불확실성과 목록 밖 코드·설정 누락 의심에서는 verify를 생략하지 않는다. 누락 의심을 verify 성공만으로 해소하지 않는다.
