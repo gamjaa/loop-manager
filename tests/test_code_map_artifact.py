@@ -283,7 +283,11 @@ class CodeMapArtifactTest(unittest.TestCase):
         def git(repo, *args):
             values = {("rev-parse", "HEAD"): commit,
                       ("rev-list", "--parents", "-n", "1", commit): f"{commit} {self.context.active_sha}",
-                      ("diff", "--name-only", self.context.active_sha, commit): artifact.ARTIFACT_PATH}
+                      ("diff", "--name-only", self.context.active_sha, commit): artifact.ARTIFACT_PATH,
+                      ("hash-object", f"--path={artifact.ARTIFACT_PATH}", "--",
+                       artifact.ARTIFACT_PATH): "a" * 40,
+                      ("rev-parse", "--verify", f"{commit}:{artifact.ARTIFACT_PATH}"):
+                          "b" * 40}
             return SimpleNamespace(stdout=values[args])
 
         contents = (self.root / artifact.ARTIFACT_PATH).read_bytes()
