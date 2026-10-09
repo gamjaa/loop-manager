@@ -51,7 +51,13 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
                     expected,
                 )
 
-        with tempfile.TemporaryDirectory() as directory:
+        # Worker level storage does not require actual Git publication.
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            loop_manager, "git_bytes",
+            side_effect=lambda worktree, _operation, spec: (
+                worktree / spec.split(":", 1)[1]
+            ).read_bytes(),
+        ) as published_blob:
             root = make_catalog_root(directory)
             plan_path = write_execplan(
                 root,
@@ -79,6 +85,9 @@ class ReviewDrivenWorkerProfileEscalationTest(WorkerEscalationFixture, unittest.
                 [(plan_path.relative_to(root).as_posix(), plan)],
                 "plan-sha",
                 "planning-fingerprint",
+            )
+            published_blob.assert_called_once_with(
+                root, "show", f"plan-sha:{plan_path.relative_to(root).as_posix()}"
             )
             stored = connection.execute(
                 """

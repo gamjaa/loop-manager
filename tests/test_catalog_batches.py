@@ -692,7 +692,14 @@ class CatalogBatchesTest(AutomationCatalogFixture, unittest.TestCase):
             )
 
     def test_batch_registration_is_atomic_and_idempotent(self):
-        with tempfile.TemporaryDirectory() as directory:
+        # Registration atomicity is a SQLite contract; publish Git observations
+        # at the adapter boundary without creating a real repository.
+        with tempfile.TemporaryDirectory() as directory, mock.patch.object(
+            loop_manager, "git_bytes",
+            side_effect=lambda worktree, _operation, spec: (
+                worktree / spec.split(":", 1)[1]
+            ).read_bytes(),
+        ) as published_blob:
             root = make_catalog_root(directory)
             second_path = write_execplan(root, "G-002", "Second", priority="high")
             third_path = write_execplan(root, "G-003", "Third", priority="normal")
@@ -745,6 +752,10 @@ class CatalogBatchesTest(AutomationCatalogFixture, unittest.TestCase):
                 "SELECT plan_id, status FROM exec_plans WHERE repo = ? ORDER BY plan_id",
                 (str(root),),
             ).fetchall()
+            self.assertEqual(published_blob.call_args_list, [
+                mock.call(root, "show", f"published-sha:{path}")
+                for _attempt in range(3) for path, _plan in plans
+            ])
             project = connection.execute(
                 "SELECT phase, planning_fingerprint FROM projects WHERE repo = ?",
                 (str(root),),
