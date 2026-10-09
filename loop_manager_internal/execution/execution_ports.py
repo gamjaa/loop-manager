@@ -166,13 +166,17 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
     verify_timeout_seconds = identity.pop("verify_timeout_seconds", 600)
     state = _ExecutionStatePort(connection, runtime_repository, identity["repo"])
     from loop_manager_internal.execution.manual_candidate import ManualCandidate, MANUAL_TEST_EVIDENCE
+    from loop_manager_internal.verification.coordination import settings as verify_execution_settings
+    verify_settings = verify_execution_settings.get()
     manual_git_bytes = dependencies.git_bytes or (
         lambda repo, *args: dependencies.git(repo, *args).stdout.encode("utf-8")
     )
     manual = ManualCandidate(connection, identity['repo'], state.plan_id, dependencies.git,
                              manual_git_bytes, dependencies.pr_for_branch,
                              identity.get('config_path'), identity.get('provider'),
-                             dependencies._agent_profile)
+                             dependencies._agent_profile,
+                             verify_timeout_seconds=verify_timeout_seconds,
+                             verify_parallelism=verify_settings.cap if verify_settings else 'auto')
     state.manual = manual
     def workspace_identity(state_dir, repo, plan_id, branch, worktree):
         return dependencies.validate_execplan_workspace_identity(state_dir, repo,

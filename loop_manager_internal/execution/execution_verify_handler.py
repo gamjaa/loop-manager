@@ -79,11 +79,12 @@ class VerifyHandler:
         assert self.ports.snapshot().catalog_plan is not None and self.ports.snapshot().plan is not None
         from loop_manager_internal.execution.manual_candidate import get_manual
         manual = get_manual(self.ports.state)
-        waiver = manual.waive(context, 'verify') if manual else None
+        manual_snapshot = manual.capture_stage(context, 'verify') if manual else None
+        waiver = manual.waive(context, 'verify', snapshot=manual_snapshot) if manual else None
         if waiver:
             self.ports.operation_print(waiver)
             return None, waiver
-        notice = manual.invalid_waiver_notice(context,'verify') if manual else None
+        notice = manual.invalid_waiver_notice(context,'verify',snapshot=manual_snapshot) if manual else None
         if notice:
             self.ports.operation_print(notice)
         self.ports.operation_log(f"전체 verify 시작: {self.ports.snapshot().plan['id']} {self.ports.snapshot().plan['title']}")
@@ -106,7 +107,7 @@ class VerifyHandler:
             return (self.ports._final(detail), detail)
         raw_output = redact_secrets(str(getattr(output, 'fingerprint_source', output)))
         if manual:
-            manual.record(context, 'verify', passed, raw_output)
+            manual.record(context, 'verify', passed, raw_output, snapshot=manual_snapshot)
         if not hasattr(output, 'fingerprint_source'):
             output = raw_output
         definition = self.ports.snapshot()._definition_snapshot

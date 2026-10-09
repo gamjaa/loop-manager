@@ -361,6 +361,9 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
 
     def step(self, service, *, verify_result=(True,'verify PASS'), review='VERDICT: PASS',
              stop=None, pr=None, profile=None):
+        from loop_manager_internal.config.managed_config import load_managed_config
+        from loop_manager_internal.verification.coordination import execution_settings
+        config=load_managed_config(service.config_path)
         real_command=loop_manager.command
         def command(arguments,*args,**kwargs):
             if list(arguments)[:3]==['gh','pr','create']:
@@ -384,8 +387,10 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
                         loop_manager.ExecutionOutcomeKind.STABLE_WAIT,detail='test boundary')))
                     return result
                 stack.enter_context(mock.patch('loop_manager._ExecutionLifecyclePorts',side_effect=ports))
-            result=loop_manager._run_project_step(service.connection,service.state_dir,service.repo,
-                service.config_path,'main',False,registered_only=True)
+            with execution_settings(mock.Mock(),config.verify_parallelism,service.state_dir):
+                result=loop_manager._run_project_step(service.connection,service.state_dir,service.repo,
+                    service.config_path,'main',False,registered_only=True,
+                    verify_timeout_seconds=config.verify_timeout_seconds)
         return result,verify,agent
 
     def test_remote_user_push_fast_forwards_without_losing_local_user_files(self):
@@ -473,8 +478,19 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
             first=service.connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',(service.repo,members[0])).fetchone()
             loop_manager._block_closed_pull_request(service.connection,service.repo,first,first['pr_url'],first['pr_head_oid'])
             self.assertTrue(all(service.runtime.get(service.repo,key).status=='PLAN_BLOCKED' for key in members))
-            closed=service.connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',(service.repo,members[0])).fetchone()
-            loop_manager._resume_reopened_pull_request(service.connection,service.repo,closed,closed['pr_url'],closed['pr_head_oid'],recovery=False)
+            reopened={'url':first['pr_url'],'headRefName':group['branch'],'baseRefName':'main',
+                'headRefOid':first['pr_head_oid'],'state':'OPEN'}
+            with mock.patch('loop_manager.pr_for_branch',return_value=reopened), \
+                 mock.patch('loop_manager.classify_pull_request_mergeability',return_value='mergeable'), \
+                 mock.patch('loop_manager._agent_profile',
+                            return_value=ResolvedProfile('fixture-reviewer','medium')) as resolve_profile:
+                loop_manager.observe_waiting_pull_requests(
+                    service.connection,service.repo_path,service.state_dir,service.repo,
+                    config_path=service.config_path,
+                )
+            resolve_profile.assert_called_once_with(
+                service.config_path,service.project['provider'],'reviewer',None,Path(group['worktree']),
+            )
             self.assertTrue(all(service.runtime.get(service.repo,key).status=='PR_OPEN' for key in members))
             pr={'url':first['pr_url'],'headRefName':group['branch'],'baseRefName':'main',
                 'headRefOid':first['pr_head_oid'],'state':'MERGED','mergedAt':'now'}
@@ -605,12 +621,16 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
     def test_default_completion_invokes_verify_and_read_only_review_without_worker(self):
         with tempfile.TemporaryDirectory() as directory:
             service,branch,worktree=self.fixture(directory)
+            service.config_path.write_text(service.config_path.read_text().replace(
+                'verify_timeout_seconds=600','verify_timeout_seconds=741').replace(
+                'verify_parallelism=auto','verify_parallelism=3'),encoding='utf-8')
             service.start('G-012')
             (worktree/'src/app.py').write_text('VALUE = 2\n')
             git_command(worktree,'add','src/app.py')
             git_command(worktree,'commit','-m','Manual implementation')
             git_command(worktree,'push','origin',branch)
             service.complete(completion())
+            composed=[]
             with mock.patch('loop_manager.validate_repository',return_value=service.repo_path), \
                  mock.patch('loop_manager.ensure_safe_base_worktree'), \
                  mock.patch('loop_manager.pr_for_branch',return_value=None), \
@@ -622,14 +642,21 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
                 effects_ports=ports._mock_wraps
                 def composition(*args,**kwargs):
                     handler=effects_ports(*args,**kwargs)
+                    composed.append(handler)
                     handler.publish=mock.Mock(return_value=loop_manager.ExecutionOutcome(
                         loop_manager.ExecutionOutcomeKind.STABLE_WAIT,detail='publication boundary'))
                     return handler
                 ports.side_effect=composition
-                loop_manager._run_project_step(service.connection,service.state_dir,service.repo,service.config_path,
-                                               'main',False,registered_only=True)
+                from loop_manager_internal.verification.coordination import execution_settings
+                with execution_settings(mock.Mock(),3,service.state_dir):
+                    loop_manager._run_project_step(service.connection,service.state_dir,service.repo,service.config_path,
+                                                   'main',False,registered_only=True,
+                                                   verify_timeout_seconds=741)
             self.assertEqual(verify.call_count,1)
             self.assertEqual(agent.call_count,1)
+            manual=composed[0].effects.state.manual
+            self.assertEqual(manual.verify_timeout_seconds,741)
+            self.assertEqual(manual.verify_parallelism,3)
             self.assertEqual(agent.call_args.args[4],'reviewer')
             self.assertTrue(agent.call_args.kwargs['read_only'])
             self.assertIsNone(service.runtime.get(service.repo,'G-012').worker_result)
@@ -647,8 +674,8 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
     def test_reviewer_prompt_distinguishes_a_valid_user_verify_waiver(self):
         from types import SimpleNamespace
         from tests.support.execution import execution_fixture
-        from loop_manager_internal.execution.manual_candidate import ManualCandidate, candidate_token
-        from loop_manager_internal.agents.agent_invocation import AgentResult
+        from loop_manager_internal.execution.manual_candidate import ManualCandidate, candidate_token, stage_input_tokens
+        from loop_manager_internal.agents.agent_invocation import AgentResult, ResolvedProfile
         from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
         from loop_manager_internal.storage import verify_receipts
         from loop_manager_internal.verification.inputs import InputObservation
@@ -677,13 +704,22 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
             value = head if args == ('rev-parse', 'HEAD') else base
             return SimpleNamespace(stdout=value, returncode=0)
 
+        config_path = Path(self.enterContext(tempfile.TemporaryDirectory())) / 'operational-config.ini'
+        config_path.write_text('[loop]\nverify_timeout_seconds=600\nverify_parallelism=auto\n', encoding='utf-8')
+        profile = ResolvedProfile('fixture-reviewer', 'medium')
+        resolve_profile = mock.Mock(return_value=profile)
         candidate = ManualCandidate(
             fixture.connection, fixture.repo, 'G-047', candidate_git, mock.Mock(),
+            config_path=config_path, provider='codex', resolve_profile=resolve_profile,
         )
         candidate.documents = mock.Mock(return_value=documents)
         candidate_input = candidate_token(fixture.connection, fixture.repo, head, base, documents)
+        verify_input_token, review_input_token = stage_input_tokens(
+            config_path, 'codex', context.worktree, resolve_profile,
+        )
         store.accept(
             group, head=head, base=base, input_token=candidate_input,
+            verify_input_token=verify_input_token, review_input_token=review_input_token,
             skip_verify=True, reason='password: waiver-secret-value',
         )
         fixture.state.manual = candidate
@@ -850,13 +886,35 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
                 profile=ResolvedProfile('changed-reviewer','high'))
             self.assertEqual(result,0)
             self.assertEqual(agent.call_count,1)
+            self.assertEqual(agent.call_args.kwargs['resolved_profile'],ResolvedProfile('changed-reviewer','high'))
             results={row[0] for row in service.connection.execute("SELECT result FROM manual_work_results "
                 "WHERE stage='review'")}
             self.assertIn('NOT_RUN',results)
             self.assertIn('PASS',results)
             self.assertNotIn('SKIPPED_BY_USER',results)
 
-    def test_unreadable_or_legacy_stage_settings_never_authorize_a_waiver(self):
+    def test_unreadable_stage_settings_never_authorize_a_waiver(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service,_,worktree=self.fixture(directory)
+            service.start('G-012')
+            args=completion()
+            args.skip_verify=True
+            args.expected_head=git_command(worktree,'rev-parse','HEAD')
+            args.skip_reason='External verify'
+            service.complete(args)
+            candidate=self.candidate(service,'G-012')
+            context=SimpleNamespace(worktree=worktree,base_branch='main')
+            self.assertIsNotNone(candidate.waive(context,'verify',record=False))
+            service.config_path.unlink()
+            self.assertIsNone(candidate.waive(context,'verify',record=False))
+            self.assertFalse(candidate.valid_evidence(context,'verify','SKIPPED_BY_USER old'))
+            values=[]
+            for table in ('manual_work_requests','manual_work_results','manual_work_publications'):
+                for row in service.connection.execute(f'SELECT * FROM {table}'):
+                    values.extend(str(value) for value in row)
+            self.assertNotIn('fixture-secret',' '.join(values))
+
+    def test_legacy_stage_settings_without_input_token_never_authorize_a_waiver(self):
         with tempfile.TemporaryDirectory() as directory:
             service,_,worktree=self.fixture(directory)
             service.start('G-012')
@@ -872,14 +930,140 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
             candidate=self.candidate(service,'G-012')
             context=SimpleNamespace(worktree=worktree,base_branch='main')
             self.assertIsNone(candidate.waive(context,'verify',record=False))
-            service.config_path.unlink()
-            self.assertIsNone(candidate.waive(context,'verify',record=False))
             self.assertFalse(candidate.valid_evidence(context,'verify','SKIPPED_BY_USER old'))
-            values=[]
-            for table in ('manual_work_requests','manual_work_results','manual_work_publications'):
-                for row in service.connection.execute(f'SELECT * FROM {table}'):
-                    values.extend(str(value) for value in row)
-            self.assertNotIn('fixture-secret',' '.join(values))
+
+    def _verify_fixture_with_manual_skip(self):
+        from tests.support.execution import execution_fixture
+        from loop_manager_internal.execution.manual_candidate import candidate_token, stage_input_tokens
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+
+        fixture=execution_fixture(self)
+        head,base='candidate-head','base'
+        context=fixture.review_context()
+        fixture.state.update_project(fixture.repo,phase='VERIFYING')
+        context=fixture.handler._context()
+        fixture.handler._post_effect_guard=mock.Mock(return_value=context)
+        documents=[{'path':'docs/plans/[G-047] Runtime.md','text':'# Runtime',
+                    'plan':dict(fixture.plan)}]
+        store=ManualWorkRepository(fixture.connection)
+        group=store.create(fixture.repo,'manual-start','loop-manager/G-047',(),head,base,
+                           members=('G-047',),documents=documents)
+        store.update(group,state='AUTOMATIC',owner_id='G-047',
+                     branch='loop-manager/G-047',worktree=str(context.worktree))
+        group=store.for_plan(fixture.repo,'G-047')
+        candidate_git=lambda _path,*args,**_kwargs: SimpleNamespace(
+            stdout=(head if args==('rev-parse','HEAD') else base),returncode=0)
+        config_path=Path(self.enterContext(tempfile.TemporaryDirectory()))/'operational-config.ini'
+        config_path.write_text('[loop]\nverify_timeout_seconds=600\nverify_parallelism=auto\n',encoding='utf-8')
+        profile=ResolvedProfile('fixture-reviewer','medium')
+        resolve_profile=mock.Mock(return_value=profile)
+        candidate=ManualCandidate(fixture.connection,fixture.repo,'G-047',candidate_git,mock.Mock(),
+            config_path=config_path,provider='codex',resolve_profile=resolve_profile,
+            verify_timeout_seconds=600,verify_parallelism='auto')
+        candidate.documents=mock.Mock(return_value=documents)
+        candidate_input=candidate_token(fixture.connection,fixture.repo,head,base,documents)
+        verify_input,review_input=stage_input_tokens(config_path,'codex',context.worktree,resolve_profile)
+        store.accept(group,head=head,base=base,input_token=candidate_input,
+                     verify_input_token=verify_input,review_input_token=review_input,
+                     skip_verify=True,reason='external verify')
+        fixture.state.manual=candidate
+        return fixture,context,candidate,config_path
+
+    def test_verify_setting_change_after_execution_composition_disables_waiver(self):
+        fixture,context,candidate,config_path=self._verify_fixture_with_manual_skip()
+        config_path.write_text(config_path.read_text().replace(
+            'verify_timeout_seconds=600','verify_timeout_seconds=900'),encoding='utf-8')
+
+        _outcome,output=fixture.handler._verify_once(context,candidate_head='candidate-head')
+
+        fixture.effects.validation.verify.assert_called_once()
+        group=candidate.group()
+        rows=fixture.connection.execute("SELECT result,detail FROM manual_work_results "
+            "WHERE group_id=? AND stage='verify'",(group['group_id'],)).fetchall()
+        self.assertIsNotNone(output)
+        self.assertIn('NOT_RUN',{row['result'] for row in rows})
+        self.assertIn('PASS',{row['result'] for row in rows})
+        self.assertNotIn('SKIPPED_BY_USER',{row['result'] for row in rows})
+        self.assertTrue(any('실행 구성 이후 단계 설정이 달라져' in row['detail'] for row in rows))
+
+    def test_unreadable_setting_after_execution_composition_disables_waiver(self):
+        fixture,context,candidate,config_path=self._verify_fixture_with_manual_skip()
+        config_path.unlink()
+
+        _outcome,output=fixture.handler._verify_once(context,candidate_head='candidate-head')
+
+        fixture.effects.validation.verify.assert_called_once()
+        group=candidate.group()
+        rows=fixture.connection.execute("SELECT result,detail FROM manual_work_results "
+            "WHERE group_id=? AND stage='verify'",(group['group_id'],)).fetchall()
+        self.assertIsNotNone(output)
+        self.assertIn('NOT_RUN',{row['result'] for row in rows})
+        self.assertIn('PASS',{row['result'] for row in rows})
+        self.assertNotIn('SKIPPED_BY_USER',{row['result'] for row in rows})
+        self.assertTrue(any('현재 단계 설정을 확인할 수 없어' in row['detail'] for row in rows))
+
+    def test_stage_result_keeps_settings_observed_before_execution(self):
+        with tempfile.TemporaryDirectory() as directory:
+            service,_,worktree=self.fixture(directory)
+            service.start('G-012')
+            service.complete(completion())
+            candidate=ManualCandidate(service.connection,service.repo,'G-012',service.effects.git,
+                service.effects.git_bytes,config_path=service.config_path,provider=service.project['provider'],
+                resolve_profile=service.effects.resolve_profile,verify_timeout_seconds=600,
+                verify_parallelism='auto')
+            context=SimpleNamespace(worktree=worktree,base_branch='main')
+            snapshot=candidate.capture_stage(context,'verify')
+            service.config_path.write_text(service.config_path.read_text().replace(
+                'verify_timeout_seconds=600','verify_timeout_seconds=900'),encoding='utf-8')
+
+            candidate.record(context,'verify',True,'verify PASS',snapshot=snapshot)
+
+            receipt=service.connection.execute("SELECT input_token FROM manual_work_results "
+                "WHERE stage='verify' AND result='PASS'").fetchone()
+            self.assertEqual(receipt['input_token'],snapshot.input_token)
+            current=candidate.inputs(context,'verify')
+            self.assertNotEqual(current[5],snapshot.input_token)
+
+            service.effects.resolve_profile.return_value=ResolvedProfile('captured-reviewer','low')
+            review_snapshot=candidate.capture_stage(context,'review')
+            service.effects.resolve_profile.return_value=ResolvedProfile('changed-reviewer','high')
+            candidate.record(context,'review',True,'review PASS',snapshot=review_snapshot)
+            review_receipt=service.connection.execute("SELECT input_token FROM manual_work_results "
+                "WHERE stage='review' AND result='PASS'").fetchone()
+            self.assertEqual(review_receipt['input_token'],review_snapshot.input_token)
+            self.assertNotEqual(candidate.inputs(context,'review')[5],review_snapshot.input_token)
+
+    def test_manual_project_sets_configured_verify_parallelism(self):
+        from loop_manager_internal.application.manual_work import ManualProjectDriverEffects, run_manual_project
+        from loop_manager_internal.config.managed_config import fast_mode_settings
+        from loop_manager_internal.verification.coordination import settings as verify_settings
+
+        config=SimpleNamespace(verify_timeout_seconds=432,verify_parallelism=2,
+                               refactoring_review_interval=7)
+        observed={}
+        def run_project_result(*args,**kwargs):
+            observed['settings']=verify_settings.get()
+            observed['fast_mode']=fast_mode_settings.get()
+            observed['args']=args
+            observed['kwargs']=kwargs
+            return 'completed'
+
+        effects=ManualProjectDriverEffects(lambda _path:config,run_project_result)
+        coordinator=mock.Mock()
+        coordinator.__enter__=mock.Mock(return_value=coordinator)
+        coordinator.__exit__=mock.Mock(return_value=False)
+        with mock.patch('loop_manager_internal.verification.coordination.VerifyCoordinator',
+                        return_value=coordinator):
+            result=run_manual_project(effects,None,Path('/state'),'repo',Path('/config'),'main',False)
+
+        self.assertEqual(result,'completed')
+        self.assertEqual(observed['settings'].cap,2)
+        self.assertEqual(observed['settings'].state_dir,Path('/state'))
+        self.assertIs(observed['fast_mode'],config)
+        self.assertEqual(observed['kwargs']['verify_timeout_seconds'],432)
+        self.assertEqual(observed['kwargs']['refactoring_review_interval'],7)
+        self.assertIsNone(verify_settings.get())
+        self.assertIsNone(fast_mode_settings.get())
 
     def test_actual_failure_cannot_be_erased_with_skip(self):
         with tempfile.TemporaryDirectory() as directory:

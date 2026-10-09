@@ -53,7 +53,9 @@ class ManualProjectDriverEffects:
 def run_manual_project(effects: ManualProjectDriverEffects, connection, state_dir, repo,
                        config_path, base, allow_mismatch, **kwargs):
     config=effects.load_managed_config(config_path)
-    with fast_mode_scope(config):
+    from loop_manager_internal.verification.coordination import VerifyCoordinator, execution_settings
+    with fast_mode_scope(config), VerifyCoordinator() as coordinator, execution_settings(
+            coordinator, config.verify_parallelism, Path(state_dir)):
         return effects.run_project_result(connection,state_dir,repo,config_path,base,allow_mismatch,
             verify_timeout_seconds=config.verify_timeout_seconds,
             refactoring_review_interval=config.refactoring_review_interval,**kwargs)

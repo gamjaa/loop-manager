@@ -16,6 +16,21 @@ from loop_manager_internal.git.command_adapter import revision_requirement_docum
 from loop_manager_internal.storage.manual_work_state import ManualWorkRepository, digest
 
 MANUAL_TEST_EVIDENCE = 'MANUAL_EXTERNAL_TARGETED_TESTS_UNCONFIRMED'
+_UNSET = object()
+
+
+@dataclass(frozen=True)
+class ManualStageSnapshot:
+    """Candidate and effective settings observed immediately before a manual stage."""
+    group_id: str
+    head: str
+    base: str
+    candidate_token: str
+    setting_token: str | None
+    input_token: str
+    known: bool
+    resolved_profile: object | None = None
+    current_settings_match: bool | None = None
 
 
 def get_manual(state):
@@ -39,21 +54,35 @@ def candidate_token(connection, repo, head, base, documents):
     return digest((head,base,documents,environment_identity(repo),guidance))
 
 
-def stage_input_tokens(config_path, provider, worktree, resolve_profile, *, stages=('verify','review')):
+def stage_input_tokens(config_path, provider, worktree, resolve_profile, *, stages=('verify','review'),
+                       verify_timeout_seconds=_UNSET, verify_parallelism=_UNSET,
+                       resolved_profile=_UNSET):
     """Observe only the effective global settings that affect manual stages."""
-    if config_path is None:
-        return None, None
-    try:
-        from loop_manager_internal.config.managed_config import load_managed_config
-        config = load_managed_config(Path(config_path))
-    except Exception:
-        return None, None
-    verify = digest(('verify', config.verify_timeout_seconds, config.verify_parallelism))
-    review = None
-    if 'review' in stages and resolve_profile is not None:
+    config = None
+    if (verify_timeout_seconds is _UNSET or verify_parallelism is _UNSET
+            or ('review' in stages and resolved_profile is _UNSET)):
+        if config_path is None:
+            return None, None
         try:
-            profile = resolve_profile(Path(config_path), provider, 'reviewer', None, Path(worktree))
-            review = digest(('review', provider, verify, profile.model, profile.effort))
+            from loop_manager_internal.config.managed_config import load_managed_config
+            config = load_managed_config(Path(config_path))
+        except Exception:
+            return None, None
+    timeout = (config.verify_timeout_seconds if verify_timeout_seconds is _UNSET
+               else verify_timeout_seconds)
+    parallelism = (config.verify_parallelism if verify_parallelism is _UNSET
+                   else verify_parallelism)
+    verify = digest(('verify', timeout, parallelism)) if timeout is not None and parallelism is not None else None
+    review = None
+    if 'review' in stages:
+        try:
+            profile = resolved_profile
+            if profile is _UNSET:
+                if resolve_profile is None:
+                    return verify, None
+                profile = resolve_profile(Path(config_path), provider, 'reviewer', None, Path(worktree))
+            if profile is not None and verify is not None:
+                review = digest(('review', provider, verify, profile.model, profile.effort))
         except Exception:
             pass
     return verify, review
@@ -73,12 +102,15 @@ class ManualPublication:
 
 class ManualCandidate:
     def __init__(self, connection, repo, plan_id, git, git_bytes, pr_for_branch=None,
-                 config_path=None, provider=None, resolve_profile=None):
+                 config_path=None, provider=None, resolve_profile=None,
+                 verify_timeout_seconds=None, verify_parallelism=None):
         self.store = ManualWorkRepository(connection)
         self.connection, self.repo, self.plan_id = connection, repo, plan_id
         self.git, self.git_bytes = git, git_bytes
         self.pr_for_branch = pr_for_branch
         self.config_path, self.provider, self.resolve_profile = config_path, provider, resolve_profile
+        self.verify_timeout_seconds = verify_timeout_seconds
+        self.verify_parallelism = verify_parallelism
 
     def group(self):
         return self.store.for_plan(self.repo, self.plan_id)
@@ -288,17 +320,61 @@ class ManualCandidate:
             f"Source: {group['source_branch']}@{group['source_head']}\n"
             '외부 targeted test 수행 결과는 Manager가 확인하지 않았습니다.\n'+evidence)
 
-    def inputs(self, context, stage):
+    def inputs(self, context, stage, *, setting_token=_UNSET):
         group=self.group()
         head=self.git(context.worktree,'rev-parse','HEAD').stdout.strip()
         base=str(self.git(Path(self.repo),'rev-parse',f'refs/remotes/origin/{context.base_branch}').stdout.strip())
         token=candidate_token(self.connection,self.repo,head,base,json.loads(group['documents']))
         row=self.connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (self.repo,self.plan_id)).fetchone()
-        settings=stage_input_tokens(self.config_path,self.provider,context.worktree,self.resolve_profile,
-                                   stages=(stage,))
-        setting_token=settings[0 if stage=='verify' else 1]
+        if setting_token is _UNSET:
+            settings=stage_input_tokens(self.config_path,self.provider,context.worktree,self.resolve_profile,
+                                       stages=(stage,))
+            setting_token=settings[0 if stage=='verify' else 1]
         stage_token=stage_result_token(token,stage,setting_token,row['verify_result'],group['members'])
         return group,head,base,token,setting_token,stage_token,setting_token is not None
+
+    def capture_stage(self, context, stage):
+        """Freeze the actual settings and candidate before verify or Reviewer runs."""
+        if not self.enabled():
+            return None
+        profile = _UNSET
+        if stage == 'review':
+            try:
+                profile = (self.resolve_profile(Path(self.config_path), self.provider, 'reviewer', None,
+                                                Path(context.worktree))
+                           if self.resolve_profile is not None and self.config_path is not None else None)
+            except Exception:
+                profile = None
+        settings = stage_input_tokens(
+            self.config_path, self.provider, context.worktree, self.resolve_profile,
+            stages=(stage,), verify_timeout_seconds=self.verify_timeout_seconds,
+            verify_parallelism=self.verify_parallelism,
+            **({'resolved_profile': profile} if stage == 'review' else {}),
+        )
+        setting_token=settings[0 if stage=='verify' else 1]
+        current_settings=stage_input_tokens(
+            self.config_path, self.provider, context.worktree, self.resolve_profile,
+            stages=(stage,),
+            **({'resolved_profile': profile} if stage == 'review' else {}),
+        )
+        current_setting_token=current_settings[0 if stage=='verify' else 1]
+        current_settings_match=(
+            None if current_setting_token is None or setting_token is None
+            else current_setting_token == setting_token
+        )
+        group,head,base,token,setting_token,stage_token,known=self.inputs(
+            context,stage,setting_token=setting_token,
+        )
+        return ManualStageSnapshot(group['group_id'],head,base,token,setting_token,
+                                    stage_token,known,None if profile is _UNSET else profile,
+                                    current_settings_match)
+
+    def _snapshot_inputs(self, snapshot):
+        group=self.group()
+        if group is None or group['group_id'] != snapshot.group_id:
+            return None
+        return (group,snapshot.head,snapshot.base,snapshot.candidate_token,
+                snapshot.setting_token,snapshot.input_token,snapshot.known)
 
     def publication_stage_tokens(self, context):
         if not self.enabled():
@@ -311,10 +387,15 @@ class ManualCandidate:
             result[stage]=stage_token
         return result
 
-    def waive(self, context, stage, *, record=True):
+    def waive(self, context, stage, *, record=True, snapshot=None):
         if not self.enabled():
             return None
-        group,head,base,token,setting_token,stage_token,known=self.inputs(context,stage)
+        if snapshot is not None and snapshot.current_settings_match is not True:
+            return None
+        values=self._snapshot_inputs(snapshot) if snapshot is not None else self.inputs(context,stage)
+        if values is None:
+            return None
+        group,head,base,token,setting_token,stage_token,known=values
         request=self.store.request(group)
         if not request or not request[f'skip_{stage}'] or not known:
             return None
@@ -362,14 +443,22 @@ class ManualCandidate:
             (self.repo,group['group_id'],stage,head,base,stage_token))}
         return required<=passed
 
-    def invalid_waiver_notice(self, context, stage):
+    def invalid_waiver_notice(self, context, stage, *, snapshot=None):
         if not self.enabled():
             return None
         group=self.group()
         request=self.store.request(group)
-        if request and request[f'skip_{stage}'] and self.waive(context,stage,record=False) is None:
-            _group,head,base,token,setting_token,stage_token,known=self.inputs(context,stage)
-            if not known:
+        if request and request[f'skip_{stage}'] and self.waive(
+                context,stage,record=False,snapshot=snapshot) is None:
+            values=self._snapshot_inputs(snapshot) if snapshot is not None else self.inputs(context,stage)
+            if values is None:
+                return None
+            _group,head,base,token,setting_token,stage_token,known=values
+            if snapshot is not None and snapshot.current_settings_match is None:
+                reason='현재 단계 설정을 확인할 수 없어 생략하지 않습니다.'
+            elif snapshot is not None and snapshot.current_settings_match is False:
+                reason='실행 구성 이후 단계 설정이 달라져 생략하지 않습니다.'
+            elif not known:
                 reason='현재 설정 입력을 확인할 수 없어 생략하지 않습니다.'
             elif request[f'{stage}_input_token'] is None:
                 reason='수락 당시 단계 설정 지문이 없어 저장된 요청을 생략 근거로 쓸 수 없습니다.'
@@ -385,8 +474,16 @@ class ManualCandidate:
             return detail
         return None
 
-    def record(self, context, stage, passed, detail, *, plan_ids=None):
-        if self.enabled():
+    def record(self, context, stage, passed, detail, *, plan_ids=None, snapshot=None):
+        if snapshot is not None:
+            if not self.enabled():
+                return
+            values=self._snapshot_inputs(snapshot)
+            if values is None:
+                return
+            group,head,base,_token,_setting,stage_token,_known=values
+            self.store.record(group,stage,head,base,stage_token,'PASS' if passed else 'FAIL',detail,plan_ids=plan_ids)
+        elif self.enabled():
             group,head,base,_token,_setting,stage_token,_known=self.inputs(context,stage)
             self.store.record(group,stage,head,base,stage_token,'PASS' if passed else 'FAIL',detail,plan_ids=plan_ids)
 
@@ -433,7 +530,7 @@ class ManualCandidate:
                 '전체 VERDICT는 모든 G가 PASS일 때만 PASS입니다. SPEC_BLOCKED는 기존 명세 결정 형식을 사용하세요.\n')
         return prompt+instruction+content
 
-    def review_results(self, context, verdict, message):
+    def review_results(self, context, verdict, message, *, snapshot=None):
         if not self.enabled() or verdict=='SPEC_BLOCKED':
             return
         members=json.loads(self.group()['members'])
@@ -445,7 +542,7 @@ class ManualCandidate:
             from loop_manager_internal.application.contracts import ReviewerProtocolError
             raise ReviewerProtocolError('수동 제출 묶음의 모든 G에 정확한 개별 Review 결과가 필요합니다.')
         for member,value in results.items():
-            self.record(context,'review',value=='PASS',message,plan_ids=(member,))
+            self.record(context,'review',value=='PASS',message,plan_ids=(member,),snapshot=snapshot)
 
         if verdict=='FAIL':
             with self.connection:

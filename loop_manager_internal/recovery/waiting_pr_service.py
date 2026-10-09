@@ -239,7 +239,8 @@ def observe_waiting_pull_requests(
             if group and effects.base_head:
                 from loop_manager_internal.recovery import manual_work_recovery
                 if manual_work_recovery.revalidate_waiting(connection,repo,stored,pull_request,
-                        effects.base_head(repo_path,registered_base)):
+                        effects.base_head(repo_path,registered_base),config_path=config_path,
+                        provider=project['provider'],resolve_profile=effects.resolve_profile):
                     continue
         with connection:
             resumed = notifications.record_work_start(
