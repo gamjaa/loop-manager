@@ -2,10 +2,22 @@
 
 문서 작성·검토 기준은 [Specification Skill](.agents/skills/specification-docs/SKILL.md)을 따른다.
 
+## 용어
+
+- 계획: Requirement
+- 작업: ExecPlan
+- 설계: PRODUCT, ARCHITECTURE
+- 베이스/기본/원본 브랜치: checkout 받은 브랜치
+- 작업 브랜치: G 작업 등을 수행하기 위해 분리한 브랜치
+
 ## 저장소 구조
 
 - 새 루트 항목은 사용자 진입, 실행·빌드·배포 또는 도구의 필수 탐색이라는 근거가 필요하다.
   그 근거가 없는 새 루트 항목은 Review에서 blocking issue로 보고한다.
+
+## 작업 중 실행
+
+- 작업 중에는 `loop_manager.py run`을 직접 실행하지 않는다.
 
 ## 실행 지침 원본 수정
 
