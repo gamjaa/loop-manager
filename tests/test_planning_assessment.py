@@ -42,6 +42,56 @@ from tests.support.planning_case import (
 )
 
 class PlanningAssessmentTest(PlanningCase):
+    def test_publication_stages_already_deleted_and_unstaged_paths_exactly(self):
+        from tests.support.git import git_command
+
+        class CommitReached(Exception):
+            pass
+
+        # Real Git verifies that re-adding an already staged deletion fails,
+        # and that literal filenames do not stage a matching unrelated path.
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            deleted = "docs/plans/[G-194] 읽기 전용 상태 조회 경계와 status CLI.md"
+            removed = "docs/requirements/R.md"
+            added = "docs/plans/[G-195] New.md"
+            unrelated = "docs/plans/G New.md"
+            for path in (deleted, removed, unrelated):
+                target = worktree / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text("original\n", encoding="utf-8")
+            git_command(worktree, "init", "-q")
+            git_command(worktree, "config", "user.name", "Test")
+            git_command(worktree, "config", "user.email", "test@example.com")
+            git_command(worktree, "add", ".")
+            git_command(worktree, "commit", "-qm", "base")
+            git_command(worktree, "rm", "--", deleted)
+            (worktree / removed).unlink()
+            (worktree / added).write_text("new\n", encoding="utf-8")
+            (worktree / unrelated).write_text("unrelated\n", encoding="utf-8")
+            ports = FakePorts(planning_snapshot(phase="PLANNING"))
+            coordinator = PlanningLifecycleCoordinator(ports)
+            run = coordinator._new_run(self.context)
+            run.planning_worktree = worktree
+            run.dirty_files = [deleted, removed, added]
+            run.validated_result = ValidatedPlanningResult(
+                plans=(), publication_paths=(deleted, removed, added),
+            )
+
+            def stage_and_commit(repo, *arguments, **kwargs):
+                output = git_command(repo, *arguments)
+                if arguments[0] == "commit":
+                    raise CommitReached
+                return SimpleNamespace(stdout=output, returncode=0)
+
+            ports.git.run = stage_and_commit
+            # Stop at the staging/commit boundary; remote publication is separate.
+            with self.assertRaises(CommitReached):
+                coordinator._publication._publish_planner_result(run)
+            changed = git_command(worktree, "diff", "--name-only", "-z", "HEAD~", "HEAD")
+            self.assertEqual(set(changed.rstrip("\0").split("\0")), {deleted, removed, added})
+            self.assertEqual(git_command(worktree, "show", f"HEAD:{unrelated}"), "original")
+
     def test_normalized_maintenance_ids_are_saved_in_full_assessment_and_decision(self):
         source = "a" * 40
         inventory = {"module.py": "b" * 64}

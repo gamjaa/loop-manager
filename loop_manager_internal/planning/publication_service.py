@@ -324,12 +324,15 @@ class PlanningPublicationService(PlanningService):
 
         plans = list(validated_result.plans)
         if run.dirty_files:
-            self._ports.git.run(
-                worktree,
-                "add",
-                "--",
-                *validated_result.publication_paths,
-            )
+            present, deleted = [], []
+            for path in validated_result.publication_paths:
+                target = worktree / path
+                (present if target.exists() or target.is_symlink() else deleted).append(path)
+            # Planner may already have staged a deletion or rename.
+            if deleted:
+                self._ports.git.run(worktree, "update-index", "--force-remove", "--", *deleted)
+            if present:
+                self._ports.git.run(worktree, "add", "--", *(f":(literal){path}" for path in present))
             if run.maintenance_planning:
                 message = "Update periodic maintenance planning batch"
             elif validated_result.retirement_moves and not (
