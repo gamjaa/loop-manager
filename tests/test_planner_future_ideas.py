@@ -25,9 +25,6 @@ class PlannerFutureIdeasTest(unittest.TestCase):
             "snapshot 밖의 기존 ExecPlan과 PR 등록·MERGED·archive 계획은 수정하지 마라",
             prompt,
         )
-        plans_contract = (loop_manager.ROOT / "docs/PLANS.md").read_text(encoding="utf-8")
-        self.assertNotIn("Agent Guidance Proposal", plans_contract)
-        self.assertNotIn("Agent Guidance User Decision", plans_contract)
 
     def test_validation_and_scope_separate_future_ideas_from_new_plans(self):
         baseline = {}

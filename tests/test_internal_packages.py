@@ -12,6 +12,7 @@ import unittest
 from unittest import mock
 
 import loop_manager
+from tests.support.fixed_samples import PROJECT_FILES
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -99,7 +100,7 @@ if sys.argv[2] != 'loop_manager':
                          "docs/ARCHITECTURE.template.md"):
                 target = runtime / name
                 target.parent.mkdir(exist_ok=True)
-                shutil.copy(ROOT / name, target)
+                shutil.copy(PROJECT_FILES / name, target)
             config = Path(directory) / "source/config/config.ini"
             config.parent.mkdir(parents=True)
             config.write_text("[telegram]\ntoken =\nchat_id =\n", encoding="utf-8")

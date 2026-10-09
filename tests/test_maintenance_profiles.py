@@ -10,6 +10,7 @@ import loop_manager
 from loop_manager_internal.agents import agent_profiles
 from loop_manager_internal.planning.agent_ports import run_scoped_planner_turn
 from tests.support.planning_case import PlanningCase
+from tests.support.fixed_samples import PROVIDER_PROFILES
 
 
 class MaintenanceProfileTest(unittest.TestCase):
@@ -55,9 +56,9 @@ class MaintenanceProfileTest(unittest.TestCase):
             with self.subTest(provider=provider), self.assertRaisesRegex(RuntimeError, "maintenance_planner"):
                 agent_profiles.validate_provider_profiles(self.config, provider, self.catalog)
 
-    def test_example_includes_both_profiles_with_existing_model_aliases(self):
+    def test_fixed_profile_sample_has_existing_model_aliases(self):
         parser = configparser.ConfigParser()
-        parser.read(loop_manager.ROOT / "config/config.ini.example")
+        parser.read(PROVIDER_PROFILES)
         for provider in ("codex", "claude"):
             section = f"{provider}.roles"
             value = parser.get(section, "maintenance_planner")

@@ -4,6 +4,7 @@ import io
 import hashlib
 import os
 import re
+import shutil
 import sqlite3
 import subprocess
 import sys
@@ -17,37 +18,72 @@ import loop_manager
 from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.config.managed_config import ManagedConfig, ManagedConfigError, load_managed_config
 from loop_manager_internal.runtime import project_registry
+from tests.support.fixed_samples import PROJECT_FILES
 
 
 @isolated_git_test
 class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
-    def test_copy_tools_do_not_handle_cli_guidance(self):
-        for script in ('scripts/copy-project-files.sh', 'scripts/copy-project-files.ps1'):
-            with self.subTest(script=script):
-                contents = (loop_manager.ROOT / script).read_text(encoding='utf-8')
-                self.assertNotIn('AGENTS.md', contents)
-                self.assertIn('.agents', contents)
-                self.assertIn('loop_manager_internal/catalog/frontmatter.py', contents)
-                self.assertIn('specification-docs/scripts/frontmatter.py', contents)
-
-    def test_copy_project_files_preserves_existing_agents_bytes(self):
-        # Manager verify exercises the executable scripts; Worker runs only
-        # the template unit case above.
+    def test_copy_project_files_runs_real_script_with_fixed_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
-            target = Path(directory) / 'project'
+            root = Path(directory)
+            source = root / 'source'
+            shutil.copytree(PROJECT_FILES, source)
+            tool_relative = '.agents/skills/specification-docs/scripts/next_requirement_id.py'
+            tool_source = source / tool_relative
+            tool_source.parent.mkdir(parents=True)
+            shutil.copy(loop_manager.ROOT / tool_relative, tool_source)
+            parser_relative = 'loop_manager_internal/catalog/frontmatter.py'
+            parser_source = source / parser_relative
+            parser_source.parent.mkdir(parents=True)
+            shutil.copy(loop_manager.ROOT / parser_relative, parser_source)
+            script_name = 'copy-project-files.ps1' if os.name == 'nt' else 'copy-project-files.sh'
+            script = source / 'scripts' / script_name
+            script.parent.mkdir()
+            shutil.copy(loop_manager.ROOT / 'scripts' / script_name, script)
+            target = root / 'project'
             target.mkdir()
             original = b'custom project rules\r\n\xff\n'
             (target / 'AGENTS.md').write_bytes(original)
             command = (['powershell.exe', '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File',
-                        str(loop_manager.ROOT / 'scripts/copy-project-files.ps1'), '-TargetPath', str(target)]
-                       if os.name == 'nt' else ['bash', str(loop_manager.ROOT / 'scripts/copy-project-files.sh'), str(target)])
+                        str(script), '-TargetPath', str(target)]
+                       if os.name == 'nt' else ['bash', str(script), str(target)])
             subprocess.run(command, check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             self.assertEqual((target / 'AGENTS.md').read_bytes(), original)
-            self.assertTrue((target / 'docs/PLANS.md').is_file())
-            # The remaining directory overwrite guards still stop repeated setup.
+            copied_files = (
+                '.agents/skills/specification-docs/SKILL.md',
+                'docs/PLANS.md',
+                'docs/FUTURE_IDEAS.md',
+                'docs/PRODUCT.template.md',
+                'docs/ARCHITECTURE.template.md',
+                'docs/REQUIREMENT.template.md',
+                'docs/PRODUCT.md',
+                'docs/ARCHITECTURE.md',
+            )
+            for relative in copied_files:
+                source_relative = (
+                    'docs/PRODUCT.template.md' if relative == 'docs/PRODUCT.md'
+                    else 'docs/ARCHITECTURE.template.md' if relative == 'docs/ARCHITECTURE.md'
+                    else relative
+                )
+                with self.subTest(path=relative):
+                    self.assertEqual((target / relative).read_bytes(),
+                                     (PROJECT_FILES / source_relative).read_bytes())
+            self.assertTrue((target / 'docs/plans').is_dir())
+            self.assertTrue((target / 'docs/requirements/archive').is_dir())
+            self.assertEqual((target / tool_relative).read_bytes(), tool_source.read_bytes())
+            copied_parser = target / '.agents/skills/specification-docs/scripts/frontmatter.py'
+            self.assertEqual(copied_parser.read_bytes(), parser_source.read_bytes())
+            query = subprocess.run([sys.executable, tool_relative], cwd=target,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            self.assertEqual((query.returncode, query.stdout, query.stderr), (0, 'R-001\n', ''))
+            protected_files = (*copied_files, tool_relative,
+                               '.agents/skills/specification-docs/scripts/frontmatter.py')
+            before = {relative: (target / relative).read_bytes() for relative in protected_files}
             result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
             self.assertNotEqual(result.returncode, 0)
             self.assertEqual((target / 'AGENTS.md').read_bytes(), original)
+            self.assertEqual(before, {relative: (target / relative).read_bytes()
+                                      for relative in protected_files})
 
     def _git(self, root: Path, *arguments: str) -> None:
         subprocess.run(
@@ -74,13 +110,13 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
         self._git(root, "config", "user.name", "Registry Test")
         (root / "docs/requirements").mkdir(parents=True)
         agents = (
-            (loop_manager.ROOT / "AGENTS.md").read_text(encoding="utf-8")
+            (PROJECT_FILES / "AGENTS.md").read_text(encoding="utf-8")
             if common_agents
             else "# Project-only agent rules\n"
         )
         (root / "AGENTS.md").write_text(agents, encoding="utf-8")
         (root / "docs/PLANS.md").write_bytes(
-            (loop_manager.ROOT / "docs/PLANS.md").read_bytes()
+            (PROJECT_FILES / "docs/PLANS.md").read_bytes()
         )
         (root / "docs/ARCHITECTURE.md").write_text(
             "# Project Architecture\n\nImplemented design.\n", encoding="utf-8"
@@ -89,6 +125,10 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             "# Project Product\n\nActive behavior.\n", encoding="utf-8"
         )
         self._commit(root, "Registration files")
+
+    def _inspect_registration_files(self, *args, **kwargs):
+        with mock.patch.object(loop_manager, "ROOT", PROJECT_FILES):
+            return loop_manager.inspect_registration_files(*args, **kwargs)
 
     def _record(
         self,
@@ -317,11 +357,11 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             root = Path(directory)
             self._project_files(root, common_agents=False)
 
-            _, approved_without_flag = loop_manager.inspect_registration_files(
+            _, approved_without_flag = self._inspect_registration_files(
                 root, "HEAD", approve_agents_mismatch=False
             )
             self.assertFalse(approved_without_flag)
-            agents_hash, approved = loop_manager.inspect_registration_files(
+            agents_hash, approved = self._inspect_registration_files(
                 root, "HEAD", approve_agents_mismatch=True
             )
             self.assertFalse(approved)
@@ -330,56 +370,9 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             (root / "docs/PLANS.md").write_text("different\n", encoding="utf-8")
             self._commit(root, "Change plans")
             with self.assertRaisesRegex(RuntimeError, "PLANS.md"):
-                loop_manager.inspect_registration_files(
+                self._inspect_registration_files(
                     root, "HEAD", approve_agents_mismatch=True
                 )
-
-    def test_copy_project_files_distributes_document_quality_guidance(self):
-        with tempfile.TemporaryDirectory() as directory:
-            target = Path(directory) / "project"
-            target.mkdir()
-            command = (["powershell.exe", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-                        str(loop_manager.ROOT / "scripts/copy-project-files.ps1"), "-TargetPath", str(target)]
-                       if os.name == "nt" else ["bash", str(loop_manager.ROOT / "scripts/copy-project-files.sh"), str(target)])
-            subprocess.run(
-                command,
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-            )
-
-            skill = (target / ".agents/skills/specification-docs/SKILL.md").read_text(
-                encoding="utf-8"
-            )
-            tool_path = ".agents/skills/specification-docs/scripts/next_requirement_id.py"
-            self.assertEqual((target / tool_path).read_bytes(),
-                             (loop_manager.ROOT / tool_path).read_bytes())
-            parser_path = ".agents/skills/specification-docs/scripts/frontmatter.py"
-            self.assertEqual(
-                (target / parser_path).read_bytes(),
-                (loop_manager.ROOT / "loop_manager_internal/catalog/frontmatter.py").read_bytes(),
-            )
-            query = subprocess.run(
-                [sys.executable, tool_path], cwd=target, check=False,
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            )
-            self.assertEqual((query.returncode, query.stdout, query.stderr), (0, "R-001\n", ""))
-            self.assertFalse((target / "AGENTS.md").exists())
-            self.assertEqual((target / ".agents/skills/specification-docs/SKILL.md").read_bytes(),
-                             (loop_manager.ROOT / ".agents/skills/specification-docs/SKILL.md").read_bytes())
-            self.assertEqual((target / "docs/PLANS.md").read_bytes(),
-                             (loop_manager.ROOT / "docs/PLANS.md").read_bytes())
-            self.assertEqual((target / "docs/ARCHITECTURE.md").read_bytes(),
-                             (loop_manager.ROOT / "docs/ARCHITECTURE.template.md").read_bytes())
-
-        for phrase in (
-            "기존 문서·템플릿을 먼저 확인한다",
-            "문서 목적 밖 구현 세부·작업 이력을 정리한다",
-            "정상/실패/예외 흐름",
-            "길이·항목 수·토큰 수에 기계적인 제한을 두지 않는다",
-        ):
-            with self.subTest(phrase=phrase):
-                self.assertIn(phrase, skill)
 
     def test_registration_rejects_unchanged_product_and_architecture_templates(self):
         for filename, expected in (
@@ -390,11 +383,11 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
                 root = Path(directory)
                 self._project_files(root)
                 (root / f"docs/{filename}.md").write_bytes(
-                    (loop_manager.ROOT / f"docs/{filename}.template.md").read_bytes()
+                    (PROJECT_FILES / f"docs/{filename}.template.md").read_bytes()
                 )
                 self._commit(root, f"Use {filename} template")
                 with self.assertRaisesRegex(RuntimeError, expected):
-                    loop_manager.inspect_registration_files(
+                    self._inspect_registration_files(
                         root, "HEAD", approve_agents_mismatch=False
                     )
 

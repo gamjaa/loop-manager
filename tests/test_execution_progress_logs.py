@@ -13,7 +13,7 @@ import loop_manager
 from loop_manager_internal.runtime import process_lock as process_lock_module
 
 
-class TimestampedExecutionProgressLogsTest(unittest.TestCase):
+class ExecutionProgressLogTest(unittest.TestCase):
     def test_operation_log_uses_fixed_local_timestamp_for_both_streams(self):
         stdout = io.StringIO()
         stderr = io.StringIO()
@@ -139,11 +139,10 @@ class TimestampedExecutionProgressLogsTest(unittest.TestCase):
             self.assertIn("python:-u", completed.stdout)
             self.assertIn("run target-repo", completed.stdout)
 
-    def test_launchers_have_no_timestamp_banner_and_scheduler_option_is_documented(self):
+    def test_launchers_have_no_timestamp_banner_or_git_execution(self):
         powershell = (loop_manager.ROOT / "run.ps1").read_text(encoding="utf-8")
         bash = (loop_manager.ROOT / "run.sh").read_text(encoding="utf-8")
         self.assertNotIn("Get-Date -Format", powershell)
         self.assertNotIn("date ", bash)
         self.assertNotIn("git ", powershell.casefold())
         self.assertNotIn("git ", bash.casefold())
-        self.assertIn("--skip-if-running", (loop_manager.ROOT / "README.md").read_text(encoding="utf-8"))

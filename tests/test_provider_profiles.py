@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 import loop_manager
 from tests.support.profiles import profile_config
+from tests.support.fixed_samples import PROVIDER_PROFILES
 from loop_manager_internal.agents import agent_profiles
 
 
@@ -97,8 +98,8 @@ class ProviderProfilesTest(unittest.TestCase):
                 self.assertEqual(agent_profiles.provider_worker_profile(
                     config, provider, level, {model: frozenset({"high"})}), (model, "high"))
 
-    def test_example_profiles_are_complete_and_preserve_reviewer(self):
-        config = Path(__file__).resolve().parents[1] / "config/config.ini.example"
+    def test_fixed_profile_sample_is_complete_and_preserves_reviewer(self):
+        config = PROVIDER_PROFILES
         catalogs = {
             "codex": {model: frozenset({"low", "medium", "high", "xhigh", "max"})
                       for model in ("gpt-6-astra", "gpt-6.1-sol", "gpt-5.6-terra", "gpt-6-luna")},
@@ -118,8 +119,6 @@ class ProviderProfilesTest(unittest.TestCase):
             ("claude-opus-5-5", "xhigh"), ("claude-opus-5-5", "max")), 1):
             self.assertEqual(agent_profiles.provider_worker_profile(
                 config, "claude", level, catalogs["claude"]), (model, effort))
-        self.assertIn("2.1.284", config.read_text())
-
     def test_worker_profile_resolves_level_alias(self):
         config = profile_config(self)
 

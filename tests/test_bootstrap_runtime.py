@@ -20,6 +20,7 @@ from tests.support.origin import (
     git, configure_identity, commit_all, write_registration_files,
     remote_fixture, advance_remote, OriginScopeFixture,
 )
+from tests.support.fixed_samples import PROJECT_FILES
 from loop_manager_internal.runtime import bootstrap
 
 
@@ -498,7 +499,7 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                     for name in ('PLANS.md', 'AGENTS.common.md', 'AGENTS.planner.md',
                                  'AGENTS.planner_check.md', 'AGENTS.worker.md', 'AGENTS.reviewer.md',
                                  'AGENTS.ponytail.md'):
-                        shutil.copy(loop_manager.ROOT / 'docs' / name, source / 'docs' / name)
+                        shutil.copy(PROJECT_FILES / 'docs' / name, source / 'docs' / name)
                     (source / 'scripts').mkdir(exist_ok=True)
                     (source / 'scripts/verify.sh').write_text('#!/bin/sh\nexit 0\n', encoding='utf-8')
                     (source / 'scripts/verify.ps1').write_text('exit 0\n', encoding='utf-8')

@@ -12,6 +12,7 @@ from pathlib import Path
 from unittest import mock
 import loop_manager
 from tests.support.profiles import profile_config
+from tests.support.fixed_samples import PROVIDER_PROFILES
 from tests.support.worker import worker_result
 
 
@@ -142,11 +143,11 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             ("claude-haiku-test", "medium"),
         )
 
-    def test_example_profiles_validate_every_role_and_level(self):
-        config = loop_manager.ROOT / "config/config.ini.example"
+    def test_fixed_profile_sample_validates_every_role_and_level(self):
+        config = PROVIDER_PROFILES
         parser = configparser.ConfigParser()
         self.assertEqual(parser.read(config, encoding="utf-8"), [str(config)])
-        # 이 테스트는 예제 설정의 내부 일관성을 검사하며 실제 CLI 지원 여부는 검사하지 않는다.
+        # 고정 샘플의 profile 일관성을 검사하며 실제 CLI 지원 여부는 검사하지 않는다.
         for provider, efforts in (
             ("codex", frozenset({"low", "medium", "high", "xhigh", "max", "ultra"})),
             ("claude", loop_manager.CLAUDE_EFFORTS),
