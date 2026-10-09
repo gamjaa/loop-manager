@@ -405,7 +405,7 @@ def validate_maintenance_planner_result(
                 related_plans.append((
                     path,
                     effects._parse_execplan(
-                        worktree, worktree / path, require_priority=True,
+                        worktree, worktree / path, require_priority=False,
                         allow_archive_fallback=False,
                     ),
                 ))
@@ -486,11 +486,16 @@ def validate_maintenance_planner_result(
             allocation.source_id: allocation.target_id
             for allocation in id_allocations
         }
-        declared_refactoring = (
-            new_ids
-            if refactoring_plan_ids is None
-            else {id_mapping.get(plan_id, plan_id) for plan_id in refactoring_plan_ids}
-        )
+        if refactoring_plan_ids is None:
+            declared_refactoring = new_ids
+        elif expected_id_allocations is not None:
+            # Recovery stores target IDs; applying source->target mapping again
+            # can collapse IDs when a target is another plan's source ID.
+            declared_refactoring = set(refactoring_plan_ids)
+        else:
+            declared_refactoring = {
+                id_mapping.get(plan_id, plan_id) for plan_id in refactoring_plan_ids
+            }
         if not declared_refactoring <= new_ids:
             unknown = sorted(declared_refactoring - new_ids)
             raise MaintenancePlanningError(

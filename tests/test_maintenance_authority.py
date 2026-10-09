@@ -96,6 +96,51 @@ class MaintenanceAuthorityTest(MaintenancePlanningCase):
         )
         self.assertEqual(intent.publication_refactoring_plan_ids, ("G-002",))
 
+    def test_maintenance_recovery_keeps_refactoring_ids_when_mapping_overlaps(self):
+        self.connection.execute(
+            "INSERT INTO execplan_cancellations "
+            "(repo, plan_id, path, title, sources, depends_on, complexity, risk, "
+            "priority, content_hash, plan_sha, deletion_commit) "
+            "VALUES (?, 'G-010', 'docs/plans/[G-010] Cancelled.md', 'Cancelled', "
+            "'[]', '[]', 'low', 'low', 'normal', 'hash', 'sha', 'commit')",
+            (str(self.repo),),
+        )
+        context = self._begin_barrier()
+        self._write_plan("G-002", "First Refactor")
+        self._write_plan("G-011", "Second Refactor")
+        self._write_plan(
+            "G-001", "Ready Feature",
+            depends_on=("G-000", "G-002", "G-011"),
+        )
+
+        initial = loop_manager.validate_maintenance_planner_result(
+            self.connection, context, self.repo,
+            loop_manager.changed_files(self.repo),
+            refactoring_plan_ids=("G-002", "G-011"),
+        )
+
+        self.assertIsNotNone(initial)
+        assert initial is not None
+        self.assertEqual(
+            [(item.source_id, item.target_id) for item in initial.id_allocations],
+            [("G-002", "G-011"), ("G-011", "G-012")],
+        )
+        self.assertEqual(initial.refactoring_plan_ids, ("G-011", "G-012"))
+
+        resumed = loop_manager.validate_maintenance_planner_result(
+            self.connection, context, self.repo,
+            loop_manager.changed_files(self.repo),
+            refactoring_plan_ids=initial.refactoring_plan_ids,
+            expected_id_allocations=initial.id_allocations,
+        )
+
+        self.assertIsNotNone(resumed)
+        assert resumed is not None
+        self.assertEqual(resumed.refactoring_plan_ids, ("G-011", "G-012"))
+        self.assertEqual(
+            [plan["id"] for _path, plan in resumed.plans], ["G-011", "G-012"],
+        )
+
     def test_single_assessment_dag_accepts_required_ready_without_reverse_barrier(self):
         context = self._begin_barrier()
         self._write_plan("G-002", "Refactor Boundary", depends_on=("G-001",))
@@ -564,6 +609,57 @@ class MaintenanceAuthorityTest(MaintenancePlanningCase):
                 metadata,
                 without_implementation,
             )
+
+    def test_revalidation_accepts_priorityless_legacy_snapshot_revision(self):
+        path = self.ready_path
+        legacy_text = path.read_text(encoding="utf-8").replace(
+            "priority: normal\n", "",
+        )
+        path.write_text(legacy_text, encoding="utf-8", newline="\n")
+        relative_path = path.relative_to(self.repo).as_posix()
+        git(self.repo, "add", relative_path)
+        git(self.repo, "commit", "-m", "Create legacy priority-less plan snapshot")
+        active_sha = git(self.repo, "rev-parse", "HEAD")
+        content_hash = hashlib.sha256(path.read_bytes()).hexdigest()
+        self.connection.execute(
+            "UPDATE exec_plans SET content_hash = ?, publication_content_hash = ?, "
+            "publication_sha = ?, current_revision_sha = ?, plan_sha = ? "
+            "WHERE repo = ? AND plan_id = 'G-001'",
+            (content_hash, content_hash, active_sha, active_sha, active_sha, str(self.repo)),
+        )
+        self.connection.commit()
+
+        cycle, _created = self._begin_legacy_assessment(active_sha)
+        repository = maintenance_state.MaintenanceRepository(self.connection)
+        refactoring = repository.transition(
+            str(self.repo), expected_phase=cycle.phase,
+            expected_revision=cycle.revision,
+            next_phase=maintenance_state.MaintenancePhase.REFACTORING,
+            refactoring_plan_ids=("G-000",), revalidation_plan_ids=("G-001",),
+        )
+        repository.transition(
+            str(self.repo), expected_phase=refactoring.phase,
+            expected_revision=refactoring.revision,
+            next_phase=maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+        )
+        context = loop_manager.prepare_maintenance_planning_context(
+            self.connection, str(self.repo), self.repo, active_sha,
+        )
+        self.assertNotIn("priority:", context.eligible_plans[0].text)
+
+        revised_text = legacy_text.replace(
+            "Separate the responsibility into a testable module boundary.",
+            "Use the refactored adapter module boundary.",
+        )
+        path.write_text(revised_text, encoding="utf-8", newline="\n")
+        result = loop_manager.validate_maintenance_planner_result(
+            self.connection, context, self.repo,
+            loop_manager.changed_files(self.repo),
+        )
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.revisions[0].plan["priority"], "normal")
 
     def test_revalidation_preserves_goal_and_allows_only_current_structure_sections(self):
         repository = maintenance_state.MaintenanceRepository(self.connection)
