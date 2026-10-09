@@ -911,6 +911,16 @@ class MaintenanceAuthorityTest(MaintenancePlanningCase):
             acceptance_criteria=revised_criteria.replace("settings.json", "invented.json"),
         )
         with self.assertRaisesRegex(
+            loop_manager.PlannerValidationError, "검증된 docs/plans batch"
+        ):
+            loop_manager.validate_maintenance_planner_result(
+                self.connection, context, self.repo,
+                [self.ready_path.relative_to(self.repo).as_posix()],
+            )
+        # After removing the out-of-scope file, its path still has no immutable
+        # move evidence and cannot replace the original acceptance criterion.
+        (self.repo / "invented.json").unlink()
+        with self.assertRaisesRegex(
             loop_manager.PlannerValidationError, "Acceptance Criteria"
         ):
             loop_manager.validate_maintenance_planner_result(
