@@ -21,3 +21,11 @@
 목록 밖 새 코드·설정의 누락, 확인되지 않은 Git·외부·동적 입력이 재사용을 약화하지 않는지
 검토한다. 성공한 verify는 목록 완전성의 증명이 아니다. 제외 확인은 해당 경로·내용·kind·
 mode와 목록·명령·환경·runtime·Git/외부 입력에 결합한 bounded 근거에만 유효하다.
+
+## Verify adapter 계약 검토
+
+`scripts/verify.json`과 [VERIFY.md](VERIFY.md)의 선택 adapter·지원 버전·참조 계약을 확인한다.
+명시적 opt-in 오류의 실패, 후보 interpreter·수집 및 필수 단계 보존, manifest·결과 identity와
+누락/중복·native fixture/skip 의미, 직렬 조건·내부 병렬 예산과 독립 경로를 검토한다.
+시작 실패·timeout·취소·불완전 결과의 진단과 자식 종료 확인·예약 보존, 다른 verify의 소유권을
+확인한다. 전달된 unit 결과와 실제 OS·언어·성능 근거를 구분하고 미실행 검증을 성공으로 인정하지 않는다.

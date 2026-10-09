@@ -98,7 +98,7 @@ def worker_environment(environment):
         child["PYTHONPYCACHEPREFIX"] = sys.pycache_prefix
     child[MARKER] = "1"
     child["PYTHONIOENCODING"] = "utf-8"
-    root = str(Path(__file__).resolve().parents[2])
+    root = child.get("LOOP_MANAGER_VERIFY_PROJECT_ROOT", str(Path(__file__).resolve().parents[2]))
     paths = [str(Path(__file__).parent / "child_guard"), root,
              *child.get("PYTHONPATH", "").split(os.pathsep)]
     child["PYTHONPATH"] = os.pathsep.join(dict.fromkeys(filter(None, paths)))

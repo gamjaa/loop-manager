@@ -1,8 +1,9 @@
 """같은 manifest를 직렬/부하 적응형 worker 프로세스에서 실행한다."""
 from __future__ import annotations
 import argparse
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 import json
+import math
 import os
 import platform
 from pathlib import Path
@@ -11,13 +12,15 @@ import subprocess
 import sys
 import time
 import traceback
-import unittest
 import uuid
 
 from loop_manager_internal.verification.coordination import CoordinatorClient, VerifyCoordinator
-from loop_manager_internal.verification.guard import MARKER, install_guard, worker_environment
-from loop_manager_internal.verification.git_timing import git_command_timing
-from loop_manager_internal.verification.manifest import Module, discover, load_module, test_cases, validate_report
+from loop_manager_internal.verification.guard import MARKER, install_guard
+from loop_manager_internal.verification.unittest_adapter import (worker_main, start_worker, stop_worker, failure_output, compile_project)
+from loop_manager_internal.verification.manifest import validate_report
+from loop_manager_internal.verification.contract import VERSION, ADAPTERS, ContractError, load
+from loop_manager_internal.verification import unittest_adapter
+from loop_manager_internal.verification.core import execute_command
 from loop_manager_internal.verification.resources import DEFAULT_WORKER_BYTES, ResourceSampler, parse_parallelism, process_memory
 from loop_manager_internal.verification.timing import (
     EventWriter, TimedResult, atomic_json, bytecode_cache_changes,
@@ -26,235 +29,28 @@ from loop_manager_internal.verification.timing import (
 )
 
 
-def worker_main():
-    os.environ[MARKER] = "1"
-    install_guard()
-    if sys.platform.startswith("linux"):
-        import ctypes
-        libc = ctypes.CDLL(None, use_errno=True)
-        if libc.prctl(36, 1, 0, 0, 0) != 0:
-            raise OSError(ctypes.get_errno(), "worker PR_SET_CHILD_SUBREAPER")
-    sys.path.insert(0, str(Path.cwd() / "tests"))
-    writer = None
-    try:
-        for line in sys.stdin:
-            request = json.loads(line)
-            if writer is None:
-                writer = EventWriter(Path(request["directory"]) / f"worker-{request['worker']}.jsonl")
-            module = Module(request["module"], tuple(request["ids"]), tuple(tuple(owner) for owner in request["owners"]), request["pattern"])
-            try:
-                with writer.activate(), phase(f"import:{module.name}"):
-                    suite = load_module(module)
-                    owners = {test.id(): (test.__class__.__module__,
-                              f"{test.__class__.__module__}.{test.__class__.__qualname__}") for test in test_cases(suite)}
-                with writer.activate(), phase(f"module:{module.name}"), fixture_timing(), git_command_timing():
-                    result = unittest.TextTestRunner(
-                        resultclass=lambda *args, **kwargs: TimedResult(*args, writer=writer, **kwargs),
-                        stream=sys.stderr,
-                    ).run(suite)
-                if sys.platform.startswith("linux"):
-                    with writer.activate(), phase(f"descendant_cleanup:{module.name}"):
-                        while True:
-                            try:
-                                os.waitpid(-1, 0)
-                            except ChildProcessError:
-                                break
-                report = {"module": module.name, "passed": result.wasSuccessful(),
-                          "completed": result.completed, "memory": process_memory()}
-                fixture_skips = {test.id() for test, _reason in result.skipped if getattr(test, "test_case", test).id() not in result.completed}
-                report["fixture_skip_sources"] = sorted(fixture_skips)
-                report["fixture_skipped"] = [identity for identity, (owner, klass) in owners.items()
-                    if identity not in result.completed and
-                    (f"setUpModule ({owner})" in fixture_skips or f"setUpClass ({klass})" in fixture_skips)]
-            except Exception:
-                traceback.print_exc()
-                report = {"module": module.name, "passed": False, "completed": [], "runner_error": True}
-            sys.stdout.flush()
-            sys.stderr.flush()
-            atomic_json(Path(request["result"]), report)
-    finally:
-        if writer:
-            writer.close()
-    return 0
+IMPLEMENTATIONS = {"unittest": unittest_adapter}
+
+def execute_manifest(modules, directory, writer, client, *, spawn=None, sleep=time.sleep):
+    from loop_manager_internal.verification.core import execute_manifest as execute
+    return execute(modules, directory, writer, client, spawn=spawn or start_worker,
+                   validate_report=validate_report, stop_worker=stop_worker,
+                   failure_output=failure_output, coverage=lambda unit, report: report["completed"] + report.get("fixture_skipped", []), sleep=sleep)
 
 
-@dataclass
-class Worker:
-    process: object
-    token: str
-    number: int
-    output: object
-    job: object = None
-    module: Module | None = None
-    report: Path | None = None
-    log_offset: int = 0
-
-    def assign(self, module, report, directory):
-        self.output.flush()
-        self.log_offset = self.output.tell()
-        self.module, self.report = module, report
-        self.process.stdin.write(json.dumps({"module": module.name, "ids": module.ids, "owners": module.owners, "pattern": module.pattern,
-                                 "result": str(report), "directory": str(directory), "worker": self.number}) + "\n")
-        self.process.stdin.flush()
-
-
-def start_worker(token, number, directory):
-    from loop_manager_internal.execution.verify_process import _LINUX_SUBREAPER
-    command = [sys.executable, "-u", "-m", "loop_manager_internal.verification.runner", "--worker"]
-    if sys.platform.startswith("linux"):
-        # 재사용 worker의 모듈 입력 pipe는 subreaper를 통과해 실제 worker에 전달한다.
-        bootstrap = _LINUX_SUBREAPER.replace("stdin=subprocess.DEVNULL", "stdin=sys.stdin")
-        command = [sys.executable, "-c", bootstrap, *command]
-    output = (directory / f"worker-{number}.log").open("wb")
-    process = None
-    job = None
-    try:
-        if os.name == "nt":
-            from loop_manager_internal.execution.windows_job import WindowsJob
-            job = WindowsJob()
-        process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=output, stderr=subprocess.STDOUT,
-                                   text=True, encoding="utf-8", env=worker_environment(os.environ),
-                                   **({"start_new_session": True} if os.name != "nt" else {}))
-        return Worker(process, token, number, output, job)
-    except BaseException:
-        if process is not None:
-            process.kill()
-            process.wait(timeout=10)
-        if job:
-            job.close()
-        output.close()
-        raise
-
-
-def failure_output(worker, directory):
-    """재사용 worker 로그에서 이번 실패 모듈의 원문만 전달한다."""
-    from loop_manager_internal.execution.validation_feedback import redact_secrets
-    path = directory / f"worker-{worker.number}.log"
-    with path.open("rb") as stream:
-        stream.seek(worker.log_offset)
-        raw = stream.read().decode("utf-8", errors="replace")
-    print(f"unittest 실패 모듈: {worker.module.name}\n{redact_secrets(raw)}", flush=True)
-
-
-def stop_worker(worker):
-    from loop_manager_internal.execution.verify_process import terminate_verify_process
-    try:
-        worker.process.wait(timeout=10)
-        if worker.job:
-            worker.job.wait(10)
-        if worker.process.returncode != 0:
-            raise RuntimeError(f"unittest worker 비정상 종료: {worker.process.returncode}")
-    except (subprocess.TimeoutExpired, TimeoutError):
-        if worker.job:
-            errors = []
-            for cleanup in (worker.job.terminate, lambda: worker.process.wait(timeout=10), lambda: worker.job.wait(10)):
-                try:
-                    cleanup()
-                except Exception as error:
-                    errors.append(str(error))
-            if errors:
-                raise RuntimeError("unittest worker 자식 종료 불명: " + "; ".join(errors))
-        else:
-            terminate_verify_process(worker.process)
-        raise RuntimeError("unittest worker 종료 시간 초과")
-    finally:
-        worker.output.close()
-        if worker.job:
-            worker.job.close()
-
-
-def execute_manifest(modules, directory, writer, client, *, spawn=start_worker, sleep=time.sleep):
-    pending, workers, completed, passed = list(modules), [], set(), True
-    budget = DEFAULT_WORKER_BYTES
-    last_reason = None
-    last_allocation_at = None
-    waiting = None
-    try:
-        while pending or any(worker.module is not None for worker in workers):
-            for worker in workers:
-                if worker.process.poll() is not None:
-                    raise RuntimeError("unittest worker가 배정/정리 전에 종료됐습니다.")
-                if worker.module is not None and worker.report.is_file():
-                    if worker.job and worker.job.active() > 1:
-                        continue
-                    report = json.loads(worker.report.read_text(encoding="utf-8"))
-                    passed = validate_report(worker.module, report) and passed
-                    if not report["passed"]:
-                        failure_output(worker, directory)
-                    if report.get("runner_error"):
-                        raise RuntimeError(f"unittest worker 수집/실행 오류: {worker.module.name}")
-                    covered = report["completed"] + report.get("fixture_skipped", [])
-                    if completed.intersection(covered):
-                        raise RuntimeError("unittest 결과 중복")
-                    completed.update(covered)
-                    memory = report.get("memory")
-                    if memory:
-                        budget = max(budget, int(memory["peak"] * 1.25))
-                    writer.emit("module_result", module=worker.module.name, passed=report["passed"], memory=memory)
-                    client.request("idle", token=worker.token)
-                    worker.module = None
-            if pending:
-                idle = next((worker for worker in workers if worker.module is None), None)
-                reply = client.request("acquire", **({"token": idle.token} if idle else {}), worker_bytes=budget)
-                reason = reply["reason"]
-                now = writer.clock()
-                if reply["granted"] or reason != last_reason or last_allocation_at is None or now - last_allocation_at >= 1:
-                    writer.emit("allocation", decision=reply, estimated_worker_bytes=budget)
-                    last_reason = reason
-                    last_allocation_at = now
-                if reply["granted"]:
-                    if waiting is not None:
-                        writer.emit("phase_end", name="resource_wait", start=waiting["at"],
-                                    duration=writer.clock() - waiting["at"], result="complete")
-                        waiting = None
-                    if idle is None:
-                        try:
-                            idle = spawn(reply["token"], len(workers), directory)
-                        except BaseException:
-                            client.request("not_started", token=reply["token"])
-                            raise
-                        workers.append(idle)
-                        client.request("bind", token=idle.token, pid=idle.process.pid)
-                        if idle.job:
-                            idle.job.assign(idle.process)
-                    module = pending.pop(0)
-                    idle.assign(module, directory / f"module-{len(modules) - len(pending) - 1}.json", directory)
-                elif waiting is None:
-                    waiting = writer.emit("phase_start", name="resource_wait")
-            if pending or any(worker.module is not None for worker in workers):
-                sleep(0.05)
-        expected = {identity for module in modules for identity in module.ids}
-        if passed and completed != expected:
-            raise RuntimeError("unittest 최종 결과에 누락이 있습니다.")
-        return passed
-    finally:
-        errors = []
-        for worker in workers:
-            try:
-                worker.process.stdin.close()
-            except Exception as error:
-                errors.append(str(error))
-        for worker in workers:
-            try:
-                with phase(f"worker_shutdown:{worker.number}", writer=writer):
-                    stop_worker(worker)
-                client.request("release", token=worker.token)
-            except Exception as error:
-                errors.append(str(error))
-        if errors:
-            raise RuntimeError("unittest 자식 정리 실패: " + "; ".join(errors))
-
-
-def compile_project(root):
-    for path in [root / "loop_manager.py", *sorted((root / "loop_manager_internal").rglob("*.py"))]:
-        py_compile.compile(str(path), doraise=True)
-
-
-def run(directory, cap):
+def run(directory, cap, timeout=600, project_python=None):
+    connection = load(Path.cwd(), project_python=project_python or sys.executable)
+    if connection is None:
+        raise ContractError("scripts/verify.json is required for the common runner")
+    adapter = IMPLEMENTATIONS[connection.adapter]
+    run_id = os.environ.get("LOOP_MANAGER_VERIFY_SESSION", uuid.uuid4().hex)
+    entrypoint = Path(__file__).with_name("entrypoint.py").resolve()
+    started_at = time.monotonic()
     directory.mkdir(parents=True, exist_ok=True)
+    os.environ["LOOP_MANAGER_VERIFY_PROJECT_ROOT"] = str(connection.root)
     os.environ[MARKER] = "1"
     install_guard()
-    writer = EventWriter(directory / "runner.jsonl")
+    writer = EventWriter(directory / "runner.jsonl", identity={"run_id": run_id})
     coordinator = None
     session = None
     try:
@@ -271,7 +67,7 @@ def run(directory, cap):
             client, coordinated = LocalClient(), False
         def git_value(*arguments):
             return subprocess.run(["git", *arguments], capture_output=True, text=True, check=True, timeout=5).stdout.strip()
-        writer.emit("run_start", revision=git_value("rev-parse", "HEAD"), git=git_value("--version"),
+        writer.emit("run_start", version=VERSION, run_id=run_id, adapter=connection.adapter, adapter_support=ADAPTERS[connection.adapter], revision=git_value("rev-parse", "HEAD"), git=git_value("--version"),
                     python=sys.version, command=sys.argv, cap=cap, coordinated=coordinated,
                     bytecode_policy=bytecode_policy(),
                     environment={"host": platform.node(), "platform": sys.platform,
@@ -280,21 +76,47 @@ def run(directory, cap):
         with writer.activate(), phase("verify"):
             with phase("bytecode_cache_snapshot_before", writer=writer):
                 bytecode_before = bytecode_cache_snapshot(Path.cwd())
-            with phase("discovery/import"):
-                modules = discover(Path.cwd() / "tests")
-                atomic_json(directory / "manifest.json", [asdict(module) for module in modules])
-            passed = execute_manifest(modules, directory, writer, client)
-            if passed:
-                with phase("compile"):
-                    compile_project(Path.cwd())
+            passed = True
+            manifest_stages = []
+            for index, stage in enumerate(connection.stages):
+                remaining = None if timeout is None else timeout - (time.monotonic() - started_at)
+                if remaining is not None and remaining <= 0:
+                    raise TimeoutError("verify total timeout")
+                stage_directory = directory / f"stage-{index}"
+                stage_directory.mkdir()
+                writer.identity["stage_id"] = stage["id"]
+                with phase(f"stage:{stage['id']}"):
+                    if stage["kind"] == "tests":
+                        modules, project_python = adapter.collect_project(connection, stage, stage_directory,
+                            run_id, entrypoint, remaining, execute_command, writer, client)
+                        units = [{"id": module.name, "ids": list(module.ids),
+                            "argv": [str(connection.python), "-u", str(entrypoint), "--worker"],
+                            "cwd": str(connection.root / stage["cwd"]), "execution": stage["execution"],
+                            "payload": asdict(module)} for module in modules]
+                        manifest_stages.append({"id": stage["id"], "kind": "tests", "python": project_python, "units": units})
+                        atomic_json(directory / "manifest.json", {"version": VERSION, "run_id": run_id,
+                            "adapter": connection.adapter, "adapter_version": ADAPTERS[connection.adapter]["version"], "stages": manifest_stages})
+                        passed = adapter.execute(connection, stage, modules, stage_directory, writer, client, run_id, entrypoint)
+                    else:
+                        argv = [{"{python}": str(connection.python), "{runner}": str(entrypoint)}.get(item, item)
+                                for item in stage["argv"]]
+                        manifest_stages.append({"id": stage["id"], "kind": "command", "argv": argv, "cwd": stage["cwd"]})
+                        atomic_json(directory / "manifest.json", {"version": VERSION, "run_id": run_id,
+                            "adapter": connection.adapter, "adapter_version": ADAPTERS[connection.adapter]["version"], "stages": manifest_stages})
+                        passed = execute_command(argv, connection.root / stage["cwd"], remaining,
+                                                 writer, client, run_id, stage["id"])
+                if not passed:
+                    break
             with phase("bytecode_cache_snapshot_after", writer=writer):
                 bytecode_after = bytecode_cache_snapshot(Path.cwd())
-            writer.emit("run_end", passed=passed, memory=process_memory(),
+            writer.emit("run_end", version=VERSION, run_id=run_id, passed=passed, memory=process_memory(),
                         bytecode_cache=bytecode_cache_changes(bytecode_before, bytecode_after))
             return 0 if passed else 1
     finally:
         writer.close()
         if coordinator and session:
+            if coordinator.reservations:
+                atomic_json(directory / "uncertain-reservations.json", coordinator.reservations)
             coordinator.finish(session, stopped=not coordinator.reservations)
         print(diagnostic(directory), flush=True)
 
@@ -302,10 +124,27 @@ def run(directory, cap):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--protocol-version", type=int, default=VERSION)
+    parser.add_argument("--version", action="store_true")
+    parser.add_argument("--collect", type=Path)
+    parser.add_argument("--compile", nargs="+", type=Path)
+    parser.add_argument("--project-python", type=Path)
+    parser.add_argument("--timeout", type=float, default=os.environ.get("LOOP_MANAGER_VERIFY_TIMEOUT"))
     parser.add_argument("--report", nargs="+", type=Path)
     parser.add_argument("--parallelism", default=os.environ.get("LOOP_MANAGER_VERIFY_PARALLELISM", "auto"))
     parser.add_argument("--execute", action="store_true", help=argparse.SUPPRESS)
     arguments = parser.parse_args()
+    if arguments.protocol_version != VERSION:
+        raise ContractError("unsupported runner protocol version")
+    if arguments.version:
+        print(json.dumps({"version": VERSION, "adapters": ADAPTERS}))
+        return 0
+    if arguments.collect:
+        unittest_adapter.collect(json.loads(arguments.collect.read_text(encoding="utf-8")))
+        return 0
+    if arguments.compile:
+        unittest_adapter.compile_paths(Path.cwd(), arguments.compile)
+        return 0
     if arguments.worker:
         return worker_main()
     if arguments.report:
@@ -313,23 +152,33 @@ def main():
         print(json.dumps({"summaries": summaries, "comparison": comparison(arguments.report, summaries)},
                          ensure_ascii=False, indent=2))
         return 0
+    if arguments.timeout is not None and (not math.isfinite(arguments.timeout) or arguments.timeout <= 0):
+        parser.error("--timeout must be finite and positive")
     cap = parse_parallelism(arguments.parallelism)
     directory = Path(os.environ.get("LOOP_MANAGER_VERIFY_LOG_DIR", str(Path.cwd() / ".cache/verify" / uuid.uuid4().hex)))
-    if arguments.execute or "LOOP_MANAGER_VERIFY_SESSION" in os.environ:
-        return run(directory, cap)
+    coordinated = "LOOP_MANAGER_VERIFY_SESSION" in os.environ
+    if coordinated and not all(os.environ.get(name) for name in (
+            "LOOP_MANAGER_VERIFY_SESSION", "LOOP_MANAGER_VERIFY_ENDPOINT", "LOOP_MANAGER_VERIFY_SECRET")):
+        raise ContractError("incomplete Manager coordination context")
+    if arguments.execute or coordinated:
+        # Older coordinated Managers own the outer deadline but do not transmit it.
+        timeout = arguments.timeout if arguments.timeout is not None else (
+            None if coordinated else 600)
+        return run(directory, cap, timeout, arguments.project_python)
     # 단독 스크립트도 기존 전체 verify timeout과 자식 종료 확인 경계를 사용한다.
     from loop_manager_internal.execution.verify_process import run_verify_process
     environment = dict(os.environ, LOOP_MANAGER_VERIFY_LOG_DIR=str(directory), PYTHONIOENCODING="utf-8")
-    timeout = 600
+    timeout = arguments.timeout if arguments.timeout is not None else 600
     config = Path("config/config.ini")
     if config.is_file():
         from loop_manager_internal.config.managed_config import load_managed_config
         managed = load_managed_config(config)
-        timeout = managed.verify_timeout_seconds
+        if arguments.timeout is None:
+            timeout = managed.verify_timeout_seconds
         if "--parallelism" not in sys.argv and "LOOP_MANAGER_VERIFY_PARALLELISM" not in os.environ:
             cap = managed.verify_parallelism
     passed, timed_out, output = run_verify_process(
-        [sys.executable, "-u", "-m", "loop_manager_internal.verification.runner", "--execute", "--parallelism", str(cap)],
+        [sys.executable, "-u", str(Path(__file__).with_name("entrypoint.py")), "--execute", "--parallelism", str(cap), "--timeout", str(timeout), "--project-python", str(arguments.project_python or sys.executable)],
         Path.cwd(), timeout, environment=environment, job_scope=True)
     print(output, end="")
     if timed_out:

@@ -245,7 +245,12 @@ def verify(effects: VerifyEffects, worktree: Path, timeout_seconds: int = 600) -
     if not script.is_file():
         return False, f"전체 검증 스크립트가 없습니다: {script.relative_to(worktree)}"
     gate = _runtime_handoff_signal.get()
-    if (worktree / "loop_manager_internal/verification/runner.py").is_file():
+    from loop_manager_internal.verification.contract import load, ContractError
+    try:
+        connected = load(worktree) is not None
+    except ContractError as error:
+        return False, VerifyOutput(f"verify connection error: {error}", timed_out=False, exit_code=2)
+    if connected:
         from loop_manager_internal.verification import manager_adapter
         passed, timed_out, output = manager_adapter.run(
             effects, arguments, worktree, timeout_seconds,

@@ -3,6 +3,7 @@ from collections import Counter
 from dataclasses import dataclass
 import unittest
 import importlib
+import os
 from pathlib import Path
 
 
@@ -47,9 +48,9 @@ class ManifestLoader(unittest.TestLoader):
             self.depth -= 1
 
 
-def discover(directory):
+def discover(directory, pattern="test*.py"):
     loader = ManifestLoader()
-    suite = loader.discover(str(directory))
+    suite = loader.discover(str(directory), pattern=pattern)
     if loader.errors:
         raise RuntimeError("unittest 수집 실패:\n" + "\n".join(loader.errors))
     expected = tuple(test_ids(suite))
@@ -62,7 +63,7 @@ def discover(directory):
 def load_module(module):
     loader = unittest.TestLoader()
     loaded = importlib.import_module(module.name)
-    loader._top_level_dir = str(Path.cwd() / "tests")
+    loader._top_level_dir = os.environ.get("LOOP_MANAGER_VERIFY_TEST_DIRECTORY", str(Path.cwd() / "tests"))
     if hasattr(loaded, "__path__"):
         loader._loading_packages.add(module.name)
     try:

@@ -94,9 +94,9 @@ class WindowsJob:
         return accounting.active
 
     def wait(self, timeout, *, remaining=0):
-        deadline = time.monotonic() + timeout
+        deadline = None if timeout is None else time.monotonic() + timeout
         while self.active() > remaining:
-            if time.monotonic() >= deadline:
+            if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError("Windows verify Job Object 자식 잔존")
             time.sleep(0.02)
 

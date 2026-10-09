@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "adapter": "unittest",
+  "environment": {"python": "launcher"},
+  "stages": [
+    {
+      "id": "unittest",
+      "kind": "tests",
+      "cwd": ".",
+      "collection": {"directory": "tests", "pattern": "test*.py"},
+      "execution": "independent"
+    },
+    {
+      "id": "compile",
+      "kind": "command",
+      "cwd": ".",
+      "argv": ["{python}", "{runner}", "--compile", "loop_manager.py", "loop_manager_internal"]
+    }
+  ]
+}
