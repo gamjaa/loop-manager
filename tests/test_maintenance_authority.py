@@ -18,6 +18,7 @@ from loop_manager_internal.storage import execplan_catalog_state
 import loop_manager
 from loop_manager_internal.maintenance import maintenance_planning
 from loop_manager_internal.maintenance import maintenance_publication
+from loop_manager_internal.maintenance import maintenance_validation
 from loop_manager_internal.maintenance import maintenance_findings
 from loop_manager_internal.maintenance import maintenance_file_inventory
 from loop_manager_internal.storage import maintenance_file_ledger
@@ -279,6 +280,57 @@ class MaintenanceAuthorityTest(MaintenancePlanningCase):
             loop_manager.MaintenancePlanningError, "평가 기준 revision"
         ):
             self._begin_barrier()
+
+    def test_manager_barrier_preserves_crlf_checkout(self):
+        git(self.repo, "config", "core.autocrlf", "true")
+        self.ready_path.write_bytes(
+            self.ready_path.read_bytes().replace(b"\n", b"\r\n")
+        )
+        context = self._begin_barrier()
+        self._write_barrier_batch()
+
+        result = self._validate_barrier(context)
+
+        updated = self.ready_path.read_bytes()
+        self.assertIn(b"\r\n", updated)
+        self.assertNotIn(b"\n", updated.replace(b"\r\n", b""))
+        self.assertEqual(
+            result.revisions[0].plan["depends_on"], ["G-000", "G-002", "G-003"],
+        )
+        self.assertEqual(
+            maintenance_planning._frontmatter_without_dependencies(
+                context.eligible_plans[0].text
+            ),
+            maintenance_planning._frontmatter_without_dependencies(
+                updated.decode("utf-8")
+            ),
+        )
+
+    def test_barrier_replacement_preserves_edit_before_atomic_replace(self):
+        original = self.ready_path.read_bytes()
+        user_edit = original.replace(
+            b"Separate the responsibility into a testable module boundary.",
+            b"Keep this edit made during Manager validation.",
+        )
+        replacement = original + b"\nManager barrier addition\n"
+        real_chmod = maintenance_validation.os.chmod
+
+        def edit_after_candidate_read(path, mode):
+            real_chmod(path, mode)
+            self.ready_path.write_bytes(user_edit)
+
+        with mock.patch.object(
+            maintenance_validation.os, "chmod", side_effect=edit_after_candidate_read,
+        ):
+            with self.assertRaisesRegex(
+                maintenance_validation.MaintenancePlanningError,
+                "교체 전에 대상 내용이 변경",
+            ):
+                maintenance_validation._replace_barrier_plan(
+                    self.ready_path, original, replacement,
+                )
+
+        self.assertEqual(self.ready_path.read_bytes(), user_edit)
 
     def test_ready_snapshot_rejects_assume_unchanged_body_change(self):
         relative_path = self.ready_path.relative_to(self.repo).as_posix()

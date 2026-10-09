@@ -27,8 +27,10 @@ import stat
 import tempfile
 
 
-def _replace_barrier_plan(path: Path, contents: bytes) -> None:
-    """Atomically replace a regular plan file without changing its mode."""
+def _replace_barrier_plan(
+    path: Path, expected_contents: bytes, contents: bytes,
+) -> None:
+    """Atomically replace a plan only while its observed source remains intact."""
 
     for directory in (path.parent.parent, path.parent):
         if not stat.S_ISDIR(directory.lstat().st_mode):
@@ -40,6 +42,24 @@ def _replace_barrier_plan(path: Path, contents: bytes) -> None:
         raise MaintenancePlanningError(
             f"Manager barrier 대상은 일반 파일이어야 합니다: {path}"
         )
+    if path.read_bytes() != expected_contents:
+        raise MaintenancePlanningError(
+            f"Manager barrier 교체 전에 대상 내용이 변경됐습니다: {path}"
+        )
+
+    def assert_source_unchanged() -> None:
+        latest = path.lstat()
+        if (
+            not stat.S_ISREG(latest.st_mode)
+            or latest.st_dev != current.st_dev
+            or latest.st_ino != current.st_ino
+            or stat.S_IMODE(latest.st_mode) != stat.S_IMODE(current.st_mode)
+            or path.read_bytes() != expected_contents
+        ):
+            raise MaintenancePlanningError(
+                f"Manager barrier 교체 전에 대상 내용이 변경됐습니다: {path}"
+            )
+
     descriptor, temporary_name = tempfile.mkstemp(
         prefix=f".{path.name}.barrier-", dir=path.parent,
     )
@@ -52,6 +72,7 @@ def _replace_barrier_plan(path: Path, contents: bytes) -> None:
             stream.flush()
             os.fsync(stream.fileno())
         os.chmod(temporary, stat.S_IMODE(current.st_mode))
+        assert_source_unchanged()
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -70,7 +91,7 @@ def _rollback_barrier_plan_writes(
                 continue
             current = path.read_bytes()
             if current == generated:
-                _replace_barrier_plan(path, original)
+                _replace_barrier_plan(path, generated, original)
             elif current != original:
                 errors.append(f"대상이 바뀌어 보존했습니다: {path}")
         except (OSError, MaintenancePlanningError) as error:
@@ -609,29 +630,57 @@ def validate_maintenance_planner_result(
                             f"barrier READY snapshot은 일반 파일이어야 합니다: {path}"
                         )
                     current_bytes = plan_path.read_bytes()
-                    original_bytes = snapshot.text.encode("utf-8")
-                    expected_text = (
-                        append_barrier_dependencies(snapshot, terminals)
-                        if path in barrier_paths else snapshot.text
+                    current_text = current_bytes.decode("utf-8")
+                    normalized_text = current_text.replace("\r\n", "\n")
+                    matches_snapshot = (
+                        current_text == snapshot.text
+                        or normalized_text == snapshot.text
                     )
-                    expected_bytes = expected_text.encode("utf-8")
-                    if current_bytes not in {original_bytes, expected_bytes}:
+                    if path not in barrier_paths:
+                        if not matches_snapshot:
+                            raise MaintenancePlanningError(
+                                "Planner가 barrier Manager 편집 이외의 READY 계획 변경을 "
+                                f"작성했습니다: {path}"
+                            )
+                        continue
+
+                    canonical_expected = append_barrier_dependencies(
+                        snapshot, terminals,
+                    )
+                    matches_expected = (
+                        current_text == canonical_expected
+                        or normalized_text == canonical_expected
+                    )
+                    if matches_snapshot:
+                        expected_text = append_barrier_dependencies(
+                            snapshot, terminals, source_text=current_text,
+                        )
+                        expected_bytes = expected_text.encode("utf-8")
+                    elif matches_expected:
+                        # A resumed Planner may already have supplied the exact
+                        # Manager dependency edit in this checkout's line endings.
+                        expected_text = current_text
+                        expected_bytes = current_bytes
+                    else:
                         raise MaintenancePlanningError(
                             "Planner가 barrier Manager 편집 이외의 READY 계획 변경을 "
                             f"작성했습니다: {path}"
                         )
-                    if expected_bytes != original_bytes:
+
+                    if expected_bytes != current_bytes:
                         expected_revisions.add(path)
-                        if current_bytes == original_bytes:
-                            manager_writes.append(
-                                (plan_path, original_bytes, expected_bytes)
-                            )
+                        manager_writes.append(
+                            (plan_path, current_bytes, expected_bytes)
+                        )
+                        planned_contents[path] = (expected_bytes, expected_text)
+                    elif matches_expected and not matches_snapshot:
+                        expected_revisions.add(path)
                         planned_contents[path] = (expected_bytes, expected_text)
 
                 if manager_writes:
                     effects._assert_maintenance_context_current(connection, context)
                     for path, original, contents in manager_writes:
-                        _replace_barrier_plan(path, contents)
+                        _replace_barrier_plan(path, original, contents)
                         manager_written.append((path, original, contents))
                         planned_contents[path.relative_to(worktree).as_posix()] = (
                             contents, contents.decode("utf-8"),

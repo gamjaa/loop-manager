@@ -290,17 +290,20 @@ def validate_barrier_revision(
 def append_barrier_dependencies(
     snapshot: ReadyPlanSnapshot,
     terminal_plan_ids: Sequence[str],
+    *,
+    source_text: str | None = None,
 ) -> str:
     """Append missing DAG terminals while preserving every other plan byte."""
 
+    text = snapshot.text if source_text is None else source_text
     additions = tuple(
         plan_id for plan_id in terminal_plan_ids
         if plan_id not in snapshot.depends_on
     )
     if not additions:
-        return snapshot.text
+        return text
 
-    lines = snapshot.text.splitlines(keepends=True)
+    lines = text.splitlines(keepends=True)
     try:
         frontmatter_end = next(
             index for index in range(1, len(lines))
