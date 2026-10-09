@@ -27,6 +27,30 @@ from tests.support.origin import OriginScopeFixture
 
 
 class SupportFixtureTests(unittest.TestCase):
+    def test_execution_review_hash_uses_fixed_guidance_and_restores_runtime_root(self):
+        from loop_manager_internal.agents import common_guidance
+        from tests.support.fixed_samples import PROJECT_FILES
+
+        original_root = common_guidance.RUNTIME_ROOT
+        read = common_guidance._read
+        def read_sample(path):
+            self.assertTrue(path.is_relative_to(PROJECT_FILES), path)
+            return read(path)
+
+        with mock.patch.object(common_guidance, '_read', side_effect=read_sample) as reads:
+            with ExitStack() as cleanup:
+                owner = SimpleNamespace(addCleanup=cleanup.callback,
+                                        assertEqual=self.assertEqual, fail=self.fail)
+                fixture = execution_fixture(owner)
+                context = fixture.review_context()
+                self.assertEqual(fixture.handler._definition_snapshot.guidance_hash,
+                                 common_guidance.runtime_content_hash())
+                outcome = fixture.handler.review(context)
+                self.assertEqual(outcome.context.phase.value, 'PUBLISHING')
+                self.assertEqual({call.args[0] for call in reads.call_args_list},
+                                 {PROJECT_FILES / path for path in common_guidance.GUIDANCE_PATHS})
+            self.assertEqual(common_guidance.RUNTIME_ROOT, original_root)
+
     def test_origin_scope_fixture_preserves_project_snapshot_without_git(self):
         connection = sqlite3.connect(':memory:')
         self.addCleanup(connection.close)

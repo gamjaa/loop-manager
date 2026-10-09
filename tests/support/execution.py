@@ -9,6 +9,7 @@ import loop_manager as lm
 from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.execution.execution_state import ExecutionStatePort
 from tests.support.database import runtime_connection
+from tests.support.fixed_samples import PROJECT_FILES
 from loop_manager_internal.execution.worker_session import SessionBinding
 from loop_manager_internal.agents.common_guidance import plan_content_hash
 import json
@@ -79,6 +80,12 @@ class ExecutionFixture:
     """Reusable setup and adapters; no discoverable test methods."""
 
     def setUp(self):
+        # Hash fallback and later phase gates must consume the same fixed inputs.
+        guidance_root = mock.patch(
+            'loop_manager_internal.agents.common_guidance.RUNTIME_ROOT', PROJECT_FILES,
+        )
+        guidance_root.start()
+        self.addCleanup(guidance_root.stop)
         self.repo = getattr(self, 'repo', 'repo')
         self.connection = runtime_connection(self.repo)
         self.addCleanup(self.connection.close)
