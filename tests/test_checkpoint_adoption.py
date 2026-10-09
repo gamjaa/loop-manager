@@ -533,7 +533,9 @@ class BlockedCheckpointRefreshUnitTests(CheckpointRefreshFixture, unittest.TestC
         prepared = blocked_checkpoint.PreparedCheckpoint('a' * 40, 'new-tree', 'new-identity', 'new-message', ())
         self.store.record_prepared(request, prepared)
         history = json.loads(self.row()['publication_history'])
-        self.assertEqual(history[0]['commit_identity'], 'identity')
+        self.assertEqual(history[0]['superseded_request']['commit_identity'], 'identity')
+        self.assertEqual(history[0]['superseded_request']['accepted_remote_oid'], 'a' * 40)
+        self.assertEqual(history[-1]['commit_identity'], 'identity')
         self.assertEqual(self.row()['commit_identity'], 'new-identity')
 
 

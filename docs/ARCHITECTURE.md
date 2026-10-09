@@ -390,6 +390,10 @@ rebase로 후보 HEAD 또는 ExecPlan·근거 입력이 바뀌면 전체 verify�
 
 PR 없는 게시 checkpoint의 Review 횟수 차단을 rebase 없이 해제할 때는 checkpoint 요청 identity·게시 commit의 tree와 identity·마지막 채택 원격 OID 및 현재 원격 ref, 동일 계획의 branch·관리 worktree와 로컬 HEAD·ref·index·작업 파일·등록 상태를 확인한다. 실행 checkpoint에 게시 소유권 근거를 보존하고 재시작과 Worker 교정 뒤에도 다시 대조한다. 이 경로는 rebase 완료 표식을 만들지 않으며, 이후 실제 rebase가 필요하면 관리 rebase의 현재 상태 판정과 정확한 원격 lease를 요구한다. 게시 소유권 오탐으로 생긴 프로젝트 차단은 같은 증거를 재검증한 경우에만 해제하고, 남아 있는 Review issue의 교정·검증과 다른 READY 계획의 선택을 계속한다.
 
+표식 없는 게시 checkpoint의 재개에도 같은 현재 소유권 검증을 적용한다. `checkpoint_ownership.publication_receipt`는 현재 게시 영수증 또는 같은 branch·worktree·PR에 결합된 과거 게시 기록을 읽기 전용으로 선택한다. 구형 flat 기록은 현재 요청의 정확한 기대 OID까지 일치해야 하며, identity·tree·commit 계보·실제 origin ref는 기존 `owned_remote_oid`로 별도 검증한다. 충분한 이력이 없거나 원격이 삭제·변경됐으면 수용하지 않는다. 요청 교체는 초기화 전에 이전 게시 영수증을 `publication_history`에 보존하며, 현재 local-only 결과를 과거 게시 성공으로 덮지 않는다.
+
+무 rebase 재개의 현재 검증 결과는 기존 `published_review_resume` 필드를 일반 게시 재개에도 사용해 실행 checkpoint에 CAS로 저장한다. 재활성화·후보 교정·중단 복구는 이 필드를 보존하고 소비할 때 현재 요청 identity·원격을 다시 검사한다. 새 계획 차단은 `blocked_resume`과 해당 게시 재개 표식을 함께 무효화해 새 원인의 재검증을 요구한다. 게시 소유권 오탐 해제는 transaction 안에서 원인·계획·프로젝트·checkpoint generation·게시 영수증·현재 Git·실제 원격과 저장된 Agent 결과를 재검증하고 증명 저장·대상 원인 해제를 함께 확정한다. 별도 계획 차단·실패 피드백·session·감사는 유지하며 rebase 완료 증명은 생성하지 않는다.
+
 원격 관측 기록은 origin identity·정확한 ref·OID·실패 원인·시각을 계획별로 보존한다. 조회 실패는 마지막 확정 OID를 덮지 않는다. 처리 키는 원래 원인·검사 지문·관측 base/work branch OID·로컬 작업 지문을 포함한다. 같은 키의 확정 결과를 재사용하며 관련 입력이 달라지면 재평가한다.
 
 ### 로컬 복구 요청의 접수와 실행

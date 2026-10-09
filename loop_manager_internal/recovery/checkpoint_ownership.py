@@ -4,10 +4,47 @@ from __future__ import annotations
 
 import sqlite3
 import re
+import json
 from pathlib import Path
 from typing import Callable
 from loop_manager_internal.recovery import blocked_checkpoint
 from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+
+
+def publication_receipt(row, remote_oid):
+    """현재 요청을 바꾸지 않고 같은 소유 작업의 과거 게시 영수증을 읽는다."""
+    if row is None or row['phase'] == 'published':
+        return dict(row) if row is not None else None
+    try:
+        history = json.loads(row['publication_history'])
+        if not isinstance(history, list):
+            raise ValueError('publication history must be a list')
+        for entry in reversed(history):
+            if not isinstance(entry, dict):
+                raise ValueError('publication history entry must be an object')
+            prior = entry.get('superseded_request', entry)
+            if not isinstance(prior, dict):
+                raise ValueError('publication receipt must be an object')
+            # 구형 flat 영수증은 현재 요청의 정확한 lease와 소유 공간에 결합한다.
+            legacy = 'superseded_request' not in entry and 'branch' not in prior
+            if legacy and row['expected_remote_oid'] != remote_oid:
+                continue
+            receipt = {**dict(row), **prior}
+            if (receipt['repo'] != row['repo'] or receipt['plan_id'] != row['plan_id']
+                    or receipt['branch'] != row['branch'] or receipt['worktree'] != row['worktree']
+                    or receipt['pr_url'] != row['pr_url']
+                    or receipt['accepted_remote_oid'] != remote_oid
+                    or not receipt['published_oid'] or not receipt['commit_identity']
+                    or not receipt['tree_oid'] or receipt['pending_remote_oid']
+                    or (not legacy and (receipt['phase'] != 'published'
+                                        or receipt['result'] != 'published'))):
+                continue
+            return {**receipt, 'phase': 'published', 'result': 'published',
+                    'request_identity': row['request_identity']}
+    except (ValueError, TypeError, KeyError) as error:
+        raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
+                              'checkpoint publication history observation failed') from error
+    return None
 
 
 def owned_remote_oid(
@@ -17,6 +54,7 @@ def owned_remote_oid(
     recorded_oid: str | None = None,
     require_live: bool = True,
     strict_observation: bool = False,
+    allow_history: bool = False,
 ) -> str | None:
     """Return an OID only when durable identity and live origin both prove it."""
     if not remote_oid:
@@ -31,6 +69,8 @@ def owned_remote_oid(
             raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
                                   'checkpoint ownership database observation failed') from error
         raise
+    if allow_history:
+        row = publication_receipt(row, remote_oid)
     if row is None or any((
         row['phase'] != 'published', row['result'] != 'published',
         row['branch'] != branch, row['worktree'] != str(worktree),

@@ -1075,7 +1075,7 @@ class OwnedScopePublicationRecoveryTests(ScopedGateFixture, unittest.TestCase):
                 self.connection, Path(self.repo), Path('/state'), self.repo,
             )
         self.assertTrue(recovered)
-        owner.assert_called_once()
+        self.assertEqual(owner.call_count, 2)  # 최초 검사와 차단 해제 transaction의 재검증.
         self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
         saved = self.connection.execute(
             "SELECT status, publication_remote_oid, worker_session_id FROM exec_plans "

@@ -827,6 +827,8 @@ _scope_reconciliation_effects_resume_owned_checkpoint_project_block = _bind_effe
         remote_branch_oid=lambda *args, **kwargs: remote_branch_oid(*args, **kwargs),
         validate_execplan_workspace_identity=lambda *args, **kwargs: validate_execplan_workspace_identity(*args, **kwargs),
         validate_managed_worktree=lambda *args, **kwargs: validate_managed_worktree(*args, **kwargs),
+        validate_blocked_agent_scope=lambda *args, **kwargs: validate_blocked_agent_scope(*args, **kwargs),
+        unmet_execplan_dependencies=lambda *args, **kwargs: unmet_execplan_dependencies(*args, **kwargs),
     ),
 )
 

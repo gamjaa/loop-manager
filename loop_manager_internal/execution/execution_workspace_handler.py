@@ -8,6 +8,7 @@ from loop_manager_internal.git import manager_git_journal
 from loop_manager_internal.git.managed_rebase_validation import RebaseStatus, valid_acceptance
 import sys
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
+from loop_manager_internal.recovery import checkpoint_ownership
 from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, RecoveryFailure, classify_exception
 from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind
 from loop_manager_internal.execution.execution_checkpoint import CheckpointAction, assess, observe
@@ -227,6 +228,9 @@ class WorkspaceHandler:
                 return self.ports._recover(
                     RecoveryReason.REMOTE_OID_UNCERTAIN,
                     'reactivated rebase candidate HEAD differs', context=context)
+            published_before = self.ports.state.connection.execute(
+                'SELECT * FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?',
+                (self.ports.identity.repo, context.plan.plan_id)).fetchone()
             if not self.ports._owned_checkpoint_remote(
                 context, row, remote_oid, current, pull_request,
             ):
@@ -235,6 +239,31 @@ class WorkspaceHandler:
                     '게시 checkpoint의 원격 OID 또는 재활성화 계보가 유효하지 않습니다.',
                     context=context,
                 )
+            published_after = self.ports.state.connection.execute(
+                'SELECT * FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?',
+                (self.ports.identity.repo, context.plan.plan_id)).fetchone()
+            if published_before != published_after:
+                return self.ports._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                    'checkpoint publication changed during ownership observation', context=context)
+            saved = current.snapshot or {}
+            if (row['publication_remote_oid'] and current.operation in {None, 'commit'}
+                    and not any(saved.get(key) for key in (
+                        'published_review_resume', 'blocked_resume', 'current_rebase_acceptance',
+                        'completed_rebase', 'rebase_completion', 'remote_adoption_scope'))):
+                receipt = checkpoint_ownership.publication_receipt(
+                    published_before, row['publication_remote_oid'])
+                if receipt is not None:
+                    self.ports.state.check_context(context)
+                    current = checkpoint.record(
+                        self.ports.identity.repo, context.plan.plan_id,
+                        expected_generation=current.generation, operation=current.operation,
+                        expected_head=current.expected_head, target_base_oid=current.target_base_oid,
+                        observed_remote_oid=current.observed_remote_oid,
+                        snapshot={**saved, 'published_review_resume': {
+                            'request_identity': receipt['request_identity'],
+                            'owner_oid': receipt['accepted_remote_oid'],
+                            'head': receipt['accepted_remote_oid']}},
+                    )
             if (current.operation is None
                     and valid_acceptance((current.snapshot or {}).get('current_rebase_acceptance'))):
                 observed, _ = self.ports._current_rebase_service(context).require_owned(checkpoint=current)

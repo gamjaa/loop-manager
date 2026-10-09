@@ -157,10 +157,8 @@ class BlockedCheckpointRepository:
             if (block['reason_code'], block['evidence']) == (request.reason_code, request.evidence):
                 return request
             history = json.loads(row['publication_history'])
-            history.append({'superseded_request': {key: row[key] for key in (
-                'request_identity', 'reason_code', 'evidence', 'phase', 'commit_identity',
-                'tree_oid', 'local_oid', 'published_oid', 'expected_remote_oid',
-                'branch', 'worktree', 'pr_url')}})
+            history.append({'superseded_request': {key: row[key] for key in row.keys()
+                if key not in {'publication_history', 'created_at', 'updated_at'}}})
             identity = request_identity(request.repo, request.plan_id, block['reason_code'],
                 block['evidence'], request.branch, request.worktree, block['release_fingerprint'], request.pr_url)
             self._update(request, request_identity=identity, reason_code=block['reason_code'],
@@ -214,11 +212,18 @@ class BlockedCheckpointRepository:
             release_fingerprint, pr_url,
         )
         current = self.connection.execute(
-            "SELECT request_identity FROM blocked_checkpoints "
+            "SELECT * FROM blocked_checkpoints "
             "WHERE repo = ? AND plan_id = ?",
             (repo, plan_id),
         ).fetchone()
-        if current is None or str(current[0]) != identity:
+        if current is None or str(current['request_identity']) != identity:
+            if current is not None and current['phase'] == 'published':
+                prior = {key: current[key] for key in current.keys()
+                         if key not in {'publication_history', 'created_at', 'updated_at'}}
+                history = json.loads(current['publication_history'])
+                history.append({'superseded_request': prior})
+                self._update(self._from_row(current),
+                             publication_history=json.dumps(history, sort_keys=True))
             self.connection.execute(
                 """
                 INSERT INTO blocked_checkpoints (
@@ -380,10 +385,17 @@ class BlockedCheckpointRepository:
         if current.phase not in {CheckpointPhase.PUBLISHED, CheckpointPhase.UNPUBLISHED}:
             return
         with self.connection:
+            row = scope_request_row(self.connection, request.repo, request.plan_id)
+            history = json.loads(row['publication_history'])
+            if current.phase is CheckpointPhase.PUBLISHED:
+                prior = {key: row[key] for key in row.keys()
+                         if key not in {'publication_history', 'created_at', 'updated_at'}}
+                history.append({'superseded_request': prior})
             self._update(
                 request, phase=CheckpointPhase.REQUESTED.value,
                 expected_remote_oid=expected_remote_oid, remote_observed=1,
                 result=None, unpublished_reason=None, retryable=0,
+                publication_history=json.dumps(history, sort_keys=True),
             )
 
     def record_rebased_publication(self, request: CheckpointRequest, head: str, tree: str) -> None:

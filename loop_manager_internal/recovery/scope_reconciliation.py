@@ -8,6 +8,7 @@ from loop_manager_internal.agents.scope_contracts import AgentScopeError
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.agents.scope_recovery import ignored_comparison_view
 from loop_manager_internal.git import rebase_block_reconciliation
+from loop_manager_internal.git import manager_git_journal
 from loop_manager_internal.recovery import blocked_plan_reconciliation
 from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 from loop_manager_internal.recovery import scoped_blocking
@@ -545,6 +546,8 @@ class ResumeOwnedCheckpointProjectBlockEffects:
     remote_branch_oid: Callable[..., object]
     validate_execplan_workspace_identity: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
+    validate_blocked_agent_scope: Callable[..., object]
+    unmet_execplan_dependencies: Callable[..., object]
 
 
 @dataclass(frozen=True)
@@ -611,12 +614,16 @@ def _resume_owned_checkpoint_project_block(effects: ResumeOwnedCheckpointProject
         or not projection_matches
         or plan['pr_url'] or project['pr_url']
         or int(plan['workspace_owned'] or 0) != WORKSPACE_OWNED
+        or effects.unmet_execplan_dependencies(connection, repo, plan_id)
     ):
         return False
     checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
         repo, plan_id,
     )
     snapshot = checkpoint.snapshot or {}
+    publication_before = connection.execute(
+        'SELECT * FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?',
+        (repo, plan_id)).fetchone()
     marker = snapshot.get('blocked_resume')
     review_marker = snapshot.get('published_review_resume')
     if review_marker is not None and not isinstance(review_marker, dict):
@@ -630,6 +637,10 @@ def _resume_owned_checkpoint_project_block(effects: ResumeOwnedCheckpointProject
                                        for entries in current.index.values()))
                 or not current.head):
             return False
+        if plan['agent_snapshot']:
+            effects.validate_blocked_agent_scope(
+                connection, repo_path, repo, str(project['base_branch']), worktree,
+                str(plan['path']), saved_plan=plan, require_safe_result=True)
         remote_oid = effects.remote_branch_oid(repo_path, branch)
         if effects.pr_for_branch(repo_path, branch) is not None:
             return False
@@ -644,7 +655,7 @@ def _resume_owned_checkpoint_project_block(effects: ResumeOwnedCheckpointProject
         else:
             before_head = str(
                 (review_marker.get('head') if isinstance(review_marker, dict) else None)
-                or snapshot.get('reactivated_from_head') or ''
+                or snapshot.get('reactivated_from_head') or plan['publication_remote_oid'] or ''
             )
             after_head = current.head
             target_base = str(snapshot.get('base_oid') or checkpoint.target_base_oid or '')
@@ -673,20 +684,19 @@ def _resume_owned_checkpoint_project_block(effects: ResumeOwnedCheckpointProject
             pushed_review or (
                 not marker and before_head == remote_oid
                 and (after_head == remote_oid or review_marker is not None)
-                and (checkpoint.expected_head == current.head or pending_review_commit)
-                and checkpoint.observed_remote_oid == remote_oid
+                and (checkpoint.expected_head in (None, current.head) or pending_review_commit)
+                and checkpoint.observed_remote_oid in (None, remote_oid)
                 and (not plan['publication_remote_oid']
                      or plan['publication_remote_oid'] == remote_oid)
             )
         )
         if direct_review:
             published = connection.execute(
-                'SELECT request_identity, phase, reason_code, branch, worktree, '
-                'accepted_remote_oid FROM blocked_checkpoints '
+                'SELECT * FROM blocked_checkpoints '
                 'WHERE repo = ? AND plan_id = ?', (repo, plan_id),
             ).fetchone()
+            published = checkpoint_ownership.publication_receipt(published, before_head)
             if (published is None or published['phase'] != 'published'
-                    or published['reason_code'] != BlockReasonCode.REVIEW_RETRY_EXHAUSTED.value
                     or published['branch'] != branch
                     or published['worktree'] != str(worktree)
                     or published['accepted_remote_oid'] != before_head
@@ -705,8 +715,10 @@ def _resume_owned_checkpoint_project_block(effects: ResumeOwnedCheckpointProject
         elif not target_base:
             return False
         if (
-            (checkpoint.expected_head != current.head and not pending_review_commit)
-            or (checkpoint.observed_remote_oid != remote_oid and not pushed_review)
+            (checkpoint.expected_head != current.head and not pending_review_commit
+             and not (direct_review and checkpoint.expected_head is None))
+            or (checkpoint.observed_remote_oid != remote_oid and not pushed_review
+                and not (direct_review and checkpoint.observed_remote_oid is None))
             or (not direct_review and not effects._direct_rebase_history_proven(
                 connection, repo_path, repo, plan_id, worktree, branch,
                 before_head, after_head, target_base,
@@ -719,7 +731,7 @@ def _resume_owned_checkpoint_project_block(effects: ResumeOwnedCheckpointProject
                 connection, repo_path, repo, plan_id, branch, worktree,
                 before_head, effects.git, before_head=current.head,
                 recorded_oid=before_head, require_live=False,
-                strict_observation=True,
+                strict_observation=True, allow_history=True,
             )
             live = effects.git(repo_path, 'ls-remote', '--heads', 'origin',
                        f'refs/heads/{branch}', check=False)
@@ -742,7 +754,7 @@ def _resume_owned_checkpoint_project_block(effects: ResumeOwnedCheckpointProject
                 remote_oid, effects.git,
                 before_head=current.head if direct_review else before_head,
                 recorded_oid=str(plan['publication_remote_oid'] or '') or None,
-                strict_observation=True,
+                strict_observation=True, allow_history=True,
             )
         if owned_oid is None:
             return False
@@ -751,12 +763,44 @@ def _resume_owned_checkpoint_project_block(effects: ResumeOwnedCheckpointProject
     except (OSError, RuntimeError, WorkspaceOwnershipError, ValueError):
         return False
     with runtime_state._transaction(connection):
+        if (not scoped_blocking.project_cause_matches(connection, block)
+                or dict(connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
+                                           (repo, plan_id)).fetchone()) != dict(plan)
+                or dict(connection.execute('SELECT * FROM projects WHERE repo = ?',
+                                           (repo,)).fetchone()) != dict(project)
+                or execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
+                    repo, plan_id) != checkpoint
+                or connection.execute('SELECT * FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?',
+                                      (repo, plan_id)).fetchone() != publication_before
+                or effects.capture_git_snapshot(worktree) != current
+                or effects.remote_branch_oid(repo_path, branch) != remote_oid
+                or effects.pr_for_branch(repo_path, branch) is not None
+                or effects.unmet_execplan_dependencies(connection, repo, plan_id)):
+            return False
+        if plan['agent_snapshot']:
+            effects.validate_blocked_agent_scope(
+                connection, repo_path, repo, str(project['base_branch']), worktree,
+                str(plan['path']), saved_plan=plan, require_safe_result=True)
+        if checkpoint_ownership.owned_remote_oid(
+                connection, repo_path, repo, plan_id, branch, worktree,
+                before_head if pushed_review else remote_oid, effects.git,
+                before_head=current.head if direct_review else before_head,
+                recorded_oid=before_head if pushed_review else str(plan['publication_remote_oid'] or '') or None,
+                require_live=not pushed_review, strict_observation=True, allow_history=True) is None:
+            return False
+        if pushed_review:
+            try:
+                if manager_git_journal.live_remote_branch_oid(effects.git, repo_path, branch) != remote_oid:
+                    return False
+            except (RuntimeError, OSError) as error:
+                raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY,
+                                      'checkpoint remote confirmation failed') from error
         if direct_review and review_marker is None:
             execution_checkpoint_state.ExecutionCheckpointRepository(connection).record(
                 repo, plan_id, expected_generation=checkpoint.generation,
-                operation=checkpoint.operation, expected_head=checkpoint.expected_head,
+                operation=checkpoint.operation, expected_head=checkpoint.expected_head or current.head,
                 target_base_oid=checkpoint.target_base_oid,
-                observed_remote_oid=checkpoint.observed_remote_oid,
+                observed_remote_oid=checkpoint.observed_remote_oid or remote_oid,
                 snapshot={**snapshot, 'published_review_resume': {
                     'request_identity': str(published['request_identity']),
                     'owner_oid': owned_oid, 'head': current.head,
