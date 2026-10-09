@@ -2,8 +2,9 @@
 
 <!--
 이 파일을 복사해 docs/requirements/[R-000] Title.md 형식으로 사용한다.
+새 Requirement를 만들기 직전에 프로젝트 루트에서 `python .agents/skills/specification-docs/scripts/next_requirement_id.py`를 실행하고 출력된 ID를 파일명과 첫 제목에 사용한다. 모델이 ID를 계산하지 않는다. 조회 결과는 예약이 아니므로 문서 생성 직전에 확인한다.
 파일명은 프로젝트 안에서 고유해야 하며 Requirement의 안정적인 식별자로 사용된다.
-Requirement는 제품에 원하는 변화와 완료 조건을 기록하는 순수 문서다.
+새 Requirement는 frontmatter 없이 제품에 원하는 변화와 완료 조건을 기록하는 순수 문서다. 기존 문서는 유효한 `id`·`title` frontmatter가 있으면 이를 원본으로 읽고, frontmatter가 없으면 첫 `# [R-ID] 제목`을 사용한다. 잘못되거나 불완전한 frontmatter를 다른 표현으로 대체하지 않으며 기존 문서에 frontmatter를 일괄 추가하지 않는다.
 docs/requirements/ 바로 아래에 저장한 모든 Requirement는 Planner 입력으로 사용된다.
 미결정 사항을 해소한 뒤 이 위치에 저장한다.
 관련 ExecPlan이 모두 실제 Merge되고 일반 Planner가 전체 Acceptance Criteria 충족을 확인한 뒤 Loop Manager가 일반 planning 게시에서 원문 그대로 archive/로 이동한다.

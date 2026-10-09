@@ -4,6 +4,7 @@
     "loop_manager.py",
     "loop_manager_internal/**",
     "tests/**",
+    "scripts/verify.json",
     "scripts/verify.sh",
     "scripts/verify.ps1",
     "scripts/copy-project-files.sh",
@@ -14,10 +15,12 @@
     "README.md",
     "docs/PLANS.md",
     "docs/PRODUCT.md",
+    "docs/ARCHITECTURE.md",
     "docs/FUTURE_IDEAS.md",
     "docs/*.template.md",
     "docs/AGENTS.*.md",
     ".agents/skills/specification-docs/SKILL.md",
+    ".agents/skills/specification-docs/scripts/**",
     "run.sh",
     "run.ps1"
   ]

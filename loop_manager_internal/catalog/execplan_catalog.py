@@ -16,6 +16,7 @@ import stat
 from types import MappingProxyType
 from typing import AbstractSet, Iterable, Mapping
 from loop_manager_internal.catalog import execplan_drafts, manager_sources
+from loop_manager_internal.catalog.frontmatter import parse_frontmatter as _parse_shared_frontmatter
 
 
 PRIORITIES = frozenset({"critical", "high", "normal", "low"})
@@ -188,36 +189,9 @@ class ExecPlanCatalogError(RuntimeError):
 
 def parse_frontmatter(text: str) -> dict[str, object]:
     """Parse the deliberately small frontmatter subset used by ExecPlans."""
-
-    lines = text.replace("\r\n", "\n").splitlines()
-    if not lines or lines[0] != "---":
+    values = _parse_shared_frontmatter(text)
+    if values is None:
         raise RuntimeError("ExecPlan frontmatter가 없습니다.")
-    try:
-        end = lines.index("---", 1)
-    except ValueError as error:
-        raise RuntimeError("ExecPlan frontmatter 종료 구분자가 없습니다.") from error
-    values: dict[str, object] = {}
-    current_list: str | None = None
-    for line in lines[1:end]:
-        if line.startswith("  - ") and current_list:
-            value = values[current_list]
-            assert isinstance(value, list)
-            value.append(line[4:].strip())
-            continue
-        if ":" not in line:
-            raise RuntimeError(f"유효하지 않은 frontmatter 줄입니다: {line}")
-        key, value = (part.strip() for part in line.split(":", 1))
-        if key in values:
-            raise RuntimeError(f"중복 frontmatter key입니다: {key}")
-        if value == "":
-            values[key] = []
-            current_list = key
-        elif value == "[]":
-            values[key] = []
-            current_list = None
-        else:
-            values[key] = value
-            current_list = None
     return values
 
 

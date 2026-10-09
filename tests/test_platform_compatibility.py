@@ -95,7 +95,12 @@ class PlatformCompatibilityTests(unittest.TestCase):
                 "print('검증 진입점')\nraise SystemExit(37)\n", encoding="utf-8")
             command = ([shutil.which("pwsh") or "powershell", "-NoProfile", "-File"]
                        if os.name == "nt" else ["bash"])
+            environment = {
+                key: value for key, value in os.environ.items()
+                if not key.startswith("LOOP_MANAGER_VERIFY_")
+            }
             result = subprocess.run([*command, str(launcher)], cwd=directory,
-                                    capture_output=True, encoding="utf-8", timeout=30)
+                                    env=environment, capture_output=True,
+                                    encoding="utf-8", timeout=30)
             self.assertEqual(result.returncode, 37, result.stdout + result.stderr)
             self.assertIn("검증 진입점", result.stdout)

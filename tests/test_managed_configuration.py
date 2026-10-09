@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr
@@ -24,6 +25,8 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
                 contents = (loop_manager.ROOT / script).read_text(encoding='utf-8')
                 self.assertNotIn('AGENTS.md', contents)
                 self.assertIn('.agents', contents)
+                self.assertIn('loop_manager_internal/catalog/frontmatter.py', contents)
+                self.assertIn('specification-docs/scripts/frontmatter.py', contents)
 
     def test_copy_project_files_preserves_existing_agents_bytes(self):
         # Manager verify exercises the executable scripts; Worker runs only
@@ -346,6 +349,19 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             skill = (target / ".agents/skills/specification-docs/SKILL.md").read_text(
                 encoding="utf-8"
             )
+            tool_path = ".agents/skills/specification-docs/scripts/next_requirement_id.py"
+            self.assertEqual((target / tool_path).read_bytes(),
+                             (loop_manager.ROOT / tool_path).read_bytes())
+            parser_path = ".agents/skills/specification-docs/scripts/frontmatter.py"
+            self.assertEqual(
+                (target / parser_path).read_bytes(),
+                (loop_manager.ROOT / "loop_manager_internal/catalog/frontmatter.py").read_bytes(),
+            )
+            query = subprocess.run(
+                [sys.executable, tool_path], cwd=target, check=False,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            )
+            self.assertEqual((query.returncode, query.stdout, query.stderr), (0, "R-001\n", ""))
             self.assertFalse((target / "AGENTS.md").exists())
             self.assertEqual((target / ".agents/skills/specification-docs/SKILL.md").read_bytes(),
                              (loop_manager.ROOT / ".agents/skills/specification-docs/SKILL.md").read_bytes())
