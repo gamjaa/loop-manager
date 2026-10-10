@@ -27,6 +27,8 @@ Requirement 제목·파일명이 바뀌어도 기존 sources 문자열을 유지
 
 `catalog/execplan_catalog.py`, `git/command_adapter.py`, `execution/plan_validation.py`, `planning/planning_document_relevance.py`·`requirement_retirement.py`와 기존 source 관계 소비자를 연결한다. Git snapshot과 worktree에서 G-230 원본 ID를 같은 방식으로 읽고 검증된 실제 경로를 반환하는 최소 경계를 공유한다. 기존 archive·retirement token과 관련성 비교에 실제 원문·identity를 결합하고 PRODUCT·ARCHITECTURE에 새 호환 계약을 반영한다.
 
+현재 G-230 구현의 `.agents/skills/specification-docs/scripts/next_requirement_id.py`가 제공하는 `requirement_identity`와 `catalog/frontmatter.py`를 재사용한다. Git blob과 worktree 원문에 같은 원본 식별 규칙을 적용하되 번호 조회 main을 실행하거나 별도 frontmatter/제목 파서를 복제하지 않는다. Skill의 독립 배포·읽기 전용 번호 후보 조회와 Manager의 source resolver 책임은 구분한다.
+
 ## Validation
 
 - 기존 catalog·source fingerprint·retirement·stage document fixture의 targeted unit test로 정확한 경로 우선, 활성 rename·archive 대응, frontmatter ID, 둘 다 참조된 중복·archive끼리 중복, 후보 부재/모호·관측 실패를 확인한다.
@@ -35,6 +37,7 @@ Requirement 제목·파일명이 바뀌어도 기존 sources 문자열을 유지
 ## Progress
 
 - [x] eb797d3a에서 정확한 경로와 같은 파일명 archive fallback만 존재하고 retirement 연결은 sources 문자열의 경로 일치에 의존함을 확인했다. 고유 R ID rename 해석은 없다. 구현·테스트 실행 없음.
+- [x] 2026-10-10 `50c699c8f9c149cecb0ddf9b081527942d8e2289`의 G-230 내용 보존 archive 이동, 실제 식별 helper·공유 parser·배포·조회 테스트를 정적으로 대조했다. source 관계 통합은 여전히 남아 있으며 구현·테스트·verify를 실행하지 않았다.
 - [ ] resolver와 관련 소비자 통합·targeted unit 검증
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
@@ -42,3 +45,4 @@ Requirement 제목·파일명이 바뀌어도 기존 sources 문자열을 유지
 
 - complexity medium: 기존 조회·관계·지문 경계에 동일 해석을 연결하며 새 정책 선택은 없다. risk high: 다른 문서로 source를 바꾸거나 연결을 놓치면 잘못된 구현·Requirement 보관이 발생한다. 원문·이력 보존과 모호함 거부를 유지하고 잘못 게시된 이동은 Git 원문을 이용한 수동 복구가 필요하다.
 - 자동 rename을 게시하기 전에 관계 보존을 먼저 구현한다. G-194의 source 필터도 이 경계를 재사용하며 별도 조회 정책을 만들지 않는다.
+- 2026-10-10 일반 planning snapshot token `19fb19af9ec3c45123d02e88db5e03423d8e58891eaba8b483fab8f32289626b`와 원본 hash `b054ac7db4e2ad563d1884e437944f4d2a88d3d9022261eaaaf2ebfb1a0a3dcd`를 확인해 현재 helper 재사용 방향만 보강했다. G-230은 동일 ID·sources·목표의 archive 이동이므로 삭제 목표 대체나 dependency 제거 대상이 아니다. 기존 ID·경로·metadata·수행 기록과 G-230 선행 Merge를 보존하며 archive 자체를 검증 성공으로 기록하지 않는다.
