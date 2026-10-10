@@ -2662,6 +2662,7 @@ _revision_execplan_input_fingerprint = _bind_effects(
         _execplan_input_fingerprint=lambda *args, **kwargs: _execplan_input_fingerprint(*args, **kwargs),
         _execplan_input_paths=lambda *args, **kwargs: _execplan_input_paths(*args, **kwargs),
         git=lambda *args, **kwargs: git(*args, **kwargs),
+        git_bytes=lambda *args, **kwargs: git_bytes(*args, **kwargs),
     ),
 )
 
@@ -2669,6 +2670,7 @@ _revision_execplan_source_fingerprint = _bind_effects(
     plan_validation._revision_execplan_source_fingerprint, lambda: plan_validation.RevisionExecplanSourceFingerprintEffects(
         _execplan_input_fingerprint=lambda *args, **kwargs: _execplan_input_fingerprint(*args, **kwargs),
         git=lambda *args, **kwargs: git(*args, **kwargs),
+        git_bytes=lambda *args, **kwargs: git_bytes(*args, **kwargs),
     ),
 )
 
@@ -3399,6 +3401,7 @@ requirement_archive_snapshot = _bind_effects(
         _requirement_archive_tree=lambda *args, **kwargs: _requirement_archive_tree(*args, **kwargs),
         _revision_execplan_catalog=lambda *args, **kwargs: _revision_execplan_catalog(*args, **kwargs),
         _validate_dependency_graph=lambda *args, **kwargs: _validate_dependency_graph(*args, **kwargs),
+        git_bytes=lambda *args, **kwargs: git_bytes(*args, **kwargs),
     ),
 )
 
@@ -3683,6 +3686,7 @@ _stable_work_reason = _bind_effects(
         catalog_schedule_decision=lambda *args, **kwargs: catalog_schedule_decision(*args, **kwargs),
         git=lambda *args, **kwargs: git(*args, **kwargs),
         is_loop_manager_repository=lambda *args, **kwargs: is_loop_manager_repository(*args, **kwargs),
+        git_bytes=lambda *args, **kwargs: git_bytes(*args, **kwargs),
     ),
 )
 
@@ -3926,6 +3930,7 @@ _ExecutionLifecyclePorts = _bind_effects(
         mutable_ready_snapshot=lambda *args, **kwargs: mutable_ready_snapshot(*args, **kwargs),
         validate_planner_result=lambda *args, **kwargs: validate_planner_result(*args, **kwargs),
         _assert_mutable_ready_snapshot_current=lambda *args, **kwargs: _assert_mutable_ready_snapshot_current(*args, **kwargs),
+        git_bytes=lambda *args, **kwargs: git_bytes(*args, **kwargs),
         _agent_profile=lambda *args, **kwargs: _agent_profile(*args, **kwargs),
         _current_rebase_service=lambda *args, **kwargs: _current_rebase_service(*args, **kwargs),
         _git_operation_entries=lambda *args, **kwargs: _git_operation_entries(*args, **kwargs),

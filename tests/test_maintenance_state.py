@@ -150,6 +150,22 @@ class DocumentDraftTest(unittest.TestCase):
             document_drafts.source_relationships(self.database, str(self.repo), target),
         )
 
+    def test_renamed_requirement_keeps_existing_source_relationship(self):
+        source = "docs/requirements/[R-027] Original.md"
+        renamed = "docs/requirements/[R-027] Renamed.md"
+        self.database.execute(
+            "INSERT INTO exec_plans (repo, plan_id, path, title, sources, "
+            "depends_on, priority, content_hash, status) "
+            "VALUES (?, 'G-302', 'docs/plans/[G-302] Requirement.md', "
+            "'Requirement', ?, '[]', 'normal', 'hash', 'READY')",
+            (str(self.repo), json.dumps([source])),
+        )
+        relationships = document_drafts.source_relationships(
+            self.database, str(self.repo), renamed,
+            requirement_documents={renamed: b"# [R-027] Renamed\n"},
+        )
+        self.assertEqual(json.loads(relationships), [["G-302", [source]]])
+
     def test_approved_listing_keeps_draft_after_its_own_plan_is_published(self):
         draft = self._create()
         approved = self.drafts.decide(

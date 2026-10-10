@@ -41,6 +41,22 @@ class ArchiveSnapshotTests(unittest.TestCase):
         self.assertEqual(snapshot.related_status,
                          ((SOURCE, (("G-001", "IMPLEMENTING"), ("G-002", "READY"))),))
 
+    def test_renamed_requirement_keeps_old_source_relation(self):
+        original = "docs/requirements/[R-001] Original.md"
+        renamed = "docs/requirements/[R-001] Renamed.md"
+        snapshot = archive.calculate(
+            base_oid="base-1",
+            catalog={"G-001": {"sources": [original]},
+                     "G-002": {"sources": ["docs/PRODUCT.md"]}},
+            states={"G-001": "READY", "G-002": "IMPLEMENTING"},
+            active_requirements=(renamed,), archived_requirements=frozenset(),
+            current_plan_id="G-002", known_statuses=STATUSES,
+            requirement_documents={renamed: "# [R-001] Renamed\n"},
+        )
+        self.assertEqual(snapshot.candidates, ())
+        self.assertEqual(snapshot.related_status,
+                         ((renamed, (("G-001", "READY"),)),))
+
     def test_valid_catalog_source_delta_overrides_old_cache(self):
         snapshot = self.calculate(
             {"G-001": {"sources": [SOURCE]}, "G-002": {"sources": [OTHER]}},

@@ -41,13 +41,30 @@ class StableWorkReasonBoundaryTest(unittest.TestCase):
 
     def test_remote_requirement_and_planner_confirmation_gate_completion(self):
         connection, repo = self._connection()
-        requirement = b"docs/requirements/[R-031] Waiting.md"
+        old_source = "docs/requirements/[R-031] Original.md"
+        requirement_path = "docs/requirements/[R-031] Waiting.md"
+        requirement = requirement_path.encode()
+        connection.execute(
+            "UPDATE exec_plans SET sources = ? WHERE repo = ?",
+            (json.dumps([old_source]), repo),
+        )
+        oid = "1" * 40
+
+        def git_bytes(_repo, operation, *args):
+            if operation == "ls-tree":
+                return f"100644 blob {oid}\t{requirement_path}\0".encode()
+            if operation == "cat-file":
+                return b"# [R-031] Waiting\n"
+            raise AssertionError((operation, args))
+
         with mock.patch("loop_manager.git") as git_command, mock.patch(
             "loop_manager._planning_input_fingerprint", return_value="cycle-one"
         ), mock.patch(
             "loop_manager._specification_input_fingerprint", return_value="spec-one"
         ), mock.patch(
             "loop_manager._git_tree_entries", return_value={requirement: (b"blob", b"oid")}
+        ), mock.patch(
+            "loop_manager.git_bytes", side_effect=git_bytes
         ):
             git_command.return_value.stdout = "base-sha\n"
             snapshot = loop_manager._stable_work_reason(

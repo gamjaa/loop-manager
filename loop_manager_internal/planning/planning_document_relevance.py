@@ -5,7 +5,9 @@ from pathlib import Path
 import re
 import stat
 
+from loop_manager_internal.catalog import requirement_sources
 from loop_manager_internal.catalog.execplan_catalog import parse_execplan_text
+from loop_manager_internal.git.command_adapter import revision_requirement_documents
 
 
 def _blob(git, repository: Path, revision: str, path: str) -> str | None:
@@ -58,7 +60,7 @@ def _declaration(git, repository: Path, revision: str, path: str) -> dict[str, o
 def relevant_document_changes(
     git, repository: Path, worktree: Path, old: str, new: str,
     edited_paths: list[str], catalog_rows, target_plan_ids=(),
-    *, include_active_requirements: bool = False,
+    *, include_active_requirements: bool = False, git_bytes=None,
 ) -> tuple[str, ...]:
     """Compare remote plan inputs and, when requested, active requirements."""
     changed = set(git(repository, "diff", "--name-only", "-z", old, new, "--",
@@ -83,6 +85,38 @@ def relevant_document_changes(
                 "docs/PLANS.md"}
     declarations = []
     dependency_ids: set[str] = set()
+    requirement_documents: dict[str, dict[str, bytes]] = {}
+    resolved_requirement_paths: dict[str, dict[str, str | None]] = {}
+
+    def requirement_docs(revision: str) -> dict[str, bytes]:
+        if revision not in requirement_documents:
+            requirement_documents[revision] = (
+                revision_requirement_documents(git_bytes, repository, revision)
+                if git_bytes is not None else {}
+            )
+        return requirement_documents[revision]
+
+    def add_sources(revision: str, sources) -> None:
+        paths = resolved_requirement_paths.setdefault(revision, {})
+        for raw_source in sources:
+            source = str(raw_source)
+            if source.startswith("manager:"):
+                continue
+            if not (source.startswith("docs/requirements/")
+                    and source.count("/") == 2 and git_bytes is not None):
+                relevant.add(source)
+                continue
+            result = requirement_sources.resolve_requirement_source(
+                source, requirement_docs(revision), allow_archive=True,
+            )
+            if result.status is requirement_sources.ResolutionStatus.AMBIGUOUS:
+                raise RuntimeError(
+                    f"ExecPlan source가 모호합니다: {source} ({', '.join(result.candidates)})"
+                )
+            resolved_path = result.path if result.status is requirement_sources.ResolutionStatus.RESOLVED else None
+            paths[source] = resolved_path
+            relevant.add(resolved_path or source)
+
     for plan_id in ids:
         previous_path = old_paths.get(plan_id)
         current_path = new_paths.get(plan_id)
@@ -108,7 +142,7 @@ def relevant_document_changes(
         for revision, path in ((old, previous_path), (new, current_path)):
             declaration = _declaration(git, repository, revision, path)
             declarations.append((revision, declaration))
-            relevant.update(str(source) for source in declaration["sources"] if not str(source).startswith("manager:"))
+            add_sources(revision, declaration["sources"])
             dependency_ids.update(str(value) for value in declaration["depends_on"])
     old_dependencies = _plan_paths(git, repository, old, dependency_ids)
     new_dependencies = _plan_paths(git, repository, new, dependency_ids)
@@ -122,6 +156,10 @@ def relevant_document_changes(
             counterpart = (new_dependencies if revision == old else old_dependencies).get(dependency_id)
             if counterpart:
                 relevant.add(counterpart)
+    local_requirement_documents = (
+        requirement_sources.worktree_requirement_documents(worktree)
+        if plan_paths else {}
+    )
     for path in plan_paths:
         file = worktree / path
         try:
@@ -133,7 +171,21 @@ def relevant_document_changes(
             )
         except (OSError, UnicodeError, RuntimeError):
             continue  # The ordinary Planner validation reports incomplete files.
-        relevant.update(str(source) for source in parsed["sources"] if not str(source).startswith("manager:"))
+        for source in parsed["sources"]:
+            source = str(source)
+            if source.startswith("manager:"):
+                continue
+            if source.startswith("docs/requirements/") and source.count("/") == 2:
+                result = requirement_sources.resolve_requirement_source(
+                    source, local_requirement_documents, allow_archive=True,
+                )
+                if result.status is requirement_sources.ResolutionStatus.AMBIGUOUS:
+                    raise RuntimeError(
+                        f"ExecPlan source가 모호합니다: {source} ({', '.join(result.candidates)})"
+                    )
+                relevant.add(result.path or source)
+            else:
+                relevant.add(source)
         for dependency in parsed["depends_on"]:
             row = rows.get(str(dependency))
             if row is not None:
@@ -150,6 +202,20 @@ def relevant_document_changes(
         path for path in changed & relevant
         if _content_changed(git, repository, old, new, path)
     }
+    if git_bytes is not None:
+        by_source: dict[str, dict[str, str | None]] = {}
+        for revision, paths in resolved_requirement_paths.items():
+            for source, path in paths.items():
+                by_source.setdefault(source, {})[revision] = path
+        for paths in by_source.values():
+            previous_path, current_path = paths.get(old), paths.get(new)
+            if previous_path and current_path and previous_path != current_path:
+                changed_inputs.discard(previous_path)
+                changed_inputs.discard(current_path)
+                previous = requirement_docs(old).get(previous_path)
+                current = requirement_docs(new).get(current_path)
+                if previous != current:
+                    changed_inputs.add(current_path)
     for plan_id in ids:
         before, after = old_paths.get(plan_id), new_paths.get(plan_id)
         if before and after and before != after:

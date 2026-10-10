@@ -30,6 +30,15 @@ class DocumentProtocolTests(TestCase):
         self.assertFalse(documents.documentary(changed))
         self.assertTrue(documents.documentary(changed[:3]))
 
+    def test_relevance_resolves_renamed_requirement_source(self):
+        source = 'docs/requirements/[R-001] Original.md'
+        renamed = 'docs/requirements/[R-001] Renamed.md'
+        relevant = documents.related_paths(
+            'docs/plans/[G-001] Plan.md', (source,), (renamed, 'src/app.py'),
+            requirement_documents={renamed: b'# [R-001] Renamed\n'},
+        )
+        self.assertEqual(relevant, (renamed,))
+
     def test_assessment_requires_complete_unambiguous_evidence(self):
         value = dict(relevant=True, implementation='satisfied', plan_text=None,
                      evidence='현재 구현이 변경된 조건을 충족하며 검증은 별도 확인한다.')
@@ -204,6 +213,32 @@ class DocumentPhaseTests(ExecutionFixture, TestCase):
         self.assertIsNone(documents.refresh(effects, self.state, ExecutionCheckpointRepository(self.connection),
             self.handler._identity, context, current, current, ['docs/requirements/Other.md']))
         effects.run_agent.assert_not_called()
+
+    def test_refresh_reassesses_a_renamed_requirement_at_its_current_path(self):
+        context = self.review_context()
+        previous = replace(
+            self.handler._definition_snapshot,
+            sources=('docs/requirements/[R-001] Original.md',),
+        )
+        renamed = 'docs/requirements/[R-001] Renamed.md'
+        oid = '1' * 40
+        effects = self.document_effects()
+
+        def git_bytes(_repo, operation, *args):
+            if operation == 'ls-tree':
+                return f'100644 blob {oid}\t{renamed}\0'.encode()
+            if operation == 'cat-file':
+                return b'# [R-001] Renamed\n'
+            raise AssertionError((operation, args))
+
+        effects.git_bytes.side_effect = git_bytes
+        item = documents.refresh(
+            effects, self.state, ExecutionCheckpointRepository(self.connection),
+            self.handler._identity, context, previous, previous, [renamed],
+        )
+        self.assertIsNotNone(item)
+        self.assertEqual(item['paths'], [renamed])
+        effects.run_agent.assert_called_once()
 
     def test_identical_proposal_finishes_without_publication(self):
         context = self.review_context()

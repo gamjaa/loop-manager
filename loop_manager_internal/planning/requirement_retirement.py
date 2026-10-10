@@ -10,6 +10,7 @@ from loop_manager_internal.application.result_normalization import bind_identity
 from dataclasses import dataclass
 import hashlib
 import json
+from loop_manager_internal.catalog import requirement_sources
 from loop_manager_internal.storage.manual_work_state import live_requirement_paths
 import os
 from pathlib import Path, PurePosixPath
@@ -25,6 +26,7 @@ from loop_manager_internal.storage.requirement_judgment_state import (
 SPECIFICATIONS = ("docs/PRODUCT.md", "docs/ARCHITECTURE.md")
 
 SOURCE = re.compile(r"docs/requirements/[^/\\]+\.md\Z")
+ARCHIVED_SOURCE = re.compile(r"docs/requirements/archive/[^/\\]+\.md\Z")
 def _judgment_result(text: str):
     normalized = normalize_markers(text, ("REQUIREMENT_JUDGMENTS",))
     if re.search(r"(?m)^REQUIREMENT_JUDGMENTS:", normalized) is None:
@@ -131,6 +133,29 @@ def _sources(value: object, plan_id: str) -> tuple[str, ...]:
     return tuple(parsed)
 
 
+def _resolved_sources(value: object, plan_id: str,
+                      documents: dict[str, bytes]) -> tuple[str, ...]:
+    resolved = []
+    for source in _sources(value, plan_id):
+        if source in {"docs/PRODUCT.md", "manager:verify-inputs"}:
+            continue
+        try:
+            result = requirement_sources.resolve_requirement_source(
+                source, documents, allow_archive=True,
+            )
+        except requirement_sources.RequirementSourceLookupError as error:
+            raise RetirementError(str(error)) from error
+        if result.status is requirement_sources.ResolutionStatus.AMBIGUOUS:
+            raise RetirementError(
+                f"ExecPlan source가 모호합니다: {source} ({', '.join(result.candidates)})"
+            )
+        if result.status is requirement_sources.ResolutionStatus.MISSING:
+            raise RetirementError(f"ExecPlan source가 없습니다: {source}")
+        assert result.path is not None
+        resolved.append(result.path)
+    return tuple(resolved)
+
+
 def _criteria(contents: bytes) -> tuple[str, ...]:
     try:
         lines = contents.decode("utf-8").splitlines()
@@ -183,6 +208,8 @@ class RequirementRetirementPort:
             self.git, repository, revision, "docs/requirements", "docs/PRODUCT.md",
             "docs/ARCHITECTURE.md",
         )
+        if not any(SOURCE.fullmatch(path) for path in tree):
+            return
         rows = list(self.connection.execute(
             "SELECT * FROM exec_plans WHERE repo = ? ORDER BY plan_id", (repo,),
         ))
@@ -196,14 +223,42 @@ class RequirementRetirementPort:
         draft_paths = {str(row["target_path"]) for row in drafts}
         from loop_manager_internal.storage.execplan_draft_state import pending_ids
         plan_drafts = pending_ids(self.connection, repo)
-        manual_sources=live_requirement_paths(self.connection,repo)
+        manual_source_paths = live_requirement_paths(self.connection, repo)
+        documents: dict[str, bytes] = {}
+        for candidate, (mode, oid) in tree.items():
+            if SOURCE.fullmatch(candidate) is None and ARCHIVED_SOURCE.fullmatch(candidate) is None:
+                continue
+            if mode not in {"100644", "100755"}:
+                raise RetirementError(f"Requirement가 일반 파일이 아닙니다: {candidate}")
+            try:
+                documents[candidate] = self.git.run_bytes(
+                    repository, "cat-file", "blob", oid,
+                )
+            except (RuntimeError, OSError) as error:
+                raise RetirementError(f"Requirement source를 읽을 수 없습니다: {candidate}") from error
+        manual_sources = _resolved_sources(
+            json.dumps(sorted(manual_source_paths)), "manual work", documents,
+        )
+        resolved_rows = {
+            str(row["plan_id"]): _resolved_sources(
+                row["sources"], str(row["plan_id"]), documents,
+            )
+            for row in rows
+        }
+        resolved_cancellations = {
+            str(row["plan_id"]): _resolved_sources(
+                row["sources"], str(row["plan_id"]), documents,
+            )
+            for row in cancellations
+        }
         for path, (mode, oid) in sorted(tree.items()):
             if not SOURCE.fullmatch(path):
                 continue
             if mode not in {"100644", "100755"}:
                 raise RetirementError(f"Requirement가 일반 파일이 아닙니다: {path}")
-            related = [row for row in rows if path in _sources(row["sources"], str(row["plan_id"]))]
-            canceled = [row for row in cancellations if path in _sources(row["sources"], str(row["plan_id"]))]
+            related = [row for row in rows if path in resolved_rows[str(row["plan_id"])]]
+            canceled = [row for row in cancellations
+                        if path in resolved_cancellations[str(row["plan_id"])] ]
             if canceled or any(str(row["status"]) != "MERGED" for row in related):
                 continue
             if any(str(row["plan_id"]) in plan_drafts for row in related):

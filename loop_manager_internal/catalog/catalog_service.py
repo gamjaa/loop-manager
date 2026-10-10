@@ -174,10 +174,23 @@ def revision_execplan_snapshot(
         documents[relative_path] = effects.git_bytes(
             repo, "cat-file", "blob", object_id.decode("ascii")
         )
+    from loop_manager_internal.catalog.requirement_sources import RequirementSourceLookupError
+    try:
+        requirement_documents = command_adapter.requirement_documents_from_tree(
+            tree,
+            lambda object_id: effects.git_bytes(
+                repo, "cat-file", "blob", object_id,
+            ),
+        )
+    except RequirementSourceLookupError as error:
+        raise execplan_catalog.ExecPlanCatalogError(
+            str(error), code="source-lookup-failed", path=error.path,
+        ) from error
     return execplan_catalog.snapshot_from_documents(
         documents,
         validate_sources=True,
         available_regular_paths=frozenset(regular_paths),
+        requirement_documents=requirement_documents,
         invalid_plan_entries=invalid_plan_entries,
         revision_sha=revision_sha,
         archive_conflict_plan_ids=archive_conflict_plan_ids,

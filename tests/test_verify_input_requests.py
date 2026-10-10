@@ -183,8 +183,10 @@ class VerifyInputRequestTest(unittest.TestCase):
         self.assertEqual(revision_document_or_none(git, Path('.'), SHA, manager_sources.SOURCE),
                          manager_sources.source_content(manager_sources.SOURCE))
         self.assertEqual(stored_requirement_sources([{'plan_id':'G-001', 'sources':json.dumps([manager_sources.SOURCE])}]), ())
-        effects = plan_validation.RevisionExecplanSourceFingerprintEffects(git=git,
-            _execplan_input_fingerprint=lambda entries: hashlib.sha256(repr(entries).encode()).hexdigest())
+        effects = plan_validation.RevisionExecplanSourceFingerprintEffects(
+            git=git, git_bytes=git,
+            _execplan_input_fingerprint=lambda entries: hashlib.sha256(repr(entries).encode()).hexdigest(),
+        )
         first = plan_validation._revision_execplan_source_fingerprint(effects, Path('.'), SHA,
             {'sources':json.dumps([manager_sources.SOURCE])})
         with mock.patch.object(manager_sources, 'RULE', 'Changed rule'):

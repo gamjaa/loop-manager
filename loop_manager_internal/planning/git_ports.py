@@ -242,6 +242,7 @@ class _PlanningGitPorts:
             self._effects.git, self._repo_path, worktree, old, target,
             edited_paths, catalog_rows, target_plan_ids,
             include_active_requirements=include_active_requirements,
+            git_bytes=self._effects.git_bytes,
         )
 
     def validate_managed_worktree(self, worktree: Path) -> None:

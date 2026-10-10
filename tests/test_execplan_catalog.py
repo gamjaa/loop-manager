@@ -407,11 +407,22 @@ class ExecPlanCatalogSnapshotTest(unittest.TestCase):
                 archive_conflict_plan_ids=archive_conflict_plan_ids,
             )
 
+        oid = "1" * 40
+
+        def git_bytes(_repo, operation, *args):
+            if operation == "ls-tree":
+                return f"100644 blob {oid}\t{source}\0".encode()
+            if operation == "cat-file":
+                return b"# Independent Requirement\n"
+            raise AssertionError((operation, args))
+
         with mock.patch.object(
             loop_manager, "revision_execplan_snapshot", side_effect=snapshot
         ), mock.patch.object(
             loop_manager, "_requirement_archive_tree",
             return_value={source.encode(): ()},
+        ), mock.patch.object(
+            loop_manager, "git_bytes", side_effect=git_bytes,
         ):
             self.assertEqual(
                 loop_manager.requirement_archive_candidates(

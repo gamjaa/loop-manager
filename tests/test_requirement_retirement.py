@@ -163,6 +163,47 @@ class RequirementRetirementTest(unittest.TestCase):
         self.connection.execute("UPDATE exec_plans SET status='MERGED' WHERE plan_id='G-002'")
         self.assertEqual(len(self.port.pending("repo", self.root, "base")), 1)
 
+    def test_renamed_requirement_keeps_old_source_relation_and_moves_current_path(self):
+        renamed = "docs/requirements/[R-001] Renamed Feature.md"
+        contents = (
+            b"# [R-001] Renamed Feature\n\n"
+            b"## Acceptance Criteria\n\n- Works end to end\n"
+        )
+        self.git.files.pop(SOURCE)
+        self.git.files[renamed] = contents
+        self.add_plan(status="READY", source=SOURCE)
+        self.assertEqual(self.port.pending("repo", self.root, "base"), ())
+        self.assertEqual(self.port.fulfilled_moves("repo", self.root, "base"), ())
+
+        self.connection.execute("UPDATE exec_plans SET status='MERGED'")
+        (item,) = self.port.pending("repo", self.root, "base")
+        self.assertEqual(item.path, renamed)
+        self.port.record("repo", self.port.validate_result(
+            "repo", self.root, "base", self.judgment_line(item),
+        ))
+        (self.root / renamed).parent.mkdir(parents=True, exist_ok=True)
+        (self.root / renamed).write_bytes(contents)
+        archived = "docs/requirements/archive/[R-001] Renamed Feature.md"
+        self.assertEqual(
+            self.port.stage_moves("repo", self.root, "base", self.root),
+            (renamed, archived),
+        )
+
+    def test_renamed_requirement_stays_live_for_manual_work_source(self):
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+
+        renamed = "docs/requirements/[R-001] Renamed Feature.md"
+        contents = b"# [R-001] Renamed Feature\n\n## Acceptance Criteria\n\n- Works\n"
+        self.git.files.pop(SOURCE)
+        self.git.files[renamed] = contents
+        groups = ManualWorkRepository(self.connection)
+        groups.create(
+            "repo", "start", "manual/branch", (), "head", "base",
+            members=("G-009",),
+            documents=({"plan": {"sources": [SOURCE]}},),
+        )
+        self.assertEqual(self.port.pending("repo", self.root, "base"), ())
+
     def test_final_merge_defers_then_reuses_judgment_and_preserves_bytes(self):
         self.add_plan(status="PR_OPEN")
         self.assertEqual(self.port.pending("repo", self.root, "base"), ())
@@ -613,7 +654,7 @@ class RequirementRetirementTest(unittest.TestCase):
         reads = self.git.blob_reads
         self.assertEqual(tuple(item.path for item in self.port.pending("repo", self.root, "base")),
                          (second,))
-        self.assertEqual(self.git.blob_reads, reads + 1)
+        self.assertEqual(self.git.blob_reads, reads + 3)
         self.assertEqual(self.port.judgments.get("repo", SOURCE).outcome, "uncertain")
 
 
@@ -777,6 +818,29 @@ class RetirementPublicationManifestTest(unittest.TestCase):
 
 
 class RequirementAuditWaitReasonTest(unittest.TestCase):
+    def test_renamed_active_requirement_keeps_old_execplan_relation(self):
+        connection = sqlite3.connect(":memory:")
+        connection.row_factory = sqlite3.Row
+        self.addCleanup(connection.close)
+        connection.executescript("""
+            CREATE TABLE projects(repo TEXT PRIMARY KEY, planning_error TEXT);
+            CREATE TABLE exec_plans(repo TEXT, plan_id TEXT, title TEXT, status TEXT,
+                depends_on TEXT, pr_url TEXT, sources TEXT);
+            INSERT INTO projects VALUES ('repo', NULL);
+        """)
+        connection.execute(
+            "INSERT INTO exec_plans VALUES (?, ?, ?, ?, ?, ?, ?)",
+            ("repo", "G-001", "Feature", "PR_OPEN", "[]", "", json.dumps([SOURCE])),
+        )
+        renamed = "docs/requirements/[R-001] Renamed.md"
+        snapshot = work_exhaustion.collect(
+            connection, "repo", cycle="cycle", active_requirements=(renamed,),
+            requirement_documents={renamed: b"# [R-001] Renamed\n"},
+        )
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertIn("관련 계획 또는 archive 확인", snapshot.requirements[0]["reason"])
+
     def test_uncertain_historical_archive_does_not_delay_project_completion(self):
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row

@@ -13,7 +13,7 @@ from loop_manager_internal.planning.planning_rebase import (
     rebase_planning_worktree,
 )
 from loop_manager_internal.planning.planning_document_relevance import relevant_document_changes
-from tests.support.catalog import write_execplan
+from tests.support.catalog import execplan_header, write_execplan
 
 
 class PlanningGitDouble:
@@ -454,6 +454,66 @@ class PlanningDocumentRelevanceTest(unittest.TestCase):
                 git, root, root, "old", "new", [current.relative_to(root).as_posix()], (),
                 include_active_requirements=True,
             ), ())
+
+    def test_requirement_rename_preserves_relation_and_reports_only_changed_content(self):
+        import hashlib
+
+        source = "docs/requirements/[R-001] Original.md"
+        renamed = "docs/requirements/[R-001] Renamed.md"
+        plan_path = "docs/plans/[G-118] Current.md"
+        plan_text = (
+            execplan_header("G-118", "Current", sources=(source,))
+            + "\n\n## Purpose\n\nFixture.\n"
+        )
+        contents = {
+            "old": {source: b"# [R-001] Original\n"},
+            "new": {renamed: b"# [R-001] Original\n"},
+        }
+        oid_contents = {}
+
+        def git_bytes(_repo, command, *args):
+            if command == "ls-tree":
+                revision = args[3]
+                records = []
+                for path, value in contents[revision].items():
+                    oid = hashlib.sha1(value).hexdigest()
+                    oid_contents[oid] = value
+                    records.append(f"100644 blob {oid}\t{path}".encode() + b"\0")
+                return b"".join(records)
+            if command == "cat-file":
+                return oid_contents[args[-1]]
+            raise AssertionError((command, args))
+
+        def run_revision(contents_by_revision):
+            def git(_repo, *args, check=True):
+                if args[:3] == ("diff", "--name-only", "-z"):
+                    return SimpleNamespace(
+                        stdout=source + "\0" + renamed + "\0", returncode=0,
+                    )
+                if args[:2] == ("ls-tree", "-r"):
+                    return SimpleNamespace(stdout=plan_path + "\0", returncode=0)
+                if args[:1] == ("show",):
+                    return SimpleNamespace(stdout=plan_text, returncode=0)
+                if args[:2] == ("rev-parse", "--verify"):
+                    revision, path = args[2].split(":", 1)
+                    if path == plan_path:
+                        value = b"same plan"
+                    else:
+                        value = contents_by_revision[revision].get(path)
+                    return SimpleNamespace(
+                        stdout=hashlib.sha1(value).hexdigest() if value is not None else "",
+                        returncode=0 if value is not None else 1,
+                    )
+                raise AssertionError(args)
+
+            return relevant_document_changes(
+                git, Path("/repo"), Path("/repo"), "old", "new", [], (),
+                ("G-118",), git_bytes=git_bytes,
+            )
+
+        self.assertEqual(run_revision(contents), ())
+        contents["new"][renamed] = b"# [R-001] Renamed\n"
+        self.assertEqual(run_revision(contents), (renamed,))
 
     def test_content_preserving_dependency_archive_needs_no_recheck(self):
         with tempfile.TemporaryDirectory() as directory:

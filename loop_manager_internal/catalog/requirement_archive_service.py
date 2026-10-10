@@ -6,6 +6,7 @@ from loop_manager_internal.storage.project_state_adapter import KNOWN_EXECPLAN_S
 from loop_manager_internal.application.contracts import RequirementArchiveCollisionError
 from loop_manager_internal.application.contracts import RequirementArchiveError
 from loop_manager_internal.catalog import requirement_archive
+from loop_manager_internal.git import command_adapter
 from loop_manager_internal.runtime.contracts import GitLockError
 from pathlib import Path
 import json
@@ -161,6 +162,7 @@ class RequirementArchiveSnapshotEffects:
     _requirement_archive_tree: Callable[..., object]
     _revision_execplan_catalog: Callable[..., object]
     _validate_dependency_graph: Callable[..., object]
+    git_bytes: Callable[..., bytes]
 
 
 def requirement_archive_snapshot(
@@ -243,6 +245,16 @@ def requirement_archive_snapshot(
 
     tree = effects._requirement_archive_tree(repo_path, revision)
     try:
+        requirement_documents = command_adapter.revision_requirement_documents(
+            effects.git_bytes, repo_path, revision,
+        )
+    except GitLockError:
+        raise
+    except RuntimeError as error:
+        raise RequirementArchiveError(
+            f"Git revision Requirement source를 읽을 수 없습니다: {error}"
+        ) from error
+    try:
         snapshot = requirement_archive.calculate(
             base_oid=revision,
             catalog=catalog,
@@ -257,6 +269,7 @@ def requirement_archive_snapshot(
             current_plan_id=current_plan_id,
             unverified_historical_ids=frozenset(unverified_historical_ids),
             known_statuses=frozenset(KNOWN_EXECPLAN_STATUSES),
+            requirement_documents=requirement_documents,
             cache_versions={
                 plan_id: tuple(
                     row[field] if field in row.keys() else None

@@ -16,6 +16,7 @@ import stat
 from types import MappingProxyType
 from typing import AbstractSet, Iterable, Mapping
 from loop_manager_internal.catalog import execplan_drafts, manager_sources
+from loop_manager_internal.catalog import requirement_sources
 from loop_manager_internal.catalog.frontmatter import parse_frontmatter as _parse_shared_frontmatter
 
 
@@ -215,22 +216,64 @@ def _source_exists(
     *,
     allow_archive_fallback: bool,
     available_regular_paths: AbstractSet[str] | None = None,
+    requirement_documents: Mapping[str, str | bytes] | None = None,
 ) -> bool:
+    resolution = _source_lookup(
+        root, source, allow_archive_fallback=allow_archive_fallback,
+        available_regular_paths=available_regular_paths,
+        requirement_documents=requirement_documents,
+    )
+    return resolution is None or resolution.status is requirement_sources.ResolutionStatus.RESOLVED
+
+
+def _source_lookup(
+    root: Path | None,
+    source: str,
+    *,
+    allow_archive_fallback: bool,
+    available_regular_paths: AbstractSet[str] | None = None,
+    requirement_documents: Mapping[str, str | bytes] | None = None,
+) -> requirement_sources.RequirementSourceResolution | None:
     if source == manager_sources.SOURCE:
-        return True  # Registration is checked at Manager state/publication gates.
-    if available_regular_paths is not None:
-        return source in available_regular_paths or bool(
-            allow_archive_fallback and source != "docs/PRODUCT.md"
-            and requirement_archive_path(source) in available_regular_paths
+        return None  # Registration is checked at Manager state/publication gates.
+    if source == "docs/PRODUCT.md":
+        if available_regular_paths is not None:
+            return requirement_sources.RequirementSourceResolution(
+                requirement_sources.ResolutionStatus.RESOLVED if source in available_regular_paths
+                else requirement_sources.ResolutionStatus.MISSING, source,
+                source if source in available_regular_paths else None,
+            )
+        if root is not None:
+            exists = _is_regular_file(root / source)
+            return requirement_sources.RequirementSourceResolution(
+                requirement_sources.ResolutionStatus.RESOLVED if exists
+                else requirement_sources.ResolutionStatus.MISSING,
+                source, source if exists else None,
+            )
+        return None
+    if requirement_documents is None and root is not None:
+        requirement_documents = requirement_sources.worktree_requirement_documents(root)
+    if requirement_documents is not None:
+        return requirement_sources.resolve_requirement_source(
+            source, requirement_documents, allow_archive=allow_archive_fallback,
         )
+    if available_regular_paths is not None:
+        if source in available_regular_paths:
+            status, path = requirement_sources.ResolutionStatus.RESOLVED, source
+        elif allow_archive_fallback and requirement_archive_path(source) in available_regular_paths:
+            status, path = requirement_sources.ResolutionStatus.RESOLVED, requirement_archive_path(source)
+        else:
+            status, path = requirement_sources.ResolutionStatus.MISSING, None
+        return requirement_sources.RequirementSourceResolution(status, source, path)
     if root is None:
-        return True
-    if _is_regular_file(root / source):
-        return True
-    return bool(
-        allow_archive_fallback
-        and source != "docs/PRODUCT.md"
-        and _is_regular_file(root / requirement_archive_path(source))
+        return None
+    # The Requirement tree was read above; this branch is only reachable for
+    # a non-Requirement source path that cannot use the shared resolver.
+    exists = _is_regular_file(root / source)
+    return requirement_sources.RequirementSourceResolution(
+        requirement_sources.ResolutionStatus.RESOLVED if exists
+        else requirement_sources.ResolutionStatus.MISSING,
+        source, source if exists else None,
     )
 
 
@@ -242,6 +285,7 @@ def parse_execplan_text(
     require_priority: bool = False,
     validate_sources: bool = True,
     allow_archive_fallback: bool = True,
+    requirement_documents: Mapping[str, str | bytes] | None = None,
 ) -> dict[str, object]:
     """Parse one plan without consulting Git, SQLite, or external services."""
 
@@ -280,15 +324,17 @@ def parse_execplan_text(
             or re.fullmatch(r"docs/requirements/[^/\\]+\.md", source)
         ):
             raise RuntimeError(f"허용되지 않는 ExecPlan source입니다: {source}")
-        if (
-            validate_sources
-            and root is not None
-            and not _source_exists(
-                root,
-                source,
-                allow_archive_fallback=allow_archive_fallback,
+        if validate_sources and (root is not None or requirement_documents is not None):
+            resolution = _source_lookup(
+                root, source, allow_archive_fallback=allow_archive_fallback,
+                requirement_documents=requirement_documents,
             )
-        ):
+            if resolution is None or resolution.status is requirement_sources.ResolutionStatus.RESOLVED:
+                continue
+            if resolution.status is requirement_sources.ResolutionStatus.AMBIGUOUS:
+                raise RuntimeError(
+                    f"ExecPlan source가 모호합니다: {source} ({', '.join(resolution.candidates)})"
+                )
             raise RuntimeError(f"존재하지 않는 ExecPlan source입니다: {source}")
     if manager_sources.SOURCE in sources:
         manager_sources.validate_scope(text, sources)
@@ -496,6 +542,7 @@ def snapshot_from_documents(
     validate_sources: bool = False,
     allow_archive_fallback: bool = True,
     available_regular_paths: AbstractSet[str] | None = None,
+    requirement_documents: Mapping[str, str | bytes] | None = None,
     invalid_plan_entries: Mapping[str, str] | None = None,
     revision_sha: str | None = None,
     archive_conflict_plan_ids: AbstractSet[str] = frozenset(),
@@ -513,6 +560,8 @@ def snapshot_from_documents(
             f"{path} ({invalid_plan_entries[path]})",
             code="non-regular-plan", path=path,
         )
+    if validate_sources and requirement_documents is None and root is not None:
+        requirement_documents = requirement_sources.worktree_requirement_documents(root)
     entries: dict[str, ExecPlanCatalogEntry] = {}
     identities: dict[str, tuple[str, str]] = {}
     issues: list[CatalogIssue] = []
@@ -563,12 +612,30 @@ def snapshot_from_documents(
                     ) from error
                 if validate_sources:
                     for source in values["sources"]:
-                        if not _source_exists(root, source, allow_archive_fallback=allow_archive_fallback,
-                                              available_regular_paths=available_regular_paths):
-                            raise ExecPlanCatalogError(
-                                f"존재하지 않는 ExecPlan source입니다: {source} ({path})",
-                                code="missing-source", path=path, source=source,
+                        try:
+                            resolution = _source_lookup(
+                                root, source,
+                                allow_archive_fallback=allow_archive_fallback,
+                                available_regular_paths=available_regular_paths,
+                                requirement_documents=requirement_documents,
                             )
+                        except requirement_sources.RequirementSourceLookupError as error:
+                            raise ExecPlanCatalogError(
+                                str(error), code="source-lookup-failed",
+                                path=path, source=source,
+                            ) from error
+                        if resolution is None or resolution.status is requirement_sources.ResolutionStatus.RESOLVED:
+                            continue
+                        if resolution.status is requirement_sources.ResolutionStatus.AMBIGUOUS:
+                            raise ExecPlanCatalogError(
+                                f"ExecPlan source가 모호합니다: {source} "
+                                f"({', '.join(resolution.candidates)})",
+                                code="ambiguous-source", path=path, source=source,
+                            )
+                        raise ExecPlanCatalogError(
+                            f"존재하지 않는 ExecPlan source입니다: {source} ({path})",
+                            code="missing-source", path=path, source=source,
+                        )
                 continue
             raise ExecPlanCatalogError(
                 f"중복 ExecPlan id입니다: {plan_id} ({other_path}, {path})",
@@ -585,9 +652,23 @@ def snapshot_from_documents(
         entries[plan_id] = entry
         if validate_sources:
             for source in entry.sources:
-                exists = _source_exists(root, source, allow_archive_fallback=allow_archive_fallback,
-                                        available_regular_paths=available_regular_paths)
-                if not exists:
+                try:
+                    resolution = _source_lookup(
+                        root, source, allow_archive_fallback=allow_archive_fallback,
+                        available_regular_paths=available_regular_paths,
+                        requirement_documents=requirement_documents,
+                    )
+                except requirement_sources.RequirementSourceLookupError as error:
+                    reject(plan_id, path, "source-lookup-failed",
+                           str(error), source)
+                    continue
+                if resolution is None or resolution.status is requirement_sources.ResolutionStatus.RESOLVED:
+                    continue
+                if resolution.status is requirement_sources.ResolutionStatus.AMBIGUOUS:
+                    reject(plan_id, path, "ambiguous-source",
+                           f"ExecPlan source가 모호합니다: {source} ({', '.join(resolution.candidates)})",
+                           source)
+                else:
                     reject(plan_id, path, "missing-source",
                            f"존재하지 않는 ExecPlan source입니다: {source} ({path})", source)
 
@@ -673,12 +754,17 @@ def load_execplan_snapshot(
             for path in directory.iterdir():
                 if path.suffix == ".md" and not _is_regular_file(path):
                     invalid[path.relative_to(root).as_posix()] = "non-regular"
+    requirement_documents = (
+        requirement_sources.worktree_requirement_documents(root)
+        if validate_sources else None
+    )
     return snapshot_from_documents(
         documents,
         invalid_plan_entries=invalid,
         root=root,
         validate_sources=validate_sources,
         allow_archive_fallback=allow_archive_fallback,
+        requirement_documents=requirement_documents,
         isolate_errors=isolate_errors,
     )
 
