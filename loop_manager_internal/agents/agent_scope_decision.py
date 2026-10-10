@@ -158,22 +158,34 @@ def used_git_resources(*, role: str, phase: str, base_branch: str,
 def scoped_metadata(before: GitSnapshot, after: GitSnapshot,
                     resources: GitResources | None, *,
                     default_worktree: str | None = None,
+                    selected_worktree: str | None = None,
                     base_branch: str | None = None) -> tuple[GitSnapshot, GitSnapshot]:
     """Keep full snapshots for audit; project only the comparison operands."""
     if resources is None and default_worktree is None and not base_branch:
         return before, after
+    compare_default_registration = bool(
+        default_worktree and default_worktree != selected_worktree
+    )
+    default_was_registered = bool(
+        compare_default_registration and default_worktree in before.worktrees
+    )
     def project(snapshot):
         refs = ({key: value for key, value in snapshot.refs.items() if key in resources.refs}
                 if resources is not None else dict(snapshot.refs))
         worktrees = ({key: value for key, value in snapshot.worktrees.items()
                       if key in resources.worktrees or key == default_worktree}
                      if resources is not None else dict(snapshot.worktrees))
-        if default_worktree:
-            registration = worktrees.get(default_worktree)
-            if registration is not None:
+        if compare_default_registration:
+            if not default_was_registered:
+                worktrees.pop(default_worktree, None)
+            elif default_worktree in worktrees:
+                # The default checkout's current HEAD, branch and status are
+                # local inputs. Preserve its registration presence so a
+                # removed primary worktree still fails the scope check.
                 worktrees[default_worktree] = tuple(
-                    field for field in registration
-                    if not field.startswith(("HEAD=", "state="))
+                    field for field in worktrees[default_worktree]
+                    if not field.startswith(("HEAD=", "branch=", "state="))
+                    and field != "detached"
                 )
         if base_branch:
             refs.pop(f"refs/heads/{base_branch}", None)
@@ -195,7 +207,8 @@ def invocation_scope_digest(snapshot: GitSnapshot, *, role: str, phase: str,
     )
     _, projected = scoped_metadata(
         snapshot, snapshot, resources,
-        default_worktree=default_worktree, base_branch=base_branch,
+        default_worktree=default_worktree, selected_worktree=worktree_key,
+        base_branch=base_branch,
     )
     identity = "\0".join((role, phase, base_branch, branch or "", worktree_key,
                            default_worktree or ""))

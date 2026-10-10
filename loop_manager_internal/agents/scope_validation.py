@@ -284,6 +284,7 @@ def validate_agent_scope(
         scope_before, scope_after = agent_scope_decision.scoped_metadata(
             before, after, resources,
             default_worktree=external_key,
+            selected_worktree=str(_canonical_path(worktree)),
             base_branch=base_branch,
         )
         if resources is not None:
