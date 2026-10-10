@@ -23,6 +23,7 @@ _LINK_DEFINITION = re.compile(
     r"^([ \t]{0,3}\[[^\]\r\n]+\]:[ \t]*)(<[^>\r\n]*>|(?:\\.|[^\s])+)(.*)$"
 )
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
+_INDENTED_CODE = re.compile(r"^(?: {4}| {0,3}\t)")
 _USER_DECISION = re.compile(r"^(#{1,6})[ \t]+User Decision(?:[ \t]+#+)?[ \t]*$")
 _ANY_HEADING = re.compile(r"^(#{1,6})(?:[ \t]+|$)")
 _IGNORED_SOURCES = frozenset({"docs/PRODUCT.md", "manager:verify-inputs"})
@@ -258,6 +259,9 @@ def _rewrite_markdown_links(
             output.append(line)
             continue
         if decision_level is not None:
+            output.append(line)
+            continue
+        if _INDENTED_CODE.match(content) is not None:
             output.append(line)
             continue
 
@@ -514,54 +518,69 @@ def plan_requirement_corrections(
                 item.raw, after,
             )
 
-    final_requirements = dict(requirement_documents)
-    rename_map = {
-        correction.source_path: correction.target_path
-        for correction in proposed.values()
-        if correction.source_path != correction.target_path
-    }
-    for correction in proposed.values():
-        if correction.source_path != correction.target_path:
-            final_requirements.pop(correction.source_path, None)
-        final_requirements[correction.target_path] = correction.after
-
-    unsafe_renames: set[str] = set()
-    for source, before, error in source_observations:
-        if before is None or error is not None:
+    destinations: dict[str, list[str]] = {}
+    for path, correction in proposed.items():
+        destinations.setdefault(correction.target_path.casefold(), []).append(path)
+    for paths in destinations.values():
+        if len(paths) < 2:
             continue
-        try:
-            source_id = requirement_sources.source_requirement_id(source)
-        except ValueError:
-            source_id = None
-        if before.status is requirement_sources.ResolutionStatus.MISSING:
+        for path in paths:
+            proposed.pop(path)
+            deferred_reasons[path] = "여러 Requirement 교정의 목적지가 같아 모두 보류했습니다"
+
+    # Rebuild after every veto: removing one edit can make another source ambiguous.
+    while True:
+        final_requirements = dict(requirement_documents)
+        rename_map = {
+            correction.source_path: correction.target_path
+            for correction in proposed.values()
+            if correction.source_path != correction.target_path
+        }
+        for correction in proposed.values():
+            if correction.source_path != correction.target_path:
+                final_requirements.pop(correction.source_path, None)
+            final_requirements[correction.target_path] = correction.after
+
+        unsafe_renames: set[str] = set()
+        for source, before, error in source_observations:
+            if before is None or error is not None:
+                continue
+            try:
+                source_id = requirement_sources.source_requirement_id(source)
+            except ValueError:
+                source_id = None
+            if before.status is requirement_sources.ResolutionStatus.MISSING:
+                try:
+                    after = requirement_sources.resolve_requirement_source(
+                        source, final_requirements, allow_archive=True,
+                    )
+                except (requirement_sources.RequirementSourceLookupError, UnicodeError, ValueError):
+                    continue
+                if after.status is not requirement_sources.ResolutionStatus.MISSING:
+                    unsafe_renames.update(
+                        path for path, correction in proposed.items()
+                        if correction.new_id == source_id
+                    )
+                continue
+            if before.status is not requirement_sources.ResolutionStatus.RESOLVED:
+                continue
+            assert before.path is not None
+            expected = rename_map.get(before.path, before.path)
             try:
                 after = requirement_sources.resolve_requirement_source(
                     source, final_requirements, allow_archive=True,
                 )
-            except (requirement_sources.RequirementSourceLookupError, UnicodeError, ValueError):
+            except (requirement_sources.RequirementSourceLookupError, UnicodeError):
+                unsafe_renames.add(before.path)
                 continue
-            if after.status is not requirement_sources.ResolutionStatus.MISSING:
-                unsafe_renames.update(
-                    path for path, correction in proposed.items()
-                    if correction.new_id == source_id
-                )
-            continue
-        if before.status is not requirement_sources.ResolutionStatus.RESOLVED:
-            continue
-        assert before.path is not None
-        expected = rename_map.get(before.path, before.path)
-        try:
-            after = requirement_sources.resolve_requirement_source(
-                source, final_requirements, allow_archive=True,
-            )
-        except (requirement_sources.RequirementSourceLookupError, UnicodeError):
-            unsafe_renames.add(before.path)
-            continue
-        if after.status is not requirement_sources.ResolutionStatus.RESOLVED or after.path != expected:
-            unsafe_renames.add(before.path)
-    for path in unsafe_renames:
-        if path in rename_map:
-            proposed.pop(path, None)
+            if after.status is not requirement_sources.ResolutionStatus.RESOLVED or after.path != expected:
+                unsafe_renames.add(before.path)
+
+        vetoes = unsafe_renames.intersection(rename_map)
+        if not vetoes:
+            break
+        for path in vetoes:
+            proposed.pop(path)
             deferred_reasons[path] = "기존 source를 rename 뒤 같은 문서로 유일하게 확인할 수 없어 보류했습니다"
 
     # Existing source targets can veto a path change after the complete preview.

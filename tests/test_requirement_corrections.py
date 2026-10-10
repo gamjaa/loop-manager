@@ -133,6 +133,7 @@ class RequirementCorrectionEditingTest(unittest.TestCase):
             "# [R-002] Owner\n\n"
             "[requirement](%5BR-001%5D%20Old.md)\n"
             "`[code](%5BR-001%5D%20Old.md)`\n"
+            "    [example](%5BR-001%5D%20Old.md)\n"
         )
         plan_text = (
             "---\n"
@@ -175,6 +176,7 @@ class RequirementCorrectionEditingTest(unittest.TestCase):
         )
         self.assertIn("owner: preserve me", corrected[new].decode())
         self.assertIn("%5BR-001%5D%20New%20Title.md", corrected[owner].decode())
+        self.assertIn("    [example](%5BR-001%5D%20Old.md)\n", corrected[owner].decode())
         self.assertIn("../requirements/%5BR-001%5D%20New%20Title.md#scope", corrected[plan].decode())
         self.assertIn(f"  - {old}\n", corrected[plan].decode())
         self.assertIn("## User Decision\n\n[keep](../requirements/%5BR-001%5D%20Old.md)", corrected[plan].decode())
@@ -199,6 +201,51 @@ class RequirementCorrectionEditingTest(unittest.TestCase):
         text = dict(result.updated_documents)[new].decode()
         self.assertIn("id: R-009\ntitle: B\nowner: preserve me", text)
         self.assertIn("# [R-009] B", text)
+
+    def test_duplicate_proposed_destinations_defer_all_without_overwriting_bodies(self):
+        a = "docs/requirements/[R-020] A.md"
+        b = "docs/requirements/[R-020] B.md"
+        c = "docs/requirements/[R-020] C.md"
+        documents = {
+            a: frontmatter_requirement("R-020", "Common", "R-020"),
+            b: frontmatter_requirement("R-020", "Common", "R-020"),
+            c: requirement("R-020", "C"),
+        }
+
+        result = requirement_corrections.plan_requirement_corrections(
+            documents, referenced_sources=(a, b), references_complete=True,
+            first_seen_order={a: 1, b: 2, c: 3},
+        )
+
+        self.assertEqual(
+            [(item.source_path, item.target_path) for item in result.corrections],
+            [(c, "docs/requirements/[R-021] C.md")],
+        )
+        self.assertNotIn("docs/requirements/[R-020] Common.md", dict(result.updated_documents))
+        deferred = {item.path: item.reason for item in result.deferred}
+        self.assertIn("목적지", deferred[a])
+        self.assertIn("목적지", deferred[b])
+
+    def test_source_is_revalidated_after_a_missing_id_veto(self):
+        old = "docs/requirements/[R-001] Old.md"
+        duplicate = "docs/requirements/[R-001] B.md"
+        missing_source = "docs/requirements/[R-002] Missing.md"
+        documents = {
+            old: frontmatter_requirement("R-001", "New", "R-001"),
+            duplicate: requirement("R-001", "B"),
+        }
+
+        result = requirement_corrections.plan_requirement_corrections(
+            documents, referenced_sources=(old, missing_source), references_complete=True,
+            first_seen_order={old: 1, duplicate: 2},
+        )
+
+        self.assertEqual(result.corrections, ())
+        self.assertEqual(result.updated_documents, ())
+        deferred = {item.path: item.reason for item in result.deferred}
+        self.assertIn("source", deferred[old])
+        self.assertIn("source", deferred[duplicate])
+        self.assertIn("미확인", deferred[missing_source])
 
     def test_unusable_title_does_not_consume_an_id_or_partially_edit_the_document(self):
         a = "docs/requirements/[R-010] A.md"
