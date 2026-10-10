@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import configparser
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -20,10 +22,50 @@ class ManagedConfig:
     refactoring_review_interval: int = 20
     verify_timeout_seconds: int = 600
     verify_parallelism: str | int = "auto"
+    fast_mode_values: tuple[tuple[str, str], ...] = ()
 
     @property
     def telegram_enabled(self) -> bool:
         return bool(self.telegram_token)
+
+
+fast_mode_settings: ContextVar[ManagedConfig | None] = ContextVar("agent_fast_mode_settings", default=None)
+
+
+@contextmanager
+def fast_mode_scope(config: ManagedConfig):
+    current = fast_mode_settings.get()
+    if current is not None and current.path.resolve() == config.path.resolve():
+        yield
+        return
+    token = fast_mode_settings.set(config)
+    try:
+        yield
+    finally:
+        fast_mode_settings.reset(token)
+
+
+def provider_fast_mode(path: Path, provider: str) -> bool | None:
+    if provider not in {"codex", "claude"}:
+        raise ManagedConfigError(f"지원하지 않는 Agent provider입니다: {provider}")
+    snapshot = fast_mode_settings.get()
+    if snapshot is not None and snapshot.path.resolve() == path.expanduser().resolve():
+        raw = dict(snapshot.fast_mode_values).get(provider, "")
+    else:
+        # profile을 직접 지정한 단독 호출은 설정 파일 없이도 기존 기본값을 사용한다.
+        parser = configparser.ConfigParser(interpolation=None)
+        try:
+            parser.read(path, encoding="utf-8")
+        except (OSError, UnicodeError, configparser.Error) as error:
+            raise ManagedConfigError(f"설정 파일 형식이 올바르지 않습니다: {path}") from error
+        raw = parser._sections.get(provider, {}).get("fast_mode", "")
+    normalized = raw.strip().lower()
+    if not normalized:
+        return None
+    try:
+        return configparser.ConfigParser.BOOLEAN_STATES[normalized]
+    except KeyError as error:
+        raise ManagedConfigError(f"[{provider}] fast_mode는 boolean 또는 공란이어야 합니다.") from error
 
 
 def _setting(
@@ -134,4 +176,6 @@ def load_managed_config(path: Path) -> ManagedConfig:
         refactoring_review_interval=refactoring_review_interval,
         verify_timeout_seconds=verify_timeout_seconds,
         verify_parallelism=verify_parallelism,
+        fast_mode_values=tuple((provider, parser._sections.get(provider, {}).get("fast_mode", ""))
+                               for provider in ("codex", "claude")),
     )

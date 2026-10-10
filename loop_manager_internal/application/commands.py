@@ -6,7 +6,7 @@ from contextlib import closing, ExitStack
 from loop_manager_internal.application.contracts import ProjectRunKind, ProjectRunResult
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.agents.agent_invocation import InvocationContext
-from loop_manager_internal.config.managed_config import ManagedConfigError
+from loop_manager_internal.config.managed_config import ManagedConfigError, fast_mode_scope
 from loop_manager_internal.runtime import project_registry
 from loop_manager_internal.runtime.contracts import ProcessLockBusyError, RuntimeMutation
 from loop_manager_internal.runtime.process_lock import process_lock
@@ -271,7 +271,7 @@ def recover_local_environment(
         connection.commit()
         # Only request intake may overlap automatic execution. Commit its
         # short DB transaction before trying the automatic process lease.
-        with ExitStack() as stack:
+        with ExitStack() as stack, fast_mode_scope(config):
             try:
                 stack.enter_context(process_lock(state_dir, identity="recover:" + request.request_id))
             except ProcessLockBusyError:
@@ -456,35 +456,36 @@ def execute_runtime_command(
             runtime_mutation=runtime_mutation,
         )
     config = effects.load_managed_config(config_path)
-    if args.command == "init":
-        with closing(effects.connect_database(state_dir, create=True)) as connection, connection:
-            pass
-        effects.operation_print(f"상태 DB 초기화 완료: {state_dir / 'loop-manager.db'}")
-        return 0
-    if args.command == "config":
-        return effects.configure_registry(args, state_dir, config_path)
-    if args.command == "document-drafts":
-        return effects._document_drafts_command(args, state_dir, config_path)
-    if args.command == "manual":
-        if effects.manual_command is None:
-            raise RuntimeError('수동 명령 composition이 없습니다.')
-        return effects.manual_command(args, state_dir, config_path, runtime_mutation)
-    if args.command == "maintenance-review":
-        from uuid import uuid4
-        from loop_manager_internal.maintenance import tiered_review
-        repo = str(Path(args.repository).expanduser().resolve())
+    with fast_mode_scope(config):
+        if args.command == "init":
+            with closing(effects.connect_database(state_dir, create=True)) as connection, connection:
+                pass
+            effects.operation_print(f"상태 DB 초기화 완료: {state_dir / 'loop-manager.db'}")
+            return 0
+        if args.command == "config":
+            return effects.configure_registry(args, state_dir, config_path)
+        if args.command == "document-drafts":
+            return effects._document_drafts_command(args, state_dir, config_path)
+        if args.command == "manual":
+            if effects.manual_command is None:
+                raise RuntimeError('수동 명령 composition이 없습니다.')
+            return effects.manual_command(args, state_dir, config_path, runtime_mutation)
+        if args.command == "maintenance-review":
+            from uuid import uuid4
+            from loop_manager_internal.maintenance import tiered_review
+            repo = str(Path(args.repository).expanduser().resolve())
+            with closing(effects.connect_database(state_dir)) as connection, connection:
+                if not connection.execute("SELECT 1 FROM projects WHERE repo = ? AND registered = 1", (repo,)).fetchone():
+                    raise ValueError("전체 정밀 점검은 등록된 프로젝트만 요청할 수 있습니다.")
+                tiered_review.ensure_schema(connection)
+                connection.execute("INSERT INTO tiered_maintenance_requests VALUES (?, ?) "
+                    "ON CONFLICT(repo) DO UPDATE SET request_id = excluded.request_id", (repo, uuid4().hex))
+                connection.commit()
+            effects.operation_print(f"전체 정밀 점검 요청 저장: {repo}; 다음 안전한 작업 선택 경계에서 실행합니다.")
+            return 0
         with closing(effects.connect_database(state_dir)) as connection, connection:
-            if not connection.execute("SELECT 1 FROM projects WHERE repo = ? AND registered = 1", (repo,)).fetchone():
-                raise ValueError("전체 정밀 점검은 등록된 프로젝트만 요청할 수 있습니다.")
-            tiered_review.ensure_schema(connection)
-            connection.execute("INSERT INTO tiered_maintenance_requests VALUES (?, ?) "
-                "ON CONFLICT(repo) DO UPDATE SET request_id = excluded.request_id", (repo, uuid4().hex))
-            connection.commit()
-        effects.operation_print(f"전체 정밀 점검 요청 저장: {repo}; 다음 안전한 작업 선택 경계에서 실행합니다.")
-        return 0
-    with closing(effects.connect_database(state_dir)) as connection, connection:
-        agent_invocation_state.InvocationRepository(connection).reconcile_interrupted(state_dir=state_dir)
-        return effects.run_registered_projects(
-            connection, state_dir, config,
-            **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
-        )
+            agent_invocation_state.InvocationRepository(connection).reconcile_interrupted(state_dir=state_dir)
+            return effects.run_registered_projects(
+                connection, state_dir, config,
+                **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
+            )

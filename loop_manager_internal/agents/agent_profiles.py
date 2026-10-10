@@ -12,6 +12,7 @@ from pathlib import Path
 import re
 
 from loop_manager_internal.agents.agent_invocation import AgentProfile
+from loop_manager_internal.config.managed_config import provider_fast_mode
 
 
 def provider_profile(
@@ -125,6 +126,7 @@ def validate_provider_profiles(
 ) -> None:
     """Validate every configured role before an Agent state transition."""
 
+    provider_fast_mode(config_path, provider)
     for role_name in ("planner", "planner_check", "maintenance_planner", "reviewer"):
         provider_profile(
             config_path,
@@ -361,6 +363,7 @@ def validate_provider_runtime(
 
     if provider not in AGENT_PROVIDERS:
         raise RuntimeError(f"지원하지 않는 Agent provider입니다: {provider}")
+    provider_fast_mode(config_path, provider)
     executable = "codex" if provider == "codex" else "claude"
     label = "Codex" if provider == "codex" else "Claude"
     if not shutil.which(executable):

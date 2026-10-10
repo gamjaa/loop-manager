@@ -19,6 +19,11 @@ verify_parallelism = auto
 token =
 chat_id =
 
+[codex]
+; true: Fast 요청, false: Fast 끄기, 공란·생략: CLI 기본 설정 상속.
+; Fast 사용에는 추가 비용 또는 구독 사용량 증가가 발생할 수 있다.
+fast_mode =
+
 [codex.models]
 frontier = gpt-6-astra
 strong = gpt-6.1-sol
@@ -43,6 +48,10 @@ level6 = strong,high
 level7 = strong,xhigh
 ; 마지막 단계도 Sol 6.1 xhigh를 사용한다.
 level8 = strong,xhigh
+
+[claude]
+; 동일하게 on/off 또는 CLI 기본 설정 상속을 선택한다.
+fast_mode =
 
 [claude.models]
 ; Opus 5.5: Claude Code >= 2.1.280, Sonnet 5.5: >= 2.1.284.

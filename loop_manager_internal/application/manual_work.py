@@ -14,6 +14,7 @@ from loop_manager_internal.runtime.resource_lock import resource_locks
 from loop_manager_internal.runtime.contracts import (ProcessLockBusyError, WorkspaceOwnershipError,
                                                      PublicationSafetyError, GitLockError)
 from loop_manager_internal.storage import work_claims
+from loop_manager_internal.config.managed_config import fast_mode_scope
 
 from loop_manager_internal.catalog import execplan_catalog
 from loop_manager_internal.git import manager_git_journal, workspace
@@ -51,9 +52,10 @@ class ManualProjectDriverEffects:
 def run_manual_project(effects: ManualProjectDriverEffects, connection, state_dir, repo,
                        config_path, base, allow_mismatch, **kwargs):
     config=effects.load_managed_config(config_path)
-    return effects.run_project_result(connection,state_dir,repo,config_path,base,allow_mismatch,
-        verify_timeout_seconds=config.verify_timeout_seconds,
-        refactoring_review_interval=config.refactoring_review_interval,**kwargs)
+    with fast_mode_scope(config):
+        return effects.run_project_result(connection,state_dir,repo,config_path,base,allow_mismatch,
+            verify_timeout_seconds=config.verify_timeout_seconds,
+            refactoring_review_interval=config.refactoring_review_interval,**kwargs)
 
 
 def validate_options(args):
