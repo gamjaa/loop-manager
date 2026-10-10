@@ -462,30 +462,38 @@ def resume_blocked_execplan_if_inputs_changed(
     if not worktree_changed and not remote_input_changed and plan["agent_result_snapshot"]:
         try:
             blocked_result = GitSnapshot.deserialize(str(plan["agent_result_snapshot"]))
-            current_candidate = effects.capture_git_snapshot(worktree)
-        except (KeyError, TypeError, ValueError, RuntimeError) as error:
-            effects._update_blocked_error(
-                connection,
-                repo,
-                str(plan["plan_id"]),
-                f"BLOCKED 현재 후보 snapshot을 확인할 수 없습니다: {error}",
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            # A legacy or incomplete result snapshot cannot establish that
+            # the live candidate changed. Keep the existing block and let the
+            # ordinary scope gate decide; malformed evidence is not a new
+            # failure cause and must not churn the durable notification.
+            blocked_result = None
+        if blocked_result is not None:
+            try:
+                current_candidate = effects.capture_git_snapshot(worktree)
+            except (KeyError, TypeError, ValueError, RuntimeError) as error:
+                effects._update_blocked_error(
+                    connection,
+                    repo,
+                    str(plan["plan_id"]),
+                    f"BLOCKED 현재 후보 snapshot을 확인할 수 없습니다: {error}",
+                )
+                return False
+            # ExecPlan/source fingerprints do not include code changes in the
+            # managed branch. Treat an edited, staged, or committed worktree
+            # candidate as new input; scope validation still decides whether it
+            # is safe to accept.
+            candidate_changed = (
+                current_candidate.branch,
+                current_candidate.head,
+                current_candidate.index,
+                current_candidate.dirty,
+            ) != (
+                blocked_result.branch,
+                blocked_result.head,
+                blocked_result.index,
+                blocked_result.dirty,
             )
-            return False
-        # ExecPlan/source fingerprints do not include code changes in the
-        # managed branch. Treat an edited, staged, or committed worktree
-        # candidate as new input; scope validation still decides whether it
-        # is safe to accept.
-        candidate_changed = (
-            current_candidate.branch,
-            current_candidate.head,
-            current_candidate.index,
-            current_candidate.dirty,
-        ) != (
-            blocked_result.branch,
-            blocked_result.head,
-            blocked_result.index,
-            blocked_result.dirty,
-        )
     if not worktree_changed and not candidate_changed and not remote_input_changed:
         try:
             effects.validate_blocked_agent_scope(

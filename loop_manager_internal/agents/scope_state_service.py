@@ -302,7 +302,7 @@ def validate_blocked_agent_scope(
     saved_plan = None,
     require_safe_result: bool = False,
     changed_candidate: bool = False,
-) -> GitSnapshot:
+) -> GitSnapshot | None:
     return scope_recovery.validate_blocked_agent_scope(
         connection,
         repo_path,

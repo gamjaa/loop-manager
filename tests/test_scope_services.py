@@ -173,7 +173,7 @@ class ScopeValidationTests(TestCase):
         return scope_validation.validate_agent_scope(role, Path('/managed'), before, after,
             selected_plan_path='docs/plans/[G-047] Runtime.md', effects=self.effects, **kwargs)
 
-    def test_blocked_scope_validation_returns_the_captured_snapshot(self):
+    def test_blocked_scope_validation_captures_only_for_changed_candidate(self):
         connection = runtime_connection()
         self.addCleanup(connection.close)
         current = snapshot(config={'local:remote.origin.url': ('origin',)})
@@ -186,6 +186,16 @@ class ScopeValidationTests(TestCase):
             ),
             connection, Path('/repo'), 'repo', 'main', Path('/managed'),
             'docs/plans/[G-047] Runtime.md',
+        )
+
+        self.assertIsNone(validated)
+        capture.assert_not_called()
+        validated = scope_state_service.validate_blocked_agent_scope(
+            scope_state_service.ValidateBlockedAgentScopeEffects(
+                _scope_recovery_effects=lambda: effects,
+            ),
+            connection, Path('/repo'), 'repo', 'main', Path('/managed'),
+            'docs/plans/[G-047] Runtime.md', changed_candidate=True,
         )
 
         self.assertEqual(validated, current)

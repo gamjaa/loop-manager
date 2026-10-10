@@ -803,7 +803,7 @@ def validate_blocked_agent_scope(
     require_safe_result: bool = False,
     changed_candidate: bool = False,
     effects: ScopeRecoveryEffects,
-) -> GitSnapshot:
+) -> GitSnapshot | None:
     """Revalidate preserved Agent output before a BLOCKED plan can resume."""
 
     project = effects.repository(connection).scope_owner(repo)
@@ -813,7 +813,7 @@ def validate_blocked_agent_scope(
         raise AgentScopeError("BLOCKED Agent 범위를 확인할 프로젝트가 없습니다.")
     serialized = project["agent_snapshot"]
     if not serialized:
-        return effects.capture_git_snapshot(worktree)
+        return effects.capture_git_snapshot(worktree) if changed_candidate else None
     role_name = str(project["agent_role"] or "")
     if role_name not in {"planner", "worker", "reviewer"}:
         raise AgentScopeError(
