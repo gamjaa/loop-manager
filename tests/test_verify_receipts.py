@@ -573,7 +573,7 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.assertEqual(self.state.row()['phase'], 'REVIEWING')
         self.assertNotIn('worker', self.calls)
 
-    def test_conflict_progress_only_preserves_rebase_state_and_real_conditions_block(self):
+    def test_conflict_progress_only_preserves_rebase_state_and_real_conditions_invalidate(self):
         text = '---\nid: G-047\n---\n## Purpose\nImplement\n## Progress\n- [ ] targeted test\n'
         original = ExecPlanBodyHash(text)
         previous = replace(self.definition, body_hash=str(original), body_text=text)
@@ -595,5 +595,10 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.assertNotIn('rebase', self.calls)
         self.effects.revision.body_hash.return_value = ExecPlanBodyHash(text.replace('targeted test', 'skip required validation'))
         result = self.handler.guard(self.context())
-        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
-        self.assertIn('ExecPlan 구현 입력', result.detail)
+        self.assertNotIsInstance(result, handlers.ExecutionOutcome)
+        self.assertTrue(result.resolving_rebase)
+        self.assertEqual(self.state.row()['worker_session_id'], 'saved')
+        for field in ('worker_result', 'verify_result', 'review_result', 'verify_token', 'review_token'):
+            self.assertIsNone(self.state.row()[field], field)
+        self.assertEqual(self.state.row()['definition_snapshot'], previous.serialize())
+        self.effects.blocking.block_active_execplan.assert_not_called()

@@ -225,6 +225,83 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         repeated = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
         self.assertEqual(set(repeated.withheld_plan_ids), {"G-001", "G-002"})
 
+    def test_missing_started_plan_reference_recovery_requires_published_judgment(self):
+        (self.repo / 'docs/requirements/R.md').unlink()
+        body = plan_text('G-002', 'Second').replace('docs/PRODUCT.md', 'docs/requirements/R.md')
+        self._remote_deletion(started=True, target_text=body)
+        self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', ever_started=1, "
+                                "worker_session_id='second-session' WHERE plan_id='G-002'")
+        self.connection.commit()
+        loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), 'main')
+        snapshot, validate = self._recovery_result()
+        held = self.connection.execute("SELECT evidence FROM execplan_catalog_holds WHERE plan_id='G-002'").fetchone()
+        self.assertIn('missing-source', {cause['code'] for cause in json.loads(held[0])['causes']})
+        payload = json.loads(snapshot.prompt_payload())
+        self.assertEqual(payload['deleted_goals'][0]['kind'], 'missing-plan')
+        self.assertTrue(payload['deleted_goals'][0]['plan_revision'])
+        self.assertNotIn('G-001', snapshot.by_id)
+        result = validate()
+        self.assertEqual(loop_manager.scoped_blocking.catalog_held_plan_ids(self.connection, str(self.repo)),
+                         {'G-001', 'G-002'})
+        git(self.repo, 'add', '.')
+        git(self.repo, 'commit', '-m', 'Recover missing prerequisite reference')
+        commit = git(self.repo, 'rev-parse', 'HEAD')
+        spec = loop_manager._specification_input_fingerprint(self.repo, commit)
+        planning = loop_manager._planning_input_fingerprint(self.repo, commit)
+        loop_manager.record_general_planning_publication_intent(
+            self.connection, str(self.repo), self.repo, result, commit, spec, planning)
+        with self.assertRaisesRegex(loop_manager.PlannerValidationError, 'push'):
+            loop_manager.publish_general_planning_batch(
+                self.connection, str(self.repo), self.repo, 'main', result, commit, spec, planning)
+        self.assertEqual(loop_manager.scoped_blocking.catalog_held_plan_ids(self.connection, str(self.repo)),
+                         {'G-001', 'G-002'})
+        git(self.repo, 'update-ref', 'refs/remotes/origin/main', commit)
+        self.assertEqual(loop_manager.recover_general_planning_batch(
+            self.connection, str(self.repo), self.repo, 'main'), 'applied')
+        self.assertEqual(self.connection.execute("SELECT status FROM exec_plans WHERE plan_id='G-002'").fetchone()[0],
+                         'PLAN_BLOCKED')
+        self.connection.execute("UPDATE projects SET phase='READY', planning_workspace_owned=0, "
+                                "planning_attempt_fingerprint=NULL WHERE repo=?", (str(self.repo),))
+        self.connection.commit()
+        for _ in range(2):
+            reconciled = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), 'main')
+            self.assertEqual(set(reconciled.withheld_plan_ids), {'G-001'})
+        repaired = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-002'").fetchone()
+        self.assertEqual((repaired['status'], repaired['worker_session_id']), ('IMPLEMENTING', 'second-session'))
+        missing = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone()
+        self.assertEqual(missing['worker_session_id'], 'saved')
+        self.assertFalse((self.repo / self.paths['G-001']).exists())
+        target = self.repo / self.paths['G-002']
+        target.write_text(target.read_text() + '\nUnreviewed G-001 reference.\n', encoding='utf-8')
+        git(self.repo, 'add', '.')
+        git(self.repo, 'commit', '-m', 'Change approved reference inputs')
+        git(self.repo, 'update-ref', 'refs/remotes/origin/main', git(self.repo, 'rev-parse', 'HEAD'))
+        reconciled = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), 'main')
+        self.assertEqual(set(reconciled.withheld_plan_ids), {'G-001', 'G-002'})
+
+    def test_missing_plan_reference_review_checks_ownership_and_retains_execution_hold(self):
+        self._remote_deletion(started=True)
+        self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', ever_started=1, "
+                                "worker_session_id='second-session' WHERE plan_id='G-002'")
+        self.connection.commit()
+        loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), 'main')
+        snapshot, validate = self._recovery_result(outcome='obsolete')
+        row = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-002'").fetchone()
+        self.assertEqual(row['status'], 'PLAN_BLOCKED')
+        self.assertEqual(row['worker_session_id'], 'second-session')
+        validate()
+        self.assertEqual(self.connection.execute("SELECT status FROM exec_plans WHERE plan_id='G-002'").fetchone()[0],
+                         'PLAN_BLOCKED')
+        self.connection.execute("UPDATE exec_plans SET pr_url='https://example.test/pr/2' WHERE plan_id='G-002'")
+        with self.assertRaisesRegex(loop_manager.PlannerValidationError, '실행 상태'):
+            loop_manager._assert_mutable_ready_snapshot_current(self.connection, snapshot)
+
+    def test_missing_plan_reference_cannot_be_removed_without_goal_judgment(self):
+        self._remote_deletion(started=True)
+        _, validate = self._recovery_result(outcome='obsolete', judgment=False)
+        with self.assertRaisesRegex(loop_manager.PlannerValidationError, '목표의 판단'):
+            validate()
+
     def test_remote_deletion_started_implementation_reference_is_held(self):
         body = plan_text("G-002", "Second").replace(
             "- Keep the boundary explicit.", "- Build on the G-001 implementation.")
@@ -246,7 +323,10 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         self.assertEqual(root["worker_session_id"], "saved")
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM execplan_cancellations").fetchone()[0], 0)
         snapshot = loop_manager.mutable_ready_snapshot(self.connection, str(self.repo), self.repo, self.base)
-        self.assertEqual(set(snapshot.by_id), {"G-007"})
+        second = self.connection.execute("SELECT pr_url FROM exec_plans WHERE plan_id='G-002'").fetchone()
+        self.assertEqual(set(snapshot.by_id), {"G-007"} if second[0] else {"G-002", "G-007"})
+        self.assertEqual(json.loads(snapshot.recovery_goals[0])["kind"], "missing-plan")
+        self.assertNotIn("G-001", snapshot.by_id)
         self.assertEqual(loop_manager.select_ready_execplan(self.connection, str(self.repo))["plan_id"], "G-007")
         for _ in range(2):
             result = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
@@ -286,7 +366,9 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         for _ in range(2):
             result = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
             self.assertEqual(set(result.withheld_plan_ids), {"G-001", "G-007", "G-008"})
-            self.assertIsNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-007'").fetchone())
+            self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-007'").fetchone())
+            snapshot = loop_manager.mutable_ready_snapshot(self.connection, str(self.repo), self.repo, self.base)
+            self.assertIn('G-007', snapshot.by_id)
             self.assertIsNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-008'").fetchone())
             self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM execplan_cancellations").fetchone()[0], 0)
             self.assertEqual(loop_manager.select_ready_execplan(self.connection, str(self.repo))["plan_id"], "G-002")
@@ -305,7 +387,7 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
     def test_remote_deletion_started_hold_allows_independent_planner_result(self):
         self._remote_deletion(started=True, new_plan=True)
         snapshot = loop_manager.mutable_ready_snapshot(self.connection, str(self.repo), self.repo, self.base)
-        self.assertEqual(set(snapshot.by_id), {"G-007"})
+        self.assertEqual(set(snapshot.by_id), {"G-002", "G-007"})
         (self.repo / "docs/plans/[G-008] Another.md").write_text(plan_text("G-008", "Another"), encoding="utf-8")
         result = loop_manager.validate_planner_result(self.repo, self.base, loop_manager.changed_files(self.repo),
             connection=self.connection, repo=str(self.repo), mutable_snapshot=snapshot)

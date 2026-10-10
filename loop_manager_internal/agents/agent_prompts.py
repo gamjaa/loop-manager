@@ -38,6 +38,7 @@ catalog에서 현재 입력과 겹치는 비종료 계획만 필요할 때 전�
 새 ExecPlan마다 priority를 기록하라. PR 전 snapshot의 계획은 같은 ID를 보존한 채 필요한 본문·metadata를 개정하라. 미착수 계획만 title에 맞게 rename하거나 삭제할 수 있다.
 snapshot의 started 계획도 PR 등록 전이면 개정할 수 있다. started 계획의 ID·경로와 기존 구현·검증 기록은 보존하고 새 조건의 미충족 부분을 구분하라. snapshot 밖의 기존 ExecPlan과 PR 등록·MERGED·archive 계획은 수정하지 마라. 삭제한 ID를 새 계획에 재사용하지 마라.
 deleted_goals가 있으면 보존된 원문·source와 최신 제품 목표를 비교해 snapshot 안의 영향 계획을 개정하라. 필요한 선행 목표는 새 ID 대체 계획 또는 목표를 보존하는 기존 계획으로 depends_on을 연결하라. 번호 공백이나 삭제·신규 추가 동시 관측을 ID 변경으로 추정하지 마라.
+missing-plan도 실행 보류와 별도로 복구 검토한다. 원문이 비어 있으면 plan_revision과 path로 git show를 조회해 과거 근거와 현재 부재를 구분하라. 삭제 작업 자체는 임의로 복원·취소하지 말고, snapshot 안의 참조 계획에 최신 source·dependency·목표에 따른 수정안을 작성하라. snapshot 밖의 삭제·PR·archive 계획은 읽기 전용 근거다.
 각 영향 계획의 Decision Log에 한 줄 DEPENDENCY_RECOVERY: JSON을 기록하라. 필드는 deleted_id, outcome(replaced|obsolete), replacement_ids(ID 배열), sources(판단에 사용한 최신 계획 source 경로 배열), reason(목표 보존 또는 최신 명세에서 불필요한 이유)다. 필요한 목표를 dependency 제거로 우회하지 마라. 의미·소유권이 불확실하면 해당 범위는 계속 보류하고 독립 작업만 계획하라.
 현재 PRODUCT/Requirement 범위 밖이지만 보존 가치가 있는 아이디어는 같은 계획 주기의 ExecPlan 범위나 미충족 작업의 근거로 사용하지 말고 docs/FUTURE_IDEAS.md에만 분리해 기록하라.
 docs/FUTURE_IDEAS.md의 목록 항목과 같은 내용을 새 ExecPlan의 제목이나 본문에 반복하지 마라.

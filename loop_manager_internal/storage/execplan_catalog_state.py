@@ -910,6 +910,13 @@ class DefinitionStateRepository:
                     "plan_id": key, "path": path, "content_hash": content_hash,
                     "causes": issues}, ensure_ascii=False, sort_keys=True)
                 for key, path, content_hash in pinned.snapshot.withheld}
+        for key, _revision, prior, _phase in expected.holds:
+            prior = json.loads(prior)
+            if key in held and prior.get("resolved_references"):
+                current = json.loads(held[key])
+                if current.get("content_hash") == prior.get("content_hash"):
+                    current["resolved_references"] = prior["resolved_references"]
+                    held[key] = json.dumps(current, ensure_ascii=False, sort_keys=True)
         previous = {item[0]: item[3] for item in expected.holds}
         resume = {key: previous.get(key) for key in held}
         for row in expected.rows:
@@ -1142,6 +1149,8 @@ class CatalogReconciliationService:
             observed_paths = {key: path for key, path, _hash in withheld}
             observed_paths.update({key: entry.path for key, entry in pinned.snapshot.all.items()})
             for goal in goals:
+                if goal.get("kind") == "missing-plan" and goal["id"] in pinned.snapshot.all:
+                    continue
                 for key in goal["affected_ids"]:
                     row = next((row for row in expected.rows if row.plan_id == key), None)
                     path = str(row.values[1]) if row is not None else observed_paths.get(key)

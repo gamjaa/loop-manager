@@ -18,6 +18,12 @@ class RemoteDeletion:
     evidence: str
 
 
+def revisable_row(row):
+    return (str(row["status"]) in {"READY", "IMPLEMENTING", "VERIFYING", "REVIEWING", "PUBLISHING", "PLAN_BLOCKED"}
+            and all(row[field] is None for field in ("pr_url", "pr_head_oid", "pr_conflict_head_oid", "pr_conflict_base_oid"))
+            and not int(row["pr_conflict_recovery"] or 0))
+
+
 def mutable_row(connection, repo, plan_id):
     row = connection.execute(
         "SELECT * FROM exec_plans WHERE repo=? AND plan_id=? AND " + _mutable_ready_cas_where(),
@@ -77,6 +83,15 @@ def reference_issues(connection, repo, repository, pinned, *, git_bytes):
                         and cause.get("source") == path):
                     affected.add(other)
                     paths.setdefault(other, evidence["path"])
+        approvals = dict(prior).get(key, {}).get("resolved_references", {})
+        for other, approval in approvals.items():
+            contents = latest_contents.get(other)
+            dependencies = next((json.loads(row["depends_on"]) for row in rows
+                                 if row["plan_id"] == other), ())
+            if (contents is not None and key not in dependencies
+                    and approval.get("path") == paths.get(other)
+                    and approval.get("content_hash") == catalog.plan_content_hash(contents)):
+                affected.discard(other)
         issues.extend(catalog.CatalogIssue(other, paths[other], "missing-plan-reference",
             f"삭제된 계획의 참조 근거를 보존합니다: {other} -> {key}", path)
             for other in sorted(affected - {key}))
@@ -139,13 +154,17 @@ def recovery_definitions(connection, repo, repository, pinned, *, git_bytes):
     """Adopt affected READY and new declarations under a hold for Planner repair."""
     affected = {key for raw in recovery_goals(connection, repo) for key in json.loads(raw)["affected_ids"]}
     affected.update(key for item in pinned.deletions for key in json.loads(item.evidence)["affected"])
+    affected.update(issue.plan_id for issue in pinned.snapshot.issues if issue.code == "missing-plan-reference")
     paths = {key: path for key, path, _hash in pinned.snapshot.withheld}
     paths.update({key: entry.path for key, entry in pinned.snapshot.all.items()})
     stored_ids = {str(row[0]) for row in connection.execute("SELECT plan_id FROM exec_plans WHERE repo=?", (repo,))}
     entries = []
     for key in sorted(affected):
-        if (key not in paths or (key in stored_ids and mutable_row(connection, repo, key) is None)
-                or any(issue.plan_id == key and issue.code != "missing-dependency" for issue in pinned.snapshot.issues)):
+        row = connection.execute("SELECT * FROM exec_plans WHERE repo=? AND plan_id=?", (repo, key)).fetchone()
+        if (key not in paths or (row is not None and not revisable_row(row))
+                or any(issue.plan_id == key and issue.code not in
+                       {"missing-dependency", "missing-plan-reference", "missing-source"}
+                       for issue in pinned.snapshot.issues)):
             continue
         path = paths[key]
         if pinned.regular_paths is None or path not in pinned.regular_paths:
@@ -164,7 +183,8 @@ def recovery_goals(connection, repo):
     goals = []
     rows = connection.execute("SELECT * FROM exec_plans WHERE repo=?", (repo,)).fetchall()
     observed_ids = {str(row["plan_id"]) for row in rows}
-    observed_ids.update(catalog_held_plan_ids(connection, repo))
+    held_ids = catalog_held_plan_ids(connection, repo)
+    observed_ids.update(held_ids)
     for cancelled in connection.execute(
         "SELECT * FROM execplan_cancellations WHERE repo=? AND recovery_evidence IS NOT NULL ORDER BY plan_id", (repo,),
     ):
@@ -184,11 +204,37 @@ def recovery_goals(connection, repo):
             goals.append(json.dumps({"id": key, "path": cancelled["path"],
                 "deletion_revision": cancelled["deletion_commit"], "evidence": cancelled["recovery_evidence"],
                 "affected_ids": affected}, ensure_ascii=False, sort_keys=True))
+    if not held_ids:
+        return tuple(goals)
+    holds = {str(row["plan_id"]): json.loads(row["evidence"]) for row in connection.execute(
+        "SELECT plan_id, evidence FROM execplan_catalog_holds WHERE repo=?", (repo,))}
+    for row in rows:
+        key, path = str(row["plan_id"]), str(row["path"])
+        held = holds.get(key, {})
+        if not any(cause["plan_id"] == key and cause["code"] == "missing-plan"
+                   for cause in held.get("causes", ())):
+            continue
+        affected = {cause["plan_id"] for evidence in holds.values()
+                    for cause in evidence.get("causes", ())
+                    if cause["code"] == "missing-plan-reference" and cause.get("source") == path}
+        affected.update(str(item["plan_id"]) for item in rows if key in json.loads(item["depends_on"]))
+        approvals = held.get("resolved_references", {})
+        affected.difference_update(str(item["plan_id"]) for item in rows
+            if key not in json.loads(item["depends_on"])
+            and approvals.get(str(item["plan_id"]), {}).get("path") == item["path"]
+            and approvals.get(str(item["plan_id"]), {}).get("content_hash") == item["content_hash"])
+        definition = json.loads(row["definition_snapshot"]) if row["definition_snapshot"] else {}
+        evidence = json.dumps({"text": definition.get("body_text") or "", "row": dict(row),
+                               "affected": sorted(affected), "resolved": {}},
+                              ensure_ascii=False, sort_keys=True)
+        goals.append(json.dumps({"id": key, "path": path, "kind": "missing-plan",
+            "deletion_revision": held.get("revision"), "evidence": evidence,
+            "affected_ids": sorted(affected)}, ensure_ascii=False, sort_keys=True))
     return tuple(goals)
 
 
 def recoverable_ids(connection, repo, held):
-    """Only deletion-goal holds may enter the ordinary mutable READY snapshot."""
+    """실행 보류와 참조 복구 검토 권한을 분리한다."""
     allowed = set()
     dependencies = {str(row["plan_id"]): json.loads(row["depends_on"]) for row in connection.execute(
         "SELECT plan_id, depends_on FROM exec_plans WHERE repo=?", (repo,))}
@@ -202,7 +248,8 @@ def recoverable_ids(connection, repo, held):
                 closure.add(key)
                 pending.extend(dependencies.get(key, ()))
         relevant = [item for item in causes if item["plan_id"] in closure]
-        if relevant and all(item["code"] in {"missing-dependency", "deleted-goal"} for item in relevant):
+        if relevant and all(item["code"] in {"missing-dependency", "deleted-goal", "missing-plan",
+                                             "missing-plan-reference", "missing-source"} for item in relevant):
             allowed.add(str(row["plan_id"]))
     affected = {key for raw in recovery_goals(connection, repo) for key in json.loads(raw)["affected_ids"]}
     return frozenset(allowed & affected & set(held))
@@ -257,6 +304,22 @@ def resolve_recovery(connection, snapshot, commit, revised_ids):
     for raw in snapshot.recovery_goals:
         goal = json.loads(raw)
         targets = set(goal["affected_ids"]) & snapshot.by_id.keys() & revised_ids
+        if goal.get("kind") == "missing-plan":
+            if not targets:
+                continue
+            row = connection.execute("SELECT evidence FROM execplan_catalog_holds WHERE repo=? AND plan_id=?",
+                                     (snapshot.repo, goal["id"])).fetchone()
+            if row is None:
+                raise PlannerValidationError("참조 복구의 삭제 보류 근거가 변경됐습니다.")
+            held = json.loads(row[0])
+            approvals = held.setdefault("resolved_references", {})
+            for key in targets:
+                plan = connection.execute("SELECT path, content_hash FROM exec_plans WHERE repo=? AND plan_id=?",
+                                          (snapshot.repo, key)).fetchone()
+                approvals[key] = {"revision": commit, "path": plan["path"], "content_hash": plan["content_hash"]}
+            connection.execute("UPDATE execplan_catalog_holds SET evidence=? WHERE repo=? AND plan_id=?",
+                (json.dumps(held, ensure_ascii=False, sort_keys=True), snapshot.repo, goal["id"]))
+            continue
         row = connection.execute("SELECT recovery_evidence FROM execplan_cancellations WHERE repo=? AND plan_id=?",
                                  (snapshot.repo, goal["id"])).fetchone()
         if row is None or row[0] != goal["evidence"]:
@@ -267,4 +330,7 @@ def resolve_recovery(connection, snapshot, commit, revised_ids):
             (json.dumps(evidence, ensure_ascii=False, sort_keys=True), snapshot.repo, goal["id"]))
     targets = {key for raw in snapshot.recovery_goals for key in json.loads(raw)["affected_ids"]} & snapshot.by_id.keys() & revised_ids
     for key in targets:
-        connection.execute("DELETE FROM execplan_catalog_holds WHERE repo=? AND plan_id=?", (snapshot.repo, key))
+        # 실행 중 보류의 resume_status는 다음 catalog 검증에서 복원한다.
+        connection.execute("DELETE FROM execplan_catalog_holds WHERE repo=? AND plan_id=? "
+            "AND NOT EXISTS (SELECT 1 FROM exec_plans WHERE repo=? AND plan_id=? AND status='PLAN_BLOCKED')",
+            (snapshot.repo, key, snapshot.repo, key))

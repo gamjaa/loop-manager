@@ -303,7 +303,7 @@ def apply_mutable_catalog_changes(
                                      (repo, original.plan_id)).fetchone()
             if row is None or planning_execution_state(row) != original.execution_state:
                 raise PlannerValidationError(f"계획 갱신 중 실행 근거가 변경됐습니다: {original.plan_id}")
-            revision_cas = ("status IN ('READY', 'IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING') "
+            revision_cas = ("status IN ('READY', 'IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING', 'PLAN_BLOCKED') "
                             "AND pr_url IS NULL AND pr_head_oid IS NULL AND pr_conflict_recovery = 0")
         else:
             revision_cas = cas

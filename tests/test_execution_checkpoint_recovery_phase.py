@@ -407,7 +407,7 @@ class ExecutionCheckpointRecoveryPhaseTests(ExecutionRecoveryScenarios, Executio
         self.effects.agent.run_agent.assert_not_called()
 
 
-    def test_conflicted_rebase_blocks_new_worker_input_before_worker(self):
+    def test_conflicted_rebase_new_worker_input_resumes_same_worker(self):
         self.handler.guard(self.context())
         self.state.update_project(
             'repo',
@@ -423,13 +423,14 @@ class ExecutionCheckpointRecoveryPhaseTests(ExecutionRecoveryScenarios, Executio
             self.handler._context()
         )
 
-        self.assertEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK)
-        self.effects.agent.run_agent.assert_not_called()
-        self.effects.blocking.block_active_execplan.assert_called_once()
-        self.assertEqual(
-            self.effects.blocking.block_active_execplan.call_args.kwargs['reason'],
-            lm.BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
-        )
+        self.assertNotEqual(outcome.kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.effects.agent.run_agent.assert_called_once()
+        self.assertEqual(self.effects.agent.run_agent.call_args.kwargs['session_id'], 'worker-session')
+        prompt = self.effects.agent.run_agent.call_args.args[5]
+        self.assertIn('rebase 충돌 복구의 최신 구현 조건', prompt)
+        self.assertIn('git show', prompt)
+        self.assertIsNone(self.effects.agent.worker_prompt.call_args.args[2])
+        self.effects.blocking.block_active_execplan.assert_not_called()
 
 
     def test_transient_worker_pause_preserves_rebase_resume_marker(self):

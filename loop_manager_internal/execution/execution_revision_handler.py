@@ -7,7 +7,7 @@ import json
 import sys
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, RecoveryFailure
-from loop_manager_internal.execution.execution_revision import DefinitionDelta, DefinitionSnapshot, RevisionGateKind, StageArtifacts, WORKER_INVALIDATING_DELTAS, decide_revision_gate
+from loop_manager_internal.execution.execution_revision import DefinitionSnapshot, RevisionGateKind, StageArtifacts, WORKER_INVALIDATING_DELTAS, decide_revision_gate
 from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind, ExecutionPhase
 from loop_manager_internal.execution.worker_outcome import WorkerOutcomeError
 from loop_manager_internal.git.command_adapter import ExternalObservationError
@@ -630,29 +630,13 @@ class RevisionHandler:
         if context.resolving_rebase:
             if (
                 (previous is None and not legacy_baseline)
-                or decision.deltas & (
-                    WORKER_INVALIDATING_DELTAS - {DefinitionDelta.DEPENDENCIES}
-                )
+                or decision.deltas & WORKER_INVALIDATING_DELTAS
             ):
-                detail = (
-                    'rebase 충돌 복구 중 ExecPlan 구현 입력이 변경되어 기존 '
-                    'Worker 변경과 안전하게 결합할 수 없습니다.'
-                )
-                self.ports._block_final(
-                    self.ports.identity.repo,
-                    context.worktree,
-                    detail,
-                    str(row['verify_result'] or ''),
-                    reason=BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
-                )
-                self.ports.operation_print(detail, file=sys.stderr)
-                return self.ports._final(detail)
-            if DefinitionDelta.DEPENDENCIES in decision.deltas:
-                # Dependency readiness was checked above. Resolve the existing
-                # conflict first, but retain the applied definition so the next
-                # gate refreshes the worktree and reruns Worker on the new DAG.
+                # Keep the applied definition and rebase target until recovery
+                # completes; changed inputs require fresh Worker validation.
                 self.ports.state.update_project(
                     self.ports.identity.repo,
+                    phase='WORKING',
                     validated_base_sha=None,
                     worker_result=None,
                     verify_result=None,

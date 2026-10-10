@@ -353,6 +353,16 @@ class WorkerHandler:
                 allow_common_plans=allow_common_plans)
             if not current_session_id or recovering:
                 prompt = (prompt or '') + query_context
+            definition = self.ports.snapshot()._definition_snapshot
+            if context.resolving_rebase and definition is not None:
+                prompt = (prompt or '') + (
+                    '\nrebase 충돌 복구의 최신 구현 조건: '
+                    + json.dumps({'revision': definition.revision_sha,
+                                  'path': definition.path, 'sources': definition.sources}, ensure_ascii=False)
+                    + '\n이 revision의 ExecPlan·연결 명세를 git show로 확인하고 현재 작업 형상과 '
+                    '대조해 충돌을 해결하라. 작업 파일의 이전 조건이나 진행 표시만으로 성공을 '
+                    '판단하지 말고 필요한 구현 보완·targeted test를 수행하라. '
+                    '기존 변경을 보존하며 rebase의 계속 진행·완료는 Manager에 맡겨라.\n')
             checkpoint = self.ports.checkpoint
             accepted = (checkpoint.get(self.ports.identity.repo, str(plan['id'])).snapshot or {}).get('current_rebase_acceptance') if checkpoint else None
             if accepted and not context.resolving_rebase:

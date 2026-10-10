@@ -205,7 +205,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
     def test_conflict_record_change_survives_database_restart_and_resumes_same_worker(self):
         self._lifecycle(with_pr=False, definition_change='record')
 
-    def test_conflict_condition_change_after_database_restart_blocks_without_touching_index(self):
+    def test_conflict_condition_change_after_database_restart_resumes_without_touching_index(self):
         self._lifecycle(with_pr=False, definition_change='condition')
 
     def test_checkpoint_multiconflict_skip_restart_verify_review(self):
@@ -562,18 +562,19 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 self.assertEqual(plan['verify_failure_history'], '["prior failure"]')
                 self.assertEqual(events, [])
                 if definition_change == 'condition':
-                    self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
-                    self.assertIn('ExecPlan 구현 입력', result.detail)
-                    effects.agent.run_agent.assert_not_called()
+                    self.assertNotIsInstance(result, ExecutionOutcome)
+                    self.assertIsNone(effects.state.row()['worker_result'])
+                    self.assertIsNone(effects.state.row()['verify_token'])
+                    self.assertEqual(effects.state.row()['definition_snapshot'], before_row['definition_snapshot'])
                 else:
                     self.assertNotIsInstance(result, ExecutionOutcome)
                     for field in ('definition_snapshot', 'worker_result', 'last_error'):
                         self.assertEqual(effects.state.row()[field], before_row[field])
-                    handler.run(result)
-                    self.assertEqual(events, ['worker'])
-                    self.assertEqual(effects.agent.run_agent.call_args.kwargs['session_id'], 'worker-session')
-                    self.assertEqual(len(resolutions), 1)
-                    self.assertEqual(git(worktree, 'diff', '--name-only', '--diff-filter=U').stdout.strip(), 'skip.txt')
+                handler.run(result)
+                self.assertEqual(events, ['worker'])
+                self.assertEqual(effects.agent.run_agent.call_args.kwargs['session_id'], 'worker-session')
+                self.assertEqual(len(resolutions), 1)
+                self.assertEqual(git(worktree, 'diff', '--name-only', '--diff-filter=U').stdout.strip(), 'skip.txt')
                 effects.validation.verify.assert_not_called()
                 effects.publication.push_managed_publication_branch.assert_not_called()
                 return

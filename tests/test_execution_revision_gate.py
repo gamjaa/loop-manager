@@ -45,7 +45,7 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
         self.assertNotIn('rebase', self.calls)
         self.effects.blocking.block_active_execplan.assert_not_called()
 
-    def test_conflicted_rebase_without_original_body_cannot_ignore_records(self):
+    def test_conflicted_rebase_without_original_body_invalidates_success_for_worker(self):
         self.handler.guard(self.context())
         text = '---\nid: G-047\n---\n## Progress\n- [ ] Run unit test\n'
         previous = replace(self.handler._definition_snapshot, body_hash=str(ExecPlanBodyHash(text)))
@@ -57,9 +57,45 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
         self.effects.revision.body_hash.side_effect = lambda _repo, revision, _path: (
             'unavailable-original' if revision == 'base' else ExecPlanBodyHash(text.replace('[ ]', '[x]')))
         result = self.handler.guard(self.context())
-        self.assertEqual(result.kind, ExecutionOutcomeKind.FINAL_BLOCK)
-        self.assertIn('ExecPlan 구현 입력', result.detail)
+        self.assertNotIsInstance(result, ExecutionOutcome)
+        self.assertTrue(result.resolving_rebase)
+        self.assertEqual(result.phase, ExecutionPhase.IMPLEMENTING)
+        self.assertIsNone(self.state.row()['worker_input_token'])
+        self.assertEqual(self.state.row()['definition_snapshot'], previous.serialize())
         self.assertEqual(self.state.row()['worker_session_id'], 'saved-session')
+        self.effects.blocking.block_active_execplan.assert_not_called()
+        self.assertNotIn('rebase', self.calls)
+
+    def test_conflicted_rebase_changed_inputs_clear_success_without_losing_recovery(self):
+        self.handler.guard(self.context())
+        previous = self.handler._definition_snapshot
+        for field in ('source_fingerprint', 'guidance_hash', 'archive_candidates', None):
+            with self.subTest(field=field):
+                applied = (replace(previous, **{field: ('docs/requirements/old.md',)
+                           if field == 'archive_candidates' else 'old-input'}) if field else None)
+                self.state.update_project('repo', phase='REVIEWING',
+                    definition_snapshot=applied.serialize() if applied else None,
+                    worker_session_id='saved-session', worker_result=READY_WORKER_RESULT,
+                    verify_result='old verify', review_result='VERDICT: PASS',
+                    worker_input_token='old-worker', archive_token='old-archive',
+                    verify_token='old-verify', review_token='old-review', publication_token='old-publication',
+                    last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict')
+                self.effects.workspace.is_directory.return_value = True
+                self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+                self.effects.revision.changed_paths.return_value = (previous.path,)
+                result = self.handler.guard(replace(self.context(), resolving_rebase=True))
+                self.assertNotIsInstance(result, ExecutionOutcome)
+                self.assertTrue(result.resolving_rebase)
+                self.assertEqual(result.phase, ExecutionPhase.IMPLEMENTING)
+                row = self.state.row()
+                self.assertEqual(row['worker_session_id'], 'saved-session')
+                self.assertEqual(row['definition_snapshot'], applied.serialize() if applied else None)
+                self.assertTrue(row['last_error'].startswith(lm.REBASE_CONFLICT_PREFIX))
+                for name in ('worker_result', 'verify_result', 'review_result', 'worker_input_token',
+                             'archive_token', 'verify_token', 'review_token', 'publication_token'):
+                    self.assertIsNone(row[name], name)
+                self.effects.blocking.block_active_execplan.assert_not_called()
+                self.assertNotIn('rebase', self.calls)
 
     def test_revision_document_observation_failure_preserves_worker_session(self):
         self.state.update_project('repo', worker_session_id='saved-session')

@@ -1441,9 +1441,8 @@ class RowIsMutableReadyEffects:
 def _row_is_mutable_ready(effects: RowIsMutableReadyEffects, row: sqlite3.Row) -> bool:
     """Keep the general Planner boundary conservative and evidence based."""
 
-    return (str(row["status"]) in {"READY", "IMPLEMENTING", "VERIFYING", "REVIEWING", "PUBLISHING"}
-            and all(row[field] is None for field in ("pr_url", "pr_head_oid", "pr_conflict_head_oid", "pr_conflict_base_oid"))
-            and not int(row["pr_conflict_recovery"] or 0))
+    from loop_manager_internal.catalog.remote_deletions import revisable_row
+    return revisable_row(row)
 
 
 def planning_execution_state(row) -> str:
@@ -1478,7 +1477,7 @@ def mutable_ready_snapshot(
         )
     rows = connection.execute(
         "SELECT * FROM exec_plans WHERE repo = ? AND status IN "
-        "('READY', 'IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING') "
+        "('READY', 'IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING', 'PLAN_BLOCKED') "
         "ORDER BY plan_id",
         (repo,),
     ).fetchall()
@@ -1489,7 +1488,11 @@ def mutable_ready_snapshot(
     recovery = remote_deletions.recoverable_ids(connection, repo, held)
     goals = remote_deletions.recovery_goals(connection, repo)
     for row in rows:
-        if (str(row["plan_id"]) in held - recovery or not effects._row_is_mutable_ready(row)):
+        if (str(row["plan_id"]) in held - recovery
+                or (row["status"] == "PLAN_BLOCKED" and str(row["plan_id"]) not in recovery)
+                or not effects._row_is_mutable_ready(row)):
+            continue
+        if str(row["plan_id"]) in recovery and not (worktree / str(row["path"])).is_file():
             continue
         if row["branch"]:
             if effects.pr_for_branch is None:

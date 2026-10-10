@@ -51,6 +51,9 @@ class MutableReadySnapshot:
                     {"id": goal["id"], "path": goal["path"],
                      "deletion_revision": goal["deletion_revision"], "affected_ids": goal["affected_ids"],
                      "text": json.loads(goal["evidence"])["text"],
+                     "kind": goal.get("kind", "cancelled"),
+                     "plan_revision": (json.loads(goal["evidence"])["row"].get("current_revision_sha")
+                                       or json.loads(goal["evidence"])["row"].get("plan_sha")),
                      "sources": json.loads(json.loads(goal["evidence"])["row"]["sources"])}
                     for goal in (json.loads(raw) for raw in self.recovery_goals)
                 ],

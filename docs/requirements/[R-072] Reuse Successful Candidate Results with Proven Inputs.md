@@ -11,7 +11,7 @@ Manager가 실제 입력과 기존 성공 근거를 비교해 필요한 단계�
 ### Rebase와 Worker
 
 - Manager가 소유권·작업물 보존 조건을 확인하고 먼저 rebase를 시도한다. 충돌 없이 완료되면 rebase나 commit SHA 변경만을 이유로 Worker를 다시 호출하거나 완료한 targeted test를 반복하지 않는다.
-- 충돌은 작업물·진행 상태·기존 Worker 세션을 보존해 같은 세션에서 해결한다. Worker는 자신이 수정한 코드에 필요한 targeted unit test를 수행한다. 해결 이후 전체 verify와 Review의 필요성은 아래 조건으로 각각 판단한다.
+- Requirement·ExecPlan 충돌의 최신 base 자동 채택·파일 전체 교체와 그 외 파일 충돌의 Worker 복귀는 [R-082](%5BR-082%5D%20단계별%20원격%20문서%20반영과%20PR%20전%20ExecPlan%20갱신.md#rebase-충돌과-구현-조건-변경)를 따른다. Worker 교정은 작업물·진행 상태·기존 세션을 보존해 수행하고 수정한 코드에 필요한 targeted unit test를 실행한다. 해결 이후 전체 verify와 Review의 필요성은 아래 조건으로 각각 판단한다.
 - 검증 실패·Review issue·구현 수정·명세나 역할 입력 변경 등 별도 교정 사유는 기존 Worker 흐름으로 처리한다. rebase 실패·미완료·소유권 불확실성은 정상 완료로 취급하지 않으며 기존 재시도·차단·복구 정책을 유지한다.
 
 ### ExecPlan 구현 입력과 기록 변경
@@ -125,7 +125,7 @@ Manager는 실제 전체 verify 성공 결과와 입력 지문을 SQLite에 저�
 
 ## Acceptance Criteria
 
-- 충돌 없는 rebase나 SHA 변경만으로 Worker·완료한 targeted test를 반복하지 않는다. 충돌은 보존된 Worker 세션에서 해결하고 관련 targeted test를 수행하며 이후 verify·Review를 각각 판단한다.
+- 충돌 없는 rebase나 SHA 변경만으로 Worker·완료한 targeted test를 반복하지 않는다. R-082의 계획·작업 문서 충돌 자동 처리 후에는 단계별 재점검을 적용하고, 그 외 파일 충돌은 보존된 Worker 세션에서 해결·수정·관련 targeted test를 수행하며 이후 verify·Review를 각각 판단한다.
 - rebase 충돌 중 구현 조건이 동일한 Progress 체크·기존 수행/검증 기록만 바뀌면 같은 Worker session·작업물·rebase 진행 상태를 유지하고, 그 변경만으로 구현 입력 변경 차단·Worker 재호출·교정 횟수 증가를 만들지 않는다.
 - 같은 기록 절의 목표·Acceptance Criteria·source·제약·검증 조건·지침·사용자 결정 변경은 실제 입력으로 구분한다. 분류 불확실성·과거 비교 근거 부재와 실제 새 조건에 맞지 않는 작업은 자동 수용하지 않으며, 필요한 재확인·차단과 verify·Review·게시 gate를 유지한다.
 - 목록이 없는 작업은 전체 verify를 실행하고 목록 생성만을 위한 Worker·Planner 즉시 호출을 하지 않는다. 다음 일반 Planner는 최신 원격 base와 기존 미완료 계획·draft·PR을 확인해 생성 계획을 중복 요청하지 않는다.
