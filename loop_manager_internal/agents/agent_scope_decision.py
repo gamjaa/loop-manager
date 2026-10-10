@@ -179,13 +179,16 @@ def scoped_metadata(before: GitSnapshot, after: GitSnapshot,
             if not default_was_registered:
                 worktrees.pop(default_worktree, None)
             elif default_worktree in worktrees:
-                # The default checkout's current HEAD, branch and status are
-                # local inputs. Preserve its registration presence so a
-                # removed primary worktree still fails the scope check.
+                # Ignore valid checkout state but retain registration identity
+                # so a removed or malformed primary worktree still fails.
                 worktrees[default_worktree] = tuple(
                     field for field in worktrees[default_worktree]
-                    if not field.startswith(("HEAD=", "branch=", "state="))
-                    and field != "detached"
+                    if not field.startswith(("HEAD=", "state="))
+                    and not (
+                        field == "detached"
+                        or field.startswith("branch=refs/heads/")
+                        and len(field) > len("branch=refs/heads/")
+                    )
                 )
         if base_branch:
             refs.pop(f"refs/heads/{base_branch}", None)

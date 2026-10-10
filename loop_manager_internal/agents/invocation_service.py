@@ -210,6 +210,7 @@ def run_agent(
         )
         baseline_view, current_view = agent_scope_decision.scoped_metadata(
             reconciled, snapshot, resources, default_worktree=default_worktree,
+            selected_worktree=str(_canonical_path(worktree)),
             base_branch=base_branch,
         )
         if baseline_view == current_view and preflight_digest is not None:

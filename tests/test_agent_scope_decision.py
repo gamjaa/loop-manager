@@ -50,7 +50,7 @@ class PersistedScopeDecisionTests(unittest.TestCase):
         unrelated = replace(before,
             refs={**before.refs, 'refs/heads/main': ('new-local', ''),
                   'refs/heads/unrelated': ('new-other', '')},
-            worktrees={**before.worktrees, REPO: ('HEAD=changed', 'state=dirty'),
+            worktrees={**before.worktrees, REPO: ('HEAD=changed', 'branch=refs/heads/user-local', 'state=dirty'),
                        '/outside': ('HEAD=other',)},
             config={'local:core.hooksPath': ('secure',),
                     'local:branch.unrelated.remote': ('new',)},
@@ -59,15 +59,18 @@ class PersistedScopeDecisionTests(unittest.TestCase):
             unrelated, role='worker', phase='IMPLEMENTING', base_branch='main',
             branch='loop-manager/G-051', worktree_key=WORKTREE, default_worktree=REPO,
         ), digest)
-        for changed in (
-            replace(before, worktrees={key: value for key, value in before.worktrees.items()
-                                       if key != REPO}),
-            replace(before, worktrees={**before.worktrees, REPO: ('HEAD=local', 'branch=other')}),
-        ):
-            self.assertNotEqual(decision.invocation_scope_digest(
-                changed, role='worker', phase='IMPLEMENTING', base_branch='main',
-                branch='loop-manager/G-051', worktree_key=WORKTREE, default_worktree=REPO,
-            ), digest)
+        branch_changed = replace(before,
+            worktrees={**before.worktrees, REPO: ('HEAD=local', 'branch=other')})
+        self.assertNotEqual(decision.invocation_scope_digest(
+            branch_changed, role='worker', phase='IMPLEMENTING', base_branch='main',
+            branch='loop-manager/G-051', worktree_key=WORKTREE, default_worktree=REPO,
+        ), digest)
+        registration_removed = replace(before,
+            worktrees={key: value for key, value in before.worktrees.items() if key != REPO})
+        self.assertNotEqual(decision.invocation_scope_digest(
+            registration_removed, role='worker', phase='IMPLEMENTING', base_branch='main',
+            branch='loop-manager/G-051', worktree_key=WORKTREE, default_worktree=REPO,
+        ), digest)
         for changed in (
             replace(before, refs={**before.refs, ref: ('b', '')}),
             replace(before, dirty={'src/app.py': (('unstaged',), 'changed')}),

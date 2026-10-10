@@ -79,7 +79,8 @@ class RunnerTests(TestCase):
         current = replace(
             before,
             refs={**before.refs, base_ref: ('b', ''), head_ref: ('b', base_ref)},
-            worktrees={**before.worktrees, source: ('HEAD=source-new', 'state=dirty'),
+            worktrees={**before.worktrees,
+                       source: ('HEAD=source-new', 'branch=refs/heads/user-local', 'state=dirty'),
                        '/unrelated': ('HEAD=unrelated-new',)},
         )
         digests = []
