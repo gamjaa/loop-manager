@@ -640,7 +640,7 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
 
 
     def test_shared_mutations_block_before_any_remote_access(self):
-        cases = ("origin", "pushurl", "config", "ref", "external")
+        cases = ("origin", "pushurl", "config", "ref")
         for mutation in cases:
             with self.subTest(mutation=mutation):
                 request = self.block()
@@ -650,10 +650,8 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
                     self.run_git(self.repo, "config", "remote.origin.pushurl", "https://github.com/other/repo.git")
                 elif mutation == "config":
                     self.run_git(self.repo, "config", "core.hooksPath", "/tmp/untrusted")
-                elif mutation == "ref":
-                    self.run_git(self.repo, "update-ref", "refs/heads/foreign", self.base_oid)
                 else:
-                    (self.repo / "code.py").write_text("external change\n")
+                    self.run_git(self.repo, "update-ref", "refs/heads/foreign", self.base_oid)
                 adapter = loop_manager._BlockedCheckpointAdapter(
                     self.connection, self.repo, self.state_dir, request.repo
                 )
@@ -672,7 +670,6 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
                     "pushurl": "shared_git_config_mutation",
                     "config": "shared_git_config_mutation",
                     "ref": "shared_ref_mutation",
-                    "external": "outside_managed_worktree_mutation",
                 }[mutation])
                 self.run_git(self.repo, "remote", "set-url", "origin", str(self.remote))
                 if mutation == "pushurl":
@@ -684,3 +681,20 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
                 self.connection.execute("DELETE FROM project_blocks")
                 self.connection.execute("UPDATE projects SET phase = NULL")
                 self.connection.commit()
+
+
+    def test_default_checkout_file_change_does_not_block_checkpoint_assessment(self):
+        request = self.block()
+        (self.repo / "code.py").write_text("external change\n")
+        adapter = loop_manager._BlockedCheckpointAdapter(
+            self.connection, self.repo, self.state_dir, request.repo
+        )
+        publication = mock.Mock()
+        results = loop_manager._BlockedCheckpointResults(self.connection)
+        repository = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection)
+
+        blocked_checkpoint.BlockedCheckpointDispatcher(repository, adapter, publication, results).dispatch(request.repo)
+
+        publication.existing_pull_request.assert_called_once_with(request)
+        publication.push.assert_not_called()
+        self.assertIsNone(self.connection.execute("SELECT 1 FROM project_blocks").fetchone())

@@ -470,6 +470,8 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                 return finish(slot, active, intent, *args, **kwargs)
             manager_git_journal._finish = interrupted_finish
     github_repository = lambda value: 'owner/repo'
+    from loop_manager_internal.git import git_adapter as _git_adapter
+    _git_adapter.github_repository = github_repository
     validate_runtime_prerequisites = lambda *args, **kwargs: None
     pr_for_branch = lambda *args, **kwargs: None
     codex_model_efforts = lambda *args: {model: frozenset({'medium', 'high', 'max', 'xhigh'})
