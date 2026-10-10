@@ -639,6 +639,7 @@ def _parse_execplan(
     require_priority: bool = False,
     validate_sources: bool = True,
     allow_archive_fallback: bool = True,
+    allow_id_fallback: bool | None = None,
 ) -> dict[str, object]:
     return execplan_catalog.parse_execplan_file(
         worktree,
@@ -646,6 +647,7 @@ def _parse_execplan(
         require_priority=require_priority,
         validate_sources=validate_sources,
         allow_archive_fallback=allow_archive_fallback,
+        allow_id_fallback=allow_id_fallback,
     )
 
 

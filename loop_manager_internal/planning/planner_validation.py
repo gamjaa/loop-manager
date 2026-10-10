@@ -989,11 +989,17 @@ def validate_planner_result(
             continue
         try:
             planner_text = plan_file.read_text(encoding="utf-8")
+            frontmatter = execplan_catalog.parse_frontmatter(planner_text)
+            existing_plan_id = frontmatter.get("id")
             parsed = effects._parse_execplan(
                 worktree,
                 plan_file,
                 require_priority=not existed,
                 allow_archive_fallback=False,
+                allow_id_fallback=(
+                    isinstance(existing_plan_id, str)
+                    and existing_plan_id in snapshot.by_id
+                ),
             )
         except (UnicodeError, RuntimeError) as error:
             if isinstance(error, (ExternalObservationError, GitLockError)):
@@ -1092,6 +1098,7 @@ def validate_planner_result(
                     parsed = effects._parse_execplan(
                         worktree, worktree / revision.path,
                         require_priority=False, allow_archive_fallback=False,
+                        allow_id_fallback=True,
                     )
                 except RuntimeError as error:
                     if isinstance(error, (ExternalObservationError, GitLockError)):

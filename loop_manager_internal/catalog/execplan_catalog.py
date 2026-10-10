@@ -231,6 +231,7 @@ def _source_lookup(
     source: str,
     *,
     allow_archive_fallback: bool,
+    allow_id_fallback: bool | None = None,
     available_regular_paths: AbstractSet[str] | None = None,
     requirement_documents: Mapping[str, str | bytes] | None = None,
 ) -> requirement_sources.RequirementSourceResolution | None:
@@ -254,9 +255,11 @@ def _source_lookup(
     if requirement_documents is None and root is not None:
         requirement_documents = requirement_sources.worktree_requirement_documents(root)
     if requirement_documents is not None:
+        if allow_id_fallback is None:
+            allow_id_fallback = allow_archive_fallback
         return requirement_sources.resolve_requirement_source(
             source, requirement_documents, allow_archive=allow_archive_fallback,
-            allow_id_fallback=allow_archive_fallback,
+            allow_id_fallback=allow_id_fallback,
         )
     if available_regular_paths is not None:
         if source in available_regular_paths:
@@ -286,6 +289,7 @@ def parse_execplan_text(
     require_priority: bool = False,
     validate_sources: bool = True,
     allow_archive_fallback: bool = True,
+    allow_id_fallback: bool | None = None,
     requirement_documents: Mapping[str, str | bytes] | None = None,
 ) -> dict[str, object]:
     """Parse one plan without consulting Git, SQLite, or external services."""
@@ -328,6 +332,7 @@ def parse_execplan_text(
         if validate_sources and (root is not None or requirement_documents is not None):
             resolution = _source_lookup(
                 root, source, allow_archive_fallback=allow_archive_fallback,
+                allow_id_fallback=allow_id_fallback,
                 requirement_documents=requirement_documents,
             )
             if resolution is None or resolution.status is requirement_sources.ResolutionStatus.RESOLVED:
@@ -777,6 +782,7 @@ def parse_execplan_file(
     require_priority: bool = False,
     validate_sources: bool = True,
     allow_archive_fallback: bool = True,
+    allow_id_fallback: bool | None = None,
 ) -> dict[str, object]:
     """Compatibility parser for one explicitly selected regular file."""
 
@@ -793,6 +799,7 @@ def parse_execplan_file(
         require_priority=require_priority,
         validate_sources=validate_sources,
         allow_archive_fallback=allow_archive_fallback,
+        allow_id_fallback=allow_id_fallback,
     )
 
 

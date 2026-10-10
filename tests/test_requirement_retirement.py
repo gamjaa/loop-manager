@@ -220,7 +220,9 @@ class RequirementRetirementTest(unittest.TestCase):
         }
         ManualWorkRepository(self.connection).create(
             "repo", "submit", "user/feature", (submitted,), "submitted-head", "base",
+            members=("G-009",),
         )
+        self.add_plan("G-009", status="MANUAL_PENDING", source=submitted)
 
         (item,) = self.port.pending("repo", self.root, "base")
         self.assertEqual(item.path, independent)

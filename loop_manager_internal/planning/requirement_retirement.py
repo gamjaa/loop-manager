@@ -242,6 +242,7 @@ class RequirementRetirementPort:
             if source in documents and SOURCE.fullmatch(source)
         }
         manual_requirement_ids = set()
+        manual_plan_ids = set()
         if self.connection.execute(
             "SELECT 1 FROM sqlite_master WHERE type='table' AND name='manual_work_groups'"
         ).fetchone():
@@ -250,6 +251,17 @@ class RequirementRetirementPort:
                 "WHERE repo=? AND state NOT IN ('MERGED','PREPARATION_CONFLICT')",
                 (repo,),
             ).fetchall()
+            if self.connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='manual_work_members'"
+            ).fetchone():
+                manual_plan_ids = {
+                    str(row[0]) for row in self.connection.execute(
+                        "SELECT m.plan_id FROM manual_work_members m "
+                        "JOIN manual_work_groups g ON g.repo=m.repo AND g.group_id=m.group_id "
+                        "WHERE g.repo=? AND g.state NOT IN ('MERGED','PREPARATION_CONFLICT')",
+                        (repo,),
+                    )
+                }
             source_documents_by_revision = {revision: documents}
             for group in manual_groups:
                 try:
@@ -310,6 +322,7 @@ class RequirementRetirementPort:
                 row["sources"], str(row["plan_id"]), documents,
             )
             for row in rows
+            if str(row["plan_id"]) not in manual_plan_ids
         }
         resolved_cancellations = {
             str(row["plan_id"]): _resolved_sources(
@@ -322,7 +335,7 @@ class RequirementRetirementPort:
                 continue
             if mode not in {"100644", "100755"}:
                 raise RetirementError(f"Requirement가 일반 파일이 아닙니다: {path}")
-            related = [row for row in rows if path in resolved_rows[str(row["plan_id"])]]
+            related = [row for row in rows if path in resolved_rows.get(str(row["plan_id"]), ())]
             canceled = [row for row in cancellations
                         if path in resolved_cancellations[str(row["plan_id"])] ]
             if canceled or any(str(row["status"]) != "MERGED" for row in related):
