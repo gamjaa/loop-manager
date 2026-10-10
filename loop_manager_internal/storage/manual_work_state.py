@@ -155,6 +155,13 @@ def planning_ownership_state(connection, repo, plan_id, execution_row):
     for group in connection.execute(
             "SELECT * FROM manual_work_groups WHERE repo=? ORDER BY group_id", (repo,)):
         group_id = str(group['group_id'])
+        if group_id not in memberships:
+            try:
+                declared_for_target = json.loads(group['members'])
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if not isinstance(declared_for_target, list) or plan_id not in declared_for_target:
+                continue
         declared, stored = _validated_group_members(connection, repo, group)
         if plan_id not in declared and plan_id not in stored:
             continue
@@ -189,7 +196,8 @@ def planning_ownership_state(connection, repo, plan_id, execution_row):
             'members': stored,
         })
     for group_id in sorted(memberships - matched):
-        # Membership rows can remain as identity history after the live group ends.
+        # Without a group row, membership has no evidence that ownership was released.
+        owned = True
         snapshot.append({'group_id': group_id, 'group': None, 'members': [plan_id]})
     return digest(snapshot), owned
 

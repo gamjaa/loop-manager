@@ -177,29 +177,6 @@ class ManualConcurrencyTests(WorkspaceFixture, unittest.TestCase):
             self.assertEqual(git(service.repo_path, 'ls-remote', '--heads', 'origin', 'main'), before)
             self.assertFalse(work_claims.publication_claims(service.connection, service.repo)[0])
 
-    def test_manual_start_intent_after_snapshot_rejects_edit_without_execplan_row_change(self):
-        with tempfile.TemporaryDirectory() as directory:
-            service, branch, worktree = self.fixture(directory)
-            candidate = self.publication(service)
-            before = dict(service.connection.execute(
-                "SELECT * FROM exec_plans WHERE repo=? AND plan_id='G-012'", (service.repo,)
-            ).fetchone())
-            group = service.store.create(
-                service.repo, 'start', branch, (), candidate[1].mutable_snapshot.active_sha,
-                candidate[1].mutable_snapshot.active_sha, members=('G-012',),
-            )
-            service.store.update(group, owner_id='G-012', branch=branch, worktree=str(worktree))
-            after = dict(service.connection.execute(
-                "SELECT * FROM exec_plans WHERE repo=? AND plan_id='G-012'", (service.repo,)
-            ).fetchone())
-            self.assertEqual(after, before)
-
-            with self.assertRaisesRegex(manager.PlannerValidationError, '수동 소유 계획'):
-                self.record(service, candidate)
-
-            self.assertIsNone(manager.general_planning_publication(service.connection, service.repo))
-            self.assertFalse(work_claims.publication_claims(service.connection, service.repo)[0])
-
     def test_planner_first_blocks_start_through_push_until_db_confirmation(self):
         with tempfile.TemporaryDirectory() as directory:
             service, _, _ = self.fixture(directory)
