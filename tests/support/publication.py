@@ -1,7 +1,9 @@
+from tests.support.fixed_samples import use_fixed_guidance
 import json
 import sqlite3
 import subprocess
 from pathlib import Path
+from unittest import mock
 import loop_manager
 from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
 from loop_manager_internal.agents.common_guidance import plan_content_hash
@@ -10,6 +12,7 @@ from tests.support.catalog import write_execplan
 from tests.support.git import git_command, make_remote_repository, commit_and_push
 from tests.support.worker import worker_result
 from tests.support.lifecycle import register_connection_cleanup
+from tests.support.fixed_samples import PROJECT_FILES
 
 
 def seed_validated_candidate(
@@ -24,6 +27,8 @@ def seed_validated_candidate(
     base_sha = git_command(repo, "rev-parse", "origin/main")
     candidate_head = git_command(worktree, "rev-parse", "HEAD")
     body = loop_manager._revision_execplan_body_hash(repo, base_sha, str(row["path"]))
+    with mock.patch('loop_manager_internal.agents.common_guidance.RUNTIME_ROOT', PROJECT_FILES):
+        guidance_hash = plan_content_hash(connection, str(repo), plan_id)
     snapshot = DefinitionSnapshot(
         revision_sha=base_sha,
         path=str(row["path"]),
@@ -39,7 +44,7 @@ def seed_validated_candidate(
             repo, base_sha, row,
         ),
         archive_candidates=(),
-        guidance_hash=plan_content_hash(connection, str(repo), plan_id),
+        guidance_hash=guidance_hash,
     )
     verify_output = str(row['verify_result'] or 'validated candidate: OK')
     values = (
@@ -99,8 +104,13 @@ def publishing_branch_pr_lookup(connection, url):
 
 class PublicationFixture:
     """Shared scenario setup; inheriting this fixture collects no tests."""
+    def setUp(self):
+        use_fixed_guidance(self)
+        super().setUp()
+
 
     def _publication_state(self, directory: str):
+        use_fixed_guidance(self)
         repo = make_remote_repository(directory)
         state_dir = Path(directory) / "state"
         state_dir.mkdir()

@@ -1,3 +1,4 @@
+from tests.support.fixed_samples import use_fixed_guidance
 import sqlite3
 import json
 import unittest
@@ -10,6 +11,10 @@ from tests.support.worker import dummy_worker_sessions
 
 
 class StableWorkReasonBoundaryTest(unittest.TestCase):
+    def setUp(self):
+        use_fixed_guidance(self)
+        super().setUp()
+
     def _connection(self):
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row

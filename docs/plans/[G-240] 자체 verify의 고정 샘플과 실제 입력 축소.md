@@ -38,7 +38,7 @@ Merge된 공통 runner의 `test_verify_contract.py`·`test_verify_runtime.py`와
 
 - [x] eb797d3a의 manifest는 문서·Skill·예제 설정을 포함한다. origin fixture와 profile/manifest 회귀가 실제 원본을 읽어 요구한 입력 축소는 미충족이다. 정적 확인만 수행했다.
 - [x] 2026-10-09 `bac6f84e`에서 새 `scripts/verify.json`·`docs/VERIFY.md`와 공통 adapter 경계를 읽었다. 선언은 실제 검증 입력이고 입력 목록의 원본 prose 의존성 축소는 남아 있다. 구현·테스트·verify 실행 없음.
-- [ ] 고정 샘플 전환·입력 목록 교정·targeted unit 검증
+- [x] 고정 샘플 전환·입력 목록 교정·16개 targeted unit 검증 완료. `scripts/verify`는 실행하지 않았으며 전체 verify는 Manager 확인 대기.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log

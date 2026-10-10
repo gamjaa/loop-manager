@@ -22,11 +22,16 @@ from tests.support.origin import (
     git, configure_identity, commit_all, write_registration_files,
     remote_fixture, advance_remote, OriginScopeFixture,
 )
+from tests.support.fixed_samples import PROJECT_FILES
 from loop_manager_internal.runtime import bootstrap
 
 
 @isolated_git_test
 class OriginRegistrationTests(unittest.TestCase):
+    def _inspect_registration_files(self, *args, **kwargs):
+        with mock.patch.object(loop_manager, "ROOT", PROJECT_FILES):
+            return loop_manager.inspect_registration_files(*args, **kwargs)
+
     def test_reregistration_archives_legacy_approval_without_approving_current_hash(self):
         from loop_manager_internal.runtime import project_registry
         from loop_manager_internal.catalog.execplan_catalog import ExecPlanCatalogSnapshot
@@ -50,7 +55,7 @@ class OriginRegistrationTests(unittest.TestCase):
                     self.assertIsNone(connection.execute("SELECT name FROM sqlite_master WHERE name = "
                         "'project_agents_approval_audit'").fetchone())
                 documents = {'AGENTS.md': b'project rules',
-                             'docs/PLANS.md': (loop_manager.ROOT / 'docs/PLANS.md').read_bytes(),
+                             'docs/PLANS.md': (PROJECT_FILES / 'docs/PLANS.md').read_bytes(),
                              'docs/ARCHITECTURE.md': b'# Custom architecture',
                              'docs/PRODUCT.md': b'# Custom product'}
                 def validate(_path, **options):
@@ -68,9 +73,10 @@ class OriginRegistrationTests(unittest.TestCase):
                     for present, approve in ((True, False), (True, True), (False, False)):
                         if not present:
                             del documents['AGENTS.md']
-                        added = loop_manager.add_registered_project(connection, root,
-                            config_path=Path('config.ini'), provider='codex', requested_base='main',
-                            approve_agents_mismatch=approve)
+                        with mock.patch.object(loop_manager, 'ROOT', PROJECT_FILES):
+                            added = loop_manager.add_registered_project(connection, root,
+                                config_path=Path('config.ini'), provider='codex', requested_base='main',
+                                approve_agents_mismatch=approve)
                         self.assertFalse(added.agents_approved)
                         expected_hash = None
                         self.assertEqual(added.agents_hash, expected_hash)
@@ -86,7 +92,7 @@ class OriginRegistrationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
             (repo / "AGENTS.md").write_text("# Local instructions\n", encoding="utf-8")
-            documents = {b'docs/PLANS.md': (loop_manager.ROOT / 'docs/PLANS.md').read_bytes(),
+            documents = {b'docs/PLANS.md': (PROJECT_FILES / 'docs/PLANS.md').read_bytes(),
                          b'docs/ARCHITECTURE.md': b'# Custom architecture',
                          b'docs/PRODUCT.md': b'# Custom product'}
             revisions = {'with-agents': {**documents, b'AGENTS.md': b'committed rules'},
@@ -96,12 +102,18 @@ class OriginRegistrationTests(unittest.TestCase):
                 self.assertNotEqual(path, 'AGENTS.md')
                 return entries.get(path.encode())
 
+            normalized_text = loop_manager.normalized_text
+            def sample_text(path):
+                self.assertTrue(path.is_relative_to(PROJECT_FILES), path)
+                return normalized_text(path)
+
             with mock.patch.object(loop_manager, '_git_tree_entries',
                 side_effect=lambda _repo, revision: revisions[revision]) as trees, mock.patch.object(
                 loop_manager, '_revision_blob', side_effect=blob
+            ), mock.patch.object(loop_manager, 'normalized_text', side_effect=sample_text
             ), mock.patch('subprocess.Popen', side_effect=AssertionError('예상 밖 process 실행')) as process:
                 for revision in revisions:
-                    self.assertEqual(loop_manager.inspect_registration_files(
+                    self.assertEqual(self._inspect_registration_files(
                         repo, revision, approve_agents_mismatch=False), (None, False))
                 self.assertEqual(trees.call_args_list,
                                  [mock.call(repo, revision) for revision in revisions])
@@ -111,7 +123,7 @@ class OriginRegistrationTests(unittest.TestCase):
     def test_cli_guidance_is_ignored_while_missing_specs_are_rejected(self):
         from loop_manager_internal.runtime import project_registry
         documents = {'AGENTS.md': '프로젝트 규칙\r\n'.encode(),
-                     'docs/PLANS.md': (loop_manager.ROOT / 'docs/PLANS.md').read_bytes(),
+                     'docs/PLANS.md': (PROJECT_FILES / 'docs/PLANS.md').read_bytes(),
                      'docs/ARCHITECTURE.md': b'# Custom architecture\n',
                      'docs/PRODUCT.md': b'# Custom product\n'}
         connection = sqlite3.connect(':memory:')
@@ -123,18 +135,18 @@ class OriginRegistrationTests(unittest.TestCase):
         with mock.patch.object(loop_manager, '_git_tree_entries', return_value={}), mock.patch.object(
             loop_manager, '_revision_blob', side_effect=lambda _root, _entries, path: documents.get(path) if path != 'AGENTS.md' else self.fail('CLI guidance was read')):
             for approve in (False, True):
-                self.assertEqual(loop_manager.inspect_registration_files(Path('/repo'), 'selected',
+                self.assertEqual(self._inspect_registration_files(Path('/repo'), 'selected',
                     approve_agents_mismatch=approve), (None, False))
             documents['AGENTS.md'] = b'\xff'
-            self.assertEqual(loop_manager.inspect_registration_files(
+            self.assertEqual(self._inspect_registration_files(
                 Path('/repo'), 'selected', approve_agents_mismatch=True), (None, False))
             del documents['AGENTS.md']
             for approve in (False, True):
-                self.assertEqual(loop_manager.inspect_registration_files(Path('/repo'), 'selected',
+                self.assertEqual(self._inspect_registration_files(Path('/repo'), 'selected',
                     approve_agents_mismatch=approve), (None, False))
             del documents['docs/PRODUCT.md']
             with self.assertRaisesRegex(RuntimeError, 'PRODUCT'):
-                loop_manager.inspect_registration_files(Path('/repo'), 'selected', approve_agents_mismatch=False)
+                self._inspect_registration_files(Path('/repo'), 'selected', approve_agents_mismatch=False)
         self.assertEqual(connection.execute('SELECT agents_hash, agents_approved FROM projects').fetchone(),
                          ('legacy-hash', 1))
 
@@ -142,7 +154,7 @@ class OriginRegistrationTests(unittest.TestCase):
         for newline in (b'\n', b'\r\n'):
             with self.subTest(newline=newline):
                 def common(path):
-                    return loop_manager.normalized_text(loop_manager.ROOT / path).encode('utf-8').replace(b'\n', newline)
+                    return loop_manager.normalized_text(PROJECT_FILES / path).encode('utf-8').replace(b'\n', newline)
 
                 documents = {
                     'AGENTS.md': common('AGENTS.md'),
@@ -154,14 +166,14 @@ class OriginRegistrationTests(unittest.TestCase):
                     loop_manager, '_revision_blob', side_effect=lambda _root, _entries, path: documents[path]
                 ):
                     self.assertEqual(
-                        loop_manager.inspect_registration_files(Path('/repo'), 'revision', approve_agents_mismatch=False),
+                        self._inspect_registration_files(Path('/repo'), 'revision', approve_agents_mismatch=False),
                         (None, False),
                     )
                     for path in ('docs/ARCHITECTURE.md', 'docs/PRODUCT.md'):
                         original = documents[path]
                         documents[path] = common(path.replace('.md', '.template.md'))
                         with self.assertRaisesRegex(RuntimeError, '템플릿'):
-                            loop_manager.inspect_registration_files(Path('/repo'), 'revision', approve_agents_mismatch=False)
+                            self._inspect_registration_files(Path('/repo'), 'revision', approve_agents_mismatch=False)
                         documents[path] = original
 
     def test_registry_schema_does_not_commit_caller_transaction(self):
@@ -252,7 +264,7 @@ class OriginRegistrationTests(unittest.TestCase):
 
             (repo / "AGENTS.md").write_text("# local-only mismatch\n", encoding="utf-8")
             (repo / "docs/PLANS.md").unlink()
-            agents_hash, approved = loop_manager.inspect_registration_files(
+            agents_hash, approved = self._inspect_registration_files(
                 repo,
                 committed_agents,
                 approve_agents_mismatch=False,
@@ -298,16 +310,16 @@ class OriginRegistrationTests(unittest.TestCase):
             self.assertEqual(inspection.origin, "example/project")
 
             (repo / "AGENTS.md").write_bytes(
-                (loop_manager.ROOT / "AGENTS.md").read_bytes()
+                (PROJECT_FILES / "AGENTS.md").read_bytes()
             )
             (repo / "docs/PLANS.md").write_text("remote-invalid\n", encoding="utf-8")
             git(repo, "add", "-A")
             git(repo, "commit", "-m", "Invalid remote plans")
             (repo / "docs/PLANS.md").write_bytes(
-                (loop_manager.ROOT / "docs/PLANS.md").read_bytes()
+                (PROJECT_FILES / "docs/PLANS.md").read_bytes()
             )
             with self.assertRaisesRegex(RuntimeError, "PLANS.md"):
-                loop_manager.inspect_registration_files(
+                self._inspect_registration_files(
                     repo,
                     "HEAD",
                     approve_agents_mismatch=True,

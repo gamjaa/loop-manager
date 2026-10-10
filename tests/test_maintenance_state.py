@@ -1,3 +1,4 @@
+from tests.support.fixed_samples import use_fixed_guidance
 from contextlib import closing
 import io
 import sqlite3
@@ -1248,6 +1249,7 @@ class BoundedGitChangeContextTest(unittest.TestCase):
 
 class FileReviewLedgerTest(unittest.TestCase):
     def setUp(self):
+        use_fixed_guidance(self)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.repo = Path(temporary.name) / "repo"

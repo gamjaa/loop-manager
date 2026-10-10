@@ -1,3 +1,4 @@
+from tests.support.fixed_samples import use_fixed_guidance
 import json
 import sqlite3
 import subprocess
@@ -27,6 +28,10 @@ from tests.support.catalog import plan_text
 
 
 class MaintenanceCycleCase(unittest.TestCase):
+    def setUp(self):
+        use_fixed_guidance(self)
+        super().setUp()
+
     @staticmethod
     def _legacy_cycle(
         connection: sqlite3.Connection, repo: str, source_sha: str,

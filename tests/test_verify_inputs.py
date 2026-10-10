@@ -288,17 +288,32 @@ class VerifyInputObservationTest(unittest.TestCase):
         with mock.patch.object(inputs.os, 'walk', side_effect=failed_walk):
             self.assertIsNone(self.observe().fingerprint)
 
-    def test_repository_manifest_covers_actual_fixture_documents_and_skills(self):
+    def test_repository_manifest_covers_execution_inputs_and_fixed_samples(self):
         root = Path(__file__).resolve().parents[1]
         patterns = inputs.parse((root / inputs.MANIFEST).read_bytes())
         for path in ('loop_manager.py', 'loop_manager_internal/verification/runner.py',
-                     'tests/support/origin.py', 'scripts/verify.json', 'scripts/verify.sh', 'scripts/verify.ps1',
-                     'requirements.txt', 'config/config.ini.example', 'AGENTS.md', 'README.md',
-                     'docs/PLANS.md', 'docs/AGENTS.worker.md', 'docs/PRODUCT.md',
-                     'docs/ARCHITECTURE.md',
-                     'docs/FUTURE_IDEAS.md', 'docs/PRODUCT.template.md',
-                     'docs/ARCHITECTURE.template.md', 'docs/REQUIREMENT.template.md',
-                     '.agents/skills/specification-docs/SKILL.md',
-                     '.agents/skills/specification-docs/scripts/next_requirement_id.py'):
+                     'loop_manager_internal/catalog/frontmatter.py',
+                     'tests/support/origin.py', 'tests/fixtures/project-files/AGENTS.md',
+                     'tests/fixtures/project-files/docs/AGENTS.common.md',
+                     'tests/fixtures/project-files/docs/AGENTS.planner.md',
+                     'tests/fixtures/project-files/docs/AGENTS.planner_check.md',
+                     'tests/fixtures/project-files/docs/AGENTS.worker.md',
+                     'tests/fixtures/project-files/docs/AGENTS.reviewer.md',
+                     'tests/fixtures/project-files/docs/AGENTS.ponytail.md',
+                     'tests/fixtures/project-files/docs/PLANS.md',
+                     'tests/fixtures/provider-profiles.ini', 'scripts/verify.json',
+                     'scripts/verify.sh', 'scripts/verify.ps1',
+                     'scripts/copy-project-files.sh', 'scripts/copy-project-files.ps1',
+                     '.agents/skills/specification-docs/scripts/next_requirement_id.py',
+                     'requirements.txt', 'run.sh', 'run.ps1'):
             with self.subTest(path=path):
                 self.assertTrue(any(inputs.matches(path, pattern) for pattern in patterns))
+        for path in ('AGENTS.md', 'README.md', 'config/config.ini.example',
+                     'docs/PLANS.md', 'docs/PRODUCT.md', 'docs/ARCHITECTURE.md',
+                     'docs/FUTURE_IDEAS.md', 'docs/VERIFY.md',
+                     'docs/PRODUCT.template.md', 'docs/ARCHITECTURE.template.md',
+                     'docs/REQUIREMENT.template.md', 'docs/AGENTS.worker.md',
+                     '.agents/skills/specification-docs/SKILL.md',
+                     'scripts/setup.sh', '.gitignore', '.gitattributes'):
+            with self.subTest(path=path):
+                self.assertFalse(any(inputs.matches(path, pattern) for pattern in patterns))

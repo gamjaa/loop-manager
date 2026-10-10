@@ -1,3 +1,4 @@
+from tests.support.fixed_samples import use_fixed_guidance
 import hashlib
 import json
 from contextlib import closing
@@ -71,6 +72,7 @@ Implement {title}.
 
 class IncrementalPlanningCatalogTest(unittest.TestCase):
     def setUp(self):
+        use_fixed_guidance(self)
         self.temporary = tempfile.TemporaryDirectory()
         self.repo = Path(self.temporary.name)
         git(self.repo, "init", "-b", "main")

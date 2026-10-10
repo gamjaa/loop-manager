@@ -1,3 +1,4 @@
+from tests.support.fixed_samples import use_fixed_guidance
 from tests.support.maintenance import root_results_for, result_for
 import hashlib
 import json
@@ -288,6 +289,7 @@ class ProvisionalFileReviewTest(unittest.TestCase):
         self.assertIsNone(self.ledger.last_success(str(self.repo)))
 
     def setUp(self):
+        use_fixed_guidance(self)
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.repo = Path(temporary.name)
@@ -629,6 +631,9 @@ class ProvisionalFileReviewTest(unittest.TestCase):
 
 
 class ReviewReceiptUnitTest(unittest.TestCase):
+    def setUp(self):
+        use_fixed_guidance(self)
+
     def test_validated_results_survive_restart_without_source_reread(self):
         from unittest import mock
         connection = sqlite3.connect(":memory:")

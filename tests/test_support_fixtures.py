@@ -27,6 +27,148 @@ from tests.support.origin import OriginScopeFixture
 
 
 class SupportFixtureTests(unittest.TestCase):
+    def test_fixed_guidance_covers_digest_and_baseline_until_cleanup(self):
+        from tests.support.fixed_samples import PROJECT_FILES, use_fixed_guidance
+        from loop_manager_internal.agents import common_guidance
+        from loop_manager_internal.storage import planning_input_state
+
+        connection = database_fixture.runtime_connection()
+        self.addCleanup(connection.close)
+        read = common_guidance._read
+        def read_sample(path):
+            self.assertTrue(path.is_relative_to(PROJECT_FILES), path)
+            return read(path)
+        with (mock.patch.object(common_guidance, 'RUNTIME_ROOT', Path('/missing-runtime')),
+              mock.patch.object(common_guidance, '_read', side_effect=read_sample)):
+            with ExitStack() as cleanup:
+                use_fixed_guidance(SimpleNamespace(addCleanup=cleanup.callback))
+                before = loop_manager._planning_input_digest([(b'app.py', b'blob', b'one')])
+                planning_input_state.record_general(connection, 'repo', 'base', {})
+                self.assertFalse(planning_input_state.guidance_changed(connection, 'repo'))
+                self.assertEqual(before, loop_manager._planning_input_digest([(b'app.py', b'blob', b'one')]))
+            self.assertEqual(common_guidance.RUNTIME_ROOT, Path('/missing-runtime'))
+
+    def test_worker_decorator_keeps_planning_baseline_stable_across_nested_context(self):
+        from loop_manager_internal.agents import common_guidance
+        from loop_manager_internal.storage import planning_input_state
+        from tests.support.fixed_samples import PROJECT_FILES
+
+        connection = database_fixture.runtime_connection()
+        self.addCleanup(connection.close)
+        read = common_guidance._read
+        def read_sample(path):
+            self.assertTrue(path.is_relative_to(PROJECT_FILES), path)
+            return read(path)
+
+        @dummy_worker_sessions
+        def scenario():
+            planning_input_state.record_general(connection, 'repo', 'base', [])
+            baseline = connection.execute(
+                'SELECT guidance_hash FROM planning_input_baselines').fetchone()[0]
+            with dummy_worker_context(roles=('worker', 'planner_check')):
+                self.assertEqual(common_guidance.runtime_content_hash(), baseline)
+            self.assertEqual(common_guidance.runtime_content_hash(), baseline)
+
+        with (mock.patch.object(common_guidance, 'RUNTIME_ROOT', Path('/unavailable-runtime')),
+              mock.patch.object(common_guidance, '_read', side_effect=read_sample)):
+            scenario()
+            self.assertEqual(common_guidance.RUNTIME_ROOT, Path('/unavailable-runtime'))
+
+    def test_pr_recovery_pins_fixed_guidance_for_later_hash_consumers(self):
+        from tests.support import pr_recovery
+        from loop_manager_internal.agents import common_guidance
+        from loop_manager_internal.storage import runtime_state
+
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as patches:
+            repo = Path(directory) / 'repo'
+            (repo / 'docs').mkdir(parents=True)
+            def make_worktree(_repo, worktree, *_args):
+                (worktree / 'src').mkdir(parents=True)
+            def register(connection, repo_key, *_args):
+                database_fixture.database._ensure_execplans_schema(connection)
+                database_fixture.AutomationCatalogFixture()._insert_plan(
+                    connection, 'G-026', 'READY', repo=repo_key)
+                runtime_state.RuntimeStateRepository(connection).activate(
+                    repo_key, 'G-026', activation_sha='a' * 40,
+                    branch='branch', worktree='/candidate')
+            for target, options in {
+                'tests.support.pr_recovery.make_remote_repository': {'return_value': repo},
+                'tests.support.pr_recovery.git_command': {'return_value': 'a' * 40},
+                'tests.support.pr_recovery.commit_and_push': {},
+                'loop_manager.make_worktree': {'side_effect': make_worktree},
+                'loop_manager.register_execplans': {'side_effect': register},
+                'loop_manager._parse_execplan': {'return_value': {}},
+                'loop_manager.specification_input_fingerprint': {'return_value': 'spec'},
+                'loop_manager.planning_input_fingerprint': {'return_value': 'planning'},
+                'loop_manager.plan_declarations': {'return_value': []},
+                'tests.support.publication.git_command': {'return_value': 'a' * 40},
+                'loop_manager._revision_execplan_body_hash': {'return_value': 'body'},
+                'loop_manager._revision_execplan_source_fingerprint': {'return_value': 'source'},
+                'loop_manager_internal.agents.common_guidance.RUNTIME_ROOT': {'new': Path('/unavailable-runtime')},
+            }.items():
+                patches.enter_context(mock.patch(target, **options))
+            fixture = pr_recovery.PrRecoveryFixture()
+            fixture.addCleanup = patches.callback
+            result = fixture._pr_open_state(directory)
+            connection = result[2]
+            patches.callback(connection.close)
+            with mock.patch.object(common_guidance, 'runtime_content_hash',
+                                   side_effect=AssertionError('runtime fallback')):
+                saved_hash = common_guidance.plan_content_hash(connection, str(repo), 'G-026')
+            snapshot = connection.execute('SELECT definition_snapshot FROM exec_plans').fetchone()[0]
+            self.assertEqual(json.loads(snapshot)['guidance_hash'], saved_hash)
+
+    def test_publication_hash_and_worker_followup_use_fixed_guidance(self):
+        from loop_manager_internal.agents import common_guidance
+        from tests.support.fixed_samples import PROJECT_FILES
+        from tests.support.publication import seed_validated_candidate
+
+        fixture = execution_fixture(self)
+        read = common_guidance._read
+        def read_sample(path):
+            self.assertTrue(path.is_relative_to(PROJECT_FILES), path)
+            return read(path)
+
+        with (mock.patch.object(common_guidance, 'RUNTIME_ROOT', Path('/unavailable-runtime')),
+              mock.patch.object(common_guidance, '_read', side_effect=read_sample),
+              mock.patch('tests.support.publication.git_command', side_effect=['base', 'candidate']),
+              mock.patch.object(loop_manager, '_revision_execplan_body_hash', return_value='body'),
+              mock.patch.object(loop_manager, '_revision_execplan_source_fingerprint', return_value='source')):
+            snapshot = seed_validated_candidate(fixture.connection, Path('repo'), Path('/candidate'), 'G-047')
+            @dummy_worker_sessions
+            def followup():
+                return common_guidance.plan_content_hash(fixture.connection, 'repo', 'G-047')
+            self.assertEqual(followup(), snapshot.guidance_hash)
+            self.assertEqual(common_guidance.RUNTIME_ROOT, Path('/unavailable-runtime'))
+            row = fixture.connection.execute(
+                'SELECT verify_result, verify_token, review_token FROM exec_plans').fetchone()
+            self.assertEqual(row['verify_token'], snapshot.verify_token('base', 'candidate', row['verify_result']))
+            self.assertEqual(row['review_token'], snapshot.review_token('base', 'candidate'))
+
+    def test_execution_review_hash_uses_fixed_guidance_and_restores_runtime_root(self):
+        from loop_manager_internal.agents import common_guidance
+        from tests.support.fixed_samples import PROJECT_FILES
+
+        original_root = common_guidance.RUNTIME_ROOT
+        read = common_guidance._read
+        def read_sample(path):
+            self.assertTrue(path.is_relative_to(PROJECT_FILES), path)
+            return read(path)
+
+        with mock.patch.object(common_guidance, '_read', side_effect=read_sample) as reads:
+            with ExitStack() as cleanup:
+                owner = SimpleNamespace(addCleanup=cleanup.callback,
+                                        assertEqual=self.assertEqual, fail=self.fail)
+                fixture = execution_fixture(owner)
+                context = fixture.review_context()
+                self.assertEqual(fixture.handler._definition_snapshot.guidance_hash,
+                                 common_guidance.runtime_content_hash())
+                outcome = fixture.handler.review(context)
+                self.assertEqual(outcome.context.phase.value, 'PUBLISHING')
+                self.assertEqual({call.args[0] for call in reads.call_args_list},
+                                 {PROJECT_FILES / path for path in common_guidance.GUIDANCE_PATHS})
+            self.assertEqual(common_guidance.RUNTIME_ROOT, original_root)
+
     def test_origin_scope_fixture_preserves_project_snapshot_without_git(self):
         connection = sqlite3.connect(':memory:')
         self.addCleanup(connection.close)
@@ -356,7 +498,9 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
             self.assertIs(returned, result)
             shared_prepare.assert_called_once_with(owner, '/fixture', **expected)
 
-    def test_shared_active_worker_setup_keeps_working_state_and_input_choice(self):
+    def test_active_worker_project_registers_owned_state_and_input_choice(self):
+        from loop_manager_internal.agents import common_guidance
+        from tests.support.fixed_samples import PROJECT_FILES
         with tempfile.TemporaryDirectory() as directory:
             for record_general_input in (False, True):
                 with self.subTest(record_general_input=record_general_input):
@@ -392,6 +536,7 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
                             commit_message='Add worker plan',
                         )
                     self.assertEqual(len(prepared), 3)
+                    self.assertEqual(common_guidance.RUNTIME_ROOT, PROJECT_FILES)
                     self.assertEqual(prepared[0], repo)
                     self.assertEqual(prepared[2].execute(
                         'SELECT phase FROM projects'

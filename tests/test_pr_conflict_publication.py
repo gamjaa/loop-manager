@@ -74,7 +74,7 @@ class PrConflictPublicationTest(PrRecoveryFixture, unittest.TestCase):
             self.assertEqual(pushes, [])
             agent.assert_not_called()
 
-    @dummy_worker_sessions
+    @dummy_worker_sessions(fixed_guidance=True)
     def test_lease_competition_blocks_without_overwriting_remote_head(self):
         with tempfile.TemporaryDirectory() as directory:
             (

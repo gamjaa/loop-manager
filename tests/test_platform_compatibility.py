@@ -95,12 +95,34 @@ class PlatformCompatibilityTests(unittest.TestCase):
                 "print('검증 진입점')\nraise SystemExit(37)\n", encoding="utf-8")
             command = ([shutil.which("pwsh") or "powershell", "-NoProfile", "-File"]
                        if os.name == "nt" else ["bash"])
-            environment = {
-                key: value for key, value in os.environ.items()
-                if not key.startswith("LOOP_MANAGER_VERIFY_")
-            }
+            # Model Manager's injected launcher settings, then exercise standalone.
+            environment = dict(os.environ)
+            environment.update({
+                "LOOP_MANAGER_VERIFY_RUNNER": str(project / "manager-entrypoint.py"),
+                "LOOP_MANAGER_VERIFY_RUNTIME_PYTHON": sys.executable,
+                "LOOP_MANAGER_VERIFY_VERSION": "1",
+                "LOOP_MANAGER_VERIFY_TIMEOUT": "600",
+            })
+            environment = {key: value for key, value in environment.items()
+                           if not key.startswith("LOOP_MANAGER_VERIFY_")}
             result = subprocess.run([*command, str(launcher)], cwd=directory,
-                                    env=environment, capture_output=True,
-                                    encoding="utf-8", timeout=30)
+                                    env=environment, capture_output=True, encoding="utf-8", timeout=30)
             self.assertEqual(result.returncode, 37, result.stdout + result.stderr)
             self.assertIn("검증 진입점", result.stdout)
+
+    def test_standalone_launcher_fixture_removes_manager_settings(self):
+        def capture(command, **options):
+            environment = options['env']
+            self.assertFalse(any(key.startswith('LOOP_MANAGER_VERIFY_') for key in environment))
+            self.assertEqual(environment['PLATFORM_FIXTURE_VALUE'], 'preserved')
+            self.assertEqual(options['timeout'], 30)
+            self.assertEqual(Path(command[-1]).parent.parent.parent, Path(options['cwd']))
+            return subprocess.CompletedProcess(command, 37, '검증 진입점\n', '')
+
+        with (mock.patch.dict(os.environ, {'LOOP_MANAGER_VERIFY_SESSION': 'manager-session',
+                                          'PLATFORM_FIXTURE_VALUE': 'preserved'}),
+              mock.patch.object(venv.EnvBuilder, 'create') as create,
+              mock.patch.object(subprocess, 'run', side_effect=capture) as run):
+            self.test_verify_launcher_uses_venv_and_root_and_preserves_failure()
+            create.assert_called_once()
+            run.assert_called_once()

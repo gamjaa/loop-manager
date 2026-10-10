@@ -1,0 +1,1 @@
+Ponytail guidance fixture.

@@ -566,6 +566,19 @@ glob의 빈 결과는 관측 가능한 빈 집합이다. 목록 자체와 실제
 확인되지 않은 입력은 재사용할 수 없다. Git 내부·bytecode는 생성물이고 `.venv`는 별도로
 측정한 runtime/외부 의존성 identity로 확인한다.
 
+자체 `scripts/verify-inputs.json`은 `loop_manager.py`, `loop_manager_internal/**`, `tests/**`,
+`requirements.txt`, `scripts/verify.json`, `scripts/verify.sh`·`verify.ps1`,
+`scripts/copy-project-files.sh`·`copy-project-files.ps1`, `run.sh`·`run.ps1`,
+`.agents/skills/specification-docs/scripts/next_requirement_id.py`를 고정 목록으로
+관측한다. `tests/**`의 등록·profile·프로젝트 준비 검증은 문서와 설정 예제 대신 고정 샘플을
+사용한다. 복사 회귀는 저장소의 실제 copy 스크립트 bytes를 샘플 source root에서 실행해 결과
+bytes·경로·기존 파일 보존·재실행 거부를 확인한다. 배포되는 조회 도구와 공통 frontmatter 파서는
+실제 실행 코드 bytes를 샘플 source에 배치해 배포 결과와 조회 동작을 확인한다. 샘플은 현재 문서 원본에서 자동 생성하거나
+동기화하지 않는다. 따라서 `AGENTS.md`, README, docs와 `.agents`의 prose, `config.ini.example`,
+setup·ignore·attributes 변경은 자체 verify 입력이 아니다. 이 제외는 해당 원문의 일관성이나
+품질을 확인하지 않으며 필수 테스트·전체 compile 또는 실제 verify/copy 스크립트 검증을
+축소하지 않는다.
+
 verify 기록은 실행 시 Python의 bytecode write 정책·cache tag·prefix와 프로젝트 Python cache의
 전후 개수, 생성·변경·유지·삭제 수를 남기며 snapshot 소요 시간을 별도 phase로 기록한다.
 비교는 bytecode 설정이 같은지 표시하고 실제 run 시간과 cache 변화를 함께 제공한다. cache 존재를

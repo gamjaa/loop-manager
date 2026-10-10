@@ -1,3 +1,4 @@
+from tests.support.fixed_samples import use_fixed_guidance
 from tests.support.database import AutomationCatalogFixture
 import json
 import tempfile
@@ -45,6 +46,7 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
         self.assertTrue(decision.has_ready)
         self.assertIsNone(decision.runnable_ready)
 
+    @dummy_worker_sessions
     def test_dependency_blocked_ready_is_not_an_empty_catalog(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -388,6 +390,7 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                 self.assertEqual(result.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
                 step.assert_called_once()
 
+    @dummy_worker_sessions
     def test_remote_input_change_after_planner_defers_published_ready_worker(self):
         for publishes_plan in (False, True):
             with self.subTest(publishes_plan=publishes_plan), tempfile.TemporaryDirectory() as directory:
@@ -547,6 +550,7 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                     + ([('G-002', 'IMPLEMENTING')] if publishes_plan else []),
                 )
 
+    @dummy_worker_sessions
     def test_changed_input_plans_before_ready_and_unchanged_input_runs_worker(self):
         for changed in (True, False):
             with self.subTest(changed=changed), tempfile.TemporaryDirectory() as directory:
@@ -766,6 +770,10 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
 
 
 class PreservedPlanningSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
+    def setUp(self):
+        use_fixed_guidance(self)
+        super().setUp()
+
     def test_failed_general_handoff_holds_targets_and_transitive_dependents(self):
         from loop_manager_internal.storage import runtime_state, planner_check_state
         for stage in ('handoff', 'superseded'):

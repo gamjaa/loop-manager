@@ -110,7 +110,7 @@ class ExecPlanDraftDocumentTest(unittest.TestCase):
             "docs/plans/[G-002] Duplicate.md": independent}).active_metadata()
         execplan_drafts.validate_questions(catalog)
 
-    def test_guidance_and_snapshot_expose_readiness_without_execution_state(self):
+    def test_snapshot_and_prompt_expose_readiness_without_execution_state(self):
         from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
         text = draft_text()
         snapshot = ReadyPlanSnapshot("G-001", PATH, "Decision", ("docs/PRODUCT.md",), (),
@@ -118,11 +118,6 @@ class ExecPlanDraftDocumentTest(unittest.TestCase):
         batch = MutableReadySnapshot("repo", "a" * 40, (snapshot,), mutable_snapshot_token("repo", "a" * 40, (snapshot,)))
         self.assertIs(json.loads(batch.prompt_payload())["plans"][0]["draft"], True)
         prompt = loop_manager.planner_prompt(None, mutable_snapshot=batch)
-        guidance = (loop_manager.ROOT / 'docs/AGENTS.planner.md').read_text(encoding='utf-8')
-        self.assertIn("draft: true", guidance)
-        self.assertIn("decision_wait.revision", guidance)
-        self.assertIn("판단 지문", guidance)
-        self.assertIn("자기 승인", guidance)
         self.assertIn(batch.prompt_payload(), prompt)
         for text, expected in ((text, True), (plan_text("G-001", "Decision"), False),
                                (text.replace("draft: true", "draft: false"), False)):

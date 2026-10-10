@@ -1,0 +1,1 @@
+Planner check guidance fixture.

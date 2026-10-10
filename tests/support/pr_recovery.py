@@ -1,5 +1,6 @@
 import sqlite3
 from pathlib import Path
+from unittest import mock
 import loop_manager
 from loop_manager_internal.storage import planning_input_state
 from tests.support.catalog import write_execplan
@@ -11,6 +12,9 @@ from tests.support.git import (
 )
 from tests.support.publication import seed_validated_candidate
 from tests.support.worker import worker_result
+from tests.support.workspace import pin_common_guidance
+from loop_manager_internal.agents.agent_invocation import InvocationContext
+from tests.support.fixed_samples import PROJECT_FILES
 
 
 def observe_live_pull_request(repo: Path, pull_request):
@@ -50,6 +54,10 @@ class PrRecoveryFixture:
         return cache
 
     def _pr_open_state(self, directory: str):
+        guidance_root = mock.patch(
+            'loop_manager_internal.agents.common_guidance.RUNTIME_ROOT', PROJECT_FILES)
+        guidance_root.start()
+        self.addCleanup(guidance_root.stop)
         repo = make_remote_repository(directory)
         state_dir = Path(directory) / "state"
         state_dir.mkdir()
@@ -167,6 +175,9 @@ class PrRecoveryFixture:
                     str(repo),
                 ),
             )
+        pin_common_guidance(connection, InvocationContext(str(repo), 'G-026'),
+                            worktree, state_dir,
+                            sessions=('worker-existing', 'reviewer-existing'))
         seed_validated_candidate(connection, repo, worktree, 'G-026')
         return (
             repo,

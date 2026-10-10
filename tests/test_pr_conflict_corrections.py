@@ -37,7 +37,7 @@ class LivePullRequestObservationTests(unittest.TestCase):
 
 
 class PrConflictLeaseTests(PrRecoveryFixture, unittest.TestCase):
-    @dummy_worker_sessions
+    @dummy_worker_sessions(fixed_guidance=True)
     def test_conflicting_pr_reuses_sessions_revalidates_new_base_and_leases_push(self):
         with tempfile.TemporaryDirectory() as directory:
             (
@@ -362,7 +362,7 @@ class PrConflictCauseRevalidationTests(PrRecoveryFixture, unittest.TestCase):
 class PrConflictInterruptionTests(PrRecoveryFixture, unittest.TestCase):
     # Mock pause/retry policy. Keep real Git for actual source preservation,
     # surviving operations/index, remote lease and resumed publication.
-    @dummy_worker_sessions
+    @dummy_worker_sessions(fixed_guidance=True)
     def test_transient_and_usage_limit_pauses_resume_same_recovery(self):
         pauses = (
             (

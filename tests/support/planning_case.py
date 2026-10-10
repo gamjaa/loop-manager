@@ -1,3 +1,4 @@
+from tests.support.fixed_samples import use_fixed_guidance
 from contextlib import contextmanager
 from dataclasses import replace
 import hashlib
@@ -613,6 +614,7 @@ class FakePorts:
 
 class PlanningCase(unittest.TestCase):
     def setUp(self):
+        use_fixed_guidance(self)
         self.context = PlanningContext(
             repo="/repo",
             repo_path=Path("/repo"),

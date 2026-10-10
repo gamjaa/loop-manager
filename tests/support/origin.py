@@ -3,6 +3,7 @@ from pathlib import Path
 import subprocess
 
 import loop_manager
+from tests.support.fixed_samples import PROJECT_FILES
 from loop_manager_internal.storage import database
 from tests.support.git import git_command as git
 
@@ -23,18 +24,15 @@ def commit_all(repo: Path, message: str) -> str:
 
 def write_registration_files(repo: Path) -> None:
     (repo / "docs/requirements").mkdir(parents=True)
-    (repo / "AGENTS.md").write_bytes((loop_manager.ROOT / "AGENTS.md").read_bytes())
-    (repo / "docs/PLANS.md").write_bytes(
-        (loop_manager.ROOT / "docs/PLANS.md").read_bytes()
-    )
-    (repo / "docs/ARCHITECTURE.md").write_text(
-        "# Test Architecture\n\nCommitted design.\n",
-        encoding="utf-8",
-    )
-    (repo / "docs/PRODUCT.md").write_text(
-        "# Test Product\n\nCommitted behavior.\n",
-        encoding="utf-8",
-    )
+    for relative in (
+        "AGENTS.md",
+        "docs/PLANS.md",
+        "docs/ARCHITECTURE.md",
+        "docs/PRODUCT.md",
+    ):
+        target = repo / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes((PROJECT_FILES / relative).read_bytes())
 
 
 

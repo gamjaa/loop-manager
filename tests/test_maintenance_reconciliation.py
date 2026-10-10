@@ -1,3 +1,4 @@
+from tests.support.fixed_samples import use_fixed_guidance
 import hashlib
 import json
 from pathlib import Path
@@ -38,6 +39,7 @@ def review(item, *, reference=None, similar=None):
 
 class ReconciliationUnitTest(unittest.TestCase):
     def setUp(self):
+        use_fixed_guidance(self)
         reader = mock.patch("loop_manager_internal.maintenance.code_map_artifact.read_maps", return_value={})
         reader.start()
         self.addCleanup(reader.stop)
@@ -371,6 +373,7 @@ class SynthesisPagingTest(unittest.TestCase):
         self.assertEqual([record["kind"] for record in records], ["selected"] * 100 + ["file_review"] * 100)
 
     def setUp(self):
+        use_fixed_guidance(self)
         self.connection = sqlite3.connect(":memory:")
         self.addCleanup(self.connection.close)
         self.connection.execute("CREATE TABLE projects (repo TEXT PRIMARY KEY)")
@@ -487,6 +490,7 @@ class SynthesisPagingTest(unittest.TestCase):
 
 class ResolutionUnitTest(unittest.TestCase):
     def setUp(self):
+        use_fixed_guidance(self)
         self.connection = sqlite3.connect(":memory:")
         self.addCleanup(self.connection.close)
         self.connection.execute("CREATE TABLE projects (repo TEXT PRIMARY KEY)")

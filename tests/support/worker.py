@@ -1,3 +1,4 @@
+from tests.support.fixed_samples import use_fixed_guidance
 import json
 import contextlib
 import sqlite3
@@ -9,6 +10,7 @@ from loop_manager_internal.execution.worker_session import SessionBinding
 from tests.support.catalog import write_execplan
 from tests.support.git import git_command, make_remote_repository, commit_and_push
 from tests.support.lifecycle import register_connection_cleanup
+from tests.support.fixed_samples import PROJECT_FILES
 
 
 def worker_result(
@@ -30,7 +32,7 @@ def isolated_scope_resources(_connection, _repo, worktree, before, role_name, **
 
 
 @contextlib.contextmanager
-def dummy_worker_context(*, roles=("worker",)):
+def dummy_worker_context(*, roles=("worker",), fixed_guidance=True):
     """Opt legacy unused.ini roles into fake profile/session preflight."""
     real_profile = loop_manager._agent_profile
     real_ports = loop_manager._ExecutionLifecyclePorts
@@ -73,21 +75,26 @@ def dummy_worker_context(*, roles=("worker",)):
             return subprocess.CompletedProcess(arguments, 0, stdout=json.dumps({'body': '', **pr}))
         return real_command(arguments, **kwargs)
 
+    runtime_root = (mock.patch('loop_manager_internal.agents.common_guidance.RUNTIME_ROOT', PROJECT_FILES)
+                    if fixed_guidance else contextlib.nullcontext())
     with mock.patch.object(loop_manager, '_agent_profile', side_effect=profile), \
          mock.patch.object(loop_manager, '_ExecutionLifecyclePorts', side_effect=ports), \
-         mock.patch.object(loop_manager, 'command', side_effect=command):
+         mock.patch.object(loop_manager, 'command', side_effect=command), runtime_root:
         yield
 
 
-def dummy_worker_sessions(test):
+def dummy_worker_sessions(test=None, *, fixed_guidance=True):
     """Limit compatibility patches to the explicitly decorated test method."""
     from functools import wraps
 
-    @wraps(test)
-    def run(*args, **kwargs):
-        with dummy_worker_context():
-            return test(*args, **kwargs)
-    return run
+    def decorate(test):
+        @wraps(test)
+        def run(*args, **kwargs):
+            with dummy_worker_context(fixed_guidance=fixed_guidance):
+                return test(*args, **kwargs)
+        return run
+
+    return decorate(test) if test is not None else decorate
 
 
 @contextlib.contextmanager
@@ -129,6 +136,7 @@ def make_active_worker_project(
     commit_message: str,
 ) -> tuple[Path, Path, sqlite3.Connection]:
     """Build a published plan, deterministic workspace, and WORKING projection."""
+    use_fixed_guidance(owner)
     repo = make_remote_repository(directory)
     state_dir = Path(directory) / "state"
     state_dir.mkdir()
@@ -175,6 +183,10 @@ def make_active_worker_project(
 
 class ActiveWorkerFixture:
     """Shared scenario setup; inheriting this fixture collects no tests."""
+    def setUp(self):
+        use_fixed_guidance(self)
+        super().setUp()
+
 
     def _make_active_worker_project(self, directory: str):
         return make_active_worker_project(

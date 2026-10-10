@@ -1,3 +1,4 @@
+from tests.support.fixed_samples import use_fixed_guidance
 from tests.support.catalog import plan_text
 import hashlib
 import json
@@ -30,6 +31,7 @@ from tests.support.git import git_command as git
 
 class MaintenancePlanningCase(unittest.TestCase):
     def setUp(self) -> None:
+        use_fixed_guidance(self)
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)
         root = Path(self.temporary.name)
