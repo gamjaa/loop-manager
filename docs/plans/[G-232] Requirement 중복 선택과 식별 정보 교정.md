@@ -35,7 +35,7 @@ G-230의 원본 해석·G-231의 source 관계를 사용해 번호 배정·보�
 ## Progress
 
 - [x] eb797d3a에 Requirement 중복 선택·제목 기반 동기화가 없음을 확인했다. 기존 ExecPlan batch 교정은 별도 완료 구현이며 재구현하지 않는다. 구현·테스트 실행 없음.
-- [ ] 결정적 선택·편집 구현과 targeted unit 검증
+- [x] `catalog/requirement_corrections.py`에 참조·원격 반영 순서 기반 선택, 최소 식별자 편집, 상대 링크 갱신과 보류 결과를 추가하고 targeted unit 12개를 통과시켰다. 원격 게시와 복구는 별도 계획 범위다.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
