@@ -65,6 +65,7 @@
 | 이벤트 시점의 진행·사용자 조치 알림과 무음 구분 | [R-053](requirements/%5BR-053%5D%20Timely%20Progress%20Notifications.md) |
 | 테스트별 시간·실제 Agent 없는 테스트·안전한 Python 캐시 | [R-058](requirements/archive/%5BR-058%5D%20Test%20Timing%20and%20Agent-Free%20Test%20Execution.md), [R-059](requirements/%5BR-059%5D%20Safe%20Python%20Bytecode%20Cache%20Use.md) |
 | 규칙 기반 작업의 Manager 처리·모델 호출과 입출력 감소 | [R-063](requirements/archive/%5BR-063%5D%20Manager-Owned%20Deterministic%20Work%20and%20Minimal%20Model%20Use.md) |
+| Requirement 중복 ID·제목 선택과 식별 정보 교정 | [R-071](requirements/%5BR-071%5D%20Remaining%20Manager-Owned%20Deterministic%20Work.md) |
 | 실제 검증 입력만의 목록·문서 원본을 고정 샘플로 대체·일반 verify와 후보 성공 결과 재사용 | [R-072](requirements/%5BR-072%5D%20Reuse%20Successful%20Candidate%20Results%20with%20Proven%20Inputs.md) |
 
 R-055의 공통 Git 변경 목표는 정상 fetch·legacy 기본 checkout 제외·BLOCKED 수동 입력 수용·로컬 수용과 게시 분리를 포함한다. 계획·작업 문서 삭제에 따른 관련 작업·source·dependency·현재 DB 관계와 소유 로컬·원격 작업 브랜치의 자동 정리도 R-055를 따른다. 이 변경은 아직 구현 완료로 취급하지 않으며 G-199·G-189에서 확인한다. R-056은 dirty FF-only·clean rebase, R-082는 단계별 원격 문서 갱신을 담당한다.
