@@ -18,6 +18,7 @@ from loop_manager_internal.agents import agent_write_isolation
 from loop_manager_internal.agents import provider_guidance
 from loop_manager_internal.agents.common_guidance import CommonGuidance
 from loop_manager_internal.execution.validation_feedback import redact_secrets
+from loop_manager_internal.config.managed_config import provider_fast_mode
 
 AGENT_CLI_TIMEOUT_SECONDS = 3600
 MAX_REVIEWER_LINE = 256 * 1024
@@ -186,6 +187,12 @@ def run_codex(
         if level is not None:
             raise RuntimeError(f"Codex {role_name}에 Worker level을 지정할 수 없습니다.")
         model, effort = effects.role(config_path, role_name, worktree)
+    fast_mode = provider_fast_mode(config_path, "codex")
+    fast_arguments = ([] if fast_mode is None else [
+        "-c", 'service_tier="fast"' if fast_mode else 'service_tier="default"',
+        "-c", f'features.fast_mode={str(fast_mode).lower()}',
+    ])
+    fast_mode_log = json.dumps({"type": "loop_manager.fast_mode", "requested": fast_mode}) + "\n"
     codex_launch = None
     launch_environment = agent_environment("codex", role_name)
     if on_isolation_checked is not None:
@@ -218,7 +225,8 @@ def run_codex(
     guidance_context = tuple(isolation_arguments or codex_sandbox_arguments(read_only))
     additional = (provider_guidance.codex_arguments(
         common_guidance, worktree, environment=launch_environment,
-        context_arguments=("-m", model, "-c", f'model_reasoning_effort="{effort}"', *guidance_context),
+        context_arguments=("-m", model, "-c", f'model_reasoning_effort="{effort}"',
+                          *fast_arguments, *guidance_context),
     ) if common_guidance else [])
     project_dir = _provider_log_directory(worktree, state_dir)
     last_message = project_dir / f"{role_name}-last.txt"
@@ -244,6 +252,7 @@ def run_codex(
             model,
             "-c",
             f'model_reasoning_effort="{effort}"',
+            *fast_arguments,
             *additional,
             *([] if role_name == "reviewer" else ["-o", str(provider_last_message)]),
             session_id,
@@ -262,6 +271,7 @@ def run_codex(
             model,
             "-c",
             f'model_reasoning_effort="{effort}"',
+            *fast_arguments,
             *additional,
             *([] if role_name == "reviewer" else ["-o", str(provider_last_message)]),
             "-",
@@ -274,6 +284,7 @@ def run_codex(
     reviewer_usage = ""
     if (persist_session and not session_id) or role_name == "reviewer" or on_process_started is not None:
         with log.open("w", encoding="utf-8") as output:
+            output.write(fast_mode_log)
             start = codex_launch.start if codex_launch else effects._handoff_popen
             process = start(
                 arguments,
@@ -341,6 +352,7 @@ def run_codex(
                     codex_launch.stop(process)
     else:
         with log.open("w", encoding="utf-8") as output:
+            output.write(fast_mode_log)
             runner = codex_launch.run if codex_launch is not None else effects._handoff_run
             result = runner(
                 arguments,
@@ -446,6 +458,8 @@ def run_claude(
         config_path, "claude", role_name, level, worktree
     )
     model, effort = profile.model, profile.effort
+    fast_mode = provider_fast_mode(config_path, "claude")
+    fast_mode_log = json.dumps({"type": "loop_manager.fast_mode", "requested": fast_mode}) + "\n"
     additional = provider_guidance.claude_arguments(common_guidance) if common_guidance else []
     if on_isolation_checked is not None:
         agent_write_isolation.prepare_isolation(
@@ -470,7 +484,7 @@ def run_claude(
         model,
         "--effort",
         effort,
-        *claude_permission_arguments(read_only),
+        *claude_permission_arguments(read_only, fast_mode=fast_mode),
         *additional,
         *(["--resume", session_id] if session_id else []),
     ]
@@ -486,6 +500,7 @@ def run_claude(
         stream_error_message = ""
         diagnostic_tail = ""
         with log.open("w", encoding="utf-8") as output:
+            output.write(fast_mode_log)
             process = effects._handoff_popen(
                 arguments,
                 stdin=subprocess.PIPE,
@@ -584,7 +599,7 @@ def run_claude(
         )
         returncode = result.returncode
         raw_output = result.stdout or ""
-        log.write_text(_redact_reviewer_log(raw_output) if role_name == "reviewer" else raw_output,
+        log.write_text(fast_mode_log + (_redact_reviewer_log(raw_output) if role_name == "reviewer" else raw_output),
                        encoding="utf-8")
         try:
             event = json.loads(raw_output)
@@ -635,7 +650,7 @@ def codex_sandbox_arguments(read_only: bool) -> list[str]:
     return list(agent_write_isolation.codex_arguments(read_only))
 
 
-def claude_permission_arguments(read_only: bool) -> list[str]:
+def claude_permission_arguments(read_only: bool, *, fast_mode: bool | None = None) -> list[str]:
     arguments = ["--permission-mode", "auto"]
     if read_only:
         arguments.extend([
@@ -649,6 +664,8 @@ def claude_permission_arguments(read_only: bool) -> list[str]:
         "allowUnsandboxedCommands": False, "autoAllowBashIfSandboxed": False,
         "excludedCommands": [],
     }}
+    if fast_mode is not None:
+        settings["fastMode"] = fast_mode
     arguments.extend(["--settings", json.dumps(settings, sort_keys=True)])
     return arguments
 

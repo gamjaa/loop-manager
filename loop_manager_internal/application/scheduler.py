@@ -10,7 +10,7 @@ from loop_manager_internal.application.contracts import ScheduledProjectResult
 from loop_manager_internal.application.commands import (
     LocalRecoveryExecutionEffects, execute_local_recovery_request, next_local_recovery_request,
 )
-from loop_manager_internal.config.managed_config import ManagedConfig
+from loop_manager_internal.config.managed_config import ManagedConfig, fast_mode_settings
 from loop_manager_internal.config.managed_config import ManagedConfigError
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.runtime import project_registry
@@ -48,9 +48,11 @@ def _run_registered_project(
     handoff_gate: RuntimeHandoffGate | None = None,
     verify_coordinator: VerifyCoordinator | None = None,
     verify_parallelism: str | int = "auto",
+    managed_config: ManagedConfig | None = None,
 ) -> ScheduledProjectResult:
     """Run one registry row with state isolated to this worker connection."""
 
+    config_token = fast_mode_settings.set(managed_config) if managed_config is not None else None
     handoff_token = _runtime_handoff_signal.set(handoff_gate)
     verify_token = (verify_settings.set(ExecutionSettings(verify_coordinator, verify_parallelism, state_dir))
                     if verify_coordinator is not None else None)
@@ -130,6 +132,8 @@ def _run_registered_project(
         if verify_token is not None:
             verify_settings.reset(verify_token)
         _runtime_handoff_signal.reset(handoff_token)
+        if config_token is not None:
+            fast_mode_settings.reset(config_token)
     return ScheduledProjectResult(project.repo, result)
 
 
@@ -182,6 +186,7 @@ def schedule_registered_projects(
                 handoff_gate=handoff_gate,
                 verify_coordinator=verify_coordinator,
                 verify_parallelism=config.verify_parallelism,
+                managed_config=config,
                 **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
             )
             for project in projects
