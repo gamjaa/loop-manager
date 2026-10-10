@@ -35,7 +35,7 @@ G-230의 원본 해석·G-231의 source 관계를 사용해 번호 배정·보�
 ## Progress
 
 - [x] eb797d3a에 Requirement 중복 선택·제목 기반 동기화가 없음을 확인했다. 기존 ExecPlan batch 교정은 별도 완료 구현이며 재구현하지 않는다. 구현·테스트 실행 없음.
-- [x] `catalog/requirement_corrections.py`에 참조·원격 반영 순서 기반 선택, 최소 식별자 편집, 상대 링크 갱신과 보류 결과를 추가했다. 들여쓴·여러 줄 코드 예제, 목적지 충돌, 보류 후 source 안전성 검증을 포함한다. blockquote 내부 fenced·들여쓴 코드와 중첩·닫히지 않은 fence의 컨테이너 종료 보존 회귀를 추가하고 현재 후보에서 `python3 -m unittest tests.test_requirement_corrections` 16개를 통과시켰다. 원격 게시와 복구는 별도 계획 범위다.
+- [x] `catalog/requirement_corrections.py`에 참조·원격 반영 순서 기반 선택, 최소 식별자 편집, 상대 링크 갱신과 보류 결과를 추가했다. 들여쓴·여러 줄 코드 예제, 목적지 충돌, 보류 후 source 안전성 검증을 포함한다. blockquote·목록 내부 fenced·들여쓴 코드와 중첩·닫히지 않은 fence의 컨테이너 종료 보존 회귀를 추가했다. 목록 코드 전후 일반 링크와 코드 내부 목록 표식·탭 들여쓰기를 함께 확인하고, 현재 후보에서 `python3 -m unittest tests.test_requirement_corrections` 재실행 결과 17개를 통과시켰다. 원격 게시와 복구는 별도 계획 범위다.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log

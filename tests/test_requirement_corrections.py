@@ -123,6 +123,42 @@ class RequirementCorrectionSelectionTest(unittest.TestCase):
 
 
 class RequirementCorrectionEditingTest(unittest.TestCase):
+    def test_list_code_preserves_literals_and_updates_links_before_and_after(self):
+        old = "docs/requirements/[R-001] Old.md"
+        owner = "docs/requirements/[R-002] Owner.md"
+        link = "[demo](%5BR-001%5D%20Old.md)"
+        renamed = "[demo](%5BR-001%5D%20New.md)"
+        examples = (
+            (f"- ~~~text\n  {link}\n  ~~~\n", f"- {link}\n"),
+            (f"+ ```text\n  {link}\n  ```\n", f"  {link}\n"),
+            (f"12. ~~~text\n    {link}\n    ~~~\n", link + "\n"),
+            (f"2) ~~~~text\n   ~~~\n   {link}\n   ~~~~\n", link + "\n"),
+            (f"- item\n\n  ~~~text\n  {link}\n  ~~~\n", f"  {link}\n"),
+            (f"- item\n  - ~~~text\n    {link}\n    ~~~\n", f"  - {link}\n"),
+            (f"> - ~~~text\n>   {link}\n>   ~~~\n", f"> - {link}\n"),
+            (f"- > ~~~text\n  > {link}\n  > ~~~\n", f"  > {link}\n"),
+            (f"- item\n\n      {link}\n\n", f"  {link}\n"),
+            (f"- ~~~text\n  {link}\n", f"- {link}\n"),
+            (f"- item\n  - ~~~text\n    {link}\n", f"  {link}\n"),
+            (f"- ~~~text\n  - literal marker\n  {link}\n  ~~~\n", link + "\n"),
+            (f"-\t~~~text\n\t{link}\n\t~~~\n", link + "\n"),
+        )
+        for example, following in examples:
+            with self.subTest(example=example):
+                before = requirement("R-002", "Owner") + link + "\n\n"
+                result = requirement_corrections.plan_requirement_corrections(
+                    {
+                        old: requirement("R-001", "New"),
+                        owner: before + example + following,
+                    },
+                    references_complete=True,
+                )
+                expected = (
+                    before.replace(link, renamed) + example
+                    + following.replace(link, renamed)
+                )
+                self.assertEqual(dict(result.updated_documents)[owner], expected.encode())
+
     def test_blockquote_code_is_preserved_while_surrounding_links_are_renamed(self):
         old = "docs/requirements/[R-001] Old.md"
         owner = "docs/requirements/[R-002] Owner.md"

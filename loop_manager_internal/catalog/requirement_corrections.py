@@ -25,6 +25,7 @@ _LINK_DEFINITION = re.compile(
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _INDENTED_CODE = re.compile(r"^(?: {4}| {0,3}\t)")
 _BLOCKQUOTE = re.compile(r"^ {0,3}>[ \t]?")
+_LIST_MARKER = re.compile(r"^ {0,3}(?:[-+*]|[0-9]{1,9}[.)])(?P<padding> +)")
 _USER_DECISION = re.compile(r"^(#{1,6})[ \t]+User Decision(?:[ \t]+#+)?[ \t]*$")
 _ANY_HEADING = re.compile(r"^(#{1,6})(?:[ \t]+|$)")
 _IGNORED_SOURCES = frozenset({"docs/PRODUCT.md", "manager:verify-inputs"})
@@ -262,27 +263,41 @@ def _rewrite_markdown_links(
     in_frontmatter = lines[0].removeprefix("\ufeff").rstrip("\r\n") == "---"
     frontmatter_open = in_frontmatter
     fence: tuple[str, int, int] | None = None
+    # Zero denotes a quote; list items store their content indentation.
+    containers: list[int] = []
     inline_code_delimiter: int | None = None
     decision_level: int | None = None
 
     for index, line in enumerate(lines):
         content = line.rstrip("\r\n")
-        block_content = content
-        quote_depth = 0
-        while quote_match := _BLOCKQUOTE.match(block_content):
-            block_content = block_content[quote_match.end():]
-            quote_depth += 1
         if frontmatter_open:
             output.append(line)
             if index and content == "---":
                 frontmatter_open = False
             continue
+        # Normalize only the inspection copy, preserving all original bytes.
+        block_content = content
+        retained = 0
+        for indent in containers:
+            if indent == 0:
+                quote_match = _BLOCKQUOTE.match(block_content)
+                if quote_match is None:
+                    break
+                block_content = block_content[quote_match.end():]
+            elif not block_content.strip():
+                block_content = ""
+            elif block_content.expandtabs(4).startswith(" " * indent):
+                block_content = block_content.expandtabs(4)[indent:]
+            else:
+                break
+            retained += 1
+        del containers[retained:]
         if fence is not None:
             marker, size, fence_depth = fence
-            if quote_depth < fence_depth:
+            if retained < fence_depth:
                 fence = None
             else:
-                if quote_depth == fence_depth and re.fullmatch(
+                if re.fullmatch(
                     rf" {{0,3}}{re.escape(marker)}{{{size},}}[ \t]*", block_content,
                 ):
                     fence = None
@@ -294,10 +309,26 @@ def _rewrite_markdown_links(
                 content, inline_code_delimiter,
             )
         else:
+            # Discover new containers only outside fenced/inline code. A list
+            # continuation uses the indentation recorded on its opening line.
+            while True:
+                quote_match = _BLOCKQUOTE.match(block_content)
+                if quote_match is not None:
+                    containers.append(0)
+                    block_content = block_content[quote_match.end():]
+                    continue
+                list_content = block_content.expandtabs(4)
+                list_match = _LIST_MARKER.match(list_content)
+                if list_match is None:
+                    break
+                padding = len(list_match.group("padding"))
+                indent = list_match.start("padding") + (padding if padding <= 4 else 1)
+                containers.append(indent)
+                block_content = list_content[indent:]
             fence_match = _FENCE.match(block_content)
             if fence_match is not None:
                 marker = fence_match.group(1)
-                fence = (marker[0], len(marker), quote_depth)
+                fence = (marker[0], len(marker), len(containers))
                 output.append(line)
                 continue
 
