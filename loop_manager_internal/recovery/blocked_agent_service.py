@@ -596,6 +596,7 @@ def preserve_blocked_agent_changes(
     *,
     preserved_input_path: str | None = None,
     accept_current_input: bool = False,
+    validated_snapshot: GitSnapshot | None = None,
 ) -> GitSnapshot | None:
     """Persist and isolate a diagnosed scope violation crash-safely."""
 
@@ -607,7 +608,22 @@ def preserve_blocked_agent_changes(
     ).fetchone()
     if project is None:
         raise AgentScopeError("보존할 BLOCKED Agent 프로젝트가 없습니다.")
+
+    def capture_validated_current() -> GitSnapshot:
+        if not isinstance(validated_snapshot, GitSnapshot):
+            raise AgentScopeError(
+                "BLOCKED Agent 현재 입력의 검증 snapshot이 없습니다."
+            )
+        current = effects.capture_git_snapshot(worktree)
+        if current.serialize() != validated_snapshot.serialize():
+            raise AgentScopeError(
+                "BLOCKED Agent 입력이 scope 검증 이후 변경되어 보존하지 않습니다."
+            )
+        return current
+
     if project["agent_recovery"]:
+        if accept_current_input:
+            capture_validated_current()
         recovery = effects._deserialize_blocked_agent_recovery(
             str(project["agent_recovery"])
         )
@@ -627,6 +643,8 @@ def preserve_blocked_agent_changes(
         effects._complete_blocked_agent_recovery(connection, repo, worktree)
         return before
     if not project["agent_snapshot"] or not project["agent_result_snapshot"]:
+        if accept_current_input:
+            capture_validated_current()
         return None
     try:
         before = GitSnapshot.deserialize(str(project["agent_snapshot"]))
@@ -639,7 +657,11 @@ def preserve_blocked_agent_changes(
         raise AgentScopeError(
             "Agent 실행 전 Git operation이 있는 worktree는 자동 격리할 수 없습니다."
         )
-    current = effects.capture_git_snapshot(worktree)
+    current = (
+        capture_validated_current()
+        if accept_current_input
+        else effects.capture_git_snapshot(worktree)
+    )
     if accept_current_input:
         effects._blocked_agent_local_baseline(
             before, result, current, worktree, accept_current_input=True,

@@ -14,10 +14,12 @@ from loop_manager_internal.recovery import blocked_checkpoint
 from loop_manager_internal.recovery import checkpoint_ownership
 from loop_manager_internal.recovery import blocked_plan_reconciliation
 from loop_manager_internal.recovery import blocked_remote_observation
+from loop_manager_internal.recovery import recovery_runtime
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 
 
 from tests.support.blocked_remote import PlanRemoteRecoveryFixture
+from tests.support.git import git_command
 
 
 class PlanRecoveryGateTests(PlanRemoteRecoveryFixture, unittest.TestCase):
@@ -223,6 +225,74 @@ class PlanRecoveryGateTests(PlanRemoteRecoveryFixture, unittest.TestCase):
         self.assertEqual(dict(self.connection.execute('SELECT * FROM projects').fetchone()), projected)
         self.assertEqual(self.plan()['status'], 'PLAN_BLOCKED')
         self.assertEqual(self.plan('G-107')['last_error'], 'other worker feedback')
+
+    def test_remote_snapshot_race_from_scope_validation_keeps_same_input_retryable(self):
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(
+            self.connection).get(self.repo, 'G-106')
+        self.assertIsNone(checkpoint.operation)
+        request = self.connection.execute(
+            "SELECT phase FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?",
+            (self.repo, 'G-106'),
+        ).fetchone()
+        self.assertNotEqual(request['phase'], 'retry_pending')
+        self.ports.validate_blocked_agent_scope.side_effect = [
+            recovery_runtime.RecoveryFailure(
+                recovery_runtime.RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                'tracking ref moved during remote observation',
+            ),
+            None,
+            None,
+        ]
+
+        self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.assertTrue(blocked_remote_observation.pending_input(self.row()))
+        saved = self.connection.execute(
+            "SELECT stage FROM blocked_plan_reconciliations WHERE repo = ? AND plan_id = ?",
+            (self.repo, 'G-106'),
+        ).fetchone()
+        self.assertEqual(saved['stage'], 'observed')
+
+        with mock.patch.object(self.coordinator, '_publish'):
+            self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
+        self.ports.validate_blocked_agent_scope.assert_called()
+        self.assertEqual(self.ports.validate_blocked_agent_scope.call_count, 3)
+        self.assertFalse(blocked_remote_observation.pending_input(self.row()))
+
+    def test_code_only_commit_marks_blocked_candidate_changed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory)
+            git_command(worktree, 'init', '--initial-branch=main')
+            git_command(worktree, 'config', 'user.email', 'loop-manager@example.com')
+            git_command(worktree, 'config', 'user.name', 'Loop Manager Test')
+            source = worktree / 'src/app.py'
+            source.parent.mkdir()
+            source.write_text('VALUE = 1\n', encoding='utf-8')
+            git_command(worktree, 'add', 'src/app.py')
+            git_command(worktree, 'commit', '-m', 'baseline')
+            blocked_result = loop_manager.capture_git_snapshot(worktree)
+            source.write_text('VALUE = 2\n', encoding='utf-8')
+            git_command(worktree, 'add', 'src/app.py')
+            git_command(worktree, 'commit', '-m', 'user code correction')
+            self.ports.capture_git_snapshot.side_effect = loop_manager.capture_git_snapshot
+            self.ports._worktree_execplan_input_fingerprint.return_value = 'same-plan-input'
+            self.ports._revision_execplan_input_fingerprint.return_value = 'same-plan-input'
+            self.connection.execute(
+                'UPDATE exec_plans SET worktree = ?, blocked_fingerprint = ?, '
+                'blocked_worktree_fingerprint = ?, agent_result_snapshot = ? '
+                'WHERE repo = ? AND plan_id = ?',
+                (str(worktree), 'same-plan-input', 'same-plan-input',
+                 blocked_result.serialize(), self.repo, 'G-106'),
+            )
+            self.connection.commit()
+            plan = self.plan()
+
+            self.assertEqual(
+                self.ports._worktree_execplan_input_fingerprint(worktree, plan),
+                plan['blocked_worktree_fingerprint'],
+            )
+            self.assertTrue(self.coordinator._candidate_changed(
+                plan, {'base_oid': self.base},
+            ))
 
 
 class ExistingPrPlanRecoveryTests(PlanRemoteRecoveryFixture, unittest.TestCase):
@@ -1168,7 +1238,6 @@ class PlanCheckpointPublicationRaceTests(PlanRemoteRecoveryFixture, unittest.Tes
         self.assertEqual(len(calls), 2)
         self.ports._evaluate_remote_checkpoint_cause.assert_called_once()
         self.assertFalse(blocked_remote_observation.pending_input(self.row()))
-
 
     def test_registered_observation_preserves_legacy_review_release(self):
         with tempfile.TemporaryDirectory() as directory:

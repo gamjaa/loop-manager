@@ -10,11 +10,12 @@ import tempfile
 from unittest import TestCase, mock
 
 import loop_manager as manager
-from loop_manager_internal.agents import scope_adapter, scope_baseline, scope_lifecycle, scope_observation, scope_recovery, scope_validation
+from loop_manager_internal.agents import scope_adapter, scope_baseline, scope_lifecycle, scope_observation, scope_recovery, scope_state_service, scope_validation
 from loop_manager_internal.agents.scope_contracts import AgentScopeError, GitSnapshot
 from loop_manager_internal.recovery import blocked_plan_reconciliation, blocked_remote_observation
 from loop_manager_internal.storage import agent_invocation_state, blocked_checkpoint_state, execution_checkpoint_state, runtime_state
 from tests.support.database import runtime_connection
+from tests.support.git import git_command
 
 
 def snapshot(**changes):
@@ -171,6 +172,24 @@ class ScopeValidationTests(TestCase):
     def validate(self, role, before, after, **kwargs):
         return scope_validation.validate_agent_scope(role, Path('/managed'), before, after,
             selected_plan_path='docs/plans/[G-047] Runtime.md', effects=self.effects, **kwargs)
+
+    def test_blocked_scope_validation_returns_the_captured_snapshot(self):
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        current = snapshot(config={'local:remote.origin.url': ('origin',)})
+        capture = mock.Mock(return_value=current)
+        effects = replace(manager._scope_recovery_effects(), capture_git_snapshot=capture)
+
+        validated = scope_state_service.validate_blocked_agent_scope(
+            scope_state_service.ValidateBlockedAgentScopeEffects(
+                _scope_recovery_effects=lambda: effects,
+            ),
+            connection, Path('/repo'), 'repo', 'main', Path('/managed'),
+            'docs/plans/[G-047] Runtime.md',
+        )
+
+        self.assertEqual(validated, current)
+        capture.assert_called_once_with(Path('/managed'))
 
     def test_reviewer_is_read_only_and_worker_protected_paths_stay_protected(self):
         for path in ('src/app.py', 'AGENTS.md', 'docs/ARCHITECTURE.md', 'docs/requirements/change.md'):
@@ -535,6 +554,7 @@ class PersistedScopeServiceTests(TestCase):
             with mock.patch.object(manager, 'capture_git_snapshot', return_value=current):
                 preserved = manager.preserve_blocked_agent_changes(
                     connection, 'repo', worktree, 'G-047', accept_current_input=True,
+                    validated_snapshot=current,
                 )
                 self.assertEqual(preserved, current)
                 with self.assertRaises(AgentScopeError):
@@ -544,6 +564,33 @@ class PersistedScopeServiceTests(TestCase):
             self.assertEqual(tuple(connection.execute(
                 "SELECT agent_snapshot, agent_result_snapshot FROM projects WHERE repo='repo'",
             ).fetchone()), (before.serialize(), result.serialize()))
+
+    def test_blocked_agent_preservation_rejects_git_snapshot_change_after_validation(self):
+        before = snapshot()
+        result = replace(before, dirty={'agent.py': (('unstaged',), 'saved Agent output')})
+        validated = replace(before, head='user-head')
+        changed = replace(validated, config={'local:remote.origin.url': ('foreign',)})
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        connection.execute(
+            "UPDATE projects SET agent_role='worker', agent_snapshot=?, "
+            "agent_result_snapshot=? WHERE repo='repo'",
+            (before.serialize(), result.serialize()),
+        )
+        connection.commit()
+
+        with mock.patch.object(manager, 'capture_git_snapshot', return_value=changed), \
+             mock.patch.object(manager, '_blocked_agent_local_baseline') as baseline:
+            with self.assertRaisesRegex(AgentScopeError, '검증 이후 변경'):
+                manager.preserve_blocked_agent_changes(
+                    connection, 'repo', Path('/managed'), 'G-047',
+                    accept_current_input=True, validated_snapshot=validated,
+                )
+
+        baseline.assert_not_called()
+        self.assertEqual(tuple(connection.execute(
+            "SELECT agent_snapshot, agent_result_snapshot FROM projects WHERE repo='repo'",
+        ).fetchone()), (before.serialize(), result.serialize()))
 
     def test_blocked_agent_preservation_resumes_pending_recovery_for_current_input(self):
         before = snapshot()
@@ -566,16 +613,18 @@ class PersistedScopeServiceTests(TestCase):
         )
         connection.commit()
 
-        with mock.patch.object(manager, "_complete_blocked_agent_recovery") as complete:
+        with mock.patch.object(manager, 'capture_git_snapshot', return_value=before), \
+             mock.patch.object(manager, "_complete_blocked_agent_recovery") as complete:
             preserved = manager.preserve_blocked_agent_changes(
                 connection, "repo", Path("/managed"), "G-047",
                 accept_current_input=True,
+                validated_snapshot=before,
             )
 
         self.assertEqual(preserved, before)
         complete.assert_called_once_with(connection, "repo", Path("/managed"))
 
-    def test_blocked_plan_resume_hands_validated_current_state_to_preservation(self):
+    def test_blocked_plan_resume_detects_code_only_committed_candidate(self):
         from types import SimpleNamespace
         from loop_manager_internal.recovery import blocked_plan_service
         from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
@@ -583,14 +632,27 @@ class PersistedScopeServiceTests(TestCase):
         with tempfile.TemporaryDirectory() as directory:
             worktree = Path(directory).resolve()
             branch = 'loop-manager/G-047'
+            git_command(worktree, 'init', f'--initial-branch={branch}')
+            git_command(worktree, 'config', 'user.email', 'loop-manager@example.com')
+            git_command(worktree, 'config', 'user.name', 'Loop Manager Test')
+            source = worktree / 'src/app.py'
+            source.parent.mkdir()
+            source.write_text('VALUE = 1\n', encoding='utf-8')
+            git_command(worktree, 'add', 'src/app.py')
+            git_command(worktree, 'commit', '-m', 'blocked Agent result')
+            blocked_result = manager.capture_git_snapshot(worktree)
+            source.write_text('VALUE = 2\n', encoding='utf-8')
+            git_command(worktree, 'add', 'src/app.py')
+            git_command(worktree, 'commit', '-m', 'user code correction')
+            current = manager.capture_git_snapshot(worktree)
             connection = runtime_connection()
             self.addCleanup(connection.close)
             connection.execute(
                 "UPDATE exec_plans SET status='IMPLEMENTING', active_sha='base', branch=?, "
                 "worktree=?, workspace_owned=1, blocked_fingerprint='old-input', "
-                "blocked_worktree_fingerprint='old-worktree' "
+                "blocked_worktree_fingerprint='old-worktree', agent_result_snapshot=? "
                 "WHERE repo='repo' AND plan_id='G-047'",
-                (branch, str(worktree)),
+                (branch, str(worktree), blocked_result.serialize()),
             )
             connection.execute(
                 "UPDATE projects SET planning_attempt_fingerprint=NULL WHERE repo='repo'",
@@ -608,7 +670,7 @@ class PersistedScopeServiceTests(TestCase):
                 {str(worktree): ('HEAD=user-head', f'branch=refs/heads/{branch}')}, {}, {},
             )
             preserve = mock.Mock(return_value=current)
-            validate = mock.Mock()
+            validate = mock.Mock(return_value=current)
             effects = SimpleNamespace(
                 _blocked_execplan_metadata_error=mock.Mock(return_value=None),
                 _blocked_execplan_revision_metadata_error=mock.Mock(return_value=None),
@@ -626,10 +688,10 @@ class PersistedScopeServiceTests(TestCase):
                 _requeue_blocked_execplan=mock.Mock(),
                 _restore_agent_staged_entries=mock.Mock(),
                 _resume_interrupted_blocked_rebase=mock.Mock(return_value=None),
-                _revision_execplan_input_fingerprint=mock.Mock(return_value='new-input'),
+                _revision_execplan_input_fingerprint=mock.Mock(return_value='old-input'),
                 _revision_review_issue_fingerprint=mock.Mock(return_value=None),
                 _update_blocked_error=mock.Mock(),
-                _worktree_execplan_input_fingerprint=mock.Mock(return_value='new-worktree'),
+                _worktree_execplan_input_fingerprint=mock.Mock(return_value='old-worktree'),
                 capture_git_snapshot=mock.Mock(return_value=current),
                 clear_agent_scope=mock.Mock(),
                 git=mock.Mock(side_effect=lambda _path, *args, **_kwargs:
@@ -652,8 +714,8 @@ class PersistedScopeServiceTests(TestCase):
             self.assertTrue(validate.call_args.kwargs['changed_candidate'])
             preserve.assert_called_once()
             self.assertTrue(preserve.call_args.kwargs['accept_current_input'])
-            self.assertEqual(preserve.call_args.kwargs['preserved_input_path'],
-                             'docs/plans/[G-047] Runtime.md')
+            self.assertEqual(preserve.call_args.kwargs['validated_snapshot'], current)
+            self.assertIsNone(preserve.call_args.kwargs['preserved_input_path'])
 
     def test_dirty_blocked_baseline_and_security_flags_are_not_absorbed(self):
         before = snapshot(worktrees={str(Path('/managed').resolve()): ('HEAD=head', 'branch=refs/heads/loop-manager/G-047')})

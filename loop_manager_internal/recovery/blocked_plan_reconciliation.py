@@ -238,6 +238,18 @@ class BlockedPlanReconciler:
             if (current_worktree != previous_worktree
                     and current_worktree != str(plan['blocked_fingerprint'] or '')):
                 return True
+        saved_result = plan['agent_result_snapshot']
+        if saved_result and plan['worktree']:
+            try:
+                baseline = GitSnapshot.deserialize(str(saved_result))
+            except (KeyError, TypeError, ValueError, RuntimeError) as error:
+                raise RuntimeError(
+                    f"차단된 Agent 결과 snapshot이 유효하지 않습니다: {error}"
+                ) from error
+            current = self.ports.capture_git_snapshot(Path(plan['worktree']))
+            if (current.branch, current.head, current.index, current.dirty) != (
+                    baseline.branch, baseline.head, baseline.index, baseline.dirty):
+                return True
         return False
 
     def _save(self, plan_id, key, stage, context):
@@ -697,7 +709,10 @@ class BlockedPlanReconciler:
                 (self.repo, plan_id)).fetchone()
             retry = (checkpoint.operation is not None or isinstance(error, AssessmentPending)
                      or isinstance(error, RecoveryFailure)
-                     and error.reason is RecoveryReason.PUBLICATION_RETRY
+                     and error.reason in {
+                         RecoveryReason.PUBLICATION_RETRY,
+                         RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                     }
                      or request is not None and request['phase'] == 'retry_pending')
             self.ports._update_blocked_error(self.connection, self.repo, plan_id, str(error), preserve_cause=True)
             if not retry:

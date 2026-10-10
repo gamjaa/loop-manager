@@ -803,7 +803,7 @@ def validate_blocked_agent_scope(
     require_safe_result: bool = False,
     changed_candidate: bool = False,
     effects: ScopeRecoveryEffects,
-) -> None:
+) -> GitSnapshot:
     """Revalidate preserved Agent output before a BLOCKED plan can resume."""
 
     project = effects.repository(connection).scope_owner(repo)
@@ -813,7 +813,7 @@ def validate_blocked_agent_scope(
         raise AgentScopeError("BLOCKED Agent 범위를 확인할 프로젝트가 없습니다.")
     serialized = project["agent_snapshot"]
     if not serialized:
-        return
+        return effects.capture_git_snapshot(worktree)
     role_name = str(project["agent_role"] or "")
     if role_name not in {"planner", "worker", "reviewer"}:
         raise AgentScopeError(
@@ -900,7 +900,7 @@ def validate_blocked_agent_scope(
                 connection, repo_path, repo, plan_id, before, current) | published_refs | observed_refs,
             allowed_worktree_changes=effects._proven_merged_cleanup_paths(connection, repo, before, current),
             **scope_options, connection=connection)
-        return
+        return current
     before = reconcile_metadata(before)
     scope_before = before
     allowed_ref_changes: frozenset[str] = observed_refs
@@ -999,7 +999,7 @@ def validate_blocked_agent_scope(
                         allowed_worktree_changes=allowed_worktree_changes,
                         external_worktree=repo_path, base_branch=base,
                         resources=resources, connection=connection)
-                    return
+                    return current
                 if relation not in {0, 1}:
                     raise AgentScopeError('사용자 입력의 commit 관계를 확인할 수 없습니다.')
         if result_serialized and not changed_candidate:
@@ -1070,3 +1070,4 @@ def validate_blocked_agent_scope(
         connection=connection,
         resources=post_agent_resources,
     )
+    return current
