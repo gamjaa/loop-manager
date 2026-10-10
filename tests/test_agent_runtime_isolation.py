@@ -100,8 +100,8 @@ class RuntimeReadOnlyIsolationTests(TestCase):
             connection.row_factory = sqlite3.Row
             self.addCleanup(connection.close)
             state.ensure_schema(connection)
-            connection.execute('CREATE TABLE projects (repo TEXT, base_branch TEXT, provider TEXT, registered INT)')
-            connection.execute('INSERT INTO projects VALUES (?, ?, ?, 1)',
+            connection.execute('CREATE TABLE projects (repo TEXT, base_branch TEXT, provider TEXT, registered INT, origin TEXT)')
+            connection.execute('INSERT INTO projects VALUES (?, ?, ?, 1, NULL)',
                                (str(boundary.source), 'main', 'codex'))
             connection.commit()
             drafts = mock.Mock()
@@ -137,7 +137,8 @@ class RuntimeReadOnlyIsolationTests(TestCase):
                  mock.patch.object(document_drafts, 'parse_generated_draft', return_value=None) as parse, \
                  mock.patch.object(manager, 'operation_print'), \
                  mock.patch.object(manager, '_agent_profile', return_value=invocation.ResolvedProfile('model', 'high')), \
-                 mock.patch.object(manager, 'capture_git_snapshot', return_value=mock.Mock(serialize=lambda: 'snapshot')), \
+                 mock.patch.object(manager, 'capture_git_snapshot', return_value=manager.GitSnapshot(
+                     observed['head'], None, {}, {}, {}, {}, {}, {})), \
                  mock.patch.object(isolation, '_git', side_effect=git), \
                  mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
                  mock.patch.object(isolation.subprocess, 'run', side_effect=run), \

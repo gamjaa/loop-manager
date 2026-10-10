@@ -166,12 +166,17 @@ def scoped_metadata(before: GitSnapshot, after: GitSnapshot,
         refs = ({key: value for key, value in snapshot.refs.items() if key in resources.refs}
                 if resources is not None else dict(snapshot.refs))
         worktrees = ({key: value for key, value in snapshot.worktrees.items()
-                      if key in resources.worktrees}
+                      if key in resources.worktrees or key == default_worktree}
                      if resources is not None else dict(snapshot.worktrees))
         if base_branch:
             refs.pop(f"refs/heads/{base_branch}", None)
         if default_worktree:
-            worktrees.pop(default_worktree, None)
+            registration = worktrees.get(default_worktree)
+            if registration is not None:
+                worktrees[default_worktree] = tuple(
+                    field for field in registration
+                    if not field.startswith(("HEAD=", "state="))
+                )
         return replace(snapshot,
             refs=refs,
             worktrees=worktrees,

@@ -166,8 +166,13 @@ def run_agent(
         if connection is None or invocation is None:
             return hashlib.sha256(snapshot.serialize().encode()).hexdigest()
         repository = RuntimeStateRepository(connection)
-        project = repository.scope_owner(invocation.repo)
-        owner = repository.scope_owner(invocation.repo, invocation.plan_id) if invocation.plan_id else project
+        try:
+            project = repository.scope_owner(invocation.repo)
+            owner = repository.scope_owner(invocation.repo, invocation.plan_id) if invocation.plan_id else project
+        except sqlite3.OperationalError as error:
+            if "no such table:" not in str(error).lower():
+                raise
+            return hashlib.sha256(snapshot.serialize().encode()).hexdigest()
         if project is None or owner is None or not project['base_branch']:
             return hashlib.sha256(snapshot.serialize().encode()).hexdigest()
         phase = {

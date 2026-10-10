@@ -215,6 +215,14 @@ class ScopeValidationTests(TestCase):
         with self.assertRaisesRegex(AgentScopeError, '공유 Git refs'):
             self.validate('worker', before, foreign_ref,
                 external_worktree=Path('/source'), base_branch='main')
+        for changed_worktrees in (
+            {'/managed': ('HEAD=a',)},
+            {'/managed': ('HEAD=a',), '/source': ('HEAD=source-old', 'branch=refs/heads/other',
+                                                    'state=clean')},
+        ):
+            with self.subTest(changed_worktrees=changed_worktrees), self.assertRaises(AgentScopeError):
+                self.validate('worker', before, replace(before, worktrees=changed_worktrees),
+                    external_worktree=Path('/source'), base_branch='main')
 
     def test_verify_scope_uses_current_worktree_resources_without_agent_ledger(self):
         branch = 'loop-manager/G-047'

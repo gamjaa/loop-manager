@@ -318,18 +318,15 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
         self.assertIsNotNone(scoped_blocking.project_block(self.connection, 'repo'))
 
 
-    def test_existing_correction_accepts_restored_flags_without_erasing_saved_result(self):
+    def test_saved_agent_index_flags_cannot_be_hidden_by_restored_current_state(self):
         flagged = replace(self.current, index={'app.py': ('S 100644 resolved 0',)})
         self.connection.execute('UPDATE exec_plans SET agent_result_snapshot = ?', (flagged.serialize(),))
         plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
-        loop_manager.validate_blocked_agent_scope(self.connection, self.repo_path, 'repo', 'main',
-            self.worktree, plan['path'], saved_plan=plan)
-        self.assertEqual(self.connection.execute('SELECT agent_result_snapshot FROM exec_plans').fetchone()[0],
-                         flagged.serialize())
-        self.current = flagged
         with self.assertRaisesRegex(loop_manager.AgentScopeError, 'index flags'):
             loop_manager.validate_blocked_agent_scope(self.connection, self.repo_path, 'repo', 'main',
                 self.worktree, plan['path'], saved_plan=plan)
+        self.assertEqual(self.connection.execute('SELECT agent_result_snapshot FROM exec_plans').fetchone()[0],
+                         flagged.serialize())
 
 
     def test_failed_false_positive_release_keeps_existing_changed_input_correction_route(self):

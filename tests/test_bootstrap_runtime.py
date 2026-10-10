@@ -777,8 +777,8 @@ class ReviewerRebaseScopeHandoffUnitTests(unittest.TestCase):
                           scope_start_digest='c' * 64,
                           worktrees={str(Path('/managed').resolve()): (
                               'HEAD=a', 'branch=refs/heads/loop-manager/G-047')},
-                          refs={'refs/heads/loop-manager/G-047': ('a', 'commit')})
-        current = replace(before, head='b', refs={'refs/heads/loop-manager/G-047': ('b', 'commit')})
+                          refs={'refs/heads/loop-manager/G-047': ('a', '')})
+        current = replace(before, head='b', refs={'refs/heads/loop-manager/G-047': ('b', '')})
         row = {'agent_snapshot': before.serialize(), 'agent_result_snapshot': before.serialize(),
                'agent_role': 'reviewer', 'plan_path': 'docs/plans/[G-047] Runtime.md',
                'branch': before.branch, 'base_branch': 'main'}

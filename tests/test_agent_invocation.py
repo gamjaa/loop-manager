@@ -3,6 +3,7 @@
 import sqlite3
 import stat
 import tempfile
+import hashlib
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -113,6 +114,27 @@ class RunnerTests(TestCase):
         self.assertEqual(result.code, 0)
         self.assertEqual(len(digests), 2)
         self.assertEqual(digests[0], digests[1])
+
+    def test_preflight_uses_full_snapshot_when_project_scope_tables_are_missing(self):
+        snapshot = manager.GitSnapshot('a' * 40, None, {}, {}, {}, {}, {}, {})
+        observed = []
+
+        class Provider:
+            def run(self, request):
+                observed.append(request.isolation_snapshot_digest())
+                return manager.AgentResult(0, 'done')
+
+        with mock.patch.object(manager, 'capture_git_snapshot', return_value=snapshot), \
+             mock.patch.object(manager, 'agent_provider', return_value=Provider()):
+            result = manager.run_agent(
+                'codex', Path('/worktree'), self.state_dir, Path('/config'),
+                'planner', 'prompt', read_only=True,
+                connection=self.connection,
+                invocation=invocation.InvocationContext('repo', None),
+                resolved_profile=invocation.ResolvedProfile('model', 'high'),
+            )
+        self.assertEqual(result.code, 0)
+        self.assertEqual(observed, [hashlib.sha256(snapshot.serialize().encode()).hexdigest()])
 
     def test_each_fallback_process_has_own_resolved_profile_and_session(self):
         seen = []

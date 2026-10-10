@@ -26,7 +26,7 @@ class LegacyBlockedScopeUnitTests(unittest.TestCase):
         connection.row_factory = sqlite3.Row
         connection.execute(loop_manager.SCHEMA)
         before = loop_manager.GitSnapshot('head', 'loop-manager/G-001', {}, {},
-            {'refs/heads/loop-manager/G-099': ('original', '')},
+            {'refs/heads/loop-manager/G-001': ('head', '')},
             {str(Path('/managed').resolve()): ('HEAD=head', 'branch=refs/heads/loop-manager/G-001')}, {}, {})
         connection.execute(
             "INSERT INTO projects (repo, base_branch, agent_role, agent_snapshot, agent_result_snapshot) "
