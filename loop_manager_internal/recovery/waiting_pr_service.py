@@ -341,6 +341,7 @@ def select_waiting_pull_request_conflict(
         "SELECT * FROM projects WHERE repo = ?", (repo,)
     ).fetchone()
     assert project is not None
+    recovery_options = {"config_path": config_path} if config_path is not None else {}
     result = effects.reconcile_existing_pull_request(
         connection,
         repo_path,
@@ -348,7 +349,7 @@ def select_waiting_pull_request_conflict(
         repo,
         project,
         pull_request,
-        config_path=config_path,
+        **recovery_options,
     )
     return PullRequestSyncResult(result, result is None, observation.merged)
 
