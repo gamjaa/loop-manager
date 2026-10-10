@@ -128,7 +128,7 @@ def resolve_requirement_source(
 
 def worktree_requirement_documents(root: Path) -> dict[str, bytes]:
     """Read only direct regular Requirement files without following symlinks."""
-    documents: dict[str, str] = {}
+    documents: dict[str, bytes] = {}
     for relative in ("docs/requirements", "docs/requirements/archive"):
         directory = root
         absent = False
