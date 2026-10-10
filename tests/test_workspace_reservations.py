@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 from tests.support.workspace import WorkspaceFixture
 import sqlite3
 import tempfile
@@ -10,6 +11,7 @@ from tests.support.lifecycle import register_connection_cleanup
 from tests.support.worker import dummy_worker_sessions
 
 
+@isolated_git_test
 class WorkspaceReservationsTest(WorkspaceFixture, unittest.TestCase):
     def test_workspace_patch_helper_restores_patches_after_return_and_exception(self):
         original = loop_manager.run_project

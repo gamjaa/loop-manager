@@ -1,121 +1,63 @@
-from tests.support.scope import AgentScopeFixture
-import tempfile
+"""역할·경로 정책은 snapshot으로 검사한다. 파싱/index는 scope_git_metadata 회귀가 맡는다."""
+from pathlib import Path
 import unittest
+from unittest import mock
+
 import loop_manager
-from tests.support.catalog import write_execplan
-from tests.support.git import git_command
+from tests.support.scope import snapshot
 
 
-class ScopeRoleBoundariesTest(AgentScopeFixture, unittest.TestCase):
+class ScopeRoleBoundariesTest(unittest.TestCase):
+    plan_path = 'docs/plans/[G-001] Scope Safety.md'
+
+    def setUp(self):
+        process = mock.patch('subprocess.Popen', side_effect=AssertionError('예상 밖 process 실행'))
+        self.process = process.start()
+        self.addCleanup(process.stop)
+        self.addCleanup(self.process.assert_not_called)
+
+    def validate(self, role, after, selected=None):
+        loop_manager.validate_agent_scope(role, Path('/managed'), snapshot(), after,
+                                          selected_plan_path=selected)
 
     def test_role_boundaries_reject_protected_and_read_only_changes(self):
         scenarios = (
-            (
-                "planner-product",
-                "planner",
-                lambda repo, _plan: (repo / "docs/PRODUCT.md").write_text(
-                    "# changed\n", encoding="utf-8"
-                ),
-                None,
-                "docs/PRODUCT.md",
-            ),
-            (
-                "worker-requirement",
-                "worker",
-                lambda repo, _plan: (
-                    repo / "docs/requirements/Active.md"
-                ).write_text("# changed\n", encoding="utf-8"),
-                "docs/plans/[G-001] Scope Safety.md",
-                "docs/requirements/Active.md",
-            ),
-            (
-                "reviewer-staged-and-untracked",
-                "reviewer",
-                lambda repo, _plan: (
-                    (repo / "src/app.py").write_text(
-                        "VALUE = 2\n", encoding="utf-8"
-                    ),
-                    git_command(repo, "add", "src/app.py"),
-                    (repo / "review.txt").write_text(
-                        "unexpected\n", encoding="utf-8"
-                    ),
-                ),
-                None,
-                "review.txt",
-            ),
+            ('planner', snapshot(dirty={'docs/PRODUCT.md': (('tracked',), 'changed')}),
+             None, 'docs/PRODUCT.md'),
+            ('worker', snapshot(dirty={'docs/requirements/Active.md': (('tracked',), 'changed')}),
+             self.plan_path, 'docs/requirements/Active.md'),
+            ('reviewer', snapshot(index={'src/app.py': ('H 100644 changed 0',)},
+                                  dirty={'review.txt': (('untracked',), 'new')}),
+             None, 'review.txt'),
         )
-        for name, role_name, mutate, selected_plan, expected in scenarios:
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
-                repo, plan_path = self._repository_with_plan(directory)
-                before = loop_manager.capture_git_snapshot(repo)
-                mutate(repo, plan_path)
-                after = loop_manager.capture_git_snapshot(repo)
-
-                with self.assertRaisesRegex(
-                    loop_manager.AgentScopeError,
-                    expected.replace("[", r"\[").replace("]", r"\]"),
-                ):
-                    loop_manager.validate_agent_scope(
-                        role_name,
-                        repo,
-                        before,
-                        after,
-                        selected_plan_path=selected_plan,
-                    )
+        for role, after, selected, expected in scenarios:
+            with self.subTest(role=role), self.assertRaisesRegex(loop_manager.AgentScopeError, expected):
+                self.validate(role, after, selected)
 
     def test_planner_new_plan_and_worker_selected_plan_are_allowed(self):
-        for role_name in ("planner", "worker"):
-            with self.subTest(role=role_name), tempfile.TemporaryDirectory() as directory:
-                repo, plan_path = self._repository_with_plan(directory)
-                before = loop_manager.capture_git_snapshot(repo)
-                selected = plan_path
-                if role_name == "planner":
-                    write_execplan(repo, "G-002", "New Plan")
-                    selected = None
-                else:
-                    (repo / plan_path).write_text(
-                        (repo / plan_path).read_text(encoding="utf-8")
-                        + "\n## Progress\n\n- [x] complete\n",
-                        encoding="utf-8",
-                    )
-                after = loop_manager.capture_git_snapshot(repo)
-
-                loop_manager.validate_agent_scope(
-                    role_name,
-                    repo,
-                    before,
-                    after,
-                    selected_plan_path=selected,
-                )
+        for role, path, kinds, selected in (
+            ('planner', 'docs/plans/[G-002] New Plan.md', ('untracked',), None),
+            ('worker', self.plan_path, ('tracked',), self.plan_path),
+        ):
+            with self.subTest(role=role):
+                self.validate(role, snapshot(dirty={path: (kinds, 'changed')}), selected)
 
     def test_architecture_changes_are_worker_only(self):
-        for role in ("worker", "planner", "maintenance_planner", "reviewer", "planner_check"):
-            with self.subTest(role=role), tempfile.TemporaryDirectory() as directory:
-                repo, plan_path = self._repository_with_plan(directory)
-                before = loop_manager.capture_git_snapshot(repo)
-                (repo / "docs/ARCHITECTURE.md").write_text("# Updated implementation design\n", encoding="utf-8")
-                after = loop_manager.capture_git_snapshot(repo)
-                if role == "worker":
-                    loop_manager.validate_agent_scope(role, repo, before, after, selected_plan_path=plan_path)
+        after = snapshot(dirty={'docs/ARCHITECTURE.md': (('tracked',), 'changed')})
+        for role in ('worker', 'planner', 'maintenance_planner', 'reviewer', 'planner_check'):
+            with self.subTest(role=role):
+                if role == 'worker':
+                    self.validate(role, after, self.plan_path)
                 else:
                     with self.assertRaises(loop_manager.AgentScopeError):
-                        loop_manager.validate_agent_scope(role, repo, before, after)
+                        self.validate(role, after)
 
     def test_planner_existing_plan_change_reaches_snapshot_validator(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repo, plan_path = self._repository_with_plan(directory)
-            before = loop_manager.capture_git_snapshot(repo)
-            (repo / plan_path).write_text("changed\n", encoding="utf-8")
-            after = loop_manager.capture_git_snapshot(repo)
-
-            loop_manager.validate_agent_scope("planner", repo, before, after)
+        self.validate('planner', snapshot(dirty={self.plan_path: (('tracked',), 'changed')}))
 
     def test_planner_check_rejects_plan_and_code_changes(self):
-        for path in ("docs/plans/[G-001] Scope Safety.md", "src/app.py"):
-            with self.subTest(path=path), tempfile.TemporaryDirectory() as directory:
-                repo, _ = self._repository_with_plan(directory)
-                before = loop_manager.capture_git_snapshot(repo)
-                (repo / path).write_text("changed\n", encoding="utf-8")
-                after = loop_manager.capture_git_snapshot(repo)
-                with self.assertRaisesRegex(loop_manager.AgentScopeError, "planner_check Git 범위 위반"):
-                    loop_manager.validate_agent_scope("planner_check", repo, before, after)
+        for path in (self.plan_path, 'src/app.py'):
+            with self.subTest(path=path), self.assertRaisesRegex(
+                loop_manager.AgentScopeError, 'planner_check Git 범위 위반'
+            ):
+                self.validate('planner_check', snapshot(dirty={path: (('tracked',), 'changed')}))

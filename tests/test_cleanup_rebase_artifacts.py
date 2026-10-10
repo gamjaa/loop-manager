@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 import subprocess
 import os
 import tempfile
@@ -9,6 +10,7 @@ from tests.support.git import git_command, make_remote_repository
 from tests.support.workspace import WorkspaceFixture
 
 
+@isolated_git_test
 class CleanupRebaseArtifactsTest(WorkspaceFixture, unittest.TestCase):
     @unittest.skipUnless(os.name == 'nt', 'Windows의 실제 대소문자 경로 alias를 검사한다.')
     def test_windows_case_alias_ignored_file_is_preserved_before_rebase(self):

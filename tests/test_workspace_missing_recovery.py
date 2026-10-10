@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 from tests.support.workspace import WorkspaceFixture
 import sqlite3
 import subprocess
@@ -12,6 +13,7 @@ from tests.support.worker import worker_result
 from tests.support.worker import dummy_worker_sessions
 
 
+@isolated_git_test
 class WorkspaceMissingRecoveryTest(WorkspaceFixture, unittest.TestCase):
     def test_missing_worktree_is_recovered_from_owned_branch(self):
         with tempfile.TemporaryDirectory() as directory:

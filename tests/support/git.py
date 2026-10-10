@@ -1,14 +1,46 @@
 import atexit
+from functools import wraps
 from functools import lru_cache
+import os
 import shutil
 import subprocess
 import tempfile
 from pathlib import Path
 import loop_manager
+from unittest import mock
 from loop_manager_internal.verification.timing import phase
 
 
-def git_command(repo: Path, *arguments: str) -> str:
+def git_test_environment():
+    """사용자 설정과 template을 제외한 테스트 subprocess 입력."""
+    environment = {key: value for key, value in os.environ.items()
+                   if not key.upper().startswith('GIT_CONFIG_') and key.upper() != 'GIT_CONFIG'
+                   and key.upper() != 'GIT_TEMPLATE_DIR'}
+    # 통제 template에는 git/ignore·attributes가 없어 XDG 기본 입력도 차단한다.
+    environment.update(GIT_CONFIG_GLOBAL=os.devnull, GIT_CONFIG_SYSTEM=os.devnull,
+                       GIT_CONFIG_NOSYSTEM='1',
+                       GIT_ATTR_NOSYSTEM='1',
+                       XDG_CONFIG_HOME=str(Path(__file__).with_name('git-template')),
+                       GIT_TEMPLATE_DIR=str(Path(__file__).with_name('git-template')))
+    return environment
+
+
+def isolated_git_test(cls):
+    """setUp부터 cleanup까지 운영 adapter와 Python 자식도 같은 입력을 상속한다."""
+    setup = cls.setUp
+
+    @wraps(setup)
+    def isolated_setup(self):
+        patch = mock.patch.dict(os.environ, git_test_environment(), clear=True)
+        patch.start()
+        self.addCleanup(patch.stop)
+        setup(self)
+
+    cls.setUp = isolated_setup
+    return cls
+
+
+def git_command(repo: Path, *arguments: str, env=None) -> str:
     result = subprocess.run(
         ["git", "-C", str(repo), *arguments],
         check=True,
@@ -16,6 +48,7 @@ def git_command(repo: Path, *arguments: str) -> str:
         encoding="utf-8",
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        env=git_test_environment() if env is None else env,
     )
     return result.stdout.strip()
 
@@ -28,6 +61,7 @@ def _initialize_remote_repository(directory: str) -> Path:
         check=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        env=git_test_environment(),
     )
     repo.mkdir()
     git_command(repo, "init", "--initial-branch=main")

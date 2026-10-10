@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 from tests.support.scope import AgentScopeFixture
 from tests.support.git import prepare_manager_import_fixture
 import sqlite3
@@ -14,6 +15,7 @@ from tests.support.catalog import write_execplan
 from tests.support.git import git_command, commit_and_push
 
 
+@isolated_git_test
 class ScopeIgnoredArtifactsTest(AgentScopeFixture, unittest.TestCase):
     def test_ignored_untracked_creation_change_and_deletion_are_allowed(self):
         scenarios = tuple(

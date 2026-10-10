@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 from tests.support.workspace import WorkspaceFixture
 import hashlib
 import sqlite3
@@ -11,18 +12,19 @@ from tests.support.lifecycle import register_connection_cleanup
 from tests.support.worker import dummy_worker_sessions
 
 
+@isolated_git_test
 class WorkspaceCollisionsTest(WorkspaceFixture, unittest.TestCase):
 
     def test_new_workspace_rejects_preexisting_path(self):
         with tempfile.TemporaryDirectory() as directory:
-            repo, _state_dir, _connection, _plan, _plan_sha, branch, worktree = (
-                self._ready_execplan(directory)
-            )
+            repo = Path(directory) / 'repo'
+            worktree = Path(directory) / 'worktree'
+            branch = 'loop-manager/G-012'
             worktree.mkdir(parents=True)
             marker = worktree / "unrelated.txt"
             marker.write_text("preserve me\n", encoding="utf-8")
 
-            with self.assertRaisesRegex(
+            with mock.patch('subprocess.Popen', side_effect=AssertionError('예상 밖 process 실행')) as process, self.assertRaisesRegex(
                 loop_manager.WorkspaceOwnershipError,
                 "worktree가 이미 존재",
             ):
@@ -37,6 +39,7 @@ class WorkspaceCollisionsTest(WorkspaceFixture, unittest.TestCase):
                 )
 
             self.assertEqual(marker.read_text(encoding="utf-8"), "preserve me\n")
+            process.assert_not_called()
 
     @dummy_worker_sessions
     def test_branch_collision_blocks_then_resumes_after_conflict_removal(self):

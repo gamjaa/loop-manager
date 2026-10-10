@@ -1,4 +1,6 @@
-from tests.support.scope import AgentScopeFixture
+from tests.support.git import isolated_git_test
+from tests.support.scope import AgentScopeFixture, snapshot
+from dataclasses import replace
 import sqlite3
 import tempfile
 import unittest
@@ -9,6 +11,7 @@ from tests.support.git import git_command
 from tests.support.worker import dummy_worker_sessions
 
 
+@isolated_git_test
 class ScopeConfigurationTest(AgentScopeFixture, unittest.TestCase):
 
     def test_git_config_changes_are_rejected_without_leaking_values(self):
@@ -66,30 +69,28 @@ class ScopeConfigurationTest(AgentScopeFixture, unittest.TestCase):
         scenarios = (
             (
                 "remote-url",
-                ("remote", "set-url", "origin"),
                 "https://secret@attacker.invalid/repo.git",
                 "local:remote.origin.url",
             ),
             (
                 "hooks-path",
-                ("config", "core.hooksPath"),
                 "agent-hooks",
                 "local:core.hookspath",
             ),
         )
-        for name, arguments, configured_value, expected_key in scenarios:
+        for name, configured_value, expected_key in scenarios:
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
-                repo, _plan_path = self._repository_with_plan(directory)
-                before = loop_manager.capture_git_snapshot(repo)
+                repo = root / 'repo'
+                before = snapshot(config={expected_key: ('original-digest',)})
                 sensitive_value = (
                     str(root / configured_value)
                     if name == "hooks-path"
                     else configured_value
                 )
-                git_command(repo, *arguments, sensitive_value)
-                blocked_result = loop_manager.capture_git_snapshot(repo)
+                blocked_result = replace(before, config={expected_key: ('changed-digest',)})
                 connection = sqlite3.connect(":memory:")
+                self.addCleanup(connection.close)
                 connection.row_factory = sqlite3.Row
                 connection.execute(loop_manager.SCHEMA)
                 connection.execute(
@@ -118,7 +119,10 @@ class ScopeConfigurationTest(AgentScopeFixture, unittest.TestCase):
                     side_effect=AssertionError("unsafe Git command before config validation"),
                 ) as unsafe_git, mock.patch(
                     "loop_manager.run_codex"
-                ) as agent:
+                ) as agent, mock.patch('subprocess.Popen',
+                    side_effect=AssertionError('예상 밖 process 실행')) as process, mock.patch.object(
+                    loop_manager, '_config_entries', return_value=blocked_result.config
+                ) as config:
                     result = loop_manager.run_project(
                         connection,
                         root / "state",
@@ -145,3 +149,5 @@ class ScopeConfigurationTest(AgentScopeFixture, unittest.TestCase):
                 migration.assert_not_called()
                 unsafe_git.assert_not_called()
                 agent.assert_not_called()
+                process.assert_not_called()
+                config.assert_called_once_with(repo)

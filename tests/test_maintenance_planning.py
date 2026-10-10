@@ -29,6 +29,7 @@ from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot
 
 
 from tests.support.maintenance_planning_case import git
+from tests.support.git import git_test_environment
 
 
 class MaintenanceGitAliasTest(unittest.TestCase):
@@ -46,6 +47,7 @@ class MaintenanceGitAliasTest(unittest.TestCase):
             encoding="utf-8",
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
+            env=git_test_environment(),
         )
         failure = subprocess.CalledProcessError(1, "git", output="failure")
         with mock.patch("tests.support.git.subprocess.run", side_effect=failure):

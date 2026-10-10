@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 from contextlib import closing
 from tests.support.workspace import CleanupFixture
 import sqlite3
@@ -11,6 +12,7 @@ from tests.support.git import git_command, make_remote_repository, commit_and_pu
 from tests.support.worker import dummy_worker_sessions
 
 
+@isolated_git_test
 class CleanupPendingStateTest(CleanupFixture, unittest.TestCase):
 
     def test_existing_database_adds_cleanup_pending_without_losing_project(self):
@@ -113,7 +115,7 @@ class CleanupPendingStateTest(CleanupFixture, unittest.TestCase):
     def test_unowned_pending_is_not_inspected_and_clears_only_when_missing(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            repo = make_remote_repository(directory)
+            repo = root / 'repo'
             state_dir = root / "state"
             victim = root / "user-worktree"
             victim.mkdir()
@@ -131,7 +133,8 @@ class CleanupPendingStateTest(CleanupFixture, unittest.TestCase):
             )
             connection.commit()
 
-            with mock.patch(
+            with mock.patch('subprocess.Popen',
+                side_effect=AssertionError('소유권 없는 경로에 process 실행')) as process, mock.patch(
                 "loop_manager.validate_pending_cleanup_worktree"
             ) as validate, mock.patch(
                 "loop_manager.remove_cleanup_worktree"
@@ -150,6 +153,8 @@ class CleanupPendingStateTest(CleanupFixture, unittest.TestCase):
             self.assertEqual(cleared, [])
             validate.assert_not_called()
             remove.assert_not_called()
+            process.assert_not_called()
+            self.assertEqual(connection.execute('SELECT COUNT(*) FROM cleanup_pending').fetchone()[0], 0)
 
     @dummy_worker_sessions
     def test_merged_dirty_worktree_becomes_nonblocking_pending(self):

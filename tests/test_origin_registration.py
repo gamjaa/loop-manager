@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 from contextlib import closing
 from tests.support.workspace import symlink_or_skip
 import contextlib
@@ -24,6 +25,7 @@ from tests.support.origin import (
 from loop_manager_internal.runtime import bootstrap
 
 
+@isolated_git_test
 class OriginRegistrationTests(unittest.TestCase):
     def test_reregistration_archives_legacy_approval_without_approving_current_hash(self):
         from loop_manager_internal.runtime import project_registry
@@ -83,18 +85,28 @@ class OriginRegistrationTests(unittest.TestCase):
     def test_registration_never_reads_root_cli_guidance(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = Path(directory)
-            git(repo, "init", "-b", "main")
-            configure_identity(repo)
-            write_registration_files(repo)
-            with_agents = commit_all(repo, "Project with optional instructions")
-            (repo / "AGENTS.md").unlink()
-            without_agents = commit_all(repo, "Project without optional instructions")
             (repo / "AGENTS.md").write_text("# Local instructions\n", encoding="utf-8")
+            documents = {b'docs/PLANS.md': (loop_manager.ROOT / 'docs/PLANS.md').read_bytes(),
+                         b'docs/ARCHITECTURE.md': b'# Custom architecture',
+                         b'docs/PRODUCT.md': b'# Custom product'}
+            revisions = {'with-agents': {**documents, b'AGENTS.md': b'committed rules'},
+                         'without-agents': documents}
 
-            self.assertEqual(loop_manager.inspect_registration_files(
-                repo, without_agents, approve_agents_mismatch=False), (None, False))
-            self.assertEqual(loop_manager.inspect_registration_files(
-                repo, with_agents, approve_agents_mismatch=False), (None, False))
+            def blob(_repo, entries, path):
+                self.assertNotEqual(path, 'AGENTS.md')
+                return entries.get(path.encode())
+
+            with mock.patch.object(loop_manager, '_git_tree_entries',
+                side_effect=lambda _repo, revision: revisions[revision]) as trees, mock.patch.object(
+                loop_manager, '_revision_blob', side_effect=blob
+            ), mock.patch('subprocess.Popen', side_effect=AssertionError('예상 밖 process 실행')) as process:
+                for revision in revisions:
+                    self.assertEqual(loop_manager.inspect_registration_files(
+                        repo, revision, approve_agents_mismatch=False), (None, False))
+                self.assertEqual(trees.call_args_list,
+                                 [mock.call(repo, revision) for revision in revisions])
+                process.assert_not_called()
+            self.assertEqual((repo / 'AGENTS.md').read_text(encoding='utf-8'), '# Local instructions\n')
 
     def test_cli_guidance_is_ignored_while_missing_specs_are_rejected(self):
         from loop_manager_internal.runtime import project_registry

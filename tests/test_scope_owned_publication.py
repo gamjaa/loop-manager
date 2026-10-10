@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -16,6 +17,7 @@ from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from tests.support.scoped_recovery import ScopedGateFixture
 
 
+@isolated_git_test
 class OwnedScopePublicationRecoveryTests(ScopedGateFixture, unittest.TestCase):
     def test_incomplete_legacy_rebase_plan_block_stays_blocked(self):
         self.plan('G-001', 'PLAN_BLOCKED', branch='loop-manager/G-001')

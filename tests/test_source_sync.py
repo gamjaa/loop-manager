@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 import contextlib
 from dataclasses import replace
 import hashlib
@@ -23,6 +24,7 @@ from loop_manager_internal.runtime import bootstrap
 from loop_manager_internal.git import source_rebase
 
 
+@isolated_git_test
 class SourceSynchronizationTests(unittest.TestCase):
     def test_multiple_conflicts_preserve_partial_staging_before_first_observation(self):
         for scenario in ("untouched", "staged-markers", "staged-modify-delete"):
@@ -708,61 +710,57 @@ class SourceSynchronizationTests(unittest.TestCase):
 
 
     def test_safe_fast_forward_skips_local_state_matrix_without_gating_remote_sha(self):
-        scenarios = (
-            "tracked",
-            "staged",
-            "untracked",
-            "ahead",
-            "diverged",
-            "detached",
-            "other-branch",
-            "operation",
-        )
-        for scenario in scenarios:
+        # branch/operation/ancestry/경로 정책만 전환한다. 실제 index/checkout 보존은 인접 회귀가 맡는다.
+        from loop_manager_internal.runtime.contracts import BaseWorktreeSnapshot
+        head, remote_sha = 'a' * 40, 'b' * 40
+        for scenario in ('tracked', 'staged', 'untracked', 'ahead', 'diverged',
+                         'detached', 'other-branch', 'operation'):
             with self.subTest(scenario=scenario), tempfile.TemporaryDirectory() as directory:
-                _remote, primary, writer = remote_fixture(directory)
-                initial = git(primary, "rev-parse", "HEAD")
-                if scenario == "tracked":
-                    (primary / "tracked.txt").write_text("local\n", encoding="utf-8")
-                elif scenario == "staged":
-                    (primary / "staged.txt").write_text("local\n", encoding="utf-8")
-                    git(primary, "add", "staged.txt")
-                elif scenario == "untracked":
-                    (primary / "untracked.txt").write_text("local\n", encoding="utf-8")
-                elif scenario in {"ahead", "diverged"}:
-                    (primary / "local.txt").write_text("local\n", encoding="utf-8")
-                    commit_all(primary, "Local only")
-                elif scenario == "detached":
-                    git(primary, "checkout", "--detach", initial)
-                elif scenario == "other-branch":
-                    git(primary, "checkout", "-b", "topic")
-                elif scenario == "operation":
-                    merge_head = Path(git(primary, "rev-parse", "--git-path", "MERGE_HEAD"))
-                    if not merge_head.is_absolute():
-                        merge_head = primary / merge_head
-                    merge_head.write_text(initial + "\n", encoding="ascii")
+                repo = Path(directory)
+                marker = repo / 'tracked.txt'
+                marker.write_bytes(b'local work')
+                before = BaseWorktreeSnapshot('main', head, (), (), ())
+                if scenario in {'tracked', 'staged', 'untracked'}:
+                    before = replace(before, changes=((scenario, 'tracked.txt', 'content'),))
+                elif scenario == 'detached':
+                    before = replace(before, branch=None)
+                elif scenario == 'other-branch':
+                    before = replace(before, branch='topic')
+                elif scenario == 'operation':
+                    before = replace(before, operations=(('MERGE_HEAD', head),))
+                expected = [mock.call(repo, 'rev-parse', '--verify', 'refs/remotes/origin/main^{commit}'),
+                            mock.call(repo, 'rev-parse', 'HEAD')]
+                results = {call.args[1:]: (0, value)
+                           for call, value in zip(expected, (remote_sha, head))}
+                if scenario not in {'detached', 'other-branch', 'operation'}:
+                    expected.append(mock.call(repo, 'merge-base', '--is-ancestor', head, remote_sha, check=False))
+                    results[expected[-1].args[1:]] = (int(scenario in {'ahead', 'diverged'}), '')
+                    if scenario in {'ahead', 'diverged'}:
+                        expected.append(mock.call(repo, 'merge-base', '--is-ancestor', remote_sha, head, check=False))
+                        results[expected[-1].args[1:]] = (int(scenario == 'diverged'), '')
 
-                remote_sha = (
-                    git(writer, "rev-parse", "HEAD")
-                    if scenario == "ahead"
-                    else advance_remote(
-                        writer,
-                        path=("staged.txt" if scenario == "staged" else
-                              "untracked.txt" if scenario == "untracked" else
-                              "tracked.txt"),
-                    )
-                )
-                git(primary, "fetch", "origin")
-                before_head = git(primary, "rev-parse", "HEAD")
-                result = loop_manager.synchronize_base_worktree(
-                    primary,
-                    "main",
-                    remote_sha=remote_sha,
-                )
-                self.assertEqual(result.status, "skipped")
-                self.assertEqual(result.remote_sha, remote_sha)
-                self.assertEqual(git(primary, "rev-parse", "HEAD"), before_head)
+                def observe(actual_repo, *arguments, **options):
+                    self.assertEqual(actual_repo, repo)
+                    self.assertIn(arguments, results, '예상 밖 Git 명령')
+                    self.assertEqual(options, {'check': False} if arguments[0] == 'merge-base' else {})
+                    code, output = results[arguments]
+                    return subprocess.CompletedProcess([], code, output)
 
+                with mock.patch.object(loop_manager, 'git', side_effect=observe) as commands, mock.patch.object(
+                    loop_manager, '_base_worktree_snapshot', return_value=before
+                ) as snapshot, mock.patch.object(loop_manager, '_nul_git_paths', return_value=['tracked.txt']) as paths, \
+                     mock.patch('subprocess.Popen', side_effect=AssertionError('예상 밖 process 실행')) as process:
+                    result = loop_manager.synchronize_base_worktree(repo, 'main', remote_sha=remote_sha)
+                    self.assertEqual(result.status, 'skipped')
+                    self.assertEqual(result.remote_sha, remote_sha)
+                    self.assertEqual(commands.call_args_list, expected)
+                    snapshot.assert_called_once_with(repo)
+                    if scenario in {'tracked', 'staged', 'untracked'}:
+                        paths.assert_called_once_with(repo, 'diff', '--no-renames', '--name-only', '-z', head, remote_sha)
+                    else:
+                        paths.assert_not_called()
+                    process.assert_not_called()
+                self.assertEqual(marker.read_bytes(), b'local work')
 
     def test_ignored_path_overlap_and_fast_forward_failures_preserve_checkout(self):
         with tempfile.TemporaryDirectory() as directory:

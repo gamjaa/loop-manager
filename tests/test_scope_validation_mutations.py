@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 from tests.support.scope import AgentScopeFixture
 import sqlite3
 import tempfile
@@ -10,6 +11,7 @@ from tests.support.worker import worker_result, isolated_scope_resources
 from tests.support.worker import dummy_worker_sessions
 
 
+@isolated_git_test
 class ScopeValidationMutationsTest(AgentScopeFixture, unittest.TestCase):
 
     @dummy_worker_sessions

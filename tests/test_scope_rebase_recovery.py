@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 from tests.support.scope import AgentScopeFixture
 import json
 import sqlite3
@@ -14,6 +15,7 @@ from tests.support.worker import isolated_scope_resources
 from tests.support.worker import dummy_worker_sessions
 
 
+@isolated_git_test
 class ScopeRebaseRecoveryTest(AgentScopeFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_agent_commit_isolated_automatically_after_blocked_input_change(self):
@@ -544,6 +546,7 @@ class ScopeRebaseRecoveryTest(AgentScopeFixture, unittest.TestCase):
             self.assertEqual(resumed_agent.call_args.args[3], "worker")
 
 
+@isolated_git_test
 class BlockedAgentBaselineResumeUnitTests(unittest.TestCase):
     def test_interrupted_dirty_baseline_restore_reuses_verified_tree(self):
         connection = sqlite3.connect(':memory:')
