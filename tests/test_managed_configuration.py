@@ -248,6 +248,7 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
         config = ManagedConfig(
             Path('/config.ini'), 1, '', '', verify_timeout_seconds=42, verify_parallelism=2,
         )
+        mutation = mock.sentinel.runtime_mutation
         result = loop_manager.ScheduledProjectResult(
             '/repo', loop_manager.ProjectRunResult(loop_manager.ProjectRunKind.WAITING, 0),
         )
@@ -255,11 +256,19 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             project_registry, 'list_projects', return_value=(self._record('/repo'),)
         ), mock.patch.object(
             loop_manager, '_run_registered_project', return_value=result
-        ) as worker:
+        ) as worker, mock.patch.object(
+            loop_manager, '_preflight_self_merge_handoff'
+        ) as preflight, mock.patch(
+            'loop_manager_internal.application.scheduler.VerifyCoordinator'
+        ):
             self.assertEqual(
-                loop_manager.schedule_registered_projects(mock.Mock(), Path('/state'), config),
+                loop_manager.schedule_registered_projects(
+                    mock.Mock(), Path('/state'), config, runtime_mutation=mutation,
+                ),
                 (result,),
             )
+        self.assertIs(preflight.call_args.args[3], mutation)
+        self.assertEqual(preflight.call_args.kwargs['config_path'], config.path)
         self.assertEqual(worker.call_args.args[-1], 42)
         self.assertEqual(worker.call_args.kwargs['verify_parallelism'], 2)
         self.assertIsNotNone(worker.call_args.kwargs['verify_coordinator'])

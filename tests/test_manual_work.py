@@ -642,6 +642,35 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
                             (service.repo,),
                         ).fetchone()
                         self.assertEqual(publication['head'],head)
+                    elif scenario=='changed':
+                        result=loop_manager.reconcile_existing_pull_request(
+                            service.connection,service.repo_path,service.state_dir,service.repo,
+                            project,pull_request,config_path=service.config_path)
+                        self.assertEqual(result,loop_manager.PROJECT_STEP_RETRY)
+                        self.assertEqual(service.runtime.get(service.repo,'G-012').status,'VERIFYING')
+                        self.assertEqual(service.store.for_plan(service.repo,'G-012')['state'],'AUTOMATIC')
+                        self.assertEqual(service.runtime.get(service.repo,'G-012').pr_url,pull_request['url'])
+                        self.assertEqual(service.runtime.get(service.repo,'G-012').pr_head_oid,head)
+                        self.assertIsNone(service.connection.execute(
+                            'SELECT 1 FROM manual_work_publications WHERE repo=?',(service.repo,),
+                        ).fetchone())
+                        with mock.patch(
+                                'loop_manager_internal.execution.execution_publication_handler.refresh_common_guidance_pr'):
+                            result,verify,agent=self.step(
+                                service,pr=pull_request,
+                                review='MANUAL_PLAN_RESULT: G-012 PASS\nVERDICT: PASS',
+                            )
+                        self.assertEqual(result,0)
+                        self.assertEqual(verify.call_count,1)
+                        self.assertEqual(agent.call_count,1)
+                        self.assertEqual(service.runtime.get(service.repo,'G-012').status,'PR_OPEN')
+                        publication=service.connection.execute(
+                            'SELECT head,evidence FROM manual_work_publications WHERE repo=?',
+                            (service.repo,),
+                        ).fetchone()
+                        self.assertEqual(publication['head'],head)
+                        self.assertEqual({row['result'] for row in json.loads(publication['evidence'])},
+                                         {'PASS'})
                     else:
                         with self.assertRaises(PublicationSafetyError):
                             loop_manager.reconcile_existing_pull_request(
@@ -661,6 +690,13 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
                 if scenario=='changed':
                     service.config_path.write_text(service.config_path.read_text().replace(
                         'verify_timeout_seconds=600','verify_timeout_seconds=601'),encoding='utf-8')
+                    checkpoint_repository=loop_manager.execution_checkpoint_state.ExecutionCheckpointRepository(
+                        service.connection)
+                    checkpoint=checkpoint_repository.get(service.repo,'G-012')
+                    checkpoint_repository.record(service.repo,'G-012',
+                        expected_generation=checkpoint.generation,operation='push',expected_head=head,
+                        target_base_oid=_base,observed_remote_oid=_base,
+                        snapshot={'remote_before':_base})
                 elif scenario=='unreadable':
                     service.config_path.write_text('[loop\ninvalid config',encoding='utf-8')
                 with mock.patch('loop_manager._agent_profile',
@@ -676,6 +712,38 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
                         (service.repo,),
                     ).fetchone()
                     self.assertEqual(publication['head'],head)
+                elif scenario=='changed':
+                    self.assertEqual(result,loop_manager.PROJECT_STEP_RETRY)
+                    selected=service.runtime.get(service.repo,'G-012')
+                    self.assertEqual(selected.status,'VERIFYING')
+                    self.assertEqual(selected.pr_url,pull_request['url'])
+                    self.assertEqual(selected.pr_head_oid,head)
+                    self.assertEqual(selected.publication_remote_oid,head)
+                    self.assertEqual(selected.pr_conflict_recovery,0)
+                    checkpoint=loop_manager.execution_checkpoint_state.ExecutionCheckpointRepository(
+                        service.connection).get(service.repo,'G-012')
+                    self.assertIsNone(checkpoint.operation)
+                    self.assertEqual(checkpoint.observed_remote_oid,head)
+                    self.assertIsNone(service.connection.execute(
+                        'SELECT 1 FROM manual_work_publications WHERE repo=?',(service.repo,),
+                    ).fetchone())
+                    with mock.patch(
+                            'loop_manager_internal.execution.execution_publication_handler.refresh_common_guidance_pr'):
+                        result,verify,agent=self.step(
+                            service,pr=pull_request,
+                            review='MANUAL_PLAN_RESULT: G-012 PASS\nVERDICT: PASS',
+                        )
+                    self.assertEqual(result,0)
+                    self.assertEqual(verify.call_count,1)
+                    self.assertEqual(agent.call_count,1)
+                    self.assertEqual(service.runtime.get(service.repo,'G-012').status,'PR_OPEN')
+                    publication=service.connection.execute(
+                        'SELECT head,evidence FROM manual_work_publications WHERE repo=?',
+                        (service.repo,),
+                    ).fetchone()
+                    self.assertEqual(publication['head'],head)
+                    self.assertEqual({row['result'] for row in json.loads(publication['evidence'])},
+                                     {'PASS'})
                 else:
                     self.assertEqual(result,1)
                     self.assertNotEqual(service.runtime.get(service.repo,'G-012').status,'PR_OPEN')

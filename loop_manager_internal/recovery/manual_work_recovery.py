@@ -9,6 +9,7 @@ from loop_manager_internal.execution.manual_candidate import (
     candidate_token, stage_input_tokens, stage_result_token,
 )
 from loop_manager_internal.runtime.contracts import PublicationSafetyError
+from loop_manager_internal.storage import execution_checkpoint_state
 
 
 def rotate_correction(connection, repo):
@@ -120,6 +121,61 @@ def revalidate_waiting(connection, repo, plan, pr, base_head, *, config_path=Non
         phase='VERIFYING' if verify_changed else 'REVIEWING'
         store.update(group,state='AUTOMATIC',active_id=group['owner_id'],resume_phase=phase,
                      last_error=f'{reason} 자동 재검증합니다.')
+    return True
+
+
+def revalidate_publication_stage(connection, repo, plan_id, stage, *, pr_url,
+                                 pr_head_oid, confirmed_push_head=None):
+    """Restart the stale manual stage after PR ownership has been confirmed."""
+    if stage not in {'verify', 'review'}:
+        return False
+    store=ManualWorkRepository(connection)
+    group=store.for_plan(repo,plan_id)
+    if (group is None or group['state']!='AUTOMATIC' or not group['request_id']
+            or plan_id not in json.loads(group['members'])):
+        return False
+    store.workspace_owner(repo,plan_id)
+    runtime=runtime_state.RuntimeStateRepository(connection)
+    selected=runtime.projected(repo)
+    if selected is None or selected.plan_id!=plan_id or selected.status!='PUBLISHING':
+        return False
+    members=json.loads(group['members'])
+    for member in members:
+        if runtime.get(repo,member).status not in {'PUBLISHING','MANUAL_PENDING','PR_OPEN'}:
+            return False
+    checkpoint_repository=execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+    checkpoint=checkpoint_repository.get(repo,plan_id)
+    if confirmed_push_head is not None and checkpoint.operation not in {None,'push'}:
+        return False
+    if (confirmed_push_head is not None and checkpoint.operation=='push'
+            and checkpoint.expected_head!=confirmed_push_head):
+        return False
+
+    phase='VERIFYING' if stage=='verify' else 'REVIEWING'
+    reason=f'{stage} 설정 입력이 변경되어 자동 재검증합니다.'
+    plan_values={'status':'MANUAL_PENDING','review_result':None,'review_token':None,
+        'publication_token':None}
+    project_values={'phase':phase,'last_error':reason,'pr_url':pr_url,'pr_head_oid':pr_head_oid,
+        'review_result':None,'review_token':None,'publication_token':None}
+    if stage=='verify':
+        plan_values.update(verify_result=None,verify_token=None,validated_base_sha=None)
+        project_values.update(verify_result=None,verify_token=None,validated_base_sha=None)
+    if confirmed_push_head is not None:
+        project_values.update(publication_remote_oid=confirmed_push_head,pr_conflict_recovery=0,
+            pr_conflict_head_oid=None,pr_conflict_base_oid=None)
+    with runtime_state._transaction(connection):
+        for member in members:
+            runtime.update_plan(repo,member,plan_values=plan_values,enqueue=False)
+        runtime.update_project(repo,project_values)
+        if confirmed_push_head is not None and checkpoint.operation=='push':
+            checkpoint_repository.record(repo,plan_id,
+                expected_generation=checkpoint.generation,operation=None,
+                expected_head=confirmed_push_head,target_base_oid=checkpoint.target_base_oid,
+                observed_remote_oid=confirmed_push_head,
+                snapshot={**(checkpoint.snapshot or {}),
+                          'confirmed_manual_stage_revalidation':stage})
+        store.update(group,state='AUTOMATIC',active_id=plan_id,resume_phase=phase,
+                     last_error=reason)
     return True
 
 

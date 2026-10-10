@@ -22,6 +22,16 @@ def digest(value: object) -> str:
                                     separators=(",", ":")).encode()).hexdigest()
 
 
+class ManualStageInputChanged(runtime_state.RuntimeStateError):
+    """A prior successful manual receipt no longer matches the current stage input."""
+
+    def __init__(self, stage: str):
+        if stage not in {"verify", "review"}:
+            raise ValueError("invalid manual stage")
+        self.stage = stage
+        super().__init__(f"수동 {stage} 단계 입력이 변경됐습니다.")
+
+
 def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute("""CREATE TABLE IF NOT EXISTS manual_work_groups (
         repo TEXT NOT NULL, group_id TEXT NOT NULL, kind TEXT NOT NULL,
@@ -201,24 +211,45 @@ class ManualWorkRepository:
         token = candidate_token(self.connection,repo,head,selected.validated_base_sha,json.loads(group['documents']))
         if not stage_tokens or any(not stage_tokens.get(stage) for stage in ('verify','review')):
             raise runtime_state.RuntimeStateError('게시 직전 수동 단계 설정 입력을 확인할 수 없습니다.')
-        evidence = [row for row in self.connection.execute("SELECT plan_id,stage,result,input_token FROM manual_work_results "
+        receipts = self.connection.execute("SELECT plan_id,stage,result,input_token,request_id FROM manual_work_results "
             "WHERE repo=? AND group_id=? AND head=? AND base_sha=? AND result IN ('PASS','SKIPPED_BY_USER')",
             (repo,group['group_id'],head,selected.validated_base_sha)).fetchall()
+        evidence = [row for row in receipts
             if row['input_token']==stage_tokens[row['stage']]]
+        publication_values = dict(values)
+        for field in ('pr_url', 'pr_head_oid', 'publication_remote_oid'):
+            if not publication_values.get(field):
+                publication_values[field] = getattr(selected, field)
         covered = {(row['plan_id'],row['stage']) for row in evidence}
         required = {(member,stage) for member in json.loads(group['members']) for stage in ('verify','review')}
         if not head or not required <= covered:
+            members = set(json.loads(group['members']))
+            for stage in ('verify', 'review'):
+                current = {row['plan_id'] for row in evidence if row['stage'] == stage}
+                stale = {row['plan_id'] for row in receipts
+                         if row['stage'] == stage and row['input_token'] != stage_tokens[stage]
+                         and row['request_id'] == group['request_id']}
+                failed = self.connection.execute(
+                    "SELECT 1 FROM manual_work_results WHERE repo=? AND group_id=? AND stage=? "
+                    "AND head=? AND base_sha=? AND input_token=? AND result='FAIL' LIMIT 1",
+                    (repo, group['group_id'], stage, head, selected.validated_base_sha,
+                     stage_tokens[stage]),
+                ).fetchone()
+                if not failed and members <= current | stale and members - current:
+                    raise ManualStageInputChanged(stage)
             raise runtime_state.RuntimeStateError('묶음 전체 G의 최종 후보 검증·Review 근거가 없습니다.')
+        if not publication_values.get('pr_url'):
+            raise runtime_state.RuntimeStateError('수동 제출 묶음의 기존 PR URL을 확인할 수 없습니다.')
         self.connection.execute('INSERT INTO manual_work_publications VALUES (?,?,?,?,?,?,?,?) '
             'ON CONFLICT(repo,group_id) DO UPDATE SET pr_url=excluded.pr_url,head=excluded.head,'
             'base_sha=excluded.base_sha,evidence=excluded.evidence,input_token=excluded.input_token,request_id=excluded.request_id',
-            (repo,group['group_id'],values['pr_url'],head,selected.validated_base_sha,
+            (repo,group['group_id'],publication_values['pr_url'],head,selected.validated_base_sha,
              json.dumps([dict(row) for row in evidence]),token,group['request_id']))
         for member in json.loads(group['members']):
             if member != plan_id:
                 runtime.update_plan(repo, member, plan_values={'status':'PR_OPEN',
                     'verify_result':selected.verify_result,'review_result':selected.review_result,
-                    'validated_base_sha':selected.validated_base_sha,**values}, enqueue=False)
+                    'validated_base_sha':selected.validated_base_sha,**publication_values}, enqueue=False)
         self.update(group, state='PR_OPEN', active_id=None)
 
     def mark_group_merged(self, repo, plan_id):
