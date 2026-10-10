@@ -323,14 +323,15 @@ class BlockedPlanReconciler:
             raise RuntimeError('기존 PR identity·상태·head가 차단 checkpoint와 다릅니다.')
         return branch.oid
 
-    def _validate(self, plan, context, *, rebase=False):
+    def _validate(self, plan, context=None, *, rebase=False):
         worktree, branch = Path(plan['worktree']), str(plan['branch'])
         self.ports.validate_execplan_workspace_identity(self.state_dir, self.repo, manual_workspace_owner(self.connection, self.repo, plan['plan_id']), branch, worktree)
         self.ports.validate_managed_worktree(self.repo_path, worktree, branch, allow_rebase=rebase)
         self.ports.validate_blocked_agent_scope(
             self.connection, self.repo_path, self.repo, self.base, worktree, plan['path'],
             accepted_rebase=rebase, saved_plan=plan,
-            changed_candidate=self._candidate_changed(plan, context))
+            changed_candidate=(self._candidate_changed(plan, context)
+                               if context is not None else False))
         return worktree, branch
 
     def _adopt(self, plan, context, *, project_recovery_context=None):

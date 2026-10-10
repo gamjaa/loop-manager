@@ -518,13 +518,17 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
             # A later completed intent cannot bridge missing proof of the first.
             self.run_git(self.repo, "reflog", "expire", "--expire=all",
                          "refs/remotes/origin/main")
-            self.assertEqual(resumed._shared_safety_error(
+            self.assertEqual(loop_manager._proven_manager_base_refs(
+                reopened, self.repo, repo, "G-034", before, current,
+            ), frozenset())
+            # The saved Manager receipt chain is still incomplete, but an
+            # independent live-origin proof accepts this normal base fetch.
+            self.assertIsNone(resumed._shared_safety_error(
                 request, resumed._plan(request), current,
-            ).reason_code, "shared_ref_mutation")
-            with self.assertRaises(loop_manager.AgentScopeError):
-                loop_manager.validate_persisted_agent_scope(
-                    reopened, self.repo, self.state_dir, repo,
-                )
+            ))
+            self.assertEqual(loop_manager.validate_persisted_agent_scope(
+                reopened, self.repo, self.state_dir, repo,
+            ).refs["refs/remotes/origin/main"], current.refs["refs/remotes/origin/main"])
         finally:
             reopened.close()
 
@@ -553,10 +557,12 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
         self.run_git(self.repo, "update-ref", "-d", "refs/heads/external-staging")
         current = loop_manager.capture_git_snapshot(self.worktree)
         self.assertEqual(current.refs["refs/remotes/origin/main"][0], target)
-        self.assertEqual(
-            adapter._shared_safety_error(request, adapter._plan(request), current).reason_code,
-            "shared_ref_mutation",
-        )
+        self.assertIsNone(adapter._shared_safety_error(
+            request, adapter._plan(request), current,
+        ))
+        self.assertEqual(loop_manager._proven_manager_base_refs(
+            self.connection, self.repo, repo, "G-034", before, current,
+        ), frozenset())
         with self.assertRaises(RuntimeError):
             loop_manager._perform_manager_base_fetch(
                 self.connection, self.repo, intent, "main",
@@ -565,6 +571,14 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
             loop_manager._finish_manager_base_fetch(
                 self.connection, self.repo, intent,
             )
+        self.assertEqual(self.connection.execute(
+            "SELECT phase FROM manager_base_fetches WHERE id = ?", (intent,),
+        ).fetchone()[0], "pending")
+        self.run_git(self.repo, "update-ref", "refs/heads/external", target)
+        unrelated = loop_manager.capture_git_snapshot(self.worktree)
+        self.assertEqual(adapter._shared_safety_error(
+            request, adapter._plan(request), unrelated,
+        ).reason_code, "shared_ref_mutation")
         with self.assertRaises(loop_manager.AgentScopeError):
             loop_manager.validate_persisted_agent_scope(
                 self.connection, self.repo, self.state_dir, repo,
