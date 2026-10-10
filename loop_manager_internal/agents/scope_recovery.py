@@ -594,7 +594,8 @@ def _validate_persisted_agent_scope(
             selected_plan_path=selected_plan_path if role_name == 'worker' else None,
             allowed_guidance_targets=guidance_targets, allow_common_plans=allow_common_plans,
             allowed_requirement_archives=archive_sources,
-            external_worktree=repo_path, base_branch=str(project['base_branch']), resources=resources)
+            external_worktree=repo_path, base_branch=str(project['base_branch']), resources=resources,
+            connection=connection)
     for check in decision.checks:
         try:
             check_refs = check.allowed_refs
@@ -623,6 +624,7 @@ def _validate_persisted_agent_scope(
                 allowed_worktree_changes=check_worktrees,
                 external_worktree=repo_path,
                 base_branch=str(project["base_branch"]),
+                connection=connection,
                 resources=resources,
                 owned_rebase=rebase_scope_normalized,
             )

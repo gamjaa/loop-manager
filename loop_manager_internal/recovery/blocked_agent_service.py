@@ -595,6 +595,7 @@ def preserve_blocked_agent_changes(
     plan_id: str,
     *,
     preserved_input_path: str | None = None,
+    accept_current_input: bool = False,
 ) -> GitSnapshot | None:
     """Persist and isolate a diagnosed scope violation crash-safely."""
 
@@ -606,6 +607,10 @@ def preserve_blocked_agent_changes(
     ).fetchone()
     if project is None:
         raise AgentScopeError("보존할 BLOCKED Agent 프로젝트가 없습니다.")
+    if accept_current_input and project["agent_recovery"]:
+        raise AgentScopeError(
+            "BLOCKED Agent 복구가 진행 중이어서 새 사용자 입력을 보존할 수 없습니다."
+        )
     if project["agent_recovery"]:
         recovery = effects._deserialize_blocked_agent_recovery(
             str(project["agent_recovery"])
@@ -639,6 +644,26 @@ def preserve_blocked_agent_changes(
             "Agent 실행 전 Git operation이 있는 worktree는 자동 격리할 수 없습니다."
         )
     current = effects.capture_git_snapshot(worktree)
+    if accept_current_input:
+        effects._blocked_agent_local_baseline(
+            before, result, current, worktree, accept_current_input=True,
+        )
+        selected = connection.execute(
+            "SELECT branch, worktree FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (repo, plan_id),
+        ).fetchone()
+        block = scoped_blocking.plan_block(connection, repo, plan_id)
+        request = connection.execute(
+            "SELECT request_identity FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?",
+            (repo, plan_id),
+        ).fetchone()
+        if (selected is None or selected["branch"] != current.branch
+                or selected["worktree"] != str(worktree)
+                or block is None or request is None):
+            raise AgentScopeError(
+                "BLOCKED Agent 현재 입력의 계획·worktree 소유권이 없습니다."
+            )
+        return current
     if current.branch != before.branch or current.head not in {
         before.head,
         result.head,

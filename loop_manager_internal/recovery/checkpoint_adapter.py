@@ -14,6 +14,7 @@ from loop_manager_internal.git import rebase_file_evidence
 from loop_manager_internal.git.base_fetch_service import reconcile_external_base
 from loop_manager_internal.recovery import blocked_checkpoint
 from loop_manager_internal.recovery import project_blocked_recovery
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.scoped_blocking import GUIDANCE_BLOCK_REASON
@@ -558,6 +559,8 @@ class CheckpointSafetyAdapter:
                 default_worktree=str(_canonical_path(self.repo_path)),
                 base_branch=str(base),
             )
+        except RecoveryFailure:
+            raise
         except (ValueError, TypeError, KeyError, RuntimeError) as error:
             return reject("workspace_ownership_uncertain", str(error))
         if before.config != current.config:

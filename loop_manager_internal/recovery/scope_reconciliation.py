@@ -166,6 +166,8 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
                 )
             else:
                 return False
+        except RecoveryFailure:
+            raise
         except (AgentScopeError, RuntimeError, WorkspaceOwnershipError, ValueError):
             return False
         with runtime_state._transaction(connection):
@@ -263,6 +265,8 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
                 require_safe_result=scoped_blocking.is_scope_baseline_block(block))
         if checked is not None and effects.capture_git_snapshot(worktree) != checked:
             return False
+    except RecoveryFailure:
+        raise
     except (AgentScopeError, RuntimeError, WorkspaceOwnershipError, ValueError):
         return False
     with runtime_state._transaction(connection):

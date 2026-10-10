@@ -13,6 +13,7 @@ from loop_manager_internal.git import rebase_block_reconciliation
 from loop_manager_internal.git.base_fetch_service import reconcile_external_base
 from loop_manager_internal.recovery import blocked_remote_observation
 from loop_manager_internal.recovery import checkpoint_ownership
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure
 from loop_manager_internal.recovery import scope_reconciliation
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
@@ -451,6 +452,8 @@ def reconcile_false_positive_runtime_block(
             connection, repo_path, state_dir, repo,
             runtime_mutation=runtime_mutation,
         )
+    except RecoveryFailure:
+        raise
     except (AgentScopeError, RuntimeError, ValueError, KeyError):
         return False
     return True

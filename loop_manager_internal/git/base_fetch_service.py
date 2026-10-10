@@ -12,6 +12,7 @@ from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
 from loop_manager_internal.runtime.contracts import RuntimeWorktree
 from loop_manager_internal.runtime.resource_lock import fetch_resource
 from loop_manager_internal.runtime.runtime_scope import proven_runtime_removal
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 from pathlib import Path
 import json
 import re
@@ -39,37 +40,98 @@ def reconcile_external_base(git, repo, base, before, current, resources, *, regi
         return before
     if not registered_origin:
         return before
+
+    remote_ref = f'refs/heads/{base}'
+
+    def retry(detail, error=None):
+        failure = RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, detail)
+        if error is None:
+            raise failure
+        raise failure from error
+
+    def remote_oid():
+        try:
+            remote = git(repo, 'ls-remote', '--heads', 'origin', remote_ref, check=False)
+        except (RuntimeError, OSError) as error:
+            retry(f'origin/{base} 원격 ref 조회를 재시도합니다.', error)
+        if remote.returncode:
+            retry(f'origin/{base} 원격 ref 조회를 재시도합니다.')
+        rows = [line.split() for line in remote.stdout.splitlines() if line.strip()]
+        if len(rows) != 1 or rows[0][1:] != [remote_ref]:
+            return None
+        return rows[0][0]
+
+    def is_ancestor(ancestor, descendant):
+        try:
+            result = git(repo, 'merge-base', '--is-ancestor', ancestor, descendant, check=False)
+        except (RuntimeError, OSError) as error:
+            retry(f'origin/{base} ancestry 관측을 재시도합니다.', error)
+        if result.returncode == 0:
+            return True
+        if result.returncode == 1:
+            return False
+        retry(f'origin/{base} ancestry 관측을 재시도합니다.')
+
+    def symbolic_head():
+        try:
+            symbolic = git(repo, 'ls-remote', '--symref', 'origin', 'HEAD', check=False)
+        except (RuntimeError, OSError) as error:
+            retry(f'origin/HEAD 관측을 재시도합니다.', error)
+        if symbolic.returncode:
+            retry(f'origin/HEAD 관측을 재시도합니다.')
+        fields = symbolic.stdout.split()
+        if len(fields) != 5 or fields[:3] != ['ref:', remote_ref, 'HEAD'] or fields[4] != 'HEAD':
+            return None
+        return fields[3]
+
     try:
         from loop_manager_internal.git.git_adapter import github_repository
-        configured = git(repo, 'remote', 'get-url', '--all', 'origin', check=False)
+        try:
+            configured = git(repo, 'remote', 'get-url', '--all', 'origin', check=False)
+        except (RuntimeError, OSError) as error:
+            retry(f'등록 origin 관측을 재시도합니다.', error)
+        if configured.returncode:
+            retry('등록 origin 관측을 재시도합니다.')
         origin_urls = [line.strip() for line in configured.stdout.splitlines() if line.strip()]
-        if (configured.returncode or len(origin_urls) != 1
-                or github_repository(origin_urls[0]) != registered_origin):
+        if len(origin_urls) != 1 or github_repository(origin_urls[0]) != registered_origin:
             return before
-        remote_ref = f'refs/heads/{base}'
-        remote = git(repo, 'ls-remote', '--heads', 'origin', remote_ref, check=False)
-        if remote.returncode or remote.stdout.split() != [new[0], remote_ref]:
+
+        advertised = remote_oid()
+        if advertised is None:
             return before
-        if git(repo, 'merge-base', '--is-ancestor', old[0], new[0], check=False).returncode:
+        if not is_ancestor(old[0], new[0]) or not is_ancestor(new[0], advertised):
             return before
+
         if previous_head is None and observed_head is not None:
-            symbolic = git(repo, 'ls-remote', '--symref', 'origin', 'HEAD', check=False)
-            if symbolic.returncode or symbolic.stdout.split() != ['ref:', remote_ref, 'HEAD', new[0], 'HEAD']:
+            symbolic_oid = symbolic_head()
+            if (symbolic_oid is None or not is_ancestor(new[0], symbolic_oid)
+                    or not (is_ancestor(advertised, symbolic_oid)
+                            or is_ancestor(symbolic_oid, advertised))):
                 return before
         # The tracking resource must still match the captured observation.
-        live = git(repo, 'rev-parse', '--verify', ref, check=False)
-        if live.returncode or live.stdout.strip() != new[0]:
-            return before
-        remote_after = git(repo, 'ls-remote', '--heads', 'origin', remote_ref, check=False)
-        if remote_after.returncode or remote_after.stdout.split() != [new[0], remote_ref]:
+        try:
+            live = git(repo, 'rev-parse', '--verify', ref, check=False)
+        except (RuntimeError, OSError) as error:
+            retry(f'{ref} live ref 관측을 재시도합니다.', error)
+        if live.returncode:
+            retry(f'{ref} live ref 관측을 재시도합니다.')
+        if live.stdout.strip() != new[0]:
+            retry(f'{ref} snapshot이 변경되어 재관측합니다.')
+
+        remote_after = remote_oid()
+        if (remote_after is None or not is_ancestor(new[0], remote_after)
+                or not is_ancestor(advertised, remote_after)):
             return before
         if previous_head is None and observed_head is not None:
-            symbolic_after = git(repo, 'ls-remote', '--symref', 'origin', 'HEAD', check=False)
-            if (symbolic_after.returncode
-                    or symbolic_after.stdout.split() != ['ref:', remote_ref, 'HEAD', new[0], 'HEAD']):
+            symbolic_after = symbolic_head()
+            if (symbolic_after is None or not is_ancestor(new[0], symbolic_after)
+                    or not (is_ancestor(remote_after, symbolic_after)
+                            or is_ancestor(symbolic_after, remote_after))):
                 return before
+    except RecoveryFailure:
+        raise
     except (RuntimeError, OSError):
-        return before
+        retry(f'origin/{base} 원격 상태 관측을 재시도합니다.')
     refs = {**before.refs, ref: new}
     if previous_head != observed_head:
         refs[head] = observed_head

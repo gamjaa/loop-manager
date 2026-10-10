@@ -468,6 +468,8 @@ def resume_blocked_execplan_if_inputs_changed(
                 worktree,
                 str(plan["path"]),
             )
+        except recovery_runtime.RecoveryFailure:
+            raise
         except (AgentScopeError, RuntimeError) as error:
             message = f"BLOCKED Agent 범위 재검증 실패:\n{error}"
             effects._update_blocked_error(connection, repo, str(plan["plan_id"]), message)
@@ -482,6 +484,8 @@ def resume_blocked_execplan_if_inputs_changed(
             str(plan["path"]),
             changed_candidate=True,
         )
+    except recovery_runtime.RecoveryFailure:
+        raise
     except (AgentScopeError, RuntimeError) as error:
         message = f"BLOCKED Agent 범위 재검증 실패:\n{error}"
         effects._update_blocked_error(connection, repo, str(plan["plan_id"]), message)
@@ -513,7 +517,10 @@ def resume_blocked_execplan_if_inputs_changed(
             worktree,
             str(plan["plan_id"]),
             preserved_input_path=(str(plan["path"]) if worktree_changed else None),
+            accept_current_input=True,
         )
+    except recovery_runtime.RecoveryFailure:
+        raise
     except (AgentScopeError, RuntimeError) as error:
         message = f"BLOCKED Agent 변경 보존 실패:\n{error}"
         effects._update_blocked_error(connection, repo, str(plan["plan_id"]), message)
