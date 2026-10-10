@@ -182,13 +182,13 @@ complete/submit의 `--skip-verify`와 `--skip-review`는 각각 전체 verify �
 | `--skip-review` | 실행해 통과해야 한다. | 사용자 생략으로 기록한다. |
 | 둘 다 | 각 단계의 사용자 생략으로 기록한다. | 각 단계의 사용자 생략으로 기록한다. |
 
-생략 옵션이 하나라도 있으면 `--expected-head`와 비어 있지 않은 `--skip-reason`을 요구한다. expected HEAD는 명령이 확인한 원격 제출 commit 전체 SHA다. complete는 해당 G의 소유 작업 branch, submit은 명시한 source branch를 기준으로 한다. 짧은 SHA나 이동 가능한 ref는 받지 않는다. 값이 다르면 실제 원격 HEAD를 알리고 요청 수락 전에 거부한다. expected HEAD는 생략 없이도 지정할 수 있으며 reason만 지정하는 입력은 거부한다.
+생략 옵션이 하나라도 있으면 `--expected-head`를 요구하며 `--skip-reason`은 선택 사항이다. expected HEAD는 명령이 확인한 원격 제출 commit 전체 SHA다. complete는 해당 G의 소유 작업 branch, submit은 명시한 source branch를 기준으로 한다. 짧은 SHA나 이동 가능한 ref는 받지 않는다. 값이 다르면 실제 원격 HEAD를 알리고 요청 수락 전에 거부한다. expected HEAD는 생략 없이도 지정할 수 있으며 reason만 지정하는 입력은 거부한다.
 
-생략은 외부 검증·Review의 통과를 Manager가 확인했다는 뜻이 아니라 사용자가 그 단계 실행을 명시적으로 면제한 사실이다. SQLite에는 단계별 실제 PASS·FAIL·NOT_RUN과 `SKIPPED_BY_USER`를 구분해 저장하고 완료 요청, 대상 commit·입력, reason·시각을 감사 근거로 남긴다. 생략을 실제 성공 cache, Worker 결과 또는 실행된 Agent 호출로 기록하지 않는다. 기존 수단으로 확인할 수 없는 승인자 identity는 추정하지 않는다.
+생략은 외부 검증·Review의 통과를 Manager가 확인했다는 뜻이 아니라 사용자가 그 단계 실행을 명시적으로 면제한 사실이다. SQLite에는 단계별 실제 PASS·FAIL·NOT_RUN과 `SKIPPED_BY_USER`를 구분해 저장하고 완료 요청, 대상 commit·입력, 제공된 reason·시각을 감사 근거로 남긴다. 사유 생략·빈 문자열·공백만 있는 값은 미입력으로 취급하고 사유가 없다는 이유로 거부하지 않는다. 감사·Reviewer 입력·PR 설명에는 미입력을 드러내며 임의 사유나 검증 완료 근거를 만들어 채우지 않는다. 생략을 실제 성공 cache, Worker 결과 또는 실행된 Agent 호출로 기록하지 않는다. 기존 수단으로 확인할 수 없는 승인자 identity는 추정하지 않는다.
 
 생략은 해당 수동 작업 또는 제출 묶음과 요청의 제출 commit, base, 전체 대상 G 구성·정의 및 단계별 입력에만 유효하다. 제출 commit이 실제 최종 후보와 일치하고 입력이 유효할 때만 적용한다. verify 입력은 검증 스크립트·설정·환경을 포함하고 Review 입력은 diff·모든 대상 G와 R·지침·verify 근거를 포함한다. 구성 G의 추가·제거·정의 변경은 기존 묶음 생략을 무효화하며 한 G의 생략을 무관한 계획에 적용하지 않는다. PR 연결 후에는 동일 PR identity도 유지해야 한다.
 
-원격 후속 commit, rebase·amend·Worker 교정 등 새 SHA, base 변경, 관련 계획·source·guidance·검증 환경 변경과 verify 근거 변경은 해당 생략을 무효화한다. 동일 tree라도 SHA가 다르면 새 후보이며, HEAD가 같아도 관련 입력이 달라졌으면 재사용하지 않는다. submit에서 생성 G를 commit해 최종 SHA가 바뀌는 경우도 예외 없이 포함한다. 코드가 같다는 이유로 최초 source commit의 생략을 새 commit으로 옮기지 않는다. 유효성을 증명할 수 없으면 생략을 이어받지 않는다. 수락 뒤 이 변화가 발생하면 해당 단계를 기본 실행하고 자동 처리를 계속하며, 새 생략 선택을 기다리는 절차를 요구하지 않는다. 사용자가 새 후보의 생략을 원하면 안내된 생성 G·소유 branch의 해당 SHA와 reason을 지정한 complete로 별도의 요청을 해야 한다.
+원격 후속 commit, rebase·amend·Worker 교정 등 새 SHA, base 변경, 관련 계획·source·guidance·검증 환경 변경과 verify 근거 변경은 해당 생략을 무효화한다. 동일 tree라도 SHA가 다르면 새 후보이며, HEAD가 같아도 관련 입력이 달라졌으면 재사용하지 않는다. submit에서 생성 G를 commit해 최종 SHA가 바뀌는 경우도 예외 없이 포함한다. 코드가 같다는 이유로 최초 source commit의 생략을 새 commit으로 옮기지 않는다. 유효성을 증명할 수 없으면 생략을 이어받지 않는다. 수락 뒤 이 변화가 발생하면 해당 단계를 기본 실행하고 자동 처리를 계속하며, 새 생략 선택을 기다리는 절차를 요구하지 않는다. 사용자가 새 후보의 생략을 원하면 안내된 생성 G·소유 branch의 해당 SHA와 생략 옵션, 선택적 reason을 지정한 complete로 별도의 요청을 해야 한다.
 
 같은 후보에 기록된 실제 verify 실패나 Reviewer blocking을 생략 옵션만으로 없애지 않는다. 해당 실패는 자동 교정과 실제 재실행 성공으로 해소한다. Worker 또는 사용자가 수정한 새 후보에는 이전 실패를 감사 이력으로 보존하고 기본 검증·Review를 수행하며, 별도의 유효한 생략 요청이 있으면 그 범위에서만 적용한다. 승인 대기·dependency·소유권·실제 공유 안전 gate는 생략이나 후보 변경으로 해제하지 않는다.
 
@@ -252,7 +252,7 @@ start 성공에는 branch·원격 HEAD·base, 다른 기기 작업 안내와 com
 - 수동 대기 중 새 유지보수 리팩터링의 게시·실행을 보류하면서 due·명시적 요청을 보존하고 독립 일반 계획은 계속한다. 이미 활성인 cycle의 gate는 수동 명령으로 우회되지 않는다.
 - 다른 기기의 사용자 push와 로컬 보존 작업, 정상 분기·최신 base를 함께 반영한다. complete/submit 수락 뒤 conflict·검증·Review 실패는 자동 복구·Worker 교정을 우선한다. 실제 소유권·lock·사용자 결정과 최종 차단에는 기존 안전·보존 정책을 적용한다.
 - 기본 complete/submit은 최종 후보의 전체 verify와 읽기 전용 Reviewer를 수행한 뒤 기존 게시 경로에 연결한다. 수동 제출을 Worker 성공이나 외부 targeted test 통과로 위장하지 않는다.
-- 네 가지 생략 조합, 제출 commit의 전체 expected SHA·reason 필수 조건과 수락 전 후보 불일치를 확인한다. 각 단계의 SKIPPED_BY_USER는 실제 PASS·FAIL과 구분되고 Reviewer 입력·PR 설명·저장 결과가 일치한다.
+- 네 가지 생략 조합, 생략 시 제출 commit의 전체 expected SHA 필수 조건과 수락 전 후보 불일치를 확인한다. complete·submit에서 생략 옵션을 사용할 때 사유 생략·빈 문자열·공백·사유 제공을 허용하고 생략 옵션 없이 reason만 지정하면 거부한다. 각 단계의 SKIPPED_BY_USER는 실제 PASS·FAIL과 구분되고 사유 미입력/제공 여부가 Reviewer 입력·PR 설명·저장 결과에서 일치한다.
 - commit·base·관련 명세·지침·검증 환경·verify 근거 변경에서 생략이 무효화된다. 동일 tree 새 SHA와 동일 HEAD의 관련 입력 변경도 포함한다. Worker 교정·rebase 뒤에는 무효화된 검증·Review를 별도 사용자 선택 없이 기본 실행하고 새 무옵션 완료 요청이 과거 생략을 상속하지 않는다.
 - complete/submit 수락 뒤 verify 실패·timeout·Review blocking·프로토콜 실패·일시 오류에 자동 교정·재시도·재검증을 수행하고 PR 게시까지 이어간다. 같은 후보의 실제 실패를 생략으로 지우거나 실패만으로 MANUAL_WORKING에 돌려보내지 않는다. 승인·안전 문제와 한도 소진에는 기존 차단을 적용하고 독립 차단을 일괄 해제하지 않는다.
 - verify 생략 후 Review blocking, Review 생략 후 verify 실패에서 Worker가 후보를 수정하면 이전 후보의 생략을 무효화하고 새 후보의 전체 verify·Review를 기본 수행한다. 두 단계 생략 뒤 최신 base 반영으로 후보가 바뀌는 경우에도 재제출을 기다리지 않고 필요한 단계를 자동 실행한다.
@@ -270,7 +270,7 @@ start 성공에는 branch·원격 HEAD·base, 다른 기기 작업 안내와 com
 - 수동 구현 대기는 독립 자동 작업을 막지 않고 Planner의 자동 편집과 자동 Worker 교정으로부터 해당 계획을 보호한다.
 - 자동 매니저가 실행 중이어도 충돌 없는 수동 명령의 준비·수락은 즉시 수행하며, 사용자는 start가 준비·푸시한 브랜치에서 바로 구현할 수 있다. 실제 충돌 요청은 구체적인 오류로 거부하고 자동 대기로 전환하지 않는다.
 - complete/submit 요청 수락 뒤에는 실패·충돌·후속 후보 변경을 기본적으로 Manager가 자동 복구·Worker 교정·재검증하며 사용자 재제출은 요구하지 않는다.
-- 외부 검증·Review를 이유로 선택한 생략은 대상 후보와 입력에 한정된 명시적 사용자 면제로 기록되며 실제 통과와 구분된다.
+- 외부 검증·Review를 이유로 선택한 생략은 대상 후보와 입력에 한정된 명시적 사용자 면제로 기록되며 실제 통과와 구분된다. 생략 사유는 선택적으로 남길 수 있고 미입력도 면제 기록에 드러난다.
 - 생성 G가 여러 개면 명시적 제출 묶음의 전체 목표를 같은 후보·PR에서 검증하고 실제 Merge 뒤 함께 완료한다. 묶음 내부의 선행 Merge 의존성은 별도 순차 제출로 처리한다.
 - 수동·자동 경로 모두 계획의 최종 완료는 연결 PR의 실제 Merge를 기준으로 한다.
 

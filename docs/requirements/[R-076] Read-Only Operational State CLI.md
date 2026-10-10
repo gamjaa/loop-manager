@@ -156,8 +156,9 @@ python loop_manager.py [--state-dir <dir>] logs <repository> --plan <id> [--tail
 
 - 명령어 Skill은 Loop Manager 자체 저장소에서만 사용한다. 등록 프로젝트로 복사·설치하지 않고 프로젝트 파일 준비 스크립트에도 배포 대상으로 추가하지 않는다. 이번 변경의 명령·범위·거부 조건·결과 확인 방법을 안내하며 호환 명령은 사용·안내하지 않는다.
 - `manual start`가 원격 브랜치·작업 공간 준비를 완료하면 사용자가 다른 AI 세션에 복사할 수 있는 짧은 프롬프트를 정해진 형식으로 코드에서 생성한다. 생성용 Agent 호출은 하지 않는다. 준비 실패·미완료 결과를 구현 준비 완료로 안내하지 않는다.
-- 프롬프트에는 G ID·계획 경로, 소유 브랜치·base, 프로젝트 안의 PRODUCT·Requirement·ARCHITECTURE 등 작업 문서 상대 경로, 해당 프로젝트의 verify 명령과 push 후 사용할 `manual complete <repo> <id>`를 포함한다. Manager 명령을 실행할 위치와 다른 기기에서 구현할 위치를 구분한다.
+- 복사용 프롬프트에는 G ID·작업 경로, 소유 브랜치·base, 프로젝트 안의 PRODUCT·Requirement·ARCHITECTURE 등 작업 문서 상대 경로와 해당 프로젝트의 verify 명령을 포함한다. 구현·검증·문서 기준 재검증 후 소유 브랜치에 push하는 단계까지 지시하며 PR 생성은 지시하지 않는다. `manual start` 출력은 복사용 프롬프트와 별도로 사용자에게 push 후 Manager에서 `manual complete <repo> <id>`를 실행하도록 안내하며, Manager 명령 실행 위치와 프로젝트 구현 위치를 구분한다.
 - Review 안내는 별도 CLI를 요구하지 않고, "작업 후 해당 계획과 PRODUCT·활성 Requirement·ARCHITECTURE를 기준으로 구현과 검증 결과를 재검증하고 누락·모순을 수정하라"는 자연어 지시를 포함한다. 이 자체 점검을 Manager의 verify·독립 Reviewer 통과나 실제 Merge 근거로 기록하지 않는다.
+- 명령어 Skill과 수동 완료 안내는 `manual complete/submit`에서 검증·Review 생략을 선택할 때 실제 수행 내용·결과 등 생략 근거를 짧게 작성해 `--skip-reason`으로 함께 전달하도록 안내한다. CLI에서는 R-077대로 선택 옵션임을 명시하고 사유 작성 안내를 생략 강제나 추가 수락 조건으로 바꾸지 않는다. 수행하지 않은 검증·Review를 완료했다고 작성하지 않는다.
 
 ### 관측 시각과 정책 재사용
 
@@ -224,7 +225,8 @@ python loop_manager.py [--state-dir <dir>] logs <repository> --plan <id> [--tail
 - 미착수 유효 수동 제출만 `cancel`·수동 `reset`으로 취소되며 브랜치·작업물·실행 근거와 수동 대기가 보존된다. 과거/이미 취소된 요청의 재확인, 자동 후속 처리 시작과 취소의 경쟁, 착수 뒤 pause에도 취소 자격이 복원되지 않음, 취소 후 자동 재개 없음과 명시적 재제출을 확인한다.
 - 자동 `reset`·`manual stop`의 진행 작업 종료, 백업 실패 시 무변경, 관리 rebase만 취소, 정확한 원격 lease와 사용자 source 보존, 현재 실행 근거만 초기화 및 성공 뒤 READY 전환을 확인한다. 중간 실패·재시작에서 백업·감사·미완료 의도가 남고 잘못된 READY나 원격 덮어쓰기가 발생하지 않는다.
 - 공유 묶음의 한 G로 취소·중단·초기화를 요청해도 전체 ID·자원에 적용되고 일부 구성원의 거부 조건이면 전체를 보존한다. PR 생성·연결 이후 세 제어 명령은 거부하고 Requirement 수정·새 ExecPlan 경로를 안내하며 실제 Merge 완료 기준은 유지한다.
-- 명령어 Skill이 Loop Manager에만 남고 등록 프로젝트로 복사되지 않는다. 수동 준비 성공에서 추가 모델 호출 없이 생성한 프롬프트에 대상·문서·verify·자연어 재검증·push 후 완료 명령이 포함되며 미완료 준비와 실제 verify·Review 통과를 혼동하지 않는다.
+- 명령어 Skill이 Loop Manager에만 남고 등록 프로젝트로 복사되지 않는다. 수동 준비 성공에서 추가 모델 호출 없이 생성한 복사용 프롬프트에 대상·문서·verify·자연어 재검증·push까지의 지시가 포함되고 PR 생성 지시는 없다. 사용자에게는 별도로 Manager에서 실행할 완료 명령을 안내하며 미완료 준비와 실제 verify·Review 통과를 혼동하지 않는다.
+- Skill·수동 완료 안내에서 생략 선택 시 근거 있는 `--skip-reason` 작성을 안내하며 CLI 필수 조건으로 표현하지 않는다. complete·submit의 사유 미입력을 허용하는 R-077과 일치하고 생략 옵션을 자동 선택하거나 검증·Review 수행 사실을 만들어 내지 않는다.
 - 실제 provider·모델을 호출하지 않는 관련 targeted unit test와 저장소에서 요구하는 전체 검증이 통과한다. 자동 검증 주체와 실행 범위는 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md를, 프로젝트 규칙은 프로젝트 지침을, 계획 작성은 docs/PLANS.md를 따른다.
 
 ## Product Impact
