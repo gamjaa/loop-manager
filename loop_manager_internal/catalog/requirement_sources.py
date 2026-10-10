@@ -3,29 +3,17 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-import importlib.util
 from pathlib import Path
 import re
 import stat
 from typing import Mapping
 
+from loop_manager_internal.catalog.frontmatter import RequirementIdError, requirement_identity
+
 
 _ACTIVE = re.compile(r"docs/requirements/[^/\\]+\.md\Z")
 _ARCHIVED = re.compile(r"docs/requirements/archive/[^/\\]+\.md\Z")
 _SOURCE_ID = re.compile(r"\[(R-[0-9]{3,})\] [^/\\]+\.md\Z")
-_SCRIPT = (
-    Path(__file__).resolve().parents[2]
-    / ".agents/skills/specification-docs/scripts/next_requirement_id.py"
-)
-_SPEC = importlib.util.spec_from_file_location(
-    "_loop_manager_requirement_identity", _SCRIPT,
-)
-if _SPEC is None or _SPEC.loader is None:
-    raise RuntimeError(f"Requirement identity helper를 읽을 수 없습니다: {_SCRIPT}")
-_IDENTITY_MODULE = importlib.util.module_from_spec(_SPEC)
-_SPEC.loader.exec_module(_IDENTITY_MODULE)
-requirement_identity = _IDENTITY_MODULE.requirement_identity
-RequirementIdError = _IDENTITY_MODULE.RequirementIdError
 
 
 class ResolutionStatus(str, Enum):
