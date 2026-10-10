@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 import hashlib
+import json
 from pathlib import Path
 import subprocess
 import sqlite3
@@ -543,6 +544,36 @@ class PersistedScopeServiceTests(TestCase):
             self.assertEqual(tuple(connection.execute(
                 "SELECT agent_snapshot, agent_result_snapshot FROM projects WHERE repo='repo'",
             ).fetchone()), (before.serialize(), result.serialize()))
+
+    def test_blocked_agent_preservation_resumes_pending_recovery_for_current_input(self):
+        before = snapshot()
+        recovery = {
+            "version": 1,
+            "state": "prepared",
+            "source_snapshot": before.serialize(),
+            "original_head": before.head,
+            "violation_head": before.head,
+            "branch": before.branch,
+            "stash_marker": "loop-manager scope violation G-047 recovery",
+            "violation_ref": "refs/loop-manager/violations/G-047",
+        }
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        connection.execute(
+            "UPDATE projects SET agent_snapshot=?, agent_result_snapshot=?, "
+            "agent_recovery=? WHERE repo='repo'",
+            (before.serialize(), before.serialize(), json.dumps(recovery)),
+        )
+        connection.commit()
+
+        with mock.patch.object(manager, "_complete_blocked_agent_recovery") as complete:
+            preserved = manager.preserve_blocked_agent_changes(
+                connection, "repo", Path("/managed"), "G-047",
+                accept_current_input=True,
+            )
+
+        self.assertEqual(preserved, before)
+        complete.assert_called_once_with(connection, "repo", Path("/managed"))
 
     def test_blocked_plan_resume_hands_validated_current_state_to_preservation(self):
         from types import SimpleNamespace

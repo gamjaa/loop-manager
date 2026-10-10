@@ -47,7 +47,7 @@
 - 같은 프로젝트의 변경 실행은 하나이며, 모든 선행 ExecPlan이 MERGED인 계획만 시작한다. 서로 다른 프로젝트는 `max_workers` 안에서 병렬 처리한다.
 - Agent는 선택된 관리 worktree와 역할별 허용 범위에서만 작업한다. 불확실한 소유권이나 실제 범위 위반은 자동으로 허용하지 않는다.
 - 실패·중단·차단 시 작업물·session·진단을 보존한다. 원인과 안전 조건이 실제로 해소된 작업만 재개한다.
-- BLOCKED 해제는 저장된 Agent 결과를 원래 증거로 먼저 검사하고 현재 repository·계획·worktree·branch 소유권을 재확인한다. 그 뒤 현재 선택 worktree의 파일·index·HEAD를 새 입력으로 판정하며 과거 snapshot으로 덮어쓰지 않는다. index 보안 flag, 미완료 Git operation, branch/worktree identity 불일치는 계속 차단한다.
+- BLOCKED 해제는 이전 Agent writer 종료와 현재 repository·계획·worktree·branch 소유권을 확인한 뒤 현재 후보를 새 입력으로 재검증한다. 현재 파일·index·HEAD를 과거 snapshot으로 대체하지 않고, 중단된 진단 복구가 있으면 저장 journal부터 재개한다. index 보안 flag, 미완료 Git operation, branch/worktree identity 불일치는 계속 차단한다.
 - 최종 후보의 관련 테스트·전체 검증·독립 Review가 성공해야 PR을 생성한다. 연결 PR의 실제 Merge만 MERGED와 완료의 근거다.
 - 사용자 변경을 승인 없이 삭제하거나 덮어쓰지 않는다. 정리 안전성을 확인할 수 없는 worktree는 보존한다.
 - 같은 사용자 상태 디렉터리에서는 자동 실행을 하나만 허용한다. 수동 명령의 준비는 계획과 실제 자원의 소유권을 원자적으로 확인·예약한 뒤 동시에 수행할 수 있다. 로컬 복구 요청도 동시에 접수할 수 있으며 실제 복구는 전역 실행 잠금과 프로젝트 실행 자리를 준수한다.

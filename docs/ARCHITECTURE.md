@@ -553,7 +553,7 @@ ExecPlan archive는 원본 hash, regular-file source, 비어 있는 destination�
 
 Agent 범위 판정은 호출·역할·session·repository·관리 worktree에 결합된 격리 증거와 현재 자원 검사를 구분한다. 격리 증거가 없거나 불완전한 legacy 실행도 기본 checkout과 로컬 base branch를 비교에서 제외하지만, 선택 worktree·branch·사용 자원·origin·보안 설정·writer·후보 입력은 계속 검사한다. 정상 외부 fetch의 선택 base ref는 등록 origin, 예상 원격 target, ancestry와 live tracking ref를 확인해 재관측한다. 조회 실패나 관측 경쟁은 원래 snapshot으로 되돌려 범위 위반으로 판정하지 않고 `REMOTE_SNAPSHOT_RACE` 재시도로 넘긴다. 재관측은 Manager receipt를 만들거나 신규 호출의 provider 격리를 대체하지 않는다.
 
-BLOCKED 계획의 현재 입력은 이전 Agent writer가 끝난 뒤 저장 결과와 현재 후보 범위를 다시 검사하고, repository·계획·worktree·branch 소유권이 유지될 때 재개 입력으로 보존한다. 파일·index·HEAD를 과거 snapshot으로 복원하지 않으며, 진행 중인 복구·미완료 Git operation·보안 index flag·소유권 변경은 계속 차단한다. 현재 입력 검증과 보존 사이의 snapshot 변경도 재개하지 않는다.
+BLOCKED 계획의 현재 입력은 이전 Agent writer 종료와 repository·계획·worktree·branch 소유권을 확인한 뒤 새 후보로 검증하고, 과거 snapshot과 결과·session은 감사 자료로 보존한다. 후보가 저장된 Agent 결과에 머물거나 선택 ExecPlan만 추가 수정됐다면 진단 복구 journal로 Agent 변경을 격리하고 사용자의 계획 입력을 원자적으로 다시 적용한다. 그 밖의 검증된 현재 파일·index·HEAD는 그대로 다음 입력으로 넘기며 과거 snapshot으로 복원하지 않는다. 중단된 복구는 저장 journal부터 재개하고, 미완료 Git operation·보안 index flag·소유권 변경이나 입력 검증과 보존 사이의 snapshot 변경은 계속 차단한다.
 
 Agent 시작 이후 Manager의 fetch·worktree 전이는 작업별 전후 기대값·소유 표식·checkpoint와 현재 Git 상태가 일치하는 자원만 비교 기준선에 반영한다. 관측 OID, SQLite 완료 상태나 예정된 cleanup만으로 전체 ref·worktree를 갱신하지 않으며, Git 변경 뒤 receipt 저장 전 중단에서도 같은 증거를 읽기 전용으로 확인한다. 원본 scope와 재개 호출의 비교 시작값을 별도로 보존해 후속 Manager 전이가 실제 Agent 위반을 덮지 않게 하며, Agent 허용 변경·session·격리 증거를 유지한다
 
