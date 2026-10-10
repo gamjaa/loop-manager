@@ -107,10 +107,11 @@ Manager는 실제 전체 verify 성공 결과와 입력 지문을 SQLite에 저�
 1. 전체 verify 성공 결과를 재사용할 수 없다. 입력 목록 부재·오류·누락 의심·비교 불가도 포함한다.
 2. 해당 ExecPlan 또는 sources의 목록·내용이 바뀌었다. 예약어 source는 해당 공통 규칙의 내용·버전을 비교한다.
 3. 마지막으로 승인한 후보와 현재 후보의 PR diff가 달라졌다. 검증 입력 목록에서 제외된 작업 변경도 포함한다.
-4. 적용되는 PRODUCT·ARCHITECTURE·사용자 결정·공통 및 역할별 원본 묶음·실제 Reviewer instruction·프로젝트 지침·Review provider·Model·Effort가 바뀌었거나 이전 승인 근거가 없거나 불완전하다.
+4. 적용되는 PRODUCT·ARCHITECTURE·사용자 결정·공통 및 역할별 원본 묶음·실제 Reviewer instruction·Review provider·Model·Effort가 바뀌었거나 이전 승인 근거가 없거나 불완전하다.
 
 - 비교 기준은 직전 rebase가 아니라 마지막 Review 승인 당시의 verify 입력·명세·diff·검토 기준이다. 이번 실행의 새 verify 성공만으로 이전 Review를 유효하게 만들지 않는다.
 - 지침 비교는 R-064의 작업에 고정된 전체 원본 묶음 해시와 실제 Reviewer 합성 내용 해시를 사용한다. common 본문만 비교해 역할 파일 변경을 놓치거나 최신 runtime 내용을 진행 중 작업의 원본으로 소급 채택하지 않는다. 기존 단일 Markdown snapshot도 원래 전달 내용을 기준으로 비교한다.
+- 프로젝트 지침의 해석은 R-066에 따라 Agent CLI에 맡긴다. Manager는 루트 `AGENTS.md`의 존재·내용·해시를 별도 수집·대조하거나 과거 파일 승인을 Review 재사용 조건으로 사용하지 않는다. 작업의 실제 PR diff 또는 확인된 일반 verify 입력에 포함되는 파일 변경에는 기존 검증·Review 조건을 적용한다.
 - 위 조건이 없고 이전 승인이 유효하면 Review를 재사용한다. 검증 입력은 같지만 명세가 바뀌면 verify만 재사용하고 Reviewer를 실행한다. 목록이 없으면 verify와 Reviewer를 모두 실행한다.
 - 충돌 해결로 실제 입력이나 diff가 바뀌면 재검토하며 충돌 발생 사실만으로 실행을 확정하지 않는다. verify 지문 동일성만으로 Review를 재사용하지 않는다.
 
@@ -139,6 +140,7 @@ Manager는 실제 전체 verify 성공 결과와 입력 지문을 SQLite에 저�
 - 성공 기록·목록 부재·오류·계산 불확실성과 목록 밖 코드·설정 누락 의심에서는 verify를 생략하지 않는다. 누락 의심을 verify 성공만으로 해소하지 않는다.
 - Reviewer는 verify 재사용 불가, ExecPlan·sources·PR diff·Review 기준 변경과 승인 근거 부재·불완전에서 실행된다. 입력 목록이 없으면 verify·Reviewer를 모두 실행한다.
 - 모든 검토 입력이 같은 승인 후보는 Review를 재사용한다. 공통 또는 역할 지침만의 변경도 비교에 반영하며 검증과 무관한 명세 변경에는 verify를 재사용하되 재검토한다. 새 verify 성공으로 오래된 Review 승인을 승격하지 않는다.
+- CLI 지침의 유무·내용·과거 파일 승인만을 위한 별도 읽기·지문·승인 gate가 없다. 실제 PR diff·verify 입력과 고정된 공통·역할별 원본 묶음·실제 Reviewer instruction의 변경 판정은 유지한다.
 - 실행·판정 중 입력 변경, 저장 중단·재시작과 게시 직전 원격 경쟁에서 오래된 근거로 게시하지 않는다. 원래 성공·현재 후보 연결과 생략 이유를 확인할 수 있고 작업물·session·실패 감사를 보존한다.
 - 실패·timeout·미완료·출처 불명과 다른 작업 주기의 결과는 재사용하지 않는다. 최신 ref·lease·ownership·dependency·승인·게시 gate, 최종 문서 확인과 Merge 뒤 Requirement 충족 판단을 유지한다.
 - 실제 모델을 호출하지 않는 검증으로 호출 감소와 필요한 교정·verify·Review 수행을 확인한다. 재사용은 실제 실행·사용량과 구분하며 허위 성공·invocation·절감량을 기록하지 않는다.
