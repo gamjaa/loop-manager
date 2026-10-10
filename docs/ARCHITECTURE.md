@@ -93,7 +93,7 @@ Specification Skill과 함께 배포하는 `.agents/skills/specification-docs/sc
 
 source 해석은 catalog 검증·문서 읽기·입력 지문·계획 관련성·단계별 문서 변경·Requirement 판단 및 이동에서 같은 resolver를 사용한다. 지문은 기존 source 문자열을 key로 두고 resolver가 찾은 현재 문서 내용을 포함한다. 따라서 경로 변경만으로 기존 작업 관계가 사라지지 않으며, 내용 변경은 일반 입력 변경·재사용 조건에 반영된다.
 
-Requirement 교정 계산은 한 원격 tree의 활성·archive 문서, 게시·보관·draft ExecPlan과 저장된 작업 관계의 source 관측, 기본 branch 반영 순서를 입력으로 받는다. 기존 identity helper와 source resolver로 선택·편집 결과와 미확인 사유를 산출하며 Git·DB·Agent 효과는 수행하지 않는다. source 관측 실패는 참조 부재로 바꾸지 않고, 선택된 각 rename 뒤에도 원래 source가 같은 문서로 유일하게 해석되는지 확인한다. 편집은 활성 Requirement의 식별 표현과 확정 상대 링크만 대상으로 하고 archive·`sources`·`User Decision`을 보존한다. 파일 적용·원격 재검사·게시와 중단 복구는 별도 Manager 경계가 소유한다.
+Requirement 교정 계산은 한 원격 tree의 활성·archive 문서, 게시·보관·draft ExecPlan과 저장된 작업 관계의 source 관측, 기본 branch 반영 순서를 입력으로 받는다. 기존 identity helper와 source resolver로 선택·편집 결과와 미확인 사유를 산출하며 Git·DB·Agent 효과는 수행하지 않는다. source 관측 실패는 참조 부재로 바꾸지 않고, 선택된 각 rename 뒤에도 원래 source가 같은 문서로 유일하게 해석되는지 확인한다. 편집은 활성 Requirement의 식별 표현과 확정 상대 링크만 대상으로 하고 archive·`sources`·`User Decision`을 보존한다. 코드 예제는 링크 편집에서 제외하며, 중첩 blockquote의 접두어와 깊이를 확인해 fenced·들여쓴 코드의 원문도 보존한다. 파일 적용·원격 재검사·게시와 중단 복구는 별도 Manager 경계가 소유한다.
 
 Requirement 최종 판단은 source로 연결된 비종료 계획·draft와 수동 제출이 없는 시점에 일반 Planner가 담당한다. 관련 계획이 있으면 모두 실제 MERGED여야 하며 연결 계획 없는 직접 구현도 코드·검증·관련 제품·설계 문서로 판단한다. Manager는 유효한 기준별 충족 판단과 입력 지문·source 관계를 확인한 원문만 내용 보존 이동으로 게시한다. 미충족이면 후속 ExecPlan을 연결하며, 원격 확인 전 입력 변경에 따른 이동 철회와 원격 확인 후 archive를 구분한다.
 

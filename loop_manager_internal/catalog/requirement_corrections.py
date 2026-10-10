@@ -24,6 +24,7 @@ _LINK_DEFINITION = re.compile(
 )
 _FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})")
 _INDENTED_CODE = re.compile(r"^(?: {4}| {0,3}\t)")
+_BLOCKQUOTE = re.compile(r"^ {0,3}>[ \t]?")
 _USER_DECISION = re.compile(r"^(#{1,6})[ \t]+User Decision(?:[ \t]+#+)?[ \t]*$")
 _ANY_HEADING = re.compile(r"^(#{1,6})(?:[ \t]+|$)")
 _IGNORED_SOURCES = frozenset({"docs/PRODUCT.md", "manager:verify-inputs"})
@@ -260,33 +261,43 @@ def _rewrite_markdown_links(
     output: list[str] = []
     in_frontmatter = lines[0].removeprefix("\ufeff").rstrip("\r\n") == "---"
     frontmatter_open = in_frontmatter
-    fence: tuple[str, int] | None = None
+    fence: tuple[str, int, int] | None = None
     inline_code_delimiter: int | None = None
     decision_level: int | None = None
 
     for index, line in enumerate(lines):
         content = line.rstrip("\r\n")
+        block_content = content
+        quote_depth = 0
+        while quote_match := _BLOCKQUOTE.match(block_content):
+            block_content = block_content[quote_match.end():]
+            quote_depth += 1
         if frontmatter_open:
             output.append(line)
             if index and content == "---":
                 frontmatter_open = False
             continue
         if fence is not None:
-            marker, size = fence
-            if re.fullmatch(rf" {{0,3}}{re.escape(marker)}{{{size},}}[ \t]*", content):
+            marker, size, fence_depth = fence
+            if quote_depth < fence_depth:
                 fence = None
-            output.append(line)
-            continue
+            else:
+                if quote_depth == fence_depth and re.fullmatch(
+                    rf" {{0,3}}{re.escape(marker)}{{{size},}}[ \t]*", block_content,
+                ):
+                    fence = None
+                output.append(line)
+                continue
 
         if inline_code_delimiter is not None:
             code_spans, inline_code_delimiter = _inline_code_spans(
                 content, inline_code_delimiter,
             )
         else:
-            fence_match = _FENCE.match(content)
+            fence_match = _FENCE.match(block_content)
             if fence_match is not None:
                 marker = fence_match.group(1)
-                fence = (marker[0], len(marker))
+                fence = (marker[0], len(marker), quote_depth)
                 output.append(line)
                 continue
 
@@ -302,7 +313,7 @@ def _rewrite_markdown_links(
             if decision_level is not None:
                 output.append(line)
                 continue
-            if _INDENTED_CODE.match(content) is not None:
+            if _INDENTED_CODE.match(block_content) is not None:
                 output.append(line)
                 continue
 

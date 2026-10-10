@@ -123,6 +123,40 @@ class RequirementCorrectionSelectionTest(unittest.TestCase):
 
 
 class RequirementCorrectionEditingTest(unittest.TestCase):
+    def test_blockquote_code_is_preserved_while_surrounding_links_are_renamed(self):
+        old = "docs/requirements/[R-001] Old.md"
+        owner = "docs/requirements/[R-002] Owner.md"
+        link = "[demo](%5BR-001%5D%20Old.md)"
+        renamed = "[demo](%5BR-001%5D%20New.md)"
+        examples = (
+            f"> ~~~text\n> {link}\n> ~~~\n",
+            f"> ```text\n> {link}\n> ```\n",
+            f"  > > ~~~~text\n  > > ~~~\n  > > {link}\n  > > ~~~~\n",
+            f">\n>     {link}\n>\n",
+            f">\n> \t{link}\n>\n",
+            # Leaving a quote also ends its unclosed fenced block.
+            f"> ~~~text\n> {link}\n",
+            f"> > ~~~text\n> > {link}\n",
+        )
+        for example in examples:
+            with self.subTest(example=example):
+                before = requirement("R-002", "Owner") + link + "\n\n" + example
+                # A link outside the code must still change, including at a
+                # shallower quote depth after an unclosed nested fence.
+                after_link = "> " + link + "\n" if example.startswith("> >") else link + "\n"
+                documents = {
+                    old: requirement("R-001", "New"),
+                    owner: before + after_link,
+                }
+                result = requirement_corrections.plan_requirement_corrections(
+                    documents, references_complete=True,
+                )
+                expected = (
+                    requirement("R-002", "Owner") + renamed + "\n\n" + example
+                    + after_link.replace(link, renamed)
+                )
+                self.assertEqual(dict(result.updated_documents)[owner], expected.encode())
+
     def test_frontmatter_identity_heading_filename_and_confirmed_links_sync_together(self):
         old = "docs/requirements/[R-001] Old.md"
         owner = "docs/requirements/[R-002] Owner.md"
