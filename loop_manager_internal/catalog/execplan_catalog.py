@@ -256,6 +256,7 @@ def _source_lookup(
     if requirement_documents is not None:
         return requirement_sources.resolve_requirement_source(
             source, requirement_documents, allow_archive=allow_archive_fallback,
+            allow_id_fallback=allow_archive_fallback,
         )
     if available_regular_paths is not None:
         if source in available_regular_paths:

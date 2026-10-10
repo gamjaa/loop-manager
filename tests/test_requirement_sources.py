@@ -165,6 +165,22 @@ class ExecPlanRequirementSourceCatalogTest(unittest.TestCase):
             )
         self.assertEqual(caught.exception.code, "missing-source")
 
+    def test_new_plan_requires_the_exact_active_source_path(self):
+        source = "docs/requirements/[R-001] Original.md"
+        renamed = "docs/requirements/[R-001] Renamed.md"
+        with self.assertRaises(execplan_catalog.ExecPlanCatalogError) as caught:
+            self.snapshot(
+                source, {renamed: requirement("R-001", "Renamed")},
+                allow_archive_fallback=False,
+            )
+        self.assertEqual(caught.exception.code, "missing-source")
+
+        exact = self.snapshot(
+            source, {source: requirement("R-001", "Original")},
+            allow_archive_fallback=False,
+        )
+        self.assertIn("G-231", exact.active)
+
 
 class RequirementSourceFingerprintTest(unittest.TestCase):
     def test_draft_input_digest_tracks_renamed_requirement_contents(self):

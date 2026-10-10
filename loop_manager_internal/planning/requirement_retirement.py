@@ -11,6 +11,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 from loop_manager_internal.catalog import requirement_sources
+from loop_manager_internal.git.command_adapter import revision_requirement_documents
 from loop_manager_internal.storage.manual_work_state import live_requirement_paths
 import os
 from pathlib import Path, PurePosixPath
@@ -236,9 +237,74 @@ class RequirementRetirementPort:
                 )
             except (RuntimeError, OSError) as error:
                 raise RetirementError(f"Requirement source를 읽을 수 없습니다: {candidate}") from error
-        manual_sources = _resolved_sources(
-            json.dumps(sorted(manual_source_paths)), "manual work", documents,
-        )
+        manual_sources = {
+            source for source in manual_source_paths
+            if source in documents and SOURCE.fullmatch(source)
+        }
+        manual_requirement_ids = set()
+        if self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='manual_work_groups'"
+        ).fetchone():
+            manual_groups = self.connection.execute(
+                "SELECT source_head, requirements, documents FROM manual_work_groups "
+                "WHERE repo=? AND state NOT IN ('MERGED','PREPARATION_CONFLICT')",
+                (repo,),
+            ).fetchall()
+            source_documents_by_revision = {revision: documents}
+            for group in manual_groups:
+                try:
+                    sources = set(json.loads(group["requirements"]))
+                    for item in json.loads(group["documents"]):
+                        sources.update(item["plan"]["sources"])
+                except (KeyError, TypeError, ValueError) as error:
+                    raise RetirementError("수동 작업 Requirement source가 유효하지 않습니다.") from error
+                sources = {source for source in sources
+                           if isinstance(source, str) and SOURCE.fullmatch(source)}
+                source_revision = str(group["source_head"])
+                if source_revision not in source_documents_by_revision:
+                    try:
+                        source_documents_by_revision[source_revision] = revision_requirement_documents(
+                            lambda repo_path, command, *args: self.git.run_bytes(
+                                repo_path, command, *args,
+                            ),
+                            repository, source_revision,
+                        )
+                    except (RuntimeError, OSError) as error:
+                        raise RetirementError(
+                            f"수동 제출 Requirement revision을 읽을 수 없습니다: {source_revision}"
+                        ) from error
+                source_documents = source_documents_by_revision[source_revision]
+                for source in sources:
+                    source_id = requirement_sources.source_requirement_id(source)
+                    if source_id is not None:
+                        manual_requirement_ids.add(source_id)
+                    try:
+                        resolved = requirement_sources.resolve_requirement_source(
+                            source, source_documents, allow_archive=True,
+                        )
+                    except requirement_sources.RequirementSourceLookupError as error:
+                        raise RetirementError(str(error)) from error
+                    if (resolved.status is requirement_sources.ResolutionStatus.RESOLVED
+                            and resolved.contents is not None):
+                        try:
+                            requirement_id, _title = requirement_sources.requirement_identity(
+                                resolved.contents,
+                            )
+                        except requirement_sources.RequirementIdError as error:
+                            raise RetirementError(str(error)) from error
+                        manual_requirement_ids.add(requirement_id)
+            if manual_requirement_ids:
+                for path, contents in documents.items():
+                    if not SOURCE.fullmatch(path) or path in manual_sources:
+                        continue
+                    try:
+                        requirement_id, _title = requirement_sources.requirement_identity(
+                            contents.decode("utf-8"),
+                        )
+                    except (UnicodeError, requirement_sources.RequirementIdError):
+                        continue
+                    if requirement_id in manual_requirement_ids:
+                        manual_sources.add(path)
         resolved_rows = {
             str(row["plan_id"]): _resolved_sources(
                 row["sources"], str(row["plan_id"]), documents,

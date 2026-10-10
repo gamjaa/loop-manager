@@ -71,6 +71,7 @@ def resolve_requirement_source(
     documents: Mapping[str, str | bytes],
     *,
     allow_archive: bool = True,
+    allow_id_fallback: bool = True,
 ) -> RequirementSourceResolution:
     """Resolve an unchanged source string against one observed document set."""
     if _ACTIVE.fullmatch(source) is None:
@@ -89,6 +90,9 @@ def resolve_requirement_source(
             ResolutionStatus.RESOLVED, source, archive_path,
             _text(archive_path, documents[archive_path]),
         )
+
+    if not allow_id_fallback:
+        return RequirementSourceResolution(ResolutionStatus.MISSING, source)
 
     requirement_id = source_requirement_id(source)
     if requirement_id is None:

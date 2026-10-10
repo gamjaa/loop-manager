@@ -204,6 +204,28 @@ class RequirementRetirementTest(unittest.TestCase):
         )
         self.assertEqual(self.port.pending("repo", self.root, "base"), ())
 
+    def test_submit_requirement_is_resolved_at_source_revision_without_blocking_base_planning(self):
+        from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+
+        independent = "docs/requirements/[R-002] Independent.md"
+        submitted = "docs/requirements/[R-001] Submitted.md"
+        self.git.revisions["base"] = {
+            independent: b"# [R-002] Independent\n\n## Acceptance Criteria\n\n- Works\n",
+            "docs/PRODUCT.md": b"# Product\n",
+            "docs/ARCHITECTURE.md": b"# Architecture\n",
+            "feature.py": b"implemented = True\n",
+        }
+        self.git.revisions["submitted-head"] = {
+            submitted: b"# [R-001] Submitted\n\n## Acceptance Criteria\n\n- Submitted\n",
+        }
+        ManualWorkRepository(self.connection).create(
+            "repo", "submit", "user/feature", (submitted,), "submitted-head", "base",
+        )
+
+        (item,) = self.port.pending("repo", self.root, "base")
+        self.assertEqual(item.path, independent)
+        self.assertEqual(item.related_ids, ())
+
     def test_final_merge_defers_then_reuses_judgment_and_preserves_bytes(self):
         self.add_plan(status="PR_OPEN")
         self.assertEqual(self.port.pending("repo", self.root, "base"), ())
