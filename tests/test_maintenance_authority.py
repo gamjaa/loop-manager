@@ -1044,6 +1044,83 @@ class MaintenanceAuthorityTest(MaintenancePlanningCase):
                     [self.ready_path.relative_to(self.repo).as_posix()],
                 )
 
+    def test_revalidation_resolves_renamed_requirement_for_existing_plan(self):
+        old_source = "docs/requirements/[R-001] Original.md"
+        renamed_source = "docs/requirements/[R-001] Renamed.md"
+        old_requirement = self.repo / old_source
+        old_requirement.parent.mkdir(parents=True)
+        old_requirement.write_text(
+            "# [R-001] Original\n\nPreserve the existing requirement.\n",
+            encoding="utf-8",
+            newline="\n",
+        )
+        self.ready_path.write_text(
+            plan_text("G-001", "Ready Feature", depends_on=("G-000",)).replace(
+                "sources:\n  - docs/PRODUCT.md",
+                f"sources:\n  - {old_source}",
+            ),
+            encoding="utf-8",
+            newline="\n",
+        )
+        git(self.repo, "add", "docs/requirements", "docs/plans")
+        git(self.repo, "commit", "-m", "Record requirement-backed ready plan")
+        original_sha = git(self.repo, "rev-parse", "HEAD")
+        original_hash = loop_manager.file_hash(self.ready_path)
+        self.connection.execute(
+            "UPDATE exec_plans SET sources = ?, content_hash = ?, plan_sha = ?, "
+            "current_revision_sha = ?, publication_content_hash = ?, publication_sha = ? "
+            "WHERE repo = ? AND plan_id = 'G-001'",
+            (
+                json.dumps([old_source], separators=(",", ":")),
+                original_hash,
+                original_sha,
+                original_sha,
+                original_hash,
+                original_sha,
+                str(self.repo),
+            ),
+        )
+        self.connection.commit()
+
+        cycle, _created = self._begin_legacy_assessment(original_sha)
+        repository = maintenance_state.MaintenanceRepository(self.connection)
+        cycle = repository.transition(
+            str(self.repo),
+            expected_phase=cycle.phase,
+            expected_revision=cycle.revision,
+            next_phase=maintenance_state.MaintenancePhase.REFACTORING,
+            refactoring_plan_ids=("G-000",),
+            revalidation_plan_ids=("G-001",),
+        )
+        repository.transition(
+            str(self.repo),
+            expected_phase=cycle.phase,
+            expected_revision=cycle.revision,
+            next_phase=maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
+        )
+
+        git(self.repo, "mv", old_source, renamed_source)
+        git(self.repo, "commit", "-m", "Rename requirement title")
+        latest = git(self.repo, "rev-parse", "HEAD")
+        context = loop_manager.prepare_maintenance_planning_context(
+            self.connection, str(self.repo), self.repo, latest
+        )
+
+        revised_text = context.eligible_by_id["G-001"].text.replace(
+            "Separate the responsibility into a testable module boundary.",
+            "Refine the implementation around the stable requirement identity.",
+        )
+        self.ready_path.write_text(revised_text, encoding="utf-8", newline="\n")
+        result = loop_manager.validate_maintenance_planner_result(
+            self.connection,
+            context,
+            self.repo,
+            loop_manager.changed_files(self.repo),
+        )
+
+        self.assertEqual(len(result.revisions), 1)
+        self.assertEqual(result.revisions[0].plan["sources"], [old_source])
+
     def test_git_operational_failures_do_not_become_planner_errors(self):
         context = self._begin_barrier()
         self._write_barrier_batch()
