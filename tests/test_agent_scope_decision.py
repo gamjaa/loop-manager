@@ -27,6 +27,84 @@ def decide(before, current, *, role="worker", phase="IMPLEMENTING", result=None,
 
 
 class PersistedScopeDecisionTests(unittest.TestCase):
+    def test_invocation_scope_digest_tracks_selected_inputs_and_ignores_unrelated_checkout_state(self):
+        ref, head = 'refs/remotes/origin/main', 'refs/remotes/origin/HEAD'
+        own = 'refs/heads/loop-manager/G-051'
+        before = snapshot(
+            refs={ref: ('a', ''), head: ('a', ref), own: ('a', ''),
+                  'refs/heads/main': ('local', ''), 'refs/heads/unrelated': ('other', '')},
+            worktrees={WORKTREE: ('HEAD=a', 'branch=' + own),
+                       REPO: ('HEAD=local', 'state=clean'),
+                       '/outside': ('HEAD=outside',)},
+            config={'local:core.hooksPath': ('secure',),
+                    'local:branch.unrelated.remote': ('old',)},
+        )
+        digest = decision.invocation_scope_digest(
+            before, role='worker', phase='IMPLEMENTING', base_branch='main',
+            branch='loop-manager/G-051', worktree_key=WORKTREE, default_worktree=REPO,
+        )
+        self.assertNotEqual(decision.invocation_scope_digest(
+            before, role='worker', phase='IMPLEMENTING', base_branch='main',
+            branch='loop-manager/other', worktree_key=WORKTREE, default_worktree=REPO,
+        ), digest)
+        unrelated = replace(before,
+            refs={**before.refs, 'refs/heads/main': ('new-local', ''),
+                  'refs/heads/unrelated': ('new-other', '')},
+            worktrees={**before.worktrees, REPO: ('HEAD=changed', 'state=dirty'),
+                       '/outside': ('HEAD=other',)},
+            config={'local:core.hooksPath': ('secure',),
+                    'local:branch.unrelated.remote': ('new',)},
+        )
+        self.assertEqual(decision.invocation_scope_digest(
+            unrelated, role='worker', phase='IMPLEMENTING', base_branch='main',
+            branch='loop-manager/G-051', worktree_key=WORKTREE, default_worktree=REPO,
+        ), digest)
+        for changed in (
+            replace(before, refs={**before.refs, ref: ('b', '')}),
+            replace(before, dirty={'src/app.py': (('unstaged',), 'changed')}),
+            replace(before, config={'local:core.hooksPath': ('unsafe',)}),
+        ):
+            with self.subTest(changed=changed):
+                self.assertNotEqual(decision.invocation_scope_digest(
+                    changed, role='worker', phase='IMPLEMENTING', base_branch='main',
+                    branch='loop-manager/G-051', worktree_key=WORKTREE, default_worktree=REPO,
+                ), digest)
+
+    def test_blocked_handoff_accepts_current_local_input_without_rewriting_history(self):
+        branch = 'loop-manager/G-051'
+        ref = f'refs/heads/{branch}'
+        before = snapshot(
+            head='old', branch=branch, refs={ref: ('old', '')},
+            worktrees={WORKTREE: ('HEAD=old', f'branch={ref}', 'locked=owner')},
+        )
+        result = replace(before, dirty={'src/agent.py': (('unstaged',), 'agent result')})
+        current = replace(
+            result, head='user-commit',
+            index={'src/user.py': ('H 100644 new-blob 0',)},
+            dirty={'src/user.py': (('staged',), 'user input')},
+            refs={ref: ('user-commit', '')},
+            worktrees={WORKTREE: ('HEAD=user-commit', f'branch={ref}', 'locked=owner')},
+        )
+        original = before.serialize()
+        accepted = decision.blocked_agent_local_baseline(
+            before, result, current, WORKTREE, accept_current_input=True,
+        )
+        self.assertEqual((accepted.head, accepted.index, accepted.dirty),
+                         (current.head, current.index, current.dirty))
+        self.assertEqual(accepted.refs[ref], current.refs[ref])
+        self.assertEqual(accepted.worktrees[WORKTREE], current.worktrees[WORKTREE])
+        self.assertEqual(before.serialize(), original)
+        for invalid in (
+            replace(current, branch='other'),
+            replace(current, refs={ref: ('wrong', '')}),
+            replace(current, operations={'rebase-merge': 'operation'}),
+            replace(current, index={'src/user.py': ('S 100644 new-blob 0',)}),
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(decision.ScopeDecisionError):
+                decision.blocked_agent_local_baseline(
+                    before, result, invalid, WORKTREE, accept_current_input=True,
+                )
+
     def test_selected_runtime_and_proven_current_base_are_distinct_operands(self):
         ref, head, runtime = 'refs/remotes/origin/develop', 'refs/remotes/origin/HEAD', '/state/runtime/b'
         before = snapshot(refs={ref: ('a', ''), head: ('a', ref)})

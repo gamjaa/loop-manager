@@ -417,6 +417,7 @@ class WorkerHandler:
                 str(row['plan_path']),
                 catalog_plan,
                 worker_scope_before,
+                scope_phase='IMPLEMENTING',
                 allow_rebase=context.resolving_rebase,
                 **({'rebase_definition': DefinitionSnapshot.deserialize(
                     row['definition_snapshot']

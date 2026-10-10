@@ -153,6 +153,7 @@ class VerifyHandler:
                 context.plan.path,
                 self.ports.snapshot().catalog_plan,
                 verify_scope_before,
+                scope_phase='VERIFYING',
             ))
         except (self.ports.contract.AgentScopeError, self.ports.contract.WorkspaceOwnershipError) as error:
             if feedback_repo is not None:

@@ -125,12 +125,14 @@ def _blocked_agent_local_baseline(
     worktree: Path,
     *,
     allowed_dirty_paths: frozenset[str] = frozenset(),
+    accept_current_input: bool = False,
 ) -> GitSnapshot:
     """Compatibility surface for the pure BLOCKED snapshot decision."""
     try:
         return agent_scope_decision.blocked_agent_local_baseline(
             before, result, current, str(_canonical_path(worktree)),
             allowed_dirty_paths=allowed_dirty_paths,
+            accept_current_input=accept_current_input,
         )
     except agent_scope_decision.ScopeDecisionError as error:
         raise AgentScopeError(str(error)) from error
@@ -536,7 +538,8 @@ def _validate_persisted_agent_scope(
             runtime_selection = replace(runtime_selection, refs={**runtime_selection.refs,
                 'refs/remotes/origin/HEAD': (runtime_mutation.commit_sha, ref)})
         verified = reconcile_external_base(effects.git, repo_path, project['base_branch'],
-                                           runtime_selection, current, resources)
+                                           runtime_selection, current, resources,
+                                           registered_origin=str(project['origin'] or ''))
         if verified is not runtime_selection:
             runtime_base_oid = verified.refs[ref][0]
         runtime_recreation_proven = runtime_scope.proven_runtime_recreation(
@@ -947,9 +950,9 @@ def validate_blocked_agent_scope(
             ) from error
 
         blocked_result = reconcile_metadata(comparison_view(blocked_result))
-        # A finished, isolated invocation gives us a separate Agent result.
-        # Validate that result first, then classify later selected-worktree
-        # edits as user input. Legacy/in-flight scopes retain strict comparison.
+        # Validate saved Agent output before treating later selected-worktree
+        # edits as user input. Missing legacy isolation never weakens its
+        # shared-resource comparison.
         resources = effects._agent_git_resources(
             connection, repo_path, worktree, before, role_name,
             selected_plan_path=selected_plan_path)
@@ -996,8 +999,7 @@ def validate_blocked_agent_scope(
                     return
                 if relation not in {0, 1}:
                     raise AgentScopeError('사용자 입력의 commit 관계를 확인할 수 없습니다.')
-        if (require_safe_result or (guidance_plan is not None
-                    and guidance_plan['blocked_reason'] == GUIDANCE_BLOCK_REASON)):
+        if result_serialized:
             original = GitSnapshot.deserialize(str(serialized))
             comparison = agent_scope_decision.manager_comparison_baseline(
                 original, original, checkpoint.snapshot or {}, role_name)
@@ -1008,16 +1010,14 @@ def validate_blocked_agent_scope(
                 allowed_requirement_archives=archive_sources,
                 external_worktree=repo_path, base_branch=base, connection=connection)
 
-            # A validated historical Agent result still protects actual Agent
-            # writes. Later unrelated branches/default-checkout changes are
-            # outside this selected Manager recovery even for legacy ledgers.
+            # Validate historical Agent output before accepting current state
+            # as post-BLOCKED user input. Isolation evidence is not invented
+            # when a legacy invocation lacks its ledger.
             owner = saved_plan if saved_plan is not None else guidance_plan
             if (role_name in {'worker', 'reviewer'} and owner is not None
                     and 'workspace_owned' in owner.keys() and int(owner['workspace_owned']) == 1
                     and owner['branch'] == current.branch and owner['worktree'] == str(worktree)):
-                post_agent_resources = agent_scope_decision.used_git_resources(
-                    role=role_name, phase='PLAN_BLOCKED', base_branch=base,
-                    branch=current.branch, worktree_key=str(worktree.resolve()))
+                post_agent_resources = resources
 
         if (
             before.shared_metadata_complete
@@ -1029,7 +1029,9 @@ def validate_blocked_agent_scope(
                 blocked_result,
                 current,
                 worktree,
-                allowed_dirty_paths=frozenset((selected_plan_path,)))
+                allowed_dirty_paths=frozenset((selected_plan_path,)),
+                accept_current_input=True,
+            )
             (
                 scope_before,
                 commit_ref_changes,
@@ -1042,6 +1044,12 @@ def validate_blocked_agent_scope(
                 scope_before)
             allowed_ref_changes |= commit_ref_changes
             allowed_worktree_changes |= commit_worktree_changes
+        elif (before.shared_metadata_complete and current.shared_metadata_complete):
+            scope_before = _blocked_agent_local_baseline(
+                before, before, current, worktree,
+                allowed_dirty_paths=frozenset((selected_plan_path,)),
+                accept_current_input=True,
+            )
 
     effects.validate_agent_scope(
         role_name,

@@ -453,6 +453,10 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         with mock.patch.object(self.handler, '_finish_worker',
                                return_value=SimpleNamespace(kind='done')):
             self.handler.run(self.context())
+        self.assertEqual(
+            self.effects.agent.validate_worker_workspace_scope.call_args.kwargs['scope_phase'],
+            'IMPLEMENTING',
+        )
         session, stored, intent, profile, invocation = observed[0]
         self.assertIsNone(session)
         self.assertIsNone(stored)

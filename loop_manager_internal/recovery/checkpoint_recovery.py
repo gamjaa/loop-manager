@@ -16,6 +16,7 @@ from loop_manager_internal.execution.result_validation import reviewer_targeted_
 from loop_manager_internal.execution.validation_feedback import normalize_feedback
 from loop_manager_internal.execution.verify_process import VerifyTerminationUncertain
 from loop_manager_internal.git import managed_rebase_adoption, managed_rebase_validation
+from loop_manager_internal.git.base_fetch_service import reconcile_external_base
 from loop_manager_internal.git.managed_rebase_validation import _safe_path
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.recovery import blocked_checkpoint
@@ -490,12 +491,24 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
             scope_snapshot = replace(scope_snapshot, refs={
                 **scope_snapshot.refs, remote_ref: (observed, '')})
         with runtime_state._transaction(connection):
+            project = connection.execute(
+                'SELECT base_branch, origin FROM projects WHERE repo = ?', (repo,),
+            ).fetchone()
+            base_branch = project['base_branch']
             resources = used_git_resources(
                 role='worker', phase='PLAN_BLOCKED',
-                base_branch=connection.execute('SELECT base_branch FROM projects WHERE repo = ?', (repo,)).fetchone()[0],
+                base_branch=base_branch,
                 branch=branch, worktree_key=str(_canonical_path(worktree)))
             current_snapshot = effects.capture_git_snapshot(worktree)
-            before_commit, at_commit = scoped_metadata(adopted_snapshot, current_snapshot, resources)
+            reconciled_adopted = reconcile_external_base(
+                effects.git, repo_path, str(base_branch), adopted_snapshot,
+                current_snapshot, resources, registered_origin=str(project['origin'] or ''),
+            )
+            before_commit, at_commit = scoped_metadata(
+                reconciled_adopted, current_snapshot, resources,
+                default_worktree=str(_canonical_path(repo_path)),
+                base_branch=str(base_branch),
+            )
             if (before_commit != at_commit
                     or adapter.observe_remote(request) != observed):
                 return retry('원격 채택 확정 전 선택 후보·사용 자원 또는 원격 lease가 변경됐습니다.')

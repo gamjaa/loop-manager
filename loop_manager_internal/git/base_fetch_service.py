@@ -19,16 +19,17 @@ import secrets
 import sqlite3
 
 
-def reconcile_external_base(git, repo, base, before, current, resources):
-    """Compare a live remote fast-forward only with invocation-bound isolation.
+def reconcile_external_base(git, repo, base, before, current, resources, *, registered_origin=None):
+    """Reobserve a selected base ref only when its remote transition is proven.
 
     This does not fabricate Manager receipts or alter saved Agent evidence.
-    Missing/rewritten refs and symbolic target changes retain strict comparison.
+    The selected branch and live remote establish a fetch-shaped observation;
+    unrelated refs and missing/rewritten refs retain strict comparison.
     """
     ref, head = f'refs/remotes/origin/{base}', 'refs/remotes/origin/HEAD'
     old, new = before.refs.get(ref), current.refs.get(ref)
-    if (resources is None or ref not in resources.refs or old is None or new is None
-            or old[1] or new[1]):
+    if ((resources is not None and ref not in resources.refs)
+            or not base or old is None or new is None or old[1] or new[1]):
         return before
     previous_head, observed_head = before.refs.get(head), current.refs.get(head)
     if previous_head != observed_head:
@@ -36,7 +37,15 @@ def reconcile_external_base(git, repo, base, before, current, resources):
             return before
     if old == new and previous_head == observed_head:
         return before
+    if not registered_origin:
+        return before
     try:
+        from loop_manager_internal.git.git_adapter import github_repository
+        configured = git(repo, 'remote', 'get-url', '--all', 'origin', check=False)
+        origin_urls = [line.strip() for line in configured.stdout.splitlines() if line.strip()]
+        if (configured.returncode or len(origin_urls) != 1
+                or github_repository(origin_urls[0]) != registered_origin):
+            return before
         remote_ref = f'refs/heads/{base}'
         remote = git(repo, 'ls-remote', '--heads', 'origin', remote_ref, check=False)
         if remote.returncode or remote.stdout.split() != [new[0], remote_ref]:
@@ -51,6 +60,14 @@ def reconcile_external_base(git, repo, base, before, current, resources):
         live = git(repo, 'rev-parse', '--verify', ref, check=False)
         if live.returncode or live.stdout.strip() != new[0]:
             return before
+        remote_after = git(repo, 'ls-remote', '--heads', 'origin', remote_ref, check=False)
+        if remote_after.returncode or remote_after.stdout.split() != [new[0], remote_ref]:
+            return before
+        if previous_head is None and observed_head is not None:
+            symbolic_after = git(repo, 'ls-remote', '--symref', 'origin', 'HEAD', check=False)
+            if (symbolic_after.returncode
+                    or symbolic_after.stdout.split() != ['ref:', remote_ref, 'HEAD', new[0], 'HEAD']):
+                return before
     except (RuntimeError, OSError):
         return before
     refs = {**before.refs, ref: new}
@@ -473,10 +490,18 @@ def _reconciled_manager_scope_metadata(effects: ReconciledManagerScopeMetadataEf
             state_dir, Path(repo), Path(path), registration))
     before = agent_scope_decision.reconcile_manager_metadata(
         before, current, refs=frozenset(), worktrees=removed)
-    project = connection.execute('SELECT base_branch FROM projects WHERE repo = ?', (repo,)).fetchone()
+    project = connection.execute('SELECT base_branch, origin FROM projects WHERE repo = ?', (repo,)).fetchone()
+    base_branch = str(project['base_branch']) if project is not None else None
     if project is not None:
-        before = reconcile_external_base(effects.git, repo_path, project[0], before, current, resources)
-    scope_before, scope_current = agent_scope_decision.scoped_metadata(before, current, resources)
+        before = reconcile_external_base(
+            effects.git, repo_path, base_branch, before, current, resources,
+            registered_origin=str(project['origin'] or ''),
+        )
+    scope_before, scope_current = agent_scope_decision.scoped_metadata(
+        before, current, resources,
+        default_worktree=str(effects._canonical_path(repo_path)),
+        base_branch=base_branch,
+    )
     effects._ensure_cleanup_pending_schema(connection)
     proven_refs = effects._proven_manager_base_refs(
         connection, repo_path, repo, plan_id or '', scope_before, scope_current)

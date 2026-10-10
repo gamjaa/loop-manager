@@ -3,7 +3,9 @@
 import sqlite3
 import stat
 import tempfile
+from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import TestCase, mock
 
 from loop_manager_internal.agents import agent_invocation as invocation
@@ -52,6 +54,65 @@ class RunnerTests(TestCase):
         resolve.assert_not_called()
         row = self.connection.execute('SELECT model, effort FROM agent_invocations').fetchone()
         self.assertEqual(tuple(row), ('actual-model', 'high'))
+
+    def test_preflight_accepts_proven_external_base_fetch_for_selected_plan(self):
+        self.connection.execute(manager.SCHEMA)
+        manager._ensure_execplans_schema(self.connection)
+        self.connection.execute("INSERT INTO projects (repo, base_branch, origin) "
+                                "VALUES ('repo', 'main', 'owner/repo')")
+        self.connection.execute("""INSERT INTO exec_plans
+            (repo, plan_id, path, title, sources, depends_on, priority, content_hash, status, branch)
+            VALUES ('repo', 'G-041', 'docs/plans/[G-041] Plan.md', 'Plan', '[]', '[]',
+                    'normal', 'hash', 'IMPLEMENTING', 'loop-manager/G-041')""")
+        worktree = str(Path('/worktree').resolve())
+        source = str(Path('repo').resolve())
+        base_ref, head_ref = 'refs/remotes/origin/main', 'refs/remotes/origin/HEAD'
+        branch_ref = 'refs/heads/loop-manager/G-041'
+        before = manager.GitSnapshot(
+            'candidate', 'loop-manager/G-041', {}, {},
+            {base_ref: ('a', ''), head_ref: ('a', base_ref), branch_ref: ('candidate', '')},
+            {worktree: ('HEAD=candidate', f'branch={branch_ref}'),
+             source: ('HEAD=source-old', 'state=clean'), '/unrelated': ('HEAD=unrelated-old',)},
+            {}, {},
+        )
+        current = replace(
+            before,
+            refs={**before.refs, base_ref: ('b', ''), head_ref: ('b', base_ref)},
+            worktrees={**before.worktrees, source: ('HEAD=source-new', 'state=dirty'),
+                       '/unrelated': ('HEAD=unrelated-new',)},
+        )
+        digests = []
+
+        class Provider:
+            def run(self, request):
+                digests.extend((request.isolation_snapshot_digest(),
+                                request.isolation_snapshot_digest()))
+                return manager.AgentResult(0, 'done')
+
+        def git(_repo, *args, **_kwargs):
+            if args[0] == 'remote':
+                return SimpleNamespace(returncode=0, stdout='https://github.com/owner/repo.git\n')
+            if args[0] == 'ls-remote':
+                return SimpleNamespace(returncode=0, stdout='b\trefs/heads/main\n')
+            if args[0] == 'merge-base':
+                return SimpleNamespace(returncode=0, stdout='')
+            if args[0] == 'rev-parse':
+                return SimpleNamespace(returncode=0, stdout='b\n')
+            raise AssertionError(args)
+
+        with mock.patch.object(manager, 'capture_git_snapshot', side_effect=(before, current)), \
+             mock.patch.object(manager, 'git', side_effect=git), \
+             mock.patch.object(manager, 'agent_provider', return_value=Provider()):
+            result = manager.run_agent(
+                'codex', Path('/worktree'), self.state_dir, Path('/config'),
+                'worker', 'prompt', read_only=False, level=5,
+                connection=self.connection,
+                invocation=invocation.InvocationContext('repo', 'G-041'),
+                resolved_profile=invocation.ResolvedProfile('model', 'high'),
+            )
+        self.assertEqual(result.code, 0)
+        self.assertEqual(len(digests), 2)
+        self.assertEqual(digests[0], digests[1])
 
     def test_each_fallback_process_has_own_resolved_profile_and_session(self):
         seen = []

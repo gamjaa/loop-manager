@@ -545,9 +545,19 @@ class CheckpointSafetyAdapter:
                 resources = agent_scope_decision.used_git_resources(
                     role='worker', phase='PLAN_BLOCKED', base_branch=base,
                     branch=request.branch, worktree_key=str(_canonical_path(Path(request.worktree))))
-            base = self.connection.execute('SELECT base_branch FROM projects WHERE repo = ?', (request.repo,)).fetchone()[0]
-            before = reconcile_external_base(self.safety_effects.git, self.repo_path, base, before, current, resources)
-            before, current = agent_scope_decision.scoped_metadata(before, current, resources)
+            project = self.connection.execute(
+                'SELECT base_branch, origin FROM projects WHERE repo = ?', (request.repo,)
+            ).fetchone()
+            base = project['base_branch']
+            before = reconcile_external_base(
+                self.safety_effects.git, self.repo_path, base, before, current, resources,
+                registered_origin=str(project['origin'] or ''),
+            )
+            before, current = agent_scope_decision.scoped_metadata(
+                before, current, resources,
+                default_worktree=str(_canonical_path(self.repo_path)),
+                base_branch=str(base),
+            )
         except (ValueError, TypeError, KeyError, RuntimeError) as error:
             return reject("workspace_ownership_uncertain", str(error))
         if before.config != current.config:

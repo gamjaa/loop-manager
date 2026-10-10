@@ -9,7 +9,7 @@ import tempfile
 from unittest import TestCase, mock
 
 import loop_manager as manager
-from loop_manager_internal.agents import scope_baseline, scope_lifecycle, scope_observation, scope_recovery, scope_validation
+from loop_manager_internal.agents import scope_adapter, scope_baseline, scope_lifecycle, scope_observation, scope_recovery, scope_validation
 from loop_manager_internal.agents.scope_contracts import AgentScopeError, GitSnapshot
 from loop_manager_internal.recovery import blocked_plan_reconciliation, blocked_remote_observation
 from loop_manager_internal.storage import agent_invocation_state, blocked_checkpoint_state, execution_checkpoint_state, runtime_state
@@ -195,6 +195,56 @@ class ScopeValidationTests(TestCase):
         for changes in changed_states:
             with self.subTest(changes=changes), self.assertRaises(AgentScopeError):
                 self.validate('worker', snapshot(), snapshot(**changes))
+
+    def test_legacy_comparison_excludes_default_checkout_and_local_base_but_keeps_foreign_ref(self):
+        before = snapshot(
+            refs={'refs/heads/main': ('local-old', ''),
+                  'refs/heads/unrelated': ('same', '')},
+            worktrees={'/managed': ('HEAD=a',), '/source': ('HEAD=source-old', 'state=clean')},
+        )
+        source_changed = replace(before,
+            refs={'refs/heads/main': ('local-new', ''),
+                  'refs/heads/unrelated': ('same', '')},
+            worktrees={'/managed': ('HEAD=a',), '/source': ('HEAD=source-new', 'state=dirty')},
+        )
+        self.validate('worker', before, source_changed,
+            external_worktree=Path('/source'), base_branch='main')
+        foreign_ref = replace(source_changed,
+            refs={**source_changed.refs, 'refs/heads/unrelated': ('foreign', '')},
+        )
+        with self.assertRaisesRegex(AgentScopeError, '공유 Git refs'):
+            self.validate('worker', before, foreign_ref,
+                external_worktree=Path('/source'), base_branch='main')
+
+    def test_verify_scope_uses_current_worktree_resources_without_agent_ledger(self):
+        branch = 'loop-manager/G-047'
+        own_ref = f'refs/heads/{branch}'
+        base_ref = 'refs/remotes/origin/main'
+        head_ref = 'refs/remotes/origin/HEAD'
+        before = snapshot(
+            refs={base_ref: ('base', ''), head_ref: ('base', base_ref),
+                  own_ref: ('head', ''), 'refs/heads/unrelated': ('old', '')},
+            worktrees={'/managed': (f'HEAD=head', f'branch={own_ref}'),
+                       '/source': ('HEAD=source', 'state=clean'),
+                       '/other': ('HEAD=other',)},
+        )
+        current = replace(before,
+            refs={**before.refs, 'refs/heads/unrelated': ('new', '')},
+            worktrees={**before.worktrees, '/source': ('HEAD=changed', 'state=dirty'),
+                       '/other': ('HEAD=changed',)},
+        )
+        effects = scope_adapter.ValidateWorkerWorkspaceScopeEffects(
+            capture_git_snapshot=lambda _worktree: current,
+            validate_active_execplan_metadata=mock.Mock(return_value={}),
+            validate_agent_scope=lambda *args, **kwargs: scope_validation.validate_agent_scope(
+                *args, effects=self.effects, **kwargs),
+            validate_managed_worktree=mock.Mock(),
+        )
+        self.assertEqual(scope_adapter.validate_worker_workspace_scope(
+            effects, Path('/source'), Path('/managed'), branch, 'main',
+            'docs/plans/[G-047] Work.md', mock.Mock(), before,
+            scope_phase='VERIFYING'), {})
+        effects.validate_managed_worktree.assert_called_once()
 
     def test_independent_changes_require_full_invocation_proof(self):
         connection = runtime_connection()

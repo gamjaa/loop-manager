@@ -10,6 +10,7 @@ from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.git import managed_rebase_adoption
 from loop_manager_internal.git import managed_rebase_validation
 from loop_manager_internal.git import rebase_block_reconciliation
+from loop_manager_internal.git.base_fetch_service import reconcile_external_base
 from loop_manager_internal.recovery import blocked_remote_observation
 from loop_manager_internal.recovery import checkpoint_ownership
 from loop_manager_internal.recovery import scope_reconciliation
@@ -263,11 +264,20 @@ def _reconcile_scope_baseline_plan_block(effects: ReconcileScopeBaselinePlanBloc
                 resources = effects._agent_git_resources(
                     connection, repo_path, worktree, start, str(plan['agent_role']),
                     selected_plan_path=str(plan['path']))
+                if resources is None:
+                    resources = agent_scope_decision.used_git_resources(
+                        role=str(plan['agent_role']), phase='PLAN_BLOCKED',
+                        base_branch=str(project['base_branch']), branch=str(plan['branch'] or '') or None,
+                        worktree_key=str(worktree.resolve()),
+                    )
                 result_view = effects._reconciled_manager_scope_metadata(
                     connection, repo_path, state_dir, repo, plan_id,
                     result_view, observed, resources)
                 result_scope, current_scope = agent_scope_decision.scoped_metadata(
-                    result_view, observed, resources)
+                    result_view, observed, resources,
+                    default_worktree=str(repo_path.resolve()),
+                    base_branch=str(project['base_branch']),
+                )
                 preserve_stage = result_scope == current_scope
                 clean_candidate = not result_scope.dirty and not current_scope.dirty
                 if preserve_stage and clean_candidate:
@@ -339,6 +349,7 @@ class ReconcileFalsePositiveRuntimeBlockEffects:
     """Named effects for reconcile_false_positive_runtime_block; no entry-point/module access."""
     _canonical_path: Callable[..., object]
     capture_git_snapshot: Callable[..., object]
+    git: Callable[..., object]
     operation_log: Callable[..., object]
     validate_persisted_agent_scope: Callable[..., object]
     _agent_git_resources: Callable[..., object] | None = None
@@ -389,11 +400,23 @@ def reconcile_false_positive_runtime_block(
                 plan_id = plan[0]
             result = effects._reconciled_manager_scope_metadata(
                 connection, repo_path, state_dir, repo, plan_id, result, current, resources)
-            _, result = agent_scope_decision.scoped_metadata(before, result, resources)
-            _, current_comparison = agent_scope_decision.scoped_metadata(before, current, resources)
-            expected, _ = agent_scope_decision.scoped_metadata(expected, current, resources)
-        else:
-            current_comparison = current
+        base_branch = str(project['base_branch'])
+        result = reconcile_external_base(
+            effects.git, repo_path, base_branch, result, current, resources,
+            registered_origin=str(project['origin'] or ''))
+        expected = reconcile_external_base(
+            effects.git, repo_path, base_branch, expected, current, resources,
+            registered_origin=str(project['origin'] or ''))
+        default_worktree = str(effects._canonical_path(repo_path))
+        _, result = agent_scope_decision.scoped_metadata(
+            before, result, resources,
+            default_worktree=default_worktree, base_branch=base_branch)
+        _, current_comparison = agent_scope_decision.scoped_metadata(
+            before, current, resources,
+            default_worktree=default_worktree, base_branch=base_branch)
+        expected, current_expected = agent_scope_decision.scoped_metadata(
+            expected, current, resources,
+            default_worktree=default_worktree, base_branch=base_branch)
         if result != current_comparison:
             effects.operation_log(
                 f"runtime 차단 재조정 거부: 결과 snapshot 불일치 "
@@ -401,7 +424,7 @@ def reconcile_false_positive_runtime_block(
                 error=True,
             )
             return False
-        if resources is None and expected != current:
+        if resources is None and expected != current_expected:
             deltas = []
             for label, older, newer in (
                 ("refs", expected.refs, current.refs),

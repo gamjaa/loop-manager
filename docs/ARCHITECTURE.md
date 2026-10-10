@@ -159,6 +159,10 @@ due 유지보수의 선택·진행 작업의 비선점 정책은 PRODUCT의 [작
 
 작업·동기화·복구가 관여하는 branch는 등록한 base와 소유권을 확인한 Loop Manager 생성 branch다. 그 밖의 사용자 branch는 생성·수정·삭제를 되돌리거나 자동 복구 대상으로 삼지 않으며, 그 변화만으로 계획·프로젝트를 차단하지 않는다. 이름이 비슷하다는 이유로 관리 branch로 간주하지 않는다. 실제 사용 중인 origin·관리 branch·worktree 등 공유 자원의 안전 검사는 유지한다.
 
+Scope snapshot과 격리 증거는 원문 그대로 보존하고, 비교할 때만 기본 checkout과 로컬 base branch를 양쪽에서 제외한다. 이 투영은 legacy·불완전 invocation에도 적용하지만 나머지 공유 ref·worktree·config는 엄격히 비교하며 격리 성공을 합성하지 않는다. 사용 중인 `origin/<base>`의 정상 전진은 설정된 `origin`에서 같은 branch OID, ancestry, live tracking ref를 확인하고 `origin/HEAD`가 같은 target을 가리킬 때만 snapshot 비교 기준에 반영한다. 최초 `origin/HEAD` 생성도 실제 원격 symbolic HEAD와 target을 확인한다. 원문 snapshot과 Manager 전이 receipt는 그대로 둔다.
+
+Agent preflight는 현재 호출의 역할·단계·작업 branch·worktree에서 사용되는 자원으로 Git snapshot digest를 계산하며, 저장된 owner 정보를 찾지 못하면 전체 snapshot 비교를 유지한다. 선택 원격 base의 변화는 일반 scope 검사와 같은 원격·ancestry·live ref 확인을 통과한 경우에만 digest 기준선에 반영한다. Worker의 post-call 검증과 일반 verify는 각각 `IMPLEMENTING`·`VERIFYING` 자원 집합을 명시해 Agent ledger가 없는 경우에도 현재 작업 scope를 사용한다. BLOCKED 재평가는 저장된 Agent 결과를 먼저 원래 증거로 검증한다. 이후 repository·계획·worktree·branch identity와 현재 branch ref 등록을 확인한 선택 worktree의 파일·index·HEAD만 새 사용자 입력으로 기준선에 반영한다. 기준 snapshot·결과·session은 수정하지 않으며, 보안 index flag·미완료 Git operation·소유권 불일치와 격리 증거가 없는 legacy 비교의 비선택 공유 자원 변경은 계속 검사한다.
+
 ### 기본 worktree 동기화
 
 | 상태 | 처리 |
