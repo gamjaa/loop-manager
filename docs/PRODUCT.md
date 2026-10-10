@@ -67,7 +67,7 @@
 | 규칙 기반 작업의 Manager 처리·모델 호출과 입출력 감소 | [R-063](requirements/archive/%5BR-063%5D%20Manager-Owned%20Deterministic%20Work%20and%20Minimal%20Model%20Use.md) |
 | 실제 검증 입력만의 목록·문서 원본을 고정 샘플로 대체·일반 verify와 후보 성공 결과 재사용 | [R-072](requirements/%5BR-072%5D%20Reuse%20Successful%20Candidate%20Results%20with%20Proven%20Inputs.md) |
 
-R-055의 공통 Git 변경 목표는 정상 fetch·legacy 기본 checkout 제외·BLOCKED 수동 입력 수용·로컬 수용과 게시 분리를 포함한다. 이 잔여 교정은 아직 구현 완료로 취급하지 않으며 G-199·G-189에서 확인한다. R-056은 dirty FF-only·clean rebase, R-082는 단계별 원격 문서 갱신을 담당한다.
+R-055의 공통 Git 변경 목표는 정상 fetch·legacy 기본 checkout 제외·BLOCKED 수동 입력 수용·로컬 수용과 게시 분리를 포함한다. 계획·작업 문서 삭제에 따른 관련 작업·source·dependency·현재 DB 관계와 소유 로컬·원격 작업 브랜치의 자동 정리도 R-055를 따른다. 이 변경은 아직 구현 완료로 취급하지 않으며 G-199·G-189에서 확인한다. R-056은 dirty FF-only·clean rebase, R-082는 단계별 원격 문서 갱신을 담당한다.
 
 R-023의 원격 실행·self handoff 목표는 유지하며 로컬 갱신 gate는 R-056, 역할별 파일 권한은 R-061을 따른다. R-055의 planning 오류와 R-061의 유효한 draft 사용자 판단 대기는 구분한다. draft는 planning 오류가 아니며 독립 작업을 막지 않지만 프로젝트 완료와 관련 Requirement archive를 허용하는 완료 상태도 아니다.
 

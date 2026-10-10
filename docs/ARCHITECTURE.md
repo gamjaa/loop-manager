@@ -120,7 +120,7 @@ SQLite에는 등록 프로젝트, 기준 branch, 선택한 provider, 과거 등�
 
 ExecPlan 번호는 연속일 필요가 없다. 번호 공백을 누락 계획으로 추정하거나 메우지 않으며 사용한 ID는 재사용하지 않는다. 현행 catalog 동기화는 SQLite 실행·취소 이력에 대응하는 원격 파일이 없거나 형식·source·ID·dependency graph가 유효하지 않으면, 다른 계획 상태를 바꾸지 않고 원인 파일을 포함한 프로젝트 범위 진단을 남긴다.
 
-[R-055 구현 예정](requirements/%5BR-055%5D%20Blocking%20Path%20Audit%20and%20Minimal%20Interruption.md): 사용자 필요에 따른 파일 삭제는 정상적인 선언 변경으로 반영한다. 원격 변경·실행 이력을 대조해 삭제 목적과 영향받는 계획·dependency를 재평가하고, 허용된 계획 개정·관계 정리를 통한 자동 복구를 차단보다 먼저 시도한다. 이력을 삭제하거나 삭제된 계획을 Merge 완료로 간주하지 않으며, 해결하지 못한 영향 범위만 보존·중단하고 검증된 독립 계획은 계속한다.
+[R-055 구현 예정](requirements/%5BR-055%5D%20Blocking%20Path%20Audit%20and%20Minimal%20Interruption.md#계획작업-문서-삭제의-자동-반영): Requirement·ExecPlan 삭제는 Manager의 원격 관측·이력 분류와 일반 Planner의 목표 판단으로 자동 처리한다. 허용된 관련 문서 개정·삭제의 원격 확인 후 현재 DB 관계와 실행 수명에 반영하고, 유지하는 관리 브랜치의 문서를 갱신하며 삭제를 반영한 취소·완료 작업의 소유 로컬·원격 브랜치와 worktree를 보존 검증 뒤 정리한다. 완료·취소·예약 감사는 활성 선언 및 source 조회와 분리해 보존한다. 게시·DB·자원 정리의 확정 지점별로 재개하며, 해결하지 못한 영향 범위와 정리 pending만 보존·보류하고 검증된 독립 계획은 계속한다.
 
 일반·유지보수 planning의 미해결 오류와 입력 지문은 다른 ExecPlan의 차단 해제·PR 상태 변경·project 실행 상태 정리와 독립적으로 보존한다. worktree 경로 부재나 관련 입력이 같은 원격 base 전진만으로 해제하지 않으며, 같은 입력의 반복 실행·재시작에서는 Planner를 다시 호출하지 않는다
 
@@ -528,7 +528,7 @@ ExecPlan archive는 원본 hash, regular-file source, 비어 있는 destination�
 - PR head 정보나 commit 관계를 확인할 수 없으면 worktree를 보존하고 `cleanup_pending`으로 기록한다
 - `cleanup_pending` worktree가 이후 clean해지거나 경로가 사라지면 기록을 지우고 강제 옵션 없이 정리한다
 - planning worktree·diff·session과 미게시 결과는 오류·게시 복구 동안 보존한다. 폐기·교체는 소유권과 보존 결과를 검증한 관리 경계에서만 수행한다
-- Merge된 로컬 관리 branch만 비강제 삭제할 수 있으며 원격 branch는 자동으로 삭제하지 않는다
+- 현행 정리는 Merge된 로컬 관리 branch만 비강제 삭제하며 원격 branch는 자동으로 삭제하지 않는다. 확인된 작업 삭제에 따른 소유 로컬·원격 branch 정리는 위 R-055의 구현 목표이며 현재 Merge 정리의 권한을 확대하지 않는다
 - 예외적으로 PR이 아직 없는 동일한 Loop Manager 소유 branch의 rebase 복구에만 `--force-with-lease`를 사용할 수 있다
 - 공통 파일 복사 스크립트는 사용자가 명시적으로 실행하는 초기 설정 도구이며 자동 Loop에서 호출하지 않는다
 - 등록 프로젝트의 문서와 verify 스크립트는 사용자가 신뢰한 입력으로 취급한다
