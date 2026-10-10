@@ -53,6 +53,7 @@ class ReconcileExistingPullRequestEffects:
     remote_base: Callable[..., object]
     update_project: Callable[..., object]
     validate_execplan_workspace_identity: Callable[..., object]
+    manual_publication_stage_tokens: Callable[..., object] | None = None
 
 @dataclass(frozen=True)
 class ResumePrConflictRebaseEffects:
@@ -78,6 +79,8 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
     repo: str,
     project: sqlite3.Row,
     pull_request: Mapping[str, object],
+    *,
+    config_path: Path | None = None,
 ) -> int | None:
     """Attach one existing head-branch PR and apply its durable state."""
 
@@ -93,14 +96,31 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
     head_value = pull_request.get("headRefOid")
     head_oid = str(head_value) if head_value else project["pr_head_oid"]
     state = str(pull_request.get("state") or "OPEN").upper()
+
+    def manual_stage_tokens():
+        if effects.manual_publication_stage_tokens is None:
+            return None
+        plan_id = effects._plan_id_from_path(str(project["plan_path"] or ""))
+        if plan_id is None:
+            return None
+        return effects.manual_publication_stage_tokens(
+            connection,
+            repo,
+            str(plan_id),
+            config_path,
+            str(project["provider"] or ""),
+        )
+
     if (state == 'OPEN' and project['phase'] == 'PUBLISHING'
             and project['pr_url'] and not int(project['pr_conflict_recovery'])):
         try:
             if effects.recover_confirmed_pr_conflict_push(
-                    connection, repo_path, state_dir, repo, project, pull_request):
+                    connection, repo_path, state_dir, repo, project, pull_request,
+                    manual_stage_tokens=manual_stage_tokens()):
                 effects.operation_print(f"기존 PR 후보 push 확인 완료: {url}")
                 return 0
-        except (PublicationSafetyError, WorkspaceOwnershipError) as error:
+        except (PublicationSafetyError, WorkspaceOwnershipError,
+                runtime_state.RuntimeStateError) as error:
             detail = f"기존 PR 후보 push 소유권 검증 실패: {error}"
             effects.block_active_execplan_from_revision(
                 connection, repo_path, repo, f"refs/remotes/origin/{project['base_branch']}",
@@ -193,6 +213,7 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
             except (
                 PublicationSafetyError,
                 WorkspaceOwnershipError,
+                runtime_state.RuntimeStateError,
             ) as error:
                 recovery_error = (
                     f"{PR_CONFLICT_PREFLIGHT_ERROR_PREFIX} {error}"
@@ -230,6 +251,7 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
                     repo,
                     project,
                     pull_request,
+                    manual_stage_tokens=manual_stage_tokens(),
                 ):
                     effects.operation_print(
                         f"기존 PR 충돌 복구 push 확인 완료: {url}"
@@ -453,11 +475,17 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
                 recovery=False,
             )
         else:
-            runtime_state.RuntimeStateRepository(connection).open_pull_request(
-                repo,
-                pr_url=url,
-                pr_head_oid=head_oid,
-            )
+            try:
+                runtime_state.RuntimeStateRepository(connection).open_pull_request(
+                    repo,
+                    pr_url=url,
+                    pr_head_oid=head_oid,
+                    manual_stage_tokens=manual_stage_tokens(),
+                )
+            except runtime_state.RuntimeStateError as error:
+                raise PublicationSafetyError(
+                    f"현재 설정으로 수동 PR 게시 근거를 확인할 수 없습니다: {error}"
+                ) from error
         effects.operation_print(f"Merge 대기 중: {url}")
         return 0
 

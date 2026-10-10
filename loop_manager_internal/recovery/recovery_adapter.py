@@ -42,6 +42,7 @@ class PullRequestRecoveryEffectsReconcileExistingPullRequestEffects:
     remote_base: Callable[..., object]
     update_project: Callable[..., object]
     validate_execplan_workspace_identity: Callable[..., object]
+    manual_publication_stage_tokens: Callable[..., object]
 
 
 def _pull_request_recovery_effects_reconcile_existing_pull_request(effects: PullRequestRecoveryEffectsReconcileExistingPullRequestEffects, ) -> pull_request_recovery.ReconcileExistingPullRequestEffects:
@@ -67,6 +68,7 @@ def _pull_request_recovery_effects_reconcile_existing_pull_request(effects: Pull
         remote_base=effects.remote_base,
         update_project=effects.update_project,
         validate_execplan_workspace_identity=effects.validate_execplan_workspace_identity,
+        manual_publication_stage_tokens=effects.manual_publication_stage_tokens,
     )
 
 

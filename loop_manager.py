@@ -290,6 +290,7 @@ from loop_manager_internal.agents import agent_adapter
 from loop_manager_internal.agents import scope_adapter
 from loop_manager_internal.agents import scope_state_service
 from loop_manager_internal.application import commands, manual_work
+from loop_manager_internal.execution import manual_candidate
 from loop_manager_internal.planning import manual_plan_generation
 from loop_manager_internal.application import contracts
 from loop_manager_internal.application import project_outcomes
@@ -587,6 +588,14 @@ _pull_request_recovery_effects_reconcile_existing_pull_request = _bind_effects(
         remote_base=lambda *args, **kwargs: remote_base(*args, **kwargs),
         update_project=lambda *args, **kwargs: update_project(*args, **kwargs),
         validate_execplan_workspace_identity=lambda *args, **kwargs: validate_execplan_workspace_identity(*args, **kwargs),
+        manual_publication_stage_tokens=lambda connection, repo, plan_id, config_path, provider: (
+            manual_candidate.recovery_publication_stage_tokens(
+                connection, repo, plan_id, config_path, provider,
+                lambda path, selected_provider, role, level, worktree: _agent_profile(
+                    path, selected_provider, role, level, worktree),
+                git, git_bytes,
+            )
+        ),
     ),
 )
 

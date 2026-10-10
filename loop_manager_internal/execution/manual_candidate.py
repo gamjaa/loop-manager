@@ -8,6 +8,7 @@ import os
 import platform
 import re
 import sys
+from types import SimpleNamespace
 
 from loop_manager_internal.catalog import execplan_catalog, requirement_sources
 from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
@@ -377,7 +378,9 @@ class ManualCandidate:
                 snapshot.setting_token,snapshot.input_token,snapshot.known)
 
     def publication_stage_tokens(self, context):
-        if not self.enabled():
+        group = self.group()
+        if (group is None or not group['request_id']
+                or group['state'] not in {'AUTOMATIC', 'PR_OPEN'}):
             return None
         result={}
         for stage in ('verify','review'):
@@ -415,6 +418,7 @@ class ManualCandidate:
         if record:
             self.store.record(group,stage,head,base,stage_token,'SKIPPED_BY_USER',detail)
         return detail
+
 
     def note_pending(self, context):
         if not self.enabled():
@@ -564,3 +568,27 @@ class ManualCandidate:
         return (body+f"\n\n## Manual submission\nGroup: {group['group_id']}\n"
             f"Source: {group['source_branch']}@{group['initial_source_head']}\nCandidate: {head}\n"
             '외부 targeted test 수행 결과는 Manager가 확인하지 않았습니다.\n'+members+'\n\n'+rows)
+
+
+def recovery_publication_stage_tokens(connection, repo, plan_id, config_path, provider,
+                                      resolve_profile, git, git_bytes=None):
+    """Observe the same effective stage inputs when recovery attaches a PR."""
+    group = ManualWorkRepository(connection).for_plan(repo, plan_id)
+    if group is None or not group['worktree']:
+        return None
+    worktree = Path(group['worktree'])
+    if git_bytes is None:
+        git_bytes = lambda path, *args: git(path, *args).stdout.encode('utf-8')
+    candidate = ManualCandidate(
+        connection, repo, plan_id, git, git_bytes,
+        config_path=config_path, provider=provider, resolve_profile=resolve_profile,
+    )
+    project = connection.execute(
+        'SELECT base_branch FROM projects WHERE repo=?', (repo,),
+    ).fetchone()
+    if project is None or not project['base_branch']:
+        return None
+    return candidate.publication_stage_tokens(SimpleNamespace(
+        worktree=worktree,
+        base_branch=str(project['base_branch']),
+    ))

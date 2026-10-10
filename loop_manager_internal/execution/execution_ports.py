@@ -186,6 +186,11 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
     def targeted_reason(evidence):
         return ('수동 제출의 외부 targeted test 결과는 Manager가 확인하지 않았습니다.'
                 if evidence == MANUAL_TEST_EVIDENCE else dependencies.reviewer_targeted_test_reason(evidence))
+    def reconcile_existing_pull_request(connection, repo_path, state_dir, repo, project, pull_request):
+        return dependencies.reconcile_existing_pull_request(
+            connection, repo_path, state_dir, repo, project, pull_request,
+            config_path=identity.get('config_path'),
+        )
     from loop_manager_internal.execution import stage_documents
     document_checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
     document_effects = stage_documents.StageDocumentEffects(
@@ -289,7 +294,7 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
         ),
         publication=execution_handlers.PublicationEffects(
             pr_for_branch=state.bind(dependencies.pr_for_branch, name="pr_for_branch", connected=False, mutates=False),
-            reconcile_existing_pull_request=state.bind(dependencies.reconcile_existing_pull_request, name="reconcile_existing_pull_request", connected=True, mutates=True),
+            reconcile_existing_pull_request=state.bind(reconcile_existing_pull_request, name="reconcile_existing_pull_request", connected=True, mutates=True),
             record_remote_publication_branch=state.bind(dependencies.record_remote_publication_branch, name="record_remote_publication_branch", connected=True, mutates=True),
             push_managed_publication_branch=state.bind(dependencies.push_managed_publication_branch, name="push_managed_publication_branch", connected=True, mutates=True),
             push_owned_pr_conflict_recovery=state.bind(dependencies.push_owned_pr_conflict_recovery, name="push_owned_pr_conflict_recovery", connected=True, mutates=True),

@@ -294,6 +294,8 @@ def select_waiting_pull_request_conflict(
     state_dir: Path,
     repo: str,
     observation: WaitingPullRequestObservation,
+    *,
+    config_path: Path | None = None,
 ) -> PullRequestSyncResult:
     """Select one still-eligible conflict after all observations are durable."""
 
@@ -346,6 +348,7 @@ def select_waiting_pull_request_conflict(
         repo,
         project,
         pull_request,
+        config_path=config_path,
     )
     return PullRequestSyncResult(result, result is None, observation.merged)
 
@@ -378,7 +381,8 @@ def synchronize_waiting_pull_requests(
     if after_reconciliation is not None:
         after_reconciliation()
     return effects.select_waiting_pull_request_conflict(
-        connection, repo_path, state_dir, repo, observation
+        connection, repo_path, state_dir, repo, observation,
+        config_path=config_path,
     )
 
 
@@ -566,8 +570,14 @@ def reconcile_existing_pull_request(
     repo: str,
     project: sqlite3.Row,
     pull_request: Mapping[str, object],
+    *,
+    config_path: Path | None = None,
 ) -> int | None:
-    return pull_request_recovery.reconcile_existing_pull_request(effects._pull_request_recovery_effects_reconcile_existing_pull_request(), connection, repo_path, state_dir, repo, project, pull_request)
+    return pull_request_recovery.reconcile_existing_pull_request(
+        effects._pull_request_recovery_effects_reconcile_existing_pull_request(),
+        connection, repo_path, state_dir, repo, project, pull_request,
+        config_path=config_path,
+    )
 
 
 @dataclass(frozen=True)

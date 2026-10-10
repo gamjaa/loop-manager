@@ -413,6 +413,8 @@ def recover_confirmed_pr_conflict_push(
     repo: str,
     project: sqlite3.Row,
     pull_request: Mapping[str, object],
+    *,
+    manual_stage_tokens: Mapping[str, str] | None = None,
 ) -> bool:
     """Recover only a previously pushed local HEAD, never an arbitrary remote head."""
 
@@ -522,5 +524,6 @@ def recover_confirmed_pr_conflict_push(
             pr_conflict_recovery=0,
             pr_conflict_head_oid=None,
             pr_conflict_base_oid=None,
+            manual_stage_tokens=manual_stage_tokens,
         )
     return True

@@ -669,6 +669,7 @@ class ProjectService:
                         self.state.repo,
                         self.state.row,
                         existing_pr,
+                        config_path=self.identity.config_path,
                     )
                     if reconciliation is not None:
                         return reconciliation
@@ -748,7 +749,8 @@ class ProjectService:
                     and str(pull_request.get('state') or '').upper() in {'CLOSED', 'MERGED'}):
                 return self.effects.reconcile_existing_pull_request(
                     self.identity.connection, self.state.repo_path, self.identity.state_dir,
-                    self.state.repo, self.state.row, pull_request)
+                    self.state.repo, self.state.row, pull_request,
+                    config_path=self.identity.config_path)
             self.effects.block_active_execplan_from_revision(
                 self.identity.connection, self.state.repo_path, self.state.repo,
                 f"refs/remotes/origin/{self.state.row['base_branch']}", str(error),

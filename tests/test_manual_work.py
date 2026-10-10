@@ -393,6 +393,51 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
                     verify_timeout_seconds=config.verify_timeout_seconds)
         return result,verify,agent
 
+    def _manual_recovery_candidate(self, directory, *, pushed_head=False):
+        service,branch,worktree=self.fixture(directory)
+        service.start('G-012')
+        (worktree/'src/app.py').write_text('VALUE = 2\n')
+        git_command(worktree,'add','src/app.py')
+        git_command(worktree,'commit','-m','Manual recovery candidate')
+        git_command(worktree,'push','origin',branch)
+        head=git_command(worktree,'rev-parse','HEAD')
+        args=completion()
+        args.skip_verify=args.skip_review=True
+        args.expected_head=head
+        args.skip_reason='External verify and Review'
+        service.complete(args)
+        result,_,_=self.step(service,stop='publish')
+        self.assertEqual(result,0)
+        base=git_command(service.repo_path,'rev-parse','origin/main')
+        row=service.connection.execute(
+            'SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
+            (service.repo,'G-012'),
+        ).fetchone()
+        from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
+        definition=DefinitionSnapshot.deserialize(row['definition_snapshot'])
+        url='https://example/pull/1'
+        observed_head=base if pushed_head else head
+        service.runtime.update_plan(service.repo,'G-012',plan_values={
+            'status':'PUBLISHING',
+            'pr_url':url,
+            'pr_head_oid':observed_head,
+            'publication_remote_oid':observed_head,
+            'active_sha':base,
+            'validated_base_sha':base,
+            'publication_token':definition.publication_token(base,head),
+        },enqueue=False)
+        service.runtime.hydrate(service.repo,'G-012')
+        group=service.store.for_plan(service.repo,'G-012')
+        service.store.update(group,state='AUTOMATIC',active_id='G-012')
+        project=service.connection.execute(
+            'SELECT * FROM projects WHERE repo=?',(service.repo,),
+        ).fetchone()
+        pull_request={
+            'url':url,'headRefName':branch,'baseRefName':'main',
+            'headRefOid':head,'state':'OPEN',
+        }
+        return service,branch,worktree,head,base,project,pull_request
+
     def test_remote_user_push_fast_forwards_without_losing_local_user_files(self):
         with tempfile.TemporaryDirectory() as directory:
             service,branch,worktree=self.fixture(directory)
@@ -567,6 +612,76 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
             group=service.store.for_source(service.repo,'source',args.requirement)
             self.assertIsNone(group['branch'])
             self.assertIn('별도 branch/PR',group['last_error'])
+
+    def test_existing_pr_recovery_observes_manual_stage_settings(self):
+        from loop_manager_internal.runtime.contracts import PublicationSafetyError
+        for scenario in ('unchanged','changed','unreadable'):
+            with self.subTest(settings=scenario), tempfile.TemporaryDirectory() as directory:
+                service,_branch,_worktree,head,base,project,pull_request = (
+                    self._manual_recovery_candidate(directory)
+                )
+                if scenario=='changed':
+                    service.config_path.write_text(service.config_path.read_text().replace(
+                        'verify_timeout_seconds=600','verify_timeout_seconds=601'),encoding='utf-8')
+                elif scenario=='unreadable':
+                    service.config_path.write_text('[loop\ninvalid config',encoding='utf-8')
+                with mock.patch('loop_manager._agent_profile',
+                                return_value=ResolvedProfile('fixture-reviewer','medium')):
+                    if scenario=='unchanged':
+                        ports=loop_manager._ExecutionLifecyclePorts(
+                            service.connection,service.runtime,repo=service.repo,
+                            repo_path=service.repo_path,state_dir=service.state_dir,
+                            base='main',base_sha=base,provider=service.project['provider'],
+                            config_path=service.config_path,newly_activated=False,
+                        )
+                        self.assertEqual(ports.effects.publication.reconcile_existing_pull_request(
+                            service.repo_path,service.state_dir,service.repo,project,pull_request),0)
+                        self.assertEqual(service.runtime.get(service.repo,'G-012').status,'PR_OPEN')
+                        publication=service.connection.execute(
+                            'SELECT head FROM manual_work_publications WHERE repo=?',
+                            (service.repo,),
+                        ).fetchone()
+                        self.assertEqual(publication['head'],head)
+                    else:
+                        with self.assertRaises(PublicationSafetyError):
+                            loop_manager.reconcile_existing_pull_request(
+                                service.connection,service.repo_path,service.state_dir,service.repo,
+                                project,pull_request,config_path=service.config_path)
+                        self.assertEqual(service.runtime.get(service.repo,'G-012').status,'PUBLISHING')
+                        self.assertIsNone(service.connection.execute(
+                            'SELECT 1 FROM manual_work_publications WHERE repo=?',(service.repo,),
+                        ).fetchone())
+
+    def test_confirmed_push_recovery_observes_manual_stage_settings(self):
+        for scenario in ('unchanged','changed','unreadable'):
+            with self.subTest(settings=scenario), tempfile.TemporaryDirectory() as directory:
+                service,_branch,_worktree,head,_base,project,pull_request = (
+                    self._manual_recovery_candidate(directory,pushed_head=True)
+                )
+                if scenario=='changed':
+                    service.config_path.write_text(service.config_path.read_text().replace(
+                        'verify_timeout_seconds=600','verify_timeout_seconds=601'),encoding='utf-8')
+                elif scenario=='unreadable':
+                    service.config_path.write_text('[loop\ninvalid config',encoding='utf-8')
+                with mock.patch('loop_manager._agent_profile',
+                                return_value=ResolvedProfile('fixture-reviewer','medium')):
+                    result=loop_manager.reconcile_existing_pull_request(
+                        service.connection,service.repo_path,service.state_dir,service.repo,
+                        project,pull_request,config_path=service.config_path)
+                if scenario=='unchanged':
+                    self.assertEqual(result,0)
+                    self.assertEqual(service.runtime.get(service.repo,'G-012').status,'PR_OPEN')
+                    publication=service.connection.execute(
+                        'SELECT head FROM manual_work_publications WHERE repo=?',
+                        (service.repo,),
+                    ).fetchone()
+                    self.assertEqual(publication['head'],head)
+                else:
+                    self.assertEqual(result,1)
+                    self.assertNotEqual(service.runtime.get(service.repo,'G-012').status,'PR_OPEN')
+                    self.assertIsNone(service.connection.execute(
+                        'SELECT 1 FROM manual_work_publications WHERE repo=?',(service.repo,),
+                    ).fetchone())
 
     def test_manual_candidate_reaches_pr_without_fabricating_worker_or_test_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
