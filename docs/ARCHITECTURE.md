@@ -87,9 +87,11 @@ SQLite 손실이나 손상에서의 자동 상태 재구성은 지원하지 않�
 
 ExecPlan의 `Progress` 체크 항목과 본문은 구현 내용·판단·검증 기록이다. 체크가 끝났다는 이유로 `READY`, `PLAN_BLOCKED`, `MERGED` 같은 실행 상태를 바꾸지 않으며, 단계·재시도·session은 SQLite, 실제 PR Merge는 GitHub 확인을 기준으로 한다. 본문 변경은 재평가 입력이고 명시적 `User Decision`은 승인 판정 입력이므로, 본문을 읽지 않거나 변경을 무시한다는 뜻은 아니다.
 
-활성 Requirement 경로는 안정적인 식별자이고 `docs/requirements/` 바로 아래 문서만 새 계획 입력이다. archive는 기존 ExecPlan source의 조회·검증 호환성에만 사용하며 재평가하거나 활성 경로로 자동 복원하지 않는다. FUTURE_IDEAS는 계획 입력·실행 상태가 아니다.
+현재 활성 Requirement 경로는 Planner 입력과 판단·이동의 경로 key이며 `docs/requirements/` 바로 아래 문서만 새 계획 입력이다. 기존 ExecPlan은 `sources` 문자열을 보존한다. Manager는 원격 revision과 worktree에서 같은 Requirement identity helper를 사용해 기록된 활성 경로, 기존 작업에 허용된 같은 파일명의 archive, source 파일명에서 확인한 R ID의 유일한 문서를 순서대로 조회한다. 정확한 경로가 있으면 중복 ID여도 해당 문서를 유지한다. ID 후보가 없거나 여러 개이거나 후보를 읽고 식별할 수 없으면 누락·모호·조회 실패를 구분해 source 관계를 확정하지 않는다. 새 ExecPlan은 정확한 활성 source 경로만 사용할 수 있다. archive는 기존 ExecPlan source의 조회·검증 호환성에만 사용하며 재평가하거나 활성 경로로 자동 복원하지 않는다. FUTURE_IDEAS는 계획 입력·실행 상태가 아니다.
 
 Specification Skill과 함께 배포하는 `.agents/skills/specification-docs/scripts/next_requirement_id.py`는 독립 Python 표준 라이브러리 도구다. 프로젝트 루트의 활성 Requirement 디렉터리와 선택적 archive 디렉터리에서 직접 포함된 `*.md` 일반 파일을 읽으며 Git 추적 여부를 검사하지 않는다. 활성 디렉터리 누락, 심볼릭 링크·일반 파일이 아닌 문서, 파일 접근·UTF-8·식별 오류는 ID를 출력하지 않고 실패하며 archive 디렉터리 부재는 빈 집합이다. 제한된 frontmatter에서 `id`·`title`을 읽고, frontmatter가 없는 문서는 첫 `# [R-ID] 제목`으로 식별한다. 파일명은 원본 판단에 쓰지 않는다. `copy-project-files`는 catalog의 공유 `frontmatter.py`를 Skill 스크립트 옆에 배포하므로 복제된 명령 실행은 Manager 설치에 의존하지 않는다. Manager ExecPlan parser와 조회 명령은 이 단일 파서 원본을 사용한다. 조회는 읽기 전용이며 Git, DB, 네트워크와 Agent 실행에 의존하지 않는다. import 가능한 `requirement_identity` 함수는 후속 Manager 번호 검사에서도 같은 식별 규칙을 재사용할 수 있게 한다.
+
+source 해석은 catalog 검증·문서 읽기·입력 지문·계획 관련성·단계별 문서 변경·Requirement 판단 및 이동에서 같은 resolver를 사용한다. 지문은 기존 source 문자열을 key로 두고 resolver가 찾은 현재 문서 내용을 포함한다. 따라서 경로 변경만으로 기존 작업 관계가 사라지지 않으며, 내용 변경은 일반 입력 변경·재사용 조건에 반영된다.
 
 Requirement 최종 판단은 source로 연결된 비종료 계획·draft와 수동 제출이 없는 시점에 일반 Planner가 담당한다. 관련 계획이 있으면 모두 실제 MERGED여야 하며 연결 계획 없는 직접 구현도 코드·검증·관련 제품·설계 문서로 판단한다. Manager는 유효한 기준별 충족 판단과 입력 지문·source 관계를 확인한 원문만 내용 보존 이동으로 게시한다. 미충족이면 후속 ExecPlan을 연결하며, 원격 확인 전 입력 변경에 따른 이동 철회와 원격 확인 후 archive를 구분한다.
 

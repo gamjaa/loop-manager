@@ -157,6 +157,7 @@ class StableWorkReasonEffects:
     catalog_schedule_decision: Callable[..., object]
     git: Callable[..., object]
     is_loop_manager_repository: Callable[..., object]
+    git_bytes: Callable[..., bytes] | None = None
 
 
 def _stable_work_reason(
@@ -235,9 +236,19 @@ def _stable_work_reason(
         path.decode("utf-8") for path in effects._git_tree_entries(repo_path, base_sha)
         if effects._is_active_requirement(path)
     )
+    requirement_documents = None
+    if effects.git_bytes is not None and active_requirements:
+        from loop_manager_internal.git.command_adapter import revision_requirement_documents
+        try:
+            requirement_documents = revision_requirement_documents(
+                effects.git_bytes, repo_path, base_sha,
+            )
+        except RuntimeError:
+            return None
     snapshot = work_exhaustion.collect(
         connection, repo, cycle=str(row["planning_fingerprint"]),
         active_requirements=active_requirements,
+        requirement_documents=requirement_documents,
     )
     if snapshot is not None and snapshot.completed:
         from loop_manager_internal.storage import planning_review_state

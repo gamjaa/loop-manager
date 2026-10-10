@@ -4,9 +4,12 @@ from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
 from loop_manager_internal.application.contracts import ExecPlanMetadataError
-from loop_manager_internal.catalog import execplan_catalog
+from loop_manager_internal.catalog import execplan_catalog, requirement_sources
 from loop_manager_internal.execution import execution_revision
-from loop_manager_internal.git.command_adapter import ExternalObservationError, revision_document_or_none
+from loop_manager_internal.git.command_adapter import (
+    ExternalObservationError, revision_document_or_none,
+    revision_requirement_documents,
+)
 from loop_manager_internal.runtime.contracts import GitLockError
 from pathlib import Path
 import hashlib
@@ -41,7 +44,24 @@ class WorktreeExecplanInputFingerprintEffects:
 
 def _worktree_execplan_input_fingerprint(effects: WorktreeExecplanInputFingerprintEffects, worktree: Path, plan: sqlite3.Row) -> str:
     entries = []
-    for relative_path in effects._execplan_input_paths(plan):
+    paths = effects._execplan_input_paths(plan)
+    requirement_documents = (
+        requirement_sources.worktree_requirement_documents(worktree)
+        if any(str(path).startswith("docs/requirements/") and str(path).count("/") == 2
+               for path in paths)
+        else {}
+    )
+    for relative_path in paths:
+        if str(relative_path).startswith("docs/requirements/") and str(relative_path).count("/") == 2:
+            resolved = requirement_sources.resolve_requirement_source(
+                str(relative_path), requirement_documents, allow_archive=True,
+            )
+            if resolved.status is requirement_sources.ResolutionStatus.AMBIGUOUS:
+                raise RuntimeError(
+                    f"ExecPlan source가 모호합니다: {relative_path} ({', '.join(resolved.candidates)})"
+                )
+            entries.append((relative_path, resolved.contents))
+            continue
         path = worktree / relative_path
         try:
             regular = stat.S_ISREG(path.stat().st_mode)
@@ -58,6 +78,7 @@ class RevisionExecplanInputFingerprintEffects:
     _execplan_input_fingerprint: Callable[..., object]
     _execplan_input_paths: Callable[..., object]
     git: Callable[..., object]
+    git_bytes: Callable[..., bytes]
 
 
 def _revision_execplan_input_fingerprint(
@@ -66,7 +87,24 @@ def _revision_execplan_input_fingerprint(
     plan: sqlite3.Row,
 ) -> str:
     entries = []
-    for relative_path in effects._execplan_input_paths(plan):
+    paths = effects._execplan_input_paths(plan)
+    requirement_documents = (
+        revision_requirement_documents(effects.git_bytes, repo_path, revision)
+        if any(str(path).startswith("docs/requirements/") and str(path).count("/") == 2
+               for path in paths)
+        else {}
+    )
+    for relative_path in paths:
+        if str(relative_path).startswith("docs/requirements/") and str(relative_path).count("/") == 2:
+            resolved = requirement_sources.resolve_requirement_source(
+                str(relative_path), requirement_documents, allow_archive=True,
+            )
+            if resolved.status is requirement_sources.ResolutionStatus.AMBIGUOUS:
+                raise RuntimeError(
+                    f"ExecPlan source가 모호합니다: {relative_path} ({', '.join(resolved.candidates)})"
+                )
+            entries.append((relative_path, resolved.contents))
+            continue
         contents = revision_document_or_none(effects.git, repo_path, revision, relative_path)
         entries.append((relative_path, contents))
     return effects._execplan_input_fingerprint(entries)
@@ -77,6 +115,7 @@ class RevisionExecplanSourceFingerprintEffects:
     """Named effects for _revision_execplan_source_fingerprint; no entry-point/module access."""
     _execplan_input_fingerprint: Callable[..., object]
     git: Callable[..., object]
+    git_bytes: Callable[..., bytes]
 
 
 def _revision_execplan_source_fingerprint(
@@ -87,17 +126,29 @@ def _revision_execplan_source_fingerprint(
     """Fingerprint only current source documents; the plan body is classified separately."""
 
     entries = []
-    for relative_path in json.loads(str(plan["sources"])):
+    source_paths = json.loads(str(plan["sources"]))
+    requirement_documents = (
+        revision_requirement_documents(effects.git_bytes, repo_path, revision)
+        if any(str(path).startswith("docs/requirements/") and str(path).count("/") == 2
+               for path in source_paths)
+        else {}
+    )
+    for relative_path in source_paths:
         if relative_path == "manager:verify-inputs":
             from loop_manager_internal.catalog.manager_sources import source_content
             entries.append((relative_path, source_content(relative_path)))
             continue
-        contents = revision_document_or_none(effects.git, repo_path, revision, relative_path)
-        if contents is None and relative_path != "docs/PRODUCT.md":
-            archive_path = execplan_catalog.requirement_archive_path(
-                str(relative_path)
+        if str(relative_path).startswith("docs/requirements/") and str(relative_path).count("/") == 2:
+            resolved = requirement_sources.resolve_requirement_source(
+                str(relative_path), requirement_documents, allow_archive=True,
             )
-            contents = revision_document_or_none(effects.git, repo_path, revision, archive_path)
+            if resolved.status is requirement_sources.ResolutionStatus.AMBIGUOUS:
+                raise RuntimeError(
+                    f"ExecPlan source가 모호합니다: {relative_path} ({', '.join(resolved.candidates)})"
+                )
+            contents = resolved.contents
+        else:
+            contents = revision_document_or_none(effects.git, repo_path, revision, relative_path)
         entries.append((str(relative_path), contents))
     return effects._execplan_input_fingerprint(entries)
 

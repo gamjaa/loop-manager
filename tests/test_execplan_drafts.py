@@ -428,6 +428,93 @@ class ExecPlanDraftCatalogTest(AutomationCatalogFixture, unittest.TestCase):
         self.assertTrue(self.waiting()["pending"])
         self.assertEqual(self.waiting()["decisions"], decisions)
 
+    def test_renamed_requirement_draft_input_matches_worktree_and_invalidates_approval(self):
+        source = "docs/requirements/[R-001] Original.md"
+        renamed = "docs/requirements/[R-001] Renamed.md"
+        draft = draft_text().replace("docs/PRODUCT.md", source)
+        product = b"# Product\n"
+        architecture = b"# Architecture\n"
+
+        def remote_catalog(plan, requirement, revision):
+            files = {
+                PATH: plan.encode(),
+                "docs/PRODUCT.md": product,
+                "docs/ARCHITECTURE.md": architecture,
+                renamed: requirement,
+            }
+            blobs = {}
+            records = []
+            for index, (path, contents) in enumerate(files.items(), 1):
+                object_id = f"{index:040x}"
+                blobs[object_id] = contents
+                records.append(
+                    f"100644 blob {object_id}\t{path}".encode() + b"\0"
+                )
+            tree = b"".join(records)
+            snapshot = execplan_catalog.snapshot_from_documents(
+                {PATH: plan}, validate_sources=True,
+                requirement_documents={renamed: requirement},
+            )
+
+            def git_bytes(_repo, *args):
+                if args[0] == "ls-tree":
+                    return tree
+                if args[0] == "cat-file":
+                    return blobs[args[-1]]
+                if args[0] == "show":
+                    return files[args[1].split(":", 1)[1]]
+                raise AssertionError(args)
+
+            def git(_repo, *args):
+                if args[0] == "rev-parse":
+                    return SimpleNamespace(stdout=revision)
+                if args == ("remote", "get-url", "origin"):
+                    return SimpleNamespace(stdout="git@github.com:owner/project.git")
+                raise AssertionError(args)
+
+            effects = catalog_service.GitCatalogDefinitionPortEffects(
+                git=git, git_bytes=git_bytes, _git_tree_entries=mock.Mock(),
+                revision_execplan_snapshot=mock.Mock(return_value=snapshot),
+            )
+            return catalog_service._GitCatalogDefinitionPort(
+                effects, Path("/repo"), "origin/main", lambda: frozenset(),
+            ).load()
+
+        def worktree_inputs(requirement):
+            with tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                for path, contents in (
+                    ("docs/PRODUCT.md", product),
+                    ("docs/ARCHITECTURE.md", architecture),
+                    (renamed, requirement),
+                ):
+                    target = root / path
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    target.write_bytes(contents)
+                plan = execplan_catalog.parse_execplan_text(
+                    PATH, draft, validate_sources=False,
+                )
+                return execplan_drafts.input_digests(root, plan)
+
+        first_requirement = b"# [R-001] Renamed\n\nFirst criteria.\n"
+        first = remote_catalog(draft, first_requirement, "c" * 40)
+        self.assertEqual(first.draft_inputs, worktree_inputs(first_requirement))
+
+        self.reconcile({PATH: draft}, first.revision_sha, inputs=first.draft_inputs)
+        held = self.waiting()
+        accepted = accepted_text(draft, held["revision"])
+        self.reconcile({PATH: accepted}, first.revision_sha, inputs=first.draft_inputs)
+        self.assertFalse(self.waiting()["pending"])
+
+        changed_requirement = b"# [R-001] Renamed\n\nChanged criteria.\n"
+        changed = remote_catalog(accepted, changed_requirement, "d" * 40)
+        self.assertEqual(changed.draft_inputs, worktree_inputs(changed_requirement))
+        self.assertNotEqual(
+            first.draft_inputs[source], changed.draft_inputs[source],
+        )
+        self.reconcile({PATH: accepted}, changed.revision_sha, inputs=changed.draft_inputs)
+        self.assertTrue(self.waiting()["pending"])
+
     def test_executed_plan_cannot_become_draft(self):
         self._insert_plan(self.connection, "G-002", "MERGED", title="Executed", plan_sha="a" * 40)
         documents = {**self.documents, "docs/plans/[G-002] Executed.md": draft_text("G-002", "Executed")}

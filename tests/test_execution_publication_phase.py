@@ -168,20 +168,22 @@ class ExternalOwnershipObservationTests(TestCase):
     def test_failed_source_read_does_not_fall_back_to_archive(self):
         source = 'docs/requirements/[R-001] Source.md'
         calls = []
-        def git(_repo, operation, *args, **kwargs):
+        def git_bytes(_repo, operation, *args):
             calls.append((operation, args))
-            if operation == 'show':
-                return SimpleNamespace(returncode=128, stdout='different diagnostic')
-            return SimpleNamespace(
-                returncode=0, stdout=f'100644 blob deadbeef\t{source}\0')
+            if operation == 'ls-tree':
+                return f'100644 blob deadbeef\t{source}\0'.encode()
+            raise RuntimeError('blob read failed')
         effects = RevisionExecplanSourceFingerprintEffects(
-            _execplan_input_fingerprint=mock.Mock(), git=git,
+            _execplan_input_fingerprint=mock.Mock(),
+            git=lambda *_args, **_kwargs: self.fail('text Git path was used'),
+            git_bytes=git_bytes,
         )
-        with self.assertRaises(ExternalObservationError):
+        from loop_manager_internal.catalog.requirement_sources import RequirementSourceLookupError
+        with self.assertRaises(RequirementSourceLookupError):
             _revision_execplan_source_fingerprint(
                 effects, Path('/repo'), 'base', {'sources': json.dumps([source])}
             )
-        self.assertEqual([operation for operation, _args in calls], ['show', 'ls-tree'])
+        self.assertEqual([operation for operation, _args in calls], ['ls-tree', 'cat-file'])
         effects._execplan_input_fingerprint.assert_not_called()
 
     def test_pr_response_must_be_valid_before_absence_or_identity_is_accepted(self):

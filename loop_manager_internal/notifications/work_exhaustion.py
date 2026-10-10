@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import json
 import re
 import sqlite3
+from loop_manager_internal.catalog import requirement_sources
 from loop_manager_internal.storage import execplan_draft_state
 
 
@@ -89,6 +90,7 @@ def collect(
     *,
     cycle: str,
     active_requirements: tuple[str, ...],
+    requirement_documents: dict[str, bytes] | None = None,
 ) -> WorkReasonSnapshot | None:
     """Read only confirmed SQLite causes; None means work may still be runnable."""
 
@@ -207,7 +209,25 @@ def collect(
                 sources = json.loads(str(row["sources"]))
             except (TypeError, ValueError):
                 sources = []
-            if path in sources:
+            relation = path in sources
+            if not relation and requirement_documents is not None:
+                for source in sources:
+                    if (not isinstance(source, str)
+                        or not source.startswith("docs/requirements/")
+                        or source.count("/") != 2):
+                        continue
+                    try:
+                        resolved = requirement_sources.resolve_requirement_source(
+                            source, requirement_documents,
+                        )
+                    except requirement_sources.RequirementSourceLookupError:
+                        return None
+                    if resolved.status is requirement_sources.ResolutionStatus.AMBIGUOUS:
+                        return None
+                    if resolved.path == path:
+                        relation = True
+                        break
+            if relation:
                 related.append(statuses[str(row["plan_id"])])
         if related and all(status == "MERGED" for status in related):
             judgment = None

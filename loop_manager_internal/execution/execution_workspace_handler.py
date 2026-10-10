@@ -67,6 +67,7 @@ class WorkspaceHandlerPorts:
     _row: Callable[[], Mapping[str, object]]
     _run_managed_rebase: Callable[..., Any]
     _stage_rebase_correction: Callable[..., Any]
+    git_bytes: Callable[..., bytes] | None = None
 
 
 class WorkspaceHandler:
@@ -212,7 +213,8 @@ class WorkspaceHandler:
             manual = get_manual(self.ports.state)
             if not manual or not manual.enabled():
                 stage_documents.remember_work_branch(self.ports.git, self.ports.state, checkpoint,
-                    self.ports.identity, context, remote_oid, snapshot.local_head, base_oid, pull_request)
+                    self.ports.identity, context, remote_oid, snapshot.local_head, base_oid, pull_request,
+                    git_bytes=self.ports.git_bytes)
                 current = checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
             if manual and manual.adopt_remote(context,remote_oid,base_oid,pull_request,
                                                self.ports.state,checkpoint):

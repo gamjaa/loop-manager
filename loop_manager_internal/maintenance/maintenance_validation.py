@@ -489,7 +489,7 @@ def validate_maintenance_planner_result(
                     path,
                     effects._parse_execplan(
                         worktree, worktree / path, require_priority=False,
-                        allow_archive_fallback=False,
+                        allow_archive_fallback=False, allow_id_fallback=True,
                     ),
                 ))
             except RuntimeError as error:

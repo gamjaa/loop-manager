@@ -220,6 +220,20 @@ class RequirementArchiveEligibilityTest(unittest.TestCase):
         self.connection.commit()
         self.assertEqual(self.candidates(revision, "G-003"), (source,))
 
+    def test_existing_plan_source_survives_renamed_requirement_in_git_snapshot(self):
+        source = self.requirement("[R-001] Original", "# [R-001] Original\n")
+        self.plan("G-001", "Referenced", (source,), "READY")
+        self.plan("G-002", "Current", ("docs/PRODUCT.md",), "IMPLEMENTING")
+        self.commit("Original Requirement path")
+
+        renamed = "docs/requirements/[R-001] Renamed.md"
+        (self.repo / source).rename(self.repo / renamed)
+        (self.repo / renamed).write_text(
+            "# [R-001] Renamed\n", encoding="utf-8",
+        )
+        revision = self.commit("Rename Requirement")
+        self.assertEqual(self.candidates(revision, "G-002"), ())
+
     def test_bootstrap_uses_general_history_for_r003_and_r005(self):
         r001 = self.requirement("[R-001] Automation")
         r002 = self.requirement("[R-002] Cleanup")
@@ -646,6 +660,7 @@ Test fallback.
             self.candidates(revision, "G-001")
 
     def test_blocked_fingerprint_ignores_archived_fallback_contents(self):
+        """Legacy selector; archive fallback content now participates in the fingerprint."""
         source = self.requirement("Fingerprint", "# Original\n")
         self.plan("G-001", "Current", (source,), "IMPLEMENTING")
         self.commit()
@@ -660,7 +675,7 @@ Test fallback.
         first = loop_manager._worktree_execplan_input_fingerprint(worker, row)
         archived.write_text("# Changed archive\n", encoding="utf-8")
         second = loop_manager._worktree_execplan_input_fingerprint(worker, row)
-        self.assertEqual(first, second)
+        self.assertNotEqual(first, second)
 
         (worker / source).write_text("# Reactivated\n", encoding="utf-8")
         third = loop_manager._worktree_execplan_input_fingerprint(worker, row)

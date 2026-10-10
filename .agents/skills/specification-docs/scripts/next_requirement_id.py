@@ -3,7 +3,6 @@
 
 from __future__ import annotations
 
-import re
 import stat
 import sys
 from pathlib import Path
@@ -22,50 +21,8 @@ exec(
     _FRONTMATTER_MODULE.__dict__,
 )
 parse_frontmatter = _FRONTMATTER_MODULE.parse_frontmatter
-
-
-_ID = re.compile(r"R-([0-9]{3,})\Z")
-_HEADING = re.compile(r"# \[(R-[0-9]{3,})\] (.+)")
-
-
-class RequirementIdError(ValueError):
-    """A Requirement document tree cannot provide an unambiguous ID set."""
-
-
-def _valid_id(value: object) -> tuple[str, int]:
-    if not isinstance(value, str):
-        raise RequirementIdError("Requirement id가 없습니다")
-    match = _ID.fullmatch(value)
-    if match is None or int(match.group(1)) == 0:
-        raise RequirementIdError(f"유효하지 않은 Requirement id입니다: {value}")
-    return value, int(match.group(1))
-
-
-def requirement_identity(text: str) -> tuple[str, str]:
-    """Return the source ID and title from one Requirement document.
-
-    Kept importable so Manager-side checks can share this identity rule.
-    """
-    text = text.removeprefix("\ufeff")
-    try:
-        frontmatter = parse_frontmatter(text)
-    except RuntimeError as error:
-        raise RequirementIdError(str(error)) from error
-    if frontmatter is not None:
-        requirement_id, _ = _valid_id(frontmatter.get("id"))
-        title = frontmatter.get("title")
-        if not isinstance(title, str) or not title.strip():
-            raise RequirementIdError("Requirement title이 없습니다")
-        return requirement_id, title
-
-    for line in text.splitlines():
-        if line.startswith("# "):
-            match = _HEADING.fullmatch(line)
-            if match is None or not match.group(2).strip():
-                raise RequirementIdError("첫 제목은 `# [R-000] 제목` 형식이어야 합니다")
-            requirement_id, _ = _valid_id(match.group(1))
-            return requirement_id, match.group(2).strip()
-    raise RequirementIdError("Requirement 첫 제목을 찾을 수 없습니다")
+RequirementIdError = _FRONTMATTER_MODULE.RequirementIdError
+requirement_identity = _FRONTMATTER_MODULE.requirement_identity
 
 
 def _markdown_files(directory: Path, *, required: bool) -> tuple[Path, ...]:

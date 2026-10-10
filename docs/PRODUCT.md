@@ -251,7 +251,7 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 - 새 Requirement는 원하는 변화·이유·Acceptance Criteria만 기록하며 frontmatter·상태·complexity·risk를 두지 않는다
 - 새 Requirement를 만들기 직전에 Specification Skill은 프로젝트 루트의 `python .agents/skills/specification-docs/scripts/next_requirement_id.py`를 실행해 출력된 ID를 사용한다. 조회는 활성·archive 문서의 원본 ID 중 최댓값 다음 후보를 반환하며, 중복이나 번호 공백은 허용하고 중간 번호를 채우지 않는다. 파일을 수정하거나 번호를 예약하지 않는다. 빈 집합은 R-001이고 archive 디렉터리 부재는 빈 집합이다. 조회 오류가 있으면 유효한 ID 없이 실패한다
 - 신규 문서는 frontmatter 없이 작성한다. 기존 문서의 ID·제목 조회는 유효한 `id`·`title` frontmatter를 우선하고, frontmatter가 없으면 첫 `# [R-ID] 제목`을 사용한다. 잘못되거나 불완전한 frontmatter는 파일명·본문으로 대체하지 않으며 기존 문서에 frontmatter를 일괄 추가하지 않는다
-- 기존 ExecPlan의 활성 Requirement source가 없으면 동일 파일명의 `docs/requirements/archive/` 문서를 조회하되 원래 source 경로는 바꾸지 않는다
+- 기존 ExecPlan의 Requirement source 문자열은 rename 뒤에도 바꾸지 않는다. 기록된 활성 경로를 먼저 사용하고, 없으면 기존 작업에 한해 같은 파일명의 archive, source 파일명에 적힌 R ID의 유일한 원본 ID 문서 순으로 조회한다. 정확한 경로가 있으면 ID가 중복돼도 그 문서를 유지하며 후보가 없거나 여러 개이거나 조회가 실패하면 source 관계를 확정하지 않는다
 - 새 ExecPlan의 source와 Planner 입력은 활성 PRODUCT 또는 `docs/requirements/` 바로 아래 문서로 제한한다
 - source로 참조하는 비종료 ExecPlan·draft가 있으면 Requirement 전체 충족 확인과 archive를 미룬다. 연결된 활성 작업이 없어지면 일반 Planner가 최신 원격 구현·검증과 관련 제품·설계 문서로 각 Acceptance Criterion을 충족·미충족·불확실로 판단한다. 관련 계획이 있으면 모두 실제 MERGED여야 하며, 계획 없이 직접 구현한 변경도 실제 근거로 판단한다. 계획 작성 완료나 관련 계획의 Merge만으로 충족을 추정하지 않는다
 - Manager는 Requirement 원문, 관련 명세·계획 관계, 구현·검증 근거에 결합된 판단을 보존한다. 동일한 유효 입력의 충족·미충족 판단은 재사용하고 관련 입력이 바뀌면 미완료 작업이 없는 시점에 일반 Planner가 다시 확인한다. 빠른 Planner는 이 판단·이동에 참여하지 않으며 기존 계획 변경 영향 점검만 수행한다
@@ -259,7 +259,7 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 - archive된 Requirement는 완료한 변경의 보관이며 재평가·새 작업·프로젝트 완료 대기의 입력으로 사용하거나 자동 복원하지 않는다. 기존 ExecPlan의 source 조회·검증을 위한 읽기 호환성과 과거 감사 기록은 보존한다
 - `PLAN_BLOCKED` 해제 지문은 원래 활성 Requirement 경로만 사용하고 archive 변경에는 반응하지 않는다
 - Requirement는 PRODUCT의 변경 요청이며 ExecPlan의 구현 상세나 실행 상태를 포함하지 않는다
-- Requirement 파일 경로를 안정적인 식별자로 사용한다
+- 현재 활성 Requirement 경로는 Planner 입력과 판단·이동의 경로 key다. 기존 ExecPlan source는 기록된 경로를 보존하며 제목 변경 뒤 고유한 원본 R ID로 같은 문서를 연결한다
 - `docs/requirements/` 바로 아래의 모든 `*.md`를 Planner 입력으로 사용한다
 - `docs/REQUIREMENT.template.md`와 `docs/requirements/archive/`는 Planner 입력에서 제외한다
 - ExecPlan의 `sources`에는 근거가 된 PRODUCT 또는 Requirement 경로가 있어야 한다

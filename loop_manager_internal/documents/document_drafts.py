@@ -12,7 +12,8 @@ import sqlite3
 import subprocess
 from uuid import uuid4
 
-from loop_manager_internal.catalog import execplan_catalog
+from loop_manager_internal.catalog import execplan_catalog, requirement_sources
+from loop_manager_internal.git.command_adapter import requirement_documents_from_tree
 from loop_manager_internal.storage import maintenance_state
 
 
@@ -71,6 +72,7 @@ def _document_path(path: str) -> bool:
 def source_relationships(
     connection: sqlite3.Connection, repo: str, path: str,
     *, exclude_plan_id: str | None = None,
+    requirement_documents: dict[str, bytes] | None = None,
 ) -> str:
     """Snapshot nonterminal plan IDs and their source lists for one document."""
     relationships = []
@@ -85,7 +87,28 @@ def source_relationships(
             raise DocumentDraftError("비종료 ExecPlan source 관계가 유효하지 않습니다.") from error
         if not isinstance(sources, list) or any(not isinstance(s, str) for s in sources):
             raise DocumentDraftError("비종료 ExecPlan source 관계가 유효하지 않습니다.")
-        if path in sources and row["plan_id"] != exclude_plan_id:
+        related = path in sources
+        if (not related and requirement_documents is not None
+            and path.startswith("docs/requirements/") and path.count("/") == 2):
+            for source in sources:
+                if not source.startswith("docs/requirements/") or source.count("/") != 2:
+                    continue
+                try:
+                    resolution = requirement_sources.resolve_requirement_source(
+                        source, requirement_documents,
+                    )
+                except requirement_sources.RequirementSourceLookupError as error:
+                    raise DocumentDraftError(
+                        "비종료 ExecPlan Requirement source 관계를 확인할 수 없습니다."
+                    ) from error
+                if resolution.status is requirement_sources.ResolutionStatus.AMBIGUOUS:
+                    raise DocumentDraftError(
+                        "비종료 ExecPlan Requirement source 관계가 모호합니다."
+                    )
+                if resolution.path == path:
+                    related = True
+                    break
+        if related and row["plan_id"] != exclude_plan_id:
             relationships.append([str(row["plan_id"]), sorted(sources)])
     return json.dumps(relationships, ensure_ascii=False, separators=(",", ":"))
 
@@ -136,8 +159,24 @@ def checked_source_relationships(
         )}
         if any(plan_id not in merged for plan_id in remote if plan_id not in expected):
             raise DocumentDraftError("원격에 SQLite가 알지 못하는 비종료 ExecPlan이 있습니다.")
+    requirement_documents = None
+    if path.startswith("docs/requirements/") and path.count("/") == 2:
+        try:
+            tree = _git(
+                repository, "ls-tree", "-r", "-z", "--full-tree", revision,
+                "--", "docs/requirements",
+            )
+            requirement_documents = requirement_documents_from_tree(
+                tree,
+                lambda object_id: _git(repository, "cat-file", "blob", object_id),
+            )
+        except (DocumentDraftError, RuntimeError) as error:
+            raise DocumentDraftError(
+                "원격 Requirement source 관계를 안전하게 읽을 수 없습니다."
+            ) from error
     return source_relationships(
         connection, repo, path, exclude_plan_id=exclude_plan_id,
+        requirement_documents=requirement_documents,
     )
 
 

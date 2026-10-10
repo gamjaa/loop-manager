@@ -158,6 +158,7 @@ class ExecutionLifecyclePortsEffects:
     mutable_ready_snapshot: Callable[..., object]
     validate_planner_result: Callable[..., object]
     _assert_mutable_ready_snapshot_current: Callable[..., object]
+    git_bytes: Callable[..., bytes] | None = None
 
 
 def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, connection, runtime_repository, **identity):
@@ -165,8 +166,11 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
     verify_timeout_seconds = identity.pop("verify_timeout_seconds", 600)
     state = _ExecutionStatePort(connection, runtime_repository, identity["repo"])
     from loop_manager_internal.execution.manual_candidate import ManualCandidate, MANUAL_TEST_EVIDENCE
+    manual_git_bytes = dependencies.git_bytes or (
+        lambda repo, *args: dependencies.git(repo, *args).stdout.encode("utf-8")
+    )
     manual = ManualCandidate(connection, identity['repo'], state.plan_id, dependencies.git,
-                             lambda repo, *args: dependencies.git(repo, *args).stdout.encode(), dependencies.pr_for_branch)
+                             manual_git_bytes, dependencies.pr_for_branch)
     state.manual = manual
     def workspace_identity(state_dir, repo, plan_id, branch, worktree):
         return dependencies.validate_execplan_workspace_identity(state_dir, repo,
@@ -180,6 +184,7 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
     document_checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
     document_effects = stage_documents.StageDocumentEffects(
         git=state.bind(dependencies._typed_execution_git, name="document_git", connected=False, mutates=False),
+        git_bytes=dependencies.git_bytes,
         capture_scope=dependencies.capture_git_snapshot,
         validate_scope=lambda *a, **kw: dependencies.validate_agent_scope(*a, connection=connection, **kw),
         run_agent=state.bind(dependencies._run_agent_with_connection, name="document_planner", connected=True, mutates=False),
@@ -200,6 +205,7 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
         workspace=execution_handlers.WorkspaceEffects(
             is_directory=lambda path: path.is_dir(),
             git=state.bind(dependencies._typed_execution_git, name="git", connected=False, mutates=False),
+            git_bytes=dependencies.git_bytes,
             make_worktree=state.bind(dependencies.make_worktree, name="make_worktree", connected=False, mutates=False),
             branch_has_changes=state.bind(dependencies.branch_has_changes, name="branch_has_changes", connected=False, mutates=False),
             remote_branch_oid=state.bind(dependencies.remote_branch_oid, name="remote_branch_oid", connected=False, mutates=False),

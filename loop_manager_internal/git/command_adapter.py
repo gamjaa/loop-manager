@@ -128,3 +128,75 @@ def revision_document_or_none(git: Callable[..., object], repo: Path,
     if not revision_path_exists(git, repo, revision, path):
         return None
     raise ExternalObservationError(f"Git revision 문서 조회에 실패했습니다: {path}")
+
+
+def revision_requirement_documents(
+    git_bytes: Callable[..., bytes], repo: Path, revision: str,
+) -> dict[str, bytes]:
+    """Read direct regular Requirement documents from one pinned Git tree."""
+    try:
+        tree = git_bytes(
+            repo, "ls-tree", "-r", "-z", "--full-tree", revision,
+            "--", "docs/requirements",
+        )
+    except GitLockError:
+        raise
+    except (RuntimeError, OSError) as error:
+        raise ExternalObservationError(
+            f"Git revision Requirement tree 조회에 실패했습니다: {revision}"
+        ) from error
+
+    def read_blob(object_id: str) -> bytes:
+        try:
+            return git_bytes(repo, "cat-file", "blob", object_id)
+        except GitLockError:
+            raise
+        except (RuntimeError, OSError) as error:
+            raise ExternalObservationError(
+                f"Git revision Requirement blob을 읽을 수 없습니다: {object_id}"
+            ) from error
+
+    return requirement_documents_from_tree(tree, read_blob)
+
+
+def requirement_documents_from_tree(
+    tree: bytes, read_blob: Callable[[str], bytes],
+) -> dict[str, bytes]:
+    """Read the eligible Requirement blobs from an already observed Git tree."""
+    from loop_manager_internal.catalog.requirement_sources import (
+        RequirementSourceLookupError,
+    )
+
+    documents: dict[str, bytes] = {}
+    for record in tree.split(b"\0"):
+        if not record:
+            continue
+        metadata, separator, raw_path = record.partition(b"\t")
+        fields = metadata.split()
+        if not separator or len(fields) != 3:
+            raise ExternalObservationError("Git Requirement tree 항목 형식이 올바르지 않습니다.")
+        if not raw_path.startswith(b"docs/requirements/") or not raw_path.endswith(b".md"):
+            continue
+        try:
+            path = raw_path.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise ExternalObservationError(
+                "Git Requirement 경로가 UTF-8이 아닙니다."
+            ) from error
+        if not (
+            path.count("/") == 2
+            or path.startswith("docs/requirements/archive/")
+            and path.count("/") == 3
+        ):
+            continue
+        mode, object_type, object_id = fields
+        if object_type != b"blob" or mode not in {b"100644", b"100755"}:
+            raise RequirementSourceLookupError(path, "일반 파일이 아닙니다")
+        try:
+            contents = read_blob(object_id.decode("ascii"))
+        except GitLockError:
+            raise
+        except (RuntimeError, OSError) as error:
+            raise RequirementSourceLookupError(path, "Git blob을 읽을 수 없습니다") from error
+        documents[path] = contents
+    return documents

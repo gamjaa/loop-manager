@@ -102,6 +102,10 @@ class RequirementIdQueryTest(unittest.TestCase):
             Path(skill_parser.__code__.co_filename).resolve(),
             Path(shared_frontmatter.parse_frontmatter.__code__.co_filename).resolve(),
         )
+        self.assertEqual(
+            Path(TOOL["requirement_identity"].__code__.co_filename).resolve(),
+            Path(shared_frontmatter.requirement_identity.__code__.co_filename).resolve(),
+        )
         invalid_key = "---\nnot a key: value\n---\n"
         with self.assertRaisesRegex(TOOL["RequirementIdError"], "frontmatter key"):
             TOOL["requirement_identity"](invalid_key)

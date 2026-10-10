@@ -9,9 +9,10 @@ import platform
 import re
 import sys
 
-from loop_manager_internal.catalog import execplan_catalog
+from loop_manager_internal.catalog import execplan_catalog, requirement_sources
 from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
 from loop_manager_internal.execution.validation_feedback import redact_secrets
+from loop_manager_internal.git.command_adapter import revision_requirement_documents
 from loop_manager_internal.storage.manual_work_state import ManualWorkRepository, digest
 
 MANUAL_TEST_EVIDENCE = 'MANUAL_EXTERNAL_TARGETED_TESTS_UNCONFIRMED'
@@ -136,6 +137,9 @@ class ManualCandidate:
         entries=self.git_bytes(worktree,'ls-tree','-rz',head).split(b'\0')
         regular=[entry.partition(b'\t')[2].decode('utf-8') for entry in entries
                  if entry.startswith((b'100644 blob ', b'100755 blob '))]
+        requirement_documents = revision_requirement_documents(
+            self.git_bytes, worktree, head,
+        )
         documents = []
         for stored in json.loads(group['documents']):
             candidates=[path for path in regular if re.fullmatch(r'docs/plans/\['+
@@ -163,7 +167,9 @@ class ManualCandidate:
                 raise RuntimeError('제출 G의 외부 dependency가 등록되지 않았습니다.')
             isolated = execplan_catalog.snapshot_from_documents(
                 {item['path']:item['text'].encode()},validate_sources=True,
-                available_regular_paths=frozenset(regular),isolate_errors=True)
+                allow_archive_fallback=group['kind'] != 'submit',
+                available_regular_paths=frozenset(regular),
+                requirement_documents=requirement_documents,isolate_errors=True)
             issues = [issue for issue in isolated.issues if issue.code != 'missing-dependency']
             if issues:
                 raise RuntimeError('; '.join(issue.message for issue in issues))
@@ -178,19 +184,53 @@ class ManualCandidate:
         plan = selected['plan']
         sources = sorted({path for item in documents for path in item['plan']['sources']})
         source_texts=[]
+        requirement_documents = revision_requirement_documents(
+            self.git_bytes, context.worktree, head,
+        )
+        base_requirement_documents = None
         for path in sources:
             from loop_manager_internal.catalog.manager_sources import SOURCE, source_content
             if path == SOURCE:
                 source_texts.append((path, source_content(path)))
                 continue
-            result=self.git(context.worktree,'show',f'{head}:{path}',check=False)
-            if result.returncode:
-                # The revision gate integrates this observed user base before
-                # any stage runs; this is definition input, never stage PASS.
-                if group['kind']!='start' or self.git(context.worktree,'merge-base','--is-ancestor',base,head,
-                                                     check=False).returncode==0:
-                    raise RuntimeError(f'수동 후보의 R 입력이 없습니다: {path}')
-                result=self.git(Path(self.repo),'show',f'{base}:{path}')
+            if path.startswith('docs/requirements/') and path.count('/') == 2:
+                resolved = requirement_sources.resolve_requirement_source(
+                    path, requirement_documents, allow_archive=True,
+                )
+                if resolved.status is requirement_sources.ResolutionStatus.AMBIGUOUS:
+                    raise RuntimeError(
+                        f'수동 후보의 Requirement source가 모호합니다: {path} '
+                        f"({', '.join(resolved.candidates)})"
+                    )
+                if resolved.status is requirement_sources.ResolutionStatus.RESOLVED:
+                    source_texts.append((path, resolved.contents))
+                    continue
+            else:
+                result=self.git(context.worktree,'show',f'{head}:{path}',check=False)
+                if result.returncode == 0:
+                    source_texts.append((path,result.stdout))
+                    continue
+            if group['kind']!='start' or self.git(context.worktree,'merge-base','--is-ancestor',base,head,
+                                                 check=False).returncode==0:
+                raise RuntimeError(f'수동 후보의 R 입력이 없습니다: {path}')
+            if path.startswith('docs/requirements/') and path.count('/') == 2:
+                if base_requirement_documents is None:
+                    base_requirement_documents = revision_requirement_documents(
+                        self.git_bytes, Path(self.repo), base,
+                    )
+                resolved = requirement_sources.resolve_requirement_source(
+                    path, base_requirement_documents, allow_archive=True,
+                )
+                if resolved.status is requirement_sources.ResolutionStatus.AMBIGUOUS:
+                    raise RuntimeError(
+                        f'수동 후보의 base Requirement source가 모호합니다: {path} '
+                        f"({', '.join(resolved.candidates)})"
+                    )
+                if resolved.status is requirement_sources.ResolutionStatus.RESOLVED:
+                    source_texts.append((path, resolved.contents))
+                    continue
+                raise RuntimeError(f'수동 후보의 R 입력이 없습니다: {path}')
+            result=self.git(Path(self.repo),'show',f'{base}:{path}')
             source_texts.append((path,result.stdout))
         from loop_manager_internal.agents import common_guidance
         snapshot = DefinitionSnapshot(base,selected['path'],plan['title'],tuple(sources),

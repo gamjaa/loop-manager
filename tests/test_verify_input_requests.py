@@ -183,8 +183,10 @@ class VerifyInputRequestTest(unittest.TestCase):
         self.assertEqual(revision_document_or_none(git, Path('.'), SHA, manager_sources.SOURCE),
                          manager_sources.source_content(manager_sources.SOURCE))
         self.assertEqual(stored_requirement_sources([{'plan_id':'G-001', 'sources':json.dumps([manager_sources.SOURCE])}]), ())
-        effects = plan_validation.RevisionExecplanSourceFingerprintEffects(git=git,
-            _execplan_input_fingerprint=lambda entries: hashlib.sha256(repr(entries).encode()).hexdigest())
+        effects = plan_validation.RevisionExecplanSourceFingerprintEffects(
+            git=git, git_bytes=git,
+            _execplan_input_fingerprint=lambda entries: hashlib.sha256(repr(entries).encode()).hexdigest(),
+        )
         first = plan_validation._revision_execplan_source_fingerprint(effects, Path('.'), SHA,
             {'sources':json.dumps([manager_sources.SOURCE])})
         with mock.patch.object(manager_sources, 'RULE', 'Changed rule'):
@@ -202,6 +204,44 @@ class VerifyInputRequestTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             catalog.snapshot_from_documents({'docs/plans/[G-001] Inputs.md':text}, validate_sources=True,
                 allow_archive_fallback=False, available_regular_paths=frozenset({'docs/requirements/archive/Old.md'}))
+
+    def test_manual_definition_fingerprints_a_renamed_requirement(self):
+        from loop_manager_internal.agents import common_guidance
+        from loop_manager_internal.execution.manual_candidate import ManualCandidate
+        from loop_manager_internal.storage.manual_work_state import digest
+
+        source = "docs/requirements/[R-001] Original.md"
+        renamed = "docs/requirements/[R-001] Renamed.md"
+        contents = b"# [R-001] Renamed\n\nCurrent requirement.\n"
+        plan_path = "docs/plans/[G-003] Inputs.md"
+        plan = {"id": "G-003", "title": "Inputs", "sources": [source],
+                "depends_on": [], "complexity": "low", "risk": "medium",
+                "priority": "normal"}
+        documents = [{"path": plan_path, "text": "plan", "plan": plan}]
+        group = {"kind": "start", "documents": json.dumps(documents)}
+
+        def git(_repo, *args, **_kwargs):
+            if args == ("rev-parse", "HEAD"):
+                return SimpleNamespace(stdout=SHA, returncode=0)
+            raise AssertionError(args)
+
+        def git_bytes(_repo, command, *args):
+            if command == "ls-tree":
+                return f"100644 blob {'1' * 40}\t{renamed}\0".encode()
+            if command == "cat-file":
+                return contents
+            raise AssertionError((command, args))
+
+        candidate = ManualCandidate(self.connection, self.repo, "G-003", git, git_bytes)
+        context = SimpleNamespace(worktree=Path("/candidate"))
+        with mock.patch.object(candidate, "group", return_value=group), \
+             mock.patch.object(candidate, "documents", return_value=documents), \
+             mock.patch.object(common_guidance, "plan_content_hash", return_value="plan-guidance"), \
+             mock.patch.object(common_guidance, "worker_content_hash", return_value="worker-guidance"):
+            snapshot = candidate.definition(context, None, SHA)
+
+        self.assertEqual(snapshot.sources, (source,))
+        self.assertEqual(snapshot.source_fingerprint, digest([(source, contents.decode("utf-8"))]))
 
 
 class ManagerSourceCatalogGateTest(unittest.TestCase):

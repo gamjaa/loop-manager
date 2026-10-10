@@ -38,7 +38,9 @@ Requirement 제목·파일명이 바뀌어도 기존 sources 문자열을 유지
 
 - [x] eb797d3a에서 정확한 경로와 같은 파일명 archive fallback만 존재하고 retirement 연결은 sources 문자열의 경로 일치에 의존함을 확인했다. 고유 R ID rename 해석은 없다. 구현·테스트 실행 없음.
 - [x] 2026-10-10 `50c699c8f9c149cecb0ddf9b081527942d8e2289`의 G-230 내용 보존 archive 이동, 실제 식별 helper·공유 parser·배포·조회 테스트를 정적으로 대조했다. source 관계 통합은 여전히 남아 있으며 구현·테스트·verify를 실행하지 않았다.
-- [ ] resolver와 관련 소비자 통합·targeted unit 검증
+- [x] 2026-10-10 resolver와 관련 소비자를 통합하고 catalog·source fingerprint·retirement·planning relevance·stage documents·document draft·stable work reason targeted unit test를 실행했다. 실패한 assertion을 수정하고 같은 단위를 재실행해 통과했다. 전체 verify는 실행하지 않았다.
+- [x] 2026-10-10 rebase 후 verify에서 복사된 Manager runtime이 `.agents` 없는 상태로 import될 때 Requirement identity helper를 찾지 못하는 문제와 archive snapshot unit fixture의 pinned Requirement tree 누락을 수정했다. identity helper를 공유 catalog parser에 두고 Skill CLI에서 재사용하며, 관련 targeted unit test를 통과시켰다.
+- [x] 2026-10-10 Review 후 원격 draft 입력도 rename resolver로 계산해 worktree digest와 일치시키고 내용 변경 시 승인을 무효화했다. 신규 ExecPlan은 정확한 활성 source 경로만 허용하고, 수동 제출 source는 제출 revision에서 읽어 base의 관련 Requirement만 보류한다. 세 회귀 테스트와 관련 기존 targeted unit test를 통과시켰다.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log

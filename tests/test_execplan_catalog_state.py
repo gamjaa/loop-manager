@@ -510,16 +510,26 @@ class ArchivedDependencySelectionTest(unittest.TestCase):
         self._record_historical("G-001", confirmed=True)
         self._insert_plan("G-002", "READY")
         source = "docs/requirements/[R-001] Shared.md"
+        oid = "1" * 40
         catalog = {
             plan_id: {**archived_entry(plan_id, f"Plan {plan_id}").metadata(),
                       "sources": [source]}
             for plan_id in ("G-001", "G-002")
         }
+
+        def git_bytes(_repo, operation, *args):
+            if operation == "ls-tree":
+                return f"100644 blob {oid}\t{source}\0".encode()
+            if operation == "cat-file":
+                return b"# [R-001] Shared\n"
+            raise AssertionError((operation, args))
+
         with (
             mock.patch.object(loop_manager, "_revision_execplan_catalog", return_value=catalog),
             mock.patch.object(loop_manager, "_requirement_archive_tree", return_value={
                 source.encode(): (b"blob", b"oid"),
             }),
+            mock.patch.object(loop_manager, "git_bytes", side_effect=git_bytes),
         ):
             self.assertEqual(loop_manager.requirement_archive_snapshot(
                 self.connection, Path("/repo"), "/repo", "base", "G-002",

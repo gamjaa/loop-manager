@@ -9,6 +9,7 @@ import re
 import stat
 from pathlib import Path
 from typing import Callable, Mapping
+from loop_manager_internal.catalog import requirement_sources
 
 
 class ArchiveSnapshotError(ValueError):
@@ -161,6 +162,7 @@ def calculate(
     unverified_historical_ids: frozenset[str] = frozenset(),
     known_statuses: frozenset[str],
     cache_versions: Mapping[str, object] | None = None,
+    requirement_documents: Mapping[str, str | bytes] | None = None,
 ) -> ArchiveSnapshot:
     """Compute candidates from the validated file catalog and one state view.
 
@@ -212,11 +214,35 @@ def calculate(
 
     candidates = []
     related_status = []
+    resolved_sources: dict[tuple[str, str], str] = {}
+    if requirement_documents is not None:
+        for plan_id, plan in catalog.items():
+            for source in plan["sources"]:
+                if source in {"docs/PRODUCT.md", "manager:verify-inputs"}:
+                    continue
+                try:
+                    resolution = requirement_sources.resolve_requirement_source(
+                        source, requirement_documents, allow_archive=True,
+                    )
+                except requirement_sources.RequirementSourceLookupError as error:
+                    raise ArchiveSnapshotError(str(error)) from error
+                if resolution.status is requirement_sources.ResolutionStatus.AMBIGUOUS:
+                    raise ArchiveSnapshotError(
+                        f"ExecPlan source가 모호합니다: {source} ({', '.join(resolution.candidates)})"
+                    )
+                if resolution.status is requirement_sources.ResolutionStatus.MISSING:
+                    raise ArchiveSnapshotError(f"ExecPlan source가 없습니다: {source}")
+                assert resolution.path is not None
+                resolved_sources[(plan_id, source)] = resolution.path
     for source in sorted(active_requirements):
         related = tuple(
             (plan_id, states.get(plan_id, "UNVERIFIED"))
             for plan_id, plan in sorted(catalog.items())
-            if source in plan["sources"]
+            if any(
+                (resolved_sources.get((plan_id, str(plan_source)), str(plan_source)) == source)
+                for plan_source in plan["sources"]
+                if str(plan_source) not in {"docs/PRODUCT.md", "manager:verify-inputs"}
+            )
         )
         if not related:
             continue

@@ -140,6 +140,54 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         self.connection.close()
         self.temporary.cleanup()
 
+    def test_existing_plan_revision_accepts_old_requirement_source_after_rename(self):
+        original = "docs/requirements/[R-001] Original.md"
+        renamed = "docs/requirements/[R-001] Renamed.md"
+        (self.repo / "docs/requirements/R.md").unlink()
+        (self.repo / original).write_text(
+            "# [R-001] Original\n\n## Acceptance Criteria\n\n- Works\n",
+            encoding="utf-8", newline="\n",
+        )
+        plan_path = self.repo / self.paths["G-001"]
+        initial_plan = plan_text("G-001", "First").replace(
+            "  - docs/PRODUCT.md", f"  - {original}",
+        )
+        plan_path.write_text(initial_plan, encoding="utf-8", newline="\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "link plan to requirement")
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", self.base)
+        self.connection.execute("UPDATE projects SET active_sha=?", (self.base,))
+        self.connection.commit()
+        self.assertTrue(loop_manager.reconcile_execplan_catalog(
+            self.connection, self.repo, str(self.repo), "main",
+        ).usable)
+
+        (self.repo / original).rename(self.repo / renamed)
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-m", "rename requirement")
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", self.base)
+        self.connection.execute("UPDATE projects SET active_sha=?", (self.base,))
+        self.connection.commit()
+        self.assertTrue(loop_manager.reconcile_execplan_catalog(
+            self.connection, self.repo, str(self.repo), "main",
+        ).usable)
+
+        snapshot = loop_manager.mutable_ready_snapshot(
+            self.connection, str(self.repo), self.repo, self.base,
+        )
+        plan_path.write_text(
+            initial_plan.replace("- Keep the boundary explicit.", "- Preserve the source relation."),
+            encoding="utf-8", newline="\n",
+        )
+        result = loop_manager.validate_planner_result(
+            self.repo, self.base, loop_manager.changed_files(self.repo),
+            connection=self.connection, repo=str(self.repo), mutable_snapshot=snapshot,
+        )
+        self.assertEqual([revision.plan["id"] for revision in result.revisions], ["G-001"])
+        self.assertEqual(result.revisions[0].plan["sources"], [original])
+
     def _remote_deletion(self, *, dependent=True, started=False, new_plan=False, archive=False, target_text=None, new_plan_text=None):
         from loop_manager_internal.catalog import remote_deletions
         if dependent:

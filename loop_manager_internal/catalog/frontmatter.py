@@ -6,6 +6,21 @@ import re
 
 
 _KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_-]*\Z")
+_REQUIREMENT_ID = re.compile(r"R-([0-9]{3,})\Z")
+_REQUIREMENT_HEADING = re.compile(r"# \[(R-[0-9]{3,})\] (.+)")
+
+
+class RequirementIdError(ValueError):
+    """A Requirement document cannot provide an unambiguous source ID."""
+
+
+def _valid_requirement_id(value: object) -> str:
+    if not isinstance(value, str):
+        raise RequirementIdError("Requirement id가 없습니다")
+    match = _REQUIREMENT_ID.fullmatch(value)
+    if match is None or int(match.group(1)) == 0:
+        raise RequirementIdError(f"유효하지 않은 Requirement id입니다: {value}")
+    return value
 
 
 def parse_frontmatter(text: str) -> dict[str, object] | None:
@@ -50,3 +65,26 @@ def parse_frontmatter(text: str) -> dict[str, object] | None:
             values[key] = value
             current_list = None
     return values
+
+
+def requirement_identity(text: str) -> tuple[str, str]:
+    """Return a Requirement ID and title using frontmatter or its first heading."""
+    text = text.removeprefix("\ufeff")
+    try:
+        frontmatter = parse_frontmatter(text)
+    except RuntimeError as error:
+        raise RequirementIdError(str(error)) from error
+    if frontmatter is not None:
+        requirement_id = _valid_requirement_id(frontmatter.get("id"))
+        title = frontmatter.get("title")
+        if not isinstance(title, str) or not title.strip():
+            raise RequirementIdError("Requirement title이 없습니다")
+        return requirement_id, title
+
+    for line in text.splitlines():
+        if line.startswith("# "):
+            match = _REQUIREMENT_HEADING.fullmatch(line)
+            if match is None or not match.group(2).strip():
+                raise RequirementIdError("첫 제목은 `# [R-000] 제목` 형식이어야 합니다")
+            return _valid_requirement_id(match.group(1)), match.group(2).strip()
+    raise RequirementIdError("Requirement 첫 제목을 찾을 수 없습니다")

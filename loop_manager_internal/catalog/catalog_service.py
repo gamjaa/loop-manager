@@ -4,7 +4,7 @@ from collections.abc import Callable
 from dataclasses import dataclass, replace
 from enum import Enum
 from loop_manager_internal.application.contracts import PLAN_SHA_BACKFILL_ERROR
-from loop_manager_internal.catalog import execplan_catalog
+from loop_manager_internal.catalog import execplan_catalog, requirement_sources
 from loop_manager_internal.catalog import project_catalog_refresh
 from loop_manager_internal.git import command_adapter
 from loop_manager_internal.notifications import notifications
@@ -174,10 +174,23 @@ def revision_execplan_snapshot(
         documents[relative_path] = effects.git_bytes(
             repo, "cat-file", "blob", object_id.decode("ascii")
         )
+    from loop_manager_internal.catalog.requirement_sources import RequirementSourceLookupError
+    try:
+        requirement_documents = command_adapter.requirement_documents_from_tree(
+            tree,
+            lambda object_id: effects.git_bytes(
+                repo, "cat-file", "blob", object_id,
+            ),
+        )
+    except RequirementSourceLookupError as error:
+        raise execplan_catalog.ExecPlanCatalogError(
+            str(error), code="source-lookup-failed", path=error.path,
+        ) from error
     return execplan_catalog.snapshot_from_documents(
         documents,
         validate_sources=True,
         available_regular_paths=frozenset(regular_paths),
+        requirement_documents=requirement_documents,
         invalid_plan_entries=invalid_plan_entries,
         revision_sha=revision_sha,
         archive_conflict_plan_ids=archive_conflict_plan_ids,
@@ -328,15 +341,40 @@ class _GitCatalogDefinitionPort:
             except UnicodeDecodeError:
                 continue
         from loop_manager_internal.catalog import execplan_drafts
+        requirement_documents = command_adapter.requirement_documents_from_tree(
+            tree,
+            lambda object_id: self._effects.git_bytes(
+                self.repo, "cat-file", "blob", object_id,
+            ),
+        )
         decision_sources = set()
         for entry in snapshot.active.values():
             if entry.draft_metadata and (entry.draft_metadata.get("draft") or entry.draft_metadata.get("draft_question")):
                 decision_sources.update(entry.sources)
                 decision_sources.update(("docs/PRODUCT.md", "docs/ARCHITECTURE.md"))
         from loop_manager_internal.catalog.manager_sources import SOURCE, source_content
-        draft_inputs = {path: execplan_drafts.content_digest(source_content(path).encode()) if path == SOURCE else execplan_drafts.content_digest(self._effects.git_bytes(
-            self.repo, "show", f"{revision_sha}:{path}")) if path in regular_paths else None
-            for path in sorted(decision_sources)}
+        draft_inputs = {}
+        for path in sorted(decision_sources):
+            if path == SOURCE:
+                content = source_content(path).encode()
+            elif path.startswith("docs/requirements/") and path.count("/") == 2:
+                resolution = requirement_sources.resolve_requirement_source(
+                    path, requirement_documents, allow_archive=True,
+                )
+                content = (
+                    resolution.contents.encode("utf-8")
+                    if resolution.status is requirement_sources.ResolutionStatus.RESOLVED
+                    and resolution.contents is not None else None
+                )
+            elif path in regular_paths:
+                content = self._effects.git_bytes(
+                    self.repo, "show", f"{revision_sha}:{path}"
+                )
+            else:
+                content = None
+            draft_inputs[path] = (
+                execplan_drafts.content_digest(content) if content is not None else None
+            )
         remote_url = None
         if decision_sources:
             from loop_manager_internal.notifications.rendering import _checkpoint_link
@@ -601,6 +639,7 @@ def _parse_execplan(
     require_priority: bool = False,
     validate_sources: bool = True,
     allow_archive_fallback: bool = True,
+    allow_id_fallback: bool | None = None,
 ) -> dict[str, object]:
     return execplan_catalog.parse_execplan_file(
         worktree,
@@ -608,6 +647,7 @@ def _parse_execplan(
         require_priority=require_priority,
         validate_sources=validate_sources,
         allow_archive_fallback=allow_archive_fallback,
+        allow_id_fallback=allow_id_fallback,
     )
 
 

@@ -7,6 +7,7 @@ import re
 from pathlib import Path
 from typing import Mapping
 
+from loop_manager_internal.catalog import requirement_sources
 from loop_manager_internal.maintenance.maintenance_planning import markdown_sections
 
 
@@ -18,8 +19,32 @@ def content_digest(content: bytes) -> str:
 def input_digests(root: Path, plan: Mapping[str, object]) -> dict[str, str | None]:
     paths = set(plan["sources"]) | {"docs/PRODUCT.md", "docs/ARCHITECTURE.md"}
     from loop_manager_internal.catalog.manager_sources import SOURCE, source_content
-    return {path: content_digest(source_content(path).encode()) if path == SOURCE else content_digest((root / path).read_bytes()) if (root / path).is_file() else None
-            for path in sorted(paths)}
+    requirement_documents = (
+        requirement_sources.worktree_requirement_documents(root)
+        if any(path.startswith("docs/requirements/") and path.count("/") == 2
+               for path in paths)
+        else {}
+    )
+    result: dict[str, str | None] = {}
+    for path in sorted(paths):
+        if path == SOURCE:
+            result[path] = content_digest(source_content(path).encode())
+        elif path.startswith("docs/requirements/") and path.count("/") == 2:
+            resolved = requirement_sources.resolve_requirement_source(
+                path, requirement_documents, allow_archive=True,
+            )
+            if resolved.status is requirement_sources.ResolutionStatus.AMBIGUOUS:
+                raise RuntimeError(
+                    f"ExecPlan source가 모호합니다: {path} ({', '.join(resolved.candidates)})"
+                )
+            result[path] = (
+                content_digest(resolved.contents.encode("utf-8"))
+                if resolved.contents is not None else None
+            )
+        else:
+            file = root / path
+            result[path] = content_digest(file.read_bytes()) if file.is_file() else None
+    return result
 
 
 def fields(text: str) -> dict[str, str]:

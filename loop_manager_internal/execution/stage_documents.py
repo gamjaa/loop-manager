@@ -21,18 +21,57 @@ from loop_manager_internal.storage import runtime_state, verify_receipts
 from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
 from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, ExecutionOutcomeKind
 from loop_manager_internal.agents.agent_invocation import TrackedAgentCall, AttemptSequence, AgentResultKind
+from loop_manager_internal.catalog import requirement_sources
+from loop_manager_internal.git.command_adapter import revision_requirement_documents
 
 
-def related_paths(plan_path, sources, changed):
-    targets = {plan_path, "docs/PRODUCT.md", "docs/ARCHITECTURE.md", *sources}
+def related_paths(plan_path, sources, changed, *, requirement_documents=None):
+    targets = {plan_path, "docs/PRODUCT.md", "docs/ARCHITECTURE.md"}
+    for source in sources:
+        if (requirement_documents is None
+            or not source.startswith("docs/requirements/") or source.count("/") != 2):
+            targets.add(source)
+            continue
+        resolution = requirement_sources.resolve_requirement_source(
+            source, requirement_documents, allow_archive=True,
+        )
+        if resolution.status is requirement_sources.ResolutionStatus.AMBIGUOUS:
+            raise RuntimeError(
+                f"ExecPlan source가 모호합니다: {source} ({', '.join(resolution.candidates)})"
+            )
+        targets.add(resolution.path or source)
     return tuple(sorted(path for path in changed if path in targets))
+
+
+def _requirement_document_sets(git_bytes, repository, revisions, sources):
+    if git_bytes is None or not any(
+        source.startswith("docs/requirements/") and source.count("/") == 2
+        for source in sources
+    ):
+        return ()
+    return tuple(
+        revision_requirement_documents(git_bytes, repository, revision)
+        for revision in dict.fromkeys(revisions) if revision
+    )
+
+
+def _related_paths_across_revisions(plan_path, sources, changed, document_sets):
+    if not document_sets:
+        return related_paths(plan_path, sources, changed)
+    return tuple(sorted({
+        path for documents in document_sets
+        for path in related_paths(
+            plan_path, sources, changed, requirement_documents=documents,
+        )
+    }))
 
 
 def documentary(paths):
     return bool(paths) and all(path.startswith("docs/") and path.endswith(".md") for path in paths)
 
 
-def remember_work_branch(git, state, checkpoints, identity, context, remote, local, base, pull_request):
+def remember_work_branch(git, state, checkpoints, identity, context, remote, local, base, pull_request,
+                         *, git_bytes=None):
     """기존 채택 권한과 별도로 변경 관측 당시의 문서 단계만 보존한다."""
     row = state.row()
     current = checkpoints.get(identity.repo, context.plan.plan_id)
@@ -49,7 +88,12 @@ def remember_work_branch(git, state, checkpoints, identity, context, remote, loc
     if changed.returncode:
         raise RecoveryFailure(RecoveryReason.STATUS_FAILED, changed.stdout)
     paths = tuple(path for path in changed.stdout.split('\0') if path)
-    relevant = related_paths(previous.path, previous.sources, paths)
+    document_sets = _requirement_document_sets(
+        git_bytes, identity.repo_path, (base, remote), previous.sources,
+    )
+    relevant = _related_paths_across_revisions(
+        previous.path, previous.sources, paths, document_sets,
+    )
     if not relevant:
         return
     save(checkpoints, identity.repo, context.plan.plan_id, {
@@ -90,10 +134,15 @@ def save(checkpoints, repo, plan_id, value):
         snapshot={**(current.snapshot or {}), "document_revision": value})
 
 
-def restart_assessment(item, base, changed):
+def restart_assessment(item, base, changed, *, git_bytes=None, repository=None):
     """원격 경합에서 게시 후보는 보존하고 새 입력의 판단 권한을 분리한다."""
     previous = DefinitionSnapshot.deserialize(item['previous'])
-    paths = related_paths(previous.path, previous.sources, changed)
+    document_sets = _requirement_document_sets(
+        git_bytes, repository, (previous.revision_sha, base), previous.sources,
+    )
+    paths = _related_paths_across_revisions(
+        previous.path, previous.sources, changed, document_sets,
+    )
     return {**{key: value for key, value in item.items() if key not in {
                 'workspace', 'original', 'commit', 'candidate', 'assessment_complete', 'published_plan_text',
                 'planner_workspace', 'planner_generation', 'planner_scope', 'planner_scope_history', 'worker_snapshot'}},
@@ -145,6 +194,7 @@ class StageDocumentEffects:
     pr_for_branch: Callable
     log: Callable
     run_with_retries: Callable
+    git_bytes: Callable[..., bytes] | None = None
 
 
 def assert_assessment_inputs(effects, checkpoints, identity, context, item):
@@ -154,7 +204,10 @@ def assert_assessment_inputs(effects, checkpoints, identity, context, item):
             or (saved is not None and not _same_local_snapshot(GitSnapshot.deserialize(saved), current))
             or effects.git(identity.repo_path, 'rev-parse', f'origin/{identity.base}').stdout.strip() != item['base']):
         save(checkpoints, identity.repo, context.plan.plan_id,
-             restart_assessment(item, item['base'], item['paths']))
+             restart_assessment(
+                 item, item['base'], item['paths'], git_bytes=effects.git_bytes,
+                 repository=identity.repo_path,
+             ))
         raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '문서 판단의 구현 후보 또는 원격 입력이 변경됐습니다.')
 
 
@@ -183,7 +236,18 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
     repo, plan_id = identity.repo, context.plan.plan_id
     row = state.row()
     item = pending(checkpoints, repo, plan_id)
-    relevant = related_paths(definition.path, definition.sources, changed)
+    sources = tuple(dict.fromkeys((*(previous.sources if previous else ()), *definition.sources)))
+    document_sets = _requirement_document_sets(
+        effects.git_bytes, identity.repo_path,
+        (definition.revision_sha, previous.revision_sha if previous else None), sources,
+    )
+    relevant = tuple(sorted({
+        path
+        for plan in (previous, definition) if plan is not None
+        for path in _related_paths_across_revisions(
+            plan.path, plan.sources, changed, document_sets,
+        )
+    }))
     if item is None and (not relevant or previous is None or context.resolving_rebase):
         return None
     if row['pr_url'] or effects.pr_for_branch(identity.repo_path, context.branch) is not None:
@@ -217,7 +281,10 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
     if context.resolving_rebase:
         return None
     if item['base'] != definition.revision_sha and item['stage'] != 'prepared':
-        item = restart_assessment(item, definition.revision_sha, changed)
+        item = restart_assessment(
+            item, definition.revision_sha, changed, git_bytes=effects.git_bytes,
+            repository=identity.repo_path,
+        )
         save(checkpoints, repo, plan_id, item)
     if str(row["active_sha"] or "") != definition.revision_sha and item["stage"] != "prepared":
         return item
@@ -394,7 +461,10 @@ plan_text(전체 ExecPlan 문자열 또는 수정 불필요면 null), evidence(�
         if published.returncode:
             if remote != item["base"]:
                 delta = effects.git(identity.repo_path, 'diff', '--name-only', '-z', item['base'], remote).stdout.split('\0')
-                item = restart_assessment(item, remote, [path for path in delta if path])
+                item = restart_assessment(
+                    item, remote, [path for path in delta if path],
+                    git_bytes=effects.git_bytes, repository=identity.repo_path,
+                )
                 save(checkpoints, repo, plan_id, item)
                 return item
             effects.assert_snapshot(state.connection, snapshot)
@@ -411,7 +481,10 @@ plan_text(전체 ExecPlan 문자열 또는 수정 불필요면 null), evidence(�
         remote = effects.git(identity.repo_path, 'rev-parse', f'origin/{identity.base}').stdout.strip()
         if remote != item['commit']:
             delta = effects.git(identity.repo_path, 'diff', '--name-only', '-z', item['commit'], remote).stdout.split('\0')
-            item = restart_assessment(item, remote, [path for path in delta if path])
+            item = restart_assessment(
+                item, remote, [path for path in delta if path],
+                git_bytes=effects.git_bytes, repository=identity.repo_path,
+            )
             save(checkpoints, repo, plan_id, item)
             return item
         remember_workspace_metadata(effects, state, checkpoints, identity, context, workspace, published=True)
