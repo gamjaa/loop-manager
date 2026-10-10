@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 from contextlib import closing
 from tests.support.scope import AgentScopeFixture
 import sqlite3
@@ -13,6 +14,7 @@ from tests.support.git import git_command, make_remote_repository, commit_and_pu
 from tests.support.worker import dummy_worker_sessions
 
 
+@isolated_git_test
 class ScopeInterruptedAgentsTest(AgentScopeFixture, unittest.TestCase):
     def test_self_hosted_runtime_preserves_interrupted_worker_and_reviewer_identity(self):
         for role in ("worker", "reviewer"):

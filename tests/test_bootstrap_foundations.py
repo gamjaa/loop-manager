@@ -1,4 +1,5 @@
 """Unit tests for bootstrap effects, ownership evidence and lock handoff."""
+from tests.support.git import isolated_git_test
 from dataclasses import replace
 import importlib.util
 import os
@@ -27,6 +28,7 @@ def runtime_service(root, **overrides):
                                       runtime_root=root, interpreter='/chosen/python')
 
 
+@isolated_git_test
 class BootstrapFoundationTests(unittest.TestCase):
     def test_runtime_bytecode_cache_prefix_separates_source_revision_and_interpreter(self):
         with tempfile.TemporaryDirectory() as directory:

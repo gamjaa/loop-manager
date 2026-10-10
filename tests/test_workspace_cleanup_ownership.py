@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 from tests.support.workspace import WorkspaceFixture
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ from tests.support.git import git_command
 from tests.support.worker import dummy_worker_sessions
 
 
+@isolated_git_test
 class WorkspaceCleanupOwnershipTest(WorkspaceFixture, unittest.TestCase):
 
     @dummy_worker_sessions

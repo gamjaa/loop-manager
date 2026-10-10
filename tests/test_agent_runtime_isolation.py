@@ -1,5 +1,6 @@
 """Read-only Agent invocation from the detached Manager runtime."""
 
+from tests.support.git import isolated_git_test
 import sqlite3
 from pathlib import Path
 import tempfile
@@ -16,6 +17,7 @@ from loop_manager_internal.agents import provider_guidance
 
 
 @skipUnless(isolation.platform.system() == 'Linux', 'native tool policy probe requires Linux')
+@isolated_git_test
 class RuntimeReadOnlyIsolationTests(TestCase):
     def fixture(self, root):
         boundary, state_root, home = native_agent_boundary(root)

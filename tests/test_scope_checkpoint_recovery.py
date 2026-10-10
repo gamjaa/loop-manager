@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 from tests.support.scope import AgentScopeFixture
 import sqlite3
 import tempfile
@@ -11,6 +12,7 @@ from tests.support.worker import isolated_scope_resources
 from tests.support.worker import dummy_worker_sessions
 
 
+@isolated_git_test
 class ScopeCheckpointRecoveryTest(AgentScopeFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_blocked_checkpoint_allows_manager_cleanup_and_later_resume(self):

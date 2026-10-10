@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 from contextlib import closing
 import contextlib
 from dataclasses import replace
@@ -23,6 +24,7 @@ from tests.support.origin import (
 from loop_manager_internal.runtime import bootstrap
 
 
+@isolated_git_test
 class BootstrapEntryTests(unittest.TestCase):
     def test_remote_child_handoff_preserves_source_config_interpreter_arguments_and_real_lock(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -411,6 +411,7 @@ Loop Manager runtime에서만 읽는 `docs/AGENTS.*.md`와 저장소 밖 Manager
 - 자체 verify의 `verify_parallelism`은 생략 시 `auto`, 양의 정수는 상한, `1`은 직렬이다. 실행량은 코드가 CPU 제한·실제 부하·메모리 여유와 미반영 예약으로 결정하며 등록 프로젝트 수로 고정 분할하지 않는다. 관측 실패는 직렬로 축소하고 자원 대기도 전체 timeout에 포함한다.
 - Manager 실행 인스턴스가 동시 verify의 확인·예약을 조율한다. 예약은 해당 자식 종료 또는 미시작을 확인한 뒤 해제하며 종료 불명은 보존한다. 기존 프로젝트 선택과 같은 프로젝트의 ExecPlan 동시 실행 정책은 유지한다. 과거 시간 자료는 현재 후보 검증을 대신하지 않는다.
 - 최종 후보에서 관련 targeted test와 전체 verify가 통과하고 Reviewer blocking issue가 없어야 한다.
+- 자체 테스트의 Git 관측·정책 조건은 mock을 기본으로 제공하고 실제 판단·저장을 검사한다. snapshot/index/worktree·OS 효과와 부모/자식 연결처럼 실제 실행이 필요한 계약은 통합 회귀로 유지하며, skip·timeout 확대·수집 축소로 검증 비용을 줄이지 않는다. 실제 Git fixture는 사용자 설정·template과 격리하고 필요한 설정만 테스트 입력으로 제공한다.
 - Manager가 먼저 안전한 rebase를 시도한다. 충돌 없이 완료되고 source 내용까지 포함한 구현 입력과 완료 Worker 결과가 같으면 SHA 변경만으로 Worker·완료한 targeted test를 반복하지 않는다. 현재 HEAD의 Worker 후보 확인 불일치나 별도 교정 사유, 충돌·미완료·과거 근거 부재는 기존 Worker/session 경로를 유지한다.
 - rebase 충돌 중 Progress 체크 상태와 명확한 기존 실행 결과만 바뀌고 구현 조건의 동일성이 증명되면 session·작업물·index·rebase 상태·retry·실패 감사를 보존해 해결을 이어간다. 절 이름만으로 목표·제약·검증 조건·사용자 결정을 제외하지 않으며 불확실한 기록이나 과거 원문 근거 부재는 기존 재확인·차단을 유지한다. 이 구분은 verify·Review 입력을 제외하지 않는다.
 - 같은 프로젝트·ExecPlan·작업 주기의 실제 전체 verify 성공과 파일 bytes·경로·종류·mode·목록·명령·환경·runtime·실제 Git/외부 입력의 지문이 같고 현재 후보에서 다시 확인되면 원래 run을 연결해 verify를 재사용한다. 목록 부재·오류·누락 의심, dirty/untracked 입력 변경, 미확인 동적·외부 입력과 유효한 성공 부재는 전체 verify를 실행한다. 일반 스크립트의 입력을 명령 문자열만으로 증명하지 않는다.

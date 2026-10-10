@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 from tests.support.scope import AgentScopeFixture
 from tests.support.blocked_remote import ProjectBlockedRemoteFixture
 from loop_manager_internal.recovery import scoped_blocking
@@ -16,6 +17,7 @@ from tests.support.catalog import write_execplan
 from tests.support.git import git_command, commit_and_push
 
 
+@isolated_git_test
 class ScopeProjectRecoveryTest(AgentScopeFixture, unittest.TestCase):
     def test_default_worktree_project_block_releases_without_source_revert(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -252,6 +254,7 @@ class ScopeProjectRecoveryTest(AgentScopeFixture, unittest.TestCase):
                     self.assertEqual(current["id"], "G-001")
 
 
+@isolated_git_test
 class ProjectRecoveryTransitionUnitTests(ProjectBlockedRemoteFixture, unittest.TestCase):
     def test_rebase_scope_project_release_advances_checkpoint_generation(self):
         self.connection.execute(

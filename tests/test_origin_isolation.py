@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 import contextlib
 from dataclasses import replace
 import hashlib
@@ -22,6 +23,7 @@ from tests.support.origin import (
 from loop_manager_internal.runtime import bootstrap
 
 
+@isolated_git_test
 class OriginIsolationScopeTest(OriginScopeFixture, unittest.TestCase):
     def test_project_fetch_recovers_owned_ref_update_after_result_write_crash(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -453,6 +455,7 @@ class OriginIsolationScopeTest(OriginScopeFixture, unittest.TestCase):
 
 
 
+@isolated_git_test
 class TaskRelevantInvocationScopeTests(unittest.TestCase):
     def setUp(self):
         directory = tempfile.TemporaryDirectory()
@@ -621,6 +624,7 @@ class TaskRelevantInvocationScopeTests(unittest.TestCase):
 
 
 
+@isolated_git_test
 class ManagerBaselineReconciliationUnitTests(unittest.TestCase):
     """Exercise durable fetch evidence and snapshot projection with fake Git."""
     def setUp(self):

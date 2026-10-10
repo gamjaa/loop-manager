@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 from tests.support.workspace import CleanupFixture
 import sqlite3
 import subprocess
@@ -9,6 +10,7 @@ import loop_manager
 from tests.support.git import git_command, make_remote_repository
 
 
+@isolated_git_test
 class WorktreeCleanupTest(CleanupFixture, unittest.TestCase):
 
     def test_commit_added_after_assessment_preserves_worktree(self):
@@ -27,13 +29,22 @@ class WorktreeCleanupTest(CleanupFixture, unittest.TestCase):
 
     def test_unverifiable_pr_head_after_assessment_preserves_worktree(self):
         with tempfile.TemporaryDirectory() as directory:
-            repo, worktree, _branch, pr_head = self._managed_worktree(Path(directory))
-            assessment = loop_manager.assess_cleanup(worktree, pr_head)
+            worktree = Path(directory)
+            marker = worktree / 'keep.txt'
+            marker.write_bytes(b'keep')
+            assessment = loop_manager.CleanupAssessment('safe', pr_head_oid='a' * 40,
+                                                        observation=('a' * 40, 'branch', ()))
             with mock.patch.object(loop_manager, "assess_cleanup", return_value=
-                                   loop_manager.CleanupAssessment("unverifiable", "PR head unavailable")):
+                loop_manager.CleanupAssessment("unverifiable", "PR head unavailable")) as observe, mock.patch(
+                'subprocess.Popen', side_effect=AssertionError('예상 밖 process 실행')
+            ) as process:
+                repo = worktree / 'repo'
                 result = loop_manager.remove_cleanup_worktree(repo, worktree, assessment)
+                observe.assert_called_once_with(worktree, 'a' * 40)
+                process.assert_not_called()
             self.assertEqual(result.status, "unverifiable")
             self.assertTrue(worktree.exists())
+            self.assertEqual(marker.read_bytes(), b'keep')
 
     def test_changed_clean_head_after_assessment_preserves_worktree(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -275,28 +286,26 @@ class WorktreeCleanupTest(CleanupFixture, unittest.TestCase):
             self.assertEqual(loop_manager.assess_cleanup(worktree, pr_head).status, "safe")
 
     def test_dirty_reasons_cover_tracked_staged_and_untracked_changes(self):
-        changes = {
-            "tracked 파일 수정": lambda worktree: (
-                worktree / "src/app.py"
-            ).write_text("VALUE = 3\n", encoding="utf-8"),
-            "staged 변경": lambda worktree: (
-                (worktree / "src/app.py").write_text("VALUE = 3\n", encoding="utf-8"),
-                git_command(worktree, "add", "src/app.py"),
-            ),
-            "untracked 파일": lambda worktree: (
-                worktree / "untracked.txt"
-            ).write_text("keep\n", encoding="utf-8"),
-        }
-        for expected_reason, change in changes.items():
+        changes = {'tracked 파일 수정': ' M src/app.py\n',
+                   'staged 변경': 'M  src/app.py\n',
+                   'untracked 파일': '?? untracked.txt\n'}
+        for expected_reason, output in changes.items():
             with self.subTest(reason=expected_reason), tempfile.TemporaryDirectory() as directory:
-                repo, worktree, _branch, pr_head = self._managed_worktree(Path(directory))
-                change(worktree)
-
-                assessment = loop_manager.assess_cleanup(worktree, pr_head)
+                worktree = Path(directory)
+                marker = worktree / 'keep.txt'
+                marker.write_bytes(b'keep')
+                with mock.patch.object(loop_manager, 'git', return_value=
+                    subprocess.CompletedProcess([], 0, output)) as git, mock.patch(
+                    'subprocess.Popen', side_effect=AssertionError('예상 밖 process 실행')
+                ) as process:
+                    assessment = loop_manager.assess_cleanup(worktree, 'a' * 40)
+                    git.assert_called_once_with(worktree, 'status', '--porcelain=v1', '--untracked-files=all')
+                    process.assert_not_called()
 
                 self.assertEqual(assessment.status, "dirty")
                 self.assertIn(expected_reason, assessment.reason)
                 self.assertTrue(worktree.exists())
+                self.assertEqual(marker.read_bytes(), b'keep')
 
     def test_local_only_and_unverifiable_commits_are_preserved(self):
         with tempfile.TemporaryDirectory() as directory:

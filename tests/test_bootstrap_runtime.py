@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 import contextlib
 from dataclasses import replace
 import hashlib
@@ -22,6 +23,7 @@ from tests.support.origin import (
 from loop_manager_internal.runtime import bootstrap
 
 
+@isolated_git_test
 class BootstrapRuntimeTests(OriginScopeFixture, unittest.TestCase):
     def test_runtime_imports_local_module_without_bytecode_and_is_removed(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -394,6 +396,7 @@ class BootstrapRuntimeTests(OriginScopeFixture, unittest.TestCase):
             )
 
 
+@isolated_git_test
 class BootstrapSavedScopeResumeTests(unittest.TestCase):
     # Real Git and child CLI are the contract here: imported runtime B, saved
     # Agent scopes, and later base C must stay connected across process restart.

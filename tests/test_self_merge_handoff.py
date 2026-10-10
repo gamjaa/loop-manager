@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 from tests.support.pr_recovery import PrRecoveryFixture
 import tempfile
 import threading
@@ -13,6 +14,7 @@ from tests.support.git import git_command
 from tests.support.worker import dummy_worker_sessions
 
 
+@isolated_git_test
 class SelfMergeHandoffTest(PrRecoveryFixture, unittest.TestCase):
     def test_local_sync_status_never_gates_verified_self_merge_handoff(self):
         project = RegisteredProject('/source', 'develop', 'codex', None, False)

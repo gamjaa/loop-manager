@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 from contextlib import closing
 import io
 import hashlib
@@ -18,6 +19,7 @@ from loop_manager_internal.config.managed_config import ManagedConfig, ManagedCo
 from loop_manager_internal.runtime import project_registry
 
 
+@isolated_git_test
 class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
     def test_copy_tools_do_not_handle_cli_guidance(self):
         for script in ('scripts/copy-project-files.sh', 'scripts/copy-project-files.ps1'):

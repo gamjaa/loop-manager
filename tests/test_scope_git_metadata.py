@@ -1,3 +1,4 @@
+from tests.support.git import isolated_git_test
 from tests.support.scope import AgentScopeFixture
 import sqlite3
 import tempfile
@@ -10,6 +11,7 @@ from tests.support.worker import isolated_scope_resources
 from tests.support.worker import dummy_worker_sessions
 
 
+@isolated_git_test
 class ScopeGitMetadataTest(AgentScopeFixture, unittest.TestCase):
 
     def test_agent_commit_and_branch_switch_are_rejected(self):

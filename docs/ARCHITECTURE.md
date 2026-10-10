@@ -463,6 +463,8 @@ verify 지문 이력, Review 지문·level 승격 이력과 실행별 Worker 교
 
 mock은 기존 Git adapter나 관측 경계에 적용하고 `ExecutionFixture`·`CurrentRebaseFixture`·관측값 생성 도구를 재사용한다. SQLite·파일 보존이 검증 대상이면 실제 저장을 유지한다. 정상·오류·중단과 연속 관측 사이의 HEAD·원격 OID 변화를 재현하며, 검증할 판정 함수나 상태 전이를 성공값으로 대체하지 않는다. 전환 시 기존 검증 조건·assertion의 대응과 필수 통합 회귀를 보존하고, 테스트 skip·timeout 확대·수집 범위 축소로 비용 감소를 대신하지 않는다.
 
+실제 Git fixture의 `tests/support/git.py`는 최초 bare/seed init과 후속 명령에 global/system 설정 및 template을 격리한 환경을 전달한다. `XDG_CONFIG_HOME`도 통제 template 경로로 지정해 기본 전역 ignore·attributes를 제외하고 `GIT_ATTR_NOSYSTEM=1`로 system attributes를 차단한다. 실제 adapter·Python 자식까지 실행하는 테스트는 `isolated_git_test`로 setUp부터 cleanup까지 같은 환경을 상속하며 예외 후 호출자 환경을 복원한다. 저장소별 local 설정은 보존하고 상속 검사는 `git_command`의 명시적 `env`에 통제된 설정 파일을 제공한다. 기본 template은 테스트용 `info/exclude`와 실행 hook이 없는 hooks 디렉터리를 제공한다. G-222·G-223 소비 경계의 전환 완료는 이 공통 경계 제공만으로 선언하지 않는다.
+
 bootstrap 회귀의 부모·자식 CLI 계측은 실제 PID·시각과 테스트 이름을 보존해 전체 verify 기록에 포함한다. 부모 CLI 시간은 자식 실행을 포함하므로 둘을 합산해 전체 실행 시간으로 보고하지 않는다. 비용 개선은 같은 기준 코드·계측·병렬도와 테스트 수집 범위의 전후 실행을 비교하며, 준비·Git·snapshot 누적 시간과 전체 경과 시간을 구분한다.
 
 새 테스트나 시나리오 확장 전에는 기존 테스트가 확인하는 계약과 assertion을 먼저 확인한다. 실제 Git·CLI 실행을 추가할 때는 검증할 효과와 기존 mock 또는 통합 회귀로 충족되지 않는 이유를 테스트에 남긴다. 역할·브랜치·오류를 조합할 때는 각 조건이 실제 연결에 영향을 주는지 구분한다. 공통 등록 중단·runtime 재사용·외부 명령 오류 처리를 모든 역할의 전체 실행에 끼워 넣지 않는다. 조건별 판단·저장 결과는 mock으로 검사하고, 조건의 상호작용 때문에 실제 연결이 필요한 사례는 유지한다. bootstrap의 서로 다른 역할별 저장 상태와 실제 자식 dispatch는 실제 프로세스 회귀로 확인한다.
