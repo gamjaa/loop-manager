@@ -1716,7 +1716,7 @@ class ManualOwnershipPlanningTest(unittest.TestCase):
 
         self.assertEqual([plan.plan_id for plan in snapshot.plans], ["G-002"])
 
-    def test_unrelated_malformed_group_does_not_block_snapshot_or_publication(self):
+    def test_related_malformed_group_skips_only_affected_plan(self):
         from types import SimpleNamespace
         from loop_manager_internal.maintenance.maintenance_planning import PlanRevision
         from loop_manager_internal.storage import work_claims
@@ -1724,14 +1724,14 @@ class ManualOwnershipPlanningTest(unittest.TestCase):
 
         store = ManualWorkRepository(self.connection)
         group = store.create(
-            self.repo, "submit", "unrelated-submit", (), self.base, self.base,
-            members=("G-099",),
+            self.repo, "submit", "malformed-submit", (), self.base, self.base,
+            members=("G-001",),
         )
         store.update(group, state="MANUAL_PENDING", owner_id="G-999")
 
         snapshot = self.mutable_snapshot()
 
-        self.assertEqual([plan.plan_id for plan in snapshot.plans], ["G-001", "G-002"])
+        self.assertEqual([plan.plan_id for plan in snapshot.plans], ["G-002"])
         result = SimpleNamespace(
             publication_paths=(), plans=(),
             revisions=(PlanRevision(snapshot.plans[0].path, {}, snapshot.plans[0]),),

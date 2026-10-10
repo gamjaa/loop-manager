@@ -16,7 +16,7 @@ from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot
 from loop_manager_internal.planning.planning_catalog import PlanDeletion
 from loop_manager_internal.planning.planning_catalog import PlannerValidationError
 from loop_manager_internal.runtime.contracts import GitLockError
-from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.storage import maintenance_state, runtime_state
 from loop_manager_internal.storage.planning_publication_state import _MUTABLE_READY_EVIDENCE_FIELDS
 from pathlib import Path
 import base64
@@ -1520,9 +1520,13 @@ def mutable_ready_snapshot(
         if str(row["plan_id"]) in recovery and not (worktree / str(row["path"])).is_file():
             continue
         from loop_manager_internal.storage import work_claims
-        manual_state, manual_owned = work_claims.manual_plan_ownership(
-            connection, repo, str(row['plan_id']), row
-        )
+        try:
+            manual_state, manual_owned = work_claims.manual_plan_ownership(
+                connection, repo, str(row['plan_id']), row
+            )
+        except runtime_state.RuntimeStateError:
+            # Incomplete related ownership evidence protects this plan alone.
+            continue
         if manual_owned:
             continue
         if row["branch"]:
