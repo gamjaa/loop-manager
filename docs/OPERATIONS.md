@@ -31,6 +31,13 @@ Windows Codex는 기존 `CODEX_HOME`의 인증·session 저장소를 사용한�
 
 Fast 선택은 한 번 실행을 시작할 때 읽어 신규·재개·재시도 호출에 고정한다. 설정 변경은 다음 Manager 실행에 반영하고 session·작업물·Worker level은 Fast 선택만으로 초기화하지 않는다. 호출 로그의 `loop_manager.fast_mode` 기록에서 요청값 `true`·`false`·`null`(CLI 기본 설정 상속)을 확인한다. 이 값은 실제 Fast 적용 성공을 뜻하지 않는다. CLI 진단·실패는 기존 처리 규칙을 따르며 모델별 사전 판정이나 CLI 버그 우회를 추가하지 않는다.
 
+명시적 Fast 선택의 CLI 전달 구문은 다음과 같다. Manager는 기존 모델·Effort·지침·권한·sandbox 인자를 보존한 채 이 설정을 합친다. 공란·생략이면 아래 Fast override를 전달하지 않는다.
+
+| provider | on | off |
+|---|---|---|
+| Codex | `-c 'service_tier="fast"' -c 'features.fast_mode=true'` | `-c 'service_tier="default"' -c 'features.fast_mode=false'` |
+| Claude | 기존 `--settings` JSON에 `"fastMode": true` 추가 | 기존 `--settings` JSON에 `"fastMode": false` 추가 |
+
 실제 config는 commit하지 않고 현재 사용자만 읽을 수 있도록 관리한다. 별도 경로는 전역 옵션으로 지정한다.
 
 ```sh
