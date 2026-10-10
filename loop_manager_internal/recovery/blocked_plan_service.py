@@ -448,19 +448,6 @@ def resume_blocked_execplan_if_inputs_changed(
     )
     if interrupted is not None:
         return interrupted
-    try:
-        effects.validate_blocked_agent_scope(
-            connection,
-            repo_path,
-            repo,
-            base,
-            worktree,
-            str(plan["path"]),
-        )
-    except (AgentScopeError, RuntimeError) as error:
-        message = f"BLOCKED Agent 범위 재검증 실패:\n{error}"
-        effects._update_blocked_error(connection, repo, str(plan["plan_id"]), message)
-        return False
     current_worktree_fingerprint = (
         effects._worktree_execplan_input_fingerprint(worktree, plan)
         if worktree.is_dir()
@@ -472,6 +459,32 @@ def resume_blocked_execplan_if_inputs_changed(
         and current_worktree_fingerprint != blocked_worktree_fingerprint
     )
     if not worktree_changed and not remote_input_changed:
+        try:
+            effects.validate_blocked_agent_scope(
+                connection,
+                repo_path,
+                repo,
+                base,
+                worktree,
+                str(plan["path"]),
+            )
+        except (AgentScopeError, RuntimeError) as error:
+            message = f"BLOCKED Agent 범위 재검증 실패:\n{error}"
+            effects._update_blocked_error(connection, repo, str(plan["plan_id"]), message)
+        return False
+    try:
+        effects.validate_blocked_agent_scope(
+            connection,
+            repo_path,
+            repo,
+            base,
+            worktree,
+            str(plan["path"]),
+            changed_candidate=True,
+        )
+    except (AgentScopeError, RuntimeError) as error:
+        message = f"BLOCKED Agent 범위 재검증 실패:\n{error}"
+        effects._update_blocked_error(connection, repo, str(plan["plan_id"]), message)
         return False
     owned_oid = None
     checkpoint_row = connection.execute(

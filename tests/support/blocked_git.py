@@ -129,6 +129,12 @@ class BlockedGitFixture:
         )
         normalizer.start()
         self.addCleanup(normalizer.stop)
+        adapter_normalizer = mock.patch(
+            "loop_manager_internal.git.git_adapter.github_repository",
+            side_effect=lambda url: "example/project" if url == str(self.remote) else normalize(url),
+        )
+        adapter_normalizer.start()
+        self.addCleanup(adapter_normalizer.stop)
         self.connection.execute("UPDATE projects SET origin = 'example/project'")
         self.connection.commit()
 

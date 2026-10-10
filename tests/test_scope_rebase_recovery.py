@@ -19,6 +19,16 @@ from tests.support.worker import dummy_worker_sessions
 class ScopeRebaseRecoveryTest(AgentScopeFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_agent_commit_isolated_automatically_after_blocked_input_change(self):
+        origin_parser = mock.patch(
+            "loop_manager_internal.git.git_adapter.github_repository",
+            return_value="owner/repo",
+        )
+        origin_parser.start()
+        self.addCleanup(origin_parser.stop)
+        manager_origin_parser = mock.patch.object(
+            loop_manager, "github_repository", return_value="owner/repo")
+        manager_origin_parser.start()
+        self.addCleanup(manager_origin_parser.stop)
         isolation = mock.patch.object(loop_manager, '_agent_git_resources', side_effect=isolated_scope_resources)
         isolation.start()
         self.addCleanup(isolation.stop)
@@ -38,7 +48,7 @@ class ScopeRebaseRecoveryTest(AgentScopeFixture, unittest.TestCase):
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
             connection.execute(
-                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                "INSERT INTO projects (repo, base_branch, origin) VALUES (?, 'main', 'owner/repo')",
                 (str(repo),),
             )
             loop_manager.register_execplans(
@@ -205,14 +215,21 @@ class ScopeRebaseRecoveryTest(AgentScopeFixture, unittest.TestCase):
                 "loop_manager.run_codex",
                 side_effect=stop_after_isolation,
             ) as resumed_agent:
-                result = loop_manager.run_project(
-                    connection,
-                    state_dir,
-                    str(repo),
-                    Path("unused.ini"),
-                    "main",
-                    False,
-                )
+                # The merged input can advance the remote again while the
+                # blocked candidate is being observed; let the Manager take
+                # one safe re-observation before resuming the Worker.
+                result = 0
+                for _ in range(2):
+                    result = loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    )
+                    if result:
+                        break
 
             project = connection.execute(
                 "SELECT phase, last_error, agent_snapshot, agent_recovery "
@@ -270,6 +287,16 @@ class ScopeRebaseRecoveryTest(AgentScopeFixture, unittest.TestCase):
 
     @dummy_worker_sessions
     def test_blocked_scope_resume_rebases_non_source_remote_and_direct_execplan_edit(self):
+        origin_parser = mock.patch(
+            "loop_manager_internal.git.git_adapter.github_repository",
+            return_value="owner/repo",
+        )
+        origin_parser.start()
+        self.addCleanup(origin_parser.stop)
+        manager_origin_parser = mock.patch.object(
+            loop_manager, "github_repository", return_value="owner/repo")
+        manager_origin_parser.start()
+        self.addCleanup(manager_origin_parser.stop)
         isolation = mock.patch.object(loop_manager, '_agent_git_resources', side_effect=isolated_scope_resources)
         isolation.start()
         self.addCleanup(isolation.stop)
@@ -289,7 +316,7 @@ class ScopeRebaseRecoveryTest(AgentScopeFixture, unittest.TestCase):
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
             connection.execute(
-                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                "INSERT INTO projects (repo, base_branch, origin) VALUES (?, 'main', 'owner/repo')",
                 (str(repo),),
             )
             loop_manager.register_execplans(
@@ -433,15 +460,22 @@ class ScopeRebaseRecoveryTest(AgentScopeFixture, unittest.TestCase):
             ), mock.patch(
                 "loop_manager.os.replace",
                 side_effect=KeyboardInterrupt,
-            ), self.assertRaises(KeyboardInterrupt):
-                loop_manager.run_project(
-                    connection,
-                    state_dir,
-                    str(repo),
-                    Path("unused.ini"),
-                    "main",
-                    False,
-                )
+            ):
+                interrupted = False
+                for _ in range(2):
+                    try:
+                        loop_manager.run_project(
+                            connection,
+                            state_dir,
+                            str(repo),
+                            Path("unused.ini"),
+                            "main",
+                            False,
+                        )
+                    except KeyboardInterrupt:
+                        interrupted = True
+                        break
+                self.assertTrue(interrupted)
 
             interrupted = connection.execute(
                 "SELECT phase, agent_recovery FROM projects WHERE repo = ?",

@@ -16,6 +16,16 @@ from tests.support.worker import dummy_worker_sessions
 class ScopeCheckpointRecoveryTest(AgentScopeFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_blocked_checkpoint_allows_manager_cleanup_and_later_resume(self):
+        origin_parser = mock.patch(
+            "loop_manager_internal.git.git_adapter.github_repository",
+            return_value="owner/repo",
+        )
+        origin_parser.start()
+        self.addCleanup(origin_parser.stop)
+        manager_origin_parser = mock.patch.object(
+            loop_manager, "github_repository", return_value="owner/repo")
+        manager_origin_parser.start()
+        self.addCleanup(manager_origin_parser.stop)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             repo, plan_path = self._repository_with_plan(directory)
@@ -43,7 +53,7 @@ class ScopeCheckpointRecoveryTest(AgentScopeFixture, unittest.TestCase):
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
             connection.execute(
-                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                "INSERT INTO projects (repo, base_branch, origin) VALUES (?, 'main', 'owner/repo')",
                 (str(repo),),
             )
             loop_manager.register_execplans(
@@ -158,7 +168,8 @@ class ScopeCheckpointRecoveryTest(AgentScopeFixture, unittest.TestCase):
             self.assertEqual(blocked_run, 0)
             self.assertIsNone(blocked_project["phase"])
             self.assertEqual(blocked_plan["status"], "PLAN_BLOCKED")
-            self.assertEqual(blocked_plan["last_error"], "scope blocked")
+            self.assertIn(
+                "reviewer.txt (untracked, worktree)", blocked_plan["last_error"])
             self.assertIsNotNone(blocked_plan["agent_snapshot"])
             self.assertFalse(cleanup_worktree.exists())
             self.assertEqual(
@@ -183,6 +194,13 @@ class ScopeCheckpointRecoveryTest(AgentScopeFixture, unittest.TestCase):
                         str(repo),
                     ),
                 )
+            def stop_after_resume(_worktree, _state, _config, role_name, _prompt, **_kwargs):
+                if role_name == "planner":
+                    return loop_manager.CodexResult(0, "", "planner-session")
+                return loop_manager.CodexResult(
+                    1, "stop after cleanup recovery", "worker-session"
+                )
+
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
             ), mock.patch(
@@ -192,22 +210,20 @@ class ScopeCheckpointRecoveryTest(AgentScopeFixture, unittest.TestCase):
             ), mock.patch(
                 "loop_manager.pr_for_branch", return_value=None
             ), mock.patch(
-                "loop_manager.run_codex",
-                side_effect=[
-                    loop_manager.CodexResult(0, "", "planner-session"),
-                    loop_manager.CodexResult(
-                        1, "stop after cleanup recovery", "worker-session"
-                    ),
-                ],
+                "loop_manager.run_codex", side_effect=stop_after_resume,
             ) as resumed_agent:
-                resumed_run = loop_manager.run_project(
-                    connection,
-                    state_dir,
-                    str(repo),
-                    Path("unused.ini"),
-                    "main",
-                    False,
-                )
+                resumed_run = 0
+                for _ in range(2):
+                    resumed_run = loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    )
+                    if resumed_run:
+                        break
 
             resumed_project = connection.execute(
                 "SELECT phase, last_error, agent_snapshot, agent_manager_snapshot "
@@ -219,7 +235,10 @@ class ScopeCheckpointRecoveryTest(AgentScopeFixture, unittest.TestCase):
                 "FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
                 (str(repo),),
             ).fetchone()
-            self.assertEqual(resumed_run, 1)
+            self.assertEqual(
+                resumed_run,
+                1,
+            )
             self.assertEqual(resumed_project["phase"], "WORKING")
             self.assertEqual(
                 resumed_project["last_error"],

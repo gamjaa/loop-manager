@@ -547,6 +547,9 @@ class TaskRelevantInvocationScopeTests(unittest.TestCase):
 
     def test_used_base_config_operation_and_out_of_scope_files_still_block(self):
         self.prove()
+        self.connection.execute(
+            "UPDATE projects SET origin = 'owner/repo' WHERE repo = ?", (self.repo,))
+        self.connection.commit()
         (self.worktree / 'unowned.txt').write_text('unexpected')
         with self.assertRaises(loop_manager.AgentScopeError):
             self.validate()
@@ -566,14 +569,15 @@ class TaskRelevantInvocationScopeTests(unittest.TestCase):
         operation.unlink()
         new_base = advance_remote(self.writer)
         git(self.source, 'fetch', 'origin')
-        self.validate()  # Verified isolation and live fast-forward preserve this scope.
-        with mock.patch.object(loop_manager, '_agent_git_resources', return_value=None):
-            with self.assertRaises(loop_manager.AgentScopeError):
-                self.validate()
-        loop_manager.validate_agent_scope('planner', self.worktree, self.before,
-            loop_manager.capture_git_snapshot(self.worktree), external_worktree=self.source,
-            base_branch='main', connection=self.connection,
-            allowed_ref_changes=frozenset({'refs/remotes/origin/main'}))
+        with mock.patch(
+                'loop_manager_internal.git.git_adapter.github_repository',
+                return_value='owner/repo'):
+            self.validate()  # Registered origin and live fast-forward prove the selected base change.
+            with mock.patch.object(loop_manager, '_agent_git_resources', return_value=None):
+                self.validate()  # The same proof does not depend on isolation evidence.
+                git(self.source, 'update-ref', 'refs/heads/unrelated', self.before.head)
+                with self.assertRaises(loop_manager.AgentScopeError):
+                    self.validate()
         self.assertEqual(git(self.source, 'rev-parse', 'origin/main'), new_base)
 
     def test_run_agent_binds_the_physical_invocation_to_the_saved_scope(self):

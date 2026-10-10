@@ -220,6 +220,26 @@ class BlockedPlanReconciler:
         return self.connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
                                        (self.repo, plan_id)).fetchone()
 
+    def _candidate_changed(self, plan, context):
+        original_revision = str(
+            plan['active_sha'] or plan['current_revision_sha'] or plan['plan_sha'] or ''
+        )
+        if original_revision and context['base_oid']:
+            original = self.ports._revision_execplan_input_fingerprint(
+                self.repo_path, original_revision, plan)
+            current = self.ports._revision_execplan_input_fingerprint(
+                self.repo_path, context['base_oid'], plan)
+            if original != current:
+                return True
+        previous_worktree = str(plan['blocked_worktree_fingerprint'] or '')
+        if previous_worktree and plan['worktree']:
+            current_worktree = self.ports._worktree_execplan_input_fingerprint(
+                Path(plan['worktree']), plan)
+            if (current_worktree != previous_worktree
+                    and current_worktree != str(plan['blocked_fingerprint'] or '')):
+                return True
+        return False
+
     def _save(self, plan_id, key, stage, context):
         with runtime_state._transaction(self.connection):
             self.connection.execute(
@@ -303,13 +323,14 @@ class BlockedPlanReconciler:
             raise RuntimeError('기존 PR identity·상태·head가 차단 checkpoint와 다릅니다.')
         return branch.oid
 
-    def _validate(self, plan, *, rebase=False):
+    def _validate(self, plan, context, *, rebase=False):
         worktree, branch = Path(plan['worktree']), str(plan['branch'])
         self.ports.validate_execplan_workspace_identity(self.state_dir, self.repo, manual_workspace_owner(self.connection, self.repo, plan['plan_id']), branch, worktree)
         self.ports.validate_managed_worktree(self.repo_path, worktree, branch, allow_rebase=rebase)
         self.ports.validate_blocked_agent_scope(
             self.connection, self.repo_path, self.repo, self.base, worktree, plan['path'],
-            accepted_rebase=rebase, saved_plan=plan)
+            accepted_rebase=rebase, saved_plan=plan,
+            changed_candidate=self._candidate_changed(plan, context))
         return worktree, branch
 
     def _adopt(self, plan, context, *, project_recovery_context=None):
@@ -368,7 +389,7 @@ class BlockedPlanReconciler:
         completed = (checkpoint.target_base_oid == context['base_oid']
                      and accepted.get('head') == checkpoint.expected_head
                      and bool(accepted))
-        worktree, branch = self._validate(plan, rebase=pending or bool(
+        worktree, branch = self._validate(plan, context, rebase=pending or bool(
             (checkpoint.snapshot or {}).get('current_rebase_acceptance')))
         if not pending and not completed:
             try:
@@ -632,7 +653,10 @@ class BlockedPlanReconciler:
                     self.ports.validate_execplan_workspace_identity(
                         self.state_dir, self.repo, manual_workspace_owner(self.connection, self.repo, plan_id), plan['branch'], Path(plan['worktree']))
                 else:
-                    self._validate(plan, rebase=checkpoint.operation in {'rebase', 'rebase_publish'})
+                    self._validate(
+                        plan, context,
+                        rebase=checkpoint.operation in {'rebase', 'rebase_publish'},
+                    )
                 self._adopt(plan, context)
                 stage = 'adopted'
                 self._save(plan_id, key, stage, context)

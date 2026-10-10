@@ -339,7 +339,39 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
         }
         if force_timeout_recheck and not local_verify_recheck:
             continue
-        if scoped_blocking.is_scope_baseline_block(current_block):
+        changed_plan_input = False
+        if current_reason == BlockReasonCode.PLAN_INPUT_INVALID.value:
+            original_revision = str(
+                blocked['active_sha'] or blocked['current_revision_sha']
+                or blocked['plan_sha'] or ''
+            )
+            try:
+                plan_effects = effects.plan_recovery_effects()
+                if original_revision:
+                    current_fingerprint = plan_effects._revision_execplan_input_fingerprint(
+                        repo_path, f'refs/remotes/origin/{base}', blocked,
+                    )
+                    original_fingerprint = plan_effects._revision_execplan_input_fingerprint(
+                        repo_path, original_revision, blocked,
+                    )
+                    changed_plan_input = current_fingerprint != original_fingerprint
+                if not changed_plan_input and blocked['worktree']:
+                    current_fingerprint = plan_effects._worktree_execplan_input_fingerprint(
+                        Path(blocked['worktree']), blocked,
+                    )
+                    changed_plan_input = bool(
+                        blocked['blocked_worktree_fingerprint']
+                        and current_fingerprint != blocked['blocked_worktree_fingerprint']
+                        and current_fingerprint != blocked['blocked_fingerprint']
+                    )
+            except (OSError, RuntimeError, ValueError):
+                changed_plan_input = False
+        if (scoped_blocking.is_scope_baseline_block(current_block)
+                or current_reason == BlockReasonCode.PLAN_INPUT_INVALID.value
+                and changed_plan_input):
+            # A changed specification/plan input has its own local handoff
+            # path, which isolates the stale Agent result before it can be
+            # checkpointed as the next candidate.
             prior_projection = effects.project_execplan(connection, repo)
             if effects.resume_blocked_execplan_if_inputs_changed(
                     connection, repo_path, repo, base, state_dir, plan_id=str(blocked['plan_id'])):

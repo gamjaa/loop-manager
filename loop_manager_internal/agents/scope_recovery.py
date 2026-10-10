@@ -799,6 +799,7 @@ def validate_blocked_agent_scope(
     accepted_rebase: bool = False,
     saved_plan = None,
     require_safe_result: bool = False,
+    changed_candidate: bool = False,
     effects: ScopeRecoveryEffects,
 ) -> None:
     """Revalidate preserved Agent output before a BLOCKED plan can resume."""
@@ -999,7 +1000,7 @@ def validate_blocked_agent_scope(
                     return
                 if relation not in {0, 1}:
                     raise AgentScopeError('사용자 입력의 commit 관계를 확인할 수 없습니다.')
-        if result_serialized:
+        if result_serialized and not changed_candidate:
             original = GitSnapshot.deserialize(str(serialized))
             comparison = agent_scope_decision.manager_comparison_baseline(
                 original, original, checkpoint.snapshot or {}, role_name)
