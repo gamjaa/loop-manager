@@ -180,10 +180,8 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
     document_checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
     document_effects = stage_documents.StageDocumentEffects(
         git=state.bind(dependencies._typed_execution_git, name="document_git", connected=False, mutates=False),
-        begin_scope=state.bind(dependencies.begin_agent_scope, name="document_begin_scope", connected=True, mutates=True),
         capture_scope=dependencies.capture_git_snapshot,
         validate_scope=lambda *a, **kw: dependencies.validate_agent_scope(*a, connection=connection, **kw),
-        clear_scope=state.bind(dependencies.clear_agent_scope, name="document_clear_scope", connected=True, mutates=True),
         run_agent=state.bind(dependencies._run_agent_with_connection, name="document_planner", connected=True, mutates=False),
         prepare_snapshot=dependencies.mutable_ready_snapshot,
         assert_snapshot=dependencies._assert_mutable_ready_snapshot_current,

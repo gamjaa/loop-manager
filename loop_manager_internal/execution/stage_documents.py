@@ -7,7 +7,10 @@ import hashlib
 import json
 from pathlib import Path
 
-from loop_manager_internal.agents.agent_scope_decision import _same_local_snapshot
+from loop_manager_internal.agents.agent_scope_decision import (
+    _same_local_snapshot, manager_comparison_baseline, reconcile_manager_metadata,
+)
+from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.execution.validation_feedback import redact_secrets
 from loop_manager_internal.planning.planning_catalog import (
     MutableReadySnapshot, mutable_snapshot_token, snapshot_to_dict, snapshot_from_dict,
@@ -92,12 +95,14 @@ def restart_assessment(item, base, changed):
     previous = DefinitionSnapshot.deserialize(item['previous'])
     paths = related_paths(previous.path, previous.sources, changed)
     return {**{key: value for key, value in item.items() if key not in {
-                'workspace', 'original', 'commit', 'candidate', 'assessment_complete', 'published_plan_text'}},
+                'workspace', 'original', 'commit', 'candidate', 'assessment_complete', 'published_plan_text',
+                'planner_workspace', 'planner_generation', 'planner_scope', 'planner_scope_history', 'worker_snapshot'}},
             'stage': 'rebase', 'base': base, 'assessment': None,
             'paths': sorted(set(item['paths']) | set(paths)),
             'document_only': item['document_only'] and documentary(changed),
             'superseded': [*item.get('superseded', []),
-                {key: item.get(key) for key in ('base', 'assessment', 'workspace', 'commit')}]}
+                {key: item.get(key) for key in ('base', 'assessment', 'workspace', 'commit', 'candidate',
+                    'planner_workspace', 'planner_scope', 'planner_scope_history', 'worker_snapshot')}]}
 
 
 def review_pending(checkpoints, repo, plan_id, definition, candidate):
@@ -130,10 +135,8 @@ def parse_assessment(output):
 @dataclass(frozen=True)
 class StageDocumentEffects:
     git: Callable
-    begin_scope: Callable
     capture_scope: Callable
     validate_scope: Callable
-    clear_scope: Callable
     run_agent: Callable
     prepare_snapshot: Callable
     assert_snapshot: Callable
@@ -142,6 +145,37 @@ class StageDocumentEffects:
     pr_for_branch: Callable
     log: Callable
     run_with_retries: Callable
+
+
+def assert_assessment_inputs(effects, checkpoints, identity, context, item):
+    current = effects.capture_scope(context.worktree)
+    saved = item.get('worker_snapshot')
+    if (current.head != item['candidate']
+            or (saved is not None and not _same_local_snapshot(GitSnapshot.deserialize(saved), current))
+            or effects.git(identity.repo_path, 'rev-parse', f'origin/{identity.base}').stdout.strip() != item['base']):
+        save(checkpoints, identity.repo, context.plan.plan_id,
+             restart_assessment(item, item['base'], item['paths']))
+        raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '문서 판단의 구현 후보 또는 원격 입력이 변경됐습니다.')
+
+
+def remember_workspace_metadata(effects, state, checkpoints, identity, context, workspace, *, published=False):
+    """Worker 원본 범위는 보존하고 Manager가 만든 등록만 비교 기준에 반영한다."""
+    row = state.row()
+    if not row['agent_snapshot']:
+        return
+    original = GitSnapshot.deserialize(row['agent_snapshot'])
+    current = checkpoints.get(identity.repo, context.plan.plan_id)
+    baseline = manager_comparison_baseline(original, original, current.snapshot or {}, row['agent_role'])
+    observed = effects.capture_scope(context.worktree)
+    baseline = reconcile_manager_metadata(baseline, observed,
+                                          refs=frozenset((f'refs/remotes/origin/{identity.base}',)) if published else frozenset(),
+                                          worktrees=frozenset((str(workspace.resolve()),)))
+    checkpoints.record(identity.repo, context.plan.plan_id, expected_generation=current.generation,
+        operation=current.operation, expected_head=current.expected_head,
+        target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+        snapshot={**(current.snapshot or {}), 'manager_metadata_agent_baseline': {
+            'role': row['agent_role'], 'original': hashlib.sha256(original.serialize().encode()).hexdigest(),
+            'snapshot': baseline.serialize()}})
 
 
 def refresh(effects, state, checkpoints, identity, context, previous, definition, changed):
@@ -176,6 +210,9 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
                 'before_head': effects.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()}
         save(checkpoints, repo, plan_id, item)
     if item["stage"] == "done":
+        if (item['base'] == definition.revision_sha and item.get('worker_snapshot')
+                and not item.get('decision_applied') and not item.get('assessment_complete')):
+            assert_assessment_inputs(effects, checkpoints, identity, context, item)
         return item if item['base'] == definition.revision_sha else None
     if context.resolving_rebase:
         return None
@@ -190,8 +227,45 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
         save(checkpoints, repo, plan_id, item)
     if item["stage"] == "assess":
         head = effects.git(context.worktree, "rev-parse", "HEAD").stdout.strip()
+        generation = item.get('planner_generation', checkpoints.get(repo, plan_id).generation)
+        if type(generation) is not int or generation < 0:
+            raise PlannerValidationError('문서 판단 작업 공간의 세대가 유효하지 않습니다.')
+        workspace = (identity.state_dir / 'worktrees' / hashlib.sha256(repo.encode()).hexdigest()[:16]
+                     / 'document-assessments' / plan_id
+                     / hashlib.sha256(f"{item['base']}:{head}:{generation}".encode()).hexdigest())
+        if not workspace.resolve().is_relative_to(identity.state_dir.resolve()) or workspace.is_symlink():
+            raise PlannerValidationError('문서 판단 작업 공간이 관리 경계를 벗어났습니다.')
+        if item.get('planner_workspace') != str(workspace) and workspace.exists():
+            raise PlannerValidationError('소유권이 없는 기존 문서 판단 작업 공간을 사용하지 않습니다.')
+        item = {**item, 'planner_workspace': str(workspace), 'planner_generation': generation, 'candidate': head}
+        save(checkpoints, repo, plan_id, item)
+        if not workspace.exists():
+            workspace.parent.mkdir(parents=True, exist_ok=True)
+            effects.git(identity.repo_path, 'worktree', 'add', '--detach', str(workspace), head)
+        effects.validate_worktree(identity.repo_path, workspace, None)
+        if (effects.git(workspace, 'rev-parse', 'HEAD').stdout.strip() != head
+                or effects.git(workspace, 'status', '--porcelain').stdout.strip()):
+            raise PlannerValidationError('문서 판단 작업 공간이 구현 revision과 다릅니다.')
+        if item.get('planner_scope'):
+            prior = item['planner_scope']
+            if prior['role'] != 'planner' or prior['worktree'] != str(workspace):
+                raise PlannerValidationError('보존된 Planner 범위가 현재 문서 판단 작업 공간과 다릅니다.')
+            before = GitSnapshot.deserialize(prior['before'])
+            after = effects.capture_scope(workspace)
+            effects.validate_scope('planner', workspace, before, after,
+                                   external_worktree=identity.repo_path, base_branch=identity.base)
+            if not _same_local_snapshot(before, after):
+                raise PlannerValidationError('중단된 읽기 전용 문서 판단의 작업 공간이 변경됐습니다.')
+        remember_workspace_metadata(effects, state, checkpoints, identity, context, workspace)
+        worker_before = effects.capture_scope(context.worktree)
+        item = {**item, 'worker_snapshot': worker_before.serialize()}
+        save(checkpoints, repo, plan_id, item)
+        document_head = head if item.get('work_branch') else item['base']
         prompt = f"""현재 진행 중인 {plan_id}의 원격 문서 변경을 판단하는 일반 Planner 호출이다.
-읽기 전용으로 현재 worktree의 구현·테스트, 최신 ExecPlan·연결 Requirement·PRODUCT·ARCHITECTURE를 대조하라.
+현재 위치는 Planner 전용 worktree이며 Worker 구현 revision은 {head}다.
+읽기 전용으로 구현·테스트와 최신 문서 revision {document_head}의 ExecPlan·연결 Requirement·PRODUCT·ARCHITECTURE를 대조하라.
+최신 문서 원문은 git show {document_head}:<문서 경로>로 확인하라.
+Worker 작업 공간 {context.worktree}의 미커밋 작업도 읽기 전용 검토 입력이며 파일·Git·범위 기록을 변경하지 마라.
 확인한 변경 문서는 {json.dumps(item['paths'], ensure_ascii=False)}다. 이전 선언은 {item['previous']}다.
 현재 단계를 {item['phase']}로 이어갈 판단이며 다른 작업을 계획하거나 파일·Git을 변경하거나 테스트를 실행하지 마라.
 PR 등록 전인 현재 ExecPlan만 필요한 경우 같은 ID·경로와 기존 수행 기록을 보존한 전체 문서 수정안으로 반환하라.
@@ -202,20 +276,27 @@ plan_text(전체 ExecPlan 문자열 또는 수정 불필요면 null), evidence(�
 """
         protocol_error = item.get('validation_error', '')
         for attempt in range(3):
-            before = effects.begin_scope(repo, context.worktree, "planner",
-                                         input_fingerprint=definition.definition_token)
+            before = effects.capture_scope(workspace)
+            item = {**item, 'planner_scope_history': [*item.get('planner_scope_history', []),
+                    *([item['planner_scope']] if item.get('planner_scope') else [])],
+                    'planner_scope': {'role': 'planner', 'worktree': str(workspace),
+                    'input_fingerprint': definition.definition_token, 'before': before.serialize(), 'after': None}}
+            save(checkpoints, repo, plan_id, item)
             result = effects.run_with_retries(TrackedAgentCall(
                 lambda session, recovery, invocation: effects.run_agent(
-                    identity.provider, context.worktree, identity.state_dir, identity.config_path,
+                    identity.provider, workspace, identity.state_dir, identity.config_path,
                     "planner", prompt + ('\n이전 결과 검증 오류: ' + protocol_error if protocol_error else ''),
                     read_only=True, persist_session=False, invocation=invocation),
                 AttemptSequence(repo, plan_id, definition.revision_sha)), session_id=None)
-            after = effects.capture_scope(context.worktree)
-            effects.validate_scope("planner", context.worktree, before, after,
+            after = effects.capture_scope(workspace)
+            item = {**item, 'planner_scope': {**item['planner_scope'], 'after': after.serialize()}}
+            save(checkpoints, repo, plan_id, item)
+            effects.validate_scope("planner", workspace, before, after,
                                    external_worktree=identity.repo_path, base_branch=identity.base)
             if not _same_local_snapshot(before, after):
                 raise PlannerValidationError("읽기 전용 문서 판단 중 작업 공간이 변경됐습니다.")
-            effects.clear_scope(repo)
+            effects.git(identity.repo_path, 'fetch', 'origin')
+            assert_assessment_inputs(effects, checkpoints, identity, context, item)
             code, output = result
             output = redact_secrets(str(output))
             if code:
@@ -232,18 +313,15 @@ plan_text(전체 ExecPlan 문자열 또는 수정 불필요면 null), evidence(�
                 save(checkpoints, repo, plan_id, item)
                 if attempt == 2:
                     raise
-        if (effects.git(context.worktree, "rev-parse", "HEAD").stdout.strip() != head
-                or effects.git(identity.repo_path, "rev-parse", f"origin/{identity.base}").stdout.strip() != item["base"]):
-            raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, "문서 판단 중 후보 또는 원격이 변경됐습니다.")
         item = {**item, "stage": "proposed", "assessment": assessment, "candidate": head}
         save(checkpoints, repo, plan_id, item)
     assessment = item["assessment"]
     assessment = parse_assessment('DOCUMENT_RESULT: ' + json.dumps(assessment))
+    if item['stage'] == 'proposed' and not item.get('assessment_complete'):
+        assert_assessment_inputs(effects, checkpoints, identity, context, item)
     if assessment["implementation"] == "uncertain":
         raise PlannerValidationError("진행 중 작업의 명세 영향 판단이 불확실합니다: " + assessment["evidence"])
     if item["stage"] == "proposed" and assessment["plan_text"] is not None:
-        if effects.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip() != item['candidate']:
-            raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '문서 판단 이후 작업 후보가 변경됐습니다.')
         snapshot = effects.prepare_snapshot(state.connection, repo, identity.repo_path, item["base"])
         original = snapshot.by_id.get(plan_id)
         if original is None:
@@ -320,14 +398,14 @@ plan_text(전체 ExecPlan 문자열 또는 수정 불필요면 null), evidence(�
                 save(checkpoints, repo, plan_id, item)
                 return item
             effects.assert_snapshot(state.connection, snapshot)
-            if effects.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip() != item['candidate']:
-                raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '문서 게시 전에 구현 후보가 변경됐습니다.')
+            assert_assessment_inputs(effects, checkpoints, identity, context, item)
             if effects.pr_for_branch(identity.repo_path, context.branch) is not None:
                 raise PlannerValidationError("문서 게시 전에 연결 PR이 등록됐습니다.")
             if (effects.git(workspace, "rev-parse", "HEAD").stdout.strip() != item["commit"]
                     or effects.git(workspace, "status", "--porcelain").stdout.strip()
                     or effects.git(workspace, "diff", "--name-only", item["base"], item["commit"]).stdout.splitlines() != [original.path]):
                 raise PlannerValidationError("보존된 문서 게시 후보가 변경됐습니다.")
+            remember_workspace_metadata(effects, state, checkpoints, identity, context, workspace)
             effects.git(workspace, "push", "origin", f"{item['commit']}:refs/heads/{identity.base}")
             effects.git(identity.repo_path, "fetch", "origin")
         remote = effects.git(identity.repo_path, 'rev-parse', f'origin/{identity.base}').stdout.strip()
@@ -336,6 +414,7 @@ plan_text(전체 ExecPlan 문자열 또는 수정 불필요면 null), evidence(�
             item = restart_assessment(item, remote, [path for path in delta if path])
             save(checkpoints, repo, plan_id, item)
             return item
+        remember_workspace_metadata(effects, state, checkpoints, identity, context, workspace, published=True)
         item = {**item, "stage": "rebase", "base": remote,
                 "assessment_complete": True, "published_plan_text": assessment["plan_text"],
                 "assessment": {**assessment, "plan_text": None}}

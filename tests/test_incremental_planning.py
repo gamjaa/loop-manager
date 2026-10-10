@@ -898,11 +898,14 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
             proposal = (self.repo / self.paths['G-002']).read_text(encoding='utf-8') + '\n- 최신 조건 반영.\n'
             raw = 'DOCUMENT_RESULT: ' + json.dumps(dict(relevant=True, implementation='satisfied',
                                                         plan_text=proposal, evidence='현재 구현과 최신 명세 대조'))
-            scope = SimpleNamespace(head=self.base, branch='work', index={}, dirty={}, operations={})
             agent = mock.Mock(return_value=loop_manager.AgentResult(0, raw))
+            worker_scope = loop_manager.begin_agent_scope(self.connection, str(self.repo), self.repo, 'worker')
+            self.connection.execute("UPDATE exec_plans SET agent_role='worker', agent_snapshot=? WHERE plan_id='G-002'",
+                                    (worker_scope.serialize(),))
+            self.connection.commit()
             effects = documents.StageDocumentEffects(git=loop_manager.git,
-                begin_scope=mock.Mock(return_value=scope), capture_scope=mock.Mock(return_value=scope),
-                validate_scope=mock.Mock(), clear_scope=mock.Mock(), run_agent=agent,
+                capture_scope=loop_manager.capture_git_snapshot,
+                validate_scope=mock.Mock(), run_agent=agent,
                 prepare_snapshot=loop_manager.mutable_ready_snapshot,
                 assert_snapshot=loop_manager._assert_mutable_ready_snapshot_current,
                 validate_result=loop_manager.validate_planner_result,
@@ -916,6 +919,14 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
             self.assertEqual(result['stage'], 'rebase')
             self.assertEqual(git(self.repo, 'show', f"origin/main:{self.paths['G-002']}") + '\n', proposal)
             self.assertEqual(git(self.repo, 'branch', '--show-current'), 'work')
+            self.assertEqual(row()['agent_role'], 'worker')
+            self.assertEqual(row()['agent_snapshot'], worker_scope.serialize())
+            from loop_manager_internal.agents.scope_contracts import GitSnapshot
+            baseline = GitSnapshot.deserialize(checkpoints.get(str(self.repo), 'G-002').snapshot[
+                'manager_metadata_agent_baseline']['snapshot'])
+            loop_manager.validate_agent_scope('worker', self.repo, baseline,
+                loop_manager.capture_git_snapshot(self.repo), selected_plan_path=self.paths['G-002'],
+                external_worktree=self.repo, base_branch='main', connection=self.connection)
             updated_base = git(self.repo, 'rev-parse', 'origin/main')
             git(self.repo, 'rebase', updated_base)
             self.connection.execute("UPDATE exec_plans SET active_sha=? WHERE plan_id='G-002'", (updated_base,))

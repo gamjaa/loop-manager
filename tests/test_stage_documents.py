@@ -4,8 +4,12 @@ import json
 from unittest import TestCase
 from unittest import mock
 from types import SimpleNamespace
+from pathlib import Path
+import tempfile
 
 from loop_manager_internal.execution import stage_documents as documents
+from loop_manager_internal.agents.scope_contracts import GitSnapshot
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure
 from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, ExecutionOutcomeKind
 from loop_manager_internal.planning.planning_catalog import PlannerValidationError
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
@@ -39,20 +43,142 @@ class DocumentProtocolTests(TestCase):
 
 
 class DocumentPhaseTests(ExecutionFixture, TestCase):
+    def setUp(self):
+        super().setUp()
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.handler._identity = replace(self.handler._identity, state_dir=Path(directory.name))
+
     def document_effects(self, base='base', outputs=None):
-        scope = SimpleNamespace(head='base', branch='work', index={}, dirty={}, operations={})
+        scope = GitSnapshot(head='base', branch='work', index={}, dirty={}, operations={},
+                            refs={}, worktrees={}, config={})
         output = 'DOCUMENT_RESULT: ' + json.dumps(dict(relevant=True, implementation='satisfied',
             plan_text=None, evidence='현재 구현은 조건을 충족하며 검증은 새 조건에서 진행한다.'))
         effects = mock.Mock()
         effects.pr_for_branch.return_value = None
-        effects.begin_scope.return_value = scope
         effects.capture_scope.return_value = scope
         effects.git.side_effect = lambda root, *args, **kw: SimpleNamespace(returncode=0,
-            stdout=base if args[-1] == 'origin/main' else 'base')
+            stdout='' if args[0] in {'status', 'worktree'} else base if args[-1] == 'origin/main' else 'base')
         import loop_manager as lm
         effects.run_agent.side_effect = [lm.AgentResult(0, text) for text in (outputs or [output])]
         effects.run_with_retries.side_effect = lambda call, session_id: call(session_id, False)
         return effects
+
+    def test_planner_uses_separate_workspace_and_preserves_worker_scope(self):
+        context = self.review_context()
+        current = self.handler._definition_snapshot
+        worker = GitSnapshot(head='base', branch='work', index={}, dirty={'app.py': (('worktree',), 'saved')},
+                             refs={}, worktrees={}, config={}, operations={})
+        self.state.update_project(self.repo, agent_role='worker', agent_snapshot=worker.serialize(),
+                                  agent_result_snapshot=worker.serialize(), worker_session_id='saved-worker')
+        saved = {key: self.state.row()[key] for key in
+                 ('agent_role', 'agent_snapshot', 'agent_result_snapshot', 'worker_session_id', 'worker_result', 'verify_result')}
+        effects = self.document_effects()
+        planner = replace(worker, branch=None, dirty={})
+        effects.capture_scope.side_effect = lambda root: worker if root == context.worktree else planner
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        result = documents.refresh(effects, self.state, checkpoints, self.handler._identity,
+                                   context, current, current, ['docs/ARCHITECTURE.md'])
+        call = effects.run_agent.call_args
+        self.assertNotEqual(call.args[1], context.worktree)
+        self.assertEqual(call.args[4], 'planner')
+        self.assertIn('Worker 구현 revision은 base', call.args[5])
+        self.assertIn(str(context.worktree), call.args[5])
+        self.assertTrue(call.kwargs['read_only'])
+        self.assertFalse(call.kwargs['persist_session'])
+        self.assertEqual(result['planner_scope']['worktree'], str(call.args[1]))
+        self.assertEqual(result['planner_scope']['before'], planner.serialize())
+        self.assertEqual(result['planner_scope']['after'], planner.serialize())
+        self.assertEqual(result['worker_snapshot'], worker.serialize())
+        self.assertEqual({key: self.state.row()[key] for key in saved}, saved)
+
+    def test_worker_or_document_change_during_assessment_discards_judgment(self):
+        for mutation in ('head', 'dirty', 'index', 'remote'):
+            with self.subTest(mutation=mutation):
+                context = self.review_context()
+                current = self.handler._definition_snapshot
+                checkpoints = ExecutionCheckpointRepository(self.connection)
+                documents.save(checkpoints, self.repo, context.plan.plan_id, None)
+                effects = self.document_effects()
+                worker = effects.capture_scope.return_value
+                def run(*args, **kwargs):
+                    if mutation == 'remote':
+                        effects.git.side_effect = lambda root, *args, **kw: SimpleNamespace(returncode=0,
+                            stdout='changed' if args[-1] == 'origin/main' else 'base')
+                    else:
+                        changed = replace(worker, **{
+                            'head': {'head': 'changed'},
+                            'dirty': {'dirty': {'app.py': (('worktree',), 'changed')}},
+                            'index': {'index': {'app.py': ('H 100644 changed 0',)}}}[mutation])
+                        effects.capture_scope.side_effect = lambda root: changed if root == context.worktree else worker
+                    import loop_manager as lm
+                    return lm.AgentResult(0, 'DOCUMENT_RESULT: ' + json.dumps(dict(relevant=True,
+                        implementation='satisfied', plan_text=None, evidence='근거')))
+                effects.run_agent.side_effect = run
+                with self.assertRaises(RecoveryFailure):
+                    documents.refresh(effects, self.state, checkpoints, self.handler._identity,
+                                      context, current, current, ['docs/ARCHITECTURE.md'])
+                self.assertEqual(documents.pending(checkpoints, self.repo, context.plan.plan_id)['stage'], 'rebase')
+                self.assertIsNone(documents.pending(checkpoints, self.repo, context.plan.plan_id)['assessment'])
+                effects.prepare_snapshot.assert_not_called()
+
+    def test_preserved_judgment_rechecks_worker_files_before_application(self):
+        context = self.review_context()
+        current = self.handler._definition_snapshot
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        effects = self.document_effects()
+        item = documents.refresh(effects, self.state, checkpoints, self.handler._identity,
+                                 context, current, current, ['docs/ARCHITECTURE.md'])
+        effects.capture_scope.return_value = replace(effects.capture_scope.return_value,
+                                                     dirty={'app.py': (('worktree',), 'changed')})
+        for stage in ('proposed', 'done'):
+            with self.subTest(stage=stage):
+                documents.save(checkpoints, self.repo, context.plan.plan_id, {**item, 'stage': stage})
+                with self.assertRaises(RecoveryFailure):
+                    documents.refresh(effects, self.state, checkpoints, self.handler._identity,
+                                      context, current, current, [])
+                self.assertEqual(documents.pending(checkpoints, self.repo, context.plan.plan_id)['stage'], 'rebase')
+
+    def test_interrupted_planner_scope_is_checked_before_retry(self):
+        context = self.review_context()
+        current = self.handler._definition_snapshot
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        effects = self.document_effects()
+        effects.run_agent.side_effect = RuntimeError('중단')
+        with self.assertRaisesRegex(RuntimeError, '중단'):
+            documents.refresh(effects, self.state, checkpoints, self.handler._identity,
+                              context, current, current, ['docs/ARCHITECTURE.md'])
+        saved = documents.pending(checkpoints, self.repo, context.plan.plan_id)
+        self.assertIsNone(saved['planner_scope']['after'])
+        worker = effects.capture_scope.return_value
+        changed = replace(worker, dirty={'app.py': (('worktree',), 'changed')})
+        effects.capture_scope.side_effect = lambda root: worker if root == context.worktree else changed
+        effects.run_agent.reset_mock()
+        with self.assertRaisesRegex(PlannerValidationError, '중단된 읽기 전용'):
+            documents.refresh(effects, self.state, checkpoints, self.handler._identity,
+                              context, current, current, [])
+        effects.run_agent.assert_not_called()
+
+    def test_adopted_work_branch_documents_keep_their_revision(self):
+        context = self.review_context()
+        current = self.handler._definition_snapshot
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        documents.save(checkpoints, self.repo, context.plan.plan_id, dict(version=1, stage='assess',
+            base='base', phase='REVIEWING', paths=['docs/ARCHITECTURE.md'], document_only=True,
+            previous=current.serialize(), assessment=None, work_branch=True, remote='worker-head',
+            worker_result='saved', verify_result=None, verify_base=None))
+        checkpoint = checkpoints.get(self.repo, context.plan.plan_id)
+        checkpoints.record(self.repo, context.plan.plan_id, expected_generation=checkpoint.generation,
+            operation=checkpoint.operation, expected_head=checkpoint.expected_head,
+            target_base_oid=checkpoint.target_base_oid, observed_remote_oid=checkpoint.observed_remote_oid,
+            snapshot={**checkpoint.snapshot, 'remote_adoption_scope': {'remote': 'worker-head'}})
+        effects = self.document_effects()
+        effects.capture_scope.return_value = replace(effects.capture_scope.return_value, head='worker-head')
+        effects.git.side_effect = lambda root, *args, **kw: SimpleNamespace(returncode=0,
+            stdout='base' if args[-1] == 'origin/main' else 'worker-head' if args[0] == 'rev-parse' else '')
+        documents.refresh(effects, self.state, checkpoints, self.handler._identity,
+                          context, current, current, [])
+        self.assertIn('git show worker-head:', effects.run_agent.call_args.args[5])
 
     def test_unlisted_upper_specification_is_reassessed_at_each_changed_base(self):
         context = self.review_context()
@@ -90,7 +216,8 @@ class DocumentPhaseTests(ExecutionFixture, TestCase):
             self.handler._identity, context, current, current, ['docs/ARCHITECTURE.md'])
         self.assertEqual(item['stage'], 'done')
         self.assertIsNone(item['assessment']['plan_text'])
-        effects.validate_worktree.assert_not_called()
+        effects.validate_worktree.assert_called_once()
+        self.assertIn('document-assessments', str(effects.validate_worktree.call_args.args[1]))
         effects.run_agent.assert_called_once()
 
     def test_actual_pr_discards_pre_pr_assessment_authority(self):
@@ -113,6 +240,7 @@ class DocumentPhaseTests(ExecutionFixture, TestCase):
                 context, current, current, ['docs/ARCHITECTURE.md'])
         self.assertEqual(effects.run_agent.call_count, 3)
         self.assertEqual(documents.pending(checkpoints, self.repo, 'G-047')['stage'], 'assess')
+        self.assertEqual(len(documents.pending(checkpoints, self.repo, 'G-047')['planner_scope_history']), 2)
         self.assertEqual(self.state.row()['worker_result'], 'worker result')
         self.assertEqual(self.state.row()['verify_result'], 'successful verify output')
 
