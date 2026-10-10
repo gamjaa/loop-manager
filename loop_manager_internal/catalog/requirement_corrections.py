@@ -217,6 +217,40 @@ def _rewrite_destination(
     return urlunsplit(("", "", quote(relative, safe="/-._~"), query, fragment))
 
 
+def _inline_code_spans(
+    content: str, active_delimiter: int | None = None,
+) -> tuple[tuple[tuple[int, int], ...], int | None]:
+    runs = tuple(re.finditer(r"`+", content))
+    spans: list[tuple[int, int]] = []
+    cursor = 0
+    if active_delimiter is not None:
+        closing = next(
+            (run for run in runs if len(run.group()) == active_delimiter), None,
+        )
+        if closing is None:
+            return ((0, len(content)),), active_delimiter
+        spans.append((0, closing.end()))
+        cursor = closing.end()
+
+    while True:
+        opening = next((run for run in runs if run.start() >= cursor), None)
+        if opening is None:
+            return tuple(spans), None
+        delimiter = len(opening.group())
+        closing = next(
+            (
+                run for run in runs
+                if run.start() >= opening.end() and len(run.group()) == delimiter
+            ),
+            None,
+        )
+        if closing is None:
+            spans.append((opening.start(), len(content)))
+            return tuple(spans), delimiter
+        spans.append((opening.start(), closing.end()))
+        cursor = closing.end()
+
+
 def _rewrite_markdown_links(
     text: str, document_path: str, renames: Mapping[str, str],
 ) -> str:
@@ -227,6 +261,7 @@ def _rewrite_markdown_links(
     in_frontmatter = lines[0].removeprefix("\ufeff").rstrip("\r\n") == "---"
     frontmatter_open = in_frontmatter
     fence: tuple[str, int] | None = None
+    inline_code_delimiter: int | None = None
     decision_level: int | None = None
 
     for index, line in enumerate(lines):
@@ -236,38 +271,42 @@ def _rewrite_markdown_links(
             if index and content == "---":
                 frontmatter_open = False
             continue
-        fence_match = _FENCE.match(content)
         if fence is not None:
             marker, size = fence
             if re.fullmatch(rf" {{0,3}}{re.escape(marker)}{{{size},}}[ \t]*", content):
                 fence = None
             output.append(line)
             continue
-        if fence_match is not None:
-            marker = fence_match.group(1)
-            fence = (marker[0], len(marker))
-            output.append(line)
-            continue
 
-        heading_match = _ANY_HEADING.match(content)
-        if decision_level is not None and heading_match is not None:
-            if len(heading_match.group(1)) <= decision_level:
-                decision_level = None
-        decision_match = _USER_DECISION.fullmatch(content)
-        if decision_match is not None:
-            decision_level = len(decision_match.group(1))
-            output.append(line)
-            continue
-        if decision_level is not None:
-            output.append(line)
-            continue
-        if _INDENTED_CODE.match(content) is not None:
-            output.append(line)
-            continue
+        if inline_code_delimiter is not None:
+            code_spans, inline_code_delimiter = _inline_code_spans(
+                content, inline_code_delimiter,
+            )
+        else:
+            fence_match = _FENCE.match(content)
+            if fence_match is not None:
+                marker = fence_match.group(1)
+                fence = (marker[0], len(marker))
+                output.append(line)
+                continue
 
-        code_spans = tuple(
-            match.span() for match in re.finditer(r"(`+)[^`\r\n]*?\1", content)
-        )
+            heading_match = _ANY_HEADING.match(content)
+            if decision_level is not None and heading_match is not None:
+                if len(heading_match.group(1)) <= decision_level:
+                    decision_level = None
+            decision_match = _USER_DECISION.fullmatch(content)
+            if decision_match is not None:
+                decision_level = len(decision_match.group(1))
+                output.append(line)
+                continue
+            if decision_level is not None:
+                output.append(line)
+                continue
+            if _INDENTED_CODE.match(content) is not None:
+                output.append(line)
+                continue
+
+            code_spans, inline_code_delimiter = _inline_code_spans(content)
 
         definition = _LINK_DEFINITION.fullmatch(content)
         if definition is not None and not any(
@@ -500,11 +539,11 @@ def plan_requirement_corrections(
         if not _safe_filename(new_id, item.title):
             deferred_reasons[path] = "제목을 파일명으로 사용할 수 없어 교정을 보류했습니다"
             continue
-        if (
-            destination != path
-            and destination.casefold() in occupied
-            and destination.casefold() != path.casefold()
-        ):
+        destination_occupied = any(
+            existing != path and existing.casefold() == destination.casefold()
+            for existing in requirement_documents
+        )
+        if destination != path and destination_occupied:
             deferred_reasons[path] = f"교정 목적지가 이미 있어 보류했습니다: {destination}"
             continue
         try:

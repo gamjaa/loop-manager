@@ -134,6 +134,9 @@ class RequirementCorrectionEditingTest(unittest.TestCase):
             "[requirement](%5BR-001%5D%20Old.md)\n"
             "`[code](%5BR-001%5D%20Old.md)`\n"
             "    [example](%5BR-001%5D%20Old.md)\n"
+            "`multi-line code begins\n"
+            "[demo](%5BR-001%5D%20Old.md)\n"
+            "and ends here`\n"
         )
         plan_text = (
             "---\n"
@@ -177,6 +180,7 @@ class RequirementCorrectionEditingTest(unittest.TestCase):
         self.assertIn("owner: preserve me", corrected[new].decode())
         self.assertIn("%5BR-001%5D%20New%20Title.md", corrected[owner].decode())
         self.assertIn("    [example](%5BR-001%5D%20Old.md)\n", corrected[owner].decode())
+        self.assertIn("[demo](%5BR-001%5D%20Old.md)\n", corrected[owner].decode())
         self.assertIn("../requirements/%5BR-001%5D%20New%20Title.md#scope", corrected[plan].decode())
         self.assertIn(f"  - {old}\n", corrected[plan].decode())
         self.assertIn("## User Decision\n\n[keep](../requirements/%5BR-001%5D%20Old.md)", corrected[plan].decode())
@@ -289,6 +293,24 @@ class RequirementCorrectionEditingTest(unittest.TestCase):
         updated = dict(result.updated_documents)
         self.assertNotIn(b, updated)
         self.assertNotIn("docs/requirements/[R-002] B.md", updated)
+
+    def test_casefold_equivalent_destination_owned_by_another_file_is_deferred(self):
+        source = "docs/requirements/[R-001] old.md"
+        destination_owner = "docs/requirements/[R-001] Old.md"
+        documents = {
+            source: requirement("R-001", "Old"),
+            destination_owner: frontmatter_requirement("R-002", "Bad/Title", "R-002"),
+        }
+
+        result = requirement_corrections.plan_requirement_corrections(
+            documents, references_complete=True,
+        )
+
+        self.assertEqual(result.corrections, ())
+        self.assertEqual(result.updated_documents, ())
+        deferred = {item.path: item.reason for item in result.deferred}
+        self.assertIn("목적지", deferred[source])
+        self.assertIn("파일명", deferred[destination_owner])
 
     def test_crlf_and_utf8_bom_are_preserved_during_identity_edit(self):
         old = "docs/requirements/[R-001] Old.md"
