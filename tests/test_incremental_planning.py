@@ -1829,8 +1829,8 @@ class ManualOwnershipPlanningTest(unittest.TestCase):
         git_result = SimpleNamespace(stdout=self.base + "\n", returncode=0)
         effects = documents.StageDocumentEffects(
             git=mock.Mock(return_value=git_result),
-            begin_scope=mock.Mock(), capture_scope=mock.Mock(), validate_scope=mock.Mock(),
-            clear_scope=mock.Mock(), run_agent=mock.Mock(),
+            capture_scope=mock.Mock(return_value=SimpleNamespace(head=self.base)),
+            validate_scope=mock.Mock(), run_agent=mock.Mock(),
             prepare_snapshot=lambda *args: self.mutable_snapshot(),
             assert_snapshot=mock.Mock(), validate_result=mock.Mock(),
             validate_worktree=mock.Mock(), pr_for_branch=mock.Mock(return_value=None),
@@ -1844,7 +1844,7 @@ class ManualOwnershipPlanningTest(unittest.TestCase):
             )
 
         effects.pr_for_branch.assert_called_once_with(self.repository, "manual-work")
-        effects.git.assert_called_once_with(self.repository, "rev-parse", "HEAD")
+        effects.git.assert_called_once_with(self.repository, "rev-parse", "origin/main")
         effects.validate_worktree.assert_not_called()
         effects.run_agent.assert_not_called()
 
