@@ -980,6 +980,7 @@ class ProcessStartBoundaryTests(unittest.TestCase):
                 process = mock.Mock()
                 process.stdout = io.StringIO('')
                 process.wait.return_value = 0
+                process.communicate.return_value = ('', None)
                 process.stdin.write.side_effect = lambda _prompt: self.assertEqual(observed, ['started'])
                 run = loop_manager.run_codex if provider == 'codex' else loop_manager.run_claude
                 profile = loop_manager.ResolvedProfile('model', 'high')

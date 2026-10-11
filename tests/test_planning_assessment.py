@@ -789,10 +789,12 @@ class ScopedPlannerTurnTests(PlanningCase):
         run.maintenance_context = object()
         source = TrackedSource("src/calc.py", "b" * 64, "100644", "base", "source code")
         unit = SimpleNamespace(source=source, session_id="owner", error=None, receipt=None,
-                               manifest_id="findings-manifest", index=0)
+                               manifest_id="findings-manifest", digest="unit-digest",
+                               decision_digest="decision-digest", index=0)
         other = TrackedSource("src/other.py", "c" * 64, "100644", "base", "source code")
         relation = SimpleNamespace(left=source, right=other, key="relation-key")
-        page = SimpleNamespace(index=0, total=1, session_id="owner", key="key", text="evidence")
+        page = SimpleNamespace(digest="page-digest", index=0, total=1, session_id="owner",
+                               key="key", text="evidence")
         port = mock.Mock()
         ports.reconciliation = port
         port.progress.return_value = SimpleNamespace(pending_scan=False, next_relation=relation,
