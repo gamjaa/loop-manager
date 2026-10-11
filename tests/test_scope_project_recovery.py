@@ -116,7 +116,7 @@ class ScopeProjectRecoveryTest(AgentScopeFixture, unittest.TestCase):
                     previous_phase="WORKING",
                 )
 
-            self.assertFalse(
+            self.assertTrue(
                 loop_manager.resume_project_block_if_safe(
                     connection,
                     repo,
@@ -124,12 +124,6 @@ class ScopeProjectRecoveryTest(AgentScopeFixture, unittest.TestCase):
                     str(repo),
                 )
             )
-            resources = loop_manager.agent_scope_decision.used_git_resources(
-                role='worker', phase='WORKING', base_branch='main',
-                branch=branch, worktree_key=str(worktree.resolve()))
-            with mock.patch.object(loop_manager, '_agent_git_resources', return_value=resources):
-                self.assertTrue(loop_manager.resume_project_block_if_safe(
-                    connection, repo, state_dir, str(repo)))
 
             project = connection.execute(
                 "SELECT phase, worker_session_id, last_error FROM projects "

@@ -204,7 +204,17 @@ def validate_agent_scope(
             selected_plan_path=selected_plan_path,
         )
     if external_worktree is not None and base_branch is not None:
-        before = reconcile_external_base(effects.git, external_worktree, base_branch, before, after, resources)
+        registered_origin = None
+        if connection is not None:
+            project = effects.repository(connection).scope_owner(
+                str(_canonical_path(Path(external_worktree)))
+            )
+            if project is not None:
+                registered_origin = str(project['origin'] or '')
+        before = reconcile_external_base(
+            effects.git, external_worktree, base_branch, before, after, resources,
+            registered_origin=registered_origin,
+        )
     original = before
     before = _completed_worker_rebase_baseline(
         role_name, worktree, before, after, selected_plan_path,
@@ -271,7 +281,12 @@ def validate_agent_scope(
             BlockReasonCode.REPOSITORY_STATE_UNSAFE,
         )
     else:
-        scope_before, scope_after = agent_scope_decision.scoped_metadata(before, after, resources)
+        scope_before, scope_after = agent_scope_decision.scoped_metadata(
+            before, after, resources,
+            default_worktree=external_key,
+            selected_worktree=str(_canonical_path(worktree)),
+            base_branch=base_branch,
+        )
         if resources is not None:
             excluded_refs = sorted(key for key in set(before.refs) | set(after.refs)
                 if key not in resources.refs and before.refs.get(key) != after.refs.get(key))

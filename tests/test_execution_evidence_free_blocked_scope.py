@@ -34,14 +34,14 @@ class EvidenceFreeBlockedScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
         with self.assertRaises(lm.AgentScopeError):
             self.validate()
 
-    def test_current_external_ref_and_default_worktree_mutation_remain_rejected(self):
+    def test_current_external_ref_is_rejected_but_default_checkout_change_is_ignored(self):
         original = self.current
-        for current in (replace(original, refs={**original.refs, 'refs/heads/other': ('foreign', '')}),
-                        replace(original, worktrees={**original.worktrees, '/repo': ('HEAD=foreign',)})):
-            with self.subTest(current=current):
-                self.current = current
-                with self.assertRaises(lm.AgentScopeError):
-                    self.validate()
+        self.current = replace(original, refs={**original.refs, 'refs/heads/other': ('foreign', '')})
+        with self.assertRaises(lm.AgentScopeError):
+            self.validate()
+        self.current = replace(original,
+            worktrees={**original.worktrees, '/repo': ('HEAD=foreign',)})
+        self.validate()
 
     def test_historical_wait_resumes_after_owned_rebase_without_file_approval(self):
         connection = self.case.fixture.connection

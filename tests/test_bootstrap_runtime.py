@@ -470,6 +470,8 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                 return finish(slot, active, intent, *args, **kwargs)
             manager_git_journal._finish = interrupted_finish
     github_repository = lambda value: 'owner/repo'
+    from loop_manager_internal.git import git_adapter as _git_adapter
+    _git_adapter.github_repository = github_repository
     validate_runtime_prerequisites = lambda *args, **kwargs: None
     pr_for_branch = lambda *args, **kwargs: None
     codex_model_efforts = lambda *args: {model: frozenset({'medium', 'high', 'max', 'xhigh'})
@@ -777,8 +779,8 @@ class ReviewerRebaseScopeHandoffUnitTests(unittest.TestCase):
                           scope_start_digest='c' * 64,
                           worktrees={str(Path('/managed').resolve()): (
                               'HEAD=a', 'branch=refs/heads/loop-manager/G-047')},
-                          refs={'refs/heads/loop-manager/G-047': ('a', 'commit')})
-        current = replace(before, head='b', refs={'refs/heads/loop-manager/G-047': ('b', 'commit')})
+                          refs={'refs/heads/loop-manager/G-047': ('a', '')})
+        current = replace(before, head='b', refs={'refs/heads/loop-manager/G-047': ('b', '')})
         row = {'agent_snapshot': before.serialize(), 'agent_result_snapshot': before.serialize(),
                'agent_role': 'reviewer', 'plan_path': 'docs/plans/[G-047] Runtime.md',
                'branch': before.branch, 'base_branch': 'main'}

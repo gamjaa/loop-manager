@@ -97,7 +97,7 @@ class AgentScopeFixture:
 def snapshot(**changes):
     base = loop_manager.GitSnapshot(
         head="a", branch="loop-manager/G-051", index={}, dirty={},
-        refs={"refs/heads/loop-manager/G-051": ("a", "commit")},
+        refs={"refs/heads/loop-manager/G-051": ("a", "")},
         worktrees={"/managed": ("HEAD=a", "branch=refs/heads/loop-manager/G-051")},
         config={}, operations={},
     )

@@ -518,13 +518,17 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
             # A later completed intent cannot bridge missing proof of the first.
             self.run_git(self.repo, "reflog", "expire", "--expire=all",
                          "refs/remotes/origin/main")
-            self.assertEqual(resumed._shared_safety_error(
+            self.assertEqual(loop_manager._proven_manager_base_refs(
+                reopened, self.repo, repo, "G-034", before, current,
+            ), frozenset())
+            # The saved Manager receipt chain is still incomplete, but an
+            # independent live-origin proof accepts this normal base fetch.
+            self.assertIsNone(resumed._shared_safety_error(
                 request, resumed._plan(request), current,
-            ).reason_code, "shared_ref_mutation")
-            with self.assertRaises(loop_manager.AgentScopeError):
-                loop_manager.validate_persisted_agent_scope(
-                    reopened, self.repo, self.state_dir, repo,
-                )
+            ))
+            self.assertEqual(loop_manager.validate_persisted_agent_scope(
+                reopened, self.repo, self.state_dir, repo,
+            ).refs["refs/remotes/origin/main"], current.refs["refs/remotes/origin/main"])
         finally:
             reopened.close()
 
@@ -553,10 +557,12 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
         self.run_git(self.repo, "update-ref", "-d", "refs/heads/external-staging")
         current = loop_manager.capture_git_snapshot(self.worktree)
         self.assertEqual(current.refs["refs/remotes/origin/main"][0], target)
-        self.assertEqual(
-            adapter._shared_safety_error(request, adapter._plan(request), current).reason_code,
-            "shared_ref_mutation",
-        )
+        self.assertIsNone(adapter._shared_safety_error(
+            request, adapter._plan(request), current,
+        ))
+        self.assertEqual(loop_manager._proven_manager_base_refs(
+            self.connection, self.repo, repo, "G-034", before, current,
+        ), frozenset())
         with self.assertRaises(RuntimeError):
             loop_manager._perform_manager_base_fetch(
                 self.connection, self.repo, intent, "main",
@@ -565,6 +571,14 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
             loop_manager._finish_manager_base_fetch(
                 self.connection, self.repo, intent,
             )
+        self.assertEqual(self.connection.execute(
+            "SELECT phase FROM manager_base_fetches WHERE id = ?", (intent,),
+        ).fetchone()[0], "pending")
+        self.run_git(self.repo, "update-ref", "refs/heads/external", target)
+        unrelated = loop_manager.capture_git_snapshot(self.worktree)
+        self.assertEqual(adapter._shared_safety_error(
+            request, adapter._plan(request), unrelated,
+        ).reason_code, "shared_ref_mutation")
         with self.assertRaises(loop_manager.AgentScopeError):
             loop_manager.validate_persisted_agent_scope(
                 self.connection, self.repo, self.state_dir, repo,
@@ -640,7 +654,7 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
 
 
     def test_shared_mutations_block_before_any_remote_access(self):
-        cases = ("origin", "pushurl", "config", "ref", "external")
+        cases = ("origin", "pushurl", "config", "ref")
         for mutation in cases:
             with self.subTest(mutation=mutation):
                 request = self.block()
@@ -650,10 +664,8 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
                     self.run_git(self.repo, "config", "remote.origin.pushurl", "https://github.com/other/repo.git")
                 elif mutation == "config":
                     self.run_git(self.repo, "config", "core.hooksPath", "/tmp/untrusted")
-                elif mutation == "ref":
-                    self.run_git(self.repo, "update-ref", "refs/heads/foreign", self.base_oid)
                 else:
-                    (self.repo / "code.py").write_text("external change\n")
+                    self.run_git(self.repo, "update-ref", "refs/heads/foreign", self.base_oid)
                 adapter = loop_manager._BlockedCheckpointAdapter(
                     self.connection, self.repo, self.state_dir, request.repo
                 )
@@ -672,7 +684,6 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
                     "pushurl": "shared_git_config_mutation",
                     "config": "shared_git_config_mutation",
                     "ref": "shared_ref_mutation",
-                    "external": "outside_managed_worktree_mutation",
                 }[mutation])
                 self.run_git(self.repo, "remote", "set-url", "origin", str(self.remote))
                 if mutation == "pushurl":
@@ -684,3 +695,20 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
                 self.connection.execute("DELETE FROM project_blocks")
                 self.connection.execute("UPDATE projects SET phase = NULL")
                 self.connection.commit()
+
+
+    def test_default_checkout_file_change_does_not_block_checkpoint_assessment(self):
+        request = self.block()
+        (self.repo / "code.py").write_text("external change\n")
+        adapter = loop_manager._BlockedCheckpointAdapter(
+            self.connection, self.repo, self.state_dir, request.repo
+        )
+        publication = mock.Mock()
+        results = loop_manager._BlockedCheckpointResults(self.connection)
+        repository = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection)
+
+        blocked_checkpoint.BlockedCheckpointDispatcher(repository, adapter, publication, results).dispatch(request.repo)
+
+        publication.existing_pull_request.assert_called_once_with(request)
+        publication.push.assert_not_called()
+        self.assertIsNone(self.connection.execute("SELECT 1 FROM project_blocks").fetchone())

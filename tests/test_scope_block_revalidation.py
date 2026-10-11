@@ -239,12 +239,39 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
         self.assertIsNone(scoped_blocking.project_block(self.connection, 'repo'))
 
 
-    def test_legacy_execution_without_isolation_cannot_attribute_external_source_change(self):
+    def test_legacy_execution_without_isolation_ignores_default_worktree_change(self):
         self.isolated = False
         self.project_block()
-        block = dict(scoped_blocking.project_block(self.connection, 'repo'))
-        self.assertFalse(self.resume_project())
-        self.assertEqual(dict(scoped_blocking.project_block(self.connection, 'repo')), block)
+        self.assertTrue(self.resume_project())
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual(row['agent_snapshot'], self.before.serialize())
+        self.assertEqual(row['agent_result_snapshot'], self.current.serialize())
+        self.assertEqual((row['worker_session_id'], row['retry_count']), ('saved-worker', 3))
+        self.assertIsNone(scoped_blocking.project_block(self.connection, 'repo'))
+
+
+    def test_legacy_blocked_handoff_accepts_current_worktree_input_and_preserves_snapshots(self):
+        self.isolated = False
+        saved_result = self.current.serialize()
+        self.project_block()
+        branch_ref = f"refs/heads/{self.before.branch}"
+        registration = self.before.worktrees[str(self.worktree)]
+        self.current = replace(
+            self.current, head='user-head',
+            index={'user.py': ('H 100644 user-blob 0',)},
+            dirty={'user.py': (('staged',), 'user input')},
+            refs={**self.current.refs, branch_ref: ('user-head', '')},
+            worktrees={**self.current.worktrees, str(self.worktree): (
+                'HEAD=user-head', *tuple(value for value in registration if not value.startswith('HEAD=')))},
+        )
+
+        self.assertTrue(self.resume_project())
+
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual(row['agent_snapshot'], self.before.serialize())
+        self.assertEqual(row['agent_result_snapshot'], saved_result)
+        self.assertEqual(self.current.head, 'user-head')
+        self.assertIsNone(scoped_blocking.project_block(self.connection, 'repo'))
 
 
     def test_mixed_used_ref_or_config_change_keeps_default_worktree_block(self):
@@ -291,18 +318,15 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
         self.assertIsNotNone(scoped_blocking.project_block(self.connection, 'repo'))
 
 
-    def test_existing_correction_accepts_restored_flags_without_erasing_saved_result(self):
+    def test_saved_agent_index_flags_cannot_be_hidden_by_restored_current_state(self):
         flagged = replace(self.current, index={'app.py': ('S 100644 resolved 0',)})
         self.connection.execute('UPDATE exec_plans SET agent_result_snapshot = ?', (flagged.serialize(),))
         plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
-        loop_manager.validate_blocked_agent_scope(self.connection, self.repo_path, 'repo', 'main',
-            self.worktree, plan['path'], saved_plan=plan)
-        self.assertEqual(self.connection.execute('SELECT agent_result_snapshot FROM exec_plans').fetchone()[0],
-                         flagged.serialize())
-        self.current = flagged
         with self.assertRaisesRegex(loop_manager.AgentScopeError, 'index flags'):
             loop_manager.validate_blocked_agent_scope(self.connection, self.repo_path, 'repo', 'main',
                 self.worktree, plan['path'], saved_plan=plan)
+        self.assertEqual(self.connection.execute('SELECT agent_result_snapshot FROM exec_plans').fetchone()[0],
+                         flagged.serialize())
 
 
     def test_failed_false_positive_release_keeps_existing_changed_input_correction_route(self):

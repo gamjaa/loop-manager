@@ -48,11 +48,13 @@ class InvocationServiceEffectsEffects:
     _start_agent_invocation: Callable[..., object]
     agent_provider: Callable[..., object]
     capture_git_snapshot: Callable[..., object]
+    git: Callable[..., object]
 
 
 def _invocation_service_effects(effects: InvocationServiceEffectsEffects, ) -> invocation_service.InvocationEffects:
     return invocation_service.InvocationEffects(effects._agent_profile, effects._check_runtime_handoff,
-        effects._start_agent_invocation, effects.capture_git_snapshot, effects.agent_provider)
+        effects._start_agent_invocation, effects.capture_git_snapshot, effects.git,
+        effects.agent_provider)
 
 
 def _start_agent_invocation(

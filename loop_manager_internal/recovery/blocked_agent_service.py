@@ -595,6 +595,8 @@ def preserve_blocked_agent_changes(
     plan_id: str,
     *,
     preserved_input_path: str | None = None,
+    accept_current_input: bool = False,
+    validated_snapshot: GitSnapshot | None = None,
 ) -> GitSnapshot | None:
     """Persist and isolate a diagnosed scope violation crash-safely."""
 
@@ -606,7 +608,22 @@ def preserve_blocked_agent_changes(
     ).fetchone()
     if project is None:
         raise AgentScopeError("보존할 BLOCKED Agent 프로젝트가 없습니다.")
+
+    def capture_validated_current() -> GitSnapshot:
+        if not isinstance(validated_snapshot, GitSnapshot):
+            raise AgentScopeError(
+                "BLOCKED Agent 현재 입력의 검증 snapshot이 없습니다."
+            )
+        current = effects.capture_git_snapshot(worktree)
+        if current.serialize() != validated_snapshot.serialize():
+            raise AgentScopeError(
+                "BLOCKED Agent 입력이 scope 검증 이후 변경되어 보존하지 않습니다."
+            )
+        return current
+
     if project["agent_recovery"]:
+        if accept_current_input:
+            capture_validated_current()
         recovery = effects._deserialize_blocked_agent_recovery(
             str(project["agent_recovery"])
         )
@@ -626,6 +643,8 @@ def preserve_blocked_agent_changes(
         effects._complete_blocked_agent_recovery(connection, repo, worktree)
         return before
     if not project["agent_snapshot"] or not project["agent_result_snapshot"]:
+        if accept_current_input:
+            capture_validated_current()
         return None
     try:
         before = GitSnapshot.deserialize(str(project["agent_snapshot"]))
@@ -638,7 +657,65 @@ def preserve_blocked_agent_changes(
         raise AgentScopeError(
             "Agent 실행 전 Git operation이 있는 worktree는 자동 격리할 수 없습니다."
         )
-    current = effects.capture_git_snapshot(worktree)
+    current = (
+        capture_validated_current()
+        if accept_current_input
+        else effects.capture_git_snapshot(worktree)
+    )
+    if accept_current_input:
+        effects._blocked_agent_local_baseline(
+            before, result, current, worktree, accept_current_input=True,
+        )
+        selected = connection.execute(
+            "SELECT branch, worktree FROM exec_plans WHERE repo = ? AND plan_id = ?",
+            (repo, plan_id),
+        ).fetchone()
+        block = scoped_blocking.plan_block(connection, repo, plan_id)
+        request = connection.execute(
+            "SELECT request_identity FROM blocked_checkpoints WHERE repo = ? AND plan_id = ?",
+            (repo, plan_id),
+        ).fetchone()
+        if (selected is None or selected["branch"] != current.branch
+                or selected["worktree"] != str(worktree)
+                or block is None or request is None):
+            raise AgentScopeError(
+                "BLOCKED Agent 현재 입력의 계획·worktree 소유권이 없습니다."
+            )
+        # A candidate that is still the saved Agent result must be isolated
+        # before rebasing. Keep the older local-change gate for that case so
+        # known Agent output cannot become a user-owned commit merely because
+        # an input changed. A genuinely newer candidate was already validated
+        # by the caller; preserve that exact state as the new input instead.
+        try:
+            before = GitSnapshot.deserialize(str(project["agent_snapshot"]))
+            result = GitSnapshot.deserialize(str(project["agent_result_snapshot"]))
+        except (KeyError, TypeError, ValueError, RuntimeError) as error:
+            raise AgentScopeError(
+                f"보존할 BLOCKED Agent snapshot이 유효하지 않습니다: {error}"
+            ) from error
+        if current.branch != before.branch or current.head not in {
+            before.head,
+            result.head,
+        }:
+            return current
+        allowed_dirty_paths = (
+            frozenset((preserved_input_path,))
+            if preserved_input_path is not None
+            else frozenset()
+        )
+        try:
+            effects._blocked_agent_local_baseline(
+                before,
+                result,
+                current,
+                worktree,
+                allowed_dirty_paths=allowed_dirty_paths,
+            )
+        except AgentScopeError:
+            return current
+        # Continue through the persisted recovery protocol below. It stashes
+        # diagnosed Agent changes, restores the pre-Agent baseline, and
+        # atomically reapplies the selected ExecPlan input.
     if current.branch != before.branch or current.head not in {
         before.head,
         result.head,

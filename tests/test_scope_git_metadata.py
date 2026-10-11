@@ -312,6 +312,16 @@ class ScopeGitMetadataTest(AgentScopeFixture, unittest.TestCase):
 
     @dummy_worker_sessions
     def test_restored_worker_git_metadata_allows_changed_input_to_requeue(self):
+        origin_parser = mock.patch(
+            "loop_manager_internal.git.git_adapter.github_repository",
+            return_value="owner/repo",
+        )
+        origin_parser.start()
+        self.addCleanup(origin_parser.stop)
+        manager_origin_parser = mock.patch.object(
+            loop_manager, "github_repository", return_value="owner/repo")
+        manager_origin_parser.start()
+        self.addCleanup(manager_origin_parser.stop)
         isolation = mock.patch.object(loop_manager, '_agent_git_resources', side_effect=isolated_scope_resources)
         isolation.start()
         self.addCleanup(isolation.stop)
@@ -331,7 +341,7 @@ class ScopeGitMetadataTest(AgentScopeFixture, unittest.TestCase):
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
             connection.execute(
-                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                "INSERT INTO projects (repo, base_branch, origin) VALUES (?, 'main', 'owner/repo')",
                 (str(repo),),
             )
             loop_manager.register_execplans(
@@ -434,21 +444,25 @@ class ScopeGitMetadataTest(AgentScopeFixture, unittest.TestCase):
                 return_value=None,
             ), mock.patch(
                 "loop_manager.run_codex",
-                side_effect=[
-                    loop_manager.CodexResult(0, "", "planner-session"),
+                side_effect=lambda _worktree, _state, _config, role_name, _prompt, **_kwargs:
                     loop_manager.CodexResult(
-                        1, "stop after restored metadata", "worker-session"
+                        0 if role_name == "planner" else 1,
+                        "" if role_name == "planner" else "stop after restored metadata",
+                        "planner-session" if role_name == "planner" else "worker-session",
                     ),
-                ],
             ) as resumed_agent:
-                result = loop_manager.run_project(
-                    connection,
-                    state_dir,
-                    str(repo),
-                    Path("unused.ini"),
-                    "main",
-                    False,
-                )
+                result = 0
+                for _ in range(2):
+                    result = loop_manager.run_project(
+                        connection,
+                        state_dir,
+                        str(repo),
+                        Path("unused.ini"),
+                        "main",
+                        False,
+                    )
+                    if result:
+                        break
 
             project = connection.execute(
                 "SELECT phase, last_error, agent_snapshot, agent_result_snapshot "

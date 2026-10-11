@@ -367,6 +367,7 @@ def validate_worker_workspace_scope(
     allowed_requirement_archives: tuple[str, ...] = (),
     allowed_guidance_targets: tuple[str, ...] = (),
     allow_common_plans: bool = False,
+    scope_phase: str | None = None,
     connection: sqlite3.Connection | None = None,
 ) -> dict[str, object]:
     """Validate one Worker-controlled operation before Manager Git writes."""
@@ -374,6 +375,10 @@ def validate_worker_workspace_scope(
     if rebase_definition is not None and not allow_rebase:
         raise ExecPlanMetadataError("rebase 기준 선언은 충돌 복구 중에만 사용할 수 있습니다.")
     after = effects.capture_git_snapshot(worktree)
+    resources = (agent_scope_decision.used_git_resources(
+        role="worker", phase=scope_phase, base_branch=base_branch,
+        branch=branch, worktree_key=str(worktree.resolve()),
+    ) if scope_phase is not None else None)
     effects.validate_agent_scope(
         "worker",
         worktree,
@@ -386,6 +391,7 @@ def validate_worker_workspace_scope(
         external_worktree=repo_path,
         base_branch=base_branch,
         connection=connection,
+        resources=resources,
     )
     plan = effects.validate_active_execplan_metadata(
         repo_path,

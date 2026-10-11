@@ -881,18 +881,20 @@ class BlockedUserInputScopeUnitTests(unittest.TestCase):
                 self.plan['blocked_reason'] = reason
                 self.effects.validate_agent_scope.reset_mock()
                 self.validate()
-                self.assertEqual(self.effects.validate_agent_scope.call_count, 1)
-                self.assertEqual(self.effects.validate_agent_scope.call_args.args[0], 'worker')
-                self.assertEqual(self.effects.validate_agent_scope.call_args.args[2].dirty, self.result.dirty)
+                checks = self.effects.validate_agent_scope.call_args_list
+                self.assertEqual(len(checks), 2)
+                self.assertTrue(all(check.args[0] == 'worker' for check in checks))
+                self.assertEqual(checks[0].args[3], self.result)
+                self.assertEqual(checks[-1].args[2].dirty, self.result.dirty)
         self.effects.git.assert_not_called()
 
     def test_diagnosed_result_keeps_scope_correction_without_user_normalization(self):
         self.effects.capture_git_snapshot.return_value = self.result
         self.plan['blocked_reason'] = 'plan_input_invalid'
-        self.effects.validate_agent_scope.side_effect = [AgentScopeError('diagnosed commit'), None]
+        self.effects.validate_agent_scope.side_effect = [AgentScopeError('diagnosed commit'), None, None]
         self.validate()
         checks = self.effects.validate_agent_scope.call_args_list
-        self.assertEqual(len(checks), 2)
+        self.assertEqual(len(checks), 3)
         self.assertTrue(all(check.args[0] == 'worker' for check in checks))
         self.assertEqual(checks[-1].args[2].dirty, self.result.dirty)
         self.effects.git.assert_not_called()
@@ -905,7 +907,7 @@ class BlockedUserInputScopeUnitTests(unittest.TestCase):
 
     def test_unfinished_or_unproven_scope_does_not_absorb_new_user_bytes(self):
         self.effects._agent_git_resources.return_value = None
-        with self.assertRaisesRegex(AgentScopeError, '새 파일 또는 index 변경'):
+        with self.assertRaisesRegex(AgentScopeError, 'worktree HEAD'):
             self.validate()
 
     def test_shared_config_change_remains_visible_to_read_only_scope_check(self):
@@ -918,7 +920,7 @@ class BlockedUserInputScopeUnitTests(unittest.TestCase):
         with self.assertRaisesRegex(AgentScopeError, 'origin changed'):
             self.validate()
 
-    def test_legacy_safe_result_ignores_later_default_checkout_and_unowned_branch_metadata(self):
+    def test_legacy_safe_result_does_not_synthesize_invocation_scope_proof(self):
         self.effects._agent_git_resources.return_value = None
         self.plan['workspace_owned'] = 1
         self.current = replace(self.result,
@@ -929,8 +931,7 @@ class BlockedUserInputScopeUnitTests(unittest.TestCase):
         self.validate(require_safe_result=True)
         checked = self.effects.validate_agent_scope.call_args_list
         self.assertEqual(checked[0].args[3], self.result)
-        self.assertIn('refs/remotes/origin/main', checked[-1].kwargs['resources'].refs)
-        self.assertNotIn('refs/heads/main', checked[-1].kwargs['resources'].refs)
+        self.assertIsNone(checked[-1].kwargs['resources'])
 
 
 if __name__ == '__main__':

@@ -12,6 +12,7 @@ from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
 from loop_manager_internal.runtime.contracts import RuntimeWorktree
 from loop_manager_internal.runtime.resource_lock import fetch_resource
 from loop_manager_internal.runtime.runtime_scope import proven_runtime_removal
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 from pathlib import Path
 import json
 import re
@@ -19,16 +20,17 @@ import secrets
 import sqlite3
 
 
-def reconcile_external_base(git, repo, base, before, current, resources):
-    """Compare a live remote fast-forward only with invocation-bound isolation.
+def reconcile_external_base(git, repo, base, before, current, resources, *, registered_origin=None):
+    """Reobserve a selected base ref only when its remote transition is proven.
 
     This does not fabricate Manager receipts or alter saved Agent evidence.
-    Missing/rewritten refs and symbolic target changes retain strict comparison.
+    The selected branch and live remote establish a fetch-shaped observation;
+    unrelated refs and missing/rewritten refs retain strict comparison.
     """
     ref, head = f'refs/remotes/origin/{base}', 'refs/remotes/origin/HEAD'
     old, new = before.refs.get(ref), current.refs.get(ref)
-    if (resources is None or ref not in resources.refs or old is None or new is None
-            or old[1] or new[1]):
+    if ((resources is not None and ref not in resources.refs)
+            or not base or old is None or new is None or old[1] or new[1]):
         return before
     previous_head, observed_head = before.refs.get(head), current.refs.get(head)
     if previous_head != observed_head:
@@ -36,23 +38,100 @@ def reconcile_external_base(git, repo, base, before, current, resources):
             return before
     if old == new and previous_head == observed_head:
         return before
-    try:
-        remote_ref = f'refs/heads/{base}'
-        remote = git(repo, 'ls-remote', '--heads', 'origin', remote_ref, check=False)
-        if remote.returncode or remote.stdout.split() != [new[0], remote_ref]:
-            return before
-        if git(repo, 'merge-base', '--is-ancestor', old[0], new[0], check=False).returncode:
-            return before
-        if previous_head is None and observed_head is not None:
+    if not registered_origin:
+        return before
+
+    remote_ref = f'refs/heads/{base}'
+
+    def retry(detail, error=None):
+        failure = RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, detail)
+        if error is None:
+            raise failure
+        raise failure from error
+
+    def remote_oid():
+        try:
+            remote = git(repo, 'ls-remote', '--heads', 'origin', remote_ref, check=False)
+        except (RuntimeError, OSError) as error:
+            retry(f'origin/{base} 원격 ref 조회를 재시도합니다.', error)
+        if remote.returncode:
+            retry(f'origin/{base} 원격 ref 조회를 재시도합니다.')
+        rows = [line.split() for line in remote.stdout.splitlines() if line.strip()]
+        if len(rows) != 1 or rows[0][1:] != [remote_ref]:
+            return None
+        return rows[0][0]
+
+    def is_ancestor(ancestor, descendant):
+        try:
+            result = git(repo, 'merge-base', '--is-ancestor', ancestor, descendant, check=False)
+        except (RuntimeError, OSError) as error:
+            retry(f'origin/{base} ancestry 관측을 재시도합니다.', error)
+        if result.returncode == 0:
+            return True
+        if result.returncode == 1:
+            return False
+        retry(f'origin/{base} ancestry 관측을 재시도합니다.')
+
+    def symbolic_head():
+        try:
             symbolic = git(repo, 'ls-remote', '--symref', 'origin', 'HEAD', check=False)
-            if symbolic.returncode or symbolic.stdout.split() != ['ref:', remote_ref, 'HEAD', new[0], 'HEAD']:
+        except (RuntimeError, OSError) as error:
+            retry(f'origin/HEAD 관측을 재시도합니다.', error)
+        if symbolic.returncode:
+            retry(f'origin/HEAD 관측을 재시도합니다.')
+        fields = symbolic.stdout.split()
+        if len(fields) != 5 or fields[:3] != ['ref:', remote_ref, 'HEAD'] or fields[4] != 'HEAD':
+            return None
+        return fields[3]
+
+    try:
+        from loop_manager_internal.git.git_adapter import github_repository
+        try:
+            configured = git(repo, 'remote', 'get-url', '--all', 'origin', check=False)
+        except (RuntimeError, OSError) as error:
+            retry(f'등록 origin 관측을 재시도합니다.', error)
+        if configured.returncode:
+            retry('등록 origin 관측을 재시도합니다.')
+        origin_urls = [line.strip() for line in configured.stdout.splitlines() if line.strip()]
+        if len(origin_urls) != 1 or github_repository(origin_urls[0]) != registered_origin:
+            return before
+
+        advertised = remote_oid()
+        if advertised is None:
+            return before
+        if not is_ancestor(old[0], new[0]) or not is_ancestor(new[0], advertised):
+            return before
+
+        if previous_head is None and observed_head is not None:
+            symbolic_oid = symbolic_head()
+            if (symbolic_oid is None or not is_ancestor(new[0], symbolic_oid)
+                    or not (is_ancestor(advertised, symbolic_oid)
+                            or is_ancestor(symbolic_oid, advertised))):
                 return before
         # The tracking resource must still match the captured observation.
-        live = git(repo, 'rev-parse', '--verify', ref, check=False)
-        if live.returncode or live.stdout.strip() != new[0]:
+        try:
+            live = git(repo, 'rev-parse', '--verify', ref, check=False)
+        except (RuntimeError, OSError) as error:
+            retry(f'{ref} live ref 관측을 재시도합니다.', error)
+        if live.returncode:
+            retry(f'{ref} live ref 관측을 재시도합니다.')
+        if live.stdout.strip() != new[0]:
+            retry(f'{ref} snapshot이 변경되어 재관측합니다.')
+
+        remote_after = remote_oid()
+        if (remote_after is None or not is_ancestor(new[0], remote_after)
+                or not is_ancestor(advertised, remote_after)):
             return before
+        if previous_head is None and observed_head is not None:
+            symbolic_after = symbolic_head()
+            if (symbolic_after is None or not is_ancestor(new[0], symbolic_after)
+                    or not (is_ancestor(remote_after, symbolic_after)
+                            or is_ancestor(symbolic_after, remote_after))):
+                return before
+    except RecoveryFailure:
+        raise
     except (RuntimeError, OSError):
-        return before
+        retry(f'origin/{base} 원격 상태 관측을 재시도합니다.')
     refs = {**before.refs, ref: new}
     if previous_head != observed_head:
         refs[head] = observed_head
@@ -473,10 +552,18 @@ def _reconciled_manager_scope_metadata(effects: ReconciledManagerScopeMetadataEf
             state_dir, Path(repo), Path(path), registration))
     before = agent_scope_decision.reconcile_manager_metadata(
         before, current, refs=frozenset(), worktrees=removed)
-    project = connection.execute('SELECT base_branch FROM projects WHERE repo = ?', (repo,)).fetchone()
+    project = connection.execute('SELECT base_branch, origin FROM projects WHERE repo = ?', (repo,)).fetchone()
+    base_branch = str(project['base_branch']) if project is not None else None
     if project is not None:
-        before = reconcile_external_base(effects.git, repo_path, project[0], before, current, resources)
-    scope_before, scope_current = agent_scope_decision.scoped_metadata(before, current, resources)
+        before = reconcile_external_base(
+            effects.git, repo_path, base_branch, before, current, resources,
+            registered_origin=str(project['origin'] or ''),
+        )
+    scope_before, scope_current = agent_scope_decision.scoped_metadata(
+        before, current, resources,
+        default_worktree=str(effects._canonical_path(repo_path)),
+        base_branch=base_branch,
+    )
     effects._ensure_cleanup_pending_schema(connection)
     proven_refs = effects._proven_manager_base_refs(
         connection, repo_path, repo, plan_id or '', scope_before, scope_current)

@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 import hashlib
+import json
 from pathlib import Path
 import subprocess
 import sqlite3
@@ -9,11 +10,12 @@ import tempfile
 from unittest import TestCase, mock
 
 import loop_manager as manager
-from loop_manager_internal.agents import scope_baseline, scope_lifecycle, scope_observation, scope_recovery, scope_validation
+from loop_manager_internal.agents import scope_adapter, scope_baseline, scope_lifecycle, scope_observation, scope_recovery, scope_state_service, scope_validation
 from loop_manager_internal.agents.scope_contracts import AgentScopeError, GitSnapshot
 from loop_manager_internal.recovery import blocked_plan_reconciliation, blocked_remote_observation
 from loop_manager_internal.storage import agent_invocation_state, blocked_checkpoint_state, execution_checkpoint_state, runtime_state
 from tests.support.database import runtime_connection
+from tests.support.git import git_command
 
 
 def snapshot(**changes):
@@ -171,6 +173,34 @@ class ScopeValidationTests(TestCase):
         return scope_validation.validate_agent_scope(role, Path('/managed'), before, after,
             selected_plan_path='docs/plans/[G-047] Runtime.md', effects=self.effects, **kwargs)
 
+    def test_blocked_scope_validation_captures_only_for_changed_candidate(self):
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        current = snapshot(config={'local:remote.origin.url': ('origin',)})
+        capture = mock.Mock(return_value=current)
+        effects = replace(manager._scope_recovery_effects(), capture_git_snapshot=capture)
+
+        validated = scope_state_service.validate_blocked_agent_scope(
+            scope_state_service.ValidateBlockedAgentScopeEffects(
+                _scope_recovery_effects=lambda: effects,
+            ),
+            connection, Path('/repo'), 'repo', 'main', Path('/managed'),
+            'docs/plans/[G-047] Runtime.md',
+        )
+
+        self.assertIsNone(validated)
+        capture.assert_not_called()
+        validated = scope_state_service.validate_blocked_agent_scope(
+            scope_state_service.ValidateBlockedAgentScopeEffects(
+                _scope_recovery_effects=lambda: effects,
+            ),
+            connection, Path('/repo'), 'repo', 'main', Path('/managed'),
+            'docs/plans/[G-047] Runtime.md', changed_candidate=True,
+        )
+
+        self.assertEqual(validated, current)
+        capture.assert_called_once_with(Path('/managed'))
+
     def test_reviewer_is_read_only_and_worker_protected_paths_stay_protected(self):
         for path in ('src/app.py', 'AGENTS.md', 'docs/ARCHITECTURE.md', 'docs/requirements/change.md'):
             changed = snapshot(dirty={path: (('untracked',), 'content')})
@@ -195,6 +225,68 @@ class ScopeValidationTests(TestCase):
         for changes in changed_states:
             with self.subTest(changes=changes), self.assertRaises(AgentScopeError):
                 self.validate('worker', snapshot(), snapshot(**changes))
+
+    def test_legacy_comparison_excludes_default_checkout_and_local_base_but_keeps_foreign_ref(self):
+        before = snapshot(
+            refs={'refs/heads/main': ('local-old', ''),
+                  'refs/heads/unrelated': ('same', '')},
+            worktrees={'/managed': ('HEAD=a',), '/source': ('HEAD=source-old', 'state=clean')},
+        )
+        source_changed = replace(before,
+            refs={'refs/heads/main': ('local-new', ''),
+                  'refs/heads/unrelated': ('same', '')},
+            worktrees={'/managed': ('HEAD=a',), '/source': ('HEAD=source-new', 'state=dirty')},
+        )
+        self.validate('worker', before, source_changed,
+            external_worktree=Path('/source'), base_branch='main')
+        foreign_ref = replace(source_changed,
+            refs={**source_changed.refs, 'refs/heads/unrelated': ('foreign', '')},
+        )
+        with self.assertRaisesRegex(AgentScopeError, '공유 Git refs'):
+            self.validate('worker', before, foreign_ref,
+                external_worktree=Path('/source'), base_branch='main')
+        self.validate('worker', before, replace(before, worktrees={
+            '/managed': ('HEAD=a',),
+            '/source': ('HEAD=source-new', 'branch=refs/heads/user-local', 'state=dirty'),
+        }), external_worktree=Path('/source'), base_branch='main')
+        with self.assertRaises(AgentScopeError):
+            self.validate('worker', before, replace(before, worktrees={
+                '/managed': ('HEAD=a',),
+                '/source': ('HEAD=source-old', 'state=clean', 'locked=maintenance'),
+            }), external_worktree=Path('/source'), base_branch='main')
+        with self.assertRaises(AgentScopeError):
+            self.validate('worker', before, replace(before, worktrees={'/managed': ('HEAD=a',)}),
+                external_worktree=Path('/source'), base_branch='main')
+
+    def test_verify_scope_uses_current_worktree_resources_without_agent_ledger(self):
+        branch = 'loop-manager/G-047'
+        own_ref = f'refs/heads/{branch}'
+        base_ref = 'refs/remotes/origin/main'
+        head_ref = 'refs/remotes/origin/HEAD'
+        before = snapshot(
+            refs={base_ref: ('base', ''), head_ref: ('base', base_ref),
+                  own_ref: ('head', ''), 'refs/heads/unrelated': ('old', '')},
+            worktrees={'/managed': (f'HEAD=head', f'branch={own_ref}'),
+                       '/source': ('HEAD=source', 'state=clean'),
+                       '/other': ('HEAD=other',)},
+        )
+        current = replace(before,
+            refs={**before.refs, 'refs/heads/unrelated': ('new', '')},
+            worktrees={**before.worktrees, '/source': ('HEAD=changed', 'state=dirty'),
+                       '/other': ('HEAD=changed',)},
+        )
+        effects = scope_adapter.ValidateWorkerWorkspaceScopeEffects(
+            capture_git_snapshot=lambda _worktree: current,
+            validate_active_execplan_metadata=mock.Mock(return_value={}),
+            validate_agent_scope=lambda *args, **kwargs: scope_validation.validate_agent_scope(
+                *args, effects=self.effects, **kwargs),
+            validate_managed_worktree=mock.Mock(),
+        )
+        self.assertEqual(scope_adapter.validate_worker_workspace_scope(
+            effects, Path('/source'), Path('/managed'), branch, 'main',
+            'docs/plans/[G-047] Work.md', mock.Mock(), before,
+            scope_phase='VERIFYING'), {})
+        effects.validate_managed_worktree.assert_called_once()
 
     def test_independent_changes_require_full_invocation_proof(self):
         connection = runtime_connection()
@@ -351,6 +443,289 @@ class PersistedScopeServiceTests(TestCase):
                                                              'repo', effects=effects)
         capture.assert_not_called()
         recover.assert_not_called()
+
+    def test_saved_result_validation_uses_registered_origin_for_normal_fetch(self):
+        from loop_manager_internal.agents import scope_validation
+        from loop_manager_internal.agents.agent_scope_decision import used_git_resources
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            repo_path = root / 'source'
+            repo_path.mkdir()
+            worktree = (root / 'worktree').resolve()
+            worktree.mkdir()
+            repo = str(repo_path.resolve())
+            connection = runtime_connection(repo)
+            self.addCleanup(connection.close)
+            branch = 'loop-manager/G-047'
+            ref, alias, own = ('refs/remotes/origin/main', 'refs/remotes/origin/HEAD',
+                               f'refs/heads/{branch}')
+            before = GitSnapshot(
+                'head', branch, {}, {}, {ref: ('a', ''), alias: ('a', ref), own: ('head', '')},
+                {str(worktree): (f'HEAD=head', f'branch={own}')}, {}, {},
+            )
+            current = replace(before, refs={ref: ('b', ''), alias: ('b', ref), own: ('head', '')})
+            plan_path = 'docs/plans/[G-047] Runtime.md'
+            connection.execute(
+                "UPDATE projects SET origin='owner/repo', phase='WORKING', agent_role='worker', "
+                "branch=?, worktree=?, plan_path=?, agent_snapshot=?, agent_result_snapshot=? "
+                "WHERE repo=?",
+                (branch, str(worktree), plan_path, before.serialize(), current.serialize(), repo),
+            )
+            connection.execute(
+                "UPDATE exec_plans SET status='IMPLEMENTING', active_sha='base', branch=?, "
+                "worktree=?, workspace_owned=1, agent_role='worker', agent_snapshot=?, "
+                "agent_result_snapshot=? WHERE repo=? AND plan_id='G-047'",
+                (branch, str(worktree), before.serialize(), current.serialize(), repo),
+            )
+            connection.commit()
+
+            def git(_path, *args, **_kwargs):
+                if args[0] == 'remote':
+                    return subprocess.CompletedProcess([], 0, 'https://github.com/owner/repo.git\n')
+                if args[0] == 'ls-remote':
+                    return subprocess.CompletedProcess([], 0, 'b\trefs/heads/main\n')
+                if args[0] == 'rev-parse':
+                    return subprocess.CompletedProcess([], 0, 'b\n')
+                return subprocess.CompletedProcess([], 0, '')
+
+            validation_effects = scope_validation.ScopeValidationEffects(
+                _agent_git_resources=lambda *_args, **_kwargs: None,
+                repository=lambda db: runtime_state.RuntimeStateRepository(db),
+                _current_rebase_service=mock.Mock(),
+                _git_common_directory=lambda _path: root,
+                _owned_rebase_state_dir=lambda *_args: None,
+                _plan_id_from_path=manager._plan_id_from_path,
+                _rebase_in_progress_for_branch=lambda *_args: False,
+                _scope_snapshot_with_start_ignore_rules=lambda _worktree, _before, after: after,
+                agent_snapshot_changes=lambda *_args: [],
+                capture_git_snapshot=lambda _worktree: current,
+                git=git,
+                operation_log=mock.Mock(),
+                validate_managed_worktree=mock.Mock(),
+            )
+            scope_effects = replace(
+                manager._scope_recovery_effects(),
+                _agent_git_resources=lambda *_args, **_kwargs: None,
+                _config_entries=lambda _path: {},
+                _with_proven_legacy_ignore_config=lambda value, *_args: value,
+                _proven_merged_cleanup_paths=lambda *_args: frozenset(),
+                _proven_manager_base_refs=lambda *_args: frozenset(),
+                _published_plan_allows_common_plans=lambda *_args: False,
+                requirement_archive_candidates=lambda *_args: (),
+                _reconciled_manager_scope_metadata=lambda *_args: _args[5],
+                capture_git_snapshot=lambda _worktree: current,
+                git=git,
+                validate_agent_scope=lambda *args, **kwargs: scope_validation.validate_agent_scope(
+                    *args, **kwargs, effects=validation_effects,
+                ),
+            )
+            scope_recovery._validate_persisted_agent_scope(
+                connection, repo_path, root, repo, effects=scope_effects,
+            )
+
+    def test_blocked_agent_preservation_keeps_validated_commit_and_all_local_input(self):
+        from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
+        from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory).resolve()
+            branch = 'loop-manager/G-047'
+            own = f'refs/heads/{branch}'
+            before = GitSnapshot(
+                'old-head', branch, {}, {}, {own: ('old-head', '')},
+                {str(worktree): ('HEAD=old-head', f'branch={own}', 'locked=owner')}, {}, {},
+            )
+            result = replace(before, dirty={'agent.py': (('unstaged',), 'saved Agent output')})
+            current = replace(
+                before, head='user-head',
+                index={'user.py': ('H 100644 user-blob 0',)},
+                dirty={'user.py': (('staged',), 'staged user input'),
+                       'extra.py': (('untracked',), 'new user file')},
+                refs={own: ('user-head', '')},
+                worktrees={str(worktree): ('HEAD=user-head', f'branch={own}', 'locked=owner')},
+            )
+            connection = runtime_connection()
+            self.addCleanup(connection.close)
+            connection.execute(
+                "UPDATE projects SET agent_role='worker', branch=?, worktree=?, "
+                "agent_snapshot=?, agent_result_snapshot=? WHERE repo='repo'",
+                (branch, str(worktree), before.serialize(), result.serialize()),
+            )
+            connection.execute(
+                "UPDATE exec_plans SET branch=?, worktree=?, workspace_owned=1, "
+                "agent_role='worker', agent_snapshot=?, agent_result_snapshot=? "
+                "WHERE repo='repo' AND plan_id='G-047'",
+                (branch, str(worktree), before.serialize(), result.serialize()),
+            )
+            connection.commit()
+            RuntimeStateRepository(connection).block_plan(
+                'repo', 'G-047', reason_code=BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION.value,
+                evidence='saved scope violation', release_fingerprint='changed-input',
+            )
+            with mock.patch.object(manager, 'capture_git_snapshot', return_value=current):
+                preserved = manager.preserve_blocked_agent_changes(
+                    connection, 'repo', worktree, 'G-047', accept_current_input=True,
+                    validated_snapshot=current,
+                )
+                self.assertEqual(preserved, current)
+                with self.assertRaises(AgentScopeError):
+                    manager.preserve_blocked_agent_changes(
+                        connection, 'repo', worktree, 'G-047',
+                    )
+            self.assertEqual(tuple(connection.execute(
+                "SELECT agent_snapshot, agent_result_snapshot FROM projects WHERE repo='repo'",
+            ).fetchone()), (before.serialize(), result.serialize()))
+
+    def test_blocked_agent_preservation_rejects_git_snapshot_change_after_validation(self):
+        before = snapshot()
+        result = replace(before, dirty={'agent.py': (('unstaged',), 'saved Agent output')})
+        validated = replace(before, head='user-head')
+        changed = replace(validated, config={'local:remote.origin.url': ('foreign',)})
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        connection.execute(
+            "UPDATE projects SET agent_role='worker', agent_snapshot=?, "
+            "agent_result_snapshot=? WHERE repo='repo'",
+            (before.serialize(), result.serialize()),
+        )
+        connection.commit()
+
+        with mock.patch.object(manager, 'capture_git_snapshot', return_value=changed), \
+             mock.patch.object(manager, '_blocked_agent_local_baseline') as baseline:
+            with self.assertRaisesRegex(AgentScopeError, '검증 이후 변경'):
+                manager.preserve_blocked_agent_changes(
+                    connection, 'repo', Path('/managed'), 'G-047',
+                    accept_current_input=True, validated_snapshot=validated,
+                )
+
+        baseline.assert_not_called()
+        self.assertEqual(tuple(connection.execute(
+            "SELECT agent_snapshot, agent_result_snapshot FROM projects WHERE repo='repo'",
+        ).fetchone()), (before.serialize(), result.serialize()))
+
+    def test_blocked_agent_preservation_resumes_pending_recovery_for_current_input(self):
+        before = snapshot()
+        recovery = {
+            "version": 1,
+            "state": "prepared",
+            "source_snapshot": before.serialize(),
+            "original_head": before.head,
+            "violation_head": before.head,
+            "branch": before.branch,
+            "stash_marker": "loop-manager scope violation G-047 recovery",
+            "violation_ref": "refs/loop-manager/violations/G-047",
+        }
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        connection.execute(
+            "UPDATE projects SET agent_snapshot=?, agent_result_snapshot=?, "
+            "agent_recovery=? WHERE repo='repo'",
+            (before.serialize(), before.serialize(), json.dumps(recovery)),
+        )
+        connection.commit()
+
+        with mock.patch.object(manager, 'capture_git_snapshot', return_value=before), \
+             mock.patch.object(manager, "_complete_blocked_agent_recovery") as complete:
+            preserved = manager.preserve_blocked_agent_changes(
+                connection, "repo", Path("/managed"), "G-047",
+                accept_current_input=True,
+                validated_snapshot=before,
+            )
+
+        self.assertEqual(preserved, before)
+        complete.assert_called_once_with(connection, "repo", Path("/managed"))
+
+    def test_blocked_plan_resume_detects_code_only_committed_candidate(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.recovery import blocked_plan_service
+        from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
+        from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
+        with tempfile.TemporaryDirectory() as directory:
+            worktree = Path(directory).resolve()
+            branch = 'loop-manager/G-047'
+            git_command(worktree, 'init', f'--initial-branch={branch}')
+            git_command(worktree, 'config', 'user.email', 'loop-manager@example.com')
+            git_command(worktree, 'config', 'user.name', 'Loop Manager Test')
+            source = worktree / 'src/app.py'
+            source.parent.mkdir()
+            source.write_text('VALUE = 1\n', encoding='utf-8')
+            git_command(worktree, 'add', 'src/app.py')
+            git_command(worktree, 'commit', '-m', 'blocked Agent result')
+            blocked_result = manager.capture_git_snapshot(worktree)
+            source.write_text('VALUE = 2\n', encoding='utf-8')
+            git_command(worktree, 'add', 'src/app.py')
+            git_command(worktree, 'commit', '-m', 'user code correction')
+            current = manager.capture_git_snapshot(worktree)
+            connection = runtime_connection()
+            self.addCleanup(connection.close)
+            connection.execute(
+                "UPDATE exec_plans SET status='IMPLEMENTING', active_sha='base', branch=?, "
+                "worktree=?, workspace_owned=1, blocked_fingerprint='old-input', "
+                "blocked_worktree_fingerprint='old-worktree', agent_result_snapshot=? "
+                "WHERE repo='repo' AND plan_id='G-047'",
+                (branch, str(worktree), blocked_result.serialize()),
+            )
+            connection.execute(
+                "UPDATE projects SET planning_attempt_fingerprint=NULL WHERE repo='repo'",
+            )
+            connection.commit()
+            RuntimeStateRepository(connection).block_plan(
+                'repo', 'G-047', reason_code=BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION.value,
+                evidence='saved scope violation', release_fingerprint='old-input',
+            )
+            current = GitSnapshot(
+                'user-head', branch, {'user.py': ('H 100644 staged-blob 0',)},
+                {'user.py': (('staged',), 'user content'),
+                 'extra.py': (('untracked',), 'additional user file')},
+                {f'refs/heads/{branch}': ('user-head', '')},
+                {str(worktree): ('HEAD=user-head', f'branch=refs/heads/{branch}')}, {}, {},
+            )
+            preserve = mock.Mock(return_value=current)
+            validate = mock.Mock(return_value=current)
+            effects = SimpleNamespace(
+                _blocked_execplan_metadata_error=mock.Mock(return_value=None),
+                _blocked_execplan_revision_metadata_error=mock.Mock(return_value=None),
+                _blocked_resume_worktree_matches=mock.Mock(return_value=True),
+                _complete_direct_rebase_checkpoint=mock.Mock(),
+                _direct_rebase_history_proven=mock.Mock(return_value=True),
+                _journaled_direct_rebase=mock.Mock(return_value=subprocess.CompletedProcess([], 0, '')),
+                _owned_rebase_journal_state=mock.Mock(return_value={}),
+                _plan_block_selected_for_release=lambda db, repo, **_kwargs: db.execute(
+                    'SELECT * FROM exec_plans WHERE repo=? AND plan_id=?', (repo, 'G-047'),
+                ).fetchone(),
+                _reconcile_rebase_evidence_block=mock.Mock(return_value=False),
+                _reconcile_scope_baseline_plan_block=mock.Mock(return_value=False),
+                _record_blocked_resume_head=mock.Mock(),
+                _requeue_blocked_execplan=mock.Mock(),
+                _restore_agent_staged_entries=mock.Mock(),
+                _resume_interrupted_blocked_rebase=mock.Mock(return_value=None),
+                _revision_execplan_input_fingerprint=mock.Mock(return_value='old-input'),
+                _revision_review_issue_fingerprint=mock.Mock(return_value=None),
+                _update_blocked_error=mock.Mock(),
+                _worktree_execplan_input_fingerprint=mock.Mock(return_value='old-worktree'),
+                capture_git_snapshot=mock.Mock(return_value=current),
+                clear_agent_scope=mock.Mock(),
+                git=mock.Mock(side_effect=lambda _path, *args, **_kwargs:
+                    subprocess.CompletedProcess([], 0, 'base\n') if args[0] == 'rev-parse'
+                    else subprocess.CompletedProcess([], 0, '')),
+                hydrate_execplan_project=mock.Mock(),
+                make_worktree=mock.Mock(),
+                preserve_blocked_agent_changes=preserve,
+                project_execplan=mock.Mock(),
+                remote_branch_oid=mock.Mock(return_value=None),
+                validate_blocked_agent_scope=validate,
+                validate_execplan_workspace_identity=mock.Mock(),
+            )
+
+            self.assertTrue(blocked_plan_service.resume_blocked_execplan_if_inputs_changed(
+                effects, connection, Path('/repo'), 'repo', 'main', Path('/state'),
+                plan_id='G-047',
+            ))
+            validate.assert_called_once()
+            self.assertTrue(validate.call_args.kwargs['changed_candidate'])
+            preserve.assert_called_once()
+            self.assertTrue(preserve.call_args.kwargs['accept_current_input'])
+            self.assertEqual(preserve.call_args.kwargs['validated_snapshot'], current)
+            self.assertIsNone(preserve.call_args.kwargs['preserved_input_path'])
 
     def test_dirty_blocked_baseline_and_security_flags_are_not_absorbed(self):
         before = snapshot(worktrees={str(Path('/managed').resolve()): ('HEAD=head', 'branch=refs/heads/loop-manager/G-047')})

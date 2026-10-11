@@ -322,6 +322,14 @@ class ProjectService:
                     manager_cleanup_worktrees=self.state.cleanup_candidates,
                     **({"runtime_mutation": self.identity.runtime_mutation} if self.identity.runtime_mutation is not None else {}),
                 )
+            except recovery_runtime.RecoveryFailure as error:
+                if error.reason is not recovery_runtime.RecoveryReason.REMOTE_SNAPSHOT_RACE:
+                    raise
+                self.effects._record_project_recovery(
+                    self.identity.connection, self.state.repo, error.reason, str(error),
+                    attempts=3,
+                )
+                return PROJECT_STEP_RETRY
             except AgentScopeError as error:
                 detail = str(error)
                 scope_result_snapshot = error.result_snapshot
@@ -608,15 +616,25 @@ class ProjectService:
 
     def _recheck_local_plan_blocks(self) -> int | None:
         """Use the same block policy without synchronizing unrelated PRs."""
-        self.effects.resume_plan_blocks(
-            self.identity.connection, self.state.repo_path, self.identity.state_dir, self.state.repo, self.state.base, self.identity.config_path,
-            self.identity.verify_timeout_seconds,
-            **({
-                "plan_id": self.identity.recovery_plan_id,
-                "force_timeout_recheck": True,
-                "recovery_request_id": self.identity.recovery_request_id,
-            } if self.identity.recovery_request_id else {}),
-        )
+        try:
+            self.effects.resume_plan_blocks(
+                self.identity.connection, self.state.repo_path, self.identity.state_dir,
+                self.state.repo, self.state.base, self.identity.config_path,
+                self.identity.verify_timeout_seconds,
+                **({
+                    "plan_id": self.identity.recovery_plan_id,
+                    "force_timeout_recheck": True,
+                    "recovery_request_id": self.identity.recovery_request_id,
+                } if self.identity.recovery_request_id else {}),
+            )
+        except recovery_runtime.RecoveryFailure as error:
+            if error.reason is not recovery_runtime.RecoveryReason.REMOTE_SNAPSHOT_RACE:
+                raise
+            self.effects._record_project_recovery(
+                self.identity.connection, self.state.repo, error.reason, str(error),
+                attempts=3,
+            )
+            return PROJECT_STEP_RETRY
         if scoped_blocking.project_block(self.identity.connection, self.state.repo) is not None:
             return 1
         self.state.row = self.identity.connection.execute(

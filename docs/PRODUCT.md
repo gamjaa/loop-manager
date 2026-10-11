@@ -41,10 +41,13 @@
 - 제품 문서는 동작과 장기 규칙, Requirement는 원하는 변화와 Acceptance Criteria, ExecPlan은 구현 계획을 기록한다. 자동 수정 권한은 각 문서의 기존 예외로 제한한다.
 - ExecPlan ID는 계획과 실행 이력을 연결하는 안정적인 식별자다. 실행 상태의 원본은 SQLite이며 문서에 상태를 기록하지 않는다.
 - 자동 작업은 최신으로 검증한 `origin/<base-branch>`를 기준으로 한다. 기본 worktree의 로컬 변경·commit은 보존하고 자동 입력에 포함하지 않는다.
+- Agent 범위 비교는 격리 ledger가 없거나 불완전한 legacy 실행에서도 기본 checkout과 로컬 base branch를 제외한다. 그 밖의 공유 ref·worktree·보안 설정은 격리 증거가 없으면 계속 검사한다. 선택한 원격 base의 전진은 원격 target·ancestry·live ref가 확인된 경우에만 일반 fetch로 재관측한다.
+- 일반 verify는 Agent ledger가 없다는 이유로 repository-wide 비교를 요구하지 않는다. 현재 verify 대상 worktree와 역할에 필요한 자원을 검사하며, 기본 checkout이나 검증과 무관한 ref·worktree 변화는 후보와 실제 검증 입력을 바꾸지 않는 한 성공을 막지 않는다.
 - 실행 중인 변경 작업은 다른 작업이 선점하지 않는다. 현재 작업에 적용되는 문서 변경은 각 단계 진입 전에 반영하며, 다른 작업의 선택은 기존 안전한 선택 경계를 따른다.
 - 같은 프로젝트의 변경 실행은 하나이며, 모든 선행 ExecPlan이 MERGED인 계획만 시작한다. 서로 다른 프로젝트는 `max_workers` 안에서 병렬 처리한다.
 - Agent는 선택된 관리 worktree와 역할별 허용 범위에서만 작업한다. 불확실한 소유권이나 실제 범위 위반은 자동으로 허용하지 않는다.
 - 실패·중단·차단 시 작업물·session·진단을 보존한다. 원인과 안전 조건이 실제로 해소된 작업만 재개한다.
+- BLOCKED 해제는 이전 Agent writer 종료와 현재 repository·계획·worktree·branch 소유권을 확인한 뒤 현재 후보를 새 입력으로 재검증한다. 현재 파일·index·HEAD를 과거 snapshot으로 대체하지 않고, 중단된 진단 복구가 있으면 저장 journal부터 재개한다. index 보안 flag, 미완료 Git operation, branch/worktree identity 불일치는 계속 차단한다.
 - 최종 후보의 관련 테스트·전체 검증·독립 Review가 성공해야 PR을 생성한다. 연결 PR의 실제 Merge만 MERGED와 완료의 근거다.
 - 사용자 변경을 승인 없이 삭제하거나 덮어쓰지 않는다. 정리 안전성을 확인할 수 없는 worktree는 보존한다.
 - 같은 사용자 상태 디렉터리에서는 자동 실행을 하나만 허용한다. 수동 명령의 준비는 계획과 실제 자원의 소유권을 원자적으로 확인·예약한 뒤 동시에 수행할 수 있다. 로컬 복구 요청도 동시에 접수할 수 있으며 실제 복구는 전역 실행 잠금과 프로젝트 실행 자리를 준수한다.

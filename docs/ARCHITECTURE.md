@@ -159,6 +159,10 @@ due 유지보수의 선택·진행 작업의 비선점 정책은 PRODUCT의 [작
 
 작업·동기화·복구가 관여하는 branch는 등록한 base와 소유권을 확인한 Loop Manager 생성 branch다. 그 밖의 사용자 branch는 생성·수정·삭제를 되돌리거나 자동 복구 대상으로 삼지 않으며, 그 변화만으로 계획·프로젝트를 차단하지 않는다. 이름이 비슷하다는 이유로 관리 branch로 간주하지 않는다. 실제 사용 중인 origin·관리 branch·worktree 등 공유 자원의 안전 검사는 유지한다.
 
+Scope snapshot과 격리 증거는 원문 그대로 보존하고, 비교할 때만 기본 checkout과 로컬 base branch를 양쪽에서 제외한다. 이 투영은 legacy·불완전 invocation에도 적용하지만 나머지 공유 ref·worktree·config는 엄격히 비교하며 격리 성공을 합성하지 않는다. 사용 중인 `origin/<base>`의 정상 전진은 설정된 `origin`에서 같은 branch OID, ancestry, live tracking ref를 확인하고 `origin/HEAD`가 같은 target을 가리킬 때만 snapshot 비교 기준에 반영한다. 최초 `origin/HEAD` 생성도 실제 원격 symbolic HEAD와 target을 확인한다. 원문 snapshot과 Manager 전이 receipt는 그대로 둔다.
+
+Agent preflight는 현재 호출의 역할·단계·작업 branch·worktree에서 사용되는 자원으로 Git snapshot digest를 계산하며, 저장된 owner 정보를 찾지 못하면 전체 snapshot 비교를 유지한다. 선택 원격 base의 변화는 일반 scope 검사와 같은 원격·ancestry·live ref 확인을 통과한 경우에만 digest 기준선에 반영한다. Worker의 post-call 검증과 일반 verify는 각각 `IMPLEMENTING`·`VERIFYING` 자원 집합을 명시해 Agent ledger가 없는 경우에도 현재 작업 scope를 사용한다. BLOCKED 재평가는 저장된 Agent 결과를 먼저 원래 증거로 검증한다. 이후 repository·계획·worktree·branch identity와 현재 branch ref 등록을 확인한 선택 worktree의 파일·index·HEAD만 새 사용자 입력으로 기준선에 반영한다. 기준 snapshot·결과·session은 수정하지 않으며, 보안 index flag·미완료 Git operation·소유권 불일치와 격리 증거가 없는 legacy 비교의 비선택 공유 자원 변경은 계속 검사한다.
+
 ### 기본 worktree 동기화
 
 | 상태 | 처리 |
@@ -547,7 +551,9 @@ ExecPlan archive는 원본 hash, regular-file source, 비어 있는 destination�
 
 동일 입력의 planning_error도 보존된 작업의 소유권·종료 호출·저장 결과를 확인해 재평가한다. 원본 결과가 저장된 scope 오류를 재현하고 ignored 비교 view만 통과하며 결과 이후의 권위 변경이 없을 때만 해당 오류를 해제한다. 차단 identity·현재 Git 상태를 transaction에서 다시 대조하고 session·retry·실패 진단을 보존한다. Planner의 ignored-only PROJECT_BLOCKED 해제는 현재 planning worktree 소유권과 저장 결과 이후의 권위 변경을 검사하며 확정 transaction에서 소유권을 다시 확인한다. ignored-only PLAN_BLOCKED는 기존 실행 격리·Manager 전이 증거를 적용한 결과가 현재 후보와 같을 때 저장한 차단 전 실행 단계와 Worker·verify·Review 결과를 이어간다. 새 verify 호출은 먼저 이전 완료 표식을 무효화하고, 통과한 호출은 HEAD가 동일하고 tracked·staged·non-ignored 미커밋 변경이 없을 때만 scope 검사 전에 후보·저장 출력에 결합한 성공 token을 기록한다. 저장 verify 결과는 validated base와 definition·출력 token이 현재 후보 HEAD와 일치할 때만 완료 증거로 인정해 `REVIEWING`으로 재개하며, 구형 `verify-stage` token은 시작·저장 결과·현재 후보 HEAD가 같고 ignored 비교 view의 결과·현재 상태가 깨끗하며, 해당 계획의 최신 불변 verify 감사가 계획에 저장된 `current_revision_sha`(verify 감사의 정의 commit) 및 성공·저장 출력과 일치할 때만 해제 transaction에서 출력 결합 token으로 전환한다. 원본 snapshot·결과·감사는 보존하고 이후 revision gate·Review·게시에서도 전환한 증거를 사용한다. 그 증명이 불완전하거나 미커밋 변경이 있으면 기존 commit·새 후보 재검증 경계를 적용한다.
 
-현행 Agent 감시 축소는 호출·역할·session·repository·관리 worktree에 결합된 격리 증거를 요구하며 증거 없는 snapshot은 엄격 비교로 남는다. R-055·G-199는 이 중 legacy 기본 checkout 제외, 일반 verify의 실행 대상 검사와 전체 preflight digest gate 제거를 구현하도록 변경한다. 현재 자원·origin·보안 설정·writer·후보 입력은 계속 검사하고 수행하지 않은 과거 격리 성공을 합성하지 않는다. 신규 호출의 provider 격리는 유지한다.
+Agent 범위 판정은 호출·역할·session·repository·관리 worktree에 결합된 격리 증거와 현재 자원 검사를 구분한다. 격리 증거가 없거나 불완전한 legacy 실행도 기본 checkout과 로컬 base branch를 비교에서 제외하지만, 선택 worktree·branch·사용 자원·origin·보안 설정·writer·후보 입력은 계속 검사한다. 정상 외부 fetch의 선택 base ref는 등록 origin, 예상 원격 target, ancestry와 live tracking ref를 확인해 재관측한다. 조회 실패나 관측 경쟁은 원래 snapshot으로 되돌려 범위 위반으로 판정하지 않고 `REMOTE_SNAPSHOT_RACE` 재시도로 넘긴다. 재관측은 Manager receipt를 만들거나 신규 호출의 provider 격리를 대체하지 않는다.
+
+BLOCKED 계획의 현재 입력은 이전 Agent writer 종료와 repository·계획·worktree·branch 소유권을 확인한 뒤 새 후보로 검증하고, 과거 snapshot과 결과·session은 감사 자료로 보존한다. 후보가 저장된 Agent 결과에 머물거나 선택 ExecPlan만 추가 수정됐다면 진단 복구 journal로 Agent 변경을 격리하고 사용자의 계획 입력을 원자적으로 다시 적용한다. 그 밖의 검증된 현재 파일·index·HEAD는 그대로 다음 입력으로 넘기며 과거 snapshot으로 복원하지 않는다. 중단된 복구는 저장 journal부터 재개하고, 미완료 Git operation·보안 index flag·소유권 변경이나 입력 검증과 보존 사이의 snapshot 변경은 계속 차단한다.
 
 Agent 시작 이후 Manager의 fetch·worktree 전이는 작업별 전후 기대값·소유 표식·checkpoint와 현재 Git 상태가 일치하는 자원만 비교 기준선에 반영한다. 관측 OID, SQLite 완료 상태나 예정된 cleanup만으로 전체 ref·worktree를 갱신하지 않으며, Git 변경 뒤 receipt 저장 전 중단에서도 같은 증거를 읽기 전용으로 확인한다. 원본 scope와 재개 호출의 비교 시작값을 별도로 보존해 후속 Manager 전이가 실제 Agent 위반을 덮지 않게 하며, Agent 허용 변경·session·격리 증거를 유지한다
 

@@ -156,16 +156,66 @@ def used_git_resources(*, role: str, phase: str, base_branch: str,
 
 
 def scoped_metadata(before: GitSnapshot, after: GitSnapshot,
-                    resources: GitResources | None) -> tuple[GitSnapshot, GitSnapshot]:
+                    resources: GitResources | None, *,
+                    default_worktree: str | None = None,
+                    selected_worktree: str | None = None,
+                    base_branch: str | None = None) -> tuple[GitSnapshot, GitSnapshot]:
     """Keep full snapshots for audit; project only the comparison operands."""
-    if resources is None:
+    if resources is None and default_worktree is None and not base_branch:
         return before, after
+    compare_default_registration = bool(
+        default_worktree and default_worktree != selected_worktree
+    )
+    default_was_registered = bool(
+        compare_default_registration and default_worktree in before.worktrees
+    )
     def project(snapshot):
+        refs = ({key: value for key, value in snapshot.refs.items() if key in resources.refs}
+                if resources is not None else dict(snapshot.refs))
+        worktrees = ({key: value for key, value in snapshot.worktrees.items()
+                      if key in resources.worktrees or key == default_worktree}
+                     if resources is not None else dict(snapshot.worktrees))
+        if compare_default_registration:
+            if not default_was_registered:
+                worktrees.pop(default_worktree, None)
+            elif default_worktree in worktrees:
+                # Ignore valid checkout state but retain registration identity
+                # so a removed or malformed primary worktree still fails.
+                worktrees[default_worktree] = tuple(
+                    field for field in worktrees[default_worktree]
+                    if not field.startswith(("HEAD=", "state="))
+                    and not (
+                        field == "detached"
+                        or field.startswith("branch=refs/heads/")
+                        and len(field) > len("branch=refs/heads/")
+                    )
+                )
+        if base_branch:
+            refs.pop(f"refs/heads/{base_branch}", None)
         return replace(snapshot,
-            refs={key: value for key, value in snapshot.refs.items() if key in resources.refs},
-            worktrees={key: value for key, value in snapshot.worktrees.items() if key in resources.worktrees},
-            config=resources.config(snapshot.config))
+            refs=refs,
+            worktrees=worktrees,
+            config=resources.config(snapshot.config) if resources is not None else snapshot.config)
     return project(before), project(after)
+
+
+def invocation_scope_digest(snapshot: GitSnapshot, *, role: str, phase: str,
+                            base_branch: str, branch: str | None,
+                            worktree_key: str,
+                            default_worktree: str | None = None) -> str:
+    """Fingerprint the current workspace and the Git resources this call uses."""
+    resources = used_git_resources(
+        role=role, phase=phase, base_branch=base_branch, branch=branch,
+        worktree_key=worktree_key,
+    )
+    _, projected = scoped_metadata(
+        snapshot, snapshot, resources,
+        default_worktree=default_worktree, selected_worktree=worktree_key,
+        base_branch=base_branch,
+    )
+    identity = "\0".join((role, phase, base_branch, branch or "", worktree_key,
+                           default_worktree or ""))
+    return hashlib.sha256((identity + "\0" + projected.serialize()).encode()).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -232,6 +282,7 @@ def blocked_agent_local_baseline(
     worktree_key: str,
     *,
     allowed_dirty_paths: frozenset[str] = frozenset(),
+    accept_current_input: bool = False,
 ) -> GitSnapshot:
     if not all(snapshot.shared_metadata_complete for snapshot in (before, result, current)):
         raise ScopeDecisionError("저장된 BLOCKED Agent Git metadata 기준 snapshot이 없습니다.")
@@ -239,6 +290,37 @@ def blocked_agent_local_baseline(
         if index_security_flags(before.index.get(path, ())) != index_security_flags(current.index.get(path, ())))
     if flagged_paths:
         raise ScopeDecisionError('BLOCKED index flags 변경: ' + ', '.join(flagged_paths[:8]))
+    if accept_current_input:
+        if before.operations or current.operations:
+            raise ScopeDecisionError("BLOCKED 인계에 미해결 Git operation이 있습니다.")
+        if before.branch != current.branch:
+            raise ScopeDecisionError("BLOCKED 인계의 소유 branch가 변경됐습니다.")
+        previous_registration = before.worktrees.get(worktree_key)
+        current_registration = current.worktrees.get(worktree_key)
+        if previous_registration is None or current_registration is None:
+            raise ScopeDecisionError("BLOCKED 인계 worktree 등록을 확인할 수 없습니다.")
+        def without_head(registration):
+            return tuple(field for field in registration if not field.startswith("HEAD="))
+        if without_head(previous_registration) != without_head(current_registration):
+            raise ScopeDecisionError("BLOCKED 인계 worktree identity가 변경됐습니다.")
+        if f"HEAD={current.head}" not in current_registration:
+            raise ScopeDecisionError("BLOCKED 인계 worktree HEAD가 현재 입력과 다릅니다.")
+        if current.branch is None:
+            if current.head != before.head:
+                raise ScopeDecisionError("detached BLOCKED worktree의 새 commit 소유권을 확인할 수 없습니다.")
+        else:
+            ref = f"refs/heads/{current.branch}"
+            if (before.refs.get(ref) != (before.head, "")
+                    or current.refs.get(ref) != (current.head, "")
+                    or f"branch={ref}" not in current_registration):
+                raise ScopeDecisionError("BLOCKED 인계 branch ref 소유권이 일치하지 않습니다.")
+        refs = dict(before.refs)
+        if current.branch is not None:
+            refs[f"refs/heads/{current.branch}"] = current.refs[f"refs/heads/{current.branch}"]
+        return replace(
+            before, head=current.head, index=current.index, dirty=current.dirty,
+            refs=refs, worktrees={**before.worktrees, worktree_key: current_registration},
+        )
     new_local_changes: set[str] = set()
     for state_name, before_state, result_state, current_state in (
         ("index", before.index, result.index, current.index),
@@ -399,6 +481,7 @@ def decide_persisted_scope(
             scope_before = blocked_agent_local_baseline(
                 checkpoint.snapshot, checkpoint.snapshot, current, worktree_key,
                 allowed_dirty_paths=frozenset((selected_plan_path,)),
+                accept_current_input=True,
             )
         allowed_cleanup = checkpoint.cleanup_worktrees | manager_cleanup_worktrees
         checks.append(ScopeCheck(
@@ -414,6 +497,7 @@ def decide_persisted_scope(
         scope_before = blocked_agent_local_baseline(
             before, result, current, worktree_key,
             allowed_dirty_paths=(frozenset((selected_plan_path,)) if selected_plan_path else frozenset()),
+            accept_current_input=True,
         )
         scope_before, commit_refs, commit_worktrees = diagnosed_blocked_commit_allowances(
             before, result, current, worktree_key, scope_before,

@@ -16,6 +16,16 @@ class ScopeValidationMutationsTest(AgentScopeFixture, unittest.TestCase):
 
     @dummy_worker_sessions
     def test_reviewer_mutation_blocks_even_when_verdict_passes(self):
+        origin_parser = mock.patch(
+            "loop_manager_internal.git.git_adapter.github_repository",
+            return_value="owner/repo",
+        )
+        origin_parser.start()
+        self.addCleanup(origin_parser.stop)
+        manager_origin_parser = mock.patch.object(
+            loop_manager, "github_repository", return_value="owner/repo")
+        manager_origin_parser.start()
+        self.addCleanup(manager_origin_parser.stop)
         isolation = mock.patch.object(loop_manager, '_agent_git_resources', side_effect=isolated_scope_resources)
         isolation.start()
         self.addCleanup(isolation.stop)
@@ -39,9 +49,9 @@ class ScopeValidationMutationsTest(AgentScopeFixture, unittest.TestCase):
             connection.execute(
                 """
                 INSERT INTO projects (
-                    repo, base_branch, active_sha, plan_sha, phase, branch,
+                    repo, base_branch, origin, active_sha, plan_sha, phase, branch,
                     worktree, plan_path, worker_result, verify_result
-                ) VALUES (?, 'main', ?, ?, 'VERIFYING', ?, ?, ?, ?, ?)
+                ) VALUES (?, 'main', 'owner/repo', ?, ?, 'VERIFYING', ?, ?, ?, ?, ?)
                 """,
                 (
                     str(repo),
@@ -133,7 +143,6 @@ class ScopeValidationMutationsTest(AgentScopeFixture, unittest.TestCase):
             )
             self.assertTrue((worktree / "reviewer.txt").is_file())
 
-            blocked_error = plan["last_error"]
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo
             ), mock.patch(
@@ -165,7 +174,8 @@ class ScopeValidationMutationsTest(AgentScopeFixture, unittest.TestCase):
             ).fetchone()
             self.assertEqual(unchanged_result, 0)
             self.assertIsNone(unchanged_project["phase"])
-            self.assertEqual(unchanged_plan["last_error"], blocked_error)
+            self.assertIn("docs/PRODUCT.md", unchanged_plan["last_error"])
+            self.assertIn("reviewer.txt (untracked, worktree)", unchanged_plan["last_error"])
             self.assertEqual(unchanged_plan["status"], "PLAN_BLOCKED")
             self.assertEqual(
                 unchanged_plan["blocked_fingerprint"],

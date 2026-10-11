@@ -27,6 +27,96 @@ def decide(before, current, *, role="worker", phase="IMPLEMENTING", result=None,
 
 
 class PersistedScopeDecisionTests(unittest.TestCase):
+    def test_invocation_scope_digest_tracks_selected_inputs_and_ignores_unrelated_checkout_state(self):
+        ref, head = 'refs/remotes/origin/main', 'refs/remotes/origin/HEAD'
+        own = 'refs/heads/loop-manager/G-051'
+        before = snapshot(
+            refs={ref: ('a', ''), head: ('a', ref), own: ('a', ''),
+                  'refs/heads/main': ('local', ''), 'refs/heads/unrelated': ('other', '')},
+            worktrees={WORKTREE: ('HEAD=a', 'branch=' + own),
+                       REPO: ('HEAD=local', 'state=clean'),
+                       '/outside': ('HEAD=outside',)},
+            config={'local:core.hooksPath': ('secure',),
+                    'local:branch.unrelated.remote': ('old',)},
+        )
+        digest = decision.invocation_scope_digest(
+            before, role='worker', phase='IMPLEMENTING', base_branch='main',
+            branch='loop-manager/G-051', worktree_key=WORKTREE, default_worktree=REPO,
+        )
+        self.assertNotEqual(decision.invocation_scope_digest(
+            before, role='worker', phase='IMPLEMENTING', base_branch='main',
+            branch='loop-manager/other', worktree_key=WORKTREE, default_worktree=REPO,
+        ), digest)
+        unrelated = replace(before,
+            refs={**before.refs, 'refs/heads/main': ('new-local', ''),
+                  'refs/heads/unrelated': ('new-other', '')},
+            worktrees={**before.worktrees, REPO: ('HEAD=changed', 'branch=refs/heads/user-local', 'state=dirty'),
+                       '/outside': ('HEAD=other',)},
+            config={'local:core.hooksPath': ('secure',),
+                    'local:branch.unrelated.remote': ('new',)},
+        )
+        self.assertEqual(decision.invocation_scope_digest(
+            unrelated, role='worker', phase='IMPLEMENTING', base_branch='main',
+            branch='loop-manager/G-051', worktree_key=WORKTREE, default_worktree=REPO,
+        ), digest)
+        branch_changed = replace(before,
+            worktrees={**before.worktrees, REPO: ('HEAD=local', 'branch=other')})
+        self.assertNotEqual(decision.invocation_scope_digest(
+            branch_changed, role='worker', phase='IMPLEMENTING', base_branch='main',
+            branch='loop-manager/G-051', worktree_key=WORKTREE, default_worktree=REPO,
+        ), digest)
+        registration_removed = replace(before,
+            worktrees={key: value for key, value in before.worktrees.items() if key != REPO})
+        self.assertNotEqual(decision.invocation_scope_digest(
+            registration_removed, role='worker', phase='IMPLEMENTING', base_branch='main',
+            branch='loop-manager/G-051', worktree_key=WORKTREE, default_worktree=REPO,
+        ), digest)
+        for changed in (
+            replace(before, refs={**before.refs, ref: ('b', '')}),
+            replace(before, dirty={'src/app.py': (('unstaged',), 'changed')}),
+            replace(before, config={'local:core.hooksPath': ('unsafe',)}),
+        ):
+            with self.subTest(changed=changed):
+                self.assertNotEqual(decision.invocation_scope_digest(
+                    changed, role='worker', phase='IMPLEMENTING', base_branch='main',
+                    branch='loop-manager/G-051', worktree_key=WORKTREE, default_worktree=REPO,
+                ), digest)
+
+    def test_blocked_handoff_accepts_current_local_input_without_rewriting_history(self):
+        branch = 'loop-manager/G-051'
+        ref = f'refs/heads/{branch}'
+        before = snapshot(
+            head='old', branch=branch, refs={ref: ('old', '')},
+            worktrees={WORKTREE: ('HEAD=old', f'branch={ref}', 'locked=owner')},
+        )
+        result = replace(before, dirty={'src/agent.py': (('unstaged',), 'agent result')})
+        current = replace(
+            result, head='user-commit',
+            index={'src/user.py': ('H 100644 new-blob 0',)},
+            dirty={'src/user.py': (('staged',), 'user input')},
+            refs={ref: ('user-commit', '')},
+            worktrees={WORKTREE: ('HEAD=user-commit', f'branch={ref}', 'locked=owner')},
+        )
+        original = before.serialize()
+        accepted = decision.blocked_agent_local_baseline(
+            before, result, current, WORKTREE, accept_current_input=True,
+        )
+        self.assertEqual((accepted.head, accepted.index, accepted.dirty),
+                         (current.head, current.index, current.dirty))
+        self.assertEqual(accepted.refs[ref], current.refs[ref])
+        self.assertEqual(accepted.worktrees[WORKTREE], current.worktrees[WORKTREE])
+        self.assertEqual(before.serialize(), original)
+        for invalid in (
+            replace(current, branch='other'),
+            replace(current, refs={ref: ('wrong', '')}),
+            replace(current, operations={'rebase-merge': 'operation'}),
+            replace(current, index={'src/user.py': ('S 100644 new-blob 0',)}),
+        ):
+            with self.subTest(invalid=invalid), self.assertRaises(decision.ScopeDecisionError):
+                decision.blocked_agent_local_baseline(
+                    before, result, invalid, WORKTREE, accept_current_input=True,
+                )
+
     def test_selected_runtime_and_proven_current_base_are_distinct_operands(self):
         ref, head, runtime = 'refs/remotes/origin/develop', 'refs/remotes/origin/HEAD', '/state/runtime/b'
         before = snapshot(refs={ref: ('a', ''), head: ('a', ref)})
@@ -200,7 +290,7 @@ class PersistedScopeDecisionTests(unittest.TestCase):
 
     def test_worker_and_reviewer_preserve_unallowed_shared_changes(self):
         before = snapshot()
-        current = replace(before, refs={**before.refs, "refs/heads/unowned": ("b", "commit")})
+        current = replace(before, refs={**before.refs, "refs/heads/unowned": ("b", "")})
         for role in ("worker", "reviewer"):
             with self.subTest(role=role):
                 check, = decide(before, current, role=role).checks
@@ -212,9 +302,9 @@ class PersistedScopeDecisionTests(unittest.TestCase):
 
     def test_planner_correction_allows_only_diagnosed_later_metadata(self):
         before = snapshot()
-        result = replace(before, head="b", refs={**before.refs, "refs/heads/main": ("b", "commit")})
-        current = replace(result, refs={**result.refs, "refs/heads/main": ("c", "commit"),
-                                        "refs/heads/unowned": ("z", "commit")})
+        result = replace(before, head="b", refs={**before.refs, "refs/heads/main": ("b", "")})
+        current = replace(result, refs={**result.refs, "refs/heads/main": ("c", ""),
+                                        "refs/heads/unowned": ("z", "")})
         check, = decide(before, current, role="planner", result=result,
                         planner_correction=True).checks
         self.assertEqual(check.before.head, "b")
@@ -226,10 +316,10 @@ class PersistedScopeDecisionTests(unittest.TestCase):
         before = snapshot()
         result = snapshot(
             head="b",
-            refs={"refs/heads/loop-manager/G-051": ("b", "commit")},
+            refs={"refs/heads/loop-manager/G-051": ("b", "")},
             worktrees={WORKTREE: ("HEAD=b", "branch=refs/heads/loop-manager/G-051")},
         )
-        current = replace(result, refs={**result.refs, "refs/remotes/origin/main": ("c", "commit")},
+        current = replace(result, refs={**result.refs, "refs/remotes/origin/main": ("c", "")},
                           worktrees={**result.worktrees, REPO: ("HEAD=c",)})
         check, = decide(before, current, phase="PLAN_BLOCKED", result=result,
                         manager_refs=frozenset({'refs/remotes/origin/main'})).checks
@@ -268,13 +358,14 @@ class PersistedScopeDecisionTests(unittest.TestCase):
                         result=replace(before, shared_metadata_complete=False)).checks
         self.assertEqual(check.before, before)
         self.assertEqual(check.allowed_refs, frozenset())
-        with self.assertRaisesRegex(decision.ScopeDecisionError, "관리 worktree 등록"):
+        with self.assertRaisesRegex(decision.ScopeDecisionError, "BLOCKED 인계 worktree 등록"):
             decide(before, replace(before, worktrees={}), phase="PLAN_BLOCKED", result=before)
 
     def test_new_blocked_local_change_is_rejected_without_expanding_allowance(self):
         before = snapshot()
-        current = replace(before, dirty={"src/unrelated.py": (("unstaged",), "new")})
-        with self.assertRaisesRegex(decision.ScopeDecisionError, "src/unrelated.py"):
+        current = replace(before, branch="unowned",
+                          dirty={"src/unrelated.py": (("unstaged",), "new")})
+        with self.assertRaisesRegex(decision.ScopeDecisionError, "소유 branch"):
             decide(before, current, phase="PLAN_BLOCKED", result=before)
 
     def test_observed_fetch_drift_without_operation_proof_gets_no_allowance(self):
@@ -448,7 +539,7 @@ class WorkerPlanDocumentScopeTests(unittest.TestCase):
         after = replace(before, dirty={self.related_plan: (("unstaged",), "inventory-update")})
         for unsafe in (
             replace(after, index={self.related_plan: ("S 100644 inventory 0",)}),
-            replace(after, refs={**after.refs, "refs/heads/unowned": ("foreign", "commit")}),
+            replace(after, refs={**after.refs, "refs/heads/unowned": ("foreign", "")}),
         ):
             with self.subTest(unsafe=unsafe), self.assertRaises(AgentScopeError):
                 validate_agent_scope("worker", Path(WORKTREE), before, unsafe,

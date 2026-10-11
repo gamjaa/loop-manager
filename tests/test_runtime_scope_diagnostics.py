@@ -71,6 +71,7 @@ class RuntimeScopeDiagnosticTests(unittest.TestCase):
 
 class RuntimeFalsePositiveBaseTests(unittest.TestCase):
     def test_false_positive_uses_registered_base_and_keeps_mixed_violation(self):
+        from types import SimpleNamespace
         from loop_manager_internal.recovery import project_block_service
         runtime = str(Path('/state/runtime/b').resolve())
         mutation = RuntimeMutation(Path('/source'), Path(runtime), 'b', 'owned')
@@ -85,9 +86,15 @@ class RuntimeFalsePositiveBaseTests(unittest.TestCase):
                     effects = project_block_service.ReconcileFalsePositiveRuntimeBlockEffects(
                         _canonical_path=lambda path: path,
                         capture_git_snapshot=mock.Mock(return_value=result),
+                        git=lambda _repo, *args, **_kwargs: SimpleNamespace(
+                            returncode=0,
+                            stdout=(f'b\trefs/heads/{base}\n' if args[0] == 'ls-remote'
+                                    else 'b\n' if args[0] == 'rev-parse'
+                                    else 'https://github.com/owner/repo.git\n' if args[0] == 'remote' else ''),
+                        ),
                         operation_log=mock.Mock(), validate_persisted_agent_scope=mock.Mock())
                     project = {'agent_snapshot': before.serialize(), 'agent_result_snapshot': result.serialize(),
-                               'worktree': '/managed', 'base_branch': base}
+                               'worktree': '/managed', 'base_branch': base, 'origin': 'owner/repo'}
                     original = dict(project)
                     accepted = project_block_service.reconcile_false_positive_runtime_block(
                         effects, None, Path('/source'), Path('/state'), '/source', project,
@@ -102,7 +109,7 @@ class RuntimeFalsePositiveBaseTests(unittest.TestCase):
 
 
 class ExternalBaseAdvanceUnitTests(unittest.TestCase):
-    def test_live_forward_and_symbolic_head_require_isolation_and_keep_original(self):
+    def test_live_forward_and_symbolic_head_accept_without_isolation_and_keep_original(self):
         from types import SimpleNamespace
         from loop_manager_internal.git.base_fetch_service import reconcile_external_base
         from loop_manager_internal.agents.agent_scope_decision import used_git_resources
@@ -119,20 +126,132 @@ class ExternalBaseAdvanceUnitTests(unittest.TestCase):
                         output = ('ref: refs/heads/' + base + '\tHEAD\nc\tHEAD\n'
                                   if '--symref' in args else 'c\trefs/heads/' + base + '\n')
                         return SimpleNamespace(returncode=0, stdout=output)
+                    if args[0] == 'remote':
+                        return SimpleNamespace(returncode=0, stdout='https://github.com/owner/repo.git\n')
                     return SimpleNamespace(returncode=0, stdout='c\n')
                 self.assertEqual(reconcile_external_base(git, Path('/source'), base,
-                    before, current, resources).refs, current.refs)
+                    before, current, resources, registered_origin='owner/repo').refs, current.refs)
                 self.assertEqual(before.serialize(), original)
-                self.assertIs(reconcile_external_base(git, Path('/source'), base, before, current, None), before)
+                self.assertEqual(reconcile_external_base(
+                    git, Path('/source'), base, before, current, None,
+                    registered_origin='owner/repo').refs, current.refs)
+                def wrong_origin(_repo, *args, **kwargs):
+                    if args[0] == 'remote':
+                        return SimpleNamespace(returncode=0, stdout='https://github.com/other/repo.git\n')
+                    return git(_repo, *args, **kwargs)
+                self.assertIs(reconcile_external_base(
+                    wrong_origin, Path('/source'), base, before, current, None,
+                    registered_origin='owner/repo'), before)
                 for invalid in (({ref: ('c', '')},) if not created else ()) + ({ref: ('c', ''), head: ('c', 'refs/heads/other')},
                                 {ref: ('c', ''), head: ('wrong', ref)}, {head: ('c', ref)}):
                     self.assertIs(reconcile_external_base(git, Path('/source'), base,
-                        before, replace(current, refs=invalid), resources), before)
+                        before, replace(current, refs=invalid), resources,
+                        registered_origin='owner/repo'), before)
                 for failure in ('ls-remote', 'merge-base', 'rev-parse'):
                     def unavailable(repo, *args, **kwargs):
                         return SimpleNamespace(returncode=1, stdout='') if args[0] == failure else git(repo, *args, **kwargs)
-                    self.assertIs(reconcile_external_base(unavailable, Path('/source'), base,
-                        before, current, resources), before)
+                    if failure == 'merge-base':
+                        self.assertIs(reconcile_external_base(unavailable, Path('/source'), base,
+                            before, current, resources, registered_origin='owner/repo'), before)
+                    else:
+                        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure
+                        with self.assertRaises(RecoveryFailure):
+                            reconcile_external_base(unavailable, Path('/source'), base,
+                                before, current, resources, registered_origin='owner/repo')
+
+    def test_remote_advance_race_is_accepted_by_scope_consumer(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.agents import scope_validation
+        from loop_manager_internal.agents.agent_scope_decision import used_git_resources
+        ref, head = 'refs/remotes/origin/main', 'refs/remotes/origin/HEAD'
+        before = snapshot(refs={ref: ('a', ''), head: ('a', ref)})
+        current = replace(before, refs={ref: ('b', ''), head: ('b', ref)})
+        remote_reads = 0
+
+        def git(_repo, *args, **_kwargs):
+            nonlocal remote_reads
+            if args[0] == 'remote':
+                return SimpleNamespace(returncode=0, stdout='https://github.com/owner/repo.git\n')
+            if args[0] == 'ls-remote':
+                remote_reads += 1
+                oid = 'b' if remote_reads == 1 else 'c'
+                return SimpleNamespace(returncode=0, stdout=f'{oid}\trefs/heads/main\n')
+            if args[0] == 'rev-parse':
+                return SimpleNamespace(returncode=0, stdout='b\n')
+            if args[0] == 'merge-base':
+                return SimpleNamespace(returncode=0, stdout='')
+            return SimpleNamespace(returncode=0, stdout='')
+
+        validation_effects = scope_validation.ScopeValidationEffects(
+            _agent_git_resources=lambda *_args, **_kwargs: None,
+            repository=lambda _connection: SimpleNamespace(
+                scope_owner=lambda *_args: {'origin': 'owner/repo'},
+            ),
+            _current_rebase_service=mock.Mock(),
+            _git_common_directory=lambda _path: Path('/common'),
+            _owned_rebase_state_dir=lambda *_args: None,
+            _plan_id_from_path=lambda _path: 'G-199',
+            _rebase_in_progress_for_branch=lambda *_args: False,
+            _scope_snapshot_with_start_ignore_rules=lambda _worktree, _before, after: after,
+            agent_snapshot_changes=lambda *_args: [],
+            capture_git_snapshot=lambda _worktree: current,
+            git=git,
+            operation_log=mock.Mock(),
+            validate_managed_worktree=mock.Mock(),
+        )
+        scope_validation.validate_agent_scope(
+            'worker', Path('/managed'), before, current,
+            selected_plan_path='docs/plans/[G-199] Work.md',
+            external_worktree=Path('/source'), base_branch='main',
+            connection=object(),
+            resources=used_git_resources(role='worker', phase='WORKING',
+                base_branch='main', branch=before.branch, worktree_key='/managed'),
+            effects=validation_effects,
+        )
+        self.assertEqual(remote_reads, 2)
+
+    def test_external_base_observation_failure_is_transient(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.agents import scope_validation
+        from loop_manager_internal.agents.agent_scope_decision import used_git_resources
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+        ref, head = 'refs/remotes/origin/main', 'refs/remotes/origin/HEAD'
+        before = snapshot(refs={ref: ('a', ''), head: ('a', ref)})
+        current = replace(before, refs={ref: ('b', ''), head: ('b', ref)})
+        def unavailable(_repo, *args, **_kwargs):
+            if args[0] == 'remote':
+                return SimpleNamespace(returncode=0, stdout='https://github.com/owner/repo.git\n')
+            if args[0] == 'ls-remote':
+                return SimpleNamespace(returncode=1, stdout='')
+            return SimpleNamespace(returncode=0, stdout='b\n')
+        validation_effects = scope_validation.ScopeValidationEffects(
+            _agent_git_resources=lambda *_args, **_kwargs: None,
+            repository=lambda _connection: SimpleNamespace(
+                scope_owner=lambda *_args: {'origin': 'owner/repo'},
+            ),
+            _current_rebase_service=mock.Mock(),
+            _git_common_directory=lambda _path: Path('/common'),
+            _owned_rebase_state_dir=lambda *_args: None,
+            _plan_id_from_path=lambda _path: 'G-199',
+            _rebase_in_progress_for_branch=lambda *_args: False,
+            _scope_snapshot_with_start_ignore_rules=lambda _worktree, _before, after: after,
+            agent_snapshot_changes=lambda *_args: [],
+            capture_git_snapshot=lambda _worktree: current,
+            git=unavailable,
+            operation_log=mock.Mock(),
+            validate_managed_worktree=mock.Mock(),
+        )
+        with self.assertRaises(RecoveryFailure) as caught:
+            scope_validation.validate_agent_scope(
+                'worker', Path('/managed'), before, current,
+                selected_plan_path='docs/plans/[G-199] Work.md',
+                external_worktree=Path('/source'), base_branch='main',
+                connection=object(),
+                resources=used_git_resources(role='worker', phase='WORKING',
+                    base_branch='main', branch=before.branch, worktree_key='/managed'),
+                effects=validation_effects,
+            )
+        self.assertEqual(caught.exception.reason, RecoveryReason.REMOTE_SNAPSHOT_RACE)
 
     def test_checkpoint_accepts_only_proven_derived_head_and_preserves_other_refs(self):
         # Test the same pure normalization used before checkpoint ref checks.

@@ -432,6 +432,7 @@ _invocation_service_effects = _bind_effects(
         _start_agent_invocation=lambda *args, **kwargs: _start_agent_invocation(*args, **kwargs),
         agent_provider=lambda *args, **kwargs: agent_provider(*args, **kwargs),
         capture_git_snapshot=lambda *args, **kwargs: capture_git_snapshot(*args, **kwargs),
+        git=lambda *args, **kwargs: git(*args, **kwargs),
     ),
 )
 
@@ -3596,6 +3597,7 @@ reconcile_false_positive_runtime_block = _bind_effects(
     project_block_service.reconcile_false_positive_runtime_block, lambda: project_block_service.ReconcileFalsePositiveRuntimeBlockEffects(
         _canonical_path=lambda *args, **kwargs: _canonical_path(*args, **kwargs),
         capture_git_snapshot=lambda *args, **kwargs: capture_git_snapshot(*args, **kwargs),
+        git=lambda *args, **kwargs: git(*args, **kwargs),
         operation_log=lambda *args, **kwargs: operation_log(*args, **kwargs),
         validate_persisted_agent_scope=lambda *args, **kwargs: validate_persisted_agent_scope(*args, **kwargs),
         _agent_git_resources=lambda *args, **kwargs: _agent_git_resources(*args, **kwargs),

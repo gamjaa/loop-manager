@@ -47,6 +47,10 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
 
         self.assertIs(outcome, final)
         self.assertEqual(output, 'completed verify output')
+        self.assertEqual(
+            self.effects.agent.validate_worker_workspace_scope.call_args.kwargs['scope_phase'],
+            'VERIFYING',
+        )
 
     def test_successful_verify_with_dirty_candidate_and_scope_block_has_no_proof(self):
         for dirty_status in (' M app.py', 'M  app.py', '?? new.py'):
