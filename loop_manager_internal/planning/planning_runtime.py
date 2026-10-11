@@ -37,6 +37,7 @@ class PlanningLifecycleCoordinator:
             (self._workspace, "_prepare_workspace"),
             (self._check, "_run_check"),
             (self._assessment, "_run_planner_turn"),
+            (self._workspace, "_refresh_after_planner"),
             (self._assessment, "_validate_planner_result"),
             (self._publication, "_publish_planner_result"),
             (self._selection, "_activate_next_execplan"),

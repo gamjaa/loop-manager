@@ -150,6 +150,7 @@ class PlanningWorkspaceService(PlanningService):
         # This is a safe boundary: no Planner or verifier is using the
         # worktree. Recheck origin even when the project step began earlier.
         conflict_detail = None
+        correction_completed = False
         try:
             latest = self._ports.git.fetch_base(context.repo_path, context.base_branch)
             if latest == row.active_sha:
@@ -214,6 +215,7 @@ class PlanningWorkspaceService(PlanningService):
                         getattr(result, "conflict_paths", ()),
                         getattr(result, "stash_sha", ""),
                     ):
+                        correction_completed = True
                         result = self._ports.git.rebase_planning_workspace(
                             context.repo,
                             str(row.planning_attempt_fingerprint or ""),
@@ -275,9 +277,30 @@ class PlanningWorkspaceService(PlanningService):
                     values.update(
                         planning_result_pending_validation=1,
                         planning_result_completed=0,
-                        planning_validation_error=recheck_message,
                         planning_result=None,
                     )
+                    can_restart_result = (
+                        not mode_failure
+                        and (not row.planning_error or linked_error)
+                        and (not row.last_error or linked_error)
+                        and not row.agent_result_snapshot
+                        and not str(row.planning_validation_error or "").startswith(
+                            "planning rebase 충돌:"
+                        )
+                    )
+                    if can_restart_result:
+                        prior_error = row.planning_error if linked_error else None
+                        values.update(
+                            planning_validation_error=(
+                                recheck_message + (
+                                    "\n이전 planning 실패를 최신 입력에서 다시 확인: "
+                                    + prior_error if prior_error else ""
+                                )
+                            ),
+                            planning_retry_count=0,
+                        )
+                    else:
+                        values["planning_validation_error"] = recheck_message
                 elif changed_documents and not row.planning_result_completed:
                     additional = [path for path in changed_documents
                                   if path not in str(row.planning_validation_error or "")]
@@ -308,6 +331,10 @@ class PlanningWorkspaceService(PlanningService):
                 self._ports.git.complete_planning_rebase(
                     context.repo, worktree, result.target,
                 )
+                observed_latest = (
+                    self._ports.git.fetch_base(context.repo_path, context.base_branch)
+                    if correction_completed else latest
+                )
                 self._ports.events.info(
                     f"planning base 반영: {row.active_sha} -> {result.target}; "
                     f"후보={self._ports.git.run(worktree, 'rev-parse', 'HEAD').stdout.strip()}; "
@@ -315,7 +342,7 @@ class PlanningWorkspaceService(PlanningService):
                     f"남은 원인={row.planning_error or row.planning_validation_error or '없음'}"
                 )
                 row = self._ports.state.planning(context.repo)
-                if result.target != latest:
+                if result.target != observed_latest:
                     return PlanningOutcome(
                         PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED,
                         detail="원격 base가 다시 전진해 다음 안전 경계에서 반영합니다.",
@@ -451,4 +478,15 @@ class PlanningWorkspaceService(PlanningService):
             )
             run.row = self._ports.state.planning(context.repo)
         run.planning_worktree = worktree
+        return None
+
+    def _refresh_after_planner(self, run: _PlanningRun) -> PlanningOutcome | None:
+        """Refresh the candidate after its writer exits and before result validation."""
+        if run.row.phase != "PLANNING" or not run.row.planning_result_completed:
+            return None
+        outcome = self._prepare_workspace(run)
+        if outcome is not None:
+            return outcome
+        if run.row.planning_result_pending_validation and not run.row.planning_result_completed:
+            return PlanningOutcome(PlanningOutcomeKind.ASSESSMENT_PROGRESS)
         return None

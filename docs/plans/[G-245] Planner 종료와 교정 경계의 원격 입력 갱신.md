@@ -33,6 +33,8 @@ Planner 작성·교정 종료 뒤 다음 판단에 들어가기 전에 최신 �
 
 `planning/conflict_correction.py`의 교정 호출과 저장 결과 재개에도 같은 원격 입력 경계를 연결한다. 교정 중인 Git 작업의 완료와 최신 원격 기준 반영을 분리해 기존 보존 절차를 지킨다. 관련성이 있는 변경만 현재 판단을 다시 수행하며 안전하게 확정할 수 없으면 결과와 원인을 보존한다.
 
+Coordinator는 성공한 Planner 결과를 `_validate_planner_result`에 넘기기 전에 `PlanningWorkspaceService`의 안전 경계 갱신을 다시 실행한다. 관련 입력 변경으로 완료 결과가 pending 재평가로 바뀌면 이전 결과 검증을 건너뛰고 기존 ID·작업물·session으로 Planner 단계에 돌아간다. 새 입력 결과는 이전 결과의 검증 교정 횟수를 이어받지 않지만 과거 진단과 독립 오류·실행 이력은 보존하며, 연결된 오류의 correction binding이 유효하면 해결될 때까지 새 입력의 제한된 교정을 재개한다. 충돌 교정은 journal의 원래 target으로 기존 Git operation을 마치고 상태·journal을 확정한 뒤 원격을 재관측하며, 더 새 target이 있으면 다음 workspace 경계까지 연기한다.
+
 ## Validation
 
 - Worker는 `tests/test_planning_assessment.py`, `tests/test_planner_validation_recovery.py`와 planning lifecycle fixture의 최소 targeted unit case로 작성 중 원격 Requirement/상위 명세 변경, 종료 직후 전진, 실패 결과 검증 전 전진과 교정 호출 전 변경을 검사한다. 실제 coordinator/handler의 호출 순서·전달된 원격 입력·같은 session·오류 횟수와 게시 여부를 확인한다.
@@ -43,8 +45,9 @@ Planner 작성·교정 종료 뒤 다음 판단에 들어가기 전에 최신 �
 ## Progress
 
 - [x] 2026-10-09 `26993760f5c55048d8a72483ef7c116292e9fd52`의 활성 명세 전문과 catalog, planning 진입·작성/검증·충돌 교정·게시 및 관련 테스트를 정적으로 대조했다. 구현·테스트·전체 verify는 실행하지 않았다.
-- [ ] Planner 종료/교정 경계 갱신·재평가 및 설명 정합화
-- [ ] targeted unit 검증과 Manager 전체 verify·읽기 전용 Review
+- [x] Planner 종료/교정 경계 갱신·재평가 및 설명 정합화
+- [x] Worker targeted unit 검증
+- [ ] Manager 전체 verify·읽기 전용 Review
 - [ ] 사용자 Merge
 
 ## Decision Log
