@@ -504,6 +504,7 @@ def run_claude(
     returncode = 0
     timeout_triggered = threading.Event()
     usage = Usage()
+    collection_status = "unknown"
 
     if streaming:
         final_event: Mapping[str, object] = {}
@@ -619,15 +620,23 @@ def run_claude(
                     on_process_finished()
             except BaseException:
                 _stop_process(process)
-                process.communicate()
-                if on_process_finished is not None:
-                    on_process_finished()
+                try:
+                    recovered_output, _ = process.communicate()
+                except BaseException:
+                    recovered_output = None
+                else:
+                    try:
+                        log.write_text(fast_mode_log + (recovered_output or ""), encoding="utf-8")
+                    except OSError:
+                        collection_status = "error"
+                    if on_process_finished is not None:
+                        on_process_finished()
                 raise
             raw_output = raw_output or ""
             try:
                 log.write_text(fast_mode_log + raw_output, encoding="utf-8")
             except OSError:
-                pass
+                collection_status = "error"
         else:
             result = effects._handoff_run(
                 arguments,
@@ -646,7 +655,7 @@ def run_claude(
             try:
                 log.write_text(fast_mode_log + raw_output, encoding="utf-8")
             except OSError:
-                pass
+                collection_status = "error"
         try:
             event = json.loads(raw_output)
         except (ValueError, RecursionError):
@@ -673,14 +682,15 @@ def run_claude(
         try:
             last_message.write_text(message, encoding="utf-8")
         except OSError:
-            pass
+            collection_status = "error"
     if persist_session and not resolved_session_id and returncode == 0:
         return AgentResult(
             1,
             f"Claude {role_name} 실행 결과에서 세션 ID를 확인할 수 없습니다.",
             usage=usage,
+            collection_status=collection_status,
         )
-    if persist_session or session_id:
+    if persist_session or session_id or collection_status == "error":
         return AgentResult(
             returncode,
             message.strip(),
@@ -691,6 +701,7 @@ def run_claude(
                 else None
             ),
             usage,
+            collection_status,
         )
     return returncode, message.strip()
 
