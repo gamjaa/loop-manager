@@ -45,14 +45,14 @@ def fast_mode_scope(config: ManagedConfig):
         fast_mode_settings.reset(token)
 
 
-def provider_fast_mode(path: Path, provider: str) -> bool | None:
+def provider_fast_mode(path: Path, provider: str) -> bool:
     if provider not in {"codex", "claude"}:
         raise ManagedConfigError(f"지원하지 않는 Agent provider입니다: {provider}")
     snapshot = fast_mode_settings.get()
     if snapshot is not None and snapshot.path.resolve() == path.expanduser().resolve():
         raw = dict(snapshot.fast_mode_values).get(provider, "")
     else:
-        # profile을 직접 지정한 단독 호출은 설정 파일 없이도 기존 기본값을 사용한다.
+        # profile을 직접 지정한 단독 호출은 설정 파일 없이도 Fast off를 기본으로 사용한다.
         parser = configparser.ConfigParser(interpolation=None)
         try:
             parser.read(path, encoding="utf-8")
@@ -61,7 +61,7 @@ def provider_fast_mode(path: Path, provider: str) -> bool | None:
         raw = parser._sections.get(provider, {}).get("fast_mode", "")
     normalized = raw.strip().lower()
     if not normalized:
-        return None
+        return False
     try:
         return configparser.ConfigParser.BOOLEAN_STATES[normalized]
     except KeyError as error:

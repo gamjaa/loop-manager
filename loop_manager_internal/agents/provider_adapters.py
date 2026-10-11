@@ -188,10 +188,10 @@ def run_codex(
             raise RuntimeError(f"Codex {role_name}에 Worker level을 지정할 수 없습니다.")
         model, effort = effects.role(config_path, role_name, worktree)
     fast_mode = provider_fast_mode(config_path, "codex")
-    fast_arguments = ([] if fast_mode is None else [
+    fast_arguments = [
         "-c", 'service_tier="fast"' if fast_mode else 'service_tier="default"',
         "-c", f'features.fast_mode={str(fast_mode).lower()}',
-    ])
+    ]
     fast_mode_log = json.dumps({"type": "loop_manager.fast_mode", "requested": fast_mode}) + "\n"
     codex_launch = None
     launch_environment = agent_environment("codex", role_name)
@@ -650,7 +650,7 @@ def codex_sandbox_arguments(read_only: bool) -> list[str]:
     return list(agent_write_isolation.codex_arguments(read_only))
 
 
-def claude_permission_arguments(read_only: bool, *, fast_mode: bool | None = None) -> list[str]:
+def claude_permission_arguments(read_only: bool, *, fast_mode: bool = False) -> list[str]:
     arguments = ["--permission-mode", "auto"]
     if read_only:
         arguments.extend([
@@ -664,8 +664,7 @@ def claude_permission_arguments(read_only: bool, *, fast_mode: bool | None = Non
         "allowUnsandboxedCommands": False, "autoAllowBashIfSandboxed": False,
         "excludedCommands": [],
     }}
-    if fast_mode is not None:
-        settings["fastMode"] = fast_mode
+    settings["fastMode"] = fast_mode
     arguments.extend(["--settings", json.dumps(settings, sort_keys=True)])
     return arguments
 

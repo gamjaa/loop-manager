@@ -1,4 +1,4 @@
-"""Fast 선택·CLI 기본 설정 상속과 실행별 설정 고정을 검증한다."""
+"""Fast 선택·기본 off와 실행별 설정 고정을 검증한다."""
 from contextlib import nullcontext
 from functools import partial
 import io
@@ -80,19 +80,14 @@ class FastModeTests(TestCase):
             self.assertIn('model_reasoning_effort="high"', arguments)
             tiers = [arg for arg in arguments if arg.startswith("service_tier=")]
             features = [arg for arg in arguments if arg.startswith("features.fast_mode=")]
-            self.assertEqual(tiers, [] if requested is None else
-                             ['service_tier="fast"' if requested else 'service_tier="default"'])
-            self.assertEqual(features, [] if requested is None else
-                             [f"features.fast_mode={str(requested).lower()}"])
+            self.assertEqual(tiers, ['service_tier="fast"' if requested else 'service_tier="default"'])
+            self.assertEqual(features, [f"features.fast_mode={str(requested).lower()}"])
             self.assertIn('approvals_reviewer="auto_review"', arguments)
         else:
             self.assertEqual(arguments[arguments.index("--effort") + 1], "high")
             self.assertEqual(arguments.count("--settings"), 1)
             settings = json.loads(arguments[arguments.index("--settings") + 1])
-            if requested is None:
-                self.assertNotIn("fastMode", settings)
-            else:
-                self.assertIs(settings["fastMode"], requested)
+            self.assertIs(settings["fastMode"], requested)
             self.assertEqual(settings["permissions"], {"defaultMode": "auto"})
             self.assertTrue(settings["sandbox"]["enabled"])
             self.assertTrue(settings["sandbox"]["failIfUnavailable"])
@@ -103,13 +98,17 @@ class FastModeTests(TestCase):
             header = json.loads(logs[0].read_text(encoding="utf-8").splitlines()[0])
             self.assertEqual(header, {"type": "loop_manager.fast_mode", "requested": requested})
 
-    def test_boolean_values_and_inheritance_do_not_use_ini_defaults(self):
+    def test_boolean_values_and_default_off_do_not_use_ini_defaults(self):
         for provider in ("codex", "claude"):
-            self.config.write_text("[DEFAULT]\nfast_mode=true\n", encoding="utf-8")
-            self.assertIsNone(provider_fast_mode(self.config, provider))
-            self.config.write_text(f"[DEFAULT]\nfast_mode=true\n[{provider}]\n", encoding="utf-8")
-            self.assertIsNone(provider_fast_mode(self.config, provider))
-            for value, expected in (("", None), ("   ", None), ("TrUe", True), ("ON", True),
+            for content in ("", f"[{provider}]\n", "[DEFAULT]\nfast_mode=true\n",
+                            f"[DEFAULT]\nfast_mode=true\n[{provider}]\n"):
+                self.config.write_text(content, encoding="utf-8")
+                for frozen in (False, True):
+                    with self.subTest(provider=provider, content=content, frozen=frozen):
+                        scope = fast_mode_scope(load_managed_config(self.config)) if frozen else nullcontext()
+                        with scope:
+                            self.assertIs(provider_fast_mode(self.config, provider), False)
+            for value, expected in (("", False), ("   ", False), ("TrUe", True), ("ON", True),
                                     ("yes", True), ("1", True), ("False", False),
                                     ("off", False), ("no", False), ("0", False)):
                 with self.subTest(provider=provider, value=value):
@@ -144,9 +143,9 @@ class FastModeTests(TestCase):
             with self.assertRaises(ManagedConfigError):
                 provider_fast_mode(self.config, "claude")
 
-    def test_on_off_inherit_are_passed_in_new_and_resumed_calls(self):
+    def test_on_off_and_blank_are_passed_in_new_and_resumed_calls(self):
         for provider in ("codex", "claude"):
-            for value, expected in (("true", True), ("false", False), ("", None)):
+            for value, expected in (("true", True), ("false", False), ("", False), ("   ", False)):
                 self.set_fast(value, value)
                 for session in (None, "saved-session"):
                     with self.subTest(provider=provider, value=value, session=session):
@@ -154,6 +153,33 @@ class FastModeTests(TestCase):
                         self.assert_fast(provider, expected)
                         self.assertEqual(len(self.calls), 1)
                         self.calls.clear()
+
+    def test_missing_fast_setting_or_config_passes_off_in_new_and_resumed_calls(self):
+        for content in (self.original, self.original + "\n[codex]\n[claude]\n", None):
+            if content is None:
+                self.config.unlink()
+            else:
+                self.config.write_text(content, encoding="utf-8")
+            for provider in ("codex", "claude"):
+                for session in (None, "saved-session"):
+                    with self.subTest(provider=provider, content=content, session=session):
+                        self.assertEqual(self.invoke(provider, session=session).code, 0)
+                        self.assert_fast(provider, False)
+                        self.assertEqual(len(self.calls), 1)
+                        self.calls.clear()
+
+    def test_default_off_is_frozen_until_next_execution(self):
+        snapshot = load_managed_config(self.config)
+        self.set_fast("true", "true")
+        with fast_mode_scope(snapshot):
+            for provider in ("codex", "claude"):
+                for session in (None, "saved-session"):
+                    with self.subTest(provider=provider, session=session):
+                        self.assertEqual(self.invoke(provider, session=session).code, 0)
+                        self.assert_fast(provider, False)
+                        self.calls.clear()
+        for provider in ("codex", "claude"):
+            self.assertIs(provider_fast_mode(self.config, provider), True)
 
     def test_every_role_uses_common_fast_setting_without_model_checks(self):
         self.set_fast("true", "true")

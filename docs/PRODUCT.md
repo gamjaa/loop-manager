@@ -400,7 +400,7 @@ complete/submit의 verify와 Review 생략 근거는 후보·base·환경·고�
 - 두 점수의 합으로 최초 Worker level 1~6을 선택한다. level 7·8은 완료한 Worker 교정 뒤의 Review 반복에 따른 승격으로만 도달한다
 - 선택 provider의 Worker level 1~8은 `config/config.ini`에 Model alias·Effort와 참조 alias의 실제 Model 이름을 모두 명시해야 한다. 누락·빈 값·잘못된 형식·CLI 미지원 조합은 Worker 시작 전 오류로 보고하며 코드·CLI 기본값이나 다른 profile로 보충하지 않는다. 예시 설정은 선택 규칙이나 fallback이 아니다
 - 실제 provider·Model·Effort는 설정대로 호출·기록한다. Model 또는 Effort가 바뀌면 기존 session 전이 정책을 따르고 작업물·검증 이력은 보존한다
-- provider별 Fast 선택은 명시적 on/off 또는 CLI 기본 설정 상속이다. 공란·생략은 상속이며 명시적 off는 CLI 기본값보다 우선하도록 요청한다. 모든 역할·Worker level에 공통 적용하고 실행 시작의 선택을 신규·재개·재시도에 유지한다. 변경은 다음 실행부터 반영하며 Fast 선택만으로 session·작업물·검증 이력·Worker level을 초기화하지 않는다
+- provider별 Fast 선택은 on/off이며 기본값은 `false`다. 공란·공백·provider section 또는 항목 생략도 off로 처리하고 CLI 기본 설정이나 저장된 session의 Fast 선택보다 우선하도록 요청한다. 모든 역할·Worker level에 공통 적용하고 실행 시작의 선택을 신규·재개·재시도에 유지한다. 변경은 다음 실행부터 반영하며 Fast 선택만으로 session·작업물·검증 이력·Worker level을 초기화하지 않는다
 - Fast 선택은 모델·Effort와 독립적이다. Manager는 모델별 Fast 지원을 사전 판정하거나 모델을 교체하지 않고 지원·대체 실행과 진단을 CLI에 맡긴다. 호출 기록의 Fast 선택을 실제 적용 성공으로 간주하지 않으며 CLI 실패는 기존 규칙대로 처리한다. Fast 사용에 따른 추가 비용·사용량 증가와 CLI 버그로 인한 미적용은 provider 정책을 따르고 별도 우회하지 않는다
 - 위 실패 정책의 완료한 교정 결과만 effective level을 한 단계씩 올릴 수 있으며 한 ExecPlan 안에서는 level을 낮추지 않는다. 과거 지문 횟수에서 교정 완료를 추정하지 않고, 관계를 확인할 수 없는 기존 기록은 다음 유효 Review부터 기준선을 시작한다
 - Codex와 Claude의 level 8도 `config/config.ini`에서 지정한 Model alias와 Effort를 사용하며 CLI가 지원하는 조합인지 검증한다. level 8보다 높은 자동 profile은 없다

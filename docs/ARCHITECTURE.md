@@ -45,14 +45,14 @@ Loop Manager는 Windows·Linux·macOS에서 동작하는 Python 3 프로그램�
 Python 표준 라이브러리 `configparser`로 `config/config.ini`를 읽는다.
 
 - `[loop].max_workers`: 동시에 처리할 프로젝트 수, 기본값 3인 양의 정수
-- provider별 Model alias와 Effort, Fast on/off 또는 CLI 기본 설정 상속
+- provider별 Model alias와 Effort, 기본값이 `false`인 Fast on/off
 - 일반 Planner(`planner`)·빠른 점검 Planner(`planner_check`), Reviewer profile
 - 선택 provider의 Worker `level1`부터 `level8`까지의 명시적 Model alias와 Effort
 - Telegram Bot token과 chat ID
 
-Fast 선택은 Manager 실행 시작의 설정 snapshot에 보관하고 병렬 프로젝트 worker와 수동·복구 실행의 호출 문맥에 결합한다. 명시적 on/off와 CLI 기본 설정 상속을 구분하며 provider section·항목 생략 또는 공란은 상속이다. 설정값 검증은 선택 provider에 한정해 미선택 provider의 잘못된 값이 독립 프로젝트를 막지 않게 한다. 같은 실행의 신규·재개·재시도는 snapshot을 사용하고 다음 실행은 설정을 다시 읽는다. 호출이 끝나면 해당 실행의 문맥을 해제한다.
+Fast 선택은 Manager 실행 시작의 설정 snapshot에 보관하고 병렬 프로젝트 worker와 수동·복구 실행의 호출 문맥에 결합한다. provider section·항목 생략 또는 공란·공백은 `false`로 해석하며, 설정 파일 없이 profile을 직접 지정한 단독 호출에도 같은 기본값을 적용한다. `[DEFAULT]`의 값은 provider별 Fast 선택으로 사용하지 않는다. 설정값 검증은 선택 provider에 한정해 미선택 provider의 잘못된 값이 독립 프로젝트를 막지 않게 한다. 같은 실행의 신규·재개·재시도는 snapshot을 사용하고 다음 실행은 설정을 다시 읽는다. 호출이 끝나면 해당 실행의 문맥을 해제한다.
 
-provider adapter는 기존 모델·Effort·지침·권한·sandbox를 보존하면서 명시적 Fast 선택만 호출 설정에 합친다. 명시적 off는 CLI 기본값의 Fast 선택보다 우선하도록 요청하고 상속은 Fast 설정을 덮어쓰지 않는다. Manager가 지원 모델 목록·계정 조회·추가 실행 gate를 관리하지 않으며 실제 적용·일반 속도 대체·CLI 오류는 provider의 결과로 처리한다. 호출 로그에는 요청한 on/off 또는 상속과 CLI 진단을 남기되 실제 적용 성공을 합성하지 않는다. Fast 선택만으로 session·작업물·검증·Worker 승격 이력을 바꾸지 않고 CLI 버그에 대한 별도 우회 실행을 추가하지 않는다.
+provider adapter는 기존 모델·Effort·지침·권한·sandbox를 보존하면서 기본값을 포함한 Fast on/off를 호출 설정에 합친다. off는 CLI 기본 설정이나 저장된 session의 Fast 선택보다 우선하도록 Codex의 일반 service tier와 비활성화 override, Claude의 `fastMode: false`를 전달한다. Manager가 지원 모델 목록·계정 조회·추가 실행 gate를 관리하지 않으며 실제 적용·일반 속도 대체·CLI 오류는 provider의 결과로 처리한다. 호출 로그에는 요청한 on/off와 CLI 진단을 남기되 실제 적용 성공을 합성하지 않는다. Fast 선택만으로 session·작업물·검증·Worker 승격 이력을 바꾸지 않고 CLI 버그에 대한 별도 우회 실행을 추가하지 않는다.
 
 실제 `config/config.ini`는 Git에서 제외하고 현재 사용자만 읽을 수 있도록 권장한다. 기본 설정 파일은 source checkout에 그대로 두며 bootstrap이 해당 경로를 runtime 자식에 명시적으로 전달한다. 사용자가 `--config`를 지정하면 bootstrap은 상대 경로를 source checkout 기준으로 절대화한 뒤 전달한다. runtime은 전달된 파일을 시작 시 한 번 읽고 runtime `ROOT`를 기준으로 기본 경로를 다시 계산하지 않는다. 설정 파일을 SHA별 runtime에 복제하지 않으며 Telegram token과 chat ID가 모두 비어 있으면 알림을 비활성화하고, 하나만 설정돼 있으면 설정 오류로 처리한다. 비밀값은 자식 명령행, 로그, AI Agent prompt와 오류 메시지에 포함하지 않는다.
 
