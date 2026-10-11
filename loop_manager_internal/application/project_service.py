@@ -976,6 +976,9 @@ class ProjectService:
         except project_catalog_refresh.CatalogRefreshStopped:
             raise
         except Exception as error:
+            from loop_manager_internal.catalog.requirement_correction_publication import CorrectionPending
+            if isinstance(error, CorrectionPending):
+                raise
             # Archive maintenance is deliberately non-gating: MERGED state,
             # READY selection, planning, and completion continue unchanged.
             self.effects.operation_print(

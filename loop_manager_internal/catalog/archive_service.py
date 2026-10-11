@@ -52,6 +52,19 @@ def dispatch_execplan_archive_housekeeping(
 
     git_port = effects._ExecPlanArchiveGitPort(repo_path, state_dir, repo)
 
+    # Deterministic corrections share the existing between-lifecycles gate,
+    # but a failed publication must not fall through to a model assessment.
+    if catalog_refresh is not None and archive_safety is not None:
+        from loop_manager_internal.catalog.requirement_correction_publication import CorrectionPending, RequirementCorrectionPublisher
+        try:
+            RequirementCorrectionPublisher(
+                connection, git_port, refresh=refresh_candidates, safe=archive_safety,
+            ).dispatch(base_branch)
+        except project_catalog_refresh.CatalogRefreshStopped:
+            raise
+        except Exception as error:
+            raise CorrectionPending(str(error)) from error
+
     def apply_catalog(base_sha, commit_oid, candidates):
         assert catalog_refresh is not None
         expected = catalog_refresh.repository.capture(repo)

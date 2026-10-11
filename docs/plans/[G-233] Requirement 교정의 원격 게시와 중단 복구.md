@@ -29,6 +29,10 @@ Manager가 안전한 원격 처리 경계에서 Requirement 중복·제목 교�
 
 G-232의 구현인 `catalog/requirement_corrections.py`의 `corrections`·`updated_documents`·`deferred`를 소비한다. 선택·식별자 편집·코드 예제 보존·rename 후 source 재검증을 다시 구현하지 않는다. 실제 tree·일반 파일·수정 권한에서 계산 입력을 수집하고 파일 적용 및 허용 diff를 검증하는 연결만 추가한다. `editable_documents`는 당시 수정 가능한 문서로 제한하며 archive·sources·User Decision과 수동 소유·실행 중 writer·PR 경계는 그대로 보호한다. 보호된 문서의 링크를 갱신할 수 없다고 그 문서의 권한을 확대하지 않는다. 기계적 교정과 R-055의 문서 삭제·목표 철회 판단은 별도 처리다.
 
+교정 진입 전에 닫힌 안전 gate·수동 Requirement source 소유는 정상 보류로 처리해 기존 수동 verify·Review·PR 복구와 독립 실행을 막지 않는다. 보존된 후보·원문·실패 이유는 유지하고 원격 관측·편집·게시를 시작하지 않는다. 진입 뒤 새 소유자나 gate 변경은 게시 전 재검사에서 실패로 보존하며 Planner 호출·성공 기록으로 바꾸지 않는다. 이 경계는 명령 관측을 mock하고 실제 SQLite·파일을 사용하는 교정 게시 unit case 및 기존 archive 안전 gate unit case에서 검사한다.
+
+worktree 원문·rename 결과 대조는 CRLF/LF checkout 차이만 허용하고 Git index·commit·원격 결과는 저장 bytes와 정확히 대조한다. 입력 변경 뒤 원상복귀한 superseded 후보는 동일 manifest와 최신 입력을 transaction에서 확인해 기존 commit·작업물로 재개하며 일반 변조 검사를 유지한다. 교정 게시 unit case에서 CRLF checkout·commit 복구·실제 내용 변조와 PRODUCT draft 생성→거절 뒤 동일 후보 재진입·낡은 입력 거부를 검사한다.
+
 ## Validation
 
 - 실제 선택·상태 저장을 실행하는 targeted unit case에서 새 참조·목적지 경합·원격 전진·push 실패·각 저장 경계 중단·원격 게시 후 DB 미확정을 검사한다. Git·PR·모델은 관측/명령 경계만 mock한다.
@@ -39,7 +43,7 @@ G-232의 구현인 `catalog/requirement_corrections.py`의 `corrections`·`updat
 
 - [x] eb797d3a의 catalog·게시·retirement 경계를 읽었다. Requirement 교정용 원격 게시·재검사·재개 연결은 없다. 구현·테스트 실행 없음.
 - [x] 2026-10-10 delta 기준 `ab0264d94da1212d68141b28fc55f0204c1c9e09` → `214c978cb296a765020d88378f5526050d241f44`, mutable snapshot token `98bf2742d165143c06a91b9a328ede34ff8b107592dc674cb39dd0acf4d40239`와 원본 hash를 확인했다. G-232의 archive 이동과 계산 코드·17개 테스트 사례를 정적으로 대조했으며 실제 호출 연결은 테스트 외에 없다. 기존 dependency·목표를 유지해 남은 관측·적용·게시·복구 연결만 구체화했다. 구현·테스트·전체 verify를 실행하지 않았다.
-- [ ] 게시·복구 통합과 targeted unit 검증
+- [x] 게시·복구 통합 구현: 기존 housekeeping gate와 detached Git adapter에 교정 게시를 연결하고 원문·배정·결과 intent, 파일·index·commit 대조, 원격 재관측, 저장 관계 재검사 및 수동 예약 충돌을 추가했다. `tests/test_requirement_correction_publication.py`는 실제 SQLite·파일과 mock 명령 경계로 적용 bytes·링크·참조 보호·경쟁·중단 복구를 검사한다. targeted 실행 결과는 Worker 보고에 기록하며 전체 verify·Merge를 대신하지 않는다.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
