@@ -1241,17 +1241,18 @@ class PlanningConflictCorrectionUnitTests(PlanningCase):
     def test_scoped_turn_saves_session_before_correction_and_stages_only_unmerged_paths(self):
         invoke = self.agent.run_planner
 
-        def planner(tree, prompt, session, callback):
+        def planner(tree, prompt, session, callback, **kwargs):
             self.assertIn("conflict detail", prompt)
             self.assertIn("git show stash^2:", prompt)
             self.assertIn("git show stash:", prompt)
             callback("started-session")
-            return invoke(tree, prompt, session, callback)
+            return invoke(tree, prompt, session, callback, **kwargs)
 
         self.agent.run_planner = planner
         self.assertTrue(self.resolve(stash_sha="stash"))
         self.assertEqual(self.sessions, ["started-session", "session-1"])
         self.assertEqual(self.agent.resumed_session, "saved-session")
+        self.assertEqual(self.agent.invocation_metadata[-1], ("conflict_resolution", "target"))
         self.agent.begin_scope.assert_called_once_with("planner", self.worktree)
         self.agent.clear_scope.assert_called_once_with("/repo")
         save_index = next(i for i, args in enumerate(self.effects) if args[0] == "save")
@@ -1285,9 +1286,9 @@ class PlanningConflictCorrectionUnitTests(PlanningCase):
 
                 self.sessions = SimpleNamespace(append=fail)
                 if started:
-                    self.agent.run_planner = lambda tree, prompt, session, callback: callback("started")
+                    self.agent.run_planner = lambda tree, prompt, session, callback, **kwargs: callback("started")
                 else:
-                    self.agent.run_planner = lambda *args: self.agent.result
+                    self.agent.run_planner = lambda *args, **kwargs: self.agent.result
                 with self.assertRaisesRegex(RuntimeError, "session persistence failed"):
                     self.resolve()
                 self.agent.finish_scope.assert_not_called()

@@ -258,6 +258,13 @@ class WorkerHandler:
                 self.ports.state.connection, self.ports.identity.repo, str(plan['id']),
                 self.ports.snapshot().level, review_result_id,
             )
+        invocation_purpose = (
+            "conflict_resolution" if context.resolving_rebase else
+            "review_correction" if review_result_id is not None else
+            "validation_correction" if is_validation_error(
+                row['last_error'], row['verify_result'], row['review_result'],
+            ) else "worker_implementation"
+        )
         decision = decide_session(
             row['worker_session_id'],
             worker_binding,
@@ -400,6 +407,7 @@ class WorkerHandler:
                 str(catalog_plan['current_revision_sha']) if catalog_plan['current_revision_sha'] is not None else None,
                 initial_transition=decision.kind,
                 initial_cause=decision.cause,
+                purpose=invocation_purpose,
             )),
             session_id=active_session_id,
         )

@@ -274,18 +274,24 @@ class NativeWriteIsolationTests(TestCase):
                     if session:
                         self.assertIn('resume', command)
                         self.assertIn(session, command)
-                    if role == 'reviewer':
-                        self.assertNotIn('-o', command)
-                        self.assertEqual(kwargs['stdout'], subprocess.PIPE)
-                        return manager.subprocess.CompletedProcess(
-                            command, 0,
-                            '{"type":"item.completed","item":{"type":"agent_message",'
-                            '"text":"completed"}}\n',
-                        )
-                    target = Path(command[command.index('-o') + 1])
-                    target.write_text('completed')
-                    kwargs['stdout'].write('provider log\n')
-                    return manager.subprocess.CompletedProcess(command, 0)
+                    if kwargs.get('on_process_started') is not None:
+                        kwargs['on_process_started']()
+                    try:
+                        if role == 'reviewer':
+                            self.assertNotIn('-o', command)
+                            self.assertEqual(kwargs['stdout'], subprocess.PIPE)
+                            return manager.subprocess.CompletedProcess(
+                                command, 0,
+                                '{"type":"item.completed","item":{"type":"agent_message",'
+                                '"text":"completed"}}\n',
+                            )
+                        target = Path(command[command.index('-o') + 1])
+                        target.write_text('completed')
+                        kwargs['stdout'].write('provider log\n')
+                        return manager.subprocess.CompletedProcess(command, 0)
+                    finally:
+                        if kwargs.get('on_process_finished') is not None:
+                            kwargs['on_process_finished']()
 
                 def start(command, **kwargs):
                     result = run(command, **kwargs)
@@ -314,9 +320,10 @@ class NativeWriteIsolationTests(TestCase):
                 self.assertNotIn('sandbox', commands[1])
                 self.assertNotIn('app-server', commands[1])
                 self.assertEqual(commands[1][commands[1].index('-C') + 1], str(boundary.worktree))
-                row = connection.execute('''SELECT proof.status, call.result_kind, call.session_id
+                row = connection.execute('''SELECT proof.status, call.result_kind, call.session_id,
+                    call.execution_status
                     FROM agent_isolation_evidence proof JOIN agent_invocations call USING(invocation_id)''').fetchone()
-                self.assertEqual(row, ('verified', 'success', session))
+                self.assertEqual(row, ('verified', 'success', session, 'executed'))
 
     def test_session_unavailable_fallback_rechecks_direct_policy_without_losing_history(self):
         for role in ('planner', 'worker', 'maintenance_planner', 'reviewer'):
@@ -528,19 +535,28 @@ class NativeWriteIsolationTests(TestCase):
                 proof = connection.execute('''SELECT proof.status, call.result_kind, call.session_id
                     FROM agent_isolation_evidence proof JOIN agent_invocations call USING(invocation_id)''').fetchone()
                 self.assertEqual(proof, ('verified', 'success', session))
+                execution = connection.execute('''SELECT execution_status,
+                    execution_started_at, execution_finished_at FROM agent_invocations''').fetchone()
+                self.assertEqual(execution[0], 'executed')
+                self.assertIsNotNone(execution[1])
+                self.assertIsNotNone(execution[2])
 
     def test_envelope_timeout_kills_process_group_and_waits(self):
         launch = envelope.CodexLaunch((), ('native',), {}, Path('/runtime'), Path('/attempt'), '{}')
         process = mock.Mock(pid=4321)
         process.communicate.side_effect = manager.subprocess.TimeoutExpired(['native'], 1)
+        lifecycle = []
         with mock.patch.object(envelope.subprocess, 'Popen', return_value=process) as start, \
              mock.patch.object(envelope.os, 'killpg') as terminate:
             with self.assertRaises(manager.subprocess.TimeoutExpired):
                 launch.run(['native'], launch_process=manager._handoff_popen,
-                           input='prompt', timeout=1, text=True)
+                           input='prompt', timeout=1, text=True,
+                           on_process_started=lambda: lifecycle.append('started'),
+                           on_process_finished=lambda: lifecycle.append('finished'))
         self.assertTrue(start.call_args.kwargs['start_new_session'])
         terminate.assert_called_once_with(4321, envelope.signal.SIGKILL)
         process.wait.assert_called_once()
+        self.assertEqual(lifecycle, ['started', 'finished'])
 
     def test_streamed_new_session_uses_direct_exec_and_persists_session(self):
         with tempfile.TemporaryDirectory() as directory:

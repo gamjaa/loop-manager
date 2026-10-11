@@ -384,6 +384,48 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
                 "excludedCommands": [],
             })
 
+    def test_claude_process_callbacks_preserve_json_mode_for_one_shot_calls(self):
+        config = profile_config(self)
+        output = json.dumps({
+            "type": "result", "session_id": "one-shot-session", "result": "done",
+            "usage": {"input_tokens": 7, "output_tokens": 2}, "is_error": False,
+        })
+        calls = []
+        lifecycle = []
+
+        class StartedProcess:
+            def __init__(self, arguments, **kwargs):
+                calls.append((arguments, kwargs))
+                self.stdin = mock.Mock()
+                self.returncode = 0
+                kwargs["stdout"].write(output)
+
+            def communicate(self, prompt, timeout=None):
+                self.stdin.write(prompt)
+                self.asserted_timeout = timeout
+
+            def kill(self):
+                raise AssertionError("completed process must not be killed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            with mock.patch("loop_manager.subprocess.Popen", side_effect=StartedProcess):
+                result = loop_manager.run_claude(
+                    worktree, root / "state", config, "planner", "prompt",
+                    read_only=True, resolved_profile=loop_manager.ResolvedProfile("model", "low"),
+                    on_process_started=lambda: lifecycle.append("started"),
+                    on_process_finished=lambda: lifecycle.append("finished"),
+                )
+
+        arguments, options = calls[0]
+        self.assertEqual(result, (0, "done"))
+        self.assertEqual(lifecycle, ["started", "finished"])
+        self.assertEqual(arguments[arguments.index("--output-format") + 1], "json")
+        self.assertNotIn("--verbose", arguments)
+        self.assertEqual(options["stdout"].name.rsplit("/", 1)[-1], "claude-planner.log")
+
     def test_claude_planner_processes_preserve_parent_bytecode_policy(self):
         config = profile_config(self)
         session_id = "claude-planner-session"
@@ -893,12 +935,14 @@ class ProcessStartBoundaryTests(unittest.TestCase):
                 with mock.patch('loop_manager.subprocess.Popen', return_value=process):
                     run(root, root / 'state', config, 'worker', 'prompt', read_only=False,
                         level=5, persist_session=True, session_id='existing-session', resolved_profile=profile,
-                        on_process_started=lambda: observed.append('started'))
-                self.assertEqual(observed, ['started'])
+                        on_process_started=lambda: observed.append('started'),
+                        on_process_finished=lambda: observed.append('finished'))
+                self.assertEqual(observed, ['started', 'finished'])
                 observed.clear()
                 with mock.patch('loop_manager.subprocess.Popen', side_effect=OSError('launch failed')):
                     with self.assertRaises(OSError):
                         run(root, root / 'state', config, 'worker', 'prompt', read_only=False,
                             level=5, persist_session=True, session_id='existing-session', resolved_profile=profile,
-                            on_process_started=lambda: observed.append('started'))
+                            on_process_started=lambda: observed.append('started'),
+                            on_process_finished=lambda: observed.append('finished'))
                 self.assertEqual(observed, [])

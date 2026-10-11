@@ -91,6 +91,8 @@ def run_agent(
             collection_status = "error"
     ledger = agent_invocation_state.InvocationRepository(connection) if connection is not None else None
     identity: str | None = None
+    execution_started = False
+    execution_started_at: float | None = None
     scope_id = None
     if connection is not None and invocation is not None:
         try:
@@ -151,6 +153,29 @@ def run_agent(
             notifications.flush_project_events(connection, invocation.repo)
         except sqlite3.Error:
             pass  # A failed event write must not change the physical call.
+
+    def observe_cli_process_started() -> None:
+        nonlocal execution_started, execution_started_at, collection_status
+        execution_started = True
+        execution_started_at = time.monotonic()
+        if ledger is not None and identity is not None:
+            try:
+                ledger.mark_execution_started(identity)
+            except sqlite3.Error:
+                collection_status = "error"
+        if notify_process_start:
+            observe_process()
+
+    def observe_cli_process_finished() -> None:
+        nonlocal collection_status
+        if ledger is None or identity is None or execution_started_at is None:
+            return
+        try:
+            ledger.mark_execution_finished(
+                identity, max(0, int((time.monotonic() - execution_started_at) * 1000)),
+            )
+        except sqlite3.Error:
+            collection_status = "error"
 
     if connection is not None and invocation is not None:
         notifications.flush_project_events(connection, invocation.repo)
@@ -218,6 +243,8 @@ def run_agent(
                 return preflight_digest
         return selected_digest(snapshot)
 
+    notify_process_start = (role_name in {"worker", "planner", "maintenance_planner"}
+                            and has_notification_session and invocation is not None)
     request = AgentRequest(
         worktree=worktree,
         state_dir=state_dir,
@@ -229,8 +256,8 @@ def run_agent(
         persist_session=persist_session,
         session_id=session_id,
         on_session_started=observe_session,
-        on_process_started=(observe_process if role_name in {"worker", "planner", "maintenance_planner"}
-                            and has_notification_session and invocation is not None else None),
+        on_process_started=(observe_cli_process_started if invocation is not None else None),
+        on_process_finished=(observe_cli_process_finished if invocation is not None else None),
         profile=resolved,
         on_isolation_checked=observe_isolation,
         isolation_snapshot_digest=preflight_scope_digest,
@@ -262,7 +289,8 @@ def run_agent(
             try:
                 ledger.finish(identity, kind, None,
                               max(0, int((time.monotonic() - started) * 1000)),
-                              None, Usage())
+                              None, Usage(),
+                              execution_status="executed" if execution_started else "not_executed")
             except sqlite3.Error:
                 pass
         raise
@@ -278,7 +306,8 @@ def run_agent(
                           max(0, int((time.monotonic() - started) * 1000)),
                           result.session_id, result.usage,
                           "error" if collection_status == "error" else None,
-                          replace_session=True)
+                          replace_session=True,
+                          execution_status="executed" if execution_started else "not_executed")
             if collection_status != "error":
                 collection_status = result.usage.status
         except sqlite3.Error:

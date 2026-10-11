@@ -241,6 +241,9 @@ class PlanningAssessmentService(PlanningService):
                     self._ports.agent, context.repo, role, worktree, prompt,
                     final_page.session_id if final_page is not None else row.planner_session_id,
                     save_final_session,
+                    purpose=("maintenance_plan" if run.maintenance_planning else
+                             "final_confirmation" if run.final_review_required else "general_planning"),
+                    target=str(row.active_sha),
                 )
             if scope_result.error:
                 scope_error = scope_result.error
@@ -395,7 +398,9 @@ class PlanningAssessmentService(PlanningService):
         result, scope = run_scoped_planner_turn(
             self._ports.agent, context.repo, "maintenance_planner", worktree,
             maintenance_findings.unit_prompt(unit, manifest),
-            unit.session_id, lambda session_id: port.findings_session(context.repo, unit, session_id))
+            unit.session_id, lambda session_id: port.findings_session(context.repo, unit, session_id),
+            purpose="maintenance_discovery",
+            target=f"findings:{unit.manifest_id}:{unit.index}")
         if scope.error:
             self._ports.events.error(scope.error)
             return self._operational_error()

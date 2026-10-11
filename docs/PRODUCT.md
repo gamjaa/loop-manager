@@ -408,6 +408,12 @@ complete/submit의 verify와 Review 생략 근거는 후보·base·환경·고�
 - Codex와 Claude의 level 8도 `config/config.ini`에서 지정한 Model alias와 Effort를 사용하며 CLI가 지원하는 조합인지 검증한다. level 8보다 높은 자동 profile은 없다
 - effective level과 level별 Review 승격 이력은 SQLite에 저장하고 새 ExecPlan 또는 정상적인 BLOCKED 해제에서 최초 level로 초기화한다
 
+### Agent 호출 기록
+
+- 실제 호출 위치는 작업 목적과 가능한 대상 계획·task·batch·파일을 invocation ledger에 기록한다. 호출의 역할·provider·Model·Effort, session 전이·재시도, 결과·사용량과 실행 구간을 이 정보에 연결한다.
+- 호출 준비와 실제 CLI 프로세스 실행을 구분한다. 프로세스 생성에 성공한 호출만 실제 실행 수와 사용량·실행 시간에 포함하며, 실행 전 거부·프로세스 생성 실패는 별도 상태로, 경계를 확인할 수 없는 중단·legacy 기록은 미확인으로 보존한다. legacy 목적이나 실행 여부를 추측하지 않는다.
+- 호출 기록에는 prompt, 비밀값, 인증 자료 또는 코드·문서 전문을 저장하지 않는다. 실행 관측 저장 실패는 Agent 결과를 바꾸지 않으며, 필수 격리·소유권 검증과 그 증거 저장은 계속 실행 gate로 적용한다.
+
 ### PR 생성과 Merge 후 정리
 
 - 시작 ignore 규칙으로 증명된 index-free ignored 파일의 생성·수정·삭제는 Planner·Worker·Reviewer·Manager verify의 scope 오류나 planning 오류의 단독 원인이 아니다. tracked·staged·non-ignored 파일과 index flag·사용 Git 자원의 보호는 유지한다.

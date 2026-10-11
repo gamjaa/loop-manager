@@ -174,6 +174,7 @@ def run_codex(
     expected_repository: str | None = None,
     on_isolation_checked: Callable[[agent_write_isolation.IsolationEvidence], None] | None = None,
     on_process_started: Callable[[], None] | None = None,
+    on_process_finished: Callable[[], None] | None = None,
     common_guidance: CommonGuidance | None = None,
     effects: ProviderEffects,
 ) -> tuple[int, str] | CodexResult:
@@ -282,7 +283,8 @@ def run_codex(
     reviewer_message = ""
     reviewer_tail = ""
     reviewer_usage = ""
-    if (persist_session and not session_id) or role_name == "reviewer" or on_process_started is not None:
+    if ((persist_session and not session_id) or role_name == "reviewer"
+            or (on_process_started is not None and codex_launch is None)):
         with log.open("w", encoding="utf-8") as output:
             output.write(fast_mode_log)
             start = codex_launch.start if codex_launch else effects._handoff_popen
@@ -299,7 +301,6 @@ def run_codex(
             )
             assert process.stdin is not None
             assert process.stdout is not None
-
             timeout = _start_timeout(process, timeout_triggered, codex_launch.stop if codex_launch else None)
             try:
                 if on_process_started is not None:
@@ -341,9 +342,13 @@ def run_codex(
                         if on_session_started:
                             on_session_started(resolved_session_id)
                 returncode = process.wait()
+                if on_process_finished is not None:
+                    on_process_finished()
             except BaseException:
                 _stop_process(process, codex_launch.stop if codex_launch else None)
                 process.wait()
+                if on_process_finished is not None:
+                    on_process_finished()
                 raise
             finally:
                 timeout.cancel()
@@ -354,6 +359,9 @@ def run_codex(
         with log.open("w", encoding="utf-8") as output:
             output.write(fast_mode_log)
             runner = codex_launch.run if codex_launch is not None else effects._handoff_run
+            callbacks = ({"on_process_started": on_process_started,
+                          "on_process_finished": on_process_finished}
+                         if codex_launch is not None else {})
             result = runner(
                 arguments,
                 input=prompt,
@@ -366,6 +374,7 @@ def run_codex(
                 cwd=worktree,
                 timeout=AGENT_CLI_TIMEOUT_SECONDS,
                 **({"launch_process": effects._handoff_popen} if codex_launch is not None else {}),
+                **callbacks,
             )
         returncode = result.returncode
     try:
@@ -451,6 +460,8 @@ def run_claude(
     isolation_snapshot_digest: Callable[[], str] | None = None,
     expected_repository: str | None = None,
     on_process_started: Callable[[], None] | None = None,
+    on_process_finished: Callable[[], None] | None = None,
+    stream_output: bool = False,
     common_guidance: CommonGuidance | None = None,
     effects: ProviderEffects,
 ) -> tuple[int, str] | AgentResult:
@@ -473,7 +484,7 @@ def run_claude(
     last_message = project_dir / f"claude-{role_name}-last.txt"
     last_message.unlink(missing_ok=True)
 
-    streaming = role_name == "reviewer" or (persist_session and session_id is None) or on_process_started is not None
+    streaming = role_name == "reviewer" or (persist_session and session_id is None) or stream_output
     arguments = [
         "claude",
         "--print",
@@ -514,7 +525,6 @@ def run_claude(
             )
             assert process.stdin is not None
             assert process.stdout is not None
-
             timeout = _start_timeout(process, timeout_triggered)
             try:
                 if on_process_started is not None:
@@ -572,9 +582,13 @@ def run_claude(
                         if parsed_usage.status != "unknown" or usage.status != "invalid":
                             usage = parsed_usage
                 returncode = process.wait()
+                if on_process_finished is not None:
+                    on_process_finished()
             except BaseException:
                 _stop_process(process)
                 process.wait()
+                if on_process_finished is not None:
+                    on_process_finished()
                 raise
             finally:
                 timeout.cancel()
@@ -585,22 +599,50 @@ def run_claude(
         if returncode and not message:
             message = diagnostic_tail
     else:
-        result = effects._handoff_run(
-            arguments,
-            input=prompt,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            env=agent_environment("claude", role_name),
-            cwd=worktree,
-            timeout=AGENT_CLI_TIMEOUT_SECONDS,
-        )
-        returncode = result.returncode
-        raw_output = result.stdout or ""
-        log.write_text(fast_mode_log + (_redact_reviewer_log(raw_output) if role_name == "reviewer" else raw_output),
-                       encoding="utf-8")
+        if on_process_started is not None:
+            with log.open("w", encoding="utf-8") as output:
+                output.write(fast_mode_log)
+                process = effects._handoff_popen(
+                    arguments,
+                    stdin=subprocess.PIPE,
+                    stdout=output,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    env=agent_environment("claude", role_name),
+                    cwd=worktree,
+                )
+                try:
+                    on_process_started()
+                    process.communicate(prompt, timeout=AGENT_CLI_TIMEOUT_SECONDS)
+                    returncode = process.returncode
+                    if on_process_finished is not None:
+                        on_process_finished()
+                except BaseException:
+                    _stop_process(process)
+                    process.communicate()
+                    if on_process_finished is not None:
+                        on_process_finished()
+                    raise
+            logged = log.read_text(encoding="utf-8", errors="replace")
+            raw_output = logged[len(fast_mode_log):] if logged.startswith(fast_mode_log) else logged
+        else:
+            result = effects._handoff_run(
+                arguments,
+                input=prompt,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=agent_environment("claude", role_name),
+                cwd=worktree,
+                timeout=AGENT_CLI_TIMEOUT_SECONDS,
+            )
+            returncode = result.returncode
+            raw_output = result.stdout or ""
+            log.write_text(fast_mode_log + raw_output, encoding="utf-8")
         try:
             event = json.loads(raw_output)
         except (ValueError, RecursionError):
@@ -725,6 +767,7 @@ class CodexAgentAdapter:
             on_isolation_checked=request.on_isolation_checked,
             common_guidance=request.common_guidance,
             on_process_started=request.on_process_started,
+            on_process_finished=request.on_process_finished,
         )
 
 
@@ -752,4 +795,6 @@ class ClaudeAgentAdapter:
             expected_repository=request.expected_repository,
             common_guidance=request.common_guidance,
             on_process_started=request.on_process_started,
+            on_process_finished=request.on_process_finished,
+            stream_output=request.stream_output,
         )

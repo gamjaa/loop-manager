@@ -1299,8 +1299,8 @@ class PlanningSelectionTest(PlanningCase):
         ports.git.relevant_document_changes = mock.Mock(return_value=("docs/PRODUCT.md",))
         original_planner = ports.agent.run_planner
 
-        def advance_after_planner(*args):
-            result = original_planner(*args)
+        def advance_after_planner(*args, **kwargs):
+            result = original_planner(*args, **kwargs)
             ports.git.remote = "new-base"
             return result
 
@@ -1340,8 +1340,8 @@ class PlanningSelectionTest(PlanningCase):
                 )
                 original_planner = ports.agent.run_planner
 
-                def advance_after_planner(*args):
-                    result = original_planner(*args)
+                def advance_after_planner(*args, **kwargs):
+                    result = original_planner(*args, **kwargs)
                     ports.git.remote = "new-base"
                     return result
 

@@ -655,6 +655,8 @@ class PlanningAssessmentTest(PlanningCase):
         self.assertEqual(ports.state.snapshot.planning_retry_count, 2)
         self.assertIn("발견 항목", ports.state.snapshot.planning_validation_error)
 
+
+class PlanningBoundaryTests(PlanningCase):
     def test_planner_agent_port_passes_planless_invocation_and_ignores_telemetry_error(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
@@ -664,12 +666,14 @@ class PlanningAssessmentTest(PlanningCase):
         )
 
         with mock.patch.object(loop_manager, "run_agent", return_value=reported) as run_agent:
-            result = port.run_planner(Path("/planning"), "prompt", None, lambda _: None)
+            result = port.run_planner(Path("/planning"), "prompt", None, lambda _: None,
+                                      purpose="general_planning", target="G-184")
 
         self.assertEqual(result.kind, PlanningAgentResultKind.SUCCESS)
         request = run_agent.call_args.kwargs["invocation"]
         self.assertEqual((request.repo, request.plan_id, request.transition,
                           request.attempt), ("/repo", None, "start", 1))
+        self.assertEqual((request.purpose, request.target), ("general_planning", "G-184"))
         self.assertIs(run_agent.call_args.kwargs["connection"], connection)
 
 

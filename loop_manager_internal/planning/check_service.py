@@ -231,7 +231,8 @@ class PlanningCheckService(PlanningService):
             result, scope = run_scoped_planner_turn(
                 self._ports.agent, repo, "planner_check", worktree, prompt,
                 str(check["session_id"]) if check["session_id"] else None,
-                save_session, read_only=True,
+                save_session, purpose="final_confirmation",
+                target=str(check["target_fingerprint"]), read_only=True,
             )
         if scope.error:
             if scope.result_snapshot:

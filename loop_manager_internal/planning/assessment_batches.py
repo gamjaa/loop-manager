@@ -100,11 +100,12 @@ class MaintenanceAssessmentBatches:
     def __init__(self, ports):
         self.ports = ports
 
-    def _invoke(self, run, worktree, prompts, prefix, session, save_session):
+    def _invoke(self, run, worktree, prompts, prefix, session, save_session, purpose):
         started = time.monotonic()
         result, scope = run_scoped_planner_turn(
             self.ports.agent, run.context.repo, "maintenance_planner", worktree,
-            batch_prompt(prompts, prefix), session, save_session,
+            batch_prompt(prompts, prefix), session, save_session, purpose=purpose,
+            target="maintenance-batch:" + prefix.rstrip(),
         )
         self.ports.events.log(f"유지보수 일괄 호출 종료: {len(prompts)}개, "
                               f"{time.monotonic() - started:.0f}초")
@@ -173,7 +174,7 @@ class MaintenanceAssessmentBatches:
                 port.session(context.repo, run.maintenance_cycle.revision, unit.source, session)
 
         result = self._invoke(run, worktree, prompts, files.RESULT_PREFIX,
-                              units[0].session_id, save_session)
+                              units[0].session_id, save_session, "maintenance_review")
         if isinstance(result, PlanningOutcome):
             return result
 
@@ -234,7 +235,8 @@ class MaintenanceAssessmentBatches:
             for relation, _ in units:
                 port.session(context.repo, run.maintenance_cycle.revision, relation, session)
 
-        result = self._invoke(run, worktree, prompts, relations.RELATION_PREFIX, units[0][1], save_session)
+        result = self._invoke(run, worktree, prompts, relations.RELATION_PREFIX, units[0][1],
+                              save_session, "maintenance_review")
         if isinstance(result, PlanningOutcome):
             return result
 
@@ -284,7 +286,7 @@ class MaintenanceAssessmentBatches:
                 session_errors.append(str(error))
 
         result = self._invoke(run, worktree, prompts, relations.SYNTHESIS_PREFIX,
-                              page.session_id, save_session)
+                              page.session_id, save_session, "maintenance_review")
         if isinstance(result, PlanningOutcome):
             return result
         if session_errors:
@@ -333,7 +335,7 @@ class MaintenanceAssessmentBatches:
                 port.resolution_session(context.repo, unit, session)
 
         result = self._invoke(run, worktree, prompts, relations.RESOLUTION_PREFIX,
-                              first.session_id, save_session)
+                              first.session_id, save_session, "maintenance_discovery")
         if isinstance(result, PlanningOutcome):
             return result
 

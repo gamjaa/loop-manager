@@ -502,6 +502,7 @@ class FakeAgentPort:
         self.resumed_session = None
         self.roles = []
         self.prompts = []
+        self.invocation_metadata = []
         self.results = []
         self.result = PlanningAgentResult(
             0,
@@ -519,11 +520,12 @@ class FakeAgentPort:
         _prompt,
         session_id,
         _on_session_started,
-        *, profile_role=None, read_only=False,
+        *, profile_role=None, read_only=False, purpose=None, target=None,
     ):
         self.run_count += 1
         self.roles.append((profile_role, read_only))
         self.prompts.append(_prompt)
+        self.invocation_metadata.append((purpose, target))
         self.resumed_session = session_id
         return self.results.pop(0) if self.results else self.result
 

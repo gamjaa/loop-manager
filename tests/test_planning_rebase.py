@@ -686,9 +686,9 @@ class PlanningRebaseGitBoundaryTest(unittest.TestCase):
                     )
                     invoke = ports.agent.run_planner
 
-                    def resolve(tree, prompt, session, callback):
+                    def resolve(tree, prompt, session, callback, **kwargs):
                         (tree / name).write_text("remote\nlocal\n")
-                        return invoke(tree, prompt, session, callback)
+                        return invoke(tree, prompt, session, callback, **kwargs)
 
                     ports.agent.run_planner = resolve
                     run = SimpleNamespace(
@@ -796,10 +796,10 @@ class PlanningRebaseGitBoundaryTest(unittest.TestCase):
                 )
                 invoke = ports.agent.run_planner
 
-                def resolve(tree, prompt, session, callback):
+                def resolve(tree, prompt, session, callback, **kwargs):
                     self.assertIn(result.stash_sha + "^2:", prompt)
                     (tree / plan).write_text("remote\nlocal staged\n")
-                    return invoke(tree, prompt, session, callback)
+                    return invoke(tree, prompt, session, callback, **kwargs)
 
                 ports.agent.run_planner = resolve
                 run = SimpleNamespace(

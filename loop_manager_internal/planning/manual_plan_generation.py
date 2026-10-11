@@ -51,7 +51,8 @@ def generate(effects, connection, repo, state_dir, config_path, provider, group,
                                     commit_sha=group['source_head'],concurrent=True)
     result=effects.run_agent(provider,runtime.path,state_dir,config_path,'planner',prompt,read_only=True,
                             connection=connection,invocation=InvocationContext(str(repo),None,
-                                task_id='manual-submit:'+group['group_id']))
+                                task_id='manual-submit:'+group['group_id'],
+                                purpose='general_planning', target='manual-submit:'+group['group_id']))
     # Interrupted/unknown Agents retain their runtime; only an observed return
     # reaches the clean, non-forced removal boundary.
     effects.remove_worktree(repo,state_dir,runtime)

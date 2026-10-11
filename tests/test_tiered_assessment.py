@@ -52,7 +52,10 @@ class TieredAssessmentTest(PlanningCase):
 
     def model(self, output=None, findings=None):
         def invoke(worktree, prompt, session, callback, **profile):
-            self.assertEqual(profile, {"profile_role": "maintenance_planner", "read_only": True})
+            self.assertEqual(profile["profile_role"], "maintenance_planner")
+            self.assertTrue(profile["read_only"])
+            self.assertEqual(profile["purpose"], "maintenance_review")
+            self.assertTrue(profile["target"])
             self.ports.agent.run_count += 1
             callback("unit-session")
             assessment = self.ports.tiered.repository.active("/repo", 1, self.sha)
