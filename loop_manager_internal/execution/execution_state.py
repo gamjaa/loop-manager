@@ -233,7 +233,7 @@ class ExecutionStatePort:
         return self.repository.transition_from_snapshot(
             expected, plan_values=values, project_values=values)
 
-    def open_pull_request(self, repo, **values):
+    def open_pull_request(self, repo, *, context=None, **values):
         if repo != self.repo:
             raise runtime_state.RuntimeStateError("execution repository identity 불일치")
         with runtime_state._transaction(self.connection):
@@ -246,7 +246,11 @@ class ExecutionStatePort:
                 project_values=runtime_state.clear_project_values(),
             )
             from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
-            ManualWorkRepository(self.connection).publish_group(repo, self.plan_id, values)
+            manual = getattr(self, 'manual', None)
+            stage_tokens = manual.publication_stage_tokens(context) if manual and context is not None else None
+            ManualWorkRepository(self.connection).publish_group(
+                repo, self.plan_id, values, stage_tokens=stage_tokens,
+            )
             self.expected = None
             return result
 

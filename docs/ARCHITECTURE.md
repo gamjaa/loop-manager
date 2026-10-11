@@ -609,7 +609,16 @@ generation, 실제 run·입력 관측·출력·결과와 reuse의 원래 run·�
 현재 receipt 선택을 CAS로 교체해 실패·중단 뒤 오래된 성공으로 되돌아갈 수 없게 한다.
 실행 전후 입력·HEAD·작업 파일과 runtime 소유 상태를 확인하고 성공 receipt와 후보 token을
 같은 transaction에서 확정한다. 저장 경쟁·실패는 현재 후보의 재사용 성공으로 처리하지 않는다.
-수동 waiver는 실제 run 성공 receipt가 아니며 기존 수동 후보 계약을 유지한다.
+수동 waiver는 실제 run 성공 receipt가 아니다. `manual_work_requests`는 기존 후보 token과 함께
+verify 및 Review의 유효 설정 token을 보존한다. verify token은 기존 managed-config loader의
+timeout·parallelism을, Review token은 verify 설정과 기존 profile resolver가 선택한 provider·
+Model·Effort를 지문으로 묶는다. 실행 중 receipt, 최종 게시와 PR 대기 재평가는 같은 계산을
+사용한다. 각 단계 시작 때 실제 verify timeout·coordinator parallelism과 Reviewer 호출에 전달할
+profile을 고정하며, 완료 시점에 설정을 다시 읽어 수행 당시 지문으로 바꾸지 않는다. 실행 중
+입력이 바뀌면 receipt는 수행 당시 입력에만 결합되고 현재 입력의 근거로 재사용되지 않는다.
+지문을 관측하지 못하면 생략·과거 단계 근거를 재사용하지 않고 기본 단계를 실행한다.
+새 열이 없는 기존 요청은 `NULL`로 남겨 당시 입력을 소급 추정하지 않는다. SQLite에는 token과
+비밀값 없는 무효화 사유만 저장하며 설정 원문·Model 인증 자료는 저장하지 않는다.
 
 `ValidationEffects.observe_verify_inputs`는 실제 명령·유효 환경·runtime·Git/외부 identity를
 증명하는 실행 adapter의 관측 경계다. 기본 임의 프로젝트 스크립트 adapter는 해당 동적 입력을

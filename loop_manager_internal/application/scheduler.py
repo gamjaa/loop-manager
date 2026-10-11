@@ -161,7 +161,9 @@ def schedule_registered_projects(
             connection, enabled=bool(config.telegram_token and config.telegram_chat_id),
         )
         connection.commit()
-    effects._preflight_self_merge_handoff(connection, projects, state_dir, runtime_mutation)
+    effects._preflight_self_merge_handoff(
+        connection, projects, state_dir, runtime_mutation, config_path=config.path,
+    )
 
     planner_mutex = threading.Lock()
     handoff_gate = RuntimeHandoffGate(threading.Event(), threading.Lock())

@@ -525,6 +525,7 @@ class PublicationHandler:
             return self.ports._recover(RecoveryReason.PUBLICATION_RETRY, str(error), context=context)
         self.ports.state.open_pull_request(
             self.ports.identity.repo,
+            context=context,
             publication_remote_oid=head_oid,
             pr_head_oid=head_oid,
             pr_conflict_recovery=0,
@@ -738,7 +739,9 @@ class PublicationHandler:
                 publication_error, context=context,
             )
         url = created.stdout.strip().splitlines()[-1]
-        self.ports.state.open_pull_request(self.ports.identity.repo, pr_url=url, pr_head_oid=head_oid)
+        self.ports.state.open_pull_request(
+            self.ports.identity.repo, context=context, pr_url=url, pr_head_oid=head_oid,
+        )
         self._complete_publication_intent(context)
         self.ports.operation_print(f"PR 생성 완료: {url}")
         return ExecutionOutcome(ExecutionOutcomeKind.SUCCESS)

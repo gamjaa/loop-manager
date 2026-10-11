@@ -239,7 +239,8 @@ class ReviewHandler:
                             else correction['level'])
         from loop_manager_internal.execution.manual_candidate import get_manual
         manual = get_manual(self.ports.state)
-        waiver = manual.waive(context, 'review') if manual else None
+        manual_snapshot = manual.capture_stage(context, 'review') if manual else None
+        waiver = manual.waive(context, 'review', snapshot=manual_snapshot) if manual else None
         if waiver:
             self.ports.operation_print(waiver)
             self.ports.state.update_project(self.ports.identity.repo, phase='PUBLISHING', last_error=None,
@@ -247,7 +248,7 @@ class ReviewHandler:
                     str(row['validated_base_sha'] or row['active_sha']),
                     self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()), publication_token=None)
             return self.ports._advanced()
-        notice = manual.invalid_waiver_notice(context,'review') if manual else None
+        notice = manual.invalid_waiver_notice(context,'review',snapshot=manual_snapshot) if manual else None
         if notice:
             self.ports.operation_print(notice)
         from loop_manager_internal.execution.result_validation import reviewer_targeted_test_evidence
@@ -297,6 +298,7 @@ class ReviewHandler:
                     read_only=True,
                     persist_session=True,
                     session_id=current_session_id,
+                    resolved_profile=(manual_snapshot.resolved_profile if manual_snapshot else None),
                     on_session_started=lambda started_session_id: self.ports.state.update_project(self.ports.identity.repo, reviewer_session_id=started_session_id),
                     invocation=invocation,
                 ), AttemptSequence(self.ports.identity.repo, str(self.ports.snapshot().plan['id']),
@@ -400,7 +402,7 @@ class ReviewHandler:
                 if verdict == 'VERIFY_REQUIRED' and not document_review:
                     raise self.ports.contract.ReviewerProtocolError('VERIFY_REQUIRED는 문서 변경 후 선행 Review에만 허용됩니다.')
                 if manual:
-                    manual.review_results(context, verdict, review)
+                    manual.review_results(context, verdict, review, snapshot=manual_snapshot)
                 if verdict == 'SPEC_BLOCKED':
                     if not isinstance(review_details, SpecificationDeadlock):
                         raise self.ports.contract.ReviewerProtocolError(
@@ -419,7 +421,8 @@ class ReviewHandler:
                         raise self.ports.contract.ReviewerProtocolError(str(error)) from error
             except self.ports.contract.ReviewerProtocolError as error:
                 if manual:
-                    manual.record(context,'review',False,f'Reviewer protocol failure: {error}\n{review}')
+                    manual.record(context,'review',False,f'Reviewer protocol failure: {error}\n{review}',
+                                  snapshot=manual_snapshot)
                 if feedback_repo is not None:
                     feedback_repo.record_result(
                         self.ports.identity.repo, str(self.ports.snapshot().plan['id']), context.plan.definition_revision_sha,
@@ -460,7 +463,7 @@ class ReviewHandler:
             )
         if verdict == 'SPEC_BLOCKED':
             if manual:
-                manual.record(context,'review',False,review)
+                manual.record(context,'review',False,review,snapshot=manual_snapshot)
             self.ports.state.update_project(self.ports.identity.repo, review_result=review)
             self.ports.operation_log(
                 f"사용자 명세 결정 필요: {self.ports.snapshot().plan['id']} {self.ports.snapshot().plan['title']}",

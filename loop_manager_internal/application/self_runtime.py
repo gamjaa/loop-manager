@@ -161,6 +161,7 @@ def _preflight_self_merge_handoff(
     projects: tuple[project_registry.RegisteredProject, ...],
     state_dir: Path,
     runtime: RuntimeMutation | None,
+    *, config_path: Path | None = None,
 ) -> None:
     """Reconcile self PRs before any project thread can start new work."""
 
@@ -172,6 +173,7 @@ def _preflight_self_merge_handoff(
         observation = effects.observe_waiting_pull_requests(
             connection, Path(project.repo), state_dir, project.repo,
             require_base_identity=True,
+            config_path=config_path,
         )
         effects._finish_self_merge_handoff(
             connection, project, state_dir, runtime, observation,

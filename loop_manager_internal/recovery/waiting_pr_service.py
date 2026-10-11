@@ -68,6 +68,7 @@ class ObserveWaitingPullRequestsEffects:
     operation_print: Callable[..., object]
     pr_for_branch: Callable[..., object]
     base_head: Callable[..., object] | None = None
+    resolve_profile: Callable[..., object] | None = None
 
 
 def observe_waiting_pull_requests(
@@ -78,6 +79,7 @@ def observe_waiting_pull_requests(
     *,
     require_base_identity: bool = False,
     read_only: bool = False,
+    config_path: Path | None = None,
 ) -> WaitingPullRequestObservation:
     """Commit every merge-wait observation before source or conflict work."""
 
@@ -90,7 +92,7 @@ def observe_waiting_pull_requests(
     registered_base = ""
     if rows:
         project = connection.execute(
-            "SELECT base_branch FROM projects WHERE repo = ?", (repo,)
+            "SELECT base_branch,provider FROM projects WHERE repo = ?", (repo,)
         ).fetchone()
         if project is None or not project["base_branch"]:
             raise RuntimeError("Merge 대기 PR의 등록 base branch를 확인할 수 없습니다.")
@@ -187,7 +189,8 @@ def observe_waiting_pull_requests(
         if group and effects.base_head and stored['status']=='PR_OPEN':
             from loop_manager_internal.recovery import manual_work_recovery
             if manual_work_recovery.revalidate_waiting(connection,repo,stored,pull_request,
-                    effects.base_head(repo_path,registered_base)):
+                    effects.base_head(repo_path,registered_base),config_path=config_path,
+                    provider=project['provider'],resolve_profile=effects.resolve_profile):
                 continue
         if (
             stored["status"] == "PLAN_BLOCKED"
@@ -236,7 +239,8 @@ def observe_waiting_pull_requests(
             if group and effects.base_head:
                 from loop_manager_internal.recovery import manual_work_recovery
                 if manual_work_recovery.revalidate_waiting(connection,repo,stored,pull_request,
-                        effects.base_head(repo_path,registered_base)):
+                        effects.base_head(repo_path,registered_base),config_path=config_path,
+                        provider=project['provider'],resolve_profile=effects.resolve_profile):
                     continue
         with connection:
             resumed = notifications.record_work_start(
@@ -290,6 +294,8 @@ def select_waiting_pull_request_conflict(
     state_dir: Path,
     repo: str,
     observation: WaitingPullRequestObservation,
+    *,
+    config_path: Path | None = None,
 ) -> PullRequestSyncResult:
     """Select one still-eligible conflict after all observations are durable."""
 
@@ -335,6 +341,7 @@ def select_waiting_pull_request_conflict(
         "SELECT * FROM projects WHERE repo = ?", (repo,)
     ).fetchone()
     assert project is not None
+    recovery_options = {"config_path": config_path} if config_path is not None else {}
     result = effects.reconcile_existing_pull_request(
         connection,
         repo_path,
@@ -342,6 +349,7 @@ def select_waiting_pull_request_conflict(
         repo,
         project,
         pull_request,
+        **recovery_options,
     )
     return PullRequestSyncResult(result, result is None, observation.merged)
 
@@ -362,17 +370,20 @@ def synchronize_waiting_pull_requests(
     after_reconciliation: Callable[[], None] | None = None,
     after_observation: Callable[[WaitingPullRequestObservation], None] | None = None,
     require_base_identity: bool = False,
+    config_path: Path | None = None,
 ) -> PullRequestSyncResult:
     observation = effects.observe_waiting_pull_requests(
         connection, repo_path, state_dir, repo,
         require_base_identity=require_base_identity,
+        config_path=config_path,
     )
     if after_observation is not None:
         after_observation(observation)
     if after_reconciliation is not None:
         after_reconciliation()
     return effects.select_waiting_pull_request_conflict(
-        connection, repo_path, state_dir, repo, observation
+        connection, repo_path, state_dir, repo, observation,
+        config_path=config_path,
     )
 
 
@@ -560,8 +571,14 @@ def reconcile_existing_pull_request(
     repo: str,
     project: sqlite3.Row,
     pull_request: Mapping[str, object],
+    *,
+    config_path: Path | None = None,
 ) -> int | None:
-    return pull_request_recovery.reconcile_existing_pull_request(effects._pull_request_recovery_effects_reconcile_existing_pull_request(), connection, repo_path, state_dir, repo, project, pull_request)
+    return pull_request_recovery.reconcile_existing_pull_request(
+        effects._pull_request_recovery_effects_reconcile_existing_pull_request(),
+        connection, repo_path, state_dir, repo, project, pull_request,
+        config_path=config_path,
+    )
 
 
 @dataclass(frozen=True)

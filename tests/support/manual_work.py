@@ -7,6 +7,7 @@ from unittest import mock
 
 import loop_manager
 from loop_manager_internal.application.manual_work import ManualWorkService
+from loop_manager_internal.agents.agent_invocation import ResolvedProfile
 from tests.support.workspace import WorkspaceFixture
 
 
@@ -27,8 +28,13 @@ class ManualWorkFixture(WorkspaceFixture):
         repo,state,connection,plan,sha,branch,worktree=self._ready_execplan(directory)
         connection.execute('UPDATE projects SET registered=1 WHERE repo=?',(str(repo),))
         connection.commit()
+        config_path=Path(directory)/'operational-config.ini'
+        config_path.write_text('[loop]\nmax_workers=3\nverify_timeout_seconds=600\n'
+            'verify_parallelism=auto\n\n[telegram]\ntoken=fixture-secret\nchat_id=fixture-chat\n',
+            encoding='utf-8')
         effects=replace(loop_manager._manual_work_effects(),validate_repository=mock.Mock(),
-                        run_project=mock.Mock(),generate_plans=mock.Mock(),operation_print=mock.Mock())
-        service=ManualWorkService(effects,connection,state,repo,Path('unused.ini'))
+                        run_project=mock.Mock(),generate_plans=mock.Mock(),operation_print=mock.Mock(),
+                        resolve_profile=mock.Mock(return_value=ResolvedProfile('fixture-reviewer','medium')))
+        service=ManualWorkService(effects,connection,state,repo,config_path)
         # The driver is not executed here; stage tests enter the real project pipeline.
         return service,branch,worktree

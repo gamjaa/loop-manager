@@ -242,6 +242,7 @@ class ProjectService:
             self.effects.observe_waiting_pull_requests(
                 self.identity.connection, self.state.repo_path, self.identity.state_dir, self.state.repo,
                 require_base_identity=self.state.require_self_pr_base, read_only=True,
+                config_path=self.identity.config_path,
             )
             self.effects.resume_project_block_if_safe(self.identity.connection, self.state.repo_path, self.identity.state_dir, self.state.repo)
             project_block = scoped_blocking.project_block(self.identity.connection, self.state.repo)
@@ -528,6 +529,7 @@ class ProjectService:
                 self.identity.connection, self.state.repo_path, self.identity.state_dir, self.state.repo,
                 after_reconciliation=self._synchronize_source_after_pr_reconciliation,
                 require_base_identity=self.state.require_self_pr_base,
+                config_path=self.identity.config_path,
                 after_observation=lambda observation: self.effects._handoff_observed_self_merge(
                     self.identity.connection, self.state.repo, self.identity.state_dir, self.identity.runtime_mutation, observation,
                 ),
@@ -667,6 +669,7 @@ class ProjectService:
                         self.state.repo,
                         self.state.row,
                         existing_pr,
+                        config_path=self.identity.config_path,
                     )
                     if reconciliation is not None:
                         return reconciliation
@@ -746,7 +749,8 @@ class ProjectService:
                     and str(pull_request.get('state') or '').upper() in {'CLOSED', 'MERGED'}):
                 return self.effects.reconcile_existing_pull_request(
                     self.identity.connection, self.state.repo_path, self.identity.state_dir,
-                    self.state.repo, self.state.row, pull_request)
+                    self.state.repo, self.state.row, pull_request,
+                    config_path=self.identity.config_path)
             self.effects.block_active_execplan_from_revision(
                 self.identity.connection, self.state.repo_path, self.state.repo,
                 f"refs/remotes/origin/{self.state.row['base_branch']}", str(error),

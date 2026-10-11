@@ -1414,6 +1414,7 @@ class RuntimeStateRepository:
         pr_conflict_recovery: int | None = None,
         pr_conflict_head_oid: str | None = None,
         pr_conflict_base_oid: str | None = None,
+        manual_stage_tokens: Mapping[str, str] | None = None,
     ) -> ExecutionSnapshot:
         snapshot = self.projected(repo)
         if snapshot is None:
@@ -1436,7 +1437,8 @@ class RuntimeStateRepository:
             result = self.transition_and_clear(repo, snapshot.plan_id, plan_values=values)
             from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
             ManualWorkRepository(self.connection).publish_group(repo,snapshot.plan_id,
-                {key:getattr(result,key) for key in ('pr_url','pr_head_oid','publication_remote_oid')})
+                {key:getattr(result,key) for key in ('pr_url','pr_head_oid','publication_remote_oid')},
+                stage_tokens=manual_stage_tokens)
             return result
 
     def mark_merged(

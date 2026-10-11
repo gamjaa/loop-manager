@@ -335,17 +335,19 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
             runtime = loop_manager.RuntimeMutation(
                 Path(repos[0]), state_dir / "runtime", "a" * 40, "b" * 32,
             )
+            config_path = Path('/managed/config.ini')
             try:
                 with mock.patch(
                     "loop_manager._registered_self_runtime_project", return_value=True
                 ), mock.patch(
                     "loop_manager.observe_waiting_pull_requests",
                     return_value=loop_manager.WaitingPullRequestObservation((), False),
-                ), mock.patch("loop_manager.ensure_safe_base_worktree") as synchronize:
+                ) as observe, mock.patch("loop_manager.ensure_safe_base_worktree") as synchronize:
                     self.assertIsNone(loop_manager._preflight_self_merge_handoff(
-                        connection, (project,), state_dir, runtime,
+                        connection, (project,), state_dir, runtime, config_path=config_path,
                     ))
                     synchronize.assert_not_called()
+                    self.assertEqual(observe.call_args.kwargs['config_path'], config_path)
                 with mock.patch(
                     "loop_manager._registered_self_runtime_project", return_value=True
                 ), mock.patch(
@@ -354,7 +356,7 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
                 ), mock.patch("loop_manager.ensure_safe_base_worktree") as synchronize:
                     with self.assertRaisesRegex(RuntimeError, "fetch failed"):
                         loop_manager._preflight_self_merge_handoff(
-                            connection, (project,), state_dir, runtime,
+                            connection, (project,), state_dir, runtime, config_path=config_path,
                         )
                     synchronize.assert_not_called()
             finally:
