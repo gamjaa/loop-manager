@@ -34,10 +34,17 @@ class RequirementCorrectionRepository:
                 "SELECT manifest,stage FROM requirement_correction_publications "
                 "WHERE repo=? AND operation_id=?", (repo, operation_id),
             ).fetchone()
-            if row['manifest'] != encoded or row['stage'] != 'prepared':
+            if row['manifest'] != encoded or row['stage'] not in {'prepared', 'superseded'}:
                 raise RuntimeError('Requirement 교정 intent가 기존 후보와 다릅니다.')
             if not current():
                 raise RuntimeError('Requirement 교정 소유 예약 중 원격·참조 입력이 변경됐습니다.')
+            if row['stage'] == 'superseded':
+                # Reuse the saved commit and worktree when the exact input
+                # returns. The publisher still validates their actual result.
+                self.connection.execute(
+                    "UPDATE requirement_correction_publications SET stage='prepared' "
+                    "WHERE repo=? AND operation_id=?", (repo, operation_id),
+                )
 
     def update(self, repo, operation_id, *, stage='prepared', commit_oid=None, reason=None):
         with _transaction(self.connection):

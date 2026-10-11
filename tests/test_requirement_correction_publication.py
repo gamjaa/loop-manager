@@ -37,6 +37,7 @@ class GitObservations:
         self.fetch_hook = None
         self.commit_hook = None
         self.fetches = 0
+        self.checkout_crlf = False
         self.add_tree('base', {A: requirement('A'), B: requirement('B'),
             'docs/PRODUCT.md': b'[link](requirements/%5BR-001%5D%20B.md)\n'})
 
@@ -90,7 +91,8 @@ class GitObservations:
             for path, (_mode, _kind, oid) in self.trees[base].items():
                 target = workspace / path
                 target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_bytes(self.blobs[oid])
+                raw = self.blobs[oid]
+                target.write_bytes(raw.replace(b'\n', b'\r\n') if self.checkout_crlf else raw)
             self.trip('worktree')
         elif command == 'write-tree':
             output = 'tree-' + hashlib.sha256(repr(self.index[repo]).encode()).hexdigest()
@@ -102,6 +104,8 @@ class GitObservations:
                 changed = {p for p in base.keys() | current.keys() if base.get(p) != current.get(p)}
             else:
                 files = self.files(repo)
+                if self.checkout_crlf:
+                    files = {path: raw.replace(b'\r\n', b'\n') for path, raw in files.items()}
                 changed = {p for p in base if p not in files or files[p] != self.blobs[base[p][2]]}
             output = ''.join(p + '\0' for p in sorted(changed))
         elif command == 'ls-files':
@@ -121,6 +125,8 @@ class GitObservations:
         elif command == 'status':
             head = self.trees[self.heads[repo]]
             files = self.files(repo)
+            if self.checkout_crlf:
+                files = {path: raw.replace(b'\r\n', b'\n') for path, raw in files.items()}
             dirty = (set(files) != set(head) or self.index[repo] != head or
                      any(files[p] != self.blobs[value[2]] for p, value in head.items() if p in files))
             output = 'dirty' if dirty else ''
@@ -445,3 +451,97 @@ class RequirementCorrectionPublicationTest(unittest.TestCase):
         with self.assertRaisesRegex(CorrectionPending, '안전한 처리'):
             self.publisher.dispatch('main')
         self.assertEqual((self.observations.commits, self.observations.pushes), (0, 0))
+
+    def test_crlf_checkout_publishes_exact_blob_bytes(self):
+        self.observations.checkout_crlf = True
+        # Stop after checkout to prove the starting file differs from its blob.
+        self.observations.fail = 'worktree'
+        with self.assertRaises(CorrectionPending):
+            self.publisher.dispatch('main')
+        saved = self.publisher.repository.pending('repo')
+        workspace = self.publisher._workspace(saved['operation_id'])
+        self.assertEqual((workspace / B).read_bytes(), requirement('B').replace(b'\n', b'\r\n'))
+        commit = self.publisher.dispatch('main')
+        self.assertEqual(self.observations.blobs[self.observations.trees[commit][NEW][2]],
+                         requirement('B').replace(b'R-001', b'R-002'))
+        self.assertEqual((self.observations.commits, self.observations.pushes), (1, 1))
+
+    def test_committed_crlf_checkout_recovers_without_recommit(self):
+        self.observations.checkout_crlf = True
+        self.observations.fail = 'push-rejected'
+        with self.assertRaises(CorrectionPending):
+            self.publisher.dispatch('main')
+        saved = self.publisher.repository.pending('repo')
+        workspace = self.publisher._workspace(saved['operation_id'])
+        for path in self.observations.files(workspace):
+            target = workspace / path
+            target.write_bytes(target.read_bytes().replace(b'\r\n', b'\n').replace(b'\n', b'\r\n'))
+        self.assertEqual(self.publisher.dispatch('main'), saved['commit_oid'])
+        self.assertEqual((self.observations.commits, self.observations.pushes), (1, 2))
+
+    def test_crlf_checkout_still_rejects_content_and_lone_cr_mutations(self):
+        self.observations.checkout_crlf = True
+        self.observations.fail = 'worktree'
+        with self.assertRaises(CorrectionPending):
+            self.publisher.dispatch('main')
+        saved = self.publisher.repository.pending('repo')
+        target = self.publisher._workspace(saved['operation_id']) / B
+        original = target.read_bytes()
+        for raw in (original.replace(b'criteria', b'changed'), original.replace(b'\r\n', b'\r')):
+            with self.subTest(raw=raw):
+                target.write_bytes(raw)
+                with self.assertRaisesRegex(CorrectionPending, '변조'):
+                    self.publisher.dispatch('main')
+                self.assertEqual(target.read_bytes(), raw)
+                self.assertEqual((self.observations.commits, self.observations.pushes), (0, 0))
+
+    def test_superseded_candidate_reuses_commit_when_draft_input_returns(self):
+        self.observations.fail = 'push-rejected'
+        with self.assertRaises(CorrectionPending):
+            self.publisher.dispatch('main')
+        saved = self.publisher.repository.pending('repo')
+        self.connection.execute('INSERT INTO document_drafts VALUES (?,?,?)', ('repo', 'docs/PRODUCT.md', 'pending'))
+        self.connection.commit()
+        with self.assertRaisesRegex(CorrectionPending, '입력이 변경'):
+            self.publisher.dispatch('main')
+        self.assertIsNone(self.publisher.repository.pending('repo'))
+        self.connection.execute("UPDATE document_drafts SET state='rejected'")
+        self.connection.commit()
+        commit = self.publisher.dispatch('main')
+        self.assertEqual(commit, saved['commit_oid'])
+        self.assertEqual(self.publisher.repository.confirmed('repo')[0]['operation_id'], saved['operation_id'])
+        self.assertEqual((self.observations.commits, self.observations.pushes), (1, 2))
+
+    def test_superseded_reentry_still_rejects_tampered_worktree(self):
+        self.observations.fail = 'push-rejected'
+        with self.assertRaises(CorrectionPending):
+            self.publisher.dispatch('main')
+        saved = self.publisher.repository.pending('repo')
+        self.connection.execute('INSERT INTO document_drafts VALUES (?,?,?)', ('repo', 'docs/PRODUCT.md', 'pending'))
+        self.connection.commit()
+        with self.assertRaises(CorrectionPending):
+            self.publisher.dispatch('main')
+        target = self.publisher._workspace(saved['operation_id']) / NEW
+        target.write_bytes(b'user edit')
+        self.connection.execute("UPDATE document_drafts SET state='rejected'")
+        self.connection.commit()
+        with self.assertRaisesRegex(CorrectionPending, '변조'):
+            self.publisher.dispatch('main')
+        self.assertEqual(target.read_bytes(), b'user edit')
+        self.assertEqual((self.observations.commits, self.observations.pushes), (1, 1))
+
+    def test_superseded_record_guard_keeps_stage_commit_and_reason_on_stale_input(self):
+        self.observations.fail = 'push-rejected'
+        with self.assertRaises(CorrectionPending):
+            self.publisher.dispatch('main')
+        saved = self.publisher.repository.pending('repo')
+        repository = self.publisher.repository
+        repository.update('repo', saved['operation_id'], stage='superseded', reason='input changed')
+        for manifest, current in ((json.loads(saved['manifest']), lambda: False),
+                                  ({'different': 'input'}, lambda: True)):
+            with self.subTest(manifest=manifest):
+                with self.assertRaises(RuntimeError):
+                    repository.record('repo', saved['operation_id'], manifest, current=current)
+                row = dict(self.connection.execute('SELECT * FROM requirement_correction_publications').fetchone())
+                self.assertEqual((row['stage'], row['commit_oid'], row['reason']),
+                                 ('superseded', saved['commit_oid'], 'input changed'))

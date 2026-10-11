@@ -31,6 +31,8 @@ G-232의 구현인 `catalog/requirement_corrections.py`의 `corrections`·`updat
 
 교정 진입 전에 닫힌 안전 gate·수동 Requirement source 소유는 정상 보류로 처리해 기존 수동 verify·Review·PR 복구와 독립 실행을 막지 않는다. 보존된 후보·원문·실패 이유는 유지하고 원격 관측·편집·게시를 시작하지 않는다. 진입 뒤 새 소유자나 gate 변경은 게시 전 재검사에서 실패로 보존하며 Planner 호출·성공 기록으로 바꾸지 않는다. 이 경계는 명령 관측을 mock하고 실제 SQLite·파일을 사용하는 교정 게시 unit case 및 기존 archive 안전 gate unit case에서 검사한다.
 
+worktree 원문·rename 결과 대조는 CRLF/LF checkout 차이만 허용하고 Git index·commit·원격 결과는 저장 bytes와 정확히 대조한다. 입력 변경 뒤 원상복귀한 superseded 후보는 동일 manifest와 최신 입력을 transaction에서 확인해 기존 commit·작업물로 재개하며 일반 변조 검사를 유지한다. 교정 게시 unit case에서 CRLF checkout·commit 복구·실제 내용 변조와 PRODUCT draft 생성→거절 뒤 동일 후보 재진입·낡은 입력 거부를 검사한다.
+
 ## Validation
 
 - 실제 선택·상태 저장을 실행하는 targeted unit case에서 새 참조·목적지 경합·원격 전진·push 실패·각 저장 경계 중단·원격 게시 후 DB 미확정을 검사한다. Git·PR·모델은 관측/명령 경계만 mock한다.

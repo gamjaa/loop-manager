@@ -32,6 +32,12 @@ def _digest(value):
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
 
 
+def _checkout_matches(contents, expected):
+    # Match the existing document-publication contract: only CRLF/LF checkout
+    # differences are allowed; index/commit/remote blobs remain byte-exact.
+    return expected is not None and contents.replace(b'\r\n', b'\n') == bytes.fromhex(expected).replace(b'\r\n', b'\n')
+
+
 class RequirementCorrectionPublisher:
     """Use the existing detached-worktree, fetch journal and fast-forward adapter."""
 
@@ -221,16 +227,16 @@ class RequirementCorrectionPublisher:
                     raise CorrectionPending(f'교정 worktree 파일이 일반 파일이 아닙니다: {path}')
                 if bool(target.stat().st_mode & 0o111) != (manifest['modes'][path] == '100755'):
                     raise CorrectionPending(f'교정 worktree 파일 mode가 다릅니다: {path}')
-                actual = target.read_bytes().hex()
+                actual = target.read_bytes()
                 allowed = {manifest['after'][path]} if committed else {original, manifest['after'][path]}
-                if actual not in allowed:
+                if not any(_checkout_matches(actual, expected) for expected in allowed):
                     raise CorrectionPending(f'교정 작업물이 변조됐습니다: {path}')
             elif (manifest['after'][path] if committed else original) is not None:
                 # A removed source is a legitimate partial application.
                 if committed or manifest['after'][path] is not None:
                     raise CorrectionPending(f'교정 원문 또는 결과가 제거됐습니다: {path}')
                 destination = next(target for source, target, _id in manifest['assignments'] if source == path)
-                if not (workspace / destination).is_file() or (workspace / destination).read_bytes().hex() != manifest['after'][destination]:
+                if not (workspace / destination).is_file() or not _checkout_matches((workspace / destination).read_bytes(), manifest['after'][destination]):
                     raise CorrectionPending(f'교정 rename 결과 없이 원문이 제거됐습니다: {path}')
         index_paths = self.git.effects.git(workspace, 'diff', '--cached', '--name-only', '-z', manifest['base'], '--').stdout.split('\0')
         if (set(index_paths) - {''}) - manifest['before'].keys():
