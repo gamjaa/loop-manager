@@ -54,6 +54,10 @@ def assert_new_ids_available(connection, repo, ids):
 
 
 def assert_manual_scopes_available(connection, repo, result):
+    from .requirement_correction_state import claimed_paths
+    collision = set(result.publication_paths) & claimed_paths(connection, repo)
+    if collision:
+        raise RuntimeError('Requirement 교정 게시 소유 예약 충돌: ' + ', '.join(sorted(collision)))
     if not connection.execute("SELECT 1 FROM sqlite_master WHERE name='manual_work_groups'").fetchone():
         return
     from .manual_work_state import live_requirement_paths

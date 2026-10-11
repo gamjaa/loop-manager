@@ -41,6 +41,8 @@ def preparation_gate(service, *, plan_ids=(), group=None, requirements=()):
             if overlap:
                 raise ManualConflictError(f"수동 제출 소유 예약과 충돌: {other['group_id']}; R={', '.join(sorted(overlap))}")
     claimed_ids, claimed_paths = work_claims.publication_claims(connection, repo)
+    from loop_manager_internal.storage.requirement_correction_state import claimed_paths as correction_paths
+    claimed_paths = claimed_paths | correction_paths(connection, repo)
     overlap = set(plan_ids) & claimed_ids
     requested_paths = set(requirements)
     for key in plan_ids:

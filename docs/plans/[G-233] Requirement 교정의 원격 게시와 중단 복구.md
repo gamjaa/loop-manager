@@ -39,7 +39,7 @@ G-232의 구현인 `catalog/requirement_corrections.py`의 `corrections`·`updat
 
 - [x] eb797d3a의 catalog·게시·retirement 경계를 읽었다. Requirement 교정용 원격 게시·재검사·재개 연결은 없다. 구현·테스트 실행 없음.
 - [x] 2026-10-10 delta 기준 `ab0264d94da1212d68141b28fc55f0204c1c9e09` → `214c978cb296a765020d88378f5526050d241f44`, mutable snapshot token `98bf2742d165143c06a91b9a328ede34ff8b107592dc674cb39dd0acf4d40239`와 원본 hash를 확인했다. G-232의 archive 이동과 계산 코드·17개 테스트 사례를 정적으로 대조했으며 실제 호출 연결은 테스트 외에 없다. 기존 dependency·목표를 유지해 남은 관측·적용·게시·복구 연결만 구체화했다. 구현·테스트·전체 verify를 실행하지 않았다.
-- [ ] 게시·복구 통합과 targeted unit 검증
+- [x] 게시·복구 통합 구현: 기존 housekeeping gate와 detached Git adapter에 교정 게시를 연결하고 원문·배정·결과 intent, 파일·index·commit 대조, 원격 재관측, 저장 관계 재검사 및 수동 예약 충돌을 추가했다. `tests/test_requirement_correction_publication.py`는 실제 SQLite·파일과 mock 명령 경계로 적용 bytes·링크·참조 보호·경쟁·중단 복구를 검사한다. targeted 실행 결과는 Worker 보고에 기록하며 전체 verify·Merge를 대신하지 않는다.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
