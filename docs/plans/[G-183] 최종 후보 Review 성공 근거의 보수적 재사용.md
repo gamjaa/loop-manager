@@ -7,6 +7,7 @@ sources:
   - docs/requirements/[R-082] 단계별 원격 문서 반영과 PR 전 ExecPlan 갱신.md
   - docs/requirements/[R-064] 모델 호출을 통한 공통 Agent 지침 전달.md
   - docs/requirements/[R-066] AGENTS 변경 사전 승인.md
+  - docs/requirements/[R-085] Codex Claude 인증 전용 자동 실행 환경.md
 depends_on:
   - G-182
   - G-147
@@ -23,6 +24,8 @@ depends_on:
   - G-217
   - G-241
   - G-242
+  - G-263
+  - G-264
 complexity: high
 risk: high
 priority: high
@@ -39,12 +42,14 @@ priority: high
 - 승인 receipt는 실제 PASS·검증된 후보/입력·작업 주기에 결합하고 최종 게시 직전 다시 확인한다. rebase·경쟁·중단/재시작에서 오래된 Review로 새 diff를 승인하거나 새 실패를 이전 PASS로 덮지 않는다.
 - 다른 계획/작업의 PASS·교정 이력·승인을 복제하지 않는다. 생략 이유와 원래 근거를 남기며 실제 Reviewer가 실행되면 기존 읽기 전용·검증 결과 전달·issue 교정 계약을 유지한다.
 - G-241의 일반 verify 입력 증명과 최신 완료 조건을 확인한다. R-082의 선행 Review PASS·VERIFY_REQUIRED와 과거 verify 참고 출력은 최종 승인 receipt가 아니며, 검증 보완 전에는 재사용·게시 근거로 승격하지 않는다.
+- R-085의 실제 Reviewer 실행 환경과 소비하는 설정·정책 입력이 같다는 근거를 확인한다. 인증 원본의 사용하지 않는 개인 config 변경은 재사용 입력이 아니며, 관리 home/source 선택·유효 정책 변경 또는 과거 환경의 입력 부재는 새 Review로 연결한다. 인증값을 지문·receipt·로그에 넣거나 현재 환경을 과거 승인 당시의 환경으로 소급 채택하지 않는다.
 
 ## Implementation
 
 - execution Review handler·publication 후보 확인과 storage의 기존 validation/checkpoint 경계를 확장한다. verify receipt와 Review 입력/receipt를 분리하되 필수 선행 검증 관계를 유지한다.
 - 기존 공통·역할별 원본 묶음 버전과 실제 Reviewer 합성 instruction의 hash, 문서 source fallback/예약어 규칙 버전, G-171 최종 문서 diff 보고를 재사용한다. 최신 runtime 원본을 진행 중 작업의 고정 버전에 섞거나 common 본문만 비교해 역할 규칙 변경을 놓치지 않는다. 실제 외부 검토 기준을 확인할 수 없으면 새 Review를 선택한다.
 - 실제 Reviewer 호출에는 G-197의 최종 후보 검증 근거 전달 경계를 재사용한다. verify 성공을 재사용했으면 원래 성공 근거와 현재 입력의 동일성 확인을 전달하고, 새 verify를 실행한 것으로 보고하지 않는다.
+- G-262의 준비된 실행 환경·실제 설정 관측과 G-263/G-264의 provider별 source 선택을 소비한다. 재사용 판정과 실제 Reviewer 실행이 같은 비밀값 없는 환경/정책 identity를 사용하게 하며 별도 home 탐색·개인 config 조회·인증 cache를 추가하지 않는다. 기존 격리/설정 증거의 확인 불가를 동일성으로 대용하지 않는다.
 - 자동 역할·권한·검증은 고정된 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md instruction을 사용하고, 설계·계획 작성은 docs/ARCHITECTURE.md·docs/PLANS.md를 참조한다. 프로젝트 지침 해석은 Agent CLI에 맡기며 Manager가 루트 지침을 읽거나 과거 승인·patch를 Review receipt에 추가하지 않는다. 기존 helper·관련 테스트와 R-064의 예약 경로를 유지한다.
 
 ## Validation
@@ -54,6 +59,7 @@ priority: high
 - Manager 전체 verify는 verify/Review 독립 선택, 실제 no-call/필수 call, 마지막 승인 기준·scope·최종 PR gate와 중단 재개를 검증한다.
 - 실제 Review가 필요한 경우 실행한 verify 또는 재사용한 verify의 유효한 근거가 같은 후보에 결합돼 전달되는지 확인한다. Review 생략은 새 Reviewer 호출·새 테스트 실행 근거를 만들지 않는다.
 - 단계별 문서 변경 뒤 선행 PASS·VERIFY_REQUIRED·최종 PASS를 구분하고, 일반 verify 재사용 및 새 완료 조건의 증거 부재에서 최종 Review를 잘못 생략하지 않는 최소 unit case를 확인한다.
+- R-085 fixture에서 실제 미소비 개인 설정만 변경한 경우와 관리 home/source·소비 설정/정책 변경·과거 환경 identity 부재를 분리한다. 실제 no-call/필수 Reviewer call·기존 receipt 보존·비밀값 비노출을 확인하며 모의 인증 성공을 실계정 실행 근거로 사용하지 않는다.
 
 ## Progress
 
@@ -62,8 +68,11 @@ priority: high
 - [ ] 구현 및 관련 targeted unit 검증
 - [x] 2026-10-09 eb797d3a의 R-072·R-082와 현재 verify adapter·문서 선행 Review를 정적으로 대조했다. 일반 verify 재사용은 미충족이며 선행 Review는 최종 승인이 아니다. 구현·테스트 실행 없음.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
+- [x] 2026-10-11 delta 검토: PR 전 snapshot token `4e4794ea5a72e4acbf130a00b86c65166feb4676b19e417a33a4af84e631cb28`, revision `6fc245469a6bd3cced81dbf64fc049130982bbc8`와 원본 hash `94dc14021dce370d8033c0c91bf1ab0dcea013699e1240603e397a78571a4314`를 대조했다. R-085의 미구현 실행 환경 전환을 기존 최종 Review 동일성 목표에 연결했다. 기존 기록을 보존하며 구현·테스트·전체 verify는 실행하지 않았다.
 
 ## Decision Log
+
+- 2026-10-11: G-263/G-264의 실제 provider 환경 분리를 선행으로 연결한다. 새 Reviewer 환경을 확인하지 않고 개인 설정 지문이나 과거 환경의 PASS를 재사용하는 경로를 막으며, 인증 환경 구현은 해당 계획에 남긴다. 기존 high complexity의 승인/입력/게시 수명 판단과 high risk의 미검증 후보 게시·receipt 보존/재검증 복구를 유지한다. ID·경로·기존 목표·dependency·수행 기록을 보존한 delta 개정이며 프로젝트 최종 전문 확인이 아니다.
 
 - 검증·전체 diff·검토 기준·게시를 결합해 complexity high, 승인 없는 후보 게시 영향으로 risk high다.
 - 2026-10-06: mutable READY token a382b8f255fc01e7ddfd58be4210b3263692ebb1e781025a65291808f7b619f3의 G-183만 개정한다. R-003 감사에서 기존 성공 결과 전달이 없음을 확인해 G-197의 실제 Merge를 선행 조건으로 추가한다. ID·경로·title·sources·Purpose와 기존 재사용 목표 및 dependency를 보존하고, 재사용한 성공을 새 실행으로 오인하지 않도록 전달 조건을 명확히 한다.
