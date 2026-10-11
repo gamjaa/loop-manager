@@ -10,7 +10,6 @@ depends_on:
 complexity: high
 risk: high
 priority: high
-draft: true
 ---
 
 ## Purpose
@@ -23,6 +22,12 @@ Question: R-055의 확인된 삭제를 반영한 취소·완료 작업에 한해
 Facts: R-055 D09/D10은 이 자동 정리를 요구하지만 ARCHITECTURE의 현행 Repository Safety and Security는 Merge된 로컬 관리 branch만 비강제 삭제하고 원격 branch는 자동 삭제하지 않는다. Architecture Change Policy는 “worktree, branch, commit, push와 PR 생성 경계 변경”에 사용자 승인을 요구한다. 현재 cleanup은 PR head에 포함된 clean worktree를 확인하며 local-only commit·dirty·미확인은 pending으로 보존한다. R-055는 원하는 변경의 근거이고 이 계획의 사용자 승인 기록을 대신 작성하지 않는다.
 Options: (A) 아래 조건을 모두 지키는 R-055의 소유 로컬·원격 자원 정리 경계를 승인한다. (B) 현재 로컬 Merge 정리를 유지하고 이 확장은 defer한다. 다른 범위나 보존 조건을 원하는 경우 사용자 명세를 먼저 조정한다.
 Impact: A는 기존 cleanup/Manager Git 효과를 확장하며 보호 실패·경쟁·PR head 사용 미확인은 해당 자원 pending으로 남긴다. B에서는 G-258–G-260의 확인된 문서·DB·취소 반영은 진행할 수 있고 이 자원 정리 목표는 미충족으로 남는다. 승인 전 아래 구현과 그 의존 실행을 시작하지 않는다.
+
+## User Decision
+
+Decision: approve
+Revision: 5553ed3c62389b0e1ba07bcdcaf4a56efd067c17d9cf20bbb62ee073c2f8fff4
+Answer: 선택지 A를 승인한다. 앞으로 작업 문서의 확인된 삭제를 반영한 취소·완료 작업에 대해 Manager가 관련 Manager 소유 원격·로컬 작업 브랜치와 worktree를 자동 정리하도록 한다. 이 계획의 작업물 보존, 소유권 확인, 정확한 ref·기대 OID 검증, PR head 사용 확인 및 중단 복구 조건을 모두 적용한다. base·사용자·다른 작업의 자원은 삭제하지 않으며, 보존 실패·사용 중·불확실한 자원은 pending으로 유지한다. 이 승인으로 Architecture Change Policy의 해당 경계 변경 판단을 해소하고 G-261의 draft를 해제한다.
 
 ## Acceptance Criteria
 
@@ -49,11 +54,13 @@ G-238의 명시적 reset/manual stop·READY 복귀는 이 작업에 포함하지
 ## Progress
 
 - [x] 2026-10-10 delta·R-055 D09/D10·ARCHITECTURE의 현행 정리/변경 정책·cleanup 구현과 기존 회귀를 정적으로 대조했다. 구현·테스트·전체 verify를 실행하지 않았다.
-- [ ] 사용자 Architecture Change Policy 판단
+- [x] 2026-10-11 사용자 Architecture Change Policy 판단: 선택지 A 승인 및 draft 해제 요청을 위 User Decision에 기록했다.
 - [ ] 승인 범위의 자원 보존·정리·재개 구현과 targeted unit 검증
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- 2026-10-11 사용자가 “앞으로 작업 문서가 삭제됐을 때 매니저가 관련 원격/로컬 브랜치도 삭제하도록 해줘. 유저 결정 남기고 draft 상태 풀어서 프리해줘”라고 명시적으로 요청했다. 해당 사용자 결정을 대신 기록하고 draft 표시를 제거했다. 기존 Draft Decision과 구현·검증 조건은 승인 범위와 판단 지문 보존을 위해 유지한다. 선행 작업·정상 실행 gate는 계속 적용한다.
 
 - R-055는 새 자원 정리 목표를 명확히 지정하지만 현재 Manager 효과에는 소유 원격 ref 자동 삭제 연결이 없다. 정책 적용 대상의 구현을 임의 승인하지 않고 이 ID의 draft 판단으로 남긴다. 사용자만 draft 해제와 User Decision을 작성하며 Agent가 결정이나 승인을 합성하지 않는다.
 - G-189의 전체 차단 감사, G-257의 참조 복구 게시, G-258의 관측·감사 구분, G-259의 의미 판단·문서 게시와 G-260의 현재 취소를 중복하지 않는다. 정리 보류가 확인된 취소나 독립 작업을 완료 대기로 되돌리지 않아야 한다. 이번 변경 검토는 프로젝트 최종 전문 확인이 아니다.
