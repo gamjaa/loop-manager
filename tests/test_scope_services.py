@@ -202,7 +202,7 @@ class ScopeValidationTests(TestCase):
         capture.assert_called_once_with(Path('/managed'))
 
     def test_reviewer_is_read_only_and_worker_protected_paths_stay_protected(self):
-        for path in ('src/app.py', 'AGENTS.md', 'docs/ARCHITECTURE.md', 'docs/requirements/change.md'):
+        for path in ('src/app.py', 'AGENTS.md', 'docs/ARCHITECTURE.md', 'docs/requirements/archive/change.md'):
             changed = snapshot(dirty={path: (('untracked',), 'content')})
             with self.subTest(path=path):
                 with self.assertRaises(AgentScopeError):

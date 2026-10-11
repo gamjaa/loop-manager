@@ -520,7 +520,7 @@ class ScopeGitMetadataTest(AgentScopeFixture, unittest.TestCase):
     def test_preexisting_index_flags_do_not_hide_agent_file_changes(self):
         scenarios = (
             ("planner", "README.md"),
-            ("worker", "docs/requirements/Active.md"),
+            ("worker", "docs/PLANS.md"),
             ("reviewer", "src/app.py"),
         )
         for option in ("--skip-worktree", "--assume-unchanged"):

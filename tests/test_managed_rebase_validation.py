@@ -66,7 +66,7 @@ class CurrentRebasePolicyTests(unittest.TestCase):
             {'staged': current.committed},
             {'index': (IndexEntry('app.py', '100644', 'unmerged', 2, 'M', 0x2000),)},
             {'remote': replace(expected.remote, oid='changed')},
-            {'committed': (replace(current.committed[0], path='docs/requirements/Protected.md'),)},
+            {'committed': (replace(current.committed[0], path='docs/requirements/archive/Protected.md'),)},
         ):
             with self.subTest(changes=changes):
                 self.assertEqual(decision_for(expected, replace(current, operations=auxiliary,
@@ -163,14 +163,14 @@ class CurrentRebasePolicyTests(unittest.TestCase):
 
     def test_scope_covers_final_dirty_staged_ignored_modes_and_real_flags(self):
         expected, current = expectation(), observation()
-        forbidden = 'docs/requirements/[R-048] Evidence-Free Managed Rebase Recovery.md'
+        forbidden = 'docs/requirements/archive/[R-048] Evidence-Free Managed Rebase Recovery.md'
         for changes in (
             {'committed': (replace(current.committed[0], path=forbidden),)},
             {'committed': (replace(current.committed[0], new_mode='040000'),)},
             {'staged': (replace(current.committed[0], path=forbidden),)},
             {'files': (WorktreeFile(forbidden, ('unstaged',), '100644', 'changed'),)},
-            {'files': (WorktreeFile('docs/requirements/Protected.md', ('untracked',), '100644', 'new'),)},
-            {'files': (WorktreeFile('docs/requirements/Protected.md', ('ignored',), '100644', 'hidden'),)},
+            {'files': (WorktreeFile('docs/requirements/archive/Protected.md', ('untracked',), '100644', 'new'),)},
+            {'files': (WorktreeFile('docs/requirements/archive/Protected.md', ('ignored',), '100644', 'hidden'),)},
             {'files': (WorktreeFile('../escape', ('untracked',), '100644', 'outside'),)},
             {'files': (WorktreeFile('.GIT/config', ('ignored',), '100644', 'outside'),)},
             {'index': (replace(current.index[0], mode='040000'),)},
@@ -189,6 +189,17 @@ class CurrentRebasePolicyTests(unittest.TestCase):
         stale_scope = scope_for(expected, current)
         self.assertEqual(assess_current_rebase(expected, dirty_allowed, stale_scope).status,
                          RebaseStatus.REJECTED)
+
+    def test_active_requirement_edits_follow_worker_scope_during_rebase(self):
+        expected = expectation()
+        current = observation()
+        path = 'docs/requirements/Active.md'
+        for actual in (
+            replace(current, committed=(replace(current.committed[0], path=path),)),
+            replace(current, files=(WorktreeFile(path, ('unstaged',), '100644', 'edited'),)),
+        ):
+            with self.subTest(observed=actual):
+                self.assertEqual(decision_for(expected, actual).status, RebaseStatus.COMPLETE)
 
     def test_guidance_and_archive_need_exact_current_contract(self):
         expected = expectation()
@@ -524,7 +535,7 @@ class CurrentRebaseObservationTests(unittest.TestCase):
         expected = self.expected
         adapters = self.adapters()
         snapshot = adapters.capture_snapshot.return_value
-        protected = 'docs/requirements/Protected.md'
+        protected = 'docs/requirements/archive/Protected.md'
         snapshot.index = {protected: ('H 100644 blob 0',)}
         original_git = adapters.git.side_effect
         def git(context, *args, **kwargs):

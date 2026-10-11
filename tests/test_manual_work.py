@@ -476,6 +476,9 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
             self.assertEqual(service.runtime.active_row(service.repo)['status'],'IMPLEMENTING')
 
     def test_generated_tracking_commit_invalidates_source_waiver(self):
+        self.enterContext(mock.patch(
+            'loop_manager_internal.execution.execution_publication_handler.common_guidance_report',
+            return_value=''))
         with tempfile.TemporaryDirectory() as directory:
             service,group,_=self.submitted(directory,count=1,skip=True)
             owner=group['owner_id']
@@ -503,6 +506,9 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
                 manual_workspace_owner(service.connection,service.repo,second),group['branch'],Path(group['worktree']))
 
     def test_shared_pr_is_published_closed_reopened_and_merged_as_one_group(self):
+        self.enterContext(mock.patch(
+            'loop_manager_internal.execution.execution_publication_handler.common_guidance_report',
+            return_value=''))
         with tempfile.TemporaryDirectory() as directory:
             service,group,_=self.submitted(directory)
             members=json.loads(group['members'])

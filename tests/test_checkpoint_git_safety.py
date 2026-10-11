@@ -277,9 +277,9 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
         self.run_git(self.worktree, "add", ".gitignore")
         self.run_git(self.worktree, "commit", "-m", "ignore rule")
         (self.worktree / "ignored.txt").write_text("secret\n", encoding="utf-8")
-        (self.worktree / "docs/requirements").mkdir(parents=True, exist_ok=True)
-        (self.worktree / "docs/requirements/Outside.md").write_text("outside\n", encoding="utf-8")
-        self.run_git(self.worktree, "add", "-f", "docs/requirements/Outside.md")
+        (self.worktree / "docs/requirements/archive").mkdir(parents=True, exist_ok=True)
+        (self.worktree / "docs/requirements/archive/Outside.md").write_text("outside\n", encoding="utf-8")
+        self.run_git(self.worktree, "add", "-f", "docs/requirements/archive/Outside.md")
         symlink_or_skip(self.worktree / "link.py", "code.py")
         request = self.block()
         adapter = loop_manager._BlockedCheckpointAdapter(
@@ -291,7 +291,7 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
         verdict = adapter.assess(request)
         self.assertFalse(verdict.safe)
         self.assertEqual(verdict.reason_code, "dirty_scope_violation")
-        self.assertIn("docs/requirements/Outside.md", verdict.detail)
+        self.assertIn("docs/requirements/archive/Outside.md", verdict.detail)
         self.assertNotIn("ignored.txt", verdict.detail)
         self.assertIn("link.py", verdict.detail)
         self.assertEqual(

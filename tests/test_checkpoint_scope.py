@@ -269,6 +269,24 @@ class CheckpointScopeTests(TestCase):
                     self.current = replace(self.before, **values)
                     self.assertFalse(self.adapter.assess(self.request).safe)
 
+    def test_active_requirement_permission_keeps_archive_and_symlink_checkpoint_guards(self):
+        plan = 'docs/plans/[G-047] Runtime.md'
+        def dirty(path, **kwargs):
+            return blocked_checkpoint.DirtyPath(path, ('staged',),
+                manager._worker_path_allowed(path, plan), **kwargs)
+        active = dirty('docs/requirements/Active.md')
+        observation = blocked_checkpoint.SafetyObservation(True, True, 'head', 'worker', 'worker',
+                                                         dirty_paths=(active,))
+        self.assertTrue(blocked_checkpoint.assess_safety(observation).safe)
+        archive = dirty('docs/requirements/archive/Outside.md')
+        link = dirty('link.py', symlink=True)
+        verdict = blocked_checkpoint.assess_safety(replace(observation, dirty_paths=(active, archive, link)))
+        self.assertFalse(verdict.safe)
+        self.assertEqual(verdict.reason_code, 'dirty_scope_violation')
+        self.assertIn(archive.path, verdict.detail)
+        self.assertIn('link.py (symlink)', verdict.detail)
+        self.assertNotIn(active.path, verdict.detail)
+
     def test_worker_result_validation_uses_saved_invocation_context(self):
         result = replace(self.before, refs={**self.before.refs, 'refs/heads/B': ('new', '')})
         self.connection.execute('UPDATE exec_plans SET agent_result_snapshot=?', (result.serialize(),))

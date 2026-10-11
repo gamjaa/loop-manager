@@ -118,7 +118,7 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
                 replace(observed, identity_verified=False),
                 replace(observed, remote=replace(observed.remote, oid='foreign')),
                 replace(observed, input_fingerprint='changed-input'),
-                replace(observed, committed=(FileChange('docs/requirements/Unexpected.md', '100644', '100644', 'old', 'new', 'M'),)),
+                replace(observed, committed=(FileChange('docs/requirements/archive/Unexpected.md', '100644', '100644', 'old', 'new', 'M'),)),
                 replace(observed, index_clean=False),
             ):
                 with self.subTest(observed=invalid):
