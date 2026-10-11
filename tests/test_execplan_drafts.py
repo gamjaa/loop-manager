@@ -565,6 +565,31 @@ class ExecPlanDraftPublicationTest(AutomationCatalogFixture, unittest.TestCase):
             with self.assertRaisesRegex(AgentScopeError, "User Decision"):
                 validate_agent_scope("worker", root, snapshot, snapshot, selected_plan_path=PATH, effects=effects)
 
+    def test_worker_cannot_remove_draft_or_entire_user_decision_section(self):
+        from loop_manager_internal.agents.scope_contracts import GitSnapshot, AgentChange, AgentScopeError
+        from loop_manager_internal.agents.scope_validation import ScopeValidationEffects, validate_agent_scope
+        snapshot = GitSnapshot("a" * 40, "worker", {}, {}, {}, {}, {}, {})
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_catalog_root(directory)
+            effects = ScopeValidationEffects(
+                _agent_git_resources=mock.Mock(), repository=mock.Mock(), _current_rebase_service=mock.Mock(),
+                _git_common_directory=mock.Mock(), _owned_rebase_state_dir=mock.Mock(),
+                _plan_id_from_path=lambda _: "G-001", _rebase_in_progress_for_branch=mock.Mock(),
+                _scope_snapshot_with_start_ignore_rules=lambda _root, _before, after: after,
+                agent_snapshot_changes=lambda *_: [AgentChange(PATH, ("worktree",))],
+                capture_git_snapshot=mock.Mock(), git=mock.Mock(),
+                operation_log=mock.Mock(), validate_managed_worktree=mock.Mock())
+            for original, changed, message in (
+                (draft_text(), draft_text().replace('draft: true\n', ''), 'draft'),
+                (accepted_text(draft_text(), 'a' * 64), draft_text().replace('draft: true\n', ''), 'User Decision'),
+            ):
+                with self.subTest(message=message):
+                    effects.git.return_value = SimpleNamespace(returncode=0, stdout=original)
+                    (root / PATH).write_text(changed, encoding='utf-8')
+                    with self.assertRaisesRegex(AgentScopeError, message):
+                        validate_agent_scope('worker', root, snapshot, snapshot,
+                                             selected_plan_path=PATH, effects=effects)
+
     def test_atomic_mixed_registration_resumes_without_duplicate_draft_or_approval(self):
         connection = self._connection()
         with tempfile.TemporaryDirectory() as directory:

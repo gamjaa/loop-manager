@@ -625,7 +625,7 @@ Test fallback.
         )
         self.assertFalse(
             loop_manager._worker_path_allowed(
-                "docs/requirements/[R-002] Other.md",
+                "docs/requirements/archive/[R-002] Other.md",
                 "docs/plans/[G-001] Plan.md",
                 (source,),
             )
@@ -638,7 +638,7 @@ Test fallback.
         self.assertNotIn("이동하라", prompt)
         self.assertIn("관련 계획이 Merge된 뒤", prompt)
         self.assertIn(
-            "수정하거나 이동하지 마라",
+            "Requirement 완료 판단이나 archive 이동 권한을 포함하지 않는다",
             loop_manager.worker_prompt("docs/plans/[G-001] Plan.md", None),
         )
 

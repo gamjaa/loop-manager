@@ -298,8 +298,44 @@ class CommonGuidancePrReportTests(TestCase):
                     self.assertIn(path, report)
                     self.assertIn(status, report)
                     self.assertIn(patch.rstrip(), report)
-                    self.assertIn('#diff-' + hashlib.sha256(path.encode()).hexdigest(), report)
+                    self.assertIn('#diff-' + hashlib.sha256(paths[-1].encode()).hexdigest(), report)
                     self.assertEqual(git.call_args.args[-len(paths):], tuple(paths))
+
+    def test_multiple_documents_and_rename_to_code_use_final_per_document_diffs(self):
+        from loop_manager_internal.documents.pr_description import common_guidance_report
+        changes = [('M', ['docs/PRODUCT.md']), ('D', ['docs/requirements/Old.md']),
+                   ('R100', ['docs/plans/Old.md', 'src/new.py']),
+                   ('A', ['README.md'])]
+        names = ''.join('\0'.join([status, *paths, '']) for status, paths in changes)
+        def git(_worktree, *args):
+            if '--name-status' in args:
+                return SimpleNamespace(stdout=names)
+            paths = args[args.index('--') + 1:]
+            return SimpleNamespace(stdout='diff for ' + ' '.join(paths) + '\n-old contract\n+new contract\n')
+        for base, head in (('a' * 40, 'b' * 40), ('c' * 40, 'd' * 40)):
+            report = common_guidance_report(git, Path('/candidate'), base, head,
+                                            'git@github.com:org/project.git', 'Align implementation contracts')
+            for status, paths in changes:
+                self.assertIn(status + ' ' + ' → '.join(paths), report)
+                for path in paths:
+                    self.assertIn('/compare/' + base + '...' + head + '#diff-' +
+                                  hashlib.sha256(paths[-1].encode()).hexdigest(), report)
+                self.assertIn('diff for ' + ' '.join(paths), report)
+            self.assertEqual(report.count('이유·구현 영향'), len(changes))
+            self.assertEqual(report.count('문서 영향:'), len(changes))
+            self.assertEqual(report.count('주요 변경 내용: -old contract'), len(changes))
+            self.assertNotIn('AGENTS 승인', report)
+
+    def test_document_specific_worker_explanation_is_selected_without_stale_paths(self):
+        from loop_manager_internal.documents.pr_description import common_guidance_report
+        git = mock.Mock(side_effect=(SimpleNamespace(stdout='M\0docs/PRODUCT.md\0'),
+                                     SimpleNamespace(stdout='-old behavior\n+new behavior\n')))
+        report = common_guidance_report(git, Path('/candidate'), 'base', 'head',
+                                        'git@github.com:org/project.git',
+                                        'docs/PRODUCT.md: preserve accepted behavior\ndocs/Old.md: stale description')
+        self.assertIn('preserve accepted behavior', report)
+        self.assertNotIn('stale description', report)
+        self.assertNotIn('docs/Old.md', report)
 
     def test_unrelated_change_has_no_guidance_report_and_summary_is_preserved(self):
         from loop_manager_internal.documents.pr_description import common_guidance_report

@@ -415,7 +415,7 @@ def validate_agent_scope(
                     from loop_manager_internal.storage.execplan_draft_state import evidence
                     plan_id = effects._plan_id_from_path(change.path)
                     known = connection is not None and evidence(connection, str(external_worktree or worktree), plan_id) is not None
-                    if known or re.search(r"^draft:", current_text, re.MULTILINE) or "## User Decision" in current_text:
+                    if known or path.is_file():
                         previous_text = revision_document_or_none(effects.git, worktree, before.head, change.path)
                         plan = execplan_catalog.parse_execplan_text(change.path, current_text, validate_sources=False)
                         execplan_drafts.validate_agent_change(plan, previous_text)
