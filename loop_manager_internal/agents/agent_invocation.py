@@ -138,6 +138,8 @@ class AgentRequest:
     expected_repository: str | None = None
     common_guidance: CommonGuidance | None = None
     on_process_started: Callable[[], None] | None = None
+    on_process_finished: Callable[[], None] | None = None
+    stream_output: bool = False
 
 
 @dataclass(frozen=True)
@@ -155,6 +157,8 @@ class InvocationContext:
     previous_session_id: str | None = None
     task_id: str | None = None
     notification_id: str | None = None
+    purpose: str | None = None
+    target: str | None = None
 
 
 class AttemptSequence:
@@ -162,13 +166,16 @@ class AttemptSequence:
 
     def __init__(self, repo: str, plan_id: str | None, revision: str | None = None,
                  initial_transition: str | None = None,
-                 initial_cause: str | None = None, task_id: str | None = None):
+                 initial_cause: str | None = None, task_id: str | None = None,
+                 purpose: str | None = None, target: str | None = None):
         self.repo = repo
         self.plan_id = plan_id
         self.revision = revision
         self.initial_transition = initial_transition
         self.initial_cause = initial_cause
         self.task_id = task_id
+        self.purpose = purpose
+        self.target = target
         self.notification_id = uuid4().hex
         self.count = 0
         self.previous_failure: str | None = None
@@ -189,6 +196,7 @@ class AttemptSequence:
         return InvocationContext(
             self.repo, self.plan_id, self.revision, transition, cause, self.count,
             task_id=self.task_id, notification_id=self.notification_id,
+            purpose=self.purpose, target=self.target,
         )
 
 

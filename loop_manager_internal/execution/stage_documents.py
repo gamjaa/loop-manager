@@ -354,7 +354,8 @@ plan_text(전체 ExecPlan 문자열 또는 수정 불필요면 null), evidence(�
                     identity.provider, workspace, identity.state_dir, identity.config_path,
                     "planner", prompt + ('\n이전 결과 검증 오류: ' + protocol_error if protocol_error else ''),
                     read_only=True, persist_session=False, invocation=invocation),
-                AttemptSequence(repo, plan_id, definition.revision_sha)), session_id=None)
+                AttemptSequence(repo, plan_id, definition.revision_sha,
+                                purpose="document_change_assessment", target=plan_id)), session_id=None)
             after = effects.capture_scope(workspace)
             item = {**item, 'planner_scope': {**item['planner_scope'], 'after': after.serialize()}}
             save(checkpoints, repo, plan_id, item)

@@ -18,6 +18,9 @@ CREATE TABLE IF NOT EXISTS agent_invocations (
     invocation_id TEXT PRIMARY KEY,
     repo TEXT NOT NULL,
     plan_id TEXT,
+    task_id TEXT,
+    purpose TEXT,
+    target TEXT,
     definition_revision TEXT,
     role TEXT NOT NULL,
     provider TEXT NOT NULL,
@@ -34,6 +37,10 @@ CREATE TABLE IF NOT EXISTS agent_invocations (
     scope_id TEXT,
     attempt INTEGER NOT NULL,
     started_at TEXT NOT NULL,
+    execution_status TEXT NOT NULL DEFAULT 'unknown',
+    execution_started_at TEXT,
+    execution_finished_at TEXT,
+    execution_duration_ms INTEGER,
     finished_at TEXT,
     duration_ms INTEGER,
     result_kind TEXT,
@@ -71,11 +78,15 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
     connection.execute(ISOLATION_SCHEMA)
     common_guidance_state.ensure_schema(connection)
     columns = {row[1] for row in connection.execute("PRAGMA table_info(agent_invocations)")}
-    for field in ("transition_id", "previous_provider", "previous_model",
-                  "previous_effort", "previous_session_id", "scope_id", "guidance_task_id",
-                  "guidance_content_hash"):
+    for field, definition in (("transition_id", "TEXT"), ("previous_provider", "TEXT"),
+                  ("previous_model", "TEXT"), ("purpose", "TEXT"), ("target", "TEXT"),
+                  ("task_id", "TEXT"), ("execution_status", "TEXT NOT NULL DEFAULT 'unknown'"),
+                  ("execution_started_at", "TEXT"), ("execution_finished_at", "TEXT"),
+                  ("execution_duration_ms", "INTEGER"), ("previous_effort", "TEXT"),
+                  ("previous_session_id", "TEXT"), ("scope_id", "TEXT"),
+                  ("guidance_task_id", "TEXT"), ("guidance_content_hash", "TEXT")):
         if field not in columns:
-            connection.execute(f"ALTER TABLE agent_invocations ADD COLUMN {field} TEXT")
+            connection.execute(f"ALTER TABLE agent_invocations ADD COLUMN {field} {definition}")
     connection.execute("""CREATE INDEX IF NOT EXISTS agent_invocations_analysis
         ON agent_invocations(repo, role, provider, model, effort, transition, started_at)""")
 
@@ -110,19 +121,37 @@ class InvocationRepository:
         identity = uuid4().hex
         with self.connection:
             self.connection.execute("""INSERT INTO agent_invocations
-                (invocation_id, repo, plan_id, definition_revision, role, provider,
+                (invocation_id, repo, plan_id, task_id, purpose, target, definition_revision, role, provider,
                  model, effort, session_id, transition, transition_cause,
                  transition_id, previous_provider, previous_model, previous_effort,
-                 previous_session_id, attempt, started_at, scope_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (identity, context.repo, context.plan_id, context.definition_revision,
+                 previous_session_id, attempt, started_at, scope_id, execution_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (identity, context.repo, context.plan_id, context.task_id, context.purpose,
+                 context.target, context.definition_revision,
                  role, provider, profile.model, profile.effort, session_id,
                  context.transition or ("resume" if session_id else "start"),
                  context.transition_cause, context.transition_id,
                  context.previous_provider, context.previous_model,
                  context.previous_effort, context.previous_session_id,
-                 context.attempt, utc_now(), scope_id))
+                 context.attempt, utc_now(), scope_id, "prepared"))
         return identity
+
+    def mark_execution_started(self, identity: str) -> None:
+        """Record only the provider callback reached after successful process creation."""
+        with self.connection:
+            self.connection.execute("""UPDATE agent_invocations SET
+                execution_status = 'executed',
+                execution_started_at = COALESCE(execution_started_at, ?)
+                WHERE invocation_id = ? AND finished_at IS NULL""",
+                (utc_now(), identity))
+
+    def mark_execution_finished(self, identity: str, duration_ms: int) -> None:
+        with self.connection:
+            self.connection.execute("""UPDATE agent_invocations SET
+                execution_finished_at = ?, execution_duration_ms = ?
+                WHERE invocation_id = ? AND finished_at IS NULL
+                  AND execution_status = 'executed'""",
+                (utc_now(), max(0, duration_ms), identity))
 
     def verified_scope(self, scope_id: str, *, repo: str, plan_id: str | None,
                        role: str, provider: str, session_id: str | None,
@@ -207,17 +236,19 @@ class InvocationRepository:
     def finish(self, identity: str, kind: str, code: int | None,
                duration_ms: int, session_id: str | None, usage: Usage,
                collection_status: str | None = None, *,
-               replace_session: bool = False) -> None:
+               replace_session: bool = False,
+               execution_status: str | None = None) -> None:
         with self.connection:
             session_update = "session_id = ?" if replace_session else "session_id = COALESCE(?, session_id)"
             cursor = self.connection.execute(f"""UPDATE agent_invocations SET
                 finished_at = ?, duration_ms = ?, result_kind = ?, result_code = ?,
                 {session_update}, collection_status = ?,
+                execution_status = COALESCE(?, execution_status),
                 input_tokens = ?, cached_input_tokens = ?, cache_write_input_tokens = ?,
                 output_tokens = ?, reasoning_output_tokens = ?
                 WHERE invocation_id = ? AND finished_at IS NULL""",
                 (utc_now(), duration_ms, kind, code, session_id,
-                 collection_status or usage.status,
+                 collection_status or usage.status, execution_status,
                  usage.input_tokens, usage.cached_input_tokens,
                  usage.cache_write_input_tokens, usage.output_tokens,
                  usage.reasoning_output_tokens, identity))
@@ -241,37 +272,50 @@ class InvocationRepository:
                     SET status = 'invalidated', reason = 'agent_attempt_interrupted'
                     WHERE status IN ('verified', 'prepared') AND invocation_id = ?""", (identity,))
                 count += self.connection.execute("""UPDATE agent_invocations SET
-                    finished_at = ?, result_kind = 'interrupted', collection_status = 'unknown'
+                    finished_at = ?, result_kind = 'interrupted', collection_status = 'unknown',
+                    execution_status = CASE WHEN execution_status = 'prepared'
+                                            THEN 'unknown' ELSE execution_status END
                     WHERE invocation_id = ? AND finished_at IS NULL""", (utc_now(),identity)).rowcount
         return count
 
     def summary(self, repo: str) -> list[sqlite3.Row]:
-        """Return comparable counters; unknown usage stays NULL."""
+        """Count only proven process starts; legacy and pending execution stays unknown."""
         return self.connection.execute("""WITH observations AS (
             SELECT *,
-                CASE WHEN input_tokens IS NOT NULL AND cached_input_tokens IS NOT NULL
+                CASE WHEN execution_status = 'executed' THEN input_tokens END AS executed_input_tokens,
+                CASE WHEN execution_status = 'executed' THEN cached_input_tokens END AS executed_cached_input_tokens,
+                CASE WHEN execution_status = 'executed' THEN cache_write_input_tokens END AS executed_cache_write_input_tokens,
+                CASE WHEN execution_status = 'executed' THEN output_tokens END AS executed_output_tokens,
+                CASE WHEN execution_status = 'executed' THEN reasoning_output_tokens END AS executed_reasoning_output_tokens,
+                CASE WHEN execution_status = 'executed' AND input_tokens IS NOT NULL
+                          AND cached_input_tokens IS NOT NULL
                      THEN input_tokens END AS paired_input_tokens,
-                CASE WHEN input_tokens IS NOT NULL AND cached_input_tokens IS NOT NULL
+                CASE WHEN execution_status = 'executed' AND input_tokens IS NOT NULL
+                          AND cached_input_tokens IS NOT NULL
                      THEN cached_input_tokens END AS paired_cached_input_tokens
             FROM agent_invocations WHERE repo = ?
         )
-        SELECT role, provider, model, effort, transition,
-            COUNT(*) AS calls,
-            SUM(CASE WHEN attempt > 1 THEN 1 ELSE 0 END) AS retries,
-            SUM(input_tokens) AS input_tokens, SUM(cached_input_tokens) AS cached_input_tokens,
-            SUM(cache_write_input_tokens) AS cache_write_input_tokens,
-            SUM(output_tokens) AS output_tokens, SUM(reasoning_output_tokens) AS reasoning_output_tokens,
-            SUM(CASE WHEN provider = 'claude' THEN input_tokens
-                     WHEN input_tokens IS NOT NULL AND cached_input_tokens IS NOT NULL
-                     THEN input_tokens - cached_input_tokens END) AS uncached_input_tokens,
+        SELECT role, purpose, plan_id, task_id, target, provider, model, effort, transition,
+            SUM(CASE WHEN execution_status = 'executed' THEN 1 ELSE 0 END) AS calls,
+            SUM(CASE WHEN execution_status = 'not_executed' THEN 1 ELSE 0 END) AS not_executed,
+            SUM(CASE WHEN execution_status IN ('prepared', 'unknown') THEN 1 ELSE 0 END) AS execution_unknown,
+            SUM(CASE WHEN execution_status = 'executed' AND attempt > 1 THEN 1 ELSE 0 END) AS retries,
+            SUM(executed_input_tokens) AS input_tokens,
+            SUM(executed_cached_input_tokens) AS cached_input_tokens,
+            SUM(executed_cache_write_input_tokens) AS cache_write_input_tokens,
+            SUM(executed_output_tokens) AS output_tokens,
+            SUM(executed_reasoning_output_tokens) AS reasoning_output_tokens,
+            SUM(CASE WHEN provider = 'claude' THEN executed_input_tokens
+                     WHEN executed_input_tokens IS NOT NULL AND executed_cached_input_tokens IS NOT NULL
+                     THEN executed_input_tokens - executed_cached_input_tokens END) AS uncached_input_tokens,
             CASE WHEN provider = 'claude' THEN
-                     1.0 * SUM(CASE WHEN cache_write_input_tokens IS NOT NULL
+                     1.0 * SUM(CASE WHEN executed_cache_write_input_tokens IS NOT NULL
                                     THEN paired_cached_input_tokens END) /
                      NULLIF(SUM(paired_input_tokens + paired_cached_input_tokens
-                                + cache_write_input_tokens), 0)
+                                + executed_cache_write_input_tokens), 0)
                  ELSE 1.0 * SUM(paired_cached_input_tokens) /
                       NULLIF(SUM(paired_input_tokens), 0)
             END AS cache_ratio,
-            SUM(duration_ms) AS duration_ms
+            SUM(execution_duration_ms) AS duration_ms
             FROM observations
-            GROUP BY role, provider, model, effort, transition""", (repo,)).fetchall()
+            GROUP BY role, purpose, plan_id, task_id, target, provider, model, effort, transition""", (repo,)).fetchall()

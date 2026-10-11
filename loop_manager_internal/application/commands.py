@@ -138,7 +138,10 @@ def _document_drafts_command(
                     str(project["provider"]), effects.ROOT, state_dir, config_path,
                     "planner", prompt, read_only=True,
                     connection=connection,
-                    invocation=InvocationContext(repo, None, task_id='document-draft:' + str(identity)),
+                    invocation=InvocationContext(
+                        repo, None, task_id='document-draft:' + str(identity),
+                        purpose='document_draft', target=str(args.target),
+                    ),
                 ),
                 None,
             )

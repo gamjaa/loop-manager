@@ -728,7 +728,8 @@ def _evaluate_remote_checkpoint_cause(effects: EvaluateRemoteCheckpointCauseEffe
             ),
             read_only=True,
             connection=connection,
-            invocation=InvocationContext(repo, str(blocked["plan_id"])),
+            invocation=InvocationContext(repo, str(blocked["plan_id"]),
+                                         purpose="review", target=str(blocked["plan_id"])),
         )
         effects.validate_agent_scope(
             "reviewer", worktree, review_before, effects.capture_git_snapshot(worktree),

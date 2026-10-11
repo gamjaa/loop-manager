@@ -44,18 +44,27 @@ class CodexLaunch:
         return launch_process(arguments, stdin=subprocess.PIPE, start_new_session=True, **kwargs)
 
     def run(self, arguments: list[str], *,
-            launch_process: Callable[..., subprocess.Popen], **kwargs):
+            launch_process: Callable[..., subprocess.Popen],
+            on_process_started: Callable[[], None] | None = None,
+            on_process_finished: Callable[[], None] | None = None,
+            **kwargs):
         prompt = kwargs.pop('input')
         timeout = kwargs.pop('timeout')
         # The caller owns the atomic runtime handoff check at process creation.
         process = self.start(arguments, launch_process=launch_process, **kwargs)
         try:
+            if on_process_started is not None:
+                on_process_started()
             process.communicate(prompt, timeout=timeout)
             return subprocess.CompletedProcess(arguments, process.returncode)
         finally:
             # Direct exec can still spawn tools. Reap the whole process group.
-            self.stop(process)
-            process.wait()
+            try:
+                self.stop(process)
+            finally:
+                process.wait()
+                if on_process_finished is not None:
+                    on_process_finished()
 
     def probe(self) -> None:
         feature_result = subprocess.run(

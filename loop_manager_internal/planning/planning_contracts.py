@@ -483,6 +483,7 @@ class PlanningAgentPort(Protocol):
         session_id: str | None,
         on_session_started: Callable[[str], None],
         *, profile_role: str | None = None, read_only: bool = False,
+        purpose: str | None = None, target: str | None = None,
     ) -> PlanningAgentResult: ...
 
     def finish_scope(

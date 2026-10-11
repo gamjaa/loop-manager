@@ -264,6 +264,83 @@ class RunnerTests(TestCase):
         self.assertEqual(result.code, 0)
         self.assertEqual(tuple(row), ("success", 0, "session", "error", 10, 4, 2))
 
+    def test_process_callbacks_store_explicit_purpose_target_and_execution_time(self):
+        class Provider:
+            def run(self, request):
+                request.on_process_started()
+                request.on_process_finished()
+                return manager.AgentResult(0, "done", "session",
+                                           usage=invocation.Usage(8, 3, None, 2))
+
+        with mock.patch.object(manager, "agent_provider", return_value=Provider()):
+            result = manager.run_agent(
+                "codex", Path("/worktree"), self.state_dir, Path("/config"),
+                "worker", "secret prompt", read_only=False,
+                connection=self.connection,
+                invocation=invocation.InvocationContext(
+                    "repo", "G-184", task_id="task-184",
+                    purpose="worker_implementation", target="G-184",
+                ),
+                resolved_profile=invocation.ResolvedProfile("model", "high"),
+            )
+
+        row = self.connection.execute("""SELECT task_id, purpose, target, execution_status,
+            execution_started_at, execution_finished_at, execution_duration_ms,
+            input_tokens, output_tokens FROM agent_invocations""").fetchone()
+        self.assertEqual(result.code, 0)
+        self.assertEqual(tuple(row[:4]),
+                         ("task-184", "worker_implementation", "G-184", "executed"))
+        self.assertTrue(row["execution_started_at"])
+        self.assertTrue(row["execution_finished_at"])
+        self.assertIsNotNone(row["execution_duration_ms"])
+        self.assertEqual((row["input_tokens"], row["output_tokens"]), (8, 2))
+
+    def test_process_wait_failure_leaves_execution_finish_unconfirmed(self):
+        class Provider:
+            def run(self, request):
+                request.on_process_started()
+                raise OSError("wait interrupted")
+
+        with mock.patch.object(manager, "agent_provider", return_value=Provider()):
+            with self.assertRaisesRegex(OSError, "wait interrupted"):
+                manager.run_agent(
+                    "codex", Path("/worktree"), self.state_dir, Path("/config"),
+                    "worker", "secret prompt", read_only=False,
+                    connection=self.connection,
+                    invocation=invocation.InvocationContext("repo", "G-184"),
+                    resolved_profile=invocation.ResolvedProfile("model", "high"),
+                )
+
+        row = self.connection.execute("""SELECT execution_status, execution_started_at,
+            execution_finished_at, execution_duration_ms FROM agent_invocations""").fetchone()
+        self.assertEqual(row["execution_status"], "executed")
+        self.assertTrue(row["execution_started_at"])
+        self.assertIsNone(row["execution_finished_at"])
+        self.assertIsNone(row["execution_duration_ms"])
+
+    def test_process_observation_storage_error_keeps_agent_result(self):
+        class Provider:
+            def run(self, request):
+                request.on_process_started()
+                request.on_process_finished()
+                return manager.AgentResult(0, "done")
+
+        with mock.patch.object(state.InvocationRepository, "mark_execution_started",
+                               side_effect=sqlite3.OperationalError("unavailable")), \
+             mock.patch.object(manager, "agent_provider", return_value=Provider()):
+            result = manager.run_agent(
+                "codex", Path("/worktree"), self.state_dir, Path("/config"),
+                "planner", "prompt", read_only=False, connection=self.connection,
+                invocation=invocation.InvocationContext("repo", None),
+                resolved_profile=manager.AgentProfile("model", "low"),
+            )
+
+        row = self.connection.execute(
+            "SELECT execution_status, collection_status FROM agent_invocations"
+        ).fetchone()
+        self.assertEqual((result.code, result.collection_status), (0, "error"))
+        self.assertEqual(tuple(row), ("executed", "error"))
+
     def test_profile_observation_failure_does_not_replace_provider_result(self):
         class Provider:
             def run(self, request):
@@ -921,12 +998,18 @@ class ProcessStartNotificationTests(TestCase):
                     resolved_profile=invocation.ResolvedProfile('model','high'))
         self.assertTrue(calls)
         start.assert_not_called()
+        row = self.connection.execute(
+            "SELECT execution_status, result_kind FROM agent_invocations"
+        ).fetchone()
+        self.assertEqual(tuple(row), ("not_executed", "transient_failure"))
 
-    def test_unconfigured_notifications_preserve_provider_invocation_shape(self):
+    def test_unconfigured_notifications_track_process_without_forcing_streaming(self):
         outer = self
         class Provider:
             def run(self, request):
-                outer.assertIsNone(request.on_process_started)
+                outer.assertIsNotNone(request.on_process_started)
+                outer.assertIsNotNone(request.on_process_finished)
+                outer.assertFalse(request.stream_output)
                 return manager.AgentResult(0, 'done')
         with mock.patch.object(manager, 'agent_provider', return_value=Provider()):
             result = manager.run_agent(

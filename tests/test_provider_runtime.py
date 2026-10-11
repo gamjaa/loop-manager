@@ -384,6 +384,154 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
                 "excludedCommands": [],
             })
 
+    def test_claude_process_callbacks_preserve_json_mode_and_usage_from_child_stdout(self):
+        config = profile_config(self)
+        output = json.dumps({
+            "type": "result", "session_id": "one-shot-session", "result": "done",
+            "usage": {"input_tokens": 7, "output_tokens": 2}, "is_error": False,
+        })
+        calls = []
+        lifecycle = []
+
+        class StartedProcess:
+            def __init__(self, arguments, **kwargs):
+                calls.append((arguments, kwargs))
+                self.stdin = mock.Mock()
+                self.returncode = 0
+                self.stdout = kwargs["stdout"]
+
+            def communicate(self, prompt, timeout=None):
+                self.stdin.write(prompt)
+                self.asserted_timeout = timeout
+                return output, None
+
+            def kill(self):
+                raise AssertionError("completed process must not be killed")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            with mock.patch("loop_manager.subprocess.Popen", side_effect=StartedProcess):
+                result = loop_manager.run_claude(
+                    worktree, root / "state", config, "planner", "prompt",
+                    read_only=True, session_id="one-shot-session",
+                    resolved_profile=loop_manager.ResolvedProfile("model", "low"),
+                    on_process_started=lambda: lifecycle.append("started"),
+                    on_process_finished=lambda: lifecycle.append("finished"),
+                )
+
+        arguments, options = calls[0]
+        self.assertIsInstance(result, loop_manager.AgentResult)
+        self.assertEqual((result.code, result.message, result.session_id),
+                         (0, "done", "one-shot-session"))
+        self.assertEqual((result.usage.input_tokens, result.usage.output_tokens), (7, 2))
+        self.assertEqual(lifecycle, ["started", "finished"])
+        self.assertEqual(arguments[arguments.index("--output-format") + 1], "json")
+        self.assertNotIn("--verbose", arguments)
+        self.assertEqual(options["stdout"], subprocess.PIPE)
+
+    def test_claude_auxiliary_write_failures_preserve_result_and_mark_collection_error(self):
+        config = profile_config(self)
+        output = json.dumps({
+            "type": "result", "session_id": "existing-session", "result": "done",
+            "usage": {"input_tokens": 7, "output_tokens": 2}, "is_error": False,
+        })
+
+        class StartedProcess:
+            def __init__(self, _arguments, **kwargs):
+                self.stdin = mock.Mock()
+                self.returncode = 0
+                self.stdout = kwargs["stdout"]
+
+            def communicate(self, prompt, timeout=None):
+                self.stdin.write(prompt)
+                return output, None
+
+            def kill(self):
+                raise AssertionError("completed process must not be killed")
+
+        original_write_text = Path.write_text
+
+        for failed_filename in ("claude-planner.log", "claude-planner-last.txt"):
+            with self.subTest(failed_filename=failed_filename):
+                def fail_auxiliary_write(path, data, *args, **kwargs):
+                    if path.name == failed_filename:
+                        raise OSError("auxiliary write interrupted")
+                    return original_write_text(path, data, *args, **kwargs)
+
+                with tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    worktree = root / "worktree"
+                    worktree.mkdir()
+                    with mock.patch("loop_manager.subprocess.Popen", side_effect=StartedProcess), \
+                         mock.patch.object(Path, "write_text", fail_auxiliary_write), \
+                         mock.patch.object(Path, "read_text", side_effect=OSError("log read interrupted")) as read_log:
+                        result = loop_manager.run_claude(
+                            worktree, root / "state", config, "planner", "prompt",
+                            read_only=True, session_id="existing-session",
+                            resolved_profile=loop_manager.ResolvedProfile("model", "low"),
+                            on_process_started=lambda: None,
+                        )
+
+                read_log.assert_not_called()
+                self.assertEqual((result.code, result.message, result.session_id),
+                                 (0, "done", "existing-session"))
+                self.assertEqual((result.usage.input_tokens, result.usage.output_tokens), (7, 2))
+                self.assertEqual(result.collection_status, "error")
+
+    def test_claude_timeout_persists_recovered_output_before_reraising(self):
+        import hashlib
+
+        config = profile_config(self)
+        lifecycle = []
+
+        class TimedOutProcess:
+            def __init__(self, _arguments, **_kwargs):
+                self.stdin = mock.Mock()
+                self.returncode = -9
+                self.communicate_calls = 0
+
+            def communicate(self, prompt=None, timeout=None):
+                if prompt is not None:
+                    self.stdin.write(prompt)
+                self.communicate_calls += 1
+                if self.communicate_calls == 1:
+                    raise subprocess.TimeoutExpired(
+                        ["claude"], timeout, output="partial diagnostic"
+                    )
+                return "partial diagnostic recovered after kill", None
+
+            def kill(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktree = root / "worktree"
+            worktree.mkdir()
+            project_dir = root / "state" / "logs" / hashlib.sha256(
+                str(worktree).encode()
+            ).hexdigest()[:16]
+            project_dir.mkdir(parents=True)
+            log = project_dir / "claude-planner.log"
+            log.write_text("stale prior output", encoding="utf-8")
+
+            with mock.patch("loop_manager.subprocess.Popen", side_effect=TimedOutProcess):
+                with self.assertRaises(subprocess.TimeoutExpired):
+                    loop_manager.run_claude(
+                        worktree, root / "state", config, "planner", "prompt",
+                        read_only=True, session_id="saved-session",
+                        resolved_profile=loop_manager.ResolvedProfile("model", "low"),
+                        on_process_started=lambda: lifecycle.append("started"),
+                        on_process_finished=lambda: lifecycle.append("finished"),
+                    )
+
+            saved_log = log.read_text(encoding="utf-8")
+
+        self.assertIn("partial diagnostic recovered after kill", saved_log)
+        self.assertNotIn("stale prior output", saved_log)
+        self.assertEqual(lifecycle, ["started", "finished"])
+
     def test_claude_planner_processes_preserve_parent_bytecode_policy(self):
         config = profile_config(self)
         session_id = "claude-planner-session"
@@ -887,18 +1035,21 @@ class ProcessStartBoundaryTests(unittest.TestCase):
                 process = mock.Mock()
                 process.stdout = io.StringIO('')
                 process.wait.return_value = 0
+                process.communicate.return_value = ('', None)
                 process.stdin.write.side_effect = lambda _prompt: self.assertEqual(observed, ['started'])
                 run = loop_manager.run_codex if provider == 'codex' else loop_manager.run_claude
                 profile = loop_manager.ResolvedProfile('model', 'high')
                 with mock.patch('loop_manager.subprocess.Popen', return_value=process):
                     run(root, root / 'state', config, 'worker', 'prompt', read_only=False,
                         level=5, persist_session=True, session_id='existing-session', resolved_profile=profile,
-                        on_process_started=lambda: observed.append('started'))
-                self.assertEqual(observed, ['started'])
+                        on_process_started=lambda: observed.append('started'),
+                        on_process_finished=lambda: observed.append('finished'))
+                self.assertEqual(observed, ['started', 'finished'])
                 observed.clear()
                 with mock.patch('loop_manager.subprocess.Popen', side_effect=OSError('launch failed')):
                     with self.assertRaises(OSError):
                         run(root, root / 'state', config, 'worker', 'prompt', read_only=False,
                             level=5, persist_session=True, session_id='existing-session', resolved_profile=profile,
-                            on_process_started=lambda: observed.append('started'))
+                            on_process_started=lambda: observed.append('started'),
+                            on_process_finished=lambda: observed.append('finished'))
                 self.assertEqual(observed, [])

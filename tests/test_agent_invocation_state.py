@@ -34,7 +34,8 @@ class InvocationRepositoryTests(TestCase):
             'repo', 'G-041', transition='replacement', transition_cause='model_changed',
             transition_id='transition-one', previous_provider='codex',
             previous_model='old', previous_effort='low',
-            previous_session_id='old-session',
+            previous_session_id='old-session', task_id='task-1',
+            purpose='worker_implementation', target='G-041',
         )
         identity = self.repository.start(context, 'worker', 'codex',
                                          ResolvedProfile('new', 'high'), None)
@@ -47,6 +48,8 @@ class InvocationRepositoryTests(TestCase):
                           row['previous_session_id'], row['model'], row['session_id']),
                          ('replacement', 'model_changed', 'transition-one', 'old',
                           'old-session', 'new', 'new-session'))
+        self.assertEqual((row['task_id'], row['purpose'], row['target'], row['execution_status']),
+                         ('task-1', 'worker_implementation', 'G-041', 'prepared'))
 
     def setUp(self):
         self.connection = sqlite3.connect(":memory:")
@@ -75,6 +78,8 @@ class InvocationRepositoryTests(TestCase):
             InvocationContext("repo", "G-134"), "worker", "codex",
             ResolvedProfile("model", "high"), "session",
         )
+        self.repository.mark_execution_started(identity)
+        self.repository.mark_execution_finished(identity, 5)
         evidence = IsolationEvidence(
             "codex", "version", "Linux:test", "worker", "/worktree", "repo",
             "a" * 64, "verified", snapshot_digest="b" * 64,
@@ -96,9 +101,13 @@ class InvocationRepositoryTests(TestCase):
         context = InvocationContext("repo", "G-039", attempt=2, transition="resume")
         codex = self.repository.start(context, "worker", "codex",
                                       ResolvedProfile("model", "high"), "session")
+        self.repository.mark_execution_started(codex)
+        self.repository.mark_execution_finished(codex, 500)
         self.repository.finish(codex, "success", 0, 500, "session", Usage(100, 60, None, 10))
         claude = self.repository.start(context, "reviewer", "claude",
                                        ResolvedProfile("other", "medium"), "session-2")
+        self.repository.mark_execution_started(claude)
+        self.repository.mark_execution_finished(claude, 300)
         self.repository.finish(claude, "success", 0, 300, None, Usage(20, 40, 5, 4))
         rows = {row["provider"]: row for row in self.repository.summary("repo")}
         self.assertEqual((rows["codex"]["uncached_input_tokens"], rows["codex"]["cache_ratio"]),
@@ -114,6 +123,8 @@ class InvocationRepositoryTests(TestCase):
         profile = ResolvedProfile("model", "high")
         for usage in (Usage(100, 40), Usage(None, 1000), Usage(200, None)):
             identity = self.repository.start(context, "worker", "codex", profile, None)
+            self.repository.mark_execution_started(identity)
+            self.repository.mark_execution_finished(identity, 10)
             self.repository.finish(identity, "success", 0, 10, None, usage)
 
         row = self.repository.summary("repo")[0]
@@ -123,9 +134,56 @@ class InvocationRepositoryTests(TestCase):
 
         unknown = self.repository.start(
             context, "reviewer", "codex", profile, None)
+        self.repository.mark_execution_started(unknown)
+        self.repository.mark_execution_finished(unknown, 10)
         self.repository.finish(unknown, "success", 0, 10, None, Usage(None, 5))
         rows = {item["role"]: item for item in self.repository.summary("repo")}
         self.assertIsNone(rows["reviewer"]["cache_ratio"])
+
+    def test_summary_separates_process_starts_from_prelaunch_and_unknown_rows(self):
+        context = InvocationContext('repo', 'G-184', purpose='worker_implementation', target='G-184')
+        profile = ResolvedProfile('model', 'high')
+        executed = self.repository.start(context, 'worker', 'codex', profile, None)
+        self.repository.mark_execution_started(executed)
+        self.repository.mark_execution_finished(executed, 7)
+        self.repository.finish(executed, 'success', 0, 40, None, Usage(10, 4, None, 2))
+
+        rejected = self.repository.start(context, 'worker', 'codex', profile, None)
+        self.repository.finish(rejected, 'permanent_configuration', 1, 3, None,
+                               Usage(900, 800), execution_status='not_executed')
+        interrupted = self.repository.start(context, 'worker', 'codex', profile, None)
+        self.assertEqual(self.repository.reconcile_interrupted(), 1)
+
+        row = self.repository.summary('repo')[0]
+        self.assertEqual((row['calls'], row['not_executed'], row['execution_unknown']), (1, 1, 1))
+        self.assertEqual((row['input_tokens'], row['cached_input_tokens'], row['duration_ms']),
+                         (10, 4, 7))
+        self.assertEqual((row['purpose'], row['plan_id'], row['target']),
+                         ('worker_implementation', 'G-184', 'G-184'))
+
+    def test_additive_migration_keeps_legacy_purpose_and_execution_unknown(self):
+        connection = sqlite3.connect(':memory:')
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        connection.execute("""CREATE TABLE agent_invocations (
+            invocation_id TEXT PRIMARY KEY, repo TEXT NOT NULL, plan_id TEXT,
+            definition_revision TEXT, role TEXT NOT NULL, provider TEXT NOT NULL,
+            model TEXT NOT NULL, effort TEXT NOT NULL, session_id TEXT,
+            transition TEXT NOT NULL, transition_cause TEXT, transition_id TEXT,
+            previous_provider TEXT, previous_model TEXT, previous_effort TEXT,
+            previous_session_id TEXT, scope_id TEXT, attempt INTEGER NOT NULL,
+            started_at TEXT NOT NULL, finished_at TEXT, duration_ms INTEGER,
+            result_kind TEXT, result_code INTEGER, collection_status TEXT NOT NULL DEFAULT 'pending',
+            input_tokens INTEGER, cached_input_tokens INTEGER, cache_write_input_tokens INTEGER,
+            output_tokens INTEGER, reasoning_output_tokens INTEGER
+        )""")
+        connection.execute("""INSERT INTO agent_invocations
+            (invocation_id, repo, role, provider, model, effort, transition, attempt, started_at)
+            VALUES ('legacy', 'repo', 'worker', 'codex', 'model', 'high', 'start', 1, 'start')""")
+        ensure_schema(connection)
+        row = connection.execute('SELECT * FROM agent_invocations').fetchone()
+        self.assertEqual((row['purpose'], row['target'], row['task_id'], row['execution_status']),
+                         (None, None, None, 'unknown'))
 
 
 class CommonGuidanceStateTests(TestCase):

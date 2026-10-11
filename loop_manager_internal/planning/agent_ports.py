@@ -51,7 +51,8 @@ def run_scoped_planner_turn(
     prompt: str,
     session_id: str | None,
     save_session: Callable[[str], None],
-    *, read_only: bool = False,
+    *, purpose: str | None = None, target: str | None = None,
+    read_only: bool = False,
 ) -> tuple[PlanningAgentResult, PlanningScopeResult]:
     """Run one turn, preserving session writes and failed scope evidence.
 
@@ -65,6 +66,10 @@ def run_scoped_planner_turn(
         read_only = True
     if read_only:
         profile["read_only"] = True
+    if purpose is not None:
+        profile["purpose"] = purpose
+    if target is not None:
+        profile["target"] = target
     result = agent.run_planner(worktree, prompt, session_id, save_session, **profile)
     if result.session_id:
         save_session(result.session_id)
@@ -119,6 +124,7 @@ class _PlanningAgentPorts:
         session_id: str | None,
         on_session_started: Callable[[str], None],
         *, profile_role: str | None = None, read_only: bool = False,
+        purpose: str | None = None, target: str | None = None,
     ) -> PlanningAgentResult:
         from loop_manager_internal.planning.manual_planning_context import protect
         prompt=protect(self._connection,self._context.repo,prompt)
@@ -164,7 +170,7 @@ class _PlanningAgentPorts:
                     connection=self._connection,
                     invocation=invocation,
                     **profile_arguments,
-                ), AttemptSequence(context.repo, None)),
+                ), AttemptSequence(context.repo, None, purpose=purpose, target=target)),
                 session_id=session_id,
             )
         kind = {

@@ -86,6 +86,7 @@ class PlanningConflictCorrection:
             )
         result, scope = run_scoped_planner_turn(
             self._agent, repo, role, worktree, prompt, session_id, save_session,
+            purpose="conflict_resolution", target=target,
         )
         if scope.error:
             self._events.error(scope.error)

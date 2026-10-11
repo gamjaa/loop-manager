@@ -302,7 +302,8 @@ class ReviewHandler:
                     on_session_started=lambda started_session_id: self.ports.state.update_project(self.ports.identity.repo, reviewer_session_id=started_session_id),
                     invocation=invocation,
                 ), AttemptSequence(self.ports.identity.repo, str(self.ports.snapshot().plan['id']),
-                                   str(self.ports.snapshot().catalog_plan['current_revision_sha']) if self.ports.snapshot().catalog_plan['current_revision_sha'] is not None else None)),
+                                   str(self.ports.snapshot().catalog_plan['current_revision_sha']) if self.ports.snapshot().catalog_plan['current_revision_sha'] is not None else None,
+                                   purpose="review")),
                 session_id=row['reviewer_session_id'],
             )
             code, review = review_result

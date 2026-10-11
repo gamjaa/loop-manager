@@ -44,7 +44,7 @@ priority: normal
 ## Progress
 
 - [x] 2026-10-05 planning 기준 a049a76의 명세·원본·관련 테스트와 비종료 catalog에서 미충족 범위를 확인함. 구현·테스트 실행은 하지 않음.
-- [ ] 구현 및 관련 targeted unit 검증
+- [x] 2026-10-11 실제 호출 위치의 목적·대상 전달, process 시작/종료 관측과 기존 invocation ledger의 additive 저장·집계를 구현하고 관련 targeted unit 검증을 실행함.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log

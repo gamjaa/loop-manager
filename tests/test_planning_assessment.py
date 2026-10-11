@@ -655,6 +655,40 @@ class PlanningAssessmentTest(PlanningCase):
         self.assertEqual(ports.state.snapshot.planning_retry_count, 2)
         self.assertIn("발견 항목", ports.state.snapshot.planning_validation_error)
 
+
+class PlanningBoundaryTests(PlanningCase):
+    def test_maintenance_batch_target_binds_active_revision_and_unit_identity(self):
+        from loop_manager_internal.planning.assessment_batches import MaintenanceAssessmentBatches
+
+        ports = FakePorts(
+            planning_snapshot(phase="PLANNING", active_sha="tree-revision", planner_session_id="owner"),
+            maintenance_cycle(phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                              cycle_base_sha="tree-revision", revision=4),
+        )
+        run = PlanningLifecycleCoordinator(ports)._new_run(self.context)
+        source = TrackedSource("src/calc.py", "b" * 64, "100644", "blob-revision", "source code")
+        unit = SimpleNamespace(source=source, session_id="owner", error=None)
+        file_review = mock.Mock()
+        file_review.progress.return_value = maintenance_file_review.FileReviewProgress((source,), (), unit)
+        file_review.pending_units.return_value = (unit,)
+        file_review.content.return_value = b"content"
+        ports.file_review = file_review
+        ports.events = mock.Mock()
+        result = SimpleNamespace(code=0, message="")
+        scope = SimpleNamespace(error="scope denied")
+        with mock.patch(
+            "loop_manager_internal.planning.assessment_batches.files.review_prompt",
+            return_value="prompt",
+        ), mock.patch(
+            "loop_manager_internal.planning.assessment_batches.run_scoped_planner_turn",
+            return_value=(result, scope),
+        ) as invoke:
+            outcome = MaintenanceAssessmentBatches(ports).review_files(run, Path("/tree"))
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+        self.assertEqual(invoke.call_args.kwargs["target"],
+                         'maintenance-batch:files@tree-revision:[["src/calc.py","blob-revision"]]')
+
     def test_planner_agent_port_passes_planless_invocation_and_ignores_telemetry_error(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)
@@ -664,12 +698,14 @@ class PlanningAssessmentTest(PlanningCase):
         )
 
         with mock.patch.object(loop_manager, "run_agent", return_value=reported) as run_agent:
-            result = port.run_planner(Path("/planning"), "prompt", None, lambda _: None)
+            result = port.run_planner(Path("/planning"), "prompt", None, lambda _: None,
+                                      purpose="general_planning", target="G-184")
 
         self.assertEqual(result.kind, PlanningAgentResultKind.SUCCESS)
         request = run_agent.call_args.kwargs["invocation"]
         self.assertEqual((request.repo, request.plan_id, request.transition,
                           request.attempt), ("/repo", None, "start", 1))
+        self.assertEqual((request.purpose, request.target), ("general_planning", "G-184"))
         self.assertIs(run_agent.call_args.kwargs["connection"], connection)
 
 
@@ -752,10 +788,13 @@ class ScopedPlannerTurnTests(PlanningCase):
         run.planning_worktree = Path("/tree")
         run.maintenance_context = object()
         source = TrackedSource("src/calc.py", "b" * 64, "100644", "base", "source code")
-        unit = SimpleNamespace(source=source, session_id="owner", error=None, receipt=None, index=0)
+        unit = SimpleNamespace(source=source, session_id="owner", error=None, receipt=None,
+                               manifest_id="findings-manifest", digest="unit-digest",
+                               decision_digest="decision-digest", index=0)
         other = TrackedSource("src/other.py", "c" * 64, "100644", "base", "source code")
         relation = SimpleNamespace(left=source, right=other, key="relation-key")
-        page = SimpleNamespace(index=0, total=1, session_id="owner", key="key", text="evidence")
+        page = SimpleNamespace(digest="page-digest", index=0, total=1, session_id="owner",
+                               key="key", text="evidence")
         port = mock.Mock()
         ports.reconciliation = port
         port.progress.return_value = SimpleNamespace(pending_scan=False, next_relation=relation,

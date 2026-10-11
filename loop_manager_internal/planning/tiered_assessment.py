@@ -67,7 +67,8 @@ def prepare_turn(ports, run, worktree):
         started = time.monotonic()
         with planner_progress(ports.events, f"유지보수 정밀 {count + 1}/{len(units)}묶음 ({context.repo})"):
             result, scope = run_scoped_planner_turn(ports.agent, context.repo, "maintenance_planner", worktree,
-                prompt, pending["session_id"], lambda session: port.repository.session(context.repo, pending, session), read_only=True)
+                prompt, pending["session_id"], lambda session: port.repository.session(context.repo, pending, session),
+                purpose="maintenance_review", target=str(pending["digest"]), read_only=True)
         ports.events.log(f"유지보수 정밀 모델 호출 종료: {time.monotonic() - started:.0f}초")
         if scope.error:
             ports.events.error(scope.error)
