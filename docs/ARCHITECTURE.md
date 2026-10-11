@@ -303,6 +303,16 @@ Worker에 추가하는 [AGENTS.ponytail.md](AGENTS.ponytail.md)는 [Ponytail](ht
 
 축약 원문은 전체 Skill·Hook과 동일한 효과를 보증하지 않는다. Codex 0.161.0의 [command Hook](https://github.com/openai/codex/blob/rust-v0.161.0/codex-rs/hooks/src/engine/command_runner.rs)은 별도 셸 프로세스로 실행되고 외부 MCP에도 내장 파일 sandbox 적용을 보장할 수 없으므로 기존 Plugin·App 비활성화와 쓰기 경계를 유지한다. 사용자 Plugin 설정·설치 상태는 변경하지 않으며 명시된 요구사항·안전·검증·역할·승인·게시 규칙을 보존한다.
 
+### R-085: 인증 전용 provider 저장소 (구현 예정)
+
+[R-085](requirements/%5BR-085%5D%20Codex%20Claude%20인증%20전용%20자동%20실행%20환경.md)는 개인 Plugin·Hook을 상속하지 않고 기존 인증만 재사용하는 설계다. 현재 Codex의 개인 config 연결과 Windows 사용자 home 재사용 및 Claude 사용자 설정 상속을 변경하는 대상이며 구현 완료를 뜻하지 않는다.
+
+Manager 상태 경로 아래의 기존 provider runtime 경계를 사용하고 repository·worktree·role과 session의 연결을 보존한다. Codex 자식에는 관리 `CODEX_HOME`을, Claude 자식에는 관리 `CLAUDE_CONFIG_DIR`을 지정하며 부모 환경은 변경하지 않는다. 기존 provider home 값은 인증 원본 선택에만 사용하고 없으면 CLI 기본 사용자 저장소 또는 OS 인증 저장소를 선택한다. 환경 준비는 인증 사전 검사와 설정 지문·권한 확인보다 먼저 수행하고 실제 호출·재개·fallback까지 같은 환경을 전달한다. 설정 검사도 실제 선택한 저장소를 기준으로 하며 인증 원본 home의 개인 설정을 다시 조회하지 않는다.
+
+Codex의 파일 기반 인증은 기존 `auth.json`의 인증 전용 연결을 재사용하고 `config.toml` 연결은 제거한다. Claude는 공식 CLI의 파일·OS 인증 저장소 또는 기존 인증 환경값을 사용하는 경로를 확인하며 인증이 아닌 사용자 설정을 가져오지 않는다. 두 provider의 사용자 설정 파일은 Manager가 생성하지 않는다. Claude는 설정 디렉터리 밖에서 읽는 사용자 설정도 실제 호출의 설정 source에서 제외해야 하며, 별도 디렉터리 지정만으로 분리를 증명하지 않는다. 프로젝트·관리 설정의 적용과 기존 충돌 판정은 유지한다.
+
+Model·Effort·Fast 선택·instruction·sandbox·승인 정책은 기존 provider adapter의 명시적 인자로 전달한다. 기본 설정 상속은 분리된 CLI 환경 안에서 해석하며 인증 원본의 profile·규칙·Plugin·Hook·지침을 복원하지 않는다. 기존 runtime의 config 링크는 Manager 소유와 연결 대상을 확인한 뒤 링크만 분리하고 원본은 보존한다. 그 밖의 소유권 미확인 파일이나 인증·설정 분리 실패는 해당 호출의 오류로 남긴다. native Windows도 같은 경계를 적용할 수 있는 공식 인증 경로를 사용하며, 이전 사용자 home 전체 재사용을 대체 실행으로 허용하지 않는다.
+
 ### R-023: workspace 쓰기 제한과 자동 승인 검토 (구현 예정)
 
 2026-09-26 사용자 결정으로 provider의 내장 workspace 쓰기 제한을 우선 사용하고, Codex·Claude의 자동 승인 검토를 함께 유지하는 설계를 채택한다. 이 절은 R-023의 구현 대상 설계이며 현재 Merge된 동작의 구현 완료를 뜻하지 않는다. Agent 호출 밖에서 Manager가 Git 쓰기를 소유하는 기존 경계는 유지한다.
