@@ -295,6 +295,29 @@ class RunnerTests(TestCase):
         self.assertIsNotNone(row["execution_duration_ms"])
         self.assertEqual((row["input_tokens"], row["output_tokens"]), (8, 2))
 
+    def test_process_wait_failure_leaves_execution_finish_unconfirmed(self):
+        class Provider:
+            def run(self, request):
+                request.on_process_started()
+                raise OSError("wait interrupted")
+
+        with mock.patch.object(manager, "agent_provider", return_value=Provider()):
+            with self.assertRaisesRegex(OSError, "wait interrupted"):
+                manager.run_agent(
+                    "codex", Path("/worktree"), self.state_dir, Path("/config"),
+                    "worker", "secret prompt", read_only=False,
+                    connection=self.connection,
+                    invocation=invocation.InvocationContext("repo", "G-184"),
+                    resolved_profile=invocation.ResolvedProfile("model", "high"),
+                )
+
+        row = self.connection.execute("""SELECT execution_status, execution_started_at,
+            execution_finished_at, execution_duration_ms FROM agent_invocations""").fetchone()
+        self.assertEqual(row["execution_status"], "executed")
+        self.assertTrue(row["execution_started_at"])
+        self.assertIsNone(row["execution_finished_at"])
+        self.assertIsNone(row["execution_duration_ms"])
+
     def test_process_observation_storage_error_keeps_agent_result(self):
         class Provider:
             def run(self, request):

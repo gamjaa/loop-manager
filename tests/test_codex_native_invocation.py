@@ -558,6 +558,22 @@ class NativeWriteIsolationTests(TestCase):
         process.wait.assert_called_once()
         self.assertEqual(lifecycle, ['started', 'finished'])
 
+    def test_envelope_wait_failure_keeps_process_finish_unobserved(self):
+        launch = envelope.CodexLaunch((), ('native',), {}, Path('/runtime'), Path('/attempt'), '{}')
+        process = mock.Mock(pid=4321)
+        process.communicate.side_effect = manager.subprocess.TimeoutExpired(['native'], 1)
+        process.wait.side_effect = OSError('wait interrupted')
+        lifecycle = []
+        with mock.patch.object(envelope.subprocess, 'Popen', return_value=process), \
+             mock.patch.object(envelope.os, 'killpg'):
+            with self.assertRaisesRegex(OSError, 'wait interrupted'):
+                launch.run(['native'], launch_process=manager._handoff_popen,
+                           input='prompt', timeout=1, text=True,
+                           on_process_started=lambda: lifecycle.append('started'),
+                           on_process_finished=lambda: lifecycle.append('finished'))
+        self.assertEqual(lifecycle, ['started'])
+        process.wait.assert_called_once()
+
     def test_streamed_new_session_uses_direct_exec_and_persists_session(self):
         with tempfile.TemporaryDirectory() as directory:
             boundary, state_root, home = self.boundary(Path(directory))

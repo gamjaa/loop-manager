@@ -71,6 +71,11 @@ def batch_prompt(prompts: list[str], prefix: str) -> str:
     )
 
 
+def _batch_target(kind, revision, unit_ids):
+    units = json.dumps(list(unit_ids), ensure_ascii=False, separators=(",", ":"))
+    return f"maintenance-batch:{kind}@{revision}:{units}"
+
+
 def _process_receipts(output, prefix, receipt_identity, units, unit_identity,
                      missing_message, validate_and_save, fail, handled_errors):
     """Apply a batch envelope while preserving independently resumable units."""
@@ -100,12 +105,13 @@ class MaintenanceAssessmentBatches:
     def __init__(self, ports):
         self.ports = ports
 
-    def _invoke(self, run, worktree, prompts, prefix, session, save_session, purpose):
+    def _invoke(self, run, worktree, prompts, prefix, session, save_session, purpose,
+                batch_kind, unit_ids):
         started = time.monotonic()
         result, scope = run_scoped_planner_turn(
             self.ports.agent, run.context.repo, "maintenance_planner", worktree,
             batch_prompt(prompts, prefix), session, save_session, purpose=purpose,
-            target="maintenance-batch:" + prefix.rstrip(),
+            target=_batch_target(batch_kind, str(run.row.active_sha), unit_ids),
         )
         self.ports.events.log(f"유지보수 일괄 호출 종료: {len(prompts)}개, "
                               f"{time.monotonic() - started:.0f}초")
@@ -174,7 +180,8 @@ class MaintenanceAssessmentBatches:
                 port.session(context.repo, run.maintenance_cycle.revision, unit.source, session)
 
         result = self._invoke(run, worktree, prompts, files.RESULT_PREFIX,
-                              units[0].session_id, save_session, "maintenance_review")
+                              units[0].session_id, save_session, "maintenance_review", "files",
+                              [(unit.source.path, unit.source.revision) for unit in units])
         if isinstance(result, PlanningOutcome):
             return result
 
@@ -236,7 +243,9 @@ class MaintenanceAssessmentBatches:
                 port.session(context.repo, run.maintenance_cycle.revision, relation, session)
 
         result = self._invoke(run, worktree, prompts, relations.RELATION_PREFIX, units[0][1],
-                              save_session, "maintenance_review")
+                              save_session, "maintenance_review", "relations",
+                              [(relation.key, relation.left.revision, relation.right.revision)
+                               for relation, _ in units])
         if isinstance(result, PlanningOutcome):
             return result
 
@@ -286,7 +295,8 @@ class MaintenanceAssessmentBatches:
                 session_errors.append(str(error))
 
         result = self._invoke(run, worktree, prompts, relations.SYNTHESIS_PREFIX,
-                              page.session_id, save_session, "maintenance_review")
+                              page.session_id, save_session, "maintenance_review", "synthesis",
+                              [(item.key, item.digest) for item in pages])
         if isinstance(result, PlanningOutcome):
             return result
         if session_errors:
@@ -335,7 +345,8 @@ class MaintenanceAssessmentBatches:
                 port.resolution_session(context.repo, unit, session)
 
         result = self._invoke(run, worktree, prompts, relations.RESOLUTION_PREFIX,
-                              first.session_id, save_session, "maintenance_discovery")
+                              first.session_id, save_session, "maintenance_discovery", "resolution",
+                              [(unit.digest, unit.decision_digest, unit.index) for unit in units])
         if isinstance(result, PlanningOutcome):
             return result
 

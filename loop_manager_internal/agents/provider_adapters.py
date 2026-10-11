@@ -600,33 +600,34 @@ def run_claude(
             message = diagnostic_tail
     else:
         if on_process_started is not None:
-            with log.open("w", encoding="utf-8") as output:
-                output.write(fast_mode_log)
-                process = effects._handoff_popen(
-                    arguments,
-                    stdin=subprocess.PIPE,
-                    stdout=output,
-                    stderr=subprocess.STDOUT,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    env=agent_environment("claude", role_name),
-                    cwd=worktree,
-                )
-                try:
-                    on_process_started()
-                    process.communicate(prompt, timeout=AGENT_CLI_TIMEOUT_SECONDS)
-                    returncode = process.returncode
-                    if on_process_finished is not None:
-                        on_process_finished()
-                except BaseException:
-                    _stop_process(process)
-                    process.communicate()
-                    if on_process_finished is not None:
-                        on_process_finished()
-                    raise
-            logged = log.read_text(encoding="utf-8", errors="replace")
-            raw_output = logged[len(fast_mode_log):] if logged.startswith(fast_mode_log) else logged
+            process = effects._handoff_popen(
+                arguments,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                env=agent_environment("claude", role_name),
+                cwd=worktree,
+            )
+            try:
+                on_process_started()
+                raw_output, _ = process.communicate(prompt, timeout=AGENT_CLI_TIMEOUT_SECONDS)
+                returncode = process.returncode
+                if on_process_finished is not None:
+                    on_process_finished()
+            except BaseException:
+                _stop_process(process)
+                process.communicate()
+                if on_process_finished is not None:
+                    on_process_finished()
+                raise
+            raw_output = raw_output or ""
+            try:
+                log.write_text(fast_mode_log + raw_output, encoding="utf-8")
+            except OSError:
+                pass
         else:
             result = effects._handoff_run(
                 arguments,
@@ -642,7 +643,10 @@ def run_claude(
             )
             returncode = result.returncode
             raw_output = result.stdout or ""
-            log.write_text(fast_mode_log + raw_output, encoding="utf-8")
+            try:
+                log.write_text(fast_mode_log + raw_output, encoding="utf-8")
+            except OSError:
+                pass
         try:
             event = json.loads(raw_output)
         except (ValueError, RecursionError):
@@ -666,7 +670,10 @@ def run_claude(
     if role_name == "reviewer":
         message = _redact_reviewer_log(message)
     if message:
-        last_message.write_text(message, encoding="utf-8")
+        try:
+            last_message.write_text(message, encoding="utf-8")
+        except OSError:
+            pass
     if persist_session and not resolved_session_id and returncode == 0:
         return AgentResult(
             1,

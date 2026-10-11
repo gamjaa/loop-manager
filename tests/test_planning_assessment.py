@@ -657,6 +657,38 @@ class PlanningAssessmentTest(PlanningCase):
 
 
 class PlanningBoundaryTests(PlanningCase):
+    def test_maintenance_batch_target_binds_active_revision_and_unit_identity(self):
+        from loop_manager_internal.planning.assessment_batches import MaintenanceAssessmentBatches
+
+        ports = FakePorts(
+            planning_snapshot(phase="PLANNING", active_sha="tree-revision", planner_session_id="owner"),
+            maintenance_cycle(phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+                              cycle_base_sha="tree-revision", revision=4),
+        )
+        run = PlanningLifecycleCoordinator(ports)._new_run(self.context)
+        source = TrackedSource("src/calc.py", "b" * 64, "100644", "blob-revision", "source code")
+        unit = SimpleNamespace(source=source, session_id="owner", error=None)
+        file_review = mock.Mock()
+        file_review.progress.return_value = maintenance_file_review.FileReviewProgress((source,), (), unit)
+        file_review.pending_units.return_value = (unit,)
+        file_review.content.return_value = b"content"
+        ports.file_review = file_review
+        ports.events = mock.Mock()
+        result = SimpleNamespace(code=0, message="")
+        scope = SimpleNamespace(error="scope denied")
+        with mock.patch(
+            "loop_manager_internal.planning.assessment_batches.files.review_prompt",
+            return_value="prompt",
+        ), mock.patch(
+            "loop_manager_internal.planning.assessment_batches.run_scoped_planner_turn",
+            return_value=(result, scope),
+        ) as invoke:
+            outcome = MaintenanceAssessmentBatches(ports).review_files(run, Path("/tree"))
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.OPERATIONAL_ERROR)
+        self.assertEqual(invoke.call_args.kwargs["target"],
+                         'maintenance-batch:files@tree-revision:[["src/calc.py","blob-revision"]]')
+
     def test_planner_agent_port_passes_planless_invocation_and_ignores_telemetry_error(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)

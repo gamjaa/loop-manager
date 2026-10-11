@@ -62,11 +62,9 @@ class CodexLaunch:
             try:
                 self.stop(process)
             finally:
-                try:
-                    process.wait()
-                finally:
-                    if on_process_finished is not None:
-                        on_process_finished()
+                process.wait()
+                if on_process_finished is not None:
+                    on_process_finished()
 
     def probe(self) -> None:
         feature_result = subprocess.run(
