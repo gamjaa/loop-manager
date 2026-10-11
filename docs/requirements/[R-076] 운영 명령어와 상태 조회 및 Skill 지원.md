@@ -8,7 +8,7 @@
 
 현재 CLI의 공통 진입 경로는 실행 잠금과 Git 기반 bootstrap·runtime 준비를 수행한다. 일반 DB 연결과 일부 Repository 생성자는 schema 초기화·migration을 수행하고, 실행 명령은 중단된 invocation을 정리한다. 조회 명령은 이 부수 효과를 일으키지 않아야 한다.
 
-호출·사용량의 기본 집계는 `loop_manager_internal/storage/agent_invocation_state.py`의 `summary()`에 있고, 복구 판단은 `loop_manager_internal/recovery/recovery_runtime.py`가 소유한다. [R-073](%5BR-073%5D%20Invocation%20Purpose%20Usage%20Scope%20and%20Queries.md)의 호출 목적·실행 여부·사용량 범위 수집 확대와 기간별 분석은 별도 요구사항이다. 이 요구사항은 이미 저장된 정보의 조회를 제공하며 R-073 전체 구현을 선행 조건으로 삼지 않는다.
+호출·사용량의 기본 집계는 `loop_manager_internal/storage/agent_invocation_state.py`의 `summary()`에 있고, 복구 판단은 `loop_manager_internal/recovery/recovery_runtime.py`가 소유한다. [R-073](%5BR-073%5D%20%ED%98%B8%EC%B6%9C%20%EB%AA%A9%EC%A0%81%EA%B3%BC%20%EC%82%AC%EC%9A%A9%EB%9F%89%20%EB%B2%94%EC%9C%84%20%EA%B8%B0%EB%A1%9D%20%EB%B0%8F%20%EC%A1%B0%ED%9A%8C.md)의 호출 목적·실행 여부·사용량 범위 수집 확대와 기간별 분석은 별도 요구사항이다. 이 요구사항은 이미 저장된 정보의 조회를 제공하며 R-073 전체 구현을 선행 조건으로 삼지 않는다.
 
 ## Requirement
 
@@ -57,7 +57,7 @@ python loop_manager.py manual cancel <repo> <id>
 python loop_manager.py manual stop <repo> <id>
 ```
 
-[R-077](%5BR-077%5D%20Manual%20Plan%20Work%20Start%20and%20Completion.md)의 시작·제출·자동 후속 처리 계약은 유지하며 아래 명시적 취소·중단·수동 대상 해제를 추가한다. PR 생성·연결은 수동 제출 처리의 종료 경계이고, ExecPlan 완료는 계속 실제 Merge를 기준으로 한다.
+[R-077](%5BR-077%5D%20G%20%EA%B3%84%ED%9A%8D%20%EC%88%98%EB%8F%99%20%EA%B5%AC%ED%98%84%EA%B3%BC%20R%C2%B7%EC%BD%94%EB%93%9C%20%EC%9D%BC%EA%B4%84%20%EC%A0%9C%EC%B6%9C.md)의 시작·제출·자동 후속 처리 계약은 유지하며 아래 명시적 취소·중단·수동 대상 해제를 추가한다. PR 생성·연결은 수동 제출 처리의 종료 경계이고, ExecPlan 완료는 계속 실제 Merge를 기준으로 한다.
 
 | 명령·대상 | 변경 결과 |
 |---|---|

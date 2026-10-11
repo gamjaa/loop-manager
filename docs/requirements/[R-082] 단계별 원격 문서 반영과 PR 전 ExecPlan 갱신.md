@@ -8,7 +8,7 @@ PR 전 ExecPlan 개정과 stage_documents의 단계별 문서 반영은 이미 �
 
 현재 구현에는 진행 중 rebase 충돌과 Worker 구현 입력 변경이 함께 발견되면 기존 작업을 보존하고 최종 차단하는 경로가 남아 있다. 아래 충돌 복구 정책은 이 경로를 최신 base의 계획·작업 문서 자동 반영과 필요한 Worker 교정·재검증으로 연결하려는 변경 요구이며, 이미 구현된 동작이나 운영 문제의 해소를 뜻하지 않는다.
 
-진행 중 작업은 최신 원격 문서에 맞춰 갱신하되, 문서 변경만으로 구현을 반복하지 않아야 한다. 이 Requirement는 [R-049](archive/%5BR-049%5D%20Input-Specific%20Planner%20Roles.md)의 미착수 READY 갱신 제한과 [R-051](archive/%5BR-051%5D%20Remote%20Change%20Rebase%20and%20Managed%20Work%20Resumption.md)의 Worker·Reviewer 문서 재확인 범위를 아래 정책으로 변경한다. [R-072](%5BR-072%5D%20Reuse%20Successful%20Candidate%20Results%20with%20Proven%20Inputs.md)의 입력 증명·성공 근거 재사용은 유지하되, 관련 문서 변경에 따른 단계 선택은 이 Requirement를 따른다.
+진행 중 작업은 최신 원격 문서에 맞춰 갱신하되, 문서 변경만으로 구현을 반복하지 않아야 한다. 이 Requirement는 [R-049](archive/%5BR-049%5D%20Input-Specific%20Planner%20Roles.md)의 미착수 READY 갱신 제한과 [R-051](archive/%5BR-051%5D%20Remote%20Change%20Rebase%20and%20Managed%20Work%20Resumption.md)의 Worker·Reviewer 문서 재확인 범위를 아래 정책으로 변경한다. [R-072](%5BR-072%5D%20%EC%9E%85%EB%A0%A5%20%EB%8F%99%EC%9D%BC%EC%84%B1%EC%9D%B4%20%EC%A6%9D%EB%AA%85%EB%90%9C%20%EA%B5%AC%ED%98%84%20%ED%9B%84%EB%B3%B4%20%EC%84%B1%EA%B3%B5%20%EA%B2%B0%EA%B3%BC%20%EC%9E%AC%EC%82%AC%EC%9A%A9.md)의 입력 증명·성공 근거 재사용은 유지하되, 관련 문서 변경에 따른 단계 선택은 이 Requirement를 따른다.
 
 ## Requirement
 

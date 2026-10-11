@@ -75,7 +75,7 @@ Manager는 비교에 필요한 시간·자원 집계를 코드로 생성하고 �
 - 다른 등록 프로젝트의 verify·테스트 프레임워크 일괄 전환 또는 여러 호스트 간 자원 조율.
 - 새로운 외부 모니터링 서비스, 상주 자원 관리 서비스 또는 범용 작업 스케줄러 도입.
 - 새 runner·IPC 체계·worker 내부 독립 프로세스 풀 도입과 Defender·동기화·색인 설정의 자동 변경.
-- 동일 SHA만으로 자체 verify를 생략하는 변경. 입력 증명과 성공 재사용은 [R-072](%5BR-072%5D%20Reuse%20Successful%20Candidate%20Results%20with%20Proven%20Inputs.md)의 별도 범위다.
+- 동일 SHA만으로 자체 verify를 생략하는 변경. 입력 증명과 성공 재사용은 [R-072](%5BR-072%5D%20%EC%9E%85%EB%A0%A5%20%EB%8F%99%EC%9D%BC%EC%84%B1%EC%9D%B4%20%EC%A6%9D%EB%AA%85%EB%90%9C%20%EA%B5%AC%ED%98%84%20%ED%9B%84%EB%B3%B4%20%EC%84%B1%EA%B3%B5%20%EA%B2%B0%EA%B3%BC%20%EC%9E%AC%EC%82%AC%EC%9A%A9.md)의 별도 범위다.
 - 매 verify마다 여러 병렬도를 시험하는 탐색, 필수 테스트 skip, timeout 자동 증가 또는 특정 절감률 보장.
 - Python 캐시 정책 변경은 R-059에서 별도로 다루며 이 요구사항의 필수 선행 조건으로 삼지 않는다.
 

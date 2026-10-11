@@ -20,7 +20,7 @@ Loop Manager는 Windows·Linux·macOS에서 동작하는 Python 3 프로그램�
 
 현행 구조와 활성 변경 요청은 [PRODUCT의 변경 요구사항 절](PRODUCT.md#활성-변경-요구사항과-현재-동작)에서 연결한다. 아래는 Merge된 구조이며 R-055의 정상 Git 변경·legacy 기본 checkout 제외·BLOCKED 현재 입력·게시 분리와 R-082의 Planner 경계 보완은 구현 목표다. 문서 편집만으로 실행 gate나 검증 성공을 바꾸지 않는다.
 
-[보관된 R-063](requirements/archive/%5BR-063%5D%20Manager-Owned%20Deterministic%20Work%20and%20Minimal%20Model%20Use.md)은 규칙 기반 처리의 Manager 이관과 모델 호출 축소의 설계 배경이다. 후보 성공 결과 재사용의 변경 요구는 [R-072](requirements/%5BR-072%5D%20Reuse%20Successful%20Candidate%20Results%20with%20Proven%20Inputs.md)를 따른다. 역할별 입력 동일성의 증거가 없는 경우의 재검증·최신 원격 게시 gate는 유지한다.
+[보관된 R-063](requirements/archive/%5BR-063%5D%20Manager-Owned%20Deterministic%20Work%20and%20Minimal%20Model%20Use.md)은 규칙 기반 처리의 Manager 이관과 모델 호출 축소의 설계 배경이다. 후보 성공 결과 재사용의 변경 요구는 [R-072](requirements/%5BR-072%5D%20%EC%9E%85%EB%A0%A5%20%EB%8F%99%EC%9D%BC%EC%84%B1%EC%9D%B4%20%EC%A6%9D%EB%AA%85%EB%90%9C%20%EA%B5%AC%ED%98%84%20%ED%9B%84%EB%B3%B4%20%EC%84%B1%EA%B3%B5%20%EA%B2%B0%EA%B3%BC%20%EC%9E%AC%EC%82%AC%EC%9A%A9.md)를 따른다. 역할별 입력 동일성의 증거가 없는 경우의 재검증·최신 원격 게시 gate는 유지한다.
 
 ## 실행 환경과 시작
 
@@ -122,7 +122,7 @@ SQLite에는 등록 프로젝트, 기준 branch, 선택한 provider, 과거 등�
 
 ExecPlan 번호는 연속일 필요가 없다. 번호 공백을 누락 계획으로 추정하거나 메우지 않으며 사용한 ID는 재사용하지 않는다. 현행 catalog 동기화는 SQLite 실행·취소 이력에 대응하는 원격 파일이 없거나 형식·source·ID·dependency graph가 유효하지 않으면, 다른 계획 상태를 바꾸지 않고 원인 파일을 포함한 프로젝트 범위 진단을 남긴다.
 
-[R-055 구현 예정](requirements/%5BR-055%5D%20Blocking%20Path%20Audit%20and%20Minimal%20Interruption.md#계획작업-문서-삭제의-자동-반영): Requirement·ExecPlan 삭제는 Manager의 원격 관측·이력 분류와 일반 Planner의 목표 판단으로 자동 처리한다. 허용된 관련 문서 개정·삭제의 원격 확인 후 현재 DB 관계와 실행 수명에 반영하고, 유지하는 관리 브랜치의 문서를 갱신하며 삭제를 반영한 취소·완료 작업의 소유 로컬·원격 브랜치와 worktree를 보존 검증 뒤 정리한다. 완료·취소·예약 감사는 활성 선언 및 source 조회와 분리해 보존한다. 게시·DB·자원 정리의 확정 지점별로 재개하며, 해결하지 못한 영향 범위와 정리 pending만 보존·보류하고 검증된 독립 계획은 계속한다.
+[R-055 구현 예정](requirements/%5BR-055%5D%20%EC%B0%A8%EB%8B%A8%20%EA%B2%BD%EB%A1%9C%20%EC%A0%84%EC%88%98%20%EC%A1%B0%EC%82%AC%EC%99%80%20%EB%B6%88%ED%95%84%EC%9A%94%ED%95%9C%20%EC%9E%91%EC%97%85%20%EC%A4%91%EB%8B%A8%20%EC%B6%95%EC%86%8C.md#계획작업-문서-삭제의-자동-반영): Requirement·ExecPlan 삭제는 Manager의 원격 관측·이력 분류와 일반 Planner의 목표 판단으로 자동 처리한다. 허용된 관련 문서 개정·삭제의 원격 확인 후 현재 DB 관계와 실행 수명에 반영하고, 유지하는 관리 브랜치의 문서를 갱신하며 삭제를 반영한 취소·완료 작업의 소유 로컬·원격 브랜치와 worktree를 보존 검증 뒤 정리한다. 완료·취소·예약 감사는 활성 선언 및 source 조회와 분리해 보존한다. 게시·DB·자원 정리의 확정 지점별로 재개하며, 해결하지 못한 영향 범위와 정리 pending만 보존·보류하고 검증된 독립 계획은 계속한다.
 
 일반·유지보수 planning의 미해결 오류와 입력 지문은 다른 ExecPlan의 차단 해제·PR 상태 변경·project 실행 상태 정리와 독립적으로 보존한다. worktree 경로 부재나 관련 입력이 같은 원격 base 전진만으로 해제하지 않으며, 같은 입력의 반복 실행·재시작에서는 Planner를 다시 호출하지 않는다
 
@@ -212,7 +212,7 @@ runtime 자식은 병렬 프로젝트 작업을 제출하기 전에 등록된 se
 1. 생성·개정·rename·삭제·FUTURE_IDEAS 변경을 분류하고 snapshot 원본, SQLite의 현재 실행 근거·PR 부재 및 적용 후 catalog의 ID·source·dependency graph를 검증한다. 시작한 계획의 ID·경로와 실행 이력은 보존한다.
    snapshot의 rename으로 확정되지 않은 미게시 새 파일은 전체 catalog를 읽기 전에 별도로 정규화한다. Manager는 active·archive 파일과 SQLite 등록·취소·수동 예약 및 mutable/held snapshot에서 사용 중인 ID를 모아 새 batch에 연속 번호를 배정하고 ID·title에 맞는 새 경로로 옮긴다. 같은 batch의 서로 다른 새 파일이 같은 ID를 쓰면 배정을 멈춘다. 새 계획과 이번 batch에서 수정한 snapshot 계획의 `depends_on` 중 대상이 확인된 batch ID만 새 ID로 갱신하며, 기존 dependency 순서·계획 identity·본문은 보존한다. 기존 ID와 batch ID가 충돌하는 관계는 의미를 정할 수 없어 오류로 남긴다. 재배정 대상 ID가 본문에 언급돼도 이를 고치거나 대상을 추론하지 않고 오류로 남긴다. draft와 `User Decision`의 원문은 보존한다. 정규화 뒤 기존 전체 catalog·source·dependency 검증을 수행한다.
    정규화는 일반·유지보수 planning 모두에 적용한다. 원본 bytes·mode와 대상 hash를 편집 전에 복구 journal에 기록하고, 완성한 임시 파일을 원자적으로 설치한다. 다음 검증 진입에서 미완료 journal을 확인해 원본을 복구한다. 복구로 제거된 journal 소유 임시·대상 경로는 호출자가 미리 수집한 변경 목록에서 제외하고, 복구 후 현재 변경을 다시 관측해 범위를 검증한다. 예상과 다른 파일이 있으면 덮어쓰지 않고 작업과 journal을 보존한다.
-2. 실패는 같은 Planner 세션에서 최대 3회 교정한다. 소진하면 원인·입력 지문을 planning_error에 보존하고 같은 실패 입력의 신규 Planner 호출을 반복하지 않는다. 현행 실행 경로는 이 오류에서 프로젝트 처리를 중단한다. [R-055](requirements/%5BR-055%5D%20Blocking%20Path%20Audit%20and%20Minimal%20Interruption.md)는 안전하게 실행 자리를 비운 뒤 이미 게시된 독립 계획의 순차 구현·PR 관측을 계속하도록 변경한다.
+2. 실패는 같은 Planner 세션에서 최대 3회 교정한다. 소진하면 원인·입력 지문을 planning_error에 보존하고 같은 실패 입력의 신규 Planner 호출을 반복하지 않는다. 현행 실행 경로는 이 오류에서 프로젝트 처리를 중단한다. [R-055](requirements/%5BR-055%5D%20%EC%B0%A8%EB%8B%A8%20%EA%B2%BD%EB%A1%9C%20%EC%A0%84%EC%88%98%20%EC%A1%B0%EC%82%AC%EC%99%80%20%EB%B6%88%ED%95%84%EC%9A%94%ED%95%9C%20%EC%9E%91%EC%97%85%20%EC%A4%91%EB%8B%A8%20%EC%B6%95%EC%86%8C.md)는 안전하게 실행 자리를 비운 뒤 이미 게시된 독립 계획의 순차 구현·PR 관측을 계속하도록 변경한다.
 3. 검증된 전체 변경을 planning worktree의 한 commit으로 만든다.
 4. 아직 게시하지 않은 동안 원격 base가 전진하면 변경·session을 보존해 반영하고 최신 catalog·대상 권한과 관련 문서를 재검증한다. 충돌·원격 재작성·소유권 불명확은 작업을 보존해 복구 경계로 보낸다.
 5. 기준과 mutable READY snapshot이 그대로면 복구 가능한 publication intent를 저장하고 base에 fast-forward push한다.
@@ -250,7 +250,7 @@ dependency·priority·명세 변경·유지보수 DAG의 선택 순서는 PRODUC
 
 일반·유지보수 planning이 진행 중이거나 시도·오류·게시 결과를 보존하는 동안 다른 ExecPlan의 차단 복구는 project 실행 투영을 교체하거나 정리하지 않는다. Worker·검증·Review·게시와 Git 변경 복구는 planning이 실행 자리를 유효하게 비운 뒤 재개한다. 안전 gate가 허용한 PR Merge·Close 확인과 해당 계획의 상태·알림 기록은 계속할 수 있다
 
-[R-055 구현 예정](requirements/%5BR-055%5D%20Blocking%20Path%20Audit%20and%20Minimal%20Interruption.md): 보존된 planning 오류 자체는 변경 실행 자리의 점유 근거가 아니다. planning worktree·session·미게시 결과·오류는 별도로 보존하고, 진행 중 operation·미확정 게시·실제 공유 안전 문제가 없으면 실행 자리를 비워 기존 독립 계획을 계속한다. 새 Planner 주기와 프로젝트 완료 선언은 오류가 해소될 때까지 보류한다.
+[R-055 구현 예정](requirements/%5BR-055%5D%20%EC%B0%A8%EB%8B%A8%20%EA%B2%BD%EB%A1%9C%20%EC%A0%84%EC%88%98%20%EC%A1%B0%EC%82%AC%EC%99%80%20%EB%B6%88%ED%95%84%EC%9A%94%ED%95%9C%20%EC%9E%91%EC%97%85%20%EC%A4%91%EB%8B%A8%20%EC%B6%95%EC%86%8C.md): 보존된 planning 오류 자체는 변경 실행 자리의 점유 근거가 아니다. planning worktree·session·미게시 결과·오류는 별도로 보존하고, 진행 중 operation·미확정 게시·실제 공유 안전 문제가 없으면 실행 자리를 비워 기존 독립 계획을 계속한다. 새 Planner 주기와 프로젝트 완료 선언은 오류가 해소될 때까지 보류한다.
 
 ### 유지보수 분석과 성공 근거
 
@@ -309,7 +309,7 @@ Worker에 추가하는 [AGENTS.ponytail.md](AGENTS.ponytail.md)는 [Ponytail](ht
 
 ### R-085: 인증 전용 provider 저장소 (구현 예정)
 
-[R-085](requirements/%5BR-085%5D%20Codex%20Claude%20인증%20전용%20자동%20실행%20환경.md)는 개인 Plugin·Hook을 상속하지 않고 기존 인증만 재사용하는 설계다. 현재 Codex의 개인 config 연결과 Windows 사용자 home 재사용 및 Claude 사용자 설정 상속을 변경하는 대상이며 구현 완료를 뜻하지 않는다.
+[R-085](requirements/%5BR-085%5D%20Codex%C2%B7Claude%20%EC%9D%B8%EC%A6%9D%20%EC%A0%84%EC%9A%A9%20%EC%9E%90%EB%8F%99%20%EC%8B%A4%ED%96%89%20%ED%99%98%EA%B2%BD.md)는 개인 Plugin·Hook을 상속하지 않고 기존 인증만 재사용하는 설계다. 현재 Codex의 개인 config 연결과 Windows 사용자 home 재사용 및 Claude 사용자 설정 상속을 변경하는 대상이며 구현 완료를 뜻하지 않는다.
 
 Manager 상태 경로 아래의 기존 provider runtime 경계를 사용하고 repository·worktree·role과 session의 연결을 보존한다. Codex 자식에는 관리 `CODEX_HOME`을, Claude 자식에는 관리 `CLAUDE_CONFIG_DIR`을 지정하며 부모 환경은 변경하지 않는다. 기존 provider home 값은 인증 원본 선택에만 사용하고 없으면 CLI 기본 사용자 저장소 또는 OS 인증 저장소를 선택한다. 환경 준비는 인증 사전 검사와 설정 지문·권한 확인보다 먼저 수행하고 실제 호출·재개·fallback까지 같은 환경을 전달한다. 설정 검사도 실제 선택한 저장소를 기준으로 하며 인증 원본 home의 개인 설정을 다시 조회하지 않는다.
 
@@ -347,7 +347,7 @@ Reviewer의 `read-only`는 workspace 파일 쓰기를 제한한다. 검색·diff
 
 ## Model과 Effort
 
-최초 Worker level은 complexity의 low=1, medium=3, high=5에 critical risk만 1을 가산해 1~6으로 계산한다. low·medium·high risk는 가산하지 않는다. [R-052](requirements/%5BR-052%5D%20Worker%20Classification%20and%20Initial%20Level%20Calibration.md)의 12개 조합은 다음과 같다.
+최초 Worker level은 complexity의 low=1, medium=3, high=5에 critical risk만 1을 가산해 1~6으로 계산한다. low·medium·high risk는 가산하지 않는다. [R-052](requirements/%5BR-052%5D%20Worker%20%ED%8C%90%EC%A0%95%20%EA%B8%B0%EC%A4%80%20%EA%B5%AC%EC%B2%B4%ED%99%94%EC%99%80%20%EC%B5%9C%EC%B4%88%20%EB%B0%B0%EC%A0%95%20%EC%99%84%ED%99%94.md)의 12개 조합은 다음과 같다.
 
 | complexity | risk | 최초 Worker level |
 |---|---|---:|
