@@ -187,7 +187,7 @@ class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
         for invalid in (
             replace(self.observed, operations=(('MERGE_HEAD', 'foreign'),)),
             replace(self.observed, head='foreign', branch_ref=('foreign', '')),
-            replace(self.observed, staged=(replace(staged, path='docs/requirements/UserDesign.md'),)),
+            replace(self.observed, staged=(replace(staged, path='docs/requirements/archive/UserDesign.md'),)),
             replace(self.observed, index=(IndexEntry('app.py', '100644', 'new', 1, 'M', 0),)),
             replace(self.observed, index=(IndexEntry('app.py', '100644', 'new', 0, 'H', 32768),)),
             replace(self.observed, remote=replace(self.observed.remote, oid='foreign')),
@@ -265,7 +265,7 @@ class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
         for observed in (replace(self.observed, remote=replace(self.expected.remote, oid='foreign')),
                          replace(self.observed, input_fingerprint='changed'),
                          replace(self.observed, committed=(FileChange(
-                             'docs/requirements/UserDesign.md', '100644', '100644', 'old', 'new', 'M'),))):
+                             'docs/requirements/archive/UserDesign.md', '100644', '100644', 'old', 'new', 'M'),))):
             with self.subTest(observed=observed):
                 self.observed = observed
                 with self.assertRaises(handlers.manager_git_journal.MutationEvidenceError):

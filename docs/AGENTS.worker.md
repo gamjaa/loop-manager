@@ -6,8 +6,11 @@
   함께 수행한다. 기존 동작을 보존하는 테스트를 포함하고 범위 밖 개선으로 확대하지 않는다.
 - 새 ExecPlan을 만들거나 다른 계획의 목표를 추가 구현하지 않는다. 연관 문서 수정은
   호출에서 제공된 권한 안에서 수행하고 목표·실행 이력·dependency·사용자 결정을 보존한다.
-- Requirement는 기본적으로 사용자가 작성하며 명시적인 Specification Skill 문서 작성 요청은
-  예외다. Requirement·ExecPlan 구현으로 바뀌는 제품 동작·장기 규칙은 PRODUCT에,
+- 현재 작업에 필요한 PRODUCT·ARCHITECTURE·활성 Requirement·기존 ExecPlan·공통 및 역할별
+  지침·사용 안내를 함께 갱신할 수 있다. 새 목표·Non-Goal·사용자 동작 의미 변경은 사용자 판단을
+  기다린다. 문서 수정으로 원래 요청·Acceptance Criteria·필수 검증·실패를 약화하거나 사용자
+  결정을 대신 작성·변경하지 않는다. 다른 계획의 ID·실행 이력·dependency·사용자 결정은 보존한다.
+- Requirement·ExecPlan 구현으로 바뀌는 제품 동작·장기 규칙은 PRODUCT에,
   설계·책임 경계·계약은 ARCHITECTURE에 코드와 같은 PR에서 반영한다. 필요한 관련 절만
   갱신하고 목표·필수 검증·사용자 결정을 보존한다.
 - Requirement의 완료 판단·archive 이동은 Manager의 책임이며 Worker가 수행하지 않는다.
@@ -33,7 +36,13 @@
   전체 verify는 직접 실행하지 않는다. Manager가 Agent 밖에서 실행하며 실패 출력만
   같은 Worker 세션에 전달한다.
 
-PR_SUMMARY에는 최종 diff의 경로·내용·이유·영향을 설명하고, 결과는 완료한 변경·미해결 문제·
+PR_SUMMARY에는 최종 diff의 문서별 경로·주요 내용·이유·제품 및 설계 영향을 설명한다. 추가·
+삭제·rename도 포함하고 rebase 뒤 실제 변경에 맞게 갱신한다. 변경 문서마다 PR_SUMMARY 안에
+`DOCUMENT_CHANGE: {"path":"최종 경로","summary":"주요 변경","reason":"수정 이유","impact":"제품·설계 영향","patch_sha256":"문서 diff의 SHA-256"}`
+한 줄을 둔다. rename은 새 경로, 삭제는 원래 경로를 사용한다. hash는 Manager가 제시한 최종
+문서 patch 또는 `git diff --no-ext-diff --no-textconv --find-renames <base> <head> -- <해당 경로들>`의
+UTF-8 stdout에 결합한다. 누락·이전 후보의 설명은 현재 diff로 보완하며 모르는 의미를 추정해
+채우지 않는다. 결과는 완료한 변경·미해결 문제·
 다음 필요한 작업을 구분한다. 실제 실행하지 않은 검증을 성공으로 보고하지 않는다.
 
 ## 연결된 adapter의 테스트 작성

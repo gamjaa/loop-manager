@@ -24,8 +24,8 @@ class ScopeRoleBoundariesTest(unittest.TestCase):
         scenarios = (
             ('planner', snapshot(dirty={'docs/PRODUCT.md': (('tracked',), 'changed')}),
              None, 'docs/PRODUCT.md'),
-            ('worker', snapshot(dirty={'docs/requirements/Active.md': (('tracked',), 'changed')}),
-             self.plan_path, 'docs/requirements/Active.md'),
+            ('worker', snapshot(dirty={'docs/requirements/archive/Active.md': (('tracked',), 'changed')}),
+             self.plan_path, 'docs/requirements/archive/Active.md'),
             ('reviewer', snapshot(index={'src/app.py': ('H 100644 changed 0',)},
                                   dirty={'review.txt': (('untracked',), 'new')}),
              None, 'review.txt'),
@@ -51,6 +51,15 @@ class ScopeRoleBoundariesTest(unittest.TestCase):
                 else:
                     with self.assertRaises(loop_manager.AgentScopeError):
                         self.validate(role, after)
+
+    def test_worker_related_documents_allow_active_requirements_and_guidance_without_approval(self):
+        for path in ('docs/requirements/Active.md', 'docs/PRODUCT.md', 'docs/ARCHITECTURE.md',
+                     'docs/AGENTS.common.md', 'docs/AGENTS.worker.md', 'AGENTS.md'):
+            with self.subTest(path=path):
+                self.validate('worker', snapshot(dirty={path: (('tracked',), 'changed')}), self.plan_path)
+                for role in ('planner', 'reviewer', 'planner_check'):
+                    with self.assertRaises(loop_manager.AgentScopeError):
+                        self.validate(role, snapshot(dirty={path: (('tracked',), 'changed')}))
 
     def test_planner_existing_plan_change_reaches_snapshot_validator(self):
         self.validate('planner', snapshot(dirty={self.plan_path: (('tracked',), 'changed')}))

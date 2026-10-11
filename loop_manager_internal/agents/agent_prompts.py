@@ -190,8 +190,8 @@ def worker_prompt(
         )
     archive_instruction = (
         "\nRequirement 완료 판단과 내용 보존 이동은 관련 계획이 Merge된 뒤 "
-        "일반 Planner와 Manager가 처리한다. 이 구현 작업에서는 "
-        "docs/requirements/ 아래 파일을 수정하거나 이동하지 마라.\n"
+        "일반 Planner와 Manager가 처리한다. Worker의 연관 문서 수정은 "
+        "Requirement 완료 판단이나 archive 이동 권한을 포함하지 않는다.\n"
     )
     recovery = ""
     if session_recovery:

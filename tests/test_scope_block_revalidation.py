@@ -582,7 +582,7 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
         _, result = self.scope_stage_result()
         for changed in (replace(result, index={'app.py': ('S 100644 manual 0',)}),
                         replace(result, index={'app.py': ('h 100644 manual 0',)}),
-                        replace(result, dirty={**result.dirty, 'docs/requirements/Protected.md': (('unstaged',), 'foreign')}),
+                        replace(result, dirty={**result.dirty, 'docs/requirements/archive/Protected.md': (('unstaged',), 'foreign')}),
                         replace(result, refs={**result.refs, 'refs/heads/other': ('foreign', '')})):
             self.connection.execute("UPDATE exec_plans SET agent_result_snapshot = ?", (changed.serialize(),))
             self.connection.commit()
@@ -784,7 +784,7 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
                                  registration=('HEAD=before', 'branch=refs/heads/loop-manager/G-047')),
                          replace(original, operations=(('MERGE_HEAD', 'foreign'),)),
                          replace(original, index=(IndexEntry('app.py', '100644', 'blob', 0, 'S', 0x40000000),)),
-                         replace(original, committed=(FileChange('docs/requirements/change.md',
+                         replace(original, committed=(FileChange('docs/requirements/archive/change.md',
                              '100644', '100644', 'old', 'new', 'M'),))):
             with self.subTest(observed=observed):
                 self.case.observed = observed

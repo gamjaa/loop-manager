@@ -362,7 +362,7 @@ class ScopeValidationMutationsTest(AgentScopeFixture, unittest.TestCase):
 
             def verify_with_protected_mutation(agent_worktree, timeout_seconds):
                 self.assertEqual(timeout_seconds, 600)
-                (agent_worktree / "docs/requirements/Active.md").write_text(
+                (agent_worktree / "docs/PLANS.md").write_text(
                     "# changed by verify\n",
                     encoding="utf-8",
                 )
@@ -407,7 +407,7 @@ class ScopeValidationMutationsTest(AgentScopeFixture, unittest.TestCase):
             self.assertIsNone(project["phase"])
             self.assertIn("worker Git 범위 위반", plan["last_error"])
             self.assertIn(
-                "docs/requirements/Active.md",
+                "docs/PLANS.md",
                 plan["last_error"],
             )
             self.assertEqual(plan["verify_result"], "verify: PASS")
@@ -420,7 +420,7 @@ class ScopeValidationMutationsTest(AgentScopeFixture, unittest.TestCase):
                 initial_head,
             )
             self.assertEqual(
-                (worktree / "docs/requirements/Active.md").read_text(
+                (worktree / "docs/PLANS.md").read_text(
                     encoding="utf-8"
                 ),
                 "# changed by verify\n",

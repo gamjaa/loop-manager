@@ -485,7 +485,7 @@ class ConflictIndexScopeTests(unittest.TestCase):
                                      selected_plan_path=PLAN, owned_rebase=True)
 
     def test_resolution_cannot_absorb_protected_path_or_shared_metadata(self):
-        for after in (replace(self.after, index={**self.after.index, 'docs/requirements/Protected.md': ('H 100644 foreign 0',)}),
+        for after in (replace(self.after, index={**self.after.index, 'docs/requirements/archive/Protected.md': ('H 100644 foreign 0',)}),
                       replace(self.after, refs={**self.after.refs, 'refs/heads/other': ('foreign', '')}),
                       replace(self.after, operations={'rebase-merge': 'different'})):
             with self.subTest(after=after), self.assertRaises(AgentScopeError):
@@ -522,7 +522,7 @@ class WorkerPlanDocumentScopeTests(unittest.TestCase):
 
     def test_protected_documents_remain_blocked_with_related_plan_update(self):
         before = snapshot()
-        for path in ("docs/PLANS.md", "docs/requirements/Active.md"):
+        for path in ("docs/PLANS.md", "docs/requirements/archive/Active.md"):
             with self.subTest(path=path):
                 after = replace(before, dirty={
                     self.related_plan: (("unstaged",), "inventory-update"),
@@ -589,8 +589,8 @@ class TaskRelevantScopeTests(unittest.TestCase):
         self.validate(allowed)
         with self.assertRaises(AgentScopeError):
             self.validate(allowed, role='reviewer')
-        for after in (replace(self.before, dirty={'docs/requirements/Protected.md': (('unstaged',), 'new')}),
-                      replace(self.before, index={'docs/requirements/Protected.md': ('H oid 0',)}),
+        for after in (replace(self.before, dirty={'docs/requirements/archive/Protected.md': (('unstaged',), 'new')}),
+                      replace(self.before, index={'docs/requirements/archive/Protected.md': ('H oid 0',)}),
                       replace(self.before, index={'app.py': ('h oid 0',)})):
             with self.subTest(after=after), self.assertRaises(AgentScopeError):
                 self.validate(after)

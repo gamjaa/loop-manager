@@ -73,6 +73,13 @@ class WorkerPromptFocusTests(TestCase):
         self.assertEqual(prompt.count(feedback), 1)
         self.assertIn('Saved partial implementation', prompt)
 
+    def test_worker_prompt_allows_related_requirement_edits_but_defers_retirement(self):
+        prompt = lm.worker_prompt('docs/plans/plan.md', None)
+        self.assertNotIn('docs/requirements/ 아래 파일을 수정하거나 이동하지 마라', prompt)
+        self.assertIn('Requirement 완료 판단이나 archive 이동 권한을 포함하지 않는다', prompt)
+        self.assertIn('User Decision은 사용자를 대신해', prompt)
+        self.assertIn('docs/PLANS.md는 이번 Worker 변경 범위가 아니다', prompt)
+
     def test_normal_turn_has_no_recovery_summary_or_correction_instruction(self):
         prompt = lm.worker_prompt('docs/plans/plan.md', None)
         self.assertNotIn('새 세션에서 이어간다', prompt)

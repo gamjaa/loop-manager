@@ -202,6 +202,15 @@ class ExecutionDocumentsTests(ExecutionRecoveryScenarios, ExecutionPhaseScenario
 
 
 class CommonGuidancePrReportTests(TestCase):
+    @staticmethod
+    def explanation(path, patch, reason='Align implementation contracts', impact='Document accepted behavior'):
+        import json
+        return 'DOCUMENT_CHANGE: ' + json.dumps({
+            'path': path, 'summary': 'Replace old contract with new contract',
+            'reason': reason, 'impact': impact,
+            'patch_sha256': hashlib.sha256(patch.encode('utf-8')).hexdigest(),
+        })
+
     def test_existing_pr_push_refreshes_report_for_confirmed_head_before_merge_wait(self):
         from loop_manager_internal.execution import execution_publication_handler as publication
         context = SimpleNamespace(branch='branch', worktree=Path('/candidate'))
@@ -225,6 +234,19 @@ class CommonGuidancePrReportTests(TestCase):
         self.assertEqual(refresh.call_args.args[-2:],
                          ({'url': row['pr_url'], 'state': 'OPEN', 'headRefOid': 'confirmed-head'}, 'final report'))
         state.open_pull_request.assert_called_once()
+        ports._recover = mock.Mock(return_value='worker correction')
+        state.reset_mock()
+        with mock.patch.object(publication, 'common_guidance_report',
+                               side_effect=publication.DocumentReportError('missing New.md')), mock.patch.object(
+                publication, 'refresh_common_guidance_pr') as refresh:
+            self.assertEqual(publication.PublicationHandler(ports)._publish_existing_pull_request(
+                context, row, 'confirmed-head'), 'worker correction')
+        refresh.assert_not_called()
+        state.open_pull_request.assert_not_called()
+        state.update_project.assert_called_once_with('repo', phase='WORKING',
+            validated_base_sha=None, last_error='missing New.md')
+        self.assertEqual(ports._recover.call_args.args[0].value, 'worker_correction')
+
 
     def test_open_pr_refresh_preserves_user_body_and_removes_stale_common_report(self):
         import json
@@ -273,12 +295,12 @@ class CommonGuidancePrReportTests(TestCase):
                 def git(_worktree, *args):
                     return SimpleNamespace(stdout=names if '--name-status' in args else patch)
                 report = common_guidance_report(git, Path('/candidate'), 'a' * 40, 'b' * 40,
-                                                'git@github.com:org/project.git', '권한 경계를 보존한다.')
+                                                'git@github.com:org/project.git', self.explanation(paths[-1], patch, '권한 경계를 보존한다.', '현재 작업 규칙 보존'))
                 for value in ('docs/AGENTS.common.md', status, patch.rstrip(), '권한 경계를 보존한다.',
                               '현재 작업', '/compare/' + 'a' * 40 + '...' + 'b' * 40):
                     self.assertIn(value, report)
                 updated = common_guidance_report(git, Path('/candidate'), 'c' * 40, 'd' * 40,
-                                                 'git@github.com:org/project.git', 'Updated reason')
+                                                 'git@github.com:org/project.git', self.explanation(paths[-1], patch, 'Updated reason'))
                 self.assertNotIn('a' * 40, updated)
                 self.assertIn('d' * 40, updated)
 
@@ -294,12 +316,90 @@ class CommonGuidancePrReportTests(TestCase):
                     patch = f'diff --git a/{path} b/{paths[-1]}\n-old\n+new\n'
                     git = mock.Mock(side_effect=(SimpleNamespace(stdout=names), SimpleNamespace(stdout=patch)))
                     report = common_guidance_report(git, Path('/candidate'), 'a' * 40, 'b' * 40,
-                                                    'git@github.com:org/project.git', 'role constraints')
+                                                    'git@github.com:org/project.git', self.explanation(paths[-1], patch, 'role constraints'))
                     self.assertIn(path, report)
                     self.assertIn(status, report)
                     self.assertIn(patch.rstrip(), report)
-                    self.assertIn('#diff-' + hashlib.sha256(path.encode()).hexdigest(), report)
+                    self.assertIn('#diff-' + hashlib.sha256(paths[-1].encode()).hexdigest(), report)
                     self.assertEqual(git.call_args.args[-len(paths):], tuple(paths))
+
+    def test_multiple_documents_and_rename_to_code_use_final_per_document_diffs(self):
+        from loop_manager_internal.documents.pr_description import common_guidance_report
+        changes = [('M', ['docs/PRODUCT.md']), ('D', ['docs/requirements/Old.md']),
+                   ('R100', ['docs/plans/Old.md', 'src/new.py']),
+                   ('A', ['README.md'])]
+        names = ''.join('\0'.join([status, *paths, '']) for status, paths in changes)
+        def git(_worktree, *args):
+            if '--name-status' in args:
+                return SimpleNamespace(stdout=names)
+            paths = args[args.index('--') + 1:]
+            return SimpleNamespace(stdout='diff for ' + ' '.join(paths) + '\n-old contract\n+new contract\n')
+        for base, head in (('a' * 40, 'b' * 40), ('c' * 40, 'd' * 40)):
+            report = common_guidance_report(git, Path('/candidate'), base, head,
+                                            'git@github.com:org/project.git', '\n'.join(self.explanation(paths[-1],
+                        'diff for ' + ' '.join(paths) + '\n-old contract\n+new contract\n')
+                        for _, paths in changes))
+            for status, paths in changes:
+                self.assertIn(status + ' ' + ' → '.join(paths), report)
+                for path in paths:
+                    self.assertIn('/compare/' + base + '...' + head + '#diff-' +
+                                  hashlib.sha256(paths[-1].encode()).hexdigest(), report)
+                self.assertIn('diff for ' + ' '.join(paths), report)
+            self.assertEqual(report.count('이유·구현 영향'), len(changes))
+            self.assertEqual(report.count('문서 영향:'), len(changes))
+            self.assertEqual(report.count('주요 변경 내용: -old contract'), len(changes))
+            self.assertNotIn('AGENTS 승인', report)
+
+    def test_document_specific_worker_explanation_is_selected_without_stale_paths(self):
+        from loop_manager_internal.documents.pr_description import common_guidance_report
+        git = mock.Mock(side_effect=(SimpleNamespace(stdout='M\0docs/PRODUCT.md\0'),
+                                     SimpleNamespace(stdout='-old behavior\n+new behavior\n')))
+        report = common_guidance_report(git, Path('/candidate'), 'base', 'head',
+                                        'git@github.com:org/project.git',
+                                        self.explanation('docs/PRODUCT.md', '-old behavior\n+new behavior\n', 'preserve accepted behavior') +
+                                        '\ndocs/Old.md: stale description')
+        self.assertIn('preserve accepted behavior', report)
+        self.assertNotIn('stale description', report)
+        self.assertNotIn('docs/Old.md', report)
+
+    def test_missing_stale_and_changed_document_explanations_require_worker_correction(self):
+        from loop_manager_internal.documents.pr_description import common_guidance_report, DocumentReportError
+        patch = '-old contract\n+new contract\n'
+        for summary in (
+            'docs/Old.md: stale reason and impact',
+            self.explanation('docs/Old.md', patch),
+            self.explanation('docs/New.md', '+previous candidate\n'),
+            'DOCUMENT_CHANGE: {"path": "docs/New.md"}',
+        ):
+            with self.subTest(summary=summary):
+                git = mock.Mock(side_effect=(SimpleNamespace(stdout='M\0docs/New.md\0'),
+                                             SimpleNamespace(stdout=patch)))
+                with self.assertRaises(DocumentReportError):
+                    common_guidance_report(git, Path('/candidate'), 'base', 'head',
+                                           'git@github.com:org/project.git', summary)
+
+    def test_new_pr_missing_document_report_returns_to_worker_before_publication(self):
+        from loop_manager_internal.execution import execution_publication_handler as publication
+        from loop_manager_internal.application.contracts import WorkerResultError
+        context = SimpleNamespace(worktree=Path('/candidate'))
+        row = {'worker_result': 'result', 'validated_base_sha': 'base'}
+        state = mock.Mock()
+        ports = SimpleNamespace(
+            identity=SimpleNamespace(repo='repo'), state=state,
+            snapshot=lambda: SimpleNamespace(plan={}, catalog_plan={
+                'publication_sha': 'plan-sha', 'publication_path': 'docs/plans/Plan.md'}),
+            git=mock.Mock(return_value=SimpleNamespace(stdout='value')),
+            published_execplan=mock.Mock(), contract=SimpleNamespace(WorkerResultError=WorkerResultError),
+            parse_worker_result=lambda *_: SimpleNamespace(summary='stale description'),
+            build_pr_body=mock.Mock(), _recover=mock.Mock(return_value='worker correction'))
+        with mock.patch.object(publication, 'common_guidance_report',
+                               side_effect=publication.DocumentReportError('missing New.md')):
+            self.assertEqual(publication.PublicationHandler(ports)._publish_new_pull_request(
+                context, row), 'worker correction')
+        ports.build_pr_body.assert_not_called()
+        state.update_project.assert_called_once_with('repo', phase='WORKING',
+            validated_base_sha=None, last_error='missing New.md')
+        self.assertEqual(ports._recover.call_args.args[0].value, 'worker_correction')
 
     def test_unrelated_change_has_no_guidance_report_and_summary_is_preserved(self):
         from loop_manager_internal.documents.pr_description import common_guidance_report
@@ -307,10 +407,12 @@ class CommonGuidancePrReportTests(TestCase):
         self.assertEqual(common_guidance_report(git, Path('/candidate'), 'a' * 40, 'b' * 40,
                                                'git@github.com:org/project.git', 'summary'), '')
         git.assert_called_once()
-        worker = lm.WorkerPublication('Title', 'actual summary', 'test: PASS')
+        worker = lm.WorkerPublication('Title', 'actual summary\n' + self.explanation(
+            'docs/New.md', '+new\n'), 'test: PASS')
         body = lm.build_pr_body(worker, {'id': 'G-147', 'title': 'Guidance', 'sources': ['docs/PRODUCT.md']},
                                 'docs/plans/[G-147] Plan.md', '## Purpose\n\nKeep instructions.\n',
                                 'git@github.com:org/project.git', 'a' * 40,
                                 common_guidance_change='final common change')
         self.assertIn('actual summary', body)
         self.assertIn('final common change', body)
+        self.assertNotIn('DOCUMENT_CHANGE:', body)
