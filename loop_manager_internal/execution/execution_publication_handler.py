@@ -1,6 +1,6 @@
 """Publication execution policy and narrow typed ports."""
 from __future__ import annotations
-from loop_manager_internal.documents.pr_description import common_guidance_report, refresh_common_guidance_pr
+from loop_manager_internal.documents.pr_description import DocumentReportError, common_guidance_report, refresh_common_guidance_pr
 from loop_manager_internal.execution.execution_runtime import LatestBasePort
 from dataclasses import dataclass, replace
 from typing import Callable, Any, Mapping
@@ -520,6 +520,10 @@ class PublicationHandler:
             refresh_common_guidance_pr(self.ports.command, context.worktree,
                 self.ports.identity.state_dir,
                 {'url': row['pr_url'], 'state': 'OPEN', 'headRefOid': head_oid}, report)
+        except DocumentReportError as error:
+            self.ports.state.update_project(self.ports.identity.repo, phase='WORKING',
+                                            validated_base_sha=None, last_error=str(error))
+            return self.ports._recover(RecoveryReason.WORKER_CORRECTION, str(error), context=context)
         except RuntimeError as error:
             self.ports.state.update_project(self.ports.identity.repo, phase='PUBLISHING', last_error=str(error))
             return self.ports._recover(RecoveryReason.PUBLICATION_RETRY, str(error), context=context)
@@ -579,10 +583,15 @@ class PublicationHandler:
             )
         origin_url = self.ports.git(context.worktree, 'remote', 'get-url', 'origin').stdout.strip()
         head_sha = self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()
-        common_change = common_guidance_report(
-            self.ports.git, context.worktree, str(row['validated_base_sha']), head_sha, origin_url,
-            worker_publication.summary,
-        )
+        try:
+            common_change = common_guidance_report(
+                self.ports.git, context.worktree, str(row['validated_base_sha']), head_sha, origin_url,
+                worker_publication.summary,
+            )
+        except DocumentReportError as error:
+            self.ports.state.update_project(self.ports.identity.repo, phase='WORKING',
+                                            validated_base_sha=None, last_error=str(error))
+            return self.ports._recover(RecoveryReason.WORKER_CORRECTION, str(error), context=context)
         body = self.ports.build_pr_body(
             worker_publication,
             self.ports.snapshot().plan,

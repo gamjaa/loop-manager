@@ -590,6 +590,31 @@ class ExecPlanDraftPublicationTest(AutomationCatalogFixture, unittest.TestCase):
                         validate_agent_scope('worker', root, snapshot, snapshot,
                                              selected_plan_path=PATH, effects=effects)
 
+    def test_worker_cannot_delete_existing_plan_without_sqlite_draft_history(self):
+        from loop_manager_internal.agents.scope_contracts import GitSnapshot, AgentChange, AgentScopeError
+        from loop_manager_internal.agents.scope_validation import ScopeValidationEffects, validate_agent_scope
+        snapshot = GitSnapshot('a' * 40, 'worker', {PATH: ('H 100644 original 0',)}, {}, {}, {}, {}, {})
+        with tempfile.TemporaryDirectory() as directory:
+            root = make_catalog_root(directory)
+            for original in (accepted_text(draft_text(), 'a' * 64),
+                             plan_text('G-001', 'Decision') + '\n## Progress\n- Existing execution record\n'):
+                with self.subTest(original=original):
+                    effects = ScopeValidationEffects(
+                        _agent_git_resources=mock.Mock(), repository=mock.Mock(), _current_rebase_service=mock.Mock(),
+                        _git_common_directory=mock.Mock(), _owned_rebase_state_dir=mock.Mock(),
+                        _plan_id_from_path=lambda _: 'G-001', _rebase_in_progress_for_branch=mock.Mock(),
+                        _scope_snapshot_with_start_ignore_rules=lambda _root, _before, after: after,
+                        agent_snapshot_changes=lambda *_: [AgentChange(PATH, ('worktree',))],
+                        capture_git_snapshot=mock.Mock(), git=mock.Mock(return_value=SimpleNamespace(returncode=0, stdout=original)),
+                        operation_log=mock.Mock(), validate_managed_worktree=mock.Mock())
+                    document = root / PATH
+                    document.write_text(original, encoding='utf-8')
+                    document.unlink()
+                    with self.assertRaisesRegex(AgentScopeError, '파일 삭제'):
+                        validate_agent_scope('worker', root, snapshot, snapshot,
+                            selected_plan_path='docs/plans/[G-002] Selected.md', effects=effects)
+                    effects.git.assert_called_once_with(root, 'show', snapshot.head + ':' + PATH)
+
     def test_atomic_mixed_registration_resumes_without_duplicate_draft_or_approval(self):
         connection = self._connection()
         with tempfile.TemporaryDirectory() as directory:

@@ -37,7 +37,12 @@
   같은 Worker 세션에 전달한다.
 
 PR_SUMMARY에는 최종 diff의 문서별 경로·주요 내용·이유·제품 및 설계 영향을 설명한다. 추가·
-삭제·rename도 포함하고 rebase 뒤 실제 변경에 맞게 갱신한다. 결과는 완료한 변경·미해결 문제·
+삭제·rename도 포함하고 rebase 뒤 실제 변경에 맞게 갱신한다. 변경 문서마다 PR_SUMMARY 안에
+`DOCUMENT_CHANGE: {"path":"최종 경로","summary":"주요 변경","reason":"수정 이유","impact":"제품·설계 영향","patch_sha256":"문서 diff의 SHA-256"}`
+한 줄을 둔다. rename은 새 경로, 삭제는 원래 경로를 사용한다. hash는 Manager가 제시한 최종
+문서 patch 또는 `git diff --no-ext-diff --no-textconv --find-renames <base> <head> -- <해당 경로들>`의
+UTF-8 stdout에 결합한다. 누락·이전 후보의 설명은 현재 diff로 보완하며 모르는 의미를 추정해
+채우지 않는다. 결과는 완료한 변경·미해결 문제·
 다음 필요한 작업을 구분한다. 실제 실행하지 않은 검증을 성공으로 보고하지 않는다.
 
 ## 연결된 adapter의 테스트 작성

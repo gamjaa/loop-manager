@@ -415,8 +415,10 @@ def validate_agent_scope(
                     from loop_manager_internal.storage.execplan_draft_state import evidence
                     plan_id = effects._plan_id_from_path(change.path)
                     known = connection is not None and evidence(connection, str(external_worktree or worktree), plan_id) is not None
-                    if known or path.is_file():
+                    if known or path.is_file() or change.path in before.index:
                         previous_text = revision_document_or_none(effects.git, worktree, before.head, change.path)
+                        if previous_text and not path.is_file():
+                            raise RuntimeError("Worker는 기존 ExecPlan의 결정·실행 기록을 파일 삭제로 제거할 수 없습니다.")
                         plan = execplan_catalog.parse_execplan_text(change.path, current_text, validate_sources=False)
                         execplan_drafts.validate_agent_change(plan, previous_text)
                         if plan.get("draft") and (not previous_text or execplan_catalog.parse_frontmatter(previous_text).get("draft") != "true"):
