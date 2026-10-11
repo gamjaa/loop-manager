@@ -29,6 +29,8 @@ Manager가 안전한 원격 처리 경계에서 Requirement 중복·제목 교�
 
 G-232의 구현인 `catalog/requirement_corrections.py`의 `corrections`·`updated_documents`·`deferred`를 소비한다. 선택·식별자 편집·코드 예제 보존·rename 후 source 재검증을 다시 구현하지 않는다. 실제 tree·일반 파일·수정 권한에서 계산 입력을 수집하고 파일 적용 및 허용 diff를 검증하는 연결만 추가한다. `editable_documents`는 당시 수정 가능한 문서로 제한하며 archive·sources·User Decision과 수동 소유·실행 중 writer·PR 경계는 그대로 보호한다. 보호된 문서의 링크를 갱신할 수 없다고 그 문서의 권한을 확대하지 않는다. 기계적 교정과 R-055의 문서 삭제·목표 철회 판단은 별도 처리다.
 
+교정 진입 전에 닫힌 안전 gate·수동 Requirement source 소유는 정상 보류로 처리해 기존 수동 verify·Review·PR 복구와 독립 실행을 막지 않는다. 보존된 후보·원문·실패 이유는 유지하고 원격 관측·편집·게시를 시작하지 않는다. 진입 뒤 새 소유자나 gate 변경은 게시 전 재검사에서 실패로 보존하며 Planner 호출·성공 기록으로 바꾸지 않는다. 이 경계는 명령 관측을 mock하고 실제 SQLite·파일을 사용하는 교정 게시 unit case 및 기존 archive 안전 gate unit case에서 검사한다.
+
 ## Validation
 
 - 실제 선택·상태 저장을 실행하는 targeted unit case에서 새 참조·목적지 경합·원격 전진·push 실패·각 저장 경계 중단·원격 게시 후 DB 미확정을 검사한다. Git·PR·모델은 관측/명령 경계만 mock한다.

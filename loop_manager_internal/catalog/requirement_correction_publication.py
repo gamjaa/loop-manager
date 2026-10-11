@@ -245,9 +245,16 @@ class RequirementCorrectionPublisher:
 
     def dispatch(self, base_branch):
         self.base_branch = base_branch
+        if not self.safe():
+            return None
         repo = self.git.repo
         saved = self.repository.pending(repo)
         try:
+            # An occupied boundary is normal deferral, not a publication
+            # failure. Preserve pending candidates while independent manual
+            # work continues; observe() still checks ownership during a write.
+            if live_requirement_paths(self.connection, repo):
+                return None
             base = self.git.fetch_remote_base(base_branch)
             for confirmed in self.repository.confirmed(repo):
                 if self.git.effects.git(self.git.repo_path, 'merge-base', '--is-ancestor', confirmed['commit_oid'], base, check=False).returncode:

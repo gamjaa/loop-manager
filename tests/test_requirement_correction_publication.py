@@ -300,8 +300,7 @@ class RequirementCorrectionPublicationTest(unittest.TestCase):
             self.publisher.dispatch('main')
         self.assertEqual(self.observations.commits, 0)
         self.safe.return_value = False
-        with self.assertRaisesRegex(CorrectionPending, '안전한 처리'):
-            self.publisher.dispatch('main')
+        self.assertIsNone(self.publisher.dispatch('main'))
 
     def test_archived_plan_and_user_decision_remain_byte_identical(self):
         plan_path = 'docs/plans/archive/[G-001] Old.md'
@@ -358,8 +357,7 @@ class RequirementCorrectionPublicationTest(unittest.TestCase):
         self.connection.executescript('''CREATE TABLE manual_work_groups
             (repo TEXT,requirements TEXT,documents TEXT,state TEXT);
             INSERT INTO manual_work_groups VALUES ('repo','["docs/requirements/[R-001] A.md"]','[]','GENERATING');''')
-        with self.assertRaisesRegex(CorrectionPending, '수동 작업'):
-            self.publisher.dispatch('main')
+        self.assertIsNone(self.publisher.dispatch('main'))
         self.assertEqual(self.observations.pushes, 1)
 
     def test_confirmed_correction_allows_later_content_preserving_archive(self):
@@ -402,3 +400,48 @@ class RequirementCorrectionPublicationTest(unittest.TestCase):
             with self.assertRaisesRegex(CorrectionPending, '진단 저장 실패'):
                 self.publisher.dispatch('main')
         self.assertEqual(self.observations.pushes, 0)
+
+    def test_manual_source_ownership_defers_before_remote_observation(self):
+        self.connection.executescript('''CREATE TABLE manual_work_groups
+            (repo TEXT,requirements TEXT,documents TEXT,state TEXT);
+            INSERT INTO manual_work_groups VALUES ('repo','["docs/requirements/[R-001] A.md"]','[]','GENERATING');''')
+        with mock.patch.object(self.observations, 'fetch', side_effect=AssertionError('remote observation forbidden')):
+            self.assertIsNone(self.publisher.dispatch('main'))
+        self.assertEqual(self.observations.fetches, 0)
+        self.assertEqual((self.observations.commits, self.observations.pushes), (0, 0))
+        self.assertIsNone(self.publisher.repository.pending('repo'))
+
+    def test_manual_owner_preserves_pending_candidate_until_boundary_reopens(self):
+        self.observations.fail = 'push-rejected'
+        with self.assertRaises(CorrectionPending):
+            self.publisher.dispatch('main')
+        saved = self.publisher.repository.pending('repo')
+        workspace = self.publisher._workspace(saved['operation_id'])
+        files = self.observations.files(workspace)
+        self.connection.executescript('''CREATE TABLE manual_work_groups
+            (repo TEXT,requirements TEXT,documents TEXT,state TEXT);
+            INSERT INTO manual_work_groups VALUES ('repo','["docs/requirements/[R-001] A.md"]','[]','GENERATING');''')
+        observed = self.observations.fetches
+        self.assertIsNone(self.publisher.dispatch('main'))
+        self.assertEqual(self.publisher.repository.pending('repo'), saved)
+        self.assertEqual(self.observations.files(workspace), files)
+        self.assertEqual(self.observations.fetches, observed)
+        self.connection.execute("UPDATE manual_work_groups SET state='MERGED'")
+        self.connection.commit()
+        self.assertEqual(self.publisher.dispatch('main'), saved['commit_oid'])
+        self.assertEqual(self.observations.commits, 1)
+
+    def test_closed_initial_safety_gate_never_observes_remote_or_state_identity(self):
+        self.safe.return_value = False
+        # The closed gate also precedes the Git adapter's owner identity read.
+        port = mock.Mock()
+        publisher = RequirementCorrectionPublisher(self.connection, port, refresh=mock.Mock(), safe=self.safe)
+        self.assertIsNone(publisher.dispatch('main'))
+        port.fetch_remote_base.assert_not_called()
+        port._manifest.assert_not_called()
+
+    def test_safety_gate_closing_after_admission_remains_a_failure(self):
+        self.safe.side_effect = [True, False]
+        with self.assertRaisesRegex(CorrectionPending, '안전한 처리'):
+            self.publisher.dispatch('main')
+        self.assertEqual((self.observations.commits, self.observations.pushes), (0, 0))

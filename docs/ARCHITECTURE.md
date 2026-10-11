@@ -528,7 +528,7 @@ ExecPlan archive는 원본 hash, regular-file source, 비어 있는 destination�
 
 ### Requirement 교정 게시와 복구
 
-Requirement 교정은 PR 관계 동기화 뒤 기존 housekeeping 안전 gate 안에서 ExecPlan archive보다 먼저 실행한다. `requirement_correction_publication`은 기존 detached-worktree Git adapter·기록된 fetch·자원 lock·fast-forward push 경계를 재사용한다. 기본 checkout·Agent/verify worktree를 편집하지 않으며 미확정 Git 쓰기·종료 불명 writer·수동 source 소유·Requirement draft·planning publication이 있으면 후보를 보존하고 이번 단계를 중단한다. 교정 실패는 비차단 archive 진단으로 삼켜 Planner로 넘기지 않는다.
+Requirement 교정은 PR 관계 동기화 뒤 기존 housekeeping 안전 gate 안에서 ExecPlan archive보다 먼저 실행한다. `requirement_correction_publication`은 기존 detached-worktree Git adapter·기록된 fetch·자원 lock·fast-forward push 경계를 재사용한다. 진입 시 안전 gate가 닫혔거나 수동 source 소유가 있으면 원격 관측·편집 없이 교정만 보류하고 기존 수동 verify·Review·PR 복구와 독립 실행을 계속한다. 보존된 후보·작업물·실패 원인은 바꾸지 않으며 소유권이 비워지면 같은 후보로 재개한다. 기본 checkout·Agent/verify worktree를 편집하지 않고, 진입 뒤에는 안전 gate·미확정 Git 쓰기·종료 불명 writer·수동 source 소유·Requirement draft·planning publication을 다시 검사해 경쟁·실패 시 후보를 보존하고 이번 단계를 중단한다. 교정 실패는 비차단 archive 진단으로 삼켜 Planner로 넘기지 않는다.
 
 동일 base의 일반 blob·mode, 활성·archive Requirement, 게시·draft·archive ExecPlan의 sources, SQLite 실행·취소·draft 관계와 planning intake를 모아 G-232의 `plan_requirement_corrections`를 호출한다. 기본 branch의 first-parent 반영 이력으로 순서를 관측하고 구분 불가 순서는 계산 함수의 파일명 정렬에 맡긴다. 조회 실패를 빈 관계로 대체하지 않는다. 수정 가능 문서는 활성 Requirement와 예약되지 않은 PRODUCT·ARCHITECTURE·FUTURE_IDEAS로 한정하며 ExecPlan·archive·sources·User Decision은 보존한다.
 
