@@ -283,8 +283,8 @@ def run_codex(
     reviewer_message = ""
     reviewer_tail = ""
     reviewer_usage = ""
-    if ((persist_session and not session_id) or role_name == "reviewer"
-            or (on_process_started is not None and codex_launch is None)):
+    if ((persist_session and not session_id) or role_name == "reviewer" or
+            (codex_launch is None and (on_process_started is not None or on_process_finished is not None))):
         with log.open("w", encoding="utf-8") as output:
             output.write(fast_mode_log)
             start = codex_launch.start if codex_launch else effects._handoff_popen
@@ -359,9 +359,9 @@ def run_codex(
         with log.open("w", encoding="utf-8") as output:
             output.write(fast_mode_log)
             runner = codex_launch.run if codex_launch is not None else effects._handoff_run
-            callbacks = ({"on_process_started": on_process_started,
-                          "on_process_finished": on_process_finished}
-                         if codex_launch is not None else {})
+            process_callbacks = ({"on_process_started": on_process_started,
+                                  "on_process_finished": on_process_finished}
+                                 if codex_launch is not None else {})
             result = runner(
                 arguments,
                 input=prompt,
@@ -374,7 +374,7 @@ def run_codex(
                 cwd=worktree,
                 timeout=AGENT_CLI_TIMEOUT_SECONDS,
                 **({"launch_process": effects._handoff_popen} if codex_launch is not None else {}),
-                **callbacks,
+                **process_callbacks,
             )
         returncode = result.returncode
     try:

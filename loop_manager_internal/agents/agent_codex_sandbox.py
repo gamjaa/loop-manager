@@ -59,12 +59,14 @@ class CodexLaunch:
             return subprocess.CompletedProcess(arguments, process.returncode)
         finally:
             # Direct exec can still spawn tools. Reap the whole process group.
-            self.stop(process)
             try:
-                process.wait()
+                self.stop(process)
             finally:
-                if on_process_finished is not None:
-                    on_process_finished()
+                try:
+                    process.wait()
+                finally:
+                    if on_process_finished is not None:
+                        on_process_finished()
 
     def probe(self) -> None:
         feature_result = subprocess.run(

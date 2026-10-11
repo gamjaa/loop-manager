@@ -756,7 +756,8 @@ class ScopedPlannerTurnTests(PlanningCase):
         run.planning_worktree = Path("/tree")
         run.maintenance_context = object()
         source = TrackedSource("src/calc.py", "b" * 64, "100644", "base", "source code")
-        unit = SimpleNamespace(source=source, session_id="owner", error=None, receipt=None, index=0)
+        unit = SimpleNamespace(source=source, session_id="owner", error=None, receipt=None,
+                               manifest_id="findings-manifest", index=0)
         other = TrackedSource("src/other.py", "c" * 64, "100644", "base", "source code")
         relation = SimpleNamespace(left=source, right=other, key="relation-key")
         page = SimpleNamespace(index=0, total=1, session_id="owner", key="key", text="evidence")
