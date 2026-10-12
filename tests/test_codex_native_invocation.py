@@ -22,6 +22,15 @@ from tests.support.workspace import native_agent_boundary, pin_common_guidance, 
 
 @skipUnless(isolation.platform.system() == "Linux", "native tool policy probe requires Linux")
 class NativeWriteIsolationTests(TestCase):
+    def setUp(self):
+        # Profile/auth behavior has its own prepared-environment tests. These
+        # fixtures keep the physical sandbox/exec/handoff boundary explicit.
+        for patch in (mock.patch.object(manager, 'validate_provider_runtime'),
+                      mock.patch.object(manager, '_agent_profile',
+                          return_value=invocation.ResolvedProfile('model', 'high'))):
+            patch.start()
+            self.addCleanup(patch.stop)
+
     @staticmethod
     def reviewer_process(output, code=0):
         process = mock.Mock(pid=4321, returncode=code)
