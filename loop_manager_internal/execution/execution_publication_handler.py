@@ -61,6 +61,8 @@ class PublicationHandlerPorts:
     _retry: Callable[..., ExecutionOutcome]
     _row: Callable[[], Mapping[str, object]]
     _step_outcome: Callable[..., Any]
+    pre_review_identity: Callable[..., Any] | None = None
+    observe_verify_inputs: Callable[..., Any] | None = None
 
 
 class PublicationHandler:
@@ -228,6 +230,14 @@ class PublicationHandler:
             self.ports.identity.state_dir, self.ports.identity.repo, self.ports.state.plan_id, branch, worktree)
         self.ports.validate_managed_worktree(repo, worktree, branch)
         head = self.ports.git(worktree, 'rev-parse', 'HEAD').stdout.strip()
+        from loop_manager_internal.storage import pre_review
+        from loop_manager_internal.execution import preliminary_review
+        preliminary = pre_review.current(self.ports.state.connection, self.ports.identity.repo, self.ports.state.plan_id)
+        if preliminary and preliminary['status'] == 'finalized_reuse':
+            context = self.ports._context()
+            if (not preliminary_review.reusable(self.ports, context, preliminary)
+                    or not preliminary_review.full_evidence(self.ports, context, preliminary)):
+                raise self.ports.contract.PublicationSafetyError('게시 직전 일반 선행 Review 승인 입력을 확인할 수 없습니다.')
         if expected_oid is not None and head != expected_oid:
             raise self.ports.contract.PublicationSafetyError('게시 관측 중 관리 HEAD가 변경됐습니다.')
         if self.ports.snapshot()._definition_snapshot is not None and (
@@ -249,6 +259,19 @@ class PublicationHandler:
                 self.ports._document_guard(context, draft)
             except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
                 return self.ports._document_block(context, draft, error)
+        from loop_manager_internal.storage import pre_review, runtime_state
+        from loop_manager_internal.execution import preliminary_review
+        preliminary = pre_review.current(self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id)
+        if preliminary and preliminary['status'] == 'finalized_reuse' and (
+                not preliminary_review.reusable(self.ports, context, preliminary)
+                or not preliminary_review.full_evidence(self.ports, context, preliminary)):
+            with runtime_state._transaction(self.ports.state.connection):
+                self.ports.state.check_context(context)
+                pre_review.update(self.ports.state.connection, preliminary, 'final_review_pending')
+                self.ports.state.update_project(self.ports.identity.repo, preserve_transaction=True,
+                    phase='REVIEWING', review_token=None, publication_token=None,
+                    last_error='게시 전 일반 선행 Review 승인 근거가 변경되어 최종 검토를 다시 수행합니다.')
+            return self.ports._retry('게시 전 일반 선행 Review 승인 근거를 다시 확인합니다.')
         try:
             publication = self._publication_resume().observe(
                 self.ports.identity.repo_path, context.worktree, context.branch,

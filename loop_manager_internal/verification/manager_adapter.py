@@ -11,7 +11,7 @@ from loop_manager_internal.verification.coordination import VerifyCoordinator, d
 from loop_manager_internal.verification.timing import EventWriter, atomic_json, diagnostic, phase
 
 
-def run(effects, arguments, worktree, timeout, *, launch=None):
+def run(effects, arguments, worktree, timeout, *, launch=None, partial_base=None):
     context = settings.get()
     coordinator = context.coordinator if context else VerifyCoordinator().start()
     session, secret = coordinator.open(context.cap if context else "auto", require_guard=True)
@@ -34,6 +34,9 @@ def run(effects, arguments, worktree, timeout, *, launch=None):
                            LOOP_MANAGER_VERIFY_PARALLELISM=str(context.cap if context else "auto"),
                            LOOP_MANAGER_VERIFY_ENDPOINT=json.dumps(coordinator.endpoint),
                            LOOP_MANAGER_VERIFY_SESSION=session, LOOP_MANAGER_VERIFY_SECRET=secret)
+        environment.pop("LOOP_MANAGER_VERIFY_PARTIAL_BASE", None)
+        if partial_base:
+            environment["LOOP_MANAGER_VERIFY_PARTIAL_BASE"] = partial_base
         with phase("verify_process", writer=writer):
             passed, timed_out, output = effects.run_verify_process(
                 arguments, worktree, timeout, environment=environment, job_scope=True, on_started=started,
@@ -41,10 +44,26 @@ def run(effects, arguments, worktree, timeout, *, launch=None):
             )
         stopped = True
         details = diagnostic(directory)
+        partial_report = None
+        if partial_base:
+            from loop_manager_internal.execution.verify_process import VerifyProcessOutput
+            output = VerifyProcessOutput(str(output) + "\n" + details, exit_code=getattr(output, "exit_code", None))
+            report = directory / "partial-result.json"
+            try:
+                partial_report = json.loads(report.read_text(encoding="utf-8"))
+                if (not isinstance(partial_report, dict) or partial_report.get('run_id') != session
+                        or type(partial_report.get('version')) is not int or partial_report.get('version') != 1
+                        or partial_report.get('kind') != 'partial_verify'):
+                    raise ValueError('partial report session/version mismatch')
+            except (OSError, ValueError):
+                partial_report = {"kind": "partial_verify", "status": "ERROR", "diagnostic": str(directory)}
+            output.partial_result = partial_report
         if not passed:
             from loop_manager_internal.execution.verify_process import VerifyProcessOutput
             output = VerifyProcessOutput(str(output) + "\n" + details + f"\n[VERIFY_DIAGNOSTIC] {directory / 'summary.json'}",
                                          exit_code=getattr(output, "exit_code", None))
+            if partial_base:
+                output.partial_result = partial_report
         return passed, timed_out, output
     finally:
         try:

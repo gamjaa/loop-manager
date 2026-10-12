@@ -3,7 +3,7 @@ id: G-241
 title: 일반 verify의 입력 증명과 문서 제외 재확인
 sources:
   - docs/PRODUCT.md
-  - docs/requirements/[R-072] Reuse Successful Candidate Results with Proven Inputs.md
+  - docs/requirements/[R-072] 입력 동일성이 증명된 구현 후보 성공 결과 재사용.md
   - docs/requirements/[R-082] 단계별 원격 문서 반영과 PR 전 ExecPlan 갱신.md
 depends_on:
   - G-240
@@ -23,7 +23,7 @@ priority: high
 
 ## Acceptance Criteria
 
-- 일반 자체 verify의 실제 성공 뒤 같은 프로젝트·ExecPlan·작업 주기의 현재 입력이 같으면 전체 verify를 생략한다. 문서만의 후보와 문서 변경을 포함한 rebase 모두 지원하고 isolated compile 성공만으로 일반 verify 충족을 주장하지 않는다. 공통 runner 도입을 필수로 요구하지 않는다.
+- 일반 자체 verify의 실제 성공 뒤 같은 프로젝트·ExecPlan·작업 주기의 현재 입력이 같으면 전체 verify를 생략한다. 문서만의 후보와 문서 변경을 포함한 rebase 모두 지원하고 isolated compile 성공만으로 일반 verify 충족을 주장하지 않는다. 공통 runner 도입을 필수로 요구하지 않는다. R-086 일반 선행 PASS 뒤에는 입력이 같아도 실제 전체 run을 유지하며 부분 성공·선행 결과로 이 재사용 조건을 충족하지 않는다.
 - 실제 명령·유효 실행값/환경·interpreter/의존 runtime·Git/외부 입력과 목록 자체·파일 bytes/경로/kind/mode·미커밋/untracked를 관측한다. tree/SHA·명령 문자열·버전 이름만으로 동적 의존성 부재를 추정하지 않는다. 안전하게 측정할 수 없는 일반 스크립트/환경은 전체 verify를 실행한다.
 - 연결된 runner에서는 실제 선택 선언의 version·adapter·수집/명령 단계, 프로젝트 interpreter와 의존성, 별도로 선택된 Manager runtime의 진입점·core·adapter 및 유효 호출 context를 결합한다. venv executable 경로를 임의로 resolve해 환경을 바꾸지 않으며 run/session identity·지원 metadata·manifest 결과만으로 외부 입력 완전성을 추정하지 않는다. 인증 자료는 저장 근거·로그에 노출하지 않는다.
 - 목록 밖 문서 변경은 현재 경로·내용·실행 context·목록 입력에 결합한 제외 근거를 다시 확인한다. 실제 비영향이 증명됐으면 현재 completeness를 갱신하고 기존 성공을 비교한다. 폴더/확장자 또는 과거 token·verify PASS만으로 제외를 승인하지 않는다.
@@ -33,7 +33,7 @@ priority: high
 
 ## Implementation
 
-`verification/manager_adapter.py`·`inputs.py`, `execution/result_validation.py`·verify/revision/Review/publication handler와 기존 verify_receipts를 확장한다. 자체 검증 계약의 실제 입력을 먼저 조사하고 측정 가능한 관측 adapter와 문서 제외 재확인 책임을 분리한다. 임의 스크립트의 의존성을 모델 추측으로 확정하거나 새로운 범용 분석/캐시 서비스를 만들지 않는다. 기존 성공 token/receipt를 새 저장 체계로 중복하지 않는다. PRODUCT·ARCHITECTURE의 현재 제한된 지원과 새 증명 범위·fallback을 정합하게 반영한다.
+`verification/manager_adapter.py`·`inputs.py`, `execution/result_validation.py`·verify/revision/Review/publication handler와 기존 verify_receipts를 확장한다. 자체 검증 계약의 실제 입력을 먼저 조사하고 측정 가능한 관측 adapter와 문서 제외 재확인 책임을 분리한다. 임의 스크립트의 의존성을 모델 추측으로 확정하거나 새로운 범용 분석/캐시 서비스를 만들지 않는다. 기존 성공 token/receipt를 새 저장 체계로 중복하지 않는다. R-086 부분 결과와 preliminary_reviews는 전체 verify_receipts와 구분하며 일반 선행 승인 뒤 실제 전체 실행을 강제하는 경계를 유지한다. PRODUCT·ARCHITECTURE의 현재 제한된 지원과 새 증명 범위·fallback을 정합하게 반영한다.
 
 `scripts/verify.json`·`docs/VERIFY.md`와 `verification/contract.py`·`entrypoint.py`·`runner.py`·`core.py`·`unittest_adapter.py`의 현재 호출/수집 경계를 재사용한다. Manager runtime과 후보 프로젝트 구현을 각각 읽는 실제 경로, 실행 환경과 동적 소비자를 조사하며 공통 runner를 재구현하거나 비Python/OS 실측을 선행 완료로 요구하지 않는다. 지원 문서의 입력·재사용 한계를 구현한 증명 범위에 맞춰 갱신한다.
 
@@ -51,6 +51,8 @@ priority: high
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- 2026-10-12 사용자 요청의 문서 정합화: R-086 일반 선행 승인 뒤의 실제 전체 검증 예외를 명시했다. 부분 실행·선행 Review를 재구현하지 않고 기존 입력 증명·문서 제외 목표, dependency·metadata·기록을 보존한다. source 경로 교정은 새 계획 생성이나 완료 선언이 아니다.
 
 - complexity high: 일반 runner와 실제 외부 의존성의 완전성·환경 경계, 현재 문서 제외와 최신 완료 조건의 증명을 중단/저장 경쟁과 함께 풀어야 한다. risk high: 잘못된 reusable 판정은 필수 검증을 생략한 후보 게시로 이어지므로 불확실성 fallback·receipt 보존·최종 gate와 수동 PR 복구가 필요하다.
 - G-182의 receipt·isolated compile와 G-183의 Review 재사용을 중복 구현하지 않는다. 새 목표는 활성 R-072에 명시됐으며 Manager verify-inputs 누락 요청이 아니다. priority는 제품 작업의 high다.

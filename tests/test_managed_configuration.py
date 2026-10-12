@@ -24,6 +24,24 @@ from tests.support.git import git_command
 
 @isolated_git_test
 class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
+    def test_partial_verify_defaults_enabled_and_config_can_disable_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config.ini'
+            self.assertTrue(ManagedConfig(config, 3, '', '').verify_partial)
+            for contents in ('[loop]\n', '[telegram]\n'):
+                with self.subTest(contents=contents):
+                    config.write_text(contents)
+                    self.assertTrue(load_managed_config(config).verify_partial)
+            for value, expected in (('true', True), ('false', False), (' OFF ', False)):
+                with self.subTest(value=value):
+                    config.write_text(f'[loop]\nverify_partial={value}\n')
+                    self.assertEqual(load_managed_config(config).verify_partial, expected)
+            for value in ('maybe', ''):
+                with self.subTest(value=value):
+                    config.write_text(f'[loop]\nverify_partial={value}\n')
+                    with self.assertRaisesRegex(ManagedConfigError, 'verify_partial'):
+                        load_managed_config(config)
+
     def test_copy_project_files_runs_real_script_with_fixed_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

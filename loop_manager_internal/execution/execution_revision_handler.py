@@ -542,6 +542,8 @@ class RevisionHandler:
                                 and observed.fingerprint == reused['fingerprint'])
             except (OSError, RuntimeError, ValueError):
                 reusable_now = False
+        from loop_manager_internal.execution import preliminary_review
+        preliminary_pending = preliminary_review.active(self.ports, context, {'partial_pass', 'review_running'})
         decision = decide_revision_gate(
             phase=ExecutionPhase(str(catalog_plan['status'])).value,
             # Rows created before G-037 have valid phase artifacts but no
@@ -553,6 +555,7 @@ class RevisionHandler:
             active_base_token=active_sha,
             current_base_token=latest_sha,
             artifacts=StageArtifacts(
+                preliminary_review_pending=bool(preliminary_pending),
                 document_review_pending=bool(self.ports.checkpoint and document_revision
                     and document_revision['stage'] == 'done'
                     and document_revision.get('verification_pending')

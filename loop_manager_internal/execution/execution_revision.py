@@ -340,6 +340,7 @@ WORKER_INVALIDATING_DELTAS = frozenset(
 @dataclass(frozen=True)
 class StageArtifacts:
     document_review_pending: bool = False
+    preliminary_review_pending: bool = False
     manual_submission: bool = False
     require_worker_candidate: bool = False
     worker_candidate_token: str | None = None
@@ -417,7 +418,8 @@ def decide_revision_gate(
     expected_verify = current.verify_token(
         current_base_token, candidate_head, artifacts.verify_output,
     )
-    if target in {"REVIEWING", "PUBLISHING"} and not (target == "REVIEWING" and artifacts.document_review_pending) and (
+    if target in {"REVIEWING", "PUBLISHING"} and not (target == "REVIEWING" and (
+            artifacts.document_review_pending or artifacts.preliminary_review_pending)) and (
         not artifacts.verify_result or artifacts.verify_token != expected_verify
     ):
         target = _earlier_phase(target, "VERIFYING")

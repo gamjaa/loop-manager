@@ -58,6 +58,13 @@ def _claim_piece(
                 (event_key,),
             )
             return None
+        from .events import worker_targeted_failure
+        reason = ('worker_correction' if row[1] == 'stage_failed' and payload.get('operation') == 'Worker'
+                  else payload.get('reason_code') if row[1] == 'persistent_execution_failure' else None)
+        if worker_targeted_failure(reason, payload.get('cause')):
+            connection.execute("UPDATE notification_outbox SET canceled_at=CURRENT_TIMESTAMP, "
+                               "delivery_started_at=NULL WHERE event_key=? AND sent_at IS NULL", (event_key,))
+            return None  # Sent pieces and original diagnostics remain auditable.
         if row[1] == "draft_decision":
             from loop_manager_internal.storage import execplan_draft_state
             saved = execplan_draft_state.evidence(connection, str(row[0]), str(payload["execplan_id"]))
