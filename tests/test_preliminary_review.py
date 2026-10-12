@@ -1,6 +1,7 @@
 """Early Review and full verify keep separate evidence and existing failure gates."""
 from dataclasses import replace
 import json
+import hashlib
 from types import SimpleNamespace
 import unittest
 from unittest import mock
@@ -153,6 +154,75 @@ class PreliminaryReviewTests(ExecutionFixture, unittest.TestCase):
         self.assertIsNotNone(self.state.row()['verify_token'])
         self.review()
         self.effects.agent.run_agent.assert_called_once()
+
+    def test_production_ports_bind_current_and_invocation_observer_to_owned_context(self):
+        from pathlib import Path
+        from loop_manager_internal.agents import provider_execution
+        production = lm._ExecutionLifecyclePorts(self.connection, self.repository,
+            repo=self.repo, repo_path=Path('/repo'), state_dir=Path('/state'),
+            base='main', base_sha='base', provider='codex', config_path=Path('/config'), newly_activated=False)
+        with mock.patch.object(provider_execution, 'observe', return_value=IDENTITY) as observe, \
+             mock.patch.object(lm, 'capture_git_snapshot', return_value=SimpleNamespace(serialize=lambda: 'snapshot')), \
+             mock.patch.object(lm, '_agent_profile', return_value=lm.ResolvedProfile('model', 'high')) as resolve, \
+             mock.patch.object(lm, 'validate_provider_runtime') as validate:
+            context = self.handler._context()
+            observer = production.effects.validation.pre_review_identity
+            self.assertEqual(observer(context), IDENTITY)
+            self.assertEqual(observer(context, invocation_id='physical-invocation'), IDENTITY)
+            kwargs = observe.call_args.kwargs
+            self.assertEqual(kwargs['repo'], self.repo)
+            self.assertEqual(kwargs['plan_id'], context.plan.plan_id)
+            self.assertEqual(kwargs['worktree'], context.worktree)
+            self.assertEqual(kwargs['state_dir'], Path('/state'))
+            self.assertEqual(kwargs['invocation_id'], 'physical-invocation')
+            self.assertEqual(kwargs['snapshot_digest'](), hashlib.sha256(b'snapshot').hexdigest())
+            kwargs['resolve_profile'](Path('/config'), 'codex', 'reviewer', None, context.worktree)
+            kwargs['validate_runtime'](Path('/config'), 'codex', context.worktree)
+            resolve.assert_called_once()
+            validate.assert_called_once()
+
+    def test_production_observer_completes_cycle_with_actual_adapter_and_durable_evidence(self):
+        from pathlib import Path
+        from tests.test_provider_execution import ProviderExecutionTests
+        from tests.support.workspace import pin_common_guidance
+        from loop_manager_internal.agents.agent_invocation import InvocationContext
+        native = ProviderExecutionTests()
+        native.plan_id = 'G-047'
+        native.setUp()
+        self.addCleanup(native.doCleanups)
+        cycle = PreliminaryReviewTests()
+        cycle.repo = native.repo
+        cycle.setUp()
+        self.addCleanup(cycle.doCleanups)
+        cycle.handler.repo_path, cycle.handler.state_dir, cycle.handler.config_path = native.source, native.state, native.config
+        cycle.state.update_project(cycle.repo, worktree=str(native.worktree))
+        native.connection = cycle.connection
+        pin_common_guidance(cycle.connection, InvocationContext(cycle.repo, native.plan_id),
+            native.worktree, native.state, role='reviewer')
+        production = lm._ExecutionLifecyclePorts(cycle.connection, cycle.repository,
+            repo=cycle.repo, repo_path=native.source, state_dir=native.state,
+            base='main', base_sha='base', provider='codex', config_path=native.config, newly_activated=False)
+        cycle.effects = replace(cycle.effects, validation=replace(cycle.effects.validation,
+            pre_review_identity=production.effects.validation.pre_review_identity))
+        cycle.handler.effects = cycle.effects
+        cycle.effects.agent.run_agent.side_effect = lambda *_args, **_kwargs: native.invoke()
+        snapshot = lm.GitSnapshot('base', 'loop-manager/G-047', {}, {}, {}, {}, {}, {})
+        with mock.patch.object(lm, '_agent_profile', side_effect=native.resolve), \
+             mock.patch.object(lm, 'validate_provider_runtime', side_effect=native.validate), \
+             mock.patch.object(lm, 'capture_git_snapshot', return_value=snapshot):
+            cycle.early_pass()
+            cycle.verify()
+            cycle.review()
+        self.assertEqual(cycle.state.row()['phase'], 'PUBLISHING')
+        self.assertEqual(cycle.saved()['status'], 'finalized_reuse')
+        cycle.effects.validation.verify.assert_called_once()
+        cycle.effects.agent.run_agent.assert_called_once()
+        self.assertEqual(cycle.partial.call_count, 1)
+        completed = cycle.connection.execute('SELECT execution_status, execution_identity '
+            'FROM agent_invocations WHERE role=? AND result_kind=?', ('reviewer', 'success')).fetchall()
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(completed[0]['execution_status'], 'executed')
+        self.assertIsNotNone(completed[0]['execution_identity'])
 
     def test_changed_reviewer_policy_requires_final_reviewer_after_full_verify(self):
         self.early_pass()

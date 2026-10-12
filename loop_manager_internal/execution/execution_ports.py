@@ -160,6 +160,7 @@ class ExecutionLifecyclePortsEffects:
     _assert_mutable_ready_snapshot_current: Callable[..., object]
     git_bytes: Callable[..., bytes] | None = None
     pre_review_identity: Callable[..., object] | None = None
+    validate_provider_runtime: Callable[..., object] | None = None
 
 
 def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, connection, runtime_repository, **identity):
@@ -184,6 +185,16 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
         return (Path(identity['config_path']).is_file()
                 and load_managed_config(identity['config_path']).verify_partial
                 and dependencies.is_loop_manager_repository(worktree))
+    def partial_review_identity(context, *, invocation_id=None):
+        from loop_manager_internal.agents import provider_execution
+        from hashlib import sha256
+        return provider_execution.observe(connection, repo=identity['repo'],
+            plan_id=context.plan.plan_id, worktree=context.worktree,
+            state_dir=identity['state_dir'], config_path=identity['config_path'],
+            provider=identity['provider'], resolve_profile=dependencies._agent_profile,
+            validate_runtime=dependencies.validate_provider_runtime,
+            snapshot_digest=lambda: sha256(dependencies.capture_git_snapshot(context.worktree).serialize().encode()).hexdigest(),
+            invocation_id=invocation_id)
     def workspace_identity(state_dir, repo, plan_id, branch, worktree):
         return dependencies.validate_execplan_workspace_identity(state_dir, repo,
             manual.store.workspace_owner(repo, plan_id), branch, worktree)
@@ -269,7 +280,7 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
             partial_verify=state.bind(lambda worktree, base: dependencies.verify(
                 worktree, verify_timeout_seconds, partial_base=base),
                 name="partial_verify", connected=False, mutates=False),
-            pre_review_identity=dependencies.pre_review_identity,
+            pre_review_identity=dependencies.pre_review_identity or partial_review_identity,
             observe_verify_inputs=state.bind(
                 result_validation.observe_verify_inputs,
                 name="observe_verify_inputs", connected=False, mutates=False,

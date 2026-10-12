@@ -3943,6 +3943,7 @@ _typed_execution_command = _bind_effects(
 
 _ExecutionLifecyclePorts = _bind_effects(
     execution_ports._ExecutionLifecyclePorts, lambda: execution_ports.ExecutionLifecyclePortsEffects(
+        validate_provider_runtime=lambda *args, **kwargs: validate_provider_runtime(*args, **kwargs),
         mutable_ready_snapshot=lambda *args, **kwargs: mutable_ready_snapshot(*args, **kwargs),
         validate_planner_result=lambda *args, **kwargs: validate_planner_result(*args, **kwargs),
         _assert_mutable_ready_snapshot_current=lambda *args, **kwargs: _assert_mutable_ready_snapshot_current(*args, **kwargs),
