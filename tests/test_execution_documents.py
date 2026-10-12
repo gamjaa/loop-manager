@@ -382,8 +382,8 @@ class CommonGuidancePrReportTests(TestCase):
                 pr.refresh_common_guidance_pr(never, Path('/candidate'), Path(directory), dict(pull_request, state=state), new)
                 never.assert_not_called()
 
-    def test_final_candidate_change_facts_patch_reason_impact_and_link_are_reported(self):
-        from loop_manager_internal.documents.pr_description import common_guidance_report
+    def test_final_document_report_contains_only_filename_summary_reason_and_impact(self):
+        from loop_manager_internal.documents.pr_description import common_guidance_report, COMMON_REPORT_START, COMMON_REPORT_END
         for status in ('A', 'M', 'D', 'R100'):
             with self.subTest(status=status):
                 paths = ['docs/AGENTS.common.md', 'docs/rules.md'] if status.startswith('R') else ['docs/AGENTS.common.md']
@@ -393,18 +393,22 @@ class CommonGuidancePrReportTests(TestCase):
                     return SimpleNamespace(stdout=names if '--name-status' in args else patch)
                 report = common_guidance_report(git, Path('/candidate'), 'a' * 40, 'b' * 40,
                                                 'git@github.com:org/project.git', self.explanation(paths[-1], patch, '권한 경계를 보존한다.', '현재 작업 규칙 보존'))
-                for value in ('docs/AGENTS.common.md', status, patch.rstrip(), '권한 경계를 보존한다.',
-                              '현재 작업', '/compare/' + 'a' * 40 + '...' + 'b' * 40):
-                    self.assertIn(value, report)
+                self.assertEqual(report, '\n'.join([
+                    COMMON_REPORT_START, '## 최종 문서 변경', '',
+                    '### ' + ' → '.join(paths), '',
+                    '- 변경 요약: Replace old contract with new contract',
+                    '- 이유: 권한 경계를 보존한다.',
+                    '- 영향: 현재 작업 규칙 보존', '', COMMON_REPORT_END,
+                ]))
                 updated = common_guidance_report(git, Path('/candidate'), 'c' * 40, 'd' * 40,
                                                  'git@github.com:org/project.git', self.explanation(paths[-1], patch, 'Updated reason'))
                 self.assertNotIn('a' * 40, updated)
-                self.assertIn('d' * 40, updated)
+                self.assertIn('Updated reason', updated)
+                self.assertNotIn('d' * 40, updated)
 
-    def test_role_instruction_changes_are_reported_with_renames_and_final_diff(self):
+    def test_role_instruction_changes_are_reported_with_renames_and_validated_diff(self):
         from loop_manager_internal.agents.common_guidance import ROLE_PATHS
         from loop_manager_internal.documents.pr_description import common_guidance_report
-        import hashlib
         for path in set(ROLE_PATHS.values()):
             for status in ('A', 'M', 'D', 'R100'):
                 with self.subTest(path=path, status=status):
@@ -415,9 +419,9 @@ class CommonGuidancePrReportTests(TestCase):
                     report = common_guidance_report(git, Path('/candidate'), 'a' * 40, 'b' * 40,
                                                     'git@github.com:org/project.git', self.explanation(paths[-1], patch, 'role constraints'))
                     self.assertIn(path, report)
-                    self.assertIn(status, report)
-                    self.assertIn(patch.rstrip(), report)
-                    self.assertIn('#diff-' + hashlib.sha256(paths[-1].encode()).hexdigest(), report)
+                    self.assertIn('role constraints', report)
+                    self.assertNotIn(patch.rstrip(), report)
+                    self.assertNotIn('#diff-', report)
                     self.assertEqual(git.call_args.args[-len(paths):], tuple(paths))
 
     def test_multiple_documents_and_rename_to_code_use_final_per_document_diffs(self):
@@ -437,14 +441,15 @@ class CommonGuidancePrReportTests(TestCase):
                         'diff for ' + ' '.join(paths) + '\n-old contract\n+new contract\n')
                         for _, paths in changes))
             for status, paths in changes:
-                self.assertIn(status + ' ' + ' → '.join(paths), report)
+                self.assertIn('### ' + ' → '.join(paths), report)
                 for path in paths:
-                    self.assertIn('/compare/' + base + '...' + head + '#diff-' +
-                                  hashlib.sha256(paths[-1].encode()).hexdigest(), report)
-                self.assertIn('diff for ' + ' '.join(paths), report)
-            self.assertEqual(report.count('이유·구현 영향'), len(changes))
-            self.assertEqual(report.count('문서 영향:'), len(changes))
-            self.assertEqual(report.count('주요 변경 내용: -old contract'), len(changes))
+                    self.assertIn(path, report)
+                self.assertNotIn('diff for ' + ' '.join(paths), report)
+            self.assertEqual(report.count('- 변경 요약:'), len(changes))
+            self.assertEqual(report.count('- 이유:'), len(changes))
+            self.assertEqual(report.count('- 영향:'), len(changes))
+            for excluded in ('/compare/', '#diff-', '<details>', '```', '-old contract', '+new contract', 'patch_sha256'):
+                self.assertNotIn(excluded, report)
             self.assertNotIn('AGENTS 승인', report)
 
     def test_document_specific_worker_explanation_is_selected_without_stale_paths(self):

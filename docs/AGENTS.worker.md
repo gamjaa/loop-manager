@@ -36,14 +36,15 @@
   전체 verify는 직접 실행하지 않는다. Manager가 Agent 밖에서 실행하며 실패 출력만
   같은 Worker 세션에 전달한다.
 
-PR_SUMMARY에는 최종 diff의 문서별 경로·주요 내용·이유·제품 및 설계 영향을 설명한다. 추가·
+PR_SUMMARY에는 최종 diff의 문서별 경로·변경 요약·이유·제품 및 설계 영향을 설명한다. 추가·
 삭제·rename도 포함하고 rebase 뒤 실제 변경에 맞게 갱신한다. 변경 문서마다 PR_SUMMARY 안에
 `DOCUMENT_CHANGE: {"path":"최종 경로","summary":"주요 변경","reason":"수정 이유","impact":"제품·설계 영향","patch_sha256":"문서 diff의 SHA-256"}`
 한 줄을 둔다. rename은 새 경로, 삭제는 원래 경로를 사용한다. hash는 Manager가 제시한 최종
 문서 patch 또는 `git diff --no-ext-diff --no-textconv --find-renames <base> <head> -- <해당 경로들>`의
 UTF-8 stdout에 결합한다. 누락·이전 후보의 설명은 현재 diff로 보완하며 모르는 의미를 추정해
-채우지 않는다. 교정 후 최종 응답에도 변경 문서 전체의 DOCUMENT_CHANGE를 함께 제출하며
-유효한 다른 문서의 설명을 빼지 않는다. 결과는 완료한 변경·미해결 문제·
+채우지 않는다. PR 본문용 설명은 파일명·변경 요약·이유·영향으로 한정하고 실제 변경 내용·patch·
+diff 링크는 넣지 않는다. patch_sha256은 Manager 검증용이다. 교정 후 최종 응답에도 변경 문서
+전체의 DOCUMENT_CHANGE를 함께 제출하며 유효한 다른 문서의 설명을 빼지 않는다. 결과는 완료한 변경·미해결 문제·
 다음 필요한 작업을 구분한다. 실제 실행하지 않은 검증을 성공으로 보고하지 않는다.
 
 ## 연결된 adapter의 테스트 작성

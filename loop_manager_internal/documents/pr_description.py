@@ -6,9 +6,7 @@ from loop_manager_internal.application.contracts import WorkerPublication
 from pathlib import Path
 import hashlib
 import json
-import re
 import tempfile
-from loop_manager_internal.git.git_adapter import github_repository
 
 class DocumentReportError(RuntimeError):
     """The final diff needs a corrected Worker document explanation."""
@@ -56,33 +54,20 @@ def common_guidance_report(git, worktree: Path, base_sha: str, head_sha: str,
         errors.append("최종 diff에 없는 DOCUMENT_CHANGE를 제거하라: " + ", ".join(sorted(stale)))
     report = [COMMON_REPORT_START, "## 최종 문서 변경", ""]
     required = []
-    for status, paths in changes:
+    for _, paths in changes:
         patch = git(worktree, "diff", "--no-ext-diff", "--no-textconv", "--find-renames",
                     base_sha, head_sha, "--", *paths).stdout
-        anchor = hashlib.sha256(paths[-1].encode()).hexdigest()
         explanation = explanations.get(paths[-1])
         patch_hash = hashlib.sha256(patch.encode("utf-8")).hexdigest()
         required.append(f"{paths[-1]}; patch_sha256={patch_hash}")
         if explanation is None or explanation["patch_sha256"] != patch_hash:
             errors.append(f"최종 문서 설명 누락 또는 patch 변경: {paths[-1]}")
             continue
-        url = "https://github.com/" + github_repository(origin_url)
-        links = ", ".join(
-            f"[{path}]({url}/compare/{base_sha}...{head_sha}#diff-{anchor})"
-            for path in paths)
-        content = "\n".join(line for line in patch.splitlines()
-                            if line.startswith(("+", "-")) and not line.startswith(("+++", "---")))
-        # ponytail: The 800-character preview is a navigation aid; the full patch follows.
-        fence = "`" * max(3, 1 + max((len(m[0]) for m in re.finditer(r"`+", patch)), default=0))
         report.extend([
-            f"### {status} {' → '.join(paths)}", "",
-            f"- 주요 변경 요약: {explanation['summary']}",
-            f"- 이유·구현 영향 (Worker Summary): {explanation['reason']}",
-            f"- 주요 변경 내용: {content[:800] or '경로 또는 파일 모드 변경 (아래 diff 참조)'}",
-            f"- 문서 영향: {explanation['impact']}",
-            f"- 최종 문서 diff: {links}", "",
-            "<details><summary>주요 변경 내용: 최종 후보의 실제 문서 diff</summary>", "",
-            fence + "diff", patch.rstrip(), fence, "", "</details>", "",
+            f"### {' → '.join(paths)}", "",
+            f"- 변경 요약: {explanation['summary']}",
+            f"- 이유: {explanation['reason']}",
+            f"- 영향: {explanation['impact']}", "",
         ])
     if errors:
         raise DocumentReportError("\n".join([
