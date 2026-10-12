@@ -586,6 +586,23 @@ class DocumentDraftTest(unittest.TestCase):
             'DOCUMENT_DRAFT_RESULT: {"status":"uncertain","reason":"Policy meaning unclear"}'
         ))
 
+    def test_self_only_cli_and_pr_open_ownership_gate(self):
+        args = loop_manager.build_parser().parse_args([
+            "document-drafts", str(self.repo), "list",
+        ])
+        with mock.patch.object(loop_manager, "is_loop_manager_repository", return_value=False), \
+             self.assertRaises(document_drafts.DocumentDraftError):
+            loop_manager._document_drafts_command(args, self.root, self.root / "config.ini")
+        self.database.execute(
+            "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, "
+            "priority, content_hash, status) VALUES (?, 'G-201', 'docs/plans/G-201.md', "
+            "'Open PR', '[]', '[]', 'normal', 'hash', 'PR_OPEN')",
+            (str(self.repo),),
+        )
+        with self.assertRaises(document_drafts.DocumentDraftError):
+            self._create()
+
+class GeneratedDraftParserTest(unittest.TestCase):
     def test_generated_draft_uses_tagged_json_without_normalizing_content(self):
         proposal = "# Product\r\n\r\nRule: DOCUMENT_DRAFT_RESULT: text.\r\n"
         evidence = "Meaning remains unchanged."
@@ -614,6 +631,10 @@ class DocumentDraftTest(unittest.TestCase):
             '"status":"candidate","content":"# Product\\n",'
             '"meaning_evidence":"Meaning remains unchanged."}',
             "DOCUMENT_DRAFT_RESULT: {not json}",
+            'DOCUMENT_DRAFT_RESULT: {"status":"candidate","content":[],"meaning_evidence":"Meaning remains unchanged."}',
+            'DOCUMENT_DRAFT_RESULT: {"status":"candidate","content":"# Product\\n","meaning_evidence":3}',
+            'DOCUMENT_DRAFT_RESULT: {"status":"candidate","content":"# Product\\n"}',
+            'DOCUMENT_DRAFT_RESULT: {"status":"uncertain","reason":"Cannot establish preservation.","content":"# Product\\n"}',
         )
         for output in invalid:
             with self.subTest(output=output[:50]), self.assertRaises(
@@ -625,44 +646,167 @@ class DocumentDraftTest(unittest.TestCase):
             document_drafts.parse_generated_draft(
                 'DOCUMENT_DRAFT_RESULT: {"status":"uncertain","reason":" "}'
             )
-        too_large = "x" * 2_100_001
+        exact_limit = (
+            '{"status":"uncertain","reason":"'
+            + "x" * (2_100_000 - len('{"status":"uncertain","reason":""}'))
+            + '"}'
+        )
+        self.assertEqual(len(exact_limit.encode("utf-8")), 2_100_000)
+        self.assertIsNone(document_drafts.parse_generated_draft(
+            "DOCUMENT_DRAFT_RESULT: " + exact_limit,
+        ))
+        above_limit = exact_limit[:-2] + '界"}'
+        self.assertGreater(len(above_limit.encode("utf-8")), 2_100_000)
         with self.assertRaises(document_drafts.DocumentDraftError):
             document_drafts.parse_generated_draft(
-                "DOCUMENT_DRAFT_RESULT: " + json.dumps({
-                    "status": "uncertain", "reason": too_large,
-                })
+                "DOCUMENT_DRAFT_RESULT: " + above_limit,
             )
 
+
+class GeneratedDraftCommandTest(unittest.TestCase):
+    def _setUpDatabase(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.database_path = Path(self.temporary.name) / "state.db"
+        self.database = sqlite3.connect(self.database_path)
+        self.addCleanup(self.database.close)
+        self.database.row_factory = sqlite3.Row
+        self.database.executescript(loop_manager.SCHEMA)
+        loop_manager._ensure_execplans_schema(self.database)
+        self.repository = Path("/repo")
+        self.repo = str(self.repository)
+        self.database.execute(
+            "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+            (self.repo,),
+        )
+        state = maintenance_state.MaintenanceRepository(self.database)
+        cycle, _ = state.begin_assessment_if_due(self.repo, 5, "a" * 40,
+                                                  self_repository=True)
+        report = {
+            "source_revision": "a" * 40,
+            "coverage": {key: "Reviewed." for key in ("code", "tests", "documents")},
+            "findings": [{
+                "id": "doc-product", "kind": "document", "path": "docs/PRODUCT.md",
+                "evidence": "Duplicate wording can be removed.", "status": "candidate",
+                "plan_ids": [], "source_hash": hashlib.sha256(b"# Original\n").hexdigest(),
+            }],
+        }
+        state.record_full_assessment(
+            self.repo, expected_revision=cycle.revision, source_sha="a" * 40,
+            result=json.dumps(report),
+        )
+        state.advance_success_baseline(
+            self.repo, expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+            expected_revision=cycle.revision, remote_commit="a" * 40,
+        )
+        self.drafts = document_drafts.DocumentDraftRepository(self.database)
+
+    def _command_connection(self, _state_dir):
+        connection = sqlite3.connect(self.database_path)
+        connection.row_factory = sqlite3.Row
+        return connection
+
+    def test_invalid_and_uncertain_generation_leave_drafts_and_decisions_untouched(self):
+        self._setUpDatabase()
+        with mock.patch.object(document_drafts, "remote_revision", return_value="c" * 40), \
+             mock.patch.object(document_drafts, "document_at", side_effect=lambda _repo, revision, _path: (
+                 revision, b"# Original\n" if revision == "a" * 40 else b"# Previous\n",
+             )), \
+             mock.patch.object(document_drafts, "checked_source_relationships", return_value="[]"):
+            pending = self.drafts.create(
+                self.repo, self.repository, "main", "docs/PRODUCT.md", b"# Pending\n",
+                "A sufficiently specific existing meaning preservation statement.",
+            )
+        self.drafts.decide(
+            pending.draft_id, pending.proposed_hash, "reject",
+            self.repository, "main",
+        )
+        self.database.commit()
+        before = tuple(tuple(row) for row in self.database.execute(
+            "SELECT draft_id, proposed_hash, state, requested_decision, decision_revision "
+            "FROM document_drafts ORDER BY draft_id",
+        ))
+        for response, uncertain in (
+            ('DOCUMENT_DRAFT_RESULT: {"status":"uncertain","reason":"Meaning cannot be established."}', True),
+            ('DOCUMENT_DRAFT_RESULT: {"status":"candidate","content":false,"meaning_evidence":"Enough evidence."}', False),
+            ('DOCUMENT_DRAFT_RESULT: {"status":"candidate","content":"# Proposed\\n","meaning_evidence":"Enough evidence."} trailing', False),
+            ('DOCUMENT_DRAFT_RESULT: {"status":"uncertain","reason":"Meaning cannot be established."}\nDOCUMENT_DRAFT_RESULT: {}', False),
+        ):
+            args = loop_manager.build_parser().parse_args([
+                "document-drafts", self.repo, "generate", "docs/PRODUCT.md",
+            ])
+            with mock.patch.object(loop_manager, "is_loop_manager_repository", return_value=True), \
+                 mock.patch.object(loop_manager, "connect_database", side_effect=self._command_connection), \
+                 mock.patch.object(loop_manager, "_recorded_base_fetch", return_value="base"), \
+                 mock.patch.object(loop_manager, "run_agent", return_value=(0, response)), \
+                 mock.patch.object(document_drafts, "remote_revision", return_value="a" * 40), \
+                 mock.patch.object(document_drafts, "document_at", return_value=("a" * 40, b"# Original\n")), \
+                 mock.patch.object(document_drafts, "checked_source_relationships", return_value="[]"), \
+                 mock.patch.object(loop_manager, "operation_print") as printed:
+                if uncertain:
+                    self.assertEqual(loop_manager._document_drafts_command(
+                        args, Path("/state"), Path("/config"),
+                    ), 0)
+                    printed.assert_called_once()
+                else:
+                    with self.assertRaises(document_drafts.DocumentDraftError):
+                        loop_manager._document_drafts_command(
+                            args, Path("/state"), Path("/config"),
+                        )
+            after = tuple(tuple(row) for row in self.database.execute(
+                "SELECT draft_id, proposed_hash, state, requested_decision, decision_revision "
+                "FROM document_drafts ORDER BY draft_id",
+            ))
+            self.assertEqual(after, before)
+
+class GeneratedDraftStorageTest(unittest.TestCase):
     def test_generated_candidate_persists_exact_bytes_and_hash(self):
+        database = sqlite3.connect(":memory:")
+        self.addCleanup(database.close)
+        database.row_factory = sqlite3.Row
+        database.executescript(loop_manager.SCHEMA)
+        loop_manager._ensure_execplans_schema(database)
+        repo = "/repo"
+        database.execute(
+            "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')", (repo,),
+        )
+        state = maintenance_state.MaintenanceRepository(database)
+        cycle, _ = state.begin_assessment_if_due(repo, 5, "a" * 40,
+                                                 self_repository=True)
+        original = b"# Original\n"
+        report = {
+            "source_revision": "a" * 40,
+            "coverage": {key: "Reviewed." for key in ("code", "tests", "documents")},
+            "findings": [{
+                "id": "doc-product", "kind": "document", "path": "docs/PRODUCT.md",
+                "evidence": "Duplicate wording can be removed.", "status": "candidate",
+                "plan_ids": [], "source_hash": hashlib.sha256(original).hexdigest(),
+            }],
+        }
+        state.record_full_assessment(
+            repo, expected_revision=cycle.revision, source_sha="a" * 40,
+            result=json.dumps(report),
+        )
+        state.advance_success_baseline(
+            repo, expected_phase=maintenance_state.MaintenancePhase.ASSESSMENT,
+            expected_revision=cycle.revision, remote_commit="a" * 40,
+        )
+        drafts = document_drafts.DocumentDraftRepository(database)
         proposal = b"# Product\r\n\r\nRule.\r\n"
         response = "DOCUMENT_DRAFT_RESULT: " + json.dumps({
             "status": "candidate", "content": proposal.decode("utf-8"),
             "meaning_evidence": "Only duplicate wording changed; behavior is unchanged.",
         })
-        content, evidence = document_drafts.parse_generated_draft(response)
-        draft = self.drafts.create(
-            str(self.repo), self.repo, "main", "docs/PRODUCT.md", content, evidence,
-        )
-        stored = self.drafts.get(draft.draft_id)
+        with mock.patch.object(document_drafts, "remote_revision", return_value="a" * 40), \
+             mock.patch.object(document_drafts, "document_at", return_value=("a" * 40, original)), \
+             mock.patch.object(document_drafts, "checked_source_relationships", return_value="[]"):
+            content, evidence = document_drafts.parse_generated_draft(response)
+            draft = drafts.create(
+                repo, Path("/repo"), "main", "docs/PRODUCT.md", content, evidence,
+            )
+        stored = drafts.get(draft.draft_id)
         self.assertEqual(stored.proposed_content, proposal)
         self.assertEqual(stored.proposed_hash, hashlib.sha256(proposal).hexdigest())
-
-    def test_self_only_cli_and_pr_open_ownership_gate(self):
-        args = loop_manager.build_parser().parse_args([
-            "document-drafts", str(self.repo), "list",
-        ])
-        with mock.patch.object(loop_manager, "is_loop_manager_repository", return_value=False), \
-             self.assertRaises(document_drafts.DocumentDraftError):
-            loop_manager._document_drafts_command(args, self.root, self.root / "config.ini")
-        self.database.execute(
-            "INSERT INTO exec_plans (repo, plan_id, path, title, sources, depends_on, "
-            "priority, content_hash, status) VALUES (?, 'G-201', 'docs/plans/G-201.md', "
-            "'Open PR', '[]', '[]', 'normal', 'hash', 'PR_OPEN')",
-            (str(self.repo),),
-        )
-        with self.assertRaises(document_drafts.DocumentDraftError):
-            self._create()
-
 
 class MaintenanceTransactionTest(unittest.TestCase):
     def test_read_then_write_reserves_writer_before_competing_project(self):
