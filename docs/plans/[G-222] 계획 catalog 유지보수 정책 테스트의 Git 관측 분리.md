@@ -31,6 +31,19 @@ priority: normal
 - 실제 Git을 유지하는 대상의 직접 subprocess·운영 Git adapter 호출과 필요한 자식이 G-224의 격리 환경을 이어받는지 대조하고 누락된 소비 경계에 적용한다. 격리 helper를 중복 구현하지 않으며 명시적인 설정 입력과 revision tree·게시·archive·원격 경쟁의 effect assertion을 보존한다.
 - assertion 대응과 실제 Git 유지 이유를 대상 테스트 또는 계획의 검증 기록에 남긴다. ARCHITECTURE의 자체 테스트 Git 경계와 AGENTS.md를 따르며 운영 정책·기존 미결정 draft를 변경하지 않는다.
 
+## Git Boundary Mapping
+
+| Test ID | Boundary and input | Preserved assertion or actual Git effect |
+|---|---|---|
+| `PlanningFingerprintTest.test_planner_no_change_saves_fingerprint_and_skip_gate_uses_it` | FakeGitPort supplies the pinned base and unchanged planning/specification fingerprints; production SQLite storage persists the completed fingerprint. `subprocess.run` and `Popen` reject process use. | The real `PlanningLifecycleCoordinator` returns `FINGERPRINT_SKIPPED`, leaves the stored SQLite values intact, and does not call the Agent. The changed-input planner invocation remains covered by `PlanningSelectionTest.test_remote_input_identity_controls_completed_result_reuse_after_pause`. |
+| `BoundedGitChangeContextTest.test_nonancestor_and_missing_baselines_return_diagnostic_errors` → `MaintenanceObservationFailureTests.test_nonancestor_and_missing_baseline_observations_return_diagnostic_errors` | Explicit `_git` results model a present remote, a present sibling baseline with a confirmed non-ancestor result, and an absent baseline. Unexpected observations and subprocesses fail. | The real classification keeps non-ancestor and missing-history diagnostics distinct from operational observation failure. |
+| `BoundedGitChangeContextTest.test_oversized_git_failure_is_not_misreported_as_truncation` | Explicit remote/ref/baseline/revision-list observations and a failed bounded-output result marked overflow. Unexpected observations and subprocesses fail. | The real error path reports failure without claiming the context was truncated. |
+| `PlanningFingerprintTest.test_planning_input_fingerprint_uses_origin_tree_and_input_boundary`; `PlanningFingerprintTest.test_planning_input_fingerprint_includes_gitlink_commit` | Real Git revision tree, blob and gitlink semantics. | Keep actual tree/blob boundary, detached HEAD versus origin revision, and gitlink object-type effects. |
+| `PlanningFingerprintTest.test_requirement_archive_move_does_not_run_planner` | Real active-to-archive file move and published revision. | Keep file preservation and processed revision assertions across the real archive move. |
+| `BoundedGitChangeContextTest.test_normal_empty_and_bounded_remote_ranges_do_not_change_worktree`; `BoundedGitChangeContextTest.test_git_capture_bounds_actual_stdout_and_stderr_without_temp_spooling` | Real commit graph, paths, worktree and bounded process pipes. | Keep ordered range/path results, byte/commit limits, unchanged HEAD/index/worktree, and actual stdout/stderr capture behavior. |
+
+실제 Git을 사용하는 대상 class에는 `tests.support.git.isolated_git_test`를 적용해 seed·직접 subprocess·운영 adapter와 필요한 자식이 같은 격리 환경을 상속하게 했다. global/system 설정과 template은 제외하고 저장소 local 설정은 보존한다. 나머지 테스트의 현재 Git effect assertion은 변경하지 않았다.
+
 ## Validation
 
 - Worker는 변경한 최소 targeted unit case를 실행한다. no-change/관련 입력 변화의 Planner 호출·SQLite 지문, 비조상/이력 부재/명령 오류 구분, catalog/draft/dependency와 유지보수 실패 시 보존을 실제 판단으로 확인하고 해당 unit에서 예상 밖 subprocess를 거부한다.
@@ -42,8 +55,9 @@ priority: normal
 
 - [x] 2026-10-08 f3ae228의 R-080 전문·설계 경계·기존 관측 fixture·변경 diff와 위의 남은 실제 Git 정책 case를 정적으로 확인했다. 구현·테스트 실행은 하지 않았다.
 - [x] 2026-10-10 사용자 요청으로 갱신된 R-080의 Git 환경 격리·Git 실행 0회·비용 측정 조건을 대조하고 G-224 소비 범위와 선행 Merge를 문서에 반영했다. 구현·테스트·성능 측정은 하지 않았다.
-- [ ] case 대응·관측 mock 전환과 targeted unit 검증
+- [x] 2026-10-12 case 대응·관측 mock 전환과 targeted unit 검증
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
+- [ ] 같은 환경·범위의 Git 호출·모듈 경과 비용 전후 비교와 Manager 전체 verify 근거 연결
 
 ## Decision Log
 

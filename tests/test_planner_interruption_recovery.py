@@ -9,12 +9,13 @@ from unittest import mock
 import loop_manager
 from tests.support.profiles import profile_config
 from tests.support.catalog import write_execplan
-from tests.support.git import make_remote_repository
+from tests.support.git import make_remote_repository, isolated_git_test
 from tests.support.worker import dummy_worker_sessions
 from loop_manager_internal.agents import provider_guidance
 from tests.support.workspace import native_developer_texts
 
 
+@isolated_git_test
 class PlannerInterruptionRecoveryTest(unittest.TestCase):
     @dummy_worker_sessions
     def test_planner_commit_failure_preserves_valid_result_without_retry_penalty(self):

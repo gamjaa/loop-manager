@@ -7,10 +7,11 @@ import loop_manager
 from tests.support.catalog import write_execplan, make_catalog_root, planner_git_observations
 from tests.support.scope import snapshot
 from dataclasses import replace
-from tests.support.git import git_command, make_remote_repository, commit_and_push
+from tests.support.git import git_command, make_remote_repository, commit_and_push, isolated_git_test
 from tests.support.worker import dummy_worker_sessions
 
 
+@isolated_git_test
 class PlannerFutureIdeasTest(unittest.TestCase):
     def test_prompt_separates_future_ideas_from_current_execplans(self):
         prompt = loop_manager.planner_prompt(None)

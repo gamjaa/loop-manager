@@ -14,6 +14,7 @@ from loop_manager_internal.planning.planning_rebase import (
 )
 from loop_manager_internal.planning.planning_document_relevance import relevant_document_changes
 from tests.support.catalog import execplan_header, write_execplan
+from tests.support.git import isolated_git_test
 
 
 class PlanningGitDouble:
@@ -621,6 +622,7 @@ class PlanningDocumentRelevanceTest(unittest.TestCase):
             ), ())
 
 
+@isolated_git_test
 class PlanningRebaseGitBoundaryTest(unittest.TestCase):
     def test_correction_resumes_after_stage_or_reset_without_repeating_planner(self):
         from loop_manager_internal.planning import planning_rebase

@@ -11,6 +11,7 @@ import unittest
 from unittest import mock
 
 import loop_manager
+from tests.support.git import isolated_git_test
 from loop_manager_internal.storage import maintenance_state, planning_publication_state, planning_input_state
 from loop_manager_internal.maintenance.maintenance_planning import PlanRevision, ReadyPlanSnapshot
 from loop_manager_internal.planning.planning_catalog import PlanDeletion, MutableReadySnapshot, mutable_snapshot_token
@@ -70,6 +71,7 @@ Implement {title}.
 """
 
 
+@isolated_git_test
 class IncrementalPlanningCatalogTest(unittest.TestCase):
     def setUp(self):
         use_fixed_guidance(self)

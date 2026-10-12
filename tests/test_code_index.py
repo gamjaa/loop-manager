@@ -8,8 +8,10 @@ import unittest
 from loop_manager_internal.maintenance import code_index
 from tests.support.maintenance import inventory
 from tests.support.workspace import symlink_or_skip
+from tests.support.git import isolated_git_test
 
 
+@isolated_git_test
 class CodeIndexTest(unittest.TestCase):
     def setUp(self):
         self.connection = sqlite3.connect(":memory:")

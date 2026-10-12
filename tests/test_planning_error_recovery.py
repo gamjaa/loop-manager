@@ -13,11 +13,13 @@ from tests.support.git import (
     make_remote_repository,
     commit_and_push,
     advance_remote_file,
+    isolated_git_test,
 )
 from tests.support.worker import isolated_scope_resources
 from tests.support.worker import dummy_worker_sessions
 
 
+@isolated_git_test
 class PlanningErrorRecoveryTest(unittest.TestCase):
     def test_ignored_scope_error_restarts_same_input_without_repeating_planner(self):
         from dataclasses import replace
