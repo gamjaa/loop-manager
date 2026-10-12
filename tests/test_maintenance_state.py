@@ -586,6 +586,67 @@ class DocumentDraftTest(unittest.TestCase):
             'DOCUMENT_DRAFT_RESULT: {"status":"uncertain","reason":"Policy meaning unclear"}'
         ))
 
+    def test_generated_draft_uses_tagged_json_without_normalizing_content(self):
+        proposal = "# Product\r\n\r\nRule: DOCUMENT_DRAFT_RESULT: text.\r\n"
+        evidence = "Meaning remains unchanged."
+        outputs = (
+            "DOCUMENT_DRAFT_RESULT: " + json.dumps({
+                "status": "candidate", "content": proposal,
+                "meaning_evidence": evidence,
+            }),
+            "**DOCUMENT_DRAFT_RESULT**: ```json\n" + json.dumps({
+                "status": "candidate", "content": proposal,
+                "meaning_evidence": evidence,
+            }, indent=2) + "\n```",
+        )
+        expected = (proposal.encode("utf-8"), evidence)
+        for output in outputs:
+            with self.subTest(output=output[:40]):
+                self.assertEqual(document_drafts.parse_generated_draft(output), expected)
+
+        invalid = (
+            outputs[0] + "\nDOCUMENT_DRAFT_RESULT: {}",
+            'DOCUMENT_DRAFT_RESULT: {"status":"candidate","status":"uncertain",'
+            '"content":"# Product\\n","meaning_evidence":"Meaning remains unchanged."}',
+            'DOCUMENT_DRAFT_RESULT: {"status":"candidate","content":"# Product\\n",'
+            '"content":"# Alternative\\n","meaning_evidence":"Meaning remains unchanged."}',
+            'DOCUMENT_DRAFT_RESULT: {"status":"uncertain","reason":"Unknown",'
+            '"status":"candidate","content":"# Product\\n",'
+            '"meaning_evidence":"Meaning remains unchanged."}',
+            "DOCUMENT_DRAFT_RESULT: {not json}",
+        )
+        for output in invalid:
+            with self.subTest(output=output[:50]), self.assertRaises(
+                document_drafts.DocumentDraftError,
+            ):
+                document_drafts.parse_generated_draft(output)
+
+        with self.assertRaises(document_drafts.DocumentDraftError):
+            document_drafts.parse_generated_draft(
+                'DOCUMENT_DRAFT_RESULT: {"status":"uncertain","reason":" "}'
+            )
+        too_large = "x" * 2_100_001
+        with self.assertRaises(document_drafts.DocumentDraftError):
+            document_drafts.parse_generated_draft(
+                "DOCUMENT_DRAFT_RESULT: " + json.dumps({
+                    "status": "uncertain", "reason": too_large,
+                })
+            )
+
+    def test_generated_candidate_persists_exact_bytes_and_hash(self):
+        proposal = b"# Product\r\n\r\nRule.\r\n"
+        response = "DOCUMENT_DRAFT_RESULT: " + json.dumps({
+            "status": "candidate", "content": proposal.decode("utf-8"),
+            "meaning_evidence": "Only duplicate wording changed; behavior is unchanged.",
+        })
+        content, evidence = document_drafts.parse_generated_draft(response)
+        draft = self.drafts.create(
+            str(self.repo), self.repo, "main", "docs/PRODUCT.md", content, evidence,
+        )
+        stored = self.drafts.get(draft.draft_id)
+        self.assertEqual(stored.proposed_content, proposal)
+        self.assertEqual(stored.proposed_hash, hashlib.sha256(proposal).hexdigest())
+
     def test_self_only_cli_and_pr_open_ownership_gate(self):
         args = loop_manager.build_parser().parse_args([
             "document-drafts", str(self.repo), "list",
