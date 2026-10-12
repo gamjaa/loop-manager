@@ -241,24 +241,27 @@ class WorktreeCleanupTest(CleanupFixture, unittest.TestCase):
             (planning / "build.cache").write_text("artifact", encoding="utf-8")
             connection = sqlite3.connect(":memory:")
             register_connection_cleanup(self, connection)
-            port = loop_manager._PlanningGitPorts(connection, repo, root)
             (planning / "unexpected.txt").write_text("publishable", encoding="utf-8")
             with self.assertRaises(loop_manager.WorkspaceOwnershipError):
-                port.run(repo, "worktree", "remove", str(planning))
+                loop_manager._PlanningGitPorts(connection, repo, root).run(
+                    repo, "worktree", "remove", str(planning)
+                )
             self.assertTrue(planning.exists())
             (planning / "unexpected.txt").unlink()
-            port.run(repo, "worktree", "remove", str(planning))
+            loop_manager._PlanningGitPorts(connection, repo, root).run(
+                repo, "worktree", "remove", str(planning)
+            )
             self.assertFalse(planning.exists())
 
     def test_planning_cleanup_case_closes_its_borrowed_port_connection(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            repo = make_remote_repository(directory)
             connection = sqlite3.connect(":memory:")
             close_connection = register_connection_cleanup(self, connection)
             try:
-                port = loop_manager._PlanningGitPorts(connection, repo, root)
-                self.assertIs(port._connection, connection)
+                with mock.patch.object(loop_manager._PlanningGitPorts, "__init__",
+                                       return_value=None) as initialize:
+                    port = loop_manager._PlanningGitPorts(connection, Path("/repo"), Path("/state"))
+                initialize.assert_called_once_with(connection, Path("/repo"), Path("/state"))
             finally:
                 close_connection()
         with self.assertRaises(sqlite3.ProgrammingError):
