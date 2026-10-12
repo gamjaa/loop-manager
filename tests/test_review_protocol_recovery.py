@@ -12,6 +12,7 @@ from loop_manager_internal.agents.agent_invocation import AgentResult
 from loop_manager_internal.execution.execution_review_handler import ReviewHandler
 from loop_manager_internal.notifications import notifications
 from tests.support.worker import dummy_worker_sessions
+from tests.support.git import isolated_git_test
 
 
 class ReviewProtocolNotificationTest(NotificationFixture, unittest.TestCase):
@@ -61,6 +62,7 @@ class ReviewProtocolNotificationTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(connection.execute("SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'stage_failed'").fetchone()[0], 0)
 
 
+@isolated_git_test
 class ReviewProtocolRecoveryTest(BoundedRecoveryFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_format_normalization_needs_no_retry_or_failure_transition(self):

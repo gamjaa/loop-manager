@@ -7,11 +7,12 @@ from pathlib import Path
 from unittest import mock
 import loop_manager
 from tests.support.catalog import write_execplan
-from tests.support.git import git_command, commit_and_push
+from tests.support.git import git_command, commit_and_push, isolated_git_test
 from tests.support.worker import worker_result
 from tests.support.worker import dummy_worker_sessions
 
 
+@isolated_git_test
 class PrSourceSynchronizationTest(PrRecoveryFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_merged_pr_fast_forwards_clean_source_after_durable_transition(self):

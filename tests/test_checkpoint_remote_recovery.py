@@ -20,6 +20,10 @@ from loop_manager_internal.execution.execution_checkpoint import controlling_git
 from tests.support.blocked_git import CheckpointGitRecoveryFixture
 
 
+from tests.support.git import isolated_git_test
+
+
+@isolated_git_test
 class ProjectCheckpointGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.TestCase):
     def test_project_block_rebases_and_publishes_diagnostic_without_original_ownership(self):
         repo, original, coordinator = self._project_block_fixture()
@@ -145,6 +149,7 @@ class ProjectCheckpointGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.T
         self.assertEqual(scoped_blocking.project_block(self.connection, repo)['evidence'], 'preserved project cause')
 
 
+@isolated_git_test
 class CheckpointRebaseGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.TestCase):
     def test_dirty_attributes_preserve_raw_bytes_and_integrate_normalized_blobs(self):
         repo, _ = self._remote_refresh_fixture(branch_changed=True)
@@ -834,6 +839,7 @@ class ManualRebaseContinuationUnitTests(unittest.TestCase):
         self.assertEqual(self.command.call_count, 3)
 
 
+@isolated_git_test
 class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest.TestCase):
     def test_review_successor_candidate_rechecks_worker_without_stale_reviewer_evidence(self):
         published = self.publish_block(

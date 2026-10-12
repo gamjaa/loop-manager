@@ -4,10 +4,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
-from tests.support.git import git_command
+from tests.support.git import git_command, isolated_git_test
 from tests.support.worker import dummy_worker_sessions
 
 
+@isolated_git_test
 class PrConflictScopeTest(PrRecoveryFixture, unittest.TestCase):
     def test_shared_ignored_cache_preparation_propagates_metadata_failure(self):
         with mock.patch(

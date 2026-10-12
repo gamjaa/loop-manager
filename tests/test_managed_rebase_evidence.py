@@ -15,6 +15,7 @@ from loop_manager_internal.git.managed_rebase_evidence import (
     ReplayEvidenceError, reconcile_frozen_sources, source_commits, stage_index_matches,
     stage_matches, stage_modes_match, verify_replay,
 )
+from tests.support.git import isolated_git_test
 
 
 class ReplayVerdictTests(unittest.TestCase):
@@ -495,6 +496,7 @@ class JournalReplayProofTests(unittest.TestCase):
                 journal.rebase_replay_proof(git, state, active, result)
 
 
+@isolated_git_test
 class RealGitJournalReplayTests(unittest.TestCase):
     def test_saved_merge_with_manual_content_is_not_silently_omitted(self):
         with TemporaryDirectory() as directory:

@@ -6,10 +6,11 @@ from pathlib import Path
 from unittest import mock
 import loop_manager
 from tests.support.catalog import write_execplan
-from tests.support.git import git_command, make_remote_repository
+from tests.support.git import git_command, make_remote_repository, isolated_git_test
 from tests.support.worker import dummy_worker_sessions
 
 
+@isolated_git_test
 class WorkerPublicationMigrationTest(unittest.TestCase):
     plan = {"id": "G-008", "title": "Descriptive Worker Commits"}
 

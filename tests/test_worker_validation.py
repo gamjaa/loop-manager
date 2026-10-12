@@ -6,12 +6,14 @@ from pathlib import Path
 from unittest import mock
 import loop_manager
 from tests.support.catalog import write_execplan
-from tests.support.git import git_command, commit_and_push
+from tests.support.git import git_command, commit_and_push, isolated_git_test
 from tests.support.worker import worker_result
 from tests.support.publication import matching_branch_pr_lookup, publishing_branch_pr_lookup
 from tests.support.worker import dummy_worker_sessions
+from tests.support.execution import execution_policy_fixture, run_execution_policy
 
 
+@isolated_git_test
 class WorkerValidationTest(ActiveWorkerFixture, unittest.TestCase):
 
     @dummy_worker_sessions
@@ -286,65 +288,59 @@ class WorkerValidationTest(ActiveWorkerFixture, unittest.TestCase):
         self.assertEqual(plan["status"], "PLAN_BLOCKED")
         self.assertIsNotNone(plan["blocked_fingerprint"])
 
-    @dummy_worker_sessions
     def test_repeated_verify_failure_blocks_in_one_run_without_reviewer(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repo, state_dir, connection = self._make_active_worker_project(directory)
-            sessions = []
-            prompts = []
+        fixture = execution_policy_fixture(self)
+        roles, sessions, prompts = [], [], []
 
-            def worker(_worktree, _state, _config, role_name, prompt, **kwargs):
-                self.assertEqual(role_name, "worker")
-                sessions.append(kwargs["session_id"])
-                prompts.append(prompt)
-                (_worktree / "src/app.py").write_text(
-                    f"VALUE = {len(sessions) + 1}\n", encoding="utf-8",
-                )
-                return loop_manager.CodexResult(
-                    0, worker_result(), "worker-session"
-                )
+        def agent(*args, **kwargs):
+            role_name = args[4]
+            roles.append(role_name)
+            self.assertEqual(role_name, "worker")
+            sessions.append(kwargs["session_id"])
+            prompts.append(args[5])
+            kwargs["on_session_started"]("worker-session")
+            fixture.dirty = True
+            return loop_manager.AgentResult(
+                0, worker_result(), session_id="worker-session",
+            )
 
-            with mock.patch(
-                "loop_manager.validate_repository", return_value=repo
-            ), mock.patch(
-                "loop_manager.remote_base", return_value="main"
-            ), mock.patch(
-                "loop_manager.ensure_safe_base_worktree"
-            ), mock.patch(
-                "loop_manager.pr_for_branch", return_value=None
-            ), mock.patch(
-                "loop_manager.run_codex", side_effect=worker
-            ), mock.patch(
-                "loop_manager.verify", return_value=(False, "verify failed")
-            ) as verify:
-                self.assertEqual(
-                    loop_manager.run_project(
-                        connection,
-                        state_dir,
-                        str(repo),
-                        Path("unused.ini"),
-                        "main",
-                        False,
-                    ),
-                    0,
-                )
+        fixture.effects.agent.run_agent.side_effect = agent
+        verify = fixture.effects.validation.verify
+        verify.side_effect = None
+        verify.return_value = (False, "verify failed")
 
-            row = connection.execute(
-                "SELECT * FROM projects WHERE repo = ?", (str(repo),)
-            ).fetchone()
-            plan = connection.execute(
-                "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
-                (str(repo),),
-            ).fetchone()
-            history = json.loads(plan["verify_failure_history"])
+        def observed_git(_path, *args, **_kwargs):
+            if args == ("rev-parse", "--verify", "base^{commit}"):
+                return mock.Mock(returncode=0, stdout="base\n")
+            if len(args) == 2 and args[0] == "show" and args[1].startswith("base:"):
+                return mock.Mock(returncode=0, stdout="fixture revision content\n")
+            raise AssertionError(f"unexpected policy Git: {args}")
 
-        self.assertIsNone(row["phase"])
+        with mock.patch.object(loop_manager, "git", side_effect=observed_git), mock.patch.object(
+            loop_manager, "capture_git_snapshot",
+            side_effect=fixture.effects.agent.capture_git_snapshot,
+        ):
+            result = run_execution_policy(fixture)
+
+        project = fixture.connection.execute(
+            "SELECT * FROM projects WHERE repo = ?", (fixture.repo,),
+        ).fetchone()
+        plan = fixture.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = 'G-047'",
+            (fixture.repo,),
+        ).fetchone()
+        history = json.loads(plan["verify_failure_history"])
+
+        self.assertEqual(result.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertEqual(result.exit_code, 0)
+        self.assertIsNone(project["phase"])
         self.assertEqual(plan["status"], "PLAN_BLOCKED")
         self.assertEqual(plan["worker_session_id"], "worker-session")
         self.assertEqual(plan["worker_result"], worker_result())
         self.assertEqual(plan["verify_result"], "verify failed")
         self.assertIn("실패 지문:", plan["last_error"])
         self.assertEqual(sessions, [None] + ["worker-session"] * 3)
+        self.assertEqual(roles, ["worker"] * 4)
         fingerprint = next(iter(history))
         self.assertIn(
             f"verify:{fingerprint} occurrence=1 revision=1\n"
