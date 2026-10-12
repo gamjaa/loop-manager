@@ -50,6 +50,7 @@ from tests.support.planning_case import (
     FakeValidationPort, FakeEventPort, planning_snapshot, maintenance_cycle,
 )
 from tests.support.catalog import plan_text
+from tests.support.git import isolated_git_test
 
 class PlanningSelectionTest(PlanningCase):
     def test_legacy_release_resumes_after_removal_and_state_clear_interruptions(self):
@@ -1777,6 +1778,7 @@ class FailedSpecificationPlanningTest(PlanningCase):
                 self.assertEqual(ports.agent.run_count, 0)
 
 
+@isolated_git_test
 class PlanningReleaseGitTest(unittest.TestCase):
     def test_checkout_operation_metadata_is_preserved_and_shared_journal_still_blocks(self):
         from tests.support.git import git_command

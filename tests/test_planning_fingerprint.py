@@ -6,11 +6,19 @@ from pathlib import Path
 from unittest import mock
 import loop_manager
 from loop_manager_internal.catalog import catalog_service
+from loop_manager_internal.planning.planning_runtime import (
+    PlanningContext, PlanningLifecycleCoordinator, PlanningOutcomeKind,
+)
+from loop_manager_internal.storage import maintenance_state, planning_input_state, runtime_state
 from tests.support.catalog import write_execplan
-from tests.support.git import git_command, make_remote_repository, commit_and_push
+from tests.support.git import (
+    git_command, make_remote_repository, commit_and_push, isolated_git_test,
+)
+from tests.support.planning_case import FakePorts, planning_snapshot
 from tests.support.worker import dummy_worker_sessions
 
 
+@isolated_git_test
 class PlanningFingerprintTest(unittest.TestCase):
     def setUp(self):
         use_fixed_guidance(self)
@@ -169,73 +177,75 @@ class PlanningFingerprintTest(unittest.TestCase):
                 loop_manager.planning_input_fingerprint(repo, "main"), first
             )
 
-    @dummy_worker_sessions
     def test_planner_no_change_saves_fingerprint_and_skip_gate_uses_it(self):
         with tempfile.TemporaryDirectory() as directory:
-            repo = make_remote_repository(directory)
+            repo = Path(directory) / "repo"
+            repo.mkdir()
             state_dir = Path(directory) / "state"
             connection = sqlite3.connect(":memory:")
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
-            logs = []
+            loop_manager._ensure_execplans_schema(connection)
+            loop_manager.notifications.ensure_schema(connection)
+            connection.execute(
+                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
+                (str(repo),),
+            )
+            connection.commit()
 
-            connection.execute(loop_manager.SCHEMA)
+            # A completed no-change Planner turn persists the observed input
+            # through the same production storage adapter used by publication.
+            loop_manager.clear_active(
+                connection, str(repo), processed_sha="base",
+                specification_fingerprint="specification-1",
+                planning_fingerprint="planning-1",
+            )
+            planning_input_state.record_general(connection, str(repo), "base", {})
+            state = loop_manager._PlanningStatePorts(
+                connection,
+                runtime_state.RuntimeStateRepository(connection),
+                maintenance_state.MaintenanceRepository(connection),
+                state_dir,
+            )
+            ports = FakePorts(planning_snapshot(repo=str(repo)))
+            ports.state = state
+            ports.git.fingerprint = "planning-1"
+            ports.git.specification_fingerprints["base"] = "specification-1"
+            context = PlanningContext(
+                repo=str(repo), repo_path=repo, state_dir=state_dir,
+                base_branch="main", base_sha="base", provider="codex",
+                config_path=Path("unused.ini"), registered_only=False,
+                refactoring_review_interval=5,
+            )
 
             with mock.patch(
-                "loop_manager.validate_repository", return_value=repo
+                "subprocess.run", side_effect=AssertionError("unexpected Git process")
             ), mock.patch(
-                "loop_manager.remote_base", return_value="main"
-            ), mock.patch(
-                "loop_manager.ensure_safe_base_worktree"
-            ), mock.patch(
-                "loop_manager.run_codex", return_value=(0, "")
-            ) as planner, mock.patch("loop_manager.operation_log", side_effect=lambda message, **kwargs: logs.append((message, kwargs))):
-                self.assertEqual(
-                    loop_manager.run_project(
-                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
-                    ),
-                    0,
-                )
-                first = connection.execute(
-                    "SELECT planning_fingerprint FROM projects WHERE repo = ?", (str(repo),)
-                ).fetchone()["planning_fingerprint"]
-                self.assertIsNotNone(first)
-                self.assertEqual(planner.call_count, 1)
-                self.assertEqual(logs[0], ("Planner 시작: 다음 ExecPlan 계획을 생성합니다.", {}))
+                "subprocess.Popen", side_effect=AssertionError("unexpected Git process")
+            ):
+                outcome = PlanningLifecycleCoordinator(ports).run(context)
 
-                planner.reset_mock()
-                self.assertEqual(
-                    loop_manager.run_project(
-                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
-                    ),
-                    0,
-                )
-                planner.assert_not_called()
-
-                (repo / "docs/notes.md").write_text("# Other notes\n", encoding="utf-8")
-                commit_and_push(repo, "Change excluded docs again")
-                self.assertEqual(
-                    loop_manager.run_project(
-                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
-                    ),
-                    0,
-                )
-                planner.assert_not_called()
-
-                (repo / "src/app.py").write_text("VALUE = 2\n", encoding="utf-8")
-                commit_and_push(repo, "Change source")
-                self.assertEqual(
-                    loop_manager.run_project(
-                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
-                    ),
-                    0,
-                )
-                self.assertEqual(planner.call_count, 1)
-
-            second = connection.execute(
-                "SELECT planning_fingerprint FROM projects WHERE repo = ?", (str(repo),)
-            ).fetchone()["planning_fingerprint"]
-            self.assertNotEqual(second, first)
+            self.assertEqual(outcome.kind, PlanningOutcomeKind.FINGERPRINT_SKIPPED)
+            self.assertEqual(ports.agent.run_count, 0)
+            self.assertEqual(
+                ports.events.messages[0],
+                ("info", "계획 입력이 바뀌지 않아 Agent를 실행하지 않습니다."),
+            )
+            saved = connection.execute(
+                "SELECT processed_sha, specification_fingerprint, planning_fingerprint "
+                "FROM projects WHERE repo = ?",
+                (str(repo),),
+            ).fetchone()
+            self.assertEqual(
+                tuple(saved), ("base", "specification-1", "planning-1")
+            )
+            self.assertEqual(
+                [call[1] for call in ports.git.calls],
+                [
+                    ("recorded_base_fetch", "main"),
+                    ("rev-parse", "--verify", "refs/remotes/origin/main^{commit}"),
+                ],
+            )
 
     @dummy_worker_sessions
     def test_requirement_archive_move_does_not_run_planner(self):

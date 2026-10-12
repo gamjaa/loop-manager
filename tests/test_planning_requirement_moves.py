@@ -21,6 +21,7 @@ from loop_manager_internal.planning.requirement_retirement import (
     RequirementRetirementPort, RetirementError, RetirementReassessment,
 )
 from loop_manager_internal.planning.assessment_service import PlanningAssessmentService
+from tests.support.git import isolated_git_test
 
 
 SOURCE = "docs/requirements/[R-001] 기능 이름.md"
@@ -66,6 +67,7 @@ Implement the remaining product work.
 """
 
 
+@isolated_git_test
 class PlanningRequirementMoveTest(unittest.TestCase):
     def git(self, root, *args):
         return subprocess.run(

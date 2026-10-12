@@ -12,7 +12,7 @@ import loop_manager
 from loop_manager_internal.catalog.catalog_service import BackfillPlanShasEffects, backfill_plan_shas
 from loop_manager_internal.runtime.contracts import GitLockError
 from tests.support.catalog import make_catalog_root, write_execplan
-from tests.support.git import git_command, make_remote_repository, commit_and_push
+from tests.support.git import git_command, make_remote_repository, commit_and_push, isolated_git_test
 
 
 class BackfillObservationTests(unittest.TestCase):
@@ -43,6 +43,7 @@ class BackfillObservationTests(unittest.TestCase):
         connection.close()
 
 
+@isolated_git_test
 class CatalogMigrationTest(AutomationCatalogFixture, unittest.TestCase):
     def test_priority_parser_supports_legacy_default_and_rejects_invalid_values(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -6,6 +6,7 @@ import subprocess
 import tempfile
 import unittest
 from tests.support.workspace import symlink_or_skip
+from tests.support.git import isolated_git_test
 import hashlib
 import json
 from dataclasses import replace
@@ -54,6 +55,54 @@ class MaintenanceObservationFailureTests(unittest.TestCase):
         self.assertFalse(context.observation_failed)
         self.assertFalse(context.ok)
 
+    def test_nonancestor_and_missing_baseline_observations_return_diagnostic_errors(self):
+        calls = []
+
+        def observe(_repo, *arguments):
+            calls.append(arguments)
+            if arguments == (
+                'rev-parse', '--verify', 'refs/remotes/origin/main^{commit}',
+            ):
+                return subprocess.CompletedProcess(['git', *arguments], 0, 'after\n')
+            if arguments == ('cat-file', '-e', 'sibling^{commit}'):
+                return subprocess.CompletedProcess(['git', *arguments], 0, '')
+            if arguments == ('merge-base', '--is-ancestor', 'sibling', 'after'):
+                return subprocess.CompletedProcess(['git', *arguments], 1, '')
+            if arguments == ('cat-file', '-e', f"{'f' * 40}^{{commit}}"):
+                return subprocess.CompletedProcess(['git', *arguments], 1, '')
+            raise AssertionError(f'unexpected maintenance Git observation: {arguments}')
+
+        with mock.patch.object(
+            maintenance_git, '_git', side_effect=observe,
+        ), mock.patch(
+            'subprocess.run', side_effect=AssertionError('unexpected Git process'),
+        ), mock.patch(
+            'subprocess.Popen', side_effect=AssertionError('unexpected Git process'),
+        ):
+            nonancestor = maintenance_git.bounded_remote_change_context(
+                Path('/repo'), 'main', 'sibling', 'after',
+            )
+            missing = maintenance_git.bounded_remote_change_context(
+                Path('/repo'), 'main', 'f' * 40, 'after',
+            )
+
+        self.assertFalse(nonancestor.ok)
+        self.assertFalse(nonancestor.observation_failed)
+        self.assertIn('조상', nonancestor.error or '')
+        self.assertFalse(missing.ok)
+        self.assertFalse(missing.observation_failed)
+        self.assertIn('이력', missing.error or '')
+        self.assertEqual(
+            calls,
+            [
+                ('rev-parse', '--verify', 'refs/remotes/origin/main^{commit}'),
+                ('cat-file', '-e', 'sibling^{commit}'),
+                ('merge-base', '--is-ancestor', 'sibling', 'after'),
+                ('rev-parse', '--verify', 'refs/remotes/origin/main^{commit}'),
+                ('cat-file', '-e', f"{'f' * 40}^{{commit}}"),
+            ],
+        )
+
     def test_context_caller_preserves_operational_and_unsafe_categories(self):
         cycle = SimpleNamespace(cycle_base_sha='after', last_success_commit='before')
         context = maintenance_git.GitChangeContext('before', 'after', (), False,
@@ -69,6 +118,7 @@ class MaintenanceObservationFailureTests(unittest.TestCase):
                 cycle_service._maintenance_change_context_text(Path('/repo'), 'main', cycle)
 
 
+@isolated_git_test
 class DocumentDraftTest(unittest.TestCase):
     def test_approved_document_bytes_apply_once_and_reject_unrelated_edits(self):
         draft = self._create()
@@ -1077,6 +1127,7 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
             self.assertEqual(tuple(plan), ("MERGED", "session-G-001"))
 
 
+@isolated_git_test
 class BoundedGitChangeContextTest(unittest.TestCase):
     def _git(self, repo: Path, *arguments: str) -> str:
         completed = subprocess.run(
@@ -1147,57 +1198,52 @@ class BoundedGitChangeContextTest(unittest.TestCase):
             self.assertEqual(self._git(repo, "symbolic-ref", "HEAD"), before_head)
             self.assertEqual(self._git(repo, "status", "--porcelain=v1"), before_status)
 
-    def test_nonancestor_and_missing_baselines_return_diagnostic_errors(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
-            self._git(repo, "init", "-b", "main")
-            self._git(repo, "config", "user.email", "test@example.com")
-            self._git(repo, "config", "user.name", "Test")
-            current = self._commit(repo, "tracked.txt", "value\n", "current")
-            self._git(repo, "update-ref", "refs/remotes/origin/main", current)
-            tree = self._git(repo, "write-tree")
-            sibling = self._git(repo, "commit-tree", tree, "-m", "sibling")
-            before = self._git(repo, "status", "--porcelain=v1")
-
-            nonancestor = maintenance_git.bounded_remote_change_context(
-                repo, "main", sibling, current
-            )
-            self.assertFalse(nonancestor.ok)
-            self.assertIn("조상", nonancestor.error or "")
-            missing = maintenance_git.bounded_remote_change_context(
-                repo, "main", "f" * 40, current
-            )
-            self.assertFalse(missing.ok)
-            self.assertIn("이력", missing.error or "")
-            self.assertEqual(self._git(repo, "status", "--porcelain=v1"), before)
-
     def test_oversized_git_failure_is_not_misreported_as_truncation(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repo = Path(directory)
-            self._git(repo, "init", "-b", "main")
-            self._git(repo, "config", "user.email", "test@example.com")
-            self._git(repo, "config", "user.name", "Test")
-            baseline = self._commit(repo, "one.txt", "one\n", "baseline")
-            current = self._commit(repo, "two.txt", "two\n", "current")
-            self._git(repo, "update-ref", "refs/remotes/origin/main", current)
-            failed = subprocess.CompletedProcess(
-                ["git"],
-                1,
-                stdout="x" * 100,
-                stderr="fatal: simulated Git failure",
+        calls = []
+
+        def observe(_repo, *arguments):
+            calls.append(arguments)
+            outputs = {
+                ('rev-parse', '--verify', 'refs/remotes/origin/main^{commit}'): (0, 'current\n'),
+                ('cat-file', '-e', 'baseline^{commit}'): (0, ''),
+                ('merge-base', '--is-ancestor', 'baseline', 'current'): (0, ''),
+                ('rev-list', '--topo-order', '--max-count=51', 'baseline..current'): (0, 'commit\n'),
+            }
+            if arguments not in outputs:
+                raise AssertionError(f'unexpected maintenance Git observation: {arguments}')
+            code, output = outputs[arguments]
+            return subprocess.CompletedProcess(['git', *arguments], code, output)
+
+        failed = subprocess.CompletedProcess(
+            ['git'], 1, stdout='x' * 100, stderr='fatal: simulated Git failure',
+        )
+        with mock.patch.object(
+            maintenance_git, '_git', side_effect=observe,
+        ), mock.patch.object(
+            maintenance_git, '_bounded_git_output', return_value=(failed, True),
+        ) as bounded_output, mock.patch(
+            'subprocess.run', side_effect=AssertionError('unexpected Git process'),
+        ), mock.patch(
+            'subprocess.Popen', side_effect=AssertionError('unexpected Git process'),
+        ):
+            context = maintenance_git.bounded_remote_change_context(
+                Path('/repo'), 'main', 'baseline', 'current',
             )
 
-            with mock.patch(
-                "loop_manager_internal.maintenance.maintenance_git._bounded_git_output",
-                return_value=(failed, True),
-            ):
-                context = maintenance_git.bounded_remote_change_context(
-                    repo, "main", baseline, current
-                )
-
-            self.assertFalse(context.ok)
-            self.assertFalse(context.truncated)
-            self.assertIn("안전하게", context.error or "")
+        self.assertFalse(context.ok)
+        self.assertTrue(context.observation_failed)
+        self.assertFalse(context.truncated)
+        self.assertIn('안전하게', context.error or '')
+        self.assertEqual(bounded_output.call_count, 2)
+        self.assertEqual(
+            calls,
+            [
+                ('rev-parse', '--verify', 'refs/remotes/origin/main^{commit}'),
+                ('cat-file', '-e', 'baseline^{commit}'),
+                ('merge-base', '--is-ancestor', 'baseline', 'current'),
+                ('rev-list', '--topo-order', '--max-count=51', 'baseline..current'),
+            ],
+        )
 
     def test_git_capture_bounds_actual_stdout_and_stderr_without_temp_spooling(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1247,6 +1293,7 @@ class BoundedGitChangeContextTest(unittest.TestCase):
             )
 
 
+@isolated_git_test
 class FileReviewLedgerTest(unittest.TestCase):
     def setUp(self):
         use_fixed_guidance(self)

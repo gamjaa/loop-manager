@@ -18,6 +18,7 @@ from loop_manager_internal.maintenance import maintenance_findings
 from loop_manager_internal.maintenance import maintenance_reconciliation
 from loop_manager_internal.maintenance.maintenance_file_inventory import RootPlacement, TrackedSource
 from tests.support.maintenance import result_for
+from tests.support.git import isolated_git_test
 from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot, mutable_snapshot_token
 from loop_manager_internal.planning.input_fingerprints import (
     IsRequirementArchiveOnlyChangeEffects, _is_requirement_archive_only_change,
@@ -79,6 +80,7 @@ class PlanningDiagnosticsTest(unittest.TestCase):
             self.assertIn('"outcome":"unsafe"', first.read_text())
             self.assertIn("base-2", second.read_text())
 
+@isolated_git_test
 class PlanningRecoveryTest(PlanningCase):
     def test_completed_general_result_rechecks_archive_mixed_with_plan_edit(self):
         requirement = b"docs/requirements/R.md"

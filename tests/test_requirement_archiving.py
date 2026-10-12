@@ -7,6 +7,7 @@ from pathlib import Path
 
 import loop_manager
 from loop_manager_internal.storage import execplan_catalog_state
+from tests.support.git import isolated_git_test
 
 
 def git(repo: Path, *arguments: str) -> str:
@@ -21,6 +22,7 @@ def git(repo: Path, *arguments: str) -> str:
     return result.stdout.strip()
 
 
+@isolated_git_test
 class RequirementArchiveEligibilityTest(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
