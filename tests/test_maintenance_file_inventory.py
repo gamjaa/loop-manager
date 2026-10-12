@@ -8,8 +8,10 @@ import unittest
 from unittest import mock
 
 from loop_manager_internal.maintenance import maintenance_file_inventory as source_inventory
+from tests.support.git import isolated_git_test
 
 
+@isolated_git_test
 class TrackedSourceInventoryTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()

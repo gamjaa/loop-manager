@@ -13,6 +13,7 @@ from unittest import mock
 from loop_manager_internal.maintenance import maintenance_file_inventory
 from loop_manager_internal.maintenance import maintenance_file_review as review
 from loop_manager_internal.storage import maintenance_file_ledger
+from tests.support.git import isolated_git_test
 
 
 class ProvisionalReviewSchemaTest(unittest.TestCase):
@@ -83,6 +84,7 @@ class FileReviewPromptTest(unittest.TestCase):
                     self.assertIn("원본 시작\n" + content.decode() + "\n원본 끝", prompt)
 
 
+@isolated_git_test
 class ProvisionalFileReviewTest(unittest.TestCase):
     def test_unchanged_source_review_survives_remote_revision_advance(self):
         first = self.publish({"src/a.py": "def calculate(): return 1\n"})

@@ -27,7 +27,9 @@ from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot
 
 
 from tests.support.maintenance_planning_case import MaintenancePlanningCase, git
+from tests.support.git import isolated_git_test
 
+@isolated_git_test
 class MaintenancePublicationTest(MaintenancePlanningCase):
     def test_publication_requires_latest_single_commit_and_is_atomic_and_idempotent(self):
         context = self._begin_barrier()

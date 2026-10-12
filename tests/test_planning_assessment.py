@@ -10,6 +10,7 @@ import unittest
 from unittest import mock
 
 import loop_manager
+from tests.support.git import isolated_git_test
 from loop_manager_internal.application.contracts import PlanIdAllocation, ValidatedPlanningResult
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.storage import maintenance_state
@@ -41,6 +42,7 @@ from tests.support.planning_case import (
     FakeValidationPort, FakeEventPort, planning_snapshot, maintenance_cycle,
 )
 
+@isolated_git_test
 class PlanningAssessmentTest(PlanningCase):
     def test_publication_stages_already_deleted_and_unstaged_paths_exactly(self):
         from tests.support.git import git_command

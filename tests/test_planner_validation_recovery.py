@@ -14,7 +14,7 @@ from loop_manager_internal.planning.planner_validation import (
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningError
 from loop_manager_internal.runtime.contracts import GitLockError
 from tests.support.catalog import write_execplan
-from tests.support.git import git_command, make_remote_repository
+from tests.support.git import git_command, make_remote_repository, isolated_git_test
 from tests.support.worker import dummy_worker_sessions
 
 
@@ -133,6 +133,7 @@ class RevisionDocumentObservationTests(unittest.TestCase):
             )
 
 
+@isolated_git_test
 class PlannerValidationRecoveryTest(unittest.TestCase):
     @dummy_worker_sessions
     def test_first_planner_validation_retry_resumes_session_and_clears_state(self):

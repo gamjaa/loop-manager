@@ -8,8 +8,10 @@ from unittest import mock
 
 from loop_manager_internal.maintenance import code_context, code_index
 from tests.support.maintenance import inventory
+from tests.support.git import isolated_git_test
 
 
+@isolated_git_test
 class CodeContextTest(unittest.TestCase):
     def setUp(self):
         temporary = tempfile.TemporaryDirectory()
