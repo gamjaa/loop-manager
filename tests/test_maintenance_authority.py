@@ -30,7 +30,9 @@ from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot
 
 
 from tests.support.maintenance_planning_case import MaintenancePlanningCase, git
+from tests.support.git import isolated_git_test
 
+@isolated_git_test
 class MaintenanceAuthorityTest(MaintenancePlanningCase):
     def test_combined_maintenance_batch_normalizes_manifest_and_result_references(self):
         self._begin_legacy_assessment(self.base_sha)
