@@ -40,6 +40,24 @@ def _claim_piece(
         if row is None or (first_attempt_only and row[5] != 0):
             return None
         payload = json.loads(str(row[2]))
+        if row[1] == "persistent_execution_failure":
+            # Recheck the exact target and cause before retiring the legacy
+            # event. A matching current block owns the notice; a missing or
+            # different block cannot make this failure actionable.
+            from .events import suppress_persistent_failure_for_block
+            subject = str(payload.get("execplan_id") or "__project__")
+            suppress_persistent_failure_for_block(
+                connection, str(row[0]), subject,
+            )
+            # Persistent-failure events are never sent separately. Preserve
+            # their prior pieces and errors while preventing another claim.
+            connection.execute(
+                "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP, "
+                "delivery_started_at = NULL WHERE event_key = ? "
+                "AND sent_at IS NULL AND canceled_at IS NULL",
+                (event_key,),
+            )
+            return None
         if row[1] == "draft_decision":
             from loop_manager_internal.storage import execplan_draft_state
             saved = execplan_draft_state.evidence(connection, str(row[0]), str(payload["execplan_id"]))

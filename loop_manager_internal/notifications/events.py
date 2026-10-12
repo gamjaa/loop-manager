@@ -335,77 +335,70 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         )
 
 
-def enqueue_persistent_execution_failure_events(
-    connection: sqlite3.Connection, repo: str,
-) -> None:
-    """Queue one actionable notice for each eligible external-run streak.
-
-    The recovery projection is retained even when Telegram is disabled.  The
-    outbox is intentionally populated only for an enabled notification session,
-    matching the established behaviour for all other project events.
-    """
-
-    exists = connection.execute(
-        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-        "AND name = 'persistent_execution_failures'"
-    ).fetchone()
-    if exists is None or not _enabled(connection):
-        return
-    ensure_schema(connection)
-    project = connection.execute(
-        "SELECT 1 FROM projects WHERE repo = ?", (repo,)
-    ).fetchone()
-    if project is None:
-        return
-    rows = connection.execute(
-        "SELECT * FROM persistent_execution_failures WHERE repo = ? "
-        "AND active = 1 AND notification_eligible = 1 "
-        "AND notification_queued = 0 AND suppressed_by_block = 0 "
-        "ORDER BY subject",
-        (repo,),
-    ).fetchall()
-    for row in rows:
-        subject = str(row["subject"])
-        plan_id = None if subject == "__project__" else subject
-        identity = "\0".join((subject, str(row["episode"]), str(row["phase"]),
-                              str(row["reason_code"]), str(row["fingerprint"])))
-        payload = {
-            "project": Path(repo).name or repo,
-            "stage": str(row["phase"]),
-            "scope": "execution",
-            "execplan_id": plan_id,
-            "reason_code": str(row["reason_code"]),
-            "cause": str(row["detail"]),
-            "consecutive_external_runs": int(row["consecutive_runs"]),
-            "recovery_attempts": json.loads(str(row["recovery_attempts"])),
-            "required_action": (
-                "Review the structured failure and fix the reported "
-                "configuration, permission, or repository condition."
-            ),
-        }
-        _insert(
-            connection, _key("persistent_failure", repo, identity), repo,
-            "persistent_execution_failure", payload,
-        )
-        connection.execute(
-            "UPDATE persistent_execution_failures SET notification_queued = 1, "
-            "updated_at = CURRENT_TIMESTAMP WHERE repo = ? AND subject = ? "
-            "AND episode = ? AND notification_eligible = 1",
-            (repo, subject, int(row["episode"])),
-        )
-
-
 def cancel_pending_persistent_execution_failure_event(
     connection: sqlite3.Connection, repo: str, subject: str, episode: int,
     phase: str, reason_code: str, fingerprint: str,
 ) -> None:
-    """Withdraw a notice only before its first delivery attempt."""
+    """Cancel remaining legacy failure pieces while retaining delivery audit."""
 
     identity = "\0".join((subject, str(episode), phase, reason_code, fingerprint))
     connection.execute(
-        "DELETE FROM notification_outbox WHERE event_key = ? "
-        "AND sent_at IS NULL AND attempts = 0",
+        "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP, "
+        "delivery_started_at = NULL WHERE event_key = ? "
+        "AND sent_at IS NULL AND canceled_at IS NULL",
         (_key("persistent_failure", repo, identity),),
+    )
+
+
+def _persistent_failure_matches_current_block(
+    connection: sqlite3.Connection, repo: str, subject: str, failure,
+) -> bool:
+    available = {
+        str(row[0]) for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table' "
+            "AND name IN ('recovery_records', 'project_blocks', 'execplan_blocks')"
+        )
+    }
+    if available != {"recovery_records", "project_blocks", "execplan_blocks"}:
+        return False
+    recovery = connection.execute(
+        "SELECT reason_code, pending_action, phase, fingerprint, "
+        "progress_marker, detail, final_evidence FROM recovery_records "
+        "WHERE repo = ? AND subject = ?", (repo, subject),
+    ).fetchone()
+    if (recovery is None or recovery[1] != "final_block"
+            or any(str(recovery[index]) != str(failure[name]) for index, name in (
+                (0, "reason_code"), (2, "phase"), (3, "fingerprint"),
+                (4, "progress_marker"), (5, "detail"),
+            ))):
+        return False
+    try:
+        final_evidence = json.loads(str(recovery[6]))
+    except (TypeError, ValueError):
+        return False
+    if (not isinstance(final_evidence, dict)
+            or final_evidence.get("reason_code") != recovery[0]):
+        return False
+    block_reason = final_evidence.get("block_reason_code")
+    if subject == "__project__":
+        block = connection.execute(
+            "SELECT reason_code, evidence FROM project_blocks WHERE repo = ?",
+            (repo,),
+        ).fetchone()
+        return bool(
+            block is not None and block[0] == block_reason
+            and block[1] == recovery[5]
+        )
+    blocks = connection.execute(
+        "SELECT reason_code, evidence FROM execplan_blocks "
+        "WHERE repo = ? AND plan_id = ? UNION ALL "
+        "SELECT reason_code, evidence FROM project_blocks "
+        "WHERE repo = ? AND plan_id = ?",
+        (repo, subject, repo, subject),
+    ).fetchall()
+    return any(
+        block[0] == block_reason and block[1] == recovery[5]
+        for block in blocks
     )
 
 
@@ -420,11 +413,15 @@ def suppress_persistent_failure_for_block(
     ).fetchone() is None:
         return
     row = connection.execute(
-        "SELECT episode, phase, reason_code, fingerprint "
+        "SELECT episode, phase, reason_code, fingerprint, progress_marker, detail "
         "FROM persistent_execution_failures WHERE repo = ? AND subject = ? "
         "AND active = 1", (repo, subject),
     ).fetchone()
-    if row is None:
+    if row is None or not _persistent_failure_matches_current_block(
+        connection, repo, subject,
+        {"phase": row[1], "reason_code": row[2], "fingerprint": row[3],
+         "progress_marker": row[4], "detail": row[5]},
+    ):
         return
     cancel_pending_persistent_execution_failure_event(
         connection, repo, subject, int(row[0]), str(row[1]), str(row[2]),
@@ -432,7 +429,6 @@ def suppress_persistent_failure_for_block(
     )
     connection.execute(
         "UPDATE persistent_execution_failures SET active = 0, "
-        "consecutive_runs = 0, notification_eligible = 0, "
         "notification_queued = 0, suppressed_by_block = 1, "
         "updated_at = CURRENT_TIMESTAMP, resolved_at = CURRENT_TIMESTAMP "
         "WHERE repo = ? AND subject = ?", (repo, subject),
