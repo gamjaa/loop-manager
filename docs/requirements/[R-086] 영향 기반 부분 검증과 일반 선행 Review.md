@@ -6,7 +6,7 @@ Worker 교정마다 전체 verify를 반복하면 Reviewer가 거부할 후보�
 
 ## Requirement
 
-- 첫 지원 범위는 Loop Manager 자체 저장소의 Python unittest adapter다. 실행 사이클은 명시적 opt-in이며 기본값은 기존 전체 verify → Reviewer다.
+- 첫 지원 범위는 Loop Manager 자체 저장소의 Python unittest adapter다. 부분 verify·일반 선행 Review 경로는 기본 사용하며 `[loop] verify_partial = false`로 끌 수 있다. 옵션 생략 시 true이며, 안전한 선정·검토 증거를 확인하지 못하면 기존 전체 verify → Reviewer로 fallback한다.
 - Worker 완료 뒤 기존 commit·최신 base reconcile로 준비한 실제 후보와 base의 diff를 사용한다. 변경 전·후 전체 Python AST 그래프의 직접·역방향 간접 의존성으로 테스트 모듈을 고르고, 변경된 테스트를 포함한다. 삭제·rename·이동의 기존 소비자도 확인하고 실제 discovery manifest ID로 정규화한다. 파일명 유사도와 AI 선정은 사용하지 않는다.
 - 동적 참조·미해결 관계, 공유 fixture/support, 초기화·진입점·공개 API, Git·SQLite·상태·권한·복구 공통 코드, 수집·runner·검증 설정 변경, 불충분한 삭제/이동 분석, 대상 없음·넓은 선택은 결정적인 규칙으로 보수적으로 fallback한다. 부분 모드에서 전체 테스트를 실행한 뒤 전체 verify를 반복하지 않는다.
 - 부분 verify는 Agent 밖에서 기존 project interpreter·guard·프로세스 종료 확인·serial/independent·자원 예약을 사용한다. 전체 discovery와 fixture·skip 의미를 유지하고 선택 모듈의 결과 누락·중복·identity 오류를 성공으로 인정하지 않는다. 미선택 모듈은 NOT_SELECTED로 구분한다. timeout·취소·종료 불명은 기존 안전 정책을 따른다.

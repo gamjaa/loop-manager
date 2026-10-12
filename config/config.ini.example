@@ -12,8 +12,9 @@ refactoring_review_interval = 20
 verify_timeout_seconds = 600
 ; auto는 실제 CPU·메모리 부하로 배정한다. 양의 정수는 verify별 상한이며 1은 직렬이다.
 verify_parallelism = auto
-# 영향 기반 부분 검증 + 일반 선행 Review. 환경/정책 증거 부재는 기존 경로로 fallback.
-verify_partial = false
+; 영향 기반 부분 검증 + 일반 선행 Review. 기본값 true, false로 끈다.
+; 환경/정책 증거 부재는 기존 전체 verify → Reviewer 경로로 fallback.
+verify_partial = true
 
 [telegram]
 ; token과 chat_id가 모두 비어 있으면 알림을 사용하지 않는다.
