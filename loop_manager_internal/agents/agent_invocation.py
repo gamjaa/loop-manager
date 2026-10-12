@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 import re
@@ -10,7 +10,7 @@ import subprocess
 from uuid import uuid4
 from typing import Callable, TYPE_CHECKING
 
-from loop_manager_internal.agents.agent_write_isolation import IsolationEvidence
+from loop_manager_internal.agents.agent_write_isolation import IsolationEvidence, CodexLaunch
 
 if TYPE_CHECKING:
     from loop_manager_internal.agents.common_guidance import CommonGuidance
@@ -140,6 +140,8 @@ class AgentRequest:
     on_process_started: Callable[[], None] | None = None
     on_process_finished: Callable[[], None] | None = None
     stream_output: bool = False
+    prepared_launch: CodexLaunch | None = field(default=None, repr=False)
+    on_execution_identity: Callable[[dict[str, str]], None] | None = None
 
 
 @dataclass(frozen=True)

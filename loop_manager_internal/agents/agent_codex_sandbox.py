@@ -121,7 +121,8 @@ def prepare_launch(boundary, state_dir: Path, role: str, read_only: bool,
     # Preserve G-088's role/repository session location for existing sessions.
     # Runtime storage belongs to Codex; it is not a writable root for its tools.
     base = state_dir.resolve() / 'agent-runtime'
-    source_home = Path(environment.get('CODEX_HOME', str(Path.home() / '.codex'))).resolve()
+    user_home = Path(environment.get('HOME', environment.get('USERPROFILE', str(Path.home()))))
+    source_home = Path(environment.get('CODEX_HOME', str(user_home / '.codex'))).resolve()
     # Validate containment before mkdir/link/mkdtemp: a misregistered state root
     # must not even create a runtime directory in the user's source checkout.
     for denied in (boundary.source, *boundary.other_worktrees, boundary.worktree,
