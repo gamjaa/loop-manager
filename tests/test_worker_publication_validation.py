@@ -6,12 +6,14 @@ from pathlib import Path
 from unittest import mock
 import loop_manager
 from tests.support.catalog import write_execplan
-from tests.support.git import git_command, make_remote_repository, commit_and_push
+from tests.support.git import git_command, make_remote_repository, commit_and_push, isolated_git_test
 from tests.support.worker import worker_result
 from tests.support.publication import publishing_branch_pr_lookup
 from tests.support.worker import dummy_worker_sessions
+from tests.support.execution import execution_policy_fixture, run_execution_policy
 
 
+@isolated_git_test
 class WorkerPublicationValidationTest(unittest.TestCase):
     plan = {"id": "G-008", "title": "Descriptive Worker Commits"}
 
@@ -172,96 +174,48 @@ class WorkerPublicationValidationTest(unittest.TestCase):
         self.assertIn(("Reviewer 시작: G-001 Worker Boundary", {}), logs)
         self.assertIn(("Worker 반환: G-001 Worker Boundary (Review 실패)", {"error": True}), logs)
 
-    @dummy_worker_sessions
     def test_invalid_worker_result_resumes_same_session_without_verify(self):
-        with tempfile.TemporaryDirectory() as directory:
-            repo = make_remote_repository(directory)
-            state_dir = Path(directory) / "state"
-            state_dir.mkdir()
-            (repo / "docs/plans").mkdir()
-            plan = write_execplan(repo, "G-001", "Worker Boundary")
-            commit_and_push(repo, "Add worker plan")
-            branch, worktree = loop_manager.expected_execplan_workspace(
-                state_dir, str(repo), "G-001"
-            )
-            loop_manager.make_worktree(repo, worktree, branch, "main")
-            plan_sha = git_command(repo, "rev-parse", "origin/main")
-            connection = sqlite3.connect(":memory:")
-            self.addCleanup(connection.close)
-            connection.row_factory = sqlite3.Row
-            connection.execute(loop_manager.SCHEMA)
-            connection.execute(
-                """
-                INSERT INTO projects (
-                    repo, base_branch, active_sha, plan_sha, phase, branch, worktree, plan_path
-                ) VALUES (?, 'main', ?, ?, 'WORKING', 'loop-manager/G-001', ?, ?)
-                """,
-                (
-                    str(repo),
-                    plan_sha,
-                    plan_sha,
-                    str(worktree),
-                    plan.relative_to(repo).as_posix(),
-                ),
-            )
-            connection.commit()
-            sessions = []
-            prompts = []
+        fixture = execution_policy_fixture(self)
+        roles, sessions, prompts = [], [], []
 
-            def worker(agent_worktree, _state, _config, role_name, prompt, **kwargs):
-                if role_name == "reviewer":
-                    return loop_manager.CodexResult(
-                        0, "VERDICT: PASS", "reviewer-session"
-                    )
-                sessions.append(kwargs["session_id"])
-                prompts.append(prompt)
-                if len(sessions) == 1:
-                    result = worker_result(
-                        "Worker Boundary", "Bad title", "test: PASS"
-                    )
-                else:
-                    (agent_worktree / "src/app.py").write_text(
-                        "VALUE = 2\n", encoding="utf-8"
-                    )
-                    result = worker_result(
-                        "Validate worker metadata", "Good title", "test: PASS"
-                    )
-                return loop_manager.CodexResult(0, result, "worker-session")
-
-            with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
-                "loop_manager.remote_base", return_value="main"
-            ), mock.patch("loop_manager.ensure_safe_base_worktree"), mock.patch(
-                "loop_manager.pr_for_branch",
-                side_effect=publishing_branch_pr_lookup(
-                    connection, "https://example.test/pr/1"
-                ),
-            ), mock.patch("loop_manager.run_codex", side_effect=worker), mock.patch(
-                "loop_manager.verify",
-                side_effect=lambda *_args: (
-                    self.assertEqual(len(sessions), 2) or True,
-                    "verify: PASS",
-                ),
-            ) as verify:
-                self.assertEqual(
-                    loop_manager.run_project(
-                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
-                    ),
-                    1,
+        def agent(*args, **kwargs):
+            role_name = args[4]
+            roles.append(role_name)
+            if role_name == "reviewer":
+                return loop_manager.AgentResult(
+                    0, "VERDICT: PASS", session_id="reviewer-session",
                 )
-                row = connection.execute(
-                    "SELECT phase, last_error FROM projects WHERE repo = ?", (str(repo),)
-                ).fetchone()
-                self.assertEqual(row["phase"], "WORKING")
-                self.assertIn("Worker 결과 검증 실패", row["last_error"])
-                verify.assert_not_called()
+            sessions.append(kwargs["session_id"])
+            prompts.append(args[5])
+            kwargs["on_session_started"]("worker-session")
+            fixture.dirty = True
+            result = "invalid Worker result" if len(sessions) == 1 else worker_result(
+                "Validate worker metadata", "Good title", "test: PASS",
+            )
+            return loop_manager.AgentResult(0, result, session_id="worker-session")
 
-                self.assertEqual(
-                    loop_manager.run_project(
-                        connection, state_dir, str(repo), Path("unused.ini"), "main", False
-                    ),
-                    0,
-                )
+        fixture.effects.agent.run_agent.side_effect = agent
+        verify = fixture.effects.validation.verify
 
-            self.assertEqual(sessions, [None, "worker-session"])
-            self.assertIn("Worker 결과 검증 실패", prompts[1])
-            verify.assert_called_once()
+        first = run_execution_policy(fixture)
+
+        row = fixture.connection.execute(
+            "SELECT phase, last_error, worker_session_id FROM projects WHERE repo = ?",
+            (fixture.repo,),
+        ).fetchone()
+        self.assertEqual(first.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
+        self.assertEqual(first.exit_code, 1)
+        self.assertEqual(row["phase"], "WORKING")
+        self.assertIn("Worker 결과 검증 실패", row["last_error"])
+        self.assertEqual(row["worker_session_id"], "worker-session")
+        self.assertEqual(roles, ["worker"])
+        verify.assert_not_called()
+
+        second = run_execution_policy(fixture)
+
+        self.assertEqual(second.kind, loop_manager.ProjectRunKind.WAITING)
+        self.assertEqual(second.exit_code, 0)
+        self.assertEqual(sessions, [None, "worker-session"])
+        self.assertIn("Worker 결과 검증 실패", prompts[1])
+        self.assertEqual(roles, ["worker", "worker", "reviewer"])
+        verify.assert_called_once()

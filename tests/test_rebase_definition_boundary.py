@@ -17,9 +17,10 @@ from loop_manager_internal.git.managed_rebase_runtime import build_service
 from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 from tests.support.execution import execution_fixture, recovered_rebase_workspace, READY_WORKER_RESULT
-from tests.support.git import make_remote_repository, git_command
+from tests.support.git import make_remote_repository, git_command, isolated_git_test
 
 
+@isolated_git_test
 class RebaseDefinitionBoundaryTests(TestCase):
     plan_path = 'docs/plans/[G-047] Runtime.md'
     source = 'docs/requirements/Added.md'

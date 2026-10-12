@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
-from tests.support.git import git_command
+from tests.support.git import git_command, isolated_git_test
 from tests.support.worker import worker_result
 from tests.support.worker import dummy_worker_sessions
 from tests.support.execution import execution_policy_fixture, run_execution_policy
@@ -36,6 +36,7 @@ class LivePullRequestObservationTests(unittest.TestCase):
                         observe_live_pull_request(Path('/repo'), {'headRefName': 'branch'})
 
 
+@isolated_git_test
 class PrConflictLeaseTests(PrRecoveryFixture, unittest.TestCase):
     @dummy_worker_sessions(fixed_guidance=True)
     def test_conflicting_pr_reuses_sessions_revalidates_new_base_and_leases_push(self):
@@ -233,6 +234,7 @@ class PrConflictLeaseTests(PrRecoveryFixture, unittest.TestCase):
             synchronize.assert_not_called()
 
 
+@isolated_git_test
 class PrConflictCauseRevalidationTests(PrRecoveryFixture, unittest.TestCase):
     def test_worker_failure_blocks_after_three_corrections_and_stays_blocked(self):
         # Retry/block policy uses supplied conflict observations. Real conflict
@@ -359,6 +361,7 @@ class PrConflictCauseRevalidationTests(PrRecoveryFixture, unittest.TestCase):
             )
 
 
+@isolated_git_test
 class PrConflictInterruptionTests(PrRecoveryFixture, unittest.TestCase):
     # Mock pause/retry policy. Keep real Git for actual source preservation,
     # surviving operations/index, remote lease and resumed publication.

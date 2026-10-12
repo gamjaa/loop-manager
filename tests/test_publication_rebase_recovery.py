@@ -7,7 +7,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
-from tests.support.git import git_command, commit_and_push
+from tests.support.git import git_command, commit_and_push, isolated_git_test
 from tests.support.worker import worker_result
 from tests.support.worker import dummy_worker_sessions
 
@@ -15,6 +15,7 @@ from tests.support.worker import dummy_worker_sessions
 class PublicationRebaseRecoveryTestFixture(PublicationFixture):
     pass
 
+@isolated_git_test
 class PublicationConflictRecoveryTests(PublicationRebaseRecoveryTestFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_publication_rebase_conflict_blocks_when_worker_cannot_resolve(self):
@@ -367,6 +368,7 @@ class PublicationConflictRecoveryTests(PublicationRebaseRecoveryTestFixture, uni
         verify.assert_not_called()
 
 
+@isolated_git_test
 class PublicationRebaseInterruptionTests(PublicationRebaseRecoveryTestFixture, unittest.TestCase):
     # Real rebase metadata, conflict files and autostash/index preservation must
     # survive Agent pause and validation failure before the same recovery resumes.
@@ -695,6 +697,7 @@ class PublicationRebaseInterruptionTests(PublicationRebaseRecoveryTestFixture, u
         self.assertEqual(len(resumed_prompts), 3)
 
 
+@isolated_git_test
 class PublicationRebaseLeaseTests(PublicationRebaseRecoveryTestFixture, unittest.TestCase):
     def test_pr_conflict_push_preserves_config_and_exact_lease(self):
         branch, old, new, base = 'loop-manager/G-081', 'a' * 40, 'b' * 40, 'c' * 40

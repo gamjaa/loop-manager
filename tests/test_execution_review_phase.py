@@ -25,6 +25,10 @@ from tests.support.execution_recovery_scenarios import ExecutionRecoveryScenario
 from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 
+from tests.support.git import isolated_git_test
+
+
+@isolated_git_test
 class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
     def test_real_git_published_review_release_restart_and_correction(self):
         # Exercise the ownership boundary with real commits, refs, registration,

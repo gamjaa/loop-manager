@@ -17,6 +17,10 @@ from loop_manager_internal.recovery import checkpoint_ownership
 from tests.support.blocked_git import CheckpointGitRecoveryFixture
 
 
+from tests.support.git import isolated_git_test
+
+
+@isolated_git_test
 class GuidanceCheckpointGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.TestCase):
 
 
@@ -69,6 +73,7 @@ class GuidanceCheckpointGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.
         self.assertEqual(self.connection.execute("SELECT status FROM exec_plans").fetchone()[0], "PR_OPEN")
 
 
+@isolated_git_test
 class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
     def test_existing_push_instead_of_cannot_redirect_frozen_target(self):
         other = Path(self.temporary.name) / 'other-remote.git'

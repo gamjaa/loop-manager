@@ -31,6 +31,9 @@ Worker 결과·verify/Review·실패 이력·수동 후보와 PR 복구의 남�
 - 실제 Git을 유지하는 실행·rebase·복구·수동 작업 fixture의 직접 subprocess·운영 Git adapter 호출과 필요한 자식에 G-224의 격리 환경을 적용한다. 공통 helper를 중복 구현하지 않고 명시적인 설정·RecoveryBoundary의 config 복원과 실제 index/lease/checkpoint effect assertion을 보존한다.
 - 직접 전환된 retry/review escalation·PR 원인 판정과 중단 회귀 축소를 유지한다. G-197의 결과 전달과 G-183의 Review 재사용 목표는 구현하지 않으며 그 작업에서 테스트가 수정돼도 실제 후보·결과 계약을 기준으로 전환한다.
 - 공동 fixture는 기존 사용자 호환성을 유지하는 최소 변경으로 제한한다. AGENTS.md와 ARCHITECTURE의 Git 경계를 따르며 assertion 대응·실제 Git 유지 이유를 대상 테스트/계획 기록에 남긴다.
+- assertion 대응: `WorkerPublicationValidationTest.test_invalid_worker_result_resumes_same_session_without_verify`는 실제 parser와 coordinator, SQLite를 사용하고 Git 관측 및 프로세스는 거부 경계로 분리한다. 최초 invalid result의 `OPERATIONAL_ERROR`·phase·오류·session, 다음 Worker의 같은 session·오류 prompt, 첫 호출의 verify no-call과 재개 뒤 verify 1회를 유지한다. `WorkerValidationTest.test_repeated_verify_failure_blocks_in_one_run_without_reviewer`는 같은 `execution_policy_fixture`를 사용해 verify 실패 4회, Worker session 재사용, prompt revision, Reviewer no-call, `PLAN_BLOCKED`와 SQLite failure history occurrence 4를 유지하며 최종 차단의 revision/snapshot 관측만 명시 mock한다.
+- 수동 후보 assertion은 `ManualWorkTest.test_reviewer_prompt_distinguishes_a_valid_user_verify_waiver`의 명시 Git 관측 mock과 process 거부 경계에서 waiver/secret redaction·verify/review 결과를 검사하고, `ManualCandidate.publication`이 Worker 결과나 외부 targeted test PASS를 합성하지 않는지 확인한다. `test_manual_candidate_reaches_pr_without_fabricating_worker_or_test_evidence`와 기존 게시·rebase·checkpoint·RecoveryBoundary 회귀는 실제 후보 게시·Git/index/중단 효과를 확인하므로 유지한다. 단계별 Review protocol과 retry 이력은 기존 직접 관측 정책 case에 대응하며 G-197/G-183 목표를 이행하지 않는다.
+- G-224 환경 대응: 대상 `test_execution*`, `test_worker*`, `test_review*`, `test_recovery*`, `test_publication*`, `test_pr_*`, `test_rebase*`, `test_managed_rebase*`, `test_checkpoint*`, `test_blocked_remote_observation.py`, `test_manual*` 중 실제 Git fixture·운영 adapter·자식 프로세스를 쓰는 테스트 클래스는 기존 `isolated_git_test`를 사용한다. 설정 상속 테스트는 G-224의 명시 입력 회귀로 확인하고 실제 index·lease·checkpoint·게시 효과를 유지한다.
 
 ## Validation
 
@@ -43,7 +46,9 @@ Worker 결과·verify/Review·실패 이력·수동 후보와 PR 복구의 남�
 
 - [x] 2026-10-08 f3ae228의 R-080과 직접 테스트 전환 diff, 실행 관측 helper, 남은 Worker 결과/verify 실패 case 및 실제 conflict·재시작 회귀를 정적으로 확인했다. 구현·테스트 실행은 하지 않았다.
 - [x] 2026-10-10 사용자 요청으로 갱신된 R-080의 Git 환경 격리·반복 verify assertion·Git 실행 0회·비용 측정 조건을 대조하고 G-224 소비 범위와 선행 Merge를 문서에 반영했다. 구현·테스트·성능 측정은 하지 않았다.
-- [ ] 남은 case 대응·mock 전환과 targeted unit 검증
+- [x] 2026-10-12 `test_worker_publication_validation`의 invalid Worker result/session 재개와 `test_worker_validation`의 반복 verify 차단을 `execution_policy_fixture`로 전환했다. 수동 후보의 미확인 targeted test evidence는 기존 mock case에 추가 확인을 두었다. `python3 -B -m unittest tests.test_worker_publication_validation.WorkerPublicationValidationTest.test_invalid_worker_result_resumes_same_session_without_verify tests.test_worker_validation.WorkerValidationTest.test_repeated_verify_failure_blocks_in_one_run_without_reviewer tests.test_manual_work.ManualWorkTest.test_reviewer_prompt_distinguishes_a_valid_user_verify_waiver -v`에서 3개 targeted case가 통과했다. 전체 verify와 성능 비교는 실행하지 않았다.
+- [x] 2026-10-12 실제 Git 효과를 유지한 대상 테스트 클래스에 G-224의 `isolated_git_test`를 연결했다. Worker invalid/session 재개·반복 verify·수동 waiver·수동 게시 효과 4개 case와 G-224의 환경 복원·hostile 설정 차단 및 명시 입력 2개 case가 각각 targeted 실행에서 통과했다. 전체 verify와 성능 비교는 실행하지 않았다.
+- [x] 2026-10-12 관리 rebase 뒤 현재 base `3d691b433f39256d54edd12a17894d1db820e3d2`의 최종 후보에서 Worker 결과/session 재개·반복 verify 차단·수동 waiver/게시 4개 case와 G-224 Git 환경 복원·명시 입력 2개 case를 다시 실행해 모두 통과했다. 전체 verify와 성능 비교는 실행하지 않았다.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log

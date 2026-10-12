@@ -5,10 +5,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
-from tests.support.git import git_command, commit_and_push
+from tests.support.git import git_command, commit_and_push, isolated_git_test
 from tests.support.worker import worker_result
 
 
+@isolated_git_test
 class RecoveryFingerprintsTest(BoundedRecoveryFixture, unittest.TestCase):
 
     def test_failure_fingerprints_normalize_noise_and_preserve_issue_identity(self):

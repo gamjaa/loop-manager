@@ -22,11 +22,12 @@ from loop_manager_internal.agents import agent_write_isolation
 from loop_manager_internal.planning import manual_plan_generation
 from tests.support import manual_work as manual_tests
 from tests.support.catalog import write_execplan
-from tests.support.git import git_command as git, commit_and_push
+from tests.support.git import git_command as git, commit_and_push, isolated_git_test
 from tests.support.origin import remote_fixture, OriginScopeFixture
 from tests.support.workspace import WorkspaceFixture
 
 
+@isolated_git_test
 class ManualConcurrencyTests(WorkspaceFixture, unittest.TestCase):
     fixture = manual_tests.ManualWorkFixture.fixture
 
@@ -477,6 +478,7 @@ class ManualConcurrencyTests(WorkspaceFixture, unittest.TestCase):
             self.assertIsNone(service.store.for_plan(service.repo, 'G-012')['request_id'])
 
 
+@isolated_git_test
 class ManualBootstrapConcurrencyTests(OriginScopeFixture, unittest.TestCase):
     def test_concurrent_entries_reach_child_while_automatic_lease_is_held(self):
         for command in ("manual", "recover"):
