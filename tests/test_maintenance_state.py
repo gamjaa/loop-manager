@@ -646,21 +646,15 @@ class GeneratedDraftParserTest(unittest.TestCase):
             document_drafts.parse_generated_draft(
                 'DOCUMENT_DRAFT_RESULT: {"status":"uncertain","reason":" "}'
             )
-        exact_limit = (
-            '{"status":"uncertain","reason":"'
-            + "x" * (2_100_000 - len('{"status":"uncertain","reason":""}'))
-            + '"}'
-        )
-        self.assertEqual(len(exact_limit.encode("utf-8")), 2_100_000)
-        self.assertIsNone(document_drafts.parse_generated_draft(
-            "DOCUMENT_DRAFT_RESULT: " + exact_limit,
-        ))
-        above_limit = exact_limit[:-2] + '界"}'
-        self.assertGreater(len(above_limit.encode("utf-8")), 2_100_000)
+        prefix = '{"status":"uncertain","reason":"'
+        suffix = '"}'
+        exact_json = prefix + "x" * (2_100_000 - len((prefix + suffix).encode())) + suffix
+        exact_limit = "DOCUMENT_DRAFT_RESULT: " + exact_json
+        self.assertEqual(len(exact_json.encode("utf-8")), 2_100_000)
+        self.assertIsNone(document_drafts.parse_generated_draft(exact_limit))
+        above_limit = "DOCUMENT_DRAFT_RESULT: " + exact_json[:-2] + '界"}'
         with self.assertRaises(document_drafts.DocumentDraftError):
-            document_drafts.parse_generated_draft(
-                "DOCUMENT_DRAFT_RESULT: " + above_limit,
-            )
+            document_drafts.parse_generated_draft(above_limit)
 
 
 class GeneratedDraftCommandTest(unittest.TestCase):
@@ -731,6 +725,7 @@ class GeneratedDraftCommandTest(unittest.TestCase):
             ('DOCUMENT_DRAFT_RESULT: {"status":"candidate","content":false,"meaning_evidence":"Enough evidence."}', False),
             ('DOCUMENT_DRAFT_RESULT: {"status":"candidate","content":"# Proposed\\n","meaning_evidence":"Enough evidence."} trailing', False),
             ('DOCUMENT_DRAFT_RESULT: {"status":"uncertain","reason":"Meaning cannot be established."}\nDOCUMENT_DRAFT_RESULT: {}', False),
+            ('DOCUMENT_DRAFT_RESULT: {not json}', False),
         ):
             args = loop_manager.build_parser().parse_args([
                 "document-drafts", self.repo, "generate", "docs/PRODUCT.md",
@@ -797,13 +792,19 @@ class GeneratedDraftStorageTest(unittest.TestCase):
             "status": "candidate", "content": proposal.decode("utf-8"),
             "meaning_evidence": "Only duplicate wording changed; behavior is unchanged.",
         })
-        with mock.patch.object(document_drafts, "remote_revision", return_value="a" * 40), \
-             mock.patch.object(document_drafts, "document_at", return_value=("a" * 40, original)), \
+        with mock.patch.object(document_drafts, "remote_revision", return_value="a" * 40) as revision, \
+             mock.patch.object(document_drafts, "document_at", return_value=("a" * 40, original)) as document, \
              mock.patch.object(document_drafts, "checked_source_relationships", return_value="[]"):
             content, evidence = document_drafts.parse_generated_draft(response)
             draft = drafts.create(
                 repo, Path("/repo"), "main", "docs/PRODUCT.md", content, evidence,
             )
+        revision.assert_called_once_with(Path("/repo"), "main")
+        self.assertEqual(document.call_count, 2)
+        self.assertEqual(document.call_args_list[0].args,
+                         (Path("/repo"), "a" * 40, "docs/PRODUCT.md"))
+        self.assertEqual(document.call_args_list[1].args,
+                         (Path("/repo"), "a" * 40, "docs/PRODUCT.md"))
         stored = drafts.get(draft.draft_id)
         self.assertEqual(stored.proposed_content, proposal)
         self.assertEqual(stored.proposed_hash, hashlib.sha256(proposal).hexdigest())
