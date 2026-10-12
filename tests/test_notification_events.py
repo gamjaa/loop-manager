@@ -199,6 +199,32 @@ class NotificationRenderingTest(unittest.TestCase):
 
 
 class NotificationEventTest(NotificationFixture, unittest.TestCase):
+    def test_targeted_worker_failure_retains_recovery_history_without_notifications(self):
+        from tests.support.worker import worker_result
+        connection = self.connection()
+        repo = '/projects/alpha'
+        with self.assertRaises(loop_manager.WorkerResultError) as raised:
+            loop_manager.parse_worker_result(worker_result('Fix targeted regression',
+                'Repair the current implementation.', 'test: FAIL'), {'id': 'G-018', 'title': 'Reliable notices'})
+        cause = 'Worker 결과 검증 실패:\n' + str(raised.exception)
+        repository = RecoveryRepository(connection)
+        failure = RecoveryObservation(RecoveryReason.WORKER_CORRECTION, repo, 'G-018', 'WORKING',
+            'plan-sha', 'base-sha', 'targeted-failure', 'head', cause)
+        for _ in range(4):
+            before = repository.external_run_snapshot(repo)
+            repository.observe(failure)
+            repository.observe_external_run(repo, before)
+            notifications.enqueue_persistent_execution_failure_events(connection, repo)
+            notifications.enqueue_worker_failure(connection, repo, 'G-018', cause, status='다음 실행에서 교정')
+        self.assertEqual(self.events(connection), [])
+        diagnostic = connection.execute('SELECT consecutive_runs, notification_eligible, notification_queued, detail '
+            'FROM persistent_execution_failures WHERE repo=? AND subject=?', (repo, 'G-018')).fetchone()
+        self.assertEqual(tuple(diagnostic[:3]), (4, 1, 0))
+        self.assertEqual(diagnostic[3], cause)
+        transport = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, 'token', 'chat', adapter=transport), 0)
+        transport.assert_not_called()
+
     def test_blocked_projection_reads_aliases_in_any_column_order(self):
         connection = sqlite3.connect(":memory:")
         self.addCleanup(connection.close)

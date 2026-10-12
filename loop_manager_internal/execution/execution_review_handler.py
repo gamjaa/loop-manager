@@ -15,6 +15,8 @@ from loop_manager_internal.execution.execution_runtime import ExecutionContext, 
 from loop_manager_internal.execution.validation_feedback import normalize_feedback, redact_secrets
 from loop_manager_internal.documents.reviewer_specification import SpecificationDeadlock, validate_locations
 from loop_manager_internal.execution import stage_documents
+from loop_manager_internal.execution import preliminary_review
+from loop_manager_internal.storage import pre_review
 
 from loop_manager_internal.execution.execution_effects import ExecutionContract, FeedbackEffects
 from loop_manager_internal.execution.execution_session import ExecutionIdentity, PreparationSnapshot
@@ -59,6 +61,7 @@ class ReviewHandlerPorts:
     _row: Callable[[], Mapping[str, object]]
     observe_verify_inputs: Callable[..., Any] | None = None
     checkpoint: Any = None
+    pre_review_identity: Callable[..., Any] | None = None
 
 
 class ReviewHandler:
@@ -129,6 +132,13 @@ class ReviewHandler:
                 f"이전 선언·입력(새 조건의 검증 증명이 아님): {item.get('previous', '기록 없음')}\n"
                 f"과거 출력(최신 조건의 PASS가 아님):\n"
                 + redact_secrets(str(item['verify_result'] or '기록 없음')))
+
+        preliminary = preliminary_review.active(self.ports, context, {'partial_pass', 'review_running'})
+        if preliminary and self.ports._document_draft(context) is None:
+            self._preliminary = preliminary
+            return worker_publication, ('Manager 부분 verify PASS; 전체 verify는 아직 실행하지 않았습니다. '
+                '일반 선행 Review로 구현·회귀·요구사항을 검토하세요. PASS는 최종 게시 승인이 아닙니다.\n'
+                + str(preliminary['partial']))
 
         candidate_head = self.ports.git(
             context.worktree, 'rev-parse', 'HEAD',
@@ -204,6 +214,7 @@ class ReviewHandler:
                 f"{redact_secrets(str(receipt['result']))}.")
 
     def review(self, context: ExecutionContext) -> ExecutionOutcome:
+        self._preliminary = None
         self.ports.state.check_context(context)
         row = self.ports._row()
         assert self.ports.snapshot().catalog_plan is not None and self.ports.snapshot().plan is not None
@@ -218,6 +229,36 @@ class ReviewHandler:
         if isinstance(entry_evidence, ExecutionOutcome):
             return entry_evidence
         worker_publication, verify_evidence = entry_evidence
+        preliminary = self._preliminary
+        if not preliminary and not self._pending_document_review(context):
+            approved = preliminary_review.active(self.ports, context, {'review_pass', 'final_review_pending'})
+            if (preliminary_review.reusable(self.ports, context, approved)
+                    and preliminary_review.full_evidence(self.ports, context, approved)):
+                with runtime_state._transaction(self.ports.state.connection):
+                    self.ports.state.check_context(context)
+                    # Entry evidence already required current full token + receipt;
+                    # repeat input identity at the state transition boundary.
+                    if (not preliminary_review.reusable(self.ports, context, approved)
+                            or not preliminary_review.full_evidence(self.ports, context, approved)):
+                        return self.ports._retry('선행 Review 최종 승인 입력이 변경됐습니다.')
+                    pre_review.update(self.ports.state.connection, approved, 'finalized_reuse')
+                    self.ports.clear_validation_failure_history(self.ports.identity.repo, 'review')
+                    self.ports.state.update_project(self.ports.identity.repo, preserve_transaction=True,
+                        phase='PUBLISHING', last_error=None, review_result=approved['review'],
+                        review_token=self.ports.snapshot()._definition_snapshot.review_token(
+                            str(row['validated_base_sha']), self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()),
+                        publication_token=None)
+                return self.ports._advanced()
+            if approved:
+                # Once a fresh final invocation is necessary, its failure or
+                # interruption must never be overwritten by the old early PASS.
+                with runtime_state._transaction(self.ports.state.connection):
+                    self.ports.state.check_context(context)
+                    pre_review.update(self.ports.state.connection, approved, 'final_review_running')
+        preliminary_identity = preliminary_review.review_identity(self.ports, context) if preliminary else None
+        if preliminary and preliminary['status'] == 'partial_pass':
+            with runtime_state._transaction(self.ports.state.connection):
+                preliminary = pre_review.update(self.ports.state.connection, preliminary, 'review_running')
         document_review = self._pending_document_review(context)
         document_instruction = (
             '\n최신 문서의 선행 Review: 구현·테스트 수정이 필요하면 기존 FAIL과 ISSUE_ID로 보고하라. '
@@ -229,13 +270,15 @@ class ReviewHandler:
             self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id,
         )
         candidate = correction.get('candidate')
-        if candidate and candidate['completed'] and candidate['verified_head'] == candidate_head:
+        if candidate and candidate['completed'] and (candidate['verified_head'] == candidate_head
+                or preliminary and candidate.get('partial_head') == candidate_head):
             review_level = candidate['level']
         elif 'level' in correction:
             pending = correction.get('pending')
             # Preserve the conservative interpretation of older stored candidates.
             review_level = (pending['level'] if pending and pending['completed']
-                            and pending['verified_head'] == candidate_head
+                            and (pending['verified_head'] == candidate_head
+                                 or preliminary and pending.get('partial_head') == candidate_head)
                             else correction['level'])
         from loop_manager_internal.execution.manual_candidate import get_manual
         manual = get_manual(self.ports.state)
@@ -303,7 +346,7 @@ class ReviewHandler:
                     invocation=invocation,
                 ), AttemptSequence(self.ports.identity.repo, str(self.ports.snapshot().plan['id']),
                                    str(self.ports.snapshot().catalog_plan['current_revision_sha']) if self.ports.snapshot().catalog_plan['current_revision_sha'] is not None else None,
-                                   purpose="review")),
+                                   purpose="preliminary_review" if preliminary else "review")),
                 session_id=row['reviewer_session_id'],
             )
             code, review = review_result
@@ -487,6 +530,25 @@ class ReviewHandler:
                         review_result=review, last_error=None)
                 return self.ports._advanced()
             # FAIL 교정은 기존 전이 경로가 수행하며, 후보가 바뀌면 관측 marker도 만료된다.
+        if preliminary:
+            with runtime_state._transaction(self.ports.state.connection):
+                same_candidate = preliminary['candidate'] == preliminary_review.candidate(self.ports, context)
+                invocation_id = getattr(review_result, 'isolation_invocation_id', None)
+                if not isinstance(invocation_id, str) or not invocation_id:
+                    invocation_id = None
+                actual_identity = (preliminary_review.review_identity(self.ports, context, invocation_id=invocation_id)
+                                   if invocation_id else None)
+                same_identity = (preliminary_identity is not None and preliminary_identity == actual_identity
+                                 == preliminary_review.review_identity(self.ports, context))
+                pre_review.update(self.ports.state.connection, preliminary,
+                    'review_pass' if verdict == 'PASS' and same_candidate and same_identity else
+                    'review_invalidated' if verdict == 'PASS' else 'review_fail',
+                    review=review, identity={**actual_identity, 'invocation_id': invocation_id} if actual_identity else None)
+                if verdict == 'PASS':
+                    self.ports.state.update_project(self.ports.identity.repo, preserve_transaction=True,
+                        phase='VERIFYING', validated_base_sha=None, verify_token=None,
+                        review_token=None, publication_token=None, last_error=None)
+                    return self.ports._advanced()
         review_source_id = None
         if feedback_repo is not None:
             review_source_id = feedback_repo.observe(
@@ -495,6 +557,9 @@ class ReviewHandler:
                 normalize_feedback('review', review) if verdict == 'FAIL' else (),
             )
         if verdict == 'FAIL':
+            final_preliminary = pre_review.current(self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id)
+            if not preliminary and final_preliminary and final_preliminary['status'] == 'final_review_running':
+                pre_review.update(self.ports.state.connection, final_preliminary, 'final_review_failed')
             decision = self.ports.transition_validation_failure(
                 self.ports.identity.repo, context.worktree, 'review', review,
                 review_level=review_level, candidate_head=candidate_head,
@@ -515,6 +580,9 @@ class ReviewHandler:
                 context=context, fingerprint=decision.fingerprint,
             )
         self.ports.clear_validation_failure_history(self.ports.identity.repo, 'review')
+        prior = pre_review.current(self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id)
+        if prior and prior['status'] in {'review_pass', 'final_review_running'}:
+            pre_review.update(self.ports.state.connection, prior, 'finalized_review')
         self.ports.state.update_project(
             self.ports.identity.repo,
             phase='PUBLISHING',

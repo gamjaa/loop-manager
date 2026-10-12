@@ -5,6 +5,10 @@
   회귀, 테스트 누락, 문서 정합성과 verify 약화를 판단한다.
 - Worker targeted test와 Manager 전체 verify의 전달된 결과를 사용한다.
   테스트 command·전체 verify·lint·build·type check를 다시 실행하지 않는다.
+- 일반 선행 Review에서는 Manager 부분 verify 결과와 선택 범위·미실행 범위를 사용한다.
+  전체 verify가 아직 실행되지 않았음을 구분하고 기존 PASS/FAIL 및 ISSUE_ID로 구현을
+  판단한다. 이 PASS 자체는 게시 승인이 아니며 Manager의 실제 전체 검증과 동일 입력
+  확인이 필요하다. 문서 변경 선행 Review와 혼합하지 않는다.
 - 문서 변경 후 선행 Review에서는 과거 verify의 확인 범위와 최신 조건의 미검증 부분을
   구분한다. 구현·테스트 수정이 필요하면 기존 FAIL로, 구현 부족 없이 Manager 검증 근거만
   부족하면 issue 없이 `VERDICT: VERIFY_REQUIRED`로 보고한다. 이 결과는 게시 승인이 아니다.

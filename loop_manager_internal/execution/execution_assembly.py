@@ -317,6 +317,10 @@ def verify(effects: ExecutionEffects, identity: ExecutionIdentity,
         snapshot: Callable[[], PreparationSnapshot], update_snapshot: Callable[..., None],
         callbacks: dict[str, Callable], *, recovery=None, rebase_corrections=None) -> VerifyHandler:
     return VerifyHandler(VerifyHandlerPorts(
+        checkpoint=effects.checkpoint,
+        partial_verify_enabled=effects.validation.partial_verify_enabled,
+        partial_verify=effects.validation.partial_verify,
+        pre_review_identity=effects.validation.pre_review_identity,
         observe_verify_inputs=effects.validation.observe_verify_inputs,
         identity=identity,
         snapshot=snapshot,
@@ -360,6 +364,7 @@ def review(effects: ExecutionEffects, identity: ExecutionIdentity,
         snapshot: Callable[[], PreparationSnapshot], update_snapshot: Callable[..., None],
         callbacks: dict[str, Callable], *, recovery=None, rebase_corrections=None) -> ReviewHandler:
     return ReviewHandler(ReviewHandlerPorts(
+        pre_review_identity=effects.validation.pre_review_identity,
         checkpoint=effects.checkpoint,
         identity=identity,
         snapshot=snapshot,
@@ -432,6 +437,8 @@ def publication(effects: ExecutionEffects, identity: ExecutionIdentity,
         snapshot: Callable[[], PreparationSnapshot], update_snapshot: Callable[..., None],
         callbacks: dict[str, Callable], *, recovery=None, rebase_corrections=None) -> PublicationHandler:
     return PublicationHandler(PublicationHandlerPorts(
+        observe_verify_inputs=effects.validation.observe_verify_inputs,
+        pre_review_identity=effects.validation.pre_review_identity,
         identity=identity,
         snapshot=snapshot,
         checkpoint=effects.checkpoint,

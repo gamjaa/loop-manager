@@ -335,6 +335,12 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
         )
 
 
+def worker_targeted_failure(reason_code, detail) -> bool:
+    """The unresolved Worker test diagnostic is local correction evidence."""
+    return (reason_code == 'worker_correction' and
+            'Worker가 해결되지 않은 targeted unit test 실패를 보고했습니다.' in str(detail))
+
+
 def enqueue_persistent_execution_failure_events(
     connection: sqlite3.Connection, repo: str,
 ) -> None:
@@ -365,6 +371,8 @@ def enqueue_persistent_execution_failure_events(
         (repo,),
     ).fetchall()
     for row in rows:
+        if worker_targeted_failure(row['reason_code'], row['detail']):
+            continue  # Keep recovery history/counters without a notification.
         subject = str(row["subject"])
         plan_id = None if subject == "__project__" else subject
         identity = "\0".join((subject, str(row["episode"]), str(row["phase"]),
@@ -656,7 +664,7 @@ def enqueue_review_failure(connection, repo, plan_id, cause, *, status):
 
 def enqueue_worker_failure(connection, repo, plan_id, cause, *, status):
     """Persist a Worker return failure in its owning state transaction."""
-    if not _enabled(connection):
+    if not _enabled(connection) or worker_targeted_failure('worker_correction', cause):
         return
     plan = connection.execute(
         "SELECT plan_id, current_revision_sha, worker_input_token FROM exec_plans "
