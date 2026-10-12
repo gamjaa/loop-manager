@@ -29,6 +29,15 @@ priority: normal
 
 G-222는 planning/catalog/maintenance·코드맵, G-223은 execution/검증/복구 소비자의 전환을 담당한다. 이 작업은 그 계획에 없는 지침 정책과 등록 wrapper를 맡으며 해당 기존 범위를 재구현하지 않는다. 두 READY 작업 또는 provider 설정 기능의 Merge는 이 국소 테스트 변경의 선행 조건이 아니다.
 
+## 구현 검증 대응
+
+| 변경 경계 | 기존 조건·assertion | 수정 후 계속 확인하는 조건·assertion |
+|---|---|---|
+| `CommonPlansScopeTest.test_common_plans_scope_requires_direct_acceptance_criterion` | 임시 저장소에 세 계획을 commit해 우연한 문구, 직접 Acceptance Criteria, conjunctive 문구, `current_revision_sha` 우선과 Loop Manager 저장소 유형을 실제 `git show`로 확인했다. | commit·checkout을 제거하고 `git show`의 `CompletedProcess` 반환 코드와 본문, 저장소 유형을 명시적으로 주입한다. 기존 네 정책 판단과 revision 인자 선택을 유지하고 show 오류와 비-Loop-Manager 거부도 검사한다. 실제 판정 함수는 실행하며 `subprocess.Popen` guard로 프로세스 실행을 막는다. |
+| `tests/support/guidance.py`의 `git_result`·`git`·`repository` | 별도 `CompletedProcess`/문자열 helper로 저장소를 만들었지만 Git 호출이 사용자 환경을 상속할 수 있었다. | `git_result`가 `git_test_environment()`를 전달하면서 `CompletedProcess`, `check=False`, 합쳐진 stderr와 subprocess 예외 계약을 유지한다. `GuidanceGitAdapterTest`가 명시 환경과 반환·오류 계약을 확인한다. |
+| `ManagedConfigurationAndProjectRegistryTest`의 직접 Git adapter | 등록 복구 테스트의 bare init·commit·revision 조회에 class 격리 환경을 상속하는 별도 subprocess adapter가 있었다. | `_git`, bare init 및 revision 조회가 `git_command`를 사용한다. `test_git_adapter_delegates_to_shared_command`는 adapter 위임을 Git 없이 확인하고, 등록 identity·rollback 회귀는 기존 실제 Git assertion을 유지한다. 기존 class의 `isolated_git_test`는 운영 adapter와 자식에 적용된다. |
+| G-224 공통 격리 경계 | seed·독립 복사·caller 환경 복원 및 통제 입력의 실제 설정 효과를 기존 `tests/test_git_fixture_seed.py`가 확인한다. | 공통 fixture 구현을 중복하지 않는다. `GitEnvironmentTests.test_environment_restores_after_setup_failure_and_next_test`를 실행해 실패 setup 뒤 caller 환경 복원을 확인한다. |
+
 ## Validation
 
 - Worker targeted unit test는 CommonPlansScopeTest의 실제 판단·revision 선택과 예상 밖 subprocess 거부를 확인한다. 실패한 git show·누락한 선언도 관측으로 제공하며 정책 함수를 성공 mock으로 대체하지 않는다.
@@ -39,7 +48,8 @@ G-222는 planning/catalog/maintenance·코드맵, G-223은 execution/검증/복�
 ## Progress
 
 - [x] 2026-10-12 source revision `c401d563589399dbca83ffe4c9cfe13419ff128e`의 module manifest `c10544e0999d36ee6e8143dedecacb414a03b8f2205fbfd2bbbb0b472d1e00b6` 발견 18·24·38과 인용을 재사용했다. 현재 HEAD·공통 helper의 반환/격리 문맥을 확인했으며 테스트·verify·비용 측정은 실행하지 않았다.
-- [ ] 정책 관측 분리·기존 공통 환경 연결과 targeted unit 검증
+- [x] 2026-10-12 rebase 전 후보에서 정책 관측 분리·공통 환경 연결을 구현하고 targeted 6개 test case를 실행했다. 이 결과는 이후 후보에 재사용하지 않는다.
+- [x] 2026-10-12 rebase 후 HEAD `1e1f92aa`에서 CommonPlansScopeTest·GuidanceGitAdapterTest·등록 adapter 위임·실패 setup 뒤 환경 복원의 targeted 5개 test case를 Python 3.12.3으로 다시 실행해 통과했다. 대응표의 이전/이후 조건은 유지했다.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log

@@ -2,6 +2,8 @@ import sqlite3
 import subprocess
 from pathlib import Path
 
+from tests.support.git import git_test_environment
+
 
 PATCH = """diff --git a/AGENTS.md b/AGENTS.md
 --- a/AGENTS.md
@@ -55,6 +57,7 @@ def git_result(repo: Path, *arguments: str, check: bool = True) -> subprocess.Co
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
+        env=git_test_environment(),
     )
 
 
