@@ -183,10 +183,12 @@ class PreliminaryReviewTests(ExecutionFixture, unittest.TestCase):
 
     def test_production_observer_completes_cycle_with_actual_adapter_and_durable_evidence(self):
         from pathlib import Path
-        from tests.test_provider_execution import ProviderExecutionTests
+        from tests.support.provider_execution import ProviderExecutionFixture
         from tests.support.workspace import pin_common_guidance
         from loop_manager_internal.agents.agent_invocation import InvocationContext
-        native = ProviderExecutionTests()
+        class NativeFixture(ProviderExecutionFixture, unittest.TestCase):
+            pass
+        native = NativeFixture()
         native.plan_id = 'G-047'
         native.setUp()
         self.addCleanup(native.doCleanups)
