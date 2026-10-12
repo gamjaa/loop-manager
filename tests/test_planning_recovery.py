@@ -1612,6 +1612,7 @@ class PlanningConflictCorrectionUnitTests(PlanningCase):
                     plan.parent.mkdir(parents=True)
                     plan.write_text("approved plan\n")
                 connection = sqlite3.connect(":memory:")
+                connection.row_factory = sqlite3.Row
                 self.addCleanup(connection.close)
                 connection.execute("CREATE TABLE projects (repo TEXT PRIMARY KEY)")
                 connection.execute("INSERT INTO projects VALUES ('/repo')")
