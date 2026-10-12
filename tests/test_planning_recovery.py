@@ -1585,6 +1585,224 @@ class PlanningConflictCorrectionUnitTests(PlanningCase):
         self.assertEqual(self.agent.run_count, 1)
         self.assertIn(("add", "--", *sorted((ARTIFACT_PATH, self.plan_path))), self.effects)
 
+    def test_manager_code_map_correction_uses_receipt_backed_journal(self):
+        from loop_manager_internal.maintenance import code_map_artifact
+        from loop_manager_internal.planning.conflict_correction import PlanningConflictCorrection
+        from loop_manager_internal.planning import planning_rebase
+        from loop_manager_internal.planning.git_ports import _PlanningGitPorts
+
+        artifact_path = code_map_artifact.ARTIFACT_PATH
+        contents = b'{"version":1}\n'
+        oid = "a" * 40
+        scenarios = (
+            ("standalone", (artifact_path,), "", True),
+            ("stash", (artifact_path,), "stash", False),
+            ("mixed", (self.plan_path, artifact_path), "", True),
+        )
+        for name, paths, stash_sha, was_rebase in scenarios:
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                worktree = root / "planning"
+                worktree.mkdir()
+                rebase_dir = worktree / ".git/rebase-merge"
+                if was_rebase:
+                    rebase_dir.mkdir(parents=True)
+                if self.plan_path in paths:
+                    plan = worktree / self.plan_path
+                    plan.parent.mkdir(parents=True)
+                    plan.write_text("approved plan\n")
+                connection = sqlite3.connect(":memory:")
+                connection.row_factory = sqlite3.Row
+                self.addCleanup(connection.close)
+                connection.execute("CREATE TABLE projects (repo TEXT PRIMARY KEY)")
+                connection.execute("INSERT INTO projects VALUES ('/repo')")
+                connection.execute(code_map_artifact._SCHEMA)
+                connection.execute(
+                    "INSERT INTO maintenance_code_map_exports VALUES (?, ?, ?, ?)",
+                    ("/repo", 1, "base", hashlib.sha256(contents).hexdigest()),
+                )
+
+                effects = []
+                head = {"value": "base"}
+                interruptions = {"add": stash_sha != "", "continue": was_rebase,
+                                 "reset": stash_sha != ""}
+
+                def git(_worktree, *args, check=True):
+                    effects.append(args)
+                    if args[:2] == ("merge-base", "--is-ancestor"):
+                        return SimpleNamespace(stdout="", returncode=0)
+                    if args == ("stash", "list", "--format=%gd%x00%H%x00%gs"):
+                        value = ("stash@{0}\0stash\0loop-manager-planning-rebase:nonce\n"
+                                 if stash_sha else "")
+                        return SimpleNamespace(stdout=value, returncode=0)
+                    if args == ("diff", "--name-only", "--diff-filter=U", "-z"):
+                        unmerged = "" if stash_sha else "\0".join(paths) + "\0"
+                        return SimpleNamespace(stdout=unmerged, returncode=0)
+                    if args == ("rev-parse", "--git-path", "rebase-merge"):
+                        return SimpleNamespace(stdout=str(rebase_dir) + "\n", returncode=0)
+                    if args == ("rev-parse", "--git-path", "rebase-apply"):
+                        return SimpleNamespace(stdout=str(worktree / ".git/rebase-apply") + "\n", returncode=0)
+                    if args == ("rev-parse", "HEAD"):
+                        return SimpleNamespace(stdout=head["value"] + "\n", returncode=0)
+                    if args == ("ls-files", "-u", "-z"):
+                        return SimpleNamespace(stdout="", returncode=0)
+                    if args[:2] == ("diff", "--binary") or args[:3] == ("diff", "--cached", "--binary"):
+                        return SimpleNamespace(stdout="", returncode=0)
+                    if args[:2] == ("status", "--porcelain"):
+                        return SimpleNamespace(stdout=" M docs/maintenance/code-map.jsonl\n", returncode=0)
+                    if args[:1] == ("add",):
+                        if interruptions["add"]:
+                            interruptions["add"] = False
+                            raise RuntimeError("interrupted after journal save")
+                        return SimpleNamespace(stdout="", returncode=0)
+                    if args[:2] == ("reset", "--soft"):
+                        if interruptions["reset"]:
+                            interruptions["reset"] = False
+                            return SimpleNamespace(stdout="reset interrupted", returncode=1)
+                        head["value"] = args[2]
+                        return SimpleNamespace(stdout="", returncode=0)
+                    if args == ("-c", "core.editor=true", "rebase", "--continue"):
+                        code = int(interruptions["continue"])
+                        interruptions["continue"] = False
+                        return SimpleNamespace(stdout="continue failed" if code else "", returncode=code)
+                    if args[:3] == ("ls-tree", "-r", "--name-only"):
+                        return SimpleNamespace(stdout="", returncode=0)
+                    if args == ("ls-files", "--others", "--exclude-standard"):
+                        return SimpleNamespace(stdout="", returncode=0)
+                    if args[:3] == ("diff", "--quiet", "HEAD"):
+                        return SimpleNamespace(stdout="", returncode=0)
+                    raise AssertionError(f"unexpected Git command: {args}")
+
+                def nul_paths(_worktree, *args):
+                    if args in (
+                        ("diff", "--name-only", "HEAD", "-z"),
+                        ("ls-files", "--others", "--exclude-standard", "-z"),
+                        ("ls-files", "-u", "-z"),
+                    ):
+                        return ()
+                    raise AssertionError(f"unexpected NUL Git command: {args}")
+
+                ports = _PlanningGitPorts(
+                    SimpleNamespace(
+                        git=git, _nul_git_paths=nul_paths,
+                        validate_planning_worktree_ownership=lambda *_args: None,
+                    ),
+                    connection, worktree, root / "state",
+                )
+                journal = planning_rebase._journal_path(root / "state", "/repo", worktree)
+                planning_rebase._write(journal, {
+                    "repo": "/repo", "worktree": str(worktree.resolve()),
+                    "old": "old", "target": "target", "head": "base",
+                    "nonce": "nonce", "dirty": True, "phase": "conflict",
+                    "restored_head": "base",
+                })
+
+                def read_conflict_blob(repository, *args):
+                    self.assertEqual(repository, worktree)
+                    if args[0] == "ls-files":
+                        return f"100644 {oid} 3\t{artifact_path}\0".encode()
+                    if args[0] == "ls-tree":
+                        return f"100644 blob {oid}\t{artifact_path}\0".encode()
+                    if args[:2] == ("cat-file", "-s"):
+                        return str(len(contents)).encode()
+                    if args[:2] == ("cat-file", "blob"):
+                        return contents
+                    raise AssertionError(f"unexpected artifact Git command: {args}")
+
+                with mock.patch.object(code_map_artifact, "_git", side_effect=read_conflict_blob):
+                    agent = FakeAgentPort()
+                    events = FakeEventPort()
+                    correction = PlanningConflictCorrection(ports, agent, events)
+                    sessions = []
+                    def resolve():
+                        return correction.resolve(
+                            "/repo", worktree, "target", "conflict", "maintenance_planner",
+                            "saved-session", sessions.append,
+                            collision_paths=(artifact_path,) if stash_sha else (), stash_sha=stash_sha,
+                        )
+                    if interruptions["add"]:
+                        with self.assertRaisesRegex(RuntimeError, "interrupted after journal save"):
+                            resolve()
+                    else:
+                        self.assertFalse(resolve())
+                self.assertEqual((worktree / artifact_path).read_bytes(), contents)
+                record = planning_rebase._read(journal, "/repo", worktree)
+                self.assertEqual(tuple(record["correction"]["paths"]), tuple(sorted(paths)))
+                self.assertEqual(
+                    set(record["correction"]), {"paths", "was_rebase", "head", "digest"},
+                )
+                artifact = worktree / artifact_path
+                for column, value in (("cycle_revision", 2), ("source_revision", "other")):
+                    with self.subTest(receipt_identity=column):
+                        connection.execute(
+                            f"UPDATE maintenance_code_map_exports SET {column} = ? WHERE repo = ?",
+                            (value, "/repo"),
+                        )
+                        self.assertEqual(artifact.read_bytes(), contents)
+                        with self.assertRaises(planning_rebase.PlanningRebaseError):
+                            ports.planning_correction("/repo", worktree, "target")
+                        connection.execute(
+                            f"UPDATE maintenance_code_map_exports SET {column} = ? WHERE repo = ?",
+                            (1 if column == "cycle_revision" else "base", "/repo"),
+                        )
+                self.assertEqual(planning_rebase._read(journal, "/repo", worktree), record)
+
+                if stash_sha:
+                    with self.assertRaisesRegex(planning_rebase.PlanningRebaseError, "reset --soft"):
+                        resolve()
+                    accepting = planning_rebase._read(journal, "/repo", worktree)
+                    self.assertEqual(accepting["phase"], "accepting")
+                    self.assertEqual(artifact.read_bytes(), contents)
+                    resets_before_rejection = sum(args[:2] == ("reset", "--soft") for args in effects)
+                    connection.execute(
+                        "UPDATE maintenance_code_map_exports SET source_revision = ? WHERE repo = ?",
+                        ("other", "/repo"),
+                    )
+                    with self.assertRaises(planning_rebase.PlanningRebaseError):
+                        ports.rebase_planning_workspace(
+                            "/repo", "fingerprint", worktree, "old", "target",
+                        )
+                    self.assertEqual(head["value"], "base")
+                    self.assertEqual(
+                        sum(args[:2] == ("reset", "--soft") for args in effects),
+                        resets_before_rejection,
+                    )
+                    self.assertEqual(planning_rebase._read(journal, "/repo", worktree), accepting)
+                    self.assertFalse(any(args[:2] == ("stash", "drop") for args in effects))
+                    connection.execute(
+                        "UPDATE maintenance_code_map_exports SET source_revision = ? WHERE repo = ?",
+                        ("base", "/repo"),
+                    )
+                    resumed = ports.rebase_planning_workspace(
+                        "/repo", "fingerprint", worktree, "old", "target",
+                    )
+                    self.assertTrue(resumed.changed)
+                    self.assertEqual(head["value"], "target")
+                    self.assertEqual(planning_rebase._read(journal, "/repo", worktree)["phase"], "restored")
+                else:
+                    self.assertTrue(resolve())
+                self.assertEqual(agent.run_count, int(name == "mixed"))
+                if name == "mixed":
+                    self.assertNotIn(artifact_path, agent.prompts[-1])
+                self.assertIn(("add", "--", *tuple(sorted(paths))), effects)
+                if not stash_sha:
+                    self.assertEqual(
+                        ports.planning_correction("/repo", worktree, "target"),
+                        (tuple(sorted(paths)), was_rebase),
+                    )
+
+                if not stash_sha:
+                    artifact.write_bytes(b"changed")
+                    with self.assertRaises(planning_rebase.PlanningRebaseError):
+                        ports.save_planning_correction(
+                            "/repo", worktree, "target", tuple(sorted(paths)), was_rebase,
+                        )
+                    with self.assertRaises(planning_rebase.PlanningRebaseError):
+                        ports.planning_correction("/repo", worktree, "target")
+                    self.assertEqual(
+                        planning_rebase._read(journal, "/repo", worktree), record,
+                    )
+
     def test_continue_failure_retains_saved_correction_and_session(self):
         self.continue_code = 1
         self.assertFalse(self.resolve())
