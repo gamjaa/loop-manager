@@ -5,6 +5,7 @@ sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-065] 실제 부하 기반 verify 병렬 실행.md
   - docs/requirements/[R-067] 프로젝트 공통 verify 실행 규약.md
+  - docs/requirements/[R-086] 영향 기반 부분 검증과 일반 선행 Review.md
 depends_on:
   - G-186
   - G-208
@@ -31,9 +32,10 @@ priority: normal
 
 ## Acceptance Criteria
 
-- Windows·Linux의 실제 Python/비Python 프로젝트에서 auto와 1이 같은 수집·테스트/compile 범위를 수행한다. 고부하 대기·동시 두 프로젝트·새 작업 진입에서 실제 관측과 미반영 예약을 함께 계산한다.
+- 전체 실행의 Windows·Linux 실제 Python/비Python 프로젝트에서 auto와 1이 같은 수집·테스트/compile 범위를 수행한다. 고부하 대기·동시 두 프로젝트·새 작업 진입에서 실제 관측과 미반영 예약을 함께 계산한다.
+- R-086이 지원하는 자체 unittest 부분 실행에서도 기존 자식/예약 격리·timeout·취소·종료 불명 보호를 확인한다. 부분 실행의 미선택 상태와 실행 없는 fallback을 전체 필수 검증 완료와 구분하며 Python/비Python의 기존 전체 적합성 범위는 유지한다.
 - timeout·취소·시작/통신/결과 오류·강제 종료에서 해당 자식 종료와 예약 해제를 확인한다. 종료 미확인 예약은 함부로 풀지 않고 다른 프로젝트의 자식/예약/작업을 변경하지 않는다.
-- 동일 revision·도구 버전·병렬도·부하 조건의 직렬/auto 실제 전체 verify 시간을 비교한다. 테스트/fixture/정리·자원 대기·개별 누적과 전체 경과를 구분하며 미측정 속도 개선을 주장하지 않는다.
+- 동일 revision·도구 버전·부하 조건에서 병렬도 설정·실제 worker 수를 기록하고 직렬/auto 실제 전체 verify 시간을 비교한다. 부분 실행 자료는 같은 mode·실제 선택 집합끼리 별도로 비교하며 전체/부분 시간을 같은 범위의 병렬 성능으로 해석하지 않는다. 테스트/fixture/정리·자원 대기·개별 누적과 전체 경과를 구분하며 미측정 속도 개선을 주장하지 않는다.
 - Worker는 좁은 관련 unit case만 실행하고 전체 실제 OS/언어 검증·성능 비교는 Manager가 Agent 밖에서 실행한다. 미실행 플랫폼/미완료 결과를 성공으로 표시하지 않는다.
 
 ## Implementation

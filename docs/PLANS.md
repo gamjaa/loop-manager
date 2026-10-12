@@ -11,8 +11,8 @@
 - 실행 상태는 파일에 기록하지 않는다. 같은 프로젝트를 직렬로 실행하더라도 모든 `depends_on`이 SQLite에서 `MERGED`가 되기 전에는 Worker를 시작하지 않는다.
 - Loop Manager는 존재하지 않는 ID, 자기 자신에 대한 의존성과 순환 의존성을 코드로 거부한다.
 - BLOCKED 해제를 위해 사용자가 ExecPlan을 수정할 수 있으며, Loop Manager는 내용 변경을 감지해 작업을 재개한다.
-- `Validation`에는 Worker가 실행할 계획별 targeted unit test, 추가할 테스트 시나리오와 전체 verify가 확인해야 할 계획 고유의 회귀 조건만 기록한다.
-- Loop Manager가 현재 운영체제의 전체 verify 스크립트를 항상 실행하므로 `scripts/verify.ps1`과 `scripts/verify.sh` 경로를 ExecPlan마다 반복하지 않는다.
+- `Validation`에는 Worker가 실행할 계획별 targeted unit test, 추가할 테스트 시나리오와 부분/전체 verify가 확인해야 할 계획 고유의 회귀 조건만 기록한다. 자체 저장소의 실행 순서와 최종 전체 검증·승인 조건은 R-086을 따른다.
+- 현재 운영체제의 verify 스크립트 선택·실행은 Loop Manager가 담당하므로 `scripts/verify.ps1`과 `scripts/verify.sh` 경로를 ExecPlan마다 반복하지 않는다. 부분 FAIL·일반 선행 FAIL·fallback의 실제 실행 범위를 구분하고 미호출 전체 verify를 성공으로 기록하지 않는다.
 
 ## Planner 변경 범위
 

@@ -4,6 +4,7 @@ title: verify 연속 배정과 비교 가능한 모듈 시간 순서
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-065] 실제 부하 기반 verify 병렬 실행.md
+  - docs/requirements/[R-086] 영향 기반 부분 검증과 일반 선행 Review.md
 depends_on:
   - G-265
   - G-266
@@ -29,13 +30,13 @@ coordinator가 허용하는 독립 모듈을 연속 배정해 모듈별 고정 5
 
 ## Implementation
 
-verification/core.py의 수집→pending 배정→대기 경계와 runner의 실행 큐 준비를 기존 coordinator·timing 자료에 연결한다. timing.comparison과 기존 manifest/환경 identity로 과거 시간의 비교 가능성을 확인하고 검증 실패에는 수집 순서를 사용한다. stage 사이 순서를 바꾸거나 새 cache/IPC/worker 내부 pool을 만들지 않는다. G-248이 보강할 시점 이벤트와 관계없이 기존 이벤트 계약을 유지한다.
+verification/core.py의 수집→pending 배정→대기 경계와 runner의 실행 큐 준비를 기존 coordinator·timing 자료에 연결한다. timing.comparison의 기존 범위·환경 대조에 실행 모드·선택 집합·자료 완결성 확인을 결합해 과거 시간의 비교 가능성을 확인하고 검증 실패에는 수집 순서를 사용한다. stage 사이 순서를 바꾸거나 새 cache/IPC/worker 내부 pool을 만들지 않는다. G-248이 보강할 시점 이벤트와 관계없이 기존 이벤트 계약을 유지한다.
 
 ## Validation
 
 - Worker는 test_verify_runtime.py의 pool fixture와 test_verify_resources.py의 coordinator double로 복수 연속 grant, 거절 뒤 대기, 즉시 완료·실행 중 cap·다중 session 공정성·시작 실패를 최소 unit으로 검사한다. fake clock/sleep·process를 제공하고 실제 배정/예약 판단을 확인한다.
-- 고정 시간 자료로 긴 모듈 우선·동률 안정·부재/손상/불완전/다른 환경 fallback과 동일 manifest·coverage/fixture·command 단계 순서를 검사한다. partial/중복 결과·자식 생존·종료 불명/timeout 회귀를 유지한다.
-- Manager 전체 verify는 1/auto의 같은 범위·결과·compile과 예약/정리를 유지한다. 영향 모듈·필수 연관 회귀를 같은 대상·Python/Git·계측/cache·실제 worker/자원·동시 부하·임시 경로에서 반복 비교해 중앙값을 남긴다. 국소 개선을 전체 시간으로 환산하지 않는다.
+- 고정 시간 자료로 긴 모듈 우선·동률 안정·부재/손상/불완전/다른 환경 fallback과 동일 manifest·coverage/fixture·command 단계 순서를 검사한다. test_partial_verify_runner.py의 기존 fixture를 재사용해 부분/전체·다른 선택 집합의 과거 자료 거부와 NOT_SELECTED 미배정을 확인한다. 불완전/중복 결과·자식 생존·종료 불명/timeout 회귀를 유지한다.
+- Manager 최종 전체 verify는 1/auto의 같은 범위·결과·compile과 예약/정리를 유지한다. 영향 모듈·필수 연관 회귀를 같은 실행 모드·선택 집합·Python/Git·계측/cache·실제 worker/자원·동시 부하·임시 경로에서 반복 비교해 중앙값을 남긴다. 부분 실행이 선정 규모를 줄인 효과와 같은 범위의 배정 개선을 구분하며 국소 개선을 전체 시간으로 환산하지 않는다.
 
 ## Progress
 

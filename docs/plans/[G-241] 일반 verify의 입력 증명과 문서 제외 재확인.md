@@ -5,6 +5,7 @@ sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-072] 입력 동일성이 증명된 구현 후보 성공 결과 재사용.md
   - docs/requirements/[R-082] 단계별 원격 문서 반영과 PR 전 ExecPlan 갱신.md
+  - docs/requirements/[R-086] 영향 기반 부분 검증과 일반 선행 Review.md
 depends_on:
   - G-240
   - G-242
@@ -39,7 +40,7 @@ priority: high
 
 ## Validation
 
-- 기존 입력/receipt/단계 fixture targeted unit test로 일반 verify의 실제 run→reuse, 문서-only/rebase 제외 재확인, 코드·명령·환경·runtime/Git 변경, 목록 밖 누락·새 조건 미검증·새 실패·CAS/관측 경쟁을 확인한다. 판정 자체는 실제 코드·SQLite로 실행한다.
+- 기존 입력/receipt/단계 fixture targeted unit test로 일반 verify의 실제 run→reuse, 문서-only/rebase 제외 재확인, 코드·명령·환경·runtime/Git 변경, 목록 밖 누락·새 조건 미검증·새 실패·CAS/관측 경쟁을 확인한다. 부분 미사용·fallback 경로의 일반 재사용과 R-086 일반 선행 PASS 뒤의 필수 실제 전체 실행을 별도 사례로 확인하며 부분 성공을 전체 receipt로 채택하지 않는다. 판정 자체는 실제 코드·SQLite로 실행한다.
 - 공통 verify 적합성 fixture를 재사용해 선언/adapter·필수 단계 변경, 프로젝트 Python·외부 의존성과 Manager runtime 변경, venv 경로 보존 및 관측 불가 fallback을 확인한다. 선언·manifest의 정적 identity만으로 성공을 재사용하는 경로는 거부한다.
 - 전체 verify는 일반 자체 verify 성공의 유효한 증명 연결과 실제 프로세스 생략/필수 실행, 원래 receipt·작업 주기/실패 감사, 중단 재개와 Review/최종 원격 gate를 확인한다. 실제 모델은 호출하지 않는다. 입력 증명이 불가능한 경로를 테스트 편의를 위해 reusable로 표시하지 않는다.
 

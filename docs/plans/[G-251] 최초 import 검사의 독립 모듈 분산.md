@@ -4,6 +4,7 @@ title: 최초 import 검사의 독립 모듈 분산
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-065] 실제 부하 기반 verify 병렬 실행.md
+  - docs/requirements/[R-086] 영향 기반 부분 검증과 일반 선행 Review.md
 depends_on:
   - G-265
   - G-266
@@ -24,6 +25,7 @@ priority: normal
 - 여러 독립 테스트 모듈을 기존 unittest adapter의 모듈 배정 단위로 제공한다. 각 대상은 새 interpreter에서 최초 import하며 순환 import·entry point 선행 로딩 금지·import 중 SQLite 연결/프로세스 생성 금지를 유지한다. 이미 import한 process를 재사용하지 않는다.
 - coordinator의 자원/cap·serial/auto 선언과 timeout·자식 종료 보호를 지킨다. 테스트 worker 안에 별도 독립 프로세스 pool이나 runner를 만들지 않는다. 각 실패는 대상과 interpreter 오류를 식별하며 미실행 대상을 완료로 기록하지 않는다.
 - 수집과 실행의 대상/테스트 identity·fixture 소유를 일치시킨다. 새 테스트 ID와 기존 검사 대상의 대응을 남기고 수집 재확인의 누락/중복·변경 실패를 유지한다. entry binding·runtime 복사·compile 등 다른 기존 회귀는 그대로 검사한다.
+- 최초 import 대상은 문자열·동적 import로 소비되므로 정적 AST 참조만으로 전체 검사 범위의 비영향을 인정하지 않는다. 대상 추가·삭제·이동, 분할 모듈과 공유 helper 변경에서 안전한 영향 선정을 증명하지 못하면 R-086의 실행 없는 fallback을 유지한다. 분산을 위해 동적 참조·공유 support의 불확실성 판정을 완화하지 않는다.
 - ARCHITECTURE의 새 interpreter 예외와 분산 책임을 구현에 맞춰 설명한다. 실제 프로세스 검사를 mock으로 대체하거나 skip·timeout 확대·필수 compile 축소로 비용을 줄이지 않는다.
 
 ## Implementation
@@ -33,6 +35,7 @@ tests/test_internal_packages.py의 최초 import 대상 수집·검사 코드와
 ## Validation
 
 - Worker는 대상 inventory/분할의 최소 unit case로 기존 집합 일치·새 모듈 포함·누락/중복 거부·수집/실행 identity 안정성과 guard 코드의 SQLite/process 거부를 확인한다. 분할 helper 자체의 조건 조합에는 process 관측을 mock하고 실제 새 interpreter 계약 회귀는 유지한다.
+- test_verify_impact.py·test_partial_verify_runner.py의 기존 선정 fixture로 대상 추가·삭제·이동과 분할/helper 변경의 불확실한 선정이 fallback하며 새 manifest/test ID를 과거 범위로 오인하지 않는지 확인한다. 미선택 분할 모듈은 NOT_SELECTED이며 최초 import 완료로 집계하지 않는다.
 - test_verify_contract.py의 discovery/load_tests·fixture/manifest 적합성과 기존 실제 최초 import 회귀가 전체 verify에서 1/auto 모두 실행돼야 한다. 각 대상의 새 interpreter·entry point 무선행 로딩·오류 식별 및 coordinator 상한을 확인한다.
 - Manager는 기존 전체 기준과 최종 전체 verify를 연결하고 분할 전후 대상/ID 대응·동일 Python/Git·계측/cache·자원/부하·worker 수·임시 경로에서 영향 모듈을 반복 비교해 중앙값을 기록한다. 테스트 ID 변경으로 범위가 줄어든 것을 속도 개선으로 보고하지 않으며 국소 비교마다 전체 suite를 반복하지 않는다.
 
