@@ -456,6 +456,10 @@ PR 없는 게시 checkpoint의 Review 횟수 차단을 rebase 없이 해제할 �
 
 `runner.py`는 단계 순서를 유지한다. `core.py`는 도구별 결과 validator·worker IPC 경계를 받아 기존 자원 배정·예약·프로세스 시작·재사용·종료 확인을 수행하며 unittest 타입이나 자체 compile 경로를 소유하지 않는다. 수집과 직렬 command도 예약·전체 timeout을 적용한다. `unittest_adapter.py`는 프로젝트 interpreter의 discovery/`load_tests`·재수집·fixture·native reporter와 명시한 Python compile 범위를 소유한다. 자식 import와 Python 경로는 후보 worktree를 선택하며 Manager runtime 패키지가 후보 코드를 대신하지 않는다.
 
+`verification/guard.py`는 interpreter의 `sys`에 둔 설치 근거·lock을 `sitecustomize`의 runpy 로딩과 후보 package import가 공유한다. 실제 audit probe로 hook 등록을 확인하고 wrapper 함수 identity를 대조한다. wrapper 설치 실패 뒤 재진입은 확인된 hook을 재사용하며 완료되지 않은 설치를 성공으로 간주하지 않는다. Python이 sitecustomize 예외 뒤 실행을 계속하는 것을 막기 위해 설치 실패는 비밀값 없는 고정 진단과 비정상 종료로 처리한다. 가드 원본의 위치는 자식 보호 경로를 정하고 환경의 프로젝트 root는 후보 package 선택을 정한다.
+
+Popen wrapper는 호출자 환경을 복사·정제하고 해당 호출의 thread-local 범위에 전달 dict identity와 내용 사본을 보관한다. audit는 같은 dict·내용일 때만 준비를 생략하고 변경되거나 직접 전달된 환경은 정제한다. 성공·시작 실패·중단 뒤 호출 범위를 복원하며 명령/API 검사는 매 실행 경계에서 수행한다. 환경의 Windows 대소문자·POSIX bytes 별칭을 처리해 조율 인증값을 제외하고 marker·가드 경로·후보 root·bytecode 정책을 유지한다. 이 설치 근거와 호출 범위는 안전 판단 cache나 새 환경 원본이 아니며 임의 언어·모든 외부 subprocess의 보호를 보장하지 않는다. 예약·종료 확인 책임은 기존 core/프로세스 경계에 남는다.
+
 manifest·이벤트·결과는 version·run·단계·단위/테스트 identity를 결합하고 adapter가 예상 범위·fixture skip 근거·결과 완결성을 대조한다. command 종료 코드는 필수 단계 결과이며 테스트별 결과를 합성하지 않는다. 예약은 session·단위·PID/시작 identity에 결합하고 확인된 종료/미시작만 회수한다. 중단 자료와 종료 불명 예약 journal을 보존하고 다른 run은 제어하지 않는다. 단계별 이벤트를 전체 진단에 집계하며 외부 runtime·의존성·동적 입력이 미확인인 연결은 성공 재사용 근거를 제공하지 않는다.
 
 선언·호출·지원 근거와 adapter 적합성/추가 경계는 [VERIFY.md](VERIFY.md)가 소유한다. 역할별 정적 규칙은 기존 common+해당 역할의 고정 원본 묶음으로 전달하고, 작업 prompt는 선택 선언·지원 버전·참조 문맥만 연결한다. 언어별 지침 사본이나 새로운 배포·snapshot 경계는 만들지 않는다.

@@ -1,5 +1,5 @@
 """테스트에서 실제 Agent 명령과 외부 API 연결을 실행 전에 거부한다."""
-from functools import lru_cache, wraps
+from functools import wraps
 import inspect
 import ipaddress
 import os
@@ -7,6 +7,8 @@ from pathlib import Path
 import re
 import subprocess
 import sys
+import threading
+from types import SimpleNamespace
 
 MARKER = "LOOP_MANAGER_TEST_NO_AGENTS"
 _COORDINATION_ENV = (
@@ -45,52 +47,87 @@ def _local(host):
         return False
 
 
-@lru_cache(maxsize=1)
+# runpy/sitecustomize and candidate imports share interpreter-owned installation evidence.
+_STATE_KEY = "_loop_manager_verify_guard_state"
+_state = sys.__dict__.setdefault(_STATE_KEY, SimpleNamespace(
+    lock=threading.RLock(), active=threading.local(), audit=None, wrapper=None))
+_PROBE = "loop_manager.verify_guard.probe"
+
+
 def install_guard():
-    os.environ[MARKER] = "1"
-    _install_child_environment_guard()
-    def audit(event, arguments):
-        if event == "subprocess.Popen":
-            if arguments[0] is not None:
-                check_command([arguments[0]], enabled=True)
-            check_command(arguments[1], enabled=True)
-            environment = arguments[3]
-            if environment is not None:
-                prepared = worker_environment(environment)
-                environment.clear()
-                environment.update(prepared)
-        elif event == "os.system":
-            check_command(arguments[0], enabled=True)
-        elif event in {"os.exec", "os.posix_spawn"}:
-            check_command([arguments[0]], enabled=True)
-            check_command(arguments[1], enabled=True)
-        elif event == "socket.getaddrinfo" and not _local(arguments[0]):
-            raise RuntimeError("테스트의 외부 API/DNS 호출을 차단했습니다.")
-        elif event == "socket.connect":
-            address = arguments[1]
-            if isinstance(address, tuple) and not _local(address[0]):
-                raise RuntimeError("테스트의 외부 API 연결을 차단했습니다.")
-    sys.addaudithook(audit)
+    with _state.lock:
+        if _state.audit is None:
+            def audit(event, arguments):
+                if event == _PROBE:
+                    if arguments[0] is _state:
+                        arguments[1].append(audit)
+                elif event == "subprocess.Popen":
+                    if arguments[0] is not None:
+                        check_command([arguments[0]], enabled=True)
+                    check_command(arguments[1], enabled=True)
+                    environment = arguments[3]
+                    active = getattr(_state.active, "environment", None)
+                    if environment is not None and not (
+                            active is not None and environment is active[0] and environment == active[1]):
+                        prepared = worker_environment(environment)
+                        environment.clear()
+                        environment.update(prepared)
+                elif event == "os.system":
+                    check_command(arguments[0], enabled=True)
+                elif event in {"os.exec", "os.posix_spawn"}:
+                    check_command([arguments[0]], enabled=True)
+                    check_command(arguments[1], enabled=True)
+                elif event == "socket.getaddrinfo" and not _local(arguments[0]):
+                    raise RuntimeError("테스트의 외부 API/DNS 호출을 차단했습니다.")
+                elif event == "socket.connect":
+                    address = arguments[1]
+                    if isinstance(address, tuple) and not _local(address[0]):
+                        raise RuntimeError("테스트의 외부 API 연결을 차단했습니다.")
+            sys.addaudithook(audit)
+            _state.audit = audit
+        confirmed = []
+        sys.audit(_PROBE, _state, confirmed)
+        if _state.audit not in confirmed:
+            _state.audit = None
+            raise RuntimeError("verify Python 가드 audit hook 설치를 확인하지 못했습니다.")
+        _install_child_environment_guard()
+        os.environ[MARKER] = "1"
 
 
 def _install_child_environment_guard():
     original_init = subprocess.Popen.__init__
-    if getattr(original_init, "_loop_manager_environment_guard", False):
+    if original_init is _state.wrapper:
         return
     signature = inspect.signature(original_init)
 
     @wraps(original_init)
     def guarded_init(self, *args, **kwargs):
         bound = signature.bind_partial(self, *args, **kwargs)
-        bound.arguments["env"] = worker_environment(bound.arguments.get("env"))
-        return original_init(*bound.args, **bound.kwargs)
+        environment = worker_environment(bound.arguments.get("env"))
+        bound.arguments["env"] = environment
+        previous = getattr(_state.active, "environment", None)
+        _state.active.environment = (environment, dict(environment))
+        try:
+            return original_init(*bound.args, **bound.kwargs)
+        finally:
+            _state.active.environment = previous
 
-    guarded_init._loop_manager_environment_guard = True
+    _state.wrapper = guarded_init
     subprocess.Popen.__init__ = guarded_init
 
 
 def worker_environment(environment):
     child = dict(os.environ if environment is None else environment)
+    managed_names = (MARKER, "LOOP_MANAGER_RUNTIME_DEFAULT_PYCACHEPREFIX",
+                     "LOOP_MANAGER_VERIFY_PROJECT_ROOT", "PYTHONPATH", "PYTHONIOENCODING",
+                     "PYTHONDONTWRITEBYTECODE", "PYTHONPYCACHEPREFIX")
+    canonical = {name.casefold() if os.name == "nt" else name: name for name in managed_names}
+    for key in tuple(child):
+        if isinstance(key, (str, bytes)):
+            name = os.fsdecode(key)
+            target = canonical.get(name.casefold() if os.name == "nt" else name)
+            if target is not None:
+                child[target] = os.fsdecode(child.pop(key))
     manager_default_cache = child.pop("LOOP_MANAGER_RUNTIME_DEFAULT_PYCACHEPREFIX", None) == "1"
     if sys.dont_write_bytecode:
         child["PYTHONDONTWRITEBYTECODE"] = "1"
