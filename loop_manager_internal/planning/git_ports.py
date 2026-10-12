@@ -90,6 +90,9 @@ class _PlanningGitPorts:
     ) -> None:
         planning_rebase.save_planning_correction(
             self._rebase_git, self._state_dir, repo, worktree, target, paths, was_rebase,
+            manager_path_validator=lambda names: self._validate_manager_correction_paths(
+                repo, worktree, names,
+            ),
         )
 
     def planning_correction(
@@ -97,7 +100,20 @@ class _PlanningGitPorts:
     ) -> tuple[tuple[str, ...], bool] | None:
         return planning_rebase.planning_correction(
             self._rebase_git, self._state_dir, repo, worktree, target,
+            manager_path_validator=lambda names: self._validate_manager_correction_paths(
+                repo, worktree, names,
+            ),
         )
+
+    def _validate_manager_correction_paths(
+        self, repo: str, worktree: Path, names: tuple[str, ...],
+    ) -> tuple[int, str, str] | None:
+        from loop_manager_internal.maintenance.code_map_artifact import (
+            ARTIFACT_PATH, validate_restored,
+        )
+        if names != (ARTIFACT_PATH,):
+            return None
+        return validate_restored(self._connection, repo, worktree)
 
     def restore_code_map_conflict(
         self, repo: str, worktree: Path, stash_sha: str = "",
@@ -219,6 +235,9 @@ class _PlanningGitPorts:
         return planning_rebase.rebase_planning_worktree(
             self._rebase_git, self._repo_path, self._state_dir, repo,
             worktree, old_base, target,
+            manager_path_validator=lambda names: self._validate_manager_correction_paths(
+                repo, worktree, names,
+            ),
         )
 
     def complete_planning_rebase(self, repo: str, worktree: Path, target: str) -> None:
@@ -231,6 +250,9 @@ class _PlanningGitPorts:
     ) -> None:
         planning_rebase.accept_resolved_stash_conflict(
             self._rebase_git, self._state_dir, repo, worktree, target,
+            manager_path_validator=lambda names: self._validate_manager_correction_paths(
+                repo, worktree, names,
+            ),
         )
 
     def relevant_document_changes(

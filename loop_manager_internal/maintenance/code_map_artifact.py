@@ -164,6 +164,21 @@ def restore_conflict(connection: sqlite3.Connection, repo: str, worktree: Path, 
         raise CodeMapArtifactError("충돌한 코드맵의 Manager 원본을 확인할 수 없습니다.") from error
 
 
+def validate_restored(
+    connection: sqlite3.Connection, repo: str, worktree: Path,
+) -> tuple[int, str, str]:
+    """Return the receipt identity only while its exact Manager bytes remain restored."""
+    row = _receipt(connection, repo)
+    target = _safe_target(worktree)
+    try:
+        contents = target.read_bytes()
+    except OSError as error:
+        raise CodeMapArtifactError("복원된 Manager 코드맵을 읽을 수 없습니다.") from error
+    if hashlib.sha256(contents).hexdigest() != row[2]:
+        raise CodeMapArtifactError("복원된 Manager 코드맵이 receipt와 다릅니다.")
+    return tuple(row)
+
+
 def attach_candidate(connection: sqlite3.Connection, context, worktree: Path, result, *, allow_stale=False):
     """Only a durable Manager receipt can add this path to a validated batch."""
     from loop_manager_internal.application.contracts import ValidatedPlanningResult
