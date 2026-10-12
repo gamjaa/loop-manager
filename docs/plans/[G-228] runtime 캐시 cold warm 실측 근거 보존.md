@@ -3,7 +3,8 @@ id: G-228
 title: runtime 캐시 cold warm 실측 근거 보존
 sources:
   - docs/PRODUCT.md
-  - docs/requirements/[R-059] Safe Python Bytecode Cache Use.md
+  - docs/requirements/[R-059] 안전한 Python bytecode 캐시 사용.md
+  - docs/requirements/[R-086] 영향 기반 부분 검증과 일반 선행 Review.md
 depends_on:
   - G-265
   - G-266
@@ -20,7 +21,7 @@ R-059의 같은 revision 첫 실행·재실행에서 실제 캐시 사용, 실�
 
 ## Acceptance Criteria
 
-- 같은 원격 revision·interpreter·원본·실행 범위의 cold/warm 실행을 실제 Python으로 측정하고 두 실행의 cache 생성/재사용·원본 실행 결과, 전체 경과 시간과 cache 준비·관리 비용을 구분한 근거를 보존한다. workload·revision·interpreter/cache tag·bytecode 정책과 비교 가능한 환경을 명시하며 fixture 측정을 운영 전체 성능으로 일반화하지 않는다.
+- 같은 원격 revision·interpreter·원본·실행 범위의 cold/warm 실행을 실제 Python으로 측정하고 두 실행의 cache 생성/재사용·원본 실행 결과, 전체 경과 시간과 cache 준비·관리 비용을 구분한 근거를 보존한다. workload·revision·interpreter/cache tag·bytecode 정책과 비교 가능한 환경을 명시한다. verify 자료를 사용할 때는 전체/부분 mode·실제 선택 집합과 선행 discovery/부분 실행의 cache 준비 여부를 구분하며 부분→전체 실행을 같은 workload의 cold/warm 쌍으로 간주하지 않는다. fixture 측정을 운영 전체 성능으로 일반화하지 않는다.
 - 캐시 없는 실행과 명시적 bytecode 비활성화에서도 같은 원본 결과가 나오는지 확인한다. 기존 `test_runtime_child_reuses_external_bytecode_cache`의 재사용·손상 복구 근거와 연결하며 cache 파일 존재나 mock 시간만으로 실제 사용·개선율을 확정하지 않는다.
 - 측정은 별도로 소유한 임시 runtime·cache에서 수행한다. 실제 Agent·외부 서비스·사용자 source/ignored 자료를 실행·변경하지 않으며 기존 runtime revision·Git 범위·소유권 검사를 유지한다. 측정용 runtime의 검증된 종료·정리 뒤에도 warm cache를 재사용할 수 있고 무관한 사용자 자료는 보존한다.
 - 결과에는 관측한 수치와 제한만 기록하고 수행하지 않은 전체 verify·Review 성공을 추가하지 않는다. 측정 실패·중단·서로 다른 입력은 비교 불가로 남기며 기본 캐시 금지·ignore/sandbox 완화로 우회하지 않는다.

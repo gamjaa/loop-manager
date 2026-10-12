@@ -4,6 +4,7 @@ title: 자체 Windows verify의 명시적 임시 경로 선택
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-067] 프로젝트 공통 verify 실행 규약.md
+  - docs/requirements/[R-086] 영향 기반 부분 검증과 일반 선행 Review.md
 depends_on:
   - G-265
   - G-266
@@ -20,8 +21,8 @@ priority: normal
 
 ## Acceptance Criteria
 
-- 자체 Windows의 단독·Manager launcher에서 동일한 명시 입력으로 임시 경로를 선택한다. 미지정은 현재 %USERPROFILE%\.cache\loop-manager\verify\tmp이며 상대 경로는 실행 checkout 기준으로 해석한다. 공백·비ASCII 경로도 실제 Python의 tempfile 선택에 적용된다.
-- Python 조회/실행을 포함한 자식 시작 전에 최종 절대 경로를 TEMP·TMP·TMPDIR에 적용한다. 실제 선택 경로를 기존 run 진단/summary에 남기고 입력 문자열이나 checkout 위치만으로 선택 성공을 표시하지 않는다.
+- 자체 Windows의 단독·Manager launcher와 부분/전체 실행에서 동일한 명시 입력으로 임시 경로를 선택한다. 미지정은 현재 %USERPROFILE%\.cache\loop-manager\verify\tmp이며 상대 경로는 실행 checkout 기준으로 해석한다. 공백·비ASCII 경로도 실제 Python의 tempfile 선택에 적용된다.
+- Python 조회/실행을 포함한 자식 시작 전에 최종 절대 경로를 TEMP·TMP·TMPDIR에 적용한다. 실제 선택 경로를 부분/전체 mode와 함께 기존 run 진단/summary에 남기고 입력 문자열이나 checkout 위치만으로 선택 성공을 표시하지 않는다.
 - 지정 경로 생성·사용 실패는 경로 오류와 실패 종료 코드다. 기본값이나 다른 디스크로 조용히 대체하지 않으며 검증 누락을 성공으로 처리하지 않는다.
 - 정상·검증 실패·예외 뒤 호출자의 TEMP/TMP/TMPDIR·Python 인코딩·console 인코딩·cwd를 원래 존재/값으로 복원한다. 공유 임시 루트의 기존 파일과 다른 실행의 자료는 보존하며 전체 폴더 삭제·보안 제품 설정 변경을 수행하지 않는다.
 - 다른 등록 프로젝트의 launcher/env를 일괄 변경하지 않는다. ARCHITECTURE의 Windows 경로 설명·docs/VERIFY.md와 OPERATIONS의 바로 필요한 선택 방법/오류/복구 안내를 실제 입력 계약에 맞춘다. 기존 interpreter·protocol/timeout·exit code·version 1 수집 범위를 유지한다.
@@ -32,7 +33,7 @@ scripts/verify.ps1의 기존 초기 환경 저장·checkout 이동·temp 생성�
 
 ## Validation
 
-- Worker는 test_platform_compatibility.py·verify launcher/manager adapter fixture의 최소 targeted case로 미지정/절대/상대·공백 경로, 생성/사용 실패, 원래 env 부재/값·인코딩/cwd 및 공유 marker 보존을 검사한다. 정책 조합은 명령/OS 관측 mock으로 확인한다.
+- Worker는 test_platform_compatibility.py·verify launcher/manager adapter fixture의 최소 targeted case로 미지정/절대/상대·공백 경로, 생성/사용 실패, 원래 env 부재/값·인코딩/cwd 및 공유 marker 보존을 검사한다. 부분/전체 실행과 부분 선정 FALLBACK에서도 같은 경로 적용·환경 복원을 확인하며 경로 오류를 선정 fallback으로 숨기지 않는다. 정책 조합은 명령/OS 관측 mock으로 확인한다.
 - 기존 launcher의 실제 interpreter 연결 회귀를 확장해 Windows 단독/Manager에서 Python tempfile.gettempdir와 진단의 최종 절대 경로가 같은지 확인한다. 실제 PowerShell/Windows가 없는 환경의 mock을 플랫폼 검증 성공으로 기록하지 않는다.
 - Manager 전체 verify는 venv 선택·프로토콜/timeout·실패 exit code·guard/자식 환경·전체 필수 범위를 유지한다. Windows의 실제 선택 파일시스템 자료를 남기고 R-065의 같은 PC·코드·범위 Windows/WSL 순차 비교 조건을 따른다. 경로 변경 자체로 절감량이나 환경 원인을 확정하지 않는다.
 

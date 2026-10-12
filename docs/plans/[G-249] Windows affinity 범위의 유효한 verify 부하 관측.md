@@ -4,6 +4,7 @@ title: Windows affinity 범위의 유효한 verify 부하 관측
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-065] 실제 부하 기반 verify 병렬 실행.md
+  - docs/requirements/[R-086] 영향 기반 부분 검증과 일반 선행 Review.md
 depends_on:
   - G-265
   - G-266
@@ -23,7 +24,7 @@ priority: normal
 - 시스템 8 CPU·허용 affinity 4 CPU의 유효한 후속 저부하 관측에서 busy가 유효하고 추가 worker 배정이 가능하다. 시스템 전체 부하와 허용 범위를 구분하며 허용 CPU 부하를 과소평가하지 않는 추정을 적용한다.
 - 첫 샘플·낡은 값·시간 차이/관측 오류에는 기존 직렬 축소를 유지한다. 높은 부하·메모리 부족·미반영 예약·사용자 cap과 평균 부하 보호를 우회하지 않는다. Linux cgroup quota의 usage 관측 부재·오류를 Windows 예외로 허용하지 않는다.
 - snapshot/배정 진단에 관측 CPU 범위·affinity·부하 추정 방식과 제한/확대 사유를 남긴다. 시스템 시간을 실제 affinity별 측정값으로 표시하지 않으며 입력 불확실성은 그대로 보존한다.
-- 기존 coordinator 확인·예약·공정성·종료 확인·timeout을 유지한다. 고정 병렬도·프로젝트 수 분할·새 OS 실행 제한이나 외부 자원 서비스를 도입하지 않는다.
+- 부분/전체 실행 모두 기존 coordinator 확인·예약·공정성·종료 확인·timeout을 유지하며 부분 실행은 실제 선정된 pending 모듈에만 배정한다. 첫 샘플의 정상적인 직렬 보호와 적은 선택 모듈 수에 따른 worker 수 제한을 affinity 교정 실패로 판단하지 않는다. 고정 병렬도·프로젝트 수 분할·새 OS 실행 제한이나 외부 자원 서비스를 도입하지 않는다.
 - PRODUCT·ARCHITECTURE의 실제 부하/관측 실패 설명과 docs/VERIFY.md의 지원 한계를 구현에 맞추고, mock Windows 입력을 실제 Windows 성능 근거로 사용하지 않는다.
 
 ## Implementation
@@ -34,7 +35,7 @@ verification/resources.py의 windows_sample·ResourceSampler.sample와 기존 Sn
 
 - Worker는 test_verify_resources.py의 sampler/decision 최소 unit case로 Windows 8/4 첫/후속 샘플, 저부하·고부하·관측 오류·낡은 값·cap/메모리/예약을 확인한다. 실제 sampler→decide→coordinator 연결을 쓰고 API·clock 관측만 mock한다.
 - Linux quota/usage 없음과 기존 평균·시간 역행/카운터 오류 회귀를 보존한다. Manager 전체 verify는 다중 session 공정성·예약·종료 불명·관측 회복과 필수 결과/compile 범위를 유지한다.
-- Manager가 실제 Windows affinity 제한 환경의 영향 모듈을 같은 revision 쌍·대상·계측/cache·Python/Git·자원/동시 부하 조건에서 반복 비교해 중앙값과 worker 수·진단을 남긴다. 기존 전체 기준과 최종 전체 verify를 연결하며 국소 비교마다 전체 suite를 반복하지 않는다. 미측정 플랫폼 효과나 전체 절감률은 주장하지 않는다.
+- Manager가 실제 Windows affinity 제한 환경의 영향 모듈을 같은 revision 쌍·실행 모드·실제 선택 집합·계측/cache·Python/Git·자원/동시 부하 조건에서 반복 비교해 중앙값과 worker 수·진단을 남긴다. 부분 실행의 선정 규모·관측 경과를 전체 실행과 구분한다. 기존 전체 기준과 R-086에 따른 최종 전체 verify를 연결하며 국소 비교마다 전체 suite를 반복하지 않는다. 미측정 플랫폼 효과나 전체 절감률은 주장하지 않는다.
 
 ## Progress
 
