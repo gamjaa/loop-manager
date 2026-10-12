@@ -50,9 +50,12 @@ priority: high
 - [x] 2026-10-12 사용자 직접 구현: 준비된 Codex 환경 전달, 실제 환경의 인증/profile·격리·지침 재확인, invocation 입력 저장 및 현재/실제 호출 관측 API를 구현했다. CLI/process는 test double이며 실제 모델·실계정 실행을 완료로 기록하지 않는다. 관련 targeted unit 117개와 native 호출·runtime 격리·중단 복구 25개가 통과했다.
 - [x] 2026-10-12 기반 구현 b75568b에서 Manager 전체 verify: 215개 모듈·3,579개 테스트(성공 3,574·skip 5), 필수 compile 포함 통과. Linux/Python 3.12이며 실계정 모델 호출은 검증하지 않았다.
 - [x] 2026-10-12 통합 구현 9dbdd1f의 전체 verify: 218개 모듈·3,622개 테스트(성공 3,617·skip 5), 필수 compile 포함 통과. production 관측·단일 선행 Reviewer 승인 사이클 및 targeted 실패 무통지 회귀를 포함하며 실제 모델·성능 실측 완료를 뜻하지 않는다.
+- [x] 2026-10-13 main 통합 복구: 최신 origin/main 4a7bec0 위에 부분 verify 변경을 옮긴 4365a6e에서 targeted unit 129개와 전체 verify 218개 모듈·3,628개 테스트(성공 3,623·skip 5), 필수 compile 포함 통과. 종료 코드 0·미완료 이벤트 0이며 실제 모델·성능 실측은 포함하지 않는다.
 - [ ] 읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- 2026-10-13 GitHub Merge 대상 확인: 기반 #238은 main에 Merge됐지만 부분 verify #236은 feature/provider-execution-evidence에 Merge되어 main에 해당 구현이 없었다. 최신 main에 기존 부분 verify·선행 Review·기본 사용 옵션·targeted 실패 무통지 변경을 다시 통합하고 main 대상 후속 PR로 제출한다. 기반 PR의 Merge와 부분 verify의 main 반영을 구분하며 후속 PR의 Merge 완료를 검증 결과로 대신하지 않는다.
 
 - 2026-10-12 사용자 후속 구현: G-262 기반 위에 R-086 production 관측 port를 연결했다. 선행 승인 뒤 실제 전체 verify와 현재/실제 Reviewer 입력 비교를 수행하고 최종 게시 gate에서도 같은 관측을 사용한다. 관측 부재·실패의 fallback은 유지하며 G-263/G-264 완료를 선행 승인 증거로 가정하지 않는다.
 
