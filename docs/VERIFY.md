@@ -42,7 +42,7 @@ adapter version 1의 범위는 Python 3.11–3.14 stdlib unittest이다. [공식
 
 ## 영향 기반 부분 실행
 
-Manager의 `[loop] verify_partial = true`는 자체 저장소의 일반 작업에서 부분 verify → 일반 선행 Reviewer → 실제 전체 verify를 선택한다. 기본값은 true이며 옵션 생략 시에도 사용한다. `[loop] verify_partial = false`로 끌 수 있다. 수동 제출·waiver·문서 draft·R-082 문서 변경 선행 Review는 기존 경로를 유지한다. 실제 Reviewer instruction/provider/model/effort·환경/정책 identity를 제공하는 검증된 관측 port가 없으면 부분 실행 전에 기존 전체 verify → Reviewer로 fallback한다. 현재 provider 조립은 이 port를 제공하지 않으며 G-262/263/264와 연계한 실제 환경 관측이 필요하다. 정적 profile이나 격리 버전 이름으로 그 identity를 합성하지 않는다.
+Manager의 `[loop] verify_partial = true`는 자체 저장소의 일반 작업에서 부분 verify → 일반 선행 Reviewer → 실제 전체 verify를 선택한다. 기본값은 true이며 옵션 생략 시에도 사용한다. `[loop] verify_partial = false`로 끌 수 있다. 수동 제출·waiver·문서 draft·R-082 문서 변경 선행 Review는 기존 경로를 유지한다. 실제 Reviewer instruction/provider/model/effort·환경/정책 identity를 제공하는 검증된 관측 port가 없으면 부분 실행 전에 기존 전체 verify → Reviewer로 fallback한다. provider 조립은 G-262의 `provider_execution.observe`에 현재 준비 입력과 지정한 실제 invocation 조회를 연결한다. CLI·인증·지침·격리·완료 기록을 확인하지 못하면 fallback하며 정적 profile이나 격리 버전 이름으로 identity를 합성하지 않는다. G-263/G-264의 인증 전용 source 변경과 Claude의 안전 거부 해제는 이 연결의 완료를 뜻하지 않는다.
 
 runner의 `--partial-base <commit>` 또는 Manager가 전달하는 `LOOP_MANAGER_VERIFY_PARTIAL_BASE`는 같은 전체 discovery manifest에서 영향받은 모듈만 실행한다. 검증 설정은 기존 `scripts/verify.json`을 사용한다. 지원하는 단계 배치는 처음에 하나의 unittest tests 단계와 그 뒤의 command 단계다. 전체 검증의 후속 필수 command는 나중의 전체 실행에서 수행한다. 일반 전체 실행의 Manager는 상속된 부분 실행 환경값을 제거한다.
 

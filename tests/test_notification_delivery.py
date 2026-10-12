@@ -43,6 +43,27 @@ class TelegramTransportTest(unittest.TestCase):
 
 
 class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
+    def test_pending_targeted_failure_notices_are_canceled_without_losing_sent_piece_audit(self):
+        for kind in ('persistent_execution_failure', 'stage_failed'):
+            for attempts, pieces in ((0, 0), (1, 0), (1, 1)):
+                with self.subTest(kind=kind, attempts=attempts, pieces=pieces):
+                    connection = self.connection()
+                    payload = {'project': 'alpha', 'execplan_id': 'G-018', 'reason_code': 'worker_correction',
+                        'operation': 'Worker', 'cause': 'Worker가 해결되지 않은 targeted unit test 실패를 보고했습니다.',
+                        'status': '다음 실행에서 교정', 'stage': 'WORKING', 'scope': 'execution',
+                        'consecutive_external_runs': 3}
+                    notifications._insert(connection, 'legacy-targeted', '/projects/alpha', kind, payload)
+                    connection.execute('UPDATE notification_outbox SET attempts=?, confirmed_pieces=?, rendered_text=?',
+                        (attempts, pieces, 'already confirmed piece\n' + 'pending content\n' * 700))
+                    connection.commit()
+                    transport = mock.Mock()
+                    notifications.dispatch_pending(connection, 'token', 'chat', adapter=transport)
+                    transport.assert_not_called()
+                    row = connection.execute('SELECT canceled_at, attempts, confirmed_pieces, payload FROM notification_outbox').fetchone()
+                    self.assertIsNotNone(row[0])
+                    self.assertEqual((row[1], row[2]), (attempts, pieces))
+                    self.assertEqual(json.loads(row[3])['cause'], payload['cause'])
+
     def test_failed_delivery_stays_pending_retries_once_and_hides_secrets(self):
         connection = self.connection()
         loop_manager.update_project(

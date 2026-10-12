@@ -13,6 +13,7 @@ from unittest import mock
 from loop_manager_internal.agents import agent_profiles, agent_write_isolation as isolation
 from loop_manager_internal.agents import common_guidance, invocation_service, provider_adapters, provider_execution, provider_guidance
 from loop_manager_internal.agents.agent_invocation import AgentResult, InvocationContext, ResolvedProfile, Usage
+from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.storage import agent_invocation_state
 from tests.support.fixed_samples import PROJECT_FILES
 from tests.support.workspace import pin_common_guidance
@@ -35,7 +36,8 @@ class ProviderExecutionTests(unittest.TestCase):
         self.addCleanup(self.connection.close)
         agent_invocation_state.ensure_schema(self.connection)
         self.repo = str(self.source)
-        pin_common_guidance(self.connection, InvocationContext(self.repo, 'G-262'),
+        self.plan_id = getattr(self, 'plan_id', 'G-262')
+        pin_common_guidance(self.connection, InvocationContext(self.repo, self.plan_id),
             self.worktree, self.state, role='reviewer')
         self.profile = ResolvedProfile('model', 'high')
         self.boundary = isolation.WorktreeBoundary(self.worktree, self.source, (),
@@ -90,7 +92,7 @@ class ProviderExecutionTests(unittest.TestCase):
         self.resolve()
 
     def observe(self, **kwargs):
-        return provider_execution.observe(self.connection, repo=self.repo, plan_id='G-262',
+        return provider_execution.observe(self.connection, repo=self.repo, plan_id=self.plan_id,
             worktree=self.worktree, state_dir=self.state, config_path=self.config, provider='codex',
             resolve_profile=self.resolve, validate_runtime=self.validate,
             snapshot_digest=lambda: 'current-snapshot', **kwargs)
@@ -107,10 +109,10 @@ class ProviderExecutionTests(unittest.TestCase):
         invoke_effects = invocation_service.InvocationEffects(self.resolve, lambda: None,
             lambda ledger, context, role, provider, profile, session, **kwargs:
                 ledger.start(context, role, provider, profile, session, **kwargs),
-            lambda _: SimpleNamespace(serialize=lambda: 'current-snapshot'), mock.Mock(), lambda _: adapter)
+            lambda _: GitSnapshot('base', 'loop-manager/'+self.plan_id, {}, {}, {}, {}, {}, {}), mock.Mock(), lambda _: adapter)
         result = invocation_service.run_agent('codex', self.worktree, self.state, self.config,
             'reviewer', 'review this candidate', read_only=True, persist_session=True,
-            connection=self.connection, invocation=InvocationContext(self.repo, 'G-262'),
+            connection=self.connection, invocation=InvocationContext(self.repo, self.plan_id),
             resolved_profile=resolved, effects=invoke_effects)
         if popen.called:
             self.assertEqual(popen.call_args.kwargs['env']['CODEX_HOME'], str(self.child_home))

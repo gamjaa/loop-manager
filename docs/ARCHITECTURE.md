@@ -609,7 +609,7 @@ Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내�
 
 `preliminary_reviews`는 전체 `verify_receipts`와 독립된 같은 작업 주기의 상태·후보/입력 identity·부분 결과·일반 선행 결과를 저장한다. generation CAS와 전체 verify cycle 변경으로 오래된 쓰기를 거부한다. Worker 교정의 `partial_head`는 `verified_head`를 만들지 않고 기존 교정 감사에 검증 종류를 보존한다. 부분 실행 중단은 미완료 상태로 남고 전체 경로로 재개한다. 일반 선행 PASS 뒤에는 실제 전체 run을 강제하며 실패 시 이전 승인을 무효화한다.
 
-`preliminary_review.py`는 동일 HEAD/base/전체 diff·직렬화된 definition·Worker 결과·Manager 실행 코드 identity와 실제 Reviewer instruction/provider/model/effort/환경/정책 관측을 결합한다. 현재 provider 조립은 마지막 관측 port를 제공하지 않으므로 부분 경로가 기본 사용이어도 기존 경로로 fallback한다. 실제 관측을 연결한 경로만 일반 선행 승인 재사용을 허용한다. Reviewer entry에서 현재 전체 verify token/receipt를 확인한 뒤 최종 token을 만들고 publication의 현재 소유권·원격 확인 경계에서 입력 identity를 다시 검사한다. 새 성공으로 과거 문서 선행 PASS를 승격하지 않으며 G-183/G-241/G-262/263/264의 별도 목표를 완료로 기록하지 않는다.
+`preliminary_review.py`는 동일 HEAD/base/전체 diff·직렬화된 definition·Worker 결과·Manager 실행 코드 identity와 실제 Reviewer instruction/provider/model/effort/환경/정책 관측을 결합한다. provider 조립은 G-262의 `provider_execution.observe`로 현재 준비 환경과 실제 invocation의 입력을 관측한다. 지정 invocation은 새 CLI/model 호출 없이 기존 완료 기록을 읽고, 현재 입력은 모델 생성 없이 같은 환경의 인증·profile·native 지침·격리 정책을 확인한다. 증거가 확인되지 않는 경로는 기본 사용이어도 기존 경로로 fallback한다. Reviewer entry에서 현재 전체 verify token/receipt를 확인한 뒤 최종 token을 만들고 publication의 현재 소유권·원격 확인 경계에서 입력 identity를 다시 검사한다. 새 성공으로 과거 문서 선행 PASS를 승격하지 않으며 G-183/G-241/G-262/263/264의 별도 목표를 완료로 기록하지 않는다.
 
 ## Verify 입력 관측과 생성 요청
 

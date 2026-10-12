@@ -44,7 +44,7 @@ priority: high
 
 ## Progress
 
-- [ ] R-086 기존 관측 port의 실제 호출 identity 연결·부재/변경 fallback 검증
+- [x] R-086 기존 관측 port를 공통 API에 연결했다. 실제 adapter·invocation 저장을 거친 동일 입력 사이클과 production 조립의 repo/plan/worktree·호출 ID 전달을 검증했다. Agent/CLI는 test double이며 실계정 실행 성공을 뜻하지 않는다.
 
 - [x] 2026-10-11 delta `214c978cb296a765020d88378f5526050d241f44` → `6fc245469a6bd3cced81dbf64fc049130982bbc8`에서 R-085와 인증/profile·invocation·launch·설정 지문·fallback 원문 및 관련 fixture를 정적으로 대조했다. 인증/profile 조회와 설정 지문은 부모 환경을 사용하고 Codex의 별도 home은 이후 launch에서 선택된다. 구현·테스트·전체 verify는 실행하지 않았다.
 - [x] 2026-10-12 사용자 직접 구현: 준비된 Codex 환경 전달, 실제 환경의 인증/profile·격리·지침 재확인, invocation 입력 저장 및 현재/실제 호출 관측 API를 구현했다. CLI/process는 test double이며 실제 모델·실계정 실행을 완료로 기록하지 않는다. 관련 targeted unit 117개와 native 호출·runtime 격리·중단 복구 25개가 통과했다.
@@ -53,8 +53,10 @@ priority: high
 
 ## Decision Log
 
+- 2026-10-12 사용자 후속 구현: G-262 기반 위에 R-086 production 관측 port를 연결했다. 선행 승인 뒤 실제 전체 verify와 현재/실제 Reviewer 입력 비교를 수행하고 최종 게시 gate에서도 같은 관측을 사용한다. 관측 부재·실패의 fallback은 유지하며 G-263/G-264 완료를 선행 승인 증거로 가정하지 않는다.
+
 - 2026-10-12 사용자 요청으로 G-262 공통 기반을 현재 main에서 별도 구현했다. 기존 dependency·ID·metadata·수행 기록을 보존하며 자동 계획 실행의 선행 gate를 해제하지 않는다. 현재 승인 비교 소비자는 후속 부분 verify PR에서 관측 API에 연결한다. G-263/G-264의 인증·개인 설정 source 변경이나 Claude 안전 거부 해제는 포함하지 않는다.
-- 2026-10-12 사용자 요청의 문서 정합화: R-086의 준비된 환경 관측 소비자를 연결 대상으로 명시했다. 현재 port 부재 때문에 부분 경로 사용 시에도 기존 경로로 fallback하는 상태를 미완료로 유지한다. 같은 관측을 별도 계획/캐시로 중복하지 않고 인증 전용 source 구현은 G-263/G-264에 남긴다. ID·기존 dependency·metadata·과거 수행 기록을 보존한다.
+- 2026-10-12 사용자 요청의 문서 정합화: R-086의 준비된 환경 관측 소비자를 연결 대상으로 명시했다. 초기 1차 구현에서는 port 부재 때문에 부분 경로 사용 시에도 기존 경로로 fallback하는 상태를 미완료로 유지했다. 같은 관측을 별도 계획/캐시로 중복하지 않고 인증 전용 source 구현은 G-263/G-264에 남긴다. ID·기존 dependency·metadata·과거 수행 기록을 보존한다.
 
 - complexity medium: 기존 요청·named effects·검사/실행 경계에 동일한 문맥을 전달하는 책임이 명확하다. provider별 인증 방식·저장소 전환은 후속 작업으로 분리한다.
 - risk high: 다른 환경에서 확인한 정책·인증을 실제 호출의 근거로 채택하면 개인 확장 설정이나 오래된 증거로 실행할 수 있다. 준비 실패의 선거부, 원래 증거·session 보존과 현재 환경 재검증이 복구 수단이며 env 불일치·설정 변경·비밀값 비노출을 AC·Validation에서 확인한다. 무인 실행에 필요한 분리 기반으로 priority high다.
