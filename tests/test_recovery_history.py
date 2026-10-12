@@ -11,8 +11,10 @@ from loop_manager_internal.recovery import scoped_blocking
 from tests.support.worker import worker_result
 from tests.support.publication import publishing_branch_pr_lookup
 from tests.support.worker import dummy_worker_sessions
+from tests.support.git import isolated_git_test
 
 
+@isolated_git_test
 class RecoveryHistoryTest(BoundedRecoveryFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_review_occurrence_history_does_not_create_final_block(self):
