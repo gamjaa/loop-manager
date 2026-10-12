@@ -95,7 +95,7 @@ class PlanningWorkspaceService(PlanningService):
         self._ports.state.preserve_diagnostics(repo, self._ports.state.planning(repo))
 
     def _prepare_workspace(
-        self, run: _PlanningRun
+        self, run: _PlanningRun, *, defer_on_remote_advance: bool = False,
     ) -> PlanningOutcome | None:
         row = run.row
         if row.phase != "PLANNING":
@@ -153,6 +153,12 @@ class PlanningWorkspaceService(PlanningService):
         correction_completed = False
         try:
             latest = self._ports.git.fetch_base(context.repo_path, context.base_branch)
+            if defer_on_remote_advance and latest != row.active_sha:
+                return PlanningOutcome(
+                    PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED,
+                    detail="Planner 종료 후 원격 base가 전진해 완료 결과와 작업물을 보존하고 다음 실행에서 갱신합니다.",
+                    error=True,
+                )
             if latest == row.active_sha:
                 # The SQLite base update may have committed immediately before
                 # a crash that left the preservation stash and journal behind.
@@ -484,7 +490,7 @@ class PlanningWorkspaceService(PlanningService):
         """Refresh the candidate after its writer exits and before result validation."""
         if run.row.phase != "PLANNING" or not run.row.planning_result_completed:
             return None
-        outcome = self._prepare_workspace(run)
+        outcome = self._prepare_workspace(run, defer_on_remote_advance=True)
         if outcome is not None:
             return outcome
         if run.row.planning_result_pending_validation and not run.row.planning_result_completed:

@@ -257,17 +257,22 @@ class PlanningRecoveryTest(PlanningCase):
             ports.agent, "run_planner", side_effect=advance_remote_after_writer,
         ) as invoke:
             outcome = coordinator.run(self.context)
-            self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+            self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED)
             ports.validation.validate_general_result.assert_not_called()
+            saved = ports.state.snapshot
+            self.assertEqual(saved.active_sha, "base")
+            self.assertTrue(saved.planning_result_pending_validation)
+            self.assertTrue(saved.planning_result_completed)
+            self.assertEqual(saved.planning_result, "planner result")
+            self.assertEqual(saved.planner_session_id, "session-1")
+
+            resumed = coordinator._new_run(replace(self.context, base_sha="new-base"))
+            self.assertIsNone(coordinator._workspace._prepare_workspace(resumed))
             saved = ports.state.snapshot
             self.assertEqual(saved.active_sha, "new-base")
             self.assertTrue(saved.planning_result_pending_validation)
             self.assertFalse(saved.planning_result_completed)
             self.assertIsNone(saved.planning_result)
-            self.assertEqual(saved.planner_session_id, "session-1")
-
-            resumed = coordinator._new_run(replace(self.context, base_sha="new-base"))
-            self.assertIsNone(coordinator._workspace._prepare_workspace(resumed))
             self.assertIsNone(coordinator._assessment._run_planner_turn(resumed))
             self.assertEqual(ports.agent.resumed_session, "session-1")
             self.assertIsNone(coordinator._workspace._refresh_after_planner(resumed))
@@ -306,18 +311,25 @@ class PlanningRecoveryTest(PlanningCase):
             ports.agent, "run_planner", side_effect=advance_remote_after_first_writer,
         ) as invoke:
             outcome = coordinator.run(self.context)
-            self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART)
+            self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED)
             saved = ports.state.snapshot
+            self.assertEqual(saved.active_sha, "base")
+            self.assertEqual(saved.planning_retry_count, 2)
+            self.assertTrue(saved.planning_result_pending_validation)
+            self.assertTrue(saved.planning_result_completed)
+            self.assertEqual(saved.planning_result, "planner result")
+            ports.validation.validate_general_result.assert_not_called()
+
+            resumed = coordinator._new_run(replace(self.context, base_sha="new-base"))
+            self.assertIsNone(coordinator._workspace._prepare_workspace(resumed))
+            saved = ports.state.snapshot
+            self.assertEqual(saved.active_sha, "new-base")
             self.assertEqual(saved.planning_retry_count, 0)
             self.assertTrue(saved.planning_result_pending_validation)
             self.assertFalse(saved.planning_result_completed)
             self.assertIsNone(saved.planning_result)
             self.assertIn("현재 planning 결과의 관련 문서가 변경됐습니다", saved.planning_validation_error)
             self.assertEqual(ports.state.diagnostics[-1].planning_retry_count, 2)
-            ports.validation.validate_general_result.assert_not_called()
-
-            resumed = coordinator._new_run(replace(self.context, base_sha="new-base"))
-            self.assertIsNone(coordinator._workspace._prepare_workspace(resumed))
             self.assertIsNone(coordinator._assessment._run_planner_turn(resumed))
             self.assertIsNone(coordinator._workspace._refresh_after_planner(resumed))
             retry = coordinator._assessment._validate_planner_result(resumed)
