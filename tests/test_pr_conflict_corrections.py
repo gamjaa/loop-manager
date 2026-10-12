@@ -1,6 +1,7 @@
 from tests.support.recovery_boundary import RecoveryBoundary
 from tests.support.pr_recovery import PrRecoveryFixture, observe_live_pull_request
 import json
+import sqlite3
 import subprocess
 import tempfile
 import unittest
@@ -8,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 import loop_manager
 from tests.support.git import git_command, isolated_git_test
+from tests.support.lifecycle import register_connection_cleanup
 from tests.support.worker import worker_result
 from tests.support.worker import dummy_worker_sessions
 from tests.support.execution import execution_policy_fixture, run_execution_policy
@@ -38,6 +40,28 @@ class LivePullRequestObservationTests(unittest.TestCase):
 
 @isolated_git_test
 class PrConflictLeaseTests(PrRecoveryFixture, unittest.TestCase):
+    def test_fixture_registers_connection_cleanup_before_preparation(self):
+        connection = sqlite3.connect(":memory:")
+        owner = mock.Mock()
+        owner.addCleanup = mock.Mock()
+        cleanups = {}
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch("tests.support.pr_recovery.sqlite3.connect",
+                        return_value=connection), \
+             mock.patch("tests.support.pr_recovery.register_connection_cleanup",
+                        side_effect=lambda cleanup_owner, conn:
+                            cleanups.setdefault(
+                                "close", register_connection_cleanup(cleanup_owner, conn)
+                            )) as register, \
+             mock.patch("tests.support.pr_recovery.loop_manager.SCHEMA",
+                        "invalid SQL"):
+            with self.assertRaisesRegex(sqlite3.OperationalError, 'near "invalid"'):
+                PrRecoveryFixture._pr_open_state(owner, directory)
+        register.assert_called_once_with(owner, connection)
+        cleanups["close"]()
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+
     @dummy_worker_sessions(fixed_guidance=True)
     def test_conflicting_pr_reuses_sessions_revalidates_new_base_and_leases_push(self):
         with tempfile.TemporaryDirectory() as directory:
