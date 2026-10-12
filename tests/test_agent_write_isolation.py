@@ -112,13 +112,14 @@ class WriteIsolationTests(TestCase):
                              mock.patch.object(isolation.platform, 'system', return_value='Linux'), \
                              mock.patch.object(isolation.subprocess, 'run', return_value=
                                                manager.subprocess.CompletedProcess([], 0, version, '')), \
-                             mock.patch.object(isolation, 'prepare_launch') as launch:
+                             mock.patch.object(isolation, 'prepare_launch', return_value=mock.Mock(
+                                 arguments=(), probe_arguments=(), environment={})) as launch:
                             with self.assertRaisesRegex(isolation.IsolationError, '자동 검토 버전'):
                                 isolation.prepare_isolation(
                                     'codex', 'worker', root, root, False, records.append,
                                     lambda: 'snapshot', expected_repository=str(boundary.source),
                                     session_id=session, environment_variables={})
-                        launch.assert_not_called()
+                        launch.return_value.probe.assert_not_called()
                         self.assertEqual(records[0].status, 'rejected')
                         self.assertEqual(records[0].cli_version, version)
                         self.assertEqual(records[0].snapshot_digest, 'snapshot')
@@ -276,7 +277,8 @@ class WriteIsolationTests(TestCase):
             boundary = isolation.WorktreeBoundary(root, root / 'source', (),
                                                    root / 'git', root / 'common', 'repository')
             records = []
-            launch = mock.Mock(probe_arguments=('standalone',), arguments=('inner',))
+            launch = mock.Mock(probe_arguments=('standalone',), arguments=('inner',),
+                               environment={'CODEX_HOME': str(provider_home)})
             with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(provider_home)}), \
                  mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \
                  mock.patch.object(isolation, 'prepare_launch', return_value=launch), \
@@ -347,7 +349,7 @@ class WriteIsolationTests(TestCase):
             boundary = isolation.WorktreeBoundary(root, root / 'source', (),
                                                    root / 'git', root / 'common', 'repo')
             records = []
-            launch = mock.Mock(probe_arguments=('standalone',))
+            launch = mock.Mock(probe_arguments=('standalone',), environment={'CODEX_HOME': str(home)})
             launch.probe.side_effect = RuntimeError('sandbox unavailable')
             with mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
                  mock.patch.object(isolation, 'inspect_worktree', return_value=boundary), \

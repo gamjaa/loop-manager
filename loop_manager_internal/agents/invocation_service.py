@@ -16,6 +16,7 @@ from loop_manager_internal.storage import agent_invocation_state
 from loop_manager_internal.agents import agent_write_isolation
 from loop_manager_internal.agents import agent_scope_decision
 from loop_manager_internal.agents import common_guidance
+from loop_manager_internal.agents import agent_profiles
 from loop_manager_internal.git.base_fetch_service import reconcile_external_base
 from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
 from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
@@ -82,9 +83,25 @@ def run_agent(
                            AgentResultKind.PERMANENT_CONFIGURATION)
     resolved: ResolvedProfile | None = resolved_profile
     collection_status = "unknown"
+    adapter = effects.agent_provider(provider)
+    prepared_launch = None
+    prepare = getattr(type(adapter), 'prepare_environment', None)
+    if invocation is not None and resolved is None and callable(prepare):
+        try:
+            prepared_launch = prepare(adapter, AgentRequest(
+                worktree, state_dir, config_path, role_name, prompt, read_only,
+                expected_repository=invocation.repo if invocation else str(worktree.resolve())))
+        except (agent_write_isolation.IsolationError, OSError) as error:
+            if owned_connection is not None:
+                owned_connection.close()
+            return AgentResult(1, f'Agent 실행 환경 준비 실패: {error}', session_id,
+                               AgentResultKind.PERMANENT_CONFIGURATION)
     if invocation is not None and resolved is None:
         try:
-            resolved = effects._agent_profile(config_path, provider, role_name, level, worktree)
+            environment = (prepared_launch.environment if prepared_launch is not None
+                           else agent_profiles.agent_environment(provider, role_name))
+            with agent_profiles.prepared_environment(provider, environment):
+                resolved = effects._agent_profile(config_path, provider, role_name, level, worktree)
         except (RuntimeError, OSError):
             # Profile observation must not alter the provider's own result.
             # A real adapter still resolves and validates before launching CLI.
@@ -130,6 +147,14 @@ def run_agent(
             raise agent_write_isolation.IsolationError(
                 "Agent 격리 증거 저장 실패"
             ) from error
+
+    def observe_execution_identity(value: dict[str, str]) -> None:
+        if ledger is None or identity is None:
+            raise agent_write_isolation.IsolationError('Agent 실제 실행 입력을 저장할 invocation이 없습니다.')
+        try:
+            ledger.record_execution_identity(identity, value)
+        except (sqlite3.Error, ValueError) as error:
+            raise agent_write_isolation.IsolationError('Agent 실제 실행 입력 증거 저장 실패') from error
 
     from loop_manager_internal.notifications import notifications
 
@@ -263,6 +288,8 @@ def run_agent(
         isolation_snapshot_digest=preflight_scope_digest,
         expected_repository=invocation.repo if invocation is not None else None,
         common_guidance=guidance,
+        prepared_launch=prepared_launch,
+        on_execution_identity=observe_execution_identity,
     )
     started = time.monotonic()
     try:
@@ -273,7 +300,7 @@ def run_agent(
                               "최소 문맥으로 새 session에서 작업을 이어가야 합니다.", session_id)
         else:
             try:
-                raw = effects.agent_provider(provider).run(request)
+                raw = adapter.run(request)
             except common_guidance.GuidanceError as error:
                 raw = AgentResult(1, f"공통 지침 provider 준비 실패: {error}", session_id,
                                   AgentResultKind.PERMANENT_CONFIGURATION)

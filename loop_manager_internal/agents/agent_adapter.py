@@ -33,11 +33,12 @@ class ProviderAdaptersEffectsEffects:
     _handoff_run: Callable[..., object]
     role: Callable[..., object]
     worker_profile: Callable[..., object]
+    validate_provider_runtime: Callable[..., object] | None = None
 
 
 def _provider_adapters_effects(effects: ProviderAdaptersEffectsEffects, ) -> provider_adapters.ProviderEffects:
     return provider_adapters.ProviderEffects(effects.role, effects.worker_profile, effects._agent_profile,
-                                            effects._handoff_popen, effects._handoff_run)
+                                            effects._handoff_popen, effects._handoff_run, effects.validate_provider_runtime)
 
 
 @dataclass(frozen=True)
@@ -383,6 +384,8 @@ def run_codex(
     on_process_started: Callable[[], None] | None = None,
     on_process_finished: Callable[[], None] | None = None,
     common_guidance: object | None = None,
+    prepared_launch: agent_write_isolation.CodexLaunch | None = None,
+    on_execution_identity=None,
 ) -> tuple[int, str] | CodexResult:
     return provider_adapters.run_codex(
         worktree,
@@ -402,6 +405,8 @@ def run_codex(
         expected_repository=expected_repository,
         on_isolation_checked=on_isolation_checked,
         common_guidance=common_guidance,
+        prepared_launch=prepared_launch,
+        on_execution_identity=on_execution_identity,
         on_process_started=on_process_started,
         on_process_finished=on_process_finished,
         effects=effects._provider_adapters_effects(),

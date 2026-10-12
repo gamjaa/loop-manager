@@ -136,6 +136,7 @@ class RuntimeReadOnlyIsolationTests(TestCase):
                  mock.patch.object(document_drafts, 'DocumentDraftRepository', return_value=drafts), \
                  mock.patch.object(document_drafts, 'parse_generated_draft', return_value=None) as parse, \
                  mock.patch.object(manager, 'operation_print'), \
+                 mock.patch.object(manager, 'validate_provider_runtime'), \
                  mock.patch.object(manager, '_agent_profile', return_value=invocation.ResolvedProfile('model', 'high')), \
                  mock.patch.object(manager, 'capture_git_snapshot', return_value=manager.GitSnapshot(
                      observed['head'], None, {}, {}, {}, {}, {}, {})), \

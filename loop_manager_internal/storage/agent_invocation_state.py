@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import sqlite3
+import json
+import re
 from uuid import uuid4
 
 from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, Usage
@@ -87,6 +89,8 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
                   ("guidance_task_id", "TEXT"), ("guidance_content_hash", "TEXT")):
         if field not in columns:
             connection.execute(f"ALTER TABLE agent_invocations ADD COLUMN {field} {definition}")
+    if 'execution_identity' not in columns:
+        connection.execute('ALTER TABLE agent_invocations ADD COLUMN execution_identity TEXT')
     connection.execute("""CREATE INDEX IF NOT EXISTS agent_invocations_analysis
         ON agent_invocations(repo, role, provider, model, effort, transition, started_at)""")
 
@@ -210,6 +214,39 @@ class InvocationRepository:
                  evidence.repository_identity, evidence.policy_digest,
                  evidence.snapshot_digest, evidence.configuration_digest,
                  evidence.status, evidence.reason, utc_now()))
+
+    def record_execution_identity(self, identity: str, value: dict[str, str]) -> None:
+        required = {'provider', 'model', 'effort', 'instruction', 'environment', 'policy'}
+        if set(value) != required or any(not isinstance(v, str) or not v for v in value.values()):
+            raise ValueError('실제 Agent 실행 입력 identity 형식이 다릅니다.')
+        if any(re.fullmatch(r'[0-9a-f]{64}', value[key]) is None
+               for key in ('instruction', 'environment', 'policy')):
+            raise ValueError('실제 Agent 실행 입력은 비밀값 없는 지문이어야 합니다.')
+        with self.connection:
+            result = self.connection.execute('''UPDATE agent_invocations SET execution_identity=?
+                WHERE invocation_id=? AND finished_at IS NULL AND execution_identity IS NULL
+                AND provider=? AND model=? AND effort=? AND EXISTS (
+                    SELECT 1 FROM agent_isolation_evidence proof
+                    WHERE proof.invocation_id=agent_invocations.invocation_id AND proof.status='verified')''',
+                (json.dumps(value, sort_keys=True), identity, value['provider'], value['model'], value['effort']))
+            if result.rowcount != 1:
+                raise ValueError('실제 Agent 실행 입력과 현재 invocation·격리 증거가 다릅니다.')
+
+    def execution_identity(self, identity: str, *, repo: str, plan_id: str | None,
+                           role: str, worktree: str, provider: str) -> dict[str, str] | None:
+        row = self.connection.execute('''SELECT call.execution_identity FROM agent_invocations call
+            JOIN agent_isolation_evidence proof USING (invocation_id)
+            WHERE call.invocation_id=? AND call.repo=? AND call.plan_id IS ? AND call.role=?
+              AND call.provider=? AND proof.provider=call.provider AND proof.role=call.role
+              AND proof.canonical_worktree=? AND proof.status='verified'
+              AND call.execution_status='executed' AND call.execution_started_at IS NOT NULL
+              AND call.execution_finished_at IS NOT NULL AND call.finished_at IS NOT NULL
+              AND call.result_kind='success' AND call.result_code=0
+              AND call.collection_status!='error' AND call.guidance_content_hash IS NOT NULL
+              AND proof.snapshot_digest!='' AND proof.configuration_digest!=''
+              AND call.execution_identity IS NOT NULL''',
+            (identity, repo, plan_id, role, provider, worktree)).fetchone()
+        return json.loads(row[0]) if row is not None else None
 
     def verified_invocation(self, identity: str, *, session_id: str | None,
                             expected: IsolationEvidence) -> bool:

@@ -422,6 +422,7 @@ _provider_adapters_effects = _bind_effects(
         _handoff_run=lambda *args, **kwargs: _handoff_run(*args, **kwargs),
         role=lambda *args, **kwargs: role(*args, **kwargs),
         worker_profile=lambda *args, **kwargs: worker_profile(*args, **kwargs),
+        validate_provider_runtime=lambda *args, **kwargs: validate_provider_runtime(*args, **kwargs),
     ),
 )
 

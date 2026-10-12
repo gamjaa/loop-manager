@@ -247,6 +247,11 @@ class PlannerInterruptionRecoveryTest(unittest.TestCase):
                 side_effect=verified_preflight,
             ), mock.patch(
                 "loop_manager.agent_write_isolation.assert_current",
+            ), mock.patch(
+                "loop_manager.validate_provider_runtime",
+            ), mock.patch(
+                "loop_manager_internal.agents.agent_codex_sandbox.CodexLaunch.stop",
+                side_effect=lambda child: child.kill(),
             ):
                 with self.assertRaisesRegex(RuntimeError, "Planner process interrupted"):
                     loop_manager.run_project(

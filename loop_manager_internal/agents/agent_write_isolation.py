@@ -125,13 +125,16 @@ def _inspect_read_only_runtime(selected: Path, state_root: Path, source: Path) -
 
 
 def _configuration_digest(provider: str, worktree: Path,
-                          config_path: Path | None) -> str:
+                          config_path: Path | None,
+                          environment_variables: dict[str, str] | None = None) -> str:
     """Bind evidence to local configuration bytes without storing secrets."""
-    home = Path.home()
+    variables = os.environ if environment_variables is None else environment_variables
+    home = Path(variables.get('HOME', variables.get('USERPROFILE', str(Path.home()))))
     if provider == "codex":
-        candidates = _codex_config_files(worktree)
+        candidates = (_codex_config_files(worktree) if environment_variables is None
+                      else _codex_config_files(worktree, environment_variables))
     else:
-        provider_home = Path(os.environ.get("CLAUDE_CONFIG_DIR", home / ".claude"))
+        provider_home = Path(variables.get("CLAUDE_CONFIG_DIR", home / ".claude"))
         candidates = (provider_home / "settings.json", worktree / ".claude/settings.json",
                       worktree / ".claude/settings.local.json")
     digest = sha256()
@@ -148,8 +151,10 @@ def _configuration_digest(provider: str, worktree: Path,
     return digest.hexdigest()
 
 
-def _codex_config_files(worktree: Path) -> tuple[Path, ...]:
-    provider_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+def _codex_config_files(worktree: Path, environment_variables: dict[str, str] | None = None) -> tuple[Path, ...]:
+    variables = os.environ if environment_variables is None else environment_variables
+    home = Path(variables.get('HOME', variables.get('USERPROFILE', str(Path.home()))))
+    provider_home = Path(variables.get("CODEX_HOME", home / ".codex"))
     project_configs = []
     for parent in (worktree, *worktree.parents):
         project_configs.append(parent / ".codex/config.toml")
@@ -160,9 +165,10 @@ def _codex_config_files(worktree: Path) -> tuple[Path, ...]:
             Path("/etc/codex/requirements.toml"))))
 
 
-def _assert_no_codex_extensions(worktree: Path) -> None:
+def _assert_no_codex_extensions(worktree: Path, environment_variables: dict[str, str] | None = None) -> None:
     """Reject external tools not disabled by the managed feature policy."""
-    for path in _codex_config_files(worktree):
+    for path in (_codex_config_files(worktree) if environment_variables is None
+                 else _codex_config_files(worktree, environment_variables)):
         try:
             with path.open("rb") as stream:
                 configuration = tomllib.load(stream)
@@ -182,9 +188,11 @@ def _assert_no_codex_extensions(worktree: Path) -> None:
             raise IsolationError('Codex 관리 정책이 확장 도구 활성화를 요구합니다.')
 
 
-def _assert_no_codex_execpolicy(worktree: Path) -> None:
+def _assert_no_codex_execpolicy(worktree: Path, environment_variables: dict[str, str] | None = None) -> None:
     """An allow rule may run a command outside the probed sandbox."""
-    provider_home = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    variables = os.environ if environment_variables is None else environment_variables
+    home = Path(variables.get('HOME', variables.get('USERPROFILE', str(Path.home()))))
+    provider_home = Path(variables.get("CODEX_HOME", home / ".codex"))
     for folder in (provider_home / "rules", worktree / ".codex/rules",
                    Path("/etc/codex/rules")):
         try:
@@ -220,6 +228,22 @@ def codex_arguments(read_only: bool) -> tuple[str, ...]:
             "--strict-config", "--ignore-rules", *_codex_configuration(read_only))
 
 
+def prepare_execution_environment(provider: str, role: str, worktree: Path, state_dir: Path,
+                                  read_only: bool, expected_repository: str | None,
+                                  environment_variables: dict[str, str]) -> CodexLaunch:
+    """Select owned storage before any provider CLI or profile lookup."""
+    boundary = inspect_worktree(worktree, state_dir, read_only=read_only)
+    if expected_repository is None or Path(expected_repository).resolve() != boundary.source:
+        raise IsolationError('선택 worktree와 등록 repository identity가 일치하지 않습니다.')
+    if provider != 'codex':
+        raise IsolationError(f'{provider} 파일 도구와 sandbox 효력을 사전에 증명할 수 없습니다.')
+    try:
+        return prepare_launch(boundary, state_dir, role, read_only,
+                              codex_arguments(read_only), dict(environment_variables))
+    except RuntimeError as error:
+        raise IsolationError(str(error)) from error
+
+
 def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
                       read_only: bool,
                       observe: Callable[[IsolationEvidence], None] | None = None,
@@ -228,6 +252,7 @@ def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
                       expected_repository: str | None = None,
                       session_id: str | None = None,
                       environment_variables: dict[str, str] | None = None,
+                      prepared_launch: CodexLaunch | None = None,
                       ) -> CodexLaunch:
     """Prove one physical call; emit a fresh record even on rejection."""
     environment = f"{platform.system()}:{platform.release()}:{platform.machine()}"
@@ -243,7 +268,6 @@ def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
         boundary = inspect_worktree(worktree, state_dir, read_only=read_only)
         if expected_repository is None or Path(expected_repository).resolve() != boundary.source:
             raise IsolationError("선택 worktree와 등록 repository identity가 일치하지 않습니다.")
-        configuration = _configuration_digest(provider, boundary.worktree, config_path)
         if snapshot_digest is None:
             raise IsolationError("Agent 시작 Git snapshot 증거가 없습니다.")
         snapshot = snapshot_digest()
@@ -253,10 +277,20 @@ def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
             raise IsolationError(f"{provider} {platform.system()}에서 쓰기 격리를 검증할 수 없습니다.")
         if provider != "codex":
             raise IsolationError(f"{provider} 파일 도구와 sandbox 효력을 사전에 증명할 수 없습니다.")
-        _assert_no_codex_execpolicy(boundary.worktree)
-        _assert_no_codex_extensions(boundary.worktree)
+        if environment_variables is None:
+            raise IsolationError("내장 도구 경계를 위한 필터된 Agent 환경이 없습니다.")
+        try:
+            launch = prepared_launch or prepare_launch(boundary, state_dir, role, read_only,
+                                                       codex_arguments(read_only), environment_variables)
+        except RuntimeError as error:
+            raise IsolationError(str(error)) from error
+        selected_environment = launch.environment
+        configuration = _configuration_digest(provider, boundary.worktree, config_path, selected_environment)
+        _assert_no_codex_execpolicy(boundary.worktree, selected_environment)
+        _assert_no_codex_extensions(boundary.worktree, selected_environment)
         result = subprocess.run(["codex", "--version"], capture_output=True,
-                                text=True, encoding="utf-8", errors="replace", timeout=15, check=False)
+                                text=True, encoding="utf-8", errors="replace", timeout=15, check=False,
+                                env=selected_environment)
         if result.returncode or not result.stdout.strip():
             raise IsolationError("Codex CLI 버전을 확인할 수 없습니다.")
         version = result.stdout.strip()
@@ -266,12 +300,7 @@ def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
         match = re.fullmatch(r"codex-cli (\d+)\.(\d+)\.(\d+)", version)
         if not match or tuple(map(int, match.groups())) < (0, 159, 3):
             raise IsolationError("Codex CLI가 지원되는 granular 자동 검토 버전이 아닙니다.")
-        args = codex_arguments(read_only)
-        if environment_variables is None:
-            raise IsolationError("내장 도구 경계를 위한 필터된 Agent 환경이 없습니다.")
         try:
-            launch = prepare_launch(boundary, state_dir, role, read_only, args,
-                                    environment_variables)
             launch.probe()
             args = launch.arguments
         except RuntimeError as error:
@@ -304,25 +333,27 @@ def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
 
 def assert_current(evidence: IsolationEvidence, worktree: Path, state_dir: Path,
                    config_path: Path, expected_repository: str | None,
-                   read_only: bool, snapshot_digest: Callable[[], str]) -> None:
+                   read_only: bool, snapshot_digest: Callable[[], str],
+                   *, environment_variables: dict[str, str] | None = None) -> None:
     """Refuse a changed workspace, settings, CLI or Git state before launch."""
     if evidence.status != "verified":
         raise IsolationError("Agent 격리 증거가 verified 상태가 아닙니다.")
     boundary = inspect_worktree(worktree, state_dir, read_only=read_only)
     if evidence.provider == "codex":
-        _assert_no_codex_execpolicy(boundary.worktree)
-        _assert_no_codex_extensions(boundary.worktree)
+        _assert_no_codex_execpolicy(boundary.worktree, environment_variables)
+        _assert_no_codex_extensions(boundary.worktree, environment_variables)
     if (expected_repository is None or
             Path(expected_repository).resolve() != boundary.source or
             evidence.worktree != str(boundary.worktree) or
             evidence.repository_identity != boundary.repository_identity or
             evidence.configuration_digest != _configuration_digest(
-                evidence.provider, boundary.worktree, config_path) or
+                evidence.provider, boundary.worktree, config_path, environment_variables) or
             evidence.snapshot_digest != snapshot_digest()):
         raise IsolationError("Agent 사전 검사 뒤 worktree·설정·Git 상태가 변경됐습니다.")
     try:
         result = subprocess.run([evidence.provider, "--version"], capture_output=True,
-                                text=True, encoding="utf-8", errors="replace", timeout=15, check=False)
+                                text=True, encoding="utf-8", errors="replace", timeout=15, check=False,
+                                env=environment_variables)
     except (OSError, subprocess.TimeoutExpired) as error:
         raise IsolationError("Agent CLI 버전 재확인 실패") from error
     if result.returncode or result.stdout.strip() != evidence.cli_version:
