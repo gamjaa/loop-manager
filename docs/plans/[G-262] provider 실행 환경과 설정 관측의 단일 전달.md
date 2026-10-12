@@ -49,6 +49,7 @@ priority: high
 - [x] 2026-10-11 delta `214c978cb296a765020d88378f5526050d241f44` → `6fc245469a6bd3cced81dbf64fc049130982bbc8`에서 R-085와 인증/profile·invocation·launch·설정 지문·fallback 원문 및 관련 fixture를 정적으로 대조했다. 인증/profile 조회와 설정 지문은 부모 환경을 사용하고 Codex의 별도 home은 이후 launch에서 선택된다. 구현·테스트·전체 verify는 실행하지 않았다.
 - [x] 2026-10-12 사용자 직접 구현: 준비된 Codex 환경 전달, 실제 환경의 인증/profile·격리·지침 재확인, invocation 입력 저장 및 현재/실제 호출 관측 API를 구현했다. CLI/process는 test double이며 실제 모델·실계정 실행을 완료로 기록하지 않는다. 관련 targeted unit 117개와 native 호출·runtime 격리·중단 복구 25개가 통과했다.
 - [x] 2026-10-12 기반 구현 b75568b에서 Manager 전체 verify: 215개 모듈·3,579개 테스트(성공 3,574·skip 5), 필수 compile 포함 통과. Linux/Python 3.12이며 실계정 모델 호출은 검증하지 않았다.
+- [x] 2026-10-12 통합 구현 9dbdd1f의 전체 verify: 218개 모듈·3,622개 테스트(성공 3,617·skip 5), 필수 compile 포함 통과. production 관측·단일 선행 Reviewer 승인 사이클 및 targeted 실패 무통지 회귀를 포함하며 실제 모델·성능 실측 완료를 뜻하지 않는다.
 - [ ] 읽기 전용 Review·사용자 Merge
 
 ## Decision Log

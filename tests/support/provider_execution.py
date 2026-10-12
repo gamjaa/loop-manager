@@ -116,4 +116,3 @@ class ProviderExecutionFixture:
         if popen.called:
             self.assertEqual(popen.call_args.kwargs['env']['CODEX_HOME'], str(self.child_home))
         return result
-
