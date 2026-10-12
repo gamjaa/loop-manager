@@ -1,6 +1,7 @@
 """Opt-in, adapter and process contracts, without full verify or real CLI execution."""
 from contextlib import ExitStack
-from dataclasses import asdict
+from dataclasses import asdict, replace
+import importlib
 import io
 import json
 import os
@@ -17,6 +18,35 @@ from loop_manager_internal.execution import result_validation, verify_process
 
 
 class VerifyContractTests(unittest.TestCase):
+    def test_fresh_import_shards_preserve_collection_identity_and_fixture_owners(self):
+        from tests.support import fresh_imports
+        targets = fresh_imports.inventory()
+        loader = manifest.ManifestLoader()
+        for shard in range(fresh_imports.SHARD_COUNT):
+            loaded = importlib.import_module(f'tests.test_internal_imports_{shard}')
+            loader.loadTestsFromModule(loaded, pattern='test*.py')
+        units = loader.modules
+        contract.validate_manifest(units)
+        self.assertEqual(sum(len(unit.ids) for unit in units), len(targets))
+        for unit in units:
+            self.assertEqual(tuple(manifest.test_ids(manifest.load_module(unit))), unit.ids)
+            self.assertTrue(all(owner == unit.name and klass == unit.name + '.FreshImportTests'
+                                for _, owner, klass in unit.owners))
+            with self.assertRaisesRegex(RuntimeError, 'fixture'):
+                manifest.load_module(replace(unit, owners=tuple((identity, 'wrong', 'wrong.Case')
+                                                               for identity in unit.ids)))
+        # Recollection must see a changed inventory even if the helper is cached.
+        changed = (*targets, fresh_imports.ImportTarget('module', 'loop_manager_internal.new_module'))
+        for observation in (targets[1:], changed):
+            with mock.patch.object(fresh_imports, 'inventory', return_value=observation):
+                affected = [unit for unit in units
+                            if tuple(manifest.test_ids(unittest.defaultTestLoader.loadTestsFromModule(
+                                importlib.import_module(unit.name)))) != unit.ids]
+                self.assertTrue(affected)
+                for unit in affected:
+                    with self.assertRaisesRegex(RuntimeError, '수집 범위'):
+                        manifest.load_module(unit)
+
     def setUp(self):
         self.cleanup = ExitStack()
         self.addCleanup(self.cleanup.close)
