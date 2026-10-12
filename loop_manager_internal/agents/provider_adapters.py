@@ -12,7 +12,7 @@ import threading
 from typing import Protocol
 
 from loop_manager_internal.agents.agent_invocation import AgentRequest, AgentResult, AgentResultKind, ResolvedProfile, Usage
-from loop_manager_internal.agents.agent_profiles import agent_environment
+from loop_manager_internal.agents.agent_profiles import agent_environment, prepared_environment
 from loop_manager_internal.agents.agent_provider_usage import claude_usage, codex_log_usage
 from loop_manager_internal.agents import agent_write_isolation
 from loop_manager_internal.agents import provider_guidance
@@ -34,6 +34,7 @@ class ProviderEffects:
     _agent_profile: Callable[[Path, str, str, int | None, Path], ResolvedProfile]
     _handoff_popen: Callable[..., subprocess.Popen[str]]
     _handoff_run: Callable[..., subprocess.CompletedProcess[str]]
+    validate_runtime: Callable[..., None] | None = None
 
 
 def _provider_log_directory(worktree: Path, state_dir: Path) -> Path:
@@ -176,26 +177,13 @@ def run_codex(
     on_process_started: Callable[[], None] | None = None,
     on_process_finished: Callable[[], None] | None = None,
     common_guidance: CommonGuidance | None = None,
+    prepared_launch: agent_write_isolation.CodexLaunch | None = None,
+    on_execution_identity=None,
     effects: ProviderEffects,
 ) -> tuple[int, str] | CodexResult:
-    if resolved_profile is not None:
-        model, effort = resolved_profile.model, resolved_profile.effort
-    elif role_name == "worker":
-        if level is None:
-            raise RuntimeError("Codex Worker level이 없습니다.")
-        model, effort = effects.worker_profile(config_path, level, worktree)
-    else:
-        if level is not None:
-            raise RuntimeError(f"Codex {role_name}에 Worker level을 지정할 수 없습니다.")
-        model, effort = effects.role(config_path, role_name, worktree)
-    fast_mode = provider_fast_mode(config_path, "codex")
-    fast_arguments = [
-        "-c", 'service_tier="fast"' if fast_mode else 'service_tier="default"',
-        "-c", f'features.fast_mode={str(fast_mode).lower()}',
-    ]
-    fast_mode_log = json.dumps({"type": "loop_manager.fast_mode", "requested": fast_mode}) + "\n"
-    codex_launch = None
-    launch_environment = agent_environment("codex", role_name)
+    codex_launch = prepared_launch
+    launch_environment = (dict(prepared_launch.environment) if prepared_launch is not None
+                          else agent_environment("codex", role_name))
     if on_isolation_checked is not None:
         checked: list[agent_write_isolation.IsolationEvidence] = []
 
@@ -207,7 +195,7 @@ def run_codex(
             "codex", role_name, worktree, state_dir, read_only, observe,
             isolation_snapshot_digest, config_path=config_path,
             expected_repository=expected_repository, session_id=session_id,
-            environment_variables=launch_environment,
+            environment_variables=launch_environment, prepared_launch=prepared_launch,
         )
         if isinstance(isolation_arguments, agent_write_isolation.CodexLaunch):
             codex_launch = isolation_arguments
@@ -222,13 +210,49 @@ def run_codex(
         agent_write_isolation.assert_current(
             isolation_evidence, worktree, state_dir, config_path,
             expected_repository, read_only, isolation_snapshot_digest,
+            environment_variables=launch_environment,
         )
+    with prepared_environment("codex", launch_environment):
+        if isolation_evidence is not None and effects.validate_runtime is not None:
+            effects.validate_runtime(config_path, 'codex', worktree)
+            current_profile = effects._agent_profile(config_path, 'codex', role_name, level, worktree)
+            if resolved_profile is not None and current_profile != resolved_profile:
+                raise agent_write_isolation.IsolationError('준비된 실행 환경의 Agent profile이 변경됐습니다.')
+            resolved_profile = current_profile
+        if resolved_profile is not None:
+            model, effort = resolved_profile.model, resolved_profile.effort
+        elif role_name == "worker":
+            if level is None:
+                raise RuntimeError("Codex Worker level이 없습니다.")
+            model, effort = effects.worker_profile(config_path, level, worktree)
+        else:
+            if level is not None:
+                raise RuntimeError(f"Codex {role_name}에 Worker level을 지정할 수 없습니다.")
+            model, effort = effects.role(config_path, role_name, worktree)
+        fast_mode = provider_fast_mode(config_path, "codex")
+        fast_arguments = [
+            "-c", 'service_tier="fast"' if fast_mode else 'service_tier="default"',
+            "-c", f'features.fast_mode={str(fast_mode).lower()}',
+        ]
+        fast_mode_log = json.dumps({"type": "loop_manager.fast_mode", "requested": fast_mode}) + "\n"
+
     guidance_context = tuple(isolation_arguments or codex_sandbox_arguments(read_only))
+    instruction_digests = []
     additional = (provider_guidance.codex_arguments(
         common_guidance, worktree, environment=launch_environment,
+        observe_instruction=instruction_digests.append,
         context_arguments=("-m", model, "-c", f'model_reasoning_effort="{effort}"',
                           *fast_arguments, *guidance_context),
     ) if common_guidance else [])
+    if codex_launch is not None and isolation_evidence is not None:
+        agent_write_isolation.assert_current(isolation_evidence, worktree, state_dir, config_path,
+            expected_repository, read_only, isolation_snapshot_digest, environment_variables=launch_environment)
+        if on_execution_identity is not None:
+            from loop_manager_internal.agents.provider_execution import execution_identity
+            if not instruction_digests:
+                raise agent_write_isolation.IsolationError('실제 Provider 지침 적용 증거가 없습니다.')
+            on_execution_identity(execution_identity(isolation_evidence, codex_launch,
+                ResolvedProfile(model, effort), instruction_digests[0], read_only=read_only))
     project_dir = _provider_log_directory(worktree, state_dir)
     last_message = project_dir / f"{role_name}-last.txt"
     saved_log = project_dir / f"{role_name}.log"
@@ -465,19 +489,21 @@ def run_claude(
     common_guidance: CommonGuidance | None = None,
     effects: ProviderEffects,
 ) -> tuple[int, str] | AgentResult:
-    profile = resolved_profile or effects._agent_profile(
-        config_path, "claude", role_name, level, worktree
-    )
+    launch_environment = agent_environment("claude", role_name)
+    with prepared_environment('claude', launch_environment):
+        profile = resolved_profile or effects._agent_profile(
+            config_path, "claude", role_name, level, worktree
+        )
     model, effort = profile.model, profile.effort
     fast_mode = provider_fast_mode(config_path, "claude")
     fast_mode_log = json.dumps({"type": "loop_manager.fast_mode", "requested": fast_mode}) + "\n"
-    additional = provider_guidance.claude_arguments(common_guidance) if common_guidance else []
+    additional = provider_guidance.claude_arguments(common_guidance, environment=launch_environment) if common_guidance else []
     if on_isolation_checked is not None:
         agent_write_isolation.prepare_isolation(
             "claude", role_name, worktree, state_dir, read_only,
             on_isolation_checked, isolation_snapshot_digest,
             config_path=config_path, expected_repository=expected_repository,
-            session_id=session_id,
+            session_id=session_id, environment_variables=launch_environment,
         )
     project_dir = _provider_log_directory(worktree, state_dir)
     log = project_dir / f"claude-{role_name}.log"
@@ -521,7 +547,7 @@ def run_claude(
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                env=agent_environment("claude", role_name),
+                env=launch_environment,
                 cwd=worktree,
             )
             assert process.stdin is not None
@@ -609,7 +635,7 @@ def run_claude(
                 text=True,
                 encoding="utf-8",
                 errors="replace",
-                env=agent_environment("claude", role_name),
+                env=launch_environment,
                 cwd=worktree,
             )
             try:
@@ -646,7 +672,7 @@ def run_claude(
                 errors="replace",
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
-                env=agent_environment("claude", role_name),
+                env=launch_environment,
                 cwd=worktree,
                 timeout=AGENT_CLI_TIMEOUT_SECONDS,
             )
@@ -767,6 +793,11 @@ class CodexAgentAdapter:
     def __init__(self, run: Callable[..., tuple[int, str] | AgentResult]):
         self._run = run
 
+    def prepare_environment(self, request: AgentRequest):
+        return agent_write_isolation.prepare_execution_environment('codex', request.role_name,
+            request.worktree, request.state_dir, request.read_only, request.expected_repository,
+            agent_environment('codex', request.role_name))
+
     def run(self, request: AgentRequest) -> tuple[int, str] | AgentResult:
         return self._run(
             request.worktree,
@@ -784,6 +815,8 @@ class CodexAgentAdapter:
             expected_repository=request.expected_repository,
             on_isolation_checked=request.on_isolation_checked,
             common_guidance=request.common_guidance,
+            prepared_launch=request.prepared_launch,
+            on_execution_identity=request.on_execution_identity,
             on_process_started=request.on_process_started,
             on_process_finished=request.on_process_finished,
         )

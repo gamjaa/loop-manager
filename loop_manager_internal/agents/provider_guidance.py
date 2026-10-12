@@ -67,7 +67,8 @@ def _override(content: str) -> list[str]:
 
 def codex_arguments(guidance: CommonGuidance, worktree: Path, *,
                     context_arguments: tuple[str, ...] = (),
-                    environment: dict[str, str] | None = None) -> list[str]:
+                    environment: dict[str, str] | None = None,
+                    observe_instruction=None) -> list[str]:
     _validate(guidance)
     version = _probe(["codex", "--version"], env=environment).strip()
     match = re.fullmatch(r"codex-cli (\d+)\.(\d+)\.(\d+)", version)
@@ -101,12 +102,14 @@ def codex_arguments(guidance: CommonGuidance, worktree: Path, *,
     expected[index] = prefix + combined + suffix
     if verified != expected:
         raise GuidanceError("Codex 공통 추가 지침의 실제 적용과 기존 지침 보존을 확인할 수 없습니다.")
+    if observe_instruction is not None:
+        observe_instruction(hashlib.sha256(json.dumps(verified, ensure_ascii=False).encode()).hexdigest())
     return override
 
 
-def claude_arguments(guidance: CommonGuidance) -> list[str]:
+def claude_arguments(guidance: CommonGuidance, *, environment: dict[str, str] | None = None) -> list[str]:
     _validate(guidance)
-    help_text = _probe(["claude", "--help"])
+    help_text = _probe(["claude", "--help"], env=environment)
     if any(flag not in help_text for flag in (
         "--append-system-prompt-file", "--system-prompt-snapshot",
     )):

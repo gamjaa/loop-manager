@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping
+from contextlib import contextmanager
+from contextvars import ContextVar
 import configparser
 import os
 import json
@@ -13,6 +15,20 @@ import re
 
 from loop_manager_internal.agents.agent_invocation import AgentProfile
 from loop_manager_internal.config.managed_config import provider_fast_mode
+
+
+_prepared_environment: ContextVar[tuple[str, Mapping[str, str]] | None] = ContextVar(
+    'prepared_provider_environment', default=None)
+
+
+@contextmanager
+def prepared_environment(provider: str, environment: Mapping[str, str]):
+    """Keep legacy profile callbacks on the explicitly selected child inputs."""
+    token = _prepared_environment.set((provider, dict(environment)))
+    try:
+        yield
+    finally:
+        _prepared_environment.reset(token)
 
 
 def provider_profile(
@@ -141,7 +157,8 @@ def validate_provider_profiles(
 
 
 def agent_environment(
-    provider: str = "codex", role_name: str | None = None
+    provider: str = "codex", role_name: str | None = None,
+    *, environment_variables: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     """Return the filtered environment for one Agent subprocess role."""
     allowed = {
@@ -180,9 +197,13 @@ def agent_environment(
         raise RuntimeError(f"지원하지 않는 Agent provider입니다: {provider}")
     allowed.update(provider_allowed[provider])
 
-    environment = {
-        key: value for key, value in os.environ.items() if key.upper() in allowed
-    }
+    selected = _prepared_environment.get()
+    source = environment_variables if environment_variables is not None else (
+        selected[1] if selected is not None and selected[0] == provider else os.environ)
+    environment = {key: value for key, value in source.items() if key.upper() in allowed}
+    # Preserve the prepared launch's owned temporary directory as well.
+    if 'TMPDIR' in source and (environment_variables is not None or selected is not None and selected[0] == provider):
+        environment['TMPDIR'] = source['TMPDIR']
     return environment
 
 
@@ -366,7 +387,7 @@ def validate_provider_runtime(
     provider_fast_mode(config_path, provider)
     executable = "codex" if provider == "codex" else "claude"
     label = "Codex" if provider == "codex" else "Claude"
-    if not shutil.which(executable):
+    if not shutil.which(executable, path=agent_environment(provider).get('PATH', os.defpath)):
         raise RuntimeError(f"선택한 {label} CLI가 PATH에 설치되어 있지 않습니다.")
 
     auth_arguments = (

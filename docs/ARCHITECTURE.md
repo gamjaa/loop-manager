@@ -307,6 +307,12 @@ Worker에 추가하는 [AGENTS.ponytail.md](AGENTS.ponytail.md)는 [Ponytail](ht
 
 축약 원문은 전체 Skill·Hook과 동일한 효과를 보증하지 않는다. Codex 0.161.0의 [command Hook](https://github.com/openai/codex/blob/rust-v0.161.0/codex-rs/hooks/src/engine/command_runner.rs)은 별도 셸 프로세스로 실행되고 외부 MCP에도 내장 파일 sandbox 적용을 보장할 수 없으므로 기존 Plugin·App 비활성화와 쓰기 경계를 유지한다. 사용자 Plugin 설정·설치 상태는 변경하지 않으며 명시된 요구사항·안전·검증·역할·승인·게시 규칙을 보존한다.
 
+### 준비된 provider 실행 입력과 호출 증거
+
+`AgentRequest.prepared_launch`는 관리 worktree·repository·role의 기존 Codex 저장소를 provider 조회보다 먼저 선택해 전달한다. legacy profile callback은 호출별 `prepared_environment` 문맥에서 같은 필터된 mapping을 사용하며 부모 `os.environ`이나 호출자 mapping을 수정하지 않는다. 물리 호출은 선택 환경에서 인증·Model/Effort·설정·권한을 다시 확인한다. 등록 단계의 사용자 환경 조회 결과는 실제 호출의 준비 성공이나 승인 재사용 근거가 아니다. 새 session·재개·제한 retry·fallback도 각각 현재 환경과 실제 invocation의 증거를 필요로 한다. Claude의 기존 안전 거부는 유지하며 인증 전용 source 변경은 G-263/G-264에 남긴다.
+
+`provider_execution.observe`는 Agent 모델 실행 없이 현재 Reviewer의 native 지침 적용·CLI/환경·설정/도구 정책을 확인하거나 지정한 실제 invocation의 완료 기록을 읽는다. Codex native prompt 조회로 확인한 전체 developer 지침 지문과 model/effort·환경/정책 지문은 process 시작 전에 기존 invocation의 `execution_identity`에 한 번 저장한다. credential 값이나 그 값의 해시, prompt 원문은 저장하지 않는다. 수신 환경의 일회성 임시 경로는 정확히 확인한 소유 디렉터리만 정규화한다. 실제 process 시작·종료·성공·격리·지침·repository/plan/role/worktree 결합이 없거나 기존 행의 입력이 누락되면 재사용 증거를 반환하지 않는다. 현재 설정을 과거 호출에 소급 기록하지 않는다.
+
 ### R-085: 인증 전용 provider 저장소 (구현 예정)
 
 [R-085](requirements/%5BR-085%5D%20Codex%C2%B7Claude%20%EC%9D%B8%EC%A6%9D%20%EC%A0%84%EC%9A%A9%20%EC%9E%90%EB%8F%99%20%EC%8B%A4%ED%96%89%20%ED%99%98%EA%B2%BD.md)는 개인 Plugin·Hook을 상속하지 않고 기존 인증만 재사용하는 설계다. 현재 Codex의 개인 config 연결과 Windows 사용자 home 재사용 및 Claude 사용자 설정 상속을 변경하는 대상이며 구현 완료를 뜻하지 않는다.
