@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 import loop_manager
 from tests.support.git import git_command, make_remote_repository
+from tests.support.lifecycle import register_connection_cleanup
 
 
 @isolated_git_test
@@ -238,14 +239,33 @@ class WorktreeCleanupTest(CleanupFixture, unittest.TestCase):
                 encoding="utf-8",
             )
             (planning / "build.cache").write_text("artifact", encoding="utf-8")
-            port = loop_manager._PlanningGitPorts(sqlite3.connect(":memory:"), repo, root)
+            connection = sqlite3.connect(":memory:")
+            register_connection_cleanup(self, connection)
             (planning / "unexpected.txt").write_text("publishable", encoding="utf-8")
             with self.assertRaises(loop_manager.WorkspaceOwnershipError):
-                port.run(repo, "worktree", "remove", str(planning))
+                loop_manager._PlanningGitPorts(connection, repo, root).run(
+                    repo, "worktree", "remove", str(planning)
+                )
             self.assertTrue(planning.exists())
             (planning / "unexpected.txt").unlink()
-            port.run(repo, "worktree", "remove", str(planning))
+            loop_manager._PlanningGitPorts(connection, repo, root).run(
+                repo, "worktree", "remove", str(planning)
+            )
             self.assertFalse(planning.exists())
+
+    def test_planning_cleanup_case_closes_its_borrowed_port_connection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            connection = sqlite3.connect(":memory:")
+            close_connection = register_connection_cleanup(self, connection)
+            try:
+                with mock.patch.object(loop_manager._PlanningGitPorts, "__init__",
+                                       return_value=None) as initialize:
+                    port = loop_manager._PlanningGitPorts(connection, Path("/repo"), Path("/state"))
+                initialize.assert_called_once_with(connection, Path("/repo"), Path("/state"))
+            finally:
+                close_connection()
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
 
     def test_merge_modes_do_not_use_base_ancestry_for_cleanup(self):
         for mode in ("merge", "squash", "rebase"):

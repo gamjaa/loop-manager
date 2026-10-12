@@ -1,9 +1,13 @@
 from tests.support.recovery_boundary import RecoveryBoundary
 from tests.support.pr_recovery import PrRecoveryFixture, observe_live_pull_request
+from tests.support.lifecycle import register_connection_cleanup
+import loop_manager_internal.agents.common_guidance as common_guidance
 import json
+import sqlite3
 import subprocess
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from unittest import mock
 import loop_manager
@@ -38,6 +42,33 @@ class LivePullRequestObservationTests(unittest.TestCase):
 
 @isolated_git_test
 class PrConflictLeaseTests(PrRecoveryFixture, unittest.TestCase):
+    def test_fixture_registers_connection_cleanup_before_preparation(self):
+        connection = sqlite3.connect(":memory:")
+        original_guidance_root = common_guidance.RUNTIME_ROOT
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as owner:
+            owner.addCleanup = owner.callback
+            repo = Path(directory) / "repo"
+            repo.mkdir()
+            (repo / "docs").mkdir()
+            with mock.patch("tests.support.pr_recovery.sqlite3.connect",
+                            return_value=connection), \
+                 mock.patch("tests.support.pr_recovery.register_connection_cleanup",
+                            wraps=register_connection_cleanup) as register, \
+                 mock.patch("tests.support.pr_recovery.make_remote_repository",
+                            return_value=repo), \
+                 mock.patch("tests.support.pr_recovery.write_execplan",
+                            return_value=repo / "docs/plans/plan.md"), \
+                 mock.patch("tests.support.pr_recovery.commit_and_push"), \
+                 mock.patch("tests.support.pr_recovery.git_command", return_value="a" * 40), \
+                 mock.patch("tests.support.pr_recovery.loop_manager.SCHEMA",
+                            "invalid SQL"):
+                with self.assertRaisesRegex(sqlite3.OperationalError, 'near "invalid"'):
+                    PrRecoveryFixture._pr_open_state(owner, directory)
+            register.assert_called_once_with(owner, connection)
+        self.assertEqual(common_guidance.RUNTIME_ROOT, original_guidance_root)
+        with self.assertRaises(sqlite3.ProgrammingError):
+            connection.execute("SELECT 1")
+
     @dummy_worker_sessions(fixed_guidance=True)
     def test_conflicting_pr_reuses_sessions_revalidates_new_base_and_leases_push(self):
         with tempfile.TemporaryDirectory() as directory:
