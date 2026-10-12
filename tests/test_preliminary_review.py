@@ -138,6 +138,22 @@ class PreliminaryReviewTests(ExecutionFixture, unittest.TestCase):
         self.review()
         self.effects.agent.run_agent.assert_called_once()
 
+    def test_unproven_environment_without_manifest_preserves_legacy_verification(self):
+        self.identity = None
+        def git_without_declaration(path, *args, **kwargs):
+            if args == ('show', 'base:scripts/verify.json'):
+                raise RuntimeError('verification declaration does not exist at candidate')
+            return self.git(path, *args, **kwargs)
+        self.effects.workspace.git.side_effect = git_without_declaration
+        self.verify()
+        self.partial.assert_not_called()
+        self.effects.validation.verify.assert_called_once()
+        self.assertEqual(self.saved()['status'], 'fallback')
+        self.assertIn('verification_declaration_unavailable', self.saved()['partial'])
+        self.assertIsNotNone(self.state.row()['verify_token'])
+        self.review()
+        self.effects.agent.run_agent.assert_called_once()
+
     def test_changed_reviewer_policy_requires_final_reviewer_after_full_verify(self):
         self.early_pass()
         original = self.saved()['review']

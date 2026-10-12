@@ -464,14 +464,22 @@ class VerifyHandler:
             receipt = pre_review.begin(connection, self.ports.identity.repo, context.plan.plan_id, key)
             if preliminary_review.review_identity(self.ports, context) is None:
                 from loop_manager_internal.verification import impact
+                fallback = ['review_environment_identity_unproven']
+                try:
+                    declaration = self.ports.git(context.worktree, 'show', f'{head}:scripts/verify.json').stdout
+                except (OSError, RuntimeError):
+                    # Legacy verification scripts need no adapter declaration.
+                    # Missing fallback diagnostics must not prevent their full run.
+                    declaration = None
+                    fallback.append('verification_declaration_unavailable')
                 pre_review.update(connection, receipt, 'fallback', partial={
                     'kind': 'partial_verify', 'status': 'FALLBACK',
                     'selection': {'head': head, 'base': context.active_sha, 'modules': [], 'ids': [], 'reasons': {},
                         'total_modules': None, 'total_tests': None, 'manifest_identity': None,
                         'configuration_identity': impact.digest({'settings': preliminary_review.verify_settings(self.ports),
-                            'declaration': self.ports.git(context.worktree, 'show', f'{head}:scripts/verify.json').stdout}),
+                            'declaration': declaration}),
                         'algorithm': f'python-ast-impact-v{impact.VERSION}/index-v{impact.code_index.VERSION}',
-                        'fallback': ['review_environment_identity_unproven']}})
+                        'fallback': fallback}})
                 self.ports.operation_log('부분 verify fallback: Review 실행 환경·정책 identity가 확인되지 않았습니다.')
                 return None
             self.ports.state.update_project(self.ports.identity.repo, preserve_transaction=True,
