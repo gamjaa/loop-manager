@@ -35,8 +35,15 @@ verification/guard.py·child_guard/sitecustomize.py와 runner/unittest_adapter�
 ## Progress
 
 - [x] 2026-10-10 50c699c8f9c149cecb0ddf9b081527942d8e2289의 R-067과 runpy sitecustomize·함수별 lru_cache·Popen wrapper/audit 환경 준비 및 관련 회귀를 정적으로 대조했다. 구현·테스트·verify는 실행하지 않았다.
-- [ ] 단일 설치/준비와 보호 회귀·targeted unit 검증
+- [x] 단일 설치/준비와 보호 회귀·targeted unit 검증
 - [ ] Manager 전체 verify·비용 비교·읽기 전용 Review·사용자 Merge
+
+### 구현 기록
+
+- `guard.py`의 함수별 cache를 interpreter 공유 설치 근거·lock·실제 audit probe와 wrapper identity로 교체했다. 확인 중단·wrapper 설치 실패는 이미 등록한 hook을 중복 등록하지 않고 재진입하며, 등록 거부를 성공으로 저장하지 않는다. sitecustomize 설치 실패는 비밀값 없는 고정 진단 후 종료한다.
+- Popen 호출 범위의 thread-local dict identity·내용 사본으로 wrapper/audit의 동일 환경 준비만 생략한다. 변경된 환경은 다시 정제하고 명령/API 검사는 매 경계에서 수행한다. Windows 대소문자·POSIX bytes 별칭의 후보 root·Python 환경 정책과 조율 인증값 제외를 유지한다.
+- `GuardInstallationTests`와 기존 환경 unit case, `CandidateEnvironmentTests`의 새 interpreter·다른 후보 package·중첩 자식 case, command 정제/시작 실패·종료 불명 예약 case를 확인했다. Python/Linux에서 15개 targeted test가 통과했고 확인 중단 재진입 보완 뒤 영향 범위 8개 targeted test가 통과했다(고유 case 총 16개). 전체 suite·verify·비용 비교·Windows 실환경 검증은 수행하지 않았다.
+
 
 ## Decision Log
 

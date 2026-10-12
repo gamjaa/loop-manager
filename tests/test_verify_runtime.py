@@ -6,6 +6,8 @@ import json
 import os
 from pathlib import Path
 import py_compile
+import runpy
+import threading
 import subprocess
 import sys
 import tempfile
@@ -278,6 +280,120 @@ class TimingAndManifestTests(unittest.TestCase):
             manifest.validate_report(definition, report)
 
 
+class GuardInstallationTests(unittest.TestCase):
+    def setUp(self):
+        self.hooks = []
+        self.state = SimpleNamespace(lock=threading.RLock(), active=threading.local(), audit=None, wrapper=None)
+        patches = (
+            mock.patch.object(guard, "_state", self.state),
+            mock.patch.object(sys, guard._STATE_KEY, self.state),
+            mock.patch.object(sys, "addaudithook", side_effect=self.hooks.append),
+            mock.patch.object(sys, "audit", side_effect=self.dispatch),
+            mock.patch.object(subprocess.Popen, "__init__", self.fake_start),
+            mock.patch.dict(os.environ),
+        )
+        for patch in patches:
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def dispatch(self, event, *arguments):
+        for hook in self.hooks:
+            hook(event, arguments)
+
+    def fake_start(self, process, args, env=None):
+        self.dispatch("subprocess.Popen", args[0], args, None, env)
+
+    def test_runpy_import_and_reentry_share_hook_and_wrapper(self):
+        loaded = runpy.run_path(guard.__file__)
+        loaded["install_guard"]()
+        wrapper = subprocess.Popen.__init__
+        guard.install_guard()
+        loaded["install_guard"]()
+        self.assertEqual(len(self.hooks), 1)
+        self.assertIs(subprocess.Popen.__init__, wrapper)
+        # An arbitrary wrapper attribute is not installation evidence.
+        def replacement(process, args, env=None):
+            return self.fake_start(process, args, env)
+        replacement._loop_manager_environment_guard = True
+        subprocess.Popen.__init__ = replacement
+        guard.install_guard()
+        self.assertIsNot(subprocess.Popen.__init__, replacement)
+        self.assertEqual(len(self.hooks), 1)
+
+    def test_environment_prepared_once_per_boundary_and_commands_always_checked(self):
+        guard.install_guard()
+        environment = {"LOOP_MANAGER_VERIFY_SECRET": "private-test-value"}
+        with mock.patch.object(guard, "worker_environment", wraps=guard.worker_environment) as prepare:
+            subprocess.Popen.__init__(object(), ["git", "status"], env=environment)
+            self.assertEqual(prepare.call_count, 1)
+            with self.assertRaises(RuntimeError):
+                subprocess.Popen.__init__(object(), ["codex", "exec"], env=environment)
+            self.assertEqual(prepare.call_count, 2)
+            self.dispatch("subprocess.Popen", "git", ["git", "status"], None, environment.copy())
+            self.assertEqual(prepare.call_count, 3)
+        self.assertEqual(environment, {"LOOP_MANAGER_VERIFY_SECRET": "private-test-value"})
+        self.assertIsNone(self.state.active.environment)
+
+    def test_changed_environment_is_prepared_again_and_start_failure_clears_scope(self):
+        def start(process, args, env=None):
+            env["LOOP_MANAGER_VERIFY_SECRET"] = "private-test-value"
+            self.dispatch("subprocess.Popen", args[0], args, None, env)
+            self.assertNotIn("LOOP_MANAGER_VERIFY_SECRET", env)
+            raise OSError("not started")
+        subprocess.Popen.__init__ = start
+        guard.install_guard()
+        with mock.patch.object(guard, "worker_environment", wraps=guard.worker_environment) as prepare:
+            with self.assertRaises(OSError):
+                subprocess.Popen.__init__(object(), ["git"])
+            self.assertEqual(prepare.call_count, 2)
+        self.assertIsNone(self.state.active.environment)
+        with mock.patch.object(guard, "worker_environment", side_effect=ValueError("invalid environment")):
+            with self.assertRaises(ValueError):
+                subprocess.Popen.__init__(object(), ["git"])
+        self.assertIsNone(self.state.active.environment)
+
+    def test_partial_install_retries_wrapper_without_duplicate_hook(self):
+        with mock.patch.object(guard.inspect, "signature", side_effect=ValueError("invalid signature")):
+            with self.assertRaises(ValueError):
+                guard.install_guard()
+        self.assertEqual(len(self.hooks), 1)
+        self.assertIsNone(self.state.wrapper)
+        guard.install_guard()
+        self.assertEqual(len(self.hooks), 1)
+        self.assertIs(subprocess.Popen.__init__, self.state.wrapper)
+
+    def test_interrupted_confirmation_retries_probe_without_duplicate_hook(self):
+        with mock.patch.object(sys, "audit", side_effect=RuntimeError("probe interrupted")):
+            with self.assertRaises(RuntimeError):
+                guard.install_guard()
+        self.assertIsNone(self.state.wrapper)
+        guard.install_guard()
+        self.assertEqual(len(self.hooks), 1)
+        self.assertIs(subprocess.Popen.__init__, self.state.wrapper)
+
+    def test_rejected_hook_is_not_cached_as_installed(self):
+        with mock.patch.object(sys, "addaudithook"):
+            with self.assertRaisesRegex(RuntimeError, "audit hook"):
+                guard.install_guard()
+        self.assertIsNone(self.state.audit)
+        self.assertIsNone(self.state.wrapper)
+        with mock.patch.object(sys, "addaudithook", side_effect=RuntimeError("installation failed")):
+            with self.assertRaises(RuntimeError):
+                guard.install_guard()
+        guard.install_guard()
+        self.assertEqual(len(self.hooks), 1)
+
+    def test_sitecustomize_failure_stops_instead_of_running_unprotected(self):
+        with mock.patch.dict(os.environ, {guard.MARKER: "1"}), \
+                mock.patch.object(runpy, "run_path", side_effect=ValueError("private-test-value")), \
+                mock.patch.object(os, "write") as write, \
+                mock.patch.object(os, "_exit", side_effect=SystemExit(1)):
+            with self.assertRaises(SystemExit):
+                exec(compile((Path(guard.__file__).parent / "child_guard/sitecustomize.py").read_text(),
+                             "sitecustomize.py", "exec"), {"__file__": guard.__file__})
+        write.assert_called_once_with(2, b"verify Python guard installation failed\n")
+
+
 class GuardAndConfigurationTests(unittest.TestCase):
     def test_worker_environment_preserves_explicit_bytecode_selection(self):
         environment = {
@@ -309,6 +425,26 @@ class GuardAndConfigurationTests(unittest.TestCase):
         self.assertNotIn("LOOP_MANAGER_RUNTIME_DEFAULT_PYCACHEPREFIX", child)
 
 
+    def test_managed_environment_aliases_keep_candidate_and_bytecode_policy(self):
+        for windows in (False, True):
+            environment = {
+                b'loop_manager_verify_project_root' if windows else b'LOOP_MANAGER_VERIFY_PROJECT_ROOT': b'/candidate',
+                b'pythonpath' if windows else b'PYTHONPATH': os.fsencode('/dependency'),
+                b'pythondontwritebytecode' if windows else b'PYTHONDONTWRITEBYTECODE': b'1',
+                b'pythonpycacheprefix' if windows else b'PYTHONPYCACHEPREFIX': b'/selected/cache',
+            }
+            original = dict(environment)
+            platform = SimpleNamespace(name='nt' if windows else 'posix', environ=os.environ,
+                                       fsdecode=os.fsdecode, fsencode=os.fsencode, pathsep=os.pathsep)
+            with mock.patch.object(guard, 'os', platform), \
+                    mock.patch.object(sys, 'dont_write_bytecode', False), \
+                    mock.patch.object(sys, 'pycache_prefix', None):
+                child = guard.worker_environment(environment)
+            self.assertEqual(child['PYTHONPATH'].split(os.pathsep)[1:], ['/candidate', '/dependency'])
+            self.assertEqual(child['PYTHONDONTWRITEBYTECODE'], '1')
+            self.assertEqual(child['PYTHONPYCACHEPREFIX'], '/selected/cache')
+            self.assertEqual(environment, original)
+
     def test_cli_guard_allows_git_and_fake_boundary_but_rejects_real_agent_commands(self):
         for command in (["codex", "exec"], ["C:\\bin\\claude.exe", "-p"], ["bash", "-c", "codex exec prompt"]):
             with self.subTest(command=command), self.assertRaises(RuntimeError):
@@ -318,9 +454,14 @@ class GuardAndConfigurationTests(unittest.TestCase):
 
     def test_audit_guard_blocks_api_and_persists_for_explicit_child_environment(self):
         hooks = []
-        guard.install_guard.cache_clear()
-        self.addCleanup(guard.install_guard.cache_clear)
-        with mock.patch.object(sys, "addaudithook", side_effect=hooks.append):
+        state = SimpleNamespace(lock=threading.RLock(), active=threading.local(), audit=None, wrapper=None)
+        def dispatch(event, *arguments):
+            for hook in hooks:
+                hook(event, arguments)
+        with mock.patch.object(guard, "_state", state), \
+                mock.patch.object(subprocess.Popen, "__init__"), \
+                mock.patch.object(sys, "addaudithook", side_effect=hooks.append), \
+                mock.patch.object(sys, "audit", side_effect=dispatch):
             guard.install_guard()
         audit = hooks[0]
         with self.assertRaises(RuntimeError):

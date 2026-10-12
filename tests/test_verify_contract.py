@@ -215,6 +215,17 @@ class VerifyContractTests(unittest.TestCase):
             operations = [call.args[0] for call in client.request.call_args_list]
             self.assertEqual(operations, ['acquire', 'bind'] if launched else ['acquire', 'not_started'])
 
+    def test_command_environment_preparation_failure_preserves_unstarted_reservation(self):
+        client = mock.Mock()
+        client.request.return_value = {'granted': True, 'reason': 'ready', 'token': 'owned'}
+        process = mock.Mock()
+        with mock.patch('loop_manager_internal.verification.guard.worker_environment',
+                        side_effect=ValueError('invalid environment')), self.assertRaises(ValueError):
+            core.execute_command(['tool'], self.root, 10, self.writer(), client, 'run', 'compile',
+                                 run_process=process)
+        process.assert_not_called()
+        self.assertEqual([call.args[0] for call in client.request.call_args_list], ['acquire', 'not_started'])
+
     def test_resource_wait_counts_toward_command_deadline(self):
         client = mock.Mock()
         client.request.return_value = {'granted': False, 'reason': 'pressure'}
@@ -282,6 +293,60 @@ class CandidateEnvironmentTests(unittest.TestCase):
         entries = prepared['PYTHONPATH'].split(os.pathsep)
         self.assertEqual(entries[1:], ['/candidate', '/dependency'])
         self.assertTrue(entries[0].endswith('child_guard'))
+
+    def test_sitecustomize_and_candidate_import_share_protection_in_nested_python(self):
+        # Fresh Python is needed to observe sitecustomize before a different package import.
+        from loop_manager_internal.verification import guard
+        import subprocess
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            package = root / 'loop_manager_internal/verification'
+            package.mkdir(parents=True)
+            (root / 'loop_manager_internal/__init__.py').write_text('')
+            (package / '__init__.py').write_text('')
+            (package / 'guard.py').write_bytes(Path(guard.__file__).read_bytes())
+            code = """
+import json, os, pathlib, runpy, subprocess, sys
+state = sys._loop_manager_verify_guard_state
+wrapper, audit = subprocess.Popen.__init__, state.audit
+from loop_manager_internal.verification import guard
+assert pathlib.Path(guard.__file__).is_relative_to(pathlib.Path(sys.argv[1]))
+guard.install_guard()
+runpy.run_path(guard.__file__)['install_guard']()
+assert state.audit is audit and subprocess.Popen.__init__ is wrapper
+for event, args in [('subprocess.Popen', ('codex', ['git'], None, {})),
+                    ('socket.getaddrinfo', ('api.openai.com', 443))]:
+    try:
+        sys.audit(event, *args)
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError(event)
+assert not any(name in os.environ for name in guard._COORDINATION_ENV)
+original = audit.__globals__['worker_environment']
+calls = []
+def prepare(env):
+    calls.append(1)
+    return original(env)
+audit.__globals__['worker_environment'] = prepare
+nested = "import os, sys; from loop_manager_internal.verification import guard; guard.install_guard(); assert sys._loop_manager_verify_guard_state.audit; assert not any(k in os.environ for k in guard._COORDINATION_ENV); assert os.environ[guard.MARKER] == '1'; assert sys.dont_write_bytecode; sys.audit('subprocess.Popen', 'codex', ['codex'], None, {})"
+result = subprocess.run([sys.executable, '-c', nested], capture_output=True, text=True, timeout=10)
+assert len(calls) == 1, calls
+assert result.returncode != 0 and 'Agent CLI' in result.stderr, result.stderr
+assert 'private-test-value' not in result.stderr
+print('protected')
+"""
+            environment = guard.worker_environment({
+                'PATH': os.environ.get('PATH', ''),
+                'LOOP_MANAGER_VERIFY_PROJECT_ROOT': str(root),
+                'LOOP_MANAGER_VERIFY_SECRET': 'private-test-value',
+                'PYTHONDONTWRITEBYTECODE': '1',
+            })
+            result = subprocess.run([sys.executable, '-c', code, str(root)], cwd=root,
+                                    env=environment, capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.strip(), 'protected')
+            self.assertNotIn('private-test-value', result.stdout + result.stderr)
 
     def test_candidate_fixture_helpers_share_runtime_instrumentation_context(self):
         candidate = SimpleNamespace()
