@@ -7,6 +7,10 @@ sources:
   - docs/requirements/[R-082] 단계별 원격 문서 반영과 PR 전 ExecPlan 갱신.md
 depends_on:
   - G-242
+  - G-265
+  - G-266
+  - G-267
+  - G-268
 complexity: low
 risk: low
 priority: normal

@@ -4,7 +4,11 @@ title: 자체 Windows verify의 명시적 임시 경로 선택
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-067] 프로젝트 공통 verify 실행 규약.md
-depends_on: []
+depends_on:
+  - G-265
+  - G-266
+  - G-267
+  - G-268
 complexity: medium
 risk: low
 priority: normal

@@ -5,7 +5,11 @@ sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-053] Timely Progress Notifications.md
   - docs/requirements/[R-074] Single-Pass Maintenance Cycle.md
-depends_on: []
+depends_on:
+  - G-265
+  - G-266
+  - G-267
+  - G-268
 complexity: medium
 risk: low
 priority: normal

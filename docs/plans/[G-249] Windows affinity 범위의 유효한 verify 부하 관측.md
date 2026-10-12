@@ -4,7 +4,11 @@ title: Windows affinity 범위의 유효한 verify 부하 관측
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-065] 실제 부하 기반 verify 병렬 실행.md
-depends_on: []
+depends_on:
+  - G-265
+  - G-266
+  - G-267
+  - G-268
 complexity: medium
 risk: medium
 priority: normal

@@ -5,7 +5,11 @@ sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-082] 단계별 원격 문서 반영과 PR 전 ExecPlan 갱신.md
   - docs/requirements/[R-072] Reuse Successful Candidate Results with Proven Inputs.md
-depends_on: []
+depends_on:
+  - G-265
+  - G-266
+  - G-267
+  - G-268
 complexity: high
 risk: high
 priority: high

@@ -4,7 +4,11 @@ title: runtime 캐시 cold warm 실측 근거 보존
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-059] Safe Python Bytecode Cache Use.md
-depends_on: []
+depends_on:
+  - G-265
+  - G-266
+  - G-267
+  - G-268
 complexity: low
 risk: low
 priority: normal

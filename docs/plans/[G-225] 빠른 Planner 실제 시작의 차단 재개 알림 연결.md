@@ -4,7 +4,11 @@ title: 빠른 Planner 실제 시작의 차단 재개 알림 연결
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-053] Timely Progress Notifications.md
-depends_on: []
+depends_on:
+  - G-265
+  - G-266
+  - G-267
+  - G-268
 complexity: low
 risk: low
 priority: normal

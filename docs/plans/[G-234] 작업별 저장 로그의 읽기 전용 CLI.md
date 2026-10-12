@@ -6,6 +6,10 @@ sources:
   - docs/requirements/[R-076] Read-Only Operational State CLI.md
 depends_on:
   - G-194
+  - G-265
+  - G-266
+  - G-267
+  - G-268
 complexity: medium
 risk: medium
 priority: normal
