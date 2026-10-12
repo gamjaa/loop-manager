@@ -310,7 +310,6 @@ class PlanningWorkspaceService(PlanningService):
                 elif (
                     relevant_input_changed
                     and not row.planning_result_completed
-                    and row.planning_result_pending_validation
                     and row.planning_validation_error
                     and not mode_failure
                     and not row.planning_error

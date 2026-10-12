@@ -349,7 +349,9 @@ class PlanningRecoveryTest(PlanningCase):
             planning_attempt_fingerprint="original-input", planning_workspace_owned=1,
             planner_session_id="saved-session", planning_retry_count=2,
             planning_validation_error=prior_error,
-            planning_result_pending_validation=True,
+            planning_result_completed=False,
+            planning_result_pending_validation=False,
+            planning_error=None,
         ))
         ports.git.remote = "new-base"
         ports.git.relevant_document_changes = mock.Mock(
@@ -365,7 +367,10 @@ class PlanningRecoveryTest(PlanningCase):
         self.assertIsNone(coordinator._workspace._prepare_workspace(run))
         saved = ports.state.snapshot
         self.assertEqual(saved.active_sha, "new-base")
+        self.assertFalse(saved.planning_result_completed)
+        self.assertFalse(saved.planning_result_pending_validation)
         self.assertEqual(saved.planning_retry_count, 0)
+        self.assertIsNone(saved.planning_error)
         self.assertIn("현재 planning 결과의 관련 문서가 변경됐습니다", saved.planning_validation_error)
         self.assertEqual(ports.state.diagnostics[-1].planning_validation_error, prior_error)
         self.assertEqual(ports.state.diagnostics[-1].planning_retry_count, 2)
