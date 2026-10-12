@@ -342,6 +342,45 @@ class PlanningRecoveryTest(PlanningCase):
         self.assertEqual(invoke.call_args_list[1].args[2], "session-1")
         ports.validation.validate_general_result.assert_called_once()
 
+    def test_related_remote_change_before_correction_resets_stale_retry_budget(self):
+        prior_error = "old input result error"
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/planning",
+            planning_attempt_fingerprint="original-input", planning_workspace_owned=1,
+            planner_session_id="saved-session", planning_retry_count=2,
+            planning_validation_error=prior_error,
+            planning_result_pending_validation=True,
+        ))
+        ports.git.remote = "new-base"
+        ports.git.relevant_document_changes = mock.Mock(
+            return_value=("docs/requirements/R-053 New.md",),
+        )
+        ports.state.execplan_rows = lambda _repo: [{"plan_id": "G-118", "status": "READY"}]
+        ports.validation.validate_general_result = mock.Mock(
+            side_effect=PlanningResultInvalid("new input result error"),
+        )
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(self.context)
+
+        self.assertIsNone(coordinator._workspace._prepare_workspace(run))
+        saved = ports.state.snapshot
+        self.assertEqual(saved.active_sha, "new-base")
+        self.assertEqual(saved.planning_retry_count, 0)
+        self.assertIn("현재 planning 결과의 관련 문서가 변경됐습니다", saved.planning_validation_error)
+        self.assertEqual(ports.state.diagnostics[-1].planning_validation_error, prior_error)
+        self.assertEqual(ports.state.diagnostics[-1].planning_retry_count, 2)
+
+        self.assertIsNone(coordinator._assessment._run_planner_turn(run))
+        self.assertEqual(ports.agent.resumed_session, "saved-session")
+        self.assertIsNone(coordinator._workspace._refresh_after_planner(run))
+        outcome = coordinator._assessment._validate_planner_result(run)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
+        self.assertEqual(ports.state.snapshot.planning_retry_count, 0)
+        self.assertEqual(ports.state.snapshot.planning_validation_error, "new input result error")
+        self.assertIsNone(ports.state.snapshot.planning_error)
+        ports.validation.validate_general_result.assert_called_once()
+
     def test_linked_remote_correction_binding_allows_fresh_validation_retry(self):
         error = "old input validation failure"
         ports = FakePorts(planning_snapshot(

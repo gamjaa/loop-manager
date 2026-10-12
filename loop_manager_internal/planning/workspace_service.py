@@ -307,6 +307,30 @@ class PlanningWorkspaceService(PlanningService):
                         )
                     else:
                         values["planning_validation_error"] = recheck_message
+                elif (
+                    relevant_input_changed
+                    and not row.planning_result_completed
+                    and row.planning_result_pending_validation
+                    and row.planning_validation_error
+                    and not mode_failure
+                    and not row.planning_error
+                    and not row.last_error
+                    and not row.agent_result_snapshot
+                    and not str(row.planning_validation_error or "").startswith(
+                        "planning rebase 충돌:"
+                    )
+                ):
+                    self._ports.state.preserve_diagnostics(context.repo, row)
+                    recheck_message = (
+                        "현재 planning 결과의 관련 문서가 변경됐습니다: "
+                        + ", ".join(changed_documents)
+                        if changed_documents else
+                        "현재 planning 결과의 전체 계획 입력이 변경됐습니다. 최신 코드와 테스트를 다시 평가하세요."
+                    )
+                    values.update(
+                        planning_validation_error=recheck_message,
+                        planning_retry_count=0,
+                    )
                 elif changed_documents and not row.planning_result_completed:
                     additional = [path for path in changed_documents
                                   if path not in str(row.planning_validation_error or "")]
