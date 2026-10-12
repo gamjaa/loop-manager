@@ -306,6 +306,7 @@ class ExecutionVerifyPhaseTests(ExecutionPhaseScenarios, ExecutionFixture, TestC
         self.assertIsNone(checkpoint.get('repo', 'G-047').operation)
         self.assertEqual(checkpoint.get('repo', 'G-047').snapshot['stage_evidence'], {
             'head': 'owned-head', 'branch': 'loop-manager/G-047',
+            'index': {},
             'files': {'app.py': 'accepted-content'},
         })
 

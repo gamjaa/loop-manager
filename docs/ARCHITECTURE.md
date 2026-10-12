@@ -292,7 +292,7 @@ planning batch의 원격 게시·catalog 반영과 현재 원격 입력 일치�
 - Planner는 새 `docs/plans/*.md`를 생성하고 `docs/FUTURE_IDEAS.md`를 생성하거나 수정할 수 있다. 프로그램의 PR 전 snapshot 안의 계획만 같은 ID로 개정하며, 시작한 계획의 경로·기존 수행 기록을 보존한다. rename·삭제는 미착수 계획에만 허용한다. snapshot 밖·PR 등록·MERGED·archive 계획과 그 밖의 파일은 변경할 수 없다. 단계별 문서 판단의 수정안은 읽기 전용 결과로 반환하고 Manager가 게시를 검증한다. 프로그램은 Agent 실행 전후 diff와 SQLite snapshot으로 범위를 검증한다
 - Worker는 ExecPlan·관련 unit test·verify 스크립트를 구현한다. Requirement·ExecPlan 구현으로 바뀌는 제품 동작·장기 규칙은 PRODUCT에, 설계·책임 경계·계약은 ARCHITECTURE에 같은 변경에서 반영하며 문서 경로만으로 설계 수정을 거부하지 않는다. 현재 구현에 필요한 대응표·구현 기록은 다른 기존 ExecPlan에도 갱신할 수 있다. 다른 계획의 목표를 구현하거나 상태를 문서에 기록하지 않는다. 범위 밖 아이디어는 FUTURE_IDEAS에 기록한다
 - Worker 문서 scope는 활성 Requirement의 직접 Markdown 경로와 PRODUCT·ARCHITECTURE·기존 ExecPlan·지침·사용 안내를 일반 작업 파일로 허용한다. archive의 기존 보호와 docs/PLANS.md의 게시된 계획 명시 조건은 유지한다. scope의 경로 허용은 목표 관련성이나 사용자 판단을 승인하지 않는다. 기존 ExecPlan은 파일이 삭제돼도 시작 index와 Git 원본으로 확인하며 결정·실행 기록을 파일째 제거하는 변경을 거부한다. 원본과 수정본을 대조해 draft 해제와 User Decision 변경·삭제를 거부한다
-- documents/pr_description.py는 기존 실행 지침 보고 경계와 publication 호출을 재사용해 최종 base/head의 name-status와 문서별 patch를 보고한다. docs 아래 파일 및 저장소 Markdown·RST·TXT 문서는 rename의 양쪽 경로까지 포함하며 각 경로에 해당 compare diff 링크를 붙인다. Worker Summary의 DOCUMENT_CHANGE에 최종 경로·주요 내용·이유·영향과 UTF-8 문서 patch의 SHA-256을 결합한다. 최종 diff에 없는 경로·누락·patch 불일치는 일반 Summary로 대체하지 않고 기존 WORKER_CORRECTION으로 현재 후보의 설명을 보완한다. 새로운 PR과 기존 PR 갱신 모두 불완전한 보고를 게시하지 않는다. 열린 PR은 확인된 head에서 Manager 소유 보고만 교체·제거하며 사용자 본문·immutable ExecPlan/source 링크·Purpose를 보존한다
+- documents/pr_description.py는 기존 실행 지침 보고 경계와 publication 호출을 재사용해 최종 base/head의 name-status와 문서별 patch를 검증한다. docs 아래 파일 및 저장소 Markdown·RST·TXT 문서는 rename의 양쪽 경로까지 식별한다. Worker Summary의 DOCUMENT_CHANGE에 최종 경로·변경 요약·이유·영향과 UTF-8 문서 patch의 SHA-256을 결합하되, PR 문서 보고에는 파일명·변경 요약·이유·영향만 렌더링한다. 실제 변경 내용·patch·diff 링크·검증용 hash는 렌더링하지 않는다. 최종 diff에 없는 경로·누락·patch 불일치는 일반 Summary로 대체하지 않고 기존 WORKER_CORRECTION으로 현재 후보의 설명을 보완한다. 새로운 PR과 기존 PR 갱신 모두 불완전한 보고를 게시하지 않는다. 열린 PR은 확인된 head에서 Manager 소유 보고만 교체·제거하며 사용자 본문·immutable ExecPlan/source 링크·Purpose를 보존한다
 - Worker는 수정한 코드와 새로 작성하거나 변경한 테스트를 직접 검증하는 최소 범위의 targeted unit test만 실행한다. 실패하면 같은 세션에서 수정하고 해당 테스트를 다시 실행하며, 실행 가능한 관련 unit test가 없으면 그 사유를 결과에 포함한다
 - Worker는 전체 test suite, integration test, end-to-end test, 프로젝트 전체 lint·build·type check와 전체 검증 스크립트를 직접 실행하지 않는다
 - Reviewer는 기본 경로에서 Worker의 targeted unit test와 프로그램의 전체 verify가 통과한 뒤 실행된다. 일반 선행 경로에서는 현재 후보의 Manager 부분 verify 뒤 실행되며 테스트 command나 verify 스크립트를 다시 실행하지 않는다. 파일을 수정하지 않고 코드, 테스트, verify 스크립트의 diff와 전달된 결과를 읽어 요구사항 충족, 회귀, 테스트 누락과 verify 약화를 포함한 blocking issue를 확인한다
@@ -473,6 +473,8 @@ manifest·이벤트·결과는 version·run·단계·단위/테스트 identity�
 선언·호출·지원 근거와 adapter 적합성/추가 경계는 [VERIFY.md](VERIFY.md)가 소유한다. 역할별 정적 규칙은 기존 common+해당 역할의 고정 원본 묶음으로 전달하고, 작업 prompt는 선택 선언·지원 버전·참조 문맥만 연결한다. 언어별 지침 사본이나 새로운 배포·snapshot 경계는 만들지 않는다.
 
 ## 검증과 재시도
+
+문서 보고 교정의 변경 요구는 [R-087](requirements/%5BR-087%5D%20문서%20보고%20교정%20반복%20제한.md)을 따른다. 구현 목표는 후보 커밋·최신 base 조정 뒤 전체/부분 검증과 성공 receipt 재사용 판단 전에 최종 문서 보고를 검사하고 게시 직전에도 다시 확인하는 것이다. Worker 교정의 반복 식별은 후보 HEAD·index·dirty 내용 지문, 현재 명세 입력과 base로 결합하며 검증 출력·Agent 세션은 진전으로 보지 않는다. 기존 verify token의 출력 결합과 입력 재관측·receipt·Review gate는 유지한다.
 
 - Worker는 구현과 관련 targeted unit test를 작성하고, 수정 범위에 직접 관련된 최소 unit test command만 실행한다
 - targeted unit test 실패는 Worker가 같은 세션에서 수정하고 재실행한다. 실행 가능한 관련 unit test가 없는 변경은 사유를 남기며 전체 검증을 생략하는 근거로 사용하지 않는다

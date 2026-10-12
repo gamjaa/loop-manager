@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from typing import Callable, Any, Mapping
 from pathlib import Path
 import hashlib
+import json
 from loop_manager_internal.recovery.recovery_runtime import RecoveryAction, RecoveryObservation, RecoveryReason, TRANSIENT, RECONCILE, reason_from_block
 from loop_manager_internal.recovery.recovery_dispatcher import RecoveryDispatcher
 from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, ExecutionOutcomeKind
@@ -21,6 +22,7 @@ class RecoveryHandlerPorts:
     recovery: RecoveryDispatcher
     state: ExecutionStatePort
     _row: Callable[[], Mapping[str, object]]
+    capture_git_snapshot: Callable[..., Any]
 
 
 class RecoveryHandler:
@@ -52,6 +54,17 @@ class RecoveryHandler:
         progress = progress_marker or '|'.join(str(row[key] or '') for key in (
             'active_sha', 'worker_session_id', 'reviewer_session_id',
             'worker_input_token', 'verify_token', 'review_token'))
+        if progress_marker is None and reason is RecoveryReason.WORKER_CORRECTION:
+            try:
+                candidate = self.ports.capture_git_snapshot(Path(str(row['worktree'])))
+            except (RuntimeError, OSError) as error:
+                return self._recover(RecoveryReason.STATUS_FAILED, str(error), context=context)
+            definition = self.ports.snapshot()._definition_snapshot
+            # Validation logs and sessions are evidence, not candidate progress.
+            progress = hashlib.sha256(json.dumps((
+                base, definition.definition_token if definition is not None else row['worker_input_token'],
+                candidate.head, candidate.index, candidate.dirty,
+            ), sort_keys=True).encode()).hexdigest()
         fingerprint_input = (
             f"{reason.value}|{row['phase']}|{base}"
             if reason in TRANSIENT or reason in RECONCILE
