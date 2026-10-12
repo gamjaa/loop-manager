@@ -4,6 +4,7 @@ from loop_manager_internal.execution.execution_runtime import LatestBasePort
 from dataclasses import dataclass
 from typing import Callable, Any, Mapping
 from loop_manager_internal.documents import document_drafts
+from loop_manager_internal.documents.pr_description import DocumentReportError, common_guidance_report
 import sys
 import json
 import time
@@ -312,6 +313,14 @@ class VerifyHandler:
         candidate_head = self.ports.git(
             context.worktree, 'rev-parse', 'HEAD'
         ).stdout.strip()
+        try:
+            origin_url = self.ports.git(context.worktree, 'remote', 'get-url', 'origin').stdout.strip()
+            common_guidance_report(self.ports.git, context.worktree, context.active_sha,
+                                   candidate_head, origin_url, worker_publication.summary)
+        except DocumentReportError as error:
+            self.ports.state.update_project(self.ports.identity.repo, phase='WORKING',
+                                            validated_base_sha=None, last_error=str(error))
+            return self.ports._recover(RecoveryReason.WORKER_CORRECTION, str(error), context=context)
         partial_outcome = self._maybe_partial(context, candidate_head)
         if partial_outcome is not None:
             return partial_outcome

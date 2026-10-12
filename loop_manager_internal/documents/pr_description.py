@@ -6,9 +6,7 @@ from loop_manager_internal.application.contracts import WorkerPublication
 from pathlib import Path
 import hashlib
 import json
-import re
 import tempfile
-from loop_manager_internal.git.git_adapter import github_repository
 
 class DocumentReportError(RuntimeError):
     """The final diff needs a corrected Worker document explanation."""
@@ -36,7 +34,7 @@ def common_guidance_report(git, worktree: Path, base_sha: str, head_sha: str,
         index += 1 + count
     if not changes:
         return ""
-    explanations = {}
+    explanations, errors = {}, []
     for line in summary.splitlines():
         if not line.startswith("DOCUMENT_CHANGE:"):
             continue
@@ -48,41 +46,36 @@ def common_guidance_report(git, worktree: Path, base_sha: str, head_sha: str,
             ) or item["path"] in explanations:
                 raise ValueError("missing/duplicate document fields")
             explanations[item["path"]] = item
-        except (ValueError, TypeError) as error:
-            raise DocumentReportError("PR_SUMMARY의 DOCUMENT_CHANGE에 문서 경로·내용·이유·영향·patch_sha256을 보완하라.") from error
+        except (ValueError, TypeError):
+            errors.append("PR_SUMMARY의 DOCUMENT_CHANGE에 문서 경로·내용·이유·영향·patch_sha256을 보완하라.")
     final_paths = {paths[-1] for _, paths in changes}
     stale = explanations.keys() - final_paths
     if stale:
-        raise DocumentReportError("최종 diff에 없는 DOCUMENT_CHANGE를 제거하라: " + ", ".join(sorted(stale)))
-    url = "https://github.com/" + github_repository(origin_url)
+        errors.append("최종 diff에 없는 DOCUMENT_CHANGE를 제거하라: " + ", ".join(sorted(stale)))
     report = [COMMON_REPORT_START, "## 최종 문서 변경", ""]
-    for status, paths in changes:
+    required = []
+    for _, paths in changes:
         patch = git(worktree, "diff", "--no-ext-diff", "--no-textconv", "--find-renames",
                     base_sha, head_sha, "--", *paths).stdout
-        anchor = hashlib.sha256(paths[-1].encode()).hexdigest()
-        links = ", ".join(
-            f"[{path}]({url}/compare/{base_sha}...{head_sha}#diff-{anchor})"
-            for path in paths)
         explanation = explanations.get(paths[-1])
         patch_hash = hashlib.sha256(patch.encode("utf-8")).hexdigest()
+        required.append(f"{paths[-1]}; patch_sha256={patch_hash}")
         if explanation is None or explanation["patch_sha256"] != patch_hash:
-            raise DocumentReportError(
-                f"최종 문서 설명 누락 또는 patch 변경: {paths[-1]}; base={base_sha}, head={head_sha}, patch_sha256={patch_hash}. "
-                "현재 diff의 주요 내용·수정 이유·제품/설계 영향을 DOCUMENT_CHANGE로 보완하라.")
-        content = "\n".join(line for line in patch.splitlines()
-                            if line.startswith(("+", "-")) and not line.startswith(("+++", "---")))
-        # ponytail: The 800-character preview is a navigation aid; the full patch follows.
-        fence = "`" * max(3, 1 + max((len(m[0]) for m in re.finditer(r"`+", patch)), default=0))
+            errors.append(f"최종 문서 설명 누락 또는 patch 변경: {paths[-1]}")
+            continue
         report.extend([
-            f"### {status} {' → '.join(paths)}", "",
-            f"- 주요 변경 요약: {explanation['summary']}",
-            f"- 이유·구현 영향 (Worker Summary): {explanation['reason']}",
-            f"- 주요 변경 내용: {content[:800] or '경로 또는 파일 모드 변경 (아래 diff 참조)'}",
-            f"- 문서 영향: {explanation['impact']}",
-            f"- 최종 문서 diff: {links}", "",
-            "<details><summary>주요 변경 내용: 최종 후보의 실제 문서 diff</summary>", "",
-            fence + "diff", patch.rstrip(), fence, "", "</details>", "",
+            f"### {' → '.join(paths)}", "",
+            f"- 변경 요약: {explanation['summary']}",
+            f"- 이유: {explanation['reason']}",
+            f"- 영향: {explanation['impact']}", "",
         ])
+    if errors:
+        raise DocumentReportError("\n".join([
+            *sorted(set(errors)), f"base={base_sha}, head={head_sha}",
+            "최종 응답의 PR_SUMMARY에 변경 문서 전체의 DOCUMENT_CHANGE를 함께 제출하라. "
+            "유효한 기존 설명도 유지하고 현재 diff의 주요 내용·수정 이유·제품/설계 영향을 포함하라.",
+            *required,
+        ]))
     report.append(COMMON_REPORT_END)
     return "\n".join(report)
 

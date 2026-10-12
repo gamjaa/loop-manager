@@ -392,6 +392,9 @@ class ExecutionRecoveryScenarios:
         self.enterContext(mock.patch(
             'loop_manager_internal.execution.execution_publication_handler.common_guidance_report',
             return_value=''))
+        self.enterContext(mock.patch(
+            'loop_manager_internal.execution.execution_verify_handler.common_guidance_report',
+            return_value=''))
         repo = str(fixture.repo.resolve())
         pr_query = mock.patch.object(lm, 'pr_for_branch', side_effect=lambda *_a, **_k:
                                     observe_live_pull_request(fixture.repo, pull_request))

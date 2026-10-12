@@ -68,6 +68,7 @@
 | 이벤트 시점의 진행·사용자 조치 알림과 무음 구분 | [R-053](requirements/%5BR-053%5D%20%EC%9D%B4%EB%B2%A4%ED%8A%B8%20%EC%8B%9C%EC%A0%90%EC%97%90%20%EB%A7%9E%EC%B6%98%20%EC%A7%84%ED%96%89%20%EC%83%81%ED%99%A9%20%EC%95%8C%EB%A6%BC.md) |
 | 테스트별 시간·실제 Agent 없는 테스트·안전한 Python 캐시 | [R-058](requirements/archive/%5BR-058%5D%20Test%20Timing%20and%20Agent-Free%20Test%20Execution.md), [R-059](requirements/%5BR-059%5D%20%EC%95%88%EC%A0%84%ED%95%9C%20Python%20bytecode%20%EC%BA%90%EC%8B%9C%20%EC%82%AC%EC%9A%A9.md) |
 | 규칙 기반 작업의 Manager 처리·모델 호출과 입출력 감소 | [R-063](requirements/archive/%5BR-063%5D%20Manager-Owned%20Deterministic%20Work%20and%20Minimal%20Model%20Use.md) |
+| 전체 문서 보고의 조기 검사·동일 후보의 교정 반복 제한 | [R-087](requirements/%5BR-087%5D%20문서%20보고%20교정%20반복%20제한.md) |
 | Requirement 중복 ID·제목 선택과 식별 정보 교정 | [R-071](requirements/%5BR-071%5D%20%EB%82%A8%EC%9D%80%20%EA%B7%9C%EC%B9%99%20%EA%B8%B0%EB%B0%98%20%EC%9E%91%EC%97%85%EC%9D%98%20Manager%20%EC%B2%98%EB%A6%AC.md) |
 | 실제 검증 입력만의 목록·문서 원본을 고정 샘플로 대체·일반 verify와 후보 성공 결과 재사용 | [R-072](requirements/%5BR-072%5D%20%EC%9E%85%EB%A0%A5%20%EB%8F%99%EC%9D%BC%EC%84%B1%EC%9D%B4%20%EC%A6%9D%EB%AA%85%EB%90%9C%20%EA%B5%AC%ED%98%84%20%ED%9B%84%EB%B3%B4%20%EC%84%B1%EA%B3%B5%20%EA%B2%B0%EA%B3%BC%20%EC%9E%AC%EC%82%AC%EC%9A%A9.md) |
 
@@ -286,7 +287,7 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 - ExecPlan의 `depends_on`은 선행 ExecPlan ID 목록이며, 모든 선행 상태가 MERGED여야 Worker를 시작할 수 있다
 - Worker는 Requirement·ExecPlan 구현으로 바뀌는 제품 동작·장기 규칙을 `PRODUCT.md`에, 설계·책임 경계·계약을 `ARCHITECTURE.md`에 코드와 같은 PR에서 반영한다. 현재 작업에 필요한 관련 절만 갱신하며 목표·필수 검증·별도 사용자 결정을 유지한다
 - Worker는 현재 작업에 필요한 활성 Requirement·기존 ExecPlan·공통 및 역할별 지침·사용 안내도 함께 갱신할 수 있다. 문서 경로나 사용자 소유라는 이유만으로 관련 수정을 거부하지 않으며 원래 요구·Acceptance Criteria·필수 검증·실패·사용자 결정과 다른 작업의 이력·dependency를 보존한다. Requirement 완료 판단과 archive 이동은 일반 Planner·Manager의 책임이다
-- PR 본문은 최종 실제 diff의 문서별 경로·주요 변경 내용·이유·영향과 문서 diff 링크를 제공한다. 추가·삭제·rename을 포함하며 Manager는 Worker Summary와 실제 최종 diff를 결합해 누락을 보완하고 rebase·PR head 변경 뒤 보고도 갱신한다. 문서별 이유·영향이 없거나 최종 diff와 결합되지 않은 보고는 해당 Worker의 교정으로 보완하며 오래된 일반 Summary나 patch만으로 대신하지 않는다. Reviewer는 읽기 전용으로 변경 전 목표·변경 후 문서·구현·보고를 검토한다
+- PR 본문의 문서 보고는 파일명·변경 요약·이유·영향만 제공한다. 추가·삭제·rename을 포함하며 실제 변경 내용·patch·diff 링크·검증용 hash는 본문에 넣지 않는다. Manager는 Worker Summary와 실제 최종 diff/hash를 대조해 누락을 교정하고 rebase·PR head 변경 뒤 보고도 갱신한다. 문서별 이유·영향이 없거나 최종 diff와 결합되지 않은 보고는 해당 Worker의 교정으로 보완하며 오래된 일반 Summary나 patch만으로 대신하지 않는다. Reviewer는 읽기 전용으로 변경 전 목표·변경 후 문서·구현·보고를 검토한다
 
 ### 프로젝트 등록 및 실행 조건
 
