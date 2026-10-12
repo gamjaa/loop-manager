@@ -3,11 +3,11 @@ id: G-183
 title: 최종 후보 Review 성공 근거의 보수적 재사용
 sources:
   - docs/PRODUCT.md
-  - docs/requirements/[R-072] Reuse Successful Candidate Results with Proven Inputs.md
+  - docs/requirements/[R-072] 입력 동일성이 증명된 구현 후보 성공 결과 재사용.md
   - docs/requirements/[R-082] 단계별 원격 문서 반영과 PR 전 ExecPlan 갱신.md
   - docs/requirements/[R-064] 모델 호출을 통한 공통 Agent 지침 전달.md
-  - docs/requirements/[R-066] AGENTS 변경 사전 승인.md
-  - docs/requirements/[R-085] Codex Claude 인증 전용 자동 실행 환경.md
+  - docs/requirements/[R-066] Agent CLI 지침의 독립성.md
+  - docs/requirements/[R-085] Codex·Claude 인증 전용 자동 실행 환경.md
 depends_on:
   - G-182
   - G-147
@@ -42,15 +42,15 @@ priority: high
 ## Acceptance Criteria
 
 - verify 성공 재사용 가능성과 마지막 승인 후보 대비 전체 PR diff·선택 ExecPlan/sources·PRODUCT/ARCHITECTURE·사용자 결정·공통/역할별 원본 묶음·실제 Reviewer instruction·Review provider/model/effort가 모두 유효하게 동일할 때만 Review를 생략한다. R-066에 따라 프로젝트 루트 지침의 존재·내용·해시와 과거 파일 승인을 별도 수집·대조하거나 재사용 gate로 사용하지 않는다. 실제 PR diff·확인된 일반 verify 입력의 변경은 기존 조건으로 판단한다.
-- 목록 부재/오류/누락 의심·입력 비교 불가, 문서나 승인 입력 변화, 부분 성공 근거는 Review를 실행한다. verify와 무관한 명세 변화에서는 verify 재사용과 새 Review를 구분한다.
+- 이 작업의 마지막 최종 승인 재사용에서 목록 부재/오류/누락 의심·입력 비교 불가, 문서나 승인 입력 변화, 부분 성공 또는 미최종 선행 결과만 있으면 필요한 Review를 실행한다. R-086 일반 선행 PASS 뒤의 실제 전체 verify와 최종 승격은 해당 별도 계약을 유지하며 이 재사용 판정으로 추가 Reviewer를 강제하거나 전체 verify를 생략하지 않는다. verify와 무관한 명세 변화에서는 verify 재사용과 새 Review를 구분한다.
 - 승인 receipt는 실제 PASS·검증된 후보/입력·작업 주기에 결합하고 최종 게시 직전 다시 확인한다. rebase·경쟁·중단/재시작에서 오래된 Review로 새 diff를 승인하거나 새 실패를 이전 PASS로 덮지 않는다.
 - 다른 계획/작업의 PASS·교정 이력·승인을 복제하지 않는다. 생략 이유와 원래 근거를 남기며 실제 Reviewer가 실행되면 기존 읽기 전용·검증 결과 전달·issue 교정 계약을 유지한다.
-- G-241의 일반 verify 입력 증명과 최신 완료 조건을 확인한다. R-082의 선행 Review PASS·VERIFY_REQUIRED와 과거 verify 참고 출력은 최종 승인 receipt가 아니며, 검증 보완 전에는 재사용·게시 근거로 승격하지 않는다.
+- G-241의 일반 verify 입력 증명과 최신 완료 조건을 확인한다. R-082의 선행 Review PASS·VERIFY_REQUIRED와 과거 verify 참고 출력은 최종 승인 receipt가 아니며, 검증 보완 이후에도 문서 선행 결과 자체를 재사용·게시 근거로 승격하지 않는다. R-086의 일반 선행 결과는 별도 증거이며 해당 전체 검증·최종 승인 gate를 통과한 기록만 마지막 최종 승인으로 읽을 수 있다.
 - R-085의 실제 Reviewer 실행 환경과 소비하는 설정·정책 입력이 같다는 근거를 확인한다. 인증 원본의 사용하지 않는 개인 config 변경은 재사용 입력이 아니며, 관리 home/source 선택·유효 정책 변경 또는 과거 환경의 입력 부재는 새 Review로 연결한다. 인증값을 지문·receipt·로그에 넣거나 현재 환경을 과거 승인 당시의 환경으로 소급 채택하지 않는다.
 
 ## Implementation
 
-- execution Review handler·publication 후보 확인과 storage의 기존 validation/checkpoint 경계를 확장한다. verify receipt와 Review 입력/receipt를 분리하되 필수 선행 검증 관계를 유지한다.
+- execution Review handler·publication 후보 확인과 storage의 기존 validation/checkpoint 경계를 확장한다. verify receipt와 Review 입력/receipt를 분리하되 필수 선행 검증 관계를 유지한다. R-086의 preliminary_reviews·실제 전체 run ID·최종 승격 및 게시 재확인 경계를 보존하고, 부분 token/receipt를 전체 검증 증거로 읽거나 일반 선행 단계를 다시 구현하지 않는다.
 - 기존 공통·역할별 원본 묶음 버전과 실제 Reviewer 합성 instruction의 hash, 문서 source fallback/예약어 규칙 버전, G-171 최종 문서 diff 보고를 재사용한다. 최신 runtime 원본을 진행 중 작업의 고정 버전에 섞거나 common 본문만 비교해 역할 규칙 변경을 놓치지 않는다. 실제 외부 검토 기준을 확인할 수 없으면 새 Review를 선택한다.
 - 실제 Reviewer 호출에는 G-197의 최종 후보 검증 근거 전달 경계를 재사용한다. verify 성공을 재사용했으면 원래 성공 근거와 현재 입력의 동일성 확인을 전달하고, 새 verify를 실행한 것으로 보고하지 않는다.
 - G-262의 준비된 실행 환경·실제 설정 관측과 G-263/G-264의 provider별 source 선택을 소비한다. 재사용 판정과 실제 Reviewer 실행이 같은 비밀값 없는 환경/정책 identity를 사용하게 하며 별도 home 탐색·개인 config 조회·인증 cache를 추가하지 않는다. 기존 격리/설정 증거의 확인 불가를 동일성으로 대용하지 않는다.
@@ -75,6 +75,8 @@ priority: high
 - [x] 2026-10-11 delta 검토: PR 전 snapshot token `4e4794ea5a72e4acbf130a00b86c65166feb4676b19e417a33a4af84e631cb28`, revision `6fc245469a6bd3cced81dbf64fc049130982bbc8`와 원본 hash `94dc14021dce370d8033c0c91bf1ab0dcea013699e1240603e397a78571a4314`를 대조했다. R-085의 미구현 실행 환경 전환을 기존 최종 Review 동일성 목표에 연결했다. 기존 기록을 보존하며 구현·테스트·전체 verify는 실행하지 않았다.
 
 ## Decision Log
+
+- 2026-10-12 사용자 요청의 문서 정합화: R-086 일반 선행 최종 승격과 이 작업의 마지막 최종 승인 재사용을 구분했다. R-082 문서 선행 결과의 승격 금지를 명확히 하고 실제 활성 source 경로를 교정했다. ID·목표·기존 dependency·metadata·수행 기록은 보존하며 G-183 구현 완료나 자동 Planner snapshot 적용으로 기록하지 않는다.
 
 - 2026-10-11: G-263/G-264의 실제 provider 환경 분리를 선행으로 연결한다. 새 Reviewer 환경을 확인하지 않고 개인 설정 지문이나 과거 환경의 PASS를 재사용하는 경로를 막으며, 인증 환경 구현은 해당 계획에 남긴다. 기존 high complexity의 승인/입력/게시 수명 판단과 high risk의 미검증 후보 게시·receipt 보존/재검증 복구를 유지한다. ID·경로·기존 목표·dependency·수행 기록을 보존한 delta 개정이며 프로젝트 최종 전문 확인이 아니다.
 

@@ -293,7 +293,7 @@ planning batch의 원격 게시·catalog 반영과 현재 원격 입력 일치�
 - documents/pr_description.py는 기존 실행 지침 보고 경계와 publication 호출을 재사용해 최종 base/head의 name-status와 문서별 patch를 보고한다. docs 아래 파일 및 저장소 Markdown·RST·TXT 문서는 rename의 양쪽 경로까지 포함하며 각 경로에 해당 compare diff 링크를 붙인다. Worker Summary의 DOCUMENT_CHANGE에 최종 경로·주요 내용·이유·영향과 UTF-8 문서 patch의 SHA-256을 결합한다. 최종 diff에 없는 경로·누락·patch 불일치는 일반 Summary로 대체하지 않고 기존 WORKER_CORRECTION으로 현재 후보의 설명을 보완한다. 새로운 PR과 기존 PR 갱신 모두 불완전한 보고를 게시하지 않는다. 열린 PR은 확인된 head에서 Manager 소유 보고만 교체·제거하며 사용자 본문·immutable ExecPlan/source 링크·Purpose를 보존한다
 - Worker는 수정한 코드와 새로 작성하거나 변경한 테스트를 직접 검증하는 최소 범위의 targeted unit test만 실행한다. 실패하면 같은 세션에서 수정하고 해당 테스트를 다시 실행하며, 실행 가능한 관련 unit test가 없으면 그 사유를 결과에 포함한다
 - Worker는 전체 test suite, integration test, end-to-end test, 프로젝트 전체 lint·build·type check와 전체 검증 스크립트를 직접 실행하지 않는다
-- Reviewer는 Worker의 targeted unit test와 프로그램의 전체 verify가 통과한 뒤 실행되며 테스트 command나 verify 스크립트를 다시 실행하지 않는다. 파일을 수정하지 않고 코드, 테스트, verify 스크립트의 diff와 전달된 결과를 읽어 요구사항 충족, 회귀, 테스트 누락과 verify 약화를 포함한 blocking issue를 확인한다
+- Reviewer는 기본 경로에서 Worker의 targeted unit test와 프로그램의 전체 verify가 통과한 뒤 실행된다. 명시적 일반 선행 경로에서는 현재 후보의 Manager 부분 verify 뒤 실행되며 테스트 command나 verify 스크립트를 다시 실행하지 않는다. 파일을 수정하지 않고 코드, 테스트, verify 스크립트의 diff와 전달된 결과를 읽어 요구사항 충족, 회귀, 테스트 누락과 verify 약화를 포함한 blocking issue를 확인한다
 - 프로그램은 각 Agent 실행 전후 diff를 검사한다. Planner의 범위 위반은 `planning_error` 흐름으로 처리하고, Worker 또는 Reviewer의 범위 위반은 해당 ExecPlan을 BLOCKED로 처리한다
 - Worker와 Reviewer는 ExecPlan이 PR 생성 준비를 마칠 때까지 각자의 세션을 재사용한다
 - 세션을 재개할 수 없으면 같은 worktree, ExecPlan과 저장된 실패 내용을 전달해 새 세션을 시작한다
@@ -361,7 +361,7 @@ Reviewer의 `read-only`는 workspace 파일 쓰기를 제한한다. 검색·diff
 | medium | low / medium / high / critical | 3 / 3 / 3 / 4 |
 | high | low / medium / high / critical | 5 / 5 / 5 / 6 |
 
-level 7·8은 완료한 Worker 교정·전체 verify 통과 뒤의 유효 Review FAIL에 따른 승격으로만 도달하며 상한은 8이다. 각 effective level의 첫 FAIL을 기준선으로 삼고 기준선의 같은 ISSUE_ID가 두 교정 결과에 다시 나타나거나 교정 결과가 세 번 연속 FAIL이면 다음 Worker 호출부터 한 단계 올린다. 집계 제외·재시작·PASS 조건은 [PRODUCT의 실패와 재시도](PRODUCT.md#실패와-재시도)를 따른다.
+level 7·8은 완료한 Worker 교정·현재 후보의 Manager 검증(기본 경로의 전체 verify 또는 일반 선행 경로의 부분 verify) 통과 뒤의 유효 Review FAIL에 따른 승격으로만 도달하며 상한은 8이다. 각 effective level의 첫 FAIL을 기준선으로 삼고 기준선의 같은 ISSUE_ID가 두 교정 결과에 다시 나타나거나 교정 결과가 세 번 연속 FAIL이면 다음 Worker 호출부터 한 단계 올린다. 집계 제외·재시작·PASS 조건은 [PRODUCT의 실패와 재시도](PRODUCT.md#실패와-재시도)를 따른다.
 
 실제 Model·Effort의 원본은 `config/config.ini`다. 선택 provider의 `[<provider>.worker]`에 level 1~8을, `[<provider>.roles]`에 일반 Planner `planner`와 빠른 점검 Planner `planner_check`를 각각 `Model alias,Effort` 형식으로 명시하고 참조 alias를 `[<provider>.models]`에 명시한다. 필수 profile·alias는 `DEFAULT`, 다른 역할·level, 코드·CLI 또는 설정 예시로 보충하지 않는다. section·profile·alias 누락, 빈 Model·Effort, 잘못된 형식과 CLI가 지원하지 않는 Model·Effort 조합은 Agent 실행 전 설정 오류로 거부한다. 미선택 provider의 설정은 요구하지 않는다. 서로 다른 level에 같은 지원 profile을 지정할 수 있고 level 8에도 특정 모델 계열·alias·Effort를 강제하지 않는다.
 
@@ -483,7 +483,7 @@ manifest·이벤트·결과는 version·run·단계·단위/테스트 identity�
 - 프로그램은 verify 스크립트를 AI Agent 밖에서 실행한다
 - 프로그램은 verify 성공 시 Worker를 다시 호출하거나 성공 출력을 전달하지 않는다
 - verify 실패 시에만 종료 코드와 필요한 출력 내용을 같은 Worker 세션에 전달한다
-- Reviewer는 성공한 Worker targeted unit test와 전체 verify 결과를 넘겨받고 테스트를 다시 실행하지 않는다
+- Reviewer는 Worker targeted unit test와 Manager 검증 결과·실제 범위를 넘겨받고 테스트를 다시 실행하지 않는다. 일반 선행 경로의 부분 결과는 전체 verify 성공을 뜻하지 않는다
 - Reviewer는 코드와 테스트의 diff 및 verify 스크립트 변경이 검증 범위를 약화하지 않았는지 읽기 전용으로 확인한다
 
 verify 지문 이력, Review 지문·level 승격 이력과 실행별 Worker 교정 횟수는 별도로 저장한다. 최종 반복·일시 중단·BLOCKED 해제 조건은 PRODUCT의 실패 정책을 따른다. verify 성공은 verify 이력만, Review 성공은 Review 이력만 초기화하고 effective level·승격 이력은 유지한다.
@@ -600,6 +600,16 @@ Agent 시작 이후 Manager의 fetch·worktree 전이는 작업별 전후 기대
 Codex가 Agent turn 추적을 위해 자동 생성·갱신·정리하는 `refs/codex/turn-diffs/*`는 게시 또는 workspace 소유권에 사용하지 않는 provider 소유의 비권위 임시 ref다. 그 namespace의 순변경만으로 Agent 범위 위반이나 `PROJECT_BLOCKED`를 만들지 않으며, 작업 소유 branch와 사용 중인 원격 ref는 계속 보호한다
 
 Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내장 쓰기 제한과 granular 자동 승인 검토를 유지한다. Reviewer는 읽기 전용이고 테스트·verify 재실행 금지는 별도의 역할 지침으로 유지한다. Codex 프로세스 전체를 감싸는 바깥 sandbox와 중첩 sandbox 호환성은 호출 조건이 아니며, 정상 session·로그 저장을 Agent의 workspace 밖 쓰기 권한과 구분한다
+
+## 일반 선행 Review와 부분 검증 증거
+
+`verification/impact.py`는 Git base/HEAD의 전체 tracked Python AST를 `maintenance/code_index.py`로 분석하며 두 그래프의 역방향 closure를 실제 manifest 모듈로 정규화한다. 동적/미해결 참조를 제외할 수 없는 경우 전역 불확실성을 fallback으로 유지한다. 구체적인 지원·선정 규칙과 진단은 [VERIFY.md](VERIFY.md#영향-기반-부분-실행)를 따른다.
+
+`runner.py`의 부분 모드는 전체 discovery를 유지한 뒤 선택 모듈만 기존 unittest adapter/core에 전달한다. 미선택 결과는 NOT_SELECTED이고 후속 command는 전체 실행에서만 수행한다. manifest identity·후보 안정성·fixture 소유자·필수 결과를 검사하며 interpreter·guard·예약·timeout/자식 종료 경계는 기존 Manager adapter를 사용한다.
+
+`preliminary_reviews`는 전체 `verify_receipts`와 독립된 같은 작업 주기의 상태·후보/입력 identity·부분 결과·일반 선행 결과를 저장한다. generation CAS와 전체 verify cycle 변경으로 오래된 쓰기를 거부한다. Worker 교정의 `partial_head`는 `verified_head`를 만들지 않고 기존 교정 감사에 검증 종류를 보존한다. 부분 실행 중단은 미완료 상태로 남고 전체 경로로 재개한다. 일반 선행 PASS 뒤에는 실제 전체 run을 강제하며 실패 시 이전 승인을 무효화한다.
+
+`preliminary_review.py`는 동일 HEAD/base/전체 diff·직렬화된 definition·Worker 결과·Manager 실행 코드 identity와 실제 Reviewer instruction/provider/model/effort/환경/정책 관측을 결합한다. 현재 provider 조립은 마지막 관측 port를 제공하지 않으므로 opt-in도 기존 경로로 fallback한다. 실제 관측을 연결한 경로만 일반 선행 승인 재사용을 허용한다. Reviewer entry에서 현재 전체 verify token/receipt를 확인한 뒤 최종 token을 만들고 publication의 현재 소유권·원격 확인 경계에서 입력 identity를 다시 검사한다. 새 성공으로 과거 문서 선행 PASS를 승격하지 않으며 G-183/G-241/G-262/263/264의 별도 목표를 완료로 기록하지 않는다.
 
 ## Verify 입력 관측과 생성 요청
 

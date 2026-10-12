@@ -23,6 +23,17 @@ from tests.support.fixed_samples import PROJECT_FILES
 
 @isolated_git_test
 class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
+    def test_partial_verify_is_explicit_boolean_with_legacy_default(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / 'config.ini'
+            config.write_text('[loop]\n')
+            self.assertFalse(load_managed_config(config).verify_partial)
+            config.write_text('[loop]\nverify_partial=true\n')
+            self.assertTrue(load_managed_config(config).verify_partial)
+            config.write_text('[loop]\nverify_partial=maybe\n')
+            with self.assertRaisesRegex(ManagedConfigError, 'verify_partial'):
+                load_managed_config(config)
+
     def test_copy_project_files_runs_real_script_with_fixed_inputs(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

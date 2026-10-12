@@ -3,7 +3,7 @@ id: G-263
 title: Codex 인증 전용 저장소와 기존 config 연결 분리
 sources:
   - docs/PRODUCT.md
-  - docs/requirements/[R-085] Codex Claude 인증 전용 자동 실행 환경.md
+  - docs/requirements/[R-085] Codex·Claude 인증 전용 자동 실행 환경.md
 depends_on:
   - G-262
   - G-265

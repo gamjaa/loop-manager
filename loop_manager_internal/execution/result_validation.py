@@ -99,7 +99,8 @@ def evaluate_review_worker_level(
     pending = state.get('pending')
     completed = bool(pending and pending['level'] == effective_level
                      and pending['completed'] and candidate_head
-                     and pending['verified_head'] == candidate_head)
+                     and (pending['verified_head'] == candidate_head
+                          or pending.get('partial_head') == candidate_head))
     if baseline:
         state = {'version': 1, 'level': effective_level,
                  'baseline': sorted(set(fingerprints)), 'failures': 0, 'issues': {},
@@ -114,7 +115,8 @@ def evaluate_review_worker_level(
     else:
         state.setdefault('audit', []).append({
             'kind': 'correction', 'level': effective_level,
-            'source_review_id': pending['source'], 'verified_head': candidate_head,
+            'source_review_id': pending['source'], 'verified_head': pending['verified_head'],
+            **({'partial_head': pending['partial_head']} if pending.get('partial_head') == candidate_head else {}),
             'issues': sorted(set(fingerprints)),
         })
         state['pending'] = None  # Consumed atomically with the level update.
@@ -239,7 +241,7 @@ def observe_verify_inputs(worktree: Path):
                           runtime_identity=None)
 
 
-def verify(effects: VerifyEffects, worktree: Path, timeout_seconds: int = 600) -> tuple[bool, str]:
+def verify(effects: VerifyEffects, worktree: Path, timeout_seconds: int = 600, *, partial_base=None) -> tuple[bool, str]:
     effects._check_runtime_handoff()
     script, arguments = verify_arguments(worktree)
     if not script.is_file():
@@ -255,19 +257,26 @@ def verify(effects: VerifyEffects, worktree: Path, timeout_seconds: int = 600) -
         passed, timed_out, output = manager_adapter.run(
             effects, arguments, worktree, timeout_seconds,
             launch=effects._handoff_popen if gate is not None else None,
+            **({"partial_base": partial_base} if partial_base else {}),
         )
+    elif partial_base:
+        return False, VerifyOutput("partial verify requires unittest connection", exit_code=2)
     else:
         passed, timed_out, output = effects.run_verify_process(
             arguments, worktree, timeout_seconds,
             **({"launch_process": effects._handoff_popen} if gate is not None else {}),
         )
     exit_code = getattr(output, "exit_code", 0 if passed else None)
+    partial_report = getattr(output, "partial_result", None)
     if timed_out:
         output += (
             f"\n전체 verify 시간 초과: verify_timeout_seconds={timeout_seconds}. "
             "verify와 자식 프로세스 종료를 확인했습니다."
         )
-    return passed, VerifyOutput(output, timed_out=timed_out, exit_code=exit_code)
+    result = VerifyOutput(output, timed_out=timed_out, exit_code=exit_code)
+    if partial_base:
+        result.partial_result = partial_report or {"kind": "partial_verify", "status": "ERROR"}
+    return passed, result
 
 
 def _valid_review_issue_path(path: str) -> bool:

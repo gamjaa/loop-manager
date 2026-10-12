@@ -98,6 +98,9 @@ class ValidationEffects:
     clear_validation_failure_history: Callable[..., Any]
     transition_validation_failure: Callable[..., Any]
     observe_verify_inputs: Callable[..., Any] | None = None
+    partial_verify_enabled: Callable[..., bool] | None = None
+    partial_verify: Callable[..., Any] | None = None
+    pre_review_identity: Callable[..., Any] | None = None
 
 @dataclass(frozen=True)
 class FeedbackEffects:

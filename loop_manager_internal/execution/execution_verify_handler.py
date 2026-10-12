@@ -5,6 +5,8 @@ from dataclasses import dataclass
 from typing import Callable, Any, Mapping
 from loop_manager_internal.documents import document_drafts
 import sys
+import json
+import time
 from loop_manager_internal.storage import review_correction_state, runtime_state
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, RecoveryFailure, classify_exception
@@ -17,6 +19,8 @@ from loop_manager_internal.execution.execution_session import ExecutionIdentity,
 from loop_manager_internal.execution.execution_state import ExecutionStatePort
 from loop_manager_internal.storage import verify_receipts
 from loop_manager_internal.verification.inputs import InputObservation
+from loop_manager_internal.storage import pre_review
+from loop_manager_internal.execution import preliminary_review
 
 @dataclass(frozen=True)
 class VerifyHandlerPorts:
@@ -57,6 +61,10 @@ class VerifyHandlerPorts:
     _retry: Callable[..., ExecutionOutcome]
     _row: Callable[[], Mapping[str, object]]
     observe_verify_inputs: Callable[..., Any] | None = None
+    partial_verify_enabled: Callable[..., bool] | None = None
+    partial_verify: Callable[..., Any] | None = None
+    pre_review_identity: Callable[..., Any] | None = None
+    checkpoint: Any = None
 
 
 class VerifyHandler:
@@ -74,20 +82,20 @@ class VerifyHandler:
         except (OSError, RuntimeError, ValueError) as error:
             return InputObservation(None, reason=str(error))
 
-    def _verify_once(self, context, candidate_head: str | None = None):
+    def _verify_once(self, context, candidate_head: str | None = None, *, partial=False):
         self._verify_executed = False
         assert self.ports.snapshot().catalog_plan is not None and self.ports.snapshot().plan is not None
         from loop_manager_internal.execution.manual_candidate import get_manual
         manual = get_manual(self.ports.state)
-        manual_snapshot = manual.capture_stage(context, 'verify') if manual else None
-        waiver = manual.waive(context, 'verify', snapshot=manual_snapshot) if manual else None
+        manual_snapshot = manual.capture_stage(context, 'verify') if manual and not partial else None
+        waiver = manual.waive(context, 'verify', snapshot=manual_snapshot) if manual and not partial else None
         if waiver:
             self.ports.operation_print(waiver)
             return None, waiver
         notice = manual.invalid_waiver_notice(context,'verify',snapshot=manual_snapshot) if manual else None
         if notice:
             self.ports.operation_print(notice)
-        self.ports.operation_log(f"전체 verify 시작: {self.ports.snapshot().plan['id']} {self.ports.snapshot().plan['title']}")
+        self.ports.operation_log(f"{'부분' if partial else '전체'} verify 시작: {self.ports.snapshot().plan['id']} {self.ports.snapshot().plan['title']}")
         verify_scope_before = self.ports.begin_agent_scope(
             self.ports.identity.repo,
             context.worktree,
@@ -95,8 +103,26 @@ class VerifyHandler:
             input_fingerprint=self.ports._worktree_execplan_input_fingerprint(context.worktree, self.ports.snapshot().catalog_plan),
         )
         try:
-            self._verify_executed = True
-            passed, output = self.ports.verify(context.worktree)
+            self._verify_executed = not partial
+            if partial:
+                passed, output = self.ports.partial_verify(context.worktree, context.active_sha)
+                self._partial_report = getattr(output, 'partial_result', None)
+                report = self._partial_report
+                if (not isinstance(report, dict) or report.get('kind') != 'partial_verify'
+                        or report.get('status') not in {'PASS', 'FAIL', 'FALLBACK', 'ERROR'}):
+                    passed = False
+                    self._partial_report = {'kind': 'partial_verify', 'status': 'ERROR'}
+                elif report['status'] == 'PASS':
+                    selection = report.get('selection') or {}
+                    passed = bool(passed and selection.get('head') == candidate_head
+                                  and selection.get('base') == context.active_sha
+                                  and selection.get('modules') and selection.get('ids') and not selection.get('fallback'))
+                    if not passed:
+                        self._partial_report = {**report, 'status': 'ERROR'}
+                elif report['status'] != 'FALLBACK':
+                    passed = False
+            else:
+                passed, output = self.ports.verify(context.worktree)
         except self.ports.contract.VerifyTerminationUncertain as error:
             detail = str(error)
             self.ports._block_final(
@@ -106,12 +132,12 @@ class VerifyHandler:
             self.ports.operation_print(detail, file=sys.stderr)
             return (self.ports._final(detail), detail)
         raw_output = redact_secrets(str(getattr(output, 'fingerprint_source', output)))
-        if manual:
+        if manual and not partial:
             manual.record(context, 'verify', passed, raw_output, snapshot=manual_snapshot)
         if not hasattr(output, 'fingerprint_source'):
             output = raw_output
         definition = self.ports.snapshot()._definition_snapshot
-        if passed and candidate_head and context.active_sha and definition is not None:
+        if not partial and passed and candidate_head and context.active_sha and definition is not None:
             observed_head = self.ports.git(
                 context.worktree, 'rev-parse', 'HEAD',
             ).stdout.strip()
@@ -191,14 +217,14 @@ class VerifyHandler:
                 audit_rejected()
             return (guarded, output)
         context = guarded
-        if feedback_repo is not None:
+        if feedback_repo is not None and not (partial and passed):
             feedback_repo.observe(
                 self.ports.identity.repo, str(self.ports.snapshot().plan['id']), context.plan.definition_revision_sha,
                 'verify', passed, raw_output, feedback_items,
             )
         if not passed:
             self.ports.operation_log(
-                f"Worker 반환: {self.ports.snapshot().plan['id']} {self.ports.snapshot().plan['title']} (전체 verify 실패)",
+                f"Worker 반환: {self.ports.snapshot().plan['id']} {self.ports.snapshot().plan['title']} ({'부분' if partial else '전체'} verify 실패)",
                 error=True,
             )
             decision = self.ports.transition_validation_failure(
@@ -286,6 +312,9 @@ class VerifyHandler:
         candidate_head = self.ports.git(
             context.worktree, 'rev-parse', 'HEAD'
         ).stdout.strip()
+        partial_outcome = self._maybe_partial(context, candidate_head)
+        if partial_outcome is not None:
+            return partial_outcome
         observation = self._observe(context.worktree)
         waived = bool(manual and manual.waive(context, 'verify', record=False))
         connection = self.ports.state.connection
@@ -300,6 +329,8 @@ class VerifyHandler:
                 selection = verify_receipts.selected(connection, repo, plan_id)
         origin = (verify_receipts.success(connection, selection, observation)
                   if not waived and self.ports.snapshot()._definition_snapshot is not None else None)
+        if preliminary_review.active(self.ports, context, {'review_pass', 'review_invalidated'}):
+            origin = None  # General preliminary PASS always requires an actual full run.
         if origin is not None:
             with runtime_state._transaction(connection):
                 self.ports.state.check_context(context)
@@ -333,11 +364,22 @@ class VerifyHandler:
                 repo, preserve_transaction=True, validated_base_sha=None,
                 verify_token=None, review_result=None, review_token=None, publication_token=None,
             )
+        full_started = time.monotonic()
         outcome, output = self._verify_once(context, candidate_head)
+        preliminary = preliminary_review.active(self.ports, context, {'review_pass', 'review_invalidated'})
+        if preliminary:
+            details = json.loads(preliminary['partial'])
+            details['full_verify'] = {'passed': outcome is None, 'duration': time.monotonic() - full_started,
+                                      'executed': self._verify_executed, 'receipt_id': identifier}
+            with runtime_state._transaction(connection):
+                pre_review.update(connection, preliminary, preliminary['status'], partial=details)
         if outcome is not None:
             with runtime_state._transaction(connection):
                 verify_receipts.complete(connection, selection, identifier, passed=False, output=output,
                                          executed=self._verify_executed)
+                preliminary = preliminary_review.active(self.ports, context, {'review_pass', 'review_invalidated'})
+                if preliminary:
+                    pre_review.update(connection, preliminary, 'full_failed')
             return outcome
         if self.ports.git(
             context.worktree, 'rev-parse', 'HEAD'
@@ -393,6 +435,70 @@ class VerifyHandler:
             )
         self.ports.update_snapshot(_latest_verify_output=output)
         return self._finish_verified(context)
+
+    def _maybe_partial(self, context, head):
+        enabled = self.ports.partial_verify_enabled
+        if enabled is None or enabled(context.worktree) is not True or self.ports.partial_verify is None:
+            return None
+        from loop_manager_internal.execution.manual_candidate import get_manual
+        manual = get_manual(self.ports.state)
+        if manual and manual.enabled() or self.ports._document_draft(context) is not None:
+            return None
+        from loop_manager_internal.execution import stage_documents
+        if self.ports.checkpoint and stage_documents.pending(self.ports.checkpoint, self.ports.identity.repo, context.plan.plan_id):
+            return None  # R-082 document preliminary Review has its own lifecycle.
+        key = preliminary_review.candidate(self.ports, context)
+        if key is None:
+            return None
+        connection = self.ports.state.connection
+        previous = pre_review.current(connection, self.ports.identity.repo, context.plan.plan_id)
+        if previous and previous['candidate'] == key:
+            if previous['status'] == 'partial_pass':
+                self.ports.state.update_project(self.ports.identity.repo, phase='REVIEWING', last_error=None)
+                return self.ports._advanced()
+            # Interrupted work, Review PASS/FAIL and prior fallback all proceed
+            # through full verify. They cannot replay an uncompleted partial run.
+            return None
+        with runtime_state._transaction(connection):
+            self.ports.state.check_context(context)
+            receipt = pre_review.begin(connection, self.ports.identity.repo, context.plan.plan_id, key)
+            if preliminary_review.review_identity(self.ports, context) is None:
+                from loop_manager_internal.verification import impact
+                pre_review.update(connection, receipt, 'fallback', partial={
+                    'kind': 'partial_verify', 'status': 'FALLBACK',
+                    'selection': {'head': head, 'base': context.active_sha, 'modules': [], 'ids': [], 'reasons': {},
+                        'total_modules': None, 'total_tests': None, 'manifest_identity': None,
+                        'configuration_identity': impact.digest({'settings': preliminary_review.verify_settings(self.ports),
+                            'declaration': self.ports.git(context.worktree, 'show', f'{head}:scripts/verify.json').stdout}),
+                        'algorithm': f'python-ast-impact-v{impact.VERSION}/index-v{impact.code_index.VERSION}',
+                        'fallback': ['review_environment_identity_unproven']}})
+                self.ports.operation_log('부분 verify fallback: Review 실행 환경·정책 identity가 확인되지 않았습니다.')
+                return None
+            self.ports.state.update_project(self.ports.identity.repo, preserve_transaction=True,
+                validated_base_sha=None, verify_token=None, review_token=None, publication_token=None)
+        self._partial_report = None
+        outcome, output = self._verify_once(context, head, partial=True)
+        report = self._partial_report or {'kind': 'partial_verify', 'status': 'ERROR'}
+        status = report['status']
+        if key != preliminary_review.candidate(self.ports, context):
+            status = 'ERROR'
+        with runtime_state._transaction(connection):
+            self.ports.state.check()
+            pre_review.update(connection, receipt,
+                'partial_pass' if status == 'PASS' and outcome is None else
+                'fallback' if status == 'FALLBACK' and outcome is None else 'partial_failed',
+                partial={**report, 'output': redact_secrets(str(output))})
+            if status == 'PASS' and outcome is None:
+                review_correction_state.partially_verified(connection, self.ports.identity.repo, context.plan.plan_id, head)
+        if outcome is not None:
+            return outcome
+        if status == 'FALLBACK':
+            self.ports.operation_log('부분 verify fallback: ' + str((report.get('selection') or {}).get('fallback')))
+            return None
+        if status != 'PASS':
+            return self.ports._retry('부분 verify 후보가 변경되어 전체 검증 경로로 재확인합니다.')
+        self.ports.state.update_project(self.ports.identity.repo, phase='REVIEWING', last_error=None)
+        return self.ports._advanced()
 
     def _finish_verified(self, context):
         assert self.ports.snapshot().catalog_plan is not None
