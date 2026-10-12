@@ -22,6 +22,9 @@ class PlanningRebaseError(RuntimeError):
     pass
 
 
+_MANAGER_CORRECTION_PATH = "docs/maintenance/code-map.jsonl"
+
+
 @dataclass(frozen=True)
 class PlanningRebaseResult:
     target: str
@@ -39,10 +42,24 @@ def _journal_path(state_dir: Path, repo: str, worktree: Path) -> Path:
 
 def _correction_path_allowed(name: object) -> bool:
     return isinstance(name, str) and "\0" not in name and (
-        name == "docs/FUTURE_IDEAS.md"
+        name == _MANAGER_CORRECTION_PATH
+        or name == "docs/FUTURE_IDEAS.md"
         or (re.fullmatch(r"docs/plans/[^/]+\.md", name) is not None
             and (os.name != "nt" or "\\" not in name))
     )
+
+
+def _authorize_manager_correction(paths, validator) -> None:
+    if _MANAGER_CORRECTION_PATH not in paths:
+        return
+    if validator is None:
+        raise PlanningRebaseError("Manager 코드맵 교정 경로에 receipt 검증이 필요합니다.")
+    try:
+        authorized = validator((_MANAGER_CORRECTION_PATH,))
+    except Exception as error:
+        raise PlanningRebaseError("Manager 코드맵 교정 receipt를 확인할 수 없습니다.") from error
+    if authorized is not True:
+        raise PlanningRebaseError("Manager 코드맵 교정 경로가 receipt 검증을 통과하지 못했습니다.")
 
 
 def _write(path: Path, record: dict[str, object]) -> None:
@@ -391,6 +408,7 @@ def _correction_digest(git, worktree: Path, paths: tuple[str, ...]) -> str:
 def save_planning_correction(
     git, state_dir: Path, repo: str, worktree: Path, target: str,
     paths: tuple[str, ...], was_rebase: bool,
+    *, manager_path_validator=None,
 ) -> None:
     """Persist a scope-checked correction before Manager stages its paths."""
     path = _journal_path(state_dir, repo, worktree)
@@ -399,6 +417,7 @@ def save_planning_correction(
         raise PlanningRebaseError("planning 교정을 저장할 rebase 단계가 다릅니다.")
     if any(not _correction_path_allowed(name) for name in paths):
         raise PlanningRebaseError("planning 교정 경로가 유효하지 않습니다.")
+    _authorize_manager_correction(paths, manager_path_validator)
     record["correction"] = {
         "paths": list(paths), "was_rebase": was_rebase,
         "head": _git_ok(git, worktree, "rev-parse", "HEAD"),
@@ -409,6 +428,7 @@ def save_planning_correction(
 
 def planning_correction(
     git, state_dir: Path, repo: str, worktree: Path, target: str,
+    *, manager_path_validator=None,
 ) -> tuple[tuple[str, ...], bool] | None:
     """Resume only the unchanged correction whose Agent scope already passed."""
     record = _read(_journal_path(state_dir, repo, worktree), repo, worktree)
@@ -427,6 +447,7 @@ def planning_correction(
             return None
         raise PlanningRebaseError("planning 교정 HEAD가 바뀌었습니다.")
     paths = tuple(saved["paths"])
+    _authorize_manager_correction(paths, manager_path_validator)
     if saved.get("digest") != _correction_digest(git, worktree, paths):
         raise PlanningRebaseError("검증된 planning 교정 후 작업물이 달라졌습니다.")
     return paths, saved["was_rebase"]

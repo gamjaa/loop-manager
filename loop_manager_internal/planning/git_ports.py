@@ -90,6 +90,9 @@ class _PlanningGitPorts:
     ) -> None:
         planning_rebase.save_planning_correction(
             self._rebase_git, self._state_dir, repo, worktree, target, paths, was_rebase,
+            manager_path_validator=lambda names: self._validate_manager_correction_paths(
+                repo, worktree, names,
+            ),
         )
 
     def planning_correction(
@@ -97,7 +100,21 @@ class _PlanningGitPorts:
     ) -> tuple[tuple[str, ...], bool] | None:
         return planning_rebase.planning_correction(
             self._rebase_git, self._state_dir, repo, worktree, target,
+            manager_path_validator=lambda names: self._validate_manager_correction_paths(
+                repo, worktree, names,
+            ),
         )
+
+    def _validate_manager_correction_paths(
+        self, repo: str, worktree: Path, names: tuple[str, ...],
+    ) -> bool:
+        from loop_manager_internal.maintenance.code_map_artifact import (
+            ARTIFACT_PATH, validate_restored,
+        )
+        if names != (ARTIFACT_PATH,):
+            return False
+        validate_restored(self._connection, repo, worktree)
+        return True
 
     def restore_code_map_conflict(
         self, repo: str, worktree: Path, stash_sha: str = "",

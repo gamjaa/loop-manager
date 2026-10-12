@@ -41,7 +41,7 @@ Manager가 복원한 코드맵과 Agent가 편집할 계획의 책임을 교정 
 ## Progress
 
 - [x] 2026-10-12 source revision `c401d563589399dbca83ffe4c9cfe13419ff128e`의 module manifest `c10544e0999d36ee6e8143dedecacb414a03b8f2205fbfd2bbbb0b472d1e00b6` 발견 6을 재사용하고 정확한 인용·HEAD 일치를 확인했다. 저장 helper 연결과 기존 mock 범위를 문맥으로 확인했으며 새로운 의미 검토·테스트·verify는 실행하지 않았다.
-- [ ] Manager 산출물/journal 계약 연결과 targeted unit 검증
+- [x] Manager 산출물/journal 계약 연결과 `PlanningConflictCorrectionUnitTests.test_manager_code_map_correction_uses_receipt_backed_journal` targeted unit 검증 (2026-10-12)
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
