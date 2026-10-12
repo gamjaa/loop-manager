@@ -293,7 +293,7 @@ planning batch의 원격 게시·catalog 반영과 현재 원격 입력 일치�
 - documents/pr_description.py는 기존 실행 지침 보고 경계와 publication 호출을 재사용해 최종 base/head의 name-status와 문서별 patch를 보고한다. docs 아래 파일 및 저장소 Markdown·RST·TXT 문서는 rename의 양쪽 경로까지 포함하며 각 경로에 해당 compare diff 링크를 붙인다. Worker Summary의 DOCUMENT_CHANGE에 최종 경로·주요 내용·이유·영향과 UTF-8 문서 patch의 SHA-256을 결합한다. 최종 diff에 없는 경로·누락·patch 불일치는 일반 Summary로 대체하지 않고 기존 WORKER_CORRECTION으로 현재 후보의 설명을 보완한다. 새로운 PR과 기존 PR 갱신 모두 불완전한 보고를 게시하지 않는다. 열린 PR은 확인된 head에서 Manager 소유 보고만 교체·제거하며 사용자 본문·immutable ExecPlan/source 링크·Purpose를 보존한다
 - Worker는 수정한 코드와 새로 작성하거나 변경한 테스트를 직접 검증하는 최소 범위의 targeted unit test만 실행한다. 실패하면 같은 세션에서 수정하고 해당 테스트를 다시 실행하며, 실행 가능한 관련 unit test가 없으면 그 사유를 결과에 포함한다
 - Worker는 전체 test suite, integration test, end-to-end test, 프로젝트 전체 lint·build·type check와 전체 검증 스크립트를 직접 실행하지 않는다
-- Reviewer는 기본 경로에서 Worker의 targeted unit test와 프로그램의 전체 verify가 통과한 뒤 실행된다. 명시적 일반 선행 경로에서는 현재 후보의 Manager 부분 verify 뒤 실행되며 테스트 command나 verify 스크립트를 다시 실행하지 않는다. 파일을 수정하지 않고 코드, 테스트, verify 스크립트의 diff와 전달된 결과를 읽어 요구사항 충족, 회귀, 테스트 누락과 verify 약화를 포함한 blocking issue를 확인한다
+- Reviewer는 기본 경로에서 Worker의 targeted unit test와 프로그램의 전체 verify가 통과한 뒤 실행된다. 일반 선행 경로에서는 현재 후보의 Manager 부분 verify 뒤 실행되며 테스트 command나 verify 스크립트를 다시 실행하지 않는다. 파일을 수정하지 않고 코드, 테스트, verify 스크립트의 diff와 전달된 결과를 읽어 요구사항 충족, 회귀, 테스트 누락과 verify 약화를 포함한 blocking issue를 확인한다
 - 프로그램은 각 Agent 실행 전후 diff를 검사한다. Planner의 범위 위반은 `planning_error` 흐름으로 처리하고, Worker 또는 Reviewer의 범위 위반은 해당 ExecPlan을 BLOCKED로 처리한다
 - Worker와 Reviewer는 ExecPlan이 PR 생성 준비를 마칠 때까지 각자의 세션을 재사용한다
 - 세션을 재개할 수 없으면 같은 worktree, ExecPlan과 저장된 실패 내용을 전달해 새 세션을 시작한다
@@ -609,7 +609,7 @@ Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내�
 
 `preliminary_reviews`는 전체 `verify_receipts`와 독립된 같은 작업 주기의 상태·후보/입력 identity·부분 결과·일반 선행 결과를 저장한다. generation CAS와 전체 verify cycle 변경으로 오래된 쓰기를 거부한다. Worker 교정의 `partial_head`는 `verified_head`를 만들지 않고 기존 교정 감사에 검증 종류를 보존한다. 부분 실행 중단은 미완료 상태로 남고 전체 경로로 재개한다. 일반 선행 PASS 뒤에는 실제 전체 run을 강제하며 실패 시 이전 승인을 무효화한다.
 
-`preliminary_review.py`는 동일 HEAD/base/전체 diff·직렬화된 definition·Worker 결과·Manager 실행 코드 identity와 실제 Reviewer instruction/provider/model/effort/환경/정책 관측을 결합한다. 현재 provider 조립은 마지막 관측 port를 제공하지 않으므로 opt-in도 기존 경로로 fallback한다. 실제 관측을 연결한 경로만 일반 선행 승인 재사용을 허용한다. Reviewer entry에서 현재 전체 verify token/receipt를 확인한 뒤 최종 token을 만들고 publication의 현재 소유권·원격 확인 경계에서 입력 identity를 다시 검사한다. 새 성공으로 과거 문서 선행 PASS를 승격하지 않으며 G-183/G-241/G-262/263/264의 별도 목표를 완료로 기록하지 않는다.
+`preliminary_review.py`는 동일 HEAD/base/전체 diff·직렬화된 definition·Worker 결과·Manager 실행 코드 identity와 실제 Reviewer instruction/provider/model/effort/환경/정책 관측을 결합한다. 현재 provider 조립은 마지막 관측 port를 제공하지 않으므로 부분 경로가 기본 사용이어도 기존 경로로 fallback한다. 실제 관측을 연결한 경로만 일반 선행 승인 재사용을 허용한다. Reviewer entry에서 현재 전체 verify token/receipt를 확인한 뒤 최종 token을 만들고 publication의 현재 소유권·원격 확인 경계에서 입력 identity를 다시 검사한다. 새 성공으로 과거 문서 선행 PASS를 승격하지 않으며 G-183/G-241/G-262/263/264의 별도 목표를 완료로 기록하지 않는다.
 
 ## Verify 입력 관측과 생성 요청
 
