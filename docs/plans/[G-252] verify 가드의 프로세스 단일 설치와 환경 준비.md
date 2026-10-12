@@ -45,6 +45,8 @@ verification/guard.py·child_guard/sitecustomize.py와 runner/unittest_adapter�
 - `GuardInstallationTests`와 기존 환경 unit case, `CandidateEnvironmentTests`의 새 interpreter·다른 후보 package·중첩 자식 case, command 정제/시작 실패·종료 불명 예약 case를 확인했다. Python/Linux에서 15개 targeted test가 통과했고 확인 중단 재진입 보완 뒤 영향 범위 8개 targeted test가 통과했다(고유 case 총 16개). 전체 suite·verify·비용 비교·Windows 실환경 검증은 수행하지 않았다.
 - Manager verify 피드백 `verify:93c1a34cb7f227d620da9715f08a90ceff2989e1e65140413a06b843c1b8ff83`의 새 interpreter 실패를 고정 runtime의 이전 가드를 먼저 설치한 동일 개별 case로 재현했다. 부모 wrapper가 이전 runtime의 sitecustomize 경로를 선점하는 fixture 의존성을 제거하기 위해 `-I -B` harness에서 현재 가드를 먼저 설치한 뒤 실제 Python 자식의 자동 sitecustomize 로딩을 검사한다. 기존 다중 로딩·후보 package·중첩 자식·명령/API 거부·인증값 제외·환경 준비 횟수·bytecode assertion과 timeout은 유지한다. 수정 후 같은 targeted command의 1개 case가 통과했으며 전체 verify는 재실행하지 않았다. 후속 Worker 결과 검증 오류는 보고에서 최초 실패 결과를 생략하고 재실행 결과 뒤에 실패 표현을 넣은 것이 원인이었다. `FAILED_COMMAND` → 최초 `FAIL` → 동일 `RERUN` → 최종 `PASS` 형식의 실제 보고를 기존 `parse_worker_result`로 검사해 통과했다. 이미 통과한 targeted case는 반복 실행하지 않았다.
 
+- Review 지적 `diagnostic-failure-bypasses-exit`에 따라 sitecustomize의 고정 진단 출력을 `try`에 두고 `finally`에서 `_exit(1)`을 호출하도록 수정했다. 기존 종료 unit case를 출력 성공·`os.write`의 `OSError` 두 subtest로 확장해 종료 코드 1과 종료 호출을 확인했다. `python3 -m unittest tests.test_verify_runtime.GuardInstallationTests.test_sitecustomize_failure_stops_instead_of_running_unprotected`의 1개 case가 통과했다. 전체 verify는 Worker가 실행하지 않았다.
+
 
 ## Decision Log
 

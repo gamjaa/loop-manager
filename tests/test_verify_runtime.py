@@ -384,14 +384,18 @@ class GuardInstallationTests(unittest.TestCase):
         self.assertEqual(len(self.hooks), 1)
 
     def test_sitecustomize_failure_stops_instead_of_running_unprotected(self):
-        with mock.patch.dict(os.environ, {guard.MARKER: "1"}), \
-                mock.patch.object(runpy, "run_path", side_effect=ValueError("private-test-value")), \
-                mock.patch.object(os, "write") as write, \
-                mock.patch.object(os, "_exit", side_effect=SystemExit(1)):
-            with self.assertRaises(SystemExit):
-                exec(compile((Path(guard.__file__).parent / "child_guard/sitecustomize.py").read_text(),
-                             "sitecustomize.py", "exec"), {"__file__": guard.__file__})
-        write.assert_called_once_with(2, b"verify Python guard installation failed\n")
+        for write_error in (None, OSError("stderr unavailable")):
+            with self.subTest(write_error=write_error), \
+                    mock.patch.dict(os.environ, {guard.MARKER: "1"}), \
+                    mock.patch.object(runpy, "run_path", side_effect=ValueError("private-test-value")), \
+                    mock.patch.object(os, "write", side_effect=write_error) as write, \
+                    mock.patch.object(os, "_exit", side_effect=SystemExit(1)) as exit_process:
+                with self.assertRaises(SystemExit) as stopped:
+                    exec(compile((Path(guard.__file__).parent / "child_guard/sitecustomize.py").read_text(),
+                                 "sitecustomize.py", "exec"), {"__file__": guard.__file__})
+                self.assertEqual(stopped.exception.code, 1)
+                exit_process.assert_called_once_with(1)
+                write.assert_called_once_with(2, b"verify Python guard installation failed\n")
 
 
 class GuardAndConfigurationTests(unittest.TestCase):
