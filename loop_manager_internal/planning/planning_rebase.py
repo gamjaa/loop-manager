@@ -49,17 +49,27 @@ def _correction_path_allowed(name: object) -> bool:
     )
 
 
-def _authorize_manager_correction(paths, validator) -> None:
+def _authorize_manager_correction(paths, validator) -> tuple[int, str, str] | None:
     if _MANAGER_CORRECTION_PATH not in paths:
-        return
+        return None
     if validator is None:
         raise PlanningRebaseError("Manager 코드맵 교정 경로에 receipt 검증이 필요합니다.")
     try:
-        authorized = validator((_MANAGER_CORRECTION_PATH,))
+        identity = validator((_MANAGER_CORRECTION_PATH,))
     except Exception as error:
         raise PlanningRebaseError("Manager 코드맵 교정 receipt를 확인할 수 없습니다.") from error
-    if authorized is not True:
+    if (not isinstance(identity, tuple) or len(identity) != 3
+            or type(identity[0]) is not int
+            or not isinstance(identity[1], str)
+            or not isinstance(identity[2], str)):
         raise PlanningRebaseError("Manager 코드맵 교정 경로가 receipt 검증을 통과하지 못했습니다.")
+    return identity
+
+
+def _identity_bound_digest(digest: str, identity: tuple[int, str, str] | None) -> str:
+    if identity is None:
+        return digest
+    return hashlib.sha256(repr((digest, identity)).encode()).hexdigest()
 
 
 def _write(path: Path, record: dict[str, object]) -> None:
@@ -176,8 +186,12 @@ def _restored_fingerprint(git, worktree: Path, revision: str = "HEAD") -> tuple[
     return staged, unstaged, tuple(files)
 
 
-def _restored_digest(git, worktree: Path, revision: str = "HEAD") -> str:
-    return hashlib.sha256(repr(_restored_fingerprint(git, worktree, revision)).encode()).hexdigest()
+def _restored_digest(
+    git, worktree: Path, revision: str = "HEAD",
+    receipt_identity: tuple[int, str, str] | None = None,
+) -> str:
+    digest = hashlib.sha256(repr(_restored_fingerprint(git, worktree, revision)).encode()).hexdigest()
+    return _identity_bound_digest(digest, receipt_identity)
 
 
 def _apply_stash(git, worktree: Path, stash_sha: str):
@@ -236,6 +250,7 @@ def _stash_untracked_collisions(git, worktree: Path, stash_sha: str) -> tuple[st
 def rebase_planning_worktree(
     git, repo_path: Path, state_dir: Path, repo: str,
     worktree: Path, old_base: str, remote_base: str,
+    *, manager_path_validator=None,
 ) -> PlanningRebaseResult:
     """Move a saved Planner result, preserving the index and untracked files.
 
@@ -289,7 +304,10 @@ def rebase_planning_worktree(
         raise PlanningRebaseError("planning 변경물의 보존 stash가 없습니다.")
 
     if phase == "accepting":
-        accept_resolved_stash_conflict(git, state_dir, repo, worktree, target)
+        accept_resolved_stash_conflict(
+            git, state_dir, repo, worktree, target,
+            manager_path_validator=manager_path_validator,
+        )
         return PlanningRebaseResult(target, True)
 
     just_started_apply = False
@@ -379,7 +397,10 @@ def rebase_planning_worktree(
     return PlanningRebaseResult(target, True)
 
 
-def _correction_digest(git, worktree: Path, paths: tuple[str, ...]) -> str:
+def _correction_digest(
+    git, worktree: Path, paths: tuple[str, ...],
+    receipt_identity: tuple[int, str, str] | None = None,
+) -> str:
     # Index stages change during "add"; bind the approved worktree bytes and
     # all other index changes instead. Include deletions and untracked output.
     names = set(paths)
@@ -402,7 +423,8 @@ def _correction_digest(git, worktree: Path, paths: tuple[str, ...]) -> str:
         git, worktree, "diff", "--cached", "--binary", "HEAD", "--", ".",
         *(f":(literal,exclude){name}" for name in paths),
     )
-    return hashlib.sha256(repr((files, other_index)).encode()).hexdigest()
+    digest = hashlib.sha256(repr((files, other_index)).encode()).hexdigest()
+    return _identity_bound_digest(digest, receipt_identity)
 
 
 def save_planning_correction(
@@ -417,11 +439,11 @@ def save_planning_correction(
         raise PlanningRebaseError("planning 교정을 저장할 rebase 단계가 다릅니다.")
     if any(not _correction_path_allowed(name) for name in paths):
         raise PlanningRebaseError("planning 교정 경로가 유효하지 않습니다.")
-    _authorize_manager_correction(paths, manager_path_validator)
+    receipt_identity = _authorize_manager_correction(paths, manager_path_validator)
     record["correction"] = {
         "paths": list(paths), "was_rebase": was_rebase,
         "head": _git_ok(git, worktree, "rev-parse", "HEAD"),
-        "digest": _correction_digest(git, worktree, paths),
+        "digest": _correction_digest(git, worktree, paths, receipt_identity),
     }
     _write(path, record)
 
@@ -447,8 +469,8 @@ def planning_correction(
             return None
         raise PlanningRebaseError("planning 교정 HEAD가 바뀌었습니다.")
     paths = tuple(saved["paths"])
-    _authorize_manager_correction(paths, manager_path_validator)
-    if saved.get("digest") != _correction_digest(git, worktree, paths):
+    receipt_identity = _authorize_manager_correction(paths, manager_path_validator)
+    if saved.get("digest") != _correction_digest(git, worktree, paths, receipt_identity):
         raise PlanningRebaseError("검증된 planning 교정 후 작업물이 달라졌습니다.")
     return paths, saved["was_rebase"]
 
@@ -472,12 +494,21 @@ def complete_planning_rebase(git, state_dir: Path, repo: str, worktree: Path, ta
 
 def accept_resolved_stash_conflict(
     git, state_dir: Path, repo: str, worktree: Path, target: str,
+    *, manager_path_validator=None,
 ) -> None:
     """Adopt an explicitly corrected stash conflict after Git reports no unmerged paths."""
     path = _journal_path(state_dir, repo, worktree)
     record = _read(path, repo, worktree)
     if record is None or record["phase"] not in {"conflict", "accepting"} or record["target"] != target:
         raise PlanningRebaseError("해결할 planning stash 충돌 단계가 없습니다.")
+    correction = record.get("correction")
+    correction_paths = tuple(correction["paths"]) if isinstance(correction, dict) else ()
+    receipt_identity = _authorize_manager_correction(correction_paths, manager_path_validator)
+    if (record["phase"] == "conflict" and receipt_identity is not None
+            and correction.get("digest") != _correction_digest(
+                git, worktree, correction_paths, receipt_identity,
+            )):
+        raise PlanningRebaseError("planning stash 확정 전 Manager 코드맵 receipt가 달라졌습니다.")
     if git(worktree, "ls-files", "-u", "-z").stdout:
         raise PlanningRebaseError("planning stash 충돌이 아직 index에 남아 있습니다.")
     head = _git_ok(git, worktree, "rev-parse", "HEAD")
@@ -489,11 +520,15 @@ def accept_resolved_stash_conflict(
             raise PlanningRebaseError("해결된 planning 후보 변경물이 없습니다.")
         # Bind index/worktree bytes to the pre-reset commit, so the identity
         # remains valid on either side of the soft-reset crash window.
-        record["accepting_digest"] = _restored_digest(git, worktree, restored_head)
+        record["accepting_digest"] = _restored_digest(
+            git, worktree, restored_head, receipt_identity,
+        )
         record["phase"] = "accepting"
         _write(path, record)
     elif (head not in {restored_head, target}
-          or record.get("accepting_digest") != _restored_digest(git, worktree, restored_head)):
+          or record.get("accepting_digest") != _restored_digest(
+              git, worktree, restored_head, receipt_identity,
+          )):
         raise PlanningRebaseError("planning stash 교정 확정 중 작업물이 달라졌습니다.")
     if head != target:
         _git_ok(git, worktree, "reset", "--soft", target)
