@@ -11,6 +11,7 @@ from tests.support.git import (
     advance_remote_file,
 )
 from tests.support.publication import seed_validated_candidate
+from tests.support.lifecycle import register_connection_cleanup
 from tests.support.worker import worker_result
 from tests.support.workspace import pin_common_guidance
 from loop_manager_internal.agents.agent_invocation import InvocationContext
@@ -73,6 +74,7 @@ class PrRecoveryFixture:
         commit_and_push(repo, "Add conflict recovery plan")
         plan_sha = git_command(repo, "rev-parse", "origin/main")
         connection = sqlite3.connect(":memory:")
+        register_connection_cleanup(self, connection)
         connection.row_factory = sqlite3.Row
         connection.execute(loop_manager.SCHEMA)
         connection.execute(
