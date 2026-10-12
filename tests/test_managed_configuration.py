@@ -101,9 +101,11 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
 
     def test_git_adapter_delegates_to_shared_command(self):
         repo = Path("/fixture/repository")
-        with mock.patch("tests.test_managed_configuration.git_command", return_value="ignored") as command:
+        with mock.patch.object(sys.modules[__name__], "git_command", return_value="ignored") as command, \
+             mock.patch("subprocess.Popen", side_effect=AssertionError("unexpected Git subprocess")) as process:
             self.assertIsNone(self._git(repo, "status", "--porcelain"))
         command.assert_called_once_with(repo, "status", "--porcelain")
+        process.assert_not_called()
 
     def _commit(self, root: Path, message: str) -> None:
         self._git(root, "add", "-A")
