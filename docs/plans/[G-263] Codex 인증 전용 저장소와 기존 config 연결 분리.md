@@ -6,6 +6,10 @@ sources:
   - docs/requirements/[R-085] Codex Claude 인증 전용 자동 실행 환경.md
 depends_on:
   - G-262
+  - G-265
+  - G-266
+  - G-267
+  - G-268
 complexity: high
 risk: high
 priority: high

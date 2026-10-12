@@ -40,6 +40,10 @@ depends_on:
   - G-216
   - G-217
   - G-242
+  - G-265
+  - G-266
+  - G-267
+  - G-268
 complexity: high
 risk: medium
 priority: low

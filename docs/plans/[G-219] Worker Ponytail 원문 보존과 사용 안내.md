@@ -4,7 +4,11 @@ title: Worker Ponytail 원문 보존과 사용 안내
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-079] Worker Ponytail 지침 주입과 설치 플러그인 중복 방지.md
-depends_on: []
+depends_on:
+  - G-265
+  - G-266
+  - G-267
+  - G-268
 complexity: low
 risk: low
 priority: normal

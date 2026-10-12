@@ -4,7 +4,11 @@ title: provider 실행 환경과 설정 관측의 단일 전달
 sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-085] Codex Claude 인증 전용 자동 실행 환경.md
-depends_on: []
+depends_on:
+  - G-265
+  - G-266
+  - G-267
+  - G-268
 complexity: medium
 risk: high
 priority: high

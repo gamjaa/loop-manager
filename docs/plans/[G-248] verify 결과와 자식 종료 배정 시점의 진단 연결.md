@@ -5,7 +5,11 @@ sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-065] 실제 부하 기반 verify 병렬 실행.md
   - docs/requirements/[R-067] 프로젝트 공통 verify 실행 규약.md
-depends_on: []
+depends_on:
+  - G-265
+  - G-266
+  - G-267
+  - G-268
 complexity: medium
 risk: low
 priority: normal

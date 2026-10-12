@@ -9,6 +9,10 @@ sources:
 depends_on:
   - G-255
   - G-242
+  - G-265
+  - G-266
+  - G-267
+  - G-268
 complexity: high
 risk: high
 priority: high
