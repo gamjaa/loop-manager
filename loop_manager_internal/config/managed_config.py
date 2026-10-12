@@ -22,6 +22,7 @@ class ManagedConfig:
     refactoring_review_interval: int = 20
     verify_timeout_seconds: int = 600
     verify_parallelism: str | int = "auto"
+    verify_partial: bool = False
     fast_mode_values: tuple[tuple[str, str], ...] = ()
 
     @property
@@ -168,6 +169,10 @@ def load_managed_config(path: Path) -> ManagedConfig:
             "[telegram] token과 chat_id는 둘 다 비우거나 둘 다 설정해야 합니다."
         )
 
+    raw_partial = _setting(parser, "loop", "verify_partial", fallback="false").lower()
+    if raw_partial not in configparser.ConfigParser.BOOLEAN_STATES:
+        raise ManagedConfigError("[loop] verify_partial은 boolean이어야 합니다.")
+
     return ManagedConfig(
         path=resolved,
         max_workers=max_workers,
@@ -176,6 +181,7 @@ def load_managed_config(path: Path) -> ManagedConfig:
         refactoring_review_interval=refactoring_review_interval,
         verify_timeout_seconds=verify_timeout_seconds,
         verify_parallelism=verify_parallelism,
+        verify_partial=configparser.ConfigParser.BOOLEAN_STATES[raw_partial],
         fast_mode_values=tuple((provider, parser._sections.get(provider, {}).get("fast_mode", ""))
                                for provider in ("codex", "claude")),
     )

@@ -40,6 +40,20 @@ adapter version 1의 범위는 Python 3.11–3.14 stdlib unittest이다. [공식
 
 적합성 unit test는 [test_verify_contract.py](../tests/test_verify_contract.py)와 기존 [test_verify_runtime.py](../tests/test_verify_runtime.py)의 fixture·native 결과·pool 경계를 사용한다. 선언·manifest 누락/중복/버전, run·단계·단위 identity, 부분 결과, 직렬 예산, 프로젝트 interpreter 전달, 필수 명령 종료 코드, 시작 실패·종료 불명·진단 보존을 확인한다. 합성 결과와 mock 통과는 실제 프로세스·OS 격리·언어 독립성의 근거가 아니다. 로컬 targeted 검증 환경은 Python 3.12/Linux이며 다른 Python 버전·Windows/macOS의 실제 실행, 동시 verify·timeout/cancel·성능 비교는 Manager의 후속 검증으로 확인한다.
 
+## 영향 기반 부분 실행
+
+Manager의 `[loop] verify_partial = true`는 자체 저장소의 일반 작업에서 부분 verify → 일반 선행 Reviewer → 실제 전체 verify를 선택하는 opt-in이다. 기본값은 false다. 수동 제출·waiver·문서 draft·R-082 문서 변경 선행 Review는 기존 경로를 유지한다. 실제 Reviewer instruction/provider/model/effort·환경/정책 identity를 제공하는 검증된 관측 port가 없으면 부분 실행 전에 기존 전체 verify → Reviewer로 fallback한다. 현재 provider 조립은 이 port를 제공하지 않으며 G-262/263/264와 연계한 실제 환경 관측이 필요하다. 정적 profile이나 격리 버전 이름으로 그 identity를 합성하지 않는다.
+
+runner의 `--partial-base <commit>` 또는 Manager가 전달하는 `LOOP_MANAGER_VERIFY_PARTIAL_BASE`는 같은 전체 discovery manifest에서 영향받은 모듈만 실행한다. 검증 설정은 기존 `scripts/verify.json`을 사용한다. 지원하는 단계 배치는 처음에 하나의 unittest tests 단계와 그 뒤의 command 단계다. 전체 검증의 후속 필수 command는 나중의 전체 실행에서 수행한다. 일반 전체 실행의 Manager는 상속된 부분 실행 환경값을 제거한다.
+
+선택기는 base/HEAD 양쪽의 모든 tracked Python body를 AST로 분석하고 변경 테스트와 직접·역방향 간접 소비자를 manifest 모듈로 정규화한다. 삭제·rename·패키지 이동의 과거 그래프도 포함한다. 어느 쪽 tree라도 동적 참조·reflection·미해결 참조가 있거나, 공유 support·고위험 공통 코드·공개 계약·패키지 초기화·진입점·비Python 입력이 변경되면 fallback한다. 테스트 모듈 수 또는 테스트 ID 수의 절반 이상을 고르거나 대상이 없어도 fallback한다. 이 규칙은 보수적인 실행 선택 기준이며 성능 성공 기준이 아니다. `query_worktree()`의 요청 파일만의 incoming 관계를 완전한 그래프로 사용하지 않는다.
+
+`partial-result.json`은 `kind: partial_verify`, run identity, PASS/FAIL/FALLBACK/ERROR, candidate/base, 선택 모듈/테스트 ID·이유, 전체 대비 규모, 알고리즘/설정/manifest identity, 시간과 진단 경로를 보존한다. 미선택 manifest 모듈은 NOT_SELECTED이며 실행 완료나 skip을 합성하지 않는다. FALLBACK은 discovery 이후에도 테스트 모듈과 command를 실행하지 않는다. 기존 core·adapter가 fixture·skip·identity/필수 결과·serial/independent·guard·예약·자식 종료를 검사하며 timeout과 취소도 전체 검증과 같은 외부 프로세스 경계를 사용한다.
+
+부분 PASS는 전체 verify token/receipt와 분리한다. 일반 선행 Review의 최종 승격도 모든 후보·검토 입력·환경/정책과 해당 선행 승인 뒤 실행한 실제 전체 verify receipt ID가 확인될 때만 가능하며 게시 직전 재확인한다. 관측 port는 현재 준비된 입력뿐 아니라 `invocation_id`가 주어진 경우 그 실제 Reviewer 호출의 고정 instruction/profile·실행 환경/정책을 증명해야 한다. 현재 설정을 과거 호출의 identity로 소급 채택하지 않는다. 실제 호출 identity·사전/사후 현재 identity가 모두 같아야 하며 호출 증거 부재·실패·변경·중단은 기존 경로로 처리한다. 이 경로는 G-183의 최종 승인 재사용, G-241의 전체 검증 생략, G-250 병렬 최적화를 구현하지 않는다.
+
+실행 자료는 verify 로그와 SQLite `preliminary_reviews`, 기존 Agent invocation/사용량 ledger에 결합된다. 부분·전체 시간, 모듈/테스트 규모, 부분 PASS 이후 전체 FAIL, 선행 FAIL의 전체 verify 미호출과 fallback 사유를 구분한다. 선행 호출 purpose는 `preliminary_review`이며 실제 실행/토큰과 재사용을 구분한다. 실제 운영 기록 없이 절감 시간·토큰 또는 완료 시간 개선률을 만들지 않는다.
+
 ## adapter 추가 경계
 
 필요한 프로젝트의 계획에서 도구의 공식 수집·native reporter·지원 버전·독립 단위·내부 병렬 제어 근거를 먼저 확인한다. 정적 registry metadata와 adapter 구현을 추가하고 공통 core의 자원 계산·예약·정리 코드를 재사용한다. adapter는 수집된 고유 단위/테스트 identity를 제공하며 run·단계·단위 version을 결합한 결과의 완결성과 native 실패·오류·skip 의미를 검증한다. 실행 중 등록되는 테스트가 있는 도구는 예상 범위와 등록된 결과의 관계를 별도 검증해야 한다. 자유 형식 stdout 추측이나 command 종료 코드로 테스트 범위 검증을 대신하지 않는다.

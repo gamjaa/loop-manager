@@ -49,6 +49,8 @@ Manager는 Worker, Manager verify, Reviewer 진입 전에 등록된 origin의 �
 
 Reviewer에는 기존 verify가 확인한 후보·입력·조건과 새 조건에 대한 검증 여부를 구분해 전달한다. 이전 문서 기준의 PASS만 남아 있으면 참고 근거로 제공하되, 변경된 조건의 검증 성공으로 표시하지 않는다. 검증만 부족한 결과를 구현 부족으로 일괄 처리하지 않으며, 필요한 테스트 작성·수정·실행은 기존 역할의 권한과 책임을 따른다.
 
+이 문서의 선행 Review는 관련 원격 문서 변경에 대한 판단이다. PASS/VERIFY_REQUIRED는 검증 보완 이후에도 자동으로 최종 승인으로 승격하지 않는다. R-086의 영향 기반 부분 verify 뒤 일반 선행 Review와 증거·수명을 구분하며, 일반 선행 승인 재사용 조건을 이 문서 변경 결과에 적용하지 않는다.
+
 ### rebase 충돌과 구현 조건 변경
 
 Worker의 최초 진입·재개·교정 진입은 필요한 일반 Planner 갱신·게시 후 최신 base의 작업 조건을 작업 branch에 반영하는 순서로 진행한다. Manager가 rebase를 수행하고 아래 기준으로 충돌을 분리한다. 계획·작업 문서는 Requirement·ExecPlan을 뜻하며 PRODUCT·ARCHITECTURE·공통 지침과 그 밖의 문서·코드·테스트·설정은 그 외 파일에 속한다.

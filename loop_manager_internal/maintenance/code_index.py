@@ -131,9 +131,13 @@ def parse_source(path: str, content: bytes) -> dict:
     return facts
 
 
-def resolve(facts: dict, paths) -> dict:
+def resolve(facts: dict, paths, *, module_aliases=None) -> dict:
     """Re-resolve unchanged import declarations after moves/additions/deletions."""
     modules = {module_name(path): path for path in sorted(paths) if path.endswith((".py", ".pyi"))}
+    for name, path in (module_aliases or {}).items():
+        if name in modules and modules[name] != path:
+            raise ValueError("ambiguous import path: " + name)
+        modules[name] = path
     roots = {name.split(".", 1)[0] for name in modules}
     result = {}
     for path, original in sorted(facts.items()):

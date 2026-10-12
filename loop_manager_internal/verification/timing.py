@@ -305,7 +305,8 @@ def comparison(directories, summaries):
              for stage in modules.get("stages", [])]))
         if isinstance(modules, dict):
             modules = [unit for stage in modules.get("stages", []) for unit in stage.get("units", [])]
-        scopes.append(tuple(identity for module in modules for identity in module["ids"]))
+        scopes.append(tuple(identity for module in modules
+                            if module.get("status") != "NOT_SELECTED" for identity in module["ids"]))
         metadata = summary["metadata"]
         environment = metadata.get("environment", {})
         limits = environment.get("limits", {})
@@ -339,6 +340,7 @@ def comparison(directories, summaries):
                     nested_fixture_phases.add(child_index)
                     break
         runs.append({"directory": str(directory), "revision": metadata.get("revision"), "cap": metadata.get("cap"),
+                     "mode": metadata.get("mode", "full"),
                      "seconds": duration("verify_process") if duration("verify_process") is not None else duration("verify"),
                      "git_fixture_seconds": sum(value for index, value in fixture_durations
                                                  if index not in nested_fixture_phases),

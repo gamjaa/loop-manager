@@ -3,7 +3,7 @@ id: G-264
 title: Claude 인증 재사용과 사용자 설정 source 제외
 sources:
   - docs/PRODUCT.md
-  - docs/requirements/[R-085] Codex Claude 인증 전용 자동 실행 환경.md
+  - docs/requirements/[R-085] Codex·Claude 인증 전용 자동 실행 환경.md
 depends_on:
   - G-262
   - G-191

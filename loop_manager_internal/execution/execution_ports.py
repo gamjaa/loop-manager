@@ -159,6 +159,7 @@ class ExecutionLifecyclePortsEffects:
     validate_planner_result: Callable[..., object]
     _assert_mutable_ready_snapshot_current: Callable[..., object]
     git_bytes: Callable[..., bytes] | None = None
+    pre_review_identity: Callable[..., object] | None = None
 
 
 def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, connection, runtime_repository, **identity):
@@ -178,6 +179,11 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
                              verify_timeout_seconds=verify_timeout_seconds,
                              verify_parallelism=verify_settings.cap if verify_settings else 'auto')
     state.manual = manual
+    def partial_enabled(worktree):
+        from loop_manager_internal.config.managed_config import load_managed_config
+        return (Path(identity['config_path']).is_file()
+                and load_managed_config(identity['config_path']).verify_partial
+                and dependencies.is_loop_manager_repository(worktree))
     def workspace_identity(state_dir, repo, plan_id, branch, worktree):
         return dependencies.validate_execplan_workspace_identity(state_dir, repo,
             manual.store.workspace_owner(repo, plan_id), branch, worktree)
@@ -259,6 +265,11 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
             ),
         ),
         validation=execution_handlers.ValidationEffects(
+            partial_verify_enabled=partial_enabled,
+            partial_verify=state.bind(lambda worktree, base: dependencies.verify(
+                worktree, verify_timeout_seconds, partial_base=base),
+                name="partial_verify", connected=False, mutates=False),
+            pre_review_identity=dependencies.pre_review_identity,
             observe_verify_inputs=state.bind(
                 result_validation.observe_verify_inputs,
                 name="observe_verify_inputs", connected=False, mutates=False,

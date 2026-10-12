@@ -12,6 +12,10 @@ def deserialize(value: object) -> dict:
     if not isinstance(state, dict):
         raise RuntimeError('저장된 Review 교정 상태가 유효하지 않습니다.')
     candidate = state.get('candidate')
+    for turn in (candidate, state.get('pending')):
+        if isinstance(turn, dict) and 'partial_head' in turn and (
+                not isinstance(turn['partial_head'], str) or not turn['partial_head']):
+            raise RuntimeError('저장된 부분 검증 후보가 유효하지 않습니다.')
     if candidate is not None and (
         not isinstance(candidate, dict)
         or type(candidate.get('level')) is not int or not 1 <= candidate['level'] <= 8
@@ -43,7 +47,8 @@ def deserialize(value: object) -> dict:
                     or not event['level'] <= event['effective_level'] <= min(8, event['level'] + 1)
                     or (event['kind'] == 'correction' and (
                         type(event.get('source_review_id')) is not int or event['source_review_id'] < 1
-                        or not isinstance(event.get('verified_head'), str) or not event['verified_head']))):
+                        or not (isinstance(event.get('verified_head'), str) and event['verified_head']
+                                or isinstance(event.get('partial_head'), str) and event['partial_head'])))):
                 raise RuntimeError('저장된 Review 교정 감사가 유효하지 않습니다.')
         pending = state.get('pending')
         if pending is not None and (
@@ -93,6 +98,7 @@ def begin_worker(connection: sqlite3.Connection, repo: str, plan_id: str,
         pending = {'source': source, 'level': level, 'completed': False, 'verified_head': None}
     if pending is not None:
         pending.update(completed=False, verified_head=None)
+        pending.pop('partial_head', None)
         state['pending'] = pending
     save(connection, repo, plan_id, state)
 
@@ -103,8 +109,10 @@ def complete_worker(connection: sqlite3.Connection, repo: str, plan_id: str, lev
     pending = state.get('pending')
     if candidate is not None and candidate['level'] == level:
         candidate.update(completed=True, verified_head=None)
+        candidate.pop('partial_head', None)
     if pending is not None and pending['level'] == level:
         pending.update(completed=True, verified_head=None)
+        pending.pop('partial_head', None)
     if candidate is not None or pending is not None:
         save(connection, repo, plan_id, state)
 
@@ -118,4 +126,17 @@ def verified(connection: sqlite3.Connection, repo: str, plan_id: str, head: str)
     if pending is not None and pending['completed']:
         pending['verified_head'] = head
     if candidate is not None or pending is not None:
+        save(connection, repo, plan_id, state)
+
+
+def partially_verified(connection, repo, plan_id, head):
+    """Link a completed correction to partial evidence without setting verified_head."""
+    state = load(connection, repo, plan_id)
+    changed = False
+    for key in ('candidate', 'pending'):
+        turn = state.get(key)
+        if turn and turn['completed']:
+            turn['partial_head'] = head
+            changed = True
+    if changed:
         save(connection, repo, plan_id, state)
