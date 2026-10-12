@@ -295,7 +295,7 @@ class CandidateEnvironmentTests(unittest.TestCase):
         self.assertTrue(entries[0].endswith('child_guard'))
 
     def test_sitecustomize_and_candidate_import_share_protection_in_nested_python(self):
-        # Fresh Python is needed to observe sitecustomize before a different package import.
+        # Isolate the harness from an older Manager guard before observing real child startup.
         from loop_manager_internal.verification import guard
         import subprocess
         with tempfile.TemporaryDirectory() as directory:
@@ -342,7 +342,18 @@ print('protected')
                 'LOOP_MANAGER_VERIFY_SECRET': 'private-test-value',
                 'PYTHONDONTWRITEBYTECODE': '1',
             })
-            result = subprocess.run([sys.executable, '-c', code, str(root)], cwd=root,
+            bootstrap = """
+import runpy, subprocess, sys
+current = runpy.run_path(sys.argv[1])
+current['install_guard']()
+result = subprocess.run([sys.executable, '-c', sys.argv[3], sys.argv[2]],
+                        capture_output=True, text=True, timeout=10)
+sys.stdout.write(result.stdout)
+sys.stderr.write(result.stderr)
+sys.exit(result.returncode)
+"""
+            result = subprocess.run([sys.executable, '-I', '-B', '-c', bootstrap,
+                                     str(Path(guard.__file__).resolve()), str(root), code], cwd=root,
                                     env=environment, capture_output=True, text=True, timeout=10)
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.strip(), 'protected')
