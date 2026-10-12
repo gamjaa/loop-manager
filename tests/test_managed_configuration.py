@@ -19,6 +19,7 @@ from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.config.managed_config import ManagedConfig, ManagedConfigError, load_managed_config
 from loop_manager_internal.runtime import project_registry
 from tests.support.fixed_samples import PROJECT_FILES
+from tests.support.git import git_command
 
 
 @isolated_git_test
@@ -96,12 +97,15 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
                                       for relative in protected_files})
 
     def _git(self, root: Path, *arguments: str) -> None:
-        subprocess.run(
-            ["git", "-C", str(root), *arguments],
-            check=True,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-        )
+        git_command(root, *arguments)
+
+    def test_git_adapter_delegates_to_shared_command(self):
+        repo = Path("/fixture/repository")
+        with mock.patch.object(sys.modules[__name__], "git_command", return_value="ignored") as command, \
+             mock.patch("subprocess.Popen", side_effect=AssertionError("unexpected Git subprocess")) as process:
+            self.assertIsNone(self._git(repo, "status", "--porcelain"))
+        command.assert_called_once_with(repo, "status", "--porcelain")
+        process.assert_not_called()
 
     def _commit(self, root: Path, message: str) -> None:
         self._git(root, "add", "-A")
@@ -458,12 +462,7 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             parent = Path(directory)
             remote = parent / "remote.git"
             root = parent / "repo"
-            subprocess.run(
-                ["git", "init", "--bare", "--initial-branch=main", str(remote)],
-                check=True,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-            )
+            git_command(parent, "init", "--bare", "--initial-branch=main", str(remote))
             root.mkdir()
             self._project_files(root)
             self._git(root, "remote", "add", "origin", str(remote))
@@ -490,12 +489,7 @@ Registration recovery fixture.
                 encoding="utf-8",
             )
             self._commit(root, "Add historical plan")
-            publication_sha = subprocess.run(
-                ["git", "-C", str(root), "rev-parse", "HEAD"],
-                check=True,
-                text=True,
-                stdout=subprocess.PIPE,
-            ).stdout.strip()
+            publication_sha = git_command(root, "rev-parse", "HEAD")
             self._git(root, "push", "origin", "main")
             archive = plans / "archive"
             archive.mkdir()
@@ -549,10 +543,7 @@ Registration recovery fixture.
             parent = Path(directory)
             remote = parent / "remote.git"
             root = parent / "repo"
-            subprocess.run(
-                ["git", "init", "--bare", "--initial-branch=main", str(remote)],
-                check=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            )
+            git_command(parent, "init", "--bare", "--initial-branch=main", str(remote))
             root.mkdir()
             self._project_files(root)
             self._git(root, "remote", "add", "origin", str(remote))
