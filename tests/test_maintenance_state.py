@@ -667,7 +667,7 @@ class GeneratedDraftCommandTest(unittest.TestCase):
         self.database.row_factory = sqlite3.Row
         self.database.executescript(loop_manager.SCHEMA)
         loop_manager._ensure_execplans_schema(self.database)
-        self.repository = Path("/repo")
+        self.repository = (Path(self.temporary.name) / "repo").resolve()
         self.repo = str(self.repository)
         self.database.execute(
             "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
