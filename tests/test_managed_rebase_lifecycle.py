@@ -31,6 +31,7 @@ from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, Rec
 from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.execution.worker_session import SessionBinding
 from tests.support import execution as policy_fixture
+from tests.support.git import isolated_git_test
 
 
 class SimulatedProcessExit(BaseException):
@@ -201,6 +202,7 @@ class RebaseObservationFailureTests(unittest.TestCase):
 
 
 @unittest.skipIf(os.name == "nt", "Linux mode-bit and bash verification fixture")
+@isolated_git_test
 class ManagedRebaseLifecycleTests(unittest.TestCase):
     def test_conflict_record_change_survives_database_restart_and_resumes_same_worker(self):
         self._lifecycle(with_pr=False, definition_change='record')

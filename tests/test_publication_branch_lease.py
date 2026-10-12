@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
-from tests.support.git import git_command, commit_and_push
+from tests.support.git import git_command, commit_and_push, isolated_git_test
 from tests.support.worker import worker_result
 from tests.support.publication import seed_validated_candidate
 from tests.support.worker import dummy_worker_sessions
@@ -15,6 +15,7 @@ from tests.support.worker import dummy_worker_sessions
 class PublicationBranchLeaseTestFixture(PublicationFixture):
     pass
 
+@isolated_git_test
 class PublicationLeaseRaceTests(PublicationBranchLeaseTestFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_remote_branch_push_interruption_recovers_without_another_push(self):
@@ -310,6 +311,7 @@ class PublicationLeaseRaceTests(PublicationBranchLeaseTestFixture, unittest.Test
         self.assertEqual(pushes, [])
 
 
+@isolated_git_test
 class PublicationPrObservationTests(PublicationBranchLeaseTestFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_existing_open_closed_reopened_and_merged_prs_are_reused(self):

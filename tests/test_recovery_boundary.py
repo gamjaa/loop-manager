@@ -6,13 +6,14 @@ import sqlite3
 import unittest
 from unittest import mock
 
-from tests.support.git import make_remote_repository, git_command, _remote_repository_seed
+from tests.support.git import make_remote_repository, git_command, _remote_repository_seed, isolated_git_test
 from tests.support.recovery_boundary import RecoveryBoundary
 from loop_manager_internal.verification.git_timing import git_command_timing
 from loop_manager_internal.verification.timing import EventWriter, phase, summarize
 import loop_manager as manager
 
 
+@isolated_git_test
 class RecoveryBoundaryTests(unittest.TestCase):
     def test_reused_preparation_reduces_commands_including_copy_and_validation(self):
         # 두 비교 모두 기존 초기 저장소 seed가 준비된 동일 조건이다.

@@ -17,6 +17,7 @@ from loop_manager_internal.storage import execution_checkpoint_state
 from loop_manager_internal.execution.execution_checkpoint import (
     CheckpointAction, CheckpointSnapshot, assess, observe,
 )
+from tests.support.git import isolated_git_test
 
 
 def snapshot(**changes):
@@ -38,6 +39,7 @@ def snapshot(**changes):
     return CheckpointSnapshot(**values)
 
 
+@isolated_git_test
 class CheckpointAssessmentTests(unittest.TestCase):
     def test_published_owner_requires_commit_tree_and_exact_live_ref(self):
         row = {

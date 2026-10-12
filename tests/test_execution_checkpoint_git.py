@@ -14,6 +14,10 @@ from loop_manager_internal.execution.execution_checkpoint import CheckpointActio
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 
 
+from tests.support.git import isolated_git_test
+
+
+@isolated_git_test
 class AutostashCheckpointGitTests(unittest.TestCase):
     def test_zero_exit_rebase_retains_unmerged_index_after_metadata_removed(self):
         with tempfile.TemporaryDirectory() as directory:

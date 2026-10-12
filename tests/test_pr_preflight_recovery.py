@@ -4,9 +4,10 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
-from tests.support.git import git_command
+from tests.support.git import git_command, isolated_git_test
 
 
+@isolated_git_test
 class PrPreflightRecoveryTest(PrRecoveryFixture, unittest.TestCase):
     def test_legacy_ignored_only_preflight_block_recovers_to_pr_open(self):
         with tempfile.TemporaryDirectory() as directory:

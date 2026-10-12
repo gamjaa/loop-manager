@@ -14,11 +14,12 @@ from loop_manager_internal.agents.agent_invocation import ResolvedProfile
 from loop_manager_internal.execution.manual_candidate import ManualCandidate
 from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
 from tests.support.manual_work import ManualWorkFixture, completion, generated
-from tests.support.git import git_command
+from tests.support.git import git_command, isolated_git_test
 from tests.support.recovery_boundary import RecoveryBoundary
 from types import SimpleNamespace
 
 
+@isolated_git_test
 class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
     def candidate(self, service, plan_id):
         return ManualCandidate(service.connection,service.repo,plan_id,service.effects.git,
@@ -863,7 +864,9 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
     def test_reviewer_prompt_distinguishes_a_valid_user_verify_waiver(self):
         from types import SimpleNamespace
         from tests.support.execution import execution_fixture
-        from loop_manager_internal.execution.manual_candidate import ManualCandidate, candidate_token, stage_input_tokens
+        from loop_manager_internal.execution.manual_candidate import (
+            MANUAL_TEST_EVIDENCE, ManualCandidate, candidate_token, stage_input_tokens,
+        )
         from loop_manager_internal.agents.agent_invocation import AgentResult, ResolvedProfile
         from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
         from loop_manager_internal.storage import verify_receipts
@@ -890,7 +893,12 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
         group = store.for_plan(fixture.repo, 'G-047')
 
         def candidate_git(_path, *args, **_kwargs):
-            value = head if args == ('rev-parse', 'HEAD') else base
+            if args == ('rev-parse', 'HEAD'):
+                value = head
+            elif args == ('rev-parse', 'refs/remotes/origin/main'):
+                value = base
+            else:
+                raise AssertionError(f'unexpected manual candidate Git: {args}')
             return SimpleNamespace(stdout=value, returncode=0)
 
         config_path = Path(self.enterContext(tempfile.TemporaryDirectory())) / 'operational-config.ini'
@@ -949,7 +957,9 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
         fixture.handler._document_draft = lambda _context: None
         fixture.handler._document_review_prompt = lambda prompt, _draft: prompt
 
-        outcome = fixture.handler.review(context)
+        with mock.patch('subprocess.Popen', side_effect=AssertionError(
+                'unexpected manual candidate process')):
+            outcome = fixture.handler.review(context)
 
         self.assertEqual(outcome.kind, loop_manager.ExecutionOutcomeKind.PHASE_ADVANCED)
         fixture.effects.validation.verify.assert_not_called()
@@ -966,6 +976,11 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
         self.assertEqual(fixture.connection.execute(
             "SELECT result FROM manual_work_results WHERE stage='review'"
         ).fetchone()['result'], 'PASS')
+        publication = candidate.publication('', fixture.plan, lambda *_: self.fail(
+            'manual candidate should not use Worker publication data'))
+        self.assertEqual(publication.test_evidence, MANUAL_TEST_EVIDENCE)
+        self.assertNotIn('targeted test: PASS', publication.summary)
+        self.assertIsNone(fixture.state.row()['worker_result'])
 
     def test_grant_expires_for_environment_new_sha_and_new_default_request(self):
         with tempfile.TemporaryDirectory() as directory:

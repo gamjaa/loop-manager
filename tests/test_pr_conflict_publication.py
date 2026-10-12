@@ -4,11 +4,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
-from tests.support.git import git_command
+from tests.support.git import git_command, isolated_git_test
 from tests.support.publication import seed_validated_candidate
 from tests.support.worker import dummy_worker_sessions
 
 
+@isolated_git_test
 class PrConflictPublicationTest(PrRecoveryFixture, unittest.TestCase):
     @dummy_worker_sessions
     def test_external_remote_head_change_blocks_without_push(self):

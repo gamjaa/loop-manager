@@ -9,6 +9,7 @@ from unittest import mock
 
 from loop_manager_internal.recovery import blocked_remote_observation as observation
 import loop_manager
+from tests.support.git import isolated_git_test
 
 
 def git(repo: Path, *args: str) -> str:
@@ -18,6 +19,7 @@ def git(repo: Path, *args: str) -> str:
     ).stdout.strip()
 
 
+@isolated_git_test
 class BlockedRemoteObservationTest(unittest.TestCase):
     def setUp(self) -> None:
         temporary = tempfile.TemporaryDirectory()
