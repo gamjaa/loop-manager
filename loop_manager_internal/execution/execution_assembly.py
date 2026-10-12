@@ -61,6 +61,7 @@ def recovery(effects: ExecutionEffects, identity: ExecutionIdentity,
         state=effects.state,
         recovery=recovery,
         _row=callbacks["_row"],
+        capture_git_snapshot=effects.agent.capture_git_snapshot,
     ))
 
 

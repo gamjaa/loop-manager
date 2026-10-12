@@ -134,6 +134,7 @@ class ExecutionFixture:
         self.effects.agent.validate_worker_workspace_scope.return_value = self.plan
         self.effects.agent.capture_git_snapshot.return_value = SimpleNamespace(
             head='owned-head', branch='loop-manager/G-047',
+            index={},
             dirty={'app.py': (('staged',), 'accepted-content')},
         )
         self.effects.validation.validate_active_execplan_metadata.return_value = self.plan

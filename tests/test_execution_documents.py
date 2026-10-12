@@ -13,9 +13,88 @@ from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, 
 
 from tests.support.execution_recovery_scenarios import ExecutionRecoveryScenarios
 from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
+from dataclasses import replace
 
 
 class ExecutionDocumentsTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+    def test_document_reports_are_corrected_before_verify_and_review(self):
+        patches = {'docs/PRODUCT.md': '-old product\n+new product\n',
+                   'docs/ARCHITECTURE.md': '-old design\n+new design\n'}
+        original_git = self.effects.workspace.git.side_effect
+        def git(worktree, *args, **kwargs):
+            if args[:2] == ('remote', 'get-url'):
+                return SimpleNamespace(stdout='git@github.com:org/project.git', returncode=0)
+            if args[0] == 'diff':
+                output = ('M\0docs/PRODUCT.md\0M\0docs/ARCHITECTURE.md\0' if '--name-status' in args
+                          else patches[args[-1]])
+                return SimpleNamespace(stdout=output, returncode=0)
+            return original_git(worktree, *args, **kwargs)
+        self.effects.workspace.git.side_effect = git
+        self.state.update_project('repo', verify_result='old PASS', review_result='VERDICT: PASS',
+                                  verify_token='old-verify', review_token='old-review')
+        self.handler.run(self.context())
+        self.assertIsNone(self.state.row()['verify_token'])
+        self.assertIsNone(self.state.row()['review_token'])
+        self.effects.validation.parse_worker_result.return_value.summary = CommonGuidancePrReportTests.explanation(
+            'docs/PRODUCT.md', patches['docs/PRODUCT.md'])
+        result = self.handler.verify(self.context(), self.handler)
+        self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(self.state.row()['phase'], 'WORKING')
+        self.assertIn('docs/ARCHITECTURE.md', self.state.row()['last_error'])
+        self.assertIn('docs/PRODUCT.md', self.state.row()['last_error'])
+        self.assertNotIn('verify', self.calls)
+        self.assertNotIn('reviewer', self.calls)
+        self.assertFalse(self.connection.execute('SELECT 1 FROM verify_receipts').fetchone())
+        self.effects.validation.parse_worker_result.return_value.summary = '\n'.join(
+            CommonGuidancePrReportTests.explanation(path, patch) for path, patch in patches.items())
+        self.handler.run(self.context())
+        result = self.handler.verify(self.context(), self.handler)
+        self.assertEqual(result.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
+        self.assertEqual(self.state.row()['phase'], 'REVIEWING')
+        self.assertEqual(self.calls.count('verify'), 1)
+
+    def test_worker_correction_counts_ignore_validation_logs_and_sessions(self):
+        context = self.handler.guard(self.context())
+        definition = self.handler._definition_snapshot
+        outcomes = []
+        for attempt in range(3):
+            output = f'PASS time={attempt}; diagnostics=/tmp/run-{attempt}/test.log'
+            self.state.update_project('repo', worker_session_id=f'worker-{attempt}',
+                reviewer_session_id=f'reviewer-{attempt}', verify_result=output,
+                verify_token=definition.verify_token('base', 'owned-head', output),
+                review_token=definition.review_token('base', 'owned-head'))
+            outcomes.append(self.handler._recover(handlers.RecoveryReason.WORKER_CORRECTION,
+                                                  'missing document explanation', context=context))
+        self.assertEqual([item.recovery.occurrence for item in outcomes], [1, 2, 3])
+        self.assertEqual(outcomes[-1].kind, ExecutionOutcomeKind.FINAL_BLOCK)
+        self.effects.blocking.block_active_execplan.assert_called_once()
+
+    def test_worker_correction_distinguishes_candidate_definition_and_base(self):
+        context = self.handler.guard(self.context())
+        candidate = self.effects.agent.capture_git_snapshot.return_value
+        def occurrence():
+            return self.handler._recover(handlers.RecoveryReason.WORKER_CORRECTION,
+                'same error', context=context).recovery.occurrence
+        self.assertEqual(occurrence(), 1)
+        self.assertEqual(occurrence(), 2)
+        candidate.head = 'changed-head'
+        self.assertEqual(occurrence(), 1)
+        candidate.dirty['app.py'] = (('unstaged',), 'new-content')
+        self.assertEqual(occurrence(), 1)
+        candidate.index = {'app.py': ('new-staged-content',)}
+        self.assertEqual(occurrence(), 1)
+        self.handler._definition_snapshot = replace(self.handler._definition_snapshot, body_hash='new-spec')
+        self.assertEqual(occurrence(), 1)
+        self.state.update_project('repo', active_sha='new-base')
+        self.assertEqual(occurrence(), 1)
+
+    def test_worker_correction_snapshot_failure_preserves_retry(self):
+        self.effects.agent.capture_git_snapshot.side_effect = RuntimeError('cannot observe candidate')
+        result = self.handler._recover(handlers.RecoveryReason.WORKER_CORRECTION,
+                                      'same error', context=self.context())
+        self.assertEqual(result.recovery.observation.reason, handlers.RecoveryReason.STATUS_FAILED)
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
     def test_draft_decision_race_reports_stored_decision(self):
         drafts = object.__new__(handlers.document_drafts.DocumentDraftRepository)
         drafts.connection = mock.Mock()
@@ -202,6 +281,24 @@ class ExecutionDocumentsTests(ExecutionRecoveryScenarios, ExecutionPhaseScenario
 
 
 class CommonGuidancePrReportTests(TestCase):
+    def test_all_missing_changed_and_malformed_reports_are_returned_together(self):
+        from loop_manager_internal.documents.pr_description import common_guidance_report, DocumentReportError
+        patches = {'docs/PRODUCT.md': '-old product\n+new product\n',
+                   'docs/ARCHITECTURE.md': '-old design\n+new design\n'}
+        for summary in ('', '\n'.join(self.explanation(path, 'old patch') for path in patches),
+                        self.explanation('docs/PRODUCT.md', 'old patch') + '\nDOCUMENT_CHANGE: invalid'):
+            with self.subTest(summary=summary):
+                git = mock.Mock(side_effect=[SimpleNamespace(stdout='M\0docs/PRODUCT.md\0M\0docs/ARCHITECTURE.md\0'),
+                    *[SimpleNamespace(stdout=patch) for patch in patches.values()]])
+                with self.assertRaises(DocumentReportError) as raised:
+                    common_guidance_report(git, Path('/candidate'), 'base', 'head',
+                                           'git@github.com:org/project.git', summary)
+                for path, patch in patches.items():
+                    self.assertIn(path, str(raised.exception))
+                    self.assertIn(hashlib.sha256(patch.encode()).hexdigest(), str(raised.exception))
+                self.assertIn('변경 문서 전체', str(raised.exception))
+                self.assertEqual(git.call_count, 3)
+
     @staticmethod
     def explanation(path, patch, reason='Align implementation contracts', impact='Document accepted behavior'):
         import json

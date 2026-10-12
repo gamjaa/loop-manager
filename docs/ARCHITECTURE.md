@@ -474,6 +474,8 @@ manifest·이벤트·결과는 version·run·단계·단위/테스트 identity�
 
 ## 검증과 재시도
 
+문서 보고 교정의 변경 요구는 [R-087](requirements/%5BR-087%5D%20문서%20보고%20교정%20반복%20제한.md)을 따른다. 구현 목표는 후보 커밋·최신 base 조정 뒤 전체/부분 검증과 성공 receipt 재사용 판단 전에 최종 문서 보고를 검사하고 게시 직전에도 다시 확인하는 것이다. Worker 교정의 반복 식별은 후보 HEAD·index·dirty 내용 지문, 현재 명세 입력과 base로 결합하며 검증 출력·Agent 세션은 진전으로 보지 않는다. 기존 verify token의 출력 결합과 입력 재관측·receipt·Review gate는 유지한다.
+
 - Worker는 구현과 관련 targeted unit test를 작성하고, 수정 범위에 직접 관련된 최소 unit test command만 실행한다
 - targeted unit test 실패는 Worker가 같은 세션에서 수정하고 재실행한다. 실행 가능한 관련 unit test가 없는 변경은 사유를 남기며 전체 검증을 생략하는 근거로 사용하지 않는다
 - Worker는 현재 운영체제용 verify 스크립트가 없으면 생성하고 테스트 명령이 바뀌면 갱신한다
