@@ -88,6 +88,24 @@ class PlanningSelectionService(PlanningService):
                 return PlanningOutcome(PlanningOutcomeKind.EXECUTION_READY, base_sha=run.base_sha)
             if getattr(decision, "project_blocked", False):
                 return PlanningOutcome(PlanningOutcomeKind.WAITING)
+        correction_context = (
+            f"{run.maintenance_cycle.phase.value}:{run.maintenance_cycle.revision}"
+            if run.maintenance_planning else "general"
+        )
+        if (
+            row.phase == "PLANNING"
+            and row.planning_workspace_owned == 1
+            and row.planning_error
+            and row.planning_error == row.planning_correction_error
+            and row.planning_error_incident_id is not None
+            and row.planning_error_incident_id == row.planning_correction_incident_id
+            and row.active_sha == row.planning_correction_sha
+            and row.planning_correction_context == correction_context
+        ):
+            # The saved correction binding authorizes fresh validation and
+            # bounded retries until that linked incident is resolved.
+            run.error_input_changed = True
+            return None
         if (row.phase == "PLANNING" and row.planning_workspace_owned == 1
                 and row.planning_result_pending_validation
                 and not row.planning_result_completed):

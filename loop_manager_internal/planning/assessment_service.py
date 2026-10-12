@@ -699,9 +699,13 @@ class PlanningAssessmentService(PlanningService):
         except PlanningResultInvalid as error:
             message = str(error)
             retry_count = row.planning_retry_count
+            recheck_context = str(row.planning_validation_error or "").startswith(
+                "현재 planning 결과의 "
+            )
             if (
                 row.planning_result_pending_validation
                 and row.planning_validation_error
+                and not recheck_context
             ):
                 retry_count += 1
             values: dict[str, object] = {

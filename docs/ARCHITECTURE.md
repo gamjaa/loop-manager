@@ -226,7 +226,7 @@ planning worktree는 `<state-dir>/worktrees/<project-id>/planning/<input-fingerp
 
 사용자가 BLOCKED의 근거 PRODUCT/Requirement를 기본 branch에서 수정한 경우 변경을 commit하고 push해야 한다. Loop Manager는 변경된 `origin/<base-branch>`를 관리 branch에 rebase한 뒤 재개한다. 작업 rebase는 관리 worktree에서 수행하며, 기본 worktree의 파일·index·HEAD는 위 부수 동기화의 안전한 FF·clean 로컬 commit rebase 조건에서만 바꾼다. 사용자는 안내된 관리 worktree의 ExecPlan을 직접 수정할 수도 있다.
 
-원격 관측은 Agent·verify가 worktree를 사용하는 동안 파일을 바꾸지 않고 다음 안전한 경계에서 적용한다. planning rebase는 작업물과 stash를 보존한 채 Git 상태를 복구하고 새 base를 SQLite에 기록한 뒤 보존 stash를 정리한다. 현재 작업의 문서 반영은 아래 경계를 따른다. 후보 HEAD가 바뀐 실행은 기존 검증·Review 증거의 재사용 자격을 다시 판단하며 게시 직전의 fast-forward·lease·PR·checkpoint 정책을 유지한다.
+원격 관측은 Agent·verify가 worktree를 사용하는 동안 파일을 바꾸지 않는다. 일반·유지보수 Planner의 작성 결과는 writer 종료 직후, 결과 검증 전에 원격 base를 다시 확인하고 기존 workspace 갱신·문서 관련성 판단·rebase journal을 적용한다. 관련 명세·ExecPlan 변경은 결과를 확정하지 않고 pending 상태로 보존해 같은 ID·작업물·session의 Planner 재평가로 돌린다. 이전 결과의 검증 교정 횟수는 최신 입력에 합산하지 않으며, 그 결과의 진단과 독립 오류·실행 이력은 보존한다. 무관한 변경은 저장 결과와 다음 단계를 유지하며 검증·재시도를 반복하지 않는다. 충돌 교정은 시작된 rebase/stash journal의 원래 target과 소유권으로 완료하고 base·작업물·journal을 확정한 뒤 원격을 다시 확인한다. 그 사이 새 base가 전진했으면 추가 rebase나 다음 Planner 판단·결과 검증을 겹치지 않고 기존 operation 완료를 보존해 다음 안전한 workspace 경계에서 최신 target을 적용한다. 원격 관측·rebase 성공은 의미 검토나 검증 성공 근거가 아니다. 현재 작업의 문서 반영은 아래 경계를 따른다. 후보 HEAD가 바뀐 실행은 기존 검증·Review 증거의 재사용 자격을 다시 판단하며 게시 직전의 fast-forward·lease·PR·checkpoint 정책을 유지한다.
 
 ### 단계별 원격 문서 반영
 

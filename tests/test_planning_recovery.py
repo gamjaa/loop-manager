@@ -233,6 +233,218 @@ class PlanningRecoveryTest(PlanningCase):
         self.assertEqual(ports.state.diagnostics[-1].planning_result, "saved result")
         self.assertEqual(ports.state.snapshot.planner_session_id, "saved-session")
 
+    def test_planner_result_refreshes_remote_before_validation_and_reuses_session(self):
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/planning",
+            planning_attempt_fingerprint="original-input", planning_workspace_owned=1,
+        ))
+        ports.git.relevant_document_changes = mock.Mock(
+            return_value=("docs/requirements/R-053 New.md",),
+        )
+        ports.state.execplan_rows = lambda _repo: [{"plan_id": "G-118", "status": "READY"}]
+        ports.validation.validate_general_result = mock.Mock(
+            return_value=ports.validation.result,
+        )
+        original_run = ports.agent.run_planner
+
+        def advance_remote_after_writer(*args, **kwargs):
+            result = original_run(*args, **kwargs)
+            ports.git.remote = "new-base"
+            return result
+
+        coordinator = PlanningLifecycleCoordinator(ports)
+        with mock.patch.object(
+            ports.agent, "run_planner", side_effect=advance_remote_after_writer,
+        ) as invoke:
+            outcome = coordinator.run(self.context)
+            self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED)
+            ports.validation.validate_general_result.assert_not_called()
+            saved = ports.state.snapshot
+            self.assertEqual(saved.active_sha, "base")
+            self.assertTrue(saved.planning_result_pending_validation)
+            self.assertTrue(saved.planning_result_completed)
+            self.assertEqual(saved.planning_result, "planner result")
+            self.assertEqual(saved.planner_session_id, "session-1")
+
+            resumed = coordinator._new_run(replace(self.context, base_sha="new-base"))
+            self.assertIsNone(coordinator._workspace._prepare_workspace(resumed))
+            saved = ports.state.snapshot
+            self.assertEqual(saved.active_sha, "new-base")
+            self.assertTrue(saved.planning_result_pending_validation)
+            self.assertFalse(saved.planning_result_completed)
+            self.assertIsNone(saved.planning_result)
+            self.assertIsNone(coordinator._assessment._run_planner_turn(resumed))
+            self.assertEqual(ports.agent.resumed_session, "session-1")
+            self.assertIsNone(coordinator._workspace._refresh_after_planner(resumed))
+            self.assertIsNone(coordinator._assessment._validate_planner_result(resumed))
+
+        self.assertEqual(invoke.call_count, 2)
+        self.assertIsNone(invoke.call_args_list[0].args[2])
+        self.assertEqual(invoke.call_args_list[1].args[2], "session-1")
+        ports.validation.validate_general_result.assert_called_once()
+
+    def test_related_remote_change_resets_only_stale_result_retry_count(self):
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/planning",
+            planning_attempt_fingerprint="original-input", planning_workspace_owned=1,
+            planner_session_id="saved-session", planning_retry_count=2,
+            planning_validation_error="old input result error",
+            planning_result="old result", planning_result_pending_validation=True,
+        ))
+        ports.git.relevant_document_changes = mock.Mock(
+            return_value=("docs/requirements/R-053 New.md",),
+        )
+        ports.state.execplan_rows = lambda _repo: [{"plan_id": "G-118", "status": "READY"}]
+        ports.validation.validate_general_result = mock.Mock(
+            side_effect=PlanningResultInvalid("new input result error"),
+        )
+        original_run = ports.agent.run_planner
+
+        def advance_remote_after_first_writer(*args, **kwargs):
+            result = original_run(*args, **kwargs)
+            if ports.agent.run_count == 1:
+                ports.git.remote = "new-base"
+            return result
+
+        coordinator = PlanningLifecycleCoordinator(ports)
+        with mock.patch.object(
+            ports.agent, "run_planner", side_effect=advance_remote_after_first_writer,
+        ) as invoke:
+            outcome = coordinator.run(self.context)
+            self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED)
+            saved = ports.state.snapshot
+            self.assertEqual(saved.active_sha, "base")
+            self.assertEqual(saved.planning_retry_count, 2)
+            self.assertTrue(saved.planning_result_pending_validation)
+            self.assertTrue(saved.planning_result_completed)
+            self.assertEqual(saved.planning_result, "planner result")
+            ports.validation.validate_general_result.assert_not_called()
+
+            resumed = coordinator._new_run(replace(self.context, base_sha="new-base"))
+            self.assertIsNone(coordinator._workspace._prepare_workspace(resumed))
+            saved = ports.state.snapshot
+            self.assertEqual(saved.active_sha, "new-base")
+            self.assertEqual(saved.planning_retry_count, 0)
+            self.assertTrue(saved.planning_result_pending_validation)
+            self.assertFalse(saved.planning_result_completed)
+            self.assertIsNone(saved.planning_result)
+            self.assertIn("현재 planning 결과의 관련 문서가 변경됐습니다", saved.planning_validation_error)
+            self.assertEqual(ports.state.diagnostics[-1].planning_retry_count, 2)
+            self.assertIsNone(coordinator._assessment._run_planner_turn(resumed))
+            self.assertIsNone(coordinator._workspace._refresh_after_planner(resumed))
+            retry = coordinator._assessment._validate_planner_result(resumed)
+            self.assertEqual(retry.kind, PlanningOutcomeKind.VALIDATION_RETRY)
+            self.assertEqual(ports.state.snapshot.planning_retry_count, 0)
+            self.assertEqual(ports.state.snapshot.planning_validation_error, "new input result error")
+
+        self.assertEqual(invoke.call_count, 2)
+        self.assertEqual(invoke.call_args_list[0].args[2], "saved-session")
+        self.assertEqual(invoke.call_args_list[1].args[2], "session-1")
+        ports.validation.validate_general_result.assert_called_once()
+
+    def test_related_remote_change_before_correction_resets_stale_retry_budget(self):
+        prior_error = "old input result error"
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/planning",
+            planning_attempt_fingerprint="original-input", planning_workspace_owned=1,
+            planner_session_id="saved-session", planning_retry_count=2,
+            planning_validation_error=prior_error,
+            planning_result_completed=False,
+            planning_result_pending_validation=False,
+            planning_error=None,
+        ))
+        ports.git.remote = "new-base"
+        ports.git.relevant_document_changes = mock.Mock(
+            return_value=("docs/requirements/R-053 New.md",),
+        )
+        ports.state.execplan_rows = lambda _repo: [{"plan_id": "G-118", "status": "READY"}]
+        ports.validation.validate_general_result = mock.Mock(
+            side_effect=PlanningResultInvalid("new input result error"),
+        )
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(self.context)
+
+        self.assertIsNone(coordinator._workspace._prepare_workspace(run))
+        saved = ports.state.snapshot
+        self.assertEqual(saved.active_sha, "new-base")
+        self.assertFalse(saved.planning_result_completed)
+        self.assertFalse(saved.planning_result_pending_validation)
+        self.assertEqual(saved.planning_retry_count, 0)
+        self.assertIsNone(saved.planning_error)
+        self.assertIn("현재 planning 결과의 관련 문서가 변경됐습니다", saved.planning_validation_error)
+        self.assertEqual(ports.state.diagnostics[-1].planning_validation_error, prior_error)
+        self.assertEqual(ports.state.diagnostics[-1].planning_retry_count, 2)
+
+        self.assertIsNone(coordinator._assessment._run_planner_turn(run))
+        self.assertEqual(ports.agent.resumed_session, "saved-session")
+        self.assertIsNone(coordinator._workspace._refresh_after_planner(run))
+        outcome = coordinator._assessment._validate_planner_result(run)
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.VALIDATION_RETRY)
+        self.assertEqual(ports.state.snapshot.planning_retry_count, 0)
+        self.assertEqual(ports.state.snapshot.planning_validation_error, "new input result error")
+        self.assertIsNone(ports.state.snapshot.planning_error)
+        ports.validation.validate_general_result.assert_called_once()
+
+    def test_linked_remote_correction_binding_allows_fresh_validation_retry(self):
+        error = "old input validation failure"
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/planning",
+            planning_attempt_fingerprint="fingerprint", planning_workspace_owned=1,
+            planner_session_id="saved-session", planning_retry_count=1,
+            planning_error=error, planning_error_fingerprint="fingerprint",
+            planning_error_incident_id="incident", planning_error_origin="validation",
+            planning_correction_error=error, planning_correction_incident_id="incident",
+            planning_correction_sha="base", planning_correction_context="general",
+            planning_validation_error="new input validation failure",
+        ))
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(self.context)
+
+        self.assertIsNone(coordinator._selection._gate_preserved_error(run))
+        self.assertTrue(run.error_input_changed)
+        self.assertIsNone(coordinator._selection._reconcile_inputs(run))
+        self.assertIsNone(coordinator._workspace._prepare_workspace(run))
+        self.assertIsNone(coordinator._assessment._run_planner_turn(run))
+        self.assertEqual(ports.agent.resumed_session, "saved-session")
+        self.assertIsNone(coordinator._workspace._refresh_after_planner(run))
+        self.assertIsNone(coordinator._assessment._validate_planner_result(run))
+        self.assertIsNone(ports.state.snapshot.planning_error)
+        self.assertIsNone(ports.state.snapshot.planning_correction_error)
+
+    def test_conflict_correction_refetches_after_owned_rebase_finishes(self):
+        ports = FakePorts(planning_snapshot(
+            phase="PLANNING", active_sha="base", worktree="/planning",
+            planning_attempt_fingerprint="original-input", planning_workspace_owned=1,
+            planner_session_id="saved-session",
+        ))
+        ports.git.fetch_base = mock.Mock(side_effect=("target", "advanced"))
+        ports.git.rebase_planning_workspace = mock.Mock(side_effect=(
+            SimpleNamespace(target="target", conflict=True, detail="conflict"),
+            SimpleNamespace(target="target", conflict=False),
+        ))
+        ports.git.complete_planning_rebase = mock.Mock()
+        ports.validation.prepare_general_context = mock.Mock(
+            return_value=ports.validation.snapshot,
+        )
+        coordinator = PlanningLifecycleCoordinator(ports)
+        with mock.patch(
+            "loop_manager_internal.planning.workspace_service.PlanningConflictCorrection",
+        ) as boundary:
+            boundary.return_value.resolve.return_value = True
+            outcome = coordinator._workspace._prepare_workspace(
+                coordinator._new_run(self.context),
+            )
+
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED)
+        self.assertEqual(ports.state.snapshot.active_sha, "target")
+        self.assertEqual(ports.state.snapshot.planner_session_id, "saved-session")
+        self.assertEqual(ports.git.fetch_base.call_count, 2)
+        ports.git.complete_planning_rebase.assert_called_once_with(
+            "/repo", Path("/planning"), "target",
+        )
+        ports.validation.prepare_general_context.assert_not_called()
+
     def test_unrelated_maintenance_requirement_does_not_reset_exhausted_error(self):
         cycle = maintenance_cycle(
             phase=maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,

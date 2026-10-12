@@ -95,7 +95,7 @@ class PlanningWorkspaceService(PlanningService):
         self._ports.state.preserve_diagnostics(repo, self._ports.state.planning(repo))
 
     def _prepare_workspace(
-        self, run: _PlanningRun
+        self, run: _PlanningRun, *, defer_on_remote_advance: bool = False,
     ) -> PlanningOutcome | None:
         row = run.row
         if row.phase != "PLANNING":
@@ -150,8 +150,15 @@ class PlanningWorkspaceService(PlanningService):
         # This is a safe boundary: no Planner or verifier is using the
         # worktree. Recheck origin even when the project step began earlier.
         conflict_detail = None
+        correction_completed = False
         try:
             latest = self._ports.git.fetch_base(context.repo_path, context.base_branch)
+            if defer_on_remote_advance and latest != row.active_sha:
+                return PlanningOutcome(
+                    PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED,
+                    detail="Planner 종료 후 원격 base가 전진해 완료 결과와 작업물을 보존하고 다음 실행에서 갱신합니다.",
+                    error=True,
+                )
             if latest == row.active_sha:
                 # The SQLite base update may have committed immediately before
                 # a crash that left the preservation stash and journal behind.
@@ -214,6 +221,7 @@ class PlanningWorkspaceService(PlanningService):
                         getattr(result, "conflict_paths", ()),
                         getattr(result, "stash_sha", ""),
                     ):
+                        correction_completed = True
                         result = self._ports.git.rebase_planning_workspace(
                             context.repo,
                             str(row.planning_attempt_fingerprint or ""),
@@ -275,8 +283,52 @@ class PlanningWorkspaceService(PlanningService):
                     values.update(
                         planning_result_pending_validation=1,
                         planning_result_completed=0,
-                        planning_validation_error=recheck_message,
                         planning_result=None,
+                    )
+                    can_restart_result = (
+                        not mode_failure
+                        and (not row.planning_error or linked_error)
+                        and (not row.last_error or linked_error)
+                        and not row.agent_result_snapshot
+                        and not str(row.planning_validation_error or "").startswith(
+                            "planning rebase 충돌:"
+                        )
+                    )
+                    if can_restart_result:
+                        prior_error = row.planning_error if linked_error else None
+                        values.update(
+                            planning_validation_error=(
+                                recheck_message + (
+                                    "\n이전 planning 실패를 최신 입력에서 다시 확인: "
+                                    + prior_error if prior_error else ""
+                                )
+                            ),
+                            planning_retry_count=0,
+                        )
+                    else:
+                        values["planning_validation_error"] = recheck_message
+                elif (
+                    relevant_input_changed
+                    and not row.planning_result_completed
+                    and row.planning_validation_error
+                    and not mode_failure
+                    and not row.planning_error
+                    and not row.last_error
+                    and not row.agent_result_snapshot
+                    and not str(row.planning_validation_error or "").startswith(
+                        "planning rebase 충돌:"
+                    )
+                ):
+                    self._ports.state.preserve_diagnostics(context.repo, row)
+                    recheck_message = (
+                        "현재 planning 결과의 관련 문서가 변경됐습니다: "
+                        + ", ".join(changed_documents)
+                        if changed_documents else
+                        "현재 planning 결과의 전체 계획 입력이 변경됐습니다. 최신 코드와 테스트를 다시 평가하세요."
+                    )
+                    values.update(
+                        planning_validation_error=recheck_message,
+                        planning_retry_count=0,
                     )
                 elif changed_documents and not row.planning_result_completed:
                     additional = [path for path in changed_documents
@@ -308,6 +360,10 @@ class PlanningWorkspaceService(PlanningService):
                 self._ports.git.complete_planning_rebase(
                     context.repo, worktree, result.target,
                 )
+                observed_latest = (
+                    self._ports.git.fetch_base(context.repo_path, context.base_branch)
+                    if correction_completed else latest
+                )
                 self._ports.events.info(
                     f"planning base 반영: {row.active_sha} -> {result.target}; "
                     f"후보={self._ports.git.run(worktree, 'rev-parse', 'HEAD').stdout.strip()}; "
@@ -315,7 +371,7 @@ class PlanningWorkspaceService(PlanningService):
                     f"남은 원인={row.planning_error or row.planning_validation_error or '없음'}"
                 )
                 row = self._ports.state.planning(context.repo)
-                if result.target != latest:
+                if result.target != observed_latest:
                     return PlanningOutcome(
                         PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED,
                         detail="원격 base가 다시 전진해 다음 안전 경계에서 반영합니다.",
@@ -451,4 +507,15 @@ class PlanningWorkspaceService(PlanningService):
             )
             run.row = self._ports.state.planning(context.repo)
         run.planning_worktree = worktree
+        return None
+
+    def _refresh_after_planner(self, run: _PlanningRun) -> PlanningOutcome | None:
+        """Refresh the candidate after its writer exits and before result validation."""
+        if run.row.phase != "PLANNING" or not run.row.planning_result_completed:
+            return None
+        outcome = self._prepare_workspace(run, defer_on_remote_advance=True)
+        if outcome is not None:
+            return outcome
+        if run.row.planning_result_pending_validation and not run.row.planning_result_completed:
+            return PlanningOutcome(PlanningOutcomeKind.ASSESSMENT_PROGRESS)
         return None
