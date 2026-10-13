@@ -9,7 +9,7 @@ from loop_manager_internal.maintenance import code_index
 from loop_manager_internal.verification.contract import validate_manifest
 from loop_manager_internal.verification import impact_analysis
 
-VERSION = 3
+VERSION = 4
 MAX_MODULES = 24
 _SMOKE = ('test_preliminary_review', 'test_managed_configuration', 'test_notification_events')
 _VERIFY_INPUTS = ('loop_manager_internal/verification/', 'scripts/verify',
@@ -203,9 +203,27 @@ def select_records(before, after, changed, modules, *, head, base, configuration
             analysis['scope_limits'].append("old_source_missing:" + old)
         if new and new.endswith(".py") and new not in after:
             analysis['scope_limits'].append("new_source_missing:" + new)
-    # Opaque consumers may hide relationships. Report the limitation; this
-    # precheck never claims exhaustive coverage and cannot replace full verify.
+    # An opaque collection inventory cannot prove the manifest is unchanged.
+    # Other opaque consumers remain limitations of this bounded precheck.
     for label, graph in (("base", before), ("head", after)):
+        collection_inputs = {path for path, facts in graph.items()
+                             if any(item['name'] == 'load_tests' for item in facts['symbols'])}
+        dependencies = {path: set() for path in graph}
+        for path, facts in graph.items():
+            for consumer in facts['dependents']:
+                dependencies[consumer].add(path)
+        pending = deque(collection_inputs)
+        while pending:
+            for dependency in dependencies[pending.popleft()] - collection_inputs:
+                collection_inputs.add(dependency)
+                pending.append(dependency)
+        inventory_changed = any(status.startswith(('A', 'D', 'R', 'C'))
+                                and any(path and path.endswith('.py') for path in (old, new))
+                                for status, old, new in changed)
+        if inventory_changed or changed_paths.intersection(collection_inputs):
+            for path in sorted(collection_inputs):
+                if graph[path].get('impact', {}).get('unbounded_file_read'):
+                    fallback.add('uncertain_collection_input:' + path)
         names = Counter(code_index.module_name(path) for path in graph)
         if any(count != 1 for count in names.values()):
             analysis['scope_limits'].append("ambiguous_module_paths:" + label)

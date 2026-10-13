@@ -49,6 +49,8 @@ Manager 소유 rebase에서 Requirement·ExecPlan 충돌을 관측한 최신 원
 - [x] 2026-10-13 최신 `origin/main`의 `20e6f0fbfdb6ceb5384d42c83f3904490b441356`으로 rebase했다. upstream의 lifecycle 문서 보고 fixture를 재사용해 중복을 제거하고 문서와 구현을 다시 대조했다. `bash scripts/verify.sh` 전체 PASS: success 3,647, skip 5, failure/error 0이며 compile도 통과했다. 관련 4개 모듈의 127개 테스트도 모두 통과했고 이전 base의 실패 5개는 최신 main에서 해소됐다.
 - [ ] 사용자 Merge
 
+- [x] 2026-10-13 현재 후보 `f2e2f7b0434f0ff2efdd922d0a069c010a6d192b`의 Manager 전체 verify 실패(`test_verify_impact`의 동적 수집 fallback 5개 subtest)를 단일 targeted case로 재현했다. `load_tests`의 직접·간접 입력에 있는 범위 불명 파일 조회를 수집 변경 판정에 연결하고 선택기 version 4로 이전 결과 재사용을 차단했다. 동일 case 재실행과 간접 helper·이전 version 거부의 2개 case가 통과했다. 추가 회귀의 첫 실행은 고정 경로 조회 fixture 때문에 실패해 범위 불명 조회로 수정한 뒤 동일 명령으로 통과했다. 전체 verify와 Review는 Worker가 실행하지 않았으며 Manager의 재검증이 남아 있다.
+
 ## Decision Log
 
 - 직접 반영된 `5e440444`는 rebase 중 구현 입력 변경의 즉시 최종 차단을 제거하고 최신 revision/source를 Worker에 전달한다. Requirement·ExecPlan 충돌을 base로 자동 처리하는 경로는 없으므로 그 남은 작업만 계획한다. G-242의 판단 형식·PR 경합, G-245의 Planner 종료 갱신과 G-189의 전수 감사는 각 기존 책임으로 유지한다.
