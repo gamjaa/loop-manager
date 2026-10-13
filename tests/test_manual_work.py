@@ -480,6 +480,9 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
         self.enterContext(mock.patch(
             'loop_manager_internal.execution.execution_publication_handler.common_guidance_report',
             return_value=''))
+        self.enterContext(mock.patch(
+            'loop_manager_internal.execution.execution_verify_handler.common_guidance_report',
+            return_value=''))
         with tempfile.TemporaryDirectory() as directory:
             service,group,_=self.submitted(directory,count=1,skip=True)
             owner=group['owner_id']
@@ -492,6 +495,9 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
             self.assertEqual(agent.call_count,1)
 
     def test_shared_review_failure_rotates_only_one_active_member(self):
+        self.enterContext(mock.patch(
+            'loop_manager_internal.execution.execution_verify_handler.common_guidance_report',
+            return_value=''))
         with tempfile.TemporaryDirectory() as directory:
             service,group,_=self.submitted(directory)
             first,second=json.loads(group['members'])
@@ -509,6 +515,9 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
     def test_shared_pr_is_published_closed_reopened_and_merged_as_one_group(self):
         self.enterContext(mock.patch(
             'loop_manager_internal.execution.execution_publication_handler.common_guidance_report',
+            return_value=''))
+        self.enterContext(mock.patch(
+            'loop_manager_internal.execution.execution_verify_handler.common_guidance_report',
             return_value=''))
         with tempfile.TemporaryDirectory() as directory:
             service,group,_=self.submitted(directory)
@@ -557,6 +566,9 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
             self.assertEqual(service.store.get(service.repo,group['group_id'])['state'],'MERGED')
 
     def test_shared_publication_rolls_back_every_member_on_failure(self):
+        self.enterContext(mock.patch(
+            'loop_manager_internal.execution.execution_verify_handler.common_guidance_report',
+            return_value=''))
         with tempfile.TemporaryDirectory() as directory:
             service,group,_=self.submitted(directory)
             first,second=json.loads(group['members'])
