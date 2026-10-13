@@ -720,9 +720,12 @@ class BootstrapSavedScopeFixtureUnitTests(unittest.TestCase):
                                 return_value=SimpleNamespace(repository_identity=repository_identity)):
                     record_saved_scope_invocation(connection, 'repo', Path('/state'), worktree,
                                                   role, before, role + '-existing', plan_id=plan_id)
+                digest = connection.execute('SELECT snapshot_digest FROM agent_isolation_evidence '
+                    'JOIN agent_invocations USING (invocation_id) WHERE scope_id=?',
+                    (before.scope_id,)).fetchone()[0]
                 expected = dict(repo='repo', plan_id=plan_id, role=role, provider='codex',
                                 session_id=role + '-existing', worktree=str(worktree.resolve()),
-                                repository_identity=repository_identity, start_digest='c' * 64)
+                                repository_identity=repository_identity, start_digest=digest)
                 self.assertTrue(ledger.verified_scope(before.scope_id, **expected))
                 for key, value in (('role', 'other'), ('session_id', 'other'),
                                    ('repository_identity', 'other'), ('worktree', '/other'),

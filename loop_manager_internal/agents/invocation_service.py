@@ -225,11 +225,7 @@ def run_agent(
             return hashlib.sha256(snapshot.serialize().encode()).hexdigest()
         if project is None or owner is None or not project['base_branch']:
             return hashlib.sha256(snapshot.serialize().encode()).hexdigest()
-        phase = {
-            'planner': 'PLANNING', 'planner_check': 'PLANNING',
-            'maintenance_planner': 'PLANNING', 'worker': 'IMPLEMENTING',
-            'reviewer': 'REVIEWING',
-        }.get(role_name)
+        phase = agent_scope_decision.invocation_scope_phase(role_name)
         if phase is None:
             return hashlib.sha256(snapshot.serialize().encode()).hexdigest()
         branch = (str(owner['branch'] or '') or None
