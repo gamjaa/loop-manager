@@ -153,7 +153,7 @@ class ImpactTests(unittest.TestCase):
         from tests.support import fresh_imports
         target = fresh_imports.inventory()[0]
         current = replace(self.modules[0], ids=(
-            'test_direct.FreshImportTests.' + target.test_name,))
+            'test_direct.FreshImportTests.' + target.method_name,))
         with self.assertRaisesRegex(ValueError, 'manifest identity'):
             impact.selected_modules(selection, [current, *self.modules[1:]])
 
