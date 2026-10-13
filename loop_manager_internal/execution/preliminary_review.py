@@ -3,9 +3,38 @@ import json
 from pathlib import Path
 import hashlib
 import sqlite3
+from collections import Counter
 from loop_manager_internal.storage import pre_review
 from loop_manager_internal.storage import verify_receipts
 from loop_manager_internal.verification.impact import digest
+
+
+def review_summary(serialized):
+    """Keep complete evidence on disk; don't multiply opaque diagnostics in AI input."""
+    report = json.loads(serialized)
+    selection = report.get('selection') or {}
+    analysis = selection.get('analysis') or {}
+    unknown = analysis.get('remaining_uncertainties') or {}
+    categories = Counter(reason.split(':', 1)[0] for reasons in unknown.values() for reason in reasons)
+    reasons = selection.get('reasons') or {}
+    return json.dumps({'kind': report.get('kind'), 'status': report.get('status'),
+        'coverage': 'selected_modules_only', 'full_verify_required': True,
+        'head': selection.get('head'), 'base': selection.get('base'),
+        'modules': selection.get('modules'), 'selected_tests': len(selection.get('ids') or []),
+        'total_modules': selection.get('total_modules'), 'total_tests': selection.get('total_tests'),
+        'reasons_sample': {name: reasons.get(name, [])[:2] for name in selection.get('modules') or []},
+        'uncertain_sources': len(unknown), 'uncertainty_categories': dict(sorted(categories.items())),
+        'uncertainty_sample': {name: values[:4] for name, values in sorted(unknown.items())[:8]},
+        'scope_limits_count': len(analysis.get('scope_limits') or []),
+        'scope_limits_sample': (analysis.get('scope_limits') or [])[:8],
+        'not_selected_related_count': len(analysis.get('not_selected_related_modules') or []),
+        'not_selected_related_sample': (analysis.get('not_selected_related_modules') or [])[:8],
+        'expansions_sample': (analysis.get('expansions') or [])[:8],
+        'algorithm': selection.get('algorithm'),
+        'manifest_identity': selection.get('manifest_identity'),
+        'configuration_identity': selection.get('configuration_identity'),
+        'selection_identity': digest(selection), 'diagnostic': report.get('diagnostic'),
+        'samples_are_incomplete': True}, ensure_ascii=False, sort_keys=True)
 
 
 def runtime_identity():
