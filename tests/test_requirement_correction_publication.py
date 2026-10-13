@@ -11,6 +11,7 @@ from unittest import mock
 from loop_manager_internal.catalog.archive_git import ArchiveGitEffects, ExecPlanArchiveGitPort
 from loop_manager_internal.catalog.requirement_correction_publication import CorrectionPending, RequirementCorrectionPublisher
 from loop_manager_internal.storage.requirement_correction_state import claimed_paths
+from loop_manager_internal.storage.agent_invocation_state import SCHEMA as AGENT_INVOCATIONS_SCHEMA
 
 
 A = 'docs/requirements/[R-001] A.md'
@@ -200,6 +201,36 @@ class RequirementCorrectionPublicationTest(unittest.TestCase):
         self.connection.execute('INSERT INTO exec_plans VALUES (?,?,?)', ('repo', 'G-002', json.dumps([B])))
         result = self.publisher.observe('base')
         self.assertEqual(result['assignments'][0][0], A)
+
+    def test_writer_gate_distinguishes_unstarted_failures_from_unconfirmed_writers(self):
+        self.connection.execute(AGENT_INVOCATIONS_SCHEMA)
+        cases = [
+            ('not_executed', 'finished', kind, None, False)
+            for kind in ('exception', 'interrupted', 'timeout')
+        ] + [
+            (status, 'finished', kind, None, True)
+            for status in ('executed', 'unknown')
+            for kind in ('exception', 'interrupted', 'timeout')
+        ] + [
+            ('not_executed', None, 'exception', None, True),
+            ('executed', None, None, None, True),
+            ('executed', 'finished', 'exception', 1, False),
+        ]
+        for status, finished, kind, code, blocked in cases:
+            with self.subTest(status=status, finished=finished, kind=kind, code=code):
+                self.connection.execute('DELETE FROM agent_invocations')
+                self.connection.execute('''INSERT INTO agent_invocations
+                    (invocation_id, repo, role, provider, model, effort, transition,
+                     attempt, started_at, execution_status, finished_at, result_kind, result_code)
+                    VALUES ('attempt', 'repo', 'planner', 'codex', 'model', 'medium',
+                            'new', 1, 'started', ?, ?, ?, ?)''', (status, finished, kind, code))
+                if blocked:
+                    with self.assertRaisesRegex(CorrectionPending, '종료가 확인되지 않은 Agent writer'):
+                        self.publisher.observe('base')
+                else:
+                    result = self.publisher.observe('base')
+                    self.assertTrue(result['assignments'])
+        self.assertEqual((self.observations.commits, self.observations.pushes), (0, 0))
 
     def test_reference_query_failure_does_not_mean_no_references(self):
         self.connection.execute('DROP TABLE execplan_cancellations')
