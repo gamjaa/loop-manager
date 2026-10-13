@@ -22,15 +22,16 @@ Windows에서도 Python과 `entrypoint.py`의 절대 경로로 같은 인수를 
 | 필드 | 계약 |
 |---|---|
 | `version` | 정수 `1`; 다른 버전과 중복 JSON key는 거부 |
-| `adapter` | 정적 registry의 `unittest`; 자동 도구 탐색 없음 |
-| `environment.python` | worktree 상대 interpreter 경로 또는 `launcher`; 후자는 launcher/명시적 `--project-python`이 선택한 interpreter |
+| `adapter` | 정적 registry의 `unittest` 또는 `perl-tap`; 자동 도구 탐색 없음 |
+| `environment.python` | unittest 전용: worktree 상대 interpreter 경로 또는 `launcher`; 후자는 launcher/명시적 `--project-python`이 선택한 interpreter |
+| `environment.perl` | perl-tap 전용: 존재하는 Perl executable의 절대 경로; Manager Python과 별도로 선택 |
 | `stages` | 중복 없는 `id`, `kind`, worktree 안의 `cwd`를 가진 순서 있는 필수 단계 |
 | tests 단계 | `collection.directory`, `collection.pattern`, `execution` (`independent` 또는 `serial`) |
 | command 단계 | 비어 있지 않은 `argv` 배열; shell 문자열 해석 없음 |
 
-command의 독립 인수 `{python}`과 `{runner}`만 각각 프로젝트 interpreter와 Manager runtime 진입점으로 치환한다. 일반 문자열의 보간이나 범용 DAG·resource lock 설정은 제공하지 않는다. command 단계는 직렬이며 테스트별 결과를 만들지 않는다. 자체 compile은 명시된 `loop_manager.py`와 `loop_manager_internal/**/*.py` 전체를 프로젝트 Python으로 검사한다.
+command의 독립 인수 `{python}`과 `{runner}`는 각각 프로젝트 interpreter와 Manager runtime 진입점으로 치환한다. perl-tap command의 첫 인수 `{perl}`는 선언한 Perl과 검증 guard preload 인수로 치환한다. Perl compile은 이 형식을 사용해 BEGIN 단계에도 guard를 적용한다. 일반 문자열의 보간이나 범용 DAG·resource lock 설정은 제공하지 않는다. command 단계는 직렬이며 테스트별 결과를 만들지 않는다. 자체 compile은 명시된 `loop_manager.py`와 `loop_manager_internal/**/*.py` 전체를 프로젝트 Python으로 검사한다.
 
-수집한 manifest는 version·run·adapter identity, 프로젝트 Python 버전과 각 단계의 단위 ID·argv·cwd·실행 조건·테스트 ID를 포함한다. 정적 선언에 테스트 ID를 쓰지 않는다. 단계 실패 뒤의 단계는 시작하지 않는다. `auto`와 `1`은 같은 필수 범위를 사용한다.
+수집한 manifest는 version·run·adapter identity, 프로젝트 도구 버전과 각 단계의 단위 ID·argv·cwd·실행 조건·테스트 ID를 포함한다. Perl 단계는 Manager Python worker argv와 별도로 native 도구 버전을 `tool`에 기록한다. 정적 선언에 테스트 ID를 쓰지 않는다. 단계 실패 뒤의 단계는 시작하지 않는다. `auto`와 `1`은 같은 필수 범위를 사용한다.
 
 ## unittest 지원과 적합성
 
@@ -43,6 +44,66 @@ adapter version 1의 범위는 Python 3.11–3.14 stdlib unittest이다. [공식
 같은 로그 부모 디렉터리의 가장 최근 진단에 현재 실행 범위·환경과 비교 가능한 완전한 모듈 시간이 있으면 독립 단계의 실행 큐만 긴 모듈 우선으로 정렬한다. 동률은 수집 순서다. 큐 재사용은 manifest·fixture 소유자·pattern·선택 상태·부분/전체 모드와 전체 단계 선언·Python·병렬도/조율·임시 경로·Python 경로·계측/bytecode 정책이 일치해야 한다. 성공·완결된 run의 모든 실행 모듈에서 유효한 단일 duration과 report identity·coverage를 확인하며 종료 불명 예약도 거부한다. 자료 부재·불완전·손상·다른 문맥은 전체 수집 순서로 실행한다. 시간 진단은 같은 실행 범위·부분/전체 모드·관측 환경·bytecode 정책·실행 context를 비교하되 context의 parallelism 값만 제외해 `1`과 `auto`의 비용 비교를 지원한다. 이 비교는 모든 context 필드가 일치해야 하는 큐 재사용 판정과 별개다. 새로운 시간 cache나 누락 duration을 만들지 않는다. serial·필수 명령 순서와 전체 discovery의 NOT_SELECTED는 유지하고, 과거 비용은 현재 실행의 성공·생략 근거로 사용하지 않는다.
 
 적합성 unit test는 [test_verify_contract.py](../tests/test_verify_contract.py)와 기존 [test_verify_runtime.py](../tests/test_verify_runtime.py)의 fixture·native 결과·pool 경계를 사용한다. 선언·manifest 누락/중복/버전, run·단계·단위 identity, 부분 결과, 직렬 예산, 프로젝트 interpreter 전달, 필수 명령 종료 코드, 시작 실패·종료 불명·진단 보존을 확인한다. 합성 결과와 mock 통과는 실제 프로세스·OS 격리·언어 독립성의 근거가 아니다. 로컬 targeted 검증 환경은 Python 3.12/Linux이며 다른 Python 버전·Windows/macOS의 실제 실행, 동시 verify·timeout/cancel·성능 비교는 Manager의 후속 검증으로 확인한다.
+
+## Perl TAP 지원과 두 언어 예제
+
+`perl-tap` version 1은 구현 환경에서 확인한 Perl 5.38.2, Test::More 1.302194,
+TAP::Parser 3.44, JSON::PP를 지원한다. 다른 버전·도구 부재는 probe 실패이며 skip이나 기존
+verify로 전환하지 않는다. 공식 근거는 [Test::More](https://perldoc.perl.org/5.38.2/Test::More)의
+plan·done_testing·skip·TODO·subtest와 [TAP::Parser](https://perldoc.perl.org/5.38.2/TAP::Parser)의
+argv 실행·native result·plan·parse_errors·exit·wait·spool 계약이다. 자동 설치는 제공하지 않는다.
+
+수집은 collection directory 아래 pattern에 맞는 파일을 정렬해 재귀 조회한다. 각 worktree 상대
+파일 ID가 하나의 suite test ID이자 독립 프로세스 단위다. assertion을 미리 실행하거나 가짜 assertion
+목록을 만들지 않는다. 실행 전 파일 목록을 다시 대조하며 실행 중 native TAP assertion의 번호와
+plan을 대조한다. `파일 ID#번호` 결과는 해당 suite에 속하고, 연속 번호·native plan·parser 오류·
+종료 코드·signal을 모두 확인해야 suite가 완결된다. 파일 전체 skip은 native skip-all 근거로
+완결되며, fixture 오류·bailout·plan 누락·중복/누락 assertion·비정상 종료는 성공이 아니다.
+Test::More의 TODO 성공/실패 의미와 nested subtest의 부모 결과를 유지한다. nested assertion은
+원본 spool에 보존하고 별도의 최상위 수집 ID로 합성하지 않는다.
+
+Python worker IPC와 공통 core의 acquire·PID bind·idle·종료 후 release를 재사용한다. Perl
+reporter가 테스트 subprocess를 기다린 뒤에만 단위 report를 만든다. serial 선언은 worker 하나를
+재사용하고 independent는 파일별 프로세스를 배정한다. native JSONL은 즉시 flush하고 TAP spool도
+flush하므로 중단 전 결과·관측 위치를 보존한다. 파일 suite의 시작·소요 시간은 공통 phase에,
+assertion 결과의 reporter 관측 elapsed는 native JSONL에 기록한다. 관측 elapsed를 assertion
+본문의 정밀 실행 시간으로 주장하지 않는다. 강제 종료·부분 JSONL에는 완료를 합성하지 않으며
+기존 외부 timeout/프로세스 경계와 종료 불명 예약 진단을 사용한다. Perl의 AST 부분 선정과 과거
+모듈 시간 기반 큐 재사용은 지원하지 않고 부분 요청은 명시적 FALLBACK이다.
+
+Perl guard는 테스트를 compile하기 전에 preload하며 일반 Perl의 system·exec·readpipe·pipe open,
+fork·socket·connect를 거부한다. 따라서 실제 Agent CLI/API와 내부 fork 병렬은 mock/stub으로
+대체해야 한다. [공식 CORE::GLOBAL override 계약](https://perldoc.perl.org/5.38.2/perlsub)에
+기반한 신뢰된 테스트 경계다. 명시적 CORE 호출·XS/FFI·ithreads·guard를 바꾸는 preload는
+지원하지 않으며 악의적인 코드의 OS sandbox라고 주장하지 않는다. Python guard와 별도다.
+
+예제 루트는 [Python](../tests/support/verify_examples/python/scripts/verify.json)과
+[Perl](../tests/support/verify_examples/perl/scripts/verify.json)이다. 둘 다 compile → tests의
+필수 순서와 fixture·skip·expected failure/TODO 예제를 제공하며 같은 version 1 core를 사용한다.
+Python 예제는 launcher가 선택한 Python 3.11–3.14를, Perl 예제는 `/usr/bin/perl`을 명시한다.
+다른 설치 위치에서는 environment.perl을 실제 절대 경로로 바꾼다. 샘플을 프로젝트로 복사할 때
+scripts와 tests를 함께 복사한다. 단독 실행은 해당 예제 루트에서 다음처럼 호출한다.
+
+```sh
+export LOOP_MANAGER_VERIFY_RUNTIME_PYTHON=/manager/runtime/python
+export LOOP_MANAGER_VERIFY_RUNNER=/manager/runtime/loop_manager_internal/verification/entrypoint.py
+# Python 프로젝트 의존성 환경이 다르면 절대 경로로 지정한다.
+export LOOP_MANAGER_EXAMPLE_PYTHON=/project/.venv/bin/python
+bash scripts/verify.sh
+```
+
+Windows launcher는 같은 환경값으로 `scripts/verify.ps1`을 호출한다. Perl의 Windows native 실행은
+이번 지원 근거에 포함되지 않는다. Manager에는 같은 예제 project root와 verify launcher를
+연결한다. Manager가 runtime·protocol·session·coordinator·timeout을 전달하며 단독 호출과 같은
+선언과 결과 validator를 사용한다. 자체 전체 verify의 Perl 적합성 검사는 위 설치 도구가 필요하며,
+부재를 성공/skip으로 숨기지 않는다.
+
+[test_verify_perl_adapter.py](../tests/test_verify_perl_adapter.py)는 native assertion·plan·skip·TODO·
+subtest·오류, 수집/결과 identity·범위·부분 결과·통신 실패·guard·serial 예산을 검사한다.
+[test_verify_language_examples.py](../tests/test_verify_language_examples.py)는 실제 두 예제의
+단독/Manager 성공·실패와 공통 manifest·예약 회수를 확인하는 Manager 전용 통합 회귀다.
+Worker는 이를 실행하지 않는다. 로컬 targeted 근거는 Linux/Perl 5.38.2이며 실제 강제 종료,
+Windows/Linux 격리와 동시 실행 실측은 전체 verify·후속 Manager 검증으로 남는다.
 
 ## 영향 기반 부분 실행
 
@@ -68,7 +129,7 @@ runner의 `--partial-base <commit>` 또는 Manager가 전달하는 `LOOP_MANAGER
 
 필요한 프로젝트의 계획에서 도구의 공식 수집·native reporter·지원 버전·독립 단위·내부 병렬 제어 근거를 먼저 확인한다. 정적 registry metadata와 adapter 구현을 추가하고 공통 core의 자원 계산·예약·정리 코드를 재사용한다. adapter는 수집된 고유 단위/테스트 identity를 제공하며 run·단계·단위 version을 결합한 결과의 완결성과 native 실패·오류·skip 의미를 검증한다. 실행 중 등록되는 테스트가 있는 도구는 예상 범위와 등록된 결과의 관계를 별도 검증해야 한다. 자유 형식 stdout 추측이나 command 종료 코드로 테스트 범위 검증을 대신하지 않는다.
 
-현재 비Python adapter와 외부 프로젝트 연결은 구현하지 않는다. 미지원 도구는 기존 verify를 유지하며 필요한 adapter·연결은 해당 프로젝트의 계획으로 진행한다. R-067의 전체 완료에는 두 번째 실제 언어·도구와 예제, Windows/Linux 격리 및 같은 revision·환경의 직렬/auto·동시 실행 실측이 남아 있다.
+unittest와 perl-tap 이외의 미연결 도구는 기존 verify를 유지하며 필요한 adapter·외부 프로젝트 연결은 해당 프로젝트의 계획으로 진행한다. 명시적으로 연결한 미지원 도구는 실패다. R-067의 전체 완료에는 Windows/Linux 격리 및 같은 revision·환경의 직렬/auto·동시 실행 실측이 남아 있다.
 
 ## 진단과 입력
 
@@ -79,7 +140,8 @@ run별 `manifest.json`, 단계별 수집 요청/결과·단위 결과·worker �
 `run.sh`·`run.ps1`과 실행 코드 `.agents/skills/specification-docs/scripts/next_requirement_id.py`를
 관측한다. 복사 회귀는 이 조회 도구와 `loop_manager_internal/catalog/frontmatter.py`의 실제 bytes를
 샘플 source에 배치하고 배포 결과·조회 동작을 확인한다. 선언 파일은 실제 adapter·interpreter·수집·필수 compile 단계를
-정하므로 목록에 포함한다. `tests/**` 안의 고정 샘플이 문서·Skill·설정 예제 원본을 대체하며,
+정하므로 목록에 포함한다. Perl adapter의 `.py`·`.pl`·`.pm`과 두 언어 예제·launcher도 기존 `loop_manager_internal/**`·
+`tests/**`에 포함된다. `tests/**` 안의 고정 샘플이 문서·Skill·설정 예제 원본을 대체하며,
 실제 copy 스크립트는 이 샘플 source에서 실행해 결과 bytes·경로·보존·덮어쓰기 거부를 확인한다.
 `AGENTS.md`, README, docs와 `.agents`의 prose, `config/config.ini.example`, setup·ignore·attributes는
 자체 verify의 prose/예제 입력에서 제외한다. 이 범위는 문서·예제의 품질 검증을 뜻하지 않으며
