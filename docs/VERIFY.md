@@ -38,6 +38,10 @@ adapter version 1의 범위는 Python 3.11–3.14 stdlib unittest이다. [공식
 
 공통 core는 자원 배정·예약·프로세스 종료 확인을 담당하고, unittest adapter는 프로젝트 interpreter에서의 수집·재수집·reporter·fixture 의미를 담당한다. 테스트 import와 자식의 Python 경로는 후보 worktree를 선택하며 Manager runtime 소스가 후보 구현을 대신하지 않는다. 실제 Agent CLI/API 호출은 기존 guard로 차단하고 테스트에서는 mock/stub을 사용한다. Python 가드는 runpy·일반 import가 프로세스 설치 근거를 공유하며 확인된 audit hook과 Popen wrapper를 한 번 설치한다. 부분 실패는 재시도하고 자식 sitecustomize 설치 실패는 고정 진단 후 종료한다. wrapper가 준비한 동일 환경은 해당 호출의 audit에서 재사용하되 변경된 환경과 명령/API는 매 실행 경계에서 다시 검사한다. 명시/상속 환경의 조율 인증값 제외·부모/호출자 환경 보존·중첩 Python 보호·후보 package 선택·bytecode 정책과 Windows 대소문자/POSIX bytes 별칭을 유지한다. 이 Python guard가 임의 언어의 모든 subprocess를 차단한다고 보장하지 않는다.
 
+완료 모듈 수집 뒤 coordinator가 허용하는 모듈은 매번 acquire·예약·PID bind를 거쳐 연속 배정한다. 즉시 완료 report는 배정 중 다른 모듈의 결과가 준비되거나 배정이 거절된 뒤에도 대기 없이 수집한다. 진행이 없거나 배정이 거절되고 즉시 수집할 report도 없으면 50ms 대기한다. report가 있어도 살아 있는 자식의 종료 확인을 생략하거나 worker를 조기에 재사용하지 않는다.
+
+같은 로그 부모 디렉터리의 가장 최근 진단에 현재 실행 범위·환경과 비교 가능한 완전한 모듈 시간이 있으면 독립 단계의 실행 큐만 긴 모듈 우선으로 정렬한다. 동률은 수집 순서다. 큐 재사용은 manifest·fixture 소유자·pattern·선택 상태·부분/전체 모드와 전체 단계 선언·Python·병렬도/조율·임시 경로·Python 경로·계측/bytecode 정책이 일치해야 한다. 성공·완결된 run의 모든 실행 모듈에서 유효한 단일 duration과 report identity·coverage를 확인하며 종료 불명 예약도 거부한다. 자료 부재·불완전·손상·다른 문맥은 전체 수집 순서로 실행한다. 시간 진단은 같은 실행 범위·부분/전체 모드·관측 환경·bytecode 정책·실행 context를 비교하되 context의 parallelism 값만 제외해 `1`과 `auto`의 비용 비교를 지원한다. 이 비교는 모든 context 필드가 일치해야 하는 큐 재사용 판정과 별개다. 새로운 시간 cache나 누락 duration을 만들지 않는다. serial·필수 명령 순서와 전체 discovery의 NOT_SELECTED는 유지하고, 과거 비용은 현재 실행의 성공·생략 근거로 사용하지 않는다.
+
 적합성 unit test는 [test_verify_contract.py](../tests/test_verify_contract.py)와 기존 [test_verify_runtime.py](../tests/test_verify_runtime.py)의 fixture·native 결과·pool 경계를 사용한다. 선언·manifest 누락/중복/버전, run·단계·단위 identity, 부분 결과, 직렬 예산, 프로젝트 interpreter 전달, 필수 명령 종료 코드, 시작 실패·종료 불명·진단 보존을 확인한다. 합성 결과와 mock 통과는 실제 프로세스·OS 격리·언어 독립성의 근거가 아니다. 로컬 targeted 검증 환경은 Python 3.12/Linux이며 다른 Python 버전·Windows/macOS의 실제 실행, 동시 verify·timeout/cancel·성능 비교는 Manager의 후속 검증으로 확인한다.
 
 ## 영향 기반 부분 실행

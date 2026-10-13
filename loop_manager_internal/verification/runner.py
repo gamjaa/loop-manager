@@ -10,6 +10,7 @@ from pathlib import Path
 import py_compile
 import subprocess
 import sys
+import tempfile
 import time
 import traceback
 import uuid
@@ -30,6 +31,82 @@ from loop_manager_internal.verification.timing import (
 
 
 IMPLEMENTATIONS = {"unittest": unittest_adapter}
+
+
+def execution_queue(modules, directory, metadata, manifest, stage_id):
+    """Use the latest diagnostic only when its whole execution scope is comparable."""
+    original = list(modules)
+    if not original:
+        return original
+    try:
+        manifest = json.loads(json.dumps(manifest))
+        stage_index, stage = next((index, stage) for index, stage in enumerate(manifest["stages"])
+                                  if stage["id"] == stage_id)
+        if stage["units"][0]["execution"] != "independent":
+            return original
+        candidates = [path for path in directory.parent.glob("*/summary.json")
+                      if path.parent != directory]
+        if not candidates or not isinstance(metadata.get("execution_context"), dict):
+            return original
+        history = max(candidates, key=lambda path: (path.stat().st_mtime_ns, str(path)))
+        previous = json.loads(history.read_text(encoding="utf-8"))
+        prior_manifest = json.loads((history.parent / "manifest.json").read_text(encoding="utf-8"))
+        if (type(prior_manifest.get("version")) is not int or prior_manifest["version"] != VERSION
+                or prior_manifest.get("run_id") != previous["metadata"]["run_id"]
+                or previous["metadata"].get("mode") not in ("full", "partial")):
+            return original
+        prior_index = next(index for index, item in enumerate(prior_manifest["stages"])
+                           if item["id"] == stage_id)
+        def scope(value, index):
+            return {**value, "stages": value["stages"][:index + 1]}
+        current = {"metadata": metadata, "phases": [], "counts": {}, "active": [], "result": None}
+        compared = comparison([directory, history.parent], [current, previous],
+            manifests=[scope(manifest, stage_index), scope(prior_manifest, prior_index)])
+        if (metadata.get("execution_context") != previous["metadata"].get("execution_context")
+                or not compared["scope_matches"] or not compared["observed_environment_matches"]
+                or previous["active"] or previous["result"]["passed"] is not True):
+            return original
+        uncertain = history.parent / "uncertain-reservations.json"
+        if uncertain.exists() and json.loads(uncertain.read_text(encoding="utf-8")):
+            return original
+        selected = [unit for unit in stage["units"] if unit.get("status") != "NOT_SELECTED"]
+        if [unit["payload"] for unit in selected] != json.loads(json.dumps([asdict(unit) for unit in original])):
+            return original
+        reports = {}
+        for path in (history.parent / f"stage-{prior_index}").glob("module-*.json"):
+            report = json.loads(path.read_text(encoding="utf-8"))
+            name = report["module"]
+            if name in reports:
+                return original
+            reports[name] = report
+        if set(reports) != {unit.name for unit in original}:
+            return original
+        events = [event for event in previous["phases"]
+                  if event.get("stage_id") == stage_id and event.get("name", "").startswith("module:")]
+        if (len(events) != len(original) or {event["name"] for event in events} !=
+                {f"module:{unit.name}" for unit in original}):
+            return original
+        module_events = {event["name"]: event for event in events}
+        durations = {}
+        for unit in original:
+            report = reports[unit.name]
+            if (type(report.get("version")) is not int or report["version"] != VERSION
+                    or report.get("run_id") != previous["metadata"]["run_id"]
+                    or report.get("stage_id") != stage_id or report.get("unit_id") != unit.name
+                    or report.get("runner_error") or not validate_report(unit, report)):
+                return original
+            event = module_events[f"module:{unit.name}"]
+            value = event.get("duration")
+            if (event.get("result") != "complete" or event.get("unit_id") != unit.name
+                    or event.get("run_id") != previous["metadata"]["run_id"]
+                    or isinstance(value, bool) or not isinstance(value, (int, float))
+                    or not math.isfinite(value) or value < 0):
+                return original
+            durations[unit.name] = value
+        return sorted(original, key=lambda unit: -durations[unit.name])
+    except (OSError, ValueError, TypeError, KeyError, IndexError, AttributeError, StopIteration, RuntimeError):
+        return original
+
 
 def execute_manifest(modules, directory, writer, client, *, spawn=None, sleep=time.sleep):
     from loop_manager_internal.verification.core import execute_manifest as execute
@@ -69,9 +146,12 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
             client, coordinated = LocalClient(), False
         def git_value(*arguments):
             return subprocess.run(["git", *arguments], capture_output=True, text=True, check=True, timeout=5).stdout.strip()
-        writer.emit("run_start", version=VERSION, run_id=run_id, mode="partial" if partial_base else "full", adapter=connection.adapter, adapter_support=ADAPTERS[connection.adapter], revision=git_value("rev-parse", "HEAD"), git=git_value("--version"),
+        metadata = writer.emit("run_start", version=VERSION, run_id=run_id, mode="partial" if partial_base else "full", adapter=connection.adapter, adapter_support=ADAPTERS[connection.adapter], revision=git_value("rev-parse", "HEAD"), git=git_value("--version"),
                     python=sys.version, command=sys.argv, cap=cap, coordinated=coordinated,
                     bytecode_policy=bytecode_policy(),
+                    execution_context={"python": str(connection.python), "stages": list(connection.stages),
+                        "parallelism": cap, "coordinated": coordinated, "instrumentation": 1,
+                        "temporary_directory": tempfile.gettempdir(), "pythonpath": os.environ.get("PYTHONPATH")},
                     environment={"host": platform.node(), "platform": sys.platform,
                                  "limits": asdict(ResourceSampler().sample())},
                     estimate={"worker_bytes": DEFAULT_WORKER_BYTES, "measured": False})
@@ -126,7 +206,11 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
                             return 0
                         if partial_base:
                             impact.assert_candidate(connection.root, selection.head, selection.base)
-                        passed = adapter.execute(connection, stage, chosen, stage_directory, writer, client, run_id, entrypoint)
+                        queue = execution_queue(chosen, directory, metadata,
+                            {"version": VERSION, "adapter": connection.adapter,
+                             "adapter_version": ADAPTERS[connection.adapter]["version"], "stages": manifest_stages}, stage["id"])
+                        writer.emit("execution_queue", units=[unit.name for unit in queue])
+                        passed = adapter.execute(connection, stage, queue, stage_directory, writer, client, run_id, entrypoint)
                         if partial_base:
                             impact.assert_candidate(connection.root, selection.head, selection.base)
                             partial_status = "PASS" if passed else "FAIL"
