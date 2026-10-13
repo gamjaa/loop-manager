@@ -303,6 +303,14 @@ class WorkspaceHandler:
                     self.ports._finish_rebase_journal(context)
                     self.ports._complete_rebase_intent(context)
                     return self.ports._context()
+                from loop_manager_internal.git.rebase_documents import has_pending_documents
+                if observed.metadata is not None and has_pending_documents(current, observed):
+                    conflict = self.ports._post_rebase_observation(
+                        context, current.target_base_oid, 'resume document conflict resolution')
+                    if conflict is not None:
+                        return conflict
+                    self.ports._complete_rebase_intent(context)
+                    return self.ports._context()
                 if ((observed.metadata is not None
                          or accepted.reason == 'owned_autostash_restore_pending')
                         and not any(entry.stage for entry in observed.index)):

@@ -346,7 +346,7 @@ class ImpactTests(unittest.TestCase):
     def test_algorithm_identity_change_rejects_old_selection(self):
         selected = self.choose()
         with self.assertRaisesRegex(ValueError, 'algorithm'):
-            impact.selected_modules(replace(selected, algorithm='python-ast-impact-v1/index-v2'), self.modules)
+            impact.selected_modules(replace(selected, algorithm=f'python-ast-impact-v3/index-v{code_index.VERSION}'), self.modules)
 
     def test_builtin_namespaces_and_reexported_loader_aliases_remain_uncertain(self):
         for consumer in (b'__builtins__["__import__"](name)\n',
@@ -441,8 +441,8 @@ class ImpactTests(unittest.TestCase):
             impact.selected_modules(replace(selection, modules=('missing',)), self.modules)
 
     def test_fresh_import_inventory_and_shard_changes_keep_opaque_consumer_fallback(self):
-        # Child-code imports stay uncertain in precheck diagnostics. A changed
-        # load_tests consumer still requires the full collection boundary.
+        # Child-code imports stay uncertain in diagnostics. Inventory or
+        # collection-input changes require the full collection boundary.
         root = Path(__file__).resolve().parents[1]
         helper = 'tests/support/fresh_imports.py'
         shard = 'tests/test_direct.py'
@@ -469,13 +469,35 @@ class ImpactTests(unittest.TestCase):
                     self.assertTrue(selection.analysis['remaining_uncertainties'][label + ':' + helper])
                 expected = ('custom_collection:' + shard,) if old == shard else (
                     ('no_tests_selected',) if status == 'A' else ())
+                expected = tuple(sorted((*expected, 'uncertain_collection_input:' + helper)))
                 self.assertEqual(selection.fallback, expected)
-                if expected:
-                    with self.assertRaises(ValueError):
-                        impact.selected_modules(selection, self.modules)
-                else:
-                    self.assertEqual([module.name for module in impact.selected_modules(selection, self.modules)],
-                                     list(selection.modules))
+                with self.assertRaises(ValueError):
+                    impact.selected_modules(selection, self.modules)
+
+        # Ordinary implementation edits and unrelated opaque readers do not
+        # change the collection inventory or its consumer/helper contract.
+        selection = impact.select_records(self.graph(sources), self.graph(sources),
+            [('M', 'pkg/value.py', 'pkg/value.py')], self.modules,
+            head='head', base='base', configuration={'version': 1})
+        self.assertFalse(selection.fallback)
+        unrelated = dict(sources, **{shard: self.sources[shard]})
+        selection = impact.select_records(self.graph(unrelated), self.graph(unrelated),
+            [('A', None, 'pkg/new.py')], self.modules,
+            head='head', base='base', configuration={'version': 1})
+        self.assertFalse(any(reason.startswith('uncertain_collection_input:')
+                             for reason in selection.fallback))
+
+    def test_opaque_inventory_reaches_collection_through_shared_helpers(self):
+        sources = dict(self.sources, **{
+            'tests/support/inventory.py': b'def inventory(root):\n    return tuple(root.rglob("*.py"))\n',
+            'tests/support/forward.py': b'from tests.support import inventory\n',
+            'tests/test_direct.py': b'from tests.support import forward\ndef load_tests(loader, tests, pattern):\n    return tests\n',
+        })
+        after = dict(sources, **{'pkg/new.py': b'pass\n'})
+        selection = self.choose([('A', None, 'pkg/new.py')], before=sources, after=after)
+        self.assertIn('uncertain_collection_input:tests/support/inventory.py', selection.fallback)
+        with self.assertRaises(ValueError):
+            impact.selected_modules(selection, self.modules)
 
     def test_new_fresh_import_ids_cannot_reuse_an_old_selection(self):
         selection = self.choose()

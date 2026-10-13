@@ -42,8 +42,20 @@ Manager 소유 rebase에서 Requirement·ExecPlan 충돌을 관측한 최신 원
 ## Progress
 
 - [x] 2026-10-10 delta 기준 `50c699c8f9c149cecb0ddf9b081527942d8e2289`부터 `ab0264d94da1212d68141b28fc55f0204c1c9e09`까지 R-082·R-072 변경, 현재 충돌 action/handler와 관련 회귀를 정적으로 대조했다. 구현·테스트·verify를 실행하지 않았다.
-- [ ] 문서 충돌 자동 처리·원형 보존과 targeted unit 검증
-- [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
+- [x] 2026-10-13 `origin/main`의 `b5ea04b2b6cd15c1db16efa5331df156a764c0f1`에서 분리한 `codex/g-255` worktree에 문서 충돌 자동 처리·원형 보존·파일별 index 적용·중단 재개를 구현했다. Requirement 삭제·rename·archive, ExecPlan ID 기반 목적지 선택, 혼합 충돌과 복수 commit 재생을 확인했다. 현재 작업의 삭제·archive·미반영 rename 등 유효성 불확실은 원인·범위를 보존해 기존 복구 경계로 연결한다.
+- [x] 2026-10-13 최종 `bash scripts/verify.sh`에서 관련 `test_rebase_correction` 14개, `test_managed_rebase_lifecycle` 30개, `test_managed_mutation_evidence` 49개, `test_execution_rebase_correction_phase` 34개가 모두 통과했다. 교체/continue 중단과 원격 재전진, autostash 원본 OID 보존 후 잔여 충돌의 Worker 전달까지 실제 Git/SQLite로 확인했다.
+- [x] 2026-10-13 전체 verify를 수행했다: success 3,639, skip 5, failure 5, error 0으로 전체 PASS는 아니다. 테스트 실패로 생략된 compile은 `python3 -m loop_manager_internal.verification.runner --compile loop_manager.py loop_manager_internal`로 별도 실행해 통과했다. `test_manual_work`의 기존 실패 4개와 `test_scope_validation_mutations`의 기존 실패 1개를 변경 전 동일 `origin/main`에서 재현했다.
+- [x] 2026-10-13 구현 후 문서 기준 읽기 전용 재검증: 자동 대상/immutable 원문, 삭제·rename·archive와 catalog/PR 거부, 원형·실행 근거 보존과 파일별 적용, 문서-only/혼합 분기, 재생·중단·원격 재전진의 5개 AC를 코드·관련 회귀와 대조했다. branch/code/index 전체 reset과 사용자 operation 중단은 없으며, base Progress를 현재 후보 성공으로 합성하지 않는다. 기존 verify·Review·게시 gate와 G-256의 단계 판단 책임을 유지한다.
+- [x] 2026-10-13 최신 `origin/main`의 `20e6f0fbfdb6ceb5384d42c83f3904490b441356`으로 rebase했다. upstream의 lifecycle 문서 보고 fixture를 재사용해 중복을 제거하고 문서와 구현을 다시 대조했다. `bash scripts/verify.sh` 전체 PASS: success 3,647, skip 5, failure/error 0이며 compile도 통과했다. 관련 4개 모듈의 127개 테스트도 모두 통과했고 이전 base의 실패 5개는 최신 main에서 해소됐다.
+- [ ] 사용자 Merge
+
+- [x] 2026-10-13 현재 후보 `f2e2f7b0434f0ff2efdd922d0a069c010a6d192b`의 Manager 전체 verify 실패(`test_verify_impact`의 동적 수집 fallback 5개 subtest)를 단일 targeted case로 재현했다. `load_tests`의 직접·간접 입력에 있는 범위 불명 파일 조회를 수집 변경 판정에 연결하고 선택기 version 4로 이전 결과 재사용을 차단했다. 동일 case 재실행과 간접 helper·이전 version 거부의 2개 case가 통과했다. 추가 회귀의 첫 실행은 고정 경로 조회 fixture 때문에 실패해 범위 불명 조회로 수정한 뒤 동일 명령으로 통과했다. 전체 verify와 Review는 Worker가 실행하지 않았으며 Manager의 재검증이 남아 있다.
+
+- [x] 2026-10-13 후보 `cb07751dec9b77dd6ad8b0768949e941483a0f4b`의 Review 두 건을 교정했다. 교체 전 중간 HEAD의 문서 blob을 보존해 staged base 원문과 별도로 검사하고, 채택 이력 전체의 경로를 최종 HEAD·index·작업 파일과 대조해 후속 비충돌 재생으로 달라진 문서의 완료 채택을 거부한다. 관련 3개 unit case는 처음 실행에서 외부 HEAD 거부 assertion이 실패해 문서 증거 불일치의 일반 scope 우회를 막은 뒤 동일 명령으로 통과했다. 기존 사용자 문서 충돌 보존 unit 1개도 통과했다. Git·CLI 관측은 mock이며 실제 Git 통합 회귀·전체 verify·Review는 Worker가 실행하지 않았다. 수정된 후보의 Manager 검증이 남아 있다.
+
+- [x] 2026-10-13 rebase 후 후보 `08eee968b6d793577d21c7124e66e54fe250c547`의 Manager verify 피드백을 단일 `test_fresh_import_inventory_and_shard_changes_keep_opaque_consumer_fallback` case로 재현했다. 수집 입력 불확실성 fallback을 누락한 기대값과 제거된 로컬 `graph` 참조를 현재 선택기 계약·공통 `self.graph`에 맞췄다. 양쪽 revision의 진단, fallback 결과 재사용 거부와 일반 본문 변경·무관한 helper의 비전환 assertion을 유지했다. 동일 명령 재실행은 1 test OK다. 전체 verify·Review는 Worker가 실행하지 않았으며 Manager 재검증이 남아 있다.
+
+- [x] 2026-10-13 후보 `457fe9a3f7590934f6bcdc649fdcf3cda8d558f2`의 후속 uncertain 기록에서 이전 채택 이력이 유실되는 Review issue를 교정했다. 정상 준비와 오류 기록이 같은 이력 보존 구문을 사용한다. 실제 SQLite checkpoint에서 A 채택 → B catalog 오류 → 원격 교정 후 B 적용을 검사하는 단일 unit 회귀는 최초 history 누락 오류를 재현한 뒤 동일 명령으로 1 test OK였다. A의 교체 전 bytes·적용 근거와 기존 실패 기록이 남고 최종 검사가 A와 B를 모두 포함함을 확인했다. Git·catalog 관측은 mock이며 전체 verify·Review는 Worker가 실행하지 않았다. 수정 후보의 Manager 재검증이 남아 있다.
 
 ## Decision Log
 

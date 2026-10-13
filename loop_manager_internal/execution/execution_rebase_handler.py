@@ -1,7 +1,7 @@
 """Rebase execution policy and narrow typed ports."""
 from __future__ import annotations
 from loop_manager_internal.execution.execution_runtime import ExecutionOutcome
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable, Any, Mapping
 from pathlib import Path
 import json
@@ -58,6 +58,7 @@ class RebaseHandlerPorts:
     _row: Callable[[], Mapping[str, object]]
     _stage_evidence_preserved: Callable[..., Any]
     _unmerged_stages: Callable[..., Any]
+    git_bytes: Callable[..., bytes] | None = None
 
 
 class RebaseHandler:
@@ -315,7 +316,7 @@ class RebaseHandler:
                 'agent_session_id': getattr(context, 'worker_session_id', None),
             })
 
-    def _execute_rebase_step(self, context, action):
+    def _execute_rebase_step(self, context, action, *, resolve_documents=True):
         rebase_git = self.ports.git
         token = None
         if action in {CorrectionAction.CONTINUE, CorrectionAction.SKIP}:
@@ -339,6 +340,10 @@ class RebaseHandler:
                 str(context.worktree.resolve()), token,
                 returncode=result.returncode,
             )
+        if resolve_documents and result.returncode:
+            automatic = self._advance_document_rebase(context)
+            if automatic is not None:
+                result = replace(automatic, output=result.output + '\n' + automatic.output)
         return result
 
     def _rebase_journal_checks(self, context):
@@ -389,6 +394,24 @@ class RebaseHandler:
                 str(context.worktree.resolve()), intent['id'],
                 returncode=rebased.returncode,
             )
+        if rebased.returncode:
+            # Automatic document replay can finish (and restore the stash)
+            # before _post_rebase_observation sees the initial Git output.
+            # Persist its identity before any interruptible document mutation.
+            stash_match = re.search(r'Created autostash: ([0-9a-fA-F]{7,64})', rebased.stdout)
+            if stash_match and self.ports.checkpoint is not None:
+                stash = self.ports.git(context.worktree, 'rev-parse', '--verify',
+                                       f'{stash_match.group(1)}^{{commit}}').stdout.strip()
+                current = self.ports.checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
+                self.ports.checkpoint.record(
+                    self.ports.identity.repo, context.plan.plan_id,
+                    expected_generation=current.generation, operation=current.operation,
+                    expected_head=current.expected_head, target_base_oid=current.target_base_oid,
+                    observed_remote_oid=current.observed_remote_oid,
+                    snapshot={**(current.snapshot or {}), 'stash_oid': stash})
+            automatic = self._advance_document_rebase(context)
+            if automatic is not None:
+                rebased = subprocess.CompletedProcess(rebased.args, automatic.returncode, rebased.stdout + '\n' + automatic.output)
         return rebased
 
     def _record_rebase_suboperation(self, context, pending, *, worker_result=None):
@@ -474,9 +497,45 @@ class RebaseHandler:
             accepted, observed, tracked_paths, clean_signatures,
         )
 
+    def _resolve_document_conflicts(self, context):
+        from loop_manager_internal.git import rebase_documents
+        if self.ports.checkpoint is None or self.ports.current_rebase_service is None:
+            return False
+        return rebase_documents.resolve(
+            context=context, identity=self.ports.identity,
+            checkpoints=self.ports.checkpoint, git=self.ports.git,
+            git_bytes=self.ports.git_bytes,
+            require_owned=lambda: self.ports._current_rebase_service(context).require_owned(),
+            capture_snapshot=self.ports.capture_git_snapshot,
+            lookup_pr=self.ports.pr_for_branch,
+        )
+
+    def _advance_document_rebase(self, context):
+        # Each continue may stop on another replayed commit. Resolve documents
+        # at every stop, using a durable per-position intent rather than recursion.
+        result = None
+        while self.ports._rebase_in_progress_for_branch(context.worktree, context.branch):
+            if not self._resolve_document_conflicts(context):
+                break
+            if self.ports._unmerged_stages(context.worktree):
+                break
+            staged = self.ports.git(context.worktree, 'diff', '--cached', '--quiet', check=False)
+            if staged.returncode not in {0, 1}:
+                raise RecoveryFailure(RecoveryReason.STATUS_FAILED, 'document resolution index unavailable')
+            action = CorrectionAction.CONTINUE if staged.returncode else CorrectionAction.SKIP
+            self._record_rebase_suboperation(context, 'continue')
+            continued = self._execute_rebase_step(context, action, resolve_documents=False)
+            result = continued
+            if continued.returncode and not self.ports._unmerged_stages(context.worktree):
+                raise RecoveryFailure(RecoveryReason.REBASE_CONTINUE_FAILED, continued.output)
+        return result
+
     def _post_rebase_observation(self, context, target_oid, output, *, corrected=False,
                                  worker_result=None):
         """A successful exit may leave autostash conflicts without rebase metadata."""
+        automatic = self._advance_document_rebase(context)
+        if automatic is not None:
+            output = automatic.output
         unmerged = self.ports._unmerged_stages(context.worktree)
         in_progress = self.ports._rebase_in_progress_for_branch(
             context.worktree, context.branch
@@ -517,6 +576,10 @@ class RebaseHandler:
                 )
         if not unmerged and not in_progress:
             if checkpoint is not None:
+                from loop_manager_internal.git.rebase_documents import validate_final
+                validate_final(context=context,
+                    checkpoint=checkpoint.get(self.ports.identity.repo, context.plan.plan_id),
+                    git_bytes=self.ports.git_bytes)
                 self.ports.validate_managed_worktree(
                     self.ports.identity.repo_path, context.worktree, context.branch
                 )

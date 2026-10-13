@@ -225,7 +225,7 @@ class ExecutionFixture:
             remote = Remote(self.repo, context.branch, options.get('remote_oid', current.observed_remote_oid))
             observed = SimpleNamespace(remote=remote, head=self.remote,
                 metadata=(('onto', current.target_base_oid),) if in_progress else None,
-                index=(SimpleNamespace(stage=1),) if stages else ())
+                index=(SimpleNamespace(stage=1, path='app.py'),) if stages else ())
             decision = RebaseDecision(RebaseStatus.WAITING if in_progress or stages else RebaseStatus.COMPLETE)
             return SimpleNamespace(expected=SimpleNamespace(remote=remote),
                 observe=lambda **_options: (observed, decision),
