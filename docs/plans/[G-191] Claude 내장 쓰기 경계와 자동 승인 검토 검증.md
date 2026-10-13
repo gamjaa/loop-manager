@@ -63,6 +63,26 @@ Claude의 관리 호출을 provider 이름만으로 일괄 거부하는 현재 �
 
 실제 CLI 정책 조합은 아직 실행 검증하지 않았다. 실환경 점검과 실행 중 managed 정책 변경 대응은 FUTURE_IDEAS의 후속 확인으로 보존하며 현재 구현 완료 조건에 추가하지 않는다. 이용 가능한 환경의 실호출 검증은 추가 근거이며 CLI 설치·계정 확보·유료 호출도 완료 조건이 아니다. 이 문서 정합화는 최신 R-023의 범위 결정을 반영하며 구현·테스트·실제 정책 적용 성공을 뜻하지 않는다.
 
+## Native 정책 갱신 조사와 남은 판단
+
+2026-10-13 Worker는 공식 문서와 [공식 changelog](https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md)의 최신 표기 v2.1.296을 대조했다. 아래는 문서 조사 결과이며 설치 CLI에서 관측한 결과가 아니다. 개발 환경은 Linux/Python 3.12.3이고 Claude executable이 없다. CLI 부재는 아래 제약의 근거나 사용자 판단 요청의 이유가 아니다. 선택 adapter는 `scripts/verify.json` version 1의 unittest이고 `docs/VERIFY.md`의 Python 3.11–3.14 계약을 확인했다.
+
+| 조사한 native 경로 | 확인된 기능·버전 및 제약 |
+|---|---|
+| 실행별 파일·명령 정책 | [파일 권한](https://code.claude.com/docs/en/permissions#read-and-edit)은 `Edit(path)`로 편집 도구를 제한하지만 임의 subprocess에는 적용되지 않는다. `--disallowedTools`는 managed 정책에 추가 제한을 줄 수 있다. [Sandbox](https://code.claude.com/docs/en/sandboxing#configure-sandboxing)의 filesystem 배열은 병합되며, 제외한 설정 source를 sandbox 구성에서도 제외하는 동작은 v2.1.246부터다. 추가 허용이나 빈 배열로 상속 허용을 지웠다고 판단할 수 없다. |
+| managed보다 강한 실행별 제한 | [설정 우선순위 예외](https://code.claude.com/docs/en/settings#exceptions-to-managed-settings-precedence)에는 `autoMode.classifyAllShell=true`가 있으나 sandbox `enabled`, `failIfUnavailable`, `allowUnsandboxedCommands`, `autoAllowBashIfSandboxed`는 없다. [Sandbox의 managed 우선순위](https://code.claude.com/docs/en/sandboxing#keep-developers-from-widening-the-policy)는 managed Boolean 값이 로컬 값을 대체함을 명시한다. 명령 classifier의 검토를 OS 쓰기 제한으로 대신할 수 없다. |
+| 정책 변경 hook | [ConfigChange 계약](https://code.claude.com/docs/en/hooks#configchange)은 로컬 managed 파일 변경을 통지하지만 해당 변경의 blocking 결정을 무시한다. 서버 managed 갱신에는 hook 자체가 실행되지 않는다. 변경을 막는 hook이나 변경 통지 후 종료만으로 모든 managed 갱신에 대한 사전 중단을 보장할 수 없다. |
+| 시작·실행 중 관측 | [서버 managed 설정](https://code.claude.com/docs/en/server-managed-settings#fetch-and-caching-behavior)은 시작 시 fetch와 실행 중 매시간 갱신을 수행한다. `claude doctor`의 remote delivery 진단은 v2.1.248부터이며 현재 fetch 결과이지 다음 갱신을 고정하는 계약이 아니다. `-p`에서 승인 dialog가 필요한 정책도 해당 실행에 적용된다. 시작 검사나 외부 polling 사이에 다음 명령이 실행될 수 있다. |
+| 설정 source 제외·bare mode | [CLI](https://code.claude.com/docs/en/cli-reference)는 `--setting-sources`에 user/project/local만 제공한다. [Bare mode](https://code.claude.com/docs/en/headless#start-faster-with-bare-mode)는 subscription OAuth/keychain을 읽지 않고 API 인증을 요구한다. 이를 기존 계정·지침 계약을 보존하면서 managed 갱신만 고정하는 기능으로 채택할 근거가 없다. `--safe-mode`도 managed 정책을 유지한다. |
+
+구체적 반례는 시작 시 안전한 유효 정책을 확인한 `--print --permission-mode auto` 호출에 서버가 `sandbox.enabled=false` 또는 `sandbox.allowUnsandboxedCommands=true`를 갱신하는 경우다. 전자는 명령 sandbox를 해제하고 후자는 실행별 sandbox 밖 retry 금지를 대체한다. managed 우선순위와 ConfigChange 미통지 때문에 현재 직접 CLI 경로의 시작 검사·설정 지문·hook으로는 갱신 적용과 다음 도구 실행 사이의 중단을 보장할 수 없다. 별도 polling이나 종료 후 diff 검사는 이미 발생한 쓰기를 예방하지 못한다. native Windows 미지원, 상속 충돌의 시작 전 거부와 달리 실행 중 정책을 원자적으로 확인·거부하는 계약이 필요한 반례다.
+
+이는 조사한 직접 CLI 기능에서 R-023과 이 작업의 실행 중 제한 유지·충돌 중단 Acceptance Criteria를 함께 충족할 수 없는 조건이다. 모든 Claude 환경의 기능 부재나 실제 범위 위반 발생을 선언하지 않는다. 해당 조건을 지원으로 표시하거나 mock으로 실제 정책 적용 성공을 합성하지 않으며, 현재 provider 단위 안전 거부는 변경하지 않았다. 독립 Codex 호출·기존 session·snapshot·과거 거부 기록도 변경하지 않았다.
+
+필요한 사용자 판단: 이 조건까지 지원하기 위해 현재 Implementation에서 제외한 별도 OS 쓰기 경계를 허용할지, 또는 native CLI가 갱신 전 확인·중단 계약을 제공할 때까지 해당 조건의 지원 구현을 보류할지 결정이 필요하다. 전자는 Claude 직접 호출의 실행 경계와 설계 변경을 요구하며 자동 승인 검토는 그대로 유지해야 한다. 조직 관리 환경만으로 지원 범위를 축소하거나 유료 호출·새 계정을 요구하는 제안은 아니다. 사용자 결정은 아직 없으며 Requirement·PRODUCT·ARCHITECTURE의 보장과 이 작업의 필수 검증은 수정하지 않았다.
+
+이번 diff는 조사·제약·필요 판단 기록만 포함한다. 실행 가능한 코드·설정·test 변경이 없어 targeted unit test를 실행하지 않았다. 전체 verify·실제 Claude 호출·managed 갱신의 실제 실행 검증도 수행하지 않았다. 구현·검증 완료와 실행 상태 판정은 기록하지 않는다.
+
 ## Decision Log
 
 - 지원 여부를 실제로 확인하지 않는 provider 단위 일괄 거부는 안전한 실패 동작이지만 R-023의 지원 환경 검증 완료 근거가 아니다. 동일한 보안 기준 안에서 확인 가능한 호출만 허용하므로 새 제품 목표나 권한 확대가 아니다.
