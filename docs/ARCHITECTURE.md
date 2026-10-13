@@ -98,7 +98,7 @@ SQLite 손실이나 손상에서의 자동 상태 재구성은 지원하지 않�
 
 프로젝트 문서·계획의 자동 입력은 fetch로 확인한 `origin/<base-branch>`의 특정 commit에서 읽는다. 등록 프로젝트의 기본 checkout에만 있는 파일·수정·commit은 사용자가 push하기 전에는 입력에 포함하지 않는다. 진행 작업은 이 원격 기준에서 만든 관리 worktree의 결과를 보존하며, 선택된 원격 작업 branch의 사용자 수정은 검증 후 반영한다.
 
-ExecPlan의 `Progress` 체크 항목과 본문은 구현 내용·판단·검증 기록이다. 체크가 끝났다는 이유로 `READY`, `PLAN_BLOCKED`, `MERGED` 같은 실행 상태를 바꾸지 않으며, 단계·재시도·session은 SQLite, 실제 PR Merge는 GitHub 확인을 기준으로 한다. 본문 변경은 재평가 입력이고 명시적 `User Decision`은 승인 판정 입력이므로, 본문을 읽지 않거나 변경을 무시한다는 뜻은 아니다.
+ExecPlan의 `Progress` 체크 항목과 본문은 구현 내용·판단·검증 기록이다. 체크가 끝났다는 이유로 `READY`, `PLAN_BLOCKED`, `MERGED` 같은 실행 상태를 바꾸지 않으며, 단계·재시도·session은 SQLite, 실제 PR Merge는 GitHub 확인을 기준으로 한다. 사용자 본문 변경과 `User Decision`은 질문 해소 판단의 입력이며, 실행 상태는 출처·근거·질문별 해소와 게시를 검증한 Manager만 바꾼다.
 
 현재 활성 Requirement 경로는 Planner 입력과 판단·이동의 경로 key이며 `docs/requirements/` 바로 아래 문서만 새 계획 입력이다. 기존 ExecPlan은 `sources` 문자열을 보존한다. Manager는 원격 revision과 worktree에서 같은 Requirement identity helper를 사용해 기록된 활성 경로, 기존 작업에 허용된 같은 파일명의 archive, source 파일명에서 확인한 R ID의 유일한 문서를 순서대로 조회한다. 정확한 경로가 있으면 중복 ID여도 해당 문서를 유지한다. ID 후보가 없거나 여러 개이거나 후보를 읽고 식별할 수 없으면 누락·모호·조회 실패를 구분해 source 관계를 확정하지 않는다. 새 ExecPlan은 정확한 활성 source 경로만 사용할 수 있다. archive는 기존 ExecPlan source의 조회·검증 호환성에만 사용하며 재평가하거나 활성 경로로 자동 복원하지 않는다. FUTURE_IDEAS는 계획 입력·실행 상태가 아니다.
 
@@ -237,7 +237,11 @@ runtime 자식은 병렬 프로젝트 작업을 제출하기 전에 등록된 se
 
 planning worktree는 `<state-dir>/worktrees/<project-id>/planning/<input-fingerprint>/`, 구현 worktree는 `<state-dir>/worktrees/<project-id>/<execplan-id>/`에 둔다. 구현 branch 이름은 `loop-manager/<execplan-id>`다. 계획은 Worker 시작 전에 base에 게시하며 구현 PR에서 처음 생성하지 않는다.
 
-일반 planning snapshot은 실제 PR이 없는 READY·진행 중 선언을 Git 원문과 SQLite의 선언·실행 근거에 결합한다. 실행 이력·branch·worktree·세션·checkpoint는 개정 금지 사유가 아니며, 게시 직전에 실행 근거와 실제 PR 부재를 다시 확인한다. 개정은 실행 상태·세션·실패 이력을 보존하고 이미 시작한 계획의 effective level을 낮추지 않는다. 이름 변경·삭제와 유지보수 snapshot은 기존 미착수·무소유 READY 범위를 유지한다. 계획 삭제는 활성 row 제거와 ID 취소 감사를 같은 transaction에서 기록하며 ID를 재사용하지 않는다. 최초 activation marker는 이후 READY로 돌아와도 유지한다.
+일반 planning snapshot은 실제 PR이 없는 READY·진행 중 선언을 Git 원문과 SQLite의 선언·실행 근거에 결합한다. 실행 이력·branch·worktree·세션·checkpoint는 개정 금지 사유가 아니며, 게시 직전에 실행 근거와 실제 PR 부재를 다시 확인한다. 개정은 실행 상태·세션·실패 이력을 보존하고 이미 시작한 계획의 effective level을 낮추지 않는다. Planner의 직접 이름 변경·삭제와 유지보수 snapshot은 기존 미착수·무소유 READY 범위를 유지한다. 검증된 Requirement 전체 철회는 Manager가 writer·실행 snapshot·실제 PR 부재를 재확인하고 삭제 전 원문·판단 영수증을 보존해 시작한 작업의 문서 취소를 준비할 수 있다. 원격 문서 자체의 삭제도 원문 hash·ancestor revision·완료된 writer 결과·PR 부재를 증명한 범위만 취소한다. 계획 삭제는 활성 row 제거와 ID 취소 감사를 같은 transaction에서 기록하며 ID를 재사용하지 않는다. 취소 이력은 원문·전체 실행 row·관련 선행 참조와 보존 자원의 정리 대기 이유를 가진다. branch·worktree는 그 증거만으로 제거하지 않는다. 최초 activation marker는 이후 READY로 돌아와도 유지한다.
+
+`remote_deletions`는 한 immutable 원격 tree에서 source resolver로 Requirement의 실제 삭제를 archive·rename과 구별하고 이전 원문·근거 revision을 catalog hold에 보존한다. 반복 관측에도 proof와 시작한 작업의 resume_status를 유지한다. Planner의 `REQUIREMENT_RECOVERY`는 source별 전체 철회·남은 목표 유지·불확실을 반환한다. Manager는 유효한 남은 source·dependency와 현재 snapshot을 검증한 변경만 기존 planning manifest·publication transaction에 반영한다. 삭제된 선행 작업의 목표 판단과 대체 dependency는 기존 DEPENDENCY_RECOVERY 경계를 따른다.
+
+`draft_decisions`는 보존된 질문 revision부터 현재 원격 문서의 변경과 경로별 Git author를 관측한다. 저장소에 설정된 사용자 email과 일치하고 기존 Manager publication·catalog/PR 감사의 commit 또는 그 문서 내용으로 설명되지 않는 변경만 사용자 근거로 제공한다. identity·계보·조회가 불확실하면 실행 대기를 유지한다. Planner의 `DRAFT_DECISION_RESULT`는 질문별 답변·새 사용자 원문 인용·근거 경로·남은 질문을 반환하며 Manager가 이를 현재 저장된 근거와 대조한다. Agent가 입력 양식·draft를 직접 해제하는 기존 금지는 유지한다. 정리 전 `execplan_drafts`에 준비 영수증을 저장하며 cleanup hash·현재 입력·revision·원격 게시를 같은 publication transaction에서 확인해 질문별 감사와 대기를 확정한다. 부분 해소·중단 재개에도 이전 결정 감사를 유지하고 source·dependency·실행 이력을 초기화하지 않는다.
 
 사용자가 BLOCKED의 근거 PRODUCT/Requirement를 기본 branch에서 수정한 경우 변경을 commit하고 push해야 한다. Loop Manager는 변경된 `origin/<base-branch>`를 관리 branch에 rebase한 뒤 재개한다. 작업 rebase는 관리 worktree에서 수행하며, 기본 worktree의 파일·index·HEAD는 위 부수 동기화의 안전한 FF·clean 로컬 commit rebase 조건에서만 바꾼다. 사용자는 안내된 관리 worktree의 ExecPlan을 직접 수정할 수도 있다.
 

@@ -277,6 +277,210 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         repeated = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
         self.assertEqual(set(repeated.withheld_plan_ids), {"G-001", "G-002"})
 
+    def test_proven_finished_writer_cancellation_preserves_started_history(self):
+        self._remote_deletion(started=True, new_plan=True)
+        self.connection.execute("UPDATE exec_plans SET worker_result='완료된 Worker 결과' WHERE plan_id='G-001'")
+        self.connection.commit()
+        result = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+        self.assertEqual(set(result.withheld_plan_ids), {"G-002"})
+        self.assertIsNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+        audit = self.connection.execute("SELECT * FROM execplan_cancellations WHERE plan_id='G-001'").fetchone()
+        history = json.loads(audit["recovery_evidence"])
+        self.assertEqual(history["row"]["worker_session_id"], "saved")
+        self.assertEqual(history["row"]["worker_result"], "완료된 Worker 결과")
+        self.assertEqual(history["affected"], ["G-002"])
+        repeated = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+        self.assertEqual(set(repeated.withheld_plan_ids), {"G-002"})
+        self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM execplan_cancellations").fetchone()[0], 1)
+        self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-007'").fetchone())
+
+    def test_requirement_deletion_cancels_only_withdrawn_and_preserves_shared_goal(self):
+        self._requirement_deletion_recovers()
+
+    def test_requirement_deletion_started_history_and_shared_resume_are_preserved(self):
+        self._requirement_deletion_recovers(started=True)
+
+    def _requirement_deletion_recovers(self, *, started=False):
+        from loop_manager_internal.catalog import remote_deletions
+        source = "docs/requirements/R.md"
+        first = plan_text("G-001", "First").replace("  - docs/PRODUCT.md", "  - " + source)
+        second = plan_text("G-002", "Second").replace("  - docs/PRODUCT.md", "  - docs/PRODUCT.md\n  - " + source)
+        for key, text in (("G-001", first), ("G-002", second)):
+            (self.repo / self.paths[key]).write_text(text, encoding="utf-8", newline="\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "connect requirement goals")
+        base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", base)
+        loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+        if started:
+            self.connection.execute("UPDATE exec_plans SET ever_started=1, worker_session_id='saved', worker_result='completed'")
+            self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING' WHERE plan_id='G-002'")
+            self.connection.commit()
+        (self.repo / source).unlink()
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-m", "withdraw only requirement")
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", self.base)
+        observed = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+        self.assertEqual(set(observed.withheld_plan_ids), {"G-001", "G-002"})
+        loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+        snapshot = loop_manager.mutable_ready_snapshot(self.connection, str(self.repo), self.repo, self.base)
+        self.assertEqual(set(snapshot.by_id), {"G-001", "G-002"})
+        goal = json.loads(snapshot.recovery_goals[0])
+        self.assertEqual(goal["kind"], "missing-source")
+        self.assertIn("# Requirement", json.loads(goal["evidence"])["text"])
+        decisions = [{"id": "G-001", "source": source, "outcome": "withdrawn", "reason": "삭제된 요구만의 목표가 철회됨"},
+                     {"id": "G-002", "source": source, "outcome": "retained", "reason": "PRODUCT의 공유 목표가 남아 있음"}]
+        self.connection.execute("UPDATE projects SET planning_result=? WHERE repo=?",
+            ("REQUIREMENT_RECOVERY: " + json.dumps(decisions), str(self.repo)))
+        self.connection.commit()
+        if not started:
+            (self.repo / self.paths["G-001"]).unlink()
+        (self.repo / self.paths["G-002"]).write_text(plan_text("G-002", "Second"), encoding="utf-8", newline="\n")
+        result = loop_manager.validate_planner_result(self.repo, self.base, loop_manager.changed_files(self.repo),
+            connection=self.connection, repo=str(self.repo), mutable_snapshot=snapshot)
+        self.assertEqual([item.snapshot.plan_id for item in result.deletions], ["G-001"])
+        self.assertEqual([item.snapshot.plan_id for item in result.revisions], ["G-002"])
+        self.assertEqual(loop_manager.validate_planner_result(self.repo, self.base, loop_manager.changed_files(self.repo),
+            connection=self.connection, repo=str(self.repo), mutable_snapshot=snapshot), result)
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-m", "publish requirement recovery")
+        published = git(self.repo, "rev-parse", "HEAD")
+        with self.connection:
+            planning_publication_state.apply_mutable_catalog_changes(self.connection, str(self.repo),
+                deletions=result.deletions, revisions=result.revisions, snapshot_token=snapshot.token,
+                plan_commit=published, content_hash=lambda path: hashlib.sha256((self.repo / path).read_bytes()).hexdigest())
+            remote_deletions.resolve_recovery(self.connection, snapshot, published, {"G-001", "G-002"})
+            from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
+            RuntimeStateRepository(self.connection).clear(str(self.repo))
+        git(self.repo, "update-ref", "refs/remotes/origin/main", published)
+        refreshed = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+        self.assertTrue(refreshed.usable, refreshed)
+        self.assertIsNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-001'").fetchone())
+        row = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-002'").fetchone()
+        self.assertEqual(json.loads(row["sources"]), ["docs/PRODUCT.md"])
+        self.assertEqual(row["status"], "IMPLEMENTING" if started else "READY",
+            [dict(held) for held in self.connection.execute("SELECT * FROM execplan_catalog_holds")])
+        if started:
+            self.assertEqual(row["worker_session_id"], "saved")
+        audit = self.connection.execute("SELECT recovery_evidence FROM execplan_cancellations WHERE plan_id='G-001'").fetchone()
+        self.assertEqual(json.loads(audit[0])["judgment"]["decision"]["outcome"], "withdrawn")
+        if started:
+            self.assertEqual(json.loads(audit[0])["row"]["worker_session_id"], "saved")
+
+    def test_started_remote_deletion_rechecks_actual_pr_before_cancelling(self):
+        self._remote_deletion(started=True, new_plan=True)
+        self.connection.execute("UPDATE exec_plans SET branch='loop-manager/G-001', worker_result='completed' WHERE plan_id='G-001'")
+        self.connection.commit()
+        for response in ({"url": "https://example.test/pull/1"}, RuntimeError("조회 불가")):
+            with self.subTest(response=response), mock.patch.object(loop_manager, "pr_for_branch") as observe:
+                if isinstance(response, Exception):
+                    observe.side_effect = response
+                else:
+                    observe.return_value = response
+                result = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+                self.assertIn("G-001", result.withheld_plan_ids)
+                self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM execplan_cancellations").fetchone()[0], 0)
+                self.assertIsNotNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-007'").fetchone())
+        with mock.patch.object(loop_manager, "pr_for_branch", return_value=None):
+            loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+        audit = json.loads(self.connection.execute("SELECT recovery_evidence FROM execplan_cancellations WHERE plan_id='G-001'").fetchone()[0])
+        self.assertEqual(audit["row"]["branch"], "loop-manager/G-001")
+        self.assertTrue(audit["cleanup_pending"])
+
+    def test_requirement_body_answer_is_proven_and_cleanup_is_publication_bound(self):
+        from loop_manager_internal.catalog import draft_decisions, execplan_catalog, execplan_drafts
+        from loop_manager_internal.storage import execplan_draft_state
+        from tests.support.catalog import draft_text
+        git(self.repo, "remote", "add", "origin", "https://github.com/example/project.git")
+        path = self.paths["G-001"]
+        source = "docs/requirements/[R-001] Original.md"
+        renamed = "docs/requirements/[R-001] Renamed.md"
+        (self.repo / "docs/requirements/R.md").unlink()
+        (self.repo / source).write_text("# [R-001] Original\n", encoding="utf-8", newline="\n")
+        text = draft_text("G-001", "First").replace("docs/PRODUCT.md", source)
+        (self.repo / path).write_text(text, encoding="utf-8", newline="\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "publish draft")
+        base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", base)
+        loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+        answer = "Use policy A and retain history."
+        (self.repo / source).rename(self.repo / renamed)
+        (self.repo / renamed).write_text("# [R-001] Renamed\n\n" + answer + "\n", encoding="utf-8", newline="\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "user answers requirement")
+        base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", base)
+        loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+        saved = execplan_draft_state.evidence(self.connection, str(self.repo), "G-001")
+        self.assertTrue(saved["user_changes"][renamed]["verified"])
+        snapshot = loop_manager.mutable_ready_snapshot(self.connection, str(self.repo), self.repo, base)
+        (self.repo / path).write_text(draft_decisions.replace_section(text, "Implementation", answer), encoding="utf-8", newline="\n")
+        assessment = [{"id": "G-001", "revision": saved["revision"], "remaining": "",
+            "resolved": [{"question": draft_decisions.questions(saved["question"])[0],
+                          "answer": answer, "source": renamed, "quote": answer}]}]
+        self.connection.execute("UPDATE projects SET planning_result=? WHERE repo=?", (draft_decisions.PREFIX + json.dumps(assessment), str(self.repo)))
+        self.connection.commit()
+        result = loop_manager.validate_planner_result(self.repo, base, loop_manager.changed_files(self.repo),
+            connection=self.connection, repo=str(self.repo), mutable_snapshot=snapshot)
+        restored = loop_manager._planning_result_from_manifest(loop_manager._planning_result_manifest(result))
+        self.assertEqual(restored, result)
+        self.assertEqual(len(result.revisions), 1)
+        self.assertNotIn("## Draft Decision", (self.repo / path).read_text())
+        self.assertIn("G-001", execplan_draft_state.pending_ids(self.connection, str(self.repo)))
+        with self.assertRaisesRegex(RuntimeError, "근거"), self.connection:
+            planning_publication_state.apply_mutable_catalog_changes(self.connection, str(self.repo),
+                deletions=(), revisions=result.revisions, snapshot_token=snapshot.token, plan_commit=base,
+                content_hash=lambda path: execplan_catalog.plan_content_hash((self.repo / path).read_bytes()), draft_inputs=lambda plan: {})
+        self.assertIn("G-001", execplan_draft_state.pending_ids(self.connection, str(self.repo)))
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "publish answer cleanup")
+        published = git(self.repo, "rev-parse", "HEAD")
+        with self.connection:
+            planning_publication_state.apply_mutable_catalog_changes(self.connection, str(self.repo),
+                deletions=(), revisions=result.revisions, snapshot_token=snapshot.token, plan_commit=published,
+                content_hash=lambda path: execplan_catalog.plan_content_hash((self.repo / path).read_bytes()),
+                draft_inputs=lambda plan: execplan_drafts.input_digests(self.repo, plan))
+        self.assertNotIn("G-001", execplan_draft_state.pending_ids(self.connection, str(self.repo)))
+        history = execplan_draft_state.evidence(self.connection, str(self.repo), "G-001")["resolutions"]
+        self.assertEqual(history[0]["user_changes"][renamed]["commit"], base)
+        self.assertEqual(history[0]["publication_revision"], published)
+
+    def test_managed_or_unrecognized_author_does_not_create_user_approval(self):
+        from loop_manager_internal.storage import execplan_draft_state
+        from tests.support.catalog import draft_text, accepted_text
+        git(self.repo, "remote", "add", "origin", "https://github.com/example/project.git")
+        path = self.paths["G-001"]
+        text = draft_text("G-001", "First")
+        (self.repo / path).write_text(text, encoding="utf-8", newline="\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "publish draft")
+        base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", base)
+        loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+        revision = execplan_draft_state.evidence(self.connection, str(self.repo), "G-001")["revision"]
+        (self.repo / path).write_text(accepted_text(text, revision), encoding="utf-8", newline="\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "--author=Other <other@example.test>", "-m", "foreign answer")
+        remote = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", remote)
+        loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+        saved = execplan_draft_state.evidence(self.connection, str(self.repo), "G-001")
+        self.assertFalse(saved["user_changes"][path]["verified"])
+        (self.repo / path).write_text(accepted_text(text, revision, answer="Use policy B."), encoding="utf-8", newline="\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "managed answer")
+        managed = git(self.repo, "rev-parse", "HEAD")
+        self.connection.execute("UPDATE exec_plans SET publication_sha=? WHERE plan_id='G-001'", (managed,))
+        self.connection.commit()
+        git(self.repo, "update-ref", "refs/remotes/origin/main", managed)
+        loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+        saved = execplan_draft_state.evidence(self.connection, str(self.repo), "G-001")
+        self.assertFalse(saved["user_changes"][path]["verified"])
+        self.assertFalse(saved["decision_ready"])
+        self.assertIn("G-001", execplan_draft_state.pending_ids(self.connection, str(self.repo)))
+
     def test_missing_started_plan_reference_recovery_requires_published_judgment(self):
         (self.repo / 'docs/requirements/R.md').unlink()
         body = plan_text('G-002', 'Second').replace('docs/PRODUCT.md', 'docs/requirements/R.md')

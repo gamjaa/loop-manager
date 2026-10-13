@@ -45,16 +45,13 @@ Purpose를 유지하고 전체 프로젝트 구조·실제 verify 명령을 확�
 
 ## ExecPlan 작성 기준
 
-- docs/PLANS.md의 형식을 유지하고 목표·변경 범위·완료 조건부터 명확히 써라. 상위 명세·공통 검증 규칙은 sources와 필요한 참조로 연결하며 본문에 길게 반복하지 마라.
-- complexity는 남은 설계·추론 난도로 판정하라: low는 기존 패턴의 국소 변경, medium은 경계가 명확한 여러 모듈·상태 전이·오류 처리, high는 불변식·중단 복구·동시성·재설계의 중요한 판단이 남은 경우다. 파일 수·코드 길이·작업 시간·핵심 경로·risk만으로 high를 정하지 마라.
-- risk는 잘못 구현했을 때의 구체적인 영향과 복구 가능성이다: low는 국소적이고 쉽게 되돌림, medium은 제한된 동작·진행 오류와 기존 복구, high는 중요한 실행·권한·게시·저장 계약의 광범위한 영향과 수동 복구, critical은 비가역 손실·비밀 노출·소유권 밖 쓰기처럼 복구가 불가능하거나 매우 어려운 영향이다. Git·SQLite·sandbox·보안·복구 코드라는 이유만으로 높이지 마라. 외부 부작용을 코드 rollback으로 복구한다고 가정하지 마라.
-- 새 계획과 개정 권한이 있는 READY 계획의 본문에 complexity·risk의 짧은 근거를 남겨라. high complexity는 남은 설계 판단, high·critical risk는 실제 실패 영향·복구 수단과 관련 Acceptance Criteria·Validation·Review 시나리오를 구체화하라. 사용자 정책 모호함을 높은 effort로 대신 결정하지 마라. 최초 level은 complexity 1·3·5에 critical risk만 1을 더한 1~6이며 Model·Effort는 프로그램이 명시 설정에서 선택한다. metadata 보존 mode와 draft·사용자 결정 경계를 우선하라.
-- Acceptance Criteria는 관찰·검증 가능한 결과로, Implementation은 변경할 책임 경계와 핵심 방향으로 작성하라. 구현자가 코드에서 결정할 수 있는 파일·함수별 절차는 미리 고정하지 말고, 순서가 안전성이나 계약을 보장하는 경우만 구체화하라.
-- Validation에는 이 작업 고유의 targeted test와 전체 verify 회귀 조건을 남겨라. Progress는 실제 진행, Decision Log는 중요한 결정과 이유를 기록하고 상세 실행 로그는 필요한 증거만 참조하라.
-- 간결화해도 결정·예외·실패 시 보존과 재개·Acceptance Criteria를 생략하지 마라. 기존 계획 개정에서는 해당 snapshot·mode의 변경 범위와 목표 보존 조건을 우선하고, 길이 제한으로 내용을 삭제하거나 권한을 확대하지 마라.
-- 일반 계획 작성에서 구현 방향에 사용자 판단이 필요하면 유효한 ID/sources/depends_on과 목표를 보존한 계획에 frontmatter `draft: true`를 선언하라. `Draft Decision` 절에 Question, Facts, Options, Impact를 각각 비어 있지 않은 `필드: 내용` 줄로 적고 미결정 구현은 명시하라. draft와 독립 실행 가능 계획은 같은 batch로 게시된다. 같은 질문은 기존 ID에서 보존·개정하며 새 계획으로 반복하지 마라.
-- draft와 그 의존 작업은 Worker·workspace·branch·PR을 시작하지 않고 독립 작업은 계속한다. draft는 planning 오류나 완료가 아니다. snapshot 밖·실행 이력·소유권이 있는 계획은 draft로 전환하지 마라. 기존 사용자 판단 대기 draft를 삭제하지 마라.
-- `User Decision` 절은 사용자만 작성한다. 사용자는 원격 계획의 draft 표시를 제거하고 Decision: approve, Revision: compact catalog의 decision_wait.revision 판단 지문, Answer: 질문에 대한 구체적 답변을 기록한다. reject/defer 또는 불완전한 결정은 계속 대기한다. 관련 목표·질문·source·설계 근거가 바뀌면 새로운 revision에 대한 결정을 받아야 한다. Agent는 결정 작성·변경이나 draft 해제로 자기 승인하지 마라. 기존 문서 draft는 별도 계약이다.
+본문 구성·체크리스트·확인한 파일과 변경 목적·작업별 Validation·Progress·Decision Log·complexity/risk 근거는 [PLANS.md의 본문 작성](PLANS.md#execplan-본문-작성)을 따른다. 변경·미충족 작업·관련 미착수 개정을 우선하고 이미 구현된 목표를 중복 계획하지 않는다. 새 source·부분 조건 변경·삭제의 영향을 작업 항목·공유 구현·검증·dependency까지 대조하며 snapshot 밖의 권한을 넓히지 않는다.
+
+최초 level은 complexity 1·3·5에 critical risk만 1을 더한 1~6이며 Model·Effort는 프로그램의 명시 설정으로 선택한다. 사용자 정책 모호함을 높은 effort로 대신 결정하지 않는다.
+
+일반 계획 작성에서 사용자 판단이 필요하면 유효한 ID/sources/depends_on과 목표를 보존해 `draft: true`를 선언한다. `Draft Decision`에 Question, Facts, Options, Impact를 비어 있지 않은 `필드: 내용` 줄로 기록한다. 여러 질문은 답변 관계를 구분하고 같은 질문은 기존 ID에서 유지·개정한다. draft와 독립 계획은 함께 게시되며 draft·의존 작업에는 Worker·workspace·branch·PR을 시작하지 않는다. 실행·소유 이력 있는 계획을 draft로 전환하거나 기존 사용자 판단 대기 draft를 임의 삭제하지 않는다.
+
+사용자는 Requirement/ExecPlan 본문 또는 User Decision의 Decision·Answer·Revision으로 판단을 전달한다. 사용자의 draft 제거·정해진 양식 반복을 필수로 요구하지 않는다. Planner는 이전 질문과 Manager가 제공한 사용자 변경 근거를 비교해 질문별 해소·남은 판단·목표 및 완료 조건의 영향을 반환한다. 자기 추론이나 문서 수정으로 승인을 만들거나 User Decision을 작성·변경하지 않는다. 검증된 결정의 본문 반영·임시 입력 정리·draft 전환과 감사·게시·DB 반영은 Manager가 수행한다. 부분 해소·거절·보류·불충분·상충·출처 불확실은 남은 대기를 유지한다.
 
 ## Verify adapter 도입 판단
 

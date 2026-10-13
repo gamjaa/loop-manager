@@ -2,7 +2,7 @@
 
 ## Context
 
-PR 전 ExecPlan 개정과 stage_documents의 단계별 문서 반영은 이미 구현됐다. 같은 ID·작업물·기록 보존과 발견 단계별 대응을 유지하고 Planner 단계 경계의 갱신·정상 사용자 rebase 수용에 남은 조건만 보완한다.
+PR 전 ExecPlan 개정과 stage_documents의 단계별 문서 반영은 이미 구현됐다. 같은 ID·작업물·기록 보존과 발견 단계별 대응을 유지하면서 Requirement 추가·수정의 의미가 작업 항목·관련 파일·검증·관계와 실행 DB에 일치하도록 보완한다. Planner 단계 경계의 갱신·정상 사용자 rebase 수용에 남은 조건도 유지한다.
 
 원격 확인과 문서 관련성 판단은 후보 검증과 구분한다. ref 갱신만으로 차단하지 않고 실제 문서·후보·검증 입력 변화에 해당하는 단계만 다시 수행해야 한다.
 
@@ -11,6 +11,30 @@ PR 전 ExecPlan 개정과 stage_documents의 단계별 문서 반영은 이미 �
 진행 중 작업은 최신 원격 문서에 맞춰 갱신하되, 문서 변경만으로 구현을 반복하지 않아야 한다. 이 Requirement는 [R-049](archive/%5BR-049%5D%20Input-Specific%20Planner%20Roles.md)의 미착수 READY 갱신 제한과 [R-051](archive/%5BR-051%5D%20Remote%20Change%20Rebase%20and%20Managed%20Work%20Resumption.md)의 Worker·Reviewer 문서 재확인 범위를 아래 정책으로 변경한다. [R-072](%5BR-072%5D%20%EC%9E%85%EB%A0%A5%20%EB%8F%99%EC%9D%BC%EC%84%B1%EC%9D%B4%20%EC%A6%9D%EB%AA%85%EB%90%9C%20%EA%B5%AC%ED%98%84%20%ED%9B%84%EB%B3%B4%20%EC%84%B1%EA%B3%B5%20%EA%B2%B0%EA%B3%BC%20%EC%9E%AC%EC%82%AC%EC%9A%A9.md)의 입력 증명·성공 근거 재사용은 유지하되, 관련 문서 변경에 따른 단계 선택은 이 Requirement를 따른다.
 
 ## Requirement
+
+### Requirement 변경과 작업·DB 동기화
+
+일반 Planner는 검증한 최신 원격의 Requirement 변경 전후 동작·조건·Acceptance Criteria를 현재 구현·테스트·기존 ExecPlan·PR과 비교한다. 파일 내용이나 source 목록이 바뀌었다는 사실만으로 새 작업을 생성하지 않고 실제 미충족 목표와 영향받는 작업을 식별한다. 직접 sources뿐 아니라 적용 제품 규칙·작업 항목·본문·공유 구현·검증·dependency의 의미를 확인한다.
+
+| 변경 | 계획 반영 |
+|---|---|
+| 신규 Requirement | 이미 구현되거나 기존 작업이 담당하는 목표는 중복 생성하지 않는다. 관련 미착수 작업으로 처리할 수 있으면 개정을 우선하고 독립적인 미충족 목표에만 새 ExecPlan을 만든다. 필요한 source·dependency를 연결한다. |
+| Requirement 수정 | 변경·추가·삭제된 조건과 완료 기준을 구분한다. 기존 작업의 목표 안이면 허용된 같은 ID 개정으로 반영하고 독립 목표는 새 작업으로 분리한다. 달라진 작업 체크리스트·관련 파일과 변경 목적·Validation·sources·dependency를 함께 갱신한다. |
+| 일부 Acceptance Criteria 삭제 | 삭제 조건에만 필요한 미구현 항목·테스트·참조를 제거하고 남은 조건·다른 Requirement·PRODUCT 목표와 공유 구현은 보존한다. 모든 현행 목표가 불필요해진 작업의 삭제·취소는 R-055를 따른다. |
+| Requirement 전체 삭제 | 전체 철회·일부 근거 삭제·남은 목표를 R-055에서 판단하고 관련 문서·DB의 취소·개정을 반영한다. 경로 부재만으로 취소하지 않는다. |
+| 완료 Requirement archive·같은 identity의 rename | 완료 보관·경로 변경으로 구분한다. R-071의 source resolver와 기존 경로 문자열 호환을 유지하고 목표 철회·중복 작업을 만들지 않는다. |
+| 이미 구현·Merge한 기능의 새 변경 | 현재 구현과 달라져야 하는 범위만 새 변경으로 계획한다. 기존 완료·Merge·검증 기록을 초기화하지 않는다. 제품 동작의 되돌림도 명세가 요구하는 새 변경으로 다룬다. |
+| 원격 조회 실패·revision 불일치·관련성 불확실 | 부재·변경 없음·동기화 완료로 확정하지 않는다. 영향 범위의 근거를 보존해 재관측·보류하고 유효한 독립 작업은 기존 정책대로 계속한다. |
+
+여러 Requirement가 하나의 ExecPlan에 연결되면 작업 항목·공유 구현·관련 완료 기준과 근거 ID의 관계를 최소한의 본문 참조로 식별한다. 한 근거의 조건이 바뀌거나 삭제돼도 다른 근거에 필요한 작업·테스트·공통 구현은 보존한다. 단순 source 경로 삭제로 부분 변경의 의미를 처리하지 않는다. 전체 Requirement에 새 기준 ID나 metadata를 일괄 추가하지 않으며 변경하는 작업에 필요한 관계만 명확히 한다.
+
+미착수·무소유 READY의 개정을 우선하고 실행 이력이 있는 작업·PR의 처리는 아래 갱신 경계를 따른다. 문서 갱신은 이미 구현한 결과와 기존 검증 근거를 무조건 초기화하거나 새 조건의 성공으로 바꾸는 근거가 아니다. 미충족 조건과 유효한 과거 근거를 구분하고, 필요한 선행 목표를 dependency 제거만으로 우회하지 않는다. source·dependency의 최종 graph와 실제 선행 PR Merge gate를 유지한다.
+
+Manager는 기존 snapshot·원격 revision·content hash·현재 실행 및 소유권의 CAS 검증과 publication intent를 재사용한다. 원격 최종 변경을 확인한 뒤 같은 결과의 새 계획 등록·개정 선언·source·dependency·선택 자격·입력 지문을 SQLite transaction에 반영한다. 삭제·취소 row와 감사는 R-055, 판단 대기·결정 입력 정리는 R-061을 따른다. PR·수동 예약·writer·소유권이 바뀌면 오래된 수정안을 적용하지 않으며 snapshot 밖의 변경 권한을 만들지 않는다.
+
+문서 게시와 DB 적용 사이 중단은 실제 원격 결과와 저장된 intent를 대조해 미완료 반영부터 재개한다. 원격 게시 또는 DB 일부 변경만으로 전체 동기화를 확정하지 않고, 같은 변경 재처리에서 중복 계획·취소·실행·지문 성공을 만들지 않는다. 변경의 의미를 판단하는 Planner와 검증·게시·원자 적용을 담당하는 Manager의 경계를 유지한다.
+
+현재 `planning/input_fingerprints.py`, `planning/planner_validation.py`, `planning/planner_publication.py`, `storage/planning_publication_state.py`, `storage/execplan_catalog_state.py`의 변경 감지·개정·원자 적용을 재사용하는 것이 기준이다. 경로는 `loop_manager_internal/` 아래다. 관련 `tests/test_incremental_planning.py`, `tests/test_execplan_catalog_state.py`, `tests/test_planning_publication.py`, `tests/test_planning_requirement_moves.py`에는 변경 감지·선언 delta·transaction·경합·archive 회귀가 있다. 이 기존 보장은 의미별 작업 동기화 전체의 완료 증거와 구분한다. 새 구현은 이미 있는 G-242·G-243·G-257~G-261과 중복하지 않는 미충족 범위만 계획한다.
 
 ### ExecPlan 갱신 경계
 
@@ -87,6 +111,11 @@ Reviewer를 먼저 진행한 결과가 구현 부족이면 Worker 교정 후 필
 
 ## Acceptance Criteria
 
+- 신규 Requirement의 목표가 이미 구현됐거나 기존 작업으로 충족되면 중복 ExecPlan이 생성되지 않는다. 기존 미착수 작업의 허용 개정과 독립적인 미충족 목표의 신규 생성이 구분되며 source·dependency와 DB 관계가 일치한다.
+- Requirement 수정의 변경 전후 동작·조건·완료 기준과 관련 작업을 확인할 수 있다. 변경·삭제된 항목의 체크리스트·관련 파일·변경 목적·Validation·source·dependency가 함께 갱신되고 이미 구현한 결과·유효한 검증·세션·실패·PR 이력은 보존된다.
+- 복수 Requirement의 일부 조건 또는 완료 기준만 삭제되면 그 부분의 작업·검증·참조만 제거된다. 다른 Requirement·PRODUCT의 목표와 공유 구현은 유지되고 필요한 선행 목표는 유효한 dependency로 남는다. 전체 철회만 R-055의 삭제·취소로 연결된다.
+- 실제 삭제·완료 archive·rename·일부 조건 삭제·Merge 뒤 새 변경·조회 실패·revision 경쟁을 구분한다. 보관·경로 부재나 조회 실패로 취소하지 않고, 완료한 기능의 새 변경은 과거 MERGED를 초기화하지 않는 미충족 작업으로 계획한다.
+- 원격 게시 확인 뒤 새 등록·개정·source·dependency·선택 관계가 같은 SQLite transaction으로 반영된다. snapshot·원격 또는 DB 소유권 경쟁에서는 오래된 반영이 거부되며, push 뒤 DB 미적용·transaction 중단·재시작은 저장 근거로 멱등하게 복구된다. 동일 입력의 중복 계획·취소·실행과 수행하지 않은 성공 기록이 없다.
 - Planner의 진입·종료·교정·게시 경계마다 최신 원격 명세·ExecPlan을 확인한다. 작성 중 갱신은 writer 종료 뒤 반영하며 기존 ID·결과·실패 이력을 불필요하게 폐기하지 않는다.
 
 - 실행 이력이 있는 READY와 IMPLEMENTING·VERIFYING·REVIEWING 상태의 PR 미등록 ExecPlan은 관련 Requirement 변경에 따라 같은 ID로 갱신할 수 있다. 기존 branch·worktree·세션·원격 checkpoint만으로 대상에서 제외되지 않으며 작업물과 실행 이력이 보존된다.
@@ -113,6 +142,7 @@ Reviewer를 먼저 진행한 결과가 구현 부족이면 Worker 교정 후 필
 
 ## Product Impact
 
+- Requirement의 추가·수정·부분 철회가 실제 미충족 작업·공유 목표·문서와 현재 DB 관계에 일치하고 완료된 구현·감사는 보존된다.
 - ExecPlan 갱신 가능 여부는 실행 이력보다 PR 등록 경계를 기준으로 판단한다.
 - 현재 작업에 적용되는 원격 문서는 각 단계 진입 시 반영되고, 부족한 구현·검증에 맞춰 필요한 단계로 연결된다.
 - 계획·작업 문서 충돌은 최신 base를 코드로 채택하고, 그 외 파일 충돌은 Worker가 최신 조건에 맞춰 해결한다.
@@ -124,7 +154,3 @@ Reviewer를 먼저 진행한 결과가 구현 부족이면 Worker 교정 후 필
 - 진행 중 프로세스를 강제 중단하거나 같은 프로젝트의 작업·Planner를 병렬 실행하지 않는다.
 - 일반 Planner에 코드·설정 수정 권한을 주거나 Reviewer의 읽기 전용·테스트 미실행 원칙을 바꾸지 않는다.
 - 다른 작업의 선택·우선순위, 유지보수 주기와 사용자 승인 정책을 변경하지 않는다. 공통 Git 수용·통합·게시 분리는 R-055를 따른다.
-
-## Open Questions
-
-- 없음

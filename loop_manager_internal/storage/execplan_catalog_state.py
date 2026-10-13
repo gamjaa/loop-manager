@@ -244,6 +244,8 @@ class PinnedCatalog:
     remote_url: str | None = None
     definition_revisions: tuple[tuple[str, str], ...] = ()
     reserved_intake_ids: frozenset[str] = frozenset()
+    draft_changes: Mapping[str, Mapping] | None = None
+    requirement_deletions: Mapping[str, Mapping] | None = None
 
 
 def new_declaration_issues(
@@ -832,6 +834,7 @@ class DefinitionStateRepository:
                                 execplan_draft_state.observe(
                                     self.connection, repo, entry.path, entry.metadata(), entry.content_hash,
                                     pinned.revision_sha, inputs=pinned.draft_inputs, remote_url=pinned.remote_url,
+                                    user_changes=(pinned.draft_changes or {}).get(plan_id),
                                 )
                             changed.append(plan_id)
                             self._fault(f"after-plan:{plan_id}")
@@ -840,6 +843,7 @@ class DefinitionStateRepository:
                         execplan_draft_state.observe(
                             self.connection, repo, entry.path, entry.metadata(), entry.content_hash,
                             pinned.revision_sha, inputs=pinned.draft_inputs, remote_url=pinned.remote_url,
+                            user_changes=(pinned.draft_changes or {}).get(plan_id),
                         )
                     sources = json.dumps(
                         entry.sources, ensure_ascii=False, separators=(",", ":")
@@ -944,15 +948,20 @@ class DefinitionStateRepository:
                   for item in pinned.snapshot.issues]
         held = {key: json.dumps({"revision": pinned.revision_sha,
                     "plan_id": key, "path": path, "content_hash": content_hash,
-                    "causes": issues}, ensure_ascii=False, sort_keys=True)
+                    "causes": issues, "deleted_sources": dict(pinned.requirement_deletions or {})}, ensure_ascii=False, sort_keys=True)
                 for key, path, content_hash in pinned.snapshot.withheld}
         for key, _revision, prior, _phase in expected.holds:
             prior = json.loads(prior)
-            if key in held and prior.get("resolved_references"):
+            if key in held:
                 current = json.loads(held[key])
+                missing_sources = {item.get("source") for item in issues if item["code"] == "missing-source"}
+                current["deleted_sources"].update({source: proof for source, proof in prior.get("deleted_sources", {}).items()
+                    if source in missing_sources and source not in current["deleted_sources"]})
                 if current.get("content_hash") == prior.get("content_hash"):
-                    current["resolved_references"] = prior["resolved_references"]
-                    held[key] = json.dumps(current, ensure_ascii=False, sort_keys=True)
+                    for field in ("resolved_references", "prepared_withdrawal"):
+                        if field in prior:
+                            current[field] = prior[field]
+                held[key] = json.dumps(current, ensure_ascii=False, sort_keys=True)
         previous = {item[0]: item[3] for item in expected.holds}
         resume = {key: previous.get(key) for key in held}
         for row in expected.rows:
