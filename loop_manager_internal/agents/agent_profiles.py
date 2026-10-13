@@ -15,6 +15,7 @@ import re
 
 from loop_manager_internal.agents.agent_invocation import AgentProfile
 from loop_manager_internal.config.managed_config import provider_fast_mode
+from .provider_home import PROVIDERS, prepare_authentication, authentication_links, assert_authentication_links, login_instructions
 
 
 _prepared_environment: ContextVar[tuple[str, Mapping[str, str]] | None] = ContextVar(
@@ -159,6 +160,7 @@ def validate_provider_profiles(
 def agent_environment(
     provider: str = "codex", role_name: str | None = None,
     *, environment_variables: Mapping[str, str] | None = None,
+    state_dir: Path | None = None,
 ) -> dict[str, str]:
     """Return the filtered environment for one Agent subprocess role."""
     allowed = {
@@ -204,6 +206,10 @@ def agent_environment(
     # Preserve the prepared launch's owned temporary directory as well.
     if 'TMPDIR' in source and (environment_variables is not None or selected is not None and selected[0] == provider):
         environment['TMPDIR'] = source['TMPDIR']
+    if state_dir is not None:
+        variable = PROVIDERS[provider][0]
+        environment = {key: value for key, value in environment.items() if key.upper() != variable}
+        environment[variable] = str(state_dir.expanduser().resolve() / f'automation-{provider}')
     return environment
 
 
@@ -379,15 +385,20 @@ def validate_provider_runtime(
     worktree: Path | None = None,
     *,
     effects: ProfileEffects,
+    state_dir: Path | None = None,
 ) -> None:
     """Fail fast when the selected CLI, auth, or profiles are unavailable."""
 
     if provider not in AGENT_PROVIDERS:
         raise RuntimeError(f"지원하지 않는 Agent provider입니다: {provider}")
     provider_fast_mode(config_path, provider)
+    environment = agent_environment(provider, state_dir=state_dir)
+    if state_dir is not None:
+        prepare_authentication(provider, environment)
+    links = authentication_links(provider, environment) if PROVIDERS[provider][0] in environment else ()
     executable = "codex" if provider == "codex" else "claude"
     label = "Codex" if provider == "codex" else "Claude"
-    if not shutil.which(executable, path=agent_environment(provider).get('PATH', os.defpath)):
+    if not shutil.which(executable, path=environment.get('PATH', os.defpath)):
         raise RuntimeError(f"선택한 {label} CLI가 PATH에 설치되어 있지 않습니다.")
 
     auth_arguments = (
@@ -399,20 +410,26 @@ def validate_provider_runtime(
         auth_arguments,
         cwd=worktree,
         check=False,
-        env=agent_environment(provider),
+        env=environment,
     )
+    if links:
+        assert_authentication_links(provider, environment, links)
     if auth.returncode:
-        login = "codex login" if provider == "codex" else "claude auth login"
+        variable, folder, _, _, _ = PROVIDERS[provider]
+        home = Path(environment.get(variable, str(Path.home() / folder)))
         raise RuntimeError(
-            f"선택한 {label} CLI가 인증되어 있지 않습니다. {login}을 실행하세요."
+            f"선택한 {label} CLI가 인증되어 있지 않습니다: {home}. {login_instructions(provider, home)}"
         )
 
     try:
-        model_efforts = (
-            effects.codex_model_efforts(worktree)
-            if provider == "codex"
-            else effects.claude_model_efforts(config_path, worktree)
-        )
+        with prepared_environment(provider, environment):
+            model_efforts = (
+                effects.codex_model_efforts(worktree)
+                if provider == "codex"
+                else effects.claude_model_efforts(config_path, worktree)
+            )
+        if links:
+            assert_authentication_links(provider, environment, links)
         validate_provider_profiles(config_path, provider, model_efforts)
     except RuntimeError as error:
         raise RuntimeError(f"{label} profile 설정 오류: {error}") from error

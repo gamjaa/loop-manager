@@ -146,7 +146,8 @@ class ManualWorkService:
 
     def validate_repository(self):
         self.effects.validate_repository(self.repo_path, allow_agents_mismatch=False, provider=self.project['provider'],
-            config_path=self.config_path, registration_checks=False, expected_origin=self.project['origin'])
+            config_path=self.config_path, registration_checks=False, expected_origin=self.project['origin'],
+            state_dir=self.state_dir)
 
     def slot_available(self, *, recovering=None, releasing_plan=None):
         row = self.connection.execute('SELECT * FROM projects WHERE repo=?', (self.repo,)).fetchone()

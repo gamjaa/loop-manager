@@ -28,6 +28,7 @@ def validate_runtime_prerequisites(
     *,
     provider: str,
     config_path: Path | None,
+    state_dir: Path | None = None,
 ) -> None:
     """Validate executable, authentication, and profile prerequisites only."""
 
@@ -36,7 +37,8 @@ def validate_runtime_prerequisites(
     if provider not in AGENT_PROVIDERS:
         raise RuntimeError(f"지원하지 않는 Agent provider입니다: {provider}")
     if config_path is not None:
-        effects.validate_provider_runtime(config_path, provider, path)
+        effects.validate_provider_runtime(config_path, provider, path,
+                                         **({'state_dir': state_dir} if state_dir is not None else {}))
     elif not shutil.which(provider):
         raise RuntimeError(
             f"선택한 {provider.capitalize()} CLI가 PATH에 설치되어 있지 않습니다."
@@ -71,6 +73,7 @@ def validate_repository(
     registration_checks: bool = True,
     expected_origin: str | None = None,
     origin_result: list[str] | None = None,
+    state_dir: Path | None = None,
 ) -> Path:
     """Validate runtime prerequisites and stable repository identity only."""
 
@@ -80,6 +83,7 @@ def validate_repository(
         path,
         provider=provider,
         config_path=config_path,
+        **({'state_dir': state_dir} if state_dir is not None else {}),
     )
     root = Path(effects.git(path, "rev-parse", "--show-toplevel").stdout.strip()).resolve()
     if root != path:
@@ -244,6 +248,7 @@ def inspect_project_registration(
         config_path=config_path,
         registration_checks=False,
         origin_result=origins,
+        **({'state_dir': state_dir} if state_dir is not None else {}),
     )
     if not origins:
         raise RuntimeError("검증한 GitHub origin을 확인할 수 없습니다.")

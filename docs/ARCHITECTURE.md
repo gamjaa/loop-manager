@@ -332,9 +332,13 @@ Worker에 추가하는 [AGENTS.ponytail.md](AGENTS.ponytail.md)는 [Ponytail](ht
 
 `provider_execution.observe`는 Agent 모델 실행 없이 현재 Reviewer의 native 지침 적용·CLI/환경·설정/도구 정책을 확인하거나 지정한 실제 invocation의 완료 기록을 읽는다. Codex native prompt 조회로 확인한 전체 developer 지침 지문과 model/effort·환경/정책 지문은 process 시작 전에 기존 invocation의 `execution_identity`에 한 번 저장한다. credential 값이나 그 값의 해시, prompt 원문은 저장하지 않는다. 수신 환경의 일회성 임시 경로는 정확히 확인한 소유 디렉터리만 정규화한다. 실제 process 시작·종료·성공·격리·지침·repository/plan/role/worktree 결합이 없거나 기존 행의 입력이 누락되면 재사용 증거를 반환하지 않는다. 현재 설정을 과거 호출에 소급 기록하지 않는다.
 
-### R-085: 인증 전용 provider 저장소 (구현 예정)
+### 인증 전용 provider 저장소
 
-[R-085](requirements/%5BR-085%5D%20Codex%C2%B7Claude%20%EC%9D%B8%EC%A6%9D%20%EC%A0%84%EC%9A%A9%20%EC%9E%90%EB%8F%99%20%EC%8B%A4%ED%96%89%20%ED%99%98%EA%B2%BD.md)는 개인 Plugin·Hook을 상속하지 않고 기존 인증만 재사용하는 설계다. 현재 Codex의 개인 config 연결과 Windows 사용자 home 재사용 및 Claude 사용자 설정 상속을 변경하는 대상이며 구현 완료를 뜻하지 않는다.
+공급자 경계는 실제 상태 루트에서 `automation-codex`·`automation-claude`의 절대 경로를 선택한다. 등록·복구·수동 작업과 실행 서비스가 상태 루트를 전달하고, 기존 `prepared_environment`로 인증/profile 조회·지침 기능 조회가 준비된 호출 환경을 사용하도록 한다. 부모 `os.environ`은 바꾸지 않는다. `provider_home`은 기존 비공개 경로 검증을 재사용해 기본 인증 파일만 링크하고 기존 파일·링크를 보존한다. 파일 링크의 경로를 호출 전후 확인하되 인증 내용은 지문·기록에 넣지 않는다.
+
+Codex는 Linux·macOS의 기존 역할·repository·worktree 해시와 runtime 홈을 유지하며 전용 원본의 config·auth 파일에 연결한다. 인증 링크는 원본 파일 경로를 유지해 원자적 교체를 따라가고 원본의 resolved 인증 경로도 도구 쓰기 보호에 포함한다. Windows는 전용 원본 홈을 직접 사용한다. 소유 runtime에서 기본 개인 config를 가리키는 알려진 연결만 분리하며 미확인 연결은 보존·거부한다.
+
+격리 확인과 직전 재검사는 실행 홈뿐 아니라 전용 원본의 설정·규칙도 확인한다. 설정 지문은 설정 파일 내용과 실제 연결 경로에 결합하며 개인 설정 전체를 연결·복제하지 않는다. 경로에 종속된 인증 저장소를 역할별 홈과 공유할 수 없는 Linux·macOS Codex 설정은 거부하고, 새 CLI 저장소나 인증 복제를 추가하지 않는다. 기존 프로젝트·관리 정책 검사, ACL·Job Object·sandbox와 Claude의 미지원 격리 거부를 유지한다. 최초 인증·갱신·cron 전환은 [운영 안내](OPERATIONS.md#전용-공급자-홈과-인증)를 따른다.
 
 Manager 상태 경로 아래의 기존 provider runtime 경계를 사용하고 repository·worktree·role과 session의 연결을 보존한다. Codex 자식에는 관리 `CODEX_HOME`을, Claude 자식에는 관리 `CLAUDE_CONFIG_DIR`을 지정하며 부모 환경은 변경하지 않는다. 기존 provider home 값은 인증 원본 선택에만 사용하고 없으면 CLI 기본 사용자 저장소 또는 OS 인증 저장소를 선택한다. 환경 준비는 인증 사전 검사와 설정 지문·권한 확인보다 먼저 수행하고 실제 호출·재개·fallback까지 같은 환경을 전달한다. 설정 검사도 실제 선택한 저장소를 기준으로 하며 인증 원본 home의 개인 설정을 다시 조회하지 않는다.
 
