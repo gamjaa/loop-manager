@@ -64,7 +64,8 @@ class RequirementCorrectionPublisher:
         if self.connection.execute("SELECT 1 FROM sqlite_master WHERE name='agent_invocations'").fetchone():
             if self.connection.execute(
                 "SELECT 1 FROM agent_invocations WHERE repo=? AND (finished_at IS NULL OR "
-                "result_code IS NULL AND result_kind IN ('interrupted','exception','timeout')) LIMIT 1",
+                "execution_status != 'not_executed' AND result_code IS NULL "
+                "AND result_kind IN ('interrupted','exception','timeout')) LIMIT 1",
                 (self.git.repo,),
             ).fetchone():
                 raise CorrectionPending('종료가 확인되지 않은 Agent writer가 있어 교정을 보류합니다.')
