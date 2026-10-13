@@ -52,6 +52,7 @@ G-148의 공통 core에 최소 하나의 실제 비Python 도구를 연결하고
 - [x] 2026-10-05 planning 기준 a049a76의 명세·원본·관련 테스트와 비종료 catalog에서 미충족 범위를 확인함. 구현·테스트 실행은 하지 않음.
 - [x] 2026-10-09 `bac6f84e`와 mutable snapshot token `72f8256fbf8d111d1e3b5471dfeb314312d188d8eeec9fbcb704063918d9c50a`에서 version 1의 공통 core·unittest 연결 및 적합성 회귀를 정적으로 대조했다. registry와 실제 구현은 unittest만 제공하며 비Python 도구·두 언어 예제는 남아 있다. 구현·테스트·verify는 실행하지 않았다.
 - [x] 2026-10-14 Perl 5.38.2 / Test::More 1.302194 / TAP::Parser 3.44를 확인하고 정적 registry·프로젝트 도구 선언·파일 수집·native reporter·공통 worker IPC/예약·별도 Perl guard를 연결했다. Python/Perl의 compile → tests 예제와 Manager 전용 실제 호출 통합 회귀를 작성했다. `tests.test_verify_perl_adapter` 10개 unit case와 entrypoint 등록 1개, 기존 선언/단계 순서/시작 실패·종료 불명 3개 targeted case를 통과했다. 첫 실행의 테스트 코드 오류와 후속 native bailout의 null plan 처리 오류는 같은 명령 재실행으로 교정했다. 전체 verify·통합 회귀·실제 forced termination·Windows 및 동시 실행 실측은 실행하지 않았다.
+- [x] 2026-10-14 Manager verify의 `ee82674c69f46563d364dfabc6713450e7c33c5edeed1cdefe13362d25fb773d` 실패 진단에서 Perl native JSON Lines가 공통 `*.jsonl` 이벤트 집계에 들어가 `KeyError: kind`를 일으킴을 확인했다. native 원본을 `*.native.ndjson`으로 분리하고 성공·중단의 진단 생성 및 시작/통신 실패 원본 보존을 두 개의 targeted unit case로 검증했다. 회귀 확인의 동일 case는 최초 `KeyError`와 중단 phase 기대값 오류를 교정한 뒤 통과했다. Worker는 통합 테스트·전체 verify를 재실행하지 않았으며 Manager 재검증이 필요하다.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log

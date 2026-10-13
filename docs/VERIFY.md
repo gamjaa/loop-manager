@@ -64,8 +64,9 @@ Test::More의 TODO 성공/실패 의미와 nested subtest의 부모 결과를 �
 
 Python worker IPC와 공통 core의 acquire·PID bind·idle·종료 후 release를 재사용한다. Perl
 reporter가 테스트 subprocess를 기다린 뒤에만 단위 report를 만든다. serial 선언은 worker 하나를
-재사용하고 independent는 파일별 프로세스를 배정한다. native JSONL은 즉시 flush하고 TAP spool도
-flush하므로 중단 전 결과·관측 위치를 보존한다. 파일 suite의 시작·소요 시간은 공통 phase에,
+재사용하고 independent는 파일별 프로세스를 배정한다. native JSON Lines는 `module-N.native.ndjson`에, 공통 EventWriter 이벤트는 `*.jsonl`에
+저장한다. 진단 집계는 공통 이벤트만 읽으며 native 원본을 공통 이벤트로 해석하지 않는다.
+native 로그는 즉시 flush하고 TAP spool도 flush하므로 중단 전 결과·관측 위치를 보존한다. 파일 suite의 시작·소요 시간은 공통 phase에,
 assertion 결과의 reporter 관측 elapsed는 native JSONL에 기록한다. 관측 elapsed를 assertion
 본문의 정밀 실행 시간으로 주장하지 않는다. 강제 종료·부분 JSONL에는 완료를 합성하지 않으며
 기존 외부 timeout/프로세스 경계와 종료 불명 예약 진단을 사용한다. Perl의 AST 부분 선정과 과거

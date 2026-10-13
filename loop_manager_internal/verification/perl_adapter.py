@@ -106,7 +106,8 @@ def worker_main():
         report.update(module=unit.name, passed=False, completed=[])
         writer = EventWriter(Path(request['directory']) / f"worker-{request['worker']}.jsonl", identity=report.copy())
         try:
-            raw = Path(request['result']).with_suffix('.native.jsonl')
+            # *.jsonl belongs to the common EventWriter protocol, not native TAP records.
+            raw = Path(request['result']).with_suffix('.native.ndjson')
             with writer.activate(), phase('module:' + unit.name), raw.open('w') as output:
                 process = subprocess.run([os.environ['LOOP_MANAGER_VERIFY_PERL'], str(REPORTER), 'run',
                     str(inside(Path(os.environ['LOOP_MANAGER_VERIFY_PROJECT_ROOT']), unit.name)),

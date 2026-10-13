@@ -11,7 +11,7 @@ from unittest import mock
 
 from loop_manager_internal.verification import contract, perl_adapter, runner
 from loop_manager_internal.verification.manifest import Module
-from loop_manager_internal.verification.timing import EventWriter
+from loop_manager_internal.verification.timing import EventWriter, diagnostic
 
 
 class PerlAdapterTests(unittest.TestCase):
@@ -179,7 +179,7 @@ class PerlAdapterTests(unittest.TestCase):
                 self.assertTrue(report['runner_error'])
                 self.assertFalse(report['passed'])
                 self.assertEqual(report['completed'], [])
-                self.assertTrue((self.root / 'result.native.jsonl').is_file())
+                self.assertTrue((self.root / 'result.native.ndjson').is_file())
 
     def test_worker_native_success_and_interruption_keep_identity_and_partial_output(self):
         (self.root / self.unit.name).write_text('use Test::More tests => 1; ok(1);')
@@ -192,8 +192,12 @@ class PerlAdapterTests(unittest.TestCase):
             self.assertEqual(perl_adapter.worker_main(), 0)
         report = json.loads((self.root / 'result.json').read_text())
         self.assertTrue(perl_adapter.validate_report(self.unit, report, self.identity))
-        native = [json.loads(line) for line in (self.root / 'result.native.jsonl').read_text().splitlines()]
+        native = [json.loads(line) for line in (self.root / 'result.native.ndjson').read_text().splitlines()]
         self.assertTrue(all(item['run_id'] == 'run' and item['unit_id'] == self.unit.name for item in native))
+        diagnostic(self.root)
+        summary = json.loads((self.root / 'summary.json').read_text())
+        self.assertTrue(any(event['name'] == 'module:' + self.unit.name
+            and event['result'] == 'complete' for event in summary['phases']))
         (self.root / 'result.json').unlink()
         def interrupted(argv, **kwargs):
             kwargs['stdout'].write(json.dumps(native[0]) + '\n')
@@ -206,7 +210,11 @@ class PerlAdapterTests(unittest.TestCase):
                 self.assertRaises(KeyboardInterrupt):
             perl_adapter.worker_main()
         self.assertFalse((self.root / 'result.json').exists())
-        self.assertEqual(json.loads((self.root / 'result.native.jsonl').read_text()), native[0])
+        self.assertEqual(json.loads((self.root / 'result.native.ndjson').read_text()), native[0])
+        diagnostic(self.root)
+        summary = json.loads((self.root / 'summary.json').read_text())
+        self.assertTrue(any(event['name'] == 'module:' + self.unit.name
+            and event['result'] == 'error' for event in summary['phases']))
 
     def test_runner_dispatches_perl_compile_manifest_and_partial_fallback(self):
         from types import SimpleNamespace
