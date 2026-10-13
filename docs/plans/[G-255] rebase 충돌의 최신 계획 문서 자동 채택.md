@@ -53,6 +53,8 @@ Manager 소유 rebase에서 Requirement·ExecPlan 충돌을 관측한 최신 원
 
 - [x] 2026-10-13 후보 `cb07751dec9b77dd6ad8b0768949e941483a0f4b`의 Review 두 건을 교정했다. 교체 전 중간 HEAD의 문서 blob을 보존해 staged base 원문과 별도로 검사하고, 채택 이력 전체의 경로를 최종 HEAD·index·작업 파일과 대조해 후속 비충돌 재생으로 달라진 문서의 완료 채택을 거부한다. 관련 3개 unit case는 처음 실행에서 외부 HEAD 거부 assertion이 실패해 문서 증거 불일치의 일반 scope 우회를 막은 뒤 동일 명령으로 통과했다. 기존 사용자 문서 충돌 보존 unit 1개도 통과했다. Git·CLI 관측은 mock이며 실제 Git 통합 회귀·전체 verify·Review는 Worker가 실행하지 않았다. 수정된 후보의 Manager 검증이 남아 있다.
 
+- [x] 2026-10-13 rebase 후 후보 `08eee968b6d793577d21c7124e66e54fe250c547`의 Manager verify 피드백을 단일 `test_fresh_import_inventory_and_shard_changes_keep_opaque_consumer_fallback` case로 재현했다. 수집 입력 불확실성 fallback을 누락한 기대값과 제거된 로컬 `graph` 참조를 현재 선택기 계약·공통 `self.graph`에 맞췄다. 양쪽 revision의 진단, fallback 결과 재사용 거부와 일반 본문 변경·무관한 helper의 비전환 assertion을 유지했다. 동일 명령 재실행은 1 test OK다. 전체 verify·Review는 Worker가 실행하지 않았으며 Manager 재검증이 남아 있다.
+
 ## Decision Log
 
 - 직접 반영된 `5e440444`는 rebase 중 구현 입력 변경의 즉시 최종 차단을 제거하고 최신 revision/source를 Worker에 전달한다. Requirement·ExecPlan 충돌을 base로 자동 처리하는 경로는 없으므로 그 남은 작업만 계획한다. G-242의 판단 형식·PR 경합, G-245의 Planner 종료 갱신과 G-189의 전수 감사는 각 기존 책임으로 유지한다.

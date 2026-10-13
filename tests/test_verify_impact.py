@@ -441,8 +441,8 @@ class ImpactTests(unittest.TestCase):
             impact.selected_modules(replace(selection, modules=('missing',)), self.modules)
 
     def test_fresh_import_inventory_and_shard_changes_keep_opaque_consumer_fallback(self):
-        # Child-code imports stay uncertain in precheck diagnostics. A changed
-        # load_tests consumer still requires the full collection boundary.
+        # Child-code imports stay uncertain in diagnostics. Inventory or
+        # collection-input changes require the full collection boundary.
         root = Path(__file__).resolve().parents[1]
         helper = 'tests/support/fresh_imports.py'
         shard = 'tests/test_direct.py'
@@ -469,22 +469,19 @@ class ImpactTests(unittest.TestCase):
                     self.assertTrue(selection.analysis['remaining_uncertainties'][label + ':' + helper])
                 expected = ('custom_collection:' + shard,) if old == shard else (
                     ('no_tests_selected',) if status == 'A' else ())
+                expected = tuple(sorted((*expected, 'uncertain_collection_input:' + helper)))
                 self.assertEqual(selection.fallback, expected)
-                if expected:
-                    with self.assertRaises(ValueError):
-                        impact.selected_modules(selection, self.modules)
-                else:
-                    self.assertEqual([module.name for module in impact.selected_modules(selection, self.modules)],
-                                     list(selection.modules))
+                with self.assertRaises(ValueError):
+                    impact.selected_modules(selection, self.modules)
 
         # Ordinary implementation edits and unrelated opaque readers do not
         # change the collection inventory or its consumer/helper contract.
-        selection = impact.select_records(graph(sources), graph(sources),
+        selection = impact.select_records(self.graph(sources), self.graph(sources),
             [('M', 'pkg/value.py', 'pkg/value.py')], self.modules,
             head='head', base='base', configuration={'version': 1})
         self.assertFalse(selection.fallback)
         unrelated = dict(sources, **{shard: self.sources[shard]})
-        selection = impact.select_records(graph(unrelated), graph(unrelated),
+        selection = impact.select_records(self.graph(unrelated), self.graph(unrelated),
             [('A', None, 'pkg/new.py')], self.modules,
             head='head', base='base', configuration={'version': 1})
         self.assertFalse(any(reason.startswith('uncertain_collection_input:')
