@@ -13,6 +13,7 @@ import subprocess
 from uuid import uuid4
 
 from loop_manager_internal.catalog import execplan_catalog, requirement_sources
+from loop_manager_internal.application.result_normalization import tagged_json
 from loop_manager_internal.git.command_adapter import requirement_documents_from_tree
 from loop_manager_internal.storage import maintenance_state
 
@@ -601,15 +602,10 @@ def review_artifact(draft: DocumentDraft) -> str:
 
 
 def parse_generated_draft(output: str) -> tuple[bytes, str] | None:
-    prefix = "DOCUMENT_DRAFT_RESULT: "
-    lines = [line[len(prefix):] for line in output.splitlines()
-             if line.startswith(prefix)]
-    if len(lines) != 1 or len(lines[0].encode("utf-8")) > 2_100_000:
-        raise DocumentDraftError("수정본 Agent 결과 JSON 한 줄이 필요합니다.")
     try:
-        result = json.loads(lines[0])
-    except json.JSONDecodeError as error:
-        raise DocumentDraftError("수정본 Agent 결과가 JSON이 아닙니다.") from error
+        result = tagged_json(output, "DOCUMENT_DRAFT_RESULT", max_bytes=2_100_000)
+    except (ValueError, UnicodeError) as error:
+        raise DocumentDraftError("수정본 Agent 결과 형식이 유효하지 않습니다.") from error
     if not isinstance(result, dict):
         raise DocumentDraftError("수정본 Agent 결과 형식이 유효하지 않습니다.")
     if result.get("status") == "uncertain" and set(result) == {"status", "reason"}:

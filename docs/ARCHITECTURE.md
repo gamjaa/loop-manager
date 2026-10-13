@@ -83,6 +83,8 @@ SQLite 손실이나 손상에서의 자동 상태 재구성은 지원하지 않�
 
 ## 문서 입력과 ExecPlan 파싱
 
+문서 수정본 결과는 application의 `tagged_json`으로 표식과 JSON 형식을 해석한다. 공통 경계는 들여쓰기·표식 표기·다중 줄 JSON과 중복 표식·중복 key·잘못된 JSON을 처리하고, 문서 모듈은 필드 집합·타입과 `candidate`/`uncertain` 의미를 검증한다. 후보의 내용 문자열은 해석 과정에서 정규화하지 않으며 전체 JSON의 2,100,000 UTF-8 byte 제한과 기존 저장 bytes/hash 계약을 유지한다. 형식 오류는 `DocumentDraftError` 경계로 전달되어 후보 저장이나 사용자 결정을 만들지 않는다.
+
 프로젝트 문서·계획의 자동 입력은 fetch로 확인한 `origin/<base-branch>`의 특정 commit에서 읽는다. 등록 프로젝트의 기본 checkout에만 있는 파일·수정·commit은 사용자가 push하기 전에는 입력에 포함하지 않는다. 진행 작업은 이 원격 기준에서 만든 관리 worktree의 결과를 보존하며, 선택된 원격 작업 branch의 사용자 수정은 검증 후 반영한다.
 
 ExecPlan의 `Progress` 체크 항목과 본문은 구현 내용·판단·검증 기록이다. 체크가 끝났다는 이유로 `READY`, `PLAN_BLOCKED`, `MERGED` 같은 실행 상태를 바꾸지 않으며, 단계·재시도·session은 SQLite, 실제 PR Merge는 GitHub 확인을 기준으로 한다. 본문 변경은 재평가 입력이고 명시적 `User Decision`은 승인 판정 입력이므로, 본문을 읽지 않거나 변경을 무시한다는 뜻은 아니다.

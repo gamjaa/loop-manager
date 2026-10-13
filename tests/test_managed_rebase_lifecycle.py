@@ -9,6 +9,8 @@ from tests.support.recovery_boundary import RecoveryBoundary
 
 from contextlib import ExitStack, nullcontext
 from dataclasses import replace
+import hashlib
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -385,6 +387,31 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             effects = replace(effects, workspace=replace(effects.workspace,
                 current_rebase_service=lambda context, **options: lm._current_rebase_service(
                     connection, repo, state_dir, repo_key, 'G-047', worktree, branch, **options)))
+
+            def parse_lifecycle_worker_result(_message, _plan):
+                active_base = effects.state.row()['active_sha']
+                head = git(worktree, 'rev-parse', 'HEAD').stdout.strip()
+                paths = git(worktree, 'diff', '--name-only', active_base, head).stdout.splitlines()
+                changes = []
+                for path in paths:
+                    if not (path.startswith('docs/') or path.lower().endswith(('.md', '.rst', '.txt'))):
+                        continue
+                    patch = git(worktree, 'diff', '--no-ext-diff', '--no-textconv',
+                                '--find-renames', active_base, head, '--', path).stdout
+                    changes.append('DOCUMENT_CHANGE: ' + json.dumps({
+                        'path': path,
+                        'summary': 'Preserve the lifecycle fixture change.',
+                        'reason': 'The fixture models an explained Worker result.',
+                        'impact': 'Lifecycle assertions retain the real document-report gate.',
+                        'patch_sha256': hashlib.sha256(patch.encode('utf-8')).hexdigest(),
+                    }))
+                return SimpleNamespace(
+                    commit_title='Resolve managed rebase fixture conflicts',
+                    test_evidence='targeted unit test: PASS',
+                    summary='\n'.join(['Rebase lifecycle fixture result.', *changes]),
+                )
+
+            effects.validation.parse_worker_result.side_effect = parse_lifecycle_worker_result
             pr_patch = mock.patch.object(lm, 'pr_for_branch', side_effect=lambda *_a, **_k:
                                         effects.publication.pr_for_branch(*_a, **_k))
             pr_patch.start()
