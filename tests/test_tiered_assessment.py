@@ -9,7 +9,7 @@ from unittest import mock
 from loop_manager_internal.maintenance import code_index, maintenance_file_review, maintenance_reconciliation, tiered_review
 from loop_manager_internal.maintenance.tiered_ports import TieredMaintenancePort
 from loop_manager_internal.planning import tiered_assessment
-from loop_manager_internal.planning.planning_runtime import PlanningAgentResult, PlanningAgentResultKind, PlanningLifecycleCoordinator, PlanningOutcomeKind
+from loop_manager_internal.planning.planning_runtime import PlanningAgentResult, PlanningAgentResultKind, PlanningLifecycleCoordinator, PlanningOutcomeKind, PlanningDecisionKind
 from loop_manager_internal.storage.maintenance_state import MaintenancePhase, ReviewDue
 from loop_manager_internal.storage import maintenance_file_ledger
 from tests.support.planning_case import PlanningCase, FakePorts, planning_snapshot, maintenance_cycle
@@ -17,6 +17,27 @@ from tests.support.maintenance import inventory
 
 
 class TieredAssessmentTest(PlanningCase):
+    def test_first_run_selects_general_planner_or_ready_without_maintenance(self):
+        self.ports.tiered.due = lambda context: TieredMaintenancePort.due(self.ports.tiered, context)
+        self.ports.git.remote = self.sha
+        context = replace(self.context, registered_only=True, base_sha=self.sha)
+        for reviewed in (False, True):
+            with self.subTest(reviewed=reviewed):
+                self.ports.state.snapshot = planning_snapshot(**({
+                    "processed_sha": self.sha, "planning_fingerprint": "fingerprint",
+                    "specification_fingerprint": "specification",
+                } if reviewed else {}))
+                self.ports.state.cycle = maintenance_cycle()
+                self.ports.state.schedule_result.has_ready = True
+                self.ports.state.schedule_result.runnable_ready = object()
+                run = self.coordinator._new_run(context)
+                self.assertIsNone(self.coordinator._selection._select_planning_work(run))
+                self.assertEqual(run.selection.kind, PlanningDecisionKind.ACTIVATE_READY
+                                 if reviewed else PlanningDecisionKind.RUN_SPECIFICATION_PLANNING)
+                self.assertFalse(run.maintenance_planning)
+                self.assertEqual(self.ports.state.maintenance_begin_count, 0)
+                self.ports.tiered.select.assert_not_called()
+
     def setUp(self):
         super().setUp()
         self.connection = sqlite3.connect(":memory:")

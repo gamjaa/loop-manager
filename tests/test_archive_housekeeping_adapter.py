@@ -88,7 +88,7 @@ class ExecPlanArchiveHousekeepingAdapterTest(unittest.TestCase):
                 refactoring_review_interval=5,
             )
         )
-        self.assertFalse(
+        self.assertTrue(
             loop_manager._execplan_archive_housekeeping_safe(
                 connection,
                 "/repo",
@@ -100,6 +100,8 @@ class ExecPlanArchiveHousekeepingAdapterTest(unittest.TestCase):
         repository = loop_manager.maintenance_state.MaintenanceRepository(
             connection
         )
+        from tests.support.maintenance import request_maintenance
+        request_maintenance(connection, "/repo")
         cycle, started = repository.begin_assessment_if_due(
             "/repo", 5, "a" * 40, self_repository=True,
         )

@@ -12,7 +12,7 @@ from unittest import mock
 
 import loop_manager
 from loop_manager_internal.notifications import notifications
-from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.storage import maintenance_state, planning_review_state
 from loop_manager_internal.planning.planning_workspace import legacy_release_identity
 from loop_manager_internal.maintenance import maintenance_file_review
 from loop_manager_internal.maintenance import maintenance_findings
@@ -35,6 +35,21 @@ from loop_manager_internal.planning.planning_runtime import (
 )
 from loop_manager_internal.storage.runtime_state import PlanningSnapshot
 from loop_manager_internal.planning.assessment_port import MaintenanceAssessmentPort
+
+
+def confirm_final_review(connection, repo, revision, input_fingerprint, specification_fingerprint):
+    identity = {
+        "revision": revision, "input_fingerprint": input_fingerprint,
+        "specification_fingerprint": specification_fingerprint,
+        "work_cycle": planning_review_state.work_cycle(connection, repo),
+    }
+    planning_review_state.begin(connection, repo, purpose="final", comparison_revision=None, **identity)
+    result = "FINAL_SPECIFICATION_REVIEW: " + json.dumps({
+        **identity, "outcome": "fulfilled", "evidence": ["docs/PRODUCT.md", "src/app.py"],
+        "reason": "Fixture models a previously confirmed full specification review.",
+    })
+    planning_review_state.validate(connection, repo, revision, result, "fulfilled")
+    planning_review_state.confirm(connection, repo, revision, revision)
 
 
 def planning_snapshot(**overrides):

@@ -8,6 +8,7 @@ from unittest import mock
 import loop_manager
 from loop_manager_internal.storage import planning_input_state
 from tests.support.catalog import write_execplan
+from tests.support.maintenance import request_maintenance
 from tests.support.git import git_command, make_remote_repository, commit_and_push, isolated_git_test
 from tests.support.worker import dummy_worker_context, dummy_worker_sessions, legacy_planning_ports
 
@@ -187,6 +188,7 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                 current_sha = git_command(
                     current_repo, "rev-parse", "origin/main"
                 )
+                request_maintenance(connection, str(current_repo))
                 cycle, _ = maintenance_repository.begin_assessment_if_due(
                     str(current_repo), 5, current_sha, self_repository=True,
                 )

@@ -14,7 +14,7 @@ from tests.support.catalog import write_execplan
 from tests.support.git import (
     git_command, make_remote_repository, commit_and_push, isolated_git_test,
 )
-from tests.support.planning_case import FakePorts, planning_snapshot
+from tests.support.planning_case import FakePorts, planning_snapshot, confirm_final_review
 from tests.support.worker import dummy_worker_sessions
 
 
@@ -201,6 +201,7 @@ class PlanningFingerprintTest(unittest.TestCase):
                 planning_fingerprint="planning-1",
             )
             planning_input_state.record_general(connection, str(repo), "base", {})
+            confirm_final_review(connection, str(repo), "base", "planning-1", "specification-1")
             state = loop_manager._PlanningStatePorts(
                 connection,
                 runtime_state.RuntimeStateRepository(connection),
@@ -274,6 +275,15 @@ class PlanningFingerprintTest(unittest.TestCase):
                 completed_fingerprint = connection.execute(
                     "SELECT planning_fingerprint FROM projects WHERE repo = ?", (str(repo),)
                 ).fetchone()["planning_fingerprint"]
+                completed = connection.execute(
+                    "SELECT processed_sha, specification_fingerprint FROM projects WHERE repo = ?", (str(repo),)
+                ).fetchone()
+                maintenance_state.MaintenanceRepository(connection).initialize_file_assessment_start(
+                    str(repo), source_sha=completed["processed_sha"], expected_merged_count=0,
+                )
+                confirm_final_review(connection, str(repo), completed["processed_sha"],
+                                     completed_fingerprint, completed["specification_fingerprint"])
+                connection.commit()
                 planner.reset_mock()
 
                 active = repo / "docs/requirements/Active.md"
