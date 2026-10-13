@@ -98,6 +98,17 @@ class PartialRunnerTests(unittest.TestCase):
             result = comparison(paths, summaries)
             self.assertFalse(result['scope_matches'])
             self.assertFalse(result['comparable'])
+
+    def test_full_and_partial_modes_with_identical_ids_are_still_incompatible(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'manifest.json').write_text(json.dumps([{'ids': ['selected.Case.a']}]))
+            summaries = [{'metadata': {'mode': mode}, 'phases': [], 'active': [],
+                          'result': {'passed': True}, 'counts': {}} for mode in ('partial', 'full')]
+            result = comparison([root, root], summaries)
+            self.assertFalse(result['mode_matches'])
+            self.assertFalse(result['scope_matches'])
+
     def test_manager_partial_timeout_and_unknown_termination_keep_normal_policy(self):
         for uncertain in (False, True):
             with self.subTest(uncertain=uncertain), tempfile.TemporaryDirectory() as temporary:

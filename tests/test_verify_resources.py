@@ -231,8 +231,16 @@ class ReservationTests(unittest.TestCase):
         self.request("bind", token=token, pid=100)
         self.assertFalse(self.coordinator.request(self.b, self.sb, "acquire")["granted"])
         self.capacity = 8
-        self.assertFalse(self.request("acquire")["granted"])
+        denied = self.request("acquire")
+        self.assertFalse(denied["granted"])
+        self.assertEqual(denied["reason"], "다른 verify의 배정 순서")
         other = self.coordinator.request(self.b, self.sb, "acquire")["token"]
+        # A continuous acquisition loop must still yield to the waiting session
+        # and account for both freshly granted reservations on its next attempt.
+        resumed = self.request("acquire")
+        self.assertTrue(resumed["granted"])
+        self.assertEqual(resumed["pending_cpu"], 2)
+        self.assertEqual(resumed["pending_memory"], 2 * resources.DEFAULT_WORKER_BYTES)
         self.coordinator.finish(self.a, stopped=True)
         self.assertIn(other, self.coordinator.reservations)
         self.assertNotIn(token, self.coordinator.reservations)

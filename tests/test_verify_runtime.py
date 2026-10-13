@@ -1,6 +1,7 @@
 """시간·수집·결과·프로세스 경계만 작은 fake로 검증한다."""
 import ctypes
 from contextlib import ExitStack
+from dataclasses import asdict
 import io
 import json
 import os
@@ -18,7 +19,8 @@ from unittest import mock
 from loop_manager_internal.config.managed_config import load_managed_config, ManagedConfigError
 from loop_manager_internal.execution import verify_process, windows_job
 from loop_manager_internal.verification import guard, manifest, runner, manager_adapter, unittest_adapter
-from loop_manager_internal.verification.coordination import execution_settings
+from loop_manager_internal.verification.coordination import execution_settings, VerifyCoordinator
+from loop_manager_internal.verification.resources import Snapshot, MIB
 from loop_manager_internal.execution.validation_feedback import MAX_DIAGNOSTIC, format_verify_failure
 from loop_manager_internal.verification.timing import (
     EventWriter, TimedResult, bytecode_cache_changes, bytecode_cache_snapshot,
@@ -34,12 +36,16 @@ class TimingAndManifestTests(unittest.TestCase):
             summary = {"metadata": {"revision": "first", "cap": 1, "python": "fake", "git": "fake",
                        "bytecode_policy": {"write_enabled": True, "cache_tag": "cpython-312",
                                            "cache_prefix": None, "optimization": 0},
+                       "execution_context": {"python": "/project/python", "stages": ["unittest", "compile"],
+                           "parallelism": 1, "coordinated": True, "instrumentation": 1,
+                           "temporary_directory": "/tmp", "pythonpath": None},
                        "environment": {"host": "same", "platform": "fake", "limits": {
                            "cpus": 4, "affinity_cpus": 4, "applied_quota": None, "source": "fake"}}},
                        "phases": [{"name": "verify", "duration": 20}], "result": {"passed": True},
                        "active": [], "counts": {"success": 1}}
             other = json.loads(json.dumps(summary))
             other["metadata"].update(revision="second", cap="auto")
+            other["metadata"]["execution_context"]["parallelism"] = "auto"
             other["phases"][0]["duration"] = 10
             report = comparison([root, root], [summary, other])
             self.assertTrue(report["comparable"])
@@ -47,6 +53,9 @@ class TimingAndManifestTests(unittest.TestCase):
             other["metadata"]["environment"]["limits"]["cpus"] = 2
             self.assertFalse(comparison([root, root], [summary, other])["comparable"])
             other["metadata"]["environment"]["limits"]["cpus"] = 4
+            other["metadata"]["execution_context"]["pythonpath"] = "/different"
+            self.assertFalse(comparison([root, root], [summary, other])["comparable"])
+            other["metadata"]["execution_context"]["pythonpath"] = None
             other["active"] = [{"id": "unfinished"}]
             self.assertFalse(comparison([root, root], [summary, other])["comparable"])
             other["active"] = []
@@ -680,6 +689,119 @@ class VerifyProcessBoundaryTests(unittest.TestCase):
 
 
 class RunnerPoolTests(unittest.TestCase):
+    def exercise_pool(self, *, immediate=False, cap=3, child=False, fail_stop=False, fail_start=False,
+                      complete_during_burst=False):
+        cleanup = ExitStack()
+        self.addCleanup(cleanup.close)
+        root = Path(cleanup.enter_context(tempfile.TemporaryDirectory()))
+        clock, identities, workers, sleeps, requests, allocations = [0.0], {}, [], [], [], []
+        coordinator = VerifyCoordinator(clock=lambda: clock[0], identity=identities.get,
+            sampler=SimpleNamespace(sample=lambda: Snapshot(clock[0], 8, 0, 4096 * MIB, 'fake')))
+        session, secret = coordinator.open(cap)
+        writer = EventWriter(root / 'events.jsonl', clock=lambda: clock[0])
+        cleanup.callback(writer.close)
+        class Client:
+            def request(self, operation, **values):
+                reply = coordinator.request(session, secret, operation, **values)
+                requests.append((operation, len(sleeps), values, reply))
+                return reply
+        def report(worker):
+            worker.report.write_text(json.dumps({'module': worker.module.name,
+                'passed': True, 'completed': list(worker.module.ids)}))
+        def spawn(token, number, directory):
+            if fail_start and number == 1:
+                raise OSError('launch failed')
+            process = mock.Mock(pid=100 + number)
+            process.poll.return_value = None
+            identities[process.pid] = number + 1
+            worker = SimpleNamespace(process=process, token=token, number=number,
+                module=None, report=None, job=mock.Mock() if child else None)
+            if child:
+                worker.job.active.return_value = 2
+            def assign(module, path, _directory):
+                worker.module, worker.report = module, path
+                allocations.append((module.name, len(sleeps)))
+                if worker.job:
+                    worker.job.active.return_value = 2
+                if immediate:
+                    report(worker)
+                if complete_during_burst and len(allocations) == 2:
+                    report(workers[0])
+            worker.assign = assign
+            workers.append(worker)
+            return worker
+        def sleep(seconds):
+            self.assertEqual(seconds, 0.05)
+            self.assertLess(len(sleeps), 10, 'busy polling or stalled pool')
+            sleeps.append(seconds)
+            clock[0] += seconds
+            for worker in workers:
+                if worker.module is not None:
+                    report(worker)
+                    if worker.job:
+                        worker.job.active.return_value = 1
+        def stop(worker):
+            if fail_stop:
+                raise verify_process.VerifyTerminationUncertain('child exit unknown')
+            identities.pop(worker.process.pid)
+        units = [manifest.Module(str(index), (f'case{index}',)) for index in range(3)]
+        with mock.patch.object(runner, 'stop_worker', side_effect=stop):
+            if fail_stop or fail_start:
+                with self.assertRaisesRegex((RuntimeError, OSError), '자식 정리 실패|launch failed'):
+                    runner.execute_manifest(units, root, writer, Client(), spawn=spawn, sleep=sleep)
+            else:
+                self.assertTrue(runner.execute_manifest(units, root, writer, Client(), spawn=spawn, sleep=sleep))
+        return coordinator, requests, allocations, sleeps, workers
+
+    def test_multiple_grants_have_no_intervening_sleep_and_protect_reservations(self):
+        coordinator, requests, assigned, sleeps, workers = self.exercise_pool()
+        self.assertEqual(assigned, [('0', 0), ('1', 0), ('2', 0)])
+        grants = [reply for operation, _, _, reply in requests if operation == 'acquire']
+        self.assertEqual([reply['running'] for reply in grants], [0, 1, 2])
+        self.assertEqual([reply['pending_cpu'] for reply in grants], [0, 1, 2])
+        self.assertEqual([reply['pending_memory'] for reply in grants], [0, 128 * MIB, 256 * MIB])
+        self.assertEqual(len(sleeps), 1)
+        self.assertEqual(len(workers), 3)
+        self.assertFalse(coordinator.reservations)
+
+    def test_cap_rejection_waits_then_reuses_confirmed_idle_worker(self):
+        coordinator, requests, assigned, sleeps, workers = self.exercise_pool(cap=2)
+        self.assertEqual(assigned, [('0', 0), ('1', 0), ('2', 1)])
+        replies = [reply for operation, _, _, reply in requests if operation == 'acquire']
+        self.assertEqual([reply['granted'] for reply in replies], [True, True, False, True])
+        self.assertEqual(len(workers), 2)
+        self.assertFalse(coordinator.reservations)
+
+    def test_immediate_results_have_no_sleep_and_do_not_create_extra_workers(self):
+        coordinator, _, assigned, sleeps, workers = self.exercise_pool(immediate=True, cap=1)
+        self.assertEqual(assigned, [('0', 0), ('1', 0), ('2', 0)])
+        self.assertEqual(sleeps, [])
+        self.assertEqual(len(workers), 1)
+        self.assertFalse(coordinator.reservations)
+
+    def test_result_ready_during_burst_is_collected_without_sleep_after_cap_rejection(self):
+        coordinator, _, assigned, sleeps, _ = self.exercise_pool(cap=2, complete_during_burst=True)
+        self.assertEqual(assigned, [('0', 0), ('1', 0), ('2', 0)])
+        self.assertEqual(len(sleeps), 1)
+        self.assertFalse(coordinator.reservations)
+
+    def test_report_with_live_descendant_waits_before_idle_or_reuse(self):
+        _, requests, assigned, sleeps, _ = self.exercise_pool(immediate=True, cap=1, child=True)
+        self.assertTrue(sleeps)
+        self.assertEqual([at for operation, at, _, _ in requests if operation == 'idle'], [1, 2, 3])
+        self.assertEqual(assigned, [('0', 0), ('1', 1), ('2', 2)])
+
+    def test_continuous_start_failure_cleans_previous_worker_and_only_unstarted_token(self):
+        coordinator, requests, _, _, _ = self.exercise_pool(fail_start=True)
+        self.assertEqual([operation for operation, _, _, _ in requests],
+            ['acquire', 'bind', 'acquire', 'not_started', 'release'])
+        self.assertFalse(coordinator.reservations)
+
+    def test_unknown_worker_termination_keeps_every_reservation(self):
+        coordinator, requests, _, _, _ = self.exercise_pool(fail_stop=True)
+        self.assertEqual(len(coordinator.reservations), 3)
+        self.assertFalse(any(operation == 'release' for operation, _, _, _ in requests))
+
     def test_unchanged_rejections_keep_periodic_snapshot_and_reservation_diagnostics(self):
         with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             root = Path(directory)
@@ -791,10 +913,12 @@ class RunnerPoolTests(unittest.TestCase):
                 path.write_text(json.dumps({"module": module.name, "passed": True, "completed": list(module.ids)}))
             worker.assign = assign
             spawn = mock.Mock(return_value=worker)
+            sleep = mock.Mock()
             with mock.patch.object(runner, "stop_worker", side_effect=lambda _worker: stopped.append(True)):
                 self.assertTrue(runner.execute_manifest([manifest.Module("first", ("a",)), manifest.Module("second", ("b",))],
-                                                       root, writer, Client(), spawn=spawn, sleep=lambda _seconds: None))
+                                                       root, writer, Client(), spawn=spawn, sleep=sleep))
             spawn.assert_called_once()
+            sleep.assert_not_called()
             self.assertEqual([operation for operation, _values in requests].count("release"), 1)
 
     def test_start_failure_reclaims_only_confirmed_unstarted_reservation(self):
@@ -808,6 +932,152 @@ class RunnerPoolTests(unittest.TestCase):
                 runner.execute_manifest([manifest.Module("first", ("a",))], root, writer, client,
                                         spawn=mock.Mock(side_effect=OSError("launch failed")))
             client.request.assert_any_call("not_started", token="owned")
+
+
+class ExecutionQueueTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.current, self.history = self.root / 'current', self.root / 'history'
+        self.current.mkdir()
+        self.history.mkdir()
+        (self.history / 'stage-0').mkdir()
+        self.modules = [manifest.Module(name, (f'{name}.Case.a',),
+            ((f'{name}.Case.a', name, f'{name}.Case'),), 'test*.py') for name in ('short', 'long', 'tie')]
+        self.manifest = {'version': 1, 'adapter': 'unittest', 'adapter_version': 1, 'stages': [
+            {'id': 'tests', 'kind': 'tests', 'python': 'project-python', 'units': [
+                {'id': unit.name, 'ids': list(unit.ids), 'payload': json.loads(json.dumps(asdict(unit))),
+                 'execution': 'independent', 'argv': ['python', 'worker'], 'cwd': '/project'}
+                for unit in self.modules]}]}
+        self.metadata = {'run_id': 'current', 'python': 'runtime-python', 'git': 'git', 'mode': 'full',
+            'bytecode_policy': {'write_enabled': True},
+            'execution_context': {'python': '/python', 'stages': ['tests', 'compile'], 'parallelism': 3},
+            'environment': {'host': 'host', 'platform': 'linux', 'limits': {
+                'cpus': 4, 'affinity_cpus': 4, 'source': 'fake'}}}
+        self.previous = {'metadata': {**self.metadata, 'run_id': 'history'}, 'phases': [
+            {'name': f'module:{unit.name}', 'duration': duration, 'result': 'complete',
+             'stage_id': 'tests', 'unit_id': unit.name, 'run_id': 'history'}
+            for unit, duration in zip(self.modules, (0, 5, 5))],
+            'result': {'passed': True}, 'active': [], 'counts': {'success': 3}}
+        self.prior_manifest = {**json.loads(json.dumps(self.manifest)), 'run_id': 'history'}
+        # Completed history may include later mandatory commands; their declaration
+        # remains part of execution_context while comparison projects this stage.
+        self.prior_manifest['stages'].append({'id': 'compile', 'kind': 'command', 'argv': ['compile']})
+        for index, unit in enumerate(self.modules):
+            (self.history / f'stage-0/module-{index}.json').write_text(json.dumps({
+                'version': 1, 'module': unit.name, 'unit_id': unit.name, 'stage_id': 'tests',
+                'run_id': 'history', 'passed': True, 'completed': list(unit.ids)}))
+        self.save_history()
+
+    def save_history(self):
+        (self.history / 'manifest.json').write_text(json.dumps(self.prior_manifest))
+        (self.history / 'summary.json').write_text(json.dumps(self.previous))
+
+    def queue(self, modules=None):
+        return runner.execution_queue(self.modules if modules is None else modules, self.current,
+            self.metadata, self.manifest, 'tests')
+
+    def test_longest_first_with_stable_ties_preserves_manifest_and_fixture_identity(self):
+        # Runner holds dataclass tuples in memory; history is decoded JSON lists.
+        for unit, payload in zip(self.manifest['stages'][0]['units'], self.modules):
+            unit['payload'] = asdict(payload)
+        before = json.loads(json.dumps(self.manifest))
+        self.assertEqual(self.queue(), [self.modules[1], self.modules[2], self.modules[0]])
+        self.assertEqual(json.loads(json.dumps(self.manifest)), before)
+        self.assertEqual(self.queue()[0].owners, self.modules[1].owners)
+        self.assertEqual(self.queue()[0].pattern, 'test*.py')
+
+    def test_missing_corrupt_or_incomplete_duration_keeps_the_entire_collection_order(self):
+        saved = json.loads(json.dumps(self.previous))
+        for alter in (
+            lambda s: s['phases'].pop(),
+            lambda s: s['phases'].append(dict(s['phases'][0])),
+            lambda s: s['phases'][0].pop('duration'),
+            lambda s: s['phases'][0].update(duration=None),
+            lambda s: s['phases'][0].update(duration=True),
+            lambda s: s['phases'][0].update(duration=-1),
+            lambda s: s['phases'][0].update(duration=float('nan')),
+            lambda s: s['phases'][0].update(duration=float('inf')),
+            lambda s: s['phases'][0].update(result='error'),
+            lambda s: s['phases'][0].update(run_id='foreign'),
+            lambda s: s['active'].append({'id': 'running'}),
+            lambda s: s['result'].update(passed=False),
+            lambda s: s.update(metadata=[]),
+            lambda s: s.update(phases=[None]),
+        ):
+            self.previous = json.loads(json.dumps(saved))
+            alter(self.previous)
+            self.save_history()
+            with self.subTest(history=self.previous):
+                self.assertEqual(self.queue(), self.modules)
+        (self.history / 'summary.json').write_text('{corrupt')
+        self.assertEqual(self.queue(), self.modules)
+        (self.history / 'summary.json').unlink()
+        self.assertEqual(self.queue(), self.modules)
+
+    def test_changed_environment_contract_owners_or_serial_stage_keeps_collection_order(self):
+        saved = json.loads(json.dumps(self.previous))
+        for alter in (
+            lambda m: m['environment'].update(host='other'),
+            lambda m: m['environment']['limits'].update(cpus=2),
+            lambda m: m['bytecode_policy'].update(write_enabled=False),
+            lambda m: m['execution_context'].update(stages=['tests', 'other-command']),
+            lambda m: m.pop('execution_context'),
+            lambda m: m['execution_context'].update(parallelism=1),
+        ):
+            self.previous = json.loads(json.dumps(saved))
+            alter(self.previous['metadata'])
+            self.save_history()
+            self.assertEqual(self.queue(), self.modules)
+        self.previous = saved
+        self.prior_manifest['run_id'] = 'foreign'
+        self.save_history()
+        self.assertEqual(self.queue(), self.modules)
+        self.prior_manifest['run_id'] = 'history'
+        self.prior_manifest['stages'][0]['units'][0]['payload']['owners'] = []
+        self.save_history()
+        self.assertEqual(self.queue(), self.modules)
+        self.manifest['stages'][0]['units'][0]['execution'] = 'serial'
+        self.assertEqual(self.queue(), self.modules)
+
+    def test_missing_duplicate_partial_reports_and_unknown_reservations_reject_history(self):
+        path = self.history / 'stage-0/module-0.json'
+        report = json.loads(path.read_text())
+        for change in ({'completed': []}, {'completed': [report['completed'][0]] * 2},
+                       {'unit_id': 'foreign'}, {'version': True}):
+            path.write_text(json.dumps({**report, **change}))
+            self.assertEqual(self.queue(), self.modules)
+        path.write_text(json.dumps(report))
+        duplicate = path.with_name('module-3.json')
+        duplicate.write_text(json.dumps(report))
+        self.assertEqual(self.queue(), self.modules)
+        duplicate.unlink()
+        uncertain = self.history / 'uncertain-reservations.json'
+        uncertain.write_text('{"owned": {}}')
+        self.assertEqual(self.queue(), self.modules)
+        uncertain.unlink()
+        path.unlink()
+        self.assertEqual(self.queue(), self.modules)
+
+    def test_partial_full_and_different_selections_are_not_comparable(self):
+        self.metadata['mode'] = 'partial'
+        self.assertEqual(self.queue(), self.modules)
+        self.previous['metadata']['mode'] = 'partial'
+        for units in (self.manifest['stages'][0]['units'], self.prior_manifest['stages'][0]['units']):
+            for index, unit in enumerate(units):
+                unit['status'] = 'NOT_SELECTED' if index == 2 else 'SELECTED'
+        (self.history / 'stage-0/module-2.json').unlink()
+        self.previous['phases'].pop()
+        self.previous['counts'] = {'success': 2}
+        self.save_history()
+        chosen = self.modules[:2]
+        self.assertEqual(self.queue(chosen), list(reversed(chosen)))
+        self.assertEqual(self.manifest['stages'][0]['units'][2]['status'], 'NOT_SELECTED')
+        self.prior_manifest['stages'][0]['units'][1]['status'] = 'NOT_SELECTED'
+        self.save_history()
+        self.assertEqual(self.queue(chosen), chosen)
+        self.assertEqual(self.queue([]), [])
 
 
 class ManagerAdapterTests(unittest.TestCase):

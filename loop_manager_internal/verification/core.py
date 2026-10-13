@@ -79,6 +79,8 @@ def execute_manifest(modules, directory, writer, client, *, spawn, validate_repo
     waiting = None
     try:
         while pending or any(worker.module is not None for worker in workers):
+            progressed = False
+            rejected = False
             for worker in workers:
                 if worker.process.poll() is not None:
                     raise RuntimeError("verify worker가 배정/정리 전에 종료됐습니다.")
@@ -101,7 +103,8 @@ def execute_manifest(modules, directory, writer, client, *, spawn, validate_repo
                     writer.emit("module_result", unit_id=worker.module.name, module=worker.module.name, passed=report["passed"], memory=memory)
                     client.request("idle", token=worker.token)
                     worker.module = None
-            if pending:
+                    progressed = True
+            while pending:
                 idle = next((worker for worker in workers if worker.module is None), None)
                 reply = client.request("acquire", **({"token": idle.token} if idle else {}), worker_bytes=budget, run_id=writer.identity.get("run_id"), unit_id=pending[0].name)
                 reason = reply["reason"]
@@ -128,10 +131,21 @@ def execute_manifest(modules, directory, writer, client, *, spawn, validate_repo
                     module = pending.pop(0)
                     writer.emit("unit_start", unit_id=module.name, pid=idle.process.pid, reservation=idle.token)
                     idle.assign(module, directory / f"module-{len(modules) - len(pending) - 1}.json", directory)
-                elif waiting is None:
-                    waiting = writer.emit("phase_start", name="resource_wait")
-            if pending or any(worker.module is not None for worker in workers):
-                sleep(0.05)
+                    progressed = True
+                    # Collect an immediately available result before reserving more
+                    # workers, without weakening the descendant/Job checks above.
+                    if idle.report.is_file():
+                        break
+                else:
+                    rejected = True
+                    if waiting is None:
+                        waiting = writer.emit("phase_start", name="resource_wait")
+                    break
+            if (rejected or not progressed) and (pending or any(worker.module is not None for worker in workers)):
+                ready = any(worker.module is not None and worker.report.is_file()
+                            and (not worker.job or worker.job.active() <= 1) for worker in workers)
+                if not ready:
+                    sleep(0.05)
         expected = {identity for module in modules for identity in module.ids}
         if passed and completed != expected:
             raise RuntimeError("verify 최종 결과에 누락이 있습니다.")

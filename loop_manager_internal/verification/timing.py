@@ -292,16 +292,18 @@ def summarize(directory: Path, *, now=None):
     return summary
 
 
-def comparison(directories, summaries):
+def comparison(directories, summaries, *, manifests=None):
     """범위와 관측된 환경을 대조하고 실측 시간만 나란히 제공한다."""
     scopes, contexts, bytecode_policies, runs, contracts = [], [], [], [], []
-    for directory, summary in zip(directories, summaries):
+    for index, (directory, summary) in enumerate(zip(directories, summaries)):
         path = directory / "manifest.json"
-        modules = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else []
+        modules = manifests[index] if manifests is not None else (
+            json.loads(path.read_text(encoding="utf-8")) if path.is_file() else [])
         contracts.append(None if isinstance(modules, list) else (
             modules.get("version"), modules.get("adapter"), modules.get("adapter_version"),
-            [(stage["id"], stage.get("python"), stage.get("argv"), stage.get("cwd"),
-              [(unit.get("argv"), unit.get("cwd"), unit.get("execution")) for unit in stage.get("units", [])])
+            [(stage["id"], stage.get("kind"), stage.get("python"), stage.get("argv"), stage.get("cwd"),
+              [(unit.get("id"), unit.get("argv"), unit.get("cwd"), unit.get("execution"),
+                unit.get("payload"), unit.get("status")) for unit in stage.get("units", [])])
              for stage in modules.get("stages", [])]))
         if isinstance(modules, dict):
             modules = [unit for stage in modules.get("stages", []) for unit in stage.get("units", [])]
@@ -310,9 +312,13 @@ def comparison(directories, summaries):
         metadata = summary["metadata"]
         environment = metadata.get("environment", {})
         limits = environment.get("limits", {})
+        execution_context = metadata.get("execution_context")
+        if isinstance(execution_context, dict):
+            execution_context = {key: value for key, value in execution_context.items()
+                                 if key != "parallelism"}
         contexts.append((metadata.get("python"), metadata.get("git"), environment.get("host"),
                          environment.get("platform"), limits.get("cpus"), limits.get("affinity_cpus"),
-                         limits.get("applied_quota"), limits.get("source")))
+                         limits.get("applied_quota"), limits.get("source"), execution_context))
         bytecode_policies.append(metadata.get("bytecode_policy"))
         def duration(name):
             return next((event["duration"] for event in summary["phases"] if event["name"] == name), None)
@@ -353,6 +359,9 @@ def comparison(directories, summaries):
                      "bytecode_cache": summary.get("bytecode_cache"),
                      "passed": (summary.get("result") or {}).get("passed"), "counts": summary["counts"]})
     scope_matches = bool(scopes and scopes[0]) and all(scope == scopes[0] for scope in scopes) and all(value == contracts[0] for value in contracts)
+    mode_matches = bool(summaries) and all(summary["metadata"].get("mode", "full") ==
+        summaries[0]["metadata"].get("mode", "full") for summary in summaries)
+    scope_matches = scope_matches and mode_matches
     bytecode_policy_matches = bool(bytecode_policies and isinstance(bytecode_policies[0], dict)) and all(
         policy == bytecode_policies[0] for policy in bytecode_policies)
     environment_matches = bool(contexts and all(value is not None for value in contexts[0][:6])) and all(
@@ -360,6 +369,7 @@ def comparison(directories, summaries):
     environment_matches = environment_matches and bytecode_policy_matches
     complete = all(run["passed"] is True and not summary["active"] for run, summary in zip(runs, summaries))
     return {"scope_matches": scope_matches, "observed_environment_matches": environment_matches,
+            "mode_matches": mode_matches,
             "bytecode_policy_matches": bytecode_policy_matches,
             "comparable": len(runs) > 1 and scope_matches and environment_matches and complete,
             "runs": runs, "note": "관측된 환경·bytecode 설정과 실제 캐시 파일 변화를 기록합니다. 속도 개선을 합성하지 않습니다. 부하·메모리 제한도 원본 기록과 대조하고, 포함 관계인 단계 시간은 합산하지 않습니다."}
