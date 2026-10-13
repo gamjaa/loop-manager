@@ -466,6 +466,10 @@ PR 없는 게시 checkpoint의 Review 횟수 차단을 rebase 없이 해제할 �
 
 `runner.py`는 단계 순서를 유지한다. `core.py`는 도구별 결과 validator·worker IPC 경계를 받아 기존 자원 배정·예약·프로세스 시작·재사용·종료 확인을 수행하며 unittest 타입이나 자체 compile 경로를 소유하지 않는다. 수집과 직렬 command도 예약·전체 timeout을 적용한다. `unittest_adapter.py`는 프로젝트 interpreter의 discovery/`load_tests`·재수집·fixture·native reporter와 명시한 Python compile 범위를 소유한다. 자식 import와 Python 경로는 후보 worktree를 선택하며 Manager runtime 패키지가 후보 코드를 대신하지 않는다.
 
+core는 완료 report와 기존 자식/Windows Job 종료 조건을 먼저 확인하고, 매 acquire의 cap·공정성·미반영 CPU/메모리 예약 판단이 허용하는 pending 모듈을 연속 배정한다. 즉시 report가 나타나면 수집으로 돌아가며, 진행이 없거나 acquire가 거절되고 즉시 수집할 report도 없으면 50ms bounded 대기한다. 시작 실패의 미시작 확인, PID bind, idle 전환과 실제 종료 뒤 release 경계는 유지한다.
+
+runner의 실행 큐는 같은 진단 부모 디렉터리의 가장 최근 `summary.json`과 manifest·모듈 report를 읽는다. 현재 단계와 전체 실행 선언·프로젝트 Python·병렬도/조율·임시 경로·Python 경로·계측 버전을 `timing.comparison`의 범위/환경·bytecode 정책 대조에 결합한다. 실행 모드·선택 상태·수집 ID·fixture 소유자·pattern이 같고, 과거 run이 성공·완결되며 종료 불명 예약이 없고 모든 실행 모듈의 단일 유효한 완료 phase duration과 report identity/coverage가 있을 때만 독립 단계에서 긴 모듈부터 배정한다. 동률은 수집 순서이고 부재·손상·불완전·비교 불가능에는 전체 수집 순서를 유지한다. manifest는 원래 수집 순서와 NOT_SELECTED를 보존하며 serial과 단계/필수 명령 순서는 바꾸지 않는다. 과거 시간은 비용 자료이며 현재 성공이나 실행 생략의 근거가 아니다.
+
 `verification/guard.py`는 interpreter의 `sys`에 둔 설치 근거·lock을 `sitecustomize`의 runpy 로딩과 후보 package import가 공유한다. 실제 audit probe로 hook 등록을 확인하고 wrapper 함수 identity를 대조한다. wrapper 설치 실패 뒤 재진입은 확인된 hook을 재사용하며 완료되지 않은 설치를 성공으로 간주하지 않는다. Python이 sitecustomize 예외 뒤 실행을 계속하는 것을 막기 위해 설치 실패는 비밀값 없는 고정 진단과 비정상 종료로 처리한다. 가드 원본의 위치는 자식 보호 경로를 정하고 환경의 프로젝트 root는 후보 package 선택을 정한다.
 
 Popen wrapper는 호출자 환경을 복사·정제하고 해당 호출의 thread-local 범위에 전달 dict identity와 내용 사본을 보관한다. audit는 같은 dict·내용일 때만 준비를 생략하고 변경되거나 직접 전달된 환경은 정제한다. 성공·시작 실패·중단 뒤 호출 범위를 복원하며 명령/API 검사는 매 실행 경계에서 수행한다. 환경의 Windows 대소문자·POSIX bytes 별칭을 처리해 조율 인증값을 제외하고 marker·가드 경로·후보 root·bytecode 정책을 유지한다. 이 설치 근거와 호출 범위는 안전 판단 cache나 새 환경 원본이 아니며 임의 언어·모든 외부 subprocess의 보호를 보장하지 않는다. 예약·종료 확인 책임은 기존 core/프로세스 경계에 남는다.
