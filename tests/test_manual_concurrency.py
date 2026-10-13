@@ -577,8 +577,44 @@ class ManualBootstrapConcurrencyTests(OriginScopeFixture, unittest.TestCase):
                 self.assertEqual(kwargs['invocation'].repo, str(source))
                 return 0, '{"plans": []}'
             effects = manual_plan_generation.ManualGenerationEffects(manager.git, mock.Mock(side_effect=agent),
-                manager.prepare_runtime_worktree, manager.remove_runtime_worktree)
+                manager.prepare_runtime_worktree, manager.remove_runtime_worktree,
+                manager.compact_execplan_catalog)
             self.assertEqual(manual_plan_generation.generate(effects, connection, source, state, source / 'unused.ini',
                 'codex', group, {}), '{"plans": []}')
             self.assertEqual(len(manager._worktree_catalog(source)), 1)
             self.assertEqual(connection.execute('SELECT count(*) FROM projects').fetchone()[0], 0)
+
+    def test_manual_generation_uses_compact_catalog_and_existing_planner_guidance_boundary(self):
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+            _, source, _writer = remote_fixture(directory)
+            state = Path(directory) / 'state'
+            state.mkdir()
+            connection = manager.connect_database(state, create=True)
+            cleanup.callback(connection.close)
+            head = git(source, 'rev-parse', 'HEAD')
+            group = {'base_sha': head, 'source_head': head, 'group_id': 'b' * 32}
+            compact = mock.Mock(return_value='[{"id":"G-001","title":"Active","status":"READY"}]')
+            captured = {}
+
+            def agent(_provider, _path, _state, _config, role, prompt, **kwargs):
+                captured.update(role=role, prompt=prompt, kwargs=kwargs)
+                return 0, '{"plans": []}'
+
+            effects = manual_plan_generation.ManualGenerationEffects(
+                manager.git, agent, manager.prepare_runtime_worktree, manager.remove_runtime_worktree,
+                compact_execplan_catalog=compact,
+            )
+            self.assertEqual(manual_plan_generation.generate(
+                effects, connection, source, state, source / 'unused.ini', 'codex', group, {},
+            ), '{"plans": []}')
+            compact.assert_called_once_with(connection, str(source))
+            self.assertEqual(captured['role'], 'planner')
+            self.assertTrue(captured['kwargs']['read_only'])
+            prompt = captured['prompt']
+            self.assertIn('설계 난도', prompt)
+            self.assertIn('실패 영향 및 복구 가능성', prompt)
+            self.assertIn('high 또는 critical', prompt)
+            self.assertIn('"status": "READY"', prompt)
+            self.assertNotIn('reserved', prompt)
+            self.assertNotIn('EXECPLAN_AUTHORING_GUIDANCE', prompt)
+            self.assertNotIn('AGENTS.md', prompt)
