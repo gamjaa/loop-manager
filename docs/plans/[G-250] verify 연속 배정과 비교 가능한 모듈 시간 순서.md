@@ -36,15 +36,19 @@ verification/core.py의 수집→pending 배정→대기 경계와 runner의 실
 
 - Worker는 test_verify_runtime.py의 pool fixture와 test_verify_resources.py의 coordinator double로 복수 연속 grant, 거절 뒤 대기, 즉시 완료·실행 중 cap·다중 session 공정성·시작 실패를 최소 unit으로 검사한다. fake clock/sleep·process를 제공하고 실제 배정/예약 판단을 확인한다.
 - 고정 시간 자료로 긴 모듈 우선·동률 안정·부재/손상/불완전/다른 환경 fallback과 동일 manifest·coverage/fixture·command 단계 순서를 검사한다. test_partial_verify_runner.py의 기존 fixture를 재사용해 부분/전체·다른 선택 집합의 과거 자료 거부와 NOT_SELECTED 미배정을 확인한다. 불완전/중복 결과·자식 생존·종료 불명/timeout 회귀를 유지한다.
-- Manager 최종 전체 verify는 1/auto의 같은 범위·결과·compile과 예약/정리를 유지한다. 영향 모듈·필수 연관 회귀를 같은 실행 모드·선택 집합·Python/Git·계측/cache·실제 worker/자원·동시 부하·임시 경로에서 반복 비교해 중앙값을 남긴다. 부분 실행이 선정 규모를 줄인 효과와 같은 범위의 배정 개선을 구분하며 국소 개선을 전체 시간으로 환산하지 않는다.
+- Manager 최종 전체 verify는 1/auto의 같은 범위·결과·compile과 예약/정리를 유지한다. 구현·정확성·안전성 검증과 읽기 전용 Review를 먼저 완료하며, 전후 성능 측정·중앙값은 이번 완료·Review·PR 게시의 필수 조건이 아니다. 측정 누락이나 측정 담당 전환만으로 Worker 재교정·사용자 판단 대기를 만들지 않는다.
+- 성능 효과는 후속 확인으로 미룬다. 실제 비교를 수행할 때는 영향 모듈·필수 연관 회귀를 같은 실행 모드·선택 집합·Python/Git·계측/cache·실제 worker/자원·동시 부하·임시 경로에서 반복 측정해 중앙값을 남긴다. 부분 실행의 선정 규모 감소와 같은 범위의 배정 개선을 구분하고 국소 개선을 전체 시간으로 환산하지 않는다. 미측정 상태를 성능 개선 성공으로 기록하지 않는다.
 
 ## Progress
 
 - [x] 2026-10-10 기준 50c699c8f9c149cecb0ddf9b081527942d8e2289의 core 단일 acquire 후 sleep, 수집 순서 pending과 기존 timing/예약·pool 회귀를 정적으로 확인했다. 구현·테스트·비교·verify는 실행하지 않았다.
 - [ ] 실행 큐·연속 배정·설명 정합화와 targeted unit 검증
-- [ ] Manager 전체 verify·같은 조건 비용 비교·읽기 전용 Review·사용자 Merge
+- [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
+- 전후 비용 비교·중앙값 확인은 구현 완료 뒤의 후속 확인이며 위 완료 항목의 선행 조건이 아니다.
 
 ## Decision Log
+
+- 2026-10-13 사용자 결정: 성능 개선의 즉시 실측을 완료 조건에서 제외하고 구현·정확성·안전성 검증·Review를 진행한다. 변경 전후 반복 측정과 중앙값은 후속 확인으로 미루며, 측정 누락·담당 전환의 사용자 판단 대기는 해소한다. 성능 개선의 입증이나 구현·검증 성공을 이 결정으로 대신하지 않는다.
 
 - 2026-10-12 사용자 요청의 문서 정합화: R-086 선택 집합·미선택 상태와 비교 범위의 호환 조건을 명시했다. 연속 배정/시간 순서의 원래 목표·dependency·metadata·기록을 유지하며 부분 검증이나 Reviewer 병렬 실행을 중복 구현하지 않는다.
 
