@@ -115,6 +115,48 @@ class ImpactTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             impact.selected_modules(replace(selection, modules=('missing',)), self.modules)
 
+    def test_fresh_import_inventory_and_shard_changes_keep_opaque_consumer_fallback(self):
+        # Use the actual consumer/helper bodies: string imports inside child code
+        # cannot be inferred from static implementation references.
+        root = Path(__file__).resolve().parents[1]
+        helper = 'tests/support/fresh_imports.py'
+        shard = 'tests/test_direct.py'
+        sources = dict(self.sources)
+        sources[helper] = (root / helper).read_bytes()
+        sources[shard] = (root / 'tests/test_internal_imports_0.py').read_bytes()
+        def graph(bodies):
+            return code_index.resolve({path: impact.source_facts(path, content)
+                                       for path, content in bodies.items()}, bodies)
+        for change in (('A', None, 'pkg/new.py'), ('D', 'pkg/value.py', None),
+                       ('R100', 'pkg/value.py', 'pkg/moved.py'), ('M', shard, shard),
+                       ('M', helper, helper)):
+            with self.subTest(change=change):
+                after = dict(sources)
+                status, old, new = change
+                if status == 'A':
+                    after[new] = b'def _value():\n    return 1\n'
+                elif status == 'D':
+                    del after[old]
+                elif status.startswith('R'):
+                    after[new] = after.pop(old)
+                else:
+                    after[new] += b'\n# consumer changed\n'
+                selection = impact.select_records(graph(sources), graph(after), [change],
+                    self.modules, head='head', base='base', configuration={'version': 1})
+                self.assertTrue(any(reason.startswith('uncertain_') and helper in reason
+                                    for reason in selection.fallback))
+                with self.assertRaises(ValueError):
+                    impact.selected_modules(selection, self.modules)
+
+    def test_new_fresh_import_ids_cannot_reuse_an_old_selection(self):
+        selection = self.choose()
+        from tests.support import fresh_imports
+        target = fresh_imports.inventory()[0]
+        current = replace(self.modules[0], ids=(
+            'test_direct.FreshImportTests.' + target.method_name,))
+        with self.assertRaisesRegex(ValueError, 'manifest identity'):
+            impact.selected_modules(selection, [current, *self.modules[1:]])
+
     def test_discovery_support_imports_use_static_aliases_not_filename_similarity(self):
         sources = dict(self.sources)
         sources['tests/support/helper.py'] = b'from pkg import value\n'

@@ -1,5 +1,6 @@
 """Partial runner retains discovery, fixtures, identity and process boundaries."""
 import json
+from dataclasses import asdict
 import os
 from pathlib import Path
 import subprocess
@@ -22,6 +23,53 @@ from tests.support.git import isolated_git_test
 
 @isolated_git_test
 class PartialRunnerTests(unittest.TestCase):
+    def test_fresh_import_unselected_and_fallback_shards_never_count_as_completed(self):
+        from loop_manager_internal.verification import impact
+        from tests.support import fresh_imports
+        units = []
+        for shard in range(fresh_imports.SHARD_COUNT):
+            owner = f'test_internal_imports_{shard}'
+            ids = tuple(manifest.test_ids(fresh_imports.suite(unittest.TestLoader(), owner, shard)))
+            units.append(manifest.Module(owner, ids))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'scripts').mkdir()
+            (root / 'tests').mkdir()
+            (root / 'scripts/verify.json').write_text(json.dumps({
+                'version': 1, 'adapter': 'unittest', 'environment': {'python': 'launcher'},
+                'stages': [{'id': 'tests', 'kind': 'tests', 'cwd': '.',
+                    'collection': {'directory': 'tests', 'pattern': 'test*.py'}, 'execution': 'independent'},
+                    {'id': 'compile', 'kind': 'command', 'cwd': '.', 'argv': ['{python}', 'compile.py']}]}))
+            for fallback in ((), ('uncertain_head:tests/support/fresh_imports.py',)):
+                logs = root / ('fallback' if fallback else 'selected')
+                selection = impact.Selection('head', 'base', (units[0].name,), units[0].ids,
+                    {}, fallback, len(units), sum(len(unit.ids) for unit in units),
+                    impact.digest([asdict(unit) for unit in units]), 'configuration')
+                with mock.patch.object(runner.Path, 'cwd', return_value=root), \
+                        mock.patch.object(runner, 'install_guard'), mock.patch.dict(os.environ, {}, clear=True), \
+                        mock.patch.object(runner, 'VerifyCoordinator') as coordinator, \
+                        mock.patch.object(runner.subprocess, 'run', return_value=SimpleNamespace(stdout='head')), \
+                        mock.patch.object(runner.unittest_adapter, 'collect_project', return_value=(units, sys.version)), \
+                        mock.patch.object(runner.unittest_adapter, 'execute', return_value=True) as execute, \
+                        mock.patch.object(runner, 'execute_command') as command, \
+                        mock.patch.object(impact, 'select', return_value=selection), \
+                        mock.patch.object(impact, 'assert_candidate'), mock.patch('sys.stdout'):
+                    coordinator.return_value.open.return_value = ('session', 'secret')
+                    coordinator.return_value.reservations = {}
+                    self.assertEqual(runner.run(logs, 1, project_python=sys.executable, partial_base='base'), 0)
+                command.assert_not_called()
+                if fallback:
+                    execute.assert_not_called()
+                else:
+                    self.assertEqual(execute.call_args.args[2], units[:1])
+                report = json.loads((logs / 'manifest.json').read_text())
+                recorded = report['stages'][0]['units']
+                self.assertEqual([unit['status'] for unit in recorded],
+                    ['NOT_SELECTED'] * len(units) if fallback else ['SELECTED', *['NOT_SELECTED'] * (len(units) - 1)])
+                self.assertTrue(all('completed' not in unit and 'fixture_skipped' not in unit for unit in recorded))
+                result = json.loads((logs / 'partial-result.json').read_text())
+                self.assertEqual(result['status'], 'FALLBACK' if fallback else 'PASS')
+
     def test_timeout_normalization_preserves_partial_diagnostic_report(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

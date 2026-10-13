@@ -517,7 +517,9 @@ bootstrap 회귀의 부모·자식 CLI 계측은 실제 PID·시각과 테스트
 
 통합 테스트는 확인할 효과에 도달하면 종료한다. 예를 들어 rebase 중단 회귀는 실제 operation·index·session 보존과 같은 복구로의 재진입을 확인한 뒤 정상적인 pause 결과로 멈출 수 있다. 이후의 반복 실패·교정 소진·최종 차단은 그 정책과 실제 효과를 확인하는 기존 전용 테스트에 맡긴다. 실제 재시도 횟수 자체가 검증 대상인 테스트에서는 필요한 반복을 유지한다. 실행을 줄일 때는 원래 조건과 assertion을 유지하거나 계속 검사하는 테스트로 대응시키며, 새 mock이 검증할 판단을 성공값으로 대신하지 않게 한다.
 
-Git 외의 subprocess도 같은 기준을 적용한다. 최초 import의 의존성과 부작용 검사는 모듈별 새 interpreter가 계약이므로 유지하며, 이미 import된 프로세스를 재사용해 검사를 약화하지 않는다. 실제 프로세스 시작·프로세스 간 전달·OS 효과가 대상이 아닌 오류 처리와 조건 조합은 subprocess 경계를 mock으로 처리한다. 새 전역 cache나 별도 runner를 추가하기 전에 기존 fixture와 관측 경계를 재사용한다.
+Git 외의 subprocess도 같은 기준을 적용한다. 최초 import의 의존성과 부작용 검사는 entry point·구현 모듈·package initializer마다 새 interpreter가 계약이다. `tests/support/fresh_imports.py`가 현재 Python 파일에서 대상 집합을 수집하고 대상 종류·모듈 이름의 안정적인 해시로 8개 독립 unittest 모듈에 배분한다. 각 대상은 고유 테스트 ID를 가지며 공유 helper의 `legacy_id`가 이전 두 검사와의 대응을 제공한다. 각 분할의 로컬 테스트 클래스가 fixture를 소유하고 `load_tests`가 매 수집·실행 로딩에서 inventory를 다시 읽으므로 대상 추가·삭제와 ID·fixture 변경은 기존 manifest 대조에서 실패한다. 새 interpreter는 SQLite 연결·프로세스 생성과 entry point 선행 로딩을 거부하며 package initializer는 서비스 모듈을 로딩하지 않아야 한다.
+
+분할 모듈의 배정과 실행량은 기존 unittest adapter와 coordinator가 소유한다. worker는 각 대상의 interpreter 하나를 기존 30초 상한 안에서 실행하고 종료를 기다린다. worker 내부 pool·별도 runner·이미 import된 프로세스 재사용 없이 기존 serial/independent 선언, 자원·사용자 상한과 전체 timeout·자식 종료 확인을 유지한다. 동적 import 문자열의 대상 범위를 AST 참조만으로 증명하지 않으며 대상 추가·삭제·이동과 분할/helper 변경의 불확실성은 기존 부분 verify의 실행 없는 fallback으로 처리한다. 미선택 모듈은 NOT_SELECTED로 남고 import 완료로 집계하지 않는다. 실제 프로세스 시작·프로세스 간 전달·OS 효과가 대상이 아닌 오류 처리와 조건 조합은 subprocess 경계를 mock으로 처리한다. 새 전역 cache나 별도 runner를 추가하기 전에 기존 fixture와 관측 경계를 재사용한다.
 
 완료된 전체 기준 검증이 있으면 비용 변경의 전후 비교는 영향을 받는 모듈만 같은 병렬도·계측·수집 범위로 실행한다. 필수 연관 회귀가 있으면 그 모듈을 포함하고, 전체 검증과 모듈 비교의 결과를 구분한다. 모듈의 시간 감소를 전체 verify의 감소로 환산하지 않는다. 이 비교 범위는 개발 중 검증에만 적용하며 전체 verify의 수집·실행 범위를 바꾸지 않는다.
 
