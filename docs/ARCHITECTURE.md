@@ -6,6 +6,14 @@ Loop Manager는 Windows·Linux·macOS에서 동작하는 Python 3 프로그램�
 
 하나의 프로젝트에는 여러 READY ExecPlan을 등록할 수 있지만 한 번에 하나만 처리한다. 서로 다른 프로젝트는 `max_workers` 범위에서 병렬로 처리한다.
 
+### 구현 모듈과 의존성 조립
+
+`loop_manager.py`는 CLI 인자 해석과 bootstrap 진입을 담당한다. Agent·Git·Planning·Execution·Recovery 등 각 내부 패키지의 `bindings.py`가 해당 기능의 구현과 명시적인 effect 계약을 연결한다. 새 서비스는 소유 패키지의 `register()`에 등록하며 진입점에 개별 callback을 추가하지 않는다.
+
+`application/composition.py`의 `create_application(root)`는 이 선언들을 조립하고 등록된 callback 의존성의 누락·중복을 확인한다. 서비스 간 callback은 호출 시 연결하므로 등록 순서나 상호 참조 때문에 실행 효과가 발생하지 않는다. 조립용 이름 조회는 이 계층에 한정하며 실제 서비스는 기존의 기능별 effect 계약을 받는다. 내부 모듈 import와 조립은 DB·Git·Agent 프로세스를 시작하지 않는다. 별도로 만든 구성은 자체 resource root와 override를 사용하며 CLI 모듈을 불러오지 않는다.
+
+`application/legacy_exports.py`는 기존 공개 타입·모듈 별칭·순수 helper를 보존하고 `application/compatibility.py`는 조립 결과를 진입점에 공개한다. 기존 함수 시그니처, 클래스 method 교체와 호출 시점의 `loop_manager` 함수 교체는 이 호환 경계에서 유지한다. 내부 구성은 진입점의 namespace를 받지 않으며, 호환 경계에서만 교체된 이름을 조회한다.
+
 ## 문서 경계와 책임
 
 | 기준 | 담당 내용 |

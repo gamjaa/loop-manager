@@ -42,12 +42,14 @@ class ProjectServiceCompositionTests(unittest.TestCase):
             self.assertTrue(worktree.is_symlink())
             self.assertEqual(preserved.read_text(encoding='utf-8'), 'preserved')
 
-    def test_root_contains_only_cli_definitions_and_public_composition(self):
+    def test_root_contains_only_cli_definitions_and_compatibility_installation(self):
         tree = ast.parse(Path(loop_manager.__file__).read_text(encoding='utf-8'))
         definitions = [node.name for node in tree.body
                        if isinstance(node, (ast.FunctionDef, ast.ClassDef))]
         self.assertEqual(definitions, ['build_parser', 'main'])
         self.assertNotIn('globals()', ast.unparse(tree))
+        self.assertNotIn('_bind_effects(', ast.unparse(tree))
+        self.assertFalse(any(isinstance(node, ast.Lambda) for node in ast.walk(tree)))
 
     def test_catalog_class_export_keeps_method_patches_on_existing_instances(self):
         self.assertIsInstance(loop_manager._GitCatalogDefinitionPort, type)
