@@ -32,6 +32,8 @@ _FILE_FUNCTIONS = {'open', 'builtins.open', 'io.open', 'glob.glob', 'glob.iglob'
                    'pkgutil.get_data', 'importlib.resources.read_text', 'importlib.resources.read_binary',
                    'xml.etree.ElementTree.parse', 'xml.dom.minidom.parse'}
 _FILE_ALIASES = {'symlink', 'symlink_to', 'link', 'link_to', 'hardlink_to', 'rename', 'replace'}
+_NAMESPACES = {'__dict__', '__globals__', '__builtins__', 'f_globals', 'f_locals',
+               '__getattribute__', '__getattr__'}
 
 
 class Source:
@@ -111,7 +113,7 @@ class Source:
 def analyze(path, content):
     facts = code_index.parse_source(path, content)
     facts['_impact_source'] = content.decode('utf-8-sig') if isinstance(content, bytes) else content
-    proof = {'uncertainties': [], 'resolved': [], 'module_targets': [], 'file_reads': [], 'protected_effect': False,
+    proof = {'uncertainties': [], 'resolved': [], 'module_targets': [], 'file_reads': [], 'accesses': [], 'protected_effect': False,
              'unbounded_file_read': False}
     facts['impact'] = proof
     if any(reason != 'dynamic_reference' for reason in facts['uncertainties']):
@@ -151,8 +153,9 @@ def analyze(path, content):
                 special_nodes.add(node.func)
                 owner = source.qualified(node.args[0]) if node.args else None
                 fields = source.strings(node.args[1]) if len(node.args) > 1 else None
-                if fields and owner and any(owner == binding or owner.startswith(binding + '.') for binding in source.bindings.values()) and owner.split('.')[0] not in {'importlib', 'builtins', 'sys', 'runpy'}:
+                if fields and not set(fields).intersection(_NAMESPACES | _OPAQUE_NAMES) and owner and any(owner == binding or owner.startswith(binding + '.') for binding in source.bindings.values()) and owner.split('.')[0] not in {'importlib', 'builtins', 'sys', 'runpy'}:
                     resolved(node, 'bounded_module_attribute', [owner])
+                    proof['accesses'].extend(owner + '.' + attribute for attribute in fields)
                 else:
                     unknown(node, 'unbounded_reflection')
             elif name and name.startswith('sys.modules.'):
@@ -209,6 +212,11 @@ def analyze(path, content):
     # Merely assigning a loader to another name must not bypass the checks.
     for node in ast.walk(source.syntax):
         name = source.qualified(node)
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) and node.id == '__builtins__' or isinstance(node, ast.Attribute) and node.attr in _NAMESPACES:
+            unknown(node, 'unbounded_namespace')
+        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load) or isinstance(node, ast.Attribute):
+            if name:
+                proof['accesses'].append(name)
         if name in _FILE_FUNCTIONS or isinstance(node, ast.Attribute) and node.attr in _FILE_METHODS | _FILE_ALIASES:
             parent = source.parents.get(node)
             if not isinstance(parent, ast.Call) or parent.func is not node:
@@ -221,6 +229,7 @@ def analyze(path, content):
     proof['uncertainties'] = sorted(set(proof['uncertainties']))
     proof['module_targets'] = sorted(set(proof['module_targets']))
     proof['file_reads'] = sorted(set(proof['file_reads']))
+    proof['accesses'] = sorted(set(proof['accesses']))
     return facts
 
 
@@ -281,12 +290,35 @@ def resolve(facts, aliases=None):
         item['references'].extend({'path': target, 'symbol': '*', 'line': 0} for target in sorted(initializers))
 
     sources = {p: Source(p, f['_impact_source']) for p, f in graph.items() if '_impact_source' in f and 'parse_failed' not in f.get('selection_uncertainties', [])}
+    # A project can re-export a loader or module registry under an innocent
+    # name. Do not mistake access to that alias for an ordinary project API.
+    for path, item in graph.items():
+        for access in item.get('impact', {}).get('accesses', []):
+            parts = access.split('.')
+            for length in range(1, len(parts)):
+                owner = modules.get('.'.join(parts[:length]))
+                if owner in sources:
+                    qualified = sources[owner].bindings.get(parts[length])
+                    if qualified in _LOADERS | _REFLECTION | _EXECUTION | _PROCESSES | {'sys.modules'}:
+                        item['selection_uncertainties'].append('escaped_project_dynamic_binding:' + access)
+                    # Usage hints prioritize actual re-export users even when
+                    # initialization effects require keeping the broad graph.
+                    # They add edges; they never delete initialization coverage.
+                    target = modules.get(qualified or '') or modules.get((qualified or '').rsplit('.', 1)[0])
+                    if target and target != path:
+                        graph[target].setdefault('usage_dependents', []).append(path)
+        if 'selection_uncertainties' in item:
+            item['selection_uncertainties'] = sorted(set(item['selection_uncertainties']))
+    passive_cache = {}
     def imports_passively(path, seen):
         if path in seen:
             return False
+        if path in passive_cache:
+            return passive_cache[path]
         source = sources.get(path)
-        return bool(source and passive(source) and not graph[path].get('selection_uncertainties')
+        passive_cache[path] = bool(source and passive(source) and not graph[path].get('selection_uncertainties')
                     and all(imports_passively(r['path'], seen | {path}) for r in graph[path]['references']))
+        return passive_cache[path]
 
     for path, item in graph.items():
         source = sources.get(path)
@@ -339,6 +371,8 @@ def resolve(facts, aliases=None):
     for item in graph.values():
         item['dependents'] = sorted(set(item['dependents']))
         item['related_tests'] = sorted(set(item['related_tests']))
+        if 'usage_dependents' in item:
+            item['usage_dependents'] = sorted(set(item['usage_dependents']))
     return graph
 
 

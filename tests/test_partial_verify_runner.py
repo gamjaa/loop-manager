@@ -136,6 +136,9 @@ class PartialRunnerTests(unittest.TestCase):
             git('init', '-q')
             (root / '.gitignore').write_text('__pycache__/\n')
             (root / 'pkg/value.py').write_text('def _value():\n    return 1\n')
+            # An opaque module elsewhere must be reported without forcing the
+            # precheck to run the whole manifest; actual full verify still runs.
+            (root / 'pkg/opaque.py').write_text('def dynamic(name):\n    return __import__(name)\n')
             (root / 'tests/test_selected.py').write_text(
                 'import unittest\nfrom pkg.value import _value\n'
                 'class Case(unittest.TestCase):\n'
@@ -181,6 +184,8 @@ class PartialRunnerTests(unittest.TestCase):
                     self.assertEqual(result['selection']['modules'], ['test_selected'])
                     self.assertEqual(len(result['selection']['ids']), 2)
                     self.assertEqual(result['selection']['total_tests'], 7)
+                    self.assertEqual(result['selection']['analysis']['coverage'], 'selected_modules_only')
+                    self.assertTrue(result['selection']['analysis']['remaining_uncertainties'])
                     proof = result['selection']['analysis']['documents'][0]
                     self.assertEqual(proof['path'], 'docs/requirements/[R-086] Impact.md')
                     self.assertNotEqual(proof['source_identity']['base'], proof['source_identity']['head'])

@@ -137,8 +137,10 @@ class ReviewHandler:
         if preliminary and self.ports._document_draft(context) is None:
             self._preliminary = preliminary
             return worker_publication, ('Manager 부분 verify PASS; 전체 verify는 아직 실행하지 않았습니다. '
+                'PASS는 선택 모듈의 성공만 뜻하며 영향 범위 전체를 증명하지 않습니다. '
+                '선정 진단의 남은 불확실성과 미선택 관련 모듈도 확인하세요. '
                 '일반 선행 Review로 구현·회귀·요구사항을 검토하세요. PASS는 최종 게시 승인이 아닙니다.\n'
-                + str(preliminary['partial']))
+                + preliminary_review.review_summary(preliminary['partial']))
 
         candidate_head = self.ports.git(
             context.worktree, 'rev-parse', 'HEAD',

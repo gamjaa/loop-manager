@@ -403,3 +403,29 @@ class PreliminaryReviewTests(ExecutionFixture, unittest.TestCase):
         self.assertIsNone(event['verified_head'])
         self.assertEqual(event['partial_head'], 'head')
         review_correction_state.deserialize(json.dumps(decision.correction_state))
+
+
+class PreliminarySummaryTests(unittest.TestCase):
+    def test_review_input_bounds_diagnostics_without_claiming_full_coverage(self):
+        selection = {'head': 'candidate', 'base': 'base', 'modules': ['test_selected'],
+            'ids': [f'test_selected.Case.test_{i}' for i in range(1000)],
+            'total_modules': 218, 'total_tests': 4000,
+            'reasons': {'test_selected': ['direct_reference', 'common_regression_precheck']},
+            'analysis': {'remaining_uncertainties': {f'head:pkg/module{i}.py': ['dynamic_import:1'] for i in range(300)},
+                         'not_selected_related_modules': [f'test_other{i}' for i in range(200)],
+                         'scope_limits': ['document_consumption_unproven:docs/PRODUCT.md']}}
+        report = {'kind': 'partial_verify', 'status': 'PASS', 'selection': selection,
+                  'diagnostic': '/logs/partial/summary.json'}
+        serialized = json.dumps(report)
+        summary = json.loads(preliminary_review.review_summary(serialized))
+        self.assertEqual(summary['coverage'], 'selected_modules_only')
+        self.assertTrue(summary['full_verify_required'])
+        self.assertTrue(summary['samples_are_incomplete'])
+        self.assertEqual(summary['selected_tests'], 1000)
+        self.assertEqual(summary['uncertain_sources'], 300)
+        self.assertEqual(summary['uncertainty_categories'], {'dynamic_import': 300})
+        self.assertEqual(summary['not_selected_related_count'], 200)
+        self.assertLess(len(summary['uncertainty_sample']), summary['uncertain_sources'])
+        self.assertEqual(summary['selection_identity'], preliminary_review.digest(selection))
+        self.assertEqual(summary['diagnostic'], report['diagnostic'])
+        self.assertEqual(json.dumps(report), serialized)
