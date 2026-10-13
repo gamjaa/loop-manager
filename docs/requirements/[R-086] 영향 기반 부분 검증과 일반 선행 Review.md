@@ -2,34 +2,40 @@
 
 ## Context
 
-Worker 교정마다 전체 verify를 반복하면 Reviewer가 거부할 후보에도 긴 검증 비용이 발생한다. Manager가 모델 없이 관련 회귀 테스트를 먼저 검사하고 일반 선행 Review를 수행해 이 비용을 줄인다. Worker의 R-003 targeted test 제한과 전체 검증·게시·복구 계약은 유지한다.
+Worker 교정마다 전체 verify를 반복하면 Reviewer가 거부할 후보에도 긴 검증 비용이 발생한다. 일반 작업은 Manager의 빠른 부분 회귀 검사 → 일반 선행 Reviewer → 실제 전체 verify로 진행한다. 부분 검사는 영향 범위의 완전성을 증명하지 않으며, 최종 안전성은 전체 검증·Review 승인·게시 계약으로 확보한다.
 
 ## Requirement
 
-- 첫 지원 범위는 Loop Manager 자체 저장소의 Python unittest adapter다. 부분 verify·일반 선행 Review 경로는 기본 사용하며 `[loop] verify_partial = false`로 끌 수 있다. 옵션 생략 시 true이며, 안전한 선정·검토 증거를 확인하지 못하면 기존 전체 verify → Reviewer로 fallback한다.
-- Worker 완료 뒤 기존 commit·최신 base reconcile로 준비한 실제 후보와 base의 diff를 사용한다. 변경 전·후 전체 Python AST 그래프의 직접·역방향 간접 의존성으로 테스트 모듈을 고르고, 변경된 테스트를 포함한다. 삭제·rename·이동의 기존 소비자도 확인하고 실제 discovery manifest ID로 정규화한다. 파일명 유사도와 AI 선정은 사용하지 않는다.
-- 동적 참조·미해결 관계, 공유 fixture/support, 초기화·진입점·공개 API, Git·SQLite·상태·권한·복구 공통 코드, 수집·runner·검증 설정 변경, 불충분한 삭제/이동 분석, 대상 없음·넓은 선택은 결정적인 규칙으로 보수적으로 fallback한다. 부분 모드에서 전체 테스트를 실행한 뒤 전체 verify를 반복하지 않는다.
-- 부분 verify는 Agent 밖에서 기존 project interpreter·guard·프로세스 종료 확인·serial/independent·자원 예약을 사용한다. 전체 discovery와 fixture·skip 의미를 유지하고 선택 모듈의 결과 누락·중복·identity 오류를 성공으로 인정하지 않는다. 미선택 모듈은 NOT_SELECTED로 구분한다. timeout·취소·종료 불명은 기존 안전 정책을 따른다.
-- 부분 결과에는 candidate/base, manifest·선택 모듈/테스트 ID, 선정/fallback 이유·규모, 알고리즘/설정 identity, 시간·실패 진단을 남긴다. 부분 성공은 전체 verify token/receipt 또는 verified_head를 만들지 않는다.
-- 부분 FAIL은 기존 verify 교정·반복 차단으로, 선행 Review FAIL은 기존 ISSUE_ID·실패 감사·Worker level 교정으로 연결한다. 선행 FAIL이면 전체 verify를 호출하지 않는다. 부분 PASS와 선행 PASS 뒤에는 실제 전체 verify가 필요하며 전체 FAIL은 기존 교정 정책을 따른다.
-- 일반 선행 PASS는 독립된 후보 증거다. 동일 작업 주기·HEAD·base·전체 diff·ExecPlan·Requirement·PRODUCT·ARCHITECTURE·사용자 결정·실제 Reviewer instruction/provider/model/effort·필요 실행 환경/정책 identity와 유효한 현재 전체 verify receipt를 모두 확인한 경우에만 추가 모델 호출 없이 최종 승인한다. identity 부재·변경·중단·원격/rebase 경쟁·증거 불충분은 기존 최종 Reviewer 또는 안전한 전체 경로로 처리한다. 게시 직전 최신 ref·lease·ownership·dependency·사용자 결정 gate를 유지한다.
-- R-082 문서 변경 선행 Review의 PASS/VERIFY_REQUIRED는 이 일반 선행 증거와 구분하며 최종 승인 근거로 재사용하지 않는다. G-183의 마지막 최종 승인 재사용과 G-241의 전체 verify 생략은 별도 작업이다. 일반 선행 Review는 전체 verify를 생략하지 않는다.
-- 실제 실행 기록에서 부분/전체 시간·선택 규모·부분 PASS 이후 전체 FAIL·Review FAIL로 미실행한 전체 검증·Reviewer 호출/토큰·Worker 교정/총시간·fallback 사유를 비교한다. 미측정 시간 절감·토큰 절감을 합성하지 않고 동일 환경/범위를 확인한다.
+- 첫 지원 범위는 Loop Manager 자체 저장소의 자동 작업과 Python unittest 어댑터다. `[loop] verify_partial`은 생략 시에도 true이며 false로 끌 수 있다. Worker의 R-003 targeted test 제한을 유지한다.
+- Worker 완료 뒤 기존 커밋·최신 기준 브랜치 조정으로 준비한 후보와 기준 커밋의 전체 변경을 사용한다. 변경 전후 전체 Python AST의 직접·역방향 간접 참조와 실제 수집 명세로 테스트 모듈을 선정한다. 삭제·이름 변경·이동 전의 소비자도 고려하며 파일명 유사도·AI 선정은 사용하지 않는다.
+- 변경된 테스트 모듈을 필수 대상으로 포함한다. 관련 테스트는 직접 참조·가까운 간접 참조 순으로 예산 내에서 선택하며 공통 회귀 검사를 보완한다. 관련 대상을 찾지 못한 일반 코드·문서 작업도 공통 회귀 검사를 사용할 수 있다. 실행 단위는 테스트 모듈이며 선택 모듈의 필수 결과를 일부만 실행하지 않는다.
+- 문서 병행 수정, 동적 참조·미해결 의존성·분석 불확실성, 공개 API·공통 지원 코드·패키지 초기화·루트 진입점·Git·SQLite·상태·권한·복구 코드 변경만으로 전체 경로로 전환하지 않는다. 확인한 관계는 선정에 반영하고 나머지는 검사 범위의 한계로 남긴다. 비Python 입력의 소비 관계를 확인하지 못해도 비영향이라고 주장하지 않는다. 문서 내용·전체 변경은 Review와 최종 승인 입력에 보존한다.
+- 부분 검증 자체의 수집·실행·차단·종료·예약 계약이나 검증 선언·진입점이 변경된 경우, 수집 명세·후보·설정 식별 정보 또는 실제 Reviewer 실행 증거가 불충분한 경우에는 기존 전체 verify → Reviewer 경로를 사용한다. 실행 가능한 대상이 없거나 필수 대상이 전체 수집 명세를 차지하는 경우에도 전환한다. 50% 비율을 안전 조건으로 사용하지 않으며 부분 모드에서 전체 테스트를 실행한 뒤 다시 전체 verify를 반복하지 않는다.
+- 부분 verify는 Agent 밖에서 기존 프로젝트 인터프리터·실행 차단·프로세스 종료 확인·직렬/독립 실행·자원 예약 정책을 사용한다. 전체 discovery와 fixture·skip 의미를 유지한다. 선택 결과 누락·중복·식별 오류는 성공이 아니며 미선택 모듈은 NOT_SELECTED다. 시간 초과·취소·종료 불명은 기존 안전 정책을 따른다.
+- 부분 결과에는 후보·기준 커밋, 수집 명세·선택 모듈/테스트 ID, 선정·전환 이유, 전체 대비 규모, 관련 후보 중 미선택 대상·남은 불확실성, 알고리즘·설정 식별 정보, 시간·실패 진단을 남긴다. PASS는 선택 모듈의 성공만 뜻하며 영향 범위 전체의 성공이 아니다. Reviewer에게 이 한계를 전달한다. 부분 성공은 전체 verify token·receipt 또는 verified_head를 만들지 않는다.
+- 부분 FAIL은 기존 verify 교정·반복 차단으로, 선행 Review FAIL은 기존 ISSUE_ID·실패 감사·Worker 수준 교정으로 연결한다. 선행 FAIL이면 전체 verify를 호출하지 않는다. 부분 PASS와 선행 PASS 뒤에는 실제 전체 verify를 반드시 수행하며 전체 FAIL은 기존 교정 정책을 따른다.
+- 일반 선행 PASS는 독립된 후보 증거다. 같은 작업 주기·HEAD·기준 커밋·전체 변경·검토 문서·사용자 결정·실제 Reviewer 지침·제공자·모델·추론 수준·실행 환경·정책과 해당 승인 이후 실제 전체 verify의 유효한 성공 기록을 모두 확인한 경우에만 추가 모델 호출 없이 최종 승인한다. 증거 부재·변경·중단·원격 변경/기준 브랜치 조정 중 경쟁에서는 기존 최종 Reviewer 또는 안전한 전체 경로를 사용한다. 게시 직전 최신 원격 상태·lease·작업물 소유권·선행 작업·사용자 결정 조건을 확인한다.
+- 수동 제출·waiver·문서 draft·R-082 별도 문서 변경 선행 Review는 기존 경로를 유지한다. R-082의 PASS/VERIFY_REQUIRED를 최종 승인 근거로 재사용하지 않는다. G-183의 최종 승인 재사용과 G-241의 전체 verify 생략은 별도 작업이다.
+- 실제 기록으로 부분/전체 시간·선택 규모·부분 PASS 이후 전체 FAIL·Review FAIL로 생략한 전체 검증·Reviewer 호출/토큰·Worker 교정/총시간·전환 사유를 비교한다. 측정하지 않은 절감률을 만들지 않는다.
 
 ## Acceptance Criteria
 
-- 직접·간접 참조, 변경 테스트, 삭제/rename/이동의 기존 소비자 선정과 후보 변경 거부를 검증한다. 불확실성·fixture·고위험/설정·대상 없음·넓은 선택은 실행 없는 fallback이다.
-- 실제 manifest identity와 선택 모듈의 필수 결과·fixture skip/실패·timeout/취소/종료 불명·자원 정책을 검증하며 부분 성공과 전체 receipt가 분리된다.
-- 부분 FAIL/선행 FAIL은 Worker로 돌아가고 선행 FAIL 이후 전체 verify 호출 수는 0이다. 선행 PASS 후 실제 전체 성공과 동일 입력에서는 Reviewer 호출 1회로 게시 승인에 도달한다.
-- HEAD/base/diff/명세/지침/profile/정책 변경·identity 부재·재시작/원격/rebase 경쟁에서 오래된 승인으로 게시하지 않는다. 전체 FAIL 뒤 교정, 문서 선행 Review·수동 제출/waiver·사용자 결정·게시 경계의 회귀를 확인한다.
+- 직접·간접 참조, 변경 테스트, 삭제·이름 변경·이동 전 소비자, 공개 API·지원 코드·공통 진입점의 관계를 확인한다. 넓은 관계는 예산 내 우선순위로 선택하며 변경 테스트는 예산 때문에 제외하지 않는다.
+- 코드와 문서 병행 수정, 문서만 수정, 전역 동적 참조·미해결 내부 참조, 고위험 공통 코드, 대상 없음에서 부분 검사가 가능하고 불확실성·공통 검사·미선택 범위를 진단에서 확인한다. 50% 이상이라는 이유만으로 전환하지 않는다.
+- 검증 엔진·설정 변경, 수집 명세 불일치, 후보 변경, 검사 대상 부재·전체 필수 대상에서는 안전한 전체 경로를 사용한다. 선정 규칙 변경 후 과거 선택·승인을 거부한다.
+- 선택 모듈의 모든 필수 결과·fixture·skip·실패·시간 초과·취소·종료 불명과 기존 자원 정책을 확인한다. 부분 성공과 전체 receipt는 분리한다.
+- 부분 FAIL/선행 FAIL은 Worker로 돌아가고 선행 FAIL 이후 전체 verify 호출 수는 0이다. 선행 PASS 뒤 실제 전체 성공과 동일 입력에서는 Reviewer 호출 1회로 게시 승인에 도달한다.
+- 후보·기준 커밋·전체 변경·명세·지침·실행 조건 변경, 증거 부재·재시작·원격 변경·rebase 이후 오래된 승인으로 게시하지 않는다. 전체 FAIL 뒤 교정과 문서 선행 Review·수동 제출/waiver·사용자 결정·게시 경계의 회귀를 확인한다.
+- 실제 실행 자료와 미측정 운영 효과를 구분해 보고한다.
 
 ## Product Impact
 
-Manager의 부분 검증은 Review 전 회귀 검사이며 최종 보장은 별도 전체 verify와 유효한 Review 승인 및 게시 gate가 제공한다.
+일반 작업의 Review 전 검사를 부분 verify로 수행하며 전체 verify와 최종 게시 조건은 유지한다.
 
 ## Non-Goals
 
-- Coverage·AI/이력 추천·함수/라인 선택·다른 언어/프레임워크, Worker 테스트 제한 완화·중복 제거, 전체 verify 생략, Review/verify 병렬 실행, G-250 병렬 최적화 중복 구현.
+- 커버리지·AI·실행 이력을 통한 테스트 추천, 함수·라인별 선택과 다른 언어·프레임워크 지원.
+- Worker 테스트 제한 완화·중복 제거, 전체 verify 생략, Review/verify 병렬 실행과 G-250 병렬 최적화 중복 구현.
 
 ## Open Questions
 

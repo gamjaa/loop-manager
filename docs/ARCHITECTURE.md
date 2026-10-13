@@ -613,7 +613,11 @@ Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내�
 
 ## 일반 선행 Review와 부분 검증 증거
 
-`verification/impact.py`는 Git base/HEAD의 전체 tracked Python AST를 `maintenance/code_index.py`로 분석하며 두 그래프의 역방향 closure를 실제 manifest 모듈로 정규화한다. 동적/미해결 참조를 제외할 수 없는 경우 전역 불확실성을 fallback으로 유지한다. 구체적인 지원·선정 규칙과 진단은 [VERIFY.md](VERIFY.md#영향-기반-부분-실행)를 따른다.
+`verification/impact.py`는 Git 기준/후보 커밋의 전체 추적 Python AST를 `maintenance/code_index.py`로 분석하며 양쪽 역방향 의존성을 실제 수집 명세로 정규화한다. `impact_analysis.py`는 원본 불확실성을 보존하고 고정된 동적 참조·정적 재노출·패키지 초기화 관계를 추가한다. 초기화 부작용 때문에 넓은 관계를 유지해야 해도 실제 API 사용 관계를 우선순위 힌트로 추가할 수 있다. 이 힌트는 완전성의 증거가 아니다.
+
+변경 테스트는 필수로 포함하며 직접 참조와 가까운 간접 참조를 우선해 기본 24개 모듈 예산으로 선정한다. 변경 테스트는 예산을 초과해도 유지한다. 불확실성·공통 경계·문서 소비 범위 불명·관련 대상 부재에서는 수집 명세에 존재하는 공통 회귀 검사를 보완한다. 전역 불확실성·문서 병행 수정·50% 규모만으로 전체 경로로 전환하지 않는다. 문서 내용/모드와 소비 근거·남은 불확실성·미선택 관련 대상은 `selection.analysis`에 보존하고 전체 변경과 승인 입력에서도 유지한다. PASS는 선택 모듈에만 적용된다. 구체적인 선정·전환 규칙은 [VERIFY.md](VERIFY.md#영향-기반-부분-실행)를 따른다.
+
+알고리즘 버전·후보·기준 커밋·설정·수집 명세 식별 정보를 검증하며 과거 알고리즘의 결과를 실행하지 않는다. Manager 실행 코드 변경도 기존 선행 승인 입력 비교에 반영된다. 부분 실행의 검증 계약 변경·후보/수집 명세 불일치·실행 대상 부재/전체 필수 대상에서는 전체 경로를 사용하며 부분 모드에서 전체 수집 명세를 중복 실행하지 않는다.
 
 `runner.py`의 부분 모드는 전체 discovery를 유지한 뒤 선택 모듈만 기존 unittest adapter/core에 전달한다. 미선택 결과는 NOT_SELECTED이고 후속 command는 전체 실행에서만 수행한다. manifest identity·후보 안정성·fixture 소유자·필수 결과를 검사하며 interpreter·guard·예약·timeout/자식 종료 경계는 기존 Manager adapter를 사용한다.
 

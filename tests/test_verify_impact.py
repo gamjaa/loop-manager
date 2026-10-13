@@ -24,8 +24,8 @@ class ImpactTests(unittest.TestCase):
                              for module in self.modules if 'other' in module.name})
 
     def graph(self, sources):
-        return code_index.resolve({path: code_index.parse_source(path, content)
-                                   for path, content in sources.items()}, sources)
+        return impact.resolve_records({path: impact.source_facts(path, content)
+                                       for path, content in sources.items()})
 
     def choose(self, changes=None, before=None, after=None, modules=None):
         return impact.select_records(self.graph(before or self.sources), self.graph(after or self.sources),
@@ -56,12 +56,13 @@ class ImpactTests(unittest.TestCase):
         self.assertEqual(result.modules, ('test_other0',))
         self.assertFalse(result.fallback)
 
-    def test_deleted_module_retains_old_consumers_and_unresolved_import_falls_back(self):
+    def test_deleted_module_retains_old_consumers_and_records_unresolved_import(self):
         after = dict(self.sources)
         del after['pkg/value.py']
         result = self.choose([('D', 'pkg/value.py', None)], after=after)
         self.assertEqual(result.modules, ('test_direct', 'test_indirect'))
-        self.assertTrue(any('unresolved_internal_import' in reason for reason in result.fallback))
+        self.assertFalse(result.fallback)
+        self.assertTrue(any('unresolved_internal_import' in reason for reasons in result.analysis['remaining_uncertainties'].values() for reason in reasons))
 
     def test_rename_package_move_merges_consumers_from_both_trees(self):
         after = dict(self.sources)
@@ -73,11 +74,12 @@ class ImpactTests(unittest.TestCase):
         self.assertFalse(result.fallback)
         self.assertEqual(len(result.reasons['test_direct']), 2)
 
-    def test_uncertain_unselected_consumer_cannot_hide_dynamic_relationship(self):
+    def test_global_uncertainty_is_recorded_without_blocking_precheck(self):
         for source in (b'__import__(name)\n', b'from pkg import missing\n', b'def broken(\n'):
             with self.subTest(source=source):
                 self.sources['pkg/opaque.py'] = source
-                self.assertTrue(any('uncertain_' in reason for reason in self.choose().fallback))
+                self.assertFalse(self.choose().fallback)
+                self.assertTrue(self.choose().analysis['remaining_uncertainties'])
 
     def test_aliased_dynamic_import_reflection_and_runtime_module_selection(self):
         for source in (b'from importlib import import_module as load\nload(name)\n',
@@ -87,23 +89,346 @@ class ImpactTests(unittest.TestCase):
                        b'import runpy\nrunpy.run_module(name)\n'):
             with self.subTest(source=source):
                 facts = impact.source_facts('pkg/opaque.py', source)
-                self.assertIn('dynamic_import_or_reflection', facts['uncertainties'])
+                self.assertTrue(facts['impact']['uncertainties'])
 
     def test_shared_support_risky_code_settings_entrypoint_and_initialization(self):
-        for path in ('tests/support/fixture.py', 'pkg/git.py', 'pkg/state.py',
-                     'pkg/recovery.py', 'pkg/permission.py', 'scripts/verify.json',
+        for path in ('loop_manager_internal/storage/schema.py',
+                     'loop_manager_internal/git/workspace.py', 'scripts/verify.json',
                      'pkg/__init__.py', 'loop_manager.py'):
             with self.subTest(path=path):
                 self.assertTrue(self.choose([('M', path, path)]).fallback)
 
-    def test_public_contract_change_is_conservative(self):
+    def test_public_contract_change_expands_known_consumers(self):
         after = dict(self.sources, **{'pkg/value.py': b'def public(value):\n    return value\n'})
-        self.assertIn('public_api_changed:pkg/value.py', self.choose(after=after).fallback)
+        result = self.choose(after=after)
+        self.assertFalse(result.fallback)
+        self.assertEqual(result.modules, ('test_direct', 'test_indirect'))
+        self.assertIn('public_api_changed:pkg/value.py', result.analysis['expansions'])
 
-    def test_too_broad_counts_modules_and_tests(self):
-        self.assertIn('selection_too_broad', self.choose(modules=self.modules[:4]).fallback)
+    def scoped(self, *, before=None, after=None, changed=None, documents=None, configuration=None, files=None):
+        return impact.select_records(self.graph(before or self.sources), self.graph(after or self.sources),
+            changed or [('M', 'pkg/value.py', 'pkg/value.py')], self.modules,
+            head='head', base='base', configuration=configuration or {'stages': [{'kind': 'tests'}]},
+            documents=documents, files=files)
+
+    def test_code_and_review_document_keep_all_document_evidence(self):
+        path = 'docs/requirements/[R-086] Impact.md'
+        versions = {'base': ('100644', b'# old'), 'head': ('100644', b'# new')}
+        selected = self.scoped(changed=[('M', 'pkg/value.py', 'pkg/value.py'), ('M', path, path)],
+                               documents={path: versions})
+        self.assertFalse(selected.fallback)
+        self.assertEqual(selected.modules, ('test_direct', 'test_indirect'))
+        proof = selected.analysis['documents'][0]
+        self.assertEqual(proof['path'], path)
+        self.assertNotEqual(proof['source_identity']['base'], proof['source_identity']['head'])
+        only_document = self.scoped(changed=[('M', path, path)], documents={path: versions})
+        self.assertIn('no_tests_selected', only_document.fallback)
+
+    def test_document_roles_require_actual_sources_and_bounded_consumption(self):
+        path = 'docs/plans/[G-086] Plan.md'
+        document = {path: {'head': ('100644', b'# plan')}}
+        for consumer in (b'from pathlib import Path\nPath("docs/plans/[G-086] Plan.md").read_text()\n',
+                         b'from pathlib import Path\nPath(location).read_text()\n',
+                         b'from pathlib import Path\nPath(location).open("r")\n',
+                         b'from pathlib import Path\n(Path("") / location).read_text()\n'):
+            with self.subTest(consumer=consumer):
+                sources = dict(self.sources, **{'pkg/reader.py': consumer})
+                sources['tests/test_other0.py'] = b'from pkg import reader\n'
+                result = self.scoped(before=sources, after=sources,
+                    changed=[('M', 'pkg/value.py', 'pkg/value.py'), ('A', None, path)], documents=document)
+                self.assertFalse(result.fallback)
+                self.assertTrue(any(reason.startswith('document_') for reason in result.analysis['scope_limits']))
+        for versions in (None, {path: {'head': ('120000', b'../code.py')}},
+                         {path: {'head': ('100644', b'\xff')}}, {path: {'head': ('100644', b'\0')}}):
+            with self.subTest(versions=versions):
+                self.assertTrue(self.scoped(changed=[('A', None, path)], documents=versions).fallback)
+        for other in ('README.md', 'docs/AGENTS.reviewer.md', 'tests/fixtures/input.md', 'config/config.ini'):
+            with self.subTest(other=other):
+                self.assertIn('non_python_input:' + other, self.scoped(changed=[('A', None, other)]).analysis['scope_limits'])
+
+    def test_document_command_input_and_unknown_configuration_are_not_excluded(self):
+        path = 'docs/PRODUCT.md'
+        for configuration in ({'version': 1}, {'stages': [{'kind': 'command', 'argv': ['validate', 'docs']}]},
+                              {'stages': [{'kind': 'command', 'argv': ['{python}', 'check.py', '--compile', 'pkg']}]},
+                              {'stages': [{'kind': 'command', 'argv': ['{python}', 'check.py']}]}):
+            with self.subTest(configuration=configuration):
+                result = self.scoped(changed=[('A', None, path)], configuration=configuration,
+                    documents={path: {'head': ('100644', b'# Product')}})
+                self.assertTrue(any('document_command_consumption_unproven' in reason for reason in result.analysis['scope_limits']))
+        context = self.scoped(changed=[('A', None, path)],
+            configuration={'stages': [{'kind': 'tests', 'cwd': 'elsewhere'}]},
+            documents={path: {'head': ('100644', b'# Product')}})
+        self.assertIn('document_execution_context_unproven:' + path, context.analysis['scope_limits'])
+
+    def test_document_reads_include_aliases_enumeration_metadata_and_copy(self):
+        path = 'docs/PRODUCT.md'
+        for consumer in (b'from builtins import open as read\nread("docs/PRODUCT.md")\n',
+                         b'from pathlib import Path\nread = Path("docs/PRODUCT.md").read_text\nread()\n',
+                         b'from pathlib import Path\nPath("docs").glob("*.md")\n',
+                         b'from pathlib import Path\nPath("docs/PRODUCT.md").stat()\n',
+                         b'import shutil\nshutil.copyfile("docs/PRODUCT.md", "out")\n'):
+            with self.subTest(consumer=consumer):
+                sources = dict(self.sources, **{'pkg/reader.py': consumer,
+                    'tests/test_other0.py': b'from pkg import reader\n'})
+                result = self.scoped(before=sources, after=sources,
+                    changed=[('M', 'pkg/value.py', 'pkg/value.py'), ('A', None, path)],
+                    documents={path: {'head': ('100644', b'# Product')}})
+                self.assertFalse(result.fallback)
+                self.assertTrue(any(reason.startswith('document_') for reason in result.analysis['scope_limits']))
+
+    def test_document_exclusion_requires_other_read_sources_to_be_regular(self):
+        path = 'docs/PRODUCT.md'
+        sources = dict(self.sources, **{'pkg/reader.py': b'from pathlib import Path\nPath("data.json").read_text()\n',
+            'tests/test_other0.py': b'from pkg import reader\n'})
+        for mode in ('100644', '120000', None):
+            with self.subTest(mode=mode):
+                result = self.scoped(before=sources, after=sources,
+                    changed=[('M', 'pkg/value.py', 'pkg/value.py'), ('A', None, path)],
+                    documents={path: {'head': ('100644', b'# Product')}},
+                    files={'data.json': {'base': mode, 'head': mode}})
+                if mode == '100644':
+                    self.assertFalse(result.fallback)
+                else:
+                    self.assertFalse(result.fallback)
+                    self.assertTrue(any('document_read_source_unproven' in reason for reason in result.analysis['scope_limits']))
+        alias = dict(sources)
+        alias['pkg/reader.py'] = b'from pathlib import Path\nPath("data.json").symlink_to("docs/PRODUCT.md")\nPath("data.json").read_text()\n'
+        result = self.scoped(before=alias, after=alias, changed=[('A', None, path)],
+            documents={path: {'head': ('100644', b'# Product')}},
+            files={'data.json': {'base': '100644', 'head': '100644'}})
+        self.assertTrue(any('document_consumption_unproven' in reason for reason in result.analysis['scope_limits']))
+
+    def test_repeated_resolution_preserves_source_facts_and_same_selection(self):
+        facts = {path: impact.source_facts(path, content) for path, content in self.sources.items()}
+        original = code_index.encode(facts)
+        first = impact.resolve_records(facts)
+        second = impact.resolve_records(facts)
+        self.assertEqual(code_index.encode(first), code_index.encode(second))
+        self.assertEqual(code_index.encode(facts), original)
+
+    def test_literal_and_finite_dynamic_imports_add_their_hidden_consumers(self):
+        for loader in (b'import importlib as loader\nloader.import_module("pkg.value")\n',
+                       b'from importlib import import_module as load\nload("pkg." + "value")\n',
+                       b'for target in ("pkg.value", "unittest"):\n    __import__(target)\n'):
+            with self.subTest(loader=loader):
+                sources = dict(self.sources, **{'pkg/opaque.py': loader,
+                    'tests/test_other0.py': b'from pkg import opaque\n'})
+                result = self.scoped(before=sources, after=sources)
+                self.assertFalse(result.fallback)
+                self.assertEqual(result.modules, ('test_direct', 'test_indirect', 'test_other0'))
+                self.assertTrue(result.analysis['resolved']['head:pkg/opaque.py'])
+
+    def test_original_index_uncertainty_is_preserved_and_unresolved_target_rejected(self):
+        sources = dict(self.sources, **{'pkg/opaque.py': b'__import__("pkg.value")\n'})
+        facts = self.graph(sources)['pkg/opaque.py']
+        self.assertIn('dynamic_reference', facts['raw_uncertainties'])
+        self.assertIn('dynamic_reference', facts['uncertainties'])
+        self.assertFalse(facts['selection_uncertainties'])
+        sources['pkg/opaque.py'] = b'__import__("pkg.missing")\n'
+        result = self.scoped(before=sources, after=sources)
+        self.assertFalse(result.fallback)
+        self.assertTrue(any('unresolved_bounded_import' in reason for reasons in result.analysis['remaining_uncertainties'].values() for reason in reasons))
+
+    def test_escaped_shadowed_and_unbounded_loaders_record_scope_limits(self):
+        for loader in (b'from importlib import import_module as load\nother = load\nother(name)\n',
+                       b'from importlib import import_module as load\ndef f(load):\n    load(name)\n',
+                       b'from importlib import import_module as load\nfrom other import fn as load\nload(name)\n',
+                       b'from importlib import import_module as load\nload(target)\n',
+                       b'def local():\n    target = "unittest"\ndef other():\n    __import__(target)\n',
+                       b'for target in ("unittest",):\n    pass\n__import__(target)\n',
+                       b'__import__("value", {"__package__": "pkg"}, {}, [], 1)\n',
+                       b'import builtins\ngetattr(builtins, name)(target)\n',
+                       b'code = "import pkg.value"\nexec(code)\n'):
+            with self.subTest(loader=loader):
+                sources = dict(self.sources, **{'pkg/unselected.py': loader})
+                result = self.scoped(before=sources, after=sources)
+                self.assertFalse(result.fallback)
+                self.assertTrue(result.analysis['remaining_uncertainties'])
+
+    def test_known_module_reflection_registry_and_external_version_have_proofs(self):
+        for source in (b'from pkg import value\ngetattr(value, "_value")\n',
+                       b'import pkg.value\nhasattr(pkg.value, "_value")\n',
+                       b'import sys as runtime\nruntime.modules["pkg.value"]\n',
+                       b'import sys as runtime\nruntime.modules.get("pkg.value")\n',
+                       b'import subprocess as process\nprocess.run(["git", "--version"])\n',
+                       b'import sys, subprocess\nsubprocess.run([sys.executable, "-m", "pkg.value"])\n'):
+            with self.subTest(source=source):
+                facts = impact.source_facts('pkg/known.py', source)
+                self.assertFalse(facts['impact']['uncertainties'])
+                self.assertTrue(facts['impact']['resolved'])
+        for source in (b'import sys\nsys.modules[key]\n',
+                       b'import sys\nsys.modules.get(key)\n',
+                       b'import sys\nlookup = sys.modules.get\nlookup(key)\n',
+                       b'import sys\nsys.modules.values()\n',
+                       b'import sys\nsys.modules["pkg.value"] = fake\n',
+                       b'import subprocess\nsubprocess.run(["git", "--version"], **options)\n',
+                       b'import subprocess\nsubprocess.run(["git", "--version"], shell=True)\n',
+                       b'import subprocess\nsubprocess.run(["git", "commit"])\n'):
+            with self.subTest(source=source):
+                self.assertTrue(impact.source_facts('pkg/unknown.py', source)['impact']['uncertainties'])
+
+    def test_support_changes_expand_consumers_without_path_word_rejection(self):
+        sources = dict(self.sources)
+        sources['tests/support/state.py'] = b'def value():\n    return 1\n'
+        sources['tests/test_other0.py'] = b'from support.state import value\n'
+        result = self.scoped(before=sources, after=sources,
+            changed=[('M', 'tests/support/state.py', 'tests/support/state.py')])
+        self.assertFalse(result.fallback)
+        self.assertEqual(result.modules, ('test_other0',))
+        self.assertIn('test_support_consumers:tests/support/state.py', result.analysis['expansions'])
+        sources['pkg/state.py'] = b'def value():\n    return 1\n'
+        sources['tests/test_other0.py'] = b'from pkg.state import value\n'
+        self.assertFalse(self.scoped(before=sources, after=sources,
+            changed=[('M', 'pkg/state.py', 'pkg/state.py')]).fallback)
+
+    def test_common_risk_paths_and_effects_expand_instead_of_falling_back(self):
+        for path, body in (('loop_manager_internal/storage/value.py', b'def value():\n    return 1\n'),
+                           ('pkg/value.py', b'def value(db):\n    db.commit()\n'),
+                           ('pkg/value.py', b'import sqlite3\ndef value():\n    return 1\n')):
+            with self.subTest(path=path):
+                sources = dict(self.sources, **{path: body})
+                sources['tests/test_direct.py'] = ('import ' + code_index.module_name(path) + '\n').encode()
+                result = self.scoped(before=sources, after=sources, changed=[('M', path, path)])
+                self.assertFalse(result.fallback)
+                self.assertTrue(any(reason.startswith(('shared_high_risk_code:', 'boundary_code:', 'database_code:')) for reason in result.analysis['expansions']))
+
+    def test_passive_facade_uses_the_reexport_owner_and_preserves_initialization(self):
+        sources = dict(self.sources)
+        sources['pkg/other.py'] = b'def other():\n    return 1\n'
+        sources['pkg/api.py'] = b'from pkg.value import _value as value\nfrom pkg.other import other\n'
+        sources['tests/test_direct.py'] = b'import pkg.api as api\napi.value()\n'
+        sources['tests/test_indirect.py'] = b'from pkg.api import other\nother()\n'
+        result = self.scoped(before=sources, after=sources)
+        self.assertEqual(result.modules, ('test_direct',))
+        self.assertFalse(result.fallback)
+        self.assertTrue(any(proof['kind'] == 'passive_reexport' for proof in result.analysis['resolved']['head:tests/test_direct.py']))
+        for effect in (b'initialize()\n', b'tokens = [initialize()]\n',
+                       b'def _value(arg=initialize()):\n    return arg\n'):
+            with self.subTest(effect=effect):
+                changed = dict(sources)
+                changed['pkg/value.py'] = effect
+                preserved = self.scoped(before=changed, after=changed)
+                self.assertIn('test_indirect', preserved.modules)
+
+    def test_facade_escape_and_dynamic_attribute_keep_the_broad_relation(self):
+        sources = dict(self.sources, **{'pkg/other.py': b'def other():\n    return 1\n',
+            'pkg/api.py': b'from pkg.value import _value as value\nfrom pkg.other import other\n'})
+        for consumer in (b'import pkg.api as api\nconsume(api)\n',
+                         b'import pkg.api as api\ngetattr(api, name)\n'):
+            with self.subTest(consumer=consumer):
+                sources['tests/test_other0.py'] = consumer
+                result = self.scoped(before=sources, after=sources)
+                self.assertIn('test_other0', result.modules)
+                if b'getattr' in consumer:
+                    self.assertFalse(result.fallback)
+                    self.assertTrue(result.analysis['remaining_uncertainties'])
+
+    def test_all_facade_aliases_and_facade_itself_retain_their_consumers(self):
+        sources = dict(self.sources, **{'pkg/other.py': b'def other():\n    return 1\n',
+            'pkg/api.py': b'from pkg.value import _value as value\nfrom pkg.other import other\n'})
+        sources['tests/test_other0.py'] = b'import pkg.api as first\nimport pkg.api as second\nfirst.value()\nsecond.other()\n'
+        result = self.scoped(before=sources, after=sources, changed=[('M', 'pkg/other.py', 'pkg/other.py')])
+        self.assertIn('test_other0', result.modules)
+        facade = self.scoped(before=sources, after=sources, changed=[('M', 'pkg/api.py', 'pkg/api.py')])
+        self.assertIn('test_other0', facade.modules)
+        self.assertFalse(facade.fallback)
+
+    def test_facade_refinement_keeps_implicit_package_initialization(self):
+        sources = dict(self.sources, **{'pkg/other.py': b'def other():\n    return 1\n',
+            'pkg/__init__.py': b'from pkg.value import _value\ncache = _value()\n',
+            'pkg/api.py': b'from pkg.value import _value as value\nfrom pkg.other import other\n',
+            'tests/test_direct.py': b'from pkg.api import value\nvalue()\n',
+            'tests/test_indirect.py': b'from pkg.api import other\nother()\n'})
+        result = self.scoped(before=sources, after=sources)
+        self.assertEqual(result.modules, ('test_direct', 'test_indirect'))
+        self.assertFalse(result.fallback)
+
+    def test_algorithm_identity_change_rejects_old_selection(self):
+        selected = self.choose()
+        with self.assertRaisesRegex(ValueError, 'algorithm'):
+            impact.selected_modules(replace(selected, algorithm='python-ast-impact-v1/index-v2'), self.modules)
+
+    def test_builtin_namespaces_and_reexported_loader_aliases_remain_uncertain(self):
+        for consumer in (b'__builtins__["__import__"](name)\n',
+                         b'import builtins\nbuiltins.__dict__["__import__"](name)\n',
+                         b'from pkg import value\ngetattr(value, "__dict__")[key](name)\n'):
+            with self.subTest(consumer=consumer):
+                self.assertTrue(impact.source_facts('pkg/hidden.py', consumer)['impact']['uncertainties'])
+        for consumer in (b'from pkg.loader import load as invoke\ninvoke(name)\n',
+                         b'from pkg import loader\nloader.load(name)\n',
+                         b'from pkg import loader\ngetattr(loader, "load")(name)\n'):
+            with self.subTest(consumer=consumer):
+                sources = dict(self.sources, **{'pkg/loader.py': b'from importlib import import_module as load\n',
+                    'tests/test_other0.py': consumer})
+                selected = self.scoped(before=sources, after=sources)
+                self.assertFalse(selected.fallback)
+                self.assertTrue(any('escaped_project_dynamic_binding' in reason for reasons in selected.analysis['remaining_uncertainties'].values() for reason in reasons))
+
+    def test_half_manifest_and_large_module_do_not_force_fallback(self):
+        self.assertFalse(self.choose(modules=self.modules[:4]).fallback)
         big = [replace(self.modules[0], ids=tuple(str(i) for i in range(100))), *self.modules[1:]]
-        self.assertIn('selection_too_broad', self.choose(modules=big).fallback)
+        self.assertFalse(self.choose(modules=big).fallback)
+        self.assertEqual(len(self.choose(modules=big).ids), 101)
+
+    def test_broad_selection_is_bounded_and_changed_tests_remain_required(self):
+        sources = dict(self.sources)
+        modules = [Module(f'test_wide{i:02}', (f'test_wide{i:02}.Case.test_value',)) for i in range(50)]
+        sources.update({'tests/' + module.name + '.py': b'from pkg import value\n' for module in modules})
+        selected = self.choose(before=sources, after=sources, modules=modules)
+        self.assertFalse(selected.fallback)
+        self.assertEqual(len(selected.modules), impact.MAX_MODULES)
+        self.assertEqual(len(selected.analysis['not_selected_related_modules']), 26)
+        self.assertEqual(selected.analysis['coverage'], 'selected_modules_only')
+        changed = [('M', 'pkg/value.py', 'pkg/value.py')]
+        changed.extend(('M', 'tests/' + m.name + '.py', 'tests/' + m.name + '.py') for m in modules[-25:])
+        mandatory = self.choose(changed, before=sources, after=sources, modules=modules)
+        self.assertEqual(mandatory.modules, tuple(m.name for m in modules[-25:]))
+        self.assertFalse(mandatory.fallback)
+        changed.extend(('M', 'tests/' + m.name + '.py', 'tests/' + m.name + '.py') for m in modules[:25])
+        self.assertIn('entire_manifest_required', self.choose(changed,
+            before=sources, after=sources, modules=modules).fallback)
+
+    def test_direct_and_actual_facade_users_precede_broad_indirect_consumers(self):
+        sources = dict(self.sources, **{'pkg/entry.py': b'from pkg.value import _value as value\ninitialize()\n'})
+        modules = [Module(f'test_broad{i:02}', (f'test_broad{i:02}.Case.test_value',)) for i in range(30)]
+        sources.update({'tests/' + module.name + '.py': b'import pkg.entry\n' for module in modules})
+        modules += [Module('test_z_actual', ('test_z_actual.Case.test_value',))]
+        sources['tests/test_z_actual.py'] = b'import pkg.entry as entry\nentry.value()\n'
+        result = self.choose(before=sources, after=sources, modules=modules)
+        self.assertFalse(result.fallback)
+        self.assertIn('test_z_actual', result.modules)
+        self.assertEqual(len(result.modules), impact.MAX_MODULES)
+        self.assertTrue(result.analysis['not_selected_related_modules'])
+
+    def test_common_checks_enable_documents_no_relationships_and_risky_entrypoints(self):
+        sources = dict(self.sources, **{'pkg/unrelated.py': b'__import__(name)\n',
+            'loop_manager.py': b'import sqlite3\n'})
+        modules = self.modules + [Module(name, (name + '.Case.test_value',)) for name in impact._SMOKE]
+        sources.update({'tests/' + m.name + '.py': b'import unittest\n' for m in modules[-3:]})
+        for path in ('docs/PRODUCT.md', 'README.md', 'tests/fixtures/data.json',
+                     'pkg/unrelated.py', 'loop_manager.py'):
+            with self.subTest(path=path):
+                result = self.choose([('M', path, path)], before=sources, after=sources, modules=modules)
+                self.assertFalse(result.fallback)
+                self.assertEqual(set(result.modules), set(impact._SMOKE))
+                self.assertTrue(result.analysis['remaining_uncertainties'])
+                self.assertTrue(all('common_regression_precheck' in result.reasons[name] for name in result.modules))
+
+    def test_document_consumers_are_selected_without_claiming_exclusion(self):
+        path = 'tests/fixtures/input.md'
+        sources = dict(self.sources, **{'pkg/reader.py': b'from pathlib import Path\nPath("tests/fixtures/input.md").read_text()\n',
+            'tests/test_other0.py': b'from pkg import reader\n'})
+        result = self.scoped(before=sources, after=sources, changed=[('M', path, path)])
+        self.assertFalse(result.fallback)
+        self.assertEqual(result.modules, ('test_other0',))
+        self.assertIn('non_python_input:' + path, result.analysis['scope_limits'])
+
+    def test_verification_contract_changes_fall_back_even_with_common_checks(self):
+        for path in ('scripts/verify.json', 'scripts/verify.sh',
+                     'loop_manager_internal/verification/runner.py', 'config/config.ini.example'):
+            with self.subTest(path=path):
+                result = self.choose([('M', 'pkg/value.py', 'pkg/value.py'), ('M', path, path)])
+                self.assertIn('verification_contract_changed:' + path, result.fallback)
 
     def test_manifest_identity_and_selection_are_exact(self):
         selection = self.choose()
