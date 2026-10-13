@@ -128,6 +128,8 @@ SQLite에는 등록 프로젝트, 기준 branch, 선택한 provider, 과거 등�
 
 최신으로 검증한 `origin/<base-branch>`의 active 및 archived ExecPlan 파일은 ID를 제외한 현재 계획 선언의 원본이다. SQLite는 최초 게시 path·hash·SHA를 불변 감사 정보로 보존하고 현재 path·title·sources·depends_on·complexity·risk·priority·hash·revision을 별도 cache로 동기화한다
 
+catalog 동기화는 로컬 작업 행이 없으면 같은 원격 snapshot의 활성·archive 선언으로 행을 복구한다. 활성 선언은 기본 READY 등록과 기존 실행 복구 규칙을 따르고, archive 선언은 별도 병합 조회나 과거 게시 본문 비교 없이 MERGED로 수락한다. `archive-document` 근거와 관측 revision·본문 hash를 기존 archive 감사에 기록하며, 이 근거를 실제 PR Merge 관측이나 유실된 최초 게시 증거로 해석하지 않는다. 기존 게시 감사가 있으면 보존하고, 문서 기반 완료 수락은 재시작에서 추가 Git/PR 검증 없이 재사용한다. 기존 작업 행에는 이 fallback을 적용하지 않으며 정상적인 archive identity 검증과 실행 이력 보존을 유지한다. 선언·source·dependency 검증, 취소·예약 충돌과 snapshot/CAS transaction 경계는 그대로 적용한다.
+
 유효한 ExecPlan 선언 변경은 계획 또는 프로젝트 차단 사유가 아니며, catalog 전체가 유효하고 원격 revision과 SQLite 상태·소유권 snapshot이 그대로일 때만 모든 현재 cache delta를 한 transaction으로 반영한다
 
 ExecPlan 번호는 연속일 필요가 없다. 번호 공백을 누락 계획으로 추정하거나 메우지 않으며 사용한 ID는 재사용하지 않는다. 현행 catalog 동기화는 SQLite 실행·취소 이력에 대응하는 원격 파일이 없거나 형식·source·ID·dependency graph가 유효하지 않으면, 다른 계획 상태를 바꾸지 않고 원인 파일을 포함한 프로젝트 범위 진단을 남긴다.

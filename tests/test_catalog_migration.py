@@ -274,19 +274,19 @@ class CatalogMigrationTest(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual(diagnostics, ())
         self.assertEqual(diagnostic_count, 0)
 
-    def test_legacy_migration_recovers_archived_identity_only_with_merge_proof(self):
+    def test_legacy_migration_recovers_archived_identity_without_merge_lookup(self):
         with tempfile.TemporaryDirectory() as directory:
             root = make_remote_repository(directory)
             (root / "docs/plans").mkdir()
             first = write_execplan(root, "G-001", "Confirmed")
             second = write_execplan(root, "G-002", "Unconfirmed")
             commit_and_push(root, "Add historical plans")
-            publication_sha = git_command(root, "rev-parse", "HEAD")
             archive = root / "docs/plans/archive"
             archive.mkdir()
             first.rename(archive / first.name)
             second.rename(archive / second.name)
             commit_and_push(root, "Archive historical plans")
+            archive_sha = git_command(root, "rev-parse", "HEAD")
 
             connection = sqlite3.connect(":memory:")
             connection.row_factory = sqlite3.Row
@@ -298,17 +298,7 @@ class CatalogMigrationTest(AutomationCatalogFixture, unittest.TestCase):
             )
             connection.commit()
 
-            def proof(_repo, branch, _url=None):
-                if branch == "loop-manager/G-001":
-                    return {
-                        "url": "https://pr/1",
-                        "state": "MERGED",
-                        "mergedAt": "2026-01-01T00:00:00Z",
-                        "mergeCommit": None,
-                    }
-                return None
-
-            with mock.patch("loop_manager.pr_for_branch", side_effect=proof):
+            with mock.patch("loop_manager.pr_for_branch", side_effect=AssertionError("unexpected PR lookup")) as lookup:
                 loop_manager.migrate_legacy_execplans(
                     connection,
                     reconcile_history=True,
@@ -333,26 +323,26 @@ class CatalogMigrationTest(AutomationCatalogFixture, unittest.TestCase):
             [
                 (
                     "G-001",
-                    "docs/plans/[G-001] Confirmed.md",
+                    "docs/plans/archive/[G-001] Confirmed.md",
                     "MERGED",
-                    publication_sha,
-                )
+                    archive_sha,
+                ),
+                ("G-002", "docs/plans/archive/[G-002] Unconfirmed.md", "MERGED", archive_sha),
             ],
         )
         self.assertEqual(history[0]["merge_confirmed"], 1)
         self.assertEqual(history[0]["observed_path"], "docs/plans/archive/[G-001] Confirmed.md")
-        self.assertEqual(history[1]["merge_confirmed"], 0)
-        self.assertEqual(history[1]["diagnostic_code"], "merge-proof-missing")
+        self.assertEqual(history[1]["merge_confirmed"], 1)
+        self.assertIsNone(history[1]["diagnostic_code"])
+        lookup.assert_not_called()
 
-    def test_fresh_recovery_rejects_archive_tampered_before_first_observation(self):
+    def test_fresh_fallback_accepts_archive_without_old_publication_check(self):
         with tempfile.TemporaryDirectory() as directory:
             root = make_remote_repository(directory)
             git_command(root, "config", "core.autocrlf", "false")
             (root / "docs/plans").mkdir()
             active = write_execplan(root, "G-001", "Tampered Archive")
-            original_hash = hashlib.sha256(active.read_bytes()).hexdigest()
             commit_and_push(root, "Publish plan")
-            publication_sha = git_command(root, "rev-parse", "HEAD")
             archive = root / "docs/plans/archive"
             archive.mkdir()
             archived = archive / active.name
@@ -364,6 +354,7 @@ class CatalogMigrationTest(AutomationCatalogFixture, unittest.TestCase):
             )
             tampered_hash = hashlib.sha256(archived.read_bytes()).hexdigest()
             commit_and_push(root, "Archive tampered plan")
+            archive_sha = git_command(root, "rev-parse", "HEAD")
 
             connection = sqlite3.connect(":memory:")
             connection.row_factory = sqlite3.Row
@@ -374,16 +365,9 @@ class CatalogMigrationTest(AutomationCatalogFixture, unittest.TestCase):
                 (str(root),),
             )
             connection.commit()
-            pull_request = {
-                "url": "https://pr/1",
-                "state": "MERGED",
-                "mergedAt": "2026-01-01T00:00:00Z",
-                "mergeCommit": None,
-            }
-
             with mock.patch(
-                "loop_manager.pr_for_branch", return_value=pull_request
-            ):
+                "loop_manager.pr_for_branch", side_effect=AssertionError("unexpected PR lookup")
+            ) as lookup:
                 loop_manager.migrate_legacy_execplans(
                     connection,
                     reconcile_history=True,
@@ -403,16 +387,14 @@ class CatalogMigrationTest(AutomationCatalogFixture, unittest.TestCase):
             ).fetchone()
             connection.close()
 
-        self.assertIsNone(runtime)
-        self.assertEqual(history["original_content_hash"], original_hash)
+        lookup.assert_not_called()
+        self.assertEqual(runtime["status"], "MERGED")
+        self.assertEqual(history["original_content_hash"], tampered_hash)
         self.assertEqual(history["final_content_hash"], tampered_hash)
-        self.assertEqual(history["plan_sha"], publication_sha)
+        self.assertEqual(history["plan_sha"], archive_sha)
         self.assertEqual(history["identity_verified"], 1)
-        self.assertEqual(history["merge_confirmed"], 0)
-        self.assertEqual(
-            history["diagnostic_code"],
-            "archived-content-hash-mismatch",
-        )
+        self.assertEqual(history["merge_confirmed"], 1)
+        self.assertIsNone(history["diagnostic_code"])
 
     def test_archived_merged_row_recovers_from_stored_state_and_git_ancestry(self):
         with tempfile.TemporaryDirectory() as directory:

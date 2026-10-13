@@ -48,7 +48,7 @@
 - Agent는 선택된 관리 worktree와 역할별 허용 범위에서만 작업한다. 불확실한 소유권이나 실제 범위 위반은 자동으로 허용하지 않는다.
 - 실패·중단·차단 시 작업물·session·진단을 보존한다. 원인과 안전 조건이 실제로 해소된 작업만 재개한다.
 - BLOCKED 해제는 이전 Agent writer 종료와 현재 repository·계획·worktree·branch 소유권을 확인한 뒤 현재 후보를 새 입력으로 재검증한다. 현재 파일·index·HEAD를 과거 snapshot으로 대체하지 않고, 중단된 진단 복구가 있으면 저장 journal부터 재개한다. index 보안 flag, 미완료 Git operation, branch/worktree identity 불일치는 계속 차단한다.
-- 최종 후보의 관련 테스트·전체 검증·독립 Review가 성공해야 PR을 생성한다. 연결 PR의 실제 Merge만 MERGED와 완료의 근거다.
+- 최종 후보의 관련 테스트·전체 검증·독립 Review가 성공해야 PR을 생성한다. 실행 중인 작업의 MERGED 전이는 연결 PR의 실제 Merge를 근거로 한다. 로컬 DB에 작업 행이 없는 경우에는 archive 문서를 완료 근거로 받아 MERGED 행을 복구한다.
 - 사용자 변경을 승인 없이 삭제하거나 덮어쓰지 않는다. 정리 안전성을 확인할 수 없는 worktree는 보존한다.
 - 같은 사용자 상태 디렉터리에서는 자동 실행을 하나만 허용한다. 수동 명령의 준비는 계획과 실제 자원의 소유권을 원자적으로 확인·예약한 뒤 동시에 수행할 수 있다. 로컬 복구 요청도 동시에 접수할 수 있으며 실제 복구는 전역 실행 잠금과 프로젝트 실행 자리를 준수한다.
 - 동일한 PR·차단·완료 사건은 중복 통지하지 않는다.
@@ -285,6 +285,7 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 - `docs/FUTURE_IDEAS.md`는 계획 입력 지문, 활성 Requirement와 프로젝트 완료 판정에서 제외하며 그 항목을 자동으로 Requirement 또는 ExecPlan으로 승격하지 않는다
 - MERGED ExecPlan은 Planner 입력에서 제외하며 프로그램만 ID 고유성, 의존성 충족과 감사 이력을 위해 관리한다
 - Planner와 Worker의 실행 후보는 `docs/plans/` 바로 아래의 active ExecPlan으로 제한하고, `docs/plans/archive/`는 ID 고유성, 다음 번호, dependency, 복구와 감사 검증에만 포함한다
+- 로컬 DB에 필요한 작업 행이 없으면 활성·archive 문서로 복구한다. 활성 문서는 기본 READY 등록과 기존 실행 복구 규칙을 따르고, archive 문서는 추가 PR 조회나 과거 게시 본문 검증 없이 MERGED로 받아들인다. 문서의 형식·ID·source·dependency 검증과 기존 행의 실행·소유권·실패 이력은 보존하며, 양쪽에 문서가 없으면 누락으로 보고한다
 - ExecPlan archive-only 이동은 계획 입력 지문, 유지보수 Merge count, 프로젝트 완료 cycle을 바꾸지 않는다
 - ExecPlan의 `depends_on`은 선행 ExecPlan ID 목록이며, 모든 선행 상태가 MERGED여야 Worker를 시작할 수 있다
 - Worker는 Requirement·ExecPlan 구현으로 바뀌는 제품 동작·장기 규칙을 `PRODUCT.md`에, 설계·책임 경계·계약을 `ARCHITECTURE.md`에 코드와 같은 PR에서 반영한다. 현재 작업에 필요한 관련 절만 갱신하며 목표·필수 검증·별도 사용자 결정을 유지한다
