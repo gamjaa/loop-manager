@@ -134,6 +134,7 @@ def rebase(effects: ExecutionEffects, identity: ExecutionIdentity,
         _row=callbacks["_row"],
         _stage_evidence_preserved=callbacks["_stage_evidence_preserved"],
         _unmerged_stages=callbacks["_unmerged_stages"],
+        git_bytes=getattr(effects.workspace, "git_bytes", None),
     ))
 
 
