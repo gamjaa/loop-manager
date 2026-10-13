@@ -950,6 +950,9 @@ class MaintenanceProgressEventTest(NotificationFixture, unittest.TestCase):
         connection = self.connection()
         repo = '/projects/alpha'
         repository = maintenance_state.MaintenanceRepository(connection)
+        from tests.support.maintenance import request_maintenance
+        request_maintenance(connection, repo)
+        connection.commit()
         ports = object.__new__(_PlanningStatePorts)
         ports._connection = connection
         ports._maintenance_repository = repository
@@ -959,7 +962,7 @@ class MaintenanceProgressEventTest(NotificationFixture, unittest.TestCase):
             self.assertTrue(created)
             sent.assert_called_once()
             self.assertTrue(sent.call_args.kwargs['disable_notification'])
-            self.assertIn('최초 유지보수 평가', sent.call_args.args[2])
+            self.assertIn('사용자의 명시적 유지보수 요청', sent.call_args.args[2])
             again, created = ports.begin_maintenance_assessment(repo, 20, 'a' * 40, include_general_planning=False)
             self.assertFalse(created)
             self.assertEqual(again, cycle)
@@ -984,6 +987,8 @@ class MaintenanceProgressEventTest(NotificationFixture, unittest.TestCase):
         connection = self.connection()
         repo = '/projects/alpha'
         repository = maintenance_state.MaintenanceRepository(connection)
+        from tests.support.maintenance import request_maintenance
+        request_maintenance(connection, repo)
         cycle, _ = repository.begin_assessment_if_due(repo, 20, 'a' * 40)
         repository.record_assessment_plans(repo, cycle.revision, ('G-018',))
         cycle = repository.advance_success_baseline(repo, expected_phase=cycle.phase, expected_revision=cycle.revision, remote_commit='a' * 40)
