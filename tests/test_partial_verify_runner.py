@@ -127,6 +127,9 @@ class PartialRunnerTests(unittest.TestCase):
             (root / 'tests').mkdir()
             (root / 'pkg').mkdir()
             (root / 'scripts').mkdir()
+            (root / 'docs/requirements').mkdir(parents=True)
+            document = root / 'docs/requirements/[R-086] Impact.md'
+            document.write_text('# Review inputs\n')
             def git(*args):
                 return subprocess.run(['git', '-C', str(root), *args], check=True,
                                       capture_output=True, text=True).stdout.strip()
@@ -153,6 +156,7 @@ class PartialRunnerTests(unittest.TestCase):
             git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'base')
             base = git('rev-parse', 'HEAD')
             (root / 'pkg/value.py').write_text('def _value():\n    return 2\n')
+            document.write_text('# Updated review inputs\n')
             git('add', '.')
             git('-c', 'user.name=Test', '-c', 'user.email=test@example.invalid', 'commit', '-qm', 'candidate')
             entrypoint = Path(runner.__file__).with_name('entrypoint.py')
@@ -177,6 +181,9 @@ class PartialRunnerTests(unittest.TestCase):
                     self.assertEqual(result['selection']['modules'], ['test_selected'])
                     self.assertEqual(len(result['selection']['ids']), 2)
                     self.assertEqual(result['selection']['total_tests'], 7)
+                    proof = result['selection']['analysis']['documents'][0]
+                    self.assertEqual(proof['path'], 'docs/requirements/[R-086] Impact.md')
+                    self.assertNotEqual(proof['source_identity']['base'], proof['source_identity']['head'])
                     units = reports[-1]['stages'][0]['units']
                     self.assertEqual(sum(unit['status'] == 'NOT_SELECTED' for unit in units), 5)
                     events = [json.loads(line) for line in (logs / 'runner.jsonl').read_text().splitlines()]

@@ -1,21 +1,32 @@
 """Deterministic, conservative module selection over both complete Git trees."""
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 import hashlib
-import ast
 from pathlib import PurePosixPath
-import re
 import subprocess
 from collections import Counter, deque
 
 from loop_manager_internal.maintenance import code_index
 from loop_manager_internal.verification.contract import validate_manifest
+from loop_manager_internal.verification import impact_analysis
 
-VERSION = 1
+VERSION = 2
 MAX_FRACTION = 0.5
-_RISK = re.compile(r"(?:^|[/_])(git|sqlite|storage|state|recovery|security|auth|permission|migration|schema|publication|checkpoint|execution|verification)(?:[/_.]|$)")
-_OPAQUE = {"__import__", "import_module", "eval", "exec", "getattr", "setattr", "hasattr",
-           "globals", "locals", "vars", "spec_from_file_location", "module_from_spec",
-           "SourceFileLoader", "load_module", "run_module", "run_path"}
+_PROTECTED = ('loop_manager_internal/git/', 'loop_manager_internal/storage/',
+              'loop_manager_internal/recovery/', 'loop_manager_internal/verification/',
+              'loop_manager_internal/security/', 'loop_manager_internal/agents/',
+              'loop_manager_internal/runtime/', 'loop_manager_internal/config/',
+              'loop_manager_internal/execution/execution_publication',
+              'loop_manager_internal/execution/execution_checkpoint',
+              'loop_manager_internal/execution/execution_verify',
+              'loop_manager_internal/execution/execution_review',
+              'loop_manager_internal/execution/execution_revision',
+              'loop_manager_internal/execution/execution_worker',
+              'loop_manager_internal/execution/execution_ports.py',
+              'loop_manager_internal/execution/execution_assembly.py',
+              'loop_manager_internal/execution/execution_state.py',
+              'loop_manager_internal/execution/preliminary_review.py',
+              'loop_manager_internal/execution/result_validation.py',
+              'loop_manager_internal/execution/stage_documents.py')
 
 
 def digest(value):
@@ -23,36 +34,13 @@ def digest(value):
 
 
 def source_facts(path, content):
-    facts = code_index.parse_source(path, content)
-    try:
-        syntax = ast.parse(content)
-        aliases = set(_OPAQUE)
-        subprocess_bindings, system_bindings, os_bindings = {'subprocess'}, {'sys'}, {'os'}
-        for node in ast.walk(syntax):
-            if isinstance(node, ast.Import):
-                for item in node.names:
-                    if item.name == 'subprocess':
-                        subprocess_bindings.add(item.asname or item.name)
-                    if item.name == 'sys':
-                        system_bindings.add(item.asname or item.name)
-                    if item.name == 'os':
-                        os_bindings.add(item.asname or item.name)
-            if isinstance(node, ast.ImportFrom):
-                aliases.update(item.asname or item.name for item in node.names if item.name in _OPAQUE)
-                if node.module == 'subprocess' or node.module == 'sys' and any(item.name == 'modules' for item in node.names):
-                    aliases.update(item.asname or item.name for item in node.names)
-        if any(isinstance(node, ast.Name) and node.id in aliases
-               or isinstance(node, ast.Attribute) and (node.attr in _OPAQUE
-                    or isinstance(node.value, ast.Name) and (
-                        node.value.id in system_bindings and node.attr == 'modules'
-                        or node.value.id in subprocess_bindings
-                        or node.value.id in os_bindings and (node.attr in {'system', 'popen'}
-                            or node.attr.startswith(('exec', 'spawn')))))
-               for node in ast.walk(syntax)):
-            facts['uncertainties'].append('dynamic_import_or_reflection')
-    except (SyntaxError, ValueError, UnicodeError, RecursionError):
-        pass  # code_index already reports parse/depth uncertainty.
-    return facts
+    return impact_analysis.analyze(path, content)
+
+
+def resolve_records(facts, directory='tests'):
+    prefix = directory.rstrip('/') + '/'
+    aliases = {code_index.module_name(path[len(prefix):]): path for path in facts if path.startswith(prefix)}
+    return impact_analysis.resolve(facts, aliases)
 
 
 @dataclass(frozen=True)
@@ -68,6 +56,7 @@ class Selection:
     manifest_identity: str
     configuration_identity: str
     algorithm: str = f"python-ast-impact-v{VERSION}/index-v{code_index.VERSION}"
+    analysis: dict = field(default_factory=dict)
 
     def serialize(self):
         return asdict(self)
@@ -99,9 +88,24 @@ def tree(repository, revision, directory="tests"):
             raise ValueError("incomplete Git source")
         facts[path] = source_facts(path, content)
         position = end + size + 2
-    prefix = directory.rstrip("/") + "/"
-    aliases = {code_index.module_name(path[len(prefix):]): path for path in facts if path.startswith(prefix)}
-    return code_index.resolve(facts, facts, module_aliases=aliases)
+    return resolve_records(facts, directory)
+
+
+def document_sources(repository, base, head, changed):
+    result = {}
+    for _, old, new in changed:
+        for label, revision, path in (('base', base, old), ('head', head, new)):
+            if not path or path.endswith('.py'):
+                continue
+            entry = code_index.git(repository, 'ls-tree', '-z', revision, '--', path).rstrip(b'\0')
+            if not entry:
+                continue
+            metadata, actual = entry.split(b'\t', 1)
+            mode, kind, oid = metadata.decode().split()
+            if kind != 'blob' or actual.decode() != path:
+                continue
+            result.setdefault(path, {})[label] = (mode, code_index.git(repository, 'cat-file', 'blob', oid))
+    return result
 
 
 def changes(repository, base, head):
@@ -126,10 +130,12 @@ def assert_candidate(repository, head, base):
 
 
 def select_records(before, after, changed, modules, *, head, base, configuration,
-                   directory="tests"):
+                   directory="tests", documents=None):
     validate_manifest(modules)
     manifest_id = digest([asdict(module) for module in modules])
     selected, reasons, fallback = set(), {}, set()
+    analysis = {'documents': [], 'expansions': [], 'resolved': {}, 'remaining_uncertainties': {},
+                'size_policy': {'module_fraction': MAX_FRACTION, 'test_fraction': MAX_FRACTION}}
     paths_to_modules = {}
     for module in modules:
         candidates = {module.name.replace(".", "/") + ".py",
@@ -143,30 +149,36 @@ def select_records(before, after, changed, modules, *, head, base, configuration
     for path in changed_paths:
         name = PurePosixPath(path).name
         if not path.endswith(".py"):
-            # Documents may define Review inputs, but cannot prove test impact.
-            fallback.add("non_python_input:" + path)
+            proof, reason = impact_analysis.review_document(path, (before, after), configuration, documents, paths_to_modules)
+            if reason:
+                fallback.add(reason)
+            else:
+                analysis['documents'].append(proof)
         elif name == "__init__.py" or "/" not in path:
             fallback.add("package_or_entrypoint:" + path)
-        elif _RISK.search(path.lower()):
+        elif path.startswith(_PROTECTED):
             fallback.add("shared_high_risk_code:" + path)
         elif path.startswith(directory.rstrip("/") + "/") and path not in paths_to_modules:
-            fallback.add("test_support_or_deleted_test:" + path)
+            if path not in after:
+                fallback.add("deleted_test_or_support:" + path)
+            else:
+                analysis['expansions'].append('test_support_consumers:' + path)
     for _, old, new in changed:
         previous, current = before.get(old), after.get(new)
         implementation = not str(new or old).startswith(directory.rstrip('/') + '/')
         for facts in (previous, current):
-            if facts and facts.get("boundary"):
+            if facts and facts.get('impact', {}).get('protected_effect', facts.get('boundary') and not facts.get('impact')):
                 fallback.add("boundary_code:" + str(new or old))
             if facts and any(item["name"] == "load_tests" for item in facts["symbols"]):
                 fallback.add("custom_collection:" + str(new or old))
-            if facts and any(item["module"].split(".")[0] in {"sqlite3", "subprocess"}
-                    or set(item["names"]).intersection({"sqlite3", "subprocess"}) for item in facts["imports"]):
-                fallback.add("external_or_database_code:" + str(new or old))
+            if facts and any(item["module"].split(".")[0] == 'sqlite3'
+                    or 'sqlite3' in item["names"] for item in facts["imports"]):
+                fallback.add("database_code:" + str(new or old))
         if implementation and (previous is None or current is None) and any(facts and facts["contracts"] for facts in (previous, current)):
-            fallback.add("public_module_added_or_deleted:" + str(new or old))
+            analysis['expansions'].append("public_module_added_or_deleted:" + str(new or old))
         if implementation and previous is not None and current is not None and (
                 previous["contracts"] != current["contracts"] or previous["exports"] != current["exports"]):
-            fallback.add("public_api_changed:" + str(new))
+            analysis['expansions'].append("public_api_changed:" + str(new))
         if old and old.endswith(".py") and old not in before:
             fallback.add("old_source_missing:" + old)
         if new and new.endswith(".py") and new not in after:
@@ -178,9 +190,15 @@ def select_records(before, after, changed, modules, *, head, base, configuration
         if any(count != 1 for count in names.values()):
             fallback.add("ambiguous_module_paths:" + label)
         for path, facts in graph.items():
-            if facts["uncertainties"]:
-                fallback.add(f"uncertain_{label}:{path}:" + ",".join(facts["uncertainties"]))
+            unknown = facts.get('selection_uncertainties', facts['uncertainties'])
+            if unknown:
+                fallback.add(f"uncertain_{label}:{path}:" + ",".join(unknown))
+                analysis['remaining_uncertainties'][label + ':' + path] = unknown
+            if facts.get('impact', {}).get('resolved'):
+                analysis['resolved'][label + ':' + path] = facts['impact']['resolved']
         pending = deque((path, path, 0) for path in sorted(changed_paths.intersection(graph)))
+        pending.extend((consumer, path, 1) for path in sorted(changed_paths.intersection(graph))
+                       for consumer in sorted(set(graph[path].get('reexport_consumers', []))))
         visited = set()
         while pending:
             path, origin, depth = pending.popleft()
@@ -200,9 +218,11 @@ def select_records(before, after, changed, modules, *, head, base, configuration
     if len(selected) >= len(modules) * MAX_FRACTION or count >= total * MAX_FRACTION:
         fallback.add("selection_too_broad")
     names = tuple(module.name for module in modules if module.name in selected)
+    analysis['expansions'].sort()
+    analysis['documents'].sort(key=lambda proof: proof['path'])
     return Selection(head, base, names, tuple(identity for module in modules if module.name in selected for identity in module.ids),
         {key: sorted(value) for key, value in sorted(reasons.items())}, tuple(sorted(fallback)),
-        len(modules), total, manifest_id, digest(configuration))
+        len(modules), total, manifest_id, digest(configuration), analysis=analysis)
 
 
 def select(repository, base, modules, configuration, directory="tests"):
@@ -211,19 +231,23 @@ def select(repository, base, modules, configuration, directory="tests"):
     assert_candidate(repository, head, base)
     try:
         before, after = tree(repository, base, directory), tree(repository, head, directory)
-    except (ValueError, UnicodeError, subprocess.CalledProcessError) as error:
+    except (ValueError, UnicodeError, OSError, RecursionError, subprocess.CalledProcessError) as error:
         selection = Selection(head, base, (), (), {}, ("source_graph_unavailable:" + str(error),),
             len(modules), sum(len(module.ids) for module in modules),
             digest([asdict(module) for module in modules]), digest(configuration))
     else:
-        selection = select_records(before, after, changes(repository, base, head),
-            modules, head=head, base=base, configuration=configuration, directory=directory)
+        changed = changes(repository, base, head)
+        selection = select_records(before, after, changed,
+            modules, head=head, base=base, configuration=configuration, directory=directory,
+            documents=document_sources(repository, base, head, changed))
     assert_candidate(repository, head, base)
     return selection
 
 
 def selected_modules(selection, modules):
     """Require exact discovery identity, preserving original order and fixtures."""
+    if selection.algorithm != f'python-ast-impact-v{VERSION}/index-v{code_index.VERSION}':
+        raise ValueError('partial selection algorithm changed')
     if digest([asdict(module) for module in modules]) != selection.manifest_identity:
         raise ValueError("partial manifest identity changed")
     chosen = [module for module in modules if module.name in selection.modules]

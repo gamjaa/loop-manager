@@ -46,9 +46,13 @@ Manager의 `[loop] verify_partial = true`는 자체 저장소의 일반 작업�
 
 runner의 `--partial-base <commit>` 또는 Manager가 전달하는 `LOOP_MANAGER_VERIFY_PARTIAL_BASE`는 같은 전체 discovery manifest에서 영향받은 모듈만 실행한다. 검증 설정은 기존 `scripts/verify.json`을 사용한다. 지원하는 단계 배치는 처음에 하나의 unittest tests 단계와 그 뒤의 command 단계다. 전체 검증의 후속 필수 command는 나중의 전체 실행에서 수행한다. 일반 전체 실행의 Manager는 상속된 부분 실행 환경값을 제거한다.
 
-선택기는 base/HEAD 양쪽의 모든 tracked Python body를 AST로 분석하고 변경 테스트와 직접·역방향 간접 소비자를 manifest 모듈로 정규화한다. 삭제·rename·패키지 이동의 과거 그래프도 포함한다. 어느 쪽 tree라도 동적 참조·reflection·미해결 참조가 있거나, 공유 support·고위험 공통 코드·공개 계약·패키지 초기화·진입점·비Python 입력이 변경되면 fallback한다. 테스트 모듈 수 또는 테스트 ID 수의 절반 이상을 고르거나 대상이 없어도 fallback한다. 이 규칙은 보수적인 실행 선택 기준이며 성능 성공 기준이 아니다. `query_worktree()`의 요청 파일만의 incoming 관계를 완전한 그래프로 사용하지 않는다.
+선택기 버전 2는 기준/후보 커밋 양쪽의 모든 추적 Python 본문을 AST로 분석하고 변경 테스트와 직접·역방향 간접 참조를 수집 명세의 모듈로 정규화한다. 삭제·이름 변경·패키지 이동 전의 관계와 패키지 초기화의 암묵적 의존성도 포함한다. 공개 API·공통 지원 코드 변경은 확인한 사용 테스트를 확대한다. 파일명 유사도와 요청 파일만의 역방향 관계는 사용하지 않는다.
 
-`partial-result.json`은 `kind: partial_verify`, run identity, PASS/FAIL/FALLBACK/ERROR, candidate/base, 선택 모듈/테스트 ID·이유, 전체 대비 규모, 알고리즘/설정/manifest identity, 시간과 진단 경로를 보존한다. 미선택 manifest 모듈은 NOT_SELECTED이며 실행 완료나 skip을 합성하지 않는다. FALLBACK은 discovery 이후에도 테스트 모듈과 command를 실행하지 않는다. 기존 core·adapter가 fixture·skip·identity/필수 결과·serial/independent·guard·예약·자식 종료를 검사하며 timeout과 취소도 전체 검증과 같은 외부 프로세스 경계를 사용한다.
+현재 해소하는 동적 참조는 고정된 절대 모듈 이름·문자열 결합 또는 리터럴 목록을 순회하는 import, 가져온 모듈의 고정 속성 조회, 고정 이름/자기 모듈의 registry 조회, Git/GitHub CLI의 고정 버전 조회와 고정된 Python `-m` 대상이다. 별칭·재바인딩·로더 함수의 다른 변수 전달·shell/추가 실행 옵션·대상 불명·registry 변경·이름공간/코드 실행은 보수적으로 처리한다. 원본 코드맵의 불확실성은 지우지 않으며 해소한 참조를 부분 그래프에 추가한다. 공통 진입점의 직접 재노출은 초기화 부작용 없는 선언·정적 별칭·속성 사용을 확인한 경우에만 원래 구현 모듈로 연결한다. 부작용·순환·동적 접근·모듈 객체 전달을 확인하지 못하면 기존 넓은 관계를 유지한다.
+
+검토 전용 문서 제외는 `docs/PRODUCT.md`, `docs/ARCHITECTURE.md`와 활성 계획·Requirement의 역할, 실제 커밋된 일반 파일 내용/모드, 전체 테스트와 참조 모듈의 파일 읽기, 기존 runner의 compile 명령을 함께 확인한다. 테스트가 읽는 문서·불명확한 파일 읽기·임의 검증 명령·지침·템플릿·설정은 제외하지 않는다. 문서의 내용/모드 식별 정보는 부분 결과에 남기고 전체 변경·검토 문서의 승인 입력은 유지한다. 핵심 Git·저장·복구·실행 정책·검증 경계, 데이터베이스/권한/상태 효과, 패키지 초기화·루트 진입점·수집 변경과 해소하지 못한 참조는 기존 전체 경로로 전환한다. 테스트 모듈 수 또는 테스트 ID 수가 전체의 절반 이상이거나 대상이 없어도 전환하며 이 비용 조건은 성능 성공 기준이 아니다.
+
+`partial-result.json`은 `kind: partial_verify`, run identity, PASS/FAIL/FALLBACK/ERROR, candidate/base, 선택 모듈/테스트 ID·이유, 전체 대비 규모, 알고리즘/설정/manifest identity, 시간과 진단 경로를 보존한다. `selection.analysis`는 문서 역할·내용/모드 식별 정보, 대상 확대·해소/제외 근거·남은 불확실성과 비용 기준을 구분한다. 이전 알고리즘 또는 다른 수집 명세의 선택 결과는 거부한다. 미선택 manifest 모듈은 NOT_SELECTED이며 실행 완료나 skip을 합성하지 않는다. FALLBACK은 discovery 이후에도 테스트 모듈과 command를 실행하지 않는다. 기존 core·adapter가 fixture·skip·identity/필수 결과·serial/independent·guard·예약·자식 종료를 검사하며 timeout과 취소도 전체 검증과 같은 외부 프로세스 경계를 사용한다.
 
 부분 PASS는 전체 verify token/receipt와 분리한다. 일반 선행 Review의 최종 승격도 모든 후보·검토 입력·환경/정책과 해당 선행 승인 뒤 실행한 실제 전체 verify receipt ID가 확인될 때만 가능하며 게시 직전 재확인한다. 관측 port는 현재 준비된 입력뿐 아니라 `invocation_id`가 주어진 경우 그 실제 Reviewer 호출의 고정 instruction/profile·실행 환경/정책을 증명해야 한다. 현재 설정을 과거 호출의 identity로 소급 채택하지 않는다. 실제 호출 identity·사전/사후 현재 identity가 모두 같아야 하며 호출 증거 부재·실패·변경·중단은 기존 경로로 처리한다. 이 경로는 G-183의 최종 승인 재사용, G-241의 전체 검증 생략, G-250 병렬 최적화를 구현하지 않는다.
 
