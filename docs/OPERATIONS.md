@@ -15,6 +15,14 @@ Git·`gh`와 선택한 Agent CLI를 설치·인증하고 대상 GitHub 저장소
 
 Windows Codex는 기존 `CODEX_HOME`의 인증·session 저장소를 사용한다. Windows ACL·Job Object, macOS Seatbelt, Linux 읽기 전용 mount·프로세스 그룹의 경계를 확인할 수 없으면 권한을 완화하지 않고 중단한다. 검증되지 않은 Claude 격리 호출도 거부한다. [Codex 권한 정책](https://developers.openai.com/codex/permissions) · [격리 설계](ARCHITECTURE.md#repository-safety-and-security)
 
+### Linux PATH 캐시
+
+`bash scripts/setup.sh`는 호출 환경의 PATH를 source checkout의 `config/execution-path.txt`에 저장한다. Git·gh와 Codex 또는 Claude가 발견되는 정상 터미널에서 실행하며 별도 로그인 셸이나 `.bashrc`를 자동 실행하지 않는다. 경로 순서·공백·심볼릭 링크는 유지하고 중복·빈 항목·상대 경로·존재하지 않는 디렉터리는 제외한다. setup 준비·경로 검사·저장 실패는 기존 캐시를 보존한다. `config`의 미추적 파일은 폴더 전체가 Git에서 제외되며 기존 `config.ini.example`은 계속 추적한다.
+
+Python source 진입은 bootstrap의 첫 Git 호출 전에 저장된 PATH, 현재 PATH의 추가 디렉터리, 기본 시스템 디렉터리 순서로 합친다. runtime 자식·Agent·verify는 확정된 환경을 상속하며 캐시를 다시 읽지 않는다. 캐시 위치는 source checkout에 고정되고 cwd·`--config`·state_dir 변경과 무관하다. 캐시가 없으면 현재 PATH와 시스템 후보를 사용하므로 PATH를 명시한 기존 cron 설정도 사용할 수 있다.
+
+프로그램이나 Node 등의 의존 실행 파일을 찾지 못하면 같은 계정의 정상 터미널에서 설치 경로를 확인하고 setup을 다시 실행한다. 읽기 불가·빈 파일·손상된 캐시는 bootstrap 전에 중단하며 현재 PATH로 조용히 대체하지 않는다. setup 재실행은 PATH 캐시만 갱신하고 `config.ini`·인증·DB·session은 초기화하지 않는다. 실행 중 캐시 갱신은 다음 source 실행부터 적용된다. 가상환경을 다시 만들어도 `config`의 PATH 캐시는 유지된다.
+
 ## 설정
 
 [config.ini.example](../config/config.ini.example)을 `config/config.ini`로 복사해 편집한다. setup은 기존 `.venv`를 재사용하고 `requirements.txt`의 패키지를 설치한다. 현재 외부 Python 의존성은 없으며 추가되면 같은 setup을 다시 실행한다.

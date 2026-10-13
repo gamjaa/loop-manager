@@ -28,6 +28,8 @@ Copy-Item -LiteralPath config/config.ini.example -Destination config/config.ini
 
 `config/config.ini`에서 선택 provider의 모델·Effort를 확인한다. Telegram을 사용하려면 `token`과 `chat_id`를 모두 입력하고, 사용하지 않으면 둘 다 비워 둔다. **실제 config는 비밀값을 포함할 수 있으므로 commit하지 않는다.** [설정 항목](docs/OPERATIONS.md#설정)
 
+Linux setup은 정상 터미널의 PATH를 `config/execution-path.txt`에 저장한다. Git·gh와 Codex 또는 Claude를 찾을 수 있는 같은 실행 계정의 터미널에서 실행하며, 설치 경로가 바뀌면 setup을 다시 실행한다. Python 진입부가 bootstrap 전에 이 PATH를 적용하므로 cron에서도 기존 launcher를 사용한다. 캐시가 없으면 cron에 지정한 PATH를 포함한 현재 환경과 시스템 경로를 사용한다. [PATH 저장·복구](docs/OPERATIONS.md#linux-path-캐시)
+
 Windows에서 Defender 검사로 verify가 느리면 [검사 제외 설정](docs/OPERATIONS.md#windows-defender와-테스트-임시-폴더)을 확인한다.
 
 ### 2. 프로젝트 문서 준비와 게시

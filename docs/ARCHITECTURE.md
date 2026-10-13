@@ -38,10 +38,11 @@ Loop Manager는 Windows·Linux·macOS에서 동작하는 Python 3 프로그램�
 - Windows는 PowerShell, Linux·macOS는 Bash 실행 진입점을 제공한다
 - 같은 사용자 상태 디렉터리의 자동 실행과 실제 복구 실행은 `<state-dir>/loop-manager.lock`으로 직렬화한다. 수동 준비와 복구 요청 접수는 별도 command runtime과 자원 잠금을 사용한다
 - `run.sh`와 `run.ps1`은 Git을 실행하지 않고 source checkout의 Python 부트스트랩만 시작한다
+- Linux Python source 진입은 `config/execution_path.py`의 공통 정리 규칙으로 source의 `config/execution-path.txt`, 현재 PATH, 존재하는 기본 시스템 후보를 순서대로 합쳐 첫 외부 명령 전에 현재 프로세스에 적용한다. setup은 같은 규칙으로 Git·gh와 최소 한 provider의 탐색을 확인하고 임시 파일의 원자적 교체로 캐시를 갱신한다. 캐시 부재는 기존 환경을 사용하고 손상·읽기 실패는 설정 오류로 중단한다. runtime 자식은 부모 PATH를 그대로 상속하며 캐시를 다시 읽지 않는다
 - 부트스트랩은 다른 Git 작업 전에 부모 process lock을 획득하고, 등록 self base(미등록이면 main)의 origin/<base-branch>를 fetch해 exact SHA의 detached runtime worktree를 선택한 뒤 같은 lock을 유지한 채 runtime 자식을 실행한다. `manual`과 `recover`는 command별 부모 lock과 고유 runtime 경로로 자동 실행과 분리한다
 - runtime worktree는 source checkout의 object database를 공유하며 사용자 `main`의 파일, index, HEAD와 로컬 전용 commit을 사용하지 않는다. push된 새 SHA는 다음 실행에서만 선택한다
 - source checkout의 bootstrap은 기존 `config/config.ini` 또는 명시된 `--config`를 source checkout 기준의 절대 경로로 확정해 runtime 자식에 전달하며 설정 파일을 runtime worktree에 복사·이동·symlink하지 않는다
-- launcher가 선택한 source checkout의 Python interpreter를 runtime 자식도 사용한다. source checkout의 ignored 파일과 cache는 runtime worktree로 전달하지 않는다
+- launcher가 선택한 source checkout의 Python interpreter를 runtime 자식도 사용한다. PATH 캐시는 source에서 읽어 확정한 환경값만 전달하고 source checkout의 ignored 파일과 cache 자체는 runtime worktree로 전달하지 않는다
 - `config/config.ini`가 없거나 유효하지 않으면 설정 방법을 안내하고 작업을 시작하지 않는다
 - 최초 설정은 사용자가 설정 모드를 명시적으로 실행해 SQLite를 생성한다
 - 일반 Loop 모드에서 SQLite가 없거나 손상됐으면 자동으로 초기화하지 않고 복원 또는 명시적 재설정을 안내한 뒤 중단한다
@@ -51,6 +52,8 @@ Loop Manager는 Windows·Linux·macOS에서 동작하는 Python 3 프로그램�
 ## 설정
 
 Python 표준 라이브러리 `configparser`로 `config/config.ini`를 읽는다.
+
+source checkout의 `config` 아래 미추적 로컬 파일은 폴더 전체가 Git 제외 대상이며 기존 `config/config.ini.example`은 계속 추적한다. Linux PATH 캐시는 운영 INI와 분리해 `config/execution-path.txt`에 보존하고 setup만 갱신한다.
 
 - `[loop].max_workers`: 동시에 처리할 프로젝트 수, 기본값 3인 양의 정수
 - provider별 Model alias와 Effort, 기본값이 `false`인 Fast on/off
