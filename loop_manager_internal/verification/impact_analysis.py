@@ -23,6 +23,15 @@ _PROCESSES = {'subprocess.run', 'subprocess.Popen', 'subprocess.call', 'subproce
               'subprocess.check_output', 'os.system', 'os.popen'}
 _OPAQUE_NAMES = {'__import__', 'import_module', 'eval', 'exec', 'load_module',
                  'run_module', 'run_path', 'spec_from_file_location', 'module_from_spec', 'SourceFileLoader'}
+_FILE_METHODS = {'read_text', 'read_bytes', 'open', 'read', 'readline', 'readlines',
+                 'glob', 'rglob', 'iterdir', 'exists', 'is_file', 'is_dir', 'stat', 'lstat'}
+_FILE_FUNCTIONS = {'open', 'builtins.open', 'io.open', 'glob.glob', 'glob.iglob',
+                   'os.listdir', 'os.scandir', 'os.walk', 'os.stat', 'os.lstat', 'os.access',
+                   'os.path.exists', 'os.path.isfile', 'os.path.isdir',
+                   'shutil.copy', 'shutil.copy2', 'shutil.copyfile', 'shutil.copytree',
+                   'pkgutil.get_data', 'importlib.resources.read_text', 'importlib.resources.read_binary',
+                   'xml.etree.ElementTree.parse', 'xml.dom.minidom.parse'}
+_FILE_ALIASES = {'symlink', 'symlink_to', 'link', 'link_to', 'hardlink_to', 'rename', 'replace'}
 
 
 class Source:
@@ -177,13 +186,15 @@ def analyze(path, content):
             elif name in {'globals', 'locals', 'vars', 'builtins.globals', 'builtins.locals', 'builtins.vars'}:
                 special_nodes.add(node.func)
                 unknown(node, 'unbounded_namespace')
-            if leaf in {'read_text', 'read_bytes', 'open'}:
-                expression = node.args[0] if leaf == 'open' and node.args and (isinstance(node.func, ast.Name) or name in {'builtins.open', 'io.open'}) else node.func.value if isinstance(node.func, ast.Attribute) else None
+            if leaf in _FILE_METHODS or name in _FILE_FUNCTIONS:
+                expression = node.args[0] if name in _FILE_FUNCTIONS and node.args else node.func.value if isinstance(node.func, ast.Attribute) else None
                 target = source.file_path(expression) if expression is not None else None
                 if target is None or any(part in {'.', '..'} for part in target.split('/')):
                     proof['unbounded_file_read'] = True
                 else:
                     proof['file_reads'].append(target)
+            if leaf in _FILE_ALIASES or name and name.rsplit('.', 1)[-1] in _FILE_ALIASES:
+                proof['unbounded_file_read'] = True
         elif isinstance(node, ast.Subscript) and source.qualified(node.value) == 'sys.modules':
             special_nodes.add(node.value)
             targets = source.strings(node.slice)
@@ -198,6 +209,10 @@ def analyze(path, content):
     # Merely assigning a loader to another name must not bypass the checks.
     for node in ast.walk(source.syntax):
         name = source.qualified(node)
+        if name in _FILE_FUNCTIONS or isinstance(node, ast.Attribute) and node.attr in _FILE_METHODS | _FILE_ALIASES:
+            parent = source.parents.get(node)
+            if not isinstance(parent, ast.Call) or parent.func is not node:
+                proof['unbounded_file_read'] = True
         if (name in _LOADERS | _EXECUTION | _REFLECTION | _PROCESSES | {'sys.modules'} or name and name.startswith('sys.modules.')) and node not in special_nodes:
             parent = source.parents.get(node)
             if isinstance(parent, ast.Attribute) and parent.value is node:
@@ -327,12 +342,13 @@ def resolve(facts, aliases=None):
     return graph
 
 
-def review_document(path, graphs, configuration, documents, test_paths):
+def review_document(path, graphs, configuration, documents, test_paths, file_inventory):
     """A bounded role AND consumption check; extension/list exclusion is insufficient."""
     parts = PurePosixPath(path).parts
     role = path in {'docs/PRODUCT.md', 'docs/ARCHITECTURE.md'} or (
-        len(parts) == 3 and parts[:2] in {('docs', 'plans'), ('docs', 'requirements')}
-        and parts[2].startswith(('[G-', '[R-')) and parts[2].endswith('.md'))
+        len(parts) == 3 and parts[2].endswith('.md') and (
+            parts[:2] == ('docs', 'plans') and parts[2].startswith('[G-')
+            or parts[:2] == ('docs', 'requirements') and parts[2].startswith('[R-')))
     if not role:
         return None, 'non_python_input:' + path
     versions = (documents or {}).get(path)
@@ -349,7 +365,9 @@ def review_document(path, graphs, configuration, documents, test_paths):
             stage.get('argv', [])[:3] != ['{python}', '{runner}', '--compile']
             or len(stage['argv']) < 4 or any('docs' in arg or arg.startswith('-') for arg in stage['argv'][3:])) for stage in stages):
         return None, 'document_command_consumption_unproven:' + path
-    for graph in graphs:
+    if any(stage['kind'] == 'tests' and stage.get('cwd', '.') != '.' for stage in stages):
+        return None, 'document_execution_context_unproven:' + path
+    for label, graph in zip(('base', 'head'), graphs):
         pending, visited = list(test_paths), set()
         while pending:
             consumer = pending.pop()
@@ -364,6 +382,10 @@ def review_document(path, graphs, configuration, documents, test_paths):
             for literal in proof['file_reads']:
                 if literal in {path, PurePosixPath(path).name, 'docs', 'docs/'} or path.startswith(literal.rstrip('/') + '/') or '*' in literal and literal.startswith(('docs', '*.md')):
                     return None, 'document_test_input:' + consumer + ':' + path
+                # Even a different extension may be a symlink to this document.
+                # Unknown/generated/external paths also lack an exclusion proof.
+                if (file_inventory or {}).get(literal, {}).get(label) not in {'100644', '100755'}:
+                    return None, 'document_read_source_unproven:' + consumer + ':' + literal
     return {'kind': 'review_only_document', 'path': path,
             'source_identity': {label: hashlib.sha256(mode.encode() + b'\0' + content).hexdigest()
                                 for label, (mode, content) in versions.items()},

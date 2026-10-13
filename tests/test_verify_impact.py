@@ -103,11 +103,11 @@ class ImpactTests(unittest.TestCase):
         self.assertEqual(result.modules, ('test_direct', 'test_indirect'))
         self.assertIn('public_api_changed:pkg/value.py', result.analysis['expansions'])
 
-    def scoped(self, *, before=None, after=None, changed=None, documents=None, configuration=None):
+    def scoped(self, *, before=None, after=None, changed=None, documents=None, configuration=None, files=None):
         return impact.select_records(self.graph(before or self.sources), self.graph(after or self.sources),
             changed or [('M', 'pkg/value.py', 'pkg/value.py')], self.modules,
             head='head', base='base', configuration=configuration or {'stages': [{'kind': 'tests'}]},
-            documents=documents)
+            documents=documents, files=files)
 
     def test_code_and_review_document_keep_all_document_evidence(self):
         path = 'docs/requirements/[R-086] Impact.md'
@@ -152,6 +152,54 @@ class ImpactTests(unittest.TestCase):
                 result = self.scoped(changed=[('A', None, path)], configuration=configuration,
                     documents={path: {'head': ('100644', b'# Product')}})
                 self.assertTrue(any('document_command_consumption_unproven' in reason for reason in result.fallback))
+        context = self.scoped(changed=[('A', None, path)],
+            configuration={'stages': [{'kind': 'tests', 'cwd': 'elsewhere'}]},
+            documents={path: {'head': ('100644', b'# Product')}})
+        self.assertIn('document_execution_context_unproven:' + path, context.fallback)
+
+    def test_document_reads_include_aliases_enumeration_metadata_and_copy(self):
+        path = 'docs/PRODUCT.md'
+        for consumer in (b'from builtins import open as read\nread("docs/PRODUCT.md")\n',
+                         b'from pathlib import Path\nread = Path("docs/PRODUCT.md").read_text\nread()\n',
+                         b'from pathlib import Path\nPath("docs").glob("*.md")\n',
+                         b'from pathlib import Path\nPath("docs/PRODUCT.md").stat()\n',
+                         b'import shutil\nshutil.copyfile("docs/PRODUCT.md", "out")\n'):
+            with self.subTest(consumer=consumer):
+                sources = dict(self.sources, **{'pkg/reader.py': consumer,
+                    'tests/test_other0.py': b'from pkg import reader\n'})
+                result = self.scoped(before=sources, after=sources,
+                    changed=[('M', 'pkg/value.py', 'pkg/value.py'), ('A', None, path)],
+                    documents={path: {'head': ('100644', b'# Product')}})
+                self.assertTrue(any(reason.startswith('document_') for reason in result.fallback))
+
+    def test_document_exclusion_requires_other_read_sources_to_be_regular(self):
+        path = 'docs/PRODUCT.md'
+        sources = dict(self.sources, **{'pkg/reader.py': b'from pathlib import Path\nPath("data.json").read_text()\n',
+            'tests/test_other0.py': b'from pkg import reader\n'})
+        for mode in ('100644', '120000', None):
+            with self.subTest(mode=mode):
+                result = self.scoped(before=sources, after=sources,
+                    changed=[('M', 'pkg/value.py', 'pkg/value.py'), ('A', None, path)],
+                    documents={path: {'head': ('100644', b'# Product')}},
+                    files={'data.json': {'base': mode, 'head': mode}})
+                if mode == '100644':
+                    self.assertFalse(result.fallback)
+                else:
+                    self.assertTrue(any('document_read_source_unproven' in reason for reason in result.fallback))
+        alias = dict(sources)
+        alias['pkg/reader.py'] = b'from pathlib import Path\nPath("data.json").symlink_to("docs/PRODUCT.md")\nPath("data.json").read_text()\n'
+        result = self.scoped(before=alias, after=alias, changed=[('A', None, path)],
+            documents={path: {'head': ('100644', b'# Product')}},
+            files={'data.json': {'base': '100644', 'head': '100644'}})
+        self.assertTrue(any('document_consumption_unproven' in reason for reason in result.fallback))
+
+    def test_repeated_resolution_preserves_source_facts_and_same_selection(self):
+        facts = {path: impact.source_facts(path, content) for path, content in self.sources.items()}
+        original = code_index.encode(facts)
+        first = impact.resolve_records(facts)
+        second = impact.resolve_records(facts)
+        self.assertEqual(code_index.encode(first), code_index.encode(second))
+        self.assertEqual(code_index.encode(facts), original)
 
     def test_literal_and_finite_dynamic_imports_add_their_hidden_consumers(self):
         for loader in (b'import importlib as loader\nloader.import_module("pkg.value")\n',

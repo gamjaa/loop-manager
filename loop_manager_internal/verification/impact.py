@@ -108,6 +108,16 @@ def document_sources(repository, base, head, changed):
     return result
 
 
+def file_inventory(repository, base, head):
+    result = {}
+    for label, revision in (('base', base), ('head', head)):
+        for entry in filter(None, code_index.git(repository, 'ls-tree', '-r', '-z', revision).split(b'\0')):
+            metadata, path = entry.split(b'\t', 1)
+            mode, kind, _ = metadata.decode().split()
+            result.setdefault(path.decode(), {})[label] = mode if kind == 'blob' else kind
+    return result
+
+
 def changes(repository, base, head):
     fields = code_index.git(repository, "diff", "--name-status", "-z", "--find-renames", base, head, "--").decode("utf-8").split("\0")
     result, index = [], 0
@@ -130,7 +140,7 @@ def assert_candidate(repository, head, base):
 
 
 def select_records(before, after, changed, modules, *, head, base, configuration,
-                   directory="tests", documents=None):
+                   directory="tests", documents=None, files=None):
     validate_manifest(modules)
     manifest_id = digest([asdict(module) for module in modules])
     selected, reasons, fallback = set(), {}, set()
@@ -149,7 +159,7 @@ def select_records(before, after, changed, modules, *, head, base, configuration
     for path in changed_paths:
         name = PurePosixPath(path).name
         if not path.endswith(".py"):
-            proof, reason = impact_analysis.review_document(path, (before, after), configuration, documents, paths_to_modules)
+            proof, reason = impact_analysis.review_document(path, (before, after), configuration, documents, paths_to_modules, files)
             if reason:
                 fallback.add(reason)
             else:
@@ -239,7 +249,7 @@ def select(repository, base, modules, configuration, directory="tests"):
         changed = changes(repository, base, head)
         selection = select_records(before, after, changed,
             modules, head=head, base=base, configuration=configuration, directory=directory,
-            documents=document_sources(repository, base, head, changed))
+            documents=document_sources(repository, base, head, changed), files=file_inventory(repository, base, head))
     assert_candidate(repository, head, base)
     return selection
 
