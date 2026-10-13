@@ -78,6 +78,7 @@ class MergeProofKind(str, Enum):
     GITHUB_PR = "github-pr"
     GIT_ANCESTRY = "git-ancestry"
     STORED_AND_GIT = "stored-and-git"
+    ARCHIVE_DOCUMENT = "archive-document"
     NONE = "none"
 
 
@@ -482,6 +483,44 @@ def insert_published_plan_row(
                                 agent=True)
 
 
+def insert_document_fallback(
+    connection: sqlite3.Connection, repo: str,
+    entry: ExecPlanCatalogEntry, revision_sha: str,
+) -> None:
+    """누락된 작업을 문서에서 복구하고 archive의 완료 수락 근거를 기록한다."""
+
+    history = CatalogStateRepository(connection, ensure=False)
+    audit = history.historical_row(repo, entry.plan_id) if entry.archived else None
+    verified = audit is not None and audit["identity_verified"]
+    original_path = str(audit["original_path"]) if verified else entry.active_path
+    original_hash = str(audit["original_content_hash"]) if verified else entry.content_hash
+    plan_sha = str(audit["plan_sha"] or revision_sha) if verified else revision_sha
+    insert_published_plan_row(
+        connection, repo, original_path, entry.metadata(), entry.content_hash,
+        plan_sha, publication_content_hash=original_hash,
+    )
+    if not entry.archived:
+        history.mark_active(repo, {entry.plan_id: entry})
+        return
+    from . import runtime_state
+
+    runtime_state.RuntimeStateRepository(connection).update_plan(
+        repo, entry.plan_id, plan_values={"status": "MERGED"}, enqueue=False,
+    )
+    connection.execute(
+        "UPDATE exec_plans SET path = ?, current_revision_sha = ? WHERE repo = ? AND plan_id = ?",
+        (entry.path, revision_sha, repo, entry.plan_id),
+    )
+    history.record(
+        repo, entry, original_path=original_path, original_content_hash=original_hash,
+        plan_sha=plan_sha,
+        proof=MergeProof(True, kind=MergeProofKind.ARCHIVE_DOCUMENT,
+                         plan_sha=plan_sha, publication_content_hash=original_hash,
+                         revision=revision_sha),
+        diagnostic=None, identity_verified=True,
+    )
+
+
 def _catalog_fingerprint(snapshot: ExecPlanCatalogSnapshot) -> str:
     digest = hashlib.sha256(b"loop-manager-execplan-catalog-v1\0")
     for plan_id, entry in snapshot.all.items():
@@ -788,15 +827,12 @@ class DefinitionStateRepository:
                     ).fetchone()
                     if row is None:
                         if plan_id in new_plan_ids:
-                            insert_published_plan_row(
-                                self.connection, repo, entry.path,
-                                entry.metadata(), entry.content_hash,
-                                pinned.revision_sha,
-                            )
-                            execplan_draft_state.observe(
-                                self.connection, repo, entry.path, entry.metadata(), entry.content_hash,
-                                pinned.revision_sha, inputs=pinned.draft_inputs, remote_url=pinned.remote_url,
-                            )
+                            insert_document_fallback(self.connection, repo, entry, pinned.revision_sha)
+                            if not entry.archived:
+                                execplan_draft_state.observe(
+                                    self.connection, repo, entry.path, entry.metadata(), entry.content_hash,
+                                    pinned.revision_sha, inputs=pinned.draft_inputs, remote_url=pinned.remote_url,
+                                )
                             changed.append(plan_id)
                             self._fault(f"after-plan:{plan_id}")
                         continue
@@ -1071,9 +1107,6 @@ class CatalogReconciliationService:
         missing_history = sorted(
             historical_ids - stored_ids - catalog_ids - pinned.reserved_intake_ids
         )
-        unknown_archived = sorted(
-            set(pinned.snapshot.archived) - stored_ids - historical_ids
-        )
         if missing_files and not pinned.snapshot.isolation_enabled and not cancelled:
             plan_id = missing_files[0]
             current = self.repository.current_definition(repo, plan_id)
@@ -1162,19 +1195,12 @@ class CatalogReconciliationService:
             if issues:
                 snapshot = replace(pinned.snapshot, withheld=tuple(sorted(set(withheld))))
                 pinned = replace(pinned, snapshot=withhold_catalog_issues(snapshot, tuple(issues)))
-        if unknown_archived:
-            plan_id = unknown_archived[0]
-            entry = pinned.snapshot.archived[plan_id]
-            return self._invalid(
-                pinned.revision_sha, "unknown-plan-id",
-                f"신규 archive ExecPlan은 자동 등록할 수 없습니다: {plan_id}",
-                path=entry.path,
-            )
         new_observations = {
             key: path for key, path, _hash in pinned.snapshot.withheld
             if key not in stored_ids and key not in historical_ids
         }
-        new_observations.update({key: entry.path for key, entry in pinned.snapshot.active.items() if key not in stored_ids})
+        new_observations.update({key: entry.path for key, entry in pinned.snapshot.all.items()
+                                 if key not in stored_ids and key not in historical_ids})
         new_observations.update({entry.plan_id: entry.path for entry in pinned.recovery_definitions
                                  if entry.plan_id not in stored_ids})
         if new_observations:
@@ -1204,7 +1230,7 @@ class CatalogReconciliationService:
             revision_is_current=(
                 lambda: self.catalog.current_revision() == pinned.revision_sha
             ),
-            new_plan_ids=tuple(sorted((set(pinned.snapshot.active)
+            new_plan_ids=tuple(sorted((set(pinned.snapshot.all)
                 | {entry.plan_id for entry in pinned.recovery_definitions}) - stored_ids)),
         )
         if changed is None:
@@ -1542,13 +1568,16 @@ class CatalogRecoveryService:
                 identity is None or identity.status == "MERGED"
             ):
                 try:
-                    proof = self.merge_proof.verify_stored(
-                        entry,
-                        StoredPlanIdentity(
-                            plan_id, original_path, original_hash,
-                            stable_plan_sha, "MERGED", current_hash,
-                        ),
-                    )
+                    if history_proof.kind is MergeProofKind.ARCHIVE_DOCUMENT:
+                        proof = history_proof
+                    else:
+                        proof = self.merge_proof.verify_stored(
+                            entry,
+                            StoredPlanIdentity(
+                                plan_id, original_path, original_hash,
+                                stable_plan_sha, "MERGED", current_hash,
+                            ),
+                        )
                     proof = replace(proof, pr_url=history_proof.pr_url)
                 except Exception as error:
                     diagnostic = self._diagnostic(

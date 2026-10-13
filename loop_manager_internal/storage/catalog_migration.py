@@ -249,8 +249,8 @@ def _migrate_execplan_catalog(
                     code="missing-plan",
                     path=stored[missing_id].path,
                 )
-            if catalog_initialized and unknown_ids:
-                unknown_id = unknown_ids[0]
+            if catalog_initialized and unknown_active_ids:
+                unknown_id = sorted(unknown_active_ids)[0]
                 raise execplan_catalog.ExecPlanCatalogError(
                     "원격 ExecPlan ID를 SQLite 실행 이력과 대응할 수 없습니다: "
                     f"{unknown_id}",
@@ -337,6 +337,17 @@ def _migrate_execplan_catalog(
 
             if not reconcile_history:
                 continue
+            for entry in snapshot.archived.values():
+                if entry.plan_id not in stored:
+                    execplan_catalog_state.insert_document_fallback(
+                        connection, str(project["repo"]), entry,
+                        snapshot.revision_sha or revision,
+                    )
+                    row = connection.execute(
+                        "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                        (project["repo"], entry.plan_id),
+                    ).fetchone()
+                    stored[entry.plan_id] = execplan_catalog_state.publication_identity(row)
             recovery_snapshot = execplan_catalog.ExecPlanCatalogSnapshot(
                 active=snapshot.active,
                 archived={

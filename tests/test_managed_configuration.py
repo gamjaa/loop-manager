@@ -475,7 +475,7 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             "MERGED",
         )
 
-    def test_registration_recovers_confirmed_archived_catalog_identity(self):
+    def test_registration_recovers_archived_catalog_without_pr_observation(self):
         with tempfile.TemporaryDirectory() as directory:
             parent = Path(directory)
             remote = parent / "remote.git"
@@ -507,12 +507,12 @@ Registration recovery fixture.
                 encoding="utf-8",
             )
             self._commit(root, "Add historical plan")
-            publication_sha = git_command(root, "rev-parse", "HEAD")
             self._git(root, "push", "origin", "main")
             archive = plans / "archive"
             archive.mkdir()
             active.rename(archive / active.name)
             self._commit(root, "Archive historical plan")
+            archive_sha = git_command(root, "rev-parse", "HEAD")
             self._git(root, "push", "origin", "main")
             connection = self._connection()
             inspection = loop_manager.ProjectRegistrationInspection(
@@ -523,16 +523,10 @@ Registration recovery fixture.
                 agents_approved=False,
                 origin=str(remote),
             )
-            proof = {
-                "url": "https://pr/1",
-                "state": "MERGED",
-                "mergedAt": "2026-01-01T00:00:00Z",
-            }
-
             with mock.patch(
                 "loop_manager.inspect_project_registration",
                 return_value=inspection,
-            ), mock.patch("loop_manager.pr_for_branch", return_value=proof):
+            ), mock.patch("loop_manager.pr_for_branch", side_effect=AssertionError("unexpected PR lookup")) as lookup:
                 loop_manager.add_registered_project(
                     connection,
                     root,
@@ -551,9 +545,10 @@ Registration recovery fixture.
             ).file_assessment_start_merged_count
             connection.close()
 
-        self.assertEqual(row["path"], "docs/plans/[G-001] Historical.md")
+        lookup.assert_not_called()
+        self.assertEqual(row["path"], "docs/plans/archive/[G-001] Historical.md")
         self.assertEqual(row["status"], "MERGED")
-        self.assertEqual(row["plan_sha"], publication_sha)
+        self.assertEqual(row["plan_sha"], archive_sha)
         self.assertEqual(baseline, 1)
 
     def test_registration_revision_drift_rolls_back_catalog_and_allows_retry(self):
