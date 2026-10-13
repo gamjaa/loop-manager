@@ -61,6 +61,39 @@ def workspace_evidence(snapshot, paths):
     }))
 
 
+def adopted_originals(checkpoint):
+    """Keep every adopted path, including earlier replay positions."""
+    item = (checkpoint.snapshot or {}).get('rebase_documents') or {}
+    originals = {}
+    for record in [*item.get('history', []), item]:
+        if (record.get('state') not in {'prepared', 'staged'}
+                or record.get('target') != checkpoint.target_base_oid
+                or record.get('before_head') != checkpoint.expected_head):
+            continue
+        for path in record['paths']:
+            if not document_path(path):
+                raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN, 'document resolution contains foreign paths')
+            originals[path] = record['originals'][path]['base']
+    return originals
+
+
+def validate_final(*, context, checkpoint, git_bytes):
+    originals = adopted_originals(checkpoint)
+    if not originals:
+        return
+    if git_bytes is None:
+        raise RecoveryFailure(RecoveryReason.STATUS_FAILED, 'document original byte reader unavailable')
+    actual, _ = rebase_file_evidence.capture_originals(context.worktree, tuple(sorted(originals)),
+                                                      {'head': 'HEAD'}, git_bytes)
+    for path, desired in originals.items():
+        content = {key: value for key, value in desired.items() if key != 'oid'}
+        index = {} if desired.get('absent') else {'0': desired}
+        if (actual[path]['head'] != desired or actual[path]['index'] != index
+                or actual[path]['worktree'] != content):
+            raise RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID,
+                                  'replayed document differs from pinned original: ' + path)
+
+
 def _save(checkpoints, identity, context, item):
     current = checkpoints.get(identity.repo, context.plan.plan_id)
     if (current.operation != 'rebase' or current.target_base_oid != item['target']
@@ -122,7 +155,7 @@ def resolve(*, context, identity, checkpoints, git, git_bytes, require_owned,
             })
             raise RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, str(error)) from error
         paths = tuple(sorted(paths))
-        revisions = {'before': current.expected_head, 'base': revision, 'replay': position}
+        revisions = {'before': current.expected_head, 'base': revision, 'replay': position, 'head': 'HEAD'}
         originals, blobs = rebase_file_evidence.capture_originals(context.worktree, paths, revisions, git_bytes)
         before = capture_snapshot(context.worktree)
         # All affected ExecPlan PR boundaries are observed, including PRs not

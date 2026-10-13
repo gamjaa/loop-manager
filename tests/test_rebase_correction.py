@@ -125,6 +125,67 @@ class RebaseCorrectionTests(TestCase):
 
 
 class DocumentConflictPolicyTests(TestCase):
+    def test_clean_replay_after_document_adoption_is_not_accepted(self):
+        from pathlib import Path
+        from loop_manager_internal.execution.execution_rebase_handler import RebaseHandler
+        from loop_manager_internal.git import rebase_documents
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+        path = 'docs/requirements/[R-001] Goal.md'
+        desired = {'mode': '100644', 'oid': 'base-blob', 'blob': 'base-hash'}
+        earlier = {'state': 'staged', 'target': 'base', 'before_head': 'before',
+                   'paths': [path], 'originals': {path: {'base': desired}}}
+        # The final replay position may have adopted a different document.
+        record = {**earlier, 'paths': [], 'originals': {}, 'history': [earlier]}
+        checkpoint = SimpleNamespace(snapshot={'rebase_documents': record},
+                                     target_base_oid='base', expected_head='before')
+        ports = mock.Mock()
+        ports.checkpoint.get.return_value = checkpoint
+        ports._unmerged_stages.return_value = ()
+        ports._rebase_in_progress_for_branch.return_value = False
+        handler = RebaseHandler(ports)
+        handler._advance_document_rebase = mock.Mock(return_value=SimpleNamespace(output='clean replay complete'))
+        context = SimpleNamespace(worktree=Path('/owned'), branch='loop-manager/G-001',
+                                  plan=SimpleNamespace(plan_id='G-001'))
+        actual = {path: {'head': {**desired, 'oid': 'stale-blob'},
+                        'index': {'0': {**desired, 'oid': 'stale-blob'}},
+                        'worktree': {'mode': '100644', 'blob': 'stale-hash'}}}
+        with mock.patch.object(rebase_documents.rebase_file_evidence, 'capture_originals',
+                               return_value=(actual, {})) as capture:
+            with self.assertRaises(RecoveryFailure) as caught:
+                handler._post_rebase_observation(context, 'base', 'initial document conflict')
+        self.assertIs(caught.exception.reason, RecoveryReason.PLAN_INPUT_INVALID)
+        self.assertIn(path, str(caught.exception))
+        self.assertEqual(capture.call_args.args[1], (path,))
+        ports._finish_rebase_journal.assert_not_called()
+        ports.checkpoint.record.assert_not_called()
+        self.assertEqual(checkpoint.snapshot['rebase_documents'], record)
+
+    def test_final_adopted_document_requires_head_index_and_worktree_original(self):
+        from pathlib import Path
+        from loop_manager_internal.git import rebase_documents
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure
+        path = 'docs/requirements/[R-001] Goal.md'
+        desired = {'mode': '100644', 'oid': 'pinned', 'blob': 'digest'}
+        record = {'state': 'staged', 'target': 'base', 'before_head': 'before',
+                  'paths': [path], 'originals': {path: {'base': desired}}}
+        checkpoint = SimpleNamespace(snapshot={'rebase_documents': record},
+                                     target_base_oid='base', expected_head='before')
+        valid = {'head': desired, 'index': {'0': desired},
+                 'worktree': {'mode': '100644', 'blob': 'digest'}}
+        for field in (None, 'head', 'index', 'worktree'):
+            actual = dict(valid)
+            if field:
+                actual[field] = {}
+            with self.subTest(field=field), mock.patch.object(
+                    rebase_documents.rebase_file_evidence, 'capture_originals', return_value=({path: actual}, {})):
+                if field:
+                    with self.assertRaises(RecoveryFailure):
+                        rebase_documents.validate_final(context=SimpleNamespace(worktree=Path('/owned')),
+                                                       checkpoint=checkpoint, git_bytes=mock.Mock())
+                else:
+                    rebase_documents.validate_final(context=SimpleNamespace(worktree=Path('/owned')),
+                                                   checkpoint=checkpoint, git_bytes=mock.Mock())
+
     def test_only_direct_requirement_and_execplan_documents_are_candidates(self):
         from loop_manager_internal.git.rebase_documents import document_path
         for path in ('docs/requirements/[R-001] Goal.md',

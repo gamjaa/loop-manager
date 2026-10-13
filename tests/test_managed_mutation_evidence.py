@@ -1230,7 +1230,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                                  ('160000', 'current-bytes'))
         ports.git.assert_not_called()
 
-    def _user_document_service(self):
+    def _user_document_service(self, document_intent=None):
         from tests.support.runtime import runtime_rebase_fixture
         from loop_manager_internal.git.managed_rebase_runtime import build_service
         connection, _, checkpoints, *_ = runtime_rebase_fixture(self)
@@ -1238,6 +1238,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         checkpoints.record('repo', 'G-047', expected_generation=current.generation,
             operation='rebase', expected_head='before', target_base_oid='base',
             observed_remote_oid='remote', snapshot={**current.snapshot,
+                **({'rebase_documents': document_intent} if document_intent else {}),
                 'work_branch_integration': {'remote': 'remote', 'local_commit': 'local-user'}})
         ports = mock.Mock()
         def git(_root, *args, **kwargs):
@@ -1259,6 +1260,36 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         service = build_service(ports, connection, Path(REPO), Path('/state'),
                                 'repo', 'G-047', Path('/owned'), 'loop-manager/G-047')
         return ports, service
+
+    def test_clean_replay_head_and_staged_document_are_checked_separately(self):
+        from tests.support.rebase_observations import observation
+        path = 'docs/requirements/[R-001] Condition.md'
+        record = {'state': 'staged', 'target': 'base', 'before_head': 'before',
+            'paths': [path], 'workspace': {'head': 'clean-replay'},
+            'originals': {path: {'base': {'absent': True},
+                               'head': {'mode': '100644', 'oid': 'clean-blob'}}}}
+        _, service = self._user_document_service(record)
+        expected = service.expected
+        staged = observation(expected, head='clean-replay',
+            metadata=(('head-name', f'refs/heads/{expected.branch}'),
+                      ('orig-head', 'before'), ('onto', 'base')),
+            committed=(FileChange(path, '100644', '100644', 'old', 'clean-blob', 'M'),),
+            staged=(FileChange(path, '100644', '000000', 'clean-blob', '0' * 40, 'D'),),
+            index=())
+        self.assertTrue(service.adapters.contracts_allowed(staged))
+        # A restarted service reads the same durable intermediate HEAD proof.
+        _, restarted = self._user_document_service(record)
+        self.assertTrue(restarted.adapters.contracts_allowed(staged))
+        self.assertFalse(service.adapters.contracts_allowed(replace(staged, head='foreign-head')))
+        self.assertFalse(service.adapters.contracts_allowed(replace(staged,
+            committed=(replace(staged.committed[0], new_oid='foreign-blob'),))))
+        self.assertFalse(service.adapters.contracts_allowed(replace(staged,
+            staged=(replace(staged.staged[0], new_mode='100644', new_oid='stale'),))))
+        final = replace(staged, metadata=None, staged=(),
+                        committed=(replace(staged.staged[0], old_oid='old'),))
+        self.assertTrue(service.adapters.contracts_allowed(final))
+        self.assertFalse(service.adapters.contracts_allowed(replace(final,
+            committed=(), index=(IndexEntry(path, '100644', 'stale', 0, 'H', 0),))))
 
     def test_owned_user_document_conflicts_allow_preservation_without_final_acceptance(self):
         from tests.support.rebase_observations import observation

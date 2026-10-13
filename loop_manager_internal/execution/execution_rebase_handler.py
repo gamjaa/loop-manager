@@ -576,6 +576,10 @@ class RebaseHandler:
                 )
         if not unmerged and not in_progress:
             if checkpoint is not None:
+                from loop_manager_internal.git.rebase_documents import validate_final
+                validate_final(context=context,
+                    checkpoint=checkpoint.get(self.ports.identity.repo, context.plan.plan_id),
+                    git_bytes=self.ports.git_bytes)
                 self.ports.validate_managed_worktree(
                     self.ports.identity.repo_path, context.worktree, context.branch
                 )
