@@ -88,18 +88,34 @@ def _agent_git_resources(
             return None
         origin = effects.git(worktree, 'remote', 'get-url', 'origin').stdout.strip()
         repository_identity = hashlib.sha256((str(common) + '\0' + origin).encode()).hexdigest()
+        start_phase = agent_scope_decision.invocation_scope_phase(invocation_role)
+        owned_branch = owner['branch'] if role in {'worker', 'reviewer'} else saved.branch
+        digest_branch = (str(owned_branch or '') or None
+                         if role in {'worker', 'reviewer'} else None)
+        if start_phase is None or agent_scope_decision.used_git_resources(
+            role=invocation_role, phase=start_phase, base_branch=str(project['base_branch']),
+            branch=digest_branch, worktree_key=str(_canonical_path(worktree)),
+        ) is None:
+            return None
+        # Use the original saved start, not a Manager-reconciled comparison
+        # baseline or the owner's current phase. Keep the full audit digest.
+        start_digest = agent_scope_decision.invocation_scope_digest(
+            saved, role=invocation_role, phase=start_phase,
+            base_branch=str(project['base_branch']), branch=digest_branch,
+            worktree_key=str(_canonical_path(worktree)),
+            default_worktree=str(_canonical_path(repo_path)),
+        )
         if not agent_invocation_state.InvocationRepository(connection).verified_scope(
             before.scope_id, repo=repo, plan_id=plan_id, role=invocation_role,
             provider=str(project['provider']), session_id=session_id,
             worktree=str(_canonical_path(worktree)), repository_identity=repository_identity,
-            start_digest=before.scope_start_digest,
+            start_digest=start_digest,
         ):
             return None
         phase = str(owner['phase'] if 'phase' in owner.keys() else owner['status'])
         if phase == 'PROJECT_BLOCKED':
             safety = scoped_blocking.project_block(connection, repo)
             phase = str(safety['previous_phase'] or '') if safety is not None else ''
-        owned_branch = owner['branch'] if role in {'worker', 'reviewer'} else saved.branch
         if role == 'reviewer' and phase in {'WORKING', 'IMPLEMENTING'} and plan_id:
             # A base refresh invalidates the candidate stages before the
             # completed read-only Reviewer scope has been retired. Keep its

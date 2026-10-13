@@ -199,11 +199,23 @@ def scoped_metadata(before: GitSnapshot, after: GitSnapshot,
     return project(before), project(after)
 
 
+def invocation_scope_phase(role: str) -> str | None:
+    """Stable invocation stage, independent of later resume/block transitions."""
+    return {
+        'planner': 'PLANNING', 'planner_check': 'PLANNING',
+        'maintenance_planner': 'PLANNING', 'worker': 'IMPLEMENTING',
+        'reviewer': 'REVIEWING',
+    }.get(role)
+
+
 def invocation_scope_digest(snapshot: GitSnapshot, *, role: str, phase: str,
                             base_branch: str, branch: str | None,
                             worktree_key: str,
                             default_worktree: str | None = None) -> str:
     """Fingerprint the current workspace and the Git resources this call uses."""
+    # Captured preflight snapshots have no ledger identity. Saved start
+    # snapshots do; exclude those audit fields from the same content contract.
+    snapshot = replace(snapshot, scope_id=None, scope_start_digest=None)
     resources = used_git_resources(
         role=role, phase=phase, base_branch=base_branch, branch=branch,
         worktree_key=worktree_key,

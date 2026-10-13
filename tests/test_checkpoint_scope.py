@@ -365,7 +365,10 @@ class CheckpointScopeTests(TestCase):
         repository_identity = hashlib.sha256((str(common) + '\0origin').encode()).hexdigest()
         ledger.record_isolation(identity, IsolationEvidence('codex', 'test', 'test', 'worker',
             str(self.worktree), repository_identity, 'b' * 64, 'verified',
-            snapshot_digest='a' * 64, configuration_digest='c' * 64))
+            snapshot_digest=agent_scope_decision.invocation_scope_digest(
+                before, role='worker', phase='IMPLEMENTING', base_branch='main',
+                branch=self.branch, worktree_key=str(self.worktree),
+                default_worktree=str(Path('repo').resolve())), configuration_digest='c' * 64))
         ledger.finish(identity, 'success', 0, 1, 'session', Usage())
         managed = mock.Mock()
         effects = replace(manager._scope_validation_effects(),
