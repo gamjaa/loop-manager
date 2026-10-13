@@ -22,6 +22,9 @@ mode·snapshot·승인 문맥과 역할 권한이 허용하는 범위 안에서�
 
 ## 품질 기준
 
+문서 작성 기준의 원본은 Requirement의 [Specification Skill](../.agents/skills/specification-docs/SKILL.md)과
+ExecPlan의 [PLANS](PLANS.md#execplan-본문-작성)다. 역할별 지침은 권한과 작업 문맥을 보완한다.
+
 - 변경 전에 기존 구현·공유 helper·관련 테스트와 표준 도구를 재사용할 수 있는지 확인하고,
   현재 목표에 필요하지 않은 추상화·설정·파일 추가는 피한다.
 - 현재 목표를 안전하게 수용하는 최소 구조를 만들되 오류 처리·보안·접근성·회귀 검증과

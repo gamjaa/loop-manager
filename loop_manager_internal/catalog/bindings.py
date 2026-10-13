@@ -58,6 +58,7 @@ def register(assembly: Composition) -> None:
             backfill_plan_shas=assembly.callback('backfill_plan_shas'),
             git=assembly.callback('git'),
             migrate_legacy_execplans=assembly.callback('migrate_legacy_execplans'),
+            pr_for_branch=assembly.callback('pr_for_branch'),
         ),
     )
 

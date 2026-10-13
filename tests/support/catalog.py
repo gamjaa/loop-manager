@@ -309,3 +309,20 @@ def catalog_reconciliation_fixture(test):
     fixture.setUp()
     test.addCleanup(fixture.tearDown)
     return fixture
+
+
+QUESTION = """\n## Draft Decision
+
+Question: Which storage policy should this goal use?
+Facts: Both policies preserve the accepted goal.
+Options: A retains history; B retains only the current value.
+Impact: The choice changes the implementation and recovery tests.
+"""
+
+def draft_text(plan_id="G-001", title="Decision"):
+    return plan_text(plan_id, title).replace("risk: low\n", "risk: low\ndraft: true\n") + QUESTION
+
+def accepted_text(text, revision, decision="approve", answer="Use policy A and retain history."):
+    return text.replace("draft: true\n", "") + (
+        f"\n## User Decision\n\nDecision: {decision}\nRevision: {revision}\nAnswer: {answer}\n"
+    )

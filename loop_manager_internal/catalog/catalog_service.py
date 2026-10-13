@@ -398,6 +398,7 @@ class ReconcileExecplanCatalogEffects:
     backfill_plan_shas: Callable[..., object]
     git: Callable[..., object]
     migrate_legacy_execplans: Callable[..., object]
+    pr_for_branch: Callable[..., object] | None = None
 
 
 def reconcile_execplan_catalog(
@@ -437,12 +438,19 @@ def reconcile_execplan_catalog(
         from loop_manager_internal.catalog import remote_deletions
         try:
             pinned = port.load()
+            from loop_manager_internal.catalog import draft_decisions
+            pinned = replace(pinned, draft_changes=draft_decisions.user_changes(
+                connection, repo, repo_path, pinned, git=effects.git, git_bytes=port._effects.git_bytes))
+            port.loaded = pinned
+            pinned = replace(pinned, requirement_deletions=remote_deletions.requirement_deletions(
+                connection, repo, repo_path, pinned, git=effects.git, git_bytes=port._effects.git_bytes))
+            port.loaded = pinned
             references = remote_deletions.reference_issues(
                 connection, repo, repo_path, pinned, git_bytes=port._effects.git_bytes,
             )
             port.loaded = replace(pinned, deletions=remote_deletions.prove_deletions(
                 connection, repo, repo_path, pinned, git=effects.git,
-                git_bytes=port._effects.git_bytes, references=references,
+                git_bytes=port._effects.git_bytes, references=references, pr_for_branch=effects.pr_for_branch,
             ))
             cancelled = {item.snapshot.plan_id for item in port.loaded.deletions}
             cancelled_paths = {item.snapshot.path for item in port.loaded.deletions}

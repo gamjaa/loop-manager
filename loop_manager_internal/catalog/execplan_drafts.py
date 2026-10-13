@@ -50,8 +50,11 @@ def input_digests(root: Path, plan: Mapping[str, object]) -> dict[str, str | Non
 def fields(text: str) -> dict[str, str]:
     """Read explicit fields; duplicate declarations cannot authorize execution."""
     result = {}
-    for match in re.finditer(r"^([A-Za-z]+):[ \t]*(.*)$", text, re.MULTILINE):
-        key, value = match.groups()
+    matches = list(re.finditer(r"^([A-Za-z]+):[ \t]*", text, re.MULTILINE))
+    for index, match in enumerate(matches):
+        key = match.group(1)
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(text)
+        value = text[match.end():end]
         if key in result:
             raise RuntimeError(f"ExecPlan decision field가 중복됐습니다: {key}")
         result[key] = value.strip().strip("`")
