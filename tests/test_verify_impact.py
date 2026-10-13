@@ -441,17 +441,14 @@ class ImpactTests(unittest.TestCase):
             impact.selected_modules(replace(selection, modules=('missing',)), self.modules)
 
     def test_fresh_import_inventory_and_shard_changes_keep_opaque_consumer_fallback(self):
-        # Use the actual consumer/helper bodies: string imports inside child code
-        # cannot be inferred from static implementation references.
+        # Child-code imports stay uncertain in precheck diagnostics. A changed
+        # load_tests consumer still requires the full collection boundary.
         root = Path(__file__).resolve().parents[1]
         helper = 'tests/support/fresh_imports.py'
         shard = 'tests/test_direct.py'
         sources = dict(self.sources)
         sources[helper] = (root / helper).read_bytes()
         sources[shard] = (root / 'tests/test_internal_imports_0.py').read_bytes()
-        def graph(bodies):
-            return code_index.resolve({path: impact.source_facts(path, content)
-                                       for path, content in bodies.items()}, bodies)
         for change in (('A', None, 'pkg/new.py'), ('D', 'pkg/value.py', None),
                        ('R100', 'pkg/value.py', 'pkg/moved.py'), ('M', shard, shard),
                        ('M', helper, helper)):
@@ -466,12 +463,19 @@ class ImpactTests(unittest.TestCase):
                     after[new] = after.pop(old)
                 else:
                     after[new] += b'\n# consumer changed\n'
-                selection = impact.select_records(graph(sources), graph(after), [change],
+                selection = impact.select_records(self.graph(sources), self.graph(after), [change],
                     self.modules, head='head', base='base', configuration={'version': 1})
-                self.assertTrue(any(reason.startswith('uncertain_') and helper in reason
-                                    for reason in selection.fallback))
-                with self.assertRaises(ValueError):
-                    impact.selected_modules(selection, self.modules)
+                for label in ('base', 'head'):
+                    self.assertTrue(selection.analysis['remaining_uncertainties'][label + ':' + helper])
+                expected = ('custom_collection:' + shard,) if old == shard else (
+                    ('no_tests_selected',) if status == 'A' else ())
+                self.assertEqual(selection.fallback, expected)
+                if expected:
+                    with self.assertRaises(ValueError):
+                        impact.selected_modules(selection, self.modules)
+                else:
+                    self.assertEqual([module.name for module in impact.selected_modules(selection, self.modules)],
+                                     list(selection.modules))
 
     def test_new_fresh_import_ids_cannot_reuse_an_old_selection(self):
         selection = self.choose()
