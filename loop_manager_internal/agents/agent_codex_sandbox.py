@@ -102,24 +102,9 @@ def _owned_directory(path: Path) -> None:
         raise RuntimeError('Codex runtime 경로의 소유권·권한을 확인할 수 없습니다.')
 
 
-def _read_only_link(target: Path, link: Path) -> None:
-    if not target.exists():
-        if link.exists() or link.is_symlink():
-            raise RuntimeError('Codex runtime 입력 경로가 변경됐습니다.')
-        return
-    if link.is_symlink():
-        if link.resolve() != target.resolve():
-            raise RuntimeError('Codex runtime 입력 연결이 변경됐습니다.')
-    elif link.exists():
-        raise RuntimeError('Codex runtime 입력이 읽기 전용 연결이 아닙니다.')
-    else:
-        link.symlink_to(target.absolute())
-
-
 def prepare_launch(boundary, state_dir: Path, role: str, read_only: bool,
                    arguments: tuple[str, ...], environment: dict[str, str]) -> CodexLaunch:
-    # Preserve G-088's role/repository session location for existing sessions.
-    # Runtime storage belongs to Codex; it is not a writable root for its tools.
+    # 이전 역할별 홈은 보존하고 runtime은 호출별 임시 저장에만 사용한다.
     base = state_dir.resolve() / 'agent-runtime'
     user_home = Path(environment.get('HOME', environment.get('USERPROFILE', str(Path.home()))))
     source_path = Path(environment.get('CODEX_HOME', str(user_home / '.codex'))).absolute()
@@ -139,20 +124,9 @@ def prepare_launch(boundary, state_dir: Path, role: str, read_only: bool,
     _owned_directory(base)
     runtime = base / identity
     _owned_directory(runtime)
-    # Windows는 전용 원본 홈을 직접 사용해 session 저장 구조를 유지한다.
-    home = source_home if os.name == 'nt' else runtime / 'codex'
-    if os.name != 'nt':
-        _owned_directory(home)
-        config_link = home / 'config.toml'
-        personal_config = user_home / '.codex/config.toml'
-        if (source_home == state_dir.resolve() / 'automation-codex' and config_link.is_symlink()
-                and config_link.resolve() == personal_config.resolve()):
-            config_link.unlink()  # 소유 runtime의 알려진 개인 config 연결만 분리한다.
-        for name in ('auth.json', 'config.toml'):
-            _read_only_link(source_home / name, home / name)
     attempt = Path(tempfile.mkdtemp(prefix='call-', dir=runtime))
     child_environment = dict(environment)
-    child_environment['CODEX_HOME'] = str(home)
+    child_environment['CODEX_HOME'] = str(source_home)
     child_environment['TMPDIR'] = str(attempt)
     if os.name == 'nt':
         child_environment['TEMP'] = child_environment['TMP'] = str(attempt)

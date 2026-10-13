@@ -50,7 +50,7 @@ class NativeWriteIsolationTests(TestCase):
                                              isolation.codex_arguments(False), environment)
             self.assertEqual(environment['CODEX_HOME'], str(home))
             scoped_home = Path(launch.environment['CODEX_HOME'])
-            self.assertTrue((scoped_home / 'auth.json').is_symlink())
+            self.assertEqual(scoped_home, home)
             self.assertEqual((scoped_home / 'auth.json').resolve(), home / 'auth.json')
             policy = json.loads(launch.specification)
             self.assertEqual(set(policy['writable']),
@@ -92,17 +92,14 @@ class NativeWriteIsolationTests(TestCase):
             self.assertNotIn(str(boundary.worktree), json.loads(reviewer.specification)['writable'])
             self.assertIn(str(boundary.worktree), json.loads(reviewer.specification)['protected'])
 
-    def test_runtime_alias_and_replaced_auth_link_are_rejected(self):
+    def test_runtime_alias_is_rejected_without_changing_source_auth(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             boundary, state_root, home = self.boundary(root)
             environment = {'CODEX_HOME': str(home)}
             launch = envelope.prepare_launch(boundary, state_root, 'worker', False, (), environment)
-            auth = Path(launch.environment['CODEX_HOME']) / 'auth.json'
-            auth.unlink()
-            auth.write_text('replaced')
-            with self.assertRaisesRegex(RuntimeError, '읽기 전용 연결'):
-                envelope.prepare_launch(boundary, state_root, 'worker', False, (), environment)
+            self.assertEqual((home / 'auth.json').read_text(), 'private-auth-placeholder')
+            self.assertEqual(launch.environment['CODEX_HOME'], str(home))
             alias = root / 'alias'
             alias.symlink_to(launch.runtime, target_is_directory=True)
             with self.assertRaisesRegex(RuntimeError, '소유권'):

@@ -9,15 +9,15 @@ Git·`gh`와 선택한 Agent CLI를 설치·인증하고 대상 GitHub 저장소
 | 환경 | 실행 조건 |
 |---|---|
 | Windows | PowerShell, Codex 사용 시 Python 3.13 이상과 초기 설정을 마친 elevated sandbox |
-| Linux·macOS | Bash, 역할별 runtime에서 원본 Agent 인증·설정에 연결 |
+| Linux·macOS | Bash, 공급자별 공통 홈과 호출별 임시 폴더 사용 |
 | Codex | CLI 0.159.3 이상, 세 OS의 내장 sandbox 사전 검사 통과 |
 | Claude Code | 설정 예시의 모델을 사용하려면 CLI 2.1.284 이상, 검증된 격리 경계 필요 |
 
-Windows Codex는 상태 루트의 전용 홈을 인증·session 저장소로 직접 사용한다. Windows ACL·Job Object, macOS Seatbelt, Linux 읽기 전용 mount·프로세스 그룹의 경계를 확인할 수 없으면 권한을 완화하지 않고 중단한다. 검증되지 않은 Claude 격리 호출도 거부한다. [Codex 권한 정책](https://developers.openai.com/codex/permissions) · [격리 설계](ARCHITECTURE.md#repository-safety-and-security)
+Codex는 세 OS에서 상태 루트의 공통 홈을 인증·설정·session 저장소로 직접 사용한다. Windows ACL·Job Object, macOS Seatbelt, Linux 읽기 전용 mount·프로세스 그룹의 경계를 확인할 수 없으면 권한을 완화하지 않고 중단한다. 검증되지 않은 Claude 격리 호출도 거부한다. [Codex 권한 정책](https://developers.openai.com/codex/permissions) · [격리 설계](ARCHITECTURE.md#repository-safety-and-security)
 
 ### 전용 공급자 홈과 인증
 
-DB·잠금에 실제 사용하는 `state_dir` 아래의 `automation-codex`·`automation-claude`를 사용한다. 상태 루트는 `--state-dir`, `LOOP_MANAGER_STATE_DIR`, OS 기본 경로 순서로 선택한다. 외부 `CODEX_HOME`·`CLAUDE_CONFIG_DIR`은 원본 홈 선택에 사용하지 않고 기존 허용 인증 환경변수의 전달은 유지한다. 설정 파일은 새로 만들거나 개인 홈에서 가져오지 않는다.
+DB·잠금에 실제 사용하는 `state_dir` 아래의 `automation-codex`·`automation-claude`를 공급자별 공통 홈으로 직접 사용한다. 상태 루트는 `--state-dir`, `LOOP_MANAGER_STATE_DIR`, OS 기본 경로 순서로 선택한다. 외부 `CODEX_HOME`·`CLAUDE_CONFIG_DIR`은 홈 선택에 사용하지 않고 기존 허용 인증 환경변수의 전달은 유지한다. Manager는 설정 파일을 생성하거나 개인 홈에서 가져오지 않는다. CLI가 공통 홈의 설정을 생성·원자적으로 교체하면 다음 호출은 그 홈의 현재 설정을 검사해 사용한다.
 
 | 공급자 | 전용 환경값 | 기본 인증 파일 |
 |---|---|---|
@@ -35,9 +35,9 @@ env CLAUDE_CONFIG_DIR=/path/to/state/automation-claude claude auth login
 env CLAUDE_CONFIG_DIR=/path/to/state/automation-claude claude auth status
 ```
 
-링크를 사용하는 인증 갱신은 기본 인증 파일에도 영향을 줄 수 있다. 로그인·로그아웃은 Manager가 자동 실행하지 않는다. CLI 호출 전후에 링크 공유를 확인하며 링크를 사본으로 교체한 결과는 정상 실행으로 사용하지 않는다. 원본 파일의 같은 경로에서 내용 갱신·원자적 교체는 다음 호출에도 반영한다. [Codex 파일·credential store](https://learn.chatgpt.com/docs/auth#credential-storage)와 [Claude 파일·Keychain](https://code.claude.com/docs/en/authentication#credential-management)은 별개다. 파일이 없는 저장소의 비밀을 추출하지 않으며 Linux·macOS의 Codex 역할별 실행 홈에서 공유할 수 없는 `keyring`·`auto`·`ephemeral` 설정은 거부한다. 필요한 파일 인증은 CLI의 지원 방식으로 준비하고 조직의 저장 정책을 완화하지 않는다.
+링크를 사용하는 인증 갱신은 기본 인증 파일에도 영향을 줄 수 있다. 로그인·로그아웃은 Manager가 자동 실행하지 않는다. CLI 호출 전후에 링크 공유를 확인하며 링크를 사본으로 교체한 결과는 정상 실행으로 사용하지 않는다. 원본 파일의 같은 경로에서 내용 갱신·원자적 교체는 다음 호출에도 반영한다. [Codex 파일·credential store](https://learn.chatgpt.com/docs/auth#credential-storage)와 [Claude 파일·Keychain](https://code.claude.com/docs/en/authentication#credential-management)은 별개다. 파일이 없는 저장소의 비밀을 추출하지 않으며 Linux·macOS Codex의 기본 사용자 저장소와 자동 실행 홈 사이에서 재사용을 확인하지 못한 `keyring`·`auto`·`ephemeral` 설정은 계속 거부한다. 필요한 파일 인증은 CLI의 지원 방식으로 준비하고 조직의 저장 정책을 완화하지 않는다.
 
-Linux·macOS Codex는 기존 역할·worktree별 runtime에서 전용 홈의 인증·설정을 사용한다. 기존 Manager 소유 runtime의 기본 개인 `config.toml` 연결만 분리하고 session·원본 설정은 보존한다. 원본을 확인할 수 없는 다른 연결은 자동 교체하지 않고 진단한다. 전용 홈이 프로젝트·관리 설정을 무효화하지 않으며 기존 확장 기능·권한 검증과 Claude 미지원 격리 거부를 유지한다.
+기존 Codex 역할·worktree별 runtime 홈의 config·auth·session은 삭제·이동·복제하지 않으며 새 호출 입력으로 연결하지 않는다. 이전 session은 저장된 ID로 재개를 시도하고 사용할 수 없으면 기존 작업·실패 문맥을 보존하는 새 session fallback을 따른다. Codex의 호출별 임시 폴더는 기존 runtime 아래에, Claude의 임시 폴더는 기존 worktree별 로그 경로 아래에 따로 생성한다. 공통 홈을 Agent 도구의 쓰기 허용 범위에 추가하지 않으며 역할별 권한과 명시적 실행값을 유지한다. 공통 홈 선택만으로 프로젝트·관리 설정이 무효화되거나 Claude의 사용자 설정 source 전체 제외·격리 지원이 완료됐다고 간주하지 않는다.
 
 기존 상태 루트가 `/home/ubuntu/.local/state/loop-manager`인 cron은 기존 `automation-codex`를 재사용하므로 `env CODEX_HOME=...`을 제거하고 `bash /home/ubuntu/loop-manager/run.sh --skip-if-running`으로 전환할 수 있다. DB의 상태 루트를 고정하는 `LOOP_MANAGER_STATE_DIR` 등 다른 옵션은 유지한다. 실제 crontab은 자동 수정하지 않는다.
 
