@@ -543,6 +543,64 @@ class ArchivedDependencySelectionTest(unittest.TestCase):
 
 
 class CatalogReconciliationTest(CatalogReconciliationFixture, unittest.TestCase):
+    def test_missing_rows_fall_back_to_active_and_archived_dependency_documents(self):
+        pinned = active_snapshot("c" * 40, {
+            "docs/plans/[G-001] Old.md": self._text("G-001", "Old"),
+            "docs/plans/[G-002] Dependency.md": self._text("G-002", "Dependency"),
+            "docs/plans/archive/[G-262] Archived.md": self._text(
+                "G-262", "Archived", depends_on=("G-265",)),
+            "docs/plans/archive/[G-265] Predecessor.md": self._text("G-265", "Predecessor"),
+            "docs/plans/[G-264] Active.md": self._text("G-264", "Active", depends_on=("G-262",)),
+        })
+        existing = dict(self.connection.execute(
+            "SELECT * FROM exec_plans WHERE plan_id = 'G-001'").fetchone())
+        archive = pinned.snapshot.archived["G-262"]
+        history = execplan_catalog_state.CatalogStateRepository(self.connection)
+        history.record(
+            "/repo", archive, original_path=archive.active_path,
+            original_content_hash=archive.content_hash, plan_sha=None,
+            proof=execplan_catalog_state.MergeProof(False), identity_verified=False,
+            diagnostic=execplan_catalog_state.CatalogDiagnostic(
+                archive.plan_id, archive.path, "merge-proof-missing", "missing"),
+        )
+        self.connection.commit()
+
+        result = self._service(pinned).reconcile("/repo")
+        self.assertTrue(result.usable)
+        rows = {row["plan_id"]: row for row in loop_manager.prerequisite_validation_rows(self.connection, "/repo")}
+        self.assertEqual(rows["G-264"]["status"], "READY")
+        for plan_id in ("G-262", "G-265"):
+            self.assertEqual(rows[plan_id]["status"], "MERGED")
+            self.assertEqual(history.historical_row("/repo", plan_id)["proof_kind"], "archive-document")
+            self.assertIsNone(history.historical_row("/repo", plan_id)["diagnostic_code"])
+        after = self.connection.execute("SELECT * FROM exec_plans WHERE plan_id = 'G-001'").fetchone()
+        for field in ("status", "branch", "worktree", "worker_session_id", "retry_count", "publication_sha"):
+            self.assertEqual(after[field], existing[field])
+        port = FakeMergeProof(execplan_catalog_state.MergeProof(False))
+        for _restart in range(2):
+            stored = {row["plan_id"]: execplan_catalog_state.publication_identity(row)
+                      for row in self.connection.execute("SELECT * FROM exec_plans")}
+            recovery = execplan_catalog_state.CatalogRecoveryService(history, port).reconcile(
+                "/repo", pinned.snapshot, stored)
+            self.assertEqual(recovery.diagnostics, ())
+            self.assertEqual(self._service(pinned).reconcile("/repo").changed_plan_ids, ())
+        self.assertEqual(port.calls, [])
+        self.assertEqual(port.local_calls, [])
+
+    def test_archive_fallback_rolls_back_with_catalog_transaction(self):
+        pinned = active_snapshot("c" * 40, {
+            "docs/plans/[G-001] Old.md": self._text("G-001", "Old"),
+            "docs/plans/[G-002] Dependency.md": self._text("G-002", "Dependency"),
+            "docs/plans/archive/[G-003] Archived.md": self._text("G-003", "Archived"),
+        })
+        def interrupt(stage):
+            if stage == "after-plan:G-003":
+                raise RuntimeError("interrupted")
+        with self.assertRaisesRegex(RuntimeError, "interrupted"):
+            self._service(pinned, fault_hook=interrupt).reconcile("/repo")
+        self.assertIsNone(self.connection.execute("SELECT 1 FROM exec_plans WHERE plan_id='G-003'").fetchone())
+        self.assertIsNone(self.connection.execute("SELECT 1 FROM execplan_catalog_history WHERE plan_id='G-003'").fetchone())
+
 
 
     def test_additive_migration_backfills_publication_audit_and_current_revision(self):
@@ -1090,7 +1148,6 @@ class CatalogReconciliationTest(CatalogReconciliationFixture, unittest.TestCase)
         self.connection.commit()
 
         cases = (
-            ({"docs/plans/archive/[G-003] Archive.md": self._text("G-003", "Archive")}, "unknown-plan-id"),
             ({"docs/plans/[G-003] Legacy.md": self._text(
                 "G-003", "Legacy"
             ).replace("priority: normal\n", "")}, "invalid-plan"),
