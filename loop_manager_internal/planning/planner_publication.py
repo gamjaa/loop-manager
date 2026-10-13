@@ -122,7 +122,7 @@ def _planning_result_manifest(effects: PlanningResultManifestEffects, result: Va
             for revision in result.revisions
         ],
         "deletions": [
-            effects.snapshot_to_dict(deletion.snapshot)
+            {**effects.snapshot_to_dict(deletion.snapshot), **({"withdrawal": deletion.judgment} if deletion.judgment else {})}
             for deletion in result.deletions
         ],
         "mutable_snapshot": {
@@ -204,7 +204,7 @@ def _planning_result_from_manifest(effects: PlanningResultFromManifestEffects, m
             for item in payload["revisions"]
         )
         deletions = tuple(
-            PlanDeletion(effects.snapshot_from_dict(item))
+            PlanDeletion(effects.snapshot_from_dict(item), item.get("withdrawal"))
             for item in payload["deletions"]
         )
         publication_hashes = tuple(
@@ -630,7 +630,7 @@ def _apply_general_planning_batch(
         notifications.record_planning_publication(connection, repo, result.plans, plan_commit)
         from loop_manager_internal.catalog.remote_deletions import resolve_recovery
         resolve_recovery(connection, snapshot, plan_commit,
-                         {item.snapshot.plan_id for item in result.revisions})
+                         {item.snapshot.plan_id for item in result.revisions} | {item.snapshot.plan_id for item in result.deletions})
         if effects.is_loop_manager_repository(Path(repo)):
             from loop_manager_internal.documents import document_drafts
             drafts = document_drafts.DocumentDraftRepository(connection)

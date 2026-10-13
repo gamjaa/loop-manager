@@ -98,7 +98,7 @@ def reference_issues(connection, repo, repository, pinned, *, git_bytes):
     return tuple(issues)
 
 
-def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes, references=None):
+def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes, references=None, pr_for_branch=None):
     """Absence alone cannot cancel a row: prove its last adopted bytes/ancestry."""
     from loop_manager_internal.storage.execplan_catalog_state import DefinitionStateRepository
     state = DefinitionStateRepository(connection).capture(repo)
@@ -107,9 +107,21 @@ def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes, ref
         references = reference_issues(connection, repo, repository, pinned, git_bytes=git_bytes)
     deletions = []
     rows = connection.execute("SELECT * FROM exec_plans WHERE repo=?", (repo,)).fetchall()
+    manual = {str(row[0]) for row in connection.execute("SELECT plan_id FROM manual_work_members WHERE repo=?", (repo,))}
     for row in rows:
         key = str(row["plan_id"])
-        if key in pinned.snapshot.observed_ids or key in reserved or mutable_row(connection, repo, key) is None:
+        completed = any(row[field] is not None for field in ("worker_result", "verify_result", "review_result", "agent_result_snapshot"))
+        started = bool(row["ever_started"] and completed and key not in manual and revisable_row(row) and row["agent_role"] is None)
+        if started and row["branch"]:
+            if pr_for_branch is None:
+                continue
+            try:
+                if pr_for_branch(repository, str(row["branch"])) is not None:
+                    continue
+            except RuntimeError:
+                continue  # 실제 PR 부재를 확인하지 못한 작업만 보류한다.
+        if (key in pinned.snapshot.observed_ids or key in reserved and not started
+                or not started and mutable_row(connection, repo, key) is None):
             continue
         revision = str(row["current_revision_sha"] or row["plan_sha"] or "")
         if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", revision):
@@ -142,18 +154,53 @@ def prove_deletions(connection, repo, repository, pinned, *, git, git_bytes, ref
             str(row["content_hash"]), revision, text,
             current_complexity=row["current_complexity"], current_risk=row["current_risk"],
             current_metadata_recorded=True,
+            execution_state=json.dumps({key: row[key] for key in row.keys() if key != "path"}, ensure_ascii=False, sort_keys=True) if started else None,
         )
         affected = {issue.plan_id for issue in references if issue.source == path}
         evidence = json.dumps({"text": text, "row": dict(row), "affected": sorted(affected),
-                               "resolved": {}}, ensure_ascii=False, sort_keys=True)
+                               "resolved": {}, "cleanup_pending": bool(row["branch"] or row["worktree"]),
+                               "cleanup_reason": "취소한 소유 자원의 작업물·PR·writer 안전 재확인 필요"},
+                              ensure_ascii=False, sort_keys=True)
         deletions.append(RemoteDeletion(original, evidence))
     return tuple(deletions)
+
+
+def requirement_deletions(connection, repo, repository, pinned, *, git, git_bytes):
+    """이전 source 원문과 현재 실제 부재를 원격 revision에 결합한다."""
+    result = {}
+    rows = connection.execute("SELECT * FROM exec_plans WHERE repo=?", (repo,)).fetchall()
+    if not any(source.startswith("docs/requirements/") for row in rows for source in json.loads(row["sources"])):
+        return result
+    from loop_manager_internal.catalog import requirement_sources
+    from loop_manager_internal.git.command_adapter import revision_requirement_documents
+    documents = revision_requirement_documents(git_bytes, repository, pinned.revision_sha)
+    for row in rows:
+        revision = str(row["current_revision_sha"] or row["plan_sha"] or "")
+        if not re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", revision):
+            continue
+        for source in json.loads(row["sources"]):
+            if not source.startswith("docs/requirements/") or source.count("/") != 2:
+                continue
+            resolution = requirement_sources.resolve_requirement_source(source, documents, allow_archive=True)
+            if resolution.status is not requirement_sources.ResolutionStatus.MISSING:
+                continue
+            ancestry = git(repository, "merge-base", "--is-ancestor", revision, pinned.revision_sha, check=False)
+            if ancestry.returncode != 0:
+                continue
+            original = git(repository, "show", f"{revision}:{source}", check=False)
+            if original.returncode:
+                continue
+            proof = result.setdefault(source, {"text": original.stdout, "revision": revision,
+                "deletion_revision": pinned.revision_sha, "row": dict(row), "affected": []})
+            proof["affected"].append(str(row["plan_id"]))
+    return result
 
 
 def recovery_definitions(connection, repo, repository, pinned, *, git_bytes):
     """Adopt affected READY and new declarations under a hold for Planner repair."""
     affected = {key for raw in recovery_goals(connection, repo) for key in json.loads(raw)["affected_ids"]}
     affected.update(key for item in pinned.deletions for key in json.loads(item.evidence)["affected"])
+    affected.update(key for proof in (pinned.requirement_deletions or {}).values() for key in proof["affected"])
     affected.update(issue.plan_id for issue in pinned.snapshot.issues if issue.code == "missing-plan-reference")
     paths = {key: path for key, path, _hash in pinned.snapshot.withheld}
     paths.update({key: entry.path for key, entry in pinned.snapshot.all.items()})
@@ -208,6 +255,17 @@ def recovery_goals(connection, repo):
         return tuple(goals)
     holds = {str(row["plan_id"]): json.loads(row["evidence"]) for row in connection.execute(
         "SELECT plan_id, evidence FROM execplan_catalog_holds WHERE repo=?", (repo,))}
+    sources = {}
+    for held in holds.values():
+        sources.update(held.get("deleted_sources", {}))
+    for source, proof in sorted(sources.items()):
+        affected = sorted((set(proof["affected"]) - set(proof.get("resolved", {}))) & observed_ids & held_ids)
+        if affected:
+            evidence = json.dumps({"text": proof["text"], "row": proof["row"],
+                "affected": affected, "resolved": {}}, ensure_ascii=False, sort_keys=True)
+            goals.append(json.dumps({"id": "requirement:" + source, "path": source, "kind": "missing-source",
+                "deletion_revision": proof["deletion_revision"], "evidence": evidence,
+                "affected_ids": affected}, ensure_ascii=False, sort_keys=True))
     for row in rows:
         key, path = str(row["plan_id"]), str(row["path"])
         held = holds.get(key, {})
@@ -255,8 +313,80 @@ def recoverable_ids(connection, repo, held):
     return frozenset(allowed & affected & set(held))
 
 
-def validate_recovery(worktree, snapshot, current_plans, catalog_metadata):
+def requirement_judgments(connection, repo):
+    if connection is None or repo is None:
+        return {}
+    row = connection.execute("SELECT planning_result FROM projects WHERE repo=?", (repo,)).fetchone()
+    lines = [line.partition(":")[2] for line in str(row[0] or "").splitlines()
+             if line.startswith("REQUIREMENT_RECOVERY:")] if row else []
+    if not lines:
+        return {}
+    try:
+        if len(lines) != 1:
+            raise ValueError("중복 결과")
+        values = json.loads(lines[0])
+        if not isinstance(values, list):
+            raise ValueError("결과 배열 필요")
+        result = {}
+        for item in values:
+            if (not isinstance(item, dict) or set(item) != {"id", "source", "outcome", "reason"}
+                    or item["outcome"] not in {"withdrawn", "retained", "uncertain"}
+                    or not isinstance(item["reason"], str) or not item["reason"].strip()
+                    or not isinstance(item["id"], str) or not isinstance(item["source"], str)
+                    or (item["id"], item["source"]) in result):
+                raise ValueError("잘못된 철회 판단")
+            result[item["id"], item["source"]] = item
+        return result
+    except (ValueError, TypeError, KeyError) as error:
+        raise PlannerValidationError("Requirement 삭제 판단 결과가 유효하지 않습니다.") from error
+
+
+def prepare_withdrawals(connection, repo, worktree, snapshot):
+    """시작한 작업의 직접 삭제 대신 안전한 Manager 문서 전환을 준비한다."""
+    decisions = requirement_judgments(connection, repo)
+    prepared = {}
+    for raw in snapshot.recovery_goals:
+        goal = json.loads(raw)
+        if goal.get("kind") != "missing-source":
+            continue
+        for key in set(goal["affected_ids"]) & snapshot.by_id.keys():
+            decision = decisions.get((key, goal["path"]))
+            if not decision or decision["outcome"] != "withdrawn":
+                continue
+            original = snapshot.by_id[key]
+            if original.execution_state:
+                from loop_manager_internal.planning.planner_validation import planning_execution_state
+                row = connection.execute("SELECT * FROM exec_plans WHERE repo=? AND plan_id=?", (repo, key)).fetchone()
+                if row is None or planning_execution_state(row) != original.execution_state or row["agent_role"]:
+                    raise PlannerValidationError("작업 철회 전에 실행 소유권·writer가 변경됐습니다.")
+                if connection.execute("SELECT 1 FROM manual_work_members WHERE repo=? AND plan_id=?", (repo, key)).fetchone():
+                    raise PlannerValidationError("수동 작업 소유권이 있는 계획을 철회할 수 없습니다.")
+            prepared[key] = {"decision": decision, "goal": goal}
+            if original.execution_state and json.loads(original.execution_state).get("ever_started"):
+                path = worktree / original.path
+                held = connection.execute("SELECT evidence FROM execplan_catalog_holds WHERE repo=? AND plan_id=?", (repo, key)).fetchone()
+                evidence = json.loads(held[0]) if held else {}
+                receipt = evidence.get("prepared_withdrawal")
+                if receipt and receipt.get("decision") == decision and receipt.get("goal") == goal and not path.exists():
+                    prepared[key] = receipt
+                    continue
+                if not path.is_file() or path.is_symlink() or not held:
+                    raise PlannerValidationError("시작한 작업은 Planner가 직접 삭제할 수 없습니다.")
+                prepared[key]["preserved_text"] = path.read_text(encoding="utf-8")
+                evidence["prepared_withdrawal"] = prepared[key]
+                from loop_manager_internal.storage.runtime_state import _transaction
+                with _transaction(connection):
+                    changed = connection.execute("UPDATE execplan_catalog_holds SET evidence=? WHERE repo=? AND plan_id=? AND evidence=?",
+                        (json.dumps(evidence, ensure_ascii=False, sort_keys=True), repo, key, held[0]))
+                    if changed.rowcount != 1:
+                        raise PlannerValidationError("작업 철회 보존 근거가 변경됐습니다.")
+                path.unlink()
+    return prepared
+
+
+def validate_recovery(worktree, snapshot, current_plans, catalog_metadata, *, connection=None, repo=None):
     """Require a Planner judgment and retained goal gates, never infer meaning."""
+    judgments = requirement_judgments(connection, repo)
     for raw in snapshot.recovery_goals:
         goal = json.loads(raw)
         for key in set(goal["affected_ids"]) & snapshot.by_id.keys():
@@ -264,6 +394,16 @@ def validate_recovery(worktree, snapshot, current_plans, catalog_metadata):
             if (not changed and snapshot.by_id[key].path not in current_plans
                     and (worktree / snapshot.by_id[key].path).exists()):
                 continue  # Uncertain goals remain held while independent work is published.
+            if goal.get("kind") == "missing-source":
+                decision = judgments.get((key, goal["path"]))
+                if not decision or decision["outcome"] == "uncertain":
+                    raise PlannerValidationError("Requirement 삭제의 목표 철회·유지 판단이 필요합니다.")
+                if decision["outcome"] == "withdrawn":
+                    if changed or (worktree / snapshot.by_id[key].path).exists():
+                        raise PlannerValidationError("전체 철회된 작업의 활성 문서를 보존할 수 없습니다.")
+                elif len(changed) != 1 or goal["path"] in changed[0][1]["sources"]:
+                    raise PlannerValidationError("유지하는 작업에 유효한 현행 source·남은 목표가 필요합니다.")
+                continue
             if len(changed) != 1:
                 raise PlannerValidationError(f"삭제 목표 복구에는 영향 계획의 명시적 개정이 필요합니다: {key}")
             path, plan = changed[0]
@@ -304,6 +444,15 @@ def resolve_recovery(connection, snapshot, commit, revised_ids):
     for raw in snapshot.recovery_goals:
         goal = json.loads(raw)
         targets = set(goal["affected_ids"]) & snapshot.by_id.keys() & revised_ids
+        if goal.get("kind") == "missing-source":
+            for row in connection.execute("SELECT plan_id, evidence FROM execplan_catalog_holds WHERE repo=?", (snapshot.repo,)).fetchall():
+                held = json.loads(row["evidence"])
+                proof = held.get("deleted_sources", {}).get(goal["path"])
+                if proof is not None:
+                    proof.setdefault("resolved", {}).update({key: commit for key in targets})
+                    connection.execute("UPDATE execplan_catalog_holds SET evidence=? WHERE repo=? AND plan_id=?",
+                        (json.dumps(held, ensure_ascii=False, sort_keys=True), snapshot.repo, row["plan_id"]))
+            continue  # 시작한 작업의 resume_status는 다음 catalog 재검증까지 보존한다.
         if goal.get("kind") == "missing-plan":
             if not targets:
                 continue

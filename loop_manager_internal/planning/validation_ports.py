@@ -93,6 +93,22 @@ class _PlanningValidationPorts:
                     prompt += document_publication.planning_instruction(candidate)
                     return prompt  # This call is reserved for the approved document draft.
         prompt += self._verify_request_prompt(mutable_snapshot.repo, mutable_snapshot.active_sha)
+        from loop_manager_internal.storage import execplan_draft_state
+        decisions = [dict(id=plan.plan_id, **execplan_draft_state.prompt_evidence(
+            self._connection, mutable_snapshot.repo, plan.plan_id))
+            for plan in mutable_snapshot.plans
+            if plan.plan_id in execplan_draft_state.pending_ids(self._connection, mutable_snapshot.repo)]
+        if decisions:
+            import json
+            prompt += "\n\nManager의 draft 질문·사용자 원격 변경 근거:\n" + json.dumps(decisions, ensure_ascii=False)
+            prompt += ("\n본문 변경 또는 User Decision의 질문 해소를 판단할 때 한 줄 DRAFT_DECISION_RESULT: JSON 배열을 반환하라. "
+                       "각 객체는 id, revision(위 판단 지문), resolved(질문별 question·answer·source·quote), "
+                       "remaining(남은 Question/Facts/Options/Impact 본문 또는 빈 문자열)을 가진다. "
+                       "question은 기존 질문의 정확한 문장, quote는 verified 사용자 변경 after에 있고 before에는 없는 원문이다. "
+                       "answer는 제품 동작·설계 선택으로 해당 계획 본문에 통합하라. "
+                       "승인 표시나 답변 존재만으로 해소하지 말고 질문별 의미와 충분성을 확인하라. "
+                       "일부 해소는 남은 질문을 보존하고 불확실하면 outcome: uncertain으로 반환하라. "
+                       "draft·User Decision을 직접 제거하지 마라. 검증·정리·대기 전환은 Manager가 수행한다.")
         return prompt
 
     def _verify_request_prompt(self, repo: str, active_sha: str) -> str:

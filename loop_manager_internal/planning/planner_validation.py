@@ -925,6 +925,13 @@ def validate_planner_result(
     recovery boundary and never consume the Planner validation retry budget.
     """
     recovered_paths = _recover_interrupted_plan_id_normalization(worktree)
+    resolutions = {}
+    withdrawals = {}
+    if connection is not None and repo is not None and mutable_snapshot is not None:
+        from loop_manager_internal.catalog import draft_decisions
+        resolutions = draft_decisions.prepare(connection, repo, worktree, mutable_snapshot)
+        from loop_manager_internal.catalog import remote_deletions
+        withdrawals = remote_deletions.prepare_withdrawals(connection, repo, worktree, mutable_snapshot)
     # A resumed batch can still have Manager moves in the index/worktree.
     # Saved dirty paths are hints, not proof that a receipted move exists.
     observed = (set(effects.changed_files(worktree, active_sha))
@@ -1016,6 +1023,8 @@ def validate_planner_result(
             except RuntimeError as error:
                 raise PlannerValidationError(str(error)) from error
         current_plans[changed_path] = parsed
+        if parsed["id"] in resolutions:
+            parsed["_draft_resolution"] = resolutions[parsed["id"]]
         plan_paths.append(changed_path)
 
     try:
@@ -1024,6 +1033,7 @@ def validate_planner_result(
                     if connection is not None and repo is not None else frozenset())
         from loop_manager_internal.catalog import remote_deletions
         changed_ids = {str(plan["id"]) for plan in current_plans.values()}
+        changed_ids.update(snapshot.by_path[path].plan_id for path in base_paths if path not in current_plans)
         recovery_ids = {key for raw in snapshot.recovery_goals for key in json.loads(raw)["affected_ids"]} & snapshot.by_id.keys() & changed_ids
         unresolved_holds = held_ids - recovery_ids
         plans: list[tuple[str, dict[str, object]]] = []
@@ -1046,7 +1056,8 @@ def validate_planner_result(
             path_identity = snapshot.by_path.get(path)
             if path_identity is not None and plan_id == path_identity.plan_id:
                 try:
-                    execplan_drafts.validate_agent_change(parsed, path_identity.text)
+                    if plan_id not in resolutions:
+                        execplan_drafts.validate_agent_change(parsed, path_identity.text)
                 except RuntimeError as error:
                     raise PlannerValidationError(str(error)) from error
                 revisions.append(PlanRevision(path, parsed, path_identity))
@@ -1132,16 +1143,16 @@ def validate_planner_result(
             execplan_drafts.validate_questions(catalog)
         project_catalog_refresh.assert_planning_dependencies_unheld(
             catalog, current_plans.items(), unresolved_holds)
-        remote_deletions.validate_recovery(worktree, snapshot, current_plans, catalog)
+        remote_deletions.validate_recovery(worktree, snapshot, current_plans, catalog, connection=connection, repo=repo)
 
         for path in sorted(displaced_paths):
             original = snapshot.by_path[path]
-            if original.execution_state and json.loads(original.execution_state)["ever_started"]:
+            if original.execution_state and json.loads(original.execution_state)["ever_started"] and original.plan_id not in withdrawals:
                 raise RuntimeError("시작한 계획의 ID와 작업 경로를 보존해야 합니다.")
             if original.plan_id not in renamed_ids:
-                if execplan_catalog.parse_frontmatter(original.text).get("draft") == "true":
+                if execplan_catalog.parse_frontmatter(original.text).get("draft") == "true" and original.plan_id not in withdrawals:
                     raise RuntimeError("사용자 판단 대기 draft를 삭제할 수 없습니다.")
-                deletions.append(PlanDeletion(original))
+                deletions.append(PlanDeletion(original, withdrawals.get(original.plan_id)))
 
         if connection is not None and repo is not None and deletions:
             deleted_ids = {item.snapshot.plan_id for item in deletions}

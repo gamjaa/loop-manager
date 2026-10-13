@@ -436,9 +436,10 @@ class CatalogBatchesTest(AutomationCatalogFixture, unittest.TestCase):
                 execplan_catalog.plan_content_hash(approved_text), "c" * 40,
                 inputs=execplan_drafts.input_digests(repo, approved_plan),
             )
-            self.assertFalse(
+            self.assertTrue(
                 execplan_draft_state.evidence(connection, str(repo), "G-010")["pending"]
             )
+            self.assertFalse(execplan_draft_state.evidence(connection, str(repo), "G-010")["decision_ready"])
 
     def test_unknown_dependency_cannot_be_captured_by_reallocated_plan_id(self):
         with tempfile.TemporaryDirectory() as directory:

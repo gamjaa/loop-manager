@@ -86,6 +86,7 @@ class PlanDeletion:
     """One snapshot-bound READY plan removed by a general Planner batch."""
 
     snapshot: ReadyPlanSnapshot
+    judgment: dict | None = None
 
 
 def unstarted_snapshot(snapshot: MutableReadySnapshot) -> MutableReadySnapshot:
