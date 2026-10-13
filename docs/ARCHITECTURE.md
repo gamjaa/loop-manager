@@ -611,6 +611,12 @@ Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내�
 
 `verification/impact.py`는 Git base/HEAD의 전체 tracked Python AST를 `maintenance/code_index.py`로 분석하며 두 그래프의 역방향 closure를 실제 manifest 모듈로 정규화한다. 동적/미해결 참조를 제외할 수 없는 경우 전역 불확실성을 fallback으로 유지한다. 구체적인 지원·선정 규칙과 진단은 [VERIFY.md](VERIFY.md#영향-기반-부분-실행)를 따른다.
 
+R-086의 후속 선정 개선 목표는 현재의 모든 비Python 변경·전역 uncertainty 일괄 거부와 공통 진입점의 import 연결에 따른 과대 선정을 줄이는 것이다. 검토 전용 문서로 확인한 입력은 테스트 선정 대상과 구분하되 전체 diff·definition에서 제외하지 않는다. verify 입력 목록 밖이라는 사실만으로 비영향을 증명하거나 G-241의 전체 성공 재사용을 적용하지 않는다. 공유 코드맵의 원본 불확실성은 보존하고 부분 선택기가 확인한 binding·literal/유한한 module 집합·소비 경계에 결합한 해소 또는 비영향 근거를 별도로 구분한다. 대상이 불명인 import·module registry·프로세스 실행·parse 실패는 그래프 밖의 소비자도 숨길 수 있으므로 도달 관계가 없다는 이유만으로 제외하지 않는다.
+
+공통 진입점의 재노출은 기존 import·별칭·심벌·attribute 사용 사실로 원래 구현 소유 모듈을 확인할 수 있는 경우에만 실제 사용 관계를 정밀화한다. import 자체의 초기화·부작용 의존성은 별도로 보존하며 확인하지 못한 재노출·동적 접근은 기존 넓은 관계로 남긴다. 실행 단위는 전체 manifest의 모듈이고 함수·라인별 선택이나 범용 호출 그래프 분석을 도입하지 않는다. API·support 소비자를 확인하면 관련 모듈을 확대하고, 핵심 검증·권한·게시·복구 경계 및 확인할 수 없는 의존성은 fallback한다. 분류·선정 규칙과 해소 근거는 candidate/base·분석/설정 identity에 결합해 변경 뒤 이전 선택·승인을 사용하지 않는다. 이 내용은 후속 구현 목표이며 현재 runner가 지원한다는 뜻이 아니다.
+
+후속 구현은 검토 전용 문서의 혼합 diff 분류, 정적으로 해소 가능한 불확실성과 범위 불명의 분리, 공통 진입점의 확인 가능한 재노출 관계 정밀화 순으로 검증한다. 현재 모듈·테스트 수 각각 50% 미만 조건은 우선 유지하고, 선정 개선 이후 실제 부분/전체 시간·선택 규모·fallback 사유를 확인해 비용 기준의 조정을 판단한다. 안전성 부족과 큰 실행 비용의 사유를 구분하며 G-250의 배정/시간 순서나 G-183의 최종 승인 재사용을 재구현하지 않는다.
+
 `runner.py`의 부분 모드는 전체 discovery를 유지한 뒤 선택 모듈만 기존 unittest adapter/core에 전달한다. 미선택 결과는 NOT_SELECTED이고 후속 command는 전체 실행에서만 수행한다. manifest identity·후보 안정성·fixture 소유자·필수 결과를 검사하며 interpreter·guard·예약·timeout/자식 종료 경계는 기존 Manager adapter를 사용한다.
 
 `preliminary_reviews`는 전체 `verify_receipts`와 독립된 같은 작업 주기의 상태·후보/입력 identity·부분 결과·일반 선행 결과를 저장한다. generation CAS와 전체 verify cycle 변경으로 오래된 쓰기를 거부한다. Worker 교정의 `partial_head`는 `verified_head`를 만들지 않고 기존 교정 감사에 검증 종류를 보존한다. 부분 실행 중단은 미완료 상태로 남고 전체 경로로 재개한다. 일반 선행 PASS 뒤에는 실제 전체 run을 강제하며 실패 시 이전 승인을 무효화한다.
