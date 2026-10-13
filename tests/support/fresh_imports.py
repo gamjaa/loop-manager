@@ -39,7 +39,7 @@ class ImportTarget:
     module: str
 
     @property
-    def test_name(self):
+    def method_name(self):
         # Dots remain visible and distinguish paths containing double underscores.
         return f"test_{self.kind}__{self.module}"
 
@@ -64,7 +64,7 @@ def validate_partition(targets, shards):
     expected, actual = Counter(targets), Counter(target for shard in shards for target in shard)
     if any(count != 1 for count in expected.values()) or actual != expected:
         raise ValueError('fresh import inventory/partition missing, duplicate or unknown target')
-    if len({target.test_name for target in targets}) != len(targets):
+    if len({target.method_name for target in targets}) != len(targets):
         raise ValueError('fresh import test identity collision')
 
 
@@ -95,12 +95,12 @@ def check_import(case, target, root=ROOT):
 def suite(loader, owner, shard):
     if not 0 <= shard < SHARD_COUNT:
         raise ValueError('invalid fresh import shard')
-    def test_method(target):
-        def test(case):
+    def method_for(target):
+        def run_case(case):
             check_import(case, target)
-        return test
+        return run_case
     # A local class owns each shard's fixtures. Rebuild inventory on every load,
     # so the existing manifest loader rejects additions/deletions after discovery.
-    methods = {target.test_name: test_method(target) for target in partition(inventory())[shard]}
+    methods = {target.method_name: method_for(target) for target in partition(inventory())[shard]}
     klass = type('FreshImportTests', (unittest.TestCase,), {'__module__': owner, **methods})
     return loader.loadTestsFromTestCase(klass)

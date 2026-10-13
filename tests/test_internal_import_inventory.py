@@ -45,10 +45,10 @@ class FreshImportInventoryTests(unittest.TestCase):
         extended = fresh_imports.partition((*targets, new))
         for old, current in zip(shards, extended):
             self.assertEqual(old, tuple(target for target in current if target != new))
-        names = {target.test_name for target in targets}
+        names = {target.method_name for target in targets}
         self.assertEqual(len(names), len(targets))
-        self.assertNotEqual(fresh_imports.ImportTarget('module', 'a.b').test_name,
-                            fresh_imports.ImportTarget('module', 'a__b').test_name)
+        self.assertNotEqual(fresh_imports.ImportTarget('module', 'a.b').method_name,
+                            fresh_imports.ImportTarget('module', 'a__b').method_name)
 
     def test_partition_rejects_missing_duplicate_and_unknown_targets(self):
         a, b = (fresh_imports.ImportTarget('module', name) for name in ('a', 'b'))
