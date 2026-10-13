@@ -374,6 +374,7 @@ class ProjectService:
                 allow_agents_mismatch=False,
                 provider=self.state.provider,
                 config_path=self.identity.config_path,
+                state_dir=self.identity.state_dir,
                 registration_checks=False,
                 expected_origin=(str(self.state.row["origin"]) if self.state.row["origin"] else None),
                 origin_result=validated_origins,
@@ -398,6 +399,7 @@ class ProjectService:
                 allow_agents_mismatch=self.identity.allow_agents_mismatch,
                 provider=self.state.provider,
                 config_path=self.identity.config_path,
+                state_dir=self.identity.state_dir,
                 origin_result=validated_origins,
             )
             self.state.current_origin = validated_origins[0] if validated_origins else None

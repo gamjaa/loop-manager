@@ -112,7 +112,7 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
                     entered.set()
                     self.assertTrue(release.wait(timeout=2))
                     if phase == "agent":
-                        return {}
+                        return loop_manager.agent_environment(*_args, **_kwargs)
                     return gate.popen(*_args, **_kwargs)
 
                 def run_one() -> None:

@@ -511,7 +511,7 @@ class UsageTests(TestCase):
             attempt = root / "attempt"
             attempt.mkdir()
             launch = provider_adapters.agent_write_isolation.CodexLaunch(
-                (), (), {}, root, attempt, "{}",
+                (), (), {'CODEX_HOME': str(root / 'automation-codex')}, root, attempt, "{}",
             )
             effects = provider_adapters.ProviderEffects(
                 mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock(),

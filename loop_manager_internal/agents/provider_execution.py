@@ -62,7 +62,7 @@ def observe(connection, *, repo: str, plan_id: str | None, worktree: Path,
         checked = []
         launch = agent_write_isolation.prepare_isolation(provider, 'reviewer', worktree, state_dir,
             True, checked.append, snapshot_digest, config_path=config_path, expected_repository=repo,
-            environment_variables=agent_profiles.agent_environment(provider, 'reviewer'))
+            environment_variables=agent_profiles.agent_environment(provider, 'reviewer', state_dir=state_dir))
         with agent_profiles.prepared_environment(provider, launch.environment):
             if validate_runtime is None:
                 return None

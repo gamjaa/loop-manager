@@ -442,12 +442,14 @@ class ValidateProviderRuntimeEffects:
     _agent_profiles_effects: Callable[..., object]
 
 
-def validate_provider_runtime(effects: ValidateProviderRuntimeEffects, config_path: Path, provider: str, worktree: Path | None=None) -> None:
+def validate_provider_runtime(effects: ValidateProviderRuntimeEffects, config_path: Path, provider: str, worktree: Path | None=None,
+                              *, state_dir: Path | None = None) -> None:
     return agent_profiles.validate_provider_runtime(
         config_path,
         provider,
         worktree,
         effects=effects._agent_profiles_effects(),
+        state_dir=state_dir,
     )
 
 

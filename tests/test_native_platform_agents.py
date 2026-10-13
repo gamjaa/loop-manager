@@ -81,7 +81,8 @@ class NativePlatformAgentTests(unittest.TestCase):
                 for session in (None, 'saved-session'):
                     for failure in (None, RuntimeError('probe denied')):
                         records = []
-                        launch = mock.Mock(arguments=('policy',), probe_arguments=('probe',))
+                        launch = mock.Mock(arguments=('policy',), probe_arguments=('probe',),
+                                           environment={'CODEX_HOME': str(home)})
                         launch.probe.side_effect = failure
                         with self.subTest(system=system, session=session, failure=failure), \
                              mock.patch.object(isolation.platform, 'system', return_value=system), \
@@ -275,7 +276,8 @@ class NativePlatformAgentTests(unittest.TestCase):
             root = Path(directory)
             attempt = root / 'attempt'
             attempt.mkdir()
-            launch = envelope.CodexLaunch((), (), dict(os.environ, PYTHONIOENCODING='utf-8'), root, attempt, '{}')
+            launch = envelope.CodexLaunch((), (), dict(os.environ, PYTHONIOENCODING='utf-8',
+                CODEX_HOME=str(root / 'automation-codex')), root, attempt, '{}')
             def prepare(*args, **kwargs):
                 args[5](SimpleNamespace(status='verified'))
                 return launch

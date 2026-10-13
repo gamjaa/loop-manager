@@ -13,6 +13,7 @@ from typing import Protocol
 
 from loop_manager_internal.agents.agent_invocation import AgentRequest, AgentResult, AgentResultKind, ResolvedProfile, Usage
 from loop_manager_internal.agents.agent_profiles import agent_environment, prepared_environment
+from loop_manager_internal.agents.provider_home import prepare_authentication, authentication_links, assert_authentication_links
 from loop_manager_internal.agents.agent_provider_usage import claude_usage, codex_log_usage
 from loop_manager_internal.agents import agent_write_isolation
 from loop_manager_internal.agents import provider_guidance
@@ -183,7 +184,7 @@ def run_codex(
 ) -> tuple[int, str] | CodexResult:
     codex_launch = prepared_launch
     launch_environment = (dict(prepared_launch.environment) if prepared_launch is not None
-                          else agent_environment("codex", role_name))
+                          else agent_environment("codex", role_name, state_dir=state_dir))
     if on_isolation_checked is not None:
         checked: list[agent_write_isolation.IsolationEvidence] = []
 
@@ -212,6 +213,9 @@ def run_codex(
             expected_repository, read_only, isolation_snapshot_digest,
             environment_variables=launch_environment,
         )
+    if codex_launch is None:
+        prepare_authentication('codex', launch_environment)
+    auth_links = authentication_links('codex', launch_environment)
     with prepared_environment("codex", launch_environment):
         if isolation_evidence is not None and effects.validate_runtime is not None:
             effects.validate_runtime(config_path, 'codex', worktree)
@@ -244,6 +248,7 @@ def run_codex(
         context_arguments=("-m", model, "-c", f'model_reasoning_effort="{effort}"',
                           *fast_arguments, *guidance_context),
     ) if common_guidance else [])
+    assert_authentication_links('codex', launch_environment, auth_links)
     if codex_launch is not None and isolation_evidence is not None:
         agent_write_isolation.assert_current(isolation_evidence, worktree, state_dir, config_path,
             expected_repository, read_only, isolation_snapshot_digest, environment_variables=launch_environment)
@@ -401,6 +406,7 @@ def run_codex(
                 **process_callbacks,
             )
         returncode = result.returncode
+    assert_authentication_links('codex', launch_environment, auth_links)
     try:
         message = (reviewer_message if role_name == "reviewer" else
                    provider_last_message.read_text(encoding="utf-8")
@@ -489,7 +495,9 @@ def run_claude(
     common_guidance: CommonGuidance | None = None,
     effects: ProviderEffects,
 ) -> tuple[int, str] | AgentResult:
-    launch_environment = agent_environment("claude", role_name)
+    launch_environment = agent_environment("claude", role_name, state_dir=state_dir)
+    prepare_authentication('claude', launch_environment)
+    auth_links = authentication_links('claude', launch_environment)
     with prepared_environment('claude', launch_environment):
         profile = resolved_profile or effects._agent_profile(
             config_path, "claude", role_name, level, worktree
@@ -498,6 +506,7 @@ def run_claude(
     fast_mode = provider_fast_mode(config_path, "claude")
     fast_mode_log = json.dumps({"type": "loop_manager.fast_mode", "requested": fast_mode}) + "\n"
     additional = provider_guidance.claude_arguments(common_guidance, environment=launch_environment) if common_guidance else []
+    assert_authentication_links('claude', launch_environment, auth_links)
     if on_isolation_checked is not None:
         agent_write_isolation.prepare_isolation(
             "claude", role_name, worktree, state_dir, read_only,
@@ -700,6 +709,7 @@ def run_claude(
         if not message and returncode:
             message = raw_output[-6000:]
 
+    assert_authentication_links('claude', launch_environment, auth_links)
     if timeout_triggered.is_set():
         message = f"Claude {role_name} 실행 timeout ({AGENT_CLI_TIMEOUT_SECONDS}초)"
     if role_name == "reviewer":
@@ -796,7 +806,7 @@ class CodexAgentAdapter:
     def prepare_environment(self, request: AgentRequest):
         return agent_write_isolation.prepare_execution_environment('codex', request.role_name,
             request.worktree, request.state_dir, request.read_only, request.expected_repository,
-            agent_environment('codex', request.role_name))
+            agent_environment('codex', request.role_name, state_dir=request.state_dir))
 
     def run(self, request: AgentRequest) -> tuple[int, str] | AgentResult:
         return self._run(
