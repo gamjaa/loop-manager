@@ -36,12 +36,16 @@ class TimingAndManifestTests(unittest.TestCase):
             summary = {"metadata": {"revision": "first", "cap": 1, "python": "fake", "git": "fake",
                        "bytecode_policy": {"write_enabled": True, "cache_tag": "cpython-312",
                                            "cache_prefix": None, "optimization": 0},
+                       "execution_context": {"python": "/project/python", "stages": ["unittest", "compile"],
+                           "parallelism": 1, "coordinated": True, "instrumentation": 1,
+                           "temporary_directory": "/tmp", "pythonpath": None},
                        "environment": {"host": "same", "platform": "fake", "limits": {
                            "cpus": 4, "affinity_cpus": 4, "applied_quota": None, "source": "fake"}}},
                        "phases": [{"name": "verify", "duration": 20}], "result": {"passed": True},
                        "active": [], "counts": {"success": 1}}
             other = json.loads(json.dumps(summary))
             other["metadata"].update(revision="second", cap="auto")
+            other["metadata"]["execution_context"]["parallelism"] = "auto"
             other["phases"][0]["duration"] = 10
             report = comparison([root, root], [summary, other])
             self.assertTrue(report["comparable"])
@@ -49,6 +53,9 @@ class TimingAndManifestTests(unittest.TestCase):
             other["metadata"]["environment"]["limits"]["cpus"] = 2
             self.assertFalse(comparison([root, root], [summary, other])["comparable"])
             other["metadata"]["environment"]["limits"]["cpus"] = 4
+            other["metadata"]["execution_context"]["pythonpath"] = "/different"
+            self.assertFalse(comparison([root, root], [summary, other])["comparable"])
+            other["metadata"]["execution_context"]["pythonpath"] = None
             other["active"] = [{"id": "unfinished"}]
             self.assertFalse(comparison([root, root], [summary, other])["comparable"])
             other["active"] = []

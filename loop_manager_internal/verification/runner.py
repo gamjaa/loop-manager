@@ -62,7 +62,8 @@ def execution_queue(modules, directory, metadata, manifest, stage_id):
         current = {"metadata": metadata, "phases": [], "counts": {}, "active": [], "result": None}
         compared = comparison([directory, history.parent], [current, previous],
             manifests=[scope(manifest, stage_index), scope(prior_manifest, prior_index)])
-        if (not compared["scope_matches"] or not compared["observed_environment_matches"]
+        if (metadata.get("execution_context") != previous["metadata"].get("execution_context")
+                or not compared["scope_matches"] or not compared["observed_environment_matches"]
                 or previous["active"] or previous["result"]["passed"] is not True):
             return original
         uncertain = history.parent / "uncertain-reservations.json"

@@ -312,10 +312,13 @@ def comparison(directories, summaries, *, manifests=None):
         metadata = summary["metadata"]
         environment = metadata.get("environment", {})
         limits = environment.get("limits", {})
+        execution_context = metadata.get("execution_context")
+        if isinstance(execution_context, dict):
+            execution_context = {key: value for key, value in execution_context.items()
+                                 if key != "parallelism"}
         contexts.append((metadata.get("python"), metadata.get("git"), environment.get("host"),
                          environment.get("platform"), limits.get("cpus"), limits.get("affinity_cpus"),
-                         limits.get("applied_quota"), limits.get("source"),
-                         metadata.get("execution_context")))
+                         limits.get("applied_quota"), limits.get("source"), execution_context))
         bytecode_policies.append(metadata.get("bytecode_policy"))
         def duration(name):
             return next((event["duration"] for event in summary["phases"] if event["name"] == name), None)
