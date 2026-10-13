@@ -24,6 +24,7 @@ from loop_manager_internal.maintenance import maintenance_file_inventory
 from loop_manager_internal.storage import maintenance_file_ledger
 from loop_manager_internal.maintenance import maintenance_file_publication
 from loop_manager_internal.storage import maintenance_state
+from tests.support.maintenance import request_maintenance
 
 
 class MaintenanceObservationFailureTests(unittest.TestCase):
@@ -355,6 +356,7 @@ class DocumentDraftTest(unittest.TestCase):
             (str(self.repo),),
         )
         self.state = maintenance_state.MaintenanceRepository(self.database)
+        request_maintenance(self.database, str(self.repo))
         cycle, _ = self.state.begin_assessment_if_due(
             str(self.repo), 5, self.source_sha, self_repository=True,
         )
@@ -674,6 +676,7 @@ class GeneratedDraftCommandTest(unittest.TestCase):
             (self.repo,),
         )
         state = maintenance_state.MaintenanceRepository(self.database)
+        request_maintenance(self.database, self.repo)
         cycle, _ = state.begin_assessment_if_due(self.repo, 5, "a" * 40,
                                                   self_repository=True)
         report = {
@@ -766,6 +769,7 @@ class GeneratedDraftStorageTest(unittest.TestCase):
             "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')", (repo,),
         )
         state = maintenance_state.MaintenanceRepository(database)
+        request_maintenance(database, repo)
         cycle, _ = state.begin_assessment_if_due(repo, 5, "a" * 40,
                                                  self_repository=True)
         original = b"# Original\n"
@@ -859,6 +863,72 @@ class MaintenanceTransactionTest(unittest.TestCase):
 
 
 class MaintenanceStateRepositoryTest(unittest.TestCase):
+    def test_first_run_counts_new_merges_without_fabricating_success_after_restart(self):
+        connection = self._connection()
+        self.addCleanup(connection.close)
+        repository = maintenance_state.MaintenanceRepository(connection)
+        source = "a" * 40
+        for number in range(1, 26):
+            self._insert_plan(connection, "one", f"G-{number:03d}", "MERGED")
+        connection.execute(
+            "INSERT INTO execplan_catalog_revisions "
+            "(repo, revision_sha, catalog_fingerprint) VALUES ('one', ?, 'catalog')",
+            (source,),
+        )
+        self.assertFalse(repository.file_assessment_due("one", 20).required)
+        initialized = repository.initialize_file_assessment_start(
+            "one", source_sha=source, expected_merged_count=25,
+        )
+        self.assertEqual(initialized.file_assessment_start_merged_count, 25)
+        self.assertFalse(repository.begin_assessment_if_due("one", 20, source)[1])
+        connection.commit()
+        with closing(sqlite3.connect(":memory:")) as restarted:
+            connection.backup(restarted)
+            restarted.row_factory = sqlite3.Row
+            repository = maintenance_state.MaintenanceRepository(restarted)
+            for number in range(26, 45):
+                self._insert_plan(restarted, "one", f"G-{number:03d}", "MERGED")
+            self.assertEqual(repository.initialize_file_assessment_start(
+                "one", source_sha="b" * 40, expected_merged_count=44,
+            ), initialized)
+            due = repository.file_assessment_due("one", 20, completion_candidate=True)
+            self.assertFalse(due.required)
+            self.assertEqual(due.merged_since_baseline, 19)
+            self.assertIsNone(initialized.last_success_commit)
+            self.assertIsNone(initialized.last_cycle_merged_count)
+            self.assertIsNone(initialized.full_assessment_result)
+            self.assertFalse(initialized.full_assessment_completed)
+            self._insert_plan(restarted, "one", "G-045", "MERGED")
+            self.assertEqual(repository.file_assessment_due("one", 20).reason, "interval_reached")
+            self.assertFalse(repository.file_assessment_due("two", 20, self_repository=True).required)
+            request_maintenance(restarted, "two")
+            cycle, created = repository.begin_assessment_if_due("two", 20, source, self_repository=True)
+            self.assertTrue(created)
+            self.assertEqual(cycle.cycle_request_id, "test-request")
+            self.assertFalse(repository.begin_assessment_if_due("two", 20, source)[1])
+
+    def test_first_run_baseline_initialization_rolls_back_and_retries(self):
+        connection = self._connection()
+        self.addCleanup(connection.close)
+        repository = maintenance_state.MaintenanceRepository(connection)
+        source = "a" * 40
+        connection.execute(
+            "INSERT INTO execplan_catalog_revisions "
+            "(repo, revision_sha, catalog_fingerprint) VALUES ('one', ?, 'catalog')",
+            (source,),
+        )
+        connection.commit()
+        with self.assertRaisesRegex(RuntimeError, "interrupted"):
+            with maintenance_state._transaction(connection):
+                repository.initialize_file_assessment_start(
+                    "one", source_sha=source, expected_merged_count=0,
+                )
+                raise RuntimeError("interrupted")
+        self.assertIsNone(repository.get("one").file_assessment_start_merged_count)
+        self.assertEqual(repository.initialize_file_assessment_start(
+            "one", source_sha=source, expected_merged_count=0,
+        ).file_assessment_start_merged_count, 0)
+
     def test_completion_boundary_migration_rolls_back_columns_and_can_resume(self):
         connection = self._connection()
         maintenance_state.ensure_schema(connection)
@@ -923,7 +993,8 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
         connection = self._connection()
         repository = maintenance_state.MaintenanceRepository(connection)
         self.assertEqual(repository.due("one", 5, self_repository=True).reason,
-                         "initial_full")
+                         "baseline_pending")
+        request_maintenance(connection, "one")
         cycle, created = repository.begin_assessment_if_due(
             "one", 5, "a" * 40, self_repository=True)
         self.assertTrue(created)
@@ -939,7 +1010,7 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
         )
         self.assertTrue(completed.full_assessment_completed)
         self.assertFalse(repository.due("one", 5, self_repository=True).required)
-        self.assertEqual(repository.due("two", 5).reason, "initial_full")
+        self.assertEqual(repository.due("two", 5).reason, "baseline_pending")
         connection.execute(
             "INSERT INTO execplan_catalog_revisions "
             "(repo, revision_sha, catalog_fingerprint) VALUES ('one', ?, 'catalog')",
@@ -961,6 +1032,7 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
     def test_full_assessment_source_drift_discards_unpublished_result(self):
         connection = self._connection()
         repository = maintenance_state.MaintenanceRepository(connection)
+        request_maintenance(connection, "one")
         cycle, _ = repository.begin_assessment_if_due(
             "one", 5, "a" * 40, self_repository=True)
         saved = repository.record_full_assessment(
@@ -978,6 +1050,7 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
         connection = self._connection()
         self._insert_plan(connection, "one", "G-100", "READY")
         repository = maintenance_state.MaintenanceRepository(connection)
+        request_maintenance(connection, "one")
         cycle, _ = repository.begin_assessment_if_due(
             "one", 5, "a" * 40, self_repository=True)
         repository.record_full_assessment(
@@ -1039,8 +1112,8 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
         self._insert_plan(connection, "two", "G-001", "READY")
         repository = maintenance_state.MaintenanceRepository(connection)
 
-        self.assertEqual(repository.due("one", 5).reason, "initial_full")
-        self.assertEqual(repository.due("two", 5).reason, "initial_full")
+        self.assertEqual(repository.due("one", 5).reason, "baseline_pending")
+        self.assertEqual(repository.due("two", 5).reason, "baseline_pending")
         cycle = self._start_legacy_assessment(connection, "one", "a" * 40)
         self.assertEqual(cycle.phase, maintenance_state.MaintenancePhase.ASSESSMENT)
         self.assertEqual(cycle.cycle_start_merged_count, 1)
@@ -1064,7 +1137,7 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
         self.assertFalse(repository.due("one", 2).required)
         self._insert_plan(connection, "one", "G-004", "MERGED")
         self.assertTrue(repository.due("one", 2).required)
-        self.assertEqual(repository.due("two", 2).reason, "initial_full")
+        self.assertEqual(repository.due("two", 2).reason, "baseline_pending")
 
     def test_file_assessment_start_waits_for_legacy_cycle_and_is_idempotent(self):
         connection = self._connection()
@@ -1117,7 +1190,8 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
         self.addCleanup(connection.close)
         repository = maintenance_state.MaintenanceRepository(connection)
         source = "a" * 40
-        self.assertEqual(repository.file_assessment_due("one", 20).reason, "initial_full")
+        self.assertEqual(repository.file_assessment_due("one", 20).reason, "baseline_pending")
+        request_maintenance(connection, "one")
         cycle, created = repository.begin_assessment_if_due("one", 20, source)
         self.assertTrue(created)
         repository.advance_success_baseline("one", expected_phase=cycle.phase,
@@ -1135,6 +1209,7 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
         self.addCleanup(connection.close)
         repository = maintenance_state.MaintenanceRepository(connection)
         source = "a" * 40
+        request_maintenance(connection, "one")
         cycle, _ = repository.begin_assessment_if_due("one", 20, source)
         repository.advance_success_baseline("one", expected_phase=cycle.phase,
             expected_revision=cycle.revision, remote_commit=source)

@@ -31,14 +31,16 @@ from tests.support.catalog import plan_text
 
 
 from tests.support.maintenance_cycle_case import MaintenanceCycleCase
+from tests.support.maintenance import request_maintenance
 
 @isolated_git_test
 class MaintenanceCycleTest(MaintenanceCycleCase):
     def test_first_and_interval_due_are_project_scoped(self):
         connection = self._connection()
         repository = maintenance_state.MaintenanceRepository(connection)
-        self.assertTrue(repository.due("/one", 2).required)
-        self.assertTrue(repository.due("/two", 2).required)
+        self.assertFalse(repository.due("/one", 2).required)
+        self.assertFalse(repository.due("/two", 2).required)
+        request_maintenance(connection, "/one")
 
         cycle, created = repository.begin_assessment_if_due(
             "/one", 2, "a" * 40, self_repository=True,
@@ -55,7 +57,7 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
         self.assertFalse(repository.due("/one", 2).required)
         self._insert_plan(connection, "/one", "G-002", status="MERGED")
         self.assertTrue(repository.due("/one", 2).required)
-        self.assertTrue(repository.due("/two", 2).required)
+        self.assertFalse(repository.due("/two", 2).required)
 
     def test_empty_file_selection_finishes_without_assessment_agent(self):
         source = "a" * 40
@@ -1149,6 +1151,7 @@ class SinglePassMaintenanceCycleTest(MaintenanceCycleCase):
         return loop_manager._advance_maintenance_cycle_after_merges(self.connection, "/one", self.latest)
 
     def start(self, phase, ids):
+        request_maintenance(self.connection, "/one")
         cycle, _ = self.repository.begin_assessment_if_due("/one", 20, self.source)
         arguments = {"prerequisite_plan_ids" if phase is maintenance_state.MaintenancePhase.PREREQUISITE_WAIT
                      else "refactoring_plan_ids": ids}
@@ -1209,6 +1212,7 @@ class SinglePassMaintenanceCycleTest(MaintenanceCycleCase):
 
     def test_existing_finding_plan_waits_for_required_merges(self):
         self._insert_plan(self.connection, "/one", "G-001", status="PR_OPEN")
+        request_maintenance(self.connection, "/one")
         cycle, _ = self.repository.begin_assessment_if_due("/one", 20, self.source)
         self.repository.record_assessment_plans("/one", cycle.revision, ("G-001",))
         executing = self.repository.advance_success_baseline("/one", expected_phase=cycle.phase,
@@ -1231,7 +1235,7 @@ class SinglePassMaintenanceCycleTest(MaintenanceCycleCase):
         self.assertFalse(self.repository.file_assessment_due("/one", 20, completion_candidate=True).required)
         self._insert_plan(self.connection, "/one", "G-021", status="MERGED")
         self.assertTrue(self.repository.file_assessment_due("/one", 20).required)
-        self.connection.execute("INSERT INTO tiered_maintenance_requests VALUES ('/one', 'request-1')")
+        request_maintenance(self.connection, "/one", "request-1")
         cycle, started = self.repository.begin_assessment_if_due("/one", 20, self.latest)
         self.assertTrue(started)
         self.assertEqual(cycle.cycle_request_id, "request-1")
@@ -1315,6 +1319,7 @@ class SinglePassMaintenanceCycleTest(MaintenanceCycleCase):
         )
         from loop_manager_internal.application.contracts import ValidatedPlanningResult
         self._insert_plan(self.connection, "/one", "G-001")
+        request_maintenance(self.connection, "/one")
         cycle, _ = self.repository.begin_assessment_if_due("/one", 20, self.source)
         self.repository.record_assessment_plans("/one", cycle.revision, (), ("G-001",))
         context = MaintenancePlanningContext("/one", MaintenancePlanMode.BARRIER, self.source, cycle.revision, "assessment", ())

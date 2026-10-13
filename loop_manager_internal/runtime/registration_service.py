@@ -350,10 +350,4 @@ def add_registered_project(
                 (project.repo, source_sha,
                  execplan_catalog_state._catalog_fingerprint(snapshot)),
             )
-            repository = maintenance_state.MaintenanceRepository(connection)
-            repository.initialize_file_assessment_start(
-                project.repo,
-                source_sha=source_sha,
-                expected_merged_count=repository.merged_count(project.repo),
-            )
     return project

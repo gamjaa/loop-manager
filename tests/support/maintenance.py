@@ -4,6 +4,16 @@ from types import SimpleNamespace
 from loop_manager_internal.maintenance import maintenance_file_inventory
 from loop_manager_internal.maintenance import maintenance_file_review as review
 from loop_manager_internal.maintenance import compact_file_review as compact
+from loop_manager_internal.maintenance import tiered_review
+
+
+def request_maintenance(connection, repo, request_id="test-request"):
+    tiered_review.ensure_schema(connection)
+    connection.execute(
+        "INSERT INTO tiered_maintenance_requests VALUES (?, ?) "
+        "ON CONFLICT(repo) DO UPDATE SET request_id = excluded.request_id",
+        (repo, request_id),
+    )
 
 
 def inventory(contents, revision="revision"):

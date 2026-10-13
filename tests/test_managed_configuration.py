@@ -549,7 +549,7 @@ Registration recovery fixture.
         self.assertEqual(row["path"], "docs/plans/archive/[G-001] Historical.md")
         self.assertEqual(row["status"], "MERGED")
         self.assertEqual(row["plan_sha"], archive_sha)
-        self.assertEqual(baseline, 1)
+        self.assertIsNone(baseline)
 
     def test_registration_revision_drift_rolls_back_catalog_and_allows_retry(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -653,10 +653,10 @@ Registration rollback fixture.
                     (str(root),),
                 ).fetchone()[0], "READY",
             )
-            self.assertEqual(
+            self.assertIsNone(
                 maintenance_state.MaintenanceRepository(connection).get(
                     str(root)
-                ).file_assessment_start_merged_count, 0,
+                ).file_assessment_start_merged_count,
             )
             connection.close()
 

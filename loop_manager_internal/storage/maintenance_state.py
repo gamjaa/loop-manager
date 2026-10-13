@@ -205,7 +205,7 @@ def calculate_review_due(
     if phase is not MaintenancePhase.IDLE:
         return ReviewDue(False, "active_cycle", 0, phase)
     if last_success_merged_count is None:
-        return ReviewDue(True, "no_successful_assessment", 0, phase)
+        return ReviewDue(False, "baseline_pending", 0, phase)
     if last_success_merged_count < 0 or current_merged_count < last_success_merged_count:
         raise MaintenanceStateError("MERGED ExecPlan 감사 기준값이 현재 이력보다 큽니다.")
     merged_since_baseline = current_merged_count - last_success_merged_count
@@ -591,7 +591,8 @@ class MaintenanceRepository:
         baseline = state.last_cycle_merged_count
         if baseline is None and state.last_success_commit:
             baseline = state.last_success_merged_count
-        due = calculate_review_due(baseline, self._merged_count(repo), interval, state.phase)
+        merged_count = self._merged_count(repo)
+        due = calculate_review_due(baseline, merged_count, interval, state.phase)
         if state.phase is not MaintenancePhase.IDLE:
             return due
         request = self.pending_request(repo)
@@ -606,7 +607,9 @@ class MaintenanceRepository:
             if self.connection.execute("SELECT 1 FROM sqlite_master WHERE name = 'tiered_maintenance_success'").fetchone():
                 if self.connection.execute("SELECT 1 FROM tiered_maintenance_success WHERE repo = ?", (repo,)).fetchone():
                     raise MaintenanceStateError("평가 근거는 있으나 유지보수 종료 경계를 확인할 수 없습니다.")
-            return ReviewDue(True, "initial_full", 0, state.phase)
+            return calculate_review_due(
+                state.file_assessment_start_merged_count, merged_count, interval, state.phase,
+            )
         return due
 
     def pending_request(self, repo: str) -> str | None:

@@ -9,6 +9,7 @@ import loop_manager
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.storage import planning_input_state
 from tests.support.worker import dummy_worker_sessions
+from tests.support.planning_case import confirm_final_review
 
 
 REPO = str(Path("/repo").resolve())
@@ -138,6 +139,11 @@ class PersistedMergeProjectQueryTest(unittest.TestCase):
             "specification_fingerprint = 'spec', processed_sha = ?", ("a" * 40,),
         )
         planning_input_state.record_general(self.connection, REPO, "a" * 40, {})
+        maintenance = loop_manager.maintenance_state.MaintenanceRepository(self.connection)
+        maintenance.initialize_file_assessment_start(
+            REPO, source_sha="a" * 40, expected_merged_count=1,
+        )
+        confirm_final_review(self.connection, REPO, "a" * 40, "stable", "spec")
         self.connection.commit()
 
     @dummy_worker_sessions
