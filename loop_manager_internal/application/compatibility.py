@@ -35,3 +35,15 @@ def bind_effects(implementation: Callable[..., R], effects: Callable[[], object]
                             if name != injected_name}
     call.__module__ = "loop_manager"
     return call
+
+
+def install_exports(module_name: str, root) -> None:
+    """Keep legacy imports and late patches at the entry-point boundary only."""
+    import sys
+    from loop_manager_internal.application.composition import create_application
+
+    namespace = vars(sys.modules[module_name])
+    application = create_application(
+        root, override_lookup=lambda name, default: namespace.get(name, default),
+    )
+    namespace.update(application.exports)
