@@ -132,6 +132,8 @@ def resolve(*, context, identity, checkpoints, git, git_bytes, require_owned,
         if git(identity.repo_path, 'merge-base', '--is-ancestor', current.target_base_oid, revision, check=False).returncode:
             raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, 'document base is not a successor of the owned target')
         effects = catalog_service.RevisionExecplanSnapshotEffects(git=git, git_bytes=git_bytes)
+        history = [*(item or {}).get('history', []),
+                   *([{key: value for key, value in item.items() if key != 'history'}] if item else [])]
         try:
             catalog = catalog_service.revision_execplan_snapshot(effects, identity.repo_path, revision)
             requirements = revision_requirement_documents(git_bytes, identity.repo_path, revision)
@@ -152,6 +154,7 @@ def resolve(*, context, identity, checkpoints, git, git_bytes, require_owned,
                 'state': 'uncertain', 'position': position, 'revision': revision,
                 'target': current.target_base_oid, 'before_head': current.expected_head,
                 'reason': str(error), 'paths': sorted(path for path in conflicts if document_path(path)),
+                'history': history,
             })
             raise RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, str(error)) from error
         paths = tuple(sorted(paths))
@@ -176,8 +179,7 @@ def resolve(*, context, identity, checkpoints, git, git_bytes, require_owned,
             'target': current.target_base_oid, 'before_head': current.expected_head,
             'paths': list(paths), 'originals': originals,
             'blobs': {digest: base64.b64encode(content).decode('ascii') for digest, content in blobs.items()},
-            'prs': prs, 'workspace': workspace_evidence(before, paths), 'history': [*((current.snapshot or {}).get('rebase_documents', {}).get('history', [])),
-                *([{key: value for key, value in item.items() if key != "history"}] if item else [])]}
+            'prs': prs, 'workspace': workspace_evidence(before, paths), 'history': history}
         _save(checkpoints, identity, context, item)
     if item['state'] == 'uncertain':
         raise RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, item['reason'])

@@ -55,6 +55,8 @@ Manager 소유 rebase에서 Requirement·ExecPlan 충돌을 관측한 최신 원
 
 - [x] 2026-10-13 rebase 후 후보 `08eee968b6d793577d21c7124e66e54fe250c547`의 Manager verify 피드백을 단일 `test_fresh_import_inventory_and_shard_changes_keep_opaque_consumer_fallback` case로 재현했다. 수집 입력 불확실성 fallback을 누락한 기대값과 제거된 로컬 `graph` 참조를 현재 선택기 계약·공통 `self.graph`에 맞췄다. 양쪽 revision의 진단, fallback 결과 재사용 거부와 일반 본문 변경·무관한 helper의 비전환 assertion을 유지했다. 동일 명령 재실행은 1 test OK다. 전체 verify·Review는 Worker가 실행하지 않았으며 Manager 재검증이 남아 있다.
 
+- [x] 2026-10-13 후보 `457fe9a3f7590934f6bcdc649fdcf3cda8d558f2`의 후속 uncertain 기록에서 이전 채택 이력이 유실되는 Review issue를 교정했다. 정상 준비와 오류 기록이 같은 이력 보존 구문을 사용한다. 실제 SQLite checkpoint에서 A 채택 → B catalog 오류 → 원격 교정 후 B 적용을 검사하는 단일 unit 회귀는 최초 history 누락 오류를 재현한 뒤 동일 명령으로 1 test OK였다. A의 교체 전 bytes·적용 근거와 기존 실패 기록이 남고 최종 검사가 A와 B를 모두 포함함을 확인했다. Git·catalog 관측은 mock이며 전체 verify·Review는 Worker가 실행하지 않았다. 수정 후보의 Manager 재검증이 남아 있다.
+
 ## Decision Log
 
 - 직접 반영된 `5e440444`는 rebase 중 구현 입력 변경의 즉시 최종 차단을 제거하고 최신 revision/source를 Worker에 전달한다. Requirement·ExecPlan 충돌을 base로 자동 처리하는 경로는 없으므로 그 남은 작업만 계획한다. G-242의 판단 형식·PR 경합, G-245의 Planner 종료 갱신과 G-189의 전수 감사는 각 기존 책임으로 유지한다.

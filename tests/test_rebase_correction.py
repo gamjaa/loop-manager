@@ -262,6 +262,83 @@ class DocumentConflictPolicyTests(TestCase):
                 ports['capture_snapshot'].assert_not_called()
                 self.assertFalse(any('update-index' in call.args for call in ports['git'].call_args_list))
 
+    def test_later_uncertainty_preserves_adoption_bytes_through_resume_and_final_check(self):
+        import base64
+        import hashlib
+        import tempfile
+        from pathlib import Path
+        from tests.support.runtime import runtime_rebase_fixture
+        from loop_manager_internal.git import rebase_documents
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure
+        _, _, checkpoints, *_ = runtime_rebase_fixture(self)
+        path_a = 'docs/requirements/[R-001] A.md'
+        path_b = 'docs/requirements/[R-002] B.md'
+        content = b'# [R-002] B\n\nPinned condition.\n'
+        digest = hashlib.sha256(content).hexdigest()
+        desired = {'mode': '100644', 'oid': 'pinned-b', 'blob': digest}
+        adopted = {'state': 'staged', 'position': 'earlier-replay', 'revision': 'new-base',
+                   'target': 'owned-target', 'before_head': 'before', 'paths': [path_a],
+                   'originals': {path_a: {'base': {'absent': True},
+                                          'before': {'mode': '100644', 'oid': 'old-a', 'blob': 'old-a-hash'}}},
+                   'blobs': {'old-a-hash': base64.b64encode(b'Original A bytes').decode()},
+                   'history': []}
+        current = checkpoints.get('repo', 'G-047')
+        checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+            operation='rebase', expected_head='before', target_base_oid='owned-target',
+            observed_remote_oid='lease', snapshot={'rebase_documents': adopted, 'failure': 'prior failure'})
+        ports = self.resolution_ports()
+        ports['checkpoints'] = checkpoints
+        ports['context'].plan.plan_id = 'G-047'
+        revision = ['new-base']
+        def git(_root, *args, **kwargs):
+            output = ('100644 old-b 2\t' + path_b + '\0' if args[:2] == ('ls-files', '-u') else
+                      'replay' if 'REBASE_HEAD' in args else revision[0])
+            return SimpleNamespace(stdout=output, returncode=0)
+        ports['git'].side_effect = git
+        with mock.patch.object(rebase_documents.catalog_service, 'revision_execplan_snapshot',
+                               side_effect=RuntimeError('catalog unavailable')):
+            with self.assertRaises(RecoveryFailure):
+                rebase_documents.resolve(**ports)
+        uncertain = checkpoints.get('repo', 'G-047')
+        saved = uncertain.snapshot['rebase_documents']
+        self.assertEqual(saved['state'], 'uncertain')
+        preserved_adoption = {key: value for key, value in adopted.items() if key != 'history'}
+        self.assertEqual(saved['history'], [preserved_adoption])
+        self.assertEqual(rebase_documents.adopted_originals(uncertain), {path_a: {'absent': True}})
+        # Unchanged remote input retries neither catalog nor document mutation.
+        with mock.patch.object(rebase_documents.catalog_service, 'revision_execplan_snapshot') as catalog_read:
+            with self.assertRaises(RecoveryFailure):
+                rebase_documents.resolve(**ports)
+            catalog_read.assert_not_called()
+        self.assertEqual(checkpoints.get('repo', 'G-047'), uncertain)
+        revision[0] = 'corrected-base'
+        catalog = SimpleNamespace(all={}, active={'G-047': ports['context'].plan})
+        snapshot = SimpleNamespace(head='intermediate', branch=None, index={}, dirty={}, operations={})
+        ports['capture_snapshot'].return_value = snapshot
+        original_b = {'base': desired, 'worktree': {'absent': True}, 'index': {}}
+        applied_b = {'worktree': {'mode': '100644', 'blob': digest}, 'index': {'0': desired}}
+        with tempfile.TemporaryDirectory() as directory:
+            ports['context'].worktree = Path(directory)
+            with mock.patch.object(rebase_documents.catalog_service, 'revision_execplan_snapshot', return_value=catalog), \
+                 mock.patch.object(rebase_documents, 'revision_requirement_documents', return_value={path_b: content}), \
+                 mock.patch.object(rebase_documents.rebase_file_evidence, 'capture_originals', side_effect=[
+                     ({path_b: original_b}, {digest: content}), ({path_b: original_b}, {digest: content}),
+                     ({path_b: original_b}, {}), ({path_b: applied_b}, {})]):
+                self.assertTrue(rebase_documents.resolve(**ports))
+            self.assertEqual((Path(directory) / path_b).read_bytes(), content)
+        resumed = checkpoints.get('repo', 'G-047')
+        self.assertEqual(resumed.snapshot['failure'], 'prior failure')
+        self.assertEqual(resumed.snapshot['rebase_documents']['history'][0], preserved_adoption)
+        self.assertEqual(rebase_documents.adopted_originals(resumed), {path_a: {'absent': True}, path_b: desired})
+        actual = {path_a: {'head': {'mode': '100644', 'oid': 'stale', 'blob': 'stale'},
+                          'index': {}, 'worktree': {'absent': True}},
+                  path_b: {'head': desired, **applied_b}}
+        with mock.patch.object(rebase_documents.rebase_file_evidence, 'capture_originals',
+                               return_value=(actual, {})) as capture:
+            with self.assertRaisesRegex(RecoveryFailure, 'A.md'):
+                rebase_documents.validate_final(context=ports['context'], checkpoint=resumed, git_bytes=ports['git_bytes'])
+        self.assertEqual(capture.call_args.args[1], (path_a, path_b))
+
     def test_pinned_catalog_rejects_actual_missing_source_and_dependency(self):
         from loop_manager_internal.git import rebase_documents
         from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
