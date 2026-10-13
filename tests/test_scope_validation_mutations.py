@@ -518,6 +518,9 @@ class ScopeValidationMutationsTest(AgentScopeFixture, unittest.TestCase):
                 "loop_manager.run_codex", side_effect=agent
             ), mock.patch(
                 "loop_manager.verify", side_effect=verify_after_rebase
+            ), mock.patch(
+                "loop_manager_internal.execution.execution_verify_handler.common_guidance_report",
+                return_value="",
             ):
                 result = loop_manager.run_project(
                     connection,
