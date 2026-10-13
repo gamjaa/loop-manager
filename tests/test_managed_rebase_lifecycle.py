@@ -257,9 +257,33 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
     def test_legacy_multiple_unpublished_rebases_without_journal_publish_final_head(self):
         self._lifecycle(with_pr=False, manual=True, missing_journal=True, cumulative=True)
 
+    def test_document_only_replay_never_invokes_conflict_worker(self):
+        self._lifecycle(with_pr=False, documents='only')
+
+    def test_mixed_conflict_adopts_documents_and_keeps_code_for_worker(self):
+        self._lifecycle(with_pr=False, documents='mixed')
+
+    def test_document_replace_restart_pins_original_despite_remote_advancement(self):
+        self._lifecycle(with_pr=False, documents='replace')
+
+    def test_document_continue_restart_preserves_autostash_conflict_identity(self):
+        self._lifecycle(with_pr=False, documents='autostash')
+
+    def test_requirement_delete_does_not_resurrect_old_replayed_conditions(self):
+        self._lifecycle(with_pr=False, documents='delete')
+
+    def test_requirement_rename_adopts_pinned_destination(self):
+        self._lifecycle(with_pr=False, documents='rename')
+
+    def test_requirement_archive_adopts_pinned_destination(self):
+        self._lifecycle(with_pr=False, documents='archive')
+
+    def test_document_stage_restart_keeps_owned_target(self):
+        self._lifecycle(with_pr=False, documents='continue')
+
     def _lifecycle(self, *, with_pr, legacy=False, sealed_restart=False,
                    manual=False, missing_journal=False, latest_base_advanced=False,
-                   publication_interruption=None, cumulative=False, definition_change=None):
+                   publication_interruption=None, cumulative=False, definition_change=None, documents=None):
         # Reuse only the deterministic service bundle, not the policy fixture's
         # substituted Manager rebase methods or its substituted journal writer.
         real_begin = journal.begin_rebase
@@ -300,6 +324,12 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 "assert p.stat().st_mode & 0o111\n"
                 "assert Path('skip.txt').read_text() == 'base\\n'\n"
                 "print('phase-bound candidate verified')\nCHECK\n")
+            requirement_path = 'docs/requirements/[R-001] Condition.md'
+            plan_path = 'docs/plans/[G-047] Runtime.md'
+            if documents:
+                (repo / 'docs/requirements').mkdir()
+                (repo / requirement_path).write_text('# [R-001] Condition\n\ninitial\n')
+                original_plan = (repo / plan_path).read_text()
             git(repo, 'add', '.')
             git(repo, 'commit', '-m', 'Initial fixture')
             base = git(repo, 'rev-parse', 'HEAD').stdout.strip()
@@ -319,7 +349,11 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 git(worktree, 'commit', '-m', title)
 
             commit('notes.txt', 'independent\n', 'Independent first commit')
-            if not publication_interruption:
+            if documents:
+                commit(requirement_path, '# [R-001] Condition\n\nworker-old\n', 'Old conditions')
+                commit(plan_path, original_plan.replace('Resolve current changes.', 'Old Worker goal.'), 'Old task goal')
+                commit(requirement_path, '# [R-001] Condition\n\nworker-later\n', 'Later replayed old conditions')
+            if not publication_interruption and documents in {None, 'mixed'}:
                 changed = lines.copy()
                 changed[0] = 'value=worker\n'
                 commit('app.txt', ''.join(changed), 'Middle conflicting commit')
@@ -336,6 +370,27 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             (repo / 'app.txt').write_text(''.join(upstream))
             (repo / 'skip.txt').write_text('base\n')
             git(repo, 'add', '.')
+            if documents:
+                expected_requirement = b'# [R-001] Condition\n\nlatest remote\n'
+                expected_plan = original_plan.replace('Resolve current changes.', 'Latest remote goal.') + '\n## Progress\n- [x] Base verification\n'
+                destination = requirement_path
+                if documents == 'delete':
+                    (repo / requirement_path).unlink()
+                    destination = None
+                elif documents in {'rename', 'archive'}:
+                    destination = ('docs/requirements/[R-001] Latest Condition.md' if documents == 'rename' else
+                                   'docs/requirements/archive/[R-001] Condition.md')
+                    (repo / destination).parent.mkdir(parents=True, exist_ok=True)
+                    (repo / requirement_path).unlink()
+                    (repo / destination).write_bytes(expected_requirement.replace(b'Condition', b'Latest Condition')
+                                                    if documents == 'rename' else expected_requirement)
+                    if documents == 'rename':
+                        expected_requirement = (repo / destination).read_bytes()
+                    git(repo, 'add', '--', destination)
+                else:
+                    (repo / requirement_path).write_bytes(expected_requirement)
+                (repo / plan_path).write_text(expected_plan)
+                git(repo, 'add', '--', requirement_path, plan_path)
             git(repo, 'commit', '-m', 'Conflicting latest base')
             target = git(repo, 'rev-parse', 'HEAD').stdout.strip()
             git(repo, 'push', 'origin', 'main')
@@ -417,6 +472,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             pr_patch.start()
             self.addCleanup(pr_patch.stop)
             effects.workspace.git.side_effect = git
+            effects = replace(effects, workspace=replace(effects.workspace, git_bytes=lm.git_bytes))
             effects.workspace.is_directory.side_effect = lambda path: path.is_dir()
             effects.workspace.remote_branch_oid.side_effect = lm.remote_branch_oid
             effects.workspace._rebase_in_progress_for_branch.side_effect = lm._rebase_in_progress_for_branch
@@ -472,7 +528,6 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                                       session_id=role + '-session')
 
             effects.agent.run_agent.side_effect = agent
-
             def verify(path):
                 events.append('verify')
                 return lm.verify(path, timeout_seconds=30)
@@ -522,6 +577,73 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                 journal.begin_rebase = begin_legacy
 
             handler = new_handler()
+            if documents:
+                def interrupted_git(path, *arguments, **kwargs):
+                    if documents == 'autostash' and arguments == ('rebase', target):
+                        return git(path, 'rebase', '--autostash', target, **kwargs)
+                    if (documents == 'replace' and arguments[:2] == ('--literal-pathspecs', 'update-index')
+                            or documents in {'continue', 'autostash'} and 'rebase' in arguments and arguments[-1] in {'--continue', '--skip'}):
+                        raise SimulatedProcessExit()
+                    return git(path, *arguments, **kwargs)
+                if documents in {'replace', 'continue', 'autostash'}:
+                    if documents == 'autostash':
+                        (worktree / 'app.txt').write_text('value=user-stash\n' + ''.join(lines[1:]))
+                    effects.workspace.git.side_effect = interrupted_git
+                    with self.assertRaises(SimulatedProcessExit):
+                        handler._rebase_latest(handler._context(), handler._row(), target, publishing=False)
+                    saved = effects.checkpoint.get(repo_key, 'G-047')
+                    self.assertEqual(saved.target_base_oid, target)
+                    self.assertEqual(saved.snapshot['rebase_documents']['state'],
+                                     'prepared' if documents == 'replace' else 'staged')
+                    if documents == 'autostash':
+                        self.assertTrue(saved.snapshot['stash_oid'])
+                    if documents == 'replace':
+                        (repo / requirement_path).write_text('# [R-001] Condition\n\nnewer after interruption\n')
+                        git(repo, 'add', '--', requirement_path)
+                        git(repo, 'commit', '-m', 'Remote advances during document application')
+                        git(repo, 'push', 'origin', 'main')
+                        git(repo, 'fetch', 'origin')
+                        fixture.remote = git(repo, 'rev-parse', 'HEAD').stdout.strip()
+                    effects.workspace.git.side_effect = git
+                    handler = restart()
+                    handler.recover(handler._context())
+                else:
+                    handler._rebase_latest(handler._context(), handler._row(), target, publishing=False)
+                if destination is None or destination != requirement_path:
+                    self.assertFalse((worktree / requirement_path).exists())
+                if destination is not None:
+                    self.assertEqual((worktree / destination).read_bytes(), expected_requirement)
+                self.assertEqual((worktree / plan_path).read_bytes(), expected_plan.encode())
+                saved = effects.checkpoint.get(repo_key, 'G-047')
+                record = saved.snapshot['rebase_documents']
+                self.assertEqual(record['revision'], target)
+                self.assertEqual(record['target'], target)
+                self.assertTrue(record['originals'])
+                self.assertTrue(record['blobs'])
+                self.assertTrue(record['history'], 'later replay must preserve earlier originals')
+                self.assertEqual(events, [], 'document resolution never invokes an Agent')
+                self.assertEqual(effects.state.row()['worker_session_id'], 'worker-session')
+                effects.validation.verify.assert_not_called()
+                self.assertIsNone(effects.state.row()['verify_token'])
+                self.assertIsNone(effects.state.row()['review_token'])
+                if documents == 'mixed':
+                    self.assertEqual(git(worktree, 'diff', '--name-only', '--diff-filter=U').stdout.strip(), 'app.txt')
+                    self.assertIn('<<<<<<<', (worktree / 'app.txt').read_text())
+                    handler.run(handler._context())
+                    self.assertEqual(events, ['worker'])
+                    self.assertEqual((worktree / requirement_path).read_bytes(), expected_requirement)
+                elif documents == 'autostash':
+                    self.assertFalse(lm._rebase_in_progress_for_branch(worktree, branch))
+                    self.assertEqual(git(worktree, 'diff', '--name-only', '--diff-filter=U').stdout.strip(), 'app.txt')
+                    self.assertIn('value=user-stash', (worktree / 'app.txt').read_text())
+                    self.assertEqual(effects.checkpoint.get(repo_key, 'G-047').snapshot['stash_oid'], saved.snapshot['stash_oid'])
+                else:
+                    self.assertFalse(lm._rebase_in_progress_for_branch(worktree, branch))
+                    self.assertEqual(git(worktree, 'ls-files', '-u').stdout, '')
+                    self.assertEqual((worktree / 'notes.txt').read_text(), 'independent\n')
+                    self.assertEqual((worktree / 'app.txt').read_text(), ''.join(upstream))
+                    self.assertIsNone(effects.state.row()['worker_result'], 'base Progress is not Worker success')
+                return
             if publication_interruption:
                 # 게시 경계만 검사할 때는 실제 Git으로 후보와 pending SQLite를
                 # 준비한다. Manager의 충돌 교정·journal 경계는 다른 12개 흐름이 검사한다.

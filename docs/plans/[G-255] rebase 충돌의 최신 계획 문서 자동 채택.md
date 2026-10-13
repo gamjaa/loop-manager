@@ -42,8 +42,12 @@ Manager 소유 rebase에서 Requirement·ExecPlan 충돌을 관측한 최신 원
 ## Progress
 
 - [x] 2026-10-10 delta 기준 `50c699c8f9c149cecb0ddf9b081527942d8e2289`부터 `ab0264d94da1212d68141b28fc55f0204c1c9e09`까지 R-082·R-072 변경, 현재 충돌 action/handler와 관련 회귀를 정적으로 대조했다. 구현·테스트·verify를 실행하지 않았다.
-- [ ] 문서 충돌 자동 처리·원형 보존과 targeted unit 검증
-- [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
+- [x] 2026-10-13 `origin/main`의 `b5ea04b2b6cd15c1db16efa5331df156a764c0f1`에서 분리한 `codex/g-255` worktree에 문서 충돌 자동 처리·원형 보존·파일별 index 적용·중단 재개를 구현했다. Requirement 삭제·rename·archive, ExecPlan ID 기반 목적지 선택, 혼합 충돌과 복수 commit 재생을 확인했다. 현재 작업의 삭제·archive·미반영 rename 등 유효성 불확실은 원인·범위를 보존해 기존 복구 경계로 연결한다.
+- [x] 2026-10-13 최종 `bash scripts/verify.sh`에서 관련 `test_rebase_correction` 14개, `test_managed_rebase_lifecycle` 30개, `test_managed_mutation_evidence` 49개, `test_execution_rebase_correction_phase` 34개가 모두 통과했다. 교체/continue 중단과 원격 재전진, autostash 원본 OID 보존 후 잔여 충돌의 Worker 전달까지 실제 Git/SQLite로 확인했다.
+- [x] 2026-10-13 전체 verify를 수행했다: success 3,639, skip 5, failure 5, error 0으로 전체 PASS는 아니다. 테스트 실패로 생략된 compile은 `python3 -m loop_manager_internal.verification.runner --compile loop_manager.py loop_manager_internal`로 별도 실행해 통과했다. `test_manual_work`의 기존 실패 4개와 `test_scope_validation_mutations`의 기존 실패 1개를 변경 전 동일 `origin/main`에서 재현했다.
+- [x] 2026-10-13 구현 후 문서 기준 읽기 전용 재검증: 자동 대상/immutable 원문, 삭제·rename·archive와 catalog/PR 거부, 원형·실행 근거 보존과 파일별 적용, 문서-only/혼합 분기, 재생·중단·원격 재전진의 5개 AC를 코드·관련 회귀와 대조했다. branch/code/index 전체 reset과 사용자 operation 중단은 없으며, base Progress를 현재 후보 성공으로 합성하지 않는다. 기존 verify·Review·게시 gate와 G-256의 단계 판단 책임을 유지한다.
+- [x] 2026-10-13 최신 `origin/main`의 `20e6f0fbfdb6ceb5384d42c83f3904490b441356`으로 rebase했다. upstream의 lifecycle 문서 보고 fixture를 재사용해 중복을 제거하고 문서와 구현을 다시 대조했다. `bash scripts/verify.sh` 전체 PASS: success 3,647, skip 5, failure/error 0이며 compile도 통과했다. 관련 4개 모듈의 127개 테스트도 모두 통과했고 이전 base의 실패 5개는 최신 main에서 해소됐다.
+- [ ] 사용자 Merge
 
 ## Decision Log
 

@@ -165,6 +165,58 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
     # and the transactional recheck.
     pending_metadata = ports._owned_rebase_metadata(worktree)
     pending_index = ports.git(worktree, 'ls-files', '-u', '-z').stdout
+    from loop_manager_internal.git.rebase_documents import document_path
+    metadata_owned = bool(isinstance(pending_metadata, dict) and checkpoint.operation == 'rebase'
+        and pending_metadata.get('orig-head') == expected.before_head
+        and pending_metadata.get('head-name') == f'refs/heads/{branch}'
+        and pending_metadata.get('onto') == expected.target_base_oid)
+    document_conflicts = set()
+    if metadata_owned:
+        from loop_manager_internal.git.rebase_correction import parse_unmerged
+        from loop_manager_internal.catalog.frontmatter import requirement_identity
+        try:
+            conflict_paths = {path for path, _, _ in parse_unmerged(pending_index)}
+        except ValueError:
+            conflict_paths = set()
+        for path in conflict_paths:
+            if not document_path(path):
+                continue
+            for source in (target, expected.before_head):
+                text = ports.git(repo_path, 'show', f'{source}:{path}', check=False)
+                if text.returncode:
+                    continue
+                try:
+                    if path.startswith('docs/requirements/'):
+                        requirement_identity(text.stdout)
+                    else:
+                        parse_execplan_text(path, text.stdout, validate_sources=False)
+                except (RuntimeError, ValueError):
+                    continue
+                document_conflicts.add(path)
+                break
+    document_intent = saved.get('rebase_documents') or {}
+    document_blobs = {}
+    document_files = set()
+    if (document_intent.get('state') in {'prepared', 'staged'}
+            and document_intent.get('before_head') == expected.before_head
+            and document_intent.get('target') == target):
+        for path in document_intent['paths']:
+            if not document_path(path):
+                raise MutationEvidenceError('document resolution contains foreign paths')
+            selected = worktree / path
+            if any(parent.is_symlink() for parent in [selected, *selected.parents]
+                   if parent != worktree and worktree in parent.parents):
+                raise MutationEvidenceError('document resolution symlink path')
+            desired = document_intent['originals'][path]['base']
+            document_blobs[path] = {('000000', '0' * width) for width in (40, 64)} if desired.get('absent') else {(desired['mode'], desired['oid'])}
+            if desired.get('absent'):
+                if not (worktree / path).exists() and not (worktree / path).is_symlink():
+                    document_files.add(path)
+            elif (worktree / path).is_file() and not (worktree / path).is_symlink():
+                hashed = ports.git(worktree, 'hash-object', '--no-filters', '--', path)
+                mode, _ = read_file(worktree, path, desired['mode'])
+                if (mode, hashed.stdout.strip()) in document_blobs[path]:
+                    document_files.add(path)
     if pending_metadata is None and not pending_index:
         options = {}
         try:
@@ -262,6 +314,24 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
                 staged=tuple(change for change in observed.staged if change.path not in conflicts),
                 files=tuple(file for file in observed.files if file.path not in conflicts),
                 index=tuple(entry for entry in observed.index if entry.path not in conflicts))
+        # Manager document changes are confined to the saved immutable blobs.
+        # Pending conflict bytes are preservation inputs under this exact owned
+        # metadata; they never grant a later Agent document-writing authority.
+        owned_metadata = bool(checkpoint.operation == 'rebase'
+            and metadata.get('head-name') == f'refs/heads/{branch}'
+            and metadata.get('orig-head') == expected.before_head
+            and metadata.get('onto') == expected.target_base_oid)
+        conflicts = {entry.path for entry in observed.index
+                     if entry.stage and entry.path in document_conflicts} if owned_metadata else set()
+        approved_documents = matching_user_paths(
+            replace(observed, files=tuple(file for file in observed.files
+                                          if file.path not in document_files)), document_blobs)
+        manager_paths = conflicts | approved_documents
+        observed = replace(observed,
+            committed=tuple(change for change in observed.committed if change.path not in manager_paths),
+            staged=tuple(change for change in observed.staged if change.path not in manager_paths),
+            files=tuple(file for file in observed.files if file.path not in manager_paths),
+            index=tuple(entry for entry in observed.index if entry.path not in manager_paths))
         approved = matching_user_paths(observed, user_blobs)
         paths = {change.path for change in (*observed.committed, *observed.staged)}
         paths.update(file.path for file in observed.files)
@@ -274,7 +344,8 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
         validate_identity=validate_identity, read_rebase_metadata=ports._owned_rebase_metadata,
         read_remote=read_remote, read_inputs=lambda _: current_contract()[-2:],
         read_file=read_file,
-        path_allowed=lambda path: worker_allowed(path) or path in user_blobs,
+        path_allowed=lambda path: worker_allowed(path) or path in user_blobs
+            or path in document_blobs or path in document_conflicts,
         contracts_allowed=scoped_contracts,
         normalize_ignored_snapshot=ports._normalize_legacy_ignored_snapshot,
     ))

@@ -122,3 +122,142 @@ class RebaseCorrectionTests(TestCase):
         empty = self.observation(stages=(), files=())
         self.assertEqual(empty.stages, ())
         self.assertEqual(empty.worktree_files, ())
+
+
+class DocumentConflictPolicyTests(TestCase):
+    def test_only_direct_requirement_and_execplan_documents_are_candidates(self):
+        from loop_manager_internal.git.rebase_documents import document_path
+        for path in ('docs/requirements/[R-001] Goal.md',
+                     'docs/requirements/archive/[R-001] Goal.md',
+                     'docs/plans/[G-001] Goal.md', 'docs/plans/archive/[G-001] Goal.md'):
+            self.assertTrue(document_path(path), path)
+        for path in ('docs/PRODUCT.md', 'docs/ARCHITECTURE.md', 'docs/AGENTS.worker.md',
+                     'AGENTS.md', 'docs/other.md', 'app.py', 'test.py', 'config.ini',
+                     'docs/plans/manual/[G-001] Goal.md', 'docs/plans/../Goal.md',
+                     'docs/plans/x\\Goal.md', 'docs/plans/x:Goal.md'):
+            self.assertFalse(document_path(path), path)
+
+    def test_requirement_rename_archive_and_deletion_selection_uses_identity(self):
+        from loop_manager_internal.git.rebase_documents import select_paths
+        old = 'docs/requirements/[R-001] Old.md'
+        renamed = 'docs/requirements/[R-001] New.md'
+        archived = 'docs/requirements/archive/[R-001] Old.md'
+        catalog = SimpleNamespace(all={})
+        self.assertEqual(select_paths((old, 'app.py'), catalog,
+            {renamed: '# [R-001] New\n\nNew condition.\n'}), {old, renamed})
+        self.assertEqual(select_paths((old,), catalog,
+            {archived: '# [R-001] Old\n\nArchived condition.\n'}), {old, archived})
+        self.assertEqual(select_paths((old,), catalog, {}), {old})
+        with self.assertRaisesRegex(RuntimeError, 'ambiguous'):
+            select_paths((old,), catalog, {
+                renamed: '# [R-001] New\n',
+                'docs/requirements/[R-001] Duplicate.md': '# [R-001] Duplicate\n'})
+        with self.assertRaises(ValueError):
+            select_paths((renamed,), catalog, {renamed: 'broken identity'})
+
+    def test_execplan_rename_archive_deletion_keeps_pinned_id(self):
+        from loop_manager_internal.git.rebase_documents import select_paths
+        old = 'docs/plans/[G-002] Old.md'
+        original = SimpleNamespace(all={'G-002': SimpleNamespace(path=old, plan_id='G-002')})
+        for destination in ('docs/plans/[G-002] New.md', 'docs/plans/archive/[G-002] Old.md'):
+            latest = SimpleNamespace(all={'G-002': SimpleNamespace(path=destination, plan_id='G-002')})
+            self.assertEqual(select_paths((old, 'src/app.py'), latest, {}, original), {old, destination})
+        self.assertEqual(select_paths((old,), SimpleNamespace(all={}), {}, original), {old})
+        with self.assertRaisesRegex(RuntimeError, 'identity unavailable'):
+            select_paths((old,), SimpleNamespace(all={}), {}, SimpleNamespace(all={}))
+
+    def resolution_ports(self, *, snapshot=None):
+        from pathlib import Path
+        current = SimpleNamespace(snapshot=snapshot or {}, operation='rebase', generation=2,
+                                  target_base_oid='owned-target', expected_head='before',
+                                  observed_remote_oid='lease')
+        checkpoints = mock.Mock()
+        checkpoints.get.return_value = current
+        context = SimpleNamespace(worktree=Path('/worktree'), branch='loop-manager/G-001',
+            plan=SimpleNamespace(plan_id='G-001', path='docs/plans/[G-001] Goal.md'))
+        identity = SimpleNamespace(repo='repo', repo_path=Path('/repo'), base='main')
+        def read(_repo, *args, **_kwargs):
+            if args[:2] == ('ls-files', '-u'):
+                return SimpleNamespace(stdout='100644 oid 2\tdocs/plans/[G-001] Goal.md\0', returncode=0)
+            return SimpleNamespace(stdout='replay' if 'REBASE_HEAD' in args else 'new-base', returncode=0)
+        return dict(context=context, identity=identity, checkpoints=checkpoints,
+                    git=mock.Mock(side_effect=read), git_bytes=mock.Mock(),
+                    require_owned=mock.Mock(), capture_snapshot=mock.Mock(), lookup_pr=mock.Mock())
+
+    def test_invalid_source_or_dependency_preserves_reason_without_selecting_files(self):
+        from loop_manager_internal.git import rebase_documents
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+        for reason in ('missing source R-001', 'missing dependency G-002', 'ambiguous source R-001'):
+            ports = self.resolution_ports()
+            with self.subTest(reason=reason), mock.patch.object(
+                    rebase_documents.catalog_service, 'revision_execplan_snapshot', side_effect=RuntimeError(reason)):
+                with self.assertRaises(RecoveryFailure) as caught:
+                    rebase_documents.resolve(**ports)
+                self.assertIs(caught.exception.reason, RecoveryReason.PLAN_INPUT_INVALID)
+                record = ports['checkpoints'].record.call_args.kwargs['snapshot']['rebase_documents']
+                self.assertEqual(record['state'], 'uncertain')
+                self.assertEqual(record['reason'], reason)
+                self.assertEqual(record['target'], 'owned-target')
+                ports['capture_snapshot'].assert_not_called()
+                self.assertFalse(any('update-index' in call.args for call in ports['git'].call_args_list))
+
+    def test_pinned_catalog_rejects_actual_missing_source_and_dependency(self):
+        from loop_manager_internal.git import rebase_documents
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+        for source, dependency, reason in (
+                ('docs/requirements/[R-001] Missing.md', '[]', 'source'),
+                ('docs/PRODUCT.md', '[G-002]', 'depends_on')):
+            ports = self.resolution_ports()
+            plan = ('---\nid: G-001\ntitle: Goal\nsources:\n  - ' + source +
+                    '\ndepends_on: ' + dependency + '\ncomplexity: low\nrisk: low\npriority: normal\n---\n\n## Purpose\nCurrent goal.\n')
+            bodies = {'plan': plan.encode(), 'product': b'# Product\n'}
+            tree = b'100644 blob plan\tdocs/plans/[G-001] Goal.md\0' + b'100644 blob product\tdocs/PRODUCT.md\0'
+            def read_bytes(_repo, *args):
+                return tree if args[0] == 'ls-tree' else bodies[args[-1]]
+            ports['git_bytes'].side_effect = read_bytes
+            with self.subTest(reason=reason), self.assertRaises(RecoveryFailure) as caught:
+                rebase_documents.resolve(**ports)
+            self.assertIs(caught.exception.reason, RecoveryReason.PLAN_INPUT_INVALID)
+            record = ports['checkpoints'].record.call_args.kwargs['snapshot']['rebase_documents']
+            self.assertEqual(record['state'], 'uncertain')
+            self.assertIn(reason, record['reason'])
+            self.assertFalse(any('update-index' in call.args for call in ports['git'].call_args_list))
+
+    def test_prepared_resolution_keeps_immutable_revision_and_rejects_pr_race(self):
+        from loop_manager_internal.git import rebase_documents
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+        saved = {'state': 'prepared', 'position': 'replay', 'target': 'owned-target',
+                 'before_head': 'before', 'revision': 'pinned-old-base', 'originals': {},
+                 'prs': {'loop-manager/G-001': None}, 'paths': ['docs/plans/[G-001] Goal.md']}
+        ports = self.resolution_ports(snapshot={'rebase_documents': saved})
+        ports['lookup_pr'].return_value = {'url': 'newly-registered-pr'}
+        with self.assertRaises(RecoveryFailure) as caught:
+            rebase_documents.resolve(**ports)
+        self.assertIs(caught.exception.reason, RecoveryReason.REMOTE_SNAPSHOT_RACE)
+        ports['checkpoints'].record.assert_not_called()
+        ports['git_bytes'].assert_not_called()
+        self.assertFalse(any('origin/main^{commit}' in call.args for call in ports['git'].call_args_list))
+        ports['capture_snapshot'].assert_not_called()
+
+    def test_saved_document_pr_observation_failure_preserves_original_intent(self):
+        from loop_manager_internal.git import rebase_documents
+        saved = {'state': 'prepared', 'position': 'replay', 'target': 'owned-target',
+                 'before_head': 'before', 'revision': 'pinned-old-base', 'originals': {},
+                 'prs': {'loop-manager/G-001': None}, 'paths': ['docs/plans/[G-001] Goal.md']}
+        ports = self.resolution_ports(snapshot={'rebase_documents': saved})
+        ports['lookup_pr'].side_effect = RuntimeError('PR observation unavailable')
+        with self.assertRaisesRegex(RuntimeError, 'PR observation unavailable'):
+            rebase_documents.resolve(**ports)
+        ports['checkpoints'].record.assert_not_called()
+        ports['capture_snapshot'].assert_not_called()
+        ports['git_bytes'].assert_not_called()
+
+    def test_ownership_or_pr_observation_failure_never_becomes_success(self):
+        from loop_manager_internal.git import rebase_documents
+        ports = self.resolution_ports()
+        ports['require_owned'].side_effect = RuntimeError('ownership/PR unavailable')
+        with self.assertRaisesRegex(RuntimeError, 'ownership/PR unavailable'):
+            rebase_documents.resolve(**ports)
+        ports['checkpoints'].record.assert_not_called()
+        ports['git_bytes'].assert_not_called()
+        ports['capture_snapshot'].assert_not_called()
