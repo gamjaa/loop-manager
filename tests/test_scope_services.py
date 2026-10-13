@@ -12,10 +12,14 @@ from unittest import TestCase, mock
 import loop_manager as manager
 from loop_manager_internal.agents import scope_adapter, scope_baseline, scope_lifecycle, scope_observation, scope_recovery, scope_state_service, scope_validation
 from loop_manager_internal.agents.scope_contracts import AgentScopeError, GitSnapshot
+from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, Usage
+from loop_manager_internal.agents.agent_write_isolation import IsolationEvidence
+from loop_manager_internal.agents import agent_scope_decision, common_guidance
 from loop_manager_internal.recovery import blocked_plan_reconciliation, blocked_remote_observation
 from loop_manager_internal.storage import agent_invocation_state, blocked_checkpoint_state, execution_checkpoint_state, runtime_state
 from tests.support.database import runtime_connection
 from tests.support.git import git_command
+from tests.support.fixed_samples import PROJECT_FILES
 
 
 def snapshot(**changes):
@@ -294,23 +298,303 @@ class ScopeValidationTests(TestCase):
         worktree = Path('/managed').resolve()
         bound = snapshot(scope_id='scope', scope_start_digest='a' * 64)
         connection.execute("UPDATE projects SET phase='WORKING', worktree=?, branch=?, "
+                           "plan_path='docs/plans/[G-047] Runtime.md', "
                            "agent_role='worker', agent_snapshot=?, worker_session_id='session'",
                            (str(worktree), bound.branch, bound.serialize()))
         effects = replace(self.effects, _git_common_directory=lambda _: Path('/common'),
             git=lambda *_: subprocess.CompletedProcess([], 0, 'origin'),
             validate_managed_worktree=mock.Mock(), _rebase_in_progress_for_branch=lambda *_: False)
-        with mock.patch.object(agent_invocation_state.InvocationRepository, 'verified_scope', return_value=False):
-            self.assertIsNone(scope_validation._agent_git_resources(
-                connection, Path('repo'), worktree, bound, 'worker', effects=effects))
-        with mock.patch.object(agent_invocation_state.InvocationRepository, 'verified_scope', return_value=True):
-            resources = scope_validation._agent_git_resources(
-                connection, Path('repo'), worktree, bound, 'worker', effects=effects)
+        self.assertIsNone(scope_validation._agent_git_resources(
+            connection, Path('repo'), worktree, bound, 'worker', effects=effects))
+        ledger = agent_invocation_state.InvocationRepository(connection)
+        identity = ledger.start(InvocationContext('repo', 'G-047'), 'worker', 'codex',
+            ResolvedProfile('model', 'high'), 'session', scope_id=bound.scope_id)
+        digest = agent_scope_decision.invocation_scope_digest(
+            bound, role='worker', phase='IMPLEMENTING', base_branch='main', branch=bound.branch,
+            worktree_key=str(worktree), default_worktree=str(Path('repo').resolve()))
+        ledger.record_isolation(identity, IsolationEvidence('codex', 'test', 'test', 'worker',
+            str(worktree), hashlib.sha256(b'/common\0origin').hexdigest(), 'b' * 64, 'verified',
+            snapshot_digest=digest, configuration_digest='c' * 64))
+        ledger.finish(identity, 'success', 0, 1, 'session', Usage())
+        resources = scope_validation._agent_git_resources(
+            connection, Path('repo'), worktree, bound, 'worker', effects=effects)
         self.assertEqual(resources.worktrees, frozenset((str(worktree),)))
         changed = replace(bound, refs={'refs/heads/unrelated': ('new', '')})
         self.validate('worker', bound, changed, resources=resources)
         with self.assertRaises(AgentScopeError):
             self.validate('worker', bound, changed)
         effects.validate_managed_worktree.assert_called_once()
+
+
+class ScopeInvocationDigestTests(TestCase):
+    """Real preflight callback, SQLite ledger and verdicts; Git observations are synthetic."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.state = Path(temporary.name)
+        self.worktree = self.state / 'managed'
+        self.worktree.mkdir()
+        self.repo_path = Path('repo')
+        self.connection = runtime_connection()
+        self.addCleanup(self.connection.close)
+        self.plan_path = 'docs/plans/[G-047] Runtime.md'
+        self.common = Path('/common')
+        self.repository_identity = hashlib.sha256(b'/common\0origin').hexdigest()
+        patch = mock.patch.object(common_guidance, 'RUNTIME_ROOT', PROJECT_FILES)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.validation = replace(manager._scope_validation_effects(),
+            _git_common_directory=lambda _: self.common,
+            git=lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, 'origin'),
+            validate_managed_worktree=lambda *_args, **_kwargs: None,
+            operation_log=lambda *_args, **_kwargs: None,
+            _rebase_in_progress_for_branch=lambda *_: False,
+            _scope_snapshot_with_start_ignore_rules=lambda _w, _b, a: a)
+        self.validation = replace(self.validation, _agent_git_resources=self.resources)
+
+    def resources(self, *args, **kwargs):
+        return scope_validation._agent_git_resources(*args, effects=self.validation, **kwargs)
+
+    def validate(self, *args, **kwargs):
+        return scope_validation.validate_agent_scope(*args, effects=self.validation, **kwargs)
+
+    def begin(self, role):
+        self.role = role
+        self.session = role + '-session'
+        self.provider_role = 'planner' if role == 'maintenance_planner' else role
+        self.plan_id = 'G-047' if role in {'worker', 'reviewer'} else None
+        branch = 'loop-manager/G-047' if self.plan_id else None
+        phase = 'WORKING' if role == 'worker' else 'REVIEWING' if role == 'reviewer' else 'PLANNING'
+        self.raw = snapshot(branch=branch,
+            refs={'refs/remotes/origin/main': ('base', ''),
+                  **({f'refs/heads/{branch}': ('head', '')} if branch else {})},
+            worktrees={str(self.worktree.resolve()): ('HEAD=head',
+                       f'branch=refs/heads/{branch}' if branch else 'detached'),
+                       str(self.repo_path.resolve()): ('HEAD=base', 'state=clean')})
+        self.current = self.raw
+        self.connection.execute('UPDATE projects SET phase=?, branch=?, worktree=?, plan_path=?, '
+            'agent_snapshot=NULL, agent_result_snapshot=NULL',
+            (phase, branch, str(self.worktree), self.plan_path if self.plan_id else None))
+        self.connection.execute('UPDATE exec_plans SET status=?, branch=?, worktree=?, '
+            'agent_snapshot=NULL, agent_result_snapshot=NULL',
+            ('IMPLEMENTING' if role == 'worker' else 'REVIEWING', branch, str(self.worktree)))
+        lifecycle = replace(manager._scope_lifecycle_effects(),
+            capture_git_snapshot=lambda _: self.raw, _capture_agent_baseline=lambda *_: None)
+        self.before = scope_lifecycle.begin_agent_scope(
+            self.connection, 'repo', self.worktree, role, effects=lifecycle)
+        self.start_serialized = self.before.serialize()
+
+    def invoke(self, *, session=None, kind='success', transition=None):
+        outer = self
+        class Provider:
+            def run(self, request):
+                digest = request.isolation_snapshot_digest()
+                outer.assertEqual(digest, request.isolation_snapshot_digest())
+                request.on_isolation_checked(IsolationEvidence(
+                    'codex', 'test', 'test', request.role_name, str(request.worktree.resolve()),
+                    outer.repository_identity, 'b' * 64, 'verified', snapshot_digest=digest,
+                    configuration_digest='c' * 64))
+                request.on_session_started(outer.session)
+                return manager.AgentResult(0 if kind == 'success' else 1, 'done', outer.session,
+                    manager.AgentResultKind(kind))
+        with mock.patch.object(manager, 'capture_git_snapshot', side_effect=lambda _: self.current), \
+             mock.patch.object(manager, 'agent_provider', return_value=Provider()):
+            result = manager.run_agent('codex', self.worktree, self.state, Path('/config'),
+                self.provider_role, 'prompt', read_only=self.role in {'reviewer', 'planner_check'},
+                connection=self.connection, session_id=self.session if session else None,
+                invocation=InvocationContext('repo', self.plan_id, transition=transition),
+                resolved_profile=ResolvedProfile('model', 'high'))
+        key = 'planner_session_id' if self.provider_role in {'planner', 'planner_check'} else self.role + '_session_id'
+        # planner_check uses the scope ledger session, rather than a project field.
+        if self.role != 'planner_check':
+            self.connection.execute(f'UPDATE projects SET {key}=?', (self.session,))
+            if self.plan_id:
+                self.connection.execute(f'UPDATE exec_plans SET {key}=?', (self.session,))
+        self.connection.commit()
+        return result.isolation_invocation_id
+
+    def independent_changes(self):
+        self.current = replace(self.raw,
+            refs={**self.raw.refs, 'refs/heads/manual/G-250': ('head', '')},
+            worktrees={**self.raw.worktrees, '/manual/G-251': ('HEAD=head',)},
+            config={'local:branch.manual/G-250.remote': ('origin',)})
+
+    def check(self, current=None, before=None):
+        self.validate(self.role, self.worktree, before or self.before, current or self.current,
+            external_worktree=self.repo_path, base_branch='main', connection=self.connection,
+            selected_plan_path=self.plan_path if self.plan_id else None)
+
+    def test_preflight_to_verified_scope_all_roles_and_resumed_phase(self):
+        for role in ('planner', 'worker', 'reviewer', 'planner_check', 'maintenance_planner'):
+            with self.subTest(role=role):
+                self.begin(role)
+                identity = self.invoke()
+                proof = self.connection.execute('SELECT snapshot_digest FROM agent_isolation_evidence '
+                    'WHERE invocation_id=?', (identity,)).fetchone()[0]
+                self.assertNotEqual(proof, self.before.scope_start_digest)
+                self.assertEqual(self.before.scope_start_digest,
+                    hashlib.sha256(self.raw.serialize().encode()).hexdigest())
+                self.independent_changes()
+                self.check()
+                self.connection.execute("UPDATE projects SET phase='PLAN_BLOCKED'")
+                self.connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED'")
+                self.invoke(session='session', transition='resume')
+                self.check()
+                # Effective comparison baselines may carry Manager metadata;
+                # verification must still hash the saved original start.
+                self.check(before=replace(self.before, refs=self.current.refs))
+                self.assertEqual(runtime_state.RuntimeStateRepository(self.connection)
+                    .scope_owner('repo')['agent_snapshot'], self.start_serialized)
+                changes = [replace(self.current, config={'local:core.hooksPath': ('evil',)}),
+                           replace(self.current, worktrees={}),
+                           replace(self.current, index={'app.py': ('s 100644 oid 0',)})]
+                selected_ref = f'refs/heads/{self.before.branch}' if self.plan_id else 'refs/remotes/origin/main'
+                changes.append(replace(self.current, refs={**self.current.refs, selected_ref: ('evil', '')}))
+                for changed in changes:
+                    with self.assertRaises(AgentScopeError):
+                        self.check(changed)
+
+    def test_invalid_proof_and_full_snapshot_fallback_remain_strict(self):
+        self.begin('worker')
+        identity = self.invoke()
+        self.independent_changes()
+        cases = [('agent_invocations', 'session_id', 'other'),
+                 ('agent_invocations', 'repo', 'other'),
+                 ('agent_invocations', 'plan_id', 'G-999'),
+                 ('agent_isolation_evidence', 'repository_identity', 'd' * 64),
+                 ('agent_isolation_evidence', 'canonical_worktree', '/other'),
+                 ('agent_isolation_evidence', 'status', 'prepared'),
+                 ('agent_isolation_evidence', 'provider', 'claude'),
+                 ('agent_isolation_evidence', 'role', 'planner'),
+                 ('agent_isolation_evidence', 'policy_digest', ''),
+                 ('agent_isolation_evidence', 'configuration_digest', ''),
+                 ('agent_isolation_evidence', 'snapshot_digest', self.before.scope_start_digest)]
+        for table, field, value in cases:
+            with self.subTest(field=field):
+                old = self.connection.execute(f'SELECT {field} FROM {table} WHERE invocation_id=?', (identity,)).fetchone()[0]
+                self.connection.execute(f'UPDATE {table} SET {field}=? WHERE invocation_id=?', (value, identity))
+                with self.assertRaises(AgentScopeError):
+                    self.check()
+                self.connection.execute(f'UPDATE {table} SET {field}=? WHERE invocation_id=?', (old, identity))
+        self.check()
+        self.invoke(transition='fallback')
+        self.check()
+        # A failed physical attempt keeps the whole scope strict even if a
+        # subsequent fallback succeeds; never manufacture missing success.
+        self.invoke(session='session', kind='transient_failure')
+        self.invoke(transition='fallback')
+        with self.assertRaises(AgentScopeError):
+            self.check()
+
+    def test_canonical_paths_and_existing_digest_contract(self):
+        # Equivalent path spellings use the same canonical invocation inputs.
+        self.worktree = self.worktree / '..' / 'managed'
+        self.repo_path = Path('.') / 'repo'
+        self.begin('worker')
+        identity = self.invoke()
+        stored = self.connection.execute('SELECT snapshot_digest FROM agent_isolation_evidence '
+            'WHERE invocation_id=?', (identity,)).fetchone()[0]
+        # Pre-hotfix evidence was generated from an unbound live snapshot.
+        # Keep accepting that exact serialization contract without rewriting it.
+        expected = agent_scope_decision.invocation_scope_digest(
+            self.raw, role='worker', phase='IMPLEMENTING', base_branch='main',
+            branch=self.before.branch, worktree_key=str(self.worktree.resolve()),
+            default_worktree=str(self.repo_path.resolve()))
+        self.assertEqual(stored, expected)
+        self.independent_changes()
+        self.check()
+        self.assertEqual(self.connection.execute('SELECT snapshot_digest FROM agent_isolation_evidence '
+            'WHERE invocation_id=?', (identity,)).fetchone()[0], stored)
+
+    def test_saved_result_resume_and_block_recovery_keep_real_proof(self):
+        for role in ('planner', 'worker', 'reviewer'):
+            with self.subTest(role=role):
+                self.begin(role)
+                identity = self.invoke()
+                self.independent_changes()
+                result = self.current.serialize()
+                self.connection.execute("UPDATE projects SET phase='PLAN_BLOCKED', agent_result_snapshot=?", (result,))
+                self.connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED', agent_result_snapshot=?", (result,))
+                # Reload the persisted DB, rather than trusting in-memory proof.
+                self.connection.commit()
+                path = self.state / (role + '.sqlite')
+                with sqlite3.connect(path) as saved:
+                    self.connection.backup(saved)
+                self.connection.close()
+                self.connection = sqlite3.connect(path)
+                self.connection.row_factory = sqlite3.Row
+                self.addCleanup(self.connection.close)
+                recovery = replace(manager._scope_recovery_effects(),
+                    _agent_git_resources=self.resources, validate_agent_scope=self.validate,
+                    capture_git_snapshot=lambda _: self.current,
+                    _config_entries=lambda _: self.current.config,
+                    _owned_rebase_state_dir=lambda *_: None,
+                    _proven_merged_cleanup_paths=lambda *_: frozenset(),
+                    _proven_manager_base_refs=lambda *_: frozenset(),
+                    _published_plan_allows_common_plans=lambda *_: False,
+                    requirement_archive_candidates=lambda *_: (),
+                    _reconciled_manager_scope_metadata=lambda _c, _r, _s, _repo, _p, value, *_: value)
+                def resume():
+                    return scope_recovery.validate_persisted_agent_scope(
+                        self.connection, self.repo_path, self.state, 'repo', effects=recovery)
+                def recover():
+                    return scope_recovery.validate_blocked_agent_scope(
+                        self.connection, self.repo_path, 'repo', 'main', self.worktree,
+                        self.plan_path if self.plan_id else '', effects=recovery, require_safe_result=True)
+                resume()
+                recover()
+                # Selected refs and protected configuration remain checked on
+                # both recovery paths, including mutations in the live state.
+                safe_current = self.current
+                ref = f'refs/heads/{self.before.branch}' if self.plan_id else 'refs/remotes/origin/main'
+                for unsafe in (replace(self.current, config={'local:core.hooksPath': ('evil',)}),
+                               replace(self.current, refs={**self.current.refs, ref: ('evil', '')})):
+                    self.current = unsafe
+                    self.connection.execute('UPDATE projects SET agent_result_snapshot=?', (unsafe.serialize(),))
+                    self.connection.execute('UPDATE exec_plans SET agent_result_snapshot=?', (unsafe.serialize(),))
+                    for action in (resume, recover):
+                        with self.assertRaises(AgentScopeError):
+                            action()
+                self.current = safe_current
+                self.connection.execute('UPDATE projects SET agent_result_snapshot=?', (result,))
+                self.connection.execute('UPDATE exec_plans SET agent_result_snapshot=?', (result,))
+                self.connection.execute("UPDATE agent_isolation_evidence SET snapshot_digest=? WHERE invocation_id=?",
+                    ('d' * 64, identity))
+                for action in (resume, recover):
+                    with self.assertRaises(AgentScopeError):
+                        action()
+                owner = runtime_state.RuntimeStateRepository(self.connection).scope_owner('repo')
+                self.assertEqual(owner['agent_snapshot'], self.start_serialized)
+                self.assertEqual(owner['agent_result_snapshot'], result)
+
+    def test_checkpoint_uses_preflight_proof_and_rejects_tampering(self):
+        from loop_manager_internal.recovery import checkpoint_adapter
+        self.begin('worker')
+        identity = self.invoke()
+        self.independent_changes()
+        self.connection.execute("UPDATE projects SET phase='PLAN_BLOCKED', origin='owner/repo'")
+        self.connection.execute("UPDATE exec_plans SET status='PLAN_BLOCKED'")
+        request = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection).request(
+            repo='repo', plan_id='G-047', reason_code=manager.GUIDANCE_BLOCK_REASON,
+            evidence='waiting', branch=self.before.branch, worktree=str(self.worktree),
+            expected_remote_oid=None, rebase_recovery=False)
+        safety = replace(manager._checkpoint_safety_effects(),
+            _agent_git_resources=self.resources,
+            git=lambda *_args, **_kwargs: subprocess.CompletedProcess([], 0, 'https://github.com/owner/repo'),
+            github_repository=lambda _: 'owner/repo',
+            _proven_merged_cleanup_paths=lambda *_: frozenset(),
+            _proven_manager_base_refs=lambda *_: frozenset(),
+            _owned_checkpoint_remote_oid=lambda *_: None)
+        adapter = checkpoint_adapter.BlockedCheckpointAdapter(
+            self.connection, self.repo_path, self.state, 'repo', safety_effects=lambda: safety,
+            publication_effects=manager._checkpoint_publication_effects)
+        plan = runtime_state.RuntimeStateRepository(self.connection).scope_owner('repo', 'G-047')
+        self.assertIsNone(adapter._shared_safety_error(request, plan, self.current))
+        unsafe = replace(self.current, config={'local:core.hooksPath': ('evil',)})
+        self.assertIsNotNone(adapter._shared_safety_error(request, plan, unsafe))
+        self.connection.execute("UPDATE agent_isolation_evidence SET status='invalidated' WHERE invocation_id=?", (identity,))
+        self.assertIsNotNone(adapter._shared_safety_error(request, plan, self.current))
 
 
 class ScopeBaselineTests(TestCase):

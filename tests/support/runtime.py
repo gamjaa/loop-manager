@@ -35,14 +35,24 @@ def record_saved_scope_invocation(connection, repo, state_dir, worktree, role, b
     from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, Usage
     from loop_manager_internal.agents.agent_write_isolation import IsolationEvidence, inspect_worktree
     from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
+    from loop_manager_internal.agents import agent_scope_decision
+    from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
+    from loop_manager_internal.runtime.runtime_identity import _canonical_path
 
     ledger = InvocationRepository(connection)
     identity = ledger.start(InvocationContext(str(repo), plan_id), role, 'codex',
                             ResolvedProfile('test-fast', 'medium'), session_id,
                             scope_id=before.scope_id)
+    project = RuntimeStateRepository(connection).scope_owner(str(repo))
+    digest = agent_scope_decision.invocation_scope_digest(
+        before, role=role, phase=agent_scope_decision.invocation_scope_phase(role),
+        base_branch=str(project['base_branch']),
+        branch=before.branch if role in {'worker', 'reviewer'} else None,
+        worktree_key=str(_canonical_path(worktree)),
+        default_worktree=str(_canonical_path(Path(repo))))
     ledger.record_isolation(identity, IsolationEvidence(
         'codex', 'codex fixture', 'Linux:fixture', role, str(worktree.resolve()),
         inspect_worktree(worktree, state_dir).repository_identity, 'a' * 64, 'verified',
-        snapshot_digest=before.scope_start_digest, configuration_digest='b' * 64))
+        snapshot_digest=digest, configuration_digest='b' * 64))
     ledger.finish(identity, 'success', 0, 10, session_id, Usage())
     return identity

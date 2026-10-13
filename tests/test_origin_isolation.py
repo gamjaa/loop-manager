@@ -14,6 +14,7 @@ from loop_manager_internal.git import manager_git_journal
 from loop_manager_internal.storage import agent_invocation_state
 from loop_manager_internal.agents.agent_invocation import InvocationContext, ResolvedProfile, Usage
 from loop_manager_internal.agents.agent_write_isolation import IsolationEvidence, inspect_worktree
+from loop_manager_internal.agents import agent_scope_decision
 
 
 from tests.support.origin import (
@@ -476,8 +477,14 @@ class TaskRelevantInvocationScopeTests(unittest.TestCase):
         self.ledger = agent_invocation_state.InvocationRepository(self.connection)
         self.evidence = IsolationEvidence('codex', 'codex test', 'Linux:test', 'planner',
             str(self.worktree), inspect_worktree(self.worktree, self.state).repository_identity,
-            'a' * 64, 'verified', snapshot_digest=self.before.scope_start_digest,
+            'a' * 64, 'verified', snapshot_digest=self.scope_digest('planner'),
             configuration_digest='b' * 64)
+
+    def scope_digest(self, role):
+        return agent_scope_decision.invocation_scope_digest(
+            self.before, role=role, phase=agent_scope_decision.invocation_scope_phase(role),
+            base_branch='main', branch=self.before.branch if role in {'worker', 'reviewer'} else None,
+            worktree_key=str(self.worktree.resolve()), default_worktree=str(self.source.resolve()))
 
     def prove(self, *, status='success', role='planner', plan_id=None):
         identity = self.ledger.start(InvocationContext(self.repo, plan_id), role, 'codex',
@@ -585,7 +592,8 @@ class TaskRelevantInvocationScopeTests(unittest.TestCase):
         from tests.support.fixed_samples import PROJECT_FILES
 
         def run(request):
-            request.on_isolation_checked(self.evidence)
+            request.on_isolation_checked(replace(self.evidence,
+                snapshot_digest=request.isolation_snapshot_digest()))
             request.on_session_started('session')
             return loop_manager.AgentResult(0, 'done', 'session')
         with mock.patch.object(common_guidance, 'RUNTIME_ROOT', PROJECT_FILES), \
@@ -618,7 +626,7 @@ class TaskRelevantInvocationScopeTests(unittest.TestCase):
                 self.before = loop_manager.begin_agent_scope(self.connection, self.repo, self.worktree, role)
                 provider_role = 'planner' if role == 'maintenance_planner' else role
                 self.evidence = replace(self.evidence, role=provider_role,
-                                        snapshot_digest=self.before.scope_start_digest)
+                                        snapshot_digest=self.scope_digest(provider_role))
                 self.prove(role=provider_role, plan_id=None if role == 'maintenance_planner' else 'G-089')
                 git(self.source, 'tag', f'independent-{role}')
                 resources = loop_manager._agent_git_resources(self.connection, self.source,
