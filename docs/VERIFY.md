@@ -48,7 +48,7 @@ adapter version 1의 범위는 Python 3.11–3.14 stdlib unittest이다. [공식
 ## Perl TAP 지원과 두 언어 예제
 
 `perl-tap` version 1은 구현 환경에서 확인한 Perl 5.38.2, Test::More 1.302194,
-TAP::Parser 3.44, JSON::PP를 지원한다. 다른 버전·도구 부재는 probe 실패이며 skip이나 기존
+TAP::Parser 3.44, JSON::PP의 Linux native 실행을 지원한다. 다른 버전·도구 부재는 probe 실패이며 skip이나 기존
 verify로 전환하지 않는다. 공식 근거는 [Test::More](https://perldoc.perl.org/5.38.2/Test::More)의
 plan·done_testing·skip·TODO·subtest와 [TAP::Parser](https://perldoc.perl.org/5.38.2/TAP::Parser)의
 argv 실행·native result·plan·parse_errors·exit·wait·spool 계약이다. 자동 설치는 제공하지 않는다.
@@ -59,6 +59,8 @@ argv 실행·native result·plan·parse_errors·exit·wait·spool 계약이다. 
 plan을 대조한다. `파일 ID#번호` 결과는 해당 suite에 속하고, 연속 번호·native plan·parser 오류·
 종료 코드·signal을 모두 확인해야 suite가 완결된다. 파일 전체 skip은 native skip-all 근거로
 완결되며, fixture 오류·bailout·plan 누락·중복/누락 assertion·비정상 종료는 성공이 아니다.
+[TAP 중단 계약](https://testanything.org/tap-version-13-specification.html#bail-out)에 따라
+완료된 plan 뒤의 bailout도 종료 코드 0이나 parser의 정상 plan 판정과 관계없이 완료/PASS를 거부한다.
 Test::More의 TODO 성공/실패 의미와 nested subtest의 부모 결과를 유지한다. nested assertion은
 원본 spool에 보존하고 별도의 최상위 수집 ID로 합성하지 않는다.
 
@@ -96,8 +98,13 @@ bash scripts/verify.sh
 Windows launcher는 같은 환경값으로 `scripts/verify.ps1`을 호출한다. Perl의 Windows native 실행은
 이번 지원 근거에 포함되지 않는다. Manager에는 같은 예제 project root와 verify launcher를
 연결한다. Manager가 runtime·protocol·session·coordinator·timeout을 전달하며 단독 호출과 같은
-선언과 결과 validator를 사용한다. 자체 전체 verify의 Perl 적합성 검사는 위 설치 도구가 필요하며,
-부재를 성공/skip으로 숨기지 않는다.
+선언과 결과 validator를 사용한다. 자체 검증의 native Perl case와 Perl 예제 통합 회귀는
+Linux 지원 범위에서 실행하며 테스트 준비가 프로젝트 PATH의 실제 Perl 절대 경로를 선언에 넣는다.
+Linux에서는 위 설치 도구의 부재·버전 불일치를 성공/skip으로 숨기지 않는다. Windows는 미지원
+Perl native case만 명시적으로 skip하고 Python 예제와 플랫폼 독립 계약·IPC 검사를 유지한다.
+순수 계약/IPC 검사는 임시 도구 파일과 mock을 사용하며 native 지원 근거로 취급하지 않는다.
+이 테스트 수집 구분은 명시적으로 연결한 프로젝트의 도구 부재 실패 계약을 바꾸지 않는다.
+예제 Manager 호출의 shell 선택은 기존 verify_arguments의 pwsh/powershell 경로를 따른다.
 
 [test_verify_perl_adapter.py](../tests/test_verify_perl_adapter.py)는 native assertion·plan·skip·TODO·
 subtest·오류, 수집/결과 identity·범위·부분 결과·통신 실패·guard·serial 예산을 검사한다.

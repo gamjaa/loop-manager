@@ -2,6 +2,7 @@
 import io
 import json
 import os
+import shutil
 from pathlib import Path
 import subprocess
 import sys
@@ -21,7 +22,10 @@ class PerlAdapterTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         (self.root / 'scripts').mkdir()
         (self.root / 'tests').mkdir()
-        self.declaration = {'version': 1, 'adapter': 'perl-tap', 'environment': {'perl': '/usr/bin/perl'},
+        # Contract/transport tests use an inert tool fixture, never a native executable.
+        self.tool = str(self.root / 'perl executable')
+        Path(self.tool).write_bytes(b'fixture')
+        self.declaration = {'version': 1, 'adapter': 'perl-tap', 'environment': {'perl': self.tool},
             'stages': [{'id': 'tests', 'kind': 'tests', 'cwd': '.',
                 'collection': {'directory': 'tests', 'pattern': '*.t'}, 'execution': 'independent'}]}
         self.stage = self.declaration['stages'][0]
@@ -32,10 +36,16 @@ class PerlAdapterTests(unittest.TestCase):
         (self.root / 'scripts/verify.json').write_text(json.dumps(self.declaration))
         return contract.load(self.root, sys.executable)
 
+    def select_native_tool(self):
+        executable = shutil.which('perl')
+        self.assertIsNotNone(executable, 'Perl is required for Linux native conformance tests')
+        self.tool = str(Path(executable).absolute())
+        self.declaration['environment']['perl'] = self.tool
+
     def native(self, source):
         path = self.root / self.unit.name
         path.write_text(source)
-        result = subprocess.run(['/usr/bin/perl', str(perl_adapter.REPORTER), 'run', str(path), str(self.root / 'native.tap'),
+        result = subprocess.run([self.tool, str(perl_adapter.REPORTER), 'run', str(path), str(self.root / 'native.tap'),
             json.dumps({**self.identity, 'unit_id': self.unit.name})],
             capture_output=True, text=True, timeout=10)
         return [json.loads(line) for line in result.stdout.splitlines()], result.returncode
@@ -46,7 +56,9 @@ class PerlAdapterTests(unittest.TestCase):
             'native': records, 'exit_code': returncode, 'passed': passed,
             'completed': list(self.unit.ids) if complete else []}
 
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Perl native conformance currently supports Linux')
     def test_native_plan_skip_todo_and_subtest_meaning(self):
+        self.select_native_tool()
         source = Path('tests/support/verify_examples/perl/tests/example.t').read_text()
         records, code = self.native(source)
         self.assertTrue(perl_adapter.validate_report(self.unit, self.report(records, code), self.identity))
@@ -56,6 +68,10 @@ class PerlAdapterTests(unittest.TestCase):
         self.assertTrue(tests[2]['todo'])
         self.assertFalse(tests[2]['actual_ok'])
         self.assertTrue((self.root / 'native.tap').is_file())
+        records, code = self.native('print "1..1\\nok 1\\nBail out! after completed plan\\n"; exit 0;')
+        self.assertEqual(code, 0)
+        self.assertTrue(any(record['type'] == 'bailout' for record in records))
+        self.assertEqual(perl_adapter.native_report(records, code), (False, False))
         for source, expected in (("use Test::More; plan skip_all => 'fixture unavailable';", True),
                 ("use Test::More tests => 2; ok(1);", False),
                 ("use Test::More tests => 1; ok(0);", False),
@@ -66,7 +82,9 @@ class PerlAdapterTests(unittest.TestCase):
                 records, code = self.native(source)
                 self.assertEqual(perl_adapter.validate_report(self.unit, self.report(records, code), self.identity), expected)
 
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Perl native conformance currently supports Linux')
     def test_perl_agent_network_and_parallel_boundaries_are_blocked_before_execution(self):
+        self.select_native_tool()
         for statement in ("system('codex', '--version')", "exec('claude')", '`codex --version`',
                 'fork()', "socket(my $socket, 2, 1, 0)", "open(my $pipe, '-|', 'codex')",
                 "use IO::Socket::INET; IO::Socket::INET->new(PeerAddr => '127.0.0.1', PeerPort => 1, Timeout => 1)"):
@@ -81,7 +99,9 @@ class PerlAdapterTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('blocked', result.stderr)
 
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Perl native conformance currently supports Linux')
     def test_partial_duplicate_missing_and_identity_results_fail_closed(self):
+        self.select_native_tool()
         records, code = self.native('use Test::More tests => 1; ok(1);')
         report = self.report(records, code)
         for key, value in (('version', True), ('run_id', 'old'), ('stage_id', 'wrong'),
@@ -102,7 +122,9 @@ class PerlAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(contract.ContractError, 'native result fields'):
             perl_adapter.native_report(corrupted, 0)
 
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Perl native conformance currently supports Linux')
     def test_collection_probe_identity_scope_and_missing_tool(self):
+        self.select_native_tool()
         (self.root / self.unit.name).write_text('use Test::More tests => 1; ok(1);')
         connection = self.connection()
         def command(argv, *args):
@@ -124,7 +146,7 @@ class PerlAdapterTests(unittest.TestCase):
         with self.assertRaisesRegex(contract.ContractError, 'identity'):
             perl_adapter.collect_project(connection, self.stage, self.root, 'run', Path('entrypoint'),
                 10, wrong_identity, mock.Mock(), mock.Mock())
-        self.declaration['environment']['perl'] = '/missing/perl'
+        self.declaration['environment']['perl'] = str(self.root / 'missing-perl')
         with self.assertRaises(contract.ContractError):
             self.connection()
         self.assertIs(runner.IMPLEMENTATIONS['perl-tap'], perl_adapter)
@@ -156,11 +178,17 @@ class PerlAdapterTests(unittest.TestCase):
             stage = {**self.stage, 'execution': 'serial'}
             self.assertTrue(perl_adapter.execute(connection, stage, [self.unit], self.root, writer, parent, 'run', Path('entrypoint')))
             self.assertEqual(spawn.call_args.kwargs['command'], [sys.executable, '-u', 'entrypoint', '--perl-worker'])
-            self.assertEqual(spawn.call_args.kwargs['environment']['LOOP_MANAGER_VERIFY_PERL'], '/usr/bin/perl')
+            self.assertEqual(spawn.call_args.kwargs['environment']['LOOP_MANAGER_VERIFY_PERL'], self.tool)
 
     def test_both_examples_load_ordered_required_compile_and_tests(self):
         for language in ('python', 'perl'):
-            root = Path('tests/support/verify_examples') / language
+            root = self.root / language
+            shutil.copytree(Path('tests/support/verify_examples') / language, root)
+            if language == 'perl':
+                declaration = root / 'scripts/verify.json'
+                data = json.loads(declaration.read_text())
+                data['environment']['perl'] = self.tool
+                declaration.write_text(json.dumps(data))
             connection = contract.load(root, sys.executable)
             self.assertEqual([stage['kind'] for stage in connection.stages], ['command', 'tests'])
 
@@ -170,7 +198,7 @@ class PerlAdapterTests(unittest.TestCase):
             'directory': str(self.root), 'result': str(self.root / 'result.json')}
         for failure in (OSError('tool start failure'), RuntimeError('reporter communication failure')):
             with self.subTest(failure=failure), mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(request) + '\n')), \
-                    mock.patch.dict(os.environ, LOOP_MANAGER_VERIFY_PERL='/usr/bin/perl',
+                    mock.patch.dict(os.environ, LOOP_MANAGER_VERIFY_PERL=self.tool,
                         LOOP_MANAGER_VERIFY_PROJECT_ROOT=str(self.root)), \
                     mock.patch.object(perl_adapter.subprocess, 'run', side_effect=failure), \
                     mock.patch.object(sys, 'stderr', io.StringIO()):
@@ -181,13 +209,15 @@ class PerlAdapterTests(unittest.TestCase):
                 self.assertEqual(report['completed'], [])
                 self.assertTrue((self.root / 'result.native.ndjson').is_file())
 
+    @unittest.skipUnless(sys.platform.startswith('linux'), 'Perl native conformance currently supports Linux')
     def test_worker_native_success_and_interruption_keep_identity_and_partial_output(self):
+        self.select_native_tool()
         (self.root / self.unit.name).write_text('use Test::More tests => 1; ok(1);')
         request = {**self.identity, 'unit_id': self.unit.name, 'module': self.unit.name,
             'ids': self.unit.ids, 'pattern': '*.t', 'owners': [], 'worker': 0,
             'directory': str(self.root), 'result': str(self.root / 'result.json')}
         with mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(request) + '\n')), \
-                mock.patch.dict(os.environ, LOOP_MANAGER_VERIFY_PERL='/usr/bin/perl',
+                mock.patch.dict(os.environ, LOOP_MANAGER_VERIFY_PERL=self.tool,
                     LOOP_MANAGER_VERIFY_PROJECT_ROOT=str(self.root)):
             self.assertEqual(perl_adapter.worker_main(), 0)
         report = json.loads((self.root / 'result.json').read_text())
@@ -204,7 +234,7 @@ class PerlAdapterTests(unittest.TestCase):
             kwargs['stdout'].flush()
             raise KeyboardInterrupt()
         with mock.patch.object(sys, 'stdin', io.StringIO(json.dumps(request) + '\n')), \
-                mock.patch.dict(os.environ, LOOP_MANAGER_VERIFY_PERL='/usr/bin/perl',
+                mock.patch.dict(os.environ, LOOP_MANAGER_VERIFY_PERL=self.tool,
                     LOOP_MANAGER_VERIFY_PROJECT_ROOT=str(self.root)), \
                 mock.patch.object(perl_adapter.subprocess, 'run', side_effect=interrupted), \
                 self.assertRaises(KeyboardInterrupt):
@@ -241,9 +271,43 @@ class PerlAdapterTests(unittest.TestCase):
                     execute.assert_not_called()
                     self.assertEqual(json.loads((logs / 'partial-result.json').read_text())['status'], 'FALLBACK')
                 else:
-                    self.assertEqual(command.call_args.args[0][:3], ['/usr/bin/perl',
+                    self.assertEqual(command.call_args.args[0][:3], [self.tool,
                         '-I' + str(perl_adapter.REPORTER.parent), '-MLoopManagerVerifyGuard'])
                     manifest = json.loads((logs / 'manifest.json').read_text())
                     self.assertEqual(manifest['adapter'], 'perl-tap')
                     self.assertEqual(manifest['stages'][1]['tool']['perl'], 'v5.38.2')
                     self.assertEqual(manifest['stages'][1]['units'][0]['argv'][-1], '--perl-worker')
+
+    def test_completed_plan_bailout_with_zero_exit_never_completes(self):
+        records = [
+            {'type': 'plan', 'raw': '1..1'},
+            {'type': 'test', 'number': 1, 'ok': True, 'actual_ok': True, 'skip': False, 'todo': False},
+            {'type': 'bailout', 'raw': 'Bail out! stop after completed plan'},
+            {'type': 'summary', 'planned': 1, 'run': 1, 'good_plan': True, 'problems': False,
+                'errors': [], 'exit': 0, 'wait': 0, 'skip_all': None},
+        ]
+        records = [{**self.identity, 'unit_id': self.unit.name, **record} for record in records]
+        self.assertEqual(perl_adapter.native_report(records, 0), (False, False))
+        report = self.report(records, 0)
+        self.assertEqual(report['completed'], [])
+        self.assertFalse(perl_adapter.validate_report(self.unit, report, self.identity))
+
+    def test_windows_keeps_portable_unit_and_python_example_checks(self):
+        import runpy
+        # Check collection policy without executing either integration scenario.
+        with mock.patch.object(sys, 'platform', 'win32'):
+            unit_class = runpy.run_path(str(Path(__file__)))['PerlAdapterTests']
+            integration_class = runpy.run_path(str(Path(__file__).with_name('test_verify_language_examples.py')))['LanguageExampleIntegrationTests']
+        for name in ('test_native_plan_skip_todo_and_subtest_meaning',
+                'test_perl_agent_network_and_parallel_boundaries_are_blocked_before_execution',
+                'test_partial_duplicate_missing_and_identity_results_fail_closed',
+                'test_collection_probe_identity_scope_and_missing_tool',
+                'test_worker_native_success_and_interruption_keep_identity_and_partial_output'):
+            self.assertTrue(getattr(unit_class, name).__unittest_skip__)
+        for name in ('test_common_process_transport_and_serial_budget',
+                'test_both_examples_load_ordered_required_compile_and_tests',
+                'test_completed_plan_bailout_with_zero_exit_never_completes'):
+            self.assertFalse(getattr(getattr(unit_class, name), '__unittest_skip__', False))
+        self.assertFalse(getattr(integration_class.test_python_standalone_and_manager_preserve_success_and_native_failure,
+            '__unittest_skip__', False))
+        self.assertTrue(integration_class.test_perl_standalone_and_manager_preserve_success_and_native_failure.__unittest_skip__)

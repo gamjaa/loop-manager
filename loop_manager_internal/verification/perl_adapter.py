@@ -76,7 +76,8 @@ def native_report(records, returncode):
                 for key in ('ok', 'actual_ok', 'skip', 'todo')) for item in tests)):
         raise ContractError('Perl invalid native result fields')
     numbers = [item['number'] for item in tests]
-    complete = (summary['good_plan'] is True and not summary['errors'] and
+    complete = (not any(item.get('type') == 'bailout' for item in records) and
+        summary['good_plan'] is True and not summary['errors'] and
         type(summary['planned']) is int and type(summary['run']) is int and
         numbers == list(range(1, summary['run'] + 1)) and
         (summary['planned'] == summary['run'] and summary['run'] > 0 or bool(summary['skip_all']) and not tests))
