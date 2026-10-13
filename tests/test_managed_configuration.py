@@ -759,7 +759,7 @@ Registration rollback fixture.
         self.assertEqual(tuple(project), (None, None))
         self.assertEqual(plan_count, 0)
         provider_runtime.assert_called_once_with(
-            Path("config.ini"), "codex", root
+            Path("config.ini"), "codex", root, state_dir=Path("/state")
         )
         registration_files.assert_not_called()
         git.assert_not_called()

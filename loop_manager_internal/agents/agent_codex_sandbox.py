@@ -113,7 +113,7 @@ def _read_only_link(target: Path, link: Path) -> None:
     elif link.exists():
         raise RuntimeError('Codex runtime 입력이 읽기 전용 연결이 아닙니다.')
     else:
-        link.symlink_to(target.resolve())
+        link.symlink_to(target.absolute())
 
 
 def prepare_launch(boundary, state_dir: Path, role: str, read_only: bool,
@@ -122,7 +122,8 @@ def prepare_launch(boundary, state_dir: Path, role: str, read_only: bool,
     # Runtime storage belongs to Codex; it is not a writable root for its tools.
     base = state_dir.resolve() / 'agent-runtime'
     user_home = Path(environment.get('HOME', environment.get('USERPROFILE', str(Path.home()))))
-    source_home = Path(environment.get('CODEX_HOME', str(user_home / '.codex'))).resolve()
+    source_path = Path(environment.get('CODEX_HOME', str(user_home / '.codex'))).absolute()
+    source_home = source_path.resolve()
     # Validate containment before mkdir/link/mkdtemp: a misregistered state root
     # must not even create a runtime directory in the user's source checkout.
     for denied in (boundary.source, *boundary.other_worktrees, boundary.worktree,
@@ -130,15 +131,23 @@ def prepare_launch(boundary, state_dir: Path, role: str, read_only: bool,
         resolved = denied.resolve()
         if base == resolved or resolved in base.parents or base in resolved.parents:
             raise RuntimeError('Codex runtime과 보호 경로가 겹칩니다.')
+    from .provider_home import prepare_authentication
+    if source_path == state_dir.resolve() / 'automation-codex':
+        prepare_authentication('codex', environment)
     identity = sha256((boundary.repository_identity + '\0' + str(boundary.worktree)
                        + '\0' + role).encode()).hexdigest()
     _owned_directory(base)
     runtime = base / identity
     _owned_directory(runtime)
-    # Windows는 인증 파일 복사나 symlink 권한 없이 기존 Codex 저장소를 사용한다.
+    # Windows는 전용 원본 홈을 직접 사용해 session 저장 구조를 유지한다.
     home = source_home if os.name == 'nt' else runtime / 'codex'
     if os.name != 'nt':
         _owned_directory(home)
+        config_link = home / 'config.toml'
+        personal_config = user_home / '.codex/config.toml'
+        if (source_home == state_dir.resolve() / 'automation-codex' and config_link.is_symlink()
+                and config_link.resolve() == personal_config.resolve()):
+            config_link.unlink()  # 소유 runtime의 알려진 개인 config 연결만 분리한다.
         for name in ('auth.json', 'config.toml'):
             _read_only_link(source_home / name, home / name)
     attempt = Path(tempfile.mkdtemp(prefix='call-', dir=runtime))

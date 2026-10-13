@@ -99,7 +99,7 @@ def run_agent(
     if invocation is not None and resolved is None:
         try:
             environment = (prepared_launch.environment if prepared_launch is not None
-                           else agent_profiles.agent_environment(provider, role_name))
+                           else agent_profiles.agent_environment(provider, role_name, state_dir=state_dir))
             with agent_profiles.prepared_environment(provider, environment):
                 resolved = effects._agent_profile(config_path, provider, role_name, level, worktree)
         except (RuntimeError, OSError):

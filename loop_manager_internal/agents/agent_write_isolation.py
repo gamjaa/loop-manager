@@ -138,10 +138,15 @@ def _configuration_digest(provider: str, worktree: Path,
         candidates = (provider_home / "settings.json", worktree / ".claude/settings.json",
                       worktree / ".claude/settings.local.json")
     digest = sha256()
+    variable, filename = (('CODEX_HOME', 'auth.json') if provider == 'codex'
+                          else ('CLAUDE_CONFIG_DIR', '.credentials.json'))
+    auth_home = Path(variables.get(variable, home / ('.codex' if provider == 'codex' else '.claude')))
+    digest.update(str((auth_home / filename).resolve()).encode())  # 인증값 대신 원본 경로만 결합한다.
     for path in (*candidates, config_path):
         if path is None:
             continue
         digest.update(str(path.absolute()).encode())
+        digest.update(str(path.resolve()).encode())
         digest.update(b"\0")
         try:
             digest.update(path.read_bytes() if path.is_file() else b"<absent>")
@@ -176,6 +181,10 @@ def _assert_no_codex_extensions(worktree: Path, environment_variables: dict[str,
             continue
         except (OSError, tomllib.TOMLDecodeError) as error:
             raise IsolationError("Codex 확장 설정을 확인할 수 없습니다.") from error
+        if os.name != 'nt' and configuration.get('cli_auth_credentials_store') not in (None, 'file'):
+            # 역할별 홈은 경로로 구분되는 credential store를 원본 홈과 공유하지 못한다.
+            raise IsolationError('Codex 역할별 실행 홈에서 파일 외 인증 저장소를 공유할 수 없습니다. '
+                                 '전용 CODEX_HOME의 파일 인증을 준비하고 조직 정책은 유지하세요.')
         if any(configuration.get(name) for name in
                ("mcp_servers", "hooks", "notify", "profile", "profiles",
                 "permissions", "default_permissions")):
@@ -285,7 +294,10 @@ def prepare_isolation(provider: str, role: str, worktree: Path, state_dir: Path,
         except RuntimeError as error:
             raise IsolationError(str(error)) from error
         selected_environment = launch.environment
+        source_environment = dict(selected_environment, CODEX_HOME=str(state_dir.resolve() / 'automation-codex'))
         configuration = _configuration_digest(provider, boundary.worktree, config_path, selected_environment)
+        _assert_no_codex_execpolicy(boundary.worktree, source_environment)
+        _assert_no_codex_extensions(boundary.worktree, source_environment)
         _assert_no_codex_execpolicy(boundary.worktree, selected_environment)
         _assert_no_codex_extensions(boundary.worktree, selected_environment)
         result = subprocess.run(["codex", "--version"], capture_output=True,
@@ -340,6 +352,9 @@ def assert_current(evidence: IsolationEvidence, worktree: Path, state_dir: Path,
         raise IsolationError("Agent 격리 증거가 verified 상태가 아닙니다.")
     boundary = inspect_worktree(worktree, state_dir, read_only=read_only)
     if evidence.provider == "codex":
+        source_environment = dict(environment_variables or {}, CODEX_HOME=str(state_dir.resolve() / 'automation-codex'))
+        _assert_no_codex_execpolicy(boundary.worktree, source_environment)
+        _assert_no_codex_extensions(boundary.worktree, source_environment)
         _assert_no_codex_execpolicy(boundary.worktree, environment_variables)
         _assert_no_codex_extensions(boundary.worktree, environment_variables)
     if (expected_repository is None or
