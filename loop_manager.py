@@ -5,6 +5,7 @@ from __future__ import annotations
 
 from pathlib import Path
 from loop_manager_internal.application.compatibility import install_exports as _install_exports
+from loop_manager_internal.config import execution_path
 
 ROOT = Path(__file__).resolve().parent
 _install_exports(__name__, ROOT)
@@ -118,6 +119,8 @@ def main() -> int:
     state_dir = state_directory(args.state_dir)
     config_path = source_config_path(ROOT, args.config)
     try:
+        if not args.runtime_child:
+            execution_path.apply_execution_path(ROOT)
         if args.runtime_child:
             if not args.runtime_source or not args.runtime_sha:
                 raise RuntimeError("runtime 자식 소유권 정보가 없습니다.")
