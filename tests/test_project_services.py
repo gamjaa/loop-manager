@@ -107,7 +107,7 @@ class ProjectServiceCompositionTests(unittest.TestCase):
                              {field.name for field in fields(contract)})
             self.assertTrue(all(callable(getattr(port._effects, field.name)) for field in fields(contract)))
 
-    def test_execution_ports_keep_project_identity_and_timeout(self):
+    def test_execution_ports_keep_project_identity_timeout_and_scope_signature(self):
         connection = runtime_connection()
         self.addCleanup(connection.close)
         connection.execute('UPDATE projects SET planning_attempt_fingerprint = NULL')
@@ -127,6 +127,16 @@ class ProjectServiceCompositionTests(unittest.TestCase):
         self.assertEqual(ports.repo, 'repo')
         self.assertEqual(ports.config_path, Path('/source/config.ini'))
         self.assertIs(ports.effects.state.connection, connection)
+        arguments = (Path('/repo'), Path('/state/G-047'), 'loop-manager/G-047',
+                     'main', 'docs/plans/[G-047] Runtime.md', {}, object())
+        with mock.patch.object(loop_manager, 'validate_worker_workspace_scope',
+                               autospec=True, return_value={}) as validate:
+            for phase in ('IMPLEMENTING', 'VERIFYING'):
+                with self.subTest(phase=phase):
+                    self.assertEqual(ports.effects.agent.validate_worker_workspace_scope(
+                        *arguments, scope_phase=phase), {})
+                    validate.assert_called_with(*arguments, scope_phase=phase,
+                                                connection=connection, state_dir=Path('/state'))
 
     def test_cli_dispatch_reaches_command_handlers_without_project_work(self):
         config_path = Path('/source/config.ini')
