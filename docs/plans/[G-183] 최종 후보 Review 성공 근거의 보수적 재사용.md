@@ -53,7 +53,7 @@ priority: high
 - execution Review handler·publication 후보 확인과 storage의 기존 validation/checkpoint 경계를 확장한다. verify receipt와 Review 입력/receipt를 분리하되 필수 선행 검증 관계를 유지한다. R-086의 preliminary_reviews·실제 전체 run ID·최종 승격 및 게시 재확인 경계를 보존하고, 부분 token/receipt를 전체 검증 증거로 읽거나 일반 선행 단계를 다시 구현하지 않는다.
 - 기존 공통·역할별 원본 묶음 버전과 실제 Reviewer 합성 instruction의 hash, 문서 source fallback/예약어 규칙 버전, G-171 최종 문서 diff 보고를 재사용한다. 최신 runtime 원본을 진행 중 작업의 고정 버전에 섞거나 common 본문만 비교해 역할 규칙 변경을 놓치지 않는다. 실제 외부 검토 기준을 확인할 수 없으면 새 Review를 선택한다.
 - 실제 Reviewer 호출에는 G-197의 최종 후보 검증 근거 전달 경계를 재사용한다. verify 성공을 재사용했으면 원래 성공 근거와 현재 입력의 동일성 확인을 전달하고, 새 verify를 실행한 것으로 보고하지 않는다.
-- G-262의 준비된 실행 환경·실제 설정 관측과 G-263/G-264의 provider별 source 선택을 소비한다. 재사용 판정과 실제 Reviewer 실행이 같은 비밀값 없는 환경/정책 identity를 사용하게 하며 별도 home 탐색·개인 config 조회·인증 cache를 추가하지 않는다. 기존 격리/설정 증거의 확인 불가를 동일성으로 대용하지 않는다.
+- G-262의 준비된 실행 환경·실제 설정 관측과 G-263/G-264의 provider별 공통 홈/소비 source를 사용한다. 역할별 임시 경로와 공통 홈을 구분하고 실제 현재 설정 생성·교체 및 최종 검사 뒤 변경을 같은 비밀값 없는 환경/정책 identity에 반영한다. 사용하지 않는 과거 runtime config·개인 config를 조회·복원하거나 인증 cache를 추가하지 않는다. 과거 환경의 증거 부재나 확인 불가를 동일성으로 대용하지 않는다.
 - 자동 역할·권한·검증은 고정된 docs/AGENTS.common.md와 해당 역할의 docs/AGENTS.*.md instruction을 사용하고, 설계·계획 작성은 docs/ARCHITECTURE.md·docs/PLANS.md를 참조한다. 프로젝트 지침 해석은 Agent CLI에 맡기며 Manager가 루트 지침을 읽거나 과거 승인·patch를 Review receipt에 추가하지 않는다. 기존 helper·관련 테스트와 R-064의 예약 경로를 유지한다.
 
 ## Validation
@@ -64,6 +64,7 @@ priority: high
 - 실제 Review가 필요한 경우 실행한 verify 또는 재사용한 verify의 유효한 근거가 같은 후보에 결합돼 전달되는지 확인한다. Review 생략은 새 Reviewer 호출·새 테스트 실행 근거를 만들지 않는다.
 - 단계별 문서 변경 뒤 선행 PASS·VERIFY_REQUIRED·최종 PASS를 구분하고, 일반 verify 재사용 및 새 완료 조건의 증거 부재에서 최종 Review를 잘못 생략하지 않는 최소 unit case를 확인한다.
 - R-085 fixture에서 실제 미소비 개인 설정만 변경한 경우와 관리 home/source·소비 설정/정책 변경·과거 환경 identity 부재를 분리한다. 실제 no-call/필수 Reviewer call·기존 receipt 보존·비밀값 비노출을 확인하며 모의 인증 성공을 실계정 실행 근거로 사용하지 않는다.
+- 공통 홈의 정상 설정 생성/교체 뒤에는 새 현재 설정 관측을 사용하고 낡은 설정의 Review를 재사용하지 않는다. 호출별 소유 임시 경로 정규화가 다른 worktree/role/정책 변경을 숨기지 않는지 기존 provider execution fixture로 확인한다. R-085 Non-Goals의 session/CLI·실계정/OS 호환성 미수행을 별도 선행 gate로 추가하지 않으며 현재 호출의 실제 격리/완료 증거는 계속 요구한다.
 
 ## Progress
 
