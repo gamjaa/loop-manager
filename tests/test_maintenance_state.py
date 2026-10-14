@@ -1223,7 +1223,9 @@ class MaintenanceStateRepositoryTest(unittest.TestCase):
         connection = self._connection()
         self.addCleanup(connection.close)
         tiered_review.ensure_schema(connection)
-        connection.execute("INSERT INTO tiered_maintenance_success VALUES ('one', '{}', '[]', ?, 0, ?, 'receipt')", ("a" * 40, "a" * 40))
+        connection.execute("INSERT INTO tiered_maintenance_success "
+            "(repo, records_json, roots_json, source_revision, full_merged_count, full_source_revision, assessment_digest) "
+            "VALUES ('one', '{}', '[]', ?, 0, ?, 'receipt')", ("a" * 40, "a" * 40))
         repository = maintenance_state.MaintenanceRepository(connection)
         with self.assertRaisesRegex(maintenance_state.MaintenanceStateError, "종료 경계"):
             repository.file_assessment_due("one", 20)
