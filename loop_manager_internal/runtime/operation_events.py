@@ -88,20 +88,20 @@ def progress(label: str, *, describe=None, interval=None):
 
 @contextmanager
 def activity(label: str, *, heartbeat=False, **fields):
-    """처리 경계의 시작·결과를 기록한다. 성공 의미는 호출자가 관측 결과로 채운다."""
+    """짧은 처리는 종료 한 줄, 긴 처리는 주기적 관측과 종료 결과를 기록한다."""
     from contextlib import nullcontext
     started, result = time.monotonic(), {}
-    emit(f"{label} 시작", **fields)
     try:
-        with progress(label) if heartbeat else nullcontext():
+        with progress(label, describe=lambda: fields) if heartbeat else nullcontext():
             yield result
     except BaseException as error:
         handoff = isinstance(error, SelfMergeRuntimeHandoff)
         emit(f"{label} 종료", level="INFO" if handoff else "WARN",
              result="runtime_handoff" if handoff else "미확인" if not isinstance(error, Exception) else "실패",
-             error_type=type(error).__name__, elapsed_seconds=round(time.monotonic() - started, 1))
+             error_type=type(error).__name__, elapsed_seconds=round(time.monotonic() - started, 1), **fields)
         raise
     else:
+        result = {**fields, **result}
         level = result.pop("level", "INFO")
         emit(f"{label} 종료", level=level, elapsed_seconds=round(time.monotonic() - started, 1), **result)
 
