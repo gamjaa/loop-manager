@@ -1,4 +1,5 @@
 from contextlib import closing
+from concurrent.futures import ThreadPoolExecutor
 import configparser
 import json
 import io
@@ -6,6 +7,7 @@ import os
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
@@ -17,6 +19,41 @@ from tests.support.worker import worker_result
 
 
 class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
+    def test_parallel_claude_resumes_share_home_but_keep_sessions_temporary_paths_and_results(self):
+        config = profile_config(self)
+        barrier = threading.Barrier(2)
+        calls = []
+
+        def resume(arguments, **options):
+            session = arguments[arguments.index('--resume') + 1]
+            calls.append((session, options))
+            barrier.wait(timeout=10)
+            return subprocess.CompletedProcess(arguments, 0, stdout=json.dumps(
+                {'type': 'result', 'session_id': session, 'result': session}))
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            worktrees = [root / name for name in ('first', 'second')]
+            for worktree in worktrees:
+                worktree.mkdir()
+            state = root / 'state'
+            with mock.patch.dict(os.environ, {'HOME': str(root / 'user'), 'USERPROFILE': str(root / 'user')}), \
+                 mock.patch('loop_manager.claude_role', return_value=('claude-opus-test', 'high')), \
+                 mock.patch('loop_manager.subprocess.run', side_effect=resume), \
+                 ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(lambda worktree: loop_manager.run_claude(
+                    worktree, state, config, 'planner', 'continue', read_only=False,
+                    persist_session=True, session_id=worktree.name), worktrees))
+            self.assertEqual([result.session_id for result in results], ['first', 'second'])
+            self.assertEqual([result.message for result in results], ['first', 'second'])
+            self.assertEqual({options['env']['CLAUDE_CONFIG_DIR'] for _, options in calls},
+                             {str(state / 'automation-claude')})
+            temporary = {options['env']['TMPDIR'] for _, options in calls}
+            self.assertEqual(len(temporary), 2)
+            self.assertTrue(all(Path(path).is_dir() for path in temporary))
+            logs = list((state / 'logs').glob('*/claude-planner-last.txt'))
+            self.assertEqual({path.read_text() for path in logs}, {'first', 'second'})
+
     def test_policy_failure_stops_retry_and_session_fallback(self):
         failures = (
             "auto_review classifier timeout",
@@ -363,6 +400,9 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
         )
         self.assertNotIn("worker prompt", start_arguments)
         self.assertEqual(start_options["cwd"], worktree)
+        self.assertEqual(start_options['env']['CLAUDE_CONFIG_DIR'], str(state_dir / 'automation-claude'))
+        self.assertEqual(resume_options['env']['CLAUDE_CONFIG_DIR'], start_options['env']['CLAUDE_CONFIG_DIR'])
+        self.assertNotEqual(start_options['env']['TMPDIR'], resume_options['env']['TMPDIR'])
         self.assertIn("--resume", resume_arguments)
         self.assertIn("stream-json", resume_arguments)
         self.assertIn(session_id, resume_arguments)

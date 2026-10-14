@@ -108,7 +108,7 @@ R-023의 원격 실행·self handoff 목표는 유지하며 로컬 갱신 gate�
 
 규칙:
 - READY, IMPLEMENTING, VERIFYING, REVIEWING, PUBLISHING, PR_OPEN 또는 PLAN_BLOCKED ExecPlan, PROJECT_BLOCKED 레코드가 있거나 해결되지 않은 `planning_error`가 있는 프로젝트는 등록 해제할 수 없다
-- 공급자 호출·인증·모델 조회와 격리 검증은 선택된 상태 루트의 `automation-codex`·`automation-claude`를 전용 설정 원본으로 사용한다. 외부 공급자 홈 지정과 부모 환경을 변경하지 않으며 새 전용 인증 파일은 기본 사용자 인증 파일만 심볼릭 링크로 공유한다. 기존 전용 파일은 보존하고 인증·링크 준비 실패는 해당 공급자의 오류로 처리한다. 개인 설정 전체를 가져오거나 기본 홈으로 fallback하지 않는다
+- 공급자 호출·인증·모델 조회와 격리 검증은 선택된 상태 루트의 `automation-codex`·`automation-claude`를 공급자별 공통 홈으로 직접 사용한다. 호출별 임시 폴더와 작업 권한은 별도로 관리한다. 외부 공급자 홈 지정과 부모 환경을 변경하지 않으며 새 전용 인증 파일은 기본 사용자 인증 파일만 심볼릭 링크로 공유한다. 기존 전용 파일은 보존하고 인증·링크 준비 실패는 해당 공급자의 오류로 처리한다. 개인 설정 전체를 가져오거나 기본 홈으로 fallback하지 않는다
 - Telegram token과 chat ID가 모두 비어 있으면 알림 기능을 비활성화하고 전송을 시도하지 않는다
 - Telegram token과 chat ID 중 하나만 설정돼 있으면 설정 오류로 처리한다
 

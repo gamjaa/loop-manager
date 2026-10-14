@@ -182,8 +182,8 @@ def _assert_no_codex_extensions(worktree: Path, environment_variables: dict[str,
         except (OSError, tomllib.TOMLDecodeError) as error:
             raise IsolationError("Codex 확장 설정을 확인할 수 없습니다.") from error
         if os.name != 'nt' and configuration.get('cli_auth_credentials_store') not in (None, 'file'):
-            # 역할별 홈은 경로로 구분되는 credential store를 원본 홈과 공유하지 못한다.
-            raise IsolationError('Codex 역할별 실행 홈에서 파일 외 인증 저장소를 공유할 수 없습니다. '
+            # 기본 사용자 홈과 공통 홈의 경로 의존 인증 공유는 검증되지 않았다.
+            raise IsolationError('Codex 자동 실행 홈에서 파일 외 인증 저장소 재사용을 확인할 수 없습니다. '
                                  '전용 CODEX_HOME의 파일 인증을 준비하고 조직 정책은 유지하세요.')
         if any(configuration.get(name) for name in
                ("mcp_servers", "hooks", "notify", "profile", "profiles",

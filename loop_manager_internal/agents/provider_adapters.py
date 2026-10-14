@@ -5,9 +5,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
+import tempfile
 import threading
 from typing import Protocol
 
@@ -515,6 +517,10 @@ def run_claude(
             session_id=session_id, environment_variables=launch_environment,
         )
     project_dir = _provider_log_directory(worktree, state_dir)
+    attempt = Path(tempfile.mkdtemp(prefix=f'claude-{role_name}-', dir=project_dir))
+    launch_environment['TMPDIR'] = str(attempt)
+    if os.name == 'nt':
+        launch_environment['TMP'] = launch_environment['TEMP'] = str(attempt)
     log = project_dir / f"claude-{role_name}.log"
     last_message = project_dir / f"claude-{role_name}-last.txt"
     last_message.unlink(missing_ok=True)
