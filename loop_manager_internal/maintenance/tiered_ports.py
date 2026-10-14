@@ -164,6 +164,7 @@ class TieredMaintenancePort:
         return result
 
     def validate_final(self, run, decision):
+        run.tiered_root_plan_links = ()
         evidence = self.repository.evidence(run.context.repo, run.maintenance_cycle.revision, str(run.row.active_sha))
         if evidence is None:
             raise tiered_review.TieredReviewError("정밀 근거가 없습니다.")
@@ -239,24 +240,51 @@ class TieredMaintenancePort:
                 if linked is None:
                     raise tiered_review.TieredReviewError("모듈 발견 또는 루트 후보가 유효한 계획에 연결되지 않았습니다.")
                 if is_root:
-                    path, text = linked
+                    path, _text = linked
                     root_links.append({"path": finding["path"], "destination": finding["destination"],
                         "root_review_hash": finding["root_review_hash"], "status": status,
                         "plan_id": plan_id, "plan_path": path.relative_to(run.planning_worktree).as_posix(),
-                        "plan_hash": tiered_review.plan_content_hash(path.read_bytes()),
                         "reason": item["reason"]})
             new_ids = {item["plan_id"] for item in dispositions if item["status"] == "new_plan"}
             if new_ids != (set(decision.plan_ids) if decision.outcome is MaintenanceOutcome.REFACTORING else set()):
                 raise tiered_review.TieredReviewError("새 리팩터링 계획과 모듈 발견 연결이 다릅니다.")
-            if root_candidates:
-                self.repository.record_root_plan_links(run.context.repo, run.maintenance_cycle.revision,
-                    str(run.row.active_sha), root_links, plan_repository=run.planning_worktree)
+            run.tiered_root_plan_links = tuple(root_links)
             return tuple(sorted({item["plan_id"] for item in dispositions if item["status"] == "existing_plan"}))
         elif decision.plan_ids:
             from loop_manager_internal.maintenance.maintenance_orchestration import MaintenanceOutcome
             if decision.outcome is not MaintenanceOutcome.PREREQUISITES:
                 raise tiered_review.TieredReviewError("모듈 발견 없이 리팩터링 계획을 만들 수 없습니다.")
         return ()
+
+    def record_final_root_plan_links(self, run, validated_result):
+        """Bind root evidence to the final plan IDs and bytes after Manager edits."""
+        drafts = run.tiered_root_plan_links
+        if not drafts:
+            return
+        allocations = {item.source_id: item for item in getattr(validated_result, "id_allocations", ())}
+        root = run.planning_worktree.resolve()
+        links = []
+        for draft in drafts:
+            allocation = allocations.get(draft["plan_id"])
+            plan_id = allocation.target_id if allocation else draft["plan_id"]
+            plan_path = allocation.target_path if allocation else draft["plan_path"]
+            target = run.planning_worktree / plan_path
+            if (target.is_symlink() or not target.resolve().is_relative_to(root)
+                    or any(parent.is_symlink() for parent in target.parents if parent != root)
+                    or not target.is_file()):
+                raise tiered_review.TieredReviewError("최종 루트 이동 계획 경로가 안전한 일반 파일이 아닙니다.")
+            try:
+                contents = target.read_bytes()
+                text = contents.decode("utf-8")
+            except (OSError, UnicodeDecodeError) as error:
+                raise tiered_review.TieredReviewError("최종 루트 이동 계획을 UTF-8 원본으로 읽을 수 없습니다.") from error
+            if not _root_move_plan_covers(draft["path"], draft["destination"], text):
+                raise tiered_review.TieredReviewError("최종 루트 이동 계획이 조사된 경로 보존을 다루지 않습니다.")
+            links.append({**draft, "plan_id": plan_id, "plan_path": plan_path,
+                          "plan_hash": tiered_review.plan_content_hash(contents)})
+        self.repository.record_root_plan_links(run.context.repo, run.maintenance_cycle.revision,
+            str(run.row.active_sha), links, plan_repository=run.planning_worktree)
+        run.tiered_root_plan_links = ()
 
 
 def prepare_query_context(connection, repository, base, revision, directory):

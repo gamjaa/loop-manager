@@ -24,7 +24,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS tiered_maintenance_success (
     repo TEXT PRIMARY KEY, records_json TEXT NOT NULL, roots_json TEXT NOT NULL,
     source_revision TEXT NOT NULL, full_merged_count INTEGER, full_source_revision TEXT,
-    assessment_digest TEXT NOT NULL, root_reviews_json TEXT);
+    assessment_digest TEXT NOT NULL, root_reviews_json TEXT, guidance_hash TEXT);
 CREATE TABLE IF NOT EXISTS tiered_maintenance_assessments (
     repo TEXT PRIMARY KEY, cycle INTEGER NOT NULL, source_revision TEXT NOT NULL,
     digest TEXT NOT NULL, assessment_json TEXT NOT NULL);
@@ -56,6 +56,8 @@ def ensure_schema(connection):
     columns = {row[1] for row in connection.execute("PRAGMA table_info(tiered_maintenance_success)")}
     if "root_reviews_json" not in columns:
         connection.execute("ALTER TABLE tiered_maintenance_success ADD COLUMN root_reviews_json TEXT")
+    if "guidance_hash" not in columns:
+        connection.execute("ALTER TABLE tiered_maintenance_success ADD COLUMN guidance_hash TEXT")
 
 
 def digest(value) -> str:
@@ -148,10 +150,12 @@ class TieredReviewRepository:
 
     def success(self, repo):
         row = self.connection.execute("SELECT records_json, roots_json, source_revision, full_merged_count, "
-            "full_source_revision, assessment_digest, root_reviews_json FROM tiered_maintenance_success WHERE repo = ?", (repo,)).fetchone()
+            "full_source_revision, assessment_digest, root_reviews_json, guidance_hash "
+            "FROM tiered_maintenance_success WHERE repo = ?", (repo,)).fetchone()
         return None if row is None else {"records": json.loads(row[0]), "roots": json.loads(row[1]),
             "source_revision": row[2], "full_merged_count": row[3], "full_source_revision": row[4],
-            "digest": row[5], "root_reviews": json.loads(row[6]) if row[6] is not None else None}
+            "digest": row[5], "root_reviews": json.loads(row[6]) if row[6] is not None else None,
+            "guidance_hash": row[7]}
 
     def select(self, repo, repository, base, revision, interval, merged_count, *, force_full=False):
         if interval <= 0:
@@ -166,13 +170,15 @@ class TieredReviewRepository:
         previous = self.success(repo)
         root_source, root_reviews = None, ()
         if placements:
+            guidance_hash = common_guidance.effective_planning_hash(self.connection, repo)
             from loop_manager_internal.storage.maintenance_file_ledger import (
                 FileReviewRepository, root_review_source, validate_root_reviews,
             )
             root_source = asdict(root_review_source(repository, inventory))
             root_reviews = FileReviewRepository(self.connection).reusable_root_reviews(repo, inventory)
             if root_reviews is None and previous is not None and previous["root_reviews"] is not None:
-                if previous["source_revision"] == revision:
+                if (previous["source_revision"] == revision
+                        and previous["guidance_hash"] == guidance_hash):
                     try:
                         root_reviews = validate_root_reviews(repository, inventory, previous["root_reviews"])
                     except (ValueError, TypeError):
@@ -506,7 +512,11 @@ class TieredReviewRepository:
                 "WHERE repo = ? AND cycle = ? AND source_revision = ?", (repo, cycle, revision),
             ).fetchone()
             if current:
-                if (current[0], json.loads(current[1])) != (evidence["digest"], normalized):
+                try:
+                    saved_links = code_index.encode(json.loads(current[1]))
+                except (TypeError, ValueError) as error:
+                    raise TieredReviewError("저장된 루트 계획 연결이 손상됐습니다.") from error
+                if current[0] != evidence["digest"] or saved_links != encoded:
                     raise TieredReviewError("같은 평가의 루트 계획 연결이 달라졌습니다.")
                 return normalized
             with self.connection:
@@ -529,10 +539,10 @@ class TieredReviewRepository:
         full_sha = evidence["source_revision"] if evidence["mode"] == "full" else prior["full_source_revision"] if prior else None
         self.connection.execute("INSERT OR REPLACE INTO tiered_maintenance_success "
             "(repo, records_json, roots_json, source_revision, full_merged_count, full_source_revision, "
-            "assessment_digest, root_reviews_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            "assessment_digest, root_reviews_json, guidance_hash) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (repo, code_index.encode(evidence["records"]), code_index.encode(evidence["roots"]),
              evidence["source_revision"], full_count, full_sha, evidence["digest"],
-             code_index.encode(evidence["root_reviews"])))
+             code_index.encode(evidence["root_reviews"]), evidence.get("guidance_hash")))
         if evidence["request_id"]:
             self.connection.execute("DELETE FROM tiered_maintenance_requests WHERE repo = ? AND request_id = ?",
                                     (repo, evidence["request_id"]))

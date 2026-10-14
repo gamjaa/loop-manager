@@ -703,6 +703,14 @@ class PlanningAssessmentService(PlanningService):
                 except (AssessmentError,
                         maintenance_state.MaintenanceStateError) as error:
                     raise PlanningResultInvalid(str(error)) from error
+            if (run.tiered_root_plan_links and decision is not None
+                    and decision.outcome is not MaintenanceOutcome.UNSAFE):
+                try:
+                    self._ports.tiered.record_final_root_plan_links(
+                        run, validated_result,
+                    )
+                except TieredReviewError as error:
+                    raise PlanningResultInvalid(str(error)) from error
         except PlanningResultInvalid as error:
             message = str(error)
             retry_count = row.planning_retry_count

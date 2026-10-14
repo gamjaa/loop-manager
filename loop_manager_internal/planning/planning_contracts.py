@@ -619,6 +619,7 @@ class _PlanningRun:
     dirty_files: list[str] | None = None
     planner_scope_error: str | None = None
     maintenance_decision: MaintenancePlannerDecision | None = None
+    tiered_root_plan_links: tuple[dict[str, object], ...] = ()
     validated_result: Any = None
     retirement_pending: tuple[Any, ...] = ()
     error_input_changed: bool = False

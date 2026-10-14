@@ -3,6 +3,8 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import sqlite3
+import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
@@ -11,6 +13,7 @@ from loop_manager_internal.maintenance.maintenance_file_inventory import (
     SourceInventory, ClassifiedPath, TrackedSource, tracked_source_inventory,
 )
 from loop_manager_internal.maintenance.maintenance_file_review import RESULT_PREFIX as FILE_REVIEW_PREFIX
+from loop_manager_internal.storage import maintenance_file_ledger
 from tests.support.maintenance import inventory, root_results_for
 from tests.support.maintenance_planning_case import MaintenancePlanningCase, git
 
@@ -277,6 +280,89 @@ class TieredReviewTest(unittest.TestCase):
         self.assertEqual(migrated['guidance_hash'], 'c' * 64)
         self.assertEqual(migrated['prior_guidance_assessment'], legacy)
         self.assertIsNotNone(self.repository.pending('repo', migrated))
+
+    def test_root_plan_links_are_idempotent_after_repository_restart(self):
+        root = {"path": "legacy", "category": "internal_implementation",
+            "destination": "src/legacy", "reason": "Move the internal legacy tree safely."}
+        with tempfile.TemporaryDirectory() as directory:
+            repository_root = Path(directory)
+            plan_path = "docs/plans/[G-003] Move Legacy.md"
+            target = repository_root / plan_path
+            target.parent.mkdir(parents=True)
+            contents = b"the final validated preservation plan\n"
+            target.write_bytes(contents)
+            link = {"path": "legacy", "destination": "src/legacy",
+                "root_review_hash": maintenance_file_ledger.root_review_hash(root),
+                "status": "new_plan", "plan_id": "G-003", "plan_path": plan_path,
+                "plan_hash": tiered_review.plan_content_hash(contents),
+                "reason": "The plan preserves the investigated root tree and its references."}
+            evidence = {"root_reviews": [root], "digest": "e" * 64}
+            with mock.patch.object(self.repository, "evidence", return_value=evidence):
+                first = self.repository.record_root_plan_links(
+                    "repo", 2, "sha", [link], plan_repository=repository_root)
+
+            restarted = tiered_review.TieredReviewRepository(self.connection)
+            with mock.patch.object(restarted, "evidence", return_value=evidence):
+                second = restarted.record_root_plan_links(
+                    "repo", 2, "sha", [link], plan_repository=repository_root)
+
+        self.assertEqual(first, second)
+        saved = self.connection.execute(
+            "SELECT assessment_digest, links_json FROM tiered_maintenance_root_plan_links"
+        ).fetchone()
+        self.assertEqual(saved[0], evidence["digest"])
+        self.assertEqual(json.loads(saved[1]), list(first))
+
+    def test_success_schema_migrates_existing_rows_with_no_guidance_hash(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        connection.execute("CREATE TABLE tiered_maintenance_success ("
+            "repo TEXT PRIMARY KEY, records_json TEXT NOT NULL, roots_json TEXT NOT NULL, "
+            "source_revision TEXT NOT NULL, full_merged_count INTEGER, full_source_revision TEXT, "
+            "assessment_digest TEXT NOT NULL, root_reviews_json TEXT)")
+        connection.execute("INSERT INTO tiered_maintenance_success VALUES "
+                           "('repo', '{}', '[]', 'sha', 0, 'sha', 'digest', '[]')")
+
+        saved = tiered_review.TieredReviewRepository(connection).success("repo")
+
+        self.assertEqual(saved["root_reviews"], [])
+        self.assertIsNone(saved["guidance_hash"])
+
+    def test_prior_root_success_requires_the_same_guidance_hash(self):
+        from loop_manager_internal.agents import common_guidance
+
+        with mock.patch.object(common_guidance, "effective_planning_hash", return_value="old-guidance"):
+            self.complete(self.select())
+        self.assertEqual(self.repository.success("repo")["guidance_hash"], "old-guidance")
+        saved_root = {"path": "docs", "category": "documentation"}
+        self.connection.execute(
+            "UPDATE tiered_maintenance_success SET roots_json = ?, root_reviews_json = ? WHERE repo = ?",
+            (code_index.encode([saved_root]), code_index.encode([{"path": "docs"}]), "repo"),
+        )
+
+        inv = inventory(self.sources, "sha")
+        actual = SourceInventory("sha", tuple(
+            TrackedSource(source.path, source.content_hash, source.mode, "sha", "source")
+            for source in inv.sources), tuple(
+            ClassifiedPath(path, "source", "source") for path in self.sources))
+        placement = SimpleNamespace(path="docs", category="documentation", reason="Tracked docs root")
+        source = TrackedSource(".", "d" * 64, "040000", "sha", "root review source")
+        with mock.patch.object(tiered_review, "cached_source_inventory", return_value=actual), \
+                mock.patch.object(tiered_review, "root_placement_inventory", return_value=(placement,)), \
+                mock.patch.object(code_index, "git", side_effect=lambda _repo, _command, value:
+                    self.sources[value.split(":", 1)[1]]), \
+                mock.patch.object(common_guidance, "effective_planning_hash", return_value="new-guidance"), \
+                mock.patch.object(maintenance_file_ledger, "root_review_source", return_value=source), \
+                mock.patch.object(maintenance_file_ledger.FileReviewRepository,
+                                  "reusable_root_reviews", return_value=None), \
+                mock.patch.object(maintenance_file_ledger, "validate_root_reviews",
+                                  side_effect=AssertionError("stale guidance must not reuse tiered roots")):
+            selection = self.repository.select("repo", Path("/repo"), "main", "sha", 20, 0)
+
+        self.assertTrue(selection.required)
+        self.assertEqual(selection.reasons, ("root_review_required",))
+        self.assertIsNone(selection.root_reviews)
 
 
 class TieredRootReviewTest(MaintenancePlanningCase):
