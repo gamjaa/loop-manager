@@ -449,6 +449,8 @@ definition snapshot에는 원래 ExecPlan 전문과 전체 body hash를 함께 �
 
 모든 관리 rebase의 시작·충돌 해결·완료·중단 복구는 현재 repository·계획·canonical worktree·소유 branch·target base·원격 OID와 PR identity/head를 확인한다. Worker 교정 turn, 승인 stage tree, 명령 receipt, reflog 표식, 원본 commit별 replay와 journal 완전성은 완료 조건이 아니며 기존 기록과 실패 감사는 보존한다
 
+rebase 시작 전 Worker branch와 target의 merge-base 이후 모두 바뀐 Requirement·ExecPlan 경로는 해당 소유 rebase의 문서 재생 입력으로만 허용한다. 이 예외는 Worker 변경 승인으로 이어지지 않으며, 충돌 해결·stage·재시작 뒤에도 target revision의 고정 원문과 경로로 대조하기 전에는 완료 채택하지 않는다.
+
 자동 Worker 해결과 사용자의 수동 파일 해결·stage·continue·완료를 같은 현재 상태 판정으로 수용한다. 소유 rebase의 Requirement·ExecPlan 충돌은 `rebase_documents`가 관측한 원격 base의 immutable revision에서 catalog·ID·source·dependency와 실제 PR 경계를 확인한 뒤 해당 문서의 bytes·mode·경로·삭제를 채택한다. PRODUCT·ARCHITECTURE·지침과 코드·테스트·설정은 자동 선택하지 않는다. rename·archive의 목적지는 같은 원본 ID로 확인하며 현재 작업의 삭제·archive·미반영 rename으로 유효성을 확정할 수 없으면 원인과 범위를 checkpoint에 보존한다.
 
 교체 전의 작업 HEAD·replay commit·문서 원문·stage별 blob·작업 파일과 문서 외 index·dirty·operation 근거는 기존 execution checkpoint에 보존한다. 중간 HEAD의 문서 blob도 보존하며 소유 operation의 같은 HEAD에서만 committed 형상으로 인정하고, staged 형상은 pinned base blob으로 따로 검증한다. 파일별 교체와 pinned blob의 index 적용 전후를 대조하고 소유권·원격 lease·PR을 재확인한다. 적용·stage 중단은 같은 원문으로 재개하고 뒤늦은 replay 충돌도 같은 문서 revision을 사용한다. 후속 catalog·source·rename 판정 오류의 uncertain 기록도 이전 채택 이력과 원문·blob을 유지한다. 모든 재생 위치의 채택 경로를 checkpoint 이력에서 모아 완료 직전 HEAD·index·작업 파일을 원문과 대조한다. 후속 비충돌 재생이 원문을 바꿨으면 완료 채택을 거부하고 checkpoint와 작업물을 기존 복구 경계에 보존한다. rebase target은 바꾸지 않으며 원격 재전진은 기존 operation 완료 후 반영한다. 문서 전용 충돌은 Manager가 continue/skip하고 혼합 충돌의 나머지 파일과 autostash 충돌은 기존 Worker 교정 경계에 남긴다. 문서 Progress는 현재 후보의 실행·검증 성공 증거가 아니며 완료 후의 입력 재평가·verify·Review·게시 gate는 유지한다
