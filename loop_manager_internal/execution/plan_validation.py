@@ -334,8 +334,10 @@ def restore_worker_frontmatter(worktree, relative_path, plan, *, repo, revision,
         raise ExecPlanMetadataError('frontmatter 복원의 공식 경로가 다릅니다.')
     root = worktree.resolve()
     target = root / relative_path
-    if target.resolve() != target or not stat.S_ISREG(target.lstat().st_mode):
+    observed = target.lstat()
+    if target.resolve() != target or not stat.S_ISREG(observed.st_mode):
         raise ExecPlanMetadataError('frontmatter 복원 대상이 실제 작업 파일이 아닙니다.')
+    identity = lambda info: (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns)
     candidate = target.read_bytes()
     def split(raw):
         lines = raw.splitlines(keepends=True)
@@ -389,9 +391,8 @@ def restore_worker_frontmatter(worktree, relative_path, plan, *, repo, revision,
             stream.write(desired + body)
             stream.flush()
             os.fsync(stream.fileno())
-        mode = stat.S_IMODE(target.stat().st_mode)
-        os.chmod(temporary, mode)
-        if target.read_bytes() != candidate:
+        os.chmod(temporary, stat.S_IMODE(observed.st_mode))
+        if target.resolve() != target or identity(target.lstat()) != identity(observed) or target.read_bytes() != candidate:
             raise RuntimeError('frontmatter 복원 전 파일이 다시 변경됐습니다.')
         os.replace(temporary, target)
     finally:
