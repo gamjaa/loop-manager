@@ -13,6 +13,21 @@ from loop_manager_internal.agents.agent_invocation import AgentResult, run_agent
 
 
 class OperationObservabilityTests(TestCase):
+    def test_log_shortens_identifiers_and_both_path_styles_only_for_display(self):
+        run = "82961ed208bbf88263b9bacf52d72b32"
+        runtime_sha = "fe06cca9d9bb4d57c9e67693caf0846a0adb7059"
+        for project in ("/home/jeong/loop-manager/", "D:\\repo\\loop-manager\\"):
+            with self.subTest(project=project):
+                output = io.StringIO()
+                with mock.patch("sys.stdout", output), events.log_context(run=run, project=project):
+                    events.emit("runtime 준비 종료", runtime_sha=runtime_sha)
+                    self.assertEqual(events.current_context()["run"], run)
+                    self.assertEqual(events.current_context()["project"], project)
+                self.assertIn("[run=82961ed project=loop-manager plan=- stage=-]", output.getvalue())
+                self.assertIn("runtime_sha=fe06cca", output.getvalue())
+                for full_value in (run, runtime_sha, project):
+                    self.assertNotIn(full_value, output.getvalue())
+
     def test_context_isolated_in_parallel_and_values_cannot_inject_log_lines(self):
         output, barrier = io.StringIO(), threading.Barrier(2)
         def run(project):

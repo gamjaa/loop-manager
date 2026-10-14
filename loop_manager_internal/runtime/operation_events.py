@@ -36,8 +36,12 @@ def log_context(**values):
         _context.reset(token)
 
 
-def _value(value) -> str:
+def _value(value, key=None) -> str:
     text = redact_secrets(str(value if value is not None else "-"))
+    if key in ("run", "runtime_sha"):
+        text = text[:7]
+    elif key == "project":
+        text = text.replace("\\", "/").rstrip("/").rsplit("/", 1)[-1] or "-"
     return json.dumps(text, ensure_ascii=False) if not text or any(
         char.isspace() or char in '"[]=;' for char in text
     ) else text
@@ -125,9 +129,9 @@ def operation_log(effects: OperationLogEffects, message: str, *, error: bool = F
         context = _context.get()
         level = level or (context.get("error_level", "ERROR") if error else "INFO")
         prefix = effects.local_now().astimezone().isoformat(sep=" ", timespec="seconds")
-        identity = " ".join(f"{key}={_value(context.get(key))}" for key in ("run", "project", "plan", "stage"))
+        identity = " ".join(f"{key}={_value(context.get(key), key)}" for key in ("run", "project", "plan", "stage"))
         text = redact_secrets(str(message)).replace("\\", "\\\\").replace("\r", r"\r").replace("\n", r"\n").replace("\t", r"\t").replace("\x1b", r"\x1b")
-        details = redact_secrets("".join(f"; {key}={_value(value)}" for key, value in fields.items()))
+        details = redact_secrets("".join(f"; {key}={_value(value, key)}" for key, value in fields.items()))
         output = sys.stderr if level != "INFO" or context.get("result_output") else sys.stdout
         with _output_lock:
             __import__("builtins").print(f"{prefix} {level} [{identity}] {text}{details}", file=output, flush=True)
