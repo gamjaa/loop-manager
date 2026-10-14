@@ -265,7 +265,12 @@ class TieredMaintenancePort:
         root = run.planning_worktree.resolve()
         links = []
         for draft in drafts:
-            allocation = allocations.get(draft["plan_id"])
+            allocation = (allocations.get(draft["plan_id"])
+                          if draft["status"] == "new_plan" else None)
+            if allocation is not None and allocation.source_path != draft["plan_path"]:
+                raise tiered_review.TieredReviewError(
+                    "루트 이동 계획 ID allocation의 원본 경로가 연결과 다릅니다."
+                )
             plan_id = allocation.target_id if allocation else draft["plan_id"]
             plan_path = allocation.target_path if allocation else draft["plan_path"]
             target = run.planning_worktree / plan_path

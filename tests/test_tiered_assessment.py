@@ -300,9 +300,9 @@ Run targeted unit tests, full verify, and a read-only Review.
         existing = self.run.planning_worktree / existing_path
         existing.write_text(plan_text("G-001", "assets.md", "docs/assets.md", depends_on=("G-000",)),
                             encoding="utf-8")
-        source_path = "docs/plans/[G-002] Preserve Notes.md"
+        source_path = "docs/plans/[G-003] Preserve Notes.md"
         source = self.run.planning_worktree / source_path
-        source.write_text(plan_text("G-002", "notes.md", "docs/notes.md"), encoding="utf-8")
+        source.write_text(plan_text("G-003", "notes.md", "docs/notes.md"), encoding="utf-8")
         self.connection.execute("INSERT INTO exec_plans VALUES (?, ?, ?, ?)",
             ("/repo", "G-001", "READY", existing_path))
         self.ports.tiered.repository.evidence = mock.Mock(return_value={
@@ -311,12 +311,12 @@ Run targeted unit tests, full verify, and a read-only Review.
         dispositions = [
             {"index": 0, "status": "existing_plan", "plan_id": "G-001",
              "reason": "The existing READY plan preserves the root asset and its references."},
-            {"index": 1, "status": "new_plan", "plan_id": "G-002",
+            {"index": 1, "status": "new_plan", "plan_id": "G-003",
              "reason": "The new plan preserves the root note and its references."},
         ]
         self.run.row = replace(self.run.row,
             planning_result="MODULE_FINDINGS_RESULT: " + json.dumps(dispositions))
-        decision = MaintenancePlannerDecision(MaintenanceOutcome.REFACTORING, ("G-002",))
+        decision = MaintenancePlannerDecision(MaintenanceOutcome.REFACTORING, ("G-003",))
         self.assertEqual(self.ports.tiered.validate_final(self.run, decision), ("G-001",))
         self.assertIsNone(self.connection.execute(
             "SELECT 1 FROM tiered_maintenance_root_plan_links").fetchone())
@@ -325,19 +325,45 @@ Run targeted unit tests, full verify, and a read-only Review.
         target = self.run.planning_worktree / target_path
         target.write_text(plan_text("G-004", "notes.md", "docs/notes.md"), encoding="utf-8")
         source.unlink()
-        source_allocation = PlanIdAllocation(source_path, "G-002", target_path, "G-004")
+        source_allocation = PlanIdAllocation(source_path, "G-003", target_path, "G-004")
         existing.write_text(plan_text("G-001", "assets.md", "docs/assets.md",
                                        depends_on=("G-000", "G-004")), encoding="utf-8")
-        validated_result = ValidatedPlanningResult(
-            plans=((target_path, {"id": "G-004", "title": "Preserve notes.md"}),),
-            publication_paths=(existing_path, target_path),
-            id_allocations=(source_allocation,),
+        general_source_path = "docs/plans/[G-001] New General Plan.md"
+        general_target_path = "docs/plans/[G-002] New General Plan.md"
+        (self.run.planning_worktree / general_target_path).write_text(
+            "A separate newly normalized general plan.", encoding="utf-8",
         )
+        general_allocation = PlanIdAllocation(
+            general_source_path, "G-001", general_target_path, "G-002",
+        )
+        validated_result = ValidatedPlanningResult(
+            plans=((target_path, {"id": "G-004", "title": "Preserve notes.md"}),
+                   (general_target_path, {"id": "G-002", "title": "New General Plan"})),
+            publication_paths=(existing_path, target_path, general_target_path),
+            id_allocations=(general_allocation, source_allocation),
+        )
+        drafts = self.run.tiered_root_plan_links
+        mismatched_allocation = PlanIdAllocation(
+            "docs/plans/[G-003] Different Source.md", "G-003", target_path, "G-004",
+        )
+        invalid_result = ValidatedPlanningResult(
+            plans=validated_result.plans,
+            publication_paths=validated_result.publication_paths,
+            id_allocations=(general_allocation, mismatched_allocation),
+        )
+        with self.assertRaisesRegex(tiered_review.TieredReviewError, "원본 경로"):
+            self.ports.tiered.record_final_root_plan_links(self.run, invalid_result)
+        self.assertEqual(self.run.tiered_root_plan_links, drafts)
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM tiered_maintenance_root_plan_links").fetchone())
+
         self.ports.tiered.record_final_root_plan_links(self.run, validated_result)
 
         saved = json.loads(self.connection.execute(
             "SELECT links_json FROM tiered_maintenance_root_plan_links").fetchone()[0])
         by_root = {item["path"]: item for item in saved}
+        self.assertEqual((by_root["assets.md"]["plan_id"], by_root["assets.md"]["plan_path"]),
+                         ("G-001", existing_path))
         self.assertEqual((by_root["notes.md"]["plan_id"], by_root["notes.md"]["plan_path"]),
                          ("G-004", target_path))
         self.assertEqual(by_root["notes.md"]["plan_hash"],
