@@ -40,7 +40,7 @@ Manager는 기존 snapshot·원격 revision·content hash·현재 실행 및 소
 
 ### ExecPlan 갱신 경계
 
-- Worker는 선택된 ExecPlan의 구현·검증 기록 등 본문만 수정한다. frontmatter와 다른 ExecPlan, 현재 작업과 무관한 Requirement는 수정하지 않는다. frontmatter 변경은 Planner·Manager가 검증하고 공식 선언·catalog·DB에 반영한 뒤 실행 입력으로 사용한다.
+- Worker는 선택된 ExecPlan의 구현·검증 기록 등 본문만 수정한다. frontmatter와 다른 ExecPlan, 활성·archive를 포함한 모든 Requirement는 수정하지 않는다. Worker는 현재 작업에 필요한 PRODUCT·ARCHITECTURE·FUTURE_IDEAS를 수정할 수 있다. Requirement 추가·삭제·rename·이동과 archive 후보 지정에 따른 Worker 수정 예외도 허용하지 않는다. frontmatter 변경은 Planner·Manager가 검증하고 공식 선언·catalog·DB에 반영한 뒤 실행 입력으로 사용한다.
 - 기존 source 경로의 rename 조회 호환은 R-071대로 유지한다. 누락·모호한 source나 잘못된 선언은 Worker 시작 전에 정합화하거나 Planner 교정으로 처리하며, Worker의 경로 수정이나 metadata 비교 완화로 우회하지 않는다. 교정은 기존 구현·문서·테스트·실행 기록을 보존하며 완료·verify 성공·차단 해제를 뜻하지 않는다.
 - 일반 Planner는 PR 등록 전인 ExecPlan을 관련 Requirement 변경에 맞춰 갱신한다. 최초 실행 여부, READY 복귀, 기존 branch·worktree·세션 또는 원격 checkpoint 존재만으로 갱신 대상에서 제외하지 않는다.
 - 진행 중 작업의 갱신은 같은 ExecPlan ID와 작업물·세션·실행 및 실패 이력을 보존한다. 이미 수행한 구현·검증 기록과 새 조건의 미충족 부분을 구분하며, 문서 갱신 자체를 작업 완료나 과거 실패 해소로 기록하지 않는다.
@@ -50,9 +50,11 @@ Manager는 기존 snapshot·원격 revision·content hash·현재 실행 및 소
 
 ### Worker 범위 밖 문서 변경의 복원 목표
 
-아래는 원본 브랜치 비교·범위 오류 진단 이후에 추가할 복원 요구이며, 현재 자동 복원이 구현됐다는 의미가 아니다.
+선택된 ExecPlan의 frontmatter는 Worker 종료 후 정상 작업 경계에서 Worker 시작 선언·공식 원본·본문 구분자가 확인될 때만 부분 복원한다. 본문 전체·mode·선택된 구현과 테스트는 보존하며, 사전 수정·동시 수정·진행 중 rebase·원본 또는 구분자 불확실성에서는 덮어쓰지 않는다. 변경 전후 선언과 본문 hash를 감사로 유지하고 Worker에게 복원 사실을 전달해 현재 문서 보고를 갱신한다. 새로운 선언 교정·DB 반영이나 검증 성공을 이 복원으로 대신하지 않는다.
 
-- rebase로 유입된 문서는 원본 브랜치와의 비교로 구분해 그대로 보존한다. Worker가 선택된 작업 외의 ExecPlan 또는 현재 작업과 무관한 Requirement를 직접 변경했는지는 호출 전후 형상과 원본을 함께 대조한다. 경로 차이만으로 변경 주체를 확정하지 않는다.
+아래 다른 문서의 파일·index 복원은 추가할 후속 요구이며, 선택된 frontmatter 부분 복원과 구분한다.
+
+- rebase로 유입된 문서는 원본 브랜치와의 비교로 구분해 그대로 보존한다. Worker가 선택된 작업 외의 ExecPlan 또는 활성·archive를 포함한 모든 Requirement를 직접 변경했는지는 호출 전후 형상과 원본을 함께 대조한다. 경로 차이만으로 변경 주체를 확정하지 않는다.
 - Manager는 Worker와 관련 writer가 종료한 뒤 실제 Worker 변경으로 확인된 경로만 복원한다. Worker 이전부터 존재한 수정·동시 외부 수정·소유권 불확실성이 있으면 덮어쓰지 않고 근거와 작업물을 보존해 기존 차단·복구 경계로 연결한다.
 - 복원 전에 대상 경로·기준 revision·변경 사유와 확보한 수정 내용을 보존한다. 복원은 해당 파일과 index entry에 한정하며 선택된 ExecPlan 본문·구현·테스트·다른 파일·HEAD·branch·실행 이력은 유지한다. 중단 뒤에도 보존한 입력과 현재 형상을 대조해 남은 복원만 처리하며 새로운 수정을 덮어쓰지 않는다.
 - 복원 성공은 차단 사유로 남기지 않는다. Manager가 같은 Worker 세션 또는 재개 문맥에 복원한 경로·원인을 전달해 현재 최종 diff와 문서 보고를 갱신하도록 한다. 복원 사실을 구현 완료·targeted test·전체 verify·Review 성공으로 취급하지 않으며 독립적인 실패는 유지한다.
@@ -153,7 +155,7 @@ Reviewer를 먼저 진행한 결과가 구현 부족이면 Worker 교정 후 필
 
 ## Acceptance Criteria
 
-- 선택된 ExecPlan의 본문 기록 수정은 허용한다. frontmatter 선언 불일치는 검증·Review 전에 거부하며, 범위 밖 문서 수정은 위 복원 목표에 따라 최종 후보에서 제거하거나 안전을 확인할 수 없으면 거부한다. 원본 브랜치에서 rebase로 유입된 문서는 범위 밖 변경에서 제외하며 실제 오류에는 비교 원본·후보 revision과 경로·변경 종류를 확인할 수 있다. source 경로 교정은 원격 공식 선언과 catalog·DB가 같은 결과를 채택한 뒤 보존된 Worker 구현·기록으로 재개하며, rename 조회 호환을 선언 일치로 오인하지 않는다.
+- 선택된 ExecPlan의 본문 기록과 PRODUCT·ARCHITECTURE·FUTURE_IDEAS의 관련 수정은 허용하고 모든 Requirement 변경은 거부한다. archive 후보 지정으로 Worker 쓰기 권한이 확대되지 않는다. Worker가 변경한 frontmatter는 위 부분 복원 조건을 충족하면 본문을 보존해 공식 선언으로 되돌리고, 조건을 확인할 수 없는 선언 불일치는 검증·Review 전에 거부하며, 범위 밖 문서 수정은 위 복원 목표에 따라 최종 후보에서 제거하거나 안전을 확인할 수 없으면 거부한다. 원본 브랜치에서 rebase로 유입된 문서는 범위 밖 변경에서 제외하며 실제 오류에는 비교 원본·후보 revision과 경로·변경 종류를 확인할 수 있다. source 경로 교정은 원격 공식 선언과 catalog·DB가 같은 결과를 채택한 뒤 보존된 Worker 구현·기록으로 재개하며, rename 조회 호환을 선언 일치로 오인하지 않는다.
 - 신규 Requirement의 목표가 이미 구현됐거나 기존 작업으로 충족되면 중복 ExecPlan이 생성되지 않는다. 기존 미착수 작업의 허용 개정과 독립적인 미충족 목표의 신규 생성이 구분되며 source·dependency와 DB 관계가 일치한다.
 - Requirement 수정의 변경 전후 동작·조건·완료 기준과 관련 작업을 확인할 수 있다. 변경·삭제된 항목의 체크리스트·관련 파일·변경 목적·Validation·source·dependency가 함께 갱신되고 이미 구현한 결과·유효한 검증·세션·실패·PR 이력은 보존된다.
 - 복수 Requirement의 일부 조건 또는 완료 기준만 삭제되면 그 부분의 작업·검증·참조만 제거된다. 다른 Requirement·PRODUCT의 목표와 공유 구현은 유지되고 필요한 선행 목표는 유효한 dependency로 남는다. 전체 철회만 R-055의 삭제·취소로 연결된다.

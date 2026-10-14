@@ -416,6 +416,7 @@ class WorkerHandler:
             feedback_repo.bind_session(delivery.attempt_id, result.session_id)
         if result.session_id and observed_session_id != result.session_id:
             session_started(result.session_id)
+        restored_frontmatter = []
         try:
             self.ports.update_snapshot(plan=self.ports.validate_worker_workspace_scope(
                 self.ports.identity.repo_path,
@@ -426,6 +427,7 @@ class WorkerHandler:
                 catalog_plan,
                 worker_scope_before,
                 scope_phase='IMPLEMENTING',
+                on_frontmatter_restored=restored_frontmatter.append,
                 allow_rebase=context.resolving_rebase,
                 **({'rebase_definition': DefinitionSnapshot.deserialize(
                     row['definition_snapshot']
@@ -480,6 +482,21 @@ class WorkerHandler:
         row = self.ports._row()
         catalog_plan = self.ports.snapshot().catalog_plan
         assert catalog_plan is not None
+        if restored_frontmatter:
+            detail = ('Manager가 선택된 ExecPlan의 frontmatter만 공식 선언으로 복원했습니다: '
+                      + ', '.join(restored_frontmatter)
+                      + '. 구현·검증 본문은 보존했습니다. frontmatter를 다시 수정하지 말고 최종 diff·문서 보고를 갱신하세요.')
+            self.ports.operation_log(detail)
+            self.ports.operation_print(detail)
+            if not code:
+                self.ports.clear_agent_scope(self.ports.identity.repo)
+                self.ports.state.update_project(self.ports.identity.repo, phase='WORKING',
+                                                last_error=detail, worker_result=message,
+                                                validated_base_sha=None, worker_input_token=None,
+                                                verify_result=None, review_result=None,
+                                                verify_token=None, review_token=None, publication_token=None)
+                return self.ports._retry(detail)
+            message = detail + '\n' + message
         if code:
             self.ports.clear_agent_scope(self.ports.identity.repo)
             if context.resolving_rebase:

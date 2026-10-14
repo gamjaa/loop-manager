@@ -353,6 +353,7 @@ class ValidateWorkerWorkspaceScopeEffects:
     validate_agent_scope: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
     git: Callable[..., object]
+    git_bytes: Callable[..., bytes] | None = None
 
 
 def validate_worker_workspace_scope(
@@ -372,6 +373,7 @@ def validate_worker_workspace_scope(
     scope_phase: str | None = None,
     connection: sqlite3.Connection | None = None,
     state_dir: Path | None = None,
+    on_frontmatter_restored: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
     """Validate one Worker-controlled operation before Manager Git writes."""
 
@@ -384,6 +386,18 @@ def validate_worker_workspace_scope(
         from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
         raise WorkspaceOwnershipError('Manager Git 작업 전에 index flags를 확인해야 합니다: '
                                       + ', '.join(unsafe_index[:8]))
+    if on_frontmatter_restored is not None and not allow_rebase:
+        if after.head != before.head:
+            raise RuntimeError('Worker 종료 전후 HEAD가 달라 frontmatter 복원을 보류합니다.')
+        effects.validate_managed_worktree(repo_path, worktree, branch)
+        if effects.git_bytes is None:
+            raise RuntimeError('frontmatter 복원의 원본 byte reader가 없습니다.')
+        from loop_manager_internal.execution.plan_validation import restore_worker_frontmatter
+        revision = str(catalog_plan['current_revision_sha'] or catalog_plan['active_sha'] or '')
+        if restore_worker_frontmatter(worktree, selected_plan_path, catalog_plan,
+                                      repo=str(repo_path), revision=revision, connection=connection, git_bytes=effects.git_bytes):
+            on_frontmatter_restored(selected_plan_path)
+            after = effects.capture_git_snapshot(worktree)
     resources = (agent_scope_decision.used_git_resources(
         role="worker", phase=scope_phase, base_branch=base_branch,
         branch=branch, worktree_key=str(worktree.resolve()),

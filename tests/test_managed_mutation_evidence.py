@@ -1459,7 +1459,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         self.assertEqual(service.expected.before_head, 'before')
         self.assertIsNone(service.adapters.read_remote(service.expected).pull_request)
         self.assertTrue(service.adapters.path_allowed('app.py'))
-        self.assertTrue(service.adapters.path_allowed('docs/requirements/Active.md'))
+        self.assertFalse(service.adapters.path_allowed('docs/requirements/Active.md'))
         self.assertFalse(service.adapters.path_allowed('docs/requirements/archive/UserDesign.md'))
         self.assertFalse(service.adapters.path_allowed('docs/plans/[G-048] Other.md'))
         self.assertFalse(service.adapters.path_allowed('docs/requirements/archive/Other.md'))

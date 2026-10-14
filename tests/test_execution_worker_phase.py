@@ -25,6 +25,20 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 
 class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+    def test_frontmatter_restore_is_reported_to_worker_without_final_block(self):
+        def validate(*_args, **kwargs):
+            kwargs['on_frontmatter_restored']('docs/plans/[G-047] Runtime.md')
+            return self.plan
+        self.effects.agent.validate_worker_workspace_scope.side_effect = validate
+        outcome = self.handler.run(self.context())
+        row = self.state.row()
+        self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
+        self.assertEqual(row['phase'], 'WORKING')
+        self.assertIn('frontmatter만 공식 선언으로 복원', row['last_error'])
+        self.assertIn('본문은 보존', row['last_error'])
+        self.effects.blocking.block_active_execplan.assert_not_called()
+        self.assertEqual(self.effects.agent.run_agent.call_count, 1)
+
     def test_worker_provider_errors_with_credentials_do_not_emit_stage_notices(self):
         from loop_manager_internal.notifications import notifications
         notifications.configure_session(self.connection, enabled=True)

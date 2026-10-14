@@ -9,8 +9,6 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import hashlib
 from pathlib import Path
-import re
-from loop_manager_internal.catalog.execplan_catalog import requirement_archive_path
 from typing import Mapping, TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -536,12 +534,7 @@ def _worker_path_allowed(
     if lowered == "docs/plans.md":
         return allow_common_plans
     if lowered.startswith("docs/requirements/"):
-        allowed_paths = {
-            candidate
-            for source in allowed_requirement_archives
-            for candidate in (source, requirement_archive_path(source))
-        }
-        return bool(re.fullmatch(r"docs/requirements/[^/]+\.md", normalized)) or normalized in allowed_paths
+        return False
     if lowered.startswith("docs/plans/"):
         return False
     return True
