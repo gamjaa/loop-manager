@@ -50,7 +50,7 @@ def _claim_piece(
             return None  # Sent pieces and original diagnostics remain auditable.
         if row[1] == "draft_decisions":
             from loop_manager_internal.storage import execplan_draft_state
-            current = execplan_draft_state.pending_ids(connection, str(row[0]))
+            current = execplan_draft_state.user_question_ids(connection, str(row[0]))
             stale = current != {plan["id"] for plan in payload["plans"]}
             for plan in payload["plans"]:
                 saved = execplan_draft_state.evidence(connection, str(row[0]), plan["id"])

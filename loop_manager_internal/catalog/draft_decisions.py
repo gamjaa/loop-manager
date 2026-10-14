@@ -11,6 +11,7 @@ from loop_manager_internal.catalog import execplan_drafts, execplan_catalog
 from loop_manager_internal.maintenance.maintenance_planning import markdown_sections
 from loop_manager_internal.storage import execplan_draft_state
 from loop_manager_internal.planning.planning_catalog import PlannerValidationError
+from loop_manager_internal.application.result_normalization import normalize_markers, tagged_json
 
 
 PREFIX = "DRAFT_DECISION_RESULT:"
@@ -72,13 +73,18 @@ def user_changes(connection, repo, repository, pinned, *, git, git_bytes):
                 if previous_path:
                     old = git(repository, "show", f"{previous}:{previous_path}", check=False)
             if old.returncode:
+                changes.pop(path, None)
                 continue  # 새 경로만으로 이전 질문의 사용자 답변을 증명하지 않는다.
             current = git_bytes(repository, "show", f"{pinned.revision_sha}:{path}").decode("utf-8")
             if execplan_drafts.content_digest(old.stdout.encode()) == execplan_drafts.content_digest(current.encode()):
+                changes.pop(path, None)
                 continue
-            author = git(repository, "log", "-1", "--format=%H%x00%ae", pinned.revision_sha, "--", path)
-            values = author.stdout.strip().split("\0")
-            verified = bool(len(values) == 2 and trusted_email and values[1] == trusted_email and values[0] not in managed)
+            author = git(repository, "log", "--follow", "--format=%H%x00%ae", f"{previous}..{pinned.revision_sha}", "--", path, check=False)
+            commits = [line.split("\0") for line in author.stdout.splitlines() if line]
+            values = commits[0] if commits else []
+            # A last user edit cannot adopt intervening Agent/Manager changes.
+            verified = bool(author.returncode == 0 and commits and trusted_email and all(
+                len(value) == 2 and value[1] == trusted_email and value[0] not in managed for value in commits))
             if verified:
                 for revision in managed:
                     for related in {path, *(source for source, target in aliases.items() if target == path)}:
@@ -89,6 +95,7 @@ def user_changes(connection, repo, repository, pinned, *, git, git_bytes):
                     if not verified:
                         break
             changes[path] = {"path": path, "revision": pinned.revision_sha,
+                             "input_path": next((source for source, target in aliases.items() if target == path), path),
                              "commit": values[0] if len(values) == 2 else "",
                              "author": values[1] if len(values) == 2 else "",
                              "verified": verified, "before": old.stdout, "after": current}
@@ -100,17 +107,18 @@ def prepare(connection, repo, worktree, snapshot):
     """Planner 의미 판단을 검증하고 게시할 같은 ID의 문서만 정리한다."""
     project = connection.execute("SELECT planning_result FROM projects WHERE repo=?", (repo,)).fetchone()
     output = str(project[0] or "") if project else ""
-    lines = [line[len(PREFIX):].strip() for line in output.splitlines() if line.startswith(PREFIX)]
+    normalized = normalize_markers(output, (PREFIX,))
     assessments = {}
-    if lines:
+    if any(line.startswith(PREFIX) for line in normalized.splitlines()):
         try:
-            if len(lines) != 1:
-                raise ValueError("중복 결과")
-            values = json.loads(lines[0])
+            values = tagged_json(output, PREFIX)
             if not isinstance(values, list):
                 raise ValueError("결과 배열 필요")
             for item in values:
-                if not isinstance(item, dict) or item.get("id") in assessments or item.get("id") not in snapshot.by_id:
+                if (not isinstance(item, dict) or not isinstance(item.get("id"), str)
+                        or item["id"] in assessments or item["id"] not in snapshot.by_id
+                        or set(item) - {"id", "revision", "resolved", "remaining", "outcome", "reason"}
+                        or item.get("outcome") not in {None, "uncertain", "valid"}):
                     raise ValueError("잘못된 계획 identity")
                 assessments[item["id"]] = item
         except (ValueError, TypeError) as error:
@@ -138,47 +146,26 @@ def prepare(connection, repo, worktree, snapshot):
             continue
         if decision.get("Decision") in {"reject", "defer"}:
             raise PlannerValidationError("거절·보류한 사용자 결정을 해소할 수 없습니다.")
+        if decision and not saved.get("decision_ready"):
+            raise PlannerValidationError("User Decision의 현재 사용자 판단 근거를 확인할 수 없습니다.")
         if assessment.get("revision") != saved["revision"]:
             raise PlannerValidationError("draft 판단 revision이 변경됐습니다.")
-        resolved = assessment.get("resolved")
-        remaining = assessment.get("remaining")
-        if not isinstance(resolved, list) or not resolved or not isinstance(remaining, str):
-            raise PlannerValidationError("draft 질문별 답변과 남은 질문이 필요합니다.")
-        fragment = markdown_sections(remaining).values
-        if fragment:
-            if set(fragment) != {"Draft Decision"}:
-                raise PlannerValidationError("남은 질문에 다른 문서 절을 포함할 수 없습니다.")
-            remaining = fragment["Draft Decision"]
-        answered = set()
-        for item in resolved:
-            if not isinstance(item, dict) or set(item) != {"question", "answer", "source", "quote"}:
-                raise PlannerValidationError("draft 질문 해소 근거가 유효하지 않습니다.")
-            if not isinstance(item["question"], str) or not isinstance(item["source"], str):
-                raise PlannerValidationError("draft 질문·근거 경로는 문자열이어야 합니다.")
-            change = saved.get("user_changes", {}).get(item["source"], {})
-            if (item["question"] not in question_items or item["question"] in answered
-                    or not isinstance(item["answer"], str) or not item["answer"].strip()
-                    or not isinstance(item["quote"], str) or not item["quote"].strip()
-                    or not change.get("verified") or item["quote"] not in change["after"]
-                    or item["quote"] in change["before"]):
-                raise PlannerValidationError("사용자 변경에서 draft 질문 해소를 확인할 수 없습니다.")
-            if (item["source"] == original.path
-                    and item["quote"] in markdown_sections(change["after"]).values.get("User Decision", "")
-                    and not saved.get("decision_ready")):
-                raise PlannerValidationError("User Decision의 현재 판단 근거를 확인할 수 없습니다.")
-            sections = markdown_sections(text).values
-            body = "\n".join(value for key, value in sections.items() if key not in {"Draft Decision", "User Decision", "Progress"})
-            if item["answer"] not in body:
-                raise PlannerValidationError("해소된 선택을 ExecPlan 본문에 반영해야 합니다.")
-            answered.add(item["question"])
-        outstanding = set(question_items) - answered
-        if set(questions(remaining)) != outstanding:
-            raise PlannerValidationError("부분 해소의 미해결 질문을 보존해야 합니다.")
-        if remaining and any(not execplan_drafts.fields(remaining).get(key) for key in ("Question", "Facts", "Options", "Impact")):
-            raise PlannerValidationError("남은 Draft Decision 필드가 필요합니다.")
-        cleaned = replace_section(replace_section(text, "Draft Decision", remaining), "User Decision", "")
-        if not outstanding:
-            cleaned = re.sub(r"^draft:[ \t]*true[ \t]*\n", "", cleaned, count=1, flags=re.M)
+        if assessment.get("outcome") == "valid":
+            if (not saved.get("reassessment") or plan.get("draft") or plan.get("draft_question")
+                    or plan.get("draft_decision") or not saved.get("resolutions")
+                    or plan.get("draft_scope") != saved["basis"]["scope"]
+                    or not isinstance(assessment.get("reason"), str) or not assessment["reason"].strip()
+                    or assessment.get("resolved", []) != [] or assessment.get("remaining", "") != ""):
+                raise PlannerValidationError("기존 결정의 현재 유효성을 확인할 수 없습니다.")
+            note = "- 기존 사용자 결정 유효성 재검토 (" + saved["revision"] + "): " + " ".join(assessment["reason"].split())
+            log = markdown_sections(text).values.get("Decision Log")
+            cleaned = (replace_section(text, "Decision Log", log.rstrip() + "\n" + note)
+                       if log is not None else text.rstrip() + "\n\n## Decision Log\n\n" + note + "\n")
+        else:
+            try:
+                cleaned = _clean_answers(original, text, saved, assessment, question_items)
+            except RuntimeError as error:
+                raise PlannerValidationError(str(error)) from error
         parsed = execplan_catalog.parse_execplan_text(original.path, cleaned, validate_sources=False)
         if parsed["id"] != original.plan_id or parsed["sources"] != plan["sources"] or parsed["depends_on"] != plan["depends_on"]:
             raise PlannerValidationError("결정 입력 정리가 계획 identity·관계를 변경했습니다.")
@@ -202,3 +189,75 @@ def prepare(connection, repo, worktree, snapshot):
                 temporary.unlink(missing_ok=True)
         prepared[original.plan_id] = resolution
     return prepared
+
+
+def _clean_answers(original, text, saved, assessment, question_items):
+    if len(set(question_items)) != len(question_items):
+        raise PlannerValidationError("중복된 draft 질문을 해소할 수 없습니다.")
+    resolved = assessment.get("resolved")
+    remaining = assessment.get("remaining")
+    if not isinstance(resolved, list) or not resolved or not isinstance(remaining, str):
+        raise PlannerValidationError("draft 질문별 답변과 남은 질문이 필요합니다.")
+    fragment = markdown_sections(remaining).values
+    if fragment:
+        if set(fragment) != {"Draft Decision"}:
+            raise PlannerValidationError("남은 질문에 다른 문서 절을 포함할 수 없습니다.")
+        remaining = fragment["Draft Decision"]
+    answered = set()
+    for item in resolved:
+        if not isinstance(item, dict) or set(item) != {"question", "answer", "source", "quote"}:
+            raise PlannerValidationError("draft 질문 해소 근거가 유효하지 않습니다.")
+        if not isinstance(item["question"], str) or not isinstance(item["source"], str):
+            raise PlannerValidationError("draft 질문·근거 경로는 문자열이어야 합니다.")
+        change = saved.get("user_changes", {}).get(item["source"], {})
+        if (item["question"] not in question_items or item["question"] in answered
+                or not isinstance(item["answer"], str) or not item["answer"].strip()
+                or not isinstance(item["quote"], str) or not item["quote"].strip()
+                or not change.get("verified") or item["quote"] not in change["after"]
+                or item["quote"] in change["before"]):
+            raise PlannerValidationError("사용자 변경에서 draft 질문 해소를 확인할 수 없습니다.")
+        if item["source"] == original.path:
+            current = original.text
+        else:
+            current = change["after"]
+            if saved["basis"]["inputs"].get(change.get("input_path", item["source"])) != execplan_drafts.content_digest(current.encode()):
+                raise PlannerValidationError("사용자 변경의 현재 source 근거가 변경됐습니다.")
+        if item["quote"] not in current:
+            raise PlannerValidationError("현재 원격 원문에 사용자 답변이 없습니다.")
+        if (item["source"] == original.path
+                and item["quote"] in markdown_sections(change["after"]).values.get("User Decision", "")
+                and not saved.get("decision_ready")):
+            raise PlannerValidationError("User Decision의 현재 판단 근거를 확인할 수 없습니다.")
+        sections = markdown_sections(text).values
+        body = "\n".join(value for key, value in sections.items() if key not in {"Draft Decision", "User Decision", "Progress"})
+        if item["answer"] not in body:
+            raise PlannerValidationError("해소된 선택을 ExecPlan 본문에 반영해야 합니다.")
+        answered.add(item["question"])
+    outstanding = set(question_items) - answered
+    if set(questions(remaining)) != outstanding or len(questions(remaining)) != len(outstanding):
+        raise PlannerValidationError("부분 해소의 미해결 질문을 보존해야 합니다.")
+    if remaining:
+        fields = execplan_drafts.fields(remaining)
+        if set(fields) != {"Question", "Facts", "Options", "Impact"} or not all(fields.values()):
+            raise PlannerValidationError("남은 Draft Decision 필드가 필요합니다.")
+    cleaned = replace_section(text, "Draft Decision", remaining)
+    if outstanding:
+        decision_body = markdown_sections(text).values.get("User Decision", "")
+        # Only consume independently quoted lines; a shared free-form answer
+        # cannot safely be split by a substring match.
+        consumed = {item["quote"].strip() for item in resolved if item["source"] == original.path}
+        decision = execplan_drafts.fields(decision_body)
+        answer = decision.get("Answer", "")
+        lines = answer.splitlines()
+        leftover = [line for line in lines if line.strip() not in consumed]
+        if answer and not leftover:
+            cleaned = replace_section(cleaned, "User Decision", "")
+        elif leftover != lines:
+            decision_body = re.sub(r"^Answer:[ \t]*.*?(?=^[A-Za-z]+:[ \t]*|\Z)",
+                                   lambda _match: "Answer: " + "\n".join(leftover) + "\n\n",
+                                   decision_body, count=1, flags=re.M | re.S)
+            cleaned = replace_section(cleaned, "User Decision", decision_body)
+    if not outstanding:
+        cleaned = replace_section(cleaned, "User Decision", "")
+        cleaned = re.sub(r"^draft:[ \t]*true[ \t]*\n", "", cleaned, count=1, flags=re.M)
+    return cleaned

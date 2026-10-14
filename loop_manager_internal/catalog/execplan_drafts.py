@@ -63,13 +63,9 @@ def fields(text: str) -> dict[str, str]:
 
 def metadata(text: str, values: Mapping[str, object]) -> dict[str, object]:
     draft = values.get("draft", False)
-    if not draft and "## Draft Decision" not in text and "## User Decision" not in text:
-        return {}
     sections = markdown_sections(text).values
     question = sections.get("Draft Decision", "")
     decision = sections.get("User Decision", "")
-    if not draft and not question and not decision:
-        return {}
     if draft:
         questions = fields(question)
         if any(not questions.get(name) for name in ("Question", "Facts", "Options", "Impact")):
@@ -79,9 +75,12 @@ def metadata(text: str, values: Mapping[str, object]) -> dict[str, object]:
     scope = {key: value for key, value in values.items() if key != "draft"}
     scope["sections"] = {key: value for key, value in sections.items()
                          if key not in {"Progress", "Decision Log", "User Decision"}}
+    scope_digest = hashlib.sha256(json.dumps(scope, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    if not draft and not question and not decision:
+        return {"draft_scope": scope_digest}
     result: dict[str, object] = {
         "draft": bool(draft), "draft_question": question,
-        "draft_scope": hashlib.sha256(json.dumps(scope, sort_keys=True, ensure_ascii=False).encode()).hexdigest(),
+        "draft_scope": scope_digest,
         "draft_decision": fields(decision),
     }
     if question:
