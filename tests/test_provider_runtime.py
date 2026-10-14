@@ -917,7 +917,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
 
     def test_cli_accepts_provider_only_as_registration_choice(self):
         args = loop_manager.build_parser().parse_args(
-            ["config", "add", "repo", "--provider", "claude"]
+            ["add", "repo", "--provider", "claude"]
         )
         self.assertEqual(args.provider, "claude")
         run = loop_manager.build_parser().parse_args(["run"])

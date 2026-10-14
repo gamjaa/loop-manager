@@ -101,12 +101,13 @@ R-023의 원격 실행·self handoff 목표는 유지하며 로컬 갱신 gate�
 
 흐름:
 1. 프로젝트별로 사용할 AI Agent provider를 선택한다 (기본값은 Codex)
-2. 대상 프로젝트 경로를 추가하거나 제거한다
+2. `add`로 대상 프로젝트를 등록하거나 `remove`로 등록 해제한다
 3. 프로젝트의 필수 조건과 공통 파일을 코드로 검증한다
 4. 원격 필수 문서를 확인한다
 5. `max_workers`를 포함한 유효한 설정을 저장한다
 
 규칙:
+- `config init`은 상태 DB를 초기화한다. 등록 목록은 현재 `config list`로 조회하며, 등록·해제는 최상위 `add`·`remove`를 사용한다. `config add`·`config remove` 호환 별칭은 없다
 - READY, IMPLEMENTING, VERIFYING, REVIEWING, PUBLISHING, PR_OPEN 또는 PLAN_BLOCKED ExecPlan, PROJECT_BLOCKED 레코드가 있거나 해결되지 않은 `planning_error`가 있는 프로젝트는 등록 해제할 수 없다
 - 공급자 호출·인증·모델 조회와 격리 검증은 선택된 상태 루트의 `automation-codex`·`automation-claude`를 공급자별 공통 홈으로 직접 사용한다. 호출별 임시 폴더와 작업 권한은 별도로 관리한다. 외부 공급자 홈 지정과 부모 환경을 변경하지 않으며 새 전용 인증 파일은 기본 사용자 인증 파일만 심볼릭 링크로 공유한다. 기존 전용 파일은 보존하고 인증·링크 준비 실패는 해당 공급자의 오류로 처리한다. 개인 설정 전체를 가져오거나 기본 홈으로 fallback하지 않는다
 - Telegram token과 chat ID가 모두 비어 있으면 알림 기능을 비활성화하고 전송을 시도하지 않는다
@@ -300,6 +301,9 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 
 ### 프로젝트 등록 및 실행 조건
 
+- `add <repo> [--base <branch>] [--provider <provider>]`는 기존 프로젝트 검증·등록을 수행하고 `remove <repo>`는 기존 등록 해제 gate를 유지한다. `config init`과 `config list`는 유지하며 이전 `config add/remove` 이름은 허용하지 않는다
+- `run [--skip-if-running] [repo...]`는 경로를 정규화하고 중복을 제거한 뒤 지정된 전체 경로가 등록됐는지 실행 처리 전에 검증한다. 경로를 생략하면 전체 등록 범위를 처리하고, 하나라도 미등록이면 어떤 프로젝트도 처리하지 않는다. 공백이 포함된 경로는 인용해 지정한다
+- 선택 실행은 기존 `max_workers`, 프로젝트별 단일 변경 자리, dependency·복구·self handoff와 실패 격리를 유지한다. 범위 밖 프로젝트는 처리하지 않는다
 - 대상 경로는 origin이 GitHub 저장소인 Git 프로젝트여야 한다
 - fetch된 `origin/<base-branch>` tree에 `docs/PLANS.md`, `docs/ARCHITECTURE.md`가 있어야 한다
 - fetch된 `origin/<base-branch>` tree에 `docs/PRODUCT.md` 또는 `docs/requirements/` 바로 아래 Requirement가 하나 이상 있어야 한다

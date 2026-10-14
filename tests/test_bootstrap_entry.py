@@ -194,8 +194,8 @@ class BootstrapEntryTests(unittest.TestCase):
             ("init",),
             ("config", "init"),
             ("config", "list"),
-            ("config", "add", "/project"),
-            ("config", "remove", "/project"),
+            ("add", "/project"),
+            ("remove", "/project"),
         )
         for command in commands:
             with self.subTest(command=command), tempfile.TemporaryDirectory() as directory:

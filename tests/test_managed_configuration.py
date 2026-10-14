@@ -354,7 +354,7 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             with closing(loop_manager.connect_database(state_dir, create=True)) as connection, connection:
                 project_registry.add_project(connection, self._record())
             args = loop_manager.build_parser().parse_args(
-                ["config", "remove", "/repo"]
+                ["remove", "/repo"]
             )
 
             with self.assertRaises(ManagedConfigError):
@@ -784,29 +784,22 @@ Registration rollback fixture.
         self.assertEqual(projects[0].provider, "codex")
         self.assertEqual(projects[0].repo, "/legacy")
 
-    def test_run_parser_has_no_implicit_registration_arguments(self):
+    def test_run_parser_accepts_project_paths_and_rejects_old_registration_aliases(self):
         args = loop_manager.build_parser().parse_args(["run"])
-        self.assertFalse(hasattr(args, "repository"))
-        with redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            loop_manager.build_parser().parse_args(["run", "/repo"])
-
-        state_dir = Path("/state")
-        with mock.patch.object(
-            loop_manager.sys,
-            "argv",
-            ["loop_manager.py", "run", "/repo", "--allow-agents-mismatch"],
-        ), mock.patch(
-            "loop_manager.state_directory", return_value=state_dir
-        ) as state_directory, mock.patch(
-            "loop_manager.process_lock"
-        ) as process_lock, redirect_stderr(io.StringIO()) as stderr:
-            with self.assertRaises(SystemExit) as raised:
-                loop_manager.main()
-
-        self.assertEqual(raised.exception.code, 2)
-        self.assertIn("unrecognized arguments", stderr.getvalue())
-        state_directory.assert_not_called()
-        process_lock.assert_not_called()
+        self.assertEqual(args.repositories, [])
+        selected = loop_manager.build_parser().parse_args(
+            ["run", "--skip-if-running", "/project with space", "/second"]
+        )
+        self.assertEqual(selected.repositories, ["/project with space", "/second"])
+        self.assertTrue(selected.skip_if_running)
+        for command in (["config", "add", "/repo"], ["config", "remove", "/repo"]):
+            with self.subTest(command=command), redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit) as raised:
+                    loop_manager.build_parser().parse_args(command)
+            self.assertEqual(raised.exception.code, 2)
+        for command in (["config", "init"], ["config", "list"]):
+            with self.subTest(command=command):
+                self.assertEqual(loop_manager.build_parser().parse_args(command).command, "config")
 
 
 if __name__ == "__main__":

@@ -120,6 +120,8 @@ class ProjectServiceCompositionTests(unittest.TestCase):
         config_path = Path('/source/config.ini')
         config = SimpleNamespace(path=config_path)
         for name, target in (('config', 'configure_registry'),
+                             ('add', 'configure_registry'),
+                             ('remove', 'configure_registry'),
                              ('document-drafts', '_document_drafts_command')):
             with self.subTest(command=name), mock.patch.object(loop_manager, 'load_managed_config', return_value=config), \
                  mock.patch.object(loop_manager, target, return_value=7) as handler, \

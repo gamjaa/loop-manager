@@ -149,10 +149,12 @@ def schedule_registered_projects(
     state_dir: Path,
     config: ManagedConfig,
     runtime_mutation: RuntimeMutation | None = None,
+    selected_projects: tuple[project_registry.RegisteredProject, ...] | None = None,
 ) -> tuple[ScheduledProjectResult, ...]:
     """Run each registered project once with bounded cross-project concurrency."""
 
-    projects = project_registry.list_projects(connection)
+    projects = (project_registry.list_projects(connection) if selected_projects is None
+                else selected_projects)
     if not projects:
         return ()
 
@@ -208,6 +210,7 @@ def run_registered_projects(
     state_dir: Path,
     config: ManagedConfig,
     runtime_mutation: RuntimeMutation | None = None,
+    selected_projects: tuple[project_registry.RegisteredProject, ...] | None = None,
 ) -> int:
     """Run all registered projects and aggregate outcomes after every worker exits."""
 
@@ -227,6 +230,7 @@ def run_registered_projects(
     try:
         results = effects.schedule_registered_projects(
             connection, state_dir, config,
+            **({"selected_projects": selected_projects} if selected_projects is not None else {}),
             **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
         )
     except SelfMergeRuntimeHandoff:

@@ -32,7 +32,8 @@ def configure_registry(
     state_dir: Path,
     config_path: Path,
 ) -> int:
-    if args.config_command == "init":
+    command = args.config_command if args.command == "config" else args.command
+    if command == "init":
         effects.load_managed_config(config_path)
         with closing(effects.connect_database(state_dir, create=True)) as connection, connection:
             pass
@@ -40,7 +41,7 @@ def configure_registry(
         return 0
 
     with closing(effects.connect_database(state_dir)) as connection, connection:
-        if args.config_command == "list":
+        if command == "list":
             projects = project_registry.list_projects(connection)
             if not projects:
                 effects.operation_print("등록된 프로젝트가 없습니다.")
@@ -50,7 +51,7 @@ def configure_registry(
                     f"{project.provider}"
                 )
             return 0
-        if args.config_command == "add":
+        if command == "add":
             config = effects.load_managed_config(config_path)
             project = effects.add_registered_project(
                 connection,
@@ -465,7 +466,7 @@ def execute_runtime_command(
                 pass
             effects.operation_print(f"상태 DB 초기화 완료: {state_dir / 'loop-manager.db'}")
             return 0
-        if args.command == "config":
+        if args.command in {"config", "add", "remove"}:
             return effects.configure_registry(args, state_dir, config_path)
         if args.command == "document-drafts":
             return effects._document_drafts_command(args, state_dir, config_path)
@@ -487,8 +488,12 @@ def execute_runtime_command(
             effects.operation_print(f"전체 정밀 점검 요청 저장: {repo}; 다음 안전한 작업 선택 경계에서 실행합니다.")
             return 0
         with closing(effects.connect_database(state_dir)) as connection, connection:
+            selected_projects = project_registry.select_projects(
+                connection, getattr(args, "repositories", None),
+            )
             agent_invocation_state.InvocationRepository(connection).reconcile_interrupted(state_dir=state_dir)
             return effects.run_registered_projects(
                 connection, state_dir, config,
+                selected_projects=selected_projects,
                 **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
             )
