@@ -299,3 +299,95 @@ class RequirementSourceFingerprintTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class WorkerFrontmatterRestoreTests(unittest.TestCase):
+    def setUp(self):
+        import sqlite3
+        from loop_manager_internal.execution import plan_validation
+        self.validation = plan_validation
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.path = 'docs/plans/[G-236] Plan.md'
+        self.target = self.root / self.path
+        self.target.parent.mkdir(parents=True)
+        self.original = (execplan_header('G-236', 'Plan') + '\n## Progress\nOriginal body.\n').encode()
+        self.body = '\r\n## Progress\r\n구현·테스트 기록 보존\r\n---\r\n'.encode()
+        self.changed_header = self.original.split(b'---', 2)[1].replace(b'title: Plan', b'title: Changed')
+        self.candidate = b'---' + self.changed_header + b'---\n' + self.body
+        self.target.write_bytes(self.candidate)
+        self.connection = sqlite3.connect(':memory:')
+        self.connection.row_factory = sqlite3.Row
+        self.addCleanup(self.connection.close)
+        self.connection.execute('CREATE TABLE exec_plans (repo TEXT, plan_id TEXT, agent_input_plan TEXT)')
+        self.connection.execute('INSERT INTO exec_plans VALUES (?, ?, ?)', ('repo', 'G-236', self.original.decode()))
+        self.connection.commit()
+        self.plan = {'path': self.path, 'plan_id': 'G-236', 'title': 'Plan',
+                     'sources': '["docs/PRODUCT.md"]', 'depends_on': '[]', 'priority': 'normal',
+                     'current_complexity': 'low', 'current_risk': 'low'}
+
+    def restore(self):
+        return self.validation.restore_worker_frontmatter(
+            self.root, self.path, self.plan, repo='repo', revision='a' * 40,
+            connection=self.connection, git_bytes=lambda *_: self.original)
+
+    def test_only_frontmatter_is_restored_and_body_bytes_and_audit_are_preserved(self):
+        import base64
+        import hashlib
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        self.assertTrue(self.restore())
+        header = self.original.split(b'---', 2)[0] + b'---' + self.original.split(b'---', 2)[1] + b'---\n'
+        self.assertEqual(self.target.read_bytes(), header + self.body)
+        records = ExecutionCheckpointRepository(self.connection).get('repo', 'G-236').snapshot['worker_frontmatter_restores']
+        self.assertEqual(len(records), 1)
+        self.assertEqual(base64.b64decode(records[0]['before']), self.candidate[:-len(self.body)])
+        self.assertEqual(records[0]['body_sha256'], hashlib.sha256(self.body).hexdigest())
+        self.assertFalse(self.restore())
+        self.assertEqual(len(ExecutionCheckpointRepository(self.connection).get('repo', 'G-236').snapshot['worker_frontmatter_restores']), 1)
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        checkpoint = checkpoints.get('repo', 'G-236')
+        checkpoints.record('repo', 'G-236', expected_generation=checkpoint.generation, operation=None,
+                           expected_head='next', target_base_oid=None, observed_remote_oid=None,
+                           snapshot={'next_stage': 'keep'})
+        self.assertEqual(checkpoints.get('repo', 'G-236').snapshot['worker_frontmatter_restores'], records)
+
+    def test_unsafe_boundaries_prior_changes_and_owned_operations_do_not_overwrite(self):
+        from loop_manager_internal.application.contracts import ExecPlanMetadataError
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        damaged = b'---\nid: G-236\n## body without delimiter\n'
+        self.target.write_bytes(damaged)
+        with self.assertRaises(ExecPlanMetadataError):
+            self.restore()
+        self.assertEqual(self.target.read_bytes(), damaged)
+        self.target.write_bytes(self.candidate)
+        self.connection.execute('UPDATE exec_plans SET agent_input_plan = ?', (self.candidate.decode(),))
+        self.assertFalse(self.restore())
+        self.assertEqual(self.target.read_bytes(), self.candidate)
+        changed_again = self.candidate.replace(b'title: Changed', b'title: ChangedAgain')
+        self.target.write_bytes(changed_again)
+        with self.assertRaisesRegex(RuntimeError, '시작 이전'):
+            self.restore()
+        self.assertEqual(self.target.read_bytes(), changed_again)
+        self.target.write_bytes(self.candidate)
+        self.connection.execute('UPDATE exec_plans SET agent_input_plan = ?', (self.original.decode(),))
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        checkpoints.record('repo', 'G-236', expected_generation=0, operation='rebase', expected_head='head',
+                           target_base_oid='base', observed_remote_oid='base', snapshot={'existing': 'keep'})
+        with self.assertRaisesRegex(RuntimeError, 'Git operation'):
+            self.restore()
+        self.assertEqual(self.target.read_bytes(), self.candidate)
+        self.assertEqual(checkpoints.get('repo', 'G-236').snapshot, {'existing': 'keep'})
+
+    def test_edit_during_atomic_write_is_preserved_and_temporary_is_removed(self):
+        from unittest import mock
+        original_chmod = self.validation.os.chmod
+        external = b'external edit must survive\n'
+        def edit(temporary, mode):
+            original_chmod(temporary, mode)
+            self.target.write_bytes(external)
+        with mock.patch.object(self.validation.os, 'chmod', side_effect=edit):
+            with self.assertRaisesRegex(RuntimeError, '다시 변경'):
+                self.restore()
+        self.assertEqual(self.target.read_bytes(), external)
+        self.assertFalse(list(self.target.parent.glob('.frontmatter-*')))

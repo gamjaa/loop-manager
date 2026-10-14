@@ -247,6 +247,7 @@ class ScopeValidationTests(TestCase):
         effects = scope_adapter.ValidateWorkerWorkspaceScopeEffects(
             _owned_rebase_state_dir=mock.Mock(), _current_rebase_service=mock.Mock(),
             capture_git_snapshot=lambda _worktree: current,
+            git=mock.Mock(return_value=subprocess.CompletedProcess([], 0, 'head')),
             validate_active_execplan_metadata=mock.Mock(return_value={}),
             validate_agent_scope=lambda *args, **kwargs: scope_validation.validate_agent_scope(
                 *args, effects=self.effects, **kwargs),
@@ -257,6 +258,52 @@ class ScopeValidationTests(TestCase):
             'docs/plans/[G-047] Work.md', {'active_sha': None}, before,
             scope_phase='VERIFYING'), {})
         effects.validate_managed_worktree.assert_called_once()
+
+    def test_candidate_scope_excludes_inherited_source_documents_but_rejects_worker_edits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git_command(root, 'init', '--initial-branch=main')
+            git_command(root, 'config', 'user.name', 'Test')
+            git_command(root, 'config', 'user.email', 'test@localhost')
+            git_command(root, 'config', 'core.autocrlf', 'false')
+            other = 'docs/plans/[G-048] Other.md'
+            (root / 'docs/plans').mkdir(parents=True)
+            (root / other).write_text('source before rebase\n', encoding='utf-8')
+            git_command(root, 'add', '.')
+            git_command(root, 'commit', '-m', 'Old source')
+            old = git_command(root, 'rev-parse', 'HEAD')
+            (root / other).write_text('updated source document\n', encoding='utf-8')
+            git_command(root, 'add', '.')
+            git_command(root, 'commit', '-m', 'Updated source')
+            source = git_command(root, 'rev-parse', 'HEAD')
+            git_command(root, 'update-ref', 'refs/remotes/origin/main', source)
+            (root / 'app.py').write_text('worker implementation\n', encoding='utf-8')
+            git_command(root, 'add', '.')
+            git_command(root, 'commit', '-m', 'Worker candidate on updated source')
+            candidate = git_command(root, 'rev-parse', 'HEAD')
+            before = manager.capture_git_snapshot(root)
+            scope = mock.Mock(side_effect=lambda *args, **kwargs: scope_validation.validate_agent_scope(
+                *args, effects=self.effects, **kwargs))
+            effects = scope_adapter.ValidateWorkerWorkspaceScopeEffects(
+                capture_git_snapshot=manager.capture_git_snapshot, git=manager.git,
+                _owned_rebase_state_dir=mock.Mock(), _current_rebase_service=mock.Mock(),
+                validate_active_execplan_metadata=mock.Mock(return_value={}),
+                validate_agent_scope=scope, validate_managed_worktree=mock.Mock())
+            args = (root, root, 'main', 'main', 'docs/plans/[G-047] Runtime.md', {'active_sha': old}, before)
+            self.assertEqual(scope_adapter.validate_worker_workspace_scope(effects, *args), {})
+            self.assertEqual(scope.call_args.args[2].head, source)
+            (root / other).write_text('Worker changed another plan\n', encoding='utf-8')
+            with self.assertRaisesRegex(AgentScopeError, 'G-048') as caught:
+                scope_adapter.validate_worker_workspace_scope(effects, *args)
+            self.assertIn('비교 원본: ' + source, str(caught.exception))
+            self.assertIn('후보: ' + candidate, str(caught.exception))
+            self.assertEqual((root / other).read_text(encoding='utf-8'), 'Worker changed another plan\n')
+            self.assertEqual((root / 'app.py').read_text(encoding='utf-8'), 'worker implementation\n')
+            self.assertEqual(git_command(root, 'rev-parse', 'HEAD'), candidate)
+            effects.validate_active_execplan_metadata.assert_called_once()
+            failed = replace(effects, git=mock.Mock(return_value=subprocess.CompletedProcess([], 1, '')))
+            with self.assertRaisesRegex(RuntimeError, '원본 브랜치 기준'):
+                scope_adapter.validate_worker_workspace_scope(failed, *args)
 
     def test_manager_resources_do_not_depend_on_invocation_proof(self):
         connection = runtime_connection()
@@ -985,6 +1032,7 @@ class SandboxGitBoundaryTests(TestCase):
                 AgentChange('docs/requirements/archive/Protected.md', ('staged',))])
         effects = scope_adapter.ValidateWorkerWorkspaceScopeEffects(
             capture_git_snapshot=lambda _w: current,
+            git=mock.Mock(side_effect=AssertionError('원본 ref 증거 없는 Git 조회')),
             _owned_rebase_state_dir=mock.Mock(), _current_rebase_service=mock.Mock(),
             validate_active_execplan_metadata=mock.Mock(), validate_managed_worktree=mock.Mock(),
             validate_agent_scope=lambda *args, **kwargs: scope_validation.validate_agent_scope(

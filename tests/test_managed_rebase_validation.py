@@ -190,7 +190,7 @@ class CurrentRebasePolicyTests(unittest.TestCase):
         self.assertEqual(assess_current_rebase(expected, dirty_allowed, stale_scope).status,
                          RebaseStatus.REJECTED)
 
-    def test_active_requirement_edits_follow_worker_scope_during_rebase(self):
+    def test_active_requirement_edits_are_rejected_during_worker_rebase(self):
         expected = expectation()
         current = observation()
         path = 'docs/requirements/Active.md'
@@ -199,9 +199,9 @@ class CurrentRebasePolicyTests(unittest.TestCase):
             replace(current, files=(WorktreeFile(path, ('unstaged',), '100644', 'edited'),)),
         ):
             with self.subTest(observed=actual):
-                self.assertEqual(decision_for(expected, actual).status, RebaseStatus.COMPLETE)
+                self.assertEqual(decision_for(expected, actual).status, RebaseStatus.REJECTED)
 
-    def test_guidance_and_archive_need_exact_current_contract(self):
+    def test_guidance_contract_does_not_grant_worker_requirement_archive_permission(self):
         expected = expectation()
         guidance = observation(committed=(FileChange('AGENTS.md', '100644', '100644',
                                                      'old', 'approved', 'M'),))
@@ -228,7 +228,7 @@ class CurrentRebasePolicyTests(unittest.TestCase):
         accepted = scope_for(expected, archives, path_allowed=path_allowed,
                              contracts_allowed=archive_contract)
         self.assertEqual(assess_current_rebase(expected, archives, accepted).status,
-                         RebaseStatus.COMPLETE)
+                         RebaseStatus.REJECTED)
         self.assertEqual(assess_current_rebase(expected, archives,
                                               scope_for(expected, archives)).status,
                          RebaseStatus.REJECTED)

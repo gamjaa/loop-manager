@@ -56,17 +56,28 @@ class ScopeRoleBoundariesTest(unittest.TestCase):
                     with self.assertRaisesRegex(loop_manager.AgentScopeError, 'ARCHITECTURE'):
                         self.validate(role, after)
 
-    def test_worker_related_documents_allow_active_requirements_and_guidance_without_approval(self):
-        for path in ('docs/requirements/Active.md', 'docs/PRODUCT.md', 'docs/ARCHITECTURE.md',
+    def test_worker_product_documents_and_guidance_remain_allowed(self):
+        for path in ('docs/FUTURE_IDEAS.md', 'docs/PRODUCT.md', 'docs/ARCHITECTURE.md',
                      'docs/AGENTS.common.md', 'docs/AGENTS.worker.md', 'AGENTS.md'):
             with self.subTest(path=path):
                 self.validate('worker', snapshot(dirty={path: (('tracked',), 'changed')}), self.plan_path)
                 for role in ('planner', 'reviewer', 'planner_check'):
-                    if role == 'planner':
+                    if role == 'planner' and path != 'docs/FUTURE_IDEAS.md':
                         with self.assertRaises(loop_manager.AgentScopeError):
                             self.validate(role, snapshot(dirty={path: (('tracked',), 'changed')}))
                     else:
                         self.validate(role, snapshot(dirty={path: (('tracked',), 'changed')}))
+
+    def test_worker_rejects_all_requirements_even_when_archive_candidates_are_provided(self):
+        for path in ('docs/requirements/Active.md', 'docs/requirements/New.md',
+                     'docs/requirements/archive/Active.md'):
+            for kinds in (('tracked',), ('staged',), ('untracked',)):
+                with self.subTest(path=path, kinds=kinds):
+                    with self.assertRaisesRegex(loop_manager.AgentScopeError, 'requirements'):
+                        loop_manager.validate_agent_scope(
+                            'worker', Path('/managed'), snapshot(),
+                            snapshot(dirty={path: (kinds, 'changed')}), selected_plan_path=self.plan_path,
+                            allowed_requirement_archives=('docs/requirements/Active.md',))
 
     def test_planner_existing_plan_change_reaches_snapshot_validator(self):
         self.validate('planner', snapshot(dirty={self.plan_path: (('tracked',), 'changed')}))

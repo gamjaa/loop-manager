@@ -115,9 +115,9 @@ class ExecutionCheckpointRepository:
     ) -> CheckpointRecord:
         """Commit an intent or completion only against the observed generation."""
         current = self.get(repo, plan_id)
-        if (current.snapshot and "document_revision" in current.snapshot
-                and (snapshot is None or "document_revision" not in snapshot)):
-            snapshot = {**(snapshot or {}), "document_revision": current.snapshot["document_revision"]}
+        for key in ('document_revision', 'worker_frontmatter_restores'):
+            if current.snapshot and key in current.snapshot and key not in (snapshot or {}):
+                snapshot = {**(snapshot or {}), key: current.snapshot[key]}
         if current.operation == 'rebase_publish':
             saved = current.snapshot or {}
             intent = current.rebase_publication_intent()

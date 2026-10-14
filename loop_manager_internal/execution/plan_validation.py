@@ -12,7 +12,10 @@ from loop_manager_internal.git.command_adapter import (
 )
 from loop_manager_internal.runtime.contracts import GitLockError
 from pathlib import Path
+import base64
 import hashlib
+import os
+import tempfile
 import json
 import sqlite3
 import stat
@@ -323,6 +326,79 @@ def _blocked_validation_input_fingerprints(
         effects._revision_execplan_input_fingerprint(repo_path, revision, plan),
         worktree_fingerprint,
     )
+
+
+def restore_worker_frontmatter(worktree, relative_path, plan, *, repo, revision, connection, git_bytes):
+    """Worker 종료 뒤 선택된 공식 선언만 복원하고 본문 bytes를 보존한다."""
+    if relative_path != plan['path']:
+        raise ExecPlanMetadataError('frontmatter 복원의 공식 경로가 다릅니다.')
+    root = worktree.resolve()
+    target = root / relative_path
+    observed = target.lstat()
+    if target.resolve() != target or not stat.S_ISREG(observed.st_mode):
+        raise ExecPlanMetadataError('frontmatter 복원 대상이 실제 작업 파일이 아닙니다.')
+    identity = lambda info: (info.st_dev, info.st_ino, info.st_mode, info.st_size, info.st_mtime_ns)
+    candidate = target.read_bytes()
+    def split(raw):
+        lines = raw.splitlines(keepends=True)
+        if not lines or lines[0].rstrip(b'\r\n') != b'---':
+            raise ExecPlanMetadataError('frontmatter 복원에 필요한 본문 경계가 없습니다.')
+        for index, line in enumerate(lines[1:], 1):
+            if line.rstrip(b'\r\n') == b'---':
+                return b''.join(lines[:index + 1]), b''.join(lines[index + 1:])
+        raise ExecPlanMetadataError('frontmatter 복원에 필요한 종료 구분자가 없습니다.')
+    current, body = split(candidate)
+    if connection is None:
+        raise RuntimeError('frontmatter 복원 감사 DB가 없습니다.')
+    entry = connection.execute('SELECT agent_input_plan FROM exec_plans WHERE repo = ? AND plan_id = ?',
+                               (repo, str(plan['plan_id']))).fetchone()
+    if entry is None or not entry['agent_input_plan']:
+        return False  # 시작 증거가 없는 과거 후보는 기존 metadata 검증으로 판단한다.
+    started, _ = split(str(entry['agent_input_plan']).encode('utf-8'))
+    if current.replace(b'\r\n', b'\n') == started.replace(b'\r\n', b'\n'):
+        return False
+    if not revision:
+        raise ExecPlanMetadataError('frontmatter 복원의 공식 revision이 없습니다.')
+    original = git_bytes(worktree, 'show', f'{revision}:{relative_path}')
+    official = execplan_catalog.parse_execplan_text(relative_path, original.decode('utf-8'), validate_sources=False)
+    error = _execplan_metadata_identity_error(
+        ExecplanMetadataIdentityErrorEffects(_current_execplan_metadata=_current_execplan_metadata),
+        worktree, official, plan, 'frontmatter 복원 원본')
+    if error is not None or official.get('draft'):
+        raise ExecPlanMetadataError(error or 'draft 선언은 자동 복원하지 않습니다.')
+    desired, _ = split(original)
+    if started.replace(b'\r\n', b'\n') != desired.replace(b'\r\n', b'\n'):
+        raise RuntimeError('Worker 시작 이전의 frontmatter 변경은 자동 복원하지 않습니다.')
+    from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+    checkpoints = ExecutionCheckpointRepository(connection)
+    checkpoint = checkpoints.get(repo, str(plan['plan_id']))
+    if checkpoint.operation is not None:
+        raise RuntimeError('진행 중 Manager Git operation에서는 frontmatter를 별도 복원하지 않습니다.')
+    record = {'path': relative_path, 'revision': revision,
+              'before': base64.b64encode(current).decode(), 'after': base64.b64encode(desired).decode(),
+              'body_sha256': hashlib.sha256(body).hexdigest()}
+    snapshot = checkpoint.snapshot or {}
+    checkpoints.record(repo, str(plan['plan_id']), expected_generation=checkpoint.generation,
+                       operation=checkpoint.operation, expected_head=checkpoint.expected_head,
+                       target_base_oid=checkpoint.target_base_oid, observed_remote_oid=checkpoint.observed_remote_oid,
+                       snapshot={**snapshot, 'worker_frontmatter_restores':
+                                 [*snapshot.get('worker_frontmatter_restores', []), record]})
+    connection.commit()
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=target.parent, prefix='.frontmatter-', delete=False) as stream:
+            temporary = Path(stream.name)
+            stream.write(desired + body)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, stat.S_IMODE(observed.st_mode))
+        if target.resolve() != target or identity(target.lstat()) != identity(observed) or target.read_bytes() != candidate:
+            raise RuntimeError('frontmatter 복원 전 파일이 다시 변경됐습니다.')
+        os.replace(temporary, target)
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+    return True
 
 
 @dataclass(frozen=True)
