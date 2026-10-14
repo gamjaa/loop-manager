@@ -337,13 +337,6 @@ def restore_worker_frontmatter(worktree, relative_path, plan, *, repo, revision,
     if target.resolve() != target or not stat.S_ISREG(target.lstat().st_mode):
         raise ExecPlanMetadataError('frontmatter 복원 대상이 실제 작업 파일이 아닙니다.')
     candidate = target.read_bytes()
-    original = git_bytes(worktree, 'show', f'{revision}:{relative_path}')
-    official = execplan_catalog.parse_execplan_text(relative_path, original.decode('utf-8'), validate_sources=False)
-    error = _execplan_metadata_identity_error(
-        ExecplanMetadataIdentityErrorEffects(_current_execplan_metadata=_current_execplan_metadata),
-        worktree, official, plan, 'frontmatter 복원 원본')
-    if error is not None or official.get('draft'):
-        raise ExecPlanMetadataError(error or 'draft 선언은 자동 복원하지 않습니다.')
     def split(raw):
         lines = raw.splitlines(keepends=True)
         if not lines or lines[0].rstrip(b'\r\n') != b'---':
@@ -352,17 +345,24 @@ def restore_worker_frontmatter(worktree, relative_path, plan, *, repo, revision,
             if line.rstrip(b'\r\n') == b'---':
                 return b''.join(lines[:index + 1]), b''.join(lines[index + 1:])
         raise ExecPlanMetadataError('frontmatter 복원에 필요한 종료 구분자가 없습니다.')
-    desired, _ = split(original)
     current, body = split(candidate)
-    if current.replace(b'\r\n', b'\n') == desired.replace(b'\r\n', b'\n'):
-        return False
     if connection is None:
         raise RuntimeError('frontmatter 복원 감사 DB가 없습니다.')
     entry = connection.execute('SELECT agent_input_plan FROM exec_plans WHERE repo = ? AND plan_id = ?',
                                (repo, str(plan['plan_id']))).fetchone()
     if entry is None or not entry['agent_input_plan']:
-        raise RuntimeError('Worker 시작 frontmatter 증거가 없어 복원하지 않습니다.')
+        return False  # 시작 증거가 없는 과거 후보는 기존 metadata 검증으로 판단한다.
     started, _ = split(str(entry['agent_input_plan']).encode('utf-8'))
+    if current.replace(b'\r\n', b'\n') == started.replace(b'\r\n', b'\n'):
+        return False
+    original = git_bytes(worktree, 'show', f'{revision}:{relative_path}')
+    official = execplan_catalog.parse_execplan_text(relative_path, original.decode('utf-8'), validate_sources=False)
+    error = _execplan_metadata_identity_error(
+        ExecplanMetadataIdentityErrorEffects(_current_execplan_metadata=_current_execplan_metadata),
+        worktree, official, plan, 'frontmatter 복원 원본')
+    if error is not None or official.get('draft'):
+        raise ExecPlanMetadataError(error or 'draft 선언은 자동 복원하지 않습니다.')
+    desired, _ = split(original)
     if started.replace(b'\r\n', b'\n') != desired.replace(b'\r\n', b'\n'):
         raise RuntimeError('Worker 시작 이전의 frontmatter 변경은 자동 복원하지 않습니다.')
     from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository

@@ -362,8 +362,7 @@ class WorkerFrontmatterRestoreTests(unittest.TestCase):
         self.assertEqual(self.target.read_bytes(), damaged)
         self.target.write_bytes(self.candidate)
         self.connection.execute('UPDATE exec_plans SET agent_input_plan = ?', (self.candidate.decode(),))
-        with self.assertRaisesRegex(RuntimeError, '시작 이전'):
-            self.restore()
+        self.assertFalse(self.restore())
         self.assertEqual(self.target.read_bytes(), self.candidate)
         self.connection.execute('UPDATE exec_plans SET agent_input_plan = ?', (self.original.decode(),))
         checkpoints = ExecutionCheckpointRepository(self.connection)

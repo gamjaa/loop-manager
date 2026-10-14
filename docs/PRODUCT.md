@@ -289,7 +289,7 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 
 - source와 dependency 변경은 같은 reconciliation 결과를 Requirement 판단 자격·입력 지문·READY 선택에 사용하고 priority 변경은 다음 선택부터 반영한다. complexity·risk 변경은 최초 Worker level을 다시 계산하되 실행 이력이 있는 계획의 effective level과 Review 승격 이력을 낮추지 않는다
 - 현재 path와 title은 compact catalog, 로그·알림과 이후 파일 조회에 사용하지만 기존 PR의 ExecPlan 링크는 최초 게시 SHA와 최초 active path를 계속 사용한다
-- 최초 또는 비교 가능한 전체 계획 성공 기준이 없거나, PRODUCT·활성 Requirement·ARCHITECTURE·사용자 active ExecPlan이 바뀌면 일반 Planner를 READY 선택보다 먼저 실행한다. 일반 Planner는 비종료 compact catalog와 PR 전 계획 snapshot으로 현재 식별 가능한 미충족 작업을 한 번에 계획한다. 실행 이력이 있어도 PR 전이면 같은 ID로 개정하며 작업물·세션·실패·Worker level 이력을 보존한다. PR 등록 후 Merge 대기 작업의 추가·변경 요구사항은 새 ExecPlan으로 작성한다
+- 최초 또는 비교 가능한 전체 계획 성공 기준이 없거나, PRODUCT·활성 Requirement·ARCHITECTURE·사용자 active ExecPlan이 바뀌면 일반 Planner를 READY 선택보다 먼저 실행한다. 일반 Planner는 비종료 compact catalog와 PR 전 계획 snapshot으로 현재 식별 가능한 미충족 작업을 한 번에 계획한다. 실행 이력이 있어도 PR 전이면 같은 ID로 개정하며 작업물·세션·실패·Worker level 이력을 보존한다. R-077의 수동 소유 계획과 start/submit 준비 intent 대상은 snapshot과 게시 직전 검사에서 보호하며, membership 변경은 영향을 받은 개정을 거부한다. 독립 계획은 계속 처리하고 실제 종료·대상 해제 뒤 남은 membership 이력만으로 소유권을 추정하지 않는다. PR 등록 후 Merge 대기 작업의 추가·변경 요구사항은 새 ExecPlan으로 작성한다
 - 일반 Planner는 마지막으로 원격 적용한 성공 검토와 비교 가능한 경우 변경·삭제·rename과 현재 catalog부터 확인한다. 영향받은 명세 절·코드·테스트·계획과 dependency를 읽고 불확실하면 범위를 넓힌다. 비교 근거가 없거나 손상되면 활성 명세 전문을 확인하며, 매 변경 검토에서 무관한 문서 전문을 반복하지 않는다
 - 문서·지침·active ExecPlan은 그대로이고 코드·테스트·설정만 바뀌면 수정 가능한 미착수 READY를 읽기 전용 점검 Planner가 먼저 확인한다. dependency 대기 READY도 포함하며 실행 이력·소유 증거가 있는 계획은 대상에서 제외한다. 대상이 없으면 일반 Planner가 위 비교 기준에 따라 미충족 작업을 확인한다
 - 점검의 수정 불필요 결과는 같은 입력과 대상에서 재사용하고 일반 Planner 없이 기존 READY 선택을 이어간다. 수정 필요·판단 불확실은 근거와 대상을 일반 Planner에 인계한다. 점검 성공은 예정 작업의 유지 가능성만 확인하며 전체 계획·유지보수 성공 기준이나 프로젝트 완료를 확정하지 않는다

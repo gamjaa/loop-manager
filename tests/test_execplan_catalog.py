@@ -505,13 +505,18 @@ class ScopedCatalogParsingTest(unittest.TestCase):
         product = 'docs/PRODUCT.md'
         broken = 'docs/plans/[G-001] Broken.md'
         independent = 'docs/plans/[G-002] Independent.md'
+        source = 'docs/requirements/[R-066] Original.md'
+        renamed = 'docs/requirements/[R-066] Renamed.md'
+        requirement = b'# [R-066] Renamed\n\nChanged requirement.\n'
         contents = {
             'broken-oid': execplan_header('G-001', 'Broken', risk='invalid').encode(),
-            'valid-oid': plan_text('G-002', 'Independent').encode(),
+            'valid-oid': execplan_header('G-002', 'Independent', sources=(source,)).encode(),
+            'requirement-oid': requirement,
         }
         tree = (f'100644 blob product-oid\t{product}\0'
                 f'100644 blob broken-oid\t{broken}\0'
-                f'100644 blob valid-oid\t{independent}\0').encode()
+                f'100644 blob valid-oid\t{independent}\0'
+                f'100644 blob requirement-oid\t{renamed}\0').encode()
         def git_bytes(_repo, command, *arguments):
             return tree if command == 'ls-tree' else contents[arguments[-1]]
         effects = SimpleNamespace(git=lambda *args: SimpleNamespace(stdout=revision), git_bytes=git_bytes)
@@ -524,4 +529,6 @@ class ScopedCatalogParsingTest(unittest.TestCase):
         self.assertEqual((pinned.revision_sha, pinned.snapshot.revision_sha), (revision, revision))
         self.assertEqual(set(pinned.snapshot.active), {'G-002'})
         self.assertEqual(pinned.snapshot.withheld_ids, {'G-001'})
-        self.assertEqual(pinned.regular_paths, {product, broken, independent})
+        self.assertEqual(pinned.regular_paths, {product, broken, independent, renamed})
+        self.assertEqual(pinned.requirement_documents, {renamed: requirement})
+        self.assertEqual(pinned.snapshot.active['G-002'].sources, (source,))

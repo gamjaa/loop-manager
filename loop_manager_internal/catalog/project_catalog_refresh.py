@@ -201,6 +201,7 @@ class ProjectCatalogRefresh:
         snapshot = execplan_catalog.snapshot_from_documents(
             documents, validate_sources=True,
             available_regular_paths=frozenset(paths), revision_sha=commit_oid,
+            requirement_documents=pinned.requirement_documents,
         )
         result = replace(pinned, revision_sha=commit_oid, snapshot=snapshot,
                          regular_paths=frozenset(paths))

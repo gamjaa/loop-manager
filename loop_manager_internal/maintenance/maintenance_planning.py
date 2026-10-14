@@ -51,6 +51,7 @@ class ReadyPlanSnapshot:
     current_risk: str | None = None
     current_metadata_recorded: bool = False
     execution_state: str | None = None
+    manual_ownership_state: str | None = None
 
     @property
     def draft(self) -> bool:

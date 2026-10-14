@@ -386,6 +386,35 @@ def validate_worker_workspace_scope(
         from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
         raise WorkspaceOwnershipError('Manager Git 작업 전에 index flags를 확인해야 합니다: '
                                       + ', '.join(unsafe_index[:8]))
+    resources = (agent_scope_decision.used_git_resources(
+        role="worker", phase=scope_phase, base_branch=base_branch,
+        branch=branch, worktree_key=str(worktree.resolve()),
+    ) if scope_phase is not None else None)
+    candidate_base = catalog_plan['active_sha']
+    origin = after.refs.get(f'refs/remotes/origin/{base_branch}')
+    if origin is not None:
+        observed = effects.git(worktree, 'merge-base', after.head, origin[0], check=False)
+        if observed.returncode or not observed.stdout.strip():
+            raise RuntimeError('Worker 범위 비교의 원본 브랜치 기준을 확인할 수 없습니다.')
+        candidate_base = observed.stdout.strip()
+    publication_head = candidate_base
+    if connection is not None and not allow_rebase:
+        manual_tables = {row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('manual_work_groups', 'manual_work_members')"
+        )}
+        if manual_tables == {'manual_work_groups', 'manual_work_members'}:
+            from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+            from loop_manager_internal.runtime.runtime_identity import _canonical_path
+            store = ManualWorkRepository(connection)
+            plan_id = str(catalog_plan['plan_id'])
+            group = store.for_plan(str(repo_path), plan_id)
+            if (group is not None and group['kind'] == 'submit' and group['state'] == 'AUTOMATIC'
+                    and group['request_id'] is not None and group['branch'] == branch
+                    and group['worktree']
+                    and _canonical_path(Path(group['worktree'])) == _canonical_path(worktree)):
+                store.workspace_owner(str(repo_path), plan_id)
+                publication_head = before.head
     if on_frontmatter_restored is not None and not allow_rebase:
         if after.head != before.head:
             raise RuntimeError('Worker 종료 전후 HEAD가 달라 frontmatter 복원을 보류합니다.')
@@ -398,18 +427,7 @@ def validate_worker_workspace_scope(
                                       repo=str(repo_path), revision=revision, connection=connection, git_bytes=effects.git_bytes):
             on_frontmatter_restored(selected_plan_path)
             after = effects.capture_git_snapshot(worktree)
-    resources = (agent_scope_decision.used_git_resources(
-        role="worker", phase=scope_phase, base_branch=base_branch,
-        branch=branch, worktree_key=str(worktree.resolve()),
-    ) if scope_phase is not None else None)
-    candidate_base = catalog_plan['active_sha']
-    origin = after.refs.get(f'refs/remotes/origin/{base_branch}')
-    if origin is not None:
-        observed = effects.git(worktree, 'merge-base', after.head, origin[0], check=False)
-        if observed.returncode or not observed.stdout.strip():
-            raise RuntimeError('Worker 범위 비교의 원본 브랜치 기준을 확인할 수 없습니다.')
-        candidate_base = observed.stdout.strip()
-    publication_before = (replace(after, head=candidate_base, index=after.index, dirty={})
+    publication_before = (replace(after, head=publication_head, index=after.index, dirty={})
                           if isinstance(candidate_base, str) and candidate_base else before)
     effects.validate_agent_scope(
         "worker",
