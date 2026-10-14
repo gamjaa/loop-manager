@@ -65,6 +65,7 @@ class RevisionHandlerPorts:
     guard: Callable[[ExecutionContext], ExecutionContext | ExecutionOutcome]
     observe_verify_inputs: Callable[..., Any] | None = None
     refresh_documents: Callable[..., Any] | None = None
+    planning_required: Callable[..., bool] | None = None
 
 
 class RevisionHandler:
@@ -335,6 +336,8 @@ class RevisionHandler:
         """Refresh and reconcile before any phase effect consumes its snapshot."""
 
         self.ports.state.check_context(context)
+        from loop_manager_internal.execution.execution_revision import advance_owned_record, record_only_definition
+        advance_owned_record(self.ports, context)
         from loop_manager_internal.execution.manual_candidate import get_manual
         pending_manual = get_manual(self.ports.state)
         if pending_manual and pending_manual.enabled() and pending_manual.group()['pending_source_head'] \
@@ -348,6 +351,9 @@ class RevisionHandler:
         self.ports._publish_rebased_checkpoint(context)
         latest_sha = self.ports._fetch_latest_base()
         try:
+            if (not context.resolving_rebase and self.ports.planning_required is not None
+                    and self.ports.planning_required(latest_sha)):
+                return self.ports._retry('명세 변경의 프로젝트 planning을 현재 작업 재개 전에 반영합니다.')
             result = self.ports.reconcile_catalog(
                 self.ports.identity.repo_path, self.ports.identity.repo, self.ports.identity.base
             )
@@ -441,6 +447,11 @@ class RevisionHandler:
             previous = DefinitionSnapshot.deserialize(
                 self.ports._row()['definition_snapshot']
             )
+            stored_previous = previous
+            if self.ports.checkpoint is not None:
+                record = (self.ports.checkpoint.get(self.ports.identity.repo, context.plan.plan_id).snapshot or {}).get('document_record')
+                if record and record.get('applied') and isinstance(record.get('text'), str):
+                    snapshot = record_only_definition(snapshot, record['text'])
             if previous is not None and previous.body_text is None and snapshot.body_text is not None:
                 # Upgrade only from the original revision, never today's plan.
                 original = self.ports.body_hash(
@@ -448,8 +459,9 @@ class RevisionHandler:
                 )
                 if original == previous.body_hash and isinstance(getattr(original, 'body_text', None), str):
                     old_token = previous.worker_token
+                    legacy_token = previous.legacy_worker_token
                     previous = replace(previous, body_text=original.body_text)
-                    if self.ports._row()['worker_input_token'] == old_token:
+                    if self.ports._row()['worker_input_token'] in {old_token, legacy_token}:
                         self.ports.state.update_project(
                             self.ports.identity.repo, worker_input_token=previous.worker_token,
                         )
@@ -473,6 +485,9 @@ class RevisionHandler:
             )
 
         row = self.ports._row()
+        if previous is not None and row['worker_input_token'] == previous.legacy_worker_token:
+            self.ports.state.update_project(self.ports.identity.repo, worker_input_token=previous.worker_token)
+            row = self.ports._row()
         active_sha = str(row['active_sha'] or '')
         document_revision = None
         if self.ports.refresh_documents is not None and self.ports.checkpoint is not None:
@@ -528,6 +543,12 @@ class RevisionHandler:
         candidate_head = self.ports.git(
             context.worktree, 'rev-parse', 'HEAD'
         ).stdout.strip()
+        worker_candidate_token = ((self.ports.checkpoint.get(self.ports.identity.repo, context.plan.plan_id).snapshot or {}).get('worker_candidate_token')
+                                  if self.ports.checkpoint else None)
+        if stored_previous is not None and previous is not None and worker_candidate_token in (
+                stored_previous.worker_candidate_token(candidate_head),
+                stored_previous.legacy_worker_candidate_token(candidate_head)):
+            worker_candidate_token = previous.worker_candidate_token(candidate_head)
         from loop_manager_internal.storage import verify_receipts
         from loop_manager_internal.verification.inputs import InputObservation
         reused = verify_receipts.reused_candidate(self.ports.state.connection,
@@ -564,8 +585,7 @@ class RevisionHandler:
                 manual_submission=bool(manual and manual.user_submission(row)),
                 require_worker_candidate=bool(self.ports.checkpoint and
                     (self.ports.checkpoint.get(self.ports.identity.repo, context.plan.plan_id).snapshot or {}).get('current_rebase_acceptance')),
-                worker_candidate_token=((self.ports.checkpoint.get(self.ports.identity.repo, context.plan.plan_id).snapshot or {}).get('worker_candidate_token')
-                                        if self.ports.checkpoint else None),
+                worker_candidate_token=worker_candidate_token,
                 worker_result=row['worker_result'] is not None,
                 verify_result=reusable_now and (manual.valid_evidence(context,'verify',row['verify_result'])
                                if manual and manual.enabled() else row['verify_result'] is not None),

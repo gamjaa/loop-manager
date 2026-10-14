@@ -414,6 +414,7 @@ _PROJECT_VERSION_FIELDS = (
     "active_sha",
     "validated_base_sha",
     "planning_preserved_state",
+    "planning_resume_plan_id",
     "planning_error",
     "planning_error_fingerprint",
     "planning_attempt_fingerprint",

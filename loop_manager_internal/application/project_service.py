@@ -884,10 +884,10 @@ class ProjectService:
             return 0
         newly_activated = planning_outcome.newly_activated
         return self._dispatch_execution(
-            runtime_repository, newly_activated=newly_activated,
+            runtime_repository, newly_activated=newly_activated, planning_context=planning_context,
         )
 
-    def _dispatch_execution(self, runtime_repository, *, newly_activated: bool) -> int:
+    def _dispatch_execution(self, runtime_repository, *, newly_activated: bool, planning_context=None) -> int:
         execution_ports = self.effects._ExecutionLifecyclePorts(
             self.identity.connection,
             runtime_repository,
@@ -918,6 +918,30 @@ class ProjectService:
                 and execution_outcome.context is not None
             ):
                 execution_context = execution_outcome.context
+                if planning_context is not None:
+                    before_planning = runtime_repository.active(self.state.repo)
+                    self.effects._recorded_base_fetch(self.state.repo_path, self.identity.state_dir,
+                                                      self.state.base, owner='project')
+                    self.state.base_sha = self._refresh_catalog()
+                    planning_context = replace(planning_context, base_sha=self.state.base_sha)
+                    planning = PlanningLifecycleCoordinator(self.effects._PlanningLifecyclePorts(
+                        self.identity.connection, runtime_repository,
+                        maintenance_state.MaintenanceRepository(self.identity.connection),
+                        planning_context, self.identity.planner_mutex,
+                    )).run(planning_context)
+                    step = self.effects._planning_outcome_step_result(planning)
+                    if step is not None:
+                        return step
+                    self.state.base_sha = planning.base_sha or self.state.base_sha
+                    after_planning = runtime_repository.active(self.state.repo)
+                    unchanged_execution = (before_planning is not None and after_planning is not None
+                        and replace(after_planning, catalog_generation=before_planning.catalog_generation,
+                                    current_revision_sha=before_planning.current_revision_sha) == before_planning)
+                    if not unchanged_execution:
+                        prepared = execution.prepare()
+                        if isinstance(prepared, ExecutionOutcome):
+                            return self.effects._execution_outcome_step_result(prepared)
+                        execution_context = prepared
                 continue
             from loop_manager_internal.recovery import manual_work_recovery
             manual_work_recovery.release_wait(self.identity.connection,self.state.repo,execution_outcome,

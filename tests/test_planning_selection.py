@@ -53,6 +53,101 @@ from tests.support.catalog import plan_text
 from tests.support.git import isolated_git_test
 
 class PlanningSelectionTest(PlanningCase):
+    def test_general_planning_finishes_before_resuming_same_active_execution(self):
+        original = planning_snapshot(phase='VERIFYING', active_sha='old-base', worktree='/saved',
+            processed_sha='old-base', planning_fingerprint='old-full', specification_fingerprint='old-spec')
+        ports = FakePorts(original)
+        ports.git.specification_fingerprints['old-base'] = 'old-spec'
+        ports.state.schedule_result.active = {'plan_id': 'G-001', 'pr_url': None,
+            'pr_conflict_recovery': 0, 'worktree': '/saved'}
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(ports.agent.run_count, 1)
+        self.assertEqual(ports.state.snapshot.phase, 'VERIFYING')
+        self.assertEqual(ports.state.snapshot.worktree, '/saved')
+        self.assertEqual(ports.state.snapshot.processed_sha, 'base')
+        self.assertIsNone(ports.state.snapshot.planning_resume_plan_id)
+        PlanningLifecycleCoordinator(ports).run(self.context)
+        self.assertEqual(ports.agent.run_count, 1)
+
+    def test_general_planning_restart_preserves_active_maintenance_and_resumes_same_execution(self):
+        for phase in (maintenance_state.MaintenancePhase.REFACTORING,
+                      maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION):
+            with self.subTest(phase=phase):
+                original = planning_snapshot(phase='VERIFYING', active_sha='old-base', worktree='/saved',
+                    processed_sha='old-base', planning_fingerprint='old-full', specification_fingerprint='old-spec')
+                cycle = maintenance_cycle(phase=phase, refactoring_plan_ids=('G-001',))
+                ports = FakePorts(original, cycle)
+                ports.git.specification_fingerprints['old-base'] = 'old-spec'
+                ports.state.schedule_result.active = {'plan_id': 'G-001', 'pr_url': None,
+                    'pr_conflict_recovery': 0, 'worktree': '/saved'}
+                coordinator = PlanningLifecycleCoordinator(ports)
+                run = coordinator._new_run(self.context)
+                coordinator._selection._select_planning_work(run)
+                coordinator._selection._reconcile_inputs(run)
+                self.assertEqual(ports.state.snapshot.phase, 'PLANNING')
+                outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+                self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
+                self.assertEqual(ports.agent.run_count, 1)
+                self.assertEqual(ports.state.snapshot.phase, 'VERIFYING')
+                self.assertEqual(ports.state.snapshot.worktree, '/saved')
+                self.assertIsNone(ports.state.snapshot.planning_resume_plan_id)
+                self.assertEqual(ports.state.cycle, cycle)
+
+    def test_local_recheck_restores_parked_general_planning_with_active_maintenance(self):
+        row = planning_snapshot(phase='PLANNING', active_sha='base', worktree='/planning',
+            planning_resume_plan_id='G-001', planning_error='failed', planning_error_fingerprint='fingerprint')
+        ports = FakePorts(row, maintenance_cycle(phase=maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION))
+        ports.state.schedule_result.active = {'plan_id': 'G-001'}
+        ports.state.suspend_planning(row, unconfirmed_plan_ids=('G-001',))
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(replace(self.context, local_environment_recheck=True))
+        self.assertIsNone(coordinator._selection._gate_preserved_error(run))
+        self.assertFalse(run.maintenance_planning)
+        self.assertEqual(run.row.phase, 'PLANNING')
+        self.assertEqual(run.row.planning_resume_plan_id, 'G-001')
+        self.assertIsNone(run.row.planning_preserved_state)
+
+    def test_specification_change_parks_active_execution_before_general_planning(self):
+        original = planning_snapshot(phase='VERIFYING', active_sha='old-base', worktree='/saved',
+            processed_sha='old-base', planning_fingerprint='old-full', specification_fingerprint='old-spec')
+        ports = FakePorts(original)
+        ports.git.specification_fingerprints['old-base'] = 'old-spec'
+        ports.state.schedule_result.active = {'plan_id': 'G-001', 'pr_url': None, 'pr_conflict_recovery': 0}
+        coordinator = PlanningLifecycleCoordinator(ports)
+        run = coordinator._new_run(self.context)
+        self.assertIsNone(coordinator._selection._select_planning_work(run))
+        self.assertEqual(run.selection.kind, PlanningDecisionKind.RUN_SPECIFICATION_PLANNING)
+        self.assertEqual(run.row.planning_resume_plan_id, 'G-001')
+        self.assertEqual(ports.state.paused_execution, original)
+        coordinator._selection._reconcile_inputs(run)
+        self.assertEqual(run.row.phase, 'PLANNING')
+        self.assertEqual(run.row.planning_resume_plan_id, 'G-001')
+
+    def test_changed_specification_waits_for_running_agent_without_parking_execution(self):
+        original = planning_snapshot(phase='VERIFYING', active_sha='old-base', worktree='/saved',
+            processed_sha='old-base', planning_fingerprint='old-full', specification_fingerprint='old-spec')
+        ports = FakePorts(original)
+        ports.git.specification_fingerprints['old-base'] = 'old-spec'
+        ports.state.schedule_result.active = {'plan_id': 'G-001', 'pr_url': None, 'pr_conflict_recovery': 0}
+        ports.state.planning_release_pending = lambda _repo: True
+        outcome = PlanningLifecycleCoordinator(ports).run(self.context)
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.WAITING)
+        self.assertEqual(ports.state.snapshot, original)
+        self.assertFalse(hasattr(ports.state, 'paused_execution'))
+        self.assertEqual(ports.agent.run_count, 0)
+
+    def test_stable_specification_resumes_active_without_planning_or_code_only_check(self):
+        original = planning_snapshot(phase='VERIFYING', active_sha='base', worktree='/saved',
+            processed_sha='base', planning_fingerprint='old-full', specification_fingerprint='fingerprint')
+        ports = FakePorts(original)
+        ports.state.schedule_result.active = {'plan_id': 'G-001', 'pr_url': None, 'pr_conflict_recovery': 0}
+        coordinator = PlanningLifecycleCoordinator(ports)
+        outcome = coordinator.run(self.context)
+        self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)
+        self.assertEqual(ports.state.snapshot, original)
+        self.assertFalse(hasattr(ports.state, 'paused_execution'))
+
     def test_legacy_release_resumes_after_removal_and_state_clear_interruptions(self):
         for interruption in ("after_remove", "during_clear"):
             with self.subTest(interruption=interruption), tempfile.TemporaryDirectory() as directory:
@@ -1617,7 +1712,7 @@ class PreservedPlanningSelectionTest(PlanningCase):
         PlanningLifecycleCoordinator(ports).run(self.context)
         saved = ports.state.snapshot.planning_preserved_state
         ports.state.snapshot = replace(ports.state.snapshot, phase="WORKING")
-        ports.state.schedule_result.active = object()
+        ports.state.schedule_result.active = {'plan_id': 'G-001', 'pr_url': 'https://example/pr/1', 'pr_conflict_recovery': 1}
         ports.git.fingerprint = "changed-input"
         outcome = PlanningLifecycleCoordinator(ports).run(self.context)
         self.assertEqual(outcome.kind, PlanningOutcomeKind.EXECUTION_READY)

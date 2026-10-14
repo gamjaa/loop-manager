@@ -481,7 +481,7 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
                 recovery_fixture,
                 recovery_fixture.BoundedRecoveryFixture._active_worker_project,
                 {'plan_id': 'G-001', 'title': 'Worker Boundary',
-                 'record_general_input': False, 'commit_message': 'Add worker plan'},
+                 'record_general_input': True, 'commit_message': 'Add worker plan'},
             ),
             (
                 escalation_fixture,

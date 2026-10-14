@@ -63,6 +63,7 @@ class PublicationHandlerPorts:
     _step_outcome: Callable[..., Any]
     pre_review_identity: Callable[..., Any] | None = None
     observe_verify_inputs: Callable[..., Any] | None = None
+    update_snapshot: Callable[..., None] | None = None
 
 
 class PublicationHandler:
@@ -97,6 +98,11 @@ class PublicationHandler:
             approved_tree = self.ports.git(
                 context.worktree, 'write-tree',
             ).stdout.strip()
+            definition = self.ports.snapshot()._definition_snapshot
+            prior_record = (current.snapshot or {}).get('document_record') or {}
+            planning_previous = definition.serialize() if definition is not None else None
+            if definition is not None and prior_record.get('applied') and definition.body_text == prior_record.get('text'):
+                planning_previous = prior_record.get('planning_previous') or prior_record['previous']
             checkpoint.record(
                 self.ports.identity.repo, context.plan.plan_id,
                 expected_generation=current.generation, operation='commit',
@@ -104,7 +110,11 @@ class PublicationHandler:
                 observed_remote_oid=current.observed_remote_oid,
                 snapshot={**(current.snapshot or {}),
                           'commit_message': title, 'before_head': before,
-                          'commit_tree_oid': approved_tree},
+                          'commit_tree_oid': approved_tree,
+                          **({'document_record': {
+                              'previous': definition.serialize(), 'planning_previous': planning_previous,
+                              'tree': approved_tree}}
+                             if definition is not None else {})},
             )
         result = self.ports.git(
             context.worktree, 'commit', '-m', title,
@@ -125,6 +135,8 @@ class PublicationHandler:
                              and (current.snapshot or {}).get('worker_candidate_token') ==
                                  self.ports.snapshot()._definition_snapshot.worker_candidate_token(before) else {})},
             )
+        from loop_manager_internal.execution.execution_revision import advance_owned_record
+        advance_owned_record(self.ports, context)
         return result
 
     def _commit_rebase_resolution(self, context, title):

@@ -152,7 +152,7 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
             result,verify,agent=self.step(service)
             self.assertEqual(result,0)
             verify.assert_not_called()
-            agent.assert_not_called()
+            self.assertEqual([call.args[4] for call in agent.call_args_list], ['planner'])
             self.assertEqual(service.runtime.get(service.repo,'G-012').status,'PR_OPEN')
 
     def test_manual_waivers_follow_the_pinned_common_guidance_version(self):
@@ -293,7 +293,7 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
             service.complete(args)
             result,verify,agent=self.step(service,stop='publish')
             verify.assert_not_called()
-            agent.assert_not_called()
+            self.assertEqual([call.args[4] for call in agent.call_args_list], ['planner'])
             self.assertEqual(service.runtime.get(service.repo,'G-012').status,'VERIFYING')
             result,verify,agent=self.step(service,review='MANUAL_PLAN_RESULT: G-012 PASS\nVERDICT: PASS',stop='publish')
             self.assertEqual(verify.call_count,1)
@@ -379,7 +379,8 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
             stack.enter_context(mock.patch('loop_manager._agent_profile',
                 return_value=profile or ResolvedProfile('fixture-reviewer','medium')))
             verify=stack.enter_context(mock.patch('loop_manager.verify',return_value=verify_result))
-            agent=stack.enter_context(mock.patch('loop_manager.run_agent',return_value=(0,review)))
+            agent=stack.enter_context(mock.patch('loop_manager.run_agent',
+                side_effect=lambda *args, **kwargs: (0, '' if args[4] == 'planner' else review)))
             if stop:
                 real_ports=loop_manager._ExecutionLifecyclePorts
                 def ports(*args,**kwargs):
