@@ -767,6 +767,8 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
                 nonlocal planner_calls
                 if role_name == "planner":
                     planner_calls += 1
+                    if planner_calls == 2:
+                        return loop_manager.CodexResult(0, '', 'general-session')
                     self.assertEqual(planner_calls, 1)
                     plans_dir = worktree / "docs/plans"
                     (plans_dir / "[G-001] Extract Boundary.md").write_text(
@@ -875,6 +877,8 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
                 with mock.patch(
                     "loop_manager.git", side_effect=record_recovery_git
                 ), mock.patch(
+                    'loop_manager.pr_for_branch', return_value=None
+                ), mock.patch(
                     "loop_manager_internal.planning.tiered_assessment.enabled",
                     return_value=False,
                 ):
@@ -899,7 +903,7 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
 
         self.assertEqual(first.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
         self.assertEqual(second.kind, loop_manager.ProjectRunKind.OPERATIONAL_ERROR)
-        self.assertEqual(planner_calls, 1)
+        self.assertEqual(planner_calls, 2)
         self.assertEqual(recovery_pushes, [])
         self.assertFalse(prepared_worktree.exists())
         self.assertEqual(selected, ["G-001"])
@@ -908,7 +912,7 @@ class MaintenanceCycleTest(MaintenanceCycleCase):
         )
         self.assertEqual(recovered.refactoring_plan_ids, ("G-001",))
         self.assertEqual(recovered.revalidation_plan_ids, ("G-002",))
-        self.assertEqual(project["processed_sha"], plan_commit)
+        self.assertEqual(project["processed_sha"], latest)
         self.assertIsNotNone(project["planning_fingerprint"])
         self.assertEqual(json.loads(general["depends_on"]), ["G-001"])
 

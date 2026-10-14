@@ -73,7 +73,7 @@ class BoundedRecoveryFixture:
             directory,
             plan_id="G-001",
             title="Worker Boundary",
-            record_general_input=False,
+            record_general_input=True,
             commit_message="Add worker plan",
         )
 

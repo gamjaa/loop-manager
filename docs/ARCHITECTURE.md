@@ -251,17 +251,30 @@ Planning rebase 교정 journal은 Agent scope를 통과한 계획·`FUTURE_IDEAS
 
 ### 단계별 원격 문서 반영
 
-Worker·Manager verify·Reviewer의 진입·교정·재개 전에 최신 원본과 작업 branch를 확인한다. 현재 ExecPlan·연결 Requirement·적용 PRODUCT·ARCHITECTURE의 변경 경로를 먼저 좁히고, 실제 관련성과 현재 구현의 부족은 현재 worktree를 읽기 전용으로 대조하는 일반 Planner가 판단한다. 무관한 문서·순수 revision 전진만으로 Worker를 반복하지 않는다. 코드 전용 점검 Planner와 유지보수 대상의 미착수 제한은 그대로다.
+Worker·Manager verify·Reviewer·게시의 진입·교정·재개 전에 최신 원본과 작업 branch를 확인한다. PRODUCT·활성 Requirement·ARCHITECTURE·사용자 active ExecPlan 변경은 프로젝트 일반 planning에서 관련 작업 개정·게시·DB 적용을 먼저 완료한다. 개별 작업의 읽기 전용 실행 대응 판단은 마지막 반영 ExecPlan의 조건 변경과 현재 후보·발견 단계에 한정하며, 상위 명세의 관련성과 작업 개정을 다시 판단하거나 전체 planning 성공으로 기록하지 않는다. 무관한 문서·순수 revision 전진만으로 Worker를 반복하지 않는다. 코드 전용 점검 Planner와 유지보수 대상의 미착수 제한은 그대로다.
 
 문서 반영의 이전 선언·발견 단계·과거 Worker/verify 근거·영향 판단·개정 게시 후보는 해당 ExecPlan의 execution checkpoint에 보존한다. 원격 작업 branch의 문서 관측은 기존 채택 권한을 부여하지 않는다. 기존 소유권·원격 OID 검사를 통과한 채택 뒤에만 해당 branch 문서를 입력으로 반영한다. 이 상태는 rebase·교정의 checkpoint 교체에서도 보존하며 다른 작업이나 일반 planning 상태를 덮어쓰지 않는다.
 
-Planner의 단일 현재 계획 수정안은 Manager가 `<state-dir>/worktrees/<project-id>/document-revisions/<execplan-id>/<base-sha>/`의 소유 detached worktree에서 구조·source·dependency·기존 ID·경로를 검증한다. 실행 중 구현 worktree는 수정하지 않는다. 게시 후보·원본 snapshot을 먼저 저장하고 현재 원격 base·실행 근거·실제 PR 부재·허용 diff를 재확인한 뒤 base에 fast-forward 게시한다. push 뒤 중단은 현재 원격 내용과 저장 후보를 확인해 같은 결과를 재사용하며, 반영을 끝낸 작업 branch에서 필요한 단계로 돌아간다. PR 출현·후속 원격 변경·소유권 불확실에서는 작업물을 보존한다.
+이전 버전의 단일 현재 계획 개정 후보는 기존 소유 detached worktree와 execution checkpoint에서 복구한다. Manager가 구조·source·dependency·기존 ID·경로·실제 PR 부재와 게시 사실을 재검증하고 미완료 적용부터 이어간다. 실행 중 구현 worktree는 수정하지 않으며 PR 출현·후속 원격 변경·소유권 불확실에서는 작업물을 보존한다. 새 실행 대응 판단은 `plan_text` 개정안을 반환하지 않고 프로젝트 일반 planning 게시를 사용한다.
 
 verify 진입의 구현 부족은 Worker 교정으로, 구현이 충족된 경우는 필요한 verify로 연결한다. Reviewer 진입의 문서 변경은 현재 구현과 과거 검증의 확인 범위·최신 조건 미검증을 구분한 선행 Review로 연결한다. 구현·테스트 수정이 필요한 FAIL은 기존 Worker 교정이며, 검증 실행 근거만 부족한 `VERIFY_REQUIRED`는 Manager verify로 연결한다. 선행 PASS도 최신 검증 없이 게시 token을 만들지 않는다. 변경된 조건에서는 과거 verify 성공 재사용을 새로 증명해야 하며 최종 후보의 verify·Review·게시 gate는 독립적으로 유지한다.
 
 진행 중인 일반·유지보수 planning은 원격 base 전진 시 staged·unstaged·untracked 변경과 세션을 관리 worktree에 보존해 반영하고 최신 catalog·SQLite 권한에서 재검증한다. 시작 revision의 READY 원본과 Planner가 작성한 결과를 구분하며, 관련 근거·의존 문서의 실제 내용이 바뀐 경우에만 해당 계획을 다시 확인한다. 무관한 문서 변경과 내용 보존 이동은 재확인을 만들지 않는다
 
-Worker·Reviewer의 문서 재확인은 현재 ExecPlan 내용 변경에 한정한다. 후보 HEAD가 바뀌면 문서 재확인 여부와 관계없이 Worker의 필요한 targeted test, Manager 전체 verify와 읽기 전용 Review를 최종 후보에서 다시 통과한다
+Worker·Reviewer는 프로젝트 planning 뒤 해당 단계에 반영된 최신 작업 문서를 사용한다. 후보 HEAD가 바뀌면 문서 재확인 여부와 관계없이 Worker의 필요한 targeted test, Manager 전체 verify와 읽기 전용 Review의 유효성을 최종 후보에서 기존 입력 증명·재사용 규칙에 따라 확인한다.
+
+### 프로젝트 planning과 작업 문서 반영 기준
+
+[R-082](requirements/%5BR-082%5D%20단계별%20원격%20문서%20반영과%20PR%20전%20ExecPlan%20갱신.md#프로젝트-planning과-현재-작업-재개-순서)의 명세 영향 판단은 프로젝트 일반 planning이 담당한다. 일반 Planner는 변경된 명세·관련 ExecPlan·dependency·현재 원격 구현과 필요한 보존 후보를 읽기 전용으로 확인한다. 관련 PR 전 계획 snapshot 검증·게시 intent·catalog 원자 적용을 재사용하며 구현 worktree를 Planner의 쓰기 공간으로 사용하지 않는다.
+
+| 책임 | 저장·실행 경계 |
+|---|---|
+| 프로젝트 변경 감지·planning 선택 | 안전한 경계에서 `projects.planning_resume_plan_id`로 재개할 작업을 고정하고 프로젝트 실행 투영만 비운다. `exec_plans`의 단계·소유권·작업물·세션·실패 이력은 유지한다. 일반 planning이 실행 자리를 사용하며 게시·DB 적용 뒤 같은 작업을 원자적으로 다시 투영한다. 실행 중 Agent·verify와 소유 Git operation은 기존 경계를 유지한다. |
+| 개정 게시·DB 적용 | 일반 `planning/publication_service.py`와 `storage/planning_input_state.py`의 성공 확정을 재사용한다. 게시 뒤 DB 미적용은 저장 intent로 먼저 복구하고, 새 원격 입력은 별도 검토한다. 관련 조건의 개정·변경 없음 결과가 확인된 최신 성공 기준에서만 현재 작업을 재개한다. |
+| 작업의 실행 대응 | `execution/stage_documents.py`는 본문 구현 조건·sources·dependency 변경의 부족 여부를 확인한다. 구현 입력 token에서 원본 명세 지문만의 변화를 제외하되 verify·Review token은 그 지문을 독립적으로 유지한다. 정확한 이전 token과 snapshot이 확인된 legacy Worker 근거만 새 비교 형식으로 옮기며 과거 성공을 합성하지 않는다. |
+| 마지막 반영 기준·진행 기록 | 소유 커밋의 변경 전 definition·승인 tree와 커밋 결과를 `document_record` checkpoint에 결합한다. 실제 tree·현재 후보의 조상 관계·순수 기록을 확인한 뒤 작업 기준과 적용 완료를 원자 저장하고 중단 후 같은 확인을 재개한다. 원격에서 같은 기록 내용을 관측한 뒤에만 `planning_input_state.advance_verified_delta`로 해당 선언 delta를 소비한다. 같은 파일의 미확인 조건과 다른 입력은 남기며 전체 planning 성공·verify·Review·실패 이력을 갱신하지 않는다. |
+
+위 코드 경로는 모두 `loop_manager_internal/` 아래다. 작업의 마지막 반영 ExecPlan 기준, 프로젝트 planning 성공 기준과 Git·verify·Review·게시의 입력 증명을 분리한다. `DefinitionSnapshot`·원격 SHA·execution checkpoint는 후자의 복구 근거까지 확인해 유지하며 일괄 제거하지 않는다. 전체 성공 기준은 검증된 `planning_input_baselines.reference_revision`과 프로젝트 지문을 사용하고 자체 delta 반영 revision을 새 전체 성공으로 사용하지 않는다. 이전 작업별 판단·개정 checkpoint도 미게시 후보·게시 사실·미완료 적용을 보존해 복구한다. planning 오류에서는 동일 실패 입력을 반복하지 않고 미확인 영향 밖의 작업만 기존 순서로 진행하며, PR·수동 소유 예외는 R-061·R-077을 유지한다.
 
 ## 실행 자리와 유지보수
 

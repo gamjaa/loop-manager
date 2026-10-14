@@ -88,16 +88,12 @@ def remember_work_branch(git, state, checkpoints, identity, context, remote, loc
     if changed.returncode:
         raise RecoveryFailure(RecoveryReason.STATUS_FAILED, changed.stdout)
     paths = tuple(path for path in changed.stdout.split('\0') if path)
-    document_sets = _requirement_document_sets(
-        git_bytes, identity.repo_path, (base, remote), previous.sources,
-    )
-    relevant = _related_paths_across_revisions(
-        previous.path, previous.sources, paths, document_sets,
-    )
+    relevant = (previous.path,) if previous.path in paths else ()
     if not relevant:
         return
     save(checkpoints, identity.repo, context.plan.plan_id, {
         'version': 1, 'stage': 'rebase', 'base': base, 'phase': context.phase.value,
+        'scope': 'execplan',
         'paths': list(relevant), 'document_only': documentary(paths), 'previous': previous.serialize(),
         'worker_result': row['worker_result'], 'verify_result': row['verify_result'],
         'verify_base': row['validated_base_sha'], 'assessment': None,
@@ -110,6 +106,7 @@ def pending(checkpoints, repo, plan_id):
     if value is None:
         return None
     if (not isinstance(value, dict) or value.get("version") != 1
+            or value.get('scope') not in (None, 'execplan')
             or value.get("phase") not in {"IMPLEMENTING", "VERIFYING", "REVIEWING", "PUBLISHING"}
             or value.get("stage") not in {"rebase", "assess", "proposed", "prepared", "done"}
             or not isinstance(value.get("base"), str)
@@ -236,18 +233,9 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
     repo, plan_id = identity.repo, context.plan.plan_id
     row = state.row()
     item = pending(checkpoints, repo, plan_id)
-    sources = tuple(dict.fromkeys((*(previous.sources if previous else ()), *definition.sources)))
-    document_sets = _requirement_document_sets(
-        effects.git_bytes, identity.repo_path,
-        (definition.revision_sha, previous.revision_sha if previous else None), sources,
-    )
-    relevant = tuple(sorted({
-        path
-        for plan in (previous, definition) if plan is not None
-        for path in _related_paths_across_revisions(
-            plan.path, plan.sources, changed, document_sets,
-        )
-    }))
+    relevant = ((definition.path,) if previous is not None
+                and (previous.worker_body_hash, previous.sources, previous.depends_on)
+                != (definition.worker_body_hash, definition.sources, definition.depends_on) else ())
     if item is None and (not relevant or previous is None or context.resolving_rebase):
         return None
     if row['pr_url'] or effects.pr_for_branch(identity.repo_path, context.branch) is not None:
@@ -258,6 +246,12 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
         adoption = (checkpoints.get(repo, plan_id).snapshot or {}).get('remote_adoption_scope')
         if not isinstance(adoption, dict) or adoption.get('remote') != item['remote']:
             return None  # 문서 관측은 원격 branch 채택 권한을 대신하지 않는다.
+        applied = DefinitionSnapshot.deserialize(item['previous'])
+        if (item.get('scope') == 'execplan' and item['stage'] == 'rebase' and applied is not None
+                and (applied.worker_body_hash, applied.sources, applied.depends_on)
+                == (definition.worker_body_hash, definition.sources, definition.depends_on)):
+            save(checkpoints, repo, plan_id, None)
+            return None
     if (item is None and previous is not None and relevant == (definition.path,)
             and previous.worker_token == definition.worker_token):
         return None  # 수행 기록만 바뀐 ExecPlan은 기존 R-072 입력 증명으로 처리한다.
@@ -267,6 +261,7 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
         if not relevant or previous is None or context.resolving_rebase:
             return None
         item = {"version": 1, "stage": "rebase", "base": definition.revision_sha,
+                "scope": "execplan",
                 "phase": context.phase.value, "paths": list(relevant),
                 "document_only": documentary(changed), "previous": previous.serialize(),
                 "worker_result": row["worker_result"], "verify_result": row["verify_result"],
@@ -328,14 +323,16 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
         item = {**item, 'worker_snapshot': worker_before.serialize()}
         save(checkpoints, repo, plan_id, item)
         document_head = head if item.get('work_branch') else item['base']
-        prompt = f"""현재 진행 중인 {plan_id}의 원격 문서 변경을 판단하는 일반 Planner 호출이다.
+        prompt = f"""현재 진행 중인 {plan_id}의 ExecPlan 조건 변경에 따른 실행 대응을 확인한다.
 현재 위치는 Planner 전용 worktree이며 Worker 구현 revision은 {head}다.
-읽기 전용으로 구현·테스트와 최신 문서 revision {document_head}의 ExecPlan·연결 Requirement·PRODUCT·ARCHITECTURE를 대조하라.
+프로젝트 전체 명세 영향 판단과 개정은 일반 planning에서 완료했다.
+읽기 전용으로 구현·테스트와 최신 문서 revision {document_head}의 ExecPlan 조건 변경만 대조하라.
 최신 문서 원문은 git show {document_head}:<문서 경로>로 확인하라.
 Worker 작업 공간 {context.worktree}의 미커밋 작업도 읽기 전용 검토 입력이며 파일·Git·범위 기록을 변경하지 마라.
 확인한 변경 문서는 {json.dumps(item['paths'], ensure_ascii=False)}다. 이전 선언은 {item['previous']}다.
 현재 단계를 {item['phase']}로 이어갈 판단이며 다른 작업을 계획하거나 파일·Git을 변경하거나 테스트를 실행하지 마라.
-PR 등록 전인 현재 ExecPlan만 필요한 경우 같은 ID·경로와 기존 수행 기록을 보존한 전체 문서 수정안으로 반환하라.
+ExecPlan을 개정하거나 연결 Requirement·PRODUCT·ARCHITECTURE의 관련성을 다시 판단하지 마라.
+새 판단의 plan_text는 null이어야 한다. 보존된 이전 개정 후보는 기존 게시 복구로 처리한다.
 구현 조건이 바뀌었지만 현재 구현이 충족하면 satisfied, 코드·테스트 수정이 필요하면 needed,
 명세 판단이 불확실하면 uncertain으로 표시하고 근거를 기록하라. 문서 변경 자체를 구현 부족이나 검증 성공으로 취급하지 마라.
 정확히 한 줄 DOCUMENT_RESULT: JSON을 반환하라. 필드는 relevant(bool), implementation(satisfied|needed|uncertain),
@@ -374,6 +371,8 @@ plan_text(전체 ExecPlan 문자열 또는 수정 불필요면 null), evidence(�
                 raise RecoveryFailure(RecoveryReason.SERVICE_UNAVAILABLE, output)
             try:
                 assessment = parse_assessment(output)
+                if item.get('scope') == 'execplan' and assessment['plan_text'] is not None:
+                    raise PlannerValidationError('실행 대응 판단은 ExecPlan 개정을 반환할 수 없습니다.')
                 break
             except PlannerValidationError as error:
                 protocol_error = str(error)

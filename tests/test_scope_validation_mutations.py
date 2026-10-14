@@ -360,6 +360,7 @@ class ScopeValidationMutationsTest(AgentScopeFixture, unittest.TestCase):
             )
             connection.commit()
 
+            self._confirm_general_plan_input(connection, repo, plan_sha)
             def verify_with_protected_mutation(agent_worktree, timeout_seconds):
                 self.assertEqual(timeout_seconds, 600)
                 (agent_worktree / "docs/PLANS.md").write_text(
@@ -466,6 +467,7 @@ class ScopeValidationMutationsTest(AgentScopeFixture, unittest.TestCase):
                 encoding="utf-8",
             )
             commit_and_push(repo, "Advance base before worker publication")
+            self._confirm_general_plan_input(connection, repo, plan_sha)
             roles = []
             verify_calls = []
 

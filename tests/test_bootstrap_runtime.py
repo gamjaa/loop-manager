@@ -543,6 +543,10 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                     else:
                         loop_manager.register_execplans(connection, str(source), source,
                             [(plan_path, loop_manager._parse_execplan(source, plan_file))], sha_a, fingerprint)
+                        from loop_manager_internal.storage import planning_input_state
+                        with connection:
+                            planning_input_state.record_general(connection, str(source), sha_a,
+                                loop_manager.plan_declarations(source, sha_a))
                         branch, workspace = loop_manager.expected_execplan_workspace(state, str(source), 'G-001')
                         loop_manager.make_worktree(source, workspace, branch, base)
                         with connection:

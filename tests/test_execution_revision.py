@@ -12,6 +12,7 @@ from loop_manager_internal.execution.execution_revision import (
     execplan_body_hash,
     ExecPlanBodyHash,
     remote_failure_correction_paths,
+    record_only_definition,
 )
 
 
@@ -29,6 +30,19 @@ def complete_artifacts(current, base="base"):
 
 
 class ExecutionRevisionTests(unittest.TestCase):
+    def test_record_baseline_does_not_consume_unconfirmed_conditions(self):
+        text = '---\nid: G-047\n---\n## Purpose\nImplement safely\n## Progress\n- [ ] Run required test\n'
+        before = replace(definition(), body_text=text, body_hash=str(ExecPlanBodyHash(text)))
+        recorded = text.replace('[ ]', '[x]')
+        after = record_only_definition(before, recorded)
+        self.assertEqual(after.body_text, recorded)
+        self.assertEqual(after.worker_token, before.worker_token)
+        self.assertNotEqual(after.definition_token, before.definition_token)
+        for mixed in (recorded + '- New condition: send data\n', recorded.replace('Implement safely', 'Skip tests'),
+                      recorded.replace('G-047', 'G-048')):
+            self.assertEqual(record_only_definition(before, mixed), before)
+        self.assertEqual(record_only_definition(replace(before, body_text=None), recorded), replace(before, body_text=None))
+
     def test_worker_record_grammar_keeps_full_definition_and_review_inputs(self):
         text = ('---\nid: G-182\n---\n## Purpose\nImplement safely\n'
                 '## Progress\n- [ ] Run required unit test\n## Decision Log\n')
@@ -119,7 +133,7 @@ class ExecutionRevisionTests(unittest.TestCase):
             "priority": (replace(original, priority="low"), DefinitionDelta.PRIORITY, False),
             "profile": (replace(original, risk="high"), DefinitionDelta.PROFILE, False),
             "path": (replace(original, path="docs/plans/[G-037] New.md"), DefinitionDelta.PATH, False),
-            "source": (replace(original, source_fingerprint="new"), DefinitionDelta.SOURCE_INPUT, True),
+            "source": (replace(original, source_fingerprint="new"), DefinitionDelta.SOURCE_INPUT, False),
             "dependency": (replace(original, depends_on=("G-036", "G-049")), DefinitionDelta.DEPENDENCIES, True),
             "body": (replace(original, body_hash="new"), DefinitionDelta.BODY, True),
             "archive": (replace(original, archive_candidates=("docs/requirements/R.md",)), DefinitionDelta.ARCHIVE_SCOPE, True),
@@ -139,6 +153,10 @@ class ExecutionRevisionTests(unittest.TestCase):
                 if invalidates_worker:
                     self.assertEqual(decision.kind, RevisionGateKind.INVALIDATE_TO_PHASE)
                     self.assertEqual(decision.phase, "IMPLEMENTING")
+                elif name == 'source':
+                    self.assertEqual(decision.kind, RevisionGateKind.INVALIDATE_TO_PHASE)
+                    self.assertEqual(decision.phase, 'VERIFYING')
+                    self.assertEqual(current.worker_token, original.worker_token)
                 else:
                     self.assertEqual(decision.kind, RevisionGateKind.CONTINUE)
                     self.assertEqual(decision.phase, "PUBLISHING")

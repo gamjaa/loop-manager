@@ -8,7 +8,7 @@ from tests.support.planning_case import PlanningCase, FakePorts, planning_snapsh
 
 
 class PlanningDecisionTest(unittest.TestCase):
-    def test_active_work_keeps_precedence_over_changed_full_input(self):
+    def test_specification_planning_precedes_active_work(self):
         decision = choose_planning_decision(
             has_active=True,
             specification_changed=True,
@@ -17,7 +17,7 @@ class PlanningDecisionTest(unittest.TestCase):
             has_waiting_catalog=True,
         )
 
-        self.assertEqual(decision.kind, PlanningDecisionKind.RESUME_ACTIVE)
+        self.assertEqual(decision.kind, PlanningDecisionKind.RUN_SPECIFICATION_PLANNING)
 
     def test_specification_change_precedes_runnable_ready(self):
         decision = choose_planning_decision(

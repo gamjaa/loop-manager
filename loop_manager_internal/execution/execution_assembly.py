@@ -193,6 +193,7 @@ def revision(effects: ExecutionEffects, identity: ExecutionIdentity,
         callbacks: dict[str, Callable], *, recovery=None, rebase_corrections=None) -> RevisionHandler:
     return RevisionHandler(RevisionHandlerPorts(
         refresh_documents=effects.revision.refresh_documents,
+        planning_required=effects.revision.planning_required,
         observe_verify_inputs=effects.validation.observe_verify_inputs,
         identity=identity,
         snapshot=snapshot,
@@ -439,6 +440,7 @@ def publication(effects: ExecutionEffects, identity: ExecutionIdentity,
         snapshot: Callable[[], PreparationSnapshot], update_snapshot: Callable[..., None],
         callbacks: dict[str, Callable], *, recovery=None, rebase_corrections=None) -> PublicationHandler:
     return PublicationHandler(PublicationHandlerPorts(
+        update_snapshot=callbacks.get('_update_snapshot'),
         observe_verify_inputs=effects.validation.observe_verify_inputs,
         pre_review_identity=effects.validation.pre_review_identity,
         identity=identity,

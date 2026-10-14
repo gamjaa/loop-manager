@@ -46,7 +46,7 @@ class PlanningLifecycleCoordinator:
     def _new_run(self, context: PlanningContext) -> _PlanningRun:
         row = self._ports.state.planning(context.repo)
         cycle = self._ports.state.maintenance_cycle(context.repo)
-        maintenance_planning = bool(row.phase == "PLANNING" and cycle.phase in {
+        maintenance_planning = bool(not row.planning_resume_plan_id and row.phase == "PLANNING" and cycle.phase in {
             maintenance_state.MaintenancePhase.ASSESSMENT,
             maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
         })

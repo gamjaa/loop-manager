@@ -164,6 +164,67 @@ class CurrentRebaseRuntimeTests(unittest.TestCase):
 
 
 class RuntimeStateRepositoryTest(unittest.TestCase):
+    def test_owned_progress_baseline_consumes_only_confirmed_published_delta(self):
+        import hashlib
+        from tests.support.revision import definition
+        from loop_manager_internal.execution.execution_revision import ExecPlanBodyHash
+        from loop_manager_internal.storage import planning_input_state
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        text = '---\nid: G-047\n---\n## Purpose\nImplement safely\n## Progress\n- [ ] Run test\n'
+        previous = dataclasses.replace(definition(), body_text=text, body_hash=str(ExecPlanBodyHash(text)))
+        recorded = text.replace('[ ]', '[x]')
+        entry = lambda value: ('blob', hashlib.sha256(value.encode('utf-8')).hexdigest())
+        before = {previous.path: entry(text), 'other.md': ('blob', 'unseen-before')}
+        planning_input_state.record_general(connection, 'repo', 'general', before)
+        checkpoints = ExecutionCheckpointRepository(connection)
+        checkpoints.record('repo', 'G-047', expected_generation=0, operation=None, expected_head='commit',
+            target_base_oid='base', observed_remote_oid=None, snapshot={'document_record': {
+                'previous': previous.serialize(), 'text': recorded, 'commit': 'commit', 'applied': True}})
+        self.assertFalse(planning_input_state.consume_owned_records(connection, 'repo', 'base', before))
+        current = {previous.path: entry(recorded), 'other.md': ('blob', 'unseen-after')}
+        self.assertTrue(planning_input_state.consume_owned_records(connection, 'repo', 'observed', current))
+        self.assertFalse(planning_input_state.consume_owned_records(connection, 'repo', 'observed', current))
+        saved = connection.execute("SELECT reference_revision,last_verified_revision,entries FROM planning_input_baselines").fetchone()
+        self.assertEqual(tuple(saved[:2]), ('general', 'observed'))
+        self.assertEqual(json.loads(saved['entries'])['other.md'], ['blob', 'unseen-before'])
+        self.assertFalse(planning_input_state.matches(connection, 'repo', current))
+
+    def test_planning_handoff_preserves_execution_and_recovers_after_failure(self):
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        runtime = runtime_state.RuntimeStateRepository(connection)
+        runtime.clear('repo')
+        connection.execute("UPDATE exec_plans SET status='VERIFYING', active_sha='base', "
+            "branch='work', worktree='/saved', worker_session_id='session', worker_result='implemented', "
+            "last_error='old failure' WHERE repo='repo'")
+        connection.commit()
+        original = runtime.hydrate('repo', 'G-047')
+        expected = runtime.planning('repo')
+        def fail(stage):
+            if stage == 'after_execution_planning_pause':
+                raise RuntimeError('interrupted')
+        with self.assertRaisesRegex(RuntimeError, 'interrupted'):
+            runtime_state.RuntimeStateRepository(connection, fault_hook=fail).pause_execution_for_planning(expected, 'G-047')
+        self.assertEqual(runtime.planning('repo'), expected)
+        runtime.pause_execution_for_planning(expected, 'G-047')
+        self.assertEqual(runtime.active('repo'), original)
+        self.assertIsNone(runtime.projected('repo'))
+        self.assertFalse(runtime.recovery_slot_available('repo'))
+        runtime.update_project('repo', {'phase': 'PLANNING', 'worktree': '/planning',
+            'planning_error': 'failed', 'planning_error_fingerprint': 'same'})
+        runtime.suspend_planning(runtime.planning('repo'), unconfirmed_plan_ids=('G-047',))
+        self.assertEqual(runtime.planning('repo').planning_resume_plan_id, 'G-047')
+        with self.assertRaises(runtime_state.RuntimeStateError):
+            runtime.resume_execution_after_planning('repo')
+        runtime.resume_planning(runtime.planning('repo'))
+        runtime.clear('repo', processed_sha='published', specification_fingerprint='new-spec', planning_fingerprint='new-full')
+        restarted = runtime_state.RuntimeStateRepository(connection)
+        self.assertEqual(restarted.resume_execution_after_planning('repo'), original)
+        self.assertEqual(restarted.projected('repo'), original)
+        self.assertEqual(restarted.planning('repo').processed_sha, 'published')
+        self.assertIsNone(restarted.planning('repo').planning_resume_plan_id)
+
     def test_planning_correction_releases_only_bound_incident_atomically(self):
         connection = runtime_connection()
         self.addCleanup(connection.close)

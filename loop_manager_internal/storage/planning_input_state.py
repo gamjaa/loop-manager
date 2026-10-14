@@ -140,6 +140,32 @@ def advance_verified_delta(
     return applied
 
 
+def consume_owned_records(connection: sqlite3.Connection, repo: str, revision: str, current: PlanEntries) -> bool:
+    import hashlib
+    from loop_manager_internal.execution.execution_revision import DefinitionSnapshot, record_only_definition
+    from loop_manager_internal.storage import runtime_state
+    if _saved(connection, repo) is None or connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execution_checkpoints'").fetchone() is None:
+        return False
+    changes = {}
+    for row in connection.execute('SELECT snapshot FROM execution_checkpoints WHERE repo = ?', (repo,)):
+        try:
+            record = json.loads(row[0] or '{}').get('document_record')
+            if not isinstance(record, dict) or record.get('applied') is not True or not isinstance(record.get('text'), str):
+                continue
+            previous = DefinitionSnapshot.deserialize(record.get('planning_previous') or record.get('previous'))
+            if previous is None or previous.body_text is None or record_only_definition(previous, record['text']) == previous:
+                continue
+            before = ('blob', hashlib.sha256(previous.body_text.encode('utf-8')).hexdigest())
+            after = ('blob', hashlib.sha256(record['text'].encode('utf-8')).hexdigest())
+            if current.get(previous.path) == after:
+                changes[previous.path] = (before, after)
+        except (ValueError, TypeError, AttributeError):
+            continue
+    with runtime_state._transaction(connection):
+        return advance_verified_delta(connection, repo, revision, changes)
+
+
 def delta(before: PlanEntries, after: PlanEntries) -> dict[
     str, tuple[tuple[str, str] | None, tuple[str, str] | None]
 ]:
