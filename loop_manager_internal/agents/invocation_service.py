@@ -113,7 +113,10 @@ def run_agent(
     scope_id = None
     if connection is not None and invocation is not None:
         try:
-            scope_id = ledger.invocation_scope_id(invocation.repo, role_name, str(worktree))
+            notification_scope_role = "planner" if role_name == "planner_check" else role_name
+            scope_id = ledger.invocation_scope_id(
+                invocation.repo, notification_scope_role, str(worktree),
+            )
         except (sqlite3.Error, KeyError, IndexError, TypeError, ValueError, RuntimeError):
             pass  # Legacy/minimal records cannot grant reduced monitoring.
     if ledger is not None and invocation is not None and resolved is not None:
@@ -161,10 +164,12 @@ def run_agent(
     def observe_process() -> None:
         if connection is None or identity is None or invocation is None:
             return
-        if role_name not in {"worker", "planner", "maintenance_planner"}:
+        if role_name not in {"worker", "planner", "planner_check", "maintenance_planner"}:
             return
         try:
-            observed_role = role_name
+            # A planner_check is a read-only call, but its physical start may
+            # consume a previously notified planning incident after release.
+            observed_role = "planner" if role_name == "planner_check" else role_name
             if role_name == "planner" and scope_id is not None:
                 from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
                 owner = RuntimeStateRepository(connection).scope_owner(invocation.repo)
@@ -264,7 +269,7 @@ def run_agent(
                 return preflight_digest
         return selected_digest(snapshot)
 
-    notify_process_start = (role_name in {"worker", "planner", "maintenance_planner"}
+    notify_process_start = (role_name in {"worker", "planner", "planner_check", "maintenance_planner"}
                             and has_notification_session and invocation is not None)
     request = AgentRequest(
         worktree=worktree,
