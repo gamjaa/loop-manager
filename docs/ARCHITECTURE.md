@@ -319,7 +319,8 @@ planning batch의 원격 게시·catalog 반영과 현재 원격 입력 일치�
 - Reviewer는 기본 경로에서 Worker의 targeted unit test와 프로그램의 전체 verify가 통과한 뒤 실행된다. 일반 선행 경로에서는 현재 후보의 Manager 부분 verify 뒤 실행되며 테스트 command나 verify 스크립트를 다시 실행하지 않는다. 파일을 수정하지 않고 코드, 테스트, verify 스크립트의 diff와 전달된 결과를 읽어 요구사항 충족, 회귀, 테스트 누락과 verify 약화를 포함한 blocking issue를 확인한다
 - 프로그램은 각 Agent 실행 전후 diff를 검사한다. Planner의 범위 위반은 `planning_error` 흐름으로 처리하고, Worker 또는 Reviewer의 범위 위반은 해당 ExecPlan을 BLOCKED로 처리한다
 - Worker와 Reviewer는 ExecPlan이 PR 생성 준비를 마칠 때까지 각자의 세션을 재사용한다
-- 세션을 재개할 수 없으면 같은 worktree, ExecPlan과 저장된 실패 내용을 전달해 새 세션을 시작한다
+- `run_agent_with_retries`는 실패 결과의 세션 부재·재개 불가 문구를 `session_resume_unavailable`로 판별한다. `no rollout found for thread id`와 `No conversation found with session ID`도 포함하며 오류 코드 `-32600`만으로 세션 부재를 판정하지 않는다. 현재 CLI 오류 문구에 의존하므로 공급자 문구가 바뀌면 판별과 회귀 테스트를 함께 갱신한다
+- 세션 복구는 현재 세션 ID를 비워 한 번만 새 세션을 시작하고, 같은 worktree와 고정 지침·작업 문맥·저장된 실패 내용을 전달한다. 기존 `AttemptSequence`는 이 호출을 `fallback`·`session_unavailable`로 기록한다. 승인·격리 정책 실패와 사용 한도 소진은 복구 대상에서 제외하고 새 세션도 실패하면 기존 실패·일시 오류 재시도 경계를 따른다
 - 상태 분류, 설정 검증, Git/GitHub 명령과 verify 실행은 프로그램 코드가 담당한다
 - Worker는 commit, fetch, pull, rebase, push, worktree 등록과 PR 생성을 수행하지 않는다. Worker 반환 뒤의 모든 Git 쓰기는 Agent 호출 밖의 프로그램 코드가 소유한다
 - AI Agent와 verify subprocess에는 역할 수행에 필요한 환경 변수만 전달하고 Telegram token을 포함한 Loop Manager 비밀값을 상속하지 않는다. provider 환경 필터는 비밀이 아닌 `PYTHONDONTWRITEBYTECODE`와 `PYTHONPYCACHEPREFIX`도 보존한다. verify 조율 endpoint·secret·session은 runner 자체 조율에 필요해 runner에만 전달한다. runner의 자식 subprocess에는 해당 세 값을 뺀 환경 복사본을 넘기며 부모 환경과 호출자 mapping은 변경하지 않는다. 명령행 Python에서 선택한 bytecode 정책과 prefix도 자식 Python에 반영한다. 기존 marker·`PYTHONPATH`와 필요한 일반 환경은 자식에서 유지한다

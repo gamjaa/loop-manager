@@ -219,10 +219,12 @@ MAX_TRANSIENT_AGENT_RETRIES = 3
 def session_resume_unavailable(message: str) -> bool:
     if approval_policy_failure(message):
         return False
+    # shortcut: CLI 오류 문구에 의존하며, 세션 부재 전용 오류가 전달되면 구조화된 판별로 바꾼다.
     normalized = " ".join(message.casefold().split())
     return bool(
         re.search(
-            r"(?:session|thread|rollout).{0,80}(?:not found|does not exist|expired)",
+            r"(?:session|thread|rollout|conversation).{0,80}(?:not found|does not exist|expired)|"
+            r"\bno (?:session|thread|rollout|conversation) found\b",
             normalized,
         )
     ) or any(
