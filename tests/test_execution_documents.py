@@ -30,13 +30,20 @@ class ExecutionDocumentsTests(ExecutionRecoveryScenarios, ExecutionPhaseScenario
                 return SimpleNamespace(stdout=output, returncode=0)
             return original_git(worktree, *args, **kwargs)
         self.effects.workspace.git.side_effect = git
+        def worker_message(summary):
+            return ('WORKER_OUTCOME: {"kind":"ready_for_validation"}\n'
+                    'COMMIT_TITLE: Bind document reports to the current implementation\n'
+                    'PR_SUMMARY: ' + summary + '\nTARGETED_TESTS:\n'
+                    'python3 -m unittest tests.test_execution_documents — PASS (1 test)')
+        message = worker_message('\n'.join(CommonGuidancePrReportTests.explanation(path, 'old patch')
+                                          for path in patches))
+        self.effects.agent.run_agent.side_effect = lambda *_a, **_k: lm.AgentResult(0, message)
+        self.effects.validation.parse_worker_result.side_effect = lambda text, plan: lm.parse_worker_result(text, plan)
         self.state.update_project('repo', verify_result='old PASS', review_result='VERDICT: PASS',
                                   verify_token='old-verify', review_token='old-review')
         self.handler.run(self.context())
         self.assertIsNone(self.state.row()['verify_token'])
         self.assertIsNone(self.state.row()['review_token'])
-        self.effects.validation.parse_worker_result.return_value.summary = CommonGuidancePrReportTests.explanation(
-            'docs/PRODUCT.md', patches['docs/PRODUCT.md'])
         result = self.handler.verify(self.context(), self.handler)
         self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
         self.assertEqual(self.state.row()['phase'], 'WORKING')
@@ -45,9 +52,10 @@ class ExecutionDocumentsTests(ExecutionRecoveryScenarios, ExecutionPhaseScenario
         self.assertNotIn('verify', self.calls)
         self.assertNotIn('reviewer', self.calls)
         self.assertFalse(self.connection.execute('SELECT 1 FROM verify_receipts').fetchone())
-        self.effects.validation.parse_worker_result.return_value.summary = '\n'.join(
-            CommonGuidancePrReportTests.explanation(path, patch) for path, patch in patches.items())
+        message = worker_message('\n'.join(CommonGuidancePrReportTests.explanation(path, patch)
+                                          for path, patch in patches.items()))
         self.handler.run(self.context())
+        self.assertEqual(self.state.row()['worker_result'], message)
         result = self.handler.verify(self.context(), self.handler)
         self.assertEqual(result.kind, ExecutionOutcomeKind.PHASE_ADVANCED)
         self.assertEqual(self.state.row()['phase'], 'REVIEWING')

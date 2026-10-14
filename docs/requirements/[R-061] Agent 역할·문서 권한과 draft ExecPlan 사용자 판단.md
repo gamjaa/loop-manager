@@ -45,6 +45,8 @@ Planner의 기존 계획 개정은 Manager가 제공한 snapshot·mode와 R-082�
 
 Planner는 변경 전 질문과 최신 사용자 문서의 원격 revision·변경 내용을 비교해 질문별 해소 여부·답변 결과·남은 판단과 목표·완료 조건·구현 방향의 영향을 반환한다. Manager는 사용자 변경 주체·출처, 실제 원격 내용·판단 근거와 현재 계획 identity·상태·소유권·허용된 개정 범위를 확인한다. 원격에 있다는 사실이나 Agent의 추론·문서 수정만으로 승인을 만들 수 없다. 사용자 출처나 질문 해소를 확인할 수 없으면 대기로 보존한다.
 
+Planner 입력에는 사용자 변경의 출처·revision과 문맥 diff를 제공하고, 변경 전후 문서 전문을 반복하지 않는다. catalog에는 질문·판단 identity만 두고 변경 근거는 별도 판단 문맥에 한 번 전달한다. Manager는 저장된 변경 전후 원문으로 인용·출처를 검증하며, 필요한 전체 원문은 Planner가 해당 원격 revision에서 조회한다.
+
 | 판단 결과 | 문서·실행 처리 |
 |---|---|
 | 모든 질문의 유효한 해소 | 결정이 정한 제품 동작은 해당 ExecPlan 본문에, 기술 선택·이유는 필요한 Decision Log에 통합한다. 확인한 사용자 Requirement는 근거로 읽으며 Planner가 대신 수정하지 않는다. 해결된 Draft Decision의 질문·선택 설명과 User Decision 입력을 제거하고 빈 decision 전용 절을 정리한다. 같은 계획의 `draft: true`와 저장된 판단 대기를 해제한다. |
@@ -86,6 +88,7 @@ Worker가 수정한 설계·계획도 검토 대상이다. 수정 전 요청과 
 - draft에는 Worker·workspace 예약·구현 branch·PR을 시작하지 않는다. 기존 draft 표시 없는 계획은 정상 처리되고 draft 선언과 실제 실행 상태의 원본이 구분된다.
 - Requirement만 명확해진 경우와 `draft: true`를 유지한 ExecPlan 본문 답변도 Planner의 질문별 영향 판단과 Manager의 사용자 출처·입력·상태 검증을 거쳐 같은 계획의 대기를 해제할 수 있다. 명시적 User Decision의 Decision/Answer/Revision 형식도 유지하며, 근거를 고유하게 확인할 수 있으면 revision 재입력을 강제하지 않는다. 명시된 stale revision·불충분 또는 상충 답변·Agent의 자기 승인·표시만 제거한 변경·무관한 변경·재시작은 승인으로 처리하지 않는다.
 - 모든 질문 해소 뒤 제품 동작·설계 선택은 본문에 반영되고 해결된 Draft Decision·User Decision 입력과 빈 decision 절·draft 표시가 정리된다. ID·sources·dependency·유효한 기술 결정·실행 이력은 보존된다. 일부 해소에서는 해당 결과·입력만 정리하고 미해결 질문·draft 대기와 의존 작업 대기를 유지한다.
+- 작은 사용자 답변을 포함한 대형 문서의 변경 전후 전문이 provider 입력 한도를 넘더라도, Planner 입력에는 변경 diff와 출처·revision만 전달한다. catalog에 같은 변경 근거가 중복되지 않으며 저장된 원문·사용자 인용 검증·판단 대기는 보존된다.
 - 거절·보류·새 모호함·출처 불확실·원격 경쟁은 승인과 구분한다. 사용자 원문·출처·revision·질문별 판단·정리 및 전환 근거는 DB 감사에 남고 원격 게시와 상태 반영 사이 중단·재시작에도 복구된다. 정리로 scope 지문이 달라져도 확인된 동일 결정을 잃거나 양식·질문·승인 대기를 다시 만들지 않으며 실제 새 조건 변경은 재판단한다. 최신 문서 링크로 과거 질문을 재통지하지 않는다.
 - draft 또는 개별 차단이 남아 있어도 독립 계획과 다른 프로젝트가 진행한다. 직접·간접 dependency 대기, 사용자 판단 대기 표시, 프로젝트 완료와 Requirement archive 조건은 유지된다.
 - Worker가 현재 작업에 필요한 ARCHITECTURE·Requirement·PRODUCT·기존 ExecPlan을 수정해도 경로 제한만으로 범위 위반·차단하지 않는다. 합의된 목표·필수 검증·다른 작업 상태와 사용자 변경을 보존한다.

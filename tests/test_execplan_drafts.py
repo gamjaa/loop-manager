@@ -262,6 +262,38 @@ class ExecPlanDraftCatalogTest(AutomationCatalogFixture, unittest.TestCase):
         self.assertIs(compact[0]["draft"], True)
         self.assertEqual(compact[0]["decision_wait"]["revision"], self.waiting()["revision"])
 
+    def test_planner_uses_change_diff_once_and_preserves_full_decision_evidence(self):
+        from loop_manager_internal.planning.validation_ports import _PlanningValidationPorts
+        saved = self.waiting()
+        unchanged = ''.join(f'Unchanged product context {number}\n' for number in range(25_000))
+        before = unchanged + 'Policy: undecided\n'
+        after = unchanged + 'Policy: keep existing storage\n'
+        saved['user_changes'] = {'docs/PRODUCT.md': {
+            'verified': True, 'revision': 'b' * 40, 'commit': 'c' * 40,
+            'author': 'user@example.test', 'before': before, 'after': after}}
+        self.connection.execute('UPDATE execplan_drafts SET evidence=? WHERE repo=? AND plan_id=?',
+                                (json.dumps(saved), 'repo', 'G-001'))
+        catalog = loop_manager.compact_execplan_catalog(self.connection, 'repo')
+        self.assertNotIn('user_changes', json.loads(catalog)[0]['decision_wait'])
+        row = self.connection.execute("SELECT * FROM exec_plans WHERE repo='repo' AND plan_id='G-001'").fetchone()
+        original = loop_manager._ready_plan_snapshot_from_contents(row, self.text.encode(), allow_started=True)
+        snapshot = MutableReadySnapshot('repo', 'b' * 40, (original,), 'token')
+        effects = SimpleNamespace(planner_prompt=loop_manager.planner_prompt,
+                                  is_loop_manager_repository=lambda _: False, git=None, git_bytes=None)
+        prompt = _PlanningValidationPorts(effects, self.connection).planner_prompt(None, catalog, snapshot)
+        self.assertGreater(len(json.dumps(saved['user_changes'])), 1_048_576)
+        self.assertLess(len(prompt), 20_000)
+        self.assertEqual(prompt.count('+Policy: keep existing storage'), 1)
+        evidence = execplan_draft_state.prompt_evidence(self.connection, 'repo', 'G-001')
+        change = evidence['user_changes']['docs/PRODUCT.md']
+        self.assertTrue(change['verified'])
+        self.assertEqual(change['revision'], 'b' * 40)
+        self.assertIn('-Policy: undecided', change['diff'])
+        self.assertNotIn('before', change)
+        self.assertNotIn('after', change)
+        self.assertEqual(self.waiting(), saved)
+        self.assertTrue(self.waiting()['pending'])
+
     def test_only_remote_explicit_current_decision_releases_draft(self):
         revision = self.waiting()["revision"]
         documents = {PATH: accepted_text(self.text, revision)}
