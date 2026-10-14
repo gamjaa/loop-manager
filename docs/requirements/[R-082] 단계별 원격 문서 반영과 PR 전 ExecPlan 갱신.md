@@ -48,6 +48,15 @@ Manager는 기존 snapshot·원격 revision·content hash·현재 실행 및 소
 - PR 경계는 연결 PR의 실제 등록 여부로 판단한다. SQLite에 아직 반영되지 않은 PR도 갱신 금지에 포함한다. 갱신 결과 적용 전에 PR이 등록됐으면 이전 갱신 권한으로 기존 작업을 덮어쓰지 않고 새 ExecPlan 경로로 다시 판단한다.
 - 진행 중 Agent나 검증 프로세스를 중단하거나 같은 worktree를 동시에 수정하지 않는다. 종료 후 다음 단계 진입 전의 안전한 경계에서 필요한 갱신·게시·작업 branch 반영을 완료하고 최신 작업 문서를 입력으로 사용한다.
 
+### Worker 범위 밖 문서 변경의 복원 목표
+
+아래는 원본 브랜치 비교·범위 오류 진단 이후에 추가할 복원 요구이며, 현재 자동 복원이 구현됐다는 의미가 아니다.
+
+- rebase로 유입된 문서는 원본 브랜치와의 비교로 구분해 그대로 보존한다. Worker가 선택된 작업 외의 ExecPlan 또는 현재 작업과 무관한 Requirement를 직접 변경했는지는 호출 전후 형상과 원본을 함께 대조한다. 경로 차이만으로 변경 주체를 확정하지 않는다.
+- Manager는 Worker와 관련 writer가 종료한 뒤 실제 Worker 변경으로 확인된 경로만 복원한다. Worker 이전부터 존재한 수정·동시 외부 수정·소유권 불확실성이 있으면 덮어쓰지 않고 근거와 작업물을 보존해 기존 차단·복구 경계로 연결한다.
+- 복원 전에 대상 경로·기준 revision·변경 사유와 확보한 수정 내용을 보존한다. 복원은 해당 파일과 index entry에 한정하며 선택된 ExecPlan 본문·구현·테스트·다른 파일·HEAD·branch·실행 이력은 유지한다. 중단 뒤에도 보존한 입력과 현재 형상을 대조해 남은 복원만 처리하며 새로운 수정을 덮어쓰지 않는다.
+- 복원 성공은 차단 사유로 남기지 않는다. Manager가 같은 Worker 세션 또는 재개 문맥에 복원한 경로·원인을 전달해 현재 최종 diff와 문서 보고를 갱신하도록 한다. 복원 사실을 구현 완료·targeted test·전체 verify·Review 성공으로 취급하지 않으며 독립적인 실패는 유지한다.
+
 ### 프로젝트 planning과 현재 작업 재개 순서
 
 Manager는 최신 원격의 PRODUCT·활성 Requirement·ARCHITECTURE 변경을 프로젝트의 마지막으로 원격 적용한 전체 planning 성공 기준과 비교한다. 사용자 active ExecPlan 변경과 비교 가능한 성공 기준 부재도 기존 일반 planning 진입 조건을 유지한다. 저장소 SHA 전진이나 기본 worktree의 equal 여부만으로 명세 변경·반영 완료를 판단하지 않는다.
@@ -144,7 +153,7 @@ Reviewer를 먼저 진행한 결과가 구현 부족이면 Worker 교정 후 필
 
 ## Acceptance Criteria
 
-- 선택된 ExecPlan의 본문 기록 수정은 허용하고 frontmatter 선언 불일치와 다른 ExecPlan 변경은 검증·Review 전에 거부한다. source 경로 교정은 원격 공식 선언과 catalog·DB가 같은 결과를 채택한 뒤 보존된 Worker 구현·기록으로 재개하며, rename 조회 호환을 선언 일치로 오인하지 않는다.
+- 선택된 ExecPlan의 본문 기록 수정은 허용한다. frontmatter 선언 불일치는 검증·Review 전에 거부하며, 범위 밖 문서 수정은 위 복원 목표에 따라 최종 후보에서 제거하거나 안전을 확인할 수 없으면 거부한다. 원본 브랜치에서 rebase로 유입된 문서는 범위 밖 변경에서 제외하며 실제 오류에는 비교 원본·후보 revision과 경로·변경 종류를 확인할 수 있다. source 경로 교정은 원격 공식 선언과 catalog·DB가 같은 결과를 채택한 뒤 보존된 Worker 구현·기록으로 재개하며, rename 조회 호환을 선언 일치로 오인하지 않는다.
 - 신규 Requirement의 목표가 이미 구현됐거나 기존 작업으로 충족되면 중복 ExecPlan이 생성되지 않는다. 기존 미착수 작업의 허용 개정과 독립적인 미충족 목표의 신규 생성이 구분되며 source·dependency와 DB 관계가 일치한다.
 - Requirement 수정의 변경 전후 동작·조건·완료 기준과 관련 작업을 확인할 수 있다. 변경·삭제된 항목의 체크리스트·관련 파일·변경 목적·Validation·source·dependency가 함께 갱신되고 이미 구현한 결과·유효한 검증·세션·실패·PR 이력은 보존된다.
 - 복수 Requirement의 일부 조건 또는 완료 기준만 삭제되면 그 부분의 작업·검증·참조만 제거된다. 다른 Requirement·PRODUCT의 목표와 공유 구현은 유지되고 필요한 선행 목표는 유효한 dependency로 남는다. 전체 철회만 R-055의 삭제·취소로 연결된다.

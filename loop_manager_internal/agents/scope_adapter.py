@@ -352,6 +352,7 @@ class ValidateWorkerWorkspaceScopeEffects:
     validate_active_execplan_metadata: Callable[..., object]
     validate_agent_scope: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
+    git: Callable[..., object]
 
 
 def validate_worker_workspace_scope(
@@ -388,6 +389,12 @@ def validate_worker_workspace_scope(
         branch=branch, worktree_key=str(worktree.resolve()),
     ) if scope_phase is not None else None)
     candidate_base = catalog_plan['active_sha']
+    origin = after.refs.get(f'refs/remotes/origin/{base_branch}')
+    if origin is not None:
+        observed = effects.git(worktree, 'merge-base', after.head, origin[0], check=False)
+        if observed.returncode or not observed.stdout.strip():
+            raise RuntimeError('Worker 범위 비교의 원본 브랜치 기준을 확인할 수 없습니다.')
+        candidate_base = observed.stdout.strip()
     publication_before = (replace(after, head=candidate_base, index=after.index, dirty={})
                           if isinstance(candidate_base, str) and candidate_base else before)
     effects.validate_agent_scope(

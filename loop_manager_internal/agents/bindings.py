@@ -286,6 +286,7 @@ def register(assembly: Composition) -> None:
             validate_active_execplan_metadata=assembly.callback('validate_active_execplan_metadata'),
             validate_agent_scope=assembly.callback('validate_agent_scope'),
             validate_managed_worktree=assembly.callback('validate_managed_worktree'),
+            git=assembly.callback('git'),
         ),
     )
 

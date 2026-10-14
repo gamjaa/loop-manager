@@ -166,7 +166,8 @@ def validate_agent_scope(
 
     if violations:
         raise AgentScopeError(
-            f"{role_name} 결과 변경 범위 오류: " + "; ".join(violations),
+            f"{role_name} 결과 변경 범위 오류: " + "; ".join(violations)
+            + f" (비교 원본: {before.head}, 후보: {after.head})",
             result_snapshot=after,
             reason_code=violation_reason,
         )
