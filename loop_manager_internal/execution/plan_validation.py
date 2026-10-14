@@ -330,8 +330,8 @@ def _blocked_validation_input_fingerprints(
 
 def restore_worker_frontmatter(worktree, relative_path, plan, *, repo, revision, connection, git_bytes):
     """Worker 종료 뒤 선택된 공식 선언만 복원하고 본문 bytes를 보존한다."""
-    if relative_path != plan['path'] or not revision:
-        raise ExecPlanMetadataError('frontmatter 복원의 공식 경로·revision이 없습니다.')
+    if relative_path != plan['path']:
+        raise ExecPlanMetadataError('frontmatter 복원의 공식 경로가 다릅니다.')
     root = worktree.resolve()
     target = root / relative_path
     if target.resolve() != target or not stat.S_ISREG(target.lstat().st_mode):
@@ -355,6 +355,8 @@ def restore_worker_frontmatter(worktree, relative_path, plan, *, repo, revision,
     started, _ = split(str(entry['agent_input_plan']).encode('utf-8'))
     if current.replace(b'\r\n', b'\n') == started.replace(b'\r\n', b'\n'):
         return False
+    if not revision:
+        raise ExecPlanMetadataError('frontmatter 복원의 공식 revision이 없습니다.')
     original = git_bytes(worktree, 'show', f'{revision}:{relative_path}')
     official = execplan_catalog.parse_execplan_text(relative_path, original.decode('utf-8'), validate_sources=False)
     error = _execplan_metadata_identity_error(
