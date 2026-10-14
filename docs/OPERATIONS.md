@@ -89,11 +89,19 @@ bootstrap은 source checkout 기준으로 설정 경로를 확정해 runtime에 
 Requirement는 frontmatter·상태 없이 `docs/requirements/` 바로 아래에 두며 모두 Planner 입력이다. 새 기능·정책 변경을 요청받은 대화형 Agent는 관련 활성 Requirement를 먼저 작성·갱신하거나 충분한 기존 문서를 재사용한다. Skill은 명세를 정리하고 Planner가 ExecPlan을 만든다.
 
 ```sh
-python loop_manager.py config add /path/to/my-project --base main --provider codex
-python loop_manager.py config remove /path/to/my-project
+python loop_manager.py add /path/to/my-project --base main --provider codex
+python loop_manager.py remove /path/to/my-project
 ```
 
 진행 중인 계획·프로젝트 차단·미해결 planning 오류가 없을 때만 등록을 해제할 수 있다. 해제는 registry만 바꾸며 파일·branch·worktree·PR·MERGED 감사는 보존한다.
+
+기본 `run`은 모든 등록 프로젝트를 처리한다. 특정 프로젝트만 실행하려면 경로를 하나 이상 지정한다. 공백이 있는 경로는 shell에서 따옴표로 감싼다.
+
+```sh
+python loop_manager.py run /path/to/project-a '/path with spaces/project-b'
+```
+
+상대 경로는 명령을 호출한 작업 디렉터리 기준으로 해석한다. 지정 경로는 정규화한 뒤 중복 제거하며 전체 경로의 등록 여부를 처리 전에 확인한다. 하나라도 등록되지 않으면 프로젝트 처리를 시작하지 않는다. `--skip-if-running`은 지정 범위에서도 기존처럼 다른 Loop Manager 실행이 있을 때 조용히 성공 종료한다.
 
 ## 수동 구현과 제출
 
