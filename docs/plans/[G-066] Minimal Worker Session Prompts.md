@@ -61,7 +61,7 @@ priority: low
 - 프로젝트 지침은 Agent CLI가 해석한다. 최초·재개·fallback 사용자 prompt에 루트 `AGENTS.md`의 읽기·승인·복원 지시를 넣지 않고 존재·인코딩·내용·자동 로딩 여부를 Manager의 추가 실행 gate로 삼지 않는다.
 - 축약 뒤에도 Worker 권한, 일반 draft·User Decision 보호, 고정 원본 묶음과 역할별 실제 instruction, 결과 protocol, targeted test 범위와 전체 verify 분리, 비밀값 가림 및 세션·작업 공간 복구 계약은 유지된다. 과거 파일 승인 감사·작업물·session은 보존한다. 전송 도중 중단·재시작해도 새 정보를 누락하지 않는다.
 - 수동 complete/submit 수락 뒤 자동 Worker 교정에도 같은 초기·delta·복구 계약을 적용한다. 수동 문맥을 덧붙이는 경로가 이미 전달한 결과나 verify·Review 원문을 다시 넣지 않는다. verify 성공 출력은 Worker에게 전달하지 않으며 미해결 실패는 기존 진단 helper의 필요한 피드백으로 전달한다. 수동 제출의 전체 G·후보 R·미확인 외부 테스트와 사용자 생략을 보존하고 실제 Worker 성공으로 합성하지 않는다.
-- R-082의 갱신·rebase를 마친 연결 Requirement/상위 명세 변경은 ExecPlan 내용이 같아도 최초·재개 Worker의 필요한 새 문맥으로 전달한다. 확인된 전달 cursor만 전진시키며, 새 세션 복구에도 현재 조건과 미완료 보완을 남긴다. 문서 영향 판단·계획 게시·후보 성공 재사용은 기존 담당 경계를 재사용한다.
+- R-082의 프로젝트 일반 planning·개정 게시·DB 적용과 필요한 rebase를 마친 최신 ExecPlan을 최초·재개 Worker의 기준으로 전달한다. 상위 명세의 관련성·개정을 작업별 prompt에서 다시 판단시키지 않는다. 유효한 planning 결과가 작업 조건 유지를 확인했다면 source 지문·SHA 전진이나 순수 진행 기록만으로 Worker 호출·문맥 재전송을 만들지 않는다. 실제 조건 변경·미완료 보완과 기존 역할의 검증 입력은 보존하고 확인된 전달 cursor만 전진시킨다.
 
 ## Implementation
 
@@ -81,7 +81,7 @@ priority: low
 - 전체 verify는 Agent 범위·고정 지침/과거 승인 감사 보존, Worker 결과·일반 사용자 결정 protocol, 피드백 audit·cursor, 실제 호출·session 복구와 rebase 후보 재확인 회귀를 유지한다. 기존 unittest manifest 수집·Agent 호출 차단을 사용하며 전체 verify와 Reviewer의 책임은 `docs/AGENTS.common.md`·`docs/AGENTS.worker.md`·`docs/AGENTS.reviewer.md`를, 계획 작성 규칙은 `docs/PLANS.md`를 따른다.
 
 - 기존 manual fixture로 수동 Worker prompt의 최소 unit case를 확인한다. Review 실패 뒤 저장된 verify PASS 출력, verify 실패 뒤 raw 출력 재추가, 동일 session 재개와 새 session fallback에서 중복·원문 복제가 없고 필요한 실패 진단·전체 G·후보 R은 남는지 검증한다. Manager 전체 verify는 생략 무효화·실제 Worker 교정·원문 및 실패 지문 보존과 수동/일반 Reviewer 입력의 회귀를 확인한다.
-- `tests/test_stage_documents.py`의 최신 문서 진입 fixture와 실제 Worker 호출을 연결해 ExecPlan 무변경/연결 Requirement·상위 명세 변경, 동일 session 재개·fallback·전달 중 중단에서 새 조건이 누락되지 않는지 최소 unit으로 확인한다. 문서 무관 판단만으로 Worker를 다시 호출하지 않는다.
+- `tests/test_planning_selection.py`·`tests/test_stage_documents.py`의 최신 문서 진입 fixture와 실제 Worker prompt 구성을 연결한다. 프로젝트 planning 후 ExecPlan 조건 유지/변경, source 지문만 변경, 순수 기록·미확인 조건이 섞인 변경, 동일 session·fallback·전달 중 중단에서 필요한 새 조건은 전달하고 확인된 동일 문맥은 반복하지 않는지 최소 unit으로 확인한다. planning 미완료를 조건 무변경으로 대신 확정하거나 전달 cursor를 전진시키지 않는다. 필요한 Worker 호출의 prompt만 검사하며 전체 planning을 각 세션 조합마다 다시 실행하지 않는다.
 
 ## Progress
 
@@ -93,6 +93,8 @@ priority: low
 - [ ] 관련 targeted 회귀 사례 추가
 
 ## Decision Log
+
+- 2026-10-14 delta 개정: 현재 R-082의 프로젝트 planning 우선 처리와 ExecPlan 실행 대응 분리에 맞춰 새 문맥의 기준·호출 조건을 정합화했다. 직접 반영된 planning·기록 기준 helper를 재구현하지 않고 최소 prompt·확인 cursor의 기존 목표와 수행 기록을 보존한다. source 지문은 verify·Review의 독립 입력으로 유지하며 구현·테스트·verify 성공을 기록하지 않는다.
 
 - 2026-10-10 사용자 정리: R-003은 내용 보존 archive하고, 정적 검증 규칙의 instruction 단일 전달은 활성 R-064에 연결한다. Worker prompt의 초기·delta·복구 목표와 기존 검증·dependency는 유지하며 아래 R-003 참조는 당시 검토 기록이다.
 
