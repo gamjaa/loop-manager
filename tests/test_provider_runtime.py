@@ -19,6 +19,47 @@ from tests.support.worker import worker_result
 
 
 class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
+    def test_missing_saved_session_starts_a_new_session(self):
+        messages = (
+            "Error: thread/resume: thread/resume failed: no rollout found for thread id "
+            "01a1379e-81d2-7f51-884e-a9ad8aad1577 (code -32600)",
+            "No rollout found for session ID saved-session",
+            "No conversation found with session ID: saved-session",
+            "No session found with ID saved-session",
+            "No thread found with ID saved-session",
+            "conversation saved-session not found",
+            "session saved-session not found",
+        )
+        for message in messages:
+            with self.subTest(message=message):
+                invoke = mock.Mock(side_effect=(
+                    loop_manager.AgentResult(1, message),
+                    loop_manager.AgentResult(0, "done", "fresh-session"),
+                ))
+                result = loop_manager.run_agent_with_retries(invoke, session_id="saved-session")
+                self.assertEqual((result.code, result.session_id), (0, "fresh-session"))
+                self.assertEqual(invoke.call_args_list,
+                                 [mock.call("saved-session", False), mock.call(None, True)])
+
+    def test_missing_session_fallback_is_bounded_and_preserves_other_failures(self):
+        message = "No rollout found for session ID saved-session"
+        failure = loop_manager.AgentResult(1, message)
+        invoke = mock.Mock(return_value=failure)
+        self.assertIs(loop_manager.run_agent_with_retries(invoke, session_id="saved-session"), failure)
+        self.assertEqual(invoke.call_args_list,
+                         [mock.call("saved-session", False), mock.call(None, True)])
+        for session, error in (
+            (None, message),
+            ("saved-session", "No configuration file found"),
+            ("saved-session", "usage limit reached; " + message),
+            ("saved-session", "approval policy denied: " + message),
+        ):
+            with self.subTest(session=session, error=error):
+                invoke = mock.Mock(return_value=loop_manager.AgentResult(1, error))
+                result = loop_manager.run_agent_with_retries(invoke, session_id=session)
+                self.assertEqual(result.code, 1)
+                invoke.assert_called_once_with(session, False)
+
     def test_parallel_claude_resumes_share_home_but_keep_sessions_temporary_paths_and_results(self):
         config = profile_config(self)
         barrier = threading.Barrier(2)
@@ -876,7 +917,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
 
     def test_cli_accepts_provider_only_as_registration_choice(self):
         args = loop_manager.build_parser().parse_args(
-            ["config", "add", "repo", "--provider", "claude"]
+            ["add", "repo", "--provider", "claude"]
         )
         self.assertEqual(args.provider, "claude")
         run = loop_manager.build_parser().parse_args(["run"])

@@ -22,6 +22,29 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 
 class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+    def test_exact_legacy_worker_token_retains_implementation_after_source_only_change(self):
+        self.handler.guard(self.context())
+        previous = self.handler._definition_snapshot
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        self.handler.effects = replace(self.effects, checkpoint=checkpoints)
+        self.effects.revision.source_fingerprint.return_value = 'changed-source'
+        candidate = 'base'
+        self.state.update_project(self.repo, phase='VERIFYING', worker_result=READY_WORKER_RESULT,
+            definition_snapshot=previous.serialize(), worker_input_token=previous.legacy_worker_token,
+            archive_token=previous.archive_token)
+        checkpoints.record(self.repo, 'G-047', expected_generation=checkpoints.get(self.repo, 'G-047').generation,
+            operation=None, expected_head='base', target_base_oid='base', observed_remote_oid=None,
+            snapshot={'current_rebase_acceptance': {'head': 'base'},
+                      'worker_candidate_token': previous.legacy_worker_candidate_token(candidate)})
+        result = self.handler.guard(self.context())
+        self.assertNotIsInstance(result, ExecutionOutcome)
+        self.assertEqual(result.phase, ExecutionPhase.VERIFYING)
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
+        self.assertEqual(self.state.row()['worker_result'], READY_WORKER_RESULT)
+        self.assertEqual(self.state.row()['worker_input_token'], previous.worker_token)
+        self.effects.agent.run_agent.assert_not_called()
+
     def test_conflicted_rebase_uses_original_legacy_body_for_record_comparison(self):
         self.handler.guard(self.context())
         text = '---\nid: G-047\n---\n## Purpose\nImplement\n## Progress\n- [ ] Run unit test\n'
@@ -69,7 +92,7 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
     def test_conflicted_rebase_changed_inputs_clear_success_without_losing_recovery(self):
         self.handler.guard(self.context())
         previous = self.handler._definition_snapshot
-        for field in ('source_fingerprint', 'guidance_hash', 'archive_candidates', None):
+        for field in ('guidance_hash', 'archive_candidates', None):
             with self.subTest(field=field):
                 applied = (replace(previous, **{field: ('docs/requirements/old.md',)
                            if field == 'archive_candidates' else 'old-input'}) if field else None)
@@ -176,7 +199,7 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
         self.assertEqual(completed.review_token, snapshot.review_token('base', 'base'))
 
 
-    def test_source_revision_without_execplan_change_invalidates_worker_but_keeps_sessions(self):
+    def test_source_revision_without_execplan_change_keeps_worker_and_rechecks_verification(self):
         guarded = self.handler.guard(self.context())
         self.assertNotIsInstance(guarded, handlers.ExecutionOutcome)
         snapshot = DefinitionSnapshot.deserialize(
@@ -204,8 +227,8 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
 
         self.assertEqual(outcome.kind, ExecutionOutcomeKind.RETRY)
         row = self.state.row()
-        self.assertEqual(row['phase'], 'WORKING')
-        self.assertIsNone(row['worker_result'])
+        self.assertEqual(row['phase'], 'VERIFYING')
+        self.assertEqual(row['worker_result'], 'worker-result')
         self.assertIsNone(row['verify_result'])
         self.assertIsNone(row['review_result'])
         self.assertEqual(row['worker_session_id'], 'worker-session')

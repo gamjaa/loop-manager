@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "adapter": "perl-tap",
+  "environment": {"perl": "/usr/bin/perl"},
+  "stages": [
+    {"id": "compile", "kind": "command", "cwd": ".", "argv": ["{perl}", "-c", "tests/example.t"]},
+    {"id": "tests", "kind": "tests", "cwd": ".", "collection": {"directory": "tests", "pattern": "*.t"}, "execution": "independent"}
+  ]
+}

@@ -217,6 +217,7 @@ class ScopeInterruptedAgentsTest(AgentScopeFixture, unittest.TestCase):
                 loop_manager.planning_input_fingerprint(repo, "main"),
             )
             loop_manager._ensure_cleanup_pending_schema(connection)
+            self._confirm_general_plan_input(connection, repo, plan_sha)
             loop_manager._store_cleanup_pending(
                 connection,
                 str(repo),

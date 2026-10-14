@@ -80,6 +80,10 @@ SQLite 손실이나 손상에서의 자동 상태 재구성은 지원하지 않�
 
 ## 프로젝트 등록
 
+- 최상위 `add`와 `remove`는 기존 등록 검증·해제 서비스와 registry gate를 호출한다. `config init`과 현재 `config list`는 유지하고 `config add/remove`는 parser 별칭으로 등록하지 않는다
+- `run [--skip-if-running] [repo...]`는 registry에서 지정 경로를 정규화·중복 제거하고 전체 등록 여부를 scheduler 호출 전에 확인한다. 하나라도 미등록이면 invocation reconciliation이나 프로젝트 처리를 시작하지 않는다
+- 검증된 등록 row만 scheduler에 전달한다. scheduler는 선택 범위에서도 기존 `max_workers`, self-merge 사전 확인, 프로젝트별 독립 실행·실패 집계 경계를 그대로 사용한다
+- bootstrap은 부모 CLI의 현재 작업 디렉터리에서 run 상대 경로를 절대화한 뒤 선택 경로와 공백을 runtime child에 전달한다. runtime child의 작업 디렉터리가 대상과 달라도 경로 해석은 달라지지 않는다
 - 대상 경로가 Git 프로젝트이고 origin이 GitHub 저장소인지 확인한다
 - 기준 branch를 확인해 프로젝트 설정에 저장한다
 - `docs/PLANS.md`, `docs/ARCHITECTURE.md` 존재 여부를 확인한다
@@ -251,17 +255,30 @@ Planning rebase 교정 journal은 역할 결과 검증을 통과한 계획·`FUT
 
 ### 단계별 원격 문서 반영
 
-Worker·Manager verify·Reviewer의 진입·교정·재개 전에 최신 원본과 작업 branch를 확인한다. 현재 ExecPlan·연결 Requirement·적용 PRODUCT·ARCHITECTURE의 변경 경로를 먼저 좁히고, 실제 관련성과 현재 구현의 부족은 현재 worktree를 읽기 전용으로 대조하는 일반 Planner가 판단한다. 무관한 문서·순수 revision 전진만으로 Worker를 반복하지 않는다. 코드 전용 점검 Planner와 유지보수 대상의 미착수 제한은 그대로다.
+Worker·Manager verify·Reviewer·게시의 진입·교정·재개 전에 최신 원본과 작업 branch를 확인한다. PRODUCT·활성 Requirement·ARCHITECTURE·사용자 active ExecPlan 변경은 프로젝트 일반 planning에서 관련 작업 개정·게시·DB 적용을 먼저 완료한다. 개별 작업의 읽기 전용 실행 대응 판단은 마지막 반영 ExecPlan의 조건 변경과 현재 후보·발견 단계에 한정하며, 상위 명세의 관련성과 작업 개정을 다시 판단하거나 전체 planning 성공으로 기록하지 않는다. 무관한 문서·순수 revision 전진만으로 Worker를 반복하지 않는다. 코드 전용 점검 Planner와 유지보수 대상의 미착수 제한은 그대로다.
 
 문서 반영의 이전 선언·발견 단계·과거 Worker/verify 근거·영향 판단·개정 게시 후보는 해당 ExecPlan의 execution checkpoint에 보존한다. 원격 작업 branch의 문서는 단순 관측 OID만으로 통합 완료나 검증 성공을 만들지 않는다. 현재 작업 대상·입력 유효성·작업물 보존을 확인해 실제 수용한 뒤 해당 문서를 입력으로 반영한다. 이 상태는 rebase·교정의 checkpoint 교체에서도 보존하며 다른 작업이나 일반 planning 상태를 덮어쓰지 않는다.
 
-Planner의 단일 현재 계획 수정안은 Manager가 `<state-dir>/worktrees/<project-id>/document-revisions/<execplan-id>/<base-sha>/`의 소유 detached worktree에서 구조·source·dependency·기존 ID·경로를 검증한다. 실행 중 구현 worktree는 수정하지 않는다. 게시 후보·원본 snapshot을 먼저 저장하고 현재 원격 base·실행 근거·실제 PR 부재·허용 diff를 재확인한 뒤 base에 fast-forward 게시한다. push 뒤 중단은 현재 원격 내용과 저장 후보를 확인해 같은 결과를 재사용하며, 반영을 끝낸 작업 branch에서 필요한 단계로 돌아간다. PR 출현·후속 원격 변경·소유권 불확실에서는 작업물을 보존한다.
+이전 버전의 단일 현재 계획 개정 후보는 기존 소유 detached worktree와 execution checkpoint에서 복구한다. Manager가 구조·source·dependency·기존 ID·경로·실제 PR 부재와 게시 사실을 재검증하고 미완료 적용부터 이어간다. 실행 중 구현 worktree는 수정하지 않으며 PR 출현·후속 원격 변경·소유권 불확실에서는 작업물을 보존한다. 새 실행 대응 판단은 `plan_text` 개정안을 반환하지 않고 프로젝트 일반 planning 게시를 사용한다.
 
 verify 진입의 구현 부족은 Worker 교정으로, 구현이 충족된 경우는 필요한 verify로 연결한다. Reviewer 진입의 문서 변경은 현재 구현과 과거 검증의 확인 범위·최신 조건 미검증을 구분한 선행 Review로 연결한다. 구현·테스트 수정이 필요한 FAIL은 기존 Worker 교정이며, 검증 실행 근거만 부족한 `VERIFY_REQUIRED`는 Manager verify로 연결한다. 선행 PASS도 최신 검증 없이 게시 token을 만들지 않는다. 변경된 조건에서는 과거 verify 성공 재사용을 새로 증명해야 하며 최종 후보의 verify·Review·게시 gate는 독립적으로 유지한다.
 
 진행 중인 일반·유지보수 planning은 원격 base 전진 시 staged·unstaged·untracked 변경과 세션을 관리 worktree에 보존해 반영하고 최신 catalog·SQLite 권한에서 재검증한다. 시작 revision의 READY 원본과 Planner가 작성한 결과를 구분하며, 관련 근거·의존 문서의 실제 내용이 바뀐 경우에만 해당 계획을 다시 확인한다. 무관한 문서 변경과 내용 보존 이동은 재확인을 만들지 않는다
 
-Worker·Reviewer의 문서 재확인은 현재 ExecPlan 내용 변경에 한정한다. 후보 HEAD가 바뀌면 문서 재확인 여부와 관계없이 Worker의 필요한 targeted test, Manager 전체 verify와 읽기 전용 Review를 최종 후보에서 다시 통과한다
+Worker·Reviewer는 프로젝트 planning 뒤 해당 단계에 반영된 최신 작업 문서를 사용한다. 후보 HEAD가 바뀌면 문서 재확인 여부와 관계없이 Worker의 필요한 targeted test, Manager 전체 verify와 읽기 전용 Review의 유효성을 최종 후보에서 기존 입력 증명·재사용 규칙에 따라 확인한다.
+
+### 프로젝트 planning과 작업 문서 반영 기준
+
+[R-082](requirements/%5BR-082%5D%20단계별%20원격%20문서%20반영과%20PR%20전%20ExecPlan%20갱신.md#프로젝트-planning과-현재-작업-재개-순서)의 명세 영향 판단은 프로젝트 일반 planning이 담당한다. 일반 Planner는 변경된 명세·관련 ExecPlan·dependency·현재 원격 구현과 필요한 보존 후보를 읽기 전용으로 확인한다. 관련 PR 전 계획 snapshot 검증·게시 intent·catalog 원자 적용을 재사용하며 구현 worktree를 Planner의 쓰기 공간으로 사용하지 않는다.
+
+| 책임 | 저장·실행 경계 |
+|---|---|
+| 프로젝트 변경 감지·planning 선택 | 안전한 경계에서 `projects.planning_resume_plan_id`로 재개할 작업을 고정하고 프로젝트 실행 투영만 비운다. `exec_plans`의 단계·소유권·작업물·세션·실패 이력은 유지한다. 일반 planning이 실행 자리를 사용하며 게시·DB 적용 뒤 같은 작업을 원자적으로 다시 투영한다. 실행 중 Agent·verify와 소유 Git operation은 기존 경계를 유지한다. |
+| 개정 게시·DB 적용 | 일반 `planning/publication_service.py`와 `storage/planning_input_state.py`의 성공 확정을 재사용한다. 게시 뒤 DB 미적용은 저장 intent로 먼저 복구하고, 새 원격 입력은 별도 검토한다. 관련 조건의 개정·변경 없음 결과가 확인된 최신 성공 기준에서만 현재 작업을 재개한다. |
+| 작업의 실행 대응 | `execution/stage_documents.py`는 본문 구현 조건·sources·dependency 변경의 부족 여부를 확인한다. 구현 입력 token에서 원본 명세 지문만의 변화를 제외하되 verify·Review token은 그 지문을 독립적으로 유지한다. 정확한 이전 token과 snapshot이 확인된 legacy Worker 근거만 새 비교 형식으로 옮기며 과거 성공을 합성하지 않는다. |
+| 마지막 반영 기준·진행 기록 | 소유 커밋의 변경 전 definition·승인 tree와 커밋 결과를 `document_record` checkpoint에 결합한다. 실제 tree·현재 후보의 조상 관계·순수 기록을 확인한 뒤 작업 기준과 적용 완료를 원자 저장하고 중단 후 같은 확인을 재개한다. 원격에서 같은 기록 내용을 관측한 뒤에만 `planning_input_state.advance_verified_delta`로 해당 선언 delta를 소비한다. 같은 파일의 미확인 조건과 다른 입력은 남기며 전체 planning 성공·verify·Review·실패 이력을 갱신하지 않는다. |
+
+위 코드 경로는 모두 `loop_manager_internal/` 아래다. 작업의 마지막 반영 ExecPlan 기준, 프로젝트 planning 성공 기준과 Git·verify·Review·게시의 입력 증명을 분리한다. `DefinitionSnapshot`·원격 SHA·execution checkpoint는 후자의 복구 근거까지 확인해 유지하며 일괄 제거하지 않는다. 전체 성공 기준은 검증된 `planning_input_baselines.reference_revision`과 프로젝트 지문을 사용하고 자체 delta 반영 revision을 새 전체 성공으로 사용하지 않는다. 이전 작업별 판단·개정 checkpoint도 미게시 후보·게시 사실·미완료 적용을 보존해 복구한다. planning 오류에서는 동일 실패 입력을 반복하지 않고 미확인 영향 밖의 작업만 기존 순서로 진행하며, PR·수동 소유 예외는 R-061·R-077을 유지한다.
 
 ## 실행 자리와 유지보수
 
@@ -319,7 +336,8 @@ planning batch의 원격 게시·catalog 반영과 현재 원격 입력 일치�
 - Reviewer는 기본 경로에서 Worker의 targeted unit test와 프로그램의 전체 verify가 통과한 뒤 실행된다. 일반 선행 경로에서는 현재 후보의 Manager 부분 verify 뒤 실행되며 테스트 command나 verify 스크립트를 다시 실행하지 않는다. 파일을 수정하지 않고 코드, 테스트, verify 스크립트의 diff와 전달된 결과를 읽어 요구사항 충족, 회귀, 테스트 누락과 verify 약화를 포함한 blocking issue를 확인한다
 - 프로그램은 Planner·Worker의 최종 변경을 역할별 게시 경로·문서·결과 계약으로 검증한다. readonly 역할의 접근은 sandbox가 제한하며 외부 파일·Git 변화의 사후 귀속 검사를 수행하지 않는다. 잘못된 Planner 결과는 planning 오류로, 잘못된 Worker 결과는 WORKER_OUTPUT_INVALID로 처리하고 Git 접근 위반 진단과 구분한다
 - Worker와 Reviewer는 ExecPlan이 PR 생성 준비를 마칠 때까지 각자의 세션을 재사용한다
-- 세션을 재개할 수 없으면 같은 worktree, ExecPlan과 저장된 실패 내용을 전달해 새 세션을 시작한다
+- `run_agent_with_retries`는 실패 결과의 세션 부재·재개 불가 문구를 `session_resume_unavailable`로 판별한다. `no rollout found for thread id`와 `No conversation found with session ID`도 포함하며 오류 코드 `-32600`만으로 세션 부재를 판정하지 않는다. 현재 CLI 오류 문구에 의존하므로 공급자 문구가 바뀌면 판별과 회귀 테스트를 함께 갱신한다
+- 세션 복구는 현재 세션 ID를 비워 한 번만 새 세션을 시작하고, 같은 worktree와 고정 지침·작업 문맥·저장된 실패 내용을 전달한다. 기존 `AttemptSequence`는 이 호출을 `fallback`·`session_unavailable`로 기록한다. 승인·격리 정책 실패와 사용 한도 소진은 복구 대상에서 제외하고 새 세션도 실패하면 기존 실패·일시 오류 재시도 경계를 따른다
 - 상태 분류, 설정 검증, Git/GitHub 명령과 verify 실행은 프로그램 코드가 담당한다
 - Worker는 commit, fetch, pull, rebase, push, worktree 등록과 PR 생성을 수행하지 않는다. Worker 반환 뒤의 모든 Git 쓰기는 Agent 호출 밖의 프로그램 코드가 소유한다
 - AI Agent와 verify subprocess에는 역할 수행에 필요한 환경 변수만 전달하고 Telegram token을 포함한 Loop Manager 비밀값을 상속하지 않는다. provider 환경 필터는 비밀이 아닌 `PYTHONDONTWRITEBYTECODE`와 `PYTHONPYCACHEPREFIX`도 보존한다. verify 조율 endpoint·secret·session은 runner 자체 조율에 필요해 runner에만 전달한다. runner의 자식 subprocess에는 해당 세 값을 뺀 환경 복사본을 넘기며 부모 환경과 호출자 mapping은 변경하지 않는다. 명령행 Python에서 선택한 bytecode 정책과 prefix도 자식 Python에 반영한다. 기존 marker·`PYTHONPATH`와 필요한 일반 환경은 자식에서 유지한다
@@ -494,6 +512,8 @@ rebase나 사용자 입력으로 후보 HEAD가 바뀌면 후보에 결합된 ve
 `verification/contract.py`가 `scripts/verify.json`의 version·정적 adapter registry·프로젝트 interpreter·수집 옵션·순서 있는 단계를 검증한다. `result_validation.verify`는 선언 부재만 기존 경로로 실행하고 잘못된 선언은 실패로 반환한다. `manager_adapter`는 고정 runtime의 Python·절대 진입점·protocol version·run/session·timeout과 기존 인스턴스 coordinator를 launcher에 전달한다. launcher는 프로젝트 interpreter를 선택한다. standalone도 같은 `entrypoint.py`와 선언을 사용하며 로컬 관측만 조율한다. 시간 상한을 전달하지 않는 구형 조율 호출은 runner·명령·프로세스/Windows Job 대기에서 바깥 Manager의 상한을 상속하며 새 기본 상한을 중첩하지 않는다. 명시적 상한과 단독 실행의 설정·기본 상한은 유지한다.
 
 `runner.py`는 단계 순서를 유지한다. `core.py`는 도구별 결과 validator·worker IPC 경계를 받아 기존 자원 배정·예약·프로세스 시작·재사용·종료 확인을 수행하며 unittest 타입이나 자체 compile 경로를 소유하지 않는다. 수집과 직렬 command도 예약·전체 timeout을 적용한다. `unittest_adapter.py`는 프로젝트 interpreter의 discovery/`load_tests`·재수집·fixture·native reporter와 명시한 Python compile 범위를 소유한다. 자식 import와 Python 경로는 후보 worktree를 선택하며 Manager runtime 패키지가 후보 코드를 대신하지 않는다.
+
+`perl_adapter.py`는 파일 suite 수집·재대조와 native TAP 결과 완결성을 소유한다. 정적 registry의 Perl executable은 Manager Python과 분리하며 공통 Python worker IPC·예약·종료 helper를 재사용한다. `perl_reporter.pl`이 공식 TAP::Parser로 테스트를 실행하고 즉시 flush하는 native JSON Lines(`*.native.ndjson`) 및 원본 TAP spool을 제공한다. 공통 진단은 EventWriter의 `*.jsonl`만 집계하며 native 원본의 별도 형식과 중단 자료를 보존한다. 파일 ID에 속한 동적 assertion 번호·plan과 parser/exit/signal을 대조해 완결된 suite만 완료로 기록한다. bailout은 plan 완료·정상 종료와 관계없이 suite 완료를 거부한다. nested subtest와 fixture 의미는 Test::More가 소유한다. `LoopManagerVerifyGuard.pm`은 테스트/compile BEGIN 전에 일반 Perl process·fork·network 경계를 막으며 CORE/XS/threads 우회는 지원하지 않는다. 부분 결과는 native 로그에 보존하고 공통 core가 실제 worker 종료 후 예약을 회수한다. Perl은 unittest AST 부분 선정·시간 큐 재사용에 진입하지 않는다.
 
 core는 완료 report와 기존 자식/Windows Job 종료 조건을 먼저 확인하고, 매 acquire의 cap·공정성·미반영 CPU/메모리 예약 판단이 허용하는 pending 모듈을 연속 배정한다. 즉시 report가 나타나면 수집으로 돌아가며, 진행이 없거나 acquire가 거절되고 즉시 수집할 report도 없으면 50ms bounded 대기한다. 시작 실패의 미시작 확인, PID bind, idle 전환과 실제 종료 뒤 release 경계는 유지한다.
 

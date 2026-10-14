@@ -70,6 +70,14 @@ class _PlanningStatePorts:
     def planning(self, repo: str) -> runtime_state.PlanningSnapshot:
         return self._runtime_repository.planning(repo)
 
+    def pause_execution_for_planning(self, expected, plan_id: str) -> None:
+        if self.planning_release_pending(expected.repo):
+            raise runtime_state.RuntimeStateError('미종료 Agent 실행이 남아 있습니다.')
+        self._runtime_repository.pause_execution_for_planning(expected, plan_id)
+
+    def resume_execution_after_planning(self, repo: str) -> None:
+        self._runtime_repository.resume_execution_after_planning(repo)
+
     def suspend_planning(
         self, expected: runtime_state.PlanningSnapshot, *, unconfirmed_plan_ids: tuple[str, ...] | None = None,
     ) -> None:
@@ -109,6 +117,13 @@ class _PlanningStatePorts:
 
     def general_baseline(self, repo: str) -> bool:
         return planning_input_state.has_baseline(self._connection, repo)
+
+    def general_reference_revision(self, repo: str) -> str | None:
+        if not self.general_baseline(repo):
+            return None
+        row = self._connection.execute('SELECT reference_revision FROM planning_input_baselines '
+            'WHERE repo = ? AND scope = ?', (repo, planning_input_state.SCOPE)).fetchone()
+        return row[0] if row else None
 
     def planning_review(self, repo: str, slot: str):
         if slot == "final":
@@ -373,6 +388,9 @@ class _PlanningStatePorts:
         self, repo: str, entries: dict[str, tuple[str, str]],
     ) -> bool:
         return planning_input_state.matches(self._connection, repo, entries)
+
+    def consume_owned_records(self, repo, revision, entries) -> None:
+        planning_input_state.consume_owned_records(self._connection, repo, revision, entries)
 
     def record_general_plan_declarations(
         self, repo: str, revision: str, entries: dict[str, tuple[str, str]],

@@ -173,6 +173,16 @@ class FakeStatePort:
     def planning_release_pending(self, _repo):
         return False
 
+    def pause_execution_for_planning(self, expected, plan_id):
+        self.paused_execution = expected
+        self.snapshot = replace(expected, phase=None, active_sha=None, worktree=None,
+                                planning_resume_plan_id=plan_id)
+
+    def resume_execution_after_planning(self, _repo):
+        original = self.paused_execution
+        self.snapshot = replace(self.snapshot, phase=original.phase, active_sha=original.active_sha,
+                                worktree=original.worktree, planning_resume_plan_id=None)
+
     def suspend_planning(self, expected, *, unconfirmed_plan_ids=None):
         from loop_manager_internal.storage.runtime_state import PLANNING_CLEAR_VALUES, EXECUTION_CLEAR_VALUES
         saved = {key: getattr(expected, key, default)
@@ -405,6 +415,9 @@ class FakeStatePort:
 
 
 class FakeGitPort:
+    def execution_operation_pending(self, _worktree):
+        return False
+
     def __init__(self):
         self.head = "base"
         self.remote = "base"

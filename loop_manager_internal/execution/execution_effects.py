@@ -147,6 +147,7 @@ class RevisionEffects:
     changed_paths: Callable[..., Any]
     unmet_dependencies: Callable[..., Any]
     refresh_documents: Callable[..., Any] | None = None
+    planning_required: Callable[..., bool] | None = None
 
 @dataclass(frozen=True)
 class ExecutionEffects:

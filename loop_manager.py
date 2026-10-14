@@ -34,7 +34,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     config_commands.add_parser("init", help="상태 DB 초기화")
     config_commands.add_parser("list", help="등록 프로젝트 목록 조회")
-    add = config_commands.add_parser("add", help="프로젝트 검증 및 등록")
+    add = subcommands.add_parser("add", help="프로젝트 검증 및 등록")
     add.add_argument("repository", help="대상 Git 저장소 루트")
     add.add_argument("--base", help="기준 branch. 생략하면 origin/HEAD 사용")
     add.add_argument(
@@ -48,7 +48,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=argparse.SUPPRESS,
     )
-    remove = config_commands.add_parser("remove", help="프로젝트 등록 해제")
+    remove = subcommands.add_parser("remove", help="프로젝트 등록 해제")
     remove.add_argument("repository", help="등록 해제할 저장소 루트")
 
     drafts = subcommands.add_parser(
@@ -109,6 +109,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="다른 Loop Manager가 실행 중이면 스케줄러용으로 조용히 성공 종료",
     )
+    run.add_argument(
+        "repositories",
+        nargs="*",
+        help="처리할 등록 프로젝트 경로. 생략하면 전체 프로젝트를 처리",
+    )
     return parser
 
 
@@ -123,6 +128,16 @@ def main() -> int:
     state_dir = state_directory(args.state_dir)
     config_path = source_config_path(ROOT, args.config)
     try:
+        if args.command == "run" and not args.runtime_child:
+            raw_arguments = ["run"]
+            if args.skip_if_running:
+                raw_arguments.append("--skip-if-running")
+            if args.repositories:
+                raw_arguments.append("--")
+                raw_arguments.extend(
+                    str(Path(repository).expanduser().resolve())
+                    for repository in args.repositories
+                )
         if not args.runtime_child:
             execution_path.apply_execution_path(ROOT)
         if args.runtime_child:

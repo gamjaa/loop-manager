@@ -101,12 +101,13 @@ R-023의 원격 실행·self handoff 목표는 유지하며 로컬 갱신 gate�
 
 흐름:
 1. 프로젝트별로 사용할 AI Agent provider를 선택한다 (기본값은 Codex)
-2. 대상 프로젝트 경로를 추가하거나 제거한다
+2. `add`로 대상 프로젝트를 등록하거나 `remove`로 등록 해제한다
 3. 프로젝트의 필수 조건과 공통 파일을 코드로 검증한다
 4. 원격 필수 문서를 확인한다
 5. `max_workers`를 포함한 유효한 설정을 저장한다
 
 규칙:
+- `config init`은 상태 DB를 초기화한다. 등록 목록은 현재 `config list`로 조회하며, 등록·해제는 최상위 `add`·`remove`를 사용한다. `config add`·`config remove` 호환 별칭은 없다
 - READY, IMPLEMENTING, VERIFYING, REVIEWING, PUBLISHING, PR_OPEN 또는 PLAN_BLOCKED ExecPlan, PROJECT_BLOCKED 레코드가 있거나 해결되지 않은 `planning_error`가 있는 프로젝트는 등록 해제할 수 없다
 - 공급자 호출·인증·모델 조회와 격리 검증은 선택된 상태 루트의 `automation-codex`·`automation-claude`를 공급자별 공통 홈으로 직접 사용한다. 호출별 임시 폴더와 작업 권한은 별도로 관리한다. 외부 공급자 홈 지정과 부모 환경을 변경하지 않으며 새 전용 인증 파일은 기본 사용자 인증 파일만 심볼릭 링크로 공유한다. 기존 전용 파일은 보존하고 인증·링크 준비 실패는 해당 공급자의 오류로 처리한다. 개인 설정 전체를 가져오거나 기본 홈으로 fallback하지 않는다
 - Telegram token과 chat ID가 모두 비어 있으면 알림 기능을 비활성화하고 전송을 시도하지 않는다
@@ -179,6 +180,7 @@ PR 없는 게시 checkpoint의 과거 Review 횟수 차단은 현재 repository�
 게시 OID가 남았지만 재개 표식이 없는 작업도 동일 계획·branch·관리 worktree와 현재 게시 identity·tree·계보·실제 원격 lease·PR 상태를 재검증해 안전하게 재개한다. 현재 checkpoint 요청이 local-only여도 충분한 과거 게시 영수증은 읽기 전용으로 사용할 수 있다. 새 원인의 차단은 낡은 재개 표식을 무효화하되 게시 이력을 보존한다. 게시 소유권 오탐만 해제하며 미해결 Worker 실패와 별도 차단·승인·Agent 위반은 유지한다. OID 삭제나 로컬·원격 HEAD 일치만으로 검사를 우회하지 않는다.
 
 외부 CLI 실패:
+- 저장된 Agent 세션을 찾지 못하거나 재개할 수 없으면 같은 작업 공간과 작업 문맥을 보존해 새 세션으로 한 번 이어간다. 승인·격리 정책 실패와 AI 사용 한도 소진은 새 세션으로 우회하지 않는다
 - 실행 실패, timeout 또는 일시적 외부 오류는 현재 프로그램 실행에서 최대 3회까지 재시도한다
 - 3회 재시도 후에도 실패하면 상태와 작업 공간을 보존하고 해당 프로젝트 처리를 이번 실행에서 중단한다
 - 다음 Loop Manager 실행에서 같은 상태부터 다시 시도한다
@@ -303,6 +305,9 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 
 ### 프로젝트 등록 및 실행 조건
 
+- `add <repo> [--base <branch>] [--provider <provider>]`는 기존 프로젝트 검증·등록을 수행하고 `remove <repo>`는 기존 등록 해제 gate를 유지한다. `config init`과 `config list`는 유지하며 이전 `config add/remove` 이름은 허용하지 않는다
+- `run [--skip-if-running] [repo...]`는 상대 경로를 CLI 호출 당시 작업 디렉터리 기준으로 절대화하고 중복을 제거한 뒤, 지정한 전체 경로가 등록됐는지 실행 전에 검증한다. 경로를 생략하면 전체 등록 범위를 처리하고, 하나라도 미등록이면 어떤 프로젝트도 처리하지 않는다. 공백이 포함된 경로는 인용해 지정한다
+- 선택 실행은 기존 `max_workers`, 프로젝트별 단일 변경 자리, dependency·복구·self handoff와 실패 격리를 유지한다. 범위 밖 프로젝트는 처리하지 않는다
 - 대상 경로는 origin이 GitHub 저장소인 Git 프로젝트여야 한다
 - fetch된 `origin/<base-branch>` tree에 `docs/PLANS.md`, `docs/ARCHITECTURE.md`가 있어야 한다
 - fetch된 `origin/<base-branch>` tree에 `docs/PRODUCT.md` 또는 `docs/requirements/` 바로 아래 Requirement가 하나 이상 있어야 한다
@@ -371,11 +376,12 @@ complete/submit의 verify와 Review 생략 근거는 후보·base·환경·고�
 
 ### 작업 선택과 동시 실행
 
-- 실행 중인 변경을 먼저 재개한다. 없으면 dependency를 충족한 확정 PR 충돌 복구를 일반 Planner·유지보수 평가·READY 선택보다 먼저 수행한다.
+- 명세 변경은 실행 중인 Worker·verify·Reviewer 종료 후 안전한 단계 경계에서 프로젝트 일반 planning을 먼저 수행하고, 관련 ExecPlan 게시·DB 반영을 마친 뒤 현재 작업을 재개한다. 명세·작업 선언이 그대로이면 현재 작업을 먼저 재개한다. 확정 PR 충돌과 소유 Git operation의 복구는 기존 안전 경계에서 먼저 처리한다.
+- 작업은 마지막으로 반영한 ExecPlan의 조건 변경과 구현·검증 부족에 따라 대응하며 같은 명세의 작업별 영향 Planner 호출은 반복하지 않는다. ID·작업물·세션·실패 이력과 실제 PR·수동 소유·dependency gate를 유지하고 자체 진행 기록은 확인한 delta만 기준에 반영한다. Git 복구와 verify·Review의 입력 증명은 별도로 유지하며 세부 실패·재개 계약은 [R-082](requirements/%5BR-082%5D%20단계별%20원격%20문서%20반영과%20PR%20전%20ExecPlan%20갱신.md#프로젝트-planning과-현재-작업-재개-순서)를 따른다.
 - Merge 대기 PR이 있으면 새 유지보수 평가는 보류한다. 독립 계획의 PLAN_BLOCKED 자체는 단계별 유지보수 평가를 막지 않으며, PROJECT_BLOCKED와 현재 변경 실행·공유 안전 gate는 유지한다.
 - 같은 프로젝트에 여러 READY ExecPlan이 대기할 수 있다
 - 같은 프로젝트에서는 IMPLEMENTING, VERIFYING, REVIEWING, PUBLISHING 또는 PR 충돌 복구 중인 ExecPlan 하나만 현재 변경 실행으로 둔다. `PLAN_BLOCKED`와 충돌 복구 중이 아닌 `PR_OPEN`은 이 자리를 점유하지 않는다
-- 새 계획 입력은 실행 중인 작업을 다른 작업으로 선점하지 않는다. Worker·Manager verify·Reviewer 진입 전 최신 원본·작업 branch를 확인해 기존 규칙으로 rebase한다. 현재 ExecPlan·연결 Requirement·적용 상위 명세 변경은 해당 경계에서 현재 작업에 반영한다. 무관한 문서 변경은 현재 단계를 계속하며, 코드 변경의 충돌 복구·검증 무효화와 증명된 결과 재사용 규칙은 유지한다
+- 새 계획 입력은 실행 중인 작업을 다른 작업으로 선점하지 않는다. 프로젝트 Planner가 명세 변경을 관련 ExecPlan에 반영하고 Worker·Manager verify·Reviewer·게시 진입 전 최신 원본·작업 branch를 확인해 기존 규칙으로 rebase한다. 현재 작업 조건이 바뀌지 않았으면 하던 단계를 계속하며, 코드 변경의 충돌 복구·검증 무효화와 증명된 결과 재사용 규칙은 유지한다
 - 소유 rebase의 Requirement·ExecPlan 충돌은 Manager가 확인한 최신 원격 base의 원문·경로·삭제로 처리한다. 삭제·rename·archive와 ID·source·dependency·실제 PR 경계를 검증하고 교체 전 문서·작업 형상과 실행 이력을 보존한다. 현재 작업의 유효성이나 소유권을 확인하지 못하면 원인과 작업을 보존해 기존 복구 경계로 연결한다. 문서 충돌만 있으면 Manager가 rebase를 이어가며, 그 외 파일과의 혼합 충돌은 문서만 처리하고 Worker 교정으로 연결한다. PRODUCT·ARCHITECTURE·지침·코드 등은 일반 문서 충돌 해소에서 자동 선택하지 않는다. 반복 교정으로 해결하지 못한 파일은 위 파일별 원본 복원·재작업 경계로 처리한다. 중단·원격 재전진에서도 진행 중 target과 채택 revision을 보존하며 base의 Progress를 현재 후보의 성공으로 사용하지 않는다
 - Worker는 최신 작업 문서를 입력으로 구현한다. verify 직전에는 구현 보완이 필요한 경우만 Worker로 돌아간다. Reviewer 직전의 관련 문서 변경은 최신 문서·구현·과거 verify가 확인한 범위와 미검증 조건으로 Review를 먼저 진행하며, 구현 부족은 Worker 교정으로, 검증 근거 부족은 Manager 검증 보완으로 연결한다. 이전 문서 기준의 PASS와 선행 Review를 최신 조건의 검증·게시 승인으로 사용하지 않는다
 - READY ExecPlan은 모든 `depends_on`이 MERGED이고 다른 현재 작업이 없을 때만 시작한다
@@ -444,6 +450,7 @@ complete/submit의 verify와 Review 생략 근거는 후보·base·환경·고�
 
 - Worker는 현재 환경의 전체 검증 스크립트를 생성·유지하고, 프로그램이 Agent 밖에서 실행한다.
 - Loop Manager 자체 verify는 동일한 unittest manifest와 fixture 계약을 직렬·프로세스 병렬 모드에서 유지하고 전체 compile을 포함한다. 실제 Agent 실행을 테스트 경계에서 차단하며 테스트·fixture·대기·정리의 시간과 중단 진단을 성공 stdout과 분리해 보존한다. Python 가드는 같은 프로세스의 다중 로딩에서도 한 번 설치되며 설치 확인 실패는 보호 없이 진행하지 않는다. 자식 환경 준비의 중복만 제거하고 실행마다 명령/API 거부 검사를 유지한다. 명시·상속 환경의 조율 인증값을 제외하고 부모·호출자 환경, 중첩 Python 보호와 후보 worktree 선택을 보존한다.
+- 명시적 공통 verify 연결은 unittest와 Perl TAP adapter를 제공한다. Perl은 선언한 프로젝트 도구로 파일 suite를 수집하고 native plan·assertion·skip/TODO·종료 결과를 대조한다. 도구·연결 오류와 부분 결과를 성공으로 처리하지 않는다. 두 언어 예제는 같은 core의 예약·종료·진단과 순서 있는 필수 compile을 사용한다. Perl의 실제 Agent 호출 경계는 별도 guard로 차단하며 지원 버전·한계는 [VERIFY.md](VERIFY.md#perl-tap-지원과-두-언어-예제)를 따른다.
 - 자체 verify는 실제 소스·테스트와 고정 샘플, 의존성, `scripts/verify.json`, verify·copy 스크립트와 소비되는 `run.sh`·`run.ps1`을 입력으로 관측한다. 문서·Skill·README·예제 설정의 정책·안내 문구 일관성은 검사하지 않으며 해당 원본을 tests 안의 고정 샘플로 자동 복사·동기화하지 않는다. 파서·등록·profile·파일 복사 동작 검증, 필수 unittest 수집과 전체 compile은 유지한다. 문서 prose 변경만으로 자체 verify를 다시 실행하지 않으며 자체 verify는 그 문서의 품질을 보증하지 않는다.
 - 복구 테스트 준비는 각 테스트가 소유한 실제 파일·Git·SQLite 경계를 독립 복원하고 현재 identity·digest를 확인해 재사용한다. 이전 테스트 성공은 현재 후보의 검증 근거가 아니며 준비 생성·복사·복원·확인과 관측 경로 전체의 비용을 진단에 포함한다.
 - 자체 verify의 `verify_parallelism`은 생략 시 `auto`, 양의 정수는 상한, `1`은 직렬이다. 실행량은 코드가 CPU 제한·실제 부하·메모리 여유와 미반영 예약으로 결정하며 등록 프로젝트 수로 고정 분할하지 않는다. 관측 실패는 직렬로 축소하고 자원 대기도 전체 timeout에 포함한다.

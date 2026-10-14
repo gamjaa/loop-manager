@@ -16,6 +16,18 @@ from tests.support.database import runtime_connection
 
 
 class ProjectServiceCompositionTests(unittest.TestCase):
+    def test_execution_planning_waits_only_for_controlling_git_operations(self):
+        effects = git_ports.PlanningGitPortsEffects(**{field.name: mock.Mock()
+            for field in fields(git_ports.PlanningGitPortsEffects)})
+        port = git_ports._PlanningGitPorts(effects, None, Path('/repo'), Path('/state'))
+        with tempfile.TemporaryDirectory() as directory:
+            for markers, pending in (({}, False), ({'MERGE_MSG': 'old'}, False),
+                                     ({'rebase-merge': 'active'}, True), ({'MERGE_HEAD': 'active'}, True)):
+                with self.subTest(markers=markers):
+                    effects._git_operation_entries.return_value = markers
+                    self.assertEqual(port.execution_operation_pending(Path(directory)), pending)
+            self.assertTrue(port.execution_operation_pending(Path(directory) / 'missing'))
+
     def test_relocated_workspace_boundary_accepts_owned_path_and_rejects_mismatch(self):
         with tempfile.TemporaryDirectory() as temporary:
             state = Path(temporary) / 'state'
@@ -120,6 +132,8 @@ class ProjectServiceCompositionTests(unittest.TestCase):
         config_path = Path('/source/config.ini')
         config = SimpleNamespace(path=config_path)
         for name, target in (('config', 'configure_registry'),
+                             ('add', 'configure_registry'),
+                             ('remove', 'configure_registry'),
                              ('document-drafts', '_document_drafts_command')):
             with self.subTest(command=name), mock.patch.object(loop_manager, 'load_managed_config', return_value=config), \
                  mock.patch.object(loop_manager, target, return_value=7) as handler, \

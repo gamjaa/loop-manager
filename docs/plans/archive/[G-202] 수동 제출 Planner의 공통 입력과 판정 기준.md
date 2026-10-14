@@ -52,7 +52,7 @@ priority: normal
 ## Progress
 
 - [x] 2026-10-07 f2ae0811a0230045852743a5fae84c6a91579bb0에서 일반 작성 helper와 수동 generation prompt·본문 검증·기존 테스트를 대조했다. 구현·테스트 실행은 하지 않았다.
-- [ ] 구현 및 관련 targeted unit 검증
+- [x] 구현 및 관련 targeted unit 검증
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log

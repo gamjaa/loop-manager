@@ -96,6 +96,11 @@ class WorkerPublicationValidationTest(unittest.TestCase):
                 )
             )
             versions = iter((2, 3, 4))
+            # 이 회귀는 일반 planning을 마친 작업의 교정·보고 경계를 확인한다.
+            from loop_manager_internal.storage import planning_input_state
+            with connection:
+                planning_input_state.record_general(connection, str(repo), plan_sha,
+                    loop_manager.plan_declarations(repo, plan_sha))
             review_messages = iter(("ISSUE_ID: src/app.py::value::incorrect\nVERDICT: FAIL", "VERDICT: PASS"))
             reviewer_prompts = []
             logs = []

@@ -162,10 +162,43 @@ class ExecutionLifecyclePortsEffects:
     pre_review_identity: Callable[..., object] | None = None
     validate_provider_runtime: Callable[..., object] | None = None
     remote_integration_effects: Callable[..., object] | None = None
+    _specification_input_fingerprint: Callable[..., object] | None = None
+    plan_declarations: Callable[..., object] | None = None
+    _is_requirement_archive_only_change: Callable[..., object] | None = None
 
 
 def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, connection, runtime_repository, **identity):
     """Bind named effects to legacy helpers, preserving their patch points."""
+    def planning_required(revision):
+        from loop_manager_internal.storage import planning_input_state
+        from loop_manager_internal.agents import common_guidance
+        row = connection.execute('SELECT * FROM projects WHERE repo = ?', (identity['repo'],)).fetchone()
+        if row['planning_preserved_state']:
+            from loop_manager_internal.storage.runtime_state import PlanningSnapshot
+            import json
+            targets = PlanningSnapshot.from_row(row).preserved_unconfirmed_plan_ids
+            saved = json.loads(row['planning_preserved_state'])
+            if (targets is not None and state.plan_id not in targets and saved['active_sha'] == revision):
+                return False
+        repo_path = identity['repo_path']
+        entries = dependencies.plan_declarations(repo_path, revision)
+        planning_input_state.consume_owned_records(connection, identity['repo'], revision, entries)
+        if not planning_input_state.matches(connection, identity['repo'], entries):
+            return True
+        guidance = common_guidance.planning_content_hash(connection, identity['repo'])
+        options = {'guidance_hash': guidance} if guidance else {}
+        fingerprint = dependencies._specification_input_fingerprint(repo_path, revision, **options)
+        previous = row['specification_fingerprint']
+        if previous is None and not row['processed_sha']:
+            reference = connection.execute('SELECT reference_revision FROM planning_input_baselines '
+                'WHERE repo = ? AND scope = ?', (identity['repo'], planning_input_state.SCOPE)).fetchone()
+            if reference:
+                previous = dependencies._specification_input_fingerprint(repo_path, reference[0], **options)
+        if previous is None and row['planning_fingerprint'] and row['processed_sha']:
+            previous = dependencies._specification_input_fingerprint(repo_path, row['processed_sha'], **options)
+        return (previous != fingerprint and not (row['processed_sha'] and
+            dependencies._is_requirement_archive_only_change(repo_path, row['processed_sha'], revision,
+                                                             verified_plan_declarations=True)))
     verify_timeout_seconds = identity.pop("verify_timeout_seconds", 600)
     state = _ExecutionStatePort(connection, runtime_repository, identity["repo"])
     lookup_pr = dependencies.pr_for_branch
@@ -355,6 +388,7 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
             operation_print=state.bind(dependencies.operation_print, name="operation_print", connected=False, mutates=False),
         ),
         revision=execution_handlers.RevisionEffects(
+            planning_required=(planning_required if dependencies.plan_declarations is not None else None),
             reconcile_catalog=state.bind(dependencies.reconcile_execution_execplan_catalog, name="reconcile_execplan_catalog", connected=True, mutates=True),
             source_fingerprint=state.bind(dependencies._revision_execplan_source_fingerprint, name="_revision_execplan_source_fingerprint", connected=False, mutates=False),
             body_hash=state.bind(dependencies._revision_execplan_body_hash, name="_revision_execplan_body_hash", connected=False, mutates=False),

@@ -284,7 +284,7 @@ class ExecutionFailurePolicyTests(ExecutionRecoveryScenarios, ExecutionPhaseScen
         self.assertEqual(row['worker_session_id'], 'worker-session')
 
 
-    def test_working_source_change_invalidates_artifacts_but_preserves_retry_history(self):
+    def test_working_execplan_change_invalidates_artifacts_but_preserves_retry_history(self):
         self.handler.guard(self.context())
         worker_token = DefinitionSnapshot.deserialize(
             self.state.row()['definition_snapshot'],
@@ -309,6 +309,7 @@ class ExecutionFailurePolicyTests(ExecutionRecoveryScenarios, ExecutionPhaseScen
         self.state.expected = self.repository.projected('repo')
         before = self.state.row()
         self.effects.revision.source_fingerprint.return_value = 'revised-source'
+        self.effects.revision.body_hash.return_value = 'revised-condition'
 
         guarded = self.handler.guard(self.handler._context())
 

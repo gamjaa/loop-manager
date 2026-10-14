@@ -506,13 +506,13 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.handler._complete_rebase_intent.assert_called_once()
         self.assertEqual(self.handler._complete_rebase_intent.call_args.kwargs['worker_definition'].worker_token, self.definition.worker_token)
 
-    def test_clean_rebase_with_changed_source_requires_worker(self):
+    def test_clean_rebase_with_changed_source_preserves_worker_and_rechecks_verify(self):
         self.effects.revision.source_fingerprint.return_value = 'new-requirement-content'
         self.remote = 'new-base'
         self.handler.guard(self.context())
-        self.assertEqual(self.state.row()['phase'], 'WORKING')
-        self.assertIsNone(self.state.row()['worker_result'])
-        self.assertIsNone(self.handler._complete_rebase_intent.call_args.kwargs['worker_definition'])
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
+        self.assertIsNotNone(self.state.row()['worker_result'])
+        self.assertIsNotNone(self.handler._complete_rebase_intent.call_args.kwargs['worker_definition'])
 
     def test_waiver_is_not_recorded_as_an_actual_verify_success(self):
         manual = mock.Mock()

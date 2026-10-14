@@ -1251,6 +1251,10 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
                 pr_for_branch=mock.Mock(return_value=None), log=mock.Mock(),
                 run_with_retries=lambda call, session_id: call(session_id, False))
             checkpoints = ExecutionCheckpointRepository(self.connection)
+            documents.save(checkpoints, str(self.repo), 'G-002', dict(version=1, stage='assess',
+                base=self.base, phase='IMPLEMENTING', paths=['docs/PRODUCT.md'], document_only=True,
+                previous=current.serialize(), assessment=None, worker_result=None,
+                verify_result=None, verify_base=None))
             with mock.patch.object(loop_manager, 'pr_for_branch', return_value=None):
                 result = documents.refresh(effects, state, checkpoints, identity, context,
                                            replace(current, source_fingerprint='old'), current, ['docs/PRODUCT.md'])
@@ -1622,6 +1626,18 @@ class MutableReadyMetadataCasTest(unittest.TestCase):
             plans=(plan,),
             token=mutable_snapshot_token("repo", "base", (plan,)),
         )
+
+    def test_active_maintenance_allows_general_snapshot_only_for_parked_execution(self):
+        self.connection.execute("INSERT INTO maintenance_cycles (repo, phase) VALUES ('repo', 'refactoring')")
+        with self.assertRaisesRegex(loop_manager.PlannerValidationError, 'maintenance cycle'):
+            loop_manager.mutable_ready_snapshot(self.connection, 'repo', Path('repo'), 'base')
+        with self.assertRaisesRegex(loop_manager.PlannerValidationError, 'maintenance cycle'):
+            loop_manager._assert_mutable_ready_snapshot_current(self.connection, self.snapshot)
+        self.connection.execute("UPDATE projects SET planning_resume_plan_id = 'G-001' WHERE repo='repo'")
+        with mock.patch.object(loop_manager, '_ready_plan_snapshot_at_revision', return_value=self.snapshot.plans[0]):
+            snapshot = loop_manager.mutable_ready_snapshot(self.connection, 'repo', Path('repo'), 'base')
+        self.assertEqual(snapshot.plans, self.snapshot.plans)
+        loop_manager._assert_mutable_ready_snapshot_current(self.connection, snapshot)
 
     def test_snapshot_reader_captures_sqlite_cache_values(self):
         contents = plan_text("G-001", "Plan").encode("utf-8")

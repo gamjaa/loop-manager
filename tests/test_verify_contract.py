@@ -446,7 +446,7 @@ class EntrypointAndGuidanceTests(unittest.TestCase):
                 cwd=directory, capture_output=True, text=True, timeout=10, check=False)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(json.loads(result.stdout)['version'], 1)
-        self.assertEqual(set(json.loads(result.stdout)['adapters']), {'unittest'})
+        self.assertEqual(set(json.loads(result.stdout)['adapters']), {'unittest', 'perl-tap'})
 
     def test_role_prompts_only_link_declaration_and_support_context(self):
         from loop_manager_internal.agents import agent_prompts

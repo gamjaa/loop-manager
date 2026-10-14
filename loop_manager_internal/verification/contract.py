@@ -5,6 +5,14 @@ from pathlib import Path
 
 VERSION = 1
 ADAPTERS = {
+    "perl-tap": {
+        "version": 1, "tool": "Perl 5.38.2 Test::More 1.302194 / TAP::Parser 3.44",
+        "collection": "recursive file discovery; file IDs own dynamically planned TAP assertions",
+        "reporter": "TAP::Parser native results and plan/exit/wait checks",
+        "execution": "file processes; Perl fork/process/network boundaries disabled",
+        "references": ["https://perldoc.perl.org/5.38.2/TAP::Parser", "https://perldoc.perl.org/5.38.2/Test::More", "https://perldoc.perl.org/5.38.2/perlsub"],
+        "validation": "Perl 5.38.2/Linux targeted native parser tests; CORE/XS bypass and threaded tests unsupported; OS termination requires Manager validation",
+    },
     "unittest": {
         "version": 1, "tool": "Python stdlib unittest", "python": "3.11–3.14",
         "collection": "TestLoader discovery and load_tests",
@@ -49,6 +57,7 @@ class Connection:
     adapter: str
     python: Path | None
     stages: tuple[dict, ...]
+    tool: Path | None = None
 
 
 def load(root, project_python=None):
@@ -65,8 +74,14 @@ def load(root, project_python=None):
             raise ContractError("unsupported verify version")
         if not isinstance(data["adapter"], str) or data["adapter"] not in ADAPTERS:
             raise ContractError("unsupported verify adapter")
-        fields(data["environment"], ("python",))
-        declared = data["environment"]["python"]
+        fields(data["environment"], ("python",) if data["adapter"] == "unittest" else ("perl",))
+        tool = None
+        if data["adapter"] == "perl-tap":
+            declared_tool = data["environment"]["perl"]
+            if not isinstance(declared_tool, str) or not Path(declared_tool).is_absolute() or not Path(declared_tool).is_file():
+                raise ContractError("Perl executable must be an existing absolute path")
+            tool = Path(declared_tool)
+        declared = data["environment"].get("python", "launcher")
         if declared == "launcher":
             python = Path(project_python).absolute() if project_python else None
         else:
@@ -107,7 +122,7 @@ def load(root, project_python=None):
                 raise ContractError("unsupported verify stage kind")
         if not any(stage["kind"] == "tests" for stage in stages):
             raise ContractError("verify requires a collected test stage")
-        return Connection(root, data["adapter"], python, tuple(stages))
+        return Connection(root, data["adapter"], python, tuple(stages), tool)
     except (OSError, ValueError, TypeError) as error:
         if isinstance(error, ContractError):
             raise

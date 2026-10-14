@@ -193,7 +193,6 @@ class DefinitionSnapshot:
             self.sources,
             self.depends_on,
             self.worker_body_hash,
-            self.source_fingerprint,
             self.archive_candidates,
             self.guidance_hash,
         )
@@ -209,6 +208,14 @@ class DefinitionSnapshot:
         return self.body_hash
 
     @property
+    def legacy_worker_token(self) -> str:
+        values = (self.sources, self.depends_on, self.worker_body_hash,
+                  self.source_fingerprint, self.archive_candidates, self.guidance_hash)
+        if self.worker_guidance_hash:
+            values += (self.worker_guidance_hash,)
+        return _digest('worker-input', values)
+
+    @property
     def archive_token(self) -> str:
         return _digest(
             "archive-scope",
@@ -218,11 +225,14 @@ class DefinitionSnapshot:
     def worker_candidate_token(self, head: str) -> str:
         return _digest('worker-candidate', (self.worker_token, head))
 
+    def legacy_worker_candidate_token(self, head: str) -> str:
+        return _digest('worker-candidate', (self.legacy_worker_token, head))
+
     def verify_token(
         self, base_token: str, candidate_head: str | None = None,
         verify_output: str | None = None,
     ) -> str:
-        values = (self.worker_token, base_token, candidate_head)
+        values = (self.worker_token, self.source_fingerprint, base_token, candidate_head)
         if self.body_text is not None:
             values += (self.body_hash,)
         if verify_output is not None:
@@ -287,6 +297,58 @@ def execplan_worker_body_hash(text: str) -> str:
     return execplan_body_hash('\n'.join(lines))
 
 
+def record_only_definition(previous: DefinitionSnapshot, text: str) -> DefinitionSnapshot:
+    from dataclasses import replace
+    if previous.body_text is None:
+        return previous
+    # 본문 정규화가 제외하는 frontmatter도 미확인 조건으로 보존한다.
+    header = lambda value: value.split('---', 2)[:2] if value.startswith('---') else []
+    if (header(previous.body_text) != header(text)
+            or previous.worker_body_hash != execplan_worker_body_hash(text)):
+        return previous
+    return replace(previous, body_hash=execplan_body_hash(text), body_text=text)
+
+
+def advance_owned_record(ports, context) -> None:
+    checkpoints = ports.checkpoint
+    if checkpoints is None:
+        return
+    checkpoint = checkpoints.get(ports.identity.repo, context.plan.plan_id)
+    record = (checkpoint.snapshot or {}).get('document_record')
+    if not record or record.get('applied') or checkpoint.operation == 'commit':
+        return
+    previous = DefinitionSnapshot.deserialize(record.get('previous'))
+    commit = record.get('commit') or (checkpoint.snapshot or {}).get('after_head')
+    if previous is None or not commit:
+        return
+    git = ports.git
+    if (git(context.worktree, 'rev-parse', f'{commit}^{{tree}}').stdout.strip() != record['tree']
+            or git(context.worktree, 'merge-base', '--is-ancestor', commit, 'HEAD', check=False).returncode):
+        return
+    text = git(context.worktree, 'show', f'{commit}:{previous.path}').stdout
+    updated = record_only_definition(previous, text)
+    if updated == previous:
+        return
+    from loop_manager_internal.storage import runtime_state
+    with runtime_state._transaction(ports.state.connection):
+        row = ports.state.row()
+        current = DefinitionSnapshot.deserialize(row['definition_snapshot'])
+        if current != previous:
+            return
+        values = {'definition_snapshot': updated.serialize()}
+        if row['worker_input_token'] == previous.worker_token:
+            values['worker_input_token'] = updated.worker_token
+        checkpoints.record(ports.identity.repo, context.plan.plan_id,
+            expected_generation=checkpoint.generation, operation=checkpoint.operation,
+            expected_head=checkpoint.expected_head, target_base_oid=checkpoint.target_base_oid,
+            observed_remote_oid=checkpoint.observed_remote_oid,
+            snapshot={**checkpoint.snapshot, 'document_record': {
+                **record, 'commit': commit, 'text': text, 'applied': True}})
+        ports.state.update_project(ports.identity.repo, preserve_transaction=True, **values)
+    if ports.update_snapshot is not None:
+        ports.update_snapshot(_definition_snapshot=updated)
+
+
 def classify_definition_delta(
     previous: DefinitionSnapshot,
     current: DefinitionSnapshot,
@@ -328,7 +390,6 @@ def classify_definition_delta(
 WORKER_INVALIDATING_DELTAS = frozenset(
     {
         DefinitionDelta.SOURCES,
-        DefinitionDelta.SOURCE_INPUT,
         DefinitionDelta.DEPENDENCIES,
         DefinitionDelta.BODY,
         DefinitionDelta.ARCHIVE_SCOPE,
