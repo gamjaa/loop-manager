@@ -168,13 +168,13 @@ class WorkerOutcomeTests(unittest.TestCase):
             "agent_input_fingerprint = 'legacy-local' WHERE repo = 'repo'"
         )
         connection.commit()
-        with mock.patch.object(loop_manager.GitSnapshot, 'deserialize',
-                               return_value='saved-snapshot'):
+        current = loop_manager.GitSnapshot('current', 'loop-manager/G-047', {}, {}, {}, {}, {}, {})
+        with mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=current):
             result = loop_manager.begin_agent_scope(
                 connection, 'repo', Path('/state/G-047'), 'worker',
                 input_fingerprint='remote-input',
             )
-        self.assertEqual(result, 'saved-snapshot')
+        self.assertEqual(result, current)
         row = connection.execute(
             "SELECT agent_snapshot, agent_input_fingerprint FROM projects "
             "WHERE repo = 'repo'"

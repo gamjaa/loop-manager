@@ -14,10 +14,8 @@ from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.agents.provider_adapters import AgentProvider
 from loop_manager_internal.storage import agent_invocation_state
 from loop_manager_internal.agents import agent_write_isolation
-from loop_manager_internal.agents import agent_scope_decision
 from loop_manager_internal.agents import common_guidance
 from loop_manager_internal.agents import agent_profiles
-from loop_manager_internal.git.base_fetch_service import reconcile_external_base
 from loop_manager_internal.storage.common_guidance_state import GuidanceRepository
 from loop_manager_internal.storage.runtime_state import RuntimeStateRepository
 from loop_manager_internal.runtime.runtime_identity import _canonical_path
@@ -207,62 +205,12 @@ def run_agent(
     has_notification_session = (connection is not None and connection.execute(
         "SELECT 1 FROM sqlite_temp_master WHERE name = 'notification_session'"
     ).fetchone() is not None)
-    preflight_baseline: GitSnapshot | None = None
-    preflight_digest: str | None = None
-
     def preflight_scope_digest() -> str:
-        nonlocal preflight_baseline, preflight_digest
-        snapshot = effects.capture_git_snapshot(worktree)
-        if connection is None or invocation is None:
-            return hashlib.sha256(snapshot.serialize().encode()).hexdigest()
-        repository = RuntimeStateRepository(connection)
-        try:
-            project = repository.scope_owner(invocation.repo)
-            owner = repository.scope_owner(invocation.repo, invocation.plan_id) if invocation.plan_id else project
-        except sqlite3.OperationalError as error:
-            if "no such table:" not in str(error).lower():
-                raise
-            return hashlib.sha256(snapshot.serialize().encode()).hexdigest()
-        if project is None or owner is None or not project['base_branch']:
-            return hashlib.sha256(snapshot.serialize().encode()).hexdigest()
-        phase = agent_scope_decision.invocation_scope_phase(role_name)
-        if phase is None:
-            return hashlib.sha256(snapshot.serialize().encode()).hexdigest()
-        branch = (str(owner['branch'] or '') or None
-                  if role_name in {'worker', 'reviewer'} else None)
-        if role_name in {'worker', 'reviewer'} and branch is None:
-            return hashlib.sha256(snapshot.serialize().encode()).hexdigest()
-        base_branch = str(project['base_branch'])
-        resources = agent_scope_decision.used_git_resources(
-            role=role_name, phase=phase, base_branch=base_branch, branch=branch,
-            worktree_key=str(_canonical_path(worktree)),
-        )
-        if resources is None:
-            return hashlib.sha256(snapshot.serialize().encode()).hexdigest()
-        default_worktree = str(_canonical_path(Path(invocation.repo)))
-        def selected_digest(value: GitSnapshot) -> str:
-            return agent_scope_decision.invocation_scope_digest(
-                value, role=role_name, phase=phase, base_branch=base_branch,
-                branch=branch, worktree_key=str(_canonical_path(worktree)),
-                default_worktree=default_worktree,
-            )
-        if preflight_baseline is None:
-            preflight_baseline = snapshot
-            preflight_digest = selected_digest(snapshot)
-            return preflight_digest
-        reconciled = reconcile_external_base(
-            effects.git, worktree, base_branch, preflight_baseline, snapshot, resources,
-            registered_origin=str(project['origin'] or ''),
-        )
-        baseline_view, current_view = agent_scope_decision.scoped_metadata(
-            reconciled, snapshot, resources, default_worktree=default_worktree,
-            selected_worktree=str(_canonical_path(worktree)),
-            base_branch=base_branch,
-        )
-        if baseline_view == current_view and preflight_digest is not None:
-            if selected_digest(preflight_baseline) == preflight_digest:
-                return preflight_digest
-        return selected_digest(snapshot)
+        # Bind policy evidence to the invocation identity, not mutable Git state.
+        identity = (role_name, str(_canonical_path(worktree)),
+                    invocation.repo if invocation is not None else '',
+                    invocation.plan_id or '' if invocation is not None else '')
+        return hashlib.sha256("\0".join(identity).encode()).hexdigest()
 
     notify_process_start = (role_name in {"worker", "planner", "maintenance_planner"}
                             and has_notification_session and invocation is not None)

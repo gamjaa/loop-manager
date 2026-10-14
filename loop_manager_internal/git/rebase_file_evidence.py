@@ -28,7 +28,7 @@ def stash_originals(worktree: Path, stash: str, git) -> dict[str, str]:
 
 
 def capture_originals(worktree: Path, paths: tuple[str, ...], revisions: dict,
-                      git_bytes) -> tuple[dict, dict[str, bytes]]:
+                      git_bytes, *, allow_incomplete=False) -> tuple[dict, dict[str, bytes]]:
     """Read exact tree/index/worktree bytes without staging or resolving files.
 
     The caller validates ownership, paths and secrets, then repeats collection
@@ -50,7 +50,7 @@ def capture_originals(worktree: Path, paths: tuple[str, ...], revisions: dict,
             raise RuntimeError('unsafe diagnostic path')
         target = worktree / name
         # A symlink parent must never turn a selected path into an external read.
-        if any(parent.is_symlink() for parent in [target, *target.parents]
+        if any(parent.is_symlink() for parent in target.parents
                if parent != worktree and worktree in parent.parents):
             raise RuntimeError('diagnostic symlink path')
         item = {}
@@ -67,28 +67,47 @@ def capture_originals(worktree: Path, paths: tuple[str, ...], revisions: dict,
             mode, kind, oid = metadata.decode('ascii').split()
             if actual != name.encode('utf-8', 'surrogateescape') or kind != 'blob':
                 raise RuntimeError('unsupported diagnostic tree entry')
-            item[label] = store(mode, git_bytes(worktree, 'cat-file', 'blob', oid), oid)
+            try:
+                item[label] = store(mode, git_bytes(worktree, 'cat-file', 'blob', oid), oid)
+            except RuntimeError:
+                if not allow_incomplete or label == 'base':
+                    raise
+                item[label] = {'mode': mode, 'oid': oid, 'unavailable': 'blob'}
         stages = {}
         raw = git_bytes(worktree, '--literal-pathspecs', 'ls-files', '--stage', '-z', '--', name)
         for entry in filter(None, raw.split(b'\0')):
             metadata, actual = entry.split(b'\t', 1)
             mode, oid, stage = metadata.decode('ascii').split()
             if (actual != name.encode('utf-8', 'surrogateescape')
-                    or stage in stages or mode not in {'100644', '100755'}):
+                    or stage in stages or mode not in {'100644', '100755', '120000'}):
                 raise RuntimeError('unsupported diagnostic index entry')
-            stages[stage] = store(mode, git_bytes(worktree, 'cat-file', 'blob', oid), oid)
+            try:
+                stages[stage] = store(mode, git_bytes(worktree, 'cat-file', 'blob', oid), oid)
+            except RuntimeError:
+                if not allow_incomplete:
+                    raise
+                stages[stage] = {'mode': mode, 'oid': oid, 'unavailable': 'blob'}
         item['index'] = stages
         try:
             mode = target.lstat().st_mode
         except FileNotFoundError:
             item['worktree'] = {'absent': True}
         else:
+            if stat.S_ISLNK(mode):
+                item['worktree'] = store('120000', os.fsencode(os.readlink(target)))
+                records[name] = item
+                continue
             if not stat.S_ISREG(mode):
                 raise RuntimeError('unsupported diagnostic worktree entry')
             file_mode = '100755' if mode & stat.S_IXUSR else '100644'
             if os.name == 'nt':
                 file_mode = stages.get('0', {}).get('mode', '100644')
-            item['worktree'] = store(file_mode, target.read_bytes())
+            try:
+                item['worktree'] = store(file_mode, target.read_bytes())
+            except OSError:
+                if not allow_incomplete:
+                    raise
+                item['worktree'] = {'mode': file_mode, 'unavailable': 'bytes'}
         records[name] = item
     return records, blobs
 

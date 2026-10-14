@@ -1,3 +1,4 @@
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure
 """Task Relevant Publication Boundary regression tests."""
 
 from tests.support.execution import execution_fixture
@@ -243,7 +244,8 @@ class TaskRelevantPublicationBoundaryTests(TestCase):
                 mock.patch.object(lm, 'validate_execplan_workspace_identity'),
                 mock.patch.object(lm, 'validate_managed_worktree'),
                 mock.patch.object(lm, '_fetch_pr_conflict_recovery_refs'),
-                mock.patch.object(lm, 'remote_branch_oid', return_value=old)):
+                mock.patch.object(lm, 'remote_branch_oid', return_value=old),
+                mock.patch('loop_manager_internal.git.manager_git_journal.live_remote_branch_oid', return_value=old)):
             stack.enter_context(patch)
         command = stack.enter_context(mock.patch.object(lm, 'git',
             return_value=SimpleNamespace(stdout=head, returncode=0)))
@@ -253,7 +255,7 @@ class TaskRelevantPublicationBoundaryTests(TestCase):
     def test_conflict_push_requeries_actual_pr_head_after_fetch(self):
         branch, head, pr, command, lookup = self.conflict_push_fixture()
         lookup.return_value = {**pr, 'headRefOid': 'd' * 40}
-        with self.assertRaises(lm.PublicationSafetyError):
+        with self.assertRaises(RecoveryFailure):
             lm.push_owned_pr_conflict_recovery(self.case.connection, Path('/repo'),
                 Path('/state'), 'repo', branch, Path('/state/G-047'), pr, head)
         self.assertFalse(any(call.args[1] == 'push' for call in command.call_args_list))

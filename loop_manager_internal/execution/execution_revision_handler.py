@@ -5,6 +5,7 @@ from dataclasses import dataclass, replace
 from typing import Callable, Any, Mapping
 import json
 import sys
+from pathlib import Path
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, RecoveryFailure
 from loop_manager_internal.execution.execution_revision import DefinitionSnapshot, RevisionGateKind, StageArtifacts, WORKER_INVALIDATING_DELTAS, decide_revision_gate
@@ -151,6 +152,20 @@ class RevisionHandler:
                 legacy_baseline=legacy_baseline,
             ),
         )
+        if decision.phase == 'VERIFYING' and self.ports.checkpoint is not None:
+            row = self.ports._row()
+            from loop_manager_internal.execution.manual_candidate import get_manual
+            manual = get_manual(self.ports.state)
+            if (manual and manual.user_submission(row)
+                    or row['worker_result'] and row['worker_input_token'] == snapshot.worker_token):
+                plan_id = str(self.ports.snapshot().catalog_plan['plan_id'])
+                current = self.ports.checkpoint.get(self.ports.identity.repo, plan_id)
+                head = self.ports.git(Path(row['worktree']), 'rev-parse', 'HEAD').stdout.strip()
+                self.ports.checkpoint.record(self.ports.identity.repo, plan_id,
+                    expected_generation=current.generation, operation=current.operation,
+                    expected_head=current.expected_head, target_base_oid=current.target_base_oid,
+                    observed_remote_oid=current.observed_remote_oid,
+                    snapshot={**(current.snapshot or {}), 'worker_candidate_token': snapshot.worker_candidate_token(head)})
         self.ports.update_snapshot(_definition_snapshot=snapshot)
         self.ports.update_snapshot(catalog_plan=self.ports.state.active_execplan(self.ports.identity.repo))
         assert self.ports.snapshot().catalog_plan is not None
@@ -484,7 +499,7 @@ class RevisionHandler:
                 return self._revision_error(context, str(error))
             except self.ports.contract.AgentScopeError as error:
                 return self.ports._block_final(self.ports.identity.repo, context.worktree, str(error),
-                    str(row['verify_result'] or ''), reason=BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION)
+                    str(row['verify_result'] or ''), reason=BlockReasonCode.PLAN_INPUT_INVALID)
             except RecoveryFailure:
                 raise
             except (RuntimeError, OSError) as error:

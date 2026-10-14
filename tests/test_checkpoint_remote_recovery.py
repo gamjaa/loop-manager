@@ -705,7 +705,7 @@ class CheckpointRebaseGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.Te
         checkpoint_store = execution_checkpoint_state.ExecutionCheckpointRepository(
             self.connection,
         )
-        stale = checkpoint_store.get(repo, 'G-034').snapshot['blocked_resume']
+        stale = {'owner_oid': previous_oid, 'before_head': previous_oid, 'after_head': self.run_git(self.worktree, 'rev-parse', 'HEAD'), 'target_base_oid': self.base_oid}
         request = self.block(evidence='second failure')
         current = checkpoint_store.get(repo, 'G-034')
         self.assertNotIn('blocked_resume', current.snapshot or {})
@@ -775,9 +775,10 @@ class CheckpointRebaseGitRecoveryTests(CheckpointGitRecoveryFixture, unittest.Te
                                       'refs/heads/loop-manager/G-034').split()[0], rebased)
         resumed = execution_checkpoint_state.ExecutionCheckpointRepository(
             self.connection,
-        ).get(repo, 'G-034').snapshot['blocked_resume']
-        self.assertEqual(resumed['owner_oid'], new_oid)
-        self.assertEqual(resumed['before_head'], new_oid)
+        ).get(repo, 'G-034').snapshot
+        self.assertEqual(resumed['accepted_work_branch'], rebased)
+        self.assertEqual(resumed['blocked_resume']['owner_oid'], new_oid)
+        self.assertEqual(resumed['blocked_resume']['before_head'], new_oid)
 
 
 class ManualRebaseContinuationUnitTests(unittest.TestCase):
@@ -919,7 +920,7 @@ class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest
         self.assertEqual(self.run_git(self.repo, "rev-parse", "main"), self.base_oid)
 
 
-    def test_rewritten_remote_branch_keeps_local_checkpoint_blocked(self):
+    def test_rewritten_remote_branch_enters_owned_conflict_without_discarding_commits(self):
         published = self.publish_block()
         before_events = self.connection.execute(
             "SELECT COUNT(*) FROM notification_outbox"
@@ -932,12 +933,12 @@ class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest
         )
 
         self.assertFalse(resumed)
-        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"), published)
+        self.assertEqual(self.run_git(self.worktree, "rev-parse", "refs/heads/loop-manager/G-034"), published)
         plan = self.connection.execute(
             "SELECT status, last_error FROM exec_plans WHERE plan_id = 'G-034'"
         ).fetchone()
         self.assertEqual(plan["status"], "PLAN_BLOCKED")
-        self.assertIn("후속이 아닙니다", plan["last_error"])
+        self.assertTrue(loop_manager._rebase_in_progress_for_branch(self.worktree, "loop-manager/G-034"))
         after_events = self.connection.execute(
             "SELECT COUNT(*) FROM notification_outbox"
         ).fetchone()[0]
@@ -1012,24 +1013,21 @@ class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest
         ).fetchone()[0], "requested")
 
 
-    def test_legacy_published_oid_cannot_be_inferred_from_remote_head(self):
+    def test_missing_legacy_receipt_accepts_remote_without_fabricating_publication(self):
         published = self.publish_block()
         self.connection.execute(
             "UPDATE blocked_checkpoints SET published_oid = NULL, "
             "accepted_remote_oid = NULL"
         )
         self.connection.commit()
-        self.user_commit()
+        corrected = self.user_commit()
 
-        self.assertFalse(loop_manager.resume_plan_blocks(
+        self.assertTrue(loop_manager.resume_plan_blocks(
             self.connection, self.repo, self.state_dir,
             str(self.repo.resolve()), "main",
         ))
-        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"), published)
-        self.assertIn("legacy checkpoint", self.connection.execute(
-            "SELECT last_error FROM exec_plans WHERE plan_id = 'G-034'"
-        ).fetchone()[0])
-
+        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"), corrected)
+        self.assertIsNone(self.connection.execute("SELECT published_oid FROM blocked_checkpoints").fetchone()[0])
 
     def test_remote_user_guidance_is_adopted_without_releasing_original_cause(self):
         published = self.publish_block()
@@ -1610,7 +1608,7 @@ class CheckpointCauseGitRevalidationTests(CheckpointGitRecoveryFixture, unittest
         self.assertIsNone(self.connection.execute(
             "SELECT inspected_input FROM blocked_checkpoints"
         ).fetchone()[0])
-        self.assertEqual(self.run_git(self.worktree, "rev-parse", "HEAD"), published)
+        self.assertEqual(self.run_git(self.worktree, "rev-parse", "refs/heads/loop-manager/G-034"), published)
 
         self.assertFalse(loop_manager.resume_plan_blocks(
             self.connection, self.repo, self.state_dir,

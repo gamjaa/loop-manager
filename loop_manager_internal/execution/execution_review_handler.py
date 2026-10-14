@@ -9,6 +9,9 @@ from loop_manager_internal.storage import review_correction_state, runtime_state
 from loop_manager_internal.notifications import notifications
 import json
 from loop_manager_internal.agents.agent_invocation import AttemptSequence, TrackedAgentCall
+from loop_manager_internal.agents.scope_contracts import GitSnapshot
+from loop_manager_internal.agents.agent_scope_decision import _same_local_snapshot
+from loop_manager_internal.git.managed_rebase_adoption import revalidation_values
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, classify_exception
 from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionOutcome, ExecutionOutcomeKind
@@ -398,6 +401,26 @@ class ReviewHandler:
                     detail, context=context,
                 )
             self.ports.clear_agent_scope(self.ports.identity.repo)
+            if (isinstance(reviewer_scope_before, GitSnapshot)
+                    and isinstance(reviewer_scope_after, GitSnapshot)
+                    and not _same_local_snapshot(reviewer_scope_before, reviewer_scope_after)):
+                if feedback_repo is not None and not code:
+                    feedback_repo.record_result(
+                        self.ports.identity.repo, str(self.ports.snapshot().plan['id']),
+                        context.plan.definition_revision_sha, 'review', 'stale_result', review)
+                self.ports.state.update_project(
+                    self.ports.identity.repo, phase='VERIFYING', validated_base_sha=None,
+                    verify_token=None, review_token=None, publication_token=None,
+                    review_result=None)
+                if self.ports.checkpoint is not None:
+                    checkpoints = self.ports.checkpoint
+                    current = checkpoints.get(self.ports.identity.repo, context.plan.plan_id)
+                    checkpoints.record(self.ports.identity.repo, context.plan.plan_id,
+                        expected_generation=current.generation, operation=current.operation,
+                        expected_head=reviewer_scope_after.head, target_base_oid=current.target_base_oid,
+                        observed_remote_oid=current.observed_remote_oid,
+                        snapshot={**(current.snapshot or {}), 'stale_review_candidate': reviewer_scope_before.serialize()})
+                return self.ports._retry('Review 중 후보가 변경되어 현재 작업물을 보존하고 다시 검증합니다.')
             guarded = self.ports._post_effect_guard(context)
             if isinstance(guarded, ExecutionOutcome):
                 if feedback_repo is not None and not code:

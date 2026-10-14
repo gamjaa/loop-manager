@@ -489,7 +489,7 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
         self.assertEqual(self.state.row()['phase'], 'WORKING')
         self.assertIsNone(self.state.row()['worker_result'])
 
-    def test_clean_rebase_does_not_override_candidate_worker_invalidation(self):
+    def test_clean_rebase_candidate_requires_verification_without_repeating_worker(self):
         from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.handler.effects = replace(self.handler.effects, checkpoint=checkpoint)
@@ -501,10 +501,10 @@ class VerifyReceiptPolicyTest(ExecutionFixture, unittest.TestCase):
                 'worker_candidate_token': self.definition.worker_candidate_token('old-head')})
         self.remote = 'new-base'
         self.handler.guard(self.context())
-        self.assertEqual(self.state.row()['phase'], 'WORKING')
-        self.assertIsNone(self.state.row()['worker_result'])
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
+        self.assertIsNotNone(self.state.row()['worker_result'])
         self.handler._complete_rebase_intent.assert_called_once()
-        self.assertIsNone(self.handler._complete_rebase_intent.call_args.kwargs['worker_definition'])
+        self.assertEqual(self.handler._complete_rebase_intent.call_args.kwargs['worker_definition'].worker_token, self.definition.worker_token)
 
     def test_clean_rebase_with_changed_source_requires_worker(self):
         self.effects.revision.source_fingerprint.return_value = 'new-requirement-content'

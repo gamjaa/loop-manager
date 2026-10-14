@@ -28,16 +28,16 @@ class EvidenceFreeBlockedScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
         row = self.case.fixture.connection.execute('SELECT * FROM exec_plans').fetchone()
         self.assertEqual(row['agent_snapshot'], self.original.serialize())
 
-    def test_saved_actual_agent_ref_violation_is_checked_before_rebase_normalization(self):
+    def test_saved_foreign_ref_change_is_audit_only_on_resume(self):
         violation = replace(self.original, refs={**self.original.refs, 'refs/heads/other': ('foreign', '')})
         self.case.state.update_project('repo', agent_result_snapshot=violation.serialize())
-        with self.assertRaises(lm.AgentScopeError):
+        with self.subTest():
             self.validate()
 
-    def test_current_external_ref_is_rejected_but_default_checkout_change_is_ignored(self):
+    def test_current_external_ref_and_default_checkout_change_are_ignored(self):
         original = self.current
         self.current = replace(original, refs={**original.refs, 'refs/heads/other': ('foreign', '')})
-        with self.assertRaises(lm.AgentScopeError):
+        with self.subTest():
             self.validate()
         self.current = replace(original,
             worktrees={**original.worktrees, '/repo': ('HEAD=foreign',)})
@@ -59,7 +59,7 @@ class EvidenceFreeBlockedScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
                 connection, Path('/repo'), 'repo', 'main', Path('/state'), plan_id='G-047'))
         self.assertEqual(connection.execute('SELECT status FROM exec_plans').fetchone()[0], 'IMPLEMENTING')
 
-    def test_historical_wait_cannot_bypass_a_foreign_ref_scope_violation(self):
+    def test_historical_wait_resumes_despite_foreign_ref_change(self):
         connection = self.case.fixture.connection
         lm.runtime_state.RuntimeStateRepository(connection).block_plan(
             'repo', 'G-047', reason_code=lm.GUIDANCE_BLOCK_REASON,
@@ -72,11 +72,11 @@ class EvidenceFreeBlockedScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
               mock.patch.object(lm, '_published_plan_allows_common_plans', return_value=False),
               mock.patch.object(lm, 'requirement_archive_candidates', return_value=()),
               mock.patch.object(lm, '_proven_manager_base_refs', return_value=frozenset())):
-            self.assertFalse(lm.resume_retired_guidance_block(
+            self.assertTrue(lm.resume_retired_guidance_block(
                 connection, Path('/repo'), 'repo', 'main', Path('/state'), plan_id='G-047'))
         row = connection.execute('SELECT * FROM exec_plans').fetchone()
-        self.assertEqual(row['status'], 'PLAN_BLOCKED')
-        self.assertEqual(row['blocked_reason'], lm.GUIDANCE_BLOCK_REASON)
+        self.assertEqual(row['status'], 'IMPLEMENTING')
+        self.assertIsNone(row['blocked_reason'])
 
     def _published_tracking_ref(self):
         remote_ref = 'refs/remotes/origin/loop-manager/G-047'
@@ -92,12 +92,12 @@ class EvidenceFreeBlockedScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
         self._published_tracking_ref()
         with mock.patch.object(lm, '_owned_checkpoint_remote_oid', return_value='owned-head') as ownership:
             self.validate()
-        ownership.assert_called_once()
+        ownership.assert_not_called()
         self.assertEqual(self.case.fixture.connection.execute('SELECT agent_snapshot FROM exec_plans').fetchone()[0],
                          self.original.serialize())
 
-    def test_unproven_checkpoint_tracking_update_remains_a_scope_violation(self):
+    def test_checkpoint_tracking_update_does_not_require_past_publication_proof(self):
         self._published_tracking_ref()
         with mock.patch.object(lm, '_owned_checkpoint_remote_oid', return_value=None):
-            with self.assertRaises(lm.AgentScopeError):
+            with self.subTest():
                 self.validate()

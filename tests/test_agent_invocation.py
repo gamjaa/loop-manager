@@ -135,7 +135,7 @@ class RunnerTests(TestCase):
                 resolved_profile=invocation.ResolvedProfile('model', 'high'),
             )
         self.assertEqual(result.code, 0)
-        self.assertEqual(observed, [hashlib.sha256(snapshot.serialize().encode()).hexdigest()])
+        self.assertEqual(observed, [hashlib.sha256(('planner\0' + str(Path('/worktree').resolve()) + '\0repo\0').encode()).hexdigest()])
 
     def test_each_fallback_process_has_own_resolved_profile_and_session(self):
         seen = []

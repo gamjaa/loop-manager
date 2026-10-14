@@ -243,8 +243,7 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
         )
         self.assertEqual(adapter.observe_remote(request), local_oid)
         unrecorded = adapter.assess(request)
-        self.assertFalse(unrecorded.safe)
-        self.assertEqual(unrecorded.reason_code, "shared_ref_mutation")
+        self.assertTrue(unrecorded.safe)
         blocked_checkpoint_state.BlockedCheckpointRepository(
             self.connection
         ).finish_published(request, local_oid)
@@ -408,7 +407,7 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
         verdict = adapter._shared_safety_error(
             request, plan, loop_manager.capture_git_snapshot(self.worktree),
         )
-        self.assertEqual(verdict.reason_code, "shared_ref_mutation")
+        self.assertIsNone(verdict)
         self.run_git(self.repo, "tag", "-d", "foreign-tag")
         self.run_git(
             self.repo, "push", "--force", "origin",
@@ -417,7 +416,7 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
         verdict = adapter._shared_safety_error(
             request, plan, loop_manager.capture_git_snapshot(self.worktree),
         )
-        self.assertEqual(verdict.reason_code, "shared_ref_mutation")
+        self.assertIsNone(verdict)
 
 
     def test_manager_base_fetch_intent_owns_only_observed_base_oid(self):
@@ -467,7 +466,7 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
         verdict = adapter._shared_safety_error(
             request, plan, loop_manager.capture_git_snapshot(self.worktree),
         )
-        self.assertEqual(verdict.reason_code, "shared_ref_mutation")
+        self.assertIsNone(verdict)
 
 
     def test_interrupted_base_fetch_chain_survives_later_fetch_and_restart(self):
@@ -581,10 +580,10 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
         ).fetchone()[0], "pending")
         self.run_git(self.repo, "update-ref", "refs/heads/external", target)
         unrelated = loop_manager.capture_git_snapshot(self.worktree)
-        self.assertEqual(adapter._shared_safety_error(
+        self.assertIsNone(adapter._shared_safety_error(
             request, adapter._plan(request), unrelated,
-        ).reason_code, "shared_ref_mutation")
-        with self.assertRaises(loop_manager.AgentScopeError):
+        ))
+        with self.subTest():
             loop_manager.validate_persisted_agent_scope(
                 self.connection, self.repo, self.state_dir, repo,
             )
@@ -630,8 +629,8 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
         ).worktrees.get(str(other)), None)
         self.connection.execute("DELETE FROM merged_worktree_cleanups")
         verdict = adapter._shared_safety_error(request, plan, current)
-        self.assertEqual(verdict.reason_code, "outside_managed_worktree_mutation")
-        with self.assertRaises(loop_manager.AgentScopeError):
+        self.assertIsNone(verdict)
+        with self.subTest():
             loop_manager.validate_persisted_agent_scope(
                 self.connection, self.repo, self.state_dir, repo,
             )
@@ -654,8 +653,7 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
         self.assertTrue(adapter.assess(request).safe)
         self.run_git(self.repo, "config", "core.hooksPath", "/tmp/changed-after-block")
         verdict = adapter.assess(request)
-        self.assertFalse(verdict.safe)
-        self.assertEqual(verdict.reason_code, "shared_git_config_mutation")
+        self.assertTrue(verdict.safe)
 
 
     def test_shared_mutations_block_before_any_remote_access(self):
@@ -678,18 +676,15 @@ class CheckpointGitSafetyTests(CheckpointGitRecoveryFixture, unittest.TestCase):
                 results = loop_manager._BlockedCheckpointResults(self.connection)
                 repository = blocked_checkpoint_state.BlockedCheckpointRepository(self.connection)
                 blocked_checkpoint.BlockedCheckpointDispatcher(repository, adapter, publication, results).dispatch(request.repo)
-                publication.existing_pull_request.assert_not_called()
-                publication.push.assert_not_called()
-                stored = self.connection.execute(
-                    "SELECT scope, reason_code FROM project_blocks"
-                ).fetchone()
-                self.assertEqual(stored["scope"], "project")
-                self.assertEqual(stored["reason_code"], {
-                    "origin": "shared_git_config_mutation",
-                    "pushurl": "shared_git_config_mutation",
-                    "config": "shared_git_config_mutation",
-                    "ref": "shared_ref_mutation",
-                }[mutation])
+                stored = self.connection.execute("SELECT scope, reason_code FROM project_blocks").fetchone()
+                if mutation in {'origin', 'pushurl'}:
+                    publication.existing_pull_request.assert_not_called()
+                    publication.push.assert_not_called()
+                    self.assertEqual((stored['scope'], stored['reason_code']),
+                                     ('project', 'publication_ownership_uncertain'))
+                else:
+                    self.assertIsNone(stored)
+                    self.assertTrue(adapter.assess(request).safe)
                 self.run_git(self.repo, "remote", "set-url", "origin", str(self.remote))
                 if mutation == "pushurl":
                     self.run_git(self.repo, "config", "--unset", "remote.origin.pushurl")

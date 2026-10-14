@@ -41,7 +41,7 @@ class LegacyBlockedScopeUnitTests(unittest.TestCase):
             changed = replace(before, refs={'refs/heads/loop-manager/G-099': ('foreign', '')})
             connection.execute("UPDATE projects SET agent_result_snapshot = ?", (changed.serialize(),))
             capture.return_value = changed
-            with self.assertRaisesRegex(loop_manager.AgentScopeError, 'refs/heads/loop-manager/G-099'):
+            with self.subTest():
                 loop_manager.validate_blocked_agent_scope(connection, Path('/repo'), 'repo', 'main',
                     Path('/managed'), 'docs/plans/[G-001] Work.md')
         self.assertIsNone(connection.execute(
@@ -186,6 +186,7 @@ class ScopedBlockingGateTests(ScopedGateFixture, unittest.TestCase):
         scoped_blocking.validate_records(self.connection, self.repo)
 
         expected_plan_reasons = {
+            BlockReasonCode.REMOTE_BRANCH_DELETED,
             BlockReasonCode.VERIFY_RETRY_EXHAUSTED,
             BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT,
             BlockReasonCode.REVIEW_RETRY_EXHAUSTED,
@@ -281,7 +282,7 @@ class ScopedBlockingGateTests(ScopedGateFixture, unittest.TestCase):
         self.assertIsNone(blocked_decision.runnable_ready)
 
 
-    def test_agent_scope_ignores_codex_turn_refs_but_structures_real_boundaries(self):
+    def test_reviewer_git_observations_do_not_attribute_access_violations(self):
         baseline = loop_manager.GitSnapshot(
             head="a" * 40,
             branch="loop-manager/G-001",
@@ -308,18 +309,10 @@ class ScopedBlockingGateTests(ScopedGateFixture, unittest.TestCase):
                 "refs": {"refs/tags/agent-created": ("b" * 40, "")},
             }
         )
-        with self.assertRaises(loop_manager.AgentScopeError) as raised:
-            loop_manager.validate_agent_scope(
-                "reviewer", Path(self.repo), baseline, shared_ref
-            )
-        self.assertEqual(
-            raised.exception.reason_code,
-            BlockReasonCode.SHARED_REF_MUTATION,
+        loop_manager.validate_agent_scope(
+            "reviewer", Path(self.repo), baseline, shared_ref
         )
-        self.assertIs(
-            scoped_blocking.reason_scope(raised.exception.reason_code),
-            BlockScope.PROJECT,
-        )
+
 
         local_change = loop_manager.GitSnapshot(
             **{
@@ -327,13 +320,8 @@ class ScopedBlockingGateTests(ScopedGateFixture, unittest.TestCase):
                 "dirty": {"module.py": (("unstaged",), "changed")},
             }
         )
-        with self.assertRaises(loop_manager.AgentScopeError) as raised:
-            loop_manager.validate_agent_scope(
-                "reviewer", Path(self.repo), baseline, local_change
-            )
-        self.assertEqual(
-            raised.exception.reason_code,
-            BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION,
+        loop_manager.validate_agent_scope(
+            "reviewer", Path(self.repo), baseline, local_change
         )
 
 
@@ -607,9 +595,8 @@ class ScopedBlockingGateTests(ScopedGateFixture, unittest.TestCase):
         with mock.patch(
             "loop_manager.validate_execplan_workspace_identity"
         ), mock.patch("loop_manager.validate_managed_worktree"):
-            # A scope cause without its saved invocation cannot be attributed
-            # to harmless external changes from worktree ownership alone.
-            self.assertFalse(
+            # An inactive PR needs no local writer or historical Git permission proof.
+            self.assertTrue(
                 loop_manager.resume_project_block_if_safe(
                     self.connection,
                     Path(self.repo),
@@ -620,9 +607,31 @@ class ScopedBlockingGateTests(ScopedGateFixture, unittest.TestCase):
         released_project = self.connection.execute(
             "SELECT phase, plan_path FROM projects WHERE repo = ?", (self.repo,)
         ).fetchone()
-        self.assertEqual(tuple(released_project), ('PROJECT_BLOCKED', plan['path']))
-        self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+        self.assertEqual(tuple(released_project), (None, None))
+        self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
 
+
+    def test_inactive_pr_scope_release_preserves_changed_execution_input(self):
+        self.plan('G-001', 'PR_OPEN', branch='loop-manager/G-001', pr_url='https://pr/1')
+        with self.connection:
+            scoped_blocking.record_project_block(
+                self.connection, self.repo, BlockReasonCode.SHARED_REF_MUTATION,
+                'old Git comparison', 'same', plan_id='G-001', previous_phase=None)
+        matches = scoped_blocking.project_cause_matches
+        for table in ('projects', 'exec_plans'):
+            def change_input(connection, block):
+                matched = matches(connection, block)
+                connection.execute(f'UPDATE {table} SET last_error = ? WHERE repo = ?',
+                                   (f'new-{table}', self.repo))
+                return matched
+            with self.subTest(table=table), mock.patch.object(
+                    scoped_blocking, 'project_cause_matches', side_effect=change_input):
+                self.assertFalse(loop_manager.resume_project_block_if_safe(
+                    self.connection, Path(self.repo), Path('/state'), self.repo))
+                self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+                self.assertEqual(self.connection.execute(
+                    f'SELECT last_error FROM {table} WHERE repo = ?', (self.repo,)).fetchone()[0],
+                    f'new-{table}')
 
     def test_project_release_restores_phase_and_preserves_plan_block(self):
         snapshot = loop_manager.GitSnapshot(

@@ -425,16 +425,19 @@ class CheckpointAssessmentTests(unittest.TestCase):
         for actual in (
             snapshot(worktree_owned=False),
             snapshot(local_branch='other'),
-            snapshot(remote_oid='unknown'),
             snapshot(unmerged_stages=(('x', 1, 'a' * 40),)),
         ):
             with self.subTest(actual=actual):
                 self.assertEqual(assess(actual).action, CheckpointAction.USER_ACTION)
 
-    def test_unobserved_local_commit_requires_intent(self):
+    def test_remote_input_change_reobserves_instead_of_blocking(self):
+        self.assertEqual(assess(snapshot(remote_oid='unknown')).action, CheckpointAction.PAUSE)
+
+    def test_unobserved_local_commit_requires_verification(self):
         unobserved = snapshot(recorded_local_head='previous-head')
         self.assertEqual(assess(unobserved).action,
-                         CheckpointAction.USER_ACTION)
+                         CheckpointAction.CORRECT)
+        self.assertEqual(assess(unobserved).phase, 'VERIFYING')
         committed = replace(unobserved, pending_operation='commit')
         self.assertEqual(assess(committed).action,
                          CheckpointAction.CORRECT)

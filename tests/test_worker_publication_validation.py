@@ -53,6 +53,8 @@ class WorkerPublicationValidationTest(unittest.TestCase):
     def test_verify_and_review_retries_keep_latest_worker_metadata_out_of_reviewer_prompt(self):
         with tempfile.TemporaryDirectory() as directory:
             repo = make_remote_repository(directory)
+            from tests.support.git import local_github_origin
+            origin = local_github_origin(self, repo)
             state_dir = Path(directory) / "state"
             state_dir.mkdir()
             (repo / "docs/plans").mkdir()
@@ -84,6 +86,7 @@ class WorkerPublicationValidationTest(unittest.TestCase):
                     plan.relative_to(repo).as_posix(),
                 ),
             )
+            connection.execute('UPDATE projects SET origin=? WHERE repo=?', (origin, str(repo)))
             connection.commit()
             worker_messages = iter(
                 (

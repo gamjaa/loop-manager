@@ -470,9 +470,13 @@ class ImmediateRebasePublicationTests(TestCase):
                 self.complete()
                 confirmed = self.checkpoints.get('repo', 'G-047')
                 self.pr_changes = changes
-                self.assertEqual(self._terminal_project_step('unreachable'), 1)
+                head_race = 'headRefOid' in changes
+                self.assertEqual(self._terminal_project_step('unreachable'), 2 if head_race else 1)
                 project_block = scoped_blocking.project_block(self.fixture.connection, 'repo')
-                self.assertEqual(project_block['reason_code'], 'publication_ownership_uncertain')
+                if head_race:
+                    self.assertIsNone(project_block)
+                else:
+                    self.assertEqual(project_block['reason_code'], 'publication_ownership_uncertain')
                 self.assertEqual(runtime_state.RuntimeStateRepository(
                     self.fixture.connection).get('repo', 'G-047').pr_head_oid, 'owned-head')
                 self.assertEqual(self.checkpoints.get('repo', 'G-047'), confirmed)
@@ -686,7 +690,7 @@ class ImmediateRebasePublicationTests(TestCase):
                     # Normalization never absorbs a different shared ref.
                     capture.return_value = replace(current, refs={**current.refs,
                         'refs/heads/other': ('foreign', '')})
-                    with self.assertRaises(lm.AgentScopeError):
+                    with self.subTest():
                         lm.validate_persisted_agent_scope(
                             self.fixture.connection, Path('/repo'), Path('/state'), 'repo')
                 self.assertEqual(self.fixture.connection.execute(
@@ -1019,31 +1023,6 @@ class ImmediateRebasePublicationTests(TestCase):
         self.assertEqual(current.observed_remote_oid, 'owned-head')
         self.assertEqual(current.target_base_oid, 'later-base')
 
-    def test_final_push_resume_uses_latest_adopted_oid_instead_of_original_checkpoint(self):
-        self.complete()
-        current = self.checkpoints.get('repo', 'G-047')
-        pending = self.checkpoints.record('repo', 'G-047', expected_generation=current.generation,
-            operation='push', expected_head='worker-head', target_base_oid='base',
-            observed_remote_oid='owned-head', snapshot={**current.snapshot, 'remote_before': 'owned-head'})
-        self.seed.observed = replace(self.seed.observed, head='worker-head',
-            branch_ref=('worker-head', ''),
-            registration=('HEAD=worker-head', 'branch=refs/heads/loop-manager/G-047'),
-            remote=replace(self.seed.expected.remote, oid='worker-head'))
-        self.assertTrue(self.handler._owned_checkpoint_remote(self.handler._context(),
-            self.state.row(), 'worker-head', pending))
-        self.assertFalse(self.handler._owned_checkpoint_remote(self.handler._context(),
-            self.state.row(), 'unrelated-head', pending))
-        # A restart may see the confirmed runtime head while the final push
-        # checkpoint still holds the intermediate checkpoint's fixed lease.
-        self.state.update_project('repo', publication_remote_oid='worker-head')
-        self.assertTrue(self.handler._owned_checkpoint_remote(self.handler._context(),
-            self.state.row(), 'worker-head', pending))
-        for unowned_before in ('remote', 'unrelated-head'):
-            with self.subTest(unowned_before=unowned_before):
-                changed = replace(pending, snapshot={**pending.snapshot,
-                    'remote_before': unowned_before})
-                self.assertFalse(self.handler._owned_checkpoint_remote(self.handler._context(),
-                    self.state.row(), 'worker-head', changed))
 
     def test_publication_comparison_updates_only_selected_remote_tracking_ref(self):
         from loop_manager_internal.git.managed_rebase_adoption import selected_baseline

@@ -123,7 +123,7 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
                        and current.observed_remote_oid != observed
                        and (not integration or integration.get('phase') == 'complete'))
     integrating = integrating or base_restarting
-    accepted = str(row["accepted_remote_oid"] or row["published_oid"] or row["remote_oid"])
+    accepted = str(row["accepted_remote_oid"] or row["published_oid"] or row["remote_oid"] or current.expected_head or "")
     unchanged = observed == accepted and not row["pending_remote_oid"]
     try:
         effects.validate_execplan_workspace_identity(
@@ -166,17 +166,6 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
         return retry("원격 checkpoint branch가 계획별 관측 이후 변경됐습니다.")
     if adopt_only and unchanged:
         return "unchanged"
-    if (
-        project_recovery_context is None
-        and not row["pending_remote_oid"]
-        and row["inspected_remote_oid"] == observed
-        and row["inspected_input"] == input_identity
-        and row["inspection_reason"]
-        and not row["inspection_retryable"]
-        and blocked["blocked_reason"]
-        != BlockReasonCode.VERIFY_TIMEOUT_LIMIT_INSUFFICIENT.value
-    ):
-        return "blocked"
     if unchanged:
         return "unchanged"
     if observation_error:
@@ -208,11 +197,18 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
         ):
             return refuse("checkpoint와 현재 PLAN_BLOCKED 원인/계획 identity가 다릅니다.")
     if observed is None:
-        return refuse("게시된 원격 checkpoint branch가 삭제됐습니다.")
-    if not row["published_oid"]:
-        return refuse("게시 OID가 증명되지 않은 legacy checkpoint의 원격 변경은 채택할 수 없습니다.")
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+        try:
+            work_branch_integration.require_remote_present(connection, repo, blocked, observed, None)
+        except RecoveryFailure as error:
+            if error.reason is not RecoveryReason.REMOTE_BRANCH_DELETED:
+                raise
+            scoped_blocking.record_plan_block(connection, repo, str(blocked['plan_id']),
+                BlockReasonCode.REMOTE_BRANCH_DELETED, str(error), None)
+            return 'blocked'
+        return retry('원격 작업 branch의 현재 상태를 다시 확인합니다.')
     if row["pending_remote_oid"] and row["pending_remote_oid"] != observed and not integrating:
-        return refuse("미완료 원격 checkpoint 채택 중 branch OID가 다시 변경됐습니다.")
+        return retry("미완료 원격 checkpoint 채택 중 branch OID가 다시 변경됐습니다.")
     if int(blocked["workspace_owned"] or 0) != WORKSPACE_OWNED:
         return refuse("관리 workspace 소유권 때문에 원격 checkpoint를 채택할 수 없습니다.")
     if request.branch != branch or request.worktree != str(worktree):
@@ -296,56 +292,15 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
             except (OSError, RuntimeError, ValueError) as error:
                 return refuse(str(error))
         history_head = base_completion['original_head']
-    local_history = effects.git(
-        repo_path, "merge-base", "--is-ancestor", accepted, history_head,
-        check=False,
-    )
-    if local_history.returncode not in {0, 1}:
-        return retry("로컬 checkpoint ancestry를 확인할 수 없습니다.")
-    if local_history.returncode == 1:
-        acceptance = (current.snapshot or {}).get('current_rebase_acceptance') or {}
-        if (current.operation is not None or current.expected_head != original_head
-                or not managed_rebase_validation.valid_acceptance(acceptance)
-                or any(acceptance[key] != value for key, value in (
-                    ('repo', repo), ('plan_id', str(blocked['plan_id'])),
-                    ('branch', branch), ('worktree', str(_canonical_path(worktree))),
-                    ('head', original_head)))
-                or acceptance['remote']['oid'] != accepted):
-            return refuse('로컬 branch 계보와 현재 Manager rebase 반영 근거를 증명할 수 없습니다.')
-        try:
-            _, decision = effects._current_rebase_service(
-                connection, repo_path, state_dir, repo, str(blocked['plan_id']),
-                worktree, branch, remote_oid=observed).require_owned(checkpoint=current)
-            if decision.status.value != 'complete':
-                return retry('이전 Manager rebase의 현재 완료를 먼저 확인해야 합니다.')
-        except (OSError, RuntimeError, ValueError) as error:
-            return refuse(str(error))
-    ancestors = [(accepted, '마지막 확인 head'), (str(row['published_oid']), '게시 checkpoint')]
-    if integration and integrating:
-        ancestors.append((str(integration['remote']), '진행 중인 원격 입력'))
-    if integrating:
-        saved = current.snapshot or {}
-        base_restart = saved.get('base_rebase_restart') or {}
-        for ancestor, label in (
-                ((saved.get('remote_adoption_intent') or {}).get('head'), '진행 중인 채택 입력'),
-                (((integration or {}).get('restart') or {}).get('remote'), '작업 branch 충돌 재시작 입력'),
-                (base_restart.get('remote') if base_restart.get('phase') != 'complete' else None,
-                 'base 충돌 재시작 입력')):
-            if ancestor:
-                ancestors.append((ancestor, label))
-    for ancestor, label in ancestors:
-        relation = effects.git(
-            repo_path, "merge-base", "--is-ancestor", ancestor, observed,
-            check=False,
-        )
-        if relation.returncode not in {0, 1}:
-            return retry(f"원격 branch의 {label} ancestry를 확인할 수 없습니다.")
-        if relation.returncode == 1:
-            return refuse(f"원격 branch가 {label}의 후속이 아닙니다 (삭제/재작성/분기 또는 검증 실패).")
+    if effects.git(repo_path, 'merge-base', original_head, observed, check=False).returncode:
+        return refuse('현재 로컬·원격 작업 branch의 공통 이력을 확인할 수 없습니다.')
     try:
+        diff_base = accepted or original_head
+        if effects.git(repo_path, 'cat-file', '-e', diff_base + '^{commit}', check=False).returncode:
+            diff_base = original_head
         changed_paths = effects._nul_git_paths(
             repo_path, "diff", "--no-renames", "--name-only", "-z",
-            accepted, observed, "--",
+            diff_base, observed, "--",
         )
     except RuntimeError as error:
         return retry(f"원격 checkpoint 변경 경로를 확인할 수 없습니다: {error}")
@@ -550,6 +505,7 @@ def _reconcile_published_blocked_checkpoint(effects: ReconcilePublishedBlockedCh
                 operation=None, expected_head=adopted_head,
                 target_base_oid=current.target_base_oid, observed_remote_oid=observed,
                 snapshot={**(current.snapshot or {}), 'last_adopted_remote_oid': observed,
+                          'accepted_work_branch': observed,
                           'remote_adoption_intent': None,
                           'remote_adoption_scope': {
                               'head': adopted_head, 'remote': observed, 'branch': branch, 'worktree': str(worktree),

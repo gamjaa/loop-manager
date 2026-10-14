@@ -268,6 +268,8 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('_owned_publication_plan', publication_service._owned_publication_plan,
         lambda: publication_service.OwnedPublicationPlanEffects(
+            git=assembly.callback('git'),
+            github_repository=assembly.callback('github_repository'),
             active_execplan=assembly.callback('active_execplan'),
             validate_execplan_workspace_identity=assembly.callback('validate_execplan_workspace_identity'),
             validate_managed_worktree=assembly.callback('validate_managed_worktree'),
@@ -297,6 +299,7 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('push_owned_pr_conflict_recovery', publication_service.push_owned_pr_conflict_recovery,
         lambda: publication_service.PushOwnedPrConflictRecoveryEffects(
+            _owned_publication_plan=assembly.callback('_owned_publication_plan'),
             _fetch_pr_conflict_recovery_refs=assembly.callback('_fetch_pr_conflict_recovery_refs'),
             _recorded_base_fetch=assembly.callback('_recorded_base_fetch'),
             active_execplan=assembly.callback('active_execplan'),

@@ -15,7 +15,7 @@ from tests.support.worker import dummy_worker_sessions
 class ScopeValidationMutationsTest(AgentScopeFixture, unittest.TestCase):
 
     @dummy_worker_sessions
-    def test_reviewer_mutation_blocks_even_when_verdict_passes(self):
+    def test_changed_candidate_during_review_revalidates_without_access_violation(self):
         origin_parser = mock.patch(
             "loop_manager_internal.git.git_adapter.github_repository",
             return_value="owner/repo",
@@ -81,6 +81,8 @@ class ScopeValidationMutationsTest(AgentScopeFixture, unittest.TestCase):
                 )
 
             def reviewer(agent_worktree, *_args, **_kwargs):
+                if _args[2] == 'worker':
+                    return loop_manager.CodexResult(1, 'stop after candidate invalidation', 'saved-worker')
                 (agent_worktree / "reviewer.txt").write_text(
                     "keep for diagnosis\n", encoding="utf-8"
                 )
@@ -122,138 +124,16 @@ class ScopeValidationMutationsTest(AgentScopeFixture, unittest.TestCase):
                 "WHERE repo = ? AND plan_id = 'G-001'",
                 (str(repo),),
             ).fetchone()
-            self.assertEqual(result, 0)
-            self.assertIsNone(project["phase"])
-            self.assertIn("reviewer Git 범위 위반", plan["last_error"])
-            self.assertEqual(plan["status"], "PLAN_BLOCKED")
-            self.assertEqual(plan["agent_role"], "reviewer")
-            self.assertIsNotNone(plan["agent_snapshot"])
-            self.assertIsNotNone(plan["agent_result_snapshot"])
-            self.assertNotIn("keep for diagnosis", plan["agent_snapshot"])
-            self.assertIsNotNone(plan["blocked_fingerprint"])
-            self.assertEqual(
-                plan["blocked_fingerprint"],
-                loop_manager._revision_execplan_input_fingerprint(
-                    repo, "refs/remotes/origin/main", plan
-                ),
-            )
-            self.assertNotEqual(
-                plan["blocked_fingerprint"],
-                plan["blocked_worktree_fingerprint"],
-            )
-            self.assertTrue((worktree / "reviewer.txt").is_file())
-
-            with mock.patch(
-                "loop_manager.validate_repository", return_value=repo
-            ), mock.patch(
-                "loop_manager.remote_base", return_value="main"
-            ), mock.patch(
-                "loop_manager.ensure_safe_base_worktree"
-            ), mock.patch(
-                "loop_manager.pr_for_branch", return_value=None
-            ), mock.patch(
-                "loop_manager.run_codex"
-            ) as unchanged_agent:
-                unchanged_result = loop_manager.run_project(
-                    connection,
-                    state_dir,
-                    str(repo),
-                    Path("unused.ini"),
-                    "main",
-                    False,
-                )
-
-            unchanged_project = connection.execute(
-                "SELECT phase, last_error FROM projects WHERE repo = ?",
-                (str(repo),),
-            ).fetchone()
-            unchanged_plan = connection.execute(
-                "SELECT status, last_error, blocked_fingerprint FROM exec_plans "
-                "WHERE repo = ? AND plan_id = 'G-001'",
-                (str(repo),),
-            ).fetchone()
-            self.assertEqual(unchanged_result, 0)
-            self.assertIsNone(unchanged_project["phase"])
-            self.assertIn("docs/PRODUCT.md", unchanged_plan["last_error"])
-            self.assertIn("reviewer.txt (untracked, worktree)", unchanged_plan["last_error"])
-            self.assertEqual(unchanged_plan["status"], "PLAN_BLOCKED")
-            self.assertEqual(
-                unchanged_plan["blocked_fingerprint"],
-                plan["blocked_fingerprint"],
-            )
-            self.assertEqual(
-                (worktree / "docs/PRODUCT.md").read_text(encoding="utf-8"),
-                "# Product changed by Reviewer\n",
-            )
-            unchanged_agent.assert_not_called()
-
-            advance_remote_file(directory, repo, 'docs/PRODUCT.md', '# Product changed after blocked review\n', 'Change source after blocked review')
-            with connection:
-                connection.execute(
-                    "UPDATE projects SET specification_fingerprint = ? "
-                    "WHERE repo = ?",
-                    (
-                        loop_manager.specification_input_fingerprint(repo, "main"),
-                        str(repo),
-                    ),
-                )
-            with mock.patch(
-                "loop_manager.validate_repository", return_value=repo
-            ), mock.patch(
-                "loop_manager.remote_base", return_value="main"
-            ), mock.patch(
-                "loop_manager.ensure_safe_base_worktree"
-            ), mock.patch(
-                "loop_manager.pr_for_branch", return_value=None
-            ), mock.patch(
-                "loop_manager.run_codex",
-                side_effect=[
-                    loop_manager.CodexResult(0, "", "planner-session"),
-                    loop_manager.CodexResult(
-                        1, "stop after scope unblock", "worker-session"
-                    ),
-                ],
-            ) as resumed_agent:
-                resumed_result = loop_manager.run_project(
-                    connection,
-                    state_dir,
-                    str(repo),
-                    Path("unused.ini"),
-                    "main",
-                    False,
-                )
-
-            resumed_project = connection.execute(
-                "SELECT phase, last_error, agent_role, agent_snapshot, "
-                "agent_result_snapshot "
-                "FROM projects WHERE repo = ?",
-                (str(repo),),
-            ).fetchone()
-            resumed_plan = connection.execute(
-                "SELECT status, blocked_fingerprint FROM exec_plans "
-                "WHERE repo = ? AND plan_id = 'G-001'",
-                (str(repo),),
-            ).fetchone()
-            self.assertEqual(resumed_result, 1)
-            self.assertEqual(resumed_project["phase"], "WORKING")
-            self.assertEqual(
-                resumed_project["last_error"],
-                "stop after scope unblock",
-            )
-            self.assertIsNone(resumed_project["agent_role"])
-            self.assertIsNone(resumed_project["agent_snapshot"])
-            self.assertIsNone(resumed_project["agent_result_snapshot"])
-            self.assertEqual(resumed_plan["status"], "IMPLEMENTING")
-            self.assertIsNone(resumed_plan["blocked_fingerprint"])
-            self.assertFalse((worktree / "reviewer.txt").exists())
-            self.assertIn(
-                "loop-manager scope violation G-001",
-                git_command(worktree, "stash", "list"),
-            )
-            self.assertEqual(
-                [call.args[3] for call in resumed_agent.call_args_list],
-                ["planner", "worker"],
-            )
+            self.assertEqual(result, 1)
+            self.assertEqual(project['phase'], 'WORKING')
+            self.assertEqual(plan['status'], 'IMPLEMENTING')
+            self.assertIsNone(plan['blocked_reason'])
+            self.assertIsNone(plan['verify_token'])
+            self.assertIsNone(plan['review_token'])
+            self.assertTrue((worktree / 'reviewer.txt').is_file())
+            self.assertEqual((worktree / 'docs/PRODUCT.md').read_text(encoding='utf-8'),
+                             '# Product changed by Reviewer\n')
+            self.assertIsNone(loop_manager.scoped_blocking.project_block(connection, str(repo)))
 
     def test_reviewer_scope_block_records_execplan_body_boundaries(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -405,7 +285,7 @@ class ScopeValidationMutationsTest(AgentScopeFixture, unittest.TestCase):
 
             self.assertEqual(result, 0)
             self.assertIsNone(project["phase"])
-            self.assertIn("worker Git 범위 위반", plan["last_error"])
+            self.assertIn("worker 결과 변경 범위 오류", plan["last_error"])
             self.assertIn(
                 "docs/PLANS.md",
                 plan["last_error"],
@@ -543,7 +423,7 @@ class ScopeValidationMutationsTest(AgentScopeFixture, unittest.TestCase):
             ).splitlines()
 
             self.assertEqual(result, 1)
-            self.assertEqual(roles, ["worker", "worker", "reviewer"])
+            self.assertEqual(roles, ["worker", "reviewer"])
             self.assertEqual(len(verify_calls), 2)
             self.assertEqual(project["phase"], "REVIEWING")
             self.assertIn("stop after publication check", project["last_error"])

@@ -169,6 +169,21 @@ class RebaseHandler:
         # after three further identical, progress-free results.
         correction_limit = 4 if abnormal_result else 3
         if saved.occurrence >= correction_limit:
+            if (self.ports.checkpoint is not None and self.ports.current_rebase_service is not None
+                    and observation.conflict_paths):
+                from loop_manager_internal.git import rebase_documents
+                rebase_documents.resolve(context=context, identity=self.ports.identity,
+                    checkpoints=self.ports.checkpoint, git=self.ports.git, git_bytes=self.ports.git_bytes,
+                    require_owned=lambda: self.ports._current_rebase_service(context).require_owned(),
+                    capture_snapshot=self.ports.capture_git_snapshot, lookup_pr=self.ports.pr_for_branch,
+                    failed_files=observation.conflict_paths,
+                    failure_reason=f'{saved.occurrence}회 동일 충돌 correction 실패: {detail}')
+                self.ports.state.update_project(self.ports.identity.repo, last_error=
+                    '충돌 복구 실패 파일을 원격 원본으로 복원했습니다. 해당 파일을 재작업하세요: '
+                    + ', '.join(observation.conflict_paths), worker_result=None,
+                    verify_token=None, review_token=None, publication_token=None)
+                return self.ports._recover(RecoveryReason.WORKER_CORRECTION,
+                    '복원된 파일의 요구사항을 다시 구현합니다.', context=context)
             attempts = [
                 {
                     'occurrence': event['occurrence'],
@@ -501,6 +516,14 @@ class RebaseHandler:
         from loop_manager_internal.git import rebase_documents
         if self.ports.checkpoint is None or self.ports.current_rebase_service is None:
             return False
+        current = self.ports.checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
+        pending = (current.snapshot or {}).get('rebase_files')
+        if pending and pending['state'] == 'prepared':
+            return rebase_documents.resolve(context=context, identity=self.ports.identity,
+                checkpoints=self.ports.checkpoint, git=self.ports.git, git_bytes=self.ports.git_bytes,
+                require_owned=lambda: self.ports._current_rebase_service(context).require_owned(),
+                capture_snapshot=self.ports.capture_git_snapshot, lookup_pr=self.ports.pr_for_branch,
+                failed_files=pending['paths'])
         return rebase_documents.resolve(
             context=context, identity=self.ports.identity,
             checkpoints=self.ports.checkpoint, git=self.ports.git,

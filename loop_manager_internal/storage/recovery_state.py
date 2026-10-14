@@ -411,6 +411,41 @@ class RecoveryRepository:
             (repo, self._subject(plan_id)),
         )
 
+    @staticmethod
+    def _retired_git_failure(row):
+        retired = {
+            RecoveryReason.AGENT_SCOPE_VIOLATION.value,
+            RecoveryReason.DEFAULT_WORKTREE_MUTATION.value,
+            RecoveryReason.SHARED_REF_MUTATION.value,
+            RecoveryReason.TURN_DIFF_REF_MUTATION.value,
+            RecoveryReason.OUTSIDE_MANAGED_WORKTREE_MUTATION.value,
+            RecoveryReason.SHARED_GIT_CONFIG_MUTATION.value,
+        }
+        return row is not None and (row['reason_code'] in retired
+            or row['reason_code'] in {RecoveryReason.STATE_UNSAFE.value,
+                                     RecoveryReason.REMOTE_SNAPSHOT_RACE.value}
+            and str(row['detail']).startswith('Agent 범위 선검증 실패:'))
+
+    def has_git_scope_failure(self, repo, plan_id):
+        record = self.row(repo, plan_id)
+        failure = self.connection.execute(
+            'SELECT * FROM persistent_execution_failures WHERE repo = ? AND subject = ? AND active = 1',
+            (repo, self._subject(plan_id))).fetchone()
+        return (self._retired_git_failure(record) and record['pending_action'] != 'reconcile'
+                or self._retired_git_failure(failure))
+
+    def resolve_git_scope_failure(self, repo: str, plan_id: str | None) -> None:
+        """Close retired Git access failures without deleting retry or failure audit."""
+        subject = self._subject(plan_id)
+        saved = self.row(repo, plan_id)
+        if self._retired_git_failure(saved) and saved['pending_action'] != 'reconcile':
+            self._resolve_rebase_failure(repo, subject, saved)
+        failure = self.connection.execute(
+            'SELECT * FROM persistent_execution_failures WHERE repo = ? AND subject = ? AND active = 1',
+            (repo, subject)).fetchone()
+        if self._retired_git_failure(failure):
+            self._resolve_persistent_failure(repo, subject, failure)
+
     def resolve_rebase_evidence_failure(
         self, repo: str, plan_id: str, *, base_revision: str | None,
         worker_session: str | None, released_block_reason: str | None = None,
@@ -491,6 +526,9 @@ class RecoveryRepository:
         ).fetchone()
         if failure is None:
             return
+        self._resolve_persistent_failure(repo, subject, failure)
+
+    def _resolve_persistent_failure(self, repo, subject, failure):
         from loop_manager_internal.notifications import notifications
         notifications.cancel_pending_persistent_execution_failure_event(
             self.connection, repo, subject, int(failure["episode"]),
@@ -501,8 +539,9 @@ class RecoveryRepository:
             "UPDATE persistent_execution_failures SET active = 0, "
             "consecutive_runs = 0, notification_eligible = 0, "
             "notification_queued = 0, updated_at = CURRENT_TIMESTAMP, "
-            "resolved_at = CURRENT_TIMESTAMP WHERE repo = ? AND subject = ?",
-            (repo, subject),
+            "resolved_at = CURRENT_TIMESTAMP WHERE repo = ? AND subject = ? "
+            "AND episode = ? AND phase = ? AND reason_code = ? AND fingerprint = ? AND active = 1",
+            (repo, subject, failure['episode'], failure['phase'], failure['reason_code'], failure['fingerprint']),
         )
 
     def external_run_snapshot(self, repo: str) -> dict[str, int]:

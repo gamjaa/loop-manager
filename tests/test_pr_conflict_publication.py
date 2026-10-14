@@ -12,7 +12,7 @@ from tests.support.worker import dummy_worker_sessions
 @isolated_git_test
 class PrConflictPublicationTest(PrRecoveryFixture, unittest.TestCase):
     @dummy_worker_sessions
-    def test_external_remote_head_change_blocks_without_push(self):
+    def test_external_remote_head_change_enters_normal_recovery(self):
         with tempfile.TemporaryDirectory() as directory:
             (
                 repo,
@@ -49,7 +49,7 @@ class PrConflictPublicationTest(PrRecoveryFixture, unittest.TestCase):
             ), mock.patch(
                 "loop_manager.pr_for_branch", return_value=pull_request
             ), mock.patch(
-                "loop_manager.run_codex"
+                "loop_manager.run_codex", return_value=(1, loop_manager.USAGE_LIMIT_ERROR_PREFIX + " test pause")
             ) as agent, mock.patch(
                 "loop_manager.git", side_effect=recording_git
             ):
@@ -69,14 +69,13 @@ class PrConflictPublicationTest(PrRecoveryFixture, unittest.TestCase):
             ).fetchone()
             self.assertNotEqual(external_head, head_oid)
             self.assertEqual(result, 1)
-            self.assertEqual(stored["phase"], "PROJECT_BLOCKED")
-            self.assertEqual(stored["pr_conflict_recovery"], 0)
-            self.assertIn("head OID", stored["last_error"])
+            self.assertNotEqual(stored["phase"], "PROJECT_BLOCKED")
+            self.assertEqual(stored["pr_conflict_recovery"], 1)
             self.assertEqual(pushes, [])
-            agent.assert_not_called()
+            agent.assert_called()
 
     @dummy_worker_sessions(fixed_guidance=True)
-    def test_lease_competition_blocks_without_overwriting_remote_head(self):
+    def test_lease_competition_reobserves_without_overwriting_remote_head(self):
         with tempfile.TemporaryDirectory() as directory:
             (
                 repo,
@@ -168,7 +167,7 @@ class PrConflictPublicationTest(PrRecoveryFixture, unittest.TestCase):
                 (str(repo),),
             ).fetchone()
             self.assertEqual(
-                outcome.kind, loop_manager.ProjectRunKind.BLOCKED,
+                outcome.kind, loop_manager.ProjectRunKind.TRANSIENT_PAUSE,
                 (outcome.detail, stored["status"],
                  stored["pr_conflict_recovery"], pushes),
             )
@@ -494,7 +493,7 @@ class PrConflictPublicationTest(PrRecoveryFixture, unittest.TestCase):
                     self.assertFalse(worktree.exists())
 
     @dummy_worker_sessions
-    def test_reopened_head_safety_failure_cannot_resume_when_head_is_restored(self):
+    def test_reopened_pr_snapshot_race_retries_and_current_head_resumes(self):
         with tempfile.TemporaryDirectory() as directory:
             repo, state_dir, connection, branch, worktree, url, head = (
                 self._pr_open_state(directory)
@@ -514,44 +513,18 @@ class PrConflictPublicationTest(PrRecoveryFixture, unittest.TestCase):
             ), 1)
 
             with mock.patch("loop_manager.validate_repository", return_value=repo), mock.patch(
-                "loop_manager.run_codex"
+                "loop_manager.run_codex", return_value=(1, loop_manager.USAGE_LIMIT_ERROR_PREFIX + " test pause")
             ) as agent, mock.patch("loop_manager.push_owned_pr_conflict_recovery") as push:
-                # A separate project safety cause permits PR queries, but no
-                # close/reopen transition before a validated catalog boundary.
-                scenarios = (
-                    (base, "OPEN", "PLAN_BLOCKED"),
-                    (head, "CLOSED", "PLAN_BLOCKED"),
-                    (head, "OPEN", "PLAN_BLOCKED"),
-                    (head, "OPEN", "PLAN_BLOCKED"),
-                )
-                for observed, state, expected_status in scenarios:
-                    with mock.patch("loop_manager.pr_for_branch", return_value=
-                                    self._pull_request(
-                                        branch, url, observed, "CONFLICTING", state=state
-                                    )):
-                        result = loop_manager.run_project_result(
-                            connection, state_dir, str(repo), Path("unused.ini"), "main", False
-                        )
-                    self.assertEqual(result.kind, loop_manager.ProjectRunKind.BLOCKED)
-                    stored = connection.execute(
-                        "SELECT * FROM exec_plans "
-                        "WHERE repo = ? AND plan_id = 'G-026'",
-                        (str(repo),),
-                    ).fetchone()
-                    self.assertEqual(stored["status"], expected_status)
-                    self.assertEqual(
-                        stored["blocked_reason"],
-                        loop_manager.PR_CLOSED_BLOCK_REASON
-                        if expected_status == "PLAN_BLOCKED"
-                        else None,
-                    )
-                    self.assertEqual(stored["pr_conflict_head_oid"], head)
-                    self.assertEqual(stored["pr_conflict_recovery"], 1)
-                    blocked_project = connection.execute(
-                        "SELECT phase FROM projects WHERE repo = ?",
-                        (str(repo),),
-                    ).fetchone()
-                    self.assertEqual(blocked_project["phase"], "PROJECT_BLOCKED")
-                    self.assertEqual(git_command(worktree, "rev-parse", "HEAD"), head)
-                agent.assert_not_called()
+                with mock.patch("loop_manager.pr_for_branch", return_value=self._pull_request(
+                        branch, url, base, "CONFLICTING", state="OPEN")):
+                    result = loop_manager.run_project_result(connection, state_dir, str(repo), Path("unused.ini"), "main", False)
+                self.assertEqual(result.kind, loop_manager.ProjectRunKind.TRANSIENT_PAUSE)
+                self.assertIsNone(loop_manager.scoped_blocking.project_block(connection, str(repo)))
+                self.assertEqual(connection.execute("SELECT status FROM exec_plans WHERE plan_id='G-026'").fetchone()[0], 'PLAN_BLOCKED')
+                with mock.patch("loop_manager.pr_for_branch", return_value=self._pull_request(
+                        branch, url, head, "CONFLICTING", state="OPEN")):
+                    result = loop_manager.run_project_result(connection, state_dir, str(repo), Path("unused.ini"), "main", False)
+                self.assertNotEqual(result.kind, loop_manager.ProjectRunKind.BLOCKED)
+                self.assertIsNone(loop_manager.scoped_blocking.project_block(connection, str(repo)))
+                self.assertEqual(git_command(worktree, 'rev-parse', 'HEAD'), head)
                 push.assert_not_called()

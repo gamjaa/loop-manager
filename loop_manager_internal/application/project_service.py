@@ -26,10 +26,12 @@ from loop_manager_internal.runtime.contracts import PROJECT_STEP_RETRY
 from loop_manager_internal.runtime.contracts import PublicationSafetyError
 from loop_manager_internal.runtime.contracts import RuntimeMutation
 from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
+from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
 from loop_manager_internal.storage import execplan_catalog_state
 from loop_manager_internal.storage import execution_checkpoint_state
 from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.storage.recovery_state import RecoveryRepository
 from pathlib import Path
 import sqlite3
 import sys
@@ -156,7 +158,14 @@ class ProjectService:
             steps.append(self._recheck_local_plan_blocks)
         steps.extend((self._resume_existing_execution, self._run_coordinators))
         for step in steps:
-            result = step()
+            try:
+                result = step()
+            except recovery_runtime.RecoveryFailure as error:
+                if error.reason not in recovery_runtime.TRANSIENT | recovery_runtime.RECONCILE:
+                    raise
+                self.effects._record_project_recovery(self.identity.connection, self.state.repo,
+                                                      error.reason, str(error))
+                return ProjectStepResult(PROJECT_STEP_RETRY)
             if result is not None:
                 return ProjectStepResult(result)
         raise AssertionError("execution coordinator must return a project result")
@@ -308,7 +317,13 @@ class ProjectService:
                 (self.state.repo,),
             ).fetchone()
         self.state.validated_agent_scope = None
-        if self.state.row and self.state.row["agent_snapshot"]:
+        saved_scope = bool(self.state.row and self.state.row['agent_snapshot'])
+        if self.state.row and self.state.row['worktree'] and not saved_scope:
+            recovery = RecoveryRepository(self.identity.connection)
+            plan_id = self.effects._plan_id_from_path(str(self.state.row['plan_path'] or ''))
+            saved_scope = (recovery.has_git_scope_failure(self.state.repo, plan_id)
+                           or recovery.has_git_scope_failure(self.state.repo, None))
+        if saved_scope:
             planner_correction = bool(
                 self.state.row["phase"] == "PLANNING" and self.state.row["planning_validation_error"]
             )
@@ -334,8 +349,12 @@ class ProjectService:
                 detail = str(error)
                 scope_result_snapshot = error.result_snapshot
                 scope_reason = error.reason_code
-            except RuntimeError:
-                detail = "저장된 Agent Git 상태를 안전하게 읽을 수 없습니다."
+            except WorkspaceOwnershipError as error:
+                detail = str(error)
+                scope_result_snapshot = None
+                scope_reason = BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN
+            except RuntimeError as error:
+                detail = f"현재 작업 공간을 확인할 수 없습니다: {error}"
                 scope_result_snapshot = None
                 scope_reason = BlockReasonCode.REPOSITORY_STATE_UNSAFE
             else:
@@ -356,9 +375,12 @@ class ProjectService:
                 return 1
             if self.state.validated_agent_scope is not None:
                 if self.state.row["agent_manager_snapshot"]:
-                    self.state.checkpoint_cleanup_candidates |= self.effects.ManagerGitCheckpoint.deserialize(
-                        str(self.state.row["agent_manager_snapshot"])
-                    ).cleanup_worktrees
+                    try:
+                        self.state.checkpoint_cleanup_candidates |= self.effects.ManagerGitCheckpoint.deserialize(
+                            str(self.state.row["agent_manager_snapshot"])
+                        ).cleanup_worktrees
+                    except (ValueError, TypeError, KeyError, RuntimeError):
+                        pass  # Historical audit is not a current operation precondition.
                 self.effects.update_project(
                     self.identity.connection,
                     self.state.repo,
@@ -675,6 +697,19 @@ class ProjectService:
             if pending_result is not None:
                 return pending_result
             existing_pr = self.effects.pr_for_branch(self.state.repo_path, self.state.row["branch"], self.state.row["pr_url"])
+            selected_id = self.effects._plan_id_from_path(str(self.state.row['plan_path'] or ''))
+            if selected_id:
+                from loop_manager_internal.recovery.deleted_branch_restart import current_pr
+                checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(self.identity.connection).get(self.state.repo, selected_id)
+                accepted_pr = current_pr(checkpoint, existing_pr)
+                if (accepted_pr is None and existing_pr and self.state.row['pr_url']
+                        and (checkpoint.snapshot or {}).get('fresh_remote_creation')
+                        and existing_pr.get('headRefName') == self.state.row['branch']
+                        and existing_pr.get('baseRefName') == self.state.row['base_branch']):
+                    runtime_state.RuntimeStateRepository(self.identity.connection).update_project(
+                        self.state.repo, {'pr_url': None, 'pr_head_oid': None})
+                    self.state.row = self.identity.connection.execute('SELECT * FROM projects WHERE repo=?', (self.state.repo,)).fetchone()
+                existing_pr = accepted_pr
             from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
             manual = ManualWorkRepository(self.identity.connection).for_plan(
                 self.state.repo, self.effects._plan_id_from_path(str(self.state.row['plan_path'] or '')))

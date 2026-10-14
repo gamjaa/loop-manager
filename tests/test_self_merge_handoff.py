@@ -16,6 +16,13 @@ from tests.support.worker import dummy_worker_sessions
 
 @isolated_git_test
 class SelfMergeHandoffTest(PrRecoveryFixture, unittest.TestCase):
+    def _pr_open_state(self, directory):
+        values = super()._pr_open_state(directory)
+        repo, _, connection, *_ = values
+        connection.execute('UPDATE projects SET origin=? WHERE repo=?', ('owner/repo', str(repo)))
+        connection.commit()
+        return values
+
     def test_local_sync_status_never_gates_verified_self_merge_handoff(self):
         project = RegisteredProject('/source', 'develop', 'codex', None, False)
         old, remote = 'a' * 40, 'b' * 40

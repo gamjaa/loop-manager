@@ -26,7 +26,7 @@ Loop Manager는 Windows·Linux·macOS에서 동작하는 Python 3 프로그램�
 
 상태의 의미와 허용 정책은 PRODUCT를 기준으로 하며 여기서는 이를 적용·보존하는 방법을 설명한다. 활성 Requirement의 미구현 설계는 구현 예정임을 구분한다.
 
-현행 구조와 활성 변경 요청은 [PRODUCT의 변경 요구사항 절](PRODUCT.md#활성-변경-요구사항과-현재-동작)에서 연결한다. 아래는 Merge된 구조이며 R-055의 정상 Git 변경·legacy 기본 checkout 제외·BLOCKED 현재 입력·게시 분리와 R-082의 Planner 경계 보완은 구현 목표다. 문서 편집만으로 실행 gate나 검증 성공을 바꾸지 않는다.
+현행 구조와 활성 변경 요청은 [PRODUCT의 변경 요구사항 절](PRODUCT.md#활성-변경-요구사항과-현재-동작)에서 연결한다. Agent 접근 권한은 sandbox에서 강제하고 사후 Git 차이를 권한 위반으로 사용하는 guard는 두지 않는다. R-055의 나머지 차단·문서 삭제 목표와 R-082의 Planner 경계 보완은 활성 Requirement에서 구현 범위를 구분한다.
 
 [보관된 R-063](requirements/archive/%5BR-063%5D%20Manager-Owned%20Deterministic%20Work%20and%20Minimal%20Model%20Use.md)은 규칙 기반 처리의 Manager 이관과 모델 호출 축소의 설계 배경이다. 후보 성공 결과 재사용의 변경 요구는 [R-072](requirements/%5BR-072%5D%20%EC%9E%85%EB%A0%A5%20%EB%8F%99%EC%9D%BC%EC%84%B1%EC%9D%B4%20%EC%A6%9D%EB%AA%85%EB%90%9C%20%EA%B5%AC%ED%98%84%20%ED%9B%84%EB%B3%B4%20%EC%84%B1%EA%B3%B5%20%EA%B2%B0%EA%B3%BC%20%EC%9E%AC%EC%82%AC%EC%9A%A9.md)를 따른다. 역할별 입력 동일성의 증거가 없는 경우의 재검증·최신 원격 게시 gate는 유지한다.
 
@@ -174,9 +174,9 @@ due 유지보수의 선택·진행 작업의 비선점 정책은 PRODUCT의 [작
 
 작업·동기화·복구가 관여하는 branch는 등록한 base와 소유권을 확인한 Loop Manager 생성 branch다. 그 밖의 사용자 branch는 생성·수정·삭제를 되돌리거나 자동 복구 대상으로 삼지 않으며, 그 변화만으로 계획·프로젝트를 차단하지 않는다. 이름이 비슷하다는 이유로 관리 branch로 간주하지 않는다. 실제 사용 중인 origin·관리 branch·worktree 등 공유 자원의 안전 검사는 유지한다.
 
-Scope snapshot과 격리 증거는 원문 그대로 보존하고, 비교할 때만 기본 checkout과 로컬 base branch를 양쪽에서 제외한다. 이 투영은 legacy·불완전 invocation에도 적용하지만 나머지 공유 ref·worktree·config는 엄격히 비교하며 격리 성공을 합성하지 않는다. 사용 중인 `origin/<base>`의 정상 전진은 설정된 `origin`에서 같은 branch OID, ancestry, live tracking ref를 확인하고 `origin/HEAD`가 같은 target을 가리킬 때만 snapshot 비교 기준에 반영한다. 최초 `origin/HEAD` 생성도 실제 원격 symbolic HEAD와 target을 확인한다. 원문 snapshot과 Manager 전이 receipt는 그대로 둔다.
+Agent snapshot과 격리 ledger는 원문을 감사로 보존한다. 공유 ref·config·다른 worktree 변화나 과거 실행·격리 기록의 부재는 접근 권한 판정 또는 재개 조건으로 사용하지 않는다. Manager의 현재 작업 대상 연결과 Git 쓰기의 충돌·보존·lease 조건은 실제 동작 경계에서 검증한다.
 
-Agent preflight는 현재 호출의 역할·단계·작업 branch·worktree에서 사용되는 자원으로 Git snapshot digest를 계산하며, 저장된 owner 정보를 찾지 못하면 전체 snapshot 비교를 유지한다. 선택 원격 base의 변화는 일반 scope 검사와 같은 원격·ancestry·live ref 확인을 통과한 경우에만 digest 기준선에 반영한다. Worker의 post-call 검증과 일반 verify는 각각 `IMPLEMENTING`·`VERIFYING` 자원 집합을 명시해 Agent ledger가 없는 경우에도 현재 작업 scope를 사용한다. BLOCKED 재평가는 저장된 Agent 결과를 먼저 원래 증거로 검증한다. 이후 repository·계획·worktree·branch identity와 현재 branch ref 등록을 확인한 선택 worktree의 파일·index·HEAD만 새 사용자 입력으로 기준선에 반영한다. 기준 snapshot·결과·session은 수정하지 않으며, 보안 index flag·미완료 Git operation·소유권 불일치와 격리 증거가 없는 legacy 비교의 비선택 공유 자원 변경은 계속 검사한다.
+Agent preflight의 digest는 현재 역할·canonical worktree·repository·작업 identity에 결합한다. mutable Git snapshot을 digest에 넣거나 과거 OID와 일치시키지 않으며, provider가 실제 적용한 sandbox 정책과 설정 identity는 호출·재개·fallback마다 확인한다. 저장된 시작·결과 snapshot은 역할별 결과 유효성과 성공 후보의 재사용 근거로만 사용한다. 현재 후보가 바뀌면 이전 verify·Review·게시 token을 무효화하고 필요한 단계부터 수행한다.
 
 ### 기본 worktree 동기화
 
@@ -247,13 +247,13 @@ planning worktree는 `<state-dir>/worktrees/<project-id>/planning/<input-fingerp
 
 원격 관측은 Agent·verify가 worktree를 사용하는 동안 파일을 바꾸지 않는다. 일반·유지보수 Planner의 작성 결과는 writer 종료 직후, 결과 검증 전에 원격 base를 다시 확인하고 기존 workspace 갱신·문서 관련성 판단·rebase journal을 적용한다. 관련 명세·ExecPlan 변경은 결과를 확정하지 않고 pending 상태로 보존해 같은 ID·작업물·session의 Planner 재평가로 돌린다. 이전 결과의 검증 교정 횟수는 최신 입력에 합산하지 않으며, 그 결과의 진단과 독립 오류·실행 이력은 보존한다. 무관한 변경은 저장 결과와 다음 단계를 유지하며 검증·재시도를 반복하지 않는다. 충돌 교정은 시작된 rebase/stash journal의 원래 target과 소유권으로 완료하고 base·작업물·journal을 확정한 뒤 원격을 다시 확인한다. 그 사이 새 base가 전진했으면 추가 rebase나 다음 Planner 판단·결과 검증을 겹치지 않고 기존 operation 완료를 보존해 다음 안전한 workspace 경계에서 최신 target을 적용한다. 원격 관측·rebase 성공은 의미 검토나 검증 성공 근거가 아니다. 현재 작업의 문서 반영은 아래 경계를 따른다. 후보 HEAD가 바뀐 실행은 기존 검증·Review 증거의 재사용 자격을 다시 판단하며 게시 직전의 fast-forward·lease·PR·checkpoint 정책을 유지한다.
 
-Planning rebase 교정 journal은 Agent scope를 통과한 계획·`FUTURE_IDEAS.md` 경로와 Manager가 복원한 `docs/maintenance/code-map.jsonl`을 구분한다. 코드맵은 기존 SQLite receipt와 충돌 원본의 bytes/hash를 대조해 관리 worktree에 복원한 경우에만 저장·재조회할 수 있고 Agent prompt·scope에는 포함하지 않는다. `cycle_revision`·`source_revision`·`artifact_hash` receipt identity는 교정 digest에 결합한다. stash 확정 journal의 `accepting` 재개도 현재 bytes와 receipt identity를 대조하며, receipt가 달라지면 base 채택·stash/journal 정리를 중단하고 기록과 작업물을 보존한다. journal은 기존 target·HEAD·digest 검증을 그대로 적용한다.
+Planning rebase 교정 journal은 역할 결과 검증을 통과한 계획·`FUTURE_IDEAS.md` 경로와 Manager가 복원한 `docs/maintenance/code-map.jsonl`을 구분한다. 코드맵은 기존 SQLite receipt와 충돌 원본의 bytes/hash를 대조해 관리 worktree에 복원한 경우에만 저장·재조회할 수 있고 Agent prompt·결과 허용 경로에는 포함하지 않는다. `cycle_revision`·`source_revision`·`artifact_hash` receipt identity는 교정 digest에 결합한다. stash 확정 journal의 `accepting` 재개도 현재 bytes와 receipt identity를 대조하며, receipt가 달라지면 base 채택·stash/journal 정리를 중단하고 기록과 작업물을 보존한다. journal은 기존 target·HEAD·digest 검증을 그대로 적용한다.
 
 ### 단계별 원격 문서 반영
 
 Worker·Manager verify·Reviewer의 진입·교정·재개 전에 최신 원본과 작업 branch를 확인한다. 현재 ExecPlan·연결 Requirement·적용 PRODUCT·ARCHITECTURE의 변경 경로를 먼저 좁히고, 실제 관련성과 현재 구현의 부족은 현재 worktree를 읽기 전용으로 대조하는 일반 Planner가 판단한다. 무관한 문서·순수 revision 전진만으로 Worker를 반복하지 않는다. 코드 전용 점검 Planner와 유지보수 대상의 미착수 제한은 그대로다.
 
-문서 반영의 이전 선언·발견 단계·과거 Worker/verify 근거·영향 판단·개정 게시 후보는 해당 ExecPlan의 execution checkpoint에 보존한다. 원격 작업 branch의 문서 관측은 기존 채택 권한을 부여하지 않는다. 기존 소유권·원격 OID 검사를 통과한 채택 뒤에만 해당 branch 문서를 입력으로 반영한다. 이 상태는 rebase·교정의 checkpoint 교체에서도 보존하며 다른 작업이나 일반 planning 상태를 덮어쓰지 않는다.
+문서 반영의 이전 선언·발견 단계·과거 Worker/verify 근거·영향 판단·개정 게시 후보는 해당 ExecPlan의 execution checkpoint에 보존한다. 원격 작업 branch의 문서는 단순 관측 OID만으로 통합 완료나 검증 성공을 만들지 않는다. 현재 작업 대상·입력 유효성·작업물 보존을 확인해 실제 수용한 뒤 해당 문서를 입력으로 반영한다. 이 상태는 rebase·교정의 checkpoint 교체에서도 보존하며 다른 작업이나 일반 planning 상태를 덮어쓰지 않는다.
 
 Planner의 단일 현재 계획 수정안은 Manager가 `<state-dir>/worktrees/<project-id>/document-revisions/<execplan-id>/<base-sha>/`의 소유 detached worktree에서 구조·source·dependency·기존 ID·경로를 검증한다. 실행 중 구현 worktree는 수정하지 않는다. 게시 후보·원본 snapshot을 먼저 저장하고 현재 원격 base·실행 근거·실제 PR 부재·허용 diff를 재확인한 뒤 base에 fast-forward 게시한다. push 뒤 중단은 현재 원격 내용과 저장 후보를 확인해 같은 결과를 재사용하며, 반영을 끝낸 작업 branch에서 필요한 단계로 돌아간다. PR 출현·후속 원격 변경·소유권 불확실에서는 작업물을 보존한다.
 
@@ -310,14 +310,14 @@ planning batch의 원격 게시·catalog 반영과 현재 원격 입력 일치�
 - Planner는 PRODUCT, 활성 Requirement, ARCHITECTURE, 관련 코드·테스트, 비종료 ExecPlan compact catalog와 프로그램이 제공한 PR 전 계획 snapshot을 읽고 현재 식별 가능한 미충족 작업 전체를 한 계획 주기에 반영하며, 범위 밖의 보존 가치가 있는 아이디어는 `docs/FUTURE_IDEAS.md`에 분리한다
 - Planner는 MERGED ExecPlan 메타데이터와 본문을 기본 입력으로 받거나 읽지 않는다. 프로그램만 ID 고유성, 번호 할당, 의존성 충족과 감사 이력을 위해 이를 유지한다
 - Planner는 안전한 무인 실행 차단과 반복적인 사용자 복구 제거를 최우선으로 priority를 정하고, 정상 경로 자동화, 그 밖의 Current Goal, 선택적 편의와 최적화 순으로 계획한다
-- Planner는 새 `docs/plans/*.md`를 생성하고 `docs/FUTURE_IDEAS.md`를 생성하거나 수정할 수 있다. 프로그램의 PR 전 snapshot 안의 계획만 같은 ID로 개정하며, 시작한 계획의 경로·기존 수행 기록을 보존한다. rename·삭제는 미착수 계획에만 허용한다. snapshot 밖·PR 등록·MERGED·archive 계획과 그 밖의 파일은 변경할 수 없다. 단계별 문서 판단의 수정안은 읽기 전용 결과로 반환하고 Manager가 게시를 검증한다. 프로그램은 Agent 실행 전후 diff와 SQLite snapshot으로 범위를 검증한다
+- Planner는 새 `docs/plans/*.md`를 생성하고 `docs/FUTURE_IDEAS.md`를 생성하거나 수정할 수 있다. 프로그램의 PR 전 snapshot 안의 계획만 같은 ID로 개정하며, 시작한 계획의 경로·기존 수행 기록을 보존한다. rename·삭제는 미착수 계획에만 허용한다. snapshot 밖·PR 등록·MERGED·archive 계획과 그 밖의 파일은 변경할 수 없다. 단계별 문서 판단의 수정안은 읽기 전용 결과로 반환하고 Manager가 게시를 검증한다. 프로그램은 최종 게시 diff와 SQLite 계획 snapshot으로 문서 결과를 검증한다
 - Worker는 ExecPlan·관련 unit test·verify 스크립트를 구현한다. Requirement·ExecPlan 구현으로 바뀌는 제품 동작·장기 규칙은 PRODUCT에, 설계·책임 경계·계약은 ARCHITECTURE에 같은 변경에서 반영하며 문서 경로만으로 설계 수정을 거부하지 않는다. 현재 구현에 필요한 대응표·구현 기록은 다른 기존 ExecPlan에도 갱신할 수 있다. 다른 계획의 목표를 구현하거나 상태를 문서에 기록하지 않는다. 범위 밖 아이디어는 FUTURE_IDEAS에 기록한다
 - Worker 문서 scope는 활성 Requirement의 직접 Markdown 경로와 PRODUCT·ARCHITECTURE·기존 ExecPlan·지침·사용 안내를 일반 작업 파일로 허용한다. archive의 기존 보호와 docs/PLANS.md의 게시된 계획 명시 조건은 유지한다. scope의 경로 허용은 목표 관련성이나 사용자 판단을 승인하지 않는다. 기존 ExecPlan은 파일이 삭제돼도 시작 index와 Git 원본으로 확인하며 결정·실행 기록을 파일째 제거하는 변경을 거부한다. 원본과 수정본을 대조해 draft 해제와 User Decision 변경·삭제를 거부한다
 - documents/pr_description.py는 기존 실행 지침 보고 경계와 publication 호출을 재사용해 최종 base/head의 name-status와 문서별 patch를 검증한다. docs 아래 파일 및 저장소 Markdown·RST·TXT 문서는 rename의 양쪽 경로까지 식별한다. Worker Summary의 DOCUMENT_CHANGE에 최종 경로·변경 요약·이유·영향과 UTF-8 문서 patch의 SHA-256을 결합하되, PR 문서 보고에는 파일명·변경 요약·이유·영향만 렌더링한다. 실제 변경 내용·patch·diff 링크·검증용 hash는 렌더링하지 않는다. 최종 diff에 없는 경로·누락·patch 불일치는 일반 Summary로 대체하지 않고 기존 WORKER_CORRECTION으로 현재 후보의 설명을 보완한다. 새로운 PR과 기존 PR 갱신 모두 불완전한 보고를 게시하지 않는다. 열린 PR은 확인된 head에서 Manager 소유 보고만 교체·제거하며 사용자 본문·immutable ExecPlan/source 링크·Purpose를 보존한다
 - Worker는 수정한 코드와 새로 작성하거나 변경한 테스트를 직접 검증하는 최소 범위의 targeted unit test만 실행한다. 실패하면 같은 세션에서 수정하고 해당 테스트를 다시 실행하며, 실행 가능한 관련 unit test가 없으면 그 사유를 결과에 포함한다
 - Worker는 전체 test suite, integration test, end-to-end test, 프로젝트 전체 lint·build·type check와 전체 검증 스크립트를 직접 실행하지 않는다
 - Reviewer는 기본 경로에서 Worker의 targeted unit test와 프로그램의 전체 verify가 통과한 뒤 실행된다. 일반 선행 경로에서는 현재 후보의 Manager 부분 verify 뒤 실행되며 테스트 command나 verify 스크립트를 다시 실행하지 않는다. 파일을 수정하지 않고 코드, 테스트, verify 스크립트의 diff와 전달된 결과를 읽어 요구사항 충족, 회귀, 테스트 누락과 verify 약화를 포함한 blocking issue를 확인한다
-- 프로그램은 각 Agent 실행 전후 diff를 검사한다. Planner의 범위 위반은 `planning_error` 흐름으로 처리하고, Worker 또는 Reviewer의 범위 위반은 해당 ExecPlan을 BLOCKED로 처리한다
+- 프로그램은 Planner·Worker의 최종 변경을 역할별 게시 경로·문서·결과 계약으로 검증한다. readonly 역할의 접근은 sandbox가 제한하며 외부 파일·Git 변화의 사후 귀속 검사를 수행하지 않는다. 잘못된 Planner 결과는 planning 오류로, 잘못된 Worker 결과는 WORKER_OUTPUT_INVALID로 처리하고 Git 접근 위반 진단과 구분한다
 - Worker와 Reviewer는 ExecPlan이 PR 생성 준비를 마칠 때까지 각자의 세션을 재사용한다
 - 세션을 재개할 수 없으면 같은 worktree, ExecPlan과 저장된 실패 내용을 전달해 새 세션을 시작한다
 - 상태 분류, 설정 검증, Git/GitHub 명령과 verify 실행은 프로그램 코드가 담당한다
@@ -373,7 +373,7 @@ provider adapter는 실제 호출 직전에 선택된 canonical worktree, Git wo
 
 격리 정책 작성과 유효 정책 확인은 provider 호출 경계의 독립 책임으로 두고, 기존 Agent invocation·session·snapshot 저장과 연결한다. SQLite에는 호환 가능한 추가 저장만 사용하며, 개별 호출마다 provider, CLI 버전, 실행 환경, 역할, canonical worktree, repository identity, 요청 정책과 적용 source·병합 후 유효 정책의 지문, session/호출 identity와 확인·거부 결과를 보존한다. 실행 중 정책 충돌·제한 적용 실패가 확인되면 해당 호출을 중단하고 변경 전후 정책과 실패 근거를 보존한다. 공식 문서 조사·모의 검증·실제 호출 관측의 근거를 구분하며, 증거 저장이나 확인이 실패하면 검증된 실행으로 취급하지 않는다. 재개·provider 전환·설정 변경·중단 뒤에는 이전 증거를 새 호출의 증거로 재사용하지 않는다. 비밀값, 인증 자료와 source checkout의 로컬 파일 내용은 저장하지 않는다.
 
-단순 CLI 옵션, cwd 지정, 자동 검토의 승인 또는 사후 Git diff만으로 호출 전 격리를 증명하지 않는다. 실제 적용되는 정책과 허용 경로 쓰기·금지 경로 쓰기 거부를 확인하며, source checkout의 로컬 상태를 바꾸지 않고 증명해야 한다. Codex 확인은 Agent의 파일 변경·도구 실행에 적용되는 내장 정책을 대상으로 한다. 설치 CLI의 공식 지원 설정, 병합 우선순위와 역할별 실제 허용·거부 동작을 확인하며, exec JSONL에 유효 정책 전용 필드가 없다는 이유로 transport를 바꾸거나 바깥 wrapper를 추가하지 않는다. Codex 프로세스 전체의 mount·내부 쓰기 및 중첩 도구 실행 성공은 증명 조건이 아니다. 정상 인증·session·로그 저장과 PRODUCT의 `refs/codex/turn-diffs/*` 예외는 구분하며 그 밖의 Git·Agent 쓰기 권한은 확대하지 않는다. Claude도 같은 확인 수준을 적용한다. 공식 정책의 지원 조건·설정 병합·resolved Git 경로와 파일 도구 권한을 대조하고 신규·재개·fallback의 호출 구성을 모의 테스트로 검증한다. 계정이 필요한 모델 호출이나 금지 쓰기·자동 검토의 실시간 시연을 호출 전 필수 probe로 추가하지 않는다. 정책 검토·모의 테스트와 실제 호출 검증의 근거를 구분해 저장하고, 실제 호출에서 관측한 미지원·정책 충돌·초기화 실패는 해당 Claude 작업에만 반영한다. Claude의 개발 환경 부재나 선택 프로젝트의 인증 실패 때문에 독립 Codex 작업을 막거나 다른 provider로 임의 전환하지 않는다. 신규 호출에서 요구 정책을 적용·확인할 수 없거나 기존 허용 작업과 양립하지 않으면 원인과 기존 작업물·session을 보존한 채 중단한다. 현행 legacy 감시와 R-055·G-199의 기본 checkout 제외 목표는 아래 실행별 범위 절에서 구분한다. Loop Manager의 Worker 이후 Reviewer 검토는 provider의 실행 전 자동 승인 검토와 별도로 유지한다.
+단순 CLI 옵션, cwd 지정, 자동 검토의 승인 또는 사후 Git diff만으로 호출 전 격리를 증명하지 않는다. 실제 적용되는 정책과 허용 경로 쓰기·금지 경로 쓰기 거부를 확인하며, source checkout의 로컬 상태를 바꾸지 않고 증명해야 한다. Codex 확인은 Agent의 파일 변경·도구 실행에 적용되는 내장 정책을 대상으로 한다. 설치 CLI의 공식 지원 설정, 병합 우선순위와 역할별 실제 허용·거부 동작을 확인하며, exec JSONL에 유효 정책 전용 필드가 없다는 이유로 transport를 바꾸거나 바깥 wrapper를 추가하지 않는다. Codex 프로세스 전체의 mount·내부 쓰기 및 중첩 도구 실행 성공은 증명 조건이 아니다. 정상 인증·session·로그 저장과 PRODUCT의 `refs/codex/turn-diffs/*` 예외는 구분하며 그 밖의 Git·Agent 쓰기 권한은 확대하지 않는다. Claude도 같은 확인 수준을 적용한다. 공식 정책의 지원 조건·설정 병합·resolved Git 경로와 파일 도구 권한을 대조하고 신규·재개·fallback의 호출 구성을 모의 테스트로 검증한다. 계정이 필요한 모델 호출이나 금지 쓰기·자동 검토의 실시간 시연을 호출 전 필수 probe로 추가하지 않는다. 정책 검토·모의 테스트와 실제 호출 검증의 근거를 구분해 저장하고, 실제 호출에서 관측한 미지원·정책 충돌·초기화 실패는 해당 Claude 작업에만 반영한다. Claude의 개발 환경 부재나 선택 프로젝트의 인증 실패 때문에 독립 Codex 작업을 막거나 다른 provider로 임의 전환하지 않는다. 신규 호출에서 요구 정책을 적용·확인할 수 없거나 기존 허용 작업과 양립하지 않으면 원인과 기존 작업물·session을 보존한 채 중단한다. 과거 Git 감시 기록은 감사로 보존하며 현재 권한 판정에는 사용하지 않는다. Loop Manager의 Worker 이후 Reviewer 검토는 provider의 실행 전 자동 승인 검토와 별도로 유지한다.
 
 Reviewer의 `read-only`는 workspace 파일 쓰기를 제한한다. 검색·diff·기존 결과 읽기에 필요한 명령은 내장 sandbox 안에서 실행할 수 있다. 테스트 command와 verify를 재실행하지 않는 규칙은 고정된 common+Reviewer 역할 instruction에 유지하며, 쓰기 없는 테스트도 역할상 실행하지 않는다. Worker의 targeted test 결과와 Manager의 전체 verify 결과를 작업별 prompt로 전달하는 기존 흐름을 유지하고, read-only 정책이 테스트 명령을 모두 차단한다고 취급하지 않는다.
 
@@ -436,19 +436,19 @@ definition snapshot에는 원래 ExecPlan 전문과 전체 body hash를 함께 �
 
 rebase 채택의 한 검사 구간에서는 `ManagedRebaseService.adopt`가 안정된 이중 관측을 읽기 전용 소유권 소비자에 전달한다. 소비자는 전체 `RebaseExpectation`과 checkpoint generation이 일치할 때만 이를 사용하고 게시 owner를 별도로 검증한다. SQLite 확정에서는 새 이중 관측으로 다시 확인하며 Git·Agent·verify·게시 및 재시작 경계를 넘어 전달 결과를 저장하지 않는다. 최초 검사·소유권 소비·확정 재검증은 각각 `rebase:adoption_inspect`·`rebase:adoption_owner`·`rebase:adoption_confirm`으로 계측한다.
 
-PR 없는 동일 계획의 기존 원격 작업 branch를 관리 rebase한 경우, 현재 repository·계획·worktree·branch·HEAD·ref·등록·target base ancestry·index·operation·허용 변경과 마지막 채택 원격 OID를 확인한 뒤 완료 HEAD를 중간 checkpoint로 게시한다. 다음 Worker·전체 verify·Review·추가 base rebase보다 먼저 게시 또는 안전한 거부를 확정하며 base가 다시 전진해도 완료된 결과를 먼저 처리한다. 기존 PR·신규 원격 branch·다른 계획의 branch는 이 경로로 게시하지 않는다
+동일 계획의 기존 원격 작업 branch를 관리 rebase한 경우, 현재 repository·계획·worktree·branch·HEAD·등록·target base·index·operation·입력과 연결 PR을 확인한 뒤 완료 HEAD의 중간 checkpoint 게시 또는 현재 lease에 따른 보류를 확정한다. 기존 PR도 같은 URL·head/base branch를 유지하며 이 경로를 사용할 수 있다. 원격 입력이 바뀌면 이전 intent를 성공 없이 감사로 보존하고 통합·재검증으로 돌아간다. 신규 원격 branch·다른 계획의 branch는 기존 게시 intent로 갱신하지 않는다.
 
-중간 게시 intent는 정확한 기대 원격 OID와 후보 HEAD, 현재 상태 수용 identity·지문을 SQLite에 보존한다. 게시 직전 실제 ref와 PR 부재를 다시 확인하고 정확한 OID를 명시한 `--force-with-lease`로 같은 ref만 갱신한다. 원격 삭제·재작성·후속 commit·PR 출현·권한 또는 보호 정책 거부에서는 기존 ref와 작업물을 보존하며 lease를 새로 추정하지 않는다
+중간 게시 intent는 정확한 기대 원격 OID와 후보 HEAD, 현재 상태 수용 identity·지문을 SQLite에 보존한다. 게시 직전 실제 ref와 연결 PR의 identity·head를 다시 확인하고 정확한 OID를 명시한 `--force-with-lease`로 같은 ref만 갱신한다. 새로운 원격 입력은 재관측·통합·재검증 대상으로 처리하고, 삭제·다른 대상·실제 권한 또는 보호 정책 거부는 해당 작업이나 쓰기를 보류한다. 원격 변화를 이전 intent의 새 lease로 끼워 넣지 않는다.
 
 push 전후 및 SQLite 반영 전 중단에서는 같은 intent와 실제 원격 OID·현재 소유 상태를 재대조한다. 원격이 이미 후보 HEAD면 push·commit을 반복하지 않고 완료 기록과 마지막 채택 원격 OID를 한 transaction으로 갱신한다. 일시적 실패는 같은 intent로 재개하며 미게시 rebase가 여러 개 쌓인 경우도 과거 journal·receipt·commit별 replay 연쇄 없이 동일한 현재 상태 판정을 사용한다. 중간 게시는 구현 완료·차단 해제·검증 성공·PR head 승인이 아니며 최종 후보의 Worker 확인·targeted test·전체 verify·Review·PR gate를 유지한다
 
-PR 없는 게시 checkpoint의 원격 OID가 rebased HEAD의 조상이 아니어도 동일 계획의 게시 identity·마지막 채택 원격 OID·현재 branch/worktree·target·허용 최종 변경이 일치하면 소유권을 유지한다. 원격 후속 commit·삭제·재작성과 PR head 변경은 수용하지 않으며 journal/replay 완전성을 ownership 조건으로 다시 요구하지 않는다
+`work_branch_integration.synchronize`는 현재 등록 origin의 fetch/push URL, 작업·worktree·ref·연결 PR을 확인하고 정확한 원격 commit을 받아온다. 로컬·원격의 차이와 현재 Git operation을 분리하며, 필요한 통합은 기존 baseline tree와 보존 commit·현재 관리 rebase 경로를 사용한다. `accepted_work_branch`는 읽고 확인한 입력이며 게시 성공 receipt가 아니다. 같은 입력은 다시 통합하지 않고 실제 Git 쓰기 직전 대상·후보·원격 lease를 재확인한다.
 
-rebase로 후보 HEAD 또는 ExecPlan·근거 입력이 바뀌면 전체 verify·Review·publication 증거를 무효화해 입력을 다시 판단한다. 위의 정상 호출에서 증명된 clean rebase는 Worker 결과를 보존하며, 그 밖의 수용은 기존 또는 정상 fallback Worker 세션이 현재 입력과 최종 diff를 재확인하고 관련 targeted test 결과를 반환한다. 같은 확인 후보에서는 Worker를 반복 호출하지 않는다. 수용 자체는 구현 완료·게시 승인·차단 해제가 아니며 중간 checkpoint 게시도 최종 성공을 대신하지 않는다.
+rebase나 사용자 입력으로 후보 HEAD가 바뀌면 후보에 결합된 verify·Review·publication 근거를 다시 판단한다. 구현 목표의 Worker 입력 token이 유효한 OID 변화는 필요한 verify·Review로 이어가며 Worker 재실행을 강제하지 않는다. 필요한 검증 단계의 후보 기준선을 저장해 같은 차이로 단계 무효화를 반복하지 않는다. 명세·목표 변화나 실제 구현 부족은 기존 문서 영향 판단·Worker 교정 경로가 처리한다.
 
-현재 결과는 선택 branch/worktree의 비교 기준선에만 반영한다. Agent 원본 snapshot·session·허용 범위와 과거 감사를 보존하고 수동 복구를 Manager 실행·Agent 격리 증거로 표시하지 않는다. 실제 Agent 범위 위반, 다른 Manager Git 작업의 증거와 별도 Review·사용자 결정·planning 차단은 기존 경계를 유지한다
+현재 결과는 선택 branch/worktree의 비교 기준선에만 반영한다. Agent 원본 snapshot·session·허용 범위와 과거 감사를 보존하고 수동 복구를 Manager 실행·Agent 격리 증거로 표시하지 않는다. 실제 sandbox 정책 오류, 다른 Manager Git 작업의 증거와 별도 Review·사용자 결정·planning 차단은 기존 경계를 유지한다
 
-저장된 rebase 충돌·완료·소유권 오탐 차단은 실제 원인과 대상 계획의 rebase를 연결하고 현재 Git 상태, checkpoint, 원격 branch·PR 소유권 및 허용 최종 변경을 다시 확인한 경우에만 해당 원인을 해제한다. 과거 작업 기록이나 세션 일치는 해제 조건이 아니다. 다른 Review·사용자 결정·Agent 범위·planning 원인과 실패·알림 감사는 보존한다. 해제 후 후보 revision에 필요한 Worker 확인, targeted test, 전체 verify와 Review를 다시 수행하며 게시 직전 최신 원격 lease를 확인한다
+저장된 rebase 충돌·완료·소유권 오탐 차단은 실제 원인과 대상 계획의 rebase를 연결하고 현재 Git 상태, checkpoint, 원격 branch·PR 소유권 및 허용 최종 변경을 다시 확인한 경우에만 해당 원인을 해제한다. 과거 작업 기록이나 세션 일치는 해제 조건이 아니다. 다른 Review·사용자 결정·sandbox·planning 원인과 실패·알림 감사는 보존한다. 해제 후 후보 revision에 필요한 Worker 확인, targeted test, 전체 verify와 Review를 다시 수행하며 게시 직전 최신 원격 lease를 확인한다
 
 ### 차단 작업의 원격 반영과 보존
 
@@ -458,26 +458,28 @@ rebase로 후보 HEAD 또는 ExecPlan·근거 입력이 바뀌면 전체 verify�
 3. 같은 소유 branch의 원격이 없으면 정확한 부재 lease로 생성하고, 저장된 expected OID의 정확한 lease에 결합된 fast-forward만 갱신한다. fast-forward가 아닌 갱신은 PR 없는 동일 소유 branch의 검증된 관리 rebase에만 허용하며 예상하지 못한 원격 commit, branch protection과 권한 거부를 우회하지 않는다
 4. commit·push phase와 local/remote OID를 저장해 중단 후 같은 checkpoint를 재개하고, 일시적 push 실패는 실행당 제한 횟수만 재시도한 뒤 local commit과 worktree를 보존한다. checkpoint 결과와 무관하게 ExecPlan은 `PLAN_BLOCKED`로 남고 독립 READY 선택 자리를 점유하지 않는다
 5. `planning_error`, 등록·branch 생성 전 실패, 기존 PR 또는 현재 대상 작업의 소유권·범위를 증명할 수 없는 차단에는 원격 쓰기를 수행하지 않고 미게시 이유를 저장한다. `PROJECT_BLOCKED`에서는 검증 가능한 대상 계획의 복구·보존만 15번의 경계에서 허용한다. 차단 알림은 checkpoint 결과 확정 뒤 성공 시 commit OID와 immutable branch link를, 미게시 시 local-only 이유를 포함한다
-6. 계획별 입력 변경, 사용자 결정 또는 닫힌 PR reopen 조건은 해당 `PLAN_BLOCKED`만 재평가한다. PR 없는 게시 checkpoint의 저장된 원격 branch가 달라지면 게시 OID와 마지막 채택 head를 포함하는 후속 commit인지 확인한다. 계획·branch·worktree·저장소 소유권, 로컬 HEAD·index·작업 파일·ignored 경로·Git operation 및 허용 변경 범위를 검증한 뒤 로컬 작업을 보존할 수 있을 때만 같은 branch를 fast-forward한다. 삭제·재작성·분기·소유권 불명확·충돌은 구체적인 이유로 계속 차단한다. 새 OID만으로 해제하지 않고 실제 변경과 원인별 조건을 재평가하며, 해결된 사용자 commit은 Worker 검토와 targeted test, 전체 verify, Review를 다시 거친다. 해결되지 않은 검사 결과는 원격 head와 함께 저장해 동일 입력의 반복 시도와 알림을 막는다. 게시 증거가 없는 legacy checkpoint와 닫힌 PR에는 이 경로를 적용하지 않는다
+6. 계획별 입력 변경, 사용자 결정 또는 닫힌 PR reopen 조건은 해당 `PLAN_BLOCKED`만 재평가한다. 작업 branch의 저장 OID나 receipt가 현재 원격과 달라도 현재 계획·branch·worktree·등록 origin·PR과 Git operation, 작업물·ignored 경로의 보존 조건을 확인해 새 입력을 수용한다. 로컬·원격의 추가 작업과 확인 가능한 관련 재작성은 양쪽 작업을 보존·통합하고 최신 base를 반영한다. 단순 OID 변경으로 원인을 해제하거나 과거 성공을 재사용하지 않고 실제 변경과 원인별 조건을 재평가한다. 필요한 verify·Review를 수행하며 실제 구현 입력 변경·부족만 Worker 교정으로 처리한다. 같은 입력의 검사·알림을 반복하지 않고 별도 사용자 결정·PR reopen·실제 대상 또는 보존 문제는 유지한다.
 7. 해제 조건이 충족된 계획은 기존 branch와 worktree에서 재개하고 재시도 횟수와 verify·Review 실패 지문 이력을 초기화하며 effective Worker level과 승격 이력을 최초 level로 되돌린 뒤 READY 또는 PR_OPEN으로 변경한다. 같은 branch의 최초 PR은 최종 verify와 Review 성공 뒤에만 생성한다
 8. `PROJECT_BLOCKED`는 기본 worktree, 허용되지 않은 공유 ref, 외부 worktree와 workspace 소유권을 다시 검증해 프로젝트 안전이 증명된 경우에만 해제한다. `refs/codex/turn-diffs/*`의 순변경은 해제 조건을 무효화하지 않는다
 9. 프로젝트 차단이 해제돼도 별도 계획 원인이 남은 ExecPlan은 `PLAN_BLOCKED`를 유지하며, 다른 차단 계획의 fingerprint와 작업 공간은 변경하지 않는다
 10. 저장된 `managed_worktree_conflict`와 계획에 연결된 rebase 완료·소유권 오탐은 같은 현재 상태 서비스로 재평가한다. 특정 구형 오류 문구, 과거 Worker 세션·교정 turn·stage 승인·receipt·journal 완전성이나 입력 변경 지문 부재만으로 복구를 거부하지 않는다. 저장 원인을 해당 계획의 rebase intent와 연결할 수 없으면 차단을 유지한다
 11. 현재 repository·reservation·등록 worktree·소유 branch·target base·원격 기대값과 rebase metadata가 일치하면 일반 branch 검사 전에 detached rebase를 인식하고 충돌·사용자 stage를 보존한 채 같은 실행을 재개한다. 이미 완료됐으면 Git 단계를 반복하지 않고 결과를 채택한다. 관측을 transaction 안에서 다시 확인하고 대상 원인 해제와 후보 검증 무효화를 함께 기록한다. 다른 활성 실행·planning 또는 미충족 dependency가 있으면 투영·session·진단을 바꾸지 않고 대기한다
-12. rebase 원인 해제는 별도 Review 실패·사용자 결정·PR reopen·실제 Agent 범위 위반과 다른 계획·planning·프로젝트 안전 원인을 해제하지 않는다. 원문·실패·알림 감사와 기존 branch·worktree·session을 보존하며 변경된 후보는 Worker의 현재 입력·최종 diff 확인과 targeted test, Manager 전체 verify, Reviewer 및 기존 게시 ownership·lease·PR identity 조건을 다시 통과해야 한다
+12. rebase 원인 해제는 별도 Review 실패·사용자 결정·PR reopen·실제 sandbox 정책 오류과 다른 계획·planning·프로젝트 안전 원인을 해제하지 않는다. 원문·실패·알림 감사와 기존 branch·worktree·session을 보존하며 변경된 후보는 Worker의 현재 입력·최종 diff 확인과 targeted test, Manager 전체 verify, Reviewer 및 기존 게시 ownership·lease·PR identity 조건을 다시 통과해야 한다
 13. 교정 소진으로 차단된 진행 중 rebase는 저장된 실제 차단 기준선과 현재 입력·선택 worktree를 비교할 수 있고 모두 같으면 차단을 유지해 동일 Worker 실패를 반복하지 않는다. 입력 또는 수동 해결·stage·continue 결과가 바뀌면 현재 상태를 다시 검사한다. 과거 기준선이나 실패 기록의 부재 자체는 복구 거부 조건이 아니다
-14. `PLAN_BLOCKED`와 계획과 연결된 `PROJECT_BLOCKED`의 계획별 원격 관측 입력은 다른 활성 계획·PR 충돌 복구·planning publication·유지보수가 변경 실행 자리를 점유하는 동안 보존한다. 자리가 비었거나 차단된 동일 계획이 점유한 때에만 정확한 원격 ref·PR·계획·branch·worktree·작업 범위를 다시 확인하고, 안전한 작업 branch 후속 commit을 먼저 채택한 뒤 최신 base를 관리 worktree에 반영한다. 계획·Requirement 지문이 같아도 base 전진은 rebase 대상으로 처리한다. PR 없는 기존 branch의 완료 결과는 현재 상태 판정과 중간 checkpoint 게시를 먼저 마친 뒤 원래 원인만 재검사한다. 원인이 남으면 이유와 차단을 유지해 기존 checkpoint 경계로 현재 작업물을 게시하며, 같은 원격 HEAD에는 빈 commit·반복 push를 만들지 않는다. 원인이 해소된 원격 복구는 기존 session·branch·worktree와 실패·승격 감사를 보존하고 후보 검증 토큰을 무효화해 Worker 확인·targeted test·전체 verify·Review부터 다시 진행한다. 저장 단계와 실제 Git 결과를 대조해 중단을 복구하며 동일한 처리 입력과 원인의 검사·rebase·알림을 반복하지 않는다. 별도 사용자 결정·PR reopen·소유권·안전 차단과 다른 계획의 상태는 유지한다
+14. `PLAN_BLOCKED`와 계획과 연결된 `PROJECT_BLOCKED`의 원격 입력은 다른 활성 계획·PR 복구·planning publication·유지보수가 실행 자리를 점유하면 보존한다. 자리가 비었거나 차단된 같은 계획이 점유한 때 현재 ref·PR·계획·branch·worktree·origin과 작업물을 확인해 원격 작업 입력을 통합하고 최신 base를 반영한다. 완료 결과의 게시 또는 lease 보류를 확정한 뒤 원래 원인만 재검사한다. 원인이 남으면 기존 checkpoint 경계에서 이유와 작업물을 보존하며 같은 원격 HEAD에는 빈 commit·반복 push를 만들지 않는다. 원인이 해소되면 기존 session·branch·worktree·실패·승격 감사를 보존하고 필요한 후보 검증·Review부터 재개한다. 실제 구현 교정은 Worker 경로로 처리한다. 저장 단계와 실제 Git 결과를 대조하고 별도 사용자 결정·PR reopen·실제 대상 문제 및 다른 계획의 상태를 유지한다.
 
-15. 프로젝트 차단 중 기존 branch의 게시 identity와 마지막 채택 원격 OID가 확인되면 동일 소유 branch에 관측 OID의 정확한 lease로 checkpoint를 게시한다. fast-forward 또는 PR 없는 검증된 관리 rebase만 허용하며 원래 차단이 남으면 상태·원인을 보존한다. 게시 계보를 증명할 수 없어도 현재 repository·plan·worktree·branch·target·원격 기대값·허용 변경 범위와 rebase 완료를 검증한 작업물은 결정적 진단 branch에 보존한다. 진단 ref는 계획·원본 branch·base·내용 OID에 결합하며 부재 시에만 생성한다. 같은 OID는 재사용하고 다른 OID는 갱신하지 않는다. 원인·ref·OID와 게시 intent·확정 결과는 SQLite에 보존하며 PR 생성·원래 branch 소유권 승격·차단 해제 근거로 사용하지 않는다
+15. 프로젝트 차단의 checkpoint 게시도 현재 작업 대상·원격 입력과 정확한 lease를 확인한다. 과거 receipt 부재는 접근 권한이나 정상 입력의 거부 사유가 아니다. 현재 원형·보존·대상 또는 원래 차단을 확정할 수 없으면 이유와 작업물을 보존한다. 진단 branch는 계획·원본 branch·base·내용 OID에 결합한 별도 자료로, 부재 시에만 생성하고 같은 OID를 재사용하며 다른 OID를 갱신하지 않는다. 진단 ref 충돌은 해당 자료 게시만 보류한다. 원인·ref·OID·intent·결과는 SQLite에 보존하며 PR 생성·원래 branch의 수용·차단 해제·verify·Review 성공 근거로 사용하지 않는다.
 16. 충돌 중이거나 현재 상태·작업 범위를 검증하지 못하면 commit·push하지 않고 작업물·session과 실제 local-only 이유를 보존한다. 원격 삭제·재작성·경쟁·권한·branch protection 오류를 예상 밖 ref의 force push로 우회하지 않는다. 과거 rebase turn·stage 승인·receipt·replay·journal 부재 자체는 현재 상태 판정의 거부 사유가 아니다. 진단 ref 생성·checkpoint commit·push·SQLite 확정 사이의 중단은 저장 intent와 실제 OID를 대조해 복구하며, 같은 입력·같은 결과의 rebase·게시·검사·알림을 반복하지 않는다. 알림에는 확인된 ref·OID 또는 실제 local-only 이유와 보존 경로를 포함한다
 
-17. 저장된 scope 차단이 증명된 격리의 무관한 변화, 검증된 Manager 전이의 낡은 기준선 또는 정상 충돌 stage 해소만으로 생겼다면 입력 지문 변경 없이 재평가한다. 실제 Agent 전후 결과·현재 선택 worktree·사용 자원·checkpoint·게시 소유권을 다시 확인하고 SQLite transaction에서 상태와 Git 결과가 그대로일 때 해당 원인만 해제한다. 진행 rebase는 일반 branch 검사보다 먼저 공통 현재 상태 서비스로 판정하며 `allow_rebase=True`나 metadata 존재만으로 detached HEAD를 수용하지 않는다. 작업물·session·retry·승인·실패 감사와 다른 차단을 보존하고 바뀐 후보의 검증·Review를 무효화한다. source freshness·safe fast-forward는 해제 후 독립 gate로 판단하며 프로젝트 안전 gate가 닫힌 동안 일반 Worker·Git 쓰기를 시작하지 않는다
+17. 폐기한 Git 진단의 차단은 입력 지문 변경과 과거 snapshot 일치 없이 재평가한다. 현재 작업·runtime 연결, 이전 writer 종료와 실행 자리·Git operation을 확인하고 동일 원인·checkpoint generation·현재 로컬 후보를 transaction에서 대조해 해당 원인만 해제한다. 과거 복원 요청·snapshot·작업물·session·retry·실패 감사와 독립 차단을 보존하고, 해당 지속 실패와 미전송 확인 요청은 해소한다. 진행 중인 관리 rebase는 기존 현재 상태 수용·journal 경계로 연결하고 후보가 달라지면 검증·Review를 다시 수행한다
 
-PR 없는 게시 checkpoint의 Review 횟수 차단을 rebase 없이 해제할 때는 checkpoint 요청 identity·게시 commit의 tree와 identity·마지막 채택 원격 OID 및 현재 원격 ref, 동일 계획의 branch·관리 worktree와 로컬 HEAD·ref·index·작업 파일·등록 상태를 확인한다. 실행 checkpoint에 게시 소유권 근거를 보존하고 재시작과 Worker 교정 뒤에도 다시 대조한다. 이 경로는 rebase 완료 표식을 만들지 않으며, 이후 실제 rebase가 필요하면 관리 rebase의 현재 상태 판정과 정확한 원격 lease를 요구한다. 게시 소유권 오탐으로 생긴 프로젝트 차단은 같은 증거를 재검증한 경우에만 해제하고, 남아 있는 Review issue의 교정·검증과 다른 READY 계획의 선택을 계속한다.
+기존 `publication_ownership_uncertain` 차단은 현재 작업 연결과 입력을 다시 확인해 정상 OID 차이·낡은 기록만 원인인 경우 해제한다. branch·worktree·origin·PR의 실제 불일치와 독립 실패는 유지한다. 해제 감사와 checkpoint generation·원인 일치 확인은 transaction에 결합하고 과거 게시·Agent·session 기록은 유지한다. 현재 입력 수용은 수행하지 않은 Git 동작이나 검증 성공을 만들지 않는다.
 
-표식 없는 게시 checkpoint의 재개에도 같은 현재 소유권 검증을 적용한다. `checkpoint_ownership.publication_receipt`는 현재 게시 영수증 또는 같은 branch·worktree·PR에 결합된 과거 게시 기록을 읽기 전용으로 선택한다. 구형 flat 기록은 현재 요청의 정확한 기대 OID까지 일치해야 하며, identity·tree·commit 계보·실제 origin ref는 기존 `owned_remote_oid`로 별도 검증한다. 충분한 이력이 없거나 원격이 삭제·변경됐으면 수용하지 않는다. 요청 교체는 초기화 전에 이전 게시 영수증을 `publication_history`에 보존하며, 현재 local-only 결과를 과거 게시 성공으로 덮지 않는다.
+과거 게시 receipt·`publication_history`·저장된 push intent는 자기 게시가 실제 완료됐는지 확인하는 자료다. 원격 입력을 읽고 통합하는 데 receipt 존재나 과거 OID 완전 일치를 요구하지 않는다. 새 원격 입력으로 낡은 중간 게시 lease가 무효화되면 intent를 감사로 보존하고 현재 통합 경로에 반환한다. 완료를 확인하지 못한 push를 성공으로 기록하거나 같은 intent에 새 lease를 끼워 넣지 않는다.
 
-무 rebase 재개의 현재 검증 결과는 기존 `published_review_resume` 필드를 일반 게시 재개에도 사용해 실행 checkpoint에 CAS로 저장한다. 재활성화·후보 교정·중단 복구는 이 필드를 보존하고 소비할 때 현재 요청 identity·원격을 다시 검사한다. 새 계획 차단은 `blocked_resume`과 해당 게시 재개 표식을 함께 무효화해 새 원인의 재검증을 요구한다. 게시 소유권 오탐 해제는 transaction 안에서 원인·계획·프로젝트·checkpoint generation·게시 영수증·현재 Git·실제 원격과 저장된 Agent 결과를 재검증하고 증명 저장·대상 원인 해제를 함께 확정한다. 별도 계획 차단·실패 피드백·session·감사는 유지하며 rebase 완료 증명은 생성하지 않는다.
+명시적 삭제 재시작은 실행 checkpoint의 `deleted_branch_restart` intent에 이전 행·block·session·publication·correction 감사를 저장한다. 기존 worktree를 별도 경로와 branch로 옮겨 index·파일·미추적·ignored 작업물을 보존하고, 최신 확인 원본에서 새 worktree를 준비한다. 파일 이동·branch 변경·새 공간 준비 사이 중단은 같은 intent로 재개하며 모든 확인 뒤에만 READY로 전환한다. 이전 verify cycle·성공 token·pending correction과 게시 요청은 새 실행과 분리한다. 실제 PR Merge 관측은 중단된 작업에서도 유지하고 재생성된 ref만으로 실행을 재개하지 않는다.
+
+`rebase_documents.resolve`의 파일 복구 모드는 진행 중인 rebase의 target·replay 위치와 복구 기준 revision에 경로별 intent를 결합한다. 반복된 진전 없는 correction의 미해결 파일만 선택해 읽을 수 있는 이전 bytes·index와 실패 사유를 기록하며, 확인한 원본 blob·mode·부재를 해당 경로에만 적용한다. 다른 경로의 head·branch·index·dirty·operation을 대조하고 준비된 intent에서 중단되면 남은 적용만 진행한다. 새 사용자 수정은 덮어쓰지 않으며 복원한 파일은 Worker 재작업과 후보 검증을 거친다.
 
 원격 관측 기록은 origin identity·정확한 ref·OID·실패 원인·시각을 계획별로 보존한다. 조회 실패는 마지막 확정 OID를 덮지 않는다. 처리 키는 원래 원인·검사 지문·관측 base/work branch OID·로컬 작업 지문을 포함한다. 같은 키의 확정 결과를 재사용하며 관련 입력이 달라지면 재평가한다.
 
@@ -558,7 +560,7 @@ Git 외의 subprocess도 같은 기준을 적용한다. 최초 import의 의존�
 
 ## GitHub와 PR
 
-등록된 Open PR은 매 상태 동기화에서 Merge 가능 여부도 확인한다. 결과가 미확정이면 다음 조회에서 확인하고, Git 충돌이 확정됐으면 관리 worktree에서 최신 원격 base를 rebase해 해소한다. 바뀐 후보의 Worker 확인·필요한 targeted test·전체 verify·읽기 전용 Review 뒤, 같은 PR identity와 원격 head를 확인해 기존 PR branch를 안전한 lease로 갱신한다. 승인·필수 check 대기는 rebase로 해소되는 충돌로 간주하지 않으며 새 PR을 중복 생성하거나 자동 Merge하지 않는다.
+등록된 Open PR은 매 상태 동기화에서 Merge 가능 여부도 확인한다. 결과가 미확정이면 다음 조회에서 확인하고, Git 충돌이 확정됐으면 관리 worktree에서 최신 원격 base를 rebase해 해소한다. 실제 구현 교정이 필요하면 Worker와 필요한 targeted test를 진행하고, 현재 후보의 전체 verify·읽기 전용 Review 뒤, 같은 PR identity와 원격 head를 확인해 기존 PR branch를 안전한 lease로 갱신한다. 승인·필수 check 대기는 rebase로 해소되는 충돌로 간주하지 않으며 새 PR을 중복 생성하거나 자동 Merge하지 않는다.
 
 - branch, commit, push와 PR 생성은 프로그램 코드가 수행한다
 - Planner의 검증된 새 ExecPlan, snapshot에 결합된 PR 전 계획 개정·미착수 계획 rename·삭제와 `docs/FUTURE_IDEAS.md` 변경은 planning commit으로 `origin/<base-branch>`에 fast-forward push하며 별도 PR을 만들지 않는다
@@ -612,31 +614,31 @@ Requirement 교정은 PR 관계 동기화 뒤 기존 housekeeping 안전 gate �
 - `cleanup_pending` worktree가 이후 clean해지거나 경로가 사라지면 기록을 지우고 강제 옵션 없이 정리한다
 - planning worktree·diff·session과 미게시 결과는 오류·게시 복구 동안 보존한다. 폐기·교체는 소유권과 보존 결과를 검증한 관리 경계에서만 수행한다
 - 현행 정리는 Merge된 로컬 관리 branch만 비강제 삭제하며 원격 branch는 자동으로 삭제하지 않는다. 확인된 작업 삭제에 따른 소유 로컬·원격 branch 정리는 위 R-055의 구현 목표이며 현재 Merge 정리의 권한을 확대하지 않는다
-- 예외적으로 PR이 아직 없는 동일한 Loop Manager 소유 branch의 rebase 복구에만 `--force-with-lease`를 사용할 수 있다
+- 동일한 Loop Manager 소유 작업 branch 게시에는 현재 원격 OID에 결합한 `--force-with-lease`를 사용한다. 이력 재작성은 현재 입력의 보존·통합과 필요한 검증을 거친 후보만 허용하며 새 lease만 바꾼 재시도는 하지 않는다
 - 공통 파일 복사 스크립트는 사용자가 명시적으로 실행하는 초기 설정 도구이며 자동 Loop에서 호출하지 않는다
 - 등록 프로젝트의 문서와 verify 스크립트는 사용자가 신뢰한 입력으로 취급한다
 - Telegram token과 다른 자격 증명을 AI prompt, subprocess 인자와 로그에 노출하지 않는다
 - subprocess는 인자 배열로 실행하고 필요한 경우에만 운영체제 shell을 사용한다
 
-### 실행별 Agent 범위와 Manager 전이
+### 역할 결과와 Manager Git 전이
 
-저장된 시작·Agent 결과·Manager checkpoint와 BLOCKED의 사전 비교는 같은 ignored 비교 view를 사용한다. 시작 시 tracked ignore 규칙의 blob·index·작업 상태 또는 기록된 외부 exclude의 경로·내용 서명이 저장 결과·현재 상태와 일치할 때만 index에 없는 과거 untracked artifact를 비교에서 제외한다. `!` 규칙으로 ignore를 해제한 경로는 삭제된 뒤에도 권위 입력으로 유지한다. 원본 snapshot과 활성 파일은 수정하지 않으며 새로 숨긴 경로, 강제 stage, index flag와 권위 있는 Git 변경은 기존 검사를 유지한다.
+역할 결과와 성공 후보의 재사용은 실제 최종 diff·입력과 후보 상태를 기준으로 검증한다. ignored 비교 view는 시작 ignore 규칙의 blob·index·작업 상태 또는 기록된 외부 exclude 서명이 일치하는 index-free artifact만 제외한다. 과거 snapshot은 감사로 보존하며 이 정규화를 Git 접근 권한 판정에 사용하지 않는다. 강제 staging·tracked 파일과 숨겨진 index 상태는 결과·현재 Git 쓰기의 검사 대상이다.
 
-관리 rebase의 연속 관측과 현재 상태 수용도 같은 규칙 검증을 재사용한다. 첫 관측의 snapshot을 단계 시작 근거로 삼고, 증명된 ignored·index-free 파일만 비교·scope·수용 fingerprint에서 제외한다. 나머지 파일과 HEAD·index·공유 config·원격 OID·PR·입력의 변화는 기존 불안정 관측 또는 범위 위반으로 처리한다. 이 관측은 Agent 호출의 저장된 시작 범위나 게시 소유권 증명을 대신하지 않는다.
+관리 rebase의 연속 관측과 현재 상태 수용은 실제 작업 후보·index·operation·현재 origin·원격 OID·PR·입력을 확인한다. 이 관측은 Git 쓰기와 후보 수용에 필요한 조건이며 Agent의 과거 접근 범위를 증명하지 않는다. 증명된 ignored·index-free artifact는 후보 비교에서 제외하고 다른 작업의 Git 변화를 해당 Agent에 귀속하지 않는다.
 
 공통 ignored 충돌 helper는 대상 tracked 경로와 대소문자·부모·자식 관계까지 비교한다. rebase 시작뿐 아니라 continue·skip·abort에도 같은 보존 검사를 적용하며, 대소문자를 구분하지 않는 파일시스템에서 ignored 파일을 tracked 경로의 alias로 덮어쓰지 않는다.
 
-동일 입력의 planning_error도 보존된 작업의 소유권·종료 호출·저장 결과를 확인해 재평가한다. 원본 결과가 저장된 scope 오류를 재현하고 ignored 비교 view만 통과하며 결과 이후의 권위 변경이 없을 때만 해당 오류를 해제한다. 차단 identity·현재 Git 상태를 transaction에서 다시 대조하고 session·retry·실패 진단을 보존한다. Planner의 ignored-only PROJECT_BLOCKED 해제는 현재 planning worktree 소유권과 저장 결과 이후의 권위 변경을 검사하며 확정 transaction에서 소유권을 다시 확인한다. ignored-only PLAN_BLOCKED는 기존 실행 격리·Manager 전이 증거를 적용한 결과가 현재 후보와 같을 때 저장한 차단 전 실행 단계와 Worker·verify·Review 결과를 이어간다. 새 verify 호출은 먼저 이전 완료 표식을 무효화하고, 통과한 호출은 HEAD가 동일하고 tracked·staged·non-ignored 미커밋 변경이 없을 때만 scope 검사 전에 후보·저장 출력에 결합한 성공 token을 기록한다. 저장 verify 결과는 validated base와 definition·출력 token이 현재 후보 HEAD와 일치할 때만 완료 증거로 인정해 `REVIEWING`으로 재개하며, 구형 `verify-stage` token은 시작·저장 결과·현재 후보 HEAD가 같고 ignored 비교 view의 결과·현재 상태가 깨끗하며, 해당 계획의 최신 불변 verify 감사가 계획에 저장된 `current_revision_sha`(verify 감사의 정의 commit) 및 성공·저장 출력과 일치할 때만 해제 transaction에서 출력 결합 token으로 전환한다. 원본 snapshot·결과·감사는 보존하고 이후 revision gate·Review·게시에서도 전환한 증거를 사용한다. 그 증명이 불완전하거나 미커밋 변경이 있으면 기존 commit·새 후보 재검증 경계를 적용한다.
+폐기된 Git 진단의 planning 오류·PLAN_BLOCKED·PROJECT_BLOCKED는 같은 입력에서 현재 작업 대상과 실행 자리를 재확인해 해제한다. 결과·session·retry·기준 snapshot·실패 진단과 해제 audit는 보존한다. 복원 intent는 기존 checkpoint에 보존하고 활성 포인터만 제거해 사용자 작업을 과거 상태로 복원하지 않는다. 복구 transaction은 원인·작업·checkpoint generation·현재 로컬 후보를 다시 확인하고 독립 오류·승인·Review 차단을 유지한다. 저장 결과와 현재 후보가 같거나 definition·base·출력에 결합한 verify token이 현재 HEAD를 증명하면 저장 단계를 이어가며, 후보가 바뀌면 검증·Review·게시 token을 무효화한다. 구형 verify token은 최신 불변 verify 감사와 정의 commit·출력·깨끗한 후보의 일치가 증명된 경우에만 전환한다.
 
-Agent 범위 판정은 호출·역할·session·repository·관리 worktree에 결합된 격리 증거와 현재 자원 검사를 구분한다. 격리 증거가 없거나 불완전한 legacy 실행도 기본 checkout과 로컬 base branch를 비교에서 제외하지만, 선택 worktree·branch·사용 자원·origin·보안 설정·writer·후보 입력은 계속 검사한다. 정상 외부 fetch의 선택 base ref는 등록 origin, 예상 원격 target, ancestry와 live tracking ref를 확인해 재관측한다. 조회 실패나 관측 경쟁은 원래 snapshot으로 되돌려 범위 위반으로 판정하지 않고 `REMOTE_SNAPSHOT_RACE` 재시도로 넘긴다. 재관측은 Manager receipt를 만들거나 신규 호출의 provider 격리를 대체하지 않는다.
+Agent의 접근 허용·거부는 provider sandbox가 담당한다. Git 변화·격리 ledger·실패한 호출 이력은 권한 판정 기준이 아니다. 현재 runtime의 정확한 path·SHA·process lock·등록 표식은 실제 runtime 재개 조건으로 확인하고, 그 실패는 현재 작업 공간 오류로 처리한다. 원격 관측 경쟁은 해당 동기화·게시의 재관측 입력이며 Agent 범위 위반으로 전환하지 않는다.
 
-BLOCKED 계획의 현재 입력은 이전 Agent writer 종료와 repository·계획·worktree·branch 소유권을 확인한 뒤 새 후보로 검증하고, 과거 snapshot과 결과·session은 감사 자료로 보존한다. 후보가 저장된 Agent 결과에 머물거나 선택 ExecPlan만 추가 수정됐다면 진단 복구 journal로 Agent 변경을 격리하고 사용자의 계획 입력을 원자적으로 다시 적용한다. 그 밖의 검증된 현재 파일·index·HEAD는 그대로 다음 입력으로 넘기며 과거 snapshot으로 복원하지 않는다. 중단된 복구는 저장 journal부터 재개하고, 미완료 Git operation·보안 index flag·소유권 변경이나 입력 검증과 보존 사이의 snapshot 변경은 계속 차단한다.
+BLOCKED 계획의 현재 입력은 현재 작업 대상과 실행 자리·Git operation을 확인한 뒤 새 후보로 수용한다. 폐기한 Git 진단의 시작·결과 snapshot과 복원 intent는 기존 checkpoint 감사로 보존하며 사용자 파일·index·HEAD를 과거 기준선으로 복원하지 않는다. 실제 미완료 Manager Git 전이는 현재 소유 자원과 journal에서 이어가고, 실제 결과·문서 입력 실패는 해당 유효성 검증에서 독립적으로 처리한다. Review 중 로컬 후보가 바뀌면 접근 위반을 기록하지 않고 저장 검증·Review·게시 token을 무효화해 필요한 verify·Review를 진행한다. 실제 문서·구현 입력의 부족은 Worker 교정으로 처리한다.
 
-Agent 시작 이후 Manager의 fetch·worktree 전이는 작업별 전후 기대값·소유 표식·checkpoint와 현재 Git 상태가 일치하는 자원만 비교 기준선에 반영한다. 관측 OID, SQLite 완료 상태나 예정된 cleanup만으로 전체 ref·worktree를 갱신하지 않으며, Git 변경 뒤 receipt 저장 전 중단에서도 같은 증거를 읽기 전용으로 확인한다. 원본 scope와 재개 호출의 비교 시작값을 별도로 보존해 후속 Manager 전이가 실제 Agent 위반을 덮지 않게 하며, Agent 허용 변경·session·격리 증거를 유지한다
+Manager fetch·worktree·rebase journal은 실제 미완료 Git 전이의 자원·현재 기대값·소유자·확정 결과를 보존한다. Agent의 과거 snapshot 차이를 허용하기 위한 receipt gate로 사용하지 않는다. 재시작은 현재 작업 조건과 미완료 쓰기의 결과를 확인하며 수행하지 않은 Git 성공이나 sandbox 격리 성공을 합성하지 않는다.
 
-현재 소유권과 허용 범위가 확인된 관리 rebase의 충돌 stage 1/2/3에서 stage 0으로의 해소(`ls-files -v`의 `M → H` 포함)는 보안 index flags 변경이 아니다. 신규 Worker 결과와 저장된 scope 차단에 같은 판정을 적용하되, `skip-worktree`·`assume-unchanged`의 예상 밖 설정·해제, 범위 밖 파일·index 변경과 소유권 불명확은 계속 차단한다
+관리 rebase의 stage 1/2/3에서 stage 0으로의 충돌 해소는 새 후보로 검증한다. index flags는 Agent 접근 위반으로 비교하지 않으며 skip-worktree·assume-unchanged처럼 파일 관측을 숨기는 현재 상태는 실제 Manager Git 작업의 안전 조건에서 확인한다.
 
-Codex가 Agent turn 추적을 위해 자동 생성·갱신·정리하는 `refs/codex/turn-diffs/*`는 게시 또는 workspace 소유권에 사용하지 않는 provider 소유의 비권위 임시 ref다. 그 namespace의 순변경만으로 Agent 범위 위반이나 `PROJECT_BLOCKED`를 만들지 않으며, 작업 소유 branch와 사용 중인 원격 ref는 계속 보호한다
+Codex의 refs/codex/turn-diffs/*와 다른 작업의 정상 공유 ref 변화는 Agent 접근 위반을 만들지 않는다. 현재 게시 branch의 원격 tip은 이번 push의 통합·명시적 force-with-lease 조건으로 관측한다.
 
 Codex는 Manager가 `codex exec`로 직접 호출하며 선택 workspace의 내장 쓰기 제한과 granular 자동 승인 검토를 유지한다. Reviewer는 읽기 전용이고 테스트·verify 재실행 금지는 별도의 역할 지침으로 유지한다. Codex 프로세스 전체를 감싸는 바깥 sandbox와 중첩 sandbox 호환성은 호출 조건이 아니며, 정상 session·로그 저장을 Agent의 workspace 밖 쓰기 권한과 구분한다
 

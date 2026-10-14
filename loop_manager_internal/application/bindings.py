@@ -12,6 +12,14 @@ from loop_manager_internal.application import self_runtime
 
 
 def register(assembly: Composition) -> None:
+    assembly.bind('_reset_deleted_branch', commands.reset_deleted_branch,
+        lambda: commands.ResetDeletedBranchEffects(
+            connect_database=assembly.callback('connect_database'),
+            remote_integration_effects=assembly.callback('_checkpoint_recovery_effects_reconcile_published_blocked_checkpoint'),
+            pr_for_branch=assembly.callback('pr_for_branch'),
+            complete_merged_execplan_worktree=assembly.callback('complete_merged_execplan_worktree'),
+            unmet_execplan_dependencies=assembly.callback('unmet_execplan_dependencies'),
+            operation_print=assembly.callback('operation_print')))
     assembly.bind('_run_project_step', project_service._run_project_step,
         lambda: project_service.RunProjectStepEffects(
             resume_manual_work=assembly.callback('_resume_manual_work'),
@@ -238,6 +246,7 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('execute_runtime_command', commands.execute_runtime_command,
         lambda: commands.ExecuteRuntimeCommandEffects(
+            reset_command=assembly.callback('_reset_deleted_branch'),
             _document_drafts_command=assembly.callback('_document_drafts_command'),
             configure_registry=assembly.callback('configure_registry'),
             connect_database=assembly.callback('connect_database'),

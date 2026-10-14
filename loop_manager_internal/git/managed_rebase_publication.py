@@ -27,6 +27,8 @@ def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree
     try:
         current = checkpoints.get(repo, plan_id)
         saved = current.snapshot or {}
+        if saved.get('pending_work_branch_input'):
+            return
         intent = saved.get('rebase_publication_intent')
         pending = current.operation == 'rebase_publish'
         if pending and current.rebase_publication_intent() is None:
@@ -39,19 +41,36 @@ def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree
             return
         if not pending and saved.get('rebase_publication_result', {}).get('acceptance_id') == acceptance['id']:
             return
+        if not pending and saved.get('rebase_publication_deferred') == acceptance['id']:
+            return
         owner = checkpoints.connection.execute(
             "SELECT accepted_remote_oid FROM blocked_checkpoints WHERE repo = ? AND plan_id = ? "
             "AND phase = 'published' AND branch = ? AND worktree = ?",
             (repo, plan_id, branch, str(worktree))).fetchone()
     except sqlite3.OperationalError as error:
         raise RebaseObservationRetry('intermediate checkpoint database observation failed') from error
-    expected_oid = (intent['remote_before'] if pending else
+    expected_oid = (intent['remote_before'] if pending else saved.get('accepted_work_branch') or
                     row['publication_remote_oid'] or (row['pr_head_oid'] if row['pr_url'] else None)
                     or (owner[0] if owner else None))
     if not pending and expected_oid is None:
         raise RebasePublicationRejected('existing remote branch has no durable publication identity')
     if not expected_oid:
         raise RebasePublicationRejected('intermediate checkpoint has no adopted remote OID')
+    try:
+        live_oid = manager_git_journal.live_remote_branch_oid(git, repo_path, branch)
+    except (manager_git_journal.MutationEvidenceError, RuntimeError, OSError) as error:
+        raise RebaseObservationRetry('intermediate checkpoint remote observation failed') from error
+    if live_oid is not None and live_oid not in ({expected_oid, intent['head']} if pending else {expected_oid}):
+        # Retire the old exact lease; current input reconciliation decides a new
+        # candidate. This records no success for an unobserved push.
+        checkpoints.record(repo, plan_id, expected_generation=current.generation,
+            operation=None, expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+            snapshot={**saved, 'rebase_publication_intent': None,
+                'rebase_publication_deferred': (intent['acceptance'] if pending else acceptance)['id'],
+                'retired_rebase_publications': [*saved.get('retired_rebase_publications', ()),
+                    {'intent': intent, 'observed_remote': live_oid, 'confirmed': False}]})
+        return
 
     def inspect():
         try:
@@ -67,7 +86,7 @@ def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree
             raise RebaseObservationRetry(str(error)) from error
         head = intent['head'] if pending else acceptance['head']
         if oid not in ({expected_oid, head} if pending else {expected_oid}):
-            raise RebasePublicationRejected('intermediate checkpoint remote lease changed or disappeared')
+            raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, 'intermediate checkpoint remote lease changed or disappeared')
         accepted_pr = (intent['acceptance'] if pending else acceptance)['remote']['pull_request']
         pr_url = accepted_pr['identity'] if accepted_pr else None
         if (row['pr_url'] or None) != pr_url:
@@ -76,6 +95,8 @@ def publish_checkpoint(*, state, checkpoints, repo, plan_id, repo_path, worktree
             live_pr = lookup_pr(repo_path, branch, pr_url)
         except (RuntimeError, OSError) as error:
             raise RebaseObservationRetry('intermediate checkpoint PR observation failed') from error
+        if live_pr and live_pr.get('url') == pr_url and live_pr.get('headRefName') == branch and live_pr.get('headRefOid') != oid:
+            raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, 'intermediate checkpoint PR head observation changed')
         if not checkpoint_pr_matches(live_pr, url=pr_url, branch=branch, head=oid):
             raise RebasePublicationRejected('intermediate checkpoint PR identity or head changed')
         try:

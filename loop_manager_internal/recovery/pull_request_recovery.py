@@ -57,6 +57,7 @@ class ReconcileExistingPullRequestEffects:
     update_project: Callable[..., object]
     validate_execplan_workspace_identity: Callable[..., object]
     manual_publication_stage_tokens: Callable[..., object] | None = None
+    remote_integration_effects: Callable[..., object] | None = None
 
 @dataclass(frozen=True)
 class ResumePrConflictRebaseEffects:
@@ -168,10 +169,20 @@ def reconcile_existing_pull_request(effects: ReconcileExistingPullRequestEffects
                 unvalidated_candidate = (unvalidated_candidate
                     or project['publication_token'] != definition.publication_token(
                         str(project['validated_base_sha'] or ''), str(head_oid or '')))
-        if unvalidated_candidate and not checkpoint_pr_matches(
-                pull_request, url=project["pr_url"], branch=branch, head=project["pr_head_oid"],
-                base=project["base_branch"]):
-            raise PublicationSafetyError("미검증 후보의 기존 PR identity 또는 head가 변경됐습니다.")
+        if unvalidated_candidate:
+            if not checkpoint_pr_matches(pull_request, url=project["pr_url"], branch=branch,
+                    head=head_oid, base=project["base_branch"]):
+                raise PublicationSafetyError("미검증 후보의 기존 PR 대상이 변경됐습니다.")
+            if head_oid != project["pr_head_oid"]:
+                if effects.remote_integration_effects is not None and plan is not None:
+                    from loop_manager_internal.recovery.work_branch_integration import synchronize
+                    integration = effects.remote_integration_effects()
+                    remote = manager_git_journal.live_remote_branch_oid(integration.git, repo_path, branch)
+                    synchronize(integration, connection, repo_path, state_dir, repo, plan, remote, pull_request)
+                    effects.update_project(connection, repo, pr_head_oid=remote,
+                                           **({'pr_conflict_head_oid': remote} if plan['pr_conflict_recovery'] else {}))
+                raise recovery_runtime.RecoveryFailure(recovery_runtime.RecoveryReason.REMOTE_SNAPSHOT_RACE,
+                    "현재 PR head 입력을 반영한 후보의 검증 단계를 다시 선택합니다.")
     blocked_plan = effects.project_execplan(connection, repo)
     if blocked_plan is not None and blocked_plan["status"] != "PLAN_BLOCKED":
         blocked_plan = None

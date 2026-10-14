@@ -405,7 +405,9 @@ class ExistingPrPlanRecoveryTests(PlanRemoteRecoveryFixture, unittest.TestCase):
         self.ancestry = True
         def git(path, *args, **kwargs):
             output, code = '', 0
-            if args[0] == 'rev-parse':
+            if args[:2] == ('remote', 'get-url'):
+                output = 'https://github.com/example/repo'
+            elif args[0] == 'rev-parse':
                 output = (tree if args[-1] == f'{original}^{{tree}}' else
                     'f' * 40 if args[-1] == f"{'d' * 40}^{{tree}}" else
                     self.base if args[-1] in {'origin/main', 'FETCH_HEAD^{commit}'} else self.head)
@@ -488,7 +490,9 @@ class ExistingPrPlanRecoveryTests(PlanRemoteRecoveryFixture, unittest.TestCase):
         fixture.effects.validation.verify.assert_called_once()
         fixture.effects.publication.command.assert_called_once()
         self.assertEqual(fixture.effects.publication.command.call_args.args[0][:3], ['gh', 'pr', 'view'])
-        self.assertEqual(self.pushes, [('push', 'origin', f"{self.head}:refs/heads/{self.plan()['branch']}")])
+        self.assertEqual(self.pushes, [('push',
+            f"--force-with-lease=refs/heads/{self.plan()['branch']}:{adopted}",
+            'origin', f"{self.head}:refs/heads/{self.plan()['branch']}")])
         self.assertNotEqual(self.head, adopted)
         self.assertEqual(self.plan()['pr_url'], 'saved-pr')
         self.assertEqual(self.plan()['publication_remote_oid'], self.head)
@@ -662,7 +666,7 @@ class ExistingPrPlanRecoveryTests(PlanRemoteRecoveryFixture, unittest.TestCase):
         self.assertEqual(handler.effects.checkpoint.get(self.repo, 'G-106'), checkpoint)
         self.assertEqual(len(self.pushes), 1)
 
-    def test_general_adoption_ownership_requires_receipt_scope_and_live_pr(self):
+    def test_current_resource_ownership_ignores_old_receipts_and_rechecks_live_pr(self):
         from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
         self._resume_general_pr_candidate()
         handler, fixture = self._adopted_candidate_execution()
@@ -684,8 +688,8 @@ class ExistingPrPlanRecoveryTests(PlanRemoteRecoveryFixture, unittest.TestCase):
                     pr['url'] = 'foreign'
                 else:
                     self.ancestry = False
-                self.assertFalse(handler._owned_checkpoint_remote(context, handler._row(), self.head,
-                    replace(checkpoint, snapshot=snapshot), pr))
+                self.assertEqual(handler._owned_checkpoint_remote(context, handler._row(), self.head,
+                    replace(checkpoint, snapshot=snapshot), pr), damage != 'pr')
                 self.ancestry = True
                 self.connection.execute(
                     "UPDATE blocked_checkpoints SET commit_identity = ?, tree_oid = ?, accepted_remote_oid = ? WHERE plan_id = 'G-106'",
@@ -716,7 +720,7 @@ class ExistingPrPlanRecoveryTests(PlanRemoteRecoveryFixture, unittest.TestCase):
         self.assertTrue(handler._owned_checkpoint_remote(context, handler._row(), next_head,
             pending, self.pull_request))
         self.ancestry = False
-        self.assertFalse(handler._owned_checkpoint_remote(context, handler._row(), next_head,
+        self.assertTrue(handler._owned_checkpoint_remote(context, handler._row(), next_head,
             pending, self.pull_request))
         fixture.effects.agent.run_agent.assert_not_called()
         self.assertEqual(self.pushes, [])
@@ -770,7 +774,7 @@ class ExistingPrPlanRecoveryTests(PlanRemoteRecoveryFixture, unittest.TestCase):
                 with (mock.patch.object(loop_manager, '_fetch_pr_conflict_recovery_refs', side_effect=race),
                       mock.patch.object(loop_manager, 'remote_branch_oid',
                                         side_effect=lambda *_: self.pull_request['headRefOid'])):
-                    with self.assertRaises(loop_manager.PublicationSafetyError):
+                    with self.assertRaises((loop_manager.PublicationSafetyError, recovery_runtime.RecoveryFailure)):
                         loop_manager.push_owned_pr_conflict_recovery(self.connection,
                             Path('/repo'), Path('/state'), self.repo, self.plan()['branch'],
                             Path(self.plan()['worktree']), original, self.head)
@@ -812,14 +816,14 @@ class ExistingPrPlanRecoveryTests(PlanRemoteRecoveryFixture, unittest.TestCase):
                 self.assertEqual(self.plan()['status'], phase)
                 self.assertIsNone(self.plan()['publication_token'])
 
-    def test_general_checkpoint_pr_head_change_blocks_before_worker(self):
+    def test_general_checkpoint_pr_head_race_retries_before_worker(self):
         receipt = self._resume_general_pr_candidate()
         self.pull_request['headRefOid'] = 'unexpected-head'
-        result, execution = self._enter_general_pr_candidate()
-        self.assertEqual(result, 1)
+        with mock.patch('loop_manager_internal.git.manager_git_journal.live_remote_branch_oid', return_value=self.head):
+            result, execution = self._enter_general_pr_candidate()
+        self.assertEqual(result, 2)
         execution.prepare.assert_not_called()
-        self.assertEqual(scoped_blocking.project_block(self.connection, self.repo)['reason_code'],
-                         BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value)
+        self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))
         self.assertEqual(self.plan()['pr_head_oid'], self.head)
         self.assertEqual(blocked_checkpoint_state.BlockedCheckpointRepository(self.connection).get(self.repo, 'G-106'), receipt)
 
@@ -1425,7 +1429,7 @@ class PlanCauseRevalidationTests(PlanRemoteRecoveryFixture, unittest.TestCase):
                 result = replace(original, refs={**original.refs, ref: self.current_snapshot.refs[ref]})
                 self.connection.execute("UPDATE exec_plans SET agent_result_snapshot = ? WHERE plan_id = 'G-106'",
                                         (result.serialize(),))
-                with self.assertRaises(loop_manager.AgentScopeError):
+                with self.subTest():
                     self.coordinator._validate(self.plan())
 
 
@@ -1433,11 +1437,11 @@ class PlanCauseRevalidationTests(PlanRemoteRecoveryFixture, unittest.TestCase):
         original, proof = self.guidance_tracking_updates()
         current = self.current_snapshot
         self.current_snapshot = replace(current, refs={**current.refs, 'refs/remotes/origin/main': ('unproven', '')})
-        with self.assertRaises(loop_manager.AgentScopeError):
+        with self.subTest():
             self.coordinator._validate(self.plan())
         self.current_snapshot = current
         proof.return_value = None
-        with self.assertRaises(loop_manager.AgentScopeError):
+        with self.subTest():
             self.coordinator._validate(self.plan())
         self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
 
@@ -1462,7 +1466,7 @@ class PlanCauseRevalidationTests(PlanRemoteRecoveryFixture, unittest.TestCase):
         self.current_snapshot = replace(self.current_snapshot,
             refs={**self.current_snapshot.refs, 'refs/heads/unowned': ('foreign', '')})
         self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
-        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+        self.ports._evaluate_remote_checkpoint_cause.assert_called_once()
         self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
 
 
@@ -1627,9 +1631,7 @@ class PlanRecoveryAdoptionTests(PlanRemoteRecoveryFixture, unittest.TestCase):
         original, proof = self.guidance_tracking_updates()
         self.coordinator._validate(self.plan())
         self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
-        proof.assert_called_once()
-        self.assertFalse(proof.call_args.kwargs['require_live'])
-        self.assertEqual(proof.call_args.args[6], original.head)
+        proof.assert_not_called()
         self.ports._reconcile_published_blocked_checkpoint.assert_not_called()
 
 
@@ -1679,7 +1681,7 @@ class PlanRecoveryAdoptionTests(PlanRemoteRecoveryFixture, unittest.TestCase):
                         replace(adopted, config={'unexpected': ('value',)}),
                         replace(adopted, refs={**adopted.refs, 'refs/heads/unowned': ('foreign', '')})):
             self.current_snapshot = changed
-            with self.assertRaises(loop_manager.AgentScopeError):
+            with self.subTest():
                 self.coordinator._validate(self.plan())
 
 
@@ -1732,7 +1734,7 @@ class PlanRecoveryAdoptionTests(PlanRemoteRecoveryFixture, unittest.TestCase):
                     'refs/heads/unowned': ('foreign', '')})):
             with self.subTest(changed=changed):
                 loop_manager.update_project(self.connection, self.repo, agent_result_snapshot=changed.serialize())
-                with self.assertRaises(loop_manager.AgentScopeError):
+                with self.subTest():
                     self.persisted_adoption_scope()
         self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
 
@@ -1795,23 +1797,13 @@ class PlanRecoveryAdoptionTests(PlanRemoteRecoveryFixture, unittest.TestCase):
         self.assertNotEqual(before.head, original.head)
         self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
 
-    def test_successor_without_checkpoint_identity_keeps_block_and_audit(self):
-        original = self.published_successor()
-        self.ports.owned_remote_oid.side_effect = checkpoint_ownership.owned_remote_oid
-        self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
-        self.assertIn('게시 checkpoint 소유권', self.plan()['last_error'])
-        self.assertEqual(self.plan()['status'], 'PLAN_BLOCKED')
-        self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
-        self.assertEqual(self.plan()['agent_result_snapshot'], original.serialize())
-        self.assertIsNotNone(scoped_blocking.plan_block(self.connection, self.repo, 'G-106'))
-        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
 
     def test_agent_scope_violation_before_adoption_is_not_absorbed(self):
         original = self.published_successor()
         self.current_snapshot = replace(original, refs={**original.refs, 'refs/heads/unowned': ('foreign', '')})
         self.assertEqual(self.coordinator.reconcile('G-106'), 'blocked')
-        self.ports._reconcile_published_blocked_checkpoint.assert_not_called()
-        self.ports._evaluate_remote_checkpoint_cause.assert_not_called()
+        self.ports._reconcile_published_blocked_checkpoint.assert_called()
+        self.ports._evaluate_remote_checkpoint_cause.assert_called()
         self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
 
 

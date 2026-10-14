@@ -40,7 +40,7 @@ def block_persisted_agent_scope_violation(
 ) -> str:
     """Persist a pre-resume scope violation without discarding Agent state."""
 
-    message = f"Agent 범위 선검증 실패:\n{detail}"
+    message = f"현재 작업 공간 검증 실패:\n{detail}"
     if result_snapshot is not None:
         preserved_snapshot = result_snapshot.serialize()
     elif row["agent_result_snapshot"]:
@@ -144,7 +144,7 @@ def recover_persisted_agent_worktree(
         or str(plan["branch"] or "") != branch
         or Path(str(plan["worktree"] or "")) != worktree
     ):
-        raise AgentScopeError(
+        raise WorkspaceOwnershipError(
             "저장된 Agent worktree의 Loop Manager 소유권을 증명할 수 없습니다: "
             f"{worktree}"
         )
@@ -168,7 +168,7 @@ def recover_persisted_agent_worktree(
             allow_existing=True,
         )
     except WorkspaceOwnershipError as error:
-        raise AgentScopeError(
+        raise WorkspaceOwnershipError(
             f"저장된 Agent worktree 복구 실패: {error}"
         ) from error
 

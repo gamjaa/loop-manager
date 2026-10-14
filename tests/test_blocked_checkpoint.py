@@ -138,7 +138,7 @@ class BlockedCheckpointPolicyTest(unittest.TestCase):
             (
                 {"shared_metadata_owned": False},
                 blocked_checkpoint.SafetyScope.PROJECT,
-                "shared_ref_mutation",
+                "workspace_ownership_uncertain",
             ),
         )
         for changes, scope, reason in cases:
@@ -506,6 +506,10 @@ class ExistingPrCheckpointPublicationTests(unittest.TestCase):
         pr = {'url': 'saved-pr', 'state': 'OPEN', 'headRefName': 'loop/G-047', 'headRefOid': self.head}
         effects.pr_for_branch.return_value = pr
         effects.git.return_value = SimpleNamespace(returncode=0, stdout=self.head)
+        def git(_path, *args, **kwargs):
+            return SimpleNamespace(returncode=0, stdout=(self.head + '\trefs/heads/loop/G-047\n'
+                if args[0] == 'ls-remote' else self.head))
+        effects.git.side_effect = git
         self.assertEqual(push_owned_pr_conflict_recovery(effects, self.connection, Path('/repo'),
             Path('/state'), 'repo', 'loop/G-047', Path('/owned'), pr, self.head), self.head)
         self.assertFalse(any(call.args[1] == 'push' for call in effects.git.call_args_list))

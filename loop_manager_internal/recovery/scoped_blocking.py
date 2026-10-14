@@ -31,6 +31,7 @@ class BlockReasonCode(str, Enum):
     MANAGED_WORKTREE_SCOPE_VIOLATION = "managed_worktree_scope_violation"
     PLAN_INPUT_INVALID = "plan_input_invalid"
     WORKER_OUTPUT_INVALID = "worker_output_invalid"
+    REMOTE_BRANCH_DELETED = "remote_branch_deleted"
 
     DEFAULT_WORKTREE_MUTATION = "default_worktree_mutation"
     SHARED_REF_MUTATION = "shared_ref_mutation"
@@ -62,21 +63,26 @@ _PLAN_REASONS = frozenset(
         BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION,
         BlockReasonCode.PLAN_INPUT_INVALID,
         BlockReasonCode.WORKER_OUTPUT_INVALID,
+        BlockReasonCode.REMOTE_BRANCH_DELETED,
     }
 )
 
-# Only these saved scope diagnoses can be reconsidered as stale baselines.
-# Revalidation still checks every used resource and actual Agent result.
+# Retired Git access diagnoses are rechecked against current operation conditions.
 SCOPE_BASELINE_REASONS = frozenset({
     BlockReasonCode.DEFAULT_WORKTREE_MUTATION.value,
     BlockReasonCode.SHARED_REF_MUTATION.value,
+    BlockReasonCode.TURN_DIFF_REF_MUTATION.value,
+    BlockReasonCode.SHARED_GIT_CONFIG_MUTATION.value,
     BlockReasonCode.OUTSIDE_MANAGED_WORKTREE_MUTATION.value,
     BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION.value,
 })
 
 
 def is_scope_baseline_block(block) -> bool:
-    return block is not None and block['reason_code'] in SCOPE_BASELINE_REASONS
+    return block is not None and (block['reason_code'] in SCOPE_BASELINE_REASONS
+        or block['reason_code'] in {BlockReasonCode.REPOSITORY_STATE_UNSAFE.value,
+                                   BlockReasonCode.LEGACY_UNSCOPED_BLOCK.value}
+        and str(block['evidence'] or '').startswith('Agent 범위 선검증 실패:'))
 
 
 def reason_scope(reason: BlockReasonCode) -> BlockScope:

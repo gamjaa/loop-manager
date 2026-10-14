@@ -221,6 +221,9 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
 
 
     def test_published_review_push_restarts_before_completion_checkpoint(self):
+        live = mock.patch('loop_manager_internal.git.manager_git_journal.live_remote_branch_oid', return_value='corrected-head')
+        live.start()
+        self.addCleanup(live.stop)
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
         self.handler.effects = self.effects
@@ -276,6 +279,9 @@ class ExecutionReviewPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
 
 
     def test_published_review_resume_push_completion_survives_restart(self):
+        live = mock.patch('loop_manager_internal.git.manager_git_journal.live_remote_branch_oid', return_value='corrected-head')
+        live.start()
+        self.addCleanup(live.stop)
         checkpoint = ExecutionCheckpointRepository(self.connection)
         self.effects = replace(self.effects, checkpoint=checkpoint)
         self.handler.effects = self.effects

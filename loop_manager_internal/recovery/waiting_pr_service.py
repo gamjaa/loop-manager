@@ -14,7 +14,7 @@ from loop_manager_internal.recovery import pull_request_recovery
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.recovery.scoped_blocking import PR_CLOSED_BLOCK_REASON
-from loop_manager_internal.recovery.recovery_runtime import RecoveryReason
+from loop_manager_internal.recovery.recovery_runtime import RecoveryReason, RecoveryFailure
 from loop_manager_internal.runtime.contracts import PublicationSafetyError
 from loop_manager_internal.runtime.contracts import REBASE_IN_PROGRESS_ERROR
 from loop_manager_internal.storage import runtime_state
@@ -69,6 +69,7 @@ class ObserveWaitingPullRequestsEffects:
     pr_for_branch: Callable[..., object]
     base_head: Callable[..., object] | None = None
     resolve_profile: Callable[..., object] | None = None
+    git: Callable[..., object] | None = None
 
 
 def observe_waiting_pull_requests(
@@ -85,9 +86,10 @@ def observe_waiting_pull_requests(
 
     rows = connection.execute(
         "SELECT * FROM exec_plans WHERE repo = ? AND "
-        "(status = 'PR_OPEN' OR (status = 'PLAN_BLOCKED' AND blocked_reason = ?)) "
+        "(status = 'PR_OPEN' OR (status = 'PLAN_BLOCKED' AND (blocked_reason = ? "
+        "OR (blocked_reason = ? AND pr_url IS NOT NULL)))) "
         "ORDER BY plan_id",
-        (repo, PR_CLOSED_BLOCK_REASON),
+        (repo, PR_CLOSED_BLOCK_REASON, BlockReasonCode.REMOTE_BRANCH_DELETED.value),
     ).fetchall()
     registered_base = ""
     if rows:
@@ -180,6 +182,24 @@ def observe_waiting_pull_requests(
                     file=sys.stderr,
                 )
             continue
+        if stored['blocked_reason'] == BlockReasonCode.REMOTE_BRANCH_DELETED.value:
+            continue
+        from loop_manager_internal.recovery.work_branch_integration import published_branch
+        if effects.git is not None and published_branch(connection, repo, stored):
+            from loop_manager_internal.git.manager_git_journal import live_remote_branch_oid
+            from loop_manager_internal.recovery.work_branch_integration import require_remote_present
+            remote = live_remote_branch_oid(effects.git, repo_path, branch)
+            if remote != live_remote_branch_oid(effects.git, repo_path, branch):
+                raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '삭제 확인 중 원격 branch가 변경됐습니다.')
+            try:
+                require_remote_present(connection, repo, stored, remote, pull_request)
+            except RecoveryFailure as error:
+                if error.reason is not RecoveryReason.REMOTE_BRANCH_DELETED:
+                    raise
+                with connection:
+                    scoped_blocking.record_plan_block(connection, repo, str(stored['plan_id']),
+                        BlockReasonCode.REMOTE_BRANCH_DELETED, str(error), None)
+                continue
         if state == "CLOSED":
             if stored["status"] == "PR_OPEN":
                 effects._block_closed_pull_request(connection, repo, stored, url, head_oid)
@@ -204,22 +224,10 @@ def observe_waiting_pull_requests(
                     # Keep the closed-PR block until its head can be checked
                     # without replacing an unrelated planning projection.
                     continue
-                error = (
-                    "다시 열린 PR head OID가 저장된 관리 head와 다릅니다: "
-                    f"expected {expected_head}, actual {head_oid}"
-                )
-                with connection:
-                    scoped_blocking.record_project_block(
-                        connection,
-                        repo,
-                        BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN,
-                        error,
-                        expected_head,
-                        plan_id=str(stored["plan_id"]),
-                        previous_phase=None,
-                    )
-                    notifications.enqueue_current_project_events(connection, repo)
-                continue
+                if effects.git is not None:
+                    from loop_manager_internal.git.manager_git_journal import live_remote_branch_oid
+                    if live_remote_branch_oid(effects.git, repo_path, branch) != head_oid:
+                        raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '재개 PR과 원격 branch의 관측 시점이 다릅니다.')
             effects._resume_reopened_pull_request(
                 connection,
                 repo,

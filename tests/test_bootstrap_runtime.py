@@ -283,10 +283,6 @@ class BootstrapRuntimeTests(OriginScopeFixture, unittest.TestCase):
                 self.assertEqual(connection.execute(
                     "SELECT agent_snapshot FROM projects WHERE repo = ?", (str(source),)
                 ).fetchone()[0], before.serialize())
-                audit = loop_manager.execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
-                    str(source), '').snapshot['manager_metadata_agent_baseline']
-                self.assertEqual(audit['original'], hashlib.sha256(before.serialize().encode()).hexdigest())
-                self.assertIn(str(runtime.path), loop_manager.GitSnapshot.deserialize(audit['snapshot']).worktrees)
 
                 with loop_manager.process_lock(state_dir):
                     reused_legacy = loop_manager._bootstrap_service().prepare_runtime_worktree(source, state_dir)
@@ -637,7 +633,7 @@ class BootstrapSavedScopeResumeTests(unittest.TestCase):
                         self.assertEqual(proof['worktree'], str(workspace))
                         self.assertIn('runtime mutation 검증', completed.stdout)
                         if attempt == 0:
-                            self.assertIn('runtime scope 수락', completed.stdout)
+                            self.assertNotIn('Agent 범위 선검증 실패', completed.stdout)
                         if role != 'planner':
                             self.assertEqual((workspace / 'src/app.py').read_text(), 'VALUE = 2\n')
                         with contextlib.closing(sqlite3.connect(state / 'loop-manager.db')) as check, check:
@@ -759,11 +755,11 @@ class BootstrapSavedScopeFixtureUnitTests(unittest.TestCase):
                         connection, Path('repo'), worktree, before, role, effects=effects))
                     effects._current_rebase_service.return_value.require_owned.return_value = (
                         None, SimpleNamespace(status=RebaseStatus.WAITING))
-                    self.assertIsNone(scope_validation._agent_git_resources(
+                    self.assertIsNotNone(scope_validation._agent_git_resources(
                         connection, Path('repo'), worktree, before, role, effects=effects))
                     owner['phase'] = 'REVIEWING'
                 owner[role + '_session_id'] = 'unmatched-session'
-                self.assertIsNone(scope_validation._agent_git_resources(
+                self.assertIsNotNone(scope_validation._agent_git_resources(
                     connection, Path('repo'), worktree, before, role, effects=effects))
 
 
@@ -802,39 +798,17 @@ class ReviewerRebaseScopeHandoffUnitTests(unittest.TestCase):
         effects._owned_rebase_state_dir.return_value = Path('/state')
         effects.capture_git_snapshot.return_value = current
         effects._capture_agent_baseline.return_value = None
+        effects.validate_agent_scope.side_effect = AssertionError('historical Reviewer comparison')
         for status in (RebaseStatus.WAITING, RebaseStatus.COMPLETE):
             effects._current_rebase_service.return_value.require_owned.return_value = (
                 None, SimpleNamespace(status=status))
-            if status is RebaseStatus.WAITING:
-                with self.assertRaises(RuntimeError):
-                    scope_lifecycle.begin_agent_scope(connection, 'repo', Path('/managed'), 'worker', effects=effects)
-                effects.update_project.assert_not_called()
-                continue
             resumed = scope_lifecycle.begin_agent_scope(
                 connection, 'repo', Path('/managed'), 'worker', effects=effects)
+            self.assertEqual(resumed.head, current.head)
             self.assertNotEqual(resumed.scope_id, before.scope_id)
-            self.assertEqual(effects.validate_agent_scope.call_count, 2)
-            self.assertEqual(effects.validate_agent_scope.call_args_list[0].args[0], 'reviewer')
-            first_check = effects.validate_agent_scope.call_args_list[0]
-            self.assertEqual(first_check.args[2].refs, first_check.args[3].refs)
-            self.assertEqual(first_check.args[2].refs['refs/remotes/origin/main'], ('b', ''))
-            self.assertNotIn('refs/remotes/origin/main', before.refs)
+            effects.validate_agent_scope.assert_not_called()
+            effects._current_rebase_service.assert_not_called()
             self.assertEqual(effects.update_project.call_args.kwargs['agent_role'], 'worker')
-            audit = checkpoint.get('repo', 'G-047').snapshot['current_rebase_agent_baseline']
-            self.assertEqual(audit['role'], 'reviewer')
-            self.assertEqual(audit['original'], hashlib.sha256(before.serialize().encode()).hexdigest())
-        effects.reset_mock()
-        effects.validate_agent_scope.side_effect = loop_manager.AgentScopeError('Reviewer write rejected')
-        prior = checkpoint.get('repo', 'G-047')
-        with self.assertRaises(loop_manager.AgentScopeError):
-            scope_lifecycle.begin_agent_scope(connection, 'repo', Path('/managed'), 'worker', effects=effects)
-        effects.update_project.assert_not_called()
-        self.assertEqual(checkpoint.get('repo', 'G-047'), prior)
-        effects.validate_agent_scope.side_effect = None
-        effects.reset_mock()
-        checkpoint.record('repo', 'G-047', expected_generation=checkpoint.get('repo', 'G-047').generation,
-                          operation=None, expected_head='b', target_base_oid='b', observed_remote_oid=None,
-                          snapshot={})
-        with self.assertRaises(RuntimeError):
-            scope_lifecycle.begin_agent_scope(connection, 'repo', Path('/managed'), 'worker', effects=effects)
-        effects.update_project.assert_not_called()
+            audit = checkpoint.get('repo', 'G-047').snapshot['retired_agent_scopes'][-1]
+            self.assertEqual(audit['agent_role'], 'reviewer')
+            self.assertEqual(audit['agent_snapshot'], before.serialize())

@@ -14,18 +14,8 @@ from tests.support.worker import dummy_worker_sessions
 @isolated_git_test
 class ScopeConfigurationTest(AgentScopeFixture, unittest.TestCase):
 
-    def test_git_config_changes_are_rejected_without_leaking_values(self):
-        scenarios = (
-            (
-                "remote-url",
-                r"Git config 변경 .*local:remote\.origin\.url",
-            ),
-            (
-                "hooks-path",
-                r"Git config 변경 .*local:core\.hookspath",
-            ),
-        )
-        for name, expected in scenarios:
+    def test_git_config_changes_are_audit_only_without_leaking_values(self):
+        for name in ('remote-url', 'hooks-path'):
             with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
                 root = Path(directory)
                 repo, plan_path = self._repository_with_plan(directory)
@@ -51,103 +41,24 @@ class ScopeConfigurationTest(AgentScopeFixture, unittest.TestCase):
 
                 self.assertNotEqual(before.config, after.config)
                 self.assertNotIn(sensitive_value, after.serialize())
-                with self.assertRaisesRegex(
-                    loop_manager.AgentScopeError,
-                    expected,
-                ) as violation:
-                    loop_manager.validate_agent_scope(
-                        "worker",
-                        repo,
-                        before,
-                        after,
-                        selected_plan_path=plan_path,
-                    )
-                self.assertNotIn(sensitive_value, str(violation.exception))
-
-    @dummy_worker_sessions
-    def test_blocked_config_change_stops_before_git_reentry(self):
-        scenarios = (
-            (
-                "remote-url",
-                "https://secret@attacker.invalid/repo.git",
-                "local:remote.origin.url",
-            ),
-            (
-                "hooks-path",
-                "agent-hooks",
-                "local:core.hookspath",
-            ),
-        )
-        for name, configured_value, expected_key in scenarios:
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                repo = root / 'repo'
-                before = snapshot(config={expected_key: ('original-digest',)})
-                sensitive_value = (
-                    str(root / configured_value)
-                    if name == "hooks-path"
-                    else configured_value
+                loop_manager.validate_agent_scope(
+                    "worker", repo, before, after, selected_plan_path=plan_path,
                 )
-                blocked_result = replace(before, config={expected_key: ('changed-digest',)})
-                connection = sqlite3.connect(":memory:")
-                self.addCleanup(connection.close)
-                connection.row_factory = sqlite3.Row
-                connection.execute(loop_manager.SCHEMA)
-                connection.execute(
-                    """
-                    INSERT INTO projects (
-                        repo, base_branch, phase, worktree, agent_role,
-                        agent_snapshot, agent_result_snapshot
-                    ) VALUES (?, 'main', 'BLOCKED', ?, 'worker', ?, ?)
-                    """,
-                    (
-                        str(repo),
-                        str(repo),
-                        before.serialize(),
-                        blocked_result.serialize(),
-                    ),
-                )
-                connection.commit()
 
-                with mock.patch(
-                    "loop_manager.validate_repository",
-                    return_value=repo,
-                ), mock.patch(
-                    "loop_manager.migrate_legacy_execplans"
-                ) as migration, mock.patch(
-                    "loop_manager.git",
-                    side_effect=AssertionError("unsafe Git command before config validation"),
-                ) as unsafe_git, mock.patch(
-                    "loop_manager.run_codex"
-                ) as agent, mock.patch('subprocess.Popen',
-                    side_effect=AssertionError('예상 밖 process 실행')) as process, mock.patch.object(
-                    loop_manager, '_config_entries', return_value=blocked_result.config
-                ) as config:
-                    result = loop_manager.run_project(
-                        connection,
-                        root / "state",
-                        str(repo),
-                        Path("unused.ini"),
-                        "main",
-                        False,
-                    )
-
-                project = connection.execute(
-                    "SELECT phase, last_error, agent_result_snapshot "
-                    "FROM projects WHERE repo = ?",
-                    (str(repo),),
-                ).fetchone()
-                self.assertEqual(result, 1)
-                self.assertEqual(project["phase"], "PROJECT_BLOCKED")
-                self.assertIn("범위 선검증 실패", project["last_error"])
-                self.assertIn(expected_key, project["last_error"])
-                self.assertNotIn(sensitive_value, project["last_error"])
-                self.assertEqual(
-                    project["agent_result_snapshot"],
-                    blocked_result.serialize(),
-                )
-                migration.assert_not_called()
-                unsafe_git.assert_not_called()
-                agent.assert_not_called()
-                process.assert_not_called()
-                config.assert_called_once_with(repo)
+    def test_current_config_drift_does_not_restore_or_compare_saved_agent_state(self):
+        from tests.support.database import runtime_connection
+        from loop_manager_internal.agents import scope_recovery
+        current = snapshot(config={'local:core.hooksPath': ('changed-digest',)})
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        connection.execute("UPDATE projects SET worktree='/managed', agent_snapshot=?",
+                           (snapshot().serialize(),))
+        effects = replace(loop_manager._scope_recovery_effects(),
+            capture_git_snapshot=mock.Mock(return_value=current),
+            git=mock.Mock(side_effect=AssertionError('Git access comparison')))
+        with mock.patch.object(Path, 'is_dir', return_value=True):
+            self.assertEqual(scope_recovery.validate_persisted_agent_scope(
+                connection, Path('/source'), Path('/state'), 'repo', effects=effects), current)
+        effects.git.assert_not_called()
+        self.assertEqual(connection.execute('SELECT agent_snapshot FROM projects').fetchone()[0],
+                         snapshot().serialize())

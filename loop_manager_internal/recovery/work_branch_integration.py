@@ -13,6 +13,8 @@ from pathlib import Path
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 from loop_manager_internal.storage import runtime_state
+from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
+from loop_manager_internal.git import managed_rebase_adoption
 from loop_manager_internal.execution.execution_checkpoint import controlling_git_operation
 
 
@@ -38,8 +40,8 @@ def _preserve_conflict(effects, repo, worktree, snapshot):
 
 
 def _successor_restart(effects, worktree, restart, remote):
-    """Retarget preserved input only to a fetched descendant of its last input."""
-    relation = effects.git(worktree, 'merge-base', '--is-ancestor',
+    """Retarget preserved input only to a fetched, related task history."""
+    relation = effects.git(worktree, 'merge-base',
                            restart['remote'], remote, check=False)
     if relation.returncode != 0:
         raise RuntimeError('보존된 충돌 재시작 입력의 후속 commit을 확인할 수 없습니다.')
@@ -146,6 +148,145 @@ def restart_base_rebase(effects, connection, repo_path, state_dir, repo, plan, r
         expected_head=now.head, target_base_oid=remote,
         observed_remote_oid=current.observed_remote_oid,
         snapshot={**(current.snapshot or {}), 'base_rebase_restart': {**restart, 'phase': 'complete'}})
+
+
+def published_branch(connection, repo, plan):
+    if plan['publication_remote_oid']:
+        return plan['publication_remote_oid']
+    published = connection.execute(
+        'SELECT published_oid FROM blocked_checkpoints WHERE repo=? AND plan_id=?',
+        (repo, plan['plan_id'])).fetchone()
+    return published['published_oid'] if published else None
+
+
+def require_remote_present(connection, repo, plan, remote, pull_request):
+    from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+    if remote is not None or pull_request and (pull_request.get('state') == 'MERGED' or pull_request.get('mergedAt')):
+        return
+    current = ExecutionCheckpointRepository(connection).get(repo, str(plan['plan_id']))
+    if (current.snapshot or {}).get('fresh_remote_creation'):
+        return
+    if published_branch(connection, repo, plan):
+        raise RecoveryFailure(RecoveryReason.REMOTE_BRANCH_DELETED,
+            'Manager 소유 원격 작업 브랜치가 Merge 전에 삭제됐습니다. '
+            f"명시적 재시작 요청이 필요합니다: {plan['branch']}")
+
+
+def synchronize(effects, connection, repo_path, state_dir, repo, plan, remote, pull_request):
+    """현재 작업의 원격 입력을 보존해 통합하고 게시 lease와 구분한다."""
+    from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+    from loop_manager_internal.storage import runtime_state
+    branch, worktree = str(plan['branch']), Path(plan['worktree'])
+    require_remote_present(connection, repo, plan, remote, pull_request)
+    if remote is None:
+        return False
+    if pull_request:
+        project = connection.execute('SELECT base_branch FROM projects WHERE repo=?', (repo,)).fetchone()
+        if (plan['pr_url'] and pull_request.get('url') != plan['pr_url']
+                or pull_request.get('headRefName') != branch
+                or pull_request.get('baseRefName') not in (None, project['base_branch'])):
+            raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN, '현재 작업과 PR 대상이 다릅니다.')
+        if pull_request.get('headRefOid') != remote:
+            raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '원격 branch와 PR head 관측 시점이 다릅니다.')
+    current = ExecutionCheckpointRepository(connection).get(repo, str(plan['plan_id']))
+    acceptance = (current.snapshot or {}).get('current_rebase_acceptance') or {}
+    known = (plan['publication_remote_oid'] or published_branch(connection, repo, plan)
+             or (acceptance.get('remote') or {}).get('oid'))
+    integration = (current.snapshot or {}).get('work_branch_integration') or {}
+    pending = bool(integration and integration.get('phase') != 'complete')
+    if remote == (current.snapshot or {}).get('accepted_work_branch') and not pending:
+        return False
+    effects.validate_execplan_workspace_identity(state_dir, repo,
+        manual_workspace_owner(connection, repo, str(plan['plan_id'])), branch, worktree)
+    effects.validate_managed_worktree(repo_path, worktree, branch, allow_rebase=current.operation == 'rebase')
+    project = connection.execute('SELECT origin FROM projects WHERE repo=?', (repo,)).fetchone()
+    for context in (repo_path, worktree):
+        for args in (('remote', 'get-url', '--all', 'origin'), ('remote', 'get-url', '--push', '--all', 'origin')):
+            urls = effects.git(context, *args).stdout.splitlines()
+            if len(urls) != 1 or effects.github_repository(urls[0]) != project['origin']:
+                raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN, '현재 등록 origin과 Git 대상이 다릅니다.')
+    effects.git(repo_path, 'fetch', '--no-tags', 'origin',
+                f'+refs/heads/{branch}:refs/remotes/origin/{branch}')
+    fetched = effects.git(repo_path, 'rev-parse', 'FETCH_HEAD^{commit}').stdout.strip()
+    live = effects.git(repo_path, 'ls-remote', '--heads', 'origin', f'refs/heads/{branch}').stdout.splitlines()
+    if fetched != remote or [line.split() for line in live] != [[remote, f'refs/heads/{branch}']]:
+        raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '작업 branch가 fetch 사이에 변경됐습니다.')
+    metadata_error = effects._blocked_execplan_revision_metadata_error(repo_path, remote, plan)
+    if metadata_error:
+        raise RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, metadata_error)
+    before = effects.capture_git_snapshot(worktree)
+    if current.operation == 'push' and remote != current.expected_head:
+        contains = effects.git(worktree, 'merge-base', '--is-ancestor', current.expected_head, remote, check=False)
+        if contains.returncode not in (0, 1):
+            raise RecoveryFailure(RecoveryReason.STATUS_FAILED, '중단된 게시 후보의 현재 원격 포함 여부를 확인할 수 없습니다.')
+        current = ExecutionCheckpointRepository(connection).record(repo, str(plan['plan_id']),
+            expected_generation=current.generation, operation=None, expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+            snapshot={**(current.snapshot or {}), 'retired_publications': [
+                *(current.snapshot or {}).get('retired_publications', ()),
+                {'operation': 'push', 'head': current.expected_head,
+                 'remote_before': (current.snapshot or {}).get('remote_before'),
+                 'observed_remote': remote, 'candidate_present': contains.returncode == 0,
+                 'command_success_confirmed': False}]})
+    if current.operation == 'rebase' and remote != known and not integration:
+        service = effects._current_rebase_service(connection, repo_path, state_dir, repo,
+            str(plan['plan_id']), worktree, branch, remote_oid=remote)
+        _, decision = service.require_owned(checkpoint=current)
+        if decision.status.value != 'complete':
+            # Finish the pinned operation first; a successor must not erase
+            # resolutions already present in this index/worktree.
+            checkpoints = ExecutionCheckpointRepository(connection)
+            checkpoints.record(repo, str(plan['plan_id']), expected_generation=current.generation,
+                operation=current.operation, expected_head=current.expected_head,
+                target_base_oid=current.target_base_oid, observed_remote_oid=remote,
+                snapshot={**(current.snapshot or {}), 'rebase_remote_oid': remote,
+                          'pending_work_branch_input': remote})
+            if pull_request and plan['pr_url']:
+                values = {'pr_head_oid': remote}
+                if plan['pr_conflict_recovery']:
+                    values['pr_conflict_head_oid'] = remote
+                runtime_state.RuntimeStateRepository(connection).update_project(repo, values)
+            return False
+        restart_base_rebase(effects, connection, repo_path, state_dir, repo, plan, remote, before)
+        current = ExecutionCheckpointRepository(connection).get(repo, str(plan['plan_id']))
+        before = effects.capture_git_snapshot(worktree)
+    ignored = effects._nul_git_paths(worktree, 'ls-files', '--others', '--ignored', '--exclude-standard', '-z')
+    changed_paths = effects._nul_git_paths(worktree, 'diff', '--no-renames', '--name-only', '-z', before.head, remote, '--')
+    if any(local == path or local.startswith(path + '/') or path.startswith(local + '/')
+           for local in ignored for path in changed_paths):
+        raise RecoveryFailure(RecoveryReason.OWNERSHIP_UNCERTAIN, '원격 변경과 ignored 로컬 작업물이 직접 충돌합니다.')
+    if controlling_git_operation(before.operations) and current.operation != 'rebase':
+        raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '사용자 Git 작업이 진행 중입니다.')
+    if current.operation == 'rebase' and remote == known and not pending:
+        return False
+    ancestor = effects.git(worktree, 'merge-base', '--is-ancestor', remote, before.head, check=False)
+    if ancestor.returncode not in (0, 1):
+        raise RecoveryFailure(RecoveryReason.STATUS_FAILED, '현재 작업 branch의 변경 관계를 확인할 수 없습니다.')
+    after = before
+    if (ancestor.returncode == 1 and remote != known) or pending:
+        if effects.git(worktree, 'merge-base', before.head, remote, check=False).returncode:
+            raise RecoveryFailure(RecoveryReason.PLAN_INPUT_INVALID, '작업 branch의 공통 이력을 확인할 수 없습니다.')
+        try:
+            after = integrate(effects, connection, repo_path, state_dir, repo, plan, remote, before)
+        except RuntimeError as error:
+            if effects.capture_git_snapshot(worktree).operations:
+                raise RecoveryFailure(RecoveryReason.REBASE_CONFLICT, str(error)) from error
+            raise
+    checkpoints = ExecutionCheckpointRepository(connection)
+    current = checkpoints.get(repo, str(plan['plan_id']))
+    checkpoints.record(repo, str(plan['plan_id']), expected_generation=current.generation,
+        operation=current.operation, expected_head=after.head,
+        target_base_oid=current.target_base_oid, observed_remote_oid=remote,
+        snapshot={**(current.snapshot or {}), 'accepted_work_branch': remote, 'pending_work_branch_input': None})
+    if pull_request and plan['pr_url']:
+        runtime_state.RuntimeStateRepository(connection).update_project(repo, {'pr_head_oid': remote})
+    changed = after.head != before.head or after.index != before.index or after.dirty != before.dirty
+    if changed and plan['status'] in runtime_state.ACTIVE_STATUSES:
+        values = managed_rebase_adoption.revalidation_values(plan['active_sha'])
+        values.pop('worker_result', None)
+        values['phase'] = 'VERIFYING' if plan['worker_result'] else 'WORKING'
+        runtime_state.RuntimeStateRepository(connection).update_project(repo, values)
+    return changed
 
 
 def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, snapshot):
@@ -302,7 +443,9 @@ def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, sna
                 connection, repo_path, repo, plan_id, worktree, branch, remote,
                 observed_remote=(remote,), agent_session_id=plan['worker_session_id'])
             if result.returncode:
-                raise RuntimeError('작업 branch 통합이 충돌 해결을 기다립니다: ' + result.stdout[-2000:])
+                detail = '작업 branch 통합이 충돌 해결을 기다립니다: ' + result.stdout[-2000:]
+                save({**intent, 'conflict_detail': detail}, head=current.expected_head, operation='rebase')
+                raise RuntimeError(detail)
         current = checkpoints.get(repo, plan_id)
         service = effects._current_rebase_service(
             connection, repo_path, state_dir, repo, plan_id, worktree, branch,
@@ -313,14 +456,16 @@ def integrate(effects, connection, repo_path, state_dir, repo, plan, remote, sna
                 connection, repo_path, repo, plan_id, worktree, branch, remote,
                 observed_remote=(remote,), agent_session_id=plan['worker_session_id'])
             if result.returncode:
-                raise RuntimeError('작업 branch 통합이 충돌 해결을 기다립니다: ' + result.stdout[-2000:])
+                detail = '작업 branch 통합이 충돌 해결을 기다립니다: ' + result.stdout[-2000:]
+                save({**intent, 'conflict_detail': detail}, head=current.expected_head, operation='rebase')
+                raise RuntimeError(detail)
             current = checkpoints.get(repo, plan_id)
             service = effects._current_rebase_service(
                 connection, repo_path, state_dir, repo, plan_id, worktree, branch,
                 target=remote, remote_oid=remote)
             observed, decision = service.require_owned()
         if decision.status.value != 'complete':
-            raise RuntimeError('작업 branch 통합의 수동 해결을 기다립니다.')
+            raise RuntimeError(intent.get('conflict_detail') or '작업 branch 통합의 수동 해결을 기다립니다.')
         # Accept only the stable current result. Publication stays with the
         # existing checkpoint/base boundary and its exact remote lease.
         complete(service, observed, decision)

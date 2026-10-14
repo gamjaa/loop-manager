@@ -359,7 +359,7 @@ class PublishedCheckpointResumeTests(ExecutionFixture, TestCase):
               mock.patch.object(lm, 'validate_agent_scope', wraps=lm.validate_agent_scope) as scope,
               mock.patch.object(lm, 'validate_blocked_agent_scope',
                                 wraps=lm.validate_blocked_agent_scope) as validation):
-            self.assertFalse(self.resume_project())
-        validation.assert_called_once()
-        self.assertGreater(scope.call_count, 0)
-        self.assertIsNotNone(scoped_blocking.project_block(self.connection, self.repo))
+            self.assertTrue(self.resume_project())
+        validation.assert_called()
+        scope.assert_not_called()
+        self.assertIsNone(scoped_blocking.project_block(self.connection, self.repo))

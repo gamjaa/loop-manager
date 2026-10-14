@@ -259,7 +259,7 @@ class ProjectRecoveryTransitionUnitTests(ProjectBlockedRemoteFixture, unittest.T
         checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection)
         before = checkpoints.get(self.repo, 'G-106')
         effects = mock.Mock()
-        effects.capture_git_snapshot.return_value = SimpleNamespace(serialize=lambda: 'candidate')
+        effects.capture_git_snapshot.return_value = SimpleNamespace(head='current', dirty={}, branch='loop-manager/G-106', index={}, operations={}, serialize=lambda: 'candidate')
         effects._clear_project_block_without_losing_planning_error.side_effect = (
             project_block_service._clear_project_block_without_losing_planning_error)
         self.assertTrue(scope_reconciliation.resume_project_block_if_safe(

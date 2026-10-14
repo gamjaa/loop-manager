@@ -1029,6 +1029,9 @@ class RuntimeStateRepository:
             check_owner()
             separate_block = not is_plan_block and expected_plan['status'] == 'PLAN_BLOCKED'
             values = revalidation_values(current_checkpoint.target_base_oid)
+            retired_scope = scoped_blocking.is_scope_baseline_block(block)
+            if retired_scope:
+                values['agent_recovery'] = None
             phase = values.pop('phase')
             values['status'] = 'PLAN_BLOCKED' if separate_block else 'IMPLEMENTING'
             if separate_block:
@@ -1049,7 +1052,8 @@ class RuntimeStateRepository:
                     prior_artifacts={key: expected_plan[key] for key in (
                         'worker_result', 'worker_input_token', 'verify_result', 'review_result',
                         'verify_token', 'review_token', 'publication_token', 'last_error')}
-                        | {'released_rebase_block': dict(block)})
+                        | {'released_rebase_block': dict(block),
+                           'prior_agent_recovery': expected_plan['agent_recovery']})
                 self._fault('after_rebase_acceptance')
             else:
                 checkpoint_repository.record(
@@ -1062,13 +1066,17 @@ class RuntimeStateRepository:
                               'rebase_block_release_state': observed.fingerprint,
                               'rebase_block_recovery_audit': [
                                   *(current_checkpoint.snapshot or {}).get('rebase_block_recovery_audit', ()),
-                                  {'block': dict(block), 'prior_artifacts': {key: expected_plan[key] for key in (
+                                  {'block': dict(block), 'prior_agent_recovery': expected_plan['agent_recovery'],
+                                   'prior_artifacts': {key: expected_plan[key] for key in (
                                       'worker_result', 'verify_result', 'review_result', 'last_error')}}]})
             scoped_blocking.clear_revalidated_rebase_block(
                 self.connection, block, is_plan_block=is_plan_block)
             self._fault('after_rebase_block_release')
             recovery_state.RecoveryRepository(self.connection).resolve_rebase_block(
                 repo, plan_id, block)
+            if retired_scope:
+                recovery_state.RecoveryRepository(self.connection).resolve_git_scope_failure(repo, plan_id)
+                recovery_state.RecoveryRepository(self.connection).resolve_git_scope_failure(repo, None)
             if is_plan_block:
                 values.update(blocked_reason=None, blocked_fingerprint=None,
                               blocked_worktree_fingerprint=None, blocked_review_fingerprint=None)

@@ -26,21 +26,23 @@ Loop Manager는 각 프로젝트의 기본 worktree 동기화 여부를 결정�
 
 bootstrap/source checkout의 HEAD·index·tracked·untracked·ignored 파일 상태는 Planner·Worker·Reviewer가 소유하는 관리 worktree 변경 범위가 아니다. source가 dirty하거나 Agent 실행 중 local 상태가 바뀌었다는 사실만으로 Agent Git 범위 위반 또는 `PROJECT_BLOCKED`를 만들지 않는다. 그 상태는 R-056의 부수적인 로컬 동기화 판단에만 사용하며 자동 작업 입력·실행·차단 해제 조건에서 제외한다.
 
-모든 등록 프로젝트의 Agent Git 범위 판정은 현재 단계의 안전에 필요한 최소 상태만 대상으로 한다. 선택된 관리 worktree의 identity·등록·branch·HEAD·index·허용 파일 변경과 현재 작업이 실제로 사용하는 소유 branch, 원격 base ref, 게시 원격 ref·PR head, 해당 Git 작업에 영향을 주는 config·operation을 검증한다. 사용하지 않는 다른 branch·tag·ref와 다른 worktree의 독립적인 등록·HEAD·index·파일 변화는 Agent 변경으로 귀속하거나 `PLAN_BLOCKED`·`PROJECT_BLOCKED`의 단독 원인으로 삼지 않는다. 해당 자원을 나중에 사용하게 되면 사용 직전에 실제 값과 소유권을 확인한다. 검증된 원격 base 전진은 기존 fetch·rebase·재검증 흐름으로 처리한다. 그 밖에 현재 작업에 영향을 미치는 예상 밖 변화 또는 영향 여부를 증명할 수 없는 변화는 계속 안전 차단한다.
+모든 등록 프로젝트의 Agent 접근 권한은 provider의 sandbox와 역할별 쓰기 정책으로 강제한다. Git 상태의 전후 차이를 접근 권한 위반으로 판정하는 검사는 R-055에 따라 제거한다. Manager는 작업 ID와 등록 규칙으로 정한 대상에서 동기화·게시·정리를 수행하고, 해당 Git 동작과 후보 검증에 필요한 현재 조건만 확인한다. 다른 작업의 branch·ref·worktree 변경이나 과거 snapshot 불일치는 Agent 위반·프로젝트 차단의 근거가 아니다.
 
-사용자는 Agent 실행 중에도 문서나 코드를 `<base-branch>`에 직접 commit·push할 수 있다. 원격 base의 편집·게시 주체가 Loop Manager뿐이라는 전제를 두지 않는다. 이 원격 전진이 현재 원격과 Git 상태로 확인되고 Agent의 공유 Git metadata 쓰기와 구분되면, 진행 중인 계획의 기존 branch·worktree·session을 보존한 채 Manager가 최신 base를 fetch하고 필요한 관리 rebase, 후보 검증과 Review를 다시 수행한다. 사용자 push를 관측했다는 사실만으로 Worker의 공유 ref 쓰기나 원격 lease·소유권 불일치를 허용하지 않는다.
+사용자는 Agent 실행 중에도 문서나 코드를 `<base-branch>`에 직접 commit·push할 수 있다. Manager는 현재 원격 원본을 기준으로 기존 branch·worktree·session을 보존해 필요한 rebase·후보 검증·Review를 수행한다. 원격 작업 브랜치에 추가된 작업의 받아오기·통합과 기존 게시 이력 재작성에 대한 조건부 force push는 R-055의 변경 관계·이번 게시 OID 기준으로 구분한다.
 
-다른 프로세스의 fetch/push로 remote-tracking ref·FETCH_HEAD가 바뀌는 것은 모든 단계에서 정상 관측 입력이다. ref 변화만으로 Agent 위반·프로젝트 차단을 만들지 않고 현재 origin·선택 자원·실제 원격을 재확인한다. 실제 후보·검증 입력이 바뀐 경우만 필요한 통합·재검증으로 연결한다. 관측 경쟁은 제한 재시도·대기, 원격 삭제·재작성·게시 권한 불확실성은 해당 통합·게시 보류로 처리하며 로컬 수용과 분리한다.
+다른 프로세스의 fetch/push로 remote-tracking ref·FETCH_HEAD가 바뀌는 것은 모든 단계에서 정상 관측 입력이다. ref 변화만으로 Agent 위반·프로젝트 차단을 만들지 않고 현재 origin·선택 자원·실제 원격을 재확인한다. 실제 후보·검증 입력이 바뀐 경우만 필요한 통합·재검증으로 연결한다. 관측 경쟁은 제한 재시도·대기로 처리하고, 확인 가능한 동일 작업의 이력 재작성은 R-055의 정상 처리로 연결한다. 현재 작업 목표·소유 대상·복구 원본이 확인된 충돌 복구 불가 파일은 R-055의 파일별 원본 복원·재작업으로 처리하고 다른 파일·index 상태와 기존 commit을 유지한다. 원격 삭제 의도·필수 결정·작업 대상이나 실제 게시 권한을 확정할 수 없으면 해당 통합·게시만 보류하며 로컬 수용과 분리한다.
 
-외부 변경 수용은 Manager의 과거 Git 작업을 증명하는 것과 다르다. journal·receipt·reflog·원본 Agent snapshot을 고치거나 격리 성공을 합성하지 않는다. 격리 증거 없는 legacy 기본 checkout도 R-055의 A안대로 비교에서 제외하지만 실제 범위 밖 쓰기 증거·선택 자원 위반·보안 설정 변조는 보존한다.
+Manager가 생성·게시한 원격 작업 branch가 실제 삭제됐고 PR이 Merge되지 않았다면 R-055에 따라 해당 작업을 중단하고 명시적 재시작을 기다린다. runtime 또는 Manager 프로세스의 정상 재시작·handoff만으로 그 작업을 재개하거나 branch를 재생성하지 않는다. 사용자의 작업 재시작 요청은 최신 원본에서 새 실행을 준비하는 입력이며 과거 작업·session·게시 감사와 독립 gate를 유지한다.
 
-refs/remotes/origin/HEAD가 사용 대상이면 symbolic target과 파생 OID를 구분한다. 같은 target의 정상 OID 변화와 등록 origin·예상 target·실제 OID로 확인한 최초 생성은 fetch의 관측 입력이다. target 변조·삭제·잘못된 target/OID와 실제 Agent ref 쓰기는 보호한다.
+journal·receipt·reflog·원본 Agent snapshot과 호출·정책 감사는 보존한다. 과거 격리 ledger 부재나 호출 실패·재시도·단계 전환을 이유로 Git snapshot 접근 권한 검사를 재활성화하거나 격리 성공을 합성하지 않는다.
 
-위 Git metadata 귀속 판정은 Agent 결과 검사, 저장 단계 선검증, PLAN_BLOCKED·PROJECT_BLOCKED 재평가와 정상·진단 checkpoint 안전 검사에 일관되게 적용한다. snapshot·호출 증거·현재 Git 상태가 같으면 검사 경로만 바뀌었다는 이유로 정상 base 전진이나 파생 HEAD 변화를 다시 공유 ref 위반으로 판정하지 않는다. R-020의 선택 runtime identity와 R-055의 checkpoint 요청 재검증도 같은 경계를 따른다. 자료 수집·정상 게시·진단 게시의 개별 소유권·범위·Git operation 허용 조건은 유지한다.
+refs/remotes/origin/HEAD를 원격 선택에 실제로 사용하는 경우 현재 symbolic target과 원격을 확인한다. 파생 OID 변화·최초 생성·삭제는 접근 권한 판정에 사용하지 않으며, 필요한 원격 기준을 확인할 수 없는 경우 해당 원격 선택만 재관측·보류한다.
 
-Agent는 선택 관리 worktree 밖 파일·shared Git metadata를 쓸 권한이 없다. 신규 호출의 provider 격리는 계속 확인하되 기본 checkout의 비교 제외를 legacy 격리 증거의 존재에 결합하지 않는다. 일반 verify의 실행 대상 검사·무관한 외부 fetch와 BLOCKED 수동 입력 수용은 R-055를 적용하며 branch·push·PR 소유권을 확대하지 않는다.
+위 책임 분리를 Agent 결과·저장 단계 재개·PLAN_BLOCKED·PROJECT_BLOCKED 재평가와 정상·진단 checkpoint에 동일하게 적용한다. 실제 Git 작업 조건과 후보 검증은 유지하고 낡은 비교 기준으로 정상 변경을 다시 거부하지 않는다. 기존 Git 오탐·지속 실행 실패의 자동 해소와 수동 입력 수용은 R-055를 따른다.
 
-Planner·Worker·Reviewer와 유지보수 Planner는 각 호출에서 선택된 관리 worktree를 workspace로 사용하며, provider의 내장 쓰기 제한을 우선 적용한다. 작업 디렉터리 지정만으로 제한이 적용됐다고 간주하지 않는다. 기본 source checkout, 다른 worktree와 shared Git metadata는 쓰기 허용 범위에 포함하지 않고, Reviewer는 선택된 worktree도 읽기 전용으로 사용한다. workspace 쓰기 허용은 해당 역할의 문서·파일 변경 범위를 확대하지 않으며, 기존 역할별 변경 검사는 유지한다. 필요한 임시 작업은 해당 실행에 소유권이 있는 제한된 경로에서만 허용한다.
+Agent는 선택 관리 worktree 밖 파일·shared Git metadata를 쓸 권한이 없으며 이를 sandbox로 제한한다. 일반 verify는 실행한 후보·검증 입력을 확인하고 branch·push·PR의 Manager 책임을 확대하지 않는다.
+
+Planner·Worker·Reviewer와 유지보수 Planner는 각 호출에서 선택된 관리 worktree를 workspace로 사용하며, provider의 내장 쓰기 제한을 적용한다. 작업 디렉터리 지정만으로 제한이 적용됐다고 간주하지 않는다. 기본 source checkout, 다른 worktree와 shared Git metadata는 쓰기 허용 범위에 포함하지 않고, Reviewer는 선택된 worktree도 읽기 전용으로 사용한다. workspace 쓰기 허용은 해당 역할의 문서·파일 변경 범위를 확대하지 않으며 역할별 최종 문서·결과 검증은 유지한다. 필요한 임시 작업은 해당 실행에 소유권이 있는 제한된 경로에서만 허용한다.
 
 Codex를 기본 provider와 기능·검증 수준의 기준으로 삼고 Claude도 같은 기능을 제공하는 전제로 지원한다. provider별 명칭·설정·호출 방식의 차이는 해당 provider 정책으로 대응한다. Claude는 기존 내장 기능의 실행별 설정, 파일 권한과 명령 sandbox를 조합해 역할별 쓰기 경계를 구성한다. 추가 디렉터리·쓰기 경로의 허용만으로 범위 밖 쓰기가 모두 차단된다고 판단하지 않으며, 상속 설정·배열 병합·기본 임시 경로까지 포함한 유효 정책을 확인한다. 구체적인 정책 조합은 ARCHITECTURE의 R-023 설계를 따른다.
 
@@ -54,9 +56,9 @@ Codex와 Claude의 자동 승인 검토는 쓰기 제한과 함께 유지한다.
 
 격리 적용·거부와 실제 효력 확인 결과는 provider·CLI 버전·실행 환경·역할·선택된 canonical worktree·repository identity·유효 설정·Agent session 및 개별 호출에 결합해 보존한다. CLI 인자나 설정의 존재만으로 격리 확인을 기록하지 않는다. Codex의 직접 실행과 확인 범위는 R-050을 따른다. Agent의 파일 변경·도구 실행에 적용되는 내장 정책을 확인하며, Codex 프로세스 전체의 내부 쓰기·mount 상태나 중첩 sandbox 호환성을 추가 증명 조건으로 요구하지 않는다. 정상 인증·session·로그 저장과 기존 PRODUCT가 허용한 Codex 임시 ref는 Agent의 workspace 밖 쓰기 권한과 구분한다. Claude도 같은 확인 수준을 적용한다. 공식 지원 기능, 병합 후 유효 정책, 역할별 workspace·파일 도구·shared Git 보호 설정과 호출 연결을 확인하며, 유료 모델 호출로 금지 쓰기나 승인 검토를 매번 시연하는 절차는 시작 조건으로 요구하지 않는다. 실제 실행에서 확인된 미지원·정책 충돌·초기화 실패는 해당 호출을 중단하고 보존하며, 개발 환경의 CLI·계정 부재만으로 별도의 사용자 정책 결정이나 지원 구현 차단을 만들지 않는다. 세션 재개, provider·설정 변경과 중단 뒤의 새 호출에서는 다시 확인한다. 비밀값이나 source checkout의 로컬 파일 내용은 증거에 저장하지 않는다.
 
-Loop Manager 자신이 process lock 아래 수행한 fetch, 관리 worktree 생성·정리·rebase, source safe fast-forward와 runtime worktree 생성·정리는 각 작업의 소유 대상, 실행 전 기대 상태와 실행 뒤 실제 결과를 연결한 durable checkpoint로 증명한다. Agent 시작 snapshot 이후 Manager 작업이 있었다면, 해당 checkpoint와 실제 Git 상태가 정확히 일치하는 부분만 Agent 범위 판정 전에 기준선에 반영한다. Agent의 원래 허용 파일 변경과 session·실행 증거는 보존하며, 불완전한 checkpoint나 관측 OID만으로 Manager 소유권을 추정하지 않는다. Git 작업과 상태 저장 사이에 중단돼도 같은 증거로 재개하고, 다른 주체의 변화가 섞였으면 영향을 받는 작업을 차단한다.
+Loop Manager가 수행한 fetch·worktree 생성·정리·rebase·source 동기화는 실제 동작과 중단 복구에 필요한 대상·기대 상태·결과를 durable checkpoint로 보존한다. 이 기록은 미완료 Git 작업의 재개에 사용하며 Agent의 과거 snapshot을 현재 상태에 맞추는 절차를 요구하지 않는다. 중단 뒤 현재 원격·작업물과 완료 상태를 확인해 필요한 동기화·확정·재검증부터 이어간다.
 
-저장된 PLAN_BLOCKED·PROJECT_BLOCKED의 기본 checkout·정상 외부 fetch 오탐은 R-055의 현재 자원 검사로 해당 원인만 재평가한다. 사용자 인계 뒤 수동 파일·staging·commit·rebase 결과를 현재 입력으로 수용하며 과거 snapshot 복원을 요구하지 않는다. writer 종료·현재 identity·소유권·실제 위반·독립 차단·session·감사를 확인하고 바뀐 후보의 필요한 검증을 다시 수행한다. 로컬 동기화 실패는 별도 해제 gate가 아니다.
+저장된 Git 오탐의 planning 오류·PLAN_BLOCKED·PROJECT_BLOCKED·지속 실행 실패는 R-055에 따라 입력 지문 변경이나 수동 DB 수정 없이 자동 재평가한다. 사용자 인계 뒤 파일·staging·commit·rebase 결과를 현재 입력으로 수용하며 session·작업물·실패 감사와 독립 차단을 보존한다. 로컬 동기화 실패나 과거 snapshot 불일치는 별도 해제 gate가 아니다.
 
 runtime 자식은 bootstrap이 전달하고 검증한 canonical source checkout, 현재 runtime SHA, repository identity와 origin을 이용해 등록 프로젝트가 실행 중인 Loop Manager 자신인지 결정해야 한다. 자기 자신으로 인정하려면 등록된 canonical repository path가 runtime source와 같고 실제 Git repository 및 origin identity도 일치해야 한다. 디렉터리 이름, 프로젝트 표시명, 원격 저장소 이름 또는 경로 prefix만으로 자기 자신으로 판단하지 않는다.
 
@@ -83,13 +85,13 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 - 로컬 변경과 충돌하거나 소유권·동시 변경 때문에 안전한 동기화가 불가능하면 보존·skip 이유를 기록한다. ahead-only는 보존하고, 안전한 diverged의 로컬 commit rebase는 R-056에 한해서 허용하며 reset·stash·autostash·강제 checkout은 수행하지 않는다.
 - source checkout의 dirty·sync skip·HEAD 차이는 검증한 `origin/<base-branch>`에서 수행하는 Planner·Worker workspace 생성, 기존 workspace 재개, PR conflict rebase와 검증을 막지 않는다.
 - Planner·Worker·Reviewer 실행 전후 bootstrap/default worktree의 HEAD·index·파일·dirty 상태만 달라진 경우 이를 해당 Agent의 변경으로 귀속하거나 `PROJECT_BLOCKED`를 만들지 않는다.
-- 선택된 관리 worktree와 현재 단계가 실제로 사용하는 ref·worktree·Git config·operation만 Agent 범위와 Git 작업 직전 안전 검사의 대상으로 삼는다. 실행과 무관한 `draft` 등 다른 local branch·tag·ref 또는 다른 worktree의 독립적인 변동만으로 Agent 범위 위반이나 프로젝트 차단을 만들지 않는다. 사용하게 되는 자원은 사용 직전에 다시 검증한다.
-- 신규·legacy 실행과 일반 verify의 정상 외부 fetch는 R-055의 공통 자원 판정을 따른다. 저장 Agent 격리 증거 부재·Manager 표식 불연속·tracking OID 변경만으로 전체 snapshot 비교나 최종 차단을 만들지 않는다. 실제 위반과 현재 자원 불확실성은 보존한다.
-- 같은 target의 파생 `origin/HEAD` OID 전진과 증명된 최초 생성은 위 조건에서 처리하고, target 변조·삭제·OID 불일치와 실제 Agent 위반 혼합은 거부한다. Agent 결과·저장 선검증·계획/프로젝트 복구·checkpoint에서 동일 증거의 수락·거부 결과가 일치한다.
-- 사용자가 Worker 실행 중 `<base-branch>`에 문서 또는 코드 commit을 직접 push하고 원격 base가 전진해도, 확인된 외부 변경을 Worker 범위 위반으로 차단하지 않는다. Manager는 기존 작업물과 session을 보존해 최신 base에 rebase하고 변경된 후보의 필요한 Worker 확인·targeted test·전체 verify·Review를 거친다. 같은 시점의 실제 Agent 공유 ref 변경이나 증명되지 않은 Git 변화는 이 예외로 해제하지 않는다.
-- 선택 worktree 오연결·역할 밖 파일/index 쓰기·origin 또는 보안 설정 변조·동일 자원 writer와 미완료 operation은 보호한다. 정상 원격 변경은 재관측·통합으로 처리하고 로컬 수용과 게시 lease를 분리한다. 기본 checkout은 legacy에도 비교에서 제외하며 다른 자원의 실제 위반을 이 예외로 숨기지 않는다.
-- Agent 시작 뒤 Manager가 수행한 fetch·worktree 생성/정리·rebase·source 갱신은 실행 전후 상태와 durable checkpoint가 일치할 때만 기준선에 반영한다. Manager rebase로 HEAD·소유 branch ref·선택된 worktree index가 바뀐 뒤 재시작해도 낡은 Agent 시작 snapshot과의 차이만으로 차단하지 않으며, Agent의 허용 파일 변경과 session을 보존한다. Manager 변화와 예상 밖 영향권 변화가 섞였거나 checkpoint가 불완전하면 해당 영향을 안전 차단한다.
-- 기존 default_worktree_mutation과 동일 유형의 저장 차단은 legacy에도 기본 checkout 복원 없이 현재 선택 자원으로 재평가한다. 수동 입력 수용·후보 검증 무효화·역사 증거와 독립 원인 보존은 R-055를 따른다.
+- Agent 접근 권한은 sandbox로 강제되고 Git 상태 차이를 위반으로 판정하는 검사는 신규·legacy·재개·fallback·일반 verify·checkpoint 경로에서 제거된다. Manager Git 작업과 후보 검증의 현재 조건은 유지된다.
+- 호출 실패·성공한 재시도·ledger 부재·역할 단계 전환과 다른 작업의 ref/worktree 변경이 snapshot 비교를 재활성화하거나 최종 차단을 만들지 않는다.
+- 파생 `origin/HEAD`의 OID 변화·최초 생성은 Agent 위반을 만들지 않는다. 실제 사용하는 원격 선택 기준을 확인할 수 없으면 해당 선택만 재관측·보류하며 과거 snapshot 복원을 요구하지 않는다.
+- 사용자가 Worker 실행 중 `<base-branch>`에 push해도 Manager는 기존 작업물·session을 보존해 최신 원본에 rebase하고 바뀐 후보의 필요한 Worker 확인·targeted test·전체 verify·Review를 거친다. 원격 작업 브랜치의 추가 작업 통합과 조건부 force push는 R-055대로 구분된다.
+- 실제 Git 작업의 대상·origin·동일 자원 writer·미완료 operation과 최종 문서·구현 결과는 해당 동작의 조건으로 확인한다. sandbox의 실제 거부·정책 오류는 Git 상태 변화와 별도로 보존한다.
+- Manager의 fetch·worktree 생성/정리·rebase·source 갱신 뒤 중단돼도 실제 완료 상태에서 재개하며 낡은 Agent snapshot이나 부족한 범위 비교 기준선 때문에 거부하지 않는다. 후보 변경은 필요한 재검증으로 연결된다.
+- 기존 Git 오탐 차단과 pending 확인 요청은 같은 입력의 정상 실행·재시작에서 자동 해소된다. 사용자 작업·session·역사 감사·독립 차단을 보존하고 실제 미해결 원인은 해당 동작의 복구·보류로 처리한다.
 - `MERGEABLE` 또는 `UNKNOWN`인 Open PR만 있고 새 Merge 완료가 없으면 기존 PR 대기 및 충돌 복구 권한을 변경하지 않는다. `CONFLICTING` 판정도 기존 소유권, worktree와 explicit lease 조건을 유지한다.
 - runtime source와 같은 canonical repository path이며 실제 repository 및 origin identity가 일치하는 등록 프로젝트만 self로 판정한다. 같은 이름, 같은 origin만 가진 다른 clone, source 하위 경로, symlink alias 또는 state directory 아래 runtime 경로를 self source로 오인하지 않는다.
 - 현재 실행이 self 프로젝트의 새 PR Merge 완료를 확인하면 Merge 결과를 포함한 최신 `origin/<base-branch>` fetch, 관련 SQLite와 outbox 영속화 및 source checkout 동기화 시도를 완료하고 fetch된 SHA를 현재 runtime SHA와 비교한다.
@@ -100,10 +102,10 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 - 다른 등록 프로젝트의 PR Merge는 해당 프로젝트 상태와 기본 worktree를 정상 갱신하지만 Loop Manager 프로세스 전체의 runtime handoff를 만들지 않는다.
 - runtime handoff는 해석한 `<base-branch>`, 현재 runtime SHA, fetch된 원격 SHA, self repository, Merge된 PR과 source sync 결과를 비밀값 없이 로그에 남기며 오류나 BLOCKED 알림으로 취급하지 않는다.
 - 자동 테스트는 main·대체 base, 모든 로컬 source 상태의 원격 revision 선택·비차단 동기화, PR 상태 선반영, runtime보다 앞선 새 self Merge의 handoff와 이미 최신 runtime의 계속 실행을 확인한다. Planner push·다른 프로젝트 Merge·일반 외부 fetch는 handoff를 만들지 않는다. origin/source identity 오류·fetch 실패·non-fast-forward 관계·handoff 뒤 새 작업 미시작과 중단·재시작도 검증한다.
-- Agent 범위 테스트는 R-055의 T01–T06·T10–T12·T16–T17·T22에 대응한다. legacy 기본 checkout 제외·일반 verify·호출 preflight, 수동 인계와 Manager 전이·실제 위반 혼합, session·작업물·독립 차단 보존을 실제 소비자에 연결한다.
+- 접근 정책·Manager Git 작업·재개 테스트는 R-055의 T01–T06·T10–T14·T16–T17·T22·T25–T26에 대응한다. sandbox 적용, 호출 실패·단계 전환 뒤 Git 범위 검사 미재활성화, 원격 동기화·게시와 기존 오탐 자동 해제를 실제 소비자에 연결한다.
 - 각 역할의 신규 호출과 session 재개에서 workspace 및 허용 파일 쓰기와 source checkout·다른 worktree·shared Git metadata 쓰기 거부를 검증한다. Reviewer의 worktree 쓰기도 거부한다. Codex는 R-050의 직접 실행과 내장 정책 확인 범위를 적용하며, 파일 쓰기 제한과 R-064의 common+Reviewer 역할 instruction에 담긴 테스트 재실행 금지를 구분한다. Claude도 Codex와 같은 기능·검증 수준으로 provider별 정책을 대응하며, 확인된 유효 정책과 실제 호출 결과를 구분해 기록한다.
 - Codex·Claude의 지원 환경에서 쓰기 경계 확대와 격리 밖 재실행은 거부하면서 나머지 승인 검토 대상의 자동 검토가 유지됨을 검증한다. 단순 편집 자동 승인으로 대체하거나 자동 검토를 전부 비활성화한 설정은 실패로 판정한다. 기존 Loop Manager Reviewer 흐름도 유지한다.
-- CLI 버전·provider·설정 변경, session 재개와 중단 뒤의 증거 재확인, 설정 충돌·격리 초기화 실패·Claude native Windows 미지원 시 안전 중단과 상태 보존, legacy 기본 checkout 제외와 실제 선택 자원 위반 보존을 검증한다. 실행 중 managed 정책 갱신에 따른 충돌·제한 적용 실패도 해당 호출의 중단과 변경 전후 근거 저장으로 연결한다. 확인·거부 기록에는 비밀값과 source checkout의 로컬 파일 내용을 포함하지 않는다.
+- CLI 버전·provider·설정 변경, session 재개와 중단 뒤의 정책 재확인, 설정 충돌·격리 초기화 실패·Claude native Windows 미지원 시 해당 호출의 중단과 상태 보존을 검증한다. 실제 sandbox 오류와 Git 오탐의 자동 복구를 구분하고 managed 정책 갱신의 제한 적용 실패도 해당 호출에서 처리한다. 확인·거부 기록에는 비밀값과 source checkout의 로컬 파일 내용을 포함하지 않는다.
 - Claude CLI·유료 계정이 없는 개발 환경에서도 공식 웹 문서에 대응하는 설정·호출 구성과 모의 테스트로 지원 구현을 검증할 수 있다. 신규·재개·fallback의 역할별 쓰기 제한, Bash·하위 프로세스와 Edit·Write·NotebookEdit 파일 도구의 source·다른 worktree·resolved shared Git 보호, 자동 승인 검토 유지 및 권한 확대 거부를 확인한다. 추가 허용 설정만으로 범위 제한을 인정하지 않고 상속·배열 병합·임시 경로를 확인한다. 실제 호출 검증 미수행은 명시하되 CLI 설치·계정 확보·유료 호출을 시작·완료 조건으로 추가하지 않는다. 실제 Claude 호출에서 관측한 인증·지원·정책 오류는 상태를 보존하고 해당 호출에 한해 처리하며 모의 성공과 실제 정책 적용 성공을 구분한다.
 - managed 정책 갱신의 제한 유지 경로 등 기술 조사 미완료를 지원 구현 전체의 사용자 판단 대기로 바꾸지 않는다. 요구사항 변경을 요청하는 경우에는 기존 기능으로 충족할 수 없는 요구·조사한 기능과 버전·근거·남은 제약·필요한 변경이 구체적으로 제시돼야 한다. 조사 미완료만으로 조직 관리 환경 한정이나 외부 격리를 필수 선택으로 제시하지 않는다.
 - 전체 verify에서 exact-SHA runtime bootstrap, process lock, Manager runtime scope reconciliation, PR conflict recovery, source checkout 보존과 origin-only Planner·Worker 입력 규칙이 유지된다.
@@ -116,7 +118,7 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 - non-overlap dirty source checkout은 로컬 변경을 유지한 채 원격 base로 전진할 수 있다.
 - source checkout을 갱신할 수 없는 로컬 상태는 시작·복구 시점 모두 원격 bootstrap·runtime과 관리 worktree 작업을 막지 않는다.
 - bootstrap이 이미 원격 base revision이면 dirty 상태를 정리하지 않고 실행하며, Agent 실행 중 bootstrap 파일 상태가 바뀌어도 관리 worktree 위반으로 오인하거나 과거 signature에 프로젝트를 영구 차단하지 않는다.
-- Agent 범위 검사는 현재 계획의 안전에 필요한 Git 상태로 제한된다. 무관한 branch·worktree 변화는 실행을 막지 않고, Manager 소유 Git 작업은 검증된 checkpoint로 재개되며, 실제 영향권 위반은 계속 차단된다.
+- Agent 접근 권한은 sandbox가 담당하며 Git 상태 차이의 범위 위반 판정을 제거한다. Manager는 현재 동작 조건으로 동기화·게시·복구를 수행하고 기존 Git 오탐 차단을 자동 해소한다.
 - Codex를 기본과 기능·검증 기준으로 삼고 Claude는 같은 기능을 provider별 정책으로 대응한다. 개발 환경의 Claude CLI·계정 부재만으로 지원 구현이나 독립 Codex 작업을 차단하지 않는다.
 - provider의 내장 workspace 쓰기 제한과 자동 승인 검토를 함께 사용한다. 격리 밖 쓰기 권한을 자동 승인하지 않으며, 실제 선택 호출에서 미지원·정책 충돌·제한 적용 실패가 확인되면 상태와 근거를 보존하고 해당 호출을 멈춘다.
 
@@ -129,7 +131,7 @@ self runtime handoff 판정은 같은 실행에서 병렬 프로젝트 작업을
 - 기존 PR 충돌 복구의 rebase, force-with-lease, branch 소유권 또는 Agent 권한을 확대하지 않는다.
 - runtime refresh를 이유로 영속화되지 않은 작업을 폐기하거나 관리 worktree, Agent session, retry history를 정리하지 않는다.
 - self Planner의 planning commit, 일반 외부 push 또는 다른 프로젝트 PR Merge를 프로세스 종료 신호로 확대하지 않는다.
-- 무관한 Git 변화의 비차단을 이유로 Agent의 다른 worktree·shared Git metadata 쓰기, 현재 작업의 소유 branch·base·게시 ref 변경 수용 또는 검증되지 않은 checkpoint 신뢰를 허용하지 않는다.
+- Git 범위 검사 제거를 이유로 sandbox의 source·다른 worktree·shared Git metadata 쓰기 제한이나 Manager의 작업물 보존·후보 검증·조건부 게시를 완화하지 않는다.
 
 ## Open Questions
 

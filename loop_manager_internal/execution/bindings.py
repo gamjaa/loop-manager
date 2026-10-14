@@ -163,6 +163,7 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('_ExecutionLifecyclePorts', execution_ports._ExecutionLifecyclePorts,
         lambda: execution_ports.ExecutionLifecyclePortsEffects(
+            remote_integration_effects=assembly.callback('_checkpoint_recovery_effects_reconcile_published_blocked_checkpoint'),
             validate_provider_runtime=assembly.callback('validate_provider_runtime'),
             mutable_ready_snapshot=assembly.callback('mutable_ready_snapshot'),
             validate_planner_result=assembly.callback('validate_planner_result'),

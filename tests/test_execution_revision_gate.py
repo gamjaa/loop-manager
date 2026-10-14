@@ -329,7 +329,8 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
             ('title', 'Unauthorized'), ('sources', ['docs/OTHER.md']),
         ):
             with self.subTest(field=field), mock.patch(
-                'loop_manager.capture_git_snapshot'
+                'loop_manager.capture_git_snapshot', return_value=lm.GitSnapshot(
+                    'owned-head', 'loop-manager/G-047', {}, {}, {}, {}, {}, {})
             ), mock.patch('loop_manager.validate_agent_scope'), mock.patch(
                 'loop_manager.validate_managed_worktree'
             ), mock.patch('loop_manager.validate_execplan', return_value={
@@ -341,7 +342,8 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
                         'main', catalog['path'], catalog, mock.Mock(),
                         allow_rebase=True, rebase_definition=baseline,
                     )
-        with mock.patch('loop_manager.capture_git_snapshot'), mock.patch(
+        with mock.patch('loop_manager.capture_git_snapshot', return_value=lm.GitSnapshot(
+                'owned-head', 'loop-manager/G-047', {}, {}, {}, {}, {}, {})), mock.patch(
             'loop_manager.validate_agent_scope'
         ), mock.patch('loop_manager.validate_managed_worktree'), mock.patch(
             'loop_manager.validate_execplan', return_value=workspace_plan

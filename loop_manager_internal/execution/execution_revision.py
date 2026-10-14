@@ -405,11 +405,13 @@ def decide_revision_gate(
         not artifacts.worker_result
         or artifacts.worker_input_token != current.worker_token
         or artifacts.archive_token != current.archive_token
-        or (artifacts.require_worker_candidate and (
-            not candidate_head
-            or artifacts.worker_candidate_token != current.worker_candidate_token(candidate_head)))
     ):
         target = "IMPLEMENTING"
+
+    if (phase != 'IMPLEMENTING' and target != 'IMPLEMENTING'
+            and artifacts.require_worker_candidate
+            and (not candidate_head or artifacts.worker_candidate_token != current.worker_candidate_token(candidate_head))):
+        target = _earlier_phase(target, 'VERIFYING')
 
     base_changed = active_base_token != current_base_token
     if base_changed and target != "IMPLEMENTING":

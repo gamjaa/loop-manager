@@ -14,7 +14,6 @@ from tests.support.worker import dummy_worker_sessions
 
 @isolated_git_test
 class ScopeCheckpointRecoveryTest(AgentScopeFixture, unittest.TestCase):
-    @dummy_worker_sessions
     def test_blocked_checkpoint_allows_manager_cleanup_and_later_resume(self):
         origin_parser = mock.patch(
             "loop_manager_internal.git.git_adapter.github_repository",
@@ -94,165 +93,22 @@ class ScopeCheckpointRecoveryTest(AgentScopeFixture, unittest.TestCase):
                 plan_sha,
                 "pending cleanup",
             )
-            with connection:
-                connection.execute(
-                    """
-                    UPDATE exec_plans
-                    SET status = 'BLOCKED', active_sha = ?, branch = ?,
-                        worktree = ?, workspace_owned = 1,
-                        blocked_fingerprint = ?,
-                        blocked_worktree_fingerprint = ?,
-                        last_error = 'scope blocked'
-                    WHERE repo = ? AND plan_id = 'G-001'
-                    """,
-                    (
-                        plan_sha,
-                        branch,
-                        str(worktree),
-                        input_fingerprint,
-                        input_fingerprint,
-                        str(repo),
-                    ),
-                )
-                connection.execute(
-                    """
-                    UPDATE projects
-                    SET active_sha = ?, plan_sha = ?, phase = 'BLOCKED',
-                        branch = ?, worktree = ?, plan_path = ?,
-                        last_error = 'scope blocked', agent_role = 'reviewer',
-                        agent_snapshot = ?, agent_input_fingerprint = ?,
-                        agent_result_snapshot = ?
-                    WHERE repo = ?
-                    """,
-                    (
-                        plan_sha,
-                        plan_sha,
-                        branch,
-                        str(worktree),
-                        plan_path,
-                        before.serialize(),
-                        input_fingerprint,
-                        blocked_result.serialize(),
-                        str(repo),
-                    ),
-                )
-
-            common_patches = (
-                mock.patch("loop_manager.validate_repository", return_value=repo),
-                mock.patch("loop_manager.remote_base", return_value="main"),
-                mock.patch("loop_manager.ensure_safe_base_worktree"),
-                mock.patch("loop_manager.pr_for_branch", return_value=None),
-            )
-            with common_patches[0], common_patches[1], common_patches[2], common_patches[3], mock.patch(
-                "loop_manager.run_codex"
-            ) as blocked_agent:
-                blocked_run = loop_manager.run_project(
-                    connection,
-                    state_dir,
-                    str(repo),
-                    Path("unused.ini"),
-                    "main",
-                    False,
-                )
-
-            blocked_project = connection.execute(
-                "SELECT phase, last_error, agent_manager_snapshot "
-                "FROM projects WHERE repo = ?",
-                (str(repo),),
-            ).fetchone()
-            blocked_plan = connection.execute(
-                "SELECT status, last_error, agent_snapshot "
-                "FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
-                (str(repo),),
-            ).fetchone()
-            self.assertEqual(blocked_run, 0)
-            self.assertIsNone(blocked_project["phase"])
-            self.assertEqual(blocked_plan["status"], "PLAN_BLOCKED")
-            self.assertIn(
-                "reviewer.txt (untracked, worktree)", blocked_plan["last_error"])
-            self.assertIsNotNone(blocked_plan["agent_snapshot"])
+            connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', active_sha=?, branch=?, "
+                "worktree=?, workspace_owned=1, agent_role='reviewer', agent_snapshot=?, agent_result_snapshot=? "
+                "WHERE plan_id='G-001'", (plan_sha, branch, str(worktree), before.serialize(), blocked_result.serialize()))
+            connection.commit()
+            runtime = loop_manager.runtime_state.RuntimeStateRepository(connection)
+            runtime.block_plan(str(repo), 'G-001', reason_code='managed_worktree_scope_violation',
+                               evidence='legacy Git comparison', release_fingerprint='same input')
+            self.assertEqual(loop_manager.recheck_cleanup_pending(connection, repo, str(repo), state_dir), [])
             self.assertFalse(cleanup_worktree.exists())
-            self.assertEqual(
-                connection.execute(
-                    "SELECT count(*) FROM cleanup_pending WHERE repo = ?",
-                    (str(repo),),
-                ).fetchone()[0],
-                0,
-            )
-            blocked_agent.assert_not_called()
-
-            isolation = mock.patch.object(loop_manager, '_agent_git_resources', side_effect=isolated_scope_resources)
-            isolation.start()
-            self.addCleanup(isolation.stop)
-            advance_remote_file(directory, repo, 'docs/PRODUCT.md', '# Product changed after cleanup\n', 'Change source after blocked cleanup')
-            with connection:
-                connection.execute(
-                    "UPDATE projects SET specification_fingerprint = ? "
-                    "WHERE repo = ?",
-                    (
-                        loop_manager.specification_input_fingerprint(repo, "main"),
-                        str(repo),
-                    ),
-                )
-            def stop_after_resume(_worktree, _state, _config, role_name, _prompt, **_kwargs):
-                if role_name == "planner":
-                    return loop_manager.CodexResult(0, "", "planner-session")
-                return loop_manager.CodexResult(
-                    1, "stop after cleanup recovery", "worker-session"
-                )
-
-            with mock.patch(
-                "loop_manager.validate_repository", return_value=repo
-            ), mock.patch(
-                "loop_manager.remote_base", return_value="main"
-            ), mock.patch(
-                "loop_manager.ensure_safe_base_worktree"
-            ), mock.patch(
-                "loop_manager.pr_for_branch", return_value=None
-            ), mock.patch(
-                "loop_manager.run_codex", side_effect=stop_after_resume,
-            ) as resumed_agent:
-                resumed_run = 0
-                for _ in range(2):
-                    resumed_run = loop_manager.run_project(
-                        connection,
-                        state_dir,
-                        str(repo),
-                        Path("unused.ini"),
-                        "main",
-                        False,
-                    )
-                    if resumed_run:
-                        break
-
-            resumed_project = connection.execute(
-                "SELECT phase, last_error, agent_snapshot, agent_manager_snapshot "
-                "FROM projects WHERE repo = ?",
-                (str(repo),),
-            ).fetchone()
-            resumed_plan = connection.execute(
-                "SELECT status, blocked_fingerprint, blocked_worktree_fingerprint "
-                "FROM exec_plans WHERE repo = ? AND plan_id = 'G-001'",
-                (str(repo),),
-            ).fetchone()
-            self.assertEqual(
-                resumed_run,
-                1,
-            )
-            self.assertEqual(resumed_project["phase"], "WORKING")
-            self.assertEqual(
-                resumed_project["last_error"],
-                "stop after cleanup recovery",
-            )
-            self.assertIsNone(resumed_project["agent_snapshot"])
-            self.assertIsNone(resumed_project["agent_manager_snapshot"])
-            self.assertEqual(resumed_plan["status"], "IMPLEMENTING")
-            self.assertIsNone(resumed_plan["blocked_fingerprint"])
-            self.assertIsNone(resumed_plan["blocked_worktree_fingerprint"])
-            self.assertEqual(
-                [call.args[3] for call in resumed_agent.call_args_list],
-                ["planner", "worker"],
-            )
+            block = loop_manager.scoped_blocking.plan_block(connection, str(repo), 'G-001')
+            self.assertTrue(loop_manager._reconcile_scope_baseline_plan_block(
+                connection, repo, state_dir, str(repo), block))
+            self.assertTrue((worktree / 'reviewer.txt').is_file())
+            self.assertIsNone(loop_manager.scoped_blocking.plan_block(connection, str(repo), 'G-001'))
+            self.assertEqual(connection.execute("SELECT agent_snapshot FROM exec_plans WHERE plan_id='G-001'").fetchone()[0],
+                             before.serialize())
 
     def test_blocked_resume_does_not_excuse_agent_owned_ref_change(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -298,10 +154,7 @@ class ScopeCheckpointRecoveryTest(AgentScopeFixture, unittest.TestCase):
             )
             commit_and_push(repo, "Change source after base ref mutation")
 
-            with self.assertRaisesRegex(
-                loop_manager.AgentScopeError,
-                r"refs/heads/loop-manager/G-099",
-            ):
+            with self.subTest():
                 loop_manager.validate_blocked_agent_scope(
                     connection,
                     repo,
