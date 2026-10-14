@@ -1,5 +1,6 @@
 """application project runner boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.runtime import operation_events as events
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.application.contracts import PROJECT_STEP_TRANSIENT_PAUSE
@@ -61,67 +62,72 @@ def run_project_result(
     connection.commit()
     outcome: ProjectRunResult | None = None
     recovery_active = runtime_state.RuntimeStateRepository(connection).active_row(repo) if recovery_request_id else None
-    try:
-        outcome = effects._run_project_result(
-            connection, state_dir, repo_arg, config_path, requested_base,
-            allow_agents_mismatch, requested_provider,
-            registered_only=registered_only, planner_mutex=planner_mutex,
-            refactoring_review_interval=refactoring_review_interval,
-            verify_timeout_seconds=verify_timeout_seconds,
-            on_step_completed=on_step_completed, runtime_mutation=runtime_mutation,
-            **({
-                "recovery_request_id": recovery_request_id,
-                "recovery_plan_id": recovery_plan_id,
-            } if recovery_request_id is not None else {}),
-        )
-        return outcome
-    except SelfMergeRuntimeHandoff:
-        outcome = ProjectRunResult(ProjectRunKind.RUNTIME_HANDOFF, 0)
-        raise
-    finally:
-        # Failure observations are saved in their recovery transaction.  This
-        # boundary only resolves an execution that reached a stable outcome.
-        with connection:
-            resolved_subjects = None
-            if recovery_request_id is not None:
-                # Local recovery may resolve only inspected subjects. Planning
-                # errors are independent of the selected execution's outcome.
-                if recovery_plan_id is not None:
-                    subjects = {recovery_plan_id}
-                    project = connection.execute("SELECT planning_error FROM projects WHERE repo = ?", (repo,)).fetchone()
-                    if project is not None and not project[0]:
-                        subjects.add("__project__")
-                    resolved_subjects = frozenset(subjects)
-                else:
-                    project = connection.execute("SELECT planning_error FROM projects WHERE repo = ?", (repo,)).fetchone()
-                    subjects = {str(recovery_active["plan_id"])} if recovery_active is not None else set()
-                    current_active = runtime_state.RuntimeStateRepository(connection).active_row(repo)
-                    if current_active is not None:
-                        subjects.add(str(current_active["plan_id"]))
-                    if project is not None and not project[0]:
-                        subjects.add("__project__")
-                    resolved_subjects = frozenset(subjects)
-            recovery_repository.finish_external_run(
-                repo, run_id,
-                resolved=(
-                    outcome is not None
-                    and outcome.kind not in {
-                        ProjectRunKind.TRANSIENT_PAUSE,
-                        ProjectRunKind.USAGE_LIMIT_PAUSE,
-                        ProjectRunKind.OPERATIONAL_ERROR,
-                        ProjectRunKind.BLOCKED,
-                        ProjectRunKind.RUNTIME_HANDOFF,
-                    }
-                ),
-                resolved_subjects=resolved_subjects,
-                blocked_subjects=(
-                    frozenset() if outcome is not None
-                    and outcome.kind is ProjectRunKind.RUNTIME_HANDOFF
-                    else effects._blocked_recovery_subjects(connection, repo)
-                ),
+    with events.log_context(run=events.current_context().get("run") or run_id, project=repo, plan=None, stage="PROJECT"), events.activity("프로젝트 처리") as report:
+        try:
+            outcome = effects._run_project_result(
+                connection, state_dir, repo_arg, config_path, requested_base,
+                allow_agents_mismatch, requested_provider,
+                registered_only=registered_only, planner_mutex=planner_mutex,
+                refactoring_review_interval=refactoring_review_interval,
+                verify_timeout_seconds=verify_timeout_seconds,
+                on_step_completed=on_step_completed, runtime_mutation=runtime_mutation,
+                **({
+                    "recovery_request_id": recovery_request_id,
+                    "recovery_plan_id": recovery_plan_id,
+                } if recovery_request_id is not None else {}),
             )
-            if outcome is None or outcome.kind is not ProjectRunKind.RUNTIME_HANDOFF:
-                notifications.enqueue_persistent_execution_failure_events(connection, repo)
+            report.update(result=outcome.kind.value, next_action=(
+                "다음 외부 실행에서 재검사" if outcome.kind in {ProjectRunKind.TRANSIENT_PAUSE, ProjectRunKind.USAGE_LIMIT_PAUSE}
+                else "대기 조건 확인" if outcome.kind is ProjectRunKind.WAITING else "이번 프로젝트 처리 종료"),
+                reason=events.summary(outcome.detail), level="ERROR" if outcome.exit_code else "INFO")
+            return outcome
+        except SelfMergeRuntimeHandoff:
+            outcome = ProjectRunResult(ProjectRunKind.RUNTIME_HANDOFF, 0)
+            raise
+        finally:
+            # Failure observations are saved in their recovery transaction.  This
+            # boundary only resolves an execution that reached a stable outcome.
+            with connection:
+                resolved_subjects = None
+                if recovery_request_id is not None:
+                    # Local recovery may resolve only inspected subjects. Planning
+                    # errors are independent of the selected execution's outcome.
+                    if recovery_plan_id is not None:
+                        subjects = {recovery_plan_id}
+                        project = connection.execute("SELECT planning_error FROM projects WHERE repo = ?", (repo,)).fetchone()
+                        if project is not None and not project[0]:
+                            subjects.add("__project__")
+                        resolved_subjects = frozenset(subjects)
+                    else:
+                        project = connection.execute("SELECT planning_error FROM projects WHERE repo = ?", (repo,)).fetchone()
+                        subjects = {str(recovery_active["plan_id"])} if recovery_active is not None else set()
+                        current_active = runtime_state.RuntimeStateRepository(connection).active_row(repo)
+                        if current_active is not None:
+                            subjects.add(str(current_active["plan_id"]))
+                        if project is not None and not project[0]:
+                            subjects.add("__project__")
+                        resolved_subjects = frozenset(subjects)
+                recovery_repository.finish_external_run(
+                    repo, run_id,
+                    resolved=(
+                        outcome is not None
+                        and outcome.kind not in {
+                            ProjectRunKind.TRANSIENT_PAUSE,
+                            ProjectRunKind.USAGE_LIMIT_PAUSE,
+                            ProjectRunKind.OPERATIONAL_ERROR,
+                            ProjectRunKind.BLOCKED,
+                            ProjectRunKind.RUNTIME_HANDOFF,
+                        }
+                    ),
+                    resolved_subjects=resolved_subjects,
+                    blocked_subjects=(
+                        frozenset() if outcome is not None
+                        and outcome.kind is ProjectRunKind.RUNTIME_HANDOFF
+                        else effects._blocked_recovery_subjects(connection, repo)
+                    ),
+                )
+                if outcome is None or outcome.kind is not ProjectRunKind.RUNTIME_HANDOFF:
+                    notifications.enqueue_persistent_execution_failure_events(connection, repo)
 
 
 @dataclass(frozen=True)

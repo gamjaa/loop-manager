@@ -1,5 +1,6 @@
 """application project service boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.runtime import operation_events as events
 from collections.abc import Callable
 from dataclasses import dataclass
 from dataclasses import replace
@@ -148,18 +149,22 @@ class ProjectService:
 
     def run(self) -> ProjectStepResult:
         steps = [
-            self._prepare_repository,
-            self._reconcile_catalog_and_cleanup,
+            ("prepare_repository", "프로젝트 준비", self._prepare_repository),
+            ("reconcile_catalog_and_cleanup", "catalog 반영·정리", self._reconcile_catalog_and_cleanup),
         ]
         if self.identity.recovery_request_id is None:
-            steps.append(self._synchronize_pull_requests)
-            steps.append(self._resume_manual_work)
+            steps.append(("synchronize_pull_requests", "PR 상태 동기화", self._synchronize_pull_requests))
+            steps.append(("resume_manual_work", "수동 작업 재개 확인", self._resume_manual_work))
         else:
-            steps.append(self._recheck_local_plan_blocks)
-        steps.extend((self._resume_existing_execution, self._run_coordinators))
-        for step in steps:
+            steps.append(("recheck_local_plan_blocks", "차단 재검사", self._recheck_local_plan_blocks))
+        steps.extend((("resume_existing_execution", "기존 작업 복구", self._resume_existing_execution),
+                      ("run_coordinators", "계획·작업 처리", self._run_coordinators)))
+        for stage, label, step in steps:
             try:
-                result = step()
+                with events.log_context(stage=stage, error_level="WARN"), events.activity(
+                        label, heartbeat=stage in {"prepare_repository", "reconcile_catalog_and_cleanup", "synchronize_pull_requests"}) as report:
+                    result = step()
+                    report.update(result="다음 경계로 진행" if result is None else result)
             except recovery_runtime.RecoveryFailure as error:
                 if error.reason not in recovery_runtime.TRANSIENT | recovery_runtime.RECONCILE:
                     raise

@@ -1,6 +1,7 @@
 """Provider-neutral, non-secret observations for physical Agent CLI attempts."""
 
 from __future__ import annotations
+from loop_manager_internal.runtime import operation_events as events
 
 from dataclasses import dataclass, field, replace
 from enum import Enum
@@ -294,11 +295,18 @@ def run_agent_with_retries(
         ):
             active_session_id = None
             session_fallback = True
+            events.emit("Agent 세션 재개 불가: 새 세션으로 전환", level="WARN",
+                        reason="session_resume_unavailable", next_action="최소 문맥으로 재시도")
             continue
         if (
             result.result_kind is AgentResultKind.TRANSIENT_FAILURE
             and transient_retries < MAX_TRANSIENT_AGENT_RETRIES
         ):
             transient_retries += 1
+            events.emit("Agent 일시 실패: 같은 실행에서 재시도", level="WARN",
+                        reason=result.ledger_kind, retry=transient_retries,
+                        retry_limit=MAX_TRANSIENT_AGENT_RETRIES)
             continue
+        events.emit("Agent 호출 중단: 복구 판단으로 전달", level="WARN", reason=result.ledger_kind,
+                    retries=transient_retries, retry_limit=MAX_TRANSIENT_AGENT_RETRIES)
         return result

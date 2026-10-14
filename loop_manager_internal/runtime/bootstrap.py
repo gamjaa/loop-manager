@@ -4,6 +4,7 @@ Git mutation and journal policy remain in the existing Git adapters. This
 service owns runtime selection, ownership validation and child handoff only.
 """
 from __future__ import annotations
+from loop_manager_internal.runtime import operation_events as events
 from contextlib import closing
 
 from collections.abc import Callable, Mapping
@@ -617,6 +618,8 @@ class BootstrapService:
             runtime=runtime,
         )
         environment = self._runtime_child_environment()
+        if events.current_context().get("run"):
+            environment["LOOP_MANAGER_RUN_ID"] = events.current_context()["run"]
         cache_prefix = self._runtime_cache_prefix(source, state_dir, runtime)
         fallback_cache = None
         if self._prepare_runtime_bytecode_cache(runtime, environment, cache_prefix):

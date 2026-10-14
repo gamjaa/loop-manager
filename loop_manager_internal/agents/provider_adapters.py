@@ -11,6 +11,7 @@ import re
 import subprocess
 import tempfile
 import threading
+from loop_manager_internal.runtime import operation_events as events
 from typing import Protocol
 
 from loop_manager_internal.agents.agent_invocation import AgentRequest, AgentResult, AgentResultKind, ResolvedProfile, Usage
@@ -44,6 +45,14 @@ def _provider_log_directory(worktree: Path, state_dir: Path) -> Path:
     directory = state_dir / "logs" / hashlib.sha256(str(worktree).encode()).hexdigest()[:16]
     directory.mkdir(parents=True, exist_ok=True)
     return directory
+
+
+def _provider_log_path(worktree: Path, state_dir: Path, provider: str, role: str, invocation_id=None) -> Path:
+    identity = invocation_id or events.current_context().get("invocation_id")
+    prefix = "claude-" if provider == "claude" else ""
+    # shortcut: 호출별 로그는 자동 만료하지 않으며, 보존 용량 정책이 정해지면 정리를 추가한다.
+    suffix = f"-{identity}" if identity else ""
+    return _provider_log_directory(worktree, state_dir) / f"{prefix}{role}{suffix}.log"
 
 
 def _json_object(line: str) -> tuple[dict[str, object] | None, bool]:
@@ -262,7 +271,7 @@ def run_codex(
                 ResolvedProfile(model, effort), instruction_digests[0], read_only=read_only))
     project_dir = _provider_log_directory(worktree, state_dir)
     last_message = project_dir / f"{role_name}-last.txt"
-    saved_log = project_dir / f"{role_name}.log"
+    saved_log = _provider_log_path(worktree, state_dir, "codex", role_name)
     log = codex_launch.attempt / "provider.log" if codex_launch else saved_log
     # Preserve the previous result until native policy preflight accepts the call.
     provider_last_message = (codex_launch.attempt / "last-message.txt"
@@ -521,7 +530,7 @@ def run_claude(
     launch_environment['TMPDIR'] = str(attempt)
     if os.name == 'nt':
         launch_environment['TMP'] = launch_environment['TEMP'] = str(attempt)
-    log = project_dir / f"claude-{role_name}.log"
+    log = _provider_log_path(worktree, state_dir, "claude", role_name)
     last_message = project_dir / f"claude-{role_name}-last.txt"
     last_message.unlink(missing_ok=True)
 

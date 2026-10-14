@@ -1,7 +1,9 @@
 """application scheduler boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.runtime import operation_events as events
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
+from contextvars import copy_context
 from contextlib import closing
 from dataclasses import dataclass
 from loop_manager_internal.application.contracts import ProjectRunKind
@@ -52,89 +54,90 @@ def _run_registered_project(
 ) -> ScheduledProjectResult:
     """Run one registry row with state isolated to this worker connection."""
 
-    config_token = fast_mode_settings.set(managed_config) if managed_config is not None else None
-    handoff_token = _runtime_handoff_signal.set(handoff_gate)
-    verify_token = (verify_settings.set(ExecutionSettings(verify_coordinator, verify_parallelism, state_dir))
-                    if verify_coordinator is not None else None)
-    try:
-        effects._check_runtime_handoff()
-        # The scheduler connection completed migrations before starting any
-        # project threads. Repeating DDL here races with another project's
-        # state transaction and can fail with SQLITE_BUSY.
-        with closing(effects.connect_database(state_dir, run_migrations=False)) as connection, connection:
-            notifications.configure_session(
-                connection, enabled=bool(telegram_token and telegram_chat_id)
+    with events.log_context(run=events.current_context().get("run") or external_run_id, project=project.repo, plan=None, stage="PROJECT"):
+        config_token = fast_mode_settings.set(managed_config) if managed_config is not None else None
+        handoff_token = _runtime_handoff_signal.set(handoff_gate)
+        verify_token = (verify_settings.set(ExecutionSettings(verify_coordinator, verify_parallelism, state_dir))
+                        if verify_coordinator is not None else None)
+        try:
+            effects._check_runtime_handoff()
+            # The scheduler connection completed migrations before starting any
+            # project threads. Repeating DDL here races with another project's
+            # state transaction and can fail with SQLITE_BUSY.
+            with closing(effects.connect_database(state_dir, run_migrations=False)) as connection, connection:
+                notifications.configure_session(
+                    connection, enabled=bool(telegram_token and telegram_chat_id)
+                )
+                # TEMP session setup opens a SQLite transaction. Close it before
+                # runtime-state repository operations so each lifecycle change
+                # owns and durably commits its intended transaction boundary.
+                connection.commit()
+
+                def deliver_new_notifications() -> None:
+                    try:
+                        notifications.flush_project_events(connection, project.repo)
+                    except Exception as error:
+                        effects.operation_log(
+                            f"즉시 알림 전송 실패 ({type(error).__name__})",
+                            error=True,
+                        )
+
+                with notifications.immediate_delivery(connection, telegram_token, telegram_chat_id, project.repo):
+                    request = next_local_recovery_request(connection, project.repo)
+                    if request is not None:
+                        result = execute_local_recovery_request(
+                            LocalRecoveryExecutionEffects(effects.operation_log, effects.run_project_result),
+                            connection, state_dir, request, config_path,
+                            planner_mutex=planner_mutex,
+                            refactoring_review_interval=refactoring_review_interval,
+                            verify_timeout_seconds=verify_timeout_seconds,
+                            runtime_mutation=runtime_mutation,
+                            on_step_completed=deliver_new_notifications,
+                        )
+                    else:
+                        # An unrelated active owner keeps progressing; the recovery
+                        # request stays pending for a later scheduler visit.
+                        result = effects.run_project_result(
+                            connection, state_dir, project.repo, config_path,
+                            None, False, registered_only=True,
+                            planner_mutex=planner_mutex,
+                            refactoring_review_interval=refactoring_review_interval,
+                            verify_timeout_seconds=verify_timeout_seconds,
+                            on_step_completed=deliver_new_notifications,
+                            external_run_id=external_run_id,
+                            **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
+                        )
+        except SelfMergeRuntimeHandoff:
+            if handoff_gate is not None:
+                handoff_gate.stop()
+            result = ProjectRunResult(ProjectRunKind.RUNTIME_HANDOFF, 0)
+        except (ManagedConfigError, project_registry.ProjectRegistryError) as error:
+            result = ProjectRunResult(
+                ProjectRunKind.CONFIGURATION_ERROR,
+                1,
+                str(error),
             )
-            # TEMP session setup opens a SQLite transaction. Close it before
-            # runtime-state repository operations so each lifecycle change
-            # owns and durably commits its intended transaction boundary.
-            connection.commit()
-
-            def deliver_new_notifications() -> None:
-                try:
-                    notifications.flush_project_events(connection, project.repo)
-                except Exception as error:
-                    effects.operation_log(
-                        f"즉시 알림 전송 실패 ({type(error).__name__})",
-                        error=True,
-                    )
-
-            with notifications.immediate_delivery(connection, telegram_token, telegram_chat_id, project.repo):
-                request = next_local_recovery_request(connection, project.repo)
-                if request is not None:
-                    result = execute_local_recovery_request(
-                        LocalRecoveryExecutionEffects(effects.operation_log, effects.run_project_result),
-                        connection, state_dir, request, config_path,
-                        planner_mutex=planner_mutex,
-                        refactoring_review_interval=refactoring_review_interval,
-                        verify_timeout_seconds=verify_timeout_seconds,
-                        runtime_mutation=runtime_mutation,
-                        on_step_completed=deliver_new_notifications,
-                    )
-                else:
-                    # An unrelated active owner keeps progressing; the recovery
-                    # request stays pending for a later scheduler visit.
-                    result = effects.run_project_result(
-                        connection, state_dir, project.repo, config_path,
-                        None, False, registered_only=True,
-                        planner_mutex=planner_mutex,
-                        refactoring_review_interval=refactoring_review_interval,
-                        verify_timeout_seconds=verify_timeout_seconds,
-                        on_step_completed=deliver_new_notifications,
-                        external_run_id=external_run_id,
-                        **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
-                    )
-    except SelfMergeRuntimeHandoff:
-        if handoff_gate is not None:
-            handoff_gate.stop()
-        result = ProjectRunResult(ProjectRunKind.RUNTIME_HANDOFF, 0)
-    except (ManagedConfigError, project_registry.ProjectRegistryError) as error:
-        result = ProjectRunResult(
-            ProjectRunKind.CONFIGURATION_ERROR,
-            1,
-            str(error),
-        )
-        effects.operation_log(
-            f"프로젝트 설정 실패 ({project.repo}): {error}",
-            error=True,
-        )
-    except Exception as error:
-        result = ProjectRunResult(
-            ProjectRunKind.OPERATIONAL_ERROR,
-            1,
-            str(error),
-        )
-        effects.operation_log(
-            f"프로젝트 처리 실패 ({project.repo}): {error}",
-            error=True,
-        )
-    finally:
-        if verify_token is not None:
-            verify_settings.reset(verify_token)
-        _runtime_handoff_signal.reset(handoff_token)
-        if config_token is not None:
-            fast_mode_settings.reset(config_token)
-    return ScheduledProjectResult(project.repo, result)
+            effects.operation_log(
+                f"프로젝트 설정 실패 ({project.repo}): {error}",
+                error=True,
+            )
+        except Exception as error:
+            result = ProjectRunResult(
+                ProjectRunKind.OPERATIONAL_ERROR,
+                1,
+                str(error),
+            )
+            effects.operation_log(
+                f"프로젝트 처리 실패 ({project.repo}): {error}",
+                error=True,
+            )
+        finally:
+            if verify_token is not None:
+                verify_settings.reset(verify_token)
+            _runtime_handoff_signal.reset(handoff_token)
+            if config_token is not None:
+                fast_mode_settings.reset(config_token)
+        return ScheduledProjectResult(project.repo, result)
 
 
 @dataclass(frozen=True)
@@ -177,6 +180,7 @@ def schedule_registered_projects(
     ) as pool:
         futures = tuple(
             pool.submit(
+                copy_context().run,
                 effects._run_registered_project,
                 project,
                 state_dir,
@@ -214,35 +218,42 @@ def run_registered_projects(
 ) -> int:
     """Run all registered projects and aggregate outcomes after every worker exits."""
 
-    try:
-        with connection:
-            notifications.configure_session(
-                connection, enabled=bool(config.telegram_token and config.telegram_chat_id),
+    with events.log_context(run=events.current_context().get("run") or secrets.token_hex(16), stage="RUN"), events.activity("전체 실행") as report:
+        try:
+            with connection:
+                notifications.configure_session(
+                    connection, enabled=bool(config.telegram_token and config.telegram_chat_id),
+                )
+                notifications.recover_interrupted_starts(connection)
+            notifications.dispatch_pending(
+                connection, config.telegram_token, config.telegram_chat_id
             )
-            notifications.recover_interrupted_starts(connection)
-        notifications.dispatch_pending(
-            connection, config.telegram_token, config.telegram_chat_id
-        )
-    except Exception as error:
-        effects.operation_log(
-            f"알림 재시도 실패 ({type(error).__name__})", error=True
-        )
-    try:
-        results = effects.schedule_registered_projects(
-            connection, state_dir, config,
-            **({"selected_projects": selected_projects} if selected_projects is not None else {}),
-            **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
-        )
-    except SelfMergeRuntimeHandoff:
-        return 0
-    if any(item.result.kind is ProjectRunKind.RUNTIME_HANDOFF for item in results):
-        return 0
-    try:
-        notifications.dispatch_pending(
-            connection, config.telegram_token, config.telegram_chat_id
-        )
-    except Exception as error:
-        effects.operation_log(
-            f"알림 재시도 실패 ({type(error).__name__})", error=True
-        )
-    return 1 if any(item.result.exit_code for item in results) else 0
+        except Exception as error:
+            effects.operation_log(
+                f"알림 재시도 실패 ({type(error).__name__})", error=True
+            )
+        try:
+            results = effects.schedule_registered_projects(
+                connection, state_dir, config,
+                **({"selected_projects": selected_projects} if selected_projects is not None else {}),
+                **({"runtime_mutation": runtime_mutation} if runtime_mutation is not None else {}),
+            )
+        except SelfMergeRuntimeHandoff:
+            report.update(result="runtime_handoff", next_action="다음 외부 실행에서 최신 runtime으로 재개")
+            return 0
+        if any(item.result.kind is ProjectRunKind.RUNTIME_HANDOFF for item in results):
+            report.update(result="runtime_handoff", next_action="다음 외부 실행에서 최신 runtime으로 재개")
+            return 0
+        try:
+            notifications.dispatch_pending(
+                connection, config.telegram_token, config.telegram_chat_id
+            )
+        except Exception as error:
+            effects.operation_log(
+                f"알림 재시도 실패 ({type(error).__name__})", error=True
+            )
+        failed = sum(bool(item.result.exit_code) for item in results)
+        report.update(projects=len(results), failed=failed,
+                      results=','.join(f"{item.repo}:{item.result.kind.value}" for item in results),
+                      level="ERROR" if failed else "INFO")
+        return 1 if failed else 0

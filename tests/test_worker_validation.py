@@ -528,7 +528,7 @@ class WorkerValidationTest(ActiveWorkerFixture, unittest.TestCase):
 
             self.assertEqual(sequence, ['targeted', 'verify', 'reviewer'])
             self.assertFalse(artifact.exists())
-            self.assertEqual(logs[:3], [("Worker 시작: G-001 Worker Boundary", {}), ("전체 verify 시작: G-001 Worker Boundary", {}), ("Reviewer 시작: G-001 Worker Boundary", {})])
+            self.assertEqual(logs[:3], [("Worker 준비: G-001 Worker Boundary", {}), ("전체 verify 시작: G-001 Worker Boundary", {}), ("Reviewer 준비: G-001 Worker Boundary (최종 Review)", {})])
             self.assertEqual([role for role, _prompt, _kwargs in calls], ["worker", "reviewer"])
             reviewer_prompt = calls[1][1]
             self.assertIn("Worker 보고:\ntargeted test: PASS", reviewer_prompt)

@@ -1,5 +1,6 @@
 """agents agent adapter boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.runtime import operation_events as events
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.agents import agent_profiles
@@ -541,23 +542,31 @@ def run_agent(
     invocation: InvocationContext | None = None,
     resolved_profile: ResolvedProfile | None = None,
 ) -> tuple[int, str] | AgentResult:
-    return invocation_service.run_agent(
-        provider,
-        worktree,
-        state_dir,
-        config_path,
-        role_name,
-        prompt,
-        read_only=read_only,
-        level=level,
-        persist_session=persist_session,
-        session_id=session_id,
-        on_session_started=on_session_started,
-        connection=connection,
-        invocation=invocation,
-        resolved_profile=resolved_profile,
-        effects=effects._invocation_service_effects(),
-    )
+    with events.log_context(project=invocation.repo if invocation else str(worktree),
+                            plan=invocation.plan_id if invocation else None, stage=role_name), events.activity("Agent 호출 처리", heartbeat=True,
+                            provider=provider, purpose=invocation.purpose if invocation else "-",
+                            attempt=invocation.attempt if invocation else 1) as report:
+        result = invocation_service.run_agent(
+            provider,
+            worktree,
+            state_dir,
+            config_path,
+            role_name,
+            prompt,
+            read_only=read_only,
+            level=level,
+            persist_session=persist_session,
+            session_id=session_id,
+            on_session_started=on_session_started,
+            connection=connection,
+            invocation=invocation,
+            resolved_profile=resolved_profile,
+            effects=effects._invocation_service_effects(),
+        )
+        code = result.code if isinstance(result, AgentResult) else result[0]
+        report.update(result_code=code)
+        report.update(result="실행 결과 수신" if code == 0 else "실패·복구 판단으로 전달", level="INFO" if code == 0 else "WARN")
+        return result
 
 
 @dataclass(frozen=True)

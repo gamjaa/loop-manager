@@ -1,5 +1,6 @@
 """Planning publication intent, remote confirmation, and recovery."""
 from __future__ import annotations
+from loop_manager_internal.runtime import operation_events as events
 from pathlib import Path
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningError, MaintenancePlanningRestart
 from loop_manager_internal.maintenance.maintenance_orchestration import MaintenanceOutcome
@@ -582,6 +583,8 @@ class PlanningPublicationService(PlanningService):
             )
             self._ports.events.error(message)
             return self._operational_error()
+        events.emit("계획 원격 게시·catalog 반영 완료", revision=plan_commit,
+                    next_action="최신 catalog에서 실행 대상 선택")
         run.base_sha = latest_sha
         run.row = self._ports.state.planning(context.repo)
         return None

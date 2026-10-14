@@ -164,7 +164,7 @@ class WorkerHandler:
         draft = self.ports._document_draft(context)
         if draft is not None:
             return self.ports._run_document(context, draft)
-        self.ports.operation_log(f"Worker 시작: {plan['id']} {plan['title']}")
+        self.ports.operation_log(f"Worker 준비: {plan['id']} {plan['title']}")
         correction_turn = None
         if context.resolving_rebase:
             try:
@@ -238,6 +238,8 @@ class WorkerHandler:
                     review_result_id,
                 )
                 if not allowed:
+                    from loop_manager_internal.runtime.operation_events import emit
+                    emit("Review 교정 한도 도달: 다음 외부 실행에서 재개", used=used, limit=recovery_state.MAX_REVIEW_CORRECTIONS_PER_RUN)
                     detail = (
                         f"Review 교정 실행 한도 도달: run={review_turn_run_id}, "
                         f"plan={plan['id']}, used={used}/"
