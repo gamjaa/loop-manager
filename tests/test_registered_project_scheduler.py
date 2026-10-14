@@ -631,10 +631,15 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
                 }
                 return results[name]
 
+            coordinator = mock.MagicMock()
+            coordinator.__enter__.return_value = coordinator
             try:
                 with mock.patch(
                     "loop_manager.run_project_result",
                     side_effect=run_one,
+                ), mock.patch(
+                    "loop_manager_internal.application.scheduler.VerifyCoordinator",
+                    return_value=coordinator,
                 ), mock.patch("loop_manager.operation_log"):
                     outcomes = loop_manager.schedule_registered_projects(
                         connection,

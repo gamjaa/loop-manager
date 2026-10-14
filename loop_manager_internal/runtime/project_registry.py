@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from contextlib import nullcontext
 import sqlite3
+from pathlib import Path
 
 from loop_manager_internal.storage.runtime_state import _transaction
 
@@ -106,6 +107,36 @@ def list_projects(connection: sqlite3.Connection) -> tuple[RegisteredProject, ..
             origin=(str(row["origin"]) if row["origin"] is not None else None),
         )
         for row in rows
+    )
+
+
+def select_projects(
+    connection: sqlite3.Connection,
+    repositories: tuple[str, ...] | list[str] | None = None,
+) -> tuple[RegisteredProject, ...]:
+    """Resolve and validate a requested run scope from the registered rows."""
+
+    projects = list_projects(connection)
+    if not repositories:
+        return projects
+
+    requested = tuple(dict.fromkeys(
+        str(Path(repository).expanduser().resolve()) for repository in repositories
+    ))
+    registered = {
+        str(Path(project.repo).expanduser().resolve())
+        for project in projects
+    }
+    missing = tuple(repository for repository in requested if repository not in registered)
+    if missing:
+        raise ProjectRegistryError(
+            "등록되지 않은 프로젝트입니다: " + ", ".join(missing)
+        )
+
+    selected = set(requested)
+    return tuple(
+        project for project in projects
+        if str(Path(project.repo).expanduser().resolve()) in selected
     )
 
 

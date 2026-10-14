@@ -3,6 +3,7 @@ from contextlib import closing
 import contextlib
 from dataclasses import replace
 import hashlib
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -150,6 +151,45 @@ class BootstrapEntryTests(unittest.TestCase):
         self.assertNotIn("spoofed", secured)
 
 
+    def test_bootstrap_resolves_run_paths_from_parent_before_runtime_cwd_changes(self):
+        with tempfile.TemporaryDirectory() as parent_directory, tempfile.TemporaryDirectory() as runtime_directory:
+            parent = Path(parent_directory).resolve()
+            runtime_path = Path(runtime_directory).resolve()
+            runtime = loop_manager.RuntimeWorktree(runtime_path, "a" * 40)
+            original_cwd = Path.cwd()
+
+            def prepare(*_args, **_kwargs):
+                self.assertEqual(Path.cwd(), parent)
+                os.chdir(runtime_path)
+                return runtime
+
+            try:
+                os.chdir(parent)
+                with mock.patch.object(loop_manager, "ROOT", parent), mock.patch.object(
+                    loop_manager.sys,
+                    "argv",
+                    ["loop_manager.py", "--state-dir", str(parent / "state"), "run", "."],
+                ), mock.patch(
+                    "loop_manager.process_lock", return_value=tempfile.TemporaryFile()
+                ), mock.patch(
+                    "loop_manager.prepare_bootstrap_runtime", side_effect=prepare
+                ), mock.patch(
+                    "loop_manager.run_runtime_child", return_value=0
+                ) as run_child:
+                    self.assertEqual(loop_manager.main(), 0)
+            finally:
+                os.chdir(original_cwd)
+
+        self.assertEqual(run_child.call_args.args[3].path, runtime_path)
+        self.assertEqual(
+            loop_manager.build_parser().parse_args(run_child.call_args.args[4]).repositories,
+            [str(parent)],
+        )
+        self.assertEqual(
+            run_child.call_args.args[4], ["run", "--", str(parent)],
+        )
+
+
     def test_bootstrap_refreshes_dirty_source_and_starts_remote_runtime_in_same_run(self):
         with tempfile.TemporaryDirectory() as directory:
             _remote, source, writer = remote_fixture(directory)
@@ -194,8 +234,8 @@ class BootstrapEntryTests(unittest.TestCase):
             ("init",),
             ("config", "init"),
             ("config", "list"),
-            ("config", "add", "/project"),
-            ("config", "remove", "/project"),
+            ("add", "/project"),
+            ("remove", "/project"),
         )
         for command in commands:
             with self.subTest(command=command), tempfile.TemporaryDirectory() as directory:

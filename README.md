@@ -62,7 +62,7 @@ Linux·macOS:
 
 ```sh
 .venv/bin/python loop_manager.py config init
-.venv/bin/python loop_manager.py config add /path/to/my-project --provider claude
+.venv/bin/python loop_manager.py add /path/to/my-project --provider claude
 .venv/bin/python loop_manager.py config list
 .venv/bin/python loop_manager.py run
 ```
@@ -71,7 +71,7 @@ Windows:
 
 ```powershell
 & .\.venv\Scripts\python.exe loop_manager.py config init
-& .\.venv\Scripts\python.exe loop_manager.py config add D:\repo\my-project --provider claude
+& .\.venv\Scripts\python.exe loop_manager.py add D:\repo\my-project --provider claude
 & .\.venv\Scripts\python.exe loop_manager.py config list
 & .\.venv\Scripts\python.exe loop_manager.py run
 ```
@@ -84,10 +84,12 @@ Windows:
 
 | 목적 | 명령 |
 |---|---|
+| 프로젝트 검증 및 등록 | `python loop_manager.py add <project-path> [--base <branch>] [--provider <provider>]` |
 | 등록된 프로젝트 처리 | `python loop_manager.py run` |
+| 지정 프로젝트만 처리 | `python loop_manager.py run <project-path> [<project-path> ...]` |
 | 스케줄러에서 중복 실행 건너뛰기 | `python loop_manager.py run --skip-if-running` |
 | 등록 목록 | `python loop_manager.py config list` |
-| 등록 해제 | `python loop_manager.py config remove <project-path>` |
+| 등록 해제 | `python loop_manager.py remove <project-path>` |
 | 로컬 환경 수정 후 재검사 | `python loop_manager.py recover <project-path> [--plan G-001]` |
 | 기존 계획을 수동 구현 | `python loop_manager.py manual start <project-path> G-012` |
 | 수동 구현 제출 | [complete·submit 안내](docs/OPERATIONS.md#수동-구현과-제출) |
@@ -95,6 +97,8 @@ Windows:
 제품 문서 변경을 push한 뒤 `run`을 실행하면 Planner가 남은 작업을 계획한다. Worker는 구현·관련 unit test, Manager는 전체 verify, Reviewer는 읽기 전용 검토를 맡는다. 의존 작업은 선행 PR의 실제 Merge를 기다리며 안정된 열린 PR이나 계획별 차단이 있어도 독립 READY는 진행한다. 한 프로젝트의 차단·일시 실패는 다른 프로젝트를 막지 않는다.
 
 반복 실행은 cron 또는 Windows 작업 스케줄러에 `run --skip-if-running`으로 등록한다. 같은 성공 입력에 할 일이 없으면 Agent를 반복 호출하지 않는다. 실행 코드는 최신 `origin/main`의 정확한 SHA를 사용하며 source checkout의 로컬 변경은 실행 revision이 아니다. [runtime·동기화 구조](docs/ARCHITECTURE.md#git과-worktree-실행-모델)
+
+`run`에 경로를 지정하면 해당 등록 프로젝트만 처리한다. 여러 경로와 공백이 있는 경로를 지원하며, 경로를 정규화·중복 제거한 뒤 전체가 등록됐는지 확인한다. 하나라도 등록되지 않았다면 어떤 프로젝트도 처리하지 않는다.
 
 ## 운영: PR과 차단 처리
 
