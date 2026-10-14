@@ -78,6 +78,10 @@ class WorkerPromptFocusTests(TestCase):
         self.assertNotIn('docs/requirements/ 아래 파일을 수정하거나 이동하지 마라', prompt)
         self.assertIn('Requirement 완료 판단이나 archive 이동 권한을 포함하지 않는다', prompt)
         self.assertIn('User Decision은 사용자를 대신해', prompt)
+        self.assertIn('본문만 수정하고 frontmatter는 직접 변경하지 마라', prompt)
+        self.assertIn('현재 작업과 무관한 Requirement와 다른 ExecPlan은 수정하지 마라', prompt)
+        self.assertIn('sources 문자열은 보존하라', prompt)
+        self.assertIn('Planner·Manager의 검증·공식 선언·DB 반영', prompt)
         self.assertIn('docs/PLANS.md는 이번 Worker 변경 범위가 아니다', prompt)
 
     def test_normal_turn_has_no_recovery_summary_or_correction_instruction(self):

@@ -778,7 +778,7 @@ class ExecPlanDraftPublicationTest(AutomationCatalogFixture, unittest.TestCase):
                     document.unlink()
                     with self.assertRaisesRegex(AgentScopeError, '파일 삭제'):
                         validate_agent_scope('worker', root, snapshot, snapshot,
-                            selected_plan_path='docs/plans/[G-002] Selected.md', effects=effects)
+                            selected_plan_path=PATH, effects=effects)
                     effects.git.assert_called_once_with(root, 'show', snapshot.head + ':' + PATH)
 
     def test_atomic_mixed_registration_resumes_without_duplicate_draft_or_approval(self):
