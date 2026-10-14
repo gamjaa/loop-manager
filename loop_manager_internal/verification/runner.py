@@ -20,7 +20,7 @@ from loop_manager_internal.verification.guard import MARKER, install_guard
 from loop_manager_internal.verification.unittest_adapter import (worker_main, start_worker, stop_worker, failure_output, compile_project)
 from loop_manager_internal.verification.manifest import validate_report
 from loop_manager_internal.verification.contract import VERSION, ADAPTERS, ContractError, load
-from loop_manager_internal.verification import unittest_adapter
+from loop_manager_internal.verification import unittest_adapter, perl_adapter
 from loop_manager_internal.verification.core import execute_command
 from loop_manager_internal.verification.resources import DEFAULT_WORKER_BYTES, ResourceSampler, parse_parallelism, process_memory
 from loop_manager_internal.verification.timing import (
@@ -30,7 +30,7 @@ from loop_manager_internal.verification.timing import (
 )
 
 
-IMPLEMENTATIONS = {"unittest": unittest_adapter}
+IMPLEMENTATIONS = {"unittest": unittest_adapter, "perl-tap": perl_adapter}
 
 
 def execution_queue(modules, directory, metadata, manifest, stage_id):
@@ -160,7 +160,7 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
                 bytecode_before = bytecode_cache_snapshot(Path.cwd())
             passed = True
             manifest_stages = []
-            if partial_base and (len([stage for stage in connection.stages if stage["kind"] == "tests"]) != 1
+            if partial_base and (connection.adapter != "unittest" or len([stage for stage in connection.stages if stage["kind"] == "tests"]) != 1
                                  or connection.stages[0]["kind"] != "tests"):
                 from loop_manager_internal.verification import impact
                 partial = {"fallback": ["unsupported_stage_layout"], "head": git_value("rev-parse", "HEAD"),
@@ -196,10 +196,10 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
                             else:
                                 chosen = impact.selected_modules(selection, modules)
                         units = [{"id": module.name, "ids": list(module.ids),
-                            "argv": [str(connection.python), "-u", str(entrypoint), "--worker"],
+                            "argv": [str(connection.python) if connection.adapter == "unittest" else sys.executable, "-u", str(entrypoint), "--worker" if connection.adapter == "unittest" else "--perl-worker"],
                             "cwd": str(connection.root / stage["cwd"]), "execution": stage["execution"],
                             "payload": asdict(module), **({"status": "SELECTED" if module in chosen and partial_status != "FALLBACK" else "NOT_SELECTED"} if partial_base else {})} for module in modules]
-                        manifest_stages.append({"id": stage["id"], "kind": "tests", "python": project_python, "units": units})
+                        manifest_stages.append({"id": stage["id"], "kind": "tests", "python" if connection.adapter == "unittest" else "tool": project_python, "units": units})
                         atomic_json(directory / "manifest.json", {"version": VERSION, "run_id": run_id,
                             "adapter": connection.adapter, "adapter_version": ADAPTERS[connection.adapter]["version"], "stages": manifest_stages})
                         if partial_status == "FALLBACK" and partial_base:
@@ -208,7 +208,7 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
                             impact.assert_candidate(connection.root, selection.head, selection.base)
                         queue = execution_queue(chosen, directory, metadata,
                             {"version": VERSION, "adapter": connection.adapter,
-                             "adapter_version": ADAPTERS[connection.adapter]["version"], "stages": manifest_stages}, stage["id"])
+                             "adapter_version": ADAPTERS[connection.adapter]["version"], "stages": manifest_stages}, stage["id"]) if connection.adapter == "unittest" else chosen
                         writer.emit("execution_queue", units=[unit.name for unit in queue])
                         passed = adapter.execute(connection, stage, queue, stage_directory, writer, client, run_id, entrypoint)
                         if partial_base:
@@ -216,8 +216,9 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
                             partial_status = "PASS" if passed else "FAIL"
                             break  # Mandatory commands remain part of the later full verify.
                     else:
+                        command = perl_adapter.command_argv(connection, stage["argv"]) if connection.adapter == "perl-tap" else stage["argv"]
                         argv = [{"{python}": str(connection.python), "{runner}": str(entrypoint)}.get(item, item)
-                                for item in stage["argv"]]
+                                for item in command]
                         manifest_stages.append({"id": stage["id"], "kind": "command", "argv": argv, "cwd": stage["cwd"]})
                         atomic_json(directory / "manifest.json", {"version": VERSION, "run_id": run_id,
                             "adapter": connection.adapter, "adapter_version": ADAPTERS[connection.adapter]["version"], "stages": manifest_stages})
@@ -247,6 +248,8 @@ def run(directory, cap, timeout=600, project_python=None, partial_base=None):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--worker", action="store_true")
+    parser.add_argument("--perl-worker", action="store_true")
+    parser.add_argument("--perl-collect", type=Path)
     parser.add_argument("--protocol-version", type=int, default=VERSION)
     parser.add_argument("--version", action="store_true")
     parser.add_argument("--collect", type=Path)
@@ -263,6 +266,11 @@ def main():
     if arguments.version:
         print(json.dumps({"version": VERSION, "adapters": ADAPTERS}))
         return 0
+    if arguments.perl_collect:
+        perl_adapter.collect(json.loads(arguments.perl_collect.read_text(encoding="utf-8")))
+        return 0
+    if arguments.perl_worker:
+        return perl_adapter.worker_main()
     if arguments.collect:
         unittest_adapter.collect(json.loads(arguments.collect.read_text(encoding="utf-8")))
         return 0

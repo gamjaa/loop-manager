@@ -440,6 +440,7 @@ complete/submit의 verify와 Review 생략 근거는 후보·base·환경·고�
 
 - Worker는 현재 환경의 전체 검증 스크립트를 생성·유지하고, 프로그램이 Agent 밖에서 실행한다.
 - Loop Manager 자체 verify는 동일한 unittest manifest와 fixture 계약을 직렬·프로세스 병렬 모드에서 유지하고 전체 compile을 포함한다. 실제 Agent 실행을 테스트 경계에서 차단하며 테스트·fixture·대기·정리의 시간과 중단 진단을 성공 stdout과 분리해 보존한다. Python 가드는 같은 프로세스의 다중 로딩에서도 한 번 설치되며 설치 확인 실패는 보호 없이 진행하지 않는다. 자식 환경 준비의 중복만 제거하고 실행마다 명령/API 거부 검사를 유지한다. 명시·상속 환경의 조율 인증값을 제외하고 부모·호출자 환경, 중첩 Python 보호와 후보 worktree 선택을 보존한다.
+- 명시적 공통 verify 연결은 unittest와 Perl TAP adapter를 제공한다. Perl은 선언한 프로젝트 도구로 파일 suite를 수집하고 native plan·assertion·skip/TODO·종료 결과를 대조한다. 도구·연결 오류와 부분 결과를 성공으로 처리하지 않는다. 두 언어 예제는 같은 core의 예약·종료·진단과 순서 있는 필수 compile을 사용한다. Perl의 실제 Agent 호출 경계는 별도 guard로 차단하며 지원 버전·한계는 [VERIFY.md](VERIFY.md#perl-tap-지원과-두-언어-예제)를 따른다.
 - 자체 verify는 실제 소스·테스트와 고정 샘플, 의존성, `scripts/verify.json`, verify·copy 스크립트와 소비되는 `run.sh`·`run.ps1`을 입력으로 관측한다. 문서·Skill·README·예제 설정의 정책·안내 문구 일관성은 검사하지 않으며 해당 원본을 tests 안의 고정 샘플로 자동 복사·동기화하지 않는다. 파서·등록·profile·파일 복사 동작 검증, 필수 unittest 수집과 전체 compile은 유지한다. 문서 prose 변경만으로 자체 verify를 다시 실행하지 않으며 자체 verify는 그 문서의 품질을 보증하지 않는다.
 - 복구 테스트 준비는 각 테스트가 소유한 실제 파일·Git·SQLite 경계를 독립 복원하고 현재 identity·digest를 확인해 재사용한다. 이전 테스트 성공은 현재 후보의 검증 근거가 아니며 준비 생성·복사·복원·확인과 관측 경로 전체의 비용을 진단에 포함한다.
 - 자체 verify의 `verify_parallelism`은 생략 시 `auto`, 양의 정수는 상한, `1`은 직렬이다. 실행량은 코드가 CPU 제한·실제 부하·메모리 여유와 미반영 예약으로 결정하며 등록 프로젝트 수로 고정 분할하지 않는다. 관측 실패는 직렬로 축소하고 자원 대기도 전체 timeout에 포함한다.

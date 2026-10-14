@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "adapter": "unittest",
+  "environment": {"python": "launcher"},
+  "stages": [
+    {"id": "compile", "kind": "command", "cwd": ".", "argv": ["{python}", "{runner}", "--compile", "tests/test_example.py"]},
+    {"id": "tests", "kind": "tests", "cwd": ".", "collection": {"directory": "tests", "pattern": "test*.py"}, "execution": "independent"}
+  ]
+}
