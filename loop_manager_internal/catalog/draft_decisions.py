@@ -77,7 +77,16 @@ def user_changes(connection, repo, repository, pinned, *, git, git_bytes):
                 continue  # 새 경로만으로 이전 질문의 사용자 답변을 증명하지 않는다.
             current = git_bytes(repository, "show", f"{pinned.revision_sha}:{path}").decode("utf-8")
             if execplan_drafts.content_digest(old.stdout.encode()) == execplan_drafts.content_digest(current.encode()):
-                changes.pop(path, None)
+                # Observation/partial publication may advance the baseline
+                # without consuming the answer. Keep its original provenance.
+                saved_after = changes.get(path, {}).get("after")
+                published_cleanup = path == entry.path and any(
+                    audit.get("content_hash") == execplan_catalog.plan_content_hash(current.encode())
+                    and audit.get("user_changes", {}).get(path) == changes.get(path)
+                    for audit in saved.get("resolutions", ()))
+                if saved_after is None or (execplan_drafts.content_digest(saved_after.encode()) != execplan_drafts.content_digest(current.encode())
+                                           and not published_cleanup):
+                    changes.pop(path, None)
                 continue
             author = git(repository, "log", "--follow", "--format=%H%x00%ae", f"{previous}..{pinned.revision_sha}", "--", path, check=False)
             commits = [line.split("\0") for line in author.stdout.splitlines() if line]

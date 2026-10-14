@@ -1020,6 +1020,147 @@ class ExecPlanDraftCatalogTest(AutomationCatalogFixture, unittest.TestCase):
         self.assertEqual(result.diagnostic.code, "draft-owned")
 
 
+class DraftAnswerReobservationTest(AutomationCatalogFixture, unittest.TestCase):
+    """Observe real evidence/state transitions; only remote Git and Planner are fakes."""
+
+    def setUp(self):
+        self.connection = self._connection()
+        self.trees = {}
+
+    def observe(self, revision, tree):
+        self.trees[revision] = tree
+        self.current = revision
+        snapshot = execplan_catalog.snapshot_from_documents({PATH: tree[PATH]}, revision_sha=revision)
+        inputs = {path: execplan_drafts.content_digest(text.encode())
+                  for path, text in tree.items() if path != PATH}
+        pinned = execplan_catalog_state.PinnedCatalog(revision, snapshot, frozenset(tree), draft_inputs=inputs)
+
+        def git(_repository, *args, **kwargs):
+            if args == ("config", "--get", "user.email"):
+                return SimpleNamespace(returncode=0, stdout="user@example.test")
+            if args[:2] == ("merge-base", "--is-ancestor"):
+                self.assertIn(args[2], self.trees)
+                self.assertEqual(args[3], revision)
+                return SimpleNamespace(returncode=0, stdout="")
+            if args[0] == "show":
+                commit, path = args[1].split(":", 1)
+                text = self.trees.get(commit, {}).get(path)
+                return SimpleNamespace(returncode=0 if text is not None else 128, stdout=text or "")
+            if args[:3] == ("log", "--follow", "--format=%H%x00%ae"):
+                self.assertTrue(args[3].endswith(".." + revision))
+                return SimpleNamespace(returncode=0, stdout=revision + "\0user@example.test")
+            self.fail(args)
+
+        def git_bytes(_repository, command, spec):
+            self.assertEqual(command, "show")
+            commit, path = spec.split(":", 1)
+            return self.trees[commit][path].encode()
+
+        changes = draft_decisions.user_changes(self.connection, "repo", Path("repo"), pinned,
+                                               git=git, git_bytes=git_bytes)
+        pinned = replace(pinned, draft_changes=changes)
+        repository = execplan_catalog_state.DefinitionStateRepository(self.connection)
+        result = execplan_catalog_state.CatalogReconciliationService(repository, FakeDefinitionPort(pinned)).reconcile("repo")
+        self.assertTrue(result.usable)
+        return execplan_draft_state.evidence(self.connection, "repo", "G-001")
+
+    def prepare(self, source, question, answer, remaining=""):
+        tree = self.trees[self.current]
+        row = self.connection.execute("SELECT * FROM exec_plans WHERE repo='repo' AND plan_id='G-001'").fetchone()
+        original = loop_manager._ready_plan_snapshot_from_contents(row, tree[PATH].encode(), allow_started=True)
+        snapshot = MutableReadySnapshot("repo", self.current, (original,), "fixture")
+        saved = execplan_draft_state.evidence(self.connection, "repo", "G-001")
+        result = [{"id": "G-001", "revision": saved["revision"], "remaining": remaining,
+                   "resolved": [{"question": question, "answer": answer, "source": source, "quote": answer}]}]
+        with self.connection:
+            self.connection.execute("UPDATE projects SET planning_result=? WHERE repo='repo'", (draft_decisions.PREFIX + json.dumps(result),))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            for path, text in tree.items():
+                target = root / path
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(text, encoding="utf-8")
+            target = root / PATH
+            body = markdown_sections(tree[PATH]).values['Implementation']
+            target.write_text(draft_decisions.replace_section(tree[PATH], "Implementation", body + "\n" + answer), encoding="utf-8")
+            prepared = draft_decisions.prepare(self.connection, "repo", root, snapshot)
+            cleaned = target.read_text()
+            for path, text in tree.items():
+                if path != PATH:
+                    self.assertEqual((root / path).read_text(), text)
+        self.assertTrue(execplan_draft_state.evidence(self.connection, "repo", "G-001")["pending"])
+        return cleaned, prepared['G-001']
+
+    def test_body_answer_survives_reobservation(self):
+        initial = {PATH: draft_text(), "docs/PRODUCT.md": "# Product\n"}
+        self.observe("a" * 40, initial)
+        answer = "Use policy A and retain history."
+        tree = {**initial, PATH: draft_decisions.replace_section(initial[PATH], "Implementation", answer)}
+        first = self.observe("b" * 40, tree)
+        self.assertEqual(first['remote_revision'], "b" * 40)
+        evidence = first['user_changes'][PATH]
+        self.assertTrue(evidence['verified'])
+        for _ in range(2):
+            saved = self.observe("b" * 40, tree)
+            self.assertEqual(saved['user_changes'].get(PATH), evidence)
+        question = draft_decisions.questions(saved['question'])[0]
+        cleaned, _receipt = self.prepare(PATH, question, answer)
+        self.assertNotIn("draft: true", cleaned)
+
+    def test_requirement_answers_survive_partial_cleanup_and_reobservation(self):
+        self.partial_answers("docs/requirements/[R-001] Policy.md")
+
+    def test_body_answers_survive_partial_cleanup_and_reobservation(self):
+        self.partial_answers(PATH)
+
+    def partial_answers(self, source):
+        first_question = "Which storage policy should this goal use?"
+        second_question = "Which retry policy should this goal use?"
+        plan = draft_text().replace(
+            "Question: " + first_question, "Question: - " + first_question + "\n- " + second_question)
+        if source != PATH:
+            plan = plan.replace("docs/PRODUCT.md", source)
+        initial = {PATH: plan, source if source != PATH else "docs/PRODUCT.md": "# [R-001] Policy\n"}
+        self.observe("a" * 40, initial)
+        first_answer = "Use policy A and retain history."
+        second_answer = "Retry only transient errors."
+        answer = first_answer + "\n" + second_answer + "\n"
+        tree = {**initial, source: (draft_decisions.replace_section(plan, "Implementation", answer)
+                                   if source == PATH else initial[source] + answer)}
+        first = self.observe("b" * 40, tree)
+        self.assertEqual(first['remote_revision'], "b" * 40)
+        evidence = first['user_changes'][source]
+        self.assertTrue(evidence['verified'])
+        saved = self.observe("b" * 40, tree)
+        self.assertEqual(saved['user_changes'].get(source), evidence)
+        cleaned, receipt = self.prepare(source, first_question, first_answer, QUESTION.replace(first_question, second_question))
+        parsed = execplan_catalog.parse_execplan_text(PATH, cleaned, validate_sources=False)
+        with self.connection:
+            execplan_draft_state.resolve(self.connection, "repo", PATH, parsed,
+                execplan_catalog.plan_content_hash(cleaned.encode()), "f" * 40, receipt, inputs=saved['basis']['inputs'])
+        published = {**tree, PATH: cleaned}
+        for _ in range(2):
+            saved = self.observe("f" * 40, published)
+            self.assertEqual(saved['user_changes'].get(source), evidence)
+            self.assertEqual(draft_decisions.questions(saved['question']), (second_question,))
+        cleaned, _receipt = self.prepare(source, second_question, second_answer)
+        self.assertNotIn("draft: true", cleaned)
+        self.assertIn(first_answer, cleaned)
+        self.assertIn(second_answer, cleaned)
+
+    def test_reobservation_does_not_restore_reverted_body_answer(self):
+        initial = {PATH: draft_text(), "docs/PRODUCT.md": "# Product\n"}
+        self.observe("a" * 40, initial)
+        answer = "Use policy A and retain history."
+        self.observe("b" * 40, {**initial, PATH: draft_decisions.replace_section(initial[PATH], "Implementation", answer)})
+        self.observe("c" * 40, initial)
+        saved = self.observe("c" * 40, initial)
+        question = draft_decisions.questions(saved['question'])[0]
+        with self.assertRaises(loop_manager.PlannerValidationError):
+            self.prepare(PATH, question, answer)
+        self.assertTrue(saved['pending'])
+
+
 class ExecPlanDraftPublicationTest(AutomationCatalogFixture, unittest.TestCase):
     def test_git_catalog_port_pins_decision_inputs_and_links_to_the_observed_revision(self):
         text = draft_text()
