@@ -26,21 +26,21 @@ PR 전 일반 계획 개정에 자동 작업의 실행 이력을 허용하면서
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/planning/planner_validation.py`의 `mutable_ready_snapshot()`은 살아 있는 `manual_work_members`·`manual_work_groups`를 조회해 제외한다. 이 직접 구현을 유지하며 구성원 등록 전의 준비 intent·자원 예약과 실제 해제 근거를 `storage/manual_work_state.py`·`work_claims.py`의 기존 소유 정보로 함께 확인한다.
-- [ ] `_assert_mutable_ready_snapshot_current()`와 planning publication의 writer transaction에서 exec_plans row 이외의 membership·준비/소유 변경도 재검사한다. 현재 `work_claims.assert_manual_scopes_available()`의 Requirement 경로/new source 보호만으로 기존 G 개정 보호가 완료됐다고 판단하지 않는다. 독립 계획의 게시 범위는 보존한다.
-- [ ] `execution/stage_documents.py`의 legacy proposed/prepared 복구에 같은 게시 권한 검사를 유지한다. 새 실행 대응은 plan_text=null 계약을 재사용하고 단일 계획 개정 생성 경로를 다시 활성화하지 않는다. R-082 일반 planning 전환 중 수동 소유 예외도 원래 작업/묶음 identity에 결합한다.
-- [ ] 기존 예약 transaction·CAS·사용자 변경 reconciliation과 PRODUCT·ARCHITECTURE의 수동 소유 설명을 필요한 범위만 정합화한다. 수락된 수동 작업을 자동 개정 가능 상태로 바꾸지 않는다.
+- [x] `planner_validation.mutable_ready_snapshot()`의 실행 이력 허용과 live membership/준비 intent 제외를 유지한다. `storage/manual_work_state.py`는 소유 묶음의 membership 정합성을 검증하고, group row 없이 남은 membership은 해제 근거가 없어 계속 보호하며, 대상과 무관한 잘못된 묶음은 독립 snapshot을 막지 않는다.
+- [x] `_assert_mutable_ready_snapshot_current()`와 planning publication writer transaction에서 계획별 ownership fingerprint와 현재 소유를 재검사한다. row가 변하지 않은 snapshot 이후 시작도 게시를 거부하며 독립 계획의 게시를 보존한다.
+- [x] `execution/stage_documents.py`의 legacy proposed/prepared 복구 경계를 검증한다. 새 실행 대응의 `plan_text=null` 검사를 테스트하고, 단일 계획 개정 생성 경로를 다시 활성화하지 않는다. R-082의 일반 planning 전환은 기존 작업·묶음 identity에 결합된 권한을 유지한다.
+- [x] 기존 reservation transaction·CAS와 PRODUCT의 수동 소유 규칙을 보존하고 ARCHITECTURE를 해당 계획의 membership 증거 범위와 맞췄다. 수락된 수동 작업을 자동 개정 가능 상태로 바꾸지 않는다.
 
 ## Validation
 
-- `tests/test_manual_work.py`·`tests/test_manual_concurrency.py`·`tests/test_incremental_planning.py`의 최소 targeted case로 수동 대기/준비 intent, 수락 뒤 각 실행 상태·복수 G membership, snapshot 이후 시작/등록과 독립 자동 계획의 개정을 검사한다. 실제 SQLite membership·reservation을 사용하고 Git/PR 관측은 기존 mock 경계로 대체한다.
-- 새 ExecPlan 실행 대응의 plan_text 거부, legacy 단일 개정 후보의 수동 대상 무게시, 필요한 자동 교정 유지와 사용자 직접 개정·생략 무효화·session/작업물 보존을 확인한다. snapshot 생성 뒤 membership만 바뀌고 exec_plans 실행 row는 같은 경합도 포함한다. 기존 자동 started 개정과 실제 PR 출현 거부는 계속 통과해야 한다.
+- `tests/test_incremental_planning.py::ManualOwnershipPlanningTest`는 수동 시작·등록 intent, 수락된 복수 G membership, 해제 근거 없는 orphan membership, 무관한 잘못된 group, snapshot 뒤 시작, legacy proposed/prepared 복구를 검사한다. `tests/test_manual_concurrency.py::ManualConcurrencyTests`는 row가 그대로인 snapshot 경합, writer reservation의 원자성과 무관한 시작의 독립 게시를 확인한다.
+- 새 ExecPlan 실행 대응의 `plan_text` 거부, legacy 단일 개정 후보의 수동 대상 무게시, 자동 started 개정 보존과 실제 PR 출현 거부는 targeted case로 확인한다. 직접 편집·생략 무효화·session/작업물 보존은 기존 실행 경계를 유지한다. 실제 SQLite membership/reservation을 사용하고 Git/PR 관측과 Agent 호출은 기존 mock 경계 또는 격리 fixture를 사용한다.
 - Manager 전체 verify는 수동 준비 병행·묶음 원자성·재시작 intent·일반/유지보수 snapshot 및 게시 안전 회귀를 유지한다. Reviewer는 권한 확대·수동 원문 또는 작업물 손실 없이 최신 문서 조건을 처리하는지 읽기 전용으로 확인한다.
 
 ## Progress
 
 - [x] eb797d3a에서 mutable snapshot의 상태 확대와 `allow_started=True`, 수동 membership·게시 예약 검사를 정적으로 대조했다. R-077의 명시적 보호는 R-082의 Non-Goals로 폐지되지 않았고 기존 수동 경합 테스트는 수락 뒤 새 snapshot 포함을 검사하지 않는다. 구현·테스트 실행 없음.
-- [ ] 수동 소유 선정/게시 보호와 targeted unit 검증
+- [x] 관리 rebase를 수용한 최신 후보에서 수동 ownership 선정·게시 직전 재검사와 legacy/새 실행 대응 경계를 보완·확인했다. `ManualOwnershipPlanningTest`, 자동 started/PR 회귀, manual concurrency의 row 불변 경합·원자 reservation 등 targeted unit 14개가 통과했다.
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log

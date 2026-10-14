@@ -1521,13 +1521,13 @@ def mutable_ready_snapshot(
             continue
         from loop_manager_internal.storage import work_claims
         try:
-            manual_state, manual_owned = work_claims.manual_plan_ownership(
+            manual_state, manual_plan_owned = work_claims.manual_plan_ownership(
                 connection, repo, str(row['plan_id']), row
             )
         except runtime_state.RuntimeStateError:
             # Incomplete related ownership evidence protects this plan alone.
             continue
-        if manual_owned:
+        if manual_plan_owned:
             continue
         if row["branch"]:
             if effects.pr_for_branch is None:
