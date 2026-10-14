@@ -6,9 +6,42 @@ import tempfile
 import shutil
 import subprocess
 import sys
+from loop_manager_internal.runtime import operation_events as events
 
 from loop_manager_internal.verification.coordination import VerifyCoordinator, descendant, settings
 from loop_manager_internal.verification.timing import EventWriter, atomic_json, diagnostic, phase
+
+
+def progress_observation(directory, positions, state):
+    """추가된 진단 행만 읽어 진행량·대기를 설명하며 실행 상태는 변경하지 않는다."""
+    for path in directory.glob("*.jsonl"):
+        with path.open(encoding="utf-8") as stream:
+            stream.seek(positions.get(path, 0))
+            while True:
+                line = stream.readline()
+                if not line.endswith("\n"):
+                    break
+                positions[path] = stream.tell()
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                if not isinstance(event, dict):
+                    continue
+                kind, identity = event.get("kind"), event.get("id")
+                key = (path, identity)
+                if kind == "test_start":
+                    state.setdefault("active", {})[key] = identity
+                elif kind in {"test_end", "test_interrupted"}:
+                    state.setdefault("active", {}).pop(key, None)
+                    if kind == "test_end":
+                        state["completed"] = state.get("completed", 0) + 1
+                elif kind == "allocation" and isinstance(event.get("decision"), dict):
+                    decision = event["decision"]
+                    state["wait"] = decision.get("reason") if not decision.get("granted") else None
+    active = list(state.get("active", {}).values())
+    return {"observed_completed_tests": state.get("completed", 0), "active_tests": len(active),
+            "current_test": active[0] if active else "-", "resource_wait": state.get("wait") or "-"}
 
 
 def run(effects, arguments, worktree, timeout, *, launch=None, partial_base=None):
@@ -37,13 +70,20 @@ def run(effects, arguments, worktree, timeout, *, launch=None, partial_base=None
         environment.pop("LOOP_MANAGER_VERIFY_PARTIAL_BASE", None)
         if partial_base:
             environment["LOOP_MANAGER_VERIFY_PARTIAL_BASE"] = partial_base
-        with phase("verify_process", writer=writer):
+        positions, observed = {}, {}
+        with phase("verify_process", writer=writer), events.activity(
+                "부분 verify 실행" if partial_base else "전체 verify 실행", run_id=session,
+                diagnostic_path=directory / "summary.json") as report, events.progress(
+                "verify", describe=lambda: progress_observation(directory, positions, observed)):
             passed, timed_out, output = effects.run_verify_process(
                 arguments, worktree, timeout, environment=environment, job_scope=True, on_started=started,
                 **({"launch_process": launch} if launch else {}),
             )
+            report.update(result="TIMEOUT" if timed_out else "프로세스 정상 종료" if passed else "FAIL",
+                          level="INFO" if passed else "WARN", exit_code=getattr(output, "exit_code", None))
         stopped = True
         details = diagnostic(directory)
+        events.emit("verify 상세 진단 저장", diagnostic_path=directory / "summary.json")
         partial_report = None
         if partial_base:
             from loop_manager_internal.execution.verify_process import VerifyProcessOutput

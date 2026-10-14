@@ -17,11 +17,13 @@ class ExecutionProgressLogTest(unittest.TestCase):
     def test_operation_log_uses_fixed_local_timestamp_for_both_streams(self):
         stdout = io.StringIO()
         stderr = io.StringIO()
-        with mock.patch("loop_manager.local_now", return_value=datetime.datetime(2026, 9, 19, 8, 7, 6)), mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
+        fixed = datetime.datetime(2026, 9, 19, 8, 7, 6)
+        with mock.patch("loop_manager.local_now", return_value=fixed), mock.patch("sys.stdout", stdout), mock.patch("sys.stderr", stderr):
             loop_manager.operation_log("started")
             loop_manager.operation_log("failed", error=True)
-        self.assertEqual(stdout.getvalue(), "2026-09-19 08:07:06 started\n")
-        self.assertEqual(stderr.getvalue(), "2026-09-19 08:07:06 failed\n")
+        prefix = r"^2026-09-19 08:07:06[+-]\d{2}:\d{2} "
+        self.assertRegex(stdout.getvalue(), prefix + r"INFO \[run=- project=- plan=- stage=-\] started\n$")
+        self.assertRegex(stderr.getvalue(), prefix + r"ERROR \[run=- project=- plan=- stage=-\] failed\n$")
 
     def test_skip_if_running_only_silences_lock_contention(self):
         state_dir = Path("state")

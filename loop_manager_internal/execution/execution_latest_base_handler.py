@@ -1,5 +1,6 @@
 """Latest Base execution policy and narrow typed ports."""
 from __future__ import annotations
+from loop_manager_internal.runtime import operation_events as events
 from loop_manager_internal.execution.execution_runtime import ExecutionContext, ExecutionOutcome
 from dataclasses import dataclass
 from typing import Callable, Any, Mapping
@@ -65,6 +66,7 @@ class LatestBaseHandler:
     def _rebase_latest(self, context, row, latest_sha, *, publishing):
         """Persist rebase intent, observe Git, then record the applied base."""
         prefix = '게시 직전 ' if publishing else ''
+        events.emit("최신 base 반영 시작", old_base=row['active_sha'], target_base=latest_sha)
         self.ports.state.update_project(
             self.ports.identity.repo,
             phase='WORKING',
@@ -74,7 +76,9 @@ class LatestBaseHandler:
             last_error=self.ports.contract.REBASE_IN_PROGRESS_ERROR,
         )
         self.ports._record_rebase_intent(context, latest_sha)
-        rebased = self.ports._run_managed_rebase(context, latest_sha)
+        with events.activity("최신 base rebase", heartbeat=True) as report:
+            rebased = self.ports._run_managed_rebase(context, latest_sha)
+            report.update(result_code=rebased.returncode, result="Git 결과 수신")
         conflict = self.ports._post_rebase_observation(context, latest_sha, rebased.stdout)
         if conflict is not None:
             return conflict
@@ -101,6 +105,7 @@ class LatestBaseHandler:
         self.ports._complete_rebase_intent(context,
             project_values=managed_rebase_adoption.revalidation_values(latest_sha),
             worker_definition=self.ports.snapshot()._definition_snapshot)
+        events.emit("최신 base 반영 완료: 변경 후보의 검증 근거 재확인", target_base=latest_sha)
         from loop_manager_internal.execution.manual_candidate import get_manual
         manual=get_manual(self.ports.state)
         if manual and manual.user_submission(row):

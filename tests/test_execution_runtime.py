@@ -152,6 +152,19 @@ class CoordinatorRecoveryTests(unittest.TestCase):
 
 
 class ExecutionPhaseCoordinatorTests(unittest.TestCase):
+    def test_execution_guard_wait_keeps_reason_and_next_action(self):
+        from loop_manager_internal.runtime import operation_events as events
+        from unittest import mock
+        context = execution_context()
+        ports = FakePorts(context)
+        ports.guard = lambda _: ExecutionOutcome(ExecutionOutcomeKind.STABLE_WAIT, detail="dependency 대기")
+        with mock.patch.object(events, "emit") as output:
+            result = ExecutionPhaseCoordinator(ports).dispatch(context)
+        self.assertEqual(result.kind, ExecutionOutcomeKind.STABLE_WAIT)
+        self.assertEqual(ports.worker.calls, [])
+        self.assertEqual(output.call_args.kwargs["reason"], "dependency 대기")
+        self.assertEqual(output.call_args.kwargs["next_action"], "대기 조건 확인")
+
     def test_typed_git_failure_reaches_common_recovery_dispatcher(self):
         context = execution_context()
         ports = FakePorts(context)

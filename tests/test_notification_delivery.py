@@ -78,12 +78,14 @@ class NotificationDeliveryTest(NotificationFixture, unittest.TestCase):
         failed = mock.Mock(
             side_effect=RuntimeError(f"https://api.telegram.org/bot{token}/failed")
         )
-        self.assertEqual(
-            notifications.dispatch_pending(
-                connection, token, chat_id, adapter=failed
-            ),
-            0,
-        )
+        from loop_manager_internal.notifications import delivery
+        with mock.patch.object(delivery.events, "emit") as output:
+            self.assertEqual(notifications.dispatch_pending(connection, token, chat_id, adapter=failed), 0)
+        self.assertEqual(output.call_args.kwargs["level"], "WARN")
+        self.assertEqual(output.call_args.kwargs["project"], "/projects/alpha")
+        self.assertIn("다음 실행에서 재시도", output.call_args.args[0])
+        self.assertNotIn(token, str(output.call_args))
+        self.assertNotIn(chat_id, str(output.call_args))
         pending = self.events(connection)[0]
         self.assertIsNone(pending["sent_at"])
         self.assertIsNone(pending["delivery_started_at"])

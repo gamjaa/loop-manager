@@ -1,6 +1,7 @@
 """ExecPlan execution phase coordination independent of process adapters."""
 
 from __future__ import annotations
+from loop_manager_internal.runtime import operation_events as events
 
 from dataclasses import dataclass, replace
 from enum import Enum
@@ -209,23 +210,46 @@ class ExecutionPhaseCoordinator:
             return self._recovery_outcome(self._ports.recover_failure(None, error))
 
     def dispatch(self, context: ExecutionContext) -> ExecutionOutcome:
-        try:
-            guarded = self._ports.guard(context)
-            if isinstance(guarded, ExecutionOutcome):
-                return self._recovery_outcome(guarded)
-            context = guarded
-            work_started = getattr(self._ports, "work_started", None)
-            if work_started is not None:
-                work_started(context)
-            handlers = {
-                ExecutionPhase.IMPLEMENTING: self._run_worker,
-                ExecutionPhase.VERIFYING: self._run_verify,
-                ExecutionPhase.REVIEWING: self._run_review,
-                ExecutionPhase.PUBLISHING: self._run_publication,
-            }
-            return self._recovery_outcome(handlers[context.phase](context))
-        except RecoveryFailure as error:
-            return self._recovery_outcome(self._ports.recover_failure(context, error))
+        with events.log_context(project=getattr(context, "repo", events.current_context().get("project")),
+                                plan=getattr(getattr(context, "plan", None), "plan_id", events.current_context().get("plan")),
+                                stage=context.phase.value, error_level="WARN"), events.activity(
+                                "작업 단계", heartbeat=context.phase is ExecutionPhase.PUBLISHING) as report:
+            try:
+                guarded = self._ports.guard(context)
+                if isinstance(guarded, ExecutionOutcome):
+                    outcome = self._recovery_outcome(guarded)
+                else:
+                    context = guarded
+                    work_started = getattr(self._ports, "work_started", None)
+                    if work_started is not None:
+                        work_started(context)
+                    handlers = {
+                        ExecutionPhase.IMPLEMENTING: self._run_worker,
+                        ExecutionPhase.VERIFYING: self._run_verify,
+                        ExecutionPhase.REVIEWING: self._run_review,
+                        ExecutionPhase.PUBLISHING: self._run_publication,
+                    }
+                    outcome = self._recovery_outcome(handlers[context.phase](context))
+            except RecoveryFailure as error:
+                outcome = self._recovery_outcome(self._ports.recover_failure(context, error))
+            next_action = {
+                ExecutionOutcomeKind.RETRY: "같은 실행에서 재시도·교정",
+                ExecutionOutcomeKind.TRANSIENT_PAUSE: "다음 외부 실행에서 재검사",
+                ExecutionOutcomeKind.USAGE_PAUSE: "다음 외부 실행에서 사용 한도 재검사",
+                ExecutionOutcomeKind.STABLE_WAIT: "대기 조건 확인",
+                ExecutionOutcomeKind.FINAL_BLOCK: "차단 원인 확인",
+                ExecutionOutcomeKind.PLANNING_PENDING: "planning 결과 반영 대기",
+            }.get(outcome.kind, "다음 단계" if outcome.context else "이번 처리 종료")
+            report.update(result=outcome.kind.value, next_action=next_action,
+                          next_stage=outcome.context.phase.value if outcome.context else "-",
+                          reason=events.summary(outcome.detail), level=(
+                              "ERROR" if outcome.kind in {ExecutionOutcomeKind.FINAL_BLOCK, ExecutionOutcomeKind.OPERATIONAL_ERROR}
+                              else "WARN" if outcome.error else "INFO"))
+            if outcome.recovery is not None:
+                report.update(reason_code=outcome.recovery.observation.reason.value,
+                              action=outcome.recovery.action.value,
+                              occurrence=outcome.recovery.occurrence, attempts=outcome.recovery.attempts)
+            return outcome
 
     @staticmethod
     def _recovery_outcome(outcome: ExecutionOutcome) -> ExecutionOutcome:

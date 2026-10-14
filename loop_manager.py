@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
+from loop_manager_internal.runtime import operation_events
 from loop_manager_internal.application.compatibility import install_exports as _install_exports
 from loop_manager_internal.config import execution_path
 
@@ -118,75 +120,80 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
-    raw_arguments = sys.argv[1:]
-    args = build_parser().parse_args(raw_arguments)
-    if args.command == 'manual' and args.manual_command != 'start':
+    run_id = os.environ.get("LOOP_MANAGER_RUN_ID") if "--runtime-child" in sys.argv else None
+    with operation_events.log_context(run=run_id or secrets.token_hex(16), stage="COMMAND",
+                            result_output="--json" in sys.argv or "--raw" in sys.argv):
+        raw_arguments = sys.argv[1:]
+        args = build_parser().parse_args(raw_arguments)
+        if args.command == 'manual' and args.manual_command != 'start':
+            try:
+                manual_work.validate_options(args)
+            except ValueError as error:
+                build_parser().error(str(error))
+        state_dir = state_directory(args.state_dir)
+        config_path = source_config_path(ROOT, args.config)
         try:
-            manual_work.validate_options(args)
-        except ValueError as error:
-            build_parser().error(str(error))
-    state_dir = state_directory(args.state_dir)
-    config_path = source_config_path(ROOT, args.config)
-    try:
-        if args.command == "run" and not args.runtime_child:
-            raw_arguments = ["run"]
-            if args.skip_if_running:
-                raw_arguments.append("--skip-if-running")
-            if args.repositories:
-                raw_arguments.append("--")
-                raw_arguments.extend(
-                    str(Path(repository).expanduser().resolve())
-                    for repository in args.repositories
+            if args.command == "run" and not args.runtime_child:
+                raw_arguments = ["run"]
+                if args.skip_if_running:
+                    raw_arguments.append("--skip-if-running")
+                if args.repositories:
+                    raw_arguments.append("--")
+                    raw_arguments.extend(
+                        str(Path(repository).expanduser().resolve())
+                        for repository in args.repositories
+                    )
+            if not args.runtime_child:
+                execution_path.apply_execution_path(ROOT)
+            if args.runtime_child:
+                if not args.runtime_source or not args.runtime_sha:
+                    raise RuntimeError("runtime 자식 소유권 정보가 없습니다.")
+                source = Path(args.runtime_source).expanduser().resolve()
+                concurrent = args.command in {"manual", "recover"}
+                runtime_options = {"concurrent": True} if concurrent else {}
+                child_options = {"command_id": args.runtime_mutation_id} if concurrent else {}
+                validate_runtime_child(source, state_dir, str(args.runtime_sha), **child_options)
+                runtime_mutation = validate_runtime_mutation(
+                    source, state_dir, str(args.runtime_sha), args.runtime_mutation_id, **runtime_options,
                 )
-        if not args.runtime_child:
-            execution_path.apply_execution_path(ROOT)
-        if args.runtime_child:
-            if not args.runtime_source or not args.runtime_sha:
-                raise RuntimeError("runtime 자식 소유권 정보가 없습니다.")
-            source = Path(args.runtime_source).expanduser().resolve()
-            concurrent = args.command in {"manual", "recover"}
-            runtime_options = {"concurrent": True} if concurrent else {}
-            child_options = {"command_id": args.runtime_mutation_id} if concurrent else {}
-            validate_runtime_child(source, state_dir, str(args.runtime_sha), **child_options)
-            runtime_mutation = validate_runtime_mutation(
-                source, state_dir, str(args.runtime_sha), args.runtime_mutation_id, **runtime_options,
-            )
-            # Mutation validation binds the selected revision and verifies any
-            # later live base advance; equality here would reject that proof.
-            return execute_runtime_command(
-                args, state_dir, config_path, runtime_mutation,
-            )
+                # Mutation validation binds the selected revision and verifies any
+                # later live base advance; equality here would reject that proof.
+                return execute_runtime_command(
+                    args, state_dir, config_path, runtime_mutation,
+                )
 
-        source = ROOT
-        mutation_id = secrets.token_hex(16)
-        concurrent = args.command in {"manual", "recover"}
-        lock_options = {"name": f"manual-{mutation_id}.lock"} if concurrent else {}
-        runtime_options = {"concurrent": True} if concurrent else {}
-        with process_lock(state_dir, identity=f"bootstrap:{mutation_id}", **lock_options) as lock_handle:
-            runtime = prepare_bootstrap_runtime(source, state_dir, mutation_id, **runtime_options)
-            _write_process_lock_identity(lock_handle, f"runtime:{mutation_id}")
-            return run_runtime_child(
-                source,
-                state_dir,
-                config_path,
-                runtime,
-                raw_arguments,
-            )
-    except ProcessLockBusyError as error:
-        if args.command == "run" and getattr(args, "skip_if_running", False):
-            return 0
-        operation_log(f"오류: {error}", error=True)
-        return 1
-    except (
-        ManagedConfigError,
-        project_registry.ProjectRegistryError,
-        RuntimeError,
-        OSError,
-        sqlite3.DatabaseError,
-        json.JSONDecodeError,
-    ) as error:
-        operation_log(f"오류: {error}", error=True)
-        return 1
+            source = ROOT
+            mutation_id = secrets.token_hex(16)
+            concurrent = args.command in {"manual", "recover"}
+            lock_options = {"name": f"manual-{mutation_id}.lock"} if concurrent else {}
+            runtime_options = {"concurrent": True} if concurrent else {}
+            with process_lock(state_dir, identity=f"bootstrap:{mutation_id}", **lock_options) as lock_handle:
+                with operation_events.log_context(stage="BOOTSTRAP"), operation_events.activity("runtime 준비", heartbeat=True) as report:
+                    runtime = prepare_bootstrap_runtime(source, state_dir, mutation_id, **runtime_options)
+                    report.update(result="준비 완료", runtime_sha=runtime.commit_sha)
+                _write_process_lock_identity(lock_handle, f"runtime:{mutation_id}")
+                return run_runtime_child(
+                    source,
+                    state_dir,
+                    config_path,
+                    runtime,
+                    raw_arguments,
+                )
+        except ProcessLockBusyError as error:
+            if args.command == "run" and getattr(args, "skip_if_running", False):
+                return 0
+            operation_log(f"오류: {error}", error=True)
+            return 1
+        except (
+            ManagedConfigError,
+            project_registry.ProjectRegistryError,
+            RuntimeError,
+            OSError,
+            sqlite3.DatabaseError,
+            json.JSONDecodeError,
+        ) as error:
+            operation_log(f"오류: {error}", error=True)
+            return 1
 
 
 if __name__ == "__main__":

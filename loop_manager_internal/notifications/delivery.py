@@ -1,5 +1,6 @@
 """Claim, confirm and retry persisted Telegram message pieces."""
 from __future__ import annotations
+from loop_manager_internal.runtime import operation_events as events
 from collections.abc import Callable
 from contextvars import ContextVar
 from contextlib import contextmanager
@@ -120,7 +121,7 @@ def dispatch_pending(
     ensure_schema(connection)
     adopt_legacy_block_notices(connection)
     rows = connection.execute(
-        "SELECT event_key, event_type, payload FROM notification_outbox "
+        "SELECT event_key, event_type, payload, repo FROM notification_outbox "
         "WHERE sent_at IS NULL AND canceled_at IS NULL "
         "ORDER BY created_at, event_key"
     ).fetchall()
@@ -143,7 +144,7 @@ def dispatch_new_pr_notifications(
         # Never publish an event before its owning state change commits.
         return 0
     rows = connection.execute(
-        "SELECT event_key, event_type, payload FROM notification_outbox "
+        "SELECT event_key, event_type, payload, repo FROM notification_outbox "
         "WHERE repo = ? AND event_type = 'pr_created' "
         "AND sent_at IS NULL AND canceled_at IS NULL AND attempts = 0 "
         "ORDER BY created_at, event_key",
@@ -183,6 +184,10 @@ def _deliver_rows(
                     adapter(token, chat_id, piece)
             except Exception as error:
                 failure = f"Telegram delivery failed ({type(error).__name__})"
+                events.emit("Telegram 전송 실패: 미전송 조각은 다음 실행에서 재시도", level="WARN",
+                            project=row[3], plan=json.loads(str(row[2])).get("execplan_id"),
+                            stage="NOTIFICATION", event_key=row[0], event_type=row[1], piece=cursor + 1, total_pieces=total,
+                            error_type=type(error).__name__)
                 with connection:
                     connection.execute(
                         "UPDATE notification_outbox SET delivery_started_at = NULL, "
@@ -228,6 +233,8 @@ def _deliver_rows(
                         _materialize_resumption(connection, int(incident[0]))
             if cursor + 1 == total:
                 sent += 1
+                events.emit("Telegram 전송 완료", project=row[3], plan=json.loads(str(row[2])).get("execplan_id"),
+                            stage="NOTIFICATION", event_key=row[0], event_type=row[1], pieces=total)
                 break
     return sent
 
@@ -253,10 +260,12 @@ def flush_project_events(connection, repo):
         return 0
     try:
         rows = connection.execute(
-            "SELECT event_key, event_type, payload FROM notification_outbox "
+            "SELECT event_key, event_type, payload, repo FROM notification_outbox "
             "WHERE repo = ? AND sent_at IS NULL AND canceled_at IS NULL AND attempts = 0 "
             "ORDER BY rowid", (repo,),
         ).fetchall()
         return _deliver_rows(connection, token, chat_id, rows, send_telegram, first_attempt_only=True)
-    except Exception:
+    except Exception as error:
+        events.emit("Telegram 즉시 전송 처리 실패: 다음 실행에서 재시도", level="WARN",
+                    error_type=type(error).__name__)
         return 0

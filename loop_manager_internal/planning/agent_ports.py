@@ -1,5 +1,6 @@
 """planning agent ports boundaries and named composition effects."""
 from __future__ import annotations
+from loop_manager_internal.runtime import operation_events
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.agents.agent_invocation import AgentResultKind
@@ -23,24 +24,13 @@ from pathlib import Path
 import contextlib
 import sqlite3
 import threading
-import time
 
 
 @contextlib.contextmanager
 def planner_progress(events, label: str, *, interval: float = 30):
     """Log elapsed time during a long call without touching SQLite on the thread."""
-    stopped = threading.Event()
-    started = time.monotonic()
-    def report():
-        while not stopped.wait(interval):
-            events.log(f"{label}: 모델 호출 진행 중, {time.monotonic() - started:.0f}초 경과")
-    reporter = threading.Thread(target=report, daemon=True)
-    reporter.start()
-    try:
+    with operation_events.progress(label, interval=interval):
         yield
-    finally:
-        stopped.set()
-        reporter.join(timeout=1)
 
 
 def run_scoped_planner_turn(
