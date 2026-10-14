@@ -619,6 +619,7 @@ class _PlanningRun:
     dirty_files: list[str] | None = None
     planner_scope_error: str | None = None
     maintenance_decision: MaintenancePlannerDecision | None = None
+    tiered_root_plan_links: tuple[dict[str, object], ...] = ()
     validated_result: Any = None
     retirement_pending: tuple[Any, ...] = ()
     error_input_changed: bool = False
@@ -668,7 +669,7 @@ def snapshot_run(run: _PlanningRun) -> PlanningRunSnapshot:
     return PlanningRunSnapshot(**values)
 
 def local_run(snapshot: PlanningRunSnapshot) -> _PlanningRun:
-    values = {name: getattr(snapshot, name) for name in _PlanningRun.__dataclass_fields__}
+    values = {name: getattr(snapshot, name) for name in PlanningRunSnapshot.__dataclass_fields__}
     if values["dirty_files"] is not None:
         values["dirty_files"] = list(values["dirty_files"])
     return _PlanningRun(**values)

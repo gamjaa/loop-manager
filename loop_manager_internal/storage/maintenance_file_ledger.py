@@ -134,10 +134,17 @@ def validate_root_reviews(repository: Path, inventory: SourceInventory, results:
         if not isinstance(references, list) or not 1 <= len(references) <= MAX_LIST_ITEMS:
             raise FileReviewLedgerError("루트 조사에는 원본 참조가 필요합니다.")
         linked = False
+        seen_references = set()
         for ref in references:
             require_fields(ref, ROOT_REFERENCE_FIELDS, f"root_reviews[{path}].references 항목",
                            error_type=FileReviewLedgerError)
             reference_path, excerpt = ref["path"], ref["excerpt"]
+            if not isinstance(reference_path, str) or not isinstance(excerpt, str):
+                raise FileReviewLedgerError("루트 조사 인용의 경로·원문 형식이 유효하지 않습니다.")
+            reference_identity = (reference_path, excerpt)
+            if reference_identity in seen_references:
+                raise FileReviewLedgerError("루트 조사 인용이 중복됐습니다.")
+            seen_references.add(reference_identity)
             if reference_path == ".":
                 text = tree
                 if result["category"] not in {"uncertain", "tool_required"}:

@@ -198,6 +198,29 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
     document_blobs = {}
     document_heads = {}
     document_files = set()
+    start_document_paths = set()
+    if (expected.before_head and checkpoint.operation in {None, 'rebase'}
+            and pending_metadata is None and not pending_index):
+        start = ports.capture_git_snapshot(worktree)
+        if start.head == expected.before_head and not start.operations:
+            ancestor = ports.git(worktree, 'merge-base', '--is-ancestor',
+                                 target, start.head, check=False)
+            if ancestor.returncode == 1:
+                base = ports.git(worktree, 'merge-base', target, start.head, check=False)
+                if base.returncode == 0 and base.stdout.strip():
+                    def changed_paths(revision):
+                        result = ports.git(repo_path, 'diff', '--no-ext-diff', '--no-textconv',
+                                           '--name-only', '--no-renames', '-z',
+                                           base.stdout.strip(), revision, '--', check=False)
+                        output = result.stdout
+                        if result.returncode or (output and not output.endswith('\0')):
+                            return set()
+                        return {path for path in output.split('\0') if path}
+
+                    start_document_paths = {
+                        path for path in changed_paths(target) & changed_paths(start.head)
+                        if document_path(path)
+                    }
     for path, desired in adopted_originals(checkpoint).items():
         document_blobs[path] = ({('000000', '0' * width) for width in (40, 64)}
                                if desired.get('absent') else {(desired['mode'], desired['oid'])})
@@ -307,6 +330,21 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
         path, expected.plan_path, archives, (), common)
     checked_contracts = contracts
     def scoped_contracts(observed):
+        # A pending Manager rebase may start with the previous Worker branch's
+        # stale document versions. Permit only exact Requirement/ExecPlan paths
+        # changed on both sides of the merge base, and only while HEAD is still
+        # the reserved pre-rebase commit. Rebase resolution must replace them
+        # with the pinned target bytes before a later observation can complete.
+        starting_documents = (start_document_paths
+            if (observed.head == expected.before_head and observed.metadata is None
+                and not observed.operations and not observed.staged
+                and not any(entry.stage for entry in observed.index)) else set())
+        if starting_documents:
+            if any(file.path in starting_documents for file in observed.files):
+                return False
+            observed = replace(observed, committed=tuple(
+                change for change in observed.committed
+                if change.path not in starting_documents))
         # Conflict bytes are preservation input, never a final approval. Only
         # recorded user paths in this exact owned operation may bypass Worker
         # document contracts while their nonzero index stages remain. The
@@ -372,6 +410,7 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
         read_remote=read_remote, read_inputs=lambda _: current_contract()[-2:],
         read_file=read_file,
         path_allowed=lambda path: worker_allowed(path) or path in user_blobs
+            or path in start_document_paths
             or path in document_blobs or path in document_conflicts,
         contracts_allowed=scoped_contracts,
         normalize_ignored_snapshot=ports._normalize_legacy_ignored_snapshot,

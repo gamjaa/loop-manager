@@ -478,6 +478,7 @@ class _PlanningStatePorts:
         try:
             evidence = maintenance_file_publication.collect(
                 self._connection, repo, repository, base, context.cycle_revision, context.active_sha,
+                plan_repository=worktree,
             )
             return code_map_artifact.prepare(self._connection, repo, context, worktree, evidence, result)
         except (maintenance_file_inventory.SourceInventoryError, ValueError, OSError) as error:

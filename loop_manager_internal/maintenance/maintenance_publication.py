@@ -347,7 +347,7 @@ def record_maintenance_publication_intent(
         if evidence is not None:
             maintenance_file_publication.save_intent(
                 connection, repo, context.cycle_revision, context.active_sha,
-                plan_commit, evidence,
+                plan_commit, evidence, plan_repository=worktree,
             )
         return intent
 

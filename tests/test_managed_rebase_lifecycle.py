@@ -286,6 +286,9 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
     def test_document_stage_restart_keeps_owned_target(self):
         self._lifecycle(with_pr=False, documents='continue')
 
+    def test_worker_only_requirement_change_is_not_rebase_input(self):
+        self._lifecycle(with_pr=False, documents='worker-only')
+
     def _lifecycle(self, *, with_pr, legacy=False, sealed_restart=False,
                    manual=False, missing_journal=False, latest_base_advanced=False,
                    publication_interruption=None, cumulative=False, definition_change=None, documents=None):
@@ -375,7 +378,7 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             (repo / 'app.txt').write_text(''.join(upstream))
             (repo / 'skip.txt').write_text('base\n')
             git(repo, 'add', '.')
-            if documents:
+            if documents and documents != 'worker-only':
                 expected_requirement = b'# [R-001] Condition\n\nlatest remote\n'
                 expected_plan = original_plan.replace('Resolve current changes.', 'Latest remote goal.') + '\n## Progress\n- [x] Base verification\n'
                 destination = requirement_path
@@ -583,6 +586,13 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
 
             handler = new_handler()
             if documents:
+                if documents == 'worker-only':
+                    with self.assertRaisesRegex(journal.MutationEvidenceError,
+                                                'current_scope_mismatch'):
+                        handler._rebase_latest(handler._context(), handler._row(), target,
+                                               publishing=False)
+                    self.assertEqual(git(worktree, 'rev-parse', 'HEAD').stdout.strip(), original)
+                    return
                 def interrupted_git(path, *arguments, **kwargs):
                     if documents == 'autostash' and arguments == ('rebase', target):
                         return git(path, 'rebase', '--autostash', target, **kwargs)

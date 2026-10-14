@@ -742,6 +742,9 @@ class ExecutionRecoveryScenarios:
         )
         self.effects.workspace.is_directory.return_value = True
         self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.agent.begin_agent_scope.side_effect = (
+            lambda _repo, path, *_args, **_kwargs: lm.capture_git_snapshot(path)
+        )
         self.effects.agent.validate_worker_workspace_scope.side_effect = (
             lm.validate_worker_workspace_scope
         )
@@ -762,6 +765,9 @@ class ExecutionRecoveryScenarios:
             'loop_manager.validate_agent_scope'
         ), mock.patch('loop_manager.validate_managed_worktree'), mock.patch(
             'loop_manager.validate_execplan', return_value=workspace_plan
+        ), mock.patch(
+            'loop_manager_internal.execution.plan_validation.restore_worker_frontmatter',
+            return_value=False,
         ):
             return ExecutionPhaseCoordinator(self.handler).dispatch(
                 self.handler._context()
