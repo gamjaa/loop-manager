@@ -30,6 +30,9 @@ class PlanningSelectionService(PlanningService):
         self, context: PlanningContext, base_sha: str,
     ) -> bool:
         current = self._ports.git.plan_declarations(context.repo_path, base_sha)
+        consume = getattr(self._ports.state, 'consume_owned_records', None)
+        if consume is not None:
+            consume(context.repo, base_sha, current)
         return self._ports.state.plan_declarations_match(context.repo, current)
 
     def _recover_ignored_error(self, run: _PlanningRun) -> bool:
@@ -70,12 +73,12 @@ class PlanningSelectionService(PlanningService):
             return self._operational_error()
         if run.context.local_environment_recheck and row.planning_error:
             if row.planning_preserved_state:
-                if self._ports.state.schedule(run.context.repo).active is not None:
+                if self._ports.state.schedule(run.context.repo).active is not None and not row.planning_resume_plan_id:
                     return PlanningOutcome(PlanningOutcomeKind.WAITING)
                 self._ports.state.resume_planning(row)
                 row = self._ports.state.planning(run.context.repo)
                 run.row = row
-                run.maintenance_planning = bool(row.phase == "PLANNING" and run.maintenance_cycle.phase in {
+                run.maintenance_planning = bool(not row.planning_resume_plan_id and row.phase == "PLANNING" and run.maintenance_cycle.phase in {
                     maintenance_state.MaintenancePhase.ASSESSMENT,
                     maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
                 })
@@ -84,10 +87,11 @@ class PlanningSelectionService(PlanningService):
             return None
         if row.planning_preserved_state:
             decision = self._ports.state.schedule(run.context.repo)
-            if getattr(decision, "active", None) is not None:
-                return PlanningOutcome(PlanningOutcomeKind.EXECUTION_READY, base_sha=run.base_sha)
             if getattr(decision, "project_blocked", False):
                 return PlanningOutcome(PlanningOutcomeKind.WAITING)
+            active = getattr(decision, 'active', None)
+            if active is not None and not row.planning_resume_plan_id and (active['pr_url'] or active['pr_conflict_recovery']):
+                return PlanningOutcome(PlanningOutcomeKind.EXECUTION_READY, base_sha=run.base_sha)
         correction_context = (
             f"{run.maintenance_cycle.phase.value}:{run.maintenance_cycle.revision}"
             if run.maintenance_planning else "general"
@@ -131,7 +135,7 @@ class PlanningSelectionService(PlanningService):
             maintenance_error = cycle.phase in {
                 maintenance_state.MaintenancePhase.ASSESSMENT,
                 maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
-            } and (run.maintenance_planning or row.phase is None or row.planning_preserved_state)
+            } and not row.planning_resume_plan_id and (run.maintenance_planning or row.phase is None or row.planning_preserved_state)
             current = (
                 maintenance_planning_fingerprint(cycle, run.general_fingerprint)
                 if maintenance_error
@@ -162,7 +166,13 @@ class PlanningSelectionService(PlanningService):
             return self._suspend_failed_planning(run)
         if row.planning_preserved_state:
             if row.phase is not None:
-                return PlanningOutcome(PlanningOutcomeKind.WAITING)
+                decision = self._ports.state.schedule(run.context.repo)
+                if getattr(decision, 'active', None) is None:
+                    return PlanningOutcome(PlanningOutcomeKind.WAITING)
+                if self._ports.git.execution_operation_pending(Path(str(row.worktree))):
+                    return PlanningOutcome(PlanningOutcomeKind.WAITING)
+                self._ports.state.pause_execution_for_planning(row, str(decision.active['plan_id']))
+                row = self._ports.state.planning(run.context.repo)
             self._ports.state.resume_planning(row)
             return PlanningOutcome(PlanningOutcomeKind.REMOTE_BASE_RESTART)
         run.error_input_changed = True
@@ -257,6 +267,13 @@ class PlanningSelectionService(PlanningService):
     def _continue_published_work(self, run: _PlanningRun) -> PlanningOutcome:
         context = run.context
         decision = self._ports.state.schedule(context.repo)
+        active = getattr(decision, 'active', None)
+        unconfirmed = run.row.preserved_unconfirmed_plan_ids
+        if (not getattr(decision, 'project_blocked', False) and active is not None
+                and unconfirmed is not None and str(active['plan_id']) not in unconfirmed):
+            if run.row.planning_resume_plan_id:
+                self._ports.state.resume_execution_after_planning(context.repo)
+            return PlanningOutcome(PlanningOutcomeKind.EXECUTION_READY, base_sha=run.base_sha)
         if (getattr(decision, "project_blocked", False)
                 or decision.runnable_ready is None):
             return PlanningOutcome(PlanningOutcomeKind.WAITING)
@@ -276,7 +293,49 @@ class PlanningSelectionService(PlanningService):
         context = run.context
         row = run.row
         cycle = run.maintenance_cycle
-        if (row.phase == "PLANNING" and cycle.phase is maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION
+        if row.planning_resume_plan_id and row.phase == 'PLANNING':
+            decision = self._ports.state.schedule(context.repo)
+            if getattr(decision, 'project_blocked', False):
+                return PlanningOutcome(PlanningOutcomeKind.WAITING)
+            if decision.active is None or str(decision.active['plan_id']) != row.planning_resume_plan_id:
+                self._ports.events.error('planning 후 재개할 작업의 identity가 변경됐습니다.')
+                return self._operational_error()
+            run.maintenance_planning = False
+            return None
+        if row.phase != 'PLANNING' and (row.planning_resume_plan_id or row.phase in {
+                'WORKING', 'IMPLEMENTING', 'VERIFYING', 'REVIEWING', 'PUBLISHING'}):
+            decision = self._ports.state.schedule(context.repo)
+            active = getattr(decision, 'active', None)
+            if getattr(decision, 'project_blocked', False):
+                return PlanningOutcome(PlanningOutcomeKind.WAITING)
+            if row.planning_resume_plan_id and active is None:
+                self._ports.events.error('planning 후 재개할 작업이 사라졌습니다.')
+                return self._operational_error()
+            if active is not None:
+                run.general_fingerprint = self._ports.git.input_fingerprint(context.repo_path, run.base_sha)
+                run.specification_fingerprint = self._ports.git.specification_fingerprint(context.repo_path, run.base_sha)
+                required = (self._specification_planning_required(row, context, run.base_sha,
+                    run.specification_fingerprint, run.general_fingerprint)
+                    or not self._plan_declarations_match(context, run.base_sha))
+                if not required:
+                    if row.planning_resume_plan_id:
+                        self._ports.state.resume_execution_after_planning(context.repo)
+                        run.row = self._ports.state.planning(context.repo)
+                    return None
+                if not row.planning_resume_plan_id:
+                    if active['pr_url'] or active['pr_conflict_recovery']:
+                        return None
+                    if self._ports.state.planning_release_pending(context.repo):
+                        return PlanningOutcome(PlanningOutcomeKind.WAITING)
+                    if self._ports.git.execution_operation_pending(Path(str(row.worktree))):
+                        return None
+                    self._ports.state.pause_execution_for_planning(row, str(active['plan_id']))
+                run.row = self._ports.state.planning(context.repo)
+                run.maintenance_planning = False
+                run.selection = choose_planning_decision(has_active=True, specification_changed=True,
+                    runnable_ready=False, planning_input_changed=True, has_waiting_catalog=True)
+                return None
+        if (not row.planning_resume_plan_id and row.phase == "PLANNING" and cycle.phase is maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION
                 and cycle.publication_stage != "prepared" and not row.planning_result_completed):
             worktree = Path(str(row.worktree or ""))
             try:
@@ -573,6 +632,10 @@ class PlanningSelectionService(PlanningService):
         if getattr(self._ports.git, 'runtime_guidance_changed', lambda _repo: False)(context.repo_path):
             return True
         baseline = row.specification_fingerprint
+        if baseline is None and not row.processed_sha:
+            reference = getattr(self._ports.state, 'general_reference_revision', lambda _repo: None)(context.repo)
+            if reference:
+                baseline = self._ports.git.specification_fingerprint(context.repo_path, reference)
         if baseline is None and row.planning_fingerprint == current_general_fingerprint:
             # Existing databases already have a successful full-input marker.
             # Treat an identical full input as the corresponding specification
@@ -962,6 +1025,12 @@ class PlanningSelectionService(PlanningService):
                     if target_fingerprint(current) != check["target_fingerprint"]:
                         return self._restart_for_new_input()
             decision = self._ports.state.schedule(context.repo)
+            if row.planning_resume_plan_id:
+                if getattr(decision, 'active', None) is None:
+                    return self._operational_error()
+                self._ports.state.resume_execution_after_planning(context.repo)
+                return PlanningOutcome(PlanningOutcomeKind.EXECUTION_READY,
+                                       base_sha=latest_sha, newly_activated=False)
             if not decision.has_ready and decision.has_waiting:
                 self._ports.events.info(
                     "독립 READY가 없어 PLAN_BLOCKED 또는 PR_OPEN 종료를 기다립니다."

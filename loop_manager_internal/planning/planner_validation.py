@@ -1489,7 +1489,8 @@ def mutable_ready_snapshot(
 
     effects._ensure_execplans_schema(connection)
     cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
-    if cycle.phase is not maintenance_state.MaintenancePhase.IDLE:
+    project = connection.execute('SELECT planning_resume_plan_id FROM projects WHERE repo = ?', (repo,)).fetchone()
+    if cycle.phase is not maintenance_state.MaintenancePhase.IDLE and not (project and project[0]):
         raise PlannerValidationError(
             "활성 maintenance cycle 중에는 일반 mutable READY snapshot을 만들 수 없습니다."
         )
@@ -1505,8 +1506,14 @@ def mutable_ready_snapshot(
     from loop_manager_internal.catalog import remote_deletions
     recovery = remote_deletions.recoverable_ids(connection, repo, held)
     goals = remote_deletions.recovery_goals(connection, repo)
+    manual_owned = set()
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='manual_work_members'").fetchone():
+        manual_owned = {str(item[0]) for item in connection.execute(
+            "SELECT m.plan_id FROM manual_work_members m JOIN manual_work_groups g "
+            "ON g.repo=m.repo AND g.group_id=m.group_id WHERE m.repo=? "
+            "AND g.state NOT IN ('MERGED','PREPARATION_CONFLICT')", (repo,))}
     for row in rows:
-        if (str(row["plan_id"]) in held - recovery
+        if (str(row['plan_id']) in manual_owned or str(row["plan_id"]) in held - recovery
                 or (row["status"] == "PLAN_BLOCKED" and str(row["plan_id"]) not in recovery)
                 or not effects._row_is_mutable_ready(row)):
             continue
@@ -1552,9 +1559,10 @@ def _assert_mutable_ready_snapshot_current(
     if snapshot.recovery_goals != recovery_goals(connection, snapshot.repo):
         raise PlannerValidationError("삭제 목표 감사가 mutable READY snapshot 이후 변경됐습니다.")
 
+    project = connection.execute('SELECT planning_resume_plan_id FROM projects WHERE repo = ?', (snapshot.repo,)).fetchone()
     if maintenance_state.MaintenanceRepository(connection).get(
         snapshot.repo
-    ).phase is not maintenance_state.MaintenancePhase.IDLE:
+    ).phase is not maintenance_state.MaintenancePhase.IDLE and not (project and project[0]):
         raise PlannerValidationError(
             "mutable READY snapshot 이후 maintenance cycle이 시작됐습니다."
         )

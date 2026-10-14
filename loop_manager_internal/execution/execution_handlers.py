@@ -669,6 +669,7 @@ class ExecutionHandlers:
             self.effects, getattr(self, "_identity", ExecutionIdentity()),
             self._snapshot, self._update_snapshot,
             {
+                "_update_snapshot": self._update_snapshot,
                 "_archive_candidates_at": lambda *a, **kw: self._archive_candidates_at(*a, **kw),
                 "_archive_collision": lambda *a, **kw: self._archive_collision(*a, **kw),
                 "_block_final": lambda *a, **kw: self._block_final(*a, **kw),

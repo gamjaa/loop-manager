@@ -78,7 +78,7 @@ class PlanningAssessmentService(PlanningService):
         if module_enabled:
             file_review_enabled = False
         if should_run:
-            if run.maintenance_cycle.phase is maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION:
+            if run.maintenance_planning and run.maintenance_cycle.phase is maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION:
                 self._ports.events.error("기존 사후 재검증의 미확정 결과를 보존합니다. 추가 Planner 호출은 실행하지 않습니다.")
                 return self._operational_error()
             final_page = None
@@ -205,6 +205,13 @@ class PlanningAssessmentService(PlanningService):
                     self._ports.state.compact_catalog(context.repo),
                     run.mutable_ready_snapshot,
                 )
+                if row.planning_resume_plan_id:
+                    active = self._ports.state.schedule(context.repo).active
+                    prompt += ('\n현재 작업을 초기화하지 않고 일반 planning 뒤 재개한다: '
+                        + str(row.planning_resume_plan_id) + '\n보존된 구현 작업 공간: ' + str(active['worktree'])
+                        + '\n필요하면 이 후보를 읽기 전용으로 확인하고 이미 수행한 구현·기록을 보존하라. '
+                          '그 작업 공간·Git·실행 이력은 수정하지 마라. 새 조건을 관련 ExecPlan에 반영하되 '
+                          '후보 확인만으로 verify·Review 성공을 확정하지 마라.\n')
                 if hasattr(self._ports.state, "planning_review"):
                     from loop_manager_internal.planning.specification_review import prepare_review
                     instruction, attempt = prepare_review(

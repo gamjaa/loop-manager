@@ -83,6 +83,7 @@ PROJECT_ONLY_FIELDS = frozenset(
         "planning_result_completed",
         "planning_result",
         "planning_preserved_state",
+        "planning_resume_plan_id",
         "planning_error",
         "planning_error_fingerprint",
         "planning_error_incident_id",
@@ -216,6 +217,8 @@ def _preserved_planning_values(raw: object) -> dict[str, object]:
 
 def planning_owns_execution_slot(project: sqlite3.Row) -> bool:
     """Only a verified suspension separates preserved errors from slot ownership."""
+    if 'planning_resume_plan_id' in project.keys() and project['planning_resume_plan_id']:
+        return True
 
     if "planning_preserved_state" in project.keys() and project["planning_preserved_state"]:
         try:
@@ -270,6 +273,7 @@ class PlanningSnapshot:
     agent_snapshot: str | None
     agent_result_snapshot: str | None
     planning_preserved_state: str | None = None
+    planning_resume_plan_id: str | None = None
 
     @property
     def preserved_worktree(self) -> str | None:
@@ -298,6 +302,7 @@ class PlanningSnapshot:
             _preserved_planning_values(row["planning_preserved_state"])
         return cls(
             planning_preserved_state=_text(row, "planning_preserved_state"),
+            planning_resume_plan_id=_text(row, "planning_resume_plan_id"),
             repo=str(row["repo"]),
             phase=_text(row, "phase"),
             processed_sha=_text(row, "processed_sha"),
@@ -599,7 +604,8 @@ class RuntimeStateRepository:
         with _transaction(self.connection):
             if self.planning(expected.repo) != expected or not expected.planning_error:
                 raise RuntimeStateError("planning 보존 입력이 변경됐습니다.")
-            if self.active_row(expected.repo) is not None or expected.phase not in (None, "PLANNING"):
+            if (self.active_row(expected.repo) is not None and not expected.planning_resume_plan_id
+                    or expected.phase not in (None, "PLANNING")):
                 raise RuntimeStateError("다른 실행이 planning 슬롯을 사용하고 있습니다.")
             if expected.planning_preserved_state:
                 raise RuntimeStateError("이미 보존된 planning 상태입니다.")
@@ -623,7 +629,8 @@ class RuntimeStateRepository:
         """Restore the same attempt after the execution slot has become free."""
         with _transaction(self.connection):
             if (self.planning(expected.repo) != expected or not expected.planning_preserved_state
-                    or self.active_row(expected.repo) is not None or expected.phase is not None):
+                    or (self.active_row(expected.repo) is not None and not expected.planning_resume_plan_id)
+                    or expected.phase is not None):
                 raise RuntimeStateError("planning 복구 슬롯 또는 입력이 변경됐습니다.")
             from loop_manager_internal.recovery.scoped_blocking import project_block
             if project_block(self.connection, expected.repo) is not None:
@@ -639,7 +646,36 @@ class RuntimeStateRepository:
         row = self.connection.execute(
             "SELECT * FROM projects WHERE repo = ?", (repo,)
         ).fetchone()
-        return row is not None and not planning_owns_execution_slot(row)
+        return row is not None and not row['planning_resume_plan_id'] and not planning_owns_execution_slot(row)
+
+    def pause_execution_for_planning(self, expected: PlanningSnapshot, plan_id: str) -> None:
+        with _transaction(self.connection):
+            active = self.active(expected.repo)
+            projected = self.projected(expected.repo)
+            if (self.planning(expected.repo) != expected or active is None or projected != active
+                    or active.plan_id != plan_id or active.pr_url or active.pr_conflict_recovery
+                    or expected.planning_resume_plan_id):
+                raise RuntimeStateError('planning 전환의 현재 작업 또는 소유권이 변경됐습니다.')
+            # 실행 원본은 exec_plans에 그대로 두고 프로젝트 투영만 비운다.
+            self._update_project_row(expected.repo, {
+                **clear_project_values(), 'planning_resume_plan_id': plan_id,
+            })
+            self._fault('after_execution_planning_pause')
+
+    def resume_execution_after_planning(self, repo: str) -> ExecutionSnapshot:
+        with _transaction(self.connection):
+            row = self.planning(repo)
+            active = self.active(repo)
+            independent = bool(active and row.planning_preserved_state
+                and row.preserved_unconfirmed_plan_ids is not None
+                and active.plan_id not in row.preserved_unconfirmed_plan_ids)
+            if (row.phase is not None or ((row.planning_error or row.planning_preserved_state) and not independent)
+                    or active is None or active.plan_id != row.planning_resume_plan_id):
+                raise RuntimeStateError('planning 완료 또는 현재 작업의 identity를 확인할 수 없습니다.')
+            self.hydrate_snapshot(repo, active)
+            self._update_project_row(repo, {'planning_resume_plan_id': None})
+            self._fault('after_execution_planning_resume')
+            return active
 
     def active_row(self, repo: str) -> sqlite3.Row | None:
         placeholders = ", ".join("?" for _ in ACTIVE_STATUSES)
