@@ -669,7 +669,7 @@ def snapshot_run(run: _PlanningRun) -> PlanningRunSnapshot:
     return PlanningRunSnapshot(**values)
 
 def local_run(snapshot: PlanningRunSnapshot) -> _PlanningRun:
-    values = {name: getattr(snapshot, name) for name in _PlanningRun.__dataclass_fields__}
+    values = {name: getattr(snapshot, name) for name in PlanningRunSnapshot.__dataclass_fields__}
     if values["dirty_files"] is not None:
         values["dirty_files"] = list(values["dirty_files"])
     return _PlanningRun(**values)
