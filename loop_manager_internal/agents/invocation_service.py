@@ -113,10 +113,7 @@ def run_agent(
     scope_id = None
     if connection is not None and invocation is not None:
         try:
-            notification_scope_role = "planner" if role_name == "planner_check" else role_name
-            scope_id = ledger.invocation_scope_id(
-                invocation.repo, notification_scope_role, str(worktree),
-            )
+            scope_id = ledger.invocation_scope_id(invocation.repo, role_name, str(worktree))
         except (sqlite3.Error, KeyError, IndexError, TypeError, ValueError, RuntimeError):
             pass  # Legacy/minimal records cannot grant reduced monitoring.
     if ledger is not None and invocation is not None and resolved is not None:

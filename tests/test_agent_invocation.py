@@ -966,7 +966,7 @@ class ProcessStartNotificationTests(TestCase):
         notifications.configure_session(self.connection, enabled=True)
         self.connection.execute("INSERT INTO projects (repo, base_branch) VALUES ('repo', 'main')")
         self.connection.execute(
-            "UPDATE projects SET agent_role = 'planner', agent_snapshot = ?, worktree = ? WHERE repo = 'repo'",
+            "UPDATE projects SET agent_role = 'planner_check', agent_snapshot = ?, worktree = ? WHERE repo = 'repo'",
             (manager.GitSnapshot('head', None, {}, {}, {}, {}, {}, {}, scope_id='planning-scope').serialize(),
              str(Path('/worktree').resolve())),
         )
@@ -1006,9 +1006,11 @@ class ProcessStartNotificationTests(TestCase):
         ).fetchone()
         self.assertEqual(json.loads(resumed[0])['operation'], 'Planner')
         self.assertEqual(json.loads(resumed[0])['cause'], 'original planning cause')
-        self.assertEqual(tuple(self.connection.execute(
-            "SELECT role, model, effort FROM agent_invocations"
-        ).fetchone()), ('planner_check', 'check-model', 'low'))
+        ledger_row = self.connection.execute(
+            "SELECT role, model, effort, scope_id FROM agent_invocations"
+        ).fetchone()
+        self.assertEqual(tuple(ledger_row),
+                         ('planner_check', 'check-model', 'low', 'planning-scope'))
         self.assertEqual(self.connection.execute(
             "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'work_started'"
         ).fetchone()[0], 0)
