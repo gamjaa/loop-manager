@@ -317,7 +317,7 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
             validate_worker_workspace_scope=state.bind(
                 lambda *args, **kwargs: dependencies.validate_worker_workspace_scope(
                     *args, connection=connection, state_dir=identity['state_dir'], **kwargs),
-                name="validate_worker_workspace_scope", connected=True, mutates=True),
+                name="validate_worker_workspace_scope", connected=False, mutates=True),
             _worktree_execplan_input_fingerprint=state.bind(dependencies._worktree_execplan_input_fingerprint, name="_worktree_execplan_input_fingerprint", connected=False, mutates=False),
             _revision_execplan_input_fingerprint=state.bind(dependencies._revision_execplan_input_fingerprint, name="_revision_execplan_input_fingerprint", connected=False, mutates=False),
             _published_plan_allows_common_plans=state.bind(dependencies._published_plan_allows_common_plans, name="_published_plan_allows_common_plans", connected=False, mutates=False),

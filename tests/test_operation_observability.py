@@ -46,6 +46,29 @@ class OperationObservabilityTests(TestCase):
             report.update(result="PASS")
         self.assertEqual(report["result"], "PASS")
 
+    def test_short_activity_only_reports_completion_with_context(self):
+        with mock.patch.object(events, "emit") as output, \
+             mock.patch.object(events.time, "monotonic", return_value=10):
+            with events.activity("프로젝트 준비", heartbeat=True, target="저장소") as report:
+                report.update(result="다음 경계로 진행")
+        output.assert_called_once_with("프로젝트 준비 종료", level="INFO", elapsed_seconds=0,
+                                       target="저장소", result="다음 경계로 진행")
+
+    def test_long_activity_reports_progress_and_completion_with_context(self):
+        observed, records = threading.Event(), []
+        def record(message, **fields):
+            records.append((message, fields))
+            if message == "Agent 호출 처리 진행 중":
+                observed.set()
+        with mock.patch.object(events, "emit", side_effect=record), \
+             mock.patch.object(events, "PROGRESS_INTERVAL_SECONDS", .001):
+            with events.activity("Agent 호출 처리", heartbeat=True, provider="codex") as report:
+                self.assertTrue(observed.wait(2))
+                report.update(result="실행 결과 수신")
+        self.assertTrue(all(message == "Agent 호출 처리 진행 중" for message, _ in records[:-1]))
+        self.assertEqual(records[-1][0], "Agent 호출 처리 종료")
+        self.assertTrue(all(fields["provider"] == "codex" for _, fields in records))
+
     def test_progress_copies_context_stops_and_suppresses_nested_reporters(self):
         seen, observed = [], threading.Event()
         def record(message, **fields):
