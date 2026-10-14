@@ -1,5 +1,7 @@
 """상태 루트·인증 링크·호출 환경을 임시 파일과 모의 CLI로 확인한다."""
 import os
+from concurrent.futures import ThreadPoolExecutor
+import json
 from pathlib import Path
 import subprocess
 import tempfile
@@ -164,31 +166,91 @@ class ProviderHomeTests(unittest.TestCase):
         self.assertFalse((home / 'config.toml').exists())
         import json
         self.assertIn(str(source), json.loads(first.specification)['protected'])
-        if os.name == 'nt':
-            self.assertEqual(home, state / 'automation-codex')
-        else:
-            self.assertEqual(home, first.runtime / 'codex')
+        self.assertEqual(home, state / 'automation-codex')
 
-    @unittest.skipIf(os.name == 'nt', 'Windows에는 역할별 config 연결이 없다')
-    def test_known_personal_runtime_config_is_detached_without_losing_session(self):
+    def test_retired_runtime_config_and_session_are_preserved_but_not_consumed(self):
         boundary, state, _ = native_agent_boundary(self.root / 'migration')
         source = self.source()
         personal_config = source.parent / 'config.toml'
         personal_config.write_text('hooks=["personal"]')
-        old = sandbox.prepare_launch(boundary, state, 'worker', False, (),
-                                     dict(self.variables, CODEX_HOME=str(source.parent)))
-        self.addCleanup(old.attempt.rmdir)
-        home = Path(old.environment['CODEX_HOME'])
+        env = self.environment(state=state)
+        first = sandbox.prepare_launch(boundary, state, 'worker', False, (), env)
+        self.addCleanup(first.attempt.rmdir)
+        home = first.runtime / 'codex'
+        home.mkdir(mode=0o700)
+        config = home / 'config.toml'
+        config.write_text('model="retired"')
         session = home / 'session-fixture'
         session.write_text('keep')
         new = sandbox.prepare_launch(boundary, state, 'worker', False, (), self.environment(state=state))
         self.addCleanup(new.attempt.rmdir)
-        self.assertEqual(new.runtime, old.runtime)
-        self.assertFalse((home / 'config.toml').exists())
-        self.assertFalse((home / 'config.toml').is_symlink())
+        self.assertEqual(new.runtime, first.runtime)
+        self.assertEqual(config.read_text(), 'model="retired"')
+        self.assertFalse((Path(new.environment['CODEX_HOME']) / 'config.toml').exists())
         self.assertEqual(personal_config.read_text(), 'hooks=["personal"]')
         self.assertEqual(session.read_text(), 'keep')
-        self.assertEqual((home / 'auth.json').resolve(), source)
+        self.assertEqual((Path(new.environment['CODEX_HOME']) / 'auth.json').resolve(), source)
+        config.unlink()
+        config.symlink_to(personal_config)
+        repeated = sandbox.prepare_launch(boundary, state, 'worker', False, (), env)
+        self.addCleanup(repeated.attempt.rmdir)
+        self.assertEqual(config.readlink(), personal_config)
+        self.assertEqual(session.read_text(), 'keep')
+
+    def test_common_home_config_lifecycle_uses_current_settings_without_runtime_links(self):
+        boundary, state, _ = native_agent_boundary(self.root / 'config-lifecycle')
+        for provider in homes.PROVIDERS:
+            with self.subTest(provider=provider):
+                env = self.environment(provider, state)
+                homes.prepare_authentication(provider, env)
+                home = Path(env[homes.PROVIDERS[provider][0]])
+                config = home / ('config.toml' if provider == 'codex' else 'settings.json')
+
+                def prepare():
+                    if provider == 'codex':
+                        launch = sandbox.prepare_launch(boundary, state, 'worker', False, (), env)
+                        self.addCleanup(launch.attempt.rmdir)
+                        self.assertEqual(Path(launch.environment['CODEX_HOME']), home)
+                        self.assertFalse((launch.runtime / 'codex').exists())
+                    else:
+                        homes.prepare_authentication(provider, env)
+                    return isolation._configuration_digest(provider, boundary.worktree, None, env)
+
+                missing = prepare()
+                self.assertFalse(config.exists())
+                previous = missing
+                for content in ('model="first"', 'model="second"') if provider == 'codex' else (
+                        '{"model":"first"}', '{"model":"second"}'):
+                    replacement = config.with_suffix('.replacement')
+                    replacement.write_text(content)
+                    replacement.replace(config)
+                    current = prepare()
+                    self.assertNotEqual(current, previous)
+                    previous = current
+                    self.assertEqual(prepare(), current)
+                    self.assertEqual(config.read_text(), content)
+                config.unlink()
+                self.assertEqual(prepare(), missing)
+                config.write_text('model="recreated"' if provider == 'codex' else '{"model":"recreated"}')
+                self.assertNotEqual(prepare(), missing)
+
+    def test_parallel_roles_share_home_but_keep_call_directories_and_permissions_separate(self):
+        boundary, state, _ = native_agent_boundary(self.root / 'parallel')
+        env = self.environment(state=state)
+        self.source()
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            worker, reviewer = list(pool.map(lambda role: sandbox.prepare_launch(
+                boundary, state, role, role == 'reviewer', (), env), ('worker', 'reviewer')))
+        for launch in (worker, reviewer):
+            self.addCleanup(launch.attempt.rmdir)
+            self.assertEqual(launch.environment['CODEX_HOME'], env['CODEX_HOME'])
+            self.assertEqual(launch.environment['TMPDIR'], str(launch.attempt))
+            self.assertIn(env['CODEX_HOME'], json.loads(launch.specification)['protected'])
+        self.assertNotEqual(worker.attempt, reviewer.attempt)
+        self.assertEqual(json.loads(worker.specification)['writable'],
+                         [str(worker.attempt), str(boundary.worktree)])
+        self.assertEqual(json.loads(reviewer.specification)['writable'], [])
+        self.assertNotIn(str(reviewer.attempt), json.loads(worker.specification)['writable'])
 
     def test_fingerprint_and_extension_checks_use_selected_config(self):
         env = self.environment()
@@ -242,8 +304,8 @@ class ProviderHomeTests(unittest.TestCase):
         effects.validate_provider_runtime.assert_called_once_with(
             self.root / 'config', 'claude', self.root, state_dir=self.state)
 
-    @unittest.skipIf(os.name == 'nt', 'Windows는 전용 홈을 직접 사용한다')
-    def test_path_scoped_credential_store_cannot_claim_shared_runtime_auth(self):
+    @unittest.skipIf(os.name == 'nt', 'Windows 파일 인증 저장소 검사는 별도 정책이다')
+    def test_path_scoped_credential_store_reuse_is_not_assumed(self):
         env = self.environment()
         homes.prepare_authentication('codex', env)
         (Path(env['CODEX_HOME']) / 'config.toml').write_text('cli_auth_credentials_store="keyring"')

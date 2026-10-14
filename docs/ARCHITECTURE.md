@@ -340,15 +340,17 @@ Worker에 추가하는 [AGENTS.ponytail.md](AGENTS.ponytail.md)는 [Ponytail](ht
 
 공급자 경계는 실제 상태 루트에서 `automation-codex`·`automation-claude`의 절대 경로를 선택한다. 등록·복구·수동 작업과 실행 서비스가 상태 루트를 전달하고, 기존 `prepared_environment`로 인증/profile 조회·지침 기능 조회가 준비된 호출 환경을 사용하도록 한다. 부모 `os.environ`은 바꾸지 않는다. `provider_home`은 기존 비공개 경로 검증을 재사용해 기본 인증 파일만 링크하고 기존 파일·링크를 보존한다. 파일 링크의 경로를 호출 전후 확인하되 인증 내용은 지문·기록에 넣지 않는다.
 
-Codex는 Linux·macOS의 기존 역할·repository·worktree 해시와 runtime 홈을 유지하며 전용 원본의 config·auth 파일에 연결한다. 인증 링크는 원본 파일 경로를 유지해 원자적 교체를 따라가고 원본의 resolved 인증 경로도 도구 쓰기 보호에 포함한다. Windows는 전용 원본 홈을 직접 사용한다. 소유 runtime에서 기본 개인 config를 가리키는 알려진 연결만 분리하며 미확인 연결은 보존·거부한다.
+Codex는 세 OS에서 상태 루트의 `automation-codex`를 직접 사용하며 역할·repository·worktree별 runtime은 호출별 임시 저장에 사용한다. 이전 runtime 홈의 설정·인증·session은 삭제하거나 새 호출에 연결하지 않는다. 기본 사용자 저장소와 자동 실행 홈 사이의 경로 의존 인증 재사용을 확인하지 못한 설정은 계속 거부한다. Claude는 `automation-claude`를 직접 사용하고 호출별 임시 폴더와 기존 worktree·role별 로그·결과를 분리한다. Claude의 사용자 설정 source 전체 제외와 검증된 격리 호출은 아직 완결되지 않았다. 현재 인증·실행 범위는 [운영 안내](OPERATIONS.md#전용-공급자-홈과-인증)를 따른다.
 
-격리 확인과 직전 재검사는 실행 홈뿐 아니라 전용 원본의 설정·규칙도 확인한다. 설정 지문은 설정 파일 내용과 실제 연결 경로에 결합하며 개인 설정 전체를 연결·복제하지 않는다. 경로에 종속된 인증 저장소를 역할별 홈과 공유할 수 없는 Linux·macOS Codex 설정은 거부하고, 새 CLI 저장소나 인증 복제를 추가하지 않는다. 기존 프로젝트·관리 정책 검사, ACL·Job Object·sandbox와 Claude의 미지원 격리 거부를 유지한다. 최초 인증·갱신·cron 전환은 [운영 안내](OPERATIONS.md#전용-공급자-홈과-인증)를 따른다.
+#### R-085: 공급자별 공통 홈과 검증 경계
 
-Manager 상태 경로 아래의 기존 provider runtime 경계를 사용하고 repository·worktree·role과 session의 연결을 보존한다. Codex 자식에는 관리 `CODEX_HOME`을, Claude 자식에는 관리 `CLAUDE_CONFIG_DIR`을 지정하며 부모 환경은 변경하지 않는다. 기존 provider home 값은 인증 원본 선택에만 사용하고 없으면 CLI 기본 사용자 저장소 또는 OS 인증 저장소를 선택한다. 환경 준비는 인증 사전 검사와 설정 지문·권한 확인보다 먼저 수행하고 실제 호출·재개·fallback까지 같은 환경을 전달한다. 설정 검사도 실제 선택한 저장소를 기준으로 하며 인증 원본 home의 개인 설정을 다시 조회하지 않는다.
+[R-085](<requirements/[R-085] Codex·Claude 인증 전용 자동 실행 환경.md>)에 따라 같은 상태 루트의 모든 Codex 자식은 `CODEX_HOME=<state_dir>/automation-codex`, 모든 Claude 자식은 `CLAUDE_CONFIG_DIR=<state_dir>/automation-claude`를 직접 사용한다. 개인 `~/.codex`·`~/.claude`는 자동 실행 홈과 분리하고 기본 인증 파일의 전용 홈 연결만 재사용한다. 역할별 runtime으로 홈을 다시 바꾸거나 공통 홈의 config·auth를 별도 실행 홈에 연결·복제하지 않는다. 전용 환경값의 저장 범위는 [Codex의 CODEX_HOME](https://learn.chatgpt.com/docs/config-file/environment-variables)과 [Claude의 CLAUDE_CONFIG_DIR](https://code.claude.com/docs/en/env-vars)의 공식 계약을 따른다. 기존 session 재개와 Claude CLI 호환성 검증은 R-085의 Non-Goals이며 공통 홈 전환의 선행 조건이나 완료 조건으로 요구하지 않는다.
 
-Codex의 파일 기반 인증은 기존 `auth.json`의 인증 전용 연결을 재사용하고 `config.toml` 연결은 제거한다. Claude는 공식 CLI의 파일·OS 인증 저장소 또는 기존 인증 환경값을 사용하는 경로를 확인하며 인증이 아닌 사용자 설정을 가져오지 않는다. 두 provider의 사용자 설정 파일은 Manager가 생성하지 않는다. Claude는 설정 디렉터리 밖에서 읽는 사용자 설정도 실제 호출의 설정 source에서 제외해야 하며, 별도 디렉터리 지정만으로 분리를 증명하지 않는다. 프로젝트·관리 설정의 적용과 기존 충돌 판정은 유지한다.
+공통 홈은 CLI가 설정과 session 등 상태를 저장하는 경계다. Manager는 사용자 설정 파일을 생성·덮어쓰지 않고 CLI의 설정 생성·원자적 교체 뒤에도 같은 홈의 현재 입력을 검사한다. 역할별 runtime의 잔여 config는 새 호출 입력으로 사용하거나 복원하지 않는다. 환경 준비는 인증·profile·설정·지침 조회보다 앞서 수행하고 실제 호출·재개·재시도·fallback까지 같은 환경을 전달한다. 설정 지문과 직전 재검사는 실제 사용하는 공통 홈·프로젝트·관리 설정을 대상으로 하며 읽기 실패·소유권 불명·검사 뒤 변경과 권한·확장 충돌은 기존 규칙으로 거부한다. 개인 설정 전체를 가져오지 않고 Claude의 설정 디렉터리 밖 개인 source도 제외한다. 기존 파일·OS 인증 저장소의 차이와 호출 전후 인증 링크 확인을 유지하며 공통 홈만으로 인증 재사용이나 Claude 격리 지원을 선언하지 않는다.
 
-Model·Effort·Fast 선택·instruction·sandbox·승인 정책은 기존 provider adapter의 명시적 인자로 전달한다. 기본 설정 상속은 분리된 CLI 환경 안에서 해석하며 인증 원본의 profile·규칙·Plugin·Hook·지침을 복원하지 않는다. 기존 runtime의 config 링크는 Manager 소유와 연결 대상을 확인한 뒤 링크만 분리하고 원본은 보존한다. 그 밖의 소유권 미확인 파일이나 인증·설정 분리 실패는 해당 호출의 오류로 남긴다. native Windows도 같은 경계를 적용할 수 있는 공식 인증 경로를 사용하며, 이전 사용자 home 전체 재사용을 대체 실행으로 허용하지 않는다.
+repository·worktree·role에 결합된 Manager runtime은 호출별 임시 폴더·로그·결과와 호출 증거를 관리하는 데 사용한다. Agent 도구에는 기존 선택 worktree와 해당 호출의 소유 임시 경로만 쓰기를 허용하고 공통 홈·개인 홈·다른 호출의 임시 경로는 포함하지 않는다. CLI 자체의 상태 저장은 도구 쓰기 권한과 구분한다. Model·Effort·Fast·instruction·sandbox·승인 정책은 명시적 호출 입력으로 전달하며 역할별 값을 공통 설정에 저장하지 않는다. 기존 ACL·Job Object·sandbox·자동 승인 검토와 Reviewer 읽기 전용 경계를 유지한다.
+
+Manager에 저장된 session ID와 repository·worktree·role·작업 결합 및 기존 fallback을 유지하며 홈의 가장 최근 session을 선택하지 않는다. 이전 홈의 session·설정·인증·작업물·로그와 DB 이력은 보존하고 홈 전체 복제·비가역 이동·초기화로 전환하지 않는다. 재개 불가는 기존 실패와 문맥을 보존하는 새 session fallback으로 연결하고 재개 성공과 구분한다. 호출별 임시 경로·출력·실행값·권한 분리는 기존 fixture·모의 호출로 확인한다. 당장 실행할 수 없는 실제 session 재개·동시 모델 실행, Claude CLI 호환성, 실계정 인증·갱신·credential store와 다른 OS의 실환경 검증은 R-085의 Non-Goals에 후속 확인 메모로만 남긴다. 이 미수행 항목으로 이번 변경을 미완료 처리하거나 기존 미지원 호출을 허용하지 않는다.
 
 ### R-023: workspace 쓰기 제한과 자동 승인 검토 (구현 예정)
 

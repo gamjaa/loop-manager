@@ -71,8 +71,7 @@ class NativePlatformAgentTests(unittest.TestCase):
                     self.assertEqual(launch.environment['TMP'], str(launch.attempt))
                     self.assertIn('windows.sandbox="elevated"', launch.arguments)
                     self.assertIn('windows.sandbox="elevated"', launch.probe_arguments)
-                else:
-                    self.assertTrue((Path(launch.environment['CODEX_HOME']) / 'auth.json').is_symlink())
+                self.assertEqual(launch.environment['CODEX_HOME'], str(home))
 
     def test_supported_platforms_require_successful_probe_for_fresh_and_resumed_calls(self):
         with tempfile.TemporaryDirectory() as directory:
