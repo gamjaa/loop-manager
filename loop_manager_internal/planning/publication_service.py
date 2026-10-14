@@ -7,8 +7,18 @@ from loop_manager_internal.maintenance.maintenance_orchestration import Maintena
 from loop_manager_internal.storage import maintenance_state
 from loop_manager_internal.planning.planning_service import PlanningService
 from loop_manager_internal.planning.planning_contracts import _PlanningRun, PlanningOutcome, PlanningOutcomeKind
+from loop_manager_internal.planning.planner_validation import MutableReadyPRConflict
 
 class PlanningPublicationService(PlanningService):
+    def _defer_mutable_pr_conflict(self, error: MutableReadyPRConflict) -> PlanningOutcome:
+        self._ports.events.info(
+            "PR 등록 경합으로 계획 후보와 실행 이력을 보존하고 현재 입력을 다시 확인합니다."
+        )
+        return PlanningOutcome(
+            PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED,
+            detail=str(error), error=True,
+        )
+
     def _verify_recovery_workspace(self, run: _PlanningRun, worktree: Path) -> None:
         """Both publication modes require the saved workspace and fresh remote ref."""
         self._ports.git.validate_worktree_ownership(
@@ -424,6 +434,19 @@ class PlanningPublicationService(PlanningService):
                     run.specification_fingerprint,
                     run.general_fingerprint,
                 )
+            except MutableReadyPRConflict as error:
+                if self._ports.state.general_publication(context.repo) is not None:
+                    if not run.publication_recovery_verified:
+                        return self._preserve_recovery_error(
+                            run, str(run.current_fingerprint or ""), error,
+                        )
+                    try:
+                        self._ports.state.supersede_unpublished_general_intent(context.repo)
+                    except RuntimeError as supersede_error:
+                        return self._preserve_recovery_error(
+                            run, str(run.current_fingerprint or ""), supersede_error,
+                        )
+                return self._defer_mutable_pr_conflict(error)
             except RuntimeError as error:
                 message = str(error)
                 self._ports.state.update(
@@ -479,6 +502,19 @@ class PlanningPublicationService(PlanningService):
                     run.specification_fingerprint,
                     run.general_fingerprint,
                 )
+            except MutableReadyPRConflict as error:
+                if latest_sha == row.active_sha:
+                    try:
+                        self._ports.state.supersede_unpublished_general_intent(context.repo)
+                    except RuntimeError as supersede_error:
+                        return self._preserve_recovery_error(
+                            run, str(run.current_fingerprint or ""), supersede_error,
+                        )
+                else:
+                    return self._preserve_recovery_error(
+                        run, str(run.current_fingerprint or ""), error,
+                    )
+                return self._defer_mutable_pr_conflict(error)
             except RuntimeError as error:
                 message = str(error)
                 self._ports.state.update(

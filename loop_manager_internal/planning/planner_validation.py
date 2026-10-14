@@ -29,6 +29,10 @@ import stat
 from uuid import uuid4
 
 
+class MutableReadyPRConflict(RuntimeError):
+    """A live PR appeared after its plan entered a mutable snapshot."""
+
+
 def _regular_file_or_absent(path: Path) -> bool:
     try:
         return stat.S_ISREG(path.stat().st_mode)
@@ -1639,8 +1643,10 @@ def _assert_mutable_ready_snapshot_current(
                 f'수동 소유권·membership이 mutable READY snapshot 이후 변경됐습니다: {plan.plan_id}'
             )
         if row["branch"]:
-            if effects.pr_for_branch is None or effects.pr_for_branch(Path(snapshot.repo), str(row["branch"])) is not None:
+            if effects.pr_for_branch is None:
                 raise PlannerValidationError(f"계획 갱신 전에 PR이 등록됐거나 확인할 수 없습니다: {plan.plan_id}")
+            if effects.pr_for_branch(Path(snapshot.repo), str(row["branch"])) is not None:
+                raise MutableReadyPRConflict(f"mutable READY snapshot 이후 PR이 등록됐습니다: {plan.plan_id}")
         sources, dependencies, priority = effects._execplan_metadata(
             {
                 "sources": list(plan.sources),

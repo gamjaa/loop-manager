@@ -1669,12 +1669,23 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
                          ('READY', 1, 'saved', 2, 8, '{"issue":2}'))
 
     def test_actual_pr_appearance_prevents_started_snapshot_publication(self):
+        from loop_manager_internal.planning.planner_validation import MutableReadyPRConflict
+
         self.connection.execute("UPDATE exec_plans SET ever_started=1, branch='work' WHERE plan_id='G-002'")
         self.connection.commit()
         with mock.patch.object(loop_manager, 'pr_for_branch', return_value=None):
             snapshot = loop_manager.mutable_ready_snapshot(self.connection, str(self.repo), self.repo, self.base)
         with mock.patch.object(loop_manager, 'pr_for_branch', return_value={'url': 'https://example/pr/2'}):
-            with self.assertRaisesRegex(loop_manager.PlannerValidationError, 'PR이 등록'):
+            with self.assertRaisesRegex(MutableReadyPRConflict, 'PR이 등록'):
+                loop_manager._assert_mutable_ready_snapshot_current(self.connection, snapshot)
+
+    def test_pr_lookup_failure_does_not_reuse_mutable_snapshot(self):
+        self.connection.execute("UPDATE exec_plans SET ever_started=1, branch='work' WHERE plan_id='G-002'")
+        self.connection.commit()
+        with mock.patch.object(loop_manager, 'pr_for_branch', return_value=None):
+            snapshot = loop_manager.mutable_ready_snapshot(self.connection, str(self.repo), self.repo, self.base)
+        with mock.patch.object(loop_manager, 'pr_for_branch', side_effect=RuntimeError('PR lookup failed')):
+            with self.assertRaisesRegex(RuntimeError, 'PR lookup failed'):
                 loop_manager._assert_mutable_ready_snapshot_current(self.connection, snapshot)
 
     def test_active_document_proposal_publication_and_restart_use_one_model_result(self):
@@ -2312,7 +2323,11 @@ class ManualOwnershipPlanningTest(unittest.TestCase):
                 current, current, ["docs/PRODUCT.md"],
             )
 
-        effects.pr_for_branch.assert_called_once_with(self.repository, "manual-work")
+        effects.pr_for_branch.assert_has_calls([
+            mock.call(self.repository, "manual-work"),
+            mock.call(self.repository, "manual-work"),
+        ])
+        self.assertEqual(effects.pr_for_branch.call_count, 2)
         effects.git.assert_called_once_with(self.repository, "rev-parse", "origin/main")
         effects.validate_worktree.assert_not_called()
 
