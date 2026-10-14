@@ -6,13 +6,40 @@
 
 명세 변경의 작업 구성·개정 판단을 프로젝트 일반 Planner로 모으고, 안전한 단계 경계에서 게시·DB 반영을 현재 작업 재개보다 먼저 끝내야 한다. 개별 작업은 마지막으로 반영한 ExecPlan과 최신 작업 문서의 구현 조건을 비교해 필요한 실행 대응을 선택한다. 자체 진행 기록을 새 구현 조건으로 오인하지 않으면서 미확인 조건을 소비하지 않는 기준 갱신도 필요하다. 같은 ID·작업물·기록 보존, 발견 단계별 대응과 정상 사용자 rebase 수용은 유지한다.
 
+ExecPlan·코드·테스트·설정 변경마다 예정 작업이나 구현 적합성을 Planner에게 확인시키는 호출도 최신 조건을 읽는 Worker와 중복된다. Planner는 아래 계획 작성·사용자 판단·Requirement 완료 확인에 집중하고, 개별 작업의 구현 판단은 Worker가 맡는다. 관련 ExecPlan이 모두 Merge된 Requirement는 다음 안전한 경계에서 바로 재확인해 미충족 조건을 놓치지 않는다.
+
 원격 확인과 문서 관련성 판단은 후보 검증과 구분한다. ref 갱신만으로 차단하지 않고 실제 문서·후보·검증 입력 변화에 해당하는 단계만 다시 수행해야 한다.
 
 현재 구현에는 진행 중 rebase 충돌과 Worker 구현 입력 변경이 함께 발견되면 기존 작업을 보존하고 최종 차단하는 경로가 남아 있다. 아래 충돌 복구 정책은 이 경로를 최신 base의 계획·작업 문서 자동 반영과 필요한 Worker 교정·재검증으로 연결하려는 변경 요구이며, 이미 구현된 동작이나 운영 문제의 해소를 뜻하지 않는다.
 
-진행 중 작업은 최신 원격 문서에 맞춰 갱신하되, 문서 변경만으로 구현을 반복하지 않아야 한다. 이 Requirement는 [R-049](archive/%5BR-049%5D%20Input-Specific%20Planner%20Roles.md)의 미착수 READY 갱신 제한과 [R-051](archive/%5BR-051%5D%20Remote%20Change%20Rebase%20and%20Managed%20Work%20Resumption.md)의 Worker·Reviewer 문서 재확인 범위를 아래 정책으로 변경한다. [R-072](%5BR-072%5D%20%EC%9E%85%EB%A0%A5%20%EB%8F%99%EC%9D%BC%EC%84%B1%EC%9D%B4%20%EC%A6%9D%EB%AA%85%EB%90%9C%20%EA%B5%AC%ED%98%84%20%ED%9B%84%EB%B3%B4%20%EC%84%B1%EA%B3%B5%20%EA%B2%B0%EA%B3%BC%20%EC%9E%AC%EC%82%AC%EC%9A%A9.md)의 입력 증명·성공 근거 재사용은 유지하되, 관련 문서 변경에 따른 단계 선택은 이 Requirement를 따른다.
+진행 중 작업은 최신 원격 문서에 맞춰 갱신하되, 문서 변경만으로 구현을 반복하지 않아야 한다. 이 Requirement는 [R-049](archive/%5BR-049%5D%20Input-Specific%20Planner%20Roles.md)의 미착수 READY 갱신 제한·ExecPlan 변경 재계획·코드 전용 점검과 [R-051](archive/%5BR-051%5D%20Remote%20Change%20Rebase%20and%20Managed%20Work%20Resumption.md)의 Worker·Reviewer 문서 재확인 범위를 아래 정책으로 변경한다. [R-072](%5BR-072%5D%20%EC%9E%85%EB%A0%A5%20%EB%8F%99%EC%9D%BC%EC%84%B1%EC%9D%B4%20%EC%A6%9D%EB%AA%85%EB%90%9C%20%EA%B5%AC%ED%98%84%20%ED%9B%84%EB%B3%B4%20%EC%84%B1%EA%B3%B5%20%EA%B2%B0%EA%B3%BC%20%EC%9E%AC%EC%82%AC%EC%9A%A9.md)의 입력 증명·성공 근거 재사용은 유지하되, 관련 문서 변경에 따른 단계 선택은 이 Requirement를 따른다.
 
 ## Requirement
+
+### Planner 실행 조건
+
+| 조건 | 호출 목적 |
+|---|---|
+| 최초 계획 수립 등 비교 가능한 전체 planning 성공 기준 부재 | 현재 명세·구현·catalog를 대조해 미충족 작업을 계획한다. |
+| 최신 원격 PRODUCT·활성 Requirement·ARCHITECTURE의 추가·변경·삭제 | 변경된 목표·조건과 영향받는 작업을 확인해 필요한 새 작업·개정을 반영한다. |
+| draft 질문에 사용자 답변이 들어와 의미 판단 필요 | R-061에 따라 답변·남은 질문을 판단한다. 일반 ExecPlan 변경을 이 조건으로 취급하지 않는다. |
+| 명시적 수동 제출에서 새 ExecPlan 생성 필요 | R-077에 따라 제출 범위와 기존 작업의 중복을 확인해 추적 작업을 생성한다. |
+| 자동 유지보수 주기 도래 또는 명시적 CLI 요청 | R-074·R-076의 기준값과 요청·안전 gate를 적용해 유지보수 평가·계획을 수행한다. |
+| 한 Requirement에 연결된 모든 ExecPlan의 실제 Merge 확인, 최신 입력의 유효한 완료 판단 부재 | 아래 Requirement 완료 재확인을 바로 수행한다. |
+| 프로젝트 완료 후보의 최신 입력에 유효한 최종 전문 확인 부재 | 전체 활성 명세와 구현·검증을 대조해 누락된 작업·사용자 판단을 확인한다. |
+
+ExecPlan의 추가·본문·선언 변경, 코드·테스트·설정 변경, 저장소 SHA 전진과 문서 수정본 승인 자체는 독립적인 Planner 실행 조건이 아니다. 미착수 READY가 있든 없든 코드 변경만을 이유로 점검 Planner나 일반 Planner를 호출하지 않으며, 점검 결과의 일반 Planner 인계도 제거한다. Manager가 catalog의 ID·source·dependency·사용자 결정·실행 자격을 검증하고 Worker가 선택된 최신 ExecPlan과 현재 코드에 맞춰 구현한다. 승인된 수정본과 적용할 기존 작업이 확정됐다면 유효성을 확인해 해당 Worker에 전달한다. 승인된 내용에 따라 PRODUCT·Requirement·ARCHITECTURE가 실제 변경된 경우는 위 명세 변경 조건을 적용한다.
+
+중단·재시작·원격 관측은 새로운 계획 호출 사유로 취급하지 않는다. 위 목적의 미완료 단계와 유효한 결과·게시 intent를 먼저 재사용하며, 실제 입력 변경으로 결과를 적용할 수 없거나 결과 오류·계획 작성 범위의 충돌 교정이 필요한 경우에만 해당 세션의 필요한 판단을 재호출한다. 명확한 형식·ID·경로 교정과 객관적 상태 확인은 R-071의 Manager 처리를 재사용한다. 같은 경계의 여러 호출 목적은 필요한 판단과 목적별 근거를 보존한 한 호출로 처리할 수 있다.
+
+### Requirement 완료 재확인
+
+- Manager가 해당 Requirement에 연결된 마지막 ExecPlan의 실제 Merge를 원격에서 확인하고 catalog·DB를 반영하면 다음 안전한 작업 선택 경계에서 해당 Requirement를 바로 재확인한다. 다른 Requirement의 READY·Merge 대기·완료나 프로젝트 전체 종료까지 미루지 않으며, 독립된 새 작업·유지보수 cycle 선택 전에 확인한다. 실행 중 writer·소유 Git operation·실제 프로젝트 안전 차단은 기존 완료·복구 경계를 따른다.
+- Worker 완료·verify PASS·Review PASS·PR 생성·Close를 Merge로 취급하지 않는다. source 관계가 유효하고 연결된 모든 ExecPlan이 실제 MERGED이며 미해결 관련 draft·사용자 판단이 없어야 완료 확인 대상이 된다. 하나의 ExecPlan이 여러 Requirement에 연결되면 각각의 남은 작업과 완료 조건을 확인한다.
+- 일반 Planner는 최신 Requirement의 각 Acceptance Criterion을 관련 PRODUCT·ARCHITECTURE, Merge된 구현·테스트와 실제 검증 근거에 대조해 충족·미충족·불확실로 판단한다. ExecPlan의 목적·조건이 원래 Requirement를 빠짐없이 다뤘는지도 확인하며, 작업이 전부 Merge됐다는 사실만으로 Requirement 전체 충족을 추정하지 않는다.
+- 전체 충족과 유효한 근거가 확인되면 Manager가 완료 판단을 기록하고 원문 그대로 archive한다. 미충족 조건은 해당 Requirement에 연결된 후속 ExecPlan으로, 필수 사용자 판단은 draft로 남긴다. 불확실·검증 근거 부재는 완료·archive를 보류하고 원인과 재개 조건을 보존한다.
+- 같은 입력의 유효한 Requirement 판단은 재사용한다. 원문·관련 명세·source 관계·구현·검증 근거가 바뀌면 이전 성공으로 완료하지 않는다. 여러 Requirement가 같은 경계에서 대상이 되거나 명세 변경 검토·프로젝트 최종 확인도 필요하면 한 Planner 호출로 처리하되 Requirement별 판단과 프로젝트 전체 확인의 근거를 구분해 기록한다.
+- 관련 Requirement 재확인만 필요한 경우 대상 조건과 관련 근거에 집중하며 무관한 전체 명세 검토를 반복하지 않는다. archive 게시·DB 반영은 기존 publication·소유권·원격 재확인 경계를 따르고, 이동 자체로 Planner 호출·새 작업 주기·완료 알림을 다시 만들지 않는다.
 
 ### Requirement 변경과 작업·DB 동기화
 
@@ -41,7 +68,7 @@ Manager는 기존 snapshot·원격 revision·content hash·현재 실행 및 소
 ### ExecPlan 갱신 경계
 
 - Worker는 선택된 ExecPlan의 구현·검증 기록 등 본문만 수정한다. frontmatter와 다른 ExecPlan, 활성·archive를 포함한 모든 Requirement는 수정하지 않는다. Worker는 현재 작업에 필요한 PRODUCT·ARCHITECTURE·FUTURE_IDEAS를 수정할 수 있다. Requirement 추가·삭제·rename·이동과 archive 후보 지정에 따른 Worker 수정 예외도 허용하지 않는다. frontmatter 변경은 Planner·Manager가 검증하고 공식 선언·catalog·DB에 반영한 뒤 실행 입력으로 사용한다.
-- 기존 source 경로의 rename 조회 호환은 R-071대로 유지한다. 누락·모호한 source나 잘못된 선언은 Worker 시작 전에 정합화하거나 Planner 교정으로 처리하며, Worker의 경로 수정이나 metadata 비교 완화로 우회하지 않는다. 교정은 기존 구현·문서·테스트·실행 기록을 보존하며 완료·verify 성공·차단 해제를 뜻하지 않는다.
+- 기존 source 경로의 rename 조회 호환은 R-071대로 유지한다. 누락·모호한 source나 잘못된 선언은 Worker 시작 전에 Manager가 확정 가능한 규칙으로 정합화하고, 확정할 수 없으면 원인과 작업을 보존해 기존 사용자 판단·복구 경로로 보류한다. ExecPlan 변경만으로 Planner를 호출하거나 Worker의 경로 수정·metadata 비교 완화로 우회하지 않는다. 교정은 기존 구현·문서·테스트·실행 기록을 보존하며 완료·verify 성공·차단 해제를 뜻하지 않는다.
 - 일반 Planner는 PR 등록 전인 ExecPlan을 관련 Requirement 변경에 맞춰 갱신한다. 최초 실행 여부, READY 복귀, 기존 branch·worktree·세션 또는 원격 checkpoint 존재만으로 갱신 대상에서 제외하지 않는다.
 - 진행 중 작업의 갱신은 같은 ExecPlan ID와 작업물·세션·실행 및 실패 이력을 보존한다. 이미 수행한 구현·검증 기록과 새 조건의 미충족 부분을 구분하며, 문서 갱신 자체를 작업 완료나 과거 실패 해소로 기록하지 않는다.
 - PR 등록 후 Merge를 기다리는 ExecPlan은 새 요구사항을 반영하기 위해 수정하지 않는다. 추가·변경 요구사항의 미충족 범위는 새 ExecPlan으로 작성하며 기존 작업과의 중복·dependency는 기존 카탈로그 규칙으로 확인한다.
@@ -61,7 +88,7 @@ Manager는 기존 snapshot·원격 revision·content hash·현재 실행 및 소
 
 ### 프로젝트 planning과 현재 작업 재개 순서
 
-Manager는 최신 원격의 PRODUCT·활성 Requirement·ARCHITECTURE 변경을 프로젝트의 마지막으로 원격 적용한 전체 planning 성공 기준과 비교한다. 사용자 active ExecPlan 변경과 비교 가능한 성공 기준 부재도 기존 일반 planning 진입 조건을 유지한다. 저장소 SHA 전진이나 기본 worktree의 equal 여부만으로 명세 변경·반영 완료를 판단하지 않는다.
+Manager는 최신 원격의 PRODUCT·활성 Requirement·ARCHITECTURE 변경을 프로젝트의 마지막으로 원격 적용한 전체 planning 성공 기준과 비교하고 위 Planner 실행 조건을 적용한다. ExecPlan 변경 자체는 프로젝트 재계획을 시작하지 않으며 Manager의 선언 검증·catalog 반영과 해당 작업의 실행 대응으로 처리한다. 저장소 SHA 전진이나 기본 worktree의 equal 여부만으로 명세 변경·반영 완료를 판단하지 않는다.
 
 1. Worker·Manager verify·Reviewer가 실행 중이면 종료를 기다린다. 같은 worktree를 동시에 수정하거나 프로세스를 강제 중단하지 않고, 결과와 현재 작업의 재개 단계·작업물·세션·실행 및 실패 이력을 보존한다.
 2. 다음 Worker·verify·Review·게시 진입 전 안전한 경계에서 필요한 프로젝트 전체 planning을 현재 작업 재개보다 먼저 수행한다. 현재 작업을 다른 작업으로 교체하거나 READY로 초기화하지 않는다. 소유 Git operation이 진행 중이면 기존 operation의 완료·복구를 먼저 처리하고 최신 명세를 반영한다.
@@ -69,7 +96,7 @@ Manager는 최신 원격의 PRODUCT·활성 Requirement·ARCHITECTURE 변경을 
 4. Manager가 허용된 개정의 원격 게시와 catalog·DB·프로젝트 planning 성공 기준의 반영을 완료한 뒤 현재 작업을 재개한다. 개정이 필요 없다는 유효한 전체 planning 결과도 같은 성공 기준에 확정해 동일 입력의 호출을 반복하지 않는다. Planner 자신의 검증된 게시 delta를 새로운 외부 명세 변경으로 재소비하지 않는다.
 5. 현재 작업 branch에 최신 ExecPlan을 반영하고 아래 실행 대응을 적용한다. 새 dependency가 있으면 실제 Merge gate를 다시 확인하며, dependency 대기를 피하려고 개정을 무시하거나 선행 관계를 삭제하지 않는다. PR 등록·수동 소유·사용자 판단·독립 차단은 기존 갱신 권한을 유지한다.
 
-프로젝트 전체 planning은 작업 구성과 명세의 관련성을 판단한다. 개별 작업의 실행 대응 확인에서 같은 명세 변경의 관련성과 ExecPlan 개정을 작업마다 다시 Planner에게 맡기지 않는다. 별도 실행 대응 판단을 했다면 프로젝트 전체 planning 성공으로 기록하지 않는다. 코드 전용 점검 Planner·유지보수의 대상 제한과 다른 작업의 기존 선택 순서는 유지한다.
+프로젝트 전체 planning은 작업 구성과 명세의 관련성을 판단한다. 개별 작업의 실행 대응 확인은 Worker·Reviewer와 Manager의 검증 책임으로 처리하며, 같은 명세 변경의 관련성이나 ExecPlan의 구현 적합성을 별도 Planner에게 다시 맡기지 않는다. 이 실행 대응을 프로젝트 전체 planning 성공으로 기록하지 않는다. Requirement 완료 재확인 뒤 일반 작업 간 우선순위와 유지보수의 대상·안전 제한은 유지한다.
 
 ### 원격 확인과 ExecPlan 변경에 따른 실행 대응
 
@@ -83,13 +110,16 @@ Manager는 Worker, Manager verify, Reviewer 진입 전에 등록된 origin의 �
 
 | 변경 종류 | 처리 |
 |---|---|
-| 프로젝트 명세 또는 사용자 active ExecPlan 변경 | 위 프로젝트 planning을 먼저 확정한다. 현재 작업과 무관해도 프로젝트의 변경 검토는 수행하며, 개별 작업별 명세 영향 Planner 호출은 반복하지 않는다. |
+| PRODUCT·활성 Requirement·ARCHITECTURE 변경 | 위 프로젝트 planning을 먼저 확정한다. 현재 작업과 무관해도 프로젝트의 변경 검토는 수행하며, 개별 작업별 명세 영향 Planner 호출은 반복하지 않는다. |
+| ExecPlan 추가·본문·선언 변경만 있음 | Manager가 catalog·source·dependency·사용자 판단을 검증해 실행 입력에 반영한다. 프로젝트 재계획·점검 Planner·작업별 영향 Planner는 호출하지 않는다. |
 | 현재 ExecPlan의 구현 조건이 그대로이거나 수행 기록만 변경 | 필요한 rebase 후 하던 단계를 계속한다. SHA·문서 변경 사실만으로 Worker를 다시 호출하지 않는다. |
 | 현재 ExecPlan의 구현 관련 조건 변경 | 마지막으로 실제 반영한 ExecPlan과 최신 문서를 비교하고 현재 후보·발견 단계에 맞춰 아래 대응을 적용한다. |
-| 코드·테스트·설정 등 구현·검증 입력 변경 | 기존 rebase·충돌 복구·후보 검증 무효화 및 증명된 결과 재사용 규칙을 적용한다. |
+| 코드·테스트·설정 등 구현·검증 입력 변경 | Planner를 호출하지 않고 기존 rebase·충돌 복구·Worker의 현재 코드 확인·후보 검증 무효화와 증명된 결과 재사용 규칙을 적용한다. |
 | 문서와 코드 변경이 함께 있음 | 필요한 프로젝트 planning·ExecPlan 실행 대응과 코드 변경의 기존 검증 규칙을 함께 적용한다. |
 
 작업의 문서 변경 비교 기준은 직전 fetch·rebase나 저장소 전체 SHA가 아니라 해당 작업이 마지막으로 실제 반영한 ExecPlan이다. 목표·범위·완료 기준·구현/검증 조건·sources·dependency·사용자 결정 등 구현 관련 내용을 R-072의 순수 기록 구분과 함께 비교한다. 절 이름만으로 Progress·Decision Log를 통째로 제외하지 않는다. 조건 변경도 Worker 재호출의 충분조건이 아니며 현재 구현의 부족과 발견 단계로 대응한다.
+
+새 조건에 대한 구현 충족 여부를 기존 Worker 결과·검증 근거로 확정할 수 없으면 해당 Worker 세션에 최신 ExecPlan·변경 delta·유효한 과거 근거를 전달해 판단과 필요한 구현·targeted test를 함께 수행한다. Worker 진입 때의 동일 판단을 별도 호출로 선행하지 않으며, 구현 부족이 없다는 유효한 근거가 있으면 현재 verify·Review를 계속한다. Worker는 frontmatter·다른 작업·Requirement를 수정하지 않고 Manager의 dependency·사용자 판단 gate를 우회하지 않는다.
 
 연결 Requirement·적용 PRODUCT·ARCHITECTURE의 변경 의미는 프로젝트 Planner가 관련 ExecPlan에 반영한다. 현재 ExecPlan이 그대로이고 유효한 전체 planning 결과가 현재 조건의 유지를 확인했다면 개별 작업이 상위 명세 영향 판단을 다시 시작하지 않는다. 전체 planning의 미완료·불확실을 ExecPlan 무변경으로 대신 확정하지 않는다. verify·Review의 실제 입력·명세·후보 비교는 R-072대로 별도로 유지한다.
 
@@ -155,6 +185,11 @@ Reviewer를 먼저 진행한 결과가 구현 부족이면 Worker 교정 후 필
 
 ## Acceptance Criteria
 
+- 위 Planner 실행 조건만 자동 호출을 시작한다. 다른 독립적인 호출 조건이 없는 ExecPlan 변경만의 경우와 코드·테스트·설정 전용 변경의 READY 있음·없음·dependency 대기 조합에서 일반·점검·작업별 문서 영향 Planner가 호출되지 않으며, Manager 선언 검증과 Worker의 최신 코드·작업 조건 반영이 유지된다.
+- 조건이 바뀐 ExecPlan의 구현 적합성은 기존 Worker 세션에서 필요한 보완과 함께 확인한다. 순수 수행 기록·이미 확인한 조건은 재호출하지 않고 새 조건을 확인하지 않은 채 과거 verify·Review 성공으로 게시하지 않는다.
+- 새 Requirement·상위 명세 변경, draft 사용자 답변, 추적 ExecPlan이 필요한 명시적 수동 제출, R-074의 자동 주기·수동 유지보수 요청, Requirement 완료 재확인과 프로젝트 최종 확인은 목적에 맞는 Planner 호출을 유지한다. 결과 재사용·오류 교정·중단 재개·원격 경쟁에서는 필요한 미완료 판단만 재호출하고 같은 입력의 중복 호출을 만들지 않는다.
+- Requirement의 마지막 연결 ExecPlan Merge를 실제 확인한 뒤, 다른 Requirement의 READY·Open PR·차단이나 프로젝트 전체 완료를 기다리지 않고 다음 안전한 경계에서 해당 Requirement를 재확인한다. 실행 중 writer·소유 operation·실제 프로젝트 안전 gate는 준수하며, 완료 확인 뒤 독립 작업·새 유지보수 선택을 계속한다.
+- 모든 연결 작업이 MERGED여도 원래 Acceptance Criteria에 누락·새 조건·검증 근거 부재가 있으면 완료·archive하지 않는다. 충족은 Manager의 판단 기록·원문 archive로, 미충족은 후속 ExecPlan으로, 사용자 결정은 draft로, 불확실은 보류·재개 조건으로 반영한다. 공유 ExecPlan의 각 Requirement 판단과 같은 입력 재사용·다중 대상 호출 통합을 확인한다.
 - 선택된 ExecPlan의 본문 기록과 PRODUCT·ARCHITECTURE·FUTURE_IDEAS의 관련 수정은 허용하고 모든 Requirement 변경은 거부한다. archive 후보 지정으로 Worker 쓰기 권한이 확대되지 않는다. Worker가 변경한 frontmatter는 위 부분 복원 조건을 충족하면 본문을 보존해 공식 선언으로 되돌리고, 조건을 확인할 수 없는 선언 불일치는 검증·Review 전에 거부하며, 범위 밖 문서 수정은 위 복원 목표에 따라 최종 후보에서 제거하거나 안전을 확인할 수 없으면 거부한다. 원본 브랜치에서 rebase로 유입된 문서는 범위 밖 변경에서 제외하며 실제 오류에는 비교 원본·후보 revision과 경로·변경 종류를 확인할 수 있다. source 경로 교정은 원격 공식 선언과 catalog·DB가 같은 결과를 채택한 뒤 보존된 Worker 구현·기록으로 재개하며, rename 조회 호환을 선언 일치로 오인하지 않는다.
 - 신규 Requirement의 목표가 이미 구현됐거나 기존 작업으로 충족되면 중복 ExecPlan이 생성되지 않는다. 기존 미착수 작업의 허용 개정과 독립적인 미충족 목표의 신규 생성이 구분되며 source·dependency와 DB 관계가 일치한다.
 - Requirement 수정의 변경 전후 동작·조건·완료 기준과 관련 작업을 확인할 수 있다. 변경·삭제된 항목의 체크리스트·관련 파일·변경 목적·Validation·source·dependency가 함께 갱신되고 이미 구현한 결과·유효한 검증·세션·실패·PR 이력은 보존된다.
@@ -194,6 +229,8 @@ Reviewer를 먼저 진행한 결과가 구현 부족이면 Worker 교정 후 필
 
 ## Product Impact
 
+- Planner는 명세의 작업 구성·사용자 판단·전체 충족 확인을 담당하고 Worker는 선택된 작업의 최신 코드 적용·구현 적합성 판단·필요한 보완을 함께 담당한다. ExecPlan·코드 변경만의 점검·재계획 호출은 없다.
+- 한 Requirement의 모든 작업이 실제 Merge되면 다음 안전한 경계에서 해당 조건을 바로 재확인하며, 다른 Requirement의 종료나 프로젝트 전체 완료까지 미루지 않는다.
 - Requirement의 추가·수정·부분 철회가 실제 미충족 작업·공유 목표·문서와 현재 DB 관계에 일치하고 완료된 구현·감사는 보존된다.
 - ExecPlan 갱신 가능 여부는 실행 이력보다 PR 등록 경계를 기준으로 판단한다.
 - 명세 변경은 안전한 단계 경계에서 프로젝트 planning·게시·DB 반영을 먼저 완료하며, 현재 작업은 마지막 반영 ExecPlan의 조건 변경과 부족한 구현·검증에 맞춰 필요한 단계로 연결된다.
@@ -206,4 +243,4 @@ Reviewer를 먼저 진행한 결과가 구현 부족이면 Worker 교정 후 필
 - Merge 대기 ExecPlan의 요구 범위를 확장하거나 PR을 자동 Merge·Close하지 않는다.
 - 진행 중 프로세스를 강제 중단하거나 같은 프로젝트의 작업·Planner를 병렬 실행하지 않는다.
 - 일반 Planner에 코드·설정 수정 권한을 주거나 Reviewer의 읽기 전용·테스트 미실행 원칙을 바꾸지 않는다.
-- 명세 변경 때 프로젝트 planning을 현재 작업 재개보다 먼저 하는 순서 외에 다른 작업의 선택·우선순위, 유지보수 주기와 사용자 승인 정책을 변경하지 않는다. 공통 Git 수용·통합·게시 분리는 R-055를 따른다.
+- 명세 변경의 선행 planning과 Requirement 완료 재확인 시점 외의 일반 작업 간 우선순위·사용자 승인 정책을 변경하지 않는다. 유지보수 주기는 R-074, CLI 요청은 R-076, 공통 Git 수용·통합·게시 분리는 R-055를 따른다.

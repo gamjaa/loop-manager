@@ -4,6 +4,7 @@ import json
 from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
+from types import SimpleNamespace
 import sqlite3
 import subprocess
 import tempfile
@@ -1243,17 +1244,18 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
             self.connection.commit()
             effects = documents.StageDocumentEffects(git=loop_manager.git,
                 capture_scope=loop_manager.capture_git_snapshot,
-                validate_scope=mock.Mock(), run_agent=agent,
+                validate_scope=mock.Mock(),
                 prepare_snapshot=loop_manager.mutable_ready_snapshot,
                 assert_snapshot=loop_manager._assert_mutable_ready_snapshot_current,
                 validate_result=loop_manager.validate_planner_result,
                 validate_worktree=loop_manager.validate_managed_worktree,
                 pr_for_branch=mock.Mock(return_value=None), log=mock.Mock(),
-                run_with_retries=lambda call, session_id: call(session_id, False))
+                )
             checkpoints = ExecutionCheckpointRepository(self.connection)
-            documents.save(checkpoints, str(self.repo), 'G-002', dict(version=1, stage='assess',
+            documents.save(checkpoints, str(self.repo), 'G-002', dict(version=1, stage='proposed',
                 base=self.base, phase='IMPLEMENTING', paths=['docs/PRODUCT.md'], document_only=True,
-                previous=current.serialize(), assessment=None, worker_result=None,
+                candidate=worker_scope.head, worker_snapshot=worker_scope.serialize(),
+                previous=current.serialize(), assessment=json.loads(raw.split(': ', 1)[1]), worker_result=None,
                 verify_result=None, verify_base=None))
             with mock.patch.object(loop_manager, 'pr_for_branch', return_value=None):
                 result = documents.refresh(effects, state, checkpoints, identity, context,
@@ -1278,7 +1280,7 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
             resumed = documents.refresh(effects, state, checkpoints, identity, context, updated, updated, [])
             self.assertEqual(first, resumed)
             self.assertEqual(first['stage'], 'done')
-            agent.assert_called_once()
+            agent.assert_not_called()
             self.assertEqual(row()['worker_session_id'], 'saved-session')
 
     def test_mutable_snapshot_uses_git_blob_with_crlf_checkout(self):
@@ -1830,11 +1832,11 @@ class ManualOwnershipPlanningTest(unittest.TestCase):
         effects = documents.StageDocumentEffects(
             git=mock.Mock(return_value=git_result),
             capture_scope=mock.Mock(return_value=SimpleNamespace(head=self.base)),
-            validate_scope=mock.Mock(), run_agent=mock.Mock(),
+            validate_scope=mock.Mock(),
             prepare_snapshot=lambda *args: self.mutable_snapshot(),
             assert_snapshot=mock.Mock(), validate_result=mock.Mock(),
             validate_worktree=mock.Mock(), pr_for_branch=mock.Mock(return_value=None),
-            log=mock.Mock(), run_with_retries=mock.Mock(),
+            log=mock.Mock(),
         )
 
         with self.assertRaisesRegex(loop_manager.PlannerValidationError, "갱신 권한"):
@@ -1846,7 +1848,6 @@ class ManualOwnershipPlanningTest(unittest.TestCase):
         effects.pr_for_branch.assert_called_once_with(self.repository, "manual-work")
         effects.git.assert_called_once_with(self.repository, "rev-parse", "origin/main")
         effects.validate_worktree.assert_not_called()
-        effects.run_agent.assert_not_called()
 
     def test_prepared_stage_document_rechecks_manual_ownership_before_push(self):
         from types import SimpleNamespace
@@ -1904,11 +1905,10 @@ class ManualOwnershipPlanningTest(unittest.TestCase):
         ))
         effects = documents.StageDocumentEffects(
             git=git, capture_scope=mock.Mock(), validate_scope=mock.Mock(),
-            run_agent=mock.Mock(), prepare_snapshot=mock.Mock(),
+            prepare_snapshot=mock.Mock(),
             assert_snapshot=loop_manager._assert_mutable_ready_snapshot_current,
             validate_result=mock.Mock(), validate_worktree=mock.Mock(),
             pr_for_branch=mock.Mock(return_value=None), log=mock.Mock(),
-            run_with_retries=mock.Mock(),
         )
         context = SimpleNamespace(
             plan=SimpleNamespace(plan_id=original.plan_id), phase=ExecutionPhase.IMPLEMENTING,
@@ -1921,82 +1921,20 @@ class ManualOwnershipPlanningTest(unittest.TestCase):
 
         self.assertEqual(git.call_count, 3)
         effects.validate_worktree.assert_called_once_with(self.repository, workspace, None)
-        effects.run_agent.assert_not_called()
 
-    def test_new_execplan_execution_assessment_cannot_return_plan_text(self):
-        from types import SimpleNamespace
-        from loop_manager_internal.agents.scope_contracts import GitSnapshot
+    def test_new_execplan_change_does_not_start_document_assessment(self):
         from loop_manager_internal.execution import stage_documents as documents
         from loop_manager_internal.execution.execution_session import ExecutionIdentity
-        from loop_manager_internal.execution.execution_runtime import ExecutionPhase
         from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
         from tests.support.revision import definition
-
-        self.connection.execute(
-            "UPDATE exec_plans SET status='IMPLEMENTING', ever_started=1, active_sha=?, branch='worker' "
-            "WHERE repo=? AND plan_id='G-001'",
-            (self.base, self.repo),
-        )
-        self.connection.commit()
-        current = replace(
-            definition(), revision_sha=self.base, path="docs/plans/[G-001] First.md",
-            title="First", sources=("docs/PRODUCT.md",),
-        )
-        state = SimpleNamespace(
-            connection=self.connection,
-            row=lambda: self.connection.execute(
-                "SELECT * FROM exec_plans WHERE repo=? AND plan_id='G-001'",
-                (self.repo,),
-            ).fetchone(),
-        )
-        with tempfile.TemporaryDirectory(dir=Path.cwd()) as directory:
-            identity = ExecutionIdentity(
-                repo=self.repo, repo_path=self.repository, state_dir=Path(directory) / "state",
-                base="main", provider="codex",
-            )
-            snapshot = GitSnapshot(
-                head=self.base, branch="worker", index={}, dirty={}, refs={},
-                worktrees={}, config={}, operations={},
-            )
-            result = (
-                'DOCUMENT_RESULT: ' + json.dumps({
-                    "relevant": True, "implementation": "satisfied",
-                    "plan_text": plan_text("G-001", "Revised"),
-                    "evidence": "현재 구현과 최신 명세를 대조했습니다.",
-                })
-            )
-            def git(_path, *arguments, **_kwargs):
-                stdout = "" if arguments == ("status", "--porcelain") else self.base + "\n"
-                return SimpleNamespace(stdout=stdout, returncode=0)
-            effects = documents.StageDocumentEffects(
-                git=mock.Mock(side_effect=git), capture_scope=mock.Mock(return_value=snapshot),
-                validate_scope=mock.Mock(), run_agent=mock.Mock(), prepare_snapshot=mock.Mock(),
-                assert_snapshot=mock.Mock(), validate_result=mock.Mock(),
-                validate_worktree=mock.Mock(), pr_for_branch=mock.Mock(return_value=None),
-                log=mock.Mock(), run_with_retries=mock.Mock(return_value=(0, result)),
-            )
-            checkpoints = ExecutionCheckpointRepository(self.connection)
-            documents.save(checkpoints, self.repo, "G-001", {
-                "version": 1, "stage": "assess", "scope": "execplan",
-                "base": self.base, "phase": "IMPLEMENTING",
-                "paths": ["docs/PRODUCT.md"], "document_only": True,
-                "previous": current.serialize(), "assessment": None,
-            })
-            context = SimpleNamespace(
-                plan=SimpleNamespace(plan_id="G-001"), phase=ExecutionPhase.IMPLEMENTING,
-                worktree=self.repository, branch="worker", resolving_rebase=False,
-            )
-
-            with self.assertRaisesRegex(
-                loop_manager.PlannerValidationError,
-                "실행 대응 판단은 ExecPlan 개정을 반환할 수 없습니다",
-            ):
-                documents.refresh(effects, state, checkpoints, identity, context,
-                                  current, current, ["docs/PRODUCT.md"])
-
-            self.assertEqual(effects.run_with_retries.call_count, 3)
-            effects.prepare_snapshot.assert_not_called()
-            effects.validate_result.assert_not_called()
+        current = definition()
+        state = SimpleNamespace(row=lambda: {'pr_url': None})
+        context = SimpleNamespace(plan=SimpleNamespace(plan_id='G-001'))
+        identity = ExecutionIdentity(repo=self.repo, repo_path=self.repository,
+            state_dir=Path("/unused/state"), base='main', provider='codex')
+        effects = mock.Mock()
+        self.assertIsNone(documents.refresh(effects, state, ExecutionCheckpointRepository(self.connection),
+            identity, context, current, current, [current.path]))
 
 
 class MutableReadyMetadataCasTest(unittest.TestCase):
@@ -2048,10 +1986,15 @@ class MutableReadyMetadataCasTest(unittest.TestCase):
 
     def test_active_maintenance_allows_general_snapshot_only_for_parked_execution(self):
         self.connection.execute("INSERT INTO maintenance_cycles (repo, phase) VALUES ('repo', 'refactoring')")
+        self.connection.execute("UPDATE projects SET phase=NULL WHERE repo='repo'")
         with self.assertRaisesRegex(loop_manager.PlannerValidationError, 'maintenance cycle'):
             loop_manager.mutable_ready_snapshot(self.connection, 'repo', Path('repo'), 'base')
         with self.assertRaisesRegex(loop_manager.PlannerValidationError, 'maintenance cycle'):
             loop_manager._assert_mutable_ready_snapshot_current(self.connection, self.snapshot)
+        self.connection.execute("UPDATE projects SET phase='PLANNING' WHERE repo='repo'")
+        check = loop_manager.mutable_ready_snapshot(self.connection, 'repo', Path('repo'), 'base')
+        self.assertEqual(check.plans, ())
+        loop_manager._assert_mutable_ready_snapshot_current(self.connection, check)
         self.connection.execute("UPDATE projects SET planning_resume_plan_id = 'G-001' WHERE repo='repo'")
         with mock.patch.object(loop_manager, '_ready_plan_snapshot_at_revision', return_value=self.snapshot.plans[0]):
             snapshot = loop_manager.mutable_ready_snapshot(self.connection, 'repo', Path('repo'), 'base')

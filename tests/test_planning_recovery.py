@@ -1358,9 +1358,10 @@ class PlanningRecoveryTest(PlanningCase):
     def test_failed_planner_does_not_activate_stale_ready(self):
         ports = FakePorts(planning_snapshot(
             processed_sha="old-base",
-            specification_fingerprint="specification",
+            specification_fingerprint="old-spec",
             planning_fingerprint="old-full",
         ))
+        ports.git.specification_fingerprints["old-base"] = "old-spec"
         ports.git.fingerprint = "new-full"
         ports.git.fingerprints["old-base"] = "old-full"
         ports.agent.result = PlanningAgentResult(

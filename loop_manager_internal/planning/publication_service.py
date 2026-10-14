@@ -279,23 +279,24 @@ class PlanningPublicationService(PlanningService):
                             ),
                         )
                     else:
+                        review = getattr(self._ports.state, 'planning_review', lambda *_: None)(context.repo, 'attempt')
+                        requirement_only = review is not None and review['purpose'] == 'requirement'
                         if hasattr(self._ports.state, "confirm_planning_review"):
                             self._ports.state.confirm_planning_review(
                                 context.repo, str(row.active_sha), str(row.active_sha),
                             )
-                        self._ports.state.record_general_plan_declarations(
-                            context.repo, str(row.active_sha or ""),
-                            self._ports.git.plan_declarations(
-                                context.repo_path, str(row.active_sha or ""),
-                            ),
-                        )
+                        if not requirement_only:
+                            self._ports.state.record_general_plan_declarations(
+                                context.repo, str(row.active_sha or ""),
+                                self._ports.git.plan_declarations(context.repo_path, str(row.active_sha or "")),
+                            )
                         self._ports.state.clear_active_in_transaction(
                             context.repo,
-                            processed_sha=row.active_sha,
+                            processed_sha=row.processed_sha if requirement_only else row.active_sha,
                             specification_fingerprint=(
-                                completed_specification_fingerprint
+                                row.specification_fingerprint if requirement_only else completed_specification_fingerprint
                             ),
-                            planning_fingerprint=completed_fingerprint,
+                            planning_fingerprint=row.planning_fingerprint if requirement_only else completed_fingerprint,
                         )
                     self._ports.git.run(
                         context.repo_path,

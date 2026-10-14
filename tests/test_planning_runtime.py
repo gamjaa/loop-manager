@@ -38,7 +38,7 @@ class PlanningDecisionTest(unittest.TestCase):
             PlanningDecisionKind.RUN_SPECIFICATION_PLANNING,
         )
 
-    def test_changed_full_input_precedes_runnable_ready(self):
+    def test_changed_full_input_activates_runnable_ready(self):
         decision = choose_planning_decision(
             has_active=False,
             specification_changed=False,
@@ -47,9 +47,9 @@ class PlanningDecisionTest(unittest.TestCase):
             has_waiting_catalog=True,
         )
 
-        self.assertEqual(decision.kind, PlanningDecisionKind.RUN_FALLBACK_PLANNING)
+        self.assertEqual(decision.kind, PlanningDecisionKind.ACTIVATE_READY)
 
-    def test_changed_full_input_plans_without_runnable_ready(self):
+    def test_changed_full_input_waits_or_completes_without_planning(self):
         decision = choose_planning_decision(
             has_active=False,
             specification_changed=False,
@@ -60,7 +60,7 @@ class PlanningDecisionTest(unittest.TestCase):
 
         self.assertEqual(
             decision.kind,
-            PlanningDecisionKind.RUN_FALLBACK_PLANNING,
+            PlanningDecisionKind.STABLE_WAIT,
         )
 
 

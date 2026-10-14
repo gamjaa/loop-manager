@@ -198,8 +198,8 @@ def calculate_review_due(
 ) -> ReviewDue:
     """Decide review eligibility solely from durable audit values."""
 
-    if interval <= 0:
-        raise ValueError("refactoring review interval must be positive")
+    if interval < 0:
+        raise ValueError("refactoring review interval must be nonnegative")
     if current_merged_count < 0:
         raise MaintenanceStateError("MERGED ExecPlan 수가 음수입니다.")
     if phase is not MaintenancePhase.IDLE:
@@ -209,6 +209,8 @@ def calculate_review_due(
     if last_success_merged_count < 0 or current_merged_count < last_success_merged_count:
         raise MaintenanceStateError("MERGED ExecPlan 감사 기준값이 현재 이력보다 큽니다.")
     merged_since_baseline = current_merged_count - last_success_merged_count
+    if interval == 0:
+        return ReviewDue(False, "disabled", merged_since_baseline, phase)
     required = merged_since_baseline >= interval
     return ReviewDue(
         required,
@@ -229,8 +231,8 @@ def calculate_file_assessment_due(
 ) -> ReviewDue:
     """Schedule a file assessment independently of legacy review history."""
 
-    if interval <= 0:
-        raise ValueError("refactoring review interval must be positive")
+    if interval < 0:
+        raise ValueError("refactoring review interval must be nonnegative")
     if current_merged_count < 0:
         raise MaintenanceStateError("MERGED ExecPlan 수가 음수입니다.")
     if start_merged_count is not None and (
@@ -253,6 +255,8 @@ def calculate_file_assessment_due(
         else start_merged_count
     )
     merged_since_baseline = current_merged_count - baseline
+    if interval == 0:
+        return ReviewDue(False, "disabled", merged_since_baseline, phase)
     if merged_since_baseline >= interval:
         return ReviewDue(True, "interval_reached", merged_since_baseline, phase)
     if (

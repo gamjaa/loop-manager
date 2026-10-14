@@ -36,6 +36,20 @@ def evidence(connection: sqlite3.Connection, repo: str, plan_id: str) -> dict | 
     return json.loads(row[0]) if row else None
 
 
+def needs_semantic_review(connection: sqlite3.Connection, repo: str, entries) -> bool:
+    from loop_manager_internal.storage import planning_input_state
+    baseline = planning_input_state._saved(connection, repo) or {}
+    for plan_id in pending_ids(connection, repo):
+        saved = evidence(connection, repo, plan_id) or {}
+        path = saved.get('path')
+        if path not in entries or baseline.get(path) == entries[path]:
+            continue
+        if any(change.get('verified') and change.get('before') != change.get('after')
+               for change in saved.get('user_changes', {}).values()):
+            return True
+    return False
+
+
 def prompt_evidence(connection: sqlite3.Connection, repo: str, plan_id: str, *,
                     include_changes: bool = True) -> dict:
     saved = evidence(connection, repo, plan_id) or {}

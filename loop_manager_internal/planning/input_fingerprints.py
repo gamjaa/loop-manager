@@ -166,6 +166,7 @@ def _is_requirement_archive_only_change(
     current_revision: str,
     *, verified_plan_declarations: bool = False,
     allow_execplan_only: bool = False,
+    specification_only: bool = False,
 ) -> bool:
     previous_tree = effects._git_tree_entries(repo, previous_revision)
     current_tree = effects._git_tree_entries(repo, current_revision)
@@ -175,6 +176,11 @@ def _is_requirement_archive_only_change(
     # Final receipt reuse may additionally accept a verified ExecPlan-only move.
 
     def relevant(path: bytes) -> bool:
+        if specification_only:
+            return (path in {b'docs/PRODUCT.md', b'docs/ARCHITECTURE.md'}
+                    or path.startswith(archive_prefix)
+                    or (path.startswith(b'docs/requirements/') and path.count(b'/') == 2
+                        and path.endswith(b'.md')))
         return (effects._is_planning_input(path) or path.startswith(archive_prefix)
                 or (verified_plan_declarations and path.startswith(b"docs/plans/archive/")))
 

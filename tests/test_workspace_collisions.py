@@ -162,7 +162,7 @@ class WorkspaceCollisionsTest(WorkspaceFixture, unittest.TestCase):
             ), mock.patch(
                 "loop_manager.pr_for_branch", return_value=None
             ), mock.patch(
-                "loop_manager.run_codex", side_effect=[planner_result, worker_stop]
+                "loop_manager.run_codex", side_effect=[worker_stop]
             ) as recovered_agent:
                 recovered_result = loop_manager.run_project(
                     connection,
@@ -205,7 +205,7 @@ class WorkspaceCollisionsTest(WorkspaceFixture, unittest.TestCase):
             )
             self.assertEqual(
                 [call.args[3] for call in recovered_agent.call_args_list],
-                ["planner", "worker"],
+                ["worker"],
             )
 
     @dummy_worker_sessions

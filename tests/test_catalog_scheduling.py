@@ -535,7 +535,7 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                 self.assertEqual(result, 1 if publishes_plan else 0)
                 self.assertEqual(
                     roles,
-                    ["planner", "planner_check", "worker"] if publishes_plan
+                    ["planner", "worker"] if publishes_plan
                     else ["planner", "planner"],
                 )
                 self.assertEqual(
@@ -644,7 +644,7 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
 
                 self.assertEqual(result, 1)
                 self.assertEqual(
-                    roles, ["planner_check", "worker"] if changed else ["worker"]
+                    roles, ["worker"]
                 )
 
     @dummy_worker_sessions

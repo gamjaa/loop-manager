@@ -100,7 +100,7 @@ def confirm(connection: sqlite3.Connection, repo: str, reviewed_revision: str,
         return  # Legacy publication recovery has no review receipt.
     if attempt["result"] is None or attempt["outcome"] is None:
         raise RuntimeError("검증되지 않은 일반 planning 검토를 확정할 수 없습니다.")
-    slots = ["general"]
+    slots = ["requirement"] if attempt["purpose"] == "requirement" else ["general"]
     if attempt["purpose"] == "final":
         slots.append("final")
     for slot in slots:

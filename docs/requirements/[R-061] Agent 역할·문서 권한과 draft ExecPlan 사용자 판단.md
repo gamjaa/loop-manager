@@ -6,7 +6,7 @@ Planner는 필요한 근거를 읽어 계획하고, Worker는 구현에 필요�
 
 현재 draft 게시·판단 대기와 명시적 User Decision의 관측·감사는 구현돼 있다. 그러나 판단 대기 해제는 사용자의 draft 제거와 동일 판단 지문의 Decision/Revision/Answer를 함께 요구한다. 사용자 본문 변경으로 질문을 해소하는 흐름과 해소 후 임시 입력 정리를 보완하고, 개별 판단 대기가 프로젝트 전체 차단으로 확대되지 않게 한다.
 
-이 Requirement의 역할 권한·사용자 판단 정책은 PRODUCT·ARCHITECTURE·공통 및 역할별 실행 지침·PLANS의 해당 제한을 갱신하는 기준이다. R-049의 역할 선택과 R-057의 변경 중심 검토·최종 확인은 유지한다. 정적 역할 권한은 R-064의 해당 역할 instruction과 실제 범위 검사에 함께 반영하며, 사용자 prompt만 고쳐 상위 권한 제한을 우회하지 않는다. 아래 변경 목표 전체가 구현 완료됐다는 뜻은 아니다.
+이 Requirement의 역할 권한·사용자 판단 정책은 PRODUCT·ARCHITECTURE·공통 및 역할별 실행 지침·PLANS의 해당 제한을 갱신하는 기준이다. Planner 실행 조건은 R-082의 호출 축소·Requirement 완료 재확인을 따르고 R-057의 변경 중심 검토·프로젝트 최종 확인은 유지한다. 정적 역할 권한은 R-064의 해당 역할 instruction과 실제 범위 검사에 함께 반영하며, 사용자 prompt만 고쳐 상위 권한 제한을 우회하지 않는다. 아래 변경 목표 전체가 구현 완료됐다는 뜻은 아니다.
 
 ## Requirement
 
@@ -20,7 +20,7 @@ Planner는 필요한 근거를 읽어 계획하고, Worker는 구현에 필요�
 
 전체 저장소 접근은 선택한 프로젝트의 관리 작업 공간을 기준으로 한다. 기본 checkout·다른 프로젝트·다른 작업 공간 또는 Manager의 실행 상태·Git 소유권을 변경할 권한으로 확대하지 않는다. 읽기 권한은 매 호출에서 모든 파일을 읽어야 한다는 뜻이 아니며, 관련 영향의 확인에 필요한 범위를 선택한다.
 
-Planner의 기존 계획 개정은 Manager가 제공한 snapshot·mode와 R-082의 PR 전 개정 경계를 따른다. 미착수·무소유 계획의 개정을 우선하며 시작한 계획은 같은 ID·경로·작업물·수행 기록을 보존해 안전한 단계 경계에서 개정한다. 이름 변경·직접 삭제와 유지보수의 미착수·무소유 제한은 유지한다. 사용자 판단 대기 draft는 미실행·무소유가 확인된 대상만 개정하며 이미 실행한 계획을 draft로 돌리지 않는다. R-049의 빠른 점검은 계속 읽기 전용이다.
+Planner의 기존 계획 개정은 Manager가 제공한 snapshot·mode와 R-082의 PR 전 개정 경계를 따른다. 미착수·무소유 계획의 개정을 우선하며 시작한 계획은 같은 ID·경로·작업물·수행 기록을 보존해 안전한 단계 경계에서 개정한다. 이름 변경·직접 삭제와 유지보수의 미착수·무소유 제한은 유지한다. 사용자 판단 대기 draft는 미실행·무소유가 확인된 대상만 개정하며 이미 실행한 계획을 draft로 돌리지 않는다. ExecPlan·코드·테스트·설정 변경 자체로 점검·일반 Planner를 호출하지 않고, 선택된 작업의 현재 구현 충족 판단과 필요한 보완은 Worker가 함께 수행한다. 선언·dependency·사용자 결정·검증 성공의 공식 반영은 기존 Manager 책임으로 유지한다.
 
 일반 Planner는 현재 PRODUCT·Requirement 범위 밖이지만 보존 가치가 있는 아이디어를 `docs/FUTURE_IDEAS.md`에 생성·수정할 수 있다. 유지보수 Planner는 일반 계획 작성을 허용한 mode에서만 같은 권한을 가진다. 파일 삭제는 허용하지 않으며, 그 항목을 같은 계획 주기의 ExecPlan 범위나 현재 미충족 작업의 근거로 사용하거나 자동 승격하지 않는다.
 
@@ -83,7 +83,7 @@ Worker가 수정한 설계·계획도 검토 대상이다. 수정 전 요청과 
 
 ## Acceptance Criteria
 
-- 일반·유지보수 Planner와 Reviewer는 저장소 전체를 읽을 수 있다. Planner는 허용된 ExecPlan을 작성·개정하고, 일반 Planner와 일반 계획 작성을 허용한 유지보수 mode는 `docs/FUTURE_IDEAS.md`도 생성·수정할 수 있다. FUTURE_IDEAS 삭제·자동 작업 승격과 제품·설계 문서 쓰기는 거부되며 빠른 점검은 읽기 전용이다.
+- 일반·유지보수 Planner와 Reviewer는 저장소 전체를 읽을 수 있다. Planner는 허용된 ExecPlan을 작성·개정하고, 일반 Planner와 일반 계획 작성을 허용한 유지보수 mode는 `docs/FUTURE_IDEAS.md`도 생성·수정할 수 있다. FUTURE_IDEAS 삭제·자동 작업 승격과 제품·설계 문서 쓰기는 거부된다. ExecPlan·코드·테스트·설정 변경만으로 새 점검 Planner를 호출하지 않고 기존 읽기 전용 호출의 결과·감사는 보존한다.
 - 설계·계획의 판단이 필요한 경우 유효한 draft에 목표·근거·질문·선택 영향을 기록하고 Planner 종료 시 다른 게시 대상과 함께 원격에 게시한다. 이 draft 때문에 독립 계획 batch를 거부하거나 프로젝트를 차단하지 않는다.
 - draft에는 Worker·workspace 예약·구현 branch·PR을 시작하지 않는다. 기존 draft 표시 없는 계획은 정상 처리되고 draft 선언과 실제 실행 상태의 원본이 구분된다.
 - Requirement만 명확해진 경우와 `draft: true`를 유지한 ExecPlan 본문 답변도 Planner의 질문별 영향 판단과 Manager의 사용자 출처·입력·상태 검증을 거쳐 같은 계획의 대기를 해제할 수 있다. 명시적 User Decision의 Decision/Answer/Revision 형식도 유지하며, 근거를 고유하게 확인할 수 있으면 revision 재입력을 강제하지 않는다. 명시된 stale revision·불충분 또는 상충 답변·Agent의 자기 승인·표시만 제거한 변경·무관한 변경·재시작은 승인으로 처리하지 않는다.
