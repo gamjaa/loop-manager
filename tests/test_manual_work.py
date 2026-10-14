@@ -523,8 +523,14 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             service,group,_=self.submitted(directory)
             members=json.loads(group['members'])
-            result,verify,agent=self.step(service,review='\n'.join(
-                [f'MANUAL_PLAN_RESULT: {member} PASS' for member in members]+['VERDICT: PASS']))
+            from loop_manager_internal.agents import scope_validation
+            with mock.patch.object(scope_validation, 'validate_agent_scope',
+                                   wraps=scope_validation.validate_agent_scope) as scope_check:
+                result,verify,agent=self.step(service,review='\n'.join(
+                    [f'MANUAL_PLAN_RESULT: {member} PASS' for member in members]+['VERDICT: PASS']))
+            worker_checks = [call for call in scope_check.call_args_list if call.args[0] == 'worker']
+            self.assertTrue(worker_checks)
+            self.assertEqual(worker_checks[0].args[2].head, group['prepared_head'])
             self.assertEqual(result,0)
             self.assertEqual(verify.call_count,1)
             self.assertEqual(agent.call_count,1)

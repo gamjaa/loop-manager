@@ -68,6 +68,28 @@ def assert_manual_scopes_available(connection, repo, result):
         collision.update(sources & set(json.loads(row['requirements'])))
     if collision:
         raise RuntimeError('수동 제출·문서 소유 예약과 Planner 게시 충돌: ' + ', '.join(sorted(collision)))
+    for item in (*result.revisions, *result.deletions):
+        plan = item.snapshot
+        row = connection.execute(
+            "SELECT * FROM exec_plans WHERE repo=? AND plan_id=?", (repo, plan.plan_id)
+        ).fetchone()
+        current, owned = manual_plan_ownership(connection, repo, plan.plan_id, row)
+        expected = (plan.manual_ownership_state if plan.manual_ownership_state is not None
+                    else empty_manual_ownership_state())
+        if owned or current != expected:
+            raise RuntimeError(
+                f'수동 계획 소유권이 mutable READY snapshot 이후 변경됐습니다: {plan.plan_id}'
+            )
+
+
+def manual_plan_ownership(connection, repo, plan_id, execution_row):
+    from .manual_work_state import planning_ownership_state
+    return planning_ownership_state(connection, repo, plan_id, execution_row)
+
+
+def empty_manual_ownership_state():
+    from .manual_work_state import digest
+    return digest([])
 
 
 def live_manual_tasks(connection, state_dir):
