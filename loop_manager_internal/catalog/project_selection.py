@@ -136,7 +136,8 @@ def compact_execplan_catalog(effects: CompactExecplanCatalogEffects, connection:
             "sources": json.loads(row["sources"]),
             "depends_on": json.loads(row["depends_on"]),
             "priority": row["priority"],
-            **({"draft": True, "decision_wait": execplan_draft_state.prompt_evidence(connection, repo, str(row["plan_id"]))}
+            **({"draft": True, "decision_wait": execplan_draft_state.prompt_evidence(
+                connection, repo, str(row["plan_id"]), include_changes=False)}
                if str(row["plan_id"]) in drafts else {}),
             **({"catalog_error": held[str(row["plan_id"])]} if str(row["plan_id"]) in held else {}),
         }

@@ -1,6 +1,7 @@
 """Durable decision holds, independent of execution phases and document drafts."""
 from __future__ import annotations
 
+import difflib
 import json
 import sqlite3
 from typing import Mapping
@@ -35,9 +36,20 @@ def evidence(connection: sqlite3.Connection, repo: str, plan_id: str) -> dict | 
     return json.loads(row[0]) if row else None
 
 
-def prompt_evidence(connection: sqlite3.Connection, repo: str, plan_id: str) -> dict:
+def prompt_evidence(connection: sqlite3.Connection, repo: str, plan_id: str, *,
+                    include_changes: bool = True) -> dict:
     saved = evidence(connection, repo, plan_id) or {}
-    return {key: saved[key] for key in ("question", "path", "revision", "url", "user_changes") if key in saved}
+    payload = {key: saved[key] for key in ("question", "path", "revision", "url") if key in saved}
+    if include_changes and "user_changes" in saved:
+        # Keep full before/after only in the decision audit, not every Planner input.
+        payload["user_changes"] = {
+            path: {**{key: value for key, value in change.items() if key not in {"before", "after"}},
+                   "diff": "\n".join(difflib.unified_diff(
+                       change["before"].splitlines(), change["after"].splitlines(),
+                       fromfile="before/" + path, tofile="after/" + path, lineterm=""))}
+            for path, change in saved["user_changes"].items()
+        }
+    return payload
 
 
 def cancel(connection: sqlite3.Connection, repo: str, plan_id: str, revision: str) -> None:
