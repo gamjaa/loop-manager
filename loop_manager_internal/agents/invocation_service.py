@@ -1,5 +1,6 @@
 """Physical invocation orchestration with explicit profile, process and audit ports."""
 from __future__ import annotations
+from loop_manager_internal.runtime import operation_events as events
 
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -8,6 +9,7 @@ from pathlib import Path
 import sqlite3
 import subprocess
 import time
+import shutil
 
 from loop_manager_internal.agents.agent_invocation import AgentRequest, AgentResult, AgentResultKind, InvocationContext, ResolvedProfile, Usage, _coerce_agent_result
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
@@ -183,6 +185,12 @@ def run_agent(
         nonlocal execution_started, execution_started_at, collection_status
         execution_started = True
         execution_started_at = time.monotonic()
+        events.emit("Agent 실제 실행 시작", invocation_id=identity,
+                    provider=provider, model=resolved.model if resolved else None,
+                    effort=resolved.effort if resolved else None,
+                    purpose=invocation.purpose if invocation else None,
+                    attempt=invocation.attempt if invocation else 1,
+                    session_transition=invocation.transition if invocation else None)
         if ledger is not None and identity is not None:
             try:
                 ledger.mark_execution_started(identity)
@@ -246,7 +254,8 @@ def run_agent(
                               "최소 문맥으로 새 session에서 작업을 이어가야 합니다.", session_id)
         else:
             try:
-                raw = adapter.run(request)
+                with events.log_context(invocation_id=identity):
+                    raw = adapter.run(request)
             except common_guidance.GuidanceError as error:
                 raw = AgentResult(1, f"공통 지침 provider 준비 실패: {error}", session_id,
                                   AgentResultKind.PERMANENT_CONFIGURATION)
@@ -255,6 +264,9 @@ def run_agent(
                 guidance_repository.bind_session(guidance_context.repo, provider,
                                                  completed.session_id, guidance.task_id)
     except BaseException as error:
+        events.emit("Agent 호출 종료 관측", level="WARN", invocation_id=identity,
+                    result=type(error).__name__, execution_status="executed" if execution_started else "not_executed",
+                    elapsed_seconds=round(time.monotonic() - started, 1))
         if ledger is not None and identity is not None:
             kind = ("interrupted" if isinstance(error, (KeyboardInterrupt, SystemExit)) else
                     "timeout" if isinstance(error, subprocess.TimeoutExpired) else
@@ -268,6 +280,22 @@ def run_agent(
                 pass
         raise
     finally:
+        if execution_started and identity is not None:
+            try:
+                from loop_manager_internal.agents.provider_adapters import _provider_log_path
+                destination = _provider_log_path(worktree, state_dir, provider, role_name, identity)
+                if prepared_launch is not None:
+                    source = prepared_launch.attempt / "provider.log"
+                    if source.is_file():
+                        shutil.copyfile(source, destination)
+                if destination.is_file():
+                    events.emit("Agent 호출별 상세 기록 보존", invocation_id=identity, log_path=destination)
+                    latest = destination.parent / f"{'claude-' if provider == 'claude' else ''}{role_name}.log"
+                    shutil.copyfile(destination, latest)
+            except OSError as error:
+                collection_status = "error"
+                events.emit("Agent 상세 기록 보존 실패", level="WARN", invocation_id=identity,
+                            error_type=type(error).__name__)
         if owned_connection is not None:
             owned_connection.close()
     result = _coerce_agent_result(raw, session_id)
@@ -285,6 +313,14 @@ def run_agent(
                 collection_status = result.usage.status
         except sqlite3.Error:
             collection_status = "error"
+    events.emit("Agent 호출 결과 관측", level="WARN" if result.code or collection_status == "error" else "INFO",
+                invocation_id=identity, result=result.ledger_kind, result_code=result.code,
+                execution_status="executed" if execution_started else "not_executed",
+                elapsed_seconds=round(time.monotonic() - started, 1),
+                usage_status=result.usage.status, collection_status=collection_status,
+                input_tokens=result.usage.input_tokens, cached_input_tokens=result.usage.cached_input_tokens,
+                cache_write_input_tokens=result.usage.cache_write_input_tokens,
+                output_tokens=result.usage.output_tokens, reasoning_output_tokens=result.usage.reasoning_output_tokens)
     if isinstance(raw, AgentResult):
         return replace(raw, collection_status=collection_status,
                        isolation_invocation_id=identity)

@@ -1,5 +1,6 @@
 """Verify execution policy and narrow typed ports."""
 from __future__ import annotations
+from loop_manager_internal.runtime import operation_events as events
 from loop_manager_internal.execution.execution_runtime import LatestBasePort
 from dataclasses import dataclass
 from typing import Callable, Any, Mapping
@@ -245,6 +246,8 @@ class VerifyHandler:
                 context=context, fingerprint=decision.fingerprint,
                 correction_limit=self.ports.contract.MAX_VALIDATION_FINGERPRINT_REPEATS + 1,
             ), output)
+        events.emit("verify 결과 확인 완료", scope="partial" if partial else "full",
+                    result=(self._partial_report or {}).get("status", "UNKNOWN") if partial else "PASS")
         return (None, output)
 
     def verify(self, context: ExecutionContext, latest_base: LatestBasePort) -> ExecutionOutcome:
@@ -514,6 +517,9 @@ class VerifyHandler:
             return None
         if status != 'PASS':
             return self.ports._retry('부분 verify 후보가 변경되어 전체 검증 경로로 재확인합니다.')
+        selection = report.get('selection') or {}
+        events.emit("부분 verify PASS: 일반 선행 Review로 진행", selected_modules=len(selection.get('modules') or ()),
+                    selected_tests=len(selection.get('ids') or ()), next_stage="REVIEWING")
         self.ports.state.update_project(self.ports.identity.repo, phase='REVIEWING', last_error=None)
         return self.ports._advanced()
 

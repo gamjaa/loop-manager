@@ -1,5 +1,6 @@
 """Planning lifecycle coordinator: dispatch durable state through phase services."""
 from __future__ import annotations
+from loop_manager_internal.runtime import operation_events as events
 import time
 from loop_manager_internal.planning.planning_contracts import (
     MAX_PLANNER_VALIDATION_RETRIES, PlanningAgentResult, PlanningAgentResultKind,
@@ -59,7 +60,8 @@ class PlanningLifecycleCoordinator:
             # Reload state and pass the normal input/workspace gates between batches.
             snapshot = snapshot_run(self._new_run(context))
             for service, phase in self._handlers:
-                step = service.step(phase, snapshot)
+                with events.log_context(project=context.repo, plan=None, stage="PLANNING"):
+                    step = service.step(phase, snapshot)
                 flush = getattr(self._ports.state, "flush_notifications", None)
                 if flush is not None:
                     flush(context.repo)
@@ -67,6 +69,9 @@ class PlanningLifecycleCoordinator:
                 outcome = step.outcome
                 if outcome is None:
                     continue
+                with events.log_context(project=context.repo, plan=None, stage="PLANNING"):
+                    events.emit("planning 판단 결과", boundary=phase.removeprefix('_'), result=outcome.kind.value,
+                                reason=events.summary(outcome.detail), level="WARN" if outcome.error else "INFO")
                 if outcome.kind is PlanningOutcomeKind.MAINTENANCE_COMPLETE:
                     from dataclasses import replace
                     latest = self._ports.git.fetch_base(context.repo_path, context.base_branch)

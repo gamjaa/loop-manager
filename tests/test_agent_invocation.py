@@ -36,6 +36,51 @@ class RunnerTests(TestCase):
         self.assertEqual(result.code, 0)
         self.assertIs(run.call_args.kwargs["connection"], self.connection)
 
+    def test_log_start_follows_process_callback_and_preserves_each_attempt(self):
+        from loop_manager_internal.runtime import operation_events as events
+        from loop_manager_internal.agents.provider_adapters import _provider_log_path
+        recorded = []
+        outer = self
+        class Provider:
+            def run(self, request):
+                outer.assertFalse(any(message == "Agent 실제 실행 시작" for message, _ in recorded[-1:]))
+                request.on_process_started()
+                _provider_log_path(request.worktree, request.state_dir, 'codex', 'worker').write_text(
+                    '이번 호출 진단', encoding='utf-8')
+                request.on_process_finished()
+                return manager.AgentResult(0, '비공개 결과', usage=invocation.Usage(input_tokens=7, output_tokens=2))
+        with mock.patch.object(manager, 'agent_provider', return_value=Provider()), \
+             mock.patch.object(events, 'emit', side_effect=lambda message, **fields: recorded.append((message, fields))):
+            for _ in range(2):
+                result = manager.run_agent('codex', Path('/worktree'), self.state_dir, Path('/config'),
+                    'worker', '비공개 prompt', read_only=False, level=1, connection=self.connection,
+                    invocation=invocation.InvocationContext('repo', 'G-log'),
+                    resolved_profile=invocation.ResolvedProfile('model', 'low'))
+                self.assertEqual(result.code, 0)
+        paths = [Path(fields['log_path']) for message, fields in recorded if message == 'Agent 호출별 상세 기록 보존']
+        self.assertEqual(len(set(paths)), 2)
+        self.assertTrue(all(path.read_text(encoding='utf-8') == '이번 호출 진단' for path in paths))
+        results = [fields for message, fields in recorded if message == 'Agent 호출 결과 관측']
+        self.assertTrue(all(fields['execution_status'] == 'executed' and fields['input_tokens'] == 7 for fields in results))
+        self.assertNotIn('비공개', str(recorded))
+
+    def test_rejected_preparation_does_not_log_process_start_or_copy_old_log(self):
+        from loop_manager_internal.runtime import operation_events as events
+        from loop_manager_internal.agents.provider_adapters import _provider_log_path
+        previous = _provider_log_path(Path('/worktree'), self.state_dir, 'codex', 'worker')
+        previous.write_text('이전 호출 진단', encoding='utf-8')
+        provider = mock.Mock()
+        provider.run.return_value = manager.AgentResult(1, '실행 전 거부')
+        with mock.patch.object(manager, 'agent_provider', return_value=provider), mock.patch.object(events, 'emit') as output:
+            manager.run_agent('codex', Path('/worktree'), self.state_dir, Path('/config'),
+                'worker', 'prompt', read_only=False, level=1, connection=self.connection,
+                invocation=invocation.InvocationContext('repo', 'G-log'),
+                resolved_profile=invocation.ResolvedProfile('model', 'low'))
+        messages = [call.args[0] for call in output.call_args_list]
+        self.assertNotIn('Agent 실제 실행 시작', messages)
+        self.assertNotIn('Agent 호출별 상세 기록 보존', messages)
+        self.assertEqual(previous.read_text(encoding='utf-8'), '이전 호출 진단')
+
     def test_pre_resolved_worker_profile_is_shared_by_cli_and_ledger(self):
         selected = invocation.ResolvedProfile('actual-model', 'high')
         class Provider:

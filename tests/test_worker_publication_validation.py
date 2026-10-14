@@ -179,7 +179,7 @@ class WorkerPublicationValidationTest(unittest.TestCase):
         pr_title = gh_commands[0][gh_commands[0].index("--title") + 1]
         self.assertEqual(pr_title, "Implement G-001: Worker Boundary")
         self.assertNotEqual(pr_title, "Publish reviewed context")
-        self.assertIn(("Reviewer 시작: G-001 Worker Boundary", {}), logs)
+        self.assertIn(("Reviewer 준비: G-001 Worker Boundary (최종 Review)", {}), logs)
         self.assertIn(("Worker 반환: G-001 Worker Boundary (Review 실패)", {"error": True}), logs)
 
     def test_invalid_worker_result_resumes_same_session_without_verify(self):

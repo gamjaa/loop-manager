@@ -1,5 +1,6 @@
 """Review execution policy and narrow typed ports."""
 from __future__ import annotations
+from loop_manager_internal.runtime import operation_events as events
 from dataclasses import dataclass
 from typing import Callable, Any, Mapping
 from loop_manager_internal.documents import document_drafts
@@ -253,6 +254,7 @@ class ReviewHandler:
                         review_token=self.ports.snapshot()._definition_snapshot.review_token(
                             str(row['validated_base_sha']), self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()),
                         publication_token=None)
+                events.emit("선행 Review 결과 재사용: 최종 전체 verify 증거 확인 완료", next_stage="PUBLISHING")
                 return self.ports._advanced()
             if approved:
                 # Once a fresh final invocation is necessary, its failure or
@@ -313,7 +315,7 @@ class ReviewHandler:
                 self.ports.state.connection, self.ports.identity.repo,
             )
             if protocol_attempt == 1:
-                self.ports.operation_log(f"Reviewer 시작: {self.ports.snapshot().plan['id']} {self.ports.snapshot().plan['title']}")
+                self.ports.operation_log(f"Reviewer 준비: {self.ports.snapshot().plan['id']} {self.ports.snapshot().plan['title']} ({'문서 선행' if document_review else '일반 선행' if preliminary else '최종'} Review)")
             else:
                 self.ports.operation_log(
                     f"Reviewer 프로토콜 교정 재시도: {self.ports.snapshot().plan['id']} {self.ports.snapshot().plan['title']} ({protocol_attempt}/{self.ports.contract.MAX_REVIEWER_PROTOCOL_ATTEMPTS})",
@@ -570,6 +572,7 @@ class ReviewHandler:
                     'review_invalidated' if verdict == 'PASS' else 'review_fail',
                     review=review, identity={**actual_identity, 'invocation_id': invocation_id} if actual_identity else None)
                 if verdict == 'PASS':
+                    events.emit("선행 Review PASS: 최종 전체 verify로 진행", next_stage="VERIFYING")
                     self.ports.state.update_project(self.ports.identity.repo, preserve_transaction=True,
                         phase='VERIFYING', validated_base_sha=None, verify_token=None,
                         review_token=None, publication_token=None, last_error=None)
@@ -604,6 +607,7 @@ class ReviewHandler:
                 RecoveryReason.REVIEW_FEEDBACK_CORRECTION, review,
                 context=context, fingerprint=decision.fingerprint,
             )
+        events.emit("최종 Review PASS: 게시 단계로 진행", next_stage="PUBLISHING")
         self.ports.clear_validation_failure_history(self.ports.identity.repo, 'review')
         prior = pre_review.current(self.ports.state.connection, self.ports.identity.repo, context.plan.plan_id)
         if prior and prior['status'] in {'review_pass', 'final_review_running'}:
