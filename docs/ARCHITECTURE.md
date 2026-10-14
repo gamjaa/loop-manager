@@ -504,7 +504,8 @@ Worker·Manager verify·Reviewer·게시의 진입·교정·재개는 writer 종
 
 `DOCUMENT_RESULT`는 기존 legacy checkpoint 복구에서 `application.result_normalization.tagged_json`으로 marker·공백·구분자·다중 줄 JSON을 정규화한다. 중복 marker·JSON key와 필드·evidence 의미 오류는 거부한다. 저장된 원문과 정규화된 판단을 후보 revision·문서 경로·Worker snapshot에 결합하고, 호출 입력이 바뀌면 이전 원문·판단을 superseded 근거로 보존해 새 판단에서 제외한다. 기존 checkpoint는 원문 필드가 없어도 원래 stage·후보·게시 사실을 확인해 복구하며 새 결과에 identity metadata를 일괄 요구하지 않는다.
 
-일반 planning snapshot은 시작 시점에 실제 연결 PR이 없는 후보만 담는다. snapshot 선정 뒤 PR이 생기면 intent 기록·게시 직전 같은 CAS 경계에서 다시 확인해 게시를 미루고 미게시 intent만 supersede하며 Planner 결과·작업 공간·세션·실행 이력을 보존한다. PR이 있는 계획은 새 snapshot에서 제외하고 나머지 계획을 현재 catalog에서 판단한다. PR 조회 실패는 부재가 아니다. 단계별 legacy `proposed`·`prepared` 개정도 게시 직전 PR을 재확인한다. `proposed`에서 snapshot이 PR 계획을 제외하면 연결 PR을 다시 조회하고, 발견 시 checkpoint 후보를 보존해 기존 PR 경로로 넘긴다. `prepared`에서도 같은 경합이면 후보를 보존한다. 확인된 PR 출현은 `PLAN_INPUT_INVALID` 최종 차단 사유가 아니며 해당 계획에만 적용한다.
+일반 planning snapshot은 시작 시점에 실제 연결 PR이 없는 후보만 담는다. snapshot 선정 뒤 PR이 생기면 intent 기록·게시 직전 같은 CAS 경계에서 다시 확인해 게시를 미루고 미게시 intent만 supersede하며 Planner 결과·작업 공간·세션·실행 이력을 보존한다. PR이 있는 계획은 새 snapshot에서 제외하고 나머지 계획을 현재 catalog에서 판단한다. PR 조회 실패는 부재가 아니다. 단계별 legacy `proposed` 개정은 `prepare_snapshot()` 결과에서 해당 계획이 PR 때문에 제외되면 연결 PR을 다시 조회하고, 발견 시 checkpoint 후보를 보존해 기존 PR 경로로 넘긴다. `prepared` 개정은 push 직전에 PR을 확인하고 나타나면 후보를 보존한다. PR 조회 실패는 부재로 취급하지 않는다. 확인된 PR 출현은 `PLAN_INPUT_INVALID` 최종 차단 사유가 아니며 해당 계획에만 적용한다.
+
 ### 프로젝트 planning과 작업 문서 반영 기준
 
 [R-082](requirements/%5BR-082%5D%20단계별%20원격%20문서%20반영과%20PR%20전%20ExecPlan%20갱신.md#프로젝트-planning과-현재-작업-재개-순서)의 명세 영향 판단은 프로젝트 일반 planning이 담당한다. 일반 Planner는 변경된 명세·관련 ExecPlan·dependency·현재 원격 구현과 필요한 보존 후보를 읽기 전용으로 확인한다. 관련 PR 전 계획 snapshot 검증·게시 intent·catalog 원자 적용을 재사용하며 구현 worktree를 Planner의 쓰기 공간으로 사용하지 않는다.

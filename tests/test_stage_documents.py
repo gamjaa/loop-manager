@@ -14,6 +14,7 @@ from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, 
 from loop_manager_internal.planning.planning_catalog import PlannerValidationError
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 from tests.support.execution import ExecutionFixture, READY_WORKER_RESULT
+from tests.support.git import git_command, isolated_git_test
 
 
 class DocumentProtocolTests(TestCase):
@@ -500,3 +501,132 @@ class DocumentPhaseTests(ExecutionFixture, TestCase):
             operation='rebase', expected_head='head', target_base_oid='new-base',
             observed_remote_oid=None, snapshot={'rebase': 'owned'})
         self.assertEqual(documents.pending(checkpoints, self.repo, 'G-047'), before)
+
+
+@isolated_git_test
+class ProposedDocumentPRRaceTests(ExecutionFixture, TestCase):
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.repo_path = Path(self.temporary.name)
+        self.repo_path.mkdir(parents=True, exist_ok=True)
+        git_command(self.repo_path, 'init', '-b', 'main')
+        git_command(self.repo_path, 'config', 'user.email', 'worker@example.com')
+        git_command(self.repo_path, 'config', 'user.name', 'Worker Test')
+        self.plan_path = 'docs/plans/[G-047] Runtime.md'
+        self.plan_text = ('---\nid: G-047\ntitle: Runtime\nsources:\n  - docs/PRODUCT.md\n'
+                          'depends_on: []\ncomplexity: medium\nrisk: medium\npriority: normal\n'
+                          '---\n\n## Purpose\n\nKeep current behavior.\n')
+        (self.repo_path / 'docs/plans').mkdir(parents=True)
+        (self.repo_path / 'docs/PRODUCT.md').parent.mkdir(parents=True, exist_ok=True)
+        (self.repo_path / 'docs/PRODUCT.md').write_text('# Product\n', encoding='utf-8')
+        (self.repo_path / self.plan_path).write_text(self.plan_text, encoding='utf-8')
+        git_command(self.repo_path, 'add', '-A')
+        git_command(self.repo_path, 'commit', '-m', 'initial plan')
+        self.base = git_command(self.repo_path, 'rev-parse', 'HEAD')
+        self.repo = str(self.repo_path)
+        super().setUp()
+
+    def test_proposed_pr_race_keeps_candidate_when_real_snapshot_excludes_plan(self):
+        import hashlib
+        import loop_manager as lm
+        from loop_manager_internal.execution.execution_runtime import ExecutionPhase
+
+        self.handler.repo_path = self.repo_path
+        self.handler.base_sha = self.base
+        self.remote = self.base
+        digest = hashlib.sha256(self.plan_text.encode('utf-8')).hexdigest()
+        self.review_context()
+        self.connection.execute(
+            "UPDATE exec_plans SET content_hash=?, current_complexity='medium', current_risk='medium', "
+            "current_revision_sha=?, plan_sha=?, active_sha=? WHERE repo=? AND plan_id='G-047'",
+            (digest, self.base, self.base, self.base, self.repo),
+        )
+        self.connection.execute(
+            'UPDATE projects SET active_sha=?, validated_base_sha=? WHERE repo=?',
+            (self.base, self.base, self.repo),
+        )
+        self.connection.commit()
+        self.state.expected = self.repository.projected(self.repo)
+        definition = replace(self.handler._definition_snapshot, revision_sha=self.base)
+        self.handler._definition_snapshot = definition
+        verify_output = 'successful verify output'
+        self.state.update_project(
+            self.repo, active_sha=self.base, phase='REVIEWING', definition_snapshot=definition.serialize(),
+            worker_result=READY_WORKER_RESULT, worker_input_token=definition.worker_token,
+            archive_token=definition.archive_token, validated_base_sha=self.base,
+            verify_token=definition.verify_token(self.base, self.base, verify_output),
+        )
+        context = self.handler._context()
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        scope = GitSnapshot(
+            head='owned-head', branch=context.branch, index={}, dirty={}, operations={},
+            refs={}, worktrees={}, config={},
+        )
+        proposed = self.plan_text.replace('Keep current behavior.', 'Add a new behavior.')
+        assessment = dict(
+            relevant=True, implementation='needed', plan_text=proposed, evidence='The proposed change needs implementation.',
+        )
+        raw_result = 'DOCUMENT_RESULT: ' + json.dumps(assessment)
+        pending = {
+            'version': 1, 'stage': 'proposed', 'base': self.base,
+            'phase': ExecutionPhase.REVIEWING.value, 'paths': [self.plan_path], 'document_only': True,
+            'previous': definition.serialize(), 'worker_result': READY_WORKER_RESULT,
+            'verify_result': verify_output, 'verify_base': self.base,
+            'assessment': assessment, 'assessment_result': assessment,
+            'assessment_raw_result': raw_result, 'candidate': scope.head,
+            'worker_snapshot': scope.serialize(),
+        }
+        documents.save(checkpoints, self.repo, 'G-047', pending)
+
+        pr_visible = False
+        lookups = []
+        snapshots = []
+
+        def lookup(repository, branch, *_args):
+            lookups.append((str(repository), branch, pr_visible))
+            return {'url': 'https://example/pr/1'} if pr_visible else None
+
+        def prepare_snapshot(connection, repo, repository, active_sha):
+            nonlocal pr_visible
+            pr_visible = True
+            snapshot = lm.mutable_ready_snapshot(connection, repo, repository, active_sha)
+            snapshots.append(snapshot)
+            return snapshot
+
+        stage_effects = documents.StageDocumentEffects(
+            git=lambda _repo, *args, **_kwargs: SimpleNamespace(
+                returncode=0,
+                stdout=self.base if args[:2] == ('rev-parse', 'origin/main') else '',
+            ),
+            capture_scope=lambda _worktree: scope,
+            validate_scope=mock.Mock(),
+            prepare_snapshot=prepare_snapshot, assert_snapshot=mock.Mock(),
+            validate_result=mock.Mock(), validate_worktree=mock.Mock(),
+            pr_for_branch=lookup, log=mock.Mock(),
+        )
+        identity = self.handler._identity
+        self.handler.effects = replace(
+            self.handler.effects,
+            checkpoint=checkpoints,
+            revision=replace(
+                self.handler.effects.revision,
+                refresh_documents=lambda current, previous, latest, changed: documents.refresh(
+                    stage_effects, self.state, checkpoints, identity,
+                    current, previous, latest, changed,
+                ),
+            ),
+        )
+
+        with mock.patch.object(lm, 'pr_for_branch', side_effect=lookup):
+            result = self.handler.guard(context)
+
+        self.assertEqual(len(snapshots), 1)
+        self.assertNotIn('G-047', snapshots[0].by_id)
+        self.assertEqual(
+            [visible for _repository, _branch, visible in lookups], [False, True, True],
+            f'result={result!r}; pending={documents.pending(checkpoints, self.repo, "G-047")!r}',
+        )
+        self.assertFalse(isinstance(result, ExecutionOutcome)
+                         and result.kind is ExecutionOutcomeKind.FINAL_BLOCK)
+        self.assertEqual(documents.pending(checkpoints, self.repo, 'G-047'), pending)
