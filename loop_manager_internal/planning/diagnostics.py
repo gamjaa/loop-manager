@@ -152,12 +152,6 @@ def preserve_remote_planning_diagnostics(effects: RemotePlanningDiagnosticsEffec
             current = effects.capture_git_snapshot(worktree)
             if current.branch is not None or not current.shared_metadata_complete:
                 raise RuntimeError('planning 진단 worktree의 detached 소유권이 유효하지 않습니다.')
-            if row.agent_snapshot:
-                before = GitSnapshot.deserialize(row.agent_snapshot)
-                if (before.config != current.config or before.refs != current.refs
-                        or {key: value for key, value in before.worktrees.items() if key != str(worktree.resolve())}
-                        != {key: value for key, value in current.worktrees.items() if key != str(worktree.resolve())}):
-                    raise RuntimeError('planning 공유 Git 자료의 소유권을 확인할 수 없습니다.')
             unmerged = any(entry.split()[-1] != '0' for entries in current.index.values() for entry in entries)
             if current.operations or unmerged:
                 if set(current.operations) - {'rebase-merge', 'rebase-apply', 'REBASE_HEAD', 'MERGE_MSG', 'MERGE_MODE'}:

@@ -170,8 +170,10 @@ class RebaseObservationFailureTests(unittest.TestCase):
 
     def test_remote_query_failure_retries_without_rebase_publication(self):
         current = SimpleNamespace(
-            operation='rebase_publish',
-            snapshot={'rebase_publication_intent': {'remote_before': 'old', 'head': 'new'}},
+            operation='rebase_publish', generation=1, expected_head='new',
+            target_base_oid='base', observed_remote_oid='old',
+            snapshot={'rebase_publication_intent': {'remote_before': 'old', 'head': 'new',
+                'acceptance': {'id': 'acceptance'}}},
             rebase_publication_intent=lambda: {'remote_before': 'old', 'head': 'new'},
         )
         checkpoints = mock.Mock()
@@ -194,13 +196,16 @@ class RebaseObservationFailureTests(unittest.TestCase):
         git.assert_not_called()
         with mock.patch.object(managed_rebase_publication.manager_git_journal,
                                'live_remote_branch_oid', return_value='unexpected'):
-            with self.assertRaises(RecoveryFailure) as caught:
-                managed_rebase_publication.publish_checkpoint(
-                    state=state, checkpoints=checkpoints, repo='/repo',
-                    plan_id='G-001', repo_path=Path('/repo'), worktree=Path('/worktree'),
-                    branch='loop-manager/G-001', service=mock.Mock(),
-                    owns_remote=mock.Mock(), git=git, lookup_pr=mock.Mock())
-        self.assertIs(caught.exception.reason, RecoveryReason.REMOTE_OID_UNCERTAIN)
+            managed_rebase_publication.publish_checkpoint(
+                state=state, checkpoints=checkpoints, repo='/repo',
+                plan_id='G-001', repo_path=Path('/repo'), worktree=Path('/worktree'),
+                branch='loop-manager/G-001', service=mock.Mock(),
+                owns_remote=mock.Mock(), git=git, lookup_pr=mock.Mock())
+        saved = checkpoints.record.call_args.kwargs
+        self.assertIsNone(saved['operation'])
+        self.assertFalse(saved['snapshot']['retired_rebase_publications'][0]['confirmed'])
+        self.assertEqual(saved['snapshot']['rebase_publication_deferred'], 'acceptance')
+        git.assert_not_called()
 
 
 @unittest.skipIf(os.name == "nt", "Linux mode-bit and bash verification fixture")

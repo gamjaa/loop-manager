@@ -11,7 +11,7 @@ from pathlib import Path
 import subprocess
 
 from loop_manager_internal.runtime.runtime_identity import _canonical_path
-from loop_manager_internal.agents.scope_contracts import GitSnapshot, AgentChange, AgentScopeError
+from loop_manager_internal.agents.scope_contracts import GitSnapshot, AgentChange
 from loop_manager_internal.agents.agent_scope_decision import index_security_flags as _non_default_index_flags
 from loop_manager_internal.verification.git_timing import snapshot_timing
 
@@ -618,7 +618,7 @@ def _scope_snapshot_with_start_ignore_rules(
     , effects=effects):
         source = _ignore_rule_source(worktree, path, effects=effects)
         if source is None:
-            raise AgentScopeError(f"ignored 경로의 Git 규칙을 확인할 수 없습니다: {path}")
+            raise RuntimeError(f"ignored 경로의 Git 규칙을 확인할 수 없습니다: {path}")
         if source == ".gitignore" or source.endswith("/.gitignore"):
             old_rule = effects.git(worktree, "rev-parse", f"{before.head}:{source}", check=False)
             new_rule = effects.git(worktree, "rev-parse", f"{after.head}:{source}", check=False)

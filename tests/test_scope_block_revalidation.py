@@ -22,6 +22,38 @@ from tests.support.scoped_recovery import CurrentRebaseBlockFixture
 
 
 class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
+    def test_retired_restore_intent_releases_without_changing_user_candidate(self):
+        self.connection.execute("UPDATE exec_plans SET agent_recovery='opaque legacy restore intent', "
+                                "worker_session_id='saved session'")
+        self.connection.commit()
+        runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
+        runtime.block_plan('repo', 'G-047', reason_code='managed_worktree_scope_violation',
+                           evidence='old scope error', release_fingerprint='unchanged')
+        block = scoped_blocking.plan_block(self.connection, 'repo', 'G-047')
+        original = self.current
+        self.assertTrue(loop_manager._reconcile_scope_baseline_plan_block(
+            self.connection, self.repo_path, Path('/state'), 'repo', block))
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertIsNone(row['agent_recovery'])
+        self.assertEqual(row['worker_session_id'], 'saved session')
+        audit = self.checkpoints.get('repo', 'G-047').snapshot['scope_block_release_audit'][-1]
+        self.assertEqual(audit['prior_agent_recovery'], 'opaque legacy restore intent')
+        self.assertEqual(self.current, original)
+
+    def test_project_retired_scope_release_invalidates_changed_candidate_only(self):
+        self.connection.execute("UPDATE exec_plans SET worker_result='old output', verify_result='old verify', "
+                                "review_result='old review', status='VERIFYING'")
+        self.connection.commit()
+        self.current = replace(self.current, head='user-new-head')
+        self.project_block()
+        self.assertTrue(self.resume_project())
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.assertEqual(row['status'], 'IMPLEMENTING')
+        self.assertIsNone(row['verify_result'])
+        self.assertIsNone(row['review_result'])
+        audit = self.checkpoints.get('repo', 'G-047').snapshot['scope_block_release_audit'][-1]
+        self.assertEqual(audit['prior_artifacts']['review_result'], 'old review')
+
     def test_ignored_plan_release_continues_after_saved_verify_without_rerunning(self):
         self._assert_saved_verify_resume(legacy=False)
 
@@ -185,19 +217,12 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
             return replace(saved, dirty={key: value for key, value in saved.dirty.items()
                                          if key != 'cache.bin'})
         with mock.patch.object(loop_manager, '_normalize_legacy_ignored_snapshot', side_effect=normalize):
-            observed = self.current
-            self.current = replace(observed, refs={**observed.refs,
-                'refs/heads/loop-manager/G-047': ('foreign', '')})
-            self.assertFalse(loop_manager._reconcile_scope_baseline_plan_block(
-                self.connection, self.repo_path, Path('/state'), 'repo', block))
-            self.assertEqual(dict(scoped_blocking.plan_block(self.connection, 'repo', 'G-047')),
-                             dict(block))
-            self.current = observed
+            self.current = replace(self.current, refs={**self.current.refs, 'refs/heads/other': ('foreign', '')})
             self.assertTrue(loop_manager._reconcile_scope_baseline_plan_block(
                 self.connection, self.repo_path, Path('/state'), 'repo', block))
         resumed = self.connection.execute('SELECT * FROM exec_plans').fetchone()
         self.assertEqual((resumed['status'], resumed['verify_result'], resumed['verify_token']),
-                         ('REVIEWING', 'saved verify', 'saved token'))
+                         ('VERIFYING', None, None))
         self.assertEqual(resumed['agent_result_snapshot'], result.serialize())
 
     def test_related_plan_document_scope_block_resumes_without_discarding_worker(self):
@@ -274,16 +299,15 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
         self.assertIsNone(scoped_blocking.project_block(self.connection, 'repo'))
 
 
-    def test_mixed_used_ref_or_config_change_keeps_default_worktree_block(self):
-        self.project_block()
+    def test_old_ref_and_config_diagnoses_release_without_git_access_attribution(self):
         original = self.current
-        for current in (replace(original, refs={**original.refs, 'refs/remotes/origin/main': ('foreign', '')}),
-                        replace(original, config={'local:core.hooksPath': ('foreign',)})):
+        for current in (replace(original, refs={**original.refs, 'refs/remotes/origin/main': ('new', '')}),
+                        replace(original, config={'local:core.hooksPath': ('changed',)})):
             self.current = current
+            self.project_block()
             with self.subTest(current=current):
-                self.assertFalse(self.resume_project())
-                self.assertEqual(scoped_blocking.project_block(self.connection, 'repo')['evidence'],
-                                 'source checkout changed')
+                self.assertTrue(self.resume_project())
+                self.assertIsNone(scoped_blocking.project_block(self.connection, 'repo'))
 
 
     def test_releasing_project_scope_does_not_release_separate_review_cause(self):
@@ -310,23 +334,21 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
         self.assertIsNotNone(scoped_blocking.project_block(self.connection, 'repo'))
 
 
-    def test_saved_real_index_flag_violation_remains_blocked_after_flag_restoration(self):
+    def test_restored_current_input_releases_old_index_diagnosis_without_erasing_audit(self):
         self.project_block()
         flagged = replace(self.current, index={'app.py': ('S 100644 resolved 0',)})
-        self.connection.execute('UPDATE exec_plans SET agent_result_snapshot = ?', (flagged.serialize(),))
-        self.assertFalse(self.resume_project())
-        self.assertIsNotNone(scoped_blocking.project_block(self.connection, 'repo'))
+        self.connection.execute('UPDATE exec_plans SET agent_result_snapshot=?', (flagged.serialize(),))
+        self.assertTrue(self.resume_project())
+        self.assertIsNone(scoped_blocking.project_block(self.connection, 'repo'))
+        self.assertEqual(self.connection.execute('SELECT agent_result_snapshot FROM exec_plans').fetchone()[0], flagged.serialize())
 
 
-    def test_saved_agent_index_flags_cannot_be_hidden_by_restored_current_state(self):
+    def test_saved_index_diagnosis_does_not_replay_permissions_against_current_candidate(self):
         flagged = replace(self.current, index={'app.py': ('S 100644 resolved 0',)})
-        self.connection.execute('UPDATE exec_plans SET agent_result_snapshot = ?', (flagged.serialize(),))
+        self.connection.execute('UPDATE exec_plans SET agent_result_snapshot=?', (flagged.serialize(),))
         plan = self.connection.execute('SELECT * FROM exec_plans').fetchone()
-        with self.assertRaisesRegex(loop_manager.AgentScopeError, 'index flags'):
-            loop_manager.validate_blocked_agent_scope(self.connection, self.repo_path, 'repo', 'main',
-                self.worktree, plan['path'], saved_plan=plan)
-        self.assertEqual(self.connection.execute('SELECT agent_result_snapshot FROM exec_plans').fetchone()[0],
-                         flagged.serialize())
+        self.assertEqual(loop_manager.validate_blocked_agent_scope(self.connection, self.repo_path, 'repo', 'main', self.worktree, plan['path'], saved_plan=plan), self.current)
+        self.assertEqual(self.connection.execute('SELECT agent_result_snapshot FROM exec_plans').fetchone()[0], flagged.serialize())
 
 
     def test_failed_false_positive_release_keeps_existing_changed_input_correction_route(self):
@@ -431,23 +453,23 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
             return original if count == 1 else replace(original, head='late mutation')
         with mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=capture):
             self.assertFalse(self.resume_project())
-        self.assertTrue(self.resume_project())
+        self.connection.execute("UPDATE projects SET planning_attempt_fingerprint='current-attempt', planning_workspace_owned=1")
+        with mock.patch.object(loop_manager, 'validate_planning_worktree_ownership'):
+            self.assertTrue(self.resume_project())
         project = self.connection.execute('SELECT * FROM projects').fetchone()
         self.assertEqual(project['planning_error'], 'independent planning error')
         self.assertEqual(project['last_error'], 'independent planning error')
 
 
-    def test_plan_scope_release_requires_matching_published_checkpoint_ownership(self):
+    def test_local_scope_release_is_independent_of_old_publication_oid(self):
         runtime = loop_manager.runtime_state.RuntimeStateRepository(self.connection)
-        runtime.block_plan('repo', 'G-047', reason_code='managed_worktree_scope_violation',
-                           evidence='old scope', release_fingerprint='same')
-        self.connection.execute("UPDATE blocked_checkpoints SET phase = 'published', published_oid = 'foreign'")
+        runtime.block_plan('repo', 'G-047', reason_code='managed_worktree_scope_violation', evidence='old scope', release_fingerprint='same')
+        self.connection.execute("UPDATE blocked_checkpoints SET phase='published', published_oid='old-remote'")
         self.connection.commit()
         with mock.patch.object(loop_manager, '_owned_checkpoint_remote_oid', return_value=None) as ownership:
-            self.assertFalse(loop_manager.resume_plan_blocks(
-                self.connection, self.repo_path, Path('/state'), 'repo', 'main'))
-        ownership.assert_called_once()
-        self.assertIsNotNone(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+            self.assertTrue(loop_manager.resume_plan_blocks(self.connection, self.repo_path, Path('/state'), 'repo', 'main'))
+        ownership.assert_not_called()
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
 
 
     def test_plan_scope_false_positive_requeues_same_worker_and_invalidates_validation(self):
@@ -455,6 +477,7 @@ class ScopeBaselineRecoveryUnitTests(ScopeBaselineFixture, unittest.TestCase):
         runtime.block_plan('repo', 'G-047', reason_code='managed_worktree_scope_violation',
                            evidence='legacy unrelated source scope', release_fingerprint='unchanged')
         self.connection.commit()
+        self.current = replace(self.current, head='new-candidate')
         self.assertTrue(loop_manager.resume_plan_blocks(
             self.connection, self.repo_path, Path('/state'), 'repo', 'main'))
         row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
@@ -577,19 +600,15 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
         self.git_write.assert_not_called()
 
 
-    def test_saved_scope_recovery_keeps_real_flags_and_out_of_scope_result_blocked(self):
+    def test_historical_git_flags_and_refs_do_not_block_owned_current_rebase(self):
         self.block(reason='managed_worktree_scope_violation')
         _, result = self.scope_stage_result()
-        for changed in (replace(result, index={'app.py': ('S 100644 manual 0',)}),
-                        replace(result, index={'app.py': ('h 100644 manual 0',)}),
-                        replace(result, dirty={**result.dirty, 'docs/requirements/archive/Protected.md': (('unstaged',), 'foreign')}),
-                        replace(result, refs={**result.refs, 'refs/heads/other': ('foreign', '')})):
-            self.connection.execute("UPDATE exec_plans SET agent_result_snapshot = ?", (changed.serialize(),))
-            self.connection.commit()
-            saved = self.snapshot()
-            with self.subTest(changed=changed):
-                self.assertFalse(self.resume())
-                self.assertEqual(self.snapshot(), saved)
+        changed = replace(result, index={'app.py': ('S 100644 manual 0',)}, refs={**result.refs, 'refs/heads/other': ('foreign', '')})
+        self.connection.execute('UPDATE exec_plans SET agent_result_snapshot=?', (changed.serialize(),))
+        self.connection.commit()
+        self.assertTrue(self.resume())
+        self.assertIsNone(scoped_blocking.plan_block(self.connection, 'repo', 'G-047'))
+        self.assertEqual(self.connection.execute('SELECT agent_result_snapshot FROM exec_plans').fetchone()[0], changed.serialize())
         self.git_write.assert_not_called()
 
 
@@ -704,7 +723,7 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
 
 
     def test_unrelated_project_cause_is_not_released_by_rebase(self):
-        self.block(project=True, reason='shared_ref_mutation')
+        self.block(project=True, reason='user_decision_required')
         before = self.snapshot()
         with mock.patch.object(loop_manager, 'validate_execplan_workspace_identity',
                                side_effect=loop_manager.WorkspaceOwnershipError('foreign owner')):
@@ -756,7 +775,9 @@ class EvidenceFreeRebaseBlockTests(CurrentRebaseBlockFixture, unittest.TestCase)
             final_block_reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN)
         self.connection.execute("UPDATE recovery_records SET occurrence_index = '{}'")
         self.connection.commit()
-        self.assertTrue(self.resume())
+        checkpoint = self.connection.execute("SELECT observed_remote_oid FROM execution_checkpoints WHERE repo='repo' AND plan_id='G-047'").fetchone()
+        with mock.patch('loop_manager_internal.git.manager_git_journal.live_remote_branch_oid', return_value=checkpoint[0]):
+            self.assertTrue(self.resume())
         self.assertIsNone(scoped_blocking.project_block(self.connection, 'repo'))
         self.assertEqual(RecoveryRepository(self.connection).row('repo', 'G-047')['pending_action'], 'reconcile')
 

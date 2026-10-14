@@ -877,6 +877,39 @@ def resume_interrupted_blocked_agent_recovery(
     ).fetchone()
     if project is None or not project["agent_recovery"]:
         return False
+    plan = effects.project_execplan(connection, repo)
+    block = (scoped_blocking.plan_block(connection, repo, str(plan['plan_id']))
+             if plan is not None else None)
+    retired = (scoped_blocking.is_scope_baseline_block(block)
+               or scoped_blocking.is_scope_baseline_block(scoped_blocking.project_block(connection, repo)))
+    if retired:
+        if (plan is None or int(plan['workspace_owned'] or 0) != WORKSPACE_OWNED
+                or not plan['worktree'] or not plan['branch']
+                or plan['worktree'] != project['worktree'] or plan['branch'] != project['branch']):
+            raise WorkspaceOwnershipError('폐기된 Git 복구의 현재 작업 공간이 일치하지 않습니다.')
+        worktree, branch = Path(plan['worktree']), str(plan['branch'])
+        effects.validate_execplan_workspace_identity(
+            state_dir, repo, manual_workspace_owner(connection, repo, str(plan['plan_id'])), branch, worktree)
+        effects.make_worktree(repo_path, worktree, branch, str(project['base_branch']),
+            journal_state_dir=state_dir, journal_owner=f"plan:{plan['plan_id']}",
+            allow_create_branch=False, allow_recovery=False, allow_existing=True,
+            allow_rebase=effects._rebase_in_progress_for_branch(worktree, branch))
+        from loop_manager_internal.storage import runtime_state
+        with runtime_state._transaction(connection):
+            current = connection.execute('SELECT agent_recovery FROM projects WHERE repo = ?', (repo,)).fetchone()
+            if current['agent_recovery'] != project['agent_recovery']:
+                raise WorkspaceOwnershipError('폐기된 Git 복구 기록이 처리 중 변경됐습니다.')
+            checkpoints = ExecutionCheckpointRepository(connection)
+            checkpoint = checkpoints.get(repo, str(plan['plan_id']))
+            saved = checkpoint.snapshot or {}
+            checkpoints.record(repo, str(plan['plan_id']), expected_generation=checkpoint.generation,
+                operation=checkpoint.operation, expected_head=checkpoint.expected_head,
+                target_base_oid=checkpoint.target_base_oid, observed_remote_oid=checkpoint.observed_remote_oid,
+                snapshot={**saved, 'retired_agent_recoveries': [
+                    *saved.get('retired_agent_recoveries', ()), project['agent_recovery']]})
+            runtime_state.RuntimeStateRepository(connection).update_project(
+                repo, {'agent_recovery': None}, enqueue=False)
+        return True
     recovery = effects._deserialize_blocked_agent_recovery(
         str(project["agent_recovery"])
     )

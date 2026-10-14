@@ -32,7 +32,7 @@
 - 소스·원격 revision·interpreter가 바뀌면 현재 코드가 실행되고 이전 캐시가 다른 revision의 원본·검증 결과로 채택되지 않는다.
 - 캐시 손상·권한 부족·경로 사용 불가에서는 안전하게 재생성하거나 무캐시로 동작한다. 실제 원본·Git·소유권 문제를 캐시 문제로 간주해 무시하지 않는다.
 - 캐시가 있는 runtime의 중단·재시작·검증된 정리가 동작하며, 다른 ignored 파일과 사용자 데이터는 그대로 보호된다.
-- 선택한 관리 worktree의 tracked·staged·non-ignored 변경, index flags, 작업 branch·HEAD·사용 중 ref와 config·operation에 대한 범위·소유권 검사가 유지된다. 로컬 base·기본 checkout과 무관한 branch의 변화는 R-056·R-060대로 제외하며, 캐시 허용을 이유로 실제 사용 자원의 검사를 생략하거나 ignore 규칙·sandbox를 완화하지 않는다.
+- 캐시 허용 뒤에도 실제 후보·검증 입력과 Manager Git 쓰기의 파일 보존·동기화·게시 조건은 유지된다. 접근 권한의 sandbox 강제와 Git 범위 검사 제거·기존 오탐 자동 복구는 R-055를 따르며, 캐시 때문에 과거 snapshot 비교를 되살리거나 ignore 규칙·sandbox를 완화하지 않는다.
 - 캐시와 tracked 경로의 충돌 또는 소유권 불명확은 파일을 보존해 실제 이유를 기록하고, 안전한 다른 원격 기준 작업은 기존 정책에 따라 계속할 수 있다.
 
 ## Product Impact

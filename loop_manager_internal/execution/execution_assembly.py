@@ -142,6 +142,7 @@ def workspace(effects: ExecutionEffects, identity: ExecutionIdentity,
         snapshot: Callable[[], PreparationSnapshot], update_snapshot: Callable[..., None],
         callbacks: dict[str, Callable], *, recovery=None, rebase_corrections=None) -> WorkspaceHandler:
     return WorkspaceHandler(WorkspaceHandlerPorts(
+        reconcile_remote=effects.workspace.reconcile_remote,
         identity=identity,
         snapshot=snapshot,
         update_snapshot=update_snapshot,

@@ -136,6 +136,8 @@ class LatestBaseHandler:
                     context.worktree,
                     remote_oid,
                 )
+        except RecoveryFailure as error:
+            return self.ports._recover(error.reason, str(error), context=context)
         except self.ports.contract.PublicationSafetyError as error:
             publication_error = str(error)
             self.ports._block_final(

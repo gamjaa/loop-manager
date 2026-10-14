@@ -41,9 +41,9 @@ class PlanningErrorRecoveryTest(unittest.TestCase):
                         result = replace(result, dirty={'src/app.py': (('unstaged',), 'actual violation')})
                     if mutation == 'config':
                         result = replace(result, config={**result.config, 'local:core.hooksPath': ('foreign',)})
-                    with self.assertRaises(loop_manager.AgentScopeError) as failure:
-                        loop_manager.validate_agent_scope('planner', repo, start, result)
-                    error = str(failure.exception) if mutation != 'other_error' else 'planner failed'
+                    error = ('planner failed' if mutation == 'other_error' else
+                             'planner 결과 변경 범위 오류: src/app.py' if mutation == 'tracked' else
+                             'planner Git 범위 위반: legacy comparison')
                     if mutation == 'current_tracked':
                         (repo / 'src/app.py').write_text('VALUE = 99\n')
                         current = loop_manager.capture_git_snapshot(repo)
@@ -99,16 +99,16 @@ class PlanningErrorRecoveryTest(unittest.TestCase):
                             mock.patch.object(service, '_suspend_failed_planning', return_value='waiting'), \
                             mock.patch.object(service, '_continue_published_work', return_value='waiting'):
                         self.assertEqual(service._gate_preserved_error(run),
-                                         None if mutation == 'ignored' else 'waiting')
+                                         None if mutation in {'ignored', 'config', 'current_tracked'} else 'waiting')
                         planner.assert_not_called()
-                    if mutation == 'ignored':
+                    if mutation in {'ignored', 'config', 'current_tracked'}:
                         saved = repository.planning(str(repo))
                         self.assertIsNone(saved.planning_error)
                         self.assertEqual(saved.planner_session_id, 'saved-session')
                         self.assertEqual(saved.planning_retry_count, 3)
                         self.assertEqual(saved.agent_snapshot, start.serialize())
                         self.assertEqual(saved.agent_result_snapshot, result.serialize())
-                        self.assertEqual(saved.planning_result_completed, 1)
+                        self.assertEqual(saved.planning_result_completed, original.planning_result_completed)
                         self.assertFalse(service._recover_ignored_error(run))
                     else:
                         self.assertEqual(repository.planning(str(repo)), original)

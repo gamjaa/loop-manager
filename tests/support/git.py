@@ -9,6 +9,7 @@ from pathlib import Path
 import loop_manager
 from unittest import mock
 from loop_manager_internal.verification.timing import phase
+from loop_manager_internal.git.git_adapter import github_repository as _parse_github_origin
 
 
 def git_test_environment():
@@ -123,6 +124,25 @@ def commit_and_push(repo: Path, message: str) -> None:
     git_command(repo, "add", "-A")
     git_command(repo, "commit", "-m", message)
     git_command(repo, "push", "origin", "HEAD:main")
+
+
+def local_github_origin(test, repo, *, read_git=git_command):
+    """로컬 bare 원격만 등록 GitHub identity로 정규화한다."""
+    origin = read_git(repo, 'remote', 'get-url', 'origin')
+    previous = getattr(loop_manager.github_repository, 'fixture_origins', {})
+    origins = {**(previous if isinstance(previous, dict) else {}), origin: 'fixture/project'}
+    def github_repository(url):
+        return origins[str(url)] if str(url) in origins else _parse_github_origin(url)
+    github_repository.fixture_origins = origins
+    def adapter_origin(url):
+        return loop_manager.github_repository(url) if str(url) in origins else _parse_github_origin(url)
+    for target, replacement in (('loop_manager.github_repository', github_repository),
+                                ('loop_manager_internal.git.git_adapter.github_repository', adapter_origin)):
+        patch = mock.patch(target, new=replacement)
+        patch.start()
+        test.addCleanup(patch.stop)
+    return 'fixture/project'
+
 
 def advance_remote_file(directory: str, repo: Path, relative_path: str,
                         contents: str, message: str) -> str:

@@ -17,6 +17,7 @@ from loop_manager_internal.recovery import waiting_pr_service
 def register(assembly: Composition) -> None:
     assembly.bind('_pull_request_recovery_effects_reconcile_existing_pull_request', recovery_adapter._pull_request_recovery_effects_reconcile_existing_pull_request,
         lambda: recovery_adapter.PullRequestRecoveryEffectsReconcileExistingPullRequestEffects(
+            remote_integration_effects=assembly.callback('_checkpoint_recovery_effects_reconcile_published_blocked_checkpoint'),
             _block_closed_pull_request=assembly.callback('_block_closed_pull_request'),
             _fetch_pr_conflict_recovery_refs=assembly.callback('_fetch_pr_conflict_recovery_refs'),
             _is_pr_conflict_preflight_block=assembly.callback('_is_pr_conflict_preflight_block'),
@@ -130,6 +131,7 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('_blocked_plan_reconciliation_effects', recovery_adapter._blocked_plan_reconciliation_effects,
         lambda: recovery_adapter.BlockedPlanReconciliationEffectsEffects(
+            remote_integration_effects=assembly.callback('_checkpoint_recovery_effects_reconcile_published_blocked_checkpoint'),
             ROOT=assembly.value('ROOT'),
             _BlockedCheckpointAdapter=assembly.callback('_BlockedCheckpointAdapter'),
             _blocked_execplan_metadata_error=assembly.callback('_blocked_execplan_metadata_error'),
@@ -228,6 +230,7 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('_scope_reconciliation_effects_resume_owned_checkpoint_project_block', recovery_adapter._scope_reconciliation_effects_resume_owned_checkpoint_project_block,
         lambda: recovery_adapter.ScopeReconciliationEffectsResumeOwnedCheckpointProjectBlockEffects(
+            remote_integration_effects=assembly.callback('_checkpoint_recovery_effects_reconcile_published_blocked_checkpoint'),
             _clear_active_in_current_transaction=assembly.callback('_clear_active_in_current_transaction'),
             _direct_rebase_history_proven=assembly.callback('_direct_rebase_history_proven'),
             _published_review_commit_intent_matches=assembly.callback('_published_review_commit_intent_matches'),
@@ -304,6 +307,7 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('_validate_pr_conflict_recovery_ownership', pr_ownership._validate_pr_conflict_recovery_ownership,
         lambda: pr_ownership.ValidatePrConflictRecoveryOwnershipEffects(
+            remote_integration_effects=assembly.callback('_checkpoint_recovery_effects_reconcile_published_blocked_checkpoint'),
             _ignored_paths_overlapping_git_update=assembly.callback('_ignored_paths_overlapping_git_update'),
             _ignored_worktree_paths=assembly.callback('_ignored_worktree_paths'),
             _non_default_index_flags=assembly.callback('_non_default_index_flags'),
@@ -329,6 +333,7 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('_validate_active_pr_conflict_recovery', pr_ownership._validate_active_pr_conflict_recovery,
         lambda: pr_ownership.ValidateActivePrConflictRecoveryEffects(
+            remote_integration_effects=assembly.callback('_checkpoint_recovery_effects_reconcile_published_blocked_checkpoint'),
             _fetch_pr_conflict_recovery_refs=assembly.callback('_fetch_pr_conflict_recovery_refs'),
             _rebase_in_progress_for_branch=assembly.callback('_rebase_in_progress_for_branch'),
             active_execplan=assembly.callback('active_execplan'),
@@ -535,6 +540,7 @@ def register(assembly: Composition) -> None:
 
     assembly.bind('observe_waiting_pull_requests', waiting_pr_service.observe_waiting_pull_requests,
         lambda: waiting_pr_service.ObserveWaitingPullRequestsEffects(
+            git=assembly.callback('git'),
             base_head=lambda repo, base: assembly.value('git')(repo, 'rev-parse', f'refs/remotes/origin/{base}').stdout.strip(),
             _block_closed_pull_request=assembly.callback('_block_closed_pull_request'),
             _recorded_base_fetch=assembly.callback('_recorded_base_fetch'),

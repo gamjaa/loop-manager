@@ -43,6 +43,7 @@ class PullRequestRecoveryEffectsReconcileExistingPullRequestEffects:
     update_project: Callable[..., object]
     validate_execplan_workspace_identity: Callable[..., object]
     manual_publication_stage_tokens: Callable[..., object]
+    remote_integration_effects: Callable[..., object] | None = None
 
 
 def _pull_request_recovery_effects_reconcile_existing_pull_request(effects: PullRequestRecoveryEffectsReconcileExistingPullRequestEffects, ) -> pull_request_recovery.ReconcileExistingPullRequestEffects:
@@ -69,6 +70,7 @@ def _pull_request_recovery_effects_reconcile_existing_pull_request(effects: Pull
         update_project=effects.update_project,
         validate_execplan_workspace_identity=effects.validate_execplan_workspace_identity,
         manual_publication_stage_tokens=effects.manual_publication_stage_tokens,
+        remote_integration_effects=effects.remote_integration_effects,
     )
 
 
@@ -267,10 +269,12 @@ class BlockedPlanReconciliationEffectsEffects:
     validate_blocked_agent_scope: Callable[..., object]
     validate_execplan_workspace_identity: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
+    remote_integration_effects: Callable[..., object] | None = None
 
 
 def _blocked_plan_reconciliation_effects(effects: BlockedPlanReconciliationEffectsEffects, ) -> blocked_plan_reconciliation.PlanRecoveryEffects:
     return blocked_plan_reconciliation.PlanRecoveryEffects(
+        remote_integration_effects=effects.remote_integration_effects,
         ROOT=effects.ROOT,
         _BlockedCheckpointAdapter=effects._BlockedCheckpointAdapter,
         _BlockedCheckpointResults=_BlockedCheckpointResults,
@@ -458,10 +462,12 @@ class ScopeReconciliationEffectsResumeOwnedCheckpointProjectBlockEffects:
     validate_managed_worktree: Callable[..., object]
     validate_blocked_agent_scope: Callable[..., object]
     unmet_execplan_dependencies: Callable[..., object]
+    remote_integration_effects: Callable[..., object] | None = None
 
 
 def _scope_reconciliation_effects_resume_owned_checkpoint_project_block(effects: ScopeReconciliationEffectsResumeOwnedCheckpointProjectBlockEffects, ) -> scope_reconciliation.ResumeOwnedCheckpointProjectBlockEffects:
     return scope_reconciliation.ResumeOwnedCheckpointProjectBlockEffects(
+        remote_integration_effects=effects.remote_integration_effects,
         _clear_active_in_current_transaction=effects._clear_active_in_current_transaction,
         _direct_rebase_history_proven=effects._direct_rebase_history_proven,
         _published_review_commit_intent_matches=effects._published_review_commit_intent_matches,

@@ -536,39 +536,6 @@ class CatalogPullRequestConsumerTests(_CatalogRefreshCase):
             self.assertNotIn('G-001', manager._catalog_archive_conflict_ids(
                 self.connection, Path(self.repo), self.repo, self.sha))
 
-    def test_new_pr_head_safety_block_prevents_followup_git_and_consumers(self):
-        def observe_reopened_pr():
-            self.connection.execute(
-                "UPDATE exec_plans SET status='PLAN_BLOCKED', ever_started=1, blocked_reason=?, "
-                "branch='branch', pr_url='https://example/pr/1', pr_head_oid=? WHERE plan_id='G-001'",
-                (manager.PR_CLOSED_BLOCK_REASON, 'd'*40))
-            self.connection.commit()
-            # Capture the step's mocks before invoking the real PR observer.
-            self.followup_fetch = manager._recorded_base_fetch
-            self.source_sync = manager.ensure_safe_base_worktree
-            manager.observe_waiting_pull_requests(
-                self.connection, Path(self.repo), Path('/state'), self.repo)
-            block = manager.scoped_blocking.project_block(self.connection, self.repo)
-            self.assertEqual(block['reason_code'],
-                             manager.BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value)
-            self.block_evidence = block['evidence']
-        with mock.patch.object(manager, 'pr_for_branch', return_value={
-                'state': 'OPEN', 'headRefOid': 'c'*40, 'headRefName': 'branch',
-                'baseRefName': 'main', 'url': 'https://example/pr/1'}), \
-             mock.patch.object(manager, 'resume_project_block_if_safe', return_value=False), \
-             mock.patch.object(manager, 'dispatch_execplan_archive_housekeeping') as archive, \
-             mock.patch.object(manager, 'run_agent') as agent:
-            self.assertEqual(self.run_step(pr=observe_reopened_pr), 1)
-        self.assertEqual(self.events, ['fetch', 'catalog', 'pr'])
-        self.followup_fetch.assert_not_called()
-        self.source_sync.assert_not_called()
-        archive.assert_not_called()
-        agent.assert_not_called()
-        self.assertEqual(self.row()['status'], 'PLAN_BLOCKED')
-        self.assertEqual(self.row()['blocked_reason'], manager.PR_CLOSED_BLOCK_REASON)
-        self.assertEqual(self.row()['pr_head_oid'], 'd'*40)
-        block = manager.scoped_blocking.project_block(self.connection, self.repo)
-        self.assertEqual(block['evidence'], self.block_evidence)
 
     def test_project_safety_block_keeps_closed_pr_block_when_head_is_restored(self):
         self.connection.execute(

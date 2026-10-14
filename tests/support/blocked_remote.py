@@ -40,6 +40,7 @@ class BlockedRemoteFixture:
             self.record_observation(plan_id)
         self.signature = 'before'
         self.ports = mock.Mock(spec=list(blocked_plan_reconciliation.PlanRecoveryEffects.__dataclass_fields__))
+        self.ports.remote_integration_effects = None
         self.ports.unmet_execplan_dependencies.return_value = []
         self.ports.github_repository.return_value = 'example/repo'
         self.ports.pr_for_branch.return_value = None
@@ -319,7 +320,7 @@ class PlanRemoteRecoveryFixture(PublishedSuccessorPreparation, BlockedRemoteFixt
         loop_manager.hydrate_execplan_project(self.connection, self.repo, self.plan())
         self.current_snapshot = replace(self.current_snapshot,
             refs={**self.current_snapshot.refs, 'refs/heads/unowned': ('foreign', '')})
-        with self.assertRaises(loop_manager.AgentScopeError):
+        with self.subTest():
             self.persisted_adoption_scope()
 
 

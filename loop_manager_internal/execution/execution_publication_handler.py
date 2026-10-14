@@ -71,6 +71,11 @@ class PublicationHandler:
     def __init__(self, ports: PublicationHandlerPorts):
         self.ports = ports
 
+    def _accepted_remote(self, context, row):
+        current = (self.ports.checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
+                   if self.ports.checkpoint else None)
+        return ((current.snapshot or {}).get('accepted_work_branch') if current else None) or str(row['publication_remote_oid'] or '') or None
+
     def _publication_intent(self, context, operation, remote_oid):
         checkpoint = self.ports.checkpoint
         if checkpoint is None:
@@ -182,6 +187,8 @@ class PublicationHandler:
             observed_remote_oid=(current.expected_head if current.operation == 'push'
                                  else current.observed_remote_oid),
             snapshot={**(current.snapshot or {}),
+                      **({'accepted_work_branch': current.expected_head, 'fresh_remote_creation': False}
+                         if current.operation == 'push' else {}),
                       **({'pushed_checkpoint_head': current.expected_head}
                          if current.operation == 'push' and
                          ((current.snapshot or {}).get('blocked_resume') or
@@ -215,7 +222,7 @@ class PublicationHandler:
             # candidate tokens and a second head check across the PR query.
             observed = self._publication_resume().observe(
                 self.ports.identity.repo_path, context.worktree, context.branch,
-                str(row['publication_remote_oid'] or '') or None, pr_url,
+                self._accepted_remote(context, row), pr_url,
             )
             pr = observed.pull_request
             if pr is None or str(pr.get('state') or '').upper() not in {'MERGED', 'CLOSED'}:
@@ -229,6 +236,8 @@ class PublicationHandler:
             )
             return (self.ports._step_outcome(reconciliation) if reconciliation is not None
                     else self.ports._retry('종료 PR 상태를 다시 확인합니다.'))
+        except RecoveryFailure as error:
+            return self.ports._recover(error.reason, str(error), context=context)
         except (self.ports.contract.PublicationSafetyError, self.ports.contract.WorkspaceOwnershipError) as error:
             return self.ports._block_final(
                 self.ports.identity.repo, context.worktree, str(error),
@@ -287,9 +296,11 @@ class PublicationHandler:
         try:
             publication = self._publication_resume().observe(
                 self.ports.identity.repo_path, context.worktree, context.branch,
-                str(row['publication_remote_oid'] or '') or None,
+                self._accepted_remote(context, row),
                 str(row['pr_url'] or '') or None,
             )
+        except RecoveryFailure as error:
+            return self.ports._recover(error.reason, str(error), context=context)
         except (self.ports.contract.PublicationSafetyError, self.ports.contract.WorkspaceOwnershipError) as error:
             return self.ports._block_final(self.ports.identity.repo, context.worktree, str(error),
                 str(row['verify_result'] or ''), reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN)
@@ -519,6 +530,8 @@ class PublicationHandler:
                 current_pr,
                 expected_oid,
             )
+        except RecoveryFailure as error:
+            return self.ports._recover(error.reason, str(error), context=context)
         except (self.ports.contract.PublicationSafetyError, self.ports.contract.WorkspaceOwnershipError) as error:
             publication_error = str(error)
             self.ports._block_final(
@@ -639,7 +652,7 @@ class PublicationHandler:
         try:
             publication = self._publication_resume().observe(
                 self.ports.identity.repo_path, context.worktree, context.branch,
-                str(row['publication_remote_oid'] or '') or None,
+                self._accepted_remote(context, row),
             )
             current = (self.ports.checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
                        if self.ports.checkpoint else None)
@@ -679,6 +692,8 @@ class PublicationHandler:
                     context.branch, context.worktree, publication.local_oid,
                 )
                 self._complete_publication_intent(context)
+        except RecoveryFailure as error:
+            return self.ports._recover(error.reason, str(error), context=context)
         except (self.ports.contract.PublicationSafetyError, self.ports.contract.WorkspaceOwnershipError) as error:
             publication_error = str(error)
             self.ports._block_final(
@@ -707,6 +722,8 @@ class PublicationHandler:
             after_push = self._publication_resume().observe(
                 self.ports.identity.repo_path, context.worktree, context.branch, head_oid,
             )
+        except RecoveryFailure as error:
+            return self.ports._recover(error.reason, str(error), context=context)
         except (self.ports.contract.PublicationSafetyError, self.ports.contract.WorkspaceOwnershipError) as error:
             return self.ports._block_final(self.ports.identity.repo, context.worktree, str(error),
                 str(self.ports._row()['verify_result'] or ''), reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN)
@@ -769,6 +786,8 @@ class PublicationHandler:
                 ['gh', 'pr', 'create', '--base', self.ports.identity.base, '--head', context.branch, '--title', title, '--body', body],
                 cwd=context.worktree,
             )
+        except RecoveryFailure as error:
+            return self.ports._recover(error.reason, str(error), context=context)
         except (self.ports.contract.PublicationSafetyError, self.ports.contract.WorkspaceOwnershipError) as error:
             return self.ports._block_final(self.ports.identity.repo, context.worktree, str(error),
                 str(self.ports._row()['verify_result'] or ''), reason=BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN)

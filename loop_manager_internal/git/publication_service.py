@@ -6,6 +6,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
 from loop_manager_internal.git import managed_rebase_adoption
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 from loop_manager_internal.runtime.contracts import PublicationSafetyError
 from loop_manager_internal.runtime.contracts import WORKSPACE_OWNED
 from loop_manager_internal.storage import execution_checkpoint_state
@@ -43,12 +44,21 @@ def remote_branch_oid(effects: RemoteBranchOidEffects, repo: Path, branch: str) 
     return oid
 
 
+def _current_pr(effects, connection, repo, plan, repo_path, branch, url=None):
+    from loop_manager_internal.recovery.deleted_branch_restart import current_pr
+    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, str(plan['plan_id']))
+    return current_pr(checkpoint, effects.pr_for_branch(repo_path, branch, url)
+                      if url else effects.pr_for_branch(repo_path, branch))
+
+
 @dataclass(frozen=True)
 class OwnedPublicationPlanEffects:
     """Named effects for _owned_publication_plan; no entry-point/module access."""
     active_execplan: Callable[..., object]
     validate_execplan_workspace_identity: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
+    git: Callable[..., object] | None = None
+    github_repository: Callable[..., object] | None = None
 
 
 def _owned_publication_plan(
@@ -79,6 +89,13 @@ def _owned_publication_plan(
         worktree,
     )
     effects.validate_managed_worktree(repo_path, worktree, branch)
+    if effects.git is not None and effects.github_repository is not None:
+        project = connection.execute('SELECT origin FROM projects WHERE repo=?', (repo,)).fetchone()
+        for location in (repo_path, worktree):
+            for args in (('remote', 'get-url', '--all', 'origin'), ('remote', 'get-url', '--push', '--all', 'origin')):
+                urls = effects.git(location, *args).stdout.splitlines()
+                if project is None or len(urls) != 1 or effects.github_repository(urls[0]) != project['origin']:
+                    raise PublicationSafetyError('현재 등록 origin과 게시 대상이 다릅니다.')
     return plan
 
 
@@ -118,7 +135,10 @@ def record_remote_publication_branch(
         return
     if recorded_oid == remote_oid:
         return
-    raise PublicationSafetyError(
+    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, str(plan['plan_id']))
+    if (checkpoint.snapshot or {}).get('accepted_work_branch') == remote_oid:
+        return
+    raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE,
         "PR이 없는 원격 branch가 현재 관리 HEAD 또는 저장된 게시 OID와 "
         f"일치하지 않아 갱신을 거부합니다: {branch}"
     )
@@ -161,7 +181,7 @@ def push_managed_publication_branch(
             checkpoint, repo_path, branch, git=effects.git, read_fetched=effects.remote_branch_oid)
     remote_oid = observe_remote()
     if remote_oid is None and plan['publication_remote_oid']:
-        raise PublicationSafetyError(
+        raise RecoveryFailure(RecoveryReason.REMOTE_BRANCH_DELETED,
             '저장된 게시 branch가 원격에서 삭제돼 새 branch 생성으로 복구할 수 없습니다.'
         )
     effects.record_remote_publication_branch(
@@ -190,8 +210,8 @@ def push_managed_publication_branch(
             recorded_oid = str(
                 refreshed["publication_remote_oid"] if refreshed else ""
             )
-        if recorded_oid != remote_oid:
-            raise PublicationSafetyError(
+        if recorded_oid != remote_oid and (checkpoint.snapshot or {}).get('accepted_work_branch') != remote_oid:
+            raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE,
                 "저장된 원격 branch OID와 fetch 결과가 달라 강제 갱신을 거부합니다."
             )
         live = effects.git(repo_path, 'ls-remote', '--heads', 'origin',
@@ -199,10 +219,10 @@ def push_managed_publication_branch(
         if (live.returncode or
                 [line.split() for line in live.stdout.splitlines() if line.strip()]
                 != [[remote_oid, f'refs/heads/{branch}']]):
-            raise PublicationSafetyError(
+            raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE,
                 'push 직전 원격 branch가 저장된 lease OID와 다릅니다.'
             )
-        if plan['pr_url'] or effects.pr_for_branch(repo_path, branch) is not None:
+        if plan['pr_url'] or _current_pr(effects, connection, repo, plan, repo_path, branch) is not None:
             raise PublicationSafetyError(
                 'PR이 있는 branch를 checkpoint 복구 강제 push할 수 없습니다.'
             )
@@ -214,7 +234,7 @@ def push_managed_publication_branch(
         live = effects.git(repo_path, 'ls-remote', '--heads', 'origin',
                    f'refs/heads/{branch}', check=False)
         if live.returncode or live.stdout.strip():
-            raise PublicationSafetyError(
+            raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE,
                 '새 branch push 직전 원격 ref가 생성되거나 조회에 실패했습니다.'
             )
         push_arguments.insert(1, f"--force-with-lease=refs/heads/{branch}:")
@@ -223,11 +243,13 @@ def push_managed_publication_branch(
     if (effects.git(worktree, 'rev-parse', 'HEAD').stdout.strip() != local_oid
             or effects.git(worktree, 'rev-parse', '--verify', f'refs/heads/{branch}').stdout.strip() != local_oid):
         raise PublicationSafetyError('push 직전 소유 branch 또는 관리 HEAD가 변경됐습니다.')
-    if effects.pr_for_branch(repo_path, branch) is not None:
+    if _current_pr(effects, connection, repo, plan, repo_path, branch) is not None:
         raise PublicationSafetyError('push 직전 게시 대상 branch의 PR이 변경됐습니다.')
 
     pushed = effects.git(worktree, *push_arguments, check=False)
     if pushed.returncode:
+        if observe_remote() != remote_oid or any(value in pushed.stdout.lower() for value in ('stale info', 'fetch first', 'non-fast-forward')):
+            raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, pushed.stdout[-8000:])
         raise RuntimeError(f"publication branch push 실패:\n{pushed.stdout[-8000:]}")
 
     effects._recorded_base_fetch(repo_path, state_dir, branch, owner="project")
@@ -261,6 +283,7 @@ class PushOwnedPrConflictRecoveryEffects:
     remote_branch_oid: Callable[..., object]
     validate_execplan_workspace_identity: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
+    _owned_publication_plan: Callable[..., object] | None = None
 
 
 def push_owned_pr_conflict_recovery(
@@ -294,21 +317,26 @@ def push_owned_pr_conflict_recovery(
     recovery = bool(plan["pr_conflict_recovery"])
     observed_head = str((plan["pr_conflict_head_oid"] if recovery
                          else plan["publication_remote_oid"]) or "")
+    checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, str(plan['plan_id']))
+    observed_head = (checkpoint.snapshot or {}).get('accepted_work_branch') or observed_head
+    fresh = bool((checkpoint.snapshot or {}).get('fresh_remote_creation'))
+    if fresh and not observed_head:
+        observed_head = str(pull_request.get('headRefOid') or '')
     target_base = str((plan["pr_conflict_base_oid"] if recovery
                       else plan["validated_base_sha"]) or "")
     if (
         str(pull_request.get("state") or "").upper() != "OPEN"
         or str(pull_request.get("url") or "") != url
         or str(pull_request.get("headRefName") or "") != branch
-        or str(pull_request.get("headRefOid") or "") != observed_head
         or (pull_request.get("baseRefName") is not None
             and pull_request["baseRefName"] != project["base_branch"])
-        or (not recovery and str(plan["pr_head_oid"] or "") != observed_head)
     ):
         raise PublicationSafetyError(
             "게시 직전 PR URL, state, head branch 또는 head OID가 복구 "
             "시작 시 관측값과 다릅니다."
         )
+    if str(pull_request.get('headRefOid') or '') != observed_head:
+        raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '게시 직전 PR head 관측이 변경됐습니다.')
     if (
         not observed_head
         or not target_base
@@ -337,26 +365,32 @@ def push_owned_pr_conflict_recovery(
         raise PublicationSafetyError(
             "검증된 base OID가 게시할 관리 HEAD의 조상이 아닙니다."
         )
-    if not recovery and effects.git(
+    if not recovery and not fresh and not (checkpoint.snapshot or {}).get('current_rebase_acceptance') and effects.git(
             worktree, 'merge-base', '--is-ancestor', observed_head, local_oid,
             check=False).returncode != 0:
         raise PublicationSafetyError('일반 PR 후보가 확인된 원격 checkpoint의 후속 commit이 아닙니다.')
 
-    effects._fetch_pr_conflict_recovery_refs(
+    if fresh:
+        effects._recorded_base_fetch(repo_path, state_dir, str(project['base_branch']), owner='project')
+    else:
+        effects._fetch_pr_conflict_recovery_refs(
         repo_path,
         state_dir,
         str(project["base_branch"]),
         branch,
     )
-    remote_oid = effects.remote_branch_oid(repo_path, branch)
-    if remote_oid != observed_head:
-        raise PublicationSafetyError(
+    from loop_manager_internal.git.manager_git_journal import live_remote_branch_oid
+    remote_oid = live_remote_branch_oid(effects.git, repo_path, branch)
+    if remote_oid != (None if fresh else observed_head):
+        raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE,
             "게시 직전 원격 PR head가 복구 시작 시 관측값과 달라졌습니다."
         )
     current_pr = effects.pr_for_branch(repo_path, branch, url)
     if (current_pr is None or any(current_pr.get(key) != pull_request.get(key)
-                                 for key in ('url', 'state', 'headRefName', 'headRefOid', 'baseRefName'))):
+                                 for key in ('url', 'state', 'headRefName', 'baseRefName'))):
         raise PublicationSafetyError('push 직전 PR identity 또는 head가 변경됐습니다.')
+    if current_pr.get('headRefOid') != observed_head:
+        raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, 'push 직전 PR head가 변경됐습니다.')
     effects.validate_managed_worktree(repo_path, worktree, branch)
     if (effects.git(worktree, 'rev-parse', 'HEAD').stdout.strip() != local_oid
             or effects.git(worktree, 'rev-parse', '--verify', f'refs/heads/{branch}').stdout.strip() != local_oid):
@@ -365,10 +399,12 @@ def push_owned_pr_conflict_recovery(
         # A validated candidate can already be the confirmed PR checkpoint.
         # Reuse its live identity after the same validation gates.
         return local_oid
+    if effects._owned_publication_plan is not None:
+        effects._owned_publication_plan(connection, repo_path, state_dir, repo, branch, worktree)
     pushed = effects.git(
         worktree,
         "push",
-        *([f"--force-with-lease=refs/heads/{branch}:{observed_head}"] if recovery else []),
+        f"--force-with-lease=refs/heads/{branch}:{'' if fresh else observed_head}",
         "origin",
         f"{local_oid}:refs/heads/{branch}",
         check=False,
@@ -377,9 +413,9 @@ def push_owned_pr_conflict_recovery(
         normalized = pushed.stdout.casefold()
         if any(
             marker in normalized
-            for marker in ("stale info", "fetch first", "rejected", "lease")
+            for marker in ("stale info", "fetch first", "non-fast-forward")
         ):
-            raise PublicationSafetyError(
+            raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE,
                 "기존 PR branch lease가 거부되어 원격 변경을 덮어쓰지 않았습니다:\n"
                 + pushed.stdout[-8000:]
             )

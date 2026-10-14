@@ -1,7 +1,7 @@
 """execution execution ports boundaries and named composition effects."""
 from __future__ import annotations
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from loop_manager_internal.agents.agent_invocation import AgentResultKind
 from loop_manager_internal.agents.scope_contracts import AgentScopeError
 from loop_manager_internal.application.contracts import ExecPlanMetadataError
@@ -161,6 +161,7 @@ class ExecutionLifecyclePortsEffects:
     git_bytes: Callable[..., bytes] | None = None
     pre_review_identity: Callable[..., object] | None = None
     validate_provider_runtime: Callable[..., object] | None = None
+    remote_integration_effects: Callable[..., object] | None = None
     _specification_input_fingerprint: Callable[..., object] | None = None
     plan_declarations: Callable[..., object] | None = None
     _is_requirement_archive_only_change: Callable[..., object] | None = None
@@ -200,6 +201,16 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
                                                              verified_plan_declarations=True)))
     verify_timeout_seconds = identity.pop("verify_timeout_seconds", 600)
     state = _ExecutionStatePort(connection, runtime_repository, identity["repo"])
+    lookup_pr = dependencies.pr_for_branch
+    def execution_pr(repo_path, branch, url=None):
+        from loop_manager_internal.recovery.deleted_branch_restart import current_pr
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        pr = lookup_pr(repo_path, branch, url) if url else lookup_pr(repo_path, branch)
+        plan = state.active_execplan(identity['repo'])
+        if plan is not None and plan['branch'] == branch:
+            pr = current_pr(ExecutionCheckpointRepository(connection).get(identity['repo'], str(plan['plan_id'])), pr)
+        return pr
+    dependencies = replace(dependencies, pr_for_branch=execution_pr)
     from loop_manager_internal.execution.manual_candidate import ManualCandidate, MANUAL_TEST_EVIDENCE
     from loop_manager_internal.verification.coordination import settings as verify_execution_settings
     verify_settings = verify_execution_settings.get()
@@ -259,11 +270,21 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
     )
     from loop_manager_internal.execution.execution_session import ExecutionIdentity
     document_identity = ExecutionIdentity(**identity)
+    def reconcile_remote(context, remote, pull_request):
+        from loop_manager_internal.recovery import work_branch_integration
+        if manual.enabled():
+            return False
+        plan = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
+            (identity['repo'], context.plan.plan_id)).fetchone()
+        return work_branch_integration.synchronize(dependencies.remote_integration_effects(),
+            connection, identity['repo_path'], identity['state_dir'], identity['repo'],
+            plan, remote, pull_request)
     effects = execution_handlers.ExecutionEffects(
         state=state,
         checkpoint=execution_checkpoint_state.ExecutionCheckpointRepository(connection),
         contract=ExecutionContract(AgentResultKind=AgentResultKind, AgentScopeError=AgentScopeError, ExecPlanMetadataError=ExecPlanMetadataError, GitLockError=GitLockError, MAX_REVIEWER_PROTOCOL_ATTEMPTS=MAX_REVIEWER_PROTOCOL_ATTEMPTS, MAX_VALIDATION_FINGERPRINT_REPEATS=MAX_VALIDATION_FINGERPRINT_REPEATS, PROJECT_STEP_RETRY=PROJECT_STEP_RETRY, PROJECT_STEP_TRANSIENT_PAUSE=PROJECT_STEP_TRANSIENT_PAUSE, PROJECT_STEP_USAGE_PAUSE=PROJECT_STEP_USAGE_PAUSE, PROJECT_STEP_PLANNING_PENDING=PROJECT_STEP_PLANNING_PENDING, PublicationSafetyError=PublicationSafetyError, REBASE_CONFLICT_PREFIX=REBASE_CONFLICT_PREFIX, REBASE_IN_PROGRESS_ERROR=REBASE_IN_PROGRESS_ERROR, RequirementArchiveCollisionError=RequirementArchiveCollisionError, RequirementArchiveError=RequirementArchiveError, ReviewerProtocolError=ReviewerProtocolError, TRANSIENT_AGENT_ERROR_PREFIX=TRANSIENT_AGENT_ERROR_PREFIX, USAGE_LIMIT_ERROR_PREFIX=USAGE_LIMIT_ERROR_PREFIX, WORKSPACE_OWNED=WORKSPACE_OWNED, WORKSPACE_RESERVED=WORKSPACE_RESERVED, WorkerResultError=WorkerResultError, WorkspaceOwnershipError=WorkspaceOwnershipError, reviewer_targeted_test_reason=targeted_reason, VerifyTerminationUncertain=VerifyTerminationUncertain),
         workspace=execution_handlers.WorkspaceEffects(
+            reconcile_remote=reconcile_remote if dependencies.remote_integration_effects else None,
             is_directory=lambda path: path.is_dir(),
             git=state.bind(dependencies._typed_execution_git, name="git", connected=False, mutates=False),
             git_bytes=dependencies.git_bytes,
@@ -294,7 +315,8 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
                 lambda *args, **kwargs: dependencies.validate_agent_scope(*args, connection=connection, **kwargs),
                 name="validate_agent_scope", connected=False, mutates=False),
             validate_worker_workspace_scope=state.bind(
-                lambda *args, **kwargs: dependencies.validate_worker_workspace_scope(*args, connection=connection, **kwargs),
+                lambda *args, **kwargs: dependencies.validate_worker_workspace_scope(
+                    *args, connection=connection, state_dir=identity['state_dir'], **kwargs),
                 name="validate_worker_workspace_scope", connected=False, mutates=False),
             _worktree_execplan_input_fingerprint=state.bind(dependencies._worktree_execplan_input_fingerprint, name="_worktree_execplan_input_fingerprint", connected=False, mutates=False),
             _revision_execplan_input_fingerprint=state.bind(dependencies._revision_execplan_input_fingerprint, name="_revision_execplan_input_fingerprint", connected=False, mutates=False),

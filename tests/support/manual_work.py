@@ -26,7 +26,9 @@ def generated(title, source='docs/requirements/Active.md', depends_on=(), identi
 class ManualWorkFixture(WorkspaceFixture):
     def fixture(self, directory):
         repo,state,connection,plan,sha,branch,worktree=self._ready_execplan(directory)
-        connection.execute('UPDATE projects SET registered=1 WHERE repo=?',(str(repo),))
+        from tests.support.git import local_github_origin
+        origin = local_github_origin(self, repo)
+        connection.execute('UPDATE projects SET registered=1, origin=? WHERE repo=?',(origin, str(repo)))
         connection.commit()
         config_path=Path(directory)/'operational-config.ini'
         config_path.write_text('[loop]\nmax_workers=3\nverify_timeout_seconds=600\n'

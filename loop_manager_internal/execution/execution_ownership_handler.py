@@ -40,7 +40,31 @@ class OwnershipHandler:
         self, context, row, remote_oid, current, pull_request=None,
         *, rebase_observation=None,
     ):
-        """Require the published checkpoint's durable owner on an active resume."""
+        """검증한 현재 작업 입력과 과거 게시 영수증을 분리한다."""
+        pending_push = current is not None and current.operation == 'push' and current.expected_head == remote_oid
+        if current and remote_oid and (pending_push or remote_oid in (
+                (current.snapshot or {}).get('accepted_work_branch'),
+                (current.snapshot or {}).get('pending_work_branch_input'))):
+            self.ports.validate_execplan_workspace_identity(
+                self.ports.identity.state_dir, self.ports.identity.repo, context.plan.plan_id,
+                context.branch, context.worktree)
+            self.ports.validate_managed_worktree(
+                self.ports.identity.repo_path, context.worktree, context.branch,
+                allow_rebase=current.operation == 'rebase')
+            if pending_push and self.ports.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip() != remote_oid:
+                return False
+            if pull_request and ((row['pr_url'] and pull_request.get('url') != row['pr_url'])
+                    or pull_request.get('headRefName') != context.branch
+                    or pull_request.get('headRefOid') != remote_oid):
+                return False
+            try:
+                live = manager_git_journal.live_remote_branch_oid(
+                    self.ports.git, self.ports.identity.repo_path, context.branch)
+            except (RuntimeError, OSError) as error:
+                raise RecoveryFailure(RecoveryReason.PUBLICATION_RETRY, '현재 원격 작업 branch 관측을 재시도합니다.') from error
+            if live != remote_oid:
+                raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '현재 원격 입력이 검증 중 변경됐습니다.')
+            return True
         try:
             checkpoint = self.ports.state.connection.execute(
                 'SELECT * '

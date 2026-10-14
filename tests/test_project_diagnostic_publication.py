@@ -88,7 +88,7 @@ class ProjectDiagnosticPublicationUnitTests(unittest.TestCase):
                 SimpleNamespace(stdout='https://github.com/example/repo.git\n'),
                 SimpleNamespace(stdout='https://github.com/other/repo.git\n')]):
             verdict = adapter._origin_safety_error(request, current)
-        self.assertEqual(verdict.reason_code, 'shared_git_config_mutation')
+        self.assertEqual(verdict.reason_code, 'publication_ownership_uncertain')
 
     def test_remote_observation_rejects_an_unexpected_ref_name(self):
         adapter = loop_manager._BlockedCheckpointAdapter(mock.Mock(), Path('/repo'), Path('/state'), 'repo')

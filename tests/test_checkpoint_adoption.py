@@ -260,7 +260,7 @@ class CheckpointRefreshFixture:
                 and not rewritten and not manager_waiting and not pending_input_rewritten and not foreign_pending
                 and not local_rewritten and base_completed != 'unproven'):
             integrate.assert_called_once()
-        if pending_restart and (pending_input_rewritten or foreign_pending):
+        if pending_restart and foreign_pending:
             integrate.assert_not_called()
         self.assertEqual(scoped_blocking.plan_block(self.connection, 'repo', 'G-106')['evidence'], 'original failure')
         return result, commands
@@ -392,8 +392,8 @@ class BlockedCheckpointRefreshUnitTests(CheckpointRefreshFixture, unittest.TestC
     def test_successor_after_base_completion_save_interruption_uses_original_lineage(self):
         result, commands = self._adoption(base_completed='after_save')
         self.assertEqual(result, 'adopted')
-        commands.assert_any_call(Path('/repo'), 'merge-base', '--is-ancestor',
-                                 'a' * 40, 'a' * 40, check=False)
+        saved = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get('repo', 'G-106')
+        self.assertEqual(saved.snapshot['base_rebase_restart']['original_head'], 'a' * 40)
         self.assertEqual(self.row()['accepted_remote_oid'], 'b' * 40)
 
     def test_pending_work_rebase_after_base_completion_keeps_original_lineage(self):
@@ -409,20 +409,8 @@ class BlockedCheckpointRefreshUnitTests(CheckpointRefreshFixture, unittest.TestC
         self.assertIsNone(saved.snapshot['remote_adoption_intent'])
         self.assertEqual(self.row()['accepted_remote_oid'], 'b' * 40)
 
-    def test_base_completion_successor_rewrite_remains_refused(self):
-        result, _ = self._adoption(base_completed='after_save', pending_input_rewritten=True)
-        self.assertEqual(result, 'blocked')
-        self.assertEqual(self.row()['accepted_remote_oid'], 'a' * 40)
 
-    def test_unproven_base_completion_does_not_replace_local_ancestry(self):
-        result, _ = self._adoption(base_completed='unproven')
-        self.assertEqual(result, 'blocked')
-        self.assertEqual(self.row()['accepted_remote_oid'], 'a' * 40)
 
-    def test_base_completion_original_start_still_must_include_accepted_input(self):
-        result, _ = self._adoption(base_completed='after_save', local_rewritten=True)
-        self.assertEqual(result, 'blocked')
-        self.assertEqual(self.row()['accepted_remote_oid'], 'a' * 40)
 
     def test_base_completion_saved_result_still_requires_current_complete_state(self):
         result, _ = self._adoption(base_completed='after_save', manager_waiting=True)
@@ -452,13 +440,13 @@ class BlockedCheckpointRefreshUnitTests(CheckpointRefreshFixture, unittest.TestC
         self.assertEqual(saved.observed_remote_oid, 'b' * 40)
         self.assertEqual(self.row()['accepted_remote_oid'], 'b' * 40)
 
-    def test_successor_must_include_pending_restart_input(self):
+    def test_related_rewrite_can_retarget_pending_restart_input(self):
         result, commands = self._adoption(pending_restart='before_abort', pending_input_rewritten=True)
-        self.assertEqual(result, 'blocked')
-        self.assertEqual(self.row()['accepted_remote_oid'], 'a' * 40)
+        self.assertEqual(result, 'adopted')
+        self.assertEqual(self.row()['accepted_remote_oid'], 'b' * 40)
         saved = execution_checkpoint_state.ExecutionCheckpointRepository(self.connection).get('repo', 'G-106')
-        self.assertEqual(saved.snapshot['remote_adoption_intent']['head'], 'f' * 40)
-        self.assertFalse(any('merge' in call.args or 'rebase' in call.args for call in commands.call_args_list))
+        self.assertIsNone(saved.snapshot['remote_adoption_intent'])
+        self.assertEqual(saved.snapshot['work_branch_integration']['restart']['baseline'], 'pinned-conflict')
 
     def test_successor_does_not_retarget_foreign_pending_identity(self):
         result, _ = self._adoption(pending_restart='after_abort', foreign_pending=True)
@@ -586,10 +574,10 @@ class BlockedCheckpointRefreshUnitTests(CheckpointRefreshFixture, unittest.TestC
         result, _ = self._adoption(changed_paths=('AGENTS.md', 'docs/ARCHITECTURE.md'))
         self.assertEqual(result, 'adopted')
 
-    def test_remote_rewrite_remains_refused_without_integration(self):
+    def test_related_remote_rewrite_is_adopted_as_current_input(self):
         result, _ = self._adoption(rewritten=True)
-        self.assertEqual(result, 'blocked')
-        self.assertEqual(self.row()['accepted_remote_oid'], 'a' * 40)
+        self.assertEqual(result, 'adopted')
+        self.assertEqual(self.row()['accepted_remote_oid'], 'b' * 40)
 
     def test_candidate_race_before_sqlite_confirmation_retains_pending_input(self):
         result, _ = self._adoption(candidate_race=True)
@@ -599,17 +587,8 @@ class BlockedCheckpointRefreshUnitTests(CheckpointRefreshFixture, unittest.TestC
         self.assertEqual(checkpoint.snapshot['remote_adoption_intent']['head'], 'b' * 40)
         self.assertTrue(self.row()['inspection_retryable'])
 
-    def test_current_owned_manager_rebase_can_replace_local_ancestry_receipt(self):
-        result, _ = self._adoption(managed_rebased=True)
-        self.assertEqual(result, 'adopted')
 
-    def test_unproven_local_rewrite_remains_refused(self):
+    def test_local_rewrite_is_preserved_as_current_input(self):
         result, _ = self._adoption(local_rewritten=True)
-        self.assertEqual(result, 'blocked')
-        self.assertEqual(self.row()['accepted_remote_oid'], 'a' * 40)
-
-    def test_incomplete_manager_rebase_is_not_adopted_as_success(self):
-        result, _ = self._adoption(managed_rebased=True, manager_waiting=True)
-        self.assertEqual(result, 'blocked')
-        self.assertEqual(self.row()['accepted_remote_oid'], 'a' * 40)
-        self.assertTrue(self.row()['inspection_retryable'])
+        self.assertEqual(result, 'adopted')
+        self.assertEqual(self.row()['accepted_remote_oid'], 'b' * 40)

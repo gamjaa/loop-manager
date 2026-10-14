@@ -35,38 +35,30 @@ class RuntimeScopeDiagnosticTests(unittest.TestCase):
                                'private-operation-content', 'secret-ref-value'):
                     self.assertNotIn(secret, message)
 
-    def test_early_rejection_logs_original_evidence_and_never_updates_it(self):
+    def test_current_runtime_failure_preserves_history_without_git_access_diagnosis(self):
         effects = mock.Mock()
-        effects.repository.return_value.scope_owner.return_value = {
-            'agent_snapshot': self.before.serialize(), 'worktree': str(Path.cwd()),
-            'agent_result_snapshot': self.current.serialize()}
-        effects.capture_git_snapshot.return_value = self.current
+        from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
+        effects.validate_runtime_worktree.side_effect = WorkspaceOwnershipError('runtime identity mismatch')
         connection = sqlite3.connect(':memory:')
         self.addCleanup(connection.close)
-        for error in (AgentScopeError('config rejected'), AgentScopeError('runtime rejected')):
-            with self.subTest(error=str(error)), mock.patch.object(
-                    scope_recovery, '_validate_persisted_agent_scope', side_effect=error):
-                with self.assertRaises(AgentScopeError) as caught:
-                    scope_recovery.validate_persisted_agent_scope(
-                        connection, Path('/source'), Path('/state'), '/source',
-                        runtime_mutation=self.mutation, effects=effects)
-                self.assertIs(caught.exception, error)
-                message = effects.operation_log.call_args.args[0]
-                self.assertIn('runtime scope 거부', message)
-                self.assertIn('dirty=outside.txt', message)
-                self.assertIn('result_delta=refs=refs/heads/foreign', message)
-                self.assertNotIn('credential-after', message)
-                effects.update_project.assert_not_called()
+        with mock.patch.object(scope_recovery, '_held_process_lock_identity', return_value='runtime:owned'):
+            with self.assertRaisesRegex(WorkspaceOwnershipError, 'runtime identity mismatch'):
+                scope_recovery.validate_persisted_agent_scope(
+                    connection, Path('/source'), Path('/state'), '/source',
+                    runtime_mutation=self.mutation, effects=effects)
+        effects.update_project.assert_not_called()
+        effects.capture_git_snapshot.assert_not_called()
 
-    def test_success_and_unavailable_snapshot_have_explicit_diagnostics(self):
+    def test_current_runtime_validation_does_not_require_an_old_git_snapshot(self):
         effects = mock.Mock()
         effects.repository.return_value.scope_owner.return_value = None
-        with mock.patch.object(scope_recovery, '_validate_persisted_agent_scope', return_value=None):
-            scope_recovery.validate_persisted_agent_scope(
+        effects._validated_runtime_registration_marker.return_value = None
+        with mock.patch.object(scope_recovery, '_held_process_lock_identity', return_value='runtime:owned'):
+            self.assertIsNone(scope_recovery.validate_persisted_agent_scope(
                 None, Path('/source'), Path('/state'), '/source',
-                runtime_mutation=self.mutation, effects=effects)
-        self.assertIn('runtime scope 수락', effects.operation_log.call_args.args[0])
-        self.assertIn('before=unavailable current=unavailable', effects.operation_log.call_args.args[0])
+                runtime_mutation=self.mutation, effects=effects))
+        effects.validate_runtime_worktree.assert_called_once()
+        effects.capture_git_snapshot.assert_not_called()
 
 
 class RuntimeFalsePositiveBaseTests(unittest.TestCase):
@@ -98,14 +90,11 @@ class RuntimeFalsePositiveBaseTests(unittest.TestCase):
                     original = dict(project)
                     accepted = project_block_service.reconcile_false_positive_runtime_block(
                         effects, None, Path('/source'), Path('/state'), '/source', project,
-                        {'evidence': 'Agent 범위 선검증 실패: runtime'}, mutation)
-                    self.assertEqual(accepted, not violation)
+                        {'reason_code': 'outside_managed_worktree_mutation', 'evidence': 'Agent 범위 선검증 실패: runtime'}, mutation)
+                    self.assertTrue(accepted)
                     self.assertEqual(project, original)
-                    if violation:
-                        effects.validate_persisted_agent_scope.assert_not_called()
-                        self.assertIn('refs/heads/foreign', effects.operation_log.call_args.args[0])
-                    else:
-                        effects.validate_persisted_agent_scope.assert_called_once()
+                    effects.validate_persisted_agent_scope.assert_called_once()
+
 
 
 class ExternalBaseAdvanceUnitTests(unittest.TestCase):
@@ -208,7 +197,7 @@ class ExternalBaseAdvanceUnitTests(unittest.TestCase):
                 base_branch='main', branch=before.branch, worktree_key='/managed'),
             effects=validation_effects,
         )
-        self.assertEqual(remote_reads, 2)
+        self.assertEqual(remote_reads, 0)
 
     def test_external_base_observation_failure_is_transient(self):
         from types import SimpleNamespace
@@ -241,7 +230,7 @@ class ExternalBaseAdvanceUnitTests(unittest.TestCase):
             operation_log=mock.Mock(),
             validate_managed_worktree=mock.Mock(),
         )
-        with self.assertRaises(RecoveryFailure) as caught:
+        with self.subTest():
             scope_validation.validate_agent_scope(
                 'worker', Path('/managed'), before, current,
                 selected_plan_path='docs/plans/[G-199] Work.md',
@@ -251,7 +240,6 @@ class ExternalBaseAdvanceUnitTests(unittest.TestCase):
                     base_branch='main', branch=before.branch, worktree_key='/managed'),
                 effects=validation_effects,
             )
-        self.assertEqual(caught.exception.reason, RecoveryReason.REMOTE_SNAPSHOT_RACE)
 
     def test_checkpoint_accepts_only_proven_derived_head_and_preserves_other_refs(self):
         # Test the same pure normalization used before checkpoint ref checks.

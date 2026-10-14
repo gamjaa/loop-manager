@@ -281,6 +281,8 @@ def register(assembly: Composition) -> None:
     assembly.bind('validate_worker_workspace_scope', scope_adapter.validate_worker_workspace_scope,
         lambda: scope_adapter.ValidateWorkerWorkspaceScopeEffects(
             capture_git_snapshot=assembly.callback('capture_git_snapshot'),
+            _owned_rebase_state_dir=assembly.callback('_owned_rebase_state_dir'),
+            _current_rebase_service=assembly.callback('_current_rebase_service'),
             validate_active_execplan_metadata=assembly.callback('validate_active_execplan_metadata'),
             validate_agent_scope=assembly.callback('validate_agent_scope'),
             validate_managed_worktree=assembly.callback('validate_managed_worktree'),

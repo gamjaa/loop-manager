@@ -208,6 +208,7 @@ class ExecuteRuntimeCommandEffects:
     run_registered_projects: Callable[..., object]
     run_project_result: Callable[..., object]
     manual_command: Callable[..., object] | None = None
+    reset_command: Callable[..., object] | None = None
 
 
 def _local_recovery_causes_remain(after: dict, plan_id: str | None) -> bool:
@@ -440,12 +441,46 @@ class LocalEnvironmentRecoveryCommandEffects:
     run_project_result: Callable[..., object]
 
 
+@dataclass(frozen=True)
+class ResetDeletedBranchEffects:
+    connect_database: Callable[..., object]
+    remote_integration_effects: Callable[..., object]
+    pr_for_branch: Callable[..., object]
+    complete_merged_execplan_worktree: Callable[..., object]
+    unmet_execplan_dependencies: Callable[..., object]
+    operation_print: Callable[..., object]
+
+
+def reset_deleted_branch(effects: ResetDeletedBranchEffects, args, state_dir):
+    from loop_manager_internal.recovery import deleted_branch_restart
+    repo_path = Path(args.repository).expanduser().resolve()
+    with closing(effects.connect_database(state_dir)) as connection:
+        from loop_manager_internal.runtime.resource_lock import resource_locks
+        plan = connection.execute('SELECT branch, worktree FROM exec_plans WHERE repo=? AND plan_id=?',
+                                  (str(repo_path), args.plan_id)).fetchone()
+        resources = ['plan:' + args.plan_id]
+        if plan:
+            resources.extend(('branch:' + str(plan['branch']), 'worktree:' + str(plan['worktree'])))
+        with resource_locks(state_dir, str(repo_path), resources, owner='reset-deleted-branch'):
+            result = deleted_branch_restart.restart(effects.remote_integration_effects(), connection,
+                repo_path, state_dir, str(repo_path), args.plan_id,
+                complete_merged=effects.complete_merged_execplan_worktree,
+                unmet_dependencies=effects.unmet_execplan_dependencies, lookup_pr=effects.pr_for_branch)
+        connection.commit()
+    effects.operation_print(result)
+    return 0
+
+
 def execute_runtime_command(
     effects: ExecuteRuntimeCommandEffects, args: argparse.Namespace,
     state_dir: Path,
     config_path: Path,
     runtime_mutation: RuntimeMutation | None = None,
 ) -> int:
+    if args.command == 'reset':
+        if effects.reset_command is None:
+            raise RuntimeError('삭제 작업 재시작 composition이 없습니다.')
+        return effects.reset_command(args, state_dir)
     if args.command == "recover":
         return recover_local_environment(
             LocalEnvironmentRecoveryCommandEffects(

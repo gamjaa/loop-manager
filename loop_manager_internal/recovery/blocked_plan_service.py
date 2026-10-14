@@ -162,7 +162,8 @@ def _record_blocked_resume_head(
         expected_head=current.expected_head if active_rebase else after_head or before_head,
         target_base_oid=target_base_oid,
         observed_remote_oid=published_oid,
-        snapshot={**(current.snapshot or {}), 'blocked_resume': marker},
+        snapshot={**(current.snapshot or {}), 'blocked_resume': marker,
+                  'accepted_work_branch': published_oid},
     )
 
 
@@ -287,7 +288,7 @@ def resume_blocked_execplan_if_inputs_changed(
         checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
             repo, scope_block['plan_id'])
         recovery = recovery_state.RecoveryRepository(connection).row(repo, scope_block['plan_id'])
-        if rebase_block_reconciliation.block_matches(scope_block, recovery, checkpoint):
+        if checkpoint.operation == 'rebase':
             return effects._reconcile_rebase_evidence_block(
                 connection, repo_path, state_dir, repo, scope_block, plan_block=True)
         if effects._reconcile_scope_baseline_plan_block(connection, repo_path, state_dir, repo, scope_block):
@@ -324,6 +325,8 @@ def resume_blocked_execplan_if_inputs_changed(
         plan_id=plan_id,
     )
     if plan is None:
+        return False
+    if plan['blocked_reason'] == BlockReasonCode.REMOTE_BRANCH_DELETED.value:
         return False
     if plan_id is not None:
         effects.hydrate_execplan_project(connection, repo, plan)

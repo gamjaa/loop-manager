@@ -145,8 +145,8 @@ def assess_safety(observation: SafetyObservation) -> SafetyVerdict:
         return SafetyVerdict(
             False,
             SafetyScope.PROJECT,
-            "shared_ref_mutation",
-            "공유 ref 또는 외부 worktree 상태의 소유권을 증명할 수 없습니다.",
+            "workspace_ownership_uncertain",
+            "현재 작업 branch와 ref·worktree 등록 연결을 확인할 수 없습니다.",
             observation.head_oid,
             (),
         )
@@ -337,7 +337,6 @@ def push_failure_retryable(output: str) -> bool:
     return not any(marker in normalized for marker in (
         'protected branch', 'permission denied', 'not permitted',
         'authentication failed', 'authorization failed', 'http 403',
-        'stale info', 'fetch first', 'non-fast-forward',
     ))
 
 

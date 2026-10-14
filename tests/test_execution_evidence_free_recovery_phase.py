@@ -354,7 +354,7 @@ class EvidenceFreeRecoveryLifecycleTests(TestCase):
         # Coordinator runs guard before dispatching the saved PUBLISHING phase.
         result = self.coordinator.dispatch(self.handler._context())
         self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
-        self.assertEqual(self.state.row()['phase'], 'WORKING')
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
         self.effects.agent.run_agent.assert_not_called()
         self.effects.validation.verify.assert_not_called()
         self.effects.publication.push_managed_publication_branch.assert_not_called()

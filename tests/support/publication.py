@@ -128,11 +128,13 @@ class PublicationFixture:
         connection = sqlite3.connect(":memory:")
         close_connection = register_connection_cleanup(self, connection)
         try:
+            from tests.support.git import local_github_origin
+            origin = local_github_origin(self, repo, read_git=git_command)
             connection.row_factory = sqlite3.Row
             connection.execute(loop_manager.SCHEMA)
             connection.execute(
-                "INSERT INTO projects (repo, base_branch) VALUES (?, 'main')",
-                (str(repo),),
+                "INSERT INTO projects (repo, base_branch, origin) VALUES (?, 'main', ?)",
+                (str(repo), origin),
             )
             connection.commit()
             relative_plan = plan.relative_to(repo).as_posix()
