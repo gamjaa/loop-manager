@@ -4,6 +4,7 @@ import sqlite3
 import stat
 import tempfile
 import hashlib
+import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -956,6 +957,64 @@ class CommonGuidanceInvocationTests(TestCase):
 
 class ProcessStartNotificationTests(TestCase):
     setUp = RunnerTests.setUp
+
+    def test_planner_check_physical_start_consumes_confirmed_planning_block(self):
+        from loop_manager_internal.notifications import notifications
+        self.connection.execute(manager.SCHEMA)
+        manager._ensure_execplans_schema(self.connection)
+        notifications.ensure_schema(self.connection)
+        notifications.configure_session(self.connection, enabled=True)
+        self.connection.execute("INSERT INTO projects (repo, base_branch) VALUES ('repo', 'main')")
+        self.connection.execute(
+            "UPDATE projects SET agent_role = 'planner_check', agent_snapshot = ?, worktree = ? WHERE repo = 'repo'",
+            (manager.GitSnapshot('head', None, {}, {}, {}, {}, {}, {}, scope_id='planning-scope').serialize(),
+             str(Path('/worktree').resolve())),
+        )
+        self.connection.commit()
+        manager.update_project(self.connection, 'repo', planning_error='original planning cause')
+        self.connection.execute(
+            "UPDATE notification_outbox SET sent_at = CURRENT_TIMESTAMP, "
+            "confirmed_pieces = 1 WHERE event_type = 'blocked'"
+        )
+        manager.update_project(self.connection, 'repo', planning_error=None)
+
+        outer = self
+        class Provider:
+            def run(self, request):
+                outer.assertEqual(request.role_name, 'planner_check')
+                outer.assertTrue(request.read_only)
+                outer.assertEqual(outer.connection.execute(
+                    "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'resumed'"
+                ).fetchone()[0], 0)
+                request.on_process_started()
+                outer.assertEqual(outer.connection.execute(
+                    "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'resumed'"
+                ).fetchone()[0], 1)
+                return manager.AgentResult(0, 'checked')
+
+        with mock.patch.object(manager, 'agent_provider', return_value=Provider()):
+            result = manager.run_agent(
+                'codex', Path('/worktree'), self.state_dir, Path('/config'),
+                'planner_check', 'read only check', read_only=True,
+                connection=self.connection,
+                invocation=invocation.InvocationContext('repo', None),
+                resolved_profile=invocation.ResolvedProfile('check-model', 'low'),
+            )
+        self.assertEqual(result.code, 0)
+        resumed = self.connection.execute(
+            "SELECT payload FROM notification_outbox WHERE event_type = 'resumed'"
+        ).fetchone()
+        self.assertEqual(json.loads(resumed[0])['operation'], 'Planner')
+        self.assertEqual(json.loads(resumed[0])['cause'], 'original planning cause')
+        ledger_row = self.connection.execute(
+            "SELECT role, model, effort, scope_id FROM agent_invocations"
+        ).fetchone()
+        self.assertEqual(tuple(ledger_row),
+                         ('planner_check', 'check-model', 'low', 'planning-scope'))
+        self.assertEqual(self.connection.execute(
+            "SELECT COUNT(*) FROM notification_outbox WHERE event_type = 'work_started'"
+        ).fetchone()[0], 0)
+
     def test_process_callback_precedes_work_and_internal_retry_does_not_notify(self):
         from loop_manager_internal.notifications import notifications
         self.connection.execute(manager.SCHEMA)
