@@ -1,5 +1,6 @@
 """Unit coverage of the catalog boundary and archive transaction adoption."""
 import contextlib
+import json
 import stat
 from dataclasses import replace
 from pathlib import Path
@@ -341,6 +342,30 @@ class CatalogCacheAndCasTests(_CatalogRefreshCase):
 
 
 class CatalogArchiveConsumerTests(_CatalogRefreshCase):
+    def test_archive_revalidation_preserves_renamed_requirement_contents(self):
+        source = 'docs/requirements/[R-066] AGENTS 변경 사전 승인.md'
+        renamed = 'docs/requirements/[R-066] Agent CLI 지침의 독립성.md'
+        requirements = {renamed: '# [R-066] Agent CLI 지침의 독립성\n\n변경된 요구사항.\n'}
+        plan_path = 'docs/plans/[G-001] Updated.md'
+        self.documents[plan_path] = self.documents[plan_path].replace(
+            'docs/requirements/change.md', source)
+        self.paths = self.paths - {'docs/requirements/change.md'} | {renamed}
+
+        def pinned(revision):
+            return state.PinnedCatalog(revision, catalog.snapshot_from_documents(
+                self.documents, validate_sources=True, available_regular_paths=self.paths,
+                requirement_documents=requirements, revision_sha=revision), self.paths,
+                requirement_documents=requirements)
+
+        with mock.patch.object(self, 'pinned', side_effect=pinned):
+            self.assertEqual(self.archive(), archive_state.ArchiveWriteResult.APPLIED)
+            self.boundary.refresh()
+        self.assertEqual(self.row('G-002')['path'], 'docs/plans/archive/[G-002] Dependency.md')
+        self.assertEqual(self.row()['sources'], json.dumps([source], ensure_ascii=False))
+        self.assertEqual(self.boundary.pinned.snapshot.active['G-001'].sources, (source,))
+        self.assertIs(self.boundary.pinned.requirement_documents, requirements)
+        self.assertEqual(len(self.loads), 1)
+
     def test_verified_archive_delta_and_audit_are_atomic_without_reread(self):
         self.assertEqual(self.archive(), archive_state.ArchiveWriteResult.APPLIED)
         item = self.archive_repo.item(self.repo, 'G-002')

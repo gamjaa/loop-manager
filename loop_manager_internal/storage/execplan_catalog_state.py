@@ -246,6 +246,7 @@ class PinnedCatalog:
     reserved_intake_ids: frozenset[str] = frozenset()
     draft_changes: Mapping[str, Mapping] | None = None
     requirement_deletions: Mapping[str, Mapping] | None = None
+    requirement_documents: Mapping[str, str | bytes] | None = None
 
 
 def new_declaration_issues(

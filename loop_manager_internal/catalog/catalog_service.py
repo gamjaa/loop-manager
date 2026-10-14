@@ -384,7 +384,7 @@ class _GitCatalogDefinitionPort:
                 remote_url = link.split("/tree/", 1)[0]
         self.loaded = execplan_catalog_state.PinnedCatalog(
             revision_sha, snapshot, frozenset(regular_paths), draft_inputs=draft_inputs,
-            remote_url=remote_url,
+            remote_url=remote_url, requirement_documents=requirement_documents,
         )
         return self.loaded
 
