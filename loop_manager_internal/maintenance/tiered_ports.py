@@ -7,10 +7,44 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import os
+import re
 import sqlite3
 
 from loop_manager_internal.maintenance import code_index, tiered_review
 from loop_manager_internal.storage import maintenance_state
+
+
+def _root_move_plan_covers(path, destination, text):
+    from loop_manager_internal.maintenance import maintenance_planning
+    try:
+        sections = maintenance_planning.markdown_sections(text).values
+    except maintenance_planning.MaintenancePlanningError:
+        return False
+    if any(not sections.get(name, "").strip() for name in
+           ("Purpose", "Acceptance Criteria", "Implementation", "Validation")):
+        return False
+    scope = "\n".join(sections[name] for name in ("Purpose", "Acceptance Criteria", "Implementation"))
+    checks = (
+        path in scope, destination in scope,
+        bool(re.search(r"(?:import|가져오|모듈\s*(?:경로|참조))", scope, re.I)),
+        bool(re.search(r"(?:실행\s*(?:명령|명령어)|launcher|command)", scope, re.I)),
+        bool(re.search(r"(?:빌드|배포|build|deploy)", scope, re.I)),
+        bool(re.search(r"(?:설정\s*(?:탐색|경로|조회)|config(?:uration)?(?:\s*discovery|\s*path))", scope, re.I)),
+        bool(re.search(r"(?:상대\s*경로|relative\s*path)", scope, re.I)),
+        bool(re.search(r"(?:문서\s*링크|링크|documentation\s*link|doc\s*link)", scope, re.I)),
+        bool(re.search(r"(?:보존|preserv)", scope, re.I)),
+        bool(re.search(r"(?:사용자\s*동작|user\s*behavio)", scope, re.I)),
+        bool(re.search(r"(?:공개\s*(?:계약|API)|public\s*(?:contract|API))", scope, re.I)),
+        bool(re.search(r"(?:저장\s*형식|storage\s*format)", scope, re.I)),
+    )
+    validation = sections["Validation"]
+    checks += (
+        bool(re.search(r"targeted", validation, re.I)),
+        bool(re.search(r"(?:전체\s*verify|full\s*verify)", validation, re.I)),
+        bool(re.search(r"(?:읽기\s*전용.{0,40}(?:Review|검토)|read.only.{0,40}review)",
+                       validation, re.I)),
+    )
+    return all(checks)
 
 
 class TieredMaintenancePort:
@@ -42,7 +76,8 @@ class TieredMaintenancePort:
     def prepare(self, run, selection=None):
         context, cycle = run.context, run.maintenance_cycle
         active = self.repository.active(context.repo, cycle.revision, str(run.row.active_sha))
-        if active is not None and active.get("analysis_version", 1) == code_index.VERSION:
+        if (active is not None and active.get("analysis_version", 1) == code_index.VERSION
+                and {"base", "root_source", "root_placements", "root_reviews", "root_classifications"} <= active.keys()):
             return active
         selection = selection or self.select(context, str(run.row.active_sha))
         if not selection.required:
@@ -90,16 +125,26 @@ class TieredMaintenancePort:
         payload = {"kind": "static_context_and_semantic_receipts", "source_revision": assessment["source_revision"],
                    "mode": assessment["mode"], "roots": assessment["roots"], "reasons": assessment["reasons"]}
         if unit:
-            payload.update(digest=unit["digest"], parts=unit["parts"], legacy_context=self._legacy_context(run, unit))
-            payload["project_modules"] = sorted({code_index.module_group(path) for path in assessment["records"]})
+            payload.update(digest=unit["digest"], legacy_context=self._legacy_context(run, unit))
+            if unit.get("kind") == "root_placement":
+                payload.update(kind="root_placement_review", source=unit["source"],
+                               placements=unit["placements"])
+            else:
+                payload["parts"] = unit["parts"]
+                payload["project_modules"] = sorted({code_index.module_group(path) for path in assessment["records"]})
         else:
-            payload["assessment"] = self.repository.evidence(run.context.repo, assessment["cycle"], assessment["source_revision"])
+            evidence = self.repository.evidence(run.context.repo, assessment["cycle"], assessment["source_revision"])
+            from loop_manager_internal.storage.maintenance_file_ledger import root_move_candidates
+            payload["root_move_candidates"] = root_move_candidates(evidence["root_reviews"])
+            payload["assessment"] = evidence
         # No operational sessions or SQLite state are exported to Agents.
         target.write_text(code_index.encode(payload) + "\n", encoding="utf-8")
         return target
 
     def _legacy_context(self, run, unit):
         """Prior source-validated judgments are context, not fabricated new receipts."""
+        if unit.get("kind") == "root_placement":
+            return {}
         records = {path: record for part in unit["parts"] for path, record in part["records"].items()}
         result = {}
         for row in self.connection.execute("SELECT path, content_hash, mode, result_json FROM provisional_file_reviews "
@@ -123,45 +168,89 @@ class TieredMaintenancePort:
         if evidence is None:
             raise tiered_review.TieredReviewError("정밀 근거가 없습니다.")
         findings = [finding for receipt in evidence["receipts"] for finding in receipt["findings"]]
-        # The final Planner must explain how each candidate was disposed of; it
-        # may reject a candidate, link an existing plan, or link a newly validated plan.
-        if findings:
+        from loop_manager_internal.storage.maintenance_file_ledger import root_move_candidates, root_review_hash
+        root_candidates = root_move_candidates(evidence["root_reviews"])
+        dispositions_scope = [*findings, *(
+            {"path": path, "excerpt": item["reason"], "reason": item["reason"],
+             "destination": item["destination"], "root_review_hash": root_review_hash(item),
+             "root_move": True}
+            for path, item in sorted(root_candidates.items())
+        )]
+        # The final Planner must link root move candidates to a preservation plan;
+        # module findings retain their existing reject/existing/new dispositions.
+        if dispositions_scope:
             from loop_manager_internal.maintenance.maintenance_orchestration import MaintenanceOutcome
             try:
                 dispositions = tagged_json(str(run.row.planning_result or ""), "MODULE_FINDINGS_RESULT")
             except (ValueError, RecursionError) as error:
-                raise tiered_review.TieredReviewError("모듈 발견 처리 결과 JSON이 잘못됐습니다.") from error
-            if not isinstance(dispositions, list) or len(dispositions) != len(findings):
-                raise tiered_review.TieredReviewError("모듈 발견의 처리 결과가 누락됐습니다.")
+                raise tiered_review.TieredReviewError("모듈·루트 후보 처리 결과 JSON이 잘못됐습니다.") from error
+            if not isinstance(dispositions, list) or len(dispositions) != len(dispositions_scope):
+                raise tiered_review.TieredReviewError("모듈 발견 또는 루트 이동 후보 처리가 누락됐습니다.")
             known = {str(row["plan_id"]): (str(row["status"]), str(row["path"])) for row in self.connection.execute(
                 "SELECT plan_id, status, path FROM exec_plans WHERE repo = ?", (run.context.repo,))}
             def relates(plan_id, index, existing):
+                if not isinstance(plan_id, str):
+                    return None
                 if existing:
+                    if plan_id not in known:
+                        return None
                     path = run.planning_worktree / known[plan_id][1]
                 else:
                     candidates = [path for path in (run.planning_worktree / "docs/plans").iterdir()
                                   if path.name.startswith("[" + str(plan_id) + "] ") and path.suffix == ".md"]
                     if len(candidates) != 1:
-                        return False
+                        return None
                     path = candidates[0]
-                return not path.is_symlink() and findings[index]["path"] in path.read_text(encoding="utf-8")
+                root = run.planning_worktree.resolve()
+                if (path.is_symlink() or not path.resolve().is_relative_to(root)
+                        or any(parent.is_symlink() for parent in path.parents if parent != root)
+                        or not path.is_file()):
+                    return None
+                try:
+                    text = path.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError) as error:
+                    raise tiered_review.TieredReviewError("연결할 계획을 UTF-8 원본으로 읽을 수 없습니다.") from error
+                finding = dispositions_scope[index]
+                if finding.get("root_move"):
+                    if (not _root_move_plan_covers(finding["path"], finding["destination"], text)
+                            or existing and known[plan_id][0] in {"MERGED", "CANCELLED"}):
+                        return None
+                elif finding["path"] not in text:
+                    return None
+                return (path, text)
+
+            root_links = []
             for index, item in enumerate(dispositions):
                 if not isinstance(item, dict) or set(item) != {"index", "status", "plan_id", "reason"} or type(item["index"]) is not int or item["index"] != index:
-                    raise tiered_review.TieredReviewError("모듈 발견 처리 identity가 다릅니다.")
+                    raise tiered_review.TieredReviewError("모듈·루트 후보 처리 identity가 다릅니다.")
                 tiered_review._note(item["reason"])
                 status, plan_id = item["status"], item["plan_id"]
                 if not isinstance(status, str) or (plan_id is not None and not isinstance(plan_id, str)):
-                    raise tiered_review.TieredReviewError("모듈 발견 처리 상태·계획 ID 형식이 다릅니다.")
-                if status == "rejected" and plan_id is None:
+                    raise tiered_review.TieredReviewError("모듈·루트 후보 처리 상태·계획 ID 형식이 다릅니다.")
+                finding = dispositions_scope[index]
+                is_root = bool(finding.get("root_move"))
+                if status == "rejected" and plan_id is None and not is_root:
                     continue
-                if status == "new_plan" and plan_id in decision.plan_ids and relates(plan_id, index, False):
-                    continue
-                if status == "existing_plan" and plan_id in known and known[plan_id][0] != "MERGED" and relates(plan_id, index, True):
-                    continue
-                raise tiered_review.TieredReviewError("모듈 발견이 유효한 처리나 계획에 연결되지 않았습니다.")
+                existing = status == "existing_plan"
+                linked = relates(plan_id, index, existing) if (
+                    (status == "new_plan" and plan_id in decision.plan_ids)
+                    or (existing and plan_id in known and known[plan_id][0] != "MERGED")
+                ) else None
+                if linked is None:
+                    raise tiered_review.TieredReviewError("모듈 발견 또는 루트 후보가 유효한 계획에 연결되지 않았습니다.")
+                if is_root:
+                    path, text = linked
+                    root_links.append({"path": finding["path"], "destination": finding["destination"],
+                        "root_review_hash": finding["root_review_hash"], "status": status,
+                        "plan_id": plan_id, "plan_path": path.relative_to(run.planning_worktree).as_posix(),
+                        "plan_hash": tiered_review.plan_content_hash(path.read_bytes()),
+                        "reason": item["reason"]})
             new_ids = {item["plan_id"] for item in dispositions if item["status"] == "new_plan"}
             if new_ids != (set(decision.plan_ids) if decision.outcome is MaintenanceOutcome.REFACTORING else set()):
                 raise tiered_review.TieredReviewError("새 리팩터링 계획과 모듈 발견 연결이 다릅니다.")
+            if root_candidates:
+                self.repository.record_root_plan_links(run.context.repo, run.maintenance_cycle.revision,
+                    str(run.row.active_sha), root_links, plan_repository=run.planning_worktree)
             return tuple(sorted({item["plan_id"] for item in dispositions if item["status"] == "existing_plan"}))
         elif decision.plan_ids:
             from loop_manager_internal.maintenance.maintenance_orchestration import MaintenanceOutcome

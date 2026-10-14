@@ -182,6 +182,91 @@ class TieredAssessmentTest(PlanningCase):
         self.assertEqual(self.ports.tiered.repository.evidence("/repo", 1, self.sha)["receipts"], [])
         self.ports.agent.run_planner.assert_not_called()
 
+    def test_confirmed_root_move_candidate_prevents_no_change_and_enters_plan_context(self):
+        root = {"path": "notes.md", "category": "internal_implementation",
+            "destination": "docs/notes.md", "reason": "Move confirmed internal notes to their safe destination.",
+            "references": [{"path": "notes.md", "excerpt": "internal notes content"}],
+            "user_path": "This file is not a user entry point.",
+            "ownership": "The application module owns this internal note."}
+        self.ports.tiered.repository.evidence = mock.Mock(return_value={
+            "receipts": [], "root_reviews": [root], "root_plan_links": None,
+        })
+        self.ports.tiered.prepare = mock.Mock(return_value={
+            "mode": "fast", "source_revision": self.sha, "cycle": 1,
+            "digest": "d" * 64, "records": {}, "roots": [], "reasons": [], "root_reviews": [root],
+        })
+        self.ports.tiered.repository.pending = mock.Mock(return_value=None)
+        self.ports.tiered.repository.units = mock.Mock(return_value=())
+        outcome, context = tiered_assessment.prepare_turn(
+            self.ports, self.run, self.run.planning_worktree,
+        )
+        self.assertIsNone(outcome)
+        manifest = Path(context.split("manifest: ", 1)[1].strip())
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertEqual(payload["root_move_candidates"]["notes.md"]["destination"], "docs/notes.md")
+        self.assertIn("읽기 전용 Review", context)
+
+    def test_root_move_plan_requires_location_and_regression_contracts(self):
+        from loop_manager_internal.maintenance.tiered_ports import _root_move_plan_covers
+
+        text = """## Purpose
+Move root notes.md to docs/notes.md while preserving user behavior, the public contract, and storage format.
+
+## Acceptance Criteria
+The plan moves notes.md to docs/notes.md and preserves import paths, execution commands, build and deploy, configuration discovery, relative paths, and documentation links.
+
+## Implementation
+Update references from notes.md to docs/notes.md, including import users and config discovery.
+
+## Validation
+Run the targeted unit test, the full verify, and a read-only Review.
+"""
+        self.assertTrue(_root_move_plan_covers("notes.md", "docs/notes.md", text))
+        self.assertFalse(_root_move_plan_covers("notes.md", "docs/notes.md", text.replace("full verify", "unit test")))
+        self.assertFalse(_root_move_plan_covers("notes.md", "docs/notes.md", text.replace("docs/notes.md", "docs/other.md")))
+        self.assertEqual(tiered_review.plan_content_hash(b"plan\r\ntext\r\n"),
+                         tiered_review.plan_content_hash(b"plan\ntext\n"))
+
+    def test_root_move_candidate_rejects_cancelled_existing_plan(self):
+        from loop_manager_internal.maintenance.maintenance_orchestration import MaintenancePlannerDecision, MaintenanceOutcome
+
+        root = {"path": "notes.md", "category": "internal_implementation",
+            "destination": "docs/notes.md", "reason": "Move the internal note to its safe destination.",
+            "references": [{"path": "notes.md", "excerpt": "internal notes content"}],
+            "user_path": "This file is not a user entry point.",
+            "ownership": "The application module owns this internal note."}
+        relative = "docs/plans/[G-001] Existing.md"
+        plan = self.run.planning_worktree / relative
+        plan.parent.mkdir(parents=True, exist_ok=True)
+        plan.write_text("""## Purpose
+Move notes.md to docs/notes.md while preserving user behavior, public API contract, and storage format.
+
+## Acceptance Criteria
+Move notes.md to docs/notes.md and preserve imports, execution commands, build and deploy, configuration discovery, relative paths, and documentation links.
+
+## Implementation
+Update imports, commands, build and deploy references, configuration discovery, relative paths, and documentation links while preserving user behavior, public API contract, and storage format.
+
+## Validation
+Run targeted unit tests, full verify, and a read-only Review.
+""", encoding="utf-8")
+        self.connection.execute("INSERT INTO exec_plans VALUES (?, ?, ?, ?)",
+                                 ("/repo", "G-001", "CANCELLED", relative))
+        self.ports.tiered.repository.evidence = mock.Mock(return_value={
+            "receipts": [], "root_reviews": [root], "root_plan_links": None,
+        })
+        self.ports.tiered.repository.record_root_plan_links = mock.Mock()
+        disposition = [{"index": 0, "status": "existing_plan", "plan_id": "G-001",
+                        "reason": "This path and preservation plan are connected to the root evidence."}]
+        self.run.row = replace(self.run.row,
+            planning_result="MODULE_FINDINGS_RESULT: " + json.dumps(disposition))
+
+        with self.assertRaises(tiered_review.TieredReviewError):
+            self.ports.tiered.validate_final(
+                self.run, MaintenancePlannerDecision(MaintenanceOutcome.NO_CHANGE),
+            )
+        self.ports.tiered.repository.record_root_plan_links.assert_not_called()
+
     def test_invalid_model_result_is_bounded_and_session_is_preserved(self):
         self.model(output="invalid model output")
         for _ in range(3):

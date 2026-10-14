@@ -44,6 +44,61 @@ class AssessmentEvidence:
     tiered: dict | None = None
 
 
+def _validate_tiered_root_links(tiered: dict) -> tuple[dict, ...]:
+    from loop_manager_internal.maintenance.tiered_review import (
+        _root_move_candidates, _validate_root_plan_links,
+    )
+    reviews = tiered.get("root_reviews")
+    candidates = _root_move_candidates(reviews)
+    links = tiered.get("root_plan_links")
+    if candidates and links is None:
+        raise FileAssessmentPublicationError("루트 이동 후보의 계획 처리 결과가 없습니다.")
+    normalized = _validate_root_plan_links(reviews, links, required=bool(candidates))
+    if links is not None and list(normalized) != links:
+        raise FileAssessmentPublicationError("루트 계획 처리 intent의 순서·identity가 다릅니다.")
+    return normalized
+
+
+def _verify_root_plan_files(repository: Path, tiered: dict, *, revision: str | None = None,
+                            connection: sqlite3.Connection | None = None,
+                            repo_key: str | None = None) -> None:
+    links = _validate_tiered_root_links(tiered)
+    from loop_manager_internal.maintenance.tiered_ports import _root_move_plan_covers
+    from loop_manager_internal.maintenance.maintenance_file_inventory import _git
+    for item in links:
+        if revision is None:
+            target = repository / item["plan_path"]
+            root = repository.resolve()
+            if (target.is_symlink() or not target.resolve().is_relative_to(root)
+                    or any(parent.is_symlink() for parent in target.parents if parent != root)
+                    or not target.is_file()):
+                raise FileAssessmentPublicationError("루트 이동 계획 경로가 안전한 일반 파일이 아닙니다.")
+            try:
+                contents = target.read_bytes()
+            except OSError as error:
+                raise FileAssessmentPublicationError("루트 이동 계획을 publication worktree에서 읽을 수 없습니다.") from error
+        else:
+            try:
+                contents = _git(repository, "show", f"{revision}:{item['plan_path']}")
+            except (ValueError, OSError) as error:
+                raise FileAssessmentPublicationError("게시된 원본에 루트 이동 계획이 없습니다.") from error
+        from loop_manager_internal.maintenance import tiered_review
+        if tiered_review.plan_content_hash(contents) != item["plan_hash"]:
+            raise FileAssessmentPublicationError("루트 이동 계획의 게시 내용이 intent와 다릅니다.")
+        try:
+            plan_text = contents.decode("utf-8")
+        except UnicodeDecodeError as error:
+            raise FileAssessmentPublicationError("루트 이동 계획이 UTF-8 문서가 아닙니다.") from error
+        if not _root_move_plan_covers(item["path"], item["destination"], plan_text):
+            raise FileAssessmentPublicationError("루트 이동 계획의 보존·검증 조건이 부족합니다.")
+        if connection is not None:
+            row = connection.execute("SELECT path, status FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                                     (repo_key or str(repository), item["plan_id"])).fetchone()
+            if (row is None or str(row[0]) != item["plan_path"]
+                    or str(row[1]) in {"MERGED", "CANCELLED"}):
+                raise FileAssessmentPublicationError("루트 이동 계획이 게시 catalog의 비종료 계획과 다릅니다.")
+
+
 def sources_match_remote(
     repository: Path, base_branch: str, revision: str,
     evidence: AssessmentEvidence,
@@ -67,7 +122,8 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
 
 def collect(
     connection: sqlite3.Connection, repo: str, repository: Path,
-    base_branch: str, cycle_revision: int, source_revision: str,
+    base_branch: str, cycle_revision: int, source_revision: str, *,
+    plan_repository: Path | None = None,
 ) -> AssessmentEvidence:
     """Freeze only completed selected reviews and fully reconciled relations."""
     from loop_manager_internal.maintenance import tiered_review
@@ -76,7 +132,9 @@ def collect(
                                        **({"include_uncertain": True} if module_assessment else {}))
     if module_assessment:
         evidence = tiered_review.TieredReviewRepository(connection).evidence(repo, cycle_revision, source_revision)
-        return AssessmentEvidence(inventory, (), (), _merged_count(connection, repo), (), evidence)
+        _verify_root_plan_files(plan_repository or repository, evidence)
+        return AssessmentEvidence(inventory, (), (), _merged_count(connection, repo),
+                                  tuple(evidence["root_reviews"]), evidence)
     reviews = ProvisionalReviewRepository(connection).progress(
         repo, repository, base_branch, cycle_revision, inventory,
     )
@@ -120,13 +178,16 @@ def _merged_count(connection: sqlite3.Connection, repo: str) -> int:
 
 def save_intent(
     connection: sqlite3.Connection, repo: str, cycle_revision: int,
-    source_revision: str, publication_commit: str, evidence: AssessmentEvidence,
+    source_revision: str, publication_commit: str, evidence: AssessmentEvidence, *,
+    plan_repository: Path | None = None,
 ) -> None:
     ensure_schema(connection)
     if evidence.root_reviews is None:
         raise FileAssessmentPublicationError("새 publication에 이전 형식 증거를 사용할 수 없습니다.")
     if evidence.inventory.revision != source_revision:
         raise FileAssessmentPublicationError("평가 증거의 source가 다릅니다.")
+    if evidence.tiered is not None:
+        _verify_root_plan_files(plan_repository or Path(repo), evidence.tiered)
     from loop_manager_internal.storage import maintenance_state
     maintenance_state.MaintenanceRepository(connection)._verified_merged_count(
         repo, source_revision, evidence.merged_count,
@@ -179,13 +240,16 @@ def saved_intent(
         )
         if inventory.revision != source_revision:
             raise FileAssessmentPublicationError("파일 평가 intent의 source가 다릅니다.")
+        tiered = value.get("tiered")
+        if tiered is not None:
+            _validate_tiered_root_links(tiered)
         return AssessmentEvidence(
             inventory,
             tuple(ReviewedSource(**item) for item in value["reviewed"]),
             tuple((str(path), str(raw)) for path, raw in value["code_maps"]),
             int(value["merged_count"]),
             tuple(value["root_reviews"]) if "root_reviews" in value else None,
-            value.get("tiered"),
+            tiered,
         )
     except (KeyError, TypeError, ValueError) as error:
         raise FileAssessmentPublicationError("파일 평가 publication intent가 손상됐습니다.") from error
@@ -199,6 +263,8 @@ def promote(
     if evidence.tiered is not None:
         if not sources_match_remote(repository, base_branch, published_revision, evidence):
             raise FileAssessmentPublicationError("정적 코드맵·정밀 근거의 원본이 게시된 원본과 다릅니다.")
+        _verify_root_plan_files(repository, evidence.tiered, revision=published_revision,
+                                connection=connection, repo_key=repo)
         expected = {source.path: (source.content_hash, source.mode) for source in evidence.inventory.sources}
         records = evidence.tiered.get("records", {})
         if (not isinstance(records, dict) or {path: (record.get("content_hash"), record.get("mode"))
