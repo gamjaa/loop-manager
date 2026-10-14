@@ -101,7 +101,7 @@ python loop_manager.py remove /path/to/my-project
 python loop_manager.py run /path/to/project-a '/path with spaces/project-b'
 ```
 
-지정 경로는 정규화한 뒤 중복 제거한다. 전체 경로의 등록 여부를 처리 전에 확인하며, 하나라도 등록되지 않으면 프로젝트 처리를 시작하지 않는다. `--skip-if-running`은 지정 범위에서도 기존처럼 다른 Loop Manager 실행이 있을 때 조용히 성공 종료한다.
+상대 경로는 명령을 호출한 작업 디렉터리 기준으로 해석한다. 지정 경로는 정규화한 뒤 중복 제거하며 전체 경로의 등록 여부를 처리 전에 확인한다. 하나라도 등록되지 않으면 프로젝트 처리를 시작하지 않는다. `--skip-if-running`은 지정 범위에서도 기존처럼 다른 Loop Manager 실행이 있을 때 조용히 성공 종료한다.
 
 ## 수동 구현과 제출
 

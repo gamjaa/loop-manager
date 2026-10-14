@@ -83,7 +83,7 @@ SQLite 손실이나 손상에서의 자동 상태 재구성은 지원하지 않�
 - 최상위 `add`와 `remove`는 기존 등록 검증·해제 서비스와 registry gate를 호출한다. `config init`과 현재 `config list`는 유지하고 `config add/remove`는 parser 별칭으로 등록하지 않는다
 - `run [--skip-if-running] [repo...]`는 registry에서 지정 경로를 정규화·중복 제거하고 전체 등록 여부를 scheduler 호출 전에 확인한다. 하나라도 미등록이면 invocation reconciliation이나 프로젝트 처리를 시작하지 않는다
 - 검증된 등록 row만 scheduler에 전달한다. scheduler는 선택 범위에서도 기존 `max_workers`, self-merge 사전 확인, 프로젝트별 독립 실행·실패 집계 경계를 그대로 사용한다
-- bootstrap은 전역 경로 옵션을 고정 runtime 인자로 바꾸면서 나머지 사용자 명령 인자를 보존하므로 선택 경로와 공백이 runtime child에 전달된다
+- bootstrap은 부모 CLI의 현재 작업 디렉터리에서 run 상대 경로를 절대화한 뒤 선택 경로와 공백을 runtime child에 전달한다. runtime child의 작업 디렉터리가 대상과 달라도 경로 해석은 달라지지 않는다
 - 대상 경로가 Git 프로젝트이고 origin이 GitHub 저장소인지 확인한다
 - 기준 branch를 확인해 프로젝트 설정에 저장한다
 - `docs/PLANS.md`, `docs/ARCHITECTURE.md` 존재 여부를 확인한다

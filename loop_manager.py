@@ -124,6 +124,16 @@ def main() -> int:
     state_dir = state_directory(args.state_dir)
     config_path = source_config_path(ROOT, args.config)
     try:
+        if args.command == "run" and not args.runtime_child:
+            raw_arguments = ["run"]
+            if args.skip_if_running:
+                raw_arguments.append("--skip-if-running")
+            if args.repositories:
+                raw_arguments.append("--")
+                raw_arguments.extend(
+                    str(Path(repository).expanduser().resolve())
+                    for repository in args.repositories
+                )
         if not args.runtime_child:
             execution_path.apply_execution_path(ROOT)
         if args.runtime_child:

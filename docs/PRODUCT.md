@@ -302,7 +302,7 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 ### 프로젝트 등록 및 실행 조건
 
 - `add <repo> [--base <branch>] [--provider <provider>]`는 기존 프로젝트 검증·등록을 수행하고 `remove <repo>`는 기존 등록 해제 gate를 유지한다. `config init`과 `config list`는 유지하며 이전 `config add/remove` 이름은 허용하지 않는다
-- `run [--skip-if-running] [repo...]`는 경로를 정규화하고 중복을 제거한 뒤 지정된 전체 경로가 등록됐는지 실행 처리 전에 검증한다. 경로를 생략하면 전체 등록 범위를 처리하고, 하나라도 미등록이면 어떤 프로젝트도 처리하지 않는다. 공백이 포함된 경로는 인용해 지정한다
+- `run [--skip-if-running] [repo...]`는 상대 경로를 CLI 호출 당시 작업 디렉터리 기준으로 절대화하고 중복을 제거한 뒤, 지정한 전체 경로가 등록됐는지 실행 전에 검증한다. 경로를 생략하면 전체 등록 범위를 처리하고, 하나라도 미등록이면 어떤 프로젝트도 처리하지 않는다. 공백이 포함된 경로는 인용해 지정한다
 - 선택 실행은 기존 `max_workers`, 프로젝트별 단일 변경 자리, dependency·복구·self handoff와 실패 격리를 유지한다. 범위 밖 프로젝트는 처리하지 않는다
 - 대상 경로는 origin이 GitHub 저장소인 Git 프로젝트여야 한다
 - fetch된 `origin/<base-branch>` tree에 `docs/PLANS.md`, `docs/ARCHITECTURE.md`가 있어야 한다
