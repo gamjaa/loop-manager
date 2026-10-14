@@ -13,15 +13,12 @@ class ManualGenerationEffects:
     run_agent: Callable
     prepare_worktree: Callable
     remove_worktree: Callable
+    compact_execplan_catalog: Callable
 
 
 def generate(effects, connection, repo, state_dir, config_path, provider, group, requirements):
     diff = effects.git(repo,'diff','--stat',group['base_sha'],group['source_head']).stdout
-    catalog = effects.git(repo,'ls-tree','-r','--name-only',group['base_sha'],'--','docs/plans').stdout
-    existing={path:effects.git(repo,'show',f"{group['base_sha']}:{path}").stdout
-              for path in catalog.splitlines() if path.endswith('.md')}
-    reserved=[dict(row) for row in connection.execute('SELECT plan_id,title,sources,depends_on,status '
-                                                     'FROM exec_plans WHERE repo=?',(str(repo),))]
+    catalog = effects.compact_execplan_catalog(connection, str(repo))
     guidance = {}
     for path in ('docs/PRODUCT.md','docs/ARCHITECTURE.md','docs/PLANS.md'):
         result=effects.git(repo,'show',f"{group['source_head']}:{path}",check=False)
@@ -37,14 +34,16 @@ def generate(effects, connection, repo, state_dir, config_path, provider, group,
         'Manager가 이를 거부하고 별도 순차 PR을 안내합니다. 임의로 dependency를 삭제하지 마세요. '
         'sources에는 제출한 R만 연결하세요. id는 초안 내 고유 식별자이며 외부 dependency는 실제 G ID입니다. '
         'body에는 PLANS의 Purpose, Acceptance Criteria, Implementation, Validation, Progress, Decision Log '
-        '모든 절과 구체적인 완료 조건/targeted unit test/Manager verify 조건을 작성하세요. '
+        '모든 절을 작성하세요. complexity와 risk 판단의 근거는 제출 본문에서 찾아 계획에 기록하세요. '
+        '작성 기준과 판정 rubric은 고정된 Planner 지침과 PLANS를 따르세요. '
+        '구체적인 완료 조건과 targeted unit test/Manager verify 조건도 작성하세요. '
         'PASS/상태/branch/session을 frontmatter에 기록하지 마세요. '
         '출력은 설명이나 markdown fence 없는 JSON 하나입니다: '
         '{"plans":[{"id":"draft-1","title":"Title","sources":["docs/requirements/R.md"],'
         '"depends_on":[],"complexity":"medium","risk":"medium","priority":"normal",'
         '"body":"## Purpose\\n..."}]}\n'
         +json.dumps({'source_head':group['source_head'],'base':group['base_sha'],
-                    'requirements':requirements,'guidance':guidance,'catalog':existing,'reserved':reserved,
+                    'requirements':requirements,'guidance':guidance,'catalog':json.loads(catalog),
                     'diff_stat':diff,'implementation_diff':implementation},ensure_ascii=False))
     mutation_id=hashlib.sha256((group['group_id']+group['source_head']).encode()).hexdigest()[:32]
     runtime=effects.prepare_worktree(repo,state_dir,mutation_id=mutation_id,
