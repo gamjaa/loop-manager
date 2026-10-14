@@ -221,6 +221,7 @@ def register(assembly: Composition) -> None:
                     run_agent=assembly.callback('run_agent'),
                     prepare_worktree=assembly.callback('prepare_runtime_worktree'),
                     remove_worktree=assembly.callback('remove_runtime_worktree'),
+                    compact_execplan_catalog=assembly.callback('compact_execplan_catalog'),
                 ), *a, **kw),
             run_project=assembly.callback('_run_manual_project'),
             operation_print=assembly.callback('operation_print'),
