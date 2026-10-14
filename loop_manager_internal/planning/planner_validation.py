@@ -1,7 +1,7 @@
 """planning planner validation boundaries and named composition effects."""
 from __future__ import annotations
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from loop_manager_internal.catalog import execplan_catalog, project_catalog_refresh
 from loop_manager_internal.catalog import execplan_drafts
 from loop_manager_internal.application.contracts import PlanIdAllocation, ValidatedPlanningResult
@@ -16,7 +16,7 @@ from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot
 from loop_manager_internal.planning.planning_catalog import PlanDeletion
 from loop_manager_internal.planning.planning_catalog import PlannerValidationError
 from loop_manager_internal.runtime.contracts import GitLockError
-from loop_manager_internal.storage import maintenance_state
+from loop_manager_internal.storage import maintenance_state, runtime_state
 from loop_manager_internal.storage.planning_publication_state import _MUTABLE_READY_EVIDENCE_FIELDS
 from pathlib import Path
 import base64
@@ -1519,17 +1519,26 @@ def mutable_ready_snapshot(
             continue
         if str(row["plan_id"]) in recovery and not (worktree / str(row["path"])).is_file():
             continue
+        from loop_manager_internal.storage import work_claims
+        try:
+            manual_state, manual_plan_owned = work_claims.manual_plan_ownership(
+                connection, repo, str(row['plan_id']), row
+            )
+        except runtime_state.RuntimeStateError:
+            # Incomplete related ownership evidence protects this plan alone.
+            continue
+        if manual_plan_owned:
+            continue
         if row["branch"]:
             if effects.pr_for_branch is None:
                 raise PlannerValidationError("기존 branch의 실제 PR 등록 여부를 확인할 수 없습니다.")
             if effects.pr_for_branch(Path(repo), str(row["branch"])) is not None:
                 continue
         try:
-            plans.append(
-                effects._ready_plan_snapshot_at_revision(
-                    worktree, active_sha, row, allow_started=True
-                )
+            plan = effects._ready_plan_snapshot_at_revision(
+                worktree, active_sha, row, allow_started=True
             )
+            plans.append(replace(plan, manual_ownership_state=manual_state))
         except MaintenancePlanningError as error:
             raise PlannerValidationError(str(error)) from error
     ordered = tuple(sorted(plans, key=lambda item: int(item.plan_id[2:])))
@@ -1589,6 +1598,23 @@ def _assert_mutable_ready_snapshot_current(
                 or any(row[field] != '{}' for field in
                        ('verify_failure_history', 'review_failure_history', 'review_level_history'))):
             raise PlannerValidationError(f"기존 미착수 snapshot의 실행 경계가 변경됐습니다: {plan.plan_id}")
+        from loop_manager_internal.storage import work_claims
+        manual_state, manual_owned = work_claims.manual_plan_ownership(
+            connection, snapshot.repo, plan.plan_id, row
+        )
+        if manual_owned:
+            raise PlannerValidationError(
+                f'수동 소유 계획은 mutable READY snapshot으로 개정할 수 없습니다: {plan.plan_id}'
+            )
+        expected_manual_state = (
+            plan.manual_ownership_state
+            if plan.manual_ownership_state is not None
+            else work_claims.empty_manual_ownership_state()
+        )
+        if manual_state != expected_manual_state:
+            raise PlannerValidationError(
+                f'수동 소유권·membership이 mutable READY snapshot 이후 변경됐습니다: {plan.plan_id}'
+            )
         if row["branch"]:
             if effects.pr_for_branch is None or effects.pr_for_branch(Path(snapshot.repo), str(row["branch"])) is not None:
                 raise PlannerValidationError(f"계획 갱신 전에 PR이 등록됐거나 확인할 수 없습니다: {plan.plan_id}")

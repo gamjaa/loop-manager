@@ -388,7 +388,25 @@ def validate_worker_workspace_scope(
         branch=branch, worktree_key=str(worktree.resolve()),
     ) if scope_phase is not None else None)
     candidate_base = catalog_plan['active_sha']
-    publication_before = (replace(after, head=candidate_base, index=after.index, dirty={})
+    publication_head = candidate_base
+    if connection is not None and not allow_rebase:
+        manual_tables = {row[0] for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' "
+            "AND name IN ('manual_work_groups', 'manual_work_members')"
+        )}
+        if manual_tables == {'manual_work_groups', 'manual_work_members'}:
+            from loop_manager_internal.storage.manual_work_state import ManualWorkRepository
+            from loop_manager_internal.runtime.runtime_identity import _canonical_path
+            store = ManualWorkRepository(connection)
+            plan_id = str(catalog_plan['plan_id'])
+            group = store.for_plan(str(repo_path), plan_id)
+            if (group is not None and group['kind'] == 'submit' and group['state'] == 'AUTOMATIC'
+                    and group['request_id'] is not None and group['branch'] == branch
+                    and group['worktree']
+                    and _canonical_path(Path(group['worktree'])) == _canonical_path(worktree)):
+                store.workspace_owner(str(repo_path), plan_id)
+                publication_head = before.head
+    publication_before = (replace(after, head=publication_head, index=after.index, dirty={})
                           if isinstance(candidate_base, str) and candidate_base else before)
     effects.validate_agent_scope(
         "worker",
