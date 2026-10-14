@@ -44,6 +44,7 @@ depends_on:
   - G-266
   - G-267
   - G-268
+  - G-281
 complexity: high
 risk: medium
 priority: low
@@ -59,7 +60,7 @@ priority: low
 - archive 후보 또는 비검증 오류가 새로 생기거나 바뀌면 해당 세션에 한 번 전달한다. 변화가 없으면 재전송하지 않고 validation feedback delta와 비검증 오류로 동일 내용을 두 번 보내지 않는다. 폐지된 CLI 파일 승인 요청·patch 대조를 복원하지 않는다.
 - provider·Model 교체 또는 session-unavailable fallback으로 새 세션이 시작되면 같은 작업에 고정된 공통·Worker 역할 instruction을 재사용하고 사용자 메시지에는 결과 형식·계획·작업 공간·미완료 작업·미해결 피드백만 간결히 재구성한다. 이전 대화, Worker 결과와 verify·Review 원문 전체는 보내지 않는다.
 - 프로젝트 지침은 Agent CLI가 해석한다. 최초·재개·fallback 사용자 prompt에 루트 `AGENTS.md`의 읽기·승인·복원 지시를 넣지 않고 존재·인코딩·내용·자동 로딩 여부를 Manager의 추가 실행 gate로 삼지 않는다.
-- 축약 뒤에도 Worker 권한, 일반 draft·User Decision 보호, 고정 원본 묶음과 역할별 실제 instruction, 결과 protocol, targeted test 범위와 전체 verify 분리, 비밀값 가림 및 세션·작업 공간 복구 계약은 유지된다. 과거 파일 승인 감사·작업물·session은 보존한다. 전송 도중 중단·재시작해도 새 정보를 누락하지 않는다.
+- 축약 뒤에도 Worker 권한, 일반 draft·User Decision 보호, 고정 원본 묶음과 역할별 실제 instruction, 결과 protocol, targeted test 범위와 전체 verify 분리, 비밀값 가림 및 세션·작업 공간 복구 계약은 유지된다. R-082의 선택된 ExecPlan 본문만 수정·frontmatter와 다른 ExecPlan 수정 금지 및 source 문자열 보존·Planner/Manager 선언 교정 책임은 정합화된 Worker instruction에 유지한다. 과거 파일 승인 감사·작업물·session은 보존한다. 전송 도중 중단·재시작해도 새 정보를 누락하지 않는다.
 - 수동 complete/submit 수락 뒤 자동 Worker 교정에도 같은 초기·delta·복구 계약을 적용한다. 수동 문맥을 덧붙이는 경로가 이미 전달한 결과나 verify·Review 원문을 다시 넣지 않는다. verify 성공 출력은 Worker에게 전달하지 않으며 미해결 실패는 기존 진단 helper의 필요한 피드백으로 전달한다. 수동 제출의 전체 G·후보 R·미확인 외부 테스트와 사용자 생략을 보존하고 실제 Worker 성공으로 합성하지 않는다.
 - R-082의 프로젝트 일반 planning·개정 게시·DB 적용과 필요한 rebase를 마친 최신 ExecPlan을 최초·재개 Worker의 기준으로 전달한다. 상위 명세의 관련성·개정을 작업별 prompt에서 다시 판단시키지 않는다. 유효한 planning 결과가 작업 조건 유지를 확인했다면 source 지문·SHA 전진이나 순수 진행 기록만으로 Worker 호출·문맥 재전송을 만들지 않는다. 실제 조건 변경·미완료 보완과 기존 역할의 검증 입력은 보존하고 확인된 전달 cursor만 전진시킨다.
 
@@ -74,7 +75,7 @@ priority: low
 
 ## Validation
 
-- 실제 `worker_prompt`를 사용한 호출에서 R-064의 common+worker instruction과 사용자 메시지를 각각 검사한다. 최소 test case/class/module, 실패 뒤 동일 command 재실행, 문서·설정/관련 unit 부재의 구체적 사유와 전체 검증 금지는 고정 instruction에 유지하고 사용자 메시지의 중복을 제거한다. `tests/test_loop_manager.py`의 Worker prompt에 정적 규칙을 요구하는 assertion을 instruction 전달 검사로 옮기며, `tests/test_agent_invocation.py`의 임의 `delta only` fixture만으로 실제 prompt의 중복 부재를 확정하지 않는다. Reviewer prompt 교정은 별도 담당 계획에 남긴다.
+- 실제 `worker_prompt`를 사용한 호출에서 R-064의 common+worker instruction과 사용자 메시지를 각각 검사한다. 최소 test case/class/module, 실패 뒤 동일 command 재실행, 문서·설정/관련 unit 부재의 구체적 사유와 전체 검증 금지는 고정 instruction에 유지하고 사용자 메시지의 중복을 제거한다. `tests/test_loop_manager.py`와 `tests/test_execution_guidance.py:WorkerPromptFocusTests`의 정적 규칙 assertion을 실제 instruction 전달 검사로 옮긴다. 선택된 본문만 수정·frontmatter와 다른 ExecPlan 금지·source 문자열 보존 및 선언 교정 책임도 instruction에서 확인하며, 사용자 메시지 중복 제거를 기존 결과 검사 완화로 대신하지 않는다. `tests/test_agent_invocation.py`의 임의 `delta only` fixture만으로 실제 prompt의 중복 부재를 확정하지 않는다. Reviewer prompt 교정은 별도 담당 계획에 남긴다.
 - Worker는 `tests/test_execution_worker_phase.py`의 prompt·fallback, `tests/test_worker_session.py`의 전이 및 `tests/test_validation_feedback_state.py`의 전달 확인·재개 중 변경한 경계의 최소 targeted unit case만 실행한다. `tests/support/execution.py`의 기존 fixture·Agent double을 재사용한다. 기존 재개 prompt의 역할 반복과 복구 prompt의 이전 결과 포함을 요구하는 assertion은 이 계획의 초기 전달·delta·최소 복구 계약에 맞춰 갱신한다.
 - 최초 turn, 같은 세션의 일반 수정·effort 변경·verify·Review 교정, archive·비검증 오류 변경 및 두 채널 중복 방지, resolved provider·Model 교체·legacy 복구·session-unavailable fallback을 검증한다. 루트 지침 관리 prompt 부재와 고정된 역할 instruction·Ponytail의 재사용, 사용자 메시지의 정적 규칙 중복 부재도 확인한다. 기존 `tests/test_agent_invocation.py`·`tests/test_provider_runtime.py`의 호출 fixture를 재사용하며 실제 Agent를 호출하지 않는다.
 - session 시작 직후 timeout, 잘못된 Worker 결과, fallback 시작 실패, 전달 확인 전후 중단·재시작·저장 실패와 호출 뒤 새 revision 발생에서 미확인 내용이 누락되지 않고 확인된 동일 내용을 반복하지 않는지 검증한다. 비밀값 가림과 승인 문맥은 `tests/test_validation_feedback.py`·`tests/test_execution_guidance.py`, 결과 형식은 `tests/test_worker_result_contract.py`의 직접 관련 case를 변경 시 연결한다.
@@ -94,6 +95,7 @@ priority: low
 
 ## Decision Log
 
+- 2026-10-14 Worker 문서 권한 delta: 직접 반영된 사용자 prompt·다른 ExecPlan 결과 거부·선언 필드 진단을 재구현하지 않는다. 고정 Worker 원본의 새 제한 정합화를 선행 dependency로 연결해 정적 문구를 제거할 때 권한 설명이 사라지지 않게 한다. 과거 묶음을 최신 지침으로 교체하지 않으며 기존 초기/delta/복구·검증·session 조건과 기록을 보존한다.
 - 2026-10-14 delta 개정: 현재 R-082의 프로젝트 planning 우선 처리와 ExecPlan 실행 대응 분리에 맞춰 새 문맥의 기준·호출 조건을 정합화했다. 직접 반영된 planning·기록 기준 helper를 재구현하지 않고 최소 prompt·확인 cursor의 기존 목표와 수행 기록을 보존한다. source 지문은 verify·Review의 독립 입력으로 유지하며 구현·테스트·verify 성공을 기록하지 않는다.
 
 - 2026-10-10 사용자 정리: R-003은 내용 보존 archive하고, 정적 검증 규칙의 instruction 단일 전달은 활성 R-064에 연결한다. Worker prompt의 초기·delta·복구 목표와 기존 검증·dependency는 유지하며 아래 R-003 참조는 당시 검토 기록이다.
