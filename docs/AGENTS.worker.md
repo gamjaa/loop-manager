@@ -4,12 +4,19 @@
 
 - 선택된 ExecPlan 하나를 구현하고 현재 변경을 안전하게 수용하는 데 필요한 리팩토링을
   함께 수행한다. 기존 동작을 보존하는 테스트를 포함하고 범위 밖 개선으로 확대하지 않는다.
-- 새 ExecPlan을 만들거나 다른 계획의 목표를 추가 구현하지 않는다. 연관 문서 수정은
-  호출에서 제공된 권한 안에서 수행하고 목표·실행 이력·dependency·사용자 결정을 보존한다.
-- 현재 작업에 필요한 PRODUCT·ARCHITECTURE·활성 Requirement·기존 ExecPlan·공통 및 역할별
+- 새 ExecPlan을 만들거나 다른 ExecPlan을 수정·추가 구현하지 않는다. 선택된 ExecPlan은
+  구현·검증 기록 등 본문만 수정하며 frontmatter는 직접 변경하지 않는다. 활성·archive를
+  포함한 모든 Requirement는 추가·수정·삭제·rename·이동하지 않는다. 연관 문서 수정은 호출에서
+  제공된 권한 안에서 수행하고
+  목표·실행 이력·dependency·사용자 결정을 보존한다.
+- source 경로와 실제 파일명이 다르면 정확 경로·동일 파일명 archive·고유 R-ID 조회로 근거를
+  확인하되 sources 문자열은 보존한다. 누락·모호함이나 선언 교정이 필요하면 원인과 대상 경로를
+  보고하고 Planner·Manager의 검증·공식 선언·DB 반영에 맡긴다. Manager가 종료 후
+  frontmatter만 복원했다고 전달하면 보존된 본문·최종 diff로 문서 보고를 갱신하고 선언을 다시 수정하지 않는다.
+- 현재 작업에 필요한 PRODUCT·ARCHITECTURE·FUTURE_IDEAS·선택된 ExecPlan 본문·공통 및 역할별
   지침·사용 안내를 함께 갱신할 수 있다. 새 목표·Non-Goal·사용자 동작 의미 변경은 사용자 판단을
   기다린다. 문서 수정으로 원래 요청·Acceptance Criteria·필수 검증·실패를 약화하거나 사용자
-  결정을 대신 작성·변경하지 않는다. 다른 계획의 ID·실행 이력·dependency·사용자 결정은 보존한다.
+  결정을 대신 작성·변경하지 않는다.
 - Requirement·ExecPlan 구현으로 바뀌는 제품 동작·장기 규칙은 PRODUCT에,
   설계·책임 경계·계약은 ARCHITECTURE에 코드와 같은 PR에서 반영한다. 필요한 관련 절만
   갱신하고 목표·필수 검증·사용자 결정을 보존한다.

@@ -352,6 +352,8 @@ class ValidateWorkerWorkspaceScopeEffects:
     validate_active_execplan_metadata: Callable[..., object]
     validate_agent_scope: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
+    git: Callable[..., object]
+    git_bytes: Callable[..., bytes] | None = None
 
 
 def validate_worker_workspace_scope(
@@ -371,6 +373,7 @@ def validate_worker_workspace_scope(
     scope_phase: str | None = None,
     connection: sqlite3.Connection | None = None,
     state_dir: Path | None = None,
+    on_frontmatter_restored: Callable[[str], None] | None = None,
 ) -> dict[str, object]:
     """Validate one Worker-controlled operation before Manager Git writes."""
 
@@ -388,6 +391,12 @@ def validate_worker_workspace_scope(
         branch=branch, worktree_key=str(worktree.resolve()),
     ) if scope_phase is not None else None)
     candidate_base = catalog_plan['active_sha']
+    origin = after.refs.get(f'refs/remotes/origin/{base_branch}')
+    if origin is not None:
+        observed = effects.git(worktree, 'merge-base', after.head, origin[0], check=False)
+        if observed.returncode or not observed.stdout.strip():
+            raise RuntimeError('Worker 범위 비교의 원본 브랜치 기준을 확인할 수 없습니다.')
+        candidate_base = observed.stdout.strip()
     publication_head = candidate_base
     if connection is not None and not allow_rebase:
         manual_tables = {row[0] for row in connection.execute(
@@ -406,6 +415,18 @@ def validate_worker_workspace_scope(
                     and _canonical_path(Path(group['worktree'])) == _canonical_path(worktree)):
                 store.workspace_owner(str(repo_path), plan_id)
                 publication_head = before.head
+    if on_frontmatter_restored is not None and not allow_rebase:
+        if after.head != before.head:
+            raise RuntimeError('Worker 종료 전후 HEAD가 달라 frontmatter 복원을 보류합니다.')
+        effects.validate_managed_worktree(repo_path, worktree, branch)
+        if effects.git_bytes is None:
+            raise RuntimeError('frontmatter 복원의 원본 byte reader가 없습니다.')
+        from loop_manager_internal.execution.plan_validation import restore_worker_frontmatter
+        revision = str(catalog_plan['current_revision_sha'] or catalog_plan['active_sha'] or '')
+        if restore_worker_frontmatter(worktree, selected_plan_path, catalog_plan,
+                                      repo=str(repo_path), revision=revision, connection=connection, git_bytes=effects.git_bytes):
+            on_frontmatter_restored(selected_plan_path)
+            after = effects.capture_git_snapshot(worktree)
     publication_before = (replace(after, head=publication_head, index=after.index, dirty={})
                           if isinstance(candidate_base, str) and candidate_base else before)
     effects.validate_agent_scope(

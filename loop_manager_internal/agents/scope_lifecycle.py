@@ -89,7 +89,7 @@ def begin_agent_scope(
     plan_file = worktree / plan_path
     agent_input_plan = (
         plan_file.read_text(encoding="utf-8")
-        if role_name == "reviewer" and plan_path and plan_file.is_file()
+        if role_name in {"worker", "reviewer"} and plan_path and plan_file.is_file()
         else None
     )
     effects.update_project(

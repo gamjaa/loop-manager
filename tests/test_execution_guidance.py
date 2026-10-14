@@ -73,13 +73,13 @@ class WorkerPromptFocusTests(TestCase):
         self.assertEqual(prompt.count(feedback), 1)
         self.assertIn('Saved partial implementation', prompt)
 
-    def test_worker_prompt_allows_related_requirement_edits_but_defers_retirement(self):
+    def test_worker_prompt_forbids_all_requirements_and_allows_product_documents(self):
         prompt = lm.worker_prompt('docs/plans/plan.md', None)
-        self.assertNotIn('docs/requirements/ 아래 파일을 수정하거나 이동하지 마라', prompt)
         self.assertIn('Requirement 완료 판단이나 archive 이동 권한을 포함하지 않는다', prompt)
         self.assertIn('User Decision은 사용자를 대신해', prompt)
         self.assertIn('본문만 수정하고 frontmatter는 직접 변경하지 마라', prompt)
-        self.assertIn('현재 작업과 무관한 Requirement와 다른 ExecPlan은 수정하지 마라', prompt)
+        self.assertIn('활성·archive를 포함한 모든 Requirement와 다른 ExecPlan은 수정하지 마라', prompt)
+        self.assertIn('PRODUCT·ARCHITECTURE·FUTURE_IDEAS는 현재 작업에 필요한 범위에서 수정할 수 있다', prompt)
         self.assertIn('sources 문자열은 보존하라', prompt)
         self.assertIn('Planner·Manager의 검증·공식 선언·DB 반영', prompt)
         self.assertIn('docs/PLANS.md는 이번 Worker 변경 범위가 아니다', prompt)
