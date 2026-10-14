@@ -39,6 +39,13 @@ class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenar
         self.effects.blocking.block_active_execplan.assert_not_called()
         self.assertEqual(self.effects.agent.run_agent.call_count, 1)
 
+    def test_failed_worker_does_not_request_frontmatter_restore(self):
+        self.effects.agent.run_agent.side_effect = lambda *_a, **_k: lm.AgentResult(
+            1, 'Worker interrupted', kind=lm.AgentResultKind.TRANSIENT_FAILURE)
+        self.handler.run(self.context())
+        self.assertIsNone(self.effects.agent.validate_worker_workspace_scope.call_args.kwargs['on_frontmatter_restored'])
+        self.assertIn('Worker interrupted', self.state.row()['last_error'])
+
     def test_worker_provider_errors_with_credentials_do_not_emit_stage_notices(self):
         from loop_manager_internal.notifications import notifications
         notifications.configure_session(self.connection, enabled=True)

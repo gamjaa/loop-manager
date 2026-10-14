@@ -427,7 +427,7 @@ class WorkerHandler:
                 catalog_plan,
                 worker_scope_before,
                 scope_phase='IMPLEMENTING',
-                on_frontmatter_restored=restored_frontmatter.append,
+                on_frontmatter_restored=restored_frontmatter.append if not code else None,
                 allow_rebase=context.resolving_rebase,
                 **({'rebase_definition': DefinitionSnapshot.deserialize(
                     row['definition_snapshot']
