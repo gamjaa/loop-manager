@@ -703,7 +703,7 @@ class PlanningAssessmentService(PlanningService):
                 except (AssessmentError,
                         maintenance_state.MaintenanceStateError) as error:
                     raise PlanningResultInvalid(str(error)) from error
-            if (run.tiered_root_plan_links and decision is not None
+            if (getattr(run, "tiered_root_plan_links", ()) and decision is not None
                     and decision.outcome is not MaintenanceOutcome.UNSAFE):
                 try:
                     self._ports.tiered.record_final_root_plan_links(
