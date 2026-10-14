@@ -1290,7 +1290,9 @@ class SinglePassMaintenanceCycleTest(MaintenanceCycleCase):
         self._insert_plan(self.connection, "/one", "G-001", status="MERGED")
         self.start(maintenance_state.MaintenancePhase.REFACTORING, ("G-001",))
         tiered_review.ensure_schema(self.connection)
-        self.connection.execute("INSERT INTO tiered_maintenance_success VALUES ('/one', '{}', '[]', ?, 0, ?, 'original-receipt')", (self.source, self.source))
+        self.connection.execute("INSERT INTO tiered_maintenance_success "
+            "(repo, records_json, roots_json, source_revision, full_merged_count, full_source_revision, assessment_digest) "
+            "VALUES ('/one', '{}', '[]', ?, 0, ?, 'original-receipt')", (self.source, self.source))
         before = tuple(self.connection.execute("SELECT * FROM tiered_maintenance_success").fetchone())
         self.catalog()
         self.advance()

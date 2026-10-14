@@ -353,6 +353,7 @@ class PlanningRequirementMoveTest(unittest.TestCase):
                 if mixed:
                     (case.root / PLAN).write_text(PLAN_TEXT, encoding="utf-8")
                 service, ports, run = self.assessment(case)
+                self.assertFalse(hasattr(run, "tiered_root_plan_links"))
                 for resumed in (False, True):
                     with self.subTest(resumed=resumed):
                         self.assertIsNone(service._validate_planner_result(run))

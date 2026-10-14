@@ -611,14 +611,14 @@ Test fallback.
         source = "docs/requirements/[R-001] Done.md"
         archived = loop_manager.requirement_archive_path(source)
 
-        self.assertTrue(
+        self.assertFalse(
             loop_manager._worker_path_allowed(
                 source,
                 "docs/plans/[G-001] Plan.md",
                 (source,),
             )
         )
-        self.assertTrue(
+        self.assertFalse(
             loop_manager._worker_path_allowed(
                 archived,
                 "docs/plans/[G-001] Plan.md",

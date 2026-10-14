@@ -3,12 +3,19 @@ from dataclasses import replace
 import json
 from pathlib import Path
 import sqlite3
+import tempfile
+from types import SimpleNamespace
 import unittest
 from unittest import mock
 
 from loop_manager_internal.maintenance import code_index, tiered_review
-from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventory, ClassifiedPath, TrackedSource
-from tests.support.maintenance import inventory
+from loop_manager_internal.maintenance.maintenance_file_inventory import (
+    SourceInventory, ClassifiedPath, TrackedSource, tracked_source_inventory,
+)
+from loop_manager_internal.maintenance.maintenance_file_review import RESULT_PREFIX as FILE_REVIEW_PREFIX
+from loop_manager_internal.storage import maintenance_file_ledger
+from tests.support.maintenance import inventory, root_results_for
+from tests.support.maintenance_planning_case import MaintenancePlanningCase, git
 
 
 class TieredReviewTest(unittest.TestCase):
@@ -43,6 +50,7 @@ class TieredReviewTest(unittest.TestCase):
         actual = SourceInventory(revision, tuple(TrackedSource(source.path, source.content_hash, source.mode, revision, "source")
             for source in inv.sources), tuple(ClassifiedPath(path, "source", "source") for path in self.sources))
         with mock.patch.object(tiered_review, "cached_source_inventory", return_value=actual), \
+                mock.patch.object(tiered_review, "root_placement_inventory", return_value=()), \
                 mock.patch.object(code_index, "git", side_effect=lambda _repo, _command, value: self.sources[value.split(":", 1)[1]]):
             return self.repository.select("repo", Path("/repo"), "main", revision, 20, merged, **kwargs)
 
@@ -254,7 +262,9 @@ class TieredReviewTest(unittest.TestCase):
             first = self.complete(selection)
         with mock.patch.object(common_guidance, 'runtime_content_hash', return_value='b' * 64):
             resumed = self.repository.prepare('repo', 1, selection)
-            self.assertEqual(resumed, {key: value for key, value in first.items() if key != 'receipts'})
+            self.assertEqual(resumed, {key: value for key, value in first.items()
+                                       if key not in {'receipts', 'root_plan_links'}})
+            self.assertIsNone(first['root_plan_links'])
             self.assertIsNone(self.repository.pending('repo', resumed))
             new = self.repository.prepare('repo', 2, selection)
             self.assertEqual(new['guidance_hash'], 'b' * 64)
@@ -270,6 +280,189 @@ class TieredReviewTest(unittest.TestCase):
         self.assertEqual(migrated['guidance_hash'], 'c' * 64)
         self.assertEqual(migrated['prior_guidance_assessment'], legacy)
         self.assertIsNotNone(self.repository.pending('repo', migrated))
+
+    def test_root_plan_links_are_idempotent_after_repository_restart(self):
+        root = {"path": "legacy", "category": "internal_implementation",
+            "destination": "src/legacy", "reason": "Move the internal legacy tree safely."}
+        with tempfile.TemporaryDirectory() as directory:
+            repository_root = Path(directory)
+            plan_path = "docs/plans/[G-003] Move Legacy.md"
+            target = repository_root / plan_path
+            target.parent.mkdir(parents=True)
+            contents = b"the final validated preservation plan\n"
+            target.write_bytes(contents)
+            link = {"path": "legacy", "destination": "src/legacy",
+                "root_review_hash": maintenance_file_ledger.root_review_hash(root),
+                "status": "new_plan", "plan_id": "G-003", "plan_path": plan_path,
+                "plan_hash": tiered_review.plan_content_hash(contents),
+                "reason": "The plan preserves the investigated root tree and its references."}
+            evidence = {"root_reviews": [root], "digest": "e" * 64}
+            with mock.patch.object(self.repository, "evidence", return_value=evidence):
+                first = self.repository.record_root_plan_links(
+                    "repo", 2, "sha", [link], plan_repository=repository_root)
+
+            restarted = tiered_review.TieredReviewRepository(self.connection)
+            with mock.patch.object(restarted, "evidence", return_value=evidence):
+                second = restarted.record_root_plan_links(
+                    "repo", 2, "sha", [link], plan_repository=repository_root)
+
+        self.assertEqual(first, second)
+        saved = self.connection.execute(
+            "SELECT assessment_digest, links_json FROM tiered_maintenance_root_plan_links"
+        ).fetchone()
+        self.assertEqual(saved[0], evidence["digest"])
+        self.assertEqual(json.loads(saved[1]), list(first))
+
+    def test_success_schema_migrates_existing_rows_with_no_guidance_hash(self):
+        connection = sqlite3.connect(":memory:")
+        self.addCleanup(connection.close)
+        connection.row_factory = sqlite3.Row
+        connection.execute("CREATE TABLE tiered_maintenance_success ("
+            "repo TEXT PRIMARY KEY, records_json TEXT NOT NULL, roots_json TEXT NOT NULL, "
+            "source_revision TEXT NOT NULL, full_merged_count INTEGER, full_source_revision TEXT, "
+            "assessment_digest TEXT NOT NULL, root_reviews_json TEXT)")
+        connection.execute("INSERT INTO tiered_maintenance_success VALUES "
+                           "('repo', '{}', '[]', 'sha', 0, 'sha', 'digest', '[]')")
+
+        saved = tiered_review.TieredReviewRepository(connection).success("repo")
+
+        self.assertEqual(saved["root_reviews"], [])
+        self.assertIsNone(saved["guidance_hash"])
+
+    def test_prior_root_success_requires_the_same_guidance_hash(self):
+        from loop_manager_internal.agents import common_guidance
+
+        with mock.patch.object(common_guidance, "effective_planning_hash", return_value="old-guidance"):
+            self.complete(self.select())
+        self.assertEqual(self.repository.success("repo")["guidance_hash"], "old-guidance")
+        saved_root = {"path": "docs", "category": "documentation"}
+        self.connection.execute(
+            "UPDATE tiered_maintenance_success SET roots_json = ?, root_reviews_json = ? WHERE repo = ?",
+            (code_index.encode([saved_root]), code_index.encode([{"path": "docs"}]), "repo"),
+        )
+
+        inv = inventory(self.sources, "sha")
+        actual = SourceInventory("sha", tuple(
+            TrackedSource(source.path, source.content_hash, source.mode, "sha", "source")
+            for source in inv.sources), tuple(
+            ClassifiedPath(path, "source", "source") for path in self.sources))
+        placement = SimpleNamespace(path="docs", category="documentation", reason="Tracked docs root")
+        source = TrackedSource(".", "d" * 64, "040000", "sha", "root review source")
+        with mock.patch.object(tiered_review, "cached_source_inventory", return_value=actual), \
+                mock.patch.object(tiered_review, "root_placement_inventory", return_value=(placement,)), \
+                mock.patch.object(code_index, "git", side_effect=lambda _repo, _command, value:
+                    self.sources[value.split(":", 1)[1]]), \
+                mock.patch.object(common_guidance, "effective_planning_hash", return_value="new-guidance"), \
+                mock.patch.object(maintenance_file_ledger, "root_review_source", return_value=source), \
+                mock.patch.object(maintenance_file_ledger.FileReviewRepository,
+                                  "reusable_root_reviews", return_value=None), \
+                mock.patch.object(maintenance_file_ledger, "validate_root_reviews",
+                                  side_effect=AssertionError("stale guidance must not reuse tiered roots")):
+            selection = self.repository.select("repo", Path("/repo"), "main", "sha", 20, 0)
+
+        self.assertTrue(selection.required)
+        self.assertEqual(selection.reasons, ("root_review_required",))
+        self.assertIsNone(selection.root_reviews)
+
+
+class TieredRootReviewTest(MaintenancePlanningCase):
+    def test_asset_only_assessment_requires_exact_complete_root_investigation(self):
+        for path in ("legacy/module.py", "refactored/adapter.py"):
+            (self.repo / path).unlink()
+        (self.repo / "scratch.png").write_bytes(b"\x89PNG\x00fixture")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-m", "Create source-free root inventory")
+        revision = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "push", "origin", "HEAD:main")
+        repository = tiered_review.TieredReviewRepository(self.connection)
+        selection = repository.select(str(self.repo), self.repo, "main", revision, 20, 1, force_full=True)
+        self.assertEqual(selection.index.records, {})
+        assessment = repository.prepare(str(self.repo), 1, selection)
+        units = repository.units(assessment)
+        self.assertEqual(len(units), 1)
+        unit = units[0]
+        self.assertEqual(unit["kind"], "root_placement")
+        inventory = tracked_source_inventory(self.repo, "main", revision, include_uncertain=True)
+        reviews = list(root_results_for(self.repo, inventory))
+
+        def output(root_reviews):
+            source = unit["source"]
+            return FILE_REVIEW_PREFIX + json.dumps({"path": source["path"], "content_hash": source["content_hash"],
+                "mode": source["mode"], "source_revision": source["revision"], "root_reviews": root_reviews})
+
+        duplicate_reference = dict(reviews[0], references=reviews[0]["references"] * 2)
+        protected_move = [dict(item) for item in reviews]
+        protected_move[0].update(category="internal_implementation", destination="archive/docs")
+        for invalid in ([], [reviews[0], reviews[0]], [duplicate_reference, *reviews[1:]], protected_move,
+                        [dict(reviews[0], references=[{"path": [], "excerpt": "untrusted reference"}]), *reviews[1:]],
+                        [dict(reviews[0], references=[{"path": ".", "excerpt": "forged root citation"}]), *reviews[1:]]):
+            with self.subTest(invalid=invalid), self.assertRaises(tiered_review.TieredReviewError):
+                repository.complete(str(self.repo), unit, output(invalid), lambda _path: b"")
+        repository.complete(str(self.repo), unit, output(reviews), lambda _path: b"")
+        evidence = repository.evidence(str(self.repo), 1, revision)
+        self.assertEqual(evidence["receipts"], [])
+        self.assertEqual({item["path"] for item in evidence["root_reviews"]}, {"docs", "scratch.png"})
+        self.assertIsNone(evidence["root_plan_links"])
+        audit = self.connection.execute(
+            "SELECT protocol, source_revision, scope_json FROM tiered_maintenance_result_audit WHERE digest = ?",
+            (unit["digest"],),
+        ).fetchone()
+        self.assertEqual(audit[0], tiered_review.ROOT_RESULT_PROTOCOL)
+        self.assertEqual(audit[1], revision)
+        self.assertEqual(json.loads(audit[2]), unit)
+        self.connection.execute("UPDATE tiered_maintenance_result_audit SET source_revision = 'stale' WHERE digest = ?",
+                                (unit["digest"],))
+        with self.assertRaises(tiered_review.TieredReviewError):
+            repository.evidence(str(self.repo), 1, revision)
+
+    def test_mixed_tree_investigates_sources_and_excluded_roots_with_launcher_evidence(self):
+        (self.repo / "requirements-prod.txt").write_text("example==1.0\n", encoding="utf-8")
+        (self.repo / "brand.svg").write_text("<svg><title>Brand</title></svg>\n", encoding="utf-8")
+        (self.repo / "run.sh").write_text("#!/bin/sh\nexec python3 app.py\n", encoding="utf-8")
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-m", "Add root manifest, asset, and launcher")
+        revision = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "push", "origin", "HEAD:main")
+
+        repository = tiered_review.TieredReviewRepository(self.connection)
+        assessment = repository.prepare(str(self.repo), 1, repository.select(
+            str(self.repo), self.repo, "main", revision, 20, 1, force_full=True))
+        units = repository.units(assessment)
+        root_unit = next(unit for unit in units if unit.get("kind") == "root_placement")
+        inventory = tracked_source_inventory(self.repo, "main", revision, include_uncertain=True)
+        reviews = list(root_results_for(self.repo, inventory))
+        launcher = next(item for item in reviews if item["path"] == "run.sh")
+        launcher.update(category="execution_build_deploy", destination=None,
+            references=[{"path": "run.sh", "excerpt": "#!/bin/sh\nexec python3 app.py"}],
+            reason="The tracked executable launches the application and remains at its working path.")
+        root_source = root_unit["source"]
+        root_output = FILE_REVIEW_PREFIX + json.dumps({
+            "path": root_source["path"], "content_hash": root_source["content_hash"],
+            "mode": root_source["mode"], "source_revision": root_source["revision"],
+            "root_reviews": reviews,
+        })
+        for unit in units:
+            if unit is root_unit:
+                output = root_output
+            else:
+                module_reviews = []
+                for part in unit["parts"]:
+                    path = next(iter(part["records"]))
+                    excerpt = (self.repo / path).read_text(encoding="utf-8").rstrip("\n")
+                    module_reviews.append({"module": part["module"],
+                        "summary": "The source modules are small fixtures with no uncovered structural issue.",
+                        "citations": [{"path": path, "excerpt": excerpt}]})
+                value = {"digest": unit["digest"], "reviews": module_reviews, "findings": []}
+                output = tiered_review.RESULT_PREFIX + json.dumps(value)
+            repository.complete(str(self.repo), unit, output, lambda path: (self.repo / path).read_bytes())
+
+        evidence = repository.evidence(str(self.repo), 1, revision)
+        self.assertEqual({item["path"] for item in evidence["root_reviews"]},
+                         {"docs", "legacy", "refactored", "requirements-prod.txt", "brand.svg", "run.sh"})
+        self.assertEqual(next(item for item in evidence["root_reviews"] if item["path"] == "run.sh")["category"],
+                         "execution_build_deploy")
+        self.assertNotIn("run.sh", tiered_review._root_move_candidates(evidence["root_reviews"]))
+        self.assertTrue(evidence["receipts"])
 
 
 if __name__ == "__main__":

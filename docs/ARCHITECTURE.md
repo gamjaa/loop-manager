@@ -301,6 +301,8 @@ PRODUCT의 `fast`·`targeted`·`full` 선택은 유지보수 진입 조건을 �
 
 모듈 의미 검토는 읽기 전용 Planner 호출로 필요한 원본과 보존 조건을 확인한다. Manager는 묶음 범위·판단·발견과 실제 원본 인용을 검증해 잠정 결과로 보존한다. 발견이 없고 일반 계획도 필요하지 않으면 추가 종합·계획 호출 없이 no-change 결과를 준비한다. 발견이 있으면 저장된 검토를 입력으로 계획 또는 근거 있는 제외에 연결하며, 파일별 검토·관계 확인·종합 페이지를 다시 기본 단계로 실행하지 않는다.
 
+같은 tiered assessment에는 별도 `.` 루트 조사 unit을 둔다. unit identity는 `root_review_source`의 원격 tree hash·mode·revision, 모든 root placement와 고정 지침에 결합하고, 기존 `parse_review`·`validate_root_reviews` 계약으로 제외 분류된 문서·자산·manifest·설정까지 실제 인용을 검증한다. 루트 protocol·scope audit는 모듈 receipt와 분리되며, 정적 inventory나 모듈 결과만으로 루트 완료를 만들지 않는다. 같은 guidance·revision의 검증된 파일별 root review 또는 이전 tiered 성공 결과만 재사용한다. 이전 tiered 성공의 root review는 성공 row에 보존된 guidance hash가 현재 지침 identity와 같고 source revision도 일치할 때만 재사용한다. 이동 후보의 링크는 후보 조사 hash와 계획 경로·본문 hash를 별도 저장하고 새 계획 또는 비종료 계획의 보존·검증 조건을 확인한다. 최종 Planner disposition에서는 후보 연결을 임시 보관하고, 전체 planning result 검증이 통과한 뒤 신규 계획 연결에만 ID allocation을 적용하며 allocation의 원본 경로가 임시 계획 경로와 일치하는지 확인한다. 기존 계획 연결은 allocation의 ID가 같아도 원래 ID·경로를 보존한다. READY barrier dependency 편집이 반영된 최종 계획 ID·경로·본문 hash에 연결한다. collect·intent 저장은 작업 worktree의 최종 계획 본문을 검사하며 promote는 게시 revision의 blob과 catalog의 비종료 계획을 다시 대조한 뒤에만 root review를 성공 baseline에 포함한다. 필수 도구·문서 경로 보호와 기존 cycle·한 번 평가 cadence는 `validate_root_reviews`와 기존 publication 경계에 남긴다.
+
 barrier mode의 유지보수 Planner는 선행과 새 리팩터링 DAG를 판단한다. Manager는 DAG 말단과 SQLite cycle rows로 필요한 선행 dependency closure를 계산한 뒤, closure 밖의 적격 READY snapshot에 누락된 말단 dependency만 기존 순서 뒤에 추가한다. 파일을 수정하기 전 cycle·snapshot 소유권을 다시 확인하고, 예상한 dependency-only diff와 catalog의 acyclic 관계를 검증한다. 실제 Manager diff는 planning result의 hash·publication path에 포함되어 원격 게시·catalog transaction·복구 검증을 통과한다. 게시 본문은 검증한 checkout과 CRLF/LF 줄바꿈 차이만 허용하며 다른 clean filter 내용 변환은 거부한다. 새 계획 등록은 현재 checkout hash와 Git 게시 blob의 감사 hash를 분리해 보존하고, Merge·archive 복구는 publication SHA의 blob hash로 증명한다. 다른 READY 파일 변경, 사용자 결정·draft 해제, snapshot 밖 파일과 실행 중·소유된 계획은 허용하지 않는다. 새 단계별 평가의 일반 계획은 별도 필요한 계획 주기에서 수행한다. 일반 계획 결합 여부와 종전 결과를 이미 보존한 cycle은 해당 mode·게시 검증을 유지해 복구한다.
 
 planning batch의 원격 게시·catalog 반영과 현재 원격 입력 일치를 확인한 뒤 정적·모듈 평가 근거와 해당 성공 기준을 SQLite transaction에서 확정한다. 미게시·검증 실패·원격 source 변경은 성공 기준을 전진시키지 않으며 잠정 근거·publication intent를 보존해 복구한다. 새 리팩터링 계획은 검증된 DAG와 Manager barrier 편집을 포함해 게시한다. 이후 cycle 종료는 R-074의 마지막 Merge·원격 관측·catalog 반영 조건을 따르며 새 cycle에서 사후 재검증을 종료 조건으로 추가하지 않는다.
@@ -446,6 +448,8 @@ definition snapshot에는 원래 ExecPlan 전문과 전체 body hash를 함께 �
 그 밖의 자유 문장·새 조건·승인은 해당 절 안에서도 입력이다. 두 원문과 hash가 일치해야 기록 분리를 적용하며 legacy snapshot은 원래 revision/path를 다시 읽어 저장 hash를 확인한 경우에만 보강한다. 원문이 없으면 현재 기록으로 합성하지 않는다. 전체 definition·verify 단계 token에는 전체 body hash를 유지해 기록 변경을 Review·승인 예외로 확대하지 않는다.
 
 모든 관리 rebase의 시작·충돌 해결·완료·중단 복구는 현재 repository·계획·canonical worktree·소유 branch·target base·원격 OID와 PR identity/head를 확인한다. Worker 교정 turn, 승인 stage tree, 명령 receipt, reflog 표식, 원본 commit별 replay와 journal 완전성은 완료 조건이 아니며 기존 기록과 실패 감사는 보존한다
+
+rebase 시작 전 Worker branch와 target의 merge-base 이후 모두 바뀐 Requirement·ExecPlan 경로는 해당 소유 rebase의 문서 재생 입력으로만 허용한다. 이 예외는 Worker 변경 승인으로 이어지지 않으며, 충돌 해결·stage·재시작 뒤에도 target revision의 고정 원문과 경로로 대조하기 전에는 완료 채택하지 않는다.
 
 자동 Worker 해결과 사용자의 수동 파일 해결·stage·continue·완료를 같은 현재 상태 판정으로 수용한다. 소유 rebase의 Requirement·ExecPlan 충돌은 `rebase_documents`가 관측한 원격 base의 immutable revision에서 catalog·ID·source·dependency와 실제 PR 경계를 확인한 뒤 해당 문서의 bytes·mode·경로·삭제를 채택한다. PRODUCT·ARCHITECTURE·지침과 코드·테스트·설정은 자동 선택하지 않는다. rename·archive의 목적지는 같은 원본 ID로 확인하며 현재 작업의 삭제·archive·미반영 rename으로 유효성을 확정할 수 없으면 원인과 범위를 checkpoint에 보존한다.
 

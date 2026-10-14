@@ -182,6 +182,217 @@ class TieredAssessmentTest(PlanningCase):
         self.assertEqual(self.ports.tiered.repository.evidence("/repo", 1, self.sha)["receipts"], [])
         self.ports.agent.run_planner.assert_not_called()
 
+    def test_confirmed_root_move_candidate_prevents_no_change_and_enters_plan_context(self):
+        root = {"path": "notes.md", "category": "internal_implementation",
+            "destination": "docs/notes.md", "reason": "Move confirmed internal notes to their safe destination.",
+            "references": [{"path": "notes.md", "excerpt": "internal notes content"}],
+            "user_path": "This file is not a user entry point.",
+            "ownership": "The application module owns this internal note."}
+        self.ports.tiered.repository.evidence = mock.Mock(return_value={
+            "receipts": [], "root_reviews": [root], "root_plan_links": None,
+        })
+        self.ports.tiered.prepare = mock.Mock(return_value={
+            "mode": "fast", "source_revision": self.sha, "cycle": 1,
+            "digest": "d" * 64, "records": {}, "roots": [], "reasons": [], "root_reviews": [root],
+        })
+        self.ports.tiered.repository.pending = mock.Mock(return_value=None)
+        self.ports.tiered.repository.units = mock.Mock(return_value=())
+        outcome, context = tiered_assessment.prepare_turn(
+            self.ports, self.run, self.run.planning_worktree,
+        )
+        self.assertIsNone(outcome)
+        manifest = Path(context.split("manifest: ", 1)[1].strip())
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        self.assertEqual(payload["root_move_candidates"]["notes.md"]["destination"], "docs/notes.md")
+        self.assertIn("읽기 전용 Review", context)
+
+    def test_root_move_plan_requires_location_and_regression_contracts(self):
+        from loop_manager_internal.maintenance.tiered_ports import _root_move_plan_covers
+
+        text = """## Purpose
+Move root notes.md to docs/notes.md while preserving user behavior, the public contract, and storage format.
+
+## Acceptance Criteria
+The plan moves notes.md to docs/notes.md and preserves import paths, execution commands, build and deploy, configuration discovery, relative paths, and documentation links.
+
+## Implementation
+Update references from notes.md to docs/notes.md, including import users and config discovery.
+
+## Validation
+Run the targeted unit test, the full verify, and a read-only Review.
+"""
+        self.assertTrue(_root_move_plan_covers("notes.md", "docs/notes.md", text))
+        self.assertFalse(_root_move_plan_covers("notes.md", "docs/notes.md", text.replace("full verify", "unit test")))
+        self.assertFalse(_root_move_plan_covers("notes.md", "docs/notes.md", text.replace("docs/notes.md", "docs/other.md")))
+        self.assertEqual(tiered_review.plan_content_hash(b"plan\r\ntext\r\n"),
+                         tiered_review.plan_content_hash(b"plan\ntext\n"))
+
+    def test_root_move_candidate_rejects_cancelled_existing_plan(self):
+        from loop_manager_internal.maintenance.maintenance_orchestration import MaintenancePlannerDecision, MaintenanceOutcome
+
+        root = {"path": "notes.md", "category": "internal_implementation",
+            "destination": "docs/notes.md", "reason": "Move the internal note to its safe destination.",
+            "references": [{"path": "notes.md", "excerpt": "internal notes content"}],
+            "user_path": "This file is not a user entry point.",
+            "ownership": "The application module owns this internal note."}
+        relative = "docs/plans/[G-001] Existing.md"
+        plan = self.run.planning_worktree / relative
+        plan.parent.mkdir(parents=True, exist_ok=True)
+        plan.write_text("""## Purpose
+Move notes.md to docs/notes.md while preserving user behavior, public API contract, and storage format.
+
+## Acceptance Criteria
+Move notes.md to docs/notes.md and preserve imports, execution commands, build and deploy, configuration discovery, relative paths, and documentation links.
+
+## Implementation
+Update imports, commands, build and deploy references, configuration discovery, relative paths, and documentation links while preserving user behavior, public API contract, and storage format.
+
+## Validation
+Run targeted unit tests, full verify, and a read-only Review.
+""", encoding="utf-8")
+        self.connection.execute("INSERT INTO exec_plans VALUES (?, ?, ?, ?)",
+                                 ("/repo", "G-001", "CANCELLED", relative))
+        self.ports.tiered.repository.evidence = mock.Mock(return_value={
+            "receipts": [], "root_reviews": [root], "root_plan_links": None,
+        })
+        self.ports.tiered.repository.record_root_plan_links = mock.Mock()
+        disposition = [{"index": 0, "status": "existing_plan", "plan_id": "G-001",
+                        "reason": "This path and preservation plan are connected to the root evidence."}]
+        self.run.row = replace(self.run.row,
+            planning_result="MODULE_FINDINGS_RESULT: " + json.dumps(disposition))
+
+        with self.assertRaises(tiered_review.TieredReviewError):
+            self.ports.tiered.validate_final(
+                self.run, MaintenancePlannerDecision(MaintenanceOutcome.NO_CHANGE),
+            )
+        self.ports.tiered.repository.record_root_plan_links.assert_not_called()
+
+    def test_root_plan_links_bind_to_id_allocations_and_final_barrier_bytes(self):
+        from loop_manager_internal.application.contracts import PlanIdAllocation, ValidatedPlanningResult
+        from loop_manager_internal.maintenance.maintenance_orchestration import (
+            MaintenanceOutcome, MaintenancePlannerDecision,
+        )
+        from tests.support.catalog import plan_text as execplan_text
+
+        def plan_text(plan_id, path, destination, *, depends_on=()):
+            text = execplan_text(plan_id, f"Preserve {path}", depends_on=depends_on,
+                purpose=(f"Move {path} to {destination} while preserving user behavior, "
+                         "the public API contract, and storage format."),
+                acceptance_criteria=(f"Move {path} to {destination}; preserve import paths, execution commands, "
+                    "build and deploy, configuration discovery, relative paths, and documentation links."),
+                implementation=("Update imports, command references, build/deploy, configuration discovery, "
+                    "relative paths, and documentation links while preserving user behavior, public API contract, "
+                    "and storage format."))
+            return text.replace(
+                "- The full verify must preserve existing behavior.",
+                "- Run the full verify and a read-only Review.",
+            )
+
+        roots = [
+            {"path": "assets.md", "category": "internal_implementation", "destination": "docs/assets.md",
+             "reason": "Move the internal asset note to its safe destination."},
+            {"path": "notes.md", "category": "internal_implementation", "destination": "docs/notes.md",
+             "reason": "Move the internal note to its safe destination."},
+        ]
+        plan_dir = self.run.planning_worktree / "docs/plans"
+        plan_dir.mkdir(parents=True)
+        existing_path = "docs/plans/[G-001] Preserve Assets.md"
+        existing = self.run.planning_worktree / existing_path
+        existing.write_text(plan_text("G-001", "assets.md", "docs/assets.md", depends_on=("G-000",)),
+                            encoding="utf-8")
+        source_path = "docs/plans/[G-003] Preserve Notes.md"
+        source = self.run.planning_worktree / source_path
+        source.write_text(plan_text("G-003", "notes.md", "docs/notes.md"), encoding="utf-8")
+        self.connection.execute("INSERT INTO exec_plans VALUES (?, ?, ?, ?)",
+            ("/repo", "G-001", "READY", existing_path))
+        self.ports.tiered.repository.evidence = mock.Mock(return_value={
+            "digest": "a" * 64, "receipts": [], "root_reviews": roots,
+        })
+        dispositions = [
+            {"index": 0, "status": "existing_plan", "plan_id": "G-001",
+             "reason": "The existing READY plan preserves the root asset and its references."},
+            {"index": 1, "status": "new_plan", "plan_id": "G-003",
+             "reason": "The new plan preserves the root note and its references."},
+        ]
+        self.run.row = replace(self.run.row,
+            planning_result="MODULE_FINDINGS_RESULT: " + json.dumps(dispositions))
+        decision = MaintenancePlannerDecision(MaintenanceOutcome.REFACTORING, ("G-003",))
+        self.assertEqual(self.ports.tiered.validate_final(self.run, decision), ("G-001",))
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM tiered_maintenance_root_plan_links").fetchone())
+
+        target_path = "docs/plans/[G-004] Preserve Notes.md"
+        target = self.run.planning_worktree / target_path
+        target.write_text(plan_text("G-004", "notes.md", "docs/notes.md"), encoding="utf-8")
+        source.unlink()
+        source_allocation = PlanIdAllocation(source_path, "G-003", target_path, "G-004")
+        existing.write_text(plan_text("G-001", "assets.md", "docs/assets.md",
+                                       depends_on=("G-000", "G-004")), encoding="utf-8")
+        general_source_path = "docs/plans/[G-001] New General Plan.md"
+        general_target_path = "docs/plans/[G-002] New General Plan.md"
+        (self.run.planning_worktree / general_target_path).write_text(
+            "A separate newly normalized general plan.", encoding="utf-8",
+        )
+        general_allocation = PlanIdAllocation(
+            general_source_path, "G-001", general_target_path, "G-002",
+        )
+        validated_result = ValidatedPlanningResult(
+            plans=((target_path, {"id": "G-004", "title": "Preserve notes.md"}),
+                   (general_target_path, {"id": "G-002", "title": "New General Plan"})),
+            publication_paths=(existing_path, target_path, general_target_path),
+            id_allocations=(general_allocation, source_allocation),
+        )
+        drafts = self.run.tiered_root_plan_links
+        mismatched_allocation = PlanIdAllocation(
+            "docs/plans/[G-003] Different Source.md", "G-003", target_path, "G-004",
+        )
+        invalid_result = ValidatedPlanningResult(
+            plans=validated_result.plans,
+            publication_paths=validated_result.publication_paths,
+            id_allocations=(general_allocation, mismatched_allocation),
+        )
+        with self.assertRaisesRegex(tiered_review.TieredReviewError, "원본 경로"):
+            self.ports.tiered.record_final_root_plan_links(self.run, invalid_result)
+        self.assertEqual(self.run.tiered_root_plan_links, drafts)
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM tiered_maintenance_root_plan_links").fetchone())
+
+        self.ports.tiered.record_final_root_plan_links(self.run, validated_result)
+
+        saved = json.loads(self.connection.execute(
+            "SELECT links_json FROM tiered_maintenance_root_plan_links").fetchone()[0])
+        by_root = {item["path"]: item for item in saved}
+        self.assertEqual((by_root["assets.md"]["plan_id"], by_root["assets.md"]["plan_path"]),
+                         ("G-001", existing_path))
+        self.assertEqual((by_root["notes.md"]["plan_id"], by_root["notes.md"]["plan_path"]),
+                         ("G-004", target_path))
+        self.assertEqual(by_root["notes.md"]["plan_hash"],
+                         tiered_review.plan_content_hash(target.read_bytes()))
+        self.assertEqual(by_root["assets.md"]["plan_hash"],
+                         tiered_review.plan_content_hash(existing.read_bytes()))
+        self.assertEqual(self.run.tiered_root_plan_links, ())
+
+    def test_planner_result_saves_root_links_after_maintenance_validation(self):
+        events = []
+        result = object()
+        self.run.maintenance_planning = True
+        self.run.dirty_files = []
+        self.run.tiered_root_plan_links = ({"path": "notes.md"},)
+        self.run.row = replace(self.run.row,
+            planning_result='MAINTENANCE_RESULT: {"outcome":"no_change"}')
+        self.ports.tiered.validate_final = mock.Mock(
+            side_effect=lambda *_args: (events.append("disposition"), ())[1])
+        self.ports.validation.validate_maintenance_result = mock.Mock(
+            side_effect=lambda *_args, **_kwargs: (events.append("validated"), result)[1])
+        self.ports.tiered.record_final_root_plan_links = mock.Mock(
+            side_effect=lambda _run, validated: (events.append("links"), self.assertIs(validated, result)))
+
+        with mock.patch.object(tiered_assessment, "enabled", return_value=True):
+            outcome = self.coordinator._assessment._validate_planner_result(self.run)
+
+        self.assertIsNone(outcome)
+        self.assertEqual(events, ["disposition", "validated", "links"])
+
     def test_invalid_model_result_is_bounded_and_session_is_preserved(self):
         self.model(output="invalid model output")
         for _ in range(3):

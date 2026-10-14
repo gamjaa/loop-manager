@@ -222,6 +222,8 @@ class CatalogSchedulingTest(AutomationCatalogFixture, unittest.TestCase):
                     side_effect=agent,
                 ), legacy_planning_ports(), dummy_worker_context(
                     roles=("worker", "planner", "maintenance_planner")
+                ), mock.patch(
+                    "loop_manager_internal.application.scheduler.VerifyCoordinator"
                 ):
                     outcomes = loop_manager.schedule_registered_projects(
                         connection,

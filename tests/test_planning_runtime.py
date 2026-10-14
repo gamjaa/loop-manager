@@ -4,7 +4,12 @@ from loop_manager_internal.planning.planning_runtime import (
     PlanningDecisionKind, PlanningLifecycleCoordinator, PlanningOutcomeKind,
     choose_planning_decision,
 )
-from tests.support.planning_case import PlanningCase, FakePorts, planning_snapshot
+from loop_manager_internal.planning.planning_contracts import (
+    _PlanningRun, local_run, snapshot_run,
+)
+from tests.support.planning_case import (
+    PlanningCase, FakePorts, maintenance_cycle, planning_snapshot,
+)
 
 
 class PlanningDecisionTest(unittest.TestCase):
@@ -57,6 +62,24 @@ class PlanningDecisionTest(unittest.TestCase):
             decision.kind,
             PlanningDecisionKind.RUN_FALLBACK_PLANNING,
         )
+
+
+class PlanningRunConversionTest(PlanningCase):
+    def test_local_run_uses_snapshot_fields_and_defaults_transient_state(self):
+        run = _PlanningRun(
+            context=self.context,
+            row=planning_snapshot(),
+            maintenance_cycle=maintenance_cycle(),
+            base_sha=self.context.base_sha,
+            maintenance_planning=False,
+            dirty_files=["changed.md"],
+            tiered_root_plan_links=({"plan_id": "P-1"},),
+        )
+
+        restored = local_run(snapshot_run(run))
+
+        self.assertEqual(restored.dirty_files, ["changed.md"])
+        self.assertEqual(restored.tiered_root_plan_links, ())
 
 
 class PlanningLifecycleCoordinatorTest(PlanningCase):
