@@ -29,26 +29,20 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
         checkpoints = ExecutionCheckpointRepository(self.connection)
         self.handler.effects = replace(self.effects, checkpoint=checkpoints)
         self.effects.revision.source_fingerprint.return_value = 'changed-source'
-        for candidate in ('base', 'unseen-head'):
-            with self.subTest(candidate=candidate):
-                self.state.update_project(self.repo, phase='VERIFYING', worker_result=READY_WORKER_RESULT,
-                    definition_snapshot=previous.serialize(), worker_input_token=previous.legacy_worker_token,
-                    archive_token=previous.archive_token)
-                checkpoints.record(self.repo, 'G-047', expected_generation=checkpoints.get(self.repo, 'G-047').generation,
-                    operation=None, expected_head='base', target_base_oid='base', observed_remote_oid=None,
-                    snapshot={'current_rebase_acceptance': {'head': 'base'},
-                              'worker_candidate_token': previous.legacy_worker_candidate_token(candidate)})
-                result = self.handler.guard(self.context())
-                if candidate == 'base':
-                    self.assertNotIsInstance(result, ExecutionOutcome)
-                    self.assertEqual(result.phase, ExecutionPhase.VERIFYING)
-                    self.assertEqual(self.state.row()['phase'], 'VERIFYING')
-                    self.assertEqual(self.state.row()['worker_result'], READY_WORKER_RESULT)
-                    self.assertEqual(self.state.row()['worker_input_token'], previous.worker_token)
-                else:
-                    self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
-                    self.assertEqual(self.state.row()['phase'], 'WORKING')
-                    self.assertIsNone(self.state.row()['worker_result'])
+        candidate = 'base'
+        self.state.update_project(self.repo, phase='VERIFYING', worker_result=READY_WORKER_RESULT,
+            definition_snapshot=previous.serialize(), worker_input_token=previous.legacy_worker_token,
+            archive_token=previous.archive_token)
+        checkpoints.record(self.repo, 'G-047', expected_generation=checkpoints.get(self.repo, 'G-047').generation,
+            operation=None, expected_head='base', target_base_oid='base', observed_remote_oid=None,
+            snapshot={'current_rebase_acceptance': {'head': 'base'},
+                      'worker_candidate_token': previous.legacy_worker_candidate_token(candidate)})
+        result = self.handler.guard(self.context())
+        self.assertNotIsInstance(result, ExecutionOutcome)
+        self.assertEqual(result.phase, ExecutionPhase.VERIFYING)
+        self.assertEqual(self.state.row()['phase'], 'VERIFYING')
+        self.assertEqual(self.state.row()['worker_result'], READY_WORKER_RESULT)
+        self.assertEqual(self.state.row()['worker_input_token'], previous.worker_token)
         self.effects.agent.run_agent.assert_not_called()
 
     def test_conflicted_rebase_uses_original_legacy_body_for_record_comparison(self):
@@ -358,7 +352,8 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
             ('title', 'Unauthorized'), ('sources', ['docs/OTHER.md']),
         ):
             with self.subTest(field=field), mock.patch(
-                'loop_manager.capture_git_snapshot'
+                'loop_manager.capture_git_snapshot', return_value=lm.GitSnapshot(
+                    'owned-head', 'loop-manager/G-047', {}, {}, {}, {}, {}, {})
             ), mock.patch('loop_manager.validate_agent_scope'), mock.patch(
                 'loop_manager.validate_managed_worktree'
             ), mock.patch('loop_manager.validate_execplan', return_value={
@@ -370,7 +365,8 @@ class ExecutionRevisionGateTests(ExecutionRecoveryScenarios, ExecutionPhaseScena
                         'main', catalog['path'], catalog, mock.Mock(),
                         allow_rebase=True, rebase_definition=baseline,
                     )
-        with mock.patch('loop_manager.capture_git_snapshot'), mock.patch(
+        with mock.patch('loop_manager.capture_git_snapshot', return_value=lm.GitSnapshot(
+                'owned-head', 'loop-manager/G-047', {}, {}, {}, {}, {}, {})), mock.patch(
             'loop_manager.validate_agent_scope'
         ), mock.patch('loop_manager.validate_managed_worktree'), mock.patch(
             'loop_manager.validate_execplan', return_value=workspace_plan

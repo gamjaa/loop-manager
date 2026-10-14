@@ -88,6 +88,10 @@ class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
     def test_current_acceptance_push_completion_retains_ownership_on_restart(self):
         self._prepare_current_checkpoint_recovery()
         self.handler._complete_rebase_intent(self.fixture.context())
+        live = mock.patch('loop_manager_internal.git.manager_git_journal.live_remote_branch_oid',
+                          side_effect=lambda *_: self.observed.remote.oid)
+        live.start()
+        self.addCleanup(live.stop)
         accepted = self.checkpoint.get('repo', 'G-047').snapshot['current_rebase_acceptance']
         for entry in ('normal', 'recover'):
             with self.subTest(entry=entry):
@@ -115,7 +119,7 @@ class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
                 self.checkpoint.record('repo', 'G-047', expected_generation=saved.generation,
                     operation='pr_create', expected_head='owned-head', target_base_oid='base',
                     observed_remote_oid='owned-head', snapshot=saved.snapshot)
-                pr = dict(url='new-pr', headRefOid='owned-head')
+                pr = dict(url='new-pr', headRefName=self.expected.branch, headRefOid='owned-head')
                 from loop_manager_internal.git.managed_rebase_validation import PullRequest
                 self.observed = replace(self.observed, remote=replace(self.observed.remote,
                     pull_request=PullRequest('new-pr', 'repo', self.expected.branch, 'owned-head', 'OPEN')))

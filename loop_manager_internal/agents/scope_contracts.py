@@ -131,15 +131,13 @@ class AgentChange:
 
 
 class AgentScopeError(RuntimeError):
-    """An Agent changed Git state outside its role boundary."""
+    """A role result or preserved recovery input failed validation."""
 
     def __init__(
         self,
         message: str,
         result_snapshot: GitSnapshot | None = None,
-        reason_code: BlockReasonCode = (
-            BlockReasonCode.MANAGED_WORKTREE_SCOPE_VIOLATION
-        ),
+        reason_code: BlockReasonCode = BlockReasonCode.REPOSITORY_STATE_UNSAFE,
     ) -> None:
         super().__init__(message)
         self.result_snapshot = result_snapshot

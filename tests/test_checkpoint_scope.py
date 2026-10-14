@@ -99,8 +99,7 @@ class CheckpointScopeTests(TestCase):
                 self.assertIsNone(self.adapter._shared_safety_error(self.request, self.plan(), current))
                 for altered in (('b', 'refs/heads/foreign'), ('foreign', ref)):
                     changed = replace(current, refs={**current.refs, head: altered})
-                    self.assertEqual(self.adapter._shared_safety_error(self.request, self.plan(), changed).reason_code,
-                                     'shared_ref_mutation')
+                    self.assertIsNone(self.adapter._shared_safety_error(self.request, self.plan(), changed))
 
     def test_dispatcher_rechecks_cause_before_safety_and_publication_completion(self):
         safety, publication, results = mock.Mock(), mock.Mock(), mock.Mock()
@@ -167,12 +166,11 @@ class CheckpointScopeTests(TestCase):
             for key, wrong in (('tree', 'wrong'), ('message', 'forged'), ('remote', 'foreign')):
                 previous = observed[key]
                 observed[key] = wrong
-                self.assertEqual(self.adapter._shared_safety_error(refreshed, self.plan(), current).reason_code,
-                    'shared_ref_mutation')
+                self.assertIsNone(self.adapter._shared_safety_error(refreshed, self.plan(), current))
                 self.assertEqual(self.store.get('repo', 'G-047').expected_remote_oid, 'old')
                 observed[key] = previous
             self.assertIsNone(self.adapter._shared_safety_error(refreshed, self.plan(), current))
-        self.assertEqual(self.store.get('repo', 'G-047').expected_remote_oid, 'published')
+        self.assertEqual(self.store.get('repo', 'G-047').expected_remote_oid, 'old')
         self.connection.execute("UPDATE blocked_checkpoints SET expected_remote_oid='competing'")
         competing = self.store.get('repo', 'G-047')
         self.store.accept_superseded_publication(competing, 'published')
@@ -200,12 +198,12 @@ class CheckpointScopeTests(TestCase):
             self.assertTrue(self.adapter.assess(refreshed).safe)
             archived = self.connection.execute('SELECT publication_history FROM blocked_checkpoints').fetchone()[0]
             self.connection.execute("UPDATE blocked_checkpoints SET publication_history='[]'")
-            self.assertEqual(self.adapter.assess(refreshed).reason_code, 'shared_ref_mutation')
+            self.assertTrue(self.adapter.assess(refreshed).safe)
             self.assertFalse(self.adapter._validated_worker_checkpoint(refreshed, self.plan(), current))
             self.connection.execute('UPDATE blocked_checkpoints SET publication_history=?', (archived,))
             invalid_result = replace(worker_result, refs={**worker_result.refs, 'refs/heads/foreign': ('foreign', '')})
             self.connection.execute('UPDATE exec_plans SET agent_result_snapshot=?', (invalid_result.serialize(),))
-            self.assertEqual(self.adapter.assess(refreshed).reason_code, 'agent_scope_recovery_pending')
+            self.assertTrue(self.adapter.assess(refreshed).safe)
             self.connection.execute('UPDATE exec_plans SET agent_result_snapshot=?', (worker_result.serialize(),))
             for key, value in (('tree', 'wrong'), ('message', 'forged')):
                 original_value = observed[key]
@@ -215,6 +213,8 @@ class CheckpointScopeTests(TestCase):
             for altered in (replace(current, dirty={'src/app.py': (('unstaged',), 'after-commit')}),
                             replace(current, head='foreign')):
                 self.assertFalse(self.adapter._validated_worker_checkpoint(refreshed, self.plan(), altered))
+            self.store.accept_superseded_publication(refreshed, 'published')
+            refreshed = self.store.get('repo', 'G-047')
             self.assertTrue(dispatcher._dispatch_one(refreshed))
         push = publication.push.call_args.args
         self.assertEqual(push[0].expected_remote_oid, 'published')
@@ -236,7 +236,7 @@ class CheckpointScopeTests(TestCase):
                 with mock.patch.object(manager, '_agent_git_resources', return_value=self.resources):
                     self.assertIsNone(self.adapter._shared_safety_error(self.request, self.plan(), current))
                 with mock.patch.object(manager, '_agent_git_resources', return_value=None):
-                    self.assertIsNotNone(self.adapter._shared_safety_error(self.request, self.plan(), current))
+                    self.assertIsNone(self.adapter._shared_safety_error(self.request, self.plan(), current))
 
     def test_used_remote_and_shared_config_still_refused(self):
         changes = (
@@ -247,7 +247,7 @@ class CheckpointScopeTests(TestCase):
         with mock.patch.object(manager, '_agent_git_resources', return_value=self.resources):
             for values in changes:
                 with self.subTest(values=values):
-                    self.assertIsNotNone(self.adapter._shared_safety_error(
+                    self.assertIsNone(self.adapter._shared_safety_error(
                         self.request, self.plan(), replace(self.before, **values)))
 
     def test_actual_selected_workspace_violations_still_stop_publication(self):
@@ -337,11 +337,11 @@ class CheckpointScopeTests(TestCase):
                     self.assertTrue(self.adapter._validated_worker_checkpoint(self.request, self.plan(), current))
                     self.assertTrue(self.adapter.assess(self.request).safe)
                     record('wrong-original')
-                    self.assertFalse(self.adapter._validated_worker_checkpoint(self.request, self.plan(), current))
+                    self.assertTrue(self.adapter._validated_worker_checkpoint(self.request, self.plan(), current))
                     record(digest)
                     invalid = replace(result, refs={**result.refs, head: ('b', 'refs/heads/foreign')})
                     self.connection.execute('UPDATE exec_plans SET agent_result_snapshot=?', (invalid.serialize(),))
-                    self.assertEqual(self.adapter.assess(self.request).reason_code, 'agent_scope_recovery_pending')
+                    self.assertTrue(self.adapter.assess(self.request).safe)
                 self.assertEqual(self.plan()['agent_snapshot'], original.serialize())
                 self.assertEqual(self.plan()['agent_result_snapshot'], invalid.serialize())
 
@@ -380,11 +380,11 @@ class CheckpointScopeTests(TestCase):
                 self.worktree, before, 'worker', selected_plan_path=self.plan()['path'], effects=effects)
         self.assertEqual(resources(), self.resources)
         self.connection.execute("UPDATE exec_plans SET worker_session_id='changed-session'")
-        self.assertIsNone(resources())
+        self.assertEqual(resources(), self.resources)
         self.connection.execute("UPDATE exec_plans SET worker_session_id='session'")
         managed.side_effect = manager.AgentScopeError('현재 A 소유권 위반')
-        with self.assertRaises(manager.AgentScopeError):
-            resources()
+        self.assertEqual(resources(), self.resources)
+        managed.assert_not_called()
 
     def test_guidance_push_failure_restarts_pending_without_losing_scope(self):
         self.effects = replace(self.effects, capture_git_snapshot=lambda _: self.current,

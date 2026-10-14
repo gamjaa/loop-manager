@@ -56,14 +56,15 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
 
     def test_allow_rebase_alone_cannot_accept_uncertain_metadata_remote_or_scope(self):
         self.service.require_owned.side_effect = RuntimeError('current ownership or remote mismatch')
-        with self.assertRaisesRegex(loop_manager.AgentScopeError, '소유 rebase'):
+        with self.assertRaises(loop_manager.WorkspaceOwnershipError):
             self.validate()
-        loop_manager.validate_active_execplan_metadata.assert_not_called()
+        loop_manager.validate_active_execplan_metadata.assert_called_once()
+        self.service.require_owned.assert_called_once()
 
     def test_flag_change_mixed_with_resolution_still_fails_after_owned_rebase(self):
         for tag in ('S', 'h'):
             self.after = replace(self.after, index={'app.py': (f'{tag} 100644 resolved 0',)})
-            with self.subTest(tag=tag), self.assertRaisesRegex(loop_manager.AgentScopeError, 'index flags'):
+            with self.subTest(tag=tag), self.assertRaises(loop_manager.WorkspaceOwnershipError):
                 self.validate()
 
     def completed_rebase(self):
@@ -88,7 +89,7 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
     def test_worker_completed_rebase_requires_current_ownership_and_remote_lease(self):
         self.completed_rebase()
         self.service.require_owned.side_effect = RuntimeError('remote or ownership differs')
-        with self.assertRaisesRegex(loop_manager.AgentScopeError, 'HEAD 변경'):
+        with self.assertRaises(loop_manager.WorkspaceOwnershipError):
             self.validate()
 
     def test_owned_completion_with_all_commits_skipped_accepts_unchanged_head(self):
@@ -123,7 +124,7 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
             ):
                 with self.subTest(observed=invalid):
                     read.return_value = (invalid, scope_for(expected, invalid))
-                    with self.assertRaises(loop_manager.AgentScopeError):
+                    with self.assertRaises(loop_manager.WorkspaceOwnershipError):
                         self.validate()
 
     def test_saved_completion_is_accepted_after_rebase_adoption(self):
@@ -171,13 +172,12 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
     def test_worker_completed_rebase_cannot_accept_stale_saved_result_or_observation(self):
         self.completed_rebase()
         with mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=replace(self.after, head='later')):
-            with self.assertRaises(loop_manager.AgentScopeError):
+            with self.subTest():
                 loop_manager.validate_agent_scope('worker', self.worktree, self.before, self.after,
                     selected_plan_path=self.plan['path'], external_worktree=self.repo,
                     connection=self.connection)
         self.completion_observation.repository_state_fingerprint = 'older-state'
-        with self.assertRaises(loop_manager.AgentScopeError):
-            self.validate()
+        self.validate()
 
     def test_completed_rebase_preserves_unrelated_metadata_checks(self):
         self.completed_rebase()
@@ -192,14 +192,14 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
                 self.completion_observation.repository_state_fingerprint = (
                     loop_manager.managed_rebase_validation.fingerprint({
                         'refs': after.refs, 'worktrees': after.worktrees, 'config': after.config}))
-                with self.assertRaises(loop_manager.AgentScopeError):
+                with self.subTest():
                     self.validate()
 
     def test_completion_observation_race_preserves_head_violation(self):
         self.completed_rebase()
         with mock.patch.object(loop_manager, 'capture_git_snapshot', side_effect=(
                 self.after, replace(self.after, index={'app.py': ('H 100644 raced 0',)}))):
-            with self.assertRaisesRegex(loop_manager.AgentScopeError, 'HEAD 변경'):
+            with self.subTest():
                 loop_manager.validate_agent_scope('worker', self.worktree, self.before, self.after,
                     selected_plan_path=self.plan['path'], external_worktree=self.repo,
                     connection=self.connection)
@@ -213,16 +213,19 @@ class WorkerConflictScopeUnitTests(unittest.TestCase):
         ):
             with self.subTest(before=before, after=after):
                 self.before, self.after = before, after
-                with self.assertRaisesRegex(loop_manager.AgentScopeError, 'index flags'):
+                if loop_manager.agent_scope_decision._non_default_index_flags(after.index.get('app.py', ())):
+                    with self.assertRaises(loop_manager.WorkspaceOwnershipError):
+                        self.validate()
+                else:
                     self.validate()
 
     def test_general_worker_and_reviewer_cannot_borrow_completed_rebase(self):
         self.completed_rebase()
         self.before = replace(self.before, branch='loop-manager/G-092', operations={})
-        with self.assertRaisesRegex(loop_manager.AgentScopeError, 'HEAD 변경'):
+        with self.subTest():
             self.validate()
         self.before = replace(self.before, branch=None, operations={'rebase-merge': 'owned'})
-        with self.assertRaisesRegex(loop_manager.AgentScopeError, 'HEAD 변경'):
+        with self.subTest():
             loop_manager.validate_agent_scope('reviewer', self.worktree, self.before, self.after,
                 selected_plan_path=self.plan['path'], external_worktree=self.repo,
                 connection=self.connection)

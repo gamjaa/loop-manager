@@ -650,10 +650,10 @@ class WorkBranchIntegrationUnitTests(unittest.TestCase):
     def test_push_after_abort_reuses_conflict_without_second_abort(self):
         self._work_restart_successor(after_abort=True)
 
-    def test_restart_successor_rewrite_is_refused_without_losing_preservation(self):
+    def test_restart_unrelated_history_is_refused_without_losing_preservation(self):
         original = self._pause_work_restart(after_abort=False)
         def rewritten(root, *args, **kwargs):
-            if args == ('merge-base', '--is-ancestor', 'second-input', 'third-input'):
+            if args == ('merge-base', 'second-input', 'third-input'):
                 return subprocess.CompletedProcess([], 1, '')
             return self.git(root, *args, **kwargs)
         self.effects.git.side_effect = rewritten
@@ -850,88 +850,34 @@ class BlockedUserInputScopeUnitTests(unittest.TestCase):
             self.connection, Path('/source'), 'repo', 'main', self.worktree,
             'docs/plans/[G-166] Work.md', saved_plan=self.plan, effects=self.effects, **options)
 
-    def test_completed_isolated_agent_result_is_checked_before_local_user_changes(self):
-        self.validate()
-        checks = self.effects.validate_agent_scope.call_args_list
-        self.assertEqual(checks[0].args[0], 'worker')
-        self.assertEqual(checks[0].args[3], self.result)
-        self.assertEqual(checks[-1].args[0], 'reviewer')
-        self.assertEqual(checks[-1].args[2].dirty, self.current.dirty)
-        self.assertEqual(checks[-1].kwargs['resources'].refs,
-            frozenset({'refs/heads/loop-manager/G-166', 'refs/remotes/origin/main',
-                       'refs/remotes/origin/HEAD', 'refs/remotes/origin/loop-manager/G-166'}))
-
-    def test_same_head_input_needs_no_ancestry_command(self):
-        self.effects.capture_git_snapshot.return_value = replace(self.current, head=self.result.head)
-        self.validate()
-        self.effects.git.assert_not_called()
-
-    def test_scope_correction_keeps_saved_result_and_checks_current_state(self):
-        self.plan['blocked_reason'] = 'managed_worktree_scope_violation'
-        self.effects.capture_git_snapshot.return_value = self.result
-        self.validate()
-        self.effects.git.assert_not_called()
-        self.assertEqual(self.effects.validate_agent_scope.call_args.args[3], self.result)
-        self.assertEqual(self.plan['agent_result_snapshot'], self.result.serialize())
-
-    def test_legacy_or_missing_cause_keeps_commit_isolation_route(self):
-        self.effects.capture_git_snapshot.return_value = self.result
-        for reason in (None, 'legacy_unscoped_block'):
+    def test_saved_result_and_current_input_never_replay_git_access_comparisons(self):
+        for reason in ('verify_retry_exhausted', 'managed_worktree_scope_violation',
+                       'plan_input_invalid', 'legacy_unscoped_block', None):
             with self.subTest(reason=reason):
                 self.plan['blocked_reason'] = reason
-                self.effects.validate_agent_scope.reset_mock()
-                self.validate()
-                checks = self.effects.validate_agent_scope.call_args_list
-                self.assertEqual(len(checks), 2)
-                self.assertTrue(all(check.args[0] == 'worker' for check in checks))
-                self.assertEqual(checks[0].args[3], self.result)
-                self.assertEqual(checks[-1].args[2].dirty, self.result.dirty)
-        self.effects.git.assert_not_called()
+                self.effects.validate_agent_scope.side_effect = AssertionError('past Git access check')
+                self.validate(require_safe_result=True)
+                self.effects.validate_agent_scope.assert_not_called()
+                self.effects.git.assert_not_called()
+                self.assertEqual(self.plan['agent_result_snapshot'], self.result.serialize())
 
-    def test_diagnosed_result_keeps_scope_correction_without_user_normalization(self):
-        self.effects.capture_git_snapshot.return_value = self.result
-        self.plan['blocked_reason'] = 'plan_input_invalid'
-        self.effects.validate_agent_scope.side_effect = [AgentScopeError('diagnosed commit'), None, None]
-        self.validate()
-        checks = self.effects.validate_agent_scope.call_args_list
-        self.assertEqual(len(checks), 3)
-        self.assertTrue(all(check.args[0] == 'worker' for check in checks))
-        self.assertEqual(checks[-1].args[2].dirty, self.result.dirty)
-        self.effects.git.assert_not_called()
-
-    def test_actual_agent_violation_is_not_absorbed_as_user_input(self):
-        self.effects.validate_agent_scope.side_effect = AgentScopeError('actual Agent violation')
-        with self.assertRaisesRegex(AgentScopeError, 'actual Agent'):
-            self.validate(require_safe_result=True)
-        self.effects.validate_agent_scope.assert_called_once()
-
-    def test_unfinished_or_unproven_scope_does_not_absorb_new_user_bytes(self):
-        self.effects._agent_git_resources.return_value = None
-        with self.assertRaisesRegex(AgentScopeError, 'worktree HEAD'):
-            self.validate()
-
-    def test_shared_config_change_remains_visible_to_read_only_scope_check(self):
-        changed = replace(self.current, config={'local:remote.origin.url': ('foreign',)})
-        self.effects.capture_git_snapshot.return_value = changed
-        def check(role, root, before, after, **kwargs):
-            if before.config != after.config:
-                raise AgentScopeError('origin changed')
-        self.effects.validate_agent_scope.side_effect = check
-        with self.assertRaisesRegex(AgentScopeError, 'origin changed'):
-            self.validate()
-
-    def test_legacy_safe_result_does_not_synthesize_invocation_scope_proof(self):
-        self.effects._agent_git_resources.return_value = None
-        self.plan['workspace_owned'] = 1
-        self.current = replace(self.result,
-            refs={**self.result.refs, 'refs/heads/main': ('user-base', ''),
-                  'refs/heads/loop-manager/user': ('user-ref', '')},
-            worktrees={**self.result.worktrees, '/source': ('HEAD=user-base',)})
-        self.effects.capture_git_snapshot.return_value = self.current
+    def test_shared_config_and_other_refs_are_audit_only_on_local_resume(self):
+        self.effects.capture_git_snapshot.return_value = replace(
+            self.current, config={'local:core.hooksPath': ('changed',)},
+            refs={'refs/heads/other': ('other-work', '')})
         self.validate(require_safe_result=True)
-        checked = self.effects.validate_agent_scope.call_args_list
-        self.assertEqual(checked[0].args[3], self.result)
-        self.assertIsNone(checked[-1].kwargs['resources'])
+        self.effects.git.assert_not_called()
+        self.effects.validate_agent_scope.assert_not_called()
+
+    def test_no_history_keeps_current_candidate_without_synthesizing_proof(self):
+        for value in (None, 'unreadable historical snapshot'):
+            with self.subTest(value=value):
+                self.plan['agent_snapshot'] = value
+                self.effects._agent_git_resources.return_value = None
+                self.validate(require_safe_result=True)
+                self.assertEqual(self.plan['agent_snapshot'], value)
+                self.effects._agent_git_resources.assert_not_called()
+
 
 
 if __name__ == '__main__':

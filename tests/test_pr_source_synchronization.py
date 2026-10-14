@@ -480,7 +480,7 @@ class PrSourceSynchronizationTest(PrRecoveryFixture, unittest.TestCase):
             synchronize.assert_not_called()
 
     @dummy_worker_sessions
-    def test_external_head_block_persists_and_preserves_dirty_ahead_source(self):
+    def test_external_head_input_recovery_preserves_dirty_ahead_source(self):
         with tempfile.TemporaryDirectory() as directory:
             (
                 repo,
@@ -541,7 +541,7 @@ class PrSourceSynchronizationTest(PrRecoveryFixture, unittest.TestCase):
             ), mock.patch(
                 "loop_manager.pr_for_branch", return_value=pull_request
             ), mock.patch(
-                "loop_manager.run_codex"
+                "loop_manager.run_codex", return_value=loop_manager.CodexResult(1, "pause after current input recovery", "worker-existing", loop_manager.AgentResultKind.USAGE_LIMIT)
             ) as agent, mock.patch(
                 "loop_manager.git", side_effect=recording_git
             ):
@@ -571,16 +571,16 @@ class PrSourceSynchronizationTest(PrRecoveryFixture, unittest.TestCase):
                 (str(repo),),
             ).fetchone()
             self.assertNotEqual(external_head, observed_head)
-            self.assertEqual((first, second), (1, 1))
+            self.assertEqual((first, second), (0, 0))
             self.assertEqual(stored["status"], "IMPLEMENTING")
             self.assertEqual(stored["pr_conflict_recovery"], 1)
-            self.assertEqual(stored["pr_conflict_head_oid"], observed_head)
+            self.assertEqual(stored["pr_conflict_head_oid"], external_head)
             project = connection.execute(
                 "SELECT phase FROM projects WHERE repo = ?", (str(repo),)
             ).fetchone()
-            self.assertEqual(project["phase"], "PROJECT_BLOCKED")
+            self.assertNotEqual(project["phase"], "PROJECT_BLOCKED")
             self.assertEqual(stored["worker_session_id"], "worker-existing")
             self.assertEqual(stored["reviewer_session_id"], "reviewer-existing")
             self.assertEqual(self._source_checkout_snapshot(repo), source_before)
             self.assertEqual(pushes, [])
-            agent.assert_not_called()
+            self.assertEqual(agent.call_count, 2)

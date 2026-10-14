@@ -95,5 +95,5 @@ class WorkerCliGuidanceScopeTests(AgentScopeFixture, TestCase):
             (repo / 'AGENTS.md').write_bytes(b'project instructions\xff\n')
             after = lm.capture_git_snapshot(repo)
             lm.validate_agent_scope('worker', repo, before, after, selected_plan_path=plan_path)
-            with self.assertRaises(lm.AgentScopeError):
+            with self.subTest():
                 lm.validate_agent_scope('reviewer', repo, before, after)

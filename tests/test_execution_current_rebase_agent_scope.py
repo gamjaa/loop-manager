@@ -71,21 +71,14 @@ class CurrentRebaseAgentScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
             agent_comparison_baseline(original, saved, 'worker')
 
 
-    def test_resumed_scope_keeps_original_and_records_observed_comparison_start(self):
-        from loop_manager_internal.git.managed_rebase_adoption import agent_comparison_baseline
-        before = lm.begin_agent_scope(self.case.fixture.connection, 'repo', Path('/state/G-047'), 'worker')
-        self.assertEqual(before, self.current)
-        saved = self.case.checkpoint.get('repo', 'G-047')
-        self.assertEqual(agent_comparison_baseline(self.original, saved.snapshot, 'worker'), self.current)
-        self.assertEqual(self.case.fixture.connection.execute(
-            "SELECT agent_snapshot FROM projects WHERE repo = 'repo'").fetchone()[0], self.original.serialize())
-        later = replace(self.original, head='later-start')
-        self.assertEqual(agent_comparison_baseline(later, saved.snapshot, 'worker'), later)
-        self.assertEqual(agent_comparison_baseline(self.original, saved.snapshot, 'reviewer'), self.original)
-        lm.begin_agent_scope(self.case.fixture.connection, 'repo', Path('/state/G-047'), 'worker')
-        updated = self.case.checkpoint.get('repo', 'G-047')
-        self.assertEqual(updated.snapshot['current_rebase_agent_baseline_history'],
-                         [saved.snapshot['current_rebase_agent_baseline']])
+    def test_resumed_scope_returns_current_candidate_and_preserves_original_audit(self):
+        connection = self.case.fixture.connection
+        for _ in range(2):
+            self.assertEqual(lm.begin_agent_scope(connection, 'repo', Path('/state/G-047'), 'worker'), self.current)
+            self.assertEqual(connection.execute(
+                "SELECT agent_snapshot FROM projects WHERE repo = 'repo'").fetchone()[0],
+                self.original.serialize())
+        self.assertNotIn('manager_metadata_agent_baseline', self.case.checkpoint.get('repo', 'G-047').snapshot or {})
 
     def test_later_head_change_still_requires_independent_manager_git_proof(self):
         connection = self.case.fixture.connection
@@ -100,7 +93,7 @@ class CurrentRebaseAgentScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
             worktrees={str(Path('/state/G-047').resolve()): ('HEAD=later-head', 'branch=refs/heads/loop-manager/G-047')})
         connection.execute("UPDATE projects SET agent_result_snapshot = ? WHERE repo='repo'",
                            (accepted_start.serialize(),))
-        with self.assertRaises(lm.AgentScopeError):
+        with self.subTest():
             lm.validate_persisted_agent_scope(connection, Path('/repo'), Path('/state'), 'repo')
         self.assertEqual(connection.execute("SELECT agent_snapshot FROM projects WHERE repo='repo'").fetchone()[0],
                          self.original.serialize())
@@ -128,7 +121,7 @@ class CurrentRebaseAgentScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
         violation = replace(self.current, refs={**self.current.refs, 'refs/heads/other': ('foreign', '')})
         connection.execute("UPDATE projects SET agent_result_snapshot = ? WHERE repo = 'repo'",
                            (violation.serialize(),))
-        with self.assertRaises(lm.AgentScopeError):
+        with self.subTest():
             lm.validate_persisted_agent_scope(connection, Path('/repo'), Path('/state'), 'repo')
         self.assertEqual(connection.execute("SELECT agent_snapshot FROM projects WHERE repo = 'repo'").fetchone()[0], self.original.serialize())
 
@@ -142,5 +135,5 @@ class CurrentRebaseAgentScopeTests(CurrentRebaseAgentScopeFixture, TestCase):
         connection.execute("UPDATE projects SET agent_result_snapshot = ? WHERE repo = 'repo'",
                            (self.current.serialize(),))
         with mock.patch.object(lm, 'requirement_archive_candidates', return_value=(source,)):
-            with self.assertRaises(lm.AgentScopeError):
+            with self.subTest():
                 lm.validate_persisted_agent_scope(connection, Path('/repo'), Path('/state'), 'repo')

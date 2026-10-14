@@ -5,10 +5,12 @@ from loop_manager_internal.storage.manual_work_state import manual_workspace_own
 from collections.abc import Callable
 from dataclasses import dataclass
 from loop_manager_internal.agents.scope_contracts import AgentScopeError
+from loop_manager_internal.agents import agent_scope_decision
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.agents.scope_recovery import ignored_comparison_view
 from loop_manager_internal.git import rebase_block_reconciliation
 from loop_manager_internal.git import manager_git_journal
+from loop_manager_internal.git import managed_rebase_adoption
 from loop_manager_internal.recovery import blocked_plan_reconciliation
 from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 from loop_manager_internal.recovery import scoped_blocking
@@ -83,10 +85,26 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
     block = scoped_blocking.project_block(connection, repo)
     if block is None:
         return False
+    if block['reason_code'] == BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value and block['plan_id']:
+        project = connection.execute('SELECT * FROM projects WHERE repo=?', (repo,)).fetchone()
+        plan = connection.execute('SELECT * FROM exec_plans WHERE repo=? AND plan_id=?',
+                                  (repo, block['plan_id'])).fetchone()
+        checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, str(block['plan_id']))
+        reconcile_input = checkpoint.operation != 'rebase'
+        if not reconcile_input and plan is not None and plan['branch']:
+            try:
+                reconcile_input = manager_git_journal.live_remote_branch_oid(
+                    effects.git, repo_path, str(plan['branch'])) != checkpoint.observed_remote_oid
+            except (RuntimeError, OSError):
+                pass
+        if project is not None and plan is not None and reconcile_input:
+            return effects._resume_owned_checkpoint_project_block(connection, repo_path, state_dir,
+                                                                  repo, block, project, plan)
     checkpoint = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
         repo, str(block['plan_id'] or ''))
     recovery = recovery_state.RecoveryRepository(connection).row(repo, str(block['plan_id'] or ''))
-    if rebase_block_reconciliation.could_be_rebase_evidence_block(block, recovery, checkpoint):
+    if (rebase_block_reconciliation.could_be_rebase_evidence_block(block, recovery, checkpoint)
+            or scoped_blocking.is_scope_baseline_block(block) and checkpoint.operation == 'rebase'):
         return effects._reconcile_rebase_evidence_block(
             connection, repo_path, state_dir, repo, block, plan_block=False,
         )
@@ -95,7 +113,8 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
         # A pending rebase cannot borrow the generic branch-only release path
         # when its stored safety cause cannot be connected to this operation.
         return False
-    if block["reason_code"] == BlockReasonCode.LEGACY_UNSCOPED_BLOCK.value:
+    if (block["reason_code"] == BlockReasonCode.LEGACY_UNSCOPED_BLOCK.value
+            and not scoped_blocking.is_scope_baseline_block(block)):
         return False
     plan_id = str(block["plan_id"] or "")
     project = connection.execute(
@@ -107,12 +126,9 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
     if not plan_id:
         if block['reason_code'] == BlockReasonCode.PUBLICATION_OWNERSHIP_UNCERTAIN.value:
             return False
-        if scoped_blocking.is_scope_baseline_block(block) and project['agent_recovery']:
-            return False
         try:
             worktree = Path(str(project['worktree'] or repo_path))
             checked = None
-            ignored_only_comparison = False
             if block["reason_code"] == BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value:
                 worktree = Path(str(project["worktree"] or ""))
                 fingerprint = str(project["planning_attempt_fingerprint"] or "")
@@ -126,44 +142,17 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
                     fingerprint,
                     worktree,
                 )
-            elif project["agent_snapshot"]:
-                before = GitSnapshot.deserialize(str(project["agent_snapshot"]))
-                after = checked = effects.capture_git_snapshot(worktree)
-                start = before
-                before = ignored_comparison_view(worktree, start, before, after, effects=effects)
-                ignored_only_comparison = before.dirty != start.dirty
-                resources = effects._agent_git_resources(connection, repo_path, worktree, before,
-                                                str(project['agent_role'] or 'planner'))
-                if scoped_blocking.is_scope_baseline_block(block) and project['agent_result_snapshot']:
-                    saved_result = GitSnapshot.deserialize(str(project['agent_result_snapshot']))
-                    result = ignored_comparison_view(worktree, start, saved_result, after, effects=effects)
-                    ignored_only_comparison |= result.dirty != saved_result.dirty
-                    comparison = effects._reconciled_manager_scope_metadata(
-                        connection, repo_path, state_dir, repo, None, before, after, resources)
-                    result = effects._reconciled_manager_scope_metadata(
-                        connection, repo_path, state_dir, repo, None, result, after, resources)
-                    effects.validate_agent_scope(str(project['agent_role'] or 'planner'), worktree,
-                        comparison, result, external_worktree=repo_path,
-                        base_branch=str(project['base_branch']), resources=resources)
-                    if ignored_only_comparison:
-                        effects.validate_agent_scope('reviewer', worktree, result, after,
-                            external_worktree=repo_path, base_branch=str(project['base_branch']),
-                            resources=resources)
-                if ignored_only_comparison:
+            elif scoped_blocking.is_scope_baseline_block(block):
+                fingerprint = str(project['planning_attempt_fingerprint'] or '')
+                if fingerprint:
+                    if not project['worktree'] or not project['planning_workspace_owned']:
+                        return False
                     effects.validate_planning_worktree_ownership(
-                        connection, repo_path, state_dir, repo,
-                        str(project['planning_attempt_fingerprint'] or ''), worktree)
-                before = effects._reconciled_manager_scope_metadata(
-                    connection, repo_path, state_dir, repo, None, before, after, resources)
-                effects.validate_agent_scope(
-                    str(project["agent_role"] or "planner"),
-                    worktree,
-                    before,
-                    after,
-                    external_worktree=repo_path,
-                    base_branch=str(project["base_branch"]),
-                    connection=connection,
-                )
+                        connection, repo_path, state_dir, repo, fingerprint, worktree)
+                    checked = effects.capture_git_snapshot(worktree)
+                elif (runtime_state.RuntimeStateRepository(connection).scope_catalog_available()
+                      and runtime_state.RuntimeStateRepository(connection).active_row(repo) is not None):
+                    return False
             else:
                 return False
         except RecoveryFailure:
@@ -171,7 +160,7 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
         except (AgentScopeError, RuntimeError, WorkspaceOwnershipError, ValueError):
             return False
         with runtime_state._transaction(connection):
-            if ignored_only_comparison:
+            if checked is not None:
                 try:
                     effects.validate_planning_worktree_ownership(
                         connection, repo_path, state_dir, repo,
@@ -181,9 +170,22 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
             if (not scoped_blocking.project_cause_matches(connection, block)
                     or dict(connection.execute('SELECT * FROM projects WHERE repo = ?',
                                                (repo,)).fetchone()) != dict(project)
-                    or (checked is not None and effects.capture_git_snapshot(worktree) != checked)):
+                    or (checked is not None and not agent_scope_decision._same_local_snapshot(
+                        effects.capture_git_snapshot(worktree), checked))):
                 return False
             effects._clear_project_block_without_losing_planning_error(connection, repo, project)
+            if scoped_blocking.is_scope_baseline_block(block):
+                checkpoints = execution_checkpoint_state.ExecutionCheckpointRepository(connection)
+                previous = checkpoints.get(repo, '')
+                checkpoints.record(repo, '', expected_generation=previous.generation,
+                    operation=previous.operation, expected_head=previous.expected_head,
+                    target_base_oid=previous.target_base_oid, observed_remote_oid=previous.observed_remote_oid,
+                    snapshot={**(previous.snapshot or {}), 'scope_block_release_audit': [
+                        *(previous.snapshot or {}).get('scope_block_release_audit', ()),
+                        {'block': dict(block), 'prior_agent_recovery': project['agent_recovery']}]})
+                runtime_state.RuntimeStateRepository(connection)._update_project_row(
+                    repo, {'agent_recovery': None})
+            recovery_state.RecoveryRepository(connection).resolve_git_scope_failure(repo, None)
         return True
     plan = connection.execute(
         "SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?",
@@ -203,6 +205,33 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
         return effects._resume_owned_checkpoint_project_block(
             connection, repo_path, state_dir, repo, block, project, plan,
         )
+    if (scoped_blocking.is_scope_baseline_block(block) and not plan['worktree']
+            and plan['status'] not in {*ACTIVE_EXECPLAN_STATUSES, 'PLAN_BLOCKED'}):
+        with runtime_state._transaction(connection):
+            if (not scoped_blocking.project_cause_matches(connection, block)
+                    or dict(connection.execute('SELECT * FROM projects WHERE repo = ?',
+                                               (repo,)).fetchone()) != dict(project)
+                    or dict(connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
+                                               (repo, plan_id)).fetchone()) != dict(plan)):
+                return False
+            saved = dict(checkpoint.snapshot or {})
+            execution_checkpoint_state.ExecutionCheckpointRepository(connection).record(
+                repo, plan_id, expected_generation=checkpoint.generation,
+                operation=checkpoint.operation, expected_head=checkpoint.expected_head,
+                target_base_oid=checkpoint.target_base_oid, observed_remote_oid=checkpoint.observed_remote_oid,
+                snapshot={**saved, 'scope_block_release_audit': [
+                    *saved.get('scope_block_release_audit', ()),
+                    {'block': dict(block), 'prior_scope': {key: project[key] for key in (
+                        'agent_snapshot', 'agent_result_snapshot', 'agent_manager_snapshot')}}]})
+            effects._clear_project_block_without_losing_planning_error(connection, repo, project)
+            recovery_state.RecoveryRepository(connection).resolve_git_scope_failure(repo, plan_id)
+            recovery_state.RecoveryRepository(connection).resolve_git_scope_failure(repo, None)
+            if not planning_owns_slot:
+                effects._clear_active_in_current_transaction(connection, repo)
+        return True
+    if (not scoped_blocking.is_scope_baseline_block(block)
+            and block['reason_code'] != BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value):
+        return False
     if (
         block["reason_code"]
         == BlockReasonCode.WORKSPACE_OWNERSHIP_UNCERTAIN.value
@@ -243,13 +272,10 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
         return True
     if int(plan["workspace_owned"]) != WORKSPACE_OWNED:
         return False
-    if scoped_blocking.is_scope_baseline_block(block) and (
-            not plan['agent_snapshot'] or plan['agent_recovery']):
-        return False
     worktree = Path(str(plan["worktree"] or ""))
     branch = str(plan["branch"] or "")
     try:
-        checked = effects.capture_git_snapshot(worktree) if plan['agent_snapshot'] else None
+        checked = effects.capture_git_snapshot(worktree)
         effects.validate_execplan_workspace_identity(
             state_dir, repo, manual_workspace_owner(connection, repo, plan_id), branch, worktree
         )
@@ -263,7 +289,7 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
                 connection, repo_path, repo, str(project['base_branch']),
                 worktree, str(plan['path']), saved_plan=plan,
                 require_safe_result=scoped_blocking.is_scope_baseline_block(block))
-        if checked is not None and effects.capture_git_snapshot(worktree) != checked:
+        if not agent_scope_decision._same_local_snapshot(effects.capture_git_snapshot(worktree), checked):
             return False
     except RecoveryFailure:
         raise
@@ -275,7 +301,8 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
                                            (repo,)).fetchone()) != dict(project)
                 or dict(connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
                                            (repo, plan_id)).fetchone()) != dict(plan)
-                or (checked is not None and effects.capture_git_snapshot(worktree) != checked)):
+                or (checked is not None and not agent_scope_decision._same_local_snapshot(
+                        effects.capture_git_snapshot(worktree), checked))):
             return False
         effects._clear_project_block_without_losing_planning_error(connection, repo, project)
         if scoped_blocking.is_scope_baseline_block(block):
@@ -290,11 +317,37 @@ def resume_project_block_if_safe(effects: ResumeProjectBlockIfSafeEffects,
                 observed_remote_oid=checkpoint.observed_remote_oid,
                 snapshot={**(checkpoint.snapshot or {}), 'scope_block_release_audit': [
                     *(checkpoint.snapshot or {}).get('scope_block_release_audit', ()),
-                    {'block': dict(block), 'candidate': checked.serialize() if checked else None}]},
+                    {'block': dict(block), 'candidate': checked.serialize() if checked else None,
+                     'prior_agent_recovery': plan['agent_recovery'],
+                     'prior_artifacts': {key: plan[key] for key in (
+                         'worker_result', 'verify_result', 'review_result', 'last_error')}}]},
             )
             recovery_state.RecoveryRepository(connection).resolve_rebase_block(repo, plan_id, block)
+            recovery_state.RecoveryRepository(connection).resolve_git_scope_failure(repo, plan_id)
+            recovery_state.RecoveryRepository(connection).resolve_git_scope_failure(repo, None)
+            from loop_manager_internal.recovery.project_block_service import _saved_verify_matches_candidate
+            matches = not checked.dirty and _saved_verify_matches_candidate(plan, checked.head)
+            if plan['agent_result_snapshot']:
+                try:
+                    result = GitSnapshot.deserialize(plan['agent_result_snapshot'])
+                    matches |= agent_scope_decision._same_local_snapshot(result, checked)
+                except (ValueError, TypeError, KeyError, RuntimeError):
+                    pass
+            if checked.dirty and plan['status'] in {'REVIEWING', 'PUBLISHING'}:
+                matches = False
+            values = {'agent_recovery': None}
+            if not matches:
+                values.update(managed_rebase_adoption.revalidation_values(plan['active_sha']))
+                values.pop('phase')
+                if str(plan['status']) in ACTIVE_EXECPLAN_STATUSES:
+                    values['status'] = 'IMPLEMENTING'
+            runtime_state.RuntimeStateRepository(connection).update_plan(
+                repo, plan_id, plan_values=values, enqueue=False)
+            plan = connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
+                                      (repo, plan_id)).fetchone()
         if str(plan["status"]) in ACTIVE_EXECPLAN_STATUSES:
-            effects.hydrate_execplan_project(connection, repo, plan)
+            runtime_state.RuntimeStateRepository(connection).hydrate_snapshot(
+                repo, runtime_state.ExecutionSnapshot.from_row(plan))
         elif not planning_owns_slot:
             effects._clear_active_in_current_transaction(connection, repo)
     return True
@@ -342,6 +395,8 @@ def resume_plan_blocks(effects: ResumePlanBlocksEffects,
             BlockReasonCode.VERIFY_RETRY_EXHAUSTED.value,
         }
         if force_timeout_recheck and not local_verify_recheck:
+            continue
+        if current_reason == BlockReasonCode.REMOTE_BRANCH_DELETED.value:
             continue
         changed_plan_input = False
         if current_reason == BlockReasonCode.PLAN_INPUT_INVALID.value:
@@ -584,6 +639,7 @@ class ResumeOwnedCheckpointProjectBlockEffects:
     validate_managed_worktree: Callable[..., object]
     validate_blocked_agent_scope: Callable[..., object]
     unmet_execplan_dependencies: Callable[..., object]
+    remote_integration_effects: Callable[..., object] | None = None
 
 
 @dataclass(frozen=True)
@@ -626,7 +682,52 @@ def _resume_owned_checkpoint_project_block(effects: ResumeOwnedCheckpointProject
     connection: sqlite3.Connection, repo_path: Path, state_dir: Path,
     repo: str, block: sqlite3.Row, project: sqlite3.Row, plan: sqlite3.Row,
 ) -> bool:
-    """Restore only a proven published checkpoint mistaken for external work."""
+    """Restore a currently owned task independently of old publication receipts."""
+    if effects.remote_integration_effects is not None:
+        from loop_manager_internal.recovery import work_branch_integration
+        if (not plan['branch'] or not plan['worktree'] or int(plan['workspace_owned'] or 0) != WORKSPACE_OWNED
+                or effects.unmet_execplan_dependencies(connection, repo, str(plan['plan_id']))
+                or project['plan_path'] not in (None, plan['path'])
+                or project['branch'] not in (None, plan['branch'])
+                or project['worktree'] not in (None, plan['worktree'])
+                or runtime_state.planning_owns_execution_slot(project)):
+            return False
+        try:
+            if plan['agent_snapshot']:
+                effects.validate_blocked_agent_scope(connection, repo_path, repo, str(project['base_branch']),
+                    Path(plan['worktree']), str(plan['path']), saved_plan=plan, require_safe_result=True)
+            remote = manager_git_journal.live_remote_branch_oid(effects.git, repo_path, str(plan['branch']))
+            pr = effects.pr_for_branch(repo_path, str(plan['branch']), str(plan['pr_url'] or '') or None)
+            work_branch_integration.synchronize(effects.remote_integration_effects(), connection,
+                repo_path, state_dir, repo, plan, remote, pr)
+        except RecoveryFailure as error:
+            if error.reason is RecoveryReason.REMOTE_BRANCH_DELETED:
+                with runtime_state._transaction(connection):
+                    scoped_blocking.record_plan_block(connection, repo, str(plan['plan_id']),
+                        BlockReasonCode.REMOTE_BRANCH_DELETED, str(error), None)
+                    scoped_blocking.clear_project_block(connection, repo)
+                return True
+            return False
+        except (WorkspaceOwnershipError, RuntimeError, OSError, ValueError):
+            return False
+        with runtime_state._transaction(connection):
+            if not scoped_blocking.project_cause_matches(connection, block):
+                return False
+            current = execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(repo, str(plan['plan_id']))
+            execution_checkpoint_state.ExecutionCheckpointRepository(connection).record(repo, str(plan['plan_id']),
+                expected_generation=current.generation, operation=current.operation, expected_head=current.expected_head,
+                target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+                snapshot={**(current.snapshot or {}), 'publication_block_release_audit': [
+                    *(current.snapshot or {}).get('publication_block_release_audit', ()), dict(block)]})
+            scoped_blocking.clear_project_block(connection, repo)
+            phase = 'VERIFYING' if plan['worker_result'] else 'WORKING'
+            runtime_state.RuntimeStateRepository(connection).transition(repo, str(plan['plan_id']),
+                plan_values={'status': 'VERIFYING' if plan['worker_result'] else 'IMPLEMENTING', 'last_error': None,
+                             'verify_token': None, 'review_token': None, 'publication_token': None,
+                             'validated_base_sha': None, 'review_result': None},
+                project_values={'phase': phase, 'last_error': None}, enqueue=False)
+            recovery_state.RecoveryRepository(connection).resolve_git_scope_failure(repo, str(plan['plan_id']))
+        return True
     plan_id = str(plan['plan_id'])
     branch = str(plan['branch'] or '')
     worktree = Path(str(plan['worktree'] or ''))

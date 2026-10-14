@@ -4,6 +4,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from types import SimpleNamespace
 from pathlib import Path
 from unittest import mock
 import loop_manager
@@ -18,7 +19,7 @@ class PublicationRebaseRecoveryTestFixture(PublicationFixture):
 @isolated_git_test
 class PublicationConflictRecoveryTests(PublicationRebaseRecoveryTestFixture, unittest.TestCase):
     @dummy_worker_sessions
-    def test_publication_rebase_conflict_blocks_when_worker_cannot_resolve(self):
+    def test_publication_rebase_conflict_restores_only_failed_file_for_rework(self):
         with tempfile.TemporaryDirectory() as directory:
             (
                 repo,
@@ -102,14 +103,16 @@ class PublicationConflictRecoveryTests(PublicationRebaseRecoveryTestFixture, uni
             rebase_preserved = loop_manager._rebase_in_progress_for_branch(worktree, branch)
             unmerged = git_command(worktree, 'ls-files', '-u')
 
-        self.assertEqual(second, 0)
-        self.assertIsNone(blocked["phase"])
-        self.assertIn("cannot resolve conflict", plan["last_error"])
-        self.assertEqual(plan["status"], "PLAN_BLOCKED")
-        # Paired with the PR retry-policy unit test: blocking must preserve the
-        # actual conflict, index and operation, not just a mocked marker value.
+            from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+            fallback = ExecutionCheckpointRepository(connection).get(str(repo), 'G-014').snapshot['rebase_files']
+            self.assertEqual(fallback['paths'], ['src/app.py'])
+            self.assertEqual((worktree / 'src/app.py').read_text(), "VALUE = 'base'\n")
+        self.assertEqual(second, 1)
+        self.assertEqual(blocked["phase"], "WORKING")
+        self.assertEqual(plan["status"], "IMPLEMENTING")
+        self.assertIn("재작업", plan["last_error"])
         self.assertTrue(rebase_preserved)
-        self.assertIn('src/app.py', unmerged)
+        self.assertEqual(unmerged, '')
 
 
     @dummy_worker_sessions
@@ -688,11 +691,10 @@ class PublicationRebaseInterruptionTests(PublicationRebaseRecoveryTestFixture, u
                 (str(repo),),
             ).fetchone()["status"]
 
-        self.assertEqual(resumed, 0)
-        self.assertIsNone(blocked["phase"])
-        self.assertEqual(plan_status, "PLAN_BLOCKED")
-        # The invalid result was already the first correction occurrence;
-        # three further abnormal results reach the no-progress safety gate.
+        self.assertEqual(resumed, 1)
+        self.assertEqual(blocked["phase"], "WORKING")
+        self.assertEqual(plan_status, "IMPLEMENTING")
+        # Repeated abnormal results restore the failed file and request rework.
         self.assertEqual(resumed_agent.call_count, 3)
         self.assertEqual(len(resumed_prompts), 3)
 
@@ -711,19 +713,22 @@ class PublicationRebaseLeaseTests(PublicationRebaseRecoveryTestFixture, unittest
         }
         pr = {'url': plan['pr_url'], 'state': 'OPEN', 'headRefName': branch, 'headRefOid': old}
         calls = []
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
 
         def git(_path, *arguments, **_kwargs):
             calls.append(arguments)
             return subprocess.CompletedProcess(arguments, 0,
-                new + '\n' if arguments[0] == 'rev-parse' else '')
+                new + '\n' if arguments[0] == 'rev-parse' else old + '\trefs/heads/' + branch + '\n' if arguments[0] == 'ls-remote' else '')
 
         with (
+            mock.patch.object(ExecutionCheckpointRepository, 'get', return_value=SimpleNamespace(snapshot={})),
+            mock.patch('loop_manager._owned_publication_plan', return_value=plan),
             mock.patch('loop_manager.active_execplan', return_value=plan),
             mock.patch('loop_manager.validate_execplan_workspace_identity'),
             mock.patch('loop_manager.validate_managed_worktree'),
             mock.patch('loop_manager._fetch_pr_conflict_recovery_refs'),
             mock.patch('loop_manager._recorded_base_fetch'),
-            mock.patch('loop_manager.remote_branch_oid', side_effect=[old, new]),
+            mock.patch('loop_manager.remote_branch_oid', return_value=new),
             mock.patch('loop_manager.pr_for_branch', return_value=pr),
             mock.patch('loop_manager.git', side_effect=git),
         ):

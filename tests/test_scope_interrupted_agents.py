@@ -71,9 +71,6 @@ class ScopeInterruptedAgentsTest(AgentScopeFixture, unittest.TestCase):
                 self.assertEqual(plan["status"], "IMPLEMENTING")
                 self.assertEqual(plan["retry_count"], 0)
                 self.assertEqual(project['agent_snapshot'], before.serialize())
-                audit = loop_manager.execution_checkpoint_state.ExecutionCheckpointRepository(connection).get(
-                    str(repo), 'G-001').snapshot['manager_metadata_agent_baseline']
-                self.assertIn(str(runtime.path), loop_manager.GitSnapshot.deserialize(audit['snapshot']).worktrees)
                 connection.close()
 
 
@@ -143,36 +140,6 @@ class ScopeInterruptedAgentsTest(AgentScopeFixture, unittest.TestCase):
                     ),
                     1,
                 )
-                blocked = connection.execute(
-                    "SELECT * FROM projects WHERE repo = ?",
-                    (str(repo),),
-                ).fetchone()
-                self.assertIn(
-                    "unexpected.txt",
-                    blocked["planning_validation_error"],
-                )
-                self.assertEqual(planner_sessions, [None])
-                start_snapshot = loop_manager.GitSnapshot.deserialize(
-                    blocked["agent_snapshot"]
-                )
-                result_snapshot = loop_manager.GitSnapshot.deserialize(
-                    blocked["agent_result_snapshot"]
-                )
-                self.assertNotEqual(start_snapshot, result_snapshot)
-                self.assertIn("unexpected.txt", result_snapshot.dirty)
-
-                self.assertEqual(
-                    loop_manager.run_project(
-                        connection,
-                        state_dir,
-                        str(repo),
-                        Path("unused.ini"),
-                        "main",
-                        False,
-                    ),
-                    1,
-                )
-
             resumed = connection.execute(
                 "SELECT phase, planning_retry_count, planning_error "
                 "FROM projects WHERE repo = ?",
@@ -183,169 +150,39 @@ class ScopeInterruptedAgentsTest(AgentScopeFixture, unittest.TestCase):
             self.assertEqual(resumed["planning_retry_count"], 0)
             self.assertIsNone(resumed["planning_error"])
 
-    def test_interrupted_config_change_stops_before_database_git_migrations(self):
-        scenarios = (
-            (
-                "remote-url",
-                ("remote", "set-url", "origin"),
-                "https://secret@attacker.invalid/repo.git",
-                "local:remote.origin.url",
-            ),
-            (
-                "hooks-path",
-                ("config", "core.hooksPath"),
-                "agent-hooks",
-                "local:core.hookspath",
-            ),
-        )
-        for name, arguments, configured_value, expected_key in scenarios:
-            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
-                repo, plan_path = self._repository_with_plan(directory)
-                before = loop_manager.capture_git_snapshot(repo)
-                state_dir = root / "state"
-                self._persist_interrupted_worker(state_dir, repo, plan_path, before)
-
-                sensitive_value = (
-                    str(root / configured_value)
-                    if name == "hooks-path"
-                    else configured_value
-                )
-                git_command(repo, *arguments, sensitive_value)
-
-                with mock.patch.object(
-                    loop_manager.sys,
-                    "argv",
-                    [
-                        "loop_manager.py",
-                        "--runtime-child",
-                        "--runtime-source",
-                        str(loop_manager.ROOT),
-                        "--runtime-sha",
-                        "a" * 40,
-                        "--state-dir",
-                        str(state_dir),
-                        "--config",
-                        str(profile_config(self)),
-                        "run",
-                    ],
-                ), mock.patch(
-                    "loop_manager.validate_runtime_child"
-                ), mock.patch(
-                    "loop_manager.validate_runtime_mutation", return_value=None
-                ), mock.patch(
-                    "loop_manager.git",
-                    side_effect=AssertionError(
-                        "unsafe Git command before config validation"
-                    ),
-                ) as unsafe_git, mock.patch(
-                    "loop_manager.run_codex"
-                ) as agent:
-                    result = loop_manager.main()
-                    database = sqlite3.connect(state_dir / "loop-manager.db")
-                    database.row_factory = sqlite3.Row
-                    project = database.execute(
-                        "SELECT phase, last_error FROM projects WHERE repo = ?",
-                        (str(repo),),
-                    ).fetchone()
-                    plan = database.execute(
-                        "SELECT status, blocked_fingerprint FROM exec_plans "
-                        "WHERE repo = ? AND plan_id = 'G-001'",
-                        (str(repo),),
-                    ).fetchone()
-                    database.close()
-
-                self.assertEqual(result, 1)
-                self.assertEqual(project["phase"], "PROJECT_BLOCKED")
-                self.assertEqual(plan["status"], "IMPLEMENTING")
-                self.assertIsNotNone(plan["blocked_fingerprint"])
-                self.assertIn("범위 선검증 실패", project["last_error"])
-                self.assertIn(expected_key, project["last_error"])
-                self.assertNotIn(sensitive_value, project["last_error"])
-                unsafe_git.assert_not_called()
-                agent.assert_not_called()
-
-    def test_interrupted_non_base_ref_change_blocks_before_migration_fetch(self):
+    def test_interrupted_config_drift_keeps_saved_state_without_git_access_attribution(self):
         with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
             repo, plan_path = self._repository_with_plan(directory)
             before = loop_manager.capture_git_snapshot(repo)
-            state_dir = root / "state"
-            self._persist_interrupted_worker(state_dir, repo, plan_path, before)
-            changed_ref = git_command(repo, "rev-parse", "HEAD^")
-            git_command(
-                repo,
-                "update-ref",
-                "refs/heads/agent-created",
-                changed_ref,
-            )
-            real_git = loop_manager.git
-            git_calls = []
+            state = Path(directory) / 'state'
+            self._persist_interrupted_worker(state, repo, plan_path, before)
+            git_command(repo, 'config', 'core.hooksPath', 'changed-hooks')
+            with closing(sqlite3.connect(state / 'loop-manager.db')) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.execute("UPDATE projects SET worker_session_id='worker-existing'")
+                current = loop_manager.validate_persisted_agent_scope(connection, repo, state, str(repo))
+                self.assertNotEqual(current.config, before.config)
+                self.assertEqual(connection.execute('SELECT agent_snapshot FROM projects').fetchone()[0],
+                                 before.serialize())
+                self.assertEqual(connection.execute('SELECT worker_session_id FROM projects').fetchone()[0],
+                                 'worker-existing')
 
-            def reject_fetch(repo_path, *arguments, **kwargs):
-                git_calls.append(arguments)
-                if arguments[:2] == ("fetch", "origin"):
-                    raise AssertionError("migration fetch ran before scope validation")
-                return real_git(repo_path, *arguments, **kwargs)
-
-            with mock.patch.object(
-                loop_manager.sys,
-                "argv",
-                [
-                    "loop_manager.py",
-                    "--runtime-child",
-                    "--runtime-source",
-                    str(loop_manager.ROOT),
-                    "--runtime-sha",
-                    "a" * 40,
-                    "--state-dir",
-                    str(state_dir),
-                    "--config",
-                    str(profile_config(self)),
-                    "run",
-                ],
-            ), mock.patch(
-                "loop_manager.validate_runtime_child"
-            ), mock.patch(
-                "loop_manager.validate_runtime_mutation", return_value=None
-            ), mock.patch(
-                "loop_manager.validate_repository",
-                return_value=repo,
-            ), mock.patch(
-                "loop_manager.git",
-                side_effect=reject_fetch,
-            ), mock.patch(
-                "loop_manager.run_codex"
-            ) as agent:
-                result = loop_manager.main()
-
-            database = sqlite3.connect(state_dir / "loop-manager.db")
-            database.row_factory = sqlite3.Row
-            project = database.execute(
-                "SELECT phase, last_error FROM projects WHERE repo = ?",
-                (str(repo),),
-            ).fetchone()
-            plan = database.execute(
-                "SELECT status, blocked_fingerprint FROM exec_plans "
-                "WHERE repo = ? AND plan_id = 'G-001'",
-                (str(repo),),
-            ).fetchone()
-            database.close()
-
-            self.assertEqual(result, 1)
-            self.assertEqual(project["phase"], "PROJECT_BLOCKED")
-            self.assertEqual(plan["status"], "IMPLEMENTING")
-            self.assertIsNotNone(plan["blocked_fingerprint"])
-            self.assertIn("공유 Git refs 변경", project["last_error"])
-            self.assertIn("refs/heads/agent-created", project["last_error"])
-            self.assertEqual(
-                git_command(repo, "rev-parse", "refs/heads/agent-created"),
-                changed_ref,
-            )
-            self.assertFalse(
-                any(arguments[:2] == ("fetch", "origin") for arguments in git_calls)
-            )
-            agent.assert_not_called()
+    def test_interrupted_unrelated_ref_change_keeps_current_user_input_and_session(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, plan_path = self._repository_with_plan(directory)
+            before = loop_manager.capture_git_snapshot(repo)
+            state = Path(directory) / 'state'
+            self._persist_interrupted_worker(state, repo, plan_path, before)
+            git_command(repo, 'branch', 'other-task')
+            with closing(sqlite3.connect(state / 'loop-manager.db')) as connection:
+                connection.row_factory = sqlite3.Row
+                connection.execute("UPDATE projects SET worker_session_id='worker-existing'")
+                current = loop_manager.validate_persisted_agent_scope(connection, repo, state, str(repo))
+                self.assertIn('refs/heads/other-task', current.refs)
+                self.assertEqual(connection.execute('SELECT agent_snapshot FROM projects').fetchone()[0],
+                                 before.serialize())
+                self.assertEqual(connection.execute('SELECT worker_session_id FROM projects').fetchone()[0],
+                                 'worker-existing')
 
     @dummy_worker_sessions
     def test_interrupted_worker_resume_accepts_manager_fetched_remote_ref(self):

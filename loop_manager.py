@@ -99,6 +99,10 @@ def build_parser() -> argparse.ArgumentParser:
     recover.add_argument("repository", help="재검사할 등록 저장소 루트")
     recover.add_argument("--plan", help="이 프로젝트 안의 특정 ExecPlan만 재검사")
 
+    reset = subcommands.add_parser('reset', help='원격 branch 삭제로 중단된 자동 작업의 명시적 재시작')
+    reset.add_argument('repository', help='등록된 Git 저장소 루트')
+    reset.add_argument('plan_id', help='삭제로 중단된 ExecPlan ID')
+
     run = subcommands.add_parser("run", help="등록 프로젝트의 다음 작업을 처리")
     run.add_argument(
         "--skip-if-running",

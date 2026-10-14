@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure
 from tests.support.git import git_command, commit_and_push, isolated_git_test
 from tests.support.worker import worker_result
 from tests.support.publication import seed_validated_candidate
@@ -192,13 +193,13 @@ class PublicationLeaseRaceTests(PublicationBranchLeaseTestFixture, unittest.Test
             mock.patch('loop_manager.record_remote_publication_branch'),
             mock.patch('loop_manager.git', side_effect=git),
         ):
-            with self.assertRaises(loop_manager.PublicationSafetyError):
+            with self.assertRaises(RecoveryFailure):
                 loop_manager.push_managed_publication_branch(
                     connection, Path('/repo'), Path('/state'), 'repo',
                     branch, Path('/managed'), 'b' * 40,
                 )
             remote.return_value = None
-            with self.assertRaises(loop_manager.PublicationSafetyError):
+            with self.assertRaises(RecoveryFailure):
                 loop_manager.push_managed_publication_branch(
                     connection, Path('/repo'), Path('/state'), 'repo',
                     branch, Path('/managed'), 'b' * 40,
@@ -256,7 +257,7 @@ class PublicationLeaseRaceTests(PublicationBranchLeaseTestFixture, unittest.Test
 
 
     @dummy_worker_sessions
-    def test_unowned_remote_branch_is_blocked_without_force_push(self):
+    def test_current_remote_branch_is_accepted_with_exact_lease(self):
         with tempfile.TemporaryDirectory() as directory:
             (
                 repo,
@@ -272,6 +273,8 @@ class PublicationLeaseRaceTests(PublicationBranchLeaseTestFixture, unittest.Test
                 "origin",
                 f"HEAD:refs/heads/{branch}",
             )
+            seed_validated_candidate(connection, repo, _worktree, "G-014")
+            created = []
             pushes = []
             original_git = loop_manager.git
 
@@ -290,7 +293,7 @@ class PublicationLeaseRaceTests(PublicationBranchLeaseTestFixture, unittest.Test
                 "loop_manager.pr_for_branch", return_value=None
             ), mock.patch(
                 "loop_manager.git", side_effect=recording_git
-            ):
+            ), mock.patch("loop_manager.build_pr_body", return_value="body"), mock.patch("loop_manager.command", side_effect=self._command_stub(created)):
                 outcome = loop_manager.run_project(
                     connection,
                     state_dir,
@@ -305,10 +308,11 @@ class PublicationLeaseRaceTests(PublicationBranchLeaseTestFixture, unittest.Test
                 (str(repo),),
             ).fetchone()
 
-        self.assertEqual(outcome, 1)
-        self.assertEqual(blocked["phase"], "PROJECT_BLOCKED")
-        self.assertIn("갱신을 거부", blocked["last_error"])
-        self.assertEqual(pushes, [])
+        self.assertEqual(outcome, 0)
+        self.assertIsNone(blocked["phase"])
+        self.assertEqual(len(pushes), 1)
+        self.assertTrue(any(value.startswith("--force-with-lease=") for value in pushes[0]))
+        self.assertEqual(len(created), 1)
 
 
 @isolated_git_test

@@ -297,7 +297,7 @@ class ExecutionRevisionTests(unittest.TestCase):
 
 
 class RebaseCandidateRevisionTests(unittest.TestCase):
-    def test_rebased_head_or_inputs_require_worker_confirmation_then_stabilize(self):
+    def test_rebased_head_requires_verification_and_changed_inputs_require_worker(self):
         current = definition()
         artifacts = replace(complete_artifacts(current), require_worker_candidate=True,
                             worker_candidate_token=current.worker_candidate_token('old'))
@@ -306,7 +306,7 @@ class RebaseCandidateRevisionTests(unittest.TestCase):
                 result = decide_revision_gate(phase='PUBLISHING', previous=current, current=inputs,
                     active_base_token='base', current_base_token='base', artifacts=artifacts,
                     candidate_head=head)
-                self.assertEqual(result.phase, 'IMPLEMENTING')
+                self.assertEqual(result.phase, 'VERIFYING' if inputs == current else 'IMPLEMENTING')
         confirmed = replace(artifacts, worker_candidate_token=current.worker_candidate_token('new'),
                             verify_token=current.verify_token('base', 'new'),
                             review_token=current.review_token('base', 'new'))

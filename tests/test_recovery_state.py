@@ -1,4 +1,5 @@
 import json
+from dataclasses import replace
 import sqlite3
 import tempfile
 import unittest
@@ -18,6 +19,53 @@ from tests.support.database import runtime_connection
 
 
 class RecoveryRepositoryTests(unittest.TestCase):
+    def test_retired_git_failure_resolves_without_resetting_audit_or_other_causes(self):
+        observation = RecoveryObservation(
+            RecoveryReason.AGENT_SCOPE_VIOLATION, 'repo', 'G-042', 'WORKING',
+            'plan', 'base', 'same-input', 'head', 'worker Git 범위 위반: 공유 Git refs 변경',
+        )
+        self.repository.observe(observation, attempts=3)
+        before = dict(self.repository.row('repo', 'G-042'))
+        self.repository.resolve_git_scope_failure('repo', 'G-042')
+        after = dict(self.repository.row('repo', 'G-042'))
+        self.assertEqual(after['pending_action'], 'reconcile')
+        for key in ('generation', 'identity', 'attempts', 'recovery_counts', 'detail', 'final_evidence'):
+            self.assertEqual(after[key], before[key])
+        self.repository.resolve_git_scope_failure('repo', 'G-042')
+        self.assertEqual(dict(self.repository.row('repo', 'G-042')), after)
+        self.repository.observe(replace(observation, reason=RecoveryReason.USER_DECISION))
+        protected = dict(self.repository.row('repo', 'G-042'))
+        self.repository.resolve_git_scope_failure('repo', 'G-042')
+        self.assertEqual(dict(self.repository.row('repo', 'G-042')), protected)
+
+    def test_retired_pending_notice_closes_even_after_an_independent_record_replaces_it(self):
+        connection = runtime_connection()
+        self.addCleanup(connection.close)
+        loop_manager.notifications.configure_session(connection, enabled=True)
+        repository = RecoveryRepository(connection)
+        observation = RecoveryObservation(
+            RecoveryReason.REMOTE_SNAPSHOT_RACE, 'repo', None, 'WORKING', None,
+            'base', 'same', 'progress', 'Agent 범위 선검증 실패: old Git observation')
+        for _ in range(3):
+            begin_external_run(connection)
+            repository.observe(observation, attempts=3)
+        notice = connection.execute("SELECT * FROM notification_outbox WHERE "
+                                    "event_type='persistent_execution_failure'").fetchone()
+        self.assertIsNotNone(notice)
+        self.assertIsNone(notice['canceled_at'])
+        connection.execute("UPDATE recovery_records SET reason_code=?", (RecoveryReason.USER_DECISION.value,))
+        protected = dict(repository.row('repo', None))
+        repository.resolve_git_scope_failure('repo', None)
+        self.assertEqual(dict(repository.row('repo', None)), protected)
+        failure = connection.execute('SELECT * FROM persistent_execution_failures').fetchone()
+        self.assertEqual(failure['active'], 0)
+        self.assertEqual(failure['detail'], observation.detail)
+        self.assertIsNone(connection.execute('SELECT * FROM notification_outbox WHERE event_key=?',
+                                            (notice['event_key'],)).fetchone())
+        repository.resolve_git_scope_failure('repo', None)
+        self.assertEqual(dict(connection.execute('SELECT * FROM persistent_execution_failures').fetchone()),
+                         dict(failure))
+
     def test_registered_project_reentry_shares_budget_across_connections(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / 'state.db'

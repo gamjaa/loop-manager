@@ -68,6 +68,7 @@ class WorkspaceEffects:
     current_rebase_service: Callable[..., Any] | None = None
     live_remote_branch_oid: Callable[..., Any] | None = None
     git_bytes: Callable[..., bytes] | None = None
+    reconcile_remote: Callable[..., Any] | None = None
 
 @dataclass(frozen=True)
 class AgentEffects:

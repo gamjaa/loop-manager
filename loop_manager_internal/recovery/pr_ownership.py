@@ -1,6 +1,7 @@
 """recovery pr ownership boundaries and named composition effects."""
 from __future__ import annotations
 from loop_manager_internal.storage.manual_work_state import manual_workspace_owner
+from loop_manager_internal.storage import runtime_state
 from collections.abc import Callable
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -78,8 +79,6 @@ def _validate_pr_conflict_recovery_identity(
     if (
         not head_oid
         or re.fullmatch(r"[0-9a-fA-F]{40}|[0-9a-fA-F]{64}", head_oid) is None
-        or not stored_head
-        or head_oid != stored_head
     ):
         raise PublicationSafetyError(
             "PR 충돌 복구 head OID가 저장된 PR head와 일치하지 않습니다."
@@ -99,6 +98,7 @@ class ValidatePrConflictRecoveryOwnershipEffects:
     make_worktree: Callable[..., object]
     remote_branch_oid: Callable[..., object]
     validate_execplan_workspace_identity: Callable[..., object]
+    remote_integration_effects: Callable[..., object] | None = None
 
 
 def _validate_pr_conflict_recovery_ownership(
@@ -137,6 +137,10 @@ def _validate_pr_conflict_recovery_ownership(
         allow_recovery=True,
         allow_existing=True,
     )
+    if effects.remote_integration_effects is not None:
+        from loop_manager_internal.recovery.work_branch_integration import synchronize
+        synchronize(effects.remote_integration_effects(), connection, repo_path, state_dir,
+                    repo, plan, head_oid, pull_request)
     snapshot = effects.capture_git_snapshot(worktree)
     ignored_paths = frozenset(effects._ignored_worktree_paths(worktree))
     publishable_dirty = {
@@ -149,7 +153,7 @@ def _validate_pr_conflict_recovery_ownership(
         if effects._non_default_index_flags(entries)
     )
     if (
-        snapshot.branch != branch or snapshot.head != head_oid
+        snapshot.branch != branch or effects.git(worktree, 'merge-base', '--is-ancestor', head_oid, snapshot.head, check=False).returncode != 0
         or publishable_dirty or flagged_paths or snapshot.operations
     ):
         details = []
@@ -270,6 +274,7 @@ class ValidateActivePrConflictRecoveryEffects:
     make_worktree: Callable[..., object]
     remote_branch_oid: Callable[..., object]
     validate_execplan_workspace_identity: Callable[..., object]
+    remote_integration_effects: Callable[..., object] | None = None
 
 
 def _validate_active_pr_conflict_recovery(
@@ -299,18 +304,27 @@ def _validate_active_pr_conflict_recovery(
     if (
         str(pull_request.get("url") or "") != str(project["pr_url"] or "")
         or str(pull_request.get("headRefName") or "") != branch
-        or not observed_head
-        or str(pull_request.get("headRefOid") or "") != observed_head
     ):
         raise PublicationSafetyError(
             "진행 중인 PR의 URL, head branch 또는 head OID가 복구 시작 시 "
             "관측값과 달라졌습니다."
         )
+    if effects.remote_integration_effects is not None:
+        from loop_manager_internal.git.manager_git_journal import live_remote_branch_oid
+        from loop_manager_internal.recovery.work_branch_integration import synchronize
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+        integration_effects = effects.remote_integration_effects()
+        live = live_remote_branch_oid(integration_effects.git, repo_path, branch)
+        if live != observed_head or str(pull_request.get('headRefOid') or '') != observed_head:
+            synchronize(integration_effects, connection, repo_path, state_dir, repo, plan, live, pull_request)
+            runtime_state.RuntimeStateRepository(connection).update_project(repo, {'pr_conflict_head_oid': live})
+            raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE, '새 PR 입력의 현재 단계를 다시 선택합니다.')
     effects._fetch_pr_conflict_recovery_refs(
         repo_path, state_dir, str(project["base_branch"]), branch
     )
     if effects.remote_branch_oid(repo_path, branch) != observed_head:
-        raise PublicationSafetyError(
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+        raise RecoveryFailure(RecoveryReason.REMOTE_SNAPSHOT_RACE,
             "진행 중인 PR의 원격 head가 복구 시작 시 관측값과 달라졌습니다."
         )
     effects.validate_execplan_workspace_identity(

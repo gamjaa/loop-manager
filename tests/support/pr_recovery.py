@@ -75,14 +75,17 @@ class PrRecoveryFixture:
         plan_sha = git_command(repo, "rev-parse", "origin/main")
         connection = sqlite3.connect(":memory:")
         register_connection_cleanup(self, connection)
+        from tests.support.git import local_github_origin
+        origin = local_github_origin(self, repo, read_git=git_command)
         connection.row_factory = sqlite3.Row
         connection.execute(loop_manager.SCHEMA)
         connection.execute(
-            "INSERT INTO projects (repo, base_branch, specification_fingerprint) "
-            "VALUES (?, 'main', ?)",
+            "INSERT INTO projects (repo, base_branch, specification_fingerprint, origin) "
+            "VALUES (?, 'main', ?, ?)",
             (
                 str(repo),
                 loop_manager.specification_input_fingerprint(repo, "main"),
+                origin,
             ),
         )
         connection.commit()

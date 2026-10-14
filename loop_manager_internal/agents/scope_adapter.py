@@ -1,14 +1,13 @@
 """agents scope adapter boundaries and named composition effects."""
 from __future__ import annotations
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from loop_manager_internal.agents import agent_scope_decision
 from loop_manager_internal.agents import scope_baseline
 from loop_manager_internal.agents import scope_lifecycle
 from loop_manager_internal.agents import scope_observation
 from loop_manager_internal.agents import scope_validation
 from loop_manager_internal.agents.scope_contracts import AgentChange
-from loop_manager_internal.agents.scope_contracts import AgentScopeError
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
 from loop_manager_internal.application.contracts import ExecPlanMetadataError
 from loop_manager_internal.execution import execution_revision
@@ -348,6 +347,8 @@ def clear_agent_scope(effects: ClearAgentScopeEffects, connection: sqlite3.Conne
 class ValidateWorkerWorkspaceScopeEffects:
     """Named effects for validate_worker_workspace_scope; no entry-point/module access."""
     capture_git_snapshot: Callable[..., object]
+    _owned_rebase_state_dir: Callable[..., object]
+    _current_rebase_service: Callable[..., object]
     validate_active_execplan_metadata: Callable[..., object]
     validate_agent_scope: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
@@ -369,20 +370,30 @@ def validate_worker_workspace_scope(
     allow_common_plans: bool = False,
     scope_phase: str | None = None,
     connection: sqlite3.Connection | None = None,
+    state_dir: Path | None = None,
 ) -> dict[str, object]:
     """Validate one Worker-controlled operation before Manager Git writes."""
 
     if rebase_definition is not None and not allow_rebase:
         raise ExecPlanMetadataError("rebase 기준 선언은 충돌 복구 중에만 사용할 수 있습니다.")
     after = effects.capture_git_snapshot(worktree)
+    unsafe_index = [path for path, entries in after.index.items()
+                    if agent_scope_decision._non_default_index_flags(entries)]
+    if unsafe_index:
+        from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
+        raise WorkspaceOwnershipError('Manager Git 작업 전에 index flags를 확인해야 합니다: '
+                                      + ', '.join(unsafe_index[:8]))
     resources = (agent_scope_decision.used_git_resources(
         role="worker", phase=scope_phase, base_branch=base_branch,
         branch=branch, worktree_key=str(worktree.resolve()),
     ) if scope_phase is not None else None)
+    candidate_base = catalog_plan['active_sha']
+    publication_before = (replace(after, head=candidate_base, index=after.index, dirty={})
+                          if isinstance(candidate_base, str) and candidate_base else before)
     effects.validate_agent_scope(
         "worker",
         worktree,
-        before,
+        publication_before,
         after,
         selected_plan_path=selected_plan_path,
         allowed_requirement_archives=allowed_requirement_archives,
@@ -406,4 +417,20 @@ def validate_worker_workspace_scope(
         branch,
         allow_rebase=allow_rebase,
     )
+    checkpoint = None
+    if allow_rebase and connection is not None:
+        from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+        checkpoint = ExecutionCheckpointRepository(connection).get(str(repo_path), str(catalog_plan['plan_id']))
+    if allow_rebase and (getattr(after, 'operations', {}) or checkpoint and checkpoint.operation == 'rebase'):
+        from loop_manager_internal.runtime.contracts import WorkspaceOwnershipError
+        plan_id = str(catalog_plan['plan_id'])
+        state_dir = state_dir or effects._owned_rebase_state_dir(str(repo_path), plan_id, worktree)
+        if state_dir is None or connection is None:
+            raise WorkspaceOwnershipError('현재 관리 rebase의 실행 대상을 확인할 수 없습니다.')
+        try:
+            effects._current_rebase_service(
+                connection, repo_path, state_dir, str(repo_path),
+                plan_id, worktree, branch).require_owned(checkpoint=checkpoint)
+        except RuntimeError as error:
+            raise WorkspaceOwnershipError(f'현재 관리 rebase를 수용할 수 없습니다: {error}') from error
     return plan

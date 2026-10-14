@@ -119,12 +119,12 @@ def assess(snapshot: CheckpointSnapshot) -> CheckpointDecision:
     if not snapshot.worktree_owned or snapshot.local_branch != snapshot.branch or not snapshot.local_head:
         return CheckpointDecision(CheckpointAction.USER_ACTION, reason="workspace_ownership_uncertain")
     if snapshot.remote_oid not in {None, snapshot.local_head, snapshot.recorded_remote_oid}:
-        return CheckpointDecision(CheckpointAction.USER_ACTION, reason="external_remote_oid")
+        return CheckpointDecision(CheckpointAction.PAUSE, reason="remote_input_changed")
     if snapshot.pr_state == "CLOSED":
         # The existing PR reconciliation owns its closed-PR block and URL.
         return CheckpointDecision(CheckpointAction.CONTINUE)
     if snapshot.pr_head_oid and snapshot.recorded_pr_head_oid and snapshot.pr_head_oid != snapshot.recorded_pr_head_oid:
-        return CheckpointDecision(CheckpointAction.USER_ACTION, reason="external_pr_head")
+        return CheckpointDecision(CheckpointAction.PAUSE, reason="remote_input_changed")
     if snapshot.unmerged_stages:
         if snapshot.git_operation == "rebase":
             return CheckpointDecision(CheckpointAction.CONFLICT, phase="IMPLEMENTING", reason="rebase_index_conflict")
@@ -149,8 +149,9 @@ def assess(snapshot: CheckpointSnapshot) -> CheckpointDecision:
                 reason="commit_completed_before_checkpoint",
             )
         if not snapshot.rebase_intent:
-            return CheckpointDecision(CheckpointAction.USER_ACTION,
-                                      reason="unobserved_local_head")
+            return CheckpointDecision(CheckpointAction.CORRECT, phase="VERIFYING",
+                                      active_sha=snapshot.base_oid, validated_base_sha=None,
+                                      invalidate_validation=True, reason="local_candidate_changed")
     if snapshot.base_is_ancestor is None:
         return CheckpointDecision(CheckpointAction.PAUSE, reason="ancestry_unavailable")
     if not snapshot.base_is_ancestor:

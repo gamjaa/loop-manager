@@ -67,6 +67,7 @@ class WorkspaceHandlerPorts:
     _row: Callable[[], Mapping[str, object]]
     _run_managed_rebase: Callable[..., Any]
     _stage_rebase_correction: Callable[..., Any]
+    reconcile_remote: Callable[..., Any] | None = None
     git_bytes: Callable[..., bytes] | None = None
 
 
@@ -125,6 +126,8 @@ class WorkspaceHandler:
                     snapshot={
                         **(current.snapshot or {} if adopted else {}),
                         'reactivated_from_head': current.expected_head,
+                        **{key: current.snapshot[key] for key in ('deleted_branch_restart', 'fresh_remote_creation')
+                           if current.snapshot and key in current.snapshot},
                         **({'blocked_resume': current.snapshot['blocked_resume']}
                            if current.snapshot and 'blocked_resume' in current.snapshot
                            else {}),
@@ -209,6 +212,13 @@ class WorkspaceHandler:
                 return self.ports._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE,
                                      'checkpoint observation changed', context=context)
             from loop_manager_internal.execution import stage_documents
+            if self.ports.reconcile_remote is not None:
+                if self.ports.reconcile_remote(context, remote_oid, pull_request):
+                    return self.ports._context()
+                row = self.ports._row()
+                current = checkpoint.get(self.ports.identity.repo, context.plan.plan_id)
+                snapshot = replace(snapshot, recorded_remote_oid=remote_oid,
+                    recorded_pr_head_oid=remote_oid if pull_request else snapshot.recorded_pr_head_oid)
             from loop_manager_internal.execution.manual_candidate import get_manual
             manual = get_manual(self.ports.state)
             if not manual or not manual.enabled():
@@ -520,7 +530,9 @@ class WorkspaceHandler:
                         {'completed_rebase': completion} if completion else
                         {'completed_rebase': current.completed_rebase()}
                         if current.completed_rebase() else {}
-                    ), **(
+                    ), **{key: current.snapshot[key] for key in
+                          ('accepted_work_branch', 'deleted_branch_restart', 'fresh_remote_creation', 'rebase_files')
+                          if current.snapshot and key in current.snapshot}, **(
                         {'published_review_resume': current.snapshot['published_review_resume']}
                         if (current.snapshot or {}).get('published_review_resume')
                         else {}
@@ -539,7 +551,8 @@ class WorkspaceHandler:
                 # reconciling the latest base and starting full verify.
                 return context
             if decision.action is CheckpointAction.PAUSE:
-                return self.ports._recover(RecoveryReason.STATUS_FAILED, decision.reason,
+                return self.ports._recover(RecoveryReason.REMOTE_SNAPSHOT_RACE if decision.reason == 'remote_input_changed'
+                                          else RecoveryReason.STATUS_FAILED, decision.reason,
                                      context=context, attempts=3)
             if decision.reason in {'external_remote_oid', 'external_pr_head'}:
                 return self.ports._recover(

@@ -9,7 +9,7 @@ from loop_manager_internal.storage.manual_work_state import manual_workspace_own
 import json
 from pathlib import Path
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from loop_manager_internal.recovery.scoped_blocking import GUIDANCE_BLOCK_REASON, PR_CLOSED_BLOCK_REASON
 from loop_manager_internal.recovery import blocked_checkpoint
 import sqlite3
@@ -190,6 +190,7 @@ class RecoveryWorkspaceEffects:
     unmet_execplan_dependencies: Callable[..., object]
     validate_execplan_workspace_identity: Callable[..., object]
     validate_managed_worktree: Callable[..., object]
+    remote_integration_effects: Callable[..., object] | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -347,6 +348,30 @@ class BlockedPlanReconciler:
         return worktree, branch
 
     def _adopt(self, plan, context, *, project_recovery_context=None):
+        row = self.connection.execute('SELECT * FROM blocked_checkpoints WHERE repo=? AND plan_id=?',
+                                      (self.repo, plan['plan_id'])).fetchone()
+        if (getattr(self.ports, 'remote_integration_effects', None) is not None
+                and (row is None or row['phase'] != 'published')):
+            from loop_manager_internal.recovery.work_branch_integration import synchronize
+            try:
+                synchronize(self.ports.remote_integration_effects(), self.connection,
+                    self.repo_path, self.state_dir, self.repo, plan, context['branch_oid'],
+                    self.ports.pr_for_branch(self.repo_path, plan['branch'], str(plan['pr_url'] or '') or None))
+            except RecoveryFailure as error:
+                if error.reason is RecoveryReason.REMOTE_BRANCH_DELETED:
+                    from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
+                    scoped_blocking.record_plan_block(self.connection, self.repo, str(plan['plan_id']),
+                        BlockReasonCode.REMOTE_BRANCH_DELETED, str(error), None)
+                    raise AssessmentPending(str(error)) from error
+                raise
+            checkpoint = ExecutionCheckpointRepository(self.connection).get(self.repo, str(plan['plan_id']))
+            row = self.connection.execute('SELECT * FROM blocked_checkpoints WHERE repo=? AND plan_id=?',
+                                           (self.repo, plan['plan_id'])).fetchone()
+            if row is not None and context['branch_oid'] and not (checkpoint.snapshot or {}).get('pending_work_branch_input'):
+                repository = BlockedCheckpointRepository(self.connection)
+                repository.record_remote_inspection(repository.get(self.repo, str(plan['plan_id'])),
+                    context['branch_oid'], context['input_identity'], '현재 작업 원격 입력 통합·수용 완료')
+            return
         checkpoint = ExecutionCheckpointRepository(self.connection).get(self.repo, plan['plan_id'])
         integration = (checkpoint.snapshot or {}).get('work_branch_integration') or {}
         if (checkpoint.operation in {'rebase', 'rebase_publish'}
@@ -377,19 +402,15 @@ class BlockedPlanReconciler:
                                    '원격 checkpoint 후속 commit의 안전한 채택이 거부됐습니다.')
             current = self._plan(plan['plan_id'])
             head = self.ports.git(Path(plan['worktree']), 'rev-parse', 'HEAD^{commit}').stdout.strip()
-            if self.ports.owned_remote_oid(
-                    self.connection, self.repo_path, self.repo, plan['plan_id'], plan['branch'],
-                    Path(plan['worktree']), context['branch_oid'], self.ports.git,
-                    before_head=head, recorded_oid=current['publication_remote_oid'],
-                    strict_observation=True) is None:
-                raise RuntimeError('마지막 채택 원격 OID와 게시 checkpoint 소유권을 증명할 수 없습니다.')
             checkpoints = ExecutionCheckpointRepository(self.connection)
             checkpoint = checkpoints.get(self.repo, plan['plan_id'])
-            if checkpoint.operation is None and checkpoint.observed_remote_oid != context['branch_oid']:
+            if checkpoint.operation is None and (checkpoint.observed_remote_oid != context['branch_oid']
+                    or (checkpoint.snapshot or {}).get('accepted_work_branch') != context['branch_oid']):
                 checkpoints.record(
                     self.repo, plan['plan_id'], expected_generation=checkpoint.generation,
                     operation=None, expected_head=head, target_base_oid=checkpoint.target_base_oid,
-                    observed_remote_oid=context['branch_oid'], snapshot=checkpoint.snapshot)
+                    observed_remote_oid=context['branch_oid'],
+                    snapshot={**(checkpoint.snapshot or {}), 'accepted_work_branch': context['branch_oid']})
         elif context['branch_oid'] is not None:
             raise RuntimeError('게시 checkpoint가 없는 기존 원격 작업 branch의 소유권을 증명할 수 없습니다.')
 

@@ -447,13 +447,12 @@ class CheckpointGitRecoveryFixture(BlockedGitFixture):
             (repo_id,),
         ).fetchone()
         self.assertEqual(tuple(recovered),
-                         ('IMPLEMENTING', published, 'retained-session'))
+                         ('IMPLEMENTING', None, 'retained-session'))
         self.assertIsNone(scoped_blocking.project_block(self.connection, repo_id))
         restored_checkpoint = checkpoint_store.get(repo_id, 'G-034')
-        self.assertEqual(restored_checkpoint.snapshot['blocked_resume'], {
-            'owner_oid': published, 'before_head': published,
-            'after_head': rebased, 'target_base_oid': target,
-        })
+        self.assertEqual(restored_checkpoint.snapshot['accepted_work_branch'], published)
+        self.assertEqual(restored_checkpoint.expected_head, rebased)
+        self.assertEqual(restored_checkpoint.snapshot['publication_block_release_audit'][-1]['evidence'], 'external_remote_oid')
 
 
     def publish_block(self, reason="verify_retry_exhausted",

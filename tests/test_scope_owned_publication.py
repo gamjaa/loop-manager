@@ -1,3 +1,4 @@
+from dataclasses import replace
 from tests.support.git import isolated_git_test
 import tempfile
 from types import SimpleNamespace
@@ -19,6 +20,15 @@ from tests.support.scoped_recovery import ScopedGateFixture
 
 @isolated_git_test
 class OwnedScopePublicationRecoveryTests(ScopedGateFixture, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        # 합성 Git 관측은 구형 callback 계약을 검사한다. 원격 통합은 실제 Git 회귀에서 확인한다.
+        factory = loop_manager._scope_reconciliation_effects_resume_owned_checkpoint_project_block
+        patch = mock.patch.object(loop_manager, '_scope_reconciliation_effects_resume_owned_checkpoint_project_block',
+            side_effect=lambda: replace(factory(), remote_integration_effects=None))
+        patch.start()
+        self.addCleanup(patch.stop)
+
     def test_incomplete_legacy_rebase_plan_block_stays_blocked(self):
         self.plan('G-001', 'PLAN_BLOCKED', branch='loop-manager/G-001')
         reason = rebase_block_reconciliation.LEGACY_COMPLETION_DIAGNOSTIC
@@ -855,7 +865,8 @@ class OwnedScopePublicationRecoveryTests(ScopedGateFixture, unittest.TestCase):
         with mock.patch.object(
             loop_manager, 'validate_execplan_workspace_identity',
             side_effect=loop_manager.WorkspaceOwnershipError('not owned'),
-        ):
+        ), mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=loop_manager.GitSnapshot(
+                'head', 'loop/G-001', {}, {}, {}, {}, {}, {})):
             self.assertFalse(loop_manager.resume_project_block_if_safe(
                 self.connection, Path(self.repo), Path('/state'), self.repo,
             ))
@@ -866,7 +877,9 @@ class OwnedScopePublicationRecoveryTests(ScopedGateFixture, unittest.TestCase):
         with mock.patch.object(loop_manager, 'validate_execplan_workspace_identity'), \
                 mock.patch.object(loop_manager, 'validate_managed_worktree'), \
                 mock.patch.object(loop_manager, '_rebase_in_progress_for_branch',
-                                  return_value=False):
+                                  return_value=False), \
+                mock.patch.object(loop_manager, 'capture_git_snapshot', return_value=loop_manager.GitSnapshot(
+                    'head', 'loop/G-001', {}, {}, {}, {}, {}, {})):
             self.assertTrue(loop_manager.resume_project_block_if_safe(
                 self.connection, Path(self.repo), Path('/state'), self.repo,
             ))
