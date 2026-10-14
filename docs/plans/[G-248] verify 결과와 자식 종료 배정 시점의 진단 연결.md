@@ -27,25 +27,33 @@ priority: normal
 - 기존 단독 .cache/verify/<run>/summary.json과 Manager <state-dir>/logs/verify/<run>/summary.json에서 배정 변화·당시 실행량/관측 근거·Git 호출 수/누적 시간·수집/준비/테스트/정리 및 전체 경과를 대조할 수 있다. 부분 run의 전체 discovery·영향 선정·선택 모듈 실행과 후속 전체 run을 기존 후보 증거로 연결하되 각 실행의 시간을 구분한다. NOT_SELECTED·FALLBACK·일반 선행 FAIL 뒤 전체 verify 미호출에는 완료 이벤트나 성공 시간을 합성하지 않는다. 비밀값·전체 env는 출력하지 않는다.
 - 첫 run_start의 busy=None과 이후 관측 실패를 구분한다. resource_wait가 상한 도달·예약 압력·미확인 관측을 포함함을 보존하며 이를 전부 유휴 시간으로 합산하지 않는다. PID별 누적 시간·부모에 포함된 자식 시간과 전체 경과를 더하지 않는다.
 - 기존 version 1·unittest manifest/결과 의미·전체 실행의 필수 compile·timeout과 진단 위치를 유지한다. 불완전한 legacy 로그에는 확인 가능한 자료만 표시한다. ARCHITECTURE·docs/VERIFY.md의 진단 설명을 갱신하며 OS 실측·성공 재사용 완료를 선언하지 않는다.
+- PRODUCT 운영 로그: Manager의 주기적 표시는 현재 run의 실제 단계별 JSONL에서 관측한 테스트 진행·자원 대기를 연결한다. `stage-N/worker-*.jsonl`의 시작·종료·중단을 놓치지 않고 부분 행은 완성된 뒤 한 번만 소비한다. run·stage·unit·test를 구분하고 단계 종료·중단 뒤의 항목을 현재 실행 중으로 표시하지 않는다. 수집·fixture·필수 command·자식 종료 대기는 테스트 실행과 구분하며 관측 불가를 실제 완료 수·성공·진척률로 합성하지 않는다. 다른 run·native NDJSON·TAP 원문은 집계하지 않는다.
 
 ## Implementation
 
 verification/core.py의 결과 수집·Windows Job 관측·unit_start와 기존 stop_worker phase, timing.py의 이벤트 집계 및 runner/manager_adapter의 metadata를 연결한다. runner의 mode·partial-result와 preliminary_reviews/verify_receipts의 기존 증거 연결, discovery·impact_selection phase를 재사용해 부분/전체 run을 구분한다. 이미 남기는 allocation·Git·fixture·시간 자료를 재사용하고 필요한 누락 시점만 보강한다. 기존 이벤트/요약 계약의 호환 확장으로 처리하고 별도 로그 저장소나 모니터링 서비스를 만들지 않는다. 실제 임시 경로의 선택·관측과 summary 연결은 G-253이 담당한다.
 
+- [ ] 확인한 `verification/manager_adapter.py:progress_observation()`의 최상위 `glob("*.jsonl")`를 현재 소유 run의 단계별 이벤트 배치와 맞춘다. 확인한 `runner.py:run()`의 `stage-N` 디렉터리와 `unittest_adapter.py:worker_main()`·`timing.py:TimedResult`의 실제 writer identity를 사용한다. 파일별 커서와 공통 phase·allocation 관측을 재사용해 단계별 진행·대기 해소를 반영하고 읽기 실패에서는 미확인 범위를 남긴다. 로그 관측 때문에 추가 Git·DB·프로세스·모델 조회를 실행하지 않는다.
+- [ ] 기존 `runtime/operation_events.py:progress()`의 reporter와 중첩 표시 억제·문맥 복사·종료를 재사용한다. 파일 관측 실패는 미확인으로 설명하며 verify 결과·timeout·예약·실패 집계에 영향을 주지 않는다. 별도 중복 reporter·새 전역 상태를 만들지 않는다.
+
 ## Validation
 
 - Worker는 test_verify_runtime.py·test_verify_contract.py의 최소 unit case로 결과 파일 있음/자식 생존, 확인 후 다음 배정, 종료 오류·재사용 금지와 run/stage/worker/module 연결을 검사한다. fake clock·process·Job을 주고 실제 core·집계 로직을 실행한다.
 - timing/manager adapter 회귀와 test_partial_verify_runner.py·test_preliminary_review.py의 기존 fixture로 standalone/Manager 동일 summary 경로와 Git/phase 자료 연결, 부분/전체 run 구분·미선택/fallback/전체 미호출, legacy 불완전 로그·비밀값 비노출·누적/경과 구분을 검사한다. 기존 실제 Windows 자식 종료 회귀는 유지하고 mock 결과를 실제 OS 근거로 확대하지 않는다.
+- Worker targeted unit은 `python3 -m unittest tests.test_operation_observability.OperationObservabilityTests`와 `tests/test_verify_runtime.py`·`tests/test_verify_contract.py`에서 이번 변경에 직접 관련된 case만 실행한다. 새 최소 fixture는 실제 `stage-0/worker-0.jsonl`과 루트 `runner.jsonl`에 version·run/stage/unit/test identity를 넣는다. 실행 중 append·UTF-8 부분 행·재관측·두 단계의 같은 test ID·중단·파일 읽기 실패와 자원 대기 해소에서 중복 완료·다른 run 혼합·낡은 실행 중 표시가 없어야 한다. 기존 최상위 단일 파일 fixture만으로 실제 writer 배치의 연결을 통과시키지 않는다. reporter 종료·오류가 verify 결과와 예약 상태를 바꾸지 않는지 모의 실행으로 확인한다.
 - Manager 전체 verify는 종료/예약·timeout/cancel·결과 완결성과 진단 보존을 유지한다. Manager가 실제 Windows 영향 모듈을 측정할 때 revision·범위·Python/Git·affinity/메모리·동시 부하·worker 수·cache·checkout/임시 파일시스템을 남겨 결과/자식/배정 시간을 구분한다. Windows와 WSL은 같은 PC에서 한 번에 하나씩 비교하고 미확인 환경 원인·절감률을 확정하지 않는다.
 
 ## Progress
 
 - [x] 2026-10-10 기준 50c699c8f9c149cecb0ddf9b081527942d8e2289의 R-065/R-067·core의 Job active 대기·timing summary와 runner metadata를 정적으로 확인했다. 구현·테스트·OS 측정·verify는 실행하지 않았다.
+- [ ] 실제 단계별 이벤트의 운영 진행 표시 연결과 최소 배치 회귀
 - [ ] 진단 연결·문서 정합화·targeted unit 검증
 - [ ] Manager 전체 verify·필요한 실제 Windows 자료·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
 
+- 2026-10-14 efc71a72f4e2ce152c9c4355e6d08bdc4ee242ac 재평가: 보존된 단계별 JSONL reader 보완과 이후 Worker 문서 권한 변경을 대조했다. 실제 writer 배치·reader·회귀 fixture의 누락은 그대로이며 관련 제품·설계 설명만 허용 문서에서 갱신한다. Requirement·다른 ExecPlan 수정이나 frontmatter 복원 기능을 추가하지 않고 ID·metadata·dependency·기존 수행 기록을 보존한다. 테스트·OS 실측·verify는 실행하지 않았다.
+- 2026-10-14 운영 로그 delta: `b72b0f7ba7be68d3977151c2a4ecbbba20af89aa` → `58814a9afa875bf5c440d610afe4e58725826921`에서 공통 로그·주기적 관측이 직접 구현됐다. 새 진행 reader는 run 루트만 읽지만 실제 unittest writer는 `stage-N/worker-*.jsonl`에 기록하므로 테스트 진행을 놓친다. `tests/test_operation_observability.py`는 루트의 단일 JSONL만 사용한다. 기존 진단 연결 목표의 소비 경계에 이 누락과 실제 배치 회귀를 통합하며 공통 포맷·reporter·이미 구현된 이벤트를 재구현하지 않는다. snapshot의 ID·경로·sources·dependency·complexity/risk·priority와 기존 기록을 보존한다. 정적 검토만 수행했으며 테스트·OS 실측·최종 제품 전문 확인 성공은 기록하지 않는다.
 - core는 Job active()>1이면 결과 수집 전에 continue하며 module_result·idle을 나중에 남긴다. timing.summarize는 module_result/unit_start의 연결 시점을 별도 집계하지 않는다. 기존 Git/phase 집계 자체는 재구현할 대상이 아니다. runner.run_start의 실제 임시 경로 누락은 G-253의 launcher·실효 경로 책임에 통합해 중복 구현하지 않는다.
 - complexity medium: core·runner·summary 사이의 확인된 시점과 실행 문맥을 연결한다. risk low: 기록·집계 오류는 보존 원본과 코드 교정으로 복구할 수 있으며 프로세스 종료·예약 정책은 바꾸지 않는다. priority normal이다.
 - G-187의 두 언어/두 OS 전체 적합성·직렬/auto/동시 실측과 구분한다. 이 계획은 새 진단 누락만 보완하며 비Python adapter 완료를 선행 요구하지 않는다. R-065의 비용 우선순위는 새 필수 dependency가 아니다.
