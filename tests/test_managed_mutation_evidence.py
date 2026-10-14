@@ -1424,7 +1424,8 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                         def archived_change(oid):
                             return observation(service.expected, committed=(FileChange(
                                 archived, '000000', '100644', '0', oid, 'A'),))
-                        self.assertTrue(service.adapters.contracts_allowed(archived_change('a' * 40)))
+                        # 유효한 archive 근거도 Worker의 Requirement 쓰기 권한은 만들지 않는다.
+                        self.assertFalse(service.adapters.contracts_allowed(archived_change('a' * 40)))
                         self.assertFalse(service.adapters.contracts_allowed(archived_change('b' * 40)))
                         # Existing requirements still cannot disappear from both paths.
                         (root / archived).unlink()
