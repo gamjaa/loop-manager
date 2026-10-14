@@ -499,16 +499,18 @@ class ConflictIndexScopeTests(unittest.TestCase):
 class WorkerPlanDocumentScopeTests(unittest.TestCase):
     related_plan = "docs/plans/[G-060] Project Root Placement Policy and Inventory.md"
 
-    def test_related_plan_updates_are_allowed_in_worker_result(self):
+    def test_other_plan_updates_are_rejected_in_worker_result(self):
         before = snapshot()
         for kinds in (("unstaged", "worktree"), ("staged",)):
             with self.subTest(kinds=kinds):
                 after = replace(before, dirty={path: (kinds, "inventory-update") for path in
                     (self.related_plan, "AGENTS.md", "docs/PRODUCT.md", "docs/ARCHITECTURE.md")})
-                validate_agent_scope("worker", Path(WORKTREE), before, after,
-                                     selected_plan_path=PLAN)
+                with self.assertRaises(AgentScopeError) as raised:
+                    validate_agent_scope("worker", Path(WORKTREE), before, after, selected_plan_path=PLAN)
+                self.assertIn(self.related_plan, str(raised.exception))
+                self.assertNotIn("AGENTS.md", str(raised.exception))
 
-    def test_saved_worker_result_can_be_revalidated_after_scope_block(self):
+    def test_saved_worker_scope_and_final_result_validation_remain_separate(self):
         before = snapshot()
         after = replace(before, dirty={self.related_plan: (("unstaged", "worktree"), "inventory-update")})
         checks = decide(before, after, phase="PLAN_BLOCKED", result=after).checks
@@ -517,6 +519,8 @@ class WorkerPlanDocumentScopeTests(unittest.TestCase):
             validate_agent_scope(check.role, Path(WORKTREE), check.before, check.after,
                                  selected_plan_path=PLAN, allowed_ref_changes=check.allowed_refs,
                                  allowed_worktree_changes=check.allowed_worktrees)
+        with self.assertRaises(AgentScopeError):
+            validate_agent_scope("worker", Path(WORKTREE), before, after, selected_plan_path=PLAN)
 
     def test_reviewer_still_rejects_related_plan_updates(self):
         before = snapshot()
@@ -536,7 +540,7 @@ class WorkerPlanDocumentScopeTests(unittest.TestCase):
                     validate_agent_scope("worker", Path(WORKTREE), before, after,
                                          selected_plan_path=PLAN)
                 self.assertIn(path, str(raised.exception))
-                self.assertNotIn(self.related_plan, str(raised.exception))
+                self.assertIn(self.related_plan, str(raised.exception))
 
     def test_related_plan_update_does_not_allow_index_flags_or_foreign_refs(self):
         before = snapshot(index={self.related_plan: ("H 100644 inventory 0",)})

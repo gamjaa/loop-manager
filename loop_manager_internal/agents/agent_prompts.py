@@ -220,7 +220,8 @@ def worker_prompt(
 관련 targeted test를 작성하되 commit, push, PR 생성과 scripts/verify 실행은 하지 마라.
 docs/plans에 새 ExecPlan을 만들지 말고 불필요한 후속 기능도 구현하지 마라.
 ExecPlan의 사용자 판단 대기 draft 표시와 User Decision은 사용자를 대신해 해제·작성·변경하지 마라.
-현재 ExecPlan 구현에 필요한 대응표·구현 기록은 docs/plans의 다른 기존 ExecPlan에도 갱신할 수 있다. 다른 계획의 목표를 추가 구현하거나 실행 상태를 문서에 기록하지 마라.
+선택된 ExecPlan은 구현·검증 기록 등 본문만 수정하고 frontmatter는 직접 변경하지 마라. 현재 작업과 무관한 Requirement와 다른 ExecPlan은 수정하지 마라.
+source 경로가 실제 파일명과 다르면 기존 정확 경로·동일 파일명 archive·고유 R-ID 조회로 근거를 확인하되 sources 문자열은 보존하라. 누락·모호함이나 선언 교정이 필요하면 원인과 대상 경로를 보고하고 Planner·Manager의 검증·공식 선언·DB 반영에 맡겨라.
 {plans_scope}
 구현과 관련 unit test를 작성하거나 갱신한 뒤, 수정한 코드와 새로 작성하거나 변경한 테스트를 직접 검증하는 최소 범위의 targeted unit test만 실행하라. 개별 test case, test class, test module 또는 이에 준하는 좁은 단위만 허용된다.
 targeted unit test가 실패하면 같은 세션에서 원인을 수정하고 같은 targeted test를 다시 실행하라. 문서·설정 전용 변경이거나 실행 가능한 관련 unit test가 없으면 테스트 범위를 확대하지 말고, 실행하지 못한 구체적인 사유를 최종 결과에 남겨라.

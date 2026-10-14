@@ -1461,8 +1461,7 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         self.assertTrue(service.adapters.path_allowed('app.py'))
         self.assertTrue(service.adapters.path_allowed('docs/requirements/Active.md'))
         self.assertFalse(service.adapters.path_allowed('docs/requirements/archive/UserDesign.md'))
-        # Current Worker guidance permits updating other existing ExecPlan records.
-        self.assertTrue(service.adapters.path_allowed('docs/plans/[G-048] Other.md'))
+        self.assertFalse(service.adapters.path_allowed('docs/plans/[G-048] Other.md'))
         self.assertFalse(service.adapters.path_allowed('docs/requirements/archive/Other.md'))
         first = service.adapters.read_inputs(service.expected)
         ports._worktree_execplan_input_fingerprint.return_value = 'edited-plan'

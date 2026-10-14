@@ -130,6 +130,59 @@ class ExecPlanRequirementSourceCatalogTest(unittest.TestCase):
         self.assertIn("G-231", snapshot.active)
         self.assertEqual(snapshot.active["G-231"].sources, (source,))
 
+    def test_worker_source_rename_requires_official_catalog_adoption_and_keeps_body(self):
+        from loop_manager_internal.execution import plan_validation
+        from loop_manager_internal.application.contracts import ExecPlanMetadataError
+
+        path = "docs/plans/[G-236] 전체와 프로젝트 pause resume의 보존 경계.md"
+        old_sources = (
+            "docs/requirements/[R-076] Read-Only Operational State CLI.md",
+            "docs/requirements/[R-077] Manual Plan Work Start and Completion.md",
+        )
+        actual_sources = (
+            "docs/requirements/[R-076] 운영 명령어와 상태 조회 및 Skill 지원.md",
+            "docs/requirements/[R-077] G 계획 수동 구현과 R·코드 일괄 제출.md",
+        )
+        documents = {name: requirement(identifier, name) for name, identifier in
+                     zip(actual_sources, ("R-076", "R-077"))}
+        body = "\n## Progress\n- 구현·문서·테스트는 checkpoint에 보존됨. 전체 verify 미확인.\n"
+        text = execplan_header("G-236", "전체와 프로젝트 pause resume의 보존 경계",
+                              sources=old_sources) + body
+        def parse(_root, relative):
+            return execplan_catalog.parse_execplan_text(
+                relative, text, requirement_documents=documents)
+        stored = {"plan_id": "G-236", "path": path, "title": "전체와 프로젝트 pause resume의 보존 경계",
+                  "sources": json.dumps(old_sources), "depends_on": "[]", "priority": "normal",
+                  "current_complexity": "low", "current_risk": "low"}
+        effects = plan_validation.ValidateActiveExecplanMetadataEffects(
+            validate_execplan=parse,
+            _current_execplan_metadata=plan_validation._current_execplan_metadata,
+            _execplan_metadata_identity_error=lambda *args: plan_validation._execplan_metadata_identity_error(
+                plan_validation.ExecplanMetadataIdentityErrorEffects(
+                    _current_execplan_metadata=plan_validation._current_execplan_metadata), *args))
+        validate = lambda: plan_validation.validate_active_execplan_metadata(
+            effects, Path("/repo"), Path("/worktree"), path, stored)
+        self.assertEqual(validate()["sources"], list(old_sources))
+        for old, actual in zip(old_sources, actual_sources):
+            text = text.replace(old, actual)
+        checkpoint_text = text
+        with self.assertRaisesRegex(ExecPlanMetadataError, "불일치 필드: sources"):
+            validate()
+        self.assertEqual(json.loads(stored["sources"]), list(old_sources))
+        stored["sources"] = json.dumps(actual_sources)
+        self.assertEqual(validate()["sources"], list(actual_sources))
+        self.assertEqual(text, checkpoint_text)
+        self.assertTrue(text.endswith(body))
+
+        current = parse(None, path)
+        for field, value in (("title", "변경된 제목"), ("sources", list(old_sources)),
+                             ("depends_on", ["G-235"]), ("complexity", "high"),
+                             ("risk", "critical"), ("priority", "high")):
+            with self.subTest(field=field):
+                changed = {**current, field: value}
+                error = effects._execplan_metadata_identity_error(Path("/repo"), changed, stored, "활성 ExecPlan")
+                self.assertIn("불일치 필드: " + field, error)
+
     def test_ambiguous_id_is_reported_separately_from_missing_source(self):
         source = "docs/requirements/[R-001] Original.md"
         with self.assertRaises(execplan_catalog.ExecPlanCatalogError) as caught:

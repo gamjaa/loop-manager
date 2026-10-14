@@ -40,6 +40,8 @@ Manager는 기존 snapshot·원격 revision·content hash·현재 실행 및 소
 
 ### ExecPlan 갱신 경계
 
+- Worker는 선택된 ExecPlan의 구현·검증 기록 등 본문만 수정한다. frontmatter와 다른 ExecPlan, 현재 작업과 무관한 Requirement는 수정하지 않는다. frontmatter 변경은 Planner·Manager가 검증하고 공식 선언·catalog·DB에 반영한 뒤 실행 입력으로 사용한다.
+- 기존 source 경로의 rename 조회 호환은 R-071대로 유지한다. 누락·모호한 source나 잘못된 선언은 Worker 시작 전에 정합화하거나 Planner 교정으로 처리하며, Worker의 경로 수정이나 metadata 비교 완화로 우회하지 않는다. 교정은 기존 구현·문서·테스트·실행 기록을 보존하며 완료·verify 성공·차단 해제를 뜻하지 않는다.
 - 일반 Planner는 PR 등록 전인 ExecPlan을 관련 Requirement 변경에 맞춰 갱신한다. 최초 실행 여부, READY 복귀, 기존 branch·worktree·세션 또는 원격 checkpoint 존재만으로 갱신 대상에서 제외하지 않는다.
 - 진행 중 작업의 갱신은 같은 ExecPlan ID와 작업물·세션·실행 및 실패 이력을 보존한다. 이미 수행한 구현·검증 기록과 새 조건의 미충족 부분을 구분하며, 문서 갱신 자체를 작업 완료나 과거 실패 해소로 기록하지 않는다.
 - PR 등록 후 Merge를 기다리는 ExecPlan은 새 요구사항을 반영하기 위해 수정하지 않는다. 추가·변경 요구사항의 미충족 범위는 새 ExecPlan으로 작성하며 기존 작업과의 중복·dependency는 기존 카탈로그 규칙으로 확인한다.
@@ -142,6 +144,7 @@ Reviewer를 먼저 진행한 결과가 구현 부족이면 Worker 교정 후 필
 
 ## Acceptance Criteria
 
+- 선택된 ExecPlan의 본문 기록 수정은 허용하고 frontmatter 선언 불일치와 다른 ExecPlan 변경은 검증·Review 전에 거부한다. source 경로 교정은 원격 공식 선언과 catalog·DB가 같은 결과를 채택한 뒤 보존된 Worker 구현·기록으로 재개하며, rename 조회 호환을 선언 일치로 오인하지 않는다.
 - 신규 Requirement의 목표가 이미 구현됐거나 기존 작업으로 충족되면 중복 ExecPlan이 생성되지 않는다. 기존 미착수 작업의 허용 개정과 독립적인 미충족 목표의 신규 생성이 구분되며 source·dependency와 DB 관계가 일치한다.
 - Requirement 수정의 변경 전후 동작·조건·완료 기준과 관련 작업을 확인할 수 있다. 변경·삭제된 항목의 체크리스트·관련 파일·변경 목적·Validation·source·dependency가 함께 갱신되고 이미 구현한 결과·유효한 검증·세션·실패·PR 이력은 보존된다.
 - 복수 Requirement의 일부 조건 또는 완료 기준만 삭제되면 그 부분의 작업·검증·참조만 제거된다. 다른 Requirement·PRODUCT의 목표와 공유 구현은 유지되고 필요한 선행 목표는 유효한 dependency로 남는다. 전체 철회만 R-055의 삭제·취소로 연결된다.

@@ -349,8 +349,9 @@ def _execplan_metadata_identity_error(
         "risk",
         "priority",
     )
-    if any(current[field] != reconciled[field] for field in metadata_fields):
-        return f"{subject} metadata가 reconciled catalog와 다릅니다."
+    mismatched = [field for field in metadata_fields if current[field] != reconciled[field]]
+    if mismatched:
+        return f"{subject} metadata가 reconciled catalog와 다릅니다. 불일치 필드: {', '.join(mismatched)}"
     return None
 
 
