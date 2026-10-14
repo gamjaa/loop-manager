@@ -25,6 +25,7 @@ from tests.support.catalog import write_execplan
 from tests.support.git import git_command as git, commit_and_push, isolated_git_test
 from tests.support.origin import remote_fixture, OriginScopeFixture
 from tests.support.workspace import WorkspaceFixture
+from tests.support.provider_execution import ProviderExecutionFixture
 
 
 @isolated_git_test
@@ -584,37 +585,113 @@ class ManualBootstrapConcurrencyTests(OriginScopeFixture, unittest.TestCase):
             self.assertEqual(len(manager._worktree_catalog(source)), 1)
             self.assertEqual(connection.execute('SELECT count(*) FROM projects').fetchone()[0], 0)
 
-    def test_manual_generation_uses_compact_catalog_and_existing_planner_guidance_boundary(self):
-        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
-            _, source, _writer = remote_fixture(directory)
+    def test_manual_generation_prompt_keeps_submission_evidence_without_static_rubric(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / 'repo'
+            source.mkdir()
             state = Path(directory) / 'state'
             state.mkdir()
             connection = manager.connect_database(state, create=True)
-            cleanup.callback(connection.close)
-            head = git(source, 'rev-parse', 'HEAD')
+            self.addCleanup(connection.close)
+            head = 'a' * 40
             group = {'base_sha': head, 'source_head': head, 'group_id': 'b' * 32}
             compact = mock.Mock(return_value='[{"id":"G-001","title":"Active","status":"READY"}]')
             captured = {}
+
+            def git_effect(_repo, *args, **_kwargs):
+                if args[0] == 'show':
+                    return type('Result', (), {'returncode': 1, 'stdout': ''})()
+                return type('Result', (), {'returncode': 0, 'stdout': 'submitted diff'})()
 
             def agent(_provider, _path, _state, _config, role, prompt, **kwargs):
                 captured.update(role=role, prompt=prompt, kwargs=kwargs)
                 return 0, '{"plans": []}'
 
+            runtime = type('Runtime', (), {'path': source})()
             effects = manual_plan_generation.ManualGenerationEffects(
-                manager.git, agent, manager.prepare_runtime_worktree, manager.remove_runtime_worktree,
-                compact_execplan_catalog=compact,
+                git_effect, agent, mock.Mock(return_value=runtime), mock.Mock(), compact,
             )
             self.assertEqual(manual_plan_generation.generate(
                 effects, connection, source, state, source / 'unused.ini', 'codex', group, {},
             ), '{"plans": []}')
             compact.assert_called_once_with(connection, str(source))
+            effects.prepare_worktree.assert_called_once()
+            effects.remove_worktree.assert_called_once_with(source, state, runtime)
             self.assertEqual(captured['role'], 'planner')
             self.assertTrue(captured['kwargs']['read_only'])
             prompt = captured['prompt']
-            self.assertIn('설계 난도', prompt)
-            self.assertIn('실패 영향 및 복구 가능성', prompt)
-            self.assertIn('high 또는 critical', prompt)
+            self.assertIn('제출 본문에서 찾아', prompt)
+            self.assertIn('고정된 Planner 지침과 PLANS', prompt)
             self.assertIn('"status": "READY"', prompt)
             self.assertNotIn('reserved', prompt)
+            self.assertNotIn('high 또는 critical', prompt)
+            self.assertNotIn('설계 난도', prompt)
+            self.assertNotIn('실패 영향 및 복구 가능성', prompt)
             self.assertNotIn('EXECPLAN_AUTHORING_GUIDANCE', prompt)
             self.assertNotIn('AGENTS.md', prompt)
+
+
+class ManualGenerationProviderGuidanceTests(ProviderExecutionFixture, unittest.TestCase):
+    def test_generation_provider_request_reuses_pinned_common_and_planner_instruction(self):
+        from types import SimpleNamespace
+        from loop_manager_internal.agents import common_guidance, invocation_service
+        from loop_manager_internal.agents.agent_invocation import InvocationContext
+        from tests.support.fixed_samples import PROJECT_FILES
+        from tests.support.workspace import pin_common_guidance
+
+        group = {'base_sha': 'a' * 40, 'source_head': 'b' * 40, 'group_id': 'c' * 32}
+        invocation_context = InvocationContext(self.repo, None,
+            task_id='manual-submit:' + group['group_id'])
+        pin_common_guidance(self.connection, invocation_context, self.worktree, self.state, role='planner')
+        requests = []
+
+        def run_agent(provider, worktree, state, config, role, prompt, **kwargs):
+            class Provider:
+                def run(_self, request):
+                    requests.append(request)
+                    return 0, '{"plans": []}'
+            invocation_effects = invocation_service.InvocationEffects(
+                lambda *_args: self.profile, lambda: None,
+                lambda ledger, context, selected_role, selected_provider, profile, session, **opts:
+                    ledger.start(context, selected_role, selected_provider, profile, session, **opts),
+                mock.Mock(), mock.Mock(), lambda _: Provider())
+            return invocation_service.run_agent(provider, worktree, state, config, role, prompt,
+                read_only=True, connection=self.connection,
+                invocation=invocation_context,
+                effects=invocation_effects)
+
+        def git_effect(_repo, *args, **_kwargs):
+            return SimpleNamespace(returncode=1 if args[0] == 'show' else 0,
+                                   stdout='' if args[0] == 'show' else 'submitted diff')
+
+        compact = mock.Mock(return_value='[{"id":"G-001","title":"Active","status":"READY"}]')
+        runtime = SimpleNamespace(path=self.worktree)
+        effects = manual_plan_generation.ManualGenerationEffects(git_effect, run_agent,
+            mock.Mock(return_value=runtime), mock.Mock(), compact)
+        changed_root = self.root / 'changed-guidance'
+        for relative in common_guidance.GUIDANCE_PATHS:
+            target = changed_root / relative
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes((PROJECT_FILES / relative).read_bytes())
+        for relative in ('docs/AGENTS.common.md', 'docs/AGENTS.planner.md'):
+            (changed_root / relative).write_text('changed instruction: ' + relative, encoding='utf-8')
+        def subprocess_run(arguments, **_kwargs):
+            output = 'codex-cli 0.159.3' if arguments[:2] == ['codex', '--version'] else 'a' * 40
+            return SimpleNamespace(returncode=0, stdout=output)
+
+        with mock.patch.object(common_guidance.subprocess, 'run', side_effect=subprocess_run), \
+             mock.patch.object(common_guidance, 'RUNTIME_ROOT', changed_root):
+            for _ in range(2):
+                self.assertEqual(manual_plan_generation.generate(effects, self.connection, self.source,
+                    self.state, self.config, 'codex', group, {}), '{"plans": []}')
+
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(requests[0].common_guidance.content, requests[1].common_guidance.content)
+        common = (PROJECT_FILES / 'docs/AGENTS.common.md').read_text(encoding='utf-8').strip()
+        planner = (PROJECT_FILES / 'docs/AGENTS.planner.md').read_text(encoding='utf-8').strip()
+        delivered = requests[0].common_guidance.content
+        self.assertEqual(requests[0].role_name, 'planner')
+        self.assertTrue(requests[0].read_only)
+        self.assertIn(common, delivered)
+        self.assertIn(planner, delivered)
+        self.assertNotIn('changed instruction:', delivered)
