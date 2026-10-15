@@ -143,6 +143,7 @@ class AgentRequest:
     stream_output: bool = False
     prepared_launch: CodexLaunch | None = field(default=None, repr=False)
     on_execution_identity: Callable[[dict[str, str]], None] | None = None
+    on_launch_prepared: Callable[[CodexLaunch], None] | None = None
 
 
 @dataclass(frozen=True)

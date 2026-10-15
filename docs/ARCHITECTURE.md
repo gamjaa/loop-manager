@@ -537,7 +537,8 @@ manifest·이벤트·결과는 version·run·단계·단위/테스트 identity�
 문서 보고 교정의 변경 요구는 [R-087](requirements/%5BR-087%5D%20문서%20보고%20교정%20반복%20제한.md)을 따른다. 구현 목표는 후보 커밋·최신 base 조정 뒤 전체/부분 검증과 성공 receipt 재사용 판단 전에 최종 문서 보고를 검사하고 게시 직전에도 다시 확인하는 것이다. Worker 교정의 반복 식별은 후보 HEAD·index·dirty 내용 지문, 현재 명세 입력과 base로 결합하며 검증 출력·Agent 세션은 진전으로 보지 않는다. 기존 verify token의 출력 결합과 입력 재관측·receipt·Review gate는 유지한다.
 
 - Worker는 구현과 관련 targeted unit test를 작성하고, 수정 범위에 직접 관련된 최소 unit test command만 실행한다
-- targeted unit test 실패는 Worker가 같은 세션에서 수정하고 재실행한다. 실행 가능한 관련 unit test가 없는 변경은 사유를 남기며 전체 검증을 생략하는 근거로 사용하지 않는다
+- targeted unit test 실패는 Worker가 같은 세션에서 수정하고 재실행한다. 프로젝트 Python과 Manager runtime의 `verification/targeted.py`로 unittest의 `test_end` 또는 새 JUnit 보고서의 개별 결과를 남긴다. 실행별 ID와 기록 폴더는 호출별 쓰기 허용 임시 폴더에 결합한다. JUnit의 classname·name은 파라미터를 포함한 안정적 테스트 ID여야 한다. unittest subTest는 상위 test.id()의 최종 결과로 집계한다. 실행 가능한 관련 unit test가 없는 변경은 사유를 남기며 전체 검증을 생략하는 근거로 사용하지 않는다
+- Manager는 물리 Agent 호출 종료·중단 경계에서 개별 결과를 SQLite `targeted_test_results`·`targeted_test_streaks`에 원자 반영한다. repository·ExecPlan·실행 ID·테스트 ID로 중복과 상충 결과를 검사하며 테스트별 연속 실패를 저장한다. 수집·fixture 오류는 개별 테스트 실패로 세지 않는다. 세 번째 실패 도달은 같은 turn에서 뒤에 성공하더라도 소비 전까지 보존하고 정상 Worker 경계에서 `targeted_test_exhausted`로 차단한다. 차단 확정과 도달 표식 소비는 같은 transaction이며 실행·실패 감사는 보존한다. Worker 최종 실패 보고는 `targeted_test_correction`으로 분리해 기존 보고 오류 한도를 소비하지 않고, 새 실행 근거가 없으면 일시 중단한다
 - Worker는 현재 운영체제용 verify 스크립트가 없으면 생성하고 테스트 명령이 바뀌면 갱신한다
   - Windows: `scripts/verify.ps1`
   - Linux: `scripts/verify.sh`

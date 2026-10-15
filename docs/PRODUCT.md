@@ -160,6 +160,12 @@ ExecPlan 게시 실패:
 3. push 성공을 원격에서 확인하기 전에는 ExecPlan을 READY로 등록하거나 Worker를 시작하지 않는다
 4. 일반·유지보수 batch의 prepared intent와 planning worktree는 push·SQLite 적용 실패 뒤에도 보존한다. 원격에 batch가 있으면 원자 적용을 재개하고, 없으면 보존 후보를 최신 base로 옮겨 재검증한다
 
+Worker targeted unit test 실패:
+- 같은 작업의 동일 테스트가 실제 실행에서 연속 3회 실패하면 해당 ExecPlan을 차단한다. Worker 완료 보고의 교정 횟수는 이 기준에 사용하지 않는다.
+- 테스트 ID별로 집계하며 다른 테스트의 실행은 서로의 횟수에 영향을 주지 않는다. 해당 테스트의 성공 또는 skip·예상된 실패는 연속 실패를 초기화한다. 후보 코드·commit·Agent 세션 변화만으로 횟수를 초기화하지 않는다.
+- 같은 실행 결과는 한 번만 세고 Worker 세션 내부 재실행·CLI 재시도·Manager 재시작 뒤에도 기록을 보존한다. 실행·수집 중단과 근거 부재는 실패 횟수에 넣지 않는다. 실패 보고에 새로운 실행 근거가 없으면 상태를 보존해 이번 실행을 일시 중단하며 다음 실행에서 실제 재검증한다.
+- 테스트 실패 외의 문서·완료 보고 오류는 기존 교정 한도를 유지한다. 전체 verify의 실패 지문 및 Review 정책도 별도로 유지한다.
+
 전체 검증 또는 Review 실패:
 1. 프로그램이 전체 검증 실패 내용 또는 Reviewer의 blocking issue를 같은 Worker 세션에 전달하고 Reviewer도 저장된 세션을 재사용한다
 2. 전체 검증 성공 출력은 Worker에게 전달하지 않는다

@@ -49,6 +49,8 @@ class NativeWriteIsolationTests(TestCase):
             launch = envelope.prepare_launch(boundary, state_root, 'worker', False,
                                              isolation.codex_arguments(False), environment)
             self.assertEqual(environment['CODEX_HOME'], str(home))
+            self.assertEqual(launch.environment['LOOP_MANAGER_TARGETED_TEST_DIRECTORY'], str(launch.attempt))
+            self.assertTrue(Path(launch.environment['LOOP_MANAGER_TARGETED_TEST_RUNNER']).is_file())
             scoped_home = Path(launch.environment['CODEX_HOME'])
             self.assertEqual(scoped_home, home)
             self.assertEqual((scoped_home / 'auth.json').resolve(), home / 'auth.json')
