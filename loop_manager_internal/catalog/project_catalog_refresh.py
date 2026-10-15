@@ -42,7 +42,8 @@ def validated_held_planning_snapshot(
         # A deletion recovery may repair only its snapshot files. All other
         # quarantined bytes stay pinned, including synthetic missing-file holds.
         editable = {key for key, evidence in held.items() if evidence.get("path") in mutable_paths}
-        if local.withheld_ids - (held.keys() - editable):
+        if (local.withheld_ids - held.keys()
+                or any(issue.plan_id in editable for issue in local.issues)):
             raise execplan_catalog.ExecPlanCatalogError(
                 "삭제 복구 결과에 새 오류 또는 미해결 개정 대상이 있습니다.", code="held-planning-mismatch")
         for key, evidence in held.items():
@@ -80,20 +81,32 @@ def validated_held_planning_snapshot(
     return local
 
 
-def assert_planning_dependencies_unheld(catalog, plans, held_ids) -> None:
-    """Apply the same transitive hold gate to general and maintenance batches."""
+def assert_planning_dependencies_unheld(
+    catalog, plans, held_ids, *, recovery_target_ids=frozenset(), original_dependencies=None,
+) -> None:
+    """Reject held prerequisites except unchanged paths in a deletion recovery."""
+    original_dependencies = original_dependencies or {}
     for path, plan in plans:
-        pending, visited = list(plan["depends_on"]), set()
+        plan_id = str(plan["id"])
+        pending = [(plan_id, str(dependency), plan_id in recovery_target_ids)
+                   for dependency in plan["depends_on"]]
+        visited = set()
         while pending:
-            dependency = pending.pop()
-            if dependency in visited:
+            parent, dependency, inherited = pending.pop()
+            marker = (parent, dependency, inherited)
+            if marker in visited:
                 continue
-            visited.add(dependency)
-            if dependency in held_ids:
+            visited.add(marker)
+            inherited = inherited and dependency in original_dependencies.get(parent, ())
+            if dependency in held_ids and not inherited:
                 raise execplan_catalog.ExecPlanCatalogError(
                     f"새 planning 결과가 보류 계획에 의존합니다: {path} -> {dependency}",
                     code="held-planning-dependency", path=path)
-            pending.extend(catalog.get(dependency, {}).get("depends_on", []))
+            current = catalog.get(dependency)
+            dependencies = (current.get("depends_on") if current is not None else None)
+            if dependencies is None:
+                dependencies = original_dependencies.get(dependency, ())
+            pending.extend((dependency, str(item), inherited) for item in dependencies)
 
 
 class CatalogRefreshStopped(RuntimeError):
