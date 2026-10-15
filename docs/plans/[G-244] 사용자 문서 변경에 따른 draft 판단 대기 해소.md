@@ -118,6 +118,10 @@ Final run: PASS (15 tests, OK, skip 없음).
 
 추가 targeted: `python3 -m unittest tests.test_execplan_drafts.ExecPlanDraftCatalogTest.test_planner_uses_change_diff_once_and_preserves_full_decision_evidence tests.test_notification_events.TimelyProgressEventTest.test_publication_and_draft_share_one_decision_notice_with_waiting` → 2 tests, OK, skip 없음. 기존 대형 원문 projection과 기본 목록/대기의 호환성을 확인했다. unittest v1·launcher Python(지원 3.11–3.14)과 `scripts/verify-inputs.json`의 기존 코드·테스트 glob 및 필수 단계는 유지했다. 전체 verify·Review는 실행하지 않았으며 Manager의 rebase 완료 뒤 최종 후보 검증에 남긴다.
 
+2026-10-15 rebase 완료 후 autostash 문서 충돌 복구: 현재 HEAD `65f5ef9`와 지정 구현 기준 `25d50b1a3acaf4230dbbc3b550ee78bcb2e9c4fc`의 ExecPlan·연결 명세를 대조했다. 충돌 두 구간은 stash 쪽에 대체 내용이 없었으므로 기존 Planner의 보존 설명과 Worker의 구현·실패/재실행 기록을 모두 유지하고 표식만 제거했다. 기록을 유지한 본문이 HEAD 원문과 같음을 확인한 뒤 이 현재 검증 기록만 추가했다. frontmatter·Requirement·다른 ExecPlan과 결합된 구현 코드는 수정하지 않았다.
+
+현재 결합 후보에서 `python3 -m unittest tests.test_execplan_drafts.DraftAnswerReobservationTest tests.test_execplan_drafts.ExecPlanDraftCatalogTest.test_shared_prompt_evidence_retains_distinct_origins_and_partial_holds tests.test_execplan_drafts.ExecPlanDraftCatalogTest.test_reassessment_coexists_with_user_question_list_and_new_question tests.test_planning_selection.PlanningSelectionTest.test_draft_reassessment_and_requirement_answer_are_reviewed_once`를 새로 실행해 9 tests, OK, skip 없이 통과했다. 재관측·Progress/철회, 공통 근거와 부분 대기, 자동 재평가·실제 질문 목록, 같은 입력의 호출 억제를 기존 실제 SQLite·parser fixture와 mock 경계로 확인했다. 이전 후보의 통과를 재사용하지 않았고 테스트·기능을 추가하지 않았다. unittest v1·launcher Python(지원 3.11–3.14)과 verify 입력 목록·필수 단계는 유지한다. index의 문서 충돌 해소 표시와 stash 정리, 전체 verify·최종 Review는 Manager에 맡기며 Worker는 Git 상태 변경·전체 검증을 실행하지 않았다.
+
 ## Decision Log
 
 - full 검토 기준은 `d99e91f5f47ccdadc7e95c2541922b01a8e3a88b`다. 앞서 전문 확인한 PRODUCT·ARCHITECTURE·활성 Requirement 중 변경된 세 문서와 실제 목록 코드·테스트를 재검토했다. base의 목록 알림은 직접 구현된 기준으로 유지한다. 보존 후보는 개별 알림에서만 `reassessment`를 제외하고 새 base의 목록 생성·전송은 모든 pending ID를 사용하므로, 같은 G-244 안에서 사용자 질문과 자동 재평가의 대상 판정을 연결한다. 내부 gate를 해제해 알림을 줄이거나 개별 알림 생성 경로를 되살리지 않는다. 기존 개별 알림 기록과 Merge된 목록 구현을 최신 결합 후보의 검증 성공으로 취급하지 않는다.
