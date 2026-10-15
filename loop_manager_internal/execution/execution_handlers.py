@@ -347,8 +347,8 @@ class ExecutionHandlers:
     def _rebase_observation(self, context, *, target=None, stash_oid=None):
         return self._rebase_handler()._rebase_observation(context, target=target, stash_oid=stash_oid)
 
-    def _rebase_conflict(self, context, detail, *, corrected=False, worker_result=None, abnormal_result=False, target=None, stash_oid=None, recovery_reason=RecoveryReason.REBASE_CONFLICT):
-        return self._rebase_handler()._rebase_conflict(context, detail, corrected=corrected, worker_result=worker_result, abnormal_result=abnormal_result, target=target, stash_oid=stash_oid, recovery_reason=recovery_reason)
+    def _rebase_conflict(self, context, detail, *, corrected=False, worker_result=None, abnormal_result=False, target=None, stash_oid=None, recovery_reason=RecoveryReason.REBASE_CONFLICT, targeted_evidence_missing=False):
+        return self._rebase_handler()._rebase_conflict(context, detail, corrected=corrected, worker_result=worker_result, abnormal_result=abnormal_result, target=target, stash_oid=stash_oid, recovery_reason=recovery_reason, targeted_evidence_missing=targeted_evidence_missing)
 
     def _record_rebase_intent(self, context, target_oid):
         return self._rebase_handler()._record_rebase_intent(context, target_oid)

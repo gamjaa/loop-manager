@@ -8,6 +8,9 @@ from loop_manager_internal.git.managed_rebase_validation import RebaseStatus
 from loop_manager_internal.notifications import notifications
 from loop_manager_internal.storage import review_correction_state, runtime_state
 from loop_manager_internal.storage import recovery_state
+from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository
+from loop_manager_internal.execution.result_validation import TargetedTestFailure
+from loop_manager_internal.verification.targeted import RUNNER_INSTRUCTION
 import re
 import subprocess
 import sys
@@ -96,6 +99,19 @@ class WorkerHandler:
     def __init__(self, ports: WorkerHandlerPorts):
         self.ports = ports
 
+    def _targeted_test_block(self, context):
+        repository = TargetedTestRepository(self.ports.state.connection)
+        repo, plan_id = self.ports.identity.repo, context.plan.plan_id
+        repeated = repository.repeated(repo, plan_id)
+        if not repeated:
+            return None
+        detail = '동일 targeted unit test가 연속 3회 실패했습니다: ' + ', '.join(repeated)
+        with runtime_state._transaction(self.ports.state.connection):
+            outcome = self.ports._recover(RecoveryReason.TARGETED_TEST_EXHAUSTED,
+                                          detail, context=context)
+            repository.acknowledge(repo, plan_id)
+        return outcome
+
     def _parse_worker_outcome(self, context, message, *, allow_legacy_ready=False):
         allowed = {context.plan.path, *context.plan.sources,
                    'docs/PRODUCT.md', 'docs/ARCHITECTURE.md'}
@@ -149,6 +165,11 @@ class WorkerHandler:
 
     def run(self, context: ExecutionContext) -> ExecutionOutcome:
         self.ports.state.check_context(context)
+        blocked = self._targeted_test_block(context)
+        if blocked is not None:
+            return blocked
+        targeted_tests = TargetedTestRepository(self.ports.state.connection)
+        targeted_sequence = targeted_tests.sequence(self.ports.identity.repo, context.plan.plan_id)
         row = self.ports._row()
         try:
             worker_binding = SessionBinding.deserialize(row['worker_session_binding'])
@@ -318,6 +339,9 @@ class WorkerHandler:
                 feedback_repo.bind_session(delivery.attempt_id, started_session_id)
         def worker_call(current_session_id, session_recovery, invocation):
             nonlocal delivery, active_transition
+            if targeted_tests.repeated(self.ports.identity.repo, context.plan.plan_id):
+                return AgentResult(1, '동일 targeted test 연속 3회 실패: 추가 CLI 재시도를 중단합니다.',
+                                   current_session_id, AgentResultKind.PERMANENT_CONFIGURATION)
             previous_session = observed_session_id or active_session_id
             if (session_recovery and previous_session
                     and (active_transition is None
@@ -482,6 +506,12 @@ class WorkerHandler:
             return guarded
         context = guarded
         row = self.ports._row()
+        blocked = self._targeted_test_block(context)
+        if blocked is not None:
+            self.ports.clear_agent_scope(self.ports.identity.repo)
+            return blocked
+        targeted_evidence_missing = targeted_tests.sequence(
+            self.ports.identity.repo, context.plan.plan_id) == targeted_sequence
         catalog_plan = self.ports.snapshot().catalog_plan
         assert catalog_plan is not None
         if restored_frontmatter:
@@ -544,10 +574,23 @@ class WorkerHandler:
         except (WorkerOutcomeError, self.ports.contract.WorkerResultError) as error:
             self.ports.clear_agent_scope(self.ports.identity.repo)
             validation_error = f"Worker 결과 검증 실패:\n{error}"
+            if isinstance(error, TargetedTestFailure) and targeted_evidence_missing:
+                validation_error += '\n새 테스트 실행 근거가 없습니다. ' + RUNNER_INSTRUCTION
             if context.resolving_rebase:
                 validation_error = self.ports.contract.REBASE_CONFLICT_PREFIX + validation_error
             self.ports.state.update_project(self.ports.identity.repo, phase='WORKING', last_error=validation_error)
             self.ports.operation_print(validation_error, file=sys.stderr)
+            if isinstance(error, TargetedTestFailure):
+                if context.resolving_rebase:
+                    return self.ports._rebase_conflict(
+                        context, validation_error, corrected=True, worker_result=message,
+                        recovery_reason=RecoveryReason.TARGETED_TEST_CORRECTION,
+                        targeted_evidence_missing=targeted_evidence_missing,
+                    )
+                return self.ports._recover(
+                    RecoveryReason.TARGETED_TEST_CORRECTION, validation_error,
+                    context=context, attempts=int(targeted_evidence_missing),
+                )
             if context.resolving_rebase:
                 return self.ports._rebase_conflict(
                     context, validation_error, corrected=True, worker_result=message,
@@ -656,7 +699,15 @@ class WorkerHandler:
             detail = self.ports.contract.REBASE_CONFLICT_PREFIX + (
                 f'Worker 결과 검증 실패:\n{error}'
             )
+            if isinstance(error, TargetedTestFailure):
+                detail += '\n새 테스트 실행 근거가 없습니다. ' + RUNNER_INSTRUCTION
             self.ports.state.update_project(self.ports.identity.repo, phase='WORKING', last_error=detail)
+            if isinstance(error, TargetedTestFailure):
+                return self.ports._rebase_conflict(
+                    context, detail, corrected=True, worker_result=saved.worker_result,
+                    recovery_reason=RecoveryReason.TARGETED_TEST_CORRECTION,
+                    targeted_evidence_missing=True,
+                )
             return self.ports._rebase_conflict(
                 context, detail, corrected=True,
                 worker_result=saved.worker_result,

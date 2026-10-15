@@ -483,6 +483,8 @@ def _ensure_execplans_schema(connection: sqlite3.Connection) -> None:
     planner_check_state.ensure_schema(connection)
     agent_invocation_state.ensure_schema(connection)
     validation_feedback_state.ensure_schema(connection)
+    from loop_manager_internal.storage.targeted_test_state import ensure_schema as targeted_test_schema
+    targeted_test_schema(connection)
     validation_feedback_state.ValidationFeedbackRepository(connection).migrate_legacy()
     scoped_blocking.ensure_schema(connection)
     if not getattr(connection, "execplans_schema_ready", False):

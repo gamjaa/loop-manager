@@ -191,6 +191,7 @@ def run_codex(
     common_guidance: CommonGuidance | None = None,
     prepared_launch: agent_write_isolation.CodexLaunch | None = None,
     on_execution_identity=None,
+    on_launch_prepared=None,
     effects: ProviderEffects,
 ) -> tuple[int, str] | CodexResult:
     codex_launch = prepared_launch
@@ -269,6 +270,8 @@ def run_codex(
                 raise agent_write_isolation.IsolationError('실제 Provider 지침 적용 증거가 없습니다.')
             on_execution_identity(execution_identity(isolation_evidence, codex_launch,
                 ResolvedProfile(model, effort), instruction_digests[0], read_only=read_only))
+    if codex_launch is not None and on_launch_prepared is not None:
+        on_launch_prepared(codex_launch)
     project_dir = _provider_log_directory(worktree, state_dir)
     last_message = project_dir / f"{role_name}-last.txt"
     saved_log = _provider_log_path(worktree, state_dir, "codex", role_name)
@@ -842,6 +845,7 @@ class CodexAgentAdapter:
             common_guidance=request.common_guidance,
             prepared_launch=request.prepared_launch,
             on_execution_identity=request.on_execution_identity,
+            on_launch_prepared=request.on_launch_prepared,
             on_process_started=request.on_process_started,
             on_process_finished=request.on_process_finished,
         )

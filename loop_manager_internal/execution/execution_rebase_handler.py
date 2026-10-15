@@ -127,7 +127,7 @@ class RebaseHandler:
 
     def _rebase_conflict(self, context, detail, *, corrected=False, worker_result=None,
                          abnormal_result=False, target=None, stash_oid=None,
-                         recovery_reason=RecoveryReason.REBASE_CONFLICT):
+                         recovery_reason=RecoveryReason.REBASE_CONFLICT, targeted_evidence_missing=False):
         """Track actual Git progress before considering the final safety gate."""
         try:
             observation = self._rebase_observation(
@@ -165,6 +165,10 @@ class RebaseHandler:
                 classify_exception(error, operation=RecoveryReason.STATUS_FAILED),
                 str(error), context=context,
             )
+        if recovery_reason is RecoveryReason.TARGETED_TEST_CORRECTION:
+            return self.ports._recover(recovery_reason, detail, context=context,
+                attempts=int(targeted_evidence_missing), fingerprint=saved.fingerprint,
+                progress_marker=saved.progress)
         # An abnormal Agent exit is the first failed correction. Block only
         # after three further identical, progress-free results.
         correction_limit = 4 if abnormal_result else 3

@@ -224,6 +224,10 @@ def run_agent(
 
     notify_process_start = (role_name in {"worker", "planner", "planner_check", "maintenance_planner"}
                             and has_notification_session and invocation is not None)
+    def observe_launch(launch):
+        nonlocal prepared_launch
+        prepared_launch = launch
+
     request = AgentRequest(
         worktree=worktree,
         state_dir=state_dir,
@@ -244,8 +248,10 @@ def run_agent(
         common_guidance=guidance,
         prepared_launch=prepared_launch,
         on_execution_identity=observe_execution_identity,
+        on_launch_prepared=observe_launch,
     )
     started = time.monotonic()
+    targeted_collection_error = None
     try:
         if session_id and session_task is None:
             # The existing retry runner rebuilds role/task context once. Keep
@@ -280,6 +286,15 @@ def run_agent(
                 pass
         raise
     finally:
+        if role_name == 'worker' and prepared_launch is not None and connection is not None and invocation is not None and invocation.plan_id:
+            from loop_manager_internal.verification.targeted import collect
+            from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository
+            try:
+                TargetedTestRepository(connection).observe(invocation.repo, invocation.plan_id,
+                                                          collect(prepared_launch.attempt))
+            except (OSError, ValueError, sqlite3.Error) as error:
+                targeted_collection_error = f'targeted test 실행 근거 수집 실패: {type(error).__name__}'
+                events.emit(targeted_collection_error, level='WARN', invocation_id=identity)
         if execution_started and identity is not None:
             try:
                 from loop_manager_internal.agents.provider_adapters import _provider_log_path
@@ -299,6 +314,8 @@ def run_agent(
         if owned_connection is not None:
             owned_connection.close()
     result = _coerce_agent_result(raw, session_id)
+    if targeted_collection_error:
+        collection_status = 'error'
     if result.collection_status == "error":
         collection_status = "error"
     if ledger is not None and identity is not None:
@@ -321,6 +338,10 @@ def run_agent(
                 input_tokens=result.usage.input_tokens, cached_input_tokens=result.usage.cached_input_tokens,
                 cache_write_input_tokens=result.usage.cache_write_input_tokens,
                 output_tokens=result.usage.output_tokens, reasoning_output_tokens=result.usage.reasoning_output_tokens)
+    if targeted_collection_error:
+        return replace(result, code=1, message=targeted_collection_error,
+                       kind=AgentResultKind.PERMANENT_CONFIGURATION,
+                       collection_status='error', isolation_invocation_id=identity)
     if isinstance(raw, AgentResult):
         return replace(raw, collection_status=collection_status,
                        isolation_invocation_id=identity)
