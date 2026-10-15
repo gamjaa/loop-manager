@@ -18,6 +18,7 @@ from loop_manager_internal.planning.planning_catalog import (
 from loop_manager_internal.planning.planning_contracts import choose_planning_decision, PlanningDecisionKind
 from loop_manager_internal.storage import (
     execplan_catalog_state, execplan_draft_state, planning_publication_state, runtime_state,
+    validation_feedback_state,
 )
 from loop_manager_internal.notifications import work_exhaustion
 from loop_manager_internal.maintenance.maintenance_planning import markdown_sections
@@ -829,6 +830,10 @@ class ExecPlanDraftCatalogTest(AutomationCatalogFixture, unittest.TestCase):
         self.connection.execute("UPDATE exec_plans SET status='PR_OPEN', ever_started=1, pr_url=? WHERE plan_id='G-004'",
                                 ("https://github.com/owner/project/pull/4",))
         self.connection.commit()
+        validation_feedback_state.ValidationFeedbackRepository(self.connection).migrate_legacy()
+        self.assertIsNotNone(self.connection.execute(
+            "SELECT 1 FROM validation_feedback_migrations WHERE repo='repo' AND plan_id='G-001'"
+        ).fetchone())
         previous = self.waiting()
         snapshot = execplan_catalog.snapshot_from_documents(
             {path: text for path, text in documents.items() if path != PATH},
@@ -877,6 +882,60 @@ class ExecPlanDraftCatalogTest(AutomationCatalogFixture, unittest.TestCase):
         execplan_catalog_state.CatalogReconciliationService(repository, FakeDefinitionPort(pinned)).reconcile("repo")
         self.assertEqual(self.waiting(), {**previous, "pending": False, "cancelled_revision": "c" * 40})
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM execplan_cancellations WHERE plan_id='G-001'").fetchone()[0], 1)
+
+    def test_orphan_feedback_migration_keeps_plan_id_reserved(self):
+        validation_feedback_state.ensure_schema(self.connection)
+        self.connection.execute(
+            "INSERT INTO validation_feedback_migrations (repo, plan_id) VALUES ('repo', 'G-002')"
+        )
+        self.connection.commit()
+        repository = execplan_catalog_state.DefinitionStateRepository(self.connection)
+        self.assertIn('G-002', {item[0] for item in repository.capture('repo').reserved})
+        result = self.reconcile({**self.documents,
+            'docs/plans/[G-002] Reused.md': plan_text('G-002', 'Reused')})
+        self.assertEqual(result.diagnostic.code, 'unknown-plan-id')
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM exec_plans WHERE repo='repo' AND plan_id='G-002'"
+        ).fetchone())
+
+    def test_deleted_draft_does_not_reopen_archived_reference_or_legacy_hold(self):
+        archive = 'docs/plans/archive/[G-002] Historical.md'
+        historical = plan_text('G-002', 'Historical') + '\n- G-001 was a past question.\n'
+        documents = {**self.documents, archive: historical}
+        self.reconcile(documents, 'b' * 40)
+        self.assertIn('G-002', execplan_catalog_state.verified_historical_merge_ids(self.connection, 'repo'))
+        snapshot = execplan_catalog.snapshot_from_documents(
+            {archive: historical}, revision_sha='c' * 40, isolate_errors=True)
+        pinned = execplan_catalog_state.PinnedCatalog('c' * 40, snapshot,
+            frozenset({'docs/PRODUCT.md', archive}), draft_inputs=self.inputs)
+        def git_bytes(_repo, *arguments):
+            if arguments[0] == 'ls-tree':
+                return b'100644 blob ' + b'a' * 40 + b'\t' + PATH.encode() + b'\0'
+            return documents[arguments[1].split(':', 1)[1]].encode()
+        causes = [dict(plan_id='G-001', path=PATH, code='missing-plan', source=None),
+                  dict(plan_id='G-002', path=archive, code='missing-plan-reference', source=PATH)]
+        for plan_id, path in (('G-001', PATH), ('G-002', archive)):
+            evidence = dict(path=path, content_hash=execplan_catalog.plan_content_hash(documents[path]),
+                            revision='c' * 40, causes=causes)
+            self.connection.execute('INSERT INTO execplan_catalog_holds '
+                '(repo, plan_id, revision_sha, evidence) VALUES (?, ?, ?, ?)',
+                ('repo', plan_id, 'c' * 40, json.dumps(evidence)))
+        self.connection.commit()
+        references = remote_deletions.reference_issues(self.connection, 'repo', Path('/repo'),
+            pinned, git_bytes=git_bytes)
+        self.assertEqual(references, ())
+        deletions = remote_deletions.prove_deletions(self.connection, 'repo', Path('/repo'), pinned,
+            git=mock.Mock(return_value=SimpleNamespace(returncode=0)), git_bytes=git_bytes,
+            references=references)
+        repository = execplan_catalog_state.DefinitionStateRepository(self.connection)
+        result = execplan_catalog_state.CatalogReconciliationService(repository,
+            FakeDefinitionPort(replace(pinned, deletions=deletions))).reconcile('repo')
+        self.assertEqual(result.withheld_plan_ids, ())
+        self.assertFalse(execplan_draft_state.pending_ids(self.connection, 'repo'))
+        self.assertFalse(remote_deletions.recovery_goals(self.connection, 'repo'))
+        self.assertEqual(self.connection.execute(
+            "SELECT status FROM exec_plans WHERE repo='repo' AND plan_id='G-002'"
+        ).fetchone()[0], 'MERGED')
 
     def test_unrelated_remote_advance_keeps_wait_identity_and_question(self):
         previous = self.waiting()

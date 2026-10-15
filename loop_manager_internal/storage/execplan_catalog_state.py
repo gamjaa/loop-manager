@@ -715,16 +715,16 @@ class DefinitionStateRepository:
             if table not in available_tables:
                 continue
             selected_path = path_column or "''"
-            # Decision holds are not execution ownership. Only an orphan audit
-            # reserves the ID here; live drafts remain eligible for user cancellation.
-            orphan_draft = (" AND NOT EXISTS (SELECT 1 FROM exec_plans p "
-                            "WHERE p.repo=execplan_drafts.repo AND p.plan_id=execplan_drafts.plan_id)"
-                            if table == "execplan_drafts" else "")
+            # Decision holds and feedback migration markers are not execution
+            # ownership; their orphan audits still reserve deleted IDs.
+            orphan_audit = (f" AND NOT EXISTS (SELECT 1 FROM exec_plans p "
+                            f"WHERE p.repo={table}.repo AND p.plan_id={table}.plan_id)"
+                            if table in {"execplan_drafts", "validation_feedback_migrations"} else "")
             reserved_values.update(
                 (str(row[0]), str(row[1]))
                 for row in self.connection.execute(
                     f"SELECT DISTINCT plan_id, {selected_path} FROM {table} "
-                    "WHERE repo = ? AND plan_id IS NOT NULL" + orphan_draft,
+                    "WHERE repo = ? AND plan_id IS NOT NULL" + orphan_audit,
                     (repo,),
                 )
             )

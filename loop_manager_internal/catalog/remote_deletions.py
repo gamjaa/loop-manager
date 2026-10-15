@@ -45,6 +45,7 @@ def reference_issues(connection, repo, repository, pinned, *, git_bytes):
     verified_merged_rows = execplan_catalog_state.verified_merged_archive_execution_ids(
         connection, repo, rows,
     )
+    historical_ids = execplan_catalog_state.verified_historical_merge_ids(connection, repo)
     missing = {str(row["plan_id"]): str(row["path"]) for row in rows
                if str(row["plan_id"]) not in pinned.snapshot.observed_ids
                and str(row["plan_id"]) not in verified_merged_rows}
@@ -172,6 +173,7 @@ def reference_issues(connection, repo, repository, pinned, *, git_bytes):
         for other in set(saved.get("resolved", {})) - current_references:
             if latest_contents.get(other) is not None:
                 affected.discard(other)
+        affected.difference_update(historical_ids)
         issues.extend(catalog.CatalogIssue(other, paths[other], "missing-plan-reference",
             f"삭제된 계획의 참조 근거를 보존합니다: {other} -> {key}", path)
             for other in sorted(affected - {key}))
@@ -508,9 +510,11 @@ def recovery_goals(connection, repo):
     """Keep cancellation evidence immutable; resolution is publication-bound."""
     from loop_manager_internal.recovery.scoped_blocking import catalog_held_plan_ids
     goals = []
-    rows = connection.execute("SELECT * FROM exec_plans WHERE repo=?", (repo,)).fetchall()
+    historical_ids = execplan_catalog_state.verified_historical_merge_ids(connection, repo)
+    rows = [row for row in connection.execute("SELECT * FROM exec_plans WHERE repo=?", (repo,))
+            if str(row["plan_id"]) not in historical_ids]
     observed_ids = {str(row["plan_id"]) for row in rows}
-    held_ids = catalog_held_plan_ids(connection, repo)
+    held_ids = catalog_held_plan_ids(connection, repo) - historical_ids
     observed_ids.update(held_ids)
     for cancelled in connection.execute(
         "SELECT * FROM execplan_cancellations WHERE repo=? AND recovery_evidence IS NOT NULL ORDER BY plan_id", (repo,),
@@ -596,6 +600,7 @@ def recovery_goals(connection, repo):
             if key not in json.loads(item["depends_on"])
             and approvals.get(str(item["plan_id"]), {}).get("path") == item["path"]
             and approvals.get(str(item["plan_id"]), {}).get("content_hash") == item["content_hash"])
+        affected.intersection_update(observed_ids)
         definition = json.loads(row["definition_snapshot"]) if row["definition_snapshot"] else {}
         evidence = json.dumps({"text": definition.get("body_text") or "", "row": dict(row),
                                "affected": sorted(affected), "resolved": {}},
