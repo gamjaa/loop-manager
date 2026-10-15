@@ -11,7 +11,7 @@ from .events import (enqueue_current_project_events,
                      suppress_persistent_failure_for_block, record_merged_plan,
                      enqueue_completion_if_ready, mark_work_available,
                      enqueue_waiting_reason, enqueue_progress, record_process_start,
-                     record_planning_publication, enqueue_draft_decision,
+                     record_planning_publication, enqueue_draft_decisions,
                      enqueue_review_failure, enqueue_worker_failure)
 from .rendering import _message, _pieces, MESSAGE_LIMIT
 from .transport import send_telegram

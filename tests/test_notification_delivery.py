@@ -804,3 +804,192 @@ class InterruptedBlockStartupTest(NotificationFixture, unittest.TestCase):
             loop_manager.run_registered_projects(connection, Path('/unused'), SimpleNamespace(telegram_token='', telegram_chat_id=''))
         self.assertEqual(len(self.events(connection)), 1)
         self.assertEqual(connection.execute('SELECT start_identity FROM notified_block_incidents').fetchone()[0], 'saved-start')
+
+
+class DraftListNotificationTest(NotificationFixture, unittest.TestCase):
+    repo = "/projects/alpha"
+
+    def draft(self, connection, plan_id="G-018", title="보존 정책", *, revision="revision", url=True):
+        from loop_manager_internal.storage import execplan_draft_state
+        execplan_draft_state.ensure_schema(connection)
+        path = f"docs/plans/[{plan_id}] {title}.md"
+        connection.execute(
+            "INSERT OR REPLACE INTO exec_plans "
+            "(repo, plan_id, path, title, sources, depends_on, priority, content_hash, status) "
+            "VALUES (?, ?, ?, ?, '[]', '[]', 'normal', 'hash', 'READY')",
+            (self.repo, plan_id, path, title),
+        )
+        saved = {"pending": True, "identity": "question-" + plan_id, "revision": revision,
+                 "question": "Question: Which storage policy?"}
+        if url:
+            saved["url"] = "https://github.com/org/repo/blob/sha/" + plan_id
+        connection.execute("INSERT OR REPLACE INTO execplan_drafts VALUES (?, ?, 1, ?)",
+                           (self.repo, plan_id, json.dumps(saved)))
+
+    def test_publication_current_and_waiting_share_one_sorted_list(self):
+        connection = self.connection()
+        with connection:
+            self.draft(connection, "G-019", "검증 🙂 정책")
+            self.draft(connection)
+            notifications.record_planning_publication(connection, self.repo, [
+                ("second", {"id": "G-019", "title": "검증 🙂 정책"}),
+                ("first", {"id": "G-018", "title": "보존 정책"}),
+                ("ordinary", {"id": "G-020", "title": "구현"}),
+            ], "publication-sha")
+            notifications.enqueue_current_project_events(connection, self.repo)
+            notifications.enqueue_waiting_reason(connection, self.repo, work_exhaustion.WorkReasonSnapshot(
+                "cycle", ({"id": "G-018", "title": "보존 정책", "status": "DRAFT",
+                           "reason": "사용자 판단 대기", "question": "Question: Choose?"},), (), None, None))
+        rows = self.events(connection)
+        self.assertEqual([row["event_type"] for row in rows],
+                         ["draft_decisions", "plans_published", "work_waiting"])
+        payload = json.loads(rows[0]["payload"])
+        self.assertEqual([plan["id"] for plan in payload["plans"]], ["G-018", "G-019"])
+        self.assertFalse(payload["silent"])
+        message = notifications._message("draft_decisions", payload)
+        self.assertIn("[alpha] draft 작업 2건 · 사용자 판단 대기\n\n• G-018 · 보존 정책\n• G-019 · 검증 🙂 정책", message)
+        self.assertIn("각 작업 문서에서 질문을 확인", message)
+        self.assertNotIn("Which storage policy", message)
+        self.assertNotIn("https://", message)
+        self.assertEqual(json.loads(rows[1]["payload"])["plans"], [{"id": "G-020", "title": "구현"}])
+
+    def test_disabled_and_empty_lists_do_not_create_notices(self):
+        connection = self.connection()
+        with connection:
+            notifications.enqueue_draft_decisions(connection, self.repo)
+        self.assertEqual(self.events(connection), [])
+        notifications.configure_session(connection, enabled=False)
+        with connection:
+            self.draft(connection)
+            notifications.enqueue_draft_decisions(connection, self.repo)
+        self.assertEqual(self.events(connection), [])
+
+    def test_restart_and_reobservation_do_not_duplicate_list(self):
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "drafts.db"
+            connection = self.connection(database=database)
+            with connection:
+                self.draft(connection)
+                notifications.enqueue_draft_decisions(connection, self.repo)
+            sent = mock.Mock()
+            self.assertEqual(notifications.dispatch_pending(connection, "token", "chat", adapter=sent), 1)
+            connection.close()
+            restarted = sqlite3.connect(database)
+            self.addCleanup(restarted.close)
+            restarted.row_factory = sqlite3.Row
+            notifications.configure_session(restarted, enabled=True)
+            with restarted:
+                notifications.enqueue_current_project_events(restarted, self.repo)
+            self.assertEqual(notifications.dispatch_pending(restarted, "token", "chat", adapter=sent), 0)
+            self.assertEqual(sent.call_count, 1)
+            restarted.close()
+
+    def test_changes_cancel_old_lists_and_returning_subset_is_delivered_once(self):
+        connection = self.connection()
+        with connection:
+            self.draft(connection)
+            notifications.enqueue_draft_decisions(connection, self.repo)
+            self.draft(connection, "G-019", "검증 정책")
+            notifications.enqueue_draft_decisions(connection, self.repo)
+            connection.execute("UPDATE execplan_drafts SET pending=0 WHERE plan_id='G-019'")
+            notifications.enqueue_draft_decisions(connection, self.repo)
+        sent = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, "token", "chat", adapter=sent), 1)
+        self.assertIn("draft 작업 1건", sent.call_args.args[2])
+        self.assertEqual(sum(row["canceled_at"] is not None for row in self.events(connection)), 2)
+        with connection:
+            self.draft(connection, revision="new-revision")
+            notifications.enqueue_draft_decisions(connection, self.repo)
+        self.assertEqual(notifications.dispatch_pending(connection, "token", "chat", adapter=sent), 1)
+
+    def test_resolved_or_changed_evidence_cancels_unsent_list(self):
+        for change in ("resolved", "revision", "identity", "added"):
+            with self.subTest(change=change):
+                connection = self.connection()
+                with connection:
+                    self.draft(connection)
+                    notifications.enqueue_draft_decisions(connection, self.repo)
+                    if change == "resolved":
+                        connection.execute("UPDATE execplan_drafts SET pending=0")
+                    elif change == "added":
+                        self.draft(connection, "G-019", "검증 정책")
+                    else:
+                        connection.execute("UPDATE execplan_drafts SET evidence=json_set(evidence, ?, 'changed')",
+                                           ("$." + change,))
+                sent = mock.Mock()
+                self.assertEqual(notifications.dispatch_pending(connection, "token", "chat", adapter=sent), 0)
+                sent.assert_not_called()
+                self.assertIsNotNone(self.events(connection)[0]["canceled_at"])
+
+    def test_split_retry_keeps_text_and_utf16_id_links(self):
+        from loop_manager_internal.notifications import delivery
+        connection = self.connection()
+        with connection:
+            self.draft(connection, title="한글 🙂 " * 900)
+            self.draft(connection, "G-019", "연결 없는 작업", url=False)
+            self.draft(connection, "G-020", "다른 문서")
+            notifications.enqueue_draft_decisions(connection, self.repo)
+        calls = []
+        def send(*args, **kwargs):
+            calls.append((args[2], kwargs))
+            if len(calls) == 2:
+                raise RuntimeError("network failure")
+        with mock.patch.object(delivery, "send_telegram", side_effect=send):
+            notifications.dispatch_pending(connection, "token", "chat", adapter=delivery.send_telegram)
+        self.assertEqual(self.events(connection)[0]["confirmed_pieces"], 1)
+        original = self.events(connection)[0]["rendered_text"]
+        with mock.patch.object(delivery, "send_telegram", side_effect=send):
+            self.assertEqual(notifications.dispatch_pending(connection, "token", "chat", adapter=delivery.send_telegram), 1)
+        self.assertEqual(calls[1], calls[2])
+        successful = [calls[0], *calls[2:]]
+        self.assertEqual("".join(text for text, _ in successful), original)
+        links = []
+        for text, kwargs in successful:
+            self.assertFalse(kwargs["disable_notification"])
+            for entity in kwargs.get("entities", []):
+                raw = text.encode("utf-16-le")
+                linked_id = raw[entity["offset"] * 2:(entity["offset"] + entity["length"]) * 2].decode("utf-16-le")
+                links.append((linked_id, entity["url"]))
+        self.assertEqual(links, [("G-018", "https://github.com/org/repo/blob/sha/G-018"),
+                                 ("G-020", "https://github.com/org/repo/blob/sha/G-020")])
+
+    def test_link_crossing_piece_boundary_keeps_both_id_fragments(self):
+        from loop_manager_internal.notifications import rendering
+        prefix = "프로젝트 🙂\n• G-018 · "
+        text = prefix + "가" * (4091 - len(prefix)) + "\n• G-019 · 두 번째"
+        payload = {"plans": [{"id": "G-019", "url": "https://example.test/second"}]}
+        fragments = []
+        for start in (0, 4096):
+            piece = text[start:start + 4096]
+            for entity in rendering._draft_entities(payload, text, start, start + 4096):
+                raw = piece.encode("utf-16-le")
+                fragments.append(raw[entity["offset"] * 2:
+                                     (entity["offset"] + entity["length"]) * 2].decode("utf-16-le"))
+                self.assertEqual(entity["url"], "https://example.test/second")
+        self.assertEqual(fragments, ["G-", "019"])
+
+    def test_legacy_individual_notice_keeps_original_payload_and_text(self):
+        connection = self.connection()
+        with connection:
+            self.draft(connection)
+            notifications.enqueue_progress(connection, self.repo, "draft_decision", "legacy",
+                execplan_id="G-018", question="Question: Which storage policy?", url="https://example.test/old",
+                decision_revision="revision", status="사용자 판단 대기", silent=False)
+        payload = self.events(connection)[0]["payload"]
+        original = notifications._message("draft_decision", json.loads(payload))
+        sent = mock.Mock()
+        self.assertEqual(notifications.dispatch_pending(connection, "token", "chat", adapter=sent), 1)
+        self.assertEqual(sent.call_args.args[2], original)
+        self.assertEqual(self.events(connection)[0]["payload"], payload)
+
+
+class TelegramEntityTransportTest(unittest.TestCase):
+    def test_text_link_entities_are_sent_without_markup(self):
+        response = mock.MagicMock()
+        response.__enter__.return_value.status = 200
+        entities = [{"type": "text_link", "offset": 0, "length": 5, "url": "https://example.test/plan"}]
+        with mock.patch.object(transport, "urlopen", return_value=response) as open_url:
+            transport.send_telegram("token", "chat", "G-018 · 작업", entities=entities)
+        payload = json.loads(open_url.call_args.args[0].data)
+        self.assertEqual(payload["entities"], entities)
+        self.assertEqual(payload["text"], "G-018 · 작업")

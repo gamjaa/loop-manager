@@ -105,12 +105,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
             return None, None
         return str(row[0]), json.loads(str(row[1]))
 
-    from loop_manager_internal.storage import execplan_draft_state
-    for draft_id in execplan_draft_state.pending_ids(connection, repo):
-        draft = connection.execute("SELECT title FROM exec_plans WHERE repo = ? AND plan_id = ?",
-                                   (repo, draft_id)).fetchone()
-        if draft:
-            enqueue_draft_decision(connection, repo, draft_id, str(draft[0]))
+    enqueue_draft_decisions(connection, repo)
 
     for plan in connection.execute(
         "SELECT plan_id, title, pr_url FROM exec_plans "
@@ -584,9 +579,7 @@ def enqueue_waiting_reason(
         return False
     ensure_schema(connection)
     payload = snapshot.payload(Path(repo).name or repo)
-    for plan in payload["plans"]:
-        if plan.get("question"):
-            enqueue_draft_decision(connection, repo, plan["id"], plan["title"])
+    enqueue_draft_decisions(connection, repo)
     signature = hashlib.sha256(
         json.dumps(payload, sort_keys=True, ensure_ascii=False,
                    separators=(",", ":")).encode()
@@ -719,23 +712,44 @@ def record_planning_publication(connection, repo, plans, revision):
         return
     from loop_manager_internal.storage import execplan_draft_state
     ordinary = []
+    drafts = execplan_draft_state.pending_ids(connection, repo)
     for path, plan in plans:
         plan_id = str(plan["id"])
-        if plan_id in execplan_draft_state.pending_ids(connection, repo):
-            enqueue_draft_decision(connection, repo, plan_id, str(plan["title"]))
-        else:
+        if plan_id not in drafts:
             ordinary.append({"id": plan_id, "title": str(plan["title"])})
+    enqueue_draft_decisions(connection, repo)
     if ordinary:
         enqueue_progress(connection, repo, "plans_published", revision,
                          plans=ordinary, status="실행 또는 dependency 대기", silent=True)
 
 
-def enqueue_draft_decision(connection, repo, plan_id, title):
+def enqueue_draft_decisions(connection, repo):
     from loop_manager_internal.storage import execplan_draft_state
-    saved = execplan_draft_state.evidence(connection, repo, plan_id)
-    if saved and saved.get("pending"):
-        enqueue_progress(connection, repo, "draft_decision",
-                         str(saved.get("identity")) + "\0" + str(saved["revision"]),
-                         execplan_id=plan_id, execplan_title=title,
-                         question=saved["question"], url=saved.get("url"), decision_revision=saved["revision"],
-                         status="사용자 판단 대기", silent=False)
+    if not _enabled(connection):
+        return
+    plans = []
+    for plan_id in sorted(execplan_draft_state.pending_ids(connection, repo)):
+        saved = execplan_draft_state.evidence(connection, repo, plan_id)
+        plan = connection.execute("SELECT title FROM exec_plans WHERE repo = ? AND plan_id = ?",
+                                  (repo, plan_id)).fetchone()
+        if saved and saved.get("pending") and plan:
+            plans.append({"id": plan_id, "title": str(plan[0]), "url": saved.get("url"),
+                          "decision_identity": saved.get("identity"), "decision_revision": saved["revision"]})
+    if plans:
+        ensure_schema(connection)
+        previous = connection.execute(
+            "SELECT event_key, payload, canceled_at FROM notification_outbox WHERE repo = ? "
+            "AND event_type = 'draft_decisions' ORDER BY rowid DESC LIMIT 1", (repo,),
+        ).fetchone()
+        def decisions(items):
+            return [(plan["id"], plan["decision_identity"], plan["decision_revision"]) for plan in items]
+        if previous and not previous[2] and decisions(json.loads(previous[1])["plans"]) == decisions(plans):
+            return
+        identity = str(previous[0] if previous else "") + "\0" + json.dumps(decisions(plans), ensure_ascii=False)
+        connection.execute(
+            "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP "
+            "WHERE repo = ? AND event_type = 'draft_decisions' "
+            "AND sent_at IS NULL AND canceled_at IS NULL", (repo,),
+        )
+        enqueue_progress(connection, repo, "draft_decisions", identity,
+                         plans=plans, status="사용자 판단 대기", silent=False)
