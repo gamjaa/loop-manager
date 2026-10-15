@@ -12,6 +12,57 @@ REF = "refs/remotes/origin/main"
 
 
 class ManagerGitTransitionTests(unittest.TestCase):
+    def test_sealed_equal_receipt_survives_interruption_before_active_marker_removal(self):
+        for recover_only in (False, True):
+            with self.subTest(recover_only=recover_only), tempfile.TemporaryDirectory() as directory:
+                state = Path(directory)
+                observed = {'oid': OLD}
+                apply = mock.Mock()
+                arguments = dict(repo='/repo', kind='project_fetch', target=REF,
+                                 observe=lambda: observed.copy(), marker=lambda _: False)
+                self.assertEqual(journal.execute(state, owner='project', before=observed,
+                    expected=observed, apply=apply, **arguments), 'equal')
+                slot = journal._slot(state, '/repo', 'project_fetch', REF)
+                intent = next(slot.glob('*.intent.json'))
+                result = next(slot.glob('*.result.json'))
+                sealed = result.read_bytes()
+                (slot / 'active.json').write_bytes(intent.read_bytes())
+
+                if recover_only:
+                    self.assertFalse(journal.recover_active(state, **arguments))
+                else:
+                    self.assertEqual(journal.execute(state, owner='project', before=observed,
+                        expected=observed, apply=apply, **arguments), 'recovered')
+
+                self.assertFalse((slot / 'active.json').exists())
+                self.assertEqual(result.read_bytes(), sealed)
+                apply.assert_not_called()
+
+    def test_equal_recovery_keeps_conflicting_sealed_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            observed = {'oid': OLD}
+            arguments = dict(repo='/repo', kind='project_fetch', target=REF,
+                             observe=lambda: observed.copy(), marker=lambda _: False)
+            apply = mock.Mock()
+            journal.execute(state, owner='project', before=observed, expected=observed,
+                            apply=apply, **arguments)
+            slot = journal._slot(state, '/repo', 'project_fetch', REF)
+            (slot / 'active.json').write_bytes(next(slot.glob('*.intent.json')).read_bytes())
+            result = next(slot.glob('*.result.json'))
+            damaged = journal._read(result)
+            damaged['observed'] = {'oid': NEW}
+            result.unlink()
+            journal._write_new(result, damaged)
+            sealed = result.read_bytes()
+
+            with self.assertRaises(journal.MutationEvidenceError):
+                journal.recover_active(state, **arguments)
+
+            self.assertTrue((slot / 'active.json').exists())
+            self.assertEqual(result.read_bytes(), sealed)
+            apply.assert_not_called()
+
     def test_sealed_rebase_without_branch_is_refused_as_mutation_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory)

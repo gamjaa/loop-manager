@@ -787,7 +787,8 @@ def execute(
             _finish(slot, active, previous, current, {}, "aborted", state_matches=state_matches)
         elif matches(previous, previous["expected"], current):
             candidates = verified_transition(previous, current, marker(previous), state_matches=state_matches)
-            _finish(slot, active, previous, current, candidates, "complete", state_matches=state_matches)
+            status = "equal" if previous["before"] == previous["expected"] else "complete"
+            _finish(slot, active, previous, current, candidates, status, state_matches=state_matches)
             if previous["owner"] == owner and matches(previous, previous["expected"], expected):
                 return "recovered"
         elif matches(previous, previous["before"], current):
@@ -856,6 +857,9 @@ def recover_active(
         _finish(slot, active, intent, current, {}, "aborted", state_matches=state_matches)
         return False
     if matches(intent["before"], current):
+        if intent["before"] == intent["expected"] and (slot / f"{intent['id']}.result.json").exists():
+            candidates = verified_transition(intent, current, marker(intent), state_matches=state_matches)
+            _finish(slot, active, intent, current, candidates, "equal", state_matches=state_matches)
         return False
     candidates = verified_transition(intent, current, marker(intent), state_matches=state_matches)
     _finish(slot, active, intent, current, candidates, "complete", state_matches=state_matches)
