@@ -2,7 +2,7 @@
 from pathlib import Path
 from uuid import uuid4
 
-from loop_manager_internal.git.manager_git_journal import live_remote_branch_oid
+from loop_manager_internal.git import manager_git_journal
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.recovery.scoped_blocking import BlockReasonCode
 from loop_manager_internal.storage import runtime_state, recovery_state, verify_receipts
@@ -51,7 +51,7 @@ def restart(effects, connection, repo_path, state_dir, repo, plan_id, *, complet
     if pr and (pr.get('state') == 'MERGED' or pr.get('mergedAt')):
         complete_merged(connection, repo_path, repo, state_dir, plan, str(pr['url']), pr.get('headRefOid'))
         return '이미 Merge된 작업을 완료 처리했습니다.'
-    if live_remote_branch_oid(effects.git, repo_path, branch) is not None:
+    if manager_git_journal.live_remote_branch_oid(effects.git, repo_path, branch) is not None:
         raise RuntimeError('중단 뒤 동일 원격 branch가 다시 생성됐습니다. 현재 writer와 대상을 확인해야 합니다.')
     checkpoints = ExecutionCheckpointRepository(connection)
     current = checkpoints.get(repo, plan_id)
@@ -100,7 +100,7 @@ def restart(effects, connection, repo_path, state_dir, repo, plan_id, *, complet
     elif archived.branch != intent['archive_branch']:
         raise RuntimeError('보존한 branch identity가 다릅니다.')
     if not worktree.exists():
-        if live_remote_branch_oid(effects.git, repo_path, branch) is not None:
+        if manager_git_journal.live_remote_branch_oid(effects.git, repo_path, branch) is not None:
             raise RuntimeError('새 실행 준비 중 원격 branch가 생성됐습니다.')
         effects.git(repo_path, 'worktree', 'add', '-b', branch, str(worktree), intent['base'])
     effects.validate_managed_worktree(repo_path, worktree, branch)
