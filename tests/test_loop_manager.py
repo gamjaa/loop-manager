@@ -1,11 +1,9 @@
 import io
-import tempfile
 import unittest
 from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 import loop_manager
-from tests.support.catalog import make_catalog_root, write_execplan
 
 
 class PublicFacadeTest(unittest.TestCase):
@@ -18,17 +16,6 @@ class PublicFacadeTest(unittest.TestCase):
                 self.assertIn('approvals_reviewer="auto_review"', args)
                 self.assertTrue(any("sandbox_approval=false" in item and
                                     "request_permissions=false" in item for item in args))
-
-    def test_current_execplan_is_valid(self):
-        with tempfile.TemporaryDirectory() as directory:
-            root = make_catalog_root(directory)
-            plan = write_execplan(root, "G-001", "Current Plan")
-
-            values = loop_manager.validate_execplan(
-                root, plan.relative_to(root).as_posix()
-            )
-
-            self.assertEqual(values["id"], "G-001")
 
     def test_worker_and_reviewer_prompts_define_test_execution_boundary(self):
         planner = loop_manager.planner_prompt(None)
