@@ -15,7 +15,7 @@ priority: high
 
 진행 작업을 보존해 일반 planning으로 전환한 뒤 오류가 남는 경우, 보존된 작업의 재개 identity와 실제 변경 실행 자리의 소유를 분리한다. 미확인 영향의 작업은 다음 단계에 진입하지 않되 안전하게 자리를 비운 뒤 검증된 독립 계획은 기존 순서로 진행하고, planning 교정 뒤 원래 작업을 같은 단계에서 재개한다.
 
-현재 정상 전환·일반 planning 성공 뒤 재개와 폐기된 Git 진단의 해소는 직접 구현돼 있다. 실패 후 `planning_resume_plan_id`가 남으면 `planning_owns_execution_slot()`은 계속 true이고 `active_row()`도 보존 작업을 반환한다. `catalog_schedule_decision()`의 suspended/독립 READY 분기는 활성 row가 없을 때만 선택하므로 오류를 보존한 원래 작업이 독립 실행까지 막는다. `_recover_ignored_error()` 역시 active 존재만으로 거부해 이 전환에서의 기존 Git 진단 해소에 도달하지 못한다. 진단 해소를 결과 검증 완료로 삼지 않는 최신 `agent_ports.py`를 재사용한다.
+현재 정상 전환·일반 planning 성공 뒤 재개와 폐기된 Git 진단의 해소는 직접 구현돼 있다. 최신 `application/project_service.py:_run_coordinators()`는 프로젝트 로컬 재검사에서 planning이 실행 자리를 소유하면 보존된 active row가 있어도 planning으로 전달하고, 실제 실행 소유 또는 명시적 계획 대상의 복구는 기존 실행 경로로 전달한다. 이 진입 교정은 재구현하지 않으며 실패 planning의 안전한 suspend·독립 선택·후속 재개 전체가 완료됐다는 뜻으로 확대하지 않는다. 실패 후 `planning_resume_plan_id`가 남으면 `planning_owns_execution_slot()`은 계속 true이고 `active_row()`도 보존 작업을 반환한다. `catalog_schedule_decision()`의 suspended/독립 READY 분기는 활성 row가 없을 때만 선택하므로 오류를 보존한 원래 작업이 독립 실행까지 막는다. `_recover_ignored_error()` 역시 active 존재만으로 거부해 이 전환에서의 기존 Git 진단 해소에 도달하지 못한다. 진단 해소를 결과 검증 완료로 삼지 않는 최신 `agent_ports.py`를 재사용한다.
 
 ## Acceptance Criteria
 
@@ -30,7 +30,7 @@ priority: high
 
 - [ ] 확인한 `loop_manager_internal/storage/runtime_state.py`의 `planning_owns_execution_slot`, `suspend_planning`, `recovery_slot_available`, `active_row`, `pause_execution_for_planning`, `resume_execution_after_planning`과 `storage/project_state_adapter.py`의 activation/hydration을 함께 대조한다. 보존 작업과 실제 슬롯 사용자를 기존 projection·checkpoint·호환 가능한 저장 근거로 구별하고 실행 원본의 단계·이력을 보존한다. 새 실행 phase나 비호환 migration은 만들지 않는다.
 - [ ] `loop_manager_internal/planning/selection_service.py`의 오류 gate·독립 선택·복구와 `catalog/project_selection.py`의 영향 closure·priority 판단을 같은 구분에 연결한다. 기존 `preserved_unconfirmed_plan_ids`와 writer/게시 검사를 재사용하며 단순 코드 변경을 독립성 증거로 취급하지 않는다. 일반 planning 성공·변경 없음의 정상 경로를 다시 구현하지 않는다.
-- [ ] `planning/agent_ports.py`의 현재 결과 검증·폐기된 Git 진단 해소, `planning/state_ports.py`, `application/project_service.py`와 기존 planning publication/runtime 저장을 재사용해 원인 재검사와 게시 후 적용·새 원격 검토·원래 작업 복원을 연결한다. 해소 뒤 남은 결과 검증·현재 후보 교정을 실제로 완료한 경우만 재개한다. 보존된 planning worktree와 구현 worktree의 쓰기를 겹치지 않는다.
+- [ ] `planning/agent_ports.py`의 현재 결과 검증·폐기된 Git 진단 해소, `planning/state_ports.py`, `application/project_service.py`와 기존 planning publication/runtime 저장을 재사용해 원인 재검사와 게시 후 적용·새 원격 검토·원래 작업 복원을 연결한다. 해소 뒤 남은 결과 검증·현재 후보 교정을 실제로 완료한 경우만 재개한다. 보존된 planning worktree와 구현 worktree의 쓰기를 겹치지 않는다. 최신 project service의 로컬 재검사 전달을 그대로 소비하고 `_recover_ignored_error()`의 실제 소유 파일인 `planning/selection_service.py`에서 남은 active/보존 상태 거부와 독립 선택을 대조한다. 진입 분기를 다시 만들거나 명시적 계획 복구의 대상을 바꾸지 않는다.
 - [ ] 같은 복구 경계에서 최신 `planning/selection_service.py`·`specification_review.py`·`storage/planning_review_state.py`의 목적 구분을 유지한다. Requirement 완료 점검의 보존 결과는 해당 판단·게시만 이어가고 프로젝트 일반 planning·최종 전문 확인 성공을 대신하지 않는다. 직접 구현된 완료 점검 우선순위·0 유지보수 주기·새 점검 호출 제거는 다시 구현하지 않는다.
 - [ ] 실제 보완한 실패·보존·독립 선택과 재개 계약만 PRODUCT·ARCHITECTURE의 해당 절에 통합한다. R-082의 정상 전환과 다른 계획의 parser·수동 소유 보호·충돌 교정은 각 기존 담당 작업에 남긴다.
 
@@ -40,7 +40,7 @@ priority: high
 - 영향받은 원래 작업과 독립 READY를 함께 두고, 안전한 suspend 후 독립 작업 한 개의 선택·진행, 보류 작업/의존 closure의 미호출, 동일 오류의 Planner no-call과 오류·session·실패·원문 보존을 확인한다. 독립 작업의 PR 대기와 실제 종료 뒤 planning 복구/원래 단계 재개도 확인한다.
 - 유효한 결과가 저장된 경우와 실제 교정이 남은 경우의 모델 호출 수를 구분한다. 단순 원격 SHA·코드·ExecPlan 전진, 재시작·객관적 gate 재검사만으로 새 점검/전체 재계획을 하지 않고, 필요한 교정만 기존 세션으로 이어져야 한다. Requirement 목적의 복구에서도 일반·최종 receipt와 현재 실행/유지보수 상태를 보존해야 한다.
 - 종료 불명 writer·소유 operation·prepared 게시·공유 안전·수동 소유·dependency·활성 유지보수와 안전한 독립성 근거 부재에서는 실행 자리를 넘기지 않는다. 정상 planning 성공·변경 없음·명세 무변경 재개는 호출 수·순서와 실제 저장 row로 검증한다.
-- 기존 Git 진단 복구에서 보존 작업의 identity만으로 거부하지 않는다. `tests/test_planning_error_recovery.py`의 현재 ignored/config/current_tracked 해소와 결과 오류/ownership/race/독립 오류 보존을 재사용하며, 바뀐 후보의 결과 검증·완료 marker 불변을 연결한다. 사후 Git 권한 검사를 되살리지 않고 테스트 준비 비용 전환은 G-270에 남긴다.
+- 기존 Git 진단 복구에서 보존 작업의 identity만으로 거부하지 않는다. `tests/test_planning_error_recovery.py`의 현재 ignored/config/current_tracked 해소와 결과 오류/ownership/race/독립 오류 보존을 재사용하며, 바뀐 후보의 결과 검증·완료 marker 불변을 연결한다. 사후 Git 권한 검사를 되살리지 않고 테스트 준비 비용 전환은 G-270에 남긴다. `tests/test_project_services.py:ProjectServiceCompositionTests.test_project_recovery_routes_to_planning_while_execution_is_paused`의 실제 SQLite 기반 planning 소유/실행 소유 분기와 request ID·local_environment_recheck 전달을 기존 근거로 재사용한다. 그 진입 테스트만으로 suspend·독립 실행·원래 단계 재개를 충족했다고 판단하지 않으며 기존 fixture에서 남은 연결만 검증한다.
 - `tests/test_planning_publication.py`, `tests/test_incremental_planning.py`, `tests/test_execution_checkpoint_recovery_phase.py`의 기존 연결 회귀로 push 후 DB 미적용·후속 base 전진·독립 실행 중 입력 변경·재개 transaction 중단을 확인한다. 모의 결과를 실제 원격/OS 성공으로 기록하지 않고 새로운 전체 실행 반복을 추가하지 않는다.
 
 ## Progress
@@ -51,6 +51,8 @@ priority: high
 - [ ] 중단·경쟁·오탐 복구의 targeted unit 검증
 
 ## Decision Log
+
+- `cdc2bc7bfa93afa5be1ae288b1060ad476d34dfa`의 project service 로컬 재검사 전달과 회귀는 직접 구현으로 소비한다. 이 작업의 잔여 목표는 실패 planning의 실행 자리 해제·독립 선택·복원이며 진입 분기 교정을 소급 계획하거나 전체 재개 성공으로 기록하지 않는다. 기존 ID·metadata·dependency·진행 기록과 명시적 계획 복구·writer/게시 보호를 보존한다.
 
 - 2026-10-15 delta: 직접 구현된 R-082 호출 축소·Requirement 목적 receipt 분리를 실패 복구에도 적용하도록 잔여 작업을 정합화했다. 복구 자격 재관측과 모델 재호출을 구분하며 기존 슬롯 분리 목표·metadata·dependency·수행 기록을 보존한다. 구현·테스트·verify는 실행하지 않았다.
 - 현재 R-055의 진단 해소와 결과 유효성 검증을 분리한다. 이 작업은 보존된 재개 identity와 실제 슬롯의 연결만 보완하며 이미 구현된 Git 진단 해소·권한 검사 제거를 재구현하지 않는다. 기존 high complexity/risk·목표·의존성·기록과 독립 실패를 보존한다.
