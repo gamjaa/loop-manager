@@ -24,7 +24,7 @@ priority: high
 
 ## Implementation
 
-- [ ] 확인한 `loop_manager_internal/agents/invocation_service.py`의 `observe_launch`·finally 수집과 `agents/agent_invocation.py`의 물리 retry identity를 재사용한다. 프로세스 실행 전에 기록 위치를 영속적으로 결합하고 정상/예외 종료·중단 복구에서 같은 자료를 재관측할 수 있게 한다. Codex 전용 launch 객체가 없는 공급자도 소비할 수 있는 최소 기록 문맥을 두되 실제 Claude 연결은 G-292에 남긴다.
+- [ ] 확인한 `loop_manager_internal/agents/invocation_service.py`의 `observe_launch`·finally 수집과 `agents/agent_invocation.py`의 물리 retry identity를 재사용한다. `agents/process_receipt.py`와 `storage/agent_invocation_state.py`에 직접 반영된 실행 전 receipt 경로 결합·종료 복구를 소비하며 종료 ledger를 새로 만들지 않는다. 이 증거에 targeted 기록 위치·미소비 수집을 결합해 정상/예외 종료·중단 복구에서 같은 자료를 재관측한다. receipt 부재·불확실·live writer를 폴더 존재나 result_code로 대신 확인하지 않는다. Codex 전용 launch 객체가 없는 공급자도 소비할 수 있는 최소 기록 문맥을 두되 실제 Claude 연결은 G-292에 남긴다.
 - [ ] 확인한 `loop_manager_internal/storage/agent_invocation_state.py`의 ledger·`reconcile_interrupted()`와 `storage/targeted_test_state.py`의 중복 없는 저장을 연결한다. 기존 scope·호출/프로세스 종료·수동 작업 보호를 재사용하고 필요한 비밀값 없는 결합 정보만 호환되게 보존한다. 광범위한 상태 폴더 탐색으로 경로의 repository·작업 귀속을 추측하지 않는다.
 - [ ] 확인한 `loop_manager_internal/verification/targeted.py:collect()`의 경로/크기·identity·완료 줄 검사와 `execution/execution_worker_handler.py`의 호출 전/후 차단·증거 부재 판정을 재수집 경계와 연결한다. 수집 오류를 provider 설정 실패나 rebase 완료 보고 횟수로 오인하지 않도록 `execution_rebase_handler.py`·`recovery/recovery_runtime.py`의 기존 targeted correction/pause를 사용한다. 실제 독립 오류는 숨기지 않는다.
 - [ ] 확인한 `tests/test_agent_invocation.py`·`tests/test_targeted_test_streak.py`의 임시 파일·실제 SQLite fixture와 `tests/test_execution_worker_phase.py`의 일반/rebase 경계를 확장한다. 중단 위치를 주입해 durable 재관측을 검사하고 실제 유료 Agent·Git 실행은 추가하지 않는다. PRODUCT·ARCHITECTURE에는 반영한 복구 경계만 통합한다.
@@ -33,6 +33,7 @@ priority: high
 
 - Worker는 위 세 모듈에서 변경한 최소 case/class만 실행한다. 파일 생성과 SQLite를 실제로 사용하되 provider·프로세스 종료·Git 관측은 기존 double로 제공한다. finally를 생략한 중단 상태를 저장 fixture로 구성하고 새로운 repository/Manager 실행 전체를 반복하지 않는다.
 - 기록 위치 결합 전/후, 완료 JSONL 생성 후 finally 이전, 수집 후 DB commit 이전, DB 반영 후 차단 이전 및 차단 transaction 중단을 각각 대조한다. 재시작 후 확인된 결과는 정확히 한 번 반영되고 세 번째 실패는 다음 Worker 없이 기존 차단으로 이어져야 한다.
+- `tests/test_agent_process_receipt.py`의 종료 proof·실패 결과 불변 회귀를 재사용한다. 이 작업의 최소 파일/SQLite fixture에서는 receipt 복구 전후에 targeted 원문을 한 번만 소비하고 live·종료 불명에서는 원문·미소비 상태를 보존하는 연결만 검증한다. 이미 있는 native 프로세스 그룹 종료 테스트를 조건별로 반복하거나 복구 관측 시각을 실제 종료 시각/실행 시간으로 합성하지 않는다.
 - CLI transient retry·session fallback·새 session/후보·같은 호출의 재관측에서 모든 확인된 실행을 동일 작업에 연결한다. 서로 다른 repository·ExecPlan·invocation, 과거/현재 runtime과 수동 실행 중인 writer의 기록이 섞이거나 삭제되지 않아야 한다.
 - 부분 마지막 줄·손상 JSON·중복/상충 ID·경로 교체/symlink·기록 부재·읽기 실패와 SQLite rollback을 검사한다. 검증 불가 자료를 실패로 합성하지 않고 기존 결과·원문·미소비 복구 근거를 유지해야 한다. 오류 뒤 정상 재관측도 같은 실행을 중복 집계하지 않아야 한다.
 - 일반 Worker와 rebase 교정의 새 근거 부재는 일시 중단이며 기존 문서 보고 한도를 소비하지 않아야 한다. 실제 provider 정책 실패·완료 보고 오류·verify/Review 실패와 독립 사용자 판단은 유지한다. invocation의 물리 종료·사용량 감사가 수집 오류 때문에 미완료로 남지 않는 기존 회귀도 유지한다.
@@ -45,6 +46,7 @@ priority: high
 
 ## Decision Log
 
+- 2026-10-15 delta: 호출별 process receipt와 종료 재관측은 직접 구현됐다. targeted JSONL의 지속 결합·미소비 재수집은 여전히 finally 밖에 없으므로 기존 목표를 유지하되 새 종료 증거를 재사용한다. G-290의 분류·G-292의 Claude 전달과 dependency는 보존하며 현재 Planner는 구현·테스트·verify를 실행하지 않았다.
 - G-290의 native 분류와 독립적으로 구현·검증할 수 있다. 그 결과 taxonomy와 기존 결과 스키마를 호환되게 소비하며 source·의존성 변경으로 실제 테스트 실패 한도를 우회하지 않는다. G-189는 두 구현과 Claude 연결 뒤 후속 소비자를 감사한다.
 - complexity high: 파일 기록·물리 호출 종료·DB 반영·차단 소비 사이 중단과 살아 있는 writer의 소유권을 일관되게 연결할 판단이 남아 있다. risk high: 누락·오귀속이 필수 차단을 우회하거나 다른 작업을 잘못 차단하며 사후 수동 복구에는 원문과 호출 결합이 필요하다. 미소비 자료·기존 결과를 보존하고 정확한 identity·transaction·중단 회귀로 완화한다. priority high는 실제 실행 근거 보존이라는 필수 무인 계약 때문이다.
 - 쓰기 허용 경로·인증 저장·Git 전이·같은 프로젝트 병렬 실행을 넓히지 않는다. 비호환 DB/상태 변경이 필요하면 해당 구현을 멈추고 Architecture Change Policy의 판단을 남긴다. additive 결합의 기술 선택을 사용자 정책의 새 승인으로 만들지 않는다.
