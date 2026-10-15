@@ -982,7 +982,8 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
                 mutable_snapshot_token=lambda *args: 'token', git=git,
                 load_execplan_catalog=manager.load_execplan_catalog,
                 _validate_future_idea_separation=mock.Mock(),
-                file_hash=lambda path: catalog.plan_content_hash(path.read_bytes()))
+                file_hash=lambda path: catalog.plan_content_hash(path.read_bytes()),
+                _stored_string_list=planner_validation._stored_string_list)
             result = planner_validation.validate_planner_result(effects, root, self.sha, [],
                 connection=self.connection, repo=self.repo)
             self.assertEqual(result.publication_paths, ('docs/FUTURE_IDEAS.md',))
@@ -1157,7 +1158,8 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
                 mutable_snapshot_token=lambda *args: 'token',
                 git=lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout=''),
                 _parse_execplan=catalog.parse_execplan_file,
-                load_execplan_catalog=manager.load_execplan_catalog)
+                load_execplan_catalog=manager.load_execplan_catalog,
+                _stored_string_list=planner_validation._stored_string_list)
             with self.assertRaisesRegex(planner_validation.PlannerValidationError, '보류 계획에 의존'):
                 planner_validation.validate_planner_result(effects, root, self.sha, [],
                     connection=self.connection, repo=self.repo)
@@ -1221,7 +1223,8 @@ class ScopedCatalogRefreshTests(_CatalogRefreshCase):
                     _parse_execplan=catalog.parse_execplan_file,
                     load_execplan_catalog=manager.load_execplan_catalog,
                     _validate_future_idea_separation=mock.Mock(),
-                    file_hash=lambda target: catalog.plan_content_hash(target.read_bytes()))
+                    file_hash=lambda target: catalog.plan_content_hash(target.read_bytes()),
+                    _stored_string_list=planner_validation._stored_string_list)
                 result = planner_validation.validate_planner_result(effects, root, self.sha, [],
                     connection=self.connection, repo=self.repo)
                 self.assertEqual([plan['id'] for _, plan in result.plans], ['G-007'])
