@@ -4,11 +4,15 @@ import json
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-def send_telegram(token: str, chat_id: str, text: str, *, disable_notification: bool = False) -> None:
+def send_telegram(token: str, chat_id: str, text: str, *, disable_notification: bool = False,
+                  entities: list[dict] | None = None) -> None:
+    payload = {"chat_id": chat_id, "text": text, "disable_notification": disable_notification}
+    if entities:
+        payload["entities"] = entities
     endpoint = f"https://api.telegram.org/bot{quote(token, safe=':')}/sendMessage"
     request = Request(
         endpoint,
-        data=json.dumps({"chat_id": chat_id, "text": text, "disable_notification": disable_notification}).encode(),
+        data=json.dumps(payload).encode(),
         headers={"Content-Type": "application/json"},
         method="POST",
     )
