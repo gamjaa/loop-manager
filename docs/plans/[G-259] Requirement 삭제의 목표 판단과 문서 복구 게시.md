@@ -52,7 +52,9 @@ Requirement 철회의 의미와 남은 공유 목표를 허용된 동일 ID 개�
 
 ## Progress
 
-다음 구현·unit 실행 결과는 보존된 G-259 후보 작업 공간의 기존 Worker 기록이다. Planner가 재실행하거나 최신 base 반영 뒤의 verify·Review 성공으로 채택한 결과가 아니다. 기록·session·실패 이력과 후보 파일은 그대로 보존한다.
+- [x] 관리 rebase 수용 후 현재 후보 검증: HEAD `449fee6`, base `ebbb32f` (`main`)에서 ExecPlan·PRODUCT·ARCHITECTURE·R-055/R-082와 base 대비 최종 diff 10개 파일 전체를 대조했다. 시작 시 worktree와 index는 clean이었고 과거 UU/충돌 복구 기록은 현재 상태가 아니다. unittest adapter version 1·launcher Python 계약을 확인했으며 이전 후보 결과를 재사용하지 않았다. 추가 코드 수정 없이 현재 후보의 `RequirementRecoveryUnitTests` 16개와 원격 draft 삭제·피드백 예약·archive legacy hold 제외·Manager 변경 후 게시 재조회의 기존 unit case 4개를 새 runner 호출로 실행해 총 20 tests, OK였다. 실행 명령은 `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_planner_validation_recovery.RequirementRecoveryUnitTests tests.test_execplan_drafts.ExecPlanDraftCatalogTest.test_remote_draft_deletion_preserves_audit_and_independent_work tests.test_execplan_drafts.ExecPlanDraftCatalogTest.test_orphan_feedback_migration_keeps_plan_id_reserved tests.test_execplan_drafts.ExecPlanDraftCatalogTest.test_deleted_draft_does_not_reopen_archived_reference_or_legacy_hold tests.test_planning_publication.PlanningPublicationTest.test_publication_uses_current_changes_after_manager_validation`다. 이번 변경은 이 검증 기록뿐이며 frontmatter·sources는 보존했다. 전체 verify·Review는 Manager가 이어간다.
+
+이전 후보의 구현·unit 실행·교정 기록은 아래에 보존하며 현재 후보의 새 검증과 구분한다.
 
 - [x] rebase 교정: `0633c3dd810a1355013f95c59ddc735be3967aaa`의 ExecPlan·PRODUCT·R-055/R-082를 `git show`로 확인하고 현재 후보와 대조했다. autostash 충돌 두 곳은 최신 본문·추가 조건과 기존 수행 기록을 보존해 해소했다. frontmatter·sources·Requirement·다른 ExecPlan은 수정하지 않았다. index의 충돌 확정·stash 및 rebase 완료 처리는 Manager에 맡긴다.
 - [x] 최신 catalog의 검증된 archive 참조/기존 hold 제외, 확인된 원격 draft 삭제와 미게시 Requirement 철회 준비의 분리, 피드백 표식의 ID 예약을 대조했다. 최신 publication service의 실제 변경 재조회·검증된 publication_paths·현재 plan commit 결합은 그대로 소비하며 중복 구현하지 않았다.
