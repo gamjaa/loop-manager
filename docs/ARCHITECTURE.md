@@ -106,7 +106,15 @@ ExecPlan의 `Progress` 체크 항목과 본문은 구현 내용·판단·검증 
 
 현재 활성 Requirement 경로는 Planner 입력과 판단·이동의 경로 key이며 `docs/requirements/` 바로 아래 문서만 새 계획 입력이다. 기존 ExecPlan은 `sources` 문자열을 보존한다. Manager는 원격 revision과 worktree에서 같은 Requirement identity helper를 사용해 기록된 활성 경로, 기존 작업에 허용된 같은 파일명의 archive, source 파일명에서 확인한 R ID의 유일한 문서를 순서대로 조회한다. 정확한 경로가 있으면 중복 ID여도 해당 문서를 유지한다. ID 후보가 없거나 여러 개이거나 후보를 읽고 식별할 수 없으면 누락·모호·조회 실패를 구분해 source 관계를 확정하지 않는다. 새 ExecPlan은 정확한 활성 source 경로만 사용할 수 있다. archive는 기존 ExecPlan source의 조회·검증 호환성에만 사용하며 재평가하거나 활성 경로로 자동 복원하지 않는다. FUTURE_IDEAS는 계획 입력·실행 상태가 아니다.
 
-Specification Skill과 함께 배포하는 `.agents/skills/specification-docs/scripts/next_requirement_id.py`는 독립 Python 표준 라이브러리 도구다. 프로젝트 루트의 활성 Requirement 디렉터리와 선택적 archive 디렉터리에서 직접 포함된 `*.md` 일반 파일을 읽으며 Git 추적 여부를 검사하지 않는다. 활성 디렉터리 누락, 심볼릭 링크·일반 파일이 아닌 문서, 파일 접근·UTF-8·식별 오류는 ID를 출력하지 않고 실패하며 archive 디렉터리 부재는 빈 집합이다. 제한된 frontmatter에서 `id`·`title`을 읽고, frontmatter가 없는 문서는 첫 `# [R-ID] 제목`으로 식별한다. 파일명은 원본 판단에 쓰지 않는다. `copy-project-files`는 catalog의 공유 `frontmatter.py`를 Skill 스크립트 옆에 배포하므로 복제된 명령 실행은 Manager 설치에 의존하지 않는다. Manager ExecPlan parser와 조회 명령은 이 단일 파서 원본을 사용한다. 조회는 읽기 전용이며 Git, DB, 네트워크와 Agent 실행에 의존하지 않는다. import 가능한 `requirement_identity` 함수는 후속 Manager 번호 검사에서도 같은 식별 규칙을 재사용할 수 있게 한다.
+Specification Skill은 Loop Manager의 내부 모듈·DB·등록 설정·실행 상태 없이 동작하는 독립 문서 도구다. Skill의 `scripts/requirement_documents.py`가 자체 문서 식별·Summary 해석과 로컬 파일 조회를 제공하며 Manager의 catalog parser와 별도로 관리한다. 두 도구는 문서 계약의 의미를 호환되게 유지하고 서로의 스크립트를 호출·import하지 않는다. `copy-project-files`는 Skill 자체의 보조 파일을 복사하며 Manager 내부 parser를 보충하지 않는다.
+
+Skill의 `scripts/next_requirement_id.py`는 프로젝트 루트의 활성 Requirement와 선택적 archive에서 원본 ID 최댓값 다음 번호를 출력한다. 활성 디렉터리 누락, 심볼릭 링크·일반 파일이 아닌 문서, 파일 접근·UTF-8·식별 오류는 실패하며 archive 디렉터리 부재는 빈 집합이다. 제한된 frontmatter의 `id`·`title`을 우선하고 frontmatter가 없으면 첫 `# [R-ID] 제목`으로 식별하며 파일명은 원본 판단에 쓰지 않는다.
+
+Skill의 `scripts/read_requirements.py`는 현재 작업 폴더의 미커밋·미추적 문서를 포함해 조회한다. JSON의 `has_active`·`has_archive`는 각 위치의 파일 존재 여부 boolean이며, `requirements`는 활성 문서의 `title`·프로젝트 상대 `path` 문자열과 선택적 `summary` 문자열을 담은 배열이다. 없는 디렉터리·빈 디렉터리는 문서 부재이며 archive 본문은 읽지 않는다. Summary가 없거나 비어 있으면 필드를 생략하고, 조회·UTF-8·식별 오류는 정상적인 부재로 바꾸지 않는다. 두 명령은 읽기 전용이며 Git·DB·네트워크·Agent 실행에 의존하지 않는다.
+
+일반 planning의 `planning/requirement_overview.py`는 고정된 검토 revision의 Git tree와 blob에서 모든 활성 Requirement를 읽는다. `revision`과 `requirements` 배열을 prompt에 제공하며 제목·경로·선택적 요약의 의미는 Skill과 호환되게 구현한다. archive·템플릿은 제외하고 일반 파일이 아닌 입력·UTF-8·식별 오류와 조회 실패는 오류로 남긴다. 일반 계획을 포함한 유지보수 호출에도 연결하고, 문서 draft 전용·유지보수 전용 호출의 범위는 유지한다. 로컬 수정이나 다른 revision의 요약을 섞지 않는다.
+
+두 도구의 Summary는 코드 블록 밖의 첫 `## Summary`부터 다음 동급·상위 제목 전까지의 내용이다. 빈 요약은 생략하고 다른 절의 내용으로 추론·대체하지 않는다. 추가 모델 호출·요약 생성·파일 변경 없이 탐색 목록을 만들며, 관련 문서의 본문과 Acceptance Criteria가 판단의 원본이다. Writer는 최초 Skill 작성과 Worker의 후속 설계 갱신에서 같은 가독성·필수 계약 보존 기준을 적용한다. 자동 역할의 구체적인 기준은 공통·Worker 지침 원본에 두고 역할별로 합성한다.
 
 source 해석은 catalog 검증·문서 읽기·입력 지문·계획 관련성·단계별 문서 변경·Requirement 판단 및 이동에서 같은 resolver를 사용한다. 지문은 기존 source 문자열을 key로 두고 resolver가 찾은 현재 문서 내용을 포함한다. 따라서 경로 변경만으로 기존 작업 관계가 사라지지 않으며, 내용 변경은 일반 입력 변경·재사용 조건에 반영된다.
 

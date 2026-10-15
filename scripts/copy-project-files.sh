@@ -26,8 +26,6 @@ if (( ${#conflicts[@]} > 0 )); then
 fi
 
 cp -R "$source_root/.agents" "$target/.agents"
-cp "$source_root/loop_manager_internal/catalog/frontmatter.py" \
-    "$target/.agents/skills/specification-docs/scripts/frontmatter.py"
 
 mkdir -p \
     "$target/docs/plans" \

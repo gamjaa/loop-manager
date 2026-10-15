@@ -621,7 +621,7 @@ with (mock.patch.object(sqlite3, 'connect', side_effect=AssertionError('DB at im
                 mock.call(repo, 'remote', 'add', 'origin', str(Path(directory) / 'remote.git')),
             ])
             self.assertEqual((repo / 'src/app.py').read_text(), 'VALUE = 1\n')
-            self.assertEqual((repo / 'docs/requirements/Active.md').read_text(), '# Active\n')
+            self.assertEqual((repo / 'docs/requirements/Active.md').read_text(), '# [R-001] Active\n')
             self.assertEqual(git.call_args_list[-2:], [
                 mock.call(repo, 'commit', '-m', 'Initial'),
                 mock.call(repo, 'push', '-u', 'origin', 'main'),

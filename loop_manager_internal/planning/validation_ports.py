@@ -92,6 +92,7 @@ class _PlanningValidationPorts:
                 if candidate is not None:
                     prompt += document_publication.planning_instruction(candidate)
                     return prompt  # This call is reserved for the approved document draft.
+        prompt += self._requirement_overview_prompt(mutable_snapshot.repo, mutable_snapshot.active_sha)
         prompt += self._verify_request_prompt(mutable_snapshot.repo, mutable_snapshot.active_sha)
         from loop_manager_internal.storage import execplan_draft_state
         import json
@@ -131,6 +132,12 @@ class _PlanningValidationPorts:
                        "draft·User Decision을 직접 제거하지 마라. 검증·정리·대기 전환은 Manager가 수행한다.")
         return prompt
 
+    def _requirement_overview_prompt(self, repo: str, active_sha: str) -> str:
+        if self._effects.git_bytes is None:
+            return ""
+        from loop_manager_internal.planning.requirement_overview import instruction
+        return instruction(Path(repo), active_sha, git_bytes=self._effects.git_bytes)
+
     def _verify_request_prompt(self, repo: str, active_sha: str) -> str:
         if self._effects.git is None or self._effects.git_bytes is None:
             return ""
@@ -165,6 +172,7 @@ class _PlanningValidationPorts:
             include_general_planning=include_general_planning,
         )
         if include_general_planning:
+            prompt += self._requirement_overview_prompt(context.repo, context.active_sha)
             prompt += self._verify_request_prompt(context.repo, context.active_sha)
         return prompt
 

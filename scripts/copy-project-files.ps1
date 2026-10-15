@@ -21,8 +21,6 @@ if ($conflicts) {
 }
 
 Copy-Item -LiteralPath (Join-Path $sourceRoot '.agents') -Destination (Join-Path $target '.agents') -Recurse
-Copy-Item -LiteralPath (Join-Path $sourceRoot 'loop_manager_internal/catalog/frontmatter.py') `
-    -Destination (Join-Path $target '.agents/skills/specification-docs/scripts/frontmatter.py')
 
 $directories = @(
     (Join-Path $target 'docs')

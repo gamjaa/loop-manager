@@ -43,7 +43,9 @@ class VerifyInputRequestTest(unittest.TestCase):
 
     def git_bytes(self, repo, *args):
         if args[0] == 'ls-tree':
-            self.assertEqual(args[-1], self.revision)
+            self.assertEqual(args[:4], ('ls-tree', '-r', '-z', '--full-tree'))
+            self.assertEqual(args[4], self.revision)
+            self.assertIn(args[5:], [(), ('--', 'docs/requirements')])
             return b''.join(mode + b' blob ' + oid.encode() + b'\t' + path.encode() + b'\0'
                             for path, (mode, oid) in self.entries.items())
         return self.blobs[args[-1]]

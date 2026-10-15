@@ -96,13 +96,13 @@ class RequirementIdQueryTest(unittest.TestCase):
                 ("R-012", "Legacy title"),
             )
 
-    def test_skill_and_execplan_use_the_same_frontmatter_parser_source(self):
+    def test_skill_and_manager_own_independent_compatible_identity_parsers(self):
         skill_parser = TOOL["parse_frontmatter"]
-        self.assertEqual(
+        self.assertNotEqual(
             Path(skill_parser.__code__.co_filename).resolve(),
             Path(shared_frontmatter.parse_frontmatter.__code__.co_filename).resolve(),
         )
-        self.assertEqual(
+        self.assertNotEqual(
             Path(TOOL["requirement_identity"].__code__.co_filename).resolve(),
             Path(shared_frontmatter.requirement_identity.__code__.co_filename).resolve(),
         )
@@ -119,8 +119,8 @@ class RequirementIdQueryTest(unittest.TestCase):
             script_directory.mkdir(parents=True)
             script = script_directory / "next_requirement_id.py"
             script.write_bytes(Path(TOOL["__file__"]).read_bytes())
-            parser = script_directory / "frontmatter.py"
-            parser.write_bytes(Path(shared_frontmatter.__file__).read_bytes())
+            parser = script_directory / "requirement_documents.py"
+            parser.write_bytes((Path(TOOL["__file__"]).parent / parser.name).read_bytes())
             self._write(root, "docs/requirements/one.md", "# [R-009] One\n")
             before = {
                 path.relative_to(root): path.read_bytes()

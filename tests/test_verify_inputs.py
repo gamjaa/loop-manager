@@ -305,6 +305,8 @@ class VerifyInputObservationTest(unittest.TestCase):
                      'scripts/verify.sh', 'scripts/verify.ps1',
                      'scripts/copy-project-files.sh', 'scripts/copy-project-files.ps1',
                      '.agents/skills/specification-docs/scripts/next_requirement_id.py',
+                     '.agents/skills/specification-docs/scripts/requirement_documents.py',
+                     '.agents/skills/specification-docs/scripts/read_requirements.py',
                      'requirements.txt', 'run.sh', 'run.ps1'):
             with self.subTest(path=path):
                 self.assertTrue(any(inputs.matches(path, pattern) for pattern in patterns))

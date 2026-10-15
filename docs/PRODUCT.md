@@ -80,6 +80,10 @@ R-023의 원격 실행·self handoff 목표는 유지하며 로컬 갱신 gate�
 
 ### 제품 문서 작성 지원
 
+Specification Skill은 사용자가 최초 제품·설계 기준과 이후 변경 요구를 작성·검토하는 독립 도구다. Loop Manager 설치·프로젝트 등록·자동 실행 없이 사용할 수 있으며 문서 형식·식별·Summary 계약을 호환되게 유지하되 코드·실행 절차·권한은 각 도구가 별도로 관리한다.
+
+최초 설계 이후 구현으로 바뀌는 장기 규칙은 Worker가 코드와 같은 PR에서 갱신하며, 최초 작성과 후속 갱신 모두 결론 우선·중복 정리·조건과 실패 의미 보존 기준을 적용한다.
+
 시작 조건:
 - 사용자가 PRODUCT, Requirement 또는 ARCHITECTURE 작성이나 검토를 요청한다
 - 사용자가 새 기능·정책 변경을 요청하면 대화형 Agent가 관련 Requirement를 작성·갱신한다. 별도 문서 작성 요청은 필요하지 않다
@@ -292,6 +296,8 @@ ASSESSMENT → REFACTORING → IDLE (확정 범위 Merge)
 - Requirement는 PRODUCT의 변경 요청이며 ExecPlan의 구현 상세나 실행 상태를 포함하지 않는다
 - 현재 활성 Requirement 경로는 Planner 입력과 판단·이동의 경로 key다. 기존 ExecPlan source는 기록된 경로를 보존하며 제목 변경 뒤 고유한 원본 R ID로 같은 문서를 연결한다
 - `docs/requirements/` 바로 아래의 모든 `*.md`를 Planner 입력으로 사용한다
+- 일반 planning에는 변경 여부와 관계없이 모든 활성 Requirement의 제목·경로와 비어 있지 않은 기존 Summary를 제공한다. 일반 계획을 함께 만드는 유지보수 호출에도 적용하며, 요약이 없으면 제목·경로만 제공한다. 요약은 탐색용이고 관련·불확실한 문서의 본문을 같은 원격 revision에서 확인한다. 요약을 생성하는 모델 호출이나 Planner의 Requirement 수정은 하지 않는다
+- PRODUCT·ARCHITECTURE의 현재 기준에서 활성 Requirement가 명시적으로 바꾸는 범위에는 변경 목표를 적용하고 나머지 계약은 보존한다. 변경되지 않은 요구도 유효하며 이전 설계만으로 되돌리는 작업을 만들지 않는다. 활성 목표의 충돌·대체 범위가 모호하면 최근 수정 시점이나 ID로 결정하지 않고 사용자 판단을 남긴다. delta·전체·최종 검토에 같은 해석을 적용하며 기존 전체 검토 조건을 유지한다
 - `docs/REQUIREMENT.template.md`와 `docs/requirements/archive/`는 Planner 입력에서 제외한다
 - ExecPlan의 `sources`에는 근거가 된 PRODUCT 또는 Requirement 경로가 있어야 한다
 

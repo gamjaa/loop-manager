@@ -3,58 +3,18 @@
 
 from __future__ import annotations
 
-import stat
 import sys
 from pathlib import Path
 from types import ModuleType
 
-_SHARED_FRONTMATTER = Path(__file__).with_name("frontmatter.py")
-if not _SHARED_FRONTMATTER.is_file():
-    _SHARED_FRONTMATTER = (
-        Path(__file__).resolve().parents[4]
-        / "loop_manager_internal/catalog/frontmatter.py"
-    )
-_FRONTMATTER_MODULE = ModuleType("_loop_manager_frontmatter")
-_FRONTMATTER_MODULE.__file__ = str(_SHARED_FRONTMATTER)
-exec(
-    compile(_SHARED_FRONTMATTER.read_bytes(), str(_SHARED_FRONTMATTER), "exec"),
-    _FRONTMATTER_MODULE.__dict__,
-)
-parse_frontmatter = _FRONTMATTER_MODULE.parse_frontmatter
-RequirementIdError = _FRONTMATTER_MODULE.RequirementIdError
-requirement_identity = _FRONTMATTER_MODULE.requirement_identity
-
-
-def _markdown_files(directory: Path, *, required: bool) -> tuple[Path, ...]:
-    try:
-        mode = directory.lstat().st_mode
-    except FileNotFoundError as error:
-        if not required:
-            return ()
-        raise RequirementIdError(f"활성 Requirement 디렉터리가 없습니다: {directory}") from error
-    except OSError as error:
-        raise RequirementIdError(f"Requirement 디렉터리를 확인할 수 없습니다: {directory} ({error})") from error
-    if not stat.S_ISDIR(mode):
-        raise RequirementIdError(f"Requirement 경로가 디렉터리가 아닙니다: {directory}")
-
-    try:
-        candidates = sorted(
-            (path for path in directory.iterdir() if path.suffix == ".md"),
-            key=lambda path: path.name,
-        )
-    except OSError as error:
-        raise RequirementIdError(f"Requirement 디렉터리를 읽을 수 없습니다: {directory} ({error})") from error
-
-    files: list[Path] = []
-    for path in candidates:
-        try:
-            mode = path.lstat().st_mode
-        except OSError as error:
-            raise RequirementIdError(f"Requirement 파일을 확인할 수 없습니다: {path} ({error})") from error
-        if not stat.S_ISREG(mode):
-            raise RequirementIdError(f"Requirement 경로가 일반 파일이 아닙니다: {path}")
-        files.append(path)
-    return tuple(files)
+_DOCUMENTS = Path(__file__).with_name("requirement_documents.py")
+_DOCUMENT_MODULE = ModuleType("_specification_requirement_documents")
+_DOCUMENT_MODULE.__file__ = str(_DOCUMENTS)
+exec(compile(_DOCUMENTS.read_bytes(), str(_DOCUMENTS), "exec"), _DOCUMENT_MODULE.__dict__)
+RequirementIdError = _DOCUMENT_MODULE.RequirementIdError
+requirement_identity = _DOCUMENT_MODULE.requirement_identity
+parse_frontmatter = _DOCUMENT_MODULE.parse_frontmatter
+_markdown_files = _DOCUMENT_MODULE.markdown_files
 
 
 def next_requirement_id(root: Path) -> str:

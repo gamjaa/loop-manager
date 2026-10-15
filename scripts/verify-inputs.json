@@ -10,7 +10,7 @@
     "scripts/verify.ps1",
     "scripts/copy-project-files.sh",
     "scripts/copy-project-files.ps1",
-    ".agents/skills/specification-docs/scripts/next_requirement_id.py",
+    ".agents/skills/specification-docs/scripts/**",
     "run.sh",
     "run.ps1"
   ]

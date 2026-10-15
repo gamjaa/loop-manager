@@ -1,6 +1,7 @@
 from tests.support.git import isolated_git_test
 from contextlib import closing
 import io
+import json
 import hashlib
 import os
 import re
@@ -51,10 +52,12 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             tool_source = source / tool_relative
             tool_source.parent.mkdir(parents=True)
             shutil.copy(loop_manager.ROOT / tool_relative, tool_source)
-            parser_relative = 'loop_manager_internal/catalog/frontmatter.py'
+            parser_relative = '.agents/skills/specification-docs/scripts/requirement_documents.py'
             parser_source = source / parser_relative
-            parser_source.parent.mkdir(parents=True)
+            parser_source.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy(loop_manager.ROOT / parser_relative, parser_source)
+            reader_relative = '.agents/skills/specification-docs/scripts/read_requirements.py'
+            shutil.copy(loop_manager.ROOT / reader_relative, source / reader_relative)
             script_name = 'copy-project-files.ps1' if os.name == 'nt' else 'copy-project-files.sh'
             script = source / 'scripts' / script_name
             script.parent.mkdir()
@@ -93,13 +96,18 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             self.assertTrue((target / 'docs/plans').is_dir())
             self.assertTrue((target / 'docs/requirements/archive').is_dir())
             self.assertEqual((target / tool_relative).read_bytes(), tool_source.read_bytes())
-            copied_parser = target / '.agents/skills/specification-docs/scripts/frontmatter.py'
+            copied_parser = target / parser_relative
             self.assertEqual(copied_parser.read_bytes(), parser_source.read_bytes())
             query = subprocess.run([sys.executable, tool_relative], cwd=target,
                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
             self.assertEqual((query.returncode, query.stdout, query.stderr), (0, 'R-001\n', ''))
+            overview = subprocess.run([sys.executable, '-X', 'utf8', reader_relative], cwd=target,
+                                      stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding='utf-8')
+            self.assertEqual(overview.returncode, 0, overview.stderr)
+            self.assertEqual(json.loads(overview.stdout),
+                             {'has_active': False, 'has_archive': False, 'requirements': []})
             protected_files = (*copied_files, tool_relative,
-                               '.agents/skills/specification-docs/scripts/frontmatter.py')
+                               parser_relative, reader_relative)
             before = {relative: (target / relative).read_bytes() for relative in protected_files}
 
             empty_target = root / 'empty-project'

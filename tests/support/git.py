@@ -78,7 +78,7 @@ def _initialize_remote_repository(directory: str) -> Path:
         "docs/PLANS.md": "# Plans\n",
         "docs/PRODUCT.md": "# Product\n",
         "docs/notes.md": "# Notes\n",
-        "docs/requirements/Active.md": "# Active\n",
+        "docs/requirements/Active.md": "# [R-001] Active\n",
         "docs/requirements/archive/Old.md": "# Old\n",
         "src/app.py": "VALUE = 1\n",
         "tests/test_app.py": "def test_app(): pass\n",
