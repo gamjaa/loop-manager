@@ -26,6 +26,7 @@ class NativeWriteIsolationTests(TestCase):
         # Profile/auth behavior has its own prepared-environment tests. These
         # fixtures keep the physical sandbox/exec/handoff boundary explicit.
         for patch in (mock.patch.object(manager, 'validate_provider_runtime'),
+                      mock.patch('loop_manager_internal.execution.verify_process._confirm_posix_group_stopped'),
                       mock.patch.object(manager, '_agent_profile',
                           return_value=invocation.ResolvedProfile('model', 'high'))):
             patch.start()
@@ -302,8 +303,9 @@ class NativeWriteIsolationTests(TestCase):
                             kwargs['on_process_finished']()
 
                 def start(command, **kwargs):
-                    result = run(command, **kwargs)
-                    return self.reviewer_process(result.stdout or '', result.returncode)
+                    output = io.StringIO()
+                    result = run(command, **{**kwargs, 'stdout': subprocess.PIPE if role == 'reviewer' else output})
+                    return self.reviewer_process(result.stdout or output.getvalue(), result.returncode)
 
                 with mock.patch.object(provider_guidance, '_developer_texts', side_effect=native_developer_texts), \
                      mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
@@ -385,8 +387,9 @@ class NativeWriteIsolationTests(TestCase):
                         resolved_profile=invocation.ResolvedProfile('model', 'high'), invocation=context),
                     attempts)
                 def start(command, **kwargs):
-                    result = run(command, **kwargs)
-                    return self.reviewer_process(result.stdout or '', result.returncode)
+                    output = io.StringIO()
+                    result = run(command, **{**kwargs, 'stdout': output})
+                    return self.reviewer_process(result.stdout or output.getvalue(), result.returncode)
 
                 with mock.patch.object(provider_guidance, '_developer_texts', side_effect=native_developer_texts), \
                      mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
@@ -498,17 +501,16 @@ class NativeWriteIsolationTests(TestCase):
                         self.assertNotIn('-o', command)
                         return process
 
-                    def communicate(prompt, *, timeout):
-                        self.assertEqual(prompt, 'prompt')
-                        self.assertEqual(timeout, manager.AGENT_CLI_TIMEOUT_SECONDS)
-                        self.assertTrue(handoff.launch_lock.acquire(blocking=False))
-                        handoff.launch_lock.release()
-                        handoff.stop()
-                        Path(command[command.index('-o') + 1]).write_text('completed')
-                        kwargs['stdout'].write('provider log\n')
-                        return (None, None)
-
-                    process.communicate.side_effect = communicate
+                    class WorkerOutput(io.StringIO):
+                        def readline(inner, size=-1):
+                            self.assertTrue(handoff.launch_lock.acquire(blocking=False))
+                            handoff.launch_lock.release()
+                            handoff.stop()
+                            Path(command[command.index('-o') + 1]).write_text('completed')
+                            return super().readline(size)
+                    process.stdin = io.StringIO()
+                    process.stdout = WorkerOutput('provider log\n')
+                    process.wait.return_value = 0
                     return process
 
                 token = manager._runtime_handoff_signal.set(handoff)
@@ -534,10 +536,7 @@ class NativeWriteIsolationTests(TestCase):
                         terminate.assert_called_once_with(4321, envelope.signal.SIGKILL)
                 finally:
                     manager._runtime_handoff_signal.reset(token)
-                if role == 'reviewer':
-                    process.communicate.assert_not_called()
-                else:
-                    process.communicate.assert_called_once()
+                process.communicate.assert_not_called()
                 process.wait.assert_called_once()
                 self.assertEqual((result.code, result.message, result.session_id), (0, 'completed', session))
                 proof = connection.execute('''SELECT proof.status, call.result_kind, call.session_id
@@ -555,6 +554,8 @@ class NativeWriteIsolationTests(TestCase):
         process.communicate.side_effect = manager.subprocess.TimeoutExpired(['native'], 1)
         lifecycle = []
         with mock.patch.object(envelope.subprocess, 'Popen', return_value=process) as start, \
+             mock.patch('loop_manager_internal.agents.process_receipt.started'), \
+             mock.patch('loop_manager_internal.agents.process_receipt.finished'), \
              mock.patch.object(envelope.os, 'killpg') as terminate:
             with self.assertRaises(manager.subprocess.TimeoutExpired):
                 launch.run(['native'], launch_process=manager._handoff_popen,
@@ -573,6 +574,7 @@ class NativeWriteIsolationTests(TestCase):
         process.wait.side_effect = OSError('wait interrupted')
         lifecycle = []
         with mock.patch.object(envelope.subprocess, 'Popen', return_value=process), \
+             mock.patch('loop_manager_internal.agents.process_receipt.started'), \
              mock.patch.object(envelope.os, 'killpg'):
             with self.assertRaisesRegex(OSError, 'wait interrupted'):
                 launch.run(['native'], launch_process=manager._handoff_popen,
@@ -581,6 +583,37 @@ class NativeWriteIsolationTests(TestCase):
                            on_process_finished=lambda: lifecycle.append('finished'))
         self.assertEqual(lifecycle, ['started'])
         process.wait.assert_called_once()
+
+    def test_envelope_group_cleanup_failure_reaps_root_without_claiming_finish(self):
+        launch = envelope.CodexLaunch((), (), {}, Path('/runtime'), Path('/attempt'), '{}')
+        process = mock.Mock(pid=4321)
+        with mock.patch.object(envelope.subprocess, 'Popen', return_value=process), \
+             mock.patch.object(envelope.CodexLaunch, 'stop', side_effect=RuntimeError('group remains')), \
+             mock.patch('loop_manager_internal.agents.process_receipt.started'), \
+             mock.patch('loop_manager_internal.agents.process_receipt.finished') as receipt:
+            observed = mock.Mock()
+            with self.assertRaisesRegex(RuntimeError, 'group remains'):
+                launch.run(['native'], launch_process=manager._handoff_popen,
+                           input='prompt', timeout=1, text=True, on_process_finished=observed)
+        process.wait.assert_called_once_with(timeout=10)
+        receipt.assert_not_called()
+        observed.assert_not_called()
+
+    def test_receipt_failure_after_spawn_cannot_be_classified_as_not_executed(self):
+        launch = envelope.CodexLaunch((), (), {}, Path('/runtime'), Path('/attempt'), '{}')
+        process = mock.Mock(pid=4321)
+        lifecycle = []
+        with mock.patch.object(envelope.subprocess, 'Popen', return_value=process), \
+             mock.patch.object(envelope.CodexLaunch, 'stop', side_effect=RuntimeError('group remains')), \
+             mock.patch('loop_manager_internal.agents.process_receipt.started', side_effect=OSError('disk full')), \
+             mock.patch('loop_manager_internal.agents.process_receipt.finished') as receipt:
+            with self.assertRaisesRegex(RuntimeError, 'group remains'):
+                launch.run(['native'], launch_process=manager._handoff_popen, input='prompt', timeout=1,
+                           text=True, on_process_started=lambda: lifecycle.append('started'),
+                           on_process_finished=lambda: lifecycle.append('finished'))
+        self.assertEqual(lifecycle, ['started'])
+        receipt.assert_not_called()
+        process.wait.assert_called_once_with(timeout=10)
 
     def test_streamed_new_session_uses_direct_exec_and_persists_session(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -659,7 +692,9 @@ class NativeWriteIsolationTests(TestCase):
                  mock.patch.object(manager, 'capture_git_snapshot', return_value=
                                    mock.Mock(serialize=lambda: 'snapshot')), \
                  mock.patch.object(isolation.subprocess, 'run', side_effect=run), \
-                     mock.patch.object(envelope.CodexLaunch, 'run', side_effect=run):
+                 mock.patch.object(envelope.CodexLaunch, 'start', return_value=
+                                   self.reviewer_process('agent write boundary verification failed', 125)), \
+                 mock.patch.object(envelope.CodexLaunch, 'stop'):
                 result = manager.run_agent(
                     'codex', boundary.worktree, state_root, state_root / 'config', 'planner', 'prompt',
                     read_only=False, connection=connection,

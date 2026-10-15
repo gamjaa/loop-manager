@@ -21,6 +21,7 @@ from loop_manager_internal.agents.agent_provider_usage import claude_usage, code
 from loop_manager_internal.agents import agent_write_isolation
 from loop_manager_internal.agents import provider_guidance
 from loop_manager_internal.agents.common_guidance import CommonGuidance
+from loop_manager_internal.agents.agent_activity import AgentActivity, received_lines
 from loop_manager_internal.execution.validation_feedback import redact_secrets
 from loop_manager_internal.config.managed_config import provider_fast_mode
 
@@ -306,7 +307,7 @@ def run_codex(
         arguments = [
             "codex",
             "exec",
-            *(["--json"] if persist_session or role_name == "reviewer" else []),
+            *(["--json"] if persist_session or role_name == "reviewer" or codex_launch is not None else []),
             *(["--ephemeral"] if not persist_session else []),
             *permissions,
             "-C",
@@ -326,7 +327,8 @@ def run_codex(
     reviewer_message = ""
     reviewer_tail = ""
     reviewer_usage = ""
-    if ((persist_session and not session_id) or role_name == "reviewer" or
+    activity = AgentActivity()
+    if (codex_launch is not None or (persist_session and not session_id) or role_name == "reviewer" or
             (codex_launch is None and (on_process_started is not None or on_process_finished is not None))):
         with log.open("w", encoding="utf-8") as output:
             output.write(fast_mode_log)
@@ -345,13 +347,20 @@ def run_codex(
             assert process.stdin is not None
             assert process.stdout is not None
             timeout = _start_timeout(process, timeout_triggered, codex_launch.stop if codex_launch else None)
+            process_waited = False
             try:
+                if codex_launch is not None:
+                    from . import process_receipt
                 if on_process_started is not None:
                     on_process_started()
+                if codex_launch is not None:
+                    process_receipt.started(codex_launch, process)
+                activity.start(process, lambda child: _stop_process(
+                    child, codex_launch.stop if codex_launch else None))
                 process.stdin.write(prompt)
                 process.stdin.close()
-                lines = (_bounded_reviewer_lines(process.stdout) if role_name == "reviewer"
-                         else process.stdout)
+                lines = received_lines(process.stdout, activity, bounded=role_name == "reviewer",
+                                       limit=MAX_REVIEWER_LINE)
                 remaining = MAX_REVIEWER_LOG
                 for line in lines:
                     if role_name == "reviewer":
@@ -385,27 +394,32 @@ def run_codex(
                         if on_session_started:
                             on_session_started(resolved_session_id)
                 returncode = process.wait()
-                if on_process_finished is not None:
-                    on_process_finished()
+                process_waited = True
             except BaseException:
                 _stop_process(process, codex_launch.stop if codex_launch else None)
-                process.wait()
-                if on_process_finished is not None:
-                    on_process_finished()
+                process.wait(timeout=10)
+                process_waited = True
                 raise
             finally:
                 timeout.cancel()
-                process.stdout.close()
-                if codex_launch is not None:
-                    codex_launch.stop(process)
+                activity.cancel()
+                try:
+                    if codex_launch is not None:
+                        try:
+                            codex_launch.stop(process)
+                        finally:
+                            if not process_waited:
+                                process.wait(timeout=10)
+                                process_waited = True
+                        process_receipt.finished(codex_launch, process)
+                    if process_waited and on_process_finished is not None:
+                        on_process_finished()
+                finally:
+                    process.stdout.close()
     else:
         with log.open("w", encoding="utf-8") as output:
             output.write(fast_mode_log)
-            runner = codex_launch.run if codex_launch is not None else effects._handoff_run
-            process_callbacks = ({"on_process_started": on_process_started,
-                                  "on_process_finished": on_process_finished}
-                                 if codex_launch is not None else {})
-            result = runner(
+            result = effects._handoff_run(
                 arguments,
                 input=prompt,
                 text=True,
@@ -416,8 +430,6 @@ def run_codex(
                 env=launch_environment,
                 cwd=worktree,
                 timeout=AGENT_CLI_TIMEOUT_SECONDS,
-                **({"launch_process": effects._handoff_popen} if codex_launch is not None else {}),
-                **process_callbacks,
             )
         returncode = result.returncode
     assert_authentication_links('codex', launch_environment, auth_links)
@@ -440,7 +452,11 @@ def run_codex(
             last_message.write_text(message, encoding="utf-8")
         except (OSError, UnicodeError):
             collection_status = "error"
-    if timeout_triggered.is_set():
+    if activity.reason:
+        returncode = returncode or 1
+        message = f"Codex {role_name} {activity.reason} timeout (600초 무출력)"
+    elif timeout_triggered.is_set():
+        returncode = returncode or 1
         message = f"Codex {role_name} 실행 timeout ({AGENT_CLI_TIMEOUT_SECONDS}초)"
     if returncode and not message:
         try:
@@ -471,14 +487,14 @@ def run_codex(
                 usage=usage,
                 collection_status=collection_status,
             )
-    if persist_session or session_id or collection_status == "error":
+    if persist_session or session_id or collection_status == "error" or activity.reason:
         return CodexResult(
             returncode,
             message.strip(),
             resolved_session_id,
             (
                 AgentResultKind.TRANSIENT_FAILURE
-                if timeout_triggered.is_set()
+                if timeout_triggered.is_set() or activity.reason
                 else None
             ),
             usage,

@@ -43,6 +43,8 @@ CREATE TABLE IF NOT EXISTS agent_invocations (
     execution_started_at TEXT,
     execution_finished_at TEXT,
     execution_duration_ms INTEGER,
+    process_receipt_path TEXT,
+    execution_finish_evidence TEXT,
     finished_at TEXT,
     duration_ms INTEGER,
     result_kind TEXT,
@@ -85,6 +87,7 @@ def ensure_schema(connection: sqlite3.Connection) -> None:
                   ("task_id", "TEXT"), ("execution_status", "TEXT NOT NULL DEFAULT 'unknown'"),
                   ("execution_started_at", "TEXT"), ("execution_finished_at", "TEXT"),
                   ("execution_duration_ms", "INTEGER"), ("previous_effort", "TEXT"),
+                  ("process_receipt_path", "TEXT"), ("execution_finish_evidence", "TEXT"),
                   ("previous_session_id", "TEXT"), ("scope_id", "TEXT"),
                   ("guidance_task_id", "TEXT"), ("guidance_content_hash", "TEXT")):
         if field not in columns:
@@ -152,10 +155,30 @@ class InvocationRepository:
     def mark_execution_finished(self, identity: str, duration_ms: int) -> None:
         with self.connection:
             self.connection.execute("""UPDATE agent_invocations SET
-                execution_finished_at = ?, execution_duration_ms = ?
+                execution_finished_at = ?, execution_duration_ms = ?,
+                execution_finish_evidence = 'provider_process_finished'
                 WHERE invocation_id = ? AND finished_at IS NULL
                   AND execution_status = 'executed'""",
                 (utc_now(), max(0, duration_ms), identity))
+
+    def bind_process_receipt(self, identity: str, path: str) -> None:
+        with self.connection:
+            self.connection.execute('''UPDATE agent_invocations SET process_receipt_path=?
+                WHERE invocation_id=? AND finished_at IS NULL''', (path, identity))
+
+    def reconcile_execution(self, *, state_dir, repo: str | None = None) -> None:
+        from loop_manager_internal.agents.process_receipt import recover
+        from .runtime_state import _transaction
+        rows = self.connection.execute('''SELECT invocation_id, process_receipt_path
+            FROM agent_invocations WHERE finished_at IS NOT NULL AND execution_finished_at IS NULL
+            AND process_receipt_path IS NOT NULL AND (? IS NULL OR repo=?)''', (repo, repo)).fetchall()
+        for identity, path in rows:
+            proof = recover(path, state_dir)
+            if proof is not None:
+                with _transaction(self.connection):
+                    self.connection.execute('''UPDATE agent_invocations SET execution_finished_at=?,
+                        execution_finish_evidence=? WHERE invocation_id=? AND execution_finished_at IS NULL''',
+                        (proof['finished_at'], json.dumps(proof, sort_keys=True), identity))
 
     def verified_scope(self, scope_id: str, *, repo: str, plan_id: str | None,
                        role: str, provider: str, session_id: str | None,
@@ -313,6 +336,8 @@ class InvocationRepository:
                     execution_status = CASE WHEN execution_status = 'prepared'
                                             THEN 'unknown' ELSE execution_status END
                     WHERE invocation_id = ? AND finished_at IS NULL""", (utc_now(),identity)).rowcount
+        if state_dir is not None:
+            self.reconcile_execution(state_dir=state_dir)
         return count
 
     def summary(self, repo: str) -> list[sqlite3.Row]:

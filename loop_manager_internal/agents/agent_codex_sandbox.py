@@ -35,6 +35,8 @@ class CodexLaunch:
             os.killpg(process.pid, signal.SIGKILL)
         except ProcessLookupError:
             pass
+        from loop_manager_internal.execution.verify_process import _confirm_posix_group_stopped
+        _confirm_posix_group_stopped(process.pid)
 
     @staticmethod
     def start(arguments, *, launch_process, **kwargs):
@@ -53,8 +55,10 @@ class CodexLaunch:
         # The caller owns the atomic runtime handoff check at process creation.
         process = self.start(arguments, launch_process=launch_process, **kwargs)
         try:
+            from . import process_receipt
             if on_process_started is not None:
                 on_process_started()
+            process_receipt.started(self, process)
             process.communicate(prompt, timeout=timeout)
             return subprocess.CompletedProcess(arguments, process.returncode)
         finally:
@@ -62,9 +66,10 @@ class CodexLaunch:
             try:
                 self.stop(process)
             finally:
-                process.wait()
-                if on_process_finished is not None:
-                    on_process_finished()
+                process.wait(timeout=10)
+            process_receipt.finished(self, process)
+            if on_process_finished is not None:
+                on_process_finished()
 
     def probe(self) -> None:
         feature_result = subprocess.run(

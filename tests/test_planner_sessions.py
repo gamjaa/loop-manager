@@ -26,19 +26,12 @@ class PlannerSessionsTest(unittest.TestCase):
             + "\n"
         )
 
-        class StartedOutput:
-            def __iter__(self):
-                return iter((thread_event,))
-
-            def close(self):
-                pass
-
         class StartedProcess:
             def __init__(self, arguments, **kwargs):
                 calls.append(arguments)
                 call_options.append(kwargs)
                 self.stdin = mock.Mock()
-                self.stdout = StartedOutput()
+                self.stdout = io.StringIO(thread_event)
 
             def wait(self):
                 return 0
