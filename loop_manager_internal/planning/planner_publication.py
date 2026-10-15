@@ -467,13 +467,18 @@ def _general_planning_batch_already_applied(
         "FROM projects WHERE repo = ?",
         (repo,),
     ).fetchone()
-    if project is None or tuple(project) != (
+    review = planning_review_state.get(connection, repo, 'requirement')
+    requirement_applied = (review is not None and review['confirmed_revision'] == plan_commit
+                           and result.mutable_snapshot is not None
+                           and review['revision'] == result.mutable_snapshot.active_sha
+                           and review['result'] is not None and review['outcome'] is not None)
+    if project is None or not requirement_applied and tuple(project) != (
         plan_commit,
         specification_fingerprint,
         planning_fingerprint,
     ):
         return False
-    if not planning_input_state.matches(
+    if not requirement_applied and not planning_input_state.matches(
         connection, repo, effects.plan_declarations(worktree, plan_commit),
     ):
         return False
@@ -644,17 +649,21 @@ def _apply_general_planning_batch(
                         drafts.bind_plan(repo, claim, str(plan["id"]))
             except (document_drafts.DocumentDraftError, OSError, UnicodeError) as error:
                 raise PlannerValidationError(str(error)) from error
+        review = planning_review_state.get(connection, repo, 'attempt')
+        requirement_only = review is not None and review['purpose'] == 'requirement'
+        previous = (connection.execute('SELECT processed_sha, specification_fingerprint, planning_fingerprint '
+                                       'FROM projects WHERE repo=?', (repo,)).fetchone() if requirement_only else None)
         planning_review_state.confirm(connection, repo, snapshot.active_sha, plan_commit)
-        planning_input_state.record_general(
-            connection, repo, plan_commit,
-            effects.plan_declarations(worktree, plan_commit),
-        )
+        if not requirement_only:
+            planning_input_state.record_general(
+                connection, repo, plan_commit, effects.plan_declarations(worktree, plan_commit),
+            )
         effects._clear_active_in_current_transaction(
             connection,
             repo,
-            processed_sha=plan_commit,
-            specification_fingerprint=specification_fingerprint,
-            planning_fingerprint=planning_fingerprint,
+            processed_sha=previous['processed_sha'] if requirement_only else plan_commit,
+            specification_fingerprint=previous['specification_fingerprint'] if requirement_only else specification_fingerprint,
+            planning_fingerprint=previous['planning_fingerprint'] if requirement_only else planning_fingerprint,
         )
         for source in result.retirement_moves:
             changed = connection.execute(

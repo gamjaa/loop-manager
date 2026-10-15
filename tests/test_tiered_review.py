@@ -45,14 +45,21 @@ class TieredReviewTest(unittest.TestCase):
                         "tests/test_a.py": b"from pkg import a\ndef test_value():\n    assert a.calculate(1) == 2\n",
                         "tests/test_other.py": b"def test_unrelated():\n    assert True\n"}
 
-    def select(self, merged=0, revision="sha", **kwargs):
+    def select(self, merged=0, revision="sha", interval=20, **kwargs):
         inv = inventory(self.sources, revision)
         actual = SourceInventory(revision, tuple(TrackedSource(source.path, source.content_hash, source.mode, revision, "source")
             for source in inv.sources), tuple(ClassifiedPath(path, "source", "source") for path in self.sources))
         with mock.patch.object(tiered_review, "cached_source_inventory", return_value=actual), \
                 mock.patch.object(tiered_review, "root_placement_inventory", return_value=()), \
                 mock.patch.object(code_index, "git", side_effect=lambda _repo, _command, value: self.sources[value.split(":", 1)[1]]):
-            return self.repository.select("repo", Path("/repo"), "main", revision, 20, merged, **kwargs)
+            return self.repository.select("repo", Path("/repo"), "main", revision, interval, merged, **kwargs)
+
+    def test_explicit_request_can_select_full_review_with_zero_interval(self):
+        self.assertFalse(self.select(interval=0).required)
+        self.connection.execute("INSERT INTO tiered_maintenance_requests VALUES ('repo', 'manual')")
+        selected = self.select(interval=0, force_full=True)
+        self.assertEqual(selected.mode, 'full')
+        self.assertEqual(selected.request_id, 'manual')
 
     def complete(self, selection, cycle=1, findings=None):
         assessment = self.repository.prepare("repo", cycle, selection)

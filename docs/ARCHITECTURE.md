@@ -57,7 +57,7 @@ source checkout의 `config` 아래 미추적 로컬 파일은 폴더 전체가 G
 
 - `[loop].max_workers`: 동시에 처리할 프로젝트 수, 기본값 3인 양의 정수
 - provider별 Model alias와 Effort, 기본값이 `false`인 Fast on/off
-- 일반 Planner(`planner`)·빠른 점검 Planner(`planner_check`), Reviewer profile
+- 일반 Planner(`planner`)·Reviewer profile과 호환을 위해 보존한 기존 점검 profile(`planner_check`). profile 존재는 새 호출의 조건이 아니며 코드 전용 점검 제거는 R-082의 변경 목표를 따른다
 - 선택 provider의 Worker `level1`부터 `level8`까지의 명시적 Model alias와 Effort
 - Telegram Bot token과 chat ID
 
@@ -222,7 +222,15 @@ runtime 자식은 병렬 프로젝트 작업을 제출하기 전에 등록된 se
 
 기존 Open PR도 [GitHub와 PR](#github와-pr)의 Merge 가능 여부를 확인한다. 충돌이 확정된 PR은 안전·dependency·실행 자리 조건을 확인한 뒤 관리 branch를 최신 원격 base에 rebase해 같은 PR을 갱신한다.
 
-그 뒤 실행 중인 변경을 재개하거나 확정 PR 충돌 복구·유지보수·일반 Planner·READY를 선택한다. dependency와 순서는 [PRODUCT의 작업 선택 정책](PRODUCT.md#작업-선택과-동시-실행)을 따른다. Worker·검증·Review·PR 생성 순서는 [제품 처리 흐름](PRODUCT.md#execplan-생성과-자동-처리)을 따른다.
+그 뒤 마지막 관련 ExecPlan의 실제 Merge와 catalog 반영이 확인된 Requirement를 다음 안전한 경계에서 바로 재확인하고, 실행 중인 변경 재개·확정 PR 충돌 복구·유지보수·일반 Planner·READY 선택을 이어간다. 실행 중 writer·소유 Git operation·실제 프로젝트 안전 gate를 우회하지 않는다. dependency와 일반 작업 간 순서는 [PRODUCT의 작업 선택 정책](PRODUCT.md#작업-선택과-동시-실행)을, Worker·검증·Review·PR 생성은 [제품 처리 흐름](PRODUCT.md#execplan-생성과-자동-처리)을 따른다.
+
+### Planner 실행과 Requirement 완료 확인
+
+프로젝트 계획 수립 여부는 최신 원격 PRODUCT·활성 Requirement·ARCHITECTURE와 마지막으로 적용한 전체 planning 성공 기준으로 판단한다. ExecPlan 선언은 catalog·실행 자격의 검증 입력이고 코드·테스트·설정은 Worker 구현과 verify·Review의 입력이다. 이 값의 변경이나 전체 저장소 SHA 차이만으로 일반·점검·작업별 영향 Planner를 호출하지 않는다. Manager가 유효한 선언·source·dependency·사용자 결정을 반영하고 Worker가 최신 작업 조건과 현재 코드를 대조해 필요한 구현·targeted test를 수행한다.
+
+Planner의 최초 계획 수립·명세 변경·draft 사용자 답변·추적 작업이 필요한 명시적 수동 제출·유지보수·Requirement 완료 재확인·프로젝트 최종 확인은 R-082의 목적별 조건을 적용한다. 같은 경계의 여러 대상·목적은 한 호출로 처리할 수 있으며, Requirement별 판단·프로젝트 전체 planning·최종 전문 확인·유지보수의 입력과 성공 근거를 구분해 보존한다. 재시작·원격 재관측에서는 유효한 결과·게시 intent의 남은 적용부터 복구하고, 실제 입력 변경·필수 판단 누락·계획 작성 범위의 충돌만 해당 세션 교정으로 연결한다.
+
+PR 상태 동기화 뒤 마지막 연결 ExecPlan이 실제 MERGED가 된 활성 Requirement는 유효한 source 관계·관련 draft·현재 입력을 확인해 완료 재확인 대상으로 삼는다. 다른 Requirement의 READY·Open PR·완료나 프로젝트 전체 종료를 기다리지 않으며 독립된 새 작업·유지보수 cycle 선택 전에 처리한다. 각 Acceptance Criterion을 최신 관련 명세·구현·테스트·실제 검증에 대조해 충족은 판단 기록·원문 archive, 미충족은 후속 ExecPlan, 필수 사용자 결정은 draft, 불확실은 보류로 반영한다. 같은 입력의 유효한 판단은 재사용하고 archive 게시·catalog·DB 적용은 기존 소유권·publication transaction·원격 재확인 경계를 유지한다.
 
 ### 계획 게시와 작업 공간
 
@@ -256,13 +264,13 @@ Planning rebase 교정 journal은 역할 결과 검증을 통과한 계획·`FUT
 
 ### 단계별 원격 문서 반영
 
-Worker·Manager verify·Reviewer·게시의 진입·교정·재개 전에 최신 원본과 작업 branch를 확인한다. PRODUCT·활성 Requirement·ARCHITECTURE·사용자 active ExecPlan 변경은 프로젝트 일반 planning에서 관련 작업 개정·게시·DB 적용을 먼저 완료한다. 개별 작업의 읽기 전용 실행 대응 판단은 마지막 반영 ExecPlan의 조건 변경과 현재 후보·발견 단계에 한정하며, 상위 명세의 관련성과 작업 개정을 다시 판단하거나 전체 planning 성공으로 기록하지 않는다. 무관한 문서·순수 revision 전진만으로 Worker를 반복하지 않는다. 코드 전용 점검 Planner와 유지보수 대상의 미착수 제한은 그대로다.
+Worker·Manager verify·Reviewer·게시의 진입·교정·재개 전에 최신 원본과 작업 branch를 확인한다. PRODUCT·활성 Requirement·ARCHITECTURE 변경은 프로젝트 일반 planning에서 관련 작업 개정·게시·DB 적용을 먼저 완료한다. ExecPlan 변경 자체는 재계획하지 않고 Manager의 선언 검증·작업 branch 반영과 Worker의 실행 대응으로 처리한다. 구현 충족 여부를 기존 근거로 확정할 수 없으면 기존 Worker 세션에서 최신 조건의 판단과 필요한 보완을 함께 수행하며 별도 읽기 전용 영향 Planner를 호출하지 않는다. 무관한 문서·순수 revision·진행 기록만의 변경은 Worker를 반복하지 않는다. 코드 전용 점검과 일반 Planner 인계는 제거하고 유지보수의 대상·안전 제한은 유지한다.
 
 문서 반영의 이전 선언·발견 단계·과거 Worker/verify 근거·영향 판단·개정 게시 후보는 해당 ExecPlan의 execution checkpoint에 보존한다. 원격 작업 branch의 문서는 단순 관측 OID만으로 통합 완료나 검증 성공을 만들지 않는다. 현재 작업 대상·입력 유효성·작업물 보존을 확인해 실제 수용한 뒤 해당 문서를 입력으로 반영한다. 이 상태는 rebase·교정의 checkpoint 교체에서도 보존하며 다른 작업이나 일반 planning 상태를 덮어쓰지 않는다.
 
-이전 버전의 단일 현재 계획 개정 후보는 기존 소유 detached worktree와 execution checkpoint에서 복구한다. Manager가 구조·source·dependency·기존 ID·경로·실제 PR 부재와 게시 사실을 재검증하고 미완료 적용부터 이어간다. 실행 중 구현 worktree는 수정하지 않으며 PR 출현·후속 원격 변경·소유권 불확실에서는 작업물을 보존한다. 새 실행 대응 판단은 `plan_text` 개정안을 반환하지 않고 프로젝트 일반 planning 게시를 사용한다.
+이전 버전의 단일 현재 계획 개정 후보는 기존 소유 detached worktree와 execution checkpoint에서 복구한다. Manager가 구조·source·dependency·기존 ID·경로·실제 PR 부재와 게시 사실을 재검증하고 미완료 적용부터 이어간다. 실행 중 구현 worktree는 수정하지 않으며 PR 출현·후속 원격 변경·소유권 불확실에서는 작업물을 보존한다. 이전 문서 영향 Planner checkpoint는 이 복구·감사에 사용하며 새로운 작업별 Planner 호출을 만들지 않는다. 새 명세에 따른 계획 개정은 필요한 프로젝트 일반 planning에서, ExecPlan만의 실행 대응은 Worker·Manager의 기존 단계에서 처리한다.
 
-verify 진입의 구현 부족은 Worker 교정으로, 구현이 충족된 경우는 필요한 verify로 연결한다. Reviewer 진입의 문서 변경은 현재 구현과 과거 검증의 확인 범위·최신 조건 미검증을 구분한 선행 Review로 연결한다. 구현·테스트 수정이 필요한 FAIL은 기존 Worker 교정이며, 검증 실행 근거만 부족한 `VERIFY_REQUIRED`는 Manager verify로 연결한다. 선행 PASS도 최신 검증 없이 게시 token을 만들지 않는다. 변경된 조건에서는 과거 verify 성공 재사용을 새로 증명해야 하며 최종 후보의 verify·Review·게시 gate는 독립적으로 유지한다.
+verify 진입의 구현 부족은 Worker 교정으로, 구현 충족의 유효한 근거가 있으면 필요한 verify로 연결한다. 새 ExecPlan 조건의 구현 적합성을 판단할 근거가 없으면 Planner 대신 해당 Worker 세션에서 확인·보완·targeted test를 함께 수행한다. Reviewer 진입의 문서 변경은 현재 구현과 과거 검증의 확인 범위·최신 조건 미검증을 구분한 선행 Review로 연결한다. 구현·테스트 수정이 필요한 FAIL은 기존 Worker 교정이며, 검증 실행 근거만 부족한 `VERIFY_REQUIRED`는 Manager verify로 연결한다. 선행 PASS도 최신 검증 없이 게시 token을 만들지 않는다. 변경된 조건에서는 과거 verify 성공 재사용을 새로 증명해야 하며 최종 후보의 verify·Review·게시 gate는 독립적으로 유지한다.
 
 진행 중인 일반·유지보수 planning은 원격 base 전진 시 staged·unstaged·untracked 변경과 세션을 관리 worktree에 보존해 반영하고 최신 catalog·SQLite 권한에서 재검증한다. 시작 revision의 READY 원본과 Planner가 작성한 결과를 구분하며, 관련 근거·의존 문서의 실제 내용이 바뀐 경우에만 해당 계획을 다시 확인한다. 무관한 문서 변경과 내용 보존 이동은 재확인을 만들지 않는다
 
@@ -296,6 +304,8 @@ dependency·priority·명세 변경·유지보수 DAG의 선택 순서는 PRODUC
 Manager는 최신 원격 추적 파일의 경로·내용 hash·mode와 분석 버전에 결합된 정적 사실을 저장한다. 변경된 파일만 다시 파싱하되 현재 파일 집합에서 관계를 다시 계산한다. 정적 코드맵·읽기 전용 조회는 심벌·import·직접 참조·관련 테스트·분석 불확실성을 제공하며 의미 검토 성공 증거는 아니다. 정적 사실은 `docs/maintenance/code-map.jsonl`과 Agent 조회용 별도 snapshot에 제공하고, Manager의 운영 SQLite·session·상태를 Agent 입력으로 내보내지 않는다.
 
 유지보수 이력이 없는 프로젝트의 최초 실행 시 확인한 MERGED 수를 첫 자동 주기 기준으로 SQLite에 보존한다. 등록만으로 기준을 설정하지 않으며, 최초 실행의 원격 catalog 검증을 마친 안전한 선택 경계에서 한 번 기록한다. 이 기준은 평가 성공·cycle 정상 종료 근거와 구분하며 재시작에서 다시 설정하지 않는다. 기존 활성 cycle·정상 종료 기준·미확정 게시·실패 이력은 보존한다.
+
+`[loop] refactoring_review_interval`은 기본값 20의 0 이상 정수로 주기를 지정한다. 양수 n에서는 저장된 최초 실행·직전 정상 종료 기준 이후 새 MERGED 수가 n개 이상이면 다음 안전한 경계에서 자동 전환한다. 0은 자동 전환만 끄며 활성 cycle의 진행·종료와 `maintenance-review <repo>`의 명시적 요청은 유지한다. 값 변경·재활성화에서도 같은 Merge 기준을 보존하고, 요청은 다음 안전한 경계에서 기존 pause·실제 Open PR·프로젝트 안전 gate를 준수해 한 번 소비한다. 설정·주기 판단의 0 허용은 R-074의 추가 구현 범위이며 요청 명령은 R-076의 기존 CLI를 재사용한다.
 
 PRODUCT의 `fast`·`targeted`·`full` 선택은 유지보수 진입 조건을 충족한 뒤 정적 비교와 마지막 성공한 전체 정밀 점검의 Merge 기준을 사용한다. 전체 점검 성공 이력의 부재만으로 최초 실행에서 유지보수를 선택하지 않으며, 첫 유지보수 cycle에서는 `full`을 수행한다. `fast`에는 모델 검토 묶음이나 의미 검토 receipt를 만들지 않는다. 정밀 점검은 관련 파일을 모듈 단위의 제한된 묶음으로 구성하고, 원본·mode·정적 사실·분석 버전·평가 조건에 결합된 묶음 identity의 성공 결과를 재사용한다. 전체 점검의 성공 Merge 기준과 최신 정적·부분 평가 기준은 따로 보존한다.
 

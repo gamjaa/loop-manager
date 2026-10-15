@@ -59,6 +59,36 @@ class PlanningPublicationTest(PlanningCase):
         connection.commit()
         return connection
 
+    def test_requirement_publication_preserves_general_baseline_and_recovers_without_model(self):
+        from loop_manager_internal.planning import planner_publication
+        from loop_manager_internal.storage import planning_review_state as reviews, planning_input_state
+        connection = self._reviewed_publication_connection()
+        connection.execute("INSERT INTO projects (repo, base_branch, processed_sha, specification_fingerprint, planning_fingerprint) VALUES ('/repo', 'main', 'old', 'old-spec', 'old-input')")
+        old = {'docs/plans/Decision.md': ('blob', 'old-answer')}
+        planning_input_state.record_general(connection, '/repo', 'old', old)
+        connection.execute("UPDATE planning_reviews SET purpose='requirement' WHERE slot='attempt'")
+        connection.commit()
+        snapshot = MutableReadySnapshot('/repo', 'base', (), 'token')
+        result = loop_manager.ValidatedPlanningResult(plans=(), publication_paths=(), mutable_snapshot=snapshot)
+        intent = SimpleNamespace(stage='prepared', base_sha='base', commit_sha='commit',
+            snapshot_token='token', specification_fingerprint='spec', planning_fingerprint='input')
+        clear = mock.Mock()
+        effects = planner_publication.ApplyGeneralPlanningBatchEffects(
+            mock.Mock(), clear, mock.Mock(return_value=False), mock.Mock(), mock.Mock(),
+            mock.Mock(return_value=intent), mock.Mock(return_value=False), mock.Mock())
+        with mock.patch.object(planner_publication.planning_publication_state, 'apply_mutable_catalog_changes'), \
+             mock.patch('loop_manager_internal.catalog.remote_deletions.resolve_recovery'):
+            planner_publication._apply_general_planning_batch(effects, connection, '/repo',
+                Path('/worktree'), result, 'commit', 'spec', 'input')
+        self.assertEqual(clear.call_args.kwargs['processed_sha'], 'old')
+        self.assertEqual(clear.call_args.kwargs['planning_fingerprint'], 'old-input')
+        self.assertTrue(planning_input_state.matches(connection, '/repo', old))
+        self.assertEqual(reviews.get(connection, '/repo', 'requirement')['confirmed_revision'], 'commit')
+        self.assertIsNone(reviews.get(connection, '/repo', 'general'))
+        applied = planner_publication.GeneralPlanningBatchAlreadyAppliedEffects(mock.Mock(), mock.Mock(), mock.Mock())
+        self.assertTrue(planner_publication._general_planning_batch_already_applied(applied,
+            connection, '/repo', Path('/worktree'), result, 'commit', 'spec', 'input'))
+
     def test_general_batch_confirms_review_and_pinned_guidance_before_clear_atomically(self):
         from loop_manager_internal.planning import planner_publication
         from loop_manager_internal.storage import planning_input_state, planning_review_state as reviews
@@ -687,9 +717,10 @@ class PlanningPublicationTest(PlanningCase):
     def test_unpublished_planner_does_not_activate_stale_ready(self):
         ports = FakePorts(planning_snapshot(
             processed_sha="old-base",
-            specification_fingerprint="specification",
+            specification_fingerprint="old-spec",
             planning_fingerprint="old-full",
         ))
+        ports.git.specification_fingerprints["old-base"] = "old-spec"
         ports.git.fingerprint = "new-full"
         ports.git.fingerprints["old-base"] = "old-full"
         ports.git.dirty_files = ["docs/plans/[G-001] Plan.md"]

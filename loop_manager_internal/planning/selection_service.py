@@ -6,7 +6,6 @@ from loop_manager_internal.maintenance.maintenance_orchestration import maintena
 from loop_manager_internal.maintenance.maintenance_planning import MaintenancePlanningError
 from loop_manager_internal.maintenance.maintenance_file_inventory import SourceInventoryError
 from loop_manager_internal.storage import maintenance_state, runtime_state
-from loop_manager_internal.storage.planner_check_state import target_fingerprint
 from loop_manager_internal.planning.planning_catalog import PlanningResultInvalid
 from loop_manager_internal.planning.planner_check import parse_planner_check_result
 from loop_manager_internal.planning.planning_workspace import planning_workspace_path, legacy_release_identity
@@ -61,6 +60,11 @@ class PlanningSelectionService(PlanningService):
             return False
         run.row = self._ports.state.planning(context.repo)
         return True
+
+    def _user_decision_pending(self, context: PlanningContext, base_sha: str) -> bool:
+        pending = getattr(self._ports.state, 'pending_user_decision', None)
+        return bool(pending and pending(context.repo,
+            self._ports.git.plan_declarations(context.repo_path, base_sha)))
 
     def _gate_preserved_error(self, run: _PlanningRun) -> PlanningOutcome | None:
         """Check the failed input before scheduling or stale-workspace cleanup."""
@@ -314,9 +318,13 @@ class PlanningSelectionService(PlanningService):
             if active is not None:
                 run.general_fingerprint = self._ports.git.input_fingerprint(context.repo_path, run.base_sha)
                 run.specification_fingerprint = self._ports.git.specification_fingerprint(context.repo_path, run.base_sha)
+                if hasattr(self._ports, 'retirement') and not active['pr_url'] and not active['pr_conflict_recovery']:
+                    run.retirement_pending = tuple(item for item in self._ports.retirement.pending(
+                        context.repo, context.repo_path, run.base_sha) if item.related_ids)
                 required = (self._specification_planning_required(row, context, run.base_sha,
                     run.specification_fingerprint, run.general_fingerprint)
-                    or not self._plan_declarations_match(context, run.base_sha))
+                    or self._user_decision_pending(context, run.base_sha)
+                    or bool(run.retirement_pending))
                 if not required:
                     if row.planning_resume_plan_id:
                         self._ports.state.resume_execution_after_planning(context.repo)
@@ -405,12 +413,21 @@ class PlanningSelectionService(PlanningService):
                 context.repo, context.repo_path, context.base_branch,
             )
         )
+        if (cycle.phase in {maintenance_state.MaintenancePhase.IDLE,
+                maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
+                maintenance_state.MaintenancePhase.REFACTORING}
+                and getattr(decision, "active", None) is None
+                and hasattr(self._ports, "retirement")):
+            run.retirement_pending = self._ports.retirement.pending(
+                context.repo, context.repo_path, run.base_sha,
+            )
         if (
             context.registered_only
             and cycle.phase is maintenance_state.MaintenancePhase.IDLE
             and not waiting_for_pr
             and not waiting_for_manual
             and not approval_pending
+            and not run.retirement_pending
         ):
             tiered_selection = None
             try:
@@ -466,7 +483,7 @@ class PlanningSelectionService(PlanningService):
             return PlanningOutcome(PlanningOutcomeKind.WAITING)
         if cycle.phase is maintenance_state.MaintenancePhase.ASSESSMENT:
             run.maintenance_planning = True
-        elif cycle.phase in {
+        elif not run.retirement_pending and cycle.phase in {
             maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
             maintenance_state.MaintenancePhase.REFACTORING,
             maintenance_state.MaintenancePhase.POST_REFACTOR_REVALIDATION,
@@ -496,64 +513,15 @@ class PlanningSelectionService(PlanningService):
                     context.repo_path, run.base_sha
                 )
             )
-            specification_changed = self._specification_planning_required(
+            specification_changed = self._user_decision_pending(context, run.base_sha) or self._specification_planning_required(
                 row,
                 context,
                 run.base_sha,
                 run.specification_fingerprint,
                 run.general_fingerprint,
             )
-            planning_input_changed = self._general_planning_required(
-                row,
-                context,
-                run.base_sha,
-                run.general_fingerprint,
-            )
-            if hasattr(self._ports, "retirement"):
-                run.retirement_pending = self._ports.retirement.pending(
-                    context.repo, context.repo_path, run.base_sha,
-                )
-            check_ready = False
-            check_accepted = False
-            if (planning_input_changed and not specification_changed
-                    and not approval_pending and row.planning_fingerprint
-                    and row.processed_sha
-                    and getattr(decision, "active", None) is None
-                    and getattr(self._ports.state, "general_baseline", lambda _repo: False)(context.repo)
-                    and self._plan_declarations_match(context, run.base_sha)):
-                previous = getattr(self._ports.state, "planner_check", lambda _repo: None)(context.repo)
-                comparison_sha = (
-                    str(previous["base_sha"])
-                    if previous is not None and previous["stage"] == "accepted"
-                    else str(row.processed_sha)
-                )
-                try:
-                    candidate = self._ports.validation.prepare_general_context(
-                        context.repo, context.repo_path, run.base_sha,
-                    )
-                    from loop_manager_internal.planning.planning_catalog import unstarted_snapshot
-                    candidate = unstarted_snapshot(candidate)
-                except PlanningResultInvalid as error:
-                    self._ports.events.error(str(error))
-                    return self._operational_error()
-                if candidate.plans:
-                    identity = target_fingerprint(candidate)
-                    check_accepted = bool(
-                        previous is not None and previous["stage"] == "accepted"
-                        and previous["input_fingerprint"] == run.general_fingerprint
-                        and previous["specification_fingerprint"] == run.specification_fingerprint
-                        and previous["target_fingerprint"] == identity
-                    )
-                    check_ready = not check_accepted
-                    run.mutable_ready_snapshot = candidate
-                    if check_ready:
-                        run.check_comparison_sha = comparison_sha
-            if check_accepted:
-                planning_input_changed = False
-                run.fingerprint_skipped = True
             if (hasattr(self._ports.state, "planning_review") and not approval_pending
-                    and not specification_changed and not planning_input_changed
-                    and not run.retirement_pending
+                    and not specification_changed
                     and self._ports.state.final_review_candidate(context.repo,
                         context.refactoring_review_interval, self_repository=context.self_repository)):
                 from loop_manager_internal.planning.specification_review import current_receipt
@@ -563,7 +531,9 @@ class PlanningSelectionService(PlanningService):
                     input_fingerprint=run.general_fingerprint,
                     specification_fingerprint=run.specification_fingerprint,
                     work_cycle=self._ports.state.review_work_cycle(context.repo),
-                    archive_only=self._ports.git.requirement_archive_only,
+                    archive_only=lambda *args, **kwargs: (
+                        self._plan_declarations_match(context, run.base_sha)
+                        and self._ports.git.requirement_archive_only(*args, **kwargs)),
                 )
             run.selection = choose_planning_decision(
                 has_active=getattr(decision, "active", None) is not None,
@@ -571,8 +541,7 @@ class PlanningSelectionService(PlanningService):
                                        or bool(run.retirement_pending)
                                        or run.final_review_required),
                 runnable_ready=decision.runnable_ready is not None,
-                planning_input_changed=planning_input_changed,
-                check_ready=check_ready,
+                planning_input_changed=specification_changed,
                 has_waiting_catalog=bool(
                     decision.has_ready or decision.has_waiting
                 ),
@@ -601,25 +570,11 @@ class PlanningSelectionService(PlanningService):
         base_sha: str,
         current_fingerprint: str,
     ) -> bool:
-        if getattr(self._ports.git, 'runtime_guidance_changed', lambda _repo: False)(context.repo_path):
-            return True
-        if not self._plan_declarations_match(context, base_sha):
-            return True
-        if row.planning_fingerprint == current_fingerprint:
-            return False
-        if row.planning_fingerprint and row.processed_sha:
-            processed = self._ports.git.nonplan_fingerprint(
-                context.repo_path, row.processed_sha
-            )
-            current = self._ports.git.nonplan_fingerprint(context.repo_path, base_sha)
-            if processed == current:
-                return False
-            if self._ports.git.requirement_archive_only(
-                context.repo_path, row.processed_sha, base_sha,
-                verified_plan_declarations=True,
-            ):
-                return False
-        return True
+        return self._specification_planning_required(
+            row, context, base_sha,
+            self._ports.git.specification_fingerprint(context.repo_path, base_sha),
+            current_fingerprint,
+        )
 
     def _specification_planning_required(
         self,
@@ -655,7 +610,7 @@ class PlanningSelectionService(PlanningService):
                 return False
             if self._ports.git.requirement_archive_only(
                 context.repo_path, row.processed_sha, base_sha,
-                verified_plan_declarations=self._plan_declarations_match(context, base_sha),
+                specification_only=True,
             ):
                 return False
         return True
@@ -796,62 +751,18 @@ class PlanningSelectionService(PlanningService):
                 PlanningDecisionKind.RUN_FALLBACK_PLANNING,
             }
         )
-        if (
-            not run.maintenance_planning
-            and not row.phase
-            and row.planning_fingerprint == run.current_fingerprint
-            and self._plan_declarations_match(context, run.base_sha)
-            and not forced_general_planning
-        ):
-            self._ports.state.update(
-                context.repo,
-                processed_sha=run.base_sha,
-                specification_fingerprint=run.specification_fingerprint,
-            )
-            self._ports.events.info(
-                "계획 입력이 바뀌지 않아 Agent를 실행하지 않습니다."
-            )
+        if (not run.maintenance_planning and not row.phase
+                and not forced_general_planning
+                and not self._specification_planning_required(
+                    row, context, run.base_sha, run.specification_fingerprint,
+                    run.current_fingerprint)):
+            self._ports.events.info("명세가 바뀌지 않아 Planner를 실행하지 않습니다.")
+            if row.planning_fingerprint == run.current_fingerprint:
+                self._ports.state.update(context.repo, processed_sha=run.base_sha,
+                    specification_fingerprint=run.specification_fingerprint)
+                row = self._ports.state.planning(context.repo)
             planning_required = False
             run.fingerprint_skipped = True
-
-        if (
-            planning_required
-            and not run.maintenance_planning
-            and row.planning_fingerprint
-            and row.processed_sha
-            and not forced_general_planning
-        ):
-            declarations_match = self._plan_declarations_match(context, run.base_sha)
-            processed = self._ports.git.nonplan_fingerprint(
-                context.repo_path, row.processed_sha,
-            )
-            current = self._ports.git.nonplan_fingerprint(
-                context.repo_path, run.base_sha,
-            )
-            if declarations_match and processed == current:
-                self._ports.state.update(
-                    context.repo,
-                    processed_sha=run.base_sha,
-                    specification_fingerprint=run.specification_fingerprint,
-                )
-                self._ports.events.info(
-                    "계획 입력이 바뀌지 않아 Agent를 실행하지 않습니다."
-                )
-                planning_required = False
-                run.fingerprint_skipped = True
-            elif declarations_match and self._ports.git.requirement_archive_only(
-                context.repo_path, row.processed_sha, run.base_sha,
-                verified_plan_declarations=True,
-            ):
-                self._ports.state.update(
-                    context.repo,
-                    processed_sha=run.base_sha,
-                )
-                self._ports.events.info(
-                    "Requirement archive 이동 외의 계획 입력이 바뀌지 않아 Agent를 실행하지 않습니다."
-                )
-                planning_required = False
-                run.fingerprint_skipped = True
 
         if planning_required:
             assert run.current_fingerprint is not None
@@ -871,16 +782,6 @@ class PlanningSelectionService(PlanningService):
             worktree = planning_workspace_path(
                 context.state_dir, context.repo, run.current_fingerprint
             )
-            if run.selection and run.selection.kind is PlanningDecisionKind.RUN_PLANNER_CHECK:
-                assert run.mutable_ready_snapshot is not None
-                self._ports.state.begin_planner_check(
-                    context.repo,
-                    input_fingerprint=str(run.general_fingerprint),
-                    specification_fingerprint=str(run.specification_fingerprint),
-                    target_fingerprint=target_fingerprint(run.mutable_ready_snapshot),
-                    base_sha=run.base_sha,
-                    comparison_sha=run.check_comparison_sha or str(row.processed_sha),
-                )
             self._ports.state.update(
                 context.repo,
                 active_sha=run.base_sha,
@@ -1008,22 +909,6 @@ class PlanningSelectionService(PlanningService):
             latest_sha = self._fetch_remote_head(context)
             if self._remote_base_changed_before_activation(run, latest_sha):
                 return self._restart_for_new_input()
-            if run.fingerprint_skipped:
-                check = getattr(self._ports.state, "planner_check", lambda _repo: None)(context.repo)
-                if (check is not None and check["stage"] == "accepted"
-                        and row.planning_fingerprint != run.current_fingerprint):
-                    if (check["input_fingerprint"] != run.current_fingerprint
-                            or check["specification_fingerprint"] != run.specification_fingerprint):
-                        return self._restart_for_new_input()
-                    try:
-                        current = self._ports.validation.prepare_general_context(
-                            context.repo, context.repo_path, latest_sha,
-                        )
-                    except PlanningResultInvalid as error:
-                        self._ports.events.error(str(error))
-                        return self._operational_error()
-                    if target_fingerprint(current) != check["target_fingerprint"]:
-                        return self._restart_for_new_input()
             decision = self._ports.state.schedule(context.repo)
             if row.planning_resume_plan_id:
                 if getattr(decision, 'active', None) is None:

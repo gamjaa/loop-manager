@@ -52,6 +52,56 @@ class DocumentProtocolTests(TestCase):
 
 
 class DocumentPhaseTests(ExecutionFixture, TestCase):
+    def test_new_execplan_conditions_do_not_create_document_assessment(self):
+        context = self.review_context()
+        current = self.handler._definition_snapshot
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        effects = self.document_effects()
+        self.state.update_project(self.repo, worker_session_id='saved-worker')
+        self.assertIsNone(documents.refresh(effects, self.state, checkpoints, self.handler._identity,
+            context, replace(current, body_hash='previous-condition'), current, [current.path]))
+        effects.run_agent.assert_not_called()
+        self.assertIsNone(documents.pending(checkpoints, self.repo, context.plan.plan_id))
+        self.assertEqual(self.state.row()['worker_session_id'], 'saved-worker')
+
+    def test_preserved_judgment_checks_candidate_without_recalling_planner(self):
+        context = self.review_context()
+        current = self.handler._definition_snapshot
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        effects = self.document_effects()
+        scope = effects.capture_scope.return_value
+        item = dict(version=1, stage='proposed', base='base', phase='REVIEWING',
+            paths=[current.path], document_only=True, previous=current.serialize(),
+            candidate='base', worker_snapshot=scope.serialize(), worker_result='saved',
+            assessment=dict(relevant=True, implementation='satisfied', plan_text=None, evidence='근거'))
+        documents.save(checkpoints, self.repo, context.plan.plan_id, item)
+        result = documents.refresh(effects, self.state, checkpoints, self.handler._identity,
+            context, current, current, [])
+        self.assertEqual(result['stage'], 'done')
+        effects.run_agent.assert_not_called()
+        effects.capture_scope.return_value = replace(scope, dirty={'app.py': (('worktree',), 'changed')})
+        with self.assertRaises(RecoveryFailure):
+            documents.refresh(effects, self.state, checkpoints, self.handler._identity,
+                context, current, current, [])
+
+    def test_unfinished_or_uncertain_assessment_keeps_audit_and_returns_to_revision_gate(self):
+        context = self.review_context()
+        current = self.handler._definition_snapshot
+        checkpoints = ExecutionCheckpointRepository(self.connection)
+        effects = self.document_effects()
+        for stage in ('assess', 'proposed'):
+            item = dict(version=1, stage=stage, base='base', phase='REVIEWING',
+                paths=[current.path], document_only=True, previous=current.serialize(),
+                candidate='base', worker_snapshot=effects.capture_scope.return_value.serialize(),
+                assessment=(dict(relevant=True, implementation='uncertain', plan_text=None,
+                                 evidence='기존 미확정 판단') if stage == 'proposed' else None))
+            documents.save(checkpoints, self.repo, context.plan.plan_id, item)
+            self.assertIsNone(documents.refresh(effects, self.state, checkpoints, self.handler._identity,
+                context, current, current, []))
+            self.assertIsNone(documents.pending(checkpoints, self.repo, context.plan.plan_id))
+            self.assertEqual(checkpoints.get(self.repo, context.plan.plan_id).snapshot['retired_document_assessment'], item)
+        effects.run_agent.assert_not_called()
+
     def test_owned_progress_commit_recovers_atomically_without_consuming_new_conditions(self):
         from loop_manager_internal.execution.execution_revision import advance_owned_record, ExecPlanBodyHash
         for mixed in (False, True):
@@ -112,121 +162,10 @@ class DocumentPhaseTests(ExecutionFixture, TestCase):
         effects.run_with_retries.side_effect = lambda call, session_id: call(session_id, False)
         return effects
 
-    def test_planner_uses_separate_workspace_and_preserves_worker_scope(self):
-        context = self.review_context()
-        current = self.handler._definition_snapshot
-        worker = GitSnapshot(head='base', branch='work', index={}, dirty={'app.py': (('worktree',), 'saved')},
-                             refs={}, worktrees={}, config={}, operations={})
-        self.state.update_project(self.repo, agent_role='worker', agent_snapshot=worker.serialize(),
-                                  agent_result_snapshot=worker.serialize(), worker_session_id='saved-worker')
-        saved = {key: self.state.row()[key] for key in
-                 ('agent_role', 'agent_snapshot', 'agent_result_snapshot', 'worker_session_id', 'worker_result', 'verify_result')}
-        effects = self.document_effects()
-        planner = replace(worker, branch=None, dirty={})
-        effects.capture_scope.side_effect = lambda root: worker if root == context.worktree else planner
-        checkpoints = ExecutionCheckpointRepository(self.connection)
-        result = documents.refresh(effects, self.state, checkpoints, self.handler._identity,
-                                   context, replace(current, body_hash='previous-body'), current, [current.path])
-        call = effects.run_agent.call_args
-        self.assertNotEqual(call.args[1], context.worktree)
-        self.assertEqual(call.args[4], 'planner')
-        self.assertIn('Worker 구현 revision은 base', call.args[5])
-        self.assertIn(str(context.worktree), call.args[5])
-        self.assertTrue(call.kwargs['read_only'])
-        self.assertFalse(call.kwargs['persist_session'])
-        self.assertEqual(result['planner_scope']['worktree'], str(call.args[1]))
-        self.assertEqual(result['planner_scope']['before'], planner.serialize())
-        self.assertEqual(result['planner_scope']['after'], planner.serialize())
-        self.assertEqual(result['worker_snapshot'], worker.serialize())
-        self.assertEqual({key: self.state.row()[key] for key in saved}, saved)
 
-    def test_worker_or_document_change_during_assessment_discards_judgment(self):
-        for mutation in ('head', 'dirty', 'index', 'remote'):
-            with self.subTest(mutation=mutation):
-                context = self.review_context()
-                current = self.handler._definition_snapshot
-                checkpoints = ExecutionCheckpointRepository(self.connection)
-                documents.save(checkpoints, self.repo, context.plan.plan_id, None)
-                effects = self.document_effects()
-                worker = effects.capture_scope.return_value
-                def run(*args, **kwargs):
-                    if mutation == 'remote':
-                        effects.git.side_effect = lambda root, *args, **kw: SimpleNamespace(returncode=0,
-                            stdout='changed' if args[-1] == 'origin/main' else 'base')
-                    else:
-                        changed = replace(worker, **{
-                            'head': {'head': 'changed'},
-                            'dirty': {'dirty': {'app.py': (('worktree',), 'changed')}},
-                            'index': {'index': {'app.py': ('H 100644 changed 0',)}}}[mutation])
-                        effects.capture_scope.side_effect = lambda root: changed if root == context.worktree else worker
-                    import loop_manager as lm
-                    return lm.AgentResult(0, 'DOCUMENT_RESULT: ' + json.dumps(dict(relevant=True,
-                        implementation='satisfied', plan_text=None, evidence='근거')))
-                effects.run_agent.side_effect = run
-                with self.assertRaises(RecoveryFailure):
-                    documents.refresh(effects, self.state, checkpoints, self.handler._identity,
-                                      context, replace(current, body_hash='previous-body'), current, [current.path])
-                self.assertEqual(documents.pending(checkpoints, self.repo, context.plan.plan_id)['stage'], 'rebase')
-                self.assertIsNone(documents.pending(checkpoints, self.repo, context.plan.plan_id)['assessment'])
-                effects.prepare_snapshot.assert_not_called()
 
-    def test_preserved_judgment_rechecks_worker_files_before_application(self):
-        context = self.review_context()
-        current = self.handler._definition_snapshot
-        checkpoints = ExecutionCheckpointRepository(self.connection)
-        effects = self.document_effects()
-        item = documents.refresh(effects, self.state, checkpoints, self.handler._identity,
-                                 context, replace(current, body_hash='previous-body'), current, [current.path])
-        effects.capture_scope.return_value = replace(effects.capture_scope.return_value,
-                                                     dirty={'app.py': (('worktree',), 'changed')})
-        for stage in ('proposed', 'done'):
-            with self.subTest(stage=stage):
-                documents.save(checkpoints, self.repo, context.plan.plan_id, {**item, 'stage': stage})
-                with self.assertRaises(RecoveryFailure):
-                    documents.refresh(effects, self.state, checkpoints, self.handler._identity,
-                                      context, current, current, [])
-                self.assertEqual(documents.pending(checkpoints, self.repo, context.plan.plan_id)['stage'], 'rebase')
 
-    def test_interrupted_planner_scope_is_checked_before_retry(self):
-        context = self.review_context()
-        current = self.handler._definition_snapshot
-        checkpoints = ExecutionCheckpointRepository(self.connection)
-        effects = self.document_effects()
-        effects.run_agent.side_effect = RuntimeError('중단')
-        with self.assertRaisesRegex(RuntimeError, '중단'):
-            documents.refresh(effects, self.state, checkpoints, self.handler._identity,
-                              context, replace(current, body_hash='previous-body'), current, [current.path])
-        saved = documents.pending(checkpoints, self.repo, context.plan.plan_id)
-        self.assertIsNone(saved['planner_scope']['after'])
-        worker = effects.capture_scope.return_value
-        changed = replace(worker, dirty={'app.py': (('worktree',), 'changed')})
-        effects.capture_scope.side_effect = lambda root: worker if root == context.worktree else changed
-        effects.run_agent.reset_mock()
-        with self.assertRaisesRegex(PlannerValidationError, '중단된 읽기 전용'):
-            documents.refresh(effects, self.state, checkpoints, self.handler._identity,
-                              context, current, current, [])
-        effects.run_agent.assert_not_called()
 
-    def test_adopted_work_branch_documents_keep_their_revision(self):
-        context = self.review_context()
-        current = self.handler._definition_snapshot
-        checkpoints = ExecutionCheckpointRepository(self.connection)
-        documents.save(checkpoints, self.repo, context.plan.plan_id, dict(version=1, stage='assess',
-            base='base', phase='REVIEWING', paths=['docs/ARCHITECTURE.md'], document_only=True,
-            previous=current.serialize(), assessment=None, work_branch=True, remote='worker-head',
-            worker_result='saved', verify_result=None, verify_base=None))
-        checkpoint = checkpoints.get(self.repo, context.plan.plan_id)
-        checkpoints.record(self.repo, context.plan.plan_id, expected_generation=checkpoint.generation,
-            operation=checkpoint.operation, expected_head=checkpoint.expected_head,
-            target_base_oid=checkpoint.target_base_oid, observed_remote_oid=checkpoint.observed_remote_oid,
-            snapshot={**checkpoint.snapshot, 'remote_adoption_scope': {'remote': 'worker-head'}})
-        effects = self.document_effects()
-        effects.capture_scope.return_value = replace(effects.capture_scope.return_value, head='worker-head')
-        effects.git.side_effect = lambda root, *args, **kw: SimpleNamespace(returncode=0,
-            stdout='base' if args[-1] == 'origin/main' else 'worker-head' if args[0] == 'rev-parse' else '')
-        documents.refresh(effects, self.state, checkpoints, self.handler._identity,
-                          context, current, current, [])
-        self.assertIn('git show worker-head:', effects.run_agent.call_args.args[5])
 
     def test_upper_specification_does_not_repeat_task_planning(self):
         context = self.review_context()
@@ -278,19 +217,6 @@ class DocumentPhaseTests(ExecutionFixture, TestCase):
         self.assertIsNone(item)
         effects.run_agent.assert_not_called()
 
-    def test_execution_assessment_cannot_propose_even_identical_plan_text(self):
-        context = self.review_context()
-        current = self.handler._definition_snapshot
-        output = 'DOCUMENT_RESULT: ' + json.dumps(dict(relevant=True, implementation='satisfied',
-            plan_text='same', evidence='현재 계획 문서는 최신 조건과 동일하다.'))
-        effects = self.document_effects(outputs=[output] * 3)
-        effects.prepare_snapshot.return_value = SimpleNamespace(by_id={'G-047': SimpleNamespace(text='same')})
-        with self.assertRaises(PlannerValidationError):
-            documents.refresh(effects, self.state, ExecutionCheckpointRepository(self.connection),
-                self.handler._identity, context, replace(current, body_hash='previous-body'), current, [current.path])
-        effects.validate_worktree.assert_called_once()
-        self.assertIn('document-assessments', str(effects.validate_worktree.call_args.args[1]))
-        self.assertEqual(effects.run_agent.call_count, 3)
 
     def test_actual_pr_discards_pre_pr_assessment_authority(self):
         checkpoints = self.changed_document('REVIEWING', 'satisfied')
@@ -302,30 +228,7 @@ class DocumentPhaseTests(ExecutionFixture, TestCase):
         self.assertIsNone(documents.pending(checkpoints, self.repo, 'G-047'))
         effects.run_agent.assert_not_called()
 
-    def test_invalid_protocol_retries_without_mutating_work_or_approving_verify(self):
-        context = self.review_context()
-        current = self.handler._definition_snapshot
-        effects = self.document_effects(outputs=['DOCUMENT_RESULT: {}'] * 3)
-        checkpoints = ExecutionCheckpointRepository(self.connection)
-        with self.assertRaises(PlannerValidationError):
-            documents.refresh(effects, self.state, checkpoints, self.handler._identity,
-                context, replace(current, body_hash='previous-body'), current, [current.path])
-        self.assertEqual(effects.run_agent.call_count, 3)
-        self.assertEqual(documents.pending(checkpoints, self.repo, 'G-047')['stage'], 'assess')
-        self.assertEqual(len(documents.pending(checkpoints, self.repo, 'G-047')['planner_scope_history']), 2)
-        self.assertEqual(self.state.row()['worker_result'], 'worker result')
-        self.assertEqual(self.state.row()['verify_result'], 'successful verify output')
 
-    def test_remote_race_keeps_proposal_and_code_invalidation(self):
-        from tests.support.revision import definition
-        old = dict(previous=definition().serialize(), paths=['docs/PRODUCT.md'], document_only=True,
-            base='old', assessment={'evidence': 'old'}, workspace='owned', commit='candidate')
-        item = documents.restart_assessment(old, 'new', ['app.py', 'docs/ARCHITECTURE.md'])
-        self.assertEqual(item['stage'], 'rebase')
-        self.assertFalse(item['document_only'])
-        self.assertIsNone(item['assessment'])
-        self.assertNotIn('workspace', item)
-        self.assertEqual(item['superseded'][0]['commit'], 'candidate')
 
     def test_work_branch_document_observation_does_not_grant_adoption(self):
         context = self.review_context()

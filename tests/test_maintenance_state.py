@@ -863,6 +863,25 @@ class MaintenanceTransactionTest(unittest.TestCase):
 
 
 class MaintenanceStateRepositoryTest(unittest.TestCase):
+    def test_zero_disables_automatic_cycles_preserves_count_and_allows_request(self):
+        connection = self._connection()
+        self.addCleanup(connection.close)
+        repository = maintenance_state.MaintenanceRepository(connection)
+        connection.execute("INSERT INTO maintenance_cycles (repo, file_assessment_start_merged_count) VALUES ('one', 0)")
+        for number in range(1, 22):
+            self._insert_plan(connection, 'one', f'G-{number:03d}', 'MERGED')
+        due = repository.file_assessment_due('one', 0, completion_candidate=True)
+        self.assertFalse(due.required)
+        self.assertEqual((due.reason, due.merged_since_baseline), ('disabled', 21))
+        self.assertTrue(repository.file_assessment_due('one', 20).required)
+        self.assertEqual(repository.get('one').file_assessment_start_merged_count, 0)
+        request_maintenance(connection, 'one')
+        self.assertEqual(repository.file_assessment_due('one', 0).reason, 'requested_full')
+        cycle, started = repository.begin_assessment_if_due('one', 0, 'a' * 40)
+        self.assertTrue(started)
+        self.assertEqual(cycle.cycle_request_id, 'test-request')
+        self.assertFalse(repository.begin_assessment_if_due('one', 0, 'a' * 40)[1])
+
     def test_first_run_counts_new_merges_without_fabricating_success_after_restart(self):
         connection = self._connection()
         self.addCleanup(connection.close)

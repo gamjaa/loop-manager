@@ -220,7 +220,9 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
                 9,
             )
 
-            for value in ("0", "-1", "1.5"):
+            configured.write_text("[loop]\nrefactoring_review_interval = 0\n", encoding="utf-8")
+            self.assertEqual(load_managed_config(configured).refactoring_review_interval, 0)
+            for value in ("-1", "1.5"):
                 with self.subTest(value=value):
                     invalid = root / f"invalid-{value}.ini"
                     invalid.write_text(
@@ -333,7 +335,7 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             state_dir = root / "state"
             invalid = root / "invalid.ini"
             invalid.write_text(
-                "[loop]\nrefactoring_review_interval = 0\n", encoding="utf-8"
+                "[loop]\nrefactoring_review_interval = -1\n", encoding="utf-8"
             )
             args = loop_manager.build_parser().parse_args(["init"])
 
@@ -349,7 +351,7 @@ class ManagedConfigurationAndProjectRegistryTest(unittest.TestCase):
             state_dir.mkdir()
             invalid = root / "invalid.ini"
             invalid.write_text(
-                "[loop]\nrefactoring_review_interval = 0\n", encoding="utf-8"
+                "[loop]\nrefactoring_review_interval = -1\n", encoding="utf-8"
             )
             with closing(loop_manager.connect_database(state_dir, create=True)) as connection, connection:
                 project_registry.add_project(connection, self._record())

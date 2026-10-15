@@ -1,5 +1,6 @@
 from tests.support.pr_recovery import PrRecoveryFixture, observe_live_pull_request
 import sqlite3
+import json
 import subprocess
 import tempfile
 import unittest
@@ -14,6 +15,20 @@ from tests.support.worker import dummy_worker_sessions
 
 @isolated_git_test
 class PrSourceSynchronizationTest(PrRecoveryFixture, unittest.TestCase):
+    def final_review_result(self, connection, repo):
+        from loop_manager_internal.storage import planning_review_state
+        attempt = planning_review_state.get(connection, str(repo), 'attempt')
+        if attempt is None or attempt['purpose'] != 'final':
+            return loop_manager.CodexResult(0, '', 'planner-session')
+        result = {key: attempt[key] for key in (
+            'revision', 'input_fingerprint', 'specification_fingerprint', 'work_cycle')}
+        paths = git_command(repo, 'ls-tree', '-r', '--name-only', attempt['revision']).splitlines()
+        result.update(outcome='fulfilled', reason='최종 전문 확인 fixture', evidence=[
+            path for path in paths if path in {'docs/PRODUCT.md', 'docs/ARCHITECTURE.md', 'src/app.py'}
+            or path.startswith('docs/requirements/') and path.count('/') == 2])
+        return loop_manager.CodexResult(0,
+            'FINAL_SPECIFICATION_REVIEW: ' + json.dumps(result), 'planner-session')
+
     @dummy_worker_sessions
     def test_merged_pr_fast_forwards_clean_source_after_durable_transition(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -58,7 +73,7 @@ class PrSourceSynchronizationTest(PrRecoveryFixture, unittest.TestCase):
                 "loop_manager.reconcile_execplan_catalog", side_effect=reconcile_catalog
             ), mock.patch("loop_manager.dispatch_execplan_archive_housekeeping"), mock.patch(
                 "loop_manager.run_codex",
-                return_value=loop_manager.CodexResult(0, "", "planner-session"),
+                side_effect=lambda *_args, **_kwargs: self.final_review_result(connection, repo),
             ) as planner:
                 result = loop_manager.run_project(
                     connection, state_dir, str(repo), Path("unused.ini"), "main", False
@@ -103,7 +118,7 @@ class PrSourceSynchronizationTest(PrRecoveryFixture, unittest.TestCase):
                 "loop_manager.reconcile_execplan_catalog", side_effect=reconcile_catalog
             ), mock.patch(
                 "loop_manager.run_codex",
-                return_value=loop_manager.CodexResult(0, "", "planner-session"),
+                side_effect=lambda *_args, **_kwargs: self.final_review_result(connection, repo),
             ) as planner:
                 result = loop_manager.run_project(
                     connection, state_dir, str(repo), Path("unused.ini"), "main", False
@@ -230,7 +245,7 @@ class PrSourceSynchronizationTest(PrRecoveryFixture, unittest.TestCase):
                 "loop_manager.ensure_safe_base_worktree", side_effect=synchronize
             ), mock.patch("loop_manager.dispatch_execplan_archive_housekeeping"), mock.patch(
                 "loop_manager.run_codex",
-                return_value=loop_manager.CodexResult(0, "", "planner-session"),
+                side_effect=lambda *_args, **_kwargs: self.final_review_result(connection, repo),
             ) as planner:
                 result = loop_manager.run_project(
                     connection, state_dir, str(repo), Path("unused.ini"), "main", False
@@ -244,7 +259,7 @@ class PrSourceSynchronizationTest(PrRecoveryFixture, unittest.TestCase):
             )
             self.assertEqual(git_command(repo, "rev-parse", "HEAD"), merged_head)
             self.assertTrue(second_worktree.exists())
-            planner.assert_called_once()
+            planner.assert_not_called()
 
     @dummy_worker_sessions
     def test_fetch_failure_after_merge_keeps_transition_for_source_resume(self):
@@ -292,7 +307,7 @@ class PrSourceSynchronizationTest(PrRecoveryFixture, unittest.TestCase):
                 "loop_manager.dispatch_execplan_archive_housekeeping"
             ), mock.patch(
                 "loop_manager.run_codex",
-                return_value=loop_manager.CodexResult(0, "", "planner-session"),
+                side_effect=lambda *_args, **_kwargs: self.final_review_result(connection, repo),
             ):
                 self.assertEqual(
                     loop_manager.run_project(
@@ -330,7 +345,7 @@ class PrSourceSynchronizationTest(PrRecoveryFixture, unittest.TestCase):
                 "loop_manager.pr_for_branch", return_value=merged
             ), mock.patch("loop_manager.dispatch_execplan_archive_housekeeping"), mock.patch(
                 "loop_manager.run_codex",
-                return_value=loop_manager.CodexResult(0, "", "planner-session"),
+                side_effect=lambda *_args, **_kwargs: self.final_review_result(connection, repo),
             ) as planner:
                 self.assertEqual(
                     loop_manager.run_project(

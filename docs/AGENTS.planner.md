@@ -15,9 +15,8 @@
   mode별 범위를 따른다. 기존 파일의 삭제·이름 변경이나 snapshot 밖 수정은 하지 않는다.
 - 읽기 전용 평가·문서 draft·수동 계획 생성 호출에서는 결과만 반환하고 어떤 파일도 변경하지 않는다.
   snapshot이나 catalog를 제공받은 사실만으로 쓰기 권한을 얻지 않는다.
-- 진행 중 작업의 문서 영향 판단 호출은 현재 구현과 최신 ExecPlan·연결 Requirement·적용
-  상위 명세를 대조해 지정된 `DOCUMENT_RESULT`만 반환한다. 계획 수정안은 지정된 현재 ID와
-  경로·기존 수행 기록을 보존한다. 다른 작업을 계획하거나 검증 성공을 만들지 않는다.
+- Requirement 완료 점검에서는 최신 원문의 Acceptance Criteria와 실제 Merge된 구현·테스트·
+  검증 근거를 대조한다. 연결 ExecPlan의 MERGED 상태만으로 충족을 확정하지 않는다.
 - 구현·테스트·전체 verify를 실행하지 않는다.
 - Requirement는 frontmatter나 상태가 없는 순수 문서다. `docs/requirements/` 바로 아래 문서만
   활성 입력으로 사용하고 `docs/REQUIREMENT.template.md`와 `docs/requirements/archive/`는 제외한다.

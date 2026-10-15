@@ -760,6 +760,8 @@ class ExecutionRecoveryScenarios:
     def _dispatch_conflict_revision(self, workspace_plan):
         # Exercise the real workspace metadata comparison, faking only Git and
         # file parsing. A constant validator result would hide stale metadata.
+        self.effects.agent.begin_agent_scope.return_value = lm.GitSnapshot(
+            'owned-head', 'loop-manager/G-047', {}, {}, {}, {}, {}, {})
         with mock.patch('loop_manager.capture_git_snapshot', return_value=lm.GitSnapshot(
                 'owned-head', 'loop-manager/G-047', {}, {}, {}, {}, {}, {})), mock.patch(
             'loop_manager.validate_agent_scope'

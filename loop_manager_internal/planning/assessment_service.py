@@ -212,19 +212,31 @@ class PlanningAssessmentService(PlanningService):
                         + '\n필요하면 이 후보를 읽기 전용으로 확인하고 이미 수행한 구현·기록을 보존하라. '
                           '그 작업 공간·Git·실행 이력은 수정하지 마라. 새 조건을 관련 ExecPlan에 반영하되 '
                           '후보 확인만으로 verify·Review 성공을 확정하지 마라.\n')
+                if hasattr(self._ports, "retirement"):
+                    run.retirement_pending = self._ports.retirement.pending(
+                        context.repo, context.repo_path, str(row.active_sha),
+                    )
                 if hasattr(self._ports.state, "planning_review"):
                     from loop_manager_internal.planning.specification_review import prepare_review
+                    requirement_only = bool(run.retirement_pending)
+                    if run.maintenance_cycle.phase not in {
+                            maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
+                            maintenance_state.MaintenancePhase.REFACTORING}:
+                        requirement_only = bool(requirement_only and row.planning_fingerprint
+                            and row.specification_fingerprint == run.specification_fingerprint
+                            and not getattr(self._ports.git, 'runtime_guidance_changed', lambda *_: False)(context.repo_path)
+                            and not self._ports.state.pending_document_approval(
+                                context.repo, context.repo_path, context.base_branch)
+                            and not getattr(self._ports.state, 'pending_user_decision', lambda *_: False)(
+                                context.repo, self._ports.git.plan_declarations(context.repo_path, str(row.active_sha))))
                     instruction, attempt = prepare_review(
                         self._ports.state, self._ports.git, context, str(row.active_sha),
-                        final_required=run.final_review_required,
+                        final_required=run.final_review_required, requirement_only=requirement_only,
                     )
                     prompt += instruction
                     self._ports.events.log(f"일반 planning 검토: purpose={attempt['purpose']}, revision={attempt['revision']}, 비교={attempt['comparison_revision']}, cycle={attempt['work_cycle']}")
                 if hasattr(self._ports, "retirement"):
                     from loop_manager_internal.planning.requirement_retirement import assessment_prompt
-                    run.retirement_pending = self._ports.retirement.pending(
-                        context.repo, context.repo_path, str(row.active_sha),
-                    )
                     prompt += assessment_prompt(run.retirement_pending)
                 check = getattr(self._ports.state, "planner_check", lambda _repo: None)(context.repo)
                 if check is not None and check["stage"] == "handoff":
@@ -581,6 +593,9 @@ class PlanningAssessmentService(PlanningService):
                     if attempt is not None:
                         if attempt["revision"] != row.active_sha or attempt["work_cycle"] != self._ports.state.review_work_cycle(context.repo):
                             raise PlanningResultInvalid("일반 planning 검토 입력이 변경됐습니다. 최신 입력을 다시 확인하세요.")
+                        if (attempt['purpose'] == 'requirement' and validated_result is not None
+                                and (validated_result.revisions or validated_result.deletions)):
+                            raise PlanningResultInvalid('Requirement 완료 점검은 진행 중인 다른 작업을 개정할 수 없습니다.')
                         outcome = (validate_final(attempt, str(row.planning_result or ""), validated_result,
                                    self._ports.git, context.repo_path,
                                    manager_source_validator=lambda path, plan:

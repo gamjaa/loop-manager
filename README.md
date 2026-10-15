@@ -82,6 +82,10 @@ Windows:
 
 아래 `python`은 설치한 `.venv`의 Python으로 실행한다. `--help`로 각 명령의 옵션을 확인할 수 있다.
 
+자동 유지보수 주기는 `config/config.ini`의 `[loop] refactoring_review_interval`로 설정한다.
+기본값은 새로 Merge된 작업 20개이며, `0`이면 자동 전환을 끈다. 이때도 아래 명령으로
+유지보수를 요청할 수 있고, 다음 안전한 경계에서 실행한다.
+
 | 목적 | 명령 |
 |---|---|
 | 프로젝트 검증 및 등록 | `python loop_manager.py add <project-path> [--base <branch>] [--provider <provider>]` |
@@ -90,6 +94,7 @@ Windows:
 | 스케줄러에서 중복 실행 건너뛰기 | `python loop_manager.py run --skip-if-running` |
 | 등록 목록 | `python loop_manager.py config list` |
 | 등록 해제 | `python loop_manager.py remove <project-path>` |
+| 다음 안전한 경계에서 유지보수 요청 | `python loop_manager.py maintenance-review <project-path>` |
 | 로컬 환경 수정 후 재검사 | `python loop_manager.py recover <project-path> [--plan G-001]` |
 | 기존 계획을 수동 구현 | `python loop_manager.py manual start <project-path> G-012` |
 | 수동 구현 제출 | [complete·submit 안내](docs/OPERATIONS.md#수동-구현과-제출) |
