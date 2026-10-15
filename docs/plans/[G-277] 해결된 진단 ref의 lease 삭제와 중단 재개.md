@@ -9,24 +9,11 @@ depends_on:
 complexity: high
 risk: high
 priority: normal
-draft: true
 ---
 
 ## Purpose
 
-해결 결과의 정상 원격 반영·원인 해소·자료 보존을 확인한 정확한 Manager 진단 ref만 lease로 삭제하고 중단 뒤 실제 원격과 대조해 재개한다. 원격 branch 자동 삭제 경계는 ARCHITECTURE의 사용자 판단 전에는 구현하지 않는다.
-
-## Draft Decision
-
-Question: R-083의 충돌 해결 진단 ref에 한해, 아래 원인별 사용·정상 branch 원격 반영·로컬 원문 복구·등록 origin·정확한 게시 OID lease 및 중단 복구 조건을 적용하는 Manager의 원격 ref 자동 삭제 경계를 승인하는가?
-Facts: 현행 ARCHITECTURE의 Repository Safety and Security는 원격 branch를 자동 삭제하지 않으며 Architecture Change Policy는 worktree·branch·commit·push·PR 경계 변경에 사용자 승인을 요구한다. 진단 코드는 생성·재사용만 수행한다. 기존 G-261 User Decision의 승인은 확인된 작업 문서 삭제에 따른 취소·완료 작업 자원 정리에 한정되어 충돌 해소 진단 ref의 수명까지 확대할 수 없다. R-083은 원하는 변경을 정의하지만 이 별도 경계의 승인 기록은 제공되지 않았다.
-Options: (A) R-083의 저장된 Manager 진단 ref에 한정된 자동 삭제를 아래 안전·보존·재개 조건으로 승인한다. (B) 원격 진단 보존을 유지하고 실제 삭제 도입은 보류한다. 대상이나 보존 조건을 바꾸려면 해당 Requirement에서 먼저 확정한다.
-Impact: A는 조건을 충족한 진단 ref를 PR Merge 전에도 정리하며 경쟁·보존 실패·사용 중·불확실한 대상은 남긴다. B에서는 정리 준비 근거 작업은 독립적으로 진행할 수 있으나 실제 자동 삭제 목표는 미충족으로 남는다. 결정 전 이 작업의 구현·Worker·workspace·branch·PR을 시작하지 않는다.
-
-## User Decision
-
-Decision: approve
-Answer: 선택지 A를 승인한다. R-083의 충돌 해결 진단 ref에 한해 Manager의 원격 ref 자동 삭제 경계를 도입한다. 원인 해소, 해결 결과의 정상 원격 반영, 다른 원인·진행 중 게시의 ref 사용 여부, 자료의 로컬 복구 가능성, 등록 origin·소유권과 저장된 게시 OID의 정확한 lease 및 중단 재개 조건을 모두 적용한다. PR Merge를 추가로 기다리지 않되 원래 작업·base·사용자·다른 작업의 branch는 변경하지 않는다. 경쟁·보존 실패·사용 중·불확실한 대상은 보존하며 이 승인으로 다른 gate나 정리 범위를 확대하지 않는다. 이 판단은 G-277의 원격 진단 ref 삭제 경계에 대한 승인이며 실제 구현·검증 완료를 뜻하지 않는다.
+R-083의 충돌 해결 진단 ref에 한해, 원인 해소·해결 결과의 정상 원격 반영·다른 원인과 진행 중 게시의 사용 종료·로컬 원문 복구 가능성을 확인한 뒤 저장된 게시 OID의 정확한 lease로 삭제한다. PR Merge는 추가로 기다리지 않으며 원래 작업·base·사용자·다른 작업 branch는 보존한다. 경쟁·보존 실패·사용 중·불확실한 대상은 남기고, 중단 뒤 실제 원격과 저장 근거를 대조해 재개한다. 확인된 사용자 결정의 범위를 구현하며 draft 정리·대기 해제와 게시 확정은 Manager가 검증한다.
 
 ## Acceptance Criteria
 
@@ -40,7 +27,7 @@ Answer: 선택지 A를 승인한다. R-083의 충돌 해결 진단 ref에 한해
 
 ## Implementation
 
-- [ ] 승인 후 선행 작업의 ref별 근거를 소비하는 정리 handler를 Manager의 안전한 실행 경계에 연결한다. `loop_manager_internal/recovery/project_blocked_recovery.py`, `checkpoint_service.py`, `bindings.py`의 원인별 복구/보존 경계와 PR 대기 중 관측을 재사용하며 실패를 최종 차단 handler로 전파하지 않는다.
+- [ ] 선행 작업의 ref별 근거를 소비하는 정리 handler를 위 Purpose의 범위에서 Manager의 안전한 실행 경계에 연결한다. `loop_manager_internal/recovery/project_blocked_recovery.py`, `checkpoint_service.py`, `bindings.py`의 원인별 복구/보존 경계와 PR 대기 중 관측을 재사용하며 실패를 최종 차단 handler로 전파하지 않는다.
 - [ ] `loop_manager_internal/recovery/checkpoint_adapter.py`의 등록 origin 검증·원격 응답 검사·고정 push 대상과 `loop_manager_internal/git/manager_git_journal.py`의 정확한 lease를 재사용한다. 현재 생성 전용 helper의 의미를 일반 삭제로 바꾸지 않고 진단 정리 대상 검증과 삭제 효과를 분리한다. hook·tracking ref·다른 ref 보호와 기존 자원 조율을 유지한다.
 - [ ] `loop_manager_internal/storage/blocked_checkpoint_state.py`의 게시 성공 기록과 보존 감사를 유지하면서 삭제 intent·기대 OID·관측 결과·미확정/완료·재평가 사유를 같은 기존 저장 책임에 둔다. 원격 효과와 SQLite 확정을 원자 작업으로 가정하지 않는다.
 - [ ] `loop_manager_internal/recovery/diagnostic_preservation.py`와 `project_blocked_recovery.py`의 과거 intent 재사용을 정리 결과와 대조한다. 이미 정리된 ref의 재생성을 막고 새 원인의 보존은 유지한다. 부족한 과거 근거를 보충하려고 원격 namespace를 일괄 채택하지 않는다.
@@ -63,6 +50,7 @@ Answer: 선택지 A를 승인한다. R-083의 충돌 해결 진단 ref에 한해
 
 ## Decision Log
 
+- 질문 해소 검토: 제공된 verified 사용자 변경 `d7a199007b8f7959611d5f7e7fbe7a070f24f5f1`의 새 Answer는 R-083의 대상·원인별 사용 종료·정상 원격 반영·로컬 복구·등록 origin/소유권·저장 OID lease·중단 재개를 모두 선택한다. PR Merge 대기 제외와 불확실한 대상 보존도 명시해 기존 질문 전체를 해소한다. 이를 위 Purpose와 Implementation에 통합했고 실제 ref 삭제·검증은 미완료로 유지한다. 최신 Architecture Change Policy도 이 승인 범위를 반복 승인 대상으로 만들지 않는다. Draft Decision·User Decision·draft 표시는 Manager의 출처·현재 입력·게시 검증을 위해 원문 그대로 남긴다.
 - R-083의 목표를 원격 삭제 없이 완료로 처리하지 않는다. 원인/자료 준비와 실제 삭제를 나누어 독립 작업은 진행한다. 2026-10-16의 사용자 요청으로 선택지 A가 승인됐으며, 문서의 draft 표시와 저장된 대기는 사용자 출처·질문 해소를 검증하는 기존 Manager 전환에서 정리한다. 이 승인으로 구현·검증 성공이나 다른 범위의 승인을 만들지 않는다.
 - complexity high: ref 사용·원인 해소·실제 게시의 최신 근거를 삭제 직전 경쟁 및 Git/SQLite 사이 중단에 결합하고 과거 intent 재생 방지까지 지켜야 한다.
 - risk high: 잘못된 삭제는 사용 중 원격 진단이나 경쟁 commit의 복구 경로를 잃게 한다. 검증한 로컬 원문/감사·정확한 게시 OID lease·자원 조율·미확정 보존으로 복구 가능성을 유지한다. 실제 ref 복원은 보존본과 감사에 따른 수동 복구이며 코드 rollback으로 대체하지 않는다. 위 경쟁·자료 손상·중단 사례에서 보존을 확인한다.

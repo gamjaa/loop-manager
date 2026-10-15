@@ -35,7 +35,7 @@ scripts/verify.ps1의 기존 초기 환경 저장·checkout 이동·temp 생성�
 
 - Worker는 test_platform_compatibility.py·verify launcher/manager adapter fixture의 최소 targeted case로 미지정/절대/상대·공백 경로, 생성/사용 실패, 원래 env 부재/값·인코딩/cwd 및 공유 marker 보존을 검사한다. 부분/전체 실행과 부분 선정 FALLBACK에서도 같은 경로 적용·환경 복원을 확인하며 경로 오류를 선정 fallback으로 숨기지 않는다. 정책 조합은 명령/OS 관측 mock으로 확인한다.
 - 기존 launcher의 실제 interpreter 연결 회귀를 확장해 Windows 단독/Manager에서 Python tempfile.gettempdir와 진단의 최종 절대 경로가 같은지 확인한다. 실제 PowerShell/Windows가 없는 환경의 mock을 플랫폼 검증 성공으로 기록하지 않는다.
-- Manager 전체 verify는 venv 선택·프로토콜/timeout·실패 exit code·guard/자식 환경·전체 필수 범위를 유지한다. Windows의 실제 선택 파일시스템 자료를 남기고 R-065의 같은 PC·코드·범위 Windows/WSL 순차 비교 조건을 따른다. 경로 변경 자체로 절감량이나 환경 원인을 확정하지 않는다.
+- Windows 개발 환경의 Manager 전체 verify·대규모 Git/CLI 통합은 AGENTS.md의 실행별 `/tmp/` 복사본·임시 환경 변수·종료 후 정리 기준으로 WSL에서 수행하며 venv 선택·프로토콜/timeout·실패 exit code·guard/자식 환경·전체 필수 범위를 유지한다. Windows native에서는 위 최소 launcher/Python 연결 회귀로 실제 선택 파일시스템·환경 복원 자료를 남기고 R-065의 같은 PC·코드·범위 Windows/WSL 순차 비교 조건을 따른다. WSL 전체 PASS와 native 핵심 회귀 결과를 구분하며 이 조합을 Windows 전체 verify PASS로 표시하지 않는다. 경로 변경 자체로 절감량이나 환경 원인을 확정하지 않는다.
 
 ## Progress
 
@@ -44,6 +44,8 @@ scripts/verify.ps1의 기존 초기 환경 저장·checkout 이동·temp 생성�
 - [ ] Manager 전체 verify·실제 Windows 연결·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- 현재 AGENTS.md의 WSL 전체 검증·최소 Windows native 회귀 구분을 적용한다. `verify.ps1`의 native 진입점과 이 작업의 명시적 임시 경로 선택 목표는 유지하며 WSL 자동 전환·플랫폼별 검증 범위 선정 기능을 도입하지 않는다.
 
 - 현재 verify.ps1은 기존 TEMP와 무관하게 사용자 프로필 기본 경로로 덮어쓴다. 환경 복원·공유 루트 보존은 이미 있으므로 재구현하지 않고 선택 입력·실효 경로 진단과 실패 조건만 보완한다.
 - complexity medium: launcher의 경로/예외·환경 복원과 실제 Python/Manager 진단 연결이 명확한 책임이다. risk low: 선택 오류는 자체 검증 실패/임시 위치 설명에 한정하며 원본 env·공유 파일을 보존하고 입력 수정·재실행으로 복구한다. priority normal이다.

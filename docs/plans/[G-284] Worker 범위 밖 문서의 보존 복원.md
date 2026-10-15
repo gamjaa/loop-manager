@@ -8,16 +8,15 @@ depends_on: []
 complexity: medium
 risk: critical
 priority: high
-draft: true
 ---
 
 ## Purpose
 
-R-082의 후속 복원 목표에 따라, Worker가 직접 변경했다고 확인한 다른 ExecPlan과 모든 Requirement의 범위 밖 변경을 원문 보존 뒤 해당 파일·index entry에서만 제거한다. 현재 모든 Requirement 변경 거부·원본 브랜치 유입 제외·선택 frontmatter 부분 복원은 이미 구현됐다. 새 작업은 다른 문서에 대한 경로별 복원·중단 재개·동일 Worker 문맥의 보고 갱신에 한정한다. 이 Manager Git 쓰기 경계는 ARCHITECTURE의 승인 정책에 해당하므로 사용자 결정 전에는 구현하지 않는다.
+R-082의 후속 복원 목표와 확인된 사용자 결정에 따라, 종료한 Worker가 직접 변경했다고 확인한 다른 ExecPlan과 활성·archive Requirement의 범위 밖 변경을 원문 보존 뒤 해당 파일·index entry에서만 제거한다. 이미 구현된 선택 frontmatter 복원, rebase 문서의 보존·경로별 적용, checkpoint와 Worker 피드백을 재사용해 중단 재개와 동일 Worker 문맥의 최종 diff·보고 갱신을 연결한다. 코드·테스트·선택 ExecPlan 본문과 나머지 파일/index·HEAD·branch·session·실행 및 실패 이력은 유지하며 전체 baseline을 일괄 복원하지 않는다. 사전 수정·동시 편집·변경 주체 또는 소유권이 불확실한 경로는 남긴다. draft 정리·대기 해제와 게시 확정은 Manager가 검증한다.
 
 ## Acceptance Criteria
 
-- 사용자 승인 후 선택된 소유 구현 worktree에서만 수행한다. Worker와 관련 writer의 종료, 현재 repository·작업·branch·worktree 및 미완료 Git operation·checkpoint 소유권을 확인한다. 진행 중 rebase나 writer 종료 불명·대상 연결 불명확은 덮어쓰지 않고 현재 근거와 작업물을 보존한다.
+- 선택된 소유 구현 worktree에서만 수행한다. Worker와 관련 writer의 종료, 현재 repository·작업·branch·worktree 및 미완료 Git operation·checkpoint 소유권을 확인한다. 진행 중 rebase나 writer 종료 불명·대상 연결 불명확은 덮어쓰지 않고 현재 근거와 작업물을 보존한다.
 - 원본 브랜치에서 rebase로 유입된 문서와 실제 Worker 변경을 구분한다. 현재 `validate_worker_workspace_scope()`의 관측 origin OID·후보 공통 조상과 호출 전후 형상을 함께 사용하며, 경로 차이나 과거 snapshot 차이만으로 변경 주체를 확정하지 않는다. 호출 전부터 있던 수정, 동시 외부 수정, 원문·mode·index 또는 변경 주체를 확정할 수 없는 경로는 복원하지 않는다. 원본 부재·조회 실패는 변경 없음이나 복원 권한으로 바꾸지 않는다.
 - 실제 Worker 변경으로 확인한 다른 ExecPlan·활성 및 archive Requirement의 수정·삭제·추가·rename·이동은 대상 양쪽 경로와 부재 여부까지 검증한다. 복원 전에 대상 경로·작업/호출 identity·고정 기준 revision·변경 이유와 확보한 변경 원문·mode·index entry를 소유 checkpoint에 보존한다. 보존 실패나 경로 별칭·symlink·다른 소유 파일과의 충돌에서는 쓰지 않는다. 새 파일 제거도 호출 전 부재와 Worker 생성이 증명된 경로에 한정하며 원문을 먼저 보존한다.
 - 복원은 확인한 파일과 index entry만 대상으로 한다. 선택된 ExecPlan 본문·구현·테스트·나머지 파일과 index·HEAD·branch·session·실행/실패 이력은 유지한다. 전체 reset·clean·checkout·stash나 과거 Git baseline 일괄 복원을 도입하지 않는다. 기존 Manager의 rebase 문서 채택·Requirement archive와 선택 frontmatter 부분 복원을 이 복원으로 대체하지 않는다.
@@ -47,20 +46,9 @@ R-082의 후속 복원 목표에 따라, Worker가 직접 변경했다고 확인
 - [ ] 최소 targeted unit·기존 Git 효과 회귀·Worker 보고 갱신 검증
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
-## Draft Decision
-
-Question: R-082의 다른 ExecPlan·모든 Requirement에 한해, 종료한 Worker의 직접 변경과 원문·현재 소유권을 증명한 경로만 보존한 뒤 파일·index entry를 복원하고 동일 Worker 문맥으로 이어가는 Manager의 자동 쓰기 경계를 승인하는가?
-Facts: R-082는 다른 범위 밖 문서의 파일·index 복원을 후속 목표로 명시했다. 현재 구현은 모든 Requirement 거부·원본 유입 제외와 선택 frontmatter 부분 복원만 수행하며 다른 문서는 범위 오류로 남긴다. ARCHITECTURE의 Architecture Change Policy는 worktree·branch·commit·push·PR 생성 경계 변경에 사용자 승인을 요구한다. 기존 frontmatter 부분 복원은 index를 변경하지 않으며 rebase 문서 채택은 소유 rebase 안의 별도 경계다. 제공된 문맥에는 정상 Worker 결과의 다른 파일·index 자동 복원에 대한 별도 승인 기록이 없다.
-Options: (A) 위 원문 보존·Writer 종료·변경 주체/소유권 확인·경로별 적용·중단 재개 조건을 지키는 Manager 복원을 승인한다. (B) 실제 파일·index 복원을 보류하고 현재 범위 오류·자료 보존을 유지한다. 대상이나 보존 조건의 변경은 사용자 Requirement에서 먼저 확정한다.
-Impact: A는 확인한 범위 오류만 복원 뒤 같은 Worker의 보고 갱신으로 이어가며 사용자 변경·불확실한 대상과 독립 실패를 보존한다. B는 복원 목표를 미충족으로 남긴다. 결정 전에는 이 작업과 의존 작업의 구현·Worker·workspace·branch·PR을 시작하지 않고 독립 계획은 계속 처리한다.
-
-## User Decision
-
-Decision: approve
-Answer: 선택지 A를 승인한다. 종료한 Worker가 직접 변경한 것으로 확인된 다른 ExecPlan과 활성·archive Requirement에 한해, 변경 원문과 복원 근거를 보존한 뒤 해당 파일·index entry만 복원한다. 기존 선택 frontmatter 복원과 rebase 문서의 보존·경로별 적용, checkpoint·Worker 피드백 구성요소를 재사용한다. 코드·테스트와 선택된 ExecPlan 본문, 나머지 파일·index·HEAD·branch·session·실행 및 실패 이력은 보존한다. 전체 baseline 일괄 복원은 하지 않는다. 사전 수정·동시 편집·변경 주체나 소유권이 불확실한 대상은 덮어쓰지 않으며 기존 writer 종료·원문 보존·경로별 적용·중단 재개 조건을 모두 지킨다. 복원 완료 뒤 같은 Worker 문맥으로 최종 diff와 문서 보고를 갱신한다. 이 승인은 G-284의 제한된 Manager 복원 경계에 한하며 구현·검증 성공이나 Worker의 Requirement 수정 권한을 뜻하지 않는다.
-
 ## Decision Log
 
+- 질문 해소 검토: 제공된 verified 사용자 변경 `d7a199007b8f7959611d5f7e7fbe7a070f24f5f1`의 새 Answer는 종료한 Worker의 직접 변경·원문 및 복원 근거 보존·경로별 파일/index 복원·동일 Worker 보고 갱신을 승인한다. 기존 복원/checkpoint/피드백 재사용과 코드·테스트·선택 본문·나머지 상태 보존, 일괄 baseline 복원 금지 및 불확실한 경로 보존을 명시해 기존 질문 전체를 해소한다. 이를 Purpose·Acceptance Criteria에 통합했으며 구현·검증 성공이나 Worker의 Requirement 수정 권한을 만들지 않는다. 최신 Architecture Change Policy와도 범위가 일치한다. Draft Decision·User Decision·draft 표시는 Manager 검증·게시 전환을 위해 원문 그대로 보존한다.
 - 최신 delta 기준은 efc71a72f4e2ce152c9c4355e6d08bdc4ee242ac이며 보존된 58814a9afa875bf5c440d610afe4e58725826921 이후 변경을 추가 확인했다. R-082의 신규 복원 절과 AC, scope adapter·Worker handler·frontmatter helper·checkpoint·직접 회귀를 대조했다. 현재 callback은 선택 frontmatter만 복원하고 다른 Requirement/ExecPlan은 `validate_agent_scope()`에서 거부한다. 기존 catalog의 지침 정합화·commit 기록 복구·ignored 통합 보호·차단 전수 감사는 이 정상 경로의 선택 파일/index 복원을 구현하지 않는다.
 - complexity medium: 경로·원문/index 보존·checkpoint CAS·Worker 피드백의 기존 경계와 helper를 재사용한다. 다만 변경 주체 판정·원본 유입·경로별 적용·중단 재개를 연결해야 하므로 단일 문구 교정으로 완료할 수 없다. risk critical: 오판한 파일 제거·index 복원이 Git에 없는 사용자 원문을 잃게 할 수 있어 적용 전 보존·경쟁 거부·실제 선택 효과의 회귀가 필요하다. 최초 Worker level은 4이며 Model/Effort는 Manager 설정을 따른다. priority high는 반복적인 범위 오류·사용자 복구를 줄이면서 사용자 작업 보존을 지키는 목표다.
 - 2026-10-16 사용자가 선택지 A를 승인하고 기존 복원 기능 재사용·코드와 선택된 ExecPlan 본문 보존을 명시했다. 위 User Decision은 이 요청을 기록한 것이며, draft 표시와 저장된 대기는 사용자 출처·질문 해소를 검증하는 기존 Manager 전환에서 정리한다. 구현·테스트·verify 성공이나 다른 범위의 승인을 만들지 않으며 G-206의 보존 후보·실행 기록과 Requirement archive·최종 제품 전문 확인 결과를 변경하지 않는다.

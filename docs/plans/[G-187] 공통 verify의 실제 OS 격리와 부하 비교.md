@@ -35,7 +35,7 @@ priority: normal
 - Windows·Linux의 실제 공통 프로세스/예약 경계와 지원되는 두 언어 예제에서 auto와 1이 같은 수집·테스트/compile 범위를 수행한다. Python은 선언한 프로젝트 interpreter를 사용하고 Perl native 실행은 현재 VERIFY의 Linux/Perl 5.38.2·Test::More 1.302194·TAP::Parser 3.44 범위에서 확인한다. Windows에는 Python 실제 실행과 플랫폼 독립 Perl 계약/IPC 회귀를 유지하며 이 결과를 Windows native Perl 지원으로 표시하지 않는다. 고부하 대기·동시 두 프로젝트·새 작업 진입에서 실제 관측과 미반영 예약을 함께 계산한다.
 - R-086이 지원하는 자체 unittest 부분 실행에서도 기존 자식/예약 격리·timeout·취소·종료 불명 보호를 확인한다. 부분 실행의 미선택 상태와 실행 없는 fallback을 전체 필수 검증 완료와 구분하며 Python/비Python의 기존 전체 적합성 범위는 유지한다.
 - timeout·취소·시작/통신/결과 오류·강제 종료에서 해당 자식 종료와 예약 해제를 확인한다. 종료 미확인 예약은 함부로 풀지 않고 다른 프로젝트의 자식/예약/작업을 변경하지 않는다.
-- 동일 revision·도구 버전·부하 조건에서 병렬도 설정·실제 worker 수를 기록하고 직렬/auto 실제 전체 verify 시간을 비교한다. 부분 실행 자료는 같은 mode·실제 선택 집합끼리 별도로 비교하며 전체/부분 시간을 같은 범위의 병렬 성능으로 해석하지 않는다. 테스트/fixture/정리·자원 대기·개별 누적과 전체 경과를 구분하며 미측정 속도 개선을 주장하지 않는다.
+- 동일 revision·도구 버전·부하 조건에서 병렬도 설정·실제 worker 수를 기록하고 같은 환경의 직렬/auto 실제 전체 verify 시간을 비교한다. Windows 개발 환경의 자체 전체 verify는 WSL에서 수행하고 Windows native는 관련 최소 회귀로 확인한다. Windows/WSL 비용 비교는 같은 PC·코드·검증 범위의 대상만 순차 측정해 WSL 전체 검증 자료와 구분한다. 부분 실행 자료는 같은 mode·실제 선택 집합끼리 별도로 비교하며 전체/부분 시간을 같은 범위의 병렬 성능으로 해석하지 않는다. 테스트/fixture/정리·자원 대기·개별 누적과 전체 경과를 구분하며 미측정 속도 개선을 주장하지 않는다.
 - Worker는 좁은 관련 unit case만 실행하고 전체 실제 OS/언어 검증·성능 비교는 Manager가 Agent 밖에서 실행한다. 미실행 플랫폼/미완료 결과를 성공으로 표시하지 않는다.
 
 ## Implementation
@@ -50,7 +50,7 @@ priority: normal
 ## Validation
 
 - Worker는 resource reservation·process cleanup·diagnostic aggregation에서 변경한 경계의 최소 unit case만 실행한다. `tests/test_verify_runtime.py`·`test_verify_contract.py`·`test_verify_perl_adapter.py`의 기존 fixture를 재사용하고 결과 확인/배정 진단은 G-248, Windows 부하 관측은 G-249의 목표와 중복하지 않는다.
-- Manager의 실제 실행에서 Windows·Linux timeout/취소·시작 실패·강제 종료 뒤 해당 자식/예약만 정리하고 다른 실행을 보존하는지 확인한다. Linux Perl reporter·테스트 자식의 부분 NDJSON/TAP spool과 suite 미완료, Windows 공통 Job 종료 불명·예약 보존을 실제 효과에 연결한다. `tests/test_verify_language_examples.py`의 통합 회귀는 Manager 전용이며 Worker targeted command에 넣지 않는다.
+- Manager의 실제 실행에서 Windows·Linux timeout/취소·시작 실패·강제 종료 뒤 해당 자식/예약만 정리하고 다른 실행을 보존하는지 확인한다. Linux Perl reporter·테스트 자식의 부분 NDJSON/TAP spool과 suite 미완료, Windows 공통 Job 종료 불명·예약 보존을 실제 효과에 연결한다. Windows native는 이 효과를 확인할 최소 실행과 경로·인자·중첩 Python guard 회귀로 한정하고 자체 전체 verify·대규모 Git/CLI 통합은 WSL에서 수행한다. `tests/test_verify_language_examples.py`의 통합 회귀는 Manager 전용이며 Worker targeted command에 넣지 않는다. WSL 실행은 AGENTS.md의 실행별 `/tmp/` 복사본·유효한 Git 메타데이터·임시 환경 변수·종료 후 정리 기준을 따른다. WSL 전체 PASS와 Windows 핵심 회귀를 Windows 전체 verify PASS로 합치지 않는다.
 - 동일 revision·도구/환경·수집/fixture/필수 compile·계측으로 직렬/auto 및 단일/동시 자료를 비교한다. 두 언어 결과·부분 FALLBACK/NOT_SELECTED·비교 범위·실제 자식 종료를 대조하며 미실행 플랫폼은 한계와 잔여 필수 확인으로 남긴다. 해당 자료 없이 R-065/R-067의 실측 완료를 선언하지 않는다.
 
 ## Progress
@@ -61,6 +61,8 @@ priority: normal
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
 
 ## Decision Log
+
+- Windows의 실제 자식·예약 격리 목표는 유지하되 자체 검증의 실행 환경은 현재 AGENTS.md를 따른다. 새 argv guard와 플랫폼 mock 교정, 대표 복구 이후 게시 회귀는 원격 코드·테스트에 직접 반영돼 재구현하지 않는다. 이 근거만으로 실제 Windows 격리·동시 부하·성능 확인을 완료하지 않으며 `verify.ps1`에 WSL 전환이나 native 검사 선정 기능을 추가하지 않는다.
 
 - 변경 비교에서 선행 adapter 계획의 archive-only 이동은 같은 ID의 완료/조회 호환 경계로 취급한다. 기존 dependency는 보존하고 확인한 실제 Perl 코드·테스트와 두 예제를 구현 근거로 사용한다. Windows/Linux 공통 프로세스 안전과 현재 Linux 전용 native Perl 근거를 대조하며 Windows Perl 지원 확대를 이 검증 작업에 끼워 넣지 않는다. 실제 OS/동시 부하·성능 목표는 미충족으로 유지하고 검증 성공은 합성하지 않는다.
 

@@ -50,7 +50,7 @@ priority: normal
 ## Validation
 
 - targeted unit test로 준비 성공/실패·공백 경로·작업 문서·verify 환경별 명령·전체 내용과 모델 호출 부재를 확인한다. 고정 샘플로 실제 복사 스크립트의 전용 Skill 제외·Specification 파일 보존·충돌 거부를 검사한다. Manager가 없는 복사 대상에서 ID 조회와 활성/archive 존재 여부·활성 제목/경로/기존 Summary 조회를 실행해 독립 배포를 확인한다.
-- `tests/test_manual_work.py`·`tests/support/manual_work.py`의 start 준비·출력 fixture를 재사용해 복사용 프롬프트에는 프로젝트 재검증·push 지시가 있고 PR 생성·Manager 명령 실행 지시는 없으며, 별도 출력에 정확한 repository·G ID의 complete 명령이 있는지 최소 unit case로 검사한다. 준비 실패·미완료에는 준비 완료용 프롬프트가 없어야 한다. 생략 안내 출력을 바꾸면 사용자가 선택한 옵션·필수 전체 expected SHA·선택적 사유를 구분하는 case를 추가하고, 실제 옵션의 사유 생략/빈 값/공백 수락·reason 단독 거부는 G-254의 회귀를 재사용한다. 새 Skill prose 검사나 실제 Manager 실행은 추가하지 않는다.
+- `tests/test_manual_work.py`·`tests/support/manual_work.py`의 start 준비·출력 fixture와 분리된 공통 `tests/support/manual_work_case.py`를 재사용해 복사용 프롬프트에는 프로젝트 재검증·push 지시가 있고 PR 생성·Manager 명령 실행 지시는 없으며, 별도 출력에 정확한 repository·G ID의 complete 명령이 있는지 최소 unit case로 검사한다. 준비 실패·미완료에는 준비 완료용 프롬프트가 없어야 한다. 생략 안내 출력을 바꾸면 사용자가 선택한 옵션·필수 전체 expected SHA·선택적 사유를 구분하는 case를 추가하고, 실제 옵션의 사유 생략/빈 값/공백 수락·reason 단독 거부는 G-254의 회귀를 재사용한다. 새 Skill prose 검사나 실제 Manager 실행은 추가하지 않는다.
 - `tests/test_tiered_commands.py`의 요청 저장·미등록 거부 fixture를 재사용한다. 출력이나 도움말을 바꾸면 해당 최소 case에서 요청 저장 성공과 실행 미호출을 확인한다. 설정 0·양수 전환의 기존 `tests/test_managed_configuration.py`·`tests/test_maintenance_state.py`·`tests/test_tiered_review.py`를 새로 복제하지 않으며, Skill prose의 내용은 실제 CLI 계약과 읽기 전용으로 대조한다.
 - 전체 verify는 기존 수동 준비·배포·새 CLI 회귀를 유지한다. 사용자 문서·Skill 원본의 정책 문구를 테스트로 고정하지 않고 실제 출력/복사 동작을 검증한다.
 

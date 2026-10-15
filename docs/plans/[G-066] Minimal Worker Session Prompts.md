@@ -5,6 +5,7 @@ sources:
   - docs/PRODUCT.md
   - docs/requirements/[R-033] Minimal Worker Session Prompts.md
   - docs/requirements/[R-064] 모델 호출을 통한 공통 Agent 지침 전달.md
+  - docs/requirements/[R-061] Agent 역할·문서 권한과 draft ExecPlan 사용자 판단.md
   - docs/requirements/[R-066] AGENTS 변경 사전 승인.md
   - docs/requirements/[R-082] 단계별 원격 문서 반영과 PR 전 ExecPlan 갱신.md
 depends_on:
@@ -94,7 +95,8 @@ priority: low
 
 ## Decision Log
 
-- 2026-10-16 사용자 요청에 따른 정합화: R-061의 역할 표·문서 수정·Acceptance Criteria가 R-082의 선택 ExecPlan 본문 허용·모든 Requirement 및 다른 ExecPlan 변경 금지와 일치하고 현재 Worker 지침·범위 검사도 같은 제한을 적용함을 확인했다. 별도 미충족 목표가 없는 G-281 draft와 그 선행 dependency를 제거한다. 이 계획의 초기/delta/fallback 전달·회귀 목표와 기존 기록은 유지하며, 문서 정리를 G-281의 실행·검증·Merge 성공으로 기록하지 않는다.
+- 삭제 목표 복구: 제공된 과거 revision `a285186a04ba87ffd504f61fc03580d8beefd38e`의 G-281 원문과 현재 부재를 구분해 확인했다. 최신 R-061의 역할 표·문서 수정·Acceptance Criteria는 R-082 및 현재 Worker instruction·범위 검사와 일치한다. 남아 있던 사용자 명세 정합화는 직접 반영됐으므로 별도 선행 구현이 필요하지 않다. 이 계획은 해당 제한을 고정 instruction에서 검증하는 초기/delta/fallback 전달·회귀 목표와 기존 기록을 유지한다. 아래 과거 G-281 대기 기록은 당시 근거이며 현재 실행 선행 조건이 아니다. 삭제 작업을 복원하거나 MERGED로 간주하지 않는다.
+DEPENDENCY_RECOVERY: {"deleted_id":"G-281","outcome":"obsolete","replacement_ids":[],"sources":["docs/PRODUCT.md","docs/requirements/[R-061] Agent 역할·문서 권한과 draft ExecPlan 사용자 판단.md","docs/requirements/[R-064] 모델 호출을 통한 공통 Agent 지침 전달.md","docs/requirements/[R-082] 단계별 원격 문서 반영과 PR 전 ExecPlan 갱신.md"],"reason":"G-281의 남은 목표였던 R-061의 Worker 문서 권한 정합화가 최신 원격 명세에 직접 반영됐고 현재 instruction·결과 검사도 같은 제한을 적용한다. G-066의 최소 prompt와 권한 보존 회귀는 그대로 남기며 별도 대체 구현이나 Merge 성공을 만들지 않는다."}
 
 - 2026-10-14 efc71a72f4e2ce152c9c4355e6d08bdc4ee242ac 재평가: 직접 구현된 모든 Requirement 변경 금지·관련 PRODUCT/ARCHITECTURE/FUTURE_IDEAS 허용과 선택 frontmatter 부분 복원 후 보고 갱신을 기존 초기/delta/fallback 전달·회귀에 반영했다. 지침 원본 수정은 이미 반영돼 재구현하지 않는다. G-281의 남은 R-061 명세 상충·사용자 문서 반영 대기와 기존 dependency를 보존하며 권한 예외·복원 구현·새 검증 성공을 만들지 않는다.
 - 2026-10-14 Worker 문서 권한 delta: 직접 반영된 사용자 prompt·다른 ExecPlan 결과 거부·선언 필드 진단을 재구현하지 않는다. 고정 Worker 원본의 새 제한 정합화를 선행 dependency로 연결해 정적 문구를 제거할 때 권한 설명이 사라지지 않게 한다. 과거 묶음을 최신 지침으로 교체하지 않으며 기존 초기/delta/복구·검증·session 조건과 기록을 보존한다.
