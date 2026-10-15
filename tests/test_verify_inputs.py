@@ -303,6 +303,7 @@ class VerifyInputObservationTest(unittest.TestCase):
                      'tests/fixtures/project-files/docs/PLANS.md',
                      'tests/fixtures/provider-profiles.ini', 'scripts/verify.json',
                      'scripts/verify.sh', 'scripts/verify.ps1',
+                     'scripts/verify_windows.py', 'scripts/verify-windows-tests.json',
                      'scripts/copy-project-files.sh', 'scripts/copy-project-files.ps1',
                      '.agents/skills/specification-docs/scripts/next_requirement_id.py',
                      '.agents/skills/specification-docs/scripts/requirement_documents.py',

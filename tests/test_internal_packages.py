@@ -88,16 +88,14 @@ class InternalPackageMigrationTests(unittest.TestCase):
             self.assertIn("--config", help_result.stdout)
             self.assertFalse(list(runtime.rglob("*.pyc")))
 
-    def test_both_verify_scripts_compile_every_relocated_module(self):
-        from loop_manager_internal.verification import runner
+    def test_verify_compile_stage_covers_every_relocated_module(self):
+        from loop_manager_internal.verification import contract, unittest_adapter
+        connection = contract.load(ROOT, project_python=sys.executable)
+        command = next(stage['argv'] for stage in connection.stages if stage['id'] == 'compile')
+        self.assertEqual(command[:3], ['{python}', '{runner}', '--compile'])
         required = {"loop_manager.py", *(p.relative_to(ROOT).as_posix()
                                          for p in PACKAGE.rglob("*.py"))}
-        with mock.patch.object(runner.py_compile, "compile") as compile_source:
-            runner.compile_project(ROOT)
+        with mock.patch.object(unittest_adapter.py_compile, "compile") as compile_source:
+            unittest_adapter.compile_paths(ROOT, command[3:])
         self.assertEqual({Path(call.args[0]).relative_to(ROOT).as_posix() for call in compile_source.call_args_list}, required)
         self.assertTrue(all(call.kwargs['doraise'] for call in compile_source.call_args_list))
-        for name in ("verify.sh", "verify.ps1"):
-            with self.subTest(script=name):
-                lines = (ROOT / "scripts" / name).read_text(encoding="utf-8").splitlines()
-                commands = [line for line in lines if "-m loop_manager_internal.verification.runner" in line]
-                self.assertEqual(len(commands), 1)

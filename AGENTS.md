@@ -38,8 +38,11 @@ Windows 개발 환경에서 이 저장소의 전체 verify와 대규모 Git·CLI
 Windows 고유 동작은 변경과 관련된 최소 native 회귀로 별도 확인한다. 경로·명령 인자·CRLF·
 ACL·Job 종료·SQLite 파일 잠금·중첩 Python guard와 필요한 실제 Git 파일 보존 효과를 포함한다.
 WSL 전체 verify와 Windows 핵심 회귀 결과는 구분해서 보고하며, 이 조합을 Windows 전체
-verify 통과로 표기하지 않는다. `scripts/verify.ps1`은 native Windows 진입점을 유지하고
-WSL 전환이나 Windows 검증 범위 선정을 자동으로 수행하지 않는다.
+verify 통과로 표기하지 않는다. 이 저장소의 `scripts/verify.ps1`은 WSL 전체 검증 후
+`scripts/verify-windows-tests.json`의 Windows 핵심 회귀를 자동 실행한다. 두 단계가 모두
+성공해야 통과하며 WSL 부재·실패를 native 전체 실행이나 성공으로 우회하지 않는다.
+복사·두 단계·정리는 하나의 전체 timeout을 공유한다. WSL 하위 runner는 독립 Linux 조율을
+사용하고, Windows 핵심 회귀는 Manager 호출이면 기존 Windows 예약 조율을 사용한다.
 
 WSL verify는 `/tmp/` 아래에 실행별 전용 디렉터리를 만들고,
 그 안에 검증 대상 변경을 반영한 프로젝트 복사본과 임시 파일 폴더를 생성해 사용한다.
