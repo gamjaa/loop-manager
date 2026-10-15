@@ -670,8 +670,6 @@ class RecoveryRepository:
 
         if resolved_subjects is not None:
             blocked_subjects = blocked_subjects & resolved_subjects
-        where = "repo = ?" + (" AND last_run_id = ?" if run_id is not None else "")
-        parameters: tuple[object, ...] = (repo,) + ((run_id,) if run_id is not None else ())
         if resolved:
             from loop_manager_internal.notifications import notifications
             for row in self.connection.execute(

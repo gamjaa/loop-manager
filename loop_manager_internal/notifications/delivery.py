@@ -224,7 +224,8 @@ def _deliver_rows(
                 connection.execute(
                     "UPDATE notification_outbox SET confirmed_pieces = ?, "
                     "delivery_started_at = CASE WHEN ? = ? "
-                    "THEN delivery_started_at ELSE NULL END, last_error = NULL, "
+                    "THEN delivery_started_at ELSE NULL END, "
+                    "last_error = CASE WHEN canceled_at IS NULL THEN NULL ELSE last_error END, "
                     "sent_at = CASE WHEN ? = ? THEN CURRENT_TIMESTAMP "
                     "ELSE NULL END WHERE event_key = ? AND sent_at IS NULL "
                     "AND confirmed_pieces = ?",
