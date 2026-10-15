@@ -89,12 +89,13 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
     applied = DefinitionSnapshot.deserialize(plan['definition_snapshot'])
     # A historical declaration is usable only with this exact saved operation
     # or acceptance target. A fresh candidate has no such metadata exception.
-    owned_definition = bool(applied is not None and target == checkpoint.target_base_oid
-        and (checkpoint.operation == 'rebase'
-             or valid_acceptance(proof) and all(proof[key] == value for key, value in (
+    accepted_target = bool(target == checkpoint.target_base_oid
+        and valid_acceptance(proof) and all(proof[key] == value for key, value in (
                  ('repo', repo), ('repository_identity', identity), ('plan_id', plan_id),
                  ('plan_path', str(plan['path'])), ('worktree', str(worktree.resolve())),
-                 ('branch', branch), ('target_base_oid', target), ('role', 'worker')))))
+                 ('branch', branch), ('target_base_oid', target), ('role', 'worker'))))
+    owned_definition = bool(applied is not None and target == checkpoint.target_base_oid
+                            and (checkpoint.operation == 'rebase' or accepted_target))
 
     def current_contract():
         row = connection.execute('SELECT * FROM exec_plans WHERE repo = ? AND plan_id = ?',
@@ -194,7 +195,9 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
                     continue
                 document_conflicts.add(path)
                 break
-    document_intent = saved.get('rebase_documents') or {}
+    # Older checkpoints retain completed pins; later Worker edits use normal scope.
+    documents_adopted = checkpoint.operation != 'rebase' and accepted_target
+    document_intent = {} if documents_adopted else saved.get('rebase_documents') or {}
     document_blobs = {}
     document_heads = {}
     document_files = set()
@@ -221,7 +224,8 @@ def build_service(ports: RebaseRuntimeEffects, connection, repo_path, state_dir,
                         path for path in changed_paths(target) & changed_paths(start.head)
                         if document_path(path)
                     }
-    for path, desired in adopted_originals(checkpoint).items():
+    originals = {} if documents_adopted else adopted_originals(checkpoint)
+    for path, desired in originals.items():
         document_blobs[path] = ({('000000', '0' * width) for width in (40, 64)}
                                if desired.get('absent') else {(desired['mode'], desired['oid'])})
     if (document_intent.get('state') in {'prepared', 'staged'}

@@ -193,6 +193,9 @@ class ExecutionCheckpointRepository:
         snapshot['current_rebase_acceptance'] = dict(acceptance)
         if prior_artifacts is not None:
             snapshot.setdefault('rebase_revalidation_audit', []).append(prior_artifacts)
+        if 'rebase_documents' in snapshot:
+            snapshot.setdefault('rebase_revalidation_audit', []).append(
+                {'rebase_documents': snapshot.pop('rebase_documents')})
         snapshot.pop('worker_candidate_token', None)
         return self.record(
             repo, plan_id, expected_generation=current.generation,

@@ -15,6 +15,7 @@ from loop_manager_internal.git.managed_rebase_validation import (
 )
 from loop_manager_internal.git.manager_git_journal import MutationEvidenceError
 from loop_manager_internal.git import manager_git_journal
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 from loop_manager_internal.verification.timing import phase
 
 
@@ -61,6 +62,9 @@ class ManagedRebaseService:
         observed, decision = self.observe(checkpoint=checkpoint)
         if decision.status not in {RebaseStatus.START, RebaseStatus.WAITING, RebaseStatus.COMPLETE}:
             detail = ': ' + observed.detail if isinstance(observed, ObservationFailure) else ''
+            if decision.reason == 'current_scope_mismatch':
+                raise RecoveryFailure(RecoveryReason.AGENT_SCOPE_VIOLATION,
+                    'current rebase rejected: ' + decision.reason)
             raise MutationEvidenceError('current rebase rejected: ' + decision.reason + detail)
         return observed, decision
 
