@@ -1035,7 +1035,17 @@ def validate_planner_result(
         changed_ids = {str(plan["id"]) for plan in current_plans.values()}
         changed_ids.update(snapshot.by_path[path].plan_id for path in base_paths if path not in current_plans)
         recovery_ids = {key for raw in snapshot.recovery_goals for key in json.loads(raw)["affected_ids"]} & snapshot.by_id.keys() & changed_ids
-        unresolved_holds = held_ids - recovery_ids
+        original_dependencies = {}
+        if held_ids:
+            original_dependencies = {
+                str(row["plan_id"]): effects._stored_string_list(row["depends_on"], "depends_on")
+                for row in connection.execute(
+                    "SELECT plan_id, depends_on FROM exec_plans WHERE repo = ?", (repo,),
+                ).fetchall()
+            }
+            original_dependencies.update({
+                plan.plan_id: tuple(plan.depends_on) for plan in snapshot.plans
+            })
         plans: list[tuple[str, dict[str, object]]] = []
         revisions: list[PlanRevision] = []
         deletions: list[PlanDeletion] = []
@@ -1124,7 +1134,9 @@ def validate_planner_result(
             revisions = normalized_revisions
         if held_ids:
             project_catalog_refresh.assert_planning_dependencies_unheld(
-                {}, current_plans.items(), unresolved_holds
+                {}, current_plans.items(), held_ids,
+                recovery_target_ids=frozenset(recovery_ids),
+                original_dependencies=original_dependencies,
             )
 
         if held_ids:
@@ -1142,7 +1154,9 @@ def validate_planner_result(
         else:
             execplan_drafts.validate_questions(catalog)
         project_catalog_refresh.assert_planning_dependencies_unheld(
-            catalog, current_plans.items(), unresolved_holds)
+            catalog, current_plans.items(), held_ids,
+            recovery_target_ids=frozenset(recovery_ids),
+            original_dependencies=original_dependencies)
         remote_deletions.validate_recovery(worktree, snapshot, current_plans, catalog, connection=connection, repo=repo)
 
         for path in sorted(displaced_paths):

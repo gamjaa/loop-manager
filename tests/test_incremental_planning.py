@@ -536,6 +536,151 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         reconciled = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), 'main')
         self.assertEqual(set(reconciled.withheld_plan_ids), {'G-001', 'G-002'})
 
+    def test_deleted_goal_recovery_preserves_existing_direct_and_transitive_holds(self):
+        def with_dependencies(text, dependencies):
+            block = ("depends_on: []" if not dependencies else
+                     "depends_on:\n" + "".join(f"  - {item}\n" for item in dependencies).rstrip())
+            return text.replace("depends_on: []", block)
+
+        dependencies = {
+            "G-002": ("G-001", "G-003", "G-004"),
+            "G-003": ("G-999",),
+            "G-004": ("G-003",),
+            "G-005": ("G-999",),
+        }
+        titles = {
+            "G-003": "Held predecessor",
+            "G-004": "Intermediate prerequisite",
+            "G-005": "New held prerequisite",
+            "G-006": "Independent",
+        }
+        for plan_id, title in titles.items():
+            self.paths[plan_id] = f"docs/plans/[{plan_id}] {title}.md"
+            deps = dependencies.get(plan_id, ())
+            path = self.repo / self.paths[plan_id]
+            path.write_text(with_dependencies(plan_text(plan_id, title), deps),
+                            encoding="utf-8", newline="\n")
+            self.connection.execute(
+                """INSERT INTO exec_plans (
+                    repo, plan_id, path, title, sources, depends_on,
+                    priority, content_hash, status, plan_sha,
+                    initial_worker_level, effective_worker_level
+                ) VALUES (?, ?, ?, ?, '["docs/PRODUCT.md"]', ?,
+                          'normal', ?, 'READY', ?, 1, 1)""",
+                (str(self.repo), plan_id, self.paths[plan_id], title,
+                 json.dumps(list(deps)),
+                 hashlib.sha256(path.read_bytes()).hexdigest(), self.base),
+            )
+        target = self.repo / self.paths["G-002"]
+        target.write_text(with_dependencies(
+            target.read_text(encoding="utf-8"), dependencies["G-002"]),
+            encoding="utf-8", newline="\n")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "Add pre-existing held prerequisite paths")
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", self.base)
+        self.connection.execute("UPDATE projects SET active_sha=?", (self.base,))
+        self.connection.commit()
+        self.assertTrue(loop_manager.reconcile_execplan_catalog(
+            self.connection, self.repo, str(self.repo), "main",
+        ).usable)
+
+        archive_path = "docs/plans/archive/[G-003] Held predecessor.md"
+        (self.repo / "docs/plans/archive").mkdir()
+        (self.repo / self.paths["G-003"]).rename(self.repo / archive_path)
+        git(self.repo, "add", "-A")
+        git(self.repo, "commit", "-m", "Preserve predecessor history in archive")
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", self.base)
+        self.connection.execute("UPDATE projects SET active_sha=?", (self.base,))
+        self.connection.commit()
+        self.assertTrue(loop_manager.reconcile_execplan_catalog(
+            self.connection, self.repo, str(self.repo), "main",
+        ).usable)
+
+        body = with_dependencies(plan_text("G-002", "Second"), dependencies["G-002"])
+        self._remote_deletion(dependent=False, target_text=body)
+        preexisting_holds = loop_manager.scoped_blocking.catalog_held_plan_ids(
+            self.connection, str(self.repo),
+        )
+        self.assertTrue({"G-003", "G-004", "G-005"} <= preexisting_holds)
+        snapshot = loop_manager.mutable_ready_snapshot(
+            self.connection, str(self.repo), self.repo, self.base,
+        )
+        self.assertIn("G-002", snapshot.by_id)
+        self.assertNotIn("G-003", snapshot.by_id)
+        self.assertNotIn("G-005", snapshot.by_id)
+
+        decision = {
+            "deleted_id": "G-001", "outcome": "obsolete", "replacement_ids": [],
+            "sources": ["docs/PRODUCT.md"], "reason": "The deleted goal is no longer required.",
+        }
+        revised_text = with_dependencies(
+            plan_text("G-002", "Second"), ("G-003", "G-004"),
+        ) + "\nDEPENDENCY_RECOVERY: " + json.dumps(decision) + "\n"
+        target.write_text(revised_text, encoding="utf-8", newline="\n")
+
+        def validate():
+            return loop_manager.validate_planner_result(
+                self.repo, self.base, loop_manager.changed_files(self.repo),
+                connection=self.connection, repo=str(self.repo), mutable_snapshot=snapshot,
+            )
+
+        result = validate()
+        self.assertEqual([item.snapshot.plan_id for item in result.revisions], ["G-002"])
+        target.write_text(revised_text.replace(
+            "  - G-004\n", "  - G-004\n  - G-005\n"), encoding="utf-8", newline="\n")
+        with self.assertRaisesRegex(loop_manager.PlannerValidationError, "보류 계획에 의존"):
+            validate()
+        target.write_text(revised_text, encoding="utf-8", newline="\n")
+
+        archived_bytes = (self.repo / archive_path).read_bytes()
+        archived_row_before = dict(self.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo=? AND plan_id='G-003'", (str(self.repo),),
+        ).fetchone())
+        merge_audit = self.connection.execute(
+            "SELECT * FROM execplan_catalog_history WHERE repo=? AND plan_id='G-003'",
+            (str(self.repo),),
+        ).fetchone()
+        merge_audit_before = dict(merge_audit) if merge_audit else None
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "Publish deleted goal recovery")
+        commit = git(self.repo, "rev-parse", "HEAD")
+        spec = loop_manager._specification_input_fingerprint(self.repo, commit)
+        planning = loop_manager._planning_input_fingerprint(self.repo, commit)
+        loop_manager.record_general_planning_publication_intent(
+            self.connection, str(self.repo), self.repo, result, commit, spec, planning,
+        )
+        with self.assertRaisesRegex(loop_manager.PlannerValidationError, "push"):
+            loop_manager.publish_general_planning_batch(
+                self.connection, str(self.repo), self.repo, "main", result, commit, spec, planning,
+            )
+        git(self.repo, "update-ref", "refs/remotes/origin/main", commit)
+        self.assertEqual(loop_manager.recover_general_planning_batch(
+            self.connection, str(self.repo), self.repo, "main",
+        ), "applied")
+
+        self.assertTrue(preexisting_holds - {"G-002"} <=
+                        loop_manager.scoped_blocking.catalog_held_plan_ids(
+                            self.connection, str(self.repo),
+                        ))
+        self.assertEqual((self.repo / archive_path).read_bytes(), archived_bytes)
+        self.assertEqual(dict(self.connection.execute(
+            "SELECT * FROM exec_plans WHERE repo=? AND plan_id='G-003'", (str(self.repo),),
+        ).fetchone()), archived_row_before)
+        merge_audit = self.connection.execute(
+            "SELECT * FROM execplan_catalog_history WHERE repo=? AND plan_id='G-003'",
+            (str(self.repo),),
+        ).fetchone()
+        self.assertEqual(dict(merge_audit) if merge_audit else None, merge_audit_before)
+        self.assertEqual(json.loads(self.connection.execute(
+            "SELECT depends_on FROM exec_plans WHERE repo=? AND plan_id='G-002'",
+            (str(self.repo),),
+        ).fetchone()[0]), ["G-003", "G-004"])
+        self.assertEqual(loop_manager.select_ready_execplan(
+            self.connection, str(self.repo),
+        )["plan_id"], "G-006")
+
     def test_missing_plan_reference_review_checks_ownership_and_retains_execution_hold(self):
         self._remote_deletion(started=True)
         self.connection.execute("UPDATE exec_plans SET status='IMPLEMENTING', ever_started=1, "
@@ -669,7 +814,13 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         self._remote_deletion()
         _, validate = self._recovery_result()
         target = self.repo / "docs/plans/[G-003] Replacement.md"
-        target.write_text(plan_text("G-003", "Replacement").replace("depends_on: []", "depends_on:\n  - G-002"), encoding="utf-8")
+        target.write_text(plan_text("G-003", "Replacement").replace(
+            "depends_on: []", "depends_on:\n  - G-004"), encoding="utf-8")
+        (self.repo / "docs/plans/[G-004] Cycle.md").write_text(
+            plan_text("G-004", "Cycle").replace(
+                "depends_on: []", "depends_on:\n  - G-003"),
+            encoding="utf-8",
+        )
         with self.assertRaisesRegex(loop_manager.PlannerValidationError, "새 오류|순환"):
             validate()
         self.assertEqual(self.connection.execute("SELECT COUNT(*) FROM general_planning_publications").fetchone()[0], 0)
