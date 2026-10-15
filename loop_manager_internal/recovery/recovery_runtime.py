@@ -42,6 +42,8 @@ class RecoveryReason(str, Enum):
     ARCHIVE_MOVE_MISMATCH = "archive_move_mismatch"
     REBASE_CONFLICT = "rebase_conflict"
     WORKER_CORRECTION = "worker_correction"
+    TARGETED_TEST_CORRECTION = "targeted_test_correction"
+    TARGETED_TEST_EXHAUSTED = "targeted_test_exhausted"
     REVIEW_FEEDBACK_CORRECTION = "review_feedback_correction"
     REVIEW_CORRECTION_BUDGET = "review_correction_budget"
     GUIDANCE_APPROVAL_REQUIRED = "guidance_approval_required"
@@ -105,6 +107,7 @@ BLOCK_REASON = {
     RecoveryReason.REVIEW_SPECIFICATION_DEADLOCK: BlockReasonCode.REVIEW_SPECIFICATION_DEADLOCK,
     RecoveryReason.MANAGED_CONFLICT_UNRECOVERABLE: BlockReasonCode.MANAGED_WORKTREE_CONFLICT,
     RecoveryReason.WORKER_OUTPUT_EXHAUSTED: BlockReasonCode.WORKER_OUTPUT_INVALID,
+    RecoveryReason.TARGETED_TEST_EXHAUSTED: BlockReasonCode.WORKER_OUTPUT_INVALID,
     RecoveryReason.DEFAULT_WORKTREE_MUTATION: BlockReasonCode.DEFAULT_WORKTREE_MUTATION,
     RecoveryReason.SHARED_REF_MUTATION: BlockReasonCode.SHARED_REF_MUTATION,
     RecoveryReason.TURN_DIFF_REF_MUTATION: BlockReasonCode.TURN_DIFF_REF_MUTATION,
@@ -236,6 +239,9 @@ def decide(
     elif reason is RecoveryReason.REVIEW_FEEDBACK_CORRECTION:
         disposition = RecoveryDisposition.AGENT_CORRECTION
         action = RecoveryAction.CORRECT
+    elif reason is RecoveryReason.TARGETED_TEST_CORRECTION:
+        disposition = RecoveryDisposition.AGENT_CORRECTION
+        action = RecoveryAction.PAUSE if attempts else RecoveryAction.CORRECT
     elif reason in CORRECTION and occurrence < correction_limit:
         disposition = RecoveryDisposition.AGENT_CORRECTION
         action = RecoveryAction.CORRECT

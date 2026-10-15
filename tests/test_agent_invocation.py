@@ -18,6 +18,53 @@ from tests.support.fixed_samples import PROJECT_FILES
 
 
 class RunnerTests(TestCase):
+    def test_invalid_targeted_evidence_still_finishes_the_physical_invocation_ledger(self):
+        class Provider:
+            def run(self, request):
+                request.on_launch_prepared(SimpleNamespace(attempt=self_outer.state_dir))
+                (self_outer.state_dir / 'targeted-corrupt.jsonl').write_text('{}\n', encoding='utf-8')
+                return manager.AgentResult(0, 'done')
+        self_outer = self
+        with mock.patch.object(manager, 'agent_provider', return_value=Provider()):
+            result = manager.run_agent('codex', Path('/worktree'), self.state_dir, Path('/config'),
+                'worker', 'prompt', read_only=False, connection=self.connection,
+                invocation=invocation.InvocationContext('repo', 'G-1'),
+                resolved_profile=invocation.ResolvedProfile('model', 'high'))
+        self.assertNotEqual(result.code, 0)
+        row = self.connection.execute('SELECT result_kind, result_code, collection_status FROM agent_invocations').fetchone()
+        self.assertEqual(tuple(row), ('success', 0, 'error'))
+
+    def test_targeted_execution_results_are_persisted_even_when_the_cli_is_interrupted(self):
+        from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository, ensure_schema
+        from loop_manager_internal.verification.timing import EventWriter
+        ensure_schema(self.connection)
+        for interrupted in (False, True):
+            with self.subTest(interrupted=interrupted):
+                attempt = self.state_dir / ('interrupted' if interrupted else 'completed')
+                attempt.mkdir()
+                class Provider:
+                    def run(self, request):
+                        request.on_launch_prepared(SimpleNamespace(attempt=attempt))
+                        writer = EventWriter(attempt / 'targeted-run.jsonl', identity={'run_id': 'run'})
+                        writer.emit('test_end', id='suite.test_one', result='failure')
+                        writer.close()
+                        if interrupted:
+                            raise KeyboardInterrupt()
+                        return manager.AgentResult(0, 'done')
+                with mock.patch.object(manager, 'agent_provider', return_value=Provider()):
+                    def invoke():
+                        return manager.run_agent('codex', Path('/worktree'), self.state_dir, Path('/config'),
+                            'worker', 'prompt', read_only=False, connection=self.connection,
+                            invocation=invocation.InvocationContext('repo', str(interrupted)),
+                            resolved_profile=invocation.ResolvedProfile('model', 'high'))
+                    if interrupted:
+                        with self.assertRaises(KeyboardInterrupt):
+                            invoke()
+                    else:
+                        self.assertEqual(invoke().code, 0)
+                repository = TargetedTestRepository(self.connection)
+                self.assertGreater(repository.sequence('repo', str(interrupted)), 0)
+
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self.temporary.cleanup)

@@ -128,6 +128,10 @@ def prepare_launch(boundary, state_dir: Path, role: str, read_only: bool,
     child_environment = dict(environment)
     child_environment['CODEX_HOME'] = str(source_home)
     child_environment['TMPDIR'] = str(attempt)
+    if role == 'worker' and not read_only:
+        child_environment['LOOP_MANAGER_TARGETED_TEST_DIRECTORY'] = str(attempt)
+        child_environment['LOOP_MANAGER_TARGETED_TEST_RUNNER'] = str(
+            Path(__file__).resolve().parents[1] / 'verification' / 'targeted.py')
     if os.name == 'nt':
         child_environment['TEMP'] = child_environment['TMP'] = str(attempt)
     writable = [] if read_only else [attempt]

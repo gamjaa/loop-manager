@@ -45,6 +45,10 @@ import shutil
 import sqlite3
 
 
+class TargetedTestFailure(WorkerResultError):
+    """최종 보고의 미해결 테스트 실패. 실행 횟수의 근거로 사용하지 않는다."""
+
+
 def _deserialize_review_level_history(
     value: object,
 ) -> dict[str, dict[str, int]]:
@@ -736,7 +740,7 @@ def parse_worker_result(effects: ParseWorkerResultEffects, message: str, plan: d
     if not test_evidence:
         raise WorkerResultError("Worker targeted unit test 증거가 비어 있습니다.")
     if effects._has_unresolved_targeted_test_failure(test_evidence):
-        raise WorkerResultError(
+        raise TargetedTestFailure(
             "Worker가 해결되지 않은 targeted unit test 실패를 보고했습니다."
         )
     no_test_reason = effects.reviewer_targeted_test_reason(test_evidence)

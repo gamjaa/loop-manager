@@ -31,6 +31,11 @@
   반복하거나 새 기능으로 확대하지 않되 필요한 리팩토링·불필요한 코드 제거는 허용한다.
   targeted test 실패는 같은 세션에서 수정하고 동일 테스트로 재검증한다. 문서·설정 전용 변경이나
   실행 가능한 관련 unit test가 없으면 범위를 확대하지 않고 구체적인 사유를 명시한다.
+- 테스트는 프로젝트 Python으로 환경변수 `LOOP_MANAGER_TARGETED_TEST_RUNNER`의 스크립트를 실행해
+  개별 실행 결과를 남긴다. unittest는 `--unittest <test ID·class·module>`, JUnit을 지원하는 도구는
+  `--junit -- <명령과 인자>`를 사용하고 도구의 XML 출력 인자에 `{junit}`을 넣는다.
+  기록 폴더는 `LOOP_MANAGER_TARGETED_TEST_DIRECTORY`다. 같은 테스트의 연속 3회 실패를 확인하면
+  추가 수정을 멈추고 실패를 보고한다. 실행·수집 중단이나 기록 부재를 테스트 실패 횟수로 보고하지 않는다.
 - 실패 명령은 `FAILED_COMMAND:`, 수정 후 동일 명령은 `RERUN:` 줄로 보고하고
   재실행 결과를 그 뒤에 명시한다. 성공·실패가 섞인 요약을 통과로 보고하지 않는다.
 - 전체 verify의 실제 입력을 `scripts/verify-inputs.json` version 1 상대 경로/glob 목록으로

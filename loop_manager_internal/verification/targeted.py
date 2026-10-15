@@ -1,0 +1,126 @@
+"""개별 targeted test 실행을 기록하는 unittest/JUnit 진입점."""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import unittest
+from uuid import uuid4
+import xml.etree.ElementTree as ET
+
+if __package__ in {None, ''}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+from loop_manager_internal.verification.manifest import test_ids
+from loop_manager_internal.verification.timing import EventWriter, TimedResult
+from loop_manager_internal.verification.unittest_adapter import project_imports
+
+
+RESULTS = frozenset({'success', 'failure', 'error', 'skip', 'expected_failure', 'unexpected_success'})
+RUNNER_INSTRUCTION = (
+    '프로젝트 Python으로 환경변수 LOOP_MANAGER_TARGETED_TEST_RUNNER의 스크립트를 실행하라. '
+    'unittest는 --unittest <test ID·class·module>, JUnit 도구는 --junit -- <명령과 인자>를 사용하고 '
+    'XML 출력 인자에 {junit}을 넣어라. 새 실행 결과를 보고하되 전체 verify는 실행하지 마라.'
+)
+
+
+def collect(directory):
+    """완료된 개별 결과는 프로세스 중단 때도 보존한다. 불완전한 마지막 줄은 제외한다."""
+    events = []
+    root = Path(directory).resolve()
+    for path in root.glob('targeted-*.jsonl'):
+        if path.is_symlink() or path.resolve().parent != root or path.stat().st_size > 16 * 1024 * 1024:
+            raise ValueError('targeted test 기록 경로·크기가 유효하지 않습니다.')
+        run_id = path.stem.removeprefix('targeted-')
+        seen = set()
+        for line in path.read_text(encoding='utf-8').splitlines(keepends=True):
+            if not line.endswith('\n'):
+                break
+            event = json.loads(line)
+            if not isinstance(event, dict) or event.get('run_id') != run_id or event.get('version') != 1:
+                raise ValueError('targeted test 실행 identity가 유효하지 않습니다.')
+            if event.get('kind') != 'test_end':
+                continue
+            identity = event.get('id')
+            if (not isinstance(identity, str) or not identity.strip() or identity in seen
+                    or event.get('result') not in RESULTS or not isinstance(event.get('utc'), str)):
+                raise ValueError('targeted test 개별 결과가 유효하지 않습니다.')
+            seen.add(identity)
+            events.append(event)
+    return tuple(sorted(events, key=lambda event: (event['utc'], event['run_id'], event['id'])))
+
+
+def junit_results(path):
+    if Path(path).stat().st_size > 16 * 1024 * 1024:
+        raise ValueError('JUnit 보고서 크기가 한도를 초과했습니다.')
+    root = ET.parse(path).getroot()
+    if root.tag.rsplit('}', 1)[-1] not in {'testsuite', 'testsuites'}:
+        raise ValueError('JUnit testsuite가 필요합니다.')
+    results = []
+    for case in root.iter():
+        if case.tag.rsplit('}', 1)[-1] != 'testcase':
+            continue
+        name, owner = case.get('name'), case.get('classname')
+        if not name or not name.strip() or not owner or not owner.strip():
+            raise ValueError('JUnit testcase의 classname과 name이 필요합니다.')
+        children = {child.tag.rsplit('}', 1)[-1] for child in case}
+        result = ('error' if 'error' in children else 'failure' if 'failure' in children
+                  else 'skip' if 'skipped' in children else 'success')
+        results.append((f'{owner}.{name}', result))
+    if not results or len({identity for identity, _ in results}) != len(results):
+        raise ValueError('JUnit testcase가 비었거나 ID가 중복됐습니다.')
+    return results
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    mode = parser.add_mutually_exclusive_group(required=True)
+    mode.add_argument('--unittest', nargs='+', metavar='TEST_ID')
+    mode.add_argument('--junit', action='store_true', help='-- 뒤 명령의 {junit}을 새 보고서 경로로 치환')
+    parser.add_argument('command', nargs=argparse.REMAINDER)
+    args = parser.parse_args(argv)
+    directory = os.environ.get('LOOP_MANAGER_TARGETED_TEST_DIRECTORY')
+    if not directory or not Path(directory).is_dir():
+        parser.error('Manager가 지정한 targeted test 기록 폴더가 필요합니다.')
+    run_id = uuid4().hex
+    directory = Path(directory)
+    writer = EventWriter(directory / f'targeted-{run_id}.jsonl', identity={'run_id': run_id})
+    try:
+        if args.unittest:
+            if args.command:
+                parser.error('--unittest 뒤에는 테스트 ID만 지정합니다.')
+            project_imports()
+            sys.path.insert(0, str(Path.cwd() / 'tests'))
+            loader = unittest.TestLoader()
+            suite = loader.loadTestsFromNames(args.unittest)
+            identities = tuple(test_ids(suite))
+            if loader.errors or not identities or len(identities) != len(set(identities)):
+                raise ValueError('targeted unittest 수집 실패·빈 범위·중복 ID입니다.')
+            with writer.activate():
+                # shortcut: subTest는 상위 test.id()로 집계하며, 파라미터별 차단이 필요하면 reporter를 확장한다.
+                result = unittest.TextTestRunner(verbosity=2, resultclass=lambda *a, **kw:
+                    TimedResult(*a, writer=writer, **kw)).run(suite)
+            return 0 if result.wasSuccessful() else 1
+        command = args.command[1:] if args.command[:1] == ['--'] else args.command
+        if not command or not any('{junit}' in arg for arg in command):
+            parser.error('--junit -- 뒤에는 {junit} 보고서 경로를 포함한 명령이 필요합니다.')
+        report = directory / f'targeted-{run_id}.xml'
+        code = subprocess.run([arg.replace('{junit}', str(report)) for arg in command], check=False).returncode
+        if report.is_symlink() or report.resolve().parent != directory.resolve():
+            raise ValueError('JUnit 보고서가 기록 폴더를 벗어났습니다.')
+        results = junit_results(report)
+        for identity, result in results:
+            writer.emit('test_end', id=identity, result=result)
+        return code or int(any(result in {'failure', 'error'} for _, result in results))
+    except (OSError, ValueError, ET.ParseError) as error:
+        print(f'targeted test 실행 근거 수집 실패: {error}', file=sys.stderr)
+        return 2
+    finally:
+        writer.close()
+
+
+if __name__ == '__main__':
+    sys.exit(main())

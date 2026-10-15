@@ -387,6 +387,7 @@ def run_codex(
     common_guidance: object | None = None,
     prepared_launch: agent_write_isolation.CodexLaunch | None = None,
     on_execution_identity=None,
+    on_launch_prepared=None,
 ) -> tuple[int, str] | CodexResult:
     return provider_adapters.run_codex(
         worktree,
@@ -408,6 +409,7 @@ def run_codex(
         common_guidance=common_guidance,
         prepared_launch=prepared_launch,
         on_execution_identity=on_execution_identity,
+        on_launch_prepared=on_launch_prepared,
         on_process_started=on_process_started,
         on_process_finished=on_process_finished,
         effects=effects._provider_adapters_effects(),

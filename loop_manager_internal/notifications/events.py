@@ -337,7 +337,7 @@ def enqueue_current_project_events(connection: sqlite3.Connection, repo: str) ->
 
 def worker_targeted_failure(reason_code, detail) -> bool:
     """The unresolved Worker test diagnostic is local correction evidence."""
-    return (reason_code == 'worker_correction' and
+    return (reason_code in {'worker_correction', 'targeted_test_correction'} and
             'Worker가 해결되지 않은 targeted unit test 실패를 보고했습니다.' in str(detail))
 
 

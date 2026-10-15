@@ -25,6 +25,35 @@ from tests.support.execution_phase_scenarios import ExecutionPhaseScenarios
 
 
 class ExecutionWorkerPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseScenarios, ExecutionFixture, TestCase):
+    def test_targeted_rebase_failures_use_individual_execution_history_instead_of_report_count(self):
+        from loop_manager_internal.execution.result_validation import TargetedTestFailure
+        from loop_manager_internal.storage.targeted_test_state import TargetedTestRepository
+        checkpoint = ExecutionCheckpointRepository(self.connection)
+        self.effects = replace(self.effects, checkpoint=checkpoint)
+        self.handler.effects = self.effects
+        checkpoint.record('repo', 'G-047', expected_generation=0, operation='rebase',
+            expected_head='before', target_base_oid='base', observed_remote_oid=None, snapshot={})
+        self.state.update_project('repo', phase='WORKING', worker_session_id='worker-session',
+                                  last_error=lm.REBASE_CONFLICT_PREFIX + 'conflict')
+        self.effects.workspace.is_directory.return_value = True
+        self.effects.workspace._rebase_in_progress_for_branch.return_value = True
+        self.effects.workspace.git.side_effect = self.observed_git
+        self.effects.validation.parse_worker_result.side_effect = TargetedTestFailure('unresolved test')
+        repository = TargetedTestRepository(self.connection)
+        for number in range(4):
+            def worker(*args, **kwargs):
+                repository.observe('repo', 'G-047', [{'run_id': str(number),
+                    'id': f'suite.test_{number}', 'result': 'failure'}])
+                return self.agent(*args, **kwargs)
+            self.effects.agent.run_agent.side_effect = worker
+            result = self.handler.run(self.context())
+            self.assertEqual(result.kind, ExecutionOutcomeKind.RETRY)
+            self.assertEqual(result.recovery.observation.reason, RecoveryReason.TARGETED_TEST_CORRECTION)
+        self.effects.agent.run_agent.side_effect = self.agent
+        result = self.handler.run(self.context())
+        self.assertEqual(result.kind, ExecutionOutcomeKind.TRANSIENT_PAUSE)
+        self.effects.blocking.block_active_execplan.assert_not_called()
+
     def test_frontmatter_restore_is_reported_to_worker_without_final_block(self):
         def validate(*_args, **kwargs):
             kwargs['on_frontmatter_restored']('docs/plans/[G-047] Runtime.md')
