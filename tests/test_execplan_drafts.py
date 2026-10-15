@@ -1243,6 +1243,47 @@ class DraftAnswerReobservationTest(AutomationCatalogFixture, unittest.TestCase):
 
 
 class ExecPlanDraftPublicationTest(AutomationCatalogFixture, unittest.TestCase):
+    def test_cleaned_decision_keeps_pinned_inputs_without_creating_another_hold(self):
+        source = 'docs/requirements/[R-001] Storage.md'
+        text = plan_text('G-001', 'Decision').replace('  - docs/PRODUCT.md', '  - ' + source)
+        plan = execplan_catalog.parse_execplan_text(PATH, text, validate_sources=False)
+        snapshot = execplan_catalog.snapshot_from_documents({PATH: text})
+        files = {'docs/PRODUCT.md': b'# Product\n', 'docs/ARCHITECTURE.md': b'# Architecture\n',
+                 source: b'# [R-001] Storage\n\nRetain data.\n'}
+        blobs = {hashlib.sha1(value).hexdigest(): value for value in files.values()}
+        tree = b''.join(b'100644 blob ' + hashlib.sha1(value).hexdigest().encode()
+            + b'\t' + path.encode() + b'\0' for path, value in files.items())
+        def git_bytes(_repo, command, *args):
+            if command == 'ls-tree':
+                return tree
+            if command == 'cat-file':
+                return blobs[args[-1]]
+            self.assertEqual(command, 'show')
+            return files[args[-1].split(':', 1)[1]]
+        effects = catalog_service.GitCatalogDefinitionPortEffects(
+            git=mock.Mock(return_value=SimpleNamespace(stdout='a' * 40)), git_bytes=git_bytes,
+            _git_tree_entries=mock.Mock(), revision_execplan_snapshot=mock.Mock(return_value=snapshot))
+        pinned = catalog_service._GitCatalogDefinitionPort(
+            effects, Path('/repo'), 'origin/main', lambda: frozenset()).load()
+        inputs = {path: execplan_drafts.content_digest(value) for path, value in files.items()}
+        self.assertEqual(pinned.draft_inputs, inputs)
+        connection = self._connection()
+        self.addCleanup(connection.close)
+        execplan_draft_state.ensure_schema(connection)
+        prior = {'pending': False, 'basis': {'scope': plan['draft_scope'], 'inputs': inputs},
+                 'path': PATH, 'revision': 'old', 'remote_revision': 'old',
+                 'resolutions': [{'publication_revision': 'old'}]}
+        connection.execute('INSERT INTO execplan_drafts VALUES (?, ?, ?, ?)',
+                           ('repo', 'G-001', 0, json.dumps(prior)))
+
+        execplan_draft_state.observe(connection, 'repo', PATH, plan, 'content', 'new',
+                                    inputs=pinned.draft_inputs)
+
+        self.assertEqual(execplan_draft_state.evidence(connection, 'repo', 'G-001'), prior)
+        execplan_draft_state.observe(connection, 'repo', PATH, plan, 'content', 'changed',
+                                    inputs={**pinned.draft_inputs, source: 'changed-requirement'})
+        self.assertTrue(execplan_draft_state.evidence(connection, 'repo', 'G-001')['pending'])
+
     def test_git_catalog_port_pins_decision_inputs_and_links_to_the_observed_revision(self):
         text = draft_text()
         snapshot = execplan_catalog.snapshot_from_documents({PATH: text})

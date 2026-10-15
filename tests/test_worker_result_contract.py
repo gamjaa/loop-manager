@@ -8,6 +8,23 @@ from tests.support.worker import worker_result
 class WorkerResultContractTest(unittest.TestCase):
     plan = {"id": "G-008", "title": "Descriptive Worker Commits"}
 
+    def test_explicit_korean_no_failures_does_not_hide_actual_failures(self):
+        declarations = ('이번 실행 실패·skip 없음.', '실패 및 오류 없습니다.',
+                        '실패, errors, skips 없음.', '재실행 실패 없음.')
+        for declaration in declarations:
+            with self.subTest(declaration=declaration):
+                evidence = 'RequirementRecoveryUnitTests: 16개 PASS.\n' + declaration
+                self.assertEqual(loop_manager.parse_worker_result(
+                    worker_result('Accept clear test evidence', 'Summary', evidence),
+                    self.plan).test_evidence, evidence)
+                for actual_failure in ('test_case: FAIL', 'test_case: ERROR', '1 failed',
+                                       'AssertionError: 없음', '실패 없음이 아님'):
+                    for combined in (actual_failure + '\n' + evidence,
+                                     evidence + '\n' + actual_failure):
+                        with self.subTest(failure=combined), self.assertRaises(loop_manager.WorkerResultError):
+                            loop_manager.parse_worker_result(worker_result(
+                                'Reject real test failures', 'Summary', combined), self.plan)
+
     def test_korean_inflected_test_success_is_recognized_without_accepting_negation(self):
         message = worker_result(
             "Recognize Korean test evidence",
@@ -361,9 +378,12 @@ class WorkerResultContractTest(unittest.TestCase):
             self.plan,
         )
         self.assertEqual(publication.test_evidence, evidence)
+        no_failures = evidence + "\n재실행 실패 없음."
+        self.assertEqual(loop_manager.parse_worker_result(worker_result(
+            "Preserve corrected unit test reports", "Keep both run outcomes.", no_failures),
+            self.plan).test_evidence, no_failures)
         for ambiguous in (
             f"FAILED_COMMAND: {first}\nRERUN: {first}\nFinal run: PASS",
-            evidence + "\n재실행 실패 없음.",
             (
                 "실패 이력 설명\n"
                 f"FAILED_COMMAND: {first}\nInitial run: FAIL\n"

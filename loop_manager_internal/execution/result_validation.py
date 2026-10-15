@@ -647,6 +647,12 @@ def _targeted_test_failure_matches(evidence: str) -> list[re.Match[str]]:
             continue
         if re.search(r"(?i)\b(?:no|without)\s+$", prefix):
             continue
+        if match.group(0).casefold() in {"실패", "fail", "failed", "failure", "failures", "error", "errors"} and re.match(
+            r"(?i)(?:[ \t]*(?:[·/,]|및|와|과)[ \t]*(?:skips?|오류|에러|실패|errors?|failures?))*"
+            r"[ \t]+없(?:음|습니다|었습니다|다)(?=[ \t]*(?:[.!;\n]|$))",
+            evidence[match.end():],
+        ):
+            continue
         failures.append(match)
     return failures
 

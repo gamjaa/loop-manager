@@ -509,6 +509,9 @@ class ScopedCatalogParsingTest(unittest.TestCase):
                 f'100644 blob valid-oid\t{independent}\0'
                 f'100644 blob requirement-oid\t{renamed}\0').encode()
         def git_bytes(_repo, command, *arguments):
+            if command == 'show':
+                self.assertEqual(arguments[-1], revision + ':' + product)
+                return b'# Product\n'
             return tree if command == 'ls-tree' else contents[arguments[-1]]
         effects = SimpleNamespace(git=lambda *args: SimpleNamespace(stdout=revision), git_bytes=git_bytes)
         port = catalog_service._GitCatalogDefinitionPort(

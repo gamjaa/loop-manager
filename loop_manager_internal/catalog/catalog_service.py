@@ -353,13 +353,17 @@ class _GitCatalogDefinitionPort:
             ),
         )
         decision_sources = set()
+        input_sources = set()
         for entry in snapshot.active.values():
+            # Cleaned decisions retain DB history after their form leaves the document.
+            input_sources.update(entry.sources)
+            input_sources.update(("docs/PRODUCT.md", "docs/ARCHITECTURE.md"))
             if entry.draft_metadata and (entry.draft_metadata.get("draft") or entry.draft_metadata.get("draft_question")):
                 decision_sources.update(entry.sources)
                 decision_sources.update(("docs/PRODUCT.md", "docs/ARCHITECTURE.md"))
         from loop_manager_internal.catalog.manager_sources import SOURCE, source_content
         draft_inputs = {}
-        for path in sorted(decision_sources):
+        for path in sorted(input_sources):
             if path == SOURCE:
                 content = source_content(path).encode()
             elif path.startswith("docs/requirements/") and path.count("/") == 2:
