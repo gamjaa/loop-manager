@@ -316,6 +316,7 @@ class PinnedCatalog:
     requirement_deletions: Mapping[str, Mapping] | None = None
     requirement_documents: Mapping[str, str | bytes] | None = None
     cancellation_recovery: Mapping[str, tuple[str | None, str]] | None = None
+    rowless_hold_deletions: Mapping[str, Mapping] | None = None
 
 
 def new_declaration_issues(
@@ -1036,6 +1037,8 @@ class DefinitionStateRepository:
             prior = json.loads(prior)
             if key in held:
                 current = json.loads(held[key])
+                if key in (pinned.rowless_hold_deletions or {}):
+                    current["deleted_goal"] = dict(pinned.rowless_hold_deletions[key])
                 missing_sources = {item.get("source") for item in issues if item["code"] == "missing-source"}
                 current["deleted_sources"].update({source: proof for source, proof in prior.get("deleted_sources", {}).items()
                     if source in missing_sources and source not in current["deleted_sources"]})

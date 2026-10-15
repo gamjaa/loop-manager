@@ -454,6 +454,10 @@ def reconcile_execplan_catalog(
             references = remote_deletions.reference_issues(
                 connection, repo, repo_path, pinned, git_bytes=port._effects.git_bytes,
             )
+            pinned = replace(pinned, rowless_hold_deletions=remote_deletions.rowless_hold_deletion_evidence(
+                connection, repo, repo_path, pinned, references, git_bytes=port._effects.git_bytes,
+            ))
+            port.loaded = pinned
             pinned = replace(pinned, cancellation_recovery=remote_deletions.cancellation_recovery_evidence(
                 connection, repo, repo_path, pinned, references,
                 git=effects.git, git_bytes=port._effects.git_bytes,

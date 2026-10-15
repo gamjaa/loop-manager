@@ -141,7 +141,7 @@ catalog 동기화는 로컬 작업 행이 없으면 같은 원격 snapshot의 �
 
 ExecPlan 번호는 연속일 필요가 없다. 번호 공백을 누락 계획으로 추정하거나 메우지 않으며 사용한 ID는 재사용하지 않는다. 활성 ExecPlan의 원격 파일 누락이나 형식·source·ID·dependency graph 오류는 기존처럼 다른 계획 상태를 바꾸지 않고 원인 파일을 포함한 프로젝트 범위 진단으로 남긴다. archive 전용 감사 이력의 원문 파일·source 링크 부재는 활성 선언 오류나 새 등록이 되지 않는다. 완전한 Merge proof를 가진 archive 이력은 대응 실행 row·문서가 없어도 dependency·완료 판단에서 MERGED로 충족되며, 미확인 archive 이력은 충족으로 계산하지 않는다. archive ID는 계속 예약되므로 같은 ID가 active 경로에 재등장하면 새 계획으로 등록하지 않는다.
 
-취소 감사와 실행 row 없는 보류도 활성 계획으로 재등록하지 않는다. 취소 문서의 원문·identity를 저장된 plan/deletion revision과 해시·메타데이터로 확인할 수 있으면 현재 snapshot의 참조 영향을 revision과 함께 감사에 보존하고, 확인할 수 없으면 미확인 사유를 남긴다. 영향 계획의 복구 판단·게시 전까지 hold를 유지하며, snapshot/SQLite CAS가 바뀌면 감사 갱신을 적용하지 않는다. 취소 ID와 원문 이력은 독립 실행을 막는 활성 source로 재사용하지 않는다.
+취소 감사와 실행 row 없는 보류도 활성 계획으로 재등록하지 않는다. 취소 문서의 원문·identity를 저장된 plan/deletion revision과 해시·메타데이터로 확인할 수 있으면 현재 snapshot의 참조 영향을 revision과 함께 감사에 보존하고, 확인할 수 없으면 미확인 사유를 남긴다. 등록 전 검증 실패로 hold만 남은 계획도 원격 삭제 시 hold의 원문·revision을 삭제 관측 근거에 보존하고, 후속 참조가 생기면 최초 관측 revision·미확인 사유와 함께 Planner 복구 목표에 전달한다. 영향 계획의 복구 판단·게시 전까지 hold를 유지하며, snapshot/SQLite CAS가 바뀌면 감사 갱신을 적용하지 않는다. 취소 ID와 원문 이력은 독립 실행을 막는 활성 source로 재사용하지 않는다.
 
 [R-055 구현 예정](requirements/%5BR-055%5D%20%EC%B0%A8%EB%8B%A8%20%EA%B2%BD%EB%A1%9C%20%EC%A0%84%EC%88%98%20%EC%A1%B0%EC%82%AC%EC%99%80%20%EB%B6%88%ED%95%84%EC%9A%94%ED%95%9C%20%EC%9E%91%EC%97%85%20%EC%A4%91%EB%8B%A8%20%EC%B6%95%EC%86%8C.md#계획작업-문서-삭제의-자동-반영): Requirement·ExecPlan 삭제는 Manager의 원격 관측·이력 분류와 일반 Planner의 목표 판단으로 자동 처리한다. 허용된 관련 문서 개정·삭제의 원격 확인 후 현재 DB 관계와 실행 수명에 반영하고, 유지하는 관리 브랜치의 문서를 갱신하며 삭제를 반영한 취소·완료 작업의 소유 로컬·원격 브랜치와 worktree를 보존 검증 뒤 정리한다. 완료·취소·예약 감사는 활성 선언 및 source 조회와 분리해 보존한다. 게시·DB·자원 정리의 확정 지점별로 재개하며, 해결하지 못한 영향 범위와 정리 pending만 보존·보류하고 검증된 독립 계획은 계속한다.
 
