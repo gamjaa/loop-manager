@@ -21,7 +21,7 @@ class RunnerTests(TestCase):
     def test_invalid_targeted_evidence_still_finishes_the_physical_invocation_ledger(self):
         class Provider:
             def run(self, request):
-                request.on_launch_prepared(SimpleNamespace(attempt=self_outer.state_dir))
+                request.on_launch_prepared(SimpleNamespace(attempt=self_outer.state_dir, runtime=self_outer.state_dir.parent))
                 (self_outer.state_dir / 'targeted-corrupt.jsonl').write_text('{}\n', encoding='utf-8')
                 return manager.AgentResult(0, 'done')
         self_outer = self
@@ -44,7 +44,7 @@ class RunnerTests(TestCase):
                 attempt.mkdir()
                 class Provider:
                     def run(self, request):
-                        request.on_launch_prepared(SimpleNamespace(attempt=attempt))
+                        request.on_launch_prepared(SimpleNamespace(attempt=attempt, runtime=attempt.parent))
                         writer = EventWriter(attempt / 'targeted-run.jsonl', identity={'run_id': 'run'})
                         writer.emit('test_end', id='suite.test_one', result='failure')
                         writer.close()

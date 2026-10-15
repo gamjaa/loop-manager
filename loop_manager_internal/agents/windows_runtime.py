@@ -54,6 +54,7 @@ def start(arguments, launch_process, **kwargs):
         job.assign(process)
         process._loop_manager_job = job
         process._loop_manager_stop_lock = threading.Lock()
+        process._loop_manager_stop_error = None
         process.stdin.write("\0" if kwargs.get("text") else b"\0")
         process.stdin.flush()
         return process
@@ -71,11 +72,16 @@ def stop(process):
     with process._loop_manager_stop_lock:
         job = process._loop_manager_job
         if job is None:
+            if process._loop_manager_stop_error is not None:
+                raise process._loop_manager_stop_error
             return
         try:
             job.terminate()
             process.wait(timeout=10)
             job.wait(10)
+        except BaseException as error:
+            process._loop_manager_stop_error = error
+            raise
         finally:
             job.close()
             process._loop_manager_job = None

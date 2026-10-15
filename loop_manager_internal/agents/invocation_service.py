@@ -227,6 +227,9 @@ def run_agent(
     def observe_launch(launch):
         nonlocal prepared_launch
         prepared_launch = launch
+        if ledger is not None and identity is not None:
+            from .process_receipt import receipt_path
+            ledger.bind_process_receipt(identity, str(receipt_path(launch)))
 
     request = AgentRequest(
         worktree=worktree,
@@ -252,6 +255,7 @@ def run_agent(
     )
     started = time.monotonic()
     targeted_collection_error = None
+    completed = None
     try:
         if session_id and session_task is None:
             # The existing retry runner rebuilds role/task context once. Keep
@@ -306,7 +310,8 @@ def run_agent(
                 if destination.is_file():
                     events.emit("Agent 호출별 상세 기록 보존", invocation_id=identity, log_path=destination)
                     latest = destination.parent / f"{'claude-' if provider == 'claude' else ''}{role_name}.log"
-                    shutil.copyfile(destination, latest)
+                    if completed is None or completed.code != 125:
+                        shutil.copyfile(destination, latest)
             except OSError as error:
                 collection_status = "error"
                 events.emit("Agent 상세 기록 보존 실패", level="WARN", invocation_id=identity,
