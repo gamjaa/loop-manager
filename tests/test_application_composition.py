@@ -55,7 +55,7 @@ assert 'loop_manager' not in sys.modules
                 self.assertEqual(exports['ROOT'], Path('/runtime') / sha)
                 self.assertEqual(exports['git'](Path('/repo'), 'rev-parse', 'HEAD').stdout, sha)
                 command.assert_called_once_with(
-                    ['git', '-C', '/repo', 'rev-parse', 'HEAD'], check=False)
+                    ['git', '-C', str(Path('/repo')), 'rev-parse', 'HEAD'], check=False)
                 exports['command'] = mock.Mock(side_effect=AssertionError('export mutation'))
                 self.assertIs(application.exports['command'], command)
 

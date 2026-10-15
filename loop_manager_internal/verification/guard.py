@@ -64,9 +64,12 @@ def install_guard():
                 elif event == "subprocess.Popen":
                     if arguments[0] is not None:
                         check_command([arguments[0]], enabled=True)
-                    check_command(arguments[1], enabled=True)
                     environment = arguments[3]
                     active = getattr(_state.active, "environment", None)
+                    command = arguments[1]
+                    if active is not None and len(active) > 2 and active[0] is environment and active[2] is not None:
+                        command = active[2]
+                    check_command(command, enabled=True)
                     if environment is not None and not (
                             active is not None and environment is active[0] and environment == active[1]):
                         prepared = worker_environment(environment)
@@ -105,8 +108,14 @@ def _install_child_environment_guard():
         bound = signature.bind_partial(self, *args, **kwargs)
         environment = worker_environment(bound.arguments.get("env"))
         bound.arguments["env"] = environment
+        command = bound.arguments.get("args")
+        if isinstance(command, (list, tuple)) and not bound.arguments.get("shell") and bound.arguments.get("executable") is None:
+            # Windows audit의 문자열 변환 전 argv를 고정해 Python 코드 속 모델 이름과 실행 파일을 구분한다.
+            bound.arguments["args"] = command = tuple(command)
+        else:
+            command = None
         previous = getattr(_state.active, "environment", None)
-        _state.active.environment = (environment, dict(environment))
+        _state.active.environment = (environment, dict(environment), command)
         try:
             return original_init(*bound.args, **bound.kwargs)
         finally:

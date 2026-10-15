@@ -1,5 +1,6 @@
 from tests.support.fixed_samples import use_fixed_guidance
 import sqlite3
+import os
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
@@ -15,7 +16,7 @@ from tests.support.fixed_samples import PROJECT_FILES
 def symlink_or_skip(link: Path, target, *, target_is_directory=False):
     """Windows의 symlink 권한 부재만 건너뛰고 다른 오류는 실패시킨다."""
     try:
-        link.symlink_to(target, target_is_directory=target_is_directory)
+        os.symlink(target, link, target_is_directory=target_is_directory)
     except OSError as error:
         if getattr(error, 'winerror', None) == 1314:
             raise unittest.SkipTest('Windows symlink 생성 권한이 없습니다.') from error

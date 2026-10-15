@@ -95,6 +95,8 @@ class ConcurrentRegisteredProjectSchedulerTest(unittest.TestCase):
         self.assertEqual(sorted(results), [0, 0])
 
     def test_handoff_between_entry_check_and_launch_blocks_agent_and_verify(self):
+        from tests.support.profiles import fake_provider_home
+        self.enterContext(fake_provider_home())
         for phase in ("agent", "verify"):
             with self.subTest(phase=phase), tempfile.TemporaryDirectory() as directory:
                 worktree = Path(directory)

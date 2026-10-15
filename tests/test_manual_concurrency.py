@@ -609,13 +609,13 @@ class ManualBootstrapConcurrencyTests(OriginScopeFixture, unittest.TestCase):
             self.assertEqual(connection.execute('SELECT count(*) FROM projects').fetchone()[0], 0)
 
     def test_manual_generation_prompt_keeps_submission_evidence_without_static_rubric(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             source = Path(directory) / 'repo'
             source.mkdir()
             state = Path(directory) / 'state'
             state.mkdir()
             connection = manager.connect_database(state, create=True)
-            self.addCleanup(connection.close)
+            cleanup.callback(connection.close)
             head = 'a' * 40
             group = {'base_sha': head, 'source_head': head, 'group_id': 'b' * 32}
             compact = mock.Mock(return_value='[{"id":"G-001","title":"Active","status":"READY"}]')

@@ -243,7 +243,7 @@ class MaintenanceAuthorityTest(MaintenancePlanningCase):
         git(self.repo, "add", self.ready_path.relative_to(self.repo).as_posix())
         git(self.repo, "commit", "-m", "Publish a different plan revision")
         mismatched_revision = git(self.repo, "rev-parse", "HEAD")
-        self.ready_path.write_text(original, encoding="utf-8")
+        self.ready_path.write_text(original, encoding="utf-8", newline="\n")
         self.connection.execute(
             "UPDATE exec_plans SET plan_sha = ?, current_revision_sha = ? "
             "WHERE repo = ? AND plan_id = 'G-001'",

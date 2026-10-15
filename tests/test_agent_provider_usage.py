@@ -14,9 +14,13 @@ from loop_manager_internal.agents import agent_invocation as invocation
 from loop_manager_internal.agents import agent_provider_usage as provider_usage
 from loop_manager_internal.agents import provider_adapters
 import loop_manager as manager
+from tests.support.profiles import fake_provider_home
 
 
 class UsageTests(TestCase):
+    def setUp(self):
+        self.enterContext(fake_provider_home())
+
     def test_reviewer_escaped_literals_keep_nonsecret_failure_context(self):
         diagnostic = r'FAILED parser at \u003d and \" token'
         malformed = r'{"type":"error","message":"Unexpected \u003d and \" token'
@@ -391,7 +395,7 @@ class UsageTests(TestCase):
             process.stdin = io.StringIO()
             process.stdout = io.StringIO("{not-json")
             process.wait.return_value = 1
-            with mock.patch.object(manager.subprocess, "Popen", return_value=process):
+            with mock.patch.object(manager, "_handoff_popen", return_value=process):
                 result = manager.run_claude(
                     root, root, root / "config", "reviewer", "prompt",
                     read_only=True, persist_session=True, session_id="session",
@@ -414,7 +418,7 @@ class UsageTests(TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with mock.patch.object(manager.subprocess, "Popen", return_value=Process()):
+            with mock.patch.object(manager, "_handoff_popen", return_value=Process()):
                 result = manager.run_codex(
                     root, root, root / "config", "planner", "prompt",
                     read_only=False, persist_session=True,
@@ -442,7 +446,7 @@ class UsageTests(TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with mock.patch.object(manager.subprocess, "Popen", side_effect=lambda *a, **k: Process()) as launch, \
+            with mock.patch.object(manager, "_handoff_popen", side_effect=lambda *a, **k: Process()) as launch, \
                  mock.patch.object(Path, "read_text", autospec=True, side_effect=read_text):
                 result = manager.run_agent_with_retries(
                     lambda _session, _fallback: manager.run_codex(
@@ -483,7 +487,7 @@ class UsageTests(TestCase):
 
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            with mock.patch.object(manager.subprocess, "run",
+            with mock.patch.object(manager, "_handoff_run",
                                    return_value=mock.Mock(returncode=1)) as launch, \
                  mock.patch.object(Path, "read_text", autospec=True,
                                    side_effect=read_text):

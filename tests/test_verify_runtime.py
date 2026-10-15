@@ -343,6 +343,19 @@ class GuardInstallationTests(unittest.TestCase):
         self.assertEqual(environment, {"LOOP_MANAGER_VERIFY_SECRET": "private-test-value"})
         self.assertIsNone(self.state.active.environment)
 
+    def test_windows_audit_command_line_keeps_argv_and_rejects_shell_or_executable_override(self):
+        def start(process, args, env=None, shell=False, executable=None):
+            self.assertIsInstance(args, tuple)
+            self.dispatch('subprocess.Popen', executable or ('cmd.exe' if shell else None),
+                          subprocess.list2cmdline(args), None, env)
+        subprocess.Popen.__init__ = start
+        guard.install_guard()
+        subprocess.Popen.__init__(object(), [sys.executable, '-c', 'print("codex claude")'])
+        for options in ({'shell': True}, {'executable': 'codex.exe'}):
+            with self.subTest(options=options), self.assertRaises(RuntimeError):
+                subprocess.Popen.__init__(object(),
+                    (sys.executable, '-c', 'print("codex claude")'), **options)
+
     def test_changed_environment_is_prepared_again_and_start_failure_clears_scope(self):
         def start(process, args, env=None):
             env["LOOP_MANAGER_VERIFY_SECRET"] = "private-test-value"
@@ -840,7 +853,7 @@ class RunnerPoolTests(unittest.TestCase):
     def test_linux_bootstrap_preserves_worker_input_pipe(self):
         with tempfile.TemporaryDirectory() as directory:
             process = mock.Mock()
-            with mock.patch.object(sys, "platform", "linux"), mock.patch.object(runner, "os", SimpleNamespace(name="posix", environ=os.environ)), mock.patch.object(
+            with mock.patch.object(sys, "platform", "linux"), mock.patch("loop_manager_internal.verification.core.os", SimpleNamespace(name="posix", environ=os.environ)), mock.patch.object(
                 runner.subprocess, "Popen", return_value=process) as launch:
                 worker = runner.start_worker("token", 0, Path(directory))
             try:

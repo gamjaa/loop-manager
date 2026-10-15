@@ -27,6 +27,7 @@ class ProviderExecutionFixture:
         self.state = self.root / 'state'
         self.worktree = self.state / 'worktrees' / 'review'
         self.worktree.mkdir(parents=True)
+        (self.worktree / '.git').mkdir()
         self.source.mkdir()
         self.config = self.root / 'config.ini'
         self.config.write_text('[codex]\nfast_mode=false\n')
@@ -53,6 +54,8 @@ class ProviderExecutionFixture:
             mock.patch.object(isolation, 'inspect_worktree', return_value=self.boundary),
             mock.patch.object(isolation, 'prepare_launch', side_effect=self.prepare_launch),
             mock.patch.object(isolation.CodexLaunch, 'probe'),
+            mock.patch.object(isolation.CodexLaunch, 'start', side_effect=
+                              lambda arguments, launch_process, **kwargs: launch_process(arguments, **kwargs)),
             mock.patch.object(isolation.CodexLaunch, 'stop'),
             mock.patch.object(isolation.subprocess, 'run', return_value=subprocess.CompletedProcess([], 0, 'codex-cli 0.159.3')),
             mock.patch.object(provider_guidance, '_probe', side_effect=self.native_probe),

@@ -54,6 +54,7 @@ class VerifyContractTests(unittest.TestCase):
         (self.root / 'scripts').mkdir()
         (self.root / 'tests').mkdir()
         (self.root / 'scripts/verify.sh').write_text('existing verify')
+        (self.root / 'scripts/verify.ps1').write_text('existing verify')
         self.declaration = {
             'version': 1, 'adapter': 'unittest', 'environment': {'python': 'launcher'},
             'stages': [{'id': 'tests', 'kind': 'tests', 'cwd': '.',

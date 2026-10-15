@@ -234,7 +234,7 @@ class ExecutionPublicationPhaseTests(ExecutionRecoveryScenarios, ExecutionPhaseS
 
     def test_manual_stage_owned_pr_requires_fresh_validation_before_publication(self):
         self._legacy_rebase_false_block_recovery(
-            plan_block=True, existing_pr=True, manual='staged',
+            plan_block=True, existing_pr=True, manual='staged', continue_to_publication=True,
         )
 
 

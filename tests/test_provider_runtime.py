@@ -13,14 +13,14 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 import loop_manager
-from tests.support.profiles import profile_config, use_empty_provider_home
+from tests.support.profiles import profile_config, fake_provider_home
 from tests.support.fixed_samples import PROJECT_FILES
 from tests.support.worker import worker_result
 
 
 class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
     def setUp(self):
-        use_empty_provider_home(self)
+        self.enterContext(fake_provider_home())
 
     def test_missing_saved_session_starts_a_new_session(self):
         messages = (
@@ -919,7 +919,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
 
 class CommonGuidanceProviderTests(unittest.TestCase):
     def setUp(self):
-        use_empty_provider_home(self)
+        self.enterContext(fake_provider_home())
         from loop_manager_internal.agents import common_guidance, provider_guidance
         self.provider_guidance = provider_guidance
         self.temporary = tempfile.TemporaryDirectory()
@@ -1096,7 +1096,7 @@ class CommonGuidanceProviderTests(unittest.TestCase):
 
 class ProcessStartBoundaryTests(unittest.TestCase):
     def setUp(self):
-        use_empty_provider_home(self)
+        self.enterContext(fake_provider_home())
 
     def test_both_providers_observe_launch_before_prompt_and_not_on_launch_error(self):
         config = profile_config(self)

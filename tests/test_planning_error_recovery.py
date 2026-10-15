@@ -1,5 +1,6 @@
 import hashlib
 import io
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -249,7 +250,7 @@ class PlanningErrorRecoveryTest(unittest.TestCase):
                 )
 
             self.assertIn(error, stderr.getvalue())
-            self.assertIn(str(preserved_worktree), stderr.getvalue())
+            self.assertIn(json.dumps(str(preserved_worktree), ensure_ascii=False)[1:-1], stderr.getvalue())
             planner.assert_not_called()
 
     @dummy_worker_sessions

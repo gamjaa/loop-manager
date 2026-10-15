@@ -323,7 +323,7 @@ class ProvisionalFileReviewTest(unittest.TestCase):
             if isinstance(content, bytes):
                 target.write_bytes(content)
             else:
-                target.write_text(content, encoding="utf-8")
+                target.write_text(content, encoding="utf-8", newline="\n")
         self.git("add", "-A")
         self.git("commit", "-m", "source")
         revision = self.git("rev-parse", "HEAD")

@@ -11,6 +11,7 @@ from tests.support.catalog import write_execplan
 from tests.support.git import git_command, make_remote_repository, commit_and_push
 from tests.support.lifecycle import register_connection_cleanup
 from tests.support.fixed_samples import PROJECT_FILES
+from tests.support.profiles import fake_provider_home
 
 
 def worker_result(
@@ -79,7 +80,7 @@ def dummy_worker_context(*, roles=("worker",), fixed_guidance=True):
                     if fixed_guidance else contextlib.nullcontext())
     with mock.patch.object(loop_manager, '_agent_profile', side_effect=profile), \
          mock.patch.object(loop_manager, '_ExecutionLifecyclePorts', side_effect=ports), \
-         mock.patch.object(loop_manager, 'command', side_effect=command), runtime_root:
+         mock.patch.object(loop_manager, 'command', side_effect=command), runtime_root, fake_provider_home():
         yield
 
 

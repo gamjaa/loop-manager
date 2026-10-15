@@ -10,7 +10,7 @@ from unittest import mock
 
 from loop_manager_internal.agents import agent_profiles as profiles, provider_home as homes
 from loop_manager_internal.agents import agent_codex_sandbox as sandbox, agent_write_isolation as isolation
-from tests.support.workspace import native_agent_boundary
+from tests.support.workspace import native_agent_boundary, symlink_or_skip
 
 
 class ProviderHomeTests(unittest.TestCase):
@@ -18,6 +18,9 @@ class ProviderHomeTests(unittest.TestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         self.root = Path(temporary.name).resolve()
+        (self.root / '.git').mkdir()
+        self.enterContext(mock.patch('loop_manager_internal.agents.windows_runtime.assert_private_directory'))
+        self.enterContext(mock.patch.object(Path, 'symlink_to', new=symlink_or_skip))
         self.user = self.root / 'user'
         self.state = self.root / 'state'
         self.variables = {'HOME': str(self.user), 'USERPROFILE': str(self.user), 'PATH': '/bin',
@@ -123,7 +126,6 @@ class ProviderHomeTests(unittest.TestCase):
     def test_auth_check_and_model_lookup_share_dedicated_environment(self):
         for provider in homes.PROVIDERS:
             with self.subTest(provider=provider):
-                self.source(provider)
                 variable = homes.PROVIDERS[provider][0]
                 observed = []
                 def catalog(*args):
@@ -237,7 +239,6 @@ class ProviderHomeTests(unittest.TestCase):
     def test_parallel_roles_share_home_but_keep_call_directories_and_permissions_separate(self):
         boundary, state, _ = native_agent_boundary(self.root / 'parallel')
         env = self.environment(state=state)
-        self.source()
         with ThreadPoolExecutor(max_workers=2) as pool:
             worker, reviewer = list(pool.map(lambda role: sandbox.prepare_launch(
                 boundary, state, role, role == 'reviewer', (), env), ('worker', 'reviewer')))

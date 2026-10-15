@@ -6,14 +6,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
-from tests.support.profiles import profile_config, use_empty_provider_home
+from tests.support.profiles import profile_config, fake_provider_home
 from tests.support.fixed_samples import PROVIDER_PROFILES
 from loop_manager_internal.agents import agent_profiles
 
 
 class ProviderProfilesTest(unittest.TestCase):
     def setUp(self):
-        use_empty_provider_home(self)
+        self.enterContext(fake_provider_home())
 
     def test_role_resolves_model_alias(self):
         config = profile_config(self)

@@ -7,12 +7,12 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
-from tests.support.profiles import profile_config, use_empty_provider_home
+from tests.support.profiles import profile_config, fake_provider_home
 
 
 class PlannerSessionsTest(unittest.TestCase):
     def setUp(self):
-        use_empty_provider_home(self)
+        self.enterContext(fake_provider_home())
 
     def test_planner_codex_persists_thread_id_and_resumes_exact_session(self):
         config = profile_config(self)

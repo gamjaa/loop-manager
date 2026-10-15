@@ -1,5 +1,6 @@
 """예제 설정과 독립된 Agent profile 테스트 설정."""
 from pathlib import Path
+from contextlib import contextmanager
 import os
 import tempfile
 from unittest import mock
@@ -12,6 +13,15 @@ def use_empty_provider_home(test_case):
     test_case.enterContext(mock.patch.dict(os.environ, {
         'HOME': directory.name, 'USERPROFILE': directory.name,
     }))
+
+
+@contextmanager
+def fake_provider_home():
+    """명령·정책 테스트의 인증 입력과 외부 ACL 관측을 고정한다."""
+    with tempfile.TemporaryDirectory() as directory, \
+         mock.patch.dict(os.environ, {'HOME': directory, 'USERPROFILE': directory}), \
+         mock.patch('loop_manager_internal.agents.windows_runtime.assert_private_directory'):
+        yield
 
 
 def profile_config(test_case):

@@ -2,7 +2,6 @@ from contextlib import closing, ExitStack
 import json
 import io
 import sqlite3
-import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -174,6 +173,8 @@ class PlannerInterruptionRecoveryTest(unittest.TestCase):
             self.assertIsNone(resumed["planning_error"])
 
     def test_interrupted_planner_persists_started_session_and_resumes(self):
+        from tests.support.profiles import fake_provider_home
+        self.enterContext(fake_provider_home())
         session_id = "0199a213-81c0-7800-8aa1-bbab2a035a53"
         thread_event = json.dumps(
             {"type": "thread.started", "thread_id": session_id}
@@ -200,13 +201,6 @@ class PlannerInterruptionRecoveryTest(unittest.TestCase):
                 self.killed = True
 
         process = InterruptedProcess()
-        real_popen = subprocess.Popen
-
-        def start_process(arguments, *args, **kwargs):
-            if arguments[0] == "codex":
-                return process
-            return real_popen(arguments, *args, **kwargs)
-
         resumed_sessions = []
 
         def verified_preflight(_provider, _role, worktree, _state_dir,
@@ -224,12 +218,13 @@ class PlannerInterruptionRecoveryTest(unittest.TestCase):
                 1, "stop after persisted session check", kwargs["session_id"]
             )
 
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
             repo = make_remote_repository(directory)
             state_dir = Path(directory) / "state"
             state_dir.mkdir()
             config = profile_config(self)
             connection = loop_manager.connect_database(state_dir, create=True)
+            cleanup.callback(connection.close)
 
             with mock.patch.object(provider_guidance, '_probe', return_value='codex-cli 0.159.3'), mock.patch.object(
                 provider_guidance, '_developer_texts', side_effect=native_developer_texts), mock.patch(
@@ -242,7 +237,8 @@ class PlannerInterruptionRecoveryTest(unittest.TestCase):
                 "loop_manager.codex_model_efforts",
                 return_value={"test-strong": frozenset({"xhigh"})},
             ), mock.patch(
-                "loop_manager.subprocess.Popen", side_effect=start_process
+                "loop_manager_internal.agents.agent_codex_sandbox.CodexLaunch.start",
+                return_value=process,
             ), mock.patch(
                 "loop_manager.agent_write_isolation.prepare_isolation",
                 side_effect=verified_preflight,

@@ -31,7 +31,17 @@ PR 보고 규칙에 따라 수정한다. 파일을 수정해도 현재 작업에
 변경한 동작을 확인하는 최소 범위의 unit test를 실행한다. 문서만 변경했거나 실행 가능한
 관련 테스트가 없으면 그 사유를 결과에 명시한다.
 
-Windows 환경에서 WSL로 verify를 진행할 때는 `/tmp/` 아래에 실행별 전용 디렉터리를 만들고,
+Windows 개발 환경에서 이 저장소의 전체 verify와 대규모 Git·CLI 통합 테스트는 WSL에서
+실행한다. 이 기준은 Loop Manager 자체 개발에만 적용하며 다른 등록 프로젝트의 verify
+실행 환경을 지정하지 않는다.
+
+Windows 고유 동작은 변경과 관련된 최소 native 회귀로 별도 확인한다. 경로·명령 인자·CRLF·
+ACL·Job 종료·SQLite 파일 잠금·중첩 Python guard와 필요한 실제 Git 파일 보존 효과를 포함한다.
+WSL 전체 verify와 Windows 핵심 회귀 결과는 구분해서 보고하며, 이 조합을 Windows 전체
+verify 통과로 표기하지 않는다. `scripts/verify.ps1`은 native Windows 진입점을 유지하고
+WSL 전환이나 Windows 검증 범위 선정을 자동으로 수행하지 않는다.
+
+WSL verify는 `/tmp/` 아래에 실행별 전용 디렉터리를 만들고,
 그 안에 검증 대상 변경을 반영한 프로젝트 복사본과 임시 파일 폴더를 생성해 사용한다.
 프로젝트 복사본의 Git 메타데이터는 WSL에서 유효해야 하며, 임시 파일은 `TMPDIR`, `TMP`, `TEMP`를
 해당 임시 파일 폴더로 지정해 사용한다. 검증 종료 후에는 성공·실패 여부와 관계없이 이번 실행에서

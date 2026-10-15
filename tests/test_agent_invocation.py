@@ -1060,7 +1060,7 @@ class ProcessStartNotificationTests(TestCase):
         self.connection.execute(
             "UPDATE projects SET agent_role = 'planner_check', agent_snapshot = ?, worktree = ? WHERE repo = 'repo'",
             (manager.GitSnapshot('head', None, {}, {}, {}, {}, {}, {}, scope_id='planning-scope').serialize(),
-             str(Path('/worktree').resolve())),
+             str(Path('/worktree'))),
         )
         self.connection.commit()
         manager.update_project(self.connection, 'repo', planning_error='original planning cause')

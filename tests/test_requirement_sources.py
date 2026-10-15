@@ -103,7 +103,8 @@ class RequirementSourceResolutionTest(unittest.TestCase):
             requirements.mkdir(parents=True)
             target = root / "target.md"
             target.write_text("# [R-001] Target\n", encoding="utf-8")
-            (requirements / "[R-001] Link.md").symlink_to(target)
+            from tests.support.workspace import symlink_or_skip
+            symlink_or_skip(requirements / "[R-001] Link.md", target)
             with self.assertRaises(requirement_sources.RequirementSourceLookupError):
                 requirement_sources.worktree_requirement_documents(root)
 
@@ -263,7 +264,7 @@ class RequirementSourceFingerprintTest(unittest.TestCase):
             (root / plan["path"]).parent.mkdir(parents=True)
             (root / plan["path"]).write_text("plan", encoding="utf-8")
             (root / renamed).parent.mkdir(parents=True)
-            (root / renamed).write_text(contents, encoding="utf-8")
+            (root / renamed).write_text(contents, encoding="utf-8", newline="\n")
             self.assertEqual(
                 _worktree_execplan_input_fingerprint(worktree_effects, root, plan),
                 "worktree",

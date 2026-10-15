@@ -423,9 +423,9 @@ class TieredRootReviewTest(MaintenancePlanningCase):
             repository.evidence(str(self.repo), 1, revision)
 
     def test_mixed_tree_investigates_sources_and_excluded_roots_with_launcher_evidence(self):
-        (self.repo / "requirements-prod.txt").write_text("example==1.0\n", encoding="utf-8")
-        (self.repo / "brand.svg").write_text("<svg><title>Brand</title></svg>\n", encoding="utf-8")
-        (self.repo / "run.sh").write_text("#!/bin/sh\nexec python3 app.py\n", encoding="utf-8")
+        (self.repo / "requirements-prod.txt").write_text("example==1.0\n", encoding="utf-8", newline="\n")
+        (self.repo / "brand.svg").write_text("<svg><title>Brand</title></svg>\n", encoding="utf-8", newline="\n")
+        (self.repo / "run.sh").write_text("#!/bin/sh\nexec python3 app.py\n", encoding="utf-8", newline="\n")
         git(self.repo, "add", "-A")
         git(self.repo, "commit", "-m", "Add root manifest, asset, and launcher")
         revision = git(self.repo, "rev-parse", "HEAD")

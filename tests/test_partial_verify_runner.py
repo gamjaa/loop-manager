@@ -74,6 +74,7 @@ class PartialRunnerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / 'scripts').mkdir()
+            (root / 'scripts/verify.ps1').write_text('verify')
             (root / 'scripts/verify.sh').write_text('verify')
             output = VerifyProcessOutput('timeout output', exit_code=1)
             report = {'kind': 'partial_verify', 'status': 'ERROR', 'diagnostic': '/logs/partial/summary.json'}
@@ -233,7 +234,10 @@ class PartialRunnerTests(unittest.TestCase):
                 if mode == 'partial':
                     arguments += ['--partial-base', base]
                 passed, timed_out, output = run_verify_process(arguments, root, 30, environment=environment, job_scope=True)
-                self.assertTrue(passed, str(output))
+                self.assertTrue(passed, f'{mode}: timed_out={timed_out}, '
+                                f'exit_code={getattr(output, "exit_code", None)}; {output}; '
+                                + '\n'.join(path.read_text(encoding='utf-8', errors='replace')[-3000:]
+                                            for path in logs.rglob('*.log')))
                 self.assertFalse(timed_out)
                 reports.append(json.loads((logs / 'manifest.json').read_text()))
                 if mode == 'partial':

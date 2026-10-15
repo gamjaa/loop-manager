@@ -31,7 +31,7 @@ class ExecutionCheckpointRecoveryPhaseTests(ExecutionRecoveryScenarios, Executio
 
 
     def test_legacy_rebase_false_block_recovers_after_restart_with_later_file_changes(self):
-        self._legacy_rebase_false_block_recovery(plan_block=True)
+        self._legacy_rebase_false_block_recovery(plan_block=True, continue_to_publication=True)
 
 
     def test_legacy_rebase_project_block_recovers_after_restart_with_later_file_changes(self):

@@ -1,6 +1,7 @@
 """Publication policy uses real SQLite/files and mocked Git command observations."""
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import subprocess
@@ -71,7 +72,7 @@ class GitObservations:
         raise AssertionError((command, args))
 
     def files(self, workspace):
-        return {str(path.relative_to(workspace)): path.read_bytes()
+        return {path.relative_to(workspace).as_posix(): path.read_bytes()
                 for path in workspace.rglob('*') if path.is_file()}
 
     def git(self, repo, command, *args, check=True):
@@ -445,8 +446,13 @@ class RequirementCorrectionPublicationTest(unittest.TestCase):
             self.publisher.dispatch('main')
         saved = self.publisher.repository.pending('repo')
         target = self.publisher._workspace(saved['operation_id']) / NEW
-        target.chmod(0o755)
-        with self.assertRaisesRegex(CorrectionPending, 'mode'):
+        original_stat = Path.stat
+        observed = target.stat()
+        changed = os.stat_result((observed.st_mode | 0o111, *observed[1:]))
+        with mock.patch.object(Path, 'stat', autospec=True, side_effect=
+                               lambda path, *args, **kwargs: changed if path == target
+                               else original_stat(path, *args, **kwargs)), \
+             self.assertRaisesRegex(CorrectionPending, 'mode'):
             self.publisher.dispatch('main')
         self.assertEqual((self.observations.commits, self.observations.pushes), (1, 1))
 

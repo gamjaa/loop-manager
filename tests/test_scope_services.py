@@ -1,6 +1,7 @@
 """Scope service contracts using real repositories and synthetic Git evidence."""
 
 from dataclasses import replace
+from contextlib import closing
 import hashlib
 import json
 from pathlib import Path
@@ -487,7 +488,7 @@ class ScopeInvocationDigestTests(TestCase):
                 # Reload the persisted DB, rather than trusting in-memory proof.
                 self.connection.commit()
                 path = self.state / (role + '.sqlite')
-                with sqlite3.connect(path) as saved:
+                with closing(sqlite3.connect(path)) as saved, saved:
                     self.connection.backup(saved)
                 self.connection.close()
                 self.connection = sqlite3.connect(path)

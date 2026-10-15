@@ -22,9 +22,13 @@ from loop_manager_internal.agents import agent_write_isolation as isolation
 from loop_manager_internal.agents import provider_adapters
 from loop_manager_internal.storage import agent_invocation_state as state
 from tests.support.workspace import native_agent_boundary, pin_common_guidance
+from tests.support.profiles import use_empty_provider_home
 
 
 class NativePlatformAgentTests(unittest.TestCase):
+    def setUp(self):
+        use_empty_provider_home(self)
+
     def test_windows_job_cleanup_failure_cannot_later_become_finish_proof(self):
         from loop_manager_internal.agents import windows_runtime
         import threading
@@ -166,8 +170,8 @@ class NativePlatformAgentTests(unittest.TestCase):
                     self.assertEqual(pointer.read_bytes(), content)
 
     def test_probe_failure_blocks_provider_and_preserves_prior_invocation_and_files(self):
-        host_run = subprocess.run
-        host_spawn = subprocess.Popen
+        # 권한 자체는 위의 실제 ACL 회귀 검증에서 확인한다.
+        self.enterContext(mock.patch('loop_manager_internal.agents.windows_runtime.assert_private_directory'))
         probe_prefix = (('codex', '-c', 'windows.sandbox="elevated"', 'sandbox')
                         if os.name == 'nt' else ('codex', 'sandbox'))
         for system in ('Linux', 'Darwin', 'Windows'):
@@ -204,9 +208,6 @@ class NativePlatformAgentTests(unittest.TestCase):
                                 path.write_text('saved content')
 
                             def run(command, **kwargs):
-                                if command[0] == 'powershell.exe':
-                                    with mock.patch.object(subprocess, 'Popen', host_spawn):
-                                        return host_run(command, **kwargs)
                                 if command == ['codex', '--version']:
                                     return subprocess.CompletedProcess(command, 0, 'codex-cli 0.159.3', '')
                                 if tuple(command[-2:]) == ('features', 'list'):
@@ -221,7 +222,7 @@ class NativePlatformAgentTests(unittest.TestCase):
                                  mock.patch.object(manager, 'capture_git_snapshot', return_value=
                                                    mock.Mock(serialize=lambda: 'snapshot')), \
                                  mock.patch.object(isolation.subprocess, 'run', side_effect=run), \
-                                 mock.patch.object(manager.subprocess, 'Popen') as spawn:
+                                 mock.patch.object(manager, '_handoff_popen') as spawn:
                                 with self.assertRaisesRegex(isolation.IsolationError, '쓰기 경계'):
                                     manager.run_agent('codex', boundary.worktree, state_root,
                                         state_root / 'config', role, 'prompt', read_only=role == 'reviewer',

@@ -32,7 +32,8 @@ from tests.support.execution import READY_WORKER_RESULT
 class ExecutionRecoveryScenarios:
     def _legacy_rebase_false_block_recovery(self, *, plan_block, rejected=None,
                                           existing_pr=False, published_checkpoint=False,
-                                          stale_cache=False, manual=None, scope_stage_block=False):
+                                          stale_cache=False, manual=None, scope_stage_block=False,
+                                          continue_to_publication=False):
         self.journal_start.stop()
         boundary = self.enterContext(RecoveryBoundary()) if isinstance(rejected, tuple) else None
         fixture = blocked_git_fixture(self, directory=boundary.directory if boundary else None)
@@ -382,8 +383,10 @@ class ExecutionRecoveryScenarios:
             self.assertEqual(app.read_text().splitlines()[12], 'later-12')
         fixture.verify_probe.assert_not_called()
         fixture.reviewer_probe.assert_not_called()
-        git(fixture.repo, 'push', 'origin', 'main')
-        self._continue_recovered_rebase(fixture, target, pull_request)
+        # 복구 조합은 위의 파일·journal·SQLite 효과까지, 후속 게시는 대표 경로에서 확인한다.
+        if continue_to_publication:
+            git(fixture.repo, 'push', 'origin', 'main')
+            self._continue_recovered_rebase(fixture, target, pull_request)
 
 
     def _continue_recovered_rebase(self, fixture, target, pull_request):

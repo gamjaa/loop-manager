@@ -17,11 +17,12 @@ from loop_manager_internal.config.managed_config import (
     ManagedConfigError, fast_mode_scope, fast_mode_settings, load_managed_config, provider_fast_mode,
 )
 from loop_manager_internal.runtime.project_registry import RegisteredProject
-from tests.support.profiles import profile_config
+from tests.support.profiles import profile_config, fake_provider_home
 
 
 class FastModeTests(TestCase):
     def setUp(self):
+        self.enterContext(fake_provider_home())
         self.config = profile_config(self)
         self.original = self.config.read_text(encoding="utf-8")
         temporary = tempfile.TemporaryDirectory()

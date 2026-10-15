@@ -11,10 +11,12 @@ from loop_manager_internal.agents import agent_invocation as invocation
 from loop_manager_internal.agents import agent_write_isolation as isolation
 from loop_manager_internal.storage import agent_invocation_state as state
 import loop_manager as manager
+from tests.support.profiles import use_empty_provider_home
 
 
 class WriteIsolationTests(TestCase):
     def setUp(self):
+        use_empty_provider_home(self)
         # 임시 worktree의 상위 사용자 설정이 테스트로 유입되지 않게 한다.
         directory = tempfile.TemporaryDirectory()
         self.addCleanup(directory.cleanup)
@@ -322,7 +324,7 @@ class WriteIsolationTests(TestCase):
                  mock.patch.object(isolation.subprocess, 'run', return_value=
                                    manager.subprocess.CompletedProcess(
                                        ['codex', '--version'], 0, 'codex-cli 0.159.3\n', '')), \
-                 mock.patch.object(manager.subprocess, 'Popen') as launch:
+                 mock.patch.object(manager, '_handoff_popen') as launch:
                 with self.assertRaisesRegex(isolation.IsolationError, '파일 도구'):
                     manager.run_agent(
                         'codex',
@@ -421,7 +423,7 @@ class WriteIsolationTests(TestCase):
 
         with mock.patch.object(isolation, 'prepare_isolation', side_effect=reject), \
              mock.patch.object(provider_guidance, '_probe', return_value='codex-cli 0.159.3'), \
-             mock.patch.object(manager.subprocess, 'Popen') as launch:
+             mock.patch.object(manager, '_handoff_popen') as launch:
             with self.assertRaisesRegex(isolation.IsolationError, 'sandbox unavailable'):
                 manager.run_agent('codex', Path('/worktree'), self.state_dir,
                                   Path('/config'), 'worker', 'secret prompt',
@@ -448,7 +450,7 @@ class WriteIsolationTests(TestCase):
                 raise isolation.IsolationError('file tool unverified')
 
             with mock.patch.object(isolation, 'prepare_isolation', side_effect=reject), \
-                 mock.patch.object(manager.subprocess, 'Popen') as launch:
+                 mock.patch.object(manager, '_handoff_popen') as launch:
                 with self.assertRaisesRegex(isolation.IsolationError, 'file tool unverified'):
                     manager.run_claude(
                         root, root, root / 'config', 'reviewer', 'prompt',

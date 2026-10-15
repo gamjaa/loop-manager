@@ -1,5 +1,6 @@
 """Targeted test 실행 원본, 연속성, 중복과 Worker 최종 차단 경계."""
 import io
+from contextlib import closing
 import json
 import os
 from pathlib import Path
@@ -63,10 +64,10 @@ class TargetedHistoryTests(TestCase):
     def test_database_restart_preserves_individual_test_history(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'state.db'
-            with sqlite3.connect(path) as first:
+            with closing(sqlite3.connect(path)) as first, first:
                 ensure_schema(first)
                 TargetedTestRepository(first).observe('repo', 'G-1', [event('a'), event('b')])
-            with sqlite3.connect(path) as second:
+            with closing(sqlite3.connect(path)) as second, second:
                 repository = TargetedTestRepository(second)
                 repository.observe('repo', 'G-1', [event('b'), event('c')])
                 self.assertTrue(repository.repeated('repo', 'G-1'))
