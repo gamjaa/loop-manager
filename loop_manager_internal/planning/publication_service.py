@@ -325,7 +325,8 @@ class PlanningPublicationService(PlanningService):
             return None
 
         plans = list(validated_result.plans)
-        if run.dirty_files:
+        # Validation can add Manager-owned changes after the Planner's dirty snapshot.
+        if self._ports.git.changed_files(worktree):
             present, deleted = [], []
             for path in validated_result.publication_paths:
                 target = worktree / path

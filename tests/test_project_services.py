@@ -16,6 +16,47 @@ from tests.support.database import runtime_connection
 
 
 class ProjectServiceCompositionTests(unittest.TestCase):
+    def test_project_recovery_routes_to_planning_while_execution_is_paused(self):
+        for planning_owns_slot in (False, True):
+            with self.subTest(planning_owns_slot=planning_owns_slot):
+                connection = runtime_connection()
+                self.addCleanup(connection.close)
+                connection.execute('UPDATE projects SET planning_attempt_fingerprint = NULL')
+                connection.commit()
+                repository = loop_manager.runtime_state.RuntimeStateRepository(connection)
+                repository.activate('repo', 'G-047', activation_sha='base',
+                    branch='loop-manager/G-047', worktree='/state/G-047')
+                if planning_owns_slot:
+                    repository.pause_execution_for_planning(repository.planning('repo'), 'G-047')
+                self.assertIsNotNone(repository.active_row('repo'))
+                effects = SimpleNamespace(_recorded_base_fetch=mock.Mock(),
+                    _check_runtime_handoff=mock.Mock(), _PlanningLifecyclePorts=mock.Mock(),
+                    is_loop_manager_repository=mock.Mock(return_value=False),
+                    _planning_outcome_step_result=mock.Mock(return_value=None))
+                identity = project_service.ProjectIdentity(connection, Path('/state'), 'repo',
+                    Path('/config.ini'), None, False, None, True, None, 20, 600, None,
+                    recovery_request_id='request')
+                service = project_service.ProjectService(effects, identity)
+                service.state.repo = 'repo'
+                service.state.base = 'main'
+                service.state.row = connection.execute('SELECT * FROM projects').fetchone()
+                with mock.patch.object(service, '_refresh_catalog', return_value='base'), \
+                     mock.patch.object(service, '_dispatch_execution', return_value=0) as execution, \
+                     mock.patch.object(project_service, 'PlanningLifecycleCoordinator') as planning:
+                    planning.return_value.run.return_value = project_service.PlanningOutcome(
+                        project_service.PlanningOutcomeKind.NO_CHANGE)
+
+                    self.assertEqual(service._run_coordinators(), 0)
+
+                if planning_owns_slot:
+                    execution.assert_not_called()
+                    context = planning.return_value.run.call_args.args[0]
+                    self.assertTrue(context.local_environment_recheck)
+                    self.assertEqual(context.recovery_request_id, 'request')
+                else:
+                    execution.assert_called_once_with(mock.ANY, newly_activated=False)
+                    planning.assert_not_called()
+
     def test_execution_planning_waits_only_for_controlling_git_operations(self):
         effects = git_ports.PlanningGitPortsEffects(**{field.name: mock.Mock()
             for field in fields(git_ports.PlanningGitPortsEffects)})

@@ -323,6 +323,7 @@ class CodeMapPublicationTest(PlanningCase):
             return original_git(repo, *args, **kwargs)
 
         ports.git.run = git
+        ports.git.changed_files = lambda *_args: ([artifact.ARTIFACT_PATH] if ports.artifact_dirty else [])
         coordinator = PlanningLifecycleCoordinator(ports)
         run = coordinator._new_run(self.context)
         run.planning_worktree = Path("/planning")

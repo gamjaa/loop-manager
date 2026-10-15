@@ -864,7 +864,9 @@ class ProjectService:
                     "실행 중인 로컬 복구 단계가 없습니다. 프로젝트 환경과 저장된 차단 원인을 확인했습니다."
                 )
                 return 0
-            if active is not None or self.identity.recovery_plan_id is not None:
+            if self.identity.recovery_plan_id is not None or (
+                active is not None and not runtime_state.planning_owns_execution_slot(self.state.row)
+            ):
                 return self._dispatch_execution(runtime_repository, newly_activated=False)
         planning_context = PlanningContext(
             repo=self.state.repo,

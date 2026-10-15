@@ -45,6 +45,43 @@ from tests.support.planning_case import (
 )
 
 class PlanningPublicationTest(PlanningCase):
+    def test_publication_uses_current_changes_after_manager_validation(self):
+        path = "docs/plans/[G-001] Plan.md"
+        for manager_changed in (True, False):
+            with self.subTest(manager_changed=manager_changed), tempfile.TemporaryDirectory() as directory:
+                worktree = Path(directory)
+                target = worktree / path
+                target.parent.mkdir(parents=True)
+                target.write_text("validated decision log", encoding="utf-8")
+                ports = FakePorts(planning_snapshot(phase="PLANNING", active_sha="base",
+                    worktree=directory, planning_workspace_owned=1))
+                ports.git.dirty_files = [path] if manager_changed else []
+                ports.git.head = "base" if manager_changed else "plan-commit"
+                ports.git.remote = "concurrent-base"
+                coordinator = PlanningLifecycleCoordinator(ports)
+                run = coordinator._new_run(self.context)
+                run.planning_worktree = worktree
+                run.validated_result = ports.validation.result
+                run.validated_result.plans = ()
+                run.validated_result.revisions = (object(),)
+                run.dirty_files = [] if manager_changed else [path]
+                run.current_fingerprint = run.general_fingerprint = "fingerprint"
+                run.specification_fingerprint = "specification"
+                original_intent = ports.state.record_general_intent
+                def record_intent(*args):
+                    self.assertEqual(args[3], "plan-commit")
+                    original_intent(*args)
+                ports.state.record_general_intent = record_intent
+
+                outcome = coordinator._publication._publish_planner_result(run)
+
+                self.assertEqual(outcome.kind, PlanningOutcomeKind.REMOTE_BASE_RESTART_DEFERRED)
+                commands = [args for _repo, args, _check in ports.git.calls]
+                self.assertEqual(sum(args[0] == "commit" for args in commands), int(manager_changed))
+                if manager_changed:
+                    self.assertIn(("add", "--", f":(literal){path}"), commands)
+                self.assertEqual(ports.state.general_intent_record_count, 1)
+
     def _reviewed_publication_connection(self):
         from loop_manager_internal.storage import planning_review_state as reviews
         connection = sqlite3.connect(':memory:')

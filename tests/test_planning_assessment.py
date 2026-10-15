@@ -87,6 +87,7 @@ class PlanningAssessmentTest(PlanningCase):
                 return SimpleNamespace(stdout=output, returncode=0)
 
             ports.git.run = stage_and_commit
+            ports.git.changed_files = loop_manager.changed_files
             # Stop at the staging/commit boundary; remote publication is separate.
             with self.assertRaises(CommitReached):
                 coordinator._publication._publish_planner_result(run)
