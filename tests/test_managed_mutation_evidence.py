@@ -20,6 +20,7 @@ from loop_manager_internal.git import cleanup_service, manager_git_journal as jo
 import loop_manager
 from loop_manager_internal.storage import runtime_state
 from loop_manager_internal.storage.execution_checkpoint_state import ExecutionCheckpointRepository
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 
 
 REPO = str(Path('/repo').resolve())
@@ -958,15 +959,17 @@ class ManagedTransitionTests(unittest.TestCase):
             mock.patch.object(loop_manager, '_current_rebase_service', side_effect=lambda *_a, **_k: case.factory(None)),
             mock.patch.object(loop_manager, '_publish_direct_rebase_checkpoint'),
         ):
-            for pending in (
-                replace(clean, index_clean=False, staged=(FileChange('app.py', '100644', '100644', 'old', 'manual', 'M'),)),
-                replace(clean, index_clean=False, index=(IndexEntry('app.py', '100644', 'unmerged', 2, 'M', 0x2000),)),
-                replace(clean, committed=(FileChange('docs/requirements/archive/UserGuidance.md', '100644', '100644', 'old', 'foreign', 'M'),)),
+            for pending, error in (
+                (replace(clean, index_clean=False, staged=(FileChange('app.py', '100644', '100644', 'old', 'manual', 'M'),)), journal.MutationEvidenceError),
+                (replace(clean, index_clean=False, index=(IndexEntry('app.py', '100644', 'unmerged', 2, 'M', 0x2000),)), journal.MutationEvidenceError),
+                (replace(clean, committed=(FileChange('docs/requirements/archive/UserGuidance.md', '100644', '100644', 'old', 'foreign', 'M'),)), RecoveryFailure),
             ):
-                with self.subTest(pending=pending), self.assertRaises(journal.MutationEvidenceError):
+                with self.subTest(pending=pending), self.assertRaises(error) as caught:
                     case.observed = pending
                     loop_manager._complete_direct_rebase_checkpoint(case.fixture.connection, 'repo', 'G-047',
                         Path('/state/G-047').resolve(), 'base', repo_path=Path(REPO), branch='loop-manager/G-047', agent_session_id=None)
+                if error is RecoveryFailure:
+                    self.assertEqual(caught.exception.reason, RecoveryReason.AGENT_SCOPE_VIOLATION)
                 self.assertEqual(case.checkpoint.get('repo', 'G-047'), original)
             case.observed = replace(clean, committed=(FileChange('app.py', '100644', '100755', 'old', 'manual-new-content', 'M'),))
             loop_manager._complete_direct_rebase_checkpoint(case.fixture.connection, 'repo', 'G-047',
@@ -1048,8 +1051,9 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
         self.assertEqual(begin.call_args.kwargs['expected']['action'], 'skip')
         case.observed = replace(case.observed, index=(IndexEntry('app.py', '100644', 'blob', 0, 'h', 0x8000),))
         with mock.patch.object(journal, 'begin_current_rebase') as begin:
-            with self.assertRaises(journal.MutationEvidenceError):
+            with self.assertRaises(RecoveryFailure) as caught:
                 case.handler._begin_rebase_continuation(case.fixture.context(), CorrectionAction.SKIP)
+            self.assertEqual(caught.exception.reason, RecoveryReason.AGENT_SCOPE_VIOLATION)
             begin.assert_not_called()
 
     def test_continuation_intent_carries_only_matching_saved_stage_files(self):
@@ -1062,8 +1066,9 @@ class DetachedRebaseOwnershipTests(unittest.TestCase):
         self.assertEqual(case.checkpoint.get('repo', 'G-047'), current)
         case.observed = replace(case.observed, staged=(FileChange('docs/requirements/archive/UserGuidance.md', '100644', '100644', 'old', 'foreign', 'M'),))
         with mock.patch.object(journal, 'begin_current_rebase') as begin:
-            with self.assertRaises(journal.MutationEvidenceError):
+            with self.assertRaises(RecoveryFailure) as caught:
                 case.handler._begin_rebase_continuation(case.fixture.context(), CorrectionAction.CONTINUE)
+            self.assertEqual(caught.exception.reason, RecoveryReason.AGENT_SCOPE_VIOLATION)
             begin.assert_not_called()
 
     def test_dropped_rebase_patch_leaves_journal_unverified_for_no_change_gate(self):
@@ -1230,14 +1235,14 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
                                  ('160000', 'current-bytes'))
         ports.git.assert_not_called()
 
-    def _user_document_service(self, document_intent=None):
+    def _user_document_service(self, document_intent=None, *, completed=False):
         from tests.support.runtime import runtime_rebase_fixture
         from loop_manager_internal.git.managed_rebase_runtime import build_service
         connection, _, checkpoints, *_ = runtime_rebase_fixture(self)
         current = checkpoints.get('repo', 'G-047')
         checkpoints.record('repo', 'G-047', expected_generation=current.generation,
             operation='rebase', expected_head='before', target_base_oid='base',
-            observed_remote_oid='remote', snapshot={**current.snapshot,
+            observed_remote_oid='remote', snapshot={**current.snapshot, 'before_head': 'before',
                 **({'rebase_documents': document_intent} if document_intent else {}),
                 'work_branch_integration': {'remote': 'remote', 'local_commit': 'local-user'}})
         ports = mock.Mock()
@@ -1259,7 +1264,43 @@ class CurrentRebaseRuntimeAdapterTests(unittest.TestCase):
         ports._worker_path_allowed.side_effect = loop_manager._worker_path_allowed
         service = build_service(ports, connection, Path(REPO), Path('/state'),
                                 'repo', 'G-047', Path('/owned'), 'loop-manager/G-047')
+        if completed:
+            from tests.support.rebase_observations import decision_for, observation
+            current = checkpoints.get('repo', 'G-047')
+            acceptance = decision_for(service.expected, observation(service.expected,
+                input_fingerprint=service.expected.input_fingerprint,
+                scope_fingerprint=service.expected.scope_fingerprint)).acceptance
+            checkpoints.record('repo', 'G-047', expected_generation=current.generation,
+                operation=None, expected_head=acceptance['head'], target_base_oid='base',
+                observed_remote_oid='remote', snapshot={**current.snapshot,
+                    'current_rebase_acceptance': acceptance})
+            ports._owned_rebase_metadata.return_value = None
+            service = build_service(ports, connection, Path(REPO), Path('/state'),
+                                    'repo', 'G-047', Path('/owned'), 'loop-manager/G-047')
         return ports, service
+
+    def test_adopted_document_pin_does_not_reject_later_worker_notes(self):
+        from tests.support.rebase_observations import observation
+        from loop_manager_internal.git.managed_rebase_validation import WorktreeFile, assess_scope
+        path = 'docs/plans/[G-047] Runtime.md'
+        for state in ('prepared', 'staged'):
+            record = {'state': state, 'target': 'base', 'before_head': 'before',
+                'paths': [path], 'originals': {path: {'base': {'mode': '100644', 'oid': 'pinned'}}}}
+            for completed in (False, True):
+                with self.subTest(state=state, completed=completed):
+                    _, service = self._user_document_service(record, completed=completed)
+                    current = observation(service.expected,
+                        index=(IndexEntry(path, '100644', 'pinned', 0, 'H', 0),),
+                        files=(WorktreeFile(path, ('unstaged',), '100644', 'new-worker-notes'),))
+                    def scope(value):
+                        return assess_scope(service.expected, value,
+                            path_allowed=service.adapters.path_allowed,
+                            contracts_allowed=service.adapters.contracts_allowed)
+                    self.assertEqual(scope(current).allowed, completed)
+                    self.assertFalse(scope(replace(current, files=(replace(
+                        current.files[0], path='docs/requirements/Protected.md'),))).allowed)
+                    self.assertFalse(scope(replace(current, files=(replace(
+                        current.files[0], path='docs/plans/[G-048] Other.md'),))).allowed)
 
     def test_clean_replay_head_and_staged_document_are_checked_separately(self):
         from tests.support.rebase_observations import observation

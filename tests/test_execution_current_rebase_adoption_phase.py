@@ -10,6 +10,7 @@ from loop_manager_internal.execution import execution_handlers as handlers
 import loop_manager as lm
 from loop_manager_internal.execution.execution_runtime import ExecutionPhase, ExecutionOutcomeKind
 from tests.support.execution import VALID_WORKER_RESULT
+from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
 
 
 from tests.support.execution_assertions import _assert_manual_autostash_recovery
@@ -224,6 +225,13 @@ class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
 
 
     def test_manual_completion_without_journal_invalidates_worker_and_validation_once(self):
+        current = self.checkpoint.get('repo', 'G-047')
+        documents = {'state': 'staged', 'paths': [self.expected.plan_path],
+                     'history': [{'state': 'prepared', 'originals': {'saved': 'blob'}}]}
+        self.checkpoint.record('repo', 'G-047', expected_generation=current.generation,
+            operation=current.operation, expected_head=current.expected_head,
+            target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+            snapshot={**current.snapshot, 'rebase_documents': documents})
         with mock.patch.object(handlers.manager_git_journal, 'verified_rebase_completion',
                                side_effect=AssertionError('history must not gate acceptance')):
             self.handler._complete_rebase_intent(self.fixture.context())
@@ -233,6 +241,8 @@ class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
         self.assertEqual(saved.snapshot['failure'], 'old failure')
         self.assertEqual(saved.snapshot['stage_evidence'], {'old': 'audit'})
         self.assertEqual(saved.snapshot['rebase_revalidation_audit'][0]['verify_result'], 'old verify')
+        self.assertNotIn('rebase_documents', saved.snapshot)
+        self.assertEqual(saved.snapshot['rebase_revalidation_audit'][-1]['rebase_documents'], documents)
         row = self.state.row()
         self.assertEqual(row['phase'], 'WORKING')
         self.assertEqual(row['worker_session_id'], 'saved-worker')
@@ -266,14 +276,20 @@ class CurrentRebaseAdoptionTests(CurrentRebaseFixture, TestCase):
     def test_stale_or_out_of_scope_current_result_preserves_checkpoint_and_audit(self):
         from loop_manager_internal.git.managed_rebase_validation import FileChange
         original = self.checkpoint.get('repo', 'G-047')
-        for observed in (replace(self.observed, remote=replace(self.expected.remote, oid='foreign')),
-                         replace(self.observed, input_fingerprint='changed'),
-                         replace(self.observed, committed=(FileChange(
-                             'docs/requirements/archive/UserDesign.md', '100644', '100644', 'old', 'new', 'M'),))):
+        for observed, error in (
+                (replace(self.observed, remote=replace(self.expected.remote, oid='foreign')),
+                 handlers.manager_git_journal.MutationEvidenceError),
+                (replace(self.observed, input_fingerprint='changed'),
+                 handlers.manager_git_journal.MutationEvidenceError),
+                (replace(self.observed, committed=(FileChange(
+                    'docs/requirements/archive/UserDesign.md', '100644', '100644', 'old', 'new', 'M'),)),
+                 RecoveryFailure)):
             with self.subTest(observed=observed):
                 self.observed = observed
-                with self.assertRaises(handlers.manager_git_journal.MutationEvidenceError):
+                with self.assertRaises(error) as caught:
                     self.handler._complete_rebase_intent(self.fixture.context())
+                if error is RecoveryFailure:
+                    self.assertEqual(caught.exception.reason, RecoveryReason.AGENT_SCOPE_VIOLATION)
                 self.assertEqual(self.checkpoint.get('repo', 'G-047'), original)
                 self.assertEqual(self.state.row()['verify_result'], 'old verify')
 

@@ -592,10 +592,11 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
             handler = new_handler()
             if documents:
                 if documents == 'worker-only':
-                    with self.assertRaisesRegex(journal.MutationEvidenceError,
-                                                'current_scope_mismatch'):
+                    with self.assertRaisesRegex(RecoveryFailure,
+                                                'current_scope_mismatch') as caught:
                         handler._rebase_latest(handler._context(), handler._row(), target,
                                                publishing=False)
+                    self.assertEqual(caught.exception.reason, RecoveryReason.AGENT_SCOPE_VIOLATION)
                     self.assertEqual(git(worktree, 'rev-parse', 'HEAD').stdout.strip(), original)
                     return
                 def interrupted_git(path, *arguments, **kwargs):
@@ -635,7 +636,11 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
                     self.assertEqual((worktree / destination).read_bytes(), expected_requirement)
                 self.assertEqual((worktree / plan_path).read_bytes(), expected_plan.encode())
                 saved = effects.checkpoint.get(repo_key, 'G-047')
-                record = saved.snapshot['rebase_documents']
+                record = saved.snapshot.get('rebase_documents')
+                if record is None:
+                    self.assertIsNone(saved.operation)
+                    record = next(item['rebase_documents'] for item in reversed(
+                        saved.snapshot['rebase_revalidation_audit']) if 'rebase_documents' in item)
                 self.assertEqual(record['revision'], target)
                 self.assertEqual(record['target'], target)
                 self.assertTrue(record['originals'])

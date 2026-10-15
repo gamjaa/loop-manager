@@ -18,6 +18,21 @@ from loop_manager_internal.git.managed_rebase_validation import FileChange, Inde
 
 
 class CurrentRebasePolicyTests(unittest.TestCase):
+    def test_service_scope_failure_is_explicit_recovery_not_transient_polling(self):
+        from loop_manager_internal.git.managed_rebase_adoption import ManagedRebaseService
+        from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, RecoveryReason
+        expected = expectation()
+        current = observation(expected, committed=(FileChange(
+            'docs/requirements/Protected.md', '100644', '100644', 'old', 'new', 'M'),))
+        scope = scope_for(expected, current)
+        service = ManagedRebaseService(expected, mock.Mock())
+        with mock.patch('loop_manager_internal.git.managed_rebase_adoption.observe_current_rebase',
+                        return_value=(current, scope)):
+            with self.assertRaises(RecoveryFailure) as caught:
+                service.require_owned()
+        self.assertEqual(caught.exception.reason, RecoveryReason.AGENT_SCOPE_VIOLATION)
+        self.assertIn('current_scope_mismatch', str(caught.exception))
+
     def test_final_manual_result_needs_no_execution_evidence(self):
         current = observation()
         expected = expectation(before_head=None)
