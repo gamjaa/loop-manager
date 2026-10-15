@@ -6,12 +6,15 @@ import unittest
 from pathlib import Path
 from unittest import mock
 import loop_manager
-from tests.support.profiles import profile_config
+from tests.support.profiles import profile_config, use_empty_provider_home
 from tests.support.fixed_samples import PROVIDER_PROFILES
 from loop_manager_internal.agents import agent_profiles
 
 
 class ProviderProfilesTest(unittest.TestCase):
+    def setUp(self):
+        use_empty_provider_home(self)
+
     def test_role_resolves_model_alias(self):
         config = profile_config(self)
 
@@ -251,7 +254,7 @@ class ProviderProfilesTest(unittest.TestCase):
                 "loop_manager.codex_model_efforts",
                 return_value={"test-balanced": frozenset({"high"})},
             ) as model_efforts, mock.patch(
-                "loop_manager.subprocess.run", return_value=completed
+                "loop_manager._handoff_run", return_value=completed
             ):
                 loop_manager.run_codex(
                     worktree,
@@ -308,7 +311,7 @@ class ProviderProfilesTest(unittest.TestCase):
             with mock.patch(
                 "loop_manager.codex_model_efforts",
                 return_value={"test-balanced": frozenset({"high"})},
-            ), mock.patch("loop_manager.subprocess.run", return_value=completed) as run:
+            ), mock.patch("loop_manager._handoff_run", return_value=completed) as run:
                 code, message = loop_manager.run_codex(
                     worktree,
                     state_dir,
@@ -337,7 +340,7 @@ class ProviderProfilesTest(unittest.TestCase):
                 return_value={
                     "test-strong": frozenset({"low", "medium", "high", "xhigh", "max", "ultra"})
                 },
-            ), mock.patch("loop_manager.subprocess.run") as run:
+            ), mock.patch("loop_manager._handoff_run") as run:
                 with self.assertRaisesRegex(RuntimeError, "Model/Effort 조합"):
                     loop_manager.run_codex(
                         root / "worktree",

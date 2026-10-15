@@ -13,12 +13,15 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 import loop_manager
-from tests.support.profiles import profile_config
+from tests.support.profiles import profile_config, use_empty_provider_home
 from tests.support.fixed_samples import PROJECT_FILES
 from tests.support.worker import worker_result
 
 
 class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
+    def setUp(self):
+        use_empty_provider_home(self)
+
     def test_missing_saved_session_starts_a_new_session(self):
         messages = (
             "Error: thread/resume: thread/resume failed: no rollout found for thread id "
@@ -80,7 +83,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             state = root / 'state'
             with mock.patch.dict(os.environ, {'HOME': str(root / 'user'), 'USERPROFILE': str(root / 'user')}), \
                  mock.patch('loop_manager.claude_role', return_value=('claude-opus-test', 'high')), \
-                 mock.patch('loop_manager.subprocess.run', side_effect=resume), \
+                 mock.patch('loop_manager._handoff_run', side_effect=resume), \
                  ThreadPoolExecutor(max_workers=2) as pool:
                 results = list(pool.map(lambda worktree: loop_manager.run_claude(
                     worktree, state, config, 'planner', 'continue', read_only=False,
@@ -230,7 +233,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
                 "[claude.worker]\nlevel1 = fast,minimal\n",
                 encoding="utf-8",
             )
-            with mock.patch("loop_manager.subprocess.run") as run:
+            with mock.patch("loop_manager._handoff_run") as run:
                 with self.assertRaisesRegex(RuntimeError, "Model/Effort 조합"):
                     loop_manager.run_claude(
                         root / "worktree",
@@ -386,7 +389,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
                 "loop_manager.claude_role",
                 return_value=("claude-opus-test", "high"),
             ), mock.patch(
-                "loop_manager.subprocess.Popen", side_effect=StartedProcess
+                "loop_manager._handoff_popen", side_effect=StartedProcess
             ):
                 started = loop_manager.run_claude(
                     worktree,
@@ -477,7 +480,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             root = Path(directory)
             worktree = root / "worktree"
             worktree.mkdir()
-            with mock.patch("loop_manager.subprocess.Popen", side_effect=StartedProcess):
+            with mock.patch("loop_manager._handoff_popen", side_effect=StartedProcess):
                 result = loop_manager.run_claude(
                     worktree, root / "state", config, "planner", "prompt",
                     read_only=True, session_id="one-shot-session",
@@ -529,7 +532,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
                     root = Path(directory)
                     worktree = root / "worktree"
                     worktree.mkdir()
-                    with mock.patch("loop_manager.subprocess.Popen", side_effect=StartedProcess), \
+                    with mock.patch("loop_manager._handoff_popen", side_effect=StartedProcess), \
                          mock.patch.object(Path, "write_text", fail_auxiliary_write), \
                          mock.patch.object(Path, "read_text", side_effect=OSError("log read interrupted")) as read_log:
                         result = loop_manager.run_claude(
@@ -581,7 +584,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             log = project_dir / "claude-planner.log"
             log.write_text("stale prior output", encoding="utf-8")
 
-            with mock.patch("loop_manager.subprocess.Popen", side_effect=TimedOutProcess):
+            with mock.patch("loop_manager._handoff_popen", side_effect=TimedOutProcess):
                 with self.assertRaises(subprocess.TimeoutExpired):
                     loop_manager.run_claude(
                         worktree, root / "state", config, "planner", "prompt",
@@ -629,9 +632,9 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
             ), mock.patch(
                 "loop_manager.claude_role", return_value=("claude-opus-test", "high")
             ), mock.patch(
-                "loop_manager.subprocess.Popen", side_effect=started_process
+                "loop_manager._handoff_popen", side_effect=started_process
             ) as popen, mock.patch(
-                "loop_manager.subprocess.run", side_effect=resumed_process
+                "loop_manager._handoff_run", side_effect=resumed_process
             ) as run:
                 started = loop_manager.run_claude(
                     worktree, root / "state", config, "planner", "plan",
@@ -752,7 +755,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
                 "loop_manager.claude_worker_profile",
                 return_value=("claude-sonnet-test", "high"),
             ), mock.patch(
-                "loop_manager.subprocess.Popen", side_effect=start_process
+                "loop_manager._handoff_popen", side_effect=start_process
             ) as popen:
 
                 def invoke(_session_id, _fallback):
@@ -773,7 +776,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
 
                 malformed = '{"type": BROKEN "usage limit reached"\n'
                 with mock.patch(
-                    "loop_manager.subprocess.Popen",
+                    "loop_manager._handoff_popen",
                     return_value=StreamProcess(malformed, 1),
                 ):
                     limited = loop_manager.run_claude(
@@ -837,7 +840,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
                                 "loop_manager.claude_worker_profile",
                                 return_value=("claude-sonnet-test", "high"),
                             ), mock.patch(
-                                "loop_manager.subprocess.Popen", side_effect=start
+                                "loop_manager._handoff_popen", side_effect=start
                             ):
                                 result = loop_manager.run_claude(
                                     root, root / "state", config, "worker", "prompt",
@@ -916,6 +919,7 @@ class ProviderNeutralAgentRuntimeTest(unittest.TestCase):
 
 class CommonGuidanceProviderTests(unittest.TestCase):
     def setUp(self):
+        use_empty_provider_home(self)
         from loop_manager_internal.agents import common_guidance, provider_guidance
         self.provider_guidance = provider_guidance
         self.temporary = tempfile.TemporaryDirectory()
@@ -1091,6 +1095,9 @@ class CommonGuidanceProviderTests(unittest.TestCase):
 
 
 class ProcessStartBoundaryTests(unittest.TestCase):
+    def setUp(self):
+        use_empty_provider_home(self)
+
     def test_both_providers_observe_launch_before_prompt_and_not_on_launch_error(self):
         config = profile_config(self)
         for provider in ('codex', 'claude'):
@@ -1104,14 +1111,14 @@ class ProcessStartBoundaryTests(unittest.TestCase):
                 process.stdin.write.side_effect = lambda _prompt: self.assertEqual(observed, ['started'])
                 run = loop_manager.run_codex if provider == 'codex' else loop_manager.run_claude
                 profile = loop_manager.ResolvedProfile('model', 'high')
-                with mock.patch('loop_manager.subprocess.Popen', return_value=process):
+                with mock.patch('loop_manager._handoff_popen', return_value=process):
                     run(root, root / 'state', config, 'worker', 'prompt', read_only=False,
                         level=5, persist_session=True, session_id='existing-session', resolved_profile=profile,
                         on_process_started=lambda: observed.append('started'),
                         on_process_finished=lambda: observed.append('finished'))
                 self.assertEqual(observed, ['started', 'finished'])
                 observed.clear()
-                with mock.patch('loop_manager.subprocess.Popen', side_effect=OSError('launch failed')):
+                with mock.patch('loop_manager._handoff_popen', side_effect=OSError('launch failed')):
                     with self.assertRaises(OSError):
                         run(root, root / 'state', config, 'worker', 'prompt', read_only=False,
                             level=5, persist_session=True, session_id='existing-session', resolved_profile=profile,

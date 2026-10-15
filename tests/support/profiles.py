@@ -1,6 +1,17 @@
 """예제 설정과 독립된 Agent profile 테스트 설정."""
 from pathlib import Path
+import os
 import tempfile
+from unittest import mock
+
+
+def use_empty_provider_home(test_case):
+    """인증 외의 테스트가 개인 인증 파일·링크 권한에 의존하지 않게 한다."""
+    directory = tempfile.TemporaryDirectory()
+    test_case.addCleanup(directory.cleanup)
+    test_case.enterContext(mock.patch.dict(os.environ, {
+        'HOME': directory.name, 'USERPROFILE': directory.name,
+    }))
 
 
 def profile_config(test_case):
