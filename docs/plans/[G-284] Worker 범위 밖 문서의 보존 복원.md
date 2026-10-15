@@ -42,7 +42,7 @@ R-082의 후속 복원 목표에 따라, Worker가 직접 변경했다고 확인
 
 ## Progress
 
-- [ ] Manager의 경로별 파일·index 복원에 대한 사용자 결정 확인
+- [x] 2026-10-16 사용자가 선택지 A를 승인하고 기존 복원 기능 재사용·코드와 선택된 ExecPlan 본문 보존을 명시했다. 아래 User Decision에 기록했으며 원격 게시·출처 확인과 draft 대기 해제는 기존 Manager 전환을 따른다.
 - [ ] Worker 변경 판정·원문 보존·선택 적용과 중단 재개 연결
 - [ ] 최소 targeted unit·기존 Git 효과 회귀·Worker 보고 갱신 검증
 - [ ] Manager 전체 verify·읽기 전용 Review·사용자 Merge
@@ -54,8 +54,13 @@ Facts: R-082는 다른 범위 밖 문서의 파일·index 복원을 후속 목�
 Options: (A) 위 원문 보존·Writer 종료·변경 주체/소유권 확인·경로별 적용·중단 재개 조건을 지키는 Manager 복원을 승인한다. (B) 실제 파일·index 복원을 보류하고 현재 범위 오류·자료 보존을 유지한다. 대상이나 보존 조건의 변경은 사용자 Requirement에서 먼저 확정한다.
 Impact: A는 확인한 범위 오류만 복원 뒤 같은 Worker의 보고 갱신으로 이어가며 사용자 변경·불확실한 대상과 독립 실패를 보존한다. B는 복원 목표를 미충족으로 남긴다. 결정 전에는 이 작업과 의존 작업의 구현·Worker·workspace·branch·PR을 시작하지 않고 독립 계획은 계속 처리한다.
 
+## User Decision
+
+Decision: approve
+Answer: 선택지 A를 승인한다. 종료한 Worker가 직접 변경한 것으로 확인된 다른 ExecPlan과 활성·archive Requirement에 한해, 변경 원문과 복원 근거를 보존한 뒤 해당 파일·index entry만 복원한다. 기존 선택 frontmatter 복원과 rebase 문서의 보존·경로별 적용, checkpoint·Worker 피드백 구성요소를 재사용한다. 코드·테스트와 선택된 ExecPlan 본문, 나머지 파일·index·HEAD·branch·session·실행 및 실패 이력은 보존한다. 전체 baseline 일괄 복원은 하지 않는다. 사전 수정·동시 편집·변경 주체나 소유권이 불확실한 대상은 덮어쓰지 않으며 기존 writer 종료·원문 보존·경로별 적용·중단 재개 조건을 모두 지킨다. 복원 완료 뒤 같은 Worker 문맥으로 최종 diff와 문서 보고를 갱신한다. 이 승인은 G-284의 제한된 Manager 복원 경계에 한하며 구현·검증 성공이나 Worker의 Requirement 수정 권한을 뜻하지 않는다.
+
 ## Decision Log
 
 - 최신 delta 기준은 efc71a72f4e2ce152c9c4355e6d08bdc4ee242ac이며 보존된 58814a9afa875bf5c440d610afe4e58725826921 이후 변경을 추가 확인했다. R-082의 신규 복원 절과 AC, scope adapter·Worker handler·frontmatter helper·checkpoint·직접 회귀를 대조했다. 현재 callback은 선택 frontmatter만 복원하고 다른 Requirement/ExecPlan은 `validate_agent_scope()`에서 거부한다. 기존 catalog의 지침 정합화·commit 기록 복구·ignored 통합 보호·차단 전수 감사는 이 정상 경로의 선택 파일/index 복원을 구현하지 않는다.
 - complexity medium: 경로·원문/index 보존·checkpoint CAS·Worker 피드백의 기존 경계와 helper를 재사용한다. 다만 변경 주체 판정·원본 유입·경로별 적용·중단 재개를 연결해야 하므로 단일 문구 교정으로 완료할 수 없다. risk critical: 오판한 파일 제거·index 복원이 Git에 없는 사용자 원문을 잃게 할 수 있어 적용 전 보존·경쟁 거부·실제 선택 효과의 회귀가 필요하다. 최초 Worker level은 4이며 Model/Effort는 Manager 설정을 따른다. priority high는 반복적인 범위 오류·사용자 복구를 줄이면서 사용자 작업 보존을 지키는 목표다.
-- 이 계획은 아직 승인되지 않은 쓰기 경계를 draft로 보존한다. 구현·테스트·verify·Git 쓰기·사용자 결정·자동 성공을 만들지 않았고 G-206의 보존 후보·실행 기록을 수정하지 않았다. Requirement archive나 최종 제품 전문 확인 결과를 뜻하지 않는다.
+- 2026-10-16 사용자가 선택지 A를 승인하고 기존 복원 기능 재사용·코드와 선택된 ExecPlan 본문 보존을 명시했다. 위 User Decision은 이 요청을 기록한 것이며, draft 표시와 저장된 대기는 사용자 출처·질문 해소를 검증하는 기존 Manager 전환에서 정리한다. 구현·테스트·verify 성공이나 다른 범위의 승인을 만들지 않으며 G-206의 보존 후보·실행 기록과 Requirement archive·최종 제품 전문 확인 결과를 변경하지 않는다.
