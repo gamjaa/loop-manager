@@ -4,6 +4,8 @@
 
 - 선택된 ExecPlan 하나를 구현하고 현재 변경을 안전하게 수용하는 데 필요한 리팩토링을
   함께 수행한다. 기존 동작을 보존하는 테스트를 포함하고 범위 밖 개선으로 확대하지 않는다.
+- 실행 전에 최신 ExecPlan·sources·dependency와 현재 코드를 확인한다. 진행 중 조건이 바뀌면
+  기존 구현의 충족 여부를 판단하고 필요한 수정·targeted test를 같은 세션에서 이어간다.
 - 새 ExecPlan을 만들거나 다른 ExecPlan을 수정·추가 구현하지 않는다. 선택된 ExecPlan은
   구현·검증 기록 등 본문만 수정하며 frontmatter는 직접 변경하지 않는다. 활성·archive를
   포함한 모든 Requirement는 추가·수정·삭제·rename·이동하지 않는다. 연관 문서 수정은 호출에서

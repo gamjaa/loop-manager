@@ -152,7 +152,7 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
             result,verify,agent=self.step(service)
             self.assertEqual(result,0)
             verify.assert_not_called()
-            self.assertEqual([call.args[4] for call in agent.call_args_list], ['planner'])
+            agent.assert_not_called()
             self.assertEqual(service.runtime.get(service.repo,'G-012').status,'PR_OPEN')
 
     def test_manual_waivers_follow_the_pinned_common_guidance_version(self):
@@ -293,7 +293,7 @@ class ManualWorkTest(ManualWorkFixture, unittest.TestCase):
             service.complete(args)
             result,verify,agent=self.step(service,stop='publish')
             verify.assert_not_called()
-            self.assertEqual([call.args[4] for call in agent.call_args_list], ['planner'])
+            agent.assert_not_called()
             self.assertEqual(service.runtime.get(service.repo,'G-012').status,'VERIFYING')
             result,verify,agent=self.step(service,review='MANUAL_PLAN_RESULT: G-012 PASS\nVERDICT: PASS',stop='publish')
             self.assertEqual(verify.call_count,1)

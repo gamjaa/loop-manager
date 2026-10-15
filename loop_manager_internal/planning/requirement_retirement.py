@@ -303,6 +303,8 @@ class RequirementRetirementPort:
                                 resolved.contents,
                             )
                         except requirement_sources.RequirementIdError as error:
+                            if source_id is None:
+                                continue  # ID 없는 기존 수동 source는 정확한 경로로 보호하며 ID 별칭을 추정하지 않는다.
                             raise RetirementError(str(error)) from error
                         manual_requirement_ids.add(requirement_id)
             if manual_requirement_ids:

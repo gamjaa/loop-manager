@@ -158,8 +158,8 @@ class TieredReviewRepository:
             "guidance_hash": row[7]}
 
     def select(self, repo, repository, base, revision, interval, merged_count, *, force_full=False):
-        if interval <= 0:
-            raise TieredReviewError("정밀 점검 주기는 양의 정수여야 합니다.")
+        if interval < 0:
+            raise TieredReviewError("정밀 점검 주기는 0 이상의 정수여야 합니다.")
         inventory = cached_source_inventory(self.connection, repository, base, revision, include_uncertain=True)
         index = code_index.build_index(self.connection, repo + ":remote", inventory,
                                       lambda source: code_index.git(repository, "show", f"{revision}:{source.path}"))
@@ -190,10 +190,12 @@ class TieredReviewRepository:
             return Selection(required, mode, reasons, paths, index, roots, merged_count, selected_request,
                              base, root_source, placements, root_reviews, classifications)
 
+        if interval == 0 and not force_full and request_id is None:
+            return selected(False, "fast", ("disabled",), ())
         count = previous["full_merged_count"] if previous else None
         if count is not None and merged_count < count:
             raise TieredReviewError("전체 정밀 Merge 기준이 현재 이력보다 큽니다.")
-        if force_full or request_id or count is None or merged_count - count >= interval:
+        if force_full or request_id or count is None or (interval > 0 and merged_count - count >= interval):
             reason = "requested_full" if force_full or request_id else "initial_full" if count is None else "periodic_full"
             return selected(True, "full", (reason,), tuple(index.records), request_id)
         old = previous["records"]

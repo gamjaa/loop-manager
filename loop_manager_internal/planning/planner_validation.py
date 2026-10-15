@@ -1489,8 +1489,15 @@ def mutable_ready_snapshot(
 
     effects._ensure_execplans_schema(connection)
     cycle = maintenance_state.MaintenanceRepository(connection).get(repo)
-    project = connection.execute('SELECT planning_resume_plan_id FROM projects WHERE repo = ?', (repo,)).fetchone()
+    project = connection.execute('SELECT planning_resume_plan_id, phase FROM projects WHERE repo = ?', (repo,)).fetchone()
     if cycle.phase is not maintenance_state.MaintenancePhase.IDLE and not (project and project[0]):
+        if project and project[1] == 'PLANNING' and cycle.phase in {
+                maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
+                maintenance_state.MaintenancePhase.REFACTORING}:
+            from loop_manager_internal.catalog.remote_deletions import recovery_goals
+            goals = recovery_goals(connection, repo)
+            return MutableReadySnapshot(repo, active_sha, (),
+                effects.mutable_snapshot_token(repo, active_sha, (), goals), goals)
         raise PlannerValidationError(
             "활성 maintenance cycle 중에는 일반 mutable READY snapshot을 만들 수 없습니다."
         )
@@ -1568,10 +1575,12 @@ def _assert_mutable_ready_snapshot_current(
     if snapshot.recovery_goals != recovery_goals(connection, snapshot.repo):
         raise PlannerValidationError("삭제 목표 감사가 mutable READY snapshot 이후 변경됐습니다.")
 
-    project = connection.execute('SELECT planning_resume_plan_id FROM projects WHERE repo = ?', (snapshot.repo,)).fetchone()
-    if maintenance_state.MaintenanceRepository(connection).get(
-        snapshot.repo
-    ).phase is not maintenance_state.MaintenancePhase.IDLE and not (project and project[0]):
+    project = connection.execute('SELECT planning_resume_plan_id, phase FROM projects WHERE repo = ?', (snapshot.repo,)).fetchone()
+    cycle = maintenance_state.MaintenanceRepository(connection).get(snapshot.repo)
+    check_only = (project and project[1] == 'PLANNING' and not snapshot.plans
+                  and cycle.phase in {maintenance_state.MaintenancePhase.PREREQUISITE_WAIT,
+                                      maintenance_state.MaintenancePhase.REFACTORING})
+    if cycle.phase is not maintenance_state.MaintenancePhase.IDLE and not (project and project[0]) and not check_only:
         raise PlannerValidationError(
             "mutable READY snapshot 이후 maintenance cycle이 시작됐습니다."
         )

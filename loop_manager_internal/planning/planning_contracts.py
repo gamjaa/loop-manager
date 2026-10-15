@@ -95,10 +95,6 @@ def choose_planning_decision(
         kind = PlanningDecisionKind.RUN_SPECIFICATION_PLANNING
     elif has_active:
         kind = PlanningDecisionKind.RESUME_ACTIVE
-    elif planning_input_changed and check_ready:
-        kind = PlanningDecisionKind.RUN_PLANNER_CHECK
-    elif planning_input_changed:
-        kind = PlanningDecisionKind.RUN_FALLBACK_PLANNING
     elif runnable_ready:
         kind = PlanningDecisionKind.ACTIVATE_READY
     elif has_waiting_catalog:
@@ -225,6 +221,8 @@ class PlanningStatePort(Protocol):
     def pending_document_approval(
         self, repo: str, repository: Path, base_branch: str,
     ) -> bool: ...
+
+    def pending_user_decision(self, repo: str, entries: Any) -> bool: ...
 
     def maintenance_due(
         self, repo: str, interval: int, *, completion_candidate: bool = False,
@@ -425,6 +423,7 @@ class PlanningGitPort(Protocol):
         self, repo_path: Path, old_sha: str, new_sha: str,
         *, verified_plan_declarations: bool = False,
         allow_execplan_only: bool = False,
+        specification_only: bool = False,
     ) -> bool: ...
 
     def validate_workspace_identity(

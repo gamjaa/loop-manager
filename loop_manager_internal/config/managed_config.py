@@ -126,11 +126,11 @@ def load_managed_config(path: Path) -> ManagedConfig:
         refactoring_review_interval = int(raw_refactoring_review_interval)
     except ValueError as error:
         raise ManagedConfigError(
-            "[loop] refactoring_review_interval은 양의 정수여야 합니다."
+            "[loop] refactoring_review_interval은 0 이상의 정수여야 합니다."
         ) from error
-    if refactoring_review_interval <= 0:
+    if refactoring_review_interval < 0:
         raise ManagedConfigError(
-            "[loop] refactoring_review_interval은 양의 정수여야 합니다."
+            "[loop] refactoring_review_interval은 0 이상의 정수여야 합니다."
         )
 
     raw_verify_timeout = _setting(

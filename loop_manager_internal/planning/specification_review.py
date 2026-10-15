@@ -72,7 +72,11 @@ def review_instruction(attempt, git, repo) -> str:
     identity = {key: attempt[key] for key in (
         "purpose", "revision", "input_fingerprint", "specification_fingerprint", "work_cycle")}
     text = "\n\n일반 planning 검토 입력: " + json.dumps(identity, ensure_ascii=False)
-    if attempt["purpose"] == "delta":
+    if attempt["purpose"] == "requirement":
+        text += ("\n이번 호출은 지정된 Requirement의 완료 점검이다. 해당 Acceptance Criteria와 "
+                 "관련 명세 절·Merge 구현·테스트·검증 근거에 집중하라. 무관한 명세 전문을 반복해서 "
+                 "검토하거나 기존 유지보수·독립 작업을 개정하지 마라. 미충족 조건만 후속 작업으로 남겨라.")
+    elif attempt["purpose"] == "delta":
         previous, current = attempt["comparison_revision"], attempt["revision"]
         changes = git.run(repo, "diff", "--name-status", "--find-renames", "-z", previous, current).stdout
         text += ("\n변경 비교 revision: " + str(previous)
@@ -157,7 +161,8 @@ def validate_final(attempt, result: str, batch, git, repo, *, manager_source_val
         raise PlanningResultInvalid(str(error)) from error
 
 
-def prepare_review(state, git, context, revision: str, *, final_required: bool):
+def prepare_review(state, git, context, revision: str, *, final_required: bool,
+                   requirement_only: bool = False):
     """Preserve the selected purpose across retry and owned-workspace rebase."""
     comparison = comparison_revision(
         state.planning_review(context.repo, "general"),
@@ -171,6 +176,9 @@ def prepare_review(state, git, context, revision: str, *, final_required: bool):
             and state.final_review_candidate(context.repo,
                 context.refactoring_review_interval, self_repository=context.self_repository))
         purpose = ("final" if final_required or resume_final
+                   else "requirement" if requirement_only or (attempt is not None
+                       and attempt['purpose'] == 'requirement'
+                       and attempt['specification_fingerprint'] == git.specification_fingerprint(context.repo_path, revision))
                    else "delta" if comparison else "full")
         state.begin_planning_review(
             context.repo, purpose=purpose, revision=revision,

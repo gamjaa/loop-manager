@@ -246,6 +246,10 @@ class _PlanningStatePorts:
             self._connection,
         ).unplanned_approved(repo, repository, base_branch))
 
+    def pending_user_decision(self, repo: str, entries) -> bool:
+        from loop_manager_internal.storage import execplan_draft_state
+        return execplan_draft_state.needs_semantic_review(self._connection, repo, entries)
+
     def maintenance_due(
         self, repo: str, interval: int, *, self_repository: bool = False,
         completion_candidate: bool = False,

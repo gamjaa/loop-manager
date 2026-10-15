@@ -183,7 +183,8 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
         repo_path = identity['repo_path']
         entries = dependencies.plan_declarations(repo_path, revision)
         planning_input_state.consume_owned_records(connection, identity['repo'], revision, entries)
-        if not planning_input_state.matches(connection, identity['repo'], entries):
+        from loop_manager_internal.storage import execplan_draft_state
+        if execplan_draft_state.needs_semantic_review(connection, identity['repo'], entries):
             return True
         guidance = common_guidance.planning_content_hash(connection, identity['repo'])
         options = {'guidance_hash': guidance} if guidance else {}
@@ -198,7 +199,7 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
             previous = dependencies._specification_input_fingerprint(repo_path, row['processed_sha'], **options)
         return (previous != fingerprint and not (row['processed_sha'] and
             dependencies._is_requirement_archive_only_change(repo_path, row['processed_sha'], revision,
-                                                             verified_plan_declarations=True)))
+                                                             specification_only=True)))
     verify_timeout_seconds = identity.pop("verify_timeout_seconds", 600)
     state = _ExecutionStatePort(connection, runtime_repository, identity["repo"])
     lookup_pr = dependencies.pr_for_branch
@@ -259,14 +260,12 @@ def _ExecutionLifecyclePorts(dependencies: ExecutionLifecyclePortsEffects, conne
         git_bytes=dependencies.git_bytes,
         capture_scope=dependencies.capture_git_snapshot,
         validate_scope=lambda *a, **kw: dependencies.validate_agent_scope(*a, connection=connection, **kw),
-        run_agent=state.bind(dependencies._run_agent_with_connection, name="document_planner", connected=True, mutates=False),
         prepare_snapshot=dependencies.mutable_ready_snapshot,
         assert_snapshot=dependencies._assert_mutable_ready_snapshot_current,
         validate_result=dependencies.validate_planner_result,
         validate_worktree=dependencies.validate_managed_worktree,
         pr_for_branch=dependencies.pr_for_branch,
         log=dependencies.operation_log,
-        run_with_retries=dependencies.run_agent_with_retries,
     )
     from loop_manager_internal.execution.execution_session import ExecutionIdentity
     document_identity = ExecutionIdentity(**identity)

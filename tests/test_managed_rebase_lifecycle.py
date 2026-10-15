@@ -447,6 +447,11 @@ class ManagedRebaseLifecycleTests(unittest.TestCase):
 
             effects = replace(fixture.effects, state=state,
                               checkpoint=ExecutionCheckpointRepository(connection))
+            if documents and documents != 'worker-only':
+                # 원문 변경은 fixture가 게시한 사용자 입력이며 Worker 쓰기 권한을 넓히지 않는다.
+                effects.checkpoint.record(repo_key, 'G-047', expected_generation=0,
+                    operation=None, expected_head=original, target_base_oid=target,
+                    observed_remote_oid=None, snapshot={'remote_user_input': original})
             effects = replace(effects, workspace=replace(effects.workspace,
                 current_rebase_service=lambda context, **options: lm._current_rebase_service(
                     connection, repo, state_dir, repo_key, 'G-047', worktree, branch, **options)))

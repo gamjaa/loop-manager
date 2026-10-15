@@ -56,10 +56,11 @@ Python source 진입은 bootstrap의 첫 Git 호출 전에 저장된 PATH, 현�
 | 항목 | 설정 기준 |
 |---|---|
 | provider 모델·역할 | 선택 provider의 Model alias와 `Model alias,Effort`를 직접 지정한다. `planner`·`planner_check`·Worker level 1~8과 참조 alias는 모두 필요하다. 누락·빈 값·미지원 조합은 실행 전에 거부하며 예시를 fallback으로 읽지 않는다. |
-| `planner_check` | `[codex.roles]` 또는 `[claude.roles]`에서 읽기 전용 점검 Planner에 독립 적용한다. 유지보수 Planner는 `maintenance_planner`를 사용하며 생략하면 일반 `planner` 설정을 재사용한다. |
+| `planner_check` | 기존 호출 이력·저장 상태의 호환성을 위해 역할 설정을 유지한다. 코드·테스트·설정 변경만으로 새 점검 호출을 만들지 않는다. 유지보수 Planner는 `maintenance_planner`를 사용하며 생략하면 일반 `planner` 설정을 재사용한다. |
 | `[codex] fast_mode` · `[claude] fast_mode` | provider별 Fast 선택. 기본값은 `false`이며 공란·공백·section 또는 항목 생략도 off다. CLI 기본 설정이나 저장된 session에서 on이어도 off가 우선하도록 전달한다. `true`는 on이며 `on/off`·`yes/no`·`1/0`도 허용한다. 모델·Effort는 그대로 전달하며 지원·대체 실행은 CLI에 맡긴다. Fast 사용에는 추가 비용 또는 구독 사용량 증가가 발생할 수 있다. |
 | `[telegram]` | `token`·`chat_id`가 모두 있으면 알림 사용, 둘 다 없으면 비활성화, 하나만 있으면 설정 오류다. |
 | `[loop] max_workers` | 동시 처리 프로젝트 수. 기본값 `3`. |
+| `[loop] refactoring_review_interval` | 새 MERGED 작업 수에 따른 자동 유지보수 주기. 기본값 `20`. `0`이면 자동 전환을 끄며 누적 수와 실행 중 cycle은 보존한다. `python loop_manager.py maintenance-review <project-path>`로 등록된 프로젝트의 다음 안전한 경계에 점검을 요청할 수 있다. |
 | `verify_timeout_seconds` | 전체 verify 상한(초). 기본값 `600`. 필요한 검증이 정상 진행 중이라는 근거가 있을 때 조정한다. |
 | `verify_parallelism` | Loop Manager 자체 verify의 모듈 배정 상한. 기본값 `auto`, 양의 정수는 verify별 상한, `1`은 직렬이다. [배정·기록](#verify-배정과-진단) |
 

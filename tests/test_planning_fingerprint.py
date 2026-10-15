@@ -230,7 +230,7 @@ class PlanningFingerprintTest(unittest.TestCase):
             self.assertEqual(ports.agent.run_count, 0)
             self.assertEqual(
                 ports.events.messages[0],
-                ("info", "계획 입력이 바뀌지 않아 Agent를 실행하지 않습니다."),
+                ("info", "명세가 바뀌지 않아 Planner를 실행하지 않습니다."),
             )
             saved = connection.execute(
                 "SELECT processed_sha, specification_fingerprint, planning_fingerprint "
@@ -309,7 +309,7 @@ class PlanningFingerprintTest(unittest.TestCase):
                 "SELECT processed_sha, planning_fingerprint FROM projects WHERE repo = ?",
                 (str(repo),),
             ).fetchone()
-            self.assertEqual(row["processed_sha"], git_command(repo, "rev-parse", "origin/main"))
+            self.assertEqual(row["processed_sha"], completed["processed_sha"])
             self.assertEqual(row["planning_fingerprint"], completed_fingerprint)
             self.assertNotEqual(
                 row["planning_fingerprint"],

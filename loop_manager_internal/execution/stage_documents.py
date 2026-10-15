@@ -1,4 +1,4 @@
-"""진행 중 작업의 문서 영향 판단과 PR 전 계획 개정 게시."""
+"""기존 문서 판단·PR 전 개정 게시의 복구. 새 입력은 Worker revision gate가 처리한다."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -11,7 +11,6 @@ from loop_manager_internal.agents.agent_scope_decision import (
     _same_local_snapshot, manager_comparison_baseline, reconcile_manager_metadata,
 )
 from loop_manager_internal.agents.scope_contracts import GitSnapshot
-from loop_manager_internal.execution.validation_feedback import redact_secrets
 from loop_manager_internal.planning.planning_catalog import (
     MutableReadySnapshot, mutable_snapshot_token, snapshot_to_dict, snapshot_from_dict,
 )
@@ -20,7 +19,6 @@ from loop_manager_internal.recovery.recovery_runtime import RecoveryFailure, Rec
 from loop_manager_internal.storage import runtime_state, verify_receipts
 from loop_manager_internal.execution.execution_revision import DefinitionSnapshot
 from loop_manager_internal.execution.execution_runtime import ExecutionOutcome, ExecutionOutcomeKind
-from loop_manager_internal.agents.agent_invocation import TrackedAgentCall, AttemptSequence, AgentResultKind
 from loop_manager_internal.catalog import requirement_sources
 from loop_manager_internal.git.command_adapter import revision_requirement_documents
 
@@ -131,6 +129,15 @@ def save(checkpoints, repo, plan_id, value):
         snapshot={**(current.snapshot or {}), "document_revision": value})
 
 
+def retire_assessment(checkpoints, repo, plan_id, item):
+    current = checkpoints.get(repo, plan_id)
+    checkpoints.record(repo, plan_id, expected_generation=current.generation,
+        operation=current.operation, expected_head=current.expected_head,
+        target_base_oid=current.target_base_oid, observed_remote_oid=current.observed_remote_oid,
+        snapshot={**(current.snapshot or {}), 'document_revision': None,
+                  'retired_document_assessment': item})
+
+
 def restart_assessment(item, base, changed, *, git_bytes=None, repository=None):
     """원격 경합에서 게시 후보는 보존하고 새 입력의 판단 권한을 분리한다."""
     previous = DefinitionSnapshot.deserialize(item['previous'])
@@ -183,14 +190,12 @@ class StageDocumentEffects:
     git: Callable
     capture_scope: Callable
     validate_scope: Callable
-    run_agent: Callable
     prepare_snapshot: Callable
     assert_snapshot: Callable
     validate_result: Callable
     validate_worktree: Callable
     pr_for_branch: Callable
     log: Callable
-    run_with_retries: Callable
     git_bytes: Callable[..., bytes] | None = None
 
 
@@ -229,14 +234,11 @@ def remember_workspace_metadata(effects, state, checkpoints, identity, context, 
 
 
 def refresh(effects, state, checkpoints, identity, context, previous, definition, changed):
-    """안전한 rebase 뒤 같은 작업만 판단하고 기존 게시 경계를 유지한다."""
+    """저장된 결과·게시를 복구하고 새 조건은 기존 Worker gate에 넘긴다."""
     repo, plan_id = identity.repo, context.plan.plan_id
     row = state.row()
     item = pending(checkpoints, repo, plan_id)
-    relevant = ((definition.path,) if previous is not None
-                and (previous.worker_body_hash, previous.sources, previous.depends_on)
-                != (definition.worker_body_hash, definition.sources, definition.depends_on) else ())
-    if item is None and (not relevant or previous is None or context.resolving_rebase):
+    if item is None:
         return None
     if row['pr_url'] or effects.pr_for_branch(identity.repo_path, context.branch) is not None:
         if item is not None:
@@ -252,22 +254,6 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
                 == (definition.worker_body_hash, definition.sources, definition.depends_on)):
             save(checkpoints, repo, plan_id, None)
             return None
-    if (item is None and previous is not None and relevant == (definition.path,)
-            and previous.worker_token == definition.worker_token):
-        return None  # 수행 기록만 바뀐 ExecPlan은 기존 R-072 입력 증명으로 처리한다.
-    if item is None or (item["stage"] == "done" and (
-            item.get("definition") != definition.definition_token
-            or (item['base'] != definition.revision_sha and relevant))):
-        if not relevant or previous is None or context.resolving_rebase:
-            return None
-        item = {"version": 1, "stage": "rebase", "base": definition.revision_sha,
-                "scope": "execplan",
-                "phase": context.phase.value, "paths": list(relevant),
-                "document_only": documentary(changed), "previous": previous.serialize(),
-                "worker_result": row["worker_result"], "verify_result": row["verify_result"],
-                "verify_base": row["validated_base_sha"], "assessment": None,
-                'before_head': effects.git(context.worktree, 'rev-parse', 'HEAD').stdout.strip()}
-        save(checkpoints, repo, plan_id, item)
     if item["stage"] == "done":
         if (item['base'] == definition.revision_sha and item.get('worker_snapshot')
                 and not item.get('decision_applied') and not item.get('assessment_complete')):
@@ -288,106 +274,35 @@ def refresh(effects, state, checkpoints, identity, context, previous, definition
                 "base": definition.revision_sha}
         save(checkpoints, repo, plan_id, item)
     if item["stage"] == "assess":
-        head = effects.git(context.worktree, "rev-parse", "HEAD").stdout.strip()
-        generation = item.get('planner_generation', checkpoints.get(repo, plan_id).generation)
-        if type(generation) is not int or generation < 0:
-            raise PlannerValidationError('문서 판단 작업 공간의 세대가 유효하지 않습니다.')
-        workspace = (identity.state_dir / 'worktrees' / hashlib.sha256(repo.encode()).hexdigest()[:16]
-                     / 'document-assessments' / plan_id
-                     / hashlib.sha256(f"{item['base']}:{head}:{generation}".encode()).hexdigest())
-        if not workspace.resolve().is_relative_to(identity.state_dir.resolve()) or workspace.is_symlink():
-            raise PlannerValidationError('문서 판단 작업 공간이 관리 경계를 벗어났습니다.')
-        if item.get('planner_workspace') != str(workspace) and workspace.exists():
-            raise PlannerValidationError('소유권이 없는 기존 문서 판단 작업 공간을 사용하지 않습니다.')
-        item = {**item, 'planner_workspace': str(workspace), 'planner_generation': generation, 'candidate': head}
-        save(checkpoints, repo, plan_id, item)
-        if not workspace.exists():
-            workspace.parent.mkdir(parents=True, exist_ok=True)
-            effects.git(identity.repo_path, 'worktree', 'add', '--detach', str(workspace), head)
-        effects.validate_worktree(identity.repo_path, workspace, None)
-        if (effects.git(workspace, 'rev-parse', 'HEAD').stdout.strip() != head
-                or effects.git(workspace, 'status', '--porcelain').stdout.strip()):
-            raise PlannerValidationError('문서 판단 작업 공간이 구현 revision과 다릅니다.')
+        # 중단된 읽기 전용 호출의 범위를 확인한 뒤 새 Worker 입력으로 넘긴다.
         if item.get('planner_scope'):
             prior = item['planner_scope']
-            if prior['role'] != 'planner' or prior['worktree'] != str(workspace):
-                raise PlannerValidationError('보존된 Planner 범위가 현재 문서 판단 작업 공간과 다릅니다.')
+            workspace = Path(str(item.get('planner_workspace', '')))
+            generation = item.get('planner_generation')
+            expected = (identity.state_dir / 'worktrees' / hashlib.sha256(repo.encode()).hexdigest()[:16]
+                        / 'document-assessments' / plan_id
+                        / hashlib.sha256(f"{item['base']}:{item['candidate']}:{generation}".encode()).hexdigest())
+            if (prior['role'] != 'planner' or prior['worktree'] != str(workspace)
+                    or workspace != expected or workspace.is_symlink()):
+                raise PlannerValidationError('보존된 문서 판단 작업 공간의 소유권이 다릅니다.')
+            effects.validate_worktree(identity.repo_path, workspace, None)
             before = GitSnapshot.deserialize(prior['before'])
             after = effects.capture_scope(workspace)
             effects.validate_scope('planner', workspace, before, after,
                                    external_worktree=identity.repo_path, base_branch=identity.base)
             if not _same_local_snapshot(before, after):
                 raise PlannerValidationError('중단된 읽기 전용 문서 판단의 작업 공간이 변경됐습니다.')
-        remember_workspace_metadata(effects, state, checkpoints, identity, context, workspace)
-        worker_before = effects.capture_scope(context.worktree)
-        item = {**item, 'worker_snapshot': worker_before.serialize()}
-        save(checkpoints, repo, plan_id, item)
-        document_head = head if item.get('work_branch') else item['base']
-        prompt = f"""현재 진행 중인 {plan_id}의 ExecPlan 조건 변경에 따른 실행 대응을 확인한다.
-현재 위치는 Planner 전용 worktree이며 Worker 구현 revision은 {head}다.
-프로젝트 전체 명세 영향 판단과 개정은 일반 planning에서 완료했다.
-읽기 전용으로 구현·테스트와 최신 문서 revision {document_head}의 ExecPlan 조건 변경만 대조하라.
-최신 문서 원문은 git show {document_head}:<문서 경로>로 확인하라.
-Worker 작업 공간 {context.worktree}의 미커밋 작업도 읽기 전용 검토 입력이며 파일·Git·범위 기록을 변경하지 마라.
-확인한 변경 문서는 {json.dumps(item['paths'], ensure_ascii=False)}다. 이전 선언은 {item['previous']}다.
-현재 단계를 {item['phase']}로 이어갈 판단이며 다른 작업을 계획하거나 파일·Git을 변경하거나 테스트를 실행하지 마라.
-ExecPlan을 개정하거나 연결 Requirement·PRODUCT·ARCHITECTURE의 관련성을 다시 판단하지 마라.
-새 판단의 plan_text는 null이어야 한다. 보존된 이전 개정 후보는 기존 게시 복구로 처리한다.
-구현 조건이 바뀌었지만 현재 구현이 충족하면 satisfied, 코드·테스트 수정이 필요하면 needed,
-명세 판단이 불확실하면 uncertain으로 표시하고 근거를 기록하라. 문서 변경 자체를 구현 부족이나 검증 성공으로 취급하지 마라.
-정확히 한 줄 DOCUMENT_RESULT: JSON을 반환하라. 필드는 relevant(bool), implementation(satisfied|needed|uncertain),
-plan_text(전체 ExecPlan 문자열 또는 수정 불필요면 null), evidence(확인한 구현·문서 관계의 근거)다.
-"""
-        protocol_error = item.get('validation_error', '')
-        for attempt in range(3):
-            before = effects.capture_scope(workspace)
-            item = {**item, 'planner_scope_history': [*item.get('planner_scope_history', []),
-                    *([item['planner_scope']] if item.get('planner_scope') else [])],
-                    'planner_scope': {'role': 'planner', 'worktree': str(workspace),
-                    'input_fingerprint': definition.definition_token, 'before': before.serialize(), 'after': None}}
-            save(checkpoints, repo, plan_id, item)
-            result = effects.run_with_retries(TrackedAgentCall(
-                lambda session, recovery, invocation: effects.run_agent(
-                    identity.provider, workspace, identity.state_dir, identity.config_path,
-                    "planner", prompt + ('\n이전 결과 검증 오류: ' + protocol_error if protocol_error else ''),
-                    read_only=True, persist_session=False, invocation=invocation),
-                AttemptSequence(repo, plan_id, definition.revision_sha,
-                                purpose="document_change_assessment", target=plan_id)), session_id=None)
-            after = effects.capture_scope(workspace)
-            item = {**item, 'planner_scope': {**item['planner_scope'], 'after': after.serialize()}}
-            save(checkpoints, repo, plan_id, item)
-            effects.validate_scope("planner", workspace, before, after,
-                                   external_worktree=identity.repo_path, base_branch=identity.base)
-            if not _same_local_snapshot(before, after):
-                raise PlannerValidationError("읽기 전용 문서 판단 중 작업 공간이 변경됐습니다.")
-            effects.git(identity.repo_path, 'fetch', 'origin')
-            assert_assessment_inputs(effects, checkpoints, identity, context, item)
-            code, output = result
-            output = redact_secrets(str(output))
-            if code:
-                if result.result_kind is AgentResultKind.USAGE_LIMIT:
-                    state.update_project(repo, last_error=output)
-                    return ExecutionOutcome(ExecutionOutcomeKind.USAGE_PAUSE, detail=output, error=True)
-                raise RecoveryFailure(RecoveryReason.SERVICE_UNAVAILABLE, output)
-            try:
-                assessment = parse_assessment(output)
-                if item.get('scope') == 'execplan' and assessment['plan_text'] is not None:
-                    raise PlannerValidationError('실행 대응 판단은 ExecPlan 개정을 반환할 수 없습니다.')
-                break
-            except PlannerValidationError as error:
-                protocol_error = str(error)
-                item = {**item, 'validation_error': protocol_error, 'last_result': output}
-                save(checkpoints, repo, plan_id, item)
-                if attempt == 2:
-                    raise
-        item = {**item, "stage": "proposed", "assessment": assessment, "candidate": head}
-        save(checkpoints, repo, plan_id, item)
+            effects.git(identity.repo_path, 'worktree', 'remove', str(workspace))
+            remember_workspace_metadata(effects, state, checkpoints, identity, context, workspace)
+        retire_assessment(checkpoints, repo, plan_id, item)
+        return None
     assessment = item["assessment"]
     assessment = parse_assessment('DOCUMENT_RESULT: ' + json.dumps(assessment))
     if item['stage'] == 'proposed' and not item.get('assessment_complete'):
         assert_assessment_inputs(effects, checkpoints, identity, context, item)
     if assessment["implementation"] == "uncertain":
-        raise PlannerValidationError("진행 중 작업의 명세 영향 판단이 불확실합니다: " + assessment["evidence"])
+        retire_assessment(checkpoints, repo, plan_id, item)
+        return None
     if item["stage"] == "proposed" and assessment["plan_text"] is not None:
         snapshot = effects.prepare_snapshot(state.connection, repo, identity.repo_path, item["base"])
         original = snapshot.by_id.get(plan_id)
