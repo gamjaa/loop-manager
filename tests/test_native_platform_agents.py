@@ -271,8 +271,11 @@ class NativePlatformAgentTests(unittest.TestCase):
                     probe._darwin_readonly_path(Path('protected'))
 
     def test_native_launch_passes_unicode_prompt_and_return_code(self):
-        launch = envelope.CodexLaunch((), (), {}, Path('.'), Path('.'), '{}')
-        with tempfile.TemporaryFile() as output:
+        with tempfile.TemporaryDirectory() as directory, tempfile.TemporaryFile() as output:
+            runtime = Path(directory)
+            attempt = runtime / 'call-native'
+            attempt.mkdir()
+            launch = envelope.CodexLaunch((), (), {}, runtime, attempt, '{}')
             result = launch.run([sys.executable, '-c',
                 "import sys; assert sys.stdin.read() == '검증 입력'; print('ok'); raise SystemExit(7)"],
                 launch_process=subprocess.Popen, input='검증 입력', timeout=10,
@@ -280,6 +283,7 @@ class NativePlatformAgentTests(unittest.TestCase):
             self.assertEqual(result.returncode, 7)
             output.seek(0)
             self.assertEqual(output.read().strip(), b'ok')
+            self.assertTrue((runtime / 'call-native.process.json').is_file())
 
     def test_streamed_provider_uses_owned_launch_and_preserves_session(self):
         from loop_manager_internal.agents import windows_runtime
@@ -318,8 +322,7 @@ class NativePlatformAgentTests(unittest.TestCase):
     @unittest.skipUnless(os.name == 'nt', 'Windows Job Object')
     def test_windows_job_stops_descendants_after_parent_exit_and_repeated_stop(self):
         from loop_manager_internal.execution.windows_job import process_identity
-        launch = envelope.CodexLaunch((), (), {}, Path('.'), Path('.'), '{}')
-        process = launch.start([sys.executable, '-c',
+        process = envelope.CodexLaunch.start([sys.executable, '-c',
             "import subprocess,sys; p=subprocess.Popen([sys.executable,'-c','import time; time.sleep(60)']); print(p.pid, flush=True)"],
             launch_process=subprocess.Popen, text=True, encoding='utf-8', stdout=subprocess.PIPE)
         try:
@@ -327,12 +330,12 @@ class NativePlatformAgentTests(unittest.TestCase):
             pid = int(process.stdout.readline())
             process.wait(timeout=10)
             self.assertIsNotNone(process_identity(pid))
-            launch.stop(process)
-            launch.stop(process)
+            envelope.CodexLaunch.stop(process)
+            envelope.CodexLaunch.stop(process)
             deadline = time.monotonic() + 2
             while process_identity(pid) is not None and time.monotonic() < deadline:
                 time.sleep(0.01)
             self.assertIsNone(process_identity(pid))
         finally:
-            launch.stop(process)
+            envelope.CodexLaunch.stop(process)
             process.stdout.close()
