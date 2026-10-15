@@ -1099,6 +1099,35 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
             self.assertIsNone(self.connection.execute("SELECT * FROM exec_plans WHERE plan_id='G-008'").fetchone())
             self.assertEqual(loop_manager.select_ready_execplan(self.connection, str(self.repo))["plan_id"], "G-002")
 
+    def test_remote_deletion_pending_hold_rejects_changed_plan_path(self):
+        body = plan_text("G-007", "Independent").replace("depends_on: []", "depends_on:\n  - G-008") + "\nUse G-001.\n"
+        (self.repo / "docs/plans/[G-007] Independent.md").write_text(body, encoding="utf-8")
+        (self.repo / "docs/plans/[G-008] Invalid.md").write_text(
+            plan_text("G-008", "Invalid").replace("priority: normal\n", ""), encoding="utf-8")
+        (self.repo / self.paths["G-001"]).unlink()
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "delete prerequisite and add held plans")
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", self.base)
+        observed = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+        self.assertTrue(observed.usable)
+        self.assertEqual(set(observed.withheld_plan_ids), {"G-007", "G-008"})
+
+        old_path = self.repo / "docs/plans/[G-007] Independent.md"
+        new_path = self.repo / "docs/plans/[G-007] Renamed.md"
+        old_path.unlink()
+        renamed_body = plan_text("G-007", "Renamed").replace(
+            "depends_on: []", "depends_on:\n  - G-008",
+        ) + "\nUse G-001.\n"
+        new_path.write_text(renamed_body, encoding="utf-8")
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "move held plan to a different identity path")
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", self.base)
+        rejected = loop_manager.reconcile_execplan_catalog(self.connection, self.repo, str(self.repo), "main")
+        self.assertFalse(rejected.usable)
+        self.assertEqual(rejected.diagnostic.code, "unknown-plan-id")
+
     def _assert_pending_deletion_goal_survives_correction(self, body, *, extra_held=frozenset()):
         result, remote_deletions = self._remote_deletion(dependent=False, new_plan_text=body)
         expected_held = {"G-007"} | extra_held

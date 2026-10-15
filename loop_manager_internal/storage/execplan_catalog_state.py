@@ -687,12 +687,6 @@ class DefinitionStateRepository:
                     (repo,),
                 )
             )
-        if "execplan_catalog_holds" in available_tables:
-            reserved_values.update(
-                (str(row[0]), "") for row in self.connection.execute(
-                    "SELECT plan_id FROM execplan_catalog_holds WHERE repo = ?", (repo,),
-                )
-            )
         return CatalogStateSnapshot(
             rows=tuple(
                 CatalogRowVersion(
@@ -1261,8 +1255,24 @@ class CatalogReconciliationService:
                             | set(expected.reserved))
             reserved_paths = {path for _key, path in all_reserved}
             reserved_ids = {item[0] for item in all_reserved}
+            held_paths = {}
+            held_ids_without_path = set()
+            for held_id, _revision, evidence_text, _resume_status in expected.holds:
+                try:
+                    evidence = json.loads(evidence_text)
+                except (TypeError, ValueError):
+                    return self._invalid(pinned.revision_sha, "unknown-plan-id",
+                        f"보류한 ExecPlan identity 근거를 확인할 수 없습니다: {held_id}")
+                held_path = evidence.get("path") if isinstance(evidence, dict) else None
+                if not isinstance(held_path, str) or not held_path:
+                    held_ids_without_path.add(held_id)
+                    continue
+                held_paths[held_id] = held_path
+            held_path_owners = {path: key for key, path in held_paths.items()}
             for key, path in new_observations.items():
-                if key in reserved_ids or path in reserved_paths:
+                if (key in reserved_ids or key in held_ids_without_path or path in reserved_paths
+                        or (key in held_paths and held_paths[key] != path)
+                        or (path in held_path_owners and held_path_owners[path] != key)):
                     return self._invalid(pinned.revision_sha, "unknown-plan-id",
                         f"신규 ExecPlan identity가 예약 이력과 충돌합니다: {key}", path=path)
         if pinned.snapshot.issues:

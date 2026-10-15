@@ -101,9 +101,18 @@ def reference_issues(connection, repo, repository, pinned, *, git_bytes):
     for key, path in missing.items():
         reference = re.compile(rb"(?<![A-Za-z0-9-])" + key.encode("ascii") + rb"(?![A-Za-z0-9-])")
         reference_path = path.encode("utf-8")
-        affected = {str(row["plan_id"]) for row in rows if key in json.loads(row["depends_on"])}
+        def refers(contents):
+            declaration = b"\n".join(
+                line for line in contents.splitlines()
+                if not line.lstrip().startswith(b"DEPENDENCY_RECOVERY:")
+            )
+            return reference_path in declaration or reference.search(declaration)
+
+        current_references = {str(row["plan_id"]) for row in rows
+                              if key in json.loads(row["depends_on"])}
+        affected = set(current_references)
         affected.update(other for other, contents in previous_contents.items()
-                        if reference_path in contents or reference.search(contents))
+                        if refers(contents))
         for other in pinned.snapshot.observed_ids:
             latest = latest_contents.get(other)
             latest_path = withheld_paths.get(other)
@@ -111,8 +120,9 @@ def reference_issues(connection, repo, repository, pinned, *, git_bytes):
                     and latest_path in pinned.regular_paths):
                 latest = git_bytes(repository, "show", f"{pinned.revision_sha}:{latest_path}")
                 latest_contents[other] = latest
-            if latest is not None and (reference_path in latest or reference.search(latest)):
+            if latest is not None and refers(latest):
                 affected.add(other)
+                current_references.add(other)
         # Keep unadopted references until their missing prerequisite returns;
         # removing a reference cannot establish that its goal is unnecessary.
         for other, evidence in prior:
@@ -132,6 +142,11 @@ def reference_issues(connection, repo, repository, pinned, *, git_bytes):
             if (contents is not None and key not in dependencies
                     and approval.get("path") == paths.get(other)
                     and approval.get("content_hash") == catalog.plan_content_hash(contents)):
+                affected.discard(other)
+        # A published recovery judgment resolves the old declaration evidence.
+        # Keep it held if the current declaration still points back to the deleted plan.
+        for other in set(saved.get("resolved", {})) - current_references:
+            if latest_contents.get(other) is not None:
                 affected.discard(other)
         issues.extend(catalog.CatalogIssue(other, paths[other], "missing-plan-reference",
             f"삭제된 계획의 참조 근거를 보존합니다: {other} -> {key}", path)
