@@ -342,6 +342,11 @@ def cancel_pending_persistent_execution_failure_event(
 ) -> None:
     """Cancel remaining legacy failure pieces while retaining delivery audit."""
 
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'notification_outbox'"
+    ).fetchone() is None:
+        return
     identity = "\0".join((subject, str(episode), phase, reason_code, fingerprint))
     connection.execute(
         "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP, "
