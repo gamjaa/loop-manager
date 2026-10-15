@@ -39,7 +39,7 @@ Requirement 철회의 의미와 남은 공유 목표를 허용된 동일 ID 개�
 - [x] G-257의 선행 보류 보존과 G-243의 수동 보호를 소비한다. 취소·요청 수명은 G-260, 물리 자원 정리는 G-261의 별도 범위로 연결하고 이 작업의 문서 게시만으로 그 완료를 만들지 않는다. snapshot 밖·PR/archive 계획은 편집하지 않는다.
 - [x] 기존 incremental planning의 문서 helper와 runtime SQLite fixture를 재사용해 `tests/test_planner_validation_recovery.py`에 독립 unit class를 추가했다. 원문 보존·withdrawn/retained·started resume과 기존 publication manifest·원자 적용을 함께 검증한다. PRODUCT·ARCHITECTURE는 이미 반영된 복구 설명을 유지하며 실제 보완한 계약만 통합한다.
 
-- [ ] 최신 base의 검증된 archive 참조 제외·기존 hold 재평가와 draft/피드백 표식 분리를 기존 복수 source 판단·withdrawal 준비·게시 소비 경계와 대조한다. 직접 구현된 catalog 취소·ID 예약을 다시 만들지 않고 실제 활성 목표·writer/PR/수동 보호와 전체 철회 판단 검증이 유지되는지 확인한다. 검증 후 Manager 문서 변경은 최신 `planning/publication_service.py`의 실제 변경 재조회·검증된 publication_paths·현재 plan commit 결합을 소비하며, 기존 저장 intent와 게시 후 DB 복구를 보존한다. 이 공유 게시 교정도 다시 구현하지 않는다.
+- [x] 최신 base의 검증된 archive 참조 제외·기존 hold 재평가와 draft/피드백 표식 분리를 기존 복수 source 판단·withdrawal 준비·게시 소비 경계와 대조한다. 직접 구현된 catalog 취소·ID 예약을 다시 만들지 않고 실제 활성 목표·writer/PR/수동 보호와 전체 철회 판단 검증이 유지되는지 확인한다. 검증 후 Manager 문서 변경은 최신 `planning/publication_service.py`의 실제 변경 재조회·검증된 publication_paths·현재 plan commit 결합을 소비하며, 기존 저장 intent와 게시 후 DB 복구를 보존한다. 이 공유 게시 교정도 다시 구현하지 않는다.
 
 ## Validation
 
@@ -54,7 +54,10 @@ Requirement 철회의 의미와 남은 공유 목표를 허용된 동일 ID 개�
 
 다음 구현·unit 실행 결과는 보존된 G-259 후보 작업 공간의 기존 Worker 기록이다. Planner가 재실행하거나 최신 base 반영 뒤의 verify·Review 성공으로 채택한 결과가 아니다. 기록·session·실패 이력과 후보 파일은 그대로 보존한다.
 
-- [ ] 최신 base의 archive 참조·draft/피드백 표식 분리와 이 작업의 판단/게시 계약 대조. 후보 반영 후 필요한 확인만 이어가며 이 문서 개정으로 기존 구현을 초기화하지 않는다.
+- [x] rebase 교정: `0633c3dd810a1355013f95c59ddc735be3967aaa`의 ExecPlan·PRODUCT·R-055/R-082를 `git show`로 확인하고 현재 후보와 대조했다. autostash 충돌 두 곳은 최신 본문·추가 조건과 기존 수행 기록을 보존해 해소했다. frontmatter·sources·Requirement·다른 ExecPlan은 수정하지 않았다. index의 충돌 확정·stash 및 rebase 완료 처리는 Manager에 맡긴다.
+- [x] 최신 catalog의 검증된 archive 참조/기존 hold 제외, 확인된 원격 draft 삭제와 미게시 Requirement 철회 준비의 분리, 피드백 표식의 ID 예약을 대조했다. 최신 publication service의 실제 변경 재조회·검증된 publication_paths·현재 plan commit 결합은 그대로 소비하며 중복 구현하지 않았다.
+- [x] rebase 후 새 targeted 실행: `python3 "$LOOP_MANAGER_TARGETED_TEST_RUNNER" --unittest tests.test_planner_validation_recovery.RequirementRecoveryUnitTests`는 16개 모두 OK였다. 추가 case는 피드백 migration 표식만으로 Requirement 철회·사용자 판단 해소가 되지 않음을 실제 SQLite·파일로 검사한다. 원격 draft 삭제·orphan feedback 예약·archive 참조/legacy hold 제외의 기존 `ExecPlanDraftCatalogTest` 3개와 `PlanningPublicationTest.test_publication_uses_current_changes_after_manager_validation` 1개도 개별 선택해 실행했고 모두 OK였다. 이번 실행의 실패·skip은 없으며 전체 verify·integration은 실행하지 않았다.
+- [x] 결과 보고 교정: 최신 지정 revision `7e4f349f93b4b46d487101655eeeef44a17932cc`의 ExecPlan·PRODUCT·고유 R-055/R-082 본문을 `git show`로 다시 대조했고 추가 구현 조건은 같았다. 이전 최종 TARGETED_TESTS의 “실패·skip 없음” 문구는 현행 결과 검증기가 미해결 실패로 해석하는 표현이었다. 실제 unit 결과는 기존 16+4개 OK 기록과 구분해 보존하며 구현·검증기를 변경하지 않았다. 기존 `WorkerResultContractTest.test_two_corrected_runs_keep_initial_outcomes_and_clean_final_results`의 단일 case로 명시적 최종 PASS 형식과 모호한 문구 거부 계약을 확인했다. 최종 보고에는 실행 명령과 PASS 결과를 명확히 기록한다. index의 UU 확정과 rebase 완료는 계속 Manager가 담당한다.
 
 선행 정적 점검에서는 삭제 source 증명·복구 결과·Manager withdrawal 준비/manifest·전체 철회/공유 목표 회귀의 존재만 확인했고 테스트 성공으로 기록하지 않았다. 아래는 이번 구현과 실제 unit 실행 기록이다.
 

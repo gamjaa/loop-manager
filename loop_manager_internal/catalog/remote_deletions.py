@@ -455,6 +455,7 @@ def requirement_deletions(connection, repo, repository, pinned, *, git, git_byte
     from loop_manager_internal.catalog import requirement_sources
     from loop_manager_internal.git.command_adapter import revision_requirement_documents
     documents = revision_requirement_documents(git_bytes, repository, pinned.revision_sha)
+    previous_documents = {}
     for row in rows:
         current_revision = row["current_revision_sha"] if "current_revision_sha" in row.keys() else None
         revision = str(current_revision or row["plan_sha"] or "")
@@ -469,10 +470,13 @@ def requirement_deletions(connection, repo, repository, pinned, *, git, git_byte
             ancestry = git(repository, "merge-base", "--is-ancestor", revision, pinned.revision_sha, check=False)
             if ancestry.returncode != 0:
                 continue
-            original = git(repository, "show", f"{revision}:{source}", check=False)
-            if original.returncode:
+            if revision not in previous_documents:
+                previous_documents[revision] = revision_requirement_documents(git_bytes, repository, revision)
+            original = requirement_sources.resolve_requirement_source(
+                source, previous_documents[revision], allow_archive=False)
+            if original.status is not requirement_sources.ResolutionStatus.RESOLVED:
                 continue
-            proof = result.setdefault(source, {"text": original.stdout, "revision": revision,
+            proof = result.setdefault(source, {"text": original.contents, "revision": revision,
                 "deletion_revision": pinned.revision_sha, "row": dict(row), "affected": []})
             proof["affected"].append(str(row["plan_id"]))
     return result
@@ -541,11 +545,20 @@ def recovery_goals(connection, repo):
         "SELECT plan_id, evidence FROM execplan_catalog_holds WHERE repo=?", (repo,))}
     sources = {}
     for held in holds.values():
-        sources.update(held.get("deleted_sources", {}))
+        for source, proof in held.get("deleted_sources", {}).items():
+            previous = sources.get(source)
+            if previous is None:
+                sources[source] = dict(proof)
+                continue
+            if any(previous.get(field) != proof.get(field) for field in ("text", "revision", "deletion_revision")):
+                raise PlannerValidationError("Requirement 삭제 원문·revision 근거가 상충합니다.")
+            previous["affected"] = sorted(set(previous["affected"]) | set(proof["affected"]))
+            previous["resolved"] = {key: value for key, value in previous.get("resolved", {}).items()
+                                    if proof.get("resolved", {}).get(key) == value}
     for source, proof in sorted(sources.items()):
         affected = sorted((set(proof["affected"]) - set(proof.get("resolved", {}))) & observed_ids & held_ids)
         if affected:
-            evidence = json.dumps({"text": proof["text"], "row": proof["row"],
+            evidence = json.dumps({"text": proof["text"], "revision": proof["revision"], "row": proof["row"],
                 "affected": affected, "resolved": {}}, ensure_ascii=False, sort_keys=True)
             goals.append(json.dumps({"id": "requirement:" + source, "path": source, "kind": "missing-source",
                 "deletion_revision": proof["deletion_revision"], "evidence": evidence,
@@ -637,19 +650,19 @@ def requirement_judgments(connection, repo):
     if connection is None or repo is None:
         return {}
     row = connection.execute("SELECT planning_result FROM projects WHERE repo=?", (repo,)).fetchone()
-    lines = [line.partition(":")[2] for line in str(row[0] or "").splitlines()
-             if line.startswith("REQUIREMENT_RECOVERY:")] if row else []
-    if not lines:
+    output = str(row[0] or "") if row else ""
+    from loop_manager_internal.application.result_normalization import normalize_markers, tagged_json
+    if not any(line.startswith("REQUIREMENT_RECOVERY:") for line in
+               normalize_markers(output, ("REQUIREMENT_RECOVERY",)).splitlines()):
         return {}
     try:
-        if len(lines) != 1:
-            raise ValueError("중복 결과")
-        values = json.loads(lines[0])
+        values = tagged_json(output, "REQUIREMENT_RECOVERY")
         if not isinstance(values, list):
             raise ValueError("결과 배열 필요")
         result = {}
         for item in values:
             if (not isinstance(item, dict) or set(item) != {"id", "source", "outcome", "reason"}
+                    or not isinstance(item["outcome"], str)
                     or item["outcome"] not in {"withdrawn", "retained", "uncertain"}
                     or not isinstance(item["reason"], str) or not item["reason"].strip()
                     or not isinstance(item["id"], str) or not isinstance(item["source"], str)
@@ -661,52 +674,83 @@ def requirement_judgments(connection, repo):
         raise PlannerValidationError("Requirement 삭제 판단 결과가 유효하지 않습니다.") from error
 
 
-def prepare_withdrawals(connection, repo, worktree, snapshot):
-    """시작한 작업의 직접 삭제 대신 안전한 Manager 문서 전환을 준비한다."""
+def requirement_recovery_decisions(connection, repo, snapshot):
+    """Bind every decision to current proof and reconcile all sources per task."""
     decisions = requirement_judgments(connection, repo)
-    prepared = {}
+    if connection is not None and snapshot.recovery_goals != recovery_goals(connection, repo):
+        raise PlannerValidationError("Requirement 삭제 원문·revision 근거가 변경됐습니다.")
+    goals = {}
     for raw in snapshot.recovery_goals:
         goal = json.loads(raw)
-        if goal.get("kind") != "missing-source":
-            continue
-        for key in set(goal["affected_ids"]) & snapshot.by_id.keys():
-            decision = decisions.get((key, goal["path"]))
-            if not decision or decision["outcome"] != "withdrawn":
+        if goal.get("kind") == "missing-source":
+            for key in set(goal["affected_ids"]) & snapshot.by_id.keys():
+                goals.setdefault(key, {})[goal["path"]] = goal
+    if any(key not in goals or source not in goals[key] for key, source in decisions):
+        raise PlannerValidationError("Requirement 삭제 판단의 대상 ID·source가 snapshot과 다릅니다.")
+    withdrawals = {}
+    for key, sources in goals.items():
+        items = [decisions.get((key, source)) for source in sorted(sources)]
+        if any(item and item["outcome"] == "withdrawn" for item in items):
+            if any(not item or item["outcome"] != "withdrawn" for item in items):
+                raise PlannerValidationError("전체 철회에는 모든 삭제 source의 일치하는 판단이 필요합니다.")
+            withdrawals[key] = {"decision": items[0], "goal": sources[items[0]["source"]],
+                                "judgments": [{"decision": item, "goal": sources[item["source"]]} for item in items]}
+    return decisions, withdrawals
+
+
+def prepare_withdrawals(connection, repo, worktree, snapshot, *, assert_current=None):
+    """시작한 작업의 직접 삭제 대신 안전한 Manager 문서 전환을 준비한다."""
+    _decisions, withdrawals = requirement_recovery_decisions(connection, repo, snapshot)
+    if withdrawals and assert_current is not None:
+        from dataclasses import replace
+        assert_current(connection, replace(snapshot, plans=tuple(
+            plan for plan in snapshot.plans if plan.plan_id in withdrawals)))
+    prepared = {}
+    for key, judgment in withdrawals.items():
+        original = snapshot.by_id[key]
+        from loop_manager_internal.storage import execplan_draft_state, work_claims
+        if original.draft or key in execplan_draft_state.pending_ids(connection, repo):
+            raise PlannerValidationError("사용자 판단 대기 draft를 철회할 수 없습니다.")
+        row = connection.execute("SELECT * FROM exec_plans WHERE repo=? AND plan_id=?", (repo, key)).fetchone()
+        manual_state, owned = work_claims.manual_plan_ownership(connection, repo, key, row)
+        if owned or manual_state != (original.manual_ownership_state or work_claims.empty_manual_ownership_state()):
+            raise PlannerValidationError("작업 철회 전에 수동 소유권·준비 intent가 변경됐습니다.")
+        if row is not None and row["branch"] and assert_current is None:
+            raise PlannerValidationError("철회 전에 실제 PR 부재를 확인해야 합니다.")
+        if original.execution_state:
+            from loop_manager_internal.planning.planner_validation import planning_execution_state
+            if row is None or planning_execution_state(row) != original.execution_state or row["agent_role"]:
+                raise PlannerValidationError("작업 철회 전에 실행 소유권·writer가 변경됐습니다.")
+        prepared[key] = judgment
+        if original.execution_state and json.loads(original.execution_state).get("ever_started"):
+            path = worktree / original.path
+            held = connection.execute("SELECT evidence FROM execplan_catalog_holds WHERE repo=? AND plan_id=?", (repo, key)).fetchone()
+            evidence = json.loads(held[0]) if held else {}
+            receipt = evidence.get("prepared_withdrawal")
+            if (receipt and all(receipt.get(field) == value for field, value in judgment.items())
+                    and receipt.get("preserved_text") == original.text and not path.exists()):
+                prepared[key] = receipt
                 continue
-            original = snapshot.by_id[key]
-            if original.execution_state:
-                from loop_manager_internal.planning.planner_validation import planning_execution_state
-                row = connection.execute("SELECT * FROM exec_plans WHERE repo=? AND plan_id=?", (repo, key)).fetchone()
-                if row is None or planning_execution_state(row) != original.execution_state or row["agent_role"]:
-                    raise PlannerValidationError("작업 철회 전에 실행 소유권·writer가 변경됐습니다.")
-                if connection.execute("SELECT 1 FROM manual_work_members WHERE repo=? AND plan_id=?", (repo, key)).fetchone():
-                    raise PlannerValidationError("수동 작업 소유권이 있는 계획을 철회할 수 없습니다.")
-            prepared[key] = {"decision": decision, "goal": goal}
-            if original.execution_state and json.loads(original.execution_state).get("ever_started"):
-                path = worktree / original.path
-                held = connection.execute("SELECT evidence FROM execplan_catalog_holds WHERE repo=? AND plan_id=?", (repo, key)).fetchone()
-                evidence = json.loads(held[0]) if held else {}
-                receipt = evidence.get("prepared_withdrawal")
-                if receipt and receipt.get("decision") == decision and receipt.get("goal") == goal and not path.exists():
-                    prepared[key] = receipt
-                    continue
-                if not path.is_file() or path.is_symlink() or not held:
-                    raise PlannerValidationError("시작한 작업은 Planner가 직접 삭제할 수 없습니다.")
-                prepared[key]["preserved_text"] = path.read_text(encoding="utf-8")
-                evidence["prepared_withdrawal"] = prepared[key]
-                from loop_manager_internal.storage.runtime_state import _transaction
-                with _transaction(connection):
-                    changed = connection.execute("UPDATE execplan_catalog_holds SET evidence=? WHERE repo=? AND plan_id=? AND evidence=?",
-                        (json.dumps(evidence, ensure_ascii=False, sort_keys=True), repo, key, held[0]))
-                    if changed.rowcount != 1:
-                        raise PlannerValidationError("작업 철회 보존 근거가 변경됐습니다.")
-                path.unlink()
+            if not path.is_file() or path.is_symlink() or not held:
+                raise PlannerValidationError("시작한 작업은 Planner가 직접 삭제할 수 없습니다.")
+            text = path.read_text(encoding="utf-8")
+            if text != original.text:
+                raise PlannerValidationError("철회할 문서 원문이 snapshot과 다릅니다.")
+            prepared[key]["preserved_text"] = text
+            evidence["prepared_withdrawal"] = prepared[key]
+            from loop_manager_internal.storage.runtime_state import _transaction
+            with _transaction(connection):
+                changed = connection.execute("UPDATE execplan_catalog_holds SET evidence=? WHERE repo=? AND plan_id=? AND evidence=?",
+                    (json.dumps(evidence, ensure_ascii=False, sort_keys=True), repo, key, held[0]))
+                if changed.rowcount != 1:
+                    raise PlannerValidationError("작업 철회 보존 근거가 변경됐습니다.")
+            path.unlink()
     return prepared
 
 
 def validate_recovery(worktree, snapshot, current_plans, catalog_metadata, *, connection=None, repo=None):
     """Require a Planner judgment and retained goal gates, never infer meaning."""
-    judgments = requirement_judgments(connection, repo)
+    judgments, _withdrawals = requirement_recovery_decisions(connection, repo, snapshot)
     for raw in snapshot.recovery_goals:
         goal = json.loads(raw)
         for key in set(goal["affected_ids"]) & snapshot.by_id.keys():
@@ -733,7 +777,8 @@ def validate_recovery(worktree, snapshot, current_plans, catalog_metadata, *, co
             for line in log.splitlines():
                 if line.startswith("DEPENDENCY_RECOVERY:"):
                     try:
-                        decisions.append(json.loads(line.partition(":")[2]))
+                        from loop_manager_internal.application.result_normalization import tagged_json
+                        decisions.append(tagged_json(line, "DEPENDENCY_RECOVERY"))
                     except ValueError as error:
                         raise PlannerValidationError("DEPENDENCY_RECOVERY JSON이 유효하지 않습니다.") from error
             matching = [item for item in decisions if isinstance(item, dict) and item.get("deleted_id") == goal["id"]]

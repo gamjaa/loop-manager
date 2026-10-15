@@ -502,3 +502,334 @@ class PlannerValidationRecoveryTest(unittest.TestCase):
             self.assertEqual(planner.call_count, 1)
             self.assertEqual(row["planning_retry_count"], 3)
             self.assertIsNotNone(row["planning_error"])
+
+
+class RequirementRecoveryUnitTests(unittest.TestCase):
+    """Real parser, files and SQLite; no Git or Agent process is needed."""
+
+    def setUp(self):
+        import json
+        from tests.support.database import runtime_connection
+        from tests.test_incremental_planning import plan_text
+        from loop_manager_internal.planning.planning_catalog import MutableReadySnapshot
+        from loop_manager_internal.maintenance.maintenance_planning import ReadyPlanSnapshot
+        from loop_manager_internal.catalog import remote_deletions
+        from loop_manager_internal.planning.planner_validation import planning_execution_state
+        self.json = json
+        self.recovery = remote_deletions
+        self.connection = runtime_connection('repo')
+        self.addCleanup(self.connection.close)
+        self.directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self.directory.cleanup)
+        self.worktree = Path(self.directory.name)
+        self.sources = ['docs/requirements/[R-001] First.md', 'docs/requirements/[R-002] Second.md']
+        self.text = plan_text('G-047', 'Runtime').replace(
+            '  - docs/PRODUCT.md', '\n'.join('  - ' + source for source in self.sources))
+        self.path = self.worktree / 'docs/plans/[G-047] Runtime.md'
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(self.text, encoding='utf-8')
+        self.connection.execute("UPDATE exec_plans SET ever_started=1, workspace_owned=0, worker_result='done', sources=?",
+                                (json.dumps(self.sources, separators=(',', ':')),))
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        self.proofs = {source: {'text': '# [R-001] Deleted\nold acceptance criteria',
+            'revision': 'original-revision', 'deletion_revision': 'deleted-revision',
+            'row': dict(row), 'affected': ['G-047']} for source in self.sources}
+        self.connection.execute('INSERT INTO execplan_catalog_holds (repo, plan_id, revision_sha, evidence) VALUES (?, ?, ?, ?)',
+            ('repo', 'G-047', 'deleted-revision', json.dumps({'deleted_sources': self.proofs})))
+        self.connection.commit()
+        original = ReadyPlanSnapshot('G-047', 'docs/plans/[G-047] Runtime.md', 'Runtime',
+            tuple(self.sources), (), 'low', 'low', 'normal', 'hash', 'plan-sha', self.text,
+            execution_state=planning_execution_state(row))
+        self.snapshot = MutableReadySnapshot('repo', 'base', (original,), 'token',
+            remote_deletions.recovery_goals(self.connection, 'repo'))
+        self.decisions = [{'id': 'G-047', 'source': source, 'outcome': 'withdrawn',
+                           'reason': 'All remaining product and shared goals were examined.'} for source in self.sources]
+        self.record(self.decisions)
+
+    def record(self, decisions=None, *, raw=None):
+        self.connection.execute('UPDATE projects SET planning_result=?',
+            (raw if raw is not None else 'REQUIREMENT_RECOVERY: ' + self.json.dumps(decisions),))
+        self.connection.commit()
+
+    def prepare(self, **kwargs):
+        return self.recovery.prepare_withdrawals(self.connection, 'repo', self.worktree, self.snapshot, **kwargs)
+
+    def test_partial_conflicting_or_uncertain_withdrawal_keeps_original_and_has_no_receipt(self):
+        for decisions in (self.decisions[:1], [self.decisions[0], dict(self.decisions[1], outcome='retained')],
+                          [self.decisions[0], dict(self.decisions[1], outcome='uncertain')]):
+            with self.subTest(decisions=decisions):
+                self.record(decisions)
+                with self.assertRaises(self.recovery.PlannerValidationError):
+                    self.prepare()
+                self.assertEqual(self.path.read_text(encoding='utf-8'), self.text)
+                evidence = self.connection.execute('SELECT evidence FROM execplan_catalog_holds').fetchone()[0]
+                self.assertNotIn('prepared_withdrawal', self.json.loads(evidence))
+
+    def test_strict_json_rejects_duplicate_marker_keys_and_invalid_fields(self):
+        valid = self.json.dumps(self.decisions)
+        invalid = [
+            'REQUIREMENT_RECOVERY: ' + valid + '\nREQUIREMENT_RECOVERY: ' + valid,
+            'REQUIREMENT_RECOVERY: ' + valid.replace('"outcome": "withdrawn"', '"outcome": "retained", "outcome": "withdrawn"', 1),
+        ]
+        for field, value in (('outcome', []), ('reason', ' '), ('id', 'G-999'),
+                             ('source', self.sources[0] + '.wrong'), ('outcome', 'partial')):
+            items = [dict(self.decisions[0], **{field: value}), self.decisions[1]]
+            invalid.append('REQUIREMENT_RECOVERY: ' + self.json.dumps(items))
+        invalid.append('REQUIREMENT_RECOVERY: ' + self.json.dumps(self.decisions + self.decisions[:1]))
+        for raw in invalid:
+            with self.subTest(raw=raw):
+                self.record(raw=raw)
+                with self.assertRaises(self.recovery.PlannerValidationError):
+                    self.prepare()
+                self.assertTrue(self.path.exists())
+
+    def test_source_text_and_last_revision_are_snapshot_bound_before_preparation(self):
+        for field in ('text', 'revision', 'deletion_revision'):
+            with self.subTest(field=field):
+                proofs = {source: dict(proof) for source, proof in self.proofs.items()}
+                proofs[self.sources[0]][field] = 'changed'
+                self.connection.execute('UPDATE execplan_catalog_holds SET evidence=?',
+                    (self.json.dumps({'deleted_sources': proofs}),))
+                self.connection.commit()
+                with self.assertRaisesRegex(self.recovery.PlannerValidationError, '근거가 변경'):
+                    self.prepare()
+                self.assertTrue(self.path.exists())
+
+    def test_preservation_receipt_resumes_before_and_after_unlink_with_all_judgments(self):
+        with mock.patch.object(Path, 'unlink', side_effect=OSError('interrupted before unlink')):
+            with self.assertRaises(OSError):
+                self.prepare()
+        self.assertTrue(self.path.exists())
+        receipt = self.json.loads(self.connection.execute('SELECT evidence FROM execplan_catalog_holds').fetchone()[0])['prepared_withdrawal']
+        self.assertEqual(receipt['preserved_text'], self.text)
+        self.assertEqual(len(receipt['judgments']), 2)
+        prepared = self.prepare()
+        self.assertFalse(self.path.exists())
+        self.assertEqual(self.prepare(), prepared)
+        self.assertEqual(prepared['G-047'], receipt)
+
+    def test_modified_original_or_writer_change_prevents_preparation(self):
+        self.path.write_text(self.text + '\nchanged goal', encoding='utf-8')
+        with self.assertRaisesRegex(self.recovery.PlannerValidationError, '원문'):
+            self.prepare()
+        self.path.write_text(self.text, encoding='utf-8')
+        self.connection.execute("UPDATE exec_plans SET agent_role='worker'")
+        self.connection.commit()
+        with self.assertRaisesRegex(self.recovery.PlannerValidationError, 'writer'):
+            self.prepare()
+        self.assertTrue(self.path.exists())
+
+    def test_actual_pr_check_runs_before_any_receipt_or_unlink_and_on_resume(self):
+        from dataclasses import replace
+        from loop_manager_internal.planning import planner_validation
+        self.connection.execute("UPDATE exec_plans SET branch='topic'")
+        self.connection.commit()
+        row = self.connection.execute('SELECT * FROM exec_plans').fetchone()
+        original = replace(self.snapshot.plans[0], current_metadata_recorded=True,
+            execution_state=planner_validation.planning_execution_state(row))
+        self.snapshot = replace(self.snapshot, plans=(original,))
+        pr = mock.Mock(return_value={'url': 'existing PR'})
+        effects = planner_validation.AssertMutableReadySnapshotCurrentEffects(
+            loop_manager._execplan_metadata, loop_manager._row_is_mutable_ready, pr)
+        def check(connection, snapshot):
+            planner_validation._assert_mutable_ready_snapshot_current(effects, connection, snapshot)
+        with self.assertRaisesRegex(self.recovery.PlannerValidationError, 'PR'):
+            self.prepare(assert_current=check)
+        self.assertTrue(self.path.exists())
+        pr.assert_called_once_with(Path('repo'), 'topic')
+        pr.return_value = None
+        self.prepare(assert_current=check)
+        pr.return_value = {'url': 'PR on resume'}
+        with self.assertRaisesRegex(self.recovery.PlannerValidationError, 'PR'):
+            self.prepare(assert_current=check)
+
+    def test_user_decision_and_manual_preparation_intent_cannot_be_withdrawn(self):
+        from loop_manager_internal.storage import execplan_draft_state
+        execplan_draft_state.ensure_schema(self.connection)
+        self.connection.execute("INSERT INTO execplan_drafts VALUES ('repo', 'G-047', 1, '{}')")
+        self.connection.commit()
+        with self.assertRaisesRegex(self.recovery.PlannerValidationError, 'draft'):
+            self.prepare()
+        self.connection.execute('DELETE FROM execplan_drafts')
+        self.connection.execute("""INSERT INTO manual_work_groups
+            (repo, group_id, kind, source_branch, requirements, source_head, base_sha, state, members, documents, owner_id)
+            VALUES ('repo', 'group', 'start', 'topic', '[]', 'head', 'base', 'STARTING', '["G-047"]', '[]', 'G-047')""")
+        self.connection.execute("INSERT INTO manual_work_members VALUES ('repo', 'G-047', 'group')")
+        self.connection.commit()
+        with self.assertRaisesRegex(self.recovery.PlannerValidationError, '수동'):
+            self.prepare()
+        self.assertTrue(self.path.exists())
+
+    def test_retained_goals_keep_shared_checklist_files_validation_and_dependency(self):
+        from loop_manager_internal.catalog.execplan_catalog import parse_execplan_text
+        self.record([dict(item, outcome='retained', reason='PRODUCT shared goal remains') for item in self.decisions])
+        revised = self.text.replace('\n'.join('  - ' + source for source in self.sources), '  - docs/PRODUCT.md')
+        revised = revised.replace('depends_on: []', 'depends_on:\n  - G-048')
+        revised += '\nShared implementation: shared.py; validation: shared_test.py (PRODUCT).\n'
+        self.path.write_text(revised, encoding='utf-8')
+        plan = parse_execplan_text(self.snapshot.plans[0].path, revised, validate_sources=False)
+        self.recovery.validate_recovery(self.worktree, self.snapshot, {self.snapshot.plans[0].path: plan},
+            {}, connection=self.connection, repo='repo')
+        self.assertEqual(self.prepare(), {})
+        self.assertEqual(plan['sources'], ['docs/PRODUCT.md'])
+        self.assertEqual(plan['depends_on'], ['G-048'])
+        self.assertIn('Keep the boundary explicit.', self.path.read_text(encoding='utf-8'))
+        self.assertIn('shared_test.py', self.path.read_text(encoding='utf-8'))
+
+    def test_unresolved_source_stays_held_and_resolutions_rollback_with_batch(self):
+        self.record([dict(item, outcome='retained') for item in self.decisions])
+        self.recovery.validate_recovery(self.worktree, self.snapshot, {}, {}, connection=self.connection, repo='repo')
+        with self.assertRaisesRegex(RuntimeError, 'rollback'):
+            with self.connection:
+                self.recovery.resolve_recovery(self.connection, self.snapshot, 'published', {'G-047'})
+                raise RuntimeError('rollback')
+        self.assertEqual(self.recovery.recovery_goals(self.connection, 'repo'), self.snapshot.recovery_goals)
+        with self.connection:
+            self.recovery.resolve_recovery(self.connection, self.snapshot, 'published', {'G-047'})
+        self.assertEqual(self.recovery.recovery_goals(self.connection, 'repo'), ())
+        with self.connection:
+            self.recovery.resolve_recovery(self.connection, self.snapshot, 'published', {'G-047'})
+        self.assertEqual(self.recovery.recovery_goals(self.connection, 'repo'), ())
+
+    def test_repeated_source_proofs_union_affected_and_reject_stale_conflicts(self):
+        other = {source: dict(proof, affected=['G-048']) for source, proof in self.proofs.items()}
+        self.connection.execute('INSERT INTO execplan_catalog_holds (repo, plan_id, revision_sha, evidence) VALUES (?, ?, ?, ?)',
+            ('repo', 'G-048', 'deleted-revision', self.json.dumps({'deleted_sources': other})))
+        goals = [self.json.loads(raw) for raw in self.recovery.recovery_goals(self.connection, 'repo')]
+        self.assertTrue(all(goal['affected_ids'] == ['G-047', 'G-048'] for goal in goals))
+        other[self.sources[0]]['text'] = 'conflicting original'
+        self.connection.execute("UPDATE execplan_catalog_holds SET evidence=? WHERE plan_id='G-048'",
+            (self.json.dumps({'deleted_sources': other}),))
+        with self.assertRaisesRegex(self.recovery.PlannerValidationError, '상충'):
+            self.recovery.recovery_goals(self.connection, 'repo')
+
+    def test_feedback_marker_does_not_authorize_requirement_withdrawal_or_release_draft(self):
+        from loop_manager_internal.storage import validation_feedback_state, execplan_draft_state
+        validation_feedback_state.ensure_schema(self.connection)
+        self.connection.execute("INSERT INTO validation_feedback_migrations (repo, plan_id) VALUES ('repo', 'G-047')")
+        self.connection.commit()
+        self.record([])
+        self.assertEqual(self.prepare(), {})
+        self.assertTrue(self.path.exists())
+        self.record(self.decisions)
+        execplan_draft_state.ensure_schema(self.connection)
+        self.connection.execute("INSERT INTO execplan_drafts VALUES ('repo', 'G-047', 1, '{}')")
+        self.connection.commit()
+        with self.assertRaisesRegex(self.recovery.PlannerValidationError, 'draft'):
+            self.prepare()
+        self.assertTrue(self.path.exists())
+        self.assertIn('G-047', execplan_draft_state.pending_ids(self.connection, 'repo'))
+
+    def test_manifest_roundtrip_and_atomic_cancellation_preserve_every_source_and_history(self):
+        from dataclasses import replace
+        from loop_manager_internal.planning.planning_catalog import PlanDeletion, mutable_snapshot_token
+        from loop_manager_internal.storage.planning_publication_state import apply_mutable_catalog_changes
+        judgment = self.prepare()['G-047']
+        snapshot = replace(self.snapshot, token=mutable_snapshot_token('repo', 'base', self.snapshot.plans, self.snapshot.recovery_goals))
+        result = loop_manager.ValidatedPlanningResult(plans=(), deletions=(PlanDeletion(snapshot.plans[0], judgment),),
+            publication_paths=(snapshot.plans[0].path,), mutable_snapshot=snapshot)
+        manifest = loop_manager._planning_result_manifest(result)
+        restored = loop_manager._planning_result_from_manifest(manifest)
+        self.assertEqual(restored, result)
+        def apply():
+            apply_mutable_catalog_changes(self.connection, 'repo', deletions=restored.deletions, revisions=(),
+                snapshot_token=snapshot.token, plan_commit='published', content_hash=lambda path: 'unused')
+            self.recovery.resolve_recovery(self.connection, snapshot, 'published', {'G-047'})
+        with self.assertRaisesRegex(RuntimeError, 'interrupted DB apply'):
+            with self.connection:
+                apply()
+                raise RuntimeError('interrupted DB apply')
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM exec_plans').fetchone()[0], 1)
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM execplan_cancellations').fetchone()[0], 0)
+        with self.connection:
+            apply()
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM exec_plans').fetchone()[0], 0)
+        audit = self.json.loads(self.connection.execute('SELECT recovery_evidence FROM execplan_cancellations').fetchone()[0])
+        self.assertEqual(audit['text'], self.text)
+        self.assertEqual(audit['row']['worker_result'], 'done')
+        self.assertEqual(audit['row']['ever_started'], 1)
+        self.assertEqual(audit['judgment']['judgments'], judgment['judgments'])
+        self.assertEqual(self.recovery.recovery_goals(self.connection, 'repo'), ())
+
+    def test_pending_decision_added_after_preparation_still_blocks_db_cancellation(self):
+        from loop_manager_internal.planning.planning_catalog import PlanDeletion
+        from loop_manager_internal.storage import execplan_draft_state, planning_publication_state
+        judgment = self.prepare()['G-047']
+        execplan_draft_state.ensure_schema(self.connection)
+        self.connection.execute("INSERT INTO execplan_drafts VALUES ('repo', 'G-047', 1, '{}')")
+        self.connection.commit()
+        with self.assertRaisesRegex(self.recovery.PlannerValidationError, 'draft'):
+            planning_publication_state.apply_mutable_catalog_changes(self.connection, 'repo',
+                deletions=(PlanDeletion(self.snapshot.plans[0], judgment),), revisions=(), snapshot_token='token',
+                plan_commit='published', content_hash=lambda path: 'unused')
+        self.assertIsNotNone(self.connection.execute('SELECT * FROM exec_plans').fetchone())
+        self.assertEqual(self.connection.execute('SELECT COUNT(*) FROM execplan_cancellations').fetchone()[0], 0)
+
+    def test_dependency_recovery_rejects_duplicate_json_keys_and_preserves_replacement_gate(self):
+        from dataclasses import replace
+        self.record([])
+        goal = {'id': 'G-046', 'path': 'docs/plans/[G-046] Deleted.md', 'affected_ids': ['G-047']}
+        snapshot = replace(self.snapshot, recovery_goals=(self.json.dumps(goal),))
+        plan = {'id': 'G-047', 'sources': ['docs/PRODUCT.md'], 'depends_on': ['G-048']}
+        decision = {'deleted_id': 'G-046', 'outcome': 'replaced', 'replacement_ids': ['G-048'],
+                    'sources': ['docs/PRODUCT.md'], 'reason': 'Shared prerequisite is still needed.'}
+        with mock.patch.object(self.recovery, 'recovery_goals', return_value=snapshot.recovery_goals):
+            for raw, catalog, valid in (
+                (self.json.dumps(decision), {'G-048': {}}, True),
+                (self.json.dumps(decision), {}, False),
+                (self.json.dumps(decision).replace('"outcome": "replaced"', '"outcome": "obsolete", "outcome": "replaced"'), {'G-048': {}}, False),
+            ):
+                with self.subTest(raw=raw, catalog=catalog):
+                    self.path.write_text(self.text + '\nDEPENDENCY_RECOVERY: ' + raw, encoding='utf-8')
+                    if valid:
+                        self.recovery.validate_recovery(self.worktree, snapshot, {self.snapshot.plans[0].path: plan},
+                            catalog, connection=self.connection, repo='repo')
+                    else:
+                        with self.assertRaises(self.recovery.PlannerValidationError):
+                            self.recovery.validate_recovery(self.worktree, snapshot, {self.snapshot.plans[0].path: plan},
+                                catalog, connection=self.connection, repo='repo')
+
+    def test_partial_ac_change_is_an_ordinary_specification_input_change(self):
+        from loop_manager_internal.planning.input_fingerprints import _specification_input_digest
+        source = b'docs/requirements/[R-003] Shared.md'
+        before = b'# [R-003] Shared\n## Acceptance Criteria\n- Shared behavior\n- Withdrawn condition\n'
+        after = before.replace(b'- Withdrawn condition\n', b'')
+        self.assertNotEqual(
+            _specification_input_digest([(source, b'blob', before)], guidance_hash='guidance'),
+            _specification_input_digest([(source, b'blob', after)], guidance_hash='guidance'))
+        self.record([])
+        from dataclasses import replace
+        empty = replace(self.snapshot, recovery_goals=())
+        self.connection.execute('DELETE FROM execplan_catalog_holds')
+        self.connection.commit()
+        self.assertEqual(self.recovery.prepare_withdrawals(self.connection, 'repo', self.worktree, empty), {})
+        self.assertEqual(self.path.read_text(encoding='utf-8'), self.text)
+
+    def test_deleted_renamed_source_uses_preserved_identity_and_observation_errors_are_not_withdrawal(self):
+        from loop_manager_internal.git import command_adapter
+        revision = 'a' * 40
+        current = 'b' * 40
+        source = self.sources[0]
+        renamed = 'docs/requirements/[R-001] Renamed.md'
+        contents = '# [R-001] Renamed\n## Acceptance Criteria\n- Keep original goal\n'
+        self.connection.execute('UPDATE exec_plans SET plan_sha=?, sources=?',
+            (revision, self.json.dumps([source])))
+        self.connection.commit()
+        git = mock.Mock(return_value=SimpleNamespace(returncode=0))
+        for current_documents, expected in (({}, True), ({renamed: contents}, False),
+                ({'docs/requirements/archive/[R-001] Renamed.md': contents}, False)):
+            with self.subTest(documents=current_documents):
+                def documents(_git_bytes, _repository, observed_revision):
+                    return current_documents if observed_revision == current else {renamed: contents}
+                with mock.patch.object(command_adapter, 'revision_requirement_documents', side_effect=documents):
+                    result = self.recovery.requirement_deletions(self.connection, 'repo', self.worktree,
+                        SimpleNamespace(revision_sha=current), git=git, git_bytes=mock.Mock())
+                self.assertEqual(bool(result), expected)
+                if expected:
+                    self.assertEqual(result[source]['text'], contents)
+                    self.assertEqual(result[source]['revision'], revision)
+                    self.assertEqual(result[source]['affected'], ['G-047'])
+        with mock.patch.object(command_adapter, 'revision_requirement_documents', side_effect=RuntimeError('lookup failed')):
+            with self.assertRaisesRegex(RuntimeError, 'lookup failed'):
+                self.recovery.requirement_deletions(self.connection, 'repo', self.worktree,
+                    SimpleNamespace(revision_sha=current), git=git, git_bytes=mock.Mock())
