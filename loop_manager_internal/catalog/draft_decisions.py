@@ -54,6 +54,11 @@ def user_changes(connection, repo, repository, pinned, *, git, git_bytes):
         saved = execplan_draft_state.evidence(connection, repo, plan_id)
         if entry is None or not saved:
             continue
+        metadata = entry.metadata()
+        relevant = set(entry.sources) | {"docs/PRODUCT.md", "docs/ARCHITECTURE.md"}
+        same_basis = saved["basis"] == {
+            "scope": metadata.get("draft_scope"),
+            "inputs": {key: value for key, value in (pinned.draft_inputs or {}).items() if key in relevant}}
         previous = str(saved["remote_revision"])
         changes = dict(saved.get("user_changes", {}))
         ancestry = git(repository, "merge-base", "--is-ancestor", previous, pinned.revision_sha, check=False)
@@ -76,6 +81,11 @@ def user_changes(connection, repo, repository, pinned, *, git, git_bytes):
                 changes.pop(path, None)
                 continue  # 새 경로만으로 이전 질문의 사용자 답변을 증명하지 않는다.
             current = git_bytes(repository, "show", f"{pinned.revision_sha}:{path}").decode("utf-8")
+            if (path == entry.path and same_basis and changes.get(path, {}).get("verified")
+                    and metadata.get("draft_decision", {}) == saved.get("decision", {})):
+                # Progress/log edits add no decision input. Keep the proven
+                # answer's original delta across the checked remote lineage.
+                continue
             if execplan_drafts.content_digest(old.stdout.encode()) == execplan_drafts.content_digest(current.encode()):
                 # Observation/partial publication may advance the baseline
                 # without consuming the answer. Keep its original provenance.

@@ -1113,7 +1113,13 @@ class DraftAnswerReobservationTest(AutomationCatalogFixture, unittest.TestCase):
     def test_body_answers_survive_partial_cleanup_and_reobservation(self):
         self.partial_answers(PATH)
 
-    def partial_answers(self, source):
+    def test_body_answers_survive_progress_edit_after_partial_cleanup(self):
+        self.partial_answers(PATH, progress=True)
+
+    def test_progress_edit_does_not_preserve_withdrawn_body_answer(self):
+        self.partial_answers(PATH, progress=True, withdraw=True)
+
+    def partial_answers(self, source, *, progress=False, withdraw=False):
         first_question = "Which storage policy should this goal use?"
         second_question = "Which retry policy should this goal use?"
         plan = draft_text().replace(
@@ -1143,6 +1149,22 @@ class DraftAnswerReobservationTest(AutomationCatalogFixture, unittest.TestCase):
             saved = self.observe("f" * 40, published)
             self.assertEqual(saved['user_changes'].get(source), evidence)
             self.assertEqual(draft_decisions.questions(saved['question']), (second_question,))
+        if progress:
+            held_revision = saved['revision']
+            progressed = {**published, PATH: draft_decisions.replace_section(cleaned, "Progress", "- [x] Initial decision integrated.")}
+            if withdraw:
+                progressed[PATH] = progressed[PATH].replace(second_answer, "Retry policy remains undecided.")
+            saved = self.observe("e" * 40, progressed)
+            if not withdraw:
+                self.assertEqual(saved['revision'], held_revision)
+                self.assertEqual(saved['user_changes'].get(source), evidence)
+            saved = self.observe("e" * 40, progressed)
+            if withdraw:
+                with self.assertRaises(loop_manager.PlannerValidationError):
+                    self.prepare(source, second_question, second_answer)
+                self.assertTrue(saved['pending'])
+                return
+            self.assertEqual(saved['user_changes'].get(source), evidence)
         cleaned, _receipt = self.prepare(source, second_question, second_answer)
         self.assertNotIn("draft: true", cleaned)
         self.assertIn(first_answer, cleaned)
