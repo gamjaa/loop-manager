@@ -20,11 +20,12 @@ priority: high
 
 ## Purpose
 
-G-255의 문서 충돌 처리를 최신 Planner 조건·Worker 교정·검증과 저장된 결과/차단의 재평가에 연결한다. 직접 구현된 입력 변경 시 작업 보존·성공 token 무효화는 유지하고, 충돌 중 생략되는 문서 판단과 과거 교정 결과의 최신 입력 확인을 보완한다.
+G-255의 문서 충돌 처리를 최신 작업 조건·Worker 교정·검증과 저장된 결과/차단의 재평가에 연결한다. 직접 구현된 입력 변경 시 작업 보존·성공 token 무효화와 R-082의 작업별 Planner 제거를 유지하고, 저장 교정 결과와 최신 입력을 연결하는 미충족 부분만 보완한다.
 
 ## Acceptance Criteria
 
 - Worker 최초·재개·교정 진입 전에 필요한 프로젝트 일반 planning의 관련 개정 게시·DB 적용을 마치고 그 immutable base의 ExecPlan을 반영한다. PR 등록 뒤 기존 계획 개정 금지·수동 소유 보호·dependency 준비 조건을 지키며 Planner와 구현 worktree의 writer/Git operation을 겹치지 않는다. 소유 rebase가 이미 진행 중이면 기존 target·pinned 문서로 그 operation의 완료/복구를 먼저 처리하고 안전한 경계에서 남은 최신 명세 planning·반영을 이어간다. 작업별 상위 명세 영향 판단·새 plan_text 생성을 다시 도입하지 않는다.
+- R-082: 상위 명세 변경에 필요한 일반 planning과 ExecPlan·코드 변경만의 실행 대응을 구분한다. 후자는 선언·source·dependency의 Manager 검증과 기존 Worker 세션에서의 구현 판단·필요한 보완·targeted test로 처리한다. 유효한 구현 충족 근거가 있으면 필요한 verify·Review를 계속하고, 새 조건을 확인할 근거가 없으면 Worker에 최신 ExecPlan·delta·과거 근거를 함께 전달한다. 별도 문서 영향·구현 적합성 Planner, 코드 전용 점검·일반 Planner 인계를 되살리지 않는다.
 - 문서-only 자동 해소 뒤 발견 단계와 실제 구현·검증 근거로 필요한 단계만 선택한다. 그 외 파일 충돌은 verify·Review·게시 단계에서 발견해도 같은 Worker session의 교정으로 연결하고, 최신 문서를 기준으로 양쪽 형상을 검토·선택·결합하며 필요한 targeted test를 수행한다. Reviewer의 읽기 전용 권한과 선행 Review·검증 보완의 기존 의미를 유지한다.
 - 본문·sources·연결 명세·archive 범위·지침 변화와 코드 충돌이 함께 있거나 이전 definition 원문이 없어도, 현재 identity·소유권·유효한 최신 조건이 확인되면 보존된 작업의 교정·검증을 이어간다. 과거 성공을 재사용할 증거가 없으면 성공 근거만 무효화하며, 입력 변경 자체로 최종 차단하거나 session·작업물·실행/실패·level 감사를 폐기하지 않는다.
 - 저장된 rebase Worker 결과와 pending stage/continue는 현재 후보·문서 조건과 결합해 소비한다. 파일 상태가 같아도 조건이 바뀌면 이전 READY나 과거 Agent snapshot/marker만으로 새 조건 충족을 승인하지 않는다. 반대로 구현 입력이 유효한 OID 변화만으로 Worker를 반복하지 않고 필요한 verify·Review로 이어간다. 입력이 같은 완료 교정은 필요한 후속 Git/검증 단계부터 재개한다.
@@ -33,7 +34,7 @@ G-255의 문서 충돌 처리를 최신 Planner 조건·Worker 교정·검증과
 
 ## Implementation
 
-`execution/stage_documents.py`의 ExecPlan 실행 대응·legacy document_revision 복구, `execution_revision_handler.py`의 정의/성공 token 판정, `execution_worker_handler.py`의 교정 호출·저장 결과 소비와 기존 rebase correction/checkpoint 저장을 연결한다. 직접 구현된 프로젝트 planning 전환과 plan_text=null 계약을 재사용한다. 최신 ExecPlan 조건·교정 turn의 입력과 과거 수행 근거를 구분하고, 진행 중 rebase는 기존 operation을 보존해 처리한 뒤 안전한 경계에서 일반 planning·게시·DB 적용과 남은 최신 base 반영을 이어간다. G-242의 의미·PR 검증을 소비하며 상위 명세의 개정을 document_revision에 다시 맡기지 않는다.
+`execution/stage_documents.py`의 legacy document_revision 복구, `execution_revision_handler.py`의 정의/성공 token 판정, `execution_worker_handler.py`의 교정 호출·저장 결과 소비와 기존 rebase correction/checkpoint 저장을 연결한다. 새 문서 판단을 만들지 않는 현재 `refresh()`와 Worker revision gate를 재사용한다. 최신 ExecPlan 조건·교정 turn의 입력과 과거 수행 근거를 구분하고, 진행 중 rebase는 기존 operation을 보존해 처리한 뒤 안전한 경계에서 필요한 상위 명세 planning·게시·DB 적용과 남은 최신 base 반영을 이어간다. G-242의 저장된 결과·legacy 게시/PR 검증만 소비하며 작업별 Planner 호출이나 새 document_revision 판단·개정 후보를 만들지 않는다.
 
 Merge된 G-255의 `git/rebase_documents.py`와 RebaseHandler의 문서 자동 진행을 원문 적용 경계로 재사용한다. `document_revision` 판단·게시와 `rebase_documents`의 pinned revision·교체 전 bytes·중간 HEAD·replay별 채택 이력은 서로의 성공 근거가 아니며 checkpoint에서 함께 보존한다. 진행 중 operation의 target·채택 revision을 새 Planner 결과로 바꾸지 않고, 해당 operation을 완료한 뒤 추가 원격 전진을 기존 최신 base 반영으로 처리한다. 일반 문서 채택의 최종 HEAD·index·작업 파일 원문 대조는 유지한다. R-055의 복구 불가 파일 재작업은 직접 구현된 `resolve(failed_files=...)`·`git/rebase_file_evidence.py`와 `rebase_files` intent를 재사용하는 별도 복구다. 확보 가능한 원형·실패 사유를 보존하고 해당 파일의 Worker 재작업·새 입력 검증으로 연결하며, 과거 파일 원형의 완전 보존을 재작업 진입 조건으로 요구하지 않는다. 다른 파일·기존 target·session·실패 이력은 보존한다. 두 모드의 교정 결과·입력 수명 연결만 보완하고 원문 교체·continue/skip·파일 복원을 재구현하지 않는다.
 
@@ -43,6 +44,7 @@ Merge된 G-255의 `git/rebase_documents.py`와 RebaseHandler의 문서 자동 �
 
 - `tests/test_execution_revision_gate.py`, `tests/test_stage_documents.py`, `tests/test_execution_rebase_correction_phase.py`·`tests/test_planning_selection.py`의 최소 targeted unit으로 operation이 없는 최초/재개/교정의 프로젝트 planning 게시·DB 적용→ExecPlan 적용→Worker 순서를 확인한다. 진행 중 rebase는 기존 target 완료/복구→추가 planning·최신 base 반영 순서이며 중첩 operation이 없어야 한다. 문서-only의 불필요한 Worker 억제와 그 외 파일/혼합 충돌의 단계별 복귀를 실제 handler·SQLite로 확인하고 Git/Agent 관측만 mock한다.
 - 저장 Worker READY 뒤 source/본문 조건만 변경되고 과거 Agent marker는 같은 경우, definition 원문 부재, pending stage/continue 재시작과 동일 입력 완료 결과를 대조한다. 현재 구현 입력은 유효하고 후보 OID만 바뀐 경우도 분리해 불필요한 Worker·오래된 성공·게시를 막는다.
+- 위 조건에서 호출 역할도 확인한다. ExecPlan·코드 변경만으로 일반·점검·문서 영향 Planner는 호출되지 않아야 하며, 미확인 새 조건은 기존 Worker 세션에서 필요한 교정과 함께 한 번 처리돼야 한다. 수행 기록만의 변경·이미 충족한 조건과 미확인 조건을 구분하고 선행 Review·최종 verify/Review gate는 보존한다.
 - `tests/test_rebase_correction.py`의 채택 이력·후속 uncertain·최종 원문 대조와 기존 lifecycle fixture를 재사용해 문서 채택과 `document_revision` 판단이 함께 있는 중단/재개를 확인한다. Planner 게시나 입력 무효화가 pinned revision·원형·기존 target을 덮어쓰지 않으며, 뒤늦은 비충돌 재생으로 달라진 문서는 완료로 채택하지 않는다. 동일 원문 적용 통합 경로를 불필요하게 반복하지 않는다.
 - `tests/test_task_remote_inputs.py`·`tests/test_rebase_file_evidence.py`의 직접 구현된 파일별 복원·새 사용자 교정 보존 회귀를 재사용한다. 저장 Worker 결과/pending continue를 복원 전후의 후보·실제 최신 조건에 연결하는 unit을 보강하며 일반 문서 채택 완료와 재작업 완료를 혼동하지 않는다. 파일 삭제/이동·일부 원형 부재·중단 뒤 새 교정·나머지 파일 보존은 현재 intent 경계에서 검사한다.
 - `tests/test_managed_rebase_lifecycle.py`, `tests/test_scope_block_revalidation.py`와 현재 rebase 수용 회귀에서 동일 입력 재평가·원인별 해제 및 실제 sandbox/결과 오류·독립 차단·사용자 operation·dependency 대기를 확인한다. 과거 ref/config/snapshot 차이를 접근 위반으로 복원하지 않고 실제 target·index·작업물 효과는 기존 통합 fixture를 재사용한다.
@@ -62,6 +64,7 @@ Merge된 G-255의 `git/rebase_documents.py`와 RebaseHandler의 문서 자동 �
 
 - 2026-10-13 delta 개정: mutable snapshot token `bbe557975a5581bd2185b8b767a35088a476de189a346cb28f0469aca8c109f7`, revision `f56739c31a49ec8fb5547a459688bfb02772586e`, 원본 hash `f13365260f2bb3c5cdc4f18ad1f7a635f2393ada7a2157bc2a75af0d884fc12a`와 일치하는 이 계획만 개정했다. G-255의 동일 ID archive 이동은 삭제 목표가 아니므로 dependency를 유지한다. ID·경로·metadata·목표·기록을 보존하고 새 원문 보존 경계의 재사용·회귀 연결만 구체화했다. 기존 high complexity/risk의 판단과 복구 조건을 유지하며 프로젝트 최종 전문 확인이나 구현 성공을 기록하지 않는다.
 
-- 현재 `RevisionHandler.guard`는 충돌 중 입력 변경/과거 원문 부재에서 runtime 성공 token을 비우고 기존 session·rebase target을 보존한다. 해당 직접 구현과 회귀는 재사용한다. `stage_documents.refresh`는 resolving_rebase에서 판단을 생략하며, `_resume_saved_rebase_worker`는 저장 교정 결과를 파일 progress와 parser로 확인한 뒤 소비하므로 최신 문서 조건에 결합된 판정이 추가로 필요하다.
-- G-242는 DOCUMENT_RESULT 형식과 PR 경합, G-243은 PR 전 snapshot의 수동 소유 보호, G-245는 일반 Planner lifecycle 경계, G-183/G-241은 성공 입력 증명을 각각 담당한다. 이 계획은 충돌 중 문서·교정 결과·차단 재평가의 연결만 맡고 기존 미충족 목표나 전수 감사를 대체하지 않는다.
+- 현재 `RevisionHandler.guard`는 충돌 중 입력 변경/과거 원문 부재에서 runtime 성공 token을 비우고 기존 session·rebase target을 보존한다. 해당 직접 구현과 회귀를 재사용한다. 최신 `stage_documents.refresh`는 저장된 legacy 결과·게시만 복구하고 새 판단을 호출하지 않는다. `_resume_saved_rebase_worker`의 저장 교정 결과는 최신 조건과 결합해 소비하고, 근거가 부족하면 같은 Worker 세션의 교정으로 연결한다.
+- G-242의 남은 저장 DOCUMENT_RESULT 형식·legacy PR 경합, G-243의 PR 전 snapshot 수동 소유 보호, G-245의 일반 Planner lifecycle, G-183/G-241의 성공 입력 증명과 책임을 나눈다. snapshot 밖 G-242는 수정하지 않으며 그 과거 새 호출 설명을 이 작업의 실행 지시로 사용하지 않는다.
+- 2026-10-15 delta: 원격 R-082의 호출 축소와 직접 반영된 `stage_documents`·선택·회귀를 대조해 위 잔여 연결을 Worker 책임으로 정합화했다. ID·경로·dependency와 이전 수행 기록은 보존하고 구현·테스트·verify를 실행하지 않았다.
 - complexity high: 문서 갱신·진행 중 Git operation·저장 Worker 결과·phase·원인별 차단의 서로 다른 확정 지점을 중단/재개에도 맞춰야 한다. risk high: 오래된 READY 소비나 잘못된 원인 해제는 최신 조건 미충족 후보의 검증·게시 또는 사용자 작업 충돌을 만들 수 있다. 원형·입력·turn·checkpoint·실패 감사를 남겨 수동 재평가·복구할 수 있어야 하며 이미 발생한 게시를 코드 rollback으로 되돌린다고 가정하지 않는다. 관련 경합·재개·무근거 성공 거부를 AC·Validation·Review에 포함한다.
