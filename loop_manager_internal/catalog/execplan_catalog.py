@@ -505,8 +505,10 @@ def _entry(relative_path: str, text: str, values: Mapping[str, object]) -> ExecP
 
 
 def _graph_issues(entries: Mapping[str, ExecPlanCatalogEntry],
-                  observed_ids: AbstractSet[str]) -> tuple[CatalogIssue, ...]:
+                  observed_ids: AbstractSet[str],
+                  satisfied_dependencies: AbstractSet[str] = frozenset()) -> tuple[CatalogIssue, ...]:
     issues = []
+    observed_ids = observed_ids | satisfied_dependencies
     for plan_id, entry in entries.items():
         missing = sorted(set(entry.depends_on) - observed_ids)
         if missing:
@@ -552,6 +554,7 @@ def snapshot_from_documents(
     invalid_plan_entries: Mapping[str, str] | None = None,
     revision_sha: str | None = None,
     archive_conflict_plan_ids: AbstractSet[str] = frozenset(),
+    satisfied_dependencies: AbstractSet[str] = frozenset(),
     isolate_errors: bool = False,
 ) -> ExecPlanCatalogSnapshot:
     """Validate the full catalog, or explicitly derive an independent execution view.
@@ -616,32 +619,8 @@ def snapshot_from_documents(
                         f"ExecPlan 파일이 유효하지 않습니다: {path} ({error})",
                         code="invalid-plan", path=path,
                     ) from error
-                if validate_sources:
-                    for source in values["sources"]:
-                        try:
-                            resolution = _source_lookup(
-                                root, source,
-                                allow_archive_fallback=allow_archive_fallback,
-                                available_regular_paths=available_regular_paths,
-                                requirement_documents=requirement_documents,
-                            )
-                        except requirement_sources.RequirementSourceLookupError as error:
-                            raise ExecPlanCatalogError(
-                                str(error), code="source-lookup-failed",
-                                path=path, source=source,
-                            ) from error
-                        if resolution is None or resolution.status is requirement_sources.ResolutionStatus.RESOLVED:
-                            continue
-                        if resolution.status is requirement_sources.ResolutionStatus.AMBIGUOUS:
-                            raise ExecPlanCatalogError(
-                                f"ExecPlan source가 모호합니다: {source} "
-                                f"({', '.join(resolution.candidates)})",
-                                code="ambiguous-source", path=path, source=source,
-                            )
-                        raise ExecPlanCatalogError(
-                            f"존재하지 않는 ExecPlan source입니다: {source} ({path})",
-                            code="missing-source", path=path, source=source,
-                        )
+                # The archive is historical evidence. Its old source path is
+                # not an active source declaration and cannot block current work.
                 continue
             raise ExecPlanCatalogError(
                 f"중복 ExecPlan id입니다: {plan_id} ({other_path}, {path})",
@@ -656,7 +635,7 @@ def snapshot_from_documents(
             continue
         entry = _entry(path, text, values)
         entries[plan_id] = entry
-        if validate_sources:
+        if validate_sources and not entry.archived:
             for source in entry.sources:
                 try:
                     resolution = _source_lookup(
@@ -686,7 +665,7 @@ def snapshot_from_documents(
                 reject(entry.plan_id, entry.path, "duplicate-manager-request",
                        "동일 Manager 요청의 생성 계획이 중복됐습니다.")
             manager_requests[request_id] = entry.plan_id
-    for issue in _graph_issues(entries, frozenset(identities)):
+    for issue in _graph_issues(entries, frozenset(identities), satisfied_dependencies):
         reject(issue.plan_id, issue.path, issue.code, issue.message)
     ordered = dict(sorted(entries.items(), key=lambda item: int(item[0][2:])))
     snapshot = ExecPlanCatalogSnapshot(

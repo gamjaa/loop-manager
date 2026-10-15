@@ -9,7 +9,7 @@ import sqlite3
 import stat
 import tempfile
 
-from loop_manager_internal.catalog import execplan_catalog, requirement_corrections, requirement_sources
+from loop_manager_internal.catalog import execplan_catalog, requirement_corrections
 from loop_manager_internal.planning.requirement_retirement import _safe_parent, _sources
 from loop_manager_internal.runtime.resource_lock import resource_locks
 from loop_manager_internal.storage import work_claims
@@ -267,18 +267,9 @@ class RequirementCorrectionPublisher:
             for confirmed in self.repository.confirmed(repo):
                 if self.git.effects.git(self.git.repo_path, 'merge-base', '--is-ancestor', confirmed['commit_oid'], base, check=False).returncode:
                     raise CorrectionPending('이미 게시된 Requirement 교정 commit이 원격 이력에서 제거됐습니다.')
-                current_tree = self.git._manifest(base)
-                confirmed_manifest = json.loads(confirmed['manifest'])
-                missing = [path for path, contents in confirmed_manifest['after'].items()
-                           if contents is not None and path not in current_tree]
-                if missing:
-                    documents = {path: self._read(base, current_tree, path)
-                                 for path in current_tree if _requirement(path)}
-                    for path in missing:
-                        if (not _requirement(path) or requirement_sources.resolve_requirement_source(
-                                path, documents, allow_archive=True,
-                        ).status is not requirement_sources.ResolutionStatus.RESOLVED):
-                            raise CorrectionPending('이미 게시된 Requirement 교정 결과가 원격에서 제거됐습니다.')
+                # A confirmed result is immutable audit. Later Requirement
+                # deletion is observed by the catalog/source resolver and does
+                # not invalidate the already confirmed publication.
             if saved is None:
                 manifest = self.observe(base)
                 if not manifest['after']:

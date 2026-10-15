@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 
 import loop_manager
+from loop_manager_internal.catalog import requirement_archive
 from loop_manager_internal.storage import execplan_catalog_state
 from tests.support.git import isolated_git_test
 
@@ -49,6 +50,32 @@ class RequirementArchiveEligibilityTest(unittest.TestCase):
 
     def tearDown(self):
         self.connection.close()
+
+    def test_missing_archived_source_does_not_block_unrelated_requirement_review(self):
+        source = "docs/requirements/[R-001] Current.md"
+        result = requirement_archive.calculate(
+            base_oid="a" * 40,
+            catalog={
+                "G-001": {
+                    "path": "docs/plans/archive/[G-001] Finished.md",
+                    "sources": ["docs/requirements/[R-002] Removed.md"],
+                    "depends_on": [],
+                },
+                "G-002": {
+                    "path": "docs/plans/[G-002] Current.md",
+                    "sources": [source],
+                    "depends_on": [],
+                },
+            },
+            states={"G-001": "MERGED", "G-002": "MERGED"},
+            active_requirements=(source,),
+            archived_requirements=frozenset(),
+            current_plan_id="G-002",
+            known_statuses=frozenset({"MERGED", "READY"}),
+            requirement_documents={source: b"# [R-001] Current\n"},
+        )
+
+        self.assertEqual(result.candidates, (source,))
 
     def requirement(self, name: str, contents: str | None = None) -> str:
         source = f"docs/requirements/{name}.md"

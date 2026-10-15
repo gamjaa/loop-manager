@@ -968,6 +968,82 @@ class IncrementalPlanningCatalogTest(unittest.TestCase):
         body = plan_text("G-007", "Independent").replace("depends_on: []", "depends_on:\n  - G-001")
         self._assert_new_plan_deletion_reference(body)
 
+    def test_rowless_cancellation_reference_recovers_original_identity_and_text(self):
+        self._remote_deletion(dependent=False, new_plan=True)
+        self.connection.execute(
+            "UPDATE execplan_cancellations SET recovery_evidence=NULL WHERE plan_id='G-001'"
+        )
+        body = plan_text("G-007", "Independent").replace(
+            "depends_on: []", "depends_on:\n  - G-001",
+        )
+        (self.repo / "docs/plans/[G-007] Independent.md").write_text(
+            body, encoding="utf-8", newline="\n",
+        )
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "reference cancelled prerequisite")
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", self.base)
+        self.connection.execute("UPDATE projects SET active_sha=?", (self.base,))
+        self.connection.commit()
+
+        result = loop_manager.reconcile_execplan_catalog(
+            self.connection, self.repo, str(self.repo), "main",
+        )
+        evidence = json.loads(self.connection.execute(
+            "SELECT recovery_evidence FROM execplan_cancellations WHERE plan_id='G-001'"
+        ).fetchone()[0])
+        snapshot = loop_manager.mutable_ready_snapshot(
+            self.connection, str(self.repo), self.repo, self.base,
+        )
+
+        self.assertEqual(set(result.withheld_plan_ids), {"G-007"})
+        self.assertIn("Implement First", evidence["text"])
+        self.assertEqual(evidence["identity"]["id"], "G-001")
+        self.assertEqual(evidence["identity"]["path"], self.paths["G-001"])
+        self.assertIsNone(evidence["unknown_reason"])
+        goal = next(json.loads(raw) for raw in snapshot.recovery_goals
+                    if json.loads(raw)["id"] == "G-001")
+        self.assertEqual(goal["affected_ids"], ["G-007"])
+
+    def test_unverifiable_rowless_cancellation_holds_only_current_references(self):
+        self._remote_deletion(dependent=False, new_plan=True)
+        self.connection.execute(
+            "UPDATE execplan_cancellations SET recovery_evidence=NULL, plan_sha='unknown' "
+            "WHERE plan_id='G-001'"
+        )
+        dependent = plan_text("G-007", "Independent").replace(
+            "depends_on: []", "depends_on:\n  - G-001",
+        )
+        (self.repo / "docs/plans/[G-007] Independent.md").write_text(
+            dependent, encoding="utf-8", newline="\n",
+        )
+        (self.repo / "docs/plans/[G-008] Unrelated.md").write_text(
+            plan_text("G-008", "Unrelated"), encoding="utf-8", newline="\n",
+        )
+        git(self.repo, "add", ".")
+        git(self.repo, "commit", "-m", "reference unverifiable cancellation")
+        self.base = git(self.repo, "rev-parse", "HEAD")
+        git(self.repo, "update-ref", "refs/remotes/origin/main", self.base)
+        self.connection.execute("UPDATE projects SET active_sha=?", (self.base,))
+        self.connection.commit()
+
+        result = loop_manager.reconcile_execplan_catalog(
+            self.connection, self.repo, str(self.repo), "main",
+        )
+        evidence = json.loads(self.connection.execute(
+            "SELECT recovery_evidence FROM execplan_cancellations WHERE plan_id='G-001'"
+        ).fetchone()[0])
+        unrelated = self.connection.execute(
+            "SELECT status FROM exec_plans WHERE repo=? AND plan_id='G-008'", (str(self.repo),),
+        ).fetchone()
+
+        self.assertEqual(set(result.withheld_plan_ids), {"G-007"})
+        self.assertEqual(evidence["text"], "")
+        self.assertIsNotNone(evidence["unknown_reason"])
+        self.assertEqual(evidence["affected"], ["G-007"])
+        self.assertIsNotNone(unrelated)
+        self.assertEqual(unrelated["status"], "READY")
+
     def _assert_new_plan_deletion_reference(self, body):
         result, remote_deletions = self._remote_deletion(dependent=False, new_plan_text=body)
         self.assertEqual(set(result.withheld_plan_ids), {"G-007"})

@@ -93,6 +93,26 @@ class MergeProof:
     detail: str | None = None
 
 
+def verified_historical_merge_ids(connection: sqlite3.Connection, repo: str) -> frozenset[str]:
+    """Return archived identities whose durable merge proof is complete."""
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_catalog_history'"
+    ).fetchone() is None:
+        return frozenset()
+    return frozenset(str(row[0]) for row in connection.execute(
+        "SELECT plan_id, original_path, observed_path, original_content_hash, final_content_hash, "
+        "plan_sha, merge_confirmed, identity_verified, proof_kind, proof_revision, diagnostic_code "
+        "FROM execplan_catalog_history WHERE repo=? AND currently_archived=1", (repo,),
+    ) if (
+        row[6] and row[7]
+        and re.fullmatch(rf"docs/plans/\[{re.escape(str(row[0]))}\] [^/]+\.md", str(row[1]))
+        and re.fullmatch(rf"docs/plans/archive/\[{re.escape(str(row[0]))}\] [^/]+\.md", str(row[2]))
+        and row[3] and row[4] and row[5] and row[9]
+        and row[8] in {kind.value for kind in MergeProofKind if kind is not MergeProofKind.NONE}
+        and row[10] is None
+    ))
+
+
 class MergeProofPort(Protocol):
     """External Git/GitHub evidence supplied to the pure recovery service."""
 
@@ -225,7 +245,7 @@ class CatalogStateSnapshot:
     project_values: tuple[object, ...] | None
     reserved: tuple[tuple[str, str], ...] = ()
     holds: tuple[tuple[str, str, str, str | None], ...] = ()
-    cancellations: tuple[tuple[str, str | None], ...] = ()
+    cancellations: tuple[tuple[object, ...], ...] = ()
     drafts: tuple[tuple[str, int, str], ...] = ()
 
     @property
@@ -247,6 +267,7 @@ class PinnedCatalog:
     draft_changes: Mapping[str, Mapping] | None = None
     requirement_deletions: Mapping[str, Mapping] | None = None
     requirement_documents: Mapping[str, str | bytes] | None = None
+    cancellation_recovery: Mapping[str, tuple[str | None, str]] | None = None
 
 
 def new_declaration_issues(
@@ -666,6 +687,12 @@ class DefinitionStateRepository:
                     (repo,),
                 )
             )
+        if "execplan_catalog_holds" in available_tables:
+            reserved_values.update(
+                (str(row[0]), "") for row in self.connection.execute(
+                    "SELECT plan_id FROM execplan_catalog_holds WHERE repo = ?", (repo,),
+                )
+            )
         return CatalogStateSnapshot(
             rows=tuple(
                 CatalogRowVersion(
@@ -685,7 +712,9 @@ class DefinitionStateRepository:
                 "WHERE repo = ? ORDER BY plan_id", (repo,),
             )),
             cancellations=tuple(tuple(row) for row in self.connection.execute(
-                "SELECT plan_id, recovery_evidence FROM execplan_cancellations WHERE repo=? ORDER BY plan_id", (repo,),
+                "SELECT plan_id, path, title, sources, depends_on, complexity, risk, priority, "
+                "content_hash, plan_sha, deletion_commit, recovery_evidence "
+                "FROM execplan_cancellations WHERE repo=? ORDER BY plan_id", (repo,),
             )),
             drafts=tuple(tuple(row) for row in self.connection.execute(
                 "SELECT plan_id, pending, evidence FROM execplan_drafts WHERE repo=? ORDER BY plan_id", (repo,),
@@ -820,6 +849,15 @@ class DefinitionStateRepository:
                     )
                     changed.append(deletion.snapshot.plan_id)
                     self._fault(f"after-cancellation:{deletion.snapshot.plan_id}")
+                for plan_id, (prior_evidence, evidence) in (pinned.cancellation_recovery or {}).items():
+                    updated = self.connection.execute(
+                        "UPDATE execplan_cancellations SET recovery_evidence=? "
+                        "WHERE repo=? AND plan_id=? AND recovery_evidence IS ?",
+                        (evidence, repo, plan_id, prior_evidence),
+                    )
+                    if updated.rowcount != 1:
+                        raise _StaleCatalogSnapshot
+                    self._fault(f"after-cancellation-evidence:{plan_id}")
                 entries = dict(pinned.snapshot.all)
                 entries.update({entry.plan_id: entry for entry in pinned.recovery_definitions})
                 for plan_id, entry in entries.items():
@@ -1115,9 +1153,6 @@ class CatalogReconciliationService:
         if missing_pending and not pinned.snapshot.isolation_enabled:
             return self._invalid(pinned.revision_sha, "missing-plan",
                 "보류한 원격 ExecPlan 파일이 없습니다: " + ", ".join(missing_pending))
-        missing_history = sorted(
-            historical_ids - stored_ids - catalog_ids - pinned.reserved_intake_ids
-        )
         if missing_files and not pinned.snapshot.isolation_enabled and not cancelled:
             plan_id = missing_files[0]
             current = self.repository.current_definition(repo, plan_id)
@@ -1126,16 +1161,6 @@ class CatalogReconciliationService:
                 "missing-plan",
                 f"SQLite ExecPlan에 대응하는 원격 파일이 없습니다: {plan_id}",
                 path=current.path,
-            )
-        if missing_history and not pinned.snapshot.isolation_enabled:
-            plan_id = missing_history[0]
-            return self._invalid(
-                pinned.revision_sha, "missing-plan",
-                f"SQLite archive 이력에 대응하는 원격 파일이 없습니다: {plan_id}",
-                path=next(
-                    path for reserved_id, path in expected.reserved
-                    if reserved_id == plan_id
-                ),
             )
         # Validate new declarations before deletion-goal holds remove them from
         # the executable catalog. Recovery registration uses the same rules.
@@ -1178,16 +1203,24 @@ class CatalogReconciliationService:
                 issues.append(CatalogIssue(key, definition.path, "missing-plan",
                     f"삭제된 실행 계획 또는 삭제 이력 미확인 계획을 보존합니다: {key}"))
                 withheld.append((key, definition.path, definition.content_hash))
-            for key in missing_history:
-                path = next(path for reserved_id, path in expected.reserved if reserved_id == key)
-                issues.append(CatalogIssue(key, path, "missing-plan", f"삭제된 archive 이력을 보존합니다: {key}"))
-                withheld.append((key, path, ""))
             for key in missing_pending:
                 prior = json.loads(next(item[2] for item in expected.holds if item[0] == key))
                 path, content_hash = prior.get("path", ""), prior.get("content_hash", "")
                 issues.append(CatalogIssue(key, path, "missing-plan", f"삭제된 미등록 보류 계획의 이력을 보존합니다: {key}"))
                 withheld.append((key, path, content_hash))
             goals = [json.loads(raw) for raw in remote_deletions.recovery_goals(self.repository.connection, repo)]
+            for key, (_prior, evidence_text) in (pinned.cancellation_recovery or {}).items():
+                evidence = json.loads(evidence_text)
+                affected = sorted(set(evidence.get("affected", ())) - set(evidence.get("resolved", {})))
+                if affected:
+                    cancellation = self.repository.connection.execute(
+                        "SELECT path, deletion_commit FROM execplan_cancellations WHERE repo=? AND plan_id=?",
+                        (repo, key),
+                    ).fetchone()
+                    if cancellation is not None:
+                        goals.append({"id": key, "path": str(cancellation["path"]),
+                            "deletion_revision": str(cancellation["deletion_commit"]),
+                            "evidence": evidence_text, "affected_ids": affected})
             goals.extend({"id": item.snapshot.plan_id, "affected_ids": json.loads(item.evidence)["affected"]}
                          for item in pinned.deletions)
             observed_paths = {key: path for key, path, _hash in withheld}
@@ -1214,6 +1247,12 @@ class CatalogReconciliationService:
                                  if key not in stored_ids and key not in historical_ids})
         new_observations.update({entry.plan_id: entry.path for entry in pinned.recovery_definitions
                                  if entry.plan_id not in stored_ids})
+        # A historical ID is not a new READY declaration when it reappears in
+        # an active path. Keep active source validation, then let the existing
+        # reservation check reject the reused identity. Archived files remain
+        # eligible for the archive-specific recovery path below.
+        new_observations.update({key: entry.path for key, entry in pinned.snapshot.active.items()
+                                 if key not in stored_ids and key in historical_ids})
         if new_observations:
             if pinned.regular_paths is None:
                 return self._invalid(pinned.revision_sha, "unknown-plan-id",
@@ -1241,8 +1280,9 @@ class CatalogReconciliationService:
             revision_is_current=(
                 lambda: self.catalog.current_revision() == pinned.revision_sha
             ),
-            new_plan_ids=tuple(sorted((set(pinned.snapshot.all)
-                | {entry.plan_id for entry in pinned.recovery_definitions}) - stored_ids)),
+            new_plan_ids=tuple(sorted(set(new_observations) | {
+                key for key in pinned.snapshot.archived if key not in stored_ids
+            } | {entry.plan_id for entry in pinned.recovery_definitions if entry.plan_id not in stored_ids})),
         )
         if changed is None:
             return CatalogReconciliationResult(
@@ -1705,13 +1745,14 @@ def publication_identity(row: sqlite3.Row) -> StoredPlanIdentity:
 def _merged_execplan_ids(
     connection: sqlite3.Connection, repo: str
 ) -> frozenset[str]:
-    return frozenset(
+    rows = frozenset(
         str(row[0])
         for row in connection.execute(
             "SELECT plan_id FROM exec_plans WHERE repo = ? AND status = 'MERGED'",
             (repo,),
         )
     )
+    return rows | verified_historical_merge_ids(connection, repo)
 
 
 def register_published_plan_row(

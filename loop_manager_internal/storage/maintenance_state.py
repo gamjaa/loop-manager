@@ -409,27 +409,22 @@ class MaintenanceRepository:
         )
 
     def _merged_count(self, repo: str) -> int:
-        history_exists = self.connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
-            "AND name = 'execplan_catalog_history'"
-        ).fetchone()
-        history_gate = ""
-        if history_exists is not None:
-            history_gate = (
-                " AND NOT EXISTS ("
-                "SELECT 1 FROM execplan_catalog_history h "
-                "WHERE h.repo = exec_plans.repo "
-                "AND h.currently_archived = 1 "
-                "AND h.plan_id = exec_plans.plan_id "
-                "AND (h.merge_confirmed = 0 OR h.identity_verified = 0 OR h.proof_revision IS NULL OR h.diagnostic_code IS NOT NULL))"
+        from .execplan_catalog_state import verified_historical_merge_ids
+
+        verified = verified_historical_merge_ids(self.connection, repo)
+        archived = {
+            str(row[0]) for row in self.connection.execute(
+                "SELECT plan_id FROM execplan_catalog_history "
+                "WHERE repo=? AND currently_archived=1", (repo,),
             )
-        return int(
-            self.connection.execute(
-                "SELECT COUNT(*) FROM exec_plans "
-                "WHERE repo = ? AND status = 'MERGED'" + history_gate,
-                (repo,),
-            ).fetchone()[0]
-        )
+        } if self.connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='execplan_catalog_history'"
+        ).fetchone() else set()
+        rows = self.connection.execute(
+            "SELECT plan_id FROM exec_plans WHERE repo=? AND status='MERGED'", (repo,),
+        ).fetchall()
+        row_ids = {str(row[0]) for row in rows}
+        return sum(1 for plan_id in row_ids if plan_id not in archived or plan_id in verified) + len(verified - row_ids)
 
     def merged_count(self, repo: str) -> int:
         """Return the existing catalog-backed MERGED count for a project."""

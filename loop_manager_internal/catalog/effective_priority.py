@@ -26,6 +26,7 @@ class EffectivePriority:
 
 def effective_priorities(
     rows: Sequence[Mapping[str, object]],
+    satisfied_dependencies: frozenset[str] = frozenset(),
 ) -> dict[str, EffectivePriority]:
     """Recompute without cache writes; incomplete/cyclic closures cannot select.
 
@@ -42,10 +43,14 @@ def effective_priorities(
         except (ValueError, TypeError):
             continue
         if (priority not in PRIORITY_ORDER or not isinstance(deps, list)
-                or any(not isinstance(dep, str) or dep not in by_id or dep == plan_id
-                       for dep in deps)):
+                or any(not isinstance(dep, str)
+                       or (dep not in by_id and dep not in satisfied_dependencies)
+                       or dep == plan_id for dep in deps)):
             continue
-        dependencies[plan_id] = tuple(sorted(set(deps), key=lambda dep: int(dep[2:])))
+        dependencies[plan_id] = tuple(sorted(
+            (dep for dep in set(deps) if dep in by_id),
+            key=lambda dep: int(dep[2:]),
+        ))
         declared[plan_id] = priority
     # Resolve complete acyclic closures, leaving invalid relationships isolated.
     valid = {plan_id for plan_id in dependencies if by_id[plan_id]['status'] == 'MERGED'}

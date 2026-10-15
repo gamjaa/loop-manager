@@ -97,12 +97,14 @@ def collect(
     history = {}
     if _table_exists(connection, "execplan_catalog_history"):
         history = {
-            str(row[0]): bool(row[1]) and not row[2]
+            str(row[0]): False
             for row in connection.execute(
-                "SELECT plan_id, merge_confirmed, diagnostic_code FROM execplan_catalog_history "
+                "SELECT plan_id FROM execplan_catalog_history "
                 "WHERE repo = ? AND currently_archived = 1", (repo,),
             )
         }
+        from loop_manager_internal.storage.execplan_catalog_state import verified_historical_merge_ids
+        history.update({plan_id: True for plan_id in verified_historical_merge_ids(connection, repo)})
     rows = connection.execute(
         "SELECT plan_id, title, status, depends_on, pr_url, sources "
         "FROM exec_plans WHERE repo = ? ORDER BY plan_id", (repo,),
@@ -121,6 +123,8 @@ def collect(
         )
         for row in rows
     }
+    statuses.update({plan_id: "MERGED" for plan_id, confirmed in history.items()
+                     if confirmed and plan_id not in statuses})
     drafts = execplan_draft_state.pending_ids(connection, repo)
     statuses.update({plan_id: "DRAFT" for plan_id in drafts if plan_id not in holds})
     blocks = {}

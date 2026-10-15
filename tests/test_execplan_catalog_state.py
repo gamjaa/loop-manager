@@ -408,6 +408,24 @@ class ArchivedDependencySelectionTest(unittest.TestCase):
         self.assertEqual(decision.runnable_ready["plan_id"], "G-002")
         self.assertEqual([item["id"] for item in compact], ["G-002"])
 
+    def test_verified_history_without_execution_row_satisfies_dependency(self):
+        self._record_historical("G-001", confirmed=True)
+        self._insert_plan("G-002", "READY", ("G-001",))
+        self.connection.commit()
+
+        decision = loop_manager.catalog_schedule_decision(self.connection, "/repo")
+        rows = loop_manager.prerequisite_validation_rows(self.connection, "/repo")
+
+        self.assertEqual(decision.runnable_ready["plan_id"], "G-002")
+        self.assertEqual([row["plan_id"] for row in rows], ["G-002"])
+        self.assertEqual(
+            maintenance_state.MaintenanceRepository(self.connection)._merged_count("/repo"), 1,
+        )
+        from loop_manager_internal.notifications import work_exhaustion
+        self.assertIsNone(work_exhaustion.collect(
+            self.connection, "/repo", cycle="cycle", active_requirements=(),
+        ))
+
     def test_unverified_archived_ready_row_is_never_selected_or_prompted(self):
         self._insert_plan("G-001", "READY")
         self._record_historical("G-001", confirmed=False)
@@ -543,6 +561,51 @@ class ArchivedDependencySelectionTest(unittest.TestCase):
 
 
 class CatalogReconciliationTest(CatalogReconciliationFixture, unittest.TestCase):
+    def _record_verified_history(self, plan_id, title):
+        entry = archived_entry(plan_id, title)
+        execplan_catalog_state.CatalogStateRepository(self.connection).record(
+            "/repo", entry, original_path=entry.active_path,
+            original_content_hash=entry.content_hash, plan_sha="a" * 40,
+            proof=execplan_catalog_state.MergeProof(
+                True, kind=execplan_catalog_state.MergeProofKind.GITHUB_PR,
+                plan_sha="a" * 40, publication_content_hash=entry.content_hash,
+                revision="b" * 40,
+            ), diagnostic=None, identity_verified=True,
+        )
+
+    def test_missing_historical_document_keeps_audit_without_active_error_or_registration(self):
+        self._record_verified_history("G-003", "Historical")
+        pinned = active_snapshot("c" * 40, {
+            "docs/plans/[G-001] Old.md": self._text("G-001", "Old"),
+            "docs/plans/[G-002] Dependency.md": self._text("G-002", "Dependency"),
+        })
+
+        result = self._service(pinned).reconcile("/repo")
+
+        self.assertTrue(result.usable)
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM exec_plans WHERE repo='/repo' AND plan_id='G-003'"
+        ).fetchone())
+        self.assertIsNotNone(execplan_catalog_state.CatalogStateRepository(
+            self.connection, ensure=False,
+        ).historical_row("/repo", "G-003"))
+
+    def test_active_reappearance_of_historical_id_stays_reserved(self):
+        self._record_verified_history("G-003", "Historical")
+        pinned = active_snapshot("c" * 40, {
+            "docs/plans/[G-001] Old.md": self._text("G-001", "Old"),
+            "docs/plans/[G-002] Dependency.md": self._text("G-002", "Dependency"),
+            "docs/plans/[G-003] Historical.md": self._text("G-003", "Historical"),
+        })
+
+        result = self._service(pinned).reconcile("/repo")
+
+        self.assertEqual(result.kind, execplan_catalog_state.ReconciliationKind.INVALID_CATALOG)
+        self.assertEqual(result.diagnostic.code, "unknown-plan-id")
+        self.assertIsNone(self.connection.execute(
+            "SELECT 1 FROM exec_plans WHERE repo='/repo' AND plan_id='G-003'"
+        ).fetchone())
+
     def test_missing_rows_fall_back_to_active_and_archived_dependency_documents(self):
         pinned = active_snapshot("c" * 40, {
             "docs/plans/[G-001] Old.md": self._text("G-001", "Old"),
