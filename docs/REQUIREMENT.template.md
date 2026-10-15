@@ -2,6 +2,10 @@
 
 <!-- 신규 작성 직전 프로젝트 루트에서 python .agents/skills/specification-docs/scripts/next_requirement_id.py를 실행해 출력된 ID를 제목·파일명에 사용한다. 작성·권한·Ready Check·Lifecycle은 .agents/skills/specification-docs/SKILL.md를 따른다. 미결정 사항 해소 뒤 docs/requirements/ 바로 아래에 저장한다. -->
 
+## Summary
+
+변경 목적과 원하는 변화, 영향을 받는 범위와 핵심 조건·예외를 짧은 한 문단으로 요약한다.
+
 ## Context
 
 해결할 문제와 변경 목적.
