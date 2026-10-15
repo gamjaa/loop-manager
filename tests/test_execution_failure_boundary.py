@@ -16,6 +16,7 @@ class PersistentExecutionFailureBoundaryTest(AutomationCatalogFixture, unittest.
                 "UPDATE projects SET phase = 'WORKING' WHERE repo = ?", (repo,)
             )
         loop_manager.notifications.configure_session(connection, enabled=True)
+        loop_manager.notifications.ensure_schema(connection)
         connection.commit()
 
         def recovered_run(*_args, **_kwargs):
@@ -54,7 +55,7 @@ class PersistentExecutionFailureBoundaryTest(AutomationCatalogFixture, unittest.
         )
 
     @dummy_worker_sessions
-    def test_scheduler_invocations_only_notify_actionable_streak(self):
+    def test_scheduler_invocations_keep_persistent_failure_as_diagnostic_only(self):
         repo = str(Path("persistent-failure-repo").resolve())
         connection = self._connection(repo)
         with connection:
@@ -75,7 +76,7 @@ class PersistentExecutionFailureBoundaryTest(AutomationCatalogFixture, unittest.
             return loop_manager.PROJECT_STEP_TRANSIENT_PAUSE
 
         with mock.patch("loop_manager._run_project_step", side_effect=failed_step):
-            for expected_events in (0, 0, 1):
+            for _ in range(3):
                 outcome = loop_manager.run_project_result(
                     connection, Path("/unused-state"), repo, Path("/unused.ini"),
                     "main", False,
@@ -85,6 +86,10 @@ class PersistentExecutionFailureBoundaryTest(AutomationCatalogFixture, unittest.
                     "SELECT event_type FROM notification_outbox WHERE repo = ?",
                     (repo,),
                 ).fetchall()
-                self.assertEqual(len(events), expected_events)
-                self.assertEqual(sum(row[0] == "stage_failed" for row in events), 0)
-                self.assertEqual(sum(row[0] == "persistent_execution_failure" for row in events), expected_events)
+                self.assertEqual(events, [])
+        diagnostic = connection.execute(
+            "SELECT active, consecutive_runs, notification_eligible, notification_queued "
+            "FROM persistent_execution_failures WHERE repo = ? AND subject = '__project__'",
+            (repo,),
+        ).fetchone()
+        self.assertEqual(tuple(diagnostic), (1, 3, 1, 0))

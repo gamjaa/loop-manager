@@ -126,8 +126,6 @@ def run_project_result(
                         else effects._blocked_recovery_subjects(connection, repo)
                     ),
                 )
-                if outcome is None or outcome.kind is not ProjectRunKind.RUNTIME_HANDOFF:
-                    notifications.enqueue_persistent_execution_failure_events(connection, repo)
 
 
 @dataclass(frozen=True)

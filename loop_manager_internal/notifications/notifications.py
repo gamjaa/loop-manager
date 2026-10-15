@@ -7,7 +7,6 @@ from .incidents import (_key, _remote_inspection_suffix, _queue_block,
                         _project_checkpoint_suffix, _current_block_key,
                         recover_interrupted_starts)
 from .events import (enqueue_current_project_events,
-                     enqueue_persistent_execution_failure_events,
                      cancel_pending_persistent_execution_failure_event,
                      suppress_persistent_failure_for_block, record_merged_plan,
                      enqueue_completion_if_ready, mark_work_available,

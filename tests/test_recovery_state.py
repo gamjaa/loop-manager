@@ -49,6 +49,13 @@ class RecoveryRepositoryTests(unittest.TestCase):
         for _ in range(3):
             begin_external_run(connection)
             repository.observe(observation, attempts=3)
+        from loop_manager_internal.notifications.events import _key
+        loop_manager.notifications.ensure_schema(connection)
+        legacy = connection.execute('SELECT * FROM persistent_execution_failures').fetchone()
+        identity = "\0".join((legacy['subject'], str(legacy['episode']), legacy['phase'],
+                              legacy['reason_code'], legacy['fingerprint']))
+        loop_manager.notifications._insert(connection, _key('persistent_failure', 'repo', identity),
+                                           'repo', 'persistent_execution_failure', {'cause': observation.detail})
         notice = connection.execute("SELECT * FROM notification_outbox WHERE "
                                     "event_type='persistent_execution_failure'").fetchone()
         self.assertIsNotNone(notice)
@@ -60,8 +67,10 @@ class RecoveryRepositoryTests(unittest.TestCase):
         failure = connection.execute('SELECT * FROM persistent_execution_failures').fetchone()
         self.assertEqual(failure['active'], 0)
         self.assertEqual(failure['detail'], observation.detail)
-        self.assertIsNone(connection.execute('SELECT * FROM notification_outbox WHERE event_key=?',
-                                            (notice['event_key'],)).fetchone())
+        canceled = connection.execute('SELECT * FROM notification_outbox WHERE event_key=?',
+                                      (notice['event_key'],)).fetchone()
+        self.assertIsNotNone(canceled['canceled_at'])
+        self.assertEqual(canceled['payload'], notice['payload'])
         repository.resolve_git_scope_failure('repo', None)
         self.assertEqual(dict(connection.execute('SELECT * FROM persistent_execution_failures').fetchone()),
                          dict(failure))
@@ -246,7 +255,7 @@ class RecoveryRepositoryTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(tuple(resolved), (0, 0))
 
-    def test_final_block_is_suppressed_from_persistent_notification(self):
+    def test_blocked_subject_without_matching_saved_block_keeps_failure_diagnostic(self):
         before = self.repository.external_run_snapshot("repo")
         self.repository.observe(RecoveryObservation(
             RecoveryReason.GUIDANCE_APPROVAL_REQUIRED, "repo", "G-042",
@@ -257,10 +266,11 @@ class RecoveryRepositoryTests(unittest.TestCase):
             "repo", before, blocked_subjects=frozenset({"G-042"}),
         )
         row = self.connection.execute(
-            "SELECT notification_eligible, suppressed_by_block FROM "
+            "SELECT active, consecutive_runs, notification_eligible, "
+            "suppressed_by_block FROM "
             "persistent_execution_failures WHERE repo = 'repo' AND subject = 'G-042'"
         ).fetchone()
-        self.assertEqual(tuple(row), (0, 1))
+        self.assertEqual(tuple(row), (1, 1, 1, 0))
 
     def test_external_failure_streak_survives_interrupted_database_restart(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -286,7 +296,7 @@ class RecoveryRepositoryTests(unittest.TestCase):
             connection.close()
         self.assertEqual(tuple(row), (3, 1))
 
-    def test_third_interrupted_observation_commits_outbox_before_run_cleanup(self):
+    def test_third_interrupted_observation_keeps_diagnostics_without_failure_outbox(self):
         with tempfile.TemporaryDirectory() as directory:
             database = Path(directory) / "state.db"
             repo = "repo"
@@ -299,6 +309,7 @@ class RecoveryRepositoryTests(unittest.TestCase):
                 connection.row_factory = sqlite3.Row
                 connection.execute(loop_manager.SCHEMA)
                 loop_manager._ensure_execplans_schema(connection)
+                loop_manager.notifications.ensure_schema(connection)
                 connection.execute(
                     "INSERT OR IGNORE INTO projects (repo, base_branch) "
                     "VALUES (?, 'main')", (repo,),
@@ -316,19 +327,20 @@ class RecoveryRepositoryTests(unittest.TestCase):
                 "SELECT COUNT(*) FROM notification_outbox "
                 "WHERE repo = ? AND event_type = 'persistent_execution_failure'",
                 (repo,),
-            ).fetchone()[0], 1)
+            ).fetchone()[0], 0)
             self.assertEqual(connection.execute(
-                "SELECT consecutive_runs, notification_queued FROM "
-                "persistent_execution_failures WHERE repo = ?", (repo,),
-            ).fetchone(), (3, 1))
+                "SELECT consecutive_runs, notification_eligible, notification_queued "
+                "FROM persistent_execution_failures WHERE repo = ?", (repo,),
+            ).fetchone(), (3, 1, 0))
             connection.close()
 
-    def test_final_block_withdraws_immediate_pending_failure_notice(self):
+    def test_block_suppression_without_matching_live_cause_keeps_legacy_audit(self):
         connection = sqlite3.connect(":memory:")
         connection.row_factory = sqlite3.Row
         self.addCleanup(connection.close)
         connection.execute(loop_manager.SCHEMA)
         loop_manager._ensure_execplans_schema(connection)
+        loop_manager.notifications.ensure_schema(connection)
         connection.execute(
             "INSERT INTO projects (repo, base_branch) VALUES ('repo', 'main')"
         )
@@ -340,25 +352,56 @@ class RecoveryRepositoryTests(unittest.TestCase):
             "IMPLEMENTING", "plan-sha", "base-sha", "guidance", "head-a",
             "decision pending",
         ))
-        self.assertEqual(connection.execute(
-            "SELECT COUNT(*) FROM notification_outbox"
-        ).fetchone()[0], 1)
+        failure = connection.execute(
+            "SELECT episode, phase, reason_code, fingerprint, consecutive_runs "
+            "FROM persistent_execution_failures WHERE repo = ? AND subject = ?",
+            ("repo", "G-042"),
+        ).fetchone()
+        identity = "\0".join((
+            "G-042", str(failure[0]), str(failure[1]), str(failure[2]),
+            str(failure[3]),
+        ))
+        event_key = loop_manager.notifications._key(
+            "persistent_failure", "repo", identity,
+        )
+        loop_manager.notifications._insert(
+            connection, event_key, "repo", "persistent_execution_failure",
+            {"execplan_id": "G-042", "stage": str(failure[1]),
+             "reason_code": str(failure[2]), "cause": "decision pending"},
+        )
+        connection.execute(
+            "UPDATE persistent_execution_failures SET notification_queued = 1 "
+            "WHERE repo = ? AND subject = ?", ("repo", "G-042"),
+        )
+        connection.commit()
+        old_payload = connection.execute(
+            "SELECT payload FROM notification_outbox WHERE event_key = ?",
+            (event_key,),
+        ).fetchone()[0]
 
-        # BLOCKED notification creation may commit before run cleanup.
+        # A claimed subject alone is not proof that this failure became a block.
         loop_manager.notifications.suppress_persistent_failure_for_block(
             connection, "repo", "G-042",
         )
         connection.commit()
-        self.assertEqual(connection.execute(
-            "SELECT COUNT(*) FROM notification_outbox"
-        ).fetchone()[0], 0)
         repository.finish_external_run(
             "repo", run_id, resolved=False,
             blocked_subjects=frozenset({"G-042"}),
         )
-        self.assertEqual(connection.execute(
-            "SELECT COUNT(*) FROM notification_outbox"
-        ).fetchone()[0], 0)
+        retained = connection.execute(
+            "SELECT attempts, canceled_at, payload FROM notification_outbox "
+            "WHERE event_key = ?", (event_key,),
+        ).fetchone()
+        self.assertEqual(retained[0], 0)
+        self.assertIsNone(retained[1])
+        self.assertEqual(retained[2], old_payload)
+        failure = connection.execute(
+            "SELECT active, consecutive_runs, notification_eligible, "
+            "notification_queued, suppressed_by_block FROM "
+            "persistent_execution_failures WHERE repo = ? AND subject = ?",
+            ("repo", "G-042"),
+        ).fetchone()
+        self.assertEqual(tuple(failure), (1, 1, 1, 1, 0))
 
     def test_external_failure_projection_supports_tuple_rows(self):
         connection = sqlite3.connect(":memory:")

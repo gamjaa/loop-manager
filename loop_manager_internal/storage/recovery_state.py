@@ -385,12 +385,6 @@ class RecoveryRepository:
                 ),
                 run_id=run_id,
             )
-            # The outbox entry belongs to the same durable transition as the
-            # third observation, even if the process never reaches run cleanup.
-            from loop_manager_internal.notifications import notifications
-            notifications.enqueue_persistent_execution_failure_events(
-                self.connection, observation.repo,
-            )
         episode = str(previous["notification_episode"]) if previous is not None and previous["notification_episode"] else uuid.uuid4().hex
         self.connection.execute("UPDATE recovery_records SET notification_episode = ? WHERE repo = ? AND subject = ?",
                                 (episode, observation.repo, self._subject(observation.plan_id)))
@@ -676,29 +670,22 @@ class RecoveryRepository:
 
         if resolved_subjects is not None:
             blocked_subjects = blocked_subjects & resolved_subjects
-        where = "repo = ?" + (" AND last_run_id = ?" if run_id is not None else "")
-        parameters: tuple[object, ...] = (repo,) + ((run_id,) if run_id is not None else ())
-        if blocked_subjects or resolved:
+        if resolved:
             from loop_manager_internal.notifications import notifications
             for row in self.connection.execute(
                 "SELECT subject, episode, phase, reason_code, fingerprint "
                 "FROM persistent_execution_failures WHERE repo = ? "
                 "AND notification_queued = 1", (repo,),
             ):
-                if ((resolved and (resolved_subjects is None or str(row[0]) in resolved_subjects))
-                        or str(row[0]) in blocked_subjects):
+                if resolved_subjects is None or str(row[0]) in resolved_subjects:
                     notifications.cancel_pending_persistent_execution_failure_event(
                         self.connection, repo, str(row[0]), int(row[1]),
                         str(row[2]), str(row[3]), str(row[4]),
                     )
         for subject in blocked_subjects:
-            self.connection.execute(
-                "UPDATE persistent_execution_failures SET active = 0, "
-                "consecutive_runs = 0, notification_eligible = 0, "
-                "notification_queued = 0, suppressed_by_block = 1, "
-                "updated_at = CURRENT_TIMESTAMP, resolved_at = CURRENT_TIMESTAMP "
-                f"WHERE {where} AND subject = ?",
-                (*parameters, subject),
+            from loop_manager_internal.notifications import notifications
+            notifications.suppress_persistent_failure_for_block(
+                self.connection, repo, subject,
             )
         if resolved:
             placeholders = ", ".join("?" for _ in blocked_subjects)

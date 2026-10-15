@@ -16,7 +16,7 @@ from loop_manager_internal.notifications import work_exhaustion
 from loop_manager_internal.runtime import project_registry
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
-from loop_manager_internal.storage.recovery_state import RecoveryRepository
+from loop_manager_internal.storage.recovery_state import RecoveryRepository, begin_external_run
 
 from tests.support.notification import NotificationFixture
 
@@ -214,7 +214,6 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
             before = repository.external_run_snapshot(repo)
             repository.observe(failure)
             repository.observe_external_run(repo, before)
-            notifications.enqueue_persistent_execution_failure_events(connection, repo)
             notifications.enqueue_worker_failure(connection, repo, 'G-018', cause, status='다음 실행에서 교정')
         self.assertEqual(self.events(connection), [])
         diagnostic = connection.execute('SELECT consecutive_runs, notification_eligible, notification_queued, detail '
@@ -464,7 +463,7 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
                 load_managed_config(config)
             self.assertNotIn(secret, str(raised.exception))
 
-    def test_persistent_failure_queues_once_and_keeps_disabled_diagnostics(self):
+    def test_persistent_failure_stays_diagnostic_without_separate_alert(self):
         connection = self.connection(enabled=False)
         repo = "/projects/alpha"
         repository = RecoveryRepository(connection)
@@ -476,7 +475,6 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
             before = repository.external_run_snapshot(repo)
             repository.observe(failure)
             repository.observe_external_run(repo, before)
-        notifications.enqueue_persistent_execution_failure_events(connection, repo)
         self.assertEqual(self.events(connection), [])
         diagnostic = connection.execute(
             "SELECT consecutive_runs, notification_eligible, notification_queued "
@@ -486,69 +484,45 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
         self.assertEqual(tuple(diagnostic), (3, 1, 0))
 
         notifications.configure_session(connection, enabled=True)
-        with connection:
-            notifications.enqueue_persistent_execution_failure_events(connection, repo)
-            notifications.enqueue_persistent_execution_failure_events(connection, repo)
-        events = self.events(connection)
-        self.assertEqual(len(events), 1)
-        self.assertEqual(events[0]["event_type"], "persistent_execution_failure")
-        payload = json.loads(events[0]["payload"])
-        self.assertEqual(payload["consecutive_external_runs"], 3)
-        self.assertEqual(payload["execplan_id"], "G-018")
-        self.assertIn("fetch failed", notifications._message(events[0]["event_type"], payload))
-
-        failed = mock.Mock(side_effect=RuntimeError("network unavailable"))
-        self.assertEqual(
-            notifications.dispatch_pending(connection, "token", "chat", adapter=failed),
-            0,
-        )
-        delivered = mock.Mock()
-        self.assertEqual(
-            notifications.dispatch_pending(connection, "token", "chat", adapter=delivered),
-            1,
-        )
-        delivered.assert_called_once()
-
-    def test_failed_persistent_delivery_remains_retryable_after_resolution(self):
-        connection = self.connection()
-        repo = "/projects/alpha"
-        repository = RecoveryRepository(connection)
-        failure = RecoveryObservation(
-            RecoveryReason.FETCH_FAILED, repo, "G-018", "PUBLISHING",
-            "plan-sha", "base-sha", "fetch-failure", "head-a", "fetch failed",
-        )
-        for _ in range(3):
-            before = repository.external_run_snapshot(repo)
-            repository.observe(failure)
-            repository.observe_external_run(repo, before)
-        with connection:
-            notifications.enqueue_persistent_execution_failure_events(connection, repo)
-
-        failed = mock.Mock(side_effect=RuntimeError("network unavailable"))
-        for _ in range(2):
-            self.assertEqual(
-                notifications.dispatch_pending(
-                    connection, "token", "chat", adapter=failed,
-                ),
-                0,
-            )
-        with connection:
-            repository.finish_external_run(repo, None, resolved=True)
-        event = connection.execute(
-            "SELECT attempts, sent_at FROM notification_outbox "
-            "WHERE repo = ? AND event_type = 'persistent_execution_failure'",
+        self.assertEqual(self.events(connection), [])
+        diagnostic = connection.execute(
+            "SELECT consecutive_runs, notification_eligible, notification_queued "
+            "FROM persistent_execution_failures WHERE repo = ? AND subject = 'G-018'",
             (repo,),
         ).fetchone()
-        self.assertEqual(tuple(event), (2, None))
+        self.assertEqual(tuple(diagnostic), (3, 1, 0))
 
-        delivered = mock.Mock()
-        self.assertEqual(
-            notifications.dispatch_pending(
-                connection, "token", "chat", adapter=delivered,
-            ),
-            1,
+    def test_same_plan_different_block_cause_does_not_suppress_failure_record(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        connection.execute(
+            "UPDATE exec_plans SET current_revision_sha = 'plan-revision', "
+            "active_sha = 'base-revision' WHERE repo = ? AND plan_id = 'G-018'",
+            (repo,),
         )
-        self.assertEqual(delivered.call_count, 1)
+        begin_external_run(connection, "unrelated-block-run")
+        RecoveryRepository(connection).observe(RecoveryObservation(
+            RecoveryReason.USER_DECISION, repo, "G-018", "READY",
+            "plan-revision", "base-revision", "decision-fingerprint",
+            "base-revision", "Original failure cause",
+        ))
+        scoped_blocking.ensure_schema(connection)
+        connection.execute(
+            "INSERT INTO execplan_blocks "
+            "(repo, plan_id, scope, reason_code, evidence) "
+            "VALUES (?, 'G-018', 'plan', 'user_decision_required', ?)",
+            (repo, "Different block cause"),
+        )
+
+        notifications.suppress_persistent_failure_for_block(
+            connection, repo, "G-018",
+        )
+        failure = connection.execute(
+            "SELECT active, consecutive_runs, notification_eligible, "
+            "suppressed_by_block FROM persistent_execution_failures "
+            "WHERE repo = ? AND subject = 'G-018'", (repo,),
+        ).fetchone()
+        self.assertEqual(tuple(failure), (1, 1, 1, 0))
 
     def test_pr_and_blocked_payloads_are_complete_and_deduplicated(self):
         connection = self.connection()
@@ -674,6 +648,18 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
             "WHERE repo = ? AND plan_id = 'G-018'",
             ("loop-manager/G-018", "/state/G-018", repo),
         )
+        connection.execute(
+            "UPDATE exec_plans SET current_revision_sha = 'plan-revision', "
+            "active_sha = 'base-revision' WHERE repo = ? AND plan_id = 'G-018'",
+            (repo,),
+        )
+        begin_external_run(connection, "final-block-run")
+        RecoveryRepository(connection).observe(RecoveryObservation(
+            RecoveryReason.USER_DECISION, repo, "G-018", "READY",
+            "plan-revision", "base-revision", "decision-fingerprint",
+            "base-revision", "User decision required",
+        ))
+        self.assertEqual(self.events(connection), [])
         with connection:
             scoped_blocking.record_plan_block(
                 connection,
@@ -718,6 +704,7 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
         with connection:
             notifications.enqueue_current_project_events(connection, repo)
         self.assertEqual(len(self.events(connection)), 1)
+        self.assertEqual(self.events(connection)[0]["event_type"], "blocked")
         self.assertEqual(repository.pending(repo), ())
         payload = json.loads(self.events(connection)[0]["payload"])
         self.assertEqual(payload["checkpoint"]["result"], "published")
@@ -726,6 +713,13 @@ class NotificationEventTest(NotificationFixture, unittest.TestCase):
             payload["checkpoint"]["branch_url"],
             f"https://github.com/example/alpha/tree/{oid}",
         )
+        failure = connection.execute(
+            "SELECT active, consecutive_runs, notification_eligible, "
+            "notification_queued, suppressed_by_block FROM "
+            "persistent_execution_failures WHERE repo = ? AND subject = 'G-018'",
+            (repo,),
+        ).fetchone()
+        self.assertEqual(tuple(failure), (0, 1, 1, 0, 1))
 
 
     def test_planning_blocked_payload_lists_basis_documents(self):

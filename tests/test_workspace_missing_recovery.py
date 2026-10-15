@@ -381,6 +381,12 @@ class WorkspaceMissingRecoveryTest(WorkspaceFixture, unittest.TestCase):
                 ),
             )
             connection.commit()
+            self.assertIsNone(
+                connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                    "AND name = 'notification_outbox'"
+                ).fetchone()
+            )
 
             with mock.patch(
                 "loop_manager.validate_repository", return_value=repo

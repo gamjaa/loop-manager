@@ -14,7 +14,7 @@ from loop_manager_internal.notifications import work_exhaustion
 from loop_manager_internal.runtime import project_registry
 from loop_manager_internal.recovery import scoped_blocking
 from loop_manager_internal.recovery.recovery_runtime import RecoveryObservation, RecoveryReason
-from loop_manager_internal.storage.recovery_state import RecoveryRepository
+from loop_manager_internal.storage.recovery_state import RecoveryRepository, begin_external_run
 
 from tests.support.notification import NotificationFixture
 
@@ -85,6 +85,95 @@ class ProjectCheckpointNotificationUnitTests(NotificationFixture, unittest.TestC
 
 
 class NotificationOutboxTest(NotificationFixture, unittest.TestCase):
+    def test_final_block_replaces_partial_legacy_failure_notice_and_keeps_its_audit(self):
+        connection = self.connection()
+        repo = "/projects/alpha"
+        connection.execute(
+            "UPDATE exec_plans SET current_revision_sha = 'plan-revision', "
+            "active_sha = 'base-revision' WHERE repo = ? AND plan_id = 'G-018'",
+            (repo,),
+        )
+        begin_external_run(connection, "final-block-run")
+        RecoveryRepository(connection).observe(RecoveryObservation(
+            RecoveryReason.USER_DECISION, repo, "G-018", "READY",
+            "plan-revision", "base-revision", "decision-fingerprint",
+            "base-revision", "User decision required",
+        ))
+        failure = connection.execute(
+            "SELECT episode, phase, reason_code, fingerprint, consecutive_runs "
+            "FROM persistent_execution_failures WHERE repo = ? AND subject = 'G-018'",
+            (repo,),
+        ).fetchone()
+        identity = "\0".join((
+            "G-018", str(failure[0]), str(failure[1]), str(failure[2]),
+            str(failure[3]),
+        ))
+        legacy_key = notifications._key("persistent_failure", repo, identity)
+        legacy_payload = {
+            "project": "alpha", "stage": str(failure[1]), "scope": "execution",
+            "execplan_id": "G-018", "reason_code": str(failure[2]),
+            "cause": "User decision required", "consecutive_external_runs": 1,
+        }
+        notifications._insert(
+            connection, legacy_key, repo, "persistent_execution_failure",
+            legacy_payload,
+        )
+        legacy_payload_before = connection.execute(
+            "SELECT payload FROM notification_outbox WHERE event_key = ?",
+            (legacy_key,),
+        ).fetchone()[0]
+        frozen_text = "already confirmed legacy text"
+        connection.execute(
+            "UPDATE notification_outbox SET attempts = 2, last_error = ?, "
+            "rendered_text = ?, confirmed_pieces = 1, "
+            "delivery_started_at = CURRENT_TIMESTAMP WHERE event_key = ?",
+            ("previous send error", frozen_text, legacy_key),
+        )
+
+        with connection:
+            scoped_blocking.record_plan_block(
+                connection, repo, "G-018",
+                scoped_blocking.BlockReasonCode.USER_DECISION_REQUIRED,
+                "User decision required", "decision-fingerprint",
+            )
+        checkpoint = blocked_checkpoint_state.BlockedCheckpointRepository(connection)
+        checkpoint.finish_unpublished(
+            checkpoint.get(repo, "G-018"), "local only", retryable=False,
+        )
+        with connection:
+            notifications.enqueue_current_project_events(connection, repo)
+
+        old = connection.execute(
+            "SELECT attempts, last_error, rendered_text, confirmed_pieces, "
+            "canceled_at, delivery_started_at, sent_at, payload "
+            "FROM notification_outbox WHERE event_key = ?", (legacy_key,),
+        ).fetchone()
+        self.assertEqual(old[0:4], (2, "previous send error", frozen_text, 1))
+        self.assertIsNotNone(old[4])
+        self.assertIsNone(old[5])
+        self.assertIsNone(old[6])
+        self.assertEqual(old[7], legacy_payload_before)
+        self.assertEqual(
+            [row["event_type"] for row in self.events(connection)],
+            ["blocked", "persistent_execution_failure"],
+        )
+        failure = connection.execute(
+            "SELECT active, consecutive_runs, notification_eligible, "
+            "notification_queued, suppressed_by_block FROM "
+            "persistent_execution_failures WHERE repo = ? AND subject = 'G-018'",
+            (repo,),
+        ).fetchone()
+        self.assertEqual(tuple(failure), (0, 1, 1, 0, 1))
+
+        delivered = []
+        self.assertEqual(notifications.dispatch_pending(
+            connection, "token", "chat",
+            adapter=lambda _token, _chat, text: delivered.append(text),
+        ), 1)
+        self.assertEqual(len(delivered), 1)
+        self.assertIn("[alpha] BLOCKED", delivered[0])
+        self.assertIn("사용자 조치 대기", delivered[0])
+
     def test_inflight_planning_piece_confirmed_after_start_still_resumes(self):
         connection = self.connection()
         repo = "/projects/alpha"

@@ -41,6 +41,24 @@ def _claim_piece(
         if row is None or (first_attempt_only and row[5] != 0):
             return None
         payload = json.loads(str(row[2]))
+        if row[1] == "persistent_execution_failure":
+            # Recheck the exact target and cause before retiring the legacy
+            # event. A matching current block owns the notice; a missing or
+            # different block cannot make this failure actionable.
+            from .events import suppress_persistent_failure_for_block
+            subject = str(payload.get("execplan_id") or "__project__")
+            suppress_persistent_failure_for_block(
+                connection, str(row[0]), subject,
+            )
+            # Persistent-failure events are never sent separately. Preserve
+            # their prior pieces and errors while preventing another claim.
+            connection.execute(
+                "UPDATE notification_outbox SET canceled_at = CURRENT_TIMESTAMP, "
+                "delivery_started_at = NULL WHERE event_key = ? "
+                "AND sent_at IS NULL AND canceled_at IS NULL",
+                (event_key,),
+            )
+            return None
         from .events import worker_targeted_failure
         reason = ('worker_correction' if row[1] == 'stage_failed' and payload.get('operation') == 'Worker'
                   else payload.get('reason_code') if row[1] == 'persistent_execution_failure' else None)
@@ -191,7 +209,8 @@ def _deliver_rows(
                 with connection:
                     connection.execute(
                         "UPDATE notification_outbox SET delivery_started_at = NULL, "
-                        "last_error = ? WHERE event_key = ? AND sent_at IS NULL "
+                        "last_error = CASE WHEN canceled_at IS NULL THEN ? "
+                        "ELSE last_error END WHERE event_key = ? AND sent_at IS NULL "
                         "AND confirmed_pieces = ?",
                         (failure, row[0], cursor),
                     )
@@ -206,7 +225,8 @@ def _deliver_rows(
                 connection.execute(
                     "UPDATE notification_outbox SET confirmed_pieces = ?, "
                     "delivery_started_at = CASE WHEN ? = ? "
-                    "THEN delivery_started_at ELSE NULL END, last_error = NULL, "
+                    "THEN delivery_started_at ELSE NULL END, "
+                    "last_error = CASE WHEN canceled_at IS NULL THEN NULL ELSE last_error END, "
                     "sent_at = CASE WHEN ? = ? THEN CURRENT_TIMESTAMP "
                     "ELSE NULL END WHERE event_key = ? AND sent_at IS NULL "
                     "AND confirmed_pieces = ?",
