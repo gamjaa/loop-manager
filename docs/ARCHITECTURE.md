@@ -353,6 +353,10 @@ Worker에 추가하는 [AGENTS.ponytail.md](AGENTS.ponytail.md)는 [Ponytail](ht
 
 ### 준비된 provider 실행 입력과 호출 증거
 
+Codex의 신규·재개·일회 실행은 같은 출력 pipe 수신 경로를 사용한다. `agent_activity`는 UTF-8 부분 출력과 이벤트를 로그 저장·Reviewer 생략 전에 관측하고 monotonic 무출력 시간, 병렬 명령 item과 턴 완료를 구분한다. Manager heartbeat는 이 경로를 호출하지 않는다. 실행 중인 명령이 없으면 600초 무출력에서 기존 프로세스 정리를 요청하며, 전체 실행 제한과 제한 재시도는 유지한다.
+
+`process_receipt`는 Agent가 쓸 수 있는 attempt 바깥의 Manager runtime에 호출별 PID·Linux 호스트/boot identity와 종료 근거를 원자적으로 저장한다. invocation은 spawn 전에 이 경로를 결합하고, 프로세스 그룹 또는 Windows Job 정리·wait 성공 뒤에만 실행 종료 콜백을 호출한다. 시작 시 interrupted 정리 및 Requirement 교정 경계는 저장된 완료 근거를 복구하며, Linux에서는 같은 호스트의 그룹 소멸 또는 reboot를 재확인할 수 있다. 미확인 Windows·macOS 호출은 완료 근거가 없으면 계속 보존한다. 복구 관측 시각을 실제 종료 시각·소요 시간이나 결과 코드로 추정하지 않으며 결과 분류·usage·session·성공 재사용 근거를 바꾸지 않는다. Requirement writer gate는 `execution_finished_at`과 실행 전 거부 여부로 종료를 판단하고 `result_code`를 대용하지 않는다.
+
 `AgentRequest.prepared_launch`는 관리 worktree·repository·role의 기존 Codex 저장소를 provider 조회보다 먼저 선택해 전달한다. legacy profile callback은 호출별 `prepared_environment` 문맥에서 같은 필터된 mapping을 사용하며 부모 `os.environ`이나 호출자 mapping을 수정하지 않는다. 물리 호출은 선택 환경에서 인증·Model/Effort·설정·권한을 다시 확인한다. 등록 단계의 사용자 환경 조회 결과는 실제 호출의 준비 성공이나 승인 재사용 근거가 아니다. 새 session·재개·제한 retry·fallback도 각각 현재 환경과 실제 invocation의 증거를 필요로 한다. Claude의 기존 안전 거부는 유지하며 인증 전용 source 변경은 G-263/G-264에 남긴다.
 
 `provider_execution.observe`는 Agent 모델 실행 없이 현재 Reviewer의 native 지침 적용·CLI/환경·설정/도구 정책을 확인하거나 지정한 실제 invocation의 완료 기록을 읽는다. Codex native prompt 조회로 확인한 전체 developer 지침 지문과 model/effort·환경/정책 지문은 process 시작 전에 기존 invocation의 `execution_identity`에 한 번 저장한다. credential 값이나 그 값의 해시, prompt 원문은 저장하지 않는다. 수신 환경의 일회성 임시 경로는 정확히 확인한 소유 디렉터리만 정규화한다. 실제 process 시작·종료·성공·격리·지침·repository/plan/role/worktree 결합이 없거나 기존 행의 입력이 누락되면 재사용 증거를 반환하지 않는다. 현재 설정을 과거 호출에 소급 기록하지 않는다.

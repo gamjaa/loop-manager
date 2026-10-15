@@ -97,7 +97,7 @@ class ProviderExecutionFixture:
             snapshot_digest=lambda: 'current-snapshot', **kwargs)
 
     def invoke(self, *, result_code=0, resolved=None):
-        process = mock.Mock()
+        process = mock.Mock(pid=4321)
         process.stdin = io.StringIO()
         process.stdout = io.StringIO(json.dumps({'type': 'thread.started', 'thread_id': 'review-session'}) + '\n' +
             json.dumps({'type': 'item.completed', 'item': {'type': 'agent_message', 'text': 'VERDICT: PASS'}}) + '\n')

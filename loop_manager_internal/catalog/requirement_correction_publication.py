@@ -62,10 +62,11 @@ class RequirementCorrectionPublisher:
         if manager_git_journal.has_pending_project_mutation(self.git.state_dir, self.git.repo):
             raise CorrectionPending('미확정 Manager Git 쓰기를 보존하고 Requirement 교정을 보류합니다.')
         if self.connection.execute("SELECT 1 FROM sqlite_master WHERE name='agent_invocations'").fetchone():
+            from loop_manager_internal.storage.agent_invocation_state import InvocationRepository
+            InvocationRepository(self.connection).reconcile_execution(state_dir=self.git.state_dir, repo=self.git.repo)
             if self.connection.execute(
-                "SELECT 1 FROM agent_invocations WHERE repo=? AND (finished_at IS NULL OR "
-                "execution_status != 'not_executed' AND result_code IS NULL "
-                "AND result_kind IN ('interrupted','exception','timeout')) LIMIT 1",
+                "SELECT 1 FROM agent_invocations WHERE repo=? AND execution_finished_at IS NULL "
+                "AND (finished_at IS NULL OR execution_status != 'not_executed') LIMIT 1",
                 (self.git.repo,),
             ).fetchone():
                 raise CorrectionPending('종료가 확인되지 않은 Agent writer가 있어 교정을 보류합니다.')

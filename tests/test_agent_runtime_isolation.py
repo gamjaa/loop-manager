@@ -5,6 +5,7 @@ import sqlite3
 from pathlib import Path
 import tempfile
 import json
+import io
 from unittest import TestCase, mock, skipUnless
 
 from loop_manager_internal.agents import agent_invocation as invocation
@@ -124,7 +125,8 @@ class RuntimeReadOnlyIsolationTests(TestCase):
                 self.assertIn('--sandbox', command)
                 self.assertEqual(command[command.index('--sandbox') + 1], 'read-only')
                 Path(command[command.index('-o') + 1]).write_text('draft response')
-                return manager.subprocess.CompletedProcess(command, 0)
+                return mock.Mock(pid=4321, stdin=io.StringIO(), stdout=io.StringIO(''),
+                                 wait=mock.Mock(return_value=0))
 
             args = manager.argparse.Namespace(repository=str(boundary.source),
                                                draft_command='generate', target='docs/PRODUCT.md')
@@ -143,7 +145,8 @@ class RuntimeReadOnlyIsolationTests(TestCase):
                  mock.patch.object(isolation, '_git', side_effect=git), \
                  mock.patch.dict(isolation.os.environ, {'CODEX_HOME': str(home)}), \
                  mock.patch.object(isolation.subprocess, 'run', side_effect=run), \
-                 mock.patch.object(envelope.CodexLaunch, 'run', side_effect=execute):
+                 mock.patch.object(envelope.CodexLaunch, 'start', side_effect=execute), \
+                 mock.patch.object(envelope.CodexLaunch, 'stop'):
                 result = manager._document_drafts_command(args, state_root, state_root / 'config')
             self.assertEqual(result, 0)
             self.assertEqual(len(launched), 1)

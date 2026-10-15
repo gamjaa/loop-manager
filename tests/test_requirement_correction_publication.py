@@ -214,7 +214,9 @@ class RequirementCorrectionPublicationTest(unittest.TestCase):
         ] + [
             ('not_executed', None, 'exception', None, True),
             ('executed', None, None, None, True),
-            ('executed', 'finished', 'exception', 1, False),
+            ('executed', 'finished', 'exception', 1, True),
+            ('executed', 'finished', 'interrupted', -1, True),
+            ('unknown', 'finished', 'success', 0, True),
         ]
         for status, finished, kind, code, blocked in cases:
             with self.subTest(status=status, finished=finished, kind=kind, code=code):
@@ -230,6 +232,10 @@ class RequirementCorrectionPublicationTest(unittest.TestCase):
                 else:
                     result = self.publisher.observe('base')
                     self.assertTrue(result['assignments'])
+                self.connection.execute("UPDATE agent_invocations SET execution_finished_at='observed'")
+                self.assertTrue(self.publisher.observe('base')['assignments'])
+                row = self.connection.execute('SELECT result_kind,result_code FROM agent_invocations').fetchone()
+                self.assertEqual(tuple(row), (kind, code))
         self.assertEqual((self.observations.commits, self.observations.pushes), (0, 0))
 
     def test_reference_query_failure_does_not_mean_no_references(self):

@@ -1,5 +1,6 @@
 from contextlib import closing, ExitStack
 import json
+import io
 import sqlite3
 import subprocess
 import tempfile
@@ -178,21 +179,21 @@ class PlannerInterruptionRecoveryTest(unittest.TestCase):
             {"type": "thread.started", "thread_id": session_id}
         ) + "\n"
 
-        class InterruptedOutput:
-            def __iter__(self):
-                yield thread_event
+        class InterruptedOutput(io.StringIO):
+            def readline(self, size=-1):
+                line = super().readline(size)
+                if line:
+                    return line
                 raise RuntimeError("Planner process interrupted")
-
-            def close(self):
-                pass
 
         class InterruptedProcess:
             def __init__(self):
                 self.stdin = mock.Mock()
-                self.stdout = InterruptedOutput()
+                self.stdout = InterruptedOutput(thread_event)
+                self.pid = 4321
                 self.killed = False
 
-            def wait(self):
+            def wait(self, timeout=None):
                 return -9
 
             def kill(self):

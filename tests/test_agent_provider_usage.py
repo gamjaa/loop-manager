@@ -517,12 +517,13 @@ class UsageTests(TestCase):
                 mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock(), mock.Mock(),
             )
             evidence = mock.Mock(status="verified")
-            def run(_launch, _arguments, **kwargs):
-                kwargs["stdout"].write(
+            def run(_arguments, **kwargs):
+                raw = (
                     '{"type":"turn.completed","usage":{"input_tokens":10,'
                     '"cached_input_tokens":4,"output_tokens":2}}\n'
                 )
-                return mock.Mock(returncode=0)
+                return mock.Mock(pid=4321, stdin=io.StringIO(), stdout=io.StringIO(raw),
+                                 wait=mock.Mock(return_value=0))
 
             def prepare(_provider, _role, _worktree, _state_dir, _read_only, observe,
                         *_args, **_kwargs):
@@ -530,7 +531,8 @@ class UsageTests(TestCase):
                 return launch
 
             with mock.patch.object(provider_adapters.agent_write_isolation.CodexLaunch,
-                                   "run", autospec=True, side_effect=run) as run_call, \
+                                   "start", side_effect=run) as run_call, \
+                 mock.patch.object(provider_adapters.agent_write_isolation.CodexLaunch, "stop"), \
                  mock.patch.object(provider_adapters.agent_write_isolation,
                                    "prepare_isolation", side_effect=prepare), \
                  mock.patch.object(provider_adapters.agent_write_isolation,

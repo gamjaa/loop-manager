@@ -25,6 +25,18 @@ from tests.support.workspace import native_agent_boundary, pin_common_guidance
 
 
 class NativePlatformAgentTests(unittest.TestCase):
+    def test_windows_job_cleanup_failure_cannot_later_become_finish_proof(self):
+        from loop_manager_internal.agents import windows_runtime
+        import threading
+        job = mock.Mock()
+        job.wait.side_effect = TimeoutError('children remain')
+        process = SimpleNamespace(_loop_manager_job=job, _loop_manager_stop_error=None,
+                                  _loop_manager_stop_lock=threading.Lock(), wait=mock.Mock())
+        for _ in range(2):
+            with self.assertRaisesRegex(TimeoutError, 'children remain'):
+                windows_runtime.stop(process)
+        job.close.assert_called_once()
+
     def test_windows_bootstrap_cannot_hide_real_agent_from_test_guard(self):
         from loop_manager_internal.agents import windows_runtime
         with mock.patch.dict(os.environ, {'LOOP_MANAGER_TEST_NO_AGENTS': '1'}), \
