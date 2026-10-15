@@ -220,7 +220,7 @@ def remove_cleanup_worktree(
         if current.status != "safe":
             return current
         _head, _branch, _index, dirty = effects._capture_local_worktree_state(worktree)
-        if dirty or effects._git_operation_entries(worktree):
+        if dirty or controlling_git_operation(effects._git_operation_entries(worktree)):
             return CleanupAssessment("dirty", "worktree 제거 직전 권위 있는 변경이 있습니다.")
         if state_dir is None:
             current = still_safe()

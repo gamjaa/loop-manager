@@ -13,6 +13,43 @@ from tests.support.lifecycle import register_connection_cleanup
 
 @isolated_git_test
 class WorktreeCleanupTest(CleanupFixture, unittest.TestCase):
+    def test_completed_rebase_markers_do_not_prevent_worktree_removal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo, worktree, _branch, head = self._managed_worktree(Path(directory))
+            git_command(worktree, 'update-ref', 'REBASE_HEAD', head)
+            for name in ('MERGE_MSG', 'MERGE_MODE'):
+                path = Path(git_command(worktree, 'rev-parse', '--git-path', name))
+                path.write_text('retained operation evidence', encoding='utf-8')
+            assessment = loop_manager.assess_cleanup(worktree, head)
+            self.assertEqual(assessment.status, 'safe')
+
+            result = loop_manager.remove_cleanup_worktree(repo, worktree, assessment)
+
+            self.assertEqual(result.status, 'safe')
+            self.assertFalse(worktree.exists())
+
+    def test_last_removal_guard_preserves_late_operations_and_index_flags(self):
+        from loop_manager_internal.git.cleanup_service import remove_cleanup_worktree
+        head = 'a' * 40
+        auxiliary = {'REBASE_HEAD': head, 'MERGE_MSG': 'retained message'}
+        cases = [({**auxiliary, marker: 'active'}, {})
+                 for marker in ('rebase-merge', 'rebase-apply', 'MERGE_HEAD', 'CHERRY_PICK_HEAD', 'sequencer')]
+        cases.append((auxiliary, {'hidden': 'index flags'}))
+        for operations, dirty in cases:
+            with self.subTest(operations=operations, dirty=dirty), tempfile.TemporaryDirectory() as directory:
+                worktree = Path(directory)
+                assessment = loop_manager.CleanupAssessment('safe', pr_head_oid=head,
+                    observation=(head, 'branch', ()))
+                effects = mock.Mock()
+                effects.assess_cleanup.return_value = assessment
+                effects._capture_local_worktree_state.return_value = (head, 'branch', {}, dirty)
+                effects._git_operation_entries.return_value = operations
+
+                result = remove_cleanup_worktree(effects, worktree / 'repo', worktree, assessment)
+
+                self.assertEqual(result.status, 'dirty')
+                effects.git.assert_not_called()
+                self.assertTrue(worktree.exists())
 
     def test_commit_added_after_assessment_preserves_worktree(self):
         with tempfile.TemporaryDirectory() as directory:
