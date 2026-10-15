@@ -567,94 +567,99 @@ class SegmentedDeliveryTest(NotificationFixture, unittest.TestCase):
             restarted.close()
 
     def test_canceled_inflight_legacy_piece_keeps_error_and_does_not_resume(self):
-        with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
-            database = Path(directory) / "state.db"
-            connection = self.connection(database=database)
-            cleanup.callback(connection.close)
-            repo = "/projects/alpha"
-            subject, episode, phase = "G-018", 2, "WORKING"
-            reason_code, fingerprint = "fetch_failed", "failure-fingerprint"
-            identity = "\0".join((subject, str(episode), phase, reason_code, fingerprint))
-            event_key = notifications._key("persistent_failure", repo, identity)
-            payload = {
-                "project": "alpha", "stage": phase, "scope": "execution",
-                "execplan_id": subject, "reason_code": reason_code,
-                "cause": "fetch failed", "consecutive_external_runs": 3,
-            }
-            notifications._insert(
-                connection, event_key, repo, "persistent_execution_failure", payload,
-            )
-            saved_text = "frozen legacy text" * 300
-            connection.execute(
-                "UPDATE notification_outbox SET attempts = 1, last_error = ?, "
-                "rendered_text = ?, delivery_started_at = CURRENT_TIMESTAMP "
-                "WHERE event_key = ?",
-                ("previous send failed", saved_text, event_key),
-            )
-            connection.commit()
+        for failure_in_flight in (False, True):
+            with self.subTest(failure_in_flight=failure_in_flight):
+                with tempfile.TemporaryDirectory() as directory, ExitStack() as cleanup:
+                    database = Path(directory) / "state.db"
+                    connection = self.connection(database=database)
+                    cleanup.callback(connection.close)
+                    repo = "/projects/alpha"
+                    subject, episode, phase = "G-018", 2, "WORKING"
+                    reason_code, fingerprint = "fetch_failed", "failure-fingerprint"
+                    identity = "\0".join((subject, str(episode), phase, reason_code, fingerprint))
+                    event_key = notifications._key("persistent_failure", repo, identity)
+                    payload = {
+                        "project": "alpha", "stage": phase, "scope": "execution",
+                        "execplan_id": subject, "reason_code": reason_code,
+                        "cause": "fetch failed", "consecutive_external_runs": 3,
+                    }
+                    notifications._insert(
+                        connection, event_key, repo, "persistent_execution_failure", payload,
+                    )
+                    saved_text = "frozen legacy text" * 300
+                    connection.execute(
+                        "UPDATE notification_outbox SET attempts = 1, last_error = ?, "
+                        "rendered_text = ?, delivery_started_at = CURRENT_TIMESTAMP "
+                        "WHERE event_key = ?",
+                        ("previous send failed", saved_text, event_key),
+                    )
+                    connection.commit()
 
-            first_piece = saved_text[:4096]
-            original_claim = delivery._claim_piece
-            claimed = False
+                    first_piece = saved_text[:4096]
+                    original_claim = delivery._claim_piece
+                    claimed = False
 
-            def claim_piece(current, key, *, first_attempt_only):
-                nonlocal claimed
-                if not claimed:
-                    claimed = True
-                    # An older process had claimed this piece before policy changed.
-                    return first_piece, 0, 2, []
-                return original_claim(
-                    current, key, first_attempt_only=first_attempt_only,
-                )
-
-            delivered = []
-
-            def cancel_during_send(_token, _chat, text):
-                concurrent = sqlite3.connect(database)
-                try:
-                    with concurrent:
-                        notifications.cancel_pending_persistent_execution_failure_event(
-                            concurrent, repo, subject, episode, phase,
-                            reason_code, fingerprint,
+                    def claim_piece(current, key, *, first_attempt_only):
+                        nonlocal claimed
+                        if not claimed:
+                            claimed = True
+                            # An older process had claimed this piece before policy changed.
+                            return first_piece, 0, 2, []
+                        return original_claim(
+                            current, key, first_attempt_only=first_attempt_only,
                         )
-                finally:
-                    concurrent.close()
-                delivered.append(text)
 
-            with mock.patch.object(delivery, "_claim_piece", side_effect=claim_piece):
-                self.assertEqual(notifications.dispatch_pending(
-                    connection, "token", "chat", adapter=cancel_during_send,
-                ), 0)
-            self.assertEqual(delivered, [first_piece])
-            row = connection.execute(
-                "SELECT attempts, last_error, rendered_text, confirmed_pieces, "
-                "canceled_at, delivery_started_at, sent_at FROM notification_outbox "
-                "WHERE event_key = ?", (event_key,),
-            ).fetchone()
-            self.assertEqual(row[:4], (
-                1, "previous send failed", saved_text, 1,
-            ))
-            self.assertIsNotNone(row[4])
-            self.assertIsNone(row[5])
-            self.assertIsNone(row[6])
-            restarted = sqlite3.connect(database)
-            cleanup.callback(restarted.close)
-            restarted.row_factory = sqlite3.Row
-            notifications.ensure_schema(restarted)
-            retry = mock.Mock()
-            self.assertEqual(notifications.dispatch_pending(
-                restarted, "token", "chat", adapter=retry,
-            ), 0)
-            retry.assert_not_called()
-            persisted = restarted.execute(
-                "SELECT attempts, last_error, rendered_text, confirmed_pieces, "
-                "canceled_at FROM notification_outbox WHERE event_key = ?",
-                (event_key,),
-            ).fetchone()
-            self.assertEqual(tuple(persisted[:4]), (
-                1, "previous send failed", saved_text, 1,
-            ))
-            self.assertIsNotNone(persisted[4])
+                    attempted = []
+
+                    def cancel_during_send(_token, _chat, text):
+                        concurrent = sqlite3.connect(database)
+                        try:
+                            with concurrent:
+                                notifications.cancel_pending_persistent_execution_failure_event(
+                                    concurrent, repo, subject, episode, phase,
+                                    reason_code, fingerprint,
+                                )
+                        finally:
+                            concurrent.close()
+                        attempted.append(text)
+                        if failure_in_flight:
+                            raise RuntimeError("network unavailable")
+
+                    with mock.patch.object(delivery, "_claim_piece", side_effect=claim_piece):
+                        self.assertEqual(notifications.dispatch_pending(
+                            connection, "token", "chat", adapter=cancel_during_send,
+                        ), 0)
+                    self.assertEqual(attempted, [first_piece])
+                    row = connection.execute(
+                        "SELECT attempts, last_error, rendered_text, confirmed_pieces, "
+                        "canceled_at, delivery_started_at, sent_at FROM notification_outbox "
+                        "WHERE event_key = ?", (event_key,),
+                    ).fetchone()
+                    confirmed_pieces = 0 if failure_in_flight else 1
+                    self.assertEqual(row[:4], (
+                        1, "previous send failed", saved_text, confirmed_pieces,
+                    ))
+                    self.assertIsNotNone(row[4])
+                    self.assertIsNone(row[5])
+                    self.assertIsNone(row[6])
+                    restarted = sqlite3.connect(database)
+                    cleanup.callback(restarted.close)
+                    restarted.row_factory = sqlite3.Row
+                    notifications.ensure_schema(restarted)
+                    retry = mock.Mock()
+                    self.assertEqual(notifications.dispatch_pending(
+                        restarted, "token", "chat", adapter=retry,
+                    ), 0)
+                    retry.assert_not_called()
+                    persisted = restarted.execute(
+                        "SELECT attempts, last_error, rendered_text, confirmed_pieces, "
+                        "canceled_at FROM notification_outbox WHERE event_key = ?",
+                        (event_key,),
+                    ).fetchone()
+                    self.assertEqual(tuple(persisted[:4]), (
+                        1, "previous send failed", saved_text, confirmed_pieces,
+                    ))
+                    self.assertIsNotNone(persisted[4])
 
     def test_immediate_pr_dispatch_uses_same_piece_cursor(self):
         connection = self.connection()
